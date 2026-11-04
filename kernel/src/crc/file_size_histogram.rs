@@ -11,7 +11,7 @@ use delta_kernel_derive::internal_api;
 use serde::{Deserialize, Serialize};
 
 use crate::utils::require;
-use crate::{KernelError, KernelResult, Result};
+use crate::{KernelError, KernelResult};
 
 const KB: i64 = 1024;
 const MB: i64 = KB * 1024;
@@ -116,7 +116,7 @@ impl FileSizeHistogram {
         sorted_bin_boundaries: Vec<i64>,
         file_counts: Vec<i64>,
         total_bytes: Vec<i64>,
-    ) -> Result<Self> {
+    ) -> KernelResult<Self> {
         require!(
             sorted_bin_boundaries.len() >= 2,
             KernelError::internal_error(format!(

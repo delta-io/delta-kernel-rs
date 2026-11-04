@@ -1,7 +1,7 @@
 //! Some utilities for working with arrow data types
 
-use crate::KernelResult;
 pub(crate) mod apply_schema;
+pub(crate) mod file_type_validation;
 
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
@@ -14,35 +14,36 @@ use itertools::Itertools;
 use tracing::debug;
 
 use self::apply_schema::apply_schema_to_struct;
+use self::file_type_validation::validate_file_values_for_read;
 use crate::arrow::array::cast::AsArray;
 use crate::arrow::array::{
-    make_array, new_null_array, Array as ArrowArray, ArrayRef as ArrowArrayRef, GenericListArray,
+    Array as ArrowArray, ArrayRef as ArrowArrayRef, GenericListArray, GenericListViewArray,
     MapArray, OffsetSizeTrait, PrimitiveArray, RecordBatch, RecordBatchOptions, StringArray,
-    StructArray,
+    StructArray, make_array, new_null_array,
 };
 use crate::arrow::buffer::NullBuffer;
-use crate::arrow::compute::{cast_with_options, CastOptions};
+use crate::arrow::compute::{CastOptions, cast_with_options};
 use crate::arrow::datatypes::{
     DataType as ArrowDataType, Field as ArrowField, FieldRef as ArrowFieldRef,
     Fields as ArrowFields, Int64Type, Schema as ArrowSchema, SchemaRef as ArrowSchemaRef,
 };
-use crate::arrow::json::writer::{make_encoder, LineDelimited, NullableEncoder};
+use crate::arrow::json::writer::{LineDelimited, NullableEncoder, make_encoder};
 use crate::arrow::json::{Encoder, EncoderFactory, EncoderOptions, ReaderBuilder, WriterBuilder};
 use crate::engine::arrow_conversion::{TryFromKernel as _, TryIntoArrow as _};
 use crate::engine::arrow_data::ArrowEngineData;
 use crate::engine::ensure_data_types::DataTypeCompat;
 use crate::engine_data::FilteredEngineData;
 use crate::parquet::arrow::arrow_reader::ArrowReaderMetadata;
-use crate::parquet::arrow::{ProjectionMask, PARQUET_FIELD_ID_META_KEY};
+use crate::parquet::arrow::{PARQUET_FIELD_ID_META_KEY, ProjectionMask};
 use crate::parquet::file::metadata::RowGroupMetaData;
 use crate::parquet::schema::types::SchemaDescriptor;
 use crate::schema::{
-    schema, ArrayType, ColumnMetadataKey, DataType, MapType, MetadataColumnSpec, MetadataValue,
-    PrimitiveType, Schema, SchemaRef, StructField, StructType,
+    ArrayType, ColumnMetadataKey, DataType, MapType, MetadataColumnSpec, MetadataValue,
+    PrimitiveType, Schema, SchemaRef, StructField, StructType, schema,
 };
-use crate::transforms::{transform_output_type, SchemaTransform};
+use crate::transforms::{SchemaTransform, transform_output_type};
 use crate::utils::require;
-use crate::{EngineData, KernelError, Result};
+use crate::{EngineData, KernelError, KernelResult, KernelResultIterator};
 
 macro_rules! prim_array_cmp {
     ( $left_arr: ident, $right_arr: ident, $(($data_ty: pat, $prim_ty: ty)),+ ) => {
@@ -179,7 +180,7 @@ impl RowIndexBuilder {
     ///
     /// Returns an error if there are duplicate or out of bounds row group ordinals.
     #[internal_api]
-    pub(crate) fn build(self) -> Result<FlattenedRangeIterator<i64>> {
+    pub(crate) fn build(self) -> KernelResult<FlattenedRangeIterator<i64>> {
         let starting_offsets = match self.row_group_ordinals {
             Some(ordinals) => {
                 let mut seen_ordinals = HashSet::with_capacity(ordinals.len());
@@ -235,8 +236,12 @@ impl RowIndexBuilder {
 /// `DataTypeCompat::NeedsCast` into an actual `arrow::compute::cast`, so post-reorder leaf types
 /// are `Identical` to the kernel target.
 ///
-/// **Cost.** O(F) per batch where F is the total number of fields (including nested). Row data
-/// (Arrow buffers, offsets, null buffers) is shared via `Arc` and never copied.
+/// **File values.** A non-null `file` value that the File type requires readers to reject fails
+/// the read; `validate_file_values_for_read` in `file_type_validation.rs` lists the rules.
+///
+/// **Cost.** O(F) per batch where F is the total number of fields (including nested), plus O(R)
+/// per `file` column for R rows. Row data (Arrow buffers, offsets, null buffers) is shared via
+/// `Arc` and never copied.
 #[internal_api]
 pub(crate) fn fixup_parquet_read(
     batch: RecordBatch,
@@ -244,15 +249,29 @@ pub(crate) fn fixup_parquet_read(
     row_indexes: Option<&mut FlattenedRangeIterator<i64>>,
     file_location: Option<&str>,
     target_schema: Option<&SchemaRef>,
-) -> Result<ArrowEngineData> {
+) -> KernelResult<ArrowEngineData> {
     let data = reorder_struct_array(batch.into(), requested_ordering, row_indexes, file_location)?;
     let data = fix_nested_null_masks(data);
     let data = if let Some(schema) = target_schema {
-        apply_schema_to_struct(&data, schema)?
+        let data = apply_schema_to_struct(&data, schema)?;
+        validate_file_values_for_read(&data, schema)?;
+        data
     } else {
         data
     };
     Ok(data.into())
+}
+
+/// Fails if a `file` value in `batch` is invalid for a writer to write: it breaks a rule reads
+/// apply (see [`fixup_parquet_read`]) or has a malformed `checksum`, so a writer never writes a
+/// data file that readers reject. Columns are matched to `kernel_schema` by name, and a `file`
+/// column missing from `batch` is an error.
+#[internal_api]
+pub(crate) fn validate_file_values_for_write(
+    batch: &RecordBatch,
+    kernel_schema: &StructType,
+) -> KernelResult<()> {
+    file_type_validation::validate_file_values_for_write(&batch.clone().into(), kernel_schema)
 }
 
 /*
@@ -510,16 +529,18 @@ fn get_indices(
             ..
         }) = kernel_field_info
         {
+            let requested_type = requested_field.data_type().physical_type();
             // If the field is a variant, make sure the parquet schema matches the unshredded
             // variant representation. This is to ensure that shredded reads are not
             // performed.
-            if requested_field.data_type == DataType::unshredded_variant() {
+            if requested_type == &DataType::unshredded_variant() {
                 validate_parquet_variant(field)?;
             }
             match field.data_type() {
                 ArrowDataType::Struct(fields) => {
-                    if let DataType::Struct(ref requested_schema)
-                    | DataType::Variant(ref requested_schema) = requested_field.data_type
+                    if let DataType::Struct(requested_schema)
+                    | DataType::Variant(requested_schema)
+                    | DataType::File(requested_schema) = requested_type
                     {
                         let mask_before = mask_indices.len();
                         let (parquet_advance, children) = get_indices(
@@ -561,7 +582,7 @@ fn get_indices(
                 | ArrowDataType::LargeListView(list_field) => {
                     // we just want to transparently recurse into lists, need to transform the
                     // kernel list data type into a schema
-                    if let DataType::Array(array_type) = requested_field.data_type() {
+                    if let DataType::Array(array_type) = requested_type {
                         let requested_schema = schema! {
                             (StructField::new(
                                 list_field.name().clone(), // so we find it in the inner call
@@ -627,7 +648,7 @@ fn get_indices(
                     }
                 }
                 ArrowDataType::Map(key_val_field, _) => {
-                    match (key_val_field.data_type(), requested_field.data_type()) {
+                    match (key_val_field.data_type(), requested_type) {
                         (ArrowDataType::Struct(inner_fields), DataType::Map(map_type)) => {
                             let mut key_val_names =
                                 inner_fields.iter().map(|f| f.name().to_string());
@@ -707,7 +728,7 @@ fn get_indices(
                         DataTypeCompat::Nested => {
                             return Err(KernelError::internal_error(
                                 "Comparing nested types in get_indices",
-                            ))
+                            ));
                         }
                     }
                     found_fields.insert(requested_field.name());
@@ -852,7 +873,7 @@ fn match_parquet_fields<'k, 'p>(
 pub(crate) fn parquet_read_plan(
     requested_schema: &SchemaRef,
     file_metadata: &ArrowReaderMetadata,
-) -> Result<(Vec<ReorderIndex>, Option<ProjectionMask>)> {
+) -> KernelResult<(Vec<ReorderIndex>, Option<ProjectionMask>)> {
     let (indices, reorder) = get_requested_indices(requested_schema, file_metadata.schema())?;
     let mask = generate_mask(file_metadata.parquet_schema(), &indices);
     Ok((reorder, mask))
@@ -1011,15 +1032,34 @@ pub(crate) fn reorder_struct_array(
                                 children,
                             )?;
                         }
+                        ArrowDataType::ListView(_) => {
+                            let list_view_array =
+                                input_cols[parquet_position].as_list_view::<i32>().clone();
+                            final_fields_cols[reorder_index.index] = reorder_list_view(
+                                list_view_array,
+                                field.name(),
+                                field.is_nullable(),
+                                children,
+                            )?;
+                        }
+                        ArrowDataType::LargeListView(_) => {
+                            let list_view_array =
+                                input_cols[parquet_position].as_list_view::<i64>().clone();
+                            final_fields_cols[reorder_index.index] = reorder_list_view(
+                                list_view_array,
+                                field.name(),
+                                field.is_nullable(),
+                                children,
+                            )?;
+                        }
                         ArrowDataType::Map(_, _) => {
                             let map_array = input_cols[parquet_position].as_map().clone();
                             final_fields_cols[reorder_index.index] =
                                 reorder_map(map_array, field.name(), children)?;
                         }
-                        // TODO(#3178): ListView/LargeListView fall through here.
                         _ => {
                             return Err(KernelError::internal_error(
-                                "Nested reorder can only apply to struct/list/map.",
+                                "Nested reorder can only apply to struct/list/list view/map.",
                             ));
                         }
                     }
@@ -1086,39 +1126,74 @@ fn reorder_list<O: OffsetSizeTrait>(
     list_nullable: bool,
     children: &[ReorderIndex],
 ) -> KernelResult<FieldArrayOpt> {
-    let (list_values_field, offset_buffer, maybe_sa, null_buf) = list_array.into_parts();
-    if let Some(struct_array) = maybe_sa.as_struct_opt() {
-        let struct_array = struct_array.clone();
-        let result_array = Arc::new(reorder_struct_array(
-            struct_array,
-            children,
-            None, /* Nested structures don't need row indexes since metadata columns can't be
-                   * nested */
-            None, // No file_location passed since metadata columns can't be nested
-        )?);
-        let new_list_field = Arc::new(ArrowField::new_struct(
-            list_values_field.name(),
-            result_array.fields().clone(),
-            result_array.is_nullable(),
-        ));
-        let list = Arc::new(GenericListArray::try_new(
-            new_list_field,
-            offset_buffer,
-            result_array,
-            null_buf,
-        )?);
-        // Take the field's type from the rebuilt array so a LargeList isn't forced to List.
-        let new_field = Arc::new(ArrowField::new(
-            input_field_name,
-            list.data_type().clone(),
-            list_nullable,
-        ));
-        Ok(Some((new_field, list)))
-    } else {
-        Err(KernelError::internal_error(
+    let (values_field, offset_buffer, values, null_buf) = list_array.into_parts();
+    let (new_values_field, values) = reorder_list_struct_fields(values_field, values, children)?;
+    let list = Arc::new(GenericListArray::try_new(
+        new_values_field,
+        offset_buffer,
+        values,
+        null_buf,
+    )?);
+    // Take the field's type from the rebuilt array so a LargeList isn't forced to List.
+    let new_field = Arc::new(ArrowField::new(
+        input_field_name,
+        list.data_type().clone(),
+        list_nullable,
+    ));
+    Ok(Some((new_field, list)))
+}
+
+fn reorder_list_view<O: OffsetSizeTrait>(
+    list_view_array: GenericListViewArray<O>,
+    input_field_name: &str,
+    list_nullable: bool,
+    children: &[ReorderIndex],
+) -> KernelResult<FieldArrayOpt> {
+    let (values_field, offsets, sizes, values, null_buf) = list_view_array.into_parts();
+    let (new_values_field, values) = reorder_list_struct_fields(values_field, values, children)?;
+    let list_view = Arc::new(GenericListViewArray::try_new(
+        new_values_field,
+        offsets,
+        sizes,
+        values,
+        null_buf,
+    )?);
+    // Take the field's type from the rebuilt array so a LargeListView isn't forced to ListView.
+    let new_field = Arc::new(ArrowField::new(
+        input_field_name,
+        list_view.data_type().clone(),
+        list_nullable,
+    ));
+    Ok(Some((new_field, list_view)))
+}
+
+/// Reorders the struct fields within the values of a list or list-view column.
+///
+/// The element field keeps its name, declared nullability, and metadata; only its data type is
+/// replaced with the reordered struct.
+fn reorder_list_struct_fields(
+    values_field: Arc<ArrowField>,
+    values: Arc<dyn ArrowArray>,
+    children: &[ReorderIndex],
+) -> KernelResult<(Arc<ArrowField>, Arc<dyn ArrowArray>)> {
+    let Some(struct_array) = values.as_struct_opt() else {
+        return Err(KernelError::internal_error(
             "Nested reorder of list should have had struct child.",
-        ))
-    }
+        ));
+    };
+    let values = Arc::new(reorder_struct_array(
+        struct_array.clone(),
+        children,
+        None, /* Nested structures don't need row indexes since metadata columns can't be nested */
+        None, // No file_location passed since metadata columns can't be nested
+    )?);
+    let new_values_field = Arc::new(
+        values_field
+            .as_ref()
+            .clone()
+            .with_data_type(values.data_type().clone()),
+    );
+    Ok((new_values_field, values))
 }
 
 fn reorder_map(
@@ -1226,7 +1301,7 @@ fn compute_nested_null_masks(sa: StructArray, parent_nulls: Option<&NullBuffer>)
 pub(crate) fn parse_json(
     json_strings: Box<dyn EngineData>,
     schema: SchemaRef,
-) -> Result<Box<dyn EngineData>> {
+) -> KernelResult<Box<dyn EngineData>> {
     let json_strings: RecordBatch = ArrowEngineData::try_from_engine_data(json_strings)?.into();
     let result = parse_json_impl(json_strings.column(0).as_ref(), schema)?;
     Ok(Box::new(ArrowEngineData::new(result)))
@@ -1409,7 +1484,14 @@ fn safe_cast_back(decoded: RecordBatch, target: &ArrowSchemaRef) -> KernelResult
 /// [`MAP_ROOT_DEFAULT`]: crate::engine::arrow_conversion::MAP_ROOT_DEFAULT
 /// [`LIST_ARRAY_ROOT`]: crate::engine::arrow_conversion::LIST_ARRAY_ROOT
 /// [`arrow_conversion`]: crate::engine::arrow_conversion
-#[cfg(test)]
+#[cfg(any(
+    test,
+    all(
+        feature = "test-utils",
+        feature = "declarative-plans",
+        feature = "default-engine-base"
+    )
+))]
 pub(crate) fn coerce_columns_to_schema(
     columns: Vec<ArrowArrayRef>,
     target: &ArrowSchemaRef,
@@ -1498,7 +1580,7 @@ impl EncoderFactory for NullValueMapEncoderFactory {
         field: &'a ArrowFieldRef,
         array: &'a dyn ArrowArray,
         _options: &'a EncoderOptions,
-    ) -> Result<Option<NullableEncoder<'a>>, crate::arrow::error::ArrowError> {
+    ) -> KernelResult<Option<NullableEncoder<'a>>, crate::arrow::error::ArrowError> {
         // `make_encoder` needs a new `EncoderOptions` in order to set `with_explicit_nulls`. The
         // lifetime of the created encoder becomes tied to the lifetime of the `EncoderOptions`,
         // and local options would be freed here. We also can't put the options inside the
@@ -1539,8 +1621,8 @@ impl Encoder for NullMapPlaceholderEncoder {
 // TODO (zach): this should stream data to the JSON writer and output an iterator.
 #[internal_api]
 pub(crate) fn to_json_bytes(
-    data: impl Iterator<Item = Result<FilteredEngineData>> + Send,
-) -> Result<Vec<u8>> {
+    data: impl KernelResultIterator<FilteredEngineData>,
+) -> KernelResult<Vec<u8>> {
     let builder = WriterBuilder::new().with_encoder_factory(Arc::new(NullValueMapEncoderFactory));
     let mut writer = builder.build::<_, LineDelimited>(Vec::new());
     for chunk in data {
@@ -1561,7 +1643,7 @@ pub(crate) fn fixup_json_read(
     batch: RecordBatch,
     reorder_indices: &[ReorderIndex],
     file_location: &str,
-) -> Result<ArrowEngineData> {
+) -> KernelResult<ArrowEngineData> {
     let data = reorder_struct_array(batch.into(), reorder_indices, None, Some(file_location))?;
     Ok(data.into())
 }
@@ -1581,7 +1663,7 @@ pub(crate) fn fixup_json_read(
 /// - Use [`json_arrow_schema`] to strip metadata columns before passing the schema to the JSON
 ///   reader.
 #[internal_api]
-pub(crate) fn build_json_reorder_indices(schema: &StructType) -> Result<Vec<ReorderIndex>> {
+pub(crate) fn build_json_reorder_indices(schema: &StructType) -> KernelResult<Vec<ReorderIndex>> {
     // Real columns: position in reorder_indices IS the source column index (0..N in schema
     // order), and reorder_index.index carries the output position.
     let mut reorder_indices = Vec::with_capacity(schema.num_fields());
@@ -1617,7 +1699,7 @@ pub(crate) fn build_json_reorder_indices(schema: &StructType) -> Result<Vec<Reor
 /// once on the same schema and apply `reorder_struct_array` to each resulting batch to
 /// insert the synthesized metadata columns at their correct positions.
 #[internal_api]
-pub(crate) fn json_arrow_schema(schema: &StructType) -> Result<ArrowSchema> {
+pub(crate) fn json_arrow_schema(schema: &StructType) -> KernelResult<ArrowSchema> {
     let json_fields = schema.with_fields_filtered(|f| f.get_metadata_column_spec().is_none())?;
     Ok(ArrowSchema::try_from_kernel(&json_fields)?)
 }
@@ -1630,10 +1712,10 @@ mod tests {
 
     use super::*;
     use crate::arrow::array::{
-        Array, ArrayRef as ArrowArrayRef, AsArray, BooleanArray, GenericListArray, Int32Array,
-        Int32Builder, Int64Array, LargeStringArray, ListArray, MapArray, MapBuilder, MapFieldNames,
-        NullArray, OffsetSizeTrait, StringArray, StringBuilder, StringViewArray, StructArray,
-        StructBuilder,
+        Array, ArrayRef as ArrowArrayRef, AsArray, BooleanArray, GenericListArray,
+        GenericListViewArray, Int32Array, Int32Builder, Int64Array, LargeStringArray, ListArray,
+        MapArray, MapBuilder, MapFieldNames, NullArray, OffsetSizeTrait, StringArray,
+        StringBuilder, StringViewArray, StructArray, StructBuilder,
     };
     use crate::arrow::buffer::{OffsetBuffer, ScalarBuffer};
     use crate::arrow::datatypes::{
@@ -1647,8 +1729,8 @@ mod tests {
     use crate::parquet::file::metadata::ColumnChunkMetaData;
     use crate::parquet::schema::types::{SchemaDescriptor, Type};
     use crate::schema::{
-        schema, schema_ref, ArrayType, ColumnMetadataKey, DataType, MapType, MetadataColumnSpec,
-        MetadataValue, StructField, StructType,
+        ArrayType, ColumnMetadataKey, DataType, MapType, MetadataColumnSpec, MetadataValue,
+        StructField, StructType, schema, schema_ref,
     };
     use crate::table_features::ColumnMappingMode;
     use crate::unit_test_utils::assert_result_error_with_message;
@@ -2197,6 +2279,20 @@ mod tests {
         let result_shredded = get_requested_indices(&requested_schema, &shredded_parquet_schema);
         assert!(matches!(result_shredded,
             Err(e) if e.to_string().contains("The default engine does not support shredded reads")));
+        #[cfg(feature = "udt-in-dev")]
+        {
+            // A UDT backed by an unshredded variant follows the same physical-read validation.
+            let udt = crate::schema::UserDefinedType::try_new(
+                DataType::unshredded_variant(),
+                Default::default(),
+            )
+            .unwrap();
+            let requested_schema = schema_ref! { nullable "v": (udt) };
+            assert!(get_requested_indices(&requested_schema, &unshredded_parquet_schema).is_ok());
+            let result = get_requested_indices(&requested_schema, &shredded_parquet_schema);
+            assert!(matches!(result,
+                Err(e) if e.to_string().contains("The default engine does not support shredded reads")));
+        }
         let result_incorrect = get_requested_indices(&requested_schema, &incorrect_parquet_schema);
         assert!(matches!(result_incorrect,
             Err(e) if e.to_string().contains("The default engine does not support shredded reads")));
@@ -2335,15 +2431,17 @@ mod tests {
             .into();
 
             // The key and value may have field ids not present in the delta schema
-            let parquet_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new_map(
-                parquet_name(0, mode),
-                "entries",
-                ArrowField::new("i", ArrowDataType::Int32, false),
-                ArrowField::new("s", ArrowDataType::Utf8, false),
-                false,
-                false,
-            )
-            .with_metadata(arrow_fid(1))]));
+            let parquet_schema = Arc::new(ArrowSchema::new(vec![
+                ArrowField::new_map(
+                    parquet_name(0, mode),
+                    "entries",
+                    ArrowField::new("i", ArrowDataType::Int32, false),
+                    ArrowField::new("s", ArrowDataType::Utf8, false),
+                    false,
+                    false,
+                )
+                .with_metadata(arrow_fid(1)),
+            ]));
             let (mask_indices, reorder_indices) =
                 get_requested_indices(&requested_schema, &parquet_schema).unwrap();
             let expect_mask = vec![0, 1];
@@ -3695,6 +3793,132 @@ mod tests {
         assert_eq!(present.as_struct().column_names(), vec!["c", "b"]);
     }
 
+    // Reorder must preserve the physical ListView/LargeListView wrapper and the element field's
+    // declared nullability and metadata.
+    #[rstest]
+    #[case::list_view(false)]
+    #[case::large_list_view(true)]
+    fn reorder_list_view_of_struct(#[case] large_list_view: bool) {
+        if large_list_view {
+            reorder_list_view_of_struct_case::<i64>();
+        } else {
+            reorder_list_view_of_struct_case::<i32>();
+        }
+    }
+
+    fn reorder_list_view_of_struct_case<O: OffsetSizeTrait>() {
+        let boolean = Arc::new(BooleanArray::from(vec![false, true, false])) as ArrowArrayRef;
+        let int = Arc::new(Int32Array::from(vec![42, 28, 19])) as ArrowArrayRef;
+        let values = StructArray::from(vec![
+            (
+                Arc::new(ArrowField::new("b", ArrowDataType::Boolean, false)),
+                boolean,
+            ),
+            (
+                Arc::new(ArrowField::new("c", ArrowDataType::Int32, false)),
+                int,
+            ),
+        ]);
+        // Deliberately non-contiguous, descending offsets: row 0 starts at value 1, row 1 is a
+        // null entry, row 2 reads value 0. Reordering must leave both buffers untouched.
+        let offsets = ScalarBuffer::<O>::from(vec![
+            O::from_usize(1).unwrap(),
+            O::from_usize(0).unwrap(),
+            O::from_usize(0).unwrap(),
+        ]);
+        let sizes = ScalarBuffer::<O>::from(vec![
+            O::from_usize(2).unwrap(),
+            O::from_usize(0).unwrap(),
+            O::from_usize(1).unwrap(),
+        ]);
+        let nulls = NullBuffer::from(vec![true, false, true]);
+        // The element field is declared nullable and carries metadata, but no element is null.
+        // Reorder must preserve both rather than inferring them from the data.
+        let item_field = Arc::new(
+            ArrowField::new("item", values.data_type().clone(), true).with_metadata(HashMap::from(
+                [("custom".to_string(), "metadata".to_string())],
+            )),
+        );
+        let list_view = Arc::new(
+            GenericListViewArray::<O>::try_new(
+                item_field,
+                offsets.clone(),
+                sizes.clone(),
+                Arc::new(values),
+                Some(nulls),
+            )
+            .unwrap(),
+        );
+        let list_field = Arc::new(ArrowField::new("list", list_view.data_type().clone(), true));
+        let struct_array = StructArray::from(vec![(list_field, list_view as ArrowArrayRef)]);
+        let reorder = vec![ReorderIndex::nested(
+            0,
+            vec![ReorderIndex::identity(1), ReorderIndex::identity(0)],
+        )];
+
+        let ordered = reorder_struct_array(struct_array, &reorder, None, None).unwrap();
+
+        assert!(ordered.fields()[0].is_nullable());
+        let ordered_list_view = ordered.column(0).as_list_view::<O>();
+        assert_eq!(ordered_list_view.offsets(), &offsets);
+        assert_eq!(ordered_list_view.sizes(), &sizes);
+        assert!(!ordered_list_view.is_null(0));
+        assert!(ordered_list_view.is_null(1));
+        assert!(!ordered_list_view.is_null(2));
+        assert_eq!(
+            matches!(
+                ordered.fields()[0].data_type(),
+                ArrowDataType::LargeListView(_)
+            ),
+            O::IS_LARGE
+        );
+        let element_field = match ordered.fields()[0].data_type() {
+            ArrowDataType::ListView(f) | ArrowDataType::LargeListView(f) => f,
+            other => panic!("expected a list view field, got {other:?}"),
+        };
+        assert_eq!(element_field.name(), "item");
+        assert!(element_field.is_nullable());
+        assert_eq!(
+            element_field.metadata().get("custom").map(String::as_str),
+            Some("metadata")
+        );
+
+        let first = ordered_list_view.value(0).as_struct().clone();
+        assert_eq!(first.column_names(), vec!["c", "b"]);
+        let c = first.column(0).as_primitive::<Int32Type>();
+        assert_eq!(c.len(), 2);
+        assert_eq!((c.value(0), c.value(1)), (28, 19));
+        let b = first.column(1).as_boolean();
+        assert_eq!(b.len(), 2);
+        assert_eq!((b.value(0), b.value(1)), (true, false));
+
+        let third = ordered_list_view.value(2).as_struct().clone();
+        let c = third.column(0).as_primitive::<Int32Type>();
+        assert_eq!(c.len(), 1);
+        assert_eq!(c.value(0), 42);
+    }
+
+    #[test]
+    fn reorder_list_view_rejects_non_struct_values() {
+        let values = Arc::new(Int32Array::from(vec![10, 20, 30])) as ArrowArrayRef;
+        let offsets = ScalarBuffer::<i32>::from(vec![0, 1, 2]);
+        let sizes = ScalarBuffer::<i32>::from(vec![1, 1, 1]);
+        let item_field = Arc::new(ArrowField::new("item", ArrowDataType::Int32, false));
+        let list_view = Arc::new(
+            GenericListViewArray::<i32>::try_new(item_field, offsets, sizes, values, None).unwrap(),
+        );
+        let list_field = Arc::new(ArrowField::new("list", list_view.data_type().clone(), true));
+        let struct_array = StructArray::from(vec![(list_field, list_view as ArrowArrayRef)]);
+        let reorder = vec![ReorderIndex::nested(
+            0,
+            vec![ReorderIndex::cast(0, ArrowDataType::Int64)],
+        )];
+
+        let err = reorder_struct_array(struct_array, &reorder, None, None)
+            .expect_err("non-struct list view values should be rejected");
+        assert!(err.to_string().contains("should have had struct child"));
+    }
+
     // boy howdy this is more complicated than expected
     fn build_arrow_map() -> MapArray {
         let key_struct_builder = StructBuilder::from_fields(
@@ -3832,7 +4056,7 @@ mod tests {
     }
 
     #[test]
-    fn test_write_json() -> Result<()> {
+    fn test_write_json() -> KernelResult<()> {
         let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
             "string",
             ArrowDataType::Utf8,
@@ -3853,7 +4077,7 @@ mod tests {
     }
 
     #[test]
-    fn test_to_json_bytes_filters_data() -> Result<()> {
+    fn test_to_json_bytes_filters_data() -> KernelResult<()> {
         // Create test data with 4 rows
         let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
             "value",

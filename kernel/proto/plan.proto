@@ -72,6 +72,13 @@ message FilterNode {
 
 message UnionAllNode {}
 
+message WriteJsonNode {
+  string file_path = 1;
+  delta.kernel.schema.StructType schema = 2;
+  bool overwrite = 3;
+  bool ordered = 4;
+}
+
 enum FileType {
   FILE_TYPE_UNSPECIFIED = 0;
   FILE_TYPE_PARQUET = 1;
@@ -140,6 +147,12 @@ message SemiJoinNode {
   repeated delta.kernel.expressions.ColumnName build_keys = 3;
 }
 
+message PrefixSumNode {
+  delta.kernel.expressions.ColumnName input = 1;
+  string output = 2;
+  delta.kernel.schema.StructType schema = 3;
+}
+
 // ============================================================================
 // Operator
 // ============================================================================
@@ -158,6 +171,9 @@ message Operator {
     DynamicScanNode dynamic_scan = 7;
     AggregateNode aggregate = 8;
     SemiJoinNode semi_join = 9;
+    PrefixSumNode prefix_sum = 12;
+    // Sinks (write nodes)
+    WriteJsonNode write_json = 11;
   }
 }
 

@@ -9,7 +9,7 @@ use crate::snapshot::SnapshotRef;
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::TableFeature;
 use crate::utils::require;
-use crate::{version_as_i64, Engine, KernelResult, Result, Version};
+use crate::{Engine, KernelResult, Version, version_as_i64};
 
 /// State for an in-progress manifest (content-tree) commit.
 #[internal_api]
@@ -48,10 +48,7 @@ impl ManifestCommitState {
         // TODO(#2866): tighten this check (checkpoints that spill to sidecars, log compaction, and
         // the precise "since the last manifest commit" semantics) once the manifest-commit write
         // path lands.
-        if let Some(checkpoint) = read_snapshot
-            .log_segment()
-            .find_last_checkpoint_action(engine)?
-        {
+        if let Some(checkpoint) = read_snapshot.latest_checkpoint_action(engine)? {
             let snapshot_version = version_as_i64(read_snapshot.version())?;
             require!(
                 checkpoint.version() >= snapshot_version,
@@ -83,7 +80,7 @@ impl ManifestCommitState {
 
     /// Folds a finished leaf's [`LeafNodeWriterResult`] into this commit.
     #[internal_api]
-    pub(crate) fn add_leaf(&mut self, _result: LeafNodeWriterResult) -> Result<()> {
+    pub(crate) fn add_leaf(&mut self, _result: LeafNodeWriterResult) -> KernelResult<()> {
         // TODO(#3352): fold the finished leaf's result into the commit.
         Err(KernelError::unsupported(
             "manifest commit add_leaf is not yet supported",

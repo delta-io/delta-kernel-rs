@@ -19,13 +19,13 @@ pub use self::schema::{SchemaDepthChecker, SchemaTransform};
 /// ```rust,no_run
 /// # use delta_kernel::schema::StructField;
 /// # use delta_kernel::transforms::{transform_output_type, SchemaTransform};
-/// # use delta_kernel::Result;
+/// # use delta_kernel::KernelResult;
 /// struct Validate;
 ///
 /// impl<'a> SchemaTransform<'a> for Validate {
-///     transform_output_type!(|'a, T| Result<()>);
+///     transform_output_type!(|'a, T| KernelResult<()>);
 ///
-///     fn transform_struct_field(&mut self, _field: &'a StructField) -> Result<()> {
+///     fn transform_struct_field(&mut self, _field: &'a StructField) -> KernelResult<()> {
 ///         todo!()
 ///     }
 /// }

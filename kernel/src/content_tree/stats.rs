@@ -16,24 +16,23 @@ use tracing::warn;
 
 use crate::actions::{MAX_VALUES, MIN_VALUES, NULL_COUNT};
 use crate::content_tree::{
-    AVG_VALUE_SIZE_IN_BYTES, LOWER_BOUND, NAN_VALUE_COUNT, NULL_VALUE_COUNT, TIGHT_BOUNDS,
-    UPPER_BOUND, VALUE_COUNT,
+    LOWER_BOUND, NAN_VALUE_COUNT, NULL_VALUE_COUNT, TOTAL_BYTES, UPPER_BOUND, VALUE_COUNT,
 };
 use crate::expressions::ColumnName;
 use crate::schema::{
     ColumnMetadataKey, DataType, MetadataValue, PrimitiveType, StructField, StructType,
 };
-use crate::transforms::{transform_output_type, SchemaTransform};
+use crate::transforms::{SchemaTransform, transform_output_type};
 use crate::{KernelError, KernelResult};
 
-/// Field ID offsets for stats fields within a column's stats struct.
+/// Field ID offsets for stats fields within a column's stats struct, per the Iceberg v4 spec's
+/// Field Statistics table.
 const STATS_OFFSET_LOWER_BOUND: i32 = 1;
 const STATS_OFFSET_UPPER_BOUND: i32 = 2;
-const STATS_OFFSET_TIGHT_BOUNDS: i32 = 3;
-const STATS_OFFSET_VALUE_COUNT: i32 = 4;
-const STATS_OFFSET_NULL_VALUE_COUNT: i32 = 5;
-const STATS_OFFSET_NAN_VALUE_COUNT: i32 = 6;
-const STATS_OFFSET_AVG_VALUE_SIZE_IN_BYTES: i32 = 7;
+const STATS_OFFSET_VALUE_COUNT: i32 = 3;
+const STATS_OFFSET_NULL_VALUE_COUNT: i32 = 4;
+const STATS_OFFSET_NAN_VALUE_COUNT: i32 = 5;
+const STATS_OFFSET_TOTAL_BYTES: i32 = 6;
 
 /// Number of supported stats per column (each column gets a range of 200 field IDs).
 /// This value is the upper bound on the number of "statistic types", e.g. min/max.
@@ -173,11 +172,11 @@ impl StatCategories {
 /// Builds a single column's stats struct, with each stat sub-field's ID an offset from
 /// `base_field_id`:
 /// - offset 1/2: `lower_bound` / `upper_bound` (typed as `bounds_type`)
-/// - offset 3: `tight_bounds` (boolean) - excluded for variants
-/// - offset 4: `value_count` (long)
-/// - offset 5: `null_value_count` (long) - emitted regardless of the column's nullability
-/// - offset 6: `nan_value_count` (long) - only for float/double `bounds_type`
-/// - offset 7: `avg_value_size_in_bytes` (int) - for string/binary `bounds_type`, or any variant
+/// - offset 3: `value_count` (long)
+/// - offset 4: `null_value_count` (long) - emitted regardless of the column's nullability
+/// - offset 5: `nan_value_count` (long) - only for float/double `bounds_type`
+/// - offset 6: `total_bytes` (long) - total uncompressed size of the column's values; for
+///   string/binary `bounds_type`, or any variant
 ///
 /// `bounds_type` is the type the bounds are recorded at: the column's own type for primitives, or
 /// an unshredded variant type for variant columns.
@@ -186,7 +185,7 @@ impl StatCategories {
 /// (the unprojected path) keeps every type-eligible sub-field. When `Some`, a sub-field is kept
 /// only when a category backing it is present: `lower_bound`<-`minValues`,
 /// `upper_bound`<-`maxValues`, `value_count`/`null_value_count`<-`nullCount`,
-/// `tight_bounds`/`nan_value_count`<-either bound category. `avg_value_size_in_bytes` has no
+/// `nan_value_count`<-either bound category. `total_bytes` has no
 /// backing category and is dropped whenever projecting -- so `null_value_count`, though independent
 /// of nullability, is still dropped when the leaf is absent from `nullCount`.
 fn build_stats_struct(
@@ -194,7 +193,6 @@ fn build_stats_struct(
     bounds_type: &DataType,
     categories: Option<StatCategories>,
 ) -> StructType {
-    let is_variant = matches!(bounds_type, DataType::Variant(_));
     let (has_nan_count, has_size_stats) = match bounds_type {
         DataType::Primitive(ptype) => (
             matches!(ptype, PrimitiveType::Float | PrimitiveType::Double),
@@ -229,12 +227,6 @@ fn build_stats_struct(
             has_max,
         ),
         (
-            TIGHT_BOUNDS,
-            DataType::BOOLEAN,
-            STATS_OFFSET_TIGHT_BOUNDS,
-            !is_variant && has_bounds,
-        ),
-        (
             VALUE_COUNT,
             DataType::LONG,
             STATS_OFFSET_VALUE_COUNT,
@@ -253,9 +245,9 @@ fn build_stats_struct(
             has_nan_count && has_bounds,
         ),
         (
-            AVG_VALUE_SIZE_IN_BYTES,
-            DataType::INTEGER,
-            STATS_OFFSET_AVG_VALUE_SIZE_IN_BYTES,
+            TOTAL_BYTES,
+            DataType::LONG,
+            STATS_OFFSET_TOTAL_BYTES,
             has_size_stats && !projecting,
         ),
     ];
@@ -327,7 +319,7 @@ fn leaf_stats_field(
         DataType::Variant(_) => {
             build_stats_struct(base_stats_id, &DataType::unshredded_variant(), categories)
         }
-        // Array/map columns carry no leaf stats.
+        // Array/map/file columns carry no leaf stats.
         _ => return Ok(None),
     };
 
@@ -404,9 +396,9 @@ impl<'a> CategoryScopes<'a> {
                 SubSchema::Struct(s) => Some(s),
                 SubSchema::Mismatch => {
                     return Err(KernelError::generic(format!(
-                    "Delta stats schema invariant violation: category '{category}' is a scalar, \
+                        "Delta stats schema invariant violation: category '{category}' is a scalar, \
                          but it must be a struct mirroring the table"
-                )))
+                    )));
                 }
             };
         }
@@ -435,7 +427,7 @@ impl<'a> CategoryScopes<'a> {
                              '{name}' as a scalar, but the table nests a struct there",
                             ColumnName::new(path),
                             STAT_CATEGORIES[i],
-                        )))
+                        )));
                     }
                 },
             };
@@ -597,7 +589,7 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
-    use crate::scan::data_skipping::stats_schema::{expected_stats_schema, StatsConfig};
+    use crate::scan::data_skipping::stats_schema::{StatsConfig, expected_stats_schema};
     use crate::schema::{ArrayType, MapType};
     #[cfg(feature = "geo-type-in-dev")]
     use crate::schema::{EdgeInterpolationAlgorithm, GeographyType, GeometryType};
@@ -614,6 +606,54 @@ mod tests {
     #[case(ROW_ID_FIELD_ID, 9_200)]
     fn valid_mapping_roundtrips(#[case] field_id: i32, #[case] stats_base: i32) {
         assert_eq!(field_id_to_statistics_base(field_id), Some(stats_base));
+    }
+
+    /// Pins the stats sub-field IDs to the Iceberg v4 spec's "Content Stats in Manifests" example
+    /// (a required int `id` with field ID 2 and an optional string `data` with field ID 3), with
+    /// literal IDs so that a change to the offset constants fails loudly. The double and variant
+    /// cases go beyond the example to pin `nan_value_count` (offset 5) and the variant layout.
+    #[rstest]
+    #[case::required_int(DataType::INTEGER, false, 2, &[
+        (LOWER_BOUND, 10_401),
+        (UPPER_BOUND, 10_402),
+        (VALUE_COUNT, 10_403),
+        (NULL_VALUE_COUNT, 10_404),
+    ])]
+    #[case::optional_string(DataType::STRING, true, 3, &[
+        (LOWER_BOUND, 10_601),
+        (UPPER_BOUND, 10_602),
+        (VALUE_COUNT, 10_603),
+        (NULL_VALUE_COUNT, 10_604),
+        (TOTAL_BYTES, 10_606),
+    ])]
+    #[case::optional_double(DataType::DOUBLE, true, 3, &[
+        (LOWER_BOUND, 10_601),
+        (UPPER_BOUND, 10_602),
+        (VALUE_COUNT, 10_603),
+        (NULL_VALUE_COUNT, 10_604),
+        (NAN_VALUE_COUNT, 10_605),
+    ])]
+    #[case::optional_variant(DataType::unshredded_variant(), true, 3, &[
+        (LOWER_BOUND, 10_601),
+        (UPPER_BOUND, 10_602),
+        (VALUE_COUNT, 10_603),
+        (NULL_VALUE_COUNT, 10_604),
+        (TOTAL_BYTES, 10_606),
+    ])]
+    fn stats_schema_matches_spec_field_ids(
+        #[case] data_type: DataType,
+        #[case] nullable: bool,
+        #[case] field_id: i32,
+        #[case] expected: &[(&str, i32)],
+    ) {
+        let field = field_with_id("c", data_type, nullable, field_id);
+        let stats = stats_schema(&StructType::new_unchecked([field])).unwrap();
+        let stats_struct = stats_struct_for_name("c", &stats);
+        let actual: Vec<_> = stats_struct
+            .fields()
+            .map(|f| (f.name().as_str(), get_field_id(f).unwrap()))
+            .collect();
+        assert_eq!(actual, expected);
     }
 
     /// Field IDs that `field_id_to_statistics_base` must reject.
@@ -638,8 +678,7 @@ mod tests {
     }
 
     /// Asserts every stats sub-field of `stats_struct` carries the expected offset from `base_id`.
-    /// `null_value_count` is always present. Variants omit `tight_bounds` and always carry the size
-    /// stat.
+    /// `null_value_count` is always present. Variants always carry the size stat.
     fn assert_stats_field_ids(stats_struct: &StructType, base_id: i32, field: &StructField) {
         let is_variant = matches!(field.data_type(), DataType::Variant(_));
         let assert_offset = |name: &str, offset: i32| {
@@ -657,33 +696,27 @@ mod tests {
             || field.data_type() == &DataType::STRING
             || field.data_type() == &DataType::BINARY
         {
-            assert_offset(
-                AVG_VALUE_SIZE_IN_BYTES,
-                STATS_OFFSET_AVG_VALUE_SIZE_IN_BYTES,
-            );
+            assert_offset(TOTAL_BYTES, STATS_OFFSET_TOTAL_BYTES);
         }
         assert_offset(LOWER_BOUND, STATS_OFFSET_LOWER_BOUND);
         assert_offset(UPPER_BOUND, STATS_OFFSET_UPPER_BOUND);
-        if !is_variant {
-            assert_offset(TIGHT_BOUNDS, STATS_OFFSET_TIGHT_BOUNDS);
-        }
     }
 
     // `null_value_count` is always present, so counts include it regardless of nullability.
     #[rstest]
-    #[case(DataType::INTEGER, false, 1, 10_200, 5)] // fixed-length
-    #[case(DataType::STRING, true, 2, 10_400, 6)] // size stats
-    #[case(DataType::DOUBLE, true, 5, 11_000, 6)] // nan count
-    #[case(DataType::FLOAT, false, 100, 30_000, 6)] // nan count
-    #[case(DataType::LONG, true, 42, 18_400, 5)] // fixed-length
-    #[case(DataType::BINARY, true, 3, 10_600, 6)] // size stats
-    #[case(DataType::BINARY, false, 4, 10_800, 6)] // size stats
+    #[case(DataType::INTEGER, false, 1, 10_200, 4)] // fixed-length
+    #[case(DataType::STRING, true, 2, 10_400, 5)] // size stats
+    #[case(DataType::DOUBLE, true, 5, 11_000, 5)] // nan count
+    #[case(DataType::FLOAT, false, 100, 30_000, 5)] // nan count
+    #[case(DataType::LONG, true, 42, 18_400, 4)] // fixed-length
+    #[case(DataType::BINARY, true, 3, 10_600, 5)] // size stats
+    #[case(DataType::BINARY, false, 4, 10_800, 5)] // size stats
     #[case(
         DataType::INTEGER,
         false,
         MAX_DATA_FIELD_ID,
         MAX_DATA_STATS_FIELD_ID,
-        5
+        4
     )] // top of range
     fn stats_schema_primitive_field(
         #[case] data_type: DataType,
@@ -766,15 +799,15 @@ mod tests {
         assert_eq!(stats.fields().count(), 2);
         assert!(stats.field("a").is_none());
 
-        // `b` is a not-null int; it still carries a null_value_count (always present), so 5
-        // sub-fields (lower, upper, tight, value, null).
+        // `b` is a not-null int; it still carries a null_value_count (always present), so 4
+        // sub-fields (lower, upper, value, null).
         let b_stats = stats_struct_for_name("a.b", &stats);
-        assert_eq!(b_stats.fields().count(), 5);
+        assert_eq!(b_stats.fields().count(), 4);
         assert_eq!(get_field_id(stats.field("a.b").unwrap()), Some(10_400));
         assert_stats_field_ids(&b_stats, 10_400, &field_b);
 
         let c_stats = stats_struct_for_name("a.c", &stats);
-        assert_eq!(c_stats.fields().count(), 6); // null + nan count
+        assert_eq!(c_stats.fields().count(), 5); // null + nan count
         assert_eq!(get_field_id(stats.field("a.c").unwrap()), Some(10_600));
         assert_stats_field_ids(&c_stats, 10_600, &field_c);
     }
@@ -846,8 +879,8 @@ mod tests {
         assert!(stats.field("a.b").is_none());
 
         let c_stats = stats_struct_for_name("a.b.c", &stats);
-        // Not-null int; null_value_count is always present, so 5 sub-fields.
-        assert_eq!(c_stats.fields().count(), 5);
+        // Not-null int; null_value_count is always present, so 4 sub-fields.
+        assert_eq!(c_stats.fields().count(), 4);
         assert!(c_stats.field(VALUE_COUNT).is_some());
         assert!(c_stats.field(LOWER_BOUND).is_some());
         assert!(c_stats.field(NULL_VALUE_COUNT).is_some());
@@ -855,9 +888,8 @@ mod tests {
     }
 
     /// Both unshredded and shredded variant inputs produce the same ordinary stats struct: the
-    /// bounds are recorded as unshredded variants, `tight_bounds` is excluded, and the size stat is
-    /// present. The physical inner layout (e.g. a shredded `typed_value`) does not affect the
-    /// generated stats.
+    /// bounds are recorded as unshredded variants and the size stat is present. The physical inner
+    /// layout (e.g. a shredded `typed_value`) does not affect the generated stats.
     #[rstest]
     #[case::unshredded(DataType::unshredded_variant())]
     #[case::shredded(
@@ -888,9 +920,8 @@ mod tests {
             v_stats.field(UPPER_BOUND).unwrap().data_type(),
             &DataType::unshredded_variant()
         );
-        // Variants exclude tight_bounds and always include the size stat.
-        assert!(v_stats.field(TIGHT_BOUNDS).is_none());
-        assert!(v_stats.field(AVG_VALUE_SIZE_IN_BYTES).is_some());
+        // Variants always include the size stat.
+        assert!(v_stats.field(TOTAL_BYTES).is_some());
         assert_stats_field_ids(&v_stats, 10_600, &field);
     }
 
@@ -1279,7 +1310,7 @@ mod tests {
 
         let projected = projected_stats_schema(&table, &delta).expect("projected should succeed");
         // Every leaf keeps its full category-backed set. This differs from the unprojected
-        // `stats_schema` only for the variant, whose `avg_value_size_in_bytes` (no backing Delta
+        // `stats_schema` only for the variant, whose `total_bytes` (no backing Delta
         // category) is dropped under the projection.
         let expected = StructType::new_unchecked([
             expected_leaf("id", DataType::LONG, 0, &STAT_CATEGORIES),
@@ -1327,10 +1358,9 @@ mod tests {
     /// projected tests (which build expectations via `build_stats_struct`), the expected sub-field
     /// names here are spelled out per case, so a wrong condition in `build_stats_struct` is caught.
     /// The leaf type varies to exercise the type-specific conditions (`nan_value_count`,
-    /// `avg_value_size_in_bytes`). Column `c` is always field id 1.
+    /// `total_bytes`). Column `c` is always field id 1.
     #[rstest]
-    // Int: lower<-minValues, upper<-maxValues, tight_bounds<-either bound, value/null_value_count
-    // <-nullCount.
+    // Int: lower<-minValues, upper<-maxValues, value/null_value_count<-nullCount.
     #[case::int_null_count(
         DataType::INTEGER,
         delta_stats(Some(stat_cols(["c"])), None, None),
@@ -1339,28 +1369,28 @@ mod tests {
     #[case::int_min(
         DataType::INTEGER,
         delta_stats(None, Some(stat_cols(["c"])), None),
-        &[LOWER_BOUND, TIGHT_BOUNDS],
+        &[LOWER_BOUND],
     )]
     #[case::int_max(
         DataType::INTEGER,
         delta_stats(None, None, Some(stat_cols(["c"]))),
-        &[UPPER_BOUND, TIGHT_BOUNDS],
+        &[UPPER_BOUND],
     )]
     #[case::int_min_and_max(
         DataType::INTEGER,
         delta_stats(None, Some(stat_cols(["c"])), Some(stat_cols(["c"]))),
-        &[LOWER_BOUND, UPPER_BOUND, TIGHT_BOUNDS],
+        &[LOWER_BOUND, UPPER_BOUND],
     )]
     #[case::int_all_categories(
         DataType::INTEGER,
         delta_stats(Some(stat_cols(["c"])), Some(stat_cols(["c"])), Some(stat_cols(["c"]))),
-        &[LOWER_BOUND, UPPER_BOUND, TIGHT_BOUNDS, VALUE_COUNT, NULL_VALUE_COUNT],
+        &[LOWER_BOUND, UPPER_BOUND, VALUE_COUNT, NULL_VALUE_COUNT],
     )]
     // Double: nan_value_count rides along with the bounds ...
     #[case::double_min_keeps_nan(
         DataType::DOUBLE,
         delta_stats(None, Some(stat_cols(["c"])), None),
-        &[LOWER_BOUND, TIGHT_BOUNDS, NAN_VALUE_COUNT],
+        &[LOWER_BOUND, NAN_VALUE_COUNT],
     )]
     // ... but is pruned when the leaf carries no bounds (nullCount only).
     #[case::double_null_count_drops_nan(
@@ -1368,12 +1398,12 @@ mod tests {
         delta_stats(Some(stat_cols(["c"])), None, None),
         &[VALUE_COUNT, NULL_VALUE_COUNT],
     )]
-    // String/variant: avg_value_size_in_bytes has no backing category, so it is dropped under the
+    // String/variant: total_bytes has no backing category, so it is dropped under the
     // projection even when the leaf is in every category.
-    #[case::string_all_drops_avg(
+    #[case::string_all_drops_total_bytes(
         DataType::STRING,
         delta_stats(Some(stat_cols(["c"])), Some(stat_cols(["c"])), Some(stat_cols(["c"]))),
-        &[LOWER_BOUND, UPPER_BOUND, TIGHT_BOUNDS, VALUE_COUNT, NULL_VALUE_COUNT],
+        &[LOWER_BOUND, UPPER_BOUND, VALUE_COUNT, NULL_VALUE_COUNT],
     )]
     #[case::variant_null_count_drops_avg(
         DataType::unshredded_variant(),
@@ -1467,7 +1497,7 @@ mod tests {
 
     /// A variant survives the projection exactly when present in some category, like any other
     /// leaf. When present only in `nullCount` (its usual shape) it keeps just the count
-    /// sub-fields -- its bounds and `avg_value_size_in_bytes` have no backing category and are
+    /// sub-fields -- its bounds and `total_bytes` have no backing category and are
     /// pruned.
     #[rstest]
     #[case::present_in_null_count(
@@ -1666,10 +1696,12 @@ mod tests {
         )]);
         // The unprojected path always emits the reserved-metadata leaf, regardless of the
         // projection.
-        assert!(stats_schema(&table)
-            .expect("stats_schema should succeed")
-            .field("_row_id")
-            .is_some());
+        assert!(
+            stats_schema(&table)
+                .expect("stats_schema should succeed")
+                .field("_row_id")
+                .is_some()
+        );
         let projected = projected_stats_schema(&table, &delta).expect("should succeed");
         assert_eq!(projected, expected);
     }

@@ -5,19 +5,29 @@ use std::convert::Infallible;
 use std::num::ParseIntError;
 use std::str::Utf8Error;
 
+use crate::Version;
 #[cfg(feature = "default-engine-base")]
 use crate::arrow::error::ArrowError;
 #[cfg(feature = "default-engine-base")]
 use crate::object_store;
 use crate::schema::{DataType, StructType};
 use crate::table_properties::ParseIntervalError;
-use crate::Version;
+
+mod delta_error;
+mod delta_error_condition;
+
+pub use delta_error::{DeltaError, DeltaErrorParameter};
+pub use delta_error_condition::DeltaErrorCondition;
 
 /// An error returned by a Delta Kernel operation.
 #[derive(Debug, thiserror::Error)]
-// TODO(#2630): Remove non_exhaustive once Delta and Engine variants are introduced.
+// TODO(#2630): Remove non_exhaustive once the Engine variant is introduced.
 #[non_exhaustive]
 pub enum Error {
+    /// A stable, user-facing Delta failure.
+    #[error(transparent)]
+    Delta(#[from] DeltaError),
+
     /// A failure represented by a kernel implementation error.
     #[error(transparent)]
     Kernel(KernelError),
@@ -93,27 +103,23 @@ pub(crate) fn add_scalar_path_context(
     }
 }
 
-/// A [`std::result::Result`] that has the kernel [`KernelError`] as the error variant
-pub type Result<T, E = KernelError> = std::result::Result<T, E>;
+/// A result whose error is the top-level [`Error`].
+// Note: `delta_kernel::Result` is currently unused as part of the error migration tracked in:
+// https://github.com/delta-io/delta-kernel-rs/issues/3421.
+// First usages will come when the first `KernelError` is migrated to a `DeltaError`.
+pub type Result<T> = std::result::Result<T, Error>;
 
-/// A result whose error is a [`KernelError`].
-pub type KernelResult<T> = std::result::Result<T, KernelError>;
+/// A result whose error defaults to [`KernelError`].
+pub type KernelResult<T, E = KernelError> = std::result::Result<T, E>;
 
-/// A boxed, `Send` iterator of [`KernelResult<T>`] items.
-pub type KernelResultIterator<'a, T> = Box<dyn Iterator<Item = KernelResult<T>> + Send + 'a>;
-
-/// A [`KernelResultIterator`] that does not borrow data.
-pub type KernelResultIteratorStatic<T> = KernelResultIterator<'static, T>;
-
-/// A boxed, `Send` iterator of [`Result<T>`] items.
+/// A `Send` iterator of [`KernelResult<T>`] items.
 ///
-/// Convenience alias for the common pattern of returning a streaming, fallible iterator from
-/// kernel APIs.
-pub type ResultIterator<'a, T> = Box<dyn Iterator<Item = Result<T>> + Send + 'a>;
+/// Use `impl KernelResultIterator<T>` for unboxed streams. At `dyn` and stored-iterator
+/// boundaries, erase with `Box<dyn KernelResultIterator<T>>` (`'static`) or
+/// `Box<dyn KernelResultIterator<T> + '_>` (borrowed).
+pub trait KernelResultIterator<T>: Iterator<Item = KernelResult<T>> + Send {}
 
-/// `'static` counterpart to [`ResultIterator`] for cases where the iterator does not
-/// reference borrowed data.
-pub type ResultIteratorStatic<T> = ResultIterator<'static, T>;
+impl<T, I> KernelResultIterator<T> for I where I: Iterator<Item = KernelResult<T>> + Send {}
 
 /// An error validating connector-provided state for snapshot construction.
 #[derive(Debug, thiserror::Error)]
@@ -187,9 +193,7 @@ pub enum SnapshotHintError {
     #[error("Invalid snapshot hint: snapshot history does not start at version 0")]
     MissingHistoryAnchor,
     /// The supplied CRC describes a different table version.
-    #[error(
-        "Invalid snapshot hint: CRC version {crc} does not match snapshot hint version {hint}"
-    )]
+    #[error("Invalid snapshot hint: CRC version {crc} does not match snapshot hint version {hint}")]
     CrcVersion {
         /// The version described by the CRC.
         crc: Version,
@@ -256,6 +260,10 @@ pub enum KernelError {
     /// A generic error with a message
     #[error("Generic delta kernel error: {0}")]
     Generic(String),
+
+    /// Commit range configuration or construction failed.
+    #[error("Commit range error: {0}")]
+    CommitRange(String),
 
     /// A generic error wrapping another error
     #[error("Generic error: {source}")]
@@ -421,6 +429,10 @@ pub enum KernelError {
     #[error("Invalid decimal: {0}")]
     InvalidDecimal(String),
 
+    /// Interval value cannot be represented by its declared qualifier
+    #[error("Invalid interval: {0}")]
+    InvalidInterval(String),
+
     /// Invalid CRS or other parameter for a Geometry / Geography type
     #[error("Invalid geo parameters: {0}")]
     InvalidGeoParams(String),
@@ -451,6 +463,13 @@ pub enum KernelError {
     /// The file already exists at the path, prohibiting a non-overwrite write
     #[error("File already exists: {0}")]
     FileAlreadyExists(String),
+
+    /// A Delta table was found during create-table validation.
+    ///
+    /// The payload is the caller-supplied table path, not the normalized table URL. Concurrent
+    /// create attempts that pass validation surface as a commit conflict instead of this error.
+    #[error("Table already exists at path: {0}")]
+    TableAlreadyExistsAtPath(String),
 
     /// Some functionality is currently unsupported
     #[error("Unsupported: {0}")]
@@ -495,7 +514,9 @@ pub enum KernelError {
     LogHistory(#[from] Box<crate::history_manager::error::LogHistoryError>),
 
     #[cfg(feature = "declarative-plans")]
-    #[error("Declarative plan execution yielded the incorrect type: expected PlanResult::{expected}, got PlanResult::{actual}")]
+    #[error(
+        "Declarative plan execution yielded the incorrect type: expected PlanResult::{expected}, got PlanResult::{actual}"
+    )]
     PlanResultTypeMismatch {
         expected: &'static str,
         actual: &'static str,
@@ -562,6 +583,11 @@ impl KernelError {
     }
     pub fn invalid_decimal(msg: impl ToString) -> Self {
         Self::InvalidDecimal(msg.to_string())
+    }
+    /// Creates an InvalidInterval error. The message explains why the interval value cannot be
+    /// represented by its qualifier.
+    pub fn invalid_interval(msg: impl ToString) -> Self {
+        Self::InvalidInterval(msg.to_string())
     }
     #[cfg(feature = "geo-type-in-dev")]
     pub fn invalid_geo_params(msg: impl ToString) -> Self {
@@ -699,7 +725,7 @@ impl From<object_store::Error> for KernelError {
     }
 }
 
-/// This impl is needed so the `?` operator can auto-convert `Result<T, Infallible>` to
+/// This impl is needed so the `?` operator can auto-convert `KernelResult<T, Infallible>` to
 /// `KernelResult<T>`. For example, `TryFrom` impls for infallible conversions use `Infallible` as
 /// their error type, and this allows those results to be propagated with `?` in functions
 /// returning `KernelResult`. The match is unreachable since `Infallible` has no variants.

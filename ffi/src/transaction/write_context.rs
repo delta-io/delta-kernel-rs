@@ -9,15 +9,15 @@ use delta_kernel::{KernelError, KernelResult};
 use delta_kernel_ffi_macros::handle_descriptor;
 
 use super::partition_value::{ExclusivePartitionValueMap, PartitionValueMap};
-use super::{ExclusiveCreateTransaction, ExclusiveTransaction};
+use super::{ExclusiveCreateTableTransaction, ExclusiveUpdateTableTransaction};
 use crate::delta_types::{FfiColumnName, FfiColumnNameArray, FfiStringArray};
 use crate::error::{ExternResult, IntoExternResult};
 use crate::expressions::SharedExpression;
 use crate::handle::Handle;
 use crate::{
-    kernel_bytes_slice, kernel_string_slice, AllocateBytesFn, AllocateColumnNamesFn,
-    AllocateStringFn, KernelBytesSlice, KernelStringSlice, NullableCvoid, OptionalValue,
-    SharedExternEngine, SharedSchema, TryFromStringSlice, Url,
+    AllocateBytesFn, AllocateColumnNamesFn, AllocateStringFn, KernelBytesSlice, KernelStringSlice,
+    NullableCvoid, OptionalValue, SharedExternEngine, SharedSchema, TryFromStringSlice, Url,
+    kernel_bytes_slice, kernel_string_slice,
 };
 
 /// A [`BoundWriteContext`] that provides schema and path information needed for writing data.
@@ -50,21 +50,20 @@ pub struct FfiRowTrackingMetadataColumns {
 
 /// Returns owned write state for an existing-table transaction without serializing it. Returns an
 /// error if the transaction cannot write. The state remains valid after the transaction is freed.
-/// Create-table transactions use the `create_table_get_*_write_context` functions instead.
+/// Create-table transactions use the `create_table_txn_get_*_write_context` functions instead.
 /// The transaction remains valid on success and error and must eventually be committed or freed.
 ///
 /// # Safety
 /// The transaction and engine handles are borrowed and must be valid.
-#[no_mangle]
-pub unsafe extern "C" fn transaction_write_state(
-    txn: Handle<ExclusiveTransaction>,
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn update_table_txn_write_state(
+    txn: Handle<ExclusiveUpdateTableTransaction>,
     engine: Handle<SharedExternEngine>,
 ) -> ExternResult<Handle<SharedWriteState>> {
     let txn = unsafe { txn.as_ref() };
     let engine = unsafe { engine.as_ref() };
-    txn.write_state()
-        .map(Into::into)
-        .into_extern_result(&engine)
+    let result = txn.write_state().map(Into::into);
+    unsafe { result.into_extern_result(&engine) }
 }
 
 /// Encodes write state for transport to workers running the same kernel version.
@@ -74,7 +73,7 @@ pub unsafe extern "C" fn transaction_write_state(
 ///
 /// # Safety
 /// The state and engine handles are borrowed and must be valid. The callback must be valid.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn write_state_encode(
     state: Handle<SharedWriteState>,
     allocate_fn: AllocateBytesFn,
@@ -82,10 +81,10 @@ pub unsafe extern "C" fn write_state_encode(
 ) -> ExternResult<NullableCvoid> {
     let state = unsafe { state.as_ref() };
     let engine = unsafe { engine.as_ref() };
-    state
+    let result = state
         .encode()
-        .map(|state| allocate_fn(kernel_bytes_slice!(state)))
-        .into_extern_result(&engine)
+        .map(|state| allocate_fn(kernel_bytes_slice!(state)));
+    unsafe { result.into_extern_result(&engine) }
 }
 
 /// Decodes the payload from [`write_state_encode`] into an owned write-state handle.
@@ -94,17 +93,15 @@ pub unsafe extern "C" fn write_state_encode(
 ///
 /// # Safety
 /// The encoded slice and engine handle are borrowed and must be valid for this call.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn write_state_decode(
     encoded: KernelBytesSlice,
     engine: Handle<SharedExternEngine>,
 ) -> ExternResult<Handle<SharedWriteState>> {
     let engine = unsafe { engine.as_ref() };
     let encoded = unsafe { encoded.try_as_slice() };
-    encoded
-        .and_then(WriteState::decode)
-        .map(Into::into)
-        .into_extern_result(&engine)
+    let result = encoded.and_then(WriteState::decode).map(Into::into);
+    unsafe { result.into_extern_result(&engine) }
 }
 
 /// Creates a builder for one bound write context.
@@ -114,7 +111,7 @@ pub unsafe extern "C" fn write_state_decode(
 ///
 /// # Safety
 /// The state handle is borrowed and must be valid.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn write_context_builder(
     state: Handle<SharedWriteState>,
 ) -> Handle<ExclusiveWriteContextBuilder> {
@@ -129,7 +126,7 @@ pub unsafe extern "C" fn write_context_builder(
 ///
 /// # Safety
 /// The builder and partition-value map handles must be valid and are consumed by this call.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn write_context_builder_with_partition_values(
     builder: Handle<ExclusiveWriteContextBuilder>,
     partition_values: Handle<ExclusivePartitionValueMap>,
@@ -146,7 +143,7 @@ pub unsafe extern "C" fn write_context_builder_with_partition_values(
 ///
 /// # Safety
 /// The builder and partition-value map handles must be valid and are consumed by this call.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn write_context_builder_with_physical_partition_values(
     builder: Handle<ExclusiveWriteContextBuilder>,
     partition_values: Handle<ExclusivePartitionValueMap>,
@@ -168,7 +165,7 @@ pub unsafe extern "C" fn write_context_builder_with_physical_partition_values(
 /// The builder handle is valid and consumed by this call. The engine handle and every selected
 /// string slice in `columns` must be valid for this call. Each optional value must have a valid
 /// enum tag.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn write_context_builder_with_row_tracking_columns(
     builder: Handle<ExclusiveWriteContextBuilder>,
     columns: &FfiRowTrackingMetadataColumns,
@@ -183,15 +180,15 @@ pub unsafe extern "C" fn write_context_builder_with_row_tracking_columns(
         Option::<&KernelStringSlice>::from(&columns.row_commit_version_col_name)
             .map(|name| unsafe { TryFromStringSlice::try_from_slice(name) })
             .transpose();
-    row_id_col_name
+    let result = row_id_col_name
         .and_then(|row_id_col_name| {
             Ok(RowTrackingMetadataColumns {
                 row_id_col_name,
                 row_commit_version_col_name: row_commit_version_col_name?,
             })
         })
-        .map(|columns| Box::new(builder.with_row_tracking_columns(columns)).into())
-        .into_extern_result(&engine)
+        .map(|columns| Box::new(builder.with_row_tracking_columns(columns)).into());
+    unsafe { result.into_extern_result(&engine) }
 }
 
 /// Builds and consumes a write-context builder.
@@ -204,35 +201,33 @@ pub unsafe extern "C" fn write_context_builder_with_row_tracking_columns(
 ///
 /// # Safety
 /// The builder and engine handles must be valid. The builder is consumed by this call.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn write_context_builder_build(
     builder: Handle<ExclusiveWriteContextBuilder>,
     engine: Handle<SharedExternEngine>,
 ) -> ExternResult<Handle<SharedWriteContext>> {
     let builder = unsafe { builder.into_inner() };
     let engine = unsafe { engine.as_ref() };
-    builder
-        .build()
-        .map(|context| Arc::new(context).into())
-        .into_extern_result(&engine)
+    let result = builder.build().map(|context| Arc::new(context).into());
+    unsafe { result.into_extern_result(&engine) }
 }
 
 /// Drops a write-context builder without building it.
 ///
 /// # Safety
 /// The handle must be valid and is consumed. Do not use or free it again.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn free_write_context_builder(builder: Handle<ExclusiveWriteContextBuilder>) {
-    unsafe { builder.drop_handle() };
+    unsafe { builder.drop_handle() }
 }
 
 /// Releases an owned write-state handle. Bound contexts keep their own state references.
 ///
 /// # Safety
 /// The handle must be valid and is consumed. Do not use or free it again.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn free_write_state(state: Handle<SharedWriteState>) {
-    unsafe { state.drop_handle() };
+    unsafe { state.drop_handle() }
 }
 
 /// Passes the physical statistics column paths to `allocate_fn` as one borrowed typed array.
@@ -242,7 +237,7 @@ pub unsafe extern "C" fn free_write_state(state: Handle<SharedWriteState>) {
 ///
 /// # Safety
 /// `state` is borrowed and must be valid. `allocate_fn` must be valid.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn get_write_state_stats_columns(
     state: Handle<SharedWriteState>,
     allocate_fn: AllocateColumnNamesFn,
@@ -270,44 +265,46 @@ pub unsafe extern "C" fn get_write_state_stats_columns(
 /// Gets the write context from a transaction for an unpartitioned table. The write context
 /// provides schema and path information needed for writing data.
 ///
-/// For partitioned tables, use [`get_partitioned_write_context`] instead. Returns an error if the
-/// table is partitioned.
+/// For partitioned tables, use [`update_table_txn_get_partitioned_write_context`] instead. Returns
+/// an error if the table is partitioned.
 ///
 /// # Safety
 ///
-/// Caller is responsible for passing a [valid][Handle#Validity] transaction handle and engine.
-#[no_mangle]
-pub unsafe extern "C" fn get_unpartitioned_write_context(
-    txn: Handle<ExclusiveTransaction>,
+/// `txn` and `engine` must be [valid][Handle#Validity] handles. Both are borrowed for this call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn update_table_txn_get_unpartitioned_write_context(
+    txn: Handle<ExclusiveUpdateTableTransaction>,
     engine: Handle<SharedExternEngine>,
 ) -> ExternResult<Handle<SharedWriteContext>> {
     let txn = unsafe { txn.as_ref() };
     let engine = unsafe { engine.as_ref() };
-    txn.write_state()
+    let result = txn
+        .write_state()
         .and_then(|state| state.write_context_builder().build())
-        .map(|context| Arc::new(context).into())
-        .into_extern_result(&engine)
+        .map(|context| Arc::new(context).into());
+    unsafe { result.into_extern_result(&engine) }
 }
 
 /// Gets the write context from a create-table transaction for an unpartitioned table.
 ///
-/// For partitioned tables, use [`create_table_get_partitioned_write_context`] instead. Returns an
-/// error if the table is partitioned.
+/// For partitioned tables, use [`create_table_txn_get_partitioned_write_context`] instead. Returns
+/// an error if the table is partitioned.
 ///
 /// # Safety
 ///
-/// Caller is responsible for passing a [valid][Handle#Validity] transaction handle and engine.
-#[no_mangle]
-pub unsafe extern "C" fn create_table_get_unpartitioned_write_context(
-    txn: Handle<ExclusiveCreateTransaction>,
+/// `txn` and `engine` must be [valid][Handle#Validity] handles. Both are borrowed for this call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn create_table_txn_get_unpartitioned_write_context(
+    txn: Handle<ExclusiveCreateTableTransaction>,
     engine: Handle<SharedExternEngine>,
 ) -> ExternResult<Handle<SharedWriteContext>> {
     let txn = unsafe { txn.as_ref() };
     let engine = unsafe { engine.as_ref() };
-    txn.write_state()
+    let result = txn
+        .write_state()
         .and_then(|state| state.write_context_builder().build())
-        .map(|context| Arc::new(context).into())
-        .into_extern_result(&engine)
+        .map(|context| Arc::new(context).into());
+    unsafe { result.into_extern_result(&engine) }
 }
 
 /// Gets the write context from a transaction for a partitioned table, for the partition described
@@ -320,23 +317,24 @@ pub unsafe extern "C" fn create_table_get_unpartitioned_write_context(
 /// columns (the kernel validates completeness and value types and rejects extras). This function
 /// consumes the map handle on both success and error; do not use or free it afterward.
 ///
-/// Returns an error if the table is not partitioned (use [`get_unpartitioned_write_context`]
-/// instead) or if the partition values are invalid for the table's partition schema.
+/// Returns an error if the table is not partitioned (use
+/// [`update_table_txn_get_unpartitioned_write_context`] instead) or if the partition values are
+/// invalid for the table's partition schema.
 ///
 /// # Safety
 ///
-/// Caller is responsible for passing a [valid][Handle#Validity] transaction handle, partition
-/// value map handle, and engine.
-#[no_mangle]
-pub unsafe extern "C" fn get_partitioned_write_context(
-    txn: Handle<ExclusiveTransaction>,
+/// All handles must be [valid][Handle#Validity]. This call borrows `txn` and `engine` and
+/// unconditionally consumes `partition_values`, including on error.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn update_table_txn_get_partitioned_write_context(
+    txn: Handle<ExclusiveUpdateTableTransaction>,
     partition_values: Handle<ExclusivePartitionValueMap>,
     engine: Handle<SharedExternEngine>,
 ) -> ExternResult<Handle<SharedWriteContext>> {
     let txn = unsafe { txn.as_ref() };
     let partition_values = unsafe { partition_values.into_inner() };
     let engine = unsafe { engine.as_ref() };
-    partitioned_write_context_impl(
+    let result = partitioned_write_context_impl(
         |pv| {
             txn.write_state()?
                 .write_context_builder()
@@ -344,27 +342,28 @@ pub unsafe extern "C" fn get_partitioned_write_context(
                 .build()
         },
         *partition_values,
-    )
-    .into_extern_result(&engine)
+    );
+    unsafe { result.into_extern_result(&engine) }
 }
 
 /// Gets the write context from a create-table transaction for a partitioned table. See
-/// [`get_partitioned_write_context`] for the contract; this is the create-table counterpart.
+/// [`update_table_txn_get_partitioned_write_context`] for the contract. This is the create-table
+/// counterpart.
 ///
 /// # Safety
 ///
-/// Caller is responsible for passing a [valid][Handle#Validity] transaction handle, partition
-/// value map handle, and engine.
-#[no_mangle]
-pub unsafe extern "C" fn create_table_get_partitioned_write_context(
-    txn: Handle<ExclusiveCreateTransaction>,
+/// All handles must be [valid][Handle#Validity]. This call borrows `txn` and `engine` and
+/// unconditionally consumes `partition_values`, including on error.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn create_table_txn_get_partitioned_write_context(
+    txn: Handle<ExclusiveCreateTableTransaction>,
     partition_values: Handle<ExclusivePartitionValueMap>,
     engine: Handle<SharedExternEngine>,
 ) -> ExternResult<Handle<SharedWriteContext>> {
     let txn = unsafe { txn.as_ref() };
     let partition_values = unsafe { partition_values.into_inner() };
     let engine = unsafe { engine.as_ref() };
-    partitioned_write_context_impl(
+    let result = partitioned_write_context_impl(
         |pv| {
             txn.write_state()?
                 .write_context_builder()
@@ -372,8 +371,8 @@ pub unsafe extern "C" fn create_table_get_partitioned_write_context(
                 .build()
         },
         *partition_values,
-    )
-    .into_extern_result(&engine)
+    );
+    unsafe { result.into_extern_result(&engine) }
 }
 
 fn partitioned_write_context_impl(
@@ -384,9 +383,9 @@ fn partitioned_write_context_impl(
     Ok(Arc::new(context).into())
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn free_write_context(write_context: Handle<SharedWriteContext>) {
-    write_context.drop_handle();
+    unsafe { write_context.drop_handle() }
 }
 
 /// Returns the logical (user-facing) write schema from a [`BoundWriteContext`] handle. For
@@ -397,7 +396,7 @@ pub unsafe extern "C" fn free_write_context(write_context: Handle<SharedWriteCon
 ///
 /// # Safety
 /// Engine is responsible for providing a valid BoundWriteContext pointer
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn get_write_schema(
     write_context: Handle<SharedWriteContext>,
 ) -> Handle<SharedSchema> {
@@ -419,7 +418,7 @@ pub unsafe extern "C" fn get_write_schema(
 ///
 /// # Safety
 /// Engine is responsible for providing a valid BoundWriteContext pointer
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn get_physical_write_schema(
     write_context: Handle<SharedWriteContext>,
 ) -> Handle<SharedSchema> {
@@ -443,7 +442,7 @@ pub unsafe extern "C" fn get_physical_write_schema(
 /// Engine is responsible for providing a valid BoundWriteContext pointer
 ///
 /// [`ExpressionEvaluator`]: delta_kernel::ExpressionEvaluator
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn get_logical_to_physical(
     write_context: Handle<SharedWriteContext>,
 ) -> Handle<SharedExpression> {
@@ -457,7 +456,7 @@ pub unsafe extern "C" fn get_logical_to_physical(
 ///
 /// # Safety
 /// Engine is responsible for providing a valid BoundWriteContext pointer
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn get_write_path(
     write_context: Handle<SharedWriteContext>,
     allocate_fn: AllocateStringFn,
@@ -481,7 +480,7 @@ pub unsafe extern "C" fn get_write_path(
 ///
 /// # Safety
 /// Engine is responsible for providing a valid BoundWriteContext pointer
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn get_write_dir(
     write_context: Handle<SharedWriteContext>,
     allocate_fn: AllocateStringFn,
@@ -502,7 +501,7 @@ pub unsafe extern "C" fn get_write_dir(
 /// # Safety
 /// Engine is responsible for providing a valid BoundWriteContext pointer, a valid `engine_context`
 /// pointer passed through to each `visitor` invocation, and a valid `visitor` function pointer.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn visit_partition_values(
     write_context: Handle<SharedWriteContext>,
     engine_context: NullableCvoid,
@@ -538,7 +537,7 @@ pub unsafe extern "C" fn visit_partition_values(
 /// # Safety
 /// Engine is responsible for providing a valid BoundWriteContext pointer, a valid `file_url`
 /// slice, and a valid engine handle.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn resolve_file_path(
     write_context: Handle<SharedWriteContext>,
     file_url: KernelStringSlice,
@@ -548,9 +547,9 @@ pub unsafe extern "C" fn resolve_file_path(
     let write_context = unsafe { write_context.as_ref() };
     let engine = unsafe { engine.as_ref() };
     let file_url: KernelResult<&str> = unsafe { TryFromStringSlice::try_from_slice(&file_url) };
-    resolve_file_path_impl(write_context, file_url)
-        .map(|path| allocate_fn(kernel_string_slice!(path)))
-        .into_extern_result(&engine)
+    let result = resolve_file_path_impl(write_context, file_url)
+        .map(|path| allocate_fn(kernel_string_slice!(path)));
+    unsafe { result.into_extern_result(&engine) }
 }
 
 fn resolve_file_path_impl(

@@ -20,7 +20,7 @@ use crate::engine::parquet_row_group_skipping::ParquetRowGroupSkipping;
 use crate::engine::sync::SyncEngine;
 use crate::engine::test_delegating::DelegatingEngine;
 use crate::expressions::{
-    col, column_name, column_pred, lit, Expression as Expr, Predicate as Pred, Scalar,
+    Expression as Expr, Predicate as Pred, Scalar, col, column_name, column_pred, lit,
 };
 use crate::object_store::memory::InMemory;
 use crate::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
@@ -28,17 +28,20 @@ use crate::parquet::arrow::arrow_writer::ArrowWriter;
 use crate::scan::data_skipping::{all_referenced_columns, as_checkpoint_skipping_predicate};
 use crate::scan::state::ScanFile;
 use crate::schema::{
-    self, schema, schema_ref, ColumnMetadataKey, DataType, MetadataColumnSpec, StructField,
-    StructType,
+    self, ColumnMetadataKey, DataType, MetadataColumnSpec, StructField, StructType, schema,
+    schema_ref,
 };
 use crate::transaction::create_table::create_table;
 use crate::transaction::data_layout::DataLayout;
 use crate::unit_test_utils::TestCancellationToken;
+use crate::unit_test_utils::recording_reads::{Read, RecordingReads};
 use crate::{
     CancellationTokenRef, Engine, EngineData, FileDataReadResultIterator, FileMeta, FileSize,
-    KernelResult, ParquetFooter, ParquetHandler, PredicateRef, ResultIteratorStatic, Snapshot,
+    KernelResult, KernelResultIterator, ParquetFooter, ParquetHandler, PredicateRef, Snapshot,
 };
 
+#[cfg(feature = "geo-type-in-dev")]
+mod geometry_stats;
 mod variant_stats;
 
 fn field_names(s: &StructArray) -> Vec<String> {
@@ -69,6 +72,23 @@ fn assert_stats_schemas_aligned(logical: &StructType, physical: &StructType) {
             (logical, physical) => assert_eq!(logical, physical),
         }
     }
+}
+
+#[rstest]
+fn map_to_struct_options_preserves_timezone(
+    #[values(
+        None,
+        Some("UTC"),
+        Some("America/Los_Angeles"),
+        Some("+05:30"),
+        Some("Not/AZone")
+    )]
+    timezone: Option<&str>,
+) {
+    assert_eq!(
+        map_to_struct_options(timezone).timestamp_timezone(),
+        timezone
+    );
 }
 
 #[test]
@@ -367,7 +387,7 @@ fn test_scan_builder_accepts_predicate_on_unprojected_data_column() {
         nullable "number": LONG,
         nullable "a_float": FLOAT,
     };
-    create_table(url, schema, "DefaultEngine")
+    create_table(url, schema, "DefaultEngine", true)
         .build(&engine, Box::new(FileSystemCommitter::new()))
         .unwrap()
         .commit(&engine)
@@ -398,7 +418,7 @@ fn test_scan_builder_rejects_predicate_on_projection_only_metadata_column() {
     let engine = SyncEngine::new_with_store(store);
 
     let schema = schema_ref! { nullable "id": LONG };
-    create_table(url, schema, "DefaultEngine")
+    create_table(url, schema, "DefaultEngine", true)
         .build(&engine, Box::new(FileSystemCommitter::new()))
         .unwrap()
         .commit(&engine)
@@ -698,6 +718,51 @@ fn test_scan_metadata_from_same_version() {
     assert_eq!(new_files.len(), 1);
 }
 
+#[rstest]
+fn scan_metadata_from_requires_timezone_support_only_for_timestamp_partitions(
+    #[values("UTC", "America/Los_Angeles", "+05:30")] timezone: &str,
+    #[values(false, true)] parsed_struct: bool,
+    #[values(false, true)] timestamp_partition: bool,
+) {
+    let table_root = "memory:///test_table/";
+    let engine = SyncEngine::new_with_store(Arc::new(InMemory::new()));
+    let partition_type = if timestamp_partition {
+        DataType::TIMESTAMP
+    } else {
+        DataType::STRING
+    };
+    let schema = schema_ref! {
+        (StructField::nullable("p", partition_type)),
+        nullable "value": INTEGER,
+    };
+    let snapshot = create_table(table_root, schema, "SyncEngine", true)
+        .with_data_layout(DataLayout::partitioned(["p"]))
+        .build(&engine, Box::new(FileSystemCommitter::new()))
+        .unwrap()
+        .commit(&engine)
+        .unwrap()
+        .unwrap_post_commit_snapshot();
+    let version = snapshot.version();
+    let options = if parsed_struct {
+        PartitionValuesOptions::with_struct()
+    } else {
+        PartitionValuesOptions::string_map_only()
+    };
+    let scan = snapshot
+        .scan_builder()
+        .with_partition_values(options.with_timestamp_timezone(timezone))
+        .build()
+        .unwrap();
+
+    let result = scan.scan_metadata_from(&engine, version, Vec::new(), None);
+    if timestamp_partition {
+        assert_result_error_with_message(result, "with_timestamp_timezone in scan_metadata_from");
+    } else {
+        let metadata: Vec<_> = result.unwrap().try_collect().unwrap();
+        assert!(metadata.is_empty());
+    }
+}
+
 #[test_log::test]
 fn scan_metadata_from_cancels_cached_metadata_consumption() {
     let path =
@@ -730,21 +795,36 @@ fn scan_metadata_from_cancels_cached_metadata_consumption() {
     assert!(matches!(metadata.next(), Some(Err(KernelError::Cancelled))));
 }
 
-// reading v0 with 3 files.
-// updating to v1 with 3 more files added.
-#[test_log::test]
-fn test_scan_metadata_from_with_update() {
-    let path = std::fs::canonicalize(PathBuf::from("./tests/data/basic_partitioned/")).unwrap();
+#[rstest]
+#[case::incremental_commits("basic_partitioned", 0, 1, &[3], &[3, 3], &[Read::Json])]
+#[case::checkpoint_full_rescan(
+    "with_checkpoint_no_last_checkpoint",
+    1,
+    2,
+    &[1],
+    &[1],
+    &[Read::Footer, Read::Parquet]
+)]
+fn scan_metadata_from_binds_token_to_new_reads(
+    #[case] table_name: &str,
+    #[case] existing_version: Version,
+    #[case] snapshot_version: Version,
+    #[case] expected_existing_rows: &[usize],
+    #[case] expected_rows: &[usize],
+    #[case] expected_reads: &[Read],
+    #[values(false, true)] pre_cancelled: bool,
+) {
+    let path = std::fs::canonicalize(PathBuf::from(format!("./tests/data/{table_name}/"))).unwrap();
     let url = url::Url::from_directory_path(path).unwrap();
-    let engine = Arc::new(SyncEngine::new());
+    let base_engine = SyncEngine::new();
 
     let snapshot = Snapshot::builder_for(url.clone())
-        .at_version(0)
-        .build(engine.as_ref())
+        .at_version(existing_version)
+        .build(&base_engine)
         .unwrap();
     let scan = snapshot.scan_builder().build().unwrap();
     let files: Vec<_> = scan
-        .scan_metadata(engine.as_ref())
+        .scan_metadata(&base_engine)
         .unwrap()
         .map_ok(|ScanMetadata { scan_files, .. }| {
             let (underlying_data, selection_vector) = scan_files.into_parts();
@@ -755,33 +835,62 @@ fn test_scan_metadata_from_with_update() {
         })
         .try_collect()
         .unwrap();
-    assert_eq!(files.len(), 1);
-    assert_eq!(files[0].num_rows(), 3);
+    let existing_rows: Vec<_> = files.iter().map(RecordBatch::num_rows).collect();
+    assert_eq!(existing_rows, expected_existing_rows);
 
     let files: Vec<_> = files
         .into_iter()
         .map(|b| Box::new(ArrowEngineData::from(b)) as Box<dyn EngineData>)
         .collect();
     let snapshot = Snapshot::builder_for(url)
-        .at_version(1)
-        .build(engine.as_ref())
+        .at_version(snapshot_version)
+        .build(&base_engine)
         .unwrap();
-    let scan = snapshot.scan_builder().build().unwrap();
-    let new_files: Vec<_> = scan
-        .scan_metadata_from(engine.as_ref(), 0, files, None)
-        .unwrap()
-        .map_ok(|ScanMetadata { scan_files, .. }| {
-            let (underlying_data, selection_vector) = scan_files.into_parts();
-            let batch: RecordBatch = ArrowEngineData::try_from_engine_data(underlying_data)
-                .unwrap()
-                .into();
-            filter_record_batch(&batch, &BooleanArray::from(selection_vector)).unwrap()
-        })
-        .try_collect()
+    // No read triggers cancellation; `pre_cancelled` cancels the token up front.
+    let reads = RecordingReads::new(None);
+    if pre_cancelled {
+        reads.token.cancel();
+    }
+    let scan = snapshot
+        .scan_builder()
+        .with_cancellation_token(reads.token.clone() as CancellationTokenRef)
+        .build()
         .unwrap();
-    assert_eq!(new_files.len(), 2);
-    assert_eq!(new_files[0].num_rows(), 3);
-    assert_eq!(new_files[1].num_rows(), 3);
+    let engine = reads.engine();
+    let result = scan.scan_metadata_from(&engine, existing_version, files, None);
+
+    if pre_cancelled {
+        let cancelled = match result {
+            Err(KernelError::Cancelled) => true,
+            Ok(mut metadata) => matches!(metadata.next(), Some(Err(KernelError::Cancelled))),
+            Err(_) => false,
+        };
+        assert!(cancelled, "pre-cancelled scan must report cancellation");
+    } else {
+        let new_files: Vec<_> = result
+            .unwrap()
+            .map_ok(|ScanMetadata { scan_files, .. }| {
+                let (underlying_data, selection_vector) = scan_files.into_parts();
+                let batch: RecordBatch = ArrowEngineData::try_from_engine_data(underlying_data)
+                    .unwrap()
+                    .into();
+                filter_record_batch(&batch, &BooleanArray::from(selection_vector)).unwrap()
+            })
+            .try_collect()
+            .unwrap();
+        let actual_rows: Vec<_> = new_files.iter().map(RecordBatch::num_rows).collect();
+        assert_eq!(actual_rows, expected_rows);
+    }
+
+    if !pre_cancelled {
+        let events = reads.events.lock().unwrap();
+        for expected_read in expected_reads {
+            assert!(
+                events.contains(expected_read),
+                "expected {expected_read:?} read, got {events:?}"
+            );
+        }
+    }
 }
 
 #[test]
@@ -925,7 +1034,7 @@ fn test_missing_column_row_group_skipping() {
 }
 
 #[test_log::test]
-fn test_scan_with_checkpoint() -> Result<()> {
+fn test_scan_with_checkpoint() -> KernelResult<()> {
     let path = std::fs::canonicalize(PathBuf::from(
         "./tests/data/with_checkpoint_no_last_checkpoint/",
     ))?;
@@ -997,7 +1106,7 @@ fn test_scan_metadata_with_stats_columns() {
     let scan_metadata_results: Vec<_> = scan
         .scan_metadata(engine.as_ref())
         .unwrap()
-        .collect::<Result<Vec<_>, _>>()
+        .collect::<KernelResult<Vec<_>>>()
         .unwrap();
 
     assert!(
@@ -1586,7 +1695,7 @@ fn surviving_ids(parquet_bytes: Bytes, pred: &Pred) -> Vec<i64> {
     let mut ids: Vec<i64> = builder
         .build()
         .unwrap()
-        .map(Result::unwrap)
+        .map(KernelResult::unwrap)
         .flat_map(|batch| {
             let add = batch
                 .column(0)
@@ -1768,7 +1877,7 @@ impl ParquetHandler for RecordingParquetHandler {
         files: &[FileMeta],
         physical_schema: schema::SchemaRef,
         predicate: Option<PredicateRef>,
-    ) -> Result<FileDataReadResultIterator> {
+    ) -> KernelResult<FileDataReadResultIterator> {
         self.reads.lock().unwrap().push(RecordedParquetRead {
             files: files.to_vec(),
             physical_schema: physical_schema.clone(),
@@ -1778,15 +1887,15 @@ impl ParquetHandler for RecordingParquetHandler {
             .read_parquet_files(files, physical_schema, predicate)
     }
 
-    fn read_parquet_footer(&self, file: &FileMeta) -> Result<ParquetFooter> {
+    fn read_parquet_footer(&self, file: &FileMeta) -> KernelResult<ParquetFooter> {
         self.inner.read_parquet_footer(file)
     }
 
     fn write_parquet_file(
         &self,
         location: url::Url,
-        data: ResultIteratorStatic<Box<dyn EngineData>>,
-    ) -> Result<FileSize> {
+        data: Box<dyn KernelResultIterator<Box<dyn EngineData>>>,
+    ) -> KernelResult<FileSize> {
         self.inner.write_parquet_file(location, data)
     }
 }
@@ -1941,7 +2050,7 @@ fn test_all_struct_parses_json_commit_stats() {
     for scan_metadata in scan
         .scan_metadata(engine.as_ref())
         .unwrap()
-        .collect::<Result<Vec<_>, _>>()
+        .collect::<KernelResult<Vec<_>>>()
         .unwrap()
     {
         let (underlying_data, selection_vector) = scan_metadata.scan_files.into_parts();
@@ -2030,7 +2139,7 @@ fn test_skip_stats_disables_data_skipping() {
     let scan_metadata_results: Vec<_> = scan
         .scan_metadata(engine.as_ref())
         .unwrap()
-        .collect::<Result<Vec<_>, _>>()
+        .collect::<KernelResult<Vec<_>>>()
         .unwrap();
 
     let mut selected_file_count = 0;
@@ -2064,7 +2173,7 @@ fn test_with_stats_last_call_wins() {
     for scan_metadata in scan
         .scan_metadata(engine.as_ref())
         .unwrap()
-        .collect::<Result<Vec<_>, _>>()
+        .collect::<KernelResult<Vec<_>>>()
         .unwrap()
     {
         let (underlying_data, _) = scan_metadata.scan_files.into_parts();
@@ -2095,7 +2204,7 @@ fn test_default_stats_options_no_struct_output() {
     let scan_metadata_results: Vec<_> = scan
         .scan_metadata(engine.as_ref())
         .unwrap()
-        .collect::<Result<Vec<_>, _>>()
+        .collect::<KernelResult<Vec<_>>>()
         .unwrap();
 
     assert!(
@@ -2348,7 +2457,7 @@ fn scan_builder_stats_output_schemas_match_scan_output(#[case] column_mapping_mo
         nullable "value": LONG,
         nullable "other": LONG,
     };
-    let mut create_builder = create_table(table_root, schema, "DefaultEngine")
+    let mut create_builder = create_table(table_root, schema, "DefaultEngine", true)
         .with_table_properties([("delta.dataSkippingNumIndexedCols", "1")]);
     if let Some(mode) = column_mapping_mode {
         create_builder = create_builder.with_table_properties([("delta.columnMapping.mode", mode)]);
@@ -2426,6 +2535,7 @@ fn scan_builder_stats_output_schemas_returns_none_without_data_columns(
         &table_root,
         schema_ref! { nullable "id": LONG },
         "DefaultEngine",
+        true,
     )
     .with_table_properties([("delta.dataSkippingNumIndexedCols", "0")]);
     if let Some(mode) = column_mapping_mode {
@@ -2468,7 +2578,7 @@ fn scan_builder_stats_output_schemas_respect_explicit_columns_and_partitions(
         nullable "part": STRING,
         nullable "other": LONG,
     };
-    let mut create_builder = create_table(table_root, schema, "DefaultEngine")
+    let mut create_builder = create_table(table_root, schema, "DefaultEngine", true)
         .with_data_layout(DataLayout::partitioned(["part"]))
         .with_table_properties([("delta.dataSkippingStatsColumns", "info.name")]);
     if let Some(mode) = column_mapping_mode {
@@ -2524,7 +2634,7 @@ fn scan_builder_stats_output_schemas_handle_extra_column_shapes() {
         nullable "items": [ nullable INTEGER ],
         nullable "part": STRING,
     };
-    create_table(table_root, schema, "DefaultEngine")
+    create_table(table_root, schema, "DefaultEngine", true)
         .with_data_layout(DataLayout::partitioned(["part"]))
         .with_table_properties([("delta.dataSkippingNumIndexedCols", "1")])
         .build(&engine, Box::new(FileSystemCommitter::new()))
@@ -2574,7 +2684,7 @@ fn scan_builder_stats_output_schemas_validate_selected_columns() {
         },
         nullable "part": STRING,
     };
-    create_table(table_root, schema, "DefaultEngine")
+    create_table(table_root, schema, "DefaultEngine", true)
         .with_data_layout(DataLayout::partitioned(["part"]))
         .build(&engine, Box::new(FileSystemCommitter::new()))
         .unwrap()
@@ -2627,7 +2737,7 @@ fn scan_builder_stats_output_schemas_follow_struct_columns(
         nullable "id": LONG,
         nullable "name": STRING,
     };
-    let mut create_builder = create_table(&table_root, schema, "DefaultEngine");
+    let mut create_builder = create_table(&table_root, schema, "DefaultEngine", true);
     if let Some(mode) = column_mapping_mode {
         create_builder = create_builder.with_table_properties([("delta.columnMapping.mode", mode)]);
     }
@@ -2653,9 +2763,11 @@ fn scan_builder_stats_output_schemas_follow_struct_columns(
     assert!(logical_min_values.field("id").is_none());
     let physical_min_values = stats_struct_field(&schemas.physical, MIN_VALUES);
     if column_mapping_mode.is_some() {
-        assert!(physical_min_values
-            .fields()
-            .all(|field| field.name().starts_with("col-")));
+        assert!(
+            physical_min_values
+                .fields()
+                .all(|field| field.name().starts_with("col-"))
+        );
     } else {
         assert_eq!(physical_min_values, logical_min_values);
     }
@@ -2696,19 +2808,19 @@ impl ParquetHandler for EmptyParquetHandler {
         _files: &[FileMeta],
         _schema: schema::SchemaRef,
         _predicate: Option<PredicateRef>,
-    ) -> Result<FileDataReadResultIterator> {
+    ) -> KernelResult<FileDataReadResultIterator> {
         Ok(Box::new(std::iter::empty()))
     }
 
-    fn read_parquet_footer(&self, _file: &FileMeta) -> Result<ParquetFooter> {
+    fn read_parquet_footer(&self, _file: &FileMeta) -> KernelResult<ParquetFooter> {
         unimplemented!()
     }
 
     fn write_parquet_file(
         &self,
         _location: url::Url,
-        _data: ResultIteratorStatic<Box<dyn EngineData>>,
-    ) -> Result<FileSize> {
+        _data: Box<dyn KernelResultIterator<Box<dyn EngineData>>>,
+    ) -> KernelResult<FileSize> {
         unimplemented!()
     }
 }
@@ -2769,12 +2881,12 @@ mod scan_metadata_completed_tests {
     use rstest::rstest;
 
     use super::ScanBuilder;
-    use crate::engine::sync::SyncEngine;
-    use crate::expressions::{col, lit, Expression as Expr, Predicate as Pred};
-    use crate::metrics::MetricEvent;
-    use crate::unit_test_utils::{install_thread_local_metrics_reporter, CapturingReporter};
-    use crate::utils::FoldWithOption as _;
     use crate::Snapshot;
+    use crate::engine::sync::SyncEngine;
+    use crate::expressions::{Expression as Expr, Predicate as Pred, col, lit};
+    use crate::metrics::MetricEvent;
+    use crate::unit_test_utils::{CapturingReporter, install_thread_local_metrics_reporter};
+    use crate::utils::FoldWithOption as _;
 
     fn run_scan(
         table: &str,
@@ -2894,9 +3006,11 @@ mod scan_metadata_completed_tests {
             let _ = iter.next();
             // Drop without exhausting -- callback must not fire
         }
-        assert!(reporter
-            .events()
-            .iter()
-            .all(|e| !matches!(e, MetricEvent::ScanMetadataCompleted(_))));
+        assert!(
+            reporter
+                .events()
+                .iter()
+                .all(|e| !matches!(e, MetricEvent::ScanMetadataCompleted(_)))
+        );
     }
 }

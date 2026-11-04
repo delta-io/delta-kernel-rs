@@ -8,9 +8,9 @@ use tracing::{debug, error};
 use crate::actions::visitors::SelectionVectorVisitor;
 use crate::actions::{MAX_VALUES, MIN_VALUES, NULL_COUNT, NUM_RECORDS};
 use crate::expressions::{
-    col, column_name, column_pred, lit, BinaryPredicateOp, ColumnName, Expression as Expr,
-    ExpressionRef, JunctionPredicateOp, MapToStructOptions, OpaquePredicateOpRef,
-    Predicate as Pred, PredicateRef, Scalar,
+    BinaryPredicateOp, ColumnName, Expression as Expr, ExpressionRef, JunctionPredicateOp,
+    MapToStructOptions, OpaquePredicateOpRef, Predicate as Pred, PredicateRef, Scalar, col,
+    column_name, column_pred, lit,
 };
 use crate::kernel_predicates::{
     DataSkippingPredicateEvaluator, KernelPredicateEvaluator, KernelPredicateEvaluatorDefaults,
@@ -18,7 +18,7 @@ use crate::kernel_predicates::{
 use crate::scan::data_skipping::stats_schema::is_skipping_eligible_datatype;
 use crate::scan::log_replay::PARTITION_VALUES_PARSED_NAME;
 use crate::scan::metrics::ScanMetrics;
-use crate::schema::{lazy_schema_ref, schema_ref, DataType, PrimitiveType, SchemaRef};
+use crate::schema::{DataType, PrimitiveType, SchemaRef, lazy_schema_ref, schema_ref};
 use crate::table_configuration::TableConfiguration;
 use crate::utils::require;
 use crate::{
@@ -29,8 +29,6 @@ use crate::{
 pub(crate) mod stats_schema;
 #[cfg(test)]
 mod tests;
-
-use delta_kernel_derive::internal_api;
 
 /// Rewrites a predicate to a predicate that can be used to skip files based on their stats.
 /// Returns `None` if the predicate is not eligible for data skipping.
@@ -91,7 +89,6 @@ pub(crate) fn as_sql_data_skipping_predicate_with_stats_columns(
     DataSkippingPredicateCreator::new(partition_columns, stats_columns).eval_sql_where(pred)
 }
 
-#[internal_api]
 pub(crate) struct DataSkippingFilter {
     /// Evaluator that extracts file-level statistics from the input batch. The caller provides
     /// the expression at construction time, which determines where stats come from:
@@ -246,11 +243,13 @@ impl DataSkippingFilter {
     /// - `table_configuration`: Source of the stats schema, partition schema, and stats-column
     ///   gate.
     /// - `input_schema`: Schema of the raw action batches passed to [`apply()`](Self::apply).
+    /// - `map_to_struct_options`: Options used to parse raw partition values.
     pub(crate) fn for_raw_action_batch(
         engine: &dyn Engine,
         physical_predicate: PredicateRef,
         table_configuration: &TableConfiguration,
         input_schema: SchemaRef,
+        map_to_struct_options: MapToStructOptions,
     ) -> Option<Self> {
         // Predicate refs become the `requested_physical_columns` filter; refs outside
         // `physical_stats_columns` fold to NULL via the gate below. Clustering columns are
@@ -278,7 +277,7 @@ impl DataSkippingFilter {
         ));
         let partition_expr = Arc::new(Expr::map_to_struct(
             col!("add.partitionValues"),
-            MapToStructOptions::default(),
+            map_to_struct_options,
         ));
         let is_add_expr = Arc::new(Pred::is_not_null(col!("add.path")).into());
         Self::new(

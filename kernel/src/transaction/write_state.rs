@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use url::Url;
 
 use super::BoundWriteContext;
-use crate::expressions::{lit, ColumnName, ExpressionStructPatchBuilder, Scalar};
+use crate::expressions::{ColumnName, ExpressionStructPatchBuilder, Scalar, lit};
 use crate::partition::serialization::serialize_partition_value;
 use crate::partition::validation::{validate_partition_values, validate_physical_partition_values};
 use crate::schema::void_utils::add_void_stripping;
@@ -18,7 +18,7 @@ use crate::table_properties::{
     MATERIALIZED_ROW_COMMIT_VERSION_COLUMN_NAME, MATERIALIZED_ROW_ID_COLUMN_NAME,
 };
 use crate::utils::require;
-use crate::{DataType, Expression, KernelError, KernelResult, Result};
+use crate::{DataType, Expression, KernelError, KernelResult};
 
 const WRITE_STATE_FORMAT_VERSION: u32 = 1;
 
@@ -155,7 +155,7 @@ impl BoundWriteContextBuilder {
     ///   is not in the table properties.
     /// - The connector specifies a row-tracking metadata column that conflicts with another logical
     ///   field.
-    pub fn build(self) -> Result<BoundWriteContext> {
+    pub fn build(self) -> KernelResult<BoundWriteContext> {
         let is_partitioned = !self.write_state.logical_partition_columns.is_empty();
         require!(
             is_partitioned || self.partition_values.is_none(),
@@ -356,7 +356,7 @@ impl WriteState {
     /// kernel upgrades.
     ///
     /// Returns an error if any field cannot be serialized.
-    pub fn encode(&self) -> Result<Vec<u8>> {
+    pub fn encode(&self) -> KernelResult<Vec<u8>> {
         Ok(serde_json::to_vec(&WriteStateWire {
             version: WRITE_STATE_FORMAT_VERSION,
             write_state: self,
@@ -370,7 +370,7 @@ impl WriteState {
     ///
     /// Returns an error if the bytes contain an unsupported format version or do not contain a
     /// valid serialized write state.
-    pub fn decode(bytes: &[u8]) -> Result<Arc<Self>> {
+    pub fn decode(bytes: &[u8]) -> KernelResult<Arc<Self>> {
         let wire: DecodedWriteStateWire = serde_json::from_slice(bytes)?;
         require!(
             wire.version == WRITE_STATE_FORMAT_VERSION,
@@ -451,13 +451,13 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
+    use crate::Engine;
     use crate::committer::FileSystemCommitter;
     use crate::engine::sync::SyncEngine;
     use crate::object_store::memory::InMemory;
-    use crate::schema::{schema_ref, MetadataValue};
+    use crate::schema::{MetadataValue, schema_ref};
     use crate::transaction::create_table::create_table;
     use crate::transaction::data_layout::DataLayout;
-    use crate::Engine;
 
     fn partitioned_write_state(
         column_mapping_mode: ColumnMappingMode,
@@ -494,6 +494,7 @@ mod tests {
                 nullable "value": INTEGER,
             },
             "test",
+            true,
         )
         .with_data_layout(DataLayout::partitioned(["year"]))
         .with_table_properties(properties)
@@ -636,9 +637,11 @@ mod tests {
                 .strip_suffix('/')
                 .unwrap();
             assert_eq!(prefix.len(), random_prefix_length);
-            assert!(prefix
-                .chars()
-                .all(|character| character.is_ascii_alphanumeric()));
+            assert!(
+                prefix
+                    .chars()
+                    .all(|character| character.is_ascii_alphanumeric())
+            );
         } else {
             assert_eq!(write_dir, "/table/year=2024/");
         }
@@ -668,32 +671,42 @@ mod tests {
         };
 
         assert!(error_for(HashMap::new()).contains("missing partition column"));
-        assert!(error_for(HashMap::from([(
-            "unknown".to_string(),
-            Scalar::Integer(2024),
-        )]))
-        .contains("unknown partition column 'unknown'"));
-        assert!(error_for(HashMap::from([(
-            physical_name.to_uppercase(),
-            Scalar::Integer(2024),
-        )]))
-        .contains("unknown partition column"));
-        assert!(error_for(HashMap::from([(
-            physical_name.clone(),
-            Scalar::String("2024".into()),
-        )]))
-        .contains("value of type"));
-        assert!(error_for(HashMap::from([(
-            physical_name.clone(),
-            Scalar::Null(DataType::INTEGER),
-        )]))
-        .contains("is not nullable"));
+        assert!(
+            error_for(HashMap::from([(
+                "unknown".to_string(),
+                Scalar::Integer(2024),
+            )]))
+            .contains("unknown partition column 'unknown'")
+        );
+        assert!(
+            error_for(HashMap::from([(
+                physical_name.to_uppercase(),
+                Scalar::Integer(2024),
+            )]))
+            .contains("unknown partition column")
+        );
+        assert!(
+            error_for(HashMap::from([(
+                physical_name.clone(),
+                Scalar::String("2024".into()),
+            )]))
+            .contains("value of type")
+        );
+        assert!(
+            error_for(HashMap::from([(
+                physical_name.clone(),
+                Scalar::Null(DataType::INTEGER),
+            )]))
+            .contains("is not nullable")
+        );
         if column_mapping_mode != ColumnMappingMode::None {
             assert_ne!(physical_name, "year");
-            assert!(error_for(HashMap::from([
-                ("year".to_string(), Scalar::Integer(2024),)
-            ]))
-            .contains("unknown partition column 'year'"));
+            assert!(
+                error_for(HashMap::from([
+                    ("year".to_string(), Scalar::Integer(2024),)
+                ]))
+                .contains("unknown partition column 'year'")
+            );
         }
     }
 
@@ -703,7 +716,7 @@ mod tests {
     fn physical_partition_names_differing_only_by_case_bind_separately(
         #[case] column_mapping_mode: ColumnMappingMode,
         #[case] mode_property: &str,
-    ) -> Result<()> {
+    ) -> KernelResult<()> {
         let physical_field = |logical_name: &str, physical_name: &str, id: i64| {
             StructField::not_null(logical_name, DataType::INTEGER).with_metadata([
                 ("delta.columnMapping.id", MetadataValue::Number(id)),
@@ -720,7 +733,7 @@ mod tests {
         ])?);
         let engine: Arc<dyn Engine> =
             Arc::new(SyncEngine::new_with_store(Arc::new(InMemory::new())));
-        let txn = create_table("memory:///case_sensitive_partitions", schema, "test")
+        let txn = create_table("memory:///case_sensitive_partitions", schema, "test", true)
             .with_data_layout(DataLayout::partitioned(["first", "second"]))
             .with_table_properties([("delta.columnMapping.mode", mode_property)])
             .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
@@ -776,7 +789,7 @@ mod tests {
             ColumnMappingMode::Id
         )]
         column_mapping_mode: ColumnMappingMode,
-    ) -> Result<()> {
+    ) -> KernelResult<()> {
         let mut write_state = partitioned_write_state(
             column_mapping_mode,
             false, /* materialize_partition_columns */
@@ -938,9 +951,11 @@ mod tests {
         encoded["version"] = 2.into();
 
         let error = WriteState::decode(&serde_json::to_vec(&encoded).unwrap()).unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("unsupported write state format version 2; expected 1"));
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported write state format version 2; expected 1")
+        );
     }
 
     #[test]

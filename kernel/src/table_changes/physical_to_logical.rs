@@ -5,9 +5,9 @@ use super::{CHANGE_TYPE_COL_NAME, COMMIT_TIMESTAMP_COL_NAME, COMMIT_VERSION_COL_
 use crate::expressions::Scalar;
 use crate::scan::state_info::StateInfo;
 use crate::scan::transform_spec::{
-    get_transform_expr, parse_partition_values, FileRowTrackingMetadata,
+    FileRowTrackingMetadata, get_transform_expr, parse_partition_values,
 };
-use crate::schema::{schema_ref, SchemaRef, StructType};
+use crate::schema::{SchemaRef, StructType, schema_ref};
 use crate::{ExpressionRef, KernelError, KernelResult};
 
 /// Gets CDF metadata columns from the logical schema and scan file.
@@ -17,7 +17,7 @@ use crate::{ExpressionRef, KernelError, KernelResult};
 fn get_cdf_columns(
     logical_schema: &SchemaRef,
     scan_file: &CdfScanFile,
-) -> KernelResult<impl Iterator<Item = (usize, (String, Scalar))>> {
+) -> KernelResult<impl Iterator<Item = (usize, (String, Scalar))> + use<>> {
     // Handle _change_type
     let change_type_field = logical_schema.field_with_index(CHANGE_TYPE_COL_NAME);
     let change_type_metadata = match (change_type_field, &scan_file.scan_type) {
@@ -136,11 +136,11 @@ mod tests {
 
     use super::*;
     use crate::expressions::Expression;
+    use crate::scan::PhysicalPredicate;
     use crate::scan::state::DvInfo;
     use crate::scan::state_info::StateInfo;
     use crate::scan::transform_spec::FieldTransformSpec;
-    use crate::scan::PhysicalPredicate;
-    use crate::schema::{schema, schema_ref, DataType};
+    use crate::schema::{DataType, schema, schema_ref};
     use crate::table_features::ColumnMappingMode;
 
     fn create_test_logical_schema() -> SchemaRef {
@@ -198,6 +198,7 @@ mod tests {
             requested_physical_stats_columns: Vec::new(),
             is_catalog_managed: false,
             skip_row_transforms: false,
+            dv_normalization_root: None,
         }
     }
 
@@ -425,6 +426,7 @@ mod tests {
             requested_physical_stats_columns: Vec::new(),
             is_catalog_managed: false,
             skip_row_transforms: false,
+            dv_normalization_root: None,
         };
 
         let result = get_cdf_transform_expr(&scan_file, &state_info, &physical_schema);

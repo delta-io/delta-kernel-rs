@@ -39,16 +39,16 @@ the REST client crate does not re-export them.
 
 ## Step 1: Build the UC client
 
-`UCClient` calls the UC Delta-Tables API. It shares a `ClientConfig` with the
+`UCDeltaTableClient` calls the UC Delta-Tables API. It shares a `ClientConfig` with the
 rest of the UC integration.
 
 ```rust,ignore
-use unity_catalog_delta_rest_client::{ClientConfig, UCClient};
+use unity_catalog_delta_rest_client::{ClientConfig, UCDeltaTableClient};
 
 let config = ClientConfig::build(&endpoint, &token)
     .with_additional_user_agent([("MyConnector", "1.0")])
     .build()?;
-let uc_client = UCClient::new(config)?;
+let uc_client = UCDeltaTableClient::new(config)?;
 ```
 
 The `endpoint` is your UC workspace URL (e.g. `"my-workspace.cloud.databricks.com"`),
@@ -186,13 +186,13 @@ use delta_kernel::object_store;
 use delta_kernel_default_engine::DefaultEngineBuilder;
 use delta_kernel_unity_catalog::snapshot_builder_from_load_table;
 use unity_catalog_delta_client_api::Operation;
-use unity_catalog_delta_rest_client::{ClientConfig, UCClient};
+use unity_catalog_delta_rest_client::{ClientConfig, UCDeltaTableClient};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 1. Build the UC client
     let config = ClientConfig::build(&endpoint, &token).with_additional_user_agent([("MyConnector", "1.0")]).build()?;
-    let uc_client = UCClient::new(config)?;
+    let uc_client = UCDeltaTableClient::new(config)?;
 
     // 2. Load the table (metadata + inline log tail)
     let resp = uc_client

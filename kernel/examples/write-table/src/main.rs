@@ -15,7 +15,7 @@ use delta_kernel::engine::arrow_conversion::TryIntoArrow;
 use delta_kernel::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt};
 use delta_kernel::schema::{DataType, SchemaRef, StructField, StructType};
 use delta_kernel::transaction::create_table::create_table as create_delta_table;
-use delta_kernel::transaction::{CommitResult, RetryableTransaction};
+use delta_kernel::transaction::{CommitResult, RetryableTransaction, UpdateTableOperation};
 use delta_kernel::{Engine, KernelError, KernelResult, Snapshot, SnapshotRef};
 use delta_kernel_default_engine::executor::tokio::TokioBackgroundExecutor;
 use delta_kernel_default_engine::{DefaultEngine, DefaultEngineBuilder};
@@ -88,10 +88,12 @@ async fn try_main() -> KernelResult<()> {
     // Write sample data to the table
     let committer = Box::new(FileSystemCommitter::new());
     let mut txn = snapshot
-        .transaction(committer, &engine)?
-        .with_operation("INSERT".to_string())
-        .with_engine_info("default_engine/write-table-example")
-        .with_data_change(true);
+        .update_table(
+            UpdateTableOperation::Custom("INSERT".to_string()),
+            "default_engine/write-table-example",
+            /* data_change */ true,
+        )
+        .build(&engine, committer)?;
 
     // This example assumes the table is unpartitioned.
     let write_context = txn.write_state()?.write_context_builder().build()?;
@@ -112,7 +114,9 @@ async fn try_main() -> KernelResult<()> {
             CommitResult::Committed(committed) => break committed,
             CommitResult::Conflicted(conflicted) => {
                 let conflicting_version = conflicted.conflict_version();
-                println!("✗ Failed to write data, transaction conflicted with version: {conflicting_version}");
+                println!(
+                    "✗ Failed to write data, transaction conflicted with version: {conflicting_version}"
+                );
                 return Err(KernelError::generic("Commit failed"));
             }
             CommitResult::Retryable(RetryableTransaction { transaction, error }) => {
@@ -198,9 +202,14 @@ async fn create_table(
 ) -> KernelResult<()> {
     // Use the create_table API to create the table
     let table_path = table_url.as_str();
-    let _result = create_delta_table(table_path, schema.clone(), "write-table-example/1.0")
-        .build(engine, Box::new(FileSystemCommitter::new()))?
-        .commit(engine)?;
+    let _result = create_delta_table(
+        table_path,
+        schema.clone(),
+        "write-table-example/1.0",
+        /* data_change */ true,
+    )
+    .build(engine, Box::new(FileSystemCommitter::new()))?
+    .commit(engine)?;
 
     println!("✓ Created Delta table with schema: {schema:#?}");
     Ok(())

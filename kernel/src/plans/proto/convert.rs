@@ -1,12 +1,12 @@
 //! Conversions from the kernel plan IR into the prost-generated proto wire types.
 
 use super::plan::agg as proto_agg;
-use super::schema::data_type::Kind as DataTypeKind;
-use super::schema::metadata_value::Value as MetadataValueKind;
-use super::schema::primitive_type::Kind as PrimitiveTypeKind;
 #[cfg(feature = "geo-type-in-dev")]
 use super::schema::EdgeInterpolationAlgorithm as EdgeAlgo;
 use super::schema::SimplePrimitiveType as Simple;
+use super::schema::data_type::Kind as DataTypeKind;
+use super::schema::metadata_value::Value as MetadataValueKind;
+use super::schema::primitive_type::Kind as PrimitiveTypeKind;
 use super::{
     expressions as proto_expr, operation as proto_op, plan as proto_plan, schema as proto_schema,
 };
@@ -19,18 +19,18 @@ use crate::expressions::{
     VariadicExpressionOp,
 };
 use crate::plans::ir::nodes::{
-    Agg, Aggregate, DynamicScan, FileType, Filter, Operator, Project, RelationRef, ScanFile,
-    ScanJson, ScanParquet, SemiJoin, Values,
+    Agg, Aggregate, DynamicScan, FileType, Filter, Operator, PrefixSum, Project, RelationRef,
+    ScanFile, ScanJson, ScanParquet, SemiJoin, Values, WriteJson,
 };
 use crate::plans::ir::plan::{Plan, PlanNode};
 use crate::plans::{IoOperation, Operation};
 use crate::schema::{
-    ArrayType, DataType, DecimalType, MapType, MetadataValue, PrimitiveType, StructField,
-    StructType,
+    ArrayType, DataType, DecimalType, IntervalYearToMonthType, MapType, MetadataValue,
+    PrimitiveType, StructField, StructType,
 };
 #[cfg(feature = "geo-type-in-dev")]
 use crate::schema::{EdgeInterpolationAlgorithm, GeographyType, GeometryType};
-use crate::{FileMeta, FileSlice, KernelError, Result};
+use crate::{FileMeta, FileSlice, KernelError, KernelResult};
 
 // === Helpers ===
 
@@ -153,6 +153,8 @@ impl From<&Operator> for proto_plan::Operator {
             Operator::Filter(n) => Op::Filter(n.into()),
             Operator::DynamicScan(n) => Op::DynamicScan(n.into()),
             Operator::Aggregate(n) => Op::Aggregate(n.into()),
+            Operator::PrefixSum(n) => Op::PrefixSum(n.into()),
+            Operator::WriteJson(n) => Op::WriteJson(n.into()),
             Operator::SemiJoin(n) => Op::SemiJoin(n.into()),
             Operator::UnionAll(_) => Op::UnionAll(proto_plan::UnionAllNode {}),
         };
@@ -218,6 +220,17 @@ impl From<&Project> for proto_plan::ProjectNode {
     fn from(node: &Project) -> Self {
         proto_plan::ProjectNode {
             expr: Some(node.expr.as_ref().into()),
+            schema: Some(node.schema.as_ref().into()),
+        }
+    }
+}
+
+impl From<&WriteJson> for proto_plan::WriteJsonNode {
+    fn from(node: &WriteJson) -> Self {
+        Self {
+            file_path: node.file_path.to_string(),
+            overwrite: node.overwrite,
+            ordered: node.ordered,
             schema: Some(node.schema.as_ref().into()),
         }
     }
@@ -297,6 +310,16 @@ impl From<&SemiJoin> for proto_plan::SemiJoinNode {
             inverted: node.inverted,
             probe_keys: convert_vec(&node.probe_keys),
             build_keys: convert_vec(&node.build_keys),
+        }
+    }
+}
+
+impl From<&PrefixSum> for proto_plan::PrefixSumNode {
+    fn from(node: &PrefixSum) -> Self {
+        proto_plan::PrefixSumNode {
+            input: Some((&node.input).into()),
+            output: node.output.clone(),
+            schema: Some(node.schema.as_ref().into()),
         }
     }
 }
@@ -569,7 +592,7 @@ impl From<&Scalar> for proto_expr::Scalar {
             Scalar::Boolean(v) => Value::Boolean(*v),
             Scalar::Timestamp(v) => Value::Timestamp(*v),
             Scalar::TimestampNtz(v) => Value::TimestampNtz(*v),
-            Scalar::IntervalYearMonth(v) => Value::IntervalYearMonth(*v),
+            Scalar::IntervalYearMonth(v) => Value::IntervalYearMonth(v.months()),
             Scalar::IntervalDayTime(v) => Value::IntervalDayTime(*v),
             Scalar::Date(v) => Value::Date(*v),
             Scalar::Binary(v) => Value::Binary(v.clone()),
@@ -638,6 +661,27 @@ impl From<&DataType> for proto_schema::DataType {
             DataType::Map(map) => DataTypeKind::Map(Box::new(map.as_ref().into())),
             // The proto `VariantType` is intentionally empty: variants are opaque on the wire.
             DataType::Variant(_) => DataTypeKind::Variant(proto_schema::VariantType {}),
+            #[cfg(feature = "udt-in-dev")]
+            DataType::UserDefined(udt) => {
+                DataTypeKind::UserDefined(Box::new(proto_schema::UserDefinedType {
+                    sql_type: Some(Box::new(udt.sql_type().into())),
+                    annotation: udt
+                        .annotation()
+                        .iter()
+                        .map(|(key, value)| {
+                            (
+                                key.clone(),
+                                proto_schema::UserDefinedAnnotationValue {
+                                    value: value.clone(),
+                                },
+                            )
+                        })
+                        .collect(),
+                }))
+            }
+            // The proto `FileType` is empty: a `file` has a fixed, canonical set of sub-fields, so
+            // the type identity alone is enough to reconstruct it.
+            DataType::File(_) => DataTypeKind::File(proto_schema::FileType {}),
         };
         proto_schema::DataType { kind: Some(kind) }
     }
@@ -668,7 +712,8 @@ impl From<&PrimitiveType> for proto_schema::PrimitiveType {
                 PrimitiveTypeKind::Geography(geography.as_ref().into())
             }
             PrimitiveType::Void => PrimitiveTypeKind::Simple(Simple::Void as i32),
-            PrimitiveType::IntervalYearMonth => {
+            PrimitiveType::IntervalYearMonth(_) => {
+                // The proto tag carries no qualifier; decoding reconstructs the full-range type.
                 PrimitiveTypeKind::Simple(Simple::IntervalYearMonth as i32)
             }
             PrimitiveType::IntervalDayTime => {
@@ -779,12 +824,12 @@ impl From<&MetadataValue> for proto_schema::MetadataValue {
 
 impl TryFrom<proto_schema::StructType> for StructType {
     type Error = KernelError;
-    fn try_from(proto: proto_schema::StructType) -> Result<Self> {
+    fn try_from(proto: proto_schema::StructType) -> KernelResult<Self> {
         let fields = proto
             .fields
             .into_iter()
             .map(StructField::try_from)
-            .collect::<Result<Vec<_>>>()?;
+            .collect::<KernelResult<Vec<_>>>()?;
         StructType::try_new(fields)
     }
 }
@@ -792,7 +837,7 @@ impl TryFrom<proto_schema::StructType> for StructType {
 impl TryFrom<proto_schema::StructField> for StructField {
     type Error = KernelError;
 
-    fn try_from(proto: proto_schema::StructField) -> Result<Self> {
+    fn try_from(proto: proto_schema::StructField) -> KernelResult<Self> {
         let data_type = proto
             .data_type
             .ok_or_else(|| KernelError::schema("StructField proto missing data_type"))?;
@@ -800,7 +845,7 @@ impl TryFrom<proto_schema::StructField> for StructField {
             .metadata
             .into_iter()
             .map(|(key, value)| Ok::<_, KernelError>((key, MetadataValue::try_from(value)?)))
-            .collect::<Result<std::collections::HashMap<_, _>>>()?;
+            .collect::<KernelResult<std::collections::HashMap<_, _>>>()?;
         Ok(StructField {
             name: proto.name,
             data_type: DataType::try_from(data_type)?,
@@ -812,7 +857,7 @@ impl TryFrom<proto_schema::StructField> for StructField {
 
 impl TryFrom<proto_schema::DataType> for DataType {
     type Error = KernelError;
-    fn try_from(proto: proto_schema::DataType) -> Result<Self> {
+    fn try_from(proto: proto_schema::DataType) -> KernelResult<Self> {
         let kind = proto
             .kind
             .ok_or_else(|| KernelError::schema("DataType proto missing kind"))?;
@@ -823,6 +868,28 @@ impl TryFrom<proto_schema::DataType> for DataType {
             DataTypeKind::Map(map) => DataType::from(MapType::try_from(*map)?),
             // Kernel does not support shredded variants, so always decode as unshredded.
             DataTypeKind::Variant(_) => DataType::unshredded_variant(),
+            DataTypeKind::UserDefined(udt) => {
+                #[cfg(feature = "udt-in-dev")]
+                {
+                    let sql_type = DataType::try_from(
+                        *udt.sql_type
+                            .ok_or_else(|| KernelError::schema("UDT proto missing sql_type"))?,
+                    )?;
+                    let annotation = udt
+                        .annotation
+                        .into_iter()
+                        .map(|(key, value)| (key, value.value))
+                        .collect();
+                    let udt = crate::schema::UserDefinedType::try_new(sql_type, annotation)?;
+                    DataType::UserDefined(udt)
+                }
+                #[cfg(not(feature = "udt-in-dev"))]
+                {
+                    let _ = udt;
+                    return Err(KernelError::unsupported("UDT requires udt-in-dev"));
+                }
+            }
+            DataTypeKind::File(_) => DataType::file_type(),
         };
         Ok(data_type)
     }
@@ -830,7 +897,7 @@ impl TryFrom<proto_schema::DataType> for DataType {
 
 impl TryFrom<proto_schema::PrimitiveType> for PrimitiveType {
     type Error = KernelError;
-    fn try_from(proto: proto_schema::PrimitiveType) -> Result<Self> {
+    fn try_from(proto: proto_schema::PrimitiveType) -> KernelResult<Self> {
         let kind = proto
             .kind
             .ok_or_else(|| KernelError::schema("PrimitiveType proto missing kind"))?;
@@ -853,10 +920,12 @@ impl TryFrom<proto_schema::PrimitiveType> for PrimitiveType {
                     Simple::Timestamp => PrimitiveType::Timestamp,
                     Simple::TimestampNtz => PrimitiveType::TimestampNtz,
                     Simple::Void => PrimitiveType::Void,
-                    Simple::IntervalYearMonth => PrimitiveType::IntervalYearMonth,
+                    Simple::IntervalYearMonth => PrimitiveType::interval_year_month(
+                        IntervalYearToMonthType::IntervalYearToMonth,
+                    ),
                     Simple::IntervalDayTime => PrimitiveType::IntervalDayTime,
                     Simple::Unspecified => {
-                        return Err(KernelError::schema("SimplePrimitiveType is unspecified"))
+                        return Err(KernelError::schema("SimplePrimitiveType is unspecified"));
                     }
                 }
             }
@@ -875,7 +944,7 @@ impl TryFrom<proto_schema::PrimitiveType> for PrimitiveType {
             PrimitiveTypeKind::Geometry(_) | PrimitiveTypeKind::Geography(_) => {
                 return Err(KernelError::schema(
                     "geometry/geography types require the 'geo-type-in-dev' feature",
-                ))
+                ));
             }
         };
         Ok(primitive)
@@ -884,7 +953,7 @@ impl TryFrom<proto_schema::PrimitiveType> for PrimitiveType {
 
 impl TryFrom<proto_schema::DecimalType> for DecimalType {
     type Error = KernelError;
-    fn try_from(proto: proto_schema::DecimalType) -> Result<Self> {
+    fn try_from(proto: proto_schema::DecimalType) -> KernelResult<Self> {
         let precision = u8::try_from(proto.precision).map_err(|_| {
             KernelError::invalid_decimal(format!("precision out of range: {}", proto.precision))
         })?;
@@ -898,7 +967,7 @@ impl TryFrom<proto_schema::DecimalType> for DecimalType {
 #[cfg(feature = "geo-type-in-dev")]
 impl TryFrom<proto_schema::GeometryType> for GeometryType {
     type Error = KernelError;
-    fn try_from(proto: proto_schema::GeometryType) -> Result<Self> {
+    fn try_from(proto: proto_schema::GeometryType) -> KernelResult<Self> {
         GeometryType::try_new(&proto.crs)
     }
 }
@@ -906,7 +975,7 @@ impl TryFrom<proto_schema::GeometryType> for GeometryType {
 #[cfg(feature = "geo-type-in-dev")]
 impl TryFrom<proto_schema::GeographyType> for GeographyType {
     type Error = KernelError;
-    fn try_from(proto: proto_schema::GeographyType) -> Result<Self> {
+    fn try_from(proto: proto_schema::GeographyType) -> KernelResult<Self> {
         let algorithm = EdgeAlgo::try_from(proto.algorithm)
             .map_err(|_| {
                 KernelError::invalid_geo_params(format!(
@@ -922,7 +991,7 @@ impl TryFrom<proto_schema::GeographyType> for GeographyType {
 #[cfg(feature = "geo-type-in-dev")]
 impl TryFrom<EdgeAlgo> for EdgeInterpolationAlgorithm {
     type Error = KernelError;
-    fn try_from(proto: EdgeAlgo) -> Result<Self> {
+    fn try_from(proto: EdgeAlgo) -> KernelResult<Self> {
         let algorithm = match proto {
             EdgeAlgo::Spherical => EdgeInterpolationAlgorithm::Spherical,
             EdgeAlgo::Vincenty => EdgeInterpolationAlgorithm::Vincenty,
@@ -932,7 +1001,7 @@ impl TryFrom<EdgeAlgo> for EdgeInterpolationAlgorithm {
             EdgeAlgo::Unspecified => {
                 return Err(KernelError::invalid_geo_params(
                     "EdgeInterpolationAlgorithm is unspecified",
-                ))
+                ));
             }
         };
         Ok(algorithm)
@@ -941,7 +1010,7 @@ impl TryFrom<EdgeAlgo> for EdgeInterpolationAlgorithm {
 
 impl TryFrom<proto_schema::ArrayType> for ArrayType {
     type Error = KernelError;
-    fn try_from(proto: proto_schema::ArrayType) -> Result<Self> {
+    fn try_from(proto: proto_schema::ArrayType) -> KernelResult<Self> {
         let element_type = proto
             .element_type
             .ok_or_else(|| KernelError::schema("ArrayType proto missing element_type"))?;
@@ -954,7 +1023,7 @@ impl TryFrom<proto_schema::ArrayType> for ArrayType {
 
 impl TryFrom<proto_schema::MapType> for MapType {
     type Error = KernelError;
-    fn try_from(proto: proto_schema::MapType) -> Result<Self> {
+    fn try_from(proto: proto_schema::MapType) -> KernelResult<Self> {
         let key_type = proto
             .key_type
             .ok_or_else(|| KernelError::schema("MapType proto missing key_type"))?;
@@ -971,7 +1040,7 @@ impl TryFrom<proto_schema::MapType> for MapType {
 
 impl TryFrom<proto_schema::MetadataValue> for MetadataValue {
     type Error = KernelError;
-    fn try_from(proto: proto_schema::MetadataValue) -> Result<Self> {
+    fn try_from(proto: proto_schema::MetadataValue) -> KernelResult<Self> {
         let value = proto
             .value
             .ok_or_else(|| KernelError::schema("MetadataValue proto missing value"))?;
@@ -999,19 +1068,19 @@ mod tests {
     use super::EdgeAlgo;
     use crate::actions::deletion_vector::DeletionVectorDescriptor;
     use crate::expressions::{
-        col, column_name, lit, ArrayData, BinaryExpressionOp, BinaryPredicateOp, ColumnName,
-        DecimalData, Expression, ExpressionStructPatchBuilder, JunctionPredicateOp, MapData,
-        MapToStructOptions, OpaqueExpressionOp, OpaquePredicateOp, Predicate, Scalar,
-        ScalarExpressionEvaluator, StructData, UnaryExpressionOp, UnaryPredicateOp,
-        VariadicExpressionOp,
+        ArrayData, BinaryExpressionOp, BinaryPredicateOp, ColumnName, DecimalData, Expression,
+        ExpressionStructPatchBuilder, JunctionPredicateOp, MapData, MapToStructOptions,
+        OpaqueExpressionOp, OpaquePredicateOp, Predicate, Scalar, ScalarExpressionEvaluator,
+        StructData, UnaryExpressionOp, UnaryPredicateOp, VariadicExpressionOp, col, column_name,
+        lit,
     };
     use crate::kernel_predicates::{
         DirectDataSkippingPredicateEvaluator, DirectPredicateEvaluator,
         IndirectDataSkippingPredicateEvaluator,
     };
     use crate::plans::ir::nodes::{
-        Agg, Aggregate, DynamicScan, FileType, Filter, Operator, Project, RelationRef, ScanFile,
-        ScanJson, ScanParquet, SemiJoin, UnionAll, Values,
+        Agg, Aggregate, DynamicScan, FileType, Filter, Operator, PrefixSum, Project, RelationRef,
+        ScanFile, ScanJson, ScanParquet, SemiJoin, UnionAll, Values, WriteJson,
     };
     use crate::plans::ir::plan::{Plan, PlanNode};
     use crate::plans::proto::{
@@ -1020,12 +1089,12 @@ mod tests {
     };
     use crate::plans::{IoOperation, Operation};
     use crate::schema::{
-        schema, schema_ref, ArrayType, DataType, DecimalType, MapType, MetadataValue,
-        PrimitiveType, SchemaRef, StructField, StructType, ToSchema as _,
+        ArrayType, DataType, DecimalType, IntervalYearToMonthType, MapType, MetadataValue,
+        PrimitiveType, SchemaRef, StructField, StructType, ToSchema as _, schema, schema_ref,
     };
     #[cfg(feature = "geo-type-in-dev")]
     use crate::schema::{EdgeInterpolationAlgorithm, GeographyType, GeometryType};
-    use crate::{FileMeta, FileSlice, Result};
+    use crate::{FileMeta, FileSlice, KernelResult};
 
     // === Test helpers ===
 
@@ -1040,7 +1109,7 @@ mod tests {
             &self,
             _eval_expr: &ScalarExpressionEvaluator<'_>,
             _exprs: &[Expression],
-        ) -> Result<Scalar> {
+        ) -> KernelResult<Scalar> {
             Ok(Scalar::Integer(0))
         }
     }
@@ -1058,7 +1127,7 @@ mod tests {
             _eval_pred: &DirectPredicateEvaluator<'_>,
             _exprs: &[Expression],
             _inverted: bool,
-        ) -> Result<Option<bool>> {
+        ) -> KernelResult<Option<bool>> {
             Ok(Some(true))
         }
         fn eval_as_data_skipping_predicate(
@@ -1354,7 +1423,19 @@ mod tests {
         Operator::SemiJoin(SemiJoin { inverted: false, probe_keys: vec![], build_keys: vec![] }),
         "semi_join"
     )]
+    #[case(
+        Operator::PrefixSum(PrefixSum {
+            input: ColumnName::new(["n"]),
+            output: "offset".to_string(),
+            schema: sample_schema(),
+        }),
+        "prefix_sum"
+    )]
     #[case(Operator::UnionAll(UnionAll), "union_all")]
+    #[case(Operator::WriteJson(WriteJson {
+        file_path: Url::parse("memory:///out.json").unwrap(), overwrite: false,
+        schema: sample_schema(), ordered: true,
+    }), "write_json")]
     fn from_operator(#[case] op: Operator, #[case] expected: &str) {
         use proto_plan::operator::Op;
         let kind = match proto_plan::Operator::from(&op).op.unwrap() {
@@ -1367,9 +1448,29 @@ mod tests {
             Op::DynamicScan(_) => "dynamic_scan",
             Op::Aggregate(_) => "aggregate",
             Op::SemiJoin(_) => "semi_join",
+            Op::PrefixSum(_) => "prefix_sum",
             Op::UnionAll(_) => "union_all",
+            Op::WriteJson(_) => "write_json",
         };
         assert_eq!(kind, expected);
+    }
+
+    #[rstest]
+    fn from_write_json(
+        #[values(false, true)] overwrite: bool,
+        #[values(false, true)] ordered: bool,
+    ) {
+        let node = WriteJson {
+            file_path: Url::parse("memory:///output%20file.json").unwrap(),
+            overwrite,
+            ordered,
+            schema: sample_schema(),
+        };
+        let proto = proto_plan::WriteJsonNode::from(&node);
+        assert_eq!(proto.file_path, node.file_path.as_str());
+        assert_eq!(proto.overwrite, overwrite);
+        assert_eq!(proto.ordered, ordered);
+        assert_eq!(proto.schema, Some(node.schema.as_ref().into()));
     }
 
     #[test]
@@ -1490,7 +1591,7 @@ mod tests {
         #[case] base_url: Url,
         #[case] expected_base_url: &str,
         #[case] dv_column: Option<ColumnName>,
-    ) -> Result<()> {
+    ) -> KernelResult<()> {
         let expect_dv_column = dv_column.is_some();
         let node = DynamicScan::try_new(
             &sample_dynamic_scan_input_schema(),
@@ -1545,6 +1646,19 @@ mod tests {
         assert_eq!(proto.group_by.len(), 1);
         assert_eq!(proto.aggs.len(), 1);
         assert!(proto.aggs[0].func.is_some());
+        assert!(proto.schema.is_some());
+    }
+
+    #[test]
+    fn from_prefix_sum() {
+        let node = PrefixSum {
+            input: ColumnName::new(["n"]),
+            output: "offset".to_string(),
+            schema: sample_schema(),
+        };
+        let proto = proto_plan::PrefixSumNode::from(&node);
+        assert_eq!(proto.input.expect("input").path, ["n"]);
+        assert_eq!(proto.output, "offset");
         assert!(proto.schema.is_some());
     }
 
@@ -2009,11 +2123,19 @@ mod tests {
 
     #[rstest]
     #[case(
-        Scalar::IntervalYearMonth(30),
+        Scalar::interval_year_month(30, IntervalYearToMonthType::IntervalYearToMonth).unwrap(),
         proto_expr::scalar::Value::IntervalYearMonth(30)
     )]
     #[case(
-        Scalar::IntervalYearMonth(i32::MIN),
+        Scalar::interval_year_month(24, IntervalYearToMonthType::IntervalYear).unwrap(),
+        proto_expr::scalar::Value::IntervalYearMonth(24)
+    )]
+    #[case(
+        Scalar::interval_year_month(30, IntervalYearToMonthType::IntervalMonth).unwrap(),
+        proto_expr::scalar::Value::IntervalYearMonth(30)
+    )]
+    #[case(
+        Scalar::interval_year_month(i32::MIN, IntervalYearToMonthType::IntervalYearToMonth).unwrap(),
         proto_expr::scalar::Value::IntervalYearMonth(i32::MIN)
     )]
     #[case(
@@ -2029,6 +2151,20 @@ mod tests {
         #[case] expected: proto_expr::scalar::Value,
     ) {
         assert_eq!(scalar_value_of(scalar), expected);
+    }
+
+    #[rstest]
+    #[case(IntervalYearToMonthType::IntervalYear)]
+    #[case(IntervalYearToMonthType::IntervalMonth)]
+    #[case(IntervalYearToMonthType::IntervalYearToMonth)]
+    fn from_interval_year_month_null_encodes_generic_type(#[case] dtype: IntervalYearToMonthType) {
+        let scalar = Scalar::Null(DataType::interval_year_month(dtype));
+        let proto_expr::scalar::Value::Null(data_type) = scalar_value_of(scalar) else {
+            panic!("expected a null scalar");
+        };
+
+        let decoded = DataType::try_from(data_type).unwrap();
+        assert_eq!(decoded, DataType::INTERVAL_YEAR_MONTH);
     }
 
     #[test]
@@ -2092,12 +2228,82 @@ mod tests {
 
     // === Schema ===
 
+    #[cfg(feature = "udt-in-dev")]
+    #[test]
+    fn round_trip_user_defined_annotation() {
+        let value = serde_json::json!({
+            "type": "udt", "sqlType": "long", "class": "Id", "pyClass": null,
+            "extension": "opaque"
+        });
+        let data_type: DataType = serde_json::from_value(value.clone()).unwrap();
+        let decoded = DataType::try_from(proto_schema::DataType::from(&data_type)).unwrap();
+        assert_eq!(serde_json::to_value(decoded).unwrap(), value);
+    }
+
+    #[test]
+    fn reject_user_defined_proto_without_physical_type() {
+        let proto = proto_schema::DataType {
+            kind: Some(proto_schema::data_type::Kind::UserDefined(Box::new(
+                proto_schema::UserDefinedType {
+                    sql_type: None,
+                    annotation: Default::default(),
+                },
+            ))),
+        };
+        let error = DataType::try_from(proto).unwrap_err();
+        #[cfg(feature = "udt-in-dev")]
+        assert!(error.to_string().contains("missing sql_type"));
+        #[cfg(not(feature = "udt-in-dev"))]
+        assert!(error.to_string().contains("udt-in-dev"));
+    }
+
+    #[cfg(feature = "udt-in-dev")]
+    #[rstest]
+    #[case::reserved_key(true)]
+    #[case::nested_udt(false)]
+    fn proto_decode_rejects_invalid_udt(#[case] reserved_key: bool) {
+        let inner = proto_schema::UserDefinedType {
+            sql_type: Some(Box::new(proto_schema::DataType::from(&DataType::LONG))),
+            annotation: Default::default(),
+        };
+        let invalid = proto_schema::UserDefinedType {
+            sql_type: Some(Box::new(if reserved_key {
+                proto_schema::DataType::from(&DataType::LONG)
+            } else {
+                proto_schema::DataType {
+                    kind: Some(proto_schema::data_type::Kind::UserDefined(Box::new(inner))),
+                }
+            })),
+            annotation: if reserved_key {
+                [(
+                    "type".into(),
+                    proto_schema::UserDefinedAnnotationValue { value: None },
+                )]
+                .into()
+            } else {
+                Default::default()
+            },
+        };
+        let proto = proto_schema::DataType {
+            kind: Some(proto_schema::data_type::Kind::UserDefined(Box::new(
+                invalid,
+            ))),
+        };
+        let error = DataType::try_from(proto).unwrap_err();
+        assert!(error.to_string().contains(if reserved_key {
+            "reserved"
+        } else {
+            "another UDT"
+        }));
+    }
+
     #[rstest]
     #[case(DataType::INTEGER, "primitive")]
     #[case(ArrayType::new(DataType::INTEGER, true).into(), "array")]
     #[case(DataType::from(schema! { nullable "a": INTEGER }), "struct")]
     #[case(MapType::new(DataType::STRING, DataType::INTEGER, true).into(), "map")]
     #[case(DataType::unshredded_variant(), "variant")]
+    #[case(DataType::file_type(), "file")]
     fn from_data_type(#[case] value: DataType, #[case] expected: &str) {
         use proto_schema::data_type::Kind;
         let kind = match proto_schema::DataType::from(&value).kind.unwrap() {
@@ -2106,6 +2312,8 @@ mod tests {
             Kind::Struct(_) => "struct",
             Kind::Map(_) => "map",
             Kind::Variant(_) => "variant",
+            Kind::UserDefined(_) => "udt",
+            Kind::File(_) => "file",
         };
         assert_eq!(kind, expected);
     }
@@ -2128,7 +2336,15 @@ mod tests {
     )]
     #[case(PrimitiveType::Void, proto_schema::SimplePrimitiveType::Void)]
     #[case(
-        PrimitiveType::IntervalYearMonth,
+        PrimitiveType::interval_year_month(IntervalYearToMonthType::IntervalYearToMonth),
+        proto_schema::SimplePrimitiveType::IntervalYearMonth
+    )]
+    #[case(
+        PrimitiveType::interval_year_month(IntervalYearToMonthType::IntervalYear),
+        proto_schema::SimplePrimitiveType::IntervalYearMonth
+    )]
+    #[case(
+        PrimitiveType::interval_year_month(IntervalYearToMonthType::IntervalMonth),
         proto_schema::SimplePrimitiveType::IntervalYearMonth
     )]
     #[case(
@@ -2265,7 +2481,7 @@ mod tests {
             PrimitiveType::Timestamp,
             PrimitiveType::TimestampNtz,
             PrimitiveType::Void,
-            PrimitiveType::IntervalYearMonth,
+            PrimitiveType::interval_year_month(IntervalYearToMonthType::IntervalYearToMonth),
             PrimitiveType::IntervalDayTime
         )]
         primitive: PrimitiveType,
@@ -2388,6 +2604,22 @@ mod tests {
             decoded.expect("decode succeeds"),
             DataType::unshredded_variant()
         );
+    }
+
+    /// A `file` keeps its logical type on the wire: it must decode back to a `file`, not to the
+    /// plain struct it is physically stored as. Covers a top-level column and nested positions.
+    #[test]
+    fn file_round_trips() {
+        use crate::schema::StructField;
+        let schema = StructType::new_unchecked([
+            StructField::nullable("f", DataType::file_type()),
+            StructField::nullable("arr", ArrayType::new(DataType::file_type(), true)),
+            StructField::nullable(
+                "m",
+                MapType::new(DataType::STRING, DataType::file_type(), true),
+            ),
+        ]);
+        assert_schema_round_trips(schema);
     }
 
     // Builds a proto `DataType::Primitive` with the given (possibly malformed) primitive kind.

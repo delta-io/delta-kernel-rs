@@ -4,7 +4,7 @@ use url::Url;
 
 use crate::path::{LogPathFileType, ParsedLogPath};
 use crate::utils::require;
-use crate::{FileMeta, KernelError, KernelResult, Result, Version};
+use crate::{FileMeta, KernelError, KernelResult, Version};
 
 /// A catalog commit that has been ratified by the catalog but not yet published to the Delta log.
 ///
@@ -98,7 +98,7 @@ impl PublishMetadata {
     pub fn try_new(
         publish_to_version: Version,
         commits_to_publish: Vec<CatalogCommit>,
-    ) -> Result<Self> {
+    ) -> KernelResult<Self> {
         Self::validate_contiguous(&commits_to_publish)?;
         Self::validate_end_version(&commits_to_publish, publish_to_version)?;
         Ok(Self {
@@ -167,10 +167,12 @@ mod tests {
         let parsed_staged_commit = ParsedLogPath::create_parsed_staged_commit(&table_root(), 10);
         let catalog_commit = CatalogCommit::try_new(&log_root(), &parsed_staged_commit).unwrap();
         assert_eq!(catalog_commit.version(), 10);
-        assert!(catalog_commit
-            .location()
-            .as_str()
-            .starts_with("memory:///_delta_log/_staged_commits/00000000000000000010"));
+        assert!(
+            catalog_commit
+                .location()
+                .as_str()
+                .starts_with("memory:///_delta_log/_staged_commits/00000000000000000010")
+        );
         assert_eq!(
             catalog_commit.published_location().as_str(),
             "memory:///_delta_log/00000000000000000010.json"

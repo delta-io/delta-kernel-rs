@@ -27,7 +27,7 @@ static GLOBAL_ALLOC: TrackingAlloc = TrackingAlloc::new();
 /// Whether this library was built with allocation tracking.
 ///
 /// Native-memory getters return zero when this is false.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn alloc_tracking_enabled() -> bool {
     cfg!(feature = "alloc-tracking")
 }
@@ -53,7 +53,7 @@ pub struct NativeMemoryStats {
 /// The value remains zero until [`reset_native_memory_stats`] starts a new measurement window.
 /// Its relationship to the current total is advisory; see the concurrent-reset contract.
 /// Returns zero when built without `alloc-tracking`.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn min_native_bytes() -> u64 {
     #[cfg(feature = "alloc-tracking")]
     {
@@ -70,7 +70,7 @@ pub extern "C" fn min_native_bytes() -> u64 {
 /// The value is process-wide, not per-operation, and counts requested Rust allocation sizes only.
 /// Its relationship to the current total is advisory; see [`reset_native_memory_stats`].
 /// Returns zero when built without `alloc-tracking`.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn max_native_bytes() -> u64 {
     #[cfg(feature = "alloc-tracking")]
     {
@@ -86,7 +86,7 @@ pub extern "C" fn max_native_bytes() -> u64 {
 ///
 /// The value is process-wide and counts requested Rust allocation sizes only. Returns zero when
 /// built without `alloc-tracking`.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn current_native_bytes() -> u64 {
     #[cfg(feature = "alloc-tracking")]
     {
@@ -107,7 +107,7 @@ pub extern "C" fn current_native_bytes() -> u64 {
 /// requiring reliable windows must quiesce tracked allocation and serialize resets.
 ///
 /// All fields are zero when built without `alloc-tracking`.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn reset_native_memory_stats() -> NativeMemoryStats {
     #[cfg(feature = "alloc-tracking")]
     {
@@ -126,7 +126,7 @@ pub extern "C" fn reset_native_memory_stats() -> NativeMemoryStats {
 /// extrema or mix windows, so the fields do not form a coherent snapshot.
 ///
 /// All fields are zero when built without `alloc-tracking`.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn get_native_memory_stats() -> NativeMemoryStats {
     #[cfg(feature = "alloc-tracking")]
     {
@@ -261,8 +261,8 @@ mod disabled_tests {
     use rstest::rstest;
 
     use super::{
-        alloc_tracking_enabled, current_native_bytes, get_native_memory_stats, max_native_bytes,
-        min_native_bytes, reset_native_memory_stats, NativeMemoryStats,
+        NativeMemoryStats, alloc_tracking_enabled, current_native_bytes, get_native_memory_stats,
+        max_native_bytes, min_native_bytes, reset_native_memory_stats,
     };
 
     #[rstest]
@@ -290,12 +290,12 @@ mod tests {
 
     use rstest::rstest;
 
+    use super::{NativeMemoryStats, TrackingAlloc};
     #[cfg(feature = "alloc-tracking")]
     use super::{
         alloc_tracking_enabled, current_native_bytes, get_native_memory_stats, max_native_bytes,
         min_native_bytes, reset_native_memory_stats,
     };
-    use super::{NativeMemoryStats, TrackingAlloc};
 
     const _: () = {
         assert!(size_of::<NativeMemoryStats>() == 24);

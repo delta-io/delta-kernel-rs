@@ -2,14 +2,14 @@
 
 use std::sync::Arc;
 
+use delta_kernel::KernelResult;
 use delta_kernel::committer::FileSystemCommitter;
-use delta_kernel::expressions::{column_name, ColumnName};
-use delta_kernel::schema::{schema_ref, DataType, StructField, StructType};
+use delta_kernel::expressions::{ColumnName, column_name};
+use delta_kernel::schema::{DataType, StructField, StructType, schema_ref};
 use delta_kernel::snapshot::Snapshot;
 use delta_kernel::table_features::TableFeature;
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
-use delta_kernel::Result;
 use rstest::rstest;
 use test_utils::{assert_result_error_with_message, test_table_setup};
 
@@ -18,7 +18,7 @@ use super::simple_schema;
 /// Builds a schema that supports clustering at depths 1, 2, and 5:
 ///   { id: int, name: string, address: { city: string, zip: string },
 ///     l1: { l2: { l3: { l4: { value: double } } } } }
-fn clustering_test_schema() -> Result<Arc<StructType>> {
+fn clustering_test_schema() -> KernelResult<Arc<StructType>> {
     Ok(schema_ref! {
         nullable "id": INTEGER,
         nullable "name": STRING,
@@ -45,7 +45,7 @@ fn clustering_test_schema() -> Result<Arc<StructType>> {
 #[case::nested_mismatched_casing(vec![vec!["ADDRESS", "CITY"]])]
 #[case::mixed(vec![vec!["id"], vec!["name"], vec!["address", "city"], vec!["address", "zip"], vec!["l1", "l2", "l3", "l4", "value"]])]
 #[tokio::test]
-async fn test_create_clustered_table(#[case] col_paths: Vec<Vec<&str>>) -> Result<()> {
+async fn test_create_clustered_table(#[case] col_paths: Vec<Vec<&str>>) -> KernelResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
     let schema = clustering_test_schema()?;
     let input_cols: Vec<ColumnName> = col_paths
@@ -58,7 +58,7 @@ async fn test_create_clustered_table(#[case] col_paths: Vec<Vec<&str>>) -> Resul
         .map(|p| ColumnName::new(p.iter().map(|s| s.to_lowercase()).collect::<Vec<_>>()))
         .collect();
 
-    let txn = create_table(&table_path, schema, "Test/1.0")
+    let txn = create_table(&table_path, schema, "Test/1.0", true)
         .with_data_layout(DataLayout::Clustered {
             columns: input_cols,
         })
@@ -77,7 +77,9 @@ async fn test_create_clustered_table(#[case] col_paths: Vec<Vec<&str>>) -> Resul
     let table_url = delta_kernel::try_parse_uri(&table_path)?;
     let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
 
-    let clustering_columns = snapshot.get_physical_clustering_columns(engine.as_ref())?;
+    let clustering_columns = snapshot
+        .reader()
+        .get_physical_clustering_columns(engine.as_ref())?;
     assert_eq!(clustering_columns, Some(expected_cols));
 
     let table_configuration = snapshot.table_configuration();
@@ -100,13 +102,13 @@ async fn test_create_clustered_table(#[case] col_paths: Vec<Vec<&str>>) -> Resul
 /// AND uses `DataLayout::Clustered`. Both would try to add DomainMetadata, but we should
 /// only have it once in the feature lists.
 #[tokio::test]
-async fn test_clustering_with_explicit_feature_signal_no_duplicates() -> Result<()> {
+async fn test_clustering_with_explicit_feature_signal_no_duplicates() -> KernelResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
     let schema = simple_schema()?;
 
     // Combine BOTH: explicit feature signal AND clustering (which auto-adds domainMetadata)
-    let _ = create_table(&table_path, schema, "Test/1.0")
+    let _ = create_table(&table_path, schema, "Test/1.0", true)
         .with_table_properties([("delta.feature.domainMetadata", "supported")])
         .with_data_layout(DataLayout::clustered(["id"]))
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
@@ -132,14 +134,16 @@ async fn test_clustering_with_explicit_feature_signal_no_duplicates() -> Result<
     );
 
     // Verify clustering columns via snapshot read path
-    let clustering_columns = snapshot.get_physical_clustering_columns(engine.as_ref())?;
+    let clustering_columns = snapshot
+        .reader()
+        .get_physical_clustering_columns(engine.as_ref())?;
     assert_eq!(clustering_columns, Some(vec![column_name!("id")]));
 
     Ok(())
 }
 
 #[tokio::test]
-async fn test_clustering_stats_columns_within_limit() -> Result<()> {
+async fn test_clustering_stats_columns_within_limit() -> KernelResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
     // Build schema with 10 columns (cluster on column 5, within default 32 limit)
@@ -149,7 +153,7 @@ async fn test_clustering_stats_columns_within_limit() -> Result<()> {
     let schema = Arc::new(StructType::try_new(fields)?);
 
     // Create clustered table on col5
-    let txn = create_table(&table_path, schema, "Test/1.0")
+    let txn = create_table(&table_path, schema, "Test/1.0", true)
         .with_data_layout(DataLayout::clustered(["col5"]))
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
 
@@ -164,7 +168,7 @@ async fn test_clustering_stats_columns_within_limit() -> Result<()> {
 }
 
 #[tokio::test]
-async fn test_clustering_stats_columns_beyond_limit() -> Result<()> {
+async fn test_clustering_stats_columns_beyond_limit() -> KernelResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
     // Build schema with 40 columns (cluster on column 35, beyond default 32 limit)
@@ -174,7 +178,7 @@ async fn test_clustering_stats_columns_beyond_limit() -> Result<()> {
     let schema = Arc::new(StructType::try_new(fields)?);
 
     // Create clustered table on col35 (position > 32)
-    let txn = create_table(&table_path, schema, "Test/1.0")
+    let txn = create_table(&table_path, schema, "Test/1.0", true)
         .with_data_layout(DataLayout::clustered(["col35"]))
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
 
@@ -204,11 +208,11 @@ async fn test_clustering_stats_columns_beyond_limit() -> Result<()> {
 async fn test_clustering_column_error(
     #[case] col_path: Vec<&str>,
     #[case] expected_error: &str,
-) -> Result<()> {
+) -> KernelResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
     let schema = clustering_test_schema()?;
 
-    let result = create_table(&table_path, schema, "Test/1.0")
+    let result = create_table(&table_path, schema, "Test/1.0", true)
         .with_data_layout(DataLayout::Clustered {
             columns: vec![ColumnName::new(col_path.iter().copied())],
         })

@@ -23,6 +23,10 @@ pub(crate) struct StatsConfig<'a> {
     /// struct. Orthogonal to the filtering above: a VARIANT leaf counts against the column limit
     /// and appears in `nullCount` either way.
     pub(crate) variant_min_max: bool,
+    /// Whether Geometry bounding-box statistics are included with the column's logical type.
+    /// Geometry counts as one leaf and has a `nullCount` independently of this option.
+    #[cfg(feature = "geo-type-in-dev")]
+    pub(crate) geometry_min_max: bool,
 }
 
 /// Handles column filtering logic for statistics based on table properties.
@@ -235,7 +239,10 @@ impl<'col> StatsColumnFilter<'col> {
                     self.collect_field(child, result);
                 }
             }
-            // All non-struct types are leaf columns for stats purposes: they count against
+            // A `file` has no statistics yet (its per-leaf statistics are not implemented), so it
+            // takes no slot against the column limit and other columns keep theirs.
+            DataType::File(_) => {}
+            // All other non-struct types are leaf columns for stats purposes: they count against
             // the column limit and are included in nullCount. Array, Map, and (unless the caller
             // opts in) Variant are excluded from min/max by MinMaxStatsTransform.
             _ => {
@@ -280,7 +287,7 @@ fn collect_required_leaf_paths(
 mod tests {
     use super::*;
     use crate::expressions::column_name;
-    use crate::schema::{schema, StructType};
+    use crate::schema::{StructType, schema};
     use crate::table_properties::TableProperties;
 
     fn make_props_with_num_cols(n: u64) -> TableProperties {

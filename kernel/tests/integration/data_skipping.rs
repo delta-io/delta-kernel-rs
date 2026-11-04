@@ -21,23 +21,26 @@ use delta_kernel::checkpoint::{CheckpointSpec, V2CheckpointConfig};
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
 use delta_kernel::expressions::{
-    col, column_name, lit, Expression as Expr, Predicate as Pred, PredicateRef, Scalar,
+    Expression as Expr, Predicate as Pred, PredicateRef, Scalar, col, column_name, lit,
 };
 use delta_kernel::metrics::{MetricEvent, ScanType};
 use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::scan::{AfterSequentialScanMetadata, ParallelScanMetadata, Scan, StatsOptions};
-use delta_kernel::schema::{schema, schema_ref, DataType, SchemaRef, StructField, StructType};
+use delta_kernel::schema::{
+    DataType, IntervalYearToMonthType, SchemaRef, StructField, StructType, schema, schema_ref,
+};
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
 use delta_kernel::{KernelError, Snapshot, SnapshotRef};
 use rstest::rstest;
 use serde::Serialize;
-use serde_json::{json, Value};
-use test_utils::delta_kernel_default_engine::executor::tokio::TokioMultiThreadExecutor;
+use serde_json::{Value, json};
 use test_utils::delta_kernel_default_engine::DefaultEngine;
+use test_utils::delta_kernel_default_engine::executor::tokio::TokioMultiThreadExecutor;
 use test_utils::{
-    add_commit, create_table_and_load_snapshot, install_thread_local_metrics_reporter,
-    into_record_batch, test_table_setup_mt, write_batch_to_table, CapturingReporter,
+    CapturingReporter, add_commit, create_table_and_load_snapshot,
+    install_thread_local_metrics_reporter, into_record_batch, test_table_setup_mt,
+    write_batch_to_table,
 };
 use url::Url;
 
@@ -78,8 +81,8 @@ fn long_batch(schema: &SchemaRef, c0_start: i64, rows: i64) -> RecordBatch {
 /// Creates a fresh table with `dataSkippingNumIndexedCols=2`, writes three add-files with
 /// disjoint `c0`/`c1` ranges, then checkpoints. Returns `(temp_dir, table_path, engine)`.
 /// The `temp_dir` keeps the on-disk table alive for the duration of the test.
-async fn build_capped_table_with_checkpoint(
-) -> Result<(tempfile::TempDir, String, Arc<TestEngine>), Box<dyn std::error::Error>> {
+async fn build_capped_table_with_checkpoint()
+-> Result<(tempfile::TempDir, String, Arc<TestEngine>), Box<dyn std::error::Error>> {
     let schema = capped_schema();
     let (tmp_dir, table_path, engine) = test_table_setup_mt()?;
     let table_url = Url::from_directory_path(&table_path)
@@ -953,7 +956,7 @@ async fn scan_with_replace_table_schema_change(
         nullable "part": STRING,
         nullable "value": STRING,
     };
-    create_table(&table_path, old_schema, "Test/1.0")
+    create_table(&table_path, old_schema, "Test/1.0", true)
         .with_data_layout(DataLayout::partitioned(["part"]))
         .with_table_properties([("delta.feature.v2Checkpoint", "supported")])
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
@@ -1220,7 +1223,7 @@ async fn partition_pruning_honors_rfc3339_offset_partition_values(
         nullable "ts": TIMESTAMP,
         nullable "v": LONG,
     };
-    create_table(&table_path, schema, "Test/1.0")
+    create_table(&table_path, schema, "Test/1.0", true)
         .with_data_layout(DataLayout::partitioned(["ts"]))
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
         .commit(engine.as_ref())?
@@ -1274,9 +1277,21 @@ async fn partition_pruning_honors_rfc3339_offset_partition_values(
 #[rstest]
 #[case::year_month(
     DataType::INTERVAL_YEAR_MONTH,
-    Scalar::IntervalYearMonth(12),
-    Scalar::IntervalYearMonth(12),
-    Scalar::IntervalYearMonth(24)
+    Scalar::interval_year_month(12, IntervalYearToMonthType::IntervalYearToMonth).unwrap(),
+    Scalar::interval_year_month(12, IntervalYearToMonthType::IntervalYearToMonth).unwrap(),
+    Scalar::interval_year_month(24, IntervalYearToMonthType::IntervalYearToMonth).unwrap()
+)]
+#[case::year(
+    DataType::INTERVAL_YEAR,
+    Scalar::interval_year_month(12, IntervalYearToMonthType::IntervalYear).unwrap(),
+    Scalar::interval_year_month(12, IntervalYearToMonthType::IntervalYear).unwrap(),
+    Scalar::interval_year_month(24, IntervalYearToMonthType::IntervalYear).unwrap()
+)]
+#[case::month(
+    DataType::INTERVAL_MONTH,
+    Scalar::interval_year_month(13, IntervalYearToMonthType::IntervalMonth).unwrap(),
+    Scalar::interval_year_month(13, IntervalYearToMonthType::IntervalMonth).unwrap(),
+    Scalar::interval_year_month(25, IntervalYearToMonthType::IntervalMonth).unwrap()
 )]
 #[case::day_time(
     DataType::INTERVAL_DAY_TIME,
@@ -1297,7 +1312,7 @@ async fn interval_partition_values_do_not_prune_files(
         nullable "period": (interval),
         nullable "v": LONG,
     };
-    let mut snapshot = create_table(&table_path, schema, "Test/1.0")
+    let mut snapshot = create_table(&table_path, schema, "Test/1.0", true)
         .with_data_layout(DataLayout::partitioned(["period"]))
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
         .commit(engine.as_ref())?

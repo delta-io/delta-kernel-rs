@@ -18,7 +18,7 @@ test:
 	cargo clean --manifest-path $(KERNEL_PATH)/kernel/Cargo.toml
 	cargo build --locked --manifest-path $(KERNEL_PATH)/Cargo.toml \
 	  -p delta_kernel -p delta_kernel_default_engine \
-	  --features "delta_kernel/internal-api,delta_kernel/prettyprint,delta_kernel_default_engine/rustls,delta_kernel_default_engine/arrow"
+	  --features "delta_kernel/internal-api,delta_kernel/prettyprint,delta_kernel/check-constraints-in-dev,delta_kernel_default_engine/rustls,delta_kernel_default_engine/arrow"
 	mdbook test -L $(KERNEL_PATH)/target/debug/deps
 
 # Clean build artifacts

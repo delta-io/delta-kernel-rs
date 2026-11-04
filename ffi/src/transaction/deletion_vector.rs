@@ -1,17 +1,17 @@
 //! FFI surface for deletion-vector update transactions.
 //!
 //! Engines build a descriptor map from connector-authored DVs, then pass it with scan metadata to
-//! [`transaction_update_deletion_vectors`] to stage the remove/add action pairs.
+//! [`update_table_txn_update_deletion_vectors`] to stage the remove/add action pairs.
 
 use std::collections::HashMap;
 use std::os::raw::c_int;
 
 use delta_kernel::actions::deletion_vector::{DeletionVectorDescriptor, DeletionVectorStorageType};
 use delta_kernel::transaction::Transaction;
-use delta_kernel::{KernelError, KernelResult, Result};
+use delta_kernel::{KernelError, KernelResult};
 use delta_kernel_ffi_macros::handle_descriptor;
 
-use super::ExclusiveTransaction;
+use super::ExclusiveUpdateTableTransaction;
 use crate::error::{ExternResult, IntoExternResult};
 use crate::handle::Handle;
 use crate::scan::SharedScanMetadataIterator;
@@ -23,7 +23,7 @@ use crate::{KernelStringSlice, SharedExternEngine, TryFromStringSlice};
 
 /// Owns a map from data-file path to the new [`DeletionVectorDescriptor`] for that file.
 /// Engines build the map by inserting descriptors and pass it to
-/// [`transaction_update_deletion_vectors`].
+/// [`update_table_txn_update_deletion_vectors`].
 pub struct DvDescriptorMap {
     inner: HashMap<String, DeletionVectorDescriptor>,
 }
@@ -37,9 +37,9 @@ pub struct ExclusiveDvDescriptorMap;
 pub struct ExclusiveDvDescriptor;
 
 /// Allocate an empty deletion vector descriptor map. The returned handle must be released
-/// either by [`free_dv_descriptor_map`] or by [`transaction_update_deletion_vectors`]
+/// either by [`free_dv_descriptor_map`] or by [`update_table_txn_update_deletion_vectors`]
 /// (which consumes the map).
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn dv_descriptor_map_new() -> Handle<ExclusiveDvDescriptorMap> {
     Box::new(DvDescriptorMap {
         inner: HashMap::new(),
@@ -52,9 +52,9 @@ pub extern "C" fn dv_descriptor_map_new() -> Handle<ExclusiveDvDescriptorMap> {
 /// # Safety
 ///
 /// Caller must pass a valid handle previously returned by [`dv_descriptor_map_new`].
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn free_dv_descriptor_map(map: Handle<ExclusiveDvDescriptorMap>) {
-    map.drop_handle();
+    unsafe { map.drop_handle() }
 }
 
 /// Free a deletion vector descriptor handle. Only call this if the descriptor has not been
@@ -63,9 +63,9 @@ pub unsafe extern "C" fn free_dv_descriptor_map(map: Handle<ExclusiveDvDescripto
 /// # Safety
 ///
 /// Caller must pass a valid descriptor handle.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn free_dv_descriptor(descriptor: Handle<ExclusiveDvDescriptor>) {
-    descriptor.drop_handle();
+    unsafe { descriptor.drop_handle() }
 }
 
 // =============================================================================
@@ -102,7 +102,7 @@ impl From<KernelDvStorageType> for DeletionVectorStorageType {
 impl TryFrom<c_int> for KernelDvStorageType {
     type Error = KernelError;
 
-    fn try_from(value: c_int) -> Result<Self> {
+    fn try_from(value: c_int) -> KernelResult<Self> {
         match value {
             0 => Ok(Self::PersistedRelative),
             1 => Ok(Self::Inline),
@@ -115,7 +115,7 @@ impl TryFrom<c_int> for KernelDvStorageType {
 }
 
 /// Construct a [`DeletionVectorDescriptor`] from raw fields, for engines that author DV
-/// files themselves and want to install them via [`transaction_update_deletion_vectors`].
+/// files themselves and want to install them via [`update_table_txn_update_deletion_vectors`].
 ///
 /// Field validation (storage-type rules, non-negative size/cardinality/offset, etc.) is
 /// performed by [`DeletionVectorDescriptor::try_new`]; see its docs for the full contract.
@@ -128,8 +128,8 @@ impl TryFrom<c_int> for KernelDvStorageType {
 ///
 /// # Safety
 ///
-/// Caller must pass valid string slice and engine handle.
-#[no_mangle]
+/// `path_or_inline_dv` and `engine` must be valid. Both are borrowed for this call.
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn dv_descriptor_new(
     storage_type: c_int,
     path_or_inline_dv: KernelStringSlice,
@@ -151,7 +151,7 @@ pub unsafe extern "C" fn dv_descriptor_new(
             cardinality,
         )
     });
-    result.into_extern_result(&engine)
+    unsafe { result.into_extern_result(&engine) }
 }
 
 fn dv_descriptor_new_impl(
@@ -179,14 +179,14 @@ fn dv_descriptor_new_impl(
 /// `data_file_path` must be the data-file path exactly as it appears in the scan
 /// metadata produced by the kernel (the Add file action's `path` field). The kernel
 /// matches against this string when applying the DV update; a typo causes
-/// [`transaction_update_deletion_vectors`] to return an error.
+/// [`update_table_txn_update_deletion_vectors`] to return an error.
 /// Re-inserting a descriptor for an existing path replaces the previous descriptor.
 ///
 /// # Safety
 ///
-/// Caller must pass valid handles. The descriptor handle is consumed and must not be used or freed
-/// after this call, regardless of the result.
-#[no_mangle]
+/// All handles and `data_file_path` must be valid. This call mutably borrows `map`, borrows
+/// `engine` and `data_file_path`, and unconditionally consumes `descriptor`, including on error.
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn dv_descriptor_map_insert(
     mut map: Handle<ExclusiveDvDescriptorMap>,
     data_file_path: KernelStringSlice,
@@ -197,9 +197,8 @@ pub unsafe extern "C" fn dv_descriptor_map_insert(
     let engine_ref = unsafe { engine.as_ref() };
     let descriptor = unsafe { descriptor.into_inner() };
     let path_result = unsafe { TryFromStringSlice::try_from_slice(&data_file_path) };
-    dv_descriptor_map_insert_impl(map_ref, path_result, *descriptor)
-        .map(|_| true)
-        .into_extern_result(&engine_ref)
+    let result = dv_descriptor_map_insert_impl(map_ref, path_result, *descriptor).map(|_| true);
+    unsafe { result.into_extern_result(&engine_ref) }
 }
 
 fn dv_descriptor_map_insert_impl(
@@ -229,19 +228,18 @@ fn dv_descriptor_map_insert_impl(
 /// references a path that does not appear in the iterator, the call returns an error and
 /// leaves the transaction unchanged.
 ///
-/// This stages data-changing DV updates by default. Call
-/// [`crate::transaction::set_data_change`] first for maintenance operations that should commit
-/// with `dataChange = false`.
+/// These updates use the `data_change` flag supplied to
+/// [`crate::transaction::new_update_table_txn_builder`]. Pass `false` for maintenance operations
+/// that preserve logical data.
 ///
 /// # Safety
 ///
-/// Caller must pass valid handles. The transaction handle is borrowed in place and remains
-/// valid after this call; the caller is expected to follow with `commit` (or
-/// `free_transaction`) on the same handle. The DV map and scan iterator handles are
-/// consumed and must not be used or freed after this call.
-#[no_mangle]
-pub unsafe extern "C" fn transaction_update_deletion_vectors(
-    mut txn: Handle<ExclusiveTransaction>,
+/// All handles must be valid. This call mutably borrows `txn`, borrows `engine`, and
+/// unconditionally consumes both `dv_map` and `scan_iter`, including on error. Do not use or free
+/// either consumed handle afterward. The caller must eventually commit or free `txn`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn update_table_txn_update_deletion_vectors(
+    mut txn: Handle<ExclusiveUpdateTableTransaction>,
     dv_map: Handle<ExclusiveDvDescriptorMap>,
     scan_iter: Handle<SharedScanMetadataIterator>,
     engine: Handle<SharedExternEngine>,
@@ -250,12 +248,12 @@ pub unsafe extern "C" fn transaction_update_deletion_vectors(
     let dv_map = unsafe { dv_map.into_inner() };
     let scan_iter = unsafe { scan_iter.into_inner() };
     let engine_ref = unsafe { engine.as_ref() };
-    transaction_update_deletion_vectors_impl(txn_ref, *dv_map, &scan_iter)
-        .map(|_| true)
-        .into_extern_result(&engine_ref)
+    let result =
+        update_table_txn_update_deletion_vectors_impl(txn_ref, *dv_map, &scan_iter).map(|_| true);
+    unsafe { result.into_extern_result(&engine_ref) }
 }
 
-fn transaction_update_deletion_vectors_impl(
+fn update_table_txn_update_deletion_vectors_impl(
     txn: &mut Transaction,
     dv_map: DvDescriptorMap,
     scan_iter: &crate::scan::ScanMetadataIterator,

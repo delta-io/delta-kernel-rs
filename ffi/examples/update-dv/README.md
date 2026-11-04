@@ -11,8 +11,8 @@ It demonstrates:
 - `dv_descriptor_new`
 - `dv_descriptor_map_insert`
 - `scan_metadata_iter_init`
-- `transaction_update_deletion_vectors`
-- `commit`
+- `update_table_txn_update_deletion_vectors`
+- `update_table_txn_commit`
 
 # Building
 

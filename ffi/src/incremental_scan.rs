@@ -43,12 +43,12 @@ use delta_kernel_ffi_macros::handle_descriptor;
 #[cfg(feature = "default-engine-base")]
 use crate::engine_data::ArrowFFIData;
 use crate::handle::Handle;
-use crate::scan::{decode_engine_predicate, EnginePredicate};
 #[cfg(feature = "default-engine-base")]
 use crate::scan::{CTransforms, ScanMetadataArrowResult};
+use crate::scan::{EnginePredicate, decode_engine_predicate};
 use crate::{
-    kernel_string_slice, ExternEngine, ExternResult, IntoExternResult, KernelStringSlice,
-    NullableCvoid, OptionalValue, SharedExternEngine, SharedSnapshot,
+    ExternEngine, ExternResult, IntoExternResult, KernelStringSlice, NullableCvoid, OptionalValue,
+    SharedExternEngine, SharedSnapshot, kernel_string_slice,
 };
 
 /// Opaque builder for constructing an [`IncrementalScanStream`] from a snapshot.
@@ -97,7 +97,7 @@ pub struct SharedIncrementalScanSummary;
 /// # Safety
 ///
 /// Caller must pass a valid snapshot handle and engine handle.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn snapshot_incremental_scan_builder(
     snapshot: Handle<SharedSnapshot>,
     base_version: Version,
@@ -128,7 +128,7 @@ pub unsafe extern "C" fn snapshot_incremental_scan_builder(
 /// `builder` and `engine` must be valid handles. The `builder` handle must not be used after this
 /// call. `predicate` must be a valid, non-null [`EnginePredicate`] whose `visitor` and `predicate`
 /// fields are safe to call and read.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn incremental_scan_builder_with_predicate(
     builder: Handle<ExclusiveIncrementalScanBuilder>,
     engine: Handle<SharedExternEngine>,
@@ -136,7 +136,8 @@ pub unsafe extern "C" fn incremental_scan_builder_with_predicate(
 ) -> ExternResult<Handle<ExclusiveIncrementalScanBuilder>> {
     let engine = unsafe { engine.as_ref() };
     let builder = unsafe { builder.into_inner() };
-    incremental_scan_builder_with_predicate_impl(*builder, predicate).into_extern_result(&engine)
+    let result = incremental_scan_builder_with_predicate_impl(*builder, predicate);
+    unsafe { result.into_extern_result(&engine) }
 }
 
 fn incremental_scan_builder_with_predicate_impl(
@@ -163,13 +164,14 @@ fn incremental_scan_builder_with_predicate_impl(
 /// # Safety
 ///
 /// Caller must pass a valid builder pointer and must not use it again after this call.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn incremental_scan_builder_build(
     builder: Handle<ExclusiveIncrementalScanBuilder>,
 ) -> ExternResult<OptionalValue<Handle<SharedIncrementalScanStream>>> {
     let builder = unsafe { builder.into_inner() };
     let engine = builder.engine.clone();
-    incremental_scan_builder_build_impl(*builder).into_extern_result(&engine.as_ref())
+    let result = incremental_scan_builder_build_impl(*builder);
+    unsafe { result.into_extern_result(&engine.as_ref()) }
 }
 
 fn incremental_scan_builder_build_impl(
@@ -196,11 +198,11 @@ fn incremental_scan_builder_build_impl(
 /// # Safety
 ///
 /// Caller must pass a valid builder pointer and must not use it again after this call.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn free_incremental_scan_builder(
     builder: Handle<ExclusiveIncrementalScanBuilder>,
 ) {
-    builder.drop_handle();
+    unsafe { builder.drop_handle() }
 }
 
 /// Get the next live-Add batch from the stream as Arrow via the C Data Interface.
@@ -222,12 +224,13 @@ pub unsafe extern "C" fn free_incremental_scan_builder(
 ///
 /// Caller must pass a valid stream handle.
 #[cfg(feature = "default-engine-base")]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn incremental_scan_stream_next_arrow(
     stream: Handle<SharedIncrementalScanStream>,
 ) -> ExternResult<*mut ScanMetadataArrowResult> {
     let stream = unsafe { stream.as_ref() };
-    incremental_scan_stream_next_arrow_impl(stream).into_extern_result(&stream.engine.as_ref())
+    let result = incremental_scan_stream_next_arrow_impl(stream);
+    unsafe { result.into_extern_result(&stream.engine.as_ref()) }
 }
 
 #[cfg(feature = "default-engine-base")]
@@ -281,13 +284,14 @@ fn next_arrow_batch(
 /// # Safety
 ///
 /// Caller must pass a valid stream handle and must not use it again after this call.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn incremental_scan_stream_into_summary(
     stream: Handle<SharedIncrementalScanStream>,
 ) -> ExternResult<Handle<SharedIncrementalScanSummary>> {
     let inner_stream = unsafe { stream.into_inner() };
     let engine = inner_stream.engine.clone();
-    incremental_scan_stream_into_summary_impl(&inner_stream).into_extern_result(&engine.as_ref())
+    let result = incremental_scan_stream_into_summary_impl(&inner_stream);
+    unsafe { result.into_extern_result(&engine.as_ref()) }
 }
 
 fn incremental_scan_stream_into_summary_impl(
@@ -314,7 +318,7 @@ fn lock_stream(
 /// # Safety
 ///
 /// Caller must pass a valid summary handle.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn incremental_scan_summary_base_version(
     summary: Handle<SharedIncrementalScanSummary>,
 ) -> Version {
@@ -326,7 +330,7 @@ pub unsafe extern "C" fn incremental_scan_summary_base_version(
 /// # Safety
 ///
 /// Caller must pass a valid summary handle.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn incremental_scan_summary_target_version(
     summary: Handle<SharedIncrementalScanSummary>,
 ) -> Version {
@@ -345,7 +349,7 @@ pub unsafe extern "C" fn incremental_scan_summary_target_version(
 /// # Safety
 ///
 /// Caller must pass a valid summary handle and a non-null `callback` function pointer.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn incremental_scan_summary_visit_live_adds(
     summary: Handle<SharedIncrementalScanSummary>,
     engine_context: NullableCvoid,
@@ -363,7 +367,7 @@ pub unsafe extern "C" fn incremental_scan_summary_visit_live_adds(
 /// # Safety
 ///
 /// Caller must pass a valid summary handle and a non-null `callback` function pointer.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn incremental_scan_summary_visit_removes(
     summary: Handle<SharedIncrementalScanSummary>,
     engine_context: NullableCvoid,
@@ -404,9 +408,9 @@ fn visit_file_keys(
 /// # Safety
 ///
 /// Caller must pass a valid stream handle and must not use it again after this call.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn free_incremental_scan_stream(stream: Handle<SharedIncrementalScanStream>) {
-    stream.drop_handle();
+    unsafe { stream.drop_handle() }
 }
 
 /// Free an incremental scan summary.
@@ -414,11 +418,11 @@ pub unsafe extern "C" fn free_incremental_scan_stream(stream: Handle<SharedIncre
 /// # Safety
 ///
 /// Caller must pass a valid summary handle and must not use it again after this call.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn free_incremental_scan_summary(
     summary: Handle<SharedIncrementalScanSummary>,
 ) {
-    summary.drop_handle();
+    unsafe { summary.drop_handle() }
 }
 
 #[cfg(test)]
@@ -427,16 +431,16 @@ mod tests {
     use std::ffi::c_void;
     use std::sync::Arc;
 
+    use delta_kernel::KernelResult;
     use delta_kernel::object_store::memory::InMemory;
-    use delta_kernel::Result;
     use delta_kernel_default_engine::DefaultEngineBuilder;
-    use test_utils::{actions_to_string, add_commit, TestAction};
+    use test_utils::{TestAction, actions_to_string, add_commit};
 
     use super::*;
     use crate::error::FFIKernelError;
     use crate::expressions::kernel_visitor::{
-        visit_expression_column, visit_expression_literal_int, visit_predicate_gt,
-        KernelExpressionVisitorState,
+        KernelExpressionVisitorState, visit_expression_column, visit_expression_literal_int,
+        visit_predicate_gt,
     };
     use crate::ffi_test_utils::{
         allocate_err, assert_extern_result_error_with_message, ok_or_panic, recover_error,
@@ -444,8 +448,9 @@ mod tests {
     #[cfg(feature = "default-engine-base")]
     use crate::scan::free_scan_metadata_arrow_result;
     use crate::{
-        engine_to_handle, free_engine, free_snapshot, get_snapshot_builder, kernel_string_slice,
-        snapshot_builder_build, snapshot_builder_with_version, NullableCvoid, TryFromStringSlice,
+        NullableCvoid, TryFromStringSlice, engine_to_handle, free_engine, free_snapshot,
+        get_snapshot_builder, kernel_string_slice, snapshot_builder_build,
+        snapshot_builder_with_version,
     };
 
     /// Build an in-memory engine handle and a snapshot pinned to the last version, from a v0
@@ -468,12 +473,9 @@ mod tests {
         }
         let engine = DefaultEngineBuilder::new(storage.clone()).build();
         let engine = engine_to_handle(Arc::new(engine), allocate_err);
-        let builder = unsafe {
-            ok_or_panic(get_snapshot_builder(
-                kernel_string_slice!(table_root),
-                engine.shallow_copy(),
-            ))
-        };
+        let table_root = kernel_string_slice!(table_root);
+        let builder =
+            unsafe { ok_or_panic(get_snapshot_builder(table_root, engine.shallow_copy())) };
         let builder = unsafe { snapshot_builder_with_version(builder, target_version) };
         let snapshot = unsafe { ok_or_panic(snapshot_builder_build(builder)) };
         (engine, snapshot)
@@ -560,8 +562,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn build_and_summary_reports_live_adds_and_removes(
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    async fn build_and_summary_reports_live_adds_and_removes() -> KernelResult<()> {
         // Range (0, 3]: A added at v1, removed at v3; B added at v2 stays live; C added at v3.
         let (engine, snapshot) = setup(vec![
             vec![TestAction::Add("A".to_string())],
@@ -607,7 +608,7 @@ mod tests {
 
     #[cfg(feature = "default-engine-base")]
     #[tokio::test]
-    async fn next_arrow_drains_then_null_then_summary() -> Result<(), Box<dyn std::error::Error>> {
+    async fn next_arrow_drains_then_null_then_summary() -> KernelResult<()> {
         let (engine, snapshot) = setup(vec![
             vec![TestAction::Add("A".to_string())],
             vec![TestAction::Add("B".to_string())],
@@ -644,7 +645,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn build_errors_when_base_not_below_target() -> Result<(), Box<dyn std::error::Error>> {
+    async fn build_errors_when_base_not_below_target() -> KernelResult<()> {
         // Target snapshot is v2; base_version 2 makes the range empty.
         let (engine, snapshot) = setup(vec![
             vec![TestAction::Add("A".to_string())],
@@ -664,7 +665,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn free_builder_without_building() -> Result<(), Box<dyn std::error::Error>> {
+    async fn free_builder_without_building() -> KernelResult<()> {
         let (engine, snapshot) = setup(vec![vec![TestAction::Add("A".to_string())]]).await;
 
         let builder = unsafe {
@@ -681,7 +682,7 @@ mod tests {
     // ids is a distinct file. Assert the FFI visitor passes the full key through, not just the
     // path: v1 adds (X, dv=uabc@1), v2 adds (X, dv=uxyz@2) -> two distinct live Adds.
     #[tokio::test]
-    async fn visit_reports_full_dv_unique_id() -> Result<(), Box<dyn std::error::Error>> {
+    async fn visit_reports_full_dv_unique_id() -> KernelResult<()> {
         let (engine, snapshot) = setup_raw(vec![
             add_with_dv("X.parquet", "u", "abc", 1),
             add_with_dv("X.parquet", "u", "xyz", 2),
@@ -714,7 +715,7 @@ mod tests {
     // contract, not this path; this test holds a real second reference.)
     #[cfg(feature = "default-engine-base")]
     #[tokio::test]
-    async fn terminal_calls_after_into_summary_error() -> Result<(), Box<dyn std::error::Error>> {
+    async fn terminal_calls_after_into_summary_error() -> KernelResult<()> {
         let (engine, snapshot) = setup(vec![vec![TestAction::Add("A".to_string())]]).await;
 
         let stream = build_stream(&snapshot, &engine, 0);
@@ -739,7 +740,7 @@ mod tests {
     // `next_arrow` and a following `into_summary` both fail rather than exposing a partial summary.
     #[cfg(feature = "default-engine-base")]
     #[tokio::test]
-    async fn next_arrow_error_kills_stream() -> Result<(), Box<dyn std::error::Error>> {
+    async fn next_arrow_error_kills_stream() -> KernelResult<()> {
         // A DV with `storageType` set but `pathOrInlineDv` null fails the required-field read
         // when the stream extracts the file key.
         let bad_dv = "{\"add\":{\"path\":\"X.parquet\",\"partitionValues\":{},\"size\":100,\"modificationTime\":1700000000000,\"dataChange\":true,\"stats\":null,\"deletionVector\":{\"storageType\":\"u\",\"pathOrInlineDv\":null,\"offset\":1,\"sizeInBytes\":10,\"cardinality\":1}}}";
@@ -768,7 +769,7 @@ mod tests {
     // Abandoning a never-drained stream must free the retained engine Arc and undrained kernel
     // stream without leak or panic (the symmetric counterpart to free_builder_without_building).
     #[tokio::test]
-    async fn free_stream_without_draining() -> Result<(), Box<dyn std::error::Error>> {
+    async fn free_stream_without_draining() -> KernelResult<()> {
         let (engine, snapshot) = setup(vec![vec![TestAction::Add("A".to_string())]]).await;
 
         let stream = build_stream(&snapshot, &engine, 0);
@@ -783,7 +784,7 @@ mod tests {
     // batches, then assert the summary still reports both commits' Adds.
     #[cfg(feature = "default-engine-base")]
     #[tokio::test]
-    async fn into_summary_drains_unread_batches() -> Result<(), Box<dyn std::error::Error>> {
+    async fn into_summary_drains_unread_batches() -> KernelResult<()> {
         let (engine, snapshot) = setup(vec![
             vec![TestAction::Add("A".to_string())],
             vec![TestAction::Add("B".to_string())],
@@ -855,12 +856,14 @@ mod tests {
     // A predicate applied through the builder prunes streamed live Adds by their `add.stats`:
     // `id > 25` drops the [0, 9] file and keeps the [20, 30] file. Removes are unaffected.
     #[tokio::test]
-    async fn with_predicate_prunes_live_adds() -> Result<(), Box<dyn std::error::Error>> {
-        let (engine, snapshot) = setup_with_id_metadata(vec![[
-            add_with_id_stats("low.parquet", 0, 9),
-            add_with_id_stats("high.parquet", 20, 30),
-        ]
-        .join("\n")])
+    async fn with_predicate_prunes_live_adds() -> KernelResult<()> {
+        let (engine, snapshot) = setup_with_id_metadata(vec![
+            [
+                add_with_id_stats("low.parquet", 0, 9),
+                add_with_id_stats("high.parquet", 20, 30),
+            ]
+            .join("\n"),
+        ])
         .await;
 
         let builder = unsafe {
@@ -901,8 +904,7 @@ mod tests {
     // A predicate referencing a column absent from the table schema fails at build (fail-fast),
     // surfacing the unresolved column rather than silently keeping every Add.
     #[tokio::test]
-    async fn with_predicate_unknown_column_errors_at_build(
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    async fn with_predicate_unknown_column_errors_at_build() -> KernelResult<()> {
         let (engine, snapshot) =
             setup_with_id_metadata(vec![add_with_id_stats("a.parquet", 0, 9)]).await;
 
@@ -954,16 +956,17 @@ mod tests {
     // `next_arrow` (the summary path is covered separately by `with_predicate_prunes_live_adds`).
     #[cfg(feature = "default-engine-base")]
     #[tokio::test]
-    async fn next_arrow_selection_vector_reflects_predicate_pruning(
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    async fn next_arrow_selection_vector_reflects_predicate_pruning() -> KernelResult<()> {
         use delta_kernel::arrow::array::{Array, RecordBatch, StringArray, StructArray};
         use delta_kernel::arrow::ffi::from_ffi;
 
-        let (engine, snapshot) = setup_with_id_metadata(vec![[
-            add_with_id_stats("low.parquet", 0, 9),
-            add_with_id_stats("high.parquet", 20, 30),
-        ]
-        .join("\n")])
+        let (engine, snapshot) = setup_with_id_metadata(vec![
+            [
+                add_with_id_stats("low.parquet", 0, 9),
+                add_with_id_stats("high.parquet", 20, 30),
+            ]
+            .join("\n"),
+        ])
         .await;
 
         let builder = unsafe {
@@ -1031,10 +1034,10 @@ mod tests {
     // then requires commit 1 and the range is uncovered. Needs a multi-thread runtime because
     // `checkpoint_snapshot` issues nested `block_on` calls.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn build_returns_none_when_range_not_covered() -> Result<(), Box<dyn std::error::Error>> {
+    async fn build_returns_none_when_range_not_covered() -> KernelResult<()> {
         use delta_kernel_default_engine::executor::tokio::TokioMultiThreadExecutor;
 
-        use crate::{checkpoint_snapshot, version, FfiCheckpointWriteResult};
+        use crate::{FfiCheckpointWriteResult, checkpoint_snapshot, version};
 
         let table_root = "memory:///";
         let storage = Arc::new(InMemory::new());

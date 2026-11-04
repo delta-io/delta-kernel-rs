@@ -8,10 +8,10 @@
 //! # `next()` protocol
 //!
 //! Each `next` callback writes its result as an `OptionalValue<EngineExecResult<T>>` (mirroring
-//! Rust's `Option<Result<T>>`) into a caller-provided out pointer. The out pointer is
+//! Rust's `Option<KernelResult<T>>`) into a caller-provided out pointer. The out pointer is
 //! pre-initialized to `Some(EngineExecResult::Uninit)`.
 //!
-//! This allows us to implement `ResultIterator<T>` semantics:
+//! This allows us to implement `KernelResultIterator` semantics:
 //!     - The outer Option represents whether iteration is complete (`None` = done)
 //!     - The inner [`EngineExecResult`] represents the item (`Success`) or an engine-side error
 //!       (`Failure`)
@@ -395,8 +395,8 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use delta_kernel::arrow::array::{
-        ffi as arrow_ffi, ArrayRef, BinaryArray, Int32Array, Int64Array, RecordBatch, StringArray,
-        StructArray, UInt64Array,
+        ArrayRef, BinaryArray, Int32Array, Int64Array, RecordBatch, StringArray, StructArray,
+        UInt64Array, ffi as arrow_ffi,
     };
     use delta_kernel::arrow::datatypes::{
         DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
@@ -404,8 +404,8 @@ mod tests {
     use delta_kernel::engine::arrow_data::ArrowEngineData;
 
     use super::*;
-    use crate::error::{EngineExecError, FFIKernelError};
     use crate::ExclusiveRustString;
+    use crate::error::{EngineExecError, FFIKernelError};
 
     // === Shared Test Helpers ===
 

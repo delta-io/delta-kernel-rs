@@ -11,7 +11,7 @@ use crate::arrow::datatypes::{DataType as ArrowDataType, Field as ArrowField, Ti
 use crate::engine::arrow_utils::make_arrow_error;
 use crate::schema::{DataType, MetadataValue, StructField};
 use crate::utils::require;
-use crate::{KernelError, KernelResult, Result};
+use crate::{KernelError, KernelResult};
 
 /// Controls how `ensure_data_types` validates struct fields and metadata.
 #[derive(Clone, Copy)]
@@ -45,7 +45,7 @@ pub(crate) fn ensure_data_types(
     kernel_type: &DataType,
     arrow_type: &ArrowDataType,
     mode: ValidationMode,
-) -> Result<DataTypeCompat> {
+) -> KernelResult<DataTypeCompat> {
     let check = EnsureDataTypes { mode };
     check.ensure_data_types(kernel_type, arrow_type)
 }
@@ -74,6 +74,7 @@ impl EnsureDataTypes {
         kernel_type: &DataType,
         arrow_type: &ArrowDataType,
     ) -> KernelResult<DataTypeCompat> {
+        let kernel_type = kernel_type.physical_type();
         match (kernel_type, arrow_type) {
             (DataType::Primitive(_), _) if arrow_type.is_primitive() => {
                 check_cast_compat(kernel_type.try_into_arrow()?, arrow_type)
@@ -83,26 +84,36 @@ impl EnsureDataTypes {
             // wrapper. Requiring exactly the variant's fields keeps this in sync with
             // `validate_parquet_variant`. The rejection of shredded layouts relies on the kernel
             // type being unshredded (the only variant kernel constructs today).
-            (DataType::Variant(variant_fields), ArrowDataType::Struct(arrow_fields)) => {
-                require!(arrow_fields.len() == variant_fields.num_fields(), {
+            (
+                DataType::Variant(fields) | DataType::File(fields),
+                ArrowDataType::Struct(arrow_fields),
+            ) => {
+                // A file is physically a struct of fixed fields matched by name, exactly like a
+                // variant, so the two share this check.
+                let type_name = if matches!(kernel_type, DataType::Variant(_)) {
+                    "Variant"
+                } else {
+                    "File"
+                };
+                require!(arrow_fields.len() == fields.num_fields(), {
                     let unexpected = arrow_fields
                         .iter()
                         .map(|f| f.name().as_str())
-                        .filter(|name| variant_fields.field(name).is_none())
+                        .filter(|name| fields.field(name).is_none())
                         .join(", ");
                     make_arrow_error(format!(
-                        "Variant struct has {} fields, expected {} (unexpected: [{unexpected}])",
+                        "{type_name} struct has {} fields, expected {} (unexpected: [{unexpected}])",
                         arrow_fields.len(),
-                        variant_fields.num_fields(),
+                        fields.num_fields(),
                     ))
                 });
-                for kernel_field in variant_fields.fields() {
+                for kernel_field in fields.fields() {
                     let Some(arrow_field) = arrow_fields
                         .iter()
                         .find(|arrow_field| arrow_field.name() == &kernel_field.name)
                     else {
                         return Err(make_arrow_error(format!(
-                            "Variant struct is missing field `{}`",
+                            "{type_name} struct is missing field `{}`",
                             kernel_field.name
                         )));
                     };
@@ -110,7 +121,7 @@ impl EnsureDataTypes {
                 }
                 Ok(DataTypeCompat::Nested)
             }
-            (&DataType::Variant(_), _) => {
+            (&DataType::Variant(_) | &DataType::File(_), _) => {
                 check_cast_compat(kernel_type.try_into_arrow()?, arrow_type)
             }
             // Arrow's `is_primitive()` covers only numeric/temporal/decimal types and
@@ -268,7 +279,8 @@ fn check_cast_compat(
     match (source_type, &target_type) {
         (source_type, target_type) if source_type == target_type => Ok(DataTypeCompat::Identical),
         (&ArrowDataType::Timestamp(_, _), &ArrowDataType::Timestamp(_, _)) => {
-            // timestamps are able to be cast between each other
+            // Timestamp bounds returned by `timestamp_stat_as_micros` in
+            // `engine/parquet_row_group_skipping.rs` must agree with the reader's casts.
             Ok(DataTypeCompat::NeedsCast(target_type))
         }
         // Allow up-casting to a larger type if it's safe and can't cause overflow or loss of
@@ -286,8 +298,8 @@ fn check_cast_compat(
         // guarantees data files conform to the table schema, so a schema mismatch (e.g. Int32
         // where Date32 is expected) would not occur in normal data files.
         //
-        // NOTE: The kernel-type equivalent lives in `PrimitiveType::is_stats_type_compatible_with`
-        // in `schema/mod.rs`. Changes here must be mirrored there.
+        // Keep these date/timestamp rules aligned with
+        // `PrimitiveType::is_checkpoint_cast_compatible` in `schema/mod.rs`.
         (Int32, Date32) => Ok(DataTypeCompat::NeedsCast(target_type)),
         (Int64, Timestamp(TimeUnit::Microsecond, _)) => Ok(DataTypeCompat::NeedsCast(target_type)),
         _ => Err(make_arrow_error(format!(
@@ -353,7 +365,7 @@ mod tests {
     use super::*;
     use crate::arrow::datatypes::{DataType as ArrowDataType, Field as ArrowField, Fields};
     use crate::engine::arrow_conversion::TryFromKernel as _;
-    use crate::schema::{schema, ArrayType, DataType, MapType};
+    use crate::schema::{ArrayType, CheckpointFieldKind, DataType, MapType, PrimitiveType, schema};
     use crate::unit_test_utils::assert_result_error_with_message;
 
     #[test]
@@ -549,14 +561,115 @@ mod tests {
         );
     }
 
+    /// The canonical Arrow shape of a `file`: a struct of its six fields.
+    fn file_arrow_struct(order: &[&'static str]) -> ArrowDataType {
+        let field = |name: &'static str| {
+            let data_type = match name {
+                "offset" | "size" => ArrowDataType::Int64,
+                "inline" => ArrowDataType::Binary,
+                _ => ArrowDataType::Utf8,
+            };
+            (name, data_type)
+        };
+        variant_arrow_struct(order.iter().copied().map(field), true)
+    }
+
+    const FILE_FIELDS: [&str; 6] = [
+        "uri",
+        "offset",
+        "size",
+        "content_type",
+        "checksum",
+        "inline",
+    ];
+
+    /// A `file` is matched by field name, in both name-based validation modes.
+    #[rstest]
+    fn ensure_file_accepts_canonical_struct(
+        #[values(ValidationMode::TypesAndNames, ValidationMode::Full)] mode: ValidationMode,
+    ) {
+        assert_eq!(
+            ensure_data_types(
+                &DataType::file_type(),
+                &file_arrow_struct(&FILE_FIELDS),
+                mode
+            )
+            .unwrap(),
+            DataTypeCompat::Nested
+        );
+    }
+
+    #[test]
+    fn ensure_file_accepts_reversed_field_order() {
+        let mut reversed = FILE_FIELDS;
+        reversed.reverse();
+        assert_eq!(
+            ensure_data_types(
+                &DataType::file_type(),
+                &file_arrow_struct(&reversed),
+                ValidationMode::Full,
+            )
+            .unwrap(),
+            DataTypeCompat::Nested
+        );
+    }
+
+    #[rstest]
+    #[case::too_few_fields(
+        file_arrow_struct(&["uri", "offset", "size", "content_type", "checksum"]),
+        "File struct has 5 fields, expected 6"
+    )]
+    #[case::extra_field(
+        variant_arrow_struct(
+            [
+                ("uri", ArrowDataType::Utf8),
+                ("offset", ArrowDataType::Int64),
+                ("size", ArrowDataType::Int64),
+                ("content_type", ArrowDataType::Utf8),
+                ("checksum", ArrowDataType::Utf8),
+                ("inline", ArrowDataType::Binary),
+                ("extra", ArrowDataType::Int64),
+            ],
+            true,
+        ),
+        "expected 6"
+    )]
+    #[case::wrong_field_name(
+        file_arrow_struct(&["uri", "offset", "size", "content_type", "checksum", "payload"]),
+        "File struct is missing field `inline`"
+    )]
+    #[case::wrong_child_type(
+        variant_arrow_struct(
+            [
+                ("uri", ArrowDataType::Utf8),
+                ("offset", ArrowDataType::Utf8),
+                ("size", ArrowDataType::Int64),
+                ("content_type", ArrowDataType::Utf8),
+                ("checksum", ArrowDataType::Utf8),
+                ("inline", ArrowDataType::Binary),
+            ],
+            true,
+        ),
+        "Incorrect datatype"
+    )]
+    #[case::not_a_struct(ArrowDataType::Binary, "Incorrect datatype")]
+    fn ensure_file_rejects(#[case] arrow_type: ArrowDataType, #[case] expected_err: &str) {
+        assert_result_error_with_message(
+            ensure_data_types(&DataType::file_type(), &arrow_type, ValidationMode::Full),
+            expected_err,
+        );
+    }
+
     #[test]
     fn ensure_decimals() {
-        assert!(ensure_data_types(
-            &DataType::decimal(5, 2).unwrap(),
-            &ArrowDataType::Decimal128(5, 2),
-            ValidationMode::TypesAndNames
-        )
-        .is_ok());
+        assert!(
+            ensure_data_types(
+                &DataType::decimal(5, 2).unwrap(),
+                &ArrowDataType::Decimal128(5, 2),
+                ValidationMode::TypesAndNames
+            )
+            .is_ok()
+        );
         assert_result_error_with_message(
             ensure_data_types(
                 &DataType::decimal(5, 2).unwrap(),
@@ -577,12 +690,14 @@ mod tests {
             false,
             false,
         );
-        assert!(ensure_data_types(
-            &DataType::from(MapType::new(DataType::LONG, DataType::STRING, true)),
-            arrow_field.data_type(),
-            ValidationMode::TypesAndNames
-        )
-        .is_ok());
+        assert!(
+            ensure_data_types(
+                &DataType::from(MapType::new(DataType::LONG, DataType::STRING, true)),
+                arrow_field.data_type(),
+                ValidationMode::TypesAndNames
+            )
+            .is_ok()
+        );
 
         assert_result_error_with_message(
             ensure_data_types(
@@ -604,18 +719,22 @@ mod tests {
 
     #[test]
     fn ensure_list() {
-        assert!(ensure_data_types(
-            &DataType::from(ArrayType::new(DataType::LONG, true)),
-            &ArrowDataType::new_list(ArrowDataType::Int64, true),
-            ValidationMode::TypesAndNames
-        )
-        .is_ok());
-        assert!(ensure_data_types(
-            &DataType::from(ArrayType::new(DataType::LONG, true)),
-            &ArrowDataType::new_large_list(ArrowDataType::Int64, true),
-            ValidationMode::TypesAndNames
-        )
-        .is_ok());
+        assert!(
+            ensure_data_types(
+                &DataType::from(ArrayType::new(DataType::LONG, true)),
+                &ArrowDataType::new_list(ArrowDataType::Int64, true),
+                ValidationMode::TypesAndNames
+            )
+            .is_ok()
+        );
+        assert!(
+            ensure_data_types(
+                &DataType::from(ArrayType::new(DataType::LONG, true)),
+                &ArrowDataType::new_large_list(ArrowDataType::Int64, true),
+                ValidationMode::TypesAndNames
+            )
+            .is_ok()
+        );
         assert_result_error_with_message(
             ensure_data_types(
                 &DataType::from(ArrayType::new(DataType::STRING, true)),
@@ -663,12 +782,14 @@ mod tests {
             ]),
             true,
         );
-        assert!(ensure_data_types(
-            &kernel_simple,
-            arrow_simple_ok.data_type(),
-            ValidationMode::Full
-        )
-        .is_ok());
+        assert!(
+            ensure_data_types(
+                &kernel_simple,
+                arrow_simple_ok.data_type(),
+                ValidationMode::Full
+            )
+            .is_ok()
+        );
 
         let arrow_missing_simple = ArrowField::new_struct(
             "arrow_struct",
@@ -904,13 +1025,11 @@ mod tests {
         );
     }
 
-    /// Ensures that every kernel-level checkpoint reinterpretation rule in
-    /// `PrimitiveType::is_checkpoint_cast_compatible` has a corresponding Arrow cast
-    /// in `check_cast_compat`. If one side is updated without the other, this test fails.
-    #[test]
-    fn checkpoint_reinterpretation_rules_match_arrow_cast_rules() {
-        use crate::schema::PrimitiveType;
-
+    #[rstest]
+    fn checkpoint_date_timestamp_rules_match_arrow_cast_rules(
+        #[values(CheckpointFieldKind::Stats, CheckpointFieldKind::PartitionValues)]
+        kind: CheckpointFieldKind,
+    ) {
         let reinterpretation_pairs: &[(PrimitiveType, PrimitiveType)] = &[
             (PrimitiveType::Integer, PrimitiveType::Date),
             (PrimitiveType::Long, PrimitiveType::Timestamp),
@@ -919,7 +1038,7 @@ mod tests {
         for (source_kernel, target_kernel) in reinterpretation_pairs {
             // Verify the kernel-level rule holds
             assert!(
-                source_kernel.is_checkpoint_cast_compatible(target_kernel),
+                source_kernel.is_checkpoint_cast_compatible(target_kernel, kind),
                 "Kernel should allow {source_kernel:?} -> {target_kernel:?}"
             );
 

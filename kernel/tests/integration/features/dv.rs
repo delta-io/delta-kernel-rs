@@ -13,14 +13,14 @@ use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::object_store::ObjectStoreExt as _;
 use delta_kernel::scan::StatsOptions;
 use delta_kernel::schema::schema_ref;
-use delta_kernel::transaction::CommitResult;
-use delta_kernel::{EngineData, Result, Snapshot};
+use delta_kernel::transaction::{CommitResult, UpdateTableOperation};
+use delta_kernel::{EngineData, KernelResult, KernelResultIterator, Snapshot};
 use itertools::Itertools;
 use tempfile::tempdir;
 use test_utils::{
-    add_commit, create_add_files_metadata, create_default_engine_mt_executor, create_table,
-    engine_store_setup, generate_batch, into_record_batch, load_and_begin_transaction,
-    read_actions_from_commit, record_batch_to_bytes, IntoArray,
+    IntoArray, add_commit, create_add_files_metadata, create_default_engine_mt_executor,
+    create_table, engine_store_setup, generate_batch, into_record_batch, read_actions_from_commit,
+    record_batch_to_bytes,
 };
 
 use crate::common::write_utils::{
@@ -35,7 +35,7 @@ async fn write_parquet_file(
     table_url: &url::Url,
     file_suffix: &str,
     data: &delta_kernel::arrow::record_batch::RecordBatch,
-) -> Result<(String, usize), Box<dyn std::error::Error>> {
+) -> KernelResult<(String, usize)> {
     use delta_kernel::object_store::path::Path as ObjectStorePath;
 
     let parquet_data = record_batch_to_bytes(data);
@@ -51,8 +51,8 @@ async fn write_parquet_file(
 }
 
 fn count_total_scan_rows(
-    scan_result_iter: impl Iterator<Item = Result<Box<dyn EngineData>>>,
-) -> Result<usize> {
+    scan_result_iter: impl KernelResultIterator<Box<dyn EngineData>>,
+) -> KernelResult<usize> {
     scan_result_iter
         .map(|result| Ok(result?.len()))
         .fold_ok(0, Add::add)
@@ -61,10 +61,7 @@ fn count_total_scan_rows(
 #[test_log::test(rstest::rstest)]
 #[case::with_dv("./tests/data/table-with-dv-small/", 8)]
 #[case::without_dv("./tests/data/table-without-dv-small/", 10)]
-fn test_table_scan(
-    #[case] table_path: &str,
-    #[case] expected_rows: usize,
-) -> Result<(), Box<dyn std::error::Error>> {
+fn test_table_scan(#[case] table_path: &str, #[case] expected_rows: usize) -> KernelResult<()> {
     let path = std::fs::canonicalize(PathBuf::from(table_path))?;
     let url = url::Url::from_directory_path(path).unwrap();
     let engine = test_utils::create_default_engine(&url)?;
@@ -84,7 +81,7 @@ fn verify_sorted_scan_results(
     batches: Vec<delta_kernel::arrow::record_batch::RecordBatch>,
     expected_ids: Vec<i32>,
     expected_values: &[&str],
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> KernelResult<()> {
     use delta_kernel::arrow::array::{Array, Int32Array, StringArray};
 
     // Extract actual ids and values from batches
@@ -139,7 +136,7 @@ fn verify_sorted_scan_results(
 /// 5. Commits the deletion vectors in a transaction
 /// 6. Verifies that scanning only returns non-deleted rows
 #[tokio::test]
-async fn test_write_deletion_vectors_end_to_end() -> Result<(), Box<dyn std::error::Error>> {
+async fn test_write_deletion_vectors_end_to_end() -> KernelResult<()> {
     let _ = tracing_subscriber::fmt::try_init();
 
     // Create a table schema with id and value columns
@@ -192,9 +189,13 @@ async fn test_write_deletion_vectors_end_to_end() -> Result<(), Box<dyn std::err
         write_parquet_file(&store, &table_url, "2", &data_batch_2).await?;
 
     // Step 2: Add both files to the table via a transaction
-    let mut txn = load_and_begin_transaction(table_url.clone(), engine.as_ref())?
-        .with_engine_info("test engine")
-        .with_operation("WRITE".to_string());
+    let mut txn = Snapshot::builder_for(table_url.clone())
+        .build(engine.as_ref())?
+        .update_table(UpdateTableOperation::Write, "test engine", true)
+        .build(
+            engine.as_ref(),
+            Box::new(delta_kernel::committer::FileSystemCommitter::new()),
+        )?;
 
     // Create add file metadata for both files
     let add_files_schema = txn.add_files_schema();
@@ -270,7 +271,7 @@ async fn test_write_deletion_vectors_end_to_end() -> Result<(), Box<dyn std::err
 
     let mut dv_file2 = KernelDeletionVector::new();
     dv_file2.add_deleted_row_indexes(FILE2_DELETE_INDEXES); // Delete rows at indices 2 and 5 (ids
-                                                            // 12, 15)
+    // 12, 15)
 
     // Step 8: Update deletion vectors for both files
     let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
@@ -312,7 +313,7 @@ async fn test_write_deletion_vectors_end_to_end() -> Result<(), Box<dyn std::err
     // Collect all rows to verify content
     let batches: Vec<_> = stream
         .map(|result| result.map(into_record_batch))
-        .collect::<Result<Vec<_>, _>>()?;
+        .collect::<KernelResult<Vec<_>>>()?;
 
     // Verify the correct rows remain
     // File 1: all except 1, 2, 5, 7 => 0, 3, 4, 6, 8, 9
@@ -335,7 +336,7 @@ async fn test_write_deletion_vectors_end_to_end() -> Result<(), Box<dyn std::err
 #[tokio::test(flavor = "multi_thread")]
 async fn test_dv_update_stats_tight_bound(
     #[case] initial_tight_bounds: Option<bool>,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> KernelResult<()> {
     // Nested schema: a `point` struct with two leaf columns.
     let schema = schema_ref! {
         nullable "point": { nullable "x": INTEGER, nullable "y": INTEGER },

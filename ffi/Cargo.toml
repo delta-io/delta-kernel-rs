@@ -35,7 +35,7 @@ delta_kernel = { path = "../kernel", default-features = false, features = [
   "internal-api",
 ] }
 delta_kernel_default_engine = { path = "../default-engine", default-features = false, optional = true }
-delta_kernel_ffi_macros = { path = "../ffi-proc-macros", version = "0.29.0" }
+delta_kernel_ffi_macros = { path = "../ffi-proc-macros", version = "0.30.1" }
 delta-kernel-unity-catalog = { path = "../delta-kernel-unity-catalog", optional = true }
 unity-catalog-delta-client-api = { path = "../unity-catalog-delta-client-api", optional = true }
 
@@ -83,6 +83,7 @@ test-ffi = []
 # Experimental, in-development feature flag gating in-progress geospatial
 # (geometry/geography) type support. TODO(#2949): remove once full geo support ships.
 geo-type-in-dev = ["delta_kernel/geo-type-in-dev"]
+udt-in-dev = ["delta_kernel/udt-in-dev"]
 
 # Experimental, in-development feature flag gating Iceberg V4 adaptive metadata tree support.
 adaptive-metadata-in-dev = ["delta_kernel/adaptive-metadata-in-dev"]

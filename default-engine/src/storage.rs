@@ -1,9 +1,9 @@
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, RwLock};
 
+use delta_kernel::KernelError as DeltaError;
 use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::{self, Error, ObjectStore};
-use delta_kernel::KernelError as DeltaError;
 use url::Url;
 
 /// Alias for convenience
@@ -48,14 +48,14 @@ pub fn insert_url_handler(
 /// ```rust
 /// # use url::Url;
 /// # use delta_kernel_default_engine::storage::store_from_url;
-/// # use delta_kernel::Result;
-/// # fn example() -> Result<()> {
+/// # use delta_kernel::KernelResult;
+/// # fn example() -> KernelResult<()> {
 /// let url = Url::parse("file:///path/to/table")?;
 /// let store = store_from_url(&url)?;
 /// # Ok(())
 /// # }
 /// ```
-pub fn store_from_url(url: &Url) -> delta_kernel::Result<Arc<dyn ObjectStore>> {
+pub fn store_from_url(url: &Url) -> delta_kernel::KernelResult<Arc<dyn ObjectStore>> {
     store_from_url_opts(url, std::iter::empty::<(&str, &str)>())
 }
 
@@ -72,8 +72,8 @@ pub fn store_from_url(url: &Url) -> delta_kernel::Result<Arc<dyn ObjectStore>> {
 /// # use url::Url;
 /// # use std::collections::HashMap;
 /// # use delta_kernel_default_engine::storage::store_from_url_opts;
-/// # use delta_kernel::Result;
-/// # fn example() -> Result<()> {
+/// # use delta_kernel::KernelResult;
+/// # fn example() -> KernelResult<()> {
 /// let url = Url::parse("s3://my-bucket/path/to/table")?;
 /// let options = HashMap::from([("region", "us-west-2")]);
 /// let store = store_from_url_opts(&url, options)?;
@@ -83,7 +83,7 @@ pub fn store_from_url(url: &Url) -> delta_kernel::Result<Arc<dyn ObjectStore>> {
 pub fn store_from_url_opts<I, K, V>(
     url: &Url,
     options: I,
-) -> delta_kernel::Result<Arc<dyn ObjectStore>>
+) -> delta_kernel::KernelResult<Arc<dyn ObjectStore>>
 where
     I: IntoIterator<Item = (K, V)>,
     K: AsRef<str>,
@@ -119,7 +119,7 @@ mod tests {
     #[cfg(feature = "arrow-60")]
     use hdfs_native_object_store_14::HdfsObjectStoreBuilder;
 
-    use super::{insert_url_handler, store_from_url_opts, URL_REGISTRY};
+    use super::{URL_REGISTRY, insert_url_handler, store_from_url_opts};
     use crate::*;
 
     /// Example funciton of doing testing of a custom [HdfsObjectStore] construction
@@ -174,7 +174,9 @@ mod tests {
             }
             Err(unexpected) => panic!("Unexpected error happened: {unexpected:?}"),
             Ok(_) => {
-                panic!("Expected to get an error when constructing an HdfsObjectStore, but something didn't work as expected! Either the parse_url_opts_hdfs_native function didn't get called, or the hdfs-native-object-store no longer errors when it cannot connect to HDFS");
+                panic!(
+                    "Expected to get an error when constructing an HdfsObjectStore, but something didn't work as expected! Either the parse_url_opts_hdfs_native function didn't get called, or the hdfs-native-object-store no longer errors when it cannot connect to HDFS"
+                );
             }
         }
     }

@@ -12,10 +12,12 @@ use super::*;
 use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
 use crate::log_segment::DomainMetadataMap;
 use crate::schema::{
-    column_name, lazy_schema_ref, ColumnName, ColumnNamesAndTypes, DataType, Schema, SchemaRef,
+    ColumnName, ColumnNamesAndTypes, DataType, Schema, SchemaRef, column_name, lazy_schema_ref,
 };
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use crate::schema::{StructField, schema};
 use crate::utils::require;
-use crate::{KernelError, KernelResult, Result};
+use crate::{KernelError, KernelResult};
 
 pub(crate) static METADATA_LEAVES: LazyLock<ColumnNamesAndTypes> =
     LazyLock::new(|| Metadata::to_schema().leaves(METADATA_NAME));
@@ -31,7 +33,7 @@ impl RowVisitor for MetadataVisitor {
         METADATA_LEAVES.as_ref()
     }
 
-    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> Result<()> {
+    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> KernelResult<()> {
         for i in 0..row_count {
             if let Some(metadata) = visit_metadata_at(i, getters)? {
                 self.metadata = Some(metadata);
@@ -55,7 +57,7 @@ impl RowVisitor for SelectionVectorVisitor {
             LazyLock::new(|| (vec![column_name!("output")], vec![DataType::BOOLEAN]).into());
         NAMES_AND_TYPES.as_ref()
     }
-    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> Result<()> {
+    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> KernelResult<()> {
         require!(
             getters.len() == 1,
             KernelError::InternalError(format!(
@@ -94,7 +96,7 @@ impl RowVisitor for ProtocolVisitor {
     fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
         PROTOCOL_LEAVES.as_ref()
     }
-    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> Result<()> {
+    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> KernelResult<()> {
         for i in 0..row_count {
             if let Some(protocol) = visit_protocol_at(i, getters)? {
                 self.protocol = Some(protocol);
@@ -119,7 +121,7 @@ impl AddVisitor {
         row_index: usize,
         path: String,
         getters: &[&'a dyn GetData<'a>],
-    ) -> Result<Add> {
+    ) -> KernelResult<Add> {
         let expected_getters = if cfg!(feature = "adaptive-metadata-in-dev") {
             17
         } else {
@@ -178,7 +180,7 @@ impl RowVisitor for AddVisitor {
     fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
         Self::names_and_types()
     }
-    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> Result<()> {
+    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> KernelResult<()> {
         for i in 0..row_count {
             // Since path column is required, use it to detect presence of an Add action
             if let Some(path) = getters[0].get_opt(i, "add.path")? {
@@ -203,7 +205,7 @@ impl RemoveVisitor {
         row_index: usize,
         path: String,
         getters: &[&'a dyn GetData<'a>],
-    ) -> Result<Remove> {
+    ) -> KernelResult<Remove> {
         let expected_getters = if cfg!(feature = "adaptive-metadata-in-dev") {
             17
         } else {
@@ -265,7 +267,7 @@ impl RowVisitor for RemoveVisitor {
     fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
         Self::names_and_types()
     }
-    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> Result<()> {
+    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> KernelResult<()> {
         for i in 0..row_count {
             // Since path column is required, use it to detect presence of a Remove action
             if let Some(path) = getters[0].get_opt(i, "remove.path")? {
@@ -290,7 +292,7 @@ impl CdcVisitor {
         row_index: usize,
         path: String,
         getters: &[&'a dyn GetData<'a>],
-    ) -> Result<Cdc> {
+    ) -> KernelResult<Cdc> {
         Ok(Cdc {
             path,
             partition_values: getters[1].get(row_index, "cdc.partitionValues")?,
@@ -307,7 +309,7 @@ impl RowVisitor for CdcVisitor {
             LazyLock::new(|| Cdc::to_schema().leaves(CDC_NAME));
         NAMES_AND_TYPES.as_ref()
     }
-    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> Result<()> {
+    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> KernelResult<()> {
         require!(
             getters.len() == 5,
             KernelError::InternalError(format!(
@@ -355,7 +357,7 @@ impl SetTransactionVisitor {
         row_index: usize,
         app_id: String,
         getters: &[&'a dyn GetData<'a>],
-    ) -> Result<SetTransaction> {
+    ) -> KernelResult<SetTransaction> {
         require!(
             getters.len() == 3,
             KernelError::InternalError(format!(
@@ -380,7 +382,7 @@ impl RowVisitor for SetTransactionVisitor {
         NAMES_AND_TYPES.as_ref()
     }
 
-    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> Result<()> {
+    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> KernelResult<()> {
         // Assumes batches are visited in reverse order relative to the log
         for i in 0..row_count {
             if let Some(app_id) = getters[0].get_opt(i, "txn.appId")? {
@@ -413,7 +415,7 @@ impl SidecarVisitor {
         row_index: usize,
         path: String,
         getters: &[&'a dyn GetData<'a>],
-    ) -> Result<Sidecar> {
+    ) -> KernelResult<Sidecar> {
         Ok(Sidecar {
             path,
             size_in_bytes: getters[1].get(row_index, "sidecar.sizeInBytes")?,
@@ -429,7 +431,7 @@ impl RowVisitor for SidecarVisitor {
             LazyLock::new(|| Sidecar::to_schema().leaves(SIDECAR_NAME));
         NAMES_AND_TYPES.as_ref()
     }
-    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> Result<()> {
+    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> KernelResult<()> {
         require!(
             getters.len() == 4,
             KernelError::InternalError(format!(
@@ -523,7 +525,7 @@ impl RowVisitor for DomainMetadataVisitor {
         NAMES_AND_TYPES.as_ref()
     }
 
-    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> Result<()> {
+    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> KernelResult<()> {
         // Requires that batches are visited in reverse order relative to the log
         for i in 0..row_count {
             let domain: Option<String> = getters[0].get_opt(i, "domainMetadata.domain")?;
@@ -612,7 +614,7 @@ fn visit_back_reference_at<'a>(
 pub(crate) fn visit_metadata_at<'a>(
     row_index: usize,
     getters: &[&'a dyn GetData<'a>],
-) -> Result<Option<Metadata>> {
+) -> KernelResult<Option<Metadata>> {
     require!(
         getters.len() == 9,
         KernelError::InternalError(format!(
@@ -660,7 +662,7 @@ pub(crate) fn visit_metadata_at<'a>(
 pub(crate) fn visit_protocol_at<'a>(
     row_index: usize,
     getters: &[&'a dyn GetData<'a>],
-) -> Result<Option<Protocol>> {
+) -> KernelResult<Option<Protocol>> {
     require!(
         getters.len() == 4,
         KernelError::InternalError(format!(
@@ -729,7 +731,7 @@ impl RowVisitor for InCommitTimestampVisitor {
         &mut self,
         row_count: usize,
         getters: &[&'a dyn crate::engine_data::GetData<'a>],
-    ) -> Result<()> {
+    ) -> KernelResult<()> {
         require!(
             getters.len() == 1,
             KernelError::InternalError(format!(
@@ -748,6 +750,75 @@ impl RowVisitor for InCommitTimestampVisitor {
         }
         Ok(())
     }
+}
+
+/// Extracts `commitInfo.lastManifestCommit` (adaptiveMetadata) from a commit's actions. Leaves
+/// `last_manifest_commit` as `None` if no visited row carries it.
+#[cfg(feature = "adaptive-metadata-in-dev")]
+#[derive(Default)]
+pub(crate) struct LastManifestCommitVisitor {
+    pub(crate) last_manifest_commit: Option<LastManifestCommit>,
+}
+
+#[cfg(feature = "adaptive-metadata-in-dev")]
+impl LastManifestCommitVisitor {
+    /// The `commitInfo` field projecting only `lastManifestCommit`, for read schemas that feed
+    /// this visitor.
+    pub(crate) fn commit_info_field() -> &'static StructField {
+        static FIELD: LazyLock<StructField> = LazyLock::new(|| {
+            StructField::nullable(COMMIT_INFO_NAME, schema! { (&LAST_MANIFEST_COMMIT_FIELD) })
+        });
+        &FIELD
+    }
+
+    /// Get the schema that the visitor expects the data to have.
+    pub(crate) fn schema() -> SchemaRef {
+        static SCHEMA: LazyLock<SchemaRef> =
+            lazy_schema_ref! { (LastManifestCommitVisitor::commit_info_field()) };
+        SCHEMA.clone()
+    }
+}
+
+#[cfg(feature = "adaptive-metadata-in-dev")]
+impl RowVisitor for LastManifestCommitVisitor {
+    fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
+        static NAMES_AND_TYPES: LazyLock<ColumnNamesAndTypes> =
+            LazyLock::new(|| LastManifestCommitVisitor::schema().leaves(None));
+        NAMES_AND_TYPES.as_ref()
+    }
+
+    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> KernelResult<()> {
+        for i in 0..row_count {
+            if let Some(last_manifest_commit) = visit_last_manifest_commit_at(i, getters)? {
+                self.last_manifest_commit = Some(last_manifest_commit);
+                return Ok(());
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Parses the `lastManifestCommit` at row `i`, or `None` if the row has none.
+#[cfg(feature = "adaptive-metadata-in-dev")]
+pub(crate) fn visit_last_manifest_commit_at<'a>(
+    i: usize,
+    getters: &[&'a dyn GetData<'a>],
+) -> KernelResult<Option<LastManifestCommit>> {
+    let [version_getter, content_root_version_getter] = getters else {
+        return Err(KernelError::internal_error(format!(
+            "Wrong number of lastManifestCommit getters: {}",
+            getters.len()
+        )));
+    };
+    let Some(version) = version_getter.get_opt(i, "lastManifestCommit.version")? else {
+        return Ok(None);
+    };
+    let content_root_version =
+        content_root_version_getter.get(i, "lastManifestCommit.contentRootVersion")?;
+    Ok(Some(LastManifestCommit::new(
+        version,
+        content_root_version,
+    )?))
 }
 
 // === Checkpoint action (adaptiveMetadata) ===
@@ -775,7 +846,7 @@ impl RowVisitor for CheckpointVisitor {
         NAMES_AND_TYPES.as_ref()
     }
 
-    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> Result<()> {
+    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> KernelResult<()> {
         require!(
             getters.len() == 1,
             KernelError::InternalError(format!(
@@ -913,7 +984,7 @@ impl RowVisitor for CheckpointElementVisitor {
         NAMES_AND_TYPES.as_ref()
     }
 
-    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> Result<()> {
+    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> KernelResult<()> {
         let r = &*CHECKPOINT_ELEMENT_RANGES;
         for i in 0..row_count {
             // Each element is a single-key tagged object, so at most one variant has a non-null
@@ -956,7 +1027,7 @@ impl RowVisitor for CheckpointElementVisitor {
                     other => {
                         return Err(KernelError::generic(format!(
                             "checkpoint sidecar has unsupported type `{other}`"
-                        )))
+                        )));
                     }
                 }
             }
@@ -997,9 +1068,14 @@ fn visit_content_root_at<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Engine;
     #[cfg(feature = "adaptive-metadata-in-dev")]
     use crate::actions::LOG_CHECKPOINT_SCHEMA;
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    use crate::actions::deletion_vector::DeletionVectorStorageType;
     use crate::arrow::array::{BooleanArray, StringArray};
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    use crate::arrow::array::{Int32Array, Int64Array};
     use crate::arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
     use crate::arrow::record_batch::RecordBatch;
     #[cfg(feature = "adaptive-metadata-in-dev")]
@@ -1010,11 +1086,10 @@ mod tests {
     use crate::engine::to_json_bytes;
     #[cfg(feature = "adaptive-metadata-in-dev")]
     use crate::engine_data::FilteredEngineData;
-    use crate::expressions::{column_expr_ref, Expression};
+    use crate::expressions::{Expression, column_expr_ref};
     use crate::schema::schema_ref;
     use crate::table_features::TableFeature;
     use crate::unit_test_utils::{action_batch, parse_json_batch, string_array_to_engine_data};
-    use crate::Engine;
 
     #[rstest::rstest]
     #[case::empty(0)]
@@ -1032,8 +1107,32 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "adaptive-metadata-in-dev")]
     #[test]
-    fn test_parse_protocol() -> Result<()> {
+    fn visit_deletion_vector_preserves_unencoded_relative_fields() {
+        let storage_type: StringArray = vec!["r"].into();
+        let path: StringArray = vec!["data/dv.bin"].into();
+        let offset: Int32Array = vec![1].into();
+        let size_in_bytes: Int32Array = vec![4].into();
+        let cardinality: Int64Array = vec![2i64].into();
+        let getters: &[&dyn GetData<'_>] =
+            &[&storage_type, &path, &offset, &size_in_bytes, &cardinality];
+
+        let dv = visit_deletion_vector_at(0, getters).unwrap().unwrap();
+        assert_eq!(
+            dv,
+            DeletionVectorDescriptor {
+                storage_type: DeletionVectorStorageType::PersistedUnencodedRelative,
+                path_or_inline_dv: "data/dv.bin".to_string(),
+                offset: Some(1),
+                size_in_bytes: 4,
+                cardinality: 2,
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_protocol() -> KernelResult<()> {
         let data = action_batch();
         let parsed = Protocol::try_new_from_data(data.as_ref())?.unwrap();
         let expected = Protocol {
@@ -1055,7 +1154,7 @@ mod tests {
     #[case::missing(None)]
     fn test_parse_metadata_format_options(
         #[case] format_options: Option<HashMap<String, String>>,
-    ) -> Result<()> {
+    ) -> KernelResult<()> {
         let mut format = serde_json::Map::from_iter([(
             "provider".to_string(),
             serde_json::Value::String("parquet".to_string()),
@@ -1106,7 +1205,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_cdc() -> Result<()> {
+    fn test_parse_cdc() -> KernelResult<()> {
         let data = action_batch();
         let mut visitor = CdcVisitor::default();
         visitor.visit_rows_of(data.as_ref())?;
@@ -1125,7 +1224,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_sidecar() -> Result<()> {
+    fn test_parse_sidecar() -> KernelResult<()> {
         let data = action_batch();
 
         let mut visitor = SidecarVisitor::default();
@@ -1156,7 +1255,7 @@ mod tests {
     #[case::with_tags(Some(HashMap::from([("k".to_string(), "v".to_string())])))]
     fn test_checkpoint_action_write_then_read_round_trip(
         #[case] sidecar_tags: Option<HashMap<String, String>>,
-    ) -> Result<()> {
+    ) -> KernelResult<()> {
         let action = CheckpointAction {
             version: 7,
             content_root: ContentRoot {
@@ -1204,7 +1303,7 @@ mod tests {
 
     #[cfg(feature = "adaptive-metadata-in-dev")]
     #[test]
-    fn test_parse_checkpoint_action() -> Result<()> {
+    fn test_parse_checkpoint_action() -> KernelResult<()> {
         use crate::unit_test_utils::checkpoint_action_batch;
 
         let data = checkpoint_action_batch();
@@ -1251,7 +1350,7 @@ mod tests {
 
     #[cfg(feature = "adaptive-metadata-in-dev")]
     #[test]
-    fn test_parse_checkpoint_action_first_row_wins() -> Result<()> {
+    fn test_parse_checkpoint_action_first_row_wins() -> KernelResult<()> {
         use crate::unit_test_utils::parse_json_batch;
 
         let element = |version: i64| {
@@ -1338,7 +1437,7 @@ mod tests {
     /// skipped rather than failing the surrounding action.
     #[cfg(feature = "adaptive-metadata-in-dev")]
     #[test]
-    fn test_parse_checkpoint_action_skips_unknown_element_variant() -> Result<()> {
+    fn test_parse_checkpoint_action_skips_unknown_element_variant() -> KernelResult<()> {
         let data = checkpoint_commit(&[
             checkpoint_elements::CHECKPOINT_METADATA,
             checkpoint_elements::CONTENT_ROOT,
@@ -1356,7 +1455,7 @@ mod tests {
 
     #[cfg(feature = "adaptive-metadata-in-dev")]
     #[test]
-    fn test_parse_checkpoint_action_minimal_round_trip() -> Result<()> {
+    fn test_parse_checkpoint_action_minimal_round_trip() -> KernelResult<()> {
         let data = checkpoint_commit(&[
             checkpoint_elements::CHECKPOINT_METADATA,
             checkpoint_elements::CONTENT_ROOT,
@@ -1377,7 +1476,7 @@ mod tests {
     /// and must parse successfully (the error rstest covers only `<` and `>`).
     #[cfg(feature = "adaptive-metadata-in-dev")]
     #[test]
-    fn test_parse_checkpoint_action_content_root_version_equal_is_ok() -> Result<()> {
+    fn test_parse_checkpoint_action_content_root_version_equal_is_ok() -> KernelResult<()> {
         let data = checkpoint_commit(&[
             checkpoint_elements::CHECKPOINT_METADATA,
             r#"{"contentRoot":{"path":"p","sizeInBytes":1,"version":42}}"#,
@@ -1392,7 +1491,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_metadata() -> Result<()> {
+    fn test_parse_metadata() -> KernelResult<()> {
         let data = action_batch();
         let parsed = Metadata::try_new_from_data(data.as_ref())?.unwrap();
 

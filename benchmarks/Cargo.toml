@@ -38,6 +38,7 @@ url = { version = "2", features = ["serde"] }
 [dev-dependencies]
 criterion = "0.5"
 tempfile = "3"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["registry"] }
 
 [[bench]]
 name = "workload_bench"

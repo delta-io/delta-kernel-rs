@@ -5,19 +5,19 @@ use std::sync::Arc;
 
 // Each foreign type is aliased with its source crate (`Kernel*`/`DF*`/`Arrow*`) so every use
 // site reads unambiguously across the three crates this converter bridges.
-use datafusion::arrow::array::{new_empty_array, ArrayRef, MapArray, StructArray};
+use datafusion::arrow::array::{ArrayRef, MapArray, StructArray, new_empty_array};
 use datafusion::arrow::buffer::OffsetBuffer;
 use datafusion::arrow::datatypes::{DataType as ArrowDataType, Field as ArrowField};
+use datafusion::common::ScalarValue as DFScalarValue;
 use datafusion::common::scalar::ScalarStructBuilder;
 use datafusion::common::utils::SingleRowListArrayBuilder;
-use datafusion::common::ScalarValue as DFScalarValue;
 use delta_kernel::engine::arrow_conversion::TryIntoArrow;
 use delta_kernel::expressions::{
     ArrayData as KernelArrayData, MapData as KernelMapData, Scalar as KernelScalar,
     StructData as KernelStructData,
 };
 use delta_kernel::schema::DataType as KernelDataType;
-use delta_kernel::{KernelError, KernelResult, Result};
+use delta_kernel::{KernelError, KernelResult};
 
 /// Converts a kernel [`Scalar`](KernelScalar) into the equivalent DataFusion
 /// [`ScalarValue`](DFScalarValue).
@@ -26,7 +26,7 @@ use delta_kernel::{KernelError, KernelResult, Result};
 /// Returns an error for interval scalars, which are not yet supported; for a type with no Arrow
 /// representation (e.g. a shredded variant); or if building the backing Arrow array for a nested
 /// container otherwise fails.
-pub fn to_df_scalar(scalar: &KernelScalar) -> Result<DFScalarValue> {
+pub fn to_df_scalar(scalar: &KernelScalar) -> KernelResult<DFScalarValue> {
     Ok(match scalar {
         KernelScalar::Integer(i) => DFScalarValue::Int32(Some(*i)),
         KernelScalar::Long(i) => DFScalarValue::Int64(Some(*i)),
@@ -52,7 +52,7 @@ pub fn to_df_scalar(scalar: &KernelScalar) -> Result<DFScalarValue> {
         KernelScalar::IntervalYearMonth(_) | KernelScalar::IntervalDayTime(_) => {
             return Err(KernelError::unsupported(
                 "interval scalars are not supported in the DataFusion executor",
-            ))
+            ));
         }
         KernelScalar::Null(data_type) => datatype_to_df_null_scalar(data_type)?,
     })
@@ -136,7 +136,7 @@ mod tests {
     use datafusion::arrow::datatypes::Int32Type;
     use datafusion::arrow::util::pretty::pretty_format_columns;
     use delta_kernel::schema::{
-        schema, ArrayType, DataType as KernelDataType, MapType, StructField, StructType,
+        ArrayType, DataType as KernelDataType, MapType, StructField, StructType, schema,
     };
     use rstest::rstest;
 

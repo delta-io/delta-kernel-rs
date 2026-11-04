@@ -7,13 +7,13 @@
 
 use std::sync::LazyLock;
 
+use crate::KernelResult;
 use crate::actions::{MAX_VALUES, MIN_VALUES, NULL_COUNT, NUM_RECORDS};
 use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
 use crate::error::KernelError;
-use crate::expressions::{column_name, ColumnName};
+use crate::expressions::{ColumnName, column_name};
 use crate::schema::{ColumnNamesAndTypes, DataType, DecimalType, PrimitiveType};
 use crate::utils::require;
-use crate::{KernelResult, Result};
 
 /// Verifies that add file statistics contain required columns.
 ///
@@ -33,30 +33,33 @@ impl StatsColumnVerifier {
     }
 
     /// Verify that all files in the provided batches have required statistics.
-    ///
-    /// For each required column, extracts all three stat columns (nullCount, minValues,
-    /// maxValues) in a single `visit_rows` call per batch.
     #[cfg_attr(not(feature = "internal-api"), allow(unreachable_pub))]
-    pub fn verify(&self, add_files: &[Box<dyn crate::EngineData>]) -> Result<()> {
+    pub fn verify(&self, add_files: &[Box<dyn crate::EngineData>]) -> KernelResult<()> {
         if self.required_columns.is_empty() {
             return Ok(());
         }
 
-        for (col, data_type) in &self.required_columns {
-            self.verify_column(add_files, col, data_type)?;
+        let mut validators: Vec<_> = self
+            .required_columns
+            .iter()
+            .map(|(column, data_type)| ColumnStatsValidator::try_new(column, data_type))
+            .collect::<KernelResult<_>>()?;
+
+        for batch in add_files {
+            for (column_names, validator) in &mut validators {
+                batch.visit_rows(column_names, validator)?;
+            }
         }
 
+        for (_, validator) in validators {
+            validator.finish()?;
+        }
         Ok(())
     }
+}
 
-    /// Verify a single required column has nullCount, minValues, and maxValues stats in
-    /// every file. Extracts all three stat columns in a single `visit_rows` call per batch.
-    fn verify_column(
-        &self,
-        add_files: &[Box<dyn crate::EngineData>],
-        column: &ColumnName,
-        data_type: &DataType,
-    ) -> KernelResult<()> {
+impl ColumnStatsValidator {
+    fn try_new(column: &ColumnName, data_type: &DataType) -> KernelResult<(Vec<ColumnName>, Self)> {
         let column_names = vec![
             column_name!("path"),
             column_name!("stats", NUM_RECORDS),
@@ -65,22 +68,25 @@ impl StatsColumnVerifier {
             build_stat_path(column, MAX_VALUES),
         ];
         let types = column_types_for(data_type)?;
+        let validator = Self {
+            column: column.clone(),
+            data_type: data_type.clone(),
+            types,
+            missing_null_count: Vec::new(),
+            missing_min: Vec::new(),
+            missing_max: Vec::new(),
+        };
+        Ok((column_names, validator))
+    }
 
-        let mut missing_null_count: Vec<String> = Vec::new();
-        let mut missing_min: Vec<String> = Vec::new();
-        let mut missing_max: Vec<String> = Vec::new();
-
-        for batch in add_files {
-            let mut visitor = ColumnStatsValidator {
-                data_type,
-                types,
-                missing_null_count: &mut missing_null_count,
-                missing_min: &mut missing_min,
-                missing_max: &mut missing_max,
-            };
-            batch.visit_rows(&column_names, &mut visitor)?;
-        }
-
+    fn finish(self) -> KernelResult<()> {
+        let Self {
+            column,
+            missing_null_count,
+            missing_min,
+            missing_max,
+            ..
+        } = self;
         if !missing_null_count.is_empty() {
             return Err(KernelError::stats_validation(format!(
                 "Required column '{column}' is missing 'nullCount' statistics for files: [{}]",
@@ -177,6 +183,8 @@ static NUM_RECORDS_TYPES: LazyLock<ColumnNamesAndTypes> = LazyLock::new(|| {
 /// Select the predefined static type array for a given column data type.
 fn column_types_for(dt: &DataType) -> KernelResult<&'static ColumnNamesAndTypes> {
     match dt {
+        #[cfg(feature = "udt-in-dev")]
+        DataType::UserDefined(_) => Err(KernelError::unsupported("UDT min/max statistics")),
         &DataType::BOOLEAN => Ok(&COL_TYPES_BOOL),
         &DataType::BYTE => Ok(&COL_TYPES_BYTE),
         &DataType::SHORT => Ok(&COL_TYPES_SHORT),
@@ -190,7 +198,7 @@ fn column_types_for(dt: &DataType) -> KernelResult<&'static ColumnNamesAndTypes>
         &DataType::TIMESTAMP => Ok(&COL_TYPES_TIMESTAMP),
         &DataType::TIMESTAMP_NTZ => Ok(&COL_TYPES_TIMESTAMP_NTZ),
         DataType::Primitive(PrimitiveType::Decimal(_)) => Ok(&COL_TYPES_DECIMAL),
-        &DataType::INTERVAL_YEAR_MONTH | &DataType::INTERVAL_DAY_TIME => {
+        DataType::Primitive(PrimitiveType::IntervalYearMonth(_)) | &DataType::INTERVAL_DAY_TIME => {
             Err(KernelError::unsupported(format!(
                 "Interval types are not supported for stats validation: {dt}"
             )))
@@ -203,7 +211,8 @@ fn column_types_for(dt: &DataType) -> KernelResult<&'static ColumnNamesAndTypes>
         | DataType::Struct(_)
         | DataType::Array(_)
         | DataType::Map(_)
-        | DataType::Variant(_) => Err(KernelError::internal_error(format!(
+        | DataType::Variant(_)
+        | DataType::File(_) => Err(KernelError::internal_error(format!(
             "Unsupported data type for stats validation: {dt}"
         ))),
     }
@@ -217,6 +226,8 @@ fn is_stat_present<'b>(
 ) -> KernelResult<bool> {
     let field_name = "stat";
     match data_type {
+        #[cfg(feature = "udt-in-dev")]
+        DataType::UserDefined(_) => Err(KernelError::unsupported("UDT min/max statistics")),
         &DataType::BOOLEAN => Ok(getter.get_bool(row_idx, field_name)?.is_some()),
         &DataType::BYTE => Ok(getter.get_byte(row_idx, field_name)?.is_some()),
         &DataType::SHORT => Ok(getter.get_short(row_idx, field_name)?.is_some()),
@@ -233,7 +244,7 @@ fn is_stat_present<'b>(
         DataType::Primitive(PrimitiveType::Decimal(_)) => {
             Ok(getter.get_decimal(row_idx, field_name)?.is_some())
         }
-        &DataType::INTERVAL_YEAR_MONTH | &DataType::INTERVAL_DAY_TIME => {
+        DataType::Primitive(PrimitiveType::IntervalYearMonth(_)) | &DataType::INTERVAL_DAY_TIME => {
             Err(KernelError::unsupported(format!(
                 "Interval types are not supported for stats presence check: {data_type}"
             )))
@@ -248,7 +259,8 @@ fn is_stat_present<'b>(
         | DataType::Struct(_)
         | DataType::Array(_)
         | DataType::Map(_)
-        | DataType::Variant(_) => Err(KernelError::internal_error(format!(
+        | DataType::Variant(_)
+        | DataType::File(_) => Err(KernelError::internal_error(format!(
             "Unsupported data type for stats presence check: {data_type}"
         ))),
     }
@@ -256,20 +268,21 @@ fn is_stat_present<'b>(
 
 /// Visitor that checks nullCount, minValues, and maxValues for a single column in one pass.
 /// Expects 5 getters: [path, numRecords, nullCount, minValues, maxValues].
-struct ColumnStatsValidator<'a> {
-    data_type: &'a DataType,
+struct ColumnStatsValidator {
+    column: ColumnName,
+    data_type: DataType,
     types: &'static ColumnNamesAndTypes,
-    missing_null_count: &'a mut Vec<String>,
-    missing_min: &'a mut Vec<String>,
-    missing_max: &'a mut Vec<String>,
+    missing_null_count: Vec<String>,
+    missing_min: Vec<String>,
+    missing_max: Vec<String>,
 }
 
-impl RowVisitor for ColumnStatsValidator<'_> {
+impl RowVisitor for ColumnStatsValidator {
     fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
         self.types.as_ref()
     }
 
-    fn visit<'b>(&mut self, row_count: usize, getters: &[&'b dyn GetData<'b>]) -> Result<()> {
+    fn visit<'b>(&mut self, row_count: usize, getters: &[&'b dyn GetData<'b>]) -> KernelResult<()> {
         require!(
             getters.len() == 5,
             KernelError::internal_error(format!(
@@ -290,10 +303,10 @@ impl RowVisitor for ColumnStatsValidator<'_> {
             if null_count.is_none() {
                 self.missing_null_count.push(path.clone());
             }
-            if !(all_null || is_stat_present(getters[3], row_idx, self.data_type)?) {
+            if !(all_null || is_stat_present(getters[3], row_idx, &self.data_type)?) {
                 self.missing_min.push(path.clone());
             }
-            if !(all_null || is_stat_present(getters[4], row_idx, self.data_type)?) {
+            if !(all_null || is_stat_present(getters[4], row_idx, &self.data_type)?) {
                 self.missing_max.push(path);
             }
         }
@@ -305,7 +318,7 @@ impl RowVisitor for ColumnStatsValidator<'_> {
 /// Verify that every `add` action has `stats.numRecords` populated. Short-circuits on the first
 /// violation and returns an error containing the `add.path`.
 #[cfg_attr(not(feature = "internal-api"), allow(unreachable_pub))]
-pub fn verify_num_records_present(add_files: &[Box<dyn crate::EngineData>]) -> Result<()> {
+pub fn verify_num_records_present(add_files: &[Box<dyn crate::EngineData>]) -> KernelResult<()> {
     let column_names = vec![column_name!("path"), column_name!("stats", NUM_RECORDS)];
     let mut first_missing: Option<String> = None;
     for batch in add_files {
@@ -337,7 +350,7 @@ impl RowVisitor for NumRecordsValidator<'_> {
         NUM_RECORDS_TYPES.as_ref()
     }
 
-    fn visit<'b>(&mut self, row_count: usize, getters: &[&'b dyn GetData<'b>]) -> Result<()> {
+    fn visit<'b>(&mut self, row_count: usize, getters: &[&'b dyn GetData<'b>]) -> KernelResult<()> {
         require!(
             getters.len() == 2,
             KernelError::internal_error(format!(

@@ -1,16 +1,24 @@
 //! Integration tests for transaction-identifier write paths.
 
-use delta_kernel::object_store::path::Path;
+use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::object_store::ObjectStoreExt as _;
+use delta_kernel::object_store::path::Path;
+use delta_kernel::transaction::UpdateTableOperation;
 use delta_kernel::{KernelError, Snapshot};
 use itertools::Itertools;
-use serde_json::{json, Deserializer};
-use test_utils::{load_and_begin_transaction, set_json_value, setup_test_tables};
+use rstest::rstest;
+use serde_json::{Deserializer, json};
+use test_utils::{assert_result_error_with_message, set_json_value, setup_test_tables};
 
-use crate::common::write_utils::{get_simple_int_schema, validate_txn_id, ZERO_UUID};
+use crate::common::write_utils::{ZERO_UUID, get_simple_int_schema, validate_txn_id};
 
+#[rstest]
+#[case::builder(false)]
+#[case::transaction(true)]
 #[tokio::test]
-async fn test_write_txn_actions() -> Result<(), Box<dyn std::error::Error>> {
+async fn test_write_txn_actions(
+    #[case] after_build: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
     // setup tracing
     let _ = tracing_subscriber::fmt::try_init();
 
@@ -21,28 +29,56 @@ async fn test_write_txn_actions() -> Result<(), Box<dyn std::error::Error>> {
         setup_test_tables(schema, &[], None, "test_table").await?
     {
         // can't have duplicate app_id in same transaction
+        let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
         assert!(matches!(
-            load_and_begin_transaction(table_url.clone(), &engine)?
+            snapshot.clone().update_table(UpdateTableOperation::Write, "test-engine", true)
                 .with_transaction_id("app_id1".to_string(), 0)
                 .with_transaction_id("app_id1".to_string(), 1)
-                .commit(&engine),
-            Err(KernelError::Generic(msg)) if msg == "app_id app_id1 already exists in transaction"
+                .build(&engine, Box::new(FileSystemCommitter::new())),
+            Err(KernelError::InvalidTransactionState(msg)) if msg.contains("app_id app_id1")
         ));
 
-        let txn = load_and_begin_transaction(table_url.clone(), &engine)?
-            .with_engine_info("default engine")
-            .with_transaction_id("app_id1".to_string(), 1)
-            .with_transaction_id("app_id2".to_string(), 2);
+        if after_build {
+            let txn = snapshot
+                .clone()
+                .update_table(UpdateTableOperation::Write, "test-engine", true)
+                .with_transaction_id("app_id1".to_string(), 0)
+                .build(&engine, Box::new(FileSystemCommitter::new()))?
+                .with_transaction_id("app_id1".to_string(), 1);
+            assert_result_error_with_message(txn.commit(&engine), "app_id app_id1");
+        }
+
+        let builder = snapshot.update_table(UpdateTableOperation::Write, "default engine", true);
+        let txn = if after_build {
+            builder
+                .build(&engine, Box::new(FileSystemCommitter::new()))?
+                .with_transaction_id("app_id1".to_string(), 1)
+                .with_transaction_id("app_id2".to_string(), 2)
+        } else {
+            builder
+                .with_transaction_id("app_id1".to_string(), 1)
+                .with_transaction_id("app_id2".to_string(), 2)
+                .build(&engine, Box::new(FileSystemCommitter::new()))?
+        };
 
         // commit!
-        assert!(txn.commit(&engine)?.is_committed());
+        txn.commit(&engine)?.unwrap_committed();
 
         let snapshot = Snapshot::builder_for(table_url.clone())
             .at_version(1)
             .build(&engine)?;
-        assert_eq!(snapshot.get_app_id_version("app_id1", &engine)?, Some(1));
-        assert_eq!(snapshot.get_app_id_version("app_id2", &engine)?, Some(2));
-        assert_eq!(snapshot.get_app_id_version("app_id3", &engine)?, None);
+        assert_eq!(
+            snapshot.reader().get_app_id_version("app_id1", &engine)?,
+            Some(1)
+        );
+        assert_eq!(
+            snapshot.reader().get_app_id_version("app_id2", &engine)?,
+            Some(2)
+        );
+        assert_eq!(
+            snapshot.reader().get_app_id_version("app_id3", &engine)?,
+            None
+        );
 
         let commit1 = store
             .get(&Path::from(format!(
@@ -101,7 +137,7 @@ async fn test_write_txn_actions() -> Result<(), Box<dyn std::error::Error>> {
             json!({
                 "commitInfo": {
                     "timestamp": 0,
-                    "operation": "UNKNOWN",
+                    "operation": "WRITE",
                     "kernelVersion": format!("v{}", env!("CARGO_PKG_VERSION")),
                     "operationParameters": {},
                     "engineInfo": "default engine",

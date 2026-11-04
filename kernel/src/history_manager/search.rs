@@ -47,10 +47,10 @@ impl Bound {
 pub(crate) enum SearchError<T: Error> {
     /// Error that occurs when a search goes out of range. The meaning of "out of range" depends on
     /// the search [`Bound`]:
-    /// - If the search bound is [`Bound::LeastUpper`], then no element was greater than or equal
-    ///   to the provided key.
-    /// - If the search bound is [`Bound::GreatestLower`], then no element was less than or equal
-    ///   to the provided key.
+    /// - If the search bound is [`Bound::LeastUpper`], then no element was greater than or equal to
+    ///   the provided key.
+    /// - If the search bound is [`Bound::GreatestLower`], then no element was less than or equal to
+    ///   the provided key.
     OutOfRange,
     /// Error that occurs when the `key_fn` fails when retrieving the key in
     /// [`binary_search_by_key_with_bounds`]. The error that occurred in the `key_fn` is returned
@@ -87,10 +87,10 @@ pub(crate) enum SearchError<T: Error> {
 /// ## Finding the Least Upper Bound
 /// ```rust,ignore
 /// # use delta_kernel::history_manager::search::*;
-/// # use delta_kernel::Result;
+/// # use delta_kernel::KernelResult;
 /// let values = [10, 20, 30, 40, 50];
 /// // Simple key function that just returns the value
-/// let key_fn = |&val| -> Result<_> { Ok(val) };
+/// let key_fn = |&val| -> KernelResult<_> { Ok(val) };
 ///
 /// // Find the least upper bound for 25 (element that is ≥ 25)
 /// let result = binary_search_by_key_with_bounds(
@@ -105,9 +105,9 @@ pub(crate) enum SearchError<T: Error> {
 /// ## Finding the Greatest Lower Bound
 /// ```rust,ignore
 /// # use delta_kernel::history_manager::search::*;
-/// # use delta_kernel::Result;
+/// # use delta_kernel::KernelResult;
 /// let values = [10, 20, 30, 40, 50];
-/// let key_fn = |&val| -> Result<_> { Ok(val) };
+/// let key_fn = |&val| -> KernelResult<_> { Ok(val) };
 ///
 /// // Find the greatest lower bound for 25 (element that is ≤ 25)
 /// let result = binary_search_by_key_with_bounds(
@@ -122,9 +122,9 @@ pub(crate) enum SearchError<T: Error> {
 /// ## Handling Out of Range Values
 /// ```rust,ignore
 /// # use delta_kernel::history_manager::search::*;
-/// # use delta_kernel::Result;
+/// # use delta_kernel::KernelResult;
 /// let values = [10, 20, 30, 40, 50];
-/// let key_fn = |&val| -> Result<_> { Ok(val) };
+/// let key_fn = |&val| -> KernelResult<_> { Ok(val) };
 ///
 /// // Finding a bound that's out of range
 /// let result = binary_search_by_key_with_bounds(
@@ -139,7 +139,7 @@ pub(crate) enum SearchError<T: Error> {
 /// ## Using a Fallible Key Function
 /// ```rust,ignore
 /// # use delta_kernel::history_manager::search::*;
-/// # use delta_kernel::Result;
+/// # use delta_kernel::KernelResult;
 /// // Using a fallible key function
 /// let values = ["10", "20", "thirty", "40"];
 /// let result = binary_search_by_key_with_bounds(
@@ -183,10 +183,10 @@ pub(crate) fn binary_search_by_key_with_bounds<'a, T, K: Ord + Debug, E: Error>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{KernelError, Result};
+    use crate::{KernelError, KernelResult};
 
     // Simple key extraction function
-    fn get_val(x: &i32) -> Result<i32> {
+    fn get_val(x: &i32) -> KernelResult<i32> {
         Ok(*x)
     }
 
@@ -248,7 +248,7 @@ mod tests {
     fn test_error_propagation() {
         let values = vec![1, 3, 5, 7, 9];
 
-        let failing_key_fn = |x: &i32| -> Result<i32> {
+        let failing_key_fn = |x: &i32| -> KernelResult<i32> {
             if *x == 5 {
                 Err(KernelError::generic("Error extracting key"))
             } else {

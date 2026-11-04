@@ -1,14 +1,15 @@
 use std::ops::{Add, Div, Mul, Sub};
 
-use rstest::rstest;
 use Expression as Expr;
 use Predicate as Pred;
+use rstest::rstest;
 
 use super::*;
+use crate::KernelResult;
 use crate::arrow::array::{
-    create_array, Array, ArrayRef, BinaryViewArray, BooleanArray, GenericStringArray, Int32Array,
-    Int32Builder, ListArray, ListViewArray, MapArray, MapBuilder, MapFieldNames, StringArray,
-    StringBuilder, StringViewArray, StructArray,
+    Array, ArrayRef, BinaryViewArray, BooleanArray, GenericStringArray, Int32Array, Int32Builder,
+    ListArray, ListViewArray, MapArray, MapBuilder, MapFieldNames, StringArray, StringBuilder,
+    StringViewArray, StructArray, create_array,
 };
 use crate::arrow::buffer::{BooleanBuffer, NullBuffer, OffsetBuffer, ScalarBuffer};
 use crate::arrow::compute::kernels::cmp::{gt_eq, lt};
@@ -29,12 +30,12 @@ use crate::kernel_predicates::{
 #[cfg(feature = "geo-type-in-dev")]
 use crate::schema::EdgeInterpolationAlgorithm;
 use crate::schema::{
-    schema, schema_ref, ArrayType, DataType as KernelDataType, MapType, StructField, StructType,
+    ArrayType, DataType as KernelDataType, IntervalYearToMonthType, MapType, StructField,
+    StructType, schema, schema_ref,
 };
 use crate::unit_test_utils::assert_result_error_with_message;
 #[cfg(feature = "geo-type-in-dev")]
 use crate::unit_test_utils::{geography_type, geometry_type};
-use crate::KernelResult;
 
 #[test]
 fn test_array_column() {
@@ -66,6 +67,25 @@ fn test_array_column() {
 
     let result = evaluate_predicate(&in_op, &batch, true).unwrap();
     assert_eq!(result, expected_not_in);
+}
+
+/// Verifies that null UDT scalars materialize as their physical Arrow type and remain compatible
+/// with the logical UDT.
+#[cfg(feature = "udt-in-dev")]
+#[rstest]
+#[case(KernelDataType::LONG)]
+#[case(KernelDataType::from(schema! { nullable "x": LONG }))]
+#[case(KernelDataType::from(ArrayType::new(KernelDataType::LONG, true)))]
+#[case(KernelDataType::from(MapType::new(KernelDataType::STRING, KernelDataType::LONG, true)))]
+fn null_udt_scalar_uses_physical_type(#[case] sql_type: KernelDataType) {
+    let udt = KernelDataType::from(
+        crate::schema::UserDefinedType::try_new(sql_type.clone(), Default::default()).unwrap(),
+    );
+    let array = Scalar::null(udt.clone()).to_array(3).unwrap();
+    let expected = Scalar::null(sql_type).to_array(3).unwrap();
+    assert_eq!(array.as_ref(), expected.as_ref());
+    assert!(top_level_types_compatible(&udt, array.data_type()));
+    assert!(!top_level_types_compatible(&udt, &DataType::Boolean));
 }
 
 #[test]
@@ -338,15 +358,19 @@ fn test_literal_complex_type_array() {
     // each nested array value has three elements, the middle one NULL
     let expected_valid = [true, false, true];
     let expected_valid = (0..5).flat_map(|_| expected_valid.iter().cloned());
-    assert!(expected_valid
-        .zip(struct_values.nulls().unwrap())
-        .all(|(a, b)| a == b));
+    assert!(
+        expected_valid
+            .zip(struct_values.nulls().unwrap())
+            .all(|(a, b)| a == b)
+    );
 
     let expected_values = [Some(42), None, Some(42)];
     let expected_values = (0..5).flat_map(|_| expected_values.iter().cloned());
-    assert!(expected_values
-        .zip(struct_values.column(0).as_primitive::<Int32Type>())
-        .all(|(a, b)| a == b));
+    assert!(
+        expected_values
+            .zip(struct_values.column(0).as_primitive::<Int32Type>())
+            .all(|(a, b)| a == b)
+    );
     assert_eq!(struct_values.column(2).null_count(), 15);
 
     // The leaf value column has 40 elements (not 60) becuase 1/3 of the parent structs are NULL.
@@ -355,9 +379,11 @@ fn test_literal_complex_type_array() {
     assert_eq!(list_values.len(), 40);
     let expected_values = [Some(1), Some(2), None, Some(3)];
     let expected_values = (0..10).flat_map(|_| expected_values.iter().cloned());
-    assert!(expected_values
-        .zip(list_values.as_primitive::<Int32Type>())
-        .all(|(a, b)| a == b));
+    assert!(
+        expected_values
+            .zip(list_values.as_primitive::<Int32Type>())
+            .all(|(a, b)| a == b)
+    );
 
     let map_values = struct_values.column(3);
     let map_array = map_values.as_map();
@@ -404,7 +430,10 @@ fn test_invalid_array_sides() {
 
     let in_result = evaluate_predicate(&in_op, &batch, false);
 
-    assert_result_error_with_message(in_result, "Invalid expression evaluation: Invalid right value for (NOT) IN comparison, left is: Column(item) right is: Column(item)");
+    assert_result_error_with_message(
+        in_result,
+        "Invalid expression evaluation: Invalid right value for (NOT) IN comparison, left is: Column(item) right is: Column(item)",
+    );
 }
 
 #[test]
@@ -688,7 +717,7 @@ impl ArrowOpaqueExpressionOp for OpaqueLessThanOp {
         &self,
         _eval_expr: &ScalarExpressionEvaluator<'_>,
         _exprs: &[Expression],
-    ) -> Result<Scalar> {
+    ) -> KernelResult<Scalar> {
         unimplemented!() // OpaqueExpressionOp is already tested
     }
 
@@ -697,7 +726,7 @@ impl ArrowOpaqueExpressionOp for OpaqueLessThanOp {
         args: &[Expression],
         batch: &RecordBatch,
         result_type: Option<&KernelDataType>,
-    ) -> Result<ArrayRef> {
+    ) -> KernelResult<ArrayRef> {
         assert!(matches!(result_type, None | Some(&KernelDataType::BOOLEAN)));
         let result = self.eval_pred(args, batch, false)?;
         Ok(Arc::new(result))
@@ -714,7 +743,7 @@ impl ArrowOpaquePredicateOp for OpaqueLessThanOp {
         args: &[Expression],
         batch: &RecordBatch,
         inverted: bool,
-    ) -> Result<BooleanArray> {
+    ) -> KernelResult<BooleanArray> {
         self.eval_pred(args, batch, inverted)
     }
 
@@ -724,7 +753,7 @@ impl ArrowOpaquePredicateOp for OpaqueLessThanOp {
         _eval_pred: &DirectPredicateEvaluator<'_>,
         _exprs: &[Expression],
         _inverted: bool,
-    ) -> Result<Option<bool>> {
+    ) -> KernelResult<Option<bool>> {
         unimplemented!() // OpaquePredicateOp is already tested
     }
 
@@ -832,7 +861,7 @@ fn test_create_many_rejects_null_in_non_nullable_field() {
 }
 
 #[test]
-fn test_scalar_map() -> Result<()> {
+fn test_scalar_map() -> KernelResult<()> {
     // making an 2-row array each with a map with 2 pairs.
     // result: { key1: 1, key2: null }, { key1: 1, key2: null }
     let map_type = MapType::new(KernelDataType::STRING, KernelDataType::INTEGER, true);
@@ -869,7 +898,7 @@ fn test_scalar_map() -> Result<()> {
 }
 
 #[test]
-fn test_null_scalar_map() -> Result<()> {
+fn test_null_scalar_map() -> KernelResult<()> {
     let map_type = MapType::new(KernelDataType::STRING, KernelDataType::STRING, false);
     let null_scalar_map = Scalar::null(map_type);
     let arrow_array = null_scalar_map.to_array(1)?;
@@ -1583,7 +1612,18 @@ fn test_void_scalar_to_array() {
 
 // Interval scalars materialize as their physical integer arrays (Int32 months / Int64 micros).
 #[rstest]
-#[case::year_month(Scalar::IntervalYearMonth(30), DataType::Int32)]
+#[case::year_month(
+    Scalar::interval_year_month(30, IntervalYearToMonthType::IntervalYearToMonth).unwrap(),
+    DataType::Int32
+)]
+#[case::year(
+    Scalar::interval_year_month(24, IntervalYearToMonthType::IntervalYear).unwrap(),
+    DataType::Int32
+)]
+#[case::month(
+    Scalar::interval_year_month(30, IntervalYearToMonthType::IntervalMonth).unwrap(),
+    DataType::Int32
+)]
 #[case::day_time(Scalar::IntervalDayTime(5), DataType::Int64)]
 fn test_interval_scalar_to_array(#[case] scalar: Scalar, #[case] arrow_type: DataType) {
     let array = scalar.to_array(2).unwrap();

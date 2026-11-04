@@ -105,3 +105,21 @@ jobs:
           breaking-change-regex: '^(feat|fix|chore|docs|perf|refactor|test|ci)!(\(.+\))?: .{1,72}$'
           labels: ${{ steps.pr.outputs.labels }}
           title: ${{ steps.pr.outputs.title }}
+
+      - name: Record PR number for comment workflow
+        if: >-
+          always() && steps.pr.outcome == 'success' && steps.pr.outputs.number != '' &&
+          steps.pr.outputs.skip != 'true'
+        env:
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+        run: echo "$PR_NUMBER" > pr-number.txt
+
+      - name: Upload PR number for comment workflow
+        if: >-
+          always() && steps.pr.outcome == 'success' && steps.pr.outputs.number != '' &&
+          steps.pr.outputs.skip != 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: pr-number
+          path: pr-number.txt
+          if-no-files-found: error

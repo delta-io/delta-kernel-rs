@@ -7,18 +7,22 @@
 
 pub(crate) mod v2;
 pub(crate) mod v3;
+#[cfg(feature = "adaptive-metadata-in-dev")]
+pub(crate) mod v4;
 
 use crate::schema::PrimitiveType::{Byte, Decimal, Double, Float, Integer, Long, Short};
 use crate::schema::{ColumnMetadataKey, DataType, MetadataValue, StructField};
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::TableFeature;
-use crate::transforms::{transform_output_type, SchemaTransform};
+use crate::transforms::{SchemaTransform, transform_output_type};
 use crate::{KernelError, KernelResult};
 
 pub(crate) enum IcebergCompatVersion {
     // TODO: Add V1 when kernel supports it
     V2,
     V3,
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    NativeV4,
 }
 
 impl IcebergCompatVersion {
@@ -26,6 +30,8 @@ impl IcebergCompatVersion {
         match self {
             Self::V2 => TableFeature::IcebergCompatV2,
             Self::V3 => TableFeature::IcebergCompatV3,
+            #[cfg(feature = "adaptive-metadata-in-dev")]
+            Self::NativeV4 => TableFeature::IcebergNativeV4Preview,
         }
     }
 }
@@ -320,7 +326,7 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
-    use crate::schema::{schema, ArrayType, MetadataValue, PrimitiveType, StructType};
+    use crate::schema::{ArrayType, MetadataValue, PrimitiveType, StructType, schema};
 
     // === LegacyNestedIdsVisitor: parquet.field.nested.ids detection ===
 

@@ -3,17 +3,17 @@
 use crate::schema::{Schema, StructType};
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::TableFeature;
-use crate::transforms::{transform_output_type, SchemaTransform};
+use crate::transforms::{SchemaTransform, transform_output_type};
 use crate::utils::require;
-use crate::{KernelError, KernelResult, Result};
+use crate::{KernelError, KernelResult};
 
 /// Schema visitor that checks if any column in the schema uses VARIANT type
 pub(crate) struct UsesVariant;
 
 impl<'a> SchemaTransform<'a> for UsesVariant {
-    transform_output_type!(|'a, T| Result<(), ()>);
+    transform_output_type!(|'a, T| KernelResult<(), ()>);
 
-    fn transform_variant(&mut self, _: &'a StructType) -> Result<(), ()> {
+    fn transform_variant(&mut self, _: &'a StructType) -> KernelResult<(), ()> {
         Err(())
     }
 }
@@ -43,7 +43,7 @@ pub(crate) fn validate_variant_type_feature_support(tc: &TableConfiguration) -> 
 #[cfg(test)]
 mod tests {
     use crate::actions::Protocol;
-    use crate::schema::{schema, DataType, StructField};
+    use crate::schema::{DataType, StructField, schema};
     use crate::table_features::TableFeature;
     use crate::unit_test_utils::{
         assert_result_error_with_message, assert_schema_feature_validation,

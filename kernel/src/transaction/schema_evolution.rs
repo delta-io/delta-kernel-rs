@@ -6,29 +6,29 @@ use std::sync::Arc;
 
 use delta_kernel_derive::internal_api;
 
+use crate::KernelResult;
 use crate::error::KernelError;
 use crate::expressions::ColumnName;
 use crate::schema::validation::validate_schema;
 use crate::schema::{ColumnMetadataKey, DataType, SchemaRef, StructField, StructType};
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::{
-    find_max_column_id_in_schema, schema_has_column_mapping_metadata,
-    strip_stray_column_mapping_metadata, try_assign_flat_column_mapping_info,
-    validate_column_mapping_id, ColumnMappingMode, TableFeature,
+    ColumnMappingMode, TableFeature, find_max_column_id_in_schema,
+    schema_has_column_mapping_metadata, strip_stray_column_mapping_metadata,
+    try_assign_flat_column_mapping_info, validate_column_mapping_id,
 };
 use crate::table_properties::COLUMN_MAPPING_MAX_COLUMN_ID;
-use crate::transforms::{transform_output_type, SchemaTransform};
+use crate::transforms::{SchemaTransform, transform_output_type};
 use crate::utils::FoldWithOption as _;
-use crate::KernelResult;
 
 /// A schema evolution operation to be applied to a table.
 ///
 /// Operations are validated and applied in order during
 /// `apply_schema_operations`. Each operation sees the schema state after all prior operations
 /// have been applied.
+#[internal_api]
 #[non_exhaustive]
 #[derive(Debug, Clone)]
-#[internal_api]
 pub(crate) enum SchemaOperation {
     /// Add a column or nested field to the table schema.
     AddColumn {
@@ -43,6 +43,7 @@ pub(crate) enum SchemaOperation {
 
 impl SchemaOperation {
     /// Creates an add-column operation under `parent`; `None` selects the root schema.
+    #[internal_api]
     pub(crate) fn add_column(parent: impl Into<Option<ColumnName>>, field: StructField) -> Self {
         Self::AddColumn {
             parent: parent.into(),
@@ -196,9 +197,9 @@ pub(crate) fn apply_schema_operations(
                     // <https://github.com/delta-io/delta-kernel-rs/issues/2492>
                     try_assign_flat_column_mapping_info(&field, id)?
                 } else {
-                    // Stray CM metadata on a mapping-disabled table is handled by the AlterTable
-                    // builder, which strips annotations this ALTER newly introduces from the
-                    // evolved schema.
+                    // `evolve_table_config` strips column-mapping annotations introduced into a
+                    // mapping-disabled table whose original schema had none. Existing residual
+                    // annotations are preserved.
                     field
                 };
                 let parent_path = parent.as_ref().map_or(&[][..], ColumnName::path);
@@ -237,7 +238,7 @@ pub(crate) fn apply_schema_operations(
         Ordering::Less => {
             return Err(KernelError::internal_error(
                 "max column ID went backwards during schema evolution",
-            ))
+            ));
         }
     };
     Ok(SchemaEvolutionResult {
@@ -305,10 +306,10 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
-    use crate::expressions::{column_name, ColumnName};
+    use crate::expressions::{ColumnName, column_name};
     use crate::schema::{
-        schema, ArrayType, ColumnMetadataKey, DataType, MapType, MetadataColumnSpec, MetadataValue,
-        StructField, StructType,
+        ArrayType, ColumnMetadataKey, DataType, MapType, MetadataColumnSpec, MetadataValue,
+        StructField, StructType, schema,
     };
 
     fn simple_schema() -> StructType {

@@ -10,7 +10,7 @@ use std::sync::Arc;
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 
-use crate::expressions::{lit, Expression, ExpressionRef, ExpressionStructPatchBuilder, Scalar};
+use crate::expressions::{Expression, ExpressionRef, ExpressionStructPatchBuilder, Scalar, lit};
 use crate::schema::{DataType, SchemaRef, StructType};
 use crate::table_features::ColumnMappingMode;
 use crate::{KernelError, KernelResult};
@@ -262,10 +262,10 @@ mod tests {
     use std::collections::HashMap;
 
     use super::*;
-    use crate::expressions::{col, BinaryExpressionOp};
-    use crate::schema::{schema, schema_ref, DataType, PrimitiveType};
+    use crate::KernelResult;
+    use crate::expressions::{BinaryExpressionOp, col};
+    use crate::schema::{DataType, PrimitiveType, schema, schema_ref};
     use crate::unit_test_utils::assert_result_error_with_message;
-    use crate::Result;
 
     // Tests for parse_partition_value function
     #[test]
@@ -690,7 +690,7 @@ mod tests {
     }
 
     #[test]
-    fn get_transform_expr_generates_stable_row_commit_versions() -> Result<()> {
+    fn get_transform_expr_generates_stable_row_commit_versions() -> KernelResult<()> {
         let transform_spec = vec![FieldTransformSpec::GenerateRowCommitVersion {
             field_name: "row_commit_version_col".to_string(),
         }];

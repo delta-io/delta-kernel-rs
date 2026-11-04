@@ -6,6 +6,7 @@
 
 use std::sync::Arc;
 
+use delta_kernel::KernelResult;
 use delta_kernel::arrow::array::{Int32Array, StringArray};
 use delta_kernel::arrow::record_batch::RecordBatch;
 use delta_kernel::committer::FileSystemCommitter;
@@ -13,11 +14,10 @@ use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::snapshot::Snapshot;
 use delta_kernel::table_features::{
-    TableFeature, TABLE_FEATURES_MIN_READER_VERSION, TABLE_FEATURES_MIN_WRITER_VERSION,
+    TABLE_FEATURES_MIN_READER_VERSION, TABLE_FEATURES_MIN_WRITER_VERSION, TableFeature,
 };
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
-use delta_kernel::Result;
 use rstest::rstest;
 use test_utils::{
     get_materialized_row_tracking_column_names, get_row_tracking_add_actions, insert_data,
@@ -72,14 +72,14 @@ async fn test_create_table_with_row_tracking(
     )]
     activation: (&str, &str),
     #[values(false, true)] with_data: bool,
-) -> Result<()> {
+) -> KernelResult<()> {
     let (key, value) = activation;
     let expect_property_enabled = key == "delta.enableRowTracking";
 
     let (_temp_dir, table_path, engine) = test_table_setup()?;
     let schema = super::simple_schema()?;
 
-    let mut txn = create_table(&table_path, schema.clone(), "Test/1.0")
+    let mut txn = create_table(&table_path, schema.clone(), "Test/1.0", true)
         .with_table_properties([(key, value)])
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
 
@@ -122,7 +122,9 @@ async fn test_create_table_with_row_tracking(
     let disk_snapshot = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
     let expected_high_water_mark: i64 = if with_data { 4 } else { -1 };
     assert_eq!(
-        disk_snapshot.get_row_tracking_high_water_mark(engine.as_ref())?,
+        disk_snapshot
+            .reader()
+            .get_row_tracking_high_water_mark(engine.as_ref())?,
         Some(expected_high_water_mark),
     );
 
@@ -191,11 +193,11 @@ async fn test_create_table_with_row_tracking(
 /// Verifies that CTAS with multiple files assigns non-overlapping baseRowId ranges and
 /// computes the correct cumulative high water mark.
 #[tokio::test]
-async fn test_create_table_with_multiple_files_and_row_tracking() -> Result<()> {
+async fn test_create_table_with_multiple_files_and_row_tracking() -> KernelResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
     let schema = super::simple_schema()?;
-    let mut txn = create_table(&table_path, schema.clone(), "Test/1.0")
+    let mut txn = create_table(&table_path, schema.clone(), "Test/1.0", true)
         .with_table_properties([("delta.enableRowTracking", "true")])
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
 
@@ -252,7 +254,9 @@ async fn test_create_table_with_multiple_files_and_row_tracking() -> Result<()> 
     // HWM should be 7 (IDs 0-2 from file 1, IDs 3-7 from file 2)
     let disk_snapshot = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
     assert_eq!(
-        disk_snapshot.get_row_tracking_high_water_mark(engine.as_ref())?,
+        disk_snapshot
+            .reader()
+            .get_row_tracking_high_water_mark(engine.as_ref())?,
         Some(7),
         "HWM should be 7 for 8 total rows (3 + 5) starting from -1"
     );
@@ -264,10 +268,10 @@ async fn test_create_table_with_multiple_files_and_row_tracking() -> Result<()> 
 /// DomainMetadata, which should appear exactly once in the protocol. Both domain metadata
 /// entries (delta.rowTracking and delta.clustering) should be present in the commit.
 #[test]
-fn test_create_table_with_row_tracking_and_clustering() -> Result<()> {
+fn test_create_table_with_row_tracking_and_clustering() -> KernelResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
-    let committed = create_table(&table_path, super::simple_schema()?, "Test/1.0")
+    let committed = create_table(&table_path, super::simple_schema()?, "Test/1.0", true)
         .with_table_properties([("delta.enableRowTracking", "true")])
         .with_data_layout(DataLayout::clustered(["id"]))
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
@@ -315,11 +319,11 @@ fn test_create_table_with_row_tracking_and_clustering() -> Result<()> {
 /// Both features generate domain metadata and the add files need row tracking columns.
 /// Verifies that both domain metadata entries survive when add files are also written.
 #[tokio::test]
-async fn test_create_table_with_row_tracking_and_clustering_and_data() -> Result<()> {
+async fn test_create_table_with_row_tracking_and_clustering_and_data() -> KernelResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
     let schema = super::simple_schema()?;
-    let mut txn = create_table(&table_path, schema.clone(), "Test/1.0")
+    let mut txn = create_table(&table_path, schema.clone(), "Test/1.0", true)
         .with_table_properties([("delta.enableRowTracking", "true")])
         .with_data_layout(DataLayout::clustered(["id"]))
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
@@ -388,7 +392,9 @@ async fn test_create_table_with_row_tracking_and_clustering_and_data() -> Result
     // High water mark should reflect the 5 written rows
     let disk_snapshot = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
     assert_eq!(
-        disk_snapshot.get_row_tracking_high_water_mark(engine.as_ref())?,
+        disk_snapshot
+            .reader()
+            .get_row_tracking_high_water_mark(engine.as_ref())?,
         Some(4),
         "5 rows -> high water mark = 4"
     );
@@ -401,11 +407,11 @@ async fn test_create_table_with_row_tracking_and_clustering_and_data() -> Result
 /// subsequent data append. The initial create writes `rowIdHighWaterMark = -1`; the append must
 /// read that and assign `baseRowId = 0` to the first file.
 #[tokio::test]
-async fn test_feature_signal_create_then_append_assigns_correct_base_row_id() -> Result<()> {
+async fn test_feature_signal_create_then_append_assigns_correct_base_row_id() -> KernelResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
     // Create empty table with feature signal only (no enablement property)
-    let _ = create_table(&table_path, super::simple_schema()?, "Test/1.0")
+    let _ = create_table(&table_path, super::simple_schema()?, "Test/1.0", true)
         .with_table_properties([("delta.feature.rowTracking", "supported")])
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
         .commit(engine.as_ref())?;
@@ -417,7 +423,9 @@ async fn test_feature_signal_create_then_append_assigns_correct_base_row_id() ->
         .at_version(0)
         .build(engine.as_ref())?;
     assert_eq!(
-        v0_snapshot.get_row_tracking_high_water_mark(engine.as_ref())?,
+        v0_snapshot
+            .reader()
+            .get_row_tracking_high_water_mark(engine.as_ref())?,
         Some(-1),
         "Initial high water mark should be -1"
     );
@@ -447,7 +455,9 @@ async fn test_feature_signal_create_then_append_assigns_correct_base_row_id() ->
     // High water mark after append: 3 rows starting from 0 -> high water mark = 2
     let v1_snapshot = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
     assert_eq!(
-        v1_snapshot.get_row_tracking_high_water_mark(engine.as_ref())?,
+        v1_snapshot
+            .reader()
+            .get_row_tracking_high_water_mark(engine.as_ref())?,
         Some(2),
         "3 rows starting from 0 -> high water mark = 2"
     );

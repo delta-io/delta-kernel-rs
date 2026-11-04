@@ -8,9 +8,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::actions::{DomainMetadata, NUM_RECORDS};
 use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
-use crate::schema::{column_name, ColumnName, ColumnNamesAndTypes, DataType};
+use crate::schema::{ColumnName, ColumnNamesAndTypes, DataType, column_name};
 use crate::utils::require;
-use crate::{KernelError, KernelResult, Result};
+use crate::{KernelError, KernelResult};
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -53,7 +53,7 @@ pub(crate) fn parse_row_tracking_high_water_mark(configuration: &str) -> KernelR
 impl TryFrom<RowTrackingDomainMetadata> for DomainMetadata {
     type Error = crate::KernelError;
 
-    fn try_from(metadata: RowTrackingDomainMetadata) -> Result<Self> {
+    fn try_from(metadata: RowTrackingDomainMetadata) -> KernelResult<Self> {
         Ok(DomainMetadata::new(
             ROW_TRACKING_DOMAIN_NAME.to_string(),
             serde_json::to_string(&metadata)?,
@@ -74,19 +74,33 @@ pub(crate) struct RowTrackingVisitor {
     /// High water mark for row IDs
     pub(crate) row_id_high_water_mark: i64,
 
-    /// Computed base row IDs of the visited actions, organized by batch
-    pub(crate) base_row_id_batches: Vec<Vec<i64>>,
+    collect_base_row_ids: bool,
+    base_row_ids: Vec<i64>,
 }
 
 impl RowTrackingVisitor {
-    pub(crate) fn new(row_id_high_water_mark: Option<i64>, num_batches: Option<usize>) -> Self {
+    pub(crate) fn new(row_id_high_water_mark: Option<i64>) -> Self {
         // A table might not have a row ID high water mark yet, so we model the input as an
         // Option<i64>
         Self {
             row_id_high_water_mark: row_id_high_water_mark
                 .unwrap_or(ROW_TRACKING_INITIAL_HIGH_WATER_MARK),
-            base_row_id_batches: Vec::with_capacity(num_batches.unwrap_or(0)),
+            collect_base_row_ids: true,
+            base_row_ids: Vec::new(),
         }
+    }
+
+    /// Like [`Self::new`], but does not materialize rowid bases.
+    pub(crate) fn dry_run(row_id_high_water_mark: Option<i64>) -> Self {
+        Self {
+            collect_base_row_ids: false,
+            ..Self::new(row_id_high_water_mark)
+        }
+    }
+
+    /// Takes all rowid bases materialized so far.
+    pub(crate) fn take_base_row_ids(&mut self) -> Vec<i64> {
+        std::mem::take(&mut self.base_row_ids)
     }
 }
 
@@ -102,7 +116,7 @@ impl RowVisitor for RowTrackingVisitor {
         NAMES_AND_TYPES.as_ref()
     }
 
-    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> Result<()> {
+    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> KernelResult<()> {
         require!(
             getters.len() == 1,
             KernelError::generic(format!(
@@ -111,22 +125,22 @@ impl RowVisitor for RowTrackingVisitor {
             ))
         );
 
-        // Create a new batch for this visit
-        let mut batch_base_row_ids = Vec::with_capacity(row_count);
+        if self.collect_base_row_ids {
+            self.base_row_ids.reserve(row_count);
+        }
 
-        let mut current_hwm = self.row_id_high_water_mark;
         for i in 0..row_count {
             let num_records: i64 = getters[0].get_opt(i, NUM_RECORDS)?.ok_or_else(|| {
                 KernelError::InternalError(format!(
                     "{NUM_RECORDS} must be present in Add actions when row tracking is enabled."
                 ))
             })?;
-            batch_base_row_ids.push(current_hwm + 1);
-            current_hwm += num_records;
+            if self.collect_base_row_ids {
+                self.base_row_ids.push(self.row_id_high_water_mark + 1);
+            }
+            self.row_id_high_water_mark += num_records;
         }
 
-        self.base_row_id_batches.push(batch_base_row_ids);
-        self.row_id_high_water_mark = current_hwm;
         Ok(())
     }
 }
@@ -146,7 +160,7 @@ mod tests {
     }
 
     impl<'a> GetData<'a> for MockGetData {
-        fn get_long(&'a self, row_index: usize, field_name: &str) -> Result<Option<i64>> {
+        fn get_long(&'a self, row_index: usize, field_name: &str) -> KernelResult<Option<i64>> {
             if field_name == NUM_RECORDS {
                 Ok(self.num_records_values.get(row_index).copied().flatten())
             } else {
@@ -160,16 +174,15 @@ mod tests {
     }
 
     #[test]
-    fn test_visit_basic_functionality() -> Result<()> {
-        let mut visitor = RowTrackingVisitor::new(None, Some(1));
+    fn test_visit_basic_functionality() -> KernelResult<()> {
+        let mut visitor = RowTrackingVisitor::new(None);
         let num_records_mock = MockGetData::new(vec![Some(10), Some(5), Some(20)]);
         let getters = create_getters(&num_records_mock);
 
         visitor.visit(3, &getters)?;
 
         // Check that base row IDs are calculated correctly
-        assert_eq!(visitor.base_row_id_batches.len(), 1);
-        assert_eq!(visitor.base_row_id_batches[0], vec![0, 10, 15]);
+        assert_eq!(visitor.take_base_row_ids(), vec![0, 10, 15]);
 
         // Check that high water mark is updated correctly
         assert_eq!(visitor.row_id_high_water_mark, 34); // -1 + 10 + 5 + 20
@@ -178,16 +191,15 @@ mod tests {
     }
 
     #[test]
-    fn test_visit_with_negative_high_water_mark() -> Result<()> {
-        let mut visitor = RowTrackingVisitor::new(Some(-5), Some(1));
+    fn test_visit_with_negative_high_water_mark() -> KernelResult<()> {
+        let mut visitor = RowTrackingVisitor::new(Some(-5));
         let num_records_mock = MockGetData::new(vec![Some(3), Some(2)]);
         let getters = create_getters(&num_records_mock);
 
         visitor.visit(2, &getters)?;
 
         // Base row IDs should start from high_water_mark + 1
-        assert_eq!(visitor.base_row_id_batches.len(), 1);
-        assert_eq!(visitor.base_row_id_batches[0], vec![-4, -1]); // -5+1=-4, then -4+3=-1
+        assert_eq!(visitor.take_base_row_ids(), vec![-4, -1]);
 
         // High water mark should be updated
         assert_eq!(visitor.row_id_high_water_mark, 0); // -5 + 3 + 2 = 0
@@ -196,16 +208,15 @@ mod tests {
     }
 
     #[test]
-    fn test_visit_with_zero_records() -> Result<()> {
-        let mut visitor = RowTrackingVisitor::new(Some(10), Some(1));
+    fn test_visit_with_zero_records() -> KernelResult<()> {
+        let mut visitor = RowTrackingVisitor::new(Some(10));
         let num_records_mock = MockGetData::new(vec![Some(0), Some(0), Some(5)]);
         let getters = create_getters(&num_records_mock);
 
         visitor.visit(3, &getters)?;
 
         // Base row IDs should still be assigned even for zero-record files
-        assert_eq!(visitor.base_row_id_batches.len(), 1);
-        assert_eq!(visitor.base_row_id_batches[0], vec![11, 11, 11]);
+        assert_eq!(visitor.take_base_row_ids(), vec![11, 11, 11]);
 
         // High water mark should only increase by non-zero records
         assert_eq!(visitor.row_id_high_water_mark, 15); // 10 + 0 + 0 + 5
@@ -214,43 +225,41 @@ mod tests {
     }
 
     #[test]
-    fn test_visit_empty_batch() -> Result<()> {
-        let mut visitor = RowTrackingVisitor::new(Some(42), None);
+    fn test_visit_empty_batch() -> KernelResult<()> {
+        let mut visitor = RowTrackingVisitor::new(Some(42));
         let num_records_mock = MockGetData::new(vec![]);
         let getters = create_getters(&num_records_mock);
 
         visitor.visit(0, &getters)?;
 
         // Should handle empty batch gracefully
-        assert_eq!(visitor.base_row_id_batches.len(), 1);
-        assert!(visitor.base_row_id_batches[0].is_empty());
+        assert!(visitor.take_base_row_ids().is_empty());
         assert_eq!(visitor.row_id_high_water_mark, 42); // Should remain unchanged
 
         Ok(())
     }
 
     #[test]
-    fn test_visit_multiple_batches() -> Result<()> {
-        let mut visitor = RowTrackingVisitor::new(Some(0), Some(2));
+    fn test_visit_multiple_batches() -> KernelResult<()> {
+        let mut visitor = RowTrackingVisitor::new(Some(0));
 
         // First batch
         let num_records_mock1 = MockGetData::new(vec![Some(10), Some(5)]);
         let getters1 = create_getters(&num_records_mock1);
         visitor.visit(2, &getters1)?;
+        let first_base_row_ids = visitor.take_base_row_ids();
 
         // Second batch
         let num_records_mock2 = MockGetData::new(vec![Some(3), Some(7), Some(2)]);
         let getters2 = create_getters(&num_records_mock2);
         visitor.visit(3, &getters2)?;
-
-        // Check that we have two batches
-        assert_eq!(visitor.base_row_id_batches.len(), 2);
+        let second_base_row_ids = visitor.take_base_row_ids();
 
         // Check first batch: starts at 1, then 11
-        assert_eq!(visitor.base_row_id_batches[0], vec![1, 11]);
+        assert_eq!(first_base_row_ids, vec![1, 11]);
 
         // Check second batch: starts at 16, then 19, then 26
-        assert_eq!(visitor.base_row_id_batches[1], vec![16, 19, 26]);
+        assert_eq!(second_base_row_ids, vec![16, 19, 26]);
 
         // Check final high water mark: 0 + 10 + 5 + 3 + 7 + 2 = 27
         assert_eq!(visitor.row_id_high_water_mark, 27);
@@ -259,8 +268,8 @@ mod tests {
     }
 
     #[test]
-    fn test_visit_wrong_getter_count() -> Result<()> {
-        let mut visitor = RowTrackingVisitor::new(Some(0), None);
+    fn test_visit_wrong_getter_count() -> KernelResult<()> {
+        let mut visitor = RowTrackingVisitor::new(Some(0));
         let wrong_getters: Vec<&dyn GetData<'_>> = vec![]; // No getters instead of expected count
 
         let result = visitor.visit(1, &wrong_getters);
@@ -270,8 +279,8 @@ mod tests {
     }
 
     #[test]
-    fn test_visit_missing_num_records() -> Result<()> {
-        let mut visitor = RowTrackingVisitor::new(Some(0), None);
+    fn test_visit_missing_num_records() -> KernelResult<()> {
+        let mut visitor = RowTrackingVisitor::new(Some(0));
         let num_records_mock = MockGetData::new(vec![None]); // Missing numRecords
         let getters = create_getters(&num_records_mock);
 
@@ -286,7 +295,7 @@ mod tests {
 
     #[test]
     fn test_selected_column_names_and_types() {
-        let visitor = RowTrackingVisitor::new(Some(0), None);
+        let visitor = RowTrackingVisitor::new(Some(0));
         let (names, types) = visitor.selected_column_names_and_types();
 
         assert_eq!(names, (vec![column_name!("stats", NUM_RECORDS)]));
@@ -294,7 +303,7 @@ mod tests {
     }
 
     #[test]
-    fn test_serialization_roundtrip() -> Result<()> {
+    fn test_serialization_roundtrip() -> KernelResult<()> {
         let original = RowTrackingDomainMetadata::new(-42);
         let json = serde_json::to_string(&original)?;
         let deserialized: RowTrackingDomainMetadata = serde_json::from_str(&json)?;

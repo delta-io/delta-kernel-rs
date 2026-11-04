@@ -7,11 +7,22 @@ use syn::parse::Parser;
 use syn::punctuated::Punctuated;
 use syn::spanned::Spanned;
 use syn::{
-    parse_macro_input, Attribute, Data, DataStruct, DeriveInput, Error, Expr, ExprLit, Field,
-    Fields, Item, ItemMacro, Lit, Meta, PathArguments, Token, Type, Visibility,
+    Attribute, Data, DataStruct, DeriveInput, Error, Expr, ExprLit, Field, Fields, Item, ItemMacro,
+    Lit, Meta, PathArguments, Token, Type, Visibility, parse_macro_input,
 };
 
+mod expr_macro;
 mod schema_macro;
+
+/// Backend for `delta_kernel::expressions::expr!`. Input is a Kernel crate path, a semicolon,
+/// and an expression; invalid syntax or constructors produce a compile error.
+#[doc(hidden)]
+#[proc_macro]
+pub fn expr(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
+    expr_macro::expand(input.into())
+        .unwrap_or_else(Error::into_compile_error)
+        .into()
+}
 
 // Builds a `StructType`; see `delta_kernel::schema::schema` re-export for details.
 #[doc(hidden)]
@@ -26,7 +37,7 @@ pub fn schema(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
 pub fn try_schema(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
     // Wrap the block in a closure that anchors the block's `?` operators
     schema_macro::parse_schema(input, true, |block| {
-        quote! { (|| -> delta_kernel::Result<_> #block)() }
+        quote! { (|| -> delta_kernel::KernelResult<_> #block)() }
     })
 }
 
@@ -402,6 +413,15 @@ fn try_from_struct_data_fields<'a>(
             "TryFromStructData does not support #[skip_schema] fields",
         ));
     }
+    if let Some(field) = fields
+        .iter()
+        .find(|field| has_named_attr(&field.attrs, "allow_null_container_values"))
+    {
+        return Err(Error::new(
+            field.span(),
+            "TryFromStructData does not support #[allow_null_container_values] fields",
+        ));
+    }
     Ok(fields)
 }
 
@@ -417,9 +437,10 @@ fn gen_schema_fields(data: &Data, span: Span) -> Result<TokenStream, Error> {
 /// - `From<Self> for StructData` — field values via `.into()`, schema from `ToSchema`
 /// - `From<Self> for Scalar` — `Scalar::Struct(self.into())`
 ///
-/// Honors `#[skip_schema]`, producing the same field set as `ToSchema`. Every schema field type
-/// must implement `Into<Scalar>` (and the struct must implement `ToSchema`).
-#[proc_macro_derive(IntoStructData)]
+/// Honors `#[skip_schema]`, producing the same field set as `ToSchema`, and
+/// `#[allow_null_container_values]`, preserving nullable map values in the scalar type. Every
+/// schema field type must implement `Into<Scalar>` (and the struct must implement `ToSchema`).
+#[proc_macro_derive(IntoStructData, attributes(allow_null_container_values, skip_schema))]
 pub fn into_struct_data_derive(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
     let struct_name = &input.ident;
@@ -428,8 +449,18 @@ pub fn into_struct_data_derive(input: proc_macro::TokenStream) -> proc_macro::To
         Ok(fields) => fields,
         Err(e) => return e.to_compile_error().into(),
     };
-    let (field_idents, field_types): (Vec<_>, Vec<_>) =
-        fields.into_iter().map(|f| (&f.ident, &f.ty)).unzip();
+    let field_types = fields.iter().map(|field| &field.ty);
+    let field_values = fields.iter().map(|field| {
+        let ident = &field.ident;
+        if has_named_attr(&field.attrs, "allow_null_container_values") {
+            quote_spanned! { field.span() =>
+                delta_kernel::schema::derive_macro_utils::IntoNullableContainerScalar::
+                    into_nullable_container_scalar(value.#ident)
+            }
+        } else {
+            quote_spanned! { field.span() => value.#ident.into() }
+        }
+    });
 
     let expanded = quote! {
         #[automatically_derived]
@@ -441,7 +472,7 @@ pub fn into_struct_data_derive(input: proc_macro::TokenStream) -> proc_macro::To
             fn from(value: #struct_name) -> Self {
                 Self::from_values_unchecked(
                     <#struct_name as delta_kernel::schema::ToSchema>::to_schema(),
-                    vec![ #(value.#field_idents.into()),* ],
+                    vec![ #(#field_values),* ],
                 )
             }
         }
@@ -471,7 +502,12 @@ pub fn into_struct_data_derive(input: proc_macro::TokenStream) -> proc_macro::To
 /// Missing, duplicate, and unknown fields are errors. Every field type must implement
 /// `TryFrom<Scalar, Error = KernelError>`. `#[skip_schema]` is rejected because the reverse
 /// conversion cannot infer a value or schema for a field omitted by `ToSchema`.
-#[proc_macro_derive(TryFromStructData, attributes(skip_schema))]
+/// `#[allow_null_container_values]` is rejected because its map scalar type cannot be converted
+/// by the standard `HashMap` conversion.
+#[proc_macro_derive(
+    TryFromStructData,
+    attributes(allow_null_container_values, skip_schema)
+)]
 pub fn try_from_struct_data_derive(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
     try_from_struct_data_impl(&input)
@@ -507,7 +543,7 @@ fn try_from_struct_data_impl(input: &DeriveInput) -> Result<TokenStream, Error> 
 
             fn try_from(
                 value: delta_kernel::expressions::StructData,
-            ) -> delta_kernel::Result<Self> {
+            ) -> delta_kernel::KernelResult<Self> {
                 let mut fields =
                     delta_kernel::schema::derive_macro_utils::StructDataFields::try_new(
                         value,
@@ -533,7 +569,7 @@ fn try_from_struct_data_impl(input: &DeriveInput) -> Result<TokenStream, Error> 
 
             fn try_from(
                 value: delta_kernel::expressions::Scalar,
-            ) -> delta_kernel::Result<Self> {
+            ) -> delta_kernel::KernelResult<Self> {
                 match value {
                     delta_kernel::expressions::Scalar::Struct(data) => data.try_into(),
                     other => Err(other.conversion_error(stringify!(#struct_name))),
@@ -958,25 +994,25 @@ mod tests {
         );
     }
 
-    #[test]
-    fn try_from_struct_data_rejects_skipped_field() {
-        let input = syn::parse_str::<DeriveInput>(
-            r#"
-            struct TestStruct {
-                #[skip_schema]
-                skipped: String,
-                kept: i32,
-            }
-            "#,
-        )
-        .unwrap();
+    #[rstest]
+    #[case::skipped(
+        "#[skip_schema]",
+        "TryFromStructData does not support #[skip_schema] fields"
+    )]
+    #[case::nullable_container_values(
+        "#[allow_null_container_values]",
+        "TryFromStructData does not support #[allow_null_container_values] fields"
+    )]
+    fn try_from_struct_data_rejects_unsupported_field(
+        #[case] attribute: &str,
+        #[case] expected: &str,
+    ) {
+        let input = format!("struct TestStruct {{ {attribute} field: String }}");
+        let input = syn::parse_str::<DeriveInput>(&input).unwrap();
         let error =
             try_from_struct_data_fields(&input.data, "TryFromStructData", input.ident.span())
                 .unwrap_err();
-        assert_eq!(
-            error.to_string(),
-            "TryFromStructData does not support #[skip_schema] fields"
-        );
+        assert_eq!(error.to_string(), expected);
     }
 
     #[rstest]

@@ -30,6 +30,10 @@ where
             try_parse(&mut props, k.as_ref(), v.as_ref()).is_none()
         });
         props.unknown_properties = unparsed.map(|(k, v)| (k.into(), v.into())).collect();
+        // The configuration has no defined order, so sort to make equal configurations parse equal.
+        props
+            .check_constraints
+            .sort_by(|a, b| (&a.name, &a.raw_sql).cmp(&(&b.name, &b.raw_sql)));
         props
     }
 }
@@ -72,6 +76,7 @@ fn try_parse(props: &mut TableProperties, k: &str, v: &str) -> Option<()> {
         ENABLE_ICEBERG_COMPAT_V1 => props.enable_iceberg_compat_v1 = Some(parse_bool(v)?),
         ENABLE_ICEBERG_COMPAT_V2 => props.enable_iceberg_compat_v2 = Some(parse_bool(v)?),
         ENABLE_ICEBERG_COMPAT_V3 => props.enable_iceberg_compat_v3 = Some(parse_bool(v)?),
+        ENABLE_ICEBERG_NATIVE_V4 => props.enable_iceberg_native_v4 = Some(parse_bool(v)?),
         ISOLATION_LEVEL => props.isolation_level = IsolationLevel::try_from(v).ok(),
         LOG_RETENTION_DURATION => props.log_retention_duration = Some(parse_interval(v)?),
         ENABLE_EXPIRED_LOG_CLEANUP => props.enable_expired_log_cleanup = Some(parse_bool(v)?),
@@ -104,7 +109,13 @@ fn try_parse(props: &mut TableProperties, k: &str, v: &str) -> Option<()> {
         IN_COMMIT_TIMESTAMP_ENABLEMENT_TIMESTAMP => {
             props.in_commit_timestamp_enablement_timestamp = Some(parse_non_negative(v)?)
         }
-        _ => return None,
+        _ => {
+            let name = strip_check_constraint_prefix(k)?;
+            props.check_constraints.push(CheckConstraint {
+                name: name.to_string(),
+                raw_sql: v.to_string(),
+            });
+        }
     }
     Some(())
 }

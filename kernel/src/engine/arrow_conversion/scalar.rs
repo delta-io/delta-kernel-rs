@@ -12,16 +12,16 @@
 
 // TODO: add `extract_scalar` that handles complex types (Struct, Array, Map) via recursive
 // extraction into StructData/ArrayData/MapData when there is a concrete use case.
+use crate::arrow::array::Array;
 use crate::arrow::array::cast::AsArray;
 use crate::arrow::array::types::{
-    Date32Type, Decimal128Type, Float32Type, Float64Type, Int16Type, Int32Type, Int64Type,
-    Int8Type, TimestampMicrosecondType,
+    Date32Type, Decimal128Type, Float32Type, Float64Type, Int8Type, Int16Type, Int32Type,
+    Int64Type, TimestampMicrosecondType,
 };
-use crate::arrow::array::Array;
 use crate::arrow::datatypes::{DataType as ArrowDataType, TimeUnit};
 use crate::expressions::Scalar;
 use crate::schema::DataType;
-use crate::{KernelError, KernelResult, Result};
+use crate::{KernelError, KernelResult};
 
 /// Extracts a primitive kernel [`Scalar`] from the given row of an Arrow array.
 ///
@@ -37,7 +37,7 @@ use crate::{KernelError, KernelResult, Result};
 /// - The Arrow data type is not a supported primitive type (e.g., Struct, List, Map)
 /// - The Arrow data type is a `Timestamp` with a non-microsecond time unit
 /// - The decimal precision/scale is invalid
-pub fn extract_primitive_scalar(array: &dyn Array, row_idx: usize) -> Result<Scalar> {
+pub fn extract_primitive_scalar(array: &dyn Array, row_idx: usize) -> KernelResult<Scalar> {
     if row_idx >= array.len() {
         return Err(KernelError::generic(format!(
             "row index {row_idx} out of bounds for array of length {}",
@@ -170,9 +170,9 @@ mod tests {
 
     use super::*;
     use crate::arrow::array::{
-        new_null_array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array,
-        Float32Array, Float64Array, Int16Array, Int32Array, Int64Array, Int8Array,
-        LargeBinaryArray, LargeStringArray, StringArray, StructArray, TimestampMicrosecondArray,
+        ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float32Array,
+        Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, LargeBinaryArray,
+        LargeStringArray, StringArray, StructArray, TimestampMicrosecondArray, new_null_array,
     };
     use crate::arrow::datatypes::{Field, Fields};
     use crate::engine::arrow_conversion::TryFromArrow as _;

@@ -5,21 +5,21 @@ use std::sync::{Arc, Mutex};
 use delta_kernel::arrow::array::{Array, ArrayData, StructArray};
 use delta_kernel::arrow::ffi::to_ffi;
 use delta_kernel::engine::arrow_data::EngineDataArrowExt;
-use delta_kernel::table_changes::scan::TableChangesScan;
 use delta_kernel::table_changes::TableChanges;
-use delta_kernel::{EngineData, KernelError, KernelResult, KernelResultIteratorStatic, Version};
+use delta_kernel::table_changes::scan::TableChangesScan;
+use delta_kernel::{EngineData, KernelError, KernelResult, KernelResultIterator, Version};
 use delta_kernel_ffi_macros::handle_descriptor;
 use tracing::debug;
 use url::Url;
 
 use super::handle::Handle;
 use crate::engine_data::ArrowFFIData;
-use crate::expressions::kernel_visitor::{unwrap_kernel_predicate, KernelExpressionVisitorState};
+use crate::expressions::kernel_visitor::{KernelExpressionVisitorState, unwrap_kernel_predicate};
 use crate::scan::EnginePredicate;
 use crate::{
-    kernel_string_slice, unwrap_and_parse_path_as_url, AllocateStringFn, ExternEngine,
-    ExternResult, IntoExternResult, KernelStringSlice, NullableCvoid, SharedExternEngine,
-    SharedSchema,
+    AllocateStringFn, ExternEngine, ExternResult, IntoExternResult, KernelStringSlice,
+    NullableCvoid, SharedExternEngine, SharedSchema, kernel_string_slice,
+    unwrap_and_parse_path_as_url,
 };
 
 #[handle_descriptor(target=TableChanges, mutable=true, sized=true)]
@@ -35,7 +35,7 @@ pub struct ExclusiveTableChanges;
 /// # Safety
 ///
 /// Caller is responsible for passing valid handles and path pointer.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn table_changes_from_version(
     path: KernelStringSlice,
     engine: Handle<SharedExternEngine>,
@@ -43,7 +43,8 @@ pub unsafe extern "C" fn table_changes_from_version(
 ) -> ExternResult<Handle<ExclusiveTableChanges>> {
     let url = unsafe { unwrap_and_parse_path_as_url(path) };
     let engine = unsafe { engine.as_ref() };
-    table_changes_impl(url, engine, start_version, None).into_extern_result(&engine)
+    let result = table_changes_impl(url, engine, start_version, None);
+    unsafe { result.into_extern_result(&engine) }
 }
 
 /// Get the table changes from the specified table between two versions
@@ -56,7 +57,7 @@ pub unsafe extern "C" fn table_changes_from_version(
 /// # Safety
 ///
 /// Caller is responsible for passing valid handles and path pointer.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn table_changes_between_versions(
     path: KernelStringSlice,
     engine: Handle<SharedExternEngine>,
@@ -65,7 +66,8 @@ pub unsafe extern "C" fn table_changes_between_versions(
 ) -> ExternResult<Handle<ExclusiveTableChanges>> {
     let url = unsafe { unwrap_and_parse_path_as_url(path) };
     let engine = unsafe { engine.as_ref() };
-    table_changes_impl(url, engine, start_version, end_version.into()).into_extern_result(&engine)
+    let result = table_changes_impl(url, engine, start_version, end_version.into());
+    unsafe { result.into_extern_result(&engine) }
 }
 
 fn table_changes_impl(
@@ -87,9 +89,9 @@ fn table_changes_impl(
 ///
 /// # Safety
 /// Caller is responsible for passing a valid table changes handle.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn free_table_changes(table_changes: Handle<ExclusiveTableChanges>) {
-    table_changes.drop_handle();
+    unsafe { table_changes.drop_handle() }
 }
 
 /// Get schema from the specified TableChanges.
@@ -97,7 +99,7 @@ pub unsafe extern "C" fn free_table_changes(table_changes: Handle<ExclusiveTable
 /// # Safety
 ///
 /// Caller is responsible for passing a valid table changes handle.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn table_changes_schema(
     table_changes: Handle<ExclusiveTableChanges>,
 ) -> Handle<SharedSchema> {
@@ -110,7 +112,7 @@ pub unsafe extern "C" fn table_changes_schema(
 /// # Safety
 ///
 /// Caller is responsible for passing a valid table changes handle.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn table_changes_table_root(
     table_changes: Handle<ExclusiveTableChanges>,
     allocate_fn: AllocateStringFn,
@@ -125,7 +127,7 @@ pub unsafe extern "C" fn table_changes_table_root(
 /// # Safety
 ///
 /// Caller is responsible for passing a valid table changes handle.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn table_changes_start_version(
     table_changes: Handle<ExclusiveTableChanges>,
 ) -> u64 {
@@ -138,7 +140,7 @@ pub unsafe extern "C" fn table_changes_start_version(
 /// # Safety
 ///
 /// Caller is responsible for passing a valid table changes handle.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn table_changes_end_version(
     table_changes: Handle<ExclusiveTableChanges>,
 ) -> u64 {
@@ -156,14 +158,15 @@ pub struct SharedTableChangesScan;
 /// # Safety
 ///
 /// Caller is responsible for passing a valid table changes pointer, and engine pointer
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn table_changes_scan(
     table_changes: Handle<ExclusiveTableChanges>,
     engine: Handle<SharedExternEngine>,
     predicate: Option<&mut EnginePredicate>,
 ) -> ExternResult<Handle<SharedTableChangesScan>> {
     let table_changes = unsafe { table_changes.into_inner() };
-    table_changes_scan_impl(*table_changes, predicate).into_extern_result(&engine.as_ref())
+    let result = table_changes_scan_impl(*table_changes, predicate);
+    unsafe { result.into_extern_result(&engine.as_ref()) }
 }
 
 fn table_changes_scan_impl(
@@ -185,11 +188,11 @@ fn table_changes_scan_impl(
 ///
 /// # Safety
 /// Caller is responsible for passing a valid scan handle.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn free_table_changes_scan(
     table_changes_scan: Handle<SharedTableChangesScan>,
 ) {
-    table_changes_scan.drop_handle();
+    unsafe { table_changes_scan.drop_handle() }
 }
 
 /// Get the table root of a table changes scan.
@@ -197,7 +200,7 @@ pub unsafe extern "C" fn free_table_changes_scan(
 /// # Safety
 /// Engine is responsible for providing a valid scan pointer and allocate_fn (for allocating the
 /// string)
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn table_changes_scan_table_root(
     table_changes_scan: Handle<SharedTableChangesScan>,
     allocate_fn: AllocateStringFn,
@@ -212,7 +215,7 @@ pub unsafe extern "C" fn table_changes_scan_table_root(
 /// # Safety
 ///
 /// Caller is responsible for passing a valid snapshot handle.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn table_changes_scan_logical_schema(
     table_changes_scan: Handle<SharedTableChangesScan>,
 ) -> Handle<SharedSchema> {
@@ -225,7 +228,7 @@ pub unsafe extern "C" fn table_changes_scan_logical_schema(
 /// # Safety
 ///
 /// Caller is responsible for passing a valid snapshot handle.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn table_changes_scan_physical_schema(
     table_changes_scan: Handle<SharedTableChangesScan>,
 ) -> Handle<SharedSchema> {
@@ -233,7 +236,7 @@ pub unsafe extern "C" fn table_changes_scan_physical_schema(
     table_changes_scan.physical_schema().clone().into()
 }
 
-type TableChangesData = Mutex<KernelResultIteratorStatic<Box<dyn EngineData>>>;
+type TableChangesData = Mutex<Box<dyn KernelResultIterator<Box<dyn EngineData>>>>;
 
 pub struct ScanTableChangesIterator {
     data: TableChangesData,
@@ -256,15 +259,15 @@ impl Drop for ScanTableChangesIterator {
 /// # Safety
 ///
 /// Engine is responsible for passing a valid [`SharedExternEngine`] and [`SharedTableChangesScan`]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn table_changes_scan_execute(
     table_changes_scan: Handle<SharedTableChangesScan>,
     engine: Handle<SharedExternEngine>,
 ) -> ExternResult<Handle<SharedScanTableChangesIterator>> {
     let table_changes_scan = unsafe { table_changes_scan.as_ref() };
     let engine = unsafe { engine.clone_as_arc() };
-    table_changes_scan_execute_impl(table_changes_scan, engine.clone())
-        .into_extern_result(&engine.as_ref())
+    let result = table_changes_scan_execute_impl(table_changes_scan, engine.clone());
+    unsafe { result.into_extern_result(&engine.as_ref()) }
 }
 
 fn table_changes_scan_execute_impl(
@@ -284,11 +287,11 @@ fn table_changes_scan_execute_impl(
 /// Drops table changes iterator.
 /// Caller is responsible for (at most once) passing a valid pointer returned by a call to
 /// [`table_changes_scan_execute`].
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn free_scan_table_changes_iter(
     data: Handle<SharedScanTableChangesIterator>,
 ) {
-    data.drop_handle();
+    unsafe { data.drop_handle() }
 }
 
 /// Get next batch of data from the table changes iterator.
@@ -301,12 +304,13 @@ pub unsafe extern "C" fn free_scan_table_changes_iter(
 ///
 /// The iterator must be valid (returned by [`table_changes_scan_execute`]) and not yet freed
 /// by [`free_scan_table_changes_iter`].
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn scan_table_changes_next(
     data: Handle<SharedScanTableChangesIterator>,
 ) -> ExternResult<*mut ArrowFFIData> {
     let data = unsafe { data.as_ref() };
-    scan_table_changes_next_impl(data).into_extern_result(&data.engine.as_ref())
+    let result = scan_table_changes_next_impl(data);
+    unsafe { result.into_extern_result(&data.engine.as_ref()) }
 }
 
 fn scan_table_changes_next_impl(
@@ -346,14 +350,14 @@ mod tests {
     use delta_kernel::object_store::memory::InMemory;
     use delta_kernel::object_store::path::Path;
     use delta_kernel::object_store::{DynObjectStore, ObjectStoreExt as _};
-    use delta_kernel::schema::{schema_ref, StructType};
-    use delta_kernel::{Engine, Result};
+    use delta_kernel::schema::{StructType, schema_ref};
+    use delta_kernel::{Engine, KernelResult};
     use delta_kernel_default_engine::DefaultEngineBuilder;
     use delta_kernel_ffi::engine_data::get_engine_data;
     use itertools::Itertools;
     use test_utils::{
-        actions_to_string_with_metadata, add_commit, generate_batch, record_batch_to_bytes,
-        IntoArray as _, TestAction,
+        IntoArray as _, TestAction, actions_to_string_with_metadata, add_commit, generate_batch,
+        record_batch_to_bytes,
     };
 
     use super::*;
@@ -415,7 +419,7 @@ mod tests {
         storage: &DynObjectStore,
         version: u64,
         file: String,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> KernelResult<()> {
         let metadata = storage.head(&Path::from(file.as_ref())).await?;
         add_commit(
             table_root,
@@ -437,7 +441,7 @@ mod tests {
         storage: &DynObjectStore,
         version: u64,
         file: String,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> KernelResult<()> {
         let metadata = storage.head(&Path::from(file.as_ref())).await?;
         add_commit(
             table_root,
@@ -458,14 +462,14 @@ mod tests {
         storage: &DynObjectStore,
         file: String,
         batch: &RecordBatch,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> KernelResult<()> {
         storage
             .put(&Path::from(file), record_batch_to_bytes(batch).into())
             .await?;
         Ok(())
     }
 
-    pub fn generate_batch_with_id(start_i: i32) -> Result<RecordBatch, ArrowError> {
+    pub fn generate_batch_with_id(start_i: i32) -> KernelResult<RecordBatch, ArrowError> {
         generate_batch(vec![
             (
                 "id",
@@ -488,7 +492,10 @@ mod tests {
         fields.iter().all(|f| schema.contains(f))
     }
 
-    fn read_scan(scan: &TableChangesScan, engine: Arc<dyn Engine>) -> Result<Vec<RecordBatch>> {
+    fn read_scan(
+        scan: &TableChangesScan,
+        engine: Arc<dyn Engine>,
+    ) -> KernelResult<Vec<RecordBatch>> {
         let scan_results = scan.execute(engine)?;
         scan_results
             .map(EngineDataArrowExt::try_into_record_batch)
@@ -530,7 +537,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_table_changes_getters() -> Result<(), Box<dyn std::error::Error>> {
+    async fn test_table_changes_getters() -> KernelResult<()> {
         let storage = Arc::new(InMemory::new());
 
         let batch = generate_batch_with_id(1)?;
@@ -618,7 +625,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_table_changes_scan() -> Result<(), Box<dyn std::error::Error>> {
+    async fn test_table_changes_scan() -> KernelResult<()> {
         let storage = Arc::new(InMemory::new());
 
         let batch = generate_batch_with_id(1)?;
@@ -675,7 +682,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_table_changes_scan_iterator() -> Result<(), Box<dyn std::error::Error>> {
+    async fn test_table_changes_scan_iterator() -> KernelResult<()> {
         let storage = Arc::new(InMemory::new());
 
         let batch = generate_batch_with_id(1)?;
@@ -756,7 +763,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_table_changes_between_commits() -> Result<(), Box<dyn std::error::Error>> {
+    async fn test_table_changes_between_commits() -> KernelResult<()> {
         let storage = Arc::new(InMemory::new());
 
         let batch = generate_batch_with_id(1)?;

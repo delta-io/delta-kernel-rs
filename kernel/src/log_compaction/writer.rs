@@ -1,16 +1,17 @@
 // TODO(#2337): remove dead_code allows when log compaction is re-enabled
 #![allow(dead_code, unused_imports)]
 
+use itertools::Itertools;
 use url::Url;
 
 use super::COMPACTION_ACTIONS_SCHEMA;
 use crate::action_reconciliation::log_replay::ActionReconciliationProcessor;
 use crate::action_reconciliation::{ActionReconciliationIterator, RetentionCalculator};
-use crate::log_replay::LogReplayProcessor;
+use crate::log_replay::HasSelectionVector;
 use crate::log_segment::LogSegment;
 use crate::path::ParsedLogPath;
 use crate::table_properties::TableProperties;
-use crate::{Engine, KernelError, KernelResult, Result, SnapshotRef, Version};
+use crate::{Engine, KernelError, KernelResult, SnapshotRef, Version};
 
 /// Determine if log compaction should be performed based on the commit version and
 /// compaction interval.
@@ -95,7 +96,10 @@ impl LogCompactionWriter {
     /// Get an iterator over the compaction data to be written
     ///
     /// Performs action reconciliation for the version range specified in the constructor
-    pub fn compaction_data(&mut self, engine: &dyn Engine) -> Result<ActionReconciliationIterator> {
+    pub fn compaction_data(
+        &mut self,
+        engine: &dyn Engine,
+    ) -> KernelResult<ActionReconciliationIterator> {
         // Validate that the requested version range is within the snapshot's range
         let snapshot_end_version = self.snapshot.version();
         if self.end_version > snapshot_end_version {
@@ -122,14 +126,17 @@ impl LogCompactionWriter {
 
         // Create action reconciliation processor for compaction
         // This reuses the same reconciliation logic as checkpoints
-        let processor = ActionReconciliationProcessor::new(
+        let mut processor = ActionReconciliationProcessor::new(
             min_file_retention_timestamp_millis,
             self.get_transaction_expiration_timestamp()?,
+            self.snapshot.table_configuration().dv_normalization_root(),
         );
 
         // Process actions using the same iterator pattern as checkpoints
         // The processor handles reverse chronological processing internally
-        let result_iter = processor.process_actions_iter(actions_iter);
+        let result_iter = actions_iter
+            .map(move |batch| processor.process_actions_batch(batch?))
+            .filter_ok(HasSelectionVector::has_selected_rows);
 
         // Wrap the iterator to track action counts lazily
         Ok(ActionReconciliationIterator::new(Box::new(result_iter)))

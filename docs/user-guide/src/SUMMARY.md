@@ -35,6 +35,8 @@
 - [Domain Metadata](./writing/domain_metadata.md)
 - [Idempotent Writes](./writing/idempotent_writes.md)
 - [Column Defaults](./writing/column_defaults.md)
+- [Check Constraints](./writing/check_constraints.md)
+- [Checkpoint Protection](./writing/checkpoint_protection.md)
 - [Altering a Table](./writing/alter_table.md)
 
 # Maintenance Operations

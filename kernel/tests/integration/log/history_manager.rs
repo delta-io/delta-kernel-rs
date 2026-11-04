@@ -5,11 +5,11 @@ use std::ops::RangeInclusive;
 use std::time::{Duration, SystemTime};
 
 use delta_kernel::committer::FileSystemCommitter;
-use delta_kernel::history_manager::{get_earliest_commit, latest_version_as_of, HistoryCommitType};
+use delta_kernel::history_manager::{HistoryCommitType, get_earliest_commit, latest_version_as_of};
 use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::{ObjectStore, ObjectStoreExt as _};
 use delta_kernel::transaction::create_table::create_table;
-use delta_kernel::{Result, Snapshot, Version};
+use delta_kernel::{KernelResult, Snapshot, Version};
 use rstest::rstest;
 use test_utils::delta_kernel_default_engine::DefaultEngineBuilder;
 use test_utils::table_builder::{FeatureSet, LogState, TestTableBuilder, VersionTarget};
@@ -38,7 +38,7 @@ async fn test_get_earliest_commit(
     #[case] earliest_ratified_commit_version: Option<Version>,
     #[case] commit_type: HistoryCommitType,
     #[case] expected_version: Version,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> KernelResult<()> {
     let table = TestTableBuilder::new()
         .with_log_state(LogState::with_latest_version(8).with_checkpoint_at([5]))
         .build()?;
@@ -66,22 +66,28 @@ async fn test_get_earliest_commit(
 /// (see `version_at_timestamp_max`). Resolution correctness across layouts is covered by the
 /// `history_manager` unit tests.
 #[test]
-fn test_at_timestamp_resolves_to_intermediate_version() -> Result<()> {
+fn test_at_timestamp_resolves_to_intermediate_version() -> KernelResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
     // v0: CreateTable
     let schema = get_simple_int_schema();
-    let mut snap = create_table(&table_path, schema, "AtTimestampTest/1.0")
+    let mut snap = create_table(&table_path, schema, "AtTimestampTest/1.0", true)
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
         .commit(engine.as_ref())?
         .unwrap_post_commit_snapshot();
 
     // v1..=4: noop commits (each writes a metaData-free, add-free commit JSON).
     for _ in 1..=4 {
-        snap = test_utils::begin_transaction(snap.clone(), engine.as_ref())?
-            .with_engine_info("AtTimestampTest")
-            .commit(engine.as_ref())?
-            .unwrap_post_commit_snapshot();
+        snap = test_utils::begin_transaction_with(
+            snap.clone(),
+            engine.as_ref(),
+            delta_kernel::transaction::UpdateTableOperation::Write,
+            "AtTimestampTest",
+            true,
+            |builder| builder,
+        )?
+        .commit(engine.as_ref())?
+        .unwrap_post_commit_snapshot();
     }
 
     // Set each commit's mtime to a distinct, monotonic value (in ms).
@@ -114,7 +120,7 @@ fn test_at_timestamp_resolves_to_intermediate_version() -> Result<()> {
 /// querying one millisecond earlier resolves to its predecessor. Deterministic without setting
 /// commit timestamps explicitly, since ICT values are derived from the table rather than hardcoded.
 #[test]
-fn test_at_timestamp_targets_specific_commit_via_ict() -> Result<()> {
+fn test_at_timestamp_targets_specific_commit_via_ict() -> KernelResult<()> {
     let table = TestTableBuilder::new()
         .with_features(FeatureSet::new().ict())
         .with_log_state(LogState::with_latest_version(4))

@@ -5,12 +5,12 @@ use clap::Parser;
 use common::{LocationArgs, ParseWithExamples};
 use delta_kernel::arrow::array::RecordBatch;
 use delta_kernel::engine::arrow_data::EngineDataArrowExt;
-use delta_kernel::parquet::arrow::async_writer::AsyncFileWriter;
 use delta_kernel::parquet::arrow::AsyncArrowWriter;
+use delta_kernel::parquet::arrow::async_writer::AsyncFileWriter;
 use delta_kernel::parquet::errors::Result as ParquetResult;
 use delta_kernel::{ActionReconciliationIterator, KernelError, KernelResult, Snapshot};
-use delta_kernel_default_engine::executor::tokio::TokioMultiThreadExecutor;
 use delta_kernel_default_engine::DefaultEngineBuilder;
+use delta_kernel_default_engine::executor::tokio::TokioMultiThreadExecutor;
 use futures::future::{BoxFuture, FutureExt};
 
 /// An example program that checkpoints a table.

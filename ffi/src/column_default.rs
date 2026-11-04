@@ -5,20 +5,21 @@
 //! write flow from C is:
 //!
 //! ```text
-//! transaction(path, engine)
-//! transaction_visit_top_level_column_defaults(txn, engine, ctx, visitor)
+//! new_update_table_txn_builder(snapshot, KernelUpdateTableOperation::Write, engine_info, true, engine)
+//! update_table_txn_builder_build(builder, engine)
+//! update_table_txn_visit_top_level_column_defaults(txn, engine, ctx, visitor)
 //!         // one callback per column with a default; the connector evaluates its raw SQL itself
-//! transaction_ack_column_defaults(txn)
-//! get_unpartitioned_write_context(txn, engine)
+//! update_table_txn_ack_column_defaults(txn)
+//! update_table_txn_get_unpartitioned_write_context(txn, engine)
 //! ```
 
-use delta_kernel::transaction::Transaction;
 use delta_kernel::KernelResult;
+use delta_kernel::transaction::Transaction;
 
 use crate::error::{ExternResult, IntoExternResult};
 use crate::handle::Handle;
-use crate::transaction::ExclusiveTransaction;
-use crate::{kernel_string_slice, KernelStringSlice, NullableCvoid, SharedExternEngine};
+use crate::transaction::ExclusiveUpdateTableTransaction;
+use crate::{KernelStringSlice, NullableCvoid, SharedExternEngine, kernel_string_slice};
 
 /// Acknowledges that the connector materializes this table's column defaults before writing data
 /// files.
@@ -29,17 +30,18 @@ use crate::{kernel_string_slice, KernelStringSlice, NullableCvoid, SharedExternE
 ///
 /// # Safety
 ///
-/// Caller is responsible for passing a valid transaction handle. The handle is borrowed and
-/// mutated in place, NOT consumed: unlike the `with_*` transaction builders, `txn` stays valid
-/// after this call and must still be freed by the caller.
-#[no_mangle]
-pub unsafe extern "C" fn transaction_ack_column_defaults(mut txn: Handle<ExclusiveTransaction>) {
+/// `txn` must be a valid handle. This call mutably borrows it. The caller must eventually commit
+/// or free it.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn update_table_txn_ack_column_defaults(
+    mut txn: Handle<ExclusiveUpdateTableTransaction>,
+) {
     let txn = unsafe { txn.as_mut() };
     txn.ack_column_defaults();
 }
 
 /// Callback invoked once per top-level column default by
-/// [`transaction_visit_top_level_column_defaults`].
+/// [`update_table_txn_visit_top_level_column_defaults`].
 ///
 /// `name` is the column's logical name; `raw_sql` is its `CURRENT_DEFAULT` metadata verbatim. The
 /// kernel does not evaluate the SQL, so what a default means is the engine's evaluator to decide.
@@ -64,17 +66,18 @@ pub type ColumnDefaultVisitor = extern "C" fn(
 ///
 /// Caller is responsible for passing valid transaction and engine handles, a valid
 /// `engine_context` pointer passed through to each `visitor` invocation, and a valid `visitor`
-/// function pointer.
-#[no_mangle]
-pub unsafe extern "C" fn transaction_visit_top_level_column_defaults(
-    txn: Handle<ExclusiveTransaction>,
+/// function pointer. This call borrows `txn` and `engine`. The caller retains ownership.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn update_table_txn_visit_top_level_column_defaults(
+    txn: Handle<ExclusiveUpdateTableTransaction>,
     engine: Handle<SharedExternEngine>,
     engine_context: NullableCvoid,
     visitor: ColumnDefaultVisitor,
 ) -> ExternResult<usize> {
     let engine = unsafe { engine.as_ref() };
     let txn = unsafe { txn.as_ref() };
-    visit_top_level_column_defaults_impl(txn, engine_context, visitor).into_extern_result(&engine)
+    let result = visit_top_level_column_defaults_impl(txn, engine_context, visitor);
+    unsafe { result.into_extern_result(&engine) }
 }
 
 fn visit_top_level_column_defaults_impl(
@@ -100,10 +103,10 @@ mod tests {
     use std::ptr::NonNull;
 
     use super::*;
-    use crate::ffi_test_utils::ok_or_panic;
+    use crate::ffi_test_utils::{build_update_table_txn, ok_or_panic};
     use crate::tests::get_default_engine;
-    use crate::transaction::{free_transaction, transaction};
-    use crate::{free_engine, TryFromStringSlice};
+    use crate::transaction::free_update_table_txn;
+    use crate::{TryFromStringSlice, free_engine};
 
     const FIXTURE: &str = "../kernel/tests/data/table-with-column-defaults/";
 
@@ -137,24 +140,21 @@ mod tests {
     fn visit_defaults_of(table_path: &str) -> (usize, Vec<VisitedDefault>) {
         let table_root = delta_kernel::try_parse_uri(table_path).unwrap().to_string();
         let engine = get_default_engine(&table_root);
-        let txn = unsafe {
-            ok_or_panic(transaction(
-                kernel_string_slice!(table_root),
-                engine.shallow_copy(),
-            ))
-        };
+        let table_root = kernel_string_slice!(table_root);
+        let txn = unsafe { ok_or_panic(build_update_table_txn(table_root, engine.shallow_copy())) };
 
         let mut collected: Vec<VisitedDefault> = Vec::new();
+        let engine_context = NonNull::new((&mut collected as *mut Vec<VisitedDefault>).cast());
         let count = unsafe {
-            ok_or_panic(transaction_visit_top_level_column_defaults(
+            ok_or_panic(update_table_txn_visit_top_level_column_defaults(
                 txn.shallow_copy(),
                 engine.shallow_copy(),
-                NonNull::new((&mut collected as *mut Vec<VisitedDefault>).cast()),
+                engine_context,
                 collect_default,
             ))
         };
 
-        unsafe { free_transaction(txn) };
+        unsafe { free_update_table_txn(txn) };
         unsafe { free_engine(engine) };
         (count, collected)
     }

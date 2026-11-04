@@ -13,20 +13,20 @@ use std::sync::Arc;
 
 use delta_kernel::arrow::array::ffi::from_ffi;
 use delta_kernel::arrow::array::{
-    make_array, Array, ArrayRef, BooleanArray, RecordBatch, StructArray,
+    Array, ArrayRef, BooleanArray, RecordBatch, StructArray, make_array,
 };
 use delta_kernel::arrow::datatypes::{Field, Fields, Schema};
 use delta_kernel::engine::arrow_expression::evaluate_expression::evaluate_expression;
 use delta_kernel::engine::arrow_expression::opaque::{
     ArrowOpaquePredicate as _, ArrowOpaquePredicateOp,
 };
-use delta_kernel::expressions::{null_lit, Expression, ExpressionRef, ScalarExpressionEvaluator};
+use delta_kernel::expressions::{Expression, ExpressionRef, ScalarExpressionEvaluator, null_lit};
 use delta_kernel::kernel_predicates::{
     DirectDataSkippingPredicateEvaluator, DirectPredicateEvaluator,
     IndirectDataSkippingPredicateEvaluator, KernelPredicateEvaluator,
 };
 use delta_kernel::schema::DataType;
-use delta_kernel::{KernelError, KernelResult, Predicate, Result};
+use delta_kernel::{KernelError, KernelResult, Predicate};
 
 use super::opaque_eval::{COpaqueEvalCallbacks, FfiOpaqueEvalCallbacks};
 use crate::engine_data::ArrowFFIData;
@@ -274,23 +274,21 @@ fn call_eval_pred(
     // -- transferring ownership of the written Arrow C Data Interface structs -- or Failure(err).
     let mut result = EngineExecResult::Uninit;
 
+    let name = kernel_string_slice!(op_name);
+    let eval = match mode {
+        EvalMode::RowMode => cb.eval_pred_rows,
+        EvalMode::StatsMode => cb.eval_pred_stats,
+    };
     // SAFETY: callback was supplied by the engine. `args_ffi` is moved into the call (engine owns
     // it now), and `result` is a writable slot valid for the duration of the call.
-    unsafe {
-        let name = kernel_string_slice!(op_name);
-        let eval = match mode {
-            EvalMode::RowMode => cb.eval_pred_rows,
-            EvalMode::StatsMode => cb.eval_pred_stats,
-        };
-        eval(cb.engine_state, name, args_ffi, inverted, &mut result);
-    }
+    unsafe { eval(cb.engine_state, name, args_ffi, inverted, &mut result) };
     let result_ffi = match result {
         EngineExecResult::Success(result_ffi) => result_ffi,
         EngineExecResult::Failure(err) => return Err(err.into()),
         EngineExecResult::Uninit => {
             return Err(KernelError::Generic(format!(
                 "engine opaque-eval callback for `{op_name}` returned without writing a result"
-            )))
+            )));
         }
     };
 
@@ -310,7 +308,7 @@ impl ArrowOpaquePredicateOp for FfiOpaquePredicateOp {
         args: &[Expression],
         batch: &RecordBatch,
         inverted: bool,
-    ) -> Result<BooleanArray> {
+    ) -> KernelResult<BooleanArray> {
         // Materialize the args batch. StatsMode pruning is best-effort: if the rewrite referenced a
         // stats column the batch doesn't carry, abstain (keep every file) rather than abort the
         // scan. RowMode has no safe abstain, so its errors propagate.
@@ -343,7 +341,7 @@ impl ArrowOpaquePredicateOp for FfiOpaquePredicateOp {
         _eval_pred: &DirectPredicateEvaluator<'_>,
         _exprs: &[Expression],
         _inverted: bool,
-    ) -> Result<Option<bool>> {
+    ) -> KernelResult<Option<bool>> {
         // Abstains from scalar evaluation (e.g. partition pruning).
         // TODO: support it by invoking the engine callback with a one-row stats batch.
         Ok(None)
@@ -393,20 +391,20 @@ mod tests {
 
     use std::ffi::c_void;
     use std::ptr;
-    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
-    use delta_kernel::arrow::array::ffi::{from_ffi, FFI_ArrowArray, FFI_ArrowSchema};
+    use delta_kernel::arrow::array::ffi::{FFI_ArrowArray, FFI_ArrowSchema, from_ffi};
     use delta_kernel::arrow::array::{
         ArrayRef, BooleanArray, Int32Array, RecordBatch, StringArray, StructArray,
     };
     use delta_kernel::arrow::datatypes::{DataType as ArrowDataType, Field, Schema};
     use delta_kernel::engine::arrow_expression::evaluate_expression::evaluate_predicate;
-    use delta_kernel::expressions::{col, lit, Expression, Predicate};
+    use delta_kernel::expressions::{Expression, Predicate, col, lit};
 
     use super::*;
-    use crate::expressions::opaque_eval::EngineEvalRowsFn;
     use crate::KernelStringSlice;
+    use crate::expressions::opaque_eval::EngineEvalRowsFn;
 
     // === Engine-side test stubs ===================================================
     //
@@ -847,15 +845,15 @@ mod tests {
         use std::cmp::Ordering;
         use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
+        use delta_kernel::Predicate;
         use delta_kernel::arrow::array::Int64Array;
         use delta_kernel::arrow::datatypes::DataType as ArrowDataType;
         use delta_kernel::expressions::{
-            col, column_name, joined_column_expr, lit, BinaryExpressionOp, BinaryPredicateOp,
-            ColumnName, Expression, JunctionPredicateOp, OpaquePredicateOpRef, Scalar,
+            BinaryExpressionOp, BinaryPredicateOp, ColumnName, Expression, JunctionPredicateOp,
+            OpaquePredicateOpRef, Scalar, col, column_name, joined_column_expr, lit,
         };
         use delta_kernel::kernel_predicates::DataSkippingPredicateEvaluator;
         use delta_kernel::schema::DataType;
-        use delta_kernel::Predicate;
 
         use super::*;
 

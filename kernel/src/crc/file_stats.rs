@@ -18,7 +18,7 @@ use crate::engine_data::{FilteredEngineData, GetData, TypedGetData as _};
 use crate::expressions::column_name;
 use crate::schema::{ColumnName, ColumnNamesAndTypes, DataType};
 use crate::utils::require;
-use crate::{EngineData, KernelError, KernelResult, Result, RowVisitor};
+use crate::{EngineData, KernelError, KernelResult, RowVisitor};
 
 /// File-level statistics for a table version: total file count, size, and histogram.
 ///
@@ -50,7 +50,7 @@ impl FileStats {
         num_files: i64,
         table_size_bytes: i64,
         file_size_histogram: Option<FileSizeHistogram>,
-    ) -> Result<Self> {
+    ) -> KernelResult<Self> {
         for (name, value) in [
             ("numFiles", num_files),
             ("tableSizeBytes", table_size_bytes),
@@ -110,6 +110,7 @@ const INCREMENTAL_SAFE_OPS: &[&str] = &[
     "UPDATE",
     "DELETE",
     "OPTIMIZE",
+    "REORG",
     "CREATE TABLE",
     "REPLACE TABLE",
     "CREATE TABLE AS SELECT",
@@ -120,9 +121,8 @@ const INCREMENTAL_SAFE_OPS: &[&str] = &[
 /// Returns `true` if the given operation can be safely tracked by incremental file stats.
 ///
 /// Incremental-safe operations produce add/remove actions whose net counts give correct file
-/// stats. Unknown or missing operations are treated as unsafe. For example, ANALYZE STATS
-/// re-adds existing files with updated statistics; naively counting those adds would
-/// double-count file stats.
+/// stats. Unknown operations return `false`. For example, ANALYZE STATS re-adds existing files
+/// with updated statistics; naively counting those adds would double-count file stats.
 pub(crate) fn is_incremental_safe_operation(operation: &str) -> bool {
     INCREMENTAL_SAFE_OPS.contains(&operation)
 }
@@ -254,7 +254,7 @@ impl RowVisitor for FileStatsVisitor<'_, '_> {
         NAMES_AND_TYPES.as_ref()
     }
 
-    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> Result<()> {
+    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> KernelResult<()> {
         require!(
             getters.len() == 1,
             KernelError::InternalError(format!(
@@ -286,7 +286,7 @@ impl RowVisitor for FileStatsVisitor<'_, '_> {
 #[cfg(test)]
 mod tests {
     use rstest::rstest;
-    use test_utils::{generate_batch, IntoArray};
+    use test_utils::{IntoArray, generate_batch};
 
     use super::*;
     use crate::engine::arrow_data::ArrowEngineData;
@@ -394,11 +394,13 @@ mod tests {
     #[test]
     fn try_compute_histogram_with_selection_vectors() {
         let adds = vec![size_batch(vec![100, 200])];
-        let removes = vec![FilteredEngineData::try_new(
-            size_batch(vec![300, 400, 500]),
-            vec![true, false, true], // 300 selected, 400 skipped, 500 selected
-        )
-        .unwrap()];
+        let removes = vec![
+            FilteredEngineData::try_new(
+                size_batch(vec![300, 400, 500]),
+                vec![true, false, true], // 300 selected, 400 skipped, 500 selected
+            )
+            .unwrap(),
+        ];
         let stats = FileStatsDelta::try_compute_for_txn(&adds, &removes, None).unwrap();
 
         // Net bin 0: 2 adds - 2 removes = 0 files, 300 - 800 = -500 bytes

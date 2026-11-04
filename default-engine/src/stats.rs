@@ -7,8 +7,8 @@ use std::sync::Arc;
 
 use delta_kernel::actions::{MAX_VALUES, MIN_VALUES, NULL_COUNT, NUM_RECORDS, TIGHT_BOUNDS};
 use delta_kernel::arrow::array::{
-    new_null_array, Array, ArrayRef, AsArray, BooleanArray, Decimal128Array, Int64Array,
-    LargeStringArray, PrimitiveArray, RecordBatch, StringArray, StringViewArray, StructArray,
+    Array, ArrayRef, AsArray, BooleanArray, Decimal128Array, Int64Array, LargeStringArray,
+    PrimitiveArray, RecordBatch, StringArray, StringViewArray, StructArray, new_null_array,
 };
 use delta_kernel::arrow::compute::concat;
 use delta_kernel::arrow::compute::kernels::aggregate::{
@@ -16,15 +16,15 @@ use delta_kernel::arrow::compute::kernels::aggregate::{
 };
 use delta_kernel::arrow::datatypes::{
     ArrowPrimitiveType, DataType, Date32Type, Date64Type, Decimal128Type, Field, Float32Type,
-    Float64Type, Int16Type, Int32Type, Int64Type, Int8Type, SchemaRef as ArrowSchemaRef, TimeUnit,
+    Float64Type, Int8Type, Int16Type, Int32Type, Int64Type, SchemaRef as ArrowSchemaRef, TimeUnit,
     TimestampMicrosecondType, TimestampMillisecondType, TimestampNanosecondType,
-    TimestampSecondType, UInt16Type, UInt32Type, UInt64Type, UInt8Type,
+    TimestampSecondType, UInt8Type, UInt16Type, UInt32Type, UInt64Type,
 };
 use delta_kernel::column_trie::ColumnTrie;
 use delta_kernel::engine::arrow_utils::fix_nested_null_masks;
 use delta_kernel::expressions::ColumnName;
 use delta_kernel::schema::{DataType as KernelDataType, StructType};
-use delta_kernel::{KernelError, KernelResult, Result};
+use delta_kernel::{KernelError, KernelResult};
 
 /// Maximum prefix length for string statistics (Delta protocol requirement).
 const STRING_PREFIX_LENGTH: usize = 32;
@@ -50,25 +50,11 @@ const UTF8_MAX_CHAR: char = '\u{10FFFF}';
 ///
 /// Returns the original string if it's already within the limit.
 fn truncate_min_string(s: &str) -> &str {
-    if s.len() <= STRING_PREFIX_LENGTH {
-        return s;
-    }
-    // Find char boundary at or before STRING_PREFIX_LENGTH
     let end = s
         .char_indices()
-        .take(STRING_PREFIX_LENGTH + 1)
-        .last()
-        .map(|(i, _)| i)
-        .unwrap_or(s.len());
-
-    // Take exactly STRING_PREFIX_LENGTH chars
-    let truncated_end = s
-        .char_indices()
         .nth(STRING_PREFIX_LENGTH)
-        .map(|(i, _)| i)
-        .unwrap_or(end);
-
-    &s[..truncated_end]
+        .map_or(s.len(), |(i, _)| i);
+    &s[..end]
 }
 
 /// Truncate a string for max statistics.
@@ -517,7 +503,7 @@ pub fn collect_stats(
     batch: &RecordBatch,
     stats_columns: &[ColumnName],
     physical_schema: &StructType,
-) -> Result<StructArray> {
+) -> KernelResult<StructArray> {
     let null_count_only_columns = interval_column_names(physical_schema, stats_columns);
     reduce_stats(&collect_stats_raw(
         batch,
@@ -625,7 +611,7 @@ fn collect_stats_raw(
 /// # use delta_kernel::expressions::column_name;
 /// # use delta_kernel::schema::{DataType as KernelDataType, StructField, StructType};
 /// # use delta_kernel_default_engine::stats::FileStatsAccumulator;
-/// # fn main() -> delta_kernel::Result<()> {
+/// # fn main() -> delta_kernel::KernelResult<()> {
 /// let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
 /// let row_group = |ids: Vec<i64>| {
 ///     RecordBatch::try_new(schema.clone(), vec![Arc::new(Int64Array::from(ids))])
@@ -688,7 +674,7 @@ impl FileStatsAccumulator {
     /// Returns an error if the accumulator already failed a merge, or if this one fails: `batch`
     /// has a different Arrow schema than the first batch merged, it produces a different statistics
     /// shape, or statistics collection fails.
-    pub fn merge(&mut self, batch: &RecordBatch) -> Result<()> {
+    pub fn merge(&mut self, batch: &RecordBatch) -> KernelResult<()> {
         // Catch every error path in one place, so no failure can leave publishable state behind.
         self.try_merge(batch)
             .inspect_err(|_| self.state = AccumulatorState::Failed)
@@ -713,15 +699,15 @@ impl FileStatsAccumulator {
             collect_stats_raw(batch, &self.stats_columns, &self.null_count_only_columns)?;
         // Schema equality can ignore a struct column's nested field names, which statistics
         // collection filters on, so equal schemas can still derive different stats shapes.
-        if let Some(first) = row_groups.first() {
-            if first.data_type() != batch_stats.data_type() {
-                return Err(KernelError::schema(format!(
-                    "all row groups must produce the same statistics shape; batch schemas compare \
+        if let Some(first) = row_groups.first()
+            && first.data_type() != batch_stats.data_type()
+        {
+            return Err(KernelError::schema(format!(
+                "all row groups must produce the same statistics shape; batch schemas compare \
                      equal but their nested field names differ: {} vs {}",
-                    first.data_type(),
-                    batch_stats.data_type(),
-                )));
-            }
+                first.data_type(),
+                batch_stats.data_type(),
+            )));
         }
         row_groups.push(batch_stats);
         Ok(())
@@ -738,7 +724,7 @@ impl FileStatsAccumulator {
     ///
     /// Returns `Err` if a merge failed, or if the accumulated statistics cannot be reduced into a
     /// single row.
-    pub fn finish(self) -> Result<Option<StructArray>> {
+    pub fn finish(self) -> KernelResult<Option<StructArray>> {
         let AccumulatorState::Open(row_groups) = self.state else {
             return Err(KernelError::stats_validation(FAILED));
         };
@@ -775,7 +761,7 @@ fn reduce_stats(stats: &StructArray) -> KernelResult<StructArray> {
             other => {
                 return Err(KernelError::internal_error(format!(
                     "cannot reduce unknown stats section: {other}"
-                )))
+                )));
             }
         });
     }
@@ -919,7 +905,10 @@ mod tests {
 
     use super::*;
 
-    fn collect_stats(batch: &RecordBatch, stats_columns: &[ColumnName]) -> Result<StructArray> {
+    fn collect_stats(
+        batch: &RecordBatch,
+        stats_columns: &[ColumnName],
+    ) -> KernelResult<StructArray> {
         super::collect_stats_for_test(batch, stats_columns)
     }
 
@@ -1424,6 +1413,12 @@ mod tests {
         // Multi-byte characters
         let multi = format!("{}À", "a".repeat(35)); // 'À' is 2 bytes in UTF-8
         assert_eq!(truncate_min_string(&multi).chars().count(), 32);
+
+        // Exactly 32 characters but more than 32 bytes: keep the whole string
+        let s32_multibyte = format!("{}é", "a".repeat(31));
+        assert_eq!(s32_multibyte.chars().count(), 32);
+        assert!(s32_multibyte.len() > STRING_PREFIX_LENGTH);
+        assert_eq!(truncate_min_string(&s32_multibyte), s32_multibyte);
     }
 
     #[test]
@@ -2018,11 +2013,13 @@ mod tests {
         let leaf = |section| string_leaf(child_struct(&merged, section), "s");
         assert_eq!(leaf(MIN_VALUES), Some("apple"));
         assert_eq!(leaf(MAX_VALUES), Some("date"));
-        assert!(merged
-            .column_by_name(TIGHT_BOUNDS)
-            .unwrap()
-            .as_boolean()
-            .value(0));
+        assert!(
+            merged
+                .column_by_name(TIGHT_BOUNDS)
+                .unwrap()
+                .as_boolean()
+                .value(0)
+        );
     }
 
     #[test]
@@ -2483,11 +2480,13 @@ mod tests {
         assert_eq!(bound(MIN_VALUES), expected_bounds.map(|(min, _)| min));
         assert_eq!(bound(MAX_VALUES), expected_bounds.map(|(_, max)| max));
         assert_eq!(flat_stat::<Int64Type>(&stats, NULL_COUNT, "n"), 0);
-        assert!(stats
-            .column_by_name(TIGHT_BOUNDS)
-            .unwrap()
-            .as_boolean()
-            .value(0));
+        assert!(
+            stats
+                .column_by_name(TIGHT_BOUNDS)
+                .unwrap()
+                .as_boolean()
+                .value(0)
+        );
     }
 
     // Every Arrow string type takes its own arm in `compute_leaf_agg`.
@@ -2531,7 +2530,7 @@ mod tests {
 
     // A malformed stats tree is a kernel bug, not bad caller input, so the guards report
     // `InternalError`.
-    fn assert_internal_error(result: Result<impl std::fmt::Debug>, needle: &str) {
+    fn assert_internal_error(result: KernelResult<impl std::fmt::Debug>, needle: &str) {
         let err = result.expect_err("must be rejected");
         // `KernelError::internal_error` captures a backtrace, which wraps the variant in
         // `Backtraced`.
@@ -2738,7 +2737,7 @@ mod tests {
             acc: FileStatsAccumulator,
         }
         impl Writer {
-            fn write_row_group(&mut self, batch: &RecordBatch) -> Result<()> {
+            fn write_row_group(&mut self, batch: &RecordBatch) -> KernelResult<()> {
                 self.acc.merge(batch)
             }
         }

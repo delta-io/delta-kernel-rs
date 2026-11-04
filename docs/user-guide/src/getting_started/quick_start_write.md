@@ -41,11 +41,11 @@ use delta_kernel_default_engine::storage::store_from_url;
 use delta_kernel_default_engine::DefaultEngine;
 use delta_kernel::schema::{DataType, StructField, StructType};
 use delta_kernel::transaction::create_table::create_table;
-use delta_kernel::transaction::CommitResult;
-use delta_kernel::{Result, Snapshot};
+use delta_kernel::transaction::{CommitResult, UpdateTableOperation};
+use delta_kernel::{KernelResult, Snapshot};
 
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() -> KernelResult<()> {
     let table_path = std::env::args()
         .nth(1)
         .expect("usage: delta_write_example <TABLE_DIR>");
@@ -60,7 +60,7 @@ async fn main() -> Result<()> {
         StructField::nullable("name", DataType::STRING),
     ])?);
 
-    create_table(url.as_str(), schema.clone(), "quick-start/1.0")
+    create_table(url.as_str(), schema.clone(), "quick-start/1.0", /* data_change */ true)
         .build(&engine, Box::new(FileSystemCommitter::new()))?
         .commit(&engine)?;
     println!("Created table at {url}");
@@ -69,10 +69,12 @@ async fn main() -> Result<()> {
     let snapshot = Snapshot::builder_for(url.clone()).build(&engine)?;
 
     let mut txn = snapshot
-        .transaction(Box::new(FileSystemCommitter::new()), &engine)?
-        .with_operation("INSERT".to_string())
-        .with_engine_info("quick-start/1.0")
-        .with_data_change(true);
+        .update_table(
+            UpdateTableOperation::Custom("INSERT".to_string()),
+            "quick-start/1.0",
+            /* data_change */ true,
+        )
+        .build(&engine, Box::new(FileSystemCommitter::new()))?;
 
     // Build an Arrow RecordBatch
     let arrow_schema: delta_kernel::arrow::datatypes::Schema =
@@ -112,10 +114,10 @@ async fn main() -> Result<()> {
     let scan = snapshot.scan_builder().build()?;
     let batches: Vec<RecordBatch> = scan
         .execute(Arc::new(engine))?
-        .map(|data| -> Result<RecordBatch> {
+        .map(|data| -> KernelResult<RecordBatch> {
             Ok(data?.try_into_record_batch()?)
         })
-        .collect::<Result<Vec<_>>>()?;
+        .collect::<KernelResult<Vec<_>>>()?;
     print_batches(&batches)?;
 
     Ok(())
@@ -132,7 +134,7 @@ let schema = Arc::new(StructType::try_new(vec![
     StructField::nullable("name", DataType::STRING),
 ])?);
 
-create_table(url.as_str(), schema.clone(), "quick-start/1.0")
+create_table(url.as_str(), schema.clone(), "quick-start/1.0", /* data_change */ true)
     .build(&engine, Box::new(FileSystemCommitter::new()))?
     .commit(&engine)?;
 ```
@@ -155,9 +157,12 @@ The write flow has four parts:
 **Start a transaction:**
 ```rust,ignore
 let mut txn = snapshot
-    .transaction(Box::new(FileSystemCommitter::new()), &engine)?
-    .with_operation("INSERT".to_string())
-    .with_data_change(true);
+    .update_table(
+        UpdateTableOperation::Custom("INSERT".to_string()),
+        "quick-start/1.0",
+        /* data_change */ true,
+    )
+    .build(&engine, Box::new(FileSystemCommitter::new()))?;
 ```
 
 **Build your data as an Arrow RecordBatch and wrap it:**

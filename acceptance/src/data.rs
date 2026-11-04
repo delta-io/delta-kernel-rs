@@ -6,39 +6,39 @@ use delta_kernel::arrow::compute::concat_batches;
 use delta_kernel::arrow::datatypes::{DataType, Field, Fields, Schema, SchemaRef};
 use delta_kernel::arrow::util::pretty::pretty_format_batches;
 use delta_kernel::engine::arrow_data::EngineDataArrowExt as _;
-use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::object_store::ObjectStore;
+use delta_kernel::object_store::local::LocalFileSystem;
 #[allow(deprecated)]
 use delta_kernel::parquet::arrow::async_reader::{
     ParquetObjectReader, ParquetRecordBatchStreamBuilder,
 };
 use delta_kernel::snapshot::Snapshot;
-use delta_kernel::{Engine, KernelError, KernelResult, Result};
-use futures::stream::TryStreamExt;
+use delta_kernel::{Engine, KernelError, KernelResult};
 use futures::StreamExt;
+use futures::stream::TryStreamExt;
 use itertools::Itertools;
 
 use crate::{TestCaseInfo, TestResult};
 
 #[allow(deprecated)]
-pub async fn read_golden(path: &Path, _version: Option<&str>) -> Result<RecordBatch> {
+pub async fn read_golden(path: &Path, _version: Option<&str>) -> KernelResult<RecordBatch> {
     let expected_root = path.join("expected").join("latest").join("table_content");
     let store = Arc::new(LocalFileSystem::new_with_prefix(&expected_root)?);
     let files: Vec<_> = store.list(None).try_collect().await?;
     let mut batches = vec![];
     let mut schema = None;
     for meta in files.into_iter() {
-        if let Some(ext) = meta.location.extension() {
-            if ext == "parquet" {
-                let reader = ParquetObjectReader::new(store.clone(), meta.location);
-                let builder = ParquetRecordBatchStreamBuilder::new(reader).await?;
-                if schema.is_none() {
-                    schema = Some(builder.schema().clone());
-                }
-                let mut stream = builder.build()?;
-                while let Some(batch) = stream.next().await {
-                    batches.push(batch?);
-                }
+        if let Some(ext) = meta.location.extension()
+            && ext == "parquet"
+        {
+            let reader = ParquetObjectReader::new(store.clone(), meta.location);
+            let builder = ParquetRecordBatchStreamBuilder::new(reader).await?;
+            if schema.is_none() {
+                schema = Some(builder.schema().clone());
+            }
+            let mut stream = builder.build()?;
+            while let Some(batch) = stream.next().await {
+                batches.push(batch?);
             }
         }
     }
@@ -88,7 +88,7 @@ pub fn assert_data_matches(
     result: Vec<RecordBatch>,
     result_schema: &SchemaRef,
     expected: RecordBatch,
-) -> Result<()> {
+) -> KernelResult<()> {
     let all_data = concat_batches(result_schema, result.iter())?;
 
     // Validate schemas match
@@ -137,7 +137,7 @@ pub async fn assert_scan_metadata(
     let mut schema = None;
     let batches: Vec<RecordBatch> = scan
         .execute(engine)?
-        .map(|data| -> Result<_> {
+        .map(|data| -> KernelResult<_> {
             let record_batch = data?.try_into_record_batch()?;
             if schema.is_none() {
                 schema = Some(record_batch.schema());

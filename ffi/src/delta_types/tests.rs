@@ -1,9 +1,44 @@
 use std::collections::HashMap;
 
+use rstest::rstest;
 use test_utils::assert_result_error_with_message;
 
 use super::*;
-use crate::{FfiFileStats, KernelI64Slice, KernelStringSlice, OptionalValue};
+use crate::{FfiFileStats, KernelI64Slice, KernelStringSlice, OptionalValue, optional_pointer};
+
+#[rstest]
+#[case(HashMap::new())]
+#[case(HashMap::from([
+    (String::from("key"), String::from("value")),
+    (String::from("empty"), String::new()),
+]))]
+fn borrowed_string_map_entries_round_trip_without_copying_payloads(
+    #[case] source: HashMap<String, String>,
+) {
+    // Both the source map and entry vector outlive every use of the borrowed FFI map.
+    let entries = unsafe { FfiStringMapEntry::from_map_unsafe(&source) };
+    let map = unsafe { FfiStringMap::new_unsafe(&entries) };
+    assert_eq!(unsafe { map.try_to_hash_map() }.unwrap(), source);
+    for entry in entries {
+        let key = unsafe { entry.key.try_to_string() }.unwrap();
+        let (source_key, source_value) = source.get_key_value(&key).unwrap();
+        assert_eq!(entry.key.ptr.cast::<u8>(), source_key.as_ptr());
+        assert_eq!(entry.value.ptr.cast::<u8>(), source_value.as_ptr());
+    }
+}
+
+#[rstest]
+fn optional_pointer_preserves_absence_and_borrows_present_value(
+    #[values(false, true)] present: bool,
+) {
+    let source = 42;
+    let pointer = optional_pointer(present.then_some(&source));
+    assert_eq!(pointer.is_null(), !present);
+    if present {
+        assert_eq!(pointer, std::ptr::from_ref(&source));
+        assert_eq!(unsafe { *pointer }, source);
+    }
+}
 
 fn slice(value: &'static str) -> KernelStringSlice {
     unsafe { KernelStringSlice::new_unsafe(value) }
@@ -317,6 +352,13 @@ fn typed_components_construct_rich_snapshot_state() {
     FfiDeletionVectorStorageType::PersistedAbsolute,
     DeletionVectorStorageType::PersistedAbsolute
 )]
+#[cfg_attr(
+    feature = "adaptive-metadata-in-dev",
+    case::persisted_unencoded_relative(
+        FfiDeletionVectorStorageType::PersistedUnencodedRelative,
+        DeletionVectorStorageType::PersistedUnencodedRelative
+    )
+)]
 fn deletion_vector_storage_type_maps_all_variants(
     #[case] ffi_type: FfiDeletionVectorStorageType,
     #[case] kernel_type: DeletionVectorStorageType,
@@ -441,10 +483,12 @@ fn typed_crc_accepts_full_kernel_state() {
         },
         ..empty_crc()
     };
-    assert!(unsafe { indeterminate.try_to_kernel() }
-        .unwrap()
-        .file_stats()
-        .is_none());
+    assert!(
+        unsafe { indeterminate.try_to_kernel() }
+            .unwrap()
+            .file_stats()
+            .is_none()
+    );
 }
 
 #[test]
@@ -570,14 +614,18 @@ fn typed_arrays_preserve_absent_and_present_empty() {
         ..empty_crc()
     };
     let parsed_crc = unsafe { crc_value.try_to_kernel() }.unwrap();
-    assert!(parsed_crc
-        .set_transaction_state
-        .expect_complete()
-        .is_empty());
-    assert!(parsed_crc
-        .domain_metadata_state
-        .expect_complete()
-        .is_empty());
+    assert!(
+        parsed_crc
+            .set_transaction_state
+            .expect_complete()
+            .is_empty()
+    );
+    assert!(
+        parsed_crc
+            .domain_metadata_state
+            .expect_complete()
+            .is_empty()
+    );
 }
 
 #[test]

@@ -7,6 +7,8 @@
 #![allow(dead_code)]
 
 use std::collections::HashMap;
+use std::fs::File;
+use std::io::Write;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -25,23 +27,48 @@ use delta_kernel::object_store::{DynObjectStore, ObjectStore, ObjectStoreExt};
 use delta_kernel::parquet::file::reader::{FileReader, SerializedFileReader};
 use delta_kernel::parquet::schema::types::Type as ParquetType;
 use delta_kernel::path::ParsedLogPath;
-use delta_kernel::schema::{schema_ref, SchemaRef, StructType};
+use delta_kernel::schema::{SchemaRef, StructType, schema_ref};
 use delta_kernel::table_features::ColumnMappingMode;
-use delta_kernel::transaction::{BoundWriteContext, CommitResult, Transaction};
-use delta_kernel::{Engine, Result, Snapshot, Version};
+use delta_kernel::transaction::{
+    BoundWriteContext, CommitResult, Transaction, UpdateTableOperation,
+};
+use delta_kernel::{Engine, KernelResult, Snapshot, Version};
 use serde_json::json;
-use test_utils::delta_kernel_default_engine::executor::tokio::TokioBackgroundExecutor;
 use test_utils::delta_kernel_default_engine::DefaultEngine;
+use test_utils::delta_kernel_default_engine::executor::tokio::TokioBackgroundExecutor;
 use test_utils::{
-    begin_transaction, create_add_files_metadata, create_table, engine_store_setup,
-    into_record_batch, load_and_begin_transaction, modify_add_file_partition_keys,
-    AddFilePartitionKeyModify,
+    AddFilePartitionKeyModify, create_add_files_metadata, create_table, engine_store_setup,
+    into_record_batch, modify_add_file_partition_keys,
 };
 use url::Url;
 use uuid::Uuid;
 
 /// Deterministic placeholder for test commit JSON comparisons.
 pub const ZERO_UUID: &str = "00000000-0000-0000-0000-000000000000";
+
+/// Simulates an external writer by rewriting a complete local commit with `edit`.
+///
+/// Keeps action wrappers and unedited actions. Reload the snapshot after calling this helper.
+/// Returns I/O or JSON errors, including errors returned by `edit`.
+pub fn rewrite_commit(
+    table_path: &str,
+    version: Version,
+    mut edit: impl FnMut(&mut serde_json::Value) -> Result<(), Box<dyn std::error::Error>>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let path = std::path::Path::new(table_path).join(format!("_delta_log/{version:020}.json"));
+    let mut actions = serde_json::Deserializer::from_reader(File::open(&path)?)
+        .into_iter::<serde_json::Value>()
+        .collect::<Result<Vec<_>, _>>()?;
+    for action in &mut actions {
+        edit(action)?;
+    }
+    let mut file = File::create(path)?;
+    for action in actions {
+        serde_json::to_writer(&mut file, &action)?;
+        file.write_all(b"\n")?;
+    }
+    Ok(())
+}
 
 /// Single-column nullable `id: int` schema.
 pub fn get_simple_schema() -> SchemaRef {
@@ -69,7 +96,7 @@ pub fn load_existing_single_file_checkpoint_path(
     for entry in std::fs::read_dir(&log_dir).expect("failed to read _delta_log") {
         let entry = entry.unwrap();
         let url = Url::from_file_path(entry.path()).expect("entry path to url");
-        let Some(parsed) = ParsedLogPath::try_from(url).expect("parse log path") else {
+        let Some(parsed) = ParsedLogPath::new(url) else {
             continue;
         };
         if parsed.is_checkpoint() && parsed.version == version {
@@ -166,7 +193,7 @@ pub fn validate_timestamp(commit_info: &serde_json::Value) {
 /// Check that the timestamps in commit_info and add actions are within 10s of SystemTime::now().
 pub fn check_action_timestamps<'a>(
     parsed_commits: impl Iterator<Item = &'a serde_json::Value>,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> KernelResult<(), Box<dyn std::error::Error>> {
     let now: i64 = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)?
         .as_millis()
@@ -199,9 +226,11 @@ pub async fn get_and_check_all_parquet_sizes(store: Arc<DynObjectStore>, path: &
         .collect::<Vec<_>>();
     assert_eq!(parquet_files.len(), 2);
     let size = parquet_files.first().unwrap().as_ref().unwrap().size;
-    assert!(parquet_files
-        .iter()
-        .all(|f| f.as_ref().unwrap().size == size));
+    assert!(
+        parquet_files
+            .iter()
+            .all(|f| f.as_ref().unwrap().size == size)
+    );
     size
 }
 
@@ -211,12 +240,18 @@ pub async fn write_data_and_check_result_and_stats(
     schema: SchemaRef,
     engine: Arc<DefaultEngine<TokioBackgroundExecutor>>,
     expected_since_commit: u64,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let mut txn = test_utils::load_and_begin_transaction(table_url.clone(), engine.as_ref())?
-        .with_data_change(true);
+) -> KernelResult<()> {
+    let mut txn = test_utils::load_and_begin_transaction_with(
+        table_url.clone(),
+        engine.as_ref(),
+        UpdateTableOperation::Write,
+        "test-engine",
+        true,
+        |builder| builder,
+    )?;
 
     // create two new arrow record batches to append
-    let append_data = [[1, 2, 3], [4, 5, 6]].map(|data| -> Result<_> {
+    let append_data = [[1, 2, 3], [4, 5, 6]].map(|data| -> KernelResult<_> {
         let data = RecordBatch::try_new(
             Arc::new(schema.as_ref().try_into_arrow()?),
             vec![Arc::new(Int32Array::from(data.to_vec()))],
@@ -275,7 +310,7 @@ pub fn set_table_properties(
     engine: &dyn Engine,
     current_version: Version,
     properties: &[(&str, &str)],
-) -> Result<Arc<Snapshot>, Box<dyn std::error::Error>> {
+) -> KernelResult<Arc<Snapshot>> {
     let v0_path = std::path::Path::new(table_path).join("_delta_log/00000000000000000000.json");
     let mut meta: serde_json::Value = std::fs::read_to_string(&v0_path)?
         .lines()
@@ -293,7 +328,7 @@ pub fn set_table_properties(
     let new_commit = std::path::Path::new(table_path)
         .join(format!("_delta_log/{:020}.json", current_version + 1));
     std::fs::write(&new_commit, serde_json::to_string(&meta)?)?;
-    Ok(Snapshot::builder_for(table_url.clone()).build(engine)?)
+    Snapshot::builder_for(table_url.clone()).build(engine)
 }
 
 /// Assert that the snapshot's column mapping mode matches the given `cm_mode` string,
@@ -370,15 +405,12 @@ pub async fn create_dv_table_with_files(
     schema: Arc<StructType>,
     partition_values: &[(&str, Option<&str>)],
     file_paths: &[&str],
-) -> Result<
-    (
-        Arc<DynObjectStore>,
-        Arc<dyn delta_kernel::Engine>,
-        Url,
-        Vec<String>,
-    ),
-    Box<dyn std::error::Error>,
-> {
+) -> KernelResult<(
+    Arc<DynObjectStore>,
+    Arc<dyn delta_kernel::Engine>,
+    Url,
+    Vec<String>,
+)> {
     let (store, engine, table_url) = engine_store_setup(table_name, None);
     let engine = Arc::new(engine);
     let partition_columns: Vec<_> = partition_values.iter().map(|(key, _)| *key).collect();
@@ -397,10 +429,12 @@ pub async fn create_dv_table_with_files(
 
     // Write files
     let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
-    let mut txn = begin_transaction(snapshot.clone(), engine.as_ref())?
-        .with_engine_info("test engine")
-        .with_operation("WRITE".to_string())
-        .with_data_change(true);
+    let mut txn = snapshot
+        .update_table(UpdateTableOperation::Write, "test engine", true)
+        .build(
+            engine.as_ref(),
+            Box::new(delta_kernel::committer::FileSystemCommitter::new()),
+        )?;
 
     let add_files_schema = txn.add_files_schema();
 
@@ -464,9 +498,11 @@ pub fn sequential_dv_descriptors(
 pub fn get_scan_files(
     snapshot: Arc<Snapshot>,
     engine: &dyn delta_kernel::Engine,
-) -> Result<Vec<FilteredEngineData>> {
+) -> KernelResult<Vec<FilteredEngineData>> {
     let scan = snapshot.scan_builder().build()?;
-    let all_scan_metadata: Vec<_> = scan.scan_metadata(engine)?.collect::<Result<Vec<_>, _>>()?;
+    let all_scan_metadata: Vec<_> = scan
+        .scan_metadata(engine)?
+        .collect::<KernelResult<Vec<_>>>()?;
 
     Ok(all_scan_metadata
         .into_iter()
@@ -480,7 +516,7 @@ pub async fn write_deletion_vector_to_store(
     write_context: &BoundWriteContext,
     dv: KernelDeletionVector,
     prefix: &str,
-) -> Result<DeletionVectorDescriptor, Box<dyn std::error::Error>> {
+) -> KernelResult<DeletionVectorDescriptor> {
     let dv_path = write_context.new_deletion_vector_path(String::from(prefix));
     let dv_object_path = Path::parse(dv_path.absolute_path()?.path())?;
 
@@ -498,8 +534,12 @@ pub async fn write_deletion_vector_to_store(
 pub fn create_dv_update_transaction(
     table_url: &Url,
     engine: &dyn Engine,
-) -> Result<Transaction, Box<dyn std::error::Error>> {
-    Ok(load_and_begin_transaction(table_url.clone(), engine)?
-        .with_engine_info("test engine")
-        .with_operation("DELETE".to_string()))
+) -> KernelResult<Transaction> {
+    Snapshot::builder_for(table_url.clone())
+        .build(engine)?
+        .update_table(UpdateTableOperation::Delete, "test engine", true)
+        .build(
+            engine,
+            Box::new(delta_kernel::committer::FileSystemCommitter::new()),
+        )
 }

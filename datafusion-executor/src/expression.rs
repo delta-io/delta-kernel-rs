@@ -2,15 +2,17 @@
 
 use std::sync::Arc;
 
-use datafusion::arrow::array::{new_null_array, ArrayRef, RecordBatch, StructArray};
+use datafusion::arrow::array::{ArrayRef, RecordBatch, StructArray, new_null_array};
 use datafusion::arrow::datatypes::{DataType as ArrowDataType, Schema as ArrowSchema};
 use datafusion::common::utils::take_function_args;
-use datafusion::common::{Column as DFColumn, DataFusionError, ScalarValue as DFScalarValue};
+use datafusion::common::{
+    Column as DFColumn, DataFusionError, Result as DFResult, ScalarValue as DFScalarValue,
+};
 use datafusion::functions::core::expr_fn::{coalesce, get_field, named_struct, nullif};
 use datafusion::functions_nested::expr_fn::make_array;
 use datafusion::logical_expr::{
-    binary_expr, cast, lit, Case, ColumnarValue, Expr as DFExpr, Operator, ScalarFunctionArgs,
-    ScalarUDF, ScalarUDFImpl, Signature, Volatility,
+    Case, ColumnarValue, Expr as DFExpr, Operator, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl,
+    Signature, Volatility, binary_expr, cast, lit,
 };
 use delta_kernel::engine::arrow_conversion::TryIntoArrow;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
@@ -25,7 +27,7 @@ use delta_kernel::schema::{
     DataType as KernelDataType, PrimitiveType, SchemaRef as KernelSchemaRef, StructField,
     StructType,
 };
-use delta_kernel::{EngineData, KernelError, KernelResult, Result};
+use delta_kernel::{EngineData, KernelError, KernelResult};
 
 use crate::predicate::to_df_predicate_expr;
 use crate::scalar::to_df_scalar;
@@ -37,8 +39,9 @@ use crate::utils::column_to_df_expr;
 /// `output_type` supplies result type information that the expression itself does not carry.
 /// `Struct` and `StructPatch` require a struct type for output field names and computed child
 /// types. `Array` validates that a supplied type is an array and forwards its element type, while
-/// `Coalesce` forwards the result type unchanged to every branch. Callers pass `None` when the
-/// result type is unknown or the expression does not need it.
+/// `Coalesce` forwards `output_type` to its arguments for construction type information, leaving
+/// common-type resolution to DataFusion. Callers pass `None` when the result type is unknown or
+/// the expression does not need it.
 ///
 /// # Errors
 /// Returns an error when a column cannot be resolved, a scalar cannot be converted, supplied type
@@ -49,7 +52,7 @@ pub fn to_df_expr(
     expr: &KernelExpression,
     input_schema: &StructType,
     output_type: Option<&KernelDataType>,
-) -> Result<DFExpr> {
+) -> KernelResult<DFExpr> {
     match expr {
         KernelExpression::Literal(scalar) => Ok(lit(to_df_scalar(scalar)?)),
         KernelExpression::Column(name) => column_to_df_expr(name, input_schema),
@@ -133,10 +136,10 @@ fn binary_expr_to_df_expr(
 }
 
 /// Lowers a variadic expression: `Coalesce` to `coalesce(..)` and `Array` to `make_array(..)`, each
-/// over the converted arguments. Coalesce is type-preserving, so it forwards `output_type` to each
-/// argument (every branch produces the same type). Array is type-wrapping: a known `Array<E>`
-/// target is peeled to `E` and threaded to each element (so an array of structs still gets its
-/// element schema); an unknown target leaves elements untyped.
+/// over the converted arguments. `Coalesce` forwards `output_type` to construct schema-dependent
+/// arguments before DataFusion performs common-type resolution and supported implicit conversions.
+/// A known `Array<E>` target is peeled to `E` and forwarded to each element so an array of structs
+/// gets its element schema; an unknown target leaves elements untyped.
 fn variadic_to_df_expr(
     variadic: &VariadicExpression,
     input_schema: &StructType,
@@ -149,7 +152,7 @@ fn variadic_to_df_expr(
             Some(other) => {
                 return Err(KernelError::unsupported(format!(
                     "converting an Array expression requires an array output type, got {other:?}"
-                )))
+                )));
             }
             None => None,
         },
@@ -511,11 +514,11 @@ impl ScalarUDFImpl for KernelMapToStructUdf {
         &self.signature
     }
 
-    fn return_type(&self, _arg_types: &[ArrowDataType]) -> Result<ArrowDataType, DataFusionError> {
+    fn return_type(&self, _arg_types: &[ArrowDataType]) -> DFResult<ArrowDataType> {
         Ok(self.return_type.clone())
     }
 
-    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue, DataFusionError> {
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
         let num_rows = args.number_rows;
         let [map] = take_function_args(self.name(), args.args)?;
         let batch = RecordBatch::try_from_iter([("map", map.into_array(num_rows)?)])?;
@@ -597,11 +600,11 @@ impl ScalarUDFImpl for ParseJsonUdf {
         &self.signature
     }
 
-    fn return_type(&self, _arg_types: &[ArrowDataType]) -> Result<ArrowDataType, DataFusionError> {
+    fn return_type(&self, _arg_types: &[ArrowDataType]) -> DFResult<ArrowDataType> {
         Ok(self.return_type.clone())
     }
 
-    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue, DataFusionError> {
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
         let num_rows = args.number_rows;
         let [json] = take_function_args(self.name(), args.args)?;
         let json = json.into_array(num_rows)?;
@@ -637,10 +640,10 @@ mod tests {
     use datafusion::physical_expr::create_physical_expr;
     use datafusion::physical_expr::execution_props::ExecutionProps;
     use delta_kernel::expressions::{
-        col, lit, null_lit, ColumnName as KernelColumnName, Expression as KernelExpr,
-        ExpressionStructPatch, ExpressionStructPatchBuilder, MapToStructOptions,
+        ColumnName as KernelColumnName, Expression as KernelExpr, ExpressionStructPatch,
+        ExpressionStructPatchBuilder, MapToStructOptions, col, lit, null_lit,
     };
-    use delta_kernel::schema::{schema, schema_ref, ArrayType, DataType, MapType, StructType};
+    use delta_kernel::schema::{ArrayType, DataType, MapType, StructType, schema, schema_ref};
     use rstest::rstest;
 
     use super::*;
@@ -883,7 +886,7 @@ mod tests {
 
     /// Asserts `res` is an error whose message contains `message`.
     #[track_caller]
-    fn assert_error_message<T>(res: Result<T>, message: &str) {
+    fn assert_error_message<T>(res: KernelResult<T>, message: &str) {
         let error = res.err().expect("expected an error").to_string();
         assert!(error.contains(message), "{error}");
     }
@@ -1142,8 +1145,9 @@ mod tests {
         #[case] expected_value: &str,
     ) {
         let target = schema! { nullable "f": (field_type) };
-        let expected =
-            format!("CASE WHEN pv IS NOT NULL THEN named_struct(Utf8(\"f\"), {expected_value}) ELSE NULL END");
+        let expected = format!(
+            "CASE WHEN pv IS NOT NULL THEN named_struct(Utf8(\"f\"), {expected_value}) ELSE NULL END"
+        );
         assert_eq!(lower_map_to_struct(target), expected);
     }
 

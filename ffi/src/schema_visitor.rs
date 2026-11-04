@@ -25,20 +25,24 @@ use std::collections::HashMap;
 use std::ffi::c_void;
 
 use delta_kernel::schema::{
-    ArrayType, DataType, DecimalType, MapType, MetadataValue, PrimitiveType, StructField,
-    StructType,
+    ArrayType, DataType, DecimalType, IntervalYearToMonthType, MapType, MetadataValue,
+    PrimitiveType, StructField, StructType,
 };
 #[cfg(feature = "geo-type-in-dev")]
 use delta_kernel::schema::{EdgeInterpolationAlgorithm, GeographyType, GeometryType};
-use delta_kernel::{KernelError, KernelResult, Result};
+use delta_kernel::{KernelError, KernelResult};
 use tracing::warn;
 
+use crate::delta_types::FfiNullableStringMap;
 use crate::scan::{CMetadataMap, CMetadataValueKind};
 use crate::{
     AllocateErrorFn, ExternResult, IntoExternResult, KernelStringSlice, ReferenceSet,
     TryFromStringSlice,
 };
 
+/// In-progress fields created by an engine while reconstructing a Kernel schema.
+///
+/// Complex field visitors consume the IDs of their child fields from this state.
 #[derive(Default)]
 pub struct KernelSchemaVisitorState {
     elements: ReferenceSet<StructField>,
@@ -77,7 +81,7 @@ pub struct EngineMetadata {
 /// Caller must pass the active map supplied to `EngineMetadata::visitor`, valid key and value data
 /// for the call duration, a valid `kind` discriminant, and a valid error allocator. The state must
 /// not be aliased or retained beyond the callback.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn visit_metadata_value(
     state: &mut CMetadataMap,
     key: KernelStringSlice,
@@ -87,9 +91,8 @@ pub unsafe extern "C" fn visit_metadata_value(
 ) -> ExternResult<bool> {
     let key = unsafe { TryFromStringSlice::try_from_slice(&key) };
     let value = unsafe { TryFromStringSlice::try_from_slice(&value) };
-    visit_metadata_value_impl(state, key, kind, value)
-        .map(|()| true)
-        .into_extern_result(&allocate_error)
+    let result = visit_metadata_value_impl(state, key, kind, value).map(|()| true);
+    unsafe { result.into_extern_result(&allocate_error) }
 }
 
 fn visit_engine_metadata(
@@ -136,7 +139,7 @@ fn visit_metadata_value_impl(
 pub fn extract_kernel_schema(
     state: &mut KernelSchemaVisitorState,
     schema_id: usize,
-) -> Result<StructType> {
+) -> KernelResult<StructType> {
     let schema_element = state
         .elements
         .take(schema_id)
@@ -193,7 +196,7 @@ fn visit_field_primitive_impl(
 /// Caller is responsible for providing a valid `state`, `name` slice with valid UTF-8 data,
 /// and `allocate_error` function pointer. When non-null, `metadata` must point to a valid
 /// descriptor and callback.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn visit_field_string(
     state: &mut KernelSchemaVisitorState,
     name: KernelStringSlice,
@@ -203,8 +206,9 @@ pub unsafe extern "C" fn visit_field_string(
 ) -> ExternResult<usize> {
     let name_str = unsafe { TryFromStringSlice::try_from_slice(&name) };
     let metadata = visit_engine_metadata(unsafe { metadata.as_ref() });
-    visit_field_primitive_impl(state, name_str, PrimitiveType::String, nullable, metadata)
-        .into_extern_result(&allocate_error)
+    let result =
+        visit_field_primitive_impl(state, name_str, PrimitiveType::String, nullable, metadata);
+    unsafe { result.into_extern_result(&allocate_error) }
 }
 
 /// Visit a long field. Long fields store 64-bit signed integers.
@@ -214,7 +218,7 @@ pub unsafe extern "C" fn visit_field_string(
 /// Caller is responsible for providing a valid `state`, `name` slice with valid UTF-8 data,
 /// and `allocate_error` function pointer. When non-null, `metadata` must point to a valid
 /// descriptor and callback.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn visit_field_long(
     state: &mut KernelSchemaVisitorState,
     name: KernelStringSlice,
@@ -224,8 +228,9 @@ pub unsafe extern "C" fn visit_field_long(
 ) -> ExternResult<usize> {
     let name_str = unsafe { TryFromStringSlice::try_from_slice(&name) };
     let metadata = visit_engine_metadata(unsafe { metadata.as_ref() });
-    visit_field_primitive_impl(state, name_str, PrimitiveType::Long, nullable, metadata)
-        .into_extern_result(&allocate_error)
+    let result =
+        visit_field_primitive_impl(state, name_str, PrimitiveType::Long, nullable, metadata);
+    unsafe { result.into_extern_result(&allocate_error) }
 }
 
 /// Visit an integer field. Integer fields store 32-bit signed integers.
@@ -235,7 +240,7 @@ pub unsafe extern "C" fn visit_field_long(
 /// Caller is responsible for providing a valid `state`, `name` slice with valid UTF-8 data,
 /// and `allocate_error` function pointer. When non-null, `metadata` must point to a valid
 /// descriptor and callback.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn visit_field_integer(
     state: &mut KernelSchemaVisitorState,
     name: KernelStringSlice,
@@ -245,8 +250,9 @@ pub unsafe extern "C" fn visit_field_integer(
 ) -> ExternResult<usize> {
     let name_str = unsafe { TryFromStringSlice::try_from_slice(&name) };
     let metadata = visit_engine_metadata(unsafe { metadata.as_ref() });
-    visit_field_primitive_impl(state, name_str, PrimitiveType::Integer, nullable, metadata)
-        .into_extern_result(&allocate_error)
+    let result =
+        visit_field_primitive_impl(state, name_str, PrimitiveType::Integer, nullable, metadata);
+    unsafe { result.into_extern_result(&allocate_error) }
 }
 
 /// Visit a short field. Short fields store 16-bit signed integers.
@@ -256,7 +262,7 @@ pub unsafe extern "C" fn visit_field_integer(
 /// Caller is responsible for providing a valid `state`, `name` slice with valid UTF-8 data,
 /// and `allocate_error` function pointer. When non-null, `metadata` must point to a valid
 /// descriptor and callback.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn visit_field_short(
     state: &mut KernelSchemaVisitorState,
     name: KernelStringSlice,
@@ -266,8 +272,9 @@ pub unsafe extern "C" fn visit_field_short(
 ) -> ExternResult<usize> {
     let name_str = unsafe { TryFromStringSlice::try_from_slice(&name) };
     let metadata = visit_engine_metadata(unsafe { metadata.as_ref() });
-    visit_field_primitive_impl(state, name_str, PrimitiveType::Short, nullable, metadata)
-        .into_extern_result(&allocate_error)
+    let result =
+        visit_field_primitive_impl(state, name_str, PrimitiveType::Short, nullable, metadata);
+    unsafe { result.into_extern_result(&allocate_error) }
 }
 
 /// Visit a byte field. Byte fields store 8-bit signed integers.
@@ -277,7 +284,7 @@ pub unsafe extern "C" fn visit_field_short(
 /// Caller is responsible for providing a valid `state`, `name` slice with valid UTF-8 data,
 /// and `allocate_error` function pointer. When non-null, `metadata` must point to a valid
 /// descriptor and callback.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn visit_field_byte(
     state: &mut KernelSchemaVisitorState,
     name: KernelStringSlice,
@@ -287,8 +294,9 @@ pub unsafe extern "C" fn visit_field_byte(
 ) -> ExternResult<usize> {
     let name_str = unsafe { TryFromStringSlice::try_from_slice(&name) };
     let metadata = visit_engine_metadata(unsafe { metadata.as_ref() });
-    visit_field_primitive_impl(state, name_str, PrimitiveType::Byte, nullable, metadata)
-        .into_extern_result(&allocate_error)
+    let result =
+        visit_field_primitive_impl(state, name_str, PrimitiveType::Byte, nullable, metadata);
+    unsafe { result.into_extern_result(&allocate_error) }
 }
 
 /// Visit a float field. Float fields store 32-bit floating point numbers.
@@ -298,7 +306,7 @@ pub unsafe extern "C" fn visit_field_byte(
 /// Caller is responsible for providing a valid `state`, `name` slice with valid UTF-8 data,
 /// and `allocate_error` function pointer. When non-null, `metadata` must point to a valid
 /// descriptor and callback.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn visit_field_float(
     state: &mut KernelSchemaVisitorState,
     name: KernelStringSlice,
@@ -308,8 +316,9 @@ pub unsafe extern "C" fn visit_field_float(
 ) -> ExternResult<usize> {
     let name_str = unsafe { TryFromStringSlice::try_from_slice(&name) };
     let metadata = visit_engine_metadata(unsafe { metadata.as_ref() });
-    visit_field_primitive_impl(state, name_str, PrimitiveType::Float, nullable, metadata)
-        .into_extern_result(&allocate_error)
+    let result =
+        visit_field_primitive_impl(state, name_str, PrimitiveType::Float, nullable, metadata);
+    unsafe { result.into_extern_result(&allocate_error) }
 }
 
 /// Visit a double field. Double fields store 64-bit floating point numbers.
@@ -319,7 +328,7 @@ pub unsafe extern "C" fn visit_field_float(
 /// Caller is responsible for providing a valid `state`, `name` slice with valid UTF-8 data,
 /// and `allocate_error` function pointer. When non-null, `metadata` must point to a valid
 /// descriptor and callback.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn visit_field_double(
     state: &mut KernelSchemaVisitorState,
     name: KernelStringSlice,
@@ -329,8 +338,9 @@ pub unsafe extern "C" fn visit_field_double(
 ) -> ExternResult<usize> {
     let name_str = unsafe { TryFromStringSlice::try_from_slice(&name) };
     let metadata = visit_engine_metadata(unsafe { metadata.as_ref() });
-    visit_field_primitive_impl(state, name_str, PrimitiveType::Double, nullable, metadata)
-        .into_extern_result(&allocate_error)
+    let result =
+        visit_field_primitive_impl(state, name_str, PrimitiveType::Double, nullable, metadata);
+    unsafe { result.into_extern_result(&allocate_error) }
 }
 
 /// Visit a boolean field. Boolean fields store true/false values.
@@ -340,7 +350,7 @@ pub unsafe extern "C" fn visit_field_double(
 /// Caller is responsible for providing a valid `state`, `name` slice with valid UTF-8 data,
 /// and `allocate_error` function pointer. When non-null, `metadata` must point to a valid
 /// descriptor and callback.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn visit_field_boolean(
     state: &mut KernelSchemaVisitorState,
     name: KernelStringSlice,
@@ -350,8 +360,9 @@ pub unsafe extern "C" fn visit_field_boolean(
 ) -> ExternResult<usize> {
     let name_str = unsafe { TryFromStringSlice::try_from_slice(&name) };
     let metadata = visit_engine_metadata(unsafe { metadata.as_ref() });
-    visit_field_primitive_impl(state, name_str, PrimitiveType::Boolean, nullable, metadata)
-        .into_extern_result(&allocate_error)
+    let result =
+        visit_field_primitive_impl(state, name_str, PrimitiveType::Boolean, nullable, metadata);
+    unsafe { result.into_extern_result(&allocate_error) }
 }
 
 /// Visit a binary field. Binary fields store arbitrary byte arrays.
@@ -361,7 +372,7 @@ pub unsafe extern "C" fn visit_field_boolean(
 /// Caller is responsible for providing a valid `state`, `name` slice with valid UTF-8 data,
 /// and `allocate_error` function pointer. When non-null, `metadata` must point to a valid
 /// descriptor and callback.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn visit_field_binary(
     state: &mut KernelSchemaVisitorState,
     name: KernelStringSlice,
@@ -371,8 +382,9 @@ pub unsafe extern "C" fn visit_field_binary(
 ) -> ExternResult<usize> {
     let name_str = unsafe { TryFromStringSlice::try_from_slice(&name) };
     let metadata = visit_engine_metadata(unsafe { metadata.as_ref() });
-    visit_field_primitive_impl(state, name_str, PrimitiveType::Binary, nullable, metadata)
-        .into_extern_result(&allocate_error)
+    let result =
+        visit_field_primitive_impl(state, name_str, PrimitiveType::Binary, nullable, metadata);
+    unsafe { result.into_extern_result(&allocate_error) }
 }
 
 /// Visit a date field. Date fields store calendar dates without time information.
@@ -382,7 +394,7 @@ pub unsafe extern "C" fn visit_field_binary(
 /// Caller is responsible for providing a valid `state`, `name` slice with valid UTF-8 data,
 /// and `allocate_error` function pointer. When non-null, `metadata` must point to a valid
 /// descriptor and callback.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn visit_field_date(
     state: &mut KernelSchemaVisitorState,
     name: KernelStringSlice,
@@ -392,8 +404,9 @@ pub unsafe extern "C" fn visit_field_date(
 ) -> ExternResult<usize> {
     let name_str = unsafe { TryFromStringSlice::try_from_slice(&name) };
     let metadata = visit_engine_metadata(unsafe { metadata.as_ref() });
-    visit_field_primitive_impl(state, name_str, PrimitiveType::Date, nullable, metadata)
-        .into_extern_result(&allocate_error)
+    let result =
+        visit_field_primitive_impl(state, name_str, PrimitiveType::Date, nullable, metadata);
+    unsafe { result.into_extern_result(&allocate_error) }
 }
 
 /// Visit a timestamp field. Timestamp fields store date and time with microsecond precision in UTC.
@@ -403,7 +416,7 @@ pub unsafe extern "C" fn visit_field_date(
 /// Caller is responsible for providing a valid `state`, `name` slice with valid UTF-8 data,
 /// and `allocate_error` function pointer. When non-null, `metadata` must point to a valid
 /// descriptor and callback.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn visit_field_timestamp(
     state: &mut KernelSchemaVisitorState,
     name: KernelStringSlice,
@@ -413,14 +426,14 @@ pub unsafe extern "C" fn visit_field_timestamp(
 ) -> ExternResult<usize> {
     let name_str = unsafe { TryFromStringSlice::try_from_slice(&name) };
     let metadata = visit_engine_metadata(unsafe { metadata.as_ref() });
-    visit_field_primitive_impl(
+    let result = visit_field_primitive_impl(
         state,
         name_str,
         PrimitiveType::Timestamp,
         nullable,
         metadata,
-    )
-    .into_extern_result(&allocate_error)
+    );
+    unsafe { result.into_extern_result(&allocate_error) }
 }
 
 /// Visit a timestamp_ntz field. Similar to timestamp but without timezone information.
@@ -430,7 +443,7 @@ pub unsafe extern "C" fn visit_field_timestamp(
 /// Caller is responsible for providing a valid `state`, `name` slice with valid UTF-8 data,
 /// and `allocate_error` function pointer. When non-null, `metadata` must point to a valid
 /// descriptor and callback.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn visit_field_timestamp_ntz(
     state: &mut KernelSchemaVisitorState,
     name: KernelStringSlice,
@@ -440,14 +453,14 @@ pub unsafe extern "C" fn visit_field_timestamp_ntz(
 ) -> ExternResult<usize> {
     let name_str = unsafe { TryFromStringSlice::try_from_slice(&name) };
     let metadata = visit_engine_metadata(unsafe { metadata.as_ref() });
-    visit_field_primitive_impl(
+    let result = visit_field_primitive_impl(
         state,
         name_str,
         PrimitiveType::TimestampNtz,
         nullable,
         metadata,
-    )
-    .into_extern_result(&allocate_error)
+    );
+    unsafe { result.into_extern_result(&allocate_error) }
 }
 
 /// Visit an interval year-month field. Values store signed month counts.
@@ -457,7 +470,7 @@ pub unsafe extern "C" fn visit_field_timestamp_ntz(
 /// Caller is responsible for providing a valid `state`, `name` slice with valid UTF-8 data,
 /// and `allocate_error` function pointer. When non-null, `metadata` must point to a valid
 /// descriptor and callback.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn visit_field_interval_year_month(
     state: &mut KernelSchemaVisitorState,
     name: KernelStringSlice,
@@ -467,14 +480,14 @@ pub unsafe extern "C" fn visit_field_interval_year_month(
 ) -> ExternResult<usize> {
     let name_str = unsafe { TryFromStringSlice::try_from_slice(&name) };
     let metadata = visit_engine_metadata(unsafe { metadata.as_ref() });
-    visit_field_primitive_impl(
+    let result = visit_field_primitive_impl(
         state,
         name_str,
-        PrimitiveType::IntervalYearMonth,
+        PrimitiveType::interval_year_month(IntervalYearToMonthType::IntervalYearToMonth),
         nullable,
         metadata,
-    )
-    .into_extern_result(&allocate_error)
+    );
+    unsafe { result.into_extern_result(&allocate_error) }
 }
 
 /// Visit an interval day-time field. Values store signed microsecond durations.
@@ -484,7 +497,7 @@ pub unsafe extern "C" fn visit_field_interval_year_month(
 /// Caller is responsible for providing a valid `state`, `name` slice with valid UTF-8 data,
 /// and `allocate_error` function pointer. When non-null, `metadata` must point to a valid
 /// descriptor and callback.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn visit_field_interval_day_time(
     state: &mut KernelSchemaVisitorState,
     name: KernelStringSlice,
@@ -494,14 +507,14 @@ pub unsafe extern "C" fn visit_field_interval_day_time(
 ) -> ExternResult<usize> {
     let name_str = unsafe { TryFromStringSlice::try_from_slice(&name) };
     let metadata = visit_engine_metadata(unsafe { metadata.as_ref() });
-    visit_field_primitive_impl(
+    let result = visit_field_primitive_impl(
         state,
         name_str,
         PrimitiveType::IntervalDayTime,
         nullable,
         metadata,
-    )
-    .into_extern_result(&allocate_error)
+    );
+    unsafe { result.into_extern_result(&allocate_error) }
 }
 
 /// Visit a void field. Void fields are not materialized in data files and read as all-null columns.
@@ -511,7 +524,7 @@ pub unsafe extern "C" fn visit_field_interval_day_time(
 /// Caller is responsible for providing a valid `state`, `name` slice with valid UTF-8 data,
 /// and `allocate_error` function pointer. When non-null, `metadata` must point to a valid
 /// descriptor and callback.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn visit_field_void(
     state: &mut KernelSchemaVisitorState,
     name: KernelStringSlice,
@@ -521,8 +534,9 @@ pub unsafe extern "C" fn visit_field_void(
 ) -> ExternResult<usize> {
     let name_str = unsafe { TryFromStringSlice::try_from_slice(&name) };
     let metadata = visit_engine_metadata(unsafe { metadata.as_ref() });
-    visit_field_primitive_impl(state, name_str, PrimitiveType::Void, nullable, metadata)
-        .into_extern_result(&allocate_error)
+    let result =
+        visit_field_primitive_impl(state, name_str, PrimitiveType::Void, nullable, metadata);
+    unsafe { result.into_extern_result(&allocate_error) }
 }
 
 /// Visit a geometry field with the given coordinate reference system.
@@ -536,7 +550,7 @@ pub unsafe extern "C" fn visit_field_void(
 /// `allocate_error` function pointer, all valid for the duration of this call. When non-null,
 /// `metadata` must point to a valid descriptor and callback.
 #[cfg(feature = "geo-type-in-dev")]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn visit_field_geometry(
     state: &mut KernelSchemaVisitorState,
     name: KernelStringSlice,
@@ -548,18 +562,18 @@ pub unsafe extern "C" fn visit_field_geometry(
     let name_str = unsafe { TryFromStringSlice::try_from_slice(&name) };
     let crs = unsafe { TryFromStringSlice::try_from_slice(&crs) };
     let metadata = visit_engine_metadata(unsafe { metadata.as_ref() });
-    visit_field_geometry_impl(state, name_str, crs, nullable, metadata)
-        .into_extern_result(&allocate_error)
+    let result = visit_field_geometry_impl(state, name_str, crs, nullable, metadata);
+    unsafe { result.into_extern_result(&allocate_error) }
 }
 
 #[cfg(feature = "geo-type-in-dev")]
 fn visit_field_geometry_impl(
     state: &mut KernelSchemaVisitorState,
-    name: Result<&str>,
-    crs: Result<&str>,
+    name: KernelResult<&str>,
+    crs: KernelResult<&str>,
     nullable: bool,
-    metadata: Result<HashMap<String, MetadataValue>>,
-) -> Result<usize> {
+    metadata: KernelResult<HashMap<String, MetadataValue>>,
+) -> KernelResult<usize> {
     let geometry = GeometryType::try_new(crs?)?;
     visit_field_primitive_impl(
         state,
@@ -582,7 +596,7 @@ fn visit_field_geometry_impl(
 /// slices, and `allocate_error` function pointer, all valid for the duration of this call. When
 /// non-null, `metadata` must point to a valid descriptor and callback.
 #[cfg(feature = "geo-type-in-dev")]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn visit_field_geography(
     state: &mut KernelSchemaVisitorState,
     name: KernelStringSlice,
@@ -596,19 +610,19 @@ pub unsafe extern "C" fn visit_field_geography(
     let crs = unsafe { TryFromStringSlice::try_from_slice(&crs) };
     let algorithm = unsafe { TryFromStringSlice::try_from_slice(&algorithm) };
     let metadata = visit_engine_metadata(unsafe { metadata.as_ref() });
-    visit_field_geography_impl(state, name_str, crs, algorithm, nullable, metadata)
-        .into_extern_result(&allocate_error)
+    let result = visit_field_geography_impl(state, name_str, crs, algorithm, nullable, metadata);
+    unsafe { result.into_extern_result(&allocate_error) }
 }
 
 #[cfg(feature = "geo-type-in-dev")]
 fn visit_field_geography_impl(
     state: &mut KernelSchemaVisitorState,
-    name: Result<&str>,
-    crs: Result<&str>,
-    algorithm: Result<&str>,
+    name: KernelResult<&str>,
+    crs: KernelResult<&str>,
+    algorithm: KernelResult<&str>,
     nullable: bool,
-    metadata: Result<HashMap<String, MetadataValue>>,
-) -> Result<usize> {
+    metadata: KernelResult<HashMap<String, MetadataValue>>,
+) -> KernelResult<usize> {
     let algorithm = algorithm?
         .parse::<EdgeInterpolationAlgorithm>()
         .map_err(|err| {
@@ -634,7 +648,7 @@ fn visit_field_geography_impl(
 /// Caller is responsible for providing a valid `state`, `name` slice with valid UTF-8 data,
 /// and `allocate_error` function pointer. When non-null, `metadata` must point to a valid
 /// descriptor and callback.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn visit_field_decimal(
     state: &mut KernelSchemaVisitorState,
     name: KernelStringSlice,
@@ -646,8 +660,8 @@ pub unsafe extern "C" fn visit_field_decimal(
 ) -> ExternResult<usize> {
     let name_str = unsafe { TryFromStringSlice::try_from_slice(&name) };
     let metadata = visit_engine_metadata(unsafe { metadata.as_ref() });
-    visit_field_decimal_impl(state, name_str, precision, scale, nullable, metadata)
-        .into_extern_result(&allocate_error)
+    let result = visit_field_decimal_impl(state, name_str, precision, scale, nullable, metadata);
+    unsafe { result.into_extern_result(&allocate_error) }
 }
 
 fn visit_field_decimal_impl(
@@ -688,7 +702,7 @@ fn visit_field_decimal_impl(
 /// Caller is responsible for providing valid `state`, `name` slice, `field_ids` array pointing
 /// to valid field IDs previously returned by this visitor, and `allocate_error` function pointer.
 /// When non-null, `metadata` must point to a valid descriptor and callback.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn visit_field_struct(
     state: &mut KernelSchemaVisitorState,
     name: KernelStringSlice,
@@ -698,12 +712,12 @@ pub unsafe extern "C" fn visit_field_struct(
     metadata: *const EngineMetadata,
     allocate_error: AllocateErrorFn,
 ) -> ExternResult<usize> {
-    let name_str: Result<&str, KernelError> = unsafe { TryFromStringSlice::try_from_slice(&name) };
+    let name_str: KernelResult<&str> = unsafe { TryFromStringSlice::try_from_slice(&name) };
     let metadata = visit_engine_metadata(unsafe { metadata.as_ref() });
     let field_ids = unsafe { std::slice::from_raw_parts(field_ids, field_count) };
 
-    visit_field_struct_impl(state, name_str, field_ids, nullable, metadata)
-        .into_extern_result(&allocate_error)
+    let result = visit_field_struct_impl(state, name_str, field_ids, nullable, metadata);
+    unsafe { result.into_extern_result(&allocate_error) }
 }
 
 // Helper to create struct DataType from field IDs
@@ -748,7 +762,7 @@ fn visit_field_struct_impl(
 /// Caller is responsible for providing valid `state`, `name` slice, `element_type_id` from
 /// a previous field visitor call, and `allocate_error` function pointer. When non-null, `metadata`
 /// must point to a valid descriptor and callback.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn visit_field_array(
     state: &mut KernelSchemaVisitorState,
     name: KernelStringSlice,
@@ -759,8 +773,8 @@ pub unsafe extern "C" fn visit_field_array(
 ) -> ExternResult<usize> {
     let name_str = unsafe { TryFromStringSlice::try_from_slice(&name) };
     let metadata = visit_engine_metadata(unsafe { metadata.as_ref() });
-    visit_field_array_impl(state, name_str, element_type_id, nullable, metadata)
-        .into_extern_result(&allocate_error)
+    let result = visit_field_array_impl(state, name_str, element_type_id, nullable, metadata);
+    unsafe { result.into_extern_result(&allocate_error) }
 }
 
 fn visit_field_array_impl(
@@ -795,7 +809,7 @@ fn visit_field_array_impl(
 /// Caller is responsible for providing valid `state`, `name` slice, `key_type_id` and
 /// `value_type_id` from previous field visitor calls, and `allocate_error` function pointer. When
 /// non-null, `metadata` must point to a valid descriptor and callback.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn visit_field_map(
     state: &mut KernelSchemaVisitorState,
     name: KernelStringSlice,
@@ -807,15 +821,15 @@ pub unsafe extern "C" fn visit_field_map(
 ) -> ExternResult<usize> {
     let name_str = unsafe { TryFromStringSlice::try_from_slice(&name) };
     let metadata = visit_engine_metadata(unsafe { metadata.as_ref() });
-    visit_field_map_impl(
+    let result = visit_field_map_impl(
         state,
         name_str,
         key_type_id,
         value_type_id,
         nullable,
         metadata,
-    )
-    .into_extern_result(&allocate_error)
+    );
+    unsafe { result.into_extern_result(&allocate_error) }
 }
 
 fn visit_field_map_impl(
@@ -850,6 +864,56 @@ fn visit_field_map_impl(
     Ok(wrap_field(state, field))
 }
 
+/// Visit a UDT field with the physical type referenced by `sql_type_id` and a borrowed annotation.
+///
+/// Copies the annotation and returns a new field ID. After decoding the name and annotation and
+/// visiting metadata, consumes `sql_type_id` even if UDT validation fails. Earlier errors and
+/// disabled UDT support leave the ID available. The physical field's name, nullability, and
+/// metadata are ignored. Returns an error for invalid IDs, invalid UTF-8, duplicate or reserved
+/// annotation keys, failed metadata callbacks, physical types containing UDTs or metadata columns,
+/// or disabled UDT support.
+///
+/// # Safety
+///
+/// `state` must be valid and exclusively borrowed. String slices must reference readable memory for
+/// their lengths. `annotation.ptr` must reference `annotation.len` initialized, aligned entries, or
+/// may be null when the length is zero. Optional values must have valid discriminants. All inputs
+/// are borrowed for the call. Non-null `metadata` must satisfy [`EngineMetadata`]'s contract, and
+/// `allocate_error` must be a valid error allocator.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn visit_field_user_defined(
+    state: &mut KernelSchemaVisitorState,
+    name: KernelStringSlice,
+    sql_type_id: usize,
+    annotation: FfiNullableStringMap,
+    nullable: bool,
+    metadata: *const EngineMetadata,
+    allocate_error: AllocateErrorFn,
+) -> ExternResult<usize> {
+    #[cfg(feature = "udt-in-dev")]
+    let result = (|| -> KernelResult<usize> {
+        let name = unsafe { name.try_to_string() }?;
+        let annotation = unsafe { annotation.try_to_hash_map() }?;
+        let metadata = visit_engine_metadata(unsafe { metadata.as_ref() })?;
+        let physical = unwrap_field(state, sql_type_id).ok_or_else(|| {
+            KernelError::schema(format!("Invalid UDT physical type ID {sql_type_id}"))
+        })?;
+        let udt = delta_kernel::schema::UserDefinedType::try_new(physical.data_type, annotation)?;
+        Ok(wrap_field(
+            state,
+            StructField::new(name, udt, nullable).with_metadata(metadata),
+        ))
+    })();
+    #[cfg(not(feature = "udt-in-dev"))]
+    let result: KernelResult<usize> = {
+        let _ = (state, name, sql_type_id, annotation, nullable, metadata);
+        Err(KernelError::unsupported(
+            "UDT schema construction requires udt-in-dev",
+        ))
+    };
+    unsafe { result.into_extern_result(&allocate_error) }
+}
+
 /// Visit a variant field.
 ///
 /// Takes a struct type ID that defines the variant schema. This must reference a field created by
@@ -860,7 +924,7 @@ fn visit_field_map_impl(
 /// Caller must ensure:
 /// - All base parameters are valid as per visit_field_string
 /// - `variant_struct_id` is a valid struct type ID from a previous visitor call
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn visit_field_variant(
     state: &mut KernelSchemaVisitorState,
     name: KernelStringSlice,
@@ -871,8 +935,8 @@ pub unsafe extern "C" fn visit_field_variant(
 ) -> ExternResult<usize> {
     let name_str = unsafe { TryFromStringSlice::try_from_slice(&name) };
     let metadata = visit_engine_metadata(unsafe { metadata.as_ref() });
-    visit_field_variant_impl(state, name_str, variant_struct_id, nullable, metadata)
-        .into_extern_result(&allocate_error)
+    let result = visit_field_variant_impl(state, name_str, variant_struct_id, nullable, metadata);
+    unsafe { result.into_extern_result(&allocate_error) }
 }
 
 fn visit_field_variant_impl(
@@ -907,7 +971,7 @@ fn create_variant_data_type(
 #[cfg(test)]
 mod tests {
     use std::ffi::c_void;
-    use std::ptr::{null, NonNull};
+    use std::ptr::{NonNull, null};
 
     use delta_kernel::schema::{DataType, MetadataValue, PrimitiveType};
     use rstest::rstest;
@@ -915,11 +979,243 @@ mod tests {
     use super::*;
     use crate::error::{EngineError, FFIKernelError};
     use crate::ffi_test_utils::{
-        allocate_err, assert_extern_result_error_with_message, ok_or_panic,
+        allocate_err, assert_extern_result_error_contains, assert_extern_result_error_with_message,
+        ok_or_panic,
     };
     use crate::scan::visit_metadata_map;
     use crate::{KernelStringSlice, NullableCvoid};
 
+    /// Verifies annotation validation and ownership of parent and physical-field attributes.
+    #[cfg(feature = "udt-in-dev")]
+    #[rstest]
+    #[case("class", true)]
+    #[case("type", false)]
+    #[case("sqlType", false)]
+    fn udt_schema_visit_preserves_annotation_and_rejects_reserved_keys(
+        #[case] key: &str,
+        #[case] valid: bool,
+        #[values(false, true)] duplicate: bool,
+    ) {
+        let mut state = KernelSchemaVisitorState::default();
+        let physical = wrap_field(
+            &mut state,
+            StructField::not_null("sqlType", DataType::LONG)
+                .with_metadata([("child", MetadataValue::String("ignored".into()))]),
+        );
+        let mut metadata = TestMetadata::from([("parent", MetadataValue::String("kept".into()))]);
+        let entries: Vec<_> = (0..if duplicate { 2 } else { 1 })
+            .map(|_| crate::delta_types::FfiNullableStringMapEntry {
+                key: unsafe { KernelStringSlice::new_unsafe(key) },
+                value: None.into(),
+            })
+            .collect();
+        let result = unsafe {
+            visit_field_user_defined(
+                &mut state,
+                KernelStringSlice::new_unsafe("value"),
+                physical,
+                FfiNullableStringMap {
+                    ptr: entries.as_ptr(),
+                    len: entries.len(),
+                },
+                true,
+                &test_engine_metadata(&mut metadata),
+                allocate_err,
+            )
+        };
+        assert_eq!(state.elements.contains(physical), duplicate);
+        if duplicate {
+            assert_extern_result_error_contains(
+                result,
+                FFIKernelError::GenericError,
+                "duplicate map key",
+            );
+        } else if valid {
+            let field = state.elements.take(ok_or_panic(result)).unwrap();
+            assert_eq!(field.name, "value");
+            assert!(field.nullable);
+            assert_eq!(field.metadata, metadata.values);
+            let DataType::UserDefined(udt) = field.data_type else {
+                panic!("Expected UDT")
+            };
+            assert_eq!(udt.sql_type(), &DataType::LONG);
+            assert_eq!(udt.annotation().get(key), Some(&None));
+        } else {
+            assert_extern_result_error_with_message(
+                result,
+                FFIKernelError::SchemaError,
+                Some("Schema error: UDT annotation keys type and sqlType are reserved"),
+            );
+        }
+    }
+
+    /// Verifies that invalid and consumed physical IDs return schema errors without disturbing
+    /// unrelated fields.
+    #[cfg(feature = "udt-in-dev")]
+    #[rstest]
+    fn udt_schema_visit_rejects_invalid_or_consumed_id(#[values(false, true)] consumed: bool) {
+        let mut state = KernelSchemaVisitorState::default();
+        let unrelated = wrap_field(&mut state, StructField::nullable("other", DataType::STRING));
+        let physical = if consumed {
+            let id = wrap_field(&mut state, StructField::nullable("sqlType", DataType::LONG));
+            let udt_id = unsafe {
+                ok_or_panic(visit_field_user_defined(
+                    &mut state,
+                    KernelStringSlice::new_unsafe("first"),
+                    id,
+                    FfiNullableStringMap {
+                        ptr: null(),
+                        len: 0,
+                    },
+                    true,
+                    null(),
+                    allocate_err,
+                ))
+            };
+            assert!(state.elements.contains(udt_id));
+            id
+        } else {
+            usize::MAX
+        };
+        let result = unsafe {
+            visit_field_user_defined(
+                &mut state,
+                KernelStringSlice::new_unsafe("value"),
+                physical,
+                FfiNullableStringMap {
+                    ptr: null(),
+                    len: 0,
+                },
+                true,
+                null(),
+                allocate_err,
+            )
+        };
+        assert_extern_result_error_contains(
+            result,
+            FFIKernelError::SchemaError,
+            "Invalid UDT physical type ID",
+        );
+        assert!(state.elements.contains(unrelated));
+        assert!(!state.elements.contains(physical));
+    }
+
+    /// Verifies that failures before physical-ID resolution leave the child available for retry.
+    #[cfg(feature = "udt-in-dev")]
+    #[rstest]
+    #[case::name(0)]
+    #[case::annotation_key(1)]
+    #[case::annotation_value(2)]
+    #[case::metadata_callback(3)]
+    fn udt_schema_visit_early_errors_preserve_child(#[case] failure: usize) {
+        let mut state = KernelSchemaVisitorState::default();
+        let physical = wrap_field(&mut state, StructField::nullable("sqlType", DataType::LONG));
+        let valid = || unsafe { KernelStringSlice::new_unsafe("value") };
+        let invalid_bytes = [0xff_u8];
+        let invalid = || KernelStringSlice {
+            ptr: invalid_bytes.as_ptr().cast(),
+            len: 1,
+        };
+        let entry = crate::delta_types::FfiNullableStringMapEntry {
+            key: if failure == 1 { invalid() } else { valid() },
+            value: Some(if failure == 2 { invalid() } else { valid() }).into(),
+        };
+        let result = unsafe {
+            visit_field_user_defined(
+                &mut state,
+                if failure == 0 { invalid() } else { valid() },
+                physical,
+                FfiNullableStringMap {
+                    ptr: &entry,
+                    len: 1,
+                },
+                true,
+                &rejected_engine_metadata(),
+                allocate_err,
+            )
+        };
+        assert_extern_result_error_with_message(
+            result,
+            if failure == 3 {
+                FFIKernelError::SchemaError
+            } else {
+                FFIKernelError::Utf8Error
+            },
+            None,
+        );
+        assert!(state.elements.contains(physical));
+    }
+
+    /// Verifies that validation after physical-ID resolution consumes the child field.
+    #[cfg(feature = "udt-in-dev")]
+    #[rstest]
+    #[case::nested_udt(
+        DataType::from(delta_kernel::schema::UserDefinedType::try_new(DataType::LONG, HashMap::new()).unwrap()),
+        "must not contain another UDT"
+    )]
+    #[case::metadata_column(
+        DataType::from(StructType::try_new([StructField::create_metadata_column(
+            "row_index", delta_kernel::schema::MetadataColumnSpec::RowIndex
+        )]).unwrap()),
+        "must not contain a metadata column"
+    )]
+    fn udt_schema_visit_validation_errors_consume_child(
+        #[case] physical_type: DataType,
+        #[case] message: &str,
+    ) {
+        let mut state = KernelSchemaVisitorState::default();
+        let physical = wrap_field(&mut state, StructField::nullable("sqlType", physical_type));
+        let unrelated = wrap_field(&mut state, StructField::nullable("other", DataType::LONG));
+        let result = unsafe {
+            visit_field_user_defined(
+                &mut state,
+                KernelStringSlice::new_unsafe("value"),
+                physical,
+                FfiNullableStringMap {
+                    ptr: null(),
+                    len: 0,
+                },
+                true,
+                null(),
+                allocate_err,
+            )
+        };
+        assert_extern_result_error_contains(result, FFIKernelError::SchemaError, message);
+        assert!(!state.elements.contains(physical));
+        assert!(state.elements.contains(unrelated));
+    }
+
+    /// Verifies that disabled UDT support rejects before visiting metadata or consuming the child.
+    #[cfg(not(feature = "udt-in-dev"))]
+    #[test]
+    fn udt_schema_visit_disabled_preserves_child_and_skips_metadata() {
+        let mut state = KernelSchemaVisitorState::default();
+        let physical = wrap_field(&mut state, StructField::nullable("sqlType", DataType::LONG));
+        let mut metadata = TestMetadata::default();
+        let result = unsafe {
+            visit_field_user_defined(
+                &mut state,
+                KernelStringSlice::new_unsafe("value"),
+                physical,
+                FfiNullableStringMap {
+                    ptr: null(),
+                    len: 0,
+                },
+                true,
+                &test_engine_metadata(&mut metadata),
+                allocate_err,
+            )
+        };
+        assert_extern_result_error_contains(
+            result,
+            FFIKernelError::UnsupportedError,
+            "requires udt-in-dev",
+        );
+        assert!(state.elements.contains(physical));
+        assert!(!metadata.visited);
+    }
+
+    /// Metadata fixture that records callback invocation and the values supplied to Kernel.
     #[derive(Default)]
     struct TestMetadata {
         visited: bool,
@@ -1955,7 +2251,10 @@ mod tests {
             ("col_date", PrimitiveType::Date),
             ("col_timestamp", PrimitiveType::Timestamp),
             ("col_timestamp_ntz", PrimitiveType::TimestampNtz),
-            ("col_interval_year_month", PrimitiveType::IntervalYearMonth),
+            (
+                "col_interval_year_month",
+                PrimitiveType::interval_year_month(IntervalYearToMonthType::IntervalYearToMonth),
+            ),
             ("col_interval_day_time", PrimitiveType::IntervalDayTime),
             ("col_void", PrimitiveType::Void),
         ];
@@ -2489,7 +2788,7 @@ mod tests {
     fn cannot_use_nullable_as_map_keys() {
         // Error allocator for tests that panics when invoked. It is used in tests where we don't
         // expect errors.
-        #[no_mangle]
+        #[unsafe(no_mangle)]
         extern "C" fn ensure_map_err(
             _etype: FFIKernelError,
             msg: crate::KernelStringSlice,

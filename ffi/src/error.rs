@@ -1,9 +1,9 @@
 use delta_kernel::snapshot::SnapshotHintError;
-use delta_kernel::{KernelError, Result};
+use delta_kernel::{KernelError, KernelResult};
 use tracing::warn;
 
 use crate::handle::Handle;
-use crate::{kernel_string_slice, ExclusiveRustString, ExternEngine, KernelStringSlice};
+use crate::{ExclusiveRustString, ExternEngine, KernelStringSlice, kernel_string_slice};
 
 // We explicitly assign integer values to the error codes here because C and Rust are inconsistent
 // about values for "typedefed" features. Rust reserves the numbers for them regardless, so
@@ -80,6 +80,9 @@ pub enum FFIKernelError {
     StartVersionNotFound = 51,
     InvalidGeoParamsError = 52,
     MaxCatalogVersionError = 53,
+    TableAlreadyExistsAtPath = 54,
+    CommitRangeError = 55,
+    InvalidIntervalError = 56,
 }
 
 impl From<KernelError> for FFIKernelError {
@@ -93,6 +96,7 @@ impl From<KernelError> for FFIKernelError {
             KernelError::Extract(..) => FFIKernelError::ExtractError,
             KernelError::Generic(_) => FFIKernelError::GenericError,
             KernelError::GenericError { .. } => FFIKernelError::GenericError,
+            KernelError::CommitRange(_) => FFIKernelError::CommitRangeError,
             KernelError::MaxCatalogVersion(_) => FFIKernelError::MaxCatalogVersionError,
             KernelError::LogTailVersionsNotContiguous { .. } => FFIKernelError::InvalidLogSegment,
             KernelError::IOError(_) => FFIKernelError::IOErrorError,
@@ -130,6 +134,7 @@ impl From<KernelError> for FFIKernelError {
             }
             KernelError::InvalidTableLocation(_) => FFIKernelError::InvalidTableLocationError,
             KernelError::InvalidDecimal(_) => FFIKernelError::InvalidDecimalError,
+            KernelError::InvalidInterval(_) => FFIKernelError::InvalidIntervalError,
             KernelError::InvalidGeoParams(_) => FFIKernelError::InvalidGeoParamsError,
             KernelError::InvalidStructData(_) => FFIKernelError::InvalidStructDataError,
             KernelError::InternalError(_) => FFIKernelError::InternalError,
@@ -142,6 +147,7 @@ impl From<KernelError> for FFIKernelError {
             KernelError::InvalidLogSegment(_) => FFIKernelError::InvalidLogSegment,
             KernelError::SnapshotHint(_) => FFIKernelError::InvalidSnapshotHint,
             KernelError::FileAlreadyExists(_) => FFIKernelError::FileAlreadyExists,
+            KernelError::TableAlreadyExistsAtPath(_) => FFIKernelError::TableAlreadyExistsAtPath,
             KernelError::Unsupported(_) => FFIKernelError::UnsupportedError,
             KernelError::ParseIntervalError(_) => FFIKernelError::ParseIntervalError,
             KernelError::ChangeDataFeedUnsupported(_) => FFIKernelError::ChangeDataFeedUnsupported,
@@ -235,11 +241,11 @@ impl<T: ExternEngine + ?Sized> AllocateError for &T {
         etype: FFIKernelError,
         msg: KernelStringSlice,
     ) -> *mut EngineError {
-        self.error_allocator().allocate_error(etype, msg)
+        unsafe { self.error_allocator().allocate_error(etype, msg) }
     }
 }
 
-/// Converts a [Result] into an [ExternResult], using the engine's error allocator.
+/// Converts a [`KernelResult`] into an [`ExternResult`], using the engine's error allocator.
 ///
 /// # Safety
 ///
@@ -248,8 +254,8 @@ pub(crate) trait IntoExternResult<T> {
     unsafe fn into_extern_result(self, alloc: &dyn AllocateError) -> ExternResult<T>;
 }
 
-// NOTE: We can't "just" impl From<Result<T>> because we require an error allocator.
-impl<T> IntoExternResult<T> for Result<T> {
+// NOTE: We can't "just" impl From<KernelResult<T>> because we require an error allocator.
+impl<T> IntoExternResult<T> for KernelResult<T> {
     unsafe fn into_extern_result(self, alloc: &dyn AllocateError) -> ExternResult<T> {
         match self {
             Ok(ok) => ExternResult::Ok(ok),
@@ -318,6 +324,7 @@ impl From<EngineExecError> for KernelError {
             FFIKernelError::CheckpointWriteError => KernelError::CheckpointWrite(message),
             FFIKernelError::EngineDataTypeError => KernelError::EngineDataType(message),
             FFIKernelError::GenericError => KernelError::Generic(message),
+            FFIKernelError::CommitRangeError => KernelError::CommitRange(message),
             FFIKernelError::MaxCatalogVersionError => KernelError::MaxCatalogVersion(message),
             FFIKernelError::InternalError => KernelError::InternalError(message),
             FFIKernelError::FileNotFoundError => KernelError::FileNotFound(message),
@@ -332,6 +339,7 @@ impl From<EngineExecError> for KernelError {
             }
             FFIKernelError::InvalidTableLocationError => KernelError::InvalidTableLocation(message),
             FFIKernelError::InvalidDecimalError => KernelError::InvalidDecimal(message),
+            FFIKernelError::InvalidIntervalError => KernelError::InvalidInterval(message),
             FFIKernelError::InvalidGeoParamsError => KernelError::InvalidGeoParams(message),
             FFIKernelError::InvalidStructDataError => KernelError::InvalidStructData(message),
             FFIKernelError::InvalidExpression => KernelError::InvalidExpressionEvaluation(message),
@@ -343,6 +351,9 @@ impl From<EngineExecError> for KernelError {
             }
             .into(),
             FFIKernelError::FileAlreadyExists => KernelError::FileAlreadyExists(message),
+            FFIKernelError::TableAlreadyExistsAtPath => {
+                KernelError::TableAlreadyExistsAtPath(message)
+            }
             FFIKernelError::UnsupportedError => KernelError::Unsupported(message),
             FFIKernelError::InvalidCheckpoint => KernelError::InvalidCheckpoint(message),
             FFIKernelError::SchemaError => KernelError::Schema(message),
@@ -415,6 +426,27 @@ mod error_code_tests {
             FFIKernelError::RowTrackingChangeFeedUnsupported
         );
         assert_eq!(FFIKernelError::RowTrackingChangeFeedUnsupported as i32, 44);
+    }
+
+    #[test]
+    fn commit_range_error_has_stable_ffi_mapping() {
+        let error = KernelError::CommitRange("invalid builder mode".to_string());
+        assert_eq!(
+            error.to_string(),
+            "Commit range error: invalid builder mode"
+        );
+        assert_eq!(
+            FFIKernelError::from(error),
+            FFIKernelError::CommitRangeError
+        );
+        assert_eq!(FFIKernelError::CommitRangeError as i32, 55);
+
+        let error: KernelError =
+            exec_error(FFIKernelError::CommitRangeError, "invalid builder mode").into();
+        assert!(matches!(
+            error,
+            KernelError::CommitRange(message) if message == "invalid builder mode"
+        ));
     }
 
     #[test]
@@ -515,6 +547,36 @@ mod error_code_tests {
 
         let err: KernelError = exec_error(FFIKernelError::MaxCatalogVersionError, "invalid").into();
         assert!(matches!(err, KernelError::MaxCatalogVersion(message) if message == "invalid"));
+    }
+
+    #[test]
+    fn table_already_exists_at_path_has_stable_ffi_mapping() {
+        assert_eq!(
+            FFIKernelError::from(KernelError::TableAlreadyExistsAtPath(
+                "memory:///table".to_string()
+            )),
+            FFIKernelError::TableAlreadyExistsAtPath
+        );
+        assert_eq!(FFIKernelError::TableAlreadyExistsAtPath as i32, 54);
+
+        let err: KernelError =
+            exec_error(FFIKernelError::TableAlreadyExistsAtPath, "memory:///table").into();
+        assert!(matches!(
+            err,
+            KernelError::TableAlreadyExistsAtPath(path) if path == "memory:///table"
+        ));
+    }
+
+    #[test]
+    fn invalid_interval_error_has_stable_ffi_mapping() {
+        assert_eq!(
+            FFIKernelError::from(KernelError::InvalidInterval("invalid".to_string())),
+            FFIKernelError::InvalidIntervalError
+        );
+        assert_eq!(FFIKernelError::InvalidIntervalError as i32, 56);
+
+        let err: KernelError = exec_error(FFIKernelError::InvalidIntervalError, "invalid").into();
+        assert!(matches!(err, KernelError::InvalidInterval(message) if message == "invalid"));
     }
 }
 

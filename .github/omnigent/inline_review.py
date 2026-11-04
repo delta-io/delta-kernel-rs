@@ -80,8 +80,10 @@ def extract_inline_findings(
 
 
 def inline_prompt_instructions(marker: str) -> str:
-    """Build the prompt contract for machine-readable inline findings."""
+    """Return a complete inline-review output contract using the per-run marker."""
     start, end = _inline_markers(marker)
+    review_start = f"<!-- AI_REVIEW_START_{marker} -->"
+    review_end = f"<!-- AI_REVIEW_END_{marker} -->"
     example = json.dumps(
         {
             "findings": [
@@ -107,13 +109,19 @@ def inline_prompt_instructions(marker: str) -> str:
     )
     return f"""
 
-This review will also be published as GitHub inline comments. After the
-human-readable review and before the final end marker, emit this exact
-machine-readable block:
+This review will also be published as GitHub inline comments. For a completed
+review, use this complete response layout, with both the human-readable review
+and the machine-readable block inside the outer review markers:
 
+{review_start}
+<human-readable review, including ### <ID> findings and Summary>
 {start}
 {example}
 {end}
+{review_end}
+
+Do not close the outer review before the machine-readable block. For a completed
+review, the outer review end marker must be the final line of your response.
 
 Include entries for up to {MAX_INLINE_FINDINGS} Blocker/Nit findings, prioritizing
 blockers and then the most useful notes. Findings omitted from this block remain

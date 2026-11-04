@@ -5,9 +5,9 @@ use std::sync::Arc;
 use itertools::Itertools;
 use url::Url;
 
-use super::log_replay::{table_changes_action_iter, TableChangesScanMetadata};
+use super::log_replay::{TableChangesScanMetadata, table_changes_action_iter};
 use super::physical_to_logical::{get_cdf_transform_expr, scan_file_physical_schema};
-use super::resolve_dvs::{resolve_scan_file_dv, ResolvedCdfScanFile};
+use super::resolve_dvs::{ResolvedCdfScanFile, resolve_scan_file_dv};
 use super::scan_file::scan_metadata_to_scan_file;
 use super::{CdfMode, TableChanges};
 use crate::actions::deletion_vector::split_vector;
@@ -16,10 +16,13 @@ use crate::scan::state_info::StateInfo;
 use crate::scan::{PartitionValuesOptions, PhysicalPredicate, StatsOptions};
 use crate::schema::{MetadataColumnSpec, SchemaRef};
 use crate::utils::FoldWithOption as _;
-use crate::{Engine, EngineData, FileMeta, KernelError, KernelResult, PredicateRef, Result};
+use crate::{
+    Engine, EngineData, FileMeta, KernelError, KernelResult, KernelResultIterator, PredicateRef,
+};
 
 /// The result of building a [`TableChanges`] scan over a table. This can be used to get the change
 /// data feed from the table.
+// TODO(#3609): Support connector-provided timezone in CDF scans.
 #[derive(Debug)]
 pub struct TableChangesScan {
     // The [`TableChanges`] that specifies this scan's start and end versions
@@ -108,7 +111,7 @@ impl TableChangesScanBuilder {
     /// provided schema make sense, and to prepare some metadata that the scan will need.  The
     /// [`TableChangesScan`] type itself can be used to fetch the files and associated metadata
     /// required to perform actual data reads.
-    pub fn build(self) -> Result<TableChangesScan> {
+    pub fn build(self) -> KernelResult<TableChangesScan> {
         // Row-tracking CDF requires row-level reconciliation by row IDs, which this
         // scanner does not perform.
         if self.table_changes.mode != CdfMode::ChangeDataFeed {
@@ -160,7 +163,7 @@ impl TableChangesScan {
     fn scan_metadata(
         &self,
         engine: Arc<dyn Engine>,
-    ) -> KernelResult<impl Iterator<Item = KernelResult<TableChangesScanMetadata>>> {
+    ) -> KernelResult<impl KernelResultIterator<TableChangesScanMetadata> + use<>> {
         let commits = self
             .table_changes
             .log_segment
@@ -217,7 +220,7 @@ impl TableChangesScan {
     pub fn execute(
         &self,
         engine: Arc<dyn Engine>,
-    ) -> Result<impl Iterator<Item = Result<Box<dyn EngineData>>>> {
+    ) -> KernelResult<impl KernelResultIterator<Box<dyn EngineData>> + use<>> {
         let scan_metadata = self.scan_metadata(engine.clone())?;
         let scan_files = scan_metadata_to_scan_file(scan_metadata);
 
@@ -257,7 +260,7 @@ fn read_scan_file(
     table_root: &Url,
     state_info: &StateInfo,
     _physical_predicate: Option<PredicateRef>,
-) -> KernelResult<impl Iterator<Item = KernelResult<Box<dyn EngineData>>>> {
+) -> KernelResult<impl KernelResultIterator<Box<dyn EngineData>> + use<>> {
     let ResolvedCdfScanFile {
         scan_file,
         mut selection_vector,
@@ -364,17 +367,17 @@ mod tests {
 
     use rstest::rstest;
 
+    use crate::Predicate;
     use crate::committer::FileSystemCommitter;
     use crate::engine::sync::SyncEngine;
     use crate::expressions::{col, lit};
     use crate::object_store::memory::InMemory;
-    use crate::scan::transform_spec::FieldTransformSpec;
     use crate::scan::PhysicalPredicate;
-    use crate::schema::{schema_ref, MetadataColumnSpec};
-    use crate::table_changes::{TableChanges, COMMIT_VERSION_COL_NAME};
+    use crate::scan::transform_spec::FieldTransformSpec;
+    use crate::schema::{MetadataColumnSpec, schema_ref};
+    use crate::table_changes::{COMMIT_VERSION_COL_NAME, TableChanges};
     use crate::transaction::create_table::create_table;
     use crate::unit_test_utils::assert_result_error_with_message;
-    use crate::Predicate;
 
     #[test]
     fn simple_table_changes_scan_builder() {
@@ -532,7 +535,7 @@ mod tests {
             nullable "id": INTEGER,
             nullable "part": STRING,
         };
-        create_table(url_str, schema, "DefaultEngine")
+        create_table(url_str, schema, "DefaultEngine", true)
             .with_table_properties([("delta.enableChangeDataFeed", "true")])
             .build(&engine, Box::new(FileSystemCommitter::new()))
             .unwrap()

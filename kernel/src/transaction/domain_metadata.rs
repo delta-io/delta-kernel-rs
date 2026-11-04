@@ -1,15 +1,15 @@
 use std::collections::HashSet;
 
-use super::{EngineDataResultIterator, Transaction};
-use crate::actions::{DomainMetadata, INTERNAL_DOMAIN_PREFIX, LOG_DOMAIN_METADATA_SCHEMA};
+use super::{ExecutionMode, Transaction};
+use crate::actions::{DomainMetadata, INTERNAL_DOMAIN_PREFIX};
 use crate::error::KernelError;
 use crate::row_tracking::{
-    RowTrackingDomainMetadata, ROW_TRACKING_DOMAIN_NAME, ROW_TRACKING_INITIAL_HIGH_WATER_MARK,
+    ROW_TRACKING_DOMAIN_NAME, ROW_TRACKING_INITIAL_HIGH_WATER_MARK, RowTrackingDomainMetadata,
 };
 use crate::table_features::TableFeature;
-use crate::{create_row, Engine, KernelResult};
+use crate::{Engine, KernelResult};
 
-impl<S> Transaction<S> {
+impl<STATE, MODE: ExecutionMode> Transaction<STATE, MODE> {
     /// Validate domain metadata operations for both create-table and existing-table transactions.
     ///
     /// Enforces the following rules:
@@ -142,12 +142,12 @@ impl<S> Transaction<S> {
         };
 
         // If the domain requires a feature, validate it's supported
-        if let Some(feature) = required_feature {
-            if !table_config.is_feature_supported(&feature) {
-                return Err(KernelError::generic(format!(
-                    "System domain '{domain}' requires the '{feature}' feature to be enabled"
-                )));
-            }
+        if let Some(feature) = required_feature
+            && !table_config.is_feature_supported(&feature)
+        {
+            return Err(KernelError::generic(format!(
+                "System domain '{domain}' requires the '{feature}' feature to be enabled"
+            )));
         }
 
         Ok(())
@@ -176,6 +176,7 @@ impl<S> Transaction<S> {
             .collect();
         let existing_domains = self
             .read_snapshot()?
+            .reader()
             .get_domain_metadatas_internal(engine, Some(&domains))?;
 
         // Create removal tombstones with pre-image configurations
@@ -191,33 +192,22 @@ impl<S> Transaction<S> {
             .collect())
     }
 
-    /// Generate domain metadata actions with validation. Handle both user and system domains.
+    /// Generates domain metadata actions (assumes domain metadata operations have already
+    /// been validated)
     ///
-    /// Returns a tuple of `(action_iter, domain_metadata_vec)`.
-    /// - The action iterator contains EngineData to be written to the commit file (`00N.json`).
-    /// - The `Vec<DomainMetadata>` is used to construct a [`CrcDelta`](crate::crc::CrcDelta), which
-    ///   feeds the post-commit snapshot with the domain metadata written in this transaction and
-    ///   powers CRC file writes.
+    /// Incorporates the calculated row-tracking high-water mark and returns the domain changes
+    /// for action encoding, commit metadata, and the post-commit
+    /// [`CrcDelta`](crate::crc::CrcDelta). Returns an error if a provided high-water mark is
+    /// below the calculated value or if domain state cannot be read.
     ///
     /// This function may perform an expensive log replay operation if there are any domain
     /// removals. The log replay is required to fetch the previous configuration value for the
     /// domain to preserve in removal tombstones as mandated by the Delta spec.
-    pub(super) fn generate_domain_metadata_actions<'a>(
-        &'a self,
-        engine: &'a dyn Engine,
+    pub(super) fn generate_domain_metadata_actions(
+        &self,
+        engine: &dyn Engine,
         row_tracking_high_watermark: Option<RowTrackingDomainMetadata>,
-    ) -> KernelResult<(EngineDataResultIterator<'a>, Vec<DomainMetadata>)> {
-        let is_create = self.is_create_table();
-
-        // Validate domain operations (includes feature validation)
-        self.validate_domain_metadata_operations()?;
-
-        if is_create {
-            // user_domain_removals already validated above, but be explicit
-            debug_assert!(self.user_domain_removals.is_empty());
-        }
-
-        // Generate removal actions (empty for create-table due to validation above)
+    ) -> KernelResult<Vec<DomainMetadata>> {
         let removal_actions = self.generate_user_domain_removal_actions(engine)?;
 
         let row_tracking_high_watermark =
@@ -226,6 +216,7 @@ impl<S> Transaction<S> {
                     Some(metadata) => metadata.high_water_mark(),
                     None => self
                         .read_snapshot()?
+                        .reader()
                         .get_row_tracking_high_water_mark(engine)?
                         .unwrap_or(ROW_TRACKING_INITIAL_HIGH_WATER_MARK),
                 };
@@ -256,14 +247,21 @@ impl<S> Transaction<S> {
             .chain(removal_actions)
             .collect();
 
-        let schema = LOG_DOMAIN_METADATA_SCHEMA.clone();
-
-        let dm_actions_iter: Vec<_> = dm_actions_vec
-            .iter()
-            .cloned()
-            .map(|dm| create_row(engine, schema.clone(), dm))
-            .collect();
-
-        Ok((Box::new(dm_actions_iter.into_iter()), dm_actions_vec))
+        Ok(dm_actions_vec)
     }
+}
+
+/// Returns the unique domains, or the caller's error for the first duplicate.
+pub(super) fn validate_unique_domains<'a>(
+    domains: impl IntoIterator<Item = &'a str>,
+    duplicate_error: impl FnOnce(&str) -> KernelError,
+) -> KernelResult<HashSet<&'a str>> {
+    let domains = domains.into_iter();
+    let mut seen = HashSet::with_capacity(domains.size_hint().0);
+    for domain in domains {
+        if !seen.insert(domain) {
+            return Err(duplicate_error(domain));
+        }
+    }
+    Ok(seen)
 }

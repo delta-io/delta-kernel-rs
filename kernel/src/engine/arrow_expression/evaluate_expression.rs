@@ -10,12 +10,12 @@ use tracing::warn;
 use super::timestamp_timezone::TimestampTimezone;
 use crate::arrow::array::types::*;
 use crate::arrow::array::{
-    self as arrow_array, make_array, new_null_array, Array, ArrayBuilder, ArrayData, ArrayRef,
-    AsArray, BooleanArray, Datum, ListArray, MapArray, MutableArrayData, NullBufferBuilder,
-    RecordBatch, StringArray, StructArray,
+    self as arrow_array, Array, ArrayBuilder, ArrayData, ArrayRef, AsArray, BooleanArray, Datum,
+    ListArray, MapArray, MutableArrayData, NullBufferBuilder, RecordBatch, StringArray,
+    StructArray, make_array, new_null_array,
 };
 use crate::arrow::buffer::{NullBuffer, OffsetBuffer};
-use crate::arrow::compute::kernels::cast_utils::{string_to_datetime, Parser};
+use crate::arrow::compute::kernels::cast_utils::{Parser, string_to_datetime};
 use crate::arrow::compute::kernels::cmp::{distinct, eq, gt, gt_eq, lt, lt_eq, neq, not_distinct};
 use crate::arrow::compute::kernels::comparison::in_list_utf8;
 use crate::arrow::compute::kernels::numeric::{add, div, mul, sub};
@@ -27,16 +27,16 @@ use crate::arrow::datatypes::{
     Schema as ArrowSchema, TimeUnit,
 };
 use crate::arrow::error::ArrowError;
-use crate::arrow::json::writer::{make_encoder, EncoderOptions};
 use crate::arrow::json::StructMode;
+use crate::arrow::json::writer::{EncoderOptions, make_encoder};
 use crate::delta_kernel_derive::internal_api;
-use crate::engine::arrow_conversion::{TryFromKernel, TryIntoArrow, LIST_ARRAY_ROOT};
+use crate::engine::arrow_conversion::{LIST_ARRAY_ROOT, TryFromKernel, TryIntoArrow};
 use crate::engine::arrow_expression::opaque::{
     ArrowOpaqueExpressionOpAdaptor, ArrowOpaquePredicateOpAdaptor,
 };
 use crate::engine::arrow_utils::{list_type_with_element, parse_json_impl, prim_array_cmp};
-use crate::engine::ensure_data_types::{ensure_data_types, ValidationMode};
-use crate::error::{KernelError, Result};
+use crate::engine::ensure_data_types::{ValidationMode, ensure_data_types};
+use crate::error::{KernelError, KernelResult};
 use crate::expressions::{
     BinaryExpression, BinaryExpressionOp, BinaryPredicate, BinaryPredicateOp, Expression,
     ExpressionRef, ExpressionStructPatch, JunctionPredicate, JunctionPredicateOp, OpaqueExpression,
@@ -44,7 +44,6 @@ use crate::expressions::{
     UnaryPredicateOp, VariadicExpression, VariadicExpressionOp,
 };
 use crate::schema::{DataType, PrimitiveType, StructField, StructType};
-use crate::KernelResult;
 
 #[internal_api]
 pub(crate) trait ProvidesColumnByName {
@@ -89,7 +88,7 @@ impl ProvidesColumnByName for StructArray {
 pub(crate) fn extract_column(
     parent: &dyn ProvidesColumnByName,
     col: &[impl AsRef<str>],
-) -> Result<ArrayRef> {
+) -> KernelResult<ArrayRef> {
     Ok(extract_column_ref(parent, col)?.clone())
 }
 
@@ -98,7 +97,7 @@ pub(crate) fn extract_column(
 pub(crate) fn extract_column_ref<'a>(
     mut parent: &'a dyn ProvidesColumnByName,
     col: &[impl AsRef<str>],
-) -> Result<&'a ArrayRef> {
+) -> KernelResult<&'a ArrayRef> {
     let mut field_names = col.iter();
     let mut field_name = match field_names.next() {
         Some(name) => name.as_ref(),
@@ -281,7 +280,7 @@ pub fn evaluate_expression(
     expression: &Expression,
     batch: &RecordBatch,
     result_type: Option<&DataType>,
-) -> Result<ArrayRef> {
+) -> KernelResult<ArrayRef> {
     use BinaryExpressionOp::*;
     use Expression::*;
     use UnaryExpressionOp::*;
@@ -323,7 +322,7 @@ pub fn evaluate_expression(
             let left_arr = evaluate_expression(left.as_ref(), batch, None)?;
             let right_arr = evaluate_expression(right.as_ref(), batch, None)?;
 
-            type Operation = fn(&dyn Datum, &dyn Datum) -> Result<ArrayRef, ArrowError>;
+            type Operation = fn(&dyn Datum, &dyn Datum) -> KernelResult<ArrayRef, ArrowError>;
             let eval: Operation = match op {
                 Plus => add,
                 Minus => sub,
@@ -618,7 +617,7 @@ pub fn evaluate_predicate(
     predicate: &Predicate,
     batch: &RecordBatch,
     inverted: bool,
-) -> Result<BooleanArray> {
+) -> KernelResult<BooleanArray> {
     use BinaryPredicateOp::*;
     use Predicate::*;
 
@@ -661,13 +660,12 @@ pub fn evaluate_predicate(
 
                     let right = evaluate_expression(right, batch, None)?;
                     let right = arrow_convert_to_non_view_type(right)?;
-                    if let Some(string_arr) = left.as_string_opt::<i32>() {
-                        if let Some(list_arr) = right.as_list_opt::<i32>() {
-                            if list_arr.value_type() == ArrowDataType::Utf8 {
-                                let result = in_list_utf8(string_arr, list_arr)?;
-                                return Ok(result);
-                            }
-                        }
+                    if let Some(string_arr) = left.as_string_opt::<i32>()
+                        && let Some(list_arr) = right.as_list_opt::<i32>()
+                        && list_arr.value_type() == ArrowDataType::Utf8
+                    {
+                        let result = in_list_utf8(string_arr, list_arr)?;
+                        return Ok(result);
                     }
 
                     use ArrowDataType::*;
@@ -754,7 +752,8 @@ pub fn evaluate_predicate(
             // In case of an empty junction, we return a default value of TRUE (FALSE) for AND (OR),
             // as a "hidden" extra child: AND(TRUE, ...) = AND(...) and OR(FALSE, ...) = OR(...).
             use JunctionPredicateOp::*;
-            type Operation = fn(&BooleanArray, &BooleanArray) -> Result<BooleanArray, ArrowError>;
+            type Operation =
+                fn(&BooleanArray, &BooleanArray) -> KernelResult<BooleanArray, ArrowError>;
             let (reducer, default): (Operation, _) = match (op, inverted) {
                 (And, false) | (Or, true) => (and_kleene, true),
                 (Or, false) | (And, true) => (or_kleene, false),
@@ -794,7 +793,7 @@ const STATS_TIMESTAMP_NTZ_FORMAT: &str = "%Y-%m-%dT%H:%M:%S%.3f";
 
 /// Converts a StructArray to JSON-encoded strings
 #[internal_api]
-pub(crate) fn to_json(input: &dyn Datum) -> Result<ArrayRef, ArrowError> {
+pub(crate) fn to_json(input: &dyn Datum) -> KernelResult<ArrayRef, ArrowError> {
     let (array_ref, _is_scalar) = input.get();
     match array_ref.data_type() {
         ArrowDataType::Struct(_) => {
@@ -882,7 +881,7 @@ pub(crate) fn to_json(input: &dyn Datum) -> Result<ArrayRef, ArrowError> {
 fn coalesce_arrays(
     arrays: &[ArrayRef],
     result_type: Option<&DataType>,
-) -> Result<ArrayRef, ArrowError> {
+) -> KernelResult<ArrayRef, ArrowError> {
     let Some((first, rest)) = arrays.split_first() else {
         return Err(ArrowError::InvalidArgumentError(
             "The default engine currently does not support empty COALESCE statements".into(),
@@ -1133,12 +1132,12 @@ mod tests {
         DataType as ArrowDataType, Field as ArrowField, Fields, Schema as ArrowSchema,
     };
     use crate::expressions::{
-        col, column_expr_ref, lit, null_lit, ArrayData, BinaryExpressionOp, BinaryPredicateOp,
-        Expression as Expr, ExpressionStructPatchBuilder, JunctionPredicateOp, MapData,
-        MapToStructOptions, Predicate as Pred, StructData,
+        ArrayData, BinaryExpressionOp, BinaryPredicateOp, Expression as Expr,
+        ExpressionStructPatchBuilder, JunctionPredicateOp, MapData, MapToStructOptions,
+        Predicate as Pred, StructData, col, column_expr_ref, lit, null_lit,
     };
     use crate::schema::{
-        schema, schema_ref, ArrayType, DataType, MapType, StructField, StructType,
+        ArrayType, DataType, MapType, StructField, StructType, schema, schema_ref,
     };
     use crate::unit_test_utils::assert_result_error_with_message;
 
@@ -1430,10 +1429,12 @@ mod tests {
         let expr = Expr::struct_patch(patch).unwrap();
         let result =
             evaluate_expression(&expr, &batch, Some(&DataType::from(output_schema.clone())));
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("reference invalid input field names"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("reference invalid input field names")
+        );
 
         // Test unused insertion keys
         let insertion_patch =
@@ -1443,10 +1444,12 @@ mod tests {
         let result2 =
             evaluate_expression(&expr2, &batch, Some(&DataType::from(output_schema.clone())));
         assert!(result2.is_err());
-        assert!(result2
-            .unwrap_err()
-            .to_string()
-            .contains("reference invalid input field names"));
+        assert!(
+            result2
+                .unwrap_err()
+                .to_string()
+                .contains("reference invalid input field names")
+        );
 
         // Test column count mismatch -- too many output schema fields
         let drop_patch = ExpressionStructPatchBuilder::new().drop("a");
@@ -1461,10 +1464,12 @@ mod tests {
         let result3 =
             evaluate_expression(&expr3, &batch, Some(&DataType::from(wrong_output_schema)));
         assert!(result3.is_err());
-        assert!(result3
-            .unwrap_err()
-            .to_string()
-            .contains("Too many fields in output schema"));
+        assert!(
+            result3
+                .unwrap_err()
+                .to_string()
+                .contains("Too many fields in output schema")
+        );
 
         // Test column count mismatch -- too few output schema fields
         let drop_patch = ExpressionStructPatchBuilder::new().drop("a");
@@ -1475,20 +1480,24 @@ mod tests {
         let result3 =
             evaluate_expression(&expr3, &batch, Some(&DataType::from(wrong_output_schema)));
         assert!(result3.is_err());
-        assert!(result3
-            .unwrap_err()
-            .to_string()
-            .contains("Too few fields in output schema"));
+        assert!(
+            result3
+                .unwrap_err()
+                .to_string()
+                .contains("Too few fields in output schema")
+        );
 
         // Test missing output schema
         let patch = ExpressionStructPatchBuilder::new();
         let expr4 = Expr::struct_patch(patch).unwrap();
         let result4 = evaluate_expression(&expr4, &batch, None);
         assert!(result4.is_err());
-        assert!(result4
-            .unwrap_err()
-            .to_string()
-            .contains("Data type is required"));
+        assert!(
+            result4
+                .unwrap_err()
+                .to_string()
+                .contains("Data type is required")
+        );
     }
 
     #[test]
@@ -1556,10 +1565,12 @@ mod tests {
         };
         let expr = Expr::struct_patch(patch).unwrap();
         let result = evaluate_expression(&expr, &batch, Some(&DataType::from(output_schema)));
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("reference invalid input field names"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("reference invalid input field names")
+        );
     }
 
     #[test]
@@ -2839,7 +2850,7 @@ mod tests {
         raw: &str,
         target: DataType,
         timestamp_timezone: Option<&str>,
-    ) -> Result<ArrayRef> {
+    ) -> KernelResult<ArrayRef> {
         let mut builder = MapBuilder::new(None, StringBuilder::new(), StringBuilder::new());
         builder.keys().append_value("ts");
         builder.values().append_value(raw);
@@ -2862,7 +2873,7 @@ mod tests {
         raw: &str,
         target: DataType,
         timestamp_timezone: Option<&str>,
-    ) -> Result<Option<i64>> {
+    ) -> KernelResult<Option<i64>> {
         let field = evaluate_map_to_struct_field(raw, target, timestamp_timezone)?;
         let timestamps = field
             .as_any()

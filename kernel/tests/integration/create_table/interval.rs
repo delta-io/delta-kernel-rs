@@ -1,18 +1,18 @@
 //! Interval-type integration tests for the CreateTable API.
 
+use delta_kernel::KernelResult;
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::expressions::column_name;
-use delta_kernel::schema::{schema_ref, DataType};
+use delta_kernel::schema::{DataType, schema_ref};
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
-use delta_kernel::Result;
 use test_utils::test_table_setup;
 
 #[rstest::rstest]
 fn test_create_table_rejects_interval_clustering(
     #[values(DataType::INTERVAL_YEAR_MONTH, DataType::INTERVAL_DAY_TIME)] interval: DataType,
     #[values(false, true)] nested: bool,
-) -> Result<()> {
+) -> KernelResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
     let (schema, clustering_column) = if nested {
         (
@@ -32,7 +32,7 @@ fn test_create_table_rejects_interval_clustering(
         )
     };
 
-    let result = create_table(&table_path, schema, "Test/1.0")
+    let result = create_table(&table_path, schema, "Test/1.0", true)
         .with_data_layout(DataLayout::Clustered {
             columns: vec![clustering_column],
         })
@@ -80,11 +80,11 @@ mod supported {
         )
             -> SchemaRef,
         #[values("none", "name", "id")] cm_mode: &str,
-    ) -> Result<()> {
+    ) -> KernelResult<()> {
         let (_temp_dir, table_path, engine) = test_table_setup()?;
         let schema = make_schema(interval);
 
-        let _ = create_table(&table_path, schema.clone(), "Test/1.0")
+        let _ = create_table(&table_path, schema.clone(), "Test/1.0", true)
             .with_table_properties(cm_properties(cm_mode))
             .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
             .commit(engine.as_ref())?;

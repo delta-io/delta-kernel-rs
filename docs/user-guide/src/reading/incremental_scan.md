@@ -34,8 +34,8 @@ Call `incremental_scan_builder(base_version)` on a `Snapshot`, then `build(engin
 # extern crate delta_kernel_default_engine;
 # use delta_kernel_default_engine::DefaultEngine;
 # use delta_kernel_default_engine::storage::store_from_url;
-# use delta_kernel::{Result, Snapshot};
-# fn example() -> Result<()> {
+# use delta_kernel::{KernelResult, Snapshot};
+# fn example() -> KernelResult<()> {
 # let url = delta_kernel::try_parse_uri("/tmp/table")?;
 # let store = store_from_url(&url)?;
 # let engine = DefaultEngine::builder(store).build();
@@ -71,10 +71,10 @@ from a full scan:
 # use std::sync::Arc;
 # use delta_kernel_default_engine::DefaultEngine;
 # use delta_kernel_default_engine::storage::store_from_url;
-# use delta_kernel::{Result, Snapshot};
+# use delta_kernel::{KernelResult, Snapshot};
 # use delta_kernel::incremental_scan::IncrementalScanStream;
 # fn consume(_: IncrementalScanStream) {}
-# fn example() -> Result<()> {
+# fn example() -> KernelResult<()> {
 # let url = delta_kernel::try_parse_uri("/tmp/table")?;
 # let store = store_from_url(&url)?;
 # let engine = DefaultEngine::builder(store).build();
@@ -99,6 +99,22 @@ match target.clone().incremental_scan_builder(base_version).build(&engine)? {
 > retains commits back to your `base_version`. Treating it as an error strands your cache with
 > no way to advance.
 
+### Predicate pushdown
+
+Use `with_predicate` for best-effort data skipping on added files, based on file statistics and
+partition values. You must still apply the predicate when reading the surviving files.
+
+Use `with_partition_values` with `PartitionValuesOptions::with_timestamp_timezone` to configure
+offset-less `TIMESTAMP` partition parsing during data skipping. See
+[Typed partition values](./scan_metadata.md#typed-partition-values) for timezone requirements.
+
+An invalid timezone doesn't cause `build()` to fail. The error only surfaces during stream
+consumption, when data skipping evaluates a partition predicate, even for non-`TIMESTAMP` partition
+columns.
+
+If you get an invalid-timezone error, correct the timezone before rebuilding; retrying with the same
+configuration will fail again.
+
 ## Consuming the stream
 
 `IncrementalScanStream` yields the live added files as `FilteredEngineData` batches, newest
@@ -120,8 +136,8 @@ the live added and removed file keys:
 # extern crate delta_kernel_default_engine;
 # use delta_kernel_default_engine::DefaultEngine;
 # use delta_kernel_default_engine::storage::store_from_url;
-# use delta_kernel::{Result, Snapshot};
-# fn example() -> Result<()> {
+# use delta_kernel::{KernelResult, Snapshot};
+# fn example() -> KernelResult<()> {
 # let url = delta_kernel::try_parse_uri("/tmp/table")?;
 # let store = store_from_url(&url)?;
 # let engine = DefaultEngine::builder(store).build();
@@ -188,9 +204,9 @@ both `removes` and `duplicate_adds`:
 # use std::collections::HashSet;
 # use delta_kernel_default_engine::DefaultEngine;
 # use delta_kernel_default_engine::storage::store_from_url;
-# use delta_kernel::{Result, Snapshot};
+# use delta_kernel::{KernelResult, Snapshot};
 # use delta_kernel::log_replay::FileActionKey;
-# fn example() -> Result<()> {
+# fn example() -> KernelResult<()> {
 # let url = delta_kernel::try_parse_uri("/tmp/table")?;
 # let store = store_from_url(&url)?;
 # let engine = DefaultEngine::builder(store).build();
@@ -254,12 +270,19 @@ miss them. See [Reading Catalog-Managed Tables](../catalog_managed/reading.md).
 
 The incremental scan is narrower than a full scan. Know these limits before you build on it.
 
-### No predicate or column pushdown
+### No column projection
 
-Unlike `scan_builder`, the incremental scan builder takes no predicate and no projection. It
-reports every added and removed file in the range, so you can't push data skipping or column
-selection into it. Apply any file-level or row-level filtering in your connector after the scan
-returns.
+Unlike `scan_builder`, the incremental scan builder takes no projection.
+
+### Predicates don't filter Removes
+
+Predicates only filter added files. Remove actions remain unfiltered so you can drop stale cached
+entries.
+
+### No parsed partition values
+
+Incremental scans return raw partition maps; `PartitionValuesOptions::with_struct()` isn't
+supported.
 
 ### In-range metadata changes aren't surfaced
 

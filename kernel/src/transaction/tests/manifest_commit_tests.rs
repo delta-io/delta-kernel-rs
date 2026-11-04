@@ -1,22 +1,25 @@
 //! Tests for `adaptiveMetadata-preview` manifest (content-tree) commits and root manifest file
 //! commits.
 
-use super::super::{ManifestCommitState, ManifestWrite, SchemaOperation, Transaction};
+use super::super::{ManifestCommitState, ManifestWrite, Transaction, UpdateTableOperation};
 use super::{add_dummy_file, create_existing_table_txn};
 use crate::actions::{DomainMetadata, LOG_DOMAIN_METADATA_SCHEMA};
+use crate::committer::FileSystemCommitter;
 use crate::engine::arrow_data::ArrowEngineData;
 use crate::schema::{DataType, StructField};
 use crate::snapshot::Snapshot;
 use crate::table_configuration::TableConfiguration;
-use crate::table_features::TableFeature;
+use crate::table_features::{TableFeature, find_max_column_id_in_schema};
+use crate::table_properties::COLUMN_MAPPING_MAX_COLUMN_ID;
 use crate::unit_test_utils::adaptive_metadata_fixtures::{
-    minimal_checkpoint_action, setup_table, write_commit,
+    minimal_checkpoint_action, setup_table, write_commit_after_manifest_commit,
+    write_manifest_commit,
 };
 use crate::unit_test_utils::{
-    assert_result_error_with_message, create_valid_add_file_batch, MockProtocolBuilder,
-    MockTableConfigurationBuilder,
+    MockProtocolBuilder, MockTableConfigurationBuilder, assert_result_error_with_message,
+    create_valid_add_file_batch,
 };
-use crate::{create_row, FileMeta, Result};
+use crate::{FileMeta, KernelError, KernelResult, create_row};
 
 fn adaptive_table_config() -> TableConfiguration {
     MockTableConfigurationBuilder::new()
@@ -41,7 +44,7 @@ fn dummy_root_manifest_file_meta(txn: &Transaction) -> FileMeta {
 // === with_root_manifest_file staging ===
 
 #[test]
-fn with_root_manifest_file_rejects_non_adaptive_table() -> Result<()> {
+fn with_root_manifest_file_rejects_non_adaptive_table() -> KernelResult<()> {
     let (_engine, txn, _tempdir) = create_existing_table_txn()?;
     let file = dummy_root_manifest_file_meta(&txn);
     assert_result_error_with_message(
@@ -52,7 +55,7 @@ fn with_root_manifest_file_rejects_non_adaptive_table() -> Result<()> {
 }
 
 #[test]
-fn validate_manifest_write_allows_root_manifest_on_adaptive_table() -> Result<()> {
+fn validate_manifest_write_allows_root_manifest_on_adaptive_table() -> KernelResult<()> {
     let (_engine, mut txn, _tempdir) = create_existing_table_txn()?;
     txn.effective_table_config = adaptive_table_config();
     let file = dummy_root_manifest_file_meta(&txn);
@@ -62,7 +65,7 @@ fn validate_manifest_write_allows_root_manifest_on_adaptive_table() -> Result<()
 }
 
 #[test]
-fn validate_manifest_write_rejects_root_manifest_with_file_actions() -> Result<()> {
+fn validate_manifest_write_rejects_root_manifest_with_file_actions() -> KernelResult<()> {
     let (_engine, mut txn, _tempdir) = create_existing_table_txn()?;
     txn.effective_table_config = adaptive_table_config();
     let file = dummy_root_manifest_file_meta(&txn);
@@ -78,7 +81,7 @@ fn validate_manifest_write_rejects_root_manifest_with_file_actions() -> Result<(
 // === with_manifest_commit staging ===
 
 #[test]
-fn with_manifest_commit_succeeds_on_adaptive_table() -> Result<()> {
+fn with_manifest_commit_succeeds_on_adaptive_table() -> KernelResult<()> {
     let (engine, mut txn, _tempdir) = create_existing_table_txn()?;
     txn.effective_table_config = adaptive_table_config();
     txn.with_manifest_commit(engine.as_ref())?;
@@ -87,7 +90,7 @@ fn with_manifest_commit_succeeds_on_adaptive_table() -> Result<()> {
 }
 
 #[test]
-fn with_manifest_commit_rejects_non_adaptive_table() -> Result<()> {
+fn with_manifest_commit_rejects_non_adaptive_table() -> KernelResult<()> {
     let (engine, mut txn, _tempdir) = create_existing_table_txn()?;
     let result = txn.with_manifest_commit(engine.as_ref());
     assert_result_error_with_message(result, "adaptiveMetadata-preview");
@@ -98,7 +101,7 @@ fn with_manifest_commit_rejects_non_adaptive_table() -> Result<()> {
 // in a non-adaptive config after staging: the second call succeeds only if it skips try_new (which
 // rejects non-adaptive configs).
 #[test]
-fn with_manifest_commit_reuses_state_on_repeated_calls() -> Result<()> {
+fn with_manifest_commit_reuses_state_on_repeated_calls() -> KernelResult<()> {
     let (engine, mut txn, _tempdir) = create_existing_table_txn()?;
     txn.effective_table_config = adaptive_table_config();
     txn.with_manifest_commit(engine.as_ref())?;
@@ -113,7 +116,7 @@ fn with_manifest_commit_reuses_state_on_repeated_calls() -> Result<()> {
 // === mutual exclusion (enforced when staging) ===
 
 #[test]
-fn with_manifest_commit_rejects_when_root_manifest_staged() -> Result<()> {
+fn with_manifest_commit_rejects_when_root_manifest_staged() -> KernelResult<()> {
     let (engine, mut txn, _tempdir) = create_existing_table_txn()?;
     txn.effective_table_config = adaptive_table_config();
     let file = dummy_root_manifest_file_meta(&txn);
@@ -126,7 +129,7 @@ fn with_manifest_commit_rejects_when_root_manifest_staged() -> Result<()> {
 }
 
 #[test]
-fn with_root_manifest_file_rejects_when_manifest_commit_staged() -> Result<()> {
+fn with_root_manifest_file_rejects_when_manifest_commit_staged() -> KernelResult<()> {
     let (engine, mut txn, _tempdir) = create_existing_table_txn()?;
     txn.effective_table_config = adaptive_table_config();
     txn.with_manifest_commit(engine.as_ref())?;
@@ -139,13 +142,13 @@ fn with_root_manifest_file_rejects_when_manifest_commit_staged() -> Result<()> {
 
 // A `checkpoint` action covering the snapshot's own version is fine to start a manifest commit on.
 #[test]
-fn manifest_commit_allows_checkpoint_covering_the_snapshot() -> Result<()> {
+fn manifest_commit_allows_checkpoint_covering_the_snapshot() -> KernelResult<()> {
     let (engine, table_root) = setup_table()?;
-    write_commit(
+    write_manifest_commit(
         &engine,
         &table_root,
         1,
-        minimal_checkpoint_action("metadata/root-v1.parquet", 1)?.into_engine_data(&engine)?,
+        minimal_checkpoint_action("metadata/root-v1.parquet", 1)?,
     )?;
     let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
     assert_eq!(snapshot.version(), 1);
@@ -156,20 +159,21 @@ fn manifest_commit_allows_checkpoint_covering_the_snapshot() -> Result<()> {
 
 // A delta commit landing after the last `checkpoint` action is not yet supported.
 #[test]
-fn manifest_commit_rejects_delta_commits_after_last_checkpoint() -> Result<()> {
+fn manifest_commit_rejects_delta_commits_after_last_checkpoint() -> KernelResult<()> {
     let (engine, table_root) = setup_table()?;
-    write_commit(
+    write_manifest_commit(
         &engine,
         &table_root,
         1,
-        minimal_checkpoint_action("metadata/root-v1.parquet", 1)?.into_engine_data(&engine)?,
+        minimal_checkpoint_action("metadata/root-v1.parquet", 1)?,
     )?;
     // A later delta commit bumps the snapshot past the checkpoint version.
     let domain_metadata = DomainMetadata::new("test.domain".to_string(), "{}".to_string());
-    write_commit(
+    write_commit_after_manifest_commit(
         &engine,
         &table_root,
         2,
+        1,
         create_row(&engine, LOG_DOMAIN_METADATA_SCHEMA.clone(), domain_metadata)?,
     )?;
     let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
@@ -185,7 +189,7 @@ fn manifest_commit_rejects_delta_commits_after_last_checkpoint() -> Result<()> {
 // The leaf writer's physical schema must come from the effective table config passed to try_new,
 // not from the read snapshot (which may predate schema evolution).
 #[test]
-fn new_leaf_node_writer_uses_effective_config_schema_not_snapshot() -> Result<()> {
+fn new_leaf_node_writer_uses_effective_config_schema_not_snapshot() -> KernelResult<()> {
     let (engine, table_root) = setup_table()?;
     let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
     let config = adaptive_table_config();
@@ -195,39 +199,47 @@ fn new_leaf_node_writer_uses_effective_config_schema_not_snapshot() -> Result<()
     Ok(())
 }
 
-#[test]
-fn with_schema_changes_rejects_after_staging_manifest_commit() -> Result<()> {
-    let (engine, mut txn, _tempdir) = create_existing_table_txn()?;
-    txn.effective_table_config = adaptive_table_config();
-    txn.with_manifest_commit(engine.as_ref())?;
-    let result = txn.with_schema_changes(vec![SchemaOperation::add_column(
-        None,
-        StructField::nullable("fresh_column", DataType::INTEGER),
-    )]);
-    assert_result_error_with_message(result, "after staging a manifest commit");
-    Ok(())
-}
-
-#[test]
-fn manifest_commit_after_schema_change_uses_evolved_schema() -> Result<()> {
-    let (engine, mut txn, _tempdir) = create_existing_table_txn()?;
-    txn.effective_table_config = adaptive_table_config();
-    let mut txn = txn.with_schema_changes(vec![SchemaOperation::add_column(
-        None,
-        StructField::nullable("fresh_column", DataType::INTEGER),
-    )])?;
+#[rstest::rstest]
+#[case(UpdateTableOperation::Write)]
+#[case(UpdateTableOperation::AlterTable)]
+fn manifest_commit_after_schema_change_uses_evolved_schema(
+    #[case] operation: UpdateTableOperation,
+) -> KernelResult<()> {
+    let (engine, table_root) = setup_table()?;
+    let mut checkpoint = minimal_checkpoint_action("metadata/root-v1.parquet", 1)?;
+    let max_column_id = find_max_column_id_in_schema(&checkpoint.metadata.parse_schema()?)
+        .expect("checkpoint fixture uses column mapping");
+    checkpoint.metadata = checkpoint
+        .metadata
+        .with_configuration_entry(COLUMN_MAPPING_MAX_COLUMN_ID, max_column_id.to_string());
+    write_manifest_commit(&engine, &table_root, 1, checkpoint)?;
+    let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
+    let initial_schema = snapshot.table_configuration().physical_schema();
+    let is_alter = operation == UpdateTableOperation::AlterTable;
+    let mut txn = snapshot
+        .update_table(operation, "test-engine", !is_alter)
+        .add_column(StructField::nullable("fresh_column", DataType::INTEGER))
+        .build(&engine, Box::new(FileSystemCommitter::new()))?;
     let expected = txn.effective_table_config.physical_schema();
+    assert_ne!(expected, initial_schema);
     let writer = txn
-        .with_manifest_commit(engine.as_ref())?
-        .new_leaf_node_writer(engine.as_ref());
+        .with_manifest_commit(&engine)?
+        .new_leaf_node_writer(&engine);
     assert_eq!(writer.physical_schema(), &expected);
+    if is_alter {
+        let error = txn.commit(&engine).unwrap_err();
+        assert!(
+            matches!(&error, KernelError::InvalidTransactionState(message)
+            if message == "ALTER TABLE cannot include manifest writes")
+        );
+    }
     Ok(())
 }
 
 // === commit ===
 
 #[test]
-fn commit_rejects_pending_manifest_commit() -> Result<()> {
+fn commit_rejects_pending_manifest_commit() -> KernelResult<()> {
     let (engine, mut txn, _tempdir) = create_existing_table_txn()?;
     txn.effective_table_config = adaptive_table_config();
     txn.with_manifest_commit(engine.as_ref())?;
@@ -238,7 +250,7 @@ fn commit_rejects_pending_manifest_commit() -> Result<()> {
 // === leaf writer ===
 
 #[test]
-fn leaf_writer_ops_unsupported() -> Result<()> {
+fn leaf_writer_ops_unsupported() -> KernelResult<()> {
     let (engine, mut txn, _tempdir) = create_existing_table_txn()?;
     txn.effective_table_config = adaptive_table_config();
     let mut leaf_writer = txn
