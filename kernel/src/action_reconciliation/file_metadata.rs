@@ -37,7 +37,7 @@ pub(crate) struct StatsTransformConfig {
 }
 
 impl StatsTransformConfig {
-    pub(super) fn from_table_properties(properties: &TableProperties) -> Self {
+    pub(crate) fn from_table_properties(properties: &TableProperties) -> Self {
         Self {
             write_stats_as_json: properties.should_write_stats_as_json(),
             write_stats_as_struct: properties.should_write_stats_as_struct(),

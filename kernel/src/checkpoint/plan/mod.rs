@@ -2,9 +2,9 @@
 
 use std::sync::Arc;
 
-use super::checkpoint_transform::build_checkpoint_transform;
 use super::{CheckpointShape, CheckpointWriter};
 use crate::action_reconciliation::RetentionCalculator as _;
+use crate::action_reconciliation::file_metadata::build_checkpoint_transform;
 use crate::action_reconciliation::plan::{ActionReplay, ReplayGroup, VERSION, checkpoint_actions};
 use crate::actions::{CHECKPOINT_METADATA_NAME, CheckpointMetadata};
 use crate::expressions::{Expression as Expr, Predicate, col, lit, null_lit};

@@ -22,6 +22,7 @@ use std::time::Duration;
 use crate::table_properties::TableProperties;
 use crate::{KernelError, KernelResult};
 
+pub(crate) mod file_metadata;
 pub(crate) mod log_replay;
 #[cfg(feature = "declarative-plans")]
 pub(crate) mod plan;

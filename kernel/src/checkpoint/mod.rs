@@ -108,6 +108,9 @@ use itertools::Itertools;
 use tracing::info;
 use url::Url;
 
+use crate::action_reconciliation::file_metadata::{
+    StatsTransformConfig, build_checkpoint_read_schema, build_checkpoint_transform,
+};
 use crate::action_reconciliation::log_replay::{
     ActionReconciliationBatch, ActionReconciliationProcessor,
 };
@@ -136,7 +139,6 @@ use crate::{
 
 #[cfg(feature = "declarative-plans")]
 mod checkpoint_shape;
-mod checkpoint_transform;
 pub(crate) mod collation_stats;
 #[cfg(feature = "declarative-plans")]
 mod plan;
@@ -145,9 +147,6 @@ mod sidecar;
 #[cfg(feature = "declarative-plans")]
 #[allow(unused_imports)]
 pub(crate) use checkpoint_shape::{CheckpointShape, CheckpointType};
-use checkpoint_transform::{
-    StatsTransformConfig, build_checkpoint_read_schema, build_checkpoint_transform,
-};
 use sidecar::{SidecarSplitter, SingleSidecarDataIterator, create_sidecar_action_batch};
 #[cfg(test)]
 mod tests;
