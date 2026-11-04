@@ -149,7 +149,10 @@ impl LogSegment {
         engine: &dyn Engine,
     ) -> KernelResult<PmCandidate> {
         #[cfg(all(feature = "adaptive-metadata-in-dev", feature = "declarative-plans"))]
-        if let (Some(plan_executor), Some(_)) = (engine.plan_executor(), self.newest_commit()) {
+        if let (Some(plan_executor), Some(_)) = (
+            engine.plan_executor(),
+            self.newest_commit_after_checkpoint(),
+        ) {
             let executor = plan_executor.as_ref();
             let newest_pm_candidate = self
                 .replay_for_pm_via_plan(executor, PmPlanSegment::NewestCommit)?
@@ -356,11 +359,11 @@ impl LogSegment {
         }))
     }
 
-    /// The commit at `end_version`, if this segment lists it. Unlike `listed.latest_commit_file`,
-    /// this is `None` when the segment ends on a checkpoint, so P&M replay never reads a commit
-    /// that the checkpoint already covers.
+    /// The commit at `end_version`, or `None` when the segment ends on a checkpoint. Unlike
+    /// `listed.latest_commit_file`, this skips the commit at the checkpoint version, since the
+    /// checkpoint already covers it.
     #[cfg(all(feature = "adaptive-metadata-in-dev", feature = "declarative-plans"))]
-    fn newest_commit(&self) -> Option<&ParsedLogPath> {
+    fn newest_commit_after_checkpoint(&self) -> Option<&ParsedLogPath> {
         self.listed
             .ascending_commit_files
             .last()
@@ -430,14 +433,14 @@ impl PmPlanSegment {
                 // Log compactions drop commitInfo, so read the newest commit itself when one
                 // covers it. Only its commitInfo is needed; the compaction is still generally
                 // cheaper to read than the commits it replaces.
-                if let Some(newest_commit) = log_segment.newest_commit() {
+                if let Some(newest_commit) = log_segment.newest_commit_after_checkpoint() {
                     if !paths.contains(&newest_commit) {
                         paths.push(newest_commit);
                     }
                 }
                 paths
             }
-            Self::NewestCommit => Vec::from_iter(log_segment.newest_commit()),
+            Self::NewestCommit => Vec::from_iter(log_segment.newest_commit_after_checkpoint()),
             Self::OlderCommits {
                 oldest_exclusive,
                 manifest_commit,
