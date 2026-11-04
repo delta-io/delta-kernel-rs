@@ -1692,8 +1692,8 @@ impl Snapshot {
 
         require!(
             unpublished_catalog_commits
-                .windows(2)
-                .all(|commits| commits[0].version() + 1 == commits[1].version()),
+                .array_windows()
+                .all(|[a, b]| a.version() + 1 == b.version()),
             KernelError::generic(format!(
                 "Expected ordered and contiguous unpublished catalog commits. \
                  Got: {unpublished_catalog_commits:?}"

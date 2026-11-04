@@ -779,13 +779,8 @@ pub fn split_vector(
 ) -> Option<Vec<bool>> {
     match vector {
         Some(vector) if split_index < vector.len() => Some(vector.split_off(split_index)),
-        Some(vector) if extend.is_some() => {
-            vector.extend(std::iter::repeat_n(
-                // safety: we just checked `is_some` above
-                #[allow(clippy::unwrap_used)]
-                extend.unwrap(),
-                split_index - vector.len(),
-            ));
+        Some(vector) if let Some(extend) = extend => {
+            vector.extend(std::iter::repeat_n(extend, split_index - vector.len()));
             None
         }
         _ => None,

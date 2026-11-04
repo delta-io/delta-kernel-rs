@@ -119,7 +119,7 @@ where
             scanner.into_scan_batches(engine.clone(), filter.clone())
         }) //Iterator-Result-Iterator-Result
         .flatten_ok() // Iterator-Result-Result
-        .map(|x| x?); // Iterator-Result
+        .map(Result::flatten); // Iterator-Result
     Ok(result)
 }
 

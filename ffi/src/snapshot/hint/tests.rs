@@ -524,8 +524,8 @@ fn assert_exported_paths_and_round_trip(snapshot: Handle<SharedSnapshot>) {
     assert!(
         state
             .files
-            .windows(2)
-            .all(|pair| pair[0].location.as_str() < pair[1].location.as_str())
+            .array_windows()
+            .all(|[a, b]| a.location.as_str() < b.location.as_str())
     );
     assert_eq!(
         state.files,

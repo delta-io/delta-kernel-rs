@@ -284,10 +284,10 @@ fn build_data_skipping_schemas(
         }
         // Requested columns bypass the indexed set and seed the stats schema; predicate refs join
         // the schema so kernel can still prune.
-        (StructStats::Columns { .. }, _) if requested_physical_stats_columns.is_some() => {
-            let mut filter = requested_physical_stats_columns
-                .unwrap_or_default()
-                .to_vec();
+        (StructStats::Columns { .. }, _)
+            if let Some(requested) = requested_physical_stats_columns =>
+        {
+            let mut filter = requested.to_vec();
             union_extra_into_filter(&mut filter, &predicate_refs_physical);
             build_stats_schema(requested_physical_stats_columns, Some(&filter))?
         }

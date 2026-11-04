@@ -1725,7 +1725,7 @@ impl Scan {
             // Iterator<Result<Iterator<Result<Box<dyn EngineData>>>>> to Iterator<Result<Result<Box<dyn EngineData>>>>
             .flatten_ok()
             // Iterator<Result<Result<Box<dyn EngineData>>>> to Iterator<Result<Box<dyn EngineData>>>
-            .map(|x| x?);
+            .map(Result::flatten);
         Ok(result)
     }
 }

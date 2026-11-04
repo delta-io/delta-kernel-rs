@@ -246,7 +246,7 @@ impl TableChangesScan {
                 )
             }) // Iterator-Result-Iterator-Result
             .flatten_ok() // Iterator-Result-Result
-            .map(|x| x?); // Iterator-Result
+            .map(Result::flatten); // Iterator-Result
 
         Ok(result)
     }
