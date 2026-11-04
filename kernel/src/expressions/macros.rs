@@ -11,7 +11,7 @@ use delta_kernel_derive::pub_macro;
 /// segments such as `path("a.b", "c")`, `coalesce`, `and`, `or`, `not`, `is_null`, `is_not_null`,
 /// and `distinct`. Every form returns an `Expression`, including comparisons and predicate calls.
 ///
-/// `struct(field, ...)` constructs a non-null struct, even when all its fields are NULL.
+/// `make_struct(field, ...)` constructs a non-null struct, even when all its fields are NULL.
 /// `guarded_struct(guard, field, ...)` takes a BOOLEAN guard and constructs a struct that is NULL
 /// when the guard evaluates to FALSE or NULL. Both forms accept zero fields. Field names and types
 /// come from the evaluator's result type, in the same order as the field expressions.
@@ -87,8 +87,8 @@ use delta_kernel_derive::pub_macro;
 ///
 /// assert_eq!(
 ///     expr!(coalesce(
-///         guarded_struct(is_not_null(col("id")), col("id"), struct("active")),
-///         struct(0_i64, struct("unknown")),
+///         guarded_struct(is_not_null(col("id")), col("id"), make_struct("active")),
+///         make_struct(0_i64, make_struct("unknown")),
 ///     )),
 ///     Expression::coalesce([
 ///         Expression::struct_with_nullability_from(
@@ -107,7 +107,7 @@ use delta_kernel_derive::pub_macro;
 ///
 /// ```compile_fail
 /// use delta_kernel::expressions::expr;
-/// let _ = expr!(struct(unknown(col("id"))));
+/// let _ = expr!(make_struct(unknown(col("id"))));
 /// ```
 ///
 /// ```compile_fail
@@ -393,16 +393,16 @@ mod tests {
     }
 
     #[rstest]
-    #[case::empty(expr!(struct()), Expression::struct_from(Vec::<Expression>::new()))]
-    #[case::raw_keyword(expr!(r#struct(1_i64)), Expression::struct_from([lit(1_i64)]))]
-    #[case::single(expr!(struct(1_i64)), Expression::struct_from([lit(1_i64)]))]
-    #[case::trailing_comma(expr!(struct(1_i64,)), Expression::struct_from([lit(1_i64)]))]
+    #[case::empty(expr!(make_struct()), Expression::struct_from(Vec::<Expression>::new()))]
+    #[case::raw_identifier(expr!(r#make_struct(1_i64)), Expression::struct_from([lit(1_i64)]))]
+    #[case::single(expr!(make_struct(1_i64)), Expression::struct_from([lit(1_i64)]))]
+    #[case::trailing_comma(expr!(make_struct(1_i64,)), Expression::struct_from([lit(1_i64)]))]
     #[case::multiple(
-        expr!(struct(col("id"), "value", null(LONG),)),
+        expr!(make_struct(col("id"), "value", null(LONG),)),
         Expression::struct_from([col!("id"), lit("value"), null_lit(DataType::LONG)]),
     )]
     #[case::nested(
-        expr!(struct(struct(), struct(col("id"), struct(1_i64)),)),
+        expr!(make_struct(make_struct(), make_struct(col("id"), make_struct(1_i64)),)),
         Expression::struct_from([
             Expression::struct_from(Vec::<Expression>::new()),
             Expression::struct_from([col!("id"), Expression::struct_from([lit(1_i64)])]),
@@ -444,7 +444,7 @@ mod tests {
         ),
     )]
     #[case::coalesce_structs(
-        expr!(coalesce(guarded_struct(col("keep"), col("id")), struct(0_i64))),
+        expr!(coalesce(guarded_struct(col("keep"), col("id")), make_struct(0_i64))),
         Expression::coalesce([
             Expression::struct_with_nullability_from([col!("id")], col!("keep")),
             Expression::struct_from([lit(0_i64)]),
@@ -598,10 +598,10 @@ mod tests {
             guarded_struct(
                 lit(next() == 1 && keep),
                 lit(next()),
-                struct(lit(next())),
+                make_struct(lit(next())),
                 guarded_struct(lit(next() == 4), lit(next())),
             ),
-            struct(lit(next())),
+            make_struct(lit(next())),
         ));
         assert_eq!(calls, 6);
         assert_eq!(
@@ -628,7 +628,7 @@ mod tests {
             };
         }
         assert_eq!(
-            expr!(struct(
+            expr!(make_struct(
                 lit(rust_argument!(struct(7_i64))),
                 path(rust_argument!(struct("field"))),
             )),
@@ -717,7 +717,7 @@ mod tests {
         assert_eq!(forward!(-7), lit(-7));
         assert_eq!(forward!("active"), lit("active"));
         assert_eq!(
-            forward!(guarded_struct(true, r#struct(1_i64))),
+            forward!(guarded_struct(true, r#make_struct(1_i64))),
             Expression::struct_with_nullability_from(
                 [Expression::struct_from([lit(1_i64)])],
                 lit(true)
@@ -770,7 +770,7 @@ mod tests {
                     true,
                     lit(__kernel_struct_guard),
                     guarded_struct(false),
-                    struct(),
+                    make_struct(),
                 )),
                 KernelExpression::struct_with_nullability_from(
                     [

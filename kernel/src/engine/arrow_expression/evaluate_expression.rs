@@ -3401,7 +3401,7 @@ mod tests {
         vec![Some(1), Some(2), Some(3), Some(4)],
     )]
     #[case::unguarded_null_fields(
-        expr!(struct(col("a"))),
+        expr!(make_struct(col("a"))),
         vec![None, None, None],
         vec![Some(true), Some(false), None],
         vec![true, true, true],
@@ -3422,7 +3422,7 @@ mod tests {
         vec![Some(1), Some(2), Some(3)],
     )]
     #[case::coalesce_structs(
-        expr!(coalesce(guarded_struct(col("is_valid"), col("a")), struct(99))),
+        expr!(coalesce(guarded_struct(col("is_valid"), col("a")), make_struct(99))),
         vec![Some(1), Some(2), Some(3), None],
         vec![Some(true), Some(false), None, Some(true)],
         vec![true, true, true, true],
@@ -3447,10 +3447,10 @@ mod tests {
     }
 
     #[rstest]
-    #[case::unguarded(expr!(struct()), vec![true, true, true])]
+    #[case::unguarded(expr!(make_struct()), vec![true, true, true])]
     #[case::guarded(expr!(guarded_struct(col("is_valid"))), vec![true, false, false])]
     #[case::coalesced(
-        expr!(coalesce(guarded_struct(col("is_valid")), struct())),
+        expr!(coalesce(guarded_struct(col("is_valid")), make_struct())),
         vec![true, true, true],
     )]
     fn empty_struct_macro_preserves_row_count_and_validity(
@@ -3474,12 +3474,12 @@ mod tests {
 
     #[rstest]
     #[case::guarded_outer(
-        expr!(guarded_struct(col("a") > 0, struct(col("a")))),
+        expr!(guarded_struct(col("a") > 0, make_struct(col("a")))),
         vec![true, false, true, false],
         vec![true, true, true, true],
     )]
     #[case::guarded_inner(
-        expr!(struct(guarded_struct(col("is_valid"), col("a")))),
+        expr!(make_struct(guarded_struct(col("is_valid"), col("a")))),
         vec![true, true, true, true],
         vec![false, true, true, false],
     )]

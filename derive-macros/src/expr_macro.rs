@@ -2,7 +2,7 @@
 //! and comparison syntax; this module restricts calls to the constructors documented by `expr!`.
 //! Arguments to `lit` and `path` remain Rust expressions, so callers can supply computed values.
 
-use proc_macro2::{Delimiter, Group, Span, TokenStream, TokenTree};
+use proc_macro2::{Span, TokenStream};
 use quote::{quote, quote_spanned};
 use syn::ext::IdentExt;
 use syn::parse::{ParseStream, Parser};
@@ -16,7 +16,7 @@ pub(crate) fn expand(input: TokenStream) -> syn::Result<TokenStream> {
     let parser = |input: ParseStream| {
         let kernel: Path = input.parse()?;
         input.parse::<Token![;]>()?;
-        let expr: Expr = syn::parse2(escape_struct_constructor(input.parse()?))?;
+        let expr: Expr = input.parse()?;
         emit(&expr, &kernel)
     };
     parser.parse2(input)
@@ -114,7 +114,7 @@ fn emit_call(call: &ExprCall, kernel: &Path) -> syn::Result<TokenStream> {
     let arity = match name.as_str() {
         "lit" | "null" | "not" | "is_null" | "is_not_null" => Some(1),
         "eq" | "ne" | "lt" | "le" | "gt" | "ge" | "distinct" => Some(2),
-        "coalesce" | "and" | "or" | "path" | "struct" | "guarded_struct" => None,
+        "coalesce" | "and" | "or" | "path" | "make_struct" | "guarded_struct" => None,
         _ => {
             return Err(Error::new_spanned(
                 method,
@@ -197,7 +197,7 @@ fn emit_call(call: &ExprCall, kernel: &Path) -> syn::Result<TokenStream> {
                         ::std::vec::Vec::<#kernel::expressions::Expression>::from([#(#children),*]),
                     )
                 }),
-                "struct" => Ok(quote! {
+                "make_struct" => Ok(quote! {
                     #kernel::expressions::Expression::struct_from(
                         ::std::vec::Vec::<#kernel::expressions::Expression>::from([#(#children),*]),
                     )
@@ -229,41 +229,6 @@ fn emit_call(call: &ExprCall, kernel: &Path) -> syn::Result<TokenStream> {
     }
 }
 
-// syn rejects `struct(...)`, so parse it as `r#struct(...)`.
-// Only lit() and path() forward Rust arguments in emit_call. Keep their argument groups
-// verbatim so caller macros receive the original tokens.
-fn escape_struct_constructor(input: TokenStream) -> TokenStream {
-    let mut tokens = input.into_iter().peekable();
-    let mut escaped = TokenStream::new();
-    while let Some(token) = tokens.next() {
-        match token {
-            TokenTree::Ident(ident) => {
-                let name = ident.unraw().to_string();
-                let ident = if name == "struct" {
-                    Ident::new_raw("struct", ident.span())
-                } else {
-                    ident
-                };
-                escaped.extend([TokenTree::Ident(ident)]);
-                if matches!(name.as_str(), "lit" | "path")
-                    && matches!(tokens.peek(), Some(TokenTree::Group(group))
-                        if group.delimiter() == Delimiter::Parenthesis)
-                {
-                    escaped.extend(tokens.next());
-                }
-            }
-            TokenTree::Group(group) => {
-                let mut escaped_group =
-                    Group::new(group.delimiter(), escape_struct_constructor(group.stream()));
-                escaped_group.set_span(group.span());
-                escaped.extend([TokenTree::Group(escaped_group)]);
-            }
-            other => escaped.extend([other]),
-        }
-    }
-    escaped
-}
-
 // Forwarded `:literal` and `:expr` fragments arrive in invisible groups, which must preserve the
 // same constructor rules as the original tokens. Explicit parentheses remain part of the syntax.
 fn ungroup(mut expr: &Expr) -> &Expr {
@@ -292,9 +257,9 @@ mod tests {
     #[case::extra_binary_arg(quote!(eq("a", 1, 2)), "requires 2 argument")]
     #[case::extra_null_predicate_arg(quote!(is_null("a", "b")), "requires 1 argument")]
     #[case::missing_struct_guard(quote!(guarded_struct()), "requires a guard")]
-    #[case::invalid_struct_field(quote!(struct(value)), "expected an expr! constructor")]
+    #[case::invalid_struct_field(quote!(make_struct(value)), "expected an expr! constructor")]
     #[case::invalid_struct_guard(quote!(guarded_struct(guard, 1)), "expected an expr! constructor")]
-    #[case::unknown_struct_field(quote!(struct(unknown(1))), "unsupported expression call")]
+    #[case::unknown_struct_field(quote!(make_struct(unknown(1))), "unsupported expression call")]
     #[case::unknown_struct_guard(quote!(guarded_struct(unknown(1))), "unsupported expression call")]
     #[case::empty_path(quote!(path()), "at least one column segment")]
     #[case::missing_literal_arg(quote!(lit()), "requires 1 argument")]
@@ -351,7 +316,7 @@ mod tests {
     #[case::missing_operand(quote!("a" >=))]
     #[case::missing_comma(quote!(and("a" > 0 "b" < 1)))]
     #[case::extra_tokens(quote!("a" > 1; "b"))]
-    #[case::missing_struct_comma(quote!(struct(1 2)))]
+    #[case::missing_struct_comma(quote!(make_struct(1 2)))]
     #[case::missing_struct_guard(quote!(guarded_struct(, 1)))]
     fn rejects_structurally_invalid_input(#[case] input: TokenStream) {
         assert!(expand(quote! { kernel; #input }).is_err());
