@@ -443,7 +443,7 @@ mod tests {
         KernelExpressionVisitorState,
     };
     use crate::ffi_test_utils::{
-        assert_extern_result_error_with_message, ok_or_panic, recover_error, ERROR_ALLOCATORS,
+        assert_extern_result_error_with_message, ok_or_panic, recover_error, TEST_ERROR_ALLOCATORS,
     };
     #[cfg(feature = "default-engine-base")]
     use crate::scan::free_scan_metadata_arrow_result;
@@ -471,7 +471,7 @@ mod tests {
                 .unwrap();
         }
         let engine = DefaultEngineBuilder::new(storage.clone()).build();
-        let engine = engine_to_handle(Arc::new(engine), ERROR_ALLOCATORS);
+        let engine = engine_to_handle(Arc::new(engine), TEST_ERROR_ALLOCATORS);
         let table_root = kernel_string_slice!(table_root);
         let builder =
             unsafe { ok_or_panic(get_snapshot_builder(table_root, engine.shallow_copy())) };
@@ -845,7 +845,7 @@ mod tests {
                 state,
                 parts.as_ptr(),
                 parts.len(),
-                &ERROR_ALLOCATORS,
+                &TEST_ERROR_ALLOCATORS,
             ))
         };
         let lit = visit_expression_literal_int(state, 25);
@@ -940,7 +940,7 @@ mod tests {
                 state,
                 parts.as_ptr(),
                 parts.len(),
-                &ERROR_ALLOCATORS,
+                &TEST_ERROR_ALLOCATORS,
             ))
         };
         let lit = visit_expression_literal_int(state, 25);
@@ -1064,7 +1064,7 @@ mod tests {
                     .with_task_executor(executor)
                     .build(),
             ),
-            ERROR_ALLOCATORS,
+            TEST_ERROR_ALLOCATORS,
         );
 
         // Checkpoint at v2 so the log segment for a later snapshot starts at the checkpoint and

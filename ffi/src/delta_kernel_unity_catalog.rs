@@ -228,9 +228,8 @@ pub unsafe extern "C" fn get_uc_committer(
     table_name: KernelStringSlice,
     error_allocators: *const ErrorAllocators,
 ) -> ExternResult<Handle<MutableCommitter>> {
-    let error_allocators = unsafe { *error_allocators };
     let result = get_uc_committer_impl(commit_client, table_id, catalog, schema, table_name);
-    unsafe { result.into_extern_result(&error_allocators) }
+    unsafe { result.into_extern_result(&*error_allocators) }
 }
 
 fn get_uc_committer_impl(
@@ -282,7 +281,7 @@ pub(crate) mod tests {
     };
 
     use super::*;
-    use crate::ffi_test_utils::{ok_or_panic, ERROR_ALLOCATORS};
+    use crate::ffi_test_utils::{ok_or_panic, TEST_ERROR_ALLOCATORS};
     use crate::{allocate_kernel_string, kernel_string_slice, OptionalValue};
 
     pub(crate) struct TestContext {
@@ -336,7 +335,7 @@ pub(crate) mod tests {
             let error_str = unsafe {
                 ok_or_panic(allocate_kernel_string(
                     kernel_string_slice!(error_msg),
-                    &ERROR_ALLOCATORS,
+                    &TEST_ERROR_ALLOCATORS,
                 ))
             };
             OptionalValue::Some(error_str)
@@ -452,7 +451,7 @@ pub(crate) mod tests {
                 kernel_string_slice!(catalog),
                 kernel_string_slice!(schema),
                 kernel_string_slice!(table_name),
-                &ERROR_ALLOCATORS,
+                &TEST_ERROR_ALLOCATORS,
             ))
         };
 

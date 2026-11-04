@@ -33,7 +33,7 @@ pub(crate) struct EngineErrorWithMessage {
     pub(crate) message: String,
 }
 
-pub(crate) const ERROR_ALLOCATORS: ErrorAllocators = ErrorAllocators {
+pub(crate) const TEST_ERROR_ALLOCATORS: ErrorAllocators = ErrorAllocators {
     context: std::ptr::null_mut(),
     allocate_kernel_error: allocate_kernel_err,
     allocate_delta_error: allocate_delta_err,
@@ -77,7 +77,7 @@ pub(crate) extern "C" fn allocate_bytes(bytes: KernelBytesSlice) -> NullableCvoi
     NonNull::new(Box::into_raw(Box::new(bytes)).cast())
 }
 
-/// Takes ownership of an error allocated by [`ERROR_ALLOCATORS`].
+/// Takes ownership of an error allocated by [`TEST_ERROR_ALLOCATORS`].
 pub(crate) unsafe fn recover_error(ptr: *mut c_void) -> EngineErrorWithMessage {
     unsafe { *Box::from_raw(ptr as *mut EngineErrorWithMessage) }
 }
@@ -123,7 +123,7 @@ impl ExternEngine for ErrorOnlyExternEngine {
 /// Return a lightweight engine handle for tests that only exercise FFI error allocation.
 pub(crate) fn error_only_engine_handle() -> crate::handle::Handle<SharedExternEngine> {
     let engine: Arc<dyn ExternEngine> = Arc::new(ErrorOnlyExternEngine {
-        error_allocators: ERROR_ALLOCATORS,
+        error_allocators: TEST_ERROR_ALLOCATORS,
     });
     engine.into()
 }
@@ -174,7 +174,7 @@ pub(crate) fn engine_handle_for_store(
     store: Arc<delta_kernel::object_store::DynObjectStore>,
 ) -> crate::handle::Handle<SharedExternEngine> {
     let engine = DefaultEngineBuilder::new(store).build();
-    engine_to_handle(Arc::new(engine), ERROR_ALLOCATORS)
+    engine_to_handle(Arc::new(engine), TEST_ERROR_ALLOCATORS)
 }
 
 /// Create an in-memory engine and snapshot from the given commit data. Returns
@@ -190,7 +190,7 @@ pub(crate) async fn setup_snapshot(
     let storage = Arc::new(InMemory::new());
     add_commit(table_root, storage.as_ref(), 0, commit_data).await?;
     let engine = DefaultEngineBuilder::new(storage.clone()).build();
-    let engine = engine_to_handle(Arc::new(engine), ERROR_ALLOCATORS);
+    let engine = engine_to_handle(Arc::new(engine), TEST_ERROR_ALLOCATORS);
     let snap = unsafe { build_snapshot(kernel_string_slice!(table_root), engine.shallow_copy()) };
     Ok((engine, snap))
 }
@@ -261,7 +261,7 @@ mod tests {
         // Create a test error
         let message = "Test error message";
         let error_ptr = unsafe {
-            ERROR_ALLOCATORS.allocate_kernel_error(delta_kernel::KernelError::generic(message))
+            TEST_ERROR_ALLOCATORS.allocate_kernel_error(delta_kernel::KernelError::generic(message))
         };
         let result = ExternResult::<i32>::Err(error_ptr);
 

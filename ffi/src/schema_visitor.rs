@@ -93,11 +93,10 @@ pub unsafe extern "C" fn visit_metadata_value(
     value: KernelStringSlice,
     error_allocators: *const ErrorAllocators,
 ) -> ExternResult<bool> {
-    let error_allocators = unsafe { *error_allocators };
     let key = unsafe { TryFromStringSlice::try_from_slice(&key) };
     let value = unsafe { TryFromStringSlice::try_from_slice(&value) };
     let result = visit_metadata_value_impl(state, key, kind, value).map(|()| true);
-    unsafe { result.into_extern_result(&error_allocators) }
+    unsafe { result.into_extern_result(&*error_allocators) }
 }
 
 fn visit_engine_metadata(
@@ -212,12 +211,11 @@ pub unsafe extern "C" fn visit_field_string(
     metadata: *const EngineMetadata,
     error_allocators: *const ErrorAllocators,
 ) -> ExternResult<usize> {
-    let error_allocators = unsafe { *error_allocators };
     let name_str = unsafe { TryFromStringSlice::try_from_slice(&name) };
     let metadata = visit_engine_metadata(unsafe { metadata.as_ref() });
     let result =
         visit_field_primitive_impl(state, name_str, PrimitiveType::String, nullable, metadata);
-    unsafe { result.into_extern_result(&error_allocators) }
+    unsafe { result.into_extern_result(&*error_allocators) }
 }
 
 /// Visit a long field. Long fields store 64-bit signed integers.
@@ -238,12 +236,11 @@ pub unsafe extern "C" fn visit_field_long(
     metadata: *const EngineMetadata,
     error_allocators: *const ErrorAllocators,
 ) -> ExternResult<usize> {
-    let error_allocators = unsafe { *error_allocators };
     let name_str = unsafe { TryFromStringSlice::try_from_slice(&name) };
     let metadata = visit_engine_metadata(unsafe { metadata.as_ref() });
     let result =
         visit_field_primitive_impl(state, name_str, PrimitiveType::Long, nullable, metadata);
-    unsafe { result.into_extern_result(&error_allocators) }
+    unsafe { result.into_extern_result(&*error_allocators) }
 }
 
 /// Visit an integer field. Integer fields store 32-bit signed integers.
@@ -264,12 +261,11 @@ pub unsafe extern "C" fn visit_field_integer(
     metadata: *const EngineMetadata,
     error_allocators: *const ErrorAllocators,
 ) -> ExternResult<usize> {
-    let error_allocators = unsafe { *error_allocators };
     let name_str = unsafe { TryFromStringSlice::try_from_slice(&name) };
     let metadata = visit_engine_metadata(unsafe { metadata.as_ref() });
     let result =
         visit_field_primitive_impl(state, name_str, PrimitiveType::Integer, nullable, metadata);
-    unsafe { result.into_extern_result(&error_allocators) }
+    unsafe { result.into_extern_result(&*error_allocators) }
 }
 
 /// Visit a short field. Short fields store 16-bit signed integers.
@@ -290,12 +286,11 @@ pub unsafe extern "C" fn visit_field_short(
     metadata: *const EngineMetadata,
     error_allocators: *const ErrorAllocators,
 ) -> ExternResult<usize> {
-    let error_allocators = unsafe { *error_allocators };
     let name_str = unsafe { TryFromStringSlice::try_from_slice(&name) };
     let metadata = visit_engine_metadata(unsafe { metadata.as_ref() });
     let result =
         visit_field_primitive_impl(state, name_str, PrimitiveType::Short, nullable, metadata);
-    unsafe { result.into_extern_result(&error_allocators) }
+    unsafe { result.into_extern_result(&*error_allocators) }
 }
 
 /// Visit a byte field. Byte fields store 8-bit signed integers.
@@ -316,12 +311,11 @@ pub unsafe extern "C" fn visit_field_byte(
     metadata: *const EngineMetadata,
     error_allocators: *const ErrorAllocators,
 ) -> ExternResult<usize> {
-    let error_allocators = unsafe { *error_allocators };
     let name_str = unsafe { TryFromStringSlice::try_from_slice(&name) };
     let metadata = visit_engine_metadata(unsafe { metadata.as_ref() });
     let result =
         visit_field_primitive_impl(state, name_str, PrimitiveType::Byte, nullable, metadata);
-    unsafe { result.into_extern_result(&error_allocators) }
+    unsafe { result.into_extern_result(&*error_allocators) }
 }
 
 /// Visit a float field. Float fields store 32-bit floating point numbers.
@@ -342,12 +336,11 @@ pub unsafe extern "C" fn visit_field_float(
     metadata: *const EngineMetadata,
     error_allocators: *const ErrorAllocators,
 ) -> ExternResult<usize> {
-    let error_allocators = unsafe { *error_allocators };
     let name_str = unsafe { TryFromStringSlice::try_from_slice(&name) };
     let metadata = visit_engine_metadata(unsafe { metadata.as_ref() });
     let result =
         visit_field_primitive_impl(state, name_str, PrimitiveType::Float, nullable, metadata);
-    unsafe { result.into_extern_result(&error_allocators) }
+    unsafe { result.into_extern_result(&*error_allocators) }
 }
 
 /// Visit a double field. Double fields store 64-bit floating point numbers.
@@ -368,12 +361,11 @@ pub unsafe extern "C" fn visit_field_double(
     metadata: *const EngineMetadata,
     error_allocators: *const ErrorAllocators,
 ) -> ExternResult<usize> {
-    let error_allocators = unsafe { *error_allocators };
     let name_str = unsafe { TryFromStringSlice::try_from_slice(&name) };
     let metadata = visit_engine_metadata(unsafe { metadata.as_ref() });
     let result =
         visit_field_primitive_impl(state, name_str, PrimitiveType::Double, nullable, metadata);
-    unsafe { result.into_extern_result(&error_allocators) }
+    unsafe { result.into_extern_result(&*error_allocators) }
 }
 
 /// Visit a boolean field. Boolean fields store true/false values.
@@ -394,12 +386,11 @@ pub unsafe extern "C" fn visit_field_boolean(
     metadata: *const EngineMetadata,
     error_allocators: *const ErrorAllocators,
 ) -> ExternResult<usize> {
-    let error_allocators = unsafe { *error_allocators };
     let name_str = unsafe { TryFromStringSlice::try_from_slice(&name) };
     let metadata = visit_engine_metadata(unsafe { metadata.as_ref() });
     let result =
         visit_field_primitive_impl(state, name_str, PrimitiveType::Boolean, nullable, metadata);
-    unsafe { result.into_extern_result(&error_allocators) }
+    unsafe { result.into_extern_result(&*error_allocators) }
 }
 
 /// Visit a binary field. Binary fields store arbitrary byte arrays.
@@ -420,12 +411,11 @@ pub unsafe extern "C" fn visit_field_binary(
     metadata: *const EngineMetadata,
     error_allocators: *const ErrorAllocators,
 ) -> ExternResult<usize> {
-    let error_allocators = unsafe { *error_allocators };
     let name_str = unsafe { TryFromStringSlice::try_from_slice(&name) };
     let metadata = visit_engine_metadata(unsafe { metadata.as_ref() });
     let result =
         visit_field_primitive_impl(state, name_str, PrimitiveType::Binary, nullable, metadata);
-    unsafe { result.into_extern_result(&error_allocators) }
+    unsafe { result.into_extern_result(&*error_allocators) }
 }
 
 /// Visit a date field. Date fields store calendar dates without time information.
@@ -446,12 +436,11 @@ pub unsafe extern "C" fn visit_field_date(
     metadata: *const EngineMetadata,
     error_allocators: *const ErrorAllocators,
 ) -> ExternResult<usize> {
-    let error_allocators = unsafe { *error_allocators };
     let name_str = unsafe { TryFromStringSlice::try_from_slice(&name) };
     let metadata = visit_engine_metadata(unsafe { metadata.as_ref() });
     let result =
         visit_field_primitive_impl(state, name_str, PrimitiveType::Date, nullable, metadata);
-    unsafe { result.into_extern_result(&error_allocators) }
+    unsafe { result.into_extern_result(&*error_allocators) }
 }
 
 /// Visit a timestamp field. Timestamp fields store date and time with microsecond precision in UTC.
@@ -472,7 +461,6 @@ pub unsafe extern "C" fn visit_field_timestamp(
     metadata: *const EngineMetadata,
     error_allocators: *const ErrorAllocators,
 ) -> ExternResult<usize> {
-    let error_allocators = unsafe { *error_allocators };
     let name_str = unsafe { TryFromStringSlice::try_from_slice(&name) };
     let metadata = visit_engine_metadata(unsafe { metadata.as_ref() });
     let result = visit_field_primitive_impl(
@@ -482,7 +470,7 @@ pub unsafe extern "C" fn visit_field_timestamp(
         nullable,
         metadata,
     );
-    unsafe { result.into_extern_result(&error_allocators) }
+    unsafe { result.into_extern_result(&*error_allocators) }
 }
 
 /// Visit a timestamp_ntz field. Similar to timestamp but without timezone information.
@@ -503,7 +491,6 @@ pub unsafe extern "C" fn visit_field_timestamp_ntz(
     metadata: *const EngineMetadata,
     error_allocators: *const ErrorAllocators,
 ) -> ExternResult<usize> {
-    let error_allocators = unsafe { *error_allocators };
     let name_str = unsafe { TryFromStringSlice::try_from_slice(&name) };
     let metadata = visit_engine_metadata(unsafe { metadata.as_ref() });
     let result = visit_field_primitive_impl(
@@ -513,7 +500,7 @@ pub unsafe extern "C" fn visit_field_timestamp_ntz(
         nullable,
         metadata,
     );
-    unsafe { result.into_extern_result(&error_allocators) }
+    unsafe { result.into_extern_result(&*error_allocators) }
 }
 
 /// Visit an interval year-month field. Values store signed month counts.
@@ -534,7 +521,6 @@ pub unsafe extern "C" fn visit_field_interval_year_month(
     metadata: *const EngineMetadata,
     error_allocators: *const ErrorAllocators,
 ) -> ExternResult<usize> {
-    let error_allocators = unsafe { *error_allocators };
     let name_str = unsafe { TryFromStringSlice::try_from_slice(&name) };
     let metadata = visit_engine_metadata(unsafe { metadata.as_ref() });
     let result = visit_field_primitive_impl(
@@ -544,7 +530,7 @@ pub unsafe extern "C" fn visit_field_interval_year_month(
         nullable,
         metadata,
     );
-    unsafe { result.into_extern_result(&error_allocators) }
+    unsafe { result.into_extern_result(&*error_allocators) }
 }
 
 /// Visit an interval day-time field. Values store signed microsecond durations.
@@ -565,7 +551,6 @@ pub unsafe extern "C" fn visit_field_interval_day_time(
     metadata: *const EngineMetadata,
     error_allocators: *const ErrorAllocators,
 ) -> ExternResult<usize> {
-    let error_allocators = unsafe { *error_allocators };
     let name_str = unsafe { TryFromStringSlice::try_from_slice(&name) };
     let metadata = visit_engine_metadata(unsafe { metadata.as_ref() });
     let result = visit_field_primitive_impl(
@@ -575,7 +560,7 @@ pub unsafe extern "C" fn visit_field_interval_day_time(
         nullable,
         metadata,
     );
-    unsafe { result.into_extern_result(&error_allocators) }
+    unsafe { result.into_extern_result(&*error_allocators) }
 }
 
 /// Visit a void field. Void fields are not materialized in data files and read as all-null columns.
@@ -596,12 +581,11 @@ pub unsafe extern "C" fn visit_field_void(
     metadata: *const EngineMetadata,
     error_allocators: *const ErrorAllocators,
 ) -> ExternResult<usize> {
-    let error_allocators = unsafe { *error_allocators };
     let name_str = unsafe { TryFromStringSlice::try_from_slice(&name) };
     let metadata = visit_engine_metadata(unsafe { metadata.as_ref() });
     let result =
         visit_field_primitive_impl(state, name_str, PrimitiveType::Void, nullable, metadata);
-    unsafe { result.into_extern_result(&error_allocators) }
+    unsafe { result.into_extern_result(&*error_allocators) }
 }
 
 /// Visit a geometry field with the given coordinate reference system.
@@ -627,12 +611,11 @@ pub unsafe extern "C" fn visit_field_geometry(
     metadata: *const EngineMetadata,
     error_allocators: *const ErrorAllocators,
 ) -> ExternResult<usize> {
-    let error_allocators = unsafe { *error_allocators };
     let name_str = unsafe { TryFromStringSlice::try_from_slice(&name) };
     let crs = unsafe { TryFromStringSlice::try_from_slice(&crs) };
     let metadata = visit_engine_metadata(unsafe { metadata.as_ref() });
     let result = visit_field_geometry_impl(state, name_str, crs, nullable, metadata);
-    unsafe { result.into_extern_result(&error_allocators) }
+    unsafe { result.into_extern_result(&*error_allocators) }
 }
 
 #[cfg(feature = "geo-type-in-dev")]
@@ -678,13 +661,12 @@ pub unsafe extern "C" fn visit_field_geography(
     metadata: *const EngineMetadata,
     error_allocators: *const ErrorAllocators,
 ) -> ExternResult<usize> {
-    let error_allocators = unsafe { *error_allocators };
     let name_str = unsafe { TryFromStringSlice::try_from_slice(&name) };
     let crs = unsafe { TryFromStringSlice::try_from_slice(&crs) };
     let algorithm = unsafe { TryFromStringSlice::try_from_slice(&algorithm) };
     let metadata = visit_engine_metadata(unsafe { metadata.as_ref() });
     let result = visit_field_geography_impl(state, name_str, crs, algorithm, nullable, metadata);
-    unsafe { result.into_extern_result(&error_allocators) }
+    unsafe { result.into_extern_result(&*error_allocators) }
 }
 
 #[cfg(feature = "geo-type-in-dev")]
@@ -734,11 +716,10 @@ pub unsafe extern "C" fn visit_field_decimal(
     metadata: *const EngineMetadata,
     error_allocators: *const ErrorAllocators,
 ) -> ExternResult<usize> {
-    let error_allocators = unsafe { *error_allocators };
     let name_str = unsafe { TryFromStringSlice::try_from_slice(&name) };
     let metadata = visit_engine_metadata(unsafe { metadata.as_ref() });
     let result = visit_field_decimal_impl(state, name_str, precision, scale, nullable, metadata);
-    unsafe { result.into_extern_result(&error_allocators) }
+    unsafe { result.into_extern_result(&*error_allocators) }
 }
 
 fn visit_field_decimal_impl(
@@ -793,13 +774,12 @@ pub unsafe extern "C" fn visit_field_struct(
     metadata: *const EngineMetadata,
     error_allocators: *const ErrorAllocators,
 ) -> ExternResult<usize> {
-    let error_allocators = unsafe { *error_allocators };
     let name_str: KernelResult<&str> = unsafe { TryFromStringSlice::try_from_slice(&name) };
     let metadata = visit_engine_metadata(unsafe { metadata.as_ref() });
     let field_ids = unsafe { std::slice::from_raw_parts(field_ids, field_count) };
 
     let result = visit_field_struct_impl(state, name_str, field_ids, nullable, metadata);
-    unsafe { result.into_extern_result(&error_allocators) }
+    unsafe { result.into_extern_result(&*error_allocators) }
 }
 
 // Helper to create struct DataType from field IDs
@@ -856,11 +836,10 @@ pub unsafe extern "C" fn visit_field_array(
     metadata: *const EngineMetadata,
     error_allocators: *const ErrorAllocators,
 ) -> ExternResult<usize> {
-    let error_allocators = unsafe { *error_allocators };
     let name_str = unsafe { TryFromStringSlice::try_from_slice(&name) };
     let metadata = visit_engine_metadata(unsafe { metadata.as_ref() });
     let result = visit_field_array_impl(state, name_str, element_type_id, nullable, metadata);
-    unsafe { result.into_extern_result(&error_allocators) }
+    unsafe { result.into_extern_result(&*error_allocators) }
 }
 
 fn visit_field_array_impl(
@@ -909,7 +888,6 @@ pub unsafe extern "C" fn visit_field_map(
     metadata: *const EngineMetadata,
     error_allocators: *const ErrorAllocators,
 ) -> ExternResult<usize> {
-    let error_allocators = unsafe { *error_allocators };
     let name_str = unsafe { TryFromStringSlice::try_from_slice(&name) };
     let metadata = visit_engine_metadata(unsafe { metadata.as_ref() });
     let result = visit_field_map_impl(
@@ -920,7 +898,7 @@ pub unsafe extern "C" fn visit_field_map(
         nullable,
         metadata,
     );
-    unsafe { result.into_extern_result(&error_allocators) }
+    unsafe { result.into_extern_result(&*error_allocators) }
 }
 
 fn visit_field_map_impl(
@@ -984,7 +962,6 @@ pub unsafe extern "C" fn visit_field_user_defined(
     metadata: *const EngineMetadata,
     error_allocators: *const ErrorAllocators,
 ) -> ExternResult<usize> {
-    let error_allocators = unsafe { *error_allocators };
     #[cfg(feature = "udt-in-dev")]
     let result = (|| -> KernelResult<usize> {
         let name = unsafe { name.try_to_string() }?;
@@ -1006,7 +983,7 @@ pub unsafe extern "C" fn visit_field_user_defined(
             "UDT schema construction requires udt-in-dev",
         ))
     };
-    unsafe { result.into_extern_result(&error_allocators) }
+    unsafe { result.into_extern_result(&*error_allocators) }
 }
 
 /// Visit a variant field.
@@ -1032,11 +1009,10 @@ pub unsafe extern "C" fn visit_field_variant(
     metadata: *const EngineMetadata,
     error_allocators: *const ErrorAllocators,
 ) -> ExternResult<usize> {
-    let error_allocators = unsafe { *error_allocators };
     let name_str = unsafe { TryFromStringSlice::try_from_slice(&name) };
     let metadata = visit_engine_metadata(unsafe { metadata.as_ref() });
     let result = visit_field_variant_impl(state, name_str, variant_struct_id, nullable, metadata);
-    unsafe { result.into_extern_result(&error_allocators) }
+    unsafe { result.into_extern_result(&*error_allocators) }
 }
 
 fn visit_field_variant_impl(
@@ -1080,7 +1056,7 @@ mod tests {
     use crate::error::FFIKernelError;
     use crate::ffi_test_utils::{
         assert_extern_result_error_contains, assert_extern_result_error_with_message, ok_or_panic,
-        ERROR_ALLOCATORS,
+        TEST_ERROR_ALLOCATORS,
     };
     use crate::scan::visit_metadata_map;
     use crate::{KernelStringSlice, NullableCvoid};
@@ -1120,7 +1096,7 @@ mod tests {
                 },
                 true,
                 &test_engine_metadata(&mut metadata),
-                &ERROR_ALLOCATORS,
+                &TEST_ERROR_ALLOCATORS,
             )
         };
         assert_eq!(state.elements.contains(physical), duplicate);
@@ -1169,7 +1145,7 @@ mod tests {
                     },
                     true,
                     null(),
-                    &ERROR_ALLOCATORS,
+                    &TEST_ERROR_ALLOCATORS,
                 ))
             };
             assert!(state.elements.contains(udt_id));
@@ -1188,7 +1164,7 @@ mod tests {
                 },
                 true,
                 null(),
-                &ERROR_ALLOCATORS,
+                &TEST_ERROR_ALLOCATORS,
             )
         };
         assert_extern_result_error_contains(
@@ -1231,7 +1207,7 @@ mod tests {
                 },
                 true,
                 &rejected_engine_metadata(),
-                &ERROR_ALLOCATORS,
+                &TEST_ERROR_ALLOCATORS,
             )
         };
         assert_extern_result_error_with_message(
@@ -1277,7 +1253,7 @@ mod tests {
                 },
                 true,
                 null(),
-                &ERROR_ALLOCATORS,
+                &TEST_ERROR_ALLOCATORS,
             )
         };
         assert_extern_result_error_contains(result, FFIKernelError::SchemaError, message);
@@ -1303,7 +1279,7 @@ mod tests {
                 },
                 true,
                 &test_engine_metadata(&mut metadata),
-                &ERROR_ALLOCATORS,
+                &TEST_ERROR_ALLOCATORS,
             )
         };
         assert_extern_result_error_contains(
@@ -1349,7 +1325,7 @@ mod tests {
                     KernelStringSlice::new_unsafe(key),
                     CMetadataValueKind::from(value),
                     KernelStringSlice::new_unsafe(&encoded),
-                    &ERROR_ALLOCATORS,
+                    &TEST_ERROR_ALLOCATORS,
                 ));
             }
         }
@@ -1386,7 +1362,7 @@ mod tests {
                     metadata: std::ptr::null_mut(),
                     visitor: reject_metadata,
                 },
-                &ERROR_ALLOCATORS,
+                &TEST_ERROR_ALLOCATORS,
             )
         };
 
@@ -1403,7 +1379,7 @@ mod tests {
                 KernelStringSlice::new_unsafe("field"),
                 false,
                 null(),
-                &ERROR_ALLOCATORS,
+                &TEST_ERROR_ALLOCATORS,
             ))
         };
         let field = unwrap_field(&mut state, field_id).unwrap();
@@ -1462,7 +1438,7 @@ mod tests {
                 KernelStringSlice::new_unsafe("key"),
                 kind,
                 KernelStringSlice::new_unsafe(value),
-                &ERROR_ALLOCATORS,
+                &TEST_ERROR_ALLOCATORS,
             )
         };
 
@@ -1494,7 +1470,7 @@ mod tests {
             } else {
                 (valid_slice, invalid_slice)
             };
-            visit_metadata_value(&mut state, key, kind, value, &ERROR_ALLOCATORS)
+            visit_metadata_value(&mut state, key, kind, value, &TEST_ERROR_ALLOCATORS)
         };
 
         assert_extern_result_error_with_message(result, FFIKernelError::Utf8Error, None);
@@ -1517,7 +1493,7 @@ mod tests {
                 KernelStringSlice::new_unsafe("key"),
                 CMetadataValueKind::MetadataNumber,
                 KernelStringSlice::new_unsafe("1"),
-                &ERROR_ALLOCATORS,
+                &TEST_ERROR_ALLOCATORS,
             ));
         }
 
@@ -1527,7 +1503,7 @@ mod tests {
                 KernelStringSlice::new_unsafe("key"),
                 kind,
                 KernelStringSlice::new_unsafe(value),
-                &ERROR_ALLOCATORS,
+                &TEST_ERROR_ALLOCATORS,
             )
         };
 
@@ -1562,7 +1538,7 @@ mod tests {
                 KernelStringSlice::new_unsafe("key"),
                 kind,
                 KernelStringSlice::new_unsafe(value),
-                &ERROR_ALLOCATORS,
+                &TEST_ERROR_ALLOCATORS,
             ));
         }
         assert_eq!(state.into_values().get("key"), Some(&expected));
@@ -1581,7 +1557,7 @@ mod tests {
                 key,
                 kind,
                 value,
-                &ERROR_ALLOCATORS,
+                &TEST_ERROR_ALLOCATORS,
             ));
         }
     }
@@ -1659,7 +1635,7 @@ mod tests {
                 KernelStringSlice::new_unsafe("field"),
                 false,
                 &metadata,
-                &ERROR_ALLOCATORS,
+                &TEST_ERROR_ALLOCATORS,
             ))
         };
         let field = unwrap_field(&mut state, field_id).unwrap();
@@ -1676,7 +1652,7 @@ mod tests {
                     KernelStringSlice::new_unsafe($name),
                     $nullable,
                     $metadata,
-                    &ERROR_ALLOCATORS,
+                    &TEST_ERROR_ALLOCATORS,
                 )
             }) }
         }};
@@ -1690,7 +1666,7 @@ mod tests {
                     arg1,
                     $nullable,
                     $metadata,
-                    &ERROR_ALLOCATORS,
+                    &TEST_ERROR_ALLOCATORS,
                 )
             }) }
         }};
@@ -1706,7 +1682,7 @@ mod tests {
                     arg2,
                     $nullable,
                     $metadata,
-                    &ERROR_ALLOCATORS,
+                    &TEST_ERROR_ALLOCATORS,
                 )
             }) }
         }};
@@ -1722,7 +1698,7 @@ mod tests {
                     ef,
                     $nullable,
                     $metadata,
-                    &ERROR_ALLOCATORS,
+                    &TEST_ERROR_ALLOCATORS,
                 )
             })
         }};
@@ -1740,7 +1716,7 @@ mod tests {
                     vf,
                     $nullable,
                     $metadata,
-                    &ERROR_ALLOCATORS,
+                    &TEST_ERROR_ALLOCATORS,
                 )
             })
         }};
@@ -1758,7 +1734,7 @@ mod tests {
                     field_count,
                     $nullable,
                     $metadata,
-                    &ERROR_ALLOCATORS,
+                    &TEST_ERROR_ALLOCATORS,
                 )
             })
         }};
@@ -1894,7 +1870,7 @@ mod tests {
                     KernelStringSlice::new_unsafe(crs),
                     true,
                     null(),
-                    &ERROR_ALLOCATORS,
+                    &TEST_ERROR_ALLOCATORS,
                 )
             },
             Some(algorithm) => unsafe {
@@ -1905,7 +1881,7 @@ mod tests {
                     KernelStringSlice::new_unsafe(algorithm),
                     true,
                     null(),
-                    &ERROR_ALLOCATORS,
+                    &TEST_ERROR_ALLOCATORS,
                 )
             },
         };
@@ -1930,7 +1906,7 @@ mod tests {
                 KernelStringSlice::new_unsafe("not-an-algorithm"),
                 true,
                 null(),
-                &ERROR_ALLOCATORS,
+                &TEST_ERROR_ALLOCATORS,
             )
         };
         assert_extern_result_error_with_message(
@@ -2061,7 +2037,7 @@ mod tests {
                 1,
                 false,
                 &rejected_engine_metadata(),
-                &ERROR_ALLOCATORS,
+                &TEST_ERROR_ALLOCATORS,
             )
         };
         assert_extern_result_error_with_message(result, FFIKernelError::SchemaError, None);
@@ -2075,7 +2051,7 @@ mod tests {
                 element,
                 false,
                 &rejected_engine_metadata(),
-                &ERROR_ALLOCATORS,
+                &TEST_ERROR_ALLOCATORS,
             )
         };
         assert_extern_result_error_with_message(result, FFIKernelError::SchemaError, None);
@@ -2091,7 +2067,7 @@ mod tests {
                 value,
                 false,
                 &rejected_engine_metadata(),
-                &ERROR_ALLOCATORS,
+                &TEST_ERROR_ALLOCATORS,
             )
         };
         assert_extern_result_error_with_message(result, FFIKernelError::SchemaError, None);
@@ -2106,7 +2082,7 @@ mod tests {
                 variant_struct,
                 false,
                 &rejected_engine_metadata(),
-                &ERROR_ALLOCATORS,
+                &TEST_ERROR_ALLOCATORS,
             )
         };
         assert_extern_result_error_with_message(result, FFIKernelError::SchemaError, None);
@@ -2324,7 +2300,7 @@ mod tests {
                 all_columns.len(),
                 false,
                 null(),
-                &ERROR_ALLOCATORS,
+                &TEST_ERROR_ALLOCATORS,
             )
         });
 
@@ -2911,7 +2887,7 @@ mod tests {
                 null(),
                 &ErrorAllocators {
                     allocate_kernel_error: ensure_map_err,
-                    ..ERROR_ALLOCATORS
+                    ..TEST_ERROR_ALLOCATORS
                 },
             )
         };

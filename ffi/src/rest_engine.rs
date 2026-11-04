@@ -386,7 +386,7 @@ mod tests {
     use url::Url;
 
     use super::*;
-    use crate::ffi_test_utils::ERROR_ALLOCATORS;
+    use crate::ffi_test_utils::TEST_ERROR_ALLOCATORS;
     use crate::kernel_string_slice;
 
     // Miri policy for this module. See ffi/AGENTS.md "Testing under Miri" for the policy;
@@ -398,7 +398,7 @@ mod tests {
     //      1-2 run under Miri, so the slow ones are `#[cfg_attr(miri, ignore)]`.
 
     fn test_error_allocators() -> ErrorAllocators {
-        ERROR_ALLOCATORS
+        TEST_ERROR_ALLOCATORS
     }
 
     fn test_auth_header_pair(name: &str, value: &str) -> CAuthHeaderPair {

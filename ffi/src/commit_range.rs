@@ -677,7 +677,7 @@ mod tests {
     use crate::error::FFIKernelError;
     use crate::ffi_test_utils::{
         assert_extern_result_error_with_message, assert_timestamp_is_recent, build_snapshot,
-        error_only_engine_handle, ok_or_panic, ERROR_ALLOCATORS,
+        error_only_engine_handle, ok_or_panic, TEST_ERROR_ALLOCATORS,
     };
     use crate::log_path::LogPathArray;
     use crate::{
@@ -713,7 +713,7 @@ mod tests {
         }
         let engine = DefaultEngineBuilder::new(storage.clone()).build();
         (
-            engine_to_handle(Arc::new(engine), ERROR_ALLOCATORS),
+            engine_to_handle(Arc::new(engine), TEST_ERROR_ALLOCATORS),
             table_root,
         )
     }
@@ -985,7 +985,7 @@ mod tests {
         }
         let engine = engine_to_handle(
             Arc::new(DefaultEngineBuilder::new(storage).build()),
-            ERROR_ALLOCATORS,
+            TEST_ERROR_ALLOCATORS,
         );
 
         let builder = unsafe {

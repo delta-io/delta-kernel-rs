@@ -484,9 +484,8 @@ pub unsafe extern "C" fn allocate_kernel_string(
     kernel_str: KernelStringSlice,
     error_allocators: *const ErrorAllocators,
 ) -> ExternResult<Handle<ExclusiveRustString>> {
-    let error_allocators = unsafe { *error_allocators };
     let result = allocate_kernel_string_impl(kernel_str);
-    unsafe { result.into_extern_result(&error_allocators) }
+    unsafe { result.into_extern_result(&*error_allocators) }
 }
 
 fn allocate_kernel_string_impl(
@@ -2299,7 +2298,7 @@ mod tests {
     use crate::error::FFIKernelError;
     use crate::ffi_test_utils::{
         allocate_str, assert_extern_result_error_contains, assert_extern_result_error_with_message,
-        build_snapshot, ok_or_panic, recover_string, setup_snapshot, ERROR_ALLOCATORS,
+        build_snapshot, ok_or_panic, recover_string, setup_snapshot, TEST_ERROR_ALLOCATORS,
     };
 
     unsafe extern "C" fn allocate_null_err(
@@ -2394,7 +2393,7 @@ mod tests {
     fn snapshot_builder_log_tail_rejects_null_nonempty_pointer() {
         let engine = engine_to_handle(
             Arc::new(DefaultEngineBuilder::new(Arc::new(InMemory::new())).build()),
-            ERROR_ALLOCATORS,
+            TEST_ERROR_ALLOCATORS,
         );
         let table_root = "memory:///test_table/";
         let builder = unsafe {
@@ -2447,7 +2446,7 @@ mod tests {
         .await?;
         let engine = engine_to_handle(
             Arc::new(DefaultEngineBuilder::new(storage.clone()).build()),
-            ERROR_ALLOCATORS,
+            TEST_ERROR_ALLOCATORS,
         );
         let snap = unsafe { build_snapshot(kernel_string_slice!(path), engine.shallow_copy()) };
         Ok((storage, engine, snap))
@@ -2472,7 +2471,7 @@ mod tests {
         .await?;
         let engine = engine_to_handle(
             Arc::new(DefaultEngineBuilder::new(storage.clone()).build()),
-            ERROR_ALLOCATORS,
+            TEST_ERROR_ALLOCATORS,
         );
         let snap = unsafe {
             let ptr = ok_or_panic(get_snapshot_builder(
@@ -2509,7 +2508,7 @@ mod tests {
 
     pub(crate) fn get_default_engine(path: &str) -> Handle<SharedExternEngine> {
         let path = kernel_string_slice!(path);
-        let builder = unsafe { ok_or_panic(get_engine_builder(path, &ERROR_ALLOCATORS)) };
+        let builder = unsafe { ok_or_panic(get_engine_builder(path, &TEST_ERROR_ALLOCATORS)) };
         unsafe { ok_or_panic(builder_build(builder)) }
     }
 
@@ -2527,7 +2526,7 @@ mod tests {
         unsafe {
             let builder = ok_or_panic(get_engine_builder(
                 kernel_string_slice!(path),
-                &ERROR_ALLOCATORS,
+                &TEST_ERROR_ALLOCATORS,
             ));
             free_engine_builder(builder);
         }
@@ -2541,7 +2540,7 @@ mod tests {
         unsafe {
             let builder = ok_or_panic(get_engine_builder(
                 kernel_string_slice!(path),
-                &ERROR_ALLOCATORS,
+                &TEST_ERROR_ALLOCATORS,
             ));
             let builder = ok_or_panic(builder_with_option(
                 builder,
@@ -2568,7 +2567,7 @@ mod tests {
         unsafe {
             let builder = ok_or_panic(get_engine_builder(
                 kernel_string_slice!(path),
-                &ERROR_ALLOCATORS,
+                &TEST_ERROR_ALLOCATORS,
             ));
             assert_extern_result_error_with_message(
                 builder_with_option(builder, invalid_key, kernel_string_slice!(value)),
@@ -2585,7 +2584,7 @@ mod tests {
         unsafe {
             let builder = ok_or_panic(get_engine_builder(
                 kernel_string_slice!(path),
-                &ERROR_ALLOCATORS,
+                &TEST_ERROR_ALLOCATORS,
             ));
             assert_extern_result_error_contains(
                 builder_build(builder),
@@ -2601,7 +2600,7 @@ mod tests {
         unsafe {
             let builder = ok_or_panic(get_engine_builder(
                 kernel_string_slice!(path),
-                &ERROR_ALLOCATORS,
+                &TEST_ERROR_ALLOCATORS,
             ));
             assert_extern_result_error_contains(
                 builder_with_rest_object_store(builder, std::ptr::null(), None, None),
@@ -2674,7 +2673,7 @@ mod tests {
             .with_log_state(LogState::with_latest_version(1).with_crc_at([0]))
             .build()?;
         let table_root = table.table_root();
-        let engine = engine_to_handle(Arc::new(table.engine()), ERROR_ALLOCATORS);
+        let engine = engine_to_handle(Arc::new(table.engine()), TEST_ERROR_ALLOCATORS);
 
         let snapshot = unsafe {
             let builder = if from_existing {
@@ -2886,7 +2885,7 @@ mod tests {
                     .unwrap();
                 engine_to_handle(
                     Arc::new(DefaultEngineBuilder::new(storage).build()),
-                    ERROR_ALLOCATORS,
+                    TEST_ERROR_ALLOCATORS,
                 )
             }
             EarliestCommitTableSetupScenario::NoCommits => get_default_engine(table_root),
@@ -2980,7 +2979,7 @@ mod tests {
         .await?;
 
         let engine = DefaultEngineBuilder::new(storage.clone()).build();
-        let engine = engine_to_handle(Arc::new(engine), ERROR_ALLOCATORS);
+        let engine = engine_to_handle(Arc::new(engine), TEST_ERROR_ALLOCATORS);
         let snap =
             unsafe { build_snapshot(kernel_string_slice!(table_root), engine.shallow_copy()) };
 
@@ -3029,7 +3028,7 @@ mod tests {
         .await?;
 
         let engine = DefaultEngineBuilder::new(storage.clone()).build();
-        let engine = engine_to_handle(Arc::new(engine), ERROR_ALLOCATORS);
+        let engine = engine_to_handle(Arc::new(engine), TEST_ERROR_ALLOCATORS);
         let snap =
             unsafe { build_snapshot(kernel_string_slice!(table_root), engine.shallow_copy()) };
 
@@ -3081,7 +3080,7 @@ mod tests {
         .await?;
 
         let engine = DefaultEngineBuilder::new(storage.clone()).build();
-        let engine = engine_to_handle(Arc::new(engine), ERROR_ALLOCATORS);
+        let engine = engine_to_handle(Arc::new(engine), TEST_ERROR_ALLOCATORS);
         let snap =
             unsafe { build_snapshot(kernel_string_slice!(table_root), engine.shallow_copy()) };
 
@@ -3231,7 +3230,7 @@ mod tests {
                     .with_task_executor(executor)
                     .build(),
             ),
-            ERROR_ALLOCATORS,
+            TEST_ERROR_ALLOCATORS,
         );
         let snapshot =
             unsafe { build_snapshot(kernel_string_slice!(table_root), engine.shallow_copy()) };
@@ -3503,7 +3502,7 @@ mod tests {
         let builder = unsafe {
             ok_or_panic(get_engine_builder(
                 kernel_string_slice!(table_root),
-                &ERROR_ALLOCATORS,
+                &TEST_ERROR_ALLOCATORS,
             ))
         };
         let builder = unsafe { builder_with_multithreaded_executor(builder, 2, 0) };
@@ -3582,7 +3581,7 @@ mod tests {
         let builder = unsafe {
             ok_or_panic(get_engine_builder(
                 kernel_string_slice!(table_root),
-                &ERROR_ALLOCATORS,
+                &TEST_ERROR_ALLOCATORS,
             ))
         };
         let builder = unsafe { builder_with_io_concurrency(builder, buffer_size, batch_size) };
@@ -3611,7 +3610,7 @@ mod tests {
         )
         .await?;
         let engine = DefaultEngineBuilder::new(storage.clone()).build();
-        let engine = engine_to_handle(Arc::new(engine), ERROR_ALLOCATORS);
+        let engine = engine_to_handle(Arc::new(engine), TEST_ERROR_ALLOCATORS);
 
         let snapshot =
             unsafe { build_snapshot(kernel_string_slice!(table_root), engine.shallow_copy()) };
@@ -3653,7 +3652,7 @@ mod tests {
             Arc::new(engine),
             ErrorAllocators {
                 allocate_kernel_error: allocate_null_err,
-                ..ERROR_ALLOCATORS
+                ..TEST_ERROR_ALLOCATORS
             },
         );
 
@@ -3783,7 +3782,7 @@ mod tests {
         add_commit(table_root, storage.as_ref(), 0, actions).await?;
         let engine = engine_to_handle(
             Arc::new(DefaultEngineBuilder::new(storage).build()),
-            ERROR_ALLOCATORS,
+            TEST_ERROR_ALLOCATORS,
         );
 
         let result = unsafe {
@@ -4003,7 +4002,7 @@ mod tests {
         .await?;
         let engine = engine_to_handle(
             Arc::new(DefaultEngineBuilder::new(storage).build()),
-            ERROR_ALLOCATORS,
+            TEST_ERROR_ALLOCATORS,
         );
 
         let snapshot_at_v1 = unsafe {
@@ -4131,7 +4130,7 @@ mod tests {
         let storage = Arc::new(InMemory::new());
         let engine = engine_to_handle(
             Arc::new(DefaultEngineBuilder::new(storage).build()),
-            ERROR_ALLOCATORS,
+            TEST_ERROR_ALLOCATORS,
         );
 
         let result = unsafe {

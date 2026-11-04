@@ -88,7 +88,7 @@ mod tests {
 
     use super::*;
     use crate::error::EngineExecResult;
-    use crate::ffi_test_utils::ERROR_ALLOCATORS;
+    use crate::ffi_test_utils::TEST_ERROR_ALLOCATORS;
     use crate::free_engine;
     use crate::plans::result::CPlanResult;
 
@@ -117,13 +117,13 @@ mod tests {
         // The caller retains ownership of the fallback engine handle. `shallow_copy` mimics C
         // passing the pointer by value, so we can still free our own handle afterward.
         let fallback = DefaultEngineBuilder::new(Arc::new(InMemory::new())).build();
-        let fallback_handle = engine_to_handle(Arc::new(fallback), ERROR_ALLOCATORS);
+        let fallback_handle = engine_to_handle(Arc::new(fallback), TEST_ERROR_ALLOCATORS);
 
         let engine_handle = unsafe {
             get_plan_based_engine(
                 executor,
                 OptionalValue::Some(fallback_handle.shallow_copy()),
-                &ERROR_ALLOCATORS,
+                &TEST_ERROR_ALLOCATORS,
             )
         };
 
@@ -158,7 +158,7 @@ mod tests {
         let executor = unsafe { get_plan_executor(None, unreachable_callback) };
 
         let engine_handle =
-            unsafe { get_plan_based_engine(executor, OptionalValue::None, &ERROR_ALLOCATORS) };
+            unsafe { get_plan_based_engine(executor, OptionalValue::None, &TEST_ERROR_ALLOCATORS) };
 
         assert_is_plan_based_engine(&engine_handle);
 
@@ -171,7 +171,7 @@ mod tests {
     fn without_fallback_unimplemented_operations_are_unsupported() {
         let executor = unsafe { get_plan_executor(None, unreachable_callback) };
         let engine_handle =
-            unsafe { get_plan_based_engine(executor, OptionalValue::None, &ERROR_ALLOCATORS) };
+            unsafe { get_plan_based_engine(executor, OptionalValue::None, &TEST_ERROR_ALLOCATORS) };
 
         let engine = unsafe { engine_handle.as_ref() }.engine();
         let location = Url::parse("memory:///table/_delta_log/00000000000000000001.json").unwrap();

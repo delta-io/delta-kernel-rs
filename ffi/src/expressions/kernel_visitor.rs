@@ -241,9 +241,8 @@ pub unsafe extern "C" fn visit_expression_column(
     parts_len: usize,
     error_allocators: *const ErrorAllocators,
 ) -> ExternResult<usize> {
-    let error_allocators = unsafe { *error_allocators };
     let result = unsafe { visit_expression_column_impl(state, parts, parts_len) };
-    unsafe { result.into_extern_result(&error_allocators) }
+    unsafe { result.into_extern_result(&*error_allocators) }
 }
 /// # Safety
 /// `parts` must point to `parts_len` valid [`KernelStringSlice`], each valid for the
@@ -302,10 +301,9 @@ pub unsafe extern "C" fn visit_expression_literal_string(
     value: KernelStringSlice,
     error_allocators: *const ErrorAllocators,
 ) -> ExternResult<usize> {
-    let error_allocators = unsafe { *error_allocators };
     let value = unsafe { String::try_from_slice(&value) };
     let result = visit_expression_literal_string_impl(state, value);
-    unsafe { result.into_extern_result(&error_allocators) }
+    unsafe { result.into_extern_result(&*error_allocators) }
 }
 fn visit_expression_literal_string_impl(
     state: &mut KernelExpressionVisitorState,
@@ -447,9 +445,8 @@ pub unsafe extern "C" fn visit_expression_literal_decimal(
     scale: u8,
     error_allocators: *const ErrorAllocators,
 ) -> ExternResult<usize> {
-    let error_allocators = unsafe { *error_allocators };
     let result = visit_expression_literal_decimal_impl(state, value_hi, value_lo, precision, scale);
-    unsafe { result.into_extern_result(&error_allocators) }
+    unsafe { result.into_extern_result(&*error_allocators) }
 }
 
 fn visit_expression_literal_decimal_impl(
@@ -644,9 +641,8 @@ pub unsafe extern "C" fn visit_expression_literal_null(
     scale: u8,
     error_allocators: *const ErrorAllocators,
 ) -> ExternResult<usize> {
-    let error_allocators = unsafe { *error_allocators };
     let result = visit_expression_literal_null_impl(state, type_tag, precision, scale);
-    unsafe { result.into_extern_result(&error_allocators) }
+    unsafe { result.into_extern_result(&*error_allocators) }
 }
 
 fn visit_expression_literal_null_impl(
@@ -743,9 +739,8 @@ pub unsafe extern "C" fn visit_engine_expression(
     engine_expression: &mut EngineExpression,
     error_allocators: *const ErrorAllocators,
 ) -> ExternResult<Handle<SharedExpression>> {
-    let error_allocators = unsafe { *error_allocators };
     let result = visit_engine_expression_impl(engine_expression);
-    unsafe { result.into_extern_result(&error_allocators) }
+    unsafe { result.into_extern_result(&*error_allocators) }
 }
 
 fn visit_engine_expression_impl(
@@ -779,9 +774,8 @@ pub unsafe extern "C" fn visit_engine_predicate(
     engine_predicate: &mut EnginePredicate,
     error_allocators: *const ErrorAllocators,
 ) -> ExternResult<Handle<SharedPredicate>> {
-    let error_allocators = unsafe { *error_allocators };
     let result = visit_engine_predicate_impl(engine_predicate);
-    unsafe { result.into_extern_result(&error_allocators) }
+    unsafe { result.into_extern_result(&*error_allocators) }
 }
 
 fn visit_engine_predicate_impl(
@@ -839,10 +833,9 @@ pub unsafe extern "C" fn visit_predicate_opaque(
     children: &mut EngineIterator,
     error_allocators: *const ErrorAllocators,
 ) -> ExternResult<usize> {
-    let error_allocators = unsafe { *error_allocators };
     let name = unsafe { String::try_from_slice(&name) };
     let result = visit_predicate_opaque_impl(state, name, children);
-    unsafe { result.into_extern_result(&error_allocators) }
+    unsafe { result.into_extern_result(&*error_allocators) }
 }
 
 fn visit_predicate_opaque_impl(
@@ -889,12 +882,11 @@ pub unsafe extern "C" fn visit_predicate_opaque_with_eval(
     callbacks: COpaqueEvalCallbacks,
     error_allocators: *const ErrorAllocators,
 ) -> ExternResult<usize> {
-    let error_allocators = unsafe { *error_allocators };
     let name = unsafe { String::try_from_slice(&name) };
     // Wrap immediately so free_state fires exactly once on every exit path.
     let callbacks = Arc::new(FfiOpaqueEvalCallbacks::new(callbacks));
     let result = visit_predicate_opaque_with_eval_impl(state, name, children, callbacks);
-    unsafe { result.into_extern_result(&error_allocators) }
+    unsafe { result.into_extern_result(&*error_allocators) }
 }
 
 #[cfg(feature = "default-engine-base")]
@@ -1249,7 +1241,12 @@ mod tests {
             })
             .collect();
         let result = unsafe {
-            visit_expression_column(&mut state, slices.as_ptr(), slices.len(), &ERROR_ALLOCATORS)
+            visit_expression_column(
+                &mut state,
+                slices.as_ptr(),
+                slices.len(),
+                &TEST_ERROR_ALLOCATORS,
+            )
         };
         assert_extern_result_error_with_message(result, expected_error, expected_message);
     }
@@ -1342,7 +1339,7 @@ mod tests {
 
     use crate::error::FFIKernelError;
     use crate::ffi_test_utils::{
-        assert_extern_result_error_with_message, ok_or_panic, ERROR_ALLOCATORS,
+        assert_extern_result_error_with_message, ok_or_panic, TEST_ERROR_ALLOCATORS,
     };
     use crate::kernel_string_slice;
 
@@ -1357,7 +1354,7 @@ mod tests {
                 &mut state,
                 kernel_string_slice!(name),
                 &mut it,
-                &ERROR_ALLOCATORS,
+                &TEST_ERROR_ALLOCATORS,
             )
         });
         assert_ne!(id, 0);
@@ -1411,7 +1408,7 @@ mod tests {
                 kernel_string_slice!(name),
                 &mut it,
                 callbacks(),
-                &ERROR_ALLOCATORS,
+                &TEST_ERROR_ALLOCATORS,
             )
         });
         assert_ne!(id, 0);
@@ -1435,7 +1432,7 @@ mod tests {
                 kernel_string_slice!(name),
                 &mut bad_it,
                 callbacks(),
-                &ERROR_ALLOCATORS,
+                &TEST_ERROR_ALLOCATORS,
             )
         });
         assert_eq!(id, 0);
@@ -1551,7 +1548,7 @@ mod tests {
                     eval_pred_stats: engine_in_range,
                     free_state: noop_free,
                 },
-                &ERROR_ALLOCATORS,
+                &TEST_ERROR_ALLOCATORS,
             )
         });
         let predicate = Arc::new(unwrap_kernel_predicate(&mut state, id).unwrap());
@@ -1680,7 +1677,7 @@ mod tests {
                     eval_pred_stats: engine_skip_null_bounds,
                     free_state: noop_free,
                 },
-                &ERROR_ALLOCATORS,
+                &TEST_ERROR_ALLOCATORS,
             )
         });
         let predicate = Arc::new(unwrap_kernel_predicate(&mut state, id).unwrap());

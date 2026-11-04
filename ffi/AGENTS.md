@@ -468,8 +468,8 @@ valid for every use and support concurrent calls when shared. Standalone exports
 for the call. Use the stored allocator when an engine or builder is already available:
 
 ```rust
-result.into_extern_result(&error_allocators); // Local copy of the supplied table.
-result.into_extern_result(&engine.as_ref()); // The engine stores the table.
+unsafe { result.into_extern_result(&*error_allocators) }; // Borrowed table for this call.
+unsafe { result.into_extern_result(&engine.as_ref()) }; // The engine stores the table.
 ```
 
 Do not require both an engine and a separate allocator table for the same operation.
@@ -519,9 +519,8 @@ pub unsafe extern "C" fn set_metadata(
     entries: CMetadataEntries,
     error_allocators: *const ErrorAllocators,
 ) -> ExternResult<bool> {
-    let error_allocators = unsafe { *error_allocators };
     let result = unsafe { set_metadata_impl(builder, entries) };
-    unsafe { result.into_extern_result(&error_allocators) }
+    unsafe { result.into_extern_result(&*error_allocators) }
 }
 
 unsafe fn set_metadata_impl(

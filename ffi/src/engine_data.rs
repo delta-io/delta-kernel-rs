@@ -166,9 +166,10 @@ pub unsafe extern "C" fn get_engine_data(
     schema: &FFI_ArrowSchema,
     error_allocators: *const ErrorAllocators,
 ) -> ExternResult<Handle<ExclusiveEngineData>> {
-    let error_allocators = unsafe { *error_allocators };
-    let result = unsafe { get_engine_data_impl(array, schema) };
-    unsafe { result.into_extern_result(&error_allocators) }
+    unsafe {
+        let result = get_engine_data_impl(array, schema);
+        result.into_extern_result(&*error_allocators)
+    }
 }
 
 #[cfg(feature = "default-engine-base")]

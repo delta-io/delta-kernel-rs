@@ -940,9 +940,8 @@ pub unsafe extern "C" fn cardinality_from_dv(
     dv_info: &DvInfo,
     error_allocators: *const ErrorAllocators,
 ) -> ExternResult<OptionalValue<u64>> {
-    let error_allocators = unsafe { *error_allocators };
     let result = dv_info.cardinality().map(Into::into);
-    unsafe { result.into_extern_result(&error_allocators) }
+    unsafe { result.into_extern_result(&*error_allocators) }
 }
 
 /// Get a selection vector out of a [`DvInfo`] struct
@@ -1190,7 +1189,9 @@ mod scan_builder_tests {
     };
     #[cfg(feature = "geo-type-in-dev")]
     use crate::ffi_test_utils::build_snapshot;
-    use crate::ffi_test_utils::{ok_or_panic, recover_error, setup_snapshot, ERROR_ALLOCATORS};
+    use crate::ffi_test_utils::{
+        ok_or_panic, recover_error, setup_snapshot, TEST_ERROR_ALLOCATORS,
+    };
     use crate::schema_visitor::{
         visit_field_integer, visit_field_struct, KernelSchemaVisitorState,
     };
@@ -1251,7 +1252,7 @@ mod scan_builder_tests {
                 kernel_string_slice!(id),
                 true,
                 std::ptr::null(),
-                &ERROR_ALLOCATORS,
+                &TEST_ERROR_ALLOCATORS,
             ))
         };
         let field_ids = [id_field_id];
@@ -1264,7 +1265,7 @@ mod scan_builder_tests {
                 1,
                 false,
                 std::ptr::null(),
-                &ERROR_ALLOCATORS,
+                &TEST_ERROR_ALLOCATORS,
             ))
         }
     }
@@ -1283,7 +1284,7 @@ mod scan_builder_tests {
                 kernel_string_slice!(crs),
                 true,
                 std::ptr::null(),
-                &ERROR_ALLOCATORS,
+                &TEST_ERROR_ALLOCATORS,
             ))
         };
         let geog = "geog";
@@ -1296,7 +1297,7 @@ mod scan_builder_tests {
                 kernel_string_slice!(algorithm),
                 true,
                 std::ptr::null(),
-                &ERROR_ALLOCATORS,
+                &TEST_ERROR_ALLOCATORS,
             ))
         };
         let field_ids = [geom_field_id, geog_field_id];
@@ -1309,7 +1310,7 @@ mod scan_builder_tests {
                 field_ids.len(),
                 false,
                 std::ptr::null(),
-                &ERROR_ALLOCATORS,
+                &TEST_ERROR_ALLOCATORS,
             ))
         }
     }
@@ -1326,7 +1327,7 @@ mod scan_builder_tests {
                 state,
                 parts.as_ptr(),
                 parts.len(),
-                &ERROR_ALLOCATORS,
+                &TEST_ERROR_ALLOCATORS,
             ))
         };
         let lit = visit_expression_literal_int(state, 10);
@@ -1494,7 +1495,7 @@ mod scan_builder_tests {
                 kernel_string_slice!(bare_field),
                 true,
                 std::ptr::null(),
-                &ERROR_ALLOCATORS,
+                &TEST_ERROR_ALLOCATORS,
             ))
         }
     }
@@ -2269,7 +2270,7 @@ mod tests {
     use super::cardinality_from_dv;
     use crate::error::FFIKernelError;
     use crate::ffi_test_utils::{
-        assert_extern_result_error_contains, ok_or_panic, ERROR_ALLOCATORS,
+        assert_extern_result_error_contains, ok_or_panic, TEST_ERROR_ALLOCATORS,
     };
     use crate::{KernelStringSlice, NullableCvoid, OptionalValue, TryFromStringSlice};
 
@@ -2297,7 +2298,7 @@ mod tests {
             })
             .unwrap_or_default();
 
-        let result = unsafe { cardinality_from_dv(&dv_info, &ERROR_ALLOCATORS) };
+        let result = unsafe { cardinality_from_dv(&dv_info, &TEST_ERROR_ALLOCATORS) };
         match expected {
             Ok(expected) => assert_eq!(ok_or_panic(result), OptionalValue::from(expected)),
             Err(message) => assert_extern_result_error_contains(
@@ -2356,7 +2357,7 @@ mod tests {
         use crate::expressions::kernel_visitor::{
             visit_expression_literal_bool, KernelExpressionVisitorState,
         };
-        use crate::ffi_test_utils::{ok_or_panic, setup_snapshot, ERROR_ALLOCATORS};
+        use crate::ffi_test_utils::{ok_or_panic, setup_snapshot, TEST_ERROR_ALLOCATORS};
         use crate::handle::Handle;
         use crate::plans::result::CPlanResult;
         use crate::plans::{get_plan_based_engine, get_plan_executor};
@@ -2389,7 +2390,7 @@ mod tests {
                 get_plan_based_engine(
                     executor,
                     OptionalValue::Some(fallback.shallow_copy()),
-                    &ERROR_ALLOCATORS,
+                    &TEST_ERROR_ALLOCATORS,
                 )
             }
         }
