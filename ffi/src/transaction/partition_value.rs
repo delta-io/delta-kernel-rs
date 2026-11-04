@@ -343,8 +343,8 @@ pub unsafe extern "C" fn partition_value_map_insert_decimal(
 
 /// Insert a typed `null` partition value under `name`. The `type_tag` identifies the column's
 /// data type using the same `NullTypeTag` encoding as `visit_expression_literal_null` in
-/// [`kernel_visitor`](crate::expressions::kernel_visitor). Fixed types ignore `parameters`.
-/// Decimal and year-month interval nulls read their respective [`KernelNullTypeParameters`] fields.
+/// [`kernel_visitor`](crate::expressions::kernel_visitor). Decimal and year-month interval nulls
+/// read their respective [`KernelNullTypeParameters`] fields.
 ///
 /// Returns an error if the tag is unrecognized, is the non-primitive sentinel (255), or carries
 /// invalid active parameters. A null partition value is only legal for a nullable partition

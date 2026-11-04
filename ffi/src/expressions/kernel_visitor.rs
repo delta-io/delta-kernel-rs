@@ -660,9 +660,8 @@ impl NullTypeTag {
 
 /// Visit a typed null literal expression.
 ///
-/// The `type_tag` identifies the data type using the `NullTypeTag` encoding. Fixed types ignore
-/// `parameters`. Decimal (tag 12) and year-month interval (tag 13) nulls read their respective
-/// fields.
+/// The `type_tag` identifies the data type using the `NullTypeTag` encoding. Decimal (tag 12) and
+/// year-month interval (tag 13) nulls read their respective fields.
 ///
 /// Returns an error if the type tag is unrecognized, if the tag is `NonPrimitive` (255), or
 /// if the active parameters are invalid.
