@@ -648,24 +648,24 @@ impl<R: ResolveColumnAsScalar> DefaultKernelPredicateEvaluator<R> {
     // CASE conditions use SQL WHERE semantics: only TRUE selects a branch. Handle known NULL
     // boolean inputs here without changing the unknown NULL sentinels used by pruning callers.
     fn eval_case_when_condition(&self, pred: &Pred, inverted: bool) -> Option<bool> {
-        match pred {
-            Pred::BooleanExpression(expr) => {
-                let mut expr = expr;
-                while let Expr::CaseWhen(case_when) = expr {
-                    expr = self.select_case_when_branch(case_when)?;
-                }
-                match expr {
-                    Expr::Predicate(pred) => self.eval_case_when_condition(pred, inverted),
-                    _ => match self.eval_expr(expr)? {
-                        Scalar::Boolean(value) => Some(value != inverted),
-                        Scalar::Null(DataType::BOOLEAN) => Some(false),
-                        _ => None,
-                    },
-                }
+        let mut expr = match pred {
+            Pred::BooleanExpression(expr) => expr,
+            _ => {
+                return eval_pred_sql_where(self, pred, inverted, |pred, inverted| {
+                    self.eval_case_when_condition(pred, inverted)
+                });
             }
-            _ => eval_pred_sql_where(self, pred, inverted, |pred, inverted| {
-                self.eval_case_when_condition(pred, inverted)
-            }),
+        };
+        while let Expr::CaseWhen(case_when) = expr {
+            expr = self.select_case_when_branch(case_when)?;
+        }
+        if let Expr::Predicate(pred) = expr {
+            return self.eval_case_when_condition(pred, inverted);
+        }
+        match self.eval_expr(expr)? {
+            Scalar::Boolean(value) => Some(value != inverted),
+            Scalar::Null(DataType::BOOLEAN) => Some(false),
+            _ => None,
         }
     }
 

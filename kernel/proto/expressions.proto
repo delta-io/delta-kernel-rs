@@ -246,10 +246,10 @@ message Expression {
     UnaryExpression unary = 6;
     BinaryExpression binary = 7;
     VariadicExpression variadic = 8;
+    CaseWhenExpression case_when = 9;
     OpaqueExpression opaque = 10;
     ParseJsonExpression parse_json = 11;
     MapToStructExpression map_to_struct = 12;
     string unknown = 13;
-    CaseWhenExpression case_when = 14;
   }
 }
