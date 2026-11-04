@@ -162,6 +162,7 @@ async fn write_parquet_to_store(
 }
 
 /// Lists the log segment for the latest version of the table at `table_root`.
+#[cfg(feature = "adaptive-metadata-in-dev")]
 pub(crate) fn latest_log_segment(table_root: &Url, engine: &dyn Engine) -> LogSegment {
     let log_root = table_root.join("_delta_log/").unwrap();
     let storage = engine.storage_handler();
