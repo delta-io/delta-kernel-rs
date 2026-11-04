@@ -1569,11 +1569,11 @@ impl LogSegment {
             log_root: self.log_root.clone(),
             last_checkpoint_metadata: None,
             listed: LogSegmentFiles {
+                latest_commit_file: commits.last().cloned(),
                 ascending_commit_files: commits,
                 ascending_compaction_files: compactions,
                 checkpoint_parts: vec![],
                 latest_crc_file: None,
-                latest_commit_file: None,
                 max_published_version: None,
             },
         }
