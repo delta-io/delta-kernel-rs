@@ -207,9 +207,10 @@ fn prepare_incremental(
                 let newer_crc = base_crc
                     .as_ref()
                     .filter(|crc| crc.version > existing.version());
-                segment
-                    .segment_after_version(existing.version())
-                    .read_protocol_metadata_opt(engine, newer_crc)?
+                match newer_crc {
+                    Some(crc) => segment.read_protocol_metadata_opt(engine, Some(crc))?,
+                    None => segment.read_protocol_metadata_after(engine, existing.version())?,
+                }
             }
         };
         Ok((resolution, crc_at_version.map(|(crc, _)| crc).or(base_crc)))

@@ -78,13 +78,8 @@ impl LogSegment {
                 "Pruning log segment to commits after CRC version {}",
                 crc.version
             );
-            let pruned = self.segment_after_version(crc.version);
-            // Ignore pruned P&M at or below the CRC version: a lagging AMT checkpoint action can
-            // carry it, and the CRC's P&M is at least as new. A captured checkpoint action is still
-            // the latest: any action at or below the CRC is older.
-            let mut resolution = pruned
-                .replay_for_pm(engine)?
-                .newer_than(version_as_i64(crc.version)?)
+            let mut resolution = self
+                .replay_for_pm_after(engine, crc.version)?
                 .into_resolution(ProtocolMetadataSource::CrcSeededPmOnlyReplay);
             if resolution.metadata.is_some() && resolution.protocol.is_some() {
                 info!("Found P&M from pruned log replay");
@@ -107,6 +102,35 @@ impl LogSegment {
         Ok(self
             .replay_for_pm(engine)?
             .into_resolution(ProtocolMetadataSource::FullReplay))
+    }
+
+    /// Reads Protocol and Metadata changes newer than an already resolved table state.
+    ///
+    /// Reads only commits after `version`. A new commit may embed an AMT checkpoint whose state
+    /// is at or below `version`; that checkpoint's P&M cannot replace the caller's newer state.
+    /// Missing changes are returned as `None`, while any captured checkpoint action is retained.
+    /// `version` must be at or above this segment's checkpoint version.
+    #[instrument(name = "log_seg.load_p_m", skip_all, fields(enable_call_frame), err)]
+    pub(crate) fn read_protocol_metadata_after(
+        &self,
+        engine: &dyn Engine,
+        version: Version,
+    ) -> KernelResult<PmResolution> {
+        Ok(self
+            .replay_for_pm_after(engine, version)?
+            .into_resolution(ProtocolMetadataSource::FullReplay))
+    }
+
+    /// Filters both commit versions and embedded P&M versions against the caller's baseline.
+    fn replay_for_pm_after(
+        &self,
+        engine: &dyn Engine,
+        version: Version,
+    ) -> KernelResult<PmCandidate> {
+        Ok(self
+            .segment_after_version(version)
+            .replay_for_pm(engine)?
+            .newer_than(version_as_i64(version)?))
     }
 
     /// Replays the log segment for the latest Protocol and Metadata, each with its version.
