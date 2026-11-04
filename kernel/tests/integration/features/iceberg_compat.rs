@@ -1031,18 +1031,17 @@ impl<'a> SchemaTransform<'a> for ExpectedFieldIdMap {
         }
         if let Some(MetadataValue::Other(json)) =
             field.get_config_value(&ColumnMetadataKey::ColumnMappingNestedIds)
+            && let Some(obj) = json.as_object()
         {
-            if let Some(obj) = json.as_object() {
-                // Each key is a relative path rooted at the field's physical name, e.g.
-                // `<phys>.key`, `<phys>.key.element`. We translate it to its corresponding
-                // `parquet_schema_path`.
-                for (physical_nested_path, value) in obj {
-                    if let Some(id) = value.as_i64() {
-                        self.expected.insert(
-                            translate_nested_path(&field_parquet_schema_path, physical_nested_path),
-                            id,
-                        );
-                    }
+            // Each key is a relative path rooted at the field's physical name, e.g.
+            // `<phys>.key`, `<phys>.key.element`. We translate it to its corresponding
+            // `parquet_schema_path`.
+            for (physical_nested_path, value) in obj {
+                if let Some(id) = value.as_i64() {
+                    self.expected.insert(
+                        translate_nested_path(&field_parquet_schema_path, physical_nested_path),
+                        id,
+                    );
                 }
             }
         }

@@ -804,23 +804,23 @@ impl Snapshot {
         // it, skipping the checkpoint. A stale `Partial` CRC (one whose file lacked the
         // `setTransactions` field) has no authoritative transaction set, so it cannot root the
         // scan and falls through to the full replay below.
-        if let Some(base) = self.base_crc() {
-            if let SetTransactionState::Complete(base_active) = &base.set_transaction_state {
-                let txn = SetTransactionScanner::get_one_rooted_in_crc(
-                    self.log_segment(),
-                    application_id,
-                    base_active,
-                    base.version,
-                    engine,
-                )?;
-                let version = txn.and_then(|txn| txn.non_expired_version(expiration_timestamp));
-                // TODO: report a distinct metric source here. A rooted tail scan is neither a
-                //       cache hit nor a full replay, yet `from_cache = false` buckets it with
-                //       full replay, hiding the checkpoint-skipping win. A 3-variant source enum
-                //       (cache / crc-rooted / full-replay) would let metrics measure it.
-                record_metric(false, version.is_some());
-                return Ok(version);
-            }
+        if let Some(base) = self.base_crc()
+            && let SetTransactionState::Complete(base_active) = &base.set_transaction_state
+        {
+            let txn = SetTransactionScanner::get_one_rooted_in_crc(
+                self.log_segment(),
+                application_id,
+                base_active,
+                base.version,
+                engine,
+            )?;
+            let version = txn.and_then(|txn| txn.non_expired_version(expiration_timestamp));
+            // TODO: report a distinct metric source here. A rooted tail scan is neither a
+            //       cache hit nor a full replay, yet `from_cache = false` buckets it with
+            //       full replay, hiding the checkpoint-skipping win. A 3-variant source enum
+            //       (cache / crc-rooted / full-replay) would let metrics measure it.
+            record_metric(false, version.is_some());
+            return Ok(version);
         }
 
         // Fallback: full log replay. Scan for the newest txn and apply expiration to it, like the
@@ -837,10 +837,10 @@ impl Snapshot {
         &self,
         engine: &dyn Engine,
     ) -> KernelResult<SetTransactionMap> {
-        if let Some(crc) = self.crc_at_version() {
-            if let SetTransactionState::Complete(map) = &crc.set_transaction_state {
-                return Ok(map.clone());
-            }
+        if let Some(crc) = self.crc_at_version()
+            && let SetTransactionState::Complete(map) = &crc.set_transaction_state
+        {
+            return Ok(map.clone());
         }
         SetTransactionScanner::get_all(self.log_segment(), engine)
     }
@@ -1022,21 +1022,21 @@ impl Snapshot {
         // it, skipping the checkpoint. A stale `Partial` CRC (one whose file lacked the
         // `domainMetadata` field) has no authoritative active-domain set, so it cannot root the
         // scan and falls through to the full replay below.
-        if let Some(base) = self.base_crc() {
-            if let DomainMetadataState::Complete(base_active) = &base.domain_metadata_state {
-                let rooted = self.log_segment().scan_domain_metadatas_rooted_in_crc(
-                    base.version,
-                    base_active,
-                    domains,
-                    engine,
-                )?;
-                // TODO: report a distinct metric source here. A rooted tail scan is neither a
-                //       cache hit nor a full replay, yet `from_cache = false` buckets it with
-                //       full replay, hiding the checkpoint-skipping win. A 3-variant source enum
-                //       (cache / crc-rooted / full-replay) would let metrics measure it.
-                record_metric(false, rooted.len());
-                return Ok(rooted);
-            }
+        if let Some(base) = self.base_crc()
+            && let DomainMetadataState::Complete(base_active) = &base.domain_metadata_state
+        {
+            let rooted = self.log_segment().scan_domain_metadatas_rooted_in_crc(
+                base.version,
+                base_active,
+                domains,
+                engine,
+            )?;
+            // TODO: report a distinct metric source here. A rooted tail scan is neither a
+            //       cache hit nor a full replay, yet `from_cache = false` buckets it with
+            //       full replay, hiding the checkpoint-skipping win. A 3-variant source enum
+            //       (cache / crc-rooted / full-replay) would let metrics measure it.
+            record_metric(false, rooted.len());
+            return Ok(rooted);
         }
 
         // Fallback: scan the log_segment from scratch.
@@ -1111,14 +1111,13 @@ impl Snapshot {
         if let InCommitTimestampEnablement::Enabled {
             enablement: Some((enablement_version, _)),
         } = enablement
+            && self.version() < enablement_version
         {
-            if self.version() < enablement_version {
-                return Err(KernelError::generic(format!(
-                    "Invalid state: snapshot at version {} has ICT enablement version {} in the future",
-                    self.version(),
-                    enablement_version
-                )));
-            }
+            return Err(KernelError::generic(format!(
+                "Invalid state: snapshot at version {} has ICT enablement version {} in the future",
+                self.version(),
+                enablement_version
+            )));
         }
 
         // Fast path: serve ICT from CRC if available at this version.

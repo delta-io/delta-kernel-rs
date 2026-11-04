@@ -654,12 +654,12 @@ impl LogSegment {
         log_tail: Vec<ParsedLogPath>,
     ) -> KernelResult<Self> {
         let end_version = end_version.into();
-        if let Some(end_version) = end_version {
-            if start_version > end_version {
-                return Err(KernelError::generic(
-                    "Failed to build LogSegment: start_version cannot be greater than end_version",
-                ));
-            }
+        if let Some(end_version) = end_version
+            && start_version > end_version
+        {
+            return Err(KernelError::generic(
+                "Failed to build LogSegment: start_version cannot be greater than end_version",
+            ));
         }
 
         // TODO: compactions?
@@ -1799,16 +1799,15 @@ fn validate_compaction_files(compactions: &[ParsedLogPath]) -> KernelResult<()> 
                 f.version, hi
             )));
         }
-        if let Some(next) = compactions.get(i + 1) {
-            // next's type is validated on its own iteration; skip sort check if it isn't a
-            // CompactedCommit since the type error will be caught then.
-            if let LogPathFileType::CompactedCommit { hi: next_hi } = next.file_type {
-                if !(f.version < next.version || (f.version == next.version && hi <= next_hi)) {
-                    return Err(KernelError::invalid_log_segment(format!(
-                        "ascending_compaction_files is not sorted: {f:?} -> {next:?}"
-                    )));
-                }
-            }
+        // next's type is validated on its own iteration; skip sort check if it isn't a
+        // CompactedCommit since the type error will be caught then.
+        if let Some(next) = compactions.get(i + 1)
+            && let LogPathFileType::CompactedCommit { hi: next_hi } = next.file_type
+            && !(f.version < next.version || (f.version == next.version && hi <= next_hi))
+        {
+            return Err(KernelError::invalid_log_segment(format!(
+                "ascending_compaction_files is not sorted: {f:?} -> {next:?}"
+            )));
         }
     }
     Ok(())

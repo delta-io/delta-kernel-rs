@@ -699,15 +699,15 @@ impl FileStatsAccumulator {
             collect_stats_raw(batch, &self.stats_columns, &self.null_count_only_columns)?;
         // Schema equality can ignore a struct column's nested field names, which statistics
         // collection filters on, so equal schemas can still derive different stats shapes.
-        if let Some(first) = row_groups.first() {
-            if first.data_type() != batch_stats.data_type() {
-                return Err(KernelError::schema(format!(
-                    "all row groups must produce the same statistics shape; batch schemas compare \
+        if let Some(first) = row_groups.first()
+            && first.data_type() != batch_stats.data_type()
+        {
+            return Err(KernelError::schema(format!(
+                "all row groups must produce the same statistics shape; batch schemas compare \
                      equal but their nested field names differ: {} vs {}",
-                    first.data_type(),
-                    batch_stats.data_type(),
-                )));
-            }
+                first.data_type(),
+                batch_stats.data_type(),
+            )));
         }
         row_groups.push(batch_stats);
         Ok(())

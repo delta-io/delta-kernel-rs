@@ -155,11 +155,10 @@ fn group_checkpoint_parts(
                 // a multi-part checkpoint
                 if let Some(part_files) = checkpoints.get_mut(&CheckpointInstance::MultiPart {
                     num_parts: *num_parts,
-                }) {
-                    if *part_num as usize == 1 + part_files.len() {
-                        // Safe to append because all previous parts exist
-                        part_files.push(part_file);
-                    }
+                }) && *part_num as usize == 1 + part_files.len()
+                {
+                    // Safe to append because all previous parts exist
+                    part_files.push(part_file);
                 }
             }
             Commit | StagedCommit | CompactedCommit { .. } | Crc | Unknown => {}
