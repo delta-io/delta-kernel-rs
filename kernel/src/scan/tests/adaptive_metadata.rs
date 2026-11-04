@@ -14,7 +14,7 @@ use crate::arrow::array::StringArray;
 use crate::content_tree::test_utils::{added_data_entry, data_manifest_entry, write_manifest};
 use crate::content_tree::{ContentTreeNodeEntry, TrackingInfo, TrackingStatus};
 use crate::engine::sync::SyncEngine;
-use crate::expressions::{col, lit, Predicate as Pred};
+use crate::expressions::{Predicate as Pred, col, lit};
 use crate::object_store::memory::InMemory;
 use crate::scan::{Scan, ScanMetadata};
 use crate::schema::schema_ref;

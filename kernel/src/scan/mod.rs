@@ -1244,10 +1244,10 @@ impl Scan {
         // Likewise for an AMT checkpoint action: commits at or below its version may no longer be
         // listed, so a hint from before it cannot be advanced commit by commit.
         #[cfg(feature = "adaptive-metadata-in-dev")]
-        if let Some(checkpoint) = self.snapshot.latest_checkpoint_action(engine)? {
-            if Version::try_from(checkpoint.version()).is_ok_and(|v| v > existing_version) {
-                return Ok(Box::new(self.scan_metadata(engine)?));
-            }
+        if let Some(checkpoint) = self.snapshot.latest_checkpoint_action(engine)?
+            && Version::try_from(checkpoint.version()).is_ok_and(|v| v > existing_version)
+        {
+            return Ok(Box::new(self.scan_metadata(engine)?));
         }
 
         // create a new log segment containing only the commits added after the version hint.

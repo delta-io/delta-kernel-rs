@@ -332,8 +332,8 @@ pub(crate) mod adaptive_metadata_fixtures {
         LastManifestCommit, Sidecar,
     };
     use crate::arrow::array::{Array as _, AsArray as _};
-    use crate::content_tree::test_utils::write_manifest;
     use crate::content_tree::ContentTreeNodeEntry;
+    use crate::content_tree::test_utils::write_manifest;
     use crate::engine_data::FilteredEngineData;
     use crate::expressions::Scalar;
     use crate::path::LogRoot;
