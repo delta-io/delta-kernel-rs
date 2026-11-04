@@ -441,7 +441,8 @@ impl LogSegment {
             .find_commit_cover_paths(None)
             .first()
             .is_some_and(|path| !path.is_commit());
-        self.newest_commit_after_checkpoint().filter(|_| newest_cover_is_compaction)
+        self.newest_commit_after_checkpoint()
+            .filter(|_| newest_cover_is_compaction)
     }
 
     /// The commit at `end_version`, or `None` when the segment ends on a checkpoint. Unlike
@@ -558,7 +559,9 @@ impl PmReplaySegment {
             // The newest commit's own action, which replay checks against its pointer. A segment
             // ending on a checkpoint does not list that commit, and the checkpoint's rows share
             // its version.
-            Self::WholeSegment => log_segment.newest_commit().map(|commit| commit.version),
+            Self::WholeSegment => log_segment
+                .newest_commit_after_checkpoint()
+                .map(|commit| commit.version),
             // The newest commit's own action, which replay checks against its pointer.
             Self::NewestCommit => Some(log_segment.end_version),
             // The action the newest commit's pointer names.
