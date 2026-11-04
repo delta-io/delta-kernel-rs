@@ -30,7 +30,7 @@ const V3_CHECKS: &[IcebergCompatCheck] = &[
     IcebergCompatCheck::write_only(iceberg_compat_v3_column_defaults_validation),
 ];
 
-fn is_v3_supported_type(dt: &DataType) -> bool {
+pub(super) fn is_v3_supported_type(dt: &DataType) -> bool {
     matches!(
         dt,
         DataType::Primitive(
