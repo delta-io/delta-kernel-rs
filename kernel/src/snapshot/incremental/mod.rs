@@ -97,8 +97,8 @@ impl SnapshotUpdate {
             }
         }
 
-        // Select retained history before resolving state: checkpoint adoption decides whether
-        // every commit after the existing snapshot remains available for incremental replay.
+        // First select files for scans and future updates. Checkpoint adoption can change this
+        // retained history even when the snapshot version does not advance.
         let start = Instant::now();
         let update = LogUpdate::discover(
             &existing.log_segment,
@@ -123,6 +123,8 @@ impl SnapshotUpdate {
         tracing::Span::current().record("version", segment.end_version);
         emit_log_segment_load(&metric_context, &segment, start.elapsed());
 
+        // The selected files now cover the target. Extend cached state if all intervening commits
+        // remain; a checkpoint ahead of the snapshot supplies a new state baseline instead.
         let prepared = match baseline {
             StateBaseline::ExistingSnapshot => {
                 prepare_incremental(existing, &segment, engine, self.crc_replay, &metric_context)
@@ -138,6 +140,8 @@ impl SnapshotUpdate {
         }
         .inspect_err(|error| report_failure(error, &segment))?;
 
+        // Both paths return validated state. Construction now combines it with the retained files
+        // and build flags without further I/O.
         let PreparedSnapshot {
             table_configuration,
             crc,
@@ -178,6 +182,8 @@ fn prepare_incremental(
         .inspect_err(|_| emit_protocol_metadata_load_failure(metric_context))?;
     emit_protocol_metadata_load(metric_context, resolution.source, start.elapsed());
 
+    // Apply only the changed protocol/metadata fields. With neither changed, this keeps the
+    // parsed schema and properties and updates only the configuration's version.
     let table_configuration = TableConfiguration::try_new_from(
         existing_config,
         resolution.metadata,
@@ -197,22 +203,24 @@ fn prepare_incremental(
 
 /// Resolves protocol/metadata changes and the CRC to retain for the updated snapshot.
 ///
-/// CRC replay starts from the newest usable disk or in-memory CRC and measures its budget from
-/// that CRC's version, which may predate the snapshot. Without a target CRC, protocol and metadata
-/// start from the existing snapshot or a newer CRC. A stale CRC may still be retained for future
-/// updates; it cannot replace newer protocol or metadata.
+/// The CRC replay budget is measured from the base CRC's version, which may predate the snapshot.
+/// A stale CRC can support future updates but cannot replace newer protocol or metadata.
 fn resolve_incremental_state(
     existing: &Snapshot,
     segment: &LogSegment,
     engine: &dyn Engine,
     crc_replay: IncrementalReplay,
 ) -> KernelResult<(PmResolution, Option<Arc<Crc>>)> {
+    // Try to obtain a CRC at the target version first: it supplies complete protocol and metadata,
+    // so success avoids a separate protocol/metadata replay.
     let base_crc = segment.pick_latest_base_crc(engine, existing.base_crc())?;
     let crc_at_version =
         segment.try_build_crc_within_budget(engine, base_crc.as_ref(), crc_replay)?;
     let mut resolution = match &crc_at_version {
         Some((crc, source)) => PmResolution::from_crc(crc, *source),
         None => {
+            // Advancing a CRC is optional; resolving protocol and metadata at the target is not.
+            // Start from the newer of the base CRC and cached state, then replay later changes.
             let newer_crc = base_crc
                 .as_ref()
                 .filter(|crc| crc.version > existing.version());
@@ -223,7 +231,8 @@ fn resolve_incremental_state(
         }
     };
 
-    // None preserves the existing configuration, including its parsed schema and properties.
+    // CRC-based resolution supplies complete values, including unchanged ones. Clear those fields
+    // so every replay path reports only replacements to apply to the existing configuration.
     let existing_config = existing.table_configuration();
     resolution
         .metadata
