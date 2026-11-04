@@ -135,6 +135,16 @@ snapshot or the connector's engine. In-memory getters remain on `Snapshot`.
 `execute()` (simple), `scan_metadata()` (advanced/distributed),
 `parallel_scan_metadata()` (two-phase distributed log replay).
 
+With `declarative-plans`, scans, checkpoint reconstruction, protocol/metadata loading, and
+minor log compaction share `action_reconciliation::plan`. Source functions return
+`(PlanBuilder, ActionOptions)`: selected actions, actual JSON/parsed stats, and a boolean for
+snapshot-typed parsed partition values. `FileActions { includes_removes }` records possible rows,
+independently of null padding. Replay selects whole actions by identity using aggregate-all or
+commit aggregation plus a base anti join. Consumers update representation facts explicitly, parse
+before scan pruning or after checkpoint retention, and synthesize JSON before pruning stats.
+Non-file-only V2 reads skip sidecars. CRC live adds cannot supply checkpoint tombstones. AMT
+protocol/metadata loading retains its specialized planner. Minor compaction reads a complete
+published commit interval without retention; writing and publication remain separate.
 
 **Write path:** `Snapshot` -> `UpdateTableTransactionBuilder` -> `Transaction` -> `commit()`.
 `UpdateTableTransactionBuilder<MODE>` aliases `TransactionBuilder<UpdateTable, MODE>`; the

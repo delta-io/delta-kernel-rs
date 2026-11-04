@@ -112,6 +112,16 @@ set), `data_skipping.rs` (rewrite predicates against min/max/nullCount stats and
   calls `transform_to_logical` / `DvInfo::get_selection_vector`
 - `scan.parallel_scan_metadata(engine)`: two-phase distributed log replay (requires the
   `internal-api` feature)
+- `scan.declarative_metadata_scan_plan(engine)`: builds a live-add relation using shared
+  `action_reconciliation::plan` sources, metadata conversion, and replay. Sources return
+  `(PlanBuilder, ActionOptions)` with actual action/statistics/partition representations.
+  Options are a plain struct; planning steps update them explicitly. Replay supports full
+  aggregation and commit aggregation plus a base anti join, preserving winning versions.
+  Checkpoints parse after replay and retention; scans parse before pruning. JSON synthesis must
+  precede pruning structured stats. Non-file-only V2 reads skip sidecars. Protocol/metadata
+  bootstrap uses the same sources; AMT keeps its specialized planner.
+  `Snapshot::declarative_log_compaction_data_plan` replays a published commit interval without
+  retention. Artifact writes and publication remain separate.
 
 **Incremental read:** `Snapshot::incremental_scan_builder(base_version)` streams the file-action
 diff over `(base_version, target_version]`: live Adds as a `FilteredEngineData` iterator

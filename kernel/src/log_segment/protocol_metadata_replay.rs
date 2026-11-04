@@ -9,6 +9,19 @@ use tracing::{info, instrument};
 use url::Url;
 
 use super::LogSegment;
+#[cfg(all(
+    feature = "declarative-plans",
+    any(test, not(feature = "adaptive-metadata-in-dev"))
+))]
+use crate::action_reconciliation::plan::{
+    ActionOptions, ReplayStrategy, replay,
+    sources::{checkpoint_actions, commit_actions},
+};
+#[cfg(all(
+    feature = "declarative-plans",
+    any(test, not(feature = "adaptive-metadata-in-dev"))
+))]
+use crate::actions::ActionKind;
 #[cfg(all(feature = "adaptive-metadata-in-dev", feature = "declarative-plans"))]
 use crate::actions::CHECKPOINT_ACTION_NAME;
 #[cfg(feature = "adaptive-metadata-in-dev")]
@@ -18,14 +31,14 @@ use crate::actions::{METADATA_FIELD, Metadata, PROTOCOL_FIELD, Protocol};
 use crate::actions::{METADATA_NAME, PROTOCOL_NAME};
 use crate::crc::Crc;
 use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
-#[cfg(feature = "declarative-plans")]
+#[cfg(all(feature = "declarative-plans", feature = "adaptive-metadata-in-dev"))]
 use crate::expressions::{Predicate, col};
 use crate::log_replay::ActionsBatch;
 use crate::metrics::ProtocolMetadataSource;
 use crate::path::ParsedLogPath;
 #[cfg(feature = "declarative-plans")]
 use crate::plans::ir::nodes::Agg;
-#[cfg(feature = "declarative-plans")]
+#[cfg(all(feature = "declarative-plans", feature = "adaptive-metadata-in-dev"))]
 use crate::plans::ir::nodes::FileType;
 #[cfg(feature = "declarative-plans")]
 use crate::plans::ir::plan::Plan;
@@ -147,17 +160,43 @@ impl LogSegment {
     /// Builds the declarative plan that selects the latest Protocol and Metadata actions.
     #[cfg(feature = "declarative-plans")]
     fn build_pm_plan(&self) -> KernelResult<Plan> {
+        #[cfg(not(feature = "adaptive-metadata-in-dev"))]
+        {
+            self.build_shared_pm_plan(ReplayStrategy::AggregateAll)
+        }
         #[cfg(feature = "adaptive-metadata-in-dev")]
+        {
+            self.build_amt_pm_plan()
+        }
+    }
+
+    #[cfg(all(
+        feature = "declarative-plans",
+        any(test, not(feature = "adaptive-metadata-in-dev"))
+    ))]
+    fn build_shared_pm_plan(&self, strategy: ReplayStrategy) -> KernelResult<Plan> {
+        let options = ActionOptions {
+            actions: [ActionKind::Protocol, ActionKind::Metadata]
+                .into_iter()
+                .collect(),
+            json_stats: false,
+            parsed_stats: None,
+            parsed_partition_values: false,
+        };
+        let commits = commit_actions(self, self.checkpoint_version, &options)?;
+        let checkpoint = checkpoint_actions(self, None, None, &options)?;
+        let state = replay(commits, checkpoint, strategy)?;
+        pm_result_plan(state.0)
+    }
+
+    // AMT checkpoint actions carry embedded P&M at their own versions, requiring nested-action
+    // extraction separate from top-level action replay.
+    #[cfg(all(feature = "declarative-plans", feature = "adaptive-metadata-in-dev"))]
+    fn build_amt_pm_plan(&self) -> KernelResult<Plan> {
         let versioned_schema = schema_ref! {
             (&PROTOCOL_FIELD),
             (&METADATA_FIELD),
             (&CHECKPOINT_ACTION_FIELD),
-            not_null "version": LONG,
-        };
-        #[cfg(not(feature = "adaptive-metadata-in-dev"))]
-        let versioned_schema = schema_ref! {
-            (&PROTOCOL_FIELD),
-            (&METADATA_FIELD),
             not_null "version": LONG,
         };
 
@@ -182,37 +221,13 @@ impl LogSegment {
             col!(PROTOCOL_NAME, "minReaderVersion").is_not_null(),
             col!(METADATA_NAME, "id").is_not_null(),
         );
-        #[cfg(feature = "adaptive-metadata-in-dev")]
         let relevant_action =
             Predicate::or(relevant_action, col!(CHECKPOINT_ACTION_NAME).is_not_null());
 
-        PlanBuilder::union_all(std::iter::once(commits).chain(checkpoint))?
-            .filter(relevant_action)?
-            .aggregate_ungrouped(|a| {
-                let protocol = || column_name!(PROTOCOL_NAME);
-                let metadata = || column_name!(METADATA_NAME);
-                let version = || column_name!("version");
-                // The version aggregates are aliased; unaliased both would be named `version`.
-                let a = a
-                    .max_non_null_by(protocol(), protocol(), version())
-                    .max_non_null_by(metadata(), metadata(), version())
-                    .aggregate_as(
-                        Agg::max_non_null_by(version(), protocol(), version()),
-                        "protocol_version",
-                    )
-                    .aggregate_as(
-                        Agg::max_non_null_by(version(), metadata(), version()),
-                        "metadata_version",
-                    );
-                #[cfg(feature = "adaptive-metadata-in-dev")]
-                let a = a.max_non_null_by(
-                    column_name!(CHECKPOINT_ACTION_NAME),
-                    column_name!(CHECKPOINT_ACTION_NAME),
-                    version(),
-                );
-                a
-            })?
-            .build()
+        pm_result_plan(
+            PlanBuilder::union_all(std::iter::once(commits).chain(checkpoint))?
+                .filter(relevant_action)?,
+        )
     }
 
     /// Reads the P&M commit cover and checkpoint via the declarative plan, tagging each batch with
@@ -281,6 +296,43 @@ impl LogSegment {
             })
         }))
     }
+}
+
+/// Assembles the latest protocol and metadata with their independent versions.
+#[cfg(feature = "declarative-plans")]
+fn pm_result_plan(input: PlanBuilder) -> KernelResult<Plan> {
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    let include_checkpoint = input.schema().contains(CHECKPOINT_ACTION_NAME);
+    input
+        .aggregate_ungrouped(|a| {
+            let protocol = || column_name!(PROTOCOL_NAME);
+            let metadata = || column_name!(METADATA_NAME);
+            let version = || column_name!("version");
+            // The version aggregates are aliased; unaliased both would be named `version`.
+            let a = a
+                .max_non_null_by(protocol(), protocol(), version())
+                .max_non_null_by(metadata(), metadata(), version())
+                .aggregate_as(
+                    Agg::max_non_null_by(version(), protocol(), version()),
+                    "protocol_version",
+                )
+                .aggregate_as(
+                    Agg::max_non_null_by(version(), metadata(), version()),
+                    "metadata_version",
+                );
+            #[cfg(feature = "adaptive-metadata-in-dev")]
+            let a = if include_checkpoint {
+                a.max_non_null_by(
+                    column_name!(CHECKPOINT_ACTION_NAME),
+                    column_name!(CHECKPOINT_ACTION_NAME),
+                    version(),
+                )
+            } else {
+                a
+            };
+            a
+        })?
+        .build()
 }
 
 /// How a snapshot's `lastManifestCommit` was resolved at build time, stored on the
@@ -555,18 +607,29 @@ mod tests {
     use std::sync::Arc;
 
     use itertools::Itertools;
-    use test_log::test;
 
+    #[cfg(feature = "declarative-plans")]
+    use super::{PmCandidate, VersionedBatch, pm_versions_from_plan_output, resolve_pm_batches};
+    #[cfg(feature = "declarative-plans")]
+    use crate::Engine;
     use crate::Snapshot;
+    #[cfg(feature = "declarative-plans")]
+    use crate::action_reconciliation::plan::ReplayStrategy;
     use crate::engine::sync::SyncEngine;
     #[cfg(feature = "declarative-plans")]
     use crate::engine::test_delegating::DelegatingEngine;
     #[cfg(feature = "declarative-plans")]
     use crate::expressions::{Predicate, col};
     #[cfg(feature = "declarative-plans")]
+    use crate::log_replay::ActionsBatch;
+    #[cfg(feature = "declarative-plans")]
+    use crate::log_segment::LogSegment;
+    #[cfg(feature = "declarative-plans")]
     use crate::plans::ir::nodes::Operator;
     #[cfg(feature = "declarative-plans")]
     use crate::plans::{Operation, PlanExecutor, PlanResult};
+    #[cfg(feature = "declarative-plans")]
+    use crate::unit_test_utils::{copy_test_table, load_test_table};
     #[cfg(feature = "declarative-plans")]
     use crate::{KernelError, KernelResult};
 
@@ -590,7 +653,7 @@ mod tests {
     //              type    nulls  min / max
     // txn.appId    BINARY  0      "3ae45b72-24e1-865a-a211-3..." / "3ae45b72-24e1-865a-a211-3..."
     // txn.version  INT64   0      "4390" / "4390"
-    #[test]
+    #[test_log::test]
     fn test_replay_for_metadata() {
         let path = std::fs::canonicalize(PathBuf::from("./tests/data/parquet_row_group_skipping/"));
         let url = url::Url::from_directory_path(path.unwrap()).unwrap();
@@ -623,7 +686,7 @@ mod tests {
     }
 
     #[cfg(feature = "declarative-plans")]
-    #[test]
+    #[test_log::test]
     fn test_declarative_pm_plan_filters_irrelevant_actions() {
         let path =
             std::fs::canonicalize(PathBuf::from("./tests/data/app-txn-checkpoint/")).unwrap();
@@ -661,7 +724,7 @@ mod tests {
     // produces a file kernel must translate on read. Spark and kernel both write `key_value`,
     // covered by
     // `scan_plan::execution_tests::declarative_metadata_reconciles_checkpoint_with_later_commits`.
-    #[test]
+    #[test_log::test]
     fn test_snapshot_build_via_plan_over_parquet_checkpoint_with_entries_named_maps() {
         let path =
             std::fs::canonicalize(PathBuf::from("./tests/data/app-txn-checkpoint/")).unwrap();
@@ -678,7 +741,7 @@ mod tests {
     // fields `item` where kernel expects `element`, so it covers the other half of the naming
     // disagreement. `metaData.partitionColumns` is the array in question, and it is present in
     // every `metaData` action, so its element name is checked on every P&M replay.
-    #[test]
+    #[test_log::test]
     fn test_snapshot_build_via_plan_over_parquet_checkpoint_with_item_named_arrays() {
         let path = std::fs::canonicalize(PathBuf::from("./tests/data/parsed-stats/")).unwrap();
         let url = url::Url::from_directory_path(path).unwrap();
@@ -691,7 +754,7 @@ mod tests {
     }
 
     #[cfg(feature = "declarative-plans")]
-    #[test]
+    #[test_log::test]
     fn test_snapshot_build_via_failing_plan_executor_surfaces_error_without_fallback() {
         let path =
             std::fs::canonicalize(PathBuf::from("./tests/data/app-txn-checkpoint/")).unwrap();
@@ -705,5 +768,109 @@ mod tests {
             result.is_err(),
             "plan failure must surface, not fall back to legacy replay"
         );
+    }
+    #[cfg(feature = "declarative-plans")]
+    fn shared_pm_candidate(
+        segment: &LogSegment,
+        engine: &dyn Engine,
+        strategy: ReplayStrategy,
+    ) -> KernelResult<PmCandidate> {
+        let plan = segment.build_shared_pm_plan(strategy)?;
+        assert!(
+            !plan
+                .nodes
+                .iter()
+                .any(|node| matches!(node.op, Operator::DynamicScan(_)))
+        );
+        let batches = engine
+            .require_plan_executor()?
+            .execute_op(Operation::QueryPlan(plan))?
+            .into_data()?;
+        resolve_pm_batches(batches.map(|batch| {
+            let batch = ActionsBatch::new(batch?, false);
+            let (protocol_version, metadata_version) =
+                pm_versions_from_plan_output(batch.actions.as_ref())?;
+            Ok(VersionedBatch {
+                protocol_version,
+                metadata_version,
+                batch,
+            })
+        }))
+    }
+
+    #[cfg(feature = "declarative-plans")]
+    #[rstest::rstest]
+    #[case("app-txn-no-checkpoint")]
+    #[case("app-txn-checkpoint")]
+    #[case("v1-single-part-struct-stats-only")]
+    #[case("v1-multi-part-struct-stats-only")]
+    #[case("v1-multi-part-partitioned-struct-stats-only")]
+    #[case("v2-checkpoints-json-with-sidecars")]
+    #[case("v2-checkpoints-parquet-with-sidecars")]
+    #[case("v2-checkpoints-json-without-sidecars")]
+    #[case("v2-checkpoints-parquet-without-sidecars")]
+    #[case("v2-json-sidecars-struct-stats-only")]
+    #[case("v2-parquet-sidecars-struct-stats-only")]
+    fn shared_pm_matches_imperative_replay(
+        #[case] table: &str,
+        #[values(ReplayStrategy::AggregateAll, ReplayStrategy::AggregateTailAndAntiJoin)] strategy: ReplayStrategy,
+    ) -> KernelResult<()> {
+        let (engine, snapshot, _tempdir) = load_test_table(table)?;
+        let segment = snapshot.log_segment();
+        let expected = resolve_pm_batches(segment.read_pm_batches(engine.as_ref())?)?;
+        let actual = shared_pm_candidate(segment, engine.as_ref(), strategy)?;
+        assert_eq!(actual.protocol, expected.protocol, "{table}");
+        assert_eq!(actual.metadata, expected.metadata, "{table}");
+        Ok(())
+    }
+
+    #[cfg(feature = "declarative-plans")]
+    #[rstest::rstest]
+    fn shared_pm_preserves_independent_versions_and_partial_crc_tail(
+        #[values(ReplayStrategy::AggregateAll, ReplayStrategy::AggregateTailAndAntiJoin)] strategy: ReplayStrategy,
+        #[values(false, true)] pruned: bool,
+    ) -> KernelResult<()> {
+        let (root, _tempdir) = copy_test_table("app-txn-checkpoint")?;
+        let engine = SyncEngine::new();
+        let initial = Snapshot::builder_for(root.clone()).build(&engine)?;
+        assert_eq!(initial.version(), 1);
+        let mut metadata = serde_json::to_value(initial.table_configuration().metadata())?;
+        metadata["id"] = serde_json::json!("updated");
+        for (version, action) in [
+            (
+                2,
+                serde_json::json!({"protocol":{"minReaderVersion":1,"minWriterVersion":3}}),
+            ),
+            (3, serde_json::json!({"metaData":metadata})),
+            (
+                4,
+                serde_json::json!({"txn":{"appId":"unrelated","version":1}}),
+            ),
+        ] {
+            std::fs::write(
+                root.join(&format!("_delta_log/{version:020}.json"))?
+                    .to_file_path()
+                    .unwrap(),
+                action.to_string(),
+            )?;
+        }
+        let snapshot = Snapshot::builder_for(root).build(&engine)?;
+        assert_eq!(snapshot.table_configuration().metadata().id(), "updated");
+        let segment = if pruned {
+            snapshot.log_segment().segment_after_version(2)
+        } else {
+            snapshot.log_segment().clone()
+        };
+        let actual = shared_pm_candidate(&segment, &engine, strategy)?;
+        assert_eq!(
+            actual.protocol.as_ref().map(|(v, _)| *v),
+            (!pruned).then_some(2)
+        );
+        assert_eq!(actual.metadata.as_ref().map(|(v, _)| *v), Some(3));
+        assert_eq!(actual.metadata.unwrap().1.id(), "updated");
+        if let Some((_, protocol)) = actual.protocol {
+            assert_eq!(serde_json::to_value(protocol)?["minWriterVersion"], 3);
+        }
+        Ok(())
     }
 }
