@@ -12,6 +12,9 @@ option java_package = "io.delta.kernel.proto.schema";
 // ============================================================================
 
 enum SimplePrimitiveType {
+  reserved 14;
+  reserved "SIMPLE_PRIMITIVE_TYPE_INTERVAL_YEAR_MONTH";
+
   SIMPLE_PRIMITIVE_TYPE_UNSPECIFIED = 0;
   SIMPLE_PRIMITIVE_TYPE_STRING = 1;
   SIMPLE_PRIMITIVE_TYPE_LONG = 2;
@@ -26,8 +29,7 @@ enum SimplePrimitiveType {
   SIMPLE_PRIMITIVE_TYPE_TIMESTAMP = 11;
   SIMPLE_PRIMITIVE_TYPE_TIMESTAMP_NTZ = 12;
   SIMPLE_PRIMITIVE_TYPE_VOID = 13;
-  reserved 14;
-  reserved "SIMPLE_PRIMITIVE_TYPE_INTERVAL_YEAR_MONTH";
+  // SIMPLE_PRIMITIVE_TYPE_INTERVAL_YEAR_MONTH = 14;
   SIMPLE_PRIMITIVE_TYPE_INTERVAL_DAY_TIME = 15;
 }
 
