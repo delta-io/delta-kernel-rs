@@ -218,7 +218,7 @@ impl<C: UpdateTableClient + 'static> Committer for FfiUCCommitter<C> {
 ///
 ///  Caller is responsible for passing a valid pointer to a SharedFfiUCCommitClient, obtained via
 ///  calling [`get_uc_commit_client`], valid KernelStringSlices for `table_id`, `catalog`,
-///  `schema`, and `table_name`, and a valid error function pointer.
+///  `schema`, and `table_name`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn get_uc_committer(
     commit_client: Handle<SharedFfiUCCommitClient>,
