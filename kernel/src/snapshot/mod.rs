@@ -39,7 +39,7 @@ use crate::metrics::{
 use crate::path::ParsedLogPath;
 use crate::row_tracking::{ROW_TRACKING_DOMAIN_NAME, parse_row_tracking_high_water_mark};
 use crate::scan::ScanBuilder;
-use crate::schema::SchemaRef;
+use crate::schema::{GeneratedColumn, SchemaRef};
 use crate::table_configuration::{InCommitTimestampEnablement, TableConfiguration};
 use crate::table_features::{Operation, TableFeature, physical_to_logical_column_name_and_type};
 #[cfg(feature = "check-constraints-in-dev")]
@@ -693,6 +693,22 @@ impl Snapshot {
     #[cfg(feature = "check-constraints-in-dev")]
     pub fn check_constraints(&self) -> &[CheckConstraint] {
         &self.table_properties().check_constraints
+    }
+
+    /// The table's [`GeneratedColumn`]s at this snapshot's version, in schema order. Empty when
+    /// the table has none, or when its protocol doesn't support the `generatedColumns` writer
+    /// feature.
+    ///
+    /// A connector writing to the table discovers them from
+    /// [`Transaction::generated_columns`](crate::transaction::Transaction::generated_columns)
+    /// instead.
+    ///
+    /// # Errors
+    ///
+    /// Returns a schema error if a generated column's `delta.generationExpression` metadata is not
+    /// a string.
+    pub fn generated_columns(&self) -> KernelResult<Vec<GeneratedColumn>> {
+        self.table_configuration().generated_columns()
     }
 
     /// Returns the protocol-derived table properties as a map of key-value pairs.
