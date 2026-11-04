@@ -1451,10 +1451,6 @@ impl Scan {
                     .as_ref()
                     .map(|s| s.as_ref()),
             )
-            .map(|result| ActionsWithCheckpointInfo {
-                actions: Box::new(result.actions) as Box<dyn KernelResultIterator<_>>,
-                checkpoint_info: result.checkpoint_info,
-            })
     }
 
     /// Errors when the snapshot has an AMT `checkpoint` action, which `entry_point` does not yet

@@ -6,7 +6,6 @@ use std::sync::Arc;
 use itertools::Itertools as _;
 use rstest::rstest;
 use serde_json::json;
-use test_utils::add_commit;
 use url::Url;
 
 use super::get_files_for_scan;
@@ -20,9 +19,9 @@ use crate::scan::{Scan, ScanMetadata};
 use crate::schema::schema_ref;
 use crate::transaction::BASE_ADD_FILES_SCHEMA;
 use crate::unit_test_utils::adaptive_metadata_fixtures::{
-    checkpoint_action_with_root, checkpoint_line, commit_file_changes, commit_files,
-    commit_root_manifest, commit_root_manifest_file, create_adaptive_metadata_table,
-    setup_adaptive_metadata_table,
+    checkpoint_action_with_root, commit_file_changes, commit_files, commit_root_manifest,
+    commit_root_manifest_file, create_adaptive_metadata_table, setup_adaptive_metadata_table,
+    write_manifest_commit_keeping_pm,
 };
 use crate::unit_test_utils::{assert_result_error_with_message, string_array_to_engine_data};
 use crate::{Engine, EngineData, FileMeta, KernelResult, Snapshot, Version};
@@ -45,10 +44,8 @@ fn deleted_entry(path: &str) -> ContentTreeNodeEntry {
 /// - v2: a checkpoint action whose tree lists `a`, `b`, and a deleted `gone`;
 /// - v3: an add of `g` and a remove of `a`;
 /// - v4: a checkpoint action whose tree lists `b`, `g`, and `h`.
-async fn two_checkpoint_table() -> SyncEngine {
-    let store = Arc::new(InMemory::new());
-    let engine = SyncEngine::new_with_store(store.clone());
-    create_adaptive_metadata_table(&engine, &table_root(), &[]);
+fn two_checkpoint_table() -> SyncEngine {
+    let (engine, _) = setup_adaptive_metadata_table();
     commit_files(&engine, &table_root(), &["stale.parquet"], &[]);
     let tree1 = [
         added_data_entry("a.parquet", 1, 1, 0, 0),
@@ -68,9 +65,7 @@ async fn two_checkpoint_table() -> SyncEngine {
     let root_path = "metadata/root-4.parquet";
     let root = write_manifest(&engine, table_root().join(root_path).unwrap(), &tree2);
     let checkpoint = checkpoint_action_with_root(root_path, root.size as i64, 4).unwrap();
-    add_commit(TABLE_ROOT, store.as_ref(), 4, checkpoint_line(&checkpoint))
-        .await
-        .unwrap();
+    write_manifest_commit_keeping_pm(&engine, &table_root(), 4, checkpoint).unwrap();
     engine
 }
 
@@ -98,12 +93,8 @@ fn strings(values: &[&str]) -> Vec<String> {
 #[case::at_first_checkpoint(2, &["a.parquet", "b.parquet"])]
 #[case::commits_after_first_checkpoint(3, &["b.parquet", "g.parquet"])]
 #[case::at_second_checkpoint(4, &["b.parquet", "g.parquet", "h.parquet"])]
-#[tokio::test]
-async fn scan_reads_latest_tree_then_later_commits(
-    #[case] version: Version,
-    #[case] expected: &[&str],
-) {
-    let engine = two_checkpoint_table().await;
+fn scan_reads_latest_tree_then_later_commits(#[case] version: Version, #[case] expected: &[&str]) {
+    let engine = two_checkpoint_table();
     assert_eq!(
         scan_paths(&engine, snapshot_at(&engine, version)),
         strings(expected)
@@ -298,13 +289,12 @@ fn cached_scan_metadata(engine: &SyncEngine, snapshot: Arc<Snapshot>) -> Vec<Box
 // the table is fully rescanned: advancing commit by commit would miss `b`.
 #[case::before_checkpoint_action(1, true, &["b.parquet", "g.parquet"])]
 #[case::at_checkpoint_action(2, false, &["b.parquet", "g.parquet"])]
-#[tokio::test]
-async fn scan_metadata_from_hint_before_checkpoint_action_rescans(
+fn scan_metadata_from_hint_before_checkpoint_action_rescans(
     #[case] existing_version: Version,
     #[case] empty_cache: bool,
     #[case] expected: &[&str],
 ) {
-    let engine = two_checkpoint_table().await;
+    let engine = two_checkpoint_table();
     let existing_data = if empty_cache {
         vec![]
     } else {
