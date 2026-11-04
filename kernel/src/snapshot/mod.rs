@@ -1375,7 +1375,7 @@ impl Snapshot {
     /// - If Kernel does not support reading or writing the table.
     /// - [`KernelError::ChecksumWriteUnsupported`] if no CRC can be resolved for this version, if
     ///   the resolved CRC's `file_stats_state` is `Indeterminate` (a non-incremental operation like
-    ///   ANALYZE STATS, or a file action with a missing size; recoverable with a full state
+    ///   Manual Update, or a counted file action with a missing size; recoverable with a full state
     ///   reconstruction in the future), or if `delta.enableInCommitTimestamps` is `true` but
     ///   `inCommitTimestampOpt` is absent.
     /// - The underlying read error if in-commit timestamps are enabled but the timestamp cannot be

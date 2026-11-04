@@ -103,28 +103,47 @@ pub(crate) struct FileStatsDelta {
     pub(crate) net_histogram: Option<FileSizeHistogram>,
 }
 
-const INCREMENTAL_SAFE_OPS: &[&str] = &[
-    "WRITE",
-    "STREAMING UPDATE",
-    "MERGE",
-    "UPDATE",
-    "DELETE",
-    "OPTIMIZE",
-    "REORG",
-    "CREATE TABLE",
-    "REPLACE TABLE",
-    "CREATE TABLE AS SELECT",
-    "REPLACE TABLE AS SELECT",
-    "CREATE OR REPLACE TABLE AS SELECT",
-];
+/// How a commit's file actions contribute to incremental statistics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FileStatsPolicy {
+    ApplyAll,
+    IgnoreAdds,
+    IgnoreRemoves,
+    Unsupported,
+}
+
+impl FileStatsPolicy {
+    /// Selects which file actions contribute to incremental checksum statistics.
+    pub(crate) fn for_operation(operation: &str) -> Self {
+        // These operation-name heuristics depend on writer conventions. The protocol proposal at
+        // https://github.com/delta-io/delta/pull/6798 makes the add/remove policy explicit through
+        // `commitInfo.incremental`.
+        match operation {
+            // These operations update metadata on existing files by re-adding them.
+            // ANALYZE STATS is a compatibility alias for statistics-only metadata updates.
+            "COMPUTE STATS"
+            | "ANALYZE STATS"
+            | "ROW TRACKING BACKFILL"
+            | "ROW TRACKING UNBACKFILL"
+            | "DROP FEATURE"
+            | "LIQUID BACKFILL"
+            | "LIQUID TAGGING"
+            | "REPLACE PARTITIONED BY WITH CLUSTER BY" => Self::IgnoreAdds,
+            // These tombstones protect deletion vectors from VACUUM without removing data files.
+            "Deletion Vector Tombstones" => Self::IgnoreRemoves,
+            // Manual updates may violate the file-action invariants.
+            "Manual Update" => Self::Unsupported,
+            _ => Self::ApplyAll,
+        }
+    }
+}
 
 /// Returns `true` if the given operation can be safely tracked by incremental file stats.
 ///
-/// Incremental-safe operations produce add/remove actions whose net counts give correct file
-/// stats. Unknown operations return `false`. For example, ANALYZE STATS re-adds existing files
-/// with updated statistics; naively counting those adds would double-count file stats.
+/// Replay applies the operation's add/remove exclusions before counting file actions. Operations
+/// outside the exclusions use normal file accounting, including names unknown to Kernel.
 pub(crate) fn is_incremental_safe_operation(operation: &str) -> bool {
-    INCREMENTAL_SAFE_OPS.contains(&operation)
+    FileStatsPolicy::for_operation(operation) != FileStatsPolicy::Unsupported
 }
 
 impl FileStatsDelta {
