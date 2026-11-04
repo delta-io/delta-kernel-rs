@@ -5698,9 +5698,26 @@ fn test_commit_phase_processes_commits() -> KernelResult<()> {
 }
 
 #[cfg(feature = "adaptive-metadata-in-dev")]
-#[test]
-fn latest_checkpoint_action_returns_none_without_checkpoint() -> KernelResult<()> {
+#[rstest]
+#[case::no_checkpoint_action(false)]
+#[case::checkpoint_action_in_log(true)]
+fn latest_checkpoint_action_returns_none_on_non_amt_table(
+    #[case] write_checkpoint_action: bool,
+) -> KernelResult<()> {
     let (engine, table_root) = setup_table()?;
+    if write_checkpoint_action {
+        // The action carries the table's own protocol, so adaptiveMetadata stays disabled.
+        let config = Snapshot::builder_for(table_root.clone())
+            .build(&engine)?
+            .table_configuration()
+            .clone();
+        let checkpoint = CheckpointAction {
+            protocol: config.protocol().clone(),
+            metadata: config.metadata().clone(),
+            ..minimal_checkpoint_action("metadata/root-v1.parquet", 1)?
+        };
+        write_manifest_commit(&engine, &table_root, 1, checkpoint)?;
+    }
     let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
     assert!(snapshot.latest_checkpoint_action(&engine)?.is_none());
     Ok(())

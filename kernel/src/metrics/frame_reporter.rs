@@ -347,9 +347,8 @@ mod tests {
 
     #[test]
     fn imperative_scan_reports_expected_callstacks() {
-        let (engine, snapshot, _tempdir) = load_test_table("table-without-dv-small").unwrap();
-
         let events = capture(|| {
+            let (engine, snapshot, _tempdir) = load_test_table("table-without-dv-small").unwrap();
             let scan = snapshot.scan_builder().build().unwrap();
             for metadata in scan.scan_metadata(engine.as_ref()).unwrap() {
                 metadata.unwrap();
@@ -367,10 +366,9 @@ mod tests {
     #[cfg(feature = "declarative-plans")]
     #[test]
     fn declarative_scan_reports_expected_callstacks() {
-        let (engine, snapshot, _tempdir) =
-            load_test_table("v2-checkpoints-parquet-with-sidecars").unwrap();
-
         let events = capture(|| {
+            let (engine, snapshot, _tempdir) =
+                load_test_table("v2-checkpoints-parquet-with-sidecars").unwrap();
             let scan = snapshot.scan_builder().build().unwrap();
             scan.declarative_metadata_scan_plan(engine.as_ref())
                 .unwrap();

@@ -20,7 +20,7 @@ use crate::schema::SchemaRef;
 use crate::table_features::TableFeature;
 use crate::transaction::UpdateTableOperation;
 use crate::unit_test_utils::adaptive_metadata_fixtures::{
-    commit_info_line, last_manifest_commit_info, protocol_and_metadata_lines,
+    checkpoint_line, commit_info_line, last_manifest_commit_info, protocol_and_metadata_lines,
 };
 use crate::unit_test_utils::{
     adaptive_metadata_table_configuration, parse_json_batch, test_schema_flat_with_column_mapping,
@@ -58,7 +58,7 @@ fn checkpoint_action(version: i64, extra_features: &[TableFeature], schema: Sche
         txn_sidecars: vec![],
         domain_metadata_sidecars: vec![],
     };
-    serde_json::json!({ "checkpoint": checkpoint }).to_string()
+    checkpoint_line(&checkpoint)
 }
 
 // Builds a top-level `metaData` commit line with the given schema (no protocol).
