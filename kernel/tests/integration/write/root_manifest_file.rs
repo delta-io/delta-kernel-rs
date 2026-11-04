@@ -428,8 +428,8 @@ fn commit_around_root_manifest(
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn test_app_id_versions_read_across_a_root_manifest_commit(
-) -> Result<(), Box<dyn std::error::Error>> {
+async fn test_app_id_versions_read_across_a_root_manifest_commit()
+-> Result<(), Box<dyn std::error::Error>> {
     let (engine, _temp_dir, table_url, snapshot) =
         setup_adaptive_metadata_table("root_manifest_file_app_id_versions").await?;
 

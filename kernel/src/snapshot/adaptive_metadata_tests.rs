@@ -5,12 +5,12 @@ use itertools::Itertools as _;
 use rstest::rstest;
 use url::Url;
 
-use crate::actions::{CheckpointAction, ContentRoot, SetTransaction, LOG_TXN_SCHEMA};
+use crate::actions::{CheckpointAction, ContentRoot, LOG_TXN_SCHEMA, SetTransaction};
 use crate::engine::sync::SyncEngine;
+use crate::unit_test_utils::Action;
 use crate::unit_test_utils::adaptive_metadata_fixtures::{
     checkpoint_line, setup_adaptive_metadata_table, write_ict_commit, write_sidecar,
 };
-use crate::unit_test_utils::Action;
 use crate::{Snapshot, SnapshotRef, Version};
 
 /// The version [`table_with_checkpoint_action`] commits its checkpoint action at.
@@ -60,10 +60,12 @@ fn table_with_checkpoint_action(
         snapshot.crc_at_version().is_some(),
         crc_version == Some(CHECKPOINT_VERSION + 1)
     );
-    assert!(snapshot
-        .latest_checkpoint_action(&engine)
-        .unwrap()
-        .is_some());
+    assert!(
+        snapshot
+            .latest_checkpoint_action(&engine)
+            .unwrap()
+            .is_some()
+    );
     (engine, snapshot)
 }
 

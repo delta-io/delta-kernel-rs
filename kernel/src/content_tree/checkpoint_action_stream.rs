@@ -4,10 +4,10 @@ use std::iter;
 
 use super::action_projector::ActionProjector;
 use super::checkpoint_sidecar::read_sidecar_actions;
-use super::reader::{read_add_actions_from_amt, ReadContext};
+use super::reader::{ReadContext, read_add_actions_from_amt};
 use crate::actions::{
-    CheckpointAction, Sidecar, ADD_NAME, LOG_ADD_SCHEMA, LOG_METADATA_SCHEMA, LOG_PROTOCOL_SCHEMA,
-    LOG_TXN_SCHEMA, METADATA_NAME, PROTOCOL_NAME, REMOVE_NAME, SET_TRANSACTION_NAME,
+    ADD_NAME, CheckpointAction, LOG_ADD_SCHEMA, LOG_METADATA_SCHEMA, LOG_PROTOCOL_SCHEMA,
+    LOG_TXN_SCHEMA, METADATA_NAME, PROTOCOL_NAME, REMOVE_NAME, SET_TRANSACTION_NAME, Sidecar,
 };
 use crate::expressions::Scalar;
 use crate::log_replay::ActionsBatch;
@@ -167,8 +167,8 @@ mod tests {
 
     use super::*;
     use crate::actions::{
-        get_commit_schema, Add, ContentRoot, Metadata, Protocol, SetTransaction, ADD_SCHEMA,
-        DOMAIN_METADATA_NAME, LOG_DOMAIN_METADATA_SCHEMA, REMOVE_FIELD,
+        ADD_SCHEMA, Add, ContentRoot, DOMAIN_METADATA_NAME, LOG_DOMAIN_METADATA_SCHEMA, Metadata,
+        Protocol, REMOVE_FIELD, SetTransaction, get_commit_schema,
     };
     use crate::arrow::array::{Array as _, AsArray as _, RecordBatch};
     use crate::arrow::datatypes::Int64Type;
@@ -186,8 +186,8 @@ mod tests {
     use crate::scan::{CHECKPOINT_READ_SCHEMA, COMMIT_READ_SCHEMA};
     use crate::schema::{StructType, schema_ref};
     use crate::unit_test_utils::adaptive_metadata_fixtures::{
-        adaptive_metadata_pm, adaptive_metadata_protocol_and_metadata, checkpoint_action_with_root,
-        commit_files, create_adaptive_metadata_table, write_sidecar,
+        adaptive_metadata_pm, checkpoint_action_with_root, commit_files,
+        create_adaptive_metadata_table, write_sidecar,
     };
     use crate::unit_test_utils::{
         Action, TestCancellationToken, assert_result_error_with_message, create_log_path_with_size,

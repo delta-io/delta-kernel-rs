@@ -657,10 +657,10 @@ impl Snapshot {
             return Ok(None);
         };
         #[cfg(feature = "adaptive-metadata-in-dev")]
-        if let Some(checkpoint) = self.latest_checkpoint_action(engine)? {
-            if !Version::try_from(checkpoint.version()).is_ok_and(|v| v <= base.version) {
-                return Ok(None);
-            }
+        if let Some(checkpoint) = self.latest_checkpoint_action(engine)?
+            && !Version::try_from(checkpoint.version()).is_ok_and(|v| v <= base.version)
+        {
+            return Ok(None);
         }
         #[cfg(not(feature = "adaptive-metadata-in-dev"))]
         let _ = engine;
