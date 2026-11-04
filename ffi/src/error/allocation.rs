@@ -367,7 +367,7 @@ mod tests {
     fn builder_retains_callback_table_after_registration_returns() {
         let mut output = Capture::default();
         let context = std::ptr::from_mut(&mut output).cast();
-        let path = "file:///tmp/";
+        let path = "memory:///";
         let value = "value";
         let builder = {
             let allocators = ErrorAllocators {
