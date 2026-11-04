@@ -10,6 +10,7 @@ mod checkpoint_sidecar;
 mod dv_conversion;
 mod mumbling;
 mod reader;
+mod skipping;
 pub(crate) mod stats;
 #[cfg(test)]
 pub(crate) mod test_utils;

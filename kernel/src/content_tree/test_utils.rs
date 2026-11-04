@@ -7,12 +7,14 @@ use url::Url;
 
 /// Encodes manifest deletion vector positions as a Mumbling bitmap.
 pub(crate) use crate::content_tree::mumbling::tests::encode_positions as mumbling_bitmap;
+use crate::content_tree::skipping::content_stats_read_field_for_predicate;
+use crate::content_tree::stats::{field_with_id, stats_schema};
 use crate::content_tree::{
-    AMT_FORMAT_VERSION, ContentTreeNodeEntry, DataContentType, DataFileFormat, DeletionVectorInfo,
-    ManifestInfo, TrackingInfo, TrackingStatus,
+    AMT_FORMAT_VERSION, CONTENT_STATS_FIELD_NAME, ContentTreeNodeEntry, DataContentType,
+    DataFileFormat, DeletionVectorInfo, ManifestInfo, TrackingInfo, TrackingStatus,
 };
-use crate::expressions::{Scalar, StructData};
-use crate::schema::ToSchema as _;
+use crate::expressions::{ArrayData, Scalar, StructData, col, lit};
+use crate::schema::{ArrayType, DataType, StructField, StructType, ToSchema as _};
 use crate::{Engine, EngineData, FileMeta};
 
 /// A valid relative AMT deletion vector, convertible to a `DeletionVectorDescriptor`.
@@ -126,7 +128,57 @@ pub(crate) fn write_manifest(
     location: Url,
     entries: &[ContentTreeNodeEntry],
 ) -> FileMeta {
-    let data = entry_batch(engine, entries);
+    write_batch(engine, location, entry_batch(engine, entries))
+}
+
+/// Writes `entries` like [`write_manifest`], followed by a `content_stats` column (described by
+/// `content_stats`) holding `stats[i]` for entry `i`.
+pub(crate) fn write_manifest_with_stats(
+    engine: &dyn Engine,
+    location: Url,
+    entries: &[ContentTreeNodeEntry],
+    content_stats: &StructField,
+    stats: Vec<Scalar>,
+) -> FileMeta {
+    let column_type = ArrayType::new(content_stats.data_type().clone(), true);
+    let column = ArrayData::try_new(column_type, stats).unwrap();
+    let schema = Arc::new(StructType::new_unchecked([content_stats.clone()]));
+    let data = entry_batch(engine, entries)
+        .append_columns(schema, vec![column])
+        .unwrap();
+    write_batch(engine, location, data)
+}
+
+/// The full `content_stats` field of a table whose only column `x` (field ID 1) is a LONG, and
+/// the read field of a skipping predicate on `x`'s max, which holds only `x`'s upper bound.
+pub(crate) fn x_content_stats() -> (StructField, StructField) {
+    let table = StructType::new_unchecked([field_with_id("x", DataType::LONG, true, 1)]);
+    let stats = stats_schema(&table).unwrap();
+    let skipping = col!("stats_parsed.maxValues.x").gt(lit(5i64));
+    let read = content_stats_read_field_for_predicate(&table, &skipping)
+        .unwrap()
+        .unwrap();
+    let full = field_with_id(CONTENT_STATS_FIELD_NAME, stats.into(), true, 146);
+    (full, read)
+}
+
+/// A `content_stats` value of `field`'s type whose single leaf holds `values`, in field order.
+pub(crate) fn x_stats(field: &StructField, values: &[i64]) -> Scalar {
+    let DataType::Struct(stats) = field.data_type() else {
+        panic!("content_stats must be a struct");
+    };
+    let leaf_field = stats.fields().next().unwrap();
+    let DataType::Struct(leaf) = leaf_field.data_type() else {
+        panic!("leaf stats must be a struct");
+    };
+    let leaf_values = values.iter().copied().map(Scalar::Long).collect();
+    let leaf_stats = StructData::try_new(leaf.fields().cloned().collect(), leaf_values).unwrap();
+    let fields = vec![leaf_field.clone()];
+    Scalar::Struct(StructData::try_new(fields, vec![Scalar::Struct(leaf_stats)]).unwrap())
+}
+
+/// Writes `data` as a single-batch parquet file at `location` and returns its [`FileMeta`].
+fn write_batch(engine: &dyn Engine, location: Url, data: Box<dyn EngineData>) -> FileMeta {
     let size = engine
         .parquet_handler()
         .write_parquet_file(location.clone(), Box::new(iter::once(Ok(data))))
@@ -142,12 +194,12 @@ mod tests {
     use std::slice;
 
     use super::*;
-    use crate::arrow::array::RecordBatch;
+    use crate::arrow::array::{Array as _, RecordBatch};
     use crate::arrow::compute::{cast, concat_batches};
     use crate::engine::arrow_data::EngineDataArrowExt as _;
     use crate::engine::sync::SyncEngine;
     use crate::object_store::memory::InMemory;
-    use crate::schema::{ColumnMetadataKey, DataType, MetadataValue, StructField, StructType};
+    use crate::schema::{ColumnMetadataKey, MetadataValue};
 
     /// Covers `tight_stats` as `Some(true)`, `Some(false)`, and `None`.
     fn manifest_entries() -> Vec<ContentTreeNodeEntry> {
@@ -241,5 +293,46 @@ mod tests {
         for (actual, expected) in read.columns().iter().zip(expected.columns()) {
             assert_eq!(&cast(actual, expected.data_type()).unwrap(), expected);
         }
+    }
+
+    /// The entry read schema followed by `content_stats`.
+    fn with_content_stats(content_stats: &StructField) -> StructType {
+        let schema = ContentTreeNodeEntry::to_schema();
+        StructType::new_unchecked(schema.fields().cloned().chain([content_stats.clone()]))
+    }
+
+    /// Reading with a narrowed `content_stats` field reads only the requested stats, by field ID.
+    #[test]
+    fn manifest_read_projects_requested_content_stats() {
+        let engine = SyncEngine::new_with_store(Arc::new(InMemory::new()));
+        let (full, read) = x_content_stats();
+        let location = Url::parse("memory:///metadata/manifest.parquet").unwrap();
+        let entries = [added_data_entry("a.parquet", 1, 10, 0, 1)];
+        let stats = vec![x_stats(&full, &[1, 9, 10, 0])];
+        let file = write_manifest_with_stats(&engine, location, &entries, &full, stats);
+
+        let batch = read_back(&engine, &file, with_content_stats(&read));
+        let expected = engine
+            .evaluation_handler()
+            .create_many(
+                Arc::new(StructType::new_unchecked([read.clone()])),
+                vec![vec![x_stats(&read, &[9])]],
+            )
+            .unwrap()
+            .try_into_record_batch()
+            .unwrap();
+        assert_eq!(
+            batch.column_by_name(CONTENT_STATS_FIELD_NAME).unwrap(),
+            expected.column(0)
+        );
+    }
+
+    #[test]
+    fn manifest_read_of_missing_content_stats_is_null() {
+        let (engine, file) = write_test_manifest();
+        let (_, read) = x_content_stats();
+        let batch = read_back(&engine, &file, with_content_stats(&read));
+        let stats = batch.column_by_name(CONTENT_STATS_FIELD_NAME).unwrap();
+        assert_eq!(stats.null_count(), batch.num_rows());
     }
 }
