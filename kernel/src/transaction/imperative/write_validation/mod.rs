@@ -10,7 +10,9 @@ mod utils;
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 
-pub(super) use addfile::{validate_add_files, validate_no_clustering_providers_set};
+pub(super) use addfile::{
+    validate_add_files, validate_no_clustering_providers_set, validate_no_tight_stats_set,
+};
 use derive_more::Constructor;
 pub(super) use dv::validate_dv_matched_files;
 pub(super) use removefile::validate_remove_files;
