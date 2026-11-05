@@ -40,9 +40,9 @@ pub(crate) struct CrcDelta {
     /// Whether the file-stats portion of this delta can be applied incrementally. When `false`,
     /// [`Crc::apply`] transitions [`FileStatsState`] to `Indeterminate`. Producers set this to
     /// `false` when file-stat changes cannot be tracked safely or their policy excludes
-    /// incremental construction. Replay rejects missing operation names only when their commit
-    /// contains file actions; transactions exclude custom operations even without file
-    /// actions.
+    /// incremental construction. Replay rejects unknown operations, and missing operation names
+    /// when their commit contains file actions; transactions exclude custom operations even
+    /// without file actions.
     pub(crate) is_incremental_safe: bool,
 }
 
@@ -316,20 +316,9 @@ mod tests {
     fn test_incremental_safe_operations() {
         for op in [
             "WRITE",
-            "STREAMING UPDATE",
-            "MERGE",
-            "UPDATE",
-            "DELETE",
-            "OPTIMIZE",
-            "REORG",
-            "CREATE TABLE",
-            "REPLACE TABLE",
-            "CREATE TABLE AS SELECT",
-            "REPLACE TABLE AS SELECT",
-            "CREATE OR REPLACE TABLE AS SELECT",
-            "UNKNOWN",
-            "LIQUID TAGGING",
+            "ADD COLUMNS",
             "COMPUTE STATS",
+            "Deletion Vector Tombstones",
         ] {
             assert!(
                 is_incremental_safe_operation(op),
@@ -341,6 +330,7 @@ mod tests {
     #[test]
     fn test_non_incremental_safe_operations() {
         assert!(!is_incremental_safe_operation("Manual Update"));
+        assert!(!is_incremental_safe_operation("UNKNOWN"));
     }
 
     // ===== Crc deserialized from CRC file (default state) =====

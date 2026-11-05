@@ -824,12 +824,12 @@ mod tests {
     #[case::safe(Some("WRITE"), true)]
     #[case::streaming_update(Some("STREAMING UPDATE"), true)]
     #[case::reorg(Some("REORG"), true)]
-    #[case::reorg_upgrade_uniform(Some("REORG TABLE UPGRADE UNIFORM"), true)]
+    #[case::reorg_upgrade_uniform(Some("REORG TABLE UPGRADE UNIFORM"), false)]
     #[case::unsafe_op(Some("Manual Update"), false)]
     #[case::vacuum_start(Some("VACUUM START"), true)]
     #[case::vacuum_end(Some("VACUUM END"), true)]
     #[case::set_properties(Some("SET TBLPROPERTIES"), true)]
-    #[case::unknown(Some("FUTURE OPERATION"), true)]
+    #[case::unknown(Some("FUTURE OPERATION"), false)]
     #[case::missing_operation(None, false)]
     fn commit_safety_depends_on_operation_only_with_file_actions(
         #[case] op: Option<&str>,
@@ -1162,7 +1162,7 @@ mod tests {
             FileSizeHistogram::create_empty_with_boundaries(vec![0, 150, 1000]).unwrap();
         let mut acc = CrcReplayAccumulator::new(with_histogram.then_some(histogram));
         acc.process_batch_start("v3.json");
-        acc.on_commit_info_without_lmc(Some("FUTURE OPERATION"), None);
+        acc.on_commit_info_without_lmc(Some("RECOMPRESSION"), None);
         acc.on_add(1000).unwrap();
 
         acc.process_batch_start("v2.json");

@@ -131,17 +131,52 @@ impl FileStatsPolicy {
             | "REPLACE PARTITIONED BY WITH CLUSTER BY" => Self::IgnoreAdds,
             // These tombstones protect deletion vectors from VACUUM without removing data files.
             "Deletion Vector Tombstones" => Self::IgnoreRemoves,
-            // Manual updates may violate the file-action invariants.
-            "Manual Update" => Self::Unsupported,
-            _ => Self::ApplyAll,
+            "WRITE"
+            | "STREAMING UPDATE"
+            | "DELETE"
+            | "UPDATE"
+            | "MERGE"
+            | "TRUNCATE"
+            | "COPY INTO"
+            | "TRANSACTION"
+            | "CREATE TABLE"
+            | "CREATE TABLE AS SELECT"
+            | "REPLACE TABLE"
+            | "REPLACE TABLE AS SELECT"
+            | "CREATE OR REPLACE TABLE"
+            | "CREATE OR REPLACE TABLE AS SELECT"
+            | "ADD COLUMNS"
+            | "DROP COLUMNS"
+            | "RENAME COLUMN"
+            | "CHANGE COLUMN"
+            | "CHANGE COLUMNS"
+            | "REPLACE COLUMNS"
+            | "UPDATE SCHEMA"
+            | "REMOVE COLUMN MAPPING"
+            | "SET TBLPROPERTIES"
+            | "UNSET TBLPROPERTIES"
+            | "ADD CONSTRAINT"
+            | "DROP CONSTRAINT"
+            | "UPGRADE PROTOCOL"
+            | "OPTIMIZE"
+            | "OPTIMIZE CHECKPOINT"
+            | "RECOMPRESSION"
+            | "REORG"
+            | "VACUUM START"
+            | "VACUUM END"
+            | "FSCK"
+            | "REPAIR METADATA"
+            | "CLUSTER BY" => Self::ApplyAll,
+            // Manual updates and unrecognized operations have no trusted file-action policy.
+            _ => Self::Unsupported,
         }
     }
 }
 
 /// Returns `true` if the given operation can be safely tracked by incremental file stats.
 ///
-/// Replay applies the operation's add/remove exclusions before counting file actions. Operations
-/// outside the exclusions use normal file accounting, including names unknown to Kernel.
+/// Replay accepts known operation names and applies their add/remove exclusions before counting
+/// file actions. Unknown operations return `false`.
 pub(crate) fn is_incremental_safe_operation(operation: &str) -> bool {
     FileStatsPolicy::for_operation(operation) != FileStatsPolicy::Unsupported
 }
