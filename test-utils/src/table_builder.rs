@@ -69,7 +69,8 @@ use delta_kernel::object_store::memory::InMemory;
 use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::{DynObjectStore, Error as ObjectStoreError, ObjectStoreExt as _};
 use delta_kernel::schema::{
-    DataType, IntervalYearToMonthType, PrimitiveType, SchemaRef, StructType, schema_ref,
+    DataType, IntervalDayToSecondType, IntervalYearToMonthType, PrimitiveType, SchemaRef,
+    StructType, schema_ref,
 };
 use delta_kernel::snapshot::ChecksumWriteResult;
 use delta_kernel::table_features::TableFeature;
@@ -1865,7 +1866,20 @@ fn scalar_for_type(data_type: &DataType, seed: usize) -> Scalar {
                     Scalar::interval_year_month(months, *dtype)
                         .expect("test seed produced invalid interval year-month")
                 }
-                PrimitiveType::IntervalDayTime => Scalar::IntervalDayTime((seed * 1000) as i64),
+                PrimitiveType::IntervalDayTime(dtype) => {
+                    let unit = match dtype {
+                        IntervalDayToSecondType::IntervalDay => 86_400_000_000,
+                        IntervalDayToSecondType::IntervalHour
+                        | IntervalDayToSecondType::IntervalDayToHour => 3_600_000_000,
+                        IntervalDayToSecondType::IntervalMinute
+                        | IntervalDayToSecondType::IntervalDayToMinute
+                        | IntervalDayToSecondType::IntervalHourToMinute => 60_000_000,
+                        _ => 1,
+                    };
+                    let micros = seed as i64 * unit;
+                    Scalar::interval_day_time(micros, *dtype)
+                        .expect("test seed produced invalid interval day-time")
+                }
                 other => panic!("{other:?} is not a valid partition column type"),
             }
         }
@@ -1916,6 +1930,21 @@ mod tests {
         let snap = Snapshot::builder_for(table.table_root()).build(&engine)?;
         assert_eq!(snap.version(), 0);
         Ok(())
+    }
+
+    #[rstest]
+    #[case::hour(IntervalDayToSecondType::IntervalHour, 4_680_000_000_000)]
+    #[case::second(IntervalDayToSecondType::IntervalDayToSecond, 1300)]
+    fn scalar_for_day_time_partition_uses_seed_as_unit_count(
+        #[case] dtype: IntervalDayToSecondType,
+        #[case] expected_micros: i64,
+    ) {
+        let seed = 1300;
+        let expected = Scalar::interval_day_time(expected_micros, dtype).unwrap();
+        assert_eq!(
+            scalar_for_type(&DataType::interval_day_time(dtype), seed),
+            expected
+        );
     }
 
     #[test]

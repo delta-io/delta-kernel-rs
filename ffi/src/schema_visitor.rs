@@ -25,8 +25,8 @@ use std::collections::HashMap;
 use std::ffi::c_void;
 
 use delta_kernel::schema::{
-    ArrayType, DataType, DecimalType, IntervalYearToMonthType, MapType, MetadataValue,
-    PrimitiveType, StructField, StructType,
+    ArrayType, DataType, DecimalType, IntervalDayToSecondType, IntervalYearToMonthType, MapType,
+    MetadataValue, PrimitiveType, StructField, StructType,
 };
 #[cfg(feature = "geo-type-in-dev")]
 use delta_kernel::schema::{EdgeInterpolationAlgorithm, GeographyType, GeometryType};
@@ -556,7 +556,7 @@ pub unsafe extern "C" fn visit_field_interval_day_time(
     let result = visit_field_primitive_impl(
         state,
         name_str,
-        PrimitiveType::IntervalDayTime,
+        PrimitiveType::interval_day_time(IntervalDayToSecondType::IntervalDayToSecond),
         nullable,
         metadata,
     );
@@ -2331,7 +2331,10 @@ mod tests {
                 "col_interval_year_month",
                 PrimitiveType::interval_year_month(IntervalYearToMonthType::IntervalYearToMonth),
             ),
-            ("col_interval_day_time", PrimitiveType::IntervalDayTime),
+            (
+                "col_interval_day_time",
+                PrimitiveType::interval_day_time(IntervalDayToSecondType::IntervalDayToSecond),
+            ),
             ("col_void", PrimitiveType::Void),
         ];
 

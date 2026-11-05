@@ -374,7 +374,7 @@ impl TryFromKernel<&DataType> for ArrowDataType {
                     }
                     PrimitiveType::Void => Ok(ArrowDataType::Null),
                     PrimitiveType::IntervalYearMonth(_) => Ok(ArrowDataType::Int32),
-                    PrimitiveType::IntervalDayTime => Ok(ArrowDataType::Int64),
+                    PrimitiveType::IntervalDayTime(_) => Ok(ArrowDataType::Int64),
                     #[cfg(feature = "geo-type-in-dev")]
                     PrimitiveType::Geometry(_) | PrimitiveType::Geography(_) => {
                         Err(ArrowError::SchemaError(format!(

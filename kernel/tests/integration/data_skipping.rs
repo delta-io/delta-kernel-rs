@@ -27,7 +27,8 @@ use delta_kernel::metrics::{MetricEvent, ScanType};
 use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::scan::{AfterSequentialScanMetadata, ParallelScanMetadata, Scan, StatsOptions};
 use delta_kernel::schema::{
-    DataType, IntervalYearToMonthType, SchemaRef, StructField, StructType, schema, schema_ref,
+    DataType, IntervalDayToSecondType, IntervalYearToMonthType, SchemaRef, StructField, StructType,
+    schema, schema_ref,
 };
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
@@ -1295,9 +1296,63 @@ async fn partition_pruning_honors_rfc3339_offset_partition_values(
 )]
 #[case::day_time(
     DataType::INTERVAL_DAY_TIME,
-    Scalar::IntervalDayTime(3_600_000_000),
-    Scalar::IntervalDayTime(3_600_000_000),
-    Scalar::IntervalDayTime(7_200_000_000)
+    Scalar::interval_day_time(3_600_000_000, IntervalDayToSecondType::IntervalDayToSecond).unwrap(),
+    Scalar::interval_day_time(3_600_000_000, IntervalDayToSecondType::IntervalDayToSecond).unwrap(),
+    Scalar::interval_day_time(7_200_000_000, IntervalDayToSecondType::IntervalDayToSecond).unwrap()
+)]
+#[case::day(
+    DataType::INTERVAL_DAY,
+    Scalar::interval_day_time(86_400_000_000, IntervalDayToSecondType::IntervalDay).unwrap(),
+    Scalar::interval_day_time(86_400_000_000, IntervalDayToSecondType::IntervalDay).unwrap(),
+    Scalar::interval_day_time(172_800_000_000, IntervalDayToSecondType::IntervalDay).unwrap()
+)]
+#[case::hour(
+    DataType::INTERVAL_HOUR,
+    Scalar::interval_day_time(93_600_000_000, IntervalDayToSecondType::IntervalHour).unwrap(),
+    Scalar::interval_day_time(93_600_000_000, IntervalDayToSecondType::IntervalHour).unwrap(),
+    Scalar::interval_day_time(97_200_000_000, IntervalDayToSecondType::IntervalHour).unwrap()
+)]
+#[case::minute(
+    DataType::INTERVAL_MINUTE,
+    Scalar::interval_day_time(93_780_000_000, IntervalDayToSecondType::IntervalMinute).unwrap(),
+    Scalar::interval_day_time(93_780_000_000, IntervalDayToSecondType::IntervalMinute).unwrap(),
+    Scalar::interval_day_time(93_840_000_000, IntervalDayToSecondType::IntervalMinute).unwrap()
+)]
+#[case::second(
+    DataType::INTERVAL_SECOND,
+    Scalar::interval_day_time(93_784_500_000, IntervalDayToSecondType::IntervalSecond).unwrap(),
+    Scalar::interval_day_time(93_784_500_000, IntervalDayToSecondType::IntervalSecond).unwrap(),
+    Scalar::interval_day_time(93_784_500_001, IntervalDayToSecondType::IntervalSecond).unwrap()
+)]
+#[case::day_hour(
+    DataType::INTERVAL_DAY_HOUR,
+    Scalar::interval_day_time(93_600_000_000, IntervalDayToSecondType::IntervalDayToHour).unwrap(),
+    Scalar::interval_day_time(93_600_000_000, IntervalDayToSecondType::IntervalDayToHour).unwrap(),
+    Scalar::interval_day_time(97_200_000_000, IntervalDayToSecondType::IntervalDayToHour).unwrap()
+)]
+#[case::day_minute(
+    DataType::INTERVAL_DAY_MINUTE,
+    Scalar::interval_day_time(93_780_000_000, IntervalDayToSecondType::IntervalDayToMinute).unwrap(),
+    Scalar::interval_day_time(93_780_000_000, IntervalDayToSecondType::IntervalDayToMinute).unwrap(),
+    Scalar::interval_day_time(93_840_000_000, IntervalDayToSecondType::IntervalDayToMinute).unwrap()
+)]
+#[case::hour_minute(
+    DataType::INTERVAL_HOUR_MINUTE,
+    Scalar::interval_day_time(93_780_000_000, IntervalDayToSecondType::IntervalHourToMinute).unwrap(),
+    Scalar::interval_day_time(93_780_000_000, IntervalDayToSecondType::IntervalHourToMinute).unwrap(),
+    Scalar::interval_day_time(93_840_000_000, IntervalDayToSecondType::IntervalHourToMinute).unwrap()
+)]
+#[case::hour_second(
+    DataType::INTERVAL_HOUR_SECOND,
+    Scalar::interval_day_time(93_784_500_000, IntervalDayToSecondType::IntervalHourToSecond).unwrap(),
+    Scalar::interval_day_time(93_784_500_000, IntervalDayToSecondType::IntervalHourToSecond).unwrap(),
+    Scalar::interval_day_time(93_784_500_001, IntervalDayToSecondType::IntervalHourToSecond).unwrap()
+)]
+#[case::minute_second(
+    DataType::INTERVAL_MINUTE_SECOND,
+    Scalar::interval_day_time(93_784_500_000, IntervalDayToSecondType::IntervalMinuteToSecond).unwrap(),
+    Scalar::interval_day_time(93_784_500_000, IntervalDayToSecondType::IntervalMinuteToSecond).unwrap(),
+    Scalar::interval_day_time(93_784_500_001, IntervalDayToSecondType::IntervalMinuteToSecond).unwrap()
 )]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn interval_partition_values_do_not_prune_files(
