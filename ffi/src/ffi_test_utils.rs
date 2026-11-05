@@ -30,6 +30,8 @@ use crate::{KernelBytesSlice, KernelStringSlice, NullableCvoid, TryFromStringSli
 pub(crate) struct EngineErrorWithMessage {
     pub(crate) etype: FFIKernelError,
     pub(crate) message: String,
+    /// The Delta catalog condition, present only for errors from the Delta callback.
+    pub(crate) condition: Option<String>,
 }
 
 pub(crate) const TEST_ERROR_ALLOCATORS: ErrorAllocators = ErrorAllocators {
@@ -46,6 +48,7 @@ unsafe extern "C" fn allocate_kernel_err(
     let error = EngineErrorWithMessage {
         etype: info.code,
         message: unsafe { info.message.try_to_string().unwrap() },
+        condition: None,
     };
     Box::into_raw(Box::new(error)).cast()
 }
@@ -58,6 +61,7 @@ unsafe extern "C" fn allocate_delta_err(
     let error = EngineErrorWithMessage {
         etype: FFIKernelError::UnknownError,
         message: unsafe { info.message.try_to_string().unwrap() },
+        condition: Some(unsafe { info.condition.try_to_string().unwrap() }),
     };
     Box::into_raw(Box::new(error)).cast()
 }
@@ -219,6 +223,22 @@ pub(crate) fn assert_extern_result_error_contains<T>(
         "expected error message to contain '{expected_message}', got '{}'",
         error.message
     );
+}
+
+/// Check that the Delta callback received `expected_condition` and `expected_message`, recovering
+/// the error to prevent leaks.
+#[cfg(test)]
+pub(crate) fn assert_extern_result_delta_error<T>(
+    res: ExternResult<T>,
+    expected_condition: &str,
+    expected_message: &str,
+) {
+    let ExternResult::Err(ptr) = res else {
+        panic!("Expected Delta error '{expected_condition}'");
+    };
+    let error = unsafe { recover_error(ptr) };
+    assert_eq!(error.condition.as_deref(), Some(expected_condition));
+    assert_eq!(error.message, expected_message);
 }
 
 fn expect_extern_result_error<T>(

@@ -16,7 +16,7 @@ use delta_kernel::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt};
 use delta_kernel::schema::{DataType, SchemaRef, StructField, StructType};
 use delta_kernel::transaction::create_table::create_table as create_delta_table;
 use delta_kernel::transaction::{CommitResult, RetryableTransaction, UpdateTableOperation};
-use delta_kernel::{Engine, KernelError, KernelResult, Snapshot, SnapshotRef};
+use delta_kernel::{DeltaErrorCondition, Engine, KernelError, KernelResult, Snapshot, SnapshotRef};
 use delta_kernel_default_engine::executor::tokio::TokioBackgroundExecutor;
 use delta_kernel_default_engine::{DefaultEngine, DefaultEngineBuilder};
 use itertools::Itertools;
@@ -151,13 +151,16 @@ async fn create_or_get_base_snapshot(
             println!("✓ Found existing table at version {}", snapshot.version());
             Ok(snapshot)
         }
-        Err(_) => {
+        Err(delta_kernel::Error::Delta(error))
+            if error.condition() == DeltaErrorCondition::DeltaPathDoesNotExist =>
+        {
             // Create new table
             println!("Creating new Delta table...");
             let schema = parse_schema(schema_str)?;
             create_table(url, &schema, engine).await?;
             Snapshot::builder_for(url.clone()).build(engine)
         }
+        Err(error) => Err(error),
     }
 }
 

@@ -1976,9 +1976,9 @@ mod tests {
     use super::*;
     use crate::error::FFIKernelError;
     use crate::ffi_test_utils::{
-        TEST_ERROR_ALLOCATORS, allocate_str, assert_extern_result_error_contains,
-        assert_extern_result_error_with_message, build_snapshot, ok_or_panic, recover_string,
-        setup_snapshot,
+        TEST_ERROR_ALLOCATORS, allocate_str, assert_extern_result_delta_error,
+        assert_extern_result_error_contains, assert_extern_result_error_with_message,
+        build_snapshot, ok_or_panic, recover_string, setup_snapshot,
     };
 
     unsafe extern "C" fn allocate_null_err(
@@ -3838,6 +3838,46 @@ mod tests {
 
         unsafe { free_engine(engine) }
         Ok(())
+    }
+
+    #[rstest]
+    #[case::latest(None)]
+    #[case::at_version(Some(0))]
+    #[tokio::test]
+    async fn test_builder_on_empty_table_root_reports_missing_table_only_at_latest(
+        #[case] version: Option<Version>,
+    ) {
+        let path = "memory:///";
+        let engine = engine_to_handle(
+            Arc::new(DefaultEngineBuilder::new(Arc::new(InMemory::new())).build()),
+            TEST_ERROR_ALLOCATORS,
+        );
+
+        let result = unsafe {
+            let builder = ok_or_panic(get_snapshot_builder(
+                kernel_string_slice!(path),
+                engine.shallow_copy(),
+            ));
+            let builder = match version {
+                Some(version) => snapshot_builder_with_version(builder, version),
+                None => builder,
+            };
+            snapshot_builder_build(builder)
+        };
+        match version {
+            None => assert_extern_result_delta_error(
+                result,
+                "DELTA_PATH_DOES_NOT_EXIST",
+                "memory:/// doesn't exist, or is not a Delta table.",
+            ),
+            Some(_) => assert_extern_result_error_with_message(
+                result,
+                FFIKernelError::EmptyLogError,
+                Some("No table version found."),
+            ),
+        }
+
+        unsafe { free_engine(engine) }
     }
 
     #[tokio::test]
