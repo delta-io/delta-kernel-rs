@@ -30,7 +30,7 @@ pub enum Error {
 
     /// A failure represented by a kernel implementation error.
     #[error(transparent)]
-    Kernel(KernelError),
+    Kernel(#[from] KernelError),
 }
 
 /// Details of a failed conversion from a scalar into a Rust value.
