@@ -61,8 +61,8 @@ from the table, through `raw_sql()`.
 # extern crate delta_kernel_default_engine;
 # use delta_kernel_default_engine::DefaultEngine;
 # use delta_kernel_default_engine::storage::store_from_url;
-# use delta_kernel::{KernelResult, Snapshot};
-# fn main() -> KernelResult<()> {
+# use delta_kernel::Snapshot;
+# fn main() -> delta_kernel::Result<()> {
 # let url = delta_kernel::try_parse_uri("/tmp/people")?;
 # let engine = DefaultEngine::builder(store_from_url(&url)?).build();
 let snapshot = Snapshot::builder_for(url).build(&engine)?;

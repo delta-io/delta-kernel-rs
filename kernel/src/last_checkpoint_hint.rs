@@ -571,7 +571,7 @@ mod tests {
     use crate::schema::schema;
     use crate::table_features::TableFeature;
     use crate::unit_test_utils::create_log_path;
-    use crate::{Engine, KernelResultIterator};
+    use crate::{Engine, KernelResultIterator, Result};
 
     /// A real `_last_checkpoint` for a V2 checkpoint carries a `v2Checkpoint` object; we parse its
     /// `path` and file metadata. An empty `sidecarFiles` (a leaf checkpoint) parses to `Some([])`,
@@ -1329,7 +1329,7 @@ mod tests {
         created_time: 1739313200623,
         config: &[("delta.checkpointPolicy", "v2")],
     })]
-    fn v2_last_checkpoint_hint_contents(#[case] expected: ExpectedHint) -> KernelResult<()> {
+    fn v2_last_checkpoint_hint_contents(#[case] expected: ExpectedHint) -> Result<()> {
         use crate::unit_test_utils::load_test_table;
 
         let ExpectedHint {

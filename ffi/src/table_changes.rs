@@ -75,7 +75,7 @@ fn table_changes_impl(
     extern_engine: &dyn ExternEngine,
     start_version: Version,
     end_version: Option<Version>,
-) -> KernelResult<Handle<ExclusiveTableChanges>> {
+) -> delta_kernel::Result<Handle<ExclusiveTableChanges>> {
     let table_changes = TableChanges::try_new(
         url?,
         extern_engine.engine().as_ref(),

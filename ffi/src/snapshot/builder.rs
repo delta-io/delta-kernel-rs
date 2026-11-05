@@ -285,7 +285,7 @@ unsafe fn snapshot_builder_with_log_tail_impl(
 
 fn snapshot_builder_build_impl(
     builder: FfiSnapshotBuilder,
-) -> KernelResult<Handle<SharedSnapshot>> {
+) -> delta_kernel::Result<Handle<SharedSnapshot>> {
     let FfiSnapshotBuilder {
         engine,
         source,
@@ -314,7 +314,7 @@ fn snapshot_builder_build_impl(
             Box<SnapshotHint>,
         )
             -> KernelResult<delta_kernel::snapshot::SnapshotBuilder<Mode>>,
-    ) -> KernelResult<SnapshotRef> {
+    ) -> delta_kernel::Result<SnapshotRef> {
         let BuildOptions {
             version,
             incremental_replay,

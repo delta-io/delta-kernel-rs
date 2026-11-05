@@ -866,7 +866,7 @@ mod tests {
     use crate::transaction::create_table::create_table;
     use crate::transaction::operation::UpdateTableOperation;
     use crate::unit_test_utils::{copy_test_table, create_valid_add_file_batch, test_schema_flat};
-    use crate::{EvaluationHandler, ExpressionEvaluator, PredicateEvaluator, Snapshot};
+    use crate::{EvaluationHandler, ExpressionEvaluator, PredicateEvaluator, Result, Snapshot};
 
     impl Transaction {
         /// Set clustering columns for testing purposes without needing a table
@@ -1068,7 +1068,7 @@ mod tests {
 
     fn existing_table_txn(
         data_change: bool,
-    ) -> KernelResult<(SyncEngine, Transaction, tempfile::TempDir)> {
+    ) -> Result<(SyncEngine, Transaction, tempfile::TempDir)> {
         let (url, tempdir) = copy_test_table("table-without-dv-small")?;
         let engine = SyncEngine::new();
         let snapshot = Snapshot::builder_for(url).build(&engine)?;
@@ -1239,7 +1239,7 @@ mod tests {
         #[case] data_change: bool,
         #[case] selection_vector: &[bool],
         #[case] expected_error: bool,
-    ) -> KernelResult<()> {
+    ) -> Result<()> {
         let (_engine, mut txn, _tempdir) = existing_table_txn(data_change)?;
         set_append_only(&mut txn, append_only)?;
         for index in 0..2 {

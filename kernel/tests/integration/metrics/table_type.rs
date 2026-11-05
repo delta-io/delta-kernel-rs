@@ -22,11 +22,13 @@ use super::simple_schema;
 #[case::path_based(false)]
 #[case::catalog_managed(true)]
 #[tokio::test(flavor = "multi_thread")]
-async fn test_metric_events_carry_table_type(#[case] catalog_managed: bool) -> KernelResult<()> {
+async fn test_metric_events_carry_table_type(
+    #[case] catalog_managed: bool,
+) -> delta_kernel::Result<()> {
     let (_tmp, table_path, engine) = test_table_setup_mt()?;
     let table_url = delta_kernel::try_parse_uri(&table_path)?;
 
-    let build_snapshot = |max_catalog_version: u64| -> KernelResult<Arc<Snapshot>> {
+    let build_snapshot = |max_catalog_version: u64| -> delta_kernel::Result<Arc<Snapshot>> {
         let builder = Snapshot::builder_for(table_url.clone());
         let builder = if catalog_managed {
             builder.with_max_catalog_version(max_catalog_version)
@@ -142,7 +144,7 @@ async fn test_build_events_carry_requested_table_type_across_protocol_mismatch(
     #[case] request_catalog_version: bool,
     #[case] expected: TableType,
     #[values(false, true)] explicit_version: bool,
-) -> KernelResult<()> {
+) -> delta_kernel::Result<()> {
     let (_tmp, table_path, engine) = test_table_setup_mt()?;
     let table_url = delta_kernel::try_parse_uri(&table_path)?;
 
