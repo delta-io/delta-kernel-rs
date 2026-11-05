@@ -89,10 +89,11 @@ use std::sync::Arc;
 
 pub use events::{
     CheckpointWriteFailure, CheckpointWriteMode, CheckpointWriteOutcome, CheckpointWriteStats,
-    CheckpointWriteSuccess, CommitFailureReason, CrcReadSuccess, DomainMetadataLoadSuccess,
-    JsonReadCompleted, LogSegmentLoadFailure, LogSegmentLoadSuccess, LogSegmentLoadType,
-    MetricEvent, MetricId, ParquetReadCompleted, ProtocolMetadataLoadFailure,
-    ProtocolMetadataLoadSuccess, ProtocolMetadataSource, ScanMetadataCompleted, ScanType,
+    CheckpointWriteSuccess, CommitFailureReason, CrcReadSuccess, CrcWrite, CrcWriteOutcome,
+    CrcWriteResolutionMode, DomainMetadataLoadSuccess, JsonReadCompleted, LogSegmentLoadFailure,
+    LogSegmentLoadSuccess, LogSegmentLoadType, MetricEvent, MetricId, ParquetReadCompleted,
+    ProtocolMetadataLoadFailure, ProtocolMetadataLoadSuccess, ProtocolMetadataSource,
+    ScanMetadataCompleted, ScanType,
     SetTransactionLoadSuccess, SnapshotBuildFailure, SnapshotBuildSuccess,
     SnapshotLoadMetricContext, SnapshotLoadType, StorageCopyCompleted, StorageListCompleted,
     StorageReadCompleted, TableType, TransactionCommitFailure, TransactionCommitSuccess,

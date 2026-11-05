@@ -125,6 +125,60 @@ impl From<kernel::CheckpointWriteMode> for CheckpointWriteMode {
     }
 }
 
+/// Final result of a [`delta_kernel::Snapshot::write_checksum`] call.
+///
+/// cbindgen:prefix-with-name=true
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(C)]
+pub enum CrcWriteOutcome {
+    /// The CRC was written and the returned snapshot was constructed successfully.
+    Written {
+        /// Exact serialized UTF-8 byte count written by this call.
+        bytes_written: u64,
+    },
+    /// The CRC already existed, including a concurrent writer winning the storage race.
+    AlreadyExists,
+    /// The call returned an error, even if the storage write had succeeded.
+    Error,
+}
+
+impl From<kernel::CrcWriteOutcome> for CrcWriteOutcome {
+    fn from(outcome: kernel::CrcWriteOutcome) -> Self {
+        match outcome {
+            kernel::CrcWriteOutcome::Written { bytes_written } => Self::Written { bytes_written },
+            kernel::CrcWriteOutcome::AlreadyExists => Self::AlreadyExists,
+            kernel::CrcWriteOutcome::Error => Self::Error,
+        }
+    }
+}
+
+/// CRC construction path selected during a [`delta_kernel::Snapshot::write_checksum`] call.
+///
+/// cbindgen:prefix-with-name=true
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(C)]
+pub enum CrcWriteResolutionMode {
+    /// Attempted construction from a checkpoint or version zero, replaying commits as needed.
+    Full,
+    /// Attempted to advance an older CRC by replaying newer commits.
+    Incremental,
+    /// Selected the in-memory CRC already at the snapshot version.
+    Cached,
+    /// Returned before selecting a CRC construction path.
+    NotAttempted,
+}
+
+impl From<kernel::CrcWriteResolutionMode> for CrcWriteResolutionMode {
+    fn from(mode: kernel::CrcWriteResolutionMode) -> Self {
+        match mode {
+            kernel::CrcWriteResolutionMode::Full => Self::Full,
+            kernel::CrcWriteResolutionMode::Incremental => Self::Incremental,
+            kernel::CrcWriteResolutionMode::Cached => Self::Cached,
+            kernel::CrcWriteResolutionMode::NotAttempted => Self::NotAttempted,
+        }
+    }
+}
+
 /// Whether a table is path-based or catalog-managed.
 ///
 /// cbindgen:prefix-with-name=true
@@ -385,6 +439,17 @@ pub struct CrcReadSuccess {
     pub duration_ns: u64,
 }
 
+/// Metrics for one returned [`delta_kernel::Snapshot::write_checksum`] call.
+#[repr(C)]
+pub struct CrcWrite {
+    /// Final API outcome, including the serialized byte count only when written.
+    pub outcome: CrcWriteOutcome,
+    /// CRC construction path selected during this call, including failures.
+    pub resolution_mode: CrcWriteResolutionMode,
+    /// Wall-clock time from API entry to return, including errors and snapshot updates.
+    pub duration_ns: u64,
+}
+
 /// A `JsonHandler::read_json_files` call completed.
 #[repr(C)]
 pub struct JsonReadCompleted {
@@ -470,6 +535,7 @@ pub enum MetricEvent {
     StorageCopyCompleted(StorageCopyCompleted),
     CheckpointWriteSuccess(CheckpointWriteSuccess),
     CheckpointWriteFailure(CheckpointWriteFailure),
+    CrcWrite(CrcWrite),
 }
 
 /// Borrow the caller-supplied correlation id as a [`KernelStringSlice`], or an empty slice when
@@ -655,6 +721,15 @@ impl MetricEvent {
                 duration_ns: ns(*duration),
             }),
             K::CrcReadFailure => Self::CrcReadFailure,
+            K::CrcWrite(kernel::CrcWrite {
+                outcome,
+                resolution_mode,
+                duration,
+            }) => Self::CrcWrite(CrcWrite {
+                outcome: (*outcome).into(),
+                resolution_mode: (*resolution_mode).into(),
+                duration_ns: ns(*duration),
+            }),
             K::JsonReadCompleted(kernel::JsonReadCompleted {
                 num_files,
                 bytes_read,
@@ -955,6 +1030,44 @@ mod tests {
             let cid: &str =
                 unsafe { TryFromStringSlice::try_from_slice(&e.correlation_id).unwrap() };
             assert_eq!(cid, "req-fail");
+        });
+    }
+
+    #[rstest]
+    #[case::written(
+        kernel::CrcWriteOutcome::Written { bytes_written: u64::MAX },
+        CrcWriteOutcome::Written { bytes_written: u64::MAX }
+    )]
+    #[case::written_zero(
+        kernel::CrcWriteOutcome::Written { bytes_written: 0 },
+        CrcWriteOutcome::Written { bytes_written: 0 }
+    )]
+    #[case::already_exists(kernel::CrcWriteOutcome::AlreadyExists, CrcWriteOutcome::AlreadyExists)]
+    #[case::error(kernel::CrcWriteOutcome::Error, CrcWriteOutcome::Error)]
+    fn from_kernel_crc_write_preserves_payload_mode_and_duration(
+        #[case] outcome: kernel::CrcWriteOutcome,
+        #[case] expected_outcome: CrcWriteOutcome,
+        #[values(
+            (kernel::CrcWriteResolutionMode::Full, CrcWriteResolutionMode::Full),
+            (kernel::CrcWriteResolutionMode::Incremental, CrcWriteResolutionMode::Incremental),
+            (kernel::CrcWriteResolutionMode::Cached, CrcWriteResolutionMode::Cached),
+            (kernel::CrcWriteResolutionMode::NotAttempted, CrcWriteResolutionMode::NotAttempted)
+        )]
+        modes: (kernel::CrcWriteResolutionMode, CrcWriteResolutionMode),
+    ) {
+        let (mode, expected_mode) = modes;
+        let event = kernel::MetricEvent::CrcWrite(kernel::CrcWrite {
+            outcome,
+            resolution_mode: mode,
+            duration: Duration::from_nanos(123_456_789),
+        });
+        with_ffi_event(&event, |ffi| {
+            let MetricEvent::CrcWrite(event) = ffi else {
+                panic!("expected CrcWrite");
+            };
+            assert_eq!(event.outcome, expected_outcome);
+            assert_eq!(event.resolution_mode, expected_mode);
+            assert_eq!(event.duration_ns, 123_456_789);
         });
     }
 
