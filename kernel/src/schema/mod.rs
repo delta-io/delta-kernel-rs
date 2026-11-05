@@ -1145,7 +1145,7 @@ impl StructType {
                 let (DataType::Struct(inner) | DataType::File(inner)) = field.data_type() else {
                     return Err(KernelError::generic(format!(
                         "Cannot resolve column '{col}': intermediate field '{field_name}' \
-                         is not a struct type"
+                         is not a struct or `file` type"
                     )));
                 };
                 current_struct = inner;
@@ -1674,7 +1674,7 @@ pub(crate) fn normalize_column_names_to_schema_casing(
                 {
                     Some(f) => {
                         normalized.push(f.name().to_string());
-                        if let DataType::Struct(inner) = f.data_type() {
+                        if let DataType::Struct(inner) | DataType::File(inner) = f.data_type() {
                             current_schema = inner;
                         }
                     }
@@ -2503,11 +2503,25 @@ pub(crate) static FILE_FIELDS: LazyLock<StructType> = LazyLock::new(|| {
     ])
 });
 
-/// Whether the `file` sub-field `name` gets `minValues` and `maxValues` statistics. `checksum` and
-/// `inline` get only `nullCount`, like every sub-field.
-#[internal_api]
+/// The `file` sub-fields that get `minValues` and `maxValues` statistics. The others, `checksum`
+/// and `inline`, get only `nullCount`, like every sub-field.
+const FILE_MIN_MAX_FIELDS: [&str; 4] = ["uri", "offset", "size", "content_type"];
+
+/// Whether the `file` sub-field `name` gets `minValues` and `maxValues` statistics.
 pub(crate) fn file_sub_field_has_min_max(name: &str) -> bool {
-    matches!(name, "uri" | "offset" | "size" | "content_type")
+    FILE_MIN_MAX_FIELDS.contains(&name)
+}
+
+/// Whether `path`, the fields from the root to a column (as from [`StructType::fields_of_path`]),
+/// ends at a `file` sub-field that gets only `nullCount`: `checksum` or `inline`.
+#[internal_api]
+pub(crate) fn is_null_count_only_file_sub_field(path: &[&StructField]) -> bool {
+    matches!(
+        path,
+        [.., parent, leaf]
+            if matches!(parent.data_type(), DataType::File(_))
+                && !file_sub_field_has_min_max(leaf.name())
+    )
 }
 
 impl DataType {
@@ -5063,7 +5077,7 @@ mod tests {
     #[case::empty_path(vec![], "Column path cannot be empty")]
     #[case::not_found_top(vec!["x"], "not found in schema")]
     #[case::not_found_nested(vec!["a", "x"], "not found in schema")]
-    #[case::intermediate_not_struct(vec!["a", "b", "c", "d"], "not a struct type")]
+    #[case::intermediate_not_struct(vec!["a", "b", "c", "d"], "is not a struct or `file` type")]
     #[test]
     fn test_walk_column_fields_error(#[case] col_path: Vec<&str>, #[case] expected_error: &str) {
         let schema = walk_test_schema();
@@ -5107,6 +5121,35 @@ mod tests {
         assert_eq!(
             normalize_column_names_to_schema_casing(&schema, &cols)[0].path(),
             ["nonexistent"]
+        );
+    }
+
+    /// Every `file` sub-field gets min/max statistics except `checksum` and `inline`.
+    #[test]
+    fn test_file_min_max_fields() {
+        let without: Vec<_> = FILE_FIELDS
+            .fields()
+            .map(|f| f.name().as_str())
+            .filter(|name| !file_sub_field_has_min_max(name))
+            .collect();
+        assert_eq!(without, ["checksum", "inline"]);
+        for name in FILE_MIN_MAX_FIELDS {
+            assert!(FILE_FIELDS.field(name).is_some(), "{name}");
+        }
+    }
+
+    /// Normalization descends into a `file` column's sub-fields, not into a same-named top-level
+    /// field.
+    #[test]
+    fn test_normalize_column_names_to_schema_casing_through_file() {
+        let schema = StructType::new_unchecked([
+            StructField::nullable("C", DataType::file_type()),
+            StructField::nullable("SIZE", DataType::LONG),
+        ]);
+        let cols = vec![column_name!("c.SIZE")];
+        assert_eq!(
+            normalize_column_names_to_schema_casing(&schema, &cols)[0].path(),
+            ["C", "size"]
         );
     }
 }

@@ -73,6 +73,15 @@ fn file_values() -> StructArray {
     ])
 }
 
+/// [`file_values`] with a valid `checksum` on the first value, so that statistics would show a
+/// `checksum` bound if one were collected.
+fn file_values_with_checksum() -> StructArray {
+    let (fields, mut columns, nulls) = file_values().into_parts();
+    let index = fields.iter().position(|f| f.name() == "checksum").unwrap();
+    columns[index] = Arc::new(StringArray::from(vec![Some("CRC32:0a1b2c3d"), None, None]));
+    StructArray::try_new(fields, columns, nulls).unwrap()
+}
+
 /// A `file` column `c` at top level, in a struct (`c.f`), as an array element, or as a map value,
 /// holding `files`.
 fn file_column(
@@ -489,7 +498,7 @@ async fn test_write_file_column_with_stats_column_settings(
         vec![
             (
                 StructField::nullable("c", DataType::file_type()),
-                Arc::new(file_values()) as ArrayRef,
+                Arc::new(file_values_with_checksum()) as ArrayRef,
             ),
             (StructField::nullable("id", DataType::INTEGER), ints()),
             (StructField::nullable("x", DataType::INTEGER), ints()),
@@ -504,6 +513,9 @@ async fn test_write_file_column_with_stats_column_settings(
         assert_eq!(stats_columns(&stats, kind), min_max, "{kind}: {stats}");
     }
     assert_eq!(stats_columns(&stats, "nullCount"), null_count, "{stats}");
+    if null_count.contains(&"c.checksum") {
+        assert_eq!(stats["nullCount"]["c"]["checksum"], 2, "{stats}");
+    }
     Ok(())
 }
 
@@ -539,7 +551,7 @@ async fn test_clustering_on_file_sub_field(
     assert!(error.contains("without min/max statistics"), "got: {error}");
 
     let _ =
-        create(&table_path, engine.as_ref(), column_name!("c.size"))?.commit(engine.as_ref())?;
+        create(&table_path, engine.as_ref(), column_name!("c.Size"))?.commit(engine.as_ref())?;
     let snapshot = Snapshot::builder_for(Url::from_directory_path(&table_path).unwrap())
         .build(engine.as_ref())?;
     let arrow_schema: ArrowSchema = schema.as_ref().try_into_arrow()?;

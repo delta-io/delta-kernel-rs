@@ -2733,7 +2733,7 @@ mod tests {
             result
                 .unwrap_err()
                 .to_string()
-                .contains("is not a struct type")
+                .contains("is not a struct or `file` type")
         );
     }
 

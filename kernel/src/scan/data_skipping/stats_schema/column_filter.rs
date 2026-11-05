@@ -235,7 +235,8 @@ impl<'col> StatsColumnFilter<'col> {
 
         match field.data_type() {
             // A `file` column's sub-fields are leaves like a struct's: each counts against the
-            // column limit and gets its own statistics.
+            // column limit and gets its own statistics, so a `file` column takes up to six slots
+            // (the `file` RFC's indexed-column budget).
             DataType::Struct(struct_type) | DataType::File(struct_type) => {
                 for child in struct_type.fields() {
                     self.collect_field(child, result);

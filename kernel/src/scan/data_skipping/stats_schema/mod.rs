@@ -20,13 +20,17 @@ use crate::transforms::{SchemaTransform, transform_output_type};
 /// The base stats schema is dependent on the current table configuration and derived via:
 /// - only fields present in data files are included (use physical names, no partition columns)
 /// - if the table property `delta.dataSkippingStatsColumns` is set, include only those columns.
-///   Column names may refer to struct fields in which case all child fields are included.
-/// - otherwise the first `dataSkippingNumIndexedCols` (default 32) leaf fields are included.
+///   Column names may refer to struct or `file` fields in which case all child fields are included.
+/// - otherwise the first `dataSkippingNumIndexedCols` (default 32) leaf fields are included. Each
+///   sub-field of a `file` column is a leaf, as each field of a struct is.
 /// - all fields are made nullable.
 ///
 /// The `nullCount` struct field is a nested structure mirroring the table's column hierarchy.
 /// It tracks the count of null values for each column. All leaf fields from the base schema
 /// are converted to LONG type (since null counts are always integers).
+///
+/// A `file` column appears as a plain struct of its sub-fields. All six are in `nullCount`, and
+/// all but `checksum` and `inline` are in `minValues`/`maxValues`.
 ///
 /// Note: Array and Map types are included in `nullCount` (null counts are meaningful for these
 /// types) but excluded from `minValues`/`maxValues` (not eligible for data skipping). Variant is
@@ -275,8 +279,8 @@ fn make_nullable_field<'a>(
 /// The nullCount struct field tracks the number of null values for each column.
 /// All leaf fields (primitives, arrays, maps, variants) are converted to LONG type
 /// since null counts are always integers, while struct fields are recursed into
-/// to preserve the nested structure. Field metadata (including column mapping info)
-/// is preserved for all fields.
+/// to preserve the nested structure. A `file` column becomes a plain struct of its sub-fields.
+/// Field metadata (including column mapping info) is preserved for all fields.
 pub(crate) struct NullCountStatsTransform;
 impl<'a> SchemaTransform<'a> for NullCountStatsTransform {
     transform_output_type!(|'a, T| Cow<'a, T>);
@@ -343,7 +347,8 @@ impl<'col> BaseStatsTransform<'col> {
 impl<'a> SchemaTransform<'a> for BaseStatsTransform<'_> {
     transform_output_type!(|'a, T| Option<Cow<'a, T>>);
 
-    // Always traverse struct fields. All non-struct leaf types count against the column limit.
+    // Always traverse struct and `file` fields. All other leaf types count against the column
+    // limit, including each `file` sub-field.
     fn transform_struct_field(&mut self, field: &'a StructField) -> Option<Cow<'a, StructField>> {
         self.filter.enter_field(field.name());
         let data_type = self.transform(&field.data_type);

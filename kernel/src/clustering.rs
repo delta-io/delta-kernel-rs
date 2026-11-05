@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use crate::actions::DomainMetadata;
 use crate::expressions::ColumnName;
 use crate::scan::data_skipping::stats_schema::is_skipping_eligible_datatype;
-use crate::schema::{DataType, StructType, file_sub_field_has_min_max};
+use crate::schema::{DataType, StructType, is_null_count_only_file_sub_field};
 use crate::{KernelError, KernelResult};
 
 /// Domain metadata structure for clustering columns.
@@ -72,7 +72,7 @@ pub(crate) struct ClusteringColumnInfo {
 /// 3. Column paths must resolve in the schema (including nested paths through structs and `file`
 ///    columns)
 /// 4. Leaf field must have a data type eligible for statistics collection; a `file` sub-field must
-///    also have min/max statistics, so `checksum` is rejected
+///    also have min/max statistics, so `checksum` and `inline` are rejected
 ///
 /// Both top-level and nested columns are supported. For nested columns, all intermediate
 /// fields must be struct or `file` types and the leaf field must be a stats-eligible primitive.
@@ -103,10 +103,7 @@ pub(crate) fn validate_clustering_columns(
         }
 
         let fields = schema.fields_of_path(col)?;
-        if let [.., parent, leaf] = fields.as_slice()
-            && matches!(parent.data_type(), DataType::File(_))
-            && !file_sub_field_has_min_max(leaf.name())
-        {
+        if is_null_count_only_file_sub_field(&fields) {
             return Err(KernelError::generic(format!(
                 "Clustering column '{col}' is a `file` sub-field without min/max statistics"
             )));
@@ -263,7 +260,7 @@ mod tests {
             result
                 .unwrap_err()
                 .to_string()
-                .contains("is not a struct type")
+                .contains("is not a struct or `file` type")
         );
     }
 

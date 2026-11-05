@@ -27,8 +27,8 @@ use crate::schema::generated_column::collect_generated_columns;
 pub(crate) use crate::schema::variant_utils::validate_variant_type_feature_support;
 use crate::schema::void_utils::strip_void_from_schema;
 use crate::schema::{
-    ColumnMetadataKey, DataType, GeneratedColumn, SchemaRef, StructField, StructType,
-    file_sub_field_has_min_max, schema_has_invariants, validate_column_defaults_metadata,
+    ColumnMetadataKey, GeneratedColumn, SchemaRef, StructField, StructType,
+    is_null_count_only_file_sub_field, schema_has_invariants, validate_column_defaults_metadata,
 };
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::table_features::V4_VALIDATOR;
@@ -230,20 +230,6 @@ pub(crate) enum InCommitTimestampEnablement {
         /// with ICT enabled from the beginning (no enablement properties needed).
         enablement: Option<(Version, i64)>,
     },
-}
-
-/// Whether `col` names a sub-field of a `file` column that has no min/max statistics.
-fn is_file_sub_field_without_min_max(schema: &StructType, col: &ColumnName) -> bool {
-    let Ok(fields) = schema.fields_of_path(col) else {
-        return false;
-    };
-    match fields.as_slice() {
-        [.., parent, leaf] => {
-            matches!(parent.data_type(), DataType::File(_))
-                && !file_sub_field_has_min_max(leaf.name())
-        }
-        _ => false,
-    }
 }
 
 /// Utility function to strip field metadata from stats schemas. This metadata describes logical
@@ -720,10 +706,11 @@ impl TableConfiguration {
     /// every column reference in the rewritten predicate against this set; every data-skipping
     /// call site shares this entry point so their gate input stays in lockstep.
     ///
-    /// It leaves out the `file` sub-fields that have no min/max statistics (`checksum` and
-    /// `inline`). The gate checks min/max eligibility by the compared value's type, and a
-    /// `checksum` is a string like the sub-fields that do have bounds, so predicates on these
-    /// sub-fields skip no files.
+    /// It leaves out the `file` sub-fields that have no min/max statistics, `checksum` and
+    /// `inline`, so predicates on them skip no files. The gate checks min/max eligibility only by
+    /// the compared value's type, and a `checksum` is a string like the sub-fields that do have
+    /// bounds. Leaving both out also gives up `IS NULL` skipping on them, though their `nullCount`
+    /// is collected; using it would need null-count eligibility tracked apart from min/max.
     pub(crate) fn physical_stats_columns_set(
         &self,
         required_columns: Option<&[ColumnName]>,
@@ -731,7 +718,11 @@ impl TableConfiguration {
         let schema = self.physical_data_schema_without_partition_columns();
         self.physical_stats_column_names(required_columns)
             .into_iter()
-            .filter(|col| !is_file_sub_field_without_min_max(&schema, col))
+            .filter(|col| {
+                !schema
+                    .fields_of_path(col)
+                    .is_ok_and(|path| is_null_count_only_file_sub_field(&path))
+            })
             .collect()
     }
 
