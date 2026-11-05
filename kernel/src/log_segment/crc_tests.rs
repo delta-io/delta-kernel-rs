@@ -1279,6 +1279,79 @@ async fn test_txn_newer_commit_wins_over_older_commit_for_same_app() {
 
 // === File stats (in-memory base) ===
 
+#[rstest]
+#[case::apply_first(
+    commit_info("WRITE", Some(1000)),
+    commit_info("LIQUID TAGGING", Some(2000)),
+    Some(1),
+    Some(2000)
+)]
+#[case::ignore_first(
+    commit_info("LIQUID TAGGING", Some(1000)),
+    commit_info("WRITE", Some(2000)),
+    Some(0),
+    Some(2000)
+)]
+#[case::empty_first(
+    json!({"commitInfo": {}}),
+    commit_info("WRITE", Some(2000)),
+    None,
+    Some(2000)
+)]
+#[case::timestamp_only_first(
+    json!({"commitInfo": {"timestamp": COMMIT_INFO_TIMESTAMP}}),
+    commit_info("WRITE", Some(2000)),
+    None,
+    Some(2000)
+)]
+#[case::ict_only_first(
+    json!({"commitInfo": {"inCommitTimestamp": 1000}}),
+    commit_info("WRITE", Some(2000)),
+    None,
+    Some(2000)
+)]
+#[case::empty_last(commit_info("WRITE", Some(1000)), json!({"commitInfo": {}}), Some(1), None)]
+#[case::timestamp_only_last(
+    commit_info("WRITE", Some(1000)),
+    json!({"commitInfo": {"timestamp": COMMIT_INFO_TIMESTAMP}}),
+    Some(1),
+    None
+)]
+#[case::missing_operation_last(
+    commit_info("WRITE", Some(1000)),
+    json!({"commitInfo": {"inCommitTimestamp": 2000}}),
+    Some(1),
+    Some(2000)
+)]
+#[tokio::test]
+async fn test_duplicate_commit_info_uses_first_operation_and_last_ict(
+    #[case] first: Value,
+    #[case] last: Value,
+    #[case] expected_files: Option<i64>,
+    #[case] expected_ict: Option<i64>,
+) {
+    let base = Crc {
+        protocol: protocol_ict(),
+        ..crc_complete_empty_dm_set_txn()
+    };
+    let crc = CrcReadTest::new()
+        .commit(0, create_table_actions_with_ict())
+        .commit(1, [first, add("a", 100), last])
+        .build()
+        .await
+        .incrementally_build_crc(&base)
+        .unwrap();
+    if let Some(expected_files) = expected_files {
+        assert!(crc.file_stats_state().is_complete());
+        let stats = crc.file_stats().unwrap();
+        assert_eq!(stats.num_files(), expected_files);
+        assert_eq!(stats.table_size_bytes(), expected_files * 100);
+    } else {
+        assert!(crc.file_stats_state().is_indeterminate());
+    }
+    assert_eq!(crc.in_commit_timestamp_opt, expected_ict);
+}
+
 #[tokio::test]
 async fn test_adds_and_removes_accumulate() {
     let crc = CrcReadTest::new()
