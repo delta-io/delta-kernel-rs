@@ -2,8 +2,8 @@ use std::collections::HashMap;
 
 use super::*;
 use crate::expressions::{
-    col, column_name, column_pred, lit, ArrayData, Expression as Expr, OpaqueExpressionOp,
-    OpaquePredicateOp, Predicate as Pred, ScalarExpressionEvaluator, StructData,
+    ArrayData, Expression as Expr, OpaqueExpressionOp, OpaquePredicateOp, Predicate as Pred,
+    ScalarExpressionEvaluator, StructData, col, column_name, column_pred, lit, null_lit,
 };
 use crate::kernel_predicates::parquet_stats_skipping::ParquetStatsProvider;
 use crate::scan::data_skipping::as_data_skipping_predicate;
@@ -1051,6 +1051,10 @@ fn test_sql_where() {
     let null_filter = DefaultKernelPredicateEvaluator::from(NullColumnResolver);
     let empty_filter = DefaultKernelPredicateEvaluator::from(EmptyColumnResolver);
 
+    for sentinel in [Pred::NULL, Pred::not(Pred::NULL)] {
+        expect_eq!(empty_filter.eval_sql_where(&sentinel), None, "{sentinel}");
+    }
+
     // Basic sanity check
     expect_eq!(
         null_filter.eval_sql_where(&Pred::from_expr(VAL)),
@@ -1135,4 +1139,152 @@ fn test_sql_where() {
     expect_eq!(null_filter.eval(pred), None, "{pred}");
     expect_eq!(null_filter.eval_sql_where(pred), Some(false), "{pred}");
     expect_eq!(empty_filter.eval_sql_where(pred), None, "{pred}");
+}
+
+// A NULL or unresolved WHEN leaves the whole CASE unknown during pruning.
+#[rstest::rstest]
+#[case::literal_true(Pred::TRUE, Some(true), Some(true))]
+#[case::literal_false(Pred::FALSE, Some(false), Some(false))]
+#[case::literal_null(Pred::NULL, None, None)]
+#[case::not_null(Pred::not(Pred::NULL), None, None)]
+#[case::column(column_pred!("flag"), Some(true), None)]
+#[case::null_column(column_pred!("null_flag"), None, None)]
+#[case::missing_column(column_pred!("missing"), None, None)]
+#[case::non_boolean(column_pred!("a"), None, None)]
+#[case::comparison(col!("a").gt(lit(1)), Some(true), None)]
+#[case::null_comparison(col!("null_a").eq(lit(1)), None, None)]
+#[case::null_and_true(Pred::and(Pred::NULL, Pred::TRUE), None, None)]
+#[case::null_or_false(Pred::or(Pred::NULL, Pred::FALSE), None, None)]
+#[case::not_null_and_false(Pred::not(Pred::and(Pred::NULL, Pred::FALSE)), Some(true), Some(true))]
+#[case::not_null_or_false(Pred::not(Pred::or(Pred::NULL, Pred::FALSE)), None, None)]
+#[case::missing_and_false(
+    Pred::and(column_pred!("missing"), Pred::FALSE), Some(false), Some(false)
+)]
+#[case::missing_or_true(Pred::or(column_pred!("missing"), Pred::TRUE), Some(true), Some(true))]
+#[case::missing_and_true(Pred::and(column_pred!("missing"), Pred::TRUE), None, None)]
+#[case::missing_or_false(Pred::or(column_pred!("missing"), Pred::FALSE), None, None)]
+#[case::unknown(Pred::unknown("unsupported"), None, None)]
+#[case::nested_null_result(
+    Pred::from_expr(Expr::case_when(
+        [(Pred::TRUE, Pred::NULL.into())], lit(true),
+    )), None, None
+)]
+#[case::nested_null_predicate(
+    Pred::from_expr(Expr::case_when(
+        [(Pred::TRUE, Pred::not(Pred::or(Pred::NULL, Pred::FALSE)).into())], lit(true),
+    )), None, None
+)]
+#[case::cast_null_boolean(
+    Pred::from_expr(Expr::cast(null_lit(DataType::STRING), DataType::BOOLEAN)),
+    None,
+    None
+)]
+#[case::cast_missing_boolean(
+    Pred::from_expr(Expr::cast(col!("missing"), DataType::BOOLEAN)), None, None
+)]
+fn test_eval_case_when_conditions(
+    #[case] condition: Pred,
+    #[case] expected: Option<bool>,
+    #[case] expected_static: Option<bool>,
+    #[values(false, true)] inverted: bool,
+) {
+    let filter = DefaultKernelPredicateEvaluator::from(HashMap::from([
+        (column_name!("flag"), Scalar::Boolean(true)),
+        (column_name!("null_flag"), Scalar::Null(DataType::BOOLEAN)),
+        (column_name!("a"), Scalar::Integer(2)),
+        (column_name!("null_a"), Scalar::Null(DataType::INTEGER)),
+    ]));
+    let expr = Expr::case_when(
+        [
+            (condition, lit(true)),
+            (Pred::TRUE, lit(false)),
+            (Pred::unknown("unselected"), lit(true)),
+        ],
+        lit(false),
+    );
+    assert_eq!(filter.eval_expr(&expr), expected.map(Scalar::Boolean));
+    let expected_pred = expected.map(|v| v != inverted);
+    let expected_static = expected_static.map(|v| v != inverted);
+    for pred in [
+        Pred::from_expr(expr.clone()),
+        expr.clone().eq(lit(true)),
+        lit(true).eq(expr.clone()),
+        expr.clone()
+            .eq(Expr::case_when([(Pred::TRUE, lit(true))], lit(false))),
+    ] {
+        let skipping =
+            as_data_skipping_predicate(&pred).and_then(|pred| filter.eval_pred(&pred, inverted));
+        assert_eq!(
+            (
+                filter.eval_pred(&pred, inverted),
+                filter.eval_pred_sql_where(&pred, inverted),
+                OneStatsValue(Scalar::Integer(2)).eval_pred(&pred, inverted),
+                skipping,
+            ),
+            (
+                expected_pred,
+                expected_pred,
+                expected_static,
+                expected_static
+            ),
+            "{pred}, inverted: {inverted}",
+        );
+    }
+    assert_eq!(
+        filter.eval_pred_unary(UnaryPredicateOp::IsNull, &expr, inverted),
+        expected.map(|_| inverted),
+    );
+}
+
+#[rstest::rstest]
+#[case::literal(lit(10), Some(Scalar::Integer(10)), Some(false))]
+#[case::column(col!("a"), Some(Scalar::Integer(2)), Some(false))]
+#[case::null(
+    null_lit(DataType::INTEGER),
+    Some(Scalar::Null(DataType::INTEGER)),
+    Some(true)
+)]
+#[case::null_boolean(
+    null_lit(DataType::BOOLEAN),
+    Some(Scalar::Null(DataType::BOOLEAN)),
+    Some(true)
+)]
+#[case::missing_column(col!("missing"), None, None)]
+#[case::unknown(Expr::unknown("selected"), None, None)]
+#[case::arithmetic(lit(10) / col!("a"), Some(Scalar::Integer(5)), None)]
+#[case::null_arithmetic(null_lit(DataType::INTEGER) + lit(1), None, None)]
+#[case::invalid_arithmetic(lit(10) / lit(0), None, None)]
+#[case::empty(
+    Expr::CaseWhen(CaseWhenExpression::new([], lit(20))),
+    Some(Scalar::Integer(20)), Some(false)
+)]
+#[case::nested(
+    Expr::case_when(
+        [(Pred::FALSE, lit(1) / lit(0))], lit(20),
+    ),
+    Some(Scalar::Integer(20)), Some(false),
+)]
+fn test_eval_case_when_results(
+    #[case] result: Expr,
+    #[case] expected: Option<Scalar>,
+    #[case] expected_is_null: Option<bool>,
+    #[values(false, true)] use_else: bool,
+) {
+    let filter = DefaultKernelPredicateEvaluator::from(HashMap::from([(
+        column_name!("a"),
+        Scalar::Integer(2),
+    )]));
+    let unselected = lit(1) / lit(0);
+    let unselected = match expected.as_ref().map(Scalar::data_type) {
+        Some(DataType::BOOLEAN) => unselected.eq(lit(0)).into(),
+        _ => unselected,
+    };
+    let (then_expr, else_expr) = if use_else {
+        (unselected, result)
+    } else {
+        (result, unselected)
+    };
+    let expr = Expr::case_when([(Pred::literal(!use_else), then_expr)], else_expr);
+    assert_eq!(filter.eval_expr(&expr), expected);
+    assert_eq!(filter.eval(&Pred::is_null(expr)), expected_is_null);
 }

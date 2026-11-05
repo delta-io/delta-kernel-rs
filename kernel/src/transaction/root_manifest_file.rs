@@ -5,13 +5,13 @@ use std::sync::Arc;
 use crate::action_reconciliation::calculate_transaction_expiration_timestamp;
 use crate::actions::visitors::SetTransactionMap;
 use crate::actions::{CheckpointAction, ContentRoot, DomainMetadata, SetTransaction};
-use crate::crc::{merge_domain_metadata, DomainMetadataState, SetTransactionState};
+use crate::crc::{DomainMetadataState, SetTransactionState, merge_domain_metadata};
 use crate::error::KernelError;
 use crate::log_segment::DomainMetadataMap;
 use crate::snapshot::SnapshotRef;
 use crate::table_configuration::TableConfiguration;
 use crate::utils::require;
-use crate::{version_as_i64, Engine, FileMeta, KernelResult, Version};
+use crate::{Engine, FileMeta, KernelResult, Version, version_as_i64};
 
 /// A pointer to an on-disk root manifest file to be committed as the table's content root via a
 /// `checkpoint` action.
@@ -170,7 +170,7 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
-    use crate::actions::{Sidecar, LOG_DOMAIN_METADATA_SCHEMA, LOG_TXN_SCHEMA};
+    use crate::actions::{LOG_DOMAIN_METADATA_SCHEMA, LOG_TXN_SCHEMA, Sidecar};
     use crate::committer::FileSystemCommitter;
     use crate::crc::{Crc, DomainMetadataState, SetTransactionState};
     use crate::engine::sync::SyncEngine;
@@ -180,10 +180,10 @@ mod tests {
     use crate::transaction::create_table::create_table;
     use crate::unit_test_utils::adaptive_metadata_fixtures::{
         adaptive_metadata_protocol_and_metadata, minimal_checkpoint_action, setup_table,
-        write_commit,
+        write_commit, write_commit_after_manifest_commit, write_manifest_commit,
     };
-    use crate::unit_test_utils::{assert_result_error_with_message, MockTableConfigurationBuilder};
-    use crate::{create_row, KernelResult};
+    use crate::unit_test_utils::{MockTableConfigurationBuilder, assert_result_error_with_message};
+    use crate::{KernelResult, create_row};
 
     fn manifest_file(location: &str, size: u64) -> KernelResult<FileMeta> {
         Ok(FileMeta {
@@ -249,11 +249,11 @@ mod tests {
     }
 
     #[test]
-    fn compute_checkpoint_action_allows_replacing_a_checkpoint_that_covers_the_snapshot(
-    ) -> KernelResult<()> {
+    fn compute_checkpoint_action_allows_replacing_a_checkpoint_that_covers_the_snapshot()
+    -> KernelResult<()> {
         let (engine, table_root) = setup_table()?;
         let existing = minimal_checkpoint_action("metadata/root-v1.parquet", 1)?;
-        write_commit(&engine, &table_root, 1, existing.into_engine_data(&engine)?)?;
+        write_manifest_commit(&engine, &table_root, 1, existing)?;
 
         let snapshot = Snapshot::builder_for(table_root.clone()).build(&engine)?;
         assert_eq!(snapshot.version(), 1);
@@ -279,12 +279,13 @@ mod tests {
     fn compute_checkpoint_action_rejects_a_stale_checkpoint() -> KernelResult<()> {
         let (engine, table_root) = setup_table()?;
         let existing = minimal_checkpoint_action("metadata/root-v1.parquet", 1)?;
-        write_commit(&engine, &table_root, 1, existing.into_engine_data(&engine)?)?;
+        write_manifest_commit(&engine, &table_root, 1, existing)?;
         let domain_metadata = DomainMetadata::new("test.domain".to_string(), "{}".to_string());
-        write_commit(
+        write_commit_after_manifest_commit(
             &engine,
             &table_root,
             2,
+            1,
             create_row(&engine, LOG_DOMAIN_METADATA_SCHEMA.clone(), domain_metadata)?,
         )?;
 
@@ -421,7 +422,7 @@ mod tests {
                 "{}".to_string(),
             )],
         );
-        write(3, checkpoint.into_engine_data(&engine)?)?;
+        write_manifest_commit(&engine, &table_root, 3, checkpoint)?;
 
         let manifest = root_manifest(
             &table_root,
@@ -442,8 +443,8 @@ mod tests {
     // (as an external writer would, with no tombstone), must not come back in the rebuilt
     // checkpoint from those older log entries.
     #[test]
-    fn compute_checkpoint_action_does_not_resurrect_entries_the_checkpoint_dropped(
-    ) -> KernelResult<()> {
+    fn compute_checkpoint_action_does_not_resurrect_entries_the_checkpoint_dropped()
+    -> KernelResult<()> {
         let (engine, table_root) = setup_table()?;
         let write = |version, data| write_commit(&engine, &table_root, version, data);
 
@@ -456,7 +457,7 @@ mod tests {
         write(2, create_row(&engine, LOG_TXN_SCHEMA.clone(), transaction)?)?;
         // Complete checkpoint at the tip that omits both.
         let existing = minimal_checkpoint_action("metadata/root-v3.parquet", 3)?;
-        write(3, existing.into_engine_data(&engine)?)?;
+        write_manifest_commit(&engine, &table_root, 3, existing)?;
 
         let snapshot = Snapshot::builder_for(table_root.clone()).build(&engine)?;
         assert_eq!(snapshot.version(), 3);
@@ -502,7 +503,7 @@ mod tests {
         };
         existing.txn_sidecars = vec![sidecar()];
         existing.domain_metadata_sidecars = vec![sidecar()];
-        write_commit(&engine, &table_root, 1, existing.into_engine_data(&engine)?)?;
+        write_manifest_commit(&engine, &table_root, 1, existing)?;
 
         let snapshot = Snapshot::builder_for(table_root.clone()).build(&engine)?;
         let manifest = root_manifest(
@@ -632,22 +633,19 @@ mod tests {
         #[case] domain_kept: bool,
     ) -> KernelResult<()> {
         let (engine, table_root) = setup_table()?;
-        let config = Snapshot::builder_for(table_root.clone())
-            .build(&engine)?
-            .table_configuration()
-            .clone();
+        let (protocol, metadata) = adaptive_metadata_protocol_and_metadata();
         let existing = CheckpointAction::new(
             1,
             ContentRoot::new("metadata/root-v1.parquet".to_string(), 1024, 1),
-            config.protocol().clone(),
-            config.metadata().clone(),
+            protocol,
+            metadata,
             vec![SetTransaction::new("app-1".to_string(), 5, None)],
             vec![DomainMetadata::new(
                 "test.domain".to_string(),
                 "{}".to_string(),
             )],
         );
-        write_commit(&engine, &table_root, 1, existing.into_engine_data(&engine)?)?;
+        write_manifest_commit(&engine, &table_root, 1, existing)?;
 
         let snapshot = Snapshot::builder_for(table_root.clone()).build(&engine)?;
         assert!(snapshot.crc_at_version().is_none());

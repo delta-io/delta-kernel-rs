@@ -64,7 +64,7 @@ fn emit(expr: &Expr, kernel: &Path) -> syn::Result<TokenStream> {
                     return Err(Error::new_spanned(
                         binary.op,
                         "supported operators are ==, !=, <, <=, >, >=",
-                    ))
+                    ));
                 }
             };
             let method = Ident::new(method, binary.op.span());
@@ -106,7 +106,7 @@ fn emit_call(call: &ExprCall, kernel: &Path) -> syn::Result<TokenStream> {
                     call,
                     "col() requires one string literal; \
                      use path() for explicit or computed column segments",
-                ))
+                ));
             }
         };
         return Ok(quote! { #kernel::expressions::col!(#path) });
@@ -119,19 +119,19 @@ fn emit_call(call: &ExprCall, kernel: &Path) -> syn::Result<TokenStream> {
             return Err(Error::new_spanned(
                 method,
                 format!("unsupported expression call: {name}"),
-            ))
-        }
-    };
-    if let Some(arity) = arity {
-        if args.len() != arity {
-            return Err(Error::new_spanned(
-                call,
-                format!(
-                    "{name}() requires {arity} argument{}",
-                    if arity == 1 { "" } else { "s" }
-                ),
             ));
         }
+    };
+    if let Some(arity) = arity
+        && args.len() != arity
+    {
+        return Err(Error::new_spanned(
+            call,
+            format!(
+                "{name}() requires {arity} argument{}",
+                if arity == 1 { "" } else { "s" }
+            ),
+        ));
     }
     match name.as_str() {
         "lit" => Ok(quote! { #kernel::expressions::lit(#args) }),
@@ -207,10 +207,9 @@ fn emit_call(call: &ExprCall, kernel: &Path) -> syn::Result<TokenStream> {
 // Forwarded `:literal` and `:expr` fragments arrive in invisible groups, which must preserve the
 // same constructor rules as the original tokens. Explicit parentheses remain part of the syntax.
 fn ungroup(mut expr: &Expr) -> &Expr {
-    while let Expr::Group(group) = expr {
-        if !group.attrs.is_empty() {
-            break;
-        }
+    while let Expr::Group(group) = expr
+        && group.attrs.is_empty()
+    {
         expr = &group.expr;
     }
     expr

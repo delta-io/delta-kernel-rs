@@ -43,12 +43,12 @@ use delta_kernel_ffi_macros::handle_descriptor;
 #[cfg(feature = "default-engine-base")]
 use crate::engine_data::ArrowFFIData;
 use crate::handle::Handle;
-use crate::scan::{decode_engine_predicate, EnginePredicate};
 #[cfg(feature = "default-engine-base")]
 use crate::scan::{CTransforms, ScanMetadataArrowResult};
+use crate::scan::{EnginePredicate, decode_engine_predicate};
 use crate::{
-    kernel_string_slice, ExternEngine, ExternResult, IntoExternResult, KernelStringSlice,
-    NullableCvoid, OptionalValue, SharedExternEngine, SharedSnapshot,
+    ExternEngine, ExternResult, IntoExternResult, KernelStringSlice, NullableCvoid, OptionalValue,
+    SharedExternEngine, SharedSnapshot, kernel_string_slice,
 };
 
 /// Opaque builder for constructing an [`IncrementalScanStream`] from a snapshot.
@@ -431,25 +431,26 @@ mod tests {
     use std::ffi::c_void;
     use std::sync::Arc;
 
-    use delta_kernel::object_store::memory::InMemory;
     use delta_kernel::KernelResult;
+    use delta_kernel::object_store::memory::InMemory;
     use delta_kernel_default_engine::DefaultEngineBuilder;
-    use test_utils::{actions_to_string, add_commit, TestAction};
+    use test_utils::{TestAction, actions_to_string, add_commit};
 
     use super::*;
     use crate::error::FFIKernelError;
     use crate::expressions::kernel_visitor::{
-        visit_expression_column, visit_expression_literal_int, visit_predicate_gt,
-        KernelExpressionVisitorState,
+        KernelExpressionVisitorState, visit_expression_column, visit_expression_literal_int,
+        visit_predicate_gt,
     };
     use crate::ffi_test_utils::{
-        allocate_err, assert_extern_result_error_with_message, ok_or_panic, recover_error,
+        TEST_ERROR_ALLOCATORS, assert_extern_result_error_with_message, ok_or_panic, recover_error,
     };
     #[cfg(feature = "default-engine-base")]
     use crate::scan::free_scan_metadata_arrow_result;
     use crate::{
-        engine_to_handle, free_engine, free_snapshot, get_snapshot_builder, kernel_string_slice,
-        snapshot_builder_build, snapshot_builder_with_version, NullableCvoid, TryFromStringSlice,
+        NullableCvoid, TryFromStringSlice, engine_to_handle, free_engine, free_snapshot,
+        get_snapshot_builder, kernel_string_slice, snapshot_builder_build,
+        snapshot_builder_with_version,
     };
 
     /// Build an in-memory engine handle and a snapshot pinned to the last version, from a v0
@@ -471,7 +472,7 @@ mod tests {
                 .unwrap();
         }
         let engine = DefaultEngineBuilder::new(storage.clone()).build();
-        let engine = engine_to_handle(Arc::new(engine), allocate_err);
+        let engine = engine_to_handle(Arc::new(engine), TEST_ERROR_ALLOCATORS);
         let table_root = kernel_string_slice!(table_root);
         let builder =
             unsafe { ok_or_panic(get_snapshot_builder(table_root, engine.shallow_copy())) };
@@ -845,7 +846,7 @@ mod tests {
                 state,
                 parts.as_ptr(),
                 parts.len(),
-                allocate_err,
+                &TEST_ERROR_ALLOCATORS,
             ))
         };
         let lit = visit_expression_literal_int(state, 25);
@@ -856,11 +857,13 @@ mod tests {
     // `id > 25` drops the [0, 9] file and keeps the [20, 30] file. Removes are unaffected.
     #[tokio::test]
     async fn with_predicate_prunes_live_adds() -> KernelResult<()> {
-        let (engine, snapshot) = setup_with_id_metadata(vec![[
-            add_with_id_stats("low.parquet", 0, 9),
-            add_with_id_stats("high.parquet", 20, 30),
-        ]
-        .join("\n")])
+        let (engine, snapshot) = setup_with_id_metadata(vec![
+            [
+                add_with_id_stats("low.parquet", 0, 9),
+                add_with_id_stats("high.parquet", 20, 30),
+            ]
+            .join("\n"),
+        ])
         .await;
 
         let builder = unsafe {
@@ -940,7 +943,7 @@ mod tests {
                 state,
                 parts.as_ptr(),
                 parts.len(),
-                allocate_err,
+                &TEST_ERROR_ALLOCATORS,
             ))
         };
         let lit = visit_expression_literal_int(state, 25);
@@ -957,11 +960,13 @@ mod tests {
         use delta_kernel::arrow::array::{Array, RecordBatch, StringArray, StructArray};
         use delta_kernel::arrow::ffi::from_ffi;
 
-        let (engine, snapshot) = setup_with_id_metadata(vec![[
-            add_with_id_stats("low.parquet", 0, 9),
-            add_with_id_stats("high.parquet", 20, 30),
-        ]
-        .join("\n")])
+        let (engine, snapshot) = setup_with_id_metadata(vec![
+            [
+                add_with_id_stats("low.parquet", 0, 9),
+                add_with_id_stats("high.parquet", 20, 30),
+            ]
+            .join("\n"),
+        ])
         .await;
 
         let builder = unsafe {
@@ -1032,7 +1037,7 @@ mod tests {
     async fn build_returns_none_when_range_not_covered() -> KernelResult<()> {
         use delta_kernel_default_engine::executor::tokio::TokioMultiThreadExecutor;
 
-        use crate::{checkpoint_snapshot, version, FfiCheckpointWriteResult};
+        use crate::{FfiCheckpointWriteResult, checkpoint_snapshot, version};
 
         let table_root = "memory:///";
         let storage = Arc::new(InMemory::new());
@@ -1064,7 +1069,7 @@ mod tests {
                     .with_task_executor(executor)
                     .build(),
             ),
-            allocate_err,
+            TEST_ERROR_ALLOCATORS,
         );
 
         // Checkpoint at v2 so the log segment for a later snapshot starts at the checkpoint and

@@ -84,17 +84,17 @@ mod tests {
     use std::sync::Arc;
 
     use rstest::rstest;
-    use tempfile::{tempdir, NamedTempFile};
+    use tempfile::{NamedTempFile, tempdir};
     use url::Url;
 
     use super::PlanBasedJsonHandler;
     use crate::arrow::array::{Array, Int32Array, RecordBatch, StringArray};
     use crate::engine::arrow_data::ArrowEngineData;
     use crate::engine::plans::parquet::PlanBasedParquetHandler;
-    use crate::engine::sync::plan::SyncPlanExecutor;
     use crate::engine::sync::SyncEngine;
+    use crate::engine::sync::plan::SyncPlanExecutor;
     use crate::engine_data::FilteredEngineData;
-    use crate::schema::{schema_ref, SchemaRef};
+    use crate::schema::{SchemaRef, schema_ref};
     use crate::{
         Engine as _, EngineData, FileDataReadResultIterator, FileMeta, JsonHandler as _,
         KernelResult, ParquetHandler as _,

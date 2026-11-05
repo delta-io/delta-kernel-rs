@@ -4,19 +4,19 @@ use std::marker::PhantomData;
 
 use delta_kernel_derive::internal_api;
 
-use super::state::TransactionBuilderState;
 use super::TransactionBuilder;
+use super::state::TransactionBuilderState;
 use crate::committer::Committer;
 use crate::expressions::ColumnName;
 use crate::schema::StructField;
 use crate::snapshot::SnapshotRef;
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::{
-    validate_iceberg_compat_if_needed, IcebergCompatValidationContext, Operation, TableFeature,
-    V2_VALIDATOR, V3_VALIDATOR,
+    IcebergCompatValidationContext, Operation, TableFeature, V2_VALIDATOR, V3_VALIDATOR,
+    validate_iceberg_compat_if_needed,
 };
 use crate::transaction::domain_metadata::validate_unique_domains;
-use crate::transaction::schema_evolution::{evolve_table_config, SchemaOperation};
+use crate::transaction::schema_evolution::{SchemaOperation, evolve_table_config};
 use crate::transaction::{
     ExecutionMode, Imperative, Transaction, UpdateTable, UpdateTableOperation,
 };
@@ -215,8 +215,8 @@ impl<MODE: ExecutionMode> TransactionBuilder<UpdateTable, MODE> {
     /// - Connector commit information that does not contain exactly one row.
     ///
     /// Schema changes are rejected when `icebergCompatV2`, `icebergCompatV3`, or
-    /// `allowColumnDefaults` is enabled. This applies to standalone ALTER TABLE transactions and
-    /// schema evolution during data-changing writes.
+    /// `allowColumnDefaults` is enabled, or when the table has generated columns. This applies to
+    /// standalone ALTER TABLE transactions and schema evolution during data-changing writes.
     pub fn build(
         self,
         engine: &dyn Engine,
@@ -309,6 +309,10 @@ fn try_new_update_table<MODE: ExecutionMode>(
         .table_configuration()
         .ensure_operation_supported(Operation::Write)?;
 
+    // TODO(#3223): Strip generation expressions on metadata updates when the pre-update protocol
+    // did not support generated columns, so a protocol upgrade cannot activate previously ignored
+    // formulas.
+
     // TODO(#3240): Validate that delta.enableRowTracking=true has the required protocol support
     // and materialized column-name properties. Materialized names must be distinct and must not
     // collide with physical data columns.
@@ -380,6 +384,13 @@ fn apply_schema_changes(
             "Schema changes are not yet supported on tables with allowColumnDefaults enabled",
         ));
     }
+    if table_config.is_feature_supported(&TableFeature::GeneratedColumns)
+        && table_config.has_generation_expressions()
+    {
+        return Err(KernelError::unsupported(
+            "Schema changes are not yet supported on tables with generated columns",
+        ));
+    }
     evolve_table_config(&table_config, changes)
 }
 
@@ -398,11 +409,11 @@ mod tests {
     use crate::engine::arrow_conversion::TryIntoArrow;
     use crate::engine::arrow_data::ArrowEngineData;
     use crate::engine::sync::SyncEngine;
-    use crate::expressions::column_name;
     #[cfg(feature = "adaptive-metadata-in-dev")]
     use crate::expressions::ColumnName;
+    use crate::expressions::column_name;
     use crate::object_store::memory::InMemory;
-    use crate::schema::{schema_ref, DataType, StructField};
+    use crate::schema::{DataType, StructField, schema_ref};
     use crate::snapshot::Snapshot;
     use crate::table_features::TableFeature;
     use crate::table_properties::{ENABLE_ICEBERG_COMPAT_V2, ENABLE_ICEBERG_COMPAT_V3};
@@ -585,10 +596,12 @@ mod tests {
             UpdateTableOperation::AlterTable.into()
         );
         assert!(transaction.should_emit_metadata);
-        assert!(transaction
-            .effective_table_config
-            .logical_schema()
-            .contains("new_column"));
+        assert!(
+            transaction
+                .effective_table_config
+                .logical_schema()
+                .contains("new_column")
+        );
         Ok(())
     }
 
@@ -608,19 +621,24 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn custom_operation_rejects_reserved_known_name() -> KernelResult<()> {
+    #[rstest]
+    fn custom_operation_rejects_reserved_known_name(
+        #[values("ALTER TABLE", "REORG")] operation: &str,
+    ) -> KernelResult<()> {
         let (engine, snapshot, _tempdir) = load_test_table("table-without-dv-small")?;
         let error = snapshot
             .update_table(
-                UpdateTableOperation::Custom("ALTER TABLE".to_string()),
+                UpdateTableOperation::Custom(operation.to_string()),
                 "test-engine",
-                true,
+                false,
             )
             .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))
             .unwrap_err();
 
-        assert!(error.to_string().contains("reserved"));
+        assert!(
+            matches!(&error, KernelError::InvalidTransactionState(message)
+            if message == &format!("custom operation name '{operation}' is reserved"))
+        );
         Ok(())
     }
 
@@ -632,9 +650,11 @@ mod tests {
             .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))
             .unwrap_err();
 
-        assert!(error
-            .to_string()
-            .contains("requires at least one schema change"));
+        assert!(
+            error
+                .to_string()
+                .contains("requires at least one schema change")
+        );
         Ok(())
     }
 
@@ -700,6 +720,7 @@ mod tests {
             UpdateTableOperation::Update,
             UpdateTableOperation::Merge,
             UpdateTableOperation::Optimize,
+            UpdateTableOperation::Reorg,
             UpdateTableOperation::Custom("UNKNOWN".to_string())
         )]
         operation: UpdateTableOperation,
@@ -778,9 +799,11 @@ mod tests {
         );
         let result = builder.build(engine.as_ref(), Box::new(FileSystemCommitter::new()));
         if let Some(feature) = feature.filter(|_| feature_enabled) {
-            assert!(snapshot
-                .table_configuration()
-                .is_feature_supported(&feature));
+            assert!(
+                snapshot
+                    .table_configuration()
+                    .is_feature_supported(&feature)
+            );
             assert!(snapshot.table_configuration().is_feature_enabled(&feature));
             let error = result.unwrap_err();
             let expected =

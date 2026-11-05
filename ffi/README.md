@@ -2,6 +2,13 @@
 
 This crate provides a C foreign function interface (ffi) for delta-kernel-rs.
 
+## Source layout
+
+Snapshot builders live in [`src/snapshot/builder.rs`](src/snapshot/builder.rs), with typed hint bindings
+in [`src/snapshot/hint/`](src/snapshot/hint/). Snapshot accessors live in
+[`src/lib.rs`](src/lib.rs). See the [source layout guidance](AGENTS.md#source-layout) for module
+organization conventions.
+
 ## Selecting scan statistics
 
 Pass `FfiStatsOptions` to `scan_builder_with_stats` to choose JSON output, indexed structured
@@ -192,3 +199,20 @@ By default the VSCode C/C++ Extension does not use any defines flags. You can op
         "DEFINE_SYNC_ENGINE"
     ]
 ```
+
+## Error allocation
+
+Register both error callbacks by passing a pointer to `ErrorAllocators` to engine constructors.
+Builders and engines copy the table, so the table itself need only live through registration.
+Callback code and connector context must remain valid for every call, including concurrent calls
+when the engine is shared. Standalone FFI functions borrow an allocator table directly.
+
+Kernel errors provide `KernelErrorInfo` (numeric code and message). Delta errors provide
+`DeltaErrorInfo` (condition, optional SQLSTATE, named parameters, and message). Callbacks must copy
+any information they retain after returning. Each callback returns a connector-owned error object
+as `void*`, or NULL if allocation fails. `ExternResult::Err` returns that pointer unchanged; the
+connector frees it. Callbacks must not unwind across FFI. See `examples/common/kernel_utils.c` for
+both callbacks and their shared registration table.
+
+This changes constructor and standalone function signatures and removes the `EngineError` layout
+requirement. Rebuild bindings against the generated headers and supply both callbacks.

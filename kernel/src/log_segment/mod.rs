@@ -1,5 +1,7 @@
 //! Represents a segment of a delta log. [`LogSegment`] wraps a set of checkpoint and commit
 //! files.
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use std::fmt::Display;
 use std::num::NonZero;
 use std::sync::{Arc, LazyLock};
 
@@ -8,39 +10,43 @@ use itertools::Itertools;
 use tracing::{debug, info, warn};
 use url::Url;
 
-use crate::actions::visitors::SidecarVisitor;
-use crate::actions::{
-    action_presence_leaf, schema_contains_file_actions, Sidecar, LOG_ADD_SCHEMA,
-    SIDECAR_FILE_SCHEMA_TAG, SIDECAR_NAME,
-};
 #[cfg(feature = "adaptive-metadata-in-dev")]
-use crate::actions::{CheckpointAction, LastManifestCommit, LOG_CHECKPOINT_SCHEMA};
+use crate::EngineData;
+#[cfg(feature = "declarative-plans")]
+use crate::Scalar;
+use crate::actions::visitors::SidecarVisitor;
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use crate::actions::{CheckpointAction, LOG_CHECKPOINT_SCHEMA, LastManifestCommit};
+use crate::actions::{
+    LOG_ADD_SCHEMA, SIDECAR_FILE_SCHEMA_TAG, SIDECAR_NAME, Sidecar, action_presence_leaf,
+    schema_contains_file_actions,
+};
 use crate::checkpoint::collation_stats::{
     build_collation_stats_read_transform, source_collation_stats,
 };
 use crate::committer::CatalogCommit;
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use crate::content_tree::read_checkpoint_action;
 use crate::expressions::ColumnName;
 use crate::last_checkpoint_hint::{HintAction, LastCheckpointHint};
 use crate::log_replay::ActionsBatch;
 #[internal_api]
 use crate::log_segment_files::LogSegmentFiles;
 use crate::metrics::{
-    emit_log_segment_load, emit_log_segment_load_failure, SnapshotLoadMetricContext,
+    SnapshotLoadMetricContext, emit_log_segment_load, emit_log_segment_load_failure,
 };
 use crate::path::LogPathFileType::*;
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use crate::path::LogRoot;
 use crate::path::{LogPathFileType, ParsedLogPath};
 #[cfg(feature = "declarative-plans")]
 use crate::plans::ir::nodes::{FileType, ScanFile};
 use crate::schema::compare::SchemaComparison;
 use crate::schema::{
-    lazy_schema_ref, CheckpointFieldKind, DataType, SchemaRef, StructField, StructType,
-    ToSchema as _,
+    CheckpointFieldKind, DataType, SchemaRef, StructField, StructType, ToSchema as _,
+    lazy_schema_ref,
 };
 use crate::utils::require;
-#[cfg(feature = "adaptive-metadata-in-dev")]
-use crate::EngineData;
-#[cfg(feature = "declarative-plans")]
-use crate::Scalar;
 use crate::{
     Engine, FileMeta, KernelError, KernelResult, KernelResultIterator, Predicate, PredicateRef,
     RowVisitor, StorageHandler, Version,
@@ -60,7 +66,7 @@ mod crc_tests;
 #[cfg(all(test, feature = "adaptive-metadata-in-dev"))]
 mod protocol_metadata_replay_amt_tests;
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 /// Statistics for the commit files selected to replay a snapshot's log segment.
 ///
@@ -91,7 +97,7 @@ pub(crate) struct CheckpointReadInfo {
     #[serde(default)]
     #[allow(unused)]
     pub has_partition_values_parsed: bool,
-    /// The schema used to read checkpoint files, potentially including stats_parsed.
+    /// The schema of normalized checkpoint batches, potentially including stats_parsed.
     #[allow(unused)]
     pub checkpoint_read_schema: SchemaRef,
 }
@@ -509,11 +515,13 @@ impl LogSegment {
                 .unwrap_or_else(|| "none".into()),
             self.listed.checkpoint_parts.len(),
             self.listed.ascending_compaction_files.len(),
-            self.listed.latest_crc_file
+            self.listed
+                .latest_crc_file
                 .as_ref()
                 .map(|f| f.version.to_string())
                 .unwrap_or_else(|| "none".into()),
-            self.listed.max_published_version
+            self.listed
+                .max_published_version
                 .map(|v| v.to_string())
                 .unwrap_or_else(|| "none".into()),
         )
@@ -650,12 +658,12 @@ impl LogSegment {
         log_tail: Vec<ParsedLogPath>,
     ) -> KernelResult<Self> {
         let end_version = end_version.into();
-        if let Some(end_version) = end_version {
-            if start_version > end_version {
-                return Err(KernelError::generic(
-                    "Failed to build LogSegment: start_version cannot be greater than end_version",
-                ));
-            }
+        if let Some(end_version) = end_version
+            && start_version > end_version
+        {
+            return Err(KernelError::generic(
+                "Failed to build LogSegment: start_version cannot be greater than end_version",
+            ));
         }
 
         // TODO: compactions?
@@ -917,7 +925,7 @@ impl LogSegment {
         meta_predicate: Option<PredicateRef>,
         stats_schema: Option<&StructType>,
         partition_schema: Option<&StructType>,
-    ) -> KernelResult<ActionsWithCheckpointInfo<impl KernelResultIterator<ActionsBatch>>> {
+    ) -> KernelResult<ActionsWithCheckpointInfo<Box<dyn KernelResultIterator<ActionsBatch>>>> {
         // Combine the action-presence predicate with the caller's skipping predicate so readers
         // can omit checkpoint data that cannot contain a relevant action.
         let projection_predicate = checkpoint_action_projection_predicate(&checkpoint_read_schema);
@@ -937,8 +945,85 @@ impl LogSegment {
         )?;
 
         Ok(ActionsWithCheckpointInfo {
-            actions: commit_stream.chain(checkpoint_result.actions),
+            actions: Box::new(commit_stream.chain(checkpoint_result.actions)),
             checkpoint_info: checkpoint_result.checkpoint_info,
+        })
+    }
+
+    /// Same as [`Self::read_actions_with_projected_checkpoint_actions`], but reads the AMT
+    /// `checkpoint` action as the segment's checkpoint: the commits after its version are followed
+    /// by the actions it carries, and the commits and checkpoint files at or below that version are
+    /// not read.
+    ///
+    /// `table_root` resolves the action's manifest locations.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn read_actions_with_checkpoint_action(
+        &self,
+        engine: &dyn Engine,
+        checkpoint: &CheckpointAction,
+        table_root: &Url,
+        commit_read_schema: SchemaRef,
+        checkpoint_read_schema: SchemaRef,
+        stats_schema: Option<&StructType>,
+    ) -> KernelResult<ActionsWithCheckpointInfo<Box<dyn KernelResultIterator<ActionsBatch>>>> {
+        let version = Version::try_from(checkpoint.version())
+            .ok()
+            .filter(|v| *v <= self.end_version)
+            .ok_or_else(|| {
+                KernelError::invalid_checkpoint(format!(
+                    "checkpoint action version {} is outside the log segment's versions 0..={}",
+                    checkpoint.version(),
+                    self.end_version
+                ))
+            })?;
+        // A manifest commit's checkpoint action covers its version with the tree alone; an older
+        // root needs the inline file actions only a standalone checkpoint carries.
+        require!(
+            checkpoint.content_root_version() == checkpoint.version(),
+            KernelError::unsupported(format!(
+                "reading a checkpoint action whose content root version {} is older than its \
+                 version {version} is not yet supported",
+                checkpoint.content_root_version()
+            ))
+        );
+        // Writers stop producing checkpoint files once adaptiveMetadata is enabled, so a file at or
+        // after the action's version is a standalone checkpoint.
+        if let Some(checkpoint_file_version) = self.checkpoint_version.filter(|v| *v >= version) {
+            return Err(KernelError::unsupported(format!(
+                "reading the adaptiveMetadata standalone checkpoint at version \
+                 {checkpoint_file_version} is not yet supported"
+            )));
+        }
+
+        let commits = Self::read_commit_files(
+            engine,
+            &self.find_commit_cover_after(Some(version)),
+            commit_read_schema,
+        )?;
+        let stats_fallback =
+            needs_json_stats_fallback(&checkpoint_read_schema, stats_schema, false)
+                .then(|| StructField::nullable("stats", DataType::STRING));
+        let checkpoint_read_schema = augment_checkpoint_read_schema(
+            &checkpoint_read_schema,
+            stats_fallback.into_iter().collect(),
+            false,
+        )?;
+        let checkpoint_actions = read_checkpoint_action(
+            engine,
+            checkpoint,
+            &LogRoot::new(table_root.clone())?,
+            checkpoint_read_schema.clone(),
+        )?;
+        Ok(ActionsWithCheckpointInfo {
+            actions: Box::new(commits.chain(checkpoint_actions)),
+            // TODO(#2866): the content tree reader produces neither `stats_parsed` nor
+            // `partitionValues_parsed`, so replay parses the JSON stats.
+            checkpoint_info: CheckpointReadInfo {
+                has_stats_parsed: false,
+                has_partition_values_parsed: false,
+                checkpoint_read_schema,
+            },
         })
     }
 
@@ -950,7 +1035,7 @@ impl LogSegment {
         &self,
         engine: &dyn Engine,
         action_schema: SchemaRef,
-    ) -> KernelResult<impl KernelResultIterator<ActionsBatch>> {
+    ) -> KernelResult<impl KernelResultIterator<ActionsBatch> + use<>> {
         let result = self.read_actions_with_projected_checkpoint_actions(
             engine,
             action_schema.clone(),
@@ -974,31 +1059,18 @@ impl LogSegment {
         engine: &dyn Engine,
         pointer: &LastManifestCommit,
     ) -> KernelResult<CheckpointAction> {
-        let inconsistent = |detail: String| {
-            KernelError::invalid_log_segment(format!(
-                "lastManifestCommit names manifest commit version {} as the source of content \
-                 root version {}, but {detail}",
-                pointer.version, pointer.content_root_version
-            ))
-        };
         let commit = self.find_pointed_commit(pointer).ok_or_else(|| {
-            inconsistent("this log segment does not list that commit".to_string())
+            last_manifest_commit_inconsistency(
+                pointer,
+                "this log segment does not list that commit",
+            )
         })?;
         let files = std::slice::from_ref(&commit.location);
         let batches =
             engine
                 .json_handler()
                 .read_json_files(files, LOG_CHECKPOINT_SCHEMA.clone(), None)?;
-        let action = first_checkpoint_action(batches)?
-            .ok_or_else(|| inconsistent("that commit carries no checkpoint action".to_string()))?;
-        require!(
-            action.content_root_version() == pointer.content_root_version,
-            inconsistent(format!(
-                "that commit's checkpoint action has content root version {}",
-                action.content_root_version()
-            ))
-        );
-        Ok(action)
+        require_pointed_checkpoint_action(pointer, first_checkpoint_action(batches)?)
     }
 
     /// The listed commit at `pointer`'s version, or `None` when this segment does not list it.
@@ -1025,7 +1097,7 @@ impl LogSegment {
         &self,
         engine: &dyn Engine,
         schema: SchemaRef,
-    ) -> KernelResult<impl KernelResultIterator<ActionsBatch>> {
+    ) -> KernelResult<impl KernelResultIterator<ActionsBatch> + use<>> {
         Self::read_commit_files(engine, &self.find_commit_cover(), schema)
     }
 
@@ -1094,7 +1166,7 @@ impl LogSegment {
         engine: &dyn Engine,
         commit_files: &[FileMeta],
         schema: SchemaRef,
-    ) -> KernelResult<impl KernelResultIterator<ActionsBatch>> {
+    ) -> KernelResult<impl KernelResultIterator<ActionsBatch> + use<>> {
         let actions = engine
             .json_handler()
             .read_json_files(commit_files, schema, None)?
@@ -1278,7 +1350,8 @@ impl LogSegment {
         meta_predicate: Option<PredicateRef>,
         stats_schema: Option<&StructType>,
         partition_schema: Option<&StructType>,
-    ) -> KernelResult<ActionsWithCheckpointInfo<impl KernelResultIterator<ActionsBatch>>> {
+    ) -> KernelResult<ActionsWithCheckpointInfo<impl KernelResultIterator<ActionsBatch> + use<>>>
+    {
         let need_file_actions = schema_contains_file_actions(&action_schema);
 
         let (file_actions_schema, sidecar_files) = if need_file_actions {
@@ -1596,7 +1669,9 @@ impl LogSegment {
         stats_schema: &StructType,
     ) -> bool {
         let Some(stats_parsed) = Self::get_field_from_add(checkpoint_schema, "stats_parsed") else {
-            debug!("stats_parsed not compatible: checkpoint schema does not contain add.stats_parsed field");
+            debug!(
+                "stats_parsed not compatible: checkpoint schema does not contain add.stats_parsed field"
+            );
             return false;
         };
 
@@ -1712,7 +1787,9 @@ impl LogSegment {
         let Some(partition_parsed) =
             Self::get_field_from_add(checkpoint_schema, "partitionValues_parsed")
         else {
-            debug!("partitionValues_parsed not compatible: checkpoint schema does not contain add.partitionValues_parsed field");
+            debug!(
+                "partitionValues_parsed not compatible: checkpoint schema does not contain add.partitionValues_parsed field"
+            );
             return false;
         };
 
@@ -1752,6 +1829,42 @@ fn first_checkpoint_action(
     Ok(None)
 }
 
+/// Returns `action`, read from the manifest commit `pointer` names, after checking that it exists
+/// and has the pointer's content root version.
+#[cfg(feature = "adaptive-metadata-in-dev")]
+fn require_pointed_checkpoint_action(
+    pointer: &LastManifestCommit,
+    action: Option<CheckpointAction>,
+) -> KernelResult<CheckpointAction> {
+    let action = action.ok_or_else(|| {
+        last_manifest_commit_inconsistency(pointer, "that commit carries no checkpoint action")
+    })?;
+    require!(
+        action.content_root_version() == pointer.content_root_version,
+        last_manifest_commit_inconsistency(
+            pointer,
+            format!(
+                "that commit's checkpoint action has content root version {}",
+                action.content_root_version()
+            )
+        )
+    );
+    Ok(action)
+}
+
+/// The error for a `pointer` that the log contradicts, as explained by `detail`.
+#[cfg(feature = "adaptive-metadata-in-dev")]
+fn last_manifest_commit_inconsistency(
+    pointer: &LastManifestCommit,
+    detail: impl Display,
+) -> KernelError {
+    KernelError::invalid_log_segment(format!(
+        "lastManifestCommit names manifest commit version {} as the source of content root \
+         version {}, but {detail}",
+        pointer.version, pointer.content_root_version
+    ))
+}
+
 fn validate_compaction_files(compactions: &[ParsedLogPath]) -> KernelResult<()> {
     for (i, f) in compactions.iter().enumerate() {
         let LogPathFileType::CompactedCommit { hi } = f.file_type else {
@@ -1766,16 +1879,15 @@ fn validate_compaction_files(compactions: &[ParsedLogPath]) -> KernelResult<()> 
                 f.version, hi
             )));
         }
-        if let Some(next) = compactions.get(i + 1) {
-            // next's type is validated on its own iteration; skip sort check if it isn't a
-            // CompactedCommit since the type error will be caught then.
-            if let LogPathFileType::CompactedCommit { hi: next_hi } = next.file_type {
-                if !(f.version < next.version || (f.version == next.version && hi <= next_hi)) {
-                    return Err(KernelError::invalid_log_segment(format!(
-                        "ascending_compaction_files is not sorted: {f:?} -> {next:?}"
-                    )));
-                }
-            }
+        // next's type is validated on its own iteration; skip sort check if it isn't a
+        // CompactedCommit since the type error will be caught then.
+        if let Some(next) = compactions.get(i + 1)
+            && let LogPathFileType::CompactedCommit { hi: next_hi } = next.file_type
+            && !(f.version < next.version || (f.version == next.version && hi <= next_hi))
+        {
+            return Err(KernelError::invalid_log_segment(format!(
+                "ascending_compaction_files is not sorted: {f:?} -> {next:?}"
+            )));
         }
     }
     Ok(())

@@ -2,25 +2,25 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use serde_json::{from_slice, json, Value};
+use serde_json::{Value, from_slice, json};
 use tempfile::tempdir;
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use test_utils::assert_result_error_with_message;
-use test_utils::{actions_to_string, add_commit, delta_path_for_version, TestAction};
+use test_utils::{TestAction, actions_to_string, add_commit, delta_path_for_version};
 use url::Url;
 
 use crate::action_reconciliation::{
-    deleted_file_retention_timestamp_with_time, ActionReconciliationIterator,
-    ActionReconciliationIteratorState, DEFAULT_RETENTION_SECS,
+    ActionReconciliationIterator, ActionReconciliationIteratorState, DEFAULT_RETENTION_SECS,
+    deleted_file_retention_timestamp_with_time,
 };
 use crate::actions::{Add, Metadata, Protocol, Remove};
 use crate::arrow::array::{
-    create_array, Array, AsArray, Int64Array, MapArray, RecordBatch, StructArray,
+    Array, AsArray, Int64Array, MapArray, RecordBatch, StructArray, create_array,
 };
 use crate::arrow::datatypes::{DataType, Field, Schema};
 use crate::checkpoint::{
-    create_last_checkpoint_data, CheckpointWriter, LastCheckpointHintStats,
-    CHECKPOINT_ACTIONS_SCHEMA_V2,
+    CHECKPOINT_ACTIONS_SCHEMA_V2, CheckpointWriter, LastCheckpointHintStats,
+    create_last_checkpoint_data,
 };
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::checkpoint::{CheckpointSpec, V2CheckpointConfig};
@@ -28,13 +28,13 @@ use crate::committer::FileSystemCommitter;
 use crate::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt};
 use crate::engine::sync::SyncEngine;
 use crate::log_replay::HasSelectionVector;
+use crate::object_store::ObjectStoreExt as _;
 use crate::object_store::memory::InMemory;
 use crate::object_store::path::Path;
-use crate::object_store::ObjectStoreExt as _;
-use crate::schema::{schema_ref, DataType as KernelDataType, StructField};
+use crate::schema::{DataType as KernelDataType, StructField, schema_ref};
 use crate::table_features::TableFeature;
-use crate::transaction::create_table::create_table;
 use crate::transaction::UpdateTableOperation;
+use crate::transaction::create_table::create_table;
 use crate::unit_test_utils::Action;
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::unit_test_utils::{
@@ -526,9 +526,10 @@ async fn test_finalize_errors_if_checkpoint_data_iterator_is_not_exhausted() -> 
         0, /* num_sidecars */
     )
     .expect_err("from_reconciliation_state should fail on non-exhausted iterator");
-    assert!(err
-        .to_string()
-        .contains("reconciliation iterator must be fully consumed"));
+    assert!(
+        err.to_string()
+            .contains("reconciliation iterator must be fully consumed")
+    );
 
     Ok(())
 }
@@ -694,7 +695,9 @@ async fn test_no_checkpoint_on_unpublished_snapshot() -> KernelResult<()> {
 
     let table_root = Url::parse("memory:///")?;
     let staged_commit = FileMeta {
-        location: Url::parse("memory:///_delta_log/_staged_commits/00000000000000000001.3a0d65cd-4056-49b8-937b-95f9e3ee90e5.json")?,
+        location: Url::parse(
+            "memory:///_delta_log/_staged_commits/00000000000000000001.3a0d65cd-4056-49b8-937b-95f9e3ee90e5.json",
+        )?,
         last_modified: 0,
         size: 100,
     };

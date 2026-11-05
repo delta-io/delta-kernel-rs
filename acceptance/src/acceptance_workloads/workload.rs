@@ -120,10 +120,10 @@ fn scan_columns(columns: &[String], predicate: Option<&Predicate>) -> Vec<String
     let mut scan_columns = columns.to_vec();
     if let Some(predicate) = predicate {
         for reference in predicate.references() {
-            if let Some(column) = reference.path().first() {
-                if !scan_columns.contains(column) {
-                    scan_columns.push(column.clone());
-                }
+            if let Some(column) = reference.path().first()
+                && !scan_columns.contains(column)
+            {
+                scan_columns.push(column.clone());
             }
         }
     }
@@ -220,7 +220,7 @@ pub fn execute_and_validate_workload(
 mod tests {
     use delta_kernel::arrow::array::{Int32Array, RecordBatch};
     use delta_kernel::arrow::datatypes::{DataType as ArrowDataType, Field, Schema as ArrowSchema};
-    use delta_kernel::expressions::{col, lit, Predicate};
+    use delta_kernel::expressions::{Predicate, col, lit};
 
     use super::*;
 

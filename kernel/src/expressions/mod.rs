@@ -6,24 +6,27 @@ use std::sync::Arc;
 
 use derive_more::From;
 use itertools::Itertools;
-use serde::{de, ser, Deserialize, Deserializer, Serialize, Serializer};
+use serde::{Deserialize, Deserializer, Serialize, Serializer, de, ser};
 
 #[doc(hidden)]
 pub use self::column_names::{__require_valid_simple_column_segment, column_expr};
 pub use self::column_names::{
-    col, column_expr_ref, column_name, column_pred, joined_column_expr, joined_column_name,
-    ColumnName,
+    ColumnName, col, column_expr_ref, column_name, column_pred, joined_column_expr,
+    joined_column_name,
 };
 #[doc(inline)]
 pub use self::macros::expr;
-pub use self::scalars::{ArrayData, DecimalData, MapData, Scalar, StructData};
+pub(crate) use self::scalars::MONTHS_PER_YEAR;
+pub use self::scalars::{
+    ArrayData, DecimalData, IntervalYearMonthData, MapData, Scalar, StructData,
+};
 use crate::kernel_predicates::{
     DirectDataSkippingPredicateEvaluator, DirectPredicateEvaluator,
     IndirectDataSkippingPredicateEvaluator,
 };
 use crate::schema::SchemaRef;
 pub use crate::struct_patch::{ExpressionFieldPatch, ExpressionStructPatch};
-use crate::transforms::{transform_output_type, ExpressionTransform};
+use crate::transforms::{ExpressionTransform, transform_output_type};
 use crate::utils::CollectInto;
 use crate::{DataType, DynPartialEq, KernelError, KernelResult};
 
@@ -363,6 +366,26 @@ pub struct VariadicExpression {
     pub exprs: Vec<Expression>,
 }
 
+/// A searched SQL `CASE WHEN` expression.
+///
+/// Conditions are checked in order. The first TRUE condition selects its result expression;
+/// FALSE and NULL conditions fall through to the next branch. Only the selected result is
+/// evaluated for each row. If no condition is TRUE, `else_expr` is evaluated.
+/// An empty branch list evaluates to `else_expr`.
+/// Every THEN result and `else_expr` must have the same logical data type, including typed NULLs.
+/// For example, integer results require an integer ELSE or a NULL typed as [`DataType::INTEGER`].
+/// No implicit casts or numeric widening are applied. The Arrow evaluator requires evaluated
+/// results to have identical Arrow types, including string representations and nested fields.
+/// Runtime type validation checks evaluated results; unused branches are not evaluated to check
+/// their types.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CaseWhenExpression {
+    /// Ordered condition/result pairs.
+    pub branches: Vec<(Predicate, Expression)>,
+    /// The fallback expression when no condition is TRUE.
+    pub else_expr: Box<Expression>,
+}
+
 /// An expression that parses a JSON string column into a struct column of `output_schema`, the
 /// inverse of [`UnaryExpressionOp::ToJson`] except for the sub-millisecond timestamp precision
 /// that operator discards.
@@ -534,6 +557,8 @@ pub enum Expression {
     Binary(BinaryExpression),
     /// An expression that takes a variable number of expressions as input.
     Variadic(VariadicExpression),
+    /// A conditional expression with ordered WHEN branches and a required ELSE.
+    CaseWhen(CaseWhenExpression),
     /// An expression that the engine defines and implements. Kernel interacts with the expression
     /// only through methods provided by the [`OpaqueExpressionOp`] trait.
     #[serde(serialize_with = "fail_serialize_opaque_expression")]
@@ -669,6 +694,18 @@ impl VariadicExpression {
     ) -> Self {
         let exprs = exprs.into_iter().map(Into::into).collect();
         Self { op, exprs }
+    }
+}
+
+impl CaseWhenExpression {
+    pub(crate) fn new(
+        branches: impl IntoIterator<Item = (Predicate, Expression)>,
+        else_expr: Expression,
+    ) -> Self {
+        Self {
+            branches: branches.into_iter().collect(),
+            else_expr: Box::new(else_expr),
+        }
     }
 }
 
@@ -966,6 +1003,22 @@ impl Expression {
     /// Creates a new Array constructor expression. See [`VariadicExpressionOp::Array`].
     pub fn array(exprs: impl IntoIterator<Item = impl Into<Expression>>) -> Self {
         Self::variadic(VariadicExpressionOp::Array, exprs)
+    }
+
+    /// Creates a searched CASE expression from ordered condition/result `branches` and an
+    /// `else_expr` fallback. Empty `branches` return `else_expr` directly.
+    /// All branch results and `else_expr` must have the same logical type, including typed NULLs;
+    /// no implicit type coercion is performed.
+    /// See [`CaseWhenExpression`] for evaluation semantics.
+    pub fn case_when(
+        branches: impl IntoIterator<Item = (Predicate, Expression)>,
+        else_expr: Expression,
+    ) -> Self {
+        let branches = branches.into_iter().collect::<Vec<_>>();
+        match branches.is_empty() {
+            true => else_expr,
+            false => Self::CaseWhen(CaseWhenExpression::new(branches, else_expr)),
+        }
     }
 
     /// Creates a new opaque expression
@@ -1274,6 +1327,16 @@ impl Display for Expression {
             Variadic(VariadicExpression { op, exprs }) => {
                 write!(f, "{op}({})", format_child_list(exprs))
             }
+            CaseWhen(CaseWhenExpression {
+                branches,
+                else_expr,
+            }) => {
+                write!(f, "CASE")?;
+                for (condition, result) in branches {
+                    write!(f, " WHEN {condition} THEN {result}")?;
+                }
+                write!(f, " ELSE {else_expr} END")
+            }
             Opaque(OpaqueExpression { op, exprs }) => {
                 write!(f, "{op:?}({})", format_child_list(exprs))
             }
@@ -1391,11 +1454,11 @@ impl<'a> ExpressionTransform<'a> for GetColumnReferences<'a> {
 mod tests {
     use std::fmt::Debug;
 
-    use serde::de::DeserializeOwned;
     use serde::Serialize;
+    use serde::de::DeserializeOwned;
 
     use super::{
-        col, column_pred, lit, DataType, Expression as Expr, MapToStructOptions, Predicate as Pred,
+        DataType, Expression as Expr, MapToStructOptions, Predicate as Pred, col, column_pred, lit,
     };
 
     /// Helper function to verify roundtrip serialization/deserialization
@@ -1424,6 +1487,20 @@ mod tests {
             (
                 Expr::cast(col!("x"), DataType::DATE),
                 "CAST(Column(x) AS date)",
+            ),
+            (
+                Expr::case_when([(col!("x").is_null(), lit(0))], col!("x")),
+                "CASE WHEN Column(x) IS NULL THEN 0 ELSE Column(x) END",
+            ),
+            (
+                Expr::case_when(
+                    [
+                        (col!("x").is_null(), lit(0)),
+                        (col!("x").gt(lit(100)), lit(100)),
+                    ],
+                    col!("x"),
+                ),
+                "CASE WHEN Column(x) IS NULL THEN 0 WHEN Column(x) > 100 THEN 100 ELSE Column(x) END",
             ),
         ];
 
@@ -1507,9 +1584,9 @@ mod tests {
         use super::assert_roundtrip;
         use crate::expressions::scalars::{ArrayData, DecimalData, MapData, StructData};
         use crate::expressions::{
-            col, column_name, lit, null_lit, BinaryExpressionOp, BinaryPredicateOp, ColumnName,
-            Expression, ExpressionStructPatchBuilder, MapToStructOptions, Predicate, Scalar,
-            UnaryExpressionOp,
+            BinaryExpressionOp, BinaryPredicateOp, ColumnName, Expression,
+            ExpressionStructPatchBuilder, MapToStructOptions, Predicate, Scalar, UnaryExpressionOp,
+            col, column_name, lit, null_lit,
         };
         use crate::schema::{ArrayType, DataType, DecimalType, MapType, StructField};
         use crate::unit_test_utils::assert_result_error_with_message;
@@ -1666,6 +1743,27 @@ mod tests {
             lit(42i64),
         ]))]
         fn test_array_expression_roundtrip(#[case] expr: Expression) {
+            assert_roundtrip(&expr);
+        }
+
+        #[rstest::rstest]
+        fn test_case_when_expression_roundtrip(
+            #[values(0, 1, 2)] num_branches: i32,
+            #[values(Expression::literal(0), null_lit(DataType::INTEGER))] else_expr: Expression,
+        ) {
+            let branches = (0..num_branches).map(|i| {
+                (
+                    col!("a").gt(Expression::literal(i)),
+                    Expression::case_when(
+                        [(col!("flag").is_null(), Expression::literal(i))],
+                        col!("value"),
+                    ),
+                )
+            });
+            let expr = Expression::case_when(branches, else_expr.clone());
+            if num_branches == 0 {
+                assert_eq!(expr, else_expr);
+            }
             assert_roundtrip(&expr);
         }
 
@@ -1906,8 +2004,8 @@ mod tests {
 
         #[test]
         fn test_opaque_expression_serialize_fails() {
-            use crate::expressions::{OpaqueExpressionOp, ScalarExpressionEvaluator};
             use crate::KernelResult;
+            use crate::expressions::{OpaqueExpressionOp, ScalarExpressionEvaluator};
 
             #[derive(Debug, PartialEq)]
             struct TestOpaqueExprOp;
@@ -1932,12 +2030,12 @@ mod tests {
 
         #[test]
         fn test_opaque_predicate_serialize_fails() {
+            use crate::KernelResult;
             use crate::expressions::{OpaquePredicateOp, ScalarExpressionEvaluator};
             use crate::kernel_predicates::{
                 DirectDataSkippingPredicateEvaluator, DirectPredicateEvaluator,
                 IndirectDataSkippingPredicateEvaluator,
             };
-            use crate::KernelResult;
 
             #[derive(Debug, PartialEq)]
             struct TestOpaquePredOp;

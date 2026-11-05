@@ -1,7 +1,7 @@
 //! Scan related ffi code
 
-use std::collections::hash_map::Entry;
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::ffi::c_void;
 use std::sync::{Arc, Mutex};
 
@@ -19,15 +19,15 @@ use super::handle::Handle;
 use crate::delta_types::FfiColumnNameArray;
 #[cfg(feature = "default-engine-base")]
 use crate::engine_data::ArrowFFIData;
-use crate::error::AllocateErrorFn;
-use crate::expressions::kernel_visitor::{unwrap_kernel_predicate, KernelExpressionVisitorState};
+use crate::error::ErrorAllocators;
 use crate::expressions::SharedExpression;
-use crate::schema_visitor::{extract_kernel_schema, KernelSchemaVisitorState};
+use crate::expressions::kernel_visitor::{KernelExpressionVisitorState, unwrap_kernel_predicate};
+use crate::schema_visitor::{KernelSchemaVisitorState, extract_kernel_schema};
 use crate::{
-    kernel_string_slice, unwrap_and_parse_path_as_url, AllocateStringFn, ExternEngine,
-    ExternResult, IntoExternResult, KernelBoolSlice, KernelRowIndexArray, KernelStringSlice,
-    NullableCvoid, OptionalValue, SharedExternEngine, SharedSchema, SharedSnapshot,
-    TryFromStringSlice,
+    AllocateStringFn, ExternEngine, ExternResult, IntoExternResult, KernelBoolSlice,
+    KernelRowIndexArray, KernelStringSlice, NullableCvoid, OptionalValue, SharedExternEngine,
+    SharedSchema, SharedSnapshot, TryFromStringSlice, kernel_string_slice,
+    unwrap_and_parse_path_as_url,
 };
 
 #[handle_descriptor(target=Scan, mutable=false, sized=true)]
@@ -439,7 +439,7 @@ pub unsafe extern "C" fn free_scan_builder(builder: Handle<ExclusiveScanBuilder>
 /// # Safety
 ///
 /// `scan` must be a valid, live [`SharedScan`] handle for the duration of the call.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn scan_snapshot(scan: Handle<SharedScan>) -> Handle<SharedSnapshot> {
     let scan = unsafe { scan.as_ref() };
     Arc::clone(scan.snapshot()).into()
@@ -923,21 +923,25 @@ pub unsafe extern "C" fn get_transform_for_row(
 /// Returns the number of rows removed by `dv_info`, or [`OptionalValue::None`] if there is no
 /// deletion vector. Reads descriptor metadata without loading the deletion vector.
 ///
-/// A negative cardinality returns a deletion-vector error allocated by `allocate_error`.
+/// A negative cardinality returns a deletion-vector error allocated by `error_allocators`.
 /// The caller owns the returned error and must free it.
 ///
 /// # Safety
 ///
+/// `error_allocators` must point to an initialized [`ErrorAllocators`] for this call. Its context
+/// and callbacks must remain valid for every use and support concurrent calls if shared across
+/// threads.
+///
 /// `dv_info` must be a valid pointer to a [`DvInfo`], borrowed for the duration of this call.
 /// When obtained from the `info` field of [`CDvInfo`], it is valid only during the scan callback.
-/// `allocate_error` must be a valid error allocator and copy any message it retains.
+/// `error_allocators` must be a valid error allocator and copy any message it retains.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn cardinality_from_dv(
     dv_info: &DvInfo,
-    allocate_error: AllocateErrorFn,
+    error_allocators: *const ErrorAllocators,
 ) -> ExternResult<OptionalValue<u64>> {
     let result = dv_info.cardinality().map(Into::into);
-    unsafe { result.into_extern_result(&allocate_error) }
+    unsafe { result.into_extern_result(&*error_allocators) }
 }
 
 /// Get a selection vector out of a [`DvInfo`] struct
@@ -1168,29 +1172,31 @@ mod scan_builder_tests {
     use std::ffi::c_void;
 
     use rstest::rstest;
-    use test_utils::{actions_to_string, TestAction};
+    use test_utils::{TestAction, actions_to_string};
     #[cfg(feature = "geo-type-in-dev")]
     use url::Url;
 
     use super::{
-        free_scan, free_scan_builder, scan_builder, scan_builder_build,
-        scan_builder_with_predicate, scan_builder_with_schema, scan_builder_with_stats,
-        scan_logical_schema, scan_snapshot, EnginePredicate, EngineSchema, FfiStatsOptions,
+        EnginePredicate, EngineSchema, FfiStatsOptions, free_scan, free_scan_builder, scan_builder,
+        scan_builder_build, scan_builder_with_predicate, scan_builder_with_schema,
+        scan_builder_with_stats, scan_logical_schema, scan_snapshot,
     };
     use crate::delta_types::{FfiColumnName, FfiColumnNameArray};
     use crate::error::FFIKernelError;
     use crate::expressions::kernel_visitor::{
-        visit_expression_column, visit_expression_literal_int, visit_predicate_lt,
-        KernelExpressionVisitorState,
+        KernelExpressionVisitorState, visit_expression_column, visit_expression_literal_int,
+        visit_predicate_lt,
     };
     #[cfg(feature = "geo-type-in-dev")]
     use crate::ffi_test_utils::build_snapshot;
-    use crate::ffi_test_utils::{allocate_err, ok_or_panic, recover_error, setup_snapshot};
+    use crate::ffi_test_utils::{
+        TEST_ERROR_ALLOCATORS, ok_or_panic, recover_error, setup_snapshot,
+    };
     use crate::schema_visitor::{
-        visit_field_integer, visit_field_struct, KernelSchemaVisitorState,
+        KernelSchemaVisitorState, visit_field_integer, visit_field_struct,
     };
     use crate::{
-        free_engine, free_schema, free_snapshot, kernel_string_slice, ExternResult, FfiSlice,
+        ExternResult, FfiSlice, free_engine, free_schema, free_snapshot, kernel_string_slice,
     };
     #[cfg(feature = "geo-type-in-dev")]
     use crate::{
@@ -1247,7 +1253,7 @@ mod scan_builder_tests {
                 kernel_string_slice!(id),
                 true,
                 std::ptr::null(),
-                allocate_err,
+                &TEST_ERROR_ALLOCATORS,
             ))
         };
         let field_ids = [id_field_id];
@@ -1260,7 +1266,7 @@ mod scan_builder_tests {
                 1,
                 false,
                 std::ptr::null(),
-                allocate_err,
+                &TEST_ERROR_ALLOCATORS,
             ))
         }
     }
@@ -1279,7 +1285,7 @@ mod scan_builder_tests {
                 kernel_string_slice!(crs),
                 true,
                 std::ptr::null(),
-                allocate_err,
+                &TEST_ERROR_ALLOCATORS,
             ))
         };
         let geog = "geog";
@@ -1291,7 +1297,7 @@ mod scan_builder_tests {
                 FfiEdgeInterpolationAlgorithm::Spherical,
                 true,
                 std::ptr::null(),
-                allocate_err,
+                &TEST_ERROR_ALLOCATORS,
             ))
         };
         let field_ids = [geom_field_id, geog_field_id];
@@ -1304,7 +1310,7 @@ mod scan_builder_tests {
                 field_ids.len(),
                 false,
                 std::ptr::null(),
-                allocate_err,
+                &TEST_ERROR_ALLOCATORS,
             ))
         }
     }
@@ -1321,7 +1327,7 @@ mod scan_builder_tests {
                 state,
                 parts.as_ptr(),
                 parts.len(),
-                allocate_err,
+                &TEST_ERROR_ALLOCATORS,
             ))
         };
         let lit = visit_expression_literal_int(state, 10);
@@ -1489,7 +1495,7 @@ mod scan_builder_tests {
                 kernel_string_slice!(bare_field),
                 true,
                 std::ptr::null(),
-                allocate_err,
+                &TEST_ERROR_ALLOCATORS,
             ))
         }
     }
@@ -1820,14 +1826,14 @@ mod scan_metadata_arrow_tests {
         Array, Int32Array, Int64Array, RecordBatch, StringArray, StructArray,
     };
     use rstest::rstest;
-    use test_utils::{actions_to_string, TestAction};
+    use test_utils::{TestAction, actions_to_string};
 
     use super::{
-        free_scan, free_scan_metadata_arrow_result, free_scan_metadata_iter, get_transform_for_row,
-        scan_builder, scan_builder_build, scan_builder_with_partition_values,
-        scan_builder_with_stats, scan_metadata_iter_init, scan_metadata_next_arrow_impl,
         CTransforms, FfiPartitionValuesOptions, FfiStatsOptions, ScanMetadataArrowResult,
-        SharedScan, SharedScanMetadataIterator,
+        SharedScan, SharedScanMetadataIterator, free_scan, free_scan_metadata_arrow_result,
+        free_scan_metadata_iter, get_transform_for_row, scan_builder, scan_builder_build,
+        scan_builder_with_partition_values, scan_builder_with_stats, scan_metadata_iter_init,
+        scan_metadata_next_arrow_impl,
     };
     use crate::engine_data::ArrowFFIData;
     use crate::ffi_test_utils::{ok_or_panic, setup_snapshot};
@@ -1934,9 +1940,11 @@ mod scan_metadata_arrow_tests {
         assert!(batch_schema.field_with_name("deletionVector").is_ok());
         assert!(batch_schema.field_with_name("fileConstantValues").is_ok());
         assert!(batch_schema.field_with_name("stats_parsed").is_err());
-        assert!(batch_schema
-            .field_with_name("partitionValues_parsed")
-            .is_err());
+        assert!(
+            batch_schema
+                .field_with_name("partitionValues_parsed")
+                .is_err()
+        );
 
         // Selection vector length matches batch rows; exactly 1 row selected (the add file)
         assert_eq!(sv.len(), batch.num_rows());
@@ -2263,7 +2271,9 @@ mod tests {
 
     use super::cardinality_from_dv;
     use crate::error::FFIKernelError;
-    use crate::ffi_test_utils::{allocate_err, assert_extern_result_error_contains, ok_or_panic};
+    use crate::ffi_test_utils::{
+        TEST_ERROR_ALLOCATORS, assert_extern_result_error_contains, ok_or_panic,
+    };
     use crate::{KernelStringSlice, NullableCvoid, OptionalValue, TryFromStringSlice};
 
     #[rstest]
@@ -2290,7 +2300,7 @@ mod tests {
             })
             .unwrap_or_default();
 
-        let result = unsafe { cardinality_from_dv(&dv_info, allocate_err) };
+        let result = unsafe { cardinality_from_dv(&dv_info, &TEST_ERROR_ALLOCATORS) };
         match expected {
             Ok(expected) => assert_eq!(ok_or_panic(result), OptionalValue::from(expected)),
             Err(message) => assert_extern_result_error_contains(
@@ -2339,23 +2349,23 @@ mod tests {
 
         use delta_kernel::plans::proto::operation as proto_op;
         use prost::Message as _;
-        use test_utils::{actions_to_string, TestAction};
+        use test_utils::{TestAction, actions_to_string};
 
         use super::super::{
-            free_scan, scan_builder, scan_builder_build, scan_builder_with_predicate,
-            scan_declarative_metadata_plan, EnginePredicate,
+            EnginePredicate, free_scan, scan_builder, scan_builder_build,
+            scan_builder_with_predicate, scan_declarative_metadata_plan,
         };
         use crate::error::EngineExecResult;
         use crate::expressions::kernel_visitor::{
-            visit_expression_literal_bool, KernelExpressionVisitorState,
+            KernelExpressionVisitorState, visit_expression_literal_bool,
         };
-        use crate::ffi_test_utils::{allocate_err, ok_or_panic, setup_snapshot};
+        use crate::ffi_test_utils::{TEST_ERROR_ALLOCATORS, ok_or_panic, setup_snapshot};
         use crate::handle::Handle;
         use crate::plans::result::CPlanResult;
         use crate::plans::{get_plan_based_engine, get_plan_executor};
         use crate::{
-            free_engine, free_snapshot, KernelBytesSlice, NullableCvoid, OptionalValue,
-            SharedExternEngine,
+            KernelBytesSlice, NullableCvoid, OptionalValue, SharedExternEngine, free_engine,
+            free_snapshot,
         };
 
         extern "C" fn visit_false(
@@ -2382,7 +2392,7 @@ mod tests {
                 get_plan_based_engine(
                     executor,
                     OptionalValue::Some(fallback.shallow_copy()),
-                    allocate_err,
+                    &TEST_ERROR_ALLOCATORS,
                 )
             }
         }

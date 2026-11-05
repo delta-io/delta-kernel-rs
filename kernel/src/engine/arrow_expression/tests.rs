@@ -1,14 +1,15 @@
 use std::ops::{Add, Div, Mul, Sub};
 
-use rstest::rstest;
 use Expression as Expr;
 use Predicate as Pred;
+use rstest::rstest;
 
 use super::*;
+use crate::KernelResult;
 use crate::arrow::array::{
-    create_array, Array, ArrayRef, BinaryViewArray, BooleanArray, GenericStringArray, Int32Array,
-    Int32Builder, ListArray, ListViewArray, MapArray, MapBuilder, MapFieldNames, StringArray,
-    StringBuilder, StringViewArray, StructArray,
+    Array, ArrayRef, BinaryViewArray, BooleanArray, GenericStringArray, Int32Array, Int32Builder,
+    ListArray, ListViewArray, MapArray, MapBuilder, MapFieldNames, StringArray, StringBuilder,
+    StringViewArray, StructArray, create_array,
 };
 use crate::arrow::buffer::{BooleanBuffer, NullBuffer, OffsetBuffer, ScalarBuffer};
 use crate::arrow::compute::kernels::cmp::{gt_eq, lt};
@@ -29,12 +30,12 @@ use crate::kernel_predicates::{
 #[cfg(feature = "geo-type-in-dev")]
 use crate::schema::EdgeInterpolationAlgorithm;
 use crate::schema::{
-    schema, schema_ref, ArrayType, DataType as KernelDataType, MapType, StructField, StructType,
+    ArrayType, DataType as KernelDataType, IntervalYearToMonthType, MapType, StructField,
+    StructType, schema, schema_ref,
 };
 use crate::unit_test_utils::assert_result_error_with_message;
 #[cfg(feature = "geo-type-in-dev")]
 use crate::unit_test_utils::{geography_type, geometry_type};
-use crate::KernelResult;
 
 #[test]
 fn test_array_column() {
@@ -357,15 +358,19 @@ fn test_literal_complex_type_array() {
     // each nested array value has three elements, the middle one NULL
     let expected_valid = [true, false, true];
     let expected_valid = (0..5).flat_map(|_| expected_valid.iter().cloned());
-    assert!(expected_valid
-        .zip(struct_values.nulls().unwrap())
-        .all(|(a, b)| a == b));
+    assert!(
+        expected_valid
+            .zip(struct_values.nulls().unwrap())
+            .all(|(a, b)| a == b)
+    );
 
     let expected_values = [Some(42), None, Some(42)];
     let expected_values = (0..5).flat_map(|_| expected_values.iter().cloned());
-    assert!(expected_values
-        .zip(struct_values.column(0).as_primitive::<Int32Type>())
-        .all(|(a, b)| a == b));
+    assert!(
+        expected_values
+            .zip(struct_values.column(0).as_primitive::<Int32Type>())
+            .all(|(a, b)| a == b)
+    );
     assert_eq!(struct_values.column(2).null_count(), 15);
 
     // The leaf value column has 40 elements (not 60) becuase 1/3 of the parent structs are NULL.
@@ -374,9 +379,11 @@ fn test_literal_complex_type_array() {
     assert_eq!(list_values.len(), 40);
     let expected_values = [Some(1), Some(2), None, Some(3)];
     let expected_values = (0..10).flat_map(|_| expected_values.iter().cloned());
-    assert!(expected_values
-        .zip(list_values.as_primitive::<Int32Type>())
-        .all(|(a, b)| a == b));
+    assert!(
+        expected_values
+            .zip(list_values.as_primitive::<Int32Type>())
+            .all(|(a, b)| a == b)
+    );
 
     let map_values = struct_values.column(3);
     let map_array = map_values.as_map();
@@ -423,7 +430,10 @@ fn test_invalid_array_sides() {
 
     let in_result = evaluate_predicate(&in_op, &batch, false);
 
-    assert_result_error_with_message(in_result, "Invalid expression evaluation: Invalid right value for (NOT) IN comparison, left is: Column(item) right is: Column(item)");
+    assert_result_error_with_message(
+        in_result,
+        "Invalid expression evaluation: Invalid right value for (NOT) IN comparison, left is: Column(item) right is: Column(item)",
+    );
 }
 
 #[test]
@@ -1114,6 +1124,35 @@ fn mixed_string_kernel_schema() -> StructType {
     }
 }
 
+#[rstest]
+#[case::then_only(Predicate::TRUE, ["a", "b", "c"])]
+#[case::else_only(Predicate::FALSE, ["fallback"; 3])]
+#[case::both(col!("s").eq(lit("a")), ["a", "fallback", "fallback"])]
+fn test_evaluator_case_when_strings(#[case] condition: Predicate, #[case] expected: [&str; 3]) {
+    let batch = ArrowEngineData::new(
+        RecordBatch::try_from_iter([(
+            "s",
+            Arc::new(StringArray::from(vec!["a", "b", "c"])) as ArrayRef,
+        )])
+        .unwrap(),
+    );
+    let expression = Expr::case_when([(condition, col!("s"))], lit("fallback"));
+    let result = ArrowEvaluationHandler
+        .new_expression_evaluator(
+            schema_ref! { nullable "s": STRING },
+            Arc::new(expression),
+            KernelDataType::STRING,
+        )
+        .unwrap()
+        .evaluate(&batch)
+        .try_into_record_batch()
+        .unwrap();
+    assert_eq!(
+        result.column(0).to_data(),
+        StringArray::from(expected.to_vec()).to_data()
+    );
+}
+
 /// Evaluator must succeed when a struct contains Utf8, LargeUtf8, and Utf8View columns in the
 /// empty patch branch. The output schema is derived from actual column types, so
 /// `LargeUtf8` and `Utf8View` columns remain valid even though the kernel type is `STRING`.
@@ -1602,7 +1641,18 @@ fn test_void_scalar_to_array() {
 
 // Interval scalars materialize as their physical integer arrays (Int32 months / Int64 micros).
 #[rstest]
-#[case::year_month(Scalar::IntervalYearMonth(30), DataType::Int32)]
+#[case::year_month(
+    Scalar::interval_year_month(30, IntervalYearToMonthType::IntervalYearToMonth).unwrap(),
+    DataType::Int32
+)]
+#[case::year(
+    Scalar::interval_year_month(24, IntervalYearToMonthType::IntervalYear).unwrap(),
+    DataType::Int32
+)]
+#[case::month(
+    Scalar::interval_year_month(30, IntervalYearToMonthType::IntervalMonth).unwrap(),
+    DataType::Int32
+)]
 #[case::day_time(Scalar::IntervalDayTime(5), DataType::Int64)]
 fn test_interval_scalar_to_array(#[case] scalar: Scalar, #[case] arrow_type: DataType) {
     let array = scalar.to_array(2).unwrap();

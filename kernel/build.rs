@@ -1,4 +1,4 @@
-use rustc_version::{version_meta, Channel};
+use rustc_version::{Channel, version_meta};
 
 fn main() {
     println!("cargo::rustc-check-cfg=cfg(NIGHTLY_CHANNEL)");
@@ -50,6 +50,6 @@ fn set_vendored_protoc() {
     // Leave a caller-supplied `protoc` alone, so a pinned toolchain wins over the vendored binary.
     if std::env::var_os("PROTOC").is_none() {
         let protoc = protoc_bin_vendored::protoc_bin_path().expect("vendored protoc binary");
-        std::env::set_var("PROTOC", protoc);
+        unsafe { std::env::set_var("PROTOC", protoc) };
     }
 }

@@ -34,6 +34,34 @@ pub struct DeltaErrorParameter {
 }
 
 impl DeltaError {
+    /// Constructs an error for `condition` in tests.
+    ///
+    /// `values` supplies one string per catalog parameter in template order. `source` is an
+    /// optional underlying cause. Returns the catalog error, or a Kernel error if the number of
+    /// values does not match the number of parameters.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn for_test(
+        condition: DeltaErrorCondition,
+        values: &[&str],
+        source: Option<Box<dyn StdError + Send + Sync + 'static>>,
+    ) -> super::KernelResult<Self> {
+        let names = condition.parameter_names();
+        if names.len() != values.len() {
+            return Err(super::KernelError::generic(format!(
+                "{} requires {} parameters, got {}",
+                condition.name(),
+                names.len(),
+                values.len()
+            )));
+        }
+        let parameters = names
+            .iter()
+            .zip(values)
+            .map(|(name, value)| DeltaErrorParameter::new(name, value))
+            .collect();
+        Ok(Self::new(condition, parameters, source))
+    }
+
     /// Returns the typed Delta condition.
     pub fn condition(&self) -> DeltaErrorCondition {
         self.condition
@@ -192,7 +220,7 @@ mod tests {
 
     use rstest::rstest;
 
-    use super::{render_template, DeltaError, DeltaErrorParameter};
+    use super::{DeltaError, DeltaErrorParameter, render_template};
     use crate::{DeltaErrorCondition, Error, Result};
 
     struct LimitedWriter {

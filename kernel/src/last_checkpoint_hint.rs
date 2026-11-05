@@ -563,9 +563,9 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
+    use crate::engine::CancellableEngine;
     use crate::engine::sync::SyncEngine;
     use crate::engine::test_delegating::DelegatingEngine;
-    use crate::engine::CancellableEngine;
     #[cfg(feature = "adaptive-metadata-in-dev")]
     use crate::object_store::memory::InMemory;
     use crate::schema::schema;
@@ -1219,18 +1219,20 @@ mod tests {
                 .unwrap();
         assert!(hint.checkpoint_schema.is_some());
 
-        assert!(LastCheckpointHint::from_parts(
-            1,
-            1,
-            None,
-            None,
-            None,
-            Some("not a schema".to_string()),
-            None,
-            None,
-            None,
-        )
-        .is_err());
+        assert!(
+            LastCheckpointHint::from_parts(
+                1,
+                1,
+                None,
+                None,
+                None,
+                Some("not a schema".to_string()),
+                None,
+                None,
+                None,
+            )
+            .is_err()
+        );
     }
 
     /// Returns the single `actions` element matching `extract`, asserting there is exactly one.

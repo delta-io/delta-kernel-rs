@@ -7,8 +7,8 @@ use delta_kernel_derive::internal_api;
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::actions::{CheckpointAction, LastManifestCommit};
 use crate::actions::{
-    CommitInfo, DomainMetadata, Metadata, Protocol, SetTransaction, MAX_VALUES, MIN_VALUES,
-    NULL_COUNT, NUM_RECORDS, TIGHT_BOUNDS,
+    CommitInfo, DomainMetadata, MAX_VALUES, MIN_VALUES, Metadata, NULL_COUNT, NUM_RECORDS,
+    Protocol, SetTransaction, TIGHT_BOUNDS,
 };
 use crate::committer::{CommitMetadata, CommitProtocolMetadata, CommitType, Committer};
 use crate::crc::{CrcDelta, FileStatsDelta};
@@ -21,14 +21,15 @@ use crate::scan::log_replay::STATS_NAME;
 pub use crate::scan::log_replay::{CLUSTERING_PROVIDER_NAME, TAGS_NAME};
 use crate::schema::void_utils::validate_schema_for_write;
 use crate::schema::{
-    lazy_schema_ref, ColumnDefault, MapType, SchemaRef, SchemaStructPatchBuilder, StructField,
+    ColumnDefault, GeneratedColumn, MapType, SchemaRef, SchemaStructPatchBuilder, StructField,
+    lazy_schema_ref,
 };
 use crate::snapshot::{Snapshot, SnapshotRef};
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::TableFeature;
 #[cfg(feature = "check-constraints-in-dev")]
 use crate::table_properties::CheckConstraint;
-use crate::utils::{require, PhantomType};
+use crate::utils::{PhantomType, require};
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::version_as_i64;
 use crate::{DataType, Engine, EngineData, FileMeta, KernelResult, KernelResultIterator, Version};
@@ -48,8 +49,8 @@ pub mod data_layout;
 #[cfg(not(feature = "internal-api"))]
 pub(crate) mod data_layout;
 
-pub use builder::update_table::UpdateTableTransactionBuilder;
 use builder::TransactionBuilderState;
+pub use builder::update_table::UpdateTableTransactionBuilder;
 pub use builder::{TransactionBuilder, TransactionType};
 use commit_info::collect_operation_metadata;
 mod bound_write_context;
@@ -332,6 +333,9 @@ pub struct Transaction<STATE = UpdateTable, MODE: ExecutionMode = Imperative> {
     // constraints.
     #[cfg(feature = "check-constraints-in-dev")]
     check_constraints_acknowledged: bool,
+    // Whether the connector acknowledged responsibility for enforcing this table's generated
+    // columns.
+    generated_columns_acknowledged: bool,
     // Whether the connector acknowledged responsibility for preserving Row IDs and Row Commit
     // Versions.
     row_tracking_preservation_acknowledged: bool,
@@ -411,6 +415,41 @@ impl<STATE, MODE: ExecutionMode> Transaction<STATE, MODE> {
     #[cfg(feature = "check-constraints-in-dev")]
     pub fn ack_check_constraints(&mut self) {
         self.check_constraints_acknowledged = true;
+    }
+
+    /// The effective [`GeneratedColumn`]s of this transaction, in schema order. Empty when the
+    /// table has none, or when its protocol doesn't support the `generatedColumns` writer feature.
+    ///
+    /// Each generated column's value is defined by a SQL expression over the row's other columns.
+    /// See [`Self::ack_generated_columns`] for what a connector must do before writing to a table
+    /// with generated columns.
+    ///
+    /// # Errors
+    ///
+    /// Returns a schema error if a generated column's `delta.generationExpression` metadata is not
+    /// a string.
+    pub fn generated_columns(&self) -> KernelResult<Vec<GeneratedColumn>> {
+        self.effective_table_config.generated_columns()
+    }
+
+    /// Acknowledges that the connector enforces this table's generated columns.
+    ///
+    /// Only the connector sees the rows it writes, so the connector evaluates generation
+    /// expressions. It must:
+    /// - Discover the generated columns of this transaction via [`Self::generated_columns`] and
+    ///   parse each one's [`raw_sql`](GeneratedColumn::raw_sql) itself. The SQL refers to logical
+    ///   column names.
+    /// - Compute each generated column from its expression when the write omits the column.
+    /// - Make every written row, including its partition values, satisfy `(<value> <=> <generation
+    ///   expression>) IS TRUE` for each generated column. `<=>` is null-safe equality, so a `NULL`
+    ///   value matches a `NULL` expression result. This includes files written for an earlier
+    ///   commit attempt, such as one that conflicted, and validated against an older table version.
+    ///
+    /// The acknowledgement covers whatever this transaction commits. Without it,
+    /// [`write_state`](Transaction::write_state) and [`commit`](Self::commit) fail whenever this
+    /// transaction has effective generated columns.
+    pub fn ack_generated_columns(&mut self) {
+        self.generated_columns_acknowledged = true;
     }
 
     /// Replaces operation metrics recorded in `commitInfo`.
@@ -621,12 +660,14 @@ impl<STATE, MODE: ExecutionMode> Transaction<STATE, MODE> {
     /// configuration.
     ///
     /// Returns an error if the table has an empty or unsupported schema, or if the table declares
-    /// column defaults or CHECK constraints that the connector has not acknowledged.
+    /// column defaults, CHECK constraints, or generated columns that the connector has not
+    /// acknowledged.
     pub fn write_state(&self) -> KernelResult<Arc<WriteState>> {
         self.ensure_schema_non_empty_for_write_state()?;
         self.ensure_column_defaults_acknowledged()?;
         #[cfg(feature = "check-constraints-in-dev")]
         self.ensure_check_constraints_acknowledged()?;
+        self.ensure_generated_columns_acknowledged()?;
         self.validate_for_data_write()?;
         // The effective table configuration can change while building a transaction, so this
         // state must be derived on demand rather than cached on the transaction. TODO(#3149):
@@ -702,6 +743,7 @@ impl<STATE, MODE: ExecutionMode> Transaction<STATE, MODE> {
             column_defaults_acknowledged: false,
             #[cfg(feature = "check-constraints-in-dev")]
             check_constraints_acknowledged: false,
+            generated_columns_acknowledged: false,
             row_tracking_preservation_acknowledged: false,
             is_blind_append: false,
             #[cfg(feature = "adaptive-metadata-in-dev")]
@@ -1001,6 +1043,20 @@ impl<STATE, MODE: ExecutionMode> Transaction<STATE, MODE> {
         Ok(())
     }
 
+    /// Fails `write_state` and `commit` when this transaction has effective generated columns that
+    /// the connector hasn't acknowledged.
+    fn ensure_generated_columns_acknowledged(&self) -> KernelResult<()> {
+        require!(
+            self.generated_columns_acknowledged
+                || self.effective_table_config.generated_columns()?.is_empty(),
+            KernelError::invalid_transaction_state(
+                "Writing to a table with generated columns requires calling \
+                 Transaction::ack_generated_columns() first",
+            )
+        );
+        Ok(())
+    }
+
     fn ensure_row_tracking_preservation_acknowledged(&self) -> KernelResult<()> {
         if !self
             .effective_table_config
@@ -1143,6 +1199,7 @@ impl<STATE, MODE: ExecutionMode> Transaction<STATE, MODE> {
 
         #[cfg(feature = "check-constraints-in-dev")]
         self.ensure_check_constraints_acknowledged()?;
+        self.ensure_generated_columns_acknowledged()?;
 
         // TODO(zach): we currently do this in two passes - can we do it in one and still keep refs
         // in the HashSet?
@@ -1353,6 +1410,8 @@ impl<STATE, MODE: ExecutionMode> Transaction<STATE, MODE> {
         // add or remove row lacks `size` (see `FileStatsVisitor::visit` in
         // `kernel/src/crc/file_stats.rs`). So at this point every size is known to be
         // present, and only operation classification can flip `is_incremental_safe`.
+        // TODO(#3714): Preserve incremental file stats for commits without add/remove actions,
+        // matching replay's safety rule.
         let is_incremental_safe = self.operation.is_incremental_safe();
         Ok(CrcDelta {
             file_stats,
@@ -1543,8 +1602,8 @@ mod tests {
     use url::Url;
 
     use super::*;
-    use crate::actions::deletion_vector::DeletionVectorDescriptor;
     use crate::actions::CommitInfo;
+    use crate::actions::deletion_vector::DeletionVectorDescriptor;
     use crate::arrow::array::{
         ArrayRef, Float64Array, Int32Array, Int64Array, NullArray, StringArray,
     };
@@ -1562,25 +1621,25 @@ mod tests {
         ArrayData, ExpressionStructPatchBuilder, MapData, Scalar, StructData,
     };
     use crate::metrics::{CommitFailureReason, MetricEvent, TableType, TransactionCommitFailure};
+    use crate::object_store::ObjectStoreExt as _;
     use crate::object_store::memory::InMemory;
     use crate::object_store::path::Path;
-    use crate::object_store::ObjectStoreExt as _;
     use crate::scan::state_info::tests::RowTrackingState;
-    use crate::schema::{column_name, schema, schema_ref, ArrayType, MapType, StructType};
+    use crate::schema::{ArrayType, MapType, StructType, column_name, schema, schema_ref};
     use crate::table_features::{ColumnMappingMode, TableFeature};
     use crate::table_properties::{ENABLE_CHANGE_DATA_FEED, ENABLE_ROW_TRACKING};
     use crate::transaction::create_table::create_table;
     use crate::transaction::data_layout::DataLayout;
     use crate::transaction::exec_mode::StagedDataChanges;
-    #[cfg(feature = "adaptive-metadata-in-dev")]
     use crate::unit_test_utils::{
-        adaptive_metadata_table_configuration, test_schema_flat_with_column_mapping,
-    };
-    use crate::unit_test_utils::{
+        CapturingReporter, MockProtocolBuilder, MockTableConfigurationBuilder,
         assert_result_error_with_message, copy_test_table, create_valid_add_file_batch,
         install_thread_local_metrics_reporter, load_test_table, string_array_to_engine_data,
         test_schema_flat, test_schema_nested, test_schema_with_array, test_schema_with_map,
-        CapturingReporter, MockProtocolBuilder, MockTableConfigurationBuilder,
+    };
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    use crate::unit_test_utils::{
+        adaptive_metadata_table_configuration, test_schema_flat_with_column_mapping,
     };
     use crate::{EvaluationHandler, Expression, KernelResultIterator, Snapshot};
 
@@ -1639,6 +1698,7 @@ mod tests {
             column_defaults_acknowledged,
             #[cfg(feature = "check-constraints-in-dev")]
             check_constraints_acknowledged,
+            generated_columns_acknowledged,
             row_tracking_preservation_acknowledged,
             is_blind_append,
             #[cfg(feature = "adaptive-metadata-in-dev")]
@@ -1673,6 +1733,7 @@ mod tests {
         assert!(!column_defaults_acknowledged);
         #[cfg(feature = "check-constraints-in-dev")]
         assert!(!check_constraints_acknowledged);
+        assert!(!generated_columns_acknowledged);
         assert!(!row_tracking_preservation_acknowledged);
         assert!(!is_blind_append);
         assert!(dv_matched_files.is_empty());
@@ -2001,9 +2062,11 @@ mod tests {
         // Independently built transactions must retain their own write schemas.
         let initial_write_state = txn.write_state()?;
         let initial_write_context = initial_write_state.write_context_builder().build()?;
-        assert!(!initial_write_context
-            .logical_data_schema()
-            .contains("fresh_column"));
+        assert!(
+            !initial_write_context
+                .logical_data_schema()
+                .contains("fresh_column")
+        );
 
         let txn = snapshot
             .update_table(UpdateTableOperation::Write, "test-engine", true)
@@ -2012,15 +2075,21 @@ mod tests {
 
         let updated_write_state = txn.write_state()?;
         let updated_write_context = updated_write_state.write_context_builder().build()?;
-        assert!(updated_write_context
-            .logical_data_schema()
-            .contains("fresh_column"));
-        assert!(updated_write_context
-            .physical_data_schema()
-            .contains("fresh_column"));
-        assert!(!initial_write_context
-            .logical_data_schema()
-            .contains("fresh_column"));
+        assert!(
+            updated_write_context
+                .logical_data_schema()
+                .contains("fresh_column")
+        );
+        assert!(
+            updated_write_context
+                .physical_data_schema()
+                .contains("fresh_column")
+        );
+        assert!(
+            !initial_write_context
+                .logical_data_schema()
+                .contains("fresh_column")
+        );
 
         Ok(())
     }
@@ -2482,7 +2551,7 @@ mod tests {
         assert_eq!(get_column!(rb, names[1], Int32Array).value(0), 7); // p2 (prepended)
         assert_eq!(get_column!(rb, names[2], Int32Array).value(0), 10); // d1
         assert_eq!(get_column!(rb, names[3], StringArray).value(0), "cc"); // p3 (after d1, void
-                                                                           // skipped)
+        // skipped)
         assert_eq!(get_column!(rb, names[4], Int32Array).value(0), 9); // p4 (after d1)
         assert_eq!(get_column!(rb, names[5], Int32Array).value(0), 20); // d2
         Ok(())
@@ -2625,7 +2694,8 @@ mod tests {
         let err_msg = result.unwrap_err().to_string();
         assert!(
             err_msg.contains("matched") && err_msg.contains("does not match"),
-            "Expected error about mismatched count (expected 1 descriptor, 0 matched files), got: {err_msg}");
+            "Expected error about mismatched count (expected 1 descriptor, 0 matched files), got: {err_msg}"
+        );
         Ok(())
     }
 
@@ -2821,6 +2891,31 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[test]
+    fn test_ctas_rejected_on_iceberg_native_v4_table() -> KernelResult<()> {
+        let tempdir = tempfile::tempdir()?;
+        let table_path = tempdir.path().join("table");
+        std::fs::create_dir(&table_path)?;
+        let engine = SyncEngine::new();
+        let mut txn = create_table(
+            table_path.to_string_lossy(),
+            schema_ref! { nullable "id": INTEGER },
+            "test-engine",
+            true,
+        )
+        .with_table_properties([("delta.enableIcebergNativeV4", "true")])
+        .build(&engine, Box::new(FileSystemCommitter::new()))?;
+        add_dummy_file(&mut txn);
+
+        assert_result_error_with_message(
+            txn.commit(&engine),
+            "commits to icebergNativeV4-preview tables cannot include file actions",
+        );
+        assert!(!table_path.join("_delta_log").exists());
+        Ok(())
+    }
+
     #[rstest]
     #[case::create_with_update_operation(
         true,
@@ -2846,6 +2941,11 @@ mod tests {
         false,
         CommitOperation::UpdateTable(UpdateTableOperation::Custom("WRITE".to_string())),
         "custom operation name 'WRITE' is reserved"
+    )]
+    #[case::reserved_reorg_operation(
+        false,
+        CommitOperation::UpdateTable(UpdateTableOperation::Custom("REORG".to_string())),
+        "custom operation name 'REORG' is reserved"
     )]
     fn operation_compatibility_rejects_invalid_internal_state(
         #[case] is_create_table: bool,

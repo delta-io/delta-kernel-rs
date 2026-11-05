@@ -95,7 +95,7 @@ impl LogSegment {
     fn read_domain_metadata_batches(
         &self,
         engine: &dyn Engine,
-    ) -> KernelResult<impl KernelResultIterator<ActionsBatch>> {
+    ) -> KernelResult<impl KernelResultIterator<ActionsBatch> + use<>> {
         self.read_actions(engine, LOG_DOMAIN_METADATA_SCHEMA.clone())
     }
 }
@@ -153,8 +153,8 @@ mod tests {
     use crate::engine::sync::SyncEngine;
     use crate::object_store::memory::InMemory;
     use crate::schema::schema_ref;
-    use crate::transaction::create_table::create_table as create_table_txn;
     use crate::transaction::UpdateTableOperation;
+    use crate::transaction::create_table::create_table as create_table_txn;
     use crate::{RowVisitor as _, Snapshot};
 
     /// Builds a two-commit in-memory Delta table:

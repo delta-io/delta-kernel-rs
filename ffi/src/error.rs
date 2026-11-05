@@ -1,9 +1,15 @@
+use std::ffi::c_void;
+
 use delta_kernel::snapshot::SnapshotHintError;
-use delta_kernel::{KernelError, KernelResult};
+use delta_kernel::{Error, KernelError, KernelResult};
 use tracing::warn;
 
 use crate::handle::Handle;
-use crate::{kernel_string_slice, ExclusiveRustString, ExternEngine, KernelStringSlice};
+use crate::{ExclusiveRustString, ExternEngine};
+
+pub mod allocation;
+
+pub use allocation::ErrorAllocators;
 
 // We explicitly assign integer values to the error codes here because C and Rust are inconsistent
 // about values for "typedefed" features. Rust reserves the numbers for them regardless, so
@@ -19,7 +25,7 @@ use crate::{kernel_string_slice, ExclusiveRustString, ExternEngine, KernelString
 // values we avoid this issue.
 
 #[repr(C)]
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 #[non_exhaustive]
 pub enum FFIKernelError {
     UnknownError = 0, // catch-all for unrecognized KernelError types
@@ -82,10 +88,17 @@ pub enum FFIKernelError {
     MaxCatalogVersionError = 53,
     TableAlreadyExistsAtPath = 54,
     CommitRangeError = 55,
+    InvalidIntervalError = 56,
 }
 
 impl From<KernelError> for FFIKernelError {
     fn from(e: KernelError) -> Self {
+        Self::from(&e)
+    }
+}
+
+impl From<&KernelError> for FFIKernelError {
+    fn from(e: &KernelError) -> Self {
         match e {
             // NOTE: By definition, no KernelError maps to FFIError
             #[cfg(feature = "default-engine-base")]
@@ -133,13 +146,14 @@ impl From<KernelError> for FFIKernelError {
             }
             KernelError::InvalidTableLocation(_) => FFIKernelError::InvalidTableLocationError,
             KernelError::InvalidDecimal(_) => FFIKernelError::InvalidDecimalError,
+            KernelError::InvalidInterval(_) => FFIKernelError::InvalidIntervalError,
             KernelError::InvalidGeoParams(_) => FFIKernelError::InvalidGeoParamsError,
             KernelError::InvalidStructData(_) => FFIKernelError::InvalidStructDataError,
             KernelError::InternalError(_) => FFIKernelError::InternalError,
             KernelError::Backtraced {
                 source,
                 backtrace: _,
-            } => Self::from(*source),
+            } => Self::from(source.as_ref()),
             KernelError::InvalidExpressionEvaluation(_) => FFIKernelError::InvalidExpression,
             KernelError::InvalidLogPath(_) => FFIKernelError::InvalidLogPath,
             KernelError::InvalidLogSegment(_) => FFIKernelError::InvalidLogSegment,
@@ -165,29 +179,21 @@ impl From<KernelError> for FFIKernelError {
     }
 }
 
-/// An error that can be returned to the engine. Engines that wish to associate additional
-/// information can define and use any type that is [pointer
-/// interconvertible](https://en.cppreference.com/w/cpp/language/static_cast#pointer-interconvertible)
-/// with this one -- e.g. by subclassing this struct or by embedding this struct as the first member
-/// of a [standard layout](https://en.cppreference.com/w/cpp/language/data_members#Standard-layout)
-/// class.
-#[repr(C)]
-pub struct EngineError {
-    pub(crate) etype: FFIKernelError,
-}
-
-/// Semantics: Kernel will always immediately return the leaked engine error to the engine (if it
-/// allocated one at all), and engine is responsible for freeing it.
+/// An FFI result containing a value or a connector-owned error pointer.
+///
+/// Kernel returns the pointer produced by the connector's allocation callback unchanged, including
+/// NULL when allocation fails. `Err(NULL)` is still a failure. The connector interprets and frees
+/// non-null error objects; Kernel does not inspect their contents.
 #[repr(C)]
 pub enum ExternResult<T> {
+    /// The operation succeeded with this value.
     Ok(T),
-    Err(*mut EngineError),
+    /// The operation failed; the pointer comes from the connector's allocation callback.
+    Err(*mut c_void),
 }
 
-pub type AllocateErrorFn =
-    extern "C" fn(etype: FFIKernelError, msg: KernelStringSlice) -> *mut EngineError;
-
 impl<T> ExternResult<T> {
+    /// Returns `true` for `Ok` and `false` for `Err`, including `Err(NULL)`.
     pub fn is_ok(&self) -> bool {
         match self {
             Self::Ok(_) => true,
@@ -199,81 +205,81 @@ impl<T> ExternResult<T> {
     }
 }
 
-/// Represents an engine error allocator. Ultimately all implementations will fall back to an
-/// [`AllocateErrorFn`] provided by the engine, but the trait allows us to conveniently access the
-/// allocator in various types that may wrap it.
+/// Allocates connector-owned error objects using the registered callbacks.
 pub trait AllocateError {
-    /// Allocates a new error in engine memory and returns the resulting pointer. The engine is
-    /// expected to copy the passed-in message, which is only guaranteed to remain valid until the
-    /// call returns. Kernel will always immediately return the result of this method to the engine.
+    /// Converts `error` into a connector-owned error pointer, or NULL if allocation fails.
     ///
     /// # Safety
     ///
-    /// The string slice must be valid until the call returns, and the error allocator must also be
-    /// valid.
-    unsafe fn allocate_error(
-        &self,
-        etype: FFIKernelError,
-        msg: KernelStringSlice,
-    ) -> *mut EngineError;
+    /// The registered context and callbacks must satisfy [`ErrorAllocators`]'s lifetime,
+    /// concurrency, and memory access requirements.
+    unsafe fn allocate_error(&self, error: Error) -> *mut c_void;
+
+    /// Converts a Kernel `error` into a connector-owned error pointer, or NULL on allocation
+    /// failure.
+    ///
+    /// # Safety
+    ///
+    /// The registered context and callbacks must satisfy [`ErrorAllocators`]'s lifetime,
+    /// concurrency, and memory access requirements.
+    unsafe fn allocate_kernel_error(&self, error: KernelError) -> *mut c_void;
 }
 
-impl AllocateError for AllocateErrorFn {
-    unsafe fn allocate_error(
-        &self,
-        etype: FFIKernelError,
-        msg: KernelStringSlice,
-    ) -> *mut EngineError {
-        self(etype, msg)
+impl AllocateError for ErrorAllocators {
+    unsafe fn allocate_error(&self, error: Error) -> *mut c_void {
+        unsafe { self.allocate_error(error) }
+    }
+
+    unsafe fn allocate_kernel_error(&self, error: KernelError) -> *mut c_void {
+        unsafe { self.allocate_kernel_error(error) }
     }
 }
 
-// We do this instead of `impl AllocateError for &dyn ExternEngine` since we can then directly use
-// this trait on type T instead of having to cast it to a trait object first.
 impl<T: ExternEngine + ?Sized> AllocateError for &T {
-    /// # Safety
-    ///
-    /// In addition to the usual requirements, the engine handle must be valid.
-    unsafe fn allocate_error(
-        &self,
-        etype: FFIKernelError,
-        msg: KernelStringSlice,
-    ) -> *mut EngineError {
-        unsafe { self.error_allocator().allocate_error(etype, msg) }
+    unsafe fn allocate_error(&self, error: Error) -> *mut c_void {
+        unsafe { self.error_allocator().allocate_error(error) }
+    }
+
+    unsafe fn allocate_kernel_error(&self, error: KernelError) -> *mut c_void {
+        unsafe { self.error_allocator().allocate_kernel_error(error) }
     }
 }
 
-/// Converts a [`KernelResult`] into an [`ExternResult`], using the engine's error allocator.
+/// Converts [`KernelResult`] or [`delta_kernel::Result`] to an FFI result.
 ///
-/// # Safety
-///
-/// The allocator must be valid.
+/// Only errors invoke the allocator.
 pub(crate) trait IntoExternResult<T> {
+    /// Preserves a successful value or calls `alloc` to create the returned error pointer.
+    ///
+    /// # Safety
+    ///
+    /// `alloc` must satisfy [`ErrorAllocators`]'s callback and context requirements.
     unsafe fn into_extern_result(self, alloc: &dyn AllocateError) -> ExternResult<T>;
 }
 
-// NOTE: We can't "just" impl From<KernelResult<T>> because we require an error allocator.
 impl<T> IntoExternResult<T> for KernelResult<T> {
     unsafe fn into_extern_result(self, alloc: &dyn AllocateError) -> ExternResult<T> {
         match self {
-            Ok(ok) => ExternResult::Ok(ok),
-            Err(err) => {
-                let msg = format!("{err}");
-                let err = unsafe { alloc.allocate_error(err.into(), kernel_string_slice!(msg)) };
-                ExternResult::Err(err)
-            }
+            Ok(value) => ExternResult::Ok(value),
+            Err(error) => ExternResult::Err(unsafe { alloc.allocate_kernel_error(error) }),
         }
     }
 }
 
-/// An error that can be returned from engine-side execution (e.g during an upcall).
+impl<T> IntoExternResult<T> for delta_kernel::Result<T> {
+    unsafe fn into_extern_result(self, alloc: &dyn AllocateError) -> ExternResult<T> {
+        match self {
+            Ok(value) => ExternResult::Ok(value),
+            Err(error) => ExternResult::Err(unsafe { alloc.allocate_error(error) }),
+        }
+    }
+}
+
+/// An error the engine returns to Kernel when an execution callback fails.
 ///
-/// This is intended to be a kernel-allocated error which Engines can return TO kernel. It is the
-/// inverse of [`EngineError`] (which is engine-allocated, and returned FROM kernel).
-///
-/// The message is an [`ExclusiveRustString`] handle, which means the engine must
-/// downcall to [`allocate_kernel_string`](crate::allocate_kernel_string) to construct it. Kernel
-/// can then take ownership and free it appropriately after receiving the error.
+/// The engine creates `message` with [`allocate_kernel_string`](crate::allocate_kernel_string)
+/// and transfers ownership of that handle to Kernel with the error. Kernel consumes and frees
+/// the message. Errors returned to the connector through [`ExternResult`] are connector-owned.
 #[repr(C)]
 pub struct EngineExecError {
     // TODO: we re-use FFIKernelError for convenience, but we should ideally split this into a
@@ -337,6 +343,7 @@ impl From<EngineExecError> for KernelError {
             }
             FFIKernelError::InvalidTableLocationError => KernelError::InvalidTableLocation(message),
             FFIKernelError::InvalidDecimalError => KernelError::InvalidDecimal(message),
+            FFIKernelError::InvalidIntervalError => KernelError::InvalidInterval(message),
             FFIKernelError::InvalidGeoParamsError => KernelError::InvalidGeoParams(message),
             FFIKernelError::InvalidStructDataError => KernelError::InvalidStructData(message),
             FFIKernelError::InvalidExpression => KernelError::InvalidExpressionEvaluation(message),
@@ -562,6 +569,18 @@ mod error_code_tests {
             err,
             KernelError::TableAlreadyExistsAtPath(path) if path == "memory:///table"
         ));
+    }
+
+    #[test]
+    fn invalid_interval_error_has_stable_ffi_mapping() {
+        assert_eq!(
+            FFIKernelError::from(KernelError::InvalidInterval("invalid".to_string())),
+            FFIKernelError::InvalidIntervalError
+        );
+        assert_eq!(FFIKernelError::InvalidIntervalError as i32, 56);
+
+        let err: KernelError = exec_error(FFIKernelError::InvalidIntervalError, "invalid").into();
+        assert!(matches!(err, KernelError::InvalidInterval(message) if message == "invalid"));
     }
 }
 

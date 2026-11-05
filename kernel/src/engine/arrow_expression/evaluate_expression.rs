@@ -10,38 +10,39 @@ use tracing::warn;
 use super::timestamp_timezone::TimestampTimezone;
 use crate::arrow::array::types::*;
 use crate::arrow::array::{
-    self as arrow_array, make_array, new_null_array, Array, ArrayBuilder, ArrayData, ArrayRef,
-    AsArray, BooleanArray, Datum, ListArray, MapArray, MutableArrayData, NullBufferBuilder,
-    RecordBatch, StringArray, StructArray,
+    self as arrow_array, Array, ArrayBuilder, ArrayData, ArrayRef, AsArray, BooleanArray, Datum,
+    ListArray, MapArray, MutableArrayData, NullBufferBuilder, RecordBatch, StringArray,
+    StructArray, make_array, new_null_array,
 };
 use crate::arrow::buffer::{NullBuffer, OffsetBuffer};
-use crate::arrow::compute::kernels::cast_utils::{string_to_datetime, Parser};
+use crate::arrow::compute::kernels::cast_utils::{Parser, string_to_datetime};
 use crate::arrow::compute::kernels::cmp::{distinct, eq, gt, gt_eq, lt, lt_eq, neq, not_distinct};
 use crate::arrow::compute::kernels::comparison::in_list_utf8;
+use crate::arrow::compute::kernels::interleave::interleave;
 use crate::arrow::compute::kernels::numeric::{add, div, mul, sub};
 use crate::arrow::compute::{
-    and_kleene, can_cast_types, cast, is_not_null, is_null, not, or_kleene,
+    and_kleene, can_cast_types, cast, filter_record_batch, is_not_null, is_null, not, or_kleene,
 };
 use crate::arrow::datatypes::{
     DataType as ArrowDataType, Field as ArrowField, Fields as ArrowFields, IntervalUnit,
     Schema as ArrowSchema, TimeUnit,
 };
 use crate::arrow::error::ArrowError;
-use crate::arrow::json::writer::{make_encoder, EncoderOptions};
 use crate::arrow::json::StructMode;
+use crate::arrow::json::writer::{EncoderOptions, make_encoder};
 use crate::delta_kernel_derive::internal_api;
-use crate::engine::arrow_conversion::{TryFromKernel, TryIntoArrow, LIST_ARRAY_ROOT};
+use crate::engine::arrow_conversion::{LIST_ARRAY_ROOT, TryFromKernel, TryIntoArrow};
 use crate::engine::arrow_expression::opaque::{
     ArrowOpaqueExpressionOpAdaptor, ArrowOpaquePredicateOpAdaptor,
 };
 use crate::engine::arrow_utils::{list_type_with_element, parse_json_impl, prim_array_cmp};
-use crate::engine::ensure_data_types::{ensure_data_types, ValidationMode};
+use crate::engine::ensure_data_types::{ValidationMode, ensure_data_types};
 use crate::error::{KernelError, KernelResult};
 use crate::expressions::{
-    BinaryExpression, BinaryExpressionOp, BinaryPredicate, BinaryPredicateOp, Expression,
-    ExpressionRef, ExpressionStructPatch, JunctionPredicate, JunctionPredicateOp, OpaqueExpression,
-    OpaquePredicate, Predicate, Scalar, UnaryExpression, UnaryExpressionOp, UnaryPredicate,
-    UnaryPredicateOp, VariadicExpression, VariadicExpressionOp,
+    BinaryExpression, BinaryExpressionOp, BinaryPredicate, BinaryPredicateOp, CaseWhenExpression,
+    Expression, ExpressionRef, ExpressionStructPatch, JunctionPredicate, JunctionPredicateOp,
+    OpaqueExpression, OpaquePredicate, Predicate, Scalar, UnaryExpression, UnaryExpressionOp,
+    UnaryPredicate, UnaryPredicateOp, VariadicExpression, VariadicExpressionOp,
 };
 use crate::schema::{DataType, PrimitiveType, StructField, StructType};
 
@@ -411,6 +412,7 @@ pub fn evaluate_expression(
             };
             validate_array_type(output, result_type)
         }
+        (CaseWhen(case_when), result_type) => evaluate_case_when(case_when, batch, result_type),
         (Unknown(name), _) => Err(KernelError::unsupported(format!(
             "Unknown expression: {name:?}"
         ))),
@@ -518,6 +520,95 @@ fn evaluate_array_expression(
     validate_array_type(Arc::new(list), result_type)
 }
 
+fn evaluate_case_when(
+    case_when: &CaseWhenExpression,
+    batch: &RecordBatch,
+    result_type: Option<&DataType>,
+) -> KernelResult<ArrayRef> {
+    let mut remaining_batch = batch.clone();
+    let mut remaining_rows: Vec<_> = (0..batch.num_rows()).collect();
+    // arrays holds each evaluated branch's results. For each original row, output_row_sources
+    // stores (array_index, row_index), identifying its value in arrays[array_index] at row_index.
+    // interleave uses this mapping to restore the original row order.
+    let mut arrays: Vec<ArrayRef> = Vec::new();
+    let mut output_row_sources = vec![(0, 0); batch.num_rows()];
+    let mut append_result =
+        |expr: &Expression, input: &RecordBatch, output_rows: &mut dyn Iterator<Item = usize>| {
+            let values = evaluate_expression(expr, input, result_type)?;
+            if values.len() != input.num_rows() && values.len() != 1 {
+                return Err(KernelError::internal_error(format!(
+                    "CASE WHEN result has {} rows, expected {} or 1",
+                    values.len(),
+                    input.num_rows(),
+                )));
+            }
+            let array_index = arrays.len();
+            let is_scalar = values.len() == 1;
+            arrays.push(values);
+            // Scalar results, like literal-only IN, use source row 0 for every output row.
+            for (row, original_row) in output_rows.enumerate() {
+                output_row_sources[original_row] = (array_index, if is_scalar { 0 } else { row });
+            }
+            Ok(())
+        };
+
+    for (condition, result) in &case_when.branches {
+        if remaining_rows.is_empty() {
+            break;
+        }
+        let condition = evaluate_predicate(condition, &remaining_batch, false)?;
+        if condition.true_count() == 0 {
+            continue;
+        }
+        // Literal-only IN predicates return one value for the whole batch. A singleton reaching
+        // this point is TRUE, so broadcast it to all remaining rows.
+        let selected = if condition.len() == 1 {
+            BooleanArray::from_iter(std::iter::repeat_n(Some(true), remaining_rows.len()))
+        } else {
+            BooleanArray::from_iter(condition.iter().map(|value| Some(value == Some(true))))
+        };
+        let selected_batch = filter_record_batch(&remaining_batch, &selected)?;
+        let mut selected_rows = remaining_rows
+            .iter()
+            .enumerate()
+            .filter_map(|(row, &original_row)| selected.value(row).then_some(original_row));
+        append_result(result, &selected_batch, &mut selected_rows)?;
+
+        // Later conditions and results see only rows not selected by an earlier WHEN.
+        // For example, remaining_rows = [2, 5, 8] and selected = [false, true, false]
+        // leaves [2, 8]: original row 5 was handled by this WHEN.
+        remaining_rows = remaining_rows
+            .into_iter()
+            .enumerate()
+            .filter_map(|(row, original_row)| (!selected.value(row)).then_some(original_row))
+            .collect();
+        if !remaining_rows.is_empty() {
+            remaining_batch = filter_record_batch(&remaining_batch, &not(&selected)?)?;
+        }
+    }
+
+    // Empty batches still evaluate ELSE to establish the result type.
+    if batch.num_rows() == 0 || !remaining_rows.is_empty() {
+        append_result(
+            &case_when.else_expr,
+            &remaining_batch,
+            &mut remaining_rows.iter().copied(),
+        )?;
+    }
+
+    if arrays.len() == 1 && arrays[0].len() == batch.num_rows() {
+        return validate_array_type(arrays.remove(0), result_type);
+    }
+    let data_type = arrays[0].data_type();
+    if arrays.iter().any(|values| values.data_type() != data_type) {
+        return Err(KernelError::generic(
+            "CASE WHEN branches must have the same type",
+        ));
+    }
+    let values = arrays.iter().map(|array| array.as_ref()).collect_vec();
+    validate_array_type(interleave(&values, &output_row_sources)?, result_type)
+}
+
 /// Direction for casting between Arrow view and non-view string/binary types.
 #[derive(Clone, Copy)]
 enum ViewCast {
@@ -593,9 +684,8 @@ fn arrow_convert_to_non_view_type(vals: Arc<dyn Array>) -> KernelResult<Arc<dyn 
     }
 }
 
-/// This function converts  Arrow types to their Arrow view type equivalents. This is used for
-/// [`evaluate_predicate`] conversion, currently does not support nested conversion. This only
-/// supports limited conversions (see code for exactly which).
+/// Converts Arrow string/binary arrays and their list elements to view representations.
+/// Other nested types are preserved.
 fn arrow_convert_to_view_type(vals: Arc<dyn Array>) -> KernelResult<Arc<dyn Array>> {
     match vals.data_type() {
         ArrowDataType::List(field) => cast_list_elements(&vals, field, ViewCast::ToView),
@@ -660,13 +750,12 @@ pub fn evaluate_predicate(
 
                     let right = evaluate_expression(right, batch, None)?;
                     let right = arrow_convert_to_non_view_type(right)?;
-                    if let Some(string_arr) = left.as_string_opt::<i32>() {
-                        if let Some(list_arr) = right.as_list_opt::<i32>() {
-                            if list_arr.value_type() == ArrowDataType::Utf8 {
-                                let result = in_list_utf8(string_arr, list_arr)?;
-                                return Ok(result);
-                            }
-                        }
+                    if let Some(string_arr) = left.as_string_opt::<i32>()
+                        && let Some(list_arr) = right.as_list_opt::<i32>()
+                        && list_arr.value_type() == ArrowDataType::Utf8
+                    {
+                        let result = in_list_utf8(string_arr, list_arr)?;
+                        return Ok(result);
                     }
 
                     use ArrowDataType::*;
@@ -1124,21 +1213,22 @@ mod tests {
     use super::super::expected_timestamp_micros;
     use super::*;
     use crate::arrow::array::{
-        ArrayRef, BinaryArray, BooleanArray, Date32Array, Float64Array, Int32Array, Int64Array,
-        LargeStringArray, ListArray, MapBuilder, StringArray, StringBuilder, StructArray,
-        TimestampMicrosecondArray,
+        ArrayData as ArrowArrayData, ArrayRef, BinaryArray, BooleanArray, Date32Array,
+        Float64Array, Int32Array, Int64Array, LargeStringArray, ListArray, MapBuilder, StringArray,
+        StringBuilder, StructArray, TimestampMicrosecondArray,
     };
     use crate::arrow::buffer::{OffsetBuffer, ScalarBuffer};
     use crate::arrow::datatypes::{
         DataType as ArrowDataType, Field as ArrowField, Fields, Schema as ArrowSchema,
     };
+    use crate::engine::arrow_conversion::TryIntoKernel;
     use crate::expressions::{
-        col, column_expr_ref, lit, null_lit, ArrayData, BinaryExpressionOp, BinaryPredicateOp,
-        Expression as Expr, ExpressionStructPatchBuilder, JunctionPredicateOp, MapData,
-        MapToStructOptions, Predicate as Pred, StructData,
+        ArrayData, BinaryExpressionOp, BinaryPredicateOp, Expression as Expr,
+        ExpressionStructPatchBuilder, JunctionPredicateOp, MapData, MapToStructOptions,
+        Predicate as Pred, StructData, col, column_expr_ref, column_pred, lit, null_lit,
     };
     use crate::schema::{
-        schema, schema_ref, ArrayType, DataType, MapType, StructField, StructType,
+        ArrayType, DataType, MapType, StructField, StructType, schema, schema_ref,
     };
     use crate::unit_test_utils::assert_result_error_with_message;
 
@@ -1430,10 +1520,12 @@ mod tests {
         let expr = Expr::struct_patch(patch).unwrap();
         let result =
             evaluate_expression(&expr, &batch, Some(&DataType::from(output_schema.clone())));
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("reference invalid input field names"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("reference invalid input field names")
+        );
 
         // Test unused insertion keys
         let insertion_patch =
@@ -1443,10 +1535,12 @@ mod tests {
         let result2 =
             evaluate_expression(&expr2, &batch, Some(&DataType::from(output_schema.clone())));
         assert!(result2.is_err());
-        assert!(result2
-            .unwrap_err()
-            .to_string()
-            .contains("reference invalid input field names"));
+        assert!(
+            result2
+                .unwrap_err()
+                .to_string()
+                .contains("reference invalid input field names")
+        );
 
         // Test column count mismatch -- too many output schema fields
         let drop_patch = ExpressionStructPatchBuilder::new().drop("a");
@@ -1461,10 +1555,12 @@ mod tests {
         let result3 =
             evaluate_expression(&expr3, &batch, Some(&DataType::from(wrong_output_schema)));
         assert!(result3.is_err());
-        assert!(result3
-            .unwrap_err()
-            .to_string()
-            .contains("Too many fields in output schema"));
+        assert!(
+            result3
+                .unwrap_err()
+                .to_string()
+                .contains("Too many fields in output schema")
+        );
 
         // Test column count mismatch -- too few output schema fields
         let drop_patch = ExpressionStructPatchBuilder::new().drop("a");
@@ -1475,20 +1571,24 @@ mod tests {
         let result3 =
             evaluate_expression(&expr3, &batch, Some(&DataType::from(wrong_output_schema)));
         assert!(result3.is_err());
-        assert!(result3
-            .unwrap_err()
-            .to_string()
-            .contains("Too few fields in output schema"));
+        assert!(
+            result3
+                .unwrap_err()
+                .to_string()
+                .contains("Too few fields in output schema")
+        );
 
         // Test missing output schema
         let patch = ExpressionStructPatchBuilder::new();
         let expr4 = Expr::struct_patch(patch).unwrap();
         let result4 = evaluate_expression(&expr4, &batch, None);
         assert!(result4.is_err());
-        assert!(result4
-            .unwrap_err()
-            .to_string()
-            .contains("Data type is required"));
+        assert!(
+            result4
+                .unwrap_err()
+                .to_string()
+                .contains("Data type is required")
+        );
     }
 
     #[test]
@@ -1556,10 +1656,12 @@ mod tests {
         };
         let expr = Expr::struct_patch(patch).unwrap();
         let result = evaluate_expression(&expr, &batch, Some(&DataType::from(output_schema)));
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("reference invalid input field names"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("reference invalid input field names")
+        );
     }
 
     #[test]
@@ -3851,5 +3953,401 @@ mod tests {
         assert_eq!(result.len(), 2);
         assert_eq!(result.null_count(), 2);
         assert_eq!(result.data_type(), &ArrowDataType::Date32);
+    }
+
+    fn case_when_batch() -> RecordBatch {
+        let strings = StringArray::from(vec![Some("first"), None, Some("last")]);
+        RecordBatch::try_from_iter([
+            ("a", Arc::new(Int32Array::from(vec![1, 2, 3])) as ArrayRef),
+            (
+                "b",
+                Arc::new(Int32Array::from(vec![Some(10), None, Some(30)])),
+            ),
+            (
+                "flag",
+                Arc::new(BooleanArray::from(vec![Some(true), None, Some(false)])),
+            ),
+            ("s", Arc::new(strings.clone())),
+            (
+                "large_s",
+                cast(&strings, &ArrowDataType::LargeUtf8).unwrap(),
+            ),
+            ("view_s", cast(&strings, &ArrowDataType::Utf8View).unwrap()),
+        ])
+        .unwrap()
+    }
+
+    fn case_when_struct_data(values: Vec<Option<i32>>, valid: Vec<bool>) -> ArrowArrayData {
+        StructArray::new(
+            vec![ArrowField::new("value", ArrowDataType::Int32, true)].into(),
+            vec![Arc::new(Int32Array::from(values))],
+            Some(NullBuffer::from(valid)),
+        )
+        .to_data()
+    }
+
+    #[rstest]
+    #[case::first_true_wins(
+        [Expr::case_when(
+            [
+                (col!("a").gt(lit(1)), lit(10)),
+                (col!("a").gt(lit(0)), lit(20)),
+            ],
+            lit(30),
+        )],
+        Ok(Int32Array::from(vec![Some(20), Some(10), Some(10)]).to_data()),
+    )]
+    #[case::null_condition_falls_through(
+        [Expr::case_when(
+            [
+                (column_pred!("flag"), lit(1)),
+                (Predicate::TRUE, lit(2)),
+            ],
+            null_lit(DataType::INTEGER),
+        )],
+        Ok(Int32Array::from(vec![Some(1), Some(2), Some(2)]).to_data()),
+    )]
+    #[case::null_condition_uses_else(
+        [Expr::case_when([(column_pred!("flag"), lit(1))], lit(2))],
+        Ok(Int32Array::from(vec![Some(1), Some(2), Some(2)]).to_data()),
+    )]
+    #[case::null_expressions_use_else(
+        [
+            Predicate::NULL,
+            Predicate::not(Predicate::NULL),
+            Predicate::and(Predicate::NULL, Predicate::TRUE),
+            Predicate::or(Predicate::NULL, Predicate::FALSE),
+            Predicate::not(Predicate::or(Predicate::NULL, Predicate::FALSE)),
+            Predicate::from_expr(Expr::cast(null_lit(DataType::STRING), DataType::BOOLEAN)),
+            Predicate::from_expr(Expr::case_when(
+                [(Predicate::TRUE, Predicate::NULL.into())], lit(true),
+            )),
+            Predicate::from_expr(Expr::case_when(
+                [(Predicate::TRUE, Predicate::not(Predicate::or(
+                    Predicate::NULL, Predicate::FALSE,
+                )).into())], lit(true),
+            )),
+        ].map(|condition| Expr::case_when([(condition, lit(1))], lit(2))),
+        Ok(Int32Array::from(vec![Some(2); 3]).to_data()),
+    )]
+    #[case::typed_null_else(
+        [Expr::case_when(
+            [(col!("a").gt(lit(2)), lit(10))],
+            null_lit(DataType::INTEGER),
+        )],
+        Ok(Int32Array::from(vec![None, None, Some(10)]).to_data()),
+    )]
+    #[case::typed_null_else_in_arithmetic(
+        [Expr::case_when(
+            [(col!("a").gt(lit(2)), lit(10))],
+            null_lit(DataType::INTEGER),
+        ) + lit(1)],
+        Ok(Int32Array::from(vec![None, None, Some(11)]).to_data()),
+    )]
+    #[case::selected_null_does_not_fall_through(
+        [Expr::case_when(
+            [
+                (Predicate::TRUE, null_lit(DataType::INTEGER)),
+                (Predicate::TRUE, lit(2)),
+            ],
+            lit(3),
+        )],
+        Ok(Int32Array::from(vec![None, None, None]).to_data()),
+    )]
+    #[case::skip_unreachable_condition_and_else(
+        [Expr::case_when(
+            [
+                (Predicate::TRUE, lit(1)),
+                (Predicate::unknown("unselected"), lit(1) / lit(0)),
+            ],
+            lit(1) / lit(0),
+        )],
+        Ok(Int32Array::from(vec![Some(1), Some(1), Some(1)]).to_data()),
+    )]
+    #[case::then_sees_only_selected_rows(
+        [Expr::case_when(
+            [(
+                col!("a").ne(lit(1)),
+                lit(10) / (col!("a") - lit(1)),
+            )],
+            lit(0),
+        )],
+        Ok(Int32Array::from(vec![Some(0), Some(10), Some(5)]).to_data()),
+    )]
+    #[case::else_sees_only_unmatched_rows(
+        [Expr::case_when(
+            [(col!("a").eq(lit(1)), lit(0))],
+            lit(10) / (col!("a") - lit(1)),
+        )],
+        Ok(Int32Array::from(vec![Some(0), Some(10), Some(5)]).to_data()),
+    )]
+    #[case::later_condition_sees_only_unmatched_rows(
+        [Expr::case_when(
+            [
+                (col!("a").eq(lit(1)), lit(0)),
+                (
+                    (lit(10) / (col!("a") - lit(1)))
+                        .gt(lit(8)),
+                    lit(7),
+                ),
+            ],
+            lit(9),
+        )],
+        Ok(Int32Array::from(vec![Some(0), Some(7), Some(9)]).to_data()),
+    )]
+    #[case::skip_branch_matching_only_already_selected_rows(
+        [Expr::case_when(
+            [
+                (col!("a").lt(lit(3)), lit(10)),
+                (col!("a").lt(lit(3)), lit(1) / lit(0)),
+            ],
+            lit(20),
+        )],
+        Ok(Int32Array::from(vec![Some(10), Some(10), Some(20)]).to_data()),
+    )]
+    #[case::nested_case_when(
+        [Expr::case_when(
+            [(col!("a").lt(lit(2)), lit(0))],
+            Expr::case_when(
+                [(col!("a").gt(lit(2)), lit(100))],
+                col!("a"),
+            ),
+        )],
+        Ok(Int32Array::from(vec![Some(0), Some(2), Some(100)]).to_data()),
+    )]
+    #[case::arithmetic_branches(
+        [Expr::case_when(
+            [((col!("a") + col!("a")).gt(lit(3)),
+              col!("a") * col!("b"))],
+            col!("b") - col!("a"),
+        )],
+        Ok(Int32Array::from(vec![Some(9), None, Some(90)]).to_data()),
+    )]
+    #[case::preserves_element_nulls(
+        [Expr::case_when(
+            [(col!("a").ge(lit(2)), col!("b"))],
+            lit(0),
+        )],
+        Ok(Int32Array::from(vec![Some(0), None, Some(30)]).to_data()),
+    )]
+    #[case::nonadjacent_rows_keep_order(
+        [Expr::case_when(
+            [(col!("a").ne(lit(2)), col!("b"))],
+            lit(0),
+        )],
+        Ok(Int32Array::from(vec![Some(10), Some(0), Some(30)]).to_data()),
+    )]
+    #[case::scalar_in_condition_broadcasts(
+        [Expr::case_when(
+            [(
+                Predicate::binary(
+                    BinaryPredicateOp::In,
+                    lit(1),
+                    Scalar::Array(ArrayData::try_new(
+                        ArrayType::new(DataType::INTEGER, false), vec![Scalar::Integer(1)],
+                    ).unwrap()),
+                ),
+                col!("a"),
+            )],
+            lit(0),
+        )],
+        Ok(Int32Array::from(vec![Some(1), Some(2), Some(3)]).to_data()),
+    )]
+    #[case::strings_literal_else(
+        [Expr::case_when(
+            [(col!("a").ge(lit(2)), col!("s"))],
+            lit("fallback"),
+        )],
+        Ok(StringArray::from(vec![Some("fallback"), None, Some("last")]).to_data()),
+    )]
+    #[case::strings_null_else(
+        [Expr::case_when(
+            [(col!("a").ge(lit(2)), col!("s"))],
+            null_lit(DataType::STRING),
+        )],
+        Ok(StringArray::from(vec![None, None, Some("last")]).to_data()),
+    )]
+    #[case::struct_literal_else(
+        [Expr::case_when(
+            [(col!("a").ge(lit(2)), Expr::struct_from([col!("b")]))],
+            Expr::struct_from([lit(0)]),
+        )],
+        Ok(case_when_struct_data(vec![Some(0), None, Some(30)], vec![true, true, true])),
+    )]
+    #[case::struct_null_else(
+        [Expr::case_when(
+            [(col!("a").ge(lit(2)), Expr::struct_from([col!("b")]))],
+            null_lit(StructType::new_unchecked([
+                StructField::nullable("value", DataType::INTEGER),
+            ])),
+        )],
+        Ok(case_when_struct_data(vec![None, None, Some(30)], vec![false, true, true])),
+    )]
+    #[case::mismatched_when_type(
+        [Expr::case_when(
+            [
+                (col!("a").gt(lit(2)), lit(1)),
+                (Predicate::TRUE, lit("text")),
+            ],
+            lit(0),
+        )],
+        Err("CASE WHEN branches must have the same type"),
+    )]
+    #[case::mismatched_else_type(
+        [Expr::case_when(
+            [(col!("a").gt(lit(2)), lit(1))],
+            lit("text"),
+        )],
+        Err("CASE WHEN branches must have the same type"),
+    )]
+    #[case::mismatched_null_type(
+        [Expr::case_when(
+            [(col!("a").gt(lit(2)), null_lit(DataType::INTEGER))],
+            null_lit(DataType::STRING),
+        )],
+        Err("CASE WHEN branches must have the same type"),
+    )]
+    #[case::mismatched_numeric_width(
+        [Expr::case_when(
+            [(col!("a").gt(lit(2)), lit(1))],
+            lit(0_i64),
+        )],
+        Err("CASE WHEN branches must have the same type"),
+    )]
+    fn test_evaluate_case_when(
+        #[case] exprs: impl IntoIterator<Item = Expr>,
+        #[case] expected: Result<ArrowArrayData, &str>,
+    ) {
+        let batch = case_when_batch();
+        for expr in exprs {
+            let expected = match &expected {
+                Ok(expected) => expected,
+                Err(message) => {
+                    assert_result_error_with_message(
+                        evaluate_expression(&expr, &batch, None),
+                        message,
+                    );
+                    continue;
+                }
+            };
+            let output_type: DataType = expected.data_type().try_into_kernel().unwrap();
+            for result_type in [None, Some(&output_type)] {
+                // Struct expressions require an explicit output schema.
+                if result_type.is_none() && matches!(output_type, DataType::Struct(_)) {
+                    continue;
+                }
+                let result = evaluate_expression(&expr, &batch, result_type).unwrap();
+                assert_eq!(result.to_data(), *expected, "{expr:?}, {result_type:?}");
+            }
+        }
+    }
+
+    #[rstest]
+    #[case::all(Predicate::TRUE, [true; 3])]
+    #[case::first_row(col!("a").eq(lit(1)), [true, false, false])]
+    #[case::nonadjacent_rows(col!("a").ne(lit(2)), [true, false, true])]
+    #[case::none(Predicate::FALSE, [false; 3])]
+    fn test_evaluate_case_when_scalar_results(
+        #[case] condition: Predicate,
+        #[case] selected: [bool; 3],
+        #[values(true, false)] scalar_then: bool,
+        #[values(0, 1, 3)] num_rows: usize,
+        #[values(None, Some(&DataType::BOOLEAN))] result_type: Option<&DataType>,
+    ) {
+        let scalar = Predicate::binary(
+            BinaryPredicateOp::In,
+            lit(1),
+            Scalar::Array(
+                ArrayData::try_new(
+                    ArrayType::new(DataType::INTEGER, false),
+                    vec![Scalar::Integer(1)],
+                )
+                .unwrap(),
+            ),
+        )
+        .into();
+        let (then_expr, else_expr) = if scalar_then {
+            (scalar, lit(false))
+        } else {
+            (lit(false), scalar)
+        };
+        let expr = Expr::case_when([(condition, then_expr)], else_expr);
+        let batch = case_when_batch().slice(0, num_rows);
+        let result = evaluate_expression(&expr, &batch, result_type).unwrap();
+        let expected = BooleanArray::from_iter(
+            selected
+                .into_iter()
+                .take(num_rows)
+                .map(|selected| Some(selected == scalar_then)),
+        );
+        assert_eq!(result.to_data(), expected.to_data());
+    }
+
+    #[rstest]
+    fn test_evaluate_case_when_string_types(
+        #[values("s", "large_s", "view_s")] column: &str,
+        #[values(false, true)] nested: bool,
+        #[values(false, true)] null_else: bool,
+    ) {
+        let source = case_when_batch();
+        let strings = source.column_by_name(column).unwrap().clone();
+        let values: ArrayRef = if nested {
+            Arc::new(StructArray::from(vec![(
+                Arc::new(ArrowField::new("value", strings.data_type().clone(), true)),
+                strings,
+            )]))
+        } else {
+            strings
+        };
+        let batch = RecordBatch::try_from_iter([
+            ("a", source.column_by_name("a").unwrap().clone()),
+            ("value", values.clone()),
+        ])
+        .unwrap();
+        let output_type: DataType = values.data_type().try_into_kernel().unwrap();
+        let fallback = if null_else {
+            null_lit(output_type)
+        } else {
+            col!("value")
+        };
+        let expr = Expr::case_when([(col!("a").gt(lit(2)), col!("value"))], fallback);
+        let result = evaluate_expression(&expr, &batch, None);
+        if null_else && column != "s" {
+            assert_result_error_with_message(result, "CASE WHEN branches must have the same type");
+        } else {
+            let expected: ArrayRef = if null_else {
+                let strings = Arc::new(StringArray::from(vec![None, None, Some("last")]));
+                if nested {
+                    Arc::new(StructArray::new(
+                        values.as_struct().fields().clone(),
+                        vec![strings],
+                        Some(NullBuffer::from(vec![false, false, true])),
+                    ))
+                } else {
+                    strings
+                }
+            } else {
+                values
+            };
+            assert_eq!(result.unwrap().to_data(), expected.to_data());
+        }
+    }
+
+    #[rstest]
+    fn test_evaluate_case_when_without_matches(
+        #[values(0, 1)] num_branches: usize,
+        #[values(None, Some(9))] else_value: Option<i32>,
+        #[values(0, 3)] num_rows: usize,
+        #[values(None, Some(&DataType::INTEGER))] result_type: Option<&DataType>,
+    ) {
+        let branches = (0..num_branches).map(|_| (col!("a").lt(lit(0)), lit(1) / lit(0)));
+        let fallback = else_value.map_or_else(|| null_lit(DataType::INTEGER), lit);
+        let expr = Expr::case_when(branches, fallback);
+        let batch = case_when_batch().slice(0, num_rows);
+        let result = evaluate_expression(&expr, &batch, result_type).unwrap();
+        assert_eq!(
+            result.to_data(),
+            Int32Array::from(vec![else_value; num_rows]).to_data()
+        );
     }
 }
