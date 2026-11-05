@@ -690,10 +690,17 @@ async fn test_post_commit_crc_metadata_only_custom_op_makes_file_stats_indetermi
     ));
 
     let fresh = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
-    assert_eq!(
-        fresh.write_checksum(engine.as_ref())?.0,
-        ChecksumWriteResult::Written
-    );
+    if operation == "CUSTOM OP" {
+        assert!(matches!(
+            fresh.write_checksum(engine.as_ref()),
+            Err(KernelError::ChecksumWriteUnsupported(_))
+        ));
+    } else {
+        assert_eq!(
+            fresh.write_checksum(engine.as_ref())?.0,
+            ChecksumWriteResult::Written
+        );
+    }
 
     Ok(())
 }
@@ -764,7 +771,7 @@ async fn test_write_checksum_double_write_returns_already_exists(
 async fn test_write_checksum_preserves_stats_across_metadata_only_commits(
     #[case] root: WriteRoot,
     #[case] checkpoint: Option<CheckpointSpec>,
-    #[values("VACUUM START", "VACUUM END", "SET TBLPROPERTIES", "CUSTOM OP")] operation: &str,
+    #[values("VACUUM START", "VACUUM END", "SET TBLPROPERTIES", "FSCK")] operation: &str,
 ) -> KernelResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
     let mut builder = create_table(
@@ -1248,7 +1255,7 @@ async fn test_write_checksum_from_checkpoint_ict_enabled_but_commit_unreadable_p
 #[case::stale_crc(WriteRoot::StaleCrcIncrementalBuild)]
 #[case::checkpoint(WriteRoot::CheckpointWithTail)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_write_checksum_ignores_metadata_readds_and_counts_subsequent_unknown_writes(
+async fn test_write_checksum_ignores_metadata_readds_and_counts_subsequent_whitelisted_writes(
     #[case] root: WriteRoot,
 ) -> KernelResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
@@ -1313,7 +1320,7 @@ async fn test_write_checksum_ignores_metadata_readds_and_counts_subsequent_unkno
         &engine,
         vec![Arc::new(Int32Array::from(vec![4, 5, 6]))],
         Box::new(FileSystemCommitter::new()),
-        "FUTURE WRITE OPERATION",
+        "COPY INTO",
         true,
         false,
     )
@@ -1352,6 +1359,7 @@ async fn test_write_checksum_ignores_metadata_readds_and_counts_subsequent_unkno
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_write_checksum_rejects_file_actions_with_unsafe_operation(
     #[case] with_checkpoint: bool,
+    #[values("Manual Update", "UNKNOWN")] operation: &str,
 ) -> KernelResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
     let snap = create_table_and_commit(&table_path, engine.as_ref())?
@@ -1376,7 +1384,7 @@ async fn test_write_checksum_rejects_file_actions_with_unsafe_operation(
         &engine,
         vec![Arc::new(Int32Array::from(vec![4, 5, 6]))],
         Box::new(FileSystemCommitter::new()),
-        "Manual Update",
+        operation,
         true,
         false,
     )
