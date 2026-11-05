@@ -133,8 +133,6 @@ impl RootManifestFile {
             );
         }
 
-        // The checkpoint action holds the complete state only when it is at the snapshot version.
-        // Otherwise, replay the log's top-level actions.
         // TODO(#3642, #3643): this misses txns and domain metadata that only the checkpoint action
         // holds, as after log cleanup, until their replay reads the checkpoint action.
         let read_snapshot_version = version_as_i64(snapshot.version())?;
