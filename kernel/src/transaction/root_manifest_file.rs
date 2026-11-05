@@ -748,7 +748,7 @@ mod tests {
         let (protocol, metadata) = adaptive_metadata_protocol_and_metadata();
         let mut existing = CheckpointAction::new(
             1,
-            ContentRoot::new("metadata/root-v1.parquet".to_string(), 1024, -1),
+            ContentRoot::new("metadata/root-v1.parquet".to_string(), 1024, 1),
             protocol,
             metadata,
             vec![],
@@ -895,7 +895,7 @@ mod tests {
         let (protocol, metadata) = adaptive_metadata_protocol_and_metadata();
         let existing = CheckpointAction::new(
             1,
-            ContentRoot::new("metadata/root-v1.parquet".to_string(), 1024, -1),
+            ContentRoot::new("metadata/root-v1.parquet".to_string(), 1024, 1),
             protocol,
             metadata,
             vec![SetTransaction::new("app-1".to_string(), 5, None)],
