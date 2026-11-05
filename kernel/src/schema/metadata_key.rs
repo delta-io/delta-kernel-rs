@@ -129,10 +129,11 @@ impl Display for MetadataKey {
     }
 }
 
-const KNOWN_KEYS: &[&str] = &["comment", "EXISTS_DEFAULT"];
+// Spark column-comment and existence-default keys supplement ColumnMetadataKey.
+const EXTRA_KNOWN_KEYS: &[&str] = &["comment", "EXISTS_DEFAULT"];
 
 fn known_key(key: &str) -> Option<&'static str> {
-    KNOWN_KEYS
+    EXTRA_KNOWN_KEYS
         .iter()
         .copied()
         .find(|known| *known == key)
@@ -152,7 +153,7 @@ mod tests {
 
     #[rstest]
     #[case::column_metadata(ColumnMetadataKey::iter().map(<&'static str>::from).collect())]
-    #[case::other(KNOWN_KEYS.to_vec())]
+    #[case::other(EXTRA_KNOWN_KEYS.to_vec())]
     fn known_keys_share_storage_across_construction_and_clone(#[case] spellings: Vec<&str>) {
         for spelling in spellings {
             let borrowed = MetadataKey::from(spelling);
