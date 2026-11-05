@@ -1429,7 +1429,7 @@ async fn test_adds_and_removes_accumulate() {
 
 // === Indeterminate trips ===
 
-// Invalid file statistics, manual updates, or missing operations lose incremental safety.
+// Distinct ways a single commit can lose incremental safety.
 #[rstest]
 #[case::remove_no_size(vec![commit_info("WRITE", None), remove("orphan", None)])]
 #[case::add_with_unsafe_op(vec![commit_info("Manual Update", None), add("a", 100)])]
