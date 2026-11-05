@@ -597,23 +597,26 @@ fn scan_file_count(
 }
 
 /// A predicate on a `file` sub-field with min/max statistics skips data files, like one on any
-/// column. `checksum` and `inline` have only `nullCount`, and predicates on them skip nothing.
+/// column, with or without column mapping. `inline` has only `nullCount`, which `IS NULL`
+/// predicates use; predicates on `checksum` skip nothing.
+#[rstest]
 #[tokio::test(flavor = "multi_thread")]
-async fn test_predicate_on_file_sub_field_skips_files() -> Result<(), Box<dyn std::error::Error>> {
+async fn test_predicate_on_file_sub_field_skips_files(
+    #[values("none", "name")] cm_mode: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
     let (_tmp_dir, _table_path, engine, snapshot) =
-        write_table("none", DataType::file_type(), Arc::new(file_values())).await?;
+        write_table(cm_mode, DataType::file_type(), Arc::new(file_values())).await?;
     let mut snapshot = snapshot?;
     // A second data file, with one larger file at another `uri`.
     let files = file_array(&[Some((Some("s3://bucket/b.png"), None, Some(1000), None))]);
-    let (data_type, column) = file_column("top_level", files, None);
     let schema = StructType::try_new([
         StructField::nullable("id", DataType::INTEGER),
-        StructField::nullable("c", data_type),
+        StructField::nullable("c", DataType::file_type()),
     ])?;
     let schema: ArrowSchema = (&schema).try_into_arrow()?;
     let batch = RecordBatch::try_new(
         Arc::new(schema),
-        vec![Arc::new(Int32Array::from(vec![10])), column],
+        vec![Arc::new(Int32Array::from(vec![10])), Arc::new(files)],
     )?;
     snapshot = write_batch_to_table(&snapshot, engine.as_ref(), batch, HashMap::new()).await?;
 
@@ -640,6 +643,8 @@ async fn test_predicate_on_file_sub_field_skips_files() -> Result<(), Box<dyn st
             Pred::eq(column_expr!("c.content_type"), Scalar::from("text/plain")),
             0,
         ),
+        // Only the first file has an inline value.
+        (Pred::is_not_null(column_expr!("c.inline")), 1),
         // Both files have only null checksums, but `checksum` predicates are not used to skip.
         (Pred::is_not_null(column_expr!("c.checksum")), 2),
         (
@@ -701,6 +706,7 @@ async fn test_predicate_on_file_sub_field_uses_written_stats()
             0,
         ),
         (Pred::is_null(column_expr!("c.uri")), 0),
+        (Pred::is_not_null(column_expr!("c.inline")), 0),
         // `checksum` statistics say every value is null, but they are not used to skip.
         (Pred::is_not_null(column_expr!("c.checksum")), 2),
     ] {

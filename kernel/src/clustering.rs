@@ -102,15 +102,12 @@ pub(crate) fn validate_clustering_columns(
             )));
         }
 
-        let fields = schema.fields_of_path(col)?;
-        if is_null_count_only_file_sub_field(&fields) {
+        if is_null_count_only_file_sub_field(&schema.fields_of_path(col)?) {
             return Err(KernelError::generic(format!(
                 "Clustering column '{col}' is a `file` sub-field without min/max statistics"
             )));
         }
-        let field = fields
-            .last()
-            .ok_or_else(|| KernelError::generic(format!("Empty clustering column '{col}'")))?;
+        let field = schema.field_at(col)?;
         match field.data_type() {
             DataType::Primitive(ptype) if is_skipping_eligible_datatype(ptype) => {}
             dt => {
