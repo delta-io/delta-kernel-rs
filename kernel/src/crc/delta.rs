@@ -40,9 +40,9 @@ pub(crate) struct CrcDelta {
     /// Whether the file-stats portion of this delta can be applied incrementally. When `false`,
     /// [`Crc::apply`] transitions [`FileStatsState`] to `Indeterminate`. Producers set this to
     /// `false` when file-stat changes cannot be tracked safely or their policy excludes
-    /// incremental construction. Replay applies operation-specific file-action exclusions and
-    /// rejects file actions without an operation; transactions exclude custom operations even
-    /// without file actions.
+    /// incremental construction. Replay rejects missing operation names only when their commit
+    /// contains file actions; transactions exclude custom operations even without file
+    /// actions.
     pub(crate) is_incremental_safe: bool,
 }
 

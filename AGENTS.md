@@ -194,10 +194,9 @@ transactions. `data_change` is never inferred from staged files, including for e
 staged-file checks. `UpdateTableOperation::AlterTable` records schema-changing DDL without
 introducing a separate transaction type.
 
-Incremental CRC replay applies operation-specific add/remove exclusions in `FileStatsPolicy`
-(`kernel/src/crc/file_stats.rs`). Other named operations use normal net Add/Remove accounting;
-file actions without an operation and manual updates make statistics indeterminate. Custom
-transaction operations remain excluded from post-commit CRC construction. Represent update-table
+Incremental CRC replay uses operation-specific exclusions in `FileStatsPolicy`
+(`kernel/src/crc/file_stats.rs`). Excluded operation names must also be rejected for
+`UpdateTableOperation::Custom`. Represent update-table
 operations with typed variants so name reservation is automatic, and mirror them in the FFI.
 
 Writers configure transaction intent before `build()`, then call

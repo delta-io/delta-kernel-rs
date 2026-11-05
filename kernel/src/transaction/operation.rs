@@ -39,16 +39,17 @@ pub enum UpdateTableOperation {
     /// An operation name recorded verbatim in commit history and successful transaction metrics.
     ///
     /// The name must be nonempty and must not match a reserved operation name, such as `REORG` or
-    /// `ALTER TABLE`. Reserved names include all [typed operation names](UpdateTableOperation),
-    /// [`RESERVED_TABLE_OPERATION_NAMES`][ops], and names whose version checksum replay policy
-    /// excludes file actions, such as `LIQUID TAGGING` or `Deletion Vector Tombstones`. Name
-    /// matching is case-sensitive. Kernel does not infer built-in operation semantics from the
-    /// name, but all other transaction and protocol checks still apply. Custom operations do not
-    /// qualify for incremental version checksum construction.
+    /// `ALTER TABLE`. Reserved names include all [typed operation names](UpdateTableOperation)
+    /// and [`RESERVED_TABLE_OPERATION_NAMES`][ops]. Name matching is case-sensitive. Kernel does
+    /// not infer built-in operation semantics from the name, but all other transaction and
+    /// protocol checks still apply. Custom operations do not qualify for incremental version
+    /// checksum construction in post-commit snapshots.
+    ///
+    /// Names whose checksum replay policy excludes file actions are also reserved.
     ///
     /// Custom names are not guaranteed to remain valid across Kernel versions. Adding a typed
-    /// variant or checksum replay exclusion reserves its exact name. Callers must choose an
-    /// unreserved name or use the corresponding typed variant when one is available.
+    /// variant reserves its exact name. Callers using that custom name must select the typed
+    /// variant before building a transaction.
     ///
     /// [ops]: https://github.com/delta-io/delta-kernel-rs/blob/main/kernel/src/transaction/operation.rs
     #[strum(disabled)]

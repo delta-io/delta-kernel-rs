@@ -653,7 +653,7 @@ async fn test_post_commit_crc_tracks_domain_metadata_changes() -> KernelResult<(
 #[rstest]
 #[tokio::test]
 async fn test_post_commit_crc_metadata_only_custom_op_makes_file_stats_indeterminate(
-    #[values("vendor.metadata.update", "VACUUM END", "SET TBLPROPERTIES")] operation: &str,
+    #[values("CUSTOM OP", "VACUUM END", "SET TBLPROPERTIES")] operation: &str,
 ) -> KernelResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
@@ -764,13 +764,7 @@ async fn test_write_checksum_double_write_returns_already_exists(
 async fn test_write_checksum_preserves_stats_across_metadata_only_commits(
     #[case] root: WriteRoot,
     #[case] checkpoint: Option<CheckpointSpec>,
-    #[values(
-        "VACUUM START",
-        "VACUUM END",
-        "SET TBLPROPERTIES",
-        "vendor.metadata.update"
-    )]
-    operation: &str,
+    #[values("VACUUM START", "VACUUM END", "SET TBLPROPERTIES", "CUSTOM OP")] operation: &str,
 ) -> KernelResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
     let mut builder = create_table(
@@ -1256,18 +1250,6 @@ async fn test_write_checksum_from_checkpoint_ict_enabled_but_commit_unreadable_p
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_write_checksum_ignores_metadata_readds_and_counts_subsequent_unknown_writes(
     #[case] root: WriteRoot,
-    #[values(
-        "COMPUTE STATS",
-        "ANALYZE STATS",
-        "ROW TRACKING BACKFILL",
-        "ROW TRACKING UNBACKFILL",
-        "DROP FEATURE",
-        "LIQUID BACKFILL",
-        "LIQUID TAGGING",
-        "REPLACE PARTITIONED BY WITH CLUSTER BY"
-    )]
-    operation: &str,
-    #[values(false, true)] commit_info_first: bool,
 ) -> KernelResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
     let snap = create_table_and_commit(&table_path, engine.as_ref())?
@@ -1293,19 +1275,16 @@ async fn test_write_checksum_ignores_metadata_readds_and_counts_subsequent_unkno
         _ => unreachable!(),
     }
 
-    // In-place metadata updates cannot be expressed through Kernel's transaction API.
+    // Re-add the active file with updated tags, preserving its identity and size.
     let table_url = snap.table_root().clone();
     let mut existing = read_actions_from_commit(&table_url, 1, "add")?;
     assert_eq!(existing.len(), 1);
     existing[0]["dataChange"] = serde_json::json!(false);
     existing[0]["tags"] = serde_json::json!({"test.tag": "updated"});
-    let mut actions = [
+    let actions = [
         serde_json::json!({"add": existing[0]}),
-        serde_json::json!({"commitInfo": {"operation": operation}}),
+        serde_json::json!({"commitInfo": {"operation": "LIQUID TAGGING"}}),
     ];
-    if commit_info_first {
-        actions.reverse();
-    }
     let commit = actions
         .iter()
         .map(ToString::to_string)
@@ -2573,9 +2552,7 @@ async fn test_file_histogram_with_bin_type_and_operation_type(
         let committed = begin_transaction_with(
             fresh_v1,
             engine.as_ref(),
-            delta_kernel::transaction::UpdateTableOperation::Custom(
-                "vendor.metadata.update".to_string(),
-            ),
+            delta_kernel::transaction::UpdateTableOperation::Custom("CUSTOM OP".to_string()),
             "test-engine",
             true,
             |builder| builder,

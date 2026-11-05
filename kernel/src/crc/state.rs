@@ -22,10 +22,10 @@ use crate::{KernelError, KernelResult};
 ///
 /// # State transitions during `Crc::apply`
 ///
-/// | Current       | + safe delta  | + unsafe delta |
-/// |---------------|---------------|----------------|
-/// | Complete      | Complete      | Indeterminate  |
-/// | Indeterminate | Indeterminate | Indeterminate  |
+/// | Current       | + safe op     | + unsafe op or missing counted size |
+/// |---------------|---------------|------------------------------------|
+/// | Complete      | Complete      | Indeterminate                      |
+/// | Indeterminate | Indeterminate | Indeterminate                      |
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FileStatsState {
     /// File stats are known-correct absolute totals. The carried [`FileStats`]'s
