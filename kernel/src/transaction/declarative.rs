@@ -78,6 +78,7 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
+    use crate::Result;
     use crate::actions::deletion_vector::DeletionVectorDescriptor;
     use crate::committer::FileSystemCommitter;
     use crate::engine::sync::plan::SyncPlanExecutor;
@@ -92,7 +93,7 @@ mod tests {
         #[values(false, true)] add_files: bool,
         #[values(false, true)] remove_files: bool,
         #[values(false, true)] update_dvs: bool,
-    ) -> KernelResult<()> {
+    ) -> Result<()> {
         let (engine, snapshot, _tempdir) = load_test_table("table-without-dv-small")?;
         let mut txn = snapshot
             .update_table(UpdateTableOperation::Write, "test-engine", true)
@@ -125,7 +126,7 @@ mod tests {
     }
 
     #[test]
-    fn commit_returns_unsupported_error() -> KernelResult<()> {
+    fn commit_returns_unsupported_error() -> Result<()> {
         let (engine, snapshot, _tempdir) = load_test_table("table-without-dv-small")?;
         let txn = snapshot
             .update_table(UpdateTableOperation::Write, "test-engine", true)

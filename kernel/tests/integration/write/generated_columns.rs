@@ -117,7 +117,7 @@ fn generated_column_pairs(generated_columns: &[GeneratedColumn]) -> Vec<(&str, &
 #[tokio::test(flavor = "multi_thread")]
 async fn snapshot_and_transaction_return_stored_generated_columns_in_schema_order(
     #[values(false, true)] checkpoint: bool,
-) -> KernelResult<()> {
+) -> delta_kernel::Result<()> {
     let (_tmp, table_path, engine) = test_table_setup_mt()?;
     let table_url = write_table(
         &table_path,
@@ -151,7 +151,7 @@ async fn snapshot_and_transaction_return_stored_generated_columns_in_schema_orde
 async fn column_mapped_and_partitioned_tables_return_logical_names_and_require_ack_for_write_state(
     #[values(true, false)] column_mapping: bool,
     #[values(true, false)] partitioned: bool,
-) -> KernelResult<()> {
+) -> delta_kernel::Result<()> {
     let (_tmp, table_path, engine) = test_table_setup()?;
     let mut reader_features = vec![];
     let mut writer_features = GENERATED_COLUMNS_FEATURE.to_vec();
@@ -194,7 +194,7 @@ async fn write_state_and_commits_require_ack_only_on_tables_with_generated_colum
     #[values(true, false)] declares_generated_columns: bool,
     #[values(true, false)] acknowledge: bool,
     #[values(true, false)] discover_first: bool,
-) -> KernelResult<()> {
+) -> delta_kernel::Result<()> {
     let (_tmp, table_path, engine) = test_table_setup()?;
     let generated = if declares_generated_columns {
         EVENT_YEAR
@@ -254,7 +254,7 @@ async fn write_state_and_commits_require_ack_only_on_tables_with_generated_colum
 
 #[tokio::test]
 async fn expressions_without_feature_define_no_generated_columns_and_writes_need_no_ack()
--> KernelResult<()> {
+-> delta_kernel::Result<()> {
     let (_tmp, table_path, engine) = test_table_setup()?;
     let table_url = write_table(&table_path, &[], EVENT_YEAR).await?;
 
@@ -271,7 +271,7 @@ async fn expressions_without_feature_define_no_generated_columns_and_writes_need
 
 #[tokio::test]
 async fn protocol_upgrade_turns_existing_expressions_into_generated_columns_that_require_ack()
--> KernelResult<()> {
+-> delta_kernel::Result<()> {
     let (_tmp, table_path, engine) = test_table_setup()?;
     let table_url = write_table(&table_path, &[], EVENT_YEAR).await?;
     let before_upgrade = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
@@ -315,7 +315,7 @@ async fn schema_changes_fail_only_on_tables_with_generated_columns(
     #[case] data_change: bool,
     #[values(true, false)] lists_feature: bool,
     #[values(true, false)] has_expression: bool,
-) -> KernelResult<()> {
+) -> delta_kernel::Result<()> {
     let (_tmp, table_path, engine) = test_table_setup()?;
     let writer_features = if lists_feature {
         GENERATED_COLUMNS_FEATURE
@@ -353,7 +353,7 @@ async fn adding_a_column_with_a_generation_expression_fails(
     #[case] operation: UpdateTableOperation,
     #[case] data_change: bool,
     #[values(true, false)] nested: bool,
-) -> KernelResult<()> {
+) -> delta_kernel::Result<()> {
     let (_tmp, table_path, engine) = test_table_setup()?;
     // The table supports `generatedColumns` but has no generated columns, so other schema changes
     // pass.

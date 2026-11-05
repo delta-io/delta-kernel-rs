@@ -19,7 +19,7 @@ use crate::common::write_utils::simple_id_batch;
 
 #[cfg(feature = "checkpoint-protection")]
 #[tokio::test(flavor = "multi_thread")]
-async fn checkpoint_protection_with_feature_allows_writes() -> KernelResult<()> {
+async fn checkpoint_protection_with_feature_allows_writes() -> delta_kernel::Result<()> {
     let schema = get_simple_schema();
     let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
     let table_url = Url::from_directory_path(&table_path).unwrap();
@@ -45,7 +45,7 @@ async fn checkpoint_protection_with_feature_allows_writes() -> KernelResult<()> 
 
 #[cfg(not(feature = "checkpoint-protection"))]
 #[tokio::test(flavor = "multi_thread")]
-async fn checkpoint_protection_without_feature_blocks_writes() -> KernelResult<()> {
+async fn checkpoint_protection_without_feature_blocks_writes() -> delta_kernel::Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
     let table_url = Url::from_directory_path(&table_path).unwrap();
     create_checkpoint_protection_table(&table_url).await?;

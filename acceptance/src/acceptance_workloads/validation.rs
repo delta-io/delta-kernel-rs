@@ -17,7 +17,7 @@ use delta_kernel::arrow::compute::{cast, concat_batches};
 use delta_kernel::arrow::datatypes::{DataType, Field, Fields, Schema as ArrowSchema, SchemaRef};
 use delta_kernel::engine::arrow_conversion::TryFromKernel;
 use delta_kernel::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-use delta_kernel::{KernelError as Error, KernelResult};
+use delta_kernel::{KernelError, KernelResult};
 use delta_kernel_workloads::models::{ExpectedError, ReadExpected, SnapshotExpected, TimeTravel};
 use itertools::Itertools;
 use serde_json::Value;
@@ -86,7 +86,9 @@ fn align_array(array: &ArrayRef, data_type: &DataType) -> KernelResult<ArrayRef>
         (array.as_any().downcast_ref::<ListArray>(), data_type)
     {
         let DataType::List(source_field) = source.data_type() else {
-            return Err(Error::internal_error("ListArray has a non-list data type"));
+            return Err(KernelError::internal_error(
+                "ListArray has a non-list data type",
+            ));
         };
         require_same_nullability("list element", source_field, field)?;
         let values = align_array(source.values(), field.data_type())?;
@@ -101,7 +103,9 @@ fn align_array(array: &ArrayRef, data_type: &DataType) -> KernelResult<ArrayRef>
         (array.as_any().downcast_ref::<MapArray>(), data_type)
     {
         let DataType::Map(source_field, source_ordered) = source.data_type() else {
-            return Err(Error::internal_error("MapArray has a non-map data type"));
+            return Err(KernelError::internal_error(
+                "MapArray has a non-map data type",
+            ));
         };
         require_map_compatibility(*source_ordered, *ordered, source_field, field)?;
         let entries = align_array(
@@ -111,7 +115,7 @@ fn align_array(array: &ArrayRef, data_type: &DataType) -> KernelResult<ArrayRef>
         let entries = entries
             .as_any()
             .downcast_ref::<StructArray>()
-            .ok_or_else(|| Error::generic("Aligned map entries are not a struct"))?
+            .ok_or_else(|| KernelError::generic("Aligned map entries are not a struct"))?
             .clone();
         return Ok(Arc::new(MapArray::try_new(
             field.clone(),
@@ -132,15 +136,15 @@ fn align_array(array: &ArrayRef, data_type: &DataType) -> KernelResult<ArrayRef>
         let source = array
             .as_any()
             .downcast_ref::<TimestampNanosecondArray>()
-            .ok_or_else(|| Error::internal_error("Timestamp array has an unexpected type"))?;
+            .ok_or_else(|| KernelError::internal_error("Timestamp array has an unexpected type"))?;
         if source.iter().flatten().any(|value| value % 1_000 != 0) {
-            return Err(Error::generic(
+            return Err(KernelError::generic(
                 "Expected Spark timestamp has sub-microsecond precision",
             ));
         }
         return Ok(cast(array, data_type)?);
     }
-    Err(Error::generic(format!(
+    Err(KernelError::generic(format!(
         "Expected data type {:?} does not match result type {data_type:?}",
         array.data_type()
     )))
@@ -157,7 +161,7 @@ fn require_matching_field_order(source: &Fields, target: &Fields) -> KernelResul
         .map(|field| field.name().clone())
         .collect_vec();
     if source_names != target_names {
-        return Err(Error::generic(format!(
+        return Err(KernelError::generic(format!(
             "Expected field order {:?} does not match result field order {:?}",
             source_names, target_names
         )));
@@ -166,7 +170,7 @@ fn require_matching_field_order(source: &Fields, target: &Fields) -> KernelResul
         if let Some((_, source_field)) = source.find(target_field.name())
             && source_field.is_nullable() != target_field.is_nullable()
         {
-            return Err(Error::generic(format!(
+            return Err(KernelError::generic(format!(
                 "Expected nullability for field '{}' does not match the result",
                 target_field.name()
             )));
@@ -179,7 +183,7 @@ fn missing_void_array(field: &Field, len: usize) -> KernelResult<ArrayRef> {
     if field.data_type() == &DataType::Null {
         Ok(new_null_array(field.data_type(), len))
     } else {
-        Err(Error::generic(format!(
+        Err(KernelError::generic(format!(
             "Expected data is missing non-void field '{}'",
             field.name()
         )))
@@ -188,7 +192,7 @@ fn missing_void_array(field: &Field, len: usize) -> KernelResult<ArrayRef> {
 
 fn require_same_nullability(context: &str, source: &Field, target: &Field) -> KernelResult<()> {
     if source.is_nullable() != target.is_nullable() {
-        return Err(Error::generic(format!(
+        return Err(KernelError::generic(format!(
             "Expected {context} nullability does not match the result"
         )));
     }
@@ -202,7 +206,7 @@ fn require_map_compatibility(
     target_field: &Field,
 ) -> KernelResult<()> {
     if source_ordered != target_ordered {
-        return Err(Error::generic(
+        return Err(KernelError::generic(
             "Expected map ordering does not match the result",
         ));
     }
@@ -242,95 +246,106 @@ fn source_is_not_found(error: &(dyn StdError + 'static)) -> bool {
     error.source().is_some_and(source_is_not_found)
 }
 
-fn is_file_not_found_error(error: &Error) -> bool {
+fn is_file_not_found_error(error: &KernelError) -> bool {
     match error {
-        Error::FileNotFound(_) => true,
-        Error::ObjectStore(error) => source_is_not_found(error),
-        Error::Arrow(delta_kernel::arrow::error::ArrowError::ExternalError(source)) => {
+        KernelError::FileNotFound(_) => true,
+        KernelError::ObjectStore(error) => source_is_not_found(error),
+        KernelError::Arrow(delta_kernel::arrow::error::ArrowError::ExternalError(source)) => {
             source_is_not_found(source.as_ref())
         }
-        Error::Parquet(delta_kernel::parquet::errors::ParquetError::External(source)) => {
+        KernelError::Parquet(delta_kernel::parquet::errors::ParquetError::External(source)) => {
             source_is_not_found(source.as_ref())
         }
         _ => false,
     }
 }
 
-fn expected_error_matches(expected: &ExpectedError, actual: &Error) -> bool {
+fn expected_error_matches(expected: &ExpectedError, actual: &KernelError) -> bool {
     let actual = actual.without_backtrace();
     match (expected.error_code.as_str(), actual) {
         (
             "DELTA_STATE_RECOVER_ERROR",
-            Error::MissingMetadata | Error::MissingProtocol | Error::MissingMetadataAndProtocol,
+            KernelError::MissingMetadata
+            | KernelError::MissingProtocol
+            | KernelError::MissingMetadataAndProtocol,
         ) => true,
-        ("DELTA_STATE_RECOVER_ERROR", Error::InvalidCheckpoint(message)) => {
+        ("DELTA_STATE_RECOVER_ERROR", KernelError::InvalidCheckpoint(message)) => {
             message == "Had a _last_checkpoint hint but didn't find any checkpoints"
         }
         (
             "DELTA_TABLE_NOT_FOUND"
             | "DELTA_MISSING_TRANSACTION_LOG"
             | "DELTA_TRUNCATED_TRANSACTION_LOG",
-            Error::EmptyLog | Error::MissingVersion(_) | Error::FileNotFound(_),
+            KernelError::EmptyLog | KernelError::MissingVersion(_) | KernelError::FileNotFound(_),
         ) => true,
-        ("DELTA_LOG_FILE_NOT_FOUND", Error::FileNotFound(_)) => true,
+        ("DELTA_LOG_FILE_NOT_FOUND", KernelError::FileNotFound(_)) => true,
         (
             "DELTA_LOG_FILE_NOT_FOUND" | "DELTA_TABLE_RESTORE_VERSION_INVALID",
-            Error::Generic(message),
+            KernelError::Generic(message),
         ) => message == "Only non-negative snapshot versions are supported",
         (
             "DELTA_VERSIONS_NOT_CONTIGUOUS" | "DELTA_VERSIONS_NOT_CONTIGUOUS.GENERIC",
-            Error::LogTailVersionsNotContiguous { .. } | Error::MissingVersion(_),
+            KernelError::LogTailVersionsNotContiguous { .. } | KernelError::MissingVersion(_),
         ) => true,
-        ("ColumnMappingUnsupportedException", Error::InvalidColumnMappingMode(_)) => true,
-        ("COLUMN_ALREADY_EXISTS", Error::Schema(message)) => {
+        ("ColumnMappingUnsupportedException", KernelError::InvalidColumnMappingMode(_)) => true,
+        ("COLUMN_ALREADY_EXISTS", KernelError::Schema(message)) => {
             message.starts_with("Duplicate field name (case-insensitive):")
         }
-        ("COLUMN_ALREADY_EXISTS", Error::MalformedJson(error)) => error
+        ("COLUMN_ALREADY_EXISTS", KernelError::MalformedJson(error)) => error
             .to_string()
             .starts_with("Schema error: Duplicate field name (case-insensitive):"),
-        ("UNRESOLVED_COLUMN", Error::Generic(message)) => {
+        ("UNRESOLVED_COLUMN", KernelError::Generic(message)) => {
             message.starts_with("Cannot determine types for: Identifier(")
         }
-        ("FIELD_NOT_FOUND", Error::Generic(message)) => {
+        ("FIELD_NOT_FOUND", KernelError::Generic(message)) => {
             message.starts_with("Cannot determine types for: CompoundIdentifier(")
         }
-        ("DELTA_VERSION_NOT_FOUND", Error::MissingVersion(_) | Error::EmptyLog) => true,
-        ("DELTA_INVALID_PROTOCOL_VERSION", Error::Unsupported(message)) => {
+        ("DELTA_VERSION_NOT_FOUND", KernelError::MissingVersion(_) | KernelError::EmptyLog) => true,
+        ("DELTA_INVALID_PROTOCOL_VERSION", KernelError::Unsupported(message)) => {
             message.starts_with("Unsupported minimum reader version ")
         }
-        ("DELTA_INVALID_PROTOCOL_VERSION", Error::InvalidProtocol(message)) => {
+        ("DELTA_INVALID_PROTOCOL_VERSION", KernelError::InvalidProtocol(message)) => {
             message.contains("min_reader_version")
         }
-        ("DELTA_UNSUPPORTED_READER_VERSION", Error::InvalidProtocol(message)) => {
+        ("DELTA_UNSUPPORTED_READER_VERSION", KernelError::InvalidProtocol(message)) => {
             message == "Writer features must be present when minimum writer version = 7"
         }
-        ("DELTA_UNSUPPORTED_FEATURES_FOR_READ", Error::Unsupported(message)) => {
+        ("DELTA_UNSUPPORTED_FEATURES_FOR_READ", KernelError::Unsupported(message)) => {
             message.contains(" is not supported")
         }
-        ("DELTA_FEATURES_PROTOCOL_METADATA_MISMATCH", Error::InvalidProtocol(message)) => message
-            .starts_with(
-                "Reader features must contain only ReaderWriter features that are also listed in writer features",
-            ),
-        ("DELTA_FEATURES_PROTOCOL_METADATA_MISMATCH", Error::Unsupported(message)) => {
+        (
+            "DELTA_FEATURES_PROTOCOL_METADATA_MISMATCH",
+            KernelError::InvalidProtocol(message),
+        ) => message.starts_with(
+            "Reader features must contain only ReaderWriter features that are also listed in writer features",
+        ),
+        ("DELTA_FEATURES_PROTOCOL_METADATA_MISMATCH", KernelError::Unsupported(message)) => {
             message.contains(" requires ")
         }
         (
             "DELTA_TIMESTAMP_EARLIER_THAN_COMMIT_RETENTION"
             | "DELTA_TIMESTAMP_GREATER_THAN_COMMIT",
-            Error::LogHistory(_),
+            KernelError::LogHistory(_),
         ) => true,
         ("FAILED_READ_FILE.DBR_FILE_NOT_EXIST", error) => is_file_not_found_error(error),
         ("FAILED_READ_FILE.NO_HINT", error) if is_file_not_found_error(error) => true,
-        ("FAILED_READ_FILE.NO_HINT", Error::DeletionVector(_)) => true,
-        ("FAILED_READ_FILE.NO_HINT", Error::InternalError(message)) => {
+        ("FAILED_READ_FILE.NO_HINT", KernelError::DeletionVector(_)) => true,
+        ("FAILED_READ_FILE.NO_HINT", KernelError::InternalError(message)) => {
             message.starts_with("Unsupported deletion vector format option:")
         }
         _ => false,
     }
 }
 
-fn validate_expected_error(actual: &Error, expected: &ExpectedError) -> KernelResult<(), String> {
-    if expected_error_matches(expected, actual) {
+fn validate_expected_error(
+    actual: &delta_kernel::Error,
+    expected: &ExpectedError,
+) -> KernelResult<(), String> {
+    let matches = match actual {
+        delta_kernel::Error::Kernel(kernel) => expected_error_matches(expected, kernel),
+        _ => false,
+    };
+    if matches {
         debug!(
             "Got expected error '{}' with message: {:?}\nKernel error: {}",
             expected.error_code, expected.error_message, actual
@@ -404,7 +419,7 @@ fn read_expected_data(expected_dir: &Path) -> KernelResult<RecordBatch, String> 
 
 /// Validate read results against expected outcome.
 pub fn validate_read_result(
-    result: KernelResult<ReadResult>,
+    result: delta_kernel::Result<ReadResult>,
     expected_dir: &Path,
     expected: &ReadExpected,
 ) -> KernelResult<(), String> {
@@ -448,7 +463,7 @@ pub fn validate_read_result(
 
 /// Validate snapshot result against expected outcome.
 pub fn validate_snapshot(
-    result: KernelResult<SnapshotResult>,
+    result: delta_kernel::Result<SnapshotResult>,
     time_travel: Option<&TimeTravel>,
     expected: &SnapshotExpected,
 ) -> KernelResult<(), String> {
@@ -526,25 +541,27 @@ mod tests {
     #[test]
     fn expected_error_rejects_unrelated_kernel_error() {
         let expected = expected_error("DELTA_STATE_RECOVER_ERROR");
-        assert!(validate_expected_error(&Error::MissingMetadata, &expected).is_ok());
+        assert!(validate_expected_error(&KernelError::MissingMetadata.into(), &expected).is_ok());
         assert!(
             validate_expected_error(
-                &Error::InvalidCheckpoint(
+                &KernelError::InvalidCheckpoint(
                     "Had a _last_checkpoint hint but didn't find any checkpoints".to_string()
-                ),
+                )
+                .into(),
                 &expected
             )
             .is_ok()
         );
 
-        let error = validate_expected_error(&Error::FileNotFound("x".into()), &expected)
-            .expect_err("wrong error category must fail");
+        let error =
+            validate_expected_error(&KernelError::FileNotFound("x".into()).into(), &expected)
+                .expect_err("wrong error category must fail");
         assert!(error.contains("Expected error category 'DELTA_STATE_RECOVER_ERROR'"));
     }
 
     #[test]
     fn protocol_error_categories_do_not_overlap() {
-        let invalid_version = Error::unsupported("Unsupported minimum reader version 4");
+        let invalid_version = KernelError::unsupported("Unsupported minimum reader version 4");
         assert!(expected_error_matches(
             &expected_error("DELTA_INVALID_PROTOCOL_VERSION"),
             &invalid_version
@@ -554,7 +571,7 @@ mod tests {
             &invalid_version
         ));
 
-        let unsupported_feature = Error::unsupported("Feature 'future' is not supported");
+        let unsupported_feature = KernelError::unsupported("Feature 'future' is not supported");
         assert!(expected_error_matches(
             &expected_error("DELTA_UNSUPPORTED_FEATURES_FOR_READ"),
             &unsupported_feature
@@ -564,7 +581,7 @@ mod tests {
             &unsupported_feature
         ));
 
-        let feature_mismatch = Error::invalid_protocol(
+        let feature_mismatch = KernelError::invalid_protocol(
             "Reader features must contain only ReaderWriter features that are also listed in writer features",
         );
         assert!(expected_error_matches(
@@ -576,7 +593,7 @@ mod tests {
             &feature_mismatch
         ));
 
-        let missing_writer_features = Error::invalid_protocol(
+        let missing_writer_features = KernelError::invalid_protocol(
             "Writer features must be present when minimum writer version = 7",
         );
         assert!(expected_error_matches(
@@ -593,7 +610,7 @@ mod tests {
     fn versions_not_contiguous_accepts_missing_version() {
         assert!(expected_error_matches(
             &expected_error("DELTA_VERSIONS_NOT_CONTIGUOUS"),
-            &Error::MissingVersion(2)
+            &KernelError::MissingVersion(2)
         ));
     }
 
@@ -604,7 +621,7 @@ mod tests {
         );
         assert!(expected_error_matches(
             &expected_error("COLUMN_ALREADY_EXISTS"),
-            &Error::MalformedJson(malformed_json)
+            &KernelError::MalformedJson(malformed_json)
         ));
     }
 
@@ -612,7 +629,9 @@ mod tests {
     fn unresolved_column_accepts_unknown_predicate_identifier() {
         assert!(expected_error_matches(
             &expected_error("UNRESOLVED_COLUMN"),
-            &Error::generic("Cannot determine types for: Identifier(nonExistentCol) and Value(1)")
+            &KernelError::generic(
+                "Cannot determine types for: Identifier(nonExistentCol) and Value(1)"
+            )
         ));
     }
 
@@ -620,15 +639,15 @@ mod tests {
     fn version_errors_match_kernel_version_failures() {
         assert!(expected_error_matches(
             &expected_error("DELTA_VERSION_NOT_FOUND"),
-            &Error::MissingVersion(2)
+            &KernelError::MissingVersion(2)
         ));
         assert!(expected_error_matches(
             &expected_error("DELTA_VERSION_NOT_FOUND"),
-            &Error::EmptyLog
+            &KernelError::EmptyLog
         ));
         assert!(expected_error_matches(
             &expected_error("DELTA_TABLE_RESTORE_VERSION_INVALID"),
-            &Error::generic("Only non-negative snapshot versions are supported")
+            &KernelError::generic("Only non-negative snapshot versions are supported")
         ));
     }
 
@@ -637,11 +656,11 @@ mod tests {
         let expected = expected_error("FAILED_READ_FILE.DBR_FILE_NOT_EXIST");
         assert!(expected_error_matches(
             &expected,
-            &Error::FileNotFound("missing.parquet".to_string())
+            &KernelError::FileNotFound("missing.parquet".to_string())
         ));
         assert!(!expected_error_matches(
             &expected,
-            &Error::ObjectStore(delta_kernel::object_store::Error::Generic {
+            &KernelError::ObjectStore(delta_kernel::object_store::Error::Generic {
                 store: "test",
                 source: Box::new(std::io::Error::new(
                     std::io::ErrorKind::PermissionDenied,
@@ -655,11 +674,11 @@ mod tests {
     fn expected_categories_reject_harness_limitations() {
         assert!(!expected_error_matches(
             &expected_error("DELTA_TIMESTAMP_GREATER_THAN_COMMIT"),
-            &Error::generic("Timestamp-based time travel is not yet supported")
+            &KernelError::generic("Timestamp-based time travel is not yet supported")
         ));
         assert!(!expected_error_matches(
             &expected_error("DELTA_INVALID_PROTOCOL_VERSION"),
-            &Error::Arrow(delta_kernel::arrow::error::ArrowError::JsonError(
+            &KernelError::Arrow(delta_kernel::arrow::error::ArrowError::JsonError(
                 "metadata decode failed".to_string()
             ))
         ));

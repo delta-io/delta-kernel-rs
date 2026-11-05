@@ -73,7 +73,7 @@ fn test_create_table_ict(
     #[case] properties: &[(&str, &str)],
     #[case] expect_ict_feature_supported: bool,
     #[case] expect_ict_enabled: bool,
-) -> KernelResult<()> {
+) -> delta_kernel::Result<()> {
     let test_start_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
