@@ -347,9 +347,8 @@ struct CrcReplayAccumulator {
 
     // Aggregate adds and removes separately until commitInfo is known. It may follow file
     // actions, including in a later batch. Memory use depends on histogram bins, not file count.
-    current_commit_file_stats: FileStatsDelta,
-    current_commit_add_histogram: Option<FileSizeHistogram>,
-    current_commit_remove_histogram: Option<FileSizeHistogram>,
+    current_commit_adds: FileStatsDelta,
+    current_commit_removes: FileStatsDelta,
     current_commit_adds_valid: bool,
     current_commit_removes_valid: bool,
 
@@ -361,9 +360,14 @@ struct CrcReplayAccumulator {
 impl CrcReplayAccumulator {
     fn new(seed_histogram: Option<FileSizeHistogram>) -> Self {
         Self {
-            current_commit_file_stats: FileStatsDelta::default(),
-            current_commit_add_histogram: seed_histogram.clone(),
-            current_commit_remove_histogram: seed_histogram.clone(),
+            current_commit_adds: FileStatsDelta {
+                net_histogram: seed_histogram.clone(),
+                ..Default::default()
+            },
+            current_commit_removes: FileStatsDelta {
+                net_histogram: seed_histogram.clone(),
+                ..Default::default()
+            },
             current_commit_adds_valid: true,
             current_commit_removes_valid: true,
             delta: CrcDelta {
@@ -399,7 +403,6 @@ impl CrcReplayAccumulator {
         if !self.delta.is_incremental_safe {
             return;
         }
-        let stats = &self.current_commit_file_stats;
         let policy = match self.current_commit_operation.as_deref() {
             Some(operation) => FileStatsPolicy::for_operation(operation),
             // Checkpoints have reconciled adds and no commitInfo. Metadata-only commits also
@@ -424,38 +427,28 @@ impl CrcReplayAccumulator {
             self.delta.is_incremental_safe = false;
         } else {
             if include_adds {
-                self.delta.file_stats.gross_add_files += stats.gross_add_files;
-                self.delta.file_stats.gross_add_bytes += stats.gross_add_bytes;
-                if let (Some(target), Some(source)) = (
-                    &mut self.delta.file_stats.net_histogram,
-                    &self.current_commit_add_histogram,
-                ) {
-                    target.accumulate_signed(source, 1);
-                }
+                self.delta.file_stats.accumulate(&self.current_commit_adds);
             }
             if include_removes {
-                self.delta.file_stats.gross_remove_files += stats.gross_remove_files;
-                self.delta.file_stats.gross_remove_bytes += stats.gross_remove_bytes;
-                if let (Some(target), Some(source)) = (
-                    &mut self.delta.file_stats.net_histogram,
-                    &self.current_commit_remove_histogram,
-                ) {
-                    target.accumulate_signed(source, -1);
-                }
+                self.delta
+                    .file_stats
+                    .accumulate(&self.current_commit_removes);
             }
         }
-        self.current_commit_file_stats = FileStatsDelta::default();
         self.current_commit_adds_valid = true;
         self.current_commit_removes_valid = true;
-        for histogram in [
-            &mut self.current_commit_add_histogram,
-            &mut self.current_commit_remove_histogram,
-        ]
-        .into_iter()
-        .flatten()
-        {
-            histogram.file_counts.fill(0);
-            histogram.total_bytes.fill(0);
+        for fs in [
+            &mut self.current_commit_adds,
+            &mut self.current_commit_removes,
+        ] {
+            if let Some(histogram) = fs.net_histogram.as_mut() {
+                histogram.file_counts.fill(0);
+                histogram.total_bytes.fill(0);
+            }
+            *fs = FileStatsDelta {
+                net_histogram: fs.net_histogram.take(),
+                ..Default::default()
+            };
         }
         self.current_commit_saw_file_action = false;
         self.current_commit_operation = None;
@@ -499,10 +492,10 @@ impl CrcReplayAccumulator {
             self.current_commit_adds_valid = false;
             return Ok(());
         }
-        let fs = &mut self.current_commit_file_stats;
+        let fs = &mut self.current_commit_adds;
         fs.gross_add_files += 1;
         fs.gross_add_bytes += size_to_u64(size)?;
-        if let Some(hist) = self.current_commit_add_histogram.as_mut() {
+        if let Some(hist) = fs.net_histogram.as_mut() {
             hist.insert(size)?;
         }
         Ok(())
@@ -522,11 +515,11 @@ impl CrcReplayAccumulator {
                 self.current_commit_removes_valid = false;
             }
             Some(s) => {
-                let fs = &mut self.current_commit_file_stats;
+                let fs = &mut self.current_commit_removes;
                 fs.gross_remove_files += 1;
                 fs.gross_remove_bytes += size_to_u64(s)?;
-                if let Some(hist) = self.current_commit_remove_histogram.as_mut() {
-                    hist.insert(s)?;
+                if let Some(hist) = fs.net_histogram.as_mut() {
+                    hist.remove(s)?;
                 }
             }
             None => {

@@ -147,6 +147,20 @@ pub(crate) fn is_incremental_safe_operation(operation: &str) -> bool {
 }
 
 impl FileStatsDelta {
+    /// Adds another delta's gross totals and net histogram, using matching bin boundaries.
+    /// If either delta has no histogram, the combined delta has none.
+    pub(crate) fn accumulate(&mut self, source: &Self) {
+        self.gross_add_files += source.gross_add_files;
+        self.gross_remove_files += source.gross_remove_files;
+        self.gross_add_bytes += source.gross_add_bytes;
+        self.gross_remove_bytes += source.gross_remove_bytes;
+        if let (Some(target), Some(source)) = (&mut self.net_histogram, &source.net_histogram) {
+            target.accumulate(source);
+        } else {
+            self.net_histogram = None;
+        }
+    }
+
     /// Net change in file count (added minus removed).
     pub(crate) fn net_files(&self) -> i64 {
         self.gross_add_files as i64 - self.gross_remove_files as i64
