@@ -63,8 +63,8 @@ generation expression, verbatim from the table, through `raw_sql()`.
 # extern crate delta_kernel_default_engine;
 # use delta_kernel_default_engine::DefaultEngine;
 # use delta_kernel_default_engine::storage::store_from_url;
-# use delta_kernel::{KernelResult, Snapshot};
-# fn main() -> KernelResult<()> {
+# use delta_kernel::{Result, Snapshot};
+# fn main() -> Result<()> {
 # let url = delta_kernel::try_parse_uri("/tmp/people")?;
 # let engine = DefaultEngine::builder(store_from_url(&url)?).build();
 
@@ -109,7 +109,7 @@ the column, the example compares the supplied values with the computed ones.
 # use delta_kernel::committer::FileSystemCommitter;
 # use delta_kernel::engine::arrow_data::ArrowEngineData;
 # use delta_kernel::transaction::{CommitResult, UpdateTableOperation};
-# use delta_kernel::{KernelError, KernelResult, SnapshotRef};
+# use delta_kernel::{Error, KernelError, KernelResult, Result, SnapshotRef};
 # use delta_kernel_default_engine::executor::TaskExecutor;
 # use delta_kernel_default_engine::DefaultEngine;
 # type CompiledExpression = Box<dyn Fn(&RecordBatch) -> KernelResult<ArrayRef>>;
@@ -125,7 +125,7 @@ async fn append_with_generated_columns(
     snapshot: SnapshotRef,
     batches: impl IntoIterator<Item = KernelResult<RecordBatch>>,
     compile_generation: impl Fn(&str) -> KernelResult<CompiledExpression>,
-) -> KernelResult<CommitResult> {
+) -> Result<CommitResult> {
     // 1. Start the transaction.
     let mut txn = snapshot
         .update_table(UpdateTableOperation::Write, "my-app/1.0", /* data_change */ true)
@@ -155,11 +155,11 @@ async fn append_with_generated_columns(
                 Some(supplied) => {
                     // `not_distinct` is null-safe equality, so a `NULL` value matches a `NULL`
                     // expression result.
-                    let matched = not_distinct(supplied, &generated)?;
+                    let matched = not_distinct(supplied, &generated).map_err(KernelError::from)?;
                     if matched.true_count() != batch.num_rows() {
-                        return Err(KernelError::generic(format!(
+                        return Err(Error::Kernel(KernelError::generic(format!(
                             "generated column {name} doesn't match its expression"
-                        )));
+                        ))));
                     }
                 }
                 None => batch = append_column(batch, name, generated)?,
