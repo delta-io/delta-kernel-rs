@@ -121,6 +121,8 @@ pub(crate) const TIGHT_BOUNDS: &str = "tightBounds";
 /// down to milliseconds; when `tightStats` is present (`true` or `false`), timestamp bounds are
 /// written at microsecond precision instead. Only defined for adaptiveMetadata tables, where it
 /// defaults to `false` when absent.
+///
+/// See the protocol RFC: <https://github.com/delta-io/delta/pull/7883>.
 #[internal_api]
 pub(crate) const TIGHT_STATS: &str = "tightStats";
 

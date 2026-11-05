@@ -794,7 +794,7 @@ pub(crate) fn ensure_standalone_checkpoint_supported(
 ) -> KernelResult<()> {
     // TODO(#3683): support standalone checkpoints for adaptiveMetadata tables.
     #[cfg(feature = "adaptive-metadata-in-dev")]
-    if table_configuration.is_feature_enabled(&TableFeature::AdaptiveMetadataPreview) {
+    if table_configuration.is_adaptive_metadata_enabled() {
         return Err(KernelError::unsupported(
             "Standalone checkpoints are not yet supported for tables with adaptiveMetadata enabled",
         ));

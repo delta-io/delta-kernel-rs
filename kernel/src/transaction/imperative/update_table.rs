@@ -720,6 +720,10 @@ mod tests {
         r#"{"numRecords":10,"tightBounds":true,"tightStats":false}"#,
         Some(false)
     )]
+    #[case::bounds_wide_stats_tight(
+        r#"{"numRecords":10,"tightBounds":false,"tightStats":true}"#,
+        Some(false)
+    )]
     fn dv_match_visitor_widens_tightness_flags(
         #[case] stats: &str,
         #[case] expected_tight_stats: Option<bool>,
