@@ -195,8 +195,8 @@ impl Validation for NoTightStats {
         if let Some(tight_stats) = getters[1].get_bool(row, TIGHT_STATS)? {
             let path: &str = getters[0].get(row, "path")?;
             return Err(KernelError::unsupported(format!(
-                "AddFile for '{path}' sets stats.{TIGHT_STATS} to {tight_stats}; writing \
-                 {TIGHT_STATS} is not supported, so it must be null"
+                "AddFile for '{path}' sets stats.{TIGHT_STATS} to {tight_stats}, but commit \
+                 writes timestamp stats at millisecond precision, so {TIGHT_STATS} must be null"
             )));
         }
         Ok(())
