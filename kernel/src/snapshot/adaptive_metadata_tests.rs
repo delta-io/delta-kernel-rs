@@ -230,6 +230,7 @@ fn domain_metadata_comes_from_checkpoint_action_and_later_commits(
     ] {
         assert_eq!(
             snapshot
+                .reader()
                 .get_domain_metadata(domain, &engine)
                 .unwrap()
                 .as_deref(),
@@ -237,8 +238,9 @@ fn domain_metadata_comes_from_checkpoint_action_and_later_commits(
             "domain {domain}"
         );
     }
-    let all = snapshot
-        .get_domain_metadatas_internal(&engine, None)
-        .unwrap();
-    assert_eq!(all.keys().sorted().collect_vec(), ["a", "d"]);
+    let all = snapshot.reader().get_all_domain_metadata(&engine).unwrap();
+    assert_eq!(
+        all.iter().map(|dm| dm.domain()).sorted().collect_vec(),
+        ["a", "d"]
+    );
 }
