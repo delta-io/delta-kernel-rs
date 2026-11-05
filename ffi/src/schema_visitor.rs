@@ -25,8 +25,8 @@ use std::collections::HashMap;
 use std::ffi::c_void;
 
 use delta_kernel::schema::{
-    ArrayType, DataType, DecimalType, IntervalYearToMonthType, MapType, MetadataValue,
-    PrimitiveType, StructField, StructType,
+    ArrayType, DataType, DecimalType, MapType, MetadataValue, PrimitiveType, StructField,
+    StructType,
 };
 #[cfg(feature = "geo-type-in-dev")]
 use delta_kernel::schema::{EdgeInterpolationAlgorithm, GeographyType, GeometryType};
@@ -34,6 +34,7 @@ use delta_kernel::{KernelError, KernelResult};
 use tracing::warn;
 
 use crate::delta_types::FfiNullableStringMap;
+use crate::interval::FfiIntervalYearToMonthType;
 use crate::scan::{CMetadataMap, CMetadataValueKind};
 use crate::{
     ErrorAllocators, ExternResult, IntoExternResult, KernelStringSlice, ReferenceSet,
@@ -503,7 +504,7 @@ pub unsafe extern "C" fn visit_field_timestamp_ntz(
     unsafe { result.into_extern_result(&*error_allocators) }
 }
 
-/// Visit an interval year-month field. Values store signed month counts.
+/// Visit an interval year-month field with its exact qualifier.
 ///
 /// # Safety
 ///
@@ -519,17 +520,20 @@ pub unsafe extern "C" fn visit_field_interval_year_month(
     name: KernelStringSlice,
     nullable: bool,
     metadata: *const EngineMetadata,
+    kind: u8,
     error_allocators: *const ErrorAllocators,
 ) -> ExternResult<usize> {
     let name_str = unsafe { TryFromStringSlice::try_from_slice(&name) };
-    let metadata = visit_engine_metadata(unsafe { metadata.as_ref() });
-    let result = visit_field_primitive_impl(
-        state,
-        name_str,
-        PrimitiveType::interval_year_month(IntervalYearToMonthType::IntervalYearToMonth),
-        nullable,
-        metadata,
-    );
+    let result = FfiIntervalYearToMonthType::try_from(kind).and_then(|kind| {
+        let metadata = visit_engine_metadata(unsafe { metadata.as_ref() });
+        visit_field_primitive_impl(
+            state,
+            name_str,
+            PrimitiveType::IntervalYearMonth(kind.into()),
+            nullable,
+            metadata,
+        )
+    });
     unsafe { result.into_extern_result(&*error_allocators) }
 }
 
@@ -1049,7 +1053,7 @@ mod tests {
     use std::ffi::c_void;
     use std::ptr::{NonNull, null};
 
-    use delta_kernel::schema::{DataType, MetadataValue, PrimitiveType};
+    use delta_kernel::schema::{DataType, IntervalYearToMonthType, MetadataValue, PrimitiveType};
     use rstest::rstest;
 
     use super::*;
@@ -1058,6 +1062,7 @@ mod tests {
         TEST_ERROR_ALLOCATORS, assert_extern_result_error_contains,
         assert_extern_result_error_with_message, ok_or_panic,
     };
+    use crate::interval::FfiIntervalYearToMonthType;
     use crate::scan::visit_metadata_map;
     use crate::{KernelStringSlice, NullableCvoid};
 
@@ -1645,6 +1650,19 @@ mod tests {
     }
 
     macro_rules! visit_field {
+        (interval_year_month, $state:ident, $name:expr, $nullable:tt, $metadata:expr) => {{
+            ok_or_panic(unsafe {
+                visit_field_interval_year_month(
+                    &mut $state,
+                    KernelStringSlice::new_unsafe($name),
+                    $nullable,
+                    $metadata,
+                    FfiIntervalYearToMonthType::IntervalYearToMonth as u8,
+                    &TEST_ERROR_ALLOCATORS,
+                )
+            })
+        }};
+
         ($type:ident, $state:ident, $name:expr, $nullable:tt, $metadata:expr) => {{
             paste::paste! { ok_or_panic(unsafe {
                 [<visit_field_ $type>](
@@ -1831,7 +1849,26 @@ mod tests {
         assert_field_metadata!(date, "date");
         assert_field_metadata!(timestamp, "timestamp");
         assert_field_metadata!(timestamp_ntz, "timestamp_ntz");
-        assert_field_metadata!(interval_year_month, "interval_year_month");
+        let mut state = KernelSchemaVisitorState::default();
+        let field_id = unsafe {
+            ok_or_panic(visit_field_interval_year_month(
+                &mut state,
+                KernelStringSlice::new_unsafe("interval_year_month"),
+                false,
+                &test_engine_metadata(&mut TestMetadata::from([(
+                    "number",
+                    MetadataValue::Number(17),
+                )])),
+                FfiIntervalYearToMonthType::IntervalYearToMonth as u8,
+                &TEST_ERROR_ALLOCATORS,
+            ))
+        };
+        let field = unwrap_field(&mut state, field_id).unwrap();
+        assert_eq!(
+            field.metadata().get("number"),
+            Some(&MetadataValue::Number(17)),
+            "interval_year_month field metadata",
+        );
         assert_field_metadata!(interval_day_time, "interval_day_time");
         assert_field_metadata!(void, "void");
         assert_field_metadata!(decimal, "decimal", 10, 2);
@@ -1849,6 +1886,139 @@ mod tests {
                 KernelStringSlice::new_unsafe("spherical")
             );
         }
+    }
+
+    #[rstest]
+    #[case::year(
+        FfiIntervalYearToMonthType::IntervalYear,
+        IntervalYearToMonthType::IntervalYear
+    )]
+    #[case::month(
+        FfiIntervalYearToMonthType::IntervalMonth,
+        IntervalYearToMonthType::IntervalMonth
+    )]
+    #[case::year_to_month(
+        FfiIntervalYearToMonthType::IntervalYearToMonth,
+        IntervalYearToMonthType::IntervalYearToMonth
+    )]
+    fn interval_year_month_field_preserves_kind(
+        #[case] ffi_kind: FfiIntervalYearToMonthType,
+        #[case] expected: IntervalYearToMonthType,
+    ) {
+        let mut state = KernelSchemaVisitorState::default();
+        let field_id = unsafe {
+            ok_or_panic(visit_field_interval_year_month(
+                &mut state,
+                KernelStringSlice::new_unsafe("ym"),
+                true,
+                null(),
+                ffi_kind as u8,
+                &TEST_ERROR_ALLOCATORS,
+            ))
+        };
+
+        let field = unwrap_field(&mut state, field_id).unwrap();
+        assert_eq!(
+            field.data_type(),
+            &DataType::Primitive(PrimitiveType::IntervalYearMonth(expected))
+        );
+        assert!(field.is_nullable());
+    }
+
+    #[rstest]
+    #[case::first_invalid(3)]
+    #[case::unknown(u8::MAX)]
+    fn interval_year_month_field_rejects_invalid_kind_before_metadata(#[case] invalid_kind: u8) {
+        let mut metadata_source = TestMetadata::from([("visited", MetadataValue::Boolean(true))]);
+        let metadata = test_engine_metadata(&mut metadata_source);
+        let mut state = KernelSchemaVisitorState::default();
+        let existing = visit_field!(string, state, "existing", true, null());
+        let result = unsafe {
+            visit_field_interval_year_month(
+                &mut state,
+                KernelStringSlice::new_unsafe("ym"),
+                false,
+                &metadata,
+                invalid_kind,
+                &TEST_ERROR_ALLOCATORS,
+            )
+        };
+
+        assert_extern_result_error_contains(
+            result,
+            FFIKernelError::SchemaError,
+            &format!("invalid interval year-month kind: {invalid_kind}"),
+        );
+        assert!(!metadata_source.visited);
+        assert_eq!(state.elements.len(), 1);
+        let existing_field = unwrap_field(&mut state, existing).unwrap();
+        assert_eq!(existing_field.name(), "existing");
+        assert!(state.elements.is_empty());
+
+        let retry = unsafe {
+            visit_field_interval_year_month(
+                &mut state,
+                KernelStringSlice::new_unsafe("ym"),
+                false,
+                null(),
+                FfiIntervalYearToMonthType::IntervalMonth as u8,
+                &TEST_ERROR_ALLOCATORS,
+            )
+        };
+        let field_id = ok_or_panic(retry);
+        let field = unwrap_field(&mut state, field_id).unwrap();
+        assert_eq!(
+            field.data_type(),
+            &DataType::Primitive(PrimitiveType::IntervalYearMonth(
+                IntervalYearToMonthType::IntervalMonth
+            ))
+        );
+    }
+
+    #[test]
+    fn interval_year_month_field_rejected_metadata_preserves_state_for_retry() {
+        let mut state = KernelSchemaVisitorState::default();
+        let existing = visit_field!(string, state, "existing", true, null());
+        let result = unsafe {
+            visit_field_interval_year_month(
+                &mut state,
+                KernelStringSlice::new_unsafe("ym"),
+                false,
+                &rejected_engine_metadata(),
+                FfiIntervalYearToMonthType::IntervalYear as u8,
+                &TEST_ERROR_ALLOCATORS,
+            )
+        };
+
+        assert_extern_result_error_with_message(result, FFIKernelError::SchemaError, None);
+        assert_eq!(state.elements.len(), 1);
+        let existing_field = unwrap_field(&mut state, existing).unwrap();
+        assert_eq!(existing_field.name(), "existing");
+
+        let mut metadata = TestMetadata::from([("number", MetadataValue::Number(17))]);
+        let field_id = unsafe {
+            ok_or_panic(visit_field_interval_year_month(
+                &mut state,
+                KernelStringSlice::new_unsafe("ym"),
+                false,
+                &test_engine_metadata(&mut metadata),
+                FfiIntervalYearToMonthType::IntervalYear as u8,
+                &TEST_ERROR_ALLOCATORS,
+            ))
+        };
+        let field = unwrap_field(&mut state, field_id).unwrap();
+        assert!(metadata.visited);
+        assert_eq!(
+            field.metadata().get("number"),
+            Some(&MetadataValue::Number(17))
+        );
+        assert_eq!(
+            field.data_type(),
+            &DataType::Primitive(PrimitiveType::IntervalYearMonth(
+                IntervalYearToMonthType::IntervalYear
+            ))
+        );
+        assert!(state.elements.is_empty());
     }
 
     #[cfg(feature = "geo-type-in-dev")]

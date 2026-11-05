@@ -56,8 +56,17 @@ uintptr_t convert_engine_to_kernel_literal(
           lit->value.long_data);
     case Date:
       return visit_expression_literal_date(state, lit->value.integer_data);
-    case IntervalYearMonth:
-      return visit_expression_literal_interval_year_month(state, lit->value.integer_data);
+    case IntervalYearMonth: {
+      struct IntervalYearMonthData* data = &lit->value.interval_year_month_data;
+      ExternResultusize result = visit_expression_literal_interval_year_month(
+          state, data->months, data->kind, &error_allocators);
+      if (result.tag == Errusize) {
+        print_error("visit_expression_literal_interval_year_month failed", (Error*)result.err);
+        free_error((Error*)result.err);
+        abort();
+      }
+      return result.ok;
+    }
     case IntervalDayTime:
       return visit_expression_literal_interval_day_time(state, lit->value.long_data);
     case Binary: {
@@ -78,7 +87,7 @@ uintptr_t convert_engine_to_kernel_literal(
     case Null: {
       struct NullTypeInfo* nt = &lit->value.null_type;
       ExternResultusize result = visit_expression_literal_null(
-          state, nt->type_tag, nt->precision, nt->scale, &error_allocators);
+          state, nt->type_tag, nt->parameters, &error_allocators);
       if (result.tag == Errusize) {
         print_error("visit_expression_literal_null failed", (Error*)result.err);
         free_error((Error*)result.err);

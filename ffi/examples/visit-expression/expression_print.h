@@ -39,6 +39,18 @@ void print_opaque_op_name(void* op_type, KernelStringSlice name) {
   printf("%s(%.*s)\n", (char*) op_type, len, name.ptr);
 }
 
+const char* interval_year_month_kind_name(enum FfiIntervalYearToMonthType kind) {
+  switch (kind) {
+    case FfiIntervalYearToMonthTypeIntervalYear:
+      return "IntervalYear";
+    case FfiIntervalYearToMonthTypeIntervalMonth:
+      return "IntervalMonth";
+    case FfiIntervalYearToMonthTypeIntervalYearToMonth:
+      return "IntervalYearToMonth";
+  }
+  return "UnknownIntervalYearMonth";
+}
+
 void print_tree_helper(ExpressionItem ref, int depth) {
   print_n_spaces(depth);
   switch (ref.type) {
@@ -184,9 +196,13 @@ void print_tree_helper(ExpressionItem ref, int depth) {
         case Date:
           printf("Date(%d)\n", lit->value.integer_data);
           break;
-        case IntervalYearMonth:
-          printf("IntervalYearMonth(%d)\n", lit->value.integer_data);
+        case IntervalYearMonth: {
+          struct IntervalYearMonthData* data = &lit->value.interval_year_month_data;
+          printf("IntervalYearMonth(%d,%s)\n",
+                 data->months,
+                 interval_year_month_kind_name(data->kind));
           break;
+        }
         case IntervalDayTime:
           printf("IntervalDayTime(%lld)\n", (long long)lit->value.long_data);
           break;
@@ -216,7 +232,13 @@ void print_tree_helper(ExpressionItem ref, int depth) {
           const size_t null_type_count = sizeof(null_type_names) / sizeof(null_type_names[0]);
           struct NullTypeInfo* nt = &lit->value.null_type;
           if (nt->type_tag == 12) {
-            printf("Null(Decimal(%d,%d))\n", nt->precision, nt->scale);
+            printf("Null(Decimal(%d,%d))\n",
+                   nt->parameters.decimal_precision,
+                   nt->parameters.decimal_scale);
+          } else if (nt->type_tag == 13) {
+            printf("Null(%s)\n",
+                   interval_year_month_kind_name(
+                       (enum FfiIntervalYearToMonthType)nt->parameters.interval_year_month_kind));
           } else if (nt->type_tag < null_type_count) {
             printf("Null(%s)\n", null_type_names[nt->type_tag]);
           } else {

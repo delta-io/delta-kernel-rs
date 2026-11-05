@@ -353,9 +353,22 @@ void visit_interval_year_month(void* data,
                                uintptr_t sibling_list_id,
                                struct KernelStringSlice name,
                                bool is_nullable,
-                               const CMetadataMap * metadata)
+                               const CMetadataMap * metadata,
+                               enum FfiIntervalYearToMonthType kind)
 {
-  visit_simple_type(data, sibling_list_id, name, is_nullable, metadata, "interval year to month");
+  char* type_name = NULL;
+  switch (kind) {
+    case FfiIntervalYearToMonthTypeIntervalYear:
+      type_name = "interval year";
+      break;
+    case FfiIntervalYearToMonthTypeIntervalMonth:
+      type_name = "interval month";
+      break;
+    case FfiIntervalYearToMonthTypeIntervalYearToMonth:
+      type_name = "interval year to month";
+      break;
+  }
+  visit_simple_type(data, sibling_list_id, name, is_nullable, metadata, type_name);
 }
 
 void visit_interval_day_time(void* data,

@@ -149,6 +149,10 @@ struct Decimal {
   uint8_t precision;
   uint8_t scale;
 };
+struct IntervalYearMonthData {
+  int32_t months;
+  enum FfiIntervalYearToMonthType kind;
+};
 typedef struct {
   size_t list_count;
   ExpressionItemList* lists;
@@ -166,8 +170,7 @@ struct MapData {
 };
 struct NullTypeInfo {
   uint8_t type_tag;
-  uint8_t precision;
-  uint8_t scale;
+  KernelNullTypeParameters parameters;
 };
 struct Literal {
   enum LitType type;
@@ -180,6 +183,7 @@ struct Literal {
     double double_data;
     bool boolean_data;
     char* string_data;
+    struct IntervalYearMonthData interval_year_month_data;
     struct Struct struct_data;
     struct ArrayData array_data;
     struct MapData map_data;
@@ -255,16 +259,23 @@ DEFINE_SIMPLE_SCALAR(visit_expr_timestamp_literal, Timestamp, int64_t, long_data
 DEFINE_SIMPLE_SCALAR(visit_expr_timestamp_ntz_literal, TimestampNtz, int64_t, long_data);
 DEFINE_SIMPLE_SCALAR(visit_expr_date_literal, Date, int32_t, integer_data);
 DEFINE_SIMPLE_SCALAR(
-    visit_expr_interval_year_month_literal,
-    IntervalYearMonth,
-    int32_t,
-    integer_data);
-DEFINE_SIMPLE_SCALAR(
     visit_expr_interval_day_time_literal,
     IntervalDayTime,
     int64_t,
     long_data);
 #undef DEFINE_SIMPLE_SCALAR
+
+void visit_expr_interval_year_month_literal(
+    void* data,
+    uintptr_t sibling_list_id,
+    int32_t months,
+    enum FfiIntervalYearToMonthType kind) {
+  struct Literal* lit = malloc(sizeof(struct Literal));
+  lit->type = IntervalYearMonth;
+  lit->value.interval_year_month_data.months = months;
+  lit->value.interval_year_month_data.kind = kind;
+  put_expr_item(data, sibling_list_id, lit, Literal);
+}
 
 void visit_expr_string_literal(void* data, uintptr_t sibling_list_id, KernelStringSlice string) {
   struct Literal* literal = malloc(sizeof(struct Literal));
@@ -314,13 +325,11 @@ void visit_expr_null_literal(
     void* data,
     uintptr_t sibling_id_list,
     uint8_t type_tag,
-    uint8_t precision,
-    uint8_t scale) {
+    KernelNullTypeParameters parameters) {
   struct Literal* literal = malloc(sizeof(struct Literal));
   literal->type = Null;
   literal->value.null_type.type_tag = type_tag;
-  literal->value.null_type.precision = precision;
-  literal->value.null_type.scale = scale;
+  literal->value.null_type.parameters = parameters;
   put_expr_item(data, sibling_id_list, literal, Literal);
 }
 

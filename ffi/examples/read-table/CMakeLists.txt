@@ -65,6 +65,9 @@ add_test(NAME commit_range_commit_files_basic_partitioned
   COMMAND "${CMAKE_CURRENT_SOURCE_DIR}/../../tests/read-table-testing/run_commit_range_commit_files_test.sh"
   "${CMAKE_CURRENT_SOURCE_DIR}/../../../acceptance/tests/dat/out/reader_tests/generated/basic_partitioned/delta/"
   "${CMAKE_CURRENT_SOURCE_DIR}/../../tests/read-table-testing/expected-data/commit-range-commit-files-basic-partitioned.expected")
+add_test(NAME read_interval_year_month_schema COMMAND ${TestRunner}
+  ../../../../acceptance/workloads/interval_types_intv_001_interval_ym_basic/delta/
+  ${ExpectedPath}/interval-year-month-schema-data.expected "-cid,period -s")
 if(GEO_TYPE_IN_DEV)
   target_compile_definitions(read_table PUBLIC DEFINE_GEO_TYPE_IN_DEV)
   add_test(NAME read_and_print_geo COMMAND ${TestRunner} ${KernelTestPath}/table-with-geo/ ${ExpectedPath}/table-with-geo.expected)
