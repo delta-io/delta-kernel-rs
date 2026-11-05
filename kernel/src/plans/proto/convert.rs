@@ -285,6 +285,11 @@ impl From<&Agg> for proto_plan::Agg {
                 value: Some(value.into()),
             }),
             Agg::CountStar => proto_agg::Func::CountStar(proto_plan::CountStarAgg {}),
+            Agg::FirstNonNull(value) => {
+                proto_agg::Func::FirstNonNull(proto_plan::FirstNonNullAgg {
+                    value: Some(value.into()),
+                })
+            }
             Agg::MinNonNullBy(operands) => {
                 proto_agg::Func::MinNonNullBy(proto_plan::MinNonNullByAgg {
                     value: Some((&operands.value).into()),
@@ -1681,6 +1686,7 @@ mod tests {
     #[case(Agg::sum(column_name!("a")), "sum")]
     #[case(Agg::count(column_name!("a")), "count")]
     #[case(Agg::count_star(), "count_star")]
+    #[case(Agg::first_non_null(column_name!("a")), "first_non_null")]
     #[case(Agg::min_non_null_by(column_name!("a"), column_name!("s"), column_name!("k")), "min_non_null_by")]
     #[case(Agg::max_non_null_by(column_name!("a"), column_name!("s"), column_name!("k")), "max_non_null_by")]
     fn from_agg(#[case] agg: Agg, #[case] expected: &str) {
@@ -1692,6 +1698,10 @@ mod tests {
             Func::Sum(_) => "sum",
             Func::Count(_) => "count",
             Func::CountStar(_) => "count_star",
+            Func::FirstNonNull(agg) => {
+                assert_eq!(agg.value.unwrap().path, ["a"]);
+                "first_non_null"
+            }
             Func::MinNonNullBy(_) => "min_non_null_by",
             Func::MaxNonNullBy(_) => "max_non_null_by",
         };
