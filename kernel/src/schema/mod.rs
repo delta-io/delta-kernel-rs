@@ -1070,7 +1070,7 @@ impl StructType {
     /// Retrieves the nested field named by the given column path.
     ///
     /// Returns an error if the path is empty, a field is not found, or an intermediate field is not
-    /// a struct type.
+    /// a struct or `file` type.
     pub fn field_at<'a>(&'a self, col: &ColumnName) -> KernelResult<&'a StructField> {
         let mut field = None;
         self.visit_fields_of_path(col, |f| field = Some(f))?;
@@ -1086,7 +1086,7 @@ impl StructType {
     /// Visits all fields along the given column path.
     ///
     /// Returns an error if the path is empty, a field is not found, or an intermediate field is not
-    /// a struct type.
+    /// a struct or `file` type.
     #[internal_api]
     pub(crate) fn visit_fields_of_path<'a>(
         &'a self,
@@ -1100,10 +1100,10 @@ impl StructType {
     /// [`StructField`]s along the path. The last element is the leaf field.
     ///
     /// Each element of the path must resolve to a field in the current struct. All intermediate
-    /// (non-leaf) fields must be struct types.
+    /// (non-leaf) fields must be struct or `file` types.
     ///
     /// Returns an error if the path is empty, a field is not found, or an intermediate
-    /// field is not a struct type.
+    /// field is not a struct or `file` type.
     #[internal_api]
     pub(crate) fn fields_of_path<'a>(
         &'a self,
@@ -1117,7 +1117,7 @@ impl StructType {
     /// Visits all fields along the given column path, using a caller-provided field name resolver.
     ///
     /// Returns an error if the path is empty, a field is not found, or an intermediate field is not
-    /// a struct type.
+    /// a struct or `file` type.
     pub(crate) fn visit_fields_of_path_by<'a, F>(
         &'a self,
         col: &ColumnName,
@@ -1140,7 +1140,9 @@ impl StructType {
             })?;
             visit_field(field);
             if i < path.len() - 1 {
-                let DataType::Struct(inner) = field.data_type() else {
+                // A `file` column's sub-fields are addressable like a struct's, for example in
+                // statistics, predicates, and clustering columns.
+                let (DataType::Struct(inner) | DataType::File(inner)) = field.data_type() else {
                     return Err(KernelError::generic(format!(
                         "Cannot resolve column '{col}': intermediate field '{field_name}' \
                          is not a struct type"
@@ -2500,6 +2502,13 @@ pub(crate) static FILE_FIELDS: LazyLock<StructType> = LazyLock::new(|| {
         StructField::nullable("inline", DataType::BINARY),
     ])
 });
+
+/// Whether the `file` sub-field `name` gets `minValues` and `maxValues` statistics. `checksum` and
+/// `inline` get only `nullCount`, like every sub-field.
+#[internal_api]
+pub(crate) fn file_sub_field_has_min_max(name: &str) -> bool {
+    matches!(name, "uri" | "offset" | "size" | "content_type")
+}
 
 impl DataType {
     pub const STRING: Self = DataType::Primitive(PrimitiveType::String);

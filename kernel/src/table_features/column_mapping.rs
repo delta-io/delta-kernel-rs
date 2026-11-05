@@ -956,7 +956,7 @@ pub(crate) fn drop_column_mapping_metadata(schema: &StructType) -> StructType {
 /// Returns an error if the column name cannot be resolved in the schema, or if column mapping is
 /// enabled but any field in the path lacks the required
 /// [`ColumnMetadataKey::ColumnMappingPhysicalName`] or [`ColumnMetadataKey::ColumnMappingId`]
-/// annotations.
+/// annotations. A `file` column's sub-fields are exempt: they keep their own names.
 #[delta_kernel_derive::internal_api]
 pub(crate) fn get_any_level_column_physical_name(
     schema: &StructType,
@@ -966,7 +966,14 @@ pub(crate) fn get_any_level_column_physical_name(
     let fields = schema.fields_of_path(col_name)?;
     let physical_path: Vec<String> = fields
         .iter()
-        .map(|field| -> KernelResult<String> {
+        .enumerate()
+        .map(|(i, field)| -> KernelResult<String> {
+            // A `file` column's sub-fields carry no column mapping annotations; their names are
+            // fixed by the type and are the same in the logical and physical schemas.
+            let in_file = i > 0 && matches!(fields[i - 1].data_type(), DataType::File(_));
+            if in_file {
+                return Ok(field.name.clone());
+            }
             if column_mapping_mode != ColumnMappingMode::None {
                 if !field.has_physical_name_annotation() {
                     return Err(KernelError::Schema(format!(
@@ -2498,6 +2505,25 @@ mod tests {
         .unwrap();
         assert_eq!(result, column_name!("a.y"));
         assert_eq!(result.path().len(), 2);
+    }
+
+    /// A `file` column's sub-fields have no column mapping annotations and keep their names.
+    #[test]
+    fn test_get_any_level_column_physical_name_file_sub_field() {
+        let schema = StructType::new_unchecked([make_cm_field("f", 1, DataType::file_type())]);
+        for mode in [ColumnMappingMode::Name, ColumnMappingMode::Id] {
+            let result =
+                get_any_level_column_physical_name(&schema, &column_name!("f.size"), mode).unwrap();
+            let physical = schema.field("f").unwrap().physical_name(mode).to_string();
+            assert_eq!(result, ColumnName::new([physical, "size".to_string()]));
+        }
+        let result = get_any_level_column_physical_name(
+            &schema,
+            &column_name!("f.size"),
+            ColumnMappingMode::None,
+        )
+        .unwrap();
+        assert_eq!(result, column_name!("f.size"));
     }
 
     #[test]

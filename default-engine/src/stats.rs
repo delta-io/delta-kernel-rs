@@ -23,7 +23,7 @@ use delta_kernel::arrow::datatypes::{
 use delta_kernel::column_trie::ColumnTrie;
 use delta_kernel::engine::arrow_utils::fix_nested_null_masks;
 use delta_kernel::expressions::ColumnName;
-use delta_kernel::schema::{DataType as KernelDataType, StructType};
+use delta_kernel::schema::{DataType as KernelDataType, StructType, file_sub_field_has_min_max};
 use delta_kernel::{KernelError, KernelResult};
 
 /// Maximum prefix length for string statistics (Delta protocol requirement).
@@ -504,7 +504,7 @@ pub fn collect_stats(
     stats_columns: &[ColumnName],
     physical_schema: &StructType,
 ) -> KernelResult<StructArray> {
-    let null_count_only_columns = interval_column_names(physical_schema, stats_columns);
+    let null_count_only_columns = null_count_only_column_names(physical_schema, stats_columns);
     reduce_stats(
         &collect_stats_raw(batch, stats_columns, &null_count_only_columns)?,
         TruncateStats::Yes,
@@ -662,7 +662,7 @@ impl FileStatsAccumulator {
     /// only) from integer columns.
     pub fn new(stats_columns: &[ColumnName], physical_schema: &StructType) -> Self {
         Self {
-            null_count_only_columns: interval_column_names(physical_schema, stats_columns),
+            null_count_only_columns: null_count_only_column_names(physical_schema, stats_columns),
             stats_columns: stats_columns.to_vec(),
             batch_schema: None,
             state: AccumulatorState::Open(None),
@@ -905,15 +905,20 @@ fn is_interval_type(data_type: &KernelDataType) -> bool {
     primitive_type.is_interval()
 }
 
-fn interval_column_names(schema: &StructType, stats_columns: &[ColumnName]) -> Vec<ColumnName> {
+/// Returns the `stats_columns` that get only `nullCount`: intervals, and the `file` sub-fields
+/// without min/max statistics (`checksum` and `inline`).
+fn null_count_only_column_names(
+    schema: &StructType,
+    stats_columns: &[ColumnName],
+) -> Vec<ColumnName> {
     stats_columns
         .iter()
-        .filter(|col| {
-            schema
-                .fields_of_path(col)
-                .ok()
-                .and_then(|fields| fields.last().map(|field| field.data_type()))
-                .is_some_and(is_interval_type)
+        .filter(|col| match schema.fields_of_path(col).ok().as_deref() {
+            Some([.., parent, leaf]) if matches!(parent.data_type(), KernelDataType::File(_)) => {
+                !file_sub_field_has_min_max(leaf.name())
+            }
+            Some([.., leaf]) => is_interval_type(leaf.data_type()),
+            _ => false,
         })
         .cloned()
         .collect()
