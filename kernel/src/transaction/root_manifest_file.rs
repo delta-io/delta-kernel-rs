@@ -41,7 +41,7 @@ impl RootManifestFile {
     /// (this transaction's `dm_changes` and `set_transactions` merged in, newest wins).
     ///
     /// Errors if delta log commits with file actions (`add`, `remove`, or `cdc`) are still pending
-    /// replay since an existing checkpoint.
+    /// replay since the last checkpoint, if any.
     pub(super) fn compute_checkpoint_action(
         &self,
         engine: &dyn Engine,
@@ -72,15 +72,18 @@ impl RootManifestFile {
             calculate_transaction_expiration_timestamp(table_config.table_properties())?;
         transactions.retain(|_, txn| !txn.is_expired(expiration_timestamp));
 
-        if let Some(existing) = &existing_checkpoint {
-            let checkpoint_version = Version::try_from(existing.version()).map_err(|_| {
-                KernelError::invalid_checkpoint(format!(
-                    "checkpoint action has negative version {}",
-                    existing.version()
-                ))
-            })?;
-            self.validate_no_file_actions_since_checkpoint(engine, checkpoint_version)?;
-        }
+        let checkpoint_version = existing_checkpoint
+            .as_ref()
+            .map(|existing| {
+                Version::try_from(existing.version()).map_err(|_| {
+                    KernelError::invalid_checkpoint(format!(
+                        "checkpoint action has negative version {}",
+                        existing.version()
+                    ))
+                })
+            })
+            .transpose()?;
+        self.validate_no_file_actions_since_checkpoint(engine, checkpoint_version)?;
 
         let version = version_as_i64(commit_version)?;
         let size = i64::try_from(self.file.size)
@@ -176,15 +179,21 @@ impl RootManifestFile {
         Ok((domain_metadata, transactions, checkpoint_action))
     }
 
-    /// Errors if a log commit after `checkpoint_version` has a file action.
+    /// Errors if a log commit after `checkpoint_version` (or any, if `None`) has a file action.
     fn validate_no_file_actions_since_checkpoint(
         &self,
         engine: &dyn Engine,
-        checkpoint_version: Version,
+        checkpoint_version: Option<Version>,
     ) -> KernelResult<()> {
         let log_segment = self.read_snapshot.log_segment();
         // A classic checkpoint after the checkpoint action drops earlier commits from the segment.
         if let Some(classic) = log_segment.checkpoint_version {
+            let Some(checkpoint_version) = checkpoint_version else {
+                return Err(KernelError::unsupported(format!(
+                    "root manifest file commit on a table with a checkpoint at version {classic} \
+                     and no checkpoint action is not yet supported"
+                )));
+            };
             require!(
                 classic <= checkpoint_version,
                 KernelError::unsupported(format!(
@@ -197,7 +206,7 @@ impl RootManifestFile {
             .listed
             .ascending_commit_files
             .iter()
-            .filter(|commit| commit.version > checkpoint_version);
+            .filter(|commit| checkpoint_version.is_none_or(|v| commit.version > v));
         for commit in commits {
             let batches = engine.json_handler().read_json_files(
                 std::slice::from_ref(&commit.location),
@@ -322,6 +331,33 @@ mod tests {
         );
         assert_eq!(checkpoint.domain_metadata, dm_changes);
         assert_eq!(checkpoint.transactions, set_transactions);
+        Ok(())
+    }
+
+    #[test]
+    fn compute_checkpoint_action_allows_replacing_a_checkpoint_that_covers_the_snapshot()
+    -> KernelResult<()> {
+        let (engine, table_root) = setup_table()?;
+        let existing = minimal_checkpoint_action("metadata/root-v1.parquet", 1)?;
+        write_manifest_commit(&engine, &table_root, 1, existing)?;
+
+        let snapshot = Snapshot::builder_for(table_root.clone()).build(&engine)?;
+        assert_eq!(snapshot.version(), 1);
+        let manifest = root_manifest(
+            &table_root,
+            "metadata/root-v2.parquet",
+            2048,
+            snapshot.clone(),
+        );
+
+        let checkpoint = manifest.compute_checkpoint_action(
+            &engine,
+            2,
+            snapshot.table_configuration(),
+            &[],
+            &[],
+        )?;
+        assert_eq!(checkpoint.path(), manifest.file.location.as_str());
         Ok(())
     }
 
@@ -476,6 +512,43 @@ mod tests {
             .sorted()
             .collect_vec();
         assert_eq!(txns, [("app-1", 5), ("app-2", 1)]);
+        Ok(())
+    }
+
+    #[test]
+    fn compute_checkpoint_action_rejects_negative_checkpoint_action_version() -> KernelResult<()> {
+        let (engine, table_root) = setup_table()?;
+        let (protocol, metadata) = adaptive_metadata_protocol_and_metadata();
+        let checkpoint = CheckpointAction::new(
+            -1,
+            ContentRoot::new("metadata/root-v1.parquet".to_string(), 1024, -1),
+            protocol,
+            metadata,
+            vec![],
+            vec![],
+        );
+        write_manifest_commit(&engine, &table_root, 1, checkpoint)?;
+        assert_result_error_with_message(
+            compute_at_latest(&engine, &table_root),
+            "checkpoint action has negative version -1",
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn compute_checkpoint_action_rejects_file_actions_without_checkpoint() -> KernelResult<()> {
+        let (engine, table_root) = setup_table()?;
+        let add = actions_to_string(vec![TestAction::Add("a".into())]);
+        write_commit(
+            &engine,
+            &table_root,
+            1,
+            parse_json_batch(vec![add.as_str()].into()),
+        )?;
+        assert_result_error_with_message(
+            compute_at_latest(&engine, &table_root),
+            "cannot follow log commit 1 with 'add' actions",
+        );
         Ok(())
     }
 
@@ -675,7 +748,7 @@ mod tests {
         let (protocol, metadata) = adaptive_metadata_protocol_and_metadata();
         let mut existing = CheckpointAction::new(
             1,
-            ContentRoot::new("metadata/root-v1.parquet".to_string(), 1024, 1),
+            ContentRoot::new("metadata/root-v1.parquet".to_string(), 1024, -1),
             protocol,
             metadata,
             vec![],
@@ -822,7 +895,7 @@ mod tests {
         let (protocol, metadata) = adaptive_metadata_protocol_and_metadata();
         let existing = CheckpointAction::new(
             1,
-            ContentRoot::new("metadata/root-v1.parquet".to_string(), 1024, 1),
+            ContentRoot::new("metadata/root-v1.parquet".to_string(), 1024, -1),
             protocol,
             metadata,
             vec![SetTransaction::new("app-1".to_string(), 5, None)],
