@@ -495,14 +495,15 @@ impl CrcReplayAccumulator {
         if !self.delta.is_incremental_safe {
             return Ok(());
         }
-        self.current_commit_file_stats.gross_add_files += 1;
         if size < 0 {
             self.current_commit_adds_valid = false;
-        } else {
-            self.current_commit_file_stats.gross_add_bytes += size_to_u64(size)?;
-            if let Some(histogram) = &mut self.current_commit_add_histogram {
-                histogram.insert(size)?;
-            }
+            return Ok(());
+        }
+        let fs = &mut self.current_commit_file_stats;
+        fs.gross_add_files += 1;
+        fs.gross_add_bytes += size_to_u64(size)?;
+        if let Some(hist) = self.current_commit_add_histogram.as_mut() {
+            hist.insert(size)?;
         }
         Ok(())
     }
@@ -516,15 +517,21 @@ impl CrcReplayAccumulator {
         if !self.delta.is_incremental_safe {
             return Ok(());
         }
-        self.current_commit_file_stats.gross_remove_files += 1;
         match size {
-            Some(size) if size >= 0 => {
-                self.current_commit_file_stats.gross_remove_bytes += size_to_u64(size)?;
-                if let Some(histogram) = &mut self.current_commit_remove_histogram {
-                    histogram.insert(size)?;
+            Some(s) if s < 0 => {
+                self.current_commit_removes_valid = false;
+            }
+            Some(s) => {
+                let fs = &mut self.current_commit_file_stats;
+                fs.gross_remove_files += 1;
+                fs.gross_remove_bytes += size_to_u64(s)?;
+                if let Some(hist) = self.current_commit_remove_histogram.as_mut() {
+                    hist.insert(s)?;
                 }
             }
-            _ => self.current_commit_removes_valid = false,
+            None => {
+                self.current_commit_removes_valid = false;
+            }
         }
         Ok(())
     }
@@ -727,16 +734,14 @@ impl RowVisitor for CommitCrcVisitor<'_> {
         self.acc.process_batch_start(&file_url);
 
         for (i, &is_commit_info) in self.commit_info_rows.iter().enumerate() {
+            let operation: Option<String> = getters[COL_OP].get_opt(i, "commitInfo.operation")?;
+            let ict: Option<i64> = getters[COL_ICT].get_opt(i, "commitInfo.inCommitTimestamp")?;
+            #[cfg(feature = "adaptive-metadata-in-dev")]
+            let last_manifest_commit = visit_last_manifest_commit_at(
+                i,
+                &getters[COL_LMC_VERSION..=COL_LMC_CONTENT_ROOT_VERSION],
+            )?;
             if is_commit_info {
-                let operation: Option<String> =
-                    getters[COL_OP].get_opt(i, "commitInfo.operation")?;
-                let ict: Option<i64> =
-                    getters[COL_ICT].get_opt(i, "commitInfo.inCommitTimestamp")?;
-                #[cfg(feature = "adaptive-metadata-in-dev")]
-                let last_manifest_commit = visit_last_manifest_commit_at(
-                    i,
-                    &getters[COL_LMC_VERSION..=COL_LMC_CONTENT_ROOT_VERSION],
-                )?;
                 self.acc.on_commit_info(
                     operation.as_deref(),
                     ict,
@@ -1026,7 +1031,7 @@ mod tests {
     fn on_add_negative_size_trips_is_incremental_safe() {
         let mut acc = CrcReplayAccumulator::new(Some(FileSizeHistogram::create_default()));
         acc.on_add(-1).unwrap();
-        assert_eq!(acc.current_commit_file_stats.gross_add_files, 1);
+        assert!(acc.current_commit_saw_file_action);
         acc.process_commit_file_end();
         assert!(!acc.delta.is_incremental_safe);
     }
@@ -1049,7 +1054,7 @@ mod tests {
         acc.on_commit_info_without_lmc(Some(op), None);
         assert!(acc.delta.is_incremental_safe);
         acc.on_remove(None).unwrap();
-        assert_eq!(acc.current_commit_file_stats.gross_remove_files, 1);
+        assert!(acc.current_commit_saw_file_action);
         acc.process_commit_file_end();
         assert!(!acc.delta.is_incremental_safe);
     }
@@ -1058,7 +1063,7 @@ mod tests {
     fn on_remove_negative_size_trips_is_incremental_safe() {
         let mut acc = CrcReplayAccumulator::new(Some(FileSizeHistogram::create_default()));
         acc.on_remove(Some(-1)).unwrap();
-        assert_eq!(acc.current_commit_file_stats.gross_remove_files, 1);
+        assert!(acc.current_commit_saw_file_action);
         acc.process_commit_file_end();
         assert!(!acc.delta.is_incremental_safe);
     }
