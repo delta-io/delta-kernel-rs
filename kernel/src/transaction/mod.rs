@@ -553,11 +553,13 @@ impl<STATE, MODE: ExecutionMode> Transaction<STATE, MODE> {
     ///   minValues: { ... },   // Nested struct, only min/max eligible types
     ///   maxValues: { ... },   // Nested struct, only min/max eligible types
     ///   tightBounds: boolean,
-    ///   tightStats: boolean,  // adaptiveMetadata tables only
+    ///   tightStats: boolean,  // adaptiveMetadata tables only; must be null
     /// }
     /// ```
     ///
     /// Engines should collect statistics matching this schema structure when writing files.
+    /// A non-null `tightStats` (`true` or `false`) promises timestamp bounds at microsecond
+    /// precision, which commit cannot preserve, so commit rejects add files that set it.
     ///
     /// Per the Delta protocol, required columns (e.g. clustering columns) are always included
     /// in statistics, regardless of `dataSkippingStatsColumns` or `dataSkippingNumIndexedCols`
@@ -940,8 +942,7 @@ impl<STATE, MODE: ExecutionMode> Transaction<STATE, MODE> {
     }
 
     fn is_adaptive_metadata_enabled(&self) -> bool {
-        self.effective_table_config
-            .is_feature_enabled(&TableFeature::AdaptiveMetadataPreview)
+        self.effective_table_config.is_adaptive_metadata_enabled()
     }
 
     /// Sets the adaptiveMetadata `dataChange` and `lastManifestCommit` fields on `commit_info` when
