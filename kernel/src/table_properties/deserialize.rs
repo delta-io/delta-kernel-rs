@@ -239,6 +239,7 @@ fn parse_interval_impl(value: &str) -> Result<Duration, ParseIntervalError> {
 #[cfg(test)]
 mod tests {
     use ParquetCompressionCodec::*;
+    use rstest::rstest;
 
     use super::*;
 
@@ -426,13 +427,15 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_parse_compression_codec_unknown_falls_through_to_unknown_properties() {
-        let props = TableProperties::from([(PARQUET_COMPRESSION_CODEC, "brotli")]);
+    #[rstest]
+    fn test_parse_compression_codec_unknown_falls_through_to_unknown_properties(
+        #[values("brotli", "BROTLI", "lzo", "LZO", "foobar")] codec: &str,
+    ) {
+        let props = TableProperties::from([(PARQUET_COMPRESSION_CODEC, codec)]);
         assert_eq!(props.parquet_compression_codec, None);
         assert_eq!(
             props.unknown_properties.get(PARQUET_COMPRESSION_CODEC),
-            Some(&"brotli".to_string())
+            Some(&codec.to_string())
         );
     }
 
