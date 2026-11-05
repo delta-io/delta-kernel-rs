@@ -106,6 +106,7 @@ pub enum MetricEvent {
     SetTransactionLoadFailure,
     CrcReadSuccess(CrcReadSuccess),
     CrcReadFailure,
+    CrcWrite(CrcWrite),
     JsonReadCompleted(JsonReadCompleted),
     ParquetReadCompleted(ParquetReadCompleted),
     ScanMetadataCompleted(ScanMetadataCompleted),
@@ -118,12 +119,13 @@ impl MetricEvent {
     /// Set the wall-clock duration on lifecycle events.
     pub(crate) fn set_duration_if_applicable(&mut self, d: Duration) {
         match self {
-            // Lifecycle success: duration must be set by the tracing layer on span close.
+            // Lifecycle events: duration is set by the tracing layer on span close.
             Self::SnapshotBuildSuccess(e) => e.set_duration(d),
             Self::TransactionCommitSuccess(e) => e.set_duration(d),
             Self::DomainMetadataLoadSuccess(e) => e.set_duration(d),
             Self::SetTransactionLoadSuccess(e) => e.set_duration(d),
             Self::CrcReadSuccess(e) => e.set_duration(d),
+            Self::CrcWrite(e) => e.duration = d,
 
             // Emit-based success events set their duration as a creation attribute, so the
             // span-close hook must not overwrite it.
@@ -155,6 +157,7 @@ impl MetricEvent {
             Self::TransactionCommitSuccess(e) => e.record_u64(name, value),
             Self::DomainMetadataLoadSuccess(e) => e.record_u64(name, value),
             Self::CrcReadSuccess(e) => e.record_u64(name, value),
+            Self::CrcWrite(e) => e.record_u64(name, value),
 
             Self::LogSegmentLoadSuccess(_) => Err(LogSegmentLoadSuccess::SPAN_NAME),
             Self::ProtocolMetadataLoadSuccess(_) => Err(ProtocolMetadataLoadSuccess::SPAN_NAME),
@@ -189,6 +192,7 @@ impl MetricEvent {
             Self::ProtocolMetadataLoadSuccess(_) => Err(ProtocolMetadataLoadSuccess::SPAN_NAME),
             Self::SnapshotBuildSuccess(_) => Err(SnapshotBuildSuccess::SPAN_NAME),
             Self::CrcReadSuccess(_) => Err(CrcReadSuccess::SPAN_NAME),
+            Self::CrcWrite(_) => Err(CrcWrite::SPAN_NAME),
             Self::ScanMetadataCompleted(_) => Err(ScanMetadataCompleted::SPAN_NAME),
             Self::JsonReadCompleted(_) => Err(JsonReadCompleted::SPAN_NAME),
             Self::ParquetReadCompleted(_) => Err(ParquetReadCompleted::SPAN_NAME),
@@ -225,15 +229,14 @@ impl MetricEvent {
             }
             return Ok(());
         }
-        // Only TransactionCommitSuccess records string fields today. If other events need them,
-        // dispatch per-variant like `record_u64`/`record_bool` above instead of this catch-all.
         match self {
             Self::TransactionCommitSuccess(e) => e.record_str(name, value),
+            Self::CrcWrite(e) => e.record_str(name, value),
             _ => Ok(()),
         }
     }
 
-    /// Maps a lifecycle success event to its failure counterpart when the span errors.
+    /// Convert lifecycle events to a failure variant or error outcome when the span errors.
     pub(crate) fn into_failure(self) -> Self {
         match self {
             Self::LogSegmentLoadSuccess(e) => Self::LogSegmentLoadFailure(LogSegmentLoadFailure {
@@ -267,6 +270,10 @@ impl MetricEvent {
             Self::DomainMetadataLoadSuccess(_) => Self::DomainMetadataLoadFailure,
             Self::SetTransactionLoadSuccess(_) => Self::SetTransactionLoadFailure,
             Self::CrcReadSuccess(_) => Self::CrcReadFailure,
+            Self::CrcWrite(mut e) => {
+                e.outcome = CrcWriteOutcome::Error;
+                Self::CrcWrite(e)
+            }
             // Events with no failure form pass through unchanged.
             // Note: here we list explicitly so adding a lifecycle event without a failure mapping
             //       fails to compile.
@@ -304,6 +311,7 @@ impl fmt::Display for MetricEvent {
             Self::SetTransactionLoadFailure => f.write_str("SetTransactionLoadFailure"),
             Self::CrcReadSuccess(e) => e.fmt(f),
             Self::CrcReadFailure => f.write_str("CrcReadFailure"),
+            Self::CrcWrite(e) => e.fmt(f),
             Self::JsonReadCompleted(e) => e.fmt(f),
             Self::ParquetReadCompleted(e) => e.fmt(f),
             Self::ScanMetadataCompleted(e) => e.fmt(f),
@@ -1136,6 +1144,111 @@ impl fmt::Display for CrcReadSuccess {
             f,
             "CrcReadSuccess(duration={duration:?}, bytes={bytes_read})"
         )
+    }
+}
+
+// ====================================================================
+// CrcWrite
+// ====================================================================
+
+pub(crate) const CRC_WRITE_SPAN: &str = "snap.write_checksum";
+
+/// Final result of a [`crate::Snapshot::write_checksum`] call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, AsRefStr, StrumDisplay)]
+#[strum(serialize_all = "snake_case")]
+pub enum CrcWriteOutcome {
+    /// The CRC was written and the updated snapshot was constructed successfully.
+    Written {
+        /// Exact serialized UTF-8 byte count written by this call.
+        bytes_written: u64,
+    },
+    /// The CRC already existed, including a concurrent writer winning the storage race.
+    AlreadyExists,
+    /// The call returned an error, even if the storage write had succeeded.
+    Error,
+}
+
+/// CRC construction path selected during [`crate::Snapshot::write_checksum`].
+///
+/// Reusing a CRC already at the snapshot version is [`Self::Cached`], regardless of how it was
+/// constructed. The selected mode is retained on failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, AsRefStr, StrumDisplay, EnumString)]
+#[strum(serialize_all = "snake_case")]
+pub enum CrcWriteResolutionMode {
+    /// Attempted construction from a checkpoint or version zero, replaying commits as needed.
+    Full,
+    /// Attempted to advance an older CRC by replaying newer commits.
+    Incremental,
+    /// Selected the in-memory CRC already at the snapshot version.
+    Cached,
+    /// Returned before selecting a CRC construction path.
+    NotAttempted,
+}
+
+/// Metrics reported once per returned [`crate::Snapshot::write_checksum`] call.
+#[derive(Debug, Clone)]
+pub struct CrcWrite {
+    /// Final result returned by the API.
+    pub outcome: CrcWriteOutcome,
+    /// CRC construction attempted during this call.
+    pub resolution_mode: CrcWriteResolutionMode,
+    /// Wall-clock time from API entry to return, including errors and snapshot updates.
+    pub duration: Duration,
+}
+
+impl CrcWrite {
+    pub(crate) const SPAN_NAME: &'static str = CRC_WRITE_SPAN;
+
+    pub(crate) fn from_attrs(_attrs: &Attributes<'_>) -> Self {
+        Self {
+            outcome: CrcWriteOutcome::Error,
+            resolution_mode: CrcWriteResolutionMode::NotAttempted,
+            duration: Duration::default(),
+        }
+    }
+
+    fn record_u64(&mut self, name: &str, value: u64) -> Result<(), &'static str> {
+        match name {
+            "bytes_written" => {
+                self.outcome = CrcWriteOutcome::Written {
+                    bytes_written: value,
+                }
+            }
+            _ => return Err(Self::SPAN_NAME),
+        }
+        Ok(())
+    }
+
+    fn record_str(&mut self, name: &str, value: &str) -> Result<(), &'static str> {
+        match name {
+            "outcome" if value == CrcWriteOutcome::AlreadyExists.as_ref() => {
+                self.outcome = CrcWriteOutcome::AlreadyExists;
+            }
+            "resolution_mode" => {
+                self.resolution_mode = value.parse().map_err(|_| Self::SPAN_NAME)?;
+            }
+            _ => return Err(Self::SPAN_NAME),
+        }
+        Ok(())
+    }
+}
+
+impl fmt::Display for CrcWrite {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self {
+            outcome,
+            resolution_mode,
+            duration,
+        } = self;
+        write!(
+            f,
+            "CrcWrite(outcome={outcome}, resolution_mode={resolution_mode}, \
+             duration={duration:?}"
+        )?;
+        if let CrcWriteOutcome::Written { bytes_written } = outcome {
+            write!(f, ", bytes_written={bytes_written}")?;
+        }
+        f.write_str(")")
     }
 }
 
@@ -2120,5 +2233,53 @@ mod tests {
         };
         assert_eq!(failure.correlation_id.as_deref(), Some("snap-req-3"));
         assert_eq!(failure.load_type, SnapshotLoadType::Incremental);
+    }
+
+    #[rstest]
+    #[case(CrcWriteOutcome::Written { bytes_written: 0 }, "written")]
+    #[case(CrcWriteOutcome::Written { bytes_written: 100 }, "written")]
+    #[case(CrcWriteOutcome::AlreadyExists, "already_exists")]
+    #[case(CrcWriteOutcome::Error, "error")]
+    fn crc_write_outcome_has_stable_label(#[case] outcome: CrcWriteOutcome, #[case] label: &str) {
+        assert_eq!(outcome.as_ref(), label);
+        assert_eq!(outcome.to_string(), label);
+    }
+
+    #[rstest]
+    #[case(CrcWriteResolutionMode::Full, "full")]
+    #[case(CrcWriteResolutionMode::Incremental, "incremental")]
+    #[case(CrcWriteResolutionMode::Cached, "cached")]
+    #[case(CrcWriteResolutionMode::NotAttempted, "not_attempted")]
+    fn crc_write_resolution_mode_has_stable_label(
+        #[case] mode: CrcWriteResolutionMode,
+        #[case] label: &str,
+    ) {
+        assert_eq!(mode.as_ref(), label);
+        assert_eq!(mode.to_string(), label);
+        assert_eq!(label.parse::<CrcWriteResolutionMode>().unwrap(), mode);
+    }
+
+    #[rstest]
+    fn crc_write_failure_preserves_mode_and_duration_but_discards_written_payload(
+        #[values(
+            CrcWriteResolutionMode::Full,
+            CrcWriteResolutionMode::Incremental,
+            CrcWriteResolutionMode::Cached,
+            CrcWriteResolutionMode::NotAttempted
+        )]
+        mode: CrcWriteResolutionMode,
+    ) {
+        let duration = Duration::from_millis(42);
+        let event = MetricEvent::CrcWrite(CrcWrite {
+            outcome: CrcWriteOutcome::Written { bytes_written: 100 },
+            resolution_mode: mode,
+            duration,
+        });
+        let MetricEvent::CrcWrite(event) = event.into_failure() else {
+            panic!("expected CrcWrite");
+        };
+        assert_eq!(event.outcome, CrcWriteOutcome::Error);
+        assert_eq!(event.resolution_mode, mode);
+        assert_eq!(event.duration, duration);
     }
 }
