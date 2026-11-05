@@ -33,6 +33,8 @@ pub(crate) mod column_default;
 pub use column_default::ColumnDefault;
 pub(crate) use column_default::{try_collect_column_defaults, validate_column_defaults_metadata};
 pub(crate) mod compare;
+mod shared_metadata;
+pub use shared_metadata::SharedFieldMetadata;
 #[cfg(feature = "schema-diff")]
 pub(crate) mod diff;
 pub(crate) mod generated_column;
@@ -382,7 +384,7 @@ pub struct StructField {
     /// Denotes whether this Field can be null
     pub nullable: bool,
     /// A JSON map containing information about this column
-    pub metadata: HashMap<String, MetadataValue>,
+    pub metadata: SharedFieldMetadata,
 }
 
 /// Parsed (and validated) pre-existing column-mapping annotations on a single field, as
@@ -414,7 +416,7 @@ impl StructField {
             name: name.into(),
             data_type: data_type.into(),
             nullable,
-            metadata: HashMap::default(),
+            metadata: SharedFieldMetadata::default(),
         }
     }
 
@@ -440,7 +442,7 @@ impl StructField {
             name: name.into(),
             data_type: spec.data_type(),
             nullable: spec.nullable(),
-            metadata,
+            metadata: metadata.into(),
         }
     }
 
@@ -720,7 +722,7 @@ impl StructField {
     }
 
     #[inline]
-    pub const fn metadata(&self) -> &HashMap<String, MetadataValue> {
+    pub fn metadata(&self) -> &HashMap<String, MetadataValue> {
         &self.metadata
     }
 
@@ -781,12 +783,14 @@ impl StructField {
     fn logical_to_physical_metadata(
         &self,
         column_mapping_mode: ColumnMappingMode,
-    ) -> HashMap<String, MetadataValue> {
+    ) -> SharedFieldMetadata {
         let mut base_metadata = self.metadata.clone();
         let physical_name_key = ColumnMetadataKey::ColumnMappingPhysicalName.as_ref();
         let field_id_key = ColumnMetadataKey::ColumnMappingId.as_ref();
         let parquet_field_id_key = ColumnMetadataKey::ParquetFieldId.as_ref();
-        let field_id = base_metadata.get(ColumnMetadataKey::ColumnMappingId.as_ref());
+        let field_id = base_metadata
+            .get(ColumnMetadataKey::ColumnMappingId.as_ref())
+            .cloned();
         match column_mapping_mode {
             ColumnMappingMode::Id => {
                 let Some(MetadataValue::Number(fid)) = field_id else {
@@ -800,10 +804,7 @@ impl StructField {
                     return base_metadata;
                 };
                 // Insert the parquet field id matching the column mapping id
-                base_metadata.insert(
-                    parquet_field_id_key.to_string(),
-                    MetadataValue::Number(*fid),
-                );
+                base_metadata.insert(parquet_field_id_key.to_string(), MetadataValue::Number(fid));
                 // Ensure that physical name is present
                 debug_assert!(base_metadata.contains_key(physical_name_key));
             }
@@ -823,10 +824,7 @@ impl StructField {
                     debug_assert!(false);
                     return base_metadata;
                 };
-                base_metadata.insert(
-                    parquet_field_id_key.to_string(),
-                    MetadataValue::Number(*fid),
-                );
+                base_metadata.insert(parquet_field_id_key.to_string(), MetadataValue::Number(fid));
                 // TODO(#1070): Remove nested column ids when they are supported in kernel
             }
             ColumnMappingMode::None => {

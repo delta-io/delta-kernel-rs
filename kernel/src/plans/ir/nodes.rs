@@ -979,7 +979,7 @@ impl Agg {
         let resolve = |value: &ColumnName, output_data_type: Option<DataType>, nullable: bool| {
             let field = input_schema.field_at(value)?;
             let (data_type, metadata) = match output_data_type {
-                Some(data_type) => (data_type, HashMap::new()),
+                Some(data_type) => (data_type, HashMap::new().into()),
                 None => (field.data_type.clone(), field.metadata.clone()),
             };
             Ok(StructField {
