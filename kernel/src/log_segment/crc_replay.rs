@@ -412,27 +412,28 @@ impl CrcReplayAccumulator {
             }
             None => FileStatsPolicy::Unsupported,
         };
-        let include_adds = policy != FileStatsPolicy::IgnoreAdds;
-        let include_removes = policy != FileStatsPolicy::IgnoreRemoves;
-        if policy == FileStatsPolicy::Unsupported
-            || (include_adds && !self.current_commit_adds_valid)
-            || (include_removes && !self.current_commit_removes_valid)
-        {
-            warn!(
-                operation = ?self.current_commit_operation,
-                "CRC reverse-replay: commit at {} has an unsupported operation or invalid \
-                 file statistics; defaulting to non-incremental-safe",
-                self.current_file_url.as_deref().unwrap_or("?")
-            );
-            self.delta.is_incremental_safe = false;
-        } else {
-            if include_adds {
-                self.delta.file_stats.accumulate(&self.current_commit_adds);
+        let fs = &mut self.delta.file_stats;
+        match policy {
+            FileStatsPolicy::ApplyAll
+                if self.current_commit_adds_valid && self.current_commit_removes_valid =>
+            {
+                fs.accumulate(&self.current_commit_adds);
+                fs.accumulate(&self.current_commit_removes);
             }
-            if include_removes {
-                self.delta
-                    .file_stats
-                    .accumulate(&self.current_commit_removes);
+            FileStatsPolicy::IgnoreAdds if self.current_commit_removes_valid => {
+                fs.accumulate(&self.current_commit_removes);
+            }
+            FileStatsPolicy::IgnoreRemoves if self.current_commit_adds_valid => {
+                fs.accumulate(&self.current_commit_adds);
+            }
+            _ => {
+                warn!(
+                    operation = ?self.current_commit_operation,
+                    "CRC reverse-replay: commit at {} has an unsupported operation or invalid \
+                     file statistics; defaulting to non-incremental-safe",
+                    self.current_file_url.as_deref().unwrap_or("?")
+                );
+                self.delta.is_incremental_safe = false;
             }
         }
         self.current_commit_adds_valid = true;
