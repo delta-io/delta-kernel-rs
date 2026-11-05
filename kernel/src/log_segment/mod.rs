@@ -955,7 +955,8 @@ impl LogSegment {
     /// by the actions it carries, and the commits and checkpoint files at or below that version are
     /// not read.
     ///
-    /// `table_root` resolves the action's manifest locations.
+    /// `table_root` resolves the action's manifest locations. `content_stats` holds the per-leaf
+    /// stats to read from the manifests, or `None` to read no stats.
     #[cfg(feature = "adaptive-metadata-in-dev")]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn read_actions_with_checkpoint_action(
@@ -966,6 +967,7 @@ impl LogSegment {
         commit_read_schema: SchemaRef,
         checkpoint_read_schema: SchemaRef,
         stats_schema: Option<&StructType>,
+        content_stats: Option<StructType>,
     ) -> KernelResult<ActionsWithCheckpointInfo<Box<dyn KernelResultIterator<ActionsBatch>>>> {
         let version = Version::try_from(checkpoint.version())
             .ok()
@@ -1014,6 +1016,7 @@ impl LogSegment {
             checkpoint,
             &LogRoot::new(table_root.clone())?,
             checkpoint_read_schema.clone(),
+            content_stats,
         )?;
         Ok(ActionsWithCheckpointInfo {
             actions: Box::new(commits.chain(checkpoint_actions)),

@@ -9,10 +9,6 @@ use url::Url;
 
 use crate::actions::NULL_COUNT;
 use crate::expressions::ColumnName;
-#[cfg(feature = "declarative-plans")]
-use crate::expressions::Predicate;
-#[cfg(feature = "declarative-plans")]
-use crate::scan::data_skipping::as_sql_data_skipping_predicate_with_stats_columns;
 use crate::scan::field_classifiers::TransformFieldClassifier;
 use crate::scan::transform_spec::{FieldTransformSpec, TransformSpec};
 use crate::scan::{PartitionValuesOptions, PhysicalPredicate, StatsOptions, StructStats};
@@ -677,26 +673,6 @@ impl StateInfo {
         self.physical_stats_schemas
             .as_ref()
             .and_then(|schemas| schemas.output.as_ref())
-    }
-
-    /// Returns the scan predicate rewritten over file metadata: `stats_parsed.*` stats and
-    /// `partitionValues_parsed.*` values. A file can be skipped when it evaluates to `false`.
-    /// `None` when the scan has no predicate or the predicate is ineligible for data skipping.
-    #[cfg(feature = "declarative-plans")]
-    pub(crate) fn data_skipping_predicate(&self) -> Option<Predicate> {
-        let PhysicalPredicate::Some(pred, _) = &self.physical_predicate else {
-            return None;
-        };
-        let partition_column_names = self
-            .physical_partition_schema
-            .iter()
-            .flat_map(|s| s.fields().map(|f| ColumnName::new([f.name()])))
-            .collect();
-        as_sql_data_skipping_predicate_with_stats_columns(
-            pred,
-            &partition_column_names,
-            &self.eligible_physical_stats_columns,
-        )
     }
 }
 

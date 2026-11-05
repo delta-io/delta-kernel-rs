@@ -5,15 +5,15 @@ use std::sync::Arc;
 
 use url::Url;
 
+use crate::actions::MAX_VALUES;
 /// Encodes manifest deletion vector positions as a Mumbling bitmap.
 pub(crate) use crate::content_tree::mumbling::tests::encode_positions as mumbling_bitmap;
-use crate::content_tree::skipping::content_stats_read_field_for_predicate;
-use crate::content_tree::stats::{field_with_id, stats_schema};
+use crate::content_tree::stats::{field_with_id, projected_stats_schema, stats_schema};
 use crate::content_tree::{
     AMT_FORMAT_VERSION, CONTENT_STATS_FIELD_NAME, ContentTreeNodeEntry, DataContentType,
     DataFileFormat, DeletionVectorInfo, ManifestInfo, TrackingInfo, TrackingStatus,
 };
-use crate::expressions::{ArrayData, Scalar, StructData, col, lit};
+use crate::expressions::{ArrayData, Scalar, StructData};
 use crate::schema::{ArrayType, DataType, StructField, StructType, ToSchema as _};
 use crate::{Engine, EngineData, FileMeta};
 
@@ -131,42 +131,45 @@ pub(crate) fn write_manifest(
     write_batch(engine, location, entry_batch(engine, entries))
 }
 
-/// Writes `entries` like [`write_manifest`], followed by a `content_stats` column (described by
-/// `content_stats`) holding `stats[i]` for entry `i`.
+/// Writes `entries` like [`write_manifest`], followed by a `content_stats` column of type
+/// `content_stats` holding `stats[i]` for entry `i`.
 pub(crate) fn write_manifest_with_stats(
     engine: &dyn Engine,
     location: Url,
     entries: &[ContentTreeNodeEntry],
-    content_stats: &StructField,
+    content_stats: &StructType,
     stats: Vec<Scalar>,
 ) -> FileMeta {
-    let column_type = ArrayType::new(content_stats.data_type().clone(), true);
+    let column_type = ArrayType::new(content_stats.clone(), true);
     let column = ArrayData::try_new(column_type, stats).unwrap();
-    let schema = Arc::new(StructType::new_unchecked([content_stats.clone()]));
+    let schema = ContentTreeNodeEntry::to_schema_with_content_stats(Some(content_stats.clone()));
+    let field = schema.field(CONTENT_STATS_FIELD_NAME).unwrap().clone();
     let data = entry_batch(engine, entries)
-        .append_columns(schema, vec![column])
+        .append_columns(Arc::new(StructType::new_unchecked([field])), vec![column])
         .unwrap();
     write_batch(engine, location, data)
 }
 
-/// The full `content_stats` field of a table whose only column `x` (field ID 1) is a LONG, and
-/// the read field of a skipping predicate on `x`'s max, which holds only `x`'s upper bound.
-pub(crate) fn x_content_stats() -> (StructField, StructField) {
-    let table = StructType::new_unchecked([field_with_id("x", DataType::LONG, true, 1)]);
-    let stats = stats_schema(&table).unwrap();
-    let skipping = col!("stats_parsed.maxValues.x").gt(lit(5i64));
-    let read = content_stats_read_field_for_predicate(&table, &skipping)
-        .unwrap()
-        .unwrap();
-    let full = field_with_id(CONTENT_STATS_FIELD_NAME, stats.into(), true, 146);
-    (full, read)
+/// Every `content_stats` stat of [`x_table`].
+pub(crate) fn x_full_stats() -> StructType {
+    stats_schema(&x_table()).unwrap()
 }
 
-/// A `content_stats` value of `field`'s type whose single leaf holds `values`, in field order.
-pub(crate) fn x_stats(field: &StructField, values: &[i64]) -> Scalar {
-    let DataType::Struct(stats) = field.data_type() else {
-        panic!("content_stats must be a struct");
-    };
+/// The `content_stats` stats of [`x_table`] a read of the Delta stat `maxValues.x` needs: only
+/// `x`'s upper bound.
+pub(crate) fn x_upper_bound_stats() -> StructType {
+    let max_values = StructType::new_unchecked([StructField::nullable("x", DataType::LONG)]);
+    let delta_stats = StructType::new_unchecked([StructField::nullable(MAX_VALUES, max_values)]);
+    projected_stats_schema(&x_table(), &delta_stats).unwrap()
+}
+
+/// A [`x_full_stats`] value: `x` ranges over `[1, 9]` across 10 values, none of them null.
+pub(crate) fn x_full_stats_value() -> Scalar {
+    x_stats(&x_full_stats(), &[1, 9, 10, 0])
+}
+
+/// A `content_stats` value of type `stats` whose single leaf holds `values`, in field order.
+pub(crate) fn x_stats(stats: &StructType, values: &[i64]) -> Scalar {
     let leaf_field = stats.fields().next().unwrap();
     let DataType::Struct(leaf) = leaf_field.data_type() else {
         panic!("leaf stats must be a struct");
@@ -175,6 +178,11 @@ pub(crate) fn x_stats(field: &StructField, values: &[i64]) -> Scalar {
     let leaf_stats = StructData::try_new(leaf.fields().cloned().collect(), leaf_values).unwrap();
     let fields = vec![leaf_field.clone()];
     Scalar::Struct(StructData::try_new(fields, vec![Scalar::Struct(leaf_stats)]).unwrap())
+}
+
+/// A physical table schema whose only column `x` (field ID 1) is a LONG.
+fn x_table() -> StructType {
+    StructType::new_unchecked([field_with_id("x", DataType::LONG, true, 1)])
 }
 
 /// Writes `data` as a single-batch parquet file at `location` and returns its [`FileMeta`].
@@ -295,27 +303,23 @@ mod tests {
         }
     }
 
-    /// The entry read schema followed by `content_stats`.
-    fn with_content_stats(content_stats: &StructField) -> StructType {
-        let schema = ContentTreeNodeEntry::to_schema();
-        StructType::new_unchecked(schema.fields().cloned().chain([content_stats.clone()]))
-    }
-
-    /// Reading with a narrowed `content_stats` field reads only the requested stats, by field ID.
+    /// Reading with narrowed `content_stats` reads only the requested stats, by field ID.
     #[test]
     fn manifest_read_projects_requested_content_stats() {
         let engine = SyncEngine::new_with_store(Arc::new(InMemory::new()));
-        let (full, read) = x_content_stats();
         let location = Url::parse("memory:///metadata/manifest.parquet").unwrap();
         let entries = [added_data_entry("a.parquet", 1, 10, 0, 1)];
-        let stats = vec![x_stats(&full, &[1, 9, 10, 0])];
-        let file = write_manifest_with_stats(&engine, location, &entries, &full, stats);
+        let stats = vec![x_full_stats_value()];
+        let file = write_manifest_with_stats(&engine, location, &entries, &x_full_stats(), stats);
 
-        let batch = read_back(&engine, &file, with_content_stats(&read));
+        let read = x_upper_bound_stats();
+        let schema = ContentTreeNodeEntry::to_schema_with_content_stats(Some(read.clone()));
+        let batch = read_back(&engine, &file, schema.clone());
+        let field = schema.field(CONTENT_STATS_FIELD_NAME).unwrap().clone();
         let expected = engine
             .evaluation_handler()
             .create_many(
-                Arc::new(StructType::new_unchecked([read.clone()])),
+                Arc::new(StructType::new_unchecked([field])),
                 vec![vec![x_stats(&read, &[9])]],
             )
             .unwrap()
@@ -330,8 +334,9 @@ mod tests {
     #[test]
     fn manifest_read_of_missing_content_stats_is_null() {
         let (engine, file) = write_test_manifest();
-        let (_, read) = x_content_stats();
-        let batch = read_back(&engine, &file, with_content_stats(&read));
+        let schema =
+            ContentTreeNodeEntry::to_schema_with_content_stats(Some(x_upper_bound_stats()));
+        let batch = read_back(&engine, &file, schema);
         let stats = batch.column_by_name(CONTENT_STATS_FIELD_NAME).unwrap();
         assert_eq!(stats.null_count(), batch.num_rows());
     }

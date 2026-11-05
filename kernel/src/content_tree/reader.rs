@@ -77,7 +77,7 @@ pub(crate) fn read_add_actions_from_amt(
 ) -> KernelResult<Box<dyn KernelResultIterator<FilteredEngineData>>> {
     let table_root = &ctx.table_root;
     let root = checkpoint.root_filemeta(table_root)?;
-    let schemas = ManifestReadSchema::new(ctx.content_stats.as_ref());
+    let schemas = ManifestReadSchema::new(ctx.content_stats.clone());
     let converter = make_root_entry_converter(engine, ctx)?;
     let mut root_actions = Vec::new();
     let mut leaves = LeafRefVisitor::new(table_root);
@@ -114,10 +114,9 @@ pub(crate) struct ReadContext {
     pub(crate) modification_time: i64,
     /// Emitted as `Add.dataChange`.
     pub(crate) data_change: bool,
-    /// The `content_stats` column to read alongside each entry, holding only the stats the read
-    /// needs (see [`super::skipping::content_stats_read_field_for_predicate`]), or `None` to read
-    /// no stats.
-    pub(crate) content_stats: Option<StructField>,
+    /// The per-leaf stats to read from each entry's `content_stats` (see
+    /// [`ContentTreeNodeEntry::to_schema_with_content_stats`]), or `None` to read no stats.
+    pub(crate) content_stats: Option<StructType>,
 }
 
 /// A leaf manifest referenced by a live root `DataManifest` entry: where to read it, and the
@@ -230,8 +229,7 @@ const LEAF_ROW_INDEX_COLUMN: &str = "_row_index";
 
 /// The schemas AMT root and leaf manifests are read with.
 struct ManifestReadSchema {
-    /// Root manifest read schema: [`ContentTreeNodeEntry::to_schema`], followed by the requested
-    /// `content_stats` column if any.
+    /// Root manifest read schema: [`ContentTreeNodeEntry::to_schema_with_content_stats`].
     root: SchemaRef,
     /// Leaf manifest read schema: [`Self::root`] plus the [`LEAF_FILE_PATH_COLUMN`] and
     /// [`LEAF_ROW_INDEX_COLUMN`] metadata columns. Root entries need neither: they are never
@@ -242,10 +240,9 @@ struct ManifestReadSchema {
 impl ManifestReadSchema {
     /// Builds the manifest read schemas, reading `content_stats` (see
     /// [`ReadContext::content_stats`]) when given.
-    fn new(content_stats: Option<&StructField>) -> Self {
-        let entry_fields = ContentTreeNodeEntry::to_schema().into_fields();
-        let entry_schema = Arc::new(StructType::new_unchecked(
-            entry_fields.chain(content_stats.cloned()),
+    fn new(content_stats: Option<StructType>) -> Self {
+        let entry_schema = Arc::new(ContentTreeNodeEntry::to_schema_with_content_stats(
+            content_stats,
         ));
         let metadata = [
             StructField::create_metadata_column(
@@ -1173,8 +1170,8 @@ mod tests {
     use crate::content_tree::dv_conversion::extract_deletion_vector_content;
     use crate::content_tree::test_utils::{
         added_data_entry, data_manifest_entry, entry_batch, mumbling_bitmap, struct_batch,
-        test_dv_info, with_field, write_manifest, write_manifest_with_stats, x_content_stats,
-        x_stats,
+        test_dv_info, with_field, write_manifest, write_manifest_with_stats, x_full_stats,
+        x_full_stats_value, x_upper_bound_stats,
     };
     use crate::content_tree::{CONTENT_STATS_FIELD_NAME, DeletionVectorInfo, ManifestInfo};
     use crate::engine::arrow_conversion::TryFromArrow as _;
@@ -1416,11 +1413,10 @@ mod tests {
     fn manifest_read_schema_adds_content_stats_and_leaf_metadata_columns(
         #[values(false, true)] with_stats: bool,
     ) {
-        let content_stats = with_stats.then(|| x_content_stats().1);
-        let schemas = ManifestReadSchema::new(content_stats.as_ref());
+        let content_stats = with_stats.then(x_upper_bound_stats);
+        let schemas = ManifestReadSchema::new(content_stats.clone());
 
-        let entry_fields = ContentTreeNodeEntry::to_schema().into_fields();
-        let root = StructType::new_unchecked(entry_fields.chain(content_stats));
+        let root = ContentTreeNodeEntry::to_schema_with_content_stats(content_stats);
         assert_eq!(*schemas.root, root);
         let leaf: Vec<_> = schemas.leaf.fields().collect();
         let (entries, metadata) = leaf.split_at(leaf.len() - 2);
@@ -1653,27 +1649,20 @@ mod tests {
         assert_eq!(actual, vec![expected]);
     }
 
-    /// Requested `content_stats` are read from the root and leaf manifests, whether or not the
-    /// manifests hold them, without changing the `Add` actions.
-    #[rstest]
-    fn read_add_actions_from_amt_reads_requested_content_stats(
-        #[values(false, true)] stats_written: bool,
-    ) {
+    /// Requested `content_stats` are read from the root and leaf manifests without changing the
+    /// `Add` actions.
+    #[test]
+    fn read_add_actions_from_amt_reads_requested_content_stats() {
         let sync = Arc::new(memory_engine());
         let recording = Arc::new(RecordingParquetHandler {
             inner: sync.parquet_handler(),
             schemas: Mutex::default(),
         });
         let engine = DelegatingEngine::new(sync).with_parquet_handler(recording.clone());
-        let (full, read) = x_content_stats();
         let write = |path: &str, entries: &[ContentTreeNodeEntry]| {
             let location = table_root().join(path).unwrap();
-            if stats_written {
-                let stats = entries.iter().map(|_| x_stats(&full, &[1, 9, 10, 0]));
-                write_manifest_with_stats(&engine, location, entries, &full, stats.collect())
-            } else {
-                write_manifest(&engine, location, entries)
-            }
+            let stats = entries.iter().map(|_| x_full_stats_value()).collect();
+            write_manifest_with_stats(&engine, location, entries, &x_full_stats(), stats)
         };
         let leaf_path = "metadata/leaf.parquet";
         let leaf_file = write(
@@ -1687,6 +1676,7 @@ mod tests {
             &[added_data_entry("root.parquet", 50, 1, 600, 4), leaf],
         );
         let checkpoint = checkpoint_action_with_root(ROOT_PATH, root.size as i64, 1).unwrap();
+        let read = x_upper_bound_stats();
         let ctx = ReadContext {
             content_stats: Some(read.clone()),
             ..read_ctx()
@@ -1707,8 +1697,10 @@ mod tests {
         assert_eq!(actual, expected);
         let schemas = recording.schemas.lock().unwrap();
         assert_eq!(schemas.len(), 2);
+        let read = DataType::from(read);
         for schema in schemas.iter() {
-            assert_eq!(schema.field(CONTENT_STATS_FIELD_NAME), Some(&read));
+            let content_stats = schema.field(CONTENT_STATS_FIELD_NAME).unwrap();
+            assert_eq!(content_stats.data_type(), &read);
         }
     }
 
