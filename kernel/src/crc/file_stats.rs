@@ -161,6 +161,18 @@ impl FileStatsDelta {
         }
     }
 
+    /// Clears counters and histogram bins while retaining boundaries and allocations.
+    pub(crate) fn clear(&mut self) {
+        if let Some(histogram) = self.net_histogram.as_mut() {
+            histogram.file_counts.fill(0);
+            histogram.total_bytes.fill(0);
+        }
+        *self = Self {
+            net_histogram: self.net_histogram.take(),
+            ..Default::default()
+        };
+    }
+
     /// Net change in file count (added minus removed).
     pub(crate) fn net_files(&self) -> i64 {
         self.gross_add_files as i64 - self.gross_remove_files as i64
