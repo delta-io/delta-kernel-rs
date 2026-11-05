@@ -810,7 +810,7 @@ impl From<&StructField> for proto_schema::StructField {
         let metadata = field
             .metadata
             .iter()
-            .map(|(key, value)| (key.clone(), value.into()))
+            .map(|(key, value)| (key.to_string(), value.into()))
             .collect();
         proto_schema::StructField {
             name: field.name.clone(),
@@ -857,7 +857,7 @@ impl TryFrom<proto_schema::StructField> for StructField {
         let metadata = proto
             .metadata
             .into_iter()
-            .map(|(key, value)| Ok::<_, KernelError>((key, MetadataValue::try_from(value)?)))
+            .map(|(key, value)| Ok::<_, KernelError>((key.into(), MetadataValue::try_from(value)?)))
             .collect::<KernelResult<std::collections::HashMap<_, _>>>()?;
         Ok(StructField {
             name: proto.name,
