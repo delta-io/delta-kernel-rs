@@ -332,7 +332,11 @@ mod adaptive_metadata {
             }})
             .to_string()
         };
+        // adaptiveMetadata snapshots read the newest commit's In-Commit Timestamp.
+        let commit_info =
+            serde_json::json!({"commitInfo": {"timestamp": 1, "inCommitTimestamp": 1}}).to_string();
         let commit = [
+            commit_info,
             add(
                 "a.parquet",
                 r#"{"numRecords":1,"tightBounds":true,"tightStats":true}"#,
