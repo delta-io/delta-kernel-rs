@@ -5,8 +5,10 @@ use std::sync::LazyLock;
 
 use super::utils::{validate_partition_keys, validate_required_field_exist};
 use super::{FileActionUniquenessValidator, StagedDataValidator, Validation};
+use crate::actions::TIGHT_STATS;
 use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
-use crate::scan::log_replay::CLUSTERING_PROVIDER_NAME;
+use crate::expressions::ColumnName;
+use crate::scan::log_replay::{CLUSTERING_PROVIDER_NAME, STATS_NAME};
 use crate::schema::{ColumnNamesAndTypes, column_name, schema_ref};
 use crate::transaction::{ADD_FILE_CLUSTERING_PROVIDER_FIELD, mandatory_add_file_schema};
 use crate::utils::require;
@@ -23,6 +25,14 @@ static ADD_FILE_COLUMNS_FOR_VALIDATION: LazyLock<ColumnNamesAndTypes> =
 
 static CLUSTERING_PROVIDER_COLUMNS: LazyLock<ColumnNamesAndTypes> =
     LazyLock::new(|| schema_ref! { (&ADD_FILE_CLUSTERING_PROVIDER_FIELD) }.leaves(None));
+
+static TIGHT_STATS_COLUMNS: LazyLock<ColumnNamesAndTypes> = LazyLock::new(|| {
+    schema_ref! {
+        not_null "path": STRING,
+        nullable STATS_NAME: { nullable TIGHT_STATS: BOOLEAN },
+    }
+    .leaves(None)
+});
 
 /// Runs mandatory validations for every staged AddFile row. When `uniqueness_validator` is
 /// provided, also validates file-action (addFile, removeFile) uniqueness across `adds` and the
@@ -42,16 +52,23 @@ pub(crate) fn validate_add_files(
 pub(crate) fn validate_no_clustering_providers_set(
     batches: &[Box<dyn EngineData>],
 ) -> KernelResult<()> {
-    let mut validator = StagedDataValidator::new(
+    validate_batches_with_column(
+        batches,
+        &column_name!(CLUSTERING_PROVIDER_NAME),
         &CLUSTERING_PROVIDER_COLUMNS,
-        vec![Box::new(UnclusteredFile)],
-    );
-    for batch in batches {
-        if batch.has_field(&column_name!(CLUSTERING_PROVIDER_NAME)) {
-            RowVisitor::visit_rows_of(&mut validator, batch.as_ref())?;
-        }
-    }
-    Ok(())
+        UnclusteredFile,
+    )
+}
+
+/// Rejects batches with a non-null `stats.tightStats`. Any non-null value promises
+/// microsecond-precision timestamp bounds, which commit does not serialize.
+pub(crate) fn validate_no_tight_stats_set(batches: &[Box<dyn EngineData>]) -> KernelResult<()> {
+    validate_batches_with_column(
+        batches,
+        &column_name!(STATS_NAME, TIGHT_STATS),
+        &TIGHT_STATS_COLUMNS,
+        NoTightStats,
+    )
 }
 
 impl<'a> StagedDataValidator<'a> {
@@ -166,6 +183,42 @@ impl Validation for UnclusteredFile {
     }
 }
 
+/// Expects getters `[path, stats.tightStats]`, matching [`TIGHT_STATS_COLUMNS`].
+struct NoTightStats;
+
+impl Validation for NoTightStats {
+    fn validate_row<'a>(
+        &mut self,
+        row: usize,
+        getters: &[&'a dyn GetData<'a>],
+    ) -> KernelResult<()> {
+        if let Some(tight_stats) = getters[1].get_bool(row, TIGHT_STATS)? {
+            let path: &str = getters[0].get(row, "path")?;
+            return Err(KernelError::unsupported(format!(
+                "AddFile for '{path}' sets stats.{TIGHT_STATS} to {tight_stats}; writing \
+                 {TIGHT_STATS} is not supported, so it must be null"
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// Runs `validation` over every batch that has `column`, skipping batches that lack it.
+fn validate_batches_with_column(
+    batches: &[Box<dyn EngineData>],
+    column: &ColumnName,
+    columns_and_types: &'static ColumnNamesAndTypes,
+    validation: impl Validation + 'static,
+) -> KernelResult<()> {
+    let mut validator = StagedDataValidator::new(columns_and_types, vec![Box::new(validation)]);
+    for batch in batches {
+        if batch.has_field(column) {
+            RowVisitor::visit_rows_of(&mut validator, batch.as_ref())?;
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -174,7 +227,9 @@ mod tests {
     use test_utils::replace_column;
 
     use super::*;
-    use crate::arrow::array::Int64Array;
+    use crate::actions::NUM_RECORDS;
+    use crate::arrow::array::{ArrayRef, BooleanArray, Int64Array, StringArray, StructArray};
+    use crate::arrow::datatypes::{DataType as ArrowDataType, Field};
     use crate::arrow::record_batch::RecordBatch;
     use crate::engine::arrow_data::ArrowEngineData;
     use crate::expressions::column_name;
@@ -424,6 +479,65 @@ mod tests {
             message.contains(expected_error),
             "expected error message to contain {expected_error:?}, got {message:?}"
         );
+    }
+
+    /// Builds a `path` + `stats` batch, where `stats` has `tightStats` only when `tight_stats` is
+    /// `Some`.
+    fn add_files_with_tight_stats(
+        paths: &[&str],
+        tight_stats: Option<&[Option<bool>]>,
+    ) -> Box<dyn EngineData> {
+        let num_records: ArrayRef = Arc::new(Int64Array::from(vec![1; paths.len()]));
+        let mut stats_fields = vec![(
+            Arc::new(Field::new(NUM_RECORDS, ArrowDataType::Int64, true)),
+            num_records,
+        )];
+        if let Some(values) = tight_stats {
+            stats_fields.push((
+                Arc::new(Field::new(TIGHT_STATS, ArrowDataType::Boolean, true)),
+                Arc::new(BooleanArray::from(values.to_vec())),
+            ));
+        }
+        let batch = RecordBatch::try_from_iter([
+            (
+                "path",
+                Arc::new(StringArray::from(paths.to_vec())) as ArrayRef,
+            ),
+            (STATS_NAME, Arc::new(StructArray::from(stats_fields))),
+        ])
+        .unwrap();
+        Box::new(ArrowEngineData::new(batch))
+    }
+
+    #[rstest]
+    #[case::column_absent(None, None)]
+    #[case::null(Some(None), None)]
+    #[case::tight(
+        Some(Some(true)),
+        Some("AddFile for 'file-2' sets stats.tightStats to true")
+    )]
+    #[case::wide(
+        Some(Some(false)),
+        Some("AddFile for 'file-2' sets stats.tightStats to false")
+    )]
+    fn tight_stats_rejected_only_when_non_null(
+        #[case] last_tight_stats: Option<Option<bool>>,
+        #[case] expected_error: Option<&str>,
+    ) {
+        // The first batch lacks `tightStats` entirely, so it must be skipped rather than error.
+        let second_batch_tight_stats = last_tight_stats.map(|value| [None, value]);
+        let batches = [
+            add_files_with_tight_stats(&["file-0"], None),
+            add_files_with_tight_stats(
+                &["file-1", "file-2"],
+                second_batch_tight_stats.as_ref().map(|values| &values[..]),
+            ),
+        ];
+        let result = validate_no_tight_stats_set(&batches);
+        match expected_error {
+            Some(expected_error) => assert_result_error_with_message(result, expected_error),
+            None => result.unwrap(),
+        }
     }
 
     #[test]
