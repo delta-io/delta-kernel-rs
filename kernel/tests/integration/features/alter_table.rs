@@ -1531,7 +1531,7 @@ async fn chain_add_column_and_set_nullable(
 fn field_with_stray_key(name: &str, key: &ColumnMetadataKey, ty: DataType) -> StructField {
     let mut f = StructField::nullable(name, ty);
     f.metadata
-        .insert(key.as_ref().to_string(), MetadataValue::Number(99));
+        .insert(key.as_ref().into(), MetadataValue::Number(99));
     f
 }
 

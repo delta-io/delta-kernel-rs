@@ -30,8 +30,8 @@ use crate::arrow::error::ArrowError;
 use crate::error::KernelError;
 use crate::parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 use crate::schema::{
-    ArrayType, ColumnMetadataKey, DataType, MapType, MetadataValue, PrimitiveType, StructField,
-    StructType,
+    ArrayType, ColumnMetadataKey, DataType, MapType, MetadataKey, MetadataValue, PrimitiveType,
+    StructField, StructType,
 };
 
 pub(crate) const LIST_ARRAY_ROOT: &str = "element";
@@ -49,10 +49,10 @@ pub(crate) fn kernel_flat_parquet_id_to_arrow_metadata(
         .metadata()
         .iter()
         .map(|(key, val)| {
-            let transformed_key = if key == ColumnMetadataKey::ParquetFieldId.as_ref() {
+            let transformed_key = if key.as_str() == ColumnMetadataKey::ParquetFieldId.as_ref() {
                 PARQUET_FIELD_ID_META_KEY.to_string()
             } else {
-                key.clone()
+                key.to_string()
             };
             match val {
                 MetadataValue::String(s) => Ok((transformed_key, s.clone())),
@@ -455,7 +455,7 @@ impl TryFromArrow<&ArrowField> for StructField {
                 ColumnMetadataKey::ParquetFieldId.as_ref(),
             )));
         }
-        let mut kernel_metadata: HashMap<String, MetadataValue> = arrow_metadata
+        let mut kernel_metadata: HashMap<MetadataKey, MetadataValue> = arrow_metadata
             .iter()
             .map(|(k, v)| -> Result<_, ArrowError> {
                 // Transform "PARQUET:field_id" to "parquet.field.id" when reading from Parquet.
@@ -469,7 +469,7 @@ impl TryFromArrow<&ArrowField> for StructField {
                         ))
                     })?;
                     return Ok((
-                        ColumnMetadataKey::ParquetFieldId.as_ref().to_string(),
+                        ColumnMetadataKey::ParquetFieldId.as_ref().into(),
                         MetadataValue::Number(id),
                     ));
                 }
@@ -480,9 +480,9 @@ impl TryFromArrow<&ArrowField> for StructField {
                             arrow_field.name()
                         ))
                     })?;
-                    return Ok((k.clone(), MetadataValue::Other(value)));
+                    return Ok((k.as_str().into(), MetadataValue::Other(value)));
                 }
-                Ok((k.clone(), MetadataValue::from(v)))
+                Ok((k.as_str().into(), MetadataValue::from(v)))
             })
             .collect::<Result<_, _>>()?;
         let mut nested_ids = serde_json::Map::new();
@@ -493,9 +493,7 @@ impl TryFromArrow<&ArrowField> for StructField {
         )?;
         if !nested_ids.is_empty() {
             kernel_metadata.insert(
-                ColumnMetadataKey::ColumnMappingNestedIds
-                    .as_ref()
-                    .to_string(),
+                ColumnMetadataKey::ColumnMappingNestedIds.as_ref().into(),
                 MetadataValue::Other(serde_json::Value::Object(nested_ids)),
             );
         }

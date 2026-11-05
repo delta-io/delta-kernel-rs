@@ -9,7 +9,7 @@ use itertools::Itertools;
 use super::arrow_conversion::TryIntoArrow as _;
 use crate::arrow::datatypes::{DataType as ArrowDataType, Field as ArrowField, TimeUnit};
 use crate::engine::arrow_utils::make_arrow_error;
-use crate::schema::{DataType, MetadataValue, StructField};
+use crate::schema::{DataType, MetadataKey, MetadataValue, StructField};
 use crate::utils::require;
 use crate::{KernelError, KernelResult};
 
@@ -340,14 +340,14 @@ impl PartialEq<String> for MetadataValue {
 
 // Compare kernel metadata with Arrow's version-specific metadata container.
 fn metadata_eq<'a>(
-    kernel_metadata: &HashMap<String, MetadataValue>,
+    kernel_metadata: &HashMap<MetadataKey, MetadataValue>,
     arrow_metadata: impl IntoIterator<Item = (&'a String, &'a String)>,
 ) -> bool {
     let mut arrow_len = 0;
     for (key, value) in arrow_metadata {
         arrow_len += 1;
         if !kernel_metadata
-            .get(key)
+            .get(key.as_str())
             .is_some_and(|kernel_value| *kernel_value == *value)
         {
             return false;

@@ -333,7 +333,7 @@ mod tests {
     fn field_with_metadata(name: &str, dtype: impl Into<DataType>, key: &str) -> StructField {
         let mut f = StructField::nullable(name, dtype);
         f.metadata.insert(
-            key.to_string(),
+            key.into(),
             MetadataValue::Other(serde_json::json!({ "x.element": 1 })),
         );
         f
