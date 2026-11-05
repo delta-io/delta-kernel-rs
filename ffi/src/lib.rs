@@ -65,7 +65,7 @@ pub mod error;
 pub mod rest_engine;
 #[cfg(feature = "default-engine-base")]
 pub mod table_changes;
-use error::{AllocateError, AllocateErrorFn, ExternResult, IntoExternResult};
+use error::{AllocateError, ErrorAllocators, ExternResult, IntoExternResult};
 #[cfg(feature = "delta-kernel-unity-catalog")]
 pub mod delta_kernel_unity_catalog;
 pub mod expressions;
@@ -481,14 +481,18 @@ pub struct ExclusiveRustString;
 ///
 /// # Safety
 ///
+/// `error_allocators` must be non-null, aligned, and point to an initialized [`ErrorAllocators`]
+/// for this call. Its callbacks and context must satisfy [`ErrorAllocators`]'s requirements until
+/// this call returns.
+///
 /// Caller is responsible for passing a valid KernelStringSlice
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn allocate_kernel_string(
     kernel_str: KernelStringSlice,
-    error_fn: AllocateErrorFn,
+    error_allocators: *const ErrorAllocators,
 ) -> ExternResult<Handle<ExclusiveRustString>> {
     let result = allocate_kernel_string_impl(kernel_str);
-    unsafe { result.into_extern_result(&error_fn) }
+    unsafe { result.into_extern_result(&*error_allocators) }
 }
 
 fn allocate_kernel_string_impl(
@@ -753,9 +757,11 @@ pub unsafe extern "C" fn free_engine_data(engine_data: Handle<ExclusiveEngineDat
     unsafe { engine_data.drop_handle() }
 }
 
-// A wrapper for Engine which defines additional FFI-specific methods.
+/// An engine and the connector callbacks used to return its FFI errors.
 pub trait ExternEngine: Send + Sync {
+    /// Returns a shared reference to the engine used for Kernel operations.
     fn engine(&self) -> Arc<dyn Engine>;
+    /// Returns the registered allocator for errors from operations using this engine.
     fn error_allocator(&self) -> &dyn AllocateError;
 }
 
@@ -766,7 +772,7 @@ pub struct SharedExternEngine;
 struct ExternEngineVtable {
     // Actual engine instance to use
     engine: Arc<dyn Engine>,
-    allocate_error: AllocateErrorFn,
+    error_allocators: ErrorAllocators,
 }
 
 #[cfg(feature = "default-engine-base")]
@@ -776,32 +782,13 @@ impl Drop for ExternEngineVtable {
     }
 }
 
-/// # Safety
-///
-/// Kernel doesn't use any threading or concurrency. If engine chooses to do so, engine is
-/// responsible for handling  any races that could result.
-#[cfg(feature = "default-engine-base")]
-unsafe impl Send for ExternEngineVtable {}
-
-/// # Safety
-///
-/// Kernel doesn't use any threading or concurrency. If engine chooses to do so, engine is
-/// responsible for handling any races that could result.
-///
-/// These are needed because anything wrapped in Arc "should" implement it
-/// Basically, by failing to implement these traits, we forbid the engine from being able to declare
-/// its thread-safety (because rust assumes it is not threadsafe). By implementing them, we leave it
-/// up to the engine to enforce thread safety if engine chooses to use threads at all.
-#[cfg(feature = "default-engine-base")]
-unsafe impl Sync for ExternEngineVtable {}
-
 #[cfg(feature = "default-engine-base")]
 impl ExternEngine for ExternEngineVtable {
     fn engine(&self) -> Arc<dyn Engine> {
         self.engine.clone()
     }
     fn error_allocator(&self) -> &dyn AllocateError {
-        &self.allocate_error
+        &self.error_allocators
     }
 }
 
@@ -833,7 +820,7 @@ pub(crate) enum ObjectStoreBackend {
 #[cfg(feature = "default-engine-base")]
 pub struct FfiEngineBuilder {
     url: Url,
-    allocate_fn: AllocateErrorFn,
+    error_allocators: ErrorAllocators,
     options: HashMap<String, String>,
     object_store_backend: ObjectStoreBackend,
     /// Configuration for multithreaded executor. If Some, use a multi-threaded executor
@@ -881,26 +868,31 @@ pub struct ExclusiveEngineBuilder;
 /// [`builder_build`] or [`free_engine_builder`].
 ///
 /// # Safety
+///
+/// `error_allocators` must be non-null, aligned, and point to an initialized [`ErrorAllocators`]
+/// for this call. The table is copied; its callbacks and context must satisfy [`ErrorAllocators`]'s
+/// requirements for the lifetime of the returned builder and any engine built from it.
 /// Caller is responsible for passing a valid path pointer.
 #[cfg(feature = "default-engine-base")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn get_engine_builder(
     path: KernelStringSlice,
-    allocate_error: AllocateErrorFn,
+    error_allocators: *const ErrorAllocators,
 ) -> ExternResult<Handle<ExclusiveEngineBuilder>> {
+    let error_allocators = unsafe { *error_allocators };
     let url = unsafe { unwrap_and_parse_path_as_url(path) };
-    let result = get_engine_builder_impl(url, allocate_error);
-    unsafe { result.into_extern_result(&allocate_error) }
+    let result = get_engine_builder_impl(url, error_allocators);
+    unsafe { result.into_extern_result(&error_allocators) }
 }
 
 #[cfg(feature = "default-engine-base")]
 fn get_engine_builder_impl(
     url: KernelResult<Url>,
-    allocate_fn: AllocateErrorFn,
+    error_allocators: ErrorAllocators,
 ) -> KernelResult<Handle<ExclusiveEngineBuilder>> {
     let builder = Box::new(FfiEngineBuilder {
         url: url?,
-        allocate_fn,
+        error_allocators,
         options: HashMap::default(),
         object_store_backend: ObjectStoreBackend::default(),
         multithreaded_executor_config: None,
@@ -940,9 +932,9 @@ pub unsafe extern "C" fn builder_with_option(
     value: KernelStringSlice,
 ) -> ExternResult<Handle<ExclusiveEngineBuilder>> {
     let mut builder = unsafe { builder.into_inner() };
-    let allocate_fn = builder.allocate_fn;
+    let error_allocators = builder.error_allocators;
     let result = builder_with_option_impl(&mut builder, key, value).map(|_| builder.into());
-    unsafe { result.into_extern_result(&allocate_fn) }
+    unsafe { result.into_extern_result(&error_allocators) }
 }
 #[cfg(feature = "default-engine-base")]
 fn builder_with_option_impl(
@@ -1042,11 +1034,11 @@ pub unsafe extern "C" fn builder_with_rest_object_store(
     context: NullableCvoid,
 ) -> ExternResult<Handle<ExclusiveEngineBuilder>> {
     let mut builder = unsafe { builder.into_inner() };
-    let allocate_fn = builder.allocate_fn;
+    let error_allocators = builder.error_allocators;
     let result =
         builder_with_rest_object_store_impl(&mut builder, endpoint_config, callback, context)
             .map(|_| builder.into());
-    unsafe { result.into_extern_result(&allocate_fn) }
+    unsafe { result.into_extern_result(&error_allocators) }
 }
 
 #[cfg(feature = "default-engine-base")]
@@ -1064,7 +1056,7 @@ fn builder_with_rest_object_store_impl(
             endpoint_config,
             callback,
             context,
-            builder.allocate_fn,
+            builder.error_allocators,
         )?));
     Ok(())
 }
@@ -1089,30 +1081,37 @@ pub unsafe extern "C" fn builder_build(
         builder_box.object_store_backend,
         builder_box.multithreaded_executor_config,
         builder_box.io_config,
-        builder_box.allocate_fn,
+        builder_box.error_allocators,
     );
-    unsafe { result.into_extern_result(&builder_box.allocate_fn) }
+    unsafe { result.into_extern_result(&builder_box.error_allocators) }
 }
 
+/// Creates a default engine for `path` and retains a copy of its error allocation callbacks.
+///
+/// Returns an engine handle, or an allocated error if the path or engine configuration is invalid.
+///
 /// # Safety
 ///
-/// Caller is responsible for passing a valid path pointer.
+/// `error_allocators` must be non-null, aligned, and point to an initialized [`ErrorAllocators`]
+/// for this call. Its callbacks and context must satisfy [`ErrorAllocators`]'s requirements for
+/// the lifetime of the returned engine. `path` must reference readable memory for its length.
 #[cfg(feature = "default-engine-base")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn get_default_engine(
     path: KernelStringSlice,
-    allocate_error: AllocateErrorFn,
+    error_allocators: *const ErrorAllocators,
 ) -> ExternResult<Handle<SharedExternEngine>> {
+    let error_allocators = unsafe { *error_allocators };
     let url = unsafe { unwrap_and_parse_path_as_url(path) };
-    let result = get_default_default_engine_impl(url, allocate_error);
-    unsafe { result.into_extern_result(&allocate_error) }
+    let result = get_default_default_engine_impl(url, error_allocators);
+    unsafe { result.into_extern_result(&error_allocators) }
 }
 
 // get the default version of the default engine :)
 #[cfg(feature = "default-engine-base")]
 fn get_default_default_engine_impl(
     url: KernelResult<Url>,
-    allocate_error: AllocateErrorFn,
+    error_allocators: ErrorAllocators,
 ) -> KernelResult<Handle<SharedExternEngine>> {
     get_default_engine_impl(
         url?,
@@ -1120,7 +1119,7 @@ fn get_default_default_engine_impl(
         ObjectStoreBackend::default(),
         None,
         IoConcurrencyConfig::default(),
-        allocate_error,
+        error_allocators,
     )
 }
 
@@ -1130,11 +1129,11 @@ fn get_default_default_engine_impl(
 #[cfg(feature = "default-engine-base")]
 fn engine_to_handle(
     engine: Arc<dyn Engine>,
-    allocate_error: AllocateErrorFn,
+    error_allocators: ErrorAllocators,
 ) -> Handle<SharedExternEngine> {
     let engine: Arc<dyn ExternEngine> = Arc::new(ExternEngineVtable {
         engine,
-        allocate_error,
+        error_allocators,
     });
     engine.into()
 }
@@ -1150,7 +1149,7 @@ fn get_default_engine_impl(
     object_store_backend: ObjectStoreBackend,
     executor_config: Option<MultithreadedExecutorConfig>,
     io_config: IoConcurrencyConfig,
-    allocate_error: AllocateErrorFn,
+    error_allocators: ErrorAllocators,
 ) -> KernelResult<Handle<SharedExternEngine>> {
     use delta_kernel_default_engine::storage::store_from_url_opts;
 
@@ -1160,7 +1159,7 @@ fn get_default_engine_impl(
             rest_engine::build_rest_object_store(&url, &options, rest.as_ref())?
         }
     };
-    build_engine_from_store(store, executor_config, io_config, allocate_error)
+    build_engine_from_store(store, executor_config, io_config, error_allocators)
 }
 
 /// Assemble a default engine from a pre-built [`ObjectStore`], applying executor and read-path I/O
@@ -1170,7 +1169,7 @@ pub(crate) fn build_engine_from_store(
     store: Arc<dyn ObjectStore>,
     executor_config: Option<MultithreadedExecutorConfig>,
     io_config: IoConcurrencyConfig,
-    allocate_error: AllocateErrorFn,
+    error_allocators: ErrorAllocators,
 ) -> KernelResult<Handle<SharedExternEngine>> {
     use delta_kernel_default_engine::DefaultEngineBuilder;
 
@@ -1202,7 +1201,7 @@ pub(crate) fn build_engine_from_store(
         Arc::new(builder.build())
     };
 
-    Ok(engine_to_handle(engine, allocate_error))
+    Ok(engine_to_handle(engine, error_allocators))
 }
 
 /// # Safety
@@ -1975,15 +1974,17 @@ mod tests {
     use url::Url;
 
     use super::*;
-    use crate::error::{EngineError, FFIKernelError};
+    use crate::error::FFIKernelError;
     use crate::ffi_test_utils::{
-        allocate_err, allocate_str, assert_extern_result_error_contains,
+        TEST_ERROR_ALLOCATORS, allocate_str, assert_extern_result_error_contains,
         assert_extern_result_error_with_message, build_snapshot, ok_or_panic, recover_string,
         setup_snapshot,
     };
 
-    #[unsafe(no_mangle)]
-    extern "C" fn allocate_null_err(_: FFIKernelError, _: KernelStringSlice) -> *mut EngineError {
+    unsafe extern "C" fn allocate_null_err(
+        _: *mut std::ffi::c_void,
+        _: *const crate::error::allocation::KernelErrorInfo,
+    ) -> *mut std::ffi::c_void {
         std::ptr::null_mut()
     }
 
@@ -2072,7 +2073,7 @@ mod tests {
     fn snapshot_builder_log_tail_rejects_null_nonempty_pointer() {
         let engine = engine_to_handle(
             Arc::new(DefaultEngineBuilder::new(Arc::new(InMemory::new())).build()),
-            allocate_err,
+            TEST_ERROR_ALLOCATORS,
         );
         let table_root = "memory:///test_table/";
         let builder = unsafe {
@@ -2125,7 +2126,7 @@ mod tests {
         .await?;
         let engine = engine_to_handle(
             Arc::new(DefaultEngineBuilder::new(storage.clone()).build()),
-            allocate_err,
+            TEST_ERROR_ALLOCATORS,
         );
         let snap = unsafe { build_snapshot(kernel_string_slice!(path), engine.shallow_copy()) };
         Ok((storage, engine, snap))
@@ -2150,7 +2151,7 @@ mod tests {
         .await?;
         let engine = engine_to_handle(
             Arc::new(DefaultEngineBuilder::new(storage.clone()).build()),
-            allocate_err,
+            TEST_ERROR_ALLOCATORS,
         );
         let snap = unsafe {
             let ptr = ok_or_panic(get_snapshot_builder(
@@ -2187,7 +2188,7 @@ mod tests {
 
     pub(crate) fn get_default_engine(path: &str) -> Handle<SharedExternEngine> {
         let path = kernel_string_slice!(path);
-        let builder = unsafe { ok_or_panic(get_engine_builder(path, allocate_err)) };
+        let builder = unsafe { ok_or_panic(get_engine_builder(path, &TEST_ERROR_ALLOCATORS)) };
         unsafe { ok_or_panic(builder_build(builder)) }
     }
 
@@ -2203,7 +2204,10 @@ mod tests {
     fn free_engine_builder_drops_unbuilt_builder() {
         let path = "memory:///doesntmatter/foo";
         unsafe {
-            let builder = ok_or_panic(get_engine_builder(kernel_string_slice!(path), allocate_err));
+            let builder = ok_or_panic(get_engine_builder(
+                kernel_string_slice!(path),
+                &TEST_ERROR_ALLOCATORS,
+            ));
             free_engine_builder(builder);
         }
     }
@@ -2214,7 +2218,10 @@ mod tests {
         let key = "custom-option";
         let value = "value";
         unsafe {
-            let builder = ok_or_panic(get_engine_builder(kernel_string_slice!(path), allocate_err));
+            let builder = ok_or_panic(get_engine_builder(
+                kernel_string_slice!(path),
+                &TEST_ERROR_ALLOCATORS,
+            ));
             let builder = ok_or_panic(builder_with_option(
                 builder,
                 kernel_string_slice!(key),
@@ -2238,7 +2245,10 @@ mod tests {
             len: invalid_utf8.len(),
         };
         unsafe {
-            let builder = ok_or_panic(get_engine_builder(kernel_string_slice!(path), allocate_err));
+            let builder = ok_or_panic(get_engine_builder(
+                kernel_string_slice!(path),
+                &TEST_ERROR_ALLOCATORS,
+            ));
             assert_extern_result_error_with_message(
                 builder_with_option(builder, invalid_key, kernel_string_slice!(value)),
                 FFIKernelError::Utf8Error,
@@ -2252,7 +2262,10 @@ mod tests {
     fn builder_build_error_consumes_builder() {
         let path = "unsupported-scheme:///doesntmatter/foo";
         unsafe {
-            let builder = ok_or_panic(get_engine_builder(kernel_string_slice!(path), allocate_err));
+            let builder = ok_or_panic(get_engine_builder(
+                kernel_string_slice!(path),
+                &TEST_ERROR_ALLOCATORS,
+            ));
             assert_extern_result_error_contains(
                 builder_build(builder),
                 FFIKernelError::ObjectStoreError,
@@ -2265,7 +2278,10 @@ mod tests {
     fn rest_object_store_error_consumes_builder() {
         let path = "memory:///doesntmatter/foo";
         unsafe {
-            let builder = ok_or_panic(get_engine_builder(kernel_string_slice!(path), allocate_err));
+            let builder = ok_or_panic(get_engine_builder(
+                kernel_string_slice!(path),
+                &TEST_ERROR_ALLOCATORS,
+            ));
             assert_extern_result_error_contains(
                 builder_with_rest_object_store(builder, std::ptr::null(), None, None),
                 FFIKernelError::GenericError,
@@ -2337,7 +2353,7 @@ mod tests {
             .with_log_state(LogState::with_latest_version(1).with_crc_at([0]))
             .build()?;
         let table_root = table.table_root();
-        let engine = engine_to_handle(Arc::new(table.engine()), allocate_err);
+        let engine = engine_to_handle(Arc::new(table.engine()), TEST_ERROR_ALLOCATORS);
 
         let snapshot = unsafe {
             let builder = if from_existing {
@@ -2549,7 +2565,7 @@ mod tests {
                     .unwrap();
                 engine_to_handle(
                     Arc::new(DefaultEngineBuilder::new(storage).build()),
-                    allocate_err,
+                    TEST_ERROR_ALLOCATORS,
                 )
             }
             EarliestCommitTableSetupScenario::NoCommits => get_default_engine(table_root),
@@ -2643,7 +2659,7 @@ mod tests {
         .await?;
 
         let engine = DefaultEngineBuilder::new(storage.clone()).build();
-        let engine = engine_to_handle(Arc::new(engine), allocate_err);
+        let engine = engine_to_handle(Arc::new(engine), TEST_ERROR_ALLOCATORS);
         let snap =
             unsafe { build_snapshot(kernel_string_slice!(table_root), engine.shallow_copy()) };
 
@@ -2692,7 +2708,7 @@ mod tests {
         .await?;
 
         let engine = DefaultEngineBuilder::new(storage.clone()).build();
-        let engine = engine_to_handle(Arc::new(engine), allocate_err);
+        let engine = engine_to_handle(Arc::new(engine), TEST_ERROR_ALLOCATORS);
         let snap =
             unsafe { build_snapshot(kernel_string_slice!(table_root), engine.shallow_copy()) };
 
@@ -2744,7 +2760,7 @@ mod tests {
         .await?;
 
         let engine = DefaultEngineBuilder::new(storage.clone()).build();
-        let engine = engine_to_handle(Arc::new(engine), allocate_err);
+        let engine = engine_to_handle(Arc::new(engine), TEST_ERROR_ALLOCATORS);
         let snap =
             unsafe { build_snapshot(kernel_string_slice!(table_root), engine.shallow_copy()) };
 
@@ -2894,7 +2910,7 @@ mod tests {
                     .with_task_executor(executor)
                     .build(),
             ),
-            allocate_err,
+            TEST_ERROR_ALLOCATORS,
         );
         let snapshot =
             unsafe { build_snapshot(kernel_string_slice!(table_root), engine.shallow_copy()) };
@@ -3168,7 +3184,7 @@ mod tests {
         let builder = unsafe {
             ok_or_panic(get_engine_builder(
                 kernel_string_slice!(table_root),
-                allocate_err,
+                &TEST_ERROR_ALLOCATORS,
             ))
         };
         let builder = unsafe { builder_with_multithreaded_executor(builder, 2, 0) };
@@ -3247,7 +3263,7 @@ mod tests {
         let builder = unsafe {
             ok_or_panic(get_engine_builder(
                 kernel_string_slice!(table_root),
-                allocate_err,
+                &TEST_ERROR_ALLOCATORS,
             ))
         };
         let builder = unsafe { builder_with_io_concurrency(builder, buffer_size, batch_size) };
@@ -3276,7 +3292,7 @@ mod tests {
         )
         .await?;
         let engine = DefaultEngineBuilder::new(storage.clone()).build();
-        let engine = engine_to_handle(Arc::new(engine), allocate_err);
+        let engine = engine_to_handle(Arc::new(engine), TEST_ERROR_ALLOCATORS);
 
         let snapshot =
             unsafe { build_snapshot(kernel_string_slice!(table_root), engine.shallow_copy()) };
@@ -3314,7 +3330,13 @@ mod tests {
         )
         .await?;
         let engine = DefaultEngineBuilder::new(storage.clone()).build();
-        let engine = engine_to_handle(Arc::new(engine), allocate_null_err);
+        let engine = engine_to_handle(
+            Arc::new(engine),
+            ErrorAllocators {
+                allocate_kernel_error: allocate_null_err,
+                ..TEST_ERROR_ALLOCATORS
+            },
+        );
 
         // Get a non-existent snapshot, this will call allocate_null_err
         let snapshot_at_non_existent_version = unsafe {
@@ -3442,7 +3464,7 @@ mod tests {
         add_commit(table_root, storage.as_ref(), 0, actions).await?;
         let engine = engine_to_handle(
             Arc::new(DefaultEngineBuilder::new(storage).build()),
-            allocate_err,
+            TEST_ERROR_ALLOCATORS,
         );
 
         let result = unsafe {
@@ -3664,7 +3686,7 @@ mod tests {
         .await?;
         let engine = engine_to_handle(
             Arc::new(DefaultEngineBuilder::new(storage).build()),
-            allocate_err,
+            TEST_ERROR_ALLOCATORS,
         );
 
         let snapshot_at_v1 = unsafe {
@@ -3792,7 +3814,7 @@ mod tests {
         let storage = Arc::new(InMemory::new());
         let engine = engine_to_handle(
             Arc::new(DefaultEngineBuilder::new(storage).build()),
-            allocate_err,
+            TEST_ERROR_ALLOCATORS,
         );
 
         let result = unsafe {

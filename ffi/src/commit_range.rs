@@ -676,7 +676,7 @@ mod tests {
     use crate::engine_funcs::{free_read_result_iter, read_result_next};
     use crate::error::FFIKernelError;
     use crate::ffi_test_utils::{
-        allocate_err, assert_extern_result_error_with_message, assert_timestamp_is_recent,
+        TEST_ERROR_ALLOCATORS, assert_extern_result_error_with_message, assert_timestamp_is_recent,
         build_snapshot, error_only_engine_handle, ok_or_panic,
     };
     use crate::log_path::LogPathArray;
@@ -712,7 +712,10 @@ mod tests {
             .unwrap();
         }
         let engine = DefaultEngineBuilder::new(storage.clone()).build();
-        (engine_to_handle(Arc::new(engine), allocate_err), table_root)
+        (
+            engine_to_handle(Arc::new(engine), TEST_ERROR_ALLOCATORS),
+            table_root,
+        )
     }
 
     /// Build a `[start_version, end_version]` commit range handle via the FFI builder API.
@@ -982,7 +985,7 @@ mod tests {
         }
         let engine = engine_to_handle(
             Arc::new(DefaultEngineBuilder::new(storage).build()),
-            allocate_err,
+            TEST_ERROR_ALLOCATORS,
         );
 
         let builder = unsafe {

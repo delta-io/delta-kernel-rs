@@ -4,11 +4,11 @@ use std::ffi::c_void;
 
 use delta_kernel::expressions::{
     ArrayData, BinaryExpression, BinaryExpressionOp, BinaryPredicate, BinaryPredicateOp,
-    ColumnName, Expression, ExpressionRef, ExpressionStructPatch, JunctionPredicate,
-    JunctionPredicateOp, MapData, MapToStructExpression, OpaqueExpression, OpaqueExpressionOpRef,
-    OpaquePredicate, OpaquePredicateOpRef, ParseJsonExpression, Predicate, Scalar, StructData,
-    UnaryExpression, UnaryExpressionOp, UnaryPredicate, UnaryPredicateOp, VariadicExpression,
-    VariadicExpressionOp,
+    CaseWhenExpression, ColumnName, Expression, ExpressionRef, ExpressionStructPatch,
+    JunctionPredicate, JunctionPredicateOp, MapData, MapToStructExpression, OpaqueExpression,
+    OpaqueExpressionOpRef, OpaquePredicate, OpaquePredicateOpRef, ParseJsonExpression, Predicate,
+    Scalar, StructData, UnaryExpression, UnaryExpressionOp, UnaryPredicate, UnaryPredicateOp,
+    VariadicExpression, VariadicExpressionOp,
 };
 
 use super::kernel_visitor::NullTypeTag;
@@ -281,6 +281,17 @@ pub struct EngineExpressionVisitor {
     /// list identified by `sibling_list_id`.
     pub visit_unknown:
         extern "C" fn(data: *mut c_void, sibling_list_id: usize, name: KernelStringSlice),
+    /// Visits a CASE WHEN expression belonging to the list identified by `sibling_list_id`.
+    /// Conditions (predicates) and results (expressions) are in separate lists identified by
+    /// `condition_list_id` and `result_list_id`, with matching order and length.
+    /// `else_list_id` identifies a list containing exactly one fallback expression.
+    pub visit_case_when: extern "C" fn(
+        data: *mut c_void,
+        sibling_list_id: usize,
+        condition_list_id: usize,
+        result_list_id: usize,
+        else_list_id: usize,
+    ),
 }
 
 /// Visit the expression of the passed [`SharedExpression`] Handle using the provided `visitor`.
@@ -686,6 +697,27 @@ fn visit_expression_impl(
             };
             visit_fn(visitor.data, sibling_list_id, child_list_id);
         }
+        Expression::CaseWhen(CaseWhenExpression {
+            branches,
+            else_expr,
+        }) => {
+            let condition_list_id = call!(visitor, make_field_list, branches.len());
+            let result_list_id = call!(visitor, make_field_list, branches.len());
+            let else_list_id = call!(visitor, make_field_list, 1);
+            for (condition, result) in branches {
+                visit_predicate_impl(visitor, condition, condition_list_id);
+                visit_expression_impl(visitor, result, result_list_id);
+            }
+            visit_expression_impl(visitor, else_expr, else_list_id);
+            call!(
+                visitor,
+                visit_case_when,
+                sibling_list_id,
+                condition_list_id,
+                result_list_id,
+                else_list_id
+            );
+        }
         Expression::Opaque(OpaqueExpression { op, exprs }) => {
             visit_expression_opaque(visitor, op, exprs, sibling_list_id)
         }
@@ -927,6 +959,7 @@ mod tests {
     ignore_fn!(ignore_struct_literal, usize, usize);
     ignore_fn!(ignore_child_list, usize);
     ignore_fn!(ignore_map_literal, usize, usize);
+    ignore_fn!(ignore_case_when, usize, usize, usize);
     ignore_fn!(ignore_null, u8, u8, u8);
     ignore_fn!(ignore_parse_json, usize, Handle<SharedSchema>);
     ignore_fn!(ignore_struct_patch, usize, usize, usize, usize);
@@ -982,6 +1015,7 @@ mod tests {
             visit_opaque_expr: ignore_opaque_expr,
             visit_opaque_pred: ignore_opaque_pred,
             visit_unknown: visit_unknown_name,
+            visit_case_when: ignore_case_when,
         }
     }
 

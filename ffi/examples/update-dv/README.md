@@ -49,13 +49,13 @@ The FFI exposes Rust's separate compressed-vector and serializer lifecycles:
 
 ```text
 dv = new_deletion_vector()
-deletion_vector_add_indexes(&dv, previous_deleted_rows, allocate_error)
-deletion_vector_add_indexes(&dv, new_deleted_rows_chunk, allocate_error)
-deletion_vector_add_indexes(&dv, another_chunk, allocate_error)
-writer = new_dv_writer(output, allocate_error)
-result = dv_writer_write(&writer, dv, allocate_error) // consumes dv, also on error
+deletion_vector_add_indexes(&dv, previous_deleted_rows, &error_allocators)
+deletion_vector_add_indexes(&dv, new_deleted_rows_chunk, &error_allocators)
+deletion_vector_add_indexes(&dv, another_chunk, &error_allocators)
+writer = new_dv_writer(output, &error_allocators)
+result = dv_writer_write(&writer, dv, &error_allocators) // consumes dv, also on error
 // Write additional completed vectors into this output, or create separate writers.
-dv_writer_finalize(writer, allocate_error)
+dv_writer_finalize(writer, &error_allocators)
 ```
 
 Create one writer per desired output file. Repeated writes put independent vectors
@@ -86,8 +86,11 @@ borrowed bytes and returns the number accepted; partial writes are retried. Flus
 must return success. Callbacks report failures with `EngineExecResult` using the
 existing Rust-owned error-message convention.
 
-The serializer requires no Engine. Each fallible entry point uses the supplied error
-allocator for its FFI result. The host retains ownership of the output and context.
+The serializer requires no Engine. Each fallible entry point borrows a non-null
+`ErrorAllocators` table for that call, using its callbacks and context to allocate
+connector-owned errors. The table and its callback state must satisfy the standard
+FFI error-allocation contract; the serializer does not retain them. The host retains
+ownership of the output and context.
 Callbacks must not unwind or re-enter the same writer. If the handle moves between
 threads, the output must support those sequential calls.
 

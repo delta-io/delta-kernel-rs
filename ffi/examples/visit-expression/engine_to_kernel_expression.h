@@ -39,7 +39,7 @@ uintptr_t convert_engine_to_kernel_literal(
         .len = strlen(lit->value.string_data)
       };
       ExternResultusize result = visit_expression_literal_string(
-          state, str_slice, allocate_error);
+          state, str_slice, &error_allocators);
       if (result.tag == Errusize) {
         print_error("visit_expression_literal_string failed", (Error*)result.err);
         free_error((Error*)result.err);
@@ -67,7 +67,7 @@ uintptr_t convert_engine_to_kernel_literal(
     case Decimal: {
       struct Decimal* dec = &lit->value.decimal;
       ExternResultusize result = visit_expression_literal_decimal(
-          state, dec->hi, dec->lo, dec->precision, dec->scale, allocate_error);
+          state, dec->hi, dec->lo, dec->precision, dec->scale, &error_allocators);
       if (result.tag == Errusize) {
         print_error("visit_expression_literal_decimal failed", (Error*)result.err);
         free_error((Error*)result.err);
@@ -78,7 +78,7 @@ uintptr_t convert_engine_to_kernel_literal(
     case Null: {
       struct NullTypeInfo* nt = &lit->value.null_type;
       ExternResultusize result = visit_expression_literal_null(
-          state, nt->type_tag, nt->precision, nt->scale, allocate_error);
+          state, nt->type_tag, nt->precision, nt->scale, &error_allocators);
       if (result.tag == Errusize) {
         print_error("visit_expression_literal_null failed", (Error*)result.err);
         free_error((Error*)result.err);
@@ -231,7 +231,7 @@ uintptr_t convert_engine_to_kernel_expression_item(
         parts[i].len = column->parts[i].len;
       }
       ExternResultusize result = visit_expression_column(
-          state, parts, column->len, allocate_error);
+          state, parts, column->len, &error_allocators);
       free(parts);
       if (result.tag == Errusize) {
         print_error("visit_expression_column failed", (Error*)result.err);
@@ -308,7 +308,7 @@ SharedExpression* convert_engine_to_kernel_expression(
   };
 
   ExternResultHandleSharedExpression result = visit_engine_expression(
-      &engine_expr, allocate_error);
+      &engine_expr, &error_allocators);
 
   if (result.tag == OkHandleSharedExpression) {
     return result.ok;
@@ -345,7 +345,7 @@ SharedPredicate* convert_engine_to_kernel_predicate(
   };
 
   ExternResultHandleSharedPredicate result = visit_engine_predicate(
-      &engine_pred, allocate_error);
+      &engine_pred, &error_allocators);
 
   if (result.tag == OkHandleSharedPredicate) {
     return result.ok;
