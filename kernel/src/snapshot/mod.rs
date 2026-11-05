@@ -663,8 +663,10 @@ impl Snapshot {
     /// - The log root Url string.
     /// - The raw `schemaString` JSON on table metadata.
     ///
-    /// The Arc-shared variables (e.g. logical/physical schemas, `crc`) are not counted,
-    /// as they can be shared between multiple snapshots and are not owned by a single snapshot.
+    /// The raw `schemaString` JSON is counted for each snapshot even when shared, so summing
+    /// estimates across snapshots may count the same buffer more than once. Other Arc-shared
+    /// variables (e.g. logical/physical schemas, `crc`) are not counted, as they are not owned by
+    /// a single snapshot.
     ///
     /// Other variables' contributions to heap size are relatively small, so they are not counted
     /// here.
