@@ -346,11 +346,9 @@ pub unsafe extern "C" fn partition_value_map_insert_decimal(
 /// [`kernel_visitor`](crate::expressions::kernel_visitor). Decimal and year-month interval nulls
 /// read their respective [`KernelNullTypeParameters`] fields.
 ///
-/// Returns an error if the tag is unrecognized or is the non-primitive sentinel (255), if decimal
-/// tag 12 has `decimal_precision` outside `1..=38` or `decimal_scale` outside
-/// `0..=decimal_precision`, or if year-month tag 13 has an `interval_year_month_kind` other than
-/// 0 (`YEAR`), 1 (`MONTH`), or 2 (`YEAR TO MONTH`). A null partition value is only legal for a
-/// nullable partition column; the kernel rejects it otherwise when the write context is built.
+/// Returns an error if the tag is unrecognized, is the non-primitive sentinel (255), or carries
+/// an invalid null type parameter. A null partition value is only legal for a nullable partition
+/// column; the kernel rejects it otherwise when the write context is built.
 ///
 /// # Safety
 ///
