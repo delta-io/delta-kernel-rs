@@ -17,7 +17,7 @@ use delta_kernel::arrow::compute::{cast, concat_batches};
 use delta_kernel::arrow::datatypes::{DataType, Field, Fields, Schema as ArrowSchema, SchemaRef};
 use delta_kernel::engine::arrow_conversion::TryFromKernel;
 use delta_kernel::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-use delta_kernel::{KernelError, KernelResult};
+use delta_kernel::{DeltaError, DeltaErrorCondition, KernelError, KernelResult};
 use delta_kernel_workloads::models::{ExpectedError, ReadExpected, SnapshotExpected, TimeTravel};
 use itertools::Itertools;
 use serde_json::Value;
@@ -273,9 +273,11 @@ fn expected_error_matches(expected: &ExpectedError, actual: &KernelError) -> boo
             message == "Had a _last_checkpoint hint but didn't find any checkpoints"
         }
         (
-            "DELTA_TABLE_NOT_FOUND"
-            | "DELTA_MISSING_TRANSACTION_LOG"
-            | "DELTA_TRUNCATED_TRANSACTION_LOG",
+            "DELTA_TABLE_NOT_FOUND" | "DELTA_MISSING_TRANSACTION_LOG",
+            KernelError::MissingVersion(_) | KernelError::FileNotFound(_),
+        ) => true,
+        (
+            "DELTA_TRUNCATED_TRANSACTION_LOG",
             KernelError::EmptyLog | KernelError::MissingVersion(_) | KernelError::FileNotFound(_),
         ) => true,
         ("DELTA_LOG_FILE_NOT_FOUND", KernelError::FileNotFound(_)) => true,
@@ -337,11 +339,28 @@ fn expected_error_matches(expected: &ExpectedError, actual: &KernelError) -> boo
     }
 }
 
+/// Returns whether a Delta error satisfies a workload's expected error code.
+///
+/// Workloads record the code that Delta Spark reported. A Delta error matches its own condition
+/// name, or a Delta Spark code listed here for the same failure.
+fn delta_error_matches(expected_code: &str, actual: &DeltaError) -> bool {
+    match (expected_code, actual.condition()) {
+        // Delta Spark reports a table root without a Delta log under either code, depending on
+        // the API that opened the table.
+        (
+            "DELTA_TABLE_NOT_FOUND" | "DELTA_MISSING_TRANSACTION_LOG",
+            DeltaErrorCondition::DeltaPathDoesNotExist,
+        ) => true,
+        (code, _) => code == actual.name(),
+    }
+}
+
 fn validate_expected_error(
     actual: &delta_kernel::Error,
     expected: &ExpectedError,
 ) -> KernelResult<(), String> {
     let matches = match actual {
+        delta_kernel::Error::Delta(delta) => delta_error_matches(&expected.error_code, delta),
         delta_kernel::Error::Kernel(kernel) => expected_error_matches(expected, kernel),
         _ => false,
     };
@@ -633,6 +652,37 @@ mod tests {
                 "Cannot determine types for: Identifier(nonExistentCol) and Value(1)"
             )
         ));
+    }
+
+    #[test]
+    fn missing_table_codes_require_the_delta_path_condition() {
+        let missing_path: delta_kernel::Error =
+            DeltaError::for_test(DeltaErrorCondition::DeltaPathDoesNotExist, &["/t"], None)
+                .unwrap()
+                .into();
+        for code in [
+            "DELTA_PATH_DOES_NOT_EXIST",
+            "DELTA_TABLE_NOT_FOUND",
+            "DELTA_MISSING_TRANSACTION_LOG",
+        ] {
+            assert!(validate_expected_error(&missing_path, &expected_error(code)).is_ok());
+        }
+        for code in ["DELTA_TRUNCATED_TRANSACTION_LOG", "DELTA_VERSION_NOT_FOUND"] {
+            assert!(validate_expected_error(&missing_path, &expected_error(code)).is_err());
+        }
+
+        // A missing table at the latest version must surface as the Delta condition.
+        let empty_log = KernelError::EmptyLog.into();
+        assert!(
+            validate_expected_error(&empty_log, &expected_error("DELTA_TABLE_NOT_FOUND")).is_err()
+        );
+        assert!(
+            validate_expected_error(
+                &empty_log,
+                &expected_error("DELTA_TRUNCATED_TRANSACTION_LOG")
+            )
+            .is_ok()
+        );
     }
 
     #[test]

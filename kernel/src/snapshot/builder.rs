@@ -14,8 +14,8 @@ use crate::metrics::events::SNAPSHOT_COMPLETED_SPAN;
 use crate::metrics::{MetricId, SnapshotLoadMetricContext, SnapshotLoadType};
 use crate::path::DELTA_LOG_DIR_WITH_SLASH;
 use crate::snapshot::{SnapshotHint, SnapshotRef};
-use crate::utils::{PhantomType, require, try_parse_uri};
-use crate::{Engine, KernelError, KernelResult, Result, Snapshot, Version};
+use crate::utils::{PhantomType, is_absent_local_path, require, try_parse_uri};
+use crate::{DeltaError, Engine, Error, KernelError, KernelResult, Result, Snapshot, Version};
 
 /// Marker for builders that load a snapshot from a table root.
 #[doc(hidden)]
@@ -170,8 +170,9 @@ impl SnapshotBuilder<FromTableRoot> {
     ///
     /// [`build`](Self::build) returns [`Error::Kernel`](crate::Error::Kernel) wrapping
     /// [`KernelError::SnapshotHint`] for hint conflicts and hinted log-segment validation failures.
-    /// Catalog-version, table-root URI, protocol, and metadata failures retain their normal
-    /// error variants.
+    /// Catalog-version, table-root URI, protocol, and metadata failures retain their Kernel error
+    /// variants, so a local table root that does not exist is
+    /// [`KernelError::InvalidTableLocation`].
     #[allow(dead_code)]
     #[internal_api]
     pub(crate) fn with_snapshot_hint(mut self, hint: impl Into<Box<SnapshotHint>>) -> Self {
@@ -324,6 +325,21 @@ impl<Mode> SnapshotBuilder<Mode> {
     ///
     /// - `engine`: Implementation of [`Engine`] apis.
     ///
+    /// # Errors
+    ///
+    /// A [`Snapshot::builder_for`] build without a snapshot hint returns [`Error::Delta`] with the
+    /// [`DeltaPathDoesNotExist`] condition when it proves that the table does not exist:
+    /// - the table root is a local path that does not exist, or
+    /// - neither [`at_version`](Self::at_version) nor
+    ///   [`with_max_catalog_version`](Self::with_max_catalog_version) is set and the Delta log has
+    ///   no commit, checkpoint, or valid `_last_checkpoint` file.
+    ///
+    /// The [`KernelError`] that detected the missing table is the error's
+    /// [`source`](std::error::Error::source). When a target version is set, a build that finds no
+    /// log files returns a Kernel error, such as [`KernelError::EmptyLog`], instead: an existing
+    /// table whose earlier history was removed also has no log files up to that version.
+    ///
+    /// [`DeltaPathDoesNotExist`]: crate::DeltaErrorCondition::DeltaPathDoesNotExist
     /// [`MetricEvent::SnapshotBuildSuccess`]: crate::metrics::MetricEvent::SnapshotBuildSuccess
     /// [`MetricEvent::SnapshotBuildFailure`]: crate::metrics::MetricEvent::SnapshotBuildFailure
     // `is_catalog_managed` is the requested load mode, not the confirmed protocol
@@ -402,7 +418,8 @@ impl<Mode> SnapshotBuilder<Mode> {
             let built_as_latest = version.is_none() || version == max_catalog_version;
 
             if let Some(table_root) = table_root {
-                let table_url = try_parse_uri(table_root)?;
+                let table_url = try_parse_uri(&table_root)
+                    .map_err(|error| classify_table_root_error(&table_root, error))?;
                 let log_segment = LogSegment::for_snapshot(
                     engine.storage_handler().as_ref(),
                     table_url
@@ -411,7 +428,10 @@ impl<Mode> SnapshotBuilder<Mode> {
                     log_tail,
                     effective_version,
                     metric_context.clone(),
-                )?;
+                )
+                .map_err(|error| {
+                    classify_log_segment_error(&table_root, effective_version, error)
+                })?;
                 Snapshot::try_new_from_log_segment(
                     table_url,
                     log_segment,
@@ -530,16 +550,52 @@ impl<Mode> SnapshotBuilder<Mode> {
     }
 }
 
+/// Classifies a [`try_parse_uri`] failure for the table root of a snapshot build.
+///
+/// A local root that does not exist becomes `DELTA_PATH_DOES_NOT_EXIST`. Any other failure, such
+/// as a root that is not a directory, stays a Kernel error.
+fn classify_table_root_error(table_root: &str, error: KernelError) -> Error {
+    match error {
+        KernelError::InvalidTableLocation(_) if is_absent_local_path(table_root) => {
+            DeltaError::path_does_not_exist(table_root, error).into()
+        }
+        error => error.into(),
+    }
+}
+
+/// Classifies a [`LogSegment::for_snapshot`] failure for a snapshot build at `target_version`.
+///
+/// Without a target version, [`KernelError::EmptyLog`] means that listing from version 0 found no
+/// commit or checkpoint (a usable `_last_checkpoint` fails with `InvalidCheckpoint` instead), so
+/// the table root has no Delta log and the error becomes `DELTA_PATH_DOES_NOT_EXIST`. With a
+/// target version, every failure stays a Kernel error; see [`SnapshotBuilder::build`].
+fn classify_log_segment_error(
+    table_root: &str,
+    target_version: Option<Version>,
+    error: KernelError,
+) -> Error {
+    match error {
+        KernelError::EmptyLog if target_version.is_none() => {
+            DeltaError::path_does_not_exist(table_root, error).into()
+        }
+        error => error.into(),
+    }
+}
+
 #[cfg(test)]
 pub(super) mod tests {
+    use std::error::Error as _;
+    use std::mem::discriminant;
     use std::sync::Arc;
     use std::time::Duration;
 
     use itertools::Itertools;
     use serde_json::json;
     use test_utils::{TestAction, actions_to_string, add_commit};
+    use url::Url;
 
     use super::*;
+    use crate::DeltaErrorCondition;
     use crate::engine::sync::SyncEngine;
     use crate::metrics::{LogSegmentLoadType, MetricEvent};
     use crate::object_store::memory::InMemory;
@@ -710,11 +766,10 @@ pub(super) mod tests {
         let (engine, _store, table_root) = setup_test();
         let (reporter, _guard) = measuring_reporter();
 
-        assert!(
-            SnapshotBuilder::new_for(table_root)
-                .build(engine.as_ref())
-                .is_err()
-        );
+        let error = SnapshotBuilder::new_for(&table_root)
+            .build(engine.as_ref())
+            .unwrap_err();
+        assert_path_does_not_exist(&error, &table_root, &KernelError::EmptyLog);
 
         let events = reporter.events();
         let failure = events
@@ -725,7 +780,160 @@ pub(super) mod tests {
             })
             .expect("expected LogSegmentLoadFailure when the log has no commits");
         assert_eq!(failure.load_type, LogSegmentLoadType::Full);
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, MetricEvent::SnapshotBuildFailure(_))),
+            "a Delta error must still report SnapshotBuildFailure"
+        );
         Ok(())
+    }
+
+    /// Asserts that `error` reports `DELTA_PATH_DOES_NOT_EXIST` for `table_root`, with a Kernel
+    /// source of the same variant as `expected_source`.
+    fn assert_path_does_not_exist(error: &Error, table_root: &str, expected_source: &KernelError) {
+        let Error::Delta(delta) = error else {
+            panic!("expected DELTA_PATH_DOES_NOT_EXIST, got {error:?}");
+        };
+        assert_eq!(
+            delta.condition(),
+            DeltaErrorCondition::DeltaPathDoesNotExist
+        );
+        assert_eq!(delta.sql_state(), Some("42K03"));
+        let parameters = delta
+            .parameters()
+            .iter()
+            .map(|parameter| (parameter.name(), parameter.value()))
+            .collect_vec();
+        assert_eq!(parameters, [("path", table_root)]);
+        assert_eq!(
+            delta.message(),
+            format!("{table_root} doesn't exist, or is not a Delta table.")
+        );
+        let source = delta
+            .source()
+            .and_then(|source| source.downcast_ref::<KernelError>())
+            .expect("the Kernel error that detected the missing table is the source");
+        assert_eq!(discriminant(source), discriminant(expected_source));
+    }
+
+    fn absent_local_path(dir: &std::path::Path) -> String {
+        dir.join("absent").to_str().unwrap().to_string()
+    }
+
+    fn absent_file_url(dir: &std::path::Path) -> String {
+        Url::from_directory_path(dir.join("absent"))
+            .unwrap()
+            .to_string()
+    }
+
+    fn empty_local_directory(dir: &std::path::Path) -> String {
+        dir.to_str().unwrap().to_string()
+    }
+
+    // `_last_checkpoint` that fails to parse is ignored, so the build lists the whole log.
+    fn unparseable_last_checkpoint(dir: &std::path::Path) -> String {
+        let log_dir = dir.join("_delta_log");
+        std::fs::create_dir(&log_dir).unwrap();
+        std::fs::write(log_dir.join("_last_checkpoint"), "not json").unwrap();
+        dir.to_str().unwrap().to_string()
+    }
+
+    #[rstest::rstest]
+    #[case::absent_local_path(absent_local_path, None, KernelError::invalid_table_location(""))]
+    #[case::absent_local_path_at_version(
+        absent_local_path,
+        Some(0),
+        KernelError::invalid_table_location("")
+    )]
+    #[case::absent_file_url(absent_file_url, None, KernelError::invalid_table_location(""))]
+    #[case::empty_local_directory(empty_local_directory, None, KernelError::EmptyLog)]
+    #[case::unparseable_last_checkpoint(unparseable_last_checkpoint, None, KernelError::EmptyLog)]
+    fn build_reports_missing_table_as_path_does_not_exist(
+        #[case] table_root: fn(&std::path::Path) -> String,
+        #[case] version: Option<Version>,
+        #[case] expected_source: KernelError,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let table_root = table_root(dir.path());
+        let error = SnapshotBuilder::new_for(&table_root)
+            .fold_with(version, SnapshotBuilder::at_version)
+            .build(&SyncEngine::new())
+            .unwrap_err();
+        assert_path_does_not_exist(&error, &table_root, &expected_source);
+    }
+
+    #[rstest::rstest]
+    #[case::at_version(Some(0), None)]
+    #[case::max_catalog_version(None, Some(0))]
+    #[tokio::test]
+    async fn build_keeps_empty_log_error_when_target_version_is_set(
+        #[case] version: Option<Version>,
+        #[case] max_catalog_version: Option<Version>,
+    ) {
+        let (engine, _store, table_root) = setup_test();
+        let error = SnapshotBuilder::new_for(table_root)
+            .fold_with(version, SnapshotBuilder::at_version)
+            .fold_with(
+                max_catalog_version,
+                SnapshotBuilder::with_max_catalog_version,
+            )
+            .build(engine.as_ref())
+            .unwrap_err();
+        assert!(
+            matches!(error, Error::Kernel(KernelError::EmptyLog)),
+            "{error:?}"
+        );
+    }
+
+    // A valid `_last_checkpoint` shows that a Delta log exists even though no checkpoint or
+    // commit remains.
+    #[tokio::test]
+    async fn build_keeps_kernel_error_for_last_checkpoint_without_checkpoint() -> Result<()> {
+        let (engine, store, table_root) = setup_test();
+        store
+            .put(
+                &Path::from("_delta_log/_last_checkpoint"),
+                r#"{"version":1,"size":1}"#.into(),
+            )
+            .await
+            .map_err(KernelError::from)?;
+        let error = SnapshotBuilder::new_for(table_root)
+            .build(engine.as_ref())
+            .unwrap_err();
+        assert!(
+            matches!(error, Error::Kernel(KernelError::InvalidCheckpoint(_))),
+            "{error:?}"
+        );
+        Ok(())
+    }
+
+    // On Unix, `try_exists` fails for these roots instead of reporting absence: a file root is
+    // resolved with a trailing slash (ENOTDIR), and a self-referential symlink loops (ELOOP).
+    #[cfg(unix)]
+    #[rstest::rstest]
+    #[case::regular_file(|dir: &std::path::Path| {
+        let file = dir.join("file");
+        std::fs::write(&file, "").unwrap();
+        file
+    })]
+    #[case::self_referential_symlink(|dir: &std::path::Path| {
+        let link = dir.join("loop");
+        std::os::unix::fs::symlink(&link, &link).unwrap();
+        link
+    })]
+    fn build_keeps_kernel_error_for_local_root_that_is_not_proven_absent(
+        #[case] create_root: fn(&std::path::Path) -> std::path::PathBuf,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let table_root = create_root(dir.path());
+        let error = SnapshotBuilder::new_for(table_root.to_str().unwrap())
+            .build(&SyncEngine::new())
+            .unwrap_err();
+        assert!(
+            matches!(error, Error::Kernel(KernelError::InvalidTableLocation(_))),
+            "{error:?}"
+        );
     }
 
     #[test_log::test(tokio::test)]
@@ -921,9 +1129,9 @@ pub(super) mod tests {
         };
 
         use super::*;
+        use crate::FileMeta;
         use crate::log_path::LogPath;
         use crate::utils::try_parse_uri;
-        use crate::{Error, FileMeta};
 
         pub(in crate::snapshot) fn create_log_path(table_root: &str, commit_path: Path) -> LogPath {
             let table_url = try_parse_uri(table_root).expect("Failed to parse table root");

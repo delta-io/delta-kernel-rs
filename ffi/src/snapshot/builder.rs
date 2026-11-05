@@ -206,6 +206,15 @@ pub unsafe extern "C" fn snapshot_builder_with_max_catalog_version(
 /// Consume the builder and return a snapshot. After calling, the builder pointer is _no longer
 /// valid_. The builder is always freed by this call, whether or not it succeeds.
 ///
+/// Failures that [`SnapshotBuilder::build`] reports as Delta errors go to the
+/// `allocate_delta_error` callback; all other failures go to `allocate_kernel_error`. For example,
+/// a latest-version build of a table root without a Delta log reports `DELTA_PATH_DOES_NOT_EXIST`,
+/// while the same build with [`snapshot_builder_with_version`] reports `EmptyLogError`. A local
+/// table path that does not exist fails earlier, when [`get_snapshot_builder`] or engine
+/// construction parses it, with `InvalidTableLocationError`.
+///
+/// [`SnapshotBuilder::build`]: delta_kernel::snapshot::SnapshotBuilder::build
+///
 /// # Safety
 ///
 /// Caller must pass a valid builder pointer and must not use it again after this call.
