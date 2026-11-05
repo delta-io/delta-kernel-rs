@@ -1123,20 +1123,13 @@ impl LogSegment {
     }
 
     fn find_commit_cover_paths(&self, after: Option<Version>) -> Vec<&ParsedLogPath> {
-        Self::commit_cover_paths_using(
-            self.listed.ascending_commit_files.iter(),
-            self.listed.ascending_compaction_files.iter(),
-            after,
-        )
+        self.find_commit_cover_paths_in_range(after, self.end_version, &[])
     }
 
     /// The commit cover over versions in `(oldest_exclusive, newest_inclusive]`, in descending
     /// order. Each of `required_commits` is read as its own commit file, never through a log
     /// compaction. A compaction that crosses either end of the range is read as its individual
     /// commits within the range.
-    #[cfg(all(feature = "adaptive-metadata-in-dev", feature = "declarative-plans"))]
-    // Used by plan-based P&M replay.
-    #[cfg_attr(not(test), allow(dead_code))]
     fn find_commit_cover_paths_in_range(
         &self,
         oldest_exclusive: Option<Version>,
@@ -1159,23 +1152,13 @@ impl LogSegment {
                         && !required_commits.iter().any(|v| (compaction.version..=hi).contains(v))
                 )
             });
-        Self::commit_cover_paths_using(commits, compactions, oldest_exclusive)
-    }
-
-    /// The commit cover over the ascending `commits` and `compactions`, restricted to files that
-    /// start after `after` as in [`Self::find_commit_cover_after`].
-    fn commit_cover_paths_using<'a>(
-        commits: impl Iterator<Item = &'a ParsedLogPath>,
-        compactions: impl Iterator<Item = &'a ParsedLogPath>,
-        after: Option<Version>,
-    ) -> Vec<&'a ParsedLogPath> {
         // Create an iterator sorted in ascending order by (initial version, end version), e.g.
         // [00.json, 00.09.compacted.json, 00.99.compacted.json, 01.json, 02.json, ..., 10.json,
         //  10.19.compacted.json, 11.json, ...]
         let all_files = itertools::Itertools::merge_by(commits, compactions, |path_a, path_b| {
             path_a.version <= path_b.version
         })
-        .filter(|path| after.is_none_or(|after| path.version > after));
+        .filter(|path| oldest_exclusive.is_none_or(|oldest| path.version > oldest));
 
         let mut last_pushed: Option<&ParsedLogPath> = None;
 

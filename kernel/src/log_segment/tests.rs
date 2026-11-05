@@ -2349,7 +2349,6 @@ fn commit_cover_after_excludes_compaction_starting_at_or_before_bound(
 }
 
 // Compaction listing is disabled, so the compactions are added to the listed segment by hand.
-#[cfg(all(feature = "adaptive-metadata-in-dev", feature = "declarative-plans"))]
 #[rstest]
 #[case::replaces_spanning_compaction_with_commits(
     (None, 4),
