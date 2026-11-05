@@ -40,8 +40,8 @@ impl RootManifestFile {
     /// the table's protocol and metadata plus every active domain metadata and set transaction
     /// (this transaction's `dm_changes` and `set_transactions` merged in, newest wins).
     ///
-    /// Errors if a log commit since the last checkpoint action has a file action (`add`, `remove`,
-    /// or `cdc`), since kernel cannot fold it into the caller-supplied root manifest.
+    /// Errors if delta log commits with file actions (`add`, `remove`, or `cdc`) are still pending
+    /// replay since an existing checkpoint.
     pub(super) fn compute_checkpoint_action(
         &self,
         engine: &dyn Engine,
@@ -183,7 +183,7 @@ impl RootManifestFile {
         checkpoint_version: Version,
     ) -> KernelResult<()> {
         let log_segment = self.read_snapshot.log_segment();
-        // A classic checkpoint after the checkpoint action hides the commits before it.
+        // A classic checkpoint after the checkpoint action drops earlier commits from the segment.
         if let Some(classic) = log_segment.checkpoint_version {
             require!(
                 classic <= checkpoint_version,
@@ -328,7 +328,7 @@ mod tests {
     // === Log commits after the last checkpoint action ===
 
     /// Computes the checkpoint action for a root manifest commit on a table whose manifest commit
-    /// at v2 carries domain `a` = `1` and txn `app-1` = `5` in its checkpoint action, followed by
+    /// at v2 has domain `a` = `1` and txn `app-1` = `5` in its checkpoint action, followed by
     /// one log commit per entry of `log_commits`. With `set_in_log`, v1 also sets them as top-level
     /// actions; otherwise the checkpoint action is their only copy, as after log cleanup.
     fn compute_after_log_commits(
@@ -398,7 +398,7 @@ mod tests {
         ],
         vec![("a", "3")]
     )]
-    fn compute_checkpoint_action_folds_log_commit_domains_onto_checkpoint(
+    fn compute_checkpoint_action_applies_log_commit_domains_to_checkpoint(
         #[case] log_commits: Vec<String>,
         #[case] expected: Vec<(&str, &str)>,
     ) -> KernelResult<()> {
@@ -417,7 +417,7 @@ mod tests {
     #[case::no_log_commits(vec![], vec![("app-1", 5)])]
     #[case::adds_app(vec![txn_line("app-2", 1)], vec![("app-1", 5), ("app-2", 1)])]
     #[case::updates_app(vec![txn_line("app-1", 7)], vec![("app-1", 7)])]
-    fn compute_checkpoint_action_folds_log_commit_txns_onto_checkpoint(
+    fn compute_checkpoint_action_applies_log_commit_txns_to_checkpoint(
         #[case] log_commits: Vec<String>,
         #[case] expected: Vec<(&str, i64)>,
     ) -> KernelResult<()> {
@@ -616,10 +616,12 @@ mod tests {
             1024,
             Snapshot::builder_for(table_root.clone()).build(&engine)?,
         );
-        let (domain_metadata, transactions, _) = manifest.scan_non_content_metadata(&engine)?;
+        let (domain_metadata, transactions, existing_checkpoint) =
+            manifest.scan_non_content_metadata(&engine)?;
 
         assert_eq!(domain_metadata.keys().collect::<Vec<_>>(), ["ckpt.domain"]);
         assert_eq!(transactions.keys().collect::<Vec<_>>(), ["ckpt-app"]);
+        assert_eq!(existing_checkpoint.map(|c| c.version()), Some(3));
         Ok(())
     }
 
@@ -767,12 +769,14 @@ mod tests {
         assert!(snapshot.crc_at_version().is_some());
 
         let manifest = root_manifest(&table_root, "metadata/root-v1.parquet", 1024, snapshot);
-        let (domain_metadata, transactions, _) = manifest.scan_non_content_metadata(&engine)?;
+        let (domain_metadata, transactions, existing_checkpoint) =
+            manifest.scan_non_content_metadata(&engine)?;
 
         assert_eq!(domain_metadata.len(), 1);
         assert!(domain_metadata.contains_key("test.domain"));
         assert_eq!(transactions.len(), 1);
         assert!(transactions.contains_key("app-1"));
+        assert_eq!(existing_checkpoint.map(|c| c.version()), Some(1));
         Ok(())
     }
 
@@ -794,12 +798,14 @@ mod tests {
         assert!(snapshot.crc_at_version().is_some());
 
         let manifest = root_manifest(&table_root, "metadata/root-v1.parquet", 1024, snapshot);
-        let (domain_metadata, transactions, _) = manifest.scan_non_content_metadata(&engine)?;
+        let (domain_metadata, transactions, existing_checkpoint) =
+            manifest.scan_non_content_metadata(&engine)?;
 
         assert_eq!(domain_metadata.len(), 1);
         assert!(domain_metadata.contains_key("test.domain"));
         assert_eq!(transactions.len(), 1);
         assert!(transactions.contains_key("app-1"));
+        assert_eq!(existing_checkpoint, None);
         Ok(())
     }
 
@@ -890,12 +896,14 @@ mod tests {
             1024,
             Arc::new(snapshot),
         );
-        let (domain_metadata, transactions, _) = manifest.scan_non_content_metadata(&engine)?;
+        let (domain_metadata, transactions, existing_checkpoint) =
+            manifest.scan_non_content_metadata(&engine)?;
 
         assert_eq!(domain_metadata.len(), 1);
         assert!(domain_metadata.contains_key("test.domain"));
         assert_eq!(transactions.len(), 1);
         assert!(transactions.contains_key("app-1"));
+        assert_eq!(existing_checkpoint, None);
         Ok(())
     }
 }
