@@ -477,6 +477,41 @@ async fn test_write_collects_stats_for_file_column(
     Ok(())
 }
 
+/// A sub-field's `nullCount` also counts rows whose whole `file` value is null, even when the
+/// sub-field's own array holds a value at that row, as the `file` RFC requires.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_write_null_count_counts_null_file_values() -> Result<(), Box<dyn std::error::Error>> {
+    // The second value is null, but its sub-field arrays still hold values.
+    let (fields, columns, _) = file_array(&[
+        Some((Some("s3://b/a"), None, Some(10), None)),
+        Some((Some("s3://b/x"), Some(1), Some(5), Some(b"q".as_slice()))),
+        Some((None, None, None, Some(b"xyz".as_slice()))),
+    ])
+    .into_parts();
+    let nulls = NullBuffer::from(vec![true, false, true]);
+    let files = StructArray::try_new(fields, columns, Some(nulls))?;
+    let (_tmp_dir, _table_path, engine, snapshot) =
+        write_table("none", DataType::file_type(), Arc::new(files)).await?;
+    let stats = data_file_stats(&snapshot?, engine.as_ref())?;
+
+    // Rows without the sub-field plus the null `file` value.
+    let null_count = &stats["nullCount"]["c"];
+    for (name, expected) in [
+        ("uri", 2),
+        ("offset", 3),
+        ("size", 2),
+        ("content_type", 1),
+        ("checksum", 3),
+        ("inline", 2),
+    ] {
+        assert_eq!(null_count[name], expected, "{name}: {stats}");
+    }
+    // The bounds ignore the null `file` value's sub-field values.
+    assert_eq!(stats["minValues"]["c"]["size"], 10, "{stats}");
+    assert_eq!(stats["maxValues"]["c"]["uri"], "s3://b/a", "{stats}");
+    Ok(())
+}
+
 /// Each `file` sub-field takes one slot against `delta.dataSkippingNumIndexedCols`, and
 /// `delta.dataSkippingStatsColumns` selects a whole `file` column or single sub-fields.
 #[rstest]
@@ -645,6 +680,15 @@ async fn test_predicate_on_file_sub_field_skips_files(
         ),
         // Only the first file has an inline value.
         (Pred::is_not_null(column_expr!("c.inline")), 1),
+        // `inline` has no min/max statistics, so a comparison on it skips only the second file,
+        // whose `inline` values are all null.
+        (
+            Pred::eq(
+                column_expr!("c.inline"),
+                Scalar::Binary(b"missing".to_vec()),
+            ),
+            1,
+        ),
         // Both files have only null checksums, but `checksum` predicates are not used to skip.
         (Pred::is_not_null(column_expr!("c.checksum")), 2),
         (

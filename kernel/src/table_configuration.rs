@@ -707,19 +707,19 @@ impl TableConfiguration {
     /// every column reference in the rewritten predicate against this set; every data-skipping
     /// call site shares this entry point so their gate input stays in lockstep.
     ///
-    /// It leaves out `checksum` sub-fields of `file` columns, so predicates on them skip no files.
-    /// The gate decides min/max eligibility by the compared value's type, and a `checksum` is a
-    /// string like the sub-fields that do have bounds, but it has no min/max statistics. This also
-    /// gives up `IS NULL` skipping on `checksum`, though its `nullCount` is collected; using it
-    /// would need null-count eligibility tracked apart from min/max.
-    /// TODO(#3608): track null-count eligibility separately so `checksum` keeps `IS NULL` skipping.
-    ///
-    /// `inline` stays in the set: it is binary, which the gate already treats as having no
-    /// min/max, so its `nullCount` is used.
+    /// It leaves out the `file` sub-fields without min/max statistics whose type the gate would
+    /// still treat as having them, so predicates on them skip no files. The gate decides min/max
+    /// eligibility by the compared value's type with [`is_skipping_eligible_datatype`], and this
+    /// set uses the same check: `checksum` is a string, so it is left out; `inline` is binary,
+    /// which the gate already treats as having no min/max, so it stays and its `nullCount` is used.
+    /// Leaving `checksum` out also gives up `IS NULL` skipping on it, though its `nullCount` is
+    /// collected.
     pub(crate) fn physical_stats_columns_set(
         &self,
         required_columns: Option<&[ColumnName]>,
     ) -> HashSet<ColumnName> {
+        // TODO(#3608): track null-count eligibility apart from min/max, so `checksum` keeps
+        // `IS NULL` skipping.
         let schema = self.physical_data_schema_without_partition_columns();
         let lacks_min_max_of_its_type = |col: &ColumnName| {
             schema.fields_of_path(col).is_ok_and(|path| {
@@ -3256,12 +3256,17 @@ mod test {
     }
 
     /// The skipping gate keeps a `file` column's sub-fields except `checksum`, whose string type
-    /// would otherwise admit min/max predicates although it has no min/max statistics.
+    /// would otherwise admit min/max predicates although it has no min/max statistics, at top
+    /// level or nested. A plain string field named `checksum` stays.
     #[test]
     fn test_physical_stats_columns_set_leaves_out_file_checksum() {
         let schema = schema_ref! {
             nullable "id": LONG,
             nullable "f": (DataType::file_type()),
+            nullable "s": {
+                nullable "f": (DataType::file_type()),
+                nullable "checksum": STRING,
+            },
         };
         let config = MockTableConfigurationBuilder::new()
             .with_schema(schema)
@@ -3277,17 +3282,14 @@ mod test {
             .map(|col| col.to_string())
             .collect();
         columns.sort();
-        assert_eq!(
-            columns,
-            [
-                "f.content_type",
-                "f.inline",
-                "f.offset",
-                "f.size",
-                "f.uri",
-                "id"
-            ]
-        );
+        let file_columns = |prefix: &str| {
+            ["content_type", "inline", "offset", "size", "uri"]
+                .map(|name| format!("{prefix}.{name}"))
+        };
+        let mut expected = [file_columns("f"), file_columns("s.f")].concat();
+        expected.extend(["id".to_string(), "s.checksum".to_string()]);
+        expected.sort();
+        assert_eq!(columns, expected);
     }
 
     #[test]

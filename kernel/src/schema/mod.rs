@@ -2503,8 +2503,8 @@ pub(crate) static FILE_FIELDS: LazyLock<StructType> = LazyLock::new(|| {
     ])
 });
 
-/// The `file` sub-fields that get `minValues` and `maxValues` statistics. The others, `checksum`
-/// and `inline`, get only `nullCount`, like every sub-field.
+/// The `file` sub-fields that get `minValues` and `maxValues` statistics. All six sub-fields get
+/// `nullCount`; only these four also get `minValues` and `maxValues`.
 const FILE_MIN_MAX_FIELDS: [&str; 4] = ["uri", "offset", "size", "content_type"];
 
 /// Whether the `file` sub-field `name` gets `minValues` and `maxValues` statistics.

@@ -286,7 +286,7 @@ impl<'a> SchemaTransform<'a> for NullCountStatsTransform {
     transform_output_type!(|'a, T| Cow<'a, T>);
 
     fn transform_struct_field(&mut self, field: &'a StructField) -> Cow<'a, StructField> {
-        // Only recurse into struct fields; convert all other types (leaf fields) to LONG
+        // Recurse into struct and `file` fields; convert all other types (leaf fields) to LONG
         match &field.data_type {
             DataType::Struct(_) => self.recurse_into_struct_field(field),
             // A `file` column's sub-fields are leaves; its counts are a plain struct of them.
