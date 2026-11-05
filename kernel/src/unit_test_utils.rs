@@ -17,7 +17,9 @@ use tracing::subscriber::DefaultGuard;
 use tracing_subscriber::util::SubscriberInitExt as _;
 use url::Url;
 
-use crate::actions::{Add, Cdc, CommitInfo, Metadata, Protocol, Remove, get_all_actions_schema};
+use crate::actions::{
+    Add, Cdc, CommitInfo, Metadata, Protocol, Remove, SetTransaction, get_all_actions_schema,
+};
 use crate::arrow::array::{
     ArrayRef, Int64Array, MapArray, RecordBatch, StringArray, StructArray, new_empty_array,
     new_null_array,
@@ -118,6 +120,9 @@ pub(crate) enum Action {
     #[allow(unused)]
     #[serde(rename = "commitInfo")]
     CommitInfo(CommitInfo),
+    #[allow(unused)]
+    #[serde(rename = "txn")]
+    Txn(SetTransaction),
 }
 
 use crate::schema::{
@@ -375,16 +380,12 @@ pub(crate) mod adaptive_metadata_fixtures {
     }
 
     /// A `commitInfo` line with In-Commit Timestamp `timestamp` and, when given, a
-    /// `lastManifestCommit` `(version, contentRootVersion)`, as an AMT writer records on every
-    /// commit.
-    pub(crate) fn commit_info_line(timestamp: i64, pointer: Option<(i64, i64)>) -> String {
+    /// `lastManifestCommit` `pointer`, as an AMT writer records on every commit.
+    pub(crate) fn commit_info_line(timestamp: i64, pointer: Option<&LastManifestCommit>) -> String {
         let mut commit_info =
             serde_json::json!({ "timestamp": timestamp, "inCommitTimestamp": timestamp });
-        if let Some((version, content_root_version)) = pointer {
-            commit_info["lastManifestCommit"] = serde_json::json!({
-                "version": version,
-                "contentRootVersion": content_root_version,
-            });
+        if let Some(pointer) = pointer {
+            commit_info["lastManifestCommit"] = serde_json::to_value(pointer).unwrap();
         }
         serde_json::json!({ "commitInfo": commit_info }).to_string()
     }
@@ -590,19 +591,22 @@ pub(crate) mod adaptive_metadata_fixtures {
             engine,
             table_root,
             0,
+            None,
             &protocol_and_metadata_lines(test_schema_flat_with_column_mapping(), partition_columns),
         );
     }
 
     /// Writes `actions` (one JSON action per line) as the commit at `version`, after a
-    /// `commitInfo` carrying the In-Commit Timestamp adaptiveMetadata tables require.
+    /// `commitInfo` carrying the In-Commit Timestamp adaptiveMetadata tables require and, when
+    /// given, the `lastManifestCommit` `pointer` (see [`commit_info_line`]).
     pub(crate) fn write_ict_commit(
         engine: &SyncEngine,
         table_root: &Url,
         version: Version,
+        pointer: Option<&LastManifestCommit>,
         actions: &str,
     ) {
-        let commit_info = commit_info_line(version_as_i64(version).unwrap() + 1, None);
+        let commit_info = commit_info_line(version_as_i64(version).unwrap() + 1, pointer);
         let lines: StringArray = iter::once(commit_info.as_str())
             .chain(actions.lines())
             .collect::<Vec<_>>()
