@@ -73,8 +73,12 @@ impl RootManifestFile {
         transactions.retain(|_, txn| !txn.is_expired(expiration_timestamp));
 
         if let Some(existing) = &existing_checkpoint {
-            let checkpoint_version = Version::try_from(existing.version())
-                .map_err(|_| KernelError::generic("checkpoint action version is negative"))?;
+            let checkpoint_version = Version::try_from(existing.version()).map_err(|_| {
+                KernelError::invalid_checkpoint(format!(
+                    "checkpoint action has negative version {}",
+                    existing.version()
+                ))
+            })?;
             self.validate_no_file_actions_since_checkpoint(engine, checkpoint_version)?;
         }
 
@@ -185,9 +189,9 @@ impl RootManifestFile {
         if let Some(classic) = log_segment.checkpoint_version {
             require!(
                 classic <= checkpoint_version,
-                KernelError::generic(format!(
-                    "root manifest file commit cannot fold log commits behind checkpoint file at \
-                     version {classic}"
+                KernelError::unsupported(format!(
+                    "root manifest file commit after the adaptiveMetadata standalone checkpoint at \
+                     version {classic} is not yet supported"
                 ))
             );
         }
@@ -218,9 +222,9 @@ impl RootManifestFile {
             ] {
                 require!(
                     !found,
-                    KernelError::generic(format!(
-                        "root manifest file commit cannot fold log commit at version {}: found \
-                         '{action}'",
+                    KernelError::unsupported(format!(
+                        "root manifest file commit cannot follow log commit {} with '{action}' \
+                         actions, since kernel cannot verify the root manifest includes them",
                         commit.version
                     ))
                 );
@@ -450,7 +454,7 @@ mod tests {
     ) {
         assert_result_error_with_message(
             compute_after_log_commits(true, &log_commits),
-            &format!("cannot fold log commit at version 3: found '{action}'"),
+            &format!("cannot follow log commit 3 with '{action}' actions"),
         );
     }
 
