@@ -59,7 +59,7 @@ async fn main() -> ExitCode {
 }
 
 // TODO: Update the example once official write APIs are introduced (issue#1123)
-async fn try_main() -> KernelResult<()> {
+async fn try_main() -> delta_kernel::Result<()> {
     let cli = Cli::parse_with_examples(env!("CARGO_PKG_NAME"), "Write", "write", "");
 
     // Check if path is a directory and if not, create it
@@ -108,7 +108,8 @@ async fn try_main() -> KernelResult<()> {
         if retries > 5 {
             return Err(KernelError::generic(
                 "Exceeded maximum 5 retries for committing transaction",
-            ));
+            )
+            .into());
         }
         txn = match txn.commit(&engine)? {
             CommitResult::Committed(committed) => break committed,
@@ -117,7 +118,7 @@ async fn try_main() -> KernelResult<()> {
                 println!(
                     "✗ Failed to write data, transaction conflicted with version: {conflicting_version}"
                 );
-                return Err(KernelError::generic("Commit failed"));
+                return Err(KernelError::generic("Commit failed").into());
             }
             CommitResult::Retryable(RetryableTransaction { transaction, error }) => {
                 println!("✗ Failed to commit, retrying... retryable error: {error}");
@@ -143,7 +144,7 @@ async fn create_or_get_base_snapshot(
     url: &Url,
     engine: &dyn Engine,
     schema_str: &str,
-) -> KernelResult<SnapshotRef> {
+) -> delta_kernel::Result<SnapshotRef> {
     // Check if table already exists
     match Snapshot::builder_for(url.clone()).build(engine) {
         Ok(snapshot) => {
@@ -269,7 +270,7 @@ fn create_sample_data(schema: &SchemaRef, num_rows: usize) -> KernelResult<Arrow
 async fn read_and_display_data(
     table_url: &Url,
     engine: DefaultEngine<TokioBackgroundExecutor>,
-) -> KernelResult<()> {
+) -> delta_kernel::Result<()> {
     let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
     let scan = snapshot.scan_builder().build()?;
 
@@ -278,6 +279,6 @@ async fn read_and_display_data(
         .map(EngineDataArrowExt::try_into_record_batch)
         .try_collect()?;
 
-    print_batches(&batches)?;
+    print_batches(&batches).map_err(KernelError::from)?;
     Ok(())
 }

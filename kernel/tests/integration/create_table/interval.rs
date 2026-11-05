@@ -80,7 +80,7 @@ mod supported {
         )
             -> SchemaRef,
         #[values("none", "name", "id")] cm_mode: &str,
-    ) -> KernelResult<()> {
+    ) -> delta_kernel::Result<()> {
         let (_temp_dir, table_path, engine) = test_table_setup()?;
         let schema = make_schema(interval);
 

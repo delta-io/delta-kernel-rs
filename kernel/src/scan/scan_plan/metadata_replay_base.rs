@@ -66,6 +66,7 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
+    use crate::Result;
     use crate::crc::Crc;
     use crate::engine::arrow_data::EngineDataArrowExt as _;
     use crate::engine::test_delegating::DelegatingEngine;
@@ -82,7 +83,7 @@ mod tests {
         #[case] version: Version,
         #[case] checkpoint_version: Option<Version>,
         #[case] has_all_files: bool,
-    ) -> KernelResult<()> {
+    ) -> Result<()> {
         let (engine, latest, _tempdir) =
             load_test_table("v1-multi-part-partitioned-struct-stats-only")?;
         let snapshot = Snapshot::builder_for(latest.table_root().clone())
@@ -121,7 +122,7 @@ mod tests {
         #[case] target_version: Version,
         #[case] empty_crc: bool,
         #[case] expected_rows: usize,
-    ) -> KernelResult<()> {
+    ) -> Result<()> {
         let (engine, latest, _tempdir) =
             load_test_table("v1-multi-part-partitioned-struct-stats-only")?;
         let target = Snapshot::builder_for(latest.table_root().clone())
