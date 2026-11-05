@@ -223,8 +223,8 @@ mod tests {
     use super::*;
     use crate::error::FFIKernelError;
     use crate::ffi_test_utils::{
-        allocate_err, allocate_str, assert_extern_result_error_with_message, build_snapshot,
-        ok_or_panic, recover_string,
+        TEST_ERROR_ALLOCATORS, allocate_str, assert_extern_result_error_with_message,
+        build_snapshot, ok_or_panic, recover_string,
     };
     use crate::{engine_to_handle, free_engine, free_snapshot, kernel_string_slice};
 
@@ -233,7 +233,7 @@ mod tests {
         let storage = Arc::new(InMemory::new());
 
         let engine = DefaultEngineBuilder::new(storage.clone()).build();
-        let engine = engine_to_handle(Arc::new(engine), allocate_err);
+        let engine = engine_to_handle(Arc::new(engine), TEST_ERROR_ALLOCATORS);
         let table_root = "memory:///test_table/";
 
         // commit0
@@ -517,7 +517,7 @@ mod tests {
     ) {
         let storage = Arc::new(InMemory::new());
         let engine = DefaultEngineBuilder::new(storage.clone()).build();
-        let engine = engine_to_handle(Arc::new(engine), allocate_err);
+        let engine = engine_to_handle(Arc::new(engine), TEST_ERROR_ALLOCATORS);
 
         let mut actions = vec![
             protocol_action(clustering_feature),
@@ -711,7 +711,7 @@ mod tests {
         const TAG_DECIMAL: u8 = 12;
         let storage = Arc::new(InMemory::new());
         let engine = DefaultEngineBuilder::new(storage.clone()).build();
-        let engine = engine_to_handle(Arc::new(engine), allocate_err);
+        let engine = engine_to_handle(Arc::new(engine), TEST_ERROR_ALLOCATORS);
         let table_root = "memory:///test_clustering_decimal/";
 
         let schema = json!({
@@ -752,7 +752,7 @@ mod tests {
     async fn test_visit_clustering_columns_column_mapping_reports_both_names() -> KernelResult<()> {
         let storage = Arc::new(InMemory::new());
         let engine = DefaultEngineBuilder::new(storage.clone()).build();
-        let engine = engine_to_handle(Arc::new(engine), allocate_err);
+        let engine = engine_to_handle(Arc::new(engine), TEST_ERROR_ALLOCATORS);
         let table_root = "memory:///test_clustering_column_mapping/";
 
         // `region` is stored physically as `col-region-phys`; clustering names the physical id.

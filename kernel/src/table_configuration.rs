@@ -23,12 +23,15 @@ use crate::scan::data_skipping::stats_schema::{
 };
 use crate::schema::collation_utils::validate_collations_feature_support;
 pub(crate) use crate::schema::file_utils::validate_file_type_feature_support;
+use crate::schema::generated_column::collect_generated_columns;
 pub(crate) use crate::schema::variant_utils::validate_variant_type_feature_support;
 use crate::schema::void_utils::strip_void_from_schema;
 use crate::schema::{
-    ColumnMetadataKey, SchemaRef, StructField, StructType, schema_has_invariants,
+    ColumnMetadataKey, GeneratedColumn, SchemaRef, StructField, StructType, schema_has_invariants,
     validate_column_defaults_metadata,
 };
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use crate::table_features::V4_VALIDATOR;
 #[cfg(feature = "geo-type-in-dev")]
 use crate::table_features::validate_geospatial_feature_support;
 use crate::table_features::{
@@ -451,6 +454,12 @@ impl TableConfiguration {
             &V3_VALIDATOR,
             IcebergCompatValidationContext::TableConfiguration,
         )?;
+        #[cfg(feature = "adaptive-metadata-in-dev")]
+        validate_iceberg_compat_if_needed(
+            &table_config,
+            &V4_VALIDATOR,
+            IcebergCompatValidationContext::TableConfiguration,
+        )?;
 
         Ok(table_config)
     }
@@ -853,6 +862,21 @@ impl TableConfiguration {
         })
     }
 
+    /// The table's [`GeneratedColumn`]s at this version, in schema order. Empty when no top-level
+    /// column declares a generation expression or the protocol doesn't support the
+    /// `generatedColumns` writer feature.
+    ///
+    /// # Errors
+    ///
+    /// Returns a schema error if a generated column's `delta.generationExpression` metadata is not
+    /// a string.
+    pub(crate) fn generated_columns(&self) -> KernelResult<Vec<GeneratedColumn>> {
+        if !self.is_feature_supported(&TableFeature::GeneratedColumns) {
+            return Ok(Vec::new());
+        }
+        collect_generated_columns(&self.logical_schema)
+    }
+
     /// The physical schema ([`SchemaRef`]) of this table at this version.
     ///
     /// When column mapping is disabled, this is identical to
@@ -1094,7 +1118,7 @@ impl TableConfiguration {
     }
 
     /// Internal helper for write operations
-    fn ensure_write_supported(&self) -> KernelResult<()> {
+    pub(crate) fn ensure_write_supported(&self) -> KernelResult<()> {
         // Version check: kernel supports writer versions
         // MIN_VALID_RW_VERSION..=MAX_VALID_WRITER_VERSION
         require!(
@@ -1113,6 +1137,8 @@ impl TableConfiguration {
         }
 
         // Check all enabled writer features have kernel support
+        // TODO(#3769): This validates requirements of supported-but-not-enabled features too,
+        // which is stricter than the protocol.
         for feature in self.get_enabled_writer_features() {
             self.check_feature_support(&feature, Operation::Write)?;
         }
@@ -1127,6 +1153,11 @@ impl TableConfiguration {
                  writer feature",
             )
         );
+
+        // Run discovery to assert that every generated column's expression is a string, because
+        // connectors receive it as SQL text. A non-string expression fails discovery with a schema
+        // error and blocks the write.
+        self.generated_columns()?;
 
         // Schema-dependent validation for Invariants (can't be in FeatureInfo)
         // TODO: Better story for schema validation for Invariants and other features
@@ -1318,6 +1349,8 @@ mod test {
         ColumnMappingMode, FeatureType, Operation, TABLE_FEATURES_MIN_READER_VERSION,
         TABLE_FEATURES_MIN_WRITER_VERSION, TableFeature,
     };
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    use crate::table_properties::ENABLE_ICEBERG_NATIVE_V4;
     use crate::table_properties::{
         ENABLE_DELETION_VECTORS, ENABLE_ICEBERG_COMPAT_V1, ENABLE_ICEBERG_COMPAT_V2,
         ENABLE_ICEBERG_COMPAT_V3, ENABLE_IN_COMMIT_TIMESTAMPS, ENABLE_ROW_TRACKING,
@@ -1423,6 +1456,7 @@ mod test {
     enum WriteSupport {
         Supported,
         InvalidProtocol,
+        InvalidSchema,
         Unsupported,
     }
 
@@ -1432,6 +1466,7 @@ mod test {
             match table_config.ensure_operation_supported(Operation::Write) {
                 Ok(()) => Self::Supported,
                 Err(KernelError::InvalidProtocol(_)) => Self::InvalidProtocol,
+                Err(KernelError::Schema(_)) => Self::InvalidSchema,
                 Err(KernelError::Unsupported(_)) => Self::Unsupported,
                 Err(err) => panic!("unexpected write error: {err:?}"),
             }
@@ -1582,47 +1617,50 @@ mod test {
         MockProtocolBuilder::new().with_versions(1, 2).build(),
         WriteSupport::Supported
     )]
-    // Kernel rejects writes to tables that support `generatedColumns`. The feature is listed in the
-    // protocol, or implied by writer version 4.
+    // Tables that support `generatedColumns`.
     #[case::with_feature(
         generated_event_year_schema(),
         MockProtocolBuilder::new()
             .with_writer_features([TableFeature::GeneratedColumns])
             .build(),
-        WriteSupport::Unsupported
+        WriteSupport::Supported
     )]
-    #[case::legacy_writer_at_min_version(
-        generated_event_year_schema(),
-        MockProtocolBuilder::new().with_versions(1, 4).build(),
-        WriteSupport::Unsupported
-    )]
-    // Write support depends only on the protocol, so empty and non-string expression values get the
-    // same results as a regular expression.
+    // Connectors validate the SQL, so an empty expression gets the same results as a regular one.
     #[case::empty_expression_with_feature(
         schema_ref! { (field_with_generation_expression("event_year", DataType::INTEGER, "")) },
         MockProtocolBuilder::new()
             .with_writer_features([TableFeature::GeneratedColumns])
             .build(),
-        WriteSupport::Unsupported
-    )]
-    #[case::non_string_expression_with_feature(
-        schema_ref! { (field_with_generation_expression("event_year", DataType::INTEGER, 7_i64)) },
-        MockProtocolBuilder::new()
-            .with_writer_features([TableFeature::GeneratedColumns])
-            .build(),
-        WriteSupport::Unsupported
+        WriteSupport::Supported
     )]
     #[case::empty_expression_without_feature(
         schema_ref! { (field_with_generation_expression("event_year", DataType::INTEGER, "")) },
         MockProtocolBuilder::new().with_versions(1, 2).build(),
         WriteSupport::Supported
     )]
+    // Connectors receive generation expressions as SQL text, so kernel rejects a non-string
+    // expression on a table that supports `generatedColumns`.
+    #[case::non_string_expression_with_feature(
+        schema_ref! { (field_with_generation_expression("event_year", DataType::INTEGER, 7_i64)) },
+        MockProtocolBuilder::new()
+            .with_writer_features([TableFeature::GeneratedColumns])
+            .build(),
+        WriteSupport::InvalidSchema
+    )]
     #[case::non_string_expression_without_feature(
         schema_ref! { (field_with_generation_expression("event_year", DataType::INTEGER, 7_i64)) },
         MockProtocolBuilder::new().with_versions(1, 2).build(),
         WriteSupport::Supported
     )]
-    // No top-level generation expressions.
+    // No top-level generation expressions. Writers must implement every table feature the protocol
+    // lists, even an unused one.
+    #[case::no_generation_expression_with_feature(
+        schema_ref! { nullable "event_time": TIMESTAMP },
+        MockProtocolBuilder::new()
+            .with_writer_features([TableFeature::GeneratedColumns])
+            .build(),
+        WriteSupport::Supported
+    )]
     #[case::no_generation_expression(
         schema_ref! { nullable "event_time": TIMESTAMP },
         MockProtocolBuilder::new().with_versions(1, 2).build(),
@@ -1749,6 +1787,42 @@ mod test {
 
         let has_generation_expressions = table_config.has_generation_expressions();
         assert_eq!(has_generation_expressions, expected);
+    }
+
+    #[rstest]
+    // Protocols that support `generatedColumns`.
+    #[case::with_feature(
+        MockProtocolBuilder::new()
+            .with_writer_features([TableFeature::GeneratedColumns])
+            .build(),
+        &[("event_year", "YEAR(event_time)")]
+    )]
+    #[case::legacy_writer_at_min_version(
+        MockProtocolBuilder::new().with_versions(1, 4).build(),
+        &[("event_year", "YEAR(event_time)")]
+    )]
+    // Protocols without `generatedColumns`, so the expressions define no generated columns.
+    #[case::without_feature(MockProtocolBuilder::new().build(), &[])]
+    #[case::legacy_writer_below_min_version(
+        MockProtocolBuilder::new().with_versions(1, 3).build(),
+        &[]
+    )]
+    fn generated_columns_returns_columns_only_with_protocol_support(
+        #[case] protocol: Protocol,
+        #[case] expected: &[(&str, &str)],
+    ) {
+        let table_config = MockTableConfigurationBuilder::new()
+            .with_schema(generated_event_year_schema())
+            .with_protocol(protocol)
+            .build();
+
+        let generated_columns = table_config.generated_columns().unwrap();
+
+        let column_pairs: Vec<_> = generated_columns
+            .iter()
+            .map(|column| (column.logical_name(), column.raw_sql()))
+            .collect();
+        assert_eq!(column_pairs, expected);
     }
 
     #[test]
@@ -3712,9 +3786,25 @@ mod test {
         vec![TableFeature::AdaptiveMetadataPreview, TableFeature::IcebergNativeV4Preview],
         None
     )]
+    #[case::checkpoint_protection(
+        vec![
+            TableFeature::AdaptiveMetadataPreview,
+            TableFeature::IcebergNativeV4Preview,
+            TableFeature::CheckpointProtection,
+        ],
+        None
+    )]
     #[case::missing_adaptive_metadata(
         vec![TableFeature::IcebergNativeV4Preview],
         Some("requires 'adaptiveMetadata-preview' to be enabled")
+    )]
+    #[case::non_allow_listed_writer_feature(
+        vec![
+            TableFeature::AdaptiveMetadataPreview,
+            TableFeature::IcebergNativeV4Preview,
+            TableFeature::AllowColumnDefaults,
+        ],
+        Some("requires 'allowColumnDefaults' to not be supported")
     )]
     fn test_iceberg_native_v4_feature_requirements(
         #[case] features: Vec<TableFeature>,
@@ -3773,6 +3863,33 @@ mod test {
             .build();
         let result = config.validate_feature_requirements(&TableFeature::IcebergNativeV4Preview);
         assert!(result.is_ok(), "expected Ok, got {result:?}");
+    }
+
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[rstest]
+    #[case::unset(None, false)]
+    #[case::true_(Some("true"), true)]
+    #[case::false_(Some("false"), false)]
+    fn test_iceberg_native_v4_enablement_follows_table_property(
+        #[case] property_value: Option<&str>,
+        #[case] expected_enabled: bool,
+    ) {
+        let properties = property_value
+            .map(|v| vec![(ENABLE_ICEBERG_NATIVE_V4, v)])
+            .unwrap_or_default();
+        let config = MockTableConfigurationBuilder::new()
+            .with_properties(&properties)
+            .with_protocol(
+                MockProtocolBuilder::new()
+                    .with_features([TableFeature::IcebergNativeV4Preview])
+                    .build(),
+            )
+            .build();
+        assert!(config.is_feature_supported(&TableFeature::IcebergNativeV4Preview));
+        assert_eq!(
+            config.is_feature_enabled(&TableFeature::IcebergNativeV4Preview),
+            expected_enabled,
+        );
     }
 
     // IcebergCompatV1/V2/V3 are pairwise mutually exclusive.

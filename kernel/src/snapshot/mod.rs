@@ -39,7 +39,7 @@ use crate::metrics::{
 use crate::path::ParsedLogPath;
 use crate::row_tracking::{ROW_TRACKING_DOMAIN_NAME, parse_row_tracking_high_water_mark};
 use crate::scan::ScanBuilder;
-use crate::schema::SchemaRef;
+use crate::schema::{GeneratedColumn, SchemaRef};
 use crate::table_configuration::{InCommitTimestampEnablement, TableConfiguration};
 use crate::table_features::{Operation, TableFeature, physical_to_logical_column_name_and_type};
 #[cfg(feature = "check-constraints-in-dev")]
@@ -323,6 +323,9 @@ impl Snapshot {
         &self,
         engine: &dyn Engine,
     ) -> KernelResult<Option<Arc<CheckpointAction>>> {
+        if !self.has_adaptive_metadata() {
+            return Ok(None);
+        }
         if let Some(cached) = self.checkpoint_action.get() {
             return Ok(cached.clone());
         }
@@ -660,8 +663,10 @@ impl Snapshot {
     /// - The log root Url string.
     /// - The raw `schemaString` JSON on table metadata.
     ///
-    /// The Arc-shared variables (e.g. logical/physical schemas, `crc`) are not counted,
-    /// as they can be shared between multiple snapshots and are not owned by a single snapshot.
+    /// The raw `schemaString` JSON is counted for each snapshot even when shared, so summing
+    /// estimates across snapshots may count the same buffer more than once. Other Arc-shared
+    /// variables (e.g. logical/physical schemas, `crc`) are not counted, as they are not owned by
+    /// a single snapshot.
     ///
     /// Other variables' contributions to heap size are relatively small, so they are not counted
     /// here.
@@ -693,6 +698,22 @@ impl Snapshot {
     #[cfg(feature = "check-constraints-in-dev")]
     pub fn check_constraints(&self) -> &[CheckConstraint] {
         &self.table_properties().check_constraints
+    }
+
+    /// The table's [`GeneratedColumn`]s at this snapshot's version, in schema order. Empty when
+    /// the table has none, or when its protocol doesn't support the `generatedColumns` writer
+    /// feature.
+    ///
+    /// A connector writing to the table discovers them from
+    /// [`Transaction::generated_columns`](crate::transaction::Transaction::generated_columns)
+    /// instead.
+    ///
+    /// # Errors
+    ///
+    /// Returns a schema error if a generated column's `delta.generationExpression` metadata is not
+    /// a string.
+    pub fn generated_columns(&self) -> KernelResult<Vec<GeneratedColumn>> {
+        self.table_configuration().generated_columns()
     }
 
     /// Returns the protocol-derived table properties as a map of key-value pairs.
@@ -1159,16 +1180,19 @@ impl Snapshot {
         &self,
         engine: &dyn Engine,
     ) -> KernelResult<Option<LastManifestCommit>> {
-        if !self
-            .table_configuration()
-            .is_feature_enabled(&TableFeature::AdaptiveMetadataPreview)
-        {
+        if !self.has_adaptive_metadata() {
             return Ok(None);
         }
         if let Some(resolved) = self.last_manifest_commit.get() {
             return Ok(resolved.clone());
         }
         Ok(self.read_ict_and_last_manifest_commit(engine)?.1)
+    }
+
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    fn has_adaptive_metadata(&self) -> bool {
+        self.table_configuration()
+            .is_feature_enabled(&TableFeature::AdaptiveMetadataPreview)
     }
 
     /// Reads the In-Commit Timestamp and `lastManifestCommit` from this version's commit file,

@@ -12,6 +12,7 @@ mod commit_info;
 mod domain_metadata;
 #[cfg(feature = "arrow-60")]
 mod file;
+mod generated_columns;
 mod ict;
 mod interval;
 mod nested_field_ids;

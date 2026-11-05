@@ -40,6 +40,8 @@ use crate::{
     KernelResult, KernelResultIterator, ParquetFooter, ParquetHandler, PredicateRef, Snapshot,
 };
 
+#[cfg(feature = "adaptive-metadata-in-dev")]
+mod adaptive_metadata;
 #[cfg(feature = "geo-type-in-dev")]
 mod geometry_stats;
 mod variant_stats;
@@ -105,6 +107,25 @@ fn test_static_skipping() {
         (false, Pred::lt(lit(10), lit(100))),
         (true, Pred::gt(lit(10), lit(100))),
         (false, Pred::and(Pred::NULL, column_pred!("a"))), // NULL is unknown, not false
+        (
+            true,
+            Pred::from_expr(Expr::case_when([(Pred::TRUE, lit(false))], lit(true))),
+        ),
+        (
+            false,
+            Pred::from_expr(Expr::case_when(
+                [(column_pred!("a"), lit(true))],
+                lit(false),
+            )),
+        ),
+        (
+            false, // A NULL condition does not establish ELSE during static pruning.
+            Pred::from_expr(Expr::case_when([(Pred::NULL, lit(true))], lit(false))),
+        ),
+        (
+            true,
+            Expr::case_when([(Pred::TRUE, lit(10))], lit(20)).eq(lit(20)),
+        ),
     ];
     for (should_skip, predicate) in test_cases {
         assert_eq!(

@@ -7,6 +7,8 @@
 
 pub(crate) mod v2;
 pub(crate) mod v3;
+#[cfg(feature = "adaptive-metadata-in-dev")]
+pub(crate) mod v4;
 
 use crate::schema::PrimitiveType::{Byte, Decimal, Double, Float, Integer, Long, Short};
 use crate::schema::{ColumnMetadataKey, DataType, MetadataValue, StructField};
@@ -19,6 +21,8 @@ pub(crate) enum IcebergCompatVersion {
     // TODO: Add V1 when kernel supports it
     V2,
     V3,
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    NativeV4,
 }
 
 impl IcebergCompatVersion {
@@ -26,6 +30,8 @@ impl IcebergCompatVersion {
         match self {
             Self::V2 => TableFeature::IcebergCompatV2,
             Self::V3 => TableFeature::IcebergCompatV3,
+            #[cfg(feature = "adaptive-metadata-in-dev")]
+            Self::NativeV4 => TableFeature::IcebergNativeV4Preview,
         }
     }
 }

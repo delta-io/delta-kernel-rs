@@ -509,11 +509,10 @@ mod tests {
         #[case] with_serde: bool,
         #[case] expected_parallel: Option<&str>,
     ) -> KernelResult<()> {
-        // This table has checkpoint sidecars, so the sequential phase yields a parallel phase.
-        let (engine, snapshot, _tempdir) = load_test_table("v2-checkpoints-json-with-sidecars")?;
-
         let reporter = Arc::new(CapturingReporter::default());
         let _guard = install_thread_local_metrics_reporter(reporter.clone());
+        // This table has checkpoint sidecars, so the sequential phase yields a parallel phase.
+        let (engine, snapshot, _tempdir) = load_test_table("v2-checkpoints-json-with-sidecars")?;
 
         let scan = snapshot
             .scan_builder()

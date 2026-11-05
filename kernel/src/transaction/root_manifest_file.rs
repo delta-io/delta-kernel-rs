@@ -633,15 +633,12 @@ mod tests {
         #[case] domain_kept: bool,
     ) -> KernelResult<()> {
         let (engine, table_root) = setup_table()?;
-        let config = Snapshot::builder_for(table_root.clone())
-            .build(&engine)?
-            .table_configuration()
-            .clone();
+        let (protocol, metadata) = adaptive_metadata_protocol_and_metadata();
         let existing = CheckpointAction::new(
             1,
             ContentRoot::new("metadata/root-v1.parquet".to_string(), 1024, 1),
-            config.protocol().clone(),
-            config.metadata().clone(),
+            protocol,
+            metadata,
             vec![SetTransaction::new("app-1".to_string(), 5, None)],
             vec![DomainMetadata::new(
                 "test.domain".to_string(),
