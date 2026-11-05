@@ -12,8 +12,8 @@ use crate::arrow::compute::interleave;
 use crate::arrow::datatypes::DataType as ArrowDataType;
 use crate::arrow::row::OwnedRow;
 use crate::engine::arrow_conversion::TryIntoArrow as _;
-use crate::engine::arrow_data::fix_nested_null_masks;
 use crate::engine::arrow_expression::evaluate_expression::{extract_column, extract_column_ref};
+use crate::engine::arrow_utils::fix_record_batch_nested_null_masks;
 use crate::expressions::ColumnName;
 use crate::plans::ir::nodes::{Agg, Aggregate, NonNullByOperands};
 use crate::schema::DataType;
@@ -39,12 +39,19 @@ trait BoundAggregate {
 }
 
 /// Evaluates an [`Aggregate`].
-/// Comparison and arithmetic operands are LONG-only. Counts and selectors support arbitrary
-/// operand types, including structs.
+/// `MIN`, `MAX`, and `SUM` require LONG operands. `MIN_NON_NULL_BY` and `MAX_NON_NULL_BY`
+/// require LONG keys, but accept any value and sentinel type. `COUNT` and `FIRST_NON_NULL`
+/// accept any operand type, including structs.
 pub(super) fn eval_aggregate(
     aggregate: &Aggregate,
     input: &[RecordBatch],
 ) -> KernelResult<Vec<RecordBatch>> {
+    // All aggregate operands and grouping keys must see the same effective nested validity.
+    let input: Vec<_> = input
+        .iter()
+        .cloned()
+        .map(fix_record_batch_nested_null_masks)
+        .try_collect()?;
     let ops: Vec<Box<dyn BoundAggregate>> = aggregate
         .aggs
         .iter()
@@ -82,12 +89,12 @@ pub(super) fn eval_aggregate(
     // Materialize the grouping key columns, followed by agg columns
     let mut output_arrays = Vec::with_capacity(aggregate.schema.fields().len());
     for group_by in &aggregate.group_by {
-        let arrays = extract_column_values(input, group_by)?;
+        let arrays = extract_column_values(&input, group_by)?;
         output_arrays.push(interleave_column_values(&arrays, &reps)?);
     }
     for (agg_idx, op) in ops.iter().enumerate() {
         let states = Vec::from_iter(aggs_by_group.iter().map(|aggs| aggs[agg_idx].as_ref()));
-        output_arrays.push(op.finalize(&states, input)?);
+        output_arrays.push(op.finalize(&states, &input)?);
     }
 
     Ok(vec![RecordBatch::try_new(output_schema, output_arrays)?])
@@ -140,7 +147,7 @@ impl FirstNonNullAgg {
     }
 }
 
-struct FirstNonNullState(Option<ArrayRef>);
+struct FirstNonNullState(Option<InputRow>);
 
 impl BoundAggregate for FirstNonNullAgg {
     fn init_state(&self) -> Box<dyn Any> {
@@ -148,27 +155,24 @@ impl BoundAggregate for FirstNonNullAgg {
     }
 
     fn prepare<'a>(&'a self, batch: &'a RecordBatch) -> KernelResult<Box<dyn AggUpdater + 'a>> {
-        // A nested operand must inherit its parents' nulls before selecting the first value.
-        let value = if self.value.len() > 1 {
-            let batch = RecordBatch::from(fix_nested_null_masks(batch.clone().into()));
-            extract_column(&batch, &self.value)?
-        } else {
-            extract_column(batch, &self.value)?
-        };
-        Ok(Box::new(FirstNonNullUpdater(value)))
+        Ok(Box::new(FirstNonNullUpdater(extract_column(
+            batch,
+            &self.value,
+        )?)))
     }
 
-    fn finalize(&self, states: &[&dyn Any], _input: &[RecordBatch]) -> KernelResult<ArrayRef> {
-        let arrays: Vec<_> = states
+    fn finalize(&self, states: &[&dyn Any], input: &[RecordBatch]) -> KernelResult<ArrayRef> {
+        let mut arrays = extract_column_values(input, &self.value)?;
+        arrays.push(new_null_array(&self.output_type, 1));
+        let null_row = (input.len(), 0);
+        let rows: Vec<_> = states
             .iter()
             .map(|state| -> KernelResult<_> {
                 Ok(downcast_state::<FirstNonNullState>(*state)?
                     .0
-                    .clone()
-                    .unwrap_or_else(|| new_null_array(&self.output_type, 1)))
+                    .unwrap_or(null_row))
             })
             .try_collect()?;
-        let rows: Vec<_> = (0..arrays.len()).map(|i| (i, 0)).collect();
         interleave_column_values(&arrays, &rows)
     }
 }
@@ -176,11 +180,10 @@ impl BoundAggregate for FirstNonNullAgg {
 struct FirstNonNullUpdater(ArrayRef);
 
 impl AggUpdater for FirstNonNullUpdater {
-    fn update(&self, state: &mut dyn Any, (_, row): InputRow) -> KernelResult<()> {
+    fn update(&self, state: &mut dyn Any, row: InputRow) -> KernelResult<()> {
         let state = downcast_state_mut::<FirstNonNullState>(state)?;
-        if state.0.is_none() && self.0.is_valid(row) {
-            // Copy only the selected row so the state does not retain source batch buffers.
-            state.0 = Some(interleave(&[self.0.as_ref()], &[(0, row)])?);
+        if state.0.is_none() && self.0.is_valid(row.1) {
+            state.0 = Some(row);
         }
         Ok(())
     }
@@ -551,34 +554,42 @@ mod tests {
         Ok(())
     }
 
-    // Test that first_non_null agg respects parent struct's nullability.
+    // Test that first_non_null keeps separate group states across batches.
     //
     // Input:
-    //     - parent validity buffer: [false, true]
-    //     - child values: [99, 7]
-    //     - effective values: [NULL, 7]
+    //     - batch 1: [(a, NULL), (b, NULL)]
+    //     - batch 2: [(a, NULL), (b, "later")]
     // Expected Output:
-    //     - [7]
+    //     - [(a, NULL), (b, "later")]
     #[test]
-    fn first_non_null_nested_operand_respects_parent_null() -> KernelResult<()> {
-        let nested = StructArray::new(
-            vec![Arc::new(Field::new("value", ArrowDataType::Int64, true))].into(),
-            vec![Arc::new(Int64Array::from(vec![99, 7]))],
-            Some(NullBuffer::from(vec![false, true])),
-        );
-        let input = RecordBatch::try_from_iter([("nested", Arc::new(nested) as ArrayRef)])?;
-        let aggregate = Aggregate::ungrouped(schema_ref! {
-            nullable "nested": { nullable "value": LONG },
-        })
-        .first_non_null(column_name!("nested.value"))
+    fn grouped_first_non_null_selects_across_batches() -> KernelResult<()> {
+        let batch = |groups: Vec<&str>, values: Vec<Option<&str>>| {
+            RecordBatch::try_from_iter([
+                ("group", Arc::new(StringArray::from(groups)) as ArrayRef),
+                ("value", Arc::new(StringArray::from(values)) as ArrayRef),
+            ])
+        };
+        let input = [
+            batch(vec!["a", "b"], vec![None, None])?,
+            batch(vec!["a", "b"], vec![None, Some("later")])?,
+        ];
+        let aggregate = Aggregate::group_by(
+            schema_ref! { not_null "group": STRING, nullable "value": STRING },
+            [column_name!("group")],
+        )
+        .first_non_null(column_name!("value"))
         .build()?;
-        let output = eval_aggregate(&aggregate, &[input])?;
-        let values = output[0]
-            .column(0)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .unwrap();
-        assert_eq!(values.iter().collect::<Vec<_>>(), [Some(7)]);
+
+        assert_batches_eq(
+            &eval_aggregate(&aggregate, &input)?,
+            "\
++-------+-------+
+| group | value |
++-------+-------+
+| a     |       |
+| b     | later |
++-------+-------+",
+        );
         Ok(())
     }
 
