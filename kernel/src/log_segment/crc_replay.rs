@@ -189,6 +189,7 @@ impl LogSegment {
             let mut visitor = CheckpointCrcVisitor { acc: &mut acc };
             visitor.visit_rows_of(batch.actions())?;
         }
+        acc.process_commit_file_end();
         Ok(acc.into_crc_delta().into_complete_crc(version))
     }
 
@@ -306,6 +307,10 @@ impl LogSegment {
             visitor.visit_rows_of(batch.as_ref())?;
         }
 
+        // Run the per-commit invariant on the final (oldest) commit; no successor batch
+        // will trigger it.
+        acc.process_commit_file_end();
+
         let delta = acc.into_crc_delta();
         #[cfg(feature = "adaptive-metadata-in-dev")]
         if let (Some(newest), Some(last_manifest_commit)) = (newest, &delta.last_manifest_commit) {
@@ -335,6 +340,10 @@ struct CrcReplayAccumulator {
     /// URL of the commit file currently being processed. Drives commit-boundary detection:
     /// a different URL on a later batch means we've moved to an older commit.
     current_file_url: Option<String>,
+
+    /// True if the current commit had at least one add/remove row. Combined with
+    /// `current_commit_operation` for the per-commit invariant check.
+    current_commit_saw_file_action: bool,
 
     // Aggregate adds and removes separately until commitInfo is known. It may follow file
     // actions, including in a later batch. Memory use depends on histogram bins, not file count.
@@ -367,6 +376,7 @@ impl CrcReplayAccumulator {
             },
             is_first_commit: true,
             current_file_url: None,
+            current_commit_saw_file_action: false,
             current_commit_operation: None,
             current_commit_saw_commit_info: false,
         }
@@ -394,9 +404,7 @@ impl CrcReplayAccumulator {
             Some(operation) => FileStatsPolicy::for_operation(operation),
             // Checkpoints have reconciled adds and no commitInfo. Metadata-only commits also
             // preserve file statistics without an operation name.
-            None if self.current_file_url.is_none()
-                || (stats.gross_add_files == 0 && stats.gross_remove_files == 0) =>
-            {
+            None if self.current_file_url.is_none() || !self.current_commit_saw_file_action => {
                 FileStatsPolicy::ApplyAll
             }
             None => FileStatsPolicy::Unsupported,
@@ -449,6 +457,7 @@ impl CrcReplayAccumulator {
             histogram.file_counts.fill(0);
             histogram.total_bytes.fill(0);
         }
+        self.current_commit_saw_file_action = false;
         self.current_commit_operation = None;
         self.current_commit_saw_commit_info = false;
     }
@@ -479,6 +488,7 @@ impl CrcReplayAccumulator {
     }
 
     fn on_add(&mut self, size: i64) -> KernelResult<()> {
+        self.current_commit_saw_file_action = true;
         // Once the delta is no longer incremental-safe, [`Crc::apply`] will transition the
         // file-stats state to `Indeterminate` and discard the accumulated file stats and
         // histogram. Stop accumulating; further math is wasted work.
@@ -499,6 +509,7 @@ impl CrcReplayAccumulator {
 
     /// A missing size makes counted removes unsafe; excluded DV tombstones need no size.
     fn on_remove(&mut self, size: Option<i64>) -> KernelResult<()> {
+        self.current_commit_saw_file_action = true;
         // Once the delta is no longer incremental-safe, [`Crc::apply`] will transition the
         // file-stats state to `Indeterminate` and discard the accumulated file stats and
         // histogram. Stop accumulating; further math is wasted work.
@@ -573,8 +584,7 @@ impl CrcReplayAccumulator {
         Ok(())
     }
 
-    fn into_crc_delta(mut self) -> CrcDelta {
-        self.process_commit_file_end();
+    fn into_crc_delta(self) -> CrcDelta {
         self.delta
     }
 }
@@ -934,6 +944,7 @@ mod tests {
         acc.process_batch_start("v1.json");
         acc.on_commit_info_without_lmc(Some("WRITE"), None);
         acc.on_add(200).unwrap();
+        acc.process_commit_file_end();
         let delta = acc.into_crc_delta();
         assert!(delta.is_incremental_safe);
         assert_eq!(delta.file_stats.net_files(), expected_files);
@@ -968,6 +979,7 @@ mod tests {
             #[cfg(feature = "adaptive-metadata-in-dev")]
             Some(LastManifestCommit::new(1, 1).unwrap()),
         );
+        acc.process_commit_file_end();
         let delta = acc.into_crc_delta();
         assert_eq!(delta.in_commit_timestamp, last_ict);
         #[cfg(feature = "adaptive-metadata-in-dev")]
@@ -1104,6 +1116,7 @@ mod tests {
     fn into_crc_delta_transfers_accumulated_state() {
         let mut acc = CrcReplayAccumulator::new(None);
         acc.on_add(42).unwrap();
+        acc.process_commit_file_end();
         let delta = acc.into_crc_delta();
         assert_eq!(delta.file_stats.net_files(), 1);
         assert_eq!(delta.file_stats.net_bytes(), 42);
@@ -1177,6 +1190,7 @@ mod tests {
         acc.process_batch_start("v1.json");
         acc.on_add(100).unwrap();
         acc.on_commit_info_without_lmc(Some("WRITE"), None);
+        acc.process_commit_file_end();
         let delta = acc.into_crc_delta();
         assert!(delta.is_incremental_safe);
         let (files, bytes, counts, histogram_bytes) = if ignore_adds {
@@ -1213,6 +1227,7 @@ mod tests {
             acc.on_remove(size).unwrap();
         }
         acc.on_commit_info_without_lmc(Some(operation), None);
+        acc.process_commit_file_end();
         let delta = acc.into_crc_delta();
         assert!(delta.is_incremental_safe);
         assert_eq!(delta.file_stats.net_files(), 0);
