@@ -1041,7 +1041,7 @@ impl TableConfiguration {
 
     /// Table root for normalizing paths. `Some` iff adaptiveMetadata is enabled.
     pub(crate) fn dv_normalization_root(&self) -> Option<Url> {
-        self.is_feature_enabled(&TableFeature::AdaptiveMetadataPreview)
+        self.is_adaptive_metadata_enabled()
             .then(|| self.table_root.clone())
     }
 

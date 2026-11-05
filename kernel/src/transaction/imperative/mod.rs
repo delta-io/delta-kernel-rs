@@ -881,8 +881,8 @@ mod tests {
     use crate::transaction::create_table::create_table;
     use crate::transaction::operation::UpdateTableOperation;
     use crate::unit_test_utils::{
-        assert_result_error_with_message, copy_test_table, create_valid_add_file_batch,
-        test_schema_flat,
+        MockProtocolBuilder, MockTableConfigurationBuilder, assert_result_error_with_message,
+        copy_test_table, create_valid_add_file_batch, test_schema_flat,
     };
     use crate::{
         EvaluationHandler, ExpressionEvaluator, KernelError, PredicateEvaluator, Result, Snapshot,
@@ -1497,12 +1497,24 @@ mod tests {
     #[case::unset(None)]
     #[case::tight(Some(true))]
     #[case::wide(Some(false))]
-    fn test_validate_file_actions_rejects_non_null_tight_stats(#[case] tight_stats: Option<bool>) {
+    fn test_validate_file_actions_rejects_non_null_tight_stats(
+        #[case] tight_stats: Option<bool>,
+        #[values(false, true)] adaptive_metadata: bool,
+    ) {
         let (engine, snapshot) = non_dv_table();
         let mut txn = snapshot
             .update_table(UpdateTableOperation::Write, "test-engine", true)
             .build(&engine, Box::new(FileSystemCommitter::new()))
             .unwrap();
+        if adaptive_metadata {
+            txn.effective_table_config = MockTableConfigurationBuilder::new()
+                .with_protocol(
+                    MockProtocolBuilder::new()
+                        .with_features([TableFeature::AdaptiveMetadataPreview])
+                        .build(),
+                )
+                .build();
+        }
         txn.add_files(add_file_with_tight_stats(tight_stats));
 
         let result = txn.validate_file_actions();
