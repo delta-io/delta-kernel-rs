@@ -1246,6 +1246,27 @@ pub fn fix_nested_null_masks(batch: StructArray) -> StructArray {
     compute_nested_null_masks(batch, None)
 }
 
+/// Propagates parent null masks through a record batch's nested struct columns while preserving
+/// its schema and row count.
+#[cfg(feature = "declarative-plans")]
+pub(crate) fn fix_record_batch_nested_null_masks(batch: RecordBatch) -> KernelResult<RecordBatch> {
+    if !batch
+        .columns()
+        .iter()
+        .any(|column| matches!(column.data_type(), ArrowDataType::Struct(_)))
+    {
+        return Ok(batch);
+    }
+    let schema = batch.schema();
+    let row_count = batch.num_rows();
+    let columns = fix_nested_null_masks(batch.into()).columns().to_vec();
+    Ok(RecordBatch::try_new_with_options(
+        schema,
+        columns,
+        &RecordBatchOptions::new().with_row_count(Some(row_count)),
+    )?)
+}
+
 /// Splits a StructArray into its parts, unions in the parent null mask, and uses the result to
 /// recursively update the children as well before putting everything back together.
 fn compute_nested_null_masks(sa: StructArray, parent_nulls: Option<&NullBuffer>) -> StructArray {
