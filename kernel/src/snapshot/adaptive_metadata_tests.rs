@@ -5,7 +5,9 @@ use itertools::Itertools as _;
 use rstest::rstest;
 use url::Url;
 
-use crate::actions::{CheckpointAction, ContentRoot, LOG_TXN_SCHEMA, SetTransaction};
+use crate::actions::{
+    CheckpointAction, ContentRoot, LOG_TXN_SCHEMA, LastManifestCommit, SetTransaction,
+};
 use crate::engine::sync::SyncEngine;
 use crate::unit_test_utils::Action;
 use crate::unit_test_utils::adaptive_metadata_fixtures::{
@@ -44,16 +46,22 @@ fn table_with_checkpoint_action(
     // The manifest commit and every later commit point at the manifest commit, as an AMT writer
     // records them; a CRC carries the pointer forward. [`checkpoint_action`]'s content root is at
     // the action's version.
-    let pointer = Some((checkpoint.version(), checkpoint.version()));
+    let pointer = LastManifestCommit::new(checkpoint.version(), checkpoint.version()).unwrap();
     write_ict_commit(
         &engine,
         &table_root,
         CHECKPOINT_VERSION,
-        pointer,
+        Some(&pointer),
         &checkpoint_line(&checkpoint),
     );
     write_crc_at(CHECKPOINT_VERSION);
-    write_ict_commit(&engine, &table_root, CHECKPOINT_VERSION + 1, pointer, after);
+    write_ict_commit(
+        &engine,
+        &table_root,
+        CHECKPOINT_VERSION + 1,
+        Some(&pointer),
+        after,
+    );
     write_crc_at(CHECKPOINT_VERSION + 1);
     let snapshot = Snapshot::builder_for(table_root).build(&engine).unwrap();
     assert_eq!(

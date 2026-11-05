@@ -380,16 +380,12 @@ pub(crate) mod adaptive_metadata_fixtures {
     }
 
     /// A `commitInfo` line with In-Commit Timestamp `timestamp` and, when given, a
-    /// `lastManifestCommit` `(version, contentRootVersion)`, as an AMT writer records on every
-    /// commit.
-    pub(crate) fn commit_info_line(timestamp: i64, pointer: Option<(i64, i64)>) -> String {
+    /// `lastManifestCommit` `pointer`, as an AMT writer records on every commit.
+    pub(crate) fn commit_info_line(timestamp: i64, pointer: Option<&LastManifestCommit>) -> String {
         let mut commit_info =
             serde_json::json!({ "timestamp": timestamp, "inCommitTimestamp": timestamp });
-        if let Some((version, content_root_version)) = pointer {
-            commit_info["lastManifestCommit"] = serde_json::json!({
-                "version": version,
-                "contentRootVersion": content_root_version,
-            });
+        if let Some(pointer) = pointer {
+            commit_info["lastManifestCommit"] = serde_json::to_value(pointer).unwrap();
         }
         serde_json::json!({ "commitInfo": commit_info }).to_string()
     }
@@ -607,7 +603,7 @@ pub(crate) mod adaptive_metadata_fixtures {
         engine: &SyncEngine,
         table_root: &Url,
         version: Version,
-        pointer: Option<(i64, i64)>,
+        pointer: Option<&LastManifestCommit>,
         actions: &str,
     ) {
         let commit_info = commit_info_line(version_as_i64(version).unwrap() + 1, pointer);
