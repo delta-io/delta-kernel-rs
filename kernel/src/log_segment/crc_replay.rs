@@ -438,19 +438,8 @@ impl CrcReplayAccumulator {
         }
         self.current_commit_adds_valid = true;
         self.current_commit_removes_valid = true;
-        for fs in [
-            &mut self.current_commit_adds,
-            &mut self.current_commit_removes,
-        ] {
-            if let Some(histogram) = fs.net_histogram.as_mut() {
-                histogram.file_counts.fill(0);
-                histogram.total_bytes.fill(0);
-            }
-            *fs = FileStatsDelta {
-                net_histogram: fs.net_histogram.take(),
-                ..Default::default()
-            };
-        }
+        self.current_commit_adds.clear();
+        self.current_commit_removes.clear();
         self.current_commit_saw_file_action = false;
         self.current_commit_operation = None;
         self.current_commit_saw_commit_info = false;
@@ -503,7 +492,7 @@ impl CrcReplayAccumulator {
     }
 
     /// A missing size makes counted removes unsafe; excluded DV tombstones need no size.
-    fn on_remove(&mut self, size: Option<i64>) -> KernelResult<()> {
+    fn on_remove(&mut self, path: &str, size: Option<i64>) -> KernelResult<()> {
         self.current_commit_saw_file_action = true;
         // Once the delta is no longer incremental-safe, [`Crc::apply`] will transition the
         // file-stats state to `Indeterminate` and discard the accumulated file stats and
@@ -524,6 +513,7 @@ impl CrcReplayAccumulator {
                 }
             }
             None => {
+                warn!("CRC reverse-replay: remove action at {path} has missing size");
                 self.current_commit_removes_valid = false;
             }
         }
@@ -745,10 +735,10 @@ impl RowVisitor for CommitCrcVisitor<'_> {
             }
 
             let remove_path: Option<String> = getters[COL_REMOVE_PATH].get_opt(i, "remove.path")?;
-            if remove_path.is_some() {
+            if let Some(path) = remove_path {
                 let remove_size: Option<i64> =
                     getters[COL_REMOVE_SIZE].get_opt(i, "remove.size")?;
-                self.acc.on_remove(remove_size)?;
+                self.acc.on_remove(&path, remove_size)?;
             }
 
             self.acc
@@ -854,7 +844,7 @@ mod tests {
         }
         if has_file_action {
             acc.on_add(0).unwrap();
-            acc.on_remove(Some(0)).unwrap();
+            acc.on_remove("a", Some(0)).unwrap();
         }
         if !commit_info_first {
             acc.on_commit_info_without_lmc(op, None);
@@ -1035,7 +1025,7 @@ mod tests {
     #[test]
     fn on_remove_with_size_decrements_files_and_bytes() {
         let mut acc = CrcReplayAccumulator::new(None);
-        acc.on_remove(Some(50)).unwrap();
+        acc.on_remove("p", Some(50)).unwrap();
         acc.process_commit_file_end();
         assert_eq!(acc.delta.file_stats.net_files(), -1);
         assert_eq!(acc.delta.file_stats.net_bytes(), -50);
@@ -1047,7 +1037,7 @@ mod tests {
         let mut acc = CrcReplayAccumulator::new(None);
         acc.on_commit_info_without_lmc(Some(op), None);
         assert!(acc.delta.is_incremental_safe);
-        acc.on_remove(None).unwrap();
+        acc.on_remove("p", None).unwrap();
         assert!(acc.current_commit_saw_file_action);
         acc.process_commit_file_end();
         assert!(!acc.delta.is_incremental_safe);
@@ -1056,7 +1046,7 @@ mod tests {
     #[test]
     fn on_remove_negative_size_trips_is_incremental_safe() {
         let mut acc = CrcReplayAccumulator::new(Some(FileSizeHistogram::create_default()));
-        acc.on_remove(Some(-1)).unwrap();
+        acc.on_remove("p", Some(-1)).unwrap();
         assert!(acc.current_commit_saw_file_action);
         acc.process_commit_file_end();
         assert!(!acc.delta.is_incremental_safe);
@@ -1181,7 +1171,7 @@ mod tests {
         }
         acc.on_add(200).unwrap();
         acc.process_batch_start("v2.json");
-        acc.on_remove(Some(100)).unwrap();
+        acc.on_remove("a", Some(100)).unwrap();
         if !commit_info_first {
             acc.on_commit_info_without_lmc(Some(operation), None);
         }
@@ -1223,7 +1213,7 @@ mod tests {
         if is_add {
             acc.on_add(size.unwrap()).unwrap();
         } else {
-            acc.on_remove(size).unwrap();
+            acc.on_remove("a", size).unwrap();
         }
         acc.on_commit_info_without_lmc(Some(operation), None);
         acc.process_commit_file_end();
