@@ -327,6 +327,9 @@ impl<STATE> Transaction<STATE, Imperative> {
                 &self.staged_data_changes.add_files_metadata,
             )?;
         }
+        write_validation::validate_no_tight_stats_set(
+            &self.staged_data_changes.add_files_metadata,
+        )?;
 
         let row_tracking_enablement = if self
             .effective_table_config
@@ -855,12 +858,14 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
-    use crate::actions::{ADD_SCHEMA, MAX_VALUES, MIN_VALUES, NULL_COUNT, NUM_RECORDS};
+    use crate::actions::{
+        ADD_SCHEMA, MAX_VALUES, MIN_VALUES, NULL_COUNT, NUM_RECORDS, TIGHT_STATS,
+    };
     use crate::arrow::array::builder::{MapBuilder, MapFieldNames, StringBuilder};
     use crate::arrow::array::{
-        ArrayRef, BooleanArray, Int64Array, StringArray, StructArray, new_null_array,
+        Array, ArrayRef, BooleanArray, Int64Array, StringArray, StructArray, new_null_array,
     };
-    use crate::arrow::datatypes::{DataType as ArrowDataType, Schema as ArrowSchema};
+    use crate::arrow::datatypes::{DataType as ArrowDataType, Field, Schema as ArrowSchema};
     use crate::arrow::record_batch::RecordBatch;
     use crate::committer::FileSystemCommitter;
     use crate::engine::DelegatingEngine;
@@ -869,13 +874,16 @@ mod tests {
     use crate::engine::arrow_expression::ArrowEvaluationHandler;
     use crate::engine::sync::SyncEngine;
     use crate::expressions::{ExpressionRef, MapData, PredicateRef, Scalar, StructData};
-    use crate::scan::log_replay::PATH_NAME;
+    use crate::scan::log_replay::{PATH_NAME, STATS_NAME};
     use crate::schema::{MapType, column_name, schema};
     use crate::table_configuration::TableConfiguration;
     use crate::table_properties::APPEND_ONLY;
     use crate::transaction::create_table::create_table;
     use crate::transaction::operation::UpdateTableOperation;
-    use crate::unit_test_utils::{copy_test_table, create_valid_add_file_batch, test_schema_flat};
+    use crate::unit_test_utils::{
+        assert_result_error_with_message, copy_test_table, create_valid_add_file_batch,
+        test_schema_flat,
+    };
     use crate::{
         EvaluationHandler, ExpressionEvaluator, KernelError, PredicateEvaluator, Result, Snapshot,
     };
@@ -1460,5 +1468,50 @@ mod tests {
             result.is_ok(),
             "Stats validation should be skipped without clustering, got: {result:?}"
         );
+    }
+
+    /// A valid add-file row whose `stats` struct is `{numRecords, tightStats}`.
+    fn add_file_with_tight_stats(tight_stats: Option<bool>) -> Box<dyn EngineData> {
+        let batch = create_valid_add_file_batch(true /* all_nullable */);
+        let stats = StructArray::from(vec![
+            (
+                Arc::new(Field::new(NUM_RECORDS, ArrowDataType::Int64, true)),
+                Arc::new(Int64Array::from(vec![1])) as ArrayRef,
+            ),
+            (
+                Arc::new(Field::new(TIGHT_STATS, ArrowDataType::Boolean, true)),
+                Arc::new(BooleanArray::from(vec![tight_stats])),
+            ),
+        ]);
+        let schema = batch.schema();
+        let stats_index = schema.index_of(STATS_NAME).unwrap();
+        let mut fields = schema.fields().to_vec();
+        fields[stats_index] = Arc::new(Field::new(STATS_NAME, stats.data_type().clone(), true));
+        let mut columns = batch.columns().to_vec();
+        columns[stats_index] = Arc::new(stats);
+        let batch = RecordBatch::try_new(Arc::new(ArrowSchema::new(fields)), columns).unwrap();
+        Box::new(ArrowEngineData::new(batch))
+    }
+
+    #[rstest]
+    #[case::unset(None)]
+    #[case::tight(Some(true))]
+    #[case::wide(Some(false))]
+    fn test_validate_file_actions_rejects_non_null_tight_stats(#[case] tight_stats: Option<bool>) {
+        let (engine, snapshot) = non_dv_table();
+        let mut txn = snapshot
+            .update_table(UpdateTableOperation::Write, "test-engine", true)
+            .build(&engine, Box::new(FileSystemCommitter::new()))
+            .unwrap();
+        txn.add_files(add_file_with_tight_stats(tight_stats));
+
+        let result = txn.validate_file_actions();
+        match tight_stats {
+            Some(value) => assert_result_error_with_message(
+                result,
+                &format!("sets stats.tightStats to {value}"),
+            ),
+            None => result.unwrap(),
+        }
     }
 }
