@@ -227,15 +227,15 @@ impl FileSizeHistogram {
         Ok(())
     }
 
-    /// Adds `sign` times each source bin, allowing negative results while building a delta.
+    /// Adds each source bin, allowing negative results while building a delta.
     /// Both histograms must have the same bin boundaries.
-    pub(crate) fn accumulate_signed(&mut self, source: &Self, sign: i64) {
+    pub(crate) fn accumulate(&mut self, source: &Self) {
         debug_assert_eq!(self.sorted_bin_boundaries, source.sorted_bin_boundaries);
         for (target, source) in self.file_counts.iter_mut().zip(&source.file_counts) {
-            *target += sign * source;
+            *target += source;
         }
         for (target, source) in self.total_bytes.iter_mut().zip(&source.total_bytes) {
-            *target += sign * source;
+            *target += source;
         }
     }
 
