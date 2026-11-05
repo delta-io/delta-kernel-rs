@@ -342,7 +342,7 @@ pub struct Metadata {
     description: Option<String>,
     /// Specification of the encoding for the files stored in the table
     format: Format,
-    /// Immutable schema JSON shared by metadata clones.
+    /// Schema JSON, shared to avoid copying large schemas when cloning metadata.
     schema_string: Arc<String>,
     /// Column names by which the data should be partitioned
     partition_columns: Vec<String>,
@@ -2827,12 +2827,9 @@ mod tests {
             .unwrap();
         assert_eq!(copy.parse_schema().unwrap(), *original_schema);
         assert_ne!(changed.schema_string(), copy.schema_string());
-        drop(changed);
         assert_eq!(serde_json::to_value(&copy).unwrap(), saved_json);
         let decoded: Metadata = serde_json::from_value(saved_json).unwrap();
         assert_eq!(decoded, copy);
-        let scalar = Scalar::from(copy.schema_string.clone());
-        assert_eq!(scalar, Scalar::String(copy.schema_string().clone()));
     }
 
     #[test]

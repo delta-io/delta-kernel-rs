@@ -749,6 +749,8 @@ where
     }
 }
 
+/// Converts to a string scalar, reusing the string buffer when uniquely owned and cloning it
+/// when shared with another owner.
 impl From<Arc<String>> for Scalar {
     fn from(value: Arc<String>) -> Self {
         Self::String(Arc::unwrap_or_clone(value))
@@ -1681,6 +1683,7 @@ mod tests {
         assert_into_scalar_matches_to_data_type(1.0f32);
         assert_into_scalar_matches_to_data_type(1.0f64);
         assert_into_scalar_matches_to_data_type("x".to_string());
+        assert_into_scalar_matches_to_data_type(Arc::new("x".to_string()));
         assert_into_scalar_matches_to_data_type(Bytes::from_static(b"x"));
         assert_into_scalar_matches_to_data_type(TableFeature::DeletionVectors);
 
@@ -1695,6 +1698,25 @@ mod tests {
             ("key1".to_string(), Some(42i32)),
             ("key2".to_string(), None),
         ]));
+    }
+
+    #[rstest]
+    #[case::unique(false)]
+    #[case::shared(true)]
+    fn arc_string_conversion_reuses_unique_buffer_and_copies_shared_buffer(#[case] shared: bool) {
+        let value = Arc::new("value".to_string());
+        let original_ptr = value.as_ptr();
+        let other_owner = shared.then(|| value.clone());
+
+        let Scalar::String(converted) = Scalar::from(value) else {
+            panic!("Expected string scalar");
+        };
+        assert_eq!(converted, "value");
+        if let Some(other_owner) = other_owner {
+            assert_ne!(converted.as_ptr(), other_owner.as_ptr());
+        } else {
+            assert_eq!(converted.as_ptr(), original_ptr);
+        }
     }
 
     #[test]
