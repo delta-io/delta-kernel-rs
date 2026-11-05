@@ -17,6 +17,8 @@ use crate::actions::deletion_vector::{
 };
 use crate::actions::{ADD_FIELD, ADD_NAME, Add, REMOVE_FIELD, SIDECAR_FIELD};
 use crate::cancellation::{CancellableIterator, CancellationTokenRef};
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use crate::content_tree::stats::projected_stats_schema;
 use crate::engine::CancellableEngine;
 use crate::engine_data::FilteredEngineData;
 use crate::expressions::{
@@ -1424,6 +1426,12 @@ impl Scan {
             self.checkpoint_read_options();
         #[cfg(feature = "adaptive-metadata-in-dev")]
         if let Some(checkpoint) = self.snapshot.latest_checkpoint_action(engine)? {
+            // The manifests' `content_stats` are read only for the Delta stats the scan reads.
+            let physical_schema = self.snapshot.table_configuration().physical_schema();
+            let content_stats = physical_stats_read_schema
+                .map(|stats| projected_stats_schema(&physical_schema, stats))
+                .transpose()?
+                .filter(|stats| stats.num_fields() > 0);
             return self
                 .snapshot
                 .log_segment()
@@ -1434,6 +1442,7 @@ impl Scan {
                     COMMIT_READ_SCHEMA.clone(),
                     checkpoint_schema,
                     physical_stats_read_schema,
+                    content_stats,
                 );
         }
         // Checkpoints already represent reconciled state, so scans project only Add actions. This
