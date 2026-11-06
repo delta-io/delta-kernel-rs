@@ -484,9 +484,13 @@ pub trait EvaluationHandler: AsAny {
     ///
     /// If the provided output type is a struct, its fields describe the columns of output produced
     /// by the evaluator. Otherwise, the output schema is a single column named "output" of the
-    /// specified `output_type`. In all cases, the output schema is only used for its names (all
-    /// field names will be updated to match) and nullability (non-nullable columns can be converted
-    /// to nullable). Any mismatch in types (including number of columns) will produce an error.
+    /// specified `output_type`. Output field names and nullability are updated to match
+    /// `output_type` (non-nullable columns can be made nullable). Incompatible types or a different
+    /// number of columns produce an error.
+    ///
+    /// The Arrow-based evaluator casts compatible leaf types to the requested output types. It
+    /// uses Arrow's safe casts: reducing timestamp precision truncates toward zero, and values
+    /// that cannot be converted (for example, timestamp scaling overflow) become null.
     ///
     /// # Parameters
     ///

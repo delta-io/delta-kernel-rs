@@ -315,8 +315,10 @@ fn apply_schema_to_file(array: &ArrayRef) -> KernelResult<StructArray> {
     apply_schema_to_struct(&ordered, &FILE_FIELDS)
 }
 
-// Apply `schema` to `array`. This handles renaming, and adjusting nullability and metadata. if the
-// actual data types don't match, this will return an error.
+/// Applies field names, nullability, metadata, and compatible leaf casts from `schema`.
+///
+/// Incompatible types produce an error. Leaf casts follow the Arrow-based evaluator's
+/// [conversion semantics](crate::EvaluationHandler::new_expression_evaluator).
 pub(crate) fn apply_schema_to(array: &ArrayRef, schema: &DataType) -> KernelResult<ArrayRef> {
     apply_schema_to_inner(array, schema, None, "")
 }
@@ -426,7 +428,11 @@ fn apply_schema_to_inner(
         Map(mtype) => Arc::new(apply_schema_to_map(array, mtype, ancestor, relative_path)?),
         // A leaf whose type is not identical to the passed schema needs to be cast.
         _ => match ensure_data_types(schema, array.data_type(), ValidationMode::Full)? {
-            DataTypeCompat::NeedsCast(target) => cast(array, &target)?,
+            DataTypeCompat::NeedsCast(target) => {
+                // by default cast will turn overflow to null, this matches reorder_struct_array so
+                // is what we want
+                cast(array, &target)?
+            }
             DataTypeCompat::Identical | DataTypeCompat::Nested => array.clone(),
         },
     };
@@ -442,7 +448,8 @@ mod apply_schema_validation_tests {
 
     use super::*;
     use crate::arrow::array::{
-        ArrayRef, BinaryArray, Int32Array, RecordBatch, StructArray, TimestampNanosecondArray,
+        ArrayRef, BinaryArray, Int32Array, RecordBatch, StructArray, TimestampMicrosecondArray,
+        TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray,
     };
     use crate::arrow::buffer::{BooleanBuffer, NullBuffer};
     use crate::arrow::datatypes::{
@@ -451,6 +458,7 @@ mod apply_schema_validation_tests {
     };
     #[cfg(feature = "udt-in-dev")]
     use crate::engine::arrow_conversion::TryIntoArrow as _;
+    use crate::engine::arrow_utils::{ReorderIndex, reorder_struct_array};
     use crate::parquet::arrow::PARQUET_FIELD_ID_META_KEY;
     use crate::schema::{
         ColumnMetadataKey, DataType, MetadataValue, StructField, StructType, schema,
@@ -604,6 +612,73 @@ mod apply_schema_validation_tests {
                 &ArrowDataType::Struct(vec![ArrowField::new("ts", expected.clone(), true)].into())
             );
         }
+    }
+
+    #[rstest]
+    #[case::seconds(TimeUnit::Second, 1_000_000)]
+    #[case::milliseconds(TimeUnit::Millisecond, 1_000)]
+    fn apply_schema_timestamp_overflow_matches_parquet_read(
+        #[case] source_unit: TimeUnit,
+        #[case] scale: i64,
+        #[values(DataType::TIMESTAMP, DataType::TIMESTAMP_NTZ)] target_type: DataType,
+    ) {
+        let min = i64::MIN / scale;
+        let max = i64::MAX / scale;
+        let values = vec![
+            Some(i64::MIN),
+            Some(min - 1),
+            Some(min),
+            Some(-1),
+            Some(0),
+            Some(1),
+            Some(max),
+            Some(max + 1),
+            Some(i64::MAX),
+            None,
+        ];
+        let input: ArrayRef = match source_unit {
+            TimeUnit::Second => Arc::new(TimestampSecondArray::from(values).with_timezone("UTC")),
+            TimeUnit::Millisecond => {
+                Arc::new(TimestampMillisecondArray::from(values).with_timezone("UTC"))
+            }
+            _ => unreachable!("Only seconds and milliseconds need scaling up to microseconds"),
+        };
+        let expected = TimestampMicrosecondArray::from(vec![
+            None,
+            None,
+            Some(min * scale),
+            Some(-scale),
+            Some(0),
+            Some(scale),
+            Some(max * scale),
+            None,
+            None,
+            None,
+        ])
+        .with_timezone_opt((target_type == DataType::TIMESTAMP).then_some("UTC"));
+        let input_struct = StructArray::try_new(
+            vec![ArrowField::new("ts", input.data_type().clone(), true)].into(),
+            vec![input.clone()],
+            None,
+        )
+        .unwrap();
+        let read = reorder_struct_array(
+            input_struct.clone(),
+            &[ReorderIndex::cast(0, expected.data_type().clone())],
+            None,
+            None,
+        )
+        .unwrap();
+        let leaf = apply_schema_to(&input, &target_type).unwrap();
+        let batch = apply_schema(
+            &input_struct,
+            &DataType::from(schema! { nullable "ts": (target_type) }),
+        )
+        .unwrap();
+
+        assert_eq!(read.column(0).as_ref(), &expected);
+        assert_eq!(leaf.as_ref(), read.column(0).as_ref());
+        assert_eq!(batch.column(0).as_ref(), read.column(0).as_ref());
     }
 
     #[test]
