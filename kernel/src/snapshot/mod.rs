@@ -168,8 +168,11 @@ fn unresolved_crc(reason: &str) -> KernelError {
     KernelError::ChecksumWriteUnsupported(format!("Cannot resolve a CRC to write: {reason}"))
 }
 
-/// Table configuration, validated [`SnapshotCrc`], and (under AMT) checkpoint-action resolution
-/// produced by the P&M resolution step, ready to build a [`Snapshot`].
+/// Validated table state ready to combine with a selected [`LogSegment`] into a [`Snapshot`].
+///
+/// Fresh and incremental state resolution produce this result after validating the configuration
+/// and optional CRC. The caller still owns the selected log files and supplies the build flags.
+/// Adaptive-metadata state may remain unresolved until a snapshot getter needs it.
 struct PreparedSnapshot {
     table_configuration: TableConfiguration,
     crc: SnapshotCrc,

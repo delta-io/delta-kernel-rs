@@ -82,6 +82,14 @@ typed hint through a callback; connectors must copy any state retained after the
    cancellation through the snapshot builder and pass their original engine.
    Completed snapshots retain neither the adapter nor its token. Declarative plan execution
    uses the original executor unchanged.
+
+   Fresh and incremental builds share `SnapshotTarget` (`kernel/src/snapshot/builder.rs`), which
+   distinguishes time travel, storage latest, and catalog latest. Incremental builds pass that target
+   to `SnapshotUpdate` (`kernel/src/snapshot/incremental/`). `LogUpdate` merges discovered
+   paths with retained files without reading actions and selects the state baseline. A checkpoint
+   at or below the input version preserves the input snapshot's state; a checkpoint ahead of it
+   requires fresh state resolution. `prepare_incremental` resolves CRC and protocol/metadata state
+   separately from file selection, so an older CRC cannot replace newer snapshot metadata.
 2. **Log replay** (`kernel/src/log_replay/`): file-action deduplication via
    `FileActionDeduplicator` and `LogReplayProcessor` trait (distinct from Protocol/Metadata
    replay above)

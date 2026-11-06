@@ -1,0 +1,2124 @@
+use std::path::PathBuf;
+
+use rstest::rstest;
+use serde_json::json;
+use test_utils::table_builder::TestTableBuilder;
+use test_utils::{LoggingTest, delta_path_for_version};
+use url::Url;
+
+use super::*;
+use crate::arrow::array::StringArray;
+use crate::arrow::record_batch::RecordBatch;
+use crate::commit_range::CommitRange;
+use crate::engine::arrow_data::ArrowEngineData;
+use crate::engine::sync::SyncEngine;
+use crate::metrics::{
+    LogSegmentLoadSuccess, LogSegmentLoadType, MetricEvent, MetricId, ProtocolMetadataLoadSuccess,
+    ProtocolMetadataSource,
+};
+use crate::object_store::ObjectStoreExt as _;
+use crate::object_store::memory::InMemory;
+use crate::parquet::arrow::ArrowWriter;
+use crate::path::LogPathFileType;
+use crate::snapshot::{CheckpointWriteResult, commit};
+use crate::unit_test_utils::{
+    CapturingReporter, install_thread_local_metrics_reporter, string_array_to_engine_data,
+};
+use crate::{Engine, KernelResult};
+
+// ============================================================================
+// Helpers
+// ============================================================================
+
+// Action builders for incremental-snapshot tests. Centralized so commit setup stays
+// consistent across tests (e.g. the schema matches `make_test_crc_json`).
+fn protocol_action(min_reader: u32, min_writer: u32) -> serde_json::Value {
+    json!({"protocol": {"minReaderVersion": min_reader, "minWriterVersion": min_writer}})
+}
+
+fn metadata_action(configuration: serde_json::Value) -> serde_json::Value {
+    json!({
+        "metaData": {
+            "id": "test-id",
+            "format": {"provider": "parquet", "options": {}},
+            "schemaString": "{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}]}",
+            "partitionColumns": [],
+            "configuration": configuration,
+            "createdTime": 1587968585495i64,
+        }
+    })
+}
+
+fn add_action(path: &str) -> serde_json::Value {
+    json!({
+        "add": {
+            "path": path,
+            "partitionValues": {},
+            "size": 100,
+            "modificationTime": 1000,
+            "dataChange": true,
+        }
+    })
+}
+
+// Helper: create a minimal test table with commits 0..num_commits.
+async fn setup_test_table_with_commits(
+    table_root: impl AsRef<str>,
+    store: &InMemory,
+    num_commits: u64,
+) -> KernelResult<()> {
+    // Commit 0: protocol + metadata + first file.
+    commit(
+        table_root.as_ref(),
+        store,
+        0,
+        vec![
+            protocol_action(1, 2),
+            metadata_action(json!({})),
+            add_action("file1.parquet"),
+        ],
+    )
+    .await;
+
+    // Additional commits with just add actions.
+    for i in 1..num_commits {
+        let path = format!("file{}.parquet", i + 1);
+        commit(table_root.as_ref(), store, i, vec![add_action(&path)]).await;
+    }
+    Ok(())
+}
+
+// Helper: write a compaction file
+async fn write_compaction_file(store: &InMemory, start: u64, end: u64) -> KernelResult<()> {
+    let content = r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}"#;
+    store
+        .put(
+            &test_utils::compacted_log_path_for_versions(start, end, "json"),
+            content.into(),
+        )
+        .await?;
+    Ok(())
+}
+
+struct IncrementalSnapshotTestContext {
+    store: Arc<InMemory>,
+    url: Url,
+    engine: Arc<SyncEngine>,
+}
+
+fn setup_incremental_snapshot_test() -> KernelResult<IncrementalSnapshotTestContext> {
+    let store = Arc::new(InMemory::new());
+    let url = Url::parse("memory:///")?;
+    let engine = Arc::new(SyncEngine::new_with_store(store.clone()));
+
+    Ok(IncrementalSnapshotTestContext { store, url, engine })
+}
+
+/// Compares two Snapshots field-by-field. LogSegment fields are compared individually,
+/// intentionally skipping `last_checkpoint_metadata` which is only populated on the
+/// from-scratch path (via `_last_checkpoint` hint) and not on the incremental update path.
+fn compare_snapshots(left: &Snapshot, right: &Snapshot) {
+    assert_eq!(left.table_configuration, right.table_configuration);
+    assert_eq!(left.log_segment.end_version, right.log_segment.end_version);
+    assert_eq!(
+        left.log_segment.checkpoint_version,
+        right.log_segment.checkpoint_version
+    );
+    assert_eq!(left.log_segment.log_root, right.log_segment.log_root);
+    assert_eq!(left.log_segment.listed, right.log_segment.listed);
+}
+
+// CRC JSON for the standard test table (see `setup_test_table_with_commits`).
+fn make_test_crc_json(table_size_bytes: i64, num_files: i64) -> serde_json::Value {
+    json!({
+        "tableSizeBytes": table_size_bytes,
+        "numFiles": num_files,
+        "numMetadata": 1,
+        "numProtocol": 1,
+        "protocol": {"minReaderVersion": 1, "minWriterVersion": 2},
+        "metadata": {
+            "id": "test-id",
+            "format": {"provider": "parquet", "options": {}},
+            "schemaString": "{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}]}",
+            "partitionColumns": [],
+            "configuration": {},
+            "createdTime": 1587968585495i64
+        }
+    })
+}
+
+// ============================================================================
+// Tests: SnapshotUpdate requests
+// ============================================================================
+
+#[test]
+fn test_try_new_from_empty_log_tail() -> KernelResult<()> {
+    let table = TestTableBuilder::new().build().unwrap();
+    let engine = SyncEngine::new_with_store(table.store().clone());
+
+    let base_snapshot = Snapshot::builder_for(table.table_root())
+        .at_version(0)
+        .build(&engine)?;
+
+    let result = SnapshotUpdate {
+        existing: base_snapshot.clone(),
+        target: SnapshotTarget::Latest,
+        log_tail: vec![],
+        checkpoint_handling: CheckpointHandling::Adopt,
+        crc_replay: IncrementalReplay::Disabled,
+    }
+    .execute(&engine, SnapshotLoadMetricContext::for_test())?;
+    assert_eq!(result, base_snapshot);
+    // `PartialEq` ignores `built_as_latest`, so assert it explicitly.
+    assert!(result.is_built_as_latest());
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_try_new_from_latest_commit_preservation() -> KernelResult<()> {
+    let store = Arc::new(InMemory::new());
+    let url = Url::parse("memory:///")?;
+    let engine = SyncEngine::new_with_store(store.clone());
+
+    // Create commits 0-2
+    let base_commit = vec![
+        json!({"protocol": {"minReaderVersion": 1, "minWriterVersion": 2}}),
+        json!({
+            "metaData": {
+                "id": "test-id",
+                "format": {"provider": "parquet", "options": {}},
+                "schemaString": "{\"type\":\"struct\",\"fields\":[]}",
+                "partitionColumns": [],
+                "configuration": {},
+                "createdTime": 1587968585495i64
+            }
+        }),
+    ];
+
+    commit(url.as_str(), store.as_ref(), 0, base_commit.clone()).await;
+    commit(
+        url.as_str(),
+        store.as_ref(),
+        1,
+        vec![json!({"commitInfo": {"timestamp": 1234}})],
+    )
+    .await;
+    commit(
+        url.as_str(),
+        store.as_ref(),
+        2,
+        vec![json!({"commitInfo": {"timestamp": 5678}})],
+    )
+    .await;
+
+    let base_snapshot = Snapshot::builder_for(url.as_str())
+        .at_version(1)
+        .build(&engine)?;
+
+    // Verify base snapshot has latest_commit_file at version 1
+    assert_eq!(
+        base_snapshot
+            .log_segment
+            .listed
+            .latest_commit_file
+            .as_ref()
+            .map(|f| f.version),
+        Some(1)
+    );
+
+    // Create log_tail with FileMeta for version 2
+    let commit_2_url = url.join("_delta_log/")?.join("00000000000000000002.json")?;
+    let file_meta = crate::FileMeta {
+        location: commit_2_url,
+        last_modified: 1234567890,
+        size: 100,
+    };
+    let parsed_path = ParsedLogPath::new(file_meta)
+        .ok_or_else(|| KernelError::Generic("Failed to parse log path".to_string()))?;
+    let log_tail = vec![parsed_path];
+
+    // Execute the supplied log tail through SnapshotUpdate.
+    let new_snapshot = SnapshotUpdate {
+        existing: base_snapshot.clone(),
+        target: SnapshotTarget::TimeTravel(2),
+        log_tail,
+        checkpoint_handling: CheckpointHandling::Adopt,
+        crc_replay: IncrementalReplay::Disabled,
+    }
+    .execute(&engine, SnapshotLoadMetricContext::for_test())?;
+
+    // Latest commit should now be version 2
+    assert_eq!(
+        new_snapshot
+            .log_segment
+            .listed
+            .latest_commit_file
+            .as_ref()
+            .map(|f| f.version),
+        Some(2)
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_try_new_from_version_boundary_cases() -> KernelResult<()> {
+    let store = Arc::new(InMemory::new());
+    let table_root = "memory:///test_table/";
+    let engine = SyncEngine::new_with_store(store.clone());
+
+    // Create commits
+    let base_commit = vec![
+        json!({"protocol": {"minReaderVersion": 1, "minWriterVersion": 2}}),
+        json!({
+            "metaData": {
+                "id": "test-id",
+                "format": {"provider": "parquet", "options": {}},
+                "schemaString": "{\"type\":\"struct\",\"fields\":[]}",
+                "partitionColumns": [],
+                "configuration": {},
+                "createdTime": 1587968585495i64
+            }
+        }),
+    ];
+
+    commit(table_root, store.as_ref(), 0, base_commit).await;
+    commit(
+        table_root,
+        store.as_ref(),
+        1,
+        vec![json!({"commitInfo": {"timestamp": 1234}})],
+    )
+    .await;
+
+    let base_snapshot = Snapshot::builder_for(table_root)
+        .at_version(1)
+        .build(&engine)?;
+
+    // Test requesting same version - should return same snapshot
+    let same_version = SnapshotUpdate {
+        existing: base_snapshot.clone(),
+        target: SnapshotTarget::TimeTravel(1),
+        log_tail: vec![],
+        checkpoint_handling: CheckpointHandling::Adopt,
+        crc_replay: IncrementalReplay::Disabled,
+    }
+    .execute(&engine, SnapshotLoadMetricContext::for_test())?;
+    assert!(Arc::ptr_eq(&same_version, &base_snapshot));
+
+    // Test requesting older version - should error
+    let older_version = SnapshotUpdate {
+        existing: base_snapshot.clone(),
+        target: SnapshotTarget::TimeTravel(0),
+        log_tail: vec![],
+        checkpoint_handling: CheckpointHandling::Adopt,
+        crc_replay: IncrementalReplay::Disabled,
+    }
+    .execute(&engine, SnapshotLoadMetricContext::for_test());
+    assert!(matches!(
+        older_version,
+        Err(KernelError::Generic(msg)) if msg.contains("older than snapshot hint version")
+    ));
+
+    Ok(())
+}
+
+// ============================================================================
+// Tests: incremental builder version boundaries and checkpoint retention
+// ============================================================================
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_skip_new_checkpoints_preserves_checkpoint_history_across_updates() -> KernelResult<()>
+{
+    // ===== GIVEN =====
+    let ctx = setup_incremental_snapshot_test()?;
+    let table_root = ctx.url.as_str();
+
+    commit(
+        table_root,
+        &ctx.store,
+        0,
+        vec![
+            protocol_action(1, 1),
+            metadata_action(json!({})),
+            add_action("file0.parquet"),
+        ],
+    )
+    .await;
+    commit(table_root, &ctx.store, 1, vec![add_action("file1.parquet")]).await;
+    Snapshot::builder_for(table_root)
+        .at_version(1)
+        .build(ctx.engine.as_ref())?
+        .checkpoint(ctx.engine.as_ref(), None)?;
+
+    commit(table_root, &ctx.store, 2, vec![add_action("file2.parquet")]).await;
+    commit(table_root, &ctx.store, 3, vec![add_action("file3.parquet")]).await;
+    let base = Snapshot::builder_for(table_root)
+        .at_version(3)
+        .build(ctx.engine.as_ref())?;
+    assert_eq!(base.log_segment.checkpoint_version, Some(1));
+
+    commit(
+        table_root,
+        &ctx.store,
+        4,
+        vec![
+            protocol_action(1, 2),
+            metadata_action(json!({"skip_new_checkpoints": "true"})),
+        ],
+    )
+    .await;
+    commit(table_root, &ctx.store, 5, vec![add_action("file5.parquet")]).await;
+    Snapshot::builder_for(table_root)
+        .at_version(5)
+        .build(ctx.engine.as_ref())?
+        .checkpoint(ctx.engine.as_ref(), None)?;
+    commit(table_root, &ctx.store, 6, vec![add_action("file6.parquet")]).await;
+
+    // ===== WHEN =====
+    // Build one normal update and one that deliberately retains the full commit tail.
+    let default_update = Snapshot::builder_from(base.clone())
+        .at_version(6)
+        .build(ctx.engine.as_ref())?;
+    let updated = Snapshot::builder_from(base.clone())
+        .at_version(6)
+        .skip_new_checkpoints()
+        .build(ctx.engine.as_ref())?;
+
+    // ===== THEN =====
+    // The retained snapshot keeps the original checkpoint and every commit needed by the range.
+    assert_eq!(default_update.log_segment.checkpoint_version, Some(5));
+    assert_eq!(updated.version(), 6);
+    assert_eq!(updated.log_segment.checkpoint_version, Some(1));
+    assert_eq!(
+        updated.log_segment.listed.checkpoint_parts,
+        base.log_segment.listed.checkpoint_parts
+    );
+    assert_eq!(
+        updated.log_segment.last_checkpoint_metadata,
+        base.log_segment.last_checkpoint_metadata
+    );
+    assert_eq!(
+        updated
+            .log_segment
+            .listed
+            .ascending_commit_files
+            .iter()
+            .map(|file| file.version)
+            .collect::<Vec<_>>(),
+        vec![2, 3, 4, 5, 6]
+    );
+    assert_eq!(
+        updated
+            .metadata_configuration()
+            .get("skip_new_checkpoints")
+            .map(String::as_str),
+        Some("true")
+    );
+    assert_eq!(
+        updated
+            .table_configuration()
+            .protocol()
+            .min_reader_version(),
+        1
+    );
+    assert_eq!(
+        updated
+            .table_configuration()
+            .protocol()
+            .min_writer_version(),
+        2
+    );
+    let range = CommitRange::builder_from(updated.clone(), 4).build(ctx.engine.as_ref())?;
+    assert_eq!(range.start_version(), 4);
+    assert_eq!(range.end_version(), 6);
+
+    // ===== WHEN =====
+    // Remove the first update's source commits, then advance from its retained file metadata.
+    for version in 4..=6 {
+        ctx.store
+            .delete(&delta_path_for_version(version, "json"))
+            .await?;
+    }
+    commit(table_root, &ctx.store, 7, vec![add_action("file7.parquet")]).await;
+    let updated_again = Snapshot::builder_from(updated)
+        .at_version(7)
+        .skip_new_checkpoints()
+        .build(ctx.engine.as_ref())?;
+
+    // ===== THEN =====
+    // The second update still carries the complete retained history through version 7.
+    assert_eq!(
+        updated_again
+            .log_segment
+            .listed
+            .ascending_commit_files
+            .iter()
+            .map(|file| file.version)
+            .collect::<Vec<_>>(),
+        vec![2, 3, 4, 5, 6, 7]
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_skip_new_checkpoints_preserves_incremental_builder_boundaries() -> KernelResult<()> {
+    // ===== GIVEN =====
+    let ctx = setup_incremental_snapshot_test()?;
+    setup_test_table_with_commits(ctx.url.as_str(), &ctx.store, 2).await?;
+    let base = Snapshot::builder_for(ctx.url.as_str())
+        .at_version(1)
+        .build(ctx.engine.as_ref())?;
+
+    // ===== WHEN =====
+    // Ask for the latest snapshot when the input is already latest.
+    let unchanged = Snapshot::builder_from(base.clone())
+        .skip_new_checkpoints()
+        .build(ctx.engine.as_ref())?;
+
+    // ===== THEN =====
+    // The reused snapshot records the requested checkpoint policy and latest-version status.
+    assert_eq!(unchanged, base);
+    assert!(unchanged.is_built_as_latest());
+    assert!(unchanged.skipped_new_checkpoints());
+
+    // ===== WHEN =====
+    let refreshed = Snapshot::builder_from(unchanged).build(ctx.engine.as_ref())?;
+
+    // ===== THEN =====
+    // A normal update replaces the previous build policy even when the version is unchanged.
+    assert!(!refreshed.skipped_new_checkpoints());
+
+    // ===== WHEN =====
+    // Request the existing snapshot's version explicitly.
+    let pinned = Snapshot::builder_from(base.clone())
+        .at_version(1)
+        .skip_new_checkpoints()
+        .build(ctx.engine.as_ref())?;
+
+    // ===== THEN =====
+    assert!(Arc::ptr_eq(&pinned, &base));
+    assert!(!pinned.skipped_new_checkpoints());
+
+    // ===== WHEN =====
+    let older = Snapshot::builder_from(base.clone())
+        .at_version(0)
+        .skip_new_checkpoints()
+        .build(ctx.engine.as_ref())
+        .expect_err("an incremental update cannot move backward");
+
+    // ===== THEN =====
+    assert!(
+        older
+            .to_string()
+            .contains("older than snapshot hint version")
+    );
+
+    // ===== WHEN =====
+    let unavailable = Snapshot::builder_from(base.clone())
+        .at_version(2)
+        .skip_new_checkpoints()
+        .build(ctx.engine.as_ref())
+        .expect_err("version 2 does not exist");
+
+    // ===== THEN =====
+    assert!(matches!(unavailable, KernelError::MissingVersion(2)));
+
+    // ===== WHEN =====
+    commit(
+        ctx.url.as_str(),
+        &ctx.store,
+        2,
+        vec![add_action("file2.parquet")],
+    )
+    .await;
+    let partially_available = Snapshot::builder_from(base)
+        .at_version(3)
+        .skip_new_checkpoints()
+        .build(ctx.engine.as_ref())
+        .expect_err("version 3 is beyond the latest commit");
+
+    // ===== THEN =====
+    assert!(matches!(
+        partially_available,
+        KernelError::MissingVersion(3)
+    ));
+
+    Ok(())
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_full_scan_warns_when_snapshot_skipped_new_checkpoints(
+    #[values(false, true)] skip_new_checkpoints: bool,
+) -> KernelResult<()> {
+    // ===== GIVEN =====
+    let ctx = setup_incremental_snapshot_test()?;
+    setup_test_table_with_commits(ctx.url.as_str(), &ctx.store, 3).await?;
+    let base = Snapshot::builder_for(ctx.url.as_str())
+        .at_version(0)
+        .build(ctx.engine.as_ref())?;
+    let builder = Snapshot::builder_from(base).at_version(2);
+    let snapshot = if skip_new_checkpoints {
+        builder.skip_new_checkpoints().build(ctx.engine.as_ref())?
+    } else {
+        builder.build(ctx.engine.as_ref())?
+    };
+    assert_eq!(snapshot.skipped_new_checkpoints(), skip_new_checkpoints);
+
+    // ===== WHEN =====
+    // Build an incremental scan, which consumes exactly the caller-selected commit range.
+    let logging = LoggingTest::new();
+    let _incremental_scan = snapshot
+        .clone()
+        .incremental_scan_builder(0)
+        .build(ctx.engine.as_ref())?;
+
+    // ===== THEN =====
+    assert!(!logging.logs().contains("skip_new_checkpoints()"));
+
+    // ===== WHEN =====
+    // Build a full scan, which may replay the extra commits retained by the snapshot.
+    let _full_scan = snapshot.scan_builder().build()?;
+
+    // ===== THEN =====
+    assert_eq!(
+        logging.logs().contains("skip_new_checkpoints()"),
+        skip_new_checkpoints
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_checkpoint_clears_skipped_new_checkpoints_warning() -> KernelResult<()> {
+    // ===== GIVEN =====
+    let ctx = setup_incremental_snapshot_test()?;
+    setup_test_table_with_commits(ctx.url.as_str(), &ctx.store, 3).await?;
+    let base = Snapshot::builder_for(ctx.url.as_str())
+        .at_version(0)
+        .build(ctx.engine.as_ref())?;
+    let snapshot = Snapshot::builder_from(base)
+        .at_version(2)
+        .skip_new_checkpoints()
+        .build(ctx.engine.as_ref())?;
+
+    // ===== WHEN =====
+    let logging = LoggingTest::new();
+    let _scan = snapshot.clone().scan_builder().build()?;
+
+    // ===== THEN =====
+    // Before reduction, a full scan warns about replaying the deliberately retained commits.
+    assert!(logging.logs().contains("skip_new_checkpoints()"));
+    drop(logging);
+
+    // ===== WHEN =====
+    // Writing a checkpoint produces a reduced snapshot rooted at that checkpoint.
+    let (result, checkpointed) = snapshot.checkpoint(ctx.engine.as_ref(), None)?;
+
+    // ===== THEN =====
+    assert_eq!(result, CheckpointWriteResult::Written);
+    assert!(!checkpointed.skipped_new_checkpoints());
+
+    let logging = LoggingTest::new();
+    let _scan = checkpointed.scan_builder().build()?;
+    assert!(!logging.logs().contains("skip_new_checkpoints()"));
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_skip_new_checkpoints_rejects_missing_history_hidden_by_newer_checkpoint()
+-> KernelResult<()> {
+    // ===== GIVEN =====
+    let ctx = setup_incremental_snapshot_test()?;
+    let table_root = ctx.url.as_str();
+    setup_test_table_with_commits(table_root, &ctx.store, 6).await?;
+
+    let base = Snapshot::builder_for(table_root)
+        .at_version(1)
+        .build(ctx.engine.as_ref())?;
+    Snapshot::builder_for(table_root)
+        .at_version(4)
+        .build(ctx.engine.as_ref())?
+        .checkpoint(ctx.engine.as_ref(), None)?;
+    ctx.store.delete(&delta_path_for_version(3, "json")).await?;
+
+    // ===== WHEN =====
+    // A normal update may use the checkpoint to bridge the missing pre-checkpoint commit.
+    let default_update = Snapshot::builder_from(base.clone())
+        .at_version(5)
+        .build(ctx.engine.as_ref())?;
+
+    // ===== THEN =====
+    assert_eq!(default_update.log_segment.checkpoint_version, Some(4));
+
+    // ===== WHEN =====
+    // Retaining commits requires the full range instead of allowing the checkpoint bridge.
+    let updated = Snapshot::builder_from(base)
+        .at_version(5)
+        .skip_new_checkpoints()
+        .build(ctx.engine.as_ref());
+
+    // ===== THEN =====
+    let error = updated.expect_err("the missing commit must not be hidden by the checkpoint");
+    assert!(matches!(error, KernelError::MissingVersion(3)));
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_incremental_snapshot_picks_up_checkpoint_written_at_current_version()
+-> KernelResult<()> {
+    let ctx = setup_incremental_snapshot_test()?;
+
+    setup_test_table_with_commits(ctx.url.as_str(), &ctx.store, 2).await?;
+
+    let snapshot_v1 = Snapshot::builder_for(ctx.url.as_str())
+        .at_version(1)
+        .build(ctx.engine.as_ref())?;
+    assert_eq!(snapshot_v1.log_segment.checkpoint_version, None);
+
+    snapshot_v1.clone().checkpoint(ctx.engine.as_ref(), None)?;
+
+    let fresh = Snapshot::builder_for(ctx.url.as_str()).build(ctx.engine.as_ref())?;
+    assert_eq!(fresh.version(), 1);
+    assert_eq!(fresh.log_segment.checkpoint_version, Some(1));
+
+    let updated = Snapshot::builder_from(snapshot_v1).build(ctx.engine.as_ref())?;
+    assert_eq!(updated.version(), 1);
+    assert_eq!(updated.log_segment.checkpoint_version, Some(1));
+    compare_snapshots(&updated, &fresh);
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_incremental_snapshot_picks_up_newer_checkpoint_below_current_version()
+-> KernelResult<()> {
+    let ctx = setup_incremental_snapshot_test()?;
+
+    setup_test_table_with_commits(ctx.url.as_str(), &ctx.store, 4).await?;
+
+    Snapshot::builder_for(ctx.url.as_str())
+        .at_version(1)
+        .build(ctx.engine.as_ref())?
+        .checkpoint(ctx.engine.as_ref(), None)?;
+
+    let snapshot_v3 = Snapshot::builder_for(ctx.url.as_str())
+        .at_version(3)
+        .build(ctx.engine.as_ref())?;
+    assert_eq!(snapshot_v3.log_segment.checkpoint_version, Some(1));
+
+    Snapshot::builder_for(ctx.url.as_str())
+        .at_version(2)
+        .build(ctx.engine.as_ref())?
+        .checkpoint(ctx.engine.as_ref(), None)?;
+
+    let fresh = Snapshot::builder_for(ctx.url.as_str()).build(ctx.engine.as_ref())?;
+    assert_eq!(fresh.version(), 3);
+    assert_eq!(fresh.log_segment.checkpoint_version, Some(2));
+
+    let updated = Snapshot::builder_from(snapshot_v3).build(ctx.engine.as_ref())?;
+    assert_eq!(updated.version(), 3);
+    assert_eq!(updated.log_segment.checkpoint_version, Some(2));
+    compare_snapshots(&updated, &fresh);
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_explicit_same_version_request_keeps_existing_snapshot_after_checkpoint_write()
+-> KernelResult<()> {
+    let ctx = setup_incremental_snapshot_test()?;
+
+    setup_test_table_with_commits(ctx.url.as_str(), &ctx.store, 2).await?;
+
+    let snapshot_v1 = Snapshot::builder_for(ctx.url.as_str())
+        .at_version(1)
+        .build(ctx.engine.as_ref())?;
+    assert_eq!(snapshot_v1.log_segment.checkpoint_version, None);
+
+    snapshot_v1.clone().checkpoint(ctx.engine.as_ref(), None)?;
+
+    let refreshed = Snapshot::builder_for(ctx.url.as_str()).build(ctx.engine.as_ref())?;
+    assert_eq!(refreshed.log_segment.checkpoint_version, Some(1));
+
+    let pinned = Snapshot::builder_from(snapshot_v1.clone())
+        .at_version(1)
+        .build(ctx.engine.as_ref())?;
+    assert!(Arc::ptr_eq(&pinned, &snapshot_v1));
+    assert_eq!(pinned.log_segment.checkpoint_version, None);
+
+    Ok(())
+}
+
+/// When a checkpoint at or below the existing snapshot version is discovered and commits
+/// between that checkpoint and the existing snapshot version contain P&M changes, the
+/// incremental update must preserve those P&M changes rather than regressing to the
+/// checkpoint's older P&M.
+///
+/// Setup: initial checkpoint@v0 so listing_start=1. A checkpoint at v1 is written (discoverable
+/// since v1 >= listing_start). The P&M change at commit 2 lies between the new checkpoint (v1)
+/// and existing_snapshot_version (v3); the incremental update must preserve it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_checkpoint_at_or_below_snapshot_version_preserves_pm_from_commits_in_between()
+-> KernelResult<()> {
+    let ctx = setup_incremental_snapshot_test()?;
+    let table_root = ctx.url.as_str();
+
+    // Commit 0: initial protocol (1, 2) + metadata + first file.
+    commit(
+        table_root,
+        &ctx.store,
+        0,
+        vec![
+            protocol_action(1, 2),
+            metadata_action(json!({})),
+            add_action("file1.parquet"),
+        ],
+    )
+    .await;
+    // Commit 1: data-only add.
+    commit(table_root, &ctx.store, 1, vec![add_action("file2.parquet")]).await;
+    // Commit 2: protocol upgrade to (2, 5). This is the change the incremental update
+    // must preserve rather than regressing to checkpoint@v1's older protocol.
+    commit(table_root, &ctx.store, 2, vec![protocol_action(2, 5)]).await;
+    // Commit 3: data-only add.
+    commit(table_root, &ctx.store, 3, vec![add_action("file3.parquet")]).await;
+
+    // Write initial checkpoint at v0 so that listing_start = v0+1 = 1.
+    Snapshot::builder_for(table_root)
+        .at_version(0)
+        .build(ctx.engine.as_ref())?
+        .checkpoint(ctx.engine.as_ref(), None)?;
+
+    // Build snapshot at v3: has checkpoint@v0, protocol (2, 5) from commit 2.
+    let snapshot_v3 = Snapshot::builder_for(table_root)
+        .at_version(3)
+        .build(ctx.engine.as_ref())?;
+    assert_eq!(snapshot_v3.log_segment.checkpoint_version, Some(0));
+    assert_eq!(
+        snapshot_v3
+            .table_configuration()
+            .protocol()
+            .min_reader_version(),
+        2
+    );
+    assert_eq!(
+        snapshot_v3
+            .table_configuration()
+            .protocol()
+            .min_writer_version(),
+        5
+    );
+
+    // Write a checkpoint at v1 (v1 >= listing_start=1, so it is discoverable).
+    // This checkpoint captures only protocol (1, 2) from commit 0.
+    Snapshot::builder_for(table_root)
+        .at_version(1)
+        .build(ctx.engine.as_ref())?
+        .checkpoint(ctx.engine.as_ref(), None)?;
+
+    // Commit 4: add file (new state beyond existing_snapshot_version=3).
+    commit(table_root, &ctx.store, 4, vec![add_action("file4.parquet")]).await;
+
+    // Incremental update from v3: listing starts from v1, discovers checkpoint@v1.
+    // Must preserve protocol (2, 5) from commit 2, not regress to (1, 2) from checkpoint@v1.
+    let updated = Snapshot::builder_from(snapshot_v3).build(ctx.engine.as_ref())?;
+    assert_eq!(updated.version(), 4);
+    assert_eq!(updated.log_segment.checkpoint_version, Some(1));
+
+    // Critical: protocol must still be (2, 5) from commit 2, not (1, 2) from ckpt@v1.
+    assert_eq!(
+        updated
+            .table_configuration()
+            .protocol()
+            .min_reader_version(),
+        2
+    );
+    assert_eq!(
+        updated
+            .table_configuration()
+            .protocol()
+            .min_writer_version(),
+        5
+    );
+
+    // Cross-check against a fresh build.
+    let fresh = Snapshot::builder_for(ctx.url.as_str()).build(ctx.engine.as_ref())?;
+    compare_snapshots(&updated, &fresh);
+
+    Ok(())
+}
+
+// Scenarios for Snapshot::builder_from:
+// 1. new version < existing version
+// 2. new version == existing version
+// 3. new version > existing version AND
+//   a. log segment hasn't changed
+//   b. log segment for old..=new version has a checkpoint (with new protocol/metadata)
+//   b. log segment for old..=new version has no checkpoint
+//     i. commits have (new protocol, new metadata)
+//     ii. commits have (new protocol, no metadata)
+//     iii. commits have (no protocol, new metadata)
+//     iv. commits have (no protocol, no metadata)
+#[tokio::test]
+async fn test_snapshot_new_from() -> KernelResult<()> {
+    let path = std::fs::canonicalize(PathBuf::from("./tests/data/table-with-dv-small/")).unwrap();
+    let url = url::Url::from_directory_path(path).unwrap();
+
+    let engine = SyncEngine::new();
+    let old_snapshot = Snapshot::builder_for(url.clone())
+        .at_version(1)
+        .build(&engine)
+        .unwrap();
+    // 1. new version < existing version: error
+    let snapshot_res = Snapshot::builder_from(old_snapshot.clone())
+        .at_version(0)
+        .build(&engine);
+    assert!(matches!(
+        snapshot_res,
+        Err(KernelError::Generic(msg)) if msg == "Requested snapshot version 0 is older than snapshot hint version 1"
+    ));
+
+    // 2. new version == existing version
+    let snapshot = Snapshot::builder_from(old_snapshot.clone())
+        .at_version(1)
+        .build(&engine)
+        .unwrap();
+    let expected = old_snapshot.clone();
+    assert_eq!(snapshot, expected);
+
+    // Compare an update from v0 to v1 with a fresh build at v1. Callers vary the protocol,
+    // metadata, and checkpoint supplied at v1.
+    fn test_new_from(store: Arc<InMemory>) -> KernelResult<()> {
+        let table_root = "memory:///";
+        let engine = SyncEngine::new_with_store(store);
+        let base_snapshot = Snapshot::builder_for(table_root)
+            .at_version(0)
+            .build(&engine)?;
+        let snapshot = Snapshot::builder_from(base_snapshot.clone())
+            .at_version(1)
+            .build(&engine)?;
+        let expected = Snapshot::builder_for(table_root)
+            .at_version(1)
+            .build(&engine)?;
+        assert_eq!(snapshot, expected);
+        Ok(())
+    }
+
+    // for (3) we will just engineer custom log files
+    let store = Arc::new(InMemory::new());
+    // everything will have a starting 0 commit with commitInfo, protocol, metadata
+    let commit0 = vec![
+        json!({
+            "commitInfo": {
+                "timestamp": 1587968586154i64,
+                "operation": "WRITE",
+                "operationParameters": {"mode":"ErrorIfExists","partitionBy":"[]"},
+                "isBlindAppend":true
+            }
+        }),
+        json!({
+            "protocol": {
+                "minReaderVersion": 1,
+                "minWriterVersion": 2
+            }
+        }),
+        json!({
+            "metaData": {
+                "id":"5fba94ed-9794-4965-ba6e-6ee3c0d22af9",
+                "format": {
+                    "provider": "parquet",
+                    "options": {}
+                },
+                "schemaString": "{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"val\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}]}",
+                "partitionColumns": [],
+                "configuration": {},
+                "createdTime": 1587968585495i64
+            }
+        }),
+    ];
+    let table_root = "memory:///";
+    commit(table_root, store.as_ref(), 0, commit0.clone()).await;
+    // 3. new version > existing version
+    // a. no new log segment
+    let engine = SyncEngine::new_with_store(Arc::new(store.fork()));
+    let base_snapshot = Snapshot::builder_for(table_root)
+        .at_version(0)
+        .build(&engine)?;
+    let snapshot = Snapshot::builder_from(base_snapshot.clone()).build(&engine)?;
+    let expected = Snapshot::builder_for(table_root)
+        .at_version(0)
+        .build(&engine)?;
+    assert_eq!(snapshot, expected);
+    // version exceeds latest version of the table = err
+    assert!(matches!(
+        Snapshot::builder_from(base_snapshot.clone())
+            .at_version(1)
+            .build(&engine),
+        Err(KernelError::MissingVersion(1))
+    ));
+
+    // b. log segment for old..=new version has a checkpoint (with new protocol/metadata)
+    let store_3a = store.fork();
+    let mut checkpoint1 = commit0.clone();
+    commit(table_root, &store_3a, 1, commit0.clone()).await;
+    checkpoint1[1] = json!({
+        "protocol": {
+            "minReaderVersion": 2,
+            "minWriterVersion": 5
+        }
+    });
+    checkpoint1[2]["partitionColumns"] = serde_json::to_value(["some_partition_column"])?;
+
+    let handler = engine.json_handler();
+    let json_strings: StringArray = checkpoint1
+        .into_iter()
+        .map(|json| json.to_string())
+        .collect::<Vec<_>>()
+        .into();
+    let parsed = handler
+        .parse_json(
+            string_array_to_engine_data(json_strings),
+            crate::actions::get_commit_schema().clone(),
+        )
+        .unwrap();
+    let checkpoint = ArrowEngineData::try_from_engine_data(parsed).unwrap();
+    let checkpoint: RecordBatch = checkpoint.into();
+
+    // Write the record batch to a Parquet file
+    let mut buffer = vec![];
+    let mut writer = ArrowWriter::try_new(&mut buffer, checkpoint.schema(), None)?;
+    writer.write(&checkpoint)?;
+    writer.close()?;
+
+    store_3a
+        .put(
+            &delta_path_for_version(1, "checkpoint.parquet"),
+            buffer.into(),
+        )
+        .await
+        .unwrap();
+    test_new_from(store_3a.into())?;
+
+    // c. log segment for old..=new version has no checkpoint
+    // i. commits have (new protocol, new metadata)
+    let store_3c_i = Arc::new(store.fork());
+    let mut commit1 = commit0.clone();
+    commit1[1] = json!({
+        "protocol": {
+            "minReaderVersion": 2,
+            "minWriterVersion": 5
+        }
+    });
+    commit1[2]["partitionColumns"] = serde_json::to_value(["some_partition_column"])?;
+    commit(table_root, store_3c_i.as_ref(), 1, commit1).await;
+    test_new_from(store_3c_i.clone())?;
+
+    // new commits AND request version > end of log
+    let engine = SyncEngine::new_with_store(store_3c_i);
+    let base_snapshot = Snapshot::builder_for(table_root)
+        .at_version(0)
+        .build(&engine)?;
+    assert!(matches!(
+        Snapshot::builder_from(base_snapshot.clone())
+            .at_version(4)
+            .build(&engine),
+        Err(KernelError::MissingVersion(2))
+    ));
+
+    // ii. commits have (new protocol, no metadata)
+    let store_3c_ii = store.fork();
+    let mut commit1 = commit0.clone();
+    commit1[1] = json!({
+        "protocol": {
+            "minReaderVersion": 2,
+            "minWriterVersion": 5
+        }
+    });
+    commit1.remove(2); // remove metadata
+    commit(table_root, &store_3c_ii, 1, commit1).await;
+    test_new_from(store_3c_ii.into())?;
+
+    // iii. commits have (no protocol, new metadata)
+    let store_3c_iii = store.fork();
+    let mut commit1 = commit0.clone();
+    commit1[2]["partitionColumns"] = serde_json::to_value(["some_partition_column"])?;
+    commit1.remove(1); // remove protocol
+    commit(table_root, &store_3c_iii, 1, commit1).await;
+    test_new_from(store_3c_iii.into())?;
+
+    // iv. commits have (no protocol, no metadata)
+    let store_3c_iv = store.fork();
+    let commit1 = vec![commit0[0].clone()];
+    commit(table_root, &store_3c_iv, 1, commit1).await;
+    test_new_from(store_3c_iv.into())?;
+
+    Ok(())
+}
+
+// ============================================================================
+// Tests: stale-CRC resolution on the incremental path
+// ============================================================================
+
+// `resolve_crc_file` when the new listing discovers a checkpoint *at or below* the existing
+// snapshot version must correctly decide which CRC file the combined segment carries on disk.
+// Each case below sets up commits 0-3, writes an existing CRC, builds snapshot_v3, writes
+// a checkpoint, optionally writes a new CRC, then runs the incremental update and checks
+// the segment's `latest_crc_file`. (The checkpoint-*ahead* path is covered separately by
+// `test_incremental_snapshot_multi_hop_replay_then_rebuild_drops_stale_crc`.)
+//
+// The update lands at the same version (v3), so the existing snapshot's in-memory crc@v3
+// always carries forward; only the on-disk `latest_crc_file` differs per case.
+//
+// Cases:
+//   keep_existing:    existing crc@v2 stays when new ckpt@v1 is below it (invariant OK)
+//                     and no newer CRC was listed; segment carries crc@v2.
+//   refresh_to_newer: existing crc@v2 is superseded by a newly-listed crc@v3.
+//   crc_equals_ckpt:  existing crc@v2 and new ckpt@v2 sit at the same version; sanity
+//                     coverage for the invariant boundary `crc.version >= ckpt.version`.
+//   drop_below_ckpt:  existing crc@v1 would violate the LogSegmentFiles invariant with
+//                     new ckpt@v2 (1 < 2), so it is filtered out; segment has no CRC file.
+#[rstest]
+#[case::keep_existing(2, 1, None, Some(2))]
+#[case::refresh_to_newer(2, 1, Some(3), Some(3))]
+#[case::crc_equals_ckpt(2, 2, None, Some(2))]
+#[case::drop_below_ckpt(1, 2, None, None)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_incremental_snapshot_crc_resolution_when_checkpoint_at_or_below_snapshot(
+    #[case] existing_crc_v: u64,
+    #[case] new_ckpt_v: u64,
+    #[case] newly_listed_crc_v: Option<u64>,
+    #[case] expected_crc_file_v: Option<u64>,
+) -> KernelResult<()> {
+    let ctx = setup_incremental_snapshot_test()?;
+    setup_test_table_with_commits(ctx.url.as_str(), &ctx.store, 4).await?;
+
+    ctx.store
+        .put(
+            &delta_path_for_version(existing_crc_v, "crc"),
+            make_test_crc_json(300, 3).to_string().into(),
+        )
+        .await?;
+
+    let snapshot_v3 = Snapshot::builder_for(ctx.url.as_str())
+        .at_version(3)
+        .with_incremental_crc_replay(IncrementalReplay::Unlimited)
+        .build(ctx.engine.as_ref())?;
+    // A fresh build advances the stale CRC via reverse-replay to a CRC at v3 (file stats
+    // Indeterminate, since these synthetic commits carry no commitInfo). The segment's
+    // latest CRC file still points at the on-disk CRC version.
+    assert_eq!(snapshot_v3.crc_at_version().map(|c| c.version), Some(3));
+    assert_eq!(
+        snapshot_v3
+            .log_segment
+            .listed
+            .latest_crc_file
+            .as_ref()
+            .map(|f| f.version),
+        Some(existing_crc_v)
+    );
+
+    // Write the new checkpoint, then optionally plant a newer CRC at `newly_listed_crc_v`.
+    Snapshot::builder_for(ctx.url.as_str())
+        .at_version(new_ckpt_v)
+        .build(ctx.engine.as_ref())?
+        .checkpoint(ctx.engine.as_ref(), None)?;
+    if let Some(v) = newly_listed_crc_v {
+        ctx.store
+            .put(
+                &delta_path_for_version(v, "crc"),
+                make_test_crc_json(400, 4).to_string().into(),
+            )
+            .await?;
+    }
+
+    let updated = Snapshot::builder_from(snapshot_v3).build(ctx.engine.as_ref())?;
+
+    // Observable equivalence: incremental update matches a fresh rebuild, including
+    // `log_segment.listed.latest_crc_file` (so a filter-bypass regression is caught by
+    // `compare_snapshots`, not just by the explicit CRC assertions below).
+    let fresh = Snapshot::builder_for(ctx.url.as_str()).build(ctx.engine.as_ref())?;
+    compare_snapshots(&updated, &fresh);
+    assert_eq!(updated.version(), 3);
+    assert_eq!(updated.log_segment.checkpoint_version, Some(new_ckpt_v));
+    assert_eq!(
+        updated
+            .log_segment
+            .listed
+            .latest_crc_file
+            .as_ref()
+            .map(|f| f.version),
+        expected_crc_file_v
+    );
+    assert_eq!(updated.crc_at_version().map(|c| c.version), Some(3));
+
+    Ok(())
+}
+
+#[rstest]
+#[case::disabled(IncrementalReplay::Disabled, None)]
+#[case::unlimited(IncrementalReplay::Unlimited, Some(5))]
+#[case::budget_exact(IncrementalReplay::UpToCommits(2), Some(5))]
+#[case::budget_more_than_enough(IncrementalReplay::UpToCommits(5), Some(5))]
+#[case::budget_too_small(IncrementalReplay::UpToCommits(1), None)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_incremental_update_advances_in_memory_crc_within_budget(
+    #[case] mode: IncrementalReplay,
+    #[case] expected_crc_v: Option<u64>,
+    #[values(false, true)] skip_new_checkpoints: bool,
+) -> KernelResult<()> {
+    let ctx = setup_incremental_snapshot_test()?;
+    setup_test_table_with_commits(ctx.url.as_str(), &ctx.store, 6).await?;
+    ctx.store
+        .put(
+            &delta_path_for_version(1, "crc"),
+            make_test_crc_json(200, 2).to_string().into(),
+        )
+        .await?;
+
+    let snapshot_a = Snapshot::builder_for(ctx.url.as_str())
+        .at_version(3)
+        .with_incremental_crc_replay(IncrementalReplay::Unlimited)
+        .build(ctx.engine.as_ref())?;
+    assert_eq!(snapshot_a.crc_at_version().map(|c| c.version), Some(3));
+
+    // Advance with each CRC budget under both checkpoint-listing policies.
+    let builder = Snapshot::builder_from(snapshot_a).with_incremental_crc_replay(mode);
+    let builder = if skip_new_checkpoints {
+        builder.skip_new_checkpoints()
+    } else {
+        builder
+    };
+    let updated = builder.build(ctx.engine.as_ref())?;
+
+    // Checkpoint retention must not change whether the configured CRC budget can advance.
+    assert_eq!(updated.version(), 5);
+    assert_eq!(updated.crc_at_version().map(|c| c.version), expected_crc_v);
+    assert_eq!(
+        updated
+            .log_segment
+            .listed
+            .latest_crc_file
+            .as_ref()
+            .map(|f| f.version),
+        Some(1)
+    );
+
+    Ok(())
+}
+
+// Stronger regression for the `resolve_crc_file` invariant filter: set up a metadata change
+// at the checkpoint version so that a stale inherited CRC would produce wrong
+// Metadata, not just wrong bookkeeping. Without the filter, the incremental update
+// would inherit the below-checkpoint CRC and return Metadata from commit 0; the fresh
+// rebuild would return Metadata from commit 2. `compare_snapshots` catches that on
+// `table_configuration`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_incremental_snapshot_drops_stale_crc_preserves_correct_metadata() -> KernelResult<()>
+{
+    let ctx = setup_incremental_snapshot_test()?;
+    let table_root = ctx.url.as_str();
+
+    // commit 0: initial P&M with empty configuration.
+    commit(
+        table_root,
+        &ctx.store,
+        0,
+        vec![
+            protocol_action(1, 2),
+            metadata_action(json!({})),
+            add_action("f0.parquet"),
+        ],
+    )
+    .await;
+    // commit 1: data-only add.
+    commit(table_root, &ctx.store, 1, vec![add_action("f1.parquet")]).await;
+    // commit 2: metadata change (new configuration property). A stale CRC@v1 would miss
+    // this.
+    commit(
+        table_root,
+        &ctx.store,
+        2,
+        vec![
+            metadata_action(json!({"delta.myKey": "myValue"})),
+            add_action("f2.parquet"),
+        ],
+    )
+    .await;
+    // commit 3: data-only add.
+    commit(table_root, &ctx.store, 3, vec![add_action("f3.parquet")]).await;
+
+    // CRC@v1 captures the BEFORE metadata (no "delta.myKey" property). This is the
+    // stale CRC we expect the filter to reject.
+    ctx.store
+        .put(
+            &delta_path_for_version(1, "crc"),
+            make_test_crc_json(200, 2).to_string().into(),
+        )
+        .await?;
+
+    let snapshot_v3 = Snapshot::builder_for(table_root)
+        .at_version(3)
+        .build(ctx.engine.as_ref())?;
+    // snapshot_v3 was built via log replay, which correctly picks up the v2 metadata
+    // change (pruned replay over commits after CRC@v1 finds the new metaData action).
+    assert_eq!(
+        snapshot_v3
+            .table_properties()
+            .unknown_properties
+            .get("delta.myKey"),
+        Some(&"myValue".to_string())
+    );
+
+    // Write checkpoint@v2, incorporating the new metadata.
+    Snapshot::builder_for(table_root)
+        .at_version(2)
+        .build(ctx.engine.as_ref())?
+        .checkpoint(ctx.engine.as_ref(), None)?;
+
+    // Incremental update. With the filter: CRC@v1 dropped, log replay via checkpoint@v2
+    // returns the correct new metadata. Without the filter: the inherited CRC@v1 returns
+    // its stale (empty) configuration, and compare_snapshots fails on table_configuration.
+    let updated = Snapshot::builder_from(snapshot_v3).build(ctx.engine.as_ref())?;
+    let fresh = Snapshot::builder_for(table_root).build(ctx.engine.as_ref())?;
+    compare_snapshots(&updated, &fresh);
+
+    // Observable contract: the user-visible metadata reflects the v2 change, not the
+    // v0 baseline captured by the stale CRC.
+    assert_eq!(
+        updated
+            .table_properties()
+            .unknown_properties
+            .get("delta.myKey"),
+        Some(&"myValue".to_string())
+    );
+
+    Ok(())
+}
+
+// Setup: commits 0-3 with a metadata change at commit 2; stale CRC@v1 captures the
+// pre-change P&M; snapshot_v3 picks up the v2 metadata via log replay. A new
+// checkpoint@v1 is then written (at or below snapshot_v3, so the update takes the
+// P+M-replay path). The pruned replay on commits > v3 is empty, so without the skip
+// it would fall back to CRC@v1 and regress to the pre-v2 configuration.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_incremental_snapshot_preserves_metadata_when_below_checkpoint_crc_is_stale()
+-> KernelResult<()> {
+    let ctx = setup_incremental_snapshot_test()?;
+    let table_root = ctx.url.as_str();
+
+    // commit 0: initial P&M with empty configuration.
+    commit(
+        table_root,
+        &ctx.store,
+        0,
+        vec![
+            protocol_action(1, 2),
+            metadata_action(json!({})),
+            add_action("f0.parquet"),
+        ],
+    )
+    .await;
+    // commit 1: data-only add.
+    commit(table_root, &ctx.store, 1, vec![add_action("f1.parquet")]).await;
+    // commit 2: metadata change (new configuration property).
+    commit(
+        table_root,
+        &ctx.store,
+        2,
+        vec![
+            metadata_action(json!({"delta.myKey": "myValue"})),
+            add_action("f2.parquet"),
+        ],
+    )
+    .await;
+    // commit 3: data-only add.
+    commit(table_root, &ctx.store, 3, vec![add_action("f3.parquet")]).await;
+
+    // CRC@v1 captures pre-v2 metadata (empty configuration); "stale" relative to the
+    // existing snapshot's v2-derived P&M.
+    ctx.store
+        .put(
+            &delta_path_for_version(1, "crc"),
+            make_test_crc_json(200, 2).to_string().into(),
+        )
+        .await?;
+
+    let snapshot_v3 = Snapshot::builder_for(table_root)
+        .at_version(3)
+        .build(ctx.engine.as_ref())?;
+    // Log replay picks up v2's metadata change despite CRC@v1's stale snapshot.
+    assert_eq!(
+        snapshot_v3
+            .table_properties()
+            .unknown_properties
+            .get("delta.myKey"),
+        Some(&"myValue".to_string())
+    );
+
+    // Write checkpoint@v1 (at or below snapshot_v3, so incremental update takes the
+    // P+M-replay path instead of a full rebuild).
+    Snapshot::builder_for(table_root)
+        .at_version(1)
+        .build(ctx.engine.as_ref())?
+        .checkpoint(ctx.engine.as_ref(), None)?;
+
+    // Incremental update. The pruned replay on commits > 3 is empty. With the stale-
+    // CRC skip, the replay returns (None, None) and `TableConfiguration::try_new_from`
+    // preserves existing P&M. Without the skip, the inherited CRC@v1 would load its stale
+    // metadata and overwrite the existing (correct) v2 configuration.
+    let updated = Snapshot::builder_from(snapshot_v3).build(ctx.engine.as_ref())?;
+    let fresh = Snapshot::builder_for(table_root).build(ctx.engine.as_ref())?;
+    compare_snapshots(&updated, &fresh);
+
+    // Observable contract: v2 metadata preserved.
+    assert_eq!(
+        updated
+            .table_properties()
+            .unknown_properties
+            .get("delta.myKey"),
+        Some(&"myValue".to_string())
+    );
+
+    Ok(())
+}
+
+// Multi-hop: v0 -> v5 (incremental P+M replay) -> v10 (checkpoint-ahead full rebuild).
+// Verifies that a CRC carried through the v5 hop is dropped when the new checkpoint
+// invalidates it, so the rebuilt v10 snapshot has no CRC.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_incremental_snapshot_multi_hop_replay_then_rebuild_drops_stale_crc()
+-> KernelResult<()> {
+    let ctx = setup_incremental_snapshot_test()?;
+    setup_test_table_with_commits(ctx.url.as_str(), &ctx.store, 11).await?;
+
+    // CRC at v5 with matching P&M; it is well above any checkpoint (none exists yet),
+    // so every hop inherits it.
+    ctx.store
+        .put(
+            &delta_path_for_version(5, "crc"),
+            make_test_crc_json(600, 6).to_string().into(),
+        )
+        .await?;
+
+    // Hop 1: snapshot at v0.
+    let snapshot_v0 = Snapshot::builder_for(ctx.url.as_str())
+        .at_version(0)
+        .build(ctx.engine.as_ref())?;
+    assert!(snapshot_v0.crc_at_version().is_none());
+
+    // Hop 2: incremental v0 -> v5 (new commits, no checkpoint -> P+M replay). This picks up
+    // CRC@v5 from the listing, which is at the snapshot version.
+    let snapshot_v5 = Snapshot::builder_from(snapshot_v0)
+        .at_version(5)
+        .build(ctx.engine.as_ref())?;
+    assert_eq!(snapshot_v5.log_segment.checkpoint_version, None);
+    assert_eq!(snapshot_v5.crc_at_version().map(|c| c.version), Some(5));
+
+    // Write checkpoint at v7.
+    Snapshot::builder_for(ctx.url.as_str())
+        .at_version(7)
+        .build(ctx.engine.as_ref())?
+        .checkpoint(ctx.engine.as_ref(), None)?;
+
+    // Hop 3: incremental v5 -> v10 (discovers a new checkpoint@v7 ahead of the
+    // existing snapshot version, triggering full rebuild). CRC@v5 is below the new
+    // checkpoint (5 < 7) so the filter drops it, and the rebuilt snapshot has no CRC.
+    let snapshot_v10 = Snapshot::builder_from(snapshot_v5).build(ctx.engine.as_ref())?;
+    let fresh_v10 = Snapshot::builder_for(ctx.url.as_str()).build(ctx.engine.as_ref())?;
+    compare_snapshots(&snapshot_v10, &fresh_v10);
+    assert_eq!(snapshot_v10.version(), 10);
+    assert_eq!(snapshot_v10.log_segment.checkpoint_version, Some(7));
+    assert!(snapshot_v10.crc_at_version().is_none());
+
+    Ok(())
+}
+
+// test new CRC in new log segment (old log segment has old CRC)
+#[tokio::test]
+async fn test_snapshot_new_from_crc() -> KernelResult<()> {
+    let store = Arc::new(InMemory::new());
+    let table_root = "memory:///";
+    let engine = SyncEngine::new_with_store(store.clone());
+    let protocol = |reader_version, writer_version| {
+        json!({
+            "protocol": {
+                "minReaderVersion": reader_version,
+                "minWriterVersion": writer_version
+            }
+        })
+    };
+    let metadata = json!({
+        "metaData": {
+            "id":"5fba94ed-9794-4965-ba6e-6ee3c0d22af9",
+            "format": {
+                "provider": "parquet",
+                "options": {}
+            },
+            "schemaString": "{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"val\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}]}",
+            "partitionColumns": [],
+            "configuration": {},
+            "createdTime": 1587968585495i64
+        }
+    });
+    let commit0 = vec![
+        json!({
+            "commitInfo": {
+                "timestamp": 1587968586154i64,
+                "operation": "WRITE",
+                "operationParameters": {"mode":"ErrorIfExists","partitionBy":"[]"},
+                "isBlindAppend":true
+            }
+        }),
+        protocol(1, 1),
+        metadata.clone(),
+    ];
+    let commit1 = vec![
+        json!({
+            "commitInfo": {
+                "timestamp": 1587968586154i64,
+                "operation": "WRITE",
+                "operationParameters": {"mode":"ErrorIfExists","partitionBy":"[]"},
+                "isBlindAppend":true
+            }
+        }),
+        protocol(1, 2),
+    ];
+
+    // commit 0 and 1 jsons
+    commit(table_root, &store, 0, commit0.clone()).await;
+    commit(table_root, &store, 1, commit1).await;
+
+    // Test CRC handling during incremental snapshot update (v0 -> v1).
+    // The new log listing starts at v1, so the new log segment doesn't find 0.crc.
+    // a) Only 0.crc exists: resolve_crc_file falls back to old segment's 0.crc.
+    // b) Both 0.crc and 1.crc exist: resolve_crc_file picks up 1.crc.
+    let crc = json!({
+        "table_size_bytes": 100,
+        "num_files": 1,
+        "num_metadata": 1,
+        "num_protocol": 1,
+        "metadata": metadata,
+        "protocol": protocol(1, 1),
+    });
+
+    // put the old crc
+    let path = delta_path_for_version(0, "crc");
+    store.put(&path, crc.to_string().into()).await?;
+
+    // base snapshot is at version 0
+    let base_snapshot = Snapshot::builder_for(table_root)
+        .at_version(0)
+        .build(&engine)?;
+
+    // a) only 0.crc exists -- falls back to old segment's 0.crc
+    let snapshot = Snapshot::builder_from(base_snapshot.clone())
+        .at_version(1)
+        .build(&engine)?;
+    assert_eq!(
+        snapshot
+            .log_segment
+            .listed
+            .latest_crc_file
+            .as_ref()
+            .unwrap()
+            .version,
+        0
+    );
+
+    // b) both 0.crc and 1.crc exist; resolve_crc_file picks up 1.crc
+    let path = delta_path_for_version(1, "crc");
+    let crc = json!({
+        "table_size_bytes": 100,
+        "num_files": 1,
+        "num_metadata": 1,
+        "num_protocol": 1,
+        "metadata": metadata,
+        "protocol": protocol(1, 2),
+    });
+    store.put(&path, crc.to_string().into()).await?;
+    let snapshot = Snapshot::builder_from(base_snapshot.clone())
+        .at_version(1)
+        .build(&engine)?;
+    let expected = Snapshot::builder_for(table_root)
+        .at_version(1)
+        .build(&engine)?;
+    assert_eq!(snapshot, expected);
+    assert_eq!(
+        snapshot
+            .log_segment
+            .listed
+            .latest_crc_file
+            .as_ref()
+            .unwrap()
+            .version,
+        1
+    );
+
+    Ok(())
+}
+
+// ============================================================================
+// Tests: compaction-file handling on the incremental path
+// ============================================================================
+
+// TODO(#2337): remove this test when log compaction is re-enabled.
+#[tokio::test]
+async fn test_compaction_files_ignored_on_read() -> KernelResult<()> {
+    let store = Arc::new(InMemory::new());
+    let table_root = "memory:///";
+    let engine = SyncEngine::new_with_store(store.clone());
+
+    // Create commits 0-2 and write compaction files to storage
+    setup_test_table_with_commits(table_root, &store, 3).await?;
+    write_compaction_file(&store, 0, 1).await?;
+    write_compaction_file(&store, 0, 2).await?;
+
+    // Compaction files exist on disk but should be skipped during listing
+    let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
+    assert!(
+        snapshot
+            .log_segment
+            .listed
+            .ascending_compaction_files
+            .is_empty(),
+        "Compaction files should be ignored when log compaction is disabled"
+    );
+
+    Ok(())
+}
+
+// TODO(#2337): remove this test when log compaction is re-enabled.
+#[tokio::test]
+async fn test_incremental_snapshot_ignores_compaction_files() -> KernelResult<()> {
+    let store = Arc::new(InMemory::new());
+    let table_root = "memory:///";
+    let engine = SyncEngine::new_with_store(store.clone());
+
+    // Create commits 0-2 with compaction files in storage
+    setup_test_table_with_commits(table_root, &store, 3).await?;
+    write_compaction_file(&store, 0, 1).await?;
+    write_compaction_file(&store, 0, 2).await?;
+
+    // Build base snapshot at v2
+    let snapshot_v2 = Snapshot::builder_for(table_root)
+        .at_version(2)
+        .build(&engine)?;
+    assert_eq!(snapshot_v2.version(), 2);
+    assert!(
+        snapshot_v2
+            .log_segment
+            .listed
+            .ascending_compaction_files
+            .is_empty()
+    );
+
+    // Add commit 3
+    commit(
+        table_root,
+        &store,
+        3,
+        vec![json!({"add": {"path": "file4.parquet", "partitionValues": {}, "size": 400, "modificationTime": 4000, "dataChange": true}})],
+    )
+    .await;
+
+    // Build v3 incrementally -- compaction files should still be skipped
+    let snapshot_v3 = Snapshot::builder_from(snapshot_v2)
+        .at_version(3)
+        .build(&engine)?;
+    assert_eq!(snapshot_v3.version(), 3);
+    assert!(
+        snapshot_v3
+            .log_segment
+            .listed
+            .ascending_compaction_files
+            .is_empty()
+    );
+
+    Ok(())
+}
+
+/// Relisting can discover compaction paths already retained by the snapshot. The merged segment
+/// must keep each path once, with compactions ordered by start and end version.
+#[tokio::test]
+#[ignore = "log compaction disabled (#2337)"]
+async fn test_incremental_snapshot_with_compaction_files() -> KernelResult<()> {
+    let store = Arc::new(InMemory::new());
+    let table_root = "memory:///";
+    let engine = SyncEngine::new_with_store(store.clone());
+
+    // Create commits 0-3 and compaction files (1,1) and (1,2)
+    setup_test_table_with_commits(table_root, &store, 3).await?;
+    write_compaction_file(&store, 1, 1).await?;
+    write_compaction_file(&store, 1, 2).await?;
+
+    // Build snapshot at v2 (includes both compaction files)
+    let snapshot_v2 = Snapshot::builder_for(table_root)
+        .at_version(2)
+        .build(&engine)?;
+    assert_eq!(
+        snapshot_v2
+            .log_segment
+            .listed
+            .ascending_compaction_files
+            .len(),
+        2
+    );
+
+    // Add commit 3
+    commit(
+        table_root,
+        &store,
+        3,
+        vec![json!({"add": {"path": "file4.parquet", "partitionValues": {}, "size": 400, "modificationTime": 4000, "dataChange": true}})],
+    )
+    .await;
+
+    // Updating to v3 must retain the existing compactions without duplicating them.
+    let snapshot_v3 = Snapshot::builder_from(snapshot_v2)
+        .at_version(3)
+        .build(&engine)?;
+
+    assert_eq!(snapshot_v3.version(), 3);
+    assert_eq!(
+        snapshot_v3
+            .log_segment
+            .listed
+            .ascending_compaction_files
+            .len(),
+        2
+    );
+
+    Ok(())
+}
+
+/// This test documents a limitation: When deduplicating compactions, the deduplication logic
+/// only checks the start version (lo), not the hi version. So a new compaction file (1,3)
+/// added after building the base snapshot at v2 gets filtered out because its start version
+/// (1) <= existing_snapshot_version (2).
+#[tokio::test]
+#[ignore = "log compaction disabled (#2337)"]
+async fn test_incremental_snapshot_with_new_compaction_files() -> KernelResult<()> {
+    let store = Arc::new(InMemory::new());
+    let table_root = "memory:///";
+    let engine = SyncEngine::new_with_store(store.clone());
+
+    // Create commits 0-3 and compaction files (1,2) and (2,2)
+    setup_test_table_with_commits(table_root, &store, 4).await?;
+    write_compaction_file(&store, 1, 2).await?;
+    write_compaction_file(&store, 2, 2).await?;
+
+    // Build snapshot at v2
+    let snapshot_v2 = Snapshot::builder_for(table_root)
+        .at_version(2)
+        .build(&engine)?;
+    assert_eq!(
+        snapshot_v2
+            .log_segment
+            .listed
+            .ascending_compaction_files
+            .len(),
+        2
+    );
+
+    // Add new compaction file (1,3) after building the base snapshot
+    write_compaction_file(&store, 1, 3).await?;
+
+    // Build v3 incrementally - the new (1,3) file gets filtered out because
+    // the deduplication only looks at start version: 1 <= existing_snapshot_version (2)
+    let snapshot_v3 = Snapshot::builder_from(snapshot_v2)
+        .at_version(3)
+        .build(&engine)?;
+
+    assert_eq!(snapshot_v3.version(), 3);
+    assert_eq!(
+        snapshot_v3
+            .log_segment
+            .listed
+            .ascending_compaction_files
+            .len(),
+        2
+    );
+
+    // Verify we still have the original (1,2) and (2,2) files
+    let versions_and_his: Vec<_> = snapshot_v3
+        .log_segment
+        .listed
+        .ascending_compaction_files
+        .iter()
+        .map(|p| match p.file_type {
+            LogPathFileType::CompactedCommit { hi } => (p.version, hi),
+            _ => panic!("Expected CompactedCommit"),
+        })
+        .collect();
+    assert_eq!(versions_and_his, vec![(1, 2), (2, 2)]);
+
+    Ok(())
+}
+
+// ============================================================================
+// ProtocolMetadataLoad source classification
+// ============================================================================
+
+/// Return a clone of the one event `extract` matches, asserting exactly one matches.
+fn single_event<T: Clone>(
+    events: &[MetricEvent],
+    extract: impl Fn(&MetricEvent) -> Option<&T>,
+) -> T {
+    let mut it = events.iter().filter_map(&extract);
+    let found = it.next().expect("expected an event of this type");
+    assert!(it.next().is_none(), "expected exactly one matching event");
+    found.clone()
+}
+
+fn protocol_metadata_load(events: &[MetricEvent]) -> ProtocolMetadataLoadSuccess {
+    single_event(events, |e| match e {
+        MetricEvent::ProtocolMetadataLoadSuccess(s) => Some(s),
+        _ => None,
+    })
+}
+
+fn log_segment_load(events: &[MetricEvent]) -> LogSegmentLoadSuccess {
+    single_event(events, |e| match e {
+        MetricEvent::LogSegmentLoadSuccess(s) => Some(s),
+        _ => None,
+    })
+}
+
+#[rstest]
+#[case::no_crc(None, IncrementalReplay::Disabled, ProtocolMetadataSource::FullReplay)]
+#[case::crc_at_target(
+    Some(3),
+    IncrementalReplay::Disabled,
+    ProtocolMetadataSource::CrcAtTarget
+)]
+#[case::stale_crc_advanced(
+    Some(1),
+    IncrementalReplay::Unlimited,
+    ProtocolMetadataSource::CrcAdvancedByReplay
+)]
+#[case::stale_crc_seeds_replay(
+    Some(1),
+    IncrementalReplay::Disabled,
+    ProtocolMetadataSource::CrcSeededPmOnlyReplay
+)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_fresh_build_classifies_protocol_metadata_source(
+    #[case] planted_crc_version: Option<u64>,
+    #[case] mode: IncrementalReplay,
+    #[case] expected_source: ProtocolMetadataSource,
+) -> KernelResult<()> {
+    let ctx = setup_incremental_snapshot_test()?;
+    setup_test_table_with_commits(ctx.url.as_str(), &ctx.store, 4).await?;
+    if let Some(v) = planted_crc_version {
+        ctx.store
+            .put(
+                &delta_path_for_version(v, "crc"),
+                make_test_crc_json(200, 2).to_string().into(),
+            )
+            .await?;
+    }
+
+    let reporter = Arc::new(CapturingReporter::default());
+    let _guard = install_thread_local_metrics_reporter(reporter.clone());
+
+    let corr = "req-abc";
+    let _snapshot = Snapshot::builder_for(ctx.url.as_str())
+        .at_version(3)
+        .with_incremental_crc_replay(mode)
+        .with_correlation_id(corr)
+        .build(ctx.engine.as_ref())?;
+
+    let events = reporter.events();
+    let pm = protocol_metadata_load(&events);
+    assert_eq!(pm.source, expected_source);
+    assert_eq!(pm.load_type, LogSegmentLoadType::Full);
+
+    let seg = log_segment_load(&events);
+    assert_eq!(seg.load_type, LogSegmentLoadType::Full);
+    // The v0-v3 table has 4 commits, no checkpoint or compaction.
+    assert_eq!(seg.num_commit_files, 4);
+    assert_eq!(seg.num_checkpoint_files, 0);
+    assert_eq!(seg.num_compaction_files, 0);
+    // No CRC decodes to None; a CRC planted at version v is `3 - v` versions behind the
+    // loaded version 3.
+    assert_eq!(seg.crc_versions_behind, planted_crc_version.map(|v| 3 - v));
+
+    // The operation_id and correlation_id survive the emit->decode round-trip and one
+    // operation_id joins both events.
+    assert_eq!(seg.correlation_id.as_deref(), Some(corr));
+    assert_ne!(seg.operation_id, MetricId::nil());
+    assert_eq!(seg.operation_id, pm.operation_id);
+
+    // The CRC-advance replay cost is folded into the P&M duration on the advanced case.
+    if expected_source == ProtocolMetadataSource::CrcAdvancedByReplay {
+        assert!(pm.duration > std::time::Duration::ZERO);
+    }
+    Ok(())
+}
+
+#[rstest]
+#[case::no_crc(None, IncrementalReplay::Disabled, ProtocolMetadataSource::FullReplay)]
+#[case::crc_at_target(
+    Some(5),
+    IncrementalReplay::Disabled,
+    ProtocolMetadataSource::CrcAtTarget
+)]
+#[case::stale_crc_advanced(
+    Some(1),
+    IncrementalReplay::Unlimited,
+    ProtocolMetadataSource::CrcAdvancedByReplay
+)]
+// A CRC newer than the existing snapshot (v3) but below the target (v5), with advance
+// disabled, seeds a pruned replay rather than being used at target or advanced.
+#[case::stale_crc_seeds_replay(
+    Some(4),
+    IncrementalReplay::Disabled,
+    ProtocolMetadataSource::CrcSeededPmOnlyReplay
+)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_incremental_build_classifies_protocol_metadata_source(
+    #[case] planted_crc_version: Option<u64>,
+    #[case] mode: IncrementalReplay,
+    #[case] expected_source: ProtocolMetadataSource,
+) -> KernelResult<()> {
+    let ctx = setup_incremental_snapshot_test()?;
+    setup_test_table_with_commits(ctx.url.as_str(), &ctx.store, 6).await?;
+    let base = Snapshot::builder_for(ctx.url.as_str())
+        .at_version(3)
+        .build(ctx.engine.as_ref())?;
+    if let Some(v) = planted_crc_version {
+        ctx.store
+            .put(
+                &delta_path_for_version(v, "crc"),
+                make_test_crc_json(200, 2).to_string().into(),
+            )
+            .await?;
+    }
+
+    let reporter = Arc::new(CapturingReporter::default());
+    let _guard = install_thread_local_metrics_reporter(reporter.clone());
+
+    let updated = Snapshot::builder_from(base)
+        .at_version(5)
+        .with_incremental_crc_replay(mode)
+        .build(ctx.engine.as_ref())?;
+    assert_eq!(updated.version(), 5);
+
+    let events = reporter.events();
+    let pm = protocol_metadata_load(&events);
+    assert_eq!(pm.source, expected_source);
+    assert_eq!(pm.load_type, LogSegmentLoadType::Incremental);
+    let seg = log_segment_load(&events);
+    assert_eq!(seg.load_type, LogSegmentLoadType::Incremental);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_incremental_build_no_pm_change_classifies_full_replay() -> KernelResult<()> {
+    let ctx = setup_incremental_snapshot_test()?;
+    setup_test_table_with_commits(ctx.url.as_str(), &ctx.store, 4).await?;
+
+    let base = Snapshot::builder_for(ctx.url.as_str())
+        .at_version(1)
+        .build(ctx.engine.as_ref())?;
+
+    let reporter = Arc::new(CapturingReporter::default());
+    let _guard = install_thread_local_metrics_reporter(reporter.clone());
+
+    let updated = Snapshot::builder_from(base).build(ctx.engine.as_ref())?;
+    assert_eq!(updated.version(), 3);
+
+    // No P&M change in the new commits, no newer CRC: the replay finds nothing above the
+    // existing snapshot, so the source is the not-CRC-rooted `FullReplay`.
+    let pm = protocol_metadata_load(&reporter.events());
+    assert_eq!(pm.source, ProtocolMetadataSource::FullReplay);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_fresh_build_missing_protocol_metadata_emits_failure() -> KernelResult<()> {
+    let ctx = setup_incremental_snapshot_test()?;
+    // A commit with only an add action: no protocol or metadata anywhere in the log.
+    commit(
+        ctx.url.as_str(),
+        &ctx.store,
+        0,
+        vec![add_action("f0.parquet")],
+    )
+    .await;
+
+    let reporter = Arc::new(CapturingReporter::default());
+    let _guard = install_thread_local_metrics_reporter(reporter.clone());
+
+    let result = Snapshot::builder_for(ctx.url.as_str()).build(ctx.engine.as_ref());
+    assert!(result.is_err());
+
+    let events = reporter.events();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| matches!(e, MetricEvent::ProtocolMetadataLoadFailure(_)))
+            .count(),
+        1,
+        "expected exactly one ProtocolMetadataLoadFailure"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, MetricEvent::ProtocolMetadataLoadSuccess(_))),
+        "no success event should fire on the failure path"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_incremental_build_replay_error_emits_failure() -> KernelResult<()> {
+    let ctx = setup_incremental_snapshot_test()?;
+    setup_test_table_with_commits(ctx.url.as_str(), &ctx.store, 6).await?;
+    let base = Snapshot::builder_for(ctx.url.as_str())
+        .at_version(3)
+        .build(ctx.engine.as_ref())?;
+
+    // Corrupt a commit above the base so the incremental P&M replay of `(3, 5]` errors.
+    ctx.store
+        .put(&delta_path_for_version(4, "json"), "{ not json".into())
+        .await?;
+
+    let reporter = Arc::new(CapturingReporter::default());
+    let _guard = install_thread_local_metrics_reporter(reporter.clone());
+
+    let result = Snapshot::builder_from(base)
+        .at_version(5)
+        .build(ctx.engine.as_ref());
+    assert!(result.is_err());
+
+    let events = reporter.events();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| matches!(e, MetricEvent::ProtocolMetadataLoadFailure(_)))
+            .count(),
+        1,
+        "expected exactly one ProtocolMetadataLoadFailure"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, MetricEvent::ProtocolMetadataLoadSuccess(_))),
+        "no success event should fire on the failure path"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_incremental_version_regression_emits_log_segment_load_failure() -> KernelResult<()> {
+    let ctx = setup_incremental_snapshot_test()?;
+    setup_test_table_with_commits(ctx.url.as_str(), &ctx.store, 6).await?; // v0..=v5
+    let base = Snapshot::builder_for(ctx.url.as_str())
+        .at_version(5)
+        .build(ctx.engine.as_ref())?;
+
+    // Simulate commits incorrectly deleted from the log: re-listing now tops out below v5, so
+    // the new segment's end version is older than the base and the regression branch fires.
+    ctx.store.delete(&delta_path_for_version(5, "json")).await?;
+    ctx.store.delete(&delta_path_for_version(4, "json")).await?;
+
+    let reporter = Arc::new(CapturingReporter::default());
+    let _guard = install_thread_local_metrics_reporter(reporter.clone());
+
+    let result = Snapshot::builder_from(base).build(ctx.engine.as_ref());
+    assert!(matches!(result, Err(KernelError::InvalidLogSegment(_))));
+
+    let events = reporter.events();
+    let failure = events
+        .iter()
+        .find_map(|e| match e {
+            MetricEvent::LogSegmentLoadFailure(f) => Some(f),
+            _ => None,
+        })
+        .expect("expected a LogSegmentLoadFailure");
+    assert_eq!(failure.load_type, LogSegmentLoadType::Incremental);
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, MetricEvent::LogSegmentLoadSuccess(_))),
+        "no success event should fire on the failure path"
+    );
+    Ok(())
+}
+
+// Requesting a version beyond the log errors and emits a LogSegmentLoadFailure,
+// matching the fresh path (which also fails a request for an unavailable version).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_incremental_unavailable_version_emits_log_segment_load_failure() -> KernelResult<()> {
+    let ctx = setup_incremental_snapshot_test()?;
+    setup_test_table_with_commits(ctx.url.as_str(), &ctx.store, 3).await?; // v0..=v2
+    let base = Snapshot::builder_for(ctx.url.as_str())
+        .at_version(2)
+        .build(ctx.engine.as_ref())?;
+
+    let reporter = Arc::new(CapturingReporter::default());
+    let _guard = install_thread_local_metrics_reporter(reporter.clone());
+
+    // The log ends at v2, so the first missing version is v3.
+    let result = Snapshot::builder_from(base)
+        .at_version(5)
+        .build(ctx.engine.as_ref());
+    assert!(matches!(result, Err(KernelError::MissingVersion(3))));
+
+    let events = reporter.events();
+    let failure = events
+        .iter()
+        .find_map(|e| match e {
+            MetricEvent::LogSegmentLoadFailure(f) => Some(f),
+            _ => None,
+        })
+        .expect("expected a LogSegmentLoadFailure");
+    assert_eq!(failure.load_type, LogSegmentLoadType::Incremental);
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, MetricEvent::LogSegmentLoadSuccess(_))),
+        "no success event should fire on the failure path"
+    );
+    Ok(())
+}
+
+// Rebuilding from a checkpoint still reports the caller's incremental load type in both
+// the log-segment and protocol/metadata metrics.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_incremental_rebuild_reports_incremental_load_type() -> KernelResult<()> {
+    let ctx = setup_incremental_snapshot_test()?;
+    setup_test_table_with_commits(ctx.url.as_str(), &ctx.store, 4).await?;
+
+    let base = Snapshot::builder_for(ctx.url.as_str())
+        .at_version(1)
+        .build(ctx.engine.as_ref())?;
+
+    // A checkpoint ahead of the v1 snapshot selects a full state rebuild.
+    Snapshot::builder_for(ctx.url.as_str())
+        .at_version(3)
+        .build(ctx.engine.as_ref())?
+        .checkpoint(ctx.engine.as_ref(), None)?;
+
+    let reporter = Arc::new(CapturingReporter::default());
+    let _guard = install_thread_local_metrics_reporter(reporter.clone());
+
+    let updated = Snapshot::builder_from(base).build(ctx.engine.as_ref())?;
+    assert_eq!(updated.version(), 3);
+    assert_eq!(updated.log_segment.checkpoint_version, Some(3));
+
+    let events = reporter.events();
+    assert_eq!(
+        log_segment_load(&events).load_type,
+        LogSegmentLoadType::Incremental
+    );
+    assert_eq!(
+        protocol_metadata_load(&events).load_type,
+        LogSegmentLoadType::Incremental
+    );
+    Ok(())
+}

@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 
+use rstest::rstest;
 use test_utils::{METADATA, TestAction, actions_to_string, add_commit, delta_path_for_version};
 use tracing::field::{Field, Visit};
 use tracing::span::{Attributes, Id, Record};
@@ -378,20 +379,30 @@ async fn snapshot_unsupported_reader_feature_emits_constructor_error()
     Ok(())
 }
 
+#[rstest]
+#[case::invalid_partition_column(
+    METADATA.replace(r#""partitionColumns":[]"#, r#""partitionColumns":["missing_column"]"#),
+    "Partition column 'missing_column' not found in schema"
+)]
+#[case::unsupported_reader_feature(
+    METADATA.replace(
+        r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}"#,
+        r#"{"protocol":{"minReaderVersion":3,"minWriterVersion":7,"readerFeatures":["futureFeature"],"writerFeatures":["futureFeature"]}}"#,
+    ),
+    "futureFeature"
+)]
 #[tokio::test]
-async fn incremental_failure_captures_assembled_log_segment()
--> Result<(), Box<dyn std::error::Error>> {
+async fn incremental_failure_captures_assembled_log_segment(
+    #[case] invalid_commit: String,
+    #[case] expected_error: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
     let (engine, store, table_root) = setup_test();
     add_commit(&table_root, store.as_ref(), 0, METADATA.to_owned()).await?;
     let snapshot = SnapshotBuilder::new_for(&table_root)
         .at_version(0)
         .build(engine.as_ref())?;
 
-    let unsupported_table = METADATA.replace(
-        r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}"#,
-        r#"{"protocol":{"minReaderVersion":3,"minWriterVersion":7,"readerFeatures":["futureFeature"],"writerFeatures":["futureFeature"]}}"#,
-    );
-    add_commit(&table_root, store.as_ref(), 1, unsupported_table).await?;
+    add_commit(&table_root, store.as_ref(), 1, invalid_commit).await?;
 
     let (captured, _guard) = install_capture();
     assert!(
@@ -408,10 +419,18 @@ async fn incremental_failure_captures_assembled_log_segment()
     assert_eq!(error_events.len(), 1);
     assert_eq!(error_events[0].0, INCREMENTAL_CONSTRUCTOR_SPAN);
     let fields = &error_events[0].1;
-    assert!(fields["error"].contains("futureFeature"));
+    assert!(fields["error"].contains(expected_error));
     assert!(fields["log_segment"].contains("end_version: 1"));
     assert!(fields["log_segment"].contains("00000000000000000001.json"));
     assert!(!fields.contains_key("log_tail"));
+
+    let recorded_values = captured.recorded_values();
+    let last_version = recorded_values
+        .iter()
+        .rev()
+        .filter(|(span_name, _)| *span_name == INCREMENTAL_CONSTRUCTOR_SPAN)
+        .find_map(|(_, fields)| fields.get("version").map(String::as_str));
+    assert_eq!(last_version, Some("1"));
 
     Ok(())
 }

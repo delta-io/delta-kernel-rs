@@ -275,6 +275,144 @@ async fn assert_lagging_checkpoint_loses_to_gap_commit<E: Engine>(
     assert_eq!(schema.num_fields(), 2);
 }
 
+#[rstest]
+#[case::checkpoint_below_snapshot(1, 2, false)]
+#[case::checkpoint_at_snapshot(2, 2, false)]
+#[case::checkpoint_after_snapshot(3, 2, true)]
+#[case::later_top_level_pm(1, 3, true)]
+#[tokio::test]
+async fn incremental_update_filters_checkpoint_pm_by_state_version(
+    #[case] checkpoint_version: i64,
+    #[case] pm_change_version: i64,
+    #[case] has_new_pm: bool,
+) {
+    assert_incremental_checkpoint_pm(
+        checkpoint_version,
+        pm_change_version,
+        has_new_pm,
+        non_plan_engine,
+    )
+    .await;
+    #[cfg(feature = "declarative-plans")]
+    assert_incremental_checkpoint_pm(checkpoint_version, pm_change_version, has_new_pm, |store| {
+        SyncEngine::new_with_store(store)
+    })
+    .await;
+}
+
+async fn assert_incremental_checkpoint_pm<E: Engine>(
+    checkpoint_version: i64,
+    pm_change_version: i64,
+    has_new_pm: bool,
+    make_engine: impl FnOnce(Arc<InMemory>) -> E,
+) {
+    // Update from v2 to v4. The v4 checkpoint action embeds state at checkpoint_version, while
+    // top-level Protocol and Metadata change at pm_change_version.
+    let original = adaptive_metadata_table_configuration(one_column_schema(), &[]);
+    let new_protocol = adaptive_metadata_table_configuration(
+        one_column_schema(),
+        &[TableFeature::TimestampWithoutTimezone],
+    )
+    .protocol()
+    .clone();
+    let new_metadata = original
+        .metadata()
+        .clone()
+        .with_configuration_entry("test.state", "updated");
+    let checkpoint_at = |version| CheckpointAction {
+        version,
+        content_root: ContentRoot::new(format!("metadata/root-{version}.parquet"), 1, version),
+        protocol: if version >= pm_change_version {
+            new_protocol.clone()
+        } else {
+            original.protocol().clone()
+        },
+        metadata: if version >= pm_change_version {
+            new_metadata.clone()
+        } else {
+            original.metadata().clone()
+        },
+        transactions: vec![],
+        domain_metadata: vec![],
+        txn_sidecars: vec![],
+        domain_metadata_sidecars: vec![],
+    };
+    let expected_checkpoint = checkpoint_at(checkpoint_version);
+    let mut commits = vec![];
+    for version in 0..=4 {
+        let pointer = match version {
+            0 => None,
+            4 => Some((4, checkpoint_version)),
+            _ => Some((1, 0)),
+        };
+        let mut commit_info: serde_json::Value =
+            serde_json::from_str(&commit_info_line(version + 1, pointer)).unwrap();
+        commit_info["commitInfo"]["dataChange"] = false.into();
+        let mut commit = commit_info.to_string();
+        let action = match version {
+            0 => format!(
+                "{}\n{}",
+                serde_json::json!({"protocol": original.protocol()}),
+                serde_json::json!({"metaData": original.metadata()}),
+            ),
+            1 => serde_json::json!({"checkpoint": checkpoint_at(0)}).to_string(),
+            4 => serde_json::json!({"checkpoint": expected_checkpoint}).to_string(),
+            _ if version == pm_change_version => format!(
+                "{}\n{}",
+                serde_json::json!({"protocol": new_protocol}),
+                serde_json::json!({"metaData": new_metadata}),
+            ),
+            _ => String::new(),
+        };
+        commit.push('\n');
+        commit.push_str(&action);
+        commits.push(commit);
+    }
+    let (store, root) = commit_table(&commits).await;
+    let engine = make_engine(store.clone());
+    let base = Snapshot::builder_for(root.clone())
+        .at_version(2)
+        .build(&engine)
+        .unwrap();
+    let segment = latest_log_segment(&root, &engine);
+    let resolution = segment.read_protocol_metadata_after(&engine, 2).unwrap();
+    assert_eq!(
+        resolution.protocol.as_ref(),
+        has_new_pm.then_some(&new_protocol)
+    );
+    assert_eq!(
+        resolution.metadata.as_ref(),
+        has_new_pm.then_some(&new_metadata)
+    );
+    assert_eq!(
+        resolution.captured_checkpoint_action.as_deref(),
+        Some(&expected_checkpoint)
+    );
+
+    let updated = Snapshot::builder_from(base).build(&engine).unwrap();
+    let fresh = Snapshot::builder_for(root).build(&engine).unwrap();
+    assert_eq!(updated.table_configuration(), fresh.table_configuration());
+    assert_eq!(updated.table_configuration().protocol(), &new_protocol);
+    assert_eq!(updated.table_configuration().metadata(), &new_metadata);
+    assert_eq!(
+        updated.last_manifest_commit(&engine).unwrap(),
+        Some(LastManifestCommit::new(4, checkpoint_version).unwrap())
+    );
+
+    // Filtering an older checkpoint's P&M must still retain its action for zero-I/O lookup.
+    store
+        .delete(&delta_path_for_version(4, "json"))
+        .await
+        .unwrap();
+    assert_eq!(
+        updated
+            .latest_checkpoint_action(&engine)
+            .unwrap()
+            .as_deref(),
+        Some(&expected_checkpoint)
+    );
+}
+
 // A fresh (no-CRC) load runs a full replay that captures the checkpoint action onto the snapshot.
 // The commit is deleted before `Snapshot::latest_checkpoint_action` runs, so following the
 // commit's `lastManifestCommit` would fail and only the captured action can answer.

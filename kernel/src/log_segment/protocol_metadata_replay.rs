@@ -39,11 +39,12 @@ use crate::{
 };
 
 impl LogSegment {
-    /// Read the latest Protocol and Metadata from this log segment, using CRC when available.
-    /// The result's `metadata` and `protocol` are `None` if not found.
+    /// Reads the latest Protocol and Metadata, filling unchanged fields from the supplied CRC.
     ///
-    /// The `crc` parameter is the CRC eagerly resolved by the caller; it is used to
-    /// short-circuit or seed the replay.
+    /// A CRC at the segment's end version supplies both values without replay. An older CRC seeds
+    /// replay of later changes. Without a CRC, replays the full segment and returns `None` for any
+    /// field not found. When the baseline is a snapshot instead of a CRC, use
+    /// [`Self::read_protocol_metadata_after`].
     ///
     /// Under `adaptive-metadata-in-dev`, the result's `captured_checkpoint_action` is the latest
     /// AMT checkpoint action when replay captured it, for the caller to store on the
@@ -54,7 +55,6 @@ impl LogSegment {
         engine: &dyn Engine,
         crc: Option<&Arc<Crc>>,
     ) -> KernelResult<PmResolution> {
-        // Case 1: If CRC at target version, use it directly and exit early.
         if let Some(crc) = crc.filter(|c| c.version == self.end_version) {
             info!("P&M from CRC at target version {}", self.end_version);
             return Ok(PmResolution::from_crc(
@@ -63,36 +63,20 @@ impl LogSegment {
             ));
         }
 
-        // We didn't return above, so we need to do log replay to find P&M.
-        //
-        // Case 2: CRC exists at an earlier version => Prune the log segment to only replay
-        //         commits *after* the CRC version.
-        //   (a) If we find new P&M in the pruned replay, return it.
-        //   (b) If we don't find new P&M, fall back to the CRC.
-        //
-        // Case 3: No CRC exists => Full P&M log replay.
-
         if let Some(crc) = crc.filter(|c| c.version < self.end_version) {
-            // Case 2(a): Replay only commits after CRC version
             info!(
                 "Pruning log segment to commits after CRC version {}",
                 crc.version
             );
-            let pruned = self.segment_after_version(crc.version);
-            // Ignore pruned P&M at or below the CRC version: a lagging AMT checkpoint action can
-            // carry it, and the CRC's P&M is at least as new. A captured checkpoint action is still
-            // the latest: any action at or below the CRC is older.
-            let mut resolution = pruned
-                .replay_for_pm(engine)?
-                .newer_than(version_as_i64(crc.version)?)
+            let mut resolution = self
+                .replay_for_pm_after(engine, crc.version)?
                 .into_resolution(ProtocolMetadataSource::CrcSeededPmOnlyReplay);
             if resolution.metadata.is_some() && resolution.protocol.is_some() {
                 info!("Found P&M from pruned log replay");
                 return Ok(resolution);
             }
 
-            // Case 2(b): P&M incomplete or older than the CRC, use the CRC. Any newer P or M found
-            // in the pruned replay takes priority over the (older) CRC values.
+            // Protocol and Metadata change independently; fill only the fields replay did not find.
             info!("P&M fallback to CRC (no P&M changes after CRC version)");
             resolution
                 .metadata
@@ -103,10 +87,42 @@ impl LogSegment {
             return Ok(resolution);
         }
 
-        // Case 3: Full P&M log replay.
         Ok(self
             .replay_for_pm(engine)?
             .into_resolution(ProtocolMetadataSource::FullReplay))
+    }
+
+    /// Reads Protocol and Metadata changes newer than an already resolved table state.
+    ///
+    /// Reads only commits after `version` and excludes embedded checkpoint P&M at or below it.
+    /// A `None` field tells the caller to keep its existing value. Any captured adaptive-metadata
+    /// checkpoint action is retained for later lookup, even if its P&M is excluded.
+    ///
+    /// `version` must be at or above this segment's checkpoint version, so dropping checkpoint
+    /// files leaves every commit needed to extend the caller's state.
+    #[instrument(name = "log_seg.load_p_m", skip_all, fields(enable_call_frame), err)]
+    pub(crate) fn read_protocol_metadata_after(
+        &self,
+        engine: &dyn Engine,
+        version: Version,
+    ) -> KernelResult<PmResolution> {
+        Ok(self
+            .replay_for_pm_after(engine, version)?
+            .into_resolution(ProtocolMetadataSource::FullReplay))
+    }
+
+    /// Filters both commit versions and embedded P&M versions against the caller's baseline.
+    fn replay_for_pm_after(
+        &self,
+        engine: &dyn Engine,
+        version: Version,
+    ) -> KernelResult<PmCandidate> {
+        // A v12 commit can embed checkpoint state at v8. Keeping only commits after v10 still
+        // includes that file, so the resolved P&M versions need a separate check against v10.
+        Ok(self
+            .segment_after_version(version)
+            .replay_for_pm(engine)?
+            .newer_than(version_as_i64(version)?))
     }
 
     /// Replays the log segment for the latest Protocol and Metadata, each with its version.
@@ -276,7 +292,10 @@ pub(crate) enum LastManifestCommitResolution {
     Unresolved,
 }
 
-/// Result of a P&M resolution (see [`LogSegment::read_protocol_metadata_opt`]).
+/// Protocol and Metadata resolved by replay or CRC, ready to construct a snapshot configuration.
+///
+/// An absent field supplies no replacement: incremental callers keep their existing value, while
+/// fresh snapshot creation requires both fields to be present.
 pub(crate) struct PmResolution {
     pub(crate) metadata: Option<Metadata>,
     pub(crate) protocol: Option<Protocol>,
