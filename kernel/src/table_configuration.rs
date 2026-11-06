@@ -351,6 +351,65 @@ impl TableConfiguration {
         Self::try_new_inner(metadata, protocol, table_root, version, logical_schema)
     }
 
+    /// Materializes configuration from state validated by a source snapshot.
+    ///
+    /// The schema still has to be parsed because the caller supplies portable metadata rather
+    /// than a native [`SchemaRef`]. Source-proven protocol and schema-feature checks are skipped.
+    /// Physical-schema construction still validates column-mapping annotations.
+    #[cfg(all(feature = "declarative-plans", feature = "internal-api"))]
+    pub(crate) fn try_new_for_scan_from_validated_state(
+        metadata: Metadata,
+        protocol: Protocol,
+        table_root: Url,
+        version: Version,
+    ) -> KernelResult<Self> {
+        let logical_schema = Arc::new(metadata.parse_schema()?);
+        let table_properties = metadata.parse_table_properties();
+        let column_mapping_mode = column_mapping_mode(&protocol, &table_properties);
+
+        let physical_schema = Arc::new(logical_schema.make_physical(column_mapping_mode)?);
+        let partition_columns: HashSet<&str> = metadata
+            .partition_columns()
+            .iter()
+            .map(|s| s.as_str())
+            .collect();
+        let physical_data_schema_without_partition_columns = {
+            let fields = logical_schema
+                .fields()
+                .zip(physical_schema.fields())
+                .filter(|(logical_field, _)| {
+                    !partition_columns.contains(logical_field.name().as_str())
+                })
+                .map(|(_, physical_field)| physical_field.clone());
+            // Safety: subset of an already-valid schema.
+            Arc::new(StructType::new_unchecked(fields))
+        };
+        let logical_schema_without_partition_columns = {
+            let fields = logical_schema
+                .fields()
+                .filter(|field| !partition_columns.contains(field.name().as_str()))
+                .cloned();
+            // Safety: subset of an already-valid schema.
+            Arc::new(StructType::new_unchecked(fields))
+        };
+
+        Ok(Self {
+            metadata,
+            protocol,
+            logical_schema,
+            // Read planning never inspects transaction-only column-default state. The source
+            // snapshot already validated the metadata, so do not traverse the schema again.
+            has_column_with_default: false,
+            logical_schema_without_partition_columns,
+            physical_schema,
+            physical_data_schema_without_partition_columns,
+            table_properties,
+            column_mapping_mode,
+            table_root,
+            version,
+        })
+    }
+
     /// Like [`try_new`](Self::try_new), but reuses `base`'s protocol, table root, and version
     /// and takes a pre-parsed `logical_schema`.
     pub(crate) fn try_new_with_schema(

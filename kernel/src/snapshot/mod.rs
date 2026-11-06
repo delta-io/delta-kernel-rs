@@ -63,6 +63,8 @@ mod hint;
 mod incremental;
 mod reader;
 mod snapshot_crc;
+#[cfg(feature = "internal-api")]
+mod state;
 #[cfg(test)]
 mod tracing_tests;
 #[doc(hidden)]
@@ -73,6 +75,10 @@ pub use builder::{IncrementalReplay, IncrementalSnapshotBuilder, SnapshotBuilder
 pub(crate) use hint::{PublicationWatermark, SnapshotHint, SnapshotHintFreshness};
 pub use reader::SnapshotReader;
 use snapshot_crc::SnapshotCrc;
+#[cfg(all(feature = "declarative-plans", feature = "internal-api"))]
+pub(crate) use state::log_segment_from_state;
+#[cfg(feature = "internal-api")]
+pub use state::{SnapshotLogPathIterator, SnapshotLogState, SnapshotScanState, SnapshotState};
 
 pub use crate::error::SnapshotHintError;
 pub use crate::log_segment::LogSegmentStats;

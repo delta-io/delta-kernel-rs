@@ -1135,6 +1135,8 @@ where
     deserializer.deserialize_map(PartitionValuesVisitor)
 }
 
+// The containing type is exposed only with internal-api.
+#[allow(unreachable_pub)]
 impl Add {
     /// Returns the URI-encoded data-file path.
     #[internal_api]
@@ -1363,6 +1365,8 @@ pub(crate) struct SetTransaction {
     pub(crate) last_updated: Option<i64>,
 }
 
+// The containing type is exposed only with internal-api.
+#[allow(unreachable_pub)]
 impl SetTransaction {
     /// Returns the application identifier.
     #[internal_api]
