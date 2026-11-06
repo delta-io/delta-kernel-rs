@@ -541,10 +541,9 @@ impl TableChanges {
         )?;
         // Any listing error surfaces here rather than mid-iteration.
         let actions = scan_metadata_to_scan_file(scan_metadata)
-            .map(|scan_file| TableChangesFileAction::try_from_scan_file(scan_file?))
-            .collect::<KernelResult<Vec<_>>>()?;
+            .map(|scan_file| TableChangesFileAction::try_from_scan_file(scan_file?));
         let actions = match mode {
-            TableChangesListingMode::AllChanges => actions,
+            TableChangesListingMode::AllChanges => actions.collect::<KernelResult<Vec<_>>>()?,
             TableChangesListingMode::NetChanges => net_changes::collapse_net_changes(actions)?,
         };
         Ok(actions.into_iter().map(Ok))
