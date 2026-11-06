@@ -1193,7 +1193,7 @@ impl<STATE, MODE: ExecutionMode> Transaction<STATE, MODE> {
             == CommitType::PathBasedWrite
         {
             // A ratified downgrade can be readable before publication. Its path-based successor
-            // must observe publication first; use the snapshot's evidence without additional I/O.
+            // must observe publication first. Use the snapshot's evidence without additional I/O.
             if let Some(commit) = self
                 .read_snapshot()?
                 .log_segment()

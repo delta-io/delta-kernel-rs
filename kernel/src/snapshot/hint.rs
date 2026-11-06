@@ -50,7 +50,7 @@ pub(crate) enum PublicationWatermark {
     /// Preserve the highest observed published version independently of the supplied paths.
     ///
     /// Retained paths may omit published commits or still name their staged locations.
-    /// Kernel trusts this evidence when allowing filesystem writes; supply only publication
+    /// Kernel trusts this evidence when allowing filesystem writes. Supply only publication
     /// actually observed, never a version inferred from ratification or snapshot freshness.
     PublishedThrough(Version),
 }
@@ -62,7 +62,7 @@ pub(crate) enum PublicationWatermark {
 /// provenance, and records the connector-provided freshness without validating it.
 /// The caller must ensure that retained staged commits were ratified. Their publication state does
 /// not require a new catalog bound. Without an explicit target, catalog-managed snapshot state
-/// still requires a bound; explicit targets must respect any supplied bound.
+/// still requires a bound. Explicit targets must respect any supplied bound.
 #[derive(Debug, Clone)]
 #[internal_api]
 pub(crate) struct SnapshotHint {

@@ -80,7 +80,7 @@ impl<STATE> Transaction<STATE, Imperative> {
     /// Catalog-managed commits can leave publication pending. After a ratified downgrade, the
     /// next path-based commit cannot proceed until the downgrade commit has been published.
     /// Path-based commits return [`KernelError::UnpublishedVersion`] if a retained catalog commit
-    /// is not known published. The connector must publish the downgrade outside this method;
+    /// is not known published. The connector must publish the downgrade outside this method.
     /// [`Snapshot::publish`](crate::Snapshot::publish) does not support pending publication on
     /// non-catalog-managed snapshots.
     /// Then rebuild the read snapshot without an explicit version or catalog bound, using

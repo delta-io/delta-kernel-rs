@@ -174,7 +174,7 @@ unsafe fn snapshot_builder_with_snapshot_hint_impl(
 /// that caller claim. `Unverified` makes it false.
 /// The caller must ensure the protocol and metadata came from the supplied files and all staged
 /// commits were catalog-ratified. Retained staged paths do not themselves require a new catalog
-/// bound; an explicit target must respect any supplied bound. Without an explicit target,
+/// bound. An explicit target must respect any supplied bound. Without an explicit target,
 /// catalog-managed snapshot state still requires a bound.
 ///
 /// # Errors

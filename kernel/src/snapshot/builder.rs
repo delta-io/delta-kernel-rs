@@ -238,7 +238,7 @@ impl<Mode> SnapshotBuilder<Mode> {
     /// systems to provide an up-to-date log tail when used to build a snapshot.
     ///
     /// Staged commits must be ratified by the managing catalog. The caller is responsible for
-    /// obtaining this authoritative tail; discovering a staged file does not establish
+    /// obtaining this authoritative tail. Discovering a staged file does not establish
     /// ratification.
     ///
     /// Note that the log tail must be a contiguous sequence of commits from M..=N where N is the
@@ -259,8 +259,8 @@ impl<Mode> SnapshotBuilder<Mode> {
     ///
     /// When no explicit time-travel version is set via [`at_version`], `max_catalog_version` is
     /// used as the effective target version. An explicit target must not exceed a supplied bound.
-    /// Without a bound, a latest-version request fails if the resolved protocol is catalog-managed;
-    /// an explicit-version request does not infer current management from historical protocol.
+    /// Without a bound, a latest-version request fails if the resolved protocol is catalog-managed.
+    /// An explicit-version request does not infer current management from historical protocol.
     ///
     /// The caller must obtain this bound from the catalog, independently of which commits the
     /// catalog still stores. An empty tail does not remove the need to supply the catalog bound.
@@ -268,7 +268,7 @@ impl<Mode> SnapshotBuilder<Mode> {
     /// time travel can select non-catalog-managed history below it. Publication is not required,
     /// provided unpublished commits are supplied through the log tail or retained in an existing
     /// snapshot or complete hint. Published history can be discovered through the filesystem.
-    /// Kernel trusts the bound; it does not load newer protocol state or independently verify a
+    /// Kernel trusts the bound. It does not load newer protocol state or independently verify a
     /// management-mode transition.
     ///
     /// To discover filesystem commits after a downgrade, refresh without the old catalog bound.
@@ -281,7 +281,7 @@ impl<Mode> SnapshotBuilder<Mode> {
     /// When a nonempty log tail is supplied with `max_catalog_version` and no time-travel version,
     /// its last entry must match `max_catalog_version` exactly. When time-travelling, the last log
     /// tail entry must be >= the requested version. Published history missing from the tail is
-    /// discovered through the filesystem; supplied catalog commits take precedence over duplicates.
+    /// discovered through the filesystem. Supplied catalog commits take precedence over duplicates.
     ///
     /// [`at_version`]: Self::at_version
     pub fn with_max_catalog_version(mut self, max_catalog_version: Version) -> Self {

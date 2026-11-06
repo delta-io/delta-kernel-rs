@@ -130,7 +130,7 @@ Reading the downgrade Snapshot doesn't establish that publication has completed 
 subsequent filesystem write.
 
 Filesystem commits return `KernelError::UnpublishedVersion` when retained catalog commits
-lack observed publication. Your connector must publish the downgrade before retrying;
+lack observed publication. Your connector must publish the downgrade before retrying.
 `Snapshot::publish()` doesn't support pending publication on a non-catalog-managed Snapshot.
 After publication, refresh with `Snapshot::builder_from(snapshot).build(engine)` or
 `Snapshot::builder_for(path).build(engine)`, without an explicit version or catalog bound.
