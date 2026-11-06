@@ -153,10 +153,11 @@ Kernel:
   rules, including what `M` and `N` must equal with and without time travel.
 
 - **`SnapshotBuilder::with_max_catalog_version(Version)`** caps the snapshot
-  version at the catalog's latest ratified version. Kernel requires this to be set
-  for every catalog-managed snapshot, so readers come with an explicit
-  catalog-ratified upper bound rather than silently reading whatever happens to be
-  on the filesystem.
+  version at the catalog's latest ratified version. Kernel requires this for
+  latest requests that resolve to catalog-managed state and for fresh staged
+  tails. Explicit-version reads don't infer the table's current management state
+  from its historical protocol. See [Reading catalog-managed tables](./reading.md)
+  for time-travel and downgrade behavior.
 
 - **`Committer` trait** defines how transactions are committed. A catalog
   committer implements `commit()` to stage and ratify commits through the

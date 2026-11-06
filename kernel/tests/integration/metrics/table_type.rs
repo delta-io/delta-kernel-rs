@@ -132,16 +132,16 @@ async fn test_protocol_metadata_load_failure_carries_table_type(#[case] catalog_
     );
 }
 
-/// Validation fails after the protocol read succeeds, so events carry the requested mode (the
-/// documented best guess), not the protocol truth.
+/// Events carry the requested discovery mode, even when it differs from the resolved protocol.
 #[rstest]
 #[case::catalog_version_on_path_based(false, true, TableType::CatalogManaged)]
 #[case::no_catalog_version_on_catalog_managed(true, false, TableType::PathBased)]
 #[tokio::test(flavor = "multi_thread")]
-async fn test_build_validation_mismatch_events_carry_requested_table_type(
+async fn test_build_events_carry_requested_table_type_across_protocol_mismatch(
     #[case] create_catalog_managed: bool,
     #[case] request_catalog_version: bool,
     #[case] expected: TableType,
+    #[values(false, true)] explicit_version: bool,
 ) -> KernelResult<()> {
     let (_tmp, table_path, engine) = test_table_setup_mt()?;
     let table_url = delta_kernel::try_parse_uri(&table_path)?;
@@ -157,11 +157,23 @@ async fn test_build_validation_mismatch_events_carry_requested_table_type(
     } else {
         builder
     };
-    assert!(builder.build(engine.as_ref()).is_err());
+    let builder = if explicit_version {
+        builder.at_version(0)
+    } else {
+        builder
+    };
+    let result = builder.build(engine.as_ref());
+    let expected_build_event = if create_catalog_managed && !explicit_version {
+        assert!(result.is_err());
+        "SnapshotBuildFailure"
+    } else {
+        assert_eq!(result?.version(), 0);
+        "SnapshotBuildSuccess"
+    };
 
     assert_table_types(
         &reporter.events(),
-        &["ProtocolMetadataLoadSuccess", "SnapshotBuildFailure"],
+        &["ProtocolMetadataLoadSuccess", expected_build_event],
         expected,
     );
     Ok(())

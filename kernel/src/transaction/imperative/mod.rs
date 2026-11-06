@@ -21,7 +21,7 @@ use crate::actions::{
     LOG_PROTOCOL_SCHEMA, LOG_REMOVE_SCHEMA, LOG_TXN_SCHEMA, Metadata, Protocol, SetTransaction,
     as_log_add_schema,
 };
-use crate::committer::{CommitMetadata, CommitResponse};
+use crate::committer::{CatalogCommit, CommitMetadata, CommitResponse, CommitType};
 use crate::crc::FileStatsDelta;
 use crate::engine_data::FilteredEngineData;
 use crate::error::KernelError;
@@ -33,6 +33,7 @@ use crate::expressions::{
 use crate::log_replay::HasSelectionVector;
 use crate::metrics::CommitFailureReason;
 use crate::metrics::events::TRANSACTION_COMMIT_SPAN;
+use crate::path::LogPathFileType;
 use crate::row_tracking::{RowTrackingDomainMetadata, RowTrackingVisitor};
 use crate::scan::data_skipping::stats_schema::schema_with_all_fields_nullable;
 use crate::scan::log_replay::{
@@ -52,6 +53,8 @@ use crate::{
     KernelResultIterator, RowVisitor, Version, create_row, version_as_i64,
 };
 
+#[cfg(test)]
+mod publication_tests;
 mod update_table;
 mod write_validation;
 
@@ -76,6 +79,13 @@ impl<STATE> Transaction<STATE, Imperative> {
     ///
     /// `ALTER TABLE` returns a validation error if any data-file batches or manifest writes are
     /// staged. Empty or fully unselected data-file batches are also rejected.
+    ///
+    /// Before a path-based write, Kernel synchronously publishes the read snapshot's retained
+    /// staged tail through [`StorageHandler::copy_atomic`](crate::StorageHandler::copy_atomic).
+    /// This allows a filesystem writer to recover an unpublished ratified downgrade. Existing
+    /// published copies are left intact. Publication failures prevent the new commit and follow
+    /// the same error handling as committer failures. Catalog-managed writes do not wait for
+    /// publication.
     #[instrument(
         parent = &self.span,
         name = TRANSACTION_COMMIT_SPAN,
@@ -211,8 +221,52 @@ impl<STATE> Transaction<STATE, Imperative> {
         commit_metadata: CommitMetadata,
     ) -> (KernelResult<CommitResponse>, Duration) {
         let committer_start = Instant::now();
-        let commit_response = self.committer.commit(engine, actions, commit_metadata);
+        let commit_response = self
+            .publish_before_path_based_write(engine)
+            .and_then(|()| self.committer.commit(engine, actions, commit_metadata));
         (commit_response, committer_start.elapsed())
+    }
+
+    fn publish_before_path_based_write(&self, engine: &dyn Engine) -> KernelResult<()> {
+        if Self::determine_commit_type(self.is_create_table(), &self.effective_table_config)
+            != CommitType::PathBasedWrite
+        {
+            return Ok(());
+        }
+        let segment = self.read_snapshot()?.log_segment();
+        let commits = &segment.listed.ascending_commit_files;
+        // Publication is ordered, so a published successor also covers historical staged paths.
+        let start = commits
+            .iter()
+            .rposition(|commit| commit.file_type != LogPathFileType::StagedCommit)
+            .map_or(0, |index| index + 1);
+        let staged_tail = &commits[start..];
+        let storage = engine.storage_handler();
+        // Find the published prefix before touching older staged files that may be cleaned up.
+        let mut unpublished_start = 0;
+        for (index, path) in staged_tail.iter().enumerate().rev() {
+            let commit = CatalogCommit::try_new(&segment.log_root, path)?;
+            match storage.head(commit.published_location()) {
+                Ok(_) => {
+                    unpublished_start = index + 1;
+                    break;
+                }
+                Err(KernelError::FileNotFound(_)) => (),
+                Err(error) => return Err(error),
+            }
+        }
+        for commit in &staged_tail[unpublished_start..] {
+            let commit = CatalogCommit::try_new(&segment.log_root, commit)?;
+            match storage.copy_atomic(commit.location(), commit.published_location()) {
+                Ok(()) | Err(KernelError::FileAlreadyExists(_)) => (),
+                Err(KernelError::FileNotFound(_)) => {
+                    // Another publisher may have finished before the staged source was removed.
+                    storage.head(commit.published_location())?;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
     }
 
     /// Translates a commit response, retaining the transaction on recoverable failures.

@@ -185,21 +185,6 @@ pub(crate) fn validate_catalog_managed_log_tail(
     let has_staged_commits = log_tail
         .iter()
         .any(|path| path.file_type == LogPathFileType::StagedCommit);
-    validate_catalog_managed_versions(
-        requested_version,
-        max_catalog_version,
-        has_staged_commits,
-        log_tail.last().map(|path| path.version),
-    )
-}
-
-/// Validate catalog version bounds against the staged commits available to the caller.
-pub(crate) fn validate_catalog_managed_versions(
-    requested_version: Option<Version>,
-    max_catalog_version: Option<Version>,
-    has_staged_commits: bool,
-    latest_commit_version: Option<Version>,
-) -> KernelResult<()> {
     require!(
         !has_staged_commits || max_catalog_version.is_some(),
         KernelError::MaxCatalogVersion(
@@ -209,6 +194,19 @@ pub(crate) fn validate_catalog_managed_versions(
         )
     );
 
+    validate_catalog_managed_versions(
+        requested_version,
+        max_catalog_version,
+        log_tail.last().map(|path| path.version),
+    )
+}
+
+/// Validate requested and terminal commit versions against a supplied catalog bound.
+pub(crate) fn validate_catalog_managed_versions(
+    requested_version: Option<Version>,
+    max_catalog_version: Option<Version>,
+    latest_commit_version: Option<Version>,
+) -> KernelResult<()> {
     if let (Some(requested_version), Some(max_catalog_version)) =
         (requested_version, max_catalog_version)
     {

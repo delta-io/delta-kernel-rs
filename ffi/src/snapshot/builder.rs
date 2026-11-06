@@ -125,6 +125,10 @@ pub unsafe extern "C" fn get_snapshot_builder_from(
 /// latest listed version. A hint and explicit target must match or build returns
 /// `InvalidSnapshotHint`.
 ///
+/// An explicit target does not require a catalog bound solely because its historical protocol is
+/// catalog-managed. The caller remains responsible for catalog discovery for the table's current
+/// management state. Fresh staged tails require a bound, and any supplied bound still applies.
+///
 /// # Safety
 ///
 /// Caller must pass a valid builder handle. The input handle is consumed; the returned handle owns
@@ -160,7 +164,10 @@ pub unsafe extern "C" fn snapshot_builder_with_incremental_crc_replay(
     builder.into()
 }
 
-/// Set the log tail on a snapshot builder for catalog-managed tables.
+/// Set the catalog-supplied log tail on a snapshot builder.
+///
+/// Staged commits must be ratified by the managing catalog. The caller is responsible for
+/// obtaining this authoritative tail. Discovering a staged file does not establish ratification.
 ///
 /// # Errors
 ///
@@ -186,8 +193,14 @@ pub unsafe extern "C" fn snapshot_builder_with_log_tail(
     unsafe { result.into_extern_result(&engine_ref) }
 }
 
-/// Set the max catalog version on a snapshot builder for catalog-managed tables. This bounds the
-/// snapshot version to what the catalog has ratified.
+/// Bound the snapshot version to what the catalog has ratified.
+///
+/// Without an explicit target, this selects the catalog version even when the resulting snapshot
+/// is non-catalog-managed, such as a ratified downgrade. Publication is not required, provided
+/// unpublished commits are supplied through the log tail or retained in an existing snapshot or
+/// complete hint. Published history can be discovered through the filesystem.
+/// An empty catalog tail does not remove the need to supply its bound. A latest request resolving
+/// to catalog-managed state without a bound fails with `MaxCatalogVersionError`.
 ///
 /// # Safety
 ///

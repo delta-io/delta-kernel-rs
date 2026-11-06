@@ -41,8 +41,8 @@ impl Snapshot {
     ///
     /// - `T` = effective target version: the time-travel version from
     ///   [`SnapshotBuilder::at_version`] when set, otherwise the `max_catalog_version` from
-    ///   [`SnapshotBuilder::with_max_catalog_version`] for catalog-managed tables, otherwise unset
-    ///   (defaults to latest).
+    ///   [`SnapshotBuilder::with_max_catalog_version`] when supplied, otherwise unset (defaults to
+    ///   latest).
     /// - `S1` = existing snapshot version.
     /// - `S2` = new snapshot version (= end version of the new listing). When `T` is set, the
     ///   listing is upper-bounded by `T`, so `S2 == T`.
