@@ -54,7 +54,7 @@ pub struct TableChangesScan {
 /// # let url = delta_kernel::try_parse_uri(path).unwrap();
 /// # use test_utils::delta_kernel_default_engine::{storage::store_from_url, DefaultEngineBuilder};
 /// # let engine = DefaultEngineBuilder::new(store_from_url(&url).unwrap()).build();
-/// # let table_changes = TableChanges::try_new(url, &engine, 0, Some(1)).unwrap();
+/// # let table_changes = TableChanges::try_new(path, &engine, 0, Some(1)).unwrap();
 /// let schema = table_changes
 ///     .schema()
 ///     .project(&["id", "_commit_version"])
