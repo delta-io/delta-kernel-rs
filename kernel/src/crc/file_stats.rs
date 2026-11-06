@@ -131,6 +131,7 @@ impl FileStatsPolicy {
             | "REPLACE PARTITIONED BY WITH CLUSTER BY" => Self::IgnoreAdds,
             // These tombstones protect deletion vectors from VACUUM without removing data files.
             "Deletion Vector Tombstones" => Self::IgnoreRemoves,
+            // Data writes.
             "WRITE"
             | "STREAMING UPDATE"
             | "DELETE"
@@ -139,12 +140,14 @@ impl FileStatsPolicy {
             | "TRUNCATE"
             | "COPY INTO"
             | "TRANSACTION"
+            // Table creation and replacement.
             | "CREATE TABLE"
             | "CREATE TABLE AS SELECT"
             | "REPLACE TABLE"
             | "REPLACE TABLE AS SELECT"
             | "CREATE OR REPLACE TABLE"
             | "CREATE OR REPLACE TABLE AS SELECT"
+            // Schema and table metadata changes.
             | "ADD COLUMNS"
             | "DROP COLUMNS"
             | "RENAME COLUMN"
@@ -158,6 +161,7 @@ impl FileStatsPolicy {
             | "ADD CONSTRAINT"
             | "DROP CONSTRAINT"
             | "UPGRADE PROTOCOL"
+            // Maintenance operations.
             | "OPTIMIZE"
             | "OPTIMIZE CHECKPOINT"
             | "RECOMPRESSION"
