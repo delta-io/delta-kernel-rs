@@ -1263,14 +1263,20 @@ impl ScanLogReplayProcessor {
 ///
 /// Note: The iterator of [`ActionsBatch`]s ('action_iter' parameter) must be sorted by the order of
 /// the actions in the log from most recent to least recent.
-pub(crate) fn scan_action_iter(
+pub(crate) fn scan_action_iter<I>(
     engine: &dyn Engine,
-    action_iter: impl KernelResultIterator<ActionsBatch>,
+    action_iter: I,
     state_info: Arc<StateInfo>,
     checkpoint_info: CheckpointReadInfo,
     stats_options: ScanStatsOptions,
     partition_values_options: ScanPartitionValuesOptions,
-) -> KernelResult<(impl KernelResultIterator<ScanMetadata>, Arc<ScanMetrics>)> {
+) -> KernelResult<(
+    impl KernelResultIterator<ScanMetadata> + use<I>,
+    Arc<ScanMetrics>,
+)>
+where
+    I: KernelResultIterator<ActionsBatch>,
+{
     let mut processor = ScanLogReplayProcessor::new(
         engine,
         state_info,
@@ -2458,6 +2464,13 @@ mod tests {
             }
             Expression::Binary(b) => count_to_json(&b.left) + count_to_json(&b.right),
             Expression::Variadic(v) => v.exprs.iter().map(|e| count_to_json(e)).sum(),
+            Expression::CaseWhen(c) => {
+                c.branches
+                    .iter()
+                    .map(|(_, result)| count_to_json(result))
+                    .sum::<usize>()
+                    + count_to_json(&c.else_expr)
+            }
             Expression::Struct(fields, nullability) => {
                 fields.iter().map(|e| count_to_json(e)).sum::<usize>()
                     + nullability.as_ref().map_or(0, |e| count_to_json(e))

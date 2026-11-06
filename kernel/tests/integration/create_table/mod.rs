@@ -5,6 +5,7 @@ mod column_mapping;
 mod ctas;
 mod file;
 mod iceberg_compat;
+mod iceberg_native_v4;
 mod ict;
 mod interval;
 mod partitioned;
@@ -22,7 +23,7 @@ use delta_kernel::snapshot::Snapshot;
 use delta_kernel::table_features::{
     TABLE_FEATURES_MIN_READER_VERSION, TABLE_FEATURES_MIN_WRITER_VERSION, TableFeature,
 };
-use delta_kernel::table_properties::TableProperties;
+use delta_kernel::table_properties::{ParquetCompressionCodec, TableProperties};
 use delta_kernel::transaction::create_table::{CreateTableTransaction, create_table};
 use delta_kernel::transaction::data_layout::DataLayout;
 use delta_kernel::{KernelError, KernelResult};
@@ -477,7 +478,7 @@ async fn test_create_table_rejects_delta_invariants_metadata() -> KernelResult<(
 
     let mut field = StructField::nullable("x", DataType::INTEGER);
     field.metadata.insert(
-        ColumnMetadataKey::Invariants.as_ref().to_string(),
+        ColumnMetadataKey::Invariants.as_ref().into(),
         MetadataValue::String(r#"{"expression": {"expression": "x > 0"}}"#.to_string()),
     );
     let schema = schema_ref! { (field) };
@@ -676,6 +677,7 @@ async fn test_create_table_txn_debug() -> KernelResult<()> {
 #[case("changeDataFeed", TableFeature::ChangeDataFeed, false, false, false)]
 #[case("rowTracking", TableFeature::RowTracking, false, false, true)]
 #[case("domainMetadata", TableFeature::DomainMetadata, false, true, true)]
+#[case("collations", TableFeature::Collations, false, true, true)]
 // WriterOnly features (AlwaysIfSupported)
 #[case(
     "materializePartitionColumns",
@@ -731,6 +733,32 @@ fn test_create_table_with_feature_signal(
         );
     }
 
+    Ok(())
+}
+
+#[rstest]
+fn create_table_rejects_preview_feature_signals(
+    #[values(
+        "collations-preview",
+        "typeWidening-preview",
+        "variantType-preview",
+        "variantShredding-preview",
+        "catalogOwned-preview",
+        "adaptiveMetadata-preview"
+    )]
+    feature_name: &str,
+) -> KernelResult<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+    let key = format!("delta.feature.{feature_name}");
+    let result = create_table(&table_path, simple_schema()?, "Test/1.0", false)
+        .with_table_properties([(key.as_str(), "supported")])
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()));
+    assert_result_error_with_message(
+        result,
+        &format!(
+            "Enabling feature '{feature_name}' via '{key}' is not supported during CREATE TABLE"
+        ),
+    );
     Ok(())
 }
 
@@ -865,6 +893,67 @@ fn test_create_table_with_checkpoint_stats_properties(
         Some(write_stats_as_struct)
     );
 
+    Ok(())
+}
+
+#[rstest]
+#[case::zstd("zstd", ParquetCompressionCodec::Zstd)]
+#[case::uncompressed("uncompressed", ParquetCompressionCodec::Uncompressed)]
+#[case::none_alias("none", ParquetCompressionCodec::Uncompressed)]
+#[case::snappy("snappy", ParquetCompressionCodec::Snappy)]
+#[case::gzip("gzip", ParquetCompressionCodec::Gzip)]
+#[case::lz4("lz4", ParquetCompressionCodec::Lz4)]
+#[case::lz4_raw("lz4_raw", ParquetCompressionCodec::Lz4Raw)]
+#[case::mixed_case("zStD", ParquetCompressionCodec::Zstd)]
+#[case::uppercase("ZSTD", ParquetCompressionCodec::Zstd)]
+#[case::uppercase_none_alias("NONE", ParquetCompressionCodec::Uncompressed)]
+fn create_table_compression_codec_round_trips(
+    #[case] codec: &str,
+    #[case] expected: ParquetCompressionCodec,
+) -> KernelResult<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+    let property = "delta.parquet.compression.codec";
+    let value = codec.to_string();
+
+    create_table(&table_path, simple_schema()?, "test", true)
+        .with_table_properties([(property, value.as_str())])
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .commit(engine.as_ref())?
+        .unwrap_committed();
+
+    let snapshot = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
+    assert_eq!(
+        snapshot
+            .table_configuration()
+            .metadata()
+            .configuration()
+            .get(property),
+        Some(&value)
+    );
+    let properties = snapshot.table_properties();
+    assert_eq!(properties.parquet_compression_codec, Some(expected));
+    assert_eq!(properties.compression_codec_or_default(), expected);
+    assert!(!properties.unknown_properties.contains_key(property));
+
+    Ok(())
+}
+
+#[rstest]
+fn create_table_rejects_invalid_compression_codec(
+    #[values(
+        "brotli", "BROTLI", "lzo", "LZO", "foobar", "FOOBAR", "", " zstd", "zstd "
+    )]
+    codec: &str,
+) -> KernelResult<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+    let result = create_table(&table_path, simple_schema()?, "test", true)
+        .with_table_properties([("delta.parquet.compression.codec", codec)])
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()));
+
+    assert_result_error_with_message(
+        result,
+        &format!("Invalid value '{codec}' for 'delta.parquet.compression.codec'"),
+    );
     Ok(())
 }
 

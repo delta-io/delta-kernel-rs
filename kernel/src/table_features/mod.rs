@@ -1,3 +1,6 @@
+use std::collections::HashSet;
+use std::sync::LazyLock;
+
 pub use column_mapping::ColumnMappingMode;
 #[internal_api]
 pub(crate) use column_mapping::get_any_level_column_physical_name;
@@ -16,6 +19,8 @@ use delta_kernel_derive::internal_api;
 pub(crate) use geospatial::validate_geospatial_feature_support;
 pub(crate) use iceberg_compat::v2::V2_VALIDATOR;
 pub(crate) use iceberg_compat::v3::V3_VALIDATOR;
+#[cfg(feature = "adaptive-metadata-in-dev")]
+pub(crate) use iceberg_compat::v4::V4_VALIDATOR;
 pub(crate) use iceberg_compat::{
     IcebergCompatValidationContext, validate_iceberg_compat_if_needed,
 };
@@ -139,6 +144,15 @@ pub(crate) enum TableFeature {
     MaterializePartitionColumns,
     /// Column Default Values.
     AllowColumnDefaults,
+    /// Collation annotations and statistics for STRING columns.
+    ///
+    /// Kernel string predicates remain binary. See
+    /// [`ScanBuilder::with_predicate`](crate::scan::ScanBuilder::with_predicate).
+    Collations,
+    /// Preview form of [`Self::Collations`], with the same binary-predicate contract.
+    #[strum(serialize = "collations-preview")]
+    #[serde(rename = "collations-preview")]
+    CollationsPreview,
 
     ///////////////////////////
     // ReaderWriter features //
@@ -391,11 +405,13 @@ static CHANGE_DATA_FEED_INFO: FeatureInfo = FeatureInfo {
     }),
 };
 
+// Enabled whenever the writer protocol supports it, even if no column declares a generation
+// expression.
 static GENERATED_COLUMNS_INFO: FeatureInfo = FeatureInfo {
     feature_type: FeatureType::WriterOnly,
     min_legacy_version: Some(MinReaderWriterVersion::new(1, 4)),
     feature_requirements: &[],
-    kernel_support: KernelSupport::NotSupported,
+    kernel_support: KernelSupport::Supported,
     enablement_check: EnablementCheck::AlwaysIfSupported,
 };
 
@@ -553,13 +569,60 @@ static ICEBERG_NATIVE_V4_PREVIEW_INFO: FeatureInfo = FeatureInfo {
         FeatureRequirement::NotEnabled(TableFeature::CheckConstraints),
         FeatureRequirement::NotEnabled(TableFeature::GeneratedColumns),
         FeatureRequirement::NotEnabled(TableFeature::IdentityColumns),
+        FeatureRequirement::Custom(check_iceberg_native_v4_allowed_writer_features),
     ],
     #[cfg(feature = "adaptive-metadata-in-dev")]
     kernel_support: KernelSupport::Supported,
     #[cfg(not(feature = "adaptive-metadata-in-dev"))]
     kernel_support: KernelSupport::NotSupported,
-    enablement_check: EnablementCheck::AlwaysIfSupported,
+    enablement_check: EnablementCheck::EnabledIf(|props| {
+        props.enable_iceberg_native_v4 == Some(true)
+    }),
 };
+
+/// Writer features an `icebergNativeV4-preview` table may list.
+// TODO(#3769): The RFC does not cover fileType, geospatial, and type widening yet. Update their
+// entries once it does.
+const ICEBERG_NATIVE_V4_ALLOWED_WRITER_FEATURES: &[TableFeature] = &[
+    TableFeature::IcebergNativeV4Preview,
+    TableFeature::AdaptiveMetadataPreview,
+    TableFeature::ColumnMapping,
+    TableFeature::DeletionVectors,
+    TableFeature::RowTracking,
+    TableFeature::DomainMetadata,
+    TableFeature::InCommitTimestamp,
+    TableFeature::VacuumProtocolCheck,
+    TableFeature::ClusteredTable,
+    TableFeature::TimestampWithoutTimezone,
+    TableFeature::TypeWidening,
+    TableFeature::TypeWideningPreview,
+    TableFeature::VariantType,
+    TableFeature::VariantTypePreview,
+    TableFeature::VariantShredding,
+    TableFeature::VariantShreddingPreview,
+    TableFeature::GeospatialType,
+    TableFeature::CatalogManaged,
+    TableFeature::CatalogOwnedPreview,
+    TableFeature::CheckpointProtection,
+    // Allowed only while inactive. The `NotEnabled` requirements check this.
+    TableFeature::AppendOnly,
+    TableFeature::ChangeDataFeed,
+    TableFeature::Invariants,
+    TableFeature::CheckConstraints,
+    TableFeature::GeneratedColumns,
+    TableFeature::IdentityColumns,
+    TableFeature::IcebergCompatV1,
+    TableFeature::IcebergCompatV2,
+    TableFeature::IcebergCompatV3,
+];
+
+static ICEBERG_NATIVE_V4_ALLOWED_WRITER_FEATURE_SET: LazyLock<HashSet<TableFeature>> =
+    LazyLock::new(|| {
+        ICEBERG_NATIVE_V4_ALLOWED_WRITER_FEATURES
+            .iter()
+            .cloned()
+            .collect()
+    });
 
 static CLUSTERED_TABLE_INFO: FeatureInfo = FeatureInfo {
     feature_type: FeatureType::WriterOnly,
@@ -581,6 +644,14 @@ static ALLOW_COLUMN_DEFAULTS_INFO: FeatureInfo = FeatureInfo {
     feature_type: FeatureType::WriterOnly,
     min_legacy_version: None,
     feature_requirements: &[],
+    kernel_support: KernelSupport::Supported,
+    enablement_check: EnablementCheck::AlwaysIfSupported,
+};
+
+static COLLATIONS_INFO: FeatureInfo = FeatureInfo {
+    feature_type: FeatureType::WriterOnly,
+    min_legacy_version: None,
+    feature_requirements: &[FeatureRequirement::Supported(TableFeature::DomainMetadata)],
     kernel_support: KernelSupport::Supported,
     enablement_check: EnablementCheck::AlwaysIfSupported,
 };
@@ -832,7 +903,9 @@ impl TableFeature {
             | TableFeature::IcebergNativeV4Preview
             | TableFeature::ClusteredTable
             | TableFeature::MaterializePartitionColumns => FeatureType::WriterOnly,
-            TableFeature::AllowColumnDefaults => FeatureType::WriterOnly,
+            TableFeature::AllowColumnDefaults
+            | TableFeature::Collations
+            | TableFeature::CollationsPreview => FeatureType::WriterOnly,
             TableFeature::Unknown(_) => FeatureType::Unknown,
         }
     }
@@ -871,6 +944,7 @@ impl TableFeature {
             TableFeature::ClusteredTable => &CLUSTERED_TABLE_INFO,
             TableFeature::MaterializePartitionColumns => &MATERIALIZE_PARTITION_COLUMNS_INFO,
             TableFeature::AllowColumnDefaults => &ALLOW_COLUMN_DEFAULTS_INFO,
+            TableFeature::Collations | TableFeature::CollationsPreview => &COLLATIONS_INFO,
 
             // ReaderWriter features
             TableFeature::CatalogManaged => &CATALOG_MANAGED_INFO,
@@ -985,10 +1059,10 @@ pub(crate) fn auto_enable_property_driven_features(
     writer_features: &mut Vec<TableFeature>,
 ) {
     for table_feature in allowed_table_features {
-        if let EnablementCheck::EnabledIf(check) = table_feature.info().enablement_check {
-            if check(table_properties) {
-                add_feature_to_lists(table_feature.clone(), reader_features, writer_features);
-            }
+        if let EnablementCheck::EnabledIf(check) = table_feature.info().enablement_check
+            && check(table_properties)
+        {
+            add_feature_to_lists(table_feature.clone(), reader_features, writer_features);
         }
     }
 }
@@ -1061,6 +1135,22 @@ pub(crate) fn ensure_table_can_be_read(protocol: &Protocol) -> KernelResult<()> 
         }
     }
 
+    Ok(())
+}
+
+fn check_iceberg_native_v4_allowed_writer_features(
+    protocol: &Protocol,
+    _properties: &TableProperties,
+) -> KernelResult<()> {
+    let writer_features = protocol.writer_features().unwrap_or_default();
+    if let Some(feature) = writer_features
+        .iter()
+        .find(|f| !ICEBERG_NATIVE_V4_ALLOWED_WRITER_FEATURE_SET.contains(*f))
+    {
+        return Err(KernelError::invalid_protocol(format!(
+            "Feature 'icebergNativeV4-preview' requires '{feature}' to not be supported"
+        )));
+    }
     Ok(())
 }
 
@@ -1263,6 +1353,8 @@ mod tests {
                 TableFeature::FileTypePreview => "fileType-preview",
                 TableFeature::AdaptiveMetadataPreview => "adaptiveMetadata-preview",
                 TableFeature::AllowColumnDefaults => "allowColumnDefaults",
+                TableFeature::Collations => "collations",
+                TableFeature::CollationsPreview => "collations-preview",
                 TableFeature::GeospatialType => "geospatial",
                 TableFeature::Unknown(_) => continue, // tested in test_unknown_features
             };

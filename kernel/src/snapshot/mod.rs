@@ -16,7 +16,7 @@ use crate::actions::set_transaction::SetTransactionScanner;
 use crate::actions::visitors::SetTransactionMap;
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::actions::{CheckpointAction, LastManifestCommit};
-use crate::actions::{DomainMetadata, INTERNAL_DOMAIN_PREFIX};
+use crate::actions::{DomainMetadata, INTERNAL_DOMAIN_PREFIX, LOG_DOMAIN_METADATA_SCHEMA};
 use crate::checkpoint::{
     CheckpointSpec, CheckpointWriter, DEFAULT_FILE_ACTIONS_PER_SIDECAR_HINT, V2CheckpointConfig,
     ensure_standalone_checkpoint_supported,
@@ -29,9 +29,12 @@ use crate::crc::{
 };
 use crate::expressions::ColumnName;
 use crate::incremental_scan::IncrementalScanBuilder;
+use crate::log_replay::ActionsBatch;
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::log_segment::LastManifestCommitResolution;
-use crate::log_segment::{DomainMetadataMap, LogSegment, PmResolution};
+use crate::log_segment::{
+    DomainMetadataMap, LogSegment, PmResolution, scan_domain_metadata_actions,
+};
 use crate::metrics::events::{DOMAIN_METADATA_LOADED_SPAN, SET_TRANSACTION_LOADED_SPAN};
 use crate::metrics::{
     SnapshotLoadMetricContext, emit_protocol_metadata_load, emit_protocol_metadata_load_failure,
@@ -39,7 +42,7 @@ use crate::metrics::{
 use crate::path::ParsedLogPath;
 use crate::row_tracking::{ROW_TRACKING_DOMAIN_NAME, parse_row_tracking_high_water_mark};
 use crate::scan::ScanBuilder;
-use crate::schema::SchemaRef;
+use crate::schema::{GeneratedColumn, SchemaRef};
 use crate::table_configuration::{InCommitTimestampEnablement, TableConfiguration};
 use crate::table_features::{Operation, TableFeature, physical_to_logical_column_name_and_type};
 #[cfg(feature = "check-constraints-in-dev")]
@@ -47,8 +50,12 @@ use crate::table_properties::CheckConstraint;
 use crate::table_properties::TableProperties;
 use crate::transaction::{UpdateTableOperation, UpdateTableTransactionBuilder};
 use crate::utils::require;
-use crate::{Engine, KernelError, KernelResult, LogCompactionWriter, Version};
+use crate::{
+    Engine, KernelError, KernelResult, KernelResultIterator, LogCompactionWriter, Version,
+};
 
+#[cfg(all(test, feature = "adaptive-metadata-in-dev"))]
+mod adaptive_metadata_tests;
 mod builder;
 #[cfg(test)]
 mod cancellation_tests;
@@ -323,6 +330,9 @@ impl Snapshot {
         &self,
         engine: &dyn Engine,
     ) -> KernelResult<Option<Arc<CheckpointAction>>> {
+        if !self.has_adaptive_metadata() {
+            return Ok(None);
+        }
         if let Some(cached) = self.checkpoint_action.get() {
             return Ok(cached.clone());
         }
@@ -336,6 +346,29 @@ impl Snapshot {
         // A concurrent caller may win the race to fill the cell; both read the same commit.
         let _ = self.checkpoint_action.set(found.clone());
         Ok(found)
+    }
+
+    /// Reads this snapshot's log with `schema`, newest first, for log replay. For a table with an
+    /// AMT `checkpoint` action (see [`Self::latest_checkpoint_action`]), that action stands in for
+    /// the checkpoint and the commits at or below its version.
+    pub(crate) fn read_log_actions(
+        &self,
+        engine: &dyn Engine,
+        schema: SchemaRef,
+    ) -> KernelResult<Box<dyn KernelResultIterator<ActionsBatch>>> {
+        #[cfg(feature = "adaptive-metadata-in-dev")]
+        if let Some(checkpoint) = self.latest_checkpoint_action(engine)? {
+            let result = self.log_segment.read_actions_with_checkpoint_action(
+                engine,
+                &checkpoint,
+                self.table_root(),
+                schema.clone(),
+                schema,
+                None,
+            )?;
+            return Ok(result.actions);
+        }
+        Ok(Box::new(self.log_segment.read_actions(engine, schema)?))
     }
 
     /// Create a new [`Snapshot`] from a freshly-listed [`LogSegment`]. Takes Protocol and Metadata
@@ -618,6 +651,24 @@ impl Snapshot {
         self.crc.base()
     }
 
+    /// The stale CRC a tail-only replay can start from: [`Self::base_crc`], unless an AMT
+    /// `checkpoint` action is newer. That action stands in for the commits at or below its
+    /// version, which may no longer be listed, so replay must read it instead.
+    fn tail_replay_base_crc(&self, engine: &dyn Engine) -> KernelResult<Option<&Arc<Crc>>> {
+        let Some(base) = self.base_crc() else {
+            return Ok(None);
+        };
+        #[cfg(feature = "adaptive-metadata-in-dev")]
+        if let Some(checkpoint) = self.latest_checkpoint_action(engine)?
+            && !Version::try_from(checkpoint.version()).is_ok_and(|v| v <= base.version)
+        {
+            return Ok(None);
+        }
+        #[cfg(not(feature = "adaptive-metadata-in-dev"))]
+        let _ = engine;
+        Ok(Some(base))
+    }
+
     pub fn table_root(&self) -> &Url {
         self.table_configuration.table_root()
     }
@@ -660,8 +711,10 @@ impl Snapshot {
     /// - The log root Url string.
     /// - The raw `schemaString` JSON on table metadata.
     ///
-    /// The Arc-shared variables (e.g. logical/physical schemas, `crc`) are not counted,
-    /// as they can be shared between multiple snapshots and are not owned by a single snapshot.
+    /// The raw `schemaString` JSON is counted for each snapshot even when shared, so summing
+    /// estimates across snapshots may count the same buffer more than once. Other Arc-shared
+    /// variables (e.g. logical/physical schemas, `crc`) are not counted, as they are not owned by
+    /// a single snapshot.
     ///
     /// Other variables' contributions to heap size are relatively small, so they are not counted
     /// here.
@@ -693,6 +746,22 @@ impl Snapshot {
     #[cfg(feature = "check-constraints-in-dev")]
     pub fn check_constraints(&self) -> &[CheckConstraint] {
         &self.table_properties().check_constraints
+    }
+
+    /// The table's [`GeneratedColumn`]s at this snapshot's version, in schema order. Empty when
+    /// the table has none, or when its protocol doesn't support the `generatedColumns` writer
+    /// feature.
+    ///
+    /// A connector writing to the table discovers them from
+    /// [`Transaction::generated_columns`](crate::transaction::Transaction::generated_columns)
+    /// instead.
+    ///
+    /// # Errors
+    ///
+    /// Returns a schema error if a generated column's `delta.generationExpression` metadata is not
+    /// a string.
+    pub fn generated_columns(&self) -> KernelResult<Vec<GeneratedColumn>> {
+        self.table_configuration().generated_columns()
     }
 
     /// Returns the protocol-derived table properties as a map of key-value pairs.
@@ -804,28 +873,28 @@ impl Snapshot {
         // it, skipping the checkpoint. A stale `Partial` CRC (one whose file lacked the
         // `setTransactions` field) has no authoritative transaction set, so it cannot root the
         // scan and falls through to the full replay below.
-        if let Some(base) = self.base_crc() {
-            if let SetTransactionState::Complete(base_active) = &base.set_transaction_state {
-                let txn = SetTransactionScanner::get_one_rooted_in_crc(
-                    self.log_segment(),
-                    application_id,
-                    base_active,
-                    base.version,
-                    engine,
-                )?;
-                let version = txn.and_then(|txn| txn.non_expired_version(expiration_timestamp));
-                // TODO: report a distinct metric source here. A rooted tail scan is neither a
-                //       cache hit nor a full replay, yet `from_cache = false` buckets it with
-                //       full replay, hiding the checkpoint-skipping win. A 3-variant source enum
-                //       (cache / crc-rooted / full-replay) would let metrics measure it.
-                record_metric(false, version.is_some());
-                return Ok(version);
-            }
+        if let Some(base) = self.tail_replay_base_crc(engine)?
+            && let SetTransactionState::Complete(base_active) = &base.set_transaction_state
+        {
+            let txn = SetTransactionScanner::get_one_rooted_in_crc(
+                self.log_segment(),
+                application_id,
+                base_active,
+                base.version,
+                engine,
+            )?;
+            let version = txn.and_then(|txn| txn.non_expired_version(expiration_timestamp));
+            // TODO: report a distinct metric source here. A rooted tail scan is neither a
+            //       cache hit nor a full replay, yet `from_cache = false` buckets it with
+            //       full replay, hiding the checkpoint-skipping win. A 3-variant source enum
+            //       (cache / crc-rooted / full-replay) would let metrics measure it.
+            record_metric(false, version.is_some());
+            return Ok(version);
         }
 
         // Fallback: full log replay. Scan for the newest txn and apply expiration to it, like the
         // CRC paths above.
-        let txn = SetTransactionScanner::get_one(self.log_segment(), application_id, engine)?;
+        let txn = SetTransactionScanner::get_one(self, application_id, engine)?;
         let version = txn.and_then(|txn| txn.non_expired_version(expiration_timestamp));
         record_metric(false, version.is_some());
         Ok(version)
@@ -837,12 +906,12 @@ impl Snapshot {
         &self,
         engine: &dyn Engine,
     ) -> KernelResult<SetTransactionMap> {
-        if let Some(crc) = self.crc_at_version() {
-            if let SetTransactionState::Complete(map) = &crc.set_transaction_state {
-                return Ok(map.clone());
-            }
+        if let Some(crc) = self.crc_at_version()
+            && let SetTransactionState::Complete(map) = &crc.set_transaction_state
+        {
+            return Ok(map.clone());
         }
-        SetTransactionScanner::get_all(self.log_segment(), engine)
+        SetTransactionScanner::get_all(self, engine)
     }
 
     /// Fetch the domainMetadata for a specific domain in this snapshot. This returns the latest
@@ -959,8 +1028,8 @@ impl Snapshot {
 
     /// Load domain metadata: if Complete in the CRC, answer from the cache; else if every
     /// requested domain is in a Partial cache, also answer from the cache; else if a stale Complete
-    /// CRC is held, scan only the commits after it and reconcile against its map; else full log
-    /// replay. `domains == None` means load all.
+    /// CRC no older than an AMT checkpoint action is held, scan only the commits after it and
+    /// reconcile against its map; else full log replay. `domains == None` means load all.
     ///
     /// Reports metrics: `DomainMetadataLoadSuccess` or `DomainMetadataLoadFailure`.
     #[instrument(
@@ -1022,21 +1091,21 @@ impl Snapshot {
         // it, skipping the checkpoint. A stale `Partial` CRC (one whose file lacked the
         // `domainMetadata` field) has no authoritative active-domain set, so it cannot root the
         // scan and falls through to the full replay below.
-        if let Some(base) = self.base_crc() {
-            if let DomainMetadataState::Complete(base_active) = &base.domain_metadata_state {
-                let rooted = self.log_segment().scan_domain_metadatas_rooted_in_crc(
-                    base.version,
-                    base_active,
-                    domains,
-                    engine,
-                )?;
-                // TODO: report a distinct metric source here. A rooted tail scan is neither a
-                //       cache hit nor a full replay, yet `from_cache = false` buckets it with
-                //       full replay, hiding the checkpoint-skipping win. A 3-variant source enum
-                //       (cache / crc-rooted / full-replay) would let metrics measure it.
-                record_metric(false, rooted.len());
-                return Ok(rooted);
-            }
+        if let Some(base) = self.tail_replay_base_crc(engine)?
+            && let DomainMetadataState::Complete(base_active) = &base.domain_metadata_state
+        {
+            let rooted = self.log_segment().scan_domain_metadatas_rooted_in_crc(
+                base.version,
+                base_active,
+                domains,
+                engine,
+            )?;
+            // TODO: report a distinct metric source here. A rooted tail scan is neither a
+            //       cache hit nor a full replay, yet `from_cache = false` buckets it with
+            //       full replay, hiding the checkpoint-skipping win. A 3-variant source enum
+            //       (cache / crc-rooted / full-replay) would let metrics measure it.
+            record_metric(false, rooted.len());
+            return Ok(rooted);
         }
 
         // Fallback: scan the log_segment from scratch.
@@ -1044,7 +1113,10 @@ impl Snapshot {
         //       miss search could skip that range and only scan the older commits, then
         //       union those results with the Partial cache's entries to produce the final
         //       answer.
-        let replayed = self.log_segment().scan_domain_metadatas(domains, engine)?;
+        let replayed = scan_domain_metadata_actions(
+            self.read_log_actions(engine, LOG_DOMAIN_METADATA_SCHEMA.clone())?,
+            domains,
+        )?;
         record_metric(false, replayed.len());
         Ok(replayed)
     }
@@ -1111,14 +1183,13 @@ impl Snapshot {
         if let InCommitTimestampEnablement::Enabled {
             enablement: Some((enablement_version, _)),
         } = enablement
+            && self.version() < enablement_version
         {
-            if self.version() < enablement_version {
-                return Err(KernelError::generic(format!(
-                    "Invalid state: snapshot at version {} has ICT enablement version {} in the future",
-                    self.version(),
-                    enablement_version
-                )));
-            }
+            return Err(KernelError::generic(format!(
+                "Invalid state: snapshot at version {} has ICT enablement version {} in the future",
+                self.version(),
+                enablement_version
+            )));
         }
 
         // Fast path: serve ICT from CRC if available at this version.
@@ -1160,16 +1231,19 @@ impl Snapshot {
         &self,
         engine: &dyn Engine,
     ) -> KernelResult<Option<LastManifestCommit>> {
-        if !self
-            .table_configuration()
-            .is_feature_enabled(&TableFeature::AdaptiveMetadataPreview)
-        {
+        if !self.has_adaptive_metadata() {
             return Ok(None);
         }
         if let Some(resolved) = self.last_manifest_commit.get() {
             return Ok(resolved.clone());
         }
         Ok(self.read_ict_and_last_manifest_commit(engine)?.1)
+    }
+
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    fn has_adaptive_metadata(&self) -> bool {
+        self.table_configuration()
+            .is_feature_enabled(&TableFeature::AdaptiveMetadataPreview)
     }
 
     /// Reads the In-Commit Timestamp and `lastManifestCommit` from this version's commit file,
@@ -1458,6 +1532,10 @@ impl Snapshot {
 
         let end = self.version();
         let log_segment = &self.log_segment;
+
+        // TODO(#2866): the replays below read only commits, so a CRC over an AMT checkpoint action
+        // misses any `txn` or `domainMetadata` entry (inline or in a sidecar) that only the action
+        // carries. The CRC must inline those entries or omit the fields.
 
         // Case 2: a stale base CRC, older than this version. Advance the retained base over the
         // tail commits (a held base is always at or above the checkpoint, so a tail exists).

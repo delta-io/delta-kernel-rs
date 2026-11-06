@@ -25,8 +25,8 @@ use crate::plans::ir::nodes::{
 use crate::plans::ir::plan::{Plan, PlanNode};
 use crate::plans::{IoOperation, Operation};
 use crate::schema::{
-    ArrayType, DataType, DecimalType, MapType, MetadataValue, PrimitiveType, StructField,
-    StructType,
+    ArrayType, DataType, DecimalType, IntervalYearToMonthType, MapType, MetadataValue,
+    PrimitiveType, StructField, StructType,
 };
 #[cfg(feature = "geo-type-in-dev")]
 use crate::schema::{EdgeInterpolationAlgorithm, GeographyType, GeometryType};
@@ -360,6 +360,19 @@ impl From<&Expression> for proto_expr::Expression {
             Expression::MapToStruct(map_to_struct) => {
                 Kind::MapToStruct(Box::new(map_to_struct.into()))
             }
+            Expression::CaseWhen(case_when) => {
+                Kind::CaseWhen(Box::new(proto_expr::CaseWhenExpression {
+                    branches: case_when
+                        .branches
+                        .iter()
+                        .map(|(condition, result)| proto_expr::CaseWhenBranch {
+                            condition: Some(condition.into()),
+                            result: Some(result.into()),
+                        })
+                        .collect(),
+                    else_expr: Some(Box::new(case_when.else_expr.as_ref().into())),
+                }))
+            }
             // No proto cast node yet; serialize as an opaque unknown.
             Expression::Cast(cast) => Kind::Unknown(format!("cast_to_{}", cast.target)),
         };
@@ -592,7 +605,7 @@ impl From<&Scalar> for proto_expr::Scalar {
             Scalar::Boolean(v) => Value::Boolean(*v),
             Scalar::Timestamp(v) => Value::Timestamp(*v),
             Scalar::TimestampNtz(v) => Value::TimestampNtz(*v),
-            Scalar::IntervalYearMonth(v) => Value::IntervalYearMonth(*v),
+            Scalar::IntervalYearMonth(v) => Value::IntervalYearMonth(v.months()),
             Scalar::IntervalDayTime(v) => Value::IntervalDayTime(*v),
             Scalar::Date(v) => Value::Date(*v),
             Scalar::Binary(v) => Value::Binary(v.clone()),
@@ -712,7 +725,8 @@ impl From<&PrimitiveType> for proto_schema::PrimitiveType {
                 PrimitiveTypeKind::Geography(geography.as_ref().into())
             }
             PrimitiveType::Void => PrimitiveTypeKind::Simple(Simple::Void as i32),
-            PrimitiveType::IntervalYearMonth => {
+            PrimitiveType::IntervalYearMonth(_) => {
+                // The proto tag carries no qualifier; decoding reconstructs the full-range type.
                 PrimitiveTypeKind::Simple(Simple::IntervalYearMonth as i32)
             }
             PrimitiveType::IntervalDayTime => {
@@ -796,7 +810,7 @@ impl From<&StructField> for proto_schema::StructField {
         let metadata = field
             .metadata
             .iter()
-            .map(|(key, value)| (key.clone(), value.into()))
+            .map(|(key, value)| (key.to_string(), value.into()))
             .collect();
         proto_schema::StructField {
             name: field.name.clone(),
@@ -843,7 +857,7 @@ impl TryFrom<proto_schema::StructField> for StructField {
         let metadata = proto
             .metadata
             .into_iter()
-            .map(|(key, value)| Ok::<_, KernelError>((key, MetadataValue::try_from(value)?)))
+            .map(|(key, value)| Ok::<_, KernelError>((key.into(), MetadataValue::try_from(value)?)))
             .collect::<KernelResult<std::collections::HashMap<_, _>>>()?;
         Ok(StructField {
             name: proto.name,
@@ -919,7 +933,9 @@ impl TryFrom<proto_schema::PrimitiveType> for PrimitiveType {
                     Simple::Timestamp => PrimitiveType::Timestamp,
                     Simple::TimestampNtz => PrimitiveType::TimestampNtz,
                     Simple::Void => PrimitiveType::Void,
-                    Simple::IntervalYearMonth => PrimitiveType::IntervalYearMonth,
+                    Simple::IntervalYearMonth => PrimitiveType::interval_year_month(
+                        IntervalYearToMonthType::IntervalYearToMonth,
+                    ),
                     Simple::IntervalDayTime => PrimitiveType::IntervalDayTime,
                     Simple::Unspecified => {
                         return Err(KernelError::schema("SimplePrimitiveType is unspecified"));
@@ -1086,8 +1102,8 @@ mod tests {
     };
     use crate::plans::{IoOperation, Operation};
     use crate::schema::{
-        ArrayType, DataType, DecimalType, MapType, MetadataValue, PrimitiveType, SchemaRef,
-        StructField, StructType, ToSchema as _, schema, schema_ref,
+        ArrayType, DataType, DecimalType, IntervalYearToMonthType, MapType, MetadataValue,
+        PrimitiveType, SchemaRef, StructField, StructType, ToSchema as _, schema, schema_ref,
     };
     #[cfg(feature = "geo-type-in-dev")]
     use crate::schema::{EdgeInterpolationAlgorithm, GeographyType, GeometryType};
@@ -1734,6 +1750,7 @@ mod tests {
         "map_to_struct"
     )]
     #[case(Expression::unknown("x"), "unknown")]
+    #[case(Expression::case_when([(Predicate::TRUE, lit(1))], lit(2)), "case_when")]
     fn from_expression(#[case] expr: Expression, #[case] expected: &str) {
         use proto_expr::expression::Kind;
         let kind = match proto_expr::Expression::from(&expr).kind.unwrap() {
@@ -1745,7 +1762,7 @@ mod tests {
             Kind::Unary(_) => "unary",
             Kind::Binary(_) => "binary",
             Kind::Variadic(_) => "variadic",
-            Kind::IfExpr(_) => "if_expr",
+            Kind::CaseWhen(_) => "case_when",
             Kind::Opaque(_) => "opaque",
             Kind::ParseJson(_) => "parse_json",
             Kind::MapToStruct(_) => "map_to_struct",
@@ -2120,11 +2137,19 @@ mod tests {
 
     #[rstest]
     #[case(
-        Scalar::IntervalYearMonth(30),
+        Scalar::interval_year_month(30, IntervalYearToMonthType::IntervalYearToMonth).unwrap(),
         proto_expr::scalar::Value::IntervalYearMonth(30)
     )]
     #[case(
-        Scalar::IntervalYearMonth(i32::MIN),
+        Scalar::interval_year_month(24, IntervalYearToMonthType::IntervalYear).unwrap(),
+        proto_expr::scalar::Value::IntervalYearMonth(24)
+    )]
+    #[case(
+        Scalar::interval_year_month(30, IntervalYearToMonthType::IntervalMonth).unwrap(),
+        proto_expr::scalar::Value::IntervalYearMonth(30)
+    )]
+    #[case(
+        Scalar::interval_year_month(i32::MIN, IntervalYearToMonthType::IntervalYearToMonth).unwrap(),
         proto_expr::scalar::Value::IntervalYearMonth(i32::MIN)
     )]
     #[case(
@@ -2140,6 +2165,20 @@ mod tests {
         #[case] expected: proto_expr::scalar::Value,
     ) {
         assert_eq!(scalar_value_of(scalar), expected);
+    }
+
+    #[rstest]
+    #[case(IntervalYearToMonthType::IntervalYear)]
+    #[case(IntervalYearToMonthType::IntervalMonth)]
+    #[case(IntervalYearToMonthType::IntervalYearToMonth)]
+    fn from_interval_year_month_null_encodes_generic_type(#[case] dtype: IntervalYearToMonthType) {
+        let scalar = Scalar::Null(DataType::interval_year_month(dtype));
+        let proto_expr::scalar::Value::Null(data_type) = scalar_value_of(scalar) else {
+            panic!("expected a null scalar");
+        };
+
+        let decoded = DataType::try_from(data_type).unwrap();
+        assert_eq!(decoded, DataType::INTERVAL_YEAR_MONTH);
     }
 
     #[test]
@@ -2311,7 +2350,15 @@ mod tests {
     )]
     #[case(PrimitiveType::Void, proto_schema::SimplePrimitiveType::Void)]
     #[case(
-        PrimitiveType::IntervalYearMonth,
+        PrimitiveType::interval_year_month(IntervalYearToMonthType::IntervalYearToMonth),
+        proto_schema::SimplePrimitiveType::IntervalYearMonth
+    )]
+    #[case(
+        PrimitiveType::interval_year_month(IntervalYearToMonthType::IntervalYear),
+        proto_schema::SimplePrimitiveType::IntervalYearMonth
+    )]
+    #[case(
+        PrimitiveType::interval_year_month(IntervalYearToMonthType::IntervalMonth),
         proto_schema::SimplePrimitiveType::IntervalYearMonth
     )]
     #[case(
@@ -2448,7 +2495,7 @@ mod tests {
             PrimitiveType::Timestamp,
             PrimitiveType::TimestampNtz,
             PrimitiveType::Void,
-            PrimitiveType::IntervalYearMonth,
+            PrimitiveType::interval_year_month(IntervalYearToMonthType::IntervalYearToMonth),
             PrimitiveType::IntervalDayTime
         )]
         primitive: PrimitiveType,

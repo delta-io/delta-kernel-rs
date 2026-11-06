@@ -18,7 +18,7 @@ Errors:     prefer ? over .unwrap(). Hidden boilerplate returns KernelResult
 Terms:      Snapshot, Scan, Transaction, Engine, connector, predicate
 Dataset:    Alice/30/Seattle, Bob/25/Portland, Carol/35/Denver
 Links:      relative paths, link first occurrence per section only
-Scope:      teach Kernel API usage, not Delta protocol internals
+Scope:      teach connector workflows; link to rustdoc for API details
 ```
 
 ## Build and test commands
@@ -42,11 +42,19 @@ and merge group event. See `.github/workflows/user-guide.yml`.
 
 ## Purpose and scope
 
-This guide teaches developers **how to use Kernel to build a connector**. It is
-NOT a Delta protocol reference. The whole point of Kernel is that connector
-authors do not need to understand protocol internals.
+This guide teaches developers **how to use Kernel to build a connector** through introductions,
+longer examples, and broader workflows. Follow the repository's
+[documentation ownership guidance](../../AGENTS.md#documentation-ownership) when deciding where an
+explanation belongs. Module and type rustdoc also explain how APIs work together, with doctests
+that teach usage and test behavior. Keep enough context to follow each guide page, and link to
+rustdoc for API details.
 
-- Explain Kernel's APIs, types, and patterns. Show how to call them correctly.
+The guide is not a Delta protocol reference. The whole point of Kernel is that connector authors
+do not need to understand protocol internals.
+
+- Explain how Kernel's APIs fit together in a connector workflow. Show how to call them correctly.
+- Keep examples that teach a decision or complete a workflow. Link to rustdoc for public
+  declarations and API contracts.
 - Mention protocol concepts (log replay, data skipping, deletion vectors) only
   to the degree needed to understand why a Kernel API exists or behaves a
   certain way.
@@ -117,25 +125,24 @@ demands a different voice, structure, and opener. MUST NOT mix types in one page
 |------|---------|-------|----------------|-----------|
 | **Tutorial** | Learning by doing | "Let's build..." | "In this tutorial, you will [outcome]." | Quick starts |
 | **How-to** | Accomplish a task | "To do X, do Y" | "To [goal], you [action]." | Building a scan, Appending data, Filter pushdown |
-| **Reference** | Look up exact details | Neutral, structured | "[Type/Trait] [does what]." One-sentence definition. | Engine trait, Schema and types, Implementing engine |
+| **Reference** | Look up configuration or project conventions | Neutral, structured | Name the setting and its effect. | Installation, Feature flags |
 | **Explanation** | Understand why | Discursive, second person OK | "[Concept] is [definition]. This matters because [why]." | Architecture, Catalog overview |
 
 ### How to decide which type a page is
 
 - Is the reader doing something for the first time with hand-holding? -> Tutorial
 - Is the reader trying to accomplish a specific task and already knows the basics? -> How-to
-- Is the reader looking up a specific API, type, trait, or method signature? -> Reference
+- Is the reader looking up a public API, type, trait, or method signature? -> Rustdoc
+- Is the reader looking up configuration or project conventions? -> Reference
 - Is the reader trying to understand WHY something works the way it does,
   or how pieces fit together at a high level? -> Explanation
 - If none of the above fit, default to How-to (task-oriented).
 
-If a page feels like it needs to be two types (e.g., `implementing_engine.md`
-is both "how to implement the Engine trait" and "reference for all handler
-signatures"), split it into two pages or pick the dominant type and link to
-the other. For example, a how-to page can link to a reference page for the
-full trait signatures rather than inlining them all.
+If a page feels like it needs to be two types, split it or pick the dominant type and link to
+the other explanation. For example, a how-to page about implementing the Engine trait should
+link to rustdoc for handler signatures and contracts.
 
-**Page classifications:**
+**Recommended page focus when writing or revising:**
 
 | Page | Type | Rationale |
 |------|------|-----------|
@@ -146,16 +153,16 @@ full trait signatures rather than inlining them all.
 | `scan_metadata.md`, `parallel_scan_metadata.md` | How-to | "To distribute reads, use scan_metadata like this" |
 | `architecture.md` | Explanation | Why Kernel is layered, how the pieces fit together |
 | `engine_trait.md` (concepts) | Explanation | Why the Engine trait exists, what role it plays |
-| `implementing_engine.md` | Reference | Trait signatures, key contracts, default implementations |
-| `engine_data.md` | Reference | EngineData trait, visitor pattern, method contracts |
-| `schema_and_types.md` | Reference | Type system listing, schema construction |
+| `implementing_engine.md` | How-to | How to implement and assemble the handlers |
+| `engine_data.md` | Explanation | Why data is opaque and how the visitor pattern fits |
+| `schema_and_types.md` | Explanation | How Kernel's type system relates to connector data |
 | `catalog_managed/overview.md` | Explanation | Why catalog-managed tables exist, how Kernel fits in |
 | `catalog_managed/committer.md` | How-to | "To implement a catalog committer, do this" |
 | `catalog_managed/reading.md`, `writing.md` | How-to | "To read/write catalog-managed tables, do this" |
 | `connector/overview.md` | Explanation | What a connector is, Kernel vs. connector responsibilities |
 | `configuring_storage.md` | How-to | "To configure S3/GCS/Azure storage, pass these options" |
 | `checkpointing.md` | How-to | "To checkpoint a table, call these APIs" |
-| `ffi/overview.md` | Explanation + Reference | Consider splitting if it grows |
+| `ffi/overview.md` | Explanation | What crosses the FFI boundary and how ownership works |
 
 ### Type-specific guidance
 
@@ -170,10 +177,9 @@ Use explicit forward references: "We're using the default engine here.
 **How-to pages:** Assume competence. Lead with the goal, not the page
 description. Follow the recipe model: specific steps, specific outcome.
 
-**Reference pages:** Mirror the structure of the API, not the user's workflow.
-Neutral voice is acceptable here (third person, impersonal constructions). An
-exhaustive listing is expected. A brief "when you would use this" sentence
-before trait signatures is still required to avoid the "wall of API" problem.
+**Reference pages:** Cover configuration or project conventions readers need to look up, such as
+dependency setup and feature selection. Neutral voice is acceptable here. Link to manifests or
+generated references for exhaustive inventories. Public API reference belongs in rustdoc.
 
 **Explanation pages:** The opener rule relaxes here. "This section explains how
 Kernel supports catalog-managed tables" is acceptable for explanation pages
@@ -191,9 +197,9 @@ Kernel is for building connectors that need protocol-level control.").
 - MUST NOT: use emojis, exclamation marks, or marketing superlatives
   ("blazingly fast", "world-class", "cutting-edge").
 - SHOULD: sound like a knowledgeable colleague, not a textbook.
-- For **reference pages**, neutral/impersonal voice is acceptable where it
-  reads more naturally (e.g., "The handler resolves columns by field ID" rather
-  than forcing "You resolve columns by field ID" when the handler does it).
+- For **reference pages**, neutral/impersonal voice is acceptable where it reads more naturally
+  (e.g., "The `rustls` feature selects the TLS backend" rather than forcing "you" into a
+  configuration description).
 
 ## Sentence-level rules
 
@@ -240,7 +246,7 @@ MUST NOT:
 - `` ```rust,no_run `` : compiles but does not run. Use for examples needing a
   real table, network, or async runtime.
 - `` ```rust,ignore `` : not compiled. Use for fragments shown in context of a
-  larger block above, or for trait/struct definitions from the Kernel API.
+  larger block above. Link to rustdoc for Kernel trait and struct declarations.
 - `` ```rust,compile_fail `` : MUST fail to compile. Use for "break-then-fix"
   teaching where you show a common mistake, display the compiler error, then
   show the corrected version.
@@ -255,6 +261,8 @@ MUST NOT:
   so the reader sees only the relevant code, but `mdbook test` still compiles.
 - MUST: show expected output after every code block that produces output. Use a
   `` ```text `` block. If the output is a table, show the ASCII table.
+- Keep shared dependency setup in [Installation](src/getting_started/installation.md).
+  Link to it from other pages and describe only the extra configuration an example needs.
 - SHOULD: use inline comments to narrate what each step does. Comments explain
   intent ("why"), not syntax ("what").
 - SHOULD: number the steps in comments (`// 1. Parse the table`,
@@ -269,8 +277,8 @@ MUST NOT:
   know about the async runtime to follow the example.
 - For **external crate examples** (e.g., Unity Catalog crates in catalog
   pages), use `rust,ignore` since the reader cannot compile them without the
-  external crate. Note the dependency explicitly in prose. See the root
-  `CLAUDE.md` for the canonical list of crates in this workspace.
+  external crate. Note the dependency explicitly in prose. Use `cargo metadata --no-deps`
+  to find workspace package names.
 - SHOULD: include experimentation prompts where natural. After an example, a
   brief "Try changing `with_predicate(age < 30)` to `age > 30` and observe
   which files are skipped" invites active learning.
@@ -288,7 +296,7 @@ Rows:   ("Alice", 30, "Seattle"), ("Bob", 25, "Portland"), ("Carol", 35, "Denver
 - Partitioned tables: add a partition column (e.g., `city`)
 - Nested types: use a purpose-built schema showing the nesting
 - Schema evolution: use a modified version of the canonical schema
-- Reference pages listing types/traits: no dataset needed
+- Configuration reference pages: no dataset needed
 
 When deviating, always show the schema and a few sample rows.
 
@@ -344,6 +352,7 @@ interest (Google developer style guide). Reserve for genuinely important info:
 
 - Link on first occurrence of a concept per section. Do not link every mention.
 - Use relative paths: `[Building a Scan](../reading/building_a_scan.md)`.
+- Link public types and methods to their rustdoc when the reader needs exact behavior.
 - When deferring a concept, name the destination explicitly: "Deletion vectors
   are covered in [Scan Metadata](./scan_metadata.md)."
 - Use explicit forward references in tutorials: "We're using the default engine
@@ -374,7 +383,11 @@ interest (Google developer style guide). Reserve for genuinely important info:
   maintenance operations belong on the Maintenance Operations pages; protocol
   details belong on the [Delta protocol spec](https://raw.githubusercontent.com/delta-io/delta/master/PROTOCOL.md)
   or the page explicitly about that feature; connector-specific concerns
-  belong on the connector pages.
+  belong on the connector pages; public API contracts belong in rustdoc.
+
+## Update cadence
+
+Follow the [guide maintenance policy](README.md#maintenance).
 
 ## SUMMARY.md structure
 
@@ -411,13 +424,16 @@ interest (Google developer style guide). Reserve for genuinely important info:
 
 ## Anti-patterns
 
-These failures are NOT already covered by the rules above and deserve explicit
-callouts.
+Avoid these common documentation mistakes.
 
-1. **"Wall of API"**: trait signatures or method lists without a motivating
-   example first. Before showing `pub trait ParquetHandler { ... }`, write one
-   sentence explaining when a connector author would implement it and show a
-   minimal use case.
+1. **Copied API reference**: declarations, exhaustive method lists, and duplicated contracts can
+   drift from rustdoc.
+
+   Good: Explain how to assemble custom handlers into an `Engine`, show the relevant implementation
+   example, and link to handler rustdoc for requirements.
+
+   Bad: Paste the public handler declarations and maintain a method-by-method copy of their
+   contracts.
 
 2. **The "obvious to the author" gap**: skipping steps that seem self-evident.
    Bad: "Configure the engine, then run the scan." Good: "Pass an

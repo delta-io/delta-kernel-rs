@@ -76,7 +76,7 @@ impl<'a> SchemaTransform<'a> for AddedFieldMetadataValidator {
     fn transform_struct_field(&mut self, field: &'a StructField) -> KernelResult<()> {
         if let Some(key) = field.metadata.keys().find(|key| {
             key.as_str() == ColumnMetadataKey::GenerationExpression.as_ref()
-                || key.starts_with("delta.identity.")
+                || key.as_str().starts_with("delta.identity.")
         }) {
             return Err(KernelError::schema(format!(
                 "Cannot add column '{}': metadata annotation '{}' is not supported",
@@ -973,7 +973,7 @@ mod tests {
     fn field_with_id_only(name: &str, ty: DataType, id: i64) -> StructField {
         let mut f = StructField::nullable(name, ty);
         f.metadata.insert(
-            ColumnMetadataKey::ColumnMappingId.as_ref().to_string(),
+            ColumnMetadataKey::ColumnMappingId.as_ref().into(),
             MetadataValue::Number(id),
         );
         f
@@ -1009,9 +1009,7 @@ mod tests {
     fn add_column_with_only_physical_name_allocates_id() {
         let mut field = StructField::nullable("named", DataType::STRING);
         field.metadata.insert(
-            ColumnMetadataKey::ColumnMappingPhysicalName
-                .as_ref()
-                .to_string(),
+            ColumnMetadataKey::ColumnMappingPhysicalName.as_ref().into(),
             MetadataValue::String("user-supplied-name".to_string()),
         );
         let ops = vec![SchemaOperation::add_column(None, field)];
@@ -1064,7 +1062,7 @@ mod tests {
     fn add_column_with_wrong_typed_id_is_rejected() {
         let mut field = StructField::nullable("bad", DataType::STRING);
         field.metadata.insert(
-            ColumnMetadataKey::ColumnMappingId.as_ref().to_string(),
+            ColumnMetadataKey::ColumnMappingId.as_ref().into(),
             MetadataValue::String("not-a-number".to_string()),
         );
         let ops = vec![SchemaOperation::add_column(None, field)];

@@ -52,7 +52,7 @@ pub type LogSegmentVisitor = extern "C" fn(context: NullableCvoid, segment: *con
 ///
 /// `snapshot` must be a valid handle for the entire call. The callback must not free or consume
 /// the snapshot, retain borrowed pointers, or unwind across the FFI boundary.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn snapshot_log_segment(
     snapshot: Handle<SharedSnapshot>,
     context: NullableCvoid,

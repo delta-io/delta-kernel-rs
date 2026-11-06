@@ -28,17 +28,17 @@ pub async fn read_golden(path: &Path, _version: Option<&str>) -> KernelResult<Re
     let mut batches = vec![];
     let mut schema = None;
     for meta in files.into_iter() {
-        if let Some(ext) = meta.location.extension() {
-            if ext == "parquet" {
-                let reader = ParquetObjectReader::new(store.clone(), meta.location);
-                let builder = ParquetRecordBatchStreamBuilder::new(reader).await?;
-                if schema.is_none() {
-                    schema = Some(builder.schema().clone());
-                }
-                let mut stream = builder.build()?;
-                while let Some(batch) = stream.next().await {
-                    batches.push(batch?);
-                }
+        if let Some(ext) = meta.location.extension()
+            && ext == "parquet"
+        {
+            let reader = ParquetObjectReader::new(store.clone(), meta.location);
+            let builder = ParquetRecordBatchStreamBuilder::new(reader).await?;
+            if schema.is_none() {
+                schema = Some(builder.schema().clone());
+            }
+            let mut stream = builder.build()?;
+            while let Some(batch) = stream.next().await {
+                batches.push(batch?);
             }
         }
     }

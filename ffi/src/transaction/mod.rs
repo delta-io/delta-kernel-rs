@@ -2,6 +2,7 @@
 mod committed;
 mod create_table;
 mod deletion_vector;
+mod deletion_vector_writer;
 mod partition_value;
 mod transaction_id;
 mod update_table;
@@ -19,6 +20,11 @@ pub use deletion_vector::{
     ExclusiveDvDescriptor, ExclusiveDvDescriptorMap, KernelDvStorageType, dv_descriptor_map_insert,
     dv_descriptor_map_new, dv_descriptor_new, free_dv_descriptor, free_dv_descriptor_map,
     update_table_txn_update_deletion_vectors,
+};
+pub use deletion_vector_writer::{
+    DvFlushFn, DvWriteFn, ExclusiveDeletionVector, ExclusiveDvWriter, FfiDvWriteResult,
+    FfiDvWriterOutput, deletion_vector_add_indexes, dv_writer_finalize, dv_writer_write,
+    free_deletion_vector, free_dv_writer, new_deletion_vector, new_dv_writer,
 };
 use delta_kernel::EngineData;
 use delta_kernel::committer::{Committer, FileSystemCommitter};
@@ -140,7 +146,7 @@ mod tests {
     use delta_kernel_ffi::engine_data::{ArrowFFIData, get_engine_data};
     use delta_kernel_ffi::error::FFIKernelError;
     use delta_kernel_ffi::ffi_test_utils::{
-        allocate_bytes, allocate_err, allocate_str, assert_extern_result_error_contains,
+        TEST_ERROR_ALLOCATORS, allocate_bytes, allocate_str, assert_extern_result_error_contains,
         assert_extern_result_error_with_message, build_snapshot, build_update_table_txn,
         engine_handle_for_store, ok_or_panic, recover_bytes, recover_error, recover_string,
     };
@@ -511,7 +517,7 @@ mod tests {
             )?;
 
             let file_info_engine_data = ok_or_panic(unsafe {
-                get_engine_data(file_info.array, &file_info.schema, allocate_err)
+                get_engine_data(file_info.array, &file_info.schema, &TEST_ERROR_ALLOCATORS)
             });
 
             unsafe { update_table_txn_add_files(txn.shallow_copy(), file_info_engine_data) };
@@ -994,7 +1000,7 @@ mod tests {
                 .try_into_arrow()?;
             let file_info = create_arrow_ffi_from_json(metadata_schema, &metadata_json)?;
             let file_info_engine_data = ok_or_panic(unsafe {
-                get_engine_data(file_info.array, &file_info.schema, allocate_err)
+                get_engine_data(file_info.array, &file_info.schema, &TEST_ERROR_ALLOCATORS)
             });
             unsafe { update_table_txn_add_files(txn.shallow_copy(), file_info_engine_data) };
 
@@ -1538,7 +1544,7 @@ mod tests {
             .try_into_arrow()?;
         let file_info = create_file_metadata("file.parquet", 1, 2, metadata_schema)?;
         let file_info_engine_data = ok_or_panic(unsafe {
-            get_engine_data(file_info.array, &file_info.schema, allocate_err)
+            get_engine_data(file_info.array, &file_info.schema, &TEST_ERROR_ALLOCATORS)
         });
         unsafe { update_table_txn_add_files(txn.shallow_copy(), file_info_engine_data) };
 
@@ -1572,7 +1578,7 @@ mod tests {
             .try_into_arrow()?;
         let file_info = create_file_metadata("file.parquet", 1, 2, metadata_schema)?;
         let file_info_engine_data = ok_or_panic(unsafe {
-            get_engine_data(file_info.array, &file_info.schema, allocate_err)
+            get_engine_data(file_info.array, &file_info.schema, &TEST_ERROR_ALLOCATORS)
         });
         unsafe { update_table_txn_add_files(txn.shallow_copy(), file_info_engine_data) };
 
@@ -1777,7 +1783,7 @@ mod tests {
                     kernel_string_slice!(catalog),
                     kernel_string_slice!(schema),
                     kernel_string_slice!(table_name),
-                    allocate_err,
+                    &TEST_ERROR_ALLOCATORS,
                 ))
             };
 
@@ -1828,7 +1834,7 @@ mod tests {
             .await?;
 
             let file_info_engine_data = ok_or_panic(unsafe {
-                get_engine_data(file_info.array, &file_info.schema, allocate_err)
+                get_engine_data(file_info.array, &file_info.schema, &TEST_ERROR_ALLOCATORS)
             });
 
             unsafe { update_table_txn_add_files(txn.shallow_copy(), file_info_engine_data) };
@@ -1853,7 +1859,7 @@ mod tests {
                     kernel_string_slice!(catalog),
                     kernel_string_slice!(schema),
                     kernel_string_slice!(table_name),
-                    allocate_err,
+                    &TEST_ERROR_ALLOCATORS,
                 ))
             };
             let published_snapshot = ok_or_panic(unsafe {
@@ -1895,7 +1901,7 @@ mod tests {
                     kernel_string_slice!(catalog),
                     kernel_string_slice!(schema),
                     kernel_string_slice!(table_name),
-                    allocate_err,
+                    &TEST_ERROR_ALLOCATORS,
                 ))
             };
             let republished_snapshot = ok_or_panic(unsafe {
@@ -2016,21 +2022,21 @@ mod tests {
                             kernel_string_slice!(name),
                             nullable,
                             std::ptr::null(),
-                            allocate_err,
+                            &TEST_ERROR_ALLOCATORS,
                         ),
                         DataType::STRING => visit_field_string(
                             state,
                             kernel_string_slice!(name),
                             nullable,
                             std::ptr::null(),
-                            allocate_err,
+                            &TEST_ERROR_ALLOCATORS,
                         ),
                         DataType::LONG => visit_field_long(
                             state,
                             kernel_string_slice!(name),
                             nullable,
                             std::ptr::null(),
-                            allocate_err,
+                            &TEST_ERROR_ALLOCATORS,
                         ),
                         _ => panic!("Unsupported test field type: {:?}", field.data_type),
                     })
@@ -2046,7 +2052,7 @@ mod tests {
                 field_ids.len(),
                 false,
                 std::ptr::null(),
-                allocate_err,
+                &TEST_ERROR_ALLOCATORS,
             ))
         }
     }
@@ -2062,7 +2068,7 @@ mod tests {
                 kernel_string_slice!(field),
                 true,
                 std::ptr::null(),
-                allocate_err,
+                &TEST_ERROR_ALLOCATORS,
             ))
         }
     }
@@ -2344,7 +2350,7 @@ mod tests {
                 kernel_string_slice!(crs),
                 true,
                 std::ptr::null(),
-                allocate_err,
+                &TEST_ERROR_ALLOCATORS,
             ))
         };
         let field_ids = [field_id];
@@ -2357,7 +2363,7 @@ mod tests {
                 field_ids.len(),
                 false,
                 std::ptr::null(),
-                allocate_err,
+                &TEST_ERROR_ALLOCATORS,
             ))
         }
     }
@@ -3142,7 +3148,7 @@ mod tests {
             .try_into_arrow()?;
         let file_info = create_file_metadata("file.parquet", 1, 2, metadata_schema)?;
         let metadata = ok_or_panic(unsafe {
-            get_engine_data(file_info.array, &file_info.schema, allocate_err)
+            get_engine_data(file_info.array, &file_info.schema, &TEST_ERROR_ALLOCATORS)
         });
         unsafe { update_table_txn_add_files(txn.shallow_copy(), metadata) };
 
@@ -4563,7 +4569,7 @@ mod tests {
             get_engine_data(
                 file_info.array,
                 &file_info.schema,
-                crate::ffi_test_utils::allocate_err,
+                &crate::ffi_test_utils::TEST_ERROR_ALLOCATORS,
             )
         });
         unsafe { update_table_txn_add_files(txn.shallow_copy(), file_info_engine_data) };

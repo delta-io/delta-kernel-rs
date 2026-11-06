@@ -163,7 +163,7 @@ impl TableChangesScan {
     fn scan_metadata(
         &self,
         engine: Arc<dyn Engine>,
-    ) -> KernelResult<impl KernelResultIterator<TableChangesScanMetadata>> {
+    ) -> KernelResult<impl KernelResultIterator<TableChangesScanMetadata> + use<>> {
         let commits = self
             .table_changes
             .log_segment
@@ -220,7 +220,7 @@ impl TableChangesScan {
     pub fn execute(
         &self,
         engine: Arc<dyn Engine>,
-    ) -> KernelResult<impl KernelResultIterator<Box<dyn EngineData>>> {
+    ) -> KernelResult<impl KernelResultIterator<Box<dyn EngineData>> + use<>> {
         let scan_metadata = self.scan_metadata(engine.clone())?;
         let scan_files = scan_metadata_to_scan_file(scan_metadata);
 
@@ -260,7 +260,7 @@ fn read_scan_file(
     table_root: &Url,
     state_info: &StateInfo,
     _physical_predicate: Option<PredicateRef>,
-) -> KernelResult<impl KernelResultIterator<Box<dyn EngineData>>> {
+) -> KernelResult<impl KernelResultIterator<Box<dyn EngineData>> + use<>> {
     let ResolvedCdfScanFile {
         scan_file,
         mut selection_vector,

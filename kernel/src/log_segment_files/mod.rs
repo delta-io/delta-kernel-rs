@@ -73,7 +73,7 @@ pub(crate) fn list_delta_log_from_storage(
     log_root: &Url,
     start_version: Version,
     end_version: Version,
-) -> KernelResult<impl KernelResultIterator<ParsedLogPath>> {
+) -> KernelResult<impl KernelResultIterator<ParsedLogPath> + use<>> {
     let start_from = log_root.join(&format!("{start_version:020}"))?;
     let log_root_str = log_root.to_string();
     let files = storage
@@ -155,11 +155,10 @@ fn group_checkpoint_parts(
                 // a multi-part checkpoint
                 if let Some(part_files) = checkpoints.get_mut(&CheckpointInstance::MultiPart {
                     num_parts: *num_parts,
-                }) {
-                    if *part_num as usize == 1 + part_files.len() {
-                        // Safe to append because all previous parts exist
-                        part_files.push(part_file);
-                    }
+                }) && *part_num as usize == 1 + part_files.len()
+                {
+                    // Safe to append because all previous parts exist
+                    part_files.push(part_file);
                 }
             }
             Commit | StagedCommit | CompactedCommit { .. } | Crc | Unknown => {}

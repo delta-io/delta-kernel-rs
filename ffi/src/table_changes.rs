@@ -361,7 +361,7 @@ mod tests {
     };
 
     use super::*;
-    use crate::ffi_test_utils::{allocate_err, allocate_str, ok_or_panic, recover_string};
+    use crate::ffi_test_utils::{TEST_ERROR_ALLOCATORS, allocate_str, ok_or_panic, recover_string};
     use crate::{engine_to_handle, free_engine, free_schema, kernel_string_slice};
 
     const PARQUET_FILE1: &str =
@@ -550,7 +550,7 @@ mod tests {
         commit_add_file(table_root, storage.as_ref(), 1, PARQUET_FILE2.to_string()).await?;
 
         let engine = DefaultEngineBuilder::new(storage).build();
-        let engine = engine_to_handle(Arc::new(engine), allocate_err);
+        let engine = engine_to_handle(Arc::new(engine), TEST_ERROR_ALLOCATORS);
 
         let table_changes = ok_or_panic(unsafe {
             table_changes_from_version(kernel_string_slice!(table_root), engine.shallow_copy(), 0)
@@ -638,7 +638,7 @@ mod tests {
         commit_add_file(table_root, storage.as_ref(), 1, PARQUET_FILE2.to_string()).await?;
 
         let engine = DefaultEngineBuilder::new(storage).build();
-        let engine = engine_to_handle(Arc::new(engine), allocate_err);
+        let engine = engine_to_handle(Arc::new(engine), TEST_ERROR_ALLOCATORS);
 
         let table_changes = ok_or_panic(unsafe {
             table_changes_from_version(kernel_string_slice!(table_root), engine.shallow_copy(), 0)
@@ -695,7 +695,7 @@ mod tests {
         commit_add_file(table_root, storage.as_ref(), 1, PARQUET_FILE2.to_string()).await?;
 
         let engine = DefaultEngineBuilder::new(storage).build();
-        let engine = engine_to_handle(Arc::new(engine), allocate_err);
+        let engine = engine_to_handle(Arc::new(engine), TEST_ERROR_ALLOCATORS);
 
         let table_changes = ok_or_panic(unsafe {
             table_changes_from_version(kernel_string_slice!(table_root), engine.shallow_copy(), 0)
@@ -721,7 +721,8 @@ mod tests {
             // Take ownership of the boxed ArrowFFIData; the inner array/schema are moved
             // into get_engine_data which takes ownership of the FFI_ArrowArray.
             let ArrowFFIData { array, schema } = *unsafe { Box::from_raw(data_ptr) };
-            let engine_data = ok_or_panic(unsafe { get_engine_data(array, &schema, allocate_err) });
+            let engine_data =
+                ok_or_panic(unsafe { get_engine_data(array, &schema, &TEST_ERROR_ALLOCATORS) });
             let record_batch = unsafe { engine_data.into_inner().try_into_record_batch() }?;
 
             println!("Batch ({i}) num rows {:?}", record_batch.num_rows());
@@ -778,7 +779,7 @@ mod tests {
         commit_remove_file(table_root, storage.as_ref(), 3, PARQUET_FILE2.to_string()).await?;
 
         let engine = DefaultEngineBuilder::new(storage).build();
-        let engine = engine_to_handle(Arc::new(engine), allocate_err);
+        let engine = engine_to_handle(Arc::new(engine), TEST_ERROR_ALLOCATORS);
 
         let table_changes = ok_or_panic(unsafe {
             table_changes_between_versions(

@@ -15,7 +15,9 @@ use delta_kernel::kernel_predicates::{
     DirectDataSkippingPredicateEvaluator, DirectPredicateEvaluator,
     IndirectDataSkippingPredicateEvaluator,
 };
-use delta_kernel::schema::{ArrayType, DataType, MapType, StructField, StructType};
+use delta_kernel::schema::{
+    ArrayType, DataType, IntervalYearToMonthType, MapType, StructField, StructType,
+};
 
 use crate::expressions::{SharedExpression, SharedPredicate};
 use crate::handle::Handle;
@@ -166,6 +168,18 @@ pub unsafe extern "C" fn get_testing_kernel_expression() -> Handle<SharedExpress
         ),
         Expr::coalesce([col!("col"), lit(0_i32)]),
         Expr::array([lit(1_i32), lit(2_i32)]),
+        Expr::case_when(
+            [
+                (column_pred!("flag"), lit(10_i32)),
+                (column_pred!("other_flag"), lit(20_i32)),
+            ],
+            lit(30_i32),
+        ),
+        Expr::case_when(
+            [(column_pred!("flag"), lit(10_i32))],
+            null_lit(DataType::INTEGER),
+        ),
+        Expr::case_when([], lit(40_i32)),
     ];
     sub_exprs.extend(
         [
@@ -214,6 +228,10 @@ pub unsafe extern "C" fn get_testing_kernel_predicate() -> Handle<SharedPredicat
         Pred::is_not_null(col!("col")),
         Pred::opaque(OpaqueTestOp("bar".to_string()), vec![lit(42), lit(1.111)]),
         Pred::unknown("intrigue"),
+        Pred::from_expr(Expr::case_when(
+            [(column_pred!("flag"), lit(true))],
+            lit(false),
+        )),
     ];
     sub_exprs.extend(
         [
@@ -250,7 +268,9 @@ pub unsafe extern "C" fn get_simple_testing_kernel_expression() -> Handle<Shared
         lit(Scalar::Date(19000)),
         lit(Scalar::Timestamp(1234567890)),
         lit(Scalar::TimestampNtz(9876543210)),
-        lit(Scalar::IntervalYearMonth(-13)),
+        lit(
+            Scalar::interval_year_month(-13, IntervalYearToMonthType::IntervalYearToMonth).unwrap(),
+        ),
         lit(Scalar::IntervalDayTime(9_876_543_210)),
         null_lit(DataType::INTEGER),
         null_lit(DataType::decimal(10, 5).unwrap()),

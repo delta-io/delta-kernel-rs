@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 
 use delta_kernel::scan::state::{DvInfo, ScanFile};
 use delta_kernel::scan::{PartitionValuesOptions, Scan, ScanBuilder, ScanMetadata, StatsOptions};
-use delta_kernel::schema::MetadataValue;
+use delta_kernel::schema::{MetadataKey, MetadataValue};
 use delta_kernel::snapshot::SnapshotRef;
 use delta_kernel::{Expression, ExpressionRef, KernelError, KernelResult, KernelResultIterator};
 use delta_kernel_ffi_macros::handle_descriptor;
@@ -19,7 +19,7 @@ use super::handle::Handle;
 use crate::delta_types::FfiColumnNameArray;
 #[cfg(feature = "default-engine-base")]
 use crate::engine_data::ArrowFFIData;
-use crate::error::AllocateErrorFn;
+use crate::error::ErrorAllocators;
 use crate::expressions::SharedExpression;
 use crate::expressions::kernel_visitor::{KernelExpressionVisitorState, unwrap_kernel_predicate};
 use crate::schema_visitor::{KernelSchemaVisitorState, extract_kernel_schema};
@@ -439,7 +439,7 @@ pub unsafe extern "C" fn free_scan_builder(builder: Handle<ExclusiveScanBuilder>
 /// # Safety
 ///
 /// `scan` must be a valid, live [`SharedScan`] handle for the duration of the call.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn scan_snapshot(scan: Handle<SharedScan>) -> Handle<SharedSnapshot> {
     let scan = unsafe { scan.as_ref() };
     Arc::clone(scan.snapshot()).into()
@@ -781,12 +781,12 @@ impl From<&MetadataValue> for CMetadataValueKind {
 /// retain it.
 #[derive(Default, From)]
 pub struct CMetadataMap {
-    values: HashMap<String, MetadataValue>,
+    values: HashMap<MetadataKey, MetadataValue>,
 }
 
 impl CMetadataMap {
     /// Insert a value without replacing an existing key.
-    pub(crate) fn insert(&mut self, key: String, value: MetadataValue) -> KernelResult<()> {
+    pub(crate) fn insert(&mut self, key: MetadataKey, value: MetadataValue) -> KernelResult<()> {
         match self.values.entry(key) {
             Entry::Vacant(entry) => {
                 entry.insert(value);
@@ -800,7 +800,7 @@ impl CMetadataMap {
     }
 
     /// Consume the map and return its metadata values.
-    pub(crate) fn into_values(self) -> HashMap<String, MetadataValue> {
+    pub(crate) fn into_values(self) -> HashMap<MetadataKey, MetadataValue> {
         self.values
     }
 }
@@ -863,6 +863,7 @@ pub unsafe extern "C" fn visit_metadata_map(
     ),
 ) {
     for (key, val) in &map.values {
+        let key = key.as_str();
         let kind = CMetadataValueKind::from(val);
         let value = val.to_string();
         visitor(
@@ -923,21 +924,25 @@ pub unsafe extern "C" fn get_transform_for_row(
 /// Returns the number of rows removed by `dv_info`, or [`OptionalValue::None`] if there is no
 /// deletion vector. Reads descriptor metadata without loading the deletion vector.
 ///
-/// A negative cardinality returns a deletion-vector error allocated by `allocate_error`.
+/// A negative cardinality returns a deletion-vector error allocated by `error_allocators`.
 /// The caller owns the returned error and must free it.
 ///
 /// # Safety
 ///
+/// `error_allocators` must point to an initialized [`ErrorAllocators`] for this call. Its context
+/// and callbacks must remain valid for every use and support concurrent calls if shared across
+/// threads.
+///
 /// `dv_info` must be a valid pointer to a [`DvInfo`], borrowed for the duration of this call.
 /// When obtained from the `info` field of [`CDvInfo`], it is valid only during the scan callback.
-/// `allocate_error` must be a valid error allocator and copy any message it retains.
+/// `error_allocators` must be a valid error allocator and copy any message it retains.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn cardinality_from_dv(
     dv_info: &DvInfo,
-    allocate_error: AllocateErrorFn,
+    error_allocators: *const ErrorAllocators,
 ) -> ExternResult<OptionalValue<u64>> {
     let result = dv_info.cardinality().map(Into::into);
-    unsafe { result.into_extern_result(&allocate_error) }
+    unsafe { result.into_extern_result(&*error_allocators) }
 }
 
 /// Get a selection vector out of a [`DvInfo`] struct
@@ -1185,7 +1190,9 @@ mod scan_builder_tests {
     };
     #[cfg(feature = "geo-type-in-dev")]
     use crate::ffi_test_utils::build_snapshot;
-    use crate::ffi_test_utils::{allocate_err, ok_or_panic, recover_error, setup_snapshot};
+    use crate::ffi_test_utils::{
+        TEST_ERROR_ALLOCATORS, ok_or_panic, recover_error, setup_snapshot,
+    };
     use crate::schema_visitor::{
         KernelSchemaVisitorState, visit_field_integer, visit_field_struct,
     };
@@ -1246,7 +1253,7 @@ mod scan_builder_tests {
                 kernel_string_slice!(id),
                 true,
                 std::ptr::null(),
-                allocate_err,
+                &TEST_ERROR_ALLOCATORS,
             ))
         };
         let field_ids = [id_field_id];
@@ -1259,7 +1266,7 @@ mod scan_builder_tests {
                 1,
                 false,
                 std::ptr::null(),
-                allocate_err,
+                &TEST_ERROR_ALLOCATORS,
             ))
         }
     }
@@ -1278,7 +1285,7 @@ mod scan_builder_tests {
                 kernel_string_slice!(crs),
                 true,
                 std::ptr::null(),
-                allocate_err,
+                &TEST_ERROR_ALLOCATORS,
             ))
         };
         let geog = "geog";
@@ -1291,7 +1298,7 @@ mod scan_builder_tests {
                 kernel_string_slice!(algorithm),
                 true,
                 std::ptr::null(),
-                allocate_err,
+                &TEST_ERROR_ALLOCATORS,
             ))
         };
         let field_ids = [geom_field_id, geog_field_id];
@@ -1304,7 +1311,7 @@ mod scan_builder_tests {
                 field_ids.len(),
                 false,
                 std::ptr::null(),
-                allocate_err,
+                &TEST_ERROR_ALLOCATORS,
             ))
         }
     }
@@ -1321,7 +1328,7 @@ mod scan_builder_tests {
                 state,
                 parts.as_ptr(),
                 parts.len(),
-                allocate_err,
+                &TEST_ERROR_ALLOCATORS,
             ))
         };
         let lit = visit_expression_literal_int(state, 10);
@@ -1489,7 +1496,7 @@ mod scan_builder_tests {
                 kernel_string_slice!(bare_field),
                 true,
                 std::ptr::null(),
-                allocate_err,
+                &TEST_ERROR_ALLOCATORS,
             ))
         }
     }
@@ -2261,11 +2268,14 @@ mod tests {
         DeletionVectorDescriptor, DeletionVectorStorageType,
     };
     use delta_kernel::scan::state::DvInfo;
+    use delta_kernel::schema::{MetadataKey, MetadataValue};
     use rstest::rstest;
 
     use super::cardinality_from_dv;
     use crate::error::FFIKernelError;
-    use crate::ffi_test_utils::{allocate_err, assert_extern_result_error_contains, ok_or_panic};
+    use crate::ffi_test_utils::{
+        TEST_ERROR_ALLOCATORS, assert_extern_result_error_contains, ok_or_panic,
+    };
     use crate::{KernelStringSlice, NullableCvoid, OptionalValue, TryFromStringSlice};
 
     #[rstest]
@@ -2292,7 +2302,7 @@ mod tests {
             })
             .unwrap_or_default();
 
-        let result = unsafe { cardinality_from_dv(&dv_info, allocate_err) };
+        let result = unsafe { cardinality_from_dv(&dv_info, &TEST_ERROR_ALLOCATORS) };
         match expected {
             Ok(expected) => assert_eq!(ok_or_panic(result), OptionalValue::from(expected)),
             Err(message) => assert_extern_result_error_contains(
@@ -2351,7 +2361,7 @@ mod tests {
         use crate::expressions::kernel_visitor::{
             KernelExpressionVisitorState, visit_expression_literal_bool,
         };
-        use crate::ffi_test_utils::{allocate_err, ok_or_panic, setup_snapshot};
+        use crate::ffi_test_utils::{TEST_ERROR_ALLOCATORS, ok_or_panic, setup_snapshot};
         use crate::handle::Handle;
         use crate::plans::result::CPlanResult;
         use crate::plans::{get_plan_based_engine, get_plan_executor};
@@ -2384,7 +2394,7 @@ mod tests {
                 get_plan_based_engine(
                     executor,
                     OptionalValue::Some(fallback.shallow_copy()),
-                    allocate_err,
+                    &TEST_ERROR_ALLOCATORS,
                 )
             }
         }
@@ -2477,24 +2487,19 @@ mod tests {
 
     #[test]
     fn visit_metadata_map_maps_kind_and_renders_each_variant() {
-        use delta_kernel::schema::MetadataValue;
-
         use super::CMetadataValueKind::*;
 
         // `Number` is i64-only, so a JSON number with a fractional part lands in `Other` -- cover
         // both so the "parse as i64" contract for `MetadataNumber` stays honest.
-        let test_map = HashMap::from([
-            ("num".to_string(), MetadataValue::Number(-7)),
-            ("str".to_string(), MetadataValue::String("hi".into())),
-            ("bool".to_string(), MetadataValue::Boolean(true)),
+        let test_map: HashMap<MetadataKey, MetadataValue> = HashMap::from([
+            ("num".into(), MetadataValue::Number(-7)),
+            ("str".into(), MetadataValue::String("hi".into())),
+            ("bool".into(), MetadataValue::Boolean(true)),
             (
-                "obj".to_string(),
+                "obj".into(),
                 MetadataValue::Other(serde_json::json!({"a": 1})),
             ),
-            (
-                "float".to_string(),
-                MetadataValue::Other(serde_json::json!(1.5)),
-            ),
+            ("float".into(), MetadataValue::Other(serde_json::json!(1.5))),
         ]);
         let cmap: super::CMetadataMap = test_map.into();
 

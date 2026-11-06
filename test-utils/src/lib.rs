@@ -2241,11 +2241,11 @@ pub async fn read_metadata_configuration_from_store(
     let mut config = HashMap::new();
     for line in std::str::from_utf8(&bytes)?.lines() {
         let v: serde_json::Value = serde_json::from_str(line)?;
-        if let Some(c) = v.get("metaData").and_then(|m| m.get("configuration")) {
-            if c.is_object() {
-                let entries: HashMap<String, String> = serde_json::from_value(c.clone())?;
-                config.extend(entries);
-            }
+        if let Some(c) = v.get("metaData").and_then(|m| m.get("configuration"))
+            && c.is_object()
+        {
+            let entries: HashMap<String, String> = serde_json::from_value(c.clone())?;
+            config.extend(entries);
         }
     }
     Ok(config)

@@ -488,6 +488,12 @@ impl ScanBuilder {
     /// to the engine by default. Use [`with_stats`](Self::with_stats) if the engine
     /// also wants stats in the scan metadata output.
     ///
+    /// String comparisons use UTF-8 binary semantics, including on columns with `__COLLATIONS`.
+    /// Kernel's pruning ignores `statsWithCollation`. For collation-aware queries, the connector
+    /// must derive a conservative predicate whose TRUE rows include every match of the original
+    /// filter, and apply the original filter after reading. Unsupported comparisons must not
+    /// discard rows through Kernel or underlying-reader pushdown.
+    ///
     /// [`StructType::add_metadata_column`]: crate::schema::StructType::add_metadata_column
     pub fn with_predicate(mut self, predicate: impl Into<Option<PredicateRef>>) -> Self {
         self.predicate = predicate.into();
@@ -1075,14 +1081,14 @@ impl Scan {
     pub fn scan_metadata(
         &self,
         engine: &dyn Engine,
-    ) -> KernelResult<impl KernelResultIterator<ScanMetadata>> {
+    ) -> KernelResult<impl KernelResultIterator<ScanMetadata> + use<>> {
         self.with_cancellable_engine(engine, |engine| self.scan_metadata_with_engine(engine))
     }
 
     fn scan_metadata_with_engine(
         &self,
         engine: &dyn Engine,
-    ) -> KernelResult<impl KernelResultIterator<ScanMetadata>> {
+    ) -> KernelResult<impl KernelResultIterator<ScanMetadata> + use<>> {
         let actions_with_checkpoint_info = self.replay_for_scan_metadata(engine)?;
         self.scan_metadata_inner(engine, actions_with_checkpoint_info)
     }
@@ -1235,6 +1241,14 @@ impl Scan {
         if matches!(log_segment.checkpoint_version, Some(v) if v > existing_version) {
             return Ok(Box::new(self.scan_metadata_with_engine(engine)?));
         }
+        // Likewise for an AMT checkpoint action: commits at or below its version may no longer be
+        // listed, so a hint from before it cannot be advanced commit by commit.
+        #[cfg(feature = "adaptive-metadata-in-dev")]
+        if let Some(checkpoint) = self.snapshot.latest_checkpoint_action(engine)?
+            && Version::try_from(checkpoint.version()).is_ok_and(|v| v > existing_version)
+        {
+            return Ok(Box::new(self.scan_metadata(engine)?));
+        }
 
         // create a new log segment containing only the commits added after the version hint.
         let mut ascending_commit_files = log_segment.listed.ascending_commit_files.clone();
@@ -1296,13 +1310,14 @@ impl Scan {
         operation(engine)
     }
 
-    fn scan_metadata_inner(
+    fn scan_metadata_inner<I>(
         &self,
         engine: &dyn Engine,
-        actions_with_checkpoint_info: ActionsWithCheckpointInfo<
-            impl KernelResultIterator<ActionsBatch>,
-        >,
-    ) -> KernelResult<impl KernelResultIterator<ScanMetadata>> {
+        actions_with_checkpoint_info: ActionsWithCheckpointInfo<I>,
+    ) -> KernelResult<impl KernelResultIterator<ScanMetadata> + use<I>>
+    where
+        I: KernelResultIterator<ActionsBatch>,
+    {
         let start = Instant::now();
         let operation_id = MetricId::new();
         let is_catalog_managed = self.snapshot.table_configuration().is_catalog_managed();
@@ -1381,6 +1396,8 @@ impl Scan {
                  use scan_metadata instead"
             )
         );
+        #[cfg(feature = "adaptive-metadata-in-dev")]
+        self.require_no_checkpoint_action(engine, "declarative_metadata_scan_plan")?;
 
         // A statically-unsatisfiable predicate (e.g. `x > 10 AND FALSE`) skips the whole table.
         if self.state_info.physical_predicate == PhysicalPredicate::StaticSkipAll {
@@ -1402,9 +1419,23 @@ impl Scan {
     fn replay_for_scan_metadata(
         &self,
         engine: &dyn Engine,
-    ) -> KernelResult<ActionsWithCheckpointInfo<impl KernelResultIterator<ActionsBatch>>> {
+    ) -> KernelResult<ActionsWithCheckpointInfo<Box<dyn KernelResultIterator<ActionsBatch>>>> {
         let (checkpoint_schema, meta_predicate, physical_stats_read_schema) =
             self.checkpoint_read_options();
+        #[cfg(feature = "adaptive-metadata-in-dev")]
+        if let Some(checkpoint) = self.snapshot.latest_checkpoint_action(engine)? {
+            return self
+                .snapshot
+                .log_segment()
+                .read_actions_with_checkpoint_action(
+                    engine,
+                    &checkpoint,
+                    self.snapshot.table_root(),
+                    COMMIT_READ_SCHEMA.clone(),
+                    checkpoint_schema,
+                    physical_stats_read_schema,
+                );
+        }
         // Checkpoints already represent reconciled state, so scans project only Add actions. This
         // derives `add.path IS NOT NULL` and allows readers to skip non-Add row groups.
         self.snapshot
@@ -1420,6 +1451,24 @@ impl Scan {
                     .as_ref()
                     .map(|s| s.as_ref()),
             )
+    }
+
+    /// Errors when the snapshot has an AMT `checkpoint` action, which `entry_point` does not yet
+    /// read.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    fn require_no_checkpoint_action(
+        &self,
+        engine: &dyn Engine,
+        entry_point: &str,
+    ) -> KernelResult<()> {
+        match self.snapshot.latest_checkpoint_action(engine)? {
+            Some(checkpoint) => Err(KernelError::unsupported(format!(
+                "{entry_point} does not yet read the adaptiveMetadata checkpoint action at version \
+                 {}",
+                checkpoint.version()
+            ))),
+            None => Ok(()),
+        }
     }
 
     /// Builds a predicate for row group skipping in checkpoint and sidecar parquet files.
@@ -1566,6 +1615,8 @@ impl Scan {
                  tables with TIMESTAMP partition columns; use scan_metadata"
             )
         );
+        #[cfg(feature = "adaptive-metadata-in-dev")]
+        self.require_no_checkpoint_action(engine.as_ref(), "parallel_scan_metadata")?;
         // For the sequential/parallel phase approach, we use a conservative checkpoint_info
         // since SequentialPhase reads checkpoints via CheckpointManifestReader which doesn't
         // currently support stats_parsed optimization.
@@ -1613,7 +1664,7 @@ impl Scan {
     pub fn execute(
         &self,
         engine: Arc<dyn Engine>,
-    ) -> KernelResult<impl KernelResultIterator<Box<dyn EngineData>>> {
+    ) -> KernelResult<impl KernelResultIterator<Box<dyn EngineData>> + use<>> {
         if self.state_info.skip_row_transforms {
             return Err(KernelError::unsupported(
                 "Scan::execute is not supported when row transforms are disabled by \
