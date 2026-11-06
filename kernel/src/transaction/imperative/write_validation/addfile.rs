@@ -60,8 +60,8 @@ pub(crate) fn validate_no_clustering_providers_set(
     )
 }
 
-/// Rejects batches with a non-null `stats.tightStats`. Any non-null value promises
-/// microsecond-precision timestamp bounds, which commit does not serialize.
+/// Rejects batches with a non-null `stats.tightStats`, which promises microsecond-precision
+/// timestamp bounds that millisecond-precision stats JSON can't represent.
 pub(crate) fn validate_no_tight_stats_set(batches: &[Box<dyn EngineData>]) -> KernelResult<()> {
     validate_batches_with_column(
         batches,

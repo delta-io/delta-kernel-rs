@@ -327,9 +327,12 @@ impl<STATE> Transaction<STATE, Imperative> {
                 &self.staged_data_changes.add_files_metadata,
             )?;
         }
-        write_validation::validate_no_tight_stats_set(
-            &self.staged_data_changes.add_files_metadata,
-        )?;
+        // Millisecond stats JSON can't keep the microsecond bounds a non-null tightStats promises.
+        if self.effective_table_config.stats_json_op() == UnaryExpressionOp::TO_JSON {
+            write_validation::validate_no_tight_stats_set(
+                &self.staged_data_changes.add_files_metadata,
+            )?;
+        }
 
         let row_tracking_enablement = if self
             .effective_table_config
@@ -1486,7 +1489,7 @@ mod tests {
     #[case::unset(None)]
     #[case::tight(Some(true))]
     #[case::wide(Some(false))]
-    fn test_validate_file_actions_rejects_non_null_tight_stats(
+    fn test_validate_file_actions_rejects_tight_stats_without_full_precision_stats(
         #[case] tight_stats: Option<bool>,
         #[values(false, true)] adaptive_metadata: bool,
     ) {
@@ -1508,11 +1511,11 @@ mod tests {
 
         let result = txn.validate_file_actions();
         match tight_stats {
-            Some(value) => assert_result_error_with_message(
+            Some(value) if !adaptive_metadata => assert_result_error_with_message(
                 result,
                 &format!("sets stats.tightStats to {value}"),
             ),
-            None => result.unwrap(),
+            _ => result.unwrap(),
         }
     }
 }
