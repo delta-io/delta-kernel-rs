@@ -561,7 +561,7 @@ impl<Mode> SnapshotBuilder<Mode> {
 fn classify_table_root_error(table_root: &str, error: KernelError) -> Error {
     match error {
         KernelError::InvalidTableLocation(_) if is_absent_local_path(table_root) => {
-            DeltaError::path_does_not_exist(table_root, Some(error)).into()
+            DeltaError::path_does_not_exist(table_root, error).into()
         }
         error => error.into(),
     }
@@ -580,7 +580,7 @@ fn classify_log_segment_error(
 ) -> Error {
     match error {
         KernelError::EmptyLog if target_version.is_none() => {
-            DeltaError::path_does_not_exist(table_root, Some(error)).into()
+            DeltaError::path_does_not_exist(table_root, error).into()
         }
         error => error.into(),
     }
