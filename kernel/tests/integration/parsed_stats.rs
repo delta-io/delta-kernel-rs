@@ -360,10 +360,12 @@ mod adaptive_metadata {
             .build()
             .unwrap();
         let mut actual: Option<Vec<(String, Option<bool>)>> = None;
+        let mut num_files = 0;
         for scan_metadata in scan.scan_metadata(&engine).unwrap() {
             let (data, selection_vector) = scan_metadata.unwrap().scan_files.into_parts();
             let batch: RecordBatch = ArrowEngineData::try_from_engine_data(data).unwrap().into();
             let batch = filter_record_batch(&batch, &BooleanArray::from(selection_vector)).unwrap();
+            num_files += batch.num_rows();
             let paths = get_column!(batch, "path", StringArray);
             let stats_parsed = get_column!(batch, STATS_PARSED, StructArray);
             let Some(tight_stats) = stats_parsed.column_by_name(TIGHT_STATS) else {
@@ -382,6 +384,7 @@ mod adaptive_metadata {
             rows.sort();
             rows.into_iter().map(|(_, tight)| tight).collect::<Vec<_>>()
         });
+        assert_eq!(num_files, 3);
         assert_eq!(actual, expected);
     }
 
