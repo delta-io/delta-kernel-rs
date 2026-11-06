@@ -168,7 +168,13 @@ fn evaluate_struct_expression(
     } else {
         None
     };
-    let data = StructArray::try_new(output_fields.into(), output_cols, null_buffer)?;
+    // Empty structs have no child arrays from which Arrow can infer the batch length.
+    let data = StructArray::try_new_with_length(
+        output_fields.into(),
+        output_cols,
+        null_buffer,
+        batch.num_rows(),
+    )?;
     Ok(Arc::new(data))
 }
 
@@ -3378,60 +3384,140 @@ mod tests {
     }
 
     #[rstest]
-    // Fast path: no nulls in predicate array — values bitmap used directly.
+    // A guard without NULLs lets the struct reuse the guard's values bitmap.
     #[case::fast_path(
+        expr!(guarded_struct(col("is_valid"), col("a"))),
         vec![Some(1), Some(2), Some(3)],
         vec![Some(true), Some(false), Some(true)],
         vec![true, false, true],
+        vec![Some(1), Some(2), Some(3)],
     )]
-    // Slow path: predicate has nulls — Kleene AND; both false and null → null struct.
+    // A guard with NULLs combines values and validity so NULL guards yield NULL structs.
     #[case::slow_path(
+        expr!(guarded_struct(col("is_valid"), col("a"))),
         vec![Some(1), Some(2), Some(3), Some(4)],
         vec![Some(true), Some(false), None, Some(true)],
         vec![true, false, false, true],
+        vec![Some(1), Some(2), Some(3), Some(4)],
     )]
-    fn test_struct_with_nullability_predicate(
+    #[case::unguarded_null_fields(
+        expr!(make_struct(col("a"))),
+        vec![None, None, None],
+        vec![Some(true), Some(false), None],
+        vec![true, true, true],
+        vec![None, None, None],
+    )]
+    #[case::predicate_guard(
+        expr!(guarded_struct(col("is_valid") == true, col("a"))),
+        vec![Some(1), Some(2), Some(3)],
+        vec![Some(true), Some(false), None],
+        vec![true, false, false],
+        vec![Some(1), Some(2), Some(3)],
+    )]
+    #[case::coalesce_guard(
+        expr!(guarded_struct(coalesce(col("is_valid"), false), col("a"))),
+        vec![Some(1), Some(2), Some(3)],
+        vec![Some(true), Some(false), None],
+        vec![true, false, false],
+        vec![Some(1), Some(2), Some(3)],
+    )]
+    #[case::coalesce_structs(
+        expr!(coalesce(guarded_struct(col("is_valid"), col("a")), make_struct(99))),
+        vec![Some(1), Some(2), Some(3), None],
+        vec![Some(true), Some(false), None, Some(true)],
+        vec![true, true, true, true],
+        vec![Some(1), Some(99), Some(99), None],
+    )]
+    fn struct_macro_preserves_row_validity_and_values(
+        #[case] expr: Expr,
         #[case] a_vals: Vec<Option<i32>>,
         #[case] pred_vals: Vec<Option<bool>>,
         #[case] expected_valid: Vec<bool>,
+        #[case] expected_values: Vec<Option<i32>>,
     ) {
         let batch = create_batch_with_bool_col(a_vals, pred_vals);
         let schema = DataType::from(schema! { nullable "a": INTEGER });
-        let expr = Expr::struct_with_nullability_from(
-            [column_expr_ref!("a")],
-            column_expr_ref!("is_valid"),
-        );
         let result = evaluate_expression(&expr, &batch, Some(&schema)).unwrap();
-        let struct_result = result.as_any().downcast_ref::<StructArray>().unwrap();
-        for (i, valid) in expected_valid.iter().enumerate() {
-            assert_eq!(struct_result.is_valid(i), *valid, "row {i}");
-        }
+        let expected = StructArray::new(
+            vec![Arc::new(ArrowField::new("a", ArrowDataType::Int32, true))].into(),
+            vec![Arc::new(Int32Array::from(expected_values))],
+            Some(NullBuffer::from(expected_valid)),
+        );
+        assert_eq!(result.as_ref(), &expected);
     }
 
-    #[test]
-    fn test_struct_with_nullability_predicate_nested_schema() {
-        // Nested struct as schema: outer struct has one field that is itself a struct.
+    #[rstest]
+    #[case::unguarded(expr!(make_struct()), vec![true, true, true])]
+    #[case::guarded(expr!(guarded_struct(col("is_valid"))), vec![true, false, false])]
+    #[case::coalesced(
+        expr!(coalesce(guarded_struct(col("is_valid")), make_struct())),
+        vec![true, true, true],
+    )]
+    fn empty_struct_macro_preserves_row_count_and_validity(
+        #[case] expr: Expr,
+        #[case] expected_valid: Vec<bool>,
+        #[values(0, 3)] num_rows: usize,
+    ) {
         let batch = create_batch_with_bool_col(
             vec![Some(1), Some(2), Some(3)],
-            vec![Some(true), Some(false), Some(true)],
+            vec![Some(true), Some(false), None],
+        )
+        .slice(0, num_rows);
+        let schema = DataType::from(schema! {});
+        let result = evaluate_expression(&expr, &batch, Some(&schema)).unwrap();
+        let expected = StructArray::new_empty_fields(
+            num_rows,
+            Some(NullBuffer::from(expected_valid).slice(0, num_rows)),
+        );
+        assert_eq!(result.as_ref(), &expected);
+    }
+
+    #[rstest]
+    #[case::guarded_outer(
+        expr!(guarded_struct(col("a") > 0, make_struct(col("a")))),
+        vec![true, false, true, false],
+        vec![true, true, true, true],
+    )]
+    #[case::guarded_inner(
+        expr!(make_struct(guarded_struct(col("is_valid"), col("a")))),
+        vec![true, true, true, true],
+        vec![false, true, true, false],
+    )]
+    #[case::both_guarded(
+        expr!(guarded_struct(col("a") > 0, guarded_struct(col("is_valid"), col("a")))),
+        vec![true, false, true, false],
+        vec![false, true, true, false],
+    )]
+    fn nested_struct_macro_preserves_independent_guards(
+        #[case] expr: Expr,
+        #[case] outer_valid: Vec<bool>,
+        #[case] inner_valid: Vec<bool>,
+    ) {
+        let values = vec![Some(1), Some(-1), Some(2), None];
+        let batch = create_batch_with_bool_col(
+            values.clone(),
+            vec![Some(false), Some(true), Some(true), None],
         );
         let schema = DataType::from(schema! {
             nullable "nested": { nullable "a": INTEGER },
         });
-        let inner_expr = Expr::struct_from([column_expr_ref!("a")]);
-        let expr = Expr::struct_with_nullability_from([inner_expr], column_expr_ref!("is_valid"));
         let result = evaluate_expression(&expr, &batch, Some(&schema)).unwrap();
-        let struct_result = result.as_any().downcast_ref::<StructArray>().unwrap();
-        assert!(struct_result.is_valid(0));
-        assert!(struct_result.is_null(1));
-        assert!(struct_result.is_valid(2));
-        // The "nested" column should itself be a StructArray with 3 rows
-        let nested = struct_result
-            .column(0)
-            .as_any()
-            .downcast_ref::<StructArray>()
-            .unwrap();
-        assert_eq!(nested.len(), 3);
+        let inner = StructArray::new(
+            vec![Arc::new(ArrowField::new("a", ArrowDataType::Int32, true))].into(),
+            vec![Arc::new(Int32Array::from(values))],
+            Some(NullBuffer::from(inner_valid)),
+        );
+        let expected = StructArray::new(
+            vec![Arc::new(ArrowField::new(
+                "nested",
+                inner.data_type().clone(),
+                true,
+            ))]
+            .into(),
+            vec![Arc::new(inner)],
+            Some(NullBuffer::from(outer_valid)),
+        );
+        assert_eq!(result.as_ref(), &expected);
     }
 
     #[test]

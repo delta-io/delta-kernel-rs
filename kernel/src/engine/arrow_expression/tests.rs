@@ -1197,6 +1197,92 @@ fn test_evaluator_mixed_string_types_struct_expression() {
         .unwrap();
 }
 
+#[rstest]
+#[case::empty(expr!(make_struct()))]
+#[case::coalesced(expr!(coalesce(guarded_struct(col("keep")), make_struct())))]
+fn public_evaluator_empty_struct_output_preserves_row_count(
+    #[case] expression: Expression,
+    #[values(0, 3)] num_rows: usize,
+) {
+    let batch = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![Field::new(
+            "keep",
+            DataType::Boolean,
+            true,
+        )])),
+        vec![Arc::new(BooleanArray::from(vec![
+            Some(true),
+            Some(false),
+            None,
+        ]))],
+    )
+    .unwrap()
+    .slice(0, num_rows);
+    let input = ArrowEngineData::new(batch);
+    let output = ArrowEvaluationHandler
+        .new_expression_evaluator(
+            schema_ref! { nullable "keep": BOOLEAN },
+            Arc::new(expression),
+            KernelDataType::from(schema! {}),
+        )
+        .unwrap()
+        .evaluate(&input)
+        .try_into_record_batch()
+        .unwrap();
+
+    assert_eq!(output.num_rows(), num_rows);
+    assert_eq!(output.num_columns(), 0);
+}
+
+#[rstest]
+#[case::unguarded(expr!(make_struct(make_struct())), vec![true, true, true])]
+#[case::guarded(
+    expr!(make_struct(guarded_struct(col("keep")))),
+    vec![true, false, false],
+)]
+#[case::coalesced(
+    expr!(make_struct(coalesce(guarded_struct(col("keep")), make_struct()))),
+    vec![true, true, true],
+)]
+fn public_evaluator_nested_empty_structs_preserve_validity(
+    #[case] expression: Expression,
+    #[case] expected_valid: Vec<bool>,
+    #[values(0, 3)] num_rows: usize,
+) {
+    let batch = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![Field::new(
+            "keep",
+            DataType::Boolean,
+            true,
+        )])),
+        vec![Arc::new(BooleanArray::from(vec![
+            Some(true),
+            Some(false),
+            None,
+        ]))],
+    )
+    .unwrap()
+    .slice(0, num_rows);
+    let input = ArrowEngineData::new(batch);
+    let output = ArrowEvaluationHandler
+        .new_expression_evaluator(
+            schema_ref! { nullable "keep": BOOLEAN },
+            Arc::new(expression),
+            KernelDataType::from(schema! { nullable "nested": {} }),
+        )
+        .unwrap()
+        .evaluate(&input)
+        .try_into_record_batch()
+        .unwrap();
+    let expected = StructArray::new_empty_fields(
+        num_rows,
+        Some(NullBuffer::from(expected_valid).slice(0, num_rows)),
+    );
+
+    assert_eq!(output.num_rows(), num_rows);
+    assert_eq!(output.column(0).as_ref(), &expected);
+}
+
 #[derive(Clone, Copy, Debug)]
 enum EvaluatorKind {
     Expression,

@@ -11,7 +11,7 @@ use super::super::arrow_conversion::{
 use super::make_arrow_error;
 use crate::KernelResult;
 use crate::arrow::array::{
-    Array, ArrayRef, AsArray, ListArray, MapArray, RecordBatch, StructArray,
+    Array, ArrayRef, AsArray, ListArray, MapArray, RecordBatch, RecordBatchOptions, StructArray,
 };
 use crate::arrow::datatypes::{
     DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
@@ -38,11 +38,14 @@ pub(crate) fn apply_schema(array: &dyn Array, schema: &DataType) -> KernelResult
         ));
     };
     let applied = apply_schema_to_struct(array, struct_schema)?;
+    // Zero-column batches still need an explicit row count.
+    let num_rows = applied.len();
     let (fields, columns, _nulls) = applied.into_parts();
 
-    Ok(RecordBatch::try_new(
+    Ok(RecordBatch::try_new_with_options(
         Arc::new(ArrowSchema::new(fields)),
         columns,
+        &RecordBatchOptions::new().with_row_count(Some(num_rows)),
     )?)
 }
 
@@ -118,10 +121,11 @@ fn transform_struct(
             transformed_cols.len()
         )));
     }
-    Ok(StructArray::try_new(
+    Ok(StructArray::try_new_with_length(
         transformed_fields.into(),
         transformed_cols,
         nulls,
+        struct_array.len(),
     )?)
 }
 
