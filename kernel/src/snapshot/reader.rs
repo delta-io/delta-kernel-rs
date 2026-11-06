@@ -1,11 +1,15 @@
 //! Access to snapshot metadata that may require storage reads.
 
 use std::collections::HashSet;
+#[cfg(feature = "declarative-plans")]
+use std::sync::Arc;
 
 use delta_kernel_derive::internal_api;
 
 use super::Snapshot;
 use crate::actions::DomainMetadata;
+#[cfg(feature = "declarative-plans")]
+use crate::checkpoint::CheckpointInfo;
 use crate::clustering::ClusteringColumnInfo;
 use crate::engine::CancellableEngine;
 use crate::expressions::ColumnName;
@@ -55,6 +59,33 @@ pub struct SnapshotReader<'a> {
 mod tests;
 
 impl<'a> SnapshotReader<'a> {
+    /// Returns metadata for the selected checkpoint, or `None` when no checkpoint was selected.
+    ///
+    /// The first call resolves the complete leaf schema and sidecar list through the engine's
+    /// plan executor. Successful results are shared with subsequent readers and scan planning;
+    /// failures are retried on the next call. Construction and hint export do not trigger this
+    /// read. Scan planning can reuse a completed result but does not initialize this cache; a
+    /// preceding scan may have already probed the same files. A new snapshot resolves its own
+    /// checkpoint independently. Concurrent getters wait for any in-progress initialization.
+    /// Neither that wait nor executor reads observe this reader's cancellation token; reads use
+    /// the executor's own cancellation behavior.
+    /// Adaptive-metadata tables are unsupported.
+    #[cfg(feature = "declarative-plans")]
+    pub fn get_checkpoint_info(
+        &self,
+        engine: &dyn Engine,
+    ) -> KernelResult<Option<Arc<CheckpointInfo>>> {
+        self.read(engine, |snapshot, engine| {
+            #[cfg(feature = "adaptive-metadata-in-dev")]
+            if snapshot.has_adaptive_metadata() {
+                return Err(crate::KernelError::unsupported(
+                    "Checkpoint info does not support adaptive metadata",
+                ));
+            }
+            Ok(snapshot.checkpoint_shape(engine)?.info.clone())
+        })
+    }
+
     /// Sets the cancellation token for this reader's handler-backed reads.
     ///
     /// Each call replaces the reader's token binding. Passing `None` clears an existing binding.

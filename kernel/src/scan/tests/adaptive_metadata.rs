@@ -187,6 +187,43 @@ fn scan_entry_point_without_checkpoint_action_support_is_unsupported(
     );
 }
 
+#[cfg(feature = "declarative-plans")]
+#[test]
+fn declarative_scan_without_checkpoint_action_does_not_require_checkpoint_info_support() {
+    let (engine, table_root) = setup_adaptive_metadata_table();
+    let version = commit_files(&engine, &table_root, &["a.parquet"], &[]);
+    let loaded = snapshot_at(&engine, version);
+    // Force commit replay even when the writer provided an allFiles CRC.
+    let snapshot = Arc::new(
+        Snapshot::new(
+            loaded.log_segment().clone(),
+            loaded.table_configuration().clone(),
+        )
+        .unwrap(),
+    );
+    assert!(snapshot.base_crc().is_none());
+    assert!(
+        snapshot
+            .latest_checkpoint_action(&engine)
+            .unwrap()
+            .is_none()
+    );
+    let scan = snapshot.clone().scan_builder().build().unwrap();
+    assert_result_error_with_message(
+        snapshot.reader().get_checkpoint_info(&engine),
+        "Checkpoint info does not support adaptive metadata",
+    );
+    assert!(
+        scan.declarative_metadata_scan_plan(&engine)
+            .unwrap()
+            .is_some()
+    );
+    assert_result_error_with_message(
+        snapshot.reader().get_checkpoint_info(&engine),
+        "Checkpoint info does not support adaptive metadata",
+    );
+}
+
 #[test]
 fn scan_with_missing_root_manifest_names_it() {
     let (engine, _) = setup_adaptive_metadata_table();

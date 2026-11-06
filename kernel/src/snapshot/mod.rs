@@ -3,7 +3,9 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-#[cfg(feature = "adaptive-metadata-in-dev")]
+#[cfg(feature = "declarative-plans")]
+use std::sync::Mutex;
+#[cfg(any(feature = "adaptive-metadata-in-dev", feature = "declarative-plans"))]
 use std::sync::OnceLock;
 
 use delta_kernel_derive::internal_api;
@@ -17,6 +19,8 @@ use crate::actions::visitors::SetTransactionMap;
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::actions::{CheckpointAction, LastManifestCommit};
 use crate::actions::{DomainMetadata, INTERNAL_DOMAIN_PREFIX, LOG_DOMAIN_METADATA_SCHEMA};
+#[cfg(feature = "declarative-plans")]
+use crate::checkpoint::CheckpointShape;
 use crate::checkpoint::{
     CheckpointSpec, CheckpointWriter, DEFAULT_FILE_ACTIONS_PER_SIDECAR_HINT, V2CheckpointConfig,
     ensure_standalone_checkpoint_supported,
@@ -116,6 +120,11 @@ pub struct Snapshot {
     built_as_latest: bool,
     /// Whether the last applicable incremental build requested ignoring new checkpoints.
     skipped_new_checkpoints: bool,
+    /// Complete state for the frozen segment. Shared with scan plans; failed reads are not cached.
+    #[cfg(feature = "declarative-plans")]
+    checkpoint_shape: OnceLock<Arc<CheckpointShape>>,
+    #[cfg(feature = "declarative-plans")]
+    checkpoint_shape_init: Mutex<()>,
     /// This snapshot's latest AMT `checkpoint` action (see
     /// [`Snapshot::latest_checkpoint_action`]), filled at build time when P&M replay or the
     /// committing transaction captured it, else on the first successful lookup (a failed
@@ -305,6 +314,10 @@ impl Snapshot {
             crc,
             built_as_latest,
             skipped_new_checkpoints,
+            #[cfg(feature = "declarative-plans")]
+            checkpoint_shape: OnceLock::new(),
+            #[cfg(feature = "declarative-plans")]
+            checkpoint_shape_init: Mutex::new(()),
             #[cfg(feature = "adaptive-metadata-in-dev")]
             checkpoint_action: match captured_checkpoint_action {
                 Some(action) => OnceLock::from(Some(action)),
@@ -313,6 +326,44 @@ impl Snapshot {
             #[cfg(feature = "adaptive-metadata-in-dev")]
             last_manifest_commit,
         }
+    }
+
+    /// Returns only completed metadata, without waiting for or starting checkpoint discovery.
+    #[cfg(feature = "declarative-plans")]
+    pub(crate) fn cached_checkpoint_shape(&self) -> Option<Arc<CheckpointShape>> {
+        self.checkpoint_shape.get().cloned()
+    }
+
+    /// Resolve checkpoint state once, without caching failures or holding an engine reference.
+    #[cfg(feature = "declarative-plans")]
+    pub(crate) fn checkpoint_shape(
+        &self,
+        engine: &dyn Engine,
+    ) -> KernelResult<Arc<CheckpointShape>> {
+        if let Some(shape) = self.checkpoint_shape.get() {
+            return Ok(shape.clone());
+        }
+        // The mutex only serializes initialization; OnceLock publishes a complete value. A panic
+        // in engine code cannot leave partial state, so a later call can retry after poisoning.
+        let _guard = self
+            .checkpoint_shape_init
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(shape) = self.checkpoint_shape.get() {
+            return Ok(shape.clone());
+        }
+        let shape = if self.log_segment.listed.checkpoint_parts.is_empty() {
+            Arc::new(CheckpointShape::default())
+        } else {
+            let executor = engine.require_plan_executor()?;
+            Arc::new(CheckpointShape::try_new(
+                executor.as_ref(),
+                self.log_segment(),
+            )?)
+        };
+        // All initializers hold the mutex; publish only after every fallible operation succeeds.
+        let _ = self.checkpoint_shape.set(shape.clone());
+        Ok(shape)
     }
 
     /// The latest AMT `checkpoint` action this snapshot covers, or `None` when the table has no
@@ -708,6 +759,7 @@ impl Snapshot {
     ///   filename / extension / Url string heap.
     /// - Vec buffer capacity (`capacity * size_of::<ParsedLogPath>()`) for the three Vec fields on
     ///   `LogSegmentFiles`.
+    /// - Cached checkpoint sidecar descriptors and their Url strings, after resolution.
     /// - The log root Url string.
     /// - The raw `schemaString` JSON on table metadata.
     ///
@@ -719,17 +771,28 @@ impl Snapshot {
     /// Other variables' contributions to heap size are relatively small, so they are not counted
     /// here.
     ///
-    /// Runs in O(n) over listed log files.
+    /// Runs in O(n) over listed log files and cached sidecars.
     ///
     /// TODO(#2757): Optimize the estimation accuracy.
     pub fn estimated_owned_heap_size_bytes(&self) -> usize {
-        self.log_segment.listed.estimated_heap_size_bytes()
+        let size = self.log_segment.listed.estimated_heap_size_bytes()
             + self.log_segment.log_root.as_str().len()
             + self
                 .table_configuration()
                 .metadata()
                 .schema_string()
-                .capacity()
+                .capacity();
+        #[cfg(feature = "declarative-plans")]
+        let size = size
+            + self.checkpoint_shape.get().map_or(0, |shape| {
+                shape.sidecars.capacity() * size_of::<crate::FileMeta>()
+                    + shape
+                        .sidecars
+                        .iter()
+                        .map(|file| file.location.as_str().len())
+                        .sum::<usize>()
+            });
+        size
     }
 
     /// Get the [`TableProperties`] for this [`Snapshot`].

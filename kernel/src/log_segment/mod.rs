@@ -1239,11 +1239,7 @@ impl LogSegment {
         let Some(first) = parts.first() else {
             return Ok(None);
         };
-        let file_type = if first.is_json() {
-            FileType::Json
-        } else {
-            FileType::Parquet
-        };
+        let file_type = first.checkpoint_file_type();
         Ok(Some((file_type, Self::version_tagged_scan_files(parts)?)))
     }
 
