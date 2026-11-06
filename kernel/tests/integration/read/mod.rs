@@ -1,6 +1,7 @@
 // Scan-metadata cancellation is a read-path concern, so its coverage lives alongside the other
 // read tests.
 mod scan_cancellation;
+mod schema_nullability;
 #[cfg(feature = "udt-in-dev")]
 mod user_defined;
 

@@ -12,12 +12,12 @@
 //! # use delta_kernel::expressions::{col, lit};
 //! # use delta_kernel::{Predicate, Snapshot, SnapshotRef, KernelError, Engine};
 //! # use delta_kernel::table_changes::TableChanges;
-//! # let path = "./tests/data/table-with-cdf";
-//! let url = delta_kernel::try_parse_uri(path)?;
+//! let path = "./tests/data/table-with-cdf";
+//! # let url = delta_kernel::try_parse_uri(path)?;
 //! # use test_utils::delta_kernel_default_engine::storage::store_from_url;
 //! # let engine = std::sync::Arc::new(DefaultEngineBuilder::new(store_from_url(&url)?).build());
 //! // Get the table changes (change data feed) between version 0 and 1
-//! let table_changes = TableChanges::try_new(url, engine.as_ref(), 0, Some(1))?;
+//! let table_changes = TableChanges::try_new(path, engine.as_ref(), 0, Some(1))?;
 //!
 //! // Optionally specify a schema and predicate to apply to the table changes scan
 //! let schema = table_changes
@@ -54,7 +54,7 @@ use crate::table_features::{Operation, TableFeature};
 use crate::table_properties::{
     MATERIALIZED_ROW_COMMIT_VERSION_COLUMN_NAME, MATERIALIZED_ROW_ID_COLUMN_NAME,
 };
-use crate::utils::require;
+use crate::utils::{require, try_parse_uri};
 use crate::{Engine, KernelError, KernelResult, KernelResultIterator, Version};
 
 mod log_replay;
@@ -214,10 +214,10 @@ static CDF_FIELDS: LazyLock<[StructField; 3]> = LazyLock::new(|| {
 ///  # use test_utils::delta_kernel_default_engine::{storage::store_from_url, DefaultEngineBuilder};
 ///  # use delta_kernel::{SnapshotRef, KernelError};
 ///  # use delta_kernel::table_changes::TableChanges;
-///  # let path = "./tests/data/table-with-cdf";
-///  let url = delta_kernel::try_parse_uri(path)?;
+///  let path = "./tests/data/table-with-cdf";
+///  # let url = delta_kernel::try_parse_uri(path)?;
 ///  # let engine = DefaultEngineBuilder::new(store_from_url(&url)?).build();
-///  let table_changes = TableChanges::try_new(url, &engine, 0, Some(1))?;
+///  let table_changes = TableChanges::try_new(path, &engine, 0, Some(1))?;
 ///  # Ok::<(), KernelError>(())
 ///  ````
 /// For more details, see the following sections of the protocol:
@@ -239,7 +239,7 @@ pub struct TableChanges {
 impl TableChanges {
     /// Creates a new [`TableChanges`] instance for the given version range. This function checks
     /// these properties:
-    /// - The change data feed table feature must be enabled in both the start or end versions.
+    /// - The change data feed table feature must be enabled in both the start and end versions.
     /// - Every enabled reader feature must be supported by the kernel.
     /// - The schemas at the start and end versions are the same.
     ///
@@ -247,17 +247,20 @@ impl TableChanges {
     /// range. It also does not check that the schema remains the same for the entire range.
     ///
     /// # Parameters
-    /// - `table_root`: url pointing at the table root (where `_delta_log` folder is located)
+    /// - `table_root`: URL or absolute or relative local directory path containing `_delta_log`.
+    ///   Local paths (including `file://` URLs) must name existing directories and are canonicalized.
+    ///   Relative paths are resolved against the current working directory.
     /// - `engine`: Implementation of [`Engine`] apis.
     /// - `start_version`: The start version of the change data feed
     /// - `end_version`: The end version (inclusive) of the change data feed. If this is none, this
     ///   defaults to the newest table version.
     pub fn try_new(
-        table_root: Url,
+        table_root: impl AsRef<str>,
         engine: &dyn Engine,
         start_version: Version,
         end_version: Option<Version>,
     ) -> KernelResult<Self> {
+        let table_root = try_parse_uri(table_root)?;
         Self::try_new_internal(
             table_root,
             engine,
@@ -630,11 +633,24 @@ mod tests {
         assert!(matches!(table_changes_res, Err(KernelError::Generic(msg)) if msg == expected_msg));
     }
 
-    #[test]
-    fn table_changes_has_cdf_schema() {
-        let path = "./tests/data/table-with-cdf";
-        let engine = Box::new(SyncEngine::new());
-        let url = delta_kernel::try_parse_uri(path).unwrap();
+    #[rstest::rstest]
+    #[case::relative_path("./tests/data/table-with-cdf")]
+    #[case::absolute_path(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/table-with-cdf"))]
+    #[case::url(Url::from_directory_path(concat!(
+        env!("CARGO_MANIFEST_DIR"), "/tests/data/table-with-cdf"
+    )).unwrap())]
+    #[case::url_string(Url::from_directory_path(concat!(
+        env!("CARGO_MANIFEST_DIR"), "/tests/data/table-with-cdf"
+    )).unwrap().to_string())]
+    #[case::url_string_without_trailing_slash(
+        Url::from_directory_path(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/table-with-cdf"))
+            .unwrap()
+            .as_str()
+            .trim_end_matches('/')
+            .to_owned()
+    )]
+    fn table_changes_accepts_urls_and_paths(#[case] table_root: impl AsRef<str>) {
+        let engine = SyncEngine::new();
         let expected_schema = [
             StructField::nullable("part", DataType::INTEGER),
             StructField::nullable("id", DataType::INTEGER),
@@ -642,9 +658,29 @@ mod tests {
         .into_iter()
         .chain(CDF_FIELDS.clone());
 
-        let table_changes =
-            TableChanges::try_new(url.clone(), engine.as_ref(), 0, 0.into()).unwrap();
+        let table_changes = TableChanges::try_new(table_root, &engine, 0, Some(1)).unwrap();
+        let expected_root =
+            Url::from_directory_path(std::fs::canonicalize("./tests/data/table-with-cdf").unwrap())
+                .unwrap();
+        assert_eq!(table_changes.table_root(), &expected_root);
+        assert_eq!(table_changes.start_version(), 0);
+        assert_eq!(table_changes.end_version(), 1);
         assert_equal(expected_schema, table_changes.schema().fields().cloned());
+    }
+
+    #[rstest::rstest]
+    #[case::local_path(false)]
+    #[case::file_url(true)]
+    fn table_changes_rejects_nonexistent_local_path(#[case] as_file_url: bool) {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let path = temp_dir.path().join("missing");
+        let table_root = if as_file_url {
+            Url::from_directory_path(&path).unwrap().to_string()
+        } else {
+            path.to_str().unwrap().to_owned()
+        };
+        let result = TableChanges::try_new(table_root, &SyncEngine::new(), 0, Some(1));
+        assert!(matches!(result, Err(KernelError::InvalidTableLocation(_))));
     }
 
     #[test]
