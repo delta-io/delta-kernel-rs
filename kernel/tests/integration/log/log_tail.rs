@@ -558,7 +558,10 @@ async fn log_tail_behind_requested_version() -> Result<(), Box<dyn std::error::E
         .with_log_tail(log_tail)
         .build(engine.as_ref());
 
-    assert!(matches!(result, Err(KernelError::MissingVersion(3))));
+    assert!(matches!(
+        result,
+        Err(delta_kernel::Error::Kernel(KernelError::MissingVersion(3)))
+    ));
 
     Ok(())
 }

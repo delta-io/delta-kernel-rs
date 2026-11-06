@@ -125,7 +125,7 @@ async fn test_append() -> KernelResult<(), Box<dyn std::error::Error>> {
 }
 
 #[tokio::test]
-async fn test_no_add_actions() -> KernelResult<()> {
+async fn test_no_add_actions() -> delta_kernel::Result<()> {
     // setup tracing
     let _ = tracing_subscriber::fmt::try_init();
     // create a simple table: one int column named 'number'
@@ -150,11 +150,14 @@ async fn test_no_add_actions() -> KernelResult<()> {
             .get(&Path::from(format!(
                 "/{table_name}/_delta_log/00000000000000000001.json"
             )))
-            .await?;
+            .await
+            .map_err(KernelError::from)?;
 
-        let parsed_actions: Vec<_> = Deserializer::from_slice(&commit1.bytes().await?)
-            .into_iter::<serde_json::Value>()
-            .try_collect()?;
+        let parsed_actions: Vec<_> =
+            Deserializer::from_slice(&commit1.bytes().await.map_err(KernelError::from)?)
+                .into_iter::<serde_json::Value>()
+                .try_collect()
+                .map_err(KernelError::from)?;
 
         // Verify that there only is a commit info action
         assert_eq!(parsed_actions.len(), 1, "Expected only one action");
@@ -164,7 +167,7 @@ async fn test_no_add_actions() -> KernelResult<()> {
 }
 
 #[tokio::test]
-async fn test_append_twice() -> KernelResult<()> {
+async fn test_append_twice() -> delta_kernel::Result<()> {
     // setup tracing
     let _ = tracing_subscriber::fmt::try_init();
     // create a simple table: one int column named 'number'
@@ -180,12 +183,20 @@ async fn test_append_twice() -> KernelResult<()> {
             .await?;
 
         test_read(
-            &ArrowEngineData::new(RecordBatch::try_new(
-                Arc::new(schema.as_ref().try_into_arrow()?),
-                vec![Arc::new(Int32Array::from(vec![
-                    1, 2, 3, 4, 5, 6, 1, 2, 3, 4, 5, 6,
-                ]))],
-            )?),
+            &ArrowEngineData::new(
+                RecordBatch::try_new(
+                    Arc::new(
+                        schema
+                            .as_ref()
+                            .try_into_arrow()
+                            .map_err(KernelError::from)?,
+                    ),
+                    vec![Arc::new(Int32Array::from(vec![
+                        1, 2, 3, 4, 5, 6, 1, 2, 3, 4, 5, 6,
+                    ]))],
+                )
+                .map_err(KernelError::from)?,
+            ),
             &table_url,
             engine,
         )?;
@@ -357,7 +368,7 @@ async fn test_append_partitioned(
 }
 
 #[tokio::test]
-async fn test_append_invalid_schema() -> KernelResult<()> {
+async fn test_append_invalid_schema() -> delta_kernel::Result<()> {
     // setup tracing
     let _ = tracing_subscriber::fmt::try_init();
     // create a simple table: one int column named 'number'
@@ -416,7 +427,7 @@ async fn test_append_invalid_schema() -> KernelResult<()> {
 }
 
 #[tokio::test]
-async fn commit_rejects_add_missing_required_field() -> KernelResult<()> {
+async fn commit_rejects_add_missing_required_field() -> delta_kernel::Result<()> {
     let _ = tracing_subscriber::fmt::try_init();
     let schema = get_simple_int_schema();
 
@@ -437,10 +448,18 @@ async fn commit_rejects_add_missing_required_field() -> KernelResult<()> {
             |builder| builder,
         )?;
 
-        let data = ArrowEngineData::new(RecordBatch::try_new(
-            Arc::new(schema.as_ref().try_into_arrow()?),
-            vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
-        )?);
+        let data = ArrowEngineData::new(
+            RecordBatch::try_new(
+                Arc::new(
+                    schema
+                        .as_ref()
+                        .try_into_arrow()
+                        .map_err(KernelError::from)?,
+                ),
+                vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+            )
+            .map_err(KernelError::from)?,
+        );
         let write_context = txn.write_state()?.write_context_builder().build()?;
 
         // Corrupt the addFile at the second batch.
@@ -449,7 +468,7 @@ async fn commit_rejects_add_missing_required_field() -> KernelResult<()> {
         let to_be_corrupted_meta = engine.write_parquet(&data, &write_context).await?;
 
         let batch = into_record_batch(to_be_corrupted_meta);
-        let index = batch.schema().index_of(field)?;
+        let index = batch.schema().index_of(field).map_err(KernelError::from)?;
 
         // The add-metadata schema declares these fields non-nullable, so rebuild the schema with
         // the target field made nullable before inserting a null column.
@@ -463,7 +482,8 @@ async fn commit_rejects_add_missing_required_field() -> KernelResult<()> {
         let nullable_schema = Arc::new(ArrowSchema::new(fields));
         let mut columns = batch.columns().to_vec();
         columns[index] = new_null_array(nullable_schema.field(index).data_type(), batch.num_rows());
-        let corrupted = RecordBatch::try_new(nullable_schema, columns)?;
+        let corrupted =
+            RecordBatch::try_new(nullable_schema, columns).map_err(KernelError::from)?;
         txn.add_files(Box::new(ArrowEngineData::new(corrupted)));
 
         let err = txn
@@ -511,7 +531,7 @@ async fn commit_rejects_add_missing_required_field() -> KernelResult<()> {
 async fn commit_rejects_add_with_invalid_partition_keys(
     #[case] column_mapping_mode: Option<&str>,
     #[case] modifications: &[AddFilePartitionKeyModify<'_>],
-) -> KernelResult<()> {
+) -> delta_kernel::Result<()> {
     let _ = tracing_subscriber::fmt::try_init();
 
     let table_schema = schema_ref! {
@@ -531,7 +551,8 @@ async fn commit_rejects_add_with_invalid_partition_keys(
         .unwrap_post_commit_snapshot();
 
     let data_schema = schema! { nullable "d": INTEGER };
-    let data_schema: Arc<ArrowSchema> = Arc::new((&data_schema).try_into_arrow()?);
+    let data_schema: Arc<ArrowSchema> =
+        Arc::new((&data_schema).try_into_arrow().map_err(KernelError::from)?);
     let make_add = |write_state: &Arc<WriteState>, p1: &str, p2: i32| {
         let wc = write_state
             .write_context_builder()
