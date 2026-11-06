@@ -318,14 +318,14 @@ impl LogSegment {
             }
             // Replay misses file changes only for a replayed manifest commit whose tree covers its
             // own version.
-            if let (Some(oldest), Some(version)) = (oldest, newest_files_only_in_manifest) {
-                if u64::try_from(version).is_ok_and(|v| v >= oldest.version) {
-                    debug!(
-                        "CRC reverse-replay: manifest commit at {version} may record files only \
-                         in its manifest; defaulting to non-incremental-safe"
-                    );
-                    delta.is_incremental_safe = false;
-                }
+            if let (Some(oldest), Some(version)) = (oldest, newest_files_only_in_manifest)
+                && u64::try_from(version).is_ok_and(|v| v >= oldest.version)
+            {
+                debug!(
+                    "CRC reverse-replay: manifest commit at {version} may record files only in \
+                     its manifest; defaulting to non-incremental-safe"
+                );
+                delta.is_incremental_safe = false;
             }
         }
         Ok(delta)
