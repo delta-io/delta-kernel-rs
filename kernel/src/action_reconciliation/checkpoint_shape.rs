@@ -14,9 +14,9 @@ use std::sync::Arc;
 
 use url::Url;
 
-use super::CHECKPOINT_ACTIONS_SCHEMA_V2;
 use crate::actions::SIDECAR_NAME;
 use crate::actions::visitors::SidecarVisitor;
+use crate::checkpoint::CHECKPOINT_ACTIONS_SCHEMA_V2;
 use crate::engine_data::RowVisitor;
 use crate::expressions::col;
 use crate::log_segment::LogSegment;
