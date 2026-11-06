@@ -19,11 +19,11 @@ use tracing::warn;
 
 use crate::actions::{
     MAX_VALUES, MIN_VALUES, NULL_COUNT, NUM_RECORDS, STATS_PARSED,
-    TIGHT_BOUNDS as DELTA_TIGHT_BOUNDS, TIGHT_STATS as DELTA_TIGHT_STATS,
+    TIGHT_BOUNDS as DELTA_TIGHT_BOUNDS,
 };
 use crate::content_tree::{
     CONTENT_STATS_FIELD_NAME, LOWER_BOUND, NAN_VALUE_COUNT, NULL_VALUE_COUNT, RECORD_COUNT,
-    TIGHT_STATS, TOTAL_BYTES, UPPER_BOUND, VALUE_COUNT,
+    TOTAL_BYTES, UPPER_BOUND, VALUE_COUNT,
 };
 use crate::expressions::{ColumnName, Expression, ExpressionRef, lit, null_lit};
 use crate::schema::{
@@ -682,14 +682,13 @@ impl<'a> StatsLeafVisitor<'a> for StatsSchemaCollector {
 /// nullCount:   {<table nesting>}  <- content_stats.<leaf>.null_value_count
 /// minValues:   {<table nesting>}  <- content_stats.<leaf>.lower_bound
 /// maxValues:   {<table nesting>}  <- content_stats.<leaf>.upper_bound
-/// tightBounds: boolean            <- coalesce(tightStats, false)
-/// tightStats:  boolean            <- coalesce(tightStats, false)
+/// tightBounds: boolean            <- false
 /// ```
 ///
 /// `content_stats` must have been read with [`projected_stats_schema`] for the same `table_schema`
 /// and `delta_stats_schema`: both are produced by the same table walk, so leaf names always agree.
 ///
-/// Both Delta tightness flags come from the entry's [`TIGHT_STATS`] column. AMT-only stats
+/// `tightBounds` is always `false`, so the bounds are reported as wide. AMT-only stats
 /// (`value_count`, `nan_value_count`, `total_bytes`) are not carried over. A leaf without a
 /// `content_stats` entry (array/map columns, out-of-range field IDs) yields null.
 pub(crate) fn build_parsed_stats_expression(
@@ -709,12 +708,10 @@ pub(crate) fn build_parsed_stats_expression(
             )));
         }
     }
-    for column in [RECORD_COUNT, TIGHT_STATS] {
-        if input_schema.field(column).is_none() {
-            return Err(KernelError::generic(format!(
-                "AMT entry column '{column}' not found in input schema"
-            )));
-        }
+    if input_schema.field(RECORD_COUNT).is_none() {
+        return Err(KernelError::generic(format!(
+            "AMT entry column '{RECORD_COUNT}' not found in input schema"
+        )));
     }
 
     let scopes = CategoryScopes::from_delta_stats_schema(delta_stats_schema)?;
@@ -806,11 +803,12 @@ fn assemble_parsed_stats_expr(
         let name = field.name().as_str();
         let expr = match name {
             NUM_RECORDS => Expression::column([RECORD_COUNT]),
-            // An absent `tight_stats` means not tight, while Delta reads an absent `tightBounds`
-            // as tight, so a null flag must become an explicit `false`.
-            DELTA_TIGHT_BOUNDS | DELTA_TIGHT_STATS => {
-                Expression::coalesce([Expression::column([TIGHT_STATS]), lit(false)])
-            }
+            // Wide bounds are still valid for data skipping; readers just can't treat them as
+            // exact. Write an explicit `false` because kernel still reads an absent `tightBounds`
+            // as tight.
+            // TODO: derive tightBounds and tightStats from the entry's tight_stats once Delta
+            // stats define tightStats.
+            DELTA_TIGHT_BOUNDS => lit(false),
             _ => STAT_CATEGORIES
                 .iter()
                 .position(|category| *category == name)
@@ -2206,7 +2204,7 @@ mod tests {
     }
 
     /// The input schema the conversion reads: `content_stats` read with [`projected_stats_schema`],
-    /// plus the entry's `recordCount` and `tightStats` columns.
+    /// plus the entry's `recordCount` column.
     fn parsed_stats_input_schema(table: &StructType, delta: &StructType) -> StructType {
         StructType::new_unchecked([
             StructField::nullable(
@@ -2214,11 +2212,10 @@ mod tests {
                 projected_stats_schema(table, delta).expect("projected schema"),
             ),
             StructField::nullable(RECORD_COUNT, DataType::LONG),
-            StructField::nullable(TIGHT_STATS, DataType::BOOLEAN),
         ])
     }
 
-    /// Converts a single input row (`content_stats`, `recordCount`, `tightStats`) and asserts the
+    /// Converts a single input row (`content_stats`, `recordCount`) and asserts the
     /// produced batch equals one built directly from `expected_stats` (the Delta stats struct
     /// scalar) and the same passthrough columns. Uses the real evaluator end to end.
     fn assert_parsed_stats(
@@ -2226,21 +2223,15 @@ mod tests {
         delta: &StructType,
         content_stats: Scalar,
         record_count: i64,
-        tight_stats: Option<bool>,
         expected_stats: Scalar,
     ) {
         let input_schema = parsed_stats_input_schema(table, delta);
         let engine = SyncEngine::new();
         let handler = engine.evaluation_handler();
-        let tight_stats = tight_stats.map_or(Scalar::Null(DataType::BOOLEAN), Scalar::Boolean);
         let input = handler
             .create_many(
                 Arc::new(input_schema.clone()),
-                vec![vec![
-                    content_stats,
-                    Scalar::Long(record_count),
-                    tight_stats.clone(),
-                ]],
+                vec![vec![content_stats, Scalar::Long(record_count)]],
             )
             .unwrap();
 
@@ -2249,11 +2240,7 @@ mod tests {
         let expected = handler
             .create_many(
                 output_schema,
-                vec![vec![
-                    expected_stats,
-                    Scalar::Long(record_count),
-                    tight_stats,
-                ]],
+                vec![vec![expected_stats, Scalar::Long(record_count)]],
             )
             .unwrap();
 
@@ -2264,8 +2251,8 @@ mod tests {
         assert_eq!(to_batch(actual), to_batch(expected));
     }
 
-    /// A nested Delta stats schema with `numRecords`, the given category sub-structs,
-    /// `tightBounds`, and `tightStats`. Mirrors the canonical Delta stats shape for building parsed
+    /// A nested Delta stats schema with `numRecords`, the given category sub-structs, and
+    /// `tightBounds`. Mirrors the canonical Delta stats shape for building parsed
     /// stats targets.
     fn delta_stats_with_bounds(
         null_count: StructType,
@@ -2278,7 +2265,6 @@ mod tests {
             StructField::nullable(MIN_VALUES, min_values),
             StructField::nullable(MAX_VALUES, max_values),
             StructField::nullable(DELTA_TIGHT_BOUNDS, DataType::BOOLEAN),
-            StructField::nullable(DELTA_TIGHT_STATS, DataType::BOOLEAN),
         ])
     }
 
@@ -2338,12 +2324,11 @@ mod tests {
                     &stat_cols(["id", "score"]),
                     vec![Scalar::Long(10), Scalar::Long(99)],
                 ),
-                Scalar::Boolean(true), // tightBounds <- tightStats
-                Scalar::Boolean(true), // tightStats <- tightStats
+                Scalar::Boolean(false), // tightBounds
             ],
         );
 
-        assert_parsed_stats(&table, &delta, content_stats, 100, Some(true), expected);
+        assert_parsed_stats(&table, &delta, content_stats, 100, expected);
     }
 
     #[test]
@@ -2387,12 +2372,11 @@ mod tests {
                 nested(Scalar::Long(2)),
                 nested(Scalar::Long(3)),
                 nested(Scalar::Long(7)),
-                Scalar::Boolean(true),
-                Scalar::Boolean(true),
+                Scalar::Boolean(false),
             ],
         );
 
-        assert_parsed_stats(&table, &delta, content_stats, 50, Some(true), expected);
+        assert_parsed_stats(&table, &delta, content_stats, 50, expected);
     }
 
     #[test]
@@ -2440,55 +2424,11 @@ mod tests {
                 ),
                 struct_scalar(&stat_cols(["id"]), vec![Scalar::Long(2)]),
                 struct_scalar(&stat_cols(["id"]), vec![Scalar::Long(9)]),
-                Scalar::Boolean(true),
-                Scalar::Boolean(true),
+                Scalar::Boolean(false),
             ],
         );
 
-        assert_parsed_stats(&table, &delta, content_stats, 10, Some(true), expected);
-    }
-
-    /// Both Delta tightness flags follow the entry's `tightStats`, with an absent flag read as
-    /// not tight.
-    #[rstest]
-    #[case::tight(Some(true), true)]
-    #[case::wide(Some(false), false)]
-    #[case::absent(None, false)]
-    fn parsed_stats_tightness_follows_entry_tight_stats(
-        #[case] tight_stats: Option<bool>,
-        #[case] expected_tight: bool,
-    ) {
-        let table = StructType::new_unchecked([field_with_id("id", DataType::LONG, true, 0)]);
-        let delta =
-            delta_stats_with_bounds(stat_cols(["id"]), stat_cols(["id"]), stat_cols(["id"]));
-        let content_stats_schema = projected_stats_schema(&table, &delta).unwrap();
-        let content_stats = struct_scalar(
-            &content_stats_schema,
-            vec![leaf_scalar(
-                &content_stats_schema,
-                "id",
-                vec![
-                    Scalar::Long(1),
-                    Scalar::Long(2),
-                    Scalar::Long(3),
-                    Scalar::Long(1),
-                ],
-            )],
-        );
-
-        let expected = struct_scalar(
-            &delta,
-            vec![
-                Scalar::Long(3),
-                struct_scalar(&stat_cols(["id"]), vec![Scalar::Long(1)]),
-                struct_scalar(&stat_cols(["id"]), vec![Scalar::Long(1)]),
-                struct_scalar(&stat_cols(["id"]), vec![Scalar::Long(2)]),
-                Scalar::Boolean(expected_tight),
-                Scalar::Boolean(expected_tight),
-            ],
-        );
-
-        assert_parsed_stats(&table, &delta, content_stats, 3, tight_stats, expected);
+        assert_parsed_stats(&table, &delta, content_stats, 10, expected);
     }
 
     #[test]
@@ -2542,11 +2482,10 @@ mod tests {
                 struct_scalar(&stat_cols(["id"]), vec![Scalar::Long(1)]),
                 struct_scalar(&stat_cols(["id"]), vec![Scalar::Long(9)]),
                 Scalar::Boolean(false),
-                Scalar::Boolean(false),
             ],
         );
 
-        assert_parsed_stats(&table, &delta, content_stats, 10, Some(false), expected);
+        assert_parsed_stats(&table, &delta, content_stats, 10, expected);
     }
 
     #[test]
@@ -2577,7 +2516,7 @@ mod tests {
             ],
         );
 
-        assert_parsed_stats(&table, &delta, content_stats, 7, Some(true), expected);
+        assert_parsed_stats(&table, &delta, content_stats, 7, expected);
     }
 
     #[test]
@@ -2611,20 +2550,17 @@ mod tests {
             ],
         );
 
-        assert_parsed_stats(&table, &delta, content_stats, 8, Some(true), expected);
+        assert_parsed_stats(&table, &delta, content_stats, 8, expected);
     }
 
-    /// `content_stats_col` names the input's stats column; `with_record_count` and
-    /// `with_tight_stats` control whether the input schema carries the required [`RECORD_COUNT`]
-    /// and [`TIGHT_STATS`] entry columns.
+    /// `content_stats_col` names the input's stats column; `with_record_count` controls whether
+    /// the input schema carries the required [`RECORD_COUNT`] entry column.
     #[rstest]
-    #[case::content_stats_missing("other_stats", true, true, "must be a struct")]
-    #[case::record_count_missing(CONTENT_STATS_FIELD_NAME, false, true, "'recordCount' not found")]
-    #[case::tight_stats_missing(CONTENT_STATS_FIELD_NAME, true, false, "'tightStats' not found")]
+    #[case::content_stats_missing("other_stats", true, "must be a struct")]
+    #[case::record_count_missing(CONTENT_STATS_FIELD_NAME, false, "'recordCount' not found")]
     fn parsed_stats_errors_on_bad_columns(
         #[case] content_stats_col: &str,
         #[case] with_record_count: bool,
-        #[case] with_tight_stats: bool,
         #[case] needle: &str,
     ) {
         let table = StructType::new_unchecked([field_with_id("id", DataType::LONG, true, 0)]);
@@ -2637,9 +2573,6 @@ mod tests {
         )];
         if with_record_count {
             fields.push(StructField::nullable(RECORD_COUNT, DataType::LONG));
-        }
-        if with_tight_stats {
-            fields.push(StructField::nullable(TIGHT_STATS, DataType::BOOLEAN));
         }
         let input_schema = StructType::new_unchecked(fields);
 
