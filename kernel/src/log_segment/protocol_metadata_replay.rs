@@ -433,10 +433,10 @@ impl PmPlanSegment {
                 // Log compactions drop commitInfo, so read the newest commit itself when one
                 // covers it. Only its commitInfo is needed; the compaction is still generally
                 // cheaper to read than the commits it replaces.
-                if let Some(newest_commit) = log_segment.newest_commit_after_checkpoint() {
-                    if !paths.contains(&newest_commit) {
-                        paths.push(newest_commit);
-                    }
+                if let Some(newest_commit) = log_segment.newest_commit_after_checkpoint()
+                    && !paths.contains(&newest_commit)
+                {
+                    paths.push(newest_commit);
                 }
                 paths
             }
