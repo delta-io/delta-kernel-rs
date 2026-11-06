@@ -17,7 +17,7 @@ use tracing::warn;
 use url::Url;
 
 use crate::actions::{Metadata, NULL_COUNT, Protocol};
-use crate::expressions::ColumnName;
+use crate::expressions::{ColumnName, UnaryExpressionOp};
 use crate::scan::data_skipping::stats_schema::{
     StatsConfig, StripFieldMetadataTransform, expected_stats_schema, stats_column_names,
 };
@@ -181,6 +181,7 @@ impl<'a> StatsSchemaBuilder<'a> {
     ///   minValues: { <columns with original types> },
     ///   maxValues: { <columns with original types> },
     ///   tightBounds: boolean,
+    ///   tightStats: boolean, // adaptiveMetadata tables only
     /// }
     /// ```
     ///
@@ -208,6 +209,7 @@ impl<'a> StatsSchemaBuilder<'a> {
             variant_min_max: self.variant_min_max,
             #[cfg(feature = "geo-type-in-dev")]
             geometry_min_max: self.geometry_min_max,
+            tight_stats: tc.is_adaptive_metadata_enabled(),
         };
         let physical_stats_schema = Arc::new(expected_stats_schema(
             &physical_data_schema,
@@ -245,19 +247,16 @@ fn strip_metadata(schema: SchemaRef) -> SchemaRef {
 /// Builds one side of [`StatsOutputSchemas`] for explicitly selected columns.
 ///
 /// Logical and physical output schemas both use this path so they follow the canonical stats
-/// selection rules and omit table-column metadata.
-fn build_stats_schema_for_columns(
+/// selection rules and omit table-column metadata. `base` supplies every option except the
+/// column selection.
+fn build_stats_schema_for_columns<'a>(
     data_schema: &StructType,
-    selected_columns: &[ColumnName],
-    variant_min_max: bool,
-    #[cfg(feature = "geo-type-in-dev")] geometry_min_max: bool,
+    selected_columns: &'a [ColumnName],
+    base: &StatsConfig<'a>,
 ) -> KernelResult<SchemaRef> {
     let config = StatsConfig {
         data_skipping_stats_columns: Some(selected_columns),
-        data_skipping_num_indexed_cols: None,
-        variant_min_max,
-        #[cfg(feature = "geo-type-in-dev")]
-        geometry_min_max,
+        ..*base
     };
     let required_columns = None;
     let requested_columns = None;
@@ -643,12 +642,17 @@ impl TableConfiguration {
         variant_min_max: bool,
         #[cfg(feature = "geo-type-in-dev")] geometry_min_max: bool,
     ) -> KernelResult<Option<StatsOutputSchemas>> {
-        let logical = build_stats_schema_for_columns(
-            &self.logical_schema_without_partition_columns(),
-            logical_columns,
+        let base = StatsConfig {
             variant_min_max,
             #[cfg(feature = "geo-type-in-dev")]
             geometry_min_max,
+            tight_stats: self.is_adaptive_metadata_enabled(),
+            ..Default::default()
+        };
+        let logical = build_stats_schema_for_columns(
+            &self.logical_schema_without_partition_columns(),
+            logical_columns,
+            &base,
         )?;
         // `expected_stats_schema` emits `nullCount` only when a data column is selected.
         if logical.field(NULL_COUNT).is_none() {
@@ -658,9 +662,7 @@ impl TableConfiguration {
         let physical = build_stats_schema_for_columns(
             &self.physical_data_schema_without_partition_columns(),
             physical_columns,
-            variant_min_max,
-            #[cfg(feature = "geo-type-in-dev")]
-            geometry_min_max,
+            &base,
         )?;
 
         Ok(Some(StatsOutputSchemas::try_new(logical, physical)?))
@@ -959,8 +961,23 @@ impl TableConfiguration {
 
     /// Table root for normalizing paths. `Some` iff adaptiveMetadata is enabled.
     pub(crate) fn dv_normalization_root(&self) -> Option<Url> {
-        self.is_feature_enabled(&TableFeature::AdaptiveMetadataPreview)
+        self.is_adaptive_metadata_enabled()
             .then(|| self.table_root.clone())
+    }
+
+    /// Whether the adaptiveMetadata table feature is enabled.
+    pub(crate) fn is_adaptive_metadata_enabled(&self) -> bool {
+        self.is_feature_enabled(&TableFeature::AdaptiveMetadataPreview)
+    }
+
+    /// The operator that encodes this table's file statistics as JSON.
+    pub(crate) fn stats_json_op(&self) -> UnaryExpressionOp {
+        // The adaptiveMetadata RFC requires untruncated timestamp bounds in file stats.
+        if self.is_adaptive_metadata_enabled() {
+            UnaryExpressionOp::ToJsonFullPrecision
+        } else {
+            UnaryExpressionOp::ToJson
+        }
     }
 
     /// The [`Version`] which this [`TableConfiguration`] belongs to.
