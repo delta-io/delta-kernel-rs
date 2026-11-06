@@ -31,12 +31,11 @@ pub struct FromSnapshot;
 ///
 /// ```no_run
 /// # use delta_kernel::{Snapshot, Engine};
-/// # use url::Url;
-/// # fn example(engine: &dyn Engine) -> Result<(), Box<dyn std::error::Error>> {
-/// let table_root = Url::parse("file:///path/to/table")?;
+/// # fn example(engine: &dyn Engine) -> delta_kernel::Result<()> {
+/// let table_root = "file:///path/to/table/";
 ///
 /// // Build a snapshot
-/// let snapshot = Snapshot::builder_for(table_root.clone())
+/// let snapshot = Snapshot::builder_for(table_root)
 ///     .at_version(5) // Optional: specify a time-travel version (default is latest version)
 ///     .build(engine)?;
 ///
@@ -557,7 +556,7 @@ impl<Mode> SnapshotBuilder<Mode> {
 fn classify_table_root_error(table_root: &str, error: KernelError) -> Error {
     match error {
         KernelError::InvalidTableLocation(_) if is_absent_local_path(table_root) => {
-            DeltaError::path_does_not_exist(table_root, error).into()
+            DeltaError::path_does_not_exist(table_root, Some(error)).into()
         }
         error => error.into(),
     }
@@ -576,7 +575,7 @@ fn classify_log_segment_error(
 ) -> Error {
     match error {
         KernelError::EmptyLog if target_version.is_none() => {
-            DeltaError::path_does_not_exist(table_root, error).into()
+            DeltaError::path_does_not_exist(table_root, Some(error)).into()
         }
         error => error.into(),
     }
