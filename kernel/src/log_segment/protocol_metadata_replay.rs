@@ -3,6 +3,8 @@
 //! This module contains the methods that perform a lightweight log replay to extract the latest
 //! Protocol and Metadata actions from a [`LogSegment`].
 
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use std::cmp::Ordering;
 use std::sync::{Arc, LazyLock};
 
 #[cfg(feature = "adaptive-metadata-in-dev")]
@@ -11,10 +13,11 @@ use tracing::{info, instrument};
 use url::Url;
 
 use super::LogSegment;
-#[cfg(all(feature = "adaptive-metadata-in-dev", feature = "declarative-plans"))]
-use super::missing_pointed_checkpoint_action;
 #[cfg(feature = "adaptive-metadata-in-dev")]
-use super::{last_manifest_commit_inconsistency, require_pointed_checkpoint_action};
+use super::{
+    checkpoint_action_projection_predicate, last_manifest_commit_inconsistency,
+    missing_pointed_checkpoint_action, require_pointed_checkpoint_action,
+};
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::actions::visitors::LastManifestCommitVisitor;
 #[cfg(feature = "adaptive-metadata-in-dev")]
@@ -30,8 +33,6 @@ use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
 use crate::expressions::{Expression, lit};
 #[cfg(feature = "declarative-plans")]
 use crate::expressions::{Predicate, col};
-#[cfg(feature = "adaptive-metadata-in-dev")]
-use crate::log_replay::ActionsBatch;
 use crate::metrics::ProtocolMetadataSource;
 use crate::path::ParsedLogPath;
 #[cfg(feature = "declarative-plans")]
@@ -145,53 +146,32 @@ impl LogSegment {
             return Ok(candidate);
         }
         let replayed = resolve_pm_batches(self.read_pm_batches(engine)?)?;
+        // Replay reads every commit until P&M are final, so a still-missing P or M means it also
+        // read the pointed commit.
         #[cfg(feature = "adaptive-metadata-in-dev")]
         let replayed = replayed.validated_pointer(self.end_version)?;
-        // Replay captures the pointed action when it reaches the pointed commit, so it is still
-        // needed only when a log compaction covers that commit.
         #[cfg(feature = "adaptive-metadata-in-dev")]
-        if let Some(pointer) = self.required_checkpoint_pointer_to_read(&replayed) {
-            let checkpoint = self.read_last_checkpoint_action_from_pointer(engine, &pointer)?;
-            // TODO(#2337): a log compaction batch ranks at its start version, so one that spans
-            // the pointed commit and also holds a later P&M change loses to the pointed action's
-            // older P&M. Once compactions are listed, replay the original commits after the
-            // pointed version instead, as delta-io/delta#7825 requires.
-            return Ok(replayed.with_checkpoint(checkpoint));
-        }
+        self.ensure_needed_checkpoint_action(&replayed)?;
         Ok(replayed)
-    }
-
-    /// The `lastManifestCommit` whose checkpoint action replay still needs: it has not been
-    /// captured, replay lacks Protocol or Metadata, and this segment lists the pointed commit.
-    /// `None` when there is no pointer or the action is not needed.
-    #[cfg(feature = "adaptive-metadata-in-dev")]
-    fn required_checkpoint_pointer_to_read(
-        &self,
-        resolved: &PmCandidate,
-    ) -> Option<LastManifestCommit> {
-        let (_, pointer) = resolved.last_manifest_commit.as_ref()?;
-        if resolved.checkpoint.is_some() {
-            return None;
-        }
-        // P&M changes are always written as top-level actions, so the segment's own P&M are at
-        // least as new as the pointed action's.
-        if resolved.protocol.is_some() && resolved.metadata.is_some() {
-            return None;
-        }
-        // An unlisted pointed commit is at or below where this segment starts, so whatever covers
-        // that start has P&M at least as new.
-        self.find_pointed_commit(pointer)?;
-        Some(pointer.clone())
     }
 
     /// Errors when replay lacks Protocol or Metadata but did not capture the checkpoint action of a
     /// pointed commit this segment lists.
-    #[cfg(all(feature = "adaptive-metadata-in-dev", feature = "declarative-plans"))]
+    #[cfg(feature = "adaptive-metadata-in-dev")]
     fn ensure_needed_checkpoint_action(&self, resolved: &PmCandidate) -> KernelResult<()> {
-        match self.required_checkpoint_pointer_to_read(resolved) {
-            Some(pointer) => Err(missing_pointed_checkpoint_action(&pointer)),
-            None => Ok(()),
+        let Some((_, pointer)) = &resolved.last_manifest_commit else {
+            return Ok(());
+        };
+        // P&M changes are always written as top-level actions, so the segment's own P&M are at
+        // least as new as the pointed action's. An unlisted pointed commit is at or below where
+        // this segment starts, so whatever covers that start has P&M at least as new.
+        if resolved.checkpoint.is_none()
+            && (resolved.protocol.is_none() || resolved.metadata.is_none())
+            && self.find_pointed_commit(pointer).is_some()
+        {
+            return Err(missing_pointed_checkpoint_action(pointer));
         }
+        Ok(())
     }
 
     /// [`Self::replay_for_pm`] for a segment that no CRC or checkpoint file bounds, whose P&M may
@@ -330,8 +310,8 @@ impl LogSegment {
             segment,
         )?;
         #[cfg(feature = "adaptive-metadata-in-dev")]
-        let (end_version, reads_checkpoint_action) =
-            (self.end_version, segment.reads_checkpoint_action(self));
+        let (end_version, checkpoint_commit_version) =
+            (self.end_version, segment.checkpoint_action_version(self));
         let batches = executor
             .execute_op(Operation::QueryPlan(plan))?
             .into_data()?
@@ -349,13 +329,9 @@ impl LogSegment {
                     protocol_version,
                     metadata_version,
                     #[cfg(feature = "adaptive-metadata-in-dev")]
-                    projects_checkpoint_action: reads_checkpoint_action,
+                    checkpoint_commit_version,
                     #[cfg(feature = "adaptive-metadata-in-dev")]
                     commit_info_version,
-                    // A plan reads the checkpoint action only from the newest or the pointed
-                    // commit.
-                    #[cfg(feature = "adaptive-metadata-in-dev")]
-                    captures_checkpoint: reads_checkpoint_action,
                     actions,
                 })
             });
@@ -376,24 +352,30 @@ impl LogSegment {
         )?);
         let checkpoint_version = self.checkpoint_version.map(|v| v as i64);
         #[cfg(feature = "adaptive-metadata-in-dev")]
-        let (end_version, end_version_i64) = (self.end_version, version_as_i64(self.end_version)?);
-        // Log compaction files drop commitInfo, so read the newest commit's `lastManifestCommit`
-        // from the commit itself when a compaction covers it. It is the newest batch, so it goes
-        // first.
+        let end_version = self.end_version;
+        // Read the files a whole-segment P&M plan reads, so the newest commit's commitInfo is read
+        // even when a log compaction covers that commit.
+        // TODO(#2337): a compaction covering the pointed commit also hides its checkpoint action;
+        // once compactions are listed, read that commit itself, as the newest-commit-first plan
+        // replay does.
         #[cfg(feature = "adaptive-metadata-in-dev")]
-        let newest_commit = self
-            .newest_commit_if_compacted()
-            .map(|commit| {
-                engine.json_handler().read_json_files(
-                    std::slice::from_ref(&commit.location),
-                    commit_schema.clone(),
-                    None,
-                )
-            })
-            .transpose()?
-            .into_iter()
-            .flatten()
-            .map_ok(|batch| ActionsBatch::new(batch, true));
+        let batches = {
+            let commit_files = self
+                .pm_commit_cover_paths()
+                .into_iter()
+                .map(|path| path.location.clone())
+                .collect_vec();
+            let checkpoint_predicate = checkpoint_action_projection_predicate(&checkpoint_schema);
+            let checkpoint = self.create_checkpoint_stream(
+                engine,
+                checkpoint_schema,
+                checkpoint_predicate,
+                None,
+                None,
+            )?;
+            Self::read_commit_files(engine, &commit_files, commit_schema)?.chain(checkpoint.actions)
+        };
+        #[cfg(not(feature = "adaptive-metadata-in-dev"))]
         let batches = self
             .read_actions_with_projected_checkpoint_actions(
                 engine,
@@ -404,8 +386,6 @@ impl LogSegment {
                 None,
             )?
             .actions;
-        #[cfg(feature = "adaptive-metadata-in-dev")]
-        let batches = newest_commit.chain(batches);
         Ok(batches.map(move |batch| {
             let batch = batch?;
             // A commit's version is parsed from its `_file`; a checkpoint batch uses the constant.
@@ -416,33 +396,37 @@ impl LogSegment {
                     KernelError::internal_error("checkpoint batch without a version")
                 })?
             };
+            // Only the commit schema projects the checkpoint action and `commitInfo`.
             #[cfg(feature = "adaptive-metadata-in-dev")]
-            let commit_info_version =
-                (batch.is_log_batch && version == end_version_i64).then_some(end_version);
+            let commit_version = batch
+                .is_log_batch
+                .then(|| as_version(version))
+                .transpose()?;
             Ok(VersionedBatch {
                 protocol_version: Some(version),
                 metadata_version: Some(version),
-                // Only the commit schema projects the checkpoint action and `commitInfo`.
                 #[cfg(feature = "adaptive-metadata-in-dev")]
-                projects_checkpoint_action: batch.is_log_batch,
+                checkpoint_commit_version: commit_version,
                 #[cfg(feature = "adaptive-metadata-in-dev")]
-                commit_info_version,
-                #[cfg(feature = "adaptive-metadata-in-dev")]
-                captures_checkpoint: commit_info_version.is_some(),
+                commit_info_version: commit_version.filter(|v| *v == end_version),
                 actions: batch.actions,
             })
         }))
     }
 
-    /// The commit at `end_version` when the commit cover reads a log compaction in its place.
+    /// The commit cover, newest first, plus the newest commit itself when a log compaction covers
+    /// it. Compactions drop commitInfo, so only the commit itself has the newest pointer; the
+    /// compaction is still generally cheaper to read than the commits it replaces.
     #[cfg(feature = "adaptive-metadata-in-dev")]
-    fn newest_commit_if_compacted(&self) -> Option<&ParsedLogPath> {
-        let newest_cover_is_compaction = self
-            .find_commit_cover_paths(None)
-            .first()
-            .is_some_and(|path| !path.is_commit());
-        self.newest_commit_after_checkpoint()
-            .filter(|_| newest_cover_is_compaction)
+    fn pm_commit_cover_paths(&self) -> Vec<&ParsedLogPath> {
+        let mut paths = self.find_commit_cover_paths(None);
+        if let Some(newest_commit) = self.newest_commit_after_checkpoint()
+            && !paths.contains(&newest_commit)
+        {
+            // First, so a replay that stops early still reads the pointer.
+            paths.insert(0, newest_commit);
+        }
+        paths
     }
 
     /// The commit at `end_version`, or `None` when the segment ends on a checkpoint. Unlike
@@ -499,7 +483,7 @@ impl PmReplaySegment {
             // Without a listed commit containing the pointed action, the newest commit's own
             // action (if any) bounds the range; otherwise every older commit is read.
             None => match &newest.checkpoint {
-                Some((version, _)) => (Some(as_version(*version)?), None),
+                Some((_, action)) => (Some(as_version(action.version())?), None),
                 None => (None, None),
             },
         };
@@ -514,18 +498,7 @@ impl PmReplaySegment {
     /// The commit files the plan reads from `log_segment`.
     fn commit_paths(self, log_segment: &LogSegment) -> Vec<&ParsedLogPath> {
         match self {
-            Self::WholeSegment => {
-                let mut paths = log_segment.find_commit_cover_paths(None);
-                // Log compactions drop commitInfo, so read the newest commit itself when one
-                // covers it. Only its commitInfo is needed; the compaction is still generally
-                // cheaper to read than the commits it replaces.
-                if let Some(newest_commit) = log_segment.newest_commit_after_checkpoint()
-                    && !paths.contains(&newest_commit)
-                {
-                    paths.push(newest_commit);
-                }
-                paths
-            }
+            Self::WholeSegment => log_segment.pm_commit_cover_paths(),
             Self::NewestCommit => Vec::from_iter(log_segment.newest_commit_after_checkpoint()),
             Self::OlderCommits {
                 oldest_exclusive,
@@ -545,11 +518,6 @@ impl PmReplaySegment {
     /// Whether the plan reads the newest commit's `commitInfo`.
     fn reads_commit_info(self) -> bool {
         !matches!(self, Self::OlderCommits { .. })
-    }
-
-    /// Whether the plan reads the AMT checkpoint action.
-    fn reads_checkpoint_action(self, log_segment: &LogSegment) -> bool {
-        self.checkpoint_action_version(log_segment).is_some()
     }
 
     /// The version of the commit in `log_segment` whose checkpoint action the plan keeps. Any other
@@ -672,10 +640,11 @@ impl PmResolution {
 struct PmCandidate {
     protocol: Option<(i64, Protocol)>,
     metadata: Option<(i64, Metadata)>,
-    /// The AMT checkpoint action `last_manifest_commit` points at, tagged with its
-    /// `checkpointMetadata.version` so it ranks the same way as Protocol and Metadata.
+    /// The newest AMT checkpoint action replay read, tagged with the version of the commit it was
+    /// read from. [`Self::validated_pointer`] keeps it only if `last_manifest_commit` points at
+    /// it.
     #[cfg(feature = "adaptive-metadata-in-dev")]
-    checkpoint: Option<(i64, CheckpointAction)>,
+    checkpoint: Option<(Version, CheckpointAction)>,
     /// The newest commit's `commitInfo.lastManifestCommit`, if replay read it, tagged with that
     /// commit's version.
     #[cfg(feature = "adaptive-metadata-in-dev")]
@@ -726,44 +695,56 @@ impl PmCandidate {
         }
     }
 
-    /// Merges in the pointed `checkpoint` action and the P&M nested in it.
-    #[cfg(feature = "adaptive-metadata-in-dev")]
-    fn with_checkpoint(self, checkpoint: CheckpointAction) -> Self {
-        let (protocol, metadata) = checkpoint_pm(&checkpoint);
-        PmCandidate {
-            protocol: newer(self.protocol, Some(protocol)),
-            metadata: newer(self.metadata, Some(metadata)),
-            checkpoint: Some((checkpoint.version(), checkpoint)),
-            ..self
-        }
-    }
-
-    /// Checks replay's `lastManifestCommit`, read from the newest commit at `version`, and any
-    /// captured checkpoint action against it: the pointer must name a manifest commit at or before
-    /// `version`, a captured action must be the one it points at, and a pointer naming `version`
-    /// requires that commit's action.
+    /// Checks replay's `lastManifestCommit`, read from the newest commit at `version`, against the
+    /// newest checkpoint action replay read, which must be the pointed one. Without a pointer, an
+    /// older commit's action is dropped, though its nested P&M still count: they are correct as of
+    /// its own version.
     ///
     /// # Errors
-    /// Returns an error if the pointer names a later commit, if replay captured a checkpoint action
-    /// without a pointer, if the captured action does not match the pointer, or if the pointer
-    /// names `version` and replay captured no action.
+    /// Returns an error if the pointer names a later commit, if the newest action replay read is
+    /// not in the pointed commit, if the newest commit carries one without a pointer, or if the
+    /// pointed action is missing from the newest commit or does not match the pointer.
     #[cfg(feature = "adaptive-metadata-in-dev")]
     fn validated_pointer(mut self, version: Version) -> KernelResult<Self> {
-        let Some((_, pointer)) = &self.last_manifest_commit else {
-            if self.checkpoint.is_some() {
+        let pointer = self
+            .last_manifest_commit
+            .as_ref()
+            .map(|(_, pointer)| pointer);
+        let pointed_version = pointer
+            .map(|pointer| {
+                pointer.ensure_at_or_before(version)?;
+                as_version(pointer.version)
+            })
+            .transpose()?;
+        self.checkpoint = match (self.checkpoint.take(), pointer.zip(pointed_version)) {
+            // Replay reads the newest commit first, so it reads the pointed commit before any older
+            // one.
+            (Some((commit, action)), Some((pointer, pointed_version))) => {
+                match commit.cmp(&pointed_version) {
+                    Ordering::Equal => Some((
+                        commit,
+                        require_pointed_checkpoint_action(pointer, Some(action))?,
+                    )),
+                    Ordering::Greater => {
+                        return Err(last_manifest_commit_inconsistency(
+                            pointer,
+                            format!("commit {commit} carries a checkpoint action"),
+                        ));
+                    }
+                    Ordering::Less => return Err(missing_pointed_checkpoint_action(pointer)),
+                }
+            }
+            (Some((commit, _)), None) if commit == version => {
                 return Err(KernelError::invalid_log_segment(format!(
                     "commit {version} carries a checkpoint action but no lastManifestCommit"
                 )));
             }
-            return Ok(self);
+            // The commit a pointer names carries the action, so one naming `version` requires it.
+            (None, Some((pointer, pointed_version))) if pointed_version == version => {
+                return Err(missing_pointed_checkpoint_action(pointer));
+            }
+            _ => None,
         };
-        pointer.ensure_at_or_before(version)?;
-        // The commit a pointer names carries the action, so one naming `version` requires it.
-        if self.checkpoint.is_some() || pointer.version == version_as_i64(version)? {
-            let action =
-                require_pointed_checkpoint_action(pointer, self.checkpoint.take().map(|(_, a)| a))?;
-            self.checkpoint = Some((action.version(), action));
-        }
         Ok(self)
     }
 }
@@ -772,60 +753,24 @@ impl PmCandidate {
 struct VersionedBatch {
     protocol_version: Option<i64>,
     metadata_version: Option<i64>,
-    /// Whether `actions` has the AMT checkpoint action column.
+    /// The version of the commit whose AMT checkpoint action `actions` projects, if any.
     #[cfg(feature = "adaptive-metadata-in-dev")]
-    projects_checkpoint_action: bool,
+    checkpoint_commit_version: Option<Version>,
     /// The newest commit's version, when `actions` holds that commit's `commitInfo`.
     #[cfg(feature = "adaptive-metadata-in-dev")]
     commit_info_version: Option<Version>,
-    /// Whether to take the batch's checkpoint action before replay knows the pointer: the newest
-    /// commit's own, or one a plan read from the pointed commit itself.
-    #[cfg(feature = "adaptive-metadata-in-dev")]
-    captures_checkpoint: bool,
     actions: Box<dyn EngineData>,
 }
 
-/// The newest Protocol and Metadata across `batches`, plus the checkpoint action that the newest
-/// commit's `lastManifestCommit` points at when replay reads the pointed commit.
+/// The newest Protocol and Metadata across `batches`.
 fn resolve_pm_batches(
     batches: impl KernelResultIterator<VersionedBatch>,
 ) -> KernelResult<PmCandidate> {
     let mut resolved = PmCandidate::default();
-    // The newest commit's version, once one of its batches carried a checkpoint action.
-    #[cfg(feature = "adaptive-metadata-in-dev")]
-    let mut newest_commit_action = None;
     for batch in batches {
         let batch = batch?;
         let batch_version = batch.protocol_version.max(batch.metadata_version);
-        let candidate = pm_candidate(&batch)?;
-        #[cfg(feature = "adaptive-metadata-in-dev")]
-        if candidate.checkpoint.is_some() {
-            newest_commit_action = batch.commit_info_version.or(newest_commit_action);
-        }
-        resolved = resolved.merge(candidate);
-        // The newest commit comes first, so the pointer is known before replay reaches the
-        // pointed commit. Only the pointed action is trusted; other checkpoint actions are skipped.
-        #[cfg(feature = "adaptive-metadata-in-dev")]
-        if let Some((_, pointer)) = resolved.last_manifest_commit.clone() {
-            // The newest commit carries a checkpoint action only when its pointer names it.
-            if let Some(version) = newest_commit_action
-                .filter(|version| i64::try_from(*version).ok() != Some(pointer.version))
-            {
-                return Err(last_manifest_commit_inconsistency(
-                    &pointer,
-                    format!("commit {version} carries a checkpoint action"),
-                ));
-            }
-            if resolved.checkpoint.is_none()
-                && batch.projects_checkpoint_action
-                && batch_version == Some(pointer.version)
-                && let Some(checkpoint) =
-                    CheckpointAction::try_new_from_data(batch.actions.as_ref())?
-            {
-                let checkpoint = require_pointed_checkpoint_action(&pointer, Some(checkpoint))?;
-                resolved = resolved.with_checkpoint(checkpoint);
-            }
-        }
+        resolved = resolved.merge(pm_candidate(&batch)?);
         // A checkpoint action's P&M can be older than its commit, so check version not presence.
         if is_final(&resolved.protocol, batch_version)
             && is_final(&resolved.metadata, batch_version)
@@ -891,7 +836,7 @@ fn checkpoint_pm(checkpoint: &CheckpointAction) -> ((i64, Protocol), (i64, Metad
 }
 
 /// Converts a log version read as `i64` to a [`Version`].
-#[cfg(all(feature = "adaptive-metadata-in-dev", feature = "declarative-plans"))]
+#[cfg(feature = "adaptive-metadata-in-dev")]
 fn as_version(version: i64) -> KernelResult<Version> {
     Version::try_from(version).map_err(|_| {
         KernelError::invalid_log_segment(format!("Delta log version {version} is negative"))
@@ -942,9 +887,8 @@ fn pm_plan_schema(extra_actions: &[PmPlanExtraAction]) -> KernelResult<SchemaRef
     Ok(Arc::new(StructType::try_new(actions.chain([version]))?))
 }
 
-/// The Protocol and Metadata in `batch`, tagged with its versions, plus the newest commit's
-/// `lastManifestCommit` when the batch comes from it and, when it `captures_checkpoint`, its
-/// checkpoint action.
+/// The Protocol and Metadata in `batch`, tagged with its versions, plus any AMT checkpoint
+/// action's nested P&M at its own version and the newest commit's `lastManifestCommit`.
 fn pm_candidate(batch: &VersionedBatch) -> KernelResult<PmCandidate> {
     let actions = batch.actions.as_ref();
     let protocol = batch
@@ -960,19 +904,18 @@ fn pm_candidate(batch: &VersionedBatch) -> KernelResult<PmCandidate> {
             Some(version) => LastManifestCommit::try_new_from_data(actions)?.map(|p| (version, p)),
             None => None,
         };
-        // Before replay knows the pointer, only a trusted action is captured here; replay captures
-        // the pointed action itself once it reaches that commit.
-        let checkpoint = if batch.captures_checkpoint {
-            CheckpointAction::try_new_from_data(actions)?
-        } else {
-            None
+        // Parsing an action needs its column in the batch's schema. A checkpoint action's nested
+        // P&M rank at its `checkpointMetadata.version`.
+        let checkpoint = match batch.checkpoint_commit_version {
+            Some(commit) => CheckpointAction::try_new_from_data(actions)?.map(|c| (commit, c)),
+            None => None,
         };
         let (checkpoint_protocol, checkpoint_metadata) =
-            checkpoint.as_ref().map(checkpoint_pm).unzip();
+            checkpoint.as_ref().map(|(_, c)| checkpoint_pm(c)).unzip();
         Ok(PmCandidate {
             protocol: newer(protocol, checkpoint_protocol),
             metadata: newer(metadata, checkpoint_metadata),
-            checkpoint: checkpoint.map(|c| (c.version(), c)),
+            checkpoint,
             last_manifest_commit,
         })
     }
@@ -1441,30 +1384,19 @@ mod tests {
             LogSegment::try_new(listed, log_root, None, None).unwrap()
         }
 
+        // The newest commit leads the cover, so a replay that stops early still reads its pointer.
         #[cfg(feature = "adaptive-metadata-in-dev")]
         #[rstest]
-        #[case::cover_reads_the_commit(false, None)]
-        #[case::cover_reads_a_compaction(true, Some(2))]
-        fn test_newest_commit_if_compacted(#[case] compacted: bool, #[case] expected: Option<u64>) {
+        #[case::cover_reads_the_commits(false, vec![(2, true), (1, true), (0, true)])]
+        #[case::cover_reads_a_compaction(true, vec![(2, true), (1, false), (0, true)])]
+        fn test_pm_commit_cover_paths_lead_with_newest_commit(
+            #[case] compacted: bool,
+            #[case] expected: Vec<(u64, bool)>,
+        ) {
             let segment = three_commit_segment(compacted);
-            let newest = segment.newest_commit_if_compacted();
-            assert_eq!(newest.map(|commit| commit.version), expected);
-        }
-
-        // A newer top-level Protocol or Metadata keeps winning over the merged checkpoint action's.
-        #[cfg(feature = "adaptive-metadata-in-dev")]
-        #[test]
-        fn test_with_checkpoint_keeps_newer_top_level_pm() {
-            let (protocol, metadata) = adaptive_metadata_protocol_and_metadata();
-            let candidate = PmCandidate {
-                metadata: Some((2, metadata.clone())),
-                ..Default::default()
-            };
-            let merged =
-                candidate.with_checkpoint(minimal_checkpoint_action("root.parquet", 1).unwrap());
-            assert_eq!(merged.metadata.map(|(version, _)| version), Some(2));
-            assert_eq!(merged.protocol, Some((1, protocol)));
-            assert_eq!(merged.checkpoint.map(|(version, _)| version), Some(1));
+            let paths = segment.pm_commit_cover_paths();
+            let paths = paths.iter().map(|path| (path.version, path.is_commit()));
+            assert_eq!(paths.collect_vec(), expected);
         }
 
         // Replay still needs the pointed action only when there is a pointer, replay has not
@@ -1472,48 +1404,80 @@ mod tests {
         // commit.
         #[cfg(feature = "adaptive-metadata-in-dev")]
         #[rstest]
-        #[case::no_pointer(None, None, false, None)]
-        #[case::captured_action(Some((1, 1)), Some(1), false, None)]
-        #[case::segment_has_pm(Some((1, 1)), None, true, None)]
-        #[case::unlisted_pointed_commit(Some((5, 5)), None, false, None)]
-        #[case::needs_pointed_commit(Some((1, 1)), None, false, Some(1))]
-        fn test_required_checkpoint_pointer_to_read(
+        #[case::no_pointer(None, None, false, false)]
+        #[case::captured_action(Some((1, 1)), Some(1), false, false)]
+        #[case::segment_has_pm(Some((1, 1)), None, true, false)]
+        #[case::unlisted_pointed_commit(Some((5, 5)), None, false, false)]
+        #[case::needs_pointed_commit(Some((1, 1)), None, false, true)]
+        fn test_ensure_needed_checkpoint_action(
             #[case] pointer: Option<(i64, i64)>,
-            #[case] captured: Option<i64>,
+            #[case] captured: Option<u64>,
             #[case] has_pm: bool,
-            #[case] expected: Option<i64>,
+            #[case] errors: bool,
         ) {
             let (protocol, metadata) = adaptive_metadata_protocol_and_metadata();
             let candidate = PmCandidate {
                 protocol: has_pm.then_some((2, protocol)),
                 metadata: has_pm.then_some((2, metadata)),
-                checkpoint: captured.map(|v| {
-                    (
-                        v,
-                        minimal_checkpoint_action("root.parquet", v as u64).unwrap(),
-                    )
-                }),
+                checkpoint: captured
+                    .map(|v| (v, minimal_checkpoint_action("root.parquet", v).unwrap())),
                 last_manifest_commit: pointer
                     .map(|(v, c)| (2, LastManifestCommit::new(v, c).unwrap())),
             };
-            let required =
-                three_commit_segment(false).required_checkpoint_pointer_to_read(&candidate);
-            assert_eq!(required.map(|pointer| pointer.version), expected);
+            let result = three_commit_segment(false).ensure_needed_checkpoint_action(&candidate);
+            assert_eq!(result.is_err(), errors);
         }
 
-        // A captured action that does not match the pointer fails validation.
+        // Validation keeps only the pointed action. Without a pointer, an older commit's action is
+        // dropped; any other action, or a missing pointed action, contradicts the log.
         #[cfg(feature = "adaptive-metadata-in-dev")]
-        #[test]
-        fn test_validated_pointer_rejects_mismatched_capture() {
+        #[rstest]
+        #[case::pointed_action(Some((1, 1)), Some((1, 1)), Ok(Some(1)))]
+        #[case::older_action(
+            Some((1, 1)),
+            Some((0, 0)),
+            Err("that commit carries no checkpoint action")
+        )]
+        #[case::older_action_without_pointer(None, Some((0, 0)), Ok(None))]
+        #[case::no_action_for_older_pointer(Some((1, 1)), None, Ok(None))]
+        #[case::other_content_root(
+            Some((1, 1)),
+            Some((1, 0)),
+            Err("checkpoint action has content root version 0")
+        )]
+        #[case::newer_action(Some((1, 1)), Some((2, 2)), Err("commit 2 carries a checkpoint action"))]
+        #[case::newest_action_without_pointer(
+            None,
+            Some((2, 2)),
+            Err("commit 2 carries a checkpoint action but no lastManifestCommit")
+        )]
+        #[case::no_action_for_newest_pointer(
+            Some((2, 2)),
+            None,
+            Err("that commit carries no checkpoint action")
+        )]
+        fn test_validated_pointer(
+            #[case] pointer: Option<(i64, i64)>,
+            #[case] action: Option<(u64, u64)>,
+            #[case] expected: Result<Option<u64>, &str>,
+        ) {
             let candidate = PmCandidate {
-                checkpoint: Some((0, minimal_checkpoint_action("root.parquet", 0).unwrap())),
-                last_manifest_commit: Some((2, LastManifestCommit::new(1, 1).unwrap())),
+                checkpoint: action.map(|(commit, content_root)| {
+                    let action = minimal_checkpoint_action("root.parquet", content_root).unwrap();
+                    (commit, action)
+                }),
+                last_manifest_commit: pointer
+                    .map(|(v, c)| (2, LastManifestCommit::new(v, c).unwrap())),
                 ..Default::default()
             };
-            assert_result_error_with_message(
-                candidate.validated_pointer(2),
-                "checkpoint action has content root version 0",
-            );
+            let result = candidate.validated_pointer(2);
+            match expected {
+                Ok(kept) => {
+                    let kept_version = result.unwrap().checkpoint.map(|(commit, _)| commit);
+                    assert_eq!(kept_version, kept);
+                }
+                Err(message) => assert_result_error_with_message(result, message),
+            }
         }
     }
 }

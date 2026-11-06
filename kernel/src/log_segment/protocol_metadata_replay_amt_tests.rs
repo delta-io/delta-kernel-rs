@@ -93,6 +93,7 @@ fn pointerless_pm_commit() -> String {
 }
 
 // The resolution of a replay that read the pointer `(version, content_root_version)`.
+#[cfg(feature = "declarative-plans")]
 fn resolved_pointer(version: i64, content_root_version: i64) -> LastManifestCommitResolution {
     LastManifestCommitResolution::Resolved(Some(
         LastManifestCommit::new(version, content_root_version).unwrap(),
@@ -1311,27 +1312,10 @@ async fn check_pointer_after_newest_commit<E: Engine>(
 // Replay reads the newest commit and the pointed manifest commit as their own files, not through
 // a log compaction covering them.
 #[rstest]
-#[case::follows_pointer(
-    vec![checkpoint_commit(1, &[], test_schema_flat_with_column_mapping()), commit_info(Some((1, 1)))],
-    test_schema_flat_with_column_mapping(),
-    resolved_pointer(1, 1),
-)]
 #[case::no_pointer(
     vec![pointerless_pm_commit(), commit_info(None), commit_info(None)],
     one_column_schema(),
     LastManifestCommitResolution::Unresolved,
-)]
-#[case::covers_manifest_commit_past_its_content_root(
-    vec![
-        carrying_pointer((0, 0), metadata_commit(test_schema_flat_with_column_mapping())),
-        carrying_pointer(
-            (2, 1),
-            checkpoint_action(1, &[], test_schema_flat_with_column_mapping()),
-        ),
-        commit_info(Some((2, 1))),
-    ],
-    test_schema_flat_with_column_mapping(),
-    resolved_pointer(2, 1),
 )]
 #[case::newest_commit_has_no_commit_info(
     vec![pointerless_pm_commit(), commit_info(None), txn_commit()],
@@ -1347,6 +1331,37 @@ async fn replay_reads_newest_commit_covered_by_compaction(
     assert_compacted_replay(&later_commits, &expected_schema, &expected, non_plan_engine).await;
     #[cfg(feature = "declarative-plans")]
     assert_compacted_replay(&later_commits, &expected_schema, &expected, |store| {
+        SyncEngine::new_with_store(store)
+    })
+    .await;
+}
+
+// A plan replay reads the pointed commit itself when a compaction covers it.
+// TODO(#2337): the imperative replay reads the compaction, which drops the pointed action.
+#[cfg(feature = "declarative-plans")]
+#[rstest]
+#[case::follows_pointer(
+    vec![checkpoint_commit(1, &[], test_schema_flat_with_column_mapping()), commit_info(Some((1, 1)))],
+    resolved_pointer(1, 1),
+)]
+#[case::covers_manifest_commit_past_its_content_root(
+    vec![
+        carrying_pointer((0, 0), metadata_commit(test_schema_flat_with_column_mapping())),
+        carrying_pointer(
+            (2, 1),
+            checkpoint_action(1, &[], test_schema_flat_with_column_mapping()),
+        ),
+        commit_info(Some((2, 1))),
+    ],
+    resolved_pointer(2, 1),
+)]
+#[tokio::test]
+async fn plan_replay_reads_pointed_commit_covered_by_compaction(
+    #[case] later_commits: Vec<String>,
+    #[case] expected: LastManifestCommitResolution,
+) {
+    let schema = test_schema_flat_with_column_mapping();
+    assert_compacted_replay(&later_commits, &schema, &expected, |store| {
         SyncEngine::new_with_store(store)
     })
     .await;
