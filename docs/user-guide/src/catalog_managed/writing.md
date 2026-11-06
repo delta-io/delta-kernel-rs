@@ -169,6 +169,19 @@ Publishing matters because:
   operate on published versions.
 - It reduces the number of commits the catalog needs to store and serve.
 
+## Writing after a downgrade
+
+Ordinary catalog-managed writes can leave publication to an asynchronous task. After a
+ratified downgrade, the next filesystem write must wait for publication. If the downgrading
+writer stops before publication, [`Transaction::commit`](https://docs.rs/delta_kernel/latest/delta_kernel/transaction/struct.Transaction.html#method.commit)
+can recover using the read Snapshot's retained staged suffix before invoking the filesystem
+committer. It checks published destinations and copies missing commits in version order.
+
+A retained staged path can name a commit that has already been published. Kernel preserves its
+published copy and does not rely on the Snapshot's cached publication watermark to skip recovery.
+A publication failure prevents the new commit. Your connector still handles any catalog-specific
+migration completion calls.
+
 ## Maintenance operations
 
 Once commits are published, you can perform maintenance operations on the published

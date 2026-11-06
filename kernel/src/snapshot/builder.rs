@@ -511,7 +511,6 @@ impl<Mode> SnapshotBuilder<Mode> {
         );
         // A non-catalog-managed protocol cannot distinguish a downgrade from an ordinary filesystem
         // commit. Trust the caller's catalog bound without reading another protocol.
-        // TODO(#3852): Enforce publication before filesystem writes in Transaction::commit.
         Ok(())
     }
 

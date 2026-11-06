@@ -87,8 +87,10 @@ impl StorageHandler for SyncStorageHandler {
         put_bytes(self.store.as_ref(), path, data, overwrite)
     }
 
-    fn copy_atomic(&self, _src: &Url, _dest: &Url) -> KernelResult<()> {
-        unimplemented!("SyncStorageHandler does not implement copy");
+    fn copy_atomic(&self, src: &Url, dest: &Url) -> KernelResult<()> {
+        let (store, _, path) = resolve_scope(self.store.as_ref(), src)?;
+        let bytes = futures::executor::block_on(async { store.get(&path).await?.bytes().await })?;
+        put_bytes(self.store.as_ref(), dest, bytes, false)
     }
 
     fn head(&self, url: &Url) -> KernelResult<FileMeta> {
@@ -115,10 +117,12 @@ impl StorageHandler for SyncStorageHandler {
 mod tests {
     use std::fs::File;
     use std::io::Write;
+    use std::sync::Arc;
     use std::time::Duration;
 
-    use bytes::{BufMut, BytesMut};
+    use bytes::{BufMut, Bytes, BytesMut};
     use itertools::Itertools;
+    use rstest::rstest;
     use url::Url;
 
     use super::SyncStorageHandler;
@@ -126,6 +130,52 @@ mod tests {
     use crate::object_store::memory::InMemory;
     use crate::utils::current_time_duration;
     use crate::{KernelError, StorageHandler};
+
+    #[rstest]
+    fn atomic_copy_preserves_existing_destination(#[values(false, true)] in_memory: bool) {
+        let dir = tempfile::tempdir().unwrap();
+        let (storage, root) = if in_memory {
+            (
+                SyncStorageHandler::new(Some(Arc::new(InMemory::new()))),
+                Url::parse("memory:///").unwrap(),
+            )
+        } else {
+            (
+                SyncStorageHandler::new(None),
+                Url::from_directory_path(dir.path()).unwrap(),
+            )
+        };
+        let src = root.join("staged/source.json").unwrap();
+        let dest = root.join("published.json").unwrap();
+        storage
+            .put(&src, Bytes::from_static(b"original"), false)
+            .unwrap();
+        storage.copy_atomic(&src, &dest).unwrap();
+        storage
+            .put(&src, Bytes::from_static(b"replacement"), true)
+            .unwrap();
+        assert!(matches!(
+            storage.copy_atomic(&src, &dest),
+            Err(KernelError::FileAlreadyExists(_))
+        ));
+        let read = |path| {
+            storage
+                .read_files(vec![(path, None)])
+                .unwrap()
+                .next()
+                .unwrap()
+                .unwrap()
+        };
+        assert_eq!(read(src), Bytes::from_static(b"replacement"));
+        assert_eq!(read(dest), Bytes::from_static(b"original"));
+        assert!(matches!(
+            storage.copy_atomic(
+                &root.join("missing.json").unwrap(),
+                &root.join("new.json").unwrap()
+            ),
+            Err(KernelError::FileNotFound(_))
+        ));
+    }
 
     /// generate json filenames that follow the spec (numbered padded to 20 chars)
     fn get_json_filename(index: usize) -> String {
