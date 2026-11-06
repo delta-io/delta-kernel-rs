@@ -177,7 +177,7 @@ mod tests {
     use crate::snapshot::Snapshot;
     use crate::transaction::create_table::create_table;
     use crate::unit_test_utils::adaptive_metadata_fixtures::{
-        adaptive_metadata_protocol_and_metadata, commit_info_line, domain, domain_metadata_line,
+        adaptive_metadata_protocol_and_metadata, domain, domain_metadata_line,
         minimal_checkpoint_action, setup_table, txn_line, write_commit,
         write_commit_after_manifest_commit, write_manifest_commit,
     };
@@ -279,34 +279,21 @@ mod tests {
 
     // === Log commits after the last checkpoint action ===
 
-    /// Computes the checkpoint action for a root manifest commit on a table whose manifest commit
-    /// at v2 has domain `a` = `1` and txn `app-1` = `5` in its checkpoint action, followed by
-    /// one log commit per entry of `log_commits`. With `set_in_log`, v1 also sets them as top-level
-    /// actions; otherwise the checkpoint action is their only copy, as after log cleanup.
-    fn compute_after_log_commits(
-        set_in_log: bool,
+    /// Commits a manifest whose checkpoint action holds `domains` and `txns`, then `log_commits`,
+    /// and computes the checkpoint action of the next root manifest commit.
+    fn checkpoint_action_after(
+        domains: Vec<DomainMetadata>,
+        txns: Vec<SetTransaction>,
         log_commits: &[String],
     ) -> KernelResult<CheckpointAction> {
         let (engine, table_root) = setup_table()?;
-        let base_domain = domain("a", "1");
-        let base_txn = SetTransaction::new("app-1".to_string(), 5, None);
-        let v1 = if set_in_log {
-            vec![
-                domain_metadata_line(base_domain.clone()),
-                txn_line("app-1", 5),
-            ]
-        } else {
-            vec![commit_info_line(1, None)]
-        };
-        let v1: Vec<_> = v1.iter().map(String::as_str).collect();
-        write_commit(&engine, &table_root, 1, parse_json_batch(v1.into()))?;
-        let mut checkpoint = minimal_checkpoint_action("metadata/root-v2.parquet", 2)?;
-        checkpoint.domain_metadata = vec![base_domain];
-        checkpoint.transactions = vec![base_txn];
-        write_manifest_commit(&engine, &table_root, 2, checkpoint)?;
-        for (version, action) in (3..).zip(log_commits) {
-            let data = parse_json_batch(vec![action.as_str()].into());
-            write_commit_after_manifest_commit(&engine, &table_root, version, 2, data)?;
+        let mut checkpoint = minimal_checkpoint_action("metadata/root-v1.parquet", 1)?;
+        checkpoint.domain_metadata = domains;
+        checkpoint.transactions = txns;
+        write_manifest_commit(&engine, &table_root, 1, checkpoint)?;
+        for (version, line) in (2..).zip(log_commits) {
+            let data = parse_json_batch(vec![line.as_str()].into());
+            write_commit_after_manifest_commit(&engine, &table_root, version, 1, data)?;
         }
         compute_at_latest(&engine, &table_root)
     }
@@ -328,9 +315,10 @@ mod tests {
 
     #[rstest]
     #[case::no_log_commits(vec![], vec![("a", "1")])]
-    #[case::adds_domain(vec![domain_metadata_line(domain("b", "1"))], vec![("a", "1"), ("b", "1")])]
-    #[case::updates_domain(vec![domain_metadata_line(domain("a", "2"))], vec![("a", "2")])]
-    #[case::removes_domain(
+    #[case::unrelated_log_commit(vec![txn_line("app", 1)], vec![("a", "1")])]
+    #[case::added(vec![domain_metadata_line(domain("b", "1"))], vec![("a", "1"), ("b", "1")])]
+    #[case::updated(vec![domain_metadata_line(domain("a", "2"))], vec![("a", "2")])]
+    #[case::removed(
         vec![domain_metadata_line(DomainMetadata::remove("a".into(), "1".into()))],
         vec![]
     )]
@@ -341,11 +329,11 @@ mod tests {
         ],
         vec![("a", "3")]
     )]
-    fn compute_checkpoint_action_applies_log_commit_domains_to_checkpoint(
+    fn compute_checkpoint_action_applies_log_commits_to_domain_metadata(
         #[case] log_commits: Vec<String>,
         #[case] expected: Vec<(&str, &str)>,
     ) -> KernelResult<()> {
-        let checkpoint = compute_after_log_commits(true, &log_commits)?;
+        let checkpoint = checkpoint_action_after(vec![domain("a", "1")], vec![], &log_commits)?;
         let domains: Vec<_> = checkpoint
             .domain_metadata
             .iter()
@@ -358,13 +346,15 @@ mod tests {
 
     #[rstest]
     #[case::no_log_commits(vec![], vec![("app-1", 5)])]
-    #[case::adds_app(vec![txn_line("app-2", 1)], vec![("app-1", 5), ("app-2", 1)])]
-    #[case::updates_app(vec![txn_line("app-1", 7)], vec![("app-1", 7)])]
-    fn compute_checkpoint_action_applies_log_commit_txns_to_checkpoint(
+    #[case::unrelated_log_commit(vec![domain_metadata_line(domain("a", "1"))], vec![("app-1", 5)])]
+    #[case::added(vec![txn_line("app-2", 1)], vec![("app-1", 5), ("app-2", 1)])]
+    #[case::updated(vec![txn_line("app-1", 7)], vec![("app-1", 7)])]
+    fn compute_checkpoint_action_applies_log_commits_to_txns(
         #[case] log_commits: Vec<String>,
         #[case] expected: Vec<(&str, i64)>,
     ) -> KernelResult<()> {
-        let checkpoint = compute_after_log_commits(true, &log_commits)?;
+        let txns = vec![SetTransaction::new("app-1".to_string(), 5, None)];
+        let checkpoint = checkpoint_action_after(vec![], txns, &log_commits)?;
         let txns: Vec<_> = checkpoint
             .transactions
             .iter()
@@ -372,34 +362,6 @@ mod tests {
             .sorted()
             .collect();
         assert_eq!(txns, expected);
-        Ok(())
-    }
-
-    #[test]
-    fn compute_checkpoint_action_keeps_checkpoint_only_domain_metadata_after_log_commit()
-    -> KernelResult<()> {
-        let checkpoint = compute_after_log_commits(false, &[txn_line("app-2", 1)])?;
-        assert_eq!(
-            checkpoint
-                .domain_metadata
-                .iter()
-                .map(|dm| (dm.domain(), dm.configuration()))
-                .collect_vec(),
-            [("a", "1")]
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn compute_checkpoint_action_keeps_checkpoint_only_txns_after_log_commit() -> KernelResult<()> {
-        let checkpoint = compute_after_log_commits(false, &[txn_line("app-2", 1)])?;
-        let txns = checkpoint
-            .transactions
-            .iter()
-            .map(|txn| (txn.app_id.as_str(), txn.version))
-            .sorted()
-            .collect_vec();
-        assert_eq!(txns, [("app-1", 5), ("app-2", 1)]);
         Ok(())
     }
 
