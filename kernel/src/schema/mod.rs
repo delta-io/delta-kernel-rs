@@ -2142,37 +2142,27 @@ impl Display for IntervalYearToMonthType {
     }
 }
 
-/// The supported qualifiers for Delta's day-time interval family.
+/// The supported ANSI qualifiers for Delta's day-time interval family.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum IntervalDayToSecondType {
-    /// ANSI `INTERVAL DAY`.
     #[serde(rename = "interval day")]
     IntervalDay,
-    /// ANSI `INTERVAL HOUR`.
     #[serde(rename = "interval hour")]
     IntervalHour,
-    /// ANSI `INTERVAL MINUTE`.
     #[serde(rename = "interval minute")]
     IntervalMinute,
-    /// ANSI `INTERVAL SECOND`.
     #[serde(rename = "interval second")]
     IntervalSecond,
-    /// ANSI `INTERVAL DAY TO HOUR`.
     #[serde(rename = "interval day to hour")]
     IntervalDayToHour,
-    /// ANSI `INTERVAL DAY TO MINUTE`.
     #[serde(rename = "interval day to minute")]
     IntervalDayToMinute,
-    /// ANSI `INTERVAL DAY TO SECOND`.
     #[serde(rename = "interval day to second")]
     IntervalDayToSecond,
-    /// ANSI `INTERVAL HOUR TO MINUTE`.
     #[serde(rename = "interval hour to minute")]
     IntervalHourToMinute,
-    /// ANSI `INTERVAL HOUR TO SECOND`.
     #[serde(rename = "interval hour to second")]
     IntervalHourToSecond,
-    /// ANSI `INTERVAL MINUTE TO SECOND`.
     #[serde(rename = "interval minute to second")]
     IntervalMinuteToSecond,
 }

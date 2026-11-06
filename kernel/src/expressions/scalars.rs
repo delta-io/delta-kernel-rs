@@ -110,7 +110,7 @@ pub struct IntervalDayTimeData {
 }
 
 impl IntervalDayTimeData {
-    /// Creates a day-time payload from microseconds and its qualifier.
+    /// Creates day-time data from microseconds and its qualifier.
     ///
     /// Returns an error when the microseconds contain a fraction of the qualifier's last unit.
     pub fn try_new(micros: i64, ty: IntervalDayToSecondType) -> KernelResult<Self> {
@@ -124,7 +124,7 @@ impl IntervalDayTimeData {
         Ok(Self { micros, ty })
     }
 
-    /// Returns the signed total-microsecond payload.
+    /// Returns the signed total microseconds for this `IntervalDayTimeData`.
     pub fn micros(&self) -> i64 {
         self.micros
     }
@@ -2179,7 +2179,17 @@ mod tests {
 
     #[rstest]
     fn interval_day_time_payload_requires_end_unit_alignment(
-        #[values(0, -1, 60_000_000, 3_600_000_000, 86_400_000_000, i64::MIN, i64::MAX)] micros: i64,
+        #[values(
+            0,
+            -1,
+            60_000_000,
+            60_000_001,
+            3_600_000_000,
+            86_400_000_000,
+            i64::MIN,
+            i64::MAX
+        )]
+        micros: i64,
         #[values(
             IntervalDayToSecondType::IntervalDay,
             IntervalDayToSecondType::IntervalHour,
@@ -2196,6 +2206,12 @@ mod tests {
     ) {
         let payload = IntervalDayTimeData::try_new(micros, dtype);
         let scalar = Scalar::interval_day_time(micros, dtype);
+        let serialized_data = serde_json::json!({ "micros": micros, "ty": dtype });
+        let deserialized_data =
+            serde_json::from_value::<IntervalDayTimeData>(serialized_data.clone());
+        let deserialized_scalar = serde_json::from_value::<Scalar>(
+            serde_json::json!({ "IntervalDayTime": serialized_data }),
+        );
         if micros % dtype.unit_micros() != 0 {
             assert!(matches!(
                 payload.unwrap_err(),
@@ -2205,15 +2221,27 @@ mod tests {
                 scalar.unwrap_err(),
                 KernelError::InvalidInterval(_)
             ));
+            assert!(
+                deserialized_data
+                    .unwrap_err()
+                    .to_string()
+                    .contains("not divisible")
+            );
+            assert!(
+                deserialized_scalar
+                    .unwrap_err()
+                    .to_string()
+                    .contains("not divisible")
+            );
             return;
         }
         let data = payload.unwrap();
+        let scalar = scalar.unwrap();
         assert_eq!(data.micros(), micros);
         assert_eq!(data.ty(), &dtype);
-        assert_eq!(
-            scalar.unwrap().data_type(),
-            DataType::interval_day_time(dtype)
-        );
+        assert_eq!(scalar.data_type(), DataType::interval_day_time(dtype));
+        assert_eq!(deserialized_data.unwrap(), data);
+        assert_eq!(deserialized_scalar.unwrap(), scalar);
     }
 
     #[rstest]
@@ -2223,28 +2251,6 @@ mod tests {
         let data = IntervalDayTimeData::from(micros);
         assert_eq!(data.micros(), micros);
         assert_eq!(data.ty(), &IntervalDayToSecondType::IntervalDayToSecond);
-    }
-
-    #[rstest]
-    #[case::day_positive(1, IntervalDayToSecondType::IntervalDay)]
-    #[case::day_negative(-1, IntervalDayToSecondType::IntervalDay)]
-    #[case::hour_negative(-1, IntervalDayToSecondType::IntervalHour)]
-    #[case::minute_positive(60_000_001, IntervalDayToSecondType::IntervalMinute)]
-    #[case::day_min(i64::MIN, IntervalDayToSecondType::IntervalDay)]
-    #[case::minute_max(i64::MAX, IntervalDayToSecondType::IntervalMinute)]
-    fn interval_day_time_deserialization_rejects_unaligned_end_units(
-        #[case] micros: i64,
-        #[case] ty: IntervalDayToSecondType,
-        #[values(false, true)] inside_scalar: bool,
-    ) {
-        let payload = serde_json::json!({ "micros": micros, "ty": ty });
-        let err = if inside_scalar {
-            serde_json::from_value::<Scalar>(serde_json::json!({ "IntervalDayTime": payload }))
-                .unwrap_err()
-        } else {
-            serde_json::from_value::<IntervalDayTimeData>(payload).unwrap_err()
-        };
-        assert!(err.to_string().contains("not divisible"));
     }
 
     #[rstest]
@@ -2328,86 +2334,26 @@ mod tests {
     }
 
     #[rstest]
-    #[case(
-        IntervalDayToSecondType::IntervalDay,
-        "INTERVAL '1' DAY",
-        Some(86_400_000_000)
-    )]
-    #[case(
-        IntervalDayToSecondType::IntervalHour,
-        "INTERVAL '26' HOUR",
-        Some(93_600_000_000)
-    )]
-    #[case(
-        IntervalDayToSecondType::IntervalMinute,
-        "INTERVAL '1563' MINUTE",
-        Some(93_780_000_000)
-    )]
-    #[case(
-        IntervalDayToSecondType::IntervalSecond,
-        "INTERVAL '93784.5' SECOND",
-        Some(93_784_500_000)
-    )]
-    #[case(
-        IntervalDayToSecondType::IntervalDayToHour,
-        "INTERVAL '1 02' DAY TO HOUR",
-        Some(93_600_000_000)
-    )]
-    #[case(
-        IntervalDayToSecondType::IntervalDayToMinute,
-        "INTERVAL '1 02:03' DAY TO MINUTE",
-        Some(93_780_000_000)
-    )]
-    #[case(
-        IntervalDayToSecondType::IntervalDayToSecond,
-        "INTERVAL '1 02:03:04.5' DAY TO SECOND",
-        Some(93_784_500_000)
-    )]
-    #[case(
-        IntervalDayToSecondType::IntervalHourToMinute,
-        "INTERVAL '26:03' HOUR TO MINUTE",
-        Some(93_780_000_000)
-    )]
-    #[case(
-        IntervalDayToSecondType::IntervalHourToSecond,
-        "INTERVAL '26:03:04.5' HOUR TO SECOND",
-        Some(93_784_500_000)
-    )]
-    #[case(
-        IntervalDayToSecondType::IntervalMinuteToSecond,
-        "INTERVAL '1563:04.5' MINUTE TO SECOND",
-        Some(93_784_500_000)
-    )]
-    #[case::day_as_hour(IntervalDayToSecondType::IntervalDay, "INTERVAL '24' HOUR", None)]
-    #[case::hour_as_day(IntervalDayToSecondType::IntervalHour, "INTERVAL '1' DAY", None)]
+    #[case::day_as_hour(IntervalDayToSecondType::IntervalDay, "INTERVAL '24' HOUR")]
+    #[case::hour_as_day(IntervalDayToSecondType::IntervalHour, "INTERVAL '1' DAY")]
     #[case::day_to_second_as_second(
         IntervalDayToSecondType::IntervalDayToSecond,
-        "INTERVAL '86400' SECOND",
-        None
+        "INTERVAL '86400' SECOND"
     )]
     #[case::minute_to_second_as_minute(
         IntervalDayToSecondType::IntervalMinuteToSecond,
-        "INTERVAL '1' MINUTE",
-        None
+        "INTERVAL '1' MINUTE"
     )]
-    fn interval_day_time_parser_requires_matching_qualifier(
+    fn interval_day_time_parser_rejects_cross_qualifier_literal(
         #[case] dtype: IntervalDayToSecondType,
         #[case] literal: &str,
-        #[case] expected_micros: Option<i64>,
     ) {
-        let result = PrimitiveType::interval_day_time(dtype).parse_scalar(literal);
-        match expected_micros {
-            Some(micros) => assert_eq!(
-                result.unwrap(),
-                Scalar::interval_day_time(micros, dtype).unwrap()
-            ),
-            None => {
-                let err = result.unwrap_err();
-                assert!(
-                    matches!(err, KernelError::ParseError(raw, ty) if raw == literal && ty == DataType::interval_day_time(dtype))
-                );
-            }
-        }
+        let err = PrimitiveType::interval_day_time(dtype)
+            .parse_scalar(literal)
+            .unwrap_err();
+        assert!(
+            matches!(err, KernelError::ParseError(raw, ty) if raw == literal && ty == DataType::interval_day_time(dtype))
+        );
     }
 
     #[test]
