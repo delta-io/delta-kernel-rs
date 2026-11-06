@@ -118,10 +118,11 @@ fn transform_struct(
             transformed_cols.len()
         )));
     }
-    Ok(StructArray::try_new(
+    Ok(StructArray::try_new_with_length(
         transformed_fields.into(),
         transformed_cols,
         nulls,
+        struct_array.len(),
     )?)
 }
 
