@@ -214,7 +214,7 @@ fn test_create_last_checkpoint_data() -> KernelResult<()> {
 
 /// TODO(#855): Merge copies and move to `test_utils`
 /// Create an in-memory store and return the store and the URL for the store's _delta_log directory.
-pub(super) fn new_in_memory_store() -> (Arc<InMemory>, Url) {
+pub(crate) fn new_in_memory_store() -> (Arc<InMemory>, Url) {
     (
         Arc::new(InMemory::new()),
         Url::parse("memory:///")
