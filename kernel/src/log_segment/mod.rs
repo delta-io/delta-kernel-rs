@@ -629,14 +629,7 @@ impl LogSegment {
             (None, None) => LogSegmentFiles::list(storage, &log_root, log_tail, None, None)?,
         };
 
-        let mut segment =
-            LogSegment::try_new(listed_files, log_root, time_travel_version, checkpoint_hint)?;
-        // Listing can observe published commits beyond the version selected by the supplied tail.
-        segment.listed.max_published_version = segment
-            .listed
-            .max_published_version
-            .map(|version| version.min(segment.end_version));
-        Ok(segment)
+        LogSegment::try_new(listed_files, log_root, time_travel_version, checkpoint_hint)
     }
 
     /// Constructs a [`LogSegment`] to be used for `TableChanges`. For a TableChanges between

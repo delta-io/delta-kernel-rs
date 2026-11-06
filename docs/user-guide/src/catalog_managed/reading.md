@@ -126,11 +126,6 @@ with the catalog bound when its commit is supplied in the catalog tail, or alrea
 published and omitted from that tail. An unpublished commit must remain available through
 the supplied tail or a retained Snapshot or complete hint. To discover later filesystem
 commits, refresh without the old bound.
-Reading the downgrade Snapshot doesn't establish that publication has completed for a
-subsequent filesystem write.
-
-Kernel does not enforce this publication barrier in `commit()`. Connectors must ensure
-that pending catalog commits are published before allowing a subsequent filesystem write.
 
 For a complete Unity Catalog example, see
 [Reading Unity Catalog tables](../unity_catalog/reading.md).

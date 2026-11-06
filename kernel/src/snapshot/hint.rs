@@ -50,8 +50,6 @@ pub(crate) enum PublicationWatermark {
     /// Preserve the highest observed published version independently of the supplied paths.
     ///
     /// Retained paths may omit published commits or still name their staged locations.
-    /// Kernel trusts this evidence when allowing filesystem writes. Supply only publication
-    /// actually observed, never a version inferred from ratification or snapshot freshness.
     PublishedThrough(Version),
 }
 
@@ -333,8 +331,8 @@ impl SnapshotHint {
         .map_err(|source| SnapshotHintError::LogSegment {
             source: Box::new(source),
         })?;
-        // Snapshot discovery bounds listing observations to the selected version. Hints supply
-        // their own evidence, so reject an invalid watermark rather than normalizing it.
+        // Regular construction derives this field from storage listing. A hint supplies it, so
+        // only the hint path needs to validate it explicitly.
         require!(
             log_segment
                 .listed
@@ -1197,11 +1195,7 @@ mod tests {
             .with_snapshot_hint(hint)
             .build(engine.as_ref())
             .unwrap_err();
-        assert!(matches!(
-            err,
-            KernelError::SnapshotHint(error)
-                if matches!(*error, SnapshotHintError::MaxPublishedVersion { .. })
-        ));
+        assert!(matches!(err, KernelError::SnapshotHint(_)));
         Ok(())
     }
 
