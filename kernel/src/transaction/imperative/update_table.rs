@@ -129,7 +129,7 @@ impl Transaction<UpdateTable, Imperative> {
     /// non-negative `baseRowId` and `defaultRowCommitVersion` in `fileConstantValues`.
     ///
     /// On commit, each matched file's add action carries `stats.tightBounds: false`, and
-    /// `stats.tightStats: false` when the file's stats carry `tightStats`.
+    /// `stats.tightStats: false` when the file's stats set `tightStats`.
     ///
     /// # Arguments
     ///
@@ -580,11 +580,13 @@ impl FilteredRowVisitor for DvMatchVisitor<'_> {
                 }
 
                 // Widen the tightness flags to false instead of recomputing the stats. Only
-                // adaptiveMetadata stats carry `tightStats`, so it is not added when absent.
+                // adaptiveMetadata stats set `tightStats`, and any non-null value promises
+                // microsecond timestamp bounds, so it is not added when absent or null.
                 let is_wide =
                     |flag| stats_obj.get(flag).and_then(serde_json::Value::as_bool) == Some(false);
                 let widen_bounds = !is_wide(TIGHT_BOUNDS);
-                let widen_stats = stats_obj.contains_key(TIGHT_STATS) && !is_wide(TIGHT_STATS);
+                let has_tight_stats = stats_obj.get(TIGHT_STATS).is_some_and(|v| !v.is_null());
+                let widen_stats = has_tight_stats && !is_wide(TIGHT_STATS);
                 let new_stats = if !widen_bounds && !widen_stats {
                     stats
                 } else {
@@ -712,6 +714,7 @@ mod tests {
     #[case::flags_absent(r#"{"numRecords":10}"#, None)]
     #[case::bounds_tight(r#"{"numRecords":10,"tightBounds":true}"#, None)]
     #[case::bounds_already_wide(r#"{"numRecords":10,"tightBounds":false}"#, None)]
+    #[case::stats_null(r#"{"numRecords":10,"tightBounds":true,"tightStats":null}"#, None)]
     #[case::stats_tight(
         r#"{"numRecords":10,"tightBounds":true,"tightStats":true}"#,
         Some(false)
