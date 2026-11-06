@@ -38,7 +38,7 @@ const IS_ADD: &str = "is_add";
 pub(crate) struct MetadataPlanner<'a> {
     pub(crate) segment: &'a LogSegment,
     pub(crate) actions: ActionSet,
-    pub(crate) checkpoint_shape: Option<CheckpointShape>,
+    pub(crate) checkpoint_shape: Option<Arc<CheckpointShape>>,
     pub(crate) stats: StatsOptions,
     pub(crate) partitions: PartitionValuesOptions,
     pub(crate) stats_schema: Option<SchemaRef>,
@@ -76,7 +76,7 @@ impl<'a> MetadataPlanner<'a> {
 
     pub(crate) fn with_checkpoint_shape(
         mut self,
-        checkpoint_shape: impl Into<Option<CheckpointShape>>,
+        checkpoint_shape: impl Into<Option<Arc<CheckpointShape>>>,
     ) -> Self {
         self.checkpoint_shape = checkpoint_shape.into();
         self
@@ -150,7 +150,7 @@ impl<'a> MetadataPlanner<'a> {
     /// JSON stats are retained or synthesized only when requested.
     /// Without tombstones, remove fields are omitted from the read, filter, and key.
     pub(crate) fn checkpoint_actions(&self) -> KernelResult<PlanBuilder> {
-        let checkpoint_shape = self.checkpoint_shape.as_ref();
+        let checkpoint_shape = self.checkpoint_shape.as_deref();
         self.build_metadata_plan(ActionSource::Checkpoint, checkpoint_shape, |schema| {
             sources::checkpoint_actions(self.segment, checkpoint_shape, self.actions, schema)
         })

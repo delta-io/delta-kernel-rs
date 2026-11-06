@@ -366,22 +366,24 @@ mod tests {
     #[cfg(feature = "declarative-plans")]
     #[test]
     fn declarative_scan_reports_expected_callstacks() {
+        // Given: a manifest checkpoint whose hinted sidecar schema needs a footer read.
         let events = capture(|| {
             let (engine, snapshot, _tempdir) =
                 load_test_table("v2-checkpoints-parquet-with-sidecars").unwrap();
             let scan = snapshot.scan_builder().build().unwrap();
+            // When: scan planning resolves its checkpoint inputs.
             scan.declarative_metadata_scan_plan(engine.as_ref())
                 .unwrap();
         });
         let callstacks = entered_callstacks(&events);
 
+        // Then: discovery and plan construction are both attributed to the scan.
         assert_contains_callstack(
             &callstacks,
             &[
                 "scan.declarative_metadata_scan_plan",
-                "checkpoint_shape.try_new_with_leaf_schema",
-                "checkpoint_shape.from_v2_checkpoint_hint",
-                "checkpoint_shape.try_new_manifest",
+                "checkpoint_shape.resolve",
+                "checkpoint_shape.read_parquet_footer_schema",
             ],
         );
         assert_contains_callstack(

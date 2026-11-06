@@ -1,5 +1,4 @@
-//! Utilities for reading the `_last_checkpoint` file. Maybe this file should instead go under
-//! log_segment module since it should only really be used there? as hint for listing?
+//! Utilities for reading and constructing portable `_last_checkpoint` metadata.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -30,6 +29,7 @@ const LAST_CHECKPOINT_FILE_NAME: &str = "_last_checkpoint";
 const LAST_CHECKPOINT_SIDECARS_THRESHOLD: usize = 30;
 const LAST_CHECKPOINT_NON_FILE_ACTIONS_THRESHOLD: usize = 30;
 
+/// Portable checkpoint metadata matching the fields of `_last_checkpoint`.
 // Note: Schema can not be derived because the checkpoint schema is only known at runtime.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[cfg_attr(test, derive(Default))]
@@ -220,7 +220,7 @@ impl LastCheckpointHint {
         self.version
     }
 
-    /// Returns the checkpoint action count.
+    /// Returns the checkpoint action count, or -1 when unknown.
     #[internal_api]
     #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
     pub(crate) fn size(&self) -> i64 {

@@ -109,8 +109,7 @@ use tracing::info;
 use url::Url;
 
 #[cfg(feature = "declarative-plans")]
-#[allow(unused_imports)]
-pub(crate) use crate::action_reconciliation::checkpoint_shape::{CheckpointShape, CheckpointType};
+pub(crate) use crate::action_reconciliation::checkpoint_shape::CheckpointType;
 use crate::action_reconciliation::file_metadata::{
     StatsTransformConfig, build_checkpoint_read_schema, build_checkpoint_transform,
 };
@@ -141,8 +140,12 @@ use crate::{
 };
 
 pub(crate) mod collation_stats;
+#[cfg(feature = "declarative-plans")]
+mod shape;
 mod sidecar;
 
+#[cfg(feature = "declarative-plans")]
+pub use shape::{CheckpointKind, CheckpointShape};
 use sidecar::{SidecarSplitter, SingleSidecarDataIterator, create_sidecar_action_batch};
 #[cfg(test)]
 pub(crate) mod tests;

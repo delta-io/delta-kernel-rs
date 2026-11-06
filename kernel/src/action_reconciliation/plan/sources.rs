@@ -43,9 +43,19 @@ pub(crate) fn checkpoint_actions(
         (true, None) => Err(KernelError::schema("File reads require a checkpoint shape")),
         (true, Some(CheckpointType::None)) => PlanBuilder::values(schema, vec![]),
         (true, Some(CheckpointType::Manifest)) => {
-            let sidecar_files = match segment.checkpoint_hint_version_tagged_sidecar_scan_files()? {
-                Some(sidecars) => PlanBuilder::scan_parquet(sidecars, &[VERSION], schema.clone()),
-                // Without a complete hint, load the sidecars referenced by the manifest.
+            let sidecar_files = match checkpoint_shape.and_then(|shape| shape.sidecars.as_ref()) {
+                Some(sidecars) => {
+                    let constants = parts
+                        .first()
+                        .map(|part| part.file_constants.clone())
+                        .unwrap_or_default();
+                    let sidecars = sidecars.iter().map(|file| ScanFile {
+                        meta: file.clone(),
+                        file_constants: constants.clone(),
+                    });
+                    PlanBuilder::scan_parquet(sidecars, &[VERSION], schema.clone())
+                }
+                // Without a complete list, load the sidecars referenced by the manifest.
                 None => {
                     sidecar_actions(file_type, parts.clone(), schema.clone(), &segment.log_root)
                 }
@@ -180,6 +190,7 @@ mod tests {
     use crate::engine::sync::SyncEngine;
     use crate::last_checkpoint_hint::{LastCheckpointHint, LastCheckpointV2};
     use crate::path::ParsedLogPath;
+    use crate::plans::ir::nodes::Operator;
     use crate::scan::StatsOptions;
     use crate::transaction::UpdateTableOperation;
     use crate::unit_test_utils::plans::execute_plan;
@@ -213,7 +224,9 @@ mod tests {
             }), false),
         )]
         checkpoint: (CheckpointSpec, bool),
+        #[values(false, true)] getter_first: bool,
     ) -> KernelResult<()> {
+        // Given: a checkpoint containing file actions, tombstones, and non-file actions.
         let (spec, use_sidecar_hint) = checkpoint;
         let mut features = FeatureSet::new().domain_metadata();
         if matches!(spec, CheckpointSpec::V2(_)) {
@@ -280,10 +293,6 @@ mod tests {
         );
 
         let snapshot = snapshot.checkpoint(&engine, Some(&spec))?.1;
-        let checkpoint_shape = actions
-            .live_adds
-            .then(|| CheckpointShape::try_new(engine.require_plan_executor()?.as_ref(), &snapshot))
-            .transpose()?;
         let mut segment = snapshot.log_segment().clone();
         // V2 hints identify UUID-named manifests; Kernel's writer uses classic naming.
         if matches!(spec, CheckpointSpec::V2(_)) {
@@ -328,12 +337,32 @@ mod tests {
             segment.checkpoint_hint_sidecars().is_some(),
             use_sidecar_hint
         );
-        let plan = MetadataPlanner::new(&segment, actions)
+        let snapshot = Snapshot::new(segment, snapshot.table_configuration().clone())?;
+        if getter_first {
+            snapshot.reader().get_checkpoint_info(&engine)?;
+        }
+        let checkpoint_shape = actions
+            .contains_content_actions()
+            .then(|| CheckpointShape::for_scan(&snapshot, &engine, false))
+            .transpose()?;
+
+        // When: selected checkpoint actions are planned from the same resolved shape.
+        let plan = MetadataPlanner::new(snapshot.log_segment(), actions)
             .with_stats(StatsOptions::json_only())
             .with_checkpoint_shape(checkpoint_shape)
             .checkpoint_actions()?
             .project_patch(|patch| patch.drop(ACTION_KEY))?
             .build()?;
+        // Then: only manifests without a complete list need dynamic sidecar discovery.
+        assert_eq!(
+            plan.nodes
+                .iter()
+                .any(|node| matches!(node.op, Operator::DynamicScan(_))),
+            matches!(spec, CheckpointSpec::V2(_))
+                && actions.contains_content_actions()
+                && !use_sidecar_hint
+                && !getter_first,
+        );
         assert_eq!(
             plan.schema
                 .fields()

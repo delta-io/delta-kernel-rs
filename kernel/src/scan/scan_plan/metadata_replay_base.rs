@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use super::MetadataPlanner;
 use crate::actions::Add;
 use crate::checkpoint::CheckpointShape;
@@ -10,7 +12,7 @@ pub(in crate::scan) enum MetadataReplayBase {
     /// Checkpoint replay base, or an empty base when no checkpoint exists.
     Checkpoint {
         version: Option<Version>,
-        shape: CheckpointShape,
+        shape: Arc<CheckpointShape>,
     },
 }
 
@@ -38,12 +40,8 @@ impl MetadataReplayBase {
 
         // Resolve the checkpoint shape once. The planner owns the decision to retain the file-
         // action schema; checkpoint discovery owns how that schema is obtained.
-        let plan_executor = engine.require_plan_executor()?;
-        let shape = if planner.requires_checkpoint_add_schema() {
-            CheckpointShape::try_new_with_leaf_schema(plan_executor.as_ref(), snapshot)?
-        } else {
-            CheckpointShape::try_new(plan_executor.as_ref(), snapshot)?
-        };
+        let shape =
+            CheckpointShape::for_scan(snapshot, engine, planner.requires_checkpoint_add_schema())?;
         Ok(Self::Checkpoint {
             version: checkpoint_version,
             shape,

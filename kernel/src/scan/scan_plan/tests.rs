@@ -269,27 +269,72 @@ fn declarative_metadata_matches_imperative_scan(
 #[rstest]
 #[case::parquet_manifest("v2-checkpoints-parquet-with-sidecars")]
 #[case::json_manifest("v2-checkpoints-json-with-sidecars")]
-fn declarative_metadata_scans_sidecars_from_checkpoint_hint(#[case] table: &str) -> Result<()> {
+#[case::single_json_sidecar("v2-json-sidecars-struct-stats-only")]
+#[case::single_parquet_sidecar("v2-parquet-sidecars-struct-stats-only")]
+#[case::classic_named_manifest("v2-classic-checkpoint-parquet")]
+fn declarative_metadata_reuses_complete_lists_or_discovers_sidecars_dynamically(
+    #[case] table: &str,
+    #[values(false, true)] remove_hint: bool,
+    #[values(false, true)] getter_first: bool,
+) -> Result<()> {
+    // Given: a manifest with optional writer hints and optional completed getter state.
     let (engine, snapshot, _tempdir) = crate::unit_test_utils::load_test_table(table)?;
-    let plan = snapshot
-        .scan_builder()
-        .build()?
+    let mut segment = snapshot.log_segment().clone();
+    if remove_hint {
+        segment.last_checkpoint_metadata = None;
+    }
+    let has_sidecar_hint = segment.checkpoint_hint_sidecars().is_some();
+    // Exercise checkpoint planning independently of any eligible CRC in the fixture.
+    let snapshot = Arc::new(Snapshot::new(
+        segment,
+        snapshot.table_configuration().clone(),
+    )?);
+    if getter_first {
+        snapshot.reader().get_checkpoint_info(engine.as_ref())?;
+    }
+    let scan = snapshot.clone().scan_builder().build()?;
+
+    // When: the scan plans before any remaining metadata resolution.
+    let plan = scan
         .declarative_metadata_scan_plan(engine.as_ref())?
         .expect("metadata plan");
 
-    assert!(
+    // Then: only unhinted, unresolved manifests need dynamic discovery; planning fills no cache.
+    assert_eq!(
         plan.nodes
             .iter()
-            .all(|node| !matches!(&node.op, Operator::DynamicScan(_)))
+            .any(|node| matches!(&node.op, Operator::DynamicScan(_))),
+        !has_sidecar_hint && !getter_first
     );
-    assert!(plan.nodes.iter().any(|node| {
-        let Operator::ScanParquet(scan) = &node.op else {
-            return false;
-        };
-        scan.files
-            .iter()
-            .any(|file| file.meta.location.path().contains("/_sidecars/"))
-    }));
+    assert_eq!(snapshot.cached_checkpoint_info().is_some(), getter_first);
+    let actual_metadata = declarative_metadata(&scan, engine.as_ref())?;
+
+    // When: the getter resolves a complete layout and the scan plans again.
+    snapshot.reader().get_checkpoint_info(engine.as_ref())?;
+    let expected_metadata = declarative_metadata(&scan, engine.as_ref())?;
+
+    // Then: scan results are unchanged and its static files match the complete sidecar list.
+    assert_metadata_eq(&actual_metadata, &expected_metadata, table)?;
+
+    let resolved = snapshot
+        .reader()
+        .get_checkpoint_info(engine.as_ref())?
+        .unwrap();
+    let expected = resolved.sidecars.as_ref().unwrap();
+    let plan = scan
+        .declarative_metadata_scan_plan(engine.as_ref())?
+        .unwrap();
+    let actual: Vec<_> = plan
+        .nodes
+        .iter()
+        .flat_map(|node| match &node.op {
+            Operator::ScanParquet(scan) => {
+                scan.files.iter().map(|file| file.meta.clone()).collect()
+            }
+            _ => vec![],
+        })
+        .collect();
+    assert_eq!(actual.as_slice(), expected.as_ref());
     Ok(())
 }
 

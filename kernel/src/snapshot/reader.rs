@@ -1,11 +1,15 @@
 //! Access to snapshot metadata that may require storage reads.
 
 use std::collections::HashSet;
+#[cfg(feature = "declarative-plans")]
+use std::sync::Arc;
 
 use delta_kernel_derive::internal_api;
 
 use super::Snapshot;
 use crate::actions::DomainMetadata;
+#[cfg(feature = "declarative-plans")]
+use crate::checkpoint::CheckpointShape;
 use crate::clustering::ClusteringColumnInfo;
 use crate::engine::CancellableEngine;
 use crate::expressions::ColumnName;
@@ -55,6 +59,42 @@ pub struct SnapshotReader<'a> {
 mod tests;
 
 impl<'a> SnapshotReader<'a> {
+    /// Returns metadata for the selected checkpoint, or `None` when no checkpoint was selected.
+    ///
+    /// The returned info has a resolved kind, leaf schema, leaf count, exact byte total, and
+    /// portable hint. In that hint, the action count is -1 when unknown; the root schema and
+    /// bounded action lists may be absent. The derived hint has no checksum. Only UUID-named
+    /// checkpoints carry `v2Checkpoint`, even when a classic-named checkpoint references
+    /// sidecars. The portable hint contains no resolved layout and does not establish complete
+    /// metadata when deserialized.
+    ///
+    /// The first call resolves the complete leaf schema and sidecar list through the engine's
+    /// plan executor. Successful results are shared with subsequent readers and scan planning;
+    /// failures are retried on the next call. Construction and hint export do not trigger this
+    /// read. Scan planning can reuse a completed result but does not initialize this cache; a
+    /// preceding scan may have already probed the same files. Reloads and updates that replace
+    /// the log segment resolve independently. Concurrent getters wait for in-progress
+    /// initialization. Neither that wait nor executor reads observe this reader's cancellation
+    /// token; reads use the executor's own cancellation behavior.
+    /// During initialization, the plan executor must not call this getter recursively on the same
+    /// snapshot: the recursive call would wait for the initialization already in progress.
+    /// Adaptive-metadata tables are unsupported.
+    #[cfg(feature = "declarative-plans")]
+    pub fn get_checkpoint_info(
+        &self,
+        engine: &dyn Engine,
+    ) -> KernelResult<Option<Arc<CheckpointShape>>> {
+        self.read(engine, |snapshot, engine| {
+            #[cfg(feature = "adaptive-metadata-in-dev")]
+            if snapshot.has_adaptive_metadata() {
+                return Err(crate::KernelError::unsupported(
+                    "Checkpoint info does not support adaptive metadata",
+                ));
+            }
+            snapshot.checkpoint_info(engine)
+        })
+    }
+
     /// Sets the cancellation token for this reader's handler-backed reads.
     ///
     /// Each call replaces the reader's token binding. Passing `None` clears an existing binding.

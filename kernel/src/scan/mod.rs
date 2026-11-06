@@ -1421,9 +1421,13 @@ impl Scan {
     #[cfg(feature = "declarative-plans")]
     /// Builds a declarative plan that produces the scan's live `add` actions.
     ///
-    /// `engine` supplies the plan executor used to inspect checkpoint shape unless a CRC at least
-    /// as new as the checkpoint provides `allFiles`. Returns `None` when no Delta metadata matches
-    /// this scan.
+    /// Planning reuses completed metadata from
+    /// [`crate::snapshot::SnapshotReader::get_checkpoint_info`] when available. Otherwise, it
+    /// probes checkpoint topology and reads a leaf schema only if needed, without populating
+    /// the snapshot's checkpoint-info cache. Without a complete sidecar list, the plan
+    /// discovers sidecars during execution. A CRC at least as new as the checkpoint
+    /// with `allFiles`, or a statically empty scan, skips checkpoint discovery. Returns `None` when
+    /// no Delta metadata matches this scan.
     ///
     /// This method returns the metadata plan without executing it. A connector that consumes the
     /// resulting live `add` rows may run the plan through the generic
