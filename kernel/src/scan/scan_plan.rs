@@ -19,8 +19,7 @@ use crate::actions::{
 use crate::checkpoint::collation_stats::source_collation_stats;
 use crate::checkpoint::{CheckpointShape, CheckpointType};
 use crate::expressions::{
-    ColumnName, Expression as Expr, Predicate, UnaryExpressionOp, col, column_name, expr,
-    joined_column_expr, lit,
+    ColumnName, Expression as Expr, Predicate, col, column_name, expr, joined_column_expr, lit,
 };
 use crate::log_segment::LogSegment;
 use crate::plans::ir::nodes::{DynamicScan, FileType, ScanFile};
@@ -295,8 +294,10 @@ impl<'a> MetadataPlanner<'a> {
                 StatsKind::Struct | StatsKind::Both => {
                     if stats == StatsKind::Struct && self.scan.stats.synthesize_json {
                         let field = StructField::nullable(STATS, DataType::STRING);
-                        let expr =
-                            Expr::unary(UnaryExpressionOp::ToJson, col!(ADD_NAME, STATS_PARSED));
+                        let expr = Expr::unary(
+                            self.scan.state_info.stats_json_op(),
+                            col!(ADD_NAME, STATS_PARSED),
+                        );
                         // Match ADD_SCHEMA's field order without moving native structured stats.
                         patch = patch.insert_after_at([ADD_NAME], "dataChange", field, expr)
                     }
