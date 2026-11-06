@@ -333,8 +333,8 @@ impl SnapshotHint {
         .map_err(|source| SnapshotHintError::LogSegment {
             source: Box::new(source),
         })?;
-        // Regular construction derives this field from storage listing. A hint supplies it, so
-        // only the hint path needs to validate it explicitly.
+        // Snapshot discovery bounds listing observations to the selected version. Hints supply
+        // their own evidence, so reject an invalid watermark rather than normalizing it.
         require!(
             log_segment
                 .listed
@@ -1197,7 +1197,11 @@ mod tests {
             .with_snapshot_hint(hint)
             .build(engine.as_ref())
             .unwrap_err();
-        assert!(matches!(err, KernelError::SnapshotHint(_)));
+        assert!(matches!(
+            err,
+            KernelError::SnapshotHint(error)
+                if matches!(*error, SnapshotHintError::MaxPublishedVersion { .. })
+        ));
         Ok(())
     }
 
@@ -1494,6 +1498,7 @@ mod tests {
             .with_snapshot_hint(snapshot.to_snapshot_hint()?)
             .build(engine.as_ref())?;
         assert_eq!(originally_latest.version(), 1);
+        // TODO(#3779): Derive hint freshness from the request when its catalog bound is newer.
         assert!(originally_latest.is_built_as_latest());
         Ok(())
     }

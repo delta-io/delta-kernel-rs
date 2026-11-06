@@ -129,14 +129,8 @@ commits, refresh without the old bound.
 Reading the downgrade Snapshot doesn't establish that publication has completed for a
 subsequent filesystem write.
 
-Filesystem commits return `KernelError::UnpublishedVersion` when retained catalog commits
-lack observed publication. Your connector must publish the downgrade before retrying.
-`Snapshot::publish()` doesn't support pending publication on a non-catalog-managed Snapshot.
-After publication, refresh with `Snapshot::builder_from(snapshot).build(engine)` or
-`Snapshot::builder_for(path).build(engine)`, without an explicit version or catalog bound.
-Exact cached reuse and incremental refreshes with `skip_new_checkpoints()` can retain stale
-publication evidence and continue rejecting the write. Ordinary catalog-managed writes
-can leave publication pending.
+Kernel does not enforce this publication barrier in `commit()`. Connectors must ensure
+that pending catalog commits are published before allowing a subsequent filesystem write.
 
 For a complete Unity Catalog example, see
 [Reading Unity Catalog tables](../unity_catalog/reading.md).

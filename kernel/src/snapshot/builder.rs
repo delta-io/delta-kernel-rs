@@ -1206,68 +1206,295 @@ pub(super) mod tests {
         }
 
         #[rstest]
+        #[case::fresh(None, 2, None)]
+        #[case::fresh_checkpoint(None, 2, Some(1))]
+        #[case::fresh_checkpoint_at_end(None, 2, Some(2))]
+        #[case::reuse_zero(Some(0), 0, None)]
+        #[case::reuse_zero_checkpoint(Some(0), 0, Some(0))]
+        #[case::reuse(Some(2), 2, None)]
+        #[case::reuse_checkpoint(Some(2), 2, Some(1))]
+        #[case::reuse_checkpoint_at_end(Some(2), 2, Some(2))]
+        #[case::advance(Some(1), 2, None)]
+        #[case::advance_checkpoint_at_base(Some(1), 2, Some(1))]
+        #[case::rebuild_checkpoint_ahead(Some(1), 2, Some(2))]
         #[test_log::test(tokio::test(flavor = "multi_thread"))]
-        async fn test_reused_snapshot_caps_publication_at_selected_version(
-            #[values(0, 1)] selected_version: Version,
-            #[values(1, 2)] filesystem_latest: Version,
-            #[values(false, true)] checkpointed: bool,
+        async fn test_snapshot_caps_publication_at_selected_version(
+            #[case] base_version: Option<Version>,
+            #[case] selected_version: Version,
+            #[case] checkpoint_version: Option<Version>,
+            #[values(0, 1)] newer_filesystem_commits: Version,
+            #[values(false, true)] explicit_target: bool,
+            #[values(false, true)] catalog_bound: bool,
         ) -> KernelResult<(), Box<dyn std::error::Error>> {
             let (engine, store, table_root) = setup_test();
             let engine = MeteredDeltaEngine::new(engine);
-            create_table(&store, &table_root).await?;
-            if checkpointed {
-                SnapshotBuilder::new_for(&table_root)
-                    .at_version(0)
-                    .build(&engine)?
-                    .checkpoint(&engine, None)?;
-            }
-            let base = SnapshotBuilder::new_for(&table_root)
-                .with_max_catalog_version(selected_version)
-                .build(&engine)?;
-            if filesystem_latest > 1 {
+            add_commit(
+                &table_root,
+                store.as_ref(),
+                0,
+                actions_to_string(vec![TestAction::Metadata]),
+            )
+            .await?;
+            for version in 1..=selected_version + newer_filesystem_commits {
                 add_commit(
                     &table_root,
                     store.as_ref(),
-                    filesystem_latest,
-                    actions_to_string(vec![TestAction::Add("newer.parquet".into())]),
+                    version,
+                    actions_to_string(vec![TestAction::Add(format!("file_{version}.parquet"))]),
                 )
                 .await?;
+            }
+            let base = base_version
+                .map(|version| {
+                    SnapshotBuilder::new_for(&table_root)
+                        .with_max_catalog_version(version)
+                        .build(&engine)
+                })
+                .transpose()?;
+            if let Some(version) = checkpoint_version {
+                SnapshotBuilder::new_for(&table_root)
+                    .at_version(version)
+                    .build(&engine)?
+                    .checkpoint(&engine, None)?;
             }
             let tail = vec![create_log_path(
                 &table_root,
                 test_utils::delta_path_for_version(selected_version, "json"),
             )];
             let (reporter, _guard) = measuring_reporter();
-            let reused = SnapshotBuilder::new_from(base.clone())
-                .with_log_tail(tail)
-                .build(&engine)?;
-            assert_eq!(reused.version(), selected_version);
+            let target = explicit_target.then_some(selected_version);
+            let bound = catalog_bound.then_some(selected_version);
+            let snapshot = if let Some(base) = &base {
+                SnapshotBuilder::new_from(base.clone())
+                    .with_log_tail(tail)
+                    .fold_with(target, SnapshotBuilder::at_version)
+                    .fold_with(bound, SnapshotBuilder::with_max_catalog_version)
+                    .build(&engine)?
+            } else {
+                SnapshotBuilder::new_for(&table_root)
+                    .with_log_tail(tail)
+                    .fold_with(target, SnapshotBuilder::at_version)
+                    .fold_with(bound, SnapshotBuilder::with_max_catalog_version)
+                    .build(&engine)?
+            };
+            assert_eq!(snapshot.version(), selected_version);
             assert_eq!(
-                reused.log_segment.listed.max_published_version,
+                snapshot.log_segment.listed.max_published_version,
                 Some(selected_version)
             );
-            assert_eq!(
-                base.log_segment.listed.max_published_version,
-                Some(selected_version)
-            );
-            assert!(Arc::ptr_eq(&base, &reused));
+            if let Some(base) = &base {
+                assert_eq!(base.log_segment.listed.max_published_version, base_version);
+                if base_version == Some(selected_version) && checkpoint_version.is_none() {
+                    assert!(Arc::ptr_eq(base, &snapshot));
+                }
+            }
             let hinted = SnapshotBuilder::new_for(&table_root)
-                .with_snapshot_hint(reused.to_snapshot_hint()?)
+                .at_version(selected_version)
+                .with_snapshot_hint(snapshot.to_snapshot_hint()?)
                 .build(&engine)?;
-            assert_eq!(hinted.log_segment.listed, reused.log_segment.listed);
+            assert_eq!(hinted.log_segment.listed, snapshot.log_segment.listed);
+            let exact_reuse =
+                base_version == Some(selected_version) && (explicit_target || catalog_bound);
             assert_eq!(
                 reporter
                     .events()
                     .iter()
                     .filter(|event| matches!(event, MetricEvent::StorageListCompleted(_)))
                     .count(),
+                usize::from(!exact_reuse)
+            );
+            if exact_reuse
+                || (base_version == Some(selected_version) && checkpoint_version.is_none())
+            {
+                assert!(!reporter.events().iter().any(|event| matches!(
+                    event,
+                    MetricEvent::JsonReadCompleted(_) | MetricEvent::ParquetReadCompleted(_)
+                )));
+            }
+            hinted.checkpoint(&engine, None)?;
+            Ok(())
+        }
+
+        #[rstest]
+        #[test_log::test(tokio::test(flavor = "multi_thread"))]
+        async fn test_checkpoint_rebuild_retains_publication_after_log_cleanup(
+            #[values(None, Some(0))] base_checkpoint: Option<Version>,
+            #[values(false, true)] staged_tail: bool,
+        ) -> KernelResult<(), Box<dyn std::error::Error>> {
+            let (engine, store, table_root) = setup_catalog_managed_test().await;
+            add_commit(
+                &table_root,
+                store.as_ref(),
+                1,
+                actions_to_string(vec![TestAction::Add("file_1.parquet".into())]),
+            )
+            .await?;
+            if let Some(version) = base_checkpoint {
+                SnapshotBuilder::new_for(&table_root)
+                    .at_version(version)
+                    .build(engine.as_ref())?
+                    .checkpoint(engine.as_ref(), None)?;
+            }
+            let base = SnapshotBuilder::new_for(&table_root)
+                .at_version(1)
+                .build(engine.as_ref())?;
+            add_commit(
+                &table_root,
+                store.as_ref(),
+                2,
+                actions_to_string(vec![TestAction::Add("file_2.parquet".into())]),
+            )
+            .await?;
+            SnapshotBuilder::new_for(&table_root)
+                .at_version(2)
+                .build(engine.as_ref())?
+                .checkpoint(engine.as_ref(), None)?;
+            for version in 0..=2 {
+                store
+                    .delete(&test_utils::delta_path_for_version(version, "json"))
+                    .await?;
+            }
+            let mut builder = SnapshotBuilder::new_from(base.clone())
+                .with_max_catalog_version(if staged_tail { 3 } else { 2 });
+            if staged_tail {
+                let staged = add_staged_commit(
+                    &table_root,
+                    store.as_ref(),
+                    3,
+                    actions_to_string(vec![TestAction::Add("file_3.parquet".into())]),
+                )
+                .await?;
+                builder = builder.with_log_tail(vec![create_log_path(&table_root, staged)]);
+            }
+            let snapshot = builder.build(engine.as_ref())?;
+            assert_eq!(snapshot.version(), if staged_tail { 3 } else { 2 });
+            assert_eq!(snapshot.log_segment.checkpoint_version, Some(2));
+            assert_eq!(snapshot.log_segment.listed.max_published_version, Some(1));
+            assert_eq!(base.log_segment.listed.max_published_version, Some(1));
+            assert_eq!(
+                snapshot
+                    .log_segment
+                    .get_unpublished_catalog_commits()?
+                    .len(),
+                usize::from(staged_tail)
+            );
+            let hinted = SnapshotBuilder::new_for(&table_root)
+                .at_version(snapshot.version())
+                .with_snapshot_hint(snapshot.to_snapshot_hint()?)
+                .build(engine.as_ref())?;
+            assert_eq!(hinted.log_segment.listed, snapshot.log_segment.listed);
+            assert!(matches!(
+                hinted.log_segment.validate_published(),
+                Err(KernelError::UnpublishedVersion(2))
+            ));
+            Ok(())
+        }
+
+        #[rstest]
+        #[test_log::test(tokio::test(flavor = "multi_thread"))]
+        async fn test_downgrade_publication_refresh_preserves_snapshot_and_hint(
+            #[values(false, true)] checkpointed: bool,
+            #[values(false, true)] incremental: bool,
+            #[values(false, true)] from_hint: bool,
+        ) -> KernelResult<(), Box<dyn std::error::Error>> {
+            let (engine, store, table_root) = setup_catalog_managed_test().await;
+            let engine = MeteredDeltaEngine::new(engine);
+            if checkpointed {
+                SnapshotBuilder::new_for(&table_root)
+                    .with_max_catalog_version(0)
+                    .build(&engine)?
+                    .checkpoint(&engine, None)?;
+            }
+            let downgrade = json!({
+                "protocol": Protocol::try_new_modern(
+                    std::iter::empty::<TableFeature>(),
+                    [TableFeature::InCommitTimestamp],
+                )?
+            })
+            .to_string();
+            let staged =
+                add_staged_commit(&table_root, store.as_ref(), 1, downgrade.clone()).await?;
+            let snapshot = SnapshotBuilder::new_for(&table_root)
+                .with_log_tail(vec![create_log_path(&table_root, staged)])
+                .with_max_catalog_version(1)
+                .build(&engine)?;
+            let snapshot = if from_hint {
+                SnapshotBuilder::new_for(&table_root)
+                    .with_snapshot_hint(snapshot.to_snapshot_hint()?)
+                    .build(&engine)?
+            } else {
+                snapshot
+            };
+            assert_eq!(
+                snapshot
+                    .log_segment
+                    .get_unpublished_catalog_commits()?
+                    .len(),
                 1
             );
+            let unchanged = SnapshotBuilder::new_from(snapshot.clone()).build(&engine)?;
+            assert!(Arc::ptr_eq(&unchanged, &snapshot));
+
+            add_commit(&table_root, store.as_ref(), 1, downgrade).await?;
+            let (reporter, _guard) = measuring_reporter();
+            let pinned = SnapshotBuilder::new_from(snapshot.clone())
+                .at_version(1)
+                .build(&engine)?;
+            assert!(Arc::ptr_eq(&pinned, &snapshot));
             assert!(!reporter.events().iter().any(|event| matches!(
                 event,
-                MetricEvent::JsonReadCompleted(_) | MetricEvent::ParquetReadCompleted(_)
+                MetricEvent::StorageListCompleted(_)
+                    | MetricEvent::StorageReadCompleted(_)
+                    | MetricEvent::JsonReadCompleted(_)
+                    | MetricEvent::ParquetReadCompleted(_)
             )));
-            hinted.checkpoint(&engine, None)?;
+            let skipped = SnapshotBuilder::new_from(snapshot.clone())
+                .skip_new_checkpoints()
+                .build(&engine)?;
+            assert_eq!(skipped.log_segment.listed.max_published_version, Some(0));
+            let events_before_refresh = reporter.events().len();
+            let refreshed = if incremental {
+                SnapshotBuilder::new_from(snapshot.clone()).build(&engine)?
+            } else {
+                SnapshotBuilder::new_for(&table_root).build(&engine)?
+            };
+            assert_eq!(refreshed.version(), snapshot.version());
+            assert_eq!(snapshot.log_segment.listed.max_published_version, Some(0));
+            assert_eq!(refreshed.log_segment.listed.max_published_version, Some(1));
+            assert!(
+                refreshed
+                    .log_segment
+                    .get_unpublished_catalog_commits()?
+                    .is_empty()
+            );
+            if incremental {
+                assert_eq!(
+                    refreshed.log_segment.listed.ascending_commit_files,
+                    snapshot.log_segment.listed.ascending_commit_files
+                );
+                let events = reporter.events();
+                let refresh_events = &events[events_before_refresh..];
+                assert_eq!(
+                    refresh_events
+                        .iter()
+                        .filter(|event| matches!(event, MetricEvent::StorageListCompleted(_)))
+                        .count(),
+                    1
+                );
+                assert!(!refresh_events.iter().any(|event| matches!(
+                    event,
+                    MetricEvent::StorageReadCompleted(_)
+                        | MetricEvent::JsonReadCompleted(_)
+                        | MetricEvent::ParquetReadCompleted(_)
+                )));
+            }
+            let reused = SnapshotBuilder::new_from(refreshed.clone()).build(&engine)?;
+            assert!(Arc::ptr_eq(&reused, &refreshed));
+            let hinted = SnapshotBuilder::new_for(&table_root)
+                .with_snapshot_hint(refreshed.to_snapshot_hint()?)
+                .build(&engine)?;
+            assert_eq!(hinted.log_segment.listed, refreshed.log_segment.listed);
+            hinted.log_segment.validate_published()?;
             Ok(())
         }
 

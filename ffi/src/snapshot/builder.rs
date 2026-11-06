@@ -164,7 +164,10 @@ pub unsafe extern "C" fn snapshot_builder_with_incremental_crc_replay(
     builder.into()
 }
 
-/// Set the log tail on a snapshot builder for catalog-managed tables.
+/// Set the catalog-supplied log tail on a snapshot builder.
+///
+/// Staged commits must be ratified by the managing catalog. The caller is responsible for
+/// obtaining this authoritative tail. Discovering a staged file does not establish ratification.
 ///
 /// # Errors
 ///
@@ -190,8 +193,7 @@ pub unsafe extern "C" fn snapshot_builder_with_log_tail(
     unsafe { result.into_extern_result(&engine_ref) }
 }
 
-/// Set the max catalog version on a snapshot builder for catalog-managed tables. This bounds the
-/// snapshot version to what the catalog has ratified.
+/// Bound the snapshot version to what the catalog has ratified.
 ///
 /// Without an explicit target, this selects the catalog version even when the resulting snapshot
 /// is non-catalog-managed, such as a ratified downgrade. Publication is not required, provided

@@ -76,18 +76,6 @@ impl<STATE> Transaction<STATE, Imperative> {
     ///
     /// `ALTER TABLE` returns a validation error if any data-file batches or manifest writes are
     /// staged. Empty or fully unselected data-file batches are also rejected.
-    ///
-    /// Catalog-managed commits can leave publication pending. After a ratified downgrade, the
-    /// next path-based commit cannot proceed until the downgrade commit has been published.
-    /// Path-based commits return [`KernelError::UnpublishedVersion`] if a retained catalog commit
-    /// is not known published. The connector must publish the downgrade outside this method.
-    /// [`Snapshot::publish`](crate::Snapshot::publish) does not support pending publication on
-    /// non-catalog-managed snapshots.
-    /// Then rebuild the read snapshot without an explicit version or catalog bound, using
-    /// `Snapshot::builder_from(snapshot).build(engine)` or
-    /// `Snapshot::builder_for(path).build(engine)`. Exact cached reuse and incremental
-    /// refreshes with `skip_new_checkpoints()` can retain stale publication evidence. This
-    /// method does not publish pending commits or wait for publication.
     #[instrument(
         parent = &self.span,
         name = TRANSACTION_COMMIT_SPAN,

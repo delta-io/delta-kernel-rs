@@ -405,6 +405,13 @@ impl Snapshot {
                  older than the existing snapshot version {existing_snapshot_version}"
             )));
         }
+        // Preserve publication evidence across checkpoint rebuilds even after old JSON files
+        // have been cleaned up, and bound listing observations to the selected snapshot.
+        new_log_segment.listed.max_published_version = new_log_segment
+            .listed
+            .max_published_version
+            .max(existing_log_segment.listed.max_published_version)
+            .map(|version| version.min(new_end_version));
         if let Some(new_checkpoint_version) = new_log_segment.checkpoint_version
             && new_checkpoint_version > existing_snapshot_version
         {
@@ -511,10 +518,7 @@ impl Snapshot {
                 // with no new checkpoint), so the new listing's `latest_commit_file` is always
                 // `Some(commit @ new_end_version)` and matches the combined snapshot version.
                 latest_commit_file: new_latest_commit_file,
-                max_published_version: new_log_segment
-                    .listed
-                    .max_published_version
-                    .max(existing_log_segment.listed.max_published_version),
+                max_published_version: new_log_segment.listed.max_published_version,
             },
             log_root,
             requested_version,
