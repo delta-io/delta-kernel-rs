@@ -10,8 +10,10 @@ use rstest::rstest;
 use test_utils::compacted_log_path_for_versions;
 use test_utils::{add_commit, assert_result_error_with_message, delta_path_for_version};
 
+use super::LastManifestCommitResolution;
+#[cfg(feature = "declarative-plans")]
+use super::LogSegment;
 use super::tests::{add_checkpoint_to_store, latest_log_segment};
-use super::{LastManifestCommitResolution, LogSegment};
 #[cfg(feature = "declarative-plans")]
 use crate::KernelResult;
 use crate::actions::{CheckpointAction, ContentRoot, LastManifestCommit, Protocol};
