@@ -11,9 +11,9 @@ use crate::actions::{CheckpointAction, ContentRoot, LastManifestCommit, Protocol
 use crate::arrow::array::StringArray;
 use crate::committer::FileSystemCommitter;
 use crate::crc::{Crc, FileStats, FileStatsState};
-use crate::engine::sync::SyncEngine;
 #[cfg(feature = "declarative-plans")]
-use crate::engine::test_delegating::DelegatingEngine;
+use crate::engine::DelegatingEngine;
+use crate::engine::sync::SyncEngine;
 use crate::object_store::ObjectStoreExt as _;
 use crate::object_store::memory::InMemory;
 use crate::schema::SchemaRef;

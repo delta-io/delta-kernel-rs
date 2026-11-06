@@ -328,8 +328,8 @@ mod tests {
 
     use super::*;
     use crate::commit_range::DeltaAction;
+    use crate::engine::DelegatingEngine;
     use crate::engine::sync::SyncEngine;
-    use crate::engine::test_delegating::DelegatingEngine;
     use crate::path::LogPathFileType;
     use crate::utils::FoldWithOption as _;
     use crate::{Engine, FileMeta, KernelResultIterator, LogPath, Snapshot, StorageHandler};

@@ -58,7 +58,8 @@ impl FileStatsState {
 
     /// Returns `true` if file stats cannot be determined incrementally and require a full
     /// add/remove reconciliation pass to recover.
-    #[cfg(any(test, feature = "test-utils"))]
+    // Downstream tests need `internal-api` to access the CRC module.
+    #[cfg(any(test, all(feature = "test-utils", feature = "internal-api")))]
     pub fn is_indeterminate(&self) -> bool {
         self == &Self::Indeterminate
     }
@@ -144,7 +145,7 @@ fn domain_metadata_map(
     Ok(result)
 }
 
-#[cfg(any(test, feature = "test-utils"))]
+#[cfg(any(test, all(feature = "test-utils", feature = "internal-api")))]
 #[allow(clippy::panic)]
 impl DomainMetadataState {
     /// Test-only: returns the map if `Complete`, panics otherwise.
@@ -230,7 +231,7 @@ fn transaction_map(
     Ok(result)
 }
 
-#[cfg(any(test, feature = "test-utils"))]
+#[cfg(any(test, all(feature = "test-utils", feature = "internal-api")))]
 #[allow(clippy::panic)]
 impl SetTransactionState {
     /// Test-only: returns the map if `Complete`, panics otherwise.

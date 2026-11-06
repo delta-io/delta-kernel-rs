@@ -557,9 +557,9 @@ mod tests {
     use test_log::test;
 
     use crate::Snapshot;
-    use crate::engine::sync::SyncEngine;
     #[cfg(feature = "declarative-plans")]
-    use crate::engine::test_delegating::DelegatingEngine;
+    use crate::engine::DelegatingEngine;
+    use crate::engine::sync::SyncEngine;
     #[cfg(feature = "declarative-plans")]
     use crate::expressions::{Predicate, expr};
     #[cfg(feature = "declarative-plans")]

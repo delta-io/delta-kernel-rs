@@ -853,11 +853,11 @@ mod tests {
     use crate::arrow::datatypes::{DataType as ArrowDataType, Schema as ArrowSchema};
     use crate::arrow::record_batch::RecordBatch;
     use crate::committer::FileSystemCommitter;
+    use crate::engine::DelegatingEngine;
     use crate::engine::arrow_conversion::TryIntoArrow;
     use crate::engine::arrow_data::ArrowEngineData;
     use crate::engine::arrow_expression::ArrowEvaluationHandler;
     use crate::engine::sync::SyncEngine;
-    use crate::engine::test_delegating::DelegatingEngine;
     use crate::expressions::{ExpressionRef, MapData, PredicateRef, Scalar, StructData};
     use crate::scan::log_replay::PATH_NAME;
     use crate::schema::{MapType, column_name, schema};

@@ -206,17 +206,20 @@ pub use plans::{IoOperation, Operation, PlanBuilder, PlanExecutor, PlanResult};
 use schema::StructField;
 pub use snapshot::{Snapshot, SnapshotReader, SnapshotRef};
 
+// `test-utils` exposes the test engines without requiring Arrow or declarative plans.
 #[cfg(any(
     feature = "default-engine-base",
     feature = "arrow-conversion",
-    feature = "declarative-plans"
+    feature = "declarative-plans",
+    feature = "test-utils"
 ))]
 pub mod engine;
 
 #[cfg(not(any(
     feature = "default-engine-base",
     feature = "arrow-conversion",
-    feature = "declarative-plans"
+    feature = "declarative-plans",
+    feature = "test-utils"
 )))]
 pub(crate) mod engine;
 
