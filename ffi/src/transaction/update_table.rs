@@ -355,6 +355,40 @@ pub unsafe extern "C" fn update_table_txn_builder_set_nullable(
     unsafe { result.into_extern_result(&engine) }
 }
 
+/// Adds or updates a single table property on the update-table builder.
+///
+/// Merges into the existing configuration. Non-`delta.*` keys are accepted as application
+/// properties. Config-only `delta.*` keys are canonicalized and validated; feature-enabling and
+/// unknown `delta.*` keys are rejected at build.
+///
+/// # Safety
+///
+/// All handles and string slices must be valid. This call borrows `engine`, `key`, and `value` and
+/// unconditionally consumes `builder`, including on error.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn update_table_txn_builder_with_table_property_added(
+    builder: Handle<ExclusiveUpdateTableTransactionBuilder>,
+    key: KernelStringSlice,
+    value: KernelStringSlice,
+    engine: Handle<SharedExternEngine>,
+) -> ExternResult<Handle<ExclusiveUpdateTableTransactionBuilder>> {
+    let engine = unsafe { engine.as_ref() };
+    let builder = unsafe { *builder.into_inner() };
+    let key = unsafe { TryFromStringSlice::try_from_slice(&key) };
+    let value = unsafe { TryFromStringSlice::try_from_slice(&value) };
+    let result = update_table_txn_builder_with_table_property_added_impl(builder, key, value);
+    unsafe { result.into_extern_result(&engine) }
+}
+
+fn update_table_txn_builder_with_table_property_added_impl(
+    builder: UpdateTableTransactionBuilder,
+    key: KernelResult<String>,
+    value: KernelResult<String>,
+) -> KernelResult<Handle<ExclusiveUpdateTableTransactionBuilder>> {
+    let builder = builder.with_table_properties_added([(key?, value?)]);
+    Ok(Box::new(builder).into())
+}
+
 fn decode_single_field(schema: &EngineSchema) -> KernelResult<delta_kernel::schema::StructField> {
     let mut fields = decode_engine_schema(schema)?.into_fields();
     match (fields.next(), fields.next()) {
