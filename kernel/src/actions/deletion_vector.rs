@@ -676,6 +676,19 @@ impl DeletionVectorDescriptor {
 
     /// Validates the deletion vector file's framing: a Delta DV file or, as a reader-side leniency
     /// for Iceberg interop, a Puffin file.
+    ///
+    /// A Delta DV file opens with a 1-byte version header, then one or more blobs; the descriptor's
+    /// `offset` points at the first blob:
+    ///
+    /// ```text
+    /// +---------------+-----------------+
+    /// |  num bytes    |  value          |
+    /// +===============+=================+
+    /// | 1 byte        |  version        |
+    /// +---------------+-----------------+
+    /// | offset-1      |  other dvs...   |
+    /// +---------------+-----------------+ <- offset (first blob)
+    /// ```
     fn validate_framing(&self, dv_data: &[u8], path: &Url) -> KernelResult<()> {
         if dv_data.starts_with(&PUFFIN_MAGIC) {
             require!(
@@ -686,14 +699,15 @@ impl DeletionVectorDescriptor {
                     PUFFIN_MAGIC.len()
                 ))
             );
-            return Ok(());
+            Ok(())
+        } else {
+            let version = dv_data.first().copied().unwrap_or_default();
+            require!(
+                version == 1,
+                KernelError::DeletionVector(format!("Invalid version {version} for {path}"))
+            );
+            Ok(())
         }
-        let version = dv_data.first().copied().unwrap_or_default();
-        require!(
-            version == 1,
-            KernelError::DeletionVector(format!("Invalid version {version} for {path}"))
-        );
-        Ok(())
     }
 }
 
