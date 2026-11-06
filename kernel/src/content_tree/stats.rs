@@ -17,10 +17,7 @@ use std::sync::Arc;
 
 use tracing::warn;
 
-use crate::actions::{
-    MAX_VALUES, MIN_VALUES, NULL_COUNT, NUM_RECORDS, STATS_PARSED,
-    TIGHT_BOUNDS as DELTA_TIGHT_BOUNDS,
-};
+use crate::actions::{MAX_VALUES, MIN_VALUES, NULL_COUNT, NUM_RECORDS, STATS_PARSED, TIGHT_BOUNDS};
 use crate::content_tree::{
     CONTENT_STATS_FIELD_NAME, LOWER_BOUND, NAN_VALUE_COUNT, NULL_VALUE_COUNT, RECORD_COUNT,
     TOTAL_BYTES, UPPER_BOUND, VALUE_COUNT,
@@ -176,9 +173,13 @@ impl StatCategories {
         self.null_count || self.min_values || self.max_values
     }
 
-    /// Category membership indexed like [`STAT_CATEGORIES`].
-    fn as_array(&self) -> [bool; 3] {
-        [self.null_count, self.min_values, self.max_values]
+    /// The `content_stats` sub-field backing each present category, in [`STAT_CATEGORIES`] order.
+    fn sub_fields(&self) -> [Option<&'static str>; 3] {
+        [
+            self.null_count.then_some(NULL_VALUE_COUNT),
+            self.min_values.then_some(LOWER_BOUND),
+            self.max_values.then_some(UPPER_BOUND),
+        ]
     }
 }
 
@@ -667,15 +668,8 @@ impl<'a> StatsLeafVisitor<'a> for StatsSchemaCollector {
 
 // == AMT content_stats -> parsed Delta stats ==
 
-/// Builds an expression that replaces the flat AMT [`CONTENT_STATS_FIELD_NAME`] column of
-/// `input_schema` with a parsed Delta stats column named [`STATS_PARSED`], passing every other
-/// column through.
-///
-/// Returns `(output_schema, expression)`: `output_schema` is `input_schema` with `content_stats`
-/// replaced by a nullable `stats_parsed` column of type `delta_stats_schema`, and `expression`
-/// evaluates rows of `input_schema` into `output_schema`.
-///
-/// The output column has the shape of `delta_stats_schema`:
+/// Replaces [`CONTENT_STATS_FIELD_NAME`] in `input_schema` with a nullable [`STATS_PARSED`] column
+/// of type `delta_stats_schema`. Other columns pass through. Returns `(output_schema, expression)`.
 ///
 /// ```text
 /// numRecords:  long               <- recordCount
@@ -686,11 +680,8 @@ impl<'a> StatsLeafVisitor<'a> for StatsSchemaCollector {
 /// ```
 ///
 /// `content_stats` must have been read with [`projected_stats_schema`] for the same `table_schema`
-/// and `delta_stats_schema`: both are produced by the same table walk, so leaf names always agree.
-///
-/// `tightBounds` is always `false`, so the bounds are reported as wide. AMT-only stats
-/// (`value_count`, `nan_value_count`, `total_bytes`) are not carried over. A leaf without a
-/// `content_stats` entry (array/map columns, out-of-range field IDs) yields null.
+/// and `delta_stats_schema`. A leaf without a `content_stats` entry (array/map columns,
+/// out-of-range field IDs) yields null.
 pub(crate) fn build_parsed_stats_expression(
     table_schema: &StructType,
     delta_stats_schema: &StructType,
@@ -724,9 +715,6 @@ pub(crate) fn build_parsed_stats_expression(
         .build()
 }
 
-/// The `content_stats` leaf sub-field backing each category, indexed like [`STAT_CATEGORIES`].
-const CATEGORY_SUB_FIELDS: [&str; 3] = [NULL_VALUE_COUNT, LOWER_BOUND, UPPER_BOUND];
-
 /// A built child expression and the name of the output field it fills.
 type NamedExpr<'a> = (&'a str, ExpressionRef);
 
@@ -755,15 +743,17 @@ impl<'a> StatsLeafVisitor<'a> for ParsedStatsExprBuilder {
         // The read schema keeps exactly the sub-fields backed by the leaf's categories, so the
         // entry has every sub-field referenced below.
         let entry = leaf_stats_field(field, path, Some(categories))?;
-        let present = categories.as_array();
-        let exprs = std::array::from_fn(|i| {
-            present[i].then(|| {
-                let sub_field = CATEGORY_SUB_FIELDS[i];
+        let exprs = categories.sub_fields().map(|sub_field| {
+            sub_field.map(|sub_field| {
                 let expr = match &entry {
                     Some(entry) => {
                         Expression::column([CONTENT_STATS_FIELD_NAME, entry.name(), sub_field])
                     }
                     None if sub_field == NULL_VALUE_COUNT => null_lit(DataType::LONG),
+                    // AMT records variant bounds as unshredded variants (see `leaf_stats_field`).
+                    None if matches!(field.data_type(), DataType::Variant(_)) => {
+                        null_lit(DataType::unshredded_variant())
+                    }
                     None => null_lit(field.data_type().clone()),
                 };
                 Arc::new(expr)
@@ -806,9 +796,8 @@ fn assemble_parsed_stats_expr(
             // Wide bounds are still valid for data skipping; readers just can't treat them as
             // exact. Write an explicit `false` because kernel still reads an absent `tightBounds`
             // as tight.
-            // TODO: derive tightBounds and tightStats from the entry's tight_stats once Delta
-            // stats define tightStats.
-            DELTA_TIGHT_BOUNDS => lit(false),
+            // TODO(#3843): derive tightBounds and tightStats from the entry's tight_stats.
+            TIGHT_BOUNDS => lit(false),
             _ => STAT_CATEGORIES
                 .iter()
                 .position(|category| *category == name)
@@ -2264,7 +2253,7 @@ mod tests {
             StructField::nullable(NULL_COUNT, null_count),
             StructField::nullable(MIN_VALUES, min_values),
             StructField::nullable(MAX_VALUES, max_values),
-            StructField::nullable(DELTA_TIGHT_BOUNDS, DataType::BOOLEAN),
+            StructField::nullable(TIGHT_BOUNDS, DataType::BOOLEAN),
         ])
     }
 
