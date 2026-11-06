@@ -4,7 +4,7 @@ use std::backtrace::Backtrace;
 use std::error::Error as StdError;
 use std::fmt;
 
-use super::{DeltaErrorCondition, KernelError};
+use super::DeltaErrorCondition;
 
 /// A catalog-defined Delta failure that terminates the current operation.
 ///
@@ -100,23 +100,26 @@ impl DeltaError {
     /// Creates a `DELTA_PATH_DOES_NOT_EXIST` error for a table root that does not exist or has no
     /// Delta log.
     ///
-    /// `path` is the table root as the caller supplied it. Supply `source` when a Kernel error
-    /// detected the missing table, or `None` when there is no underlying cause.
+    /// `path` is the table root as the caller supplied it. `source` is the error that detected
+    /// the missing table and is preserved for downcasting through [`StdError::source`].
     ///
     /// ```
     /// use delta_kernel::{DeltaError, DeltaErrorCondition};
     /// use std::error::Error as _;
+    /// use std::io;
     ///
-    /// let error = DeltaError::path_does_not_exist("/path/to/table", None);
+    /// let source = io::Error::from(io::ErrorKind::NotFound);
+    /// let error = DeltaError::path_does_not_exist("/path/to/table", source);
     /// assert_eq!(error.condition(), DeltaErrorCondition::DeltaPathDoesNotExist);
     /// assert_eq!(error.parameters()[0].value(), "/path/to/table");
-    /// assert!(error.source().is_none());
+    /// let source = error.source().unwrap().downcast_ref::<io::Error>().unwrap();
+    /// assert_eq!(source.kind(), io::ErrorKind::NotFound);
     /// ```
-    pub fn path_does_not_exist(path: &str, source: Option<KernelError>) -> Self {
+    pub fn path_does_not_exist(path: &str, source: impl StdError + Send + Sync + 'static) -> Self {
         Self::new(
             DeltaErrorCondition::DeltaPathDoesNotExist,
             vec![DeltaErrorParameter::new("path", path)],
-            source.map(|source| Box::new(source) as _),
+            Some(Box::new(source)),
         )
     }
 
