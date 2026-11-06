@@ -1334,9 +1334,10 @@ pub unsafe extern "C" fn checkpoint_snapshot(
 
 /// Publish unpublished catalog commits on a catalog-managed snapshot.
 ///
-/// No-op (still returns a caller-owned snapshot handle at the same version) when there is
-/// nothing to publish. Errors when unpublished commits exist but the table is not
-/// catalog-managed or the committer is not a catalog committer.
+/// The returned snapshot uses published paths for commits known to be published, even when no
+/// commits need copying. Filesystem-managed snapshots with nothing to publish are unchanged.
+/// Errors when unpublished commits exist but the table is not catalog-managed or the committer
+/// is not a catalog committer. See [`Snapshot::publish`] for the publication contract.
 ///
 /// Caller owns the returned handle ([`free_snapshot`]). The input snapshot is borrowed; the
 /// committer is consumed (do not free). The returned snapshot carries the published watermark

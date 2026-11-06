@@ -38,7 +38,7 @@ use crate::metrics::{
 use crate::path::LogPathFileType::*;
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::path::LogRoot;
-use crate::path::{LogPathFileType, ParsedLogPath};
+use crate::path::{LogPathFileType, ParsedLogPath, published_commit_file_name};
 #[cfg(feature = "declarative-plans")]
 use crate::plans::ir::nodes::{FileType, ScanFile};
 use crate::schema::compare::SchemaComparison;
@@ -868,12 +868,75 @@ impl LogSegment {
         Ok(new_log_segment)
     }
 
-    pub(crate) fn new_as_published(&self) -> KernelResult<Self> {
-        // In the future, we can additionally convert the staged commit files to published commit
-        // files. That would reqire faking their FileMeta locations.
+    /// Replaces retained staged commit references through `published_through` with published paths.
+    ///
+    /// The caller establishes which commits have been published; this method performs no storage
+    /// reads. Replaced commit references retain the staged file's size and modification time.
+    /// `published_through` cannot exceed `self.end_version` or be less than
+    /// `self.listed.max_published_version`. `None` means no commits are known to be published.
+    /// Returns `None` without cloning if the commit paths and `max_published_version` are
+    /// unchanged.
+    pub(crate) fn new_as_published(
+        &self,
+        published_through: Option<Version>,
+    ) -> KernelResult<Option<Self>> {
+        require!(
+            published_through <= Some(self.end_version),
+            KernelError::invalid_log_segment(format!(
+                "publication watermark {published_through:?} exceeds log segment end version {}",
+                self.end_version
+            ))
+        );
+        require!(
+            published_through >= self.listed.max_published_version,
+            KernelError::invalid_log_segment(format!(
+                "publication watermark {published_through:?} regresses existing watermark {:?}",
+                self.listed.max_published_version
+            ))
+        );
+
+        let needs_published_path = |file: &ParsedLogPath| {
+            file.file_type == StagedCommit
+                && published_through.is_some_and(|version| file.version <= version)
+        };
+        if published_through == self.listed.max_published_version
+            && !self
+                .listed
+                .ascending_commit_files
+                .iter()
+                .chain(self.listed.latest_commit_file.iter())
+                .any(needs_published_path)
+        {
+            return Ok(None);
+        }
+
+        let replace_staged = |file: &mut ParsedLogPath| -> KernelResult<()> {
+            if needs_published_path(file) {
+                let location = self
+                    .log_root
+                    .join(&published_commit_file_name(file.version))?;
+                let metadata = FileMeta {
+                    location: location.clone(),
+                    last_modified: file.location.last_modified,
+                    size: file.location.size,
+                };
+                *file = ParsedLogPath::new(metadata)
+                    .ok_or_else(|| KernelError::invalid_log_path(location))?;
+            }
+            Ok(())
+        };
+
         let mut new_log_segment = self.clone();
-        new_log_segment.listed.max_published_version = Some(self.end_version);
-        Ok(new_log_segment)
+        new_log_segment.listed.max_published_version = published_through;
+        for file in &mut new_log_segment.listed.ascending_commit_files {
+            replace_staged(file)?;
+        }
+        // Loading a snapshot with a checkpoint at the same version leaves ascending_commit_files
+        // empty. latest_commit_file is still needed to read the in-commit timestamp.
+        if let Some(file) = &mut new_log_segment.listed.latest_commit_file {
+            replace_staged(file)?;
+        }
+        Ok(Some(new_log_segment))
     }
 
     pub(crate) fn get_unpublished_catalog_commits(&self) -> KernelResult<Vec<CatalogCommit>> {

@@ -10,7 +10,7 @@ use delta_kernel::actions::{Add, LastManifestCommit};
 use delta_kernel::crc::Crc;
 use delta_kernel::last_checkpoint_hint::{LastCheckpointHint, LastCheckpointV2};
 use delta_kernel::log_segment::LogSegment;
-use delta_kernel::path::ParsedLogPath;
+use delta_kernel::path::{LogPathFileType, ParsedLogPath};
 use delta_kernel::snapshot::{IncrementalReplay, PublicationWatermark, Snapshot};
 use delta_kernel::{
     Engine, EvaluationHandler, FileMeta, JsonHandler, ParquetHandler, StorageHandler,
@@ -921,8 +921,13 @@ fn visited_hint_preserves_partial_crc_maps_and_indeterminate_file_stats() {
     }
 }
 
-#[test]
-fn visited_hint_after_publish_preserves_staged_paths_and_advanced_watermark() {
+#[rstest::rstest]
+#[case::new_publication(0)]
+#[case::already_published(1)]
+fn visited_hint_after_publish_uses_published_paths_and_watermark(
+    #[case] source_watermark: Version,
+) {
+    // GIVEN: a hint with published commit 0 and staged commit 1, which may already be published.
     let engine = test_engine();
     let reader_features = [slice("catalogManaged")];
     let writer_features = [slice("catalogManaged"), slice("inCommitTimestamp")];
@@ -960,8 +965,8 @@ fn visited_hint_after_publish_preserves_staged_paths_and_advanced_watermark() {
                 "memory:///hinted-table/_delta_log/_staged_commits/",
                 "00000000000000000001.3a0d65cd-4056-49b8-937b-95f9e3ee90e5.json",
             )),
-            2,
-            1,
+            17,
+            13,
         ),
     ];
     let crc = FfiCrc {
@@ -975,25 +980,55 @@ fn visited_hint_after_publish_preserves_staged_paths_and_advanced_watermark() {
     hint.protocol = protocol();
     hint.metadata = metadata();
     hint.crc = &crc;
+    hint.publication_watermark = FfiPublicationWatermark::PublishedThrough(source_watermark);
+    let source_hint_paths = unsafe { hint.log_paths.log_paths() }.unwrap();
     let builder = unsafe { snapshot_builder_with_max_catalog_version(test_builder(&engine), 1) };
     let builder = unsafe { ok_or_panic(snapshot_builder_with_snapshot_hint(builder, &hint)) };
     let source = unsafe { ok_or_panic(snapshot_builder_build(builder)) };
     let source_ref = unsafe { source.clone_as_arc() };
     assert_eq!(
         source_ref.log_segment().listed.max_published_version,
-        Some(0)
+        Some(source_watermark)
     );
+    let source_segment = source_ref.log_segment().clone();
     let kernel_engine = unsafe { engine.as_ref() }.engine();
+    // WHEN: publish the snapshot built from that hint.
     let published = source_ref
         .publish(kernel_engine.as_ref(), &TestCatalogCommitter)
         .unwrap();
+
+    // THEN: both commit paths are published, while the input snapshot and hint remain unchanged.
     assert_eq!(
         published.log_segment().listed.max_published_version,
         Some(1)
     );
+    let published_files = &published.log_segment().listed.ascending_commit_files;
+    assert_eq!(published_files.len(), 2);
+    for (file, expected_location, (size, last_modified)) in itertools::izip!(
+        published_files,
+        [
+            "memory:///hinted-table/_delta_log/00000000000000000000.json",
+            "memory:///hinted-table/_delta_log/00000000000000000001.json",
+        ],
+        [(1, 1), (13, 17)],
+    ) {
+        assert_eq!(file.location.location.as_str(), expected_location);
+        assert_eq!(file.file_type, LogPathFileType::Commit);
+        assert_eq!(file.location.size, size);
+        assert_eq!(file.location.last_modified, last_modified);
+    }
     assert_eq!(
-        published.log_segment().listed.ascending_commit_files,
-        source_ref.log_segment().listed.ascending_commit_files
+        published.log_segment().listed.latest_commit_file.as_ref(),
+        published_files.last()
+    );
+    assert_eq!(source_ref.log_segment(), &source_segment);
+    assert_eq!(
+        unsafe { hint.log_paths.log_paths() }.unwrap(),
+        source_hint_paths
+    );
+    assert_eq!(
+        PublicationWatermark::from(hint.publication_watermark),
+        PublicationWatermark::PublishedThrough(source_watermark)
     );
     let published: Handle<SharedSnapshot> = published.into();
     let expected_segment = unsafe { published.as_ref() }.log_segment().listed.clone();
@@ -1004,6 +1039,7 @@ fn visited_hint_after_publish_preserves_staged_paths_and_advanced_watermark() {
         watermark: None,
         visits: 0,
     };
+    // WHEN: export the returned snapshot through the FFI visitor.
     assert!(unsafe {
         ok_or_panic(snapshot_to_snapshot_hint(
             published.shallow_copy(),
@@ -1012,6 +1048,8 @@ fn visited_hint_after_publish_preserves_staged_paths_and_advanced_watermark() {
             install_visited_hint,
         ))
     });
+
+    // THEN: the exported hint rebuilds a snapshot with the same published paths and metadata.
     assert_eq!(state.visits, 1);
     unsafe {
         free_snapshot(source);
