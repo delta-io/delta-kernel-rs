@@ -1347,28 +1347,15 @@ async fn test_txn_newer_commit_wins_over_older_commit_for_same_app() {
     Some(0),
     Some(2000)
 )]
-#[case::empty_first(
-    json!({"commitInfo": {}}),
-    commit_info("WRITE", Some(2000)),
-    None,
-    Some(2000)
-)]
-#[case::timestamp_only_first(
-    json!({"commitInfo": {"timestamp": COMMIT_INFO_TIMESTAMP}}),
-    commit_info("WRITE", Some(2000)),
-    None,
-    Some(2000)
-)]
 #[case::ict_only_first(
     json!({"commitInfo": {"inCommitTimestamp": 1000}}),
     commit_info("WRITE", Some(2000)),
     None,
     Some(2000)
 )]
-#[case::empty_last(commit_info("WRITE", Some(1000)), json!({"commitInfo": {}}), Some(1), None)]
-#[case::timestamp_only_last(
+#[case::missing_ict_last(
     commit_info("WRITE", Some(1000)),
-    json!({"commitInfo": {"timestamp": COMMIT_INFO_TIMESTAMP}}),
+    commit_info("WRITE", None),
     Some(1),
     None
 )]

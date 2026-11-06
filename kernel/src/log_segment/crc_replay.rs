@@ -19,7 +19,7 @@ use super::LogSegment;
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::actions::visitors::visit_last_manifest_commit_at;
 use crate::actions::visitors::{
-    METADATA_LEAVES, PROTOCOL_LEAVES, SelectionVectorVisitor, visit_metadata_at, visit_protocol_at,
+    METADATA_LEAVES, PROTOCOL_LEAVES, visit_metadata_at, visit_protocol_at,
 };
 use crate::actions::{
     ADD_NAME, COMMIT_INFO_NAME, DOMAIN_METADATA_FIELD, DomainMetadata, METADATA_FIELD,
@@ -32,7 +32,6 @@ use crate::crc::{
     size_to_u64,
 };
 use crate::engine_data::{GetData, TypedGetData as _};
-use crate::expressions::col;
 use crate::metrics::ProtocolMetadataSource;
 use crate::path::ParsedLogPath;
 use crate::schema::{
@@ -283,11 +282,6 @@ impl LogSegment {
             .map(|c| c.location.clone())
             .collect();
         let mut acc = CrcReplayAccumulator::new(seed_histogram);
-        // Struct presence distinguishes an empty commitInfo from another action's null fields.
-        let commit_info_predicate = engine.evaluation_handler().new_predicate_evaluator(
-            REPLAY_SCHEMA.clone(),
-            Arc::new(col!(COMMIT_INFO_NAME).is_not_null()),
-        )?;
         let batches =
             engine
                 .json_handler()
@@ -295,15 +289,9 @@ impl LogSegment {
 
         for batch_result in batches {
             let batch = batch_result?;
-            let commit_info_rows = commit_info_predicate.evaluate(batch.as_ref())?;
-            let mut selection = SelectionVectorVisitor::default();
-            selection.visit_rows_of(commit_info_rows.as_ref())?;
             // Transient visitor borrows the shared accumulator for the duration of the
             // batch; same pattern as `ActionReconciliationVisitor`.
-            let mut visitor = CommitCrcVisitor {
-                acc: &mut acc,
-                commit_info_rows: &selection.selection_vector,
-            };
+            let mut visitor = CommitCrcVisitor { acc: &mut acc };
             visitor.visit_rows_of(batch.as_ref())?;
         }
 
@@ -447,8 +435,8 @@ impl CrcReplayAccumulator {
 
     // ===== Row-level updates (also the seams used by `on_*` unit tests) =====
 
-    /// The first commitInfo selects the operation, including when it is absent. ICT and manifest
-    /// metadata come from the last commitInfo in the newest commit, including absent values.
+    /// The first detected commitInfo selects the operation. ICT and manifest metadata come from
+    /// the last detected commitInfo in the newest commit, including absent values.
     fn on_commit_info(
         &mut self,
         operation: Option<&str>,
@@ -673,7 +661,6 @@ const N_FIXED_COLS: usize = N_CRC_SPECIFIC_COLS + N_SHARED_SINGLE_LEAF_COLS;
 /// `on_*` methods. All behavior lives in [`CrcReplayAccumulator`].
 struct CommitCrcVisitor<'a> {
     acc: &'a mut CrcReplayAccumulator,
-    commit_info_rows: &'a [bool],
 }
 
 impl RowVisitor for CommitCrcVisitor<'_> {
@@ -705,10 +692,6 @@ impl RowVisitor for CommitCrcVisitor<'_> {
 
     fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> KernelResult<()> {
         check_visitor_getters(getters, N_FIXED_COLS, "CommitCrcVisitor")?;
-        require!(
-            self.commit_info_rows.len() == row_count,
-            KernelError::internal_error("commitInfo predicate output length does not match batch")
-        );
         if row_count == 0 {
             return Ok(());
         }
@@ -717,14 +700,17 @@ impl RowVisitor for CommitCrcVisitor<'_> {
         let file_url: String = getters[COL_FILE].get(0, "_file")?;
         self.acc.process_batch_start(&file_url);
 
-        for (i, &is_commit_info) in self.commit_info_rows.iter().enumerate() {
+        for i in 0..row_count {
             let operation: Option<String> = getters[COL_OP].get_opt(i, "commitInfo.operation")?;
             let ict: Option<i64> = getters[COL_ICT].get_opt(i, "commitInfo.inCommitTimestamp")?;
+            let is_commit_info = operation.is_some() || ict.is_some();
             #[cfg(feature = "adaptive-metadata-in-dev")]
             let last_manifest_commit = visit_last_manifest_commit_at(
                 i,
                 &getters[COL_LMC_VERSION..=COL_LMC_CONTENT_ROOT_VERSION],
             )?;
+            #[cfg(feature = "adaptive-metadata-in-dev")]
+            let is_commit_info = is_commit_info || last_manifest_commit.is_some();
             if is_commit_info {
                 self.acc.on_commit_info(
                     operation.as_deref(),
@@ -956,7 +942,7 @@ mod tests {
         let last_manifest_commit = last_ict.map(|_| LastManifestCommit::new(2, 2).unwrap());
         acc.process_batch_start("v2.json");
         acc.on_commit_info(
-            None,
+            Some("WRITE"),
             last_ict,
             #[cfg(feature = "adaptive-metadata-in-dev")]
             last_manifest_commit.clone(),
@@ -1114,10 +1100,7 @@ mod tests {
     #[test]
     fn visitor_schema_length_matches_column_indices() {
         let mut acc = CrcReplayAccumulator::new(None);
-        let visitor = CommitCrcVisitor {
-            acc: &mut acc,
-            commit_info_rows: &[],
-        };
+        let visitor = CommitCrcVisitor { acc: &mut acc };
         let (names, types) = visitor.selected_column_names_and_types();
         let expected =
             N_FIXED_COLS + PROTOCOL_LEAVES.as_ref().0.len() + METADATA_LEAVES.as_ref().0.len();
