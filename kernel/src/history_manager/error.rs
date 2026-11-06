@@ -2,17 +2,16 @@
 
 use url::Url;
 
-use super::search::Bound;
 use super::Timestamp;
+use super::search::Bound;
 use crate::Version;
 
 /// The nearest retained timestamp on the side of the search bound that an
 /// out-of-range search failed against. Engines surface this to users so the
 /// error message can point at a valid timestamp.
 ///
-/// `Earliest` and `Latest` carry the boundary commit's timestamp. `Unknown`
-/// means no boundary timestamp was available, e.g. empty log or a failure
-/// reading the boundary commit's In-Commit Timestamp at the error site.
+/// `Earliest` and `Latest` carry the boundary commit's timestamp. `Unknown` means no boundary
+/// timestamp was available. Cancellation during the boundary read propagates as an error.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum NearestTimestamp {
@@ -99,13 +98,24 @@ pub enum LogHistoryError {
         context: &'static str,
         /// The underlying error, if any.
         #[source]
-        source: Option<Box<crate::Error>>,
+        source: Option<Box<crate::KernelError>>,
     },
 }
 
 impl LogHistoryError {
+    /// Returns whether this error wraps a typed cancellation.
+    pub(crate) fn is_cancelled(&self) -> bool {
+        matches!(
+            self,
+            Self::Internal {
+                source: Some(source),
+                ..
+            } if matches!(source.as_ref(), crate::KernelError::Cancelled)
+        )
+    }
+
     /// Creates an internal error with context and an underlying cause.
-    pub(crate) fn internal(context: &'static str, source: crate::Error) -> Self {
+    pub(crate) fn internal(context: &'static str, source: crate::KernelError) -> Self {
         Self::Internal {
             context,
             source: Some(Box::new(source)),
@@ -134,8 +144,39 @@ impl LogHistoryError {
     }
 }
 
-impl From<LogHistoryError> for crate::Error {
+impl From<LogHistoryError> for crate::KernelError {
+    /// Preserves typed cancellation and wraps other timestamp-conversion failures with context.
     fn from(e: LogHistoryError) -> Self {
-        crate::Error::LogHistory(Box::new(e))
+        if e.is_cancelled() {
+            return crate::KernelError::Cancelled;
+        }
+        crate::KernelError::LogHistory(Box::new(e))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::KernelError;
+
+    #[rstest::rstest]
+    #[case(Some(KernelError::Cancelled), true)]
+    #[case(Some(KernelError::generic("read failed")), false)]
+    #[case(None, false)]
+    fn conversion_preserves_cancellation(
+        #[case] source: Option<KernelError>,
+        #[case] cancelled: bool,
+    ) {
+        let error = LogHistoryError::Internal {
+            context: "reading a boundary timestamp",
+            source: source.map(Box::new),
+        };
+        assert_eq!(error.is_cancelled(), cancelled);
+        let error = KernelError::from(error);
+        if cancelled {
+            assert!(matches!(error, KernelError::Cancelled));
+        } else {
+            assert!(matches!(error, KernelError::LogHistory(_)));
+        }
     }
 }

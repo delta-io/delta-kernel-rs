@@ -2,41 +2,44 @@
 //! specification](https://github.com/delta-io/delta/blob/master/PROTOCOL.md)
 
 use std::collections::HashMap;
-use std::sync::LazyLock;
+use std::fmt;
+use std::sync::{Arc, LazyLock};
 
-use delta_kernel_derive::{
-    internal_api, IntoEngineData, IntoStructData, ToSchema, TryFromStructData,
-};
-use serde::{Deserialize, Serialize};
+use delta_kernel_derive::{IntoStructData, ToSchema, TryFromStructData, internal_api};
+use derive_more::Constructor;
+use serde::de::{MapAccess, Visitor};
+use serde::{Deserialize, Deserializer, Serialize};
 use tracing::warn;
 use url::Url;
 use visitors::{MetadataVisitor, ProtocolVisitor};
 
 use self::deletion_vector::DeletionVectorDescriptor;
 #[cfg(feature = "adaptive-metadata-in-dev")]
+use crate::amt_path_util::amt_manifest_filemeta;
+#[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::expressions::Scalar;
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::expressions::{ArrayData, StructData};
-use crate::schema::{
-    is_unsupported_delta_type_error, lazy_schema_ref, schema_ref, SchemaRef, StructField,
-    StructType, ToSchema as _,
-};
 #[cfg(feature = "adaptive-metadata-in-dev")]
-use crate::schema::{schema, ArrayType, DataType};
+use crate::schema::{ArrayType, DataType, schema};
+use crate::schema::{
+    SchemaRef, StructField, StructType, ToSchema as _, is_unsupported_delta_type_error,
+    lazy_schema_ref, schema_ref,
+};
 use crate::table_features::{
-    FeatureType, TableFeature, LEGACY_READER_FEATURES, MIN_VALID_RW_VERSION,
-    TABLE_FEATURES_MIN_READER_VERSION, TABLE_FEATURES_MIN_WRITER_VERSION,
+    FeatureType, LEGACY_READER_FEATURES, MIN_VALID_RW_VERSION, TABLE_FEATURES_MIN_READER_VERSION,
+    TABLE_FEATURES_MIN_WRITER_VERSION, TableFeature,
 };
 use crate::table_properties::TableProperties;
-use crate::utils::require;
-use crate::{
-    DeltaResult, Engine, EngineData, Error, EvaluationHandlerExtension as _, FileMeta, FileSize,
-    IntoEngineData, RowVisitor as _,
-};
+use crate::utils::{require, to_file_size};
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use crate::{Engine, Version, create_row};
+use crate::{EngineData, FileMeta, KernelError, KernelResult, RowVisitor as _};
 
 const KERNEL_VERSION: &str = env!("CARGO_PKG_VERSION");
 const SERDE_JSON_RECURSION_LIMIT_ERROR_PREFIX: &str = "recursion limit exceeded";
 const UNKNOWN_OPERATION: &str = "UNKNOWN";
+pub(crate) const ROW_TRACKING_PRESERVED_TAG: &str = "delta.rowTracking.preserved";
 
 pub mod deletion_vector;
 pub mod deletion_vector_writer;
@@ -66,6 +69,9 @@ pub(crate) const CDC_NAME: &str = "cdc";
 pub(crate) const SIDECAR_NAME: &str = "sidecar";
 #[internal_api]
 pub(crate) const CHECKPOINT_METADATA_NAME: &str = "checkpointMetadata";
+/// Optional `checkpointMetadata.tags` key whose value is the JSON-encoded `StructType` of the
+/// checkpoint's sidecar files
+pub(crate) const SIDECAR_FILE_SCHEMA_TAG: &str = "sidecarFileSchema";
 #[internal_api]
 pub(crate) const DOMAIN_METADATA_NAME: &str = "domainMetadata";
 #[cfg(feature = "adaptive-metadata-in-dev")]
@@ -162,7 +168,7 @@ static CONTENT_SIDECAR_FIELD: LazyLock<StructField> = LazyLock::new(|| {
 
 /// The `checkpoint` action serializes as an array whose elements are each one of the metadata
 /// actions embedded in an adaptiveMetadata manifest commit. This schema is the union of every
-/// element type that may appear in that array (per the adaptiveMetadata RFC, delta-io/delta#6978):
+/// element type that may appear in that array:
 /// `checkpointMetadata`, `contentRoot`, `protocol`, `metaData`, `domainMetadata`, `txn`, `sidecar`.
 #[cfg(feature = "adaptive-metadata-in-dev")]
 static CHECKPOINT_ACTION_ELEMENT_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
@@ -182,6 +188,11 @@ pub(crate) static CHECKPOINT_ACTION_FIELD: LazyLock<StructField> = LazyLock::new
         ArrayType::new(CHECKPOINT_ACTION_ELEMENT_SCHEMA.clone(), false),
     )
 });
+
+/// The `lastManifestCommit` field as nested in commitInfo actions and CRC files.
+#[cfg(feature = "adaptive-metadata-in-dev")]
+pub(crate) static LAST_MANIFEST_COMMIT_FIELD: LazyLock<StructField> =
+    LazyLock::new(|| StructField::nullable("lastManifestCommit", LastManifestCommit::to_schema()));
 
 /// The `checkpoint` action field, present only under the `adaptive-metadata-in-dev` feature;
 /// otherwise an empty iterator.
@@ -331,8 +342,8 @@ pub struct Metadata {
     description: Option<String>,
     /// Specification of the encoding for the files stored in the table
     format: Format,
-    /// Schema of the table
-    schema_string: String,
+    /// Schema JSON, shared to avoid copying large schemas when cloning metadata.
+    schema_string: Arc<String>,
     /// Column names by which the data should be partitioned
     partition_columns: Vec<String>,
     /// The time when this metadata action is created, in milliseconds since the Unix epoch
@@ -342,6 +353,39 @@ pub struct Metadata {
 }
 
 impl Metadata {
+    /// Reconstructs metadata from its serialized action fields.
+    ///
+    /// This constructor does not validate the schema, partition columns, format, or table
+    /// configuration. Callers must validate the result before using it as table state.
+    #[internal_api]
+    #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn from_parts(
+        id: String,
+        name: Option<String>,
+        description: Option<String>,
+        format_provider: String,
+        format_options: HashMap<String, String>,
+        schema_string: String,
+        partition_columns: Vec<String>,
+        created_time: Option<i64>,
+        configuration: HashMap<String, String>,
+    ) -> Self {
+        Self {
+            id,
+            name,
+            description,
+            format: Format {
+                provider: format_provider,
+                options: format_options,
+            },
+            schema_string: Arc::new(schema_string),
+            partition_columns,
+            created_time,
+            configuration,
+        }
+    }
+
     /// Create a new [`Metadata`] instances.
     ///
     /// # Errors
@@ -355,12 +399,12 @@ impl Metadata {
         partition_columns: Vec<String>,
         created_time: i64,
         configuration: HashMap<String, String>,
-    ) -> DeltaResult<Self> {
+    ) -> KernelResult<Self> {
         // Validate that the schema does not contain metadata columns
         // Note: We don't have to look for nested metadata columns because that is already validated
         // when creating a StructType.
         if let Some(metadata_field) = schema.fields().find(|field| field.is_metadata_column()) {
-            return Err(Error::Schema(format!(
+            return Err(KernelError::Schema(format!(
                 "Table schema must not contain metadata columns. Found metadata column: '{}'",
                 metadata_field.name
             )));
@@ -375,7 +419,7 @@ impl Metadata {
             // both for legacy reasons and to enable possible support for other formats in the
             // future (See delta-io/delta#87).
             format: Format::default(),
-            schema_string: serde_json::to_string(&schema)?,
+            schema_string: Arc::new(serde_json::to_string(&schema)?),
             partition_columns,
             created_time: Some(created_time),
             configuration,
@@ -383,7 +427,7 @@ impl Metadata {
     }
 
     #[internal_api]
-    pub(crate) fn try_new_from_data(data: &dyn EngineData) -> DeltaResult<Option<Metadata>> {
+    pub(crate) fn try_new_from_data(data: &dyn EngineData) -> KernelResult<Option<Metadata>> {
         let mut visitor = MetadataVisitor::default();
         visitor.visit_rows_of(data)?;
         Ok(visitor.metadata)
@@ -425,6 +469,13 @@ impl Metadata {
         &self.format.provider
     }
 
+    /// Returns the arbitrary format-specific options stored in this metadata action.
+    #[internal_api]
+    #[allow(dead_code)]
+    pub(crate) fn format_options(&self) -> &HashMap<String, String> {
+        &self.format.options
+    }
+
     #[internal_api]
     pub(crate) fn schema_string(&self) -> &String {
         &self.schema_string
@@ -434,11 +485,11 @@ impl Metadata {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Schema`] when the schema exceeds the supported decoding depth or
-    /// declares a type the kernel doesn't support, or [`Error::MalformedJson`] for other
+    /// Returns [`KernelError::Schema`] when the schema exceeds the supported decoding depth or
+    /// declares a type the kernel doesn't support, or [`KernelError::MalformedJson`] for other
     /// JSON decoding failures.
     #[internal_api]
-    pub(crate) fn parse_schema(&self) -> DeltaResult<StructType> {
+    pub(crate) fn parse_schema(&self) -> KernelResult<StructType> {
         // TODO(#1896): Increase the supported nesting depth or use non-recursive schema decoding.
         serde_json::from_str(&self.schema_string).map_err(|error| {
             // serde_json keeps ErrorCode::RecursionLimitExceeded private, so we use string
@@ -448,13 +499,13 @@ impl Metadata {
                     .to_string()
                     .starts_with(SERDE_JSON_RECURSION_LIMIT_ERROR_PREFIX)
             {
-                Error::schema(format!(
+                KernelError::schema(format!(
                     "Table schema is too deeply nested: decoding metaData.schemaString exceeded \
                      serde_json's recursion limit: {error}"
                 ))
                 .with_backtrace()
             } else if is_unsupported_delta_type_error(&error) {
-                Error::schema(error.to_string()).with_backtrace()
+                KernelError::schema(error.to_string()).with_backtrace()
             } else {
                 error.into()
             }
@@ -479,15 +530,17 @@ impl Metadata {
     /// # Errors
     ///
     /// Returns an error if schema serialization fails.
-    pub(crate) fn with_schema(self, schema: SchemaRef) -> DeltaResult<Self> {
+    #[internal_api]
+    pub(crate) fn with_schema(self, schema: SchemaRef) -> KernelResult<Self> {
         Ok(Self {
-            schema_string: serde_json::to_string(&schema)?,
+            schema_string: Arc::new(serde_json::to_string(&schema)?),
             ..self
         })
     }
 
     /// Returns a new Metadata with a single configuration entry inserted (or replaced),
     /// preserving all other configuration entries and metadata fields.
+    #[internal_api]
     pub(crate) fn with_configuration_entry(
         mut self,
         key: impl Into<String>,
@@ -514,7 +567,7 @@ impl Metadata {
             name,
             description,
             format,
-            schema_string: schema_string.into(),
+            schema_string: Arc::new(schema_string.into()),
             partition_columns,
             created_time,
             configuration,
@@ -522,42 +575,8 @@ impl Metadata {
     }
 }
 
-// NOTE: We can't derive IntoEngineData for Metadata because it has a nested Format struct,
-// and create_one expects flattened values for nested schemas.
-impl IntoEngineData for Metadata {
-    fn into_engine_data(
-        self,
-        schema: SchemaRef,
-        engine: &dyn Engine,
-    ) -> DeltaResult<Box<dyn EngineData>> {
-        // For format, we need to provide individual scalars for provider and options
-        let values = [
-            self.id.into(),
-            self.name.into(),
-            self.description.into(),
-            self.format.provider.into(),
-            self.format.options.into(),
-            self.schema_string.into(),
-            self.partition_columns.into(),
-            self.created_time.into(),
-            self.configuration.into(),
-        ];
-
-        engine.evaluation_handler().create_one(schema, &values)
-    }
-}
-
 #[derive(
-    Default,
-    Debug,
-    Clone,
-    PartialEq,
-    Eq,
-    ToSchema,
-    IntoStructData,
-    Serialize,
-    Deserialize,
-    IntoEngineData,
+    Default, Debug, Clone, PartialEq, Eq, ToSchema, IntoStructData, Serialize, Deserialize,
 )]
 // Deserialization goes through `ProtocolRaw` so every serde entry point (e.g. CRC files) is
 // validated by `try_new`, like the JSON-replay path. Otherwise a CRC file could load a malformed
@@ -595,9 +614,9 @@ struct ProtocolRaw {
 }
 
 impl TryFrom<ProtocolRaw> for Protocol {
-    type Error = Error;
+    type Error = KernelError;
 
-    fn try_from(protocol: ProtocolRaw) -> DeltaResult<Self> {
+    fn try_from(protocol: ProtocolRaw) -> KernelResult<Self> {
         Protocol::try_new(
             protocol.min_reader_version,
             protocol.min_writer_version,
@@ -621,7 +640,7 @@ impl Protocol {
     pub(crate) fn try_new_modern(
         reader_features: impl IntoIterator<Item = impl Into<TableFeature>>,
         writer_features: impl IntoIterator<Item = impl Into<TableFeature>>,
-    ) -> DeltaResult<Self> {
+    ) -> KernelResult<Self> {
         Self::try_new(
             TABLE_FEATURES_MIN_READER_VERSION,
             TABLE_FEATURES_MIN_WRITER_VERSION,
@@ -635,7 +654,7 @@ impl Protocol {
     pub(crate) fn try_new_legacy(
         min_reader_version: i32,
         min_writer_version: i32,
-    ) -> DeltaResult<Self> {
+    ) -> KernelResult<Self> {
         Self::try_new(
             min_reader_version,
             min_writer_version,
@@ -645,21 +664,22 @@ impl Protocol {
     }
 
     /// Try to create a new Protocol instance from reader/writer versions and table features.
+    #[internal_api]
     pub(crate) fn try_new(
         min_reader_version: i32,
         min_writer_version: i32,
         reader_features: Option<impl IntoIterator<Item = impl Into<TableFeature>>>,
         writer_features: Option<impl IntoIterator<Item = impl Into<TableFeature>>>,
-    ) -> DeltaResult<Self> {
+    ) -> KernelResult<Self> {
         require!(
             min_reader_version >= MIN_VALID_RW_VERSION,
-            Error::InvalidProtocol(format!(
+            KernelError::InvalidProtocol(format!(
                 "min_reader_version must be >= {MIN_VALID_RW_VERSION}, got {min_reader_version}"
             ))
         );
         require!(
             min_writer_version >= MIN_VALID_RW_VERSION,
-            Error::InvalidProtocol(format!(
+            KernelError::InvalidProtocol(format!(
                 "min_writer_version must be >= {MIN_VALID_RW_VERSION}, got {min_writer_version}"
             ))
         );
@@ -672,14 +692,14 @@ impl Protocol {
         if min_reader_version == TABLE_FEATURES_MIN_READER_VERSION {
             require!(
                 reader_features.is_some(),
-                Error::invalid_protocol(
+                KernelError::invalid_protocol(
                     "Reader features must be present when minimum reader version = 3"
                 )
             );
         } else {
             require!(
                 reader_features.is_none(),
-                Error::invalid_protocol(
+                KernelError::invalid_protocol(
                     "Reader features must not be present when minimum reader version != 3"
                 )
             );
@@ -690,14 +710,14 @@ impl Protocol {
         if min_writer_version == TABLE_FEATURES_MIN_WRITER_VERSION {
             require!(
                 writer_features.is_some(),
-                Error::invalid_protocol(
+                KernelError::invalid_protocol(
                     "Writer features must be present when minimum writer version = 7"
                 )
             );
         } else {
             require!(
                 writer_features.is_none(),
-                Error::invalid_protocol(
+                KernelError::invalid_protocol(
                     "Writer features must not be present when minimum writer version != 7"
                 )
             );
@@ -715,7 +735,7 @@ impl Protocol {
                         FeatureType::ReaderWriter | FeatureType::Unknown
                     ) || !writer_features.contains(*feature)
                 }) {
-                    return Err(Error::invalid_protocol(format!(
+                    return Err(KernelError::invalid_protocol(format!(
                         "Reader features must contain only ReaderWriter features that are also \
                          listed in writer features, but {offending:?} is not \
                          (readerFeatures={reader_features:?}, writerFeatures={writer_features:?}, \
@@ -747,7 +767,7 @@ impl Protocol {
                     if LEGACY_READER_FEATURES.contains(feature) {
                         legacy_orphans.push(feature);
                     } else {
-                        return Err(Error::invalid_protocol(format!(
+                        return Err(KernelError::invalid_protocol(format!(
                             "Writer features must be Writer-only or also listed in reader features, \
                              but ReaderWriter feature {feature:?} is listed in writerFeatures and \
                              missing from readerFeatures \
@@ -783,7 +803,7 @@ impl Protocol {
                         }
                     }
                 }) {
-                    return Err(Error::invalid_protocol(format!(
+                    return Err(KernelError::invalid_protocol(format!(
                         "Writer features must be Writer-only or also listed in reader features, \
                          but ReaderWriter feature {offending:?} is listed in writerFeatures with \
                          no reader features present \
@@ -793,7 +813,7 @@ impl Protocol {
                 }
                 Ok(())
             }
-            (Some(_), None) => Err(Error::invalid_protocol(
+            (Some(_), None) => Err(KernelError::invalid_protocol(
                 "Reader features should be present in writer features",
             )),
         }?;
@@ -808,7 +828,7 @@ impl Protocol {
 
     /// Create a new Protocol by visiting the EngineData and extracting the first protocol row into
     /// a Protocol instance. If no protocol row is found, returns Ok(None).
-    pub(crate) fn try_new_from_data(data: &dyn EngineData) -> DeltaResult<Option<Protocol>> {
+    pub(crate) fn try_new_from_data(data: &dyn EngineData) -> KernelResult<Option<Protocol>> {
         let mut visitor = ProtocolVisitor::default();
         visitor.visit_rows_of(data)?;
         Ok(visitor.protocol)
@@ -861,7 +881,7 @@ impl Protocol {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, ToSchema, IntoEngineData)]
+#[derive(Debug, Clone, PartialEq, Eq, ToSchema, IntoStructData)]
 #[internal_api]
 #[cfg_attr(test, derive(Serialize, Default), serde(rename_all = "camelCase"))]
 pub(crate) struct CommitInfo {
@@ -878,7 +898,7 @@ pub(crate) struct CommitInfo {
     /// specified by the engine. Read: optional, write: required (that is, kernel alwarys writes).
     pub(crate) operation: Option<String>,
     /// Map of arbitrary string key-value pairs that provide additional information about the
-    /// operation. This is specified by the engine. For now this is always empty on write.
+    /// operation. This is specified by the connector and may be populated on write.
     pub(crate) operation_parameters: Option<HashMap<String, Option<String>>>,
     /// Map of arbitrary string key-value pairs that provide operation metrics.
     /// This is specified by the engine.
@@ -893,6 +913,19 @@ pub(crate) struct CommitInfo {
     pub(crate) engine_info: Option<String>,
     /// A unique transaction identifier for this commit.
     pub(crate) txn_id: Option<String>,
+    /// Map of tags associated with this commit.
+    pub(crate) tags: Option<HashMap<String, Option<String>>>,
+    /// Whether this commit changes the table's logical records. Required on every commit when
+    /// adaptiveMetadata is enabled; readers then treat it as the source of truth over the
+    /// per-file-action `dataChange` flags.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[cfg_attr(test, serde(skip_serializing_if = "Option::is_none"))]
+    pub(crate) data_change: Option<bool>,
+    /// Identifies the latest manifest commit up to this version. Absent until the table's first
+    /// manifest commit (adaptiveMetadata).
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[cfg_attr(test, serde(skip_serializing_if = "Option::is_none"))]
+    pub(crate) last_manifest_commit: Option<LastManifestCommit>,
 }
 
 impl CommitInfo {
@@ -913,16 +946,87 @@ impl CommitInfo {
             is_blind_append: is_blind_append.then_some(true),
             engine_info,
             txn_id: Some(uuid::Uuid::new_v4().to_string()),
+            tags: None,
+            #[cfg(feature = "adaptive-metadata-in-dev")]
+            data_change: None,
+            #[cfg(feature = "adaptive-metadata-in-dev")]
+            last_manifest_commit: None,
+        }
+    }
+
+    pub(crate) fn set_row_tracking_preserved(&mut self) {
+        self.tags.get_or_insert_default().insert(
+            ROW_TRACKING_PRESERVED_TAG.to_string(),
+            Some("true".to_string()),
+        );
+    }
+
+    pub(crate) fn set_operation_parameters(
+        &mut self,
+        operation_parameters: HashMap<String, Option<String>>,
+    ) {
+        self.operation_parameters = Some(operation_parameters);
+    }
+
+    pub(crate) fn set_operation_metrics(
+        &mut self,
+        operation_metrics: HashMap<String, Option<String>>,
+    ) {
+        self.operation_metrics = Some(operation_metrics);
+    }
+
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    pub(crate) fn set_data_change(&mut self, data_change: bool) {
+        self.data_change = Some(data_change);
+    }
+
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    pub(crate) fn set_last_manifest_commit(
+        &mut self,
+        last_manifest_commit: Option<LastManifestCommit>,
+    ) {
+        self.last_manifest_commit = last_manifest_commit;
+    }
+
+    /// Merges the supplied tags into this CommitInfo's tags.
+    ///
+    /// Existing values take precedence when both maps contain the same key.
+    pub(crate) fn merge_tags(&mut self, tags: Option<HashMap<String, Option<String>>>) {
+        let Some(tags) = tags else {
+            return;
+        };
+        let current_tags = self.tags.get_or_insert_default();
+        for (key, value) in tags {
+            current_tags.entry(key).or_insert(value);
         }
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, ToSchema)]
-#[cfg_attr(
-    test,
-    derive(Serialize, Deserialize, Default),
-    serde(rename_all = "camelCase")
-)]
+/// Identifies the location of a file's existing entry within the adaptive metadata tree, pointing
+/// at a specific position in a leaf manifest.
+///
+/// A back reference lets a writer locate an existing tree entry without scanning entire leaf
+/// manifests. It is meaningful only relative to a specific tree version. See the
+/// [Iceberg V4 metadata RFC].
+///
+/// [Iceberg V4 metadata RFC]: https://github.com/delta-io/delta/blob/master/protocol_rfcs/iceberg-v4-metadata.md#backreferences
+#[cfg(feature = "adaptive-metadata-in-dev")]
+#[derive(Debug, Clone, PartialEq, Eq, ToSchema, IntoStructData, Deserialize)]
+#[cfg_attr(test, derive(Serialize))]
+#[serde(rename_all = "camelCase")]
+#[internal_api]
+pub(crate) struct BackReference {
+    /// Path to the leaf manifest containing this file, relative to the table root
+    /// (e.g. `metadata/leaf-m1.parquet`). Resolved by joining the table location and this path
+    /// with a `/` separator, so it must not start with `/`.
+    pub(crate) manifest: String,
+    /// Row position (0-indexed) of the file entry within the manifest.
+    pub(crate) pos: i32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, ToSchema, IntoStructData, Deserialize)]
+#[cfg_attr(test, derive(Serialize, Default))]
+#[serde(rename_all = "camelCase")]
 #[internal_api]
 pub(crate) struct Add {
     /// A relative path to a data file from the root of the table or an absolute path to a file
@@ -940,6 +1044,7 @@ pub(crate) struct Add {
     ///
     /// [`materialize`]: crate::engine_data::MapItem::materialize
     #[allow_null_container_values]
+    #[serde(deserialize_with = "deserialize_partition_values")]
     pub(crate) partition_values: HashMap<String, String>,
 
     /// The size of this data file in bytes
@@ -985,13 +1090,146 @@ pub(crate) struct Add {
     /// The name of the clustering implementation
     #[cfg_attr(test, serde(skip_serializing_if = "Option::is_none"))]
     pub clustering_provider: Option<String>,
+
+    /// Back reference into the adaptive metadata tree. Present only when this `add` re-adds a file
+    /// that has no paired `remove` (e.g. stats backfilling); otherwise absent.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[cfg_attr(test, serde(skip_serializing_if = "Option::is_none"))]
+    pub(crate) back_reference: Option<BackReference>,
+}
+
+fn deserialize_partition_values<'de, D>(
+    deserializer: D,
+) -> KernelResult<HashMap<String, String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct PartitionValuesVisitor;
+
+    impl<'de> Visitor<'de> for PartitionValuesVisitor {
+        type Value = HashMap<String, String>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("a map of nullable partition values")
+        }
+
+        fn visit_map<A>(self, mut map: A) -> KernelResult<Self::Value, A::Error>
+        where
+            A: MapAccess<'de>,
+        {
+            let mut values = HashMap::new();
+            while let Some((key, value)) = map.next_entry::<String, Option<String>>()? {
+                match value {
+                    Some(value) => {
+                        values.insert(key, value);
+                    }
+                    None => {
+                        values.remove(&key);
+                    }
+                }
+            }
+            Ok(values)
+        }
+    }
+
+    deserializer.deserialize_map(PartitionValuesVisitor)
 }
 
 impl Add {
+    /// Returns the URI-encoded data-file path.
+    #[internal_api]
+    #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
+    pub(crate) fn path(&self) -> &str {
+        &self.path
+    }
+
+    /// Returns non-null partition values. Missing partition columns represent null values.
+    #[internal_api]
+    #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
+    pub(crate) fn partition_values(&self) -> &HashMap<String, String> {
+        &self.partition_values
+    }
+
+    /// Returns the data-file size in bytes.
+    #[internal_api]
+    #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
+    pub(crate) fn size(&self) -> i64 {
+        self.size
+    }
+
+    /// Returns the file modification time in milliseconds since the Unix epoch.
+    #[internal_api]
+    #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
+    pub(crate) fn modification_time(&self) -> i64 {
+        self.modification_time
+    }
+
+    /// Returns whether the action changes table data.
+    #[internal_api]
+    #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
+    pub(crate) fn data_change(&self) -> bool {
+        self.data_change
+    }
+
+    /// Returns this action's adaptive-metadata back reference, if present.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[internal_api]
+    #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
+    pub(crate) fn back_reference(&self) -> Option<&BackReference> {
+        self.back_reference.as_ref()
+    }
+
+    /// Reconstructs an Add action from its serialized fields.
+    #[internal_api]
+    #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn from_parts(
+        path: String,
+        partition_values: HashMap<String, String>,
+        size: i64,
+        modification_time: i64,
+        data_change: bool,
+        stats: Option<String>,
+        tags: Option<HashMap<String, Option<String>>>,
+        deletion_vector: Option<DeletionVectorDescriptor>,
+        base_row_id: Option<i64>,
+        default_row_commit_version: Option<i64>,
+        clustering_provider: Option<String>,
+    ) -> Self {
+        Self {
+            path,
+            partition_values,
+            size,
+            modification_time,
+            data_change,
+            stats,
+            tags,
+            deletion_vector,
+            base_row_id,
+            default_row_commit_version,
+            clustering_provider,
+            #[cfg(feature = "adaptive-metadata-in-dev")]
+            back_reference: None,
+        }
+    }
+
     #[internal_api]
     #[allow(dead_code)]
-    pub(crate) fn dv_unique_id(&self) -> Option<String> {
-        self.deletion_vector.as_ref().map(|dv| dv.unique_id())
+    pub(crate) fn dv_unique_id(
+        &self,
+        dv_normalization_root: Option<&Url>,
+    ) -> KernelResult<Option<String>> {
+        self.deletion_vector
+            .as_ref()
+            .map(|dv| {
+                DeletionVectorDescriptor::unique_id_with_root(
+                    &dv.storage_type.to_string(),
+                    &dv.path_or_inline_dv,
+                    dv.offset,
+                    dv_normalization_root,
+                )
+            })
+            .transpose()
     }
 }
 
@@ -1007,6 +1245,9 @@ pub(crate) struct Remove {
     pub(crate) path: String,
 
     /// The time this logical file was created, as milliseconds since the epoch.
+    ///
+    /// Must be null when adaptiveMetadata is enabled on the table since metadata cleanup
+    /// uses tree reachability instead of timestamp-based expiration.
     #[cfg_attr(test, serde(skip_serializing_if = "Option::is_none"))]
     pub(crate) deletion_timestamp: Option<i64>,
 
@@ -1014,7 +1255,9 @@ pub(crate) struct Remove {
     /// in the added file must be contained in one or more remove actions in the same version.
     pub(crate) data_change: bool,
 
-    /// When true the fields `partition_values`, `size`, and `tags` are present
+    /// When true, the fields `partition_values` and `size` are present
+    ///
+    /// Must be true when adaptiveMetadata is enabled on the table.
     #[cfg_attr(test, serde(skip_serializing_if = "Option::is_none"))]
     pub(crate) extended_file_metadata: Option<bool>,
 
@@ -1035,6 +1278,8 @@ pub(crate) struct Remove {
 
     /// Contains [statistics] (e.g., count, min/max values for columns) about the data in this
     /// logical file encoded as a JSON string.
+    ///
+    /// Must be set when adaptiveMetadata is enabled on the table.
     ///
     /// [statistics]: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#Per-file-Statistics
     #[cfg_attr(test, serde(skip_serializing_if = "Option::is_none"))]
@@ -1058,6 +1303,13 @@ pub(crate) struct Remove {
     /// First commit version in which an add action with the same path was committed to the table.
     #[cfg_attr(test, serde(skip_serializing_if = "Option::is_none"))]
     pub(crate) default_row_commit_version: Option<i64>,
+
+    /// Back reference into the adaptive metadata tree. Required when the file's entry lives in a
+    /// leaf manifest; absent when the file has no leaf-manifest entry (it has no entry in the
+    /// tree, or its entry is inline in the root manifest).
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[cfg_attr(test, serde(skip_serializing_if = "Option::is_none"))]
+    pub(crate) back_reference: Option<BackReference>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, ToSchema)]
@@ -1096,11 +1348,10 @@ pub(crate) struct Cdc {
     pub tags: Option<HashMap<String, String>>,
 }
 
-#[derive(
-    Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema, IntoStructData, IntoEngineData,
-)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[internal_api]
+#[derive(Constructor, IntoStructData, ToSchema)]
 pub(crate) struct SetTransaction {
     /// A unique identifier for the application performing the transaction.
     pub(crate) app_id: String,
@@ -1113,12 +1364,25 @@ pub(crate) struct SetTransaction {
 }
 
 impl SetTransaction {
-    pub(crate) fn new(app_id: String, version: i64, last_updated: Option<i64>) -> Self {
-        Self {
-            app_id,
-            version,
-            last_updated,
-        }
+    /// Returns the application identifier.
+    #[internal_api]
+    #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
+    pub(crate) fn app_id(&self) -> &str {
+        &self.app_id
+    }
+
+    /// Returns the application-specific transaction version.
+    #[internal_api]
+    #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
+    pub(crate) fn version(&self) -> i64 {
+        self.version
+    }
+
+    /// Returns the last-updated timestamp, if captured.
+    #[internal_api]
+    #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
+    pub(crate) fn last_updated(&self) -> Option<i64> {
+        self.last_updated
     }
 
     /// Whether this transaction is expired: `last_updated <= expiration_timestamp` with both
@@ -1141,13 +1405,10 @@ impl SetTransaction {
 ///
 /// Contains the path, size, and version of the root manifest file.
 #[cfg(feature = "adaptive-metadata-in-dev")]
-#[derive(Debug, Clone, PartialEq, Eq, ToSchema, IntoStructData)]
+#[derive(Debug, Clone, PartialEq, Eq, ToSchema, IntoStructData, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 #[internal_api]
-#[cfg_attr(
-    test,
-    derive(Serialize, Deserialize, Default),
-    serde(rename_all = "camelCase")
-)]
+#[cfg_attr(test, derive(Default))]
 pub(crate) struct ContentRoot {
     /// Path to the root manifest file. It is absolute if it begins with an [RFC 3986] URI scheme
     /// (e.g. `s3://bucket/...`); otherwise it is relative and resolved against the table root by
@@ -1158,14 +1419,87 @@ pub(crate) struct ContentRoot {
     /// [Iceberg V4 relative paths specification]: https://iceberg.apache.org/spec/#paths-in-metadata
     pub(crate) path: String,
     /// Size of the root manifest file in bytes. Not exposed directly -- use
-    /// [`ContentRoot::to_filemeta`] to get a validated [`FileMeta`].
+    /// [`CheckpointAction::root_filemeta`] to get a validated [`FileMeta`].
     size_in_bytes: i64,
-    /// The table version the root manifest reflects. Per the adaptiveMetadata RFC this is
+    /// The table version the root manifest reflects. This is
     /// `<= checkpointMetadata.version`: equal in a manifest commit, and strictly less in a
     /// standalone checkpoint (where inline file actions cover the gap up to the checkpoint
     /// version). Distinct from [`CheckpointAction::version`], which is
     /// `checkpointMetadata.version`.
     version: i64,
+}
+
+/// Identifies the latest manifest commit up to a given table version.
+///
+/// Recorded on the `commitInfo` action and in the version checksum (`.crc`) file so readers can
+/// locate the most recent `checkpoint` action without scanning the log. See the
+/// [adaptiveMetadata RFC].
+///
+/// [adaptiveMetadata RFC]: https://github.com/delta-io/delta/pull/6978
+#[cfg(feature = "adaptive-metadata-in-dev")]
+#[derive(Debug, Clone, PartialEq, Eq, ToSchema, IntoStructData, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[internal_api]
+pub(crate) struct LastManifestCommit {
+    /// Version of the manifest commit that emitted the latest [`CheckpointAction`].
+    pub(crate) version: i64,
+    /// The [`ContentRoot::version`] of that checkpoint action. Never newer than [`Self::version`].
+    pub(crate) content_root_version: i64,
+}
+
+#[cfg(feature = "adaptive-metadata-in-dev")]
+impl LastManifestCommit {
+    /// Builds a reference to the manifest commit at `version` whose checkpoint action's content
+    /// root reflects `content_root_version`.
+    ///
+    /// Enforces the adaptiveMetadata invariants that both versions are non-negative and the
+    /// referenced content root version never exceeds the manifest commit version, so an invalid
+    /// pair can never be constructed. Mirrors the validation on `CheckpointAction`.
+    #[internal_api]
+    #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
+    pub(crate) fn new(version: i64, content_root_version: i64) -> KernelResult<Self> {
+        let last_manifest_commit = LastManifestCommit {
+            version,
+            content_root_version,
+        };
+        last_manifest_commit.validate()?;
+        Ok(last_manifest_commit)
+    }
+
+    /// Enforce the adaptiveMetadata invariants that `contentRootVersion` is non-negative and never
+    /// exceeds the manifest commit `version`. Because [`LastManifestCommit`] derives
+    /// [`Deserialize`], values parsed from JSON bypass [`Self::new`], so callers that deserialize
+    /// must invoke this explicitly.
+    pub(crate) fn validate(&self) -> KernelResult<()> {
+        require!(
+            self.content_root_version >= 0,
+            KernelError::generic(format!(
+                "lastManifestCommit contentRootVersion {} must be non-negative",
+                self.content_root_version
+            ))
+        );
+        require!(
+            self.content_root_version <= self.version,
+            KernelError::generic(format!(
+                "lastManifestCommit contentRootVersion {} exceeds version {}",
+                self.content_root_version, self.version
+            ))
+        );
+        Ok(())
+    }
+
+    /// Errors unless this names a manifest commit at or before `commit_version`, the version of
+    /// the commit or CRC that carries it.
+    pub(crate) fn ensure_at_or_before(&self, commit_version: Version) -> KernelResult<()> {
+        require!(
+            u64::try_from(self.version).is_ok_and(|v| v <= commit_version),
+            KernelError::generic(format!(
+                "lastManifestCommit version {} exceeds commit version {commit_version}",
+                self.version
+            ))
+        );
+        Ok(())
+    }
 }
 
 /// The checkpoint action embeds metadata tree state in a Delta log entry.
@@ -1174,9 +1508,6 @@ pub(crate) struct ContentRoot {
 /// references a root manifest file. The `version` field indicates the table version up to
 /// which the checkpoint is complete. For manifest commits, the checkpoint action also contains
 /// the table protocol and metadata, making the commit self-contained with respect to P+M.
-///
-///
-/// [adaptiveMetadata RFC]: https://github.com/delta-io/delta/pull/6978
 ///
 /// Example manifest-commit JSON:
 /// ```json
@@ -1191,6 +1522,15 @@ pub(crate) struct ContentRoot {
 ///   ]
 /// }
 /// ```
+// Serde is hand-written (see below), not derived: the wire form is a JSON array of tagged element
+// objects (`[{"checkpointMetadata":..}, {"contentRoot":..}, ..]`), not a struct. This is the same
+// shape the EngineData path uses, so the `_last_checkpoint` hint (which serdes this action) and log
+// replay share the wire form and the enumerated invariants (required singletons, no duplicates,
+// known sidecar `type`, `contentRoot.version <= checkpointMetadata.version`). They intentionally
+// differ on unknown elements: log replay skips a future element kind for forward compatibility (see
+// `visitors::CheckpointElementVisitor::visit`), whereas the serde path fails closed on it (an
+// externally-tagged enum with no catch-all), so a hint carrying one is dropped and the reader falls
+// back to log replay. Used by the hint's `AmtCheckpoint.checkpoint` field.
 #[cfg(feature = "adaptive-metadata-in-dev")]
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[internal_api]
@@ -1215,39 +1555,134 @@ pub(crate) struct CheckpointAction {
     pub(crate) domain_metadata_sidecars: Vec<Sidecar>,
 }
 
+// === CheckpointAction <-> JSON (array of tagged elements) ===
+
+/// One element of a [`CheckpointAction`]'s serialized array (the adaptiveMetadata "Checkpoint
+/// Action" wire form). A checkpoint action serializes as a JSON array of single-key tagged objects,
+/// so this is an externally-tagged enum keyed by the action name, reusing kernel's action structs
+/// to yield
+/// the same types as log replay. Having no catch-all variant, it fails the parse on an unrecognized
+/// action key -- deliberately fail-closed, unlike the forward-compatible EngineData
+/// `CheckpointElementVisitor`, which skips unknown elements. A hint carrying a future
+/// element kind is thus dropped and the reader falls back to log replay.
+#[cfg(feature = "adaptive-metadata-in-dev")]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+#[internal_api]
+pub(crate) enum CheckpointActionElement {
+    CheckpointMetadata(CheckpointMetadata),
+    ContentRoot(ContentRoot),
+    Protocol(Protocol),
+    #[serde(rename = "metaData")]
+    Metadata(Metadata),
+    DomainMetadata(DomainMetadata),
+    Txn(SetTransaction),
+    Sidecar(CheckpointSidecar),
+}
+
+/// A `sidecar` element inside a checkpoint action array. The wire form prefixes the [`Sidecar`]
+/// fields with a `type` discriminator (`"txn"` or `"domainMetadata"`) identifying which action kind
+/// the sidecar spills; [`Sidecar`] itself carries no type, so it is flattened in alongside it.
+#[cfg(feature = "adaptive-metadata-in-dev")]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+#[internal_api]
+pub(crate) struct CheckpointSidecar {
+    /// The action kind this sidecar spills: `"txn"` or `"domainMetadata"`.
+    #[serde(rename = "type")]
+    pub(crate) sidecar_type: String,
+    #[serde(flatten)]
+    pub(crate) sidecar: Sidecar,
+}
+
+#[cfg(feature = "adaptive-metadata-in-dev")]
+impl Serialize for CheckpointAction {
+    /// Emits the array of tagged elements in the same canonical order as
+    /// `try_into_scalar` (`checkpointMetadata`, `contentRoot`, `protocol`, `metaData`,
+    /// then `txn`, `domainMetadata`, and the `txn`/`domainMetadata` sidecars). Validates first,
+    /// so an invalid action can never be written through serde either.
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> KernelResult<S::Ok, S::Error> {
+        self.validate().map_err(serde::ser::Error::custom)?;
+        let checkpoint_metadata = CheckpointMetadata {
+            version: self.version,
+            tags: None,
+        };
+        let mut elements = vec![
+            CheckpointActionElement::CheckpointMetadata(checkpoint_metadata),
+            CheckpointActionElement::ContentRoot(self.content_root.clone()),
+            CheckpointActionElement::Protocol(self.protocol.clone()),
+            CheckpointActionElement::Metadata(self.metadata.clone()),
+        ];
+        elements.extend(
+            self.transactions
+                .iter()
+                .cloned()
+                .map(CheckpointActionElement::Txn),
+        );
+        elements.extend(
+            self.domain_metadata
+                .iter()
+                .cloned()
+                .map(CheckpointActionElement::DomainMetadata),
+        );
+        let sidecar_element = |type_str: &str, sidecar: &Sidecar| {
+            CheckpointActionElement::Sidecar(CheckpointSidecar {
+                sidecar_type: type_str.to_string(),
+                sidecar: sidecar.clone(),
+            })
+        };
+        elements.extend(
+            self.txn_sidecars
+                .iter()
+                .map(|s| sidecar_element(SET_TRANSACTION_NAME, s)),
+        );
+        elements.extend(
+            self.domain_metadata_sidecars
+                .iter()
+                .map(|s| sidecar_element(DOMAIN_METADATA_NAME, s)),
+        );
+        elements.serialize(serializer)
+    }
+}
+
+#[cfg(feature = "adaptive-metadata-in-dev")]
+impl<'de> Deserialize<'de> for CheckpointAction {
+    /// Folds the array of tagged elements into a typed action, applying the same enumerated
+    /// checks as the EngineData [`visitors::CheckpointVisitor`]: required singletons, no
+    /// duplicates, known sidecar `type`, and the `contentRoot.version <=
+    /// checkpointMetadata.version` invariant. The one intended difference is unknown elements:
+    /// this path fails closed on an unrecognized element key (see [`CheckpointActionElement`]),
+    /// whereas the visitor skips it for forward compatibility.
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> KernelResult<Self, D::Error> {
+        let elements = Vec::<CheckpointActionElement>::deserialize(deserializer)?;
+        Self::from_elements(elements).map_err(serde::de::Error::custom)
+    }
+}
+
 // === CheckpointAction -> EngineData ===
 
 /// Build the `sidecar` element payload: a [`Sidecar`] scalar prefixed with a `type` discriminator
 /// (`"txn"` or `"domainMetadata"`), matching [`CONTENT_SIDECAR_FIELD`].
 #[cfg(feature = "adaptive-metadata-in-dev")]
-fn content_sidecar_element(type_str: &str, sidecar: Sidecar) -> DeltaResult<Scalar> {
+fn content_sidecar_element(type_str: &str, sidecar: Sidecar) -> KernelResult<Scalar> {
     let sidecar: StructData = sidecar.into();
     let fields = std::iter::once(StructField::not_null("type", DataType::STRING))
         .chain(sidecar.fields().iter().cloned());
     let values = std::iter::once(Scalar::from(type_str))
         .chain(sidecar.values().iter().cloned())
         .collect();
-    // `from_values_unchecked`, not `try_new`: `Sidecar::tags` carries
-    // `#[allow_null_container_values]` so its schema field declares value-nullable maps, while
-    // the derived `.into()` value is a non-nullable map -- a leaf-level mismatch `try_new`
-    // would reject. This is inert because the enclosing `checkpoint_action_union_element` still
-    // validates the composite against `CONTENT_SIDECAR_FIELD`, and materialization derives map
-    // nullability from the schema, not the scalar. Tracked by delta-io/delta-kernel-rs#3136,
-    // which will let this use `try_new`.
-    Ok(Scalar::Struct(StructData::from_values_unchecked(
-        StructType::try_new(fields)?,
-        values,
-    )))
+    let fields = StructType::try_new(fields)?.into_fields().collect();
+    Ok(Scalar::Struct(StructData::try_new(fields, values)?))
 }
 
 /// Wrap a single element `value` into a full union struct matching the checkpoint array's element
 /// type: the field named `field_name` holds `value`, every other field is a typed null.
 #[cfg(feature = "adaptive-metadata-in-dev")]
-fn checkpoint_action_union_element(field_name: &str, value: Scalar) -> DeltaResult<Scalar> {
+fn checkpoint_action_union_element(field_name: &str, value: Scalar) -> KernelResult<Scalar> {
     let fields: Vec<StructField> = CHECKPOINT_ACTION_ELEMENT_SCHEMA.fields().cloned().collect();
     require!(
         fields.iter().any(|f| f.name() == field_name),
-        Error::generic(format!(
+        KernelError::generic(format!(
             "checkpoint union element field {field_name:?} not found in element schema"
         ))
     );
@@ -1264,18 +1699,14 @@ fn checkpoint_action_union_element(field_name: &str, value: Scalar) -> DeltaResu
     Ok(Scalar::Struct(StructData::try_new(fields, values)?))
 }
 
-// `CheckpointAction` cannot use `#[derive(IntoEngineData)]`/`create_one`: its single `checkpoint`
-// column is an array whose elements are a union struct (one field per action kind), and
-// `create_one` only flattens to leaves. Instead we build the whole column as one non-flattened
-// `Scalar::Array` and materialize it via `create_many` (whose `Scalar::append_to` recurses through
-// Array/Struct/Null).
 #[cfg(feature = "adaptive-metadata-in-dev")]
-impl IntoEngineData for CheckpointAction {
-    fn into_engine_data(
-        self,
-        schema: SchemaRef,
-        engine: &dyn Engine,
-    ) -> DeltaResult<Box<dyn EngineData>> {
+impl CheckpointAction {
+    /// Encodes this action as its single `checkpoint` column [`Scalar`]: an array whose elements
+    /// are a union struct (one field per action kind). Unlike the other actions, it has no derived
+    /// struct-scalar conversion because that nested array-of-union shape can't be expressed by the
+    /// derive, so we build the `Scalar::Array` by hand. This is also where the action is validated,
+    /// hence a fallible method rather than an infallible `From`.
+    fn try_into_scalar(self) -> KernelResult<Scalar> {
         self.validate()?;
         let checkpoint_metadata = CheckpointMetadata {
             version: self.version,
@@ -1309,86 +1740,59 @@ impl IntoEngineData for CheckpointAction {
         }
 
         let array_type = ArrayType::new(CHECKPOINT_ACTION_ELEMENT_SCHEMA.clone(), false);
-        let array = Scalar::Array(ArrayData::try_new(array_type, elements)?);
-        engine.evaluation_handler().create_many(schema, &[&[array]])
+        Ok(Scalar::Array(ArrayData::try_new(array_type, elements)?))
     }
-}
-
-/// Returns whether `location` begins with a URI scheme, per [RFC 3986 section 3.1]:
-/// `scheme = ALPHA *( ALPHA / DIGIT / "+" / "-" / "." )`, terminated by `:`.
-///
-/// [RFC 3986 section 3.1]: https://datatracker.ietf.org/doc/html/rfc3986#section-3.1
-#[cfg(feature = "adaptive-metadata-in-dev")]
-fn has_scheme(location: &str) -> bool {
-    for (position, ch) in location.char_indices() {
-        if ch == ':' {
-            return position > 0;
-        }
-        if !is_scheme_char(ch, position) {
-            return false;
-        }
-    }
-    false
-}
-
-/// Returns whether `ch` is allowed at `position` in a URI scheme, per [RFC 3986 section 3.1]:
-/// the first character must be `ALPHA`; subsequent characters may also be `DIGIT`, `+`, `-`, or
-/// `.`. Schemes are restricted to US-ASCII, so non-ASCII letters are rejected.
-///
-/// [RFC 3986 section 3.1]: https://datatracker.ietf.org/doc/html/rfc3986#section-3.1
-#[cfg(feature = "adaptive-metadata-in-dev")]
-fn is_scheme_char(ch: char, position: usize) -> bool {
-    if ch.is_ascii_alphabetic() {
-        return true;
-    }
-    position > 0 && (ch.is_ascii_digit() || ch == '+' || ch == '-' || ch == '.')
 }
 
 #[cfg(feature = "adaptive-metadata-in-dev")]
 impl ContentRoot {
-    /// Convert this root manifest reference into a [`FileMeta`] for engine I/O.
-    ///
-    /// A `path` with a URI scheme is absolute and used as-is; otherwise it is resolved relative to
-    /// `table_root` by concatenation with a single `/` separator, matching Iceberg V4's
-    /// [relative paths specification].
-    ///
-    /// Returns an error if the resolved location fails to parse as a [`Url`], or if the size does
-    /// not fit a [`crate::FileSize`].
-    ///
-    /// [relative paths specification]: https://iceberg.apache.org/spec/#paths-in-metadata
-    #[internal_api]
-    pub(crate) fn to_filemeta(&self, table_root: &Url) -> DeltaResult<FileMeta> {
-        let path = &self.path;
-        let location = if has_scheme(path) {
-            // A URI scheme means the path is absolute and used as-is.
-            Url::parse(path).map_err(|e| {
-                Error::generic(format!(
-                    "Failed to parse absolute checkpoint contentRoot path {path:?}: {e}"
-                ))
-            })?
-        } else {
-            // Otherwise the path is relative and concatenated onto `table_root` with a single `/`.
-            let mut base = table_root.as_str().to_string();
-            if !base.ends_with('/') {
-                base.push('/');
-            }
-            Url::parse(&format!("{base}{path}")).map_err(|e| {
-                Error::generic(format!(
-                    "Failed to resolve checkpoint contentRoot path {path:?} against table \
-                     root {base}: {e}"
-                ))
-            })?
-        };
-        Ok(FileMeta {
-            location,
-            last_modified: i64::MAX,
-            size: to_file_size(self.size_in_bytes, "checkpoint contentRoot")?,
-        })
+    /// Builds a reference to a root manifest at `path`, `size_in_bytes`, reflecting `version`.
+    pub(crate) fn new(path: String, size_in_bytes: i64, version: i64) -> Self {
+        ContentRoot {
+            path,
+            size_in_bytes,
+            version,
+        }
     }
 }
 
 #[cfg(feature = "adaptive-metadata-in-dev")]
 impl CheckpointAction {
+    /// Builds a checkpoint action at `version` with all `transactions` and `domain_metadata`
+    /// inlined and no sidecars.
+    // TODO(#2866): spill transactions and domain metadata into sidecars once the adaptiveMetadata
+    // sidecar format is defined.
+    #[internal_api]
+    pub(crate) fn new(
+        version: i64,
+        content_root: ContentRoot,
+        protocol: Protocol,
+        metadata: Metadata,
+        transactions: Vec<SetTransaction>,
+        domain_metadata: Vec<DomainMetadata>,
+    ) -> Self {
+        CheckpointAction {
+            version,
+            content_root,
+            protocol,
+            metadata,
+            transactions,
+            domain_metadata,
+            txn_sidecars: vec![],
+            domain_metadata_sidecars: vec![],
+        }
+    }
+
+    /// Serialize this checkpoint action into a single-row `EngineData`.
+    #[internal_api]
+    pub(crate) fn into_engine_data(self, engine: &dyn Engine) -> KernelResult<Box<dyn EngineData>> {
+        create_row(
+            engine,
+            LOG_CHECKPOINT_SCHEMA.clone(),
+            self.try_into_scalar()?,
+        )
+    }
+
     /// Parse the first `checkpoint` action in `data`, ignoring any later ones. Rows without a
     /// `checkpoint` action are skipped, so `Ok(None)` means the batch had none at all.
     ///
@@ -1398,19 +1802,83 @@ impl CheckpointAction {
     #[internal_api]
     pub(crate) fn try_new_from_data(
         data: &dyn EngineData,
-    ) -> DeltaResult<Option<CheckpointAction>> {
+    ) -> KernelResult<Option<CheckpointAction>> {
         let mut visitor = visitors::CheckpointVisitor::default();
         visitor.visit_rows_of(data)?;
         Ok(visitor.checkpoint)
     }
 
+    /// Folds a deserialized array of tagged [`CheckpointActionElement`]s into a checkpoint
+    /// action, mirroring [`visitors::CheckpointVisitor`]: the four required elements are singletons
+    /// (missing or repeated is an error), `txn`/`domainMetadata` are collected, `sidecar` entries
+    /// are split by their `type` (unknown types error), and the assembled action is validated.
+    fn from_elements(elements: Vec<CheckpointActionElement>) -> KernelResult<Self> {
+        fn set_once<T>(slot: &mut Option<T>, value: T, name: &str) -> KernelResult<()> {
+            require!(
+                slot.replace(value).is_none(),
+                KernelError::generic(format!("duplicate `{name}` element in checkpoint action"))
+            );
+            Ok(())
+        }
+
+        let mut version = None;
+        let mut content_root = None;
+        let mut protocol = None;
+        let mut metadata = None;
+        let mut transactions = Vec::new();
+        let mut domain_metadata = Vec::new();
+        let mut txn_sidecars = Vec::new();
+        let mut domain_metadata_sidecars = Vec::new();
+        for element in elements {
+            match element {
+                CheckpointActionElement::CheckpointMetadata(cm) => {
+                    set_once(&mut version, cm.version, CHECKPOINT_METADATA_NAME)?
+                }
+                CheckpointActionElement::ContentRoot(cr) => {
+                    set_once(&mut content_root, cr, CONTENT_ROOT_NAME)?
+                }
+                CheckpointActionElement::Protocol(p) => set_once(&mut protocol, p, PROTOCOL_NAME)?,
+                CheckpointActionElement::Metadata(m) => set_once(&mut metadata, m, METADATA_NAME)?,
+                CheckpointActionElement::Txn(t) => transactions.push(t),
+                CheckpointActionElement::DomainMetadata(dm) => domain_metadata.push(dm),
+                CheckpointActionElement::Sidecar(cs) => match cs.sidecar_type.as_str() {
+                    SET_TRANSACTION_NAME => txn_sidecars.push(cs.sidecar),
+                    DOMAIN_METADATA_NAME => domain_metadata_sidecars.push(cs.sidecar),
+                    other => {
+                        return Err(KernelError::generic(format!(
+                            "checkpoint sidecar has unsupported type `{other}`"
+                        )));
+                    }
+                },
+            }
+        }
+
+        let missing = |field: &str| {
+            KernelError::generic(format!(
+                "checkpoint action is missing required `{field}` element"
+            ))
+        };
+        let action = CheckpointAction {
+            version: version.ok_or_else(|| missing(CHECKPOINT_METADATA_NAME))?,
+            content_root: content_root.ok_or_else(|| missing(CONTENT_ROOT_NAME))?,
+            protocol: protocol.ok_or_else(|| missing(PROTOCOL_NAME))?,
+            metadata: metadata.ok_or_else(|| missing(METADATA_NAME))?,
+            transactions,
+            domain_metadata,
+            txn_sidecars,
+            domain_metadata_sidecars,
+        };
+        action.validate()?;
+        Ok(action)
+    }
+
     /// Enforce the adaptiveMetadata invariant that `contentRoot.version` never exceeds the
     /// checkpoint version. Called on both the parse and serialize paths so a `CheckpointAction`
     /// can never be written in a shape the reader would reject.
-    fn validate(&self) -> DeltaResult<()> {
+    fn validate(&self) -> KernelResult<()> {
         require!(
             self.content_root.version <= self.version,
-            Error::generic(format!(
+            KernelError::generic(format!(
                 "checkpoint contentRoot.version {} exceeds checkpointMetadata.version {}",
                 self.content_root.version, self.version
             ))
@@ -1424,17 +1892,37 @@ impl CheckpointAction {
         &self.content_root.path
     }
 
+    /// The table version the root manifest reflects (delegates to the nested [`ContentRoot`]).
+    #[internal_api]
+    pub(crate) fn content_root_version(&self) -> i64 {
+        self.content_root.version
+    }
+
     /// Get the checkpoint version.
     #[internal_api]
     pub(crate) fn version(&self) -> i64 {
         self.version
     }
 
-    /// Convert the referenced root manifest into a [`FileMeta`] for engine I/O (delegates to
-    /// [`ContentRoot::to_filemeta`]).
+    /// Convert the referenced root manifest into a [`FileMeta`] for engine I/O.
+    ///
+    /// The `contentRoot` path is absolute if it has a URI scheme, otherwise it is resolved relative
+    /// to `table_root` by concatenation with a single `/` separator, matching Iceberg V4's
+    /// [relative paths specification].
+    ///
+    /// Returns an error if the resolved location fails to parse as a [`Url`], or if the size does
+    /// not fit a [`crate::FileSize`].
+    ///
+    /// [relative paths specification]: https://iceberg.apache.org/spec/#paths-in-metadata
     #[internal_api]
-    pub(crate) fn root_filemeta(&self, table_root: &Url) -> DeltaResult<FileMeta> {
-        self.content_root.to_filemeta(table_root)
+    pub(crate) fn root_filemeta(&self, table_root: &Url) -> KernelResult<FileMeta> {
+        let content_root = &self.content_root;
+        amt_manifest_filemeta(
+            &content_root.path,
+            content_root.size_in_bytes,
+            table_root,
+            "checkpoint contentRoot",
+        )
     }
 
     /// The table protocol embedded in this checkpoint action (at [`Self::version`]).
@@ -1478,22 +1966,29 @@ pub(crate) struct Sidecar {
     pub tags: Option<HashMap<String, String>>,
 }
 
-/// Convert an `i64` byte count from a log action into a [`FileSize`], erroring with `context` (a
-/// short action name, e.g. `"sidecar"`) and the offending value when it is negative.
-fn to_file_size(bytes: i64, context: &str) -> DeltaResult<FileSize> {
-    bytes.try_into().map_err(|_| {
-        Error::generic(format!(
-            "Failed to convert {context} size {bytes} to FileSize"
-        ))
-    })
-}
-
 impl Sidecar {
+    /// Creates a sidecar action.
+    #[internal_api]
+    #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
+    pub(crate) fn new(
+        path: String,
+        size_in_bytes: i64,
+        modification_time: i64,
+        tags: Option<HashMap<String, String>>,
+    ) -> Self {
+        Self {
+            path,
+            size_in_bytes,
+            modification_time,
+            tags,
+        }
+    }
+
     /// Convert a Sidecar record to a FileMeta.
     ///
     /// This helper first builds the URL by joining the provided log_root with
     /// the "_sidecars/" folder and the given sidecar path.
-    pub(crate) fn to_filemeta(&self, log_root: &Url) -> DeltaResult<FileMeta> {
+    pub(crate) fn to_filemeta(&self, log_root: &Url) -> KernelResult<FileMeta> {
         Ok(FileMeta {
             location: log_root.join("_sidecars/")?.join(&self.path)?,
             last_modified: self.modification_time,
@@ -1506,9 +2001,10 @@ impl Sidecar {
 /// specification.
 ///
 /// [More info]: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#checkpoint-metadata
-#[derive(Debug, Clone, PartialEq, Eq, ToSchema, IntoStructData, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[internal_api]
+#[derive(Constructor, IntoStructData, ToSchema)]
 pub(crate) struct CheckpointMetadata {
     /// The version of the V2 spec checkpoint.
     ///
@@ -1519,8 +2015,25 @@ pub(crate) struct CheckpointMetadata {
     pub(crate) version: i64,
 
     /// Map containing any additional metadata about the V2 spec checkpoint. Values can be null.
+    #[serde(skip_serializing_if = "Option::is_none")]
     #[allow_null_container_values]
     pub(crate) tags: Option<HashMap<String, String>>,
+}
+
+impl CheckpointMetadata {
+    /// Returns the checkpoint version.
+    #[internal_api]
+    #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
+    pub(crate) fn version(&self) -> i64 {
+        self.version
+    }
+
+    /// Returns checkpoint tags, preserving absent versus empty maps.
+    #[internal_api]
+    #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
+    pub(crate) fn tags(&self) -> Option<&HashMap<String, String>> {
+        self.tags.as_ref()
+    }
 }
 
 /// The [DomainMetadata] action contains a configuration (string) for a named metadata domain. Two
@@ -1530,9 +2043,7 @@ pub(crate) struct CheckpointMetadata {
 /// Note that the `delta.*` domain is reserved for internal use.
 ///
 /// [DomainMetadata]: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#domain-metadata
-#[derive(
-    Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema, IntoStructData, IntoEngineData,
-)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema, IntoStructData)]
 pub struct DomainMetadata {
     domain: String,
     configuration: String,
@@ -1541,6 +2052,7 @@ pub struct DomainMetadata {
 
 impl DomainMetadata {
     /// Create a new DomainMetadata action.
+    #[internal_api]
     pub(crate) fn new(domain: String, configuration: String) -> Self {
         Self {
             domain,
@@ -1550,6 +2062,7 @@ impl DomainMetadata {
     }
 
     /// Create a new DomainMetadata action to remove a domain.
+    #[internal_api]
     pub(crate) fn remove(domain: String, configuration: String) -> Self {
         Self {
             domain,
@@ -1588,19 +2101,24 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    use crate::FileSize;
     use crate::arrow::array::{
-        Array, BooleanArray, Int32Array, Int64Array, ListArray, ListBuilder, MapBuilder,
-        MapFieldNames, RecordBatch, StringArray, StringBuilder, StructArray,
+        Array, Int32Array, ListBuilder, RecordBatch, StringBuilder, StructArray,
     };
     use crate::arrow::datatypes::{DataType as ArrowDataType, Field, Schema};
     use crate::arrow::json::ReaderBuilder;
     use crate::engine::arrow_data::EngineDataArrowExt as _;
     use crate::engine::arrow_expression::ArrowEvaluationHandler;
-    use crate::expressions::Scalar;
-    use crate::schema::{schema, schema_ref, DataType, MapType, StructField};
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    use crate::engine::to_json_bytes;
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    use crate::engine_data::FilteredEngineData;
+    use crate::expressions::{Scalar, StructData};
+    use crate::schema::{DataType, MapType, StructField, schema, schema_ref};
     use crate::unit_test_utils::assert_result_error_with_message;
     use crate::{
-        Engine, EvaluationHandler, IntoEngineData, JsonHandler, ParquetHandler, StorageHandler,
+        Engine, EvaluationHandler, JsonHandler, ParquetHandler, StorageHandler, create_row,
     };
 
     #[rstest]
@@ -1646,25 +2164,6 @@ mod tests {
         }
     }
 
-    fn create_string_map_builder(
-        nullable_values: bool,
-    ) -> MapBuilder<StringBuilder, StringBuilder> {
-        MapBuilder::new(
-            Some(MapFieldNames {
-                entry: "key_value".to_string(),
-                key: "key".to_string(),
-                value: "value".to_string(),
-            }),
-            StringBuilder::new(),
-            StringBuilder::new(),
-        )
-        .with_values_field(Field::new(
-            "value".to_string(),
-            ArrowDataType::Utf8,
-            nullable_values,
-        ))
-    }
-
     #[rstest]
     #[case::no_expiration_configured(None, Some(1000), false)]
     #[case::null_last_updated_never_expires(Some(5000), None, false)]
@@ -1683,6 +2182,30 @@ mod tests {
             txn.non_expired_version(expiration_timestamp),
             (!expired).then_some(7)
         );
+    }
+
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[test]
+    fn test_last_manifest_commit_schema() {
+        let expected = schema! {
+            not_null "version": LONG,
+            not_null "contentRootVersion": LONG,
+        };
+        assert_eq!(LastManifestCommit::to_schema(), expected);
+    }
+
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[rstest]
+    #[case::equal(5, 5, true)]
+    #[case::content_root_older(5, 3, true)]
+    #[case::content_root_newer(3, 5, false)]
+    fn test_last_manifest_commit_new_validates(
+        #[case] version: i64,
+        #[case] content_root_version: i64,
+        #[case] ok: bool,
+    ) {
+        let result = LastManifestCommit::new(version, content_root_version);
+        assert_eq!(result.is_ok(), ok);
     }
 
     #[test]
@@ -1714,7 +2237,7 @@ mod tests {
     #[case::exceeded(42, true)]
     fn parse_schema_nesting_boundary(#[case] depth: usize, #[case] exceeds_limit: bool) {
         let metadata = Metadata {
-            schema_string: serde_json::to_string(&nested_schema(depth)).unwrap(),
+            schema_string: Arc::new(serde_json::to_string(&nested_schema(depth)).unwrap()),
             ..Default::default()
         };
 
@@ -1729,10 +2252,10 @@ mod tests {
                 ),
             );
             let error = match result.unwrap_err() {
-                Error::Backtraced { source, .. } => *source,
+                KernelError::Backtraced { source, .. } => *source,
                 error => error,
             };
-            assert!(matches!(error, Error::Schema(_)));
+            assert!(matches!(error, KernelError::Schema(_)));
         } else {
             result.unwrap();
         }
@@ -1779,21 +2302,24 @@ mod tests {
         #[case] expected_error: &str,
     ) {
         let metadata = Metadata {
-            schema_string: schema_string.to_string(),
+            schema_string: Arc::new(schema_string.to_string()),
             ..Default::default()
         };
         // Error conversion captures a backtrace only when enabled, so normalize both forms before
         // checking the underlying error.
         let error = match metadata.parse_schema().unwrap_err() {
-            Error::Backtraced { source, .. } => *source,
+            KernelError::Backtraced { source, .. } => *source,
             error => error,
         };
         match expected_error {
             "MalformedJson" => {
-                assert!(matches!(error, Error::MalformedJson(_)), "got: {error:?}")
+                assert!(
+                    matches!(error, KernelError::MalformedJson(_)),
+                    "got: {error:?}"
+                )
             }
             "Schema" => {
-                assert!(matches!(error, Error::Schema(_)), "got: {error:?}")
+                assert!(matches!(error, KernelError::Schema(_)), "got: {error:?}")
             }
             other => panic!("unknown expected_error discriminant: {other}"),
         }
@@ -1812,6 +2338,24 @@ mod tests {
             .project(&[ADD_NAME])
             .expect("Couldn't get add field");
 
+        #[cfg(feature = "adaptive-metadata-in-dev")]
+        let expected = schema_ref! {
+            nullable "add": {
+                not_null "path": STRING,
+                not_null "partitionValues": { STRING => nullable STRING },
+                not_null "size": LONG,
+                not_null "modificationTime": LONG,
+                not_null "dataChange": BOOLEAN,
+                nullable "stats": STRING,
+                nullable "tags": { STRING => nullable STRING },
+                (deletion_vector_field()),
+                nullable "baseRowId": LONG,
+                nullable "defaultRowCommitVersion": LONG,
+                nullable "clusteringProvider": STRING,
+                nullable "backReference": (BackReference::to_schema()),
+            },
+        };
+        #[cfg(not(feature = "adaptive-metadata-in-dev"))]
         let expected = schema_ref! {
             nullable "add": {
                 not_null "path": STRING,
@@ -1862,6 +2406,24 @@ mod tests {
         let schema = get_commit_schema()
             .project(&[REMOVE_NAME])
             .expect("Couldn't get remove field");
+        #[cfg(feature = "adaptive-metadata-in-dev")]
+        let expected = schema_ref! {
+            nullable "remove": {
+                not_null "path": STRING,
+                nullable "deletionTimestamp": LONG,
+                not_null "dataChange": BOOLEAN,
+                nullable "extendedFileMetadata": BOOLEAN,
+                (partition_values_field()),
+                nullable "size": LONG,
+                nullable "stats": STRING,
+                (tags_field()),
+                (deletion_vector_field()),
+                nullable "baseRowId": LONG,
+                nullable "defaultRowCommitVersion": LONG,
+                nullable "backReference": (BackReference::to_schema()),
+            },
+        };
+        #[cfg(not(feature = "adaptive-metadata-in-dev"))]
         let expected = schema_ref! {
             nullable "remove": {
                 not_null "path": STRING,
@@ -1945,6 +2507,7 @@ mod tests {
             .project(&["commitInfo"])
             .expect("Couldn't get commitInfo field");
 
+        #[cfg(feature = "adaptive-metadata-in-dev")]
         let expected = schema_ref! {
             nullable "commitInfo": {
                 nullable "timestamp": LONG,
@@ -1956,6 +2519,27 @@ mod tests {
                 nullable "isBlindAppend": BOOLEAN,
                 nullable "engineInfo": STRING,
                 nullable "txnId": STRING,
+                nullable "tags": { STRING => nullable STRING },
+                nullable "dataChange": BOOLEAN,
+                nullable "lastManifestCommit": {
+                    not_null "version": LONG,
+                    not_null "contentRootVersion": LONG,
+                },
+            },
+        };
+        #[cfg(not(feature = "adaptive-metadata-in-dev"))]
+        let expected = schema_ref! {
+            nullable "commitInfo": {
+                nullable "timestamp": LONG,
+                nullable "inCommitTimestamp": LONG,
+                nullable "operation": STRING,
+                nullable "operationParameters": { STRING => nullable STRING },
+                nullable "operationMetrics": { STRING => nullable STRING },
+                nullable "kernelVersion": STRING,
+                nullable "isBlindAppend": BOOLEAN,
+                nullable "engineInfo": STRING,
+                nullable "txnId": STRING,
+                nullable "tags": { STRING => nullable STRING },
             },
         };
         assert_eq!(schema, expected);
@@ -2012,7 +2596,7 @@ mod tests {
                     reader_features,
                     writer_features
                 ),
-                Err(Error::InvalidProtocol(_)),
+                Err(KernelError::InvalidProtocol(_)),
             ));
         }
     }
@@ -2024,9 +2608,13 @@ mod tests {
     #[case(1, -1)]
     fn reject_protocol_version_below_minimum(#[case] rv: i32, #[case] wv: i32) {
         let expected = if rv < 1 {
-            format!("Invalid protocol action in the delta log: min_reader_version must be >= 1, got {rv}")
+            format!(
+                "Invalid protocol action in the delta log: min_reader_version must be >= 1, got {rv}"
+            )
         } else {
-            format!("Invalid protocol action in the delta log: min_writer_version must be >= 1, got {wv}")
+            format!(
+                "Invalid protocol action in the delta log: min_writer_version must be >= 1, got {wv}"
+            )
         };
         assert_result_error_with_message(
             Protocol::try_new(rv, wv, TableFeature::NO_LIST, TableFeature::NO_LIST),
@@ -2064,10 +2652,7 @@ mod tests {
             ),
             (
                 vec![TableFeature::VariantType],
-                vec![
-                    TableFeature::VariantType,
-                    TableFeature::DeletionVectors,
-                ],
+                vec![TableFeature::VariantType, TableFeature::DeletionVectors],
                 "Writer features must be Writer-only or also listed in reader features",
             ),
             // WriterOnly feature present in reader features
@@ -2085,7 +2670,7 @@ mod tests {
             assert!(
                 matches!(
                     &res,
-                    Err(Error::InvalidProtocol(error)) if error.to_string().contains(error_msg)
+                    Err(KernelError::InvalidProtocol(error)) if error.to_string().contains(error_msg)
                 ),
                 "Expected message containing:\t{error_msg}\nBut got:{res:?}\n"
             );
@@ -2223,99 +2808,28 @@ mod tests {
     }
 
     #[test]
-    fn test_into_engine_data() {
-        let engine = ExprEngine::new();
-
-        let set_transaction = SetTransaction {
-            app_id: "app_id".to_string(),
-            version: 0,
-            last_updated: None,
-        };
-
-        let engine_data =
-            set_transaction.into_engine_data(SetTransaction::to_schema().into(), &engine);
-        let record_batch = engine_data.try_into_record_batch().unwrap();
-
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("appId", ArrowDataType::Utf8, false),
-            Field::new("version", ArrowDataType::Int64, false),
-            Field::new("lastUpdated", ArrowDataType::Int64, true),
-        ]));
-
-        let expected = RecordBatch::try_new(
-            schema,
-            vec![
-                Arc::new(StringArray::from(vec!["app_id"])),
-                Arc::new(Int64Array::from(vec![0_i64])),
-                Arc::new(Int64Array::from(vec![None::<i64>])),
-            ],
+    fn metadata_clone_preserves_schema_when_another_copy_changes() {
+        let original_schema = schema_ref! { not_null "id": INTEGER };
+        let metadata = Metadata::try_new(
+            None,
+            None,
+            original_schema.clone(),
+            vec![],
+            0,
+            HashMap::new(),
         )
         .unwrap();
-
-        assert_eq!(record_batch, expected);
-    }
-
-    #[test]
-    fn test_commit_info_into_engine_data() {
-        let engine = ExprEngine::new();
-
-        let commit_info = CommitInfo::new(0, None, None, None, false);
-        let commit_info_txn_id = commit_info.txn_id.clone();
-
-        let engine_data = commit_info.into_engine_data(CommitInfo::to_schema().into(), &engine);
-        let record_batch = engine_data.try_into_record_batch().unwrap();
-
-        let mut map_builder = create_string_map_builder(true);
-        map_builder.append(true).unwrap();
-        let operation_parameters = Arc::new(map_builder.finish());
-        let mut map_builder = create_string_map_builder(true);
-        map_builder.append(false).unwrap();
-        let operation_metrics = Arc::new(map_builder.finish());
-
-        let expected = RecordBatch::try_new(
-            record_batch.schema(),
-            vec![
-                Arc::new(Int64Array::from(vec![Some(0)])),
-                Arc::new(Int64Array::from(vec![None::<i64>])),
-                Arc::new(StringArray::from(vec![Some("UNKNOWN")])),
-                operation_parameters,
-                operation_metrics,
-                Arc::new(StringArray::from(vec![Some(format!("v{KERNEL_VERSION}"))])),
-                Arc::new(BooleanArray::from(vec![None::<bool>])),
-                Arc::new(StringArray::from(vec![None::<String>])),
-                Arc::new(StringArray::from(vec![commit_info_txn_id])),
-            ],
-        )
-        .unwrap();
-
-        assert_eq!(record_batch, expected);
-    }
-
-    #[test]
-    fn test_domain_metadata_into_engine_data() {
-        let engine = ExprEngine::new();
-
-        let domain_metadata = DomainMetadata {
-            domain: "my.domain".to_string(),
-            configuration: "config_value".to_string(),
-            removed: false,
-        };
-
-        let engine_data =
-            domain_metadata.into_engine_data(DomainMetadata::to_schema().into(), &engine);
-        let record_batch = engine_data.try_into_record_batch().unwrap();
-
-        let expected = RecordBatch::try_new(
-            record_batch.schema(),
-            vec![
-                Arc::new(StringArray::from(vec!["my.domain"])),
-                Arc::new(StringArray::from(vec!["config_value"])),
-                Arc::new(BooleanArray::from(vec![false])),
-            ],
-        )
-        .unwrap();
-
-        assert_eq!(record_batch, expected);
+        let saved_json = serde_json::to_value(&metadata).unwrap();
+        let copy = metadata.clone();
+        assert!(Arc::ptr_eq(&metadata.schema_string, &copy.schema_string));
+        let changed = metadata
+            .with_schema(schema_ref! { nullable "name": STRING })
+            .unwrap();
+        assert_eq!(copy.parse_schema().unwrap(), *original_schema);
+        assert_ne!(changed.schema_string(), copy.schema_string());
+        assert_eq!(serde_json::to_value(&copy).unwrap(), saved_json);
+        let decoded: Metadata = serde_json::from_value(saved_json).unwrap();
+        assert_eq!(decoded, copy);
     }
 
     #[test]
@@ -2336,7 +2850,7 @@ mod tests {
         assert!(!metadata.id.is_empty());
         assert_eq!(metadata.name, Some("test_table".to_string()));
         assert_eq!(
-            metadata.schema_string,
+            metadata.schema_string.as_str(),
             serde_json::to_string(&schema).unwrap()
         );
         assert_eq!(metadata.created_time, Some(1234567890));
@@ -2405,54 +2919,6 @@ mod tests {
     }
 
     #[test]
-    fn test_metadata_into_engine_data() {
-        let engine = ExprEngine::new();
-        let schema = schema_ref! { not_null "id": INTEGER };
-
-        let test_metadata = Metadata::try_new(
-            Some("test".to_string()),
-            Some("my table".to_string()),
-            schema.clone(),
-            vec!["part".to_string()],
-            123,
-            HashMap::from([("k".to_string(), "v".to_string())]),
-        )
-        .unwrap();
-
-        // have to get the id since it's random
-        let test_id = test_metadata.id.clone();
-        let actual = test_metadata
-            .into_engine_data(Metadata::to_schema().into(), &engine)
-            .unwrap()
-            .try_into_record_batch()
-            .unwrap();
-
-        let expected_json = json!({
-            "id": test_id,
-            "name": "test",
-            "description": "my table",
-            "format": {
-                "provider": "parquet",
-                "options": {}
-            },
-            "schemaString": "{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{}}]}",
-            "partitionColumns": ["part"],
-            "createdTime": 123,
-            "configuration": {
-                "k": "v"
-            }
-        }).to_string();
-        let expected = ReaderBuilder::new(actual.schema())
-            .build(expected_json.as_bytes())
-            .unwrap()
-            .next()
-            .unwrap()
-            .unwrap();
-
-        assert_eq!(actual, expected);
-    }
-
-    #[test]
     fn test_metadata_with_log_schema() {
         let engine = ExprEngine::new();
         let schema = schema_ref! { not_null "id": INTEGER };
@@ -2471,8 +2937,7 @@ mod tests {
 
         // test with the full log schema that wraps metadata in a "metaData" field
         let commit_schema = LOG_METADATA_SCHEMA.clone();
-        let actual = metadata
-            .into_engine_data(commit_schema, &engine)
+        let actual = create_row(&engine, commit_schema, metadata)
             .unwrap()
             .try_into_record_batch()
             .unwrap();
@@ -2502,18 +2967,13 @@ mod tests {
     }
 
     #[test]
-    fn test_protocol_into_engine_data() {
+    fn test_protocol_creates_log_row() {
         let engine = ExprEngine::new();
         let protocol = Protocol::try_new_modern(
             [TableFeature::DeletionVectors, TableFeature::ColumnMapping],
             [TableFeature::DeletionVectors, TableFeature::ColumnMapping],
         )
         .unwrap();
-
-        let engine_data = protocol
-            .clone()
-            .into_engine_data(Protocol::to_schema().into(), &engine);
-        let record_batch = engine_data.try_into_record_batch().unwrap();
 
         let list_field = Arc::new(Field::new("element", ArrowDataType::Utf8, false));
         let protocol_fields = vec![
@@ -2530,7 +2990,6 @@ mod tests {
                 true, // nullable
             ),
         ];
-        let schema = Arc::new(Schema::new(protocol_fields.clone()));
 
         let string_builder = StringBuilder::new();
         let mut list_builder = ListBuilder::new(string_builder).with_field(list_field.clone());
@@ -2546,22 +3005,8 @@ mod tests {
         list_builder.append(true);
         let writer_features_array = list_builder.finish();
 
-        let expected = RecordBatch::try_new(
-            schema,
-            vec![
-                Arc::new(Int32Array::from(vec![3])),
-                Arc::new(Int32Array::from(vec![7])),
-                Arc::new(reader_features_array.clone()),
-                Arc::new(writer_features_array.clone()),
-            ],
-        )
-        .unwrap();
-
-        assert_eq!(record_batch, expected);
-
-        // test with the full log schema that wraps protocol in a "protocol" field
         let commit_schema = LOG_PROTOCOL_SCHEMA.clone();
-        let engine_data = protocol.into_engine_data(commit_schema, &engine);
+        let engine_data = create_row(&engine, commit_schema, protocol);
 
         let schema = Arc::new(Schema::new(vec![Field::new(
             "protocol",
@@ -2603,55 +3048,6 @@ mod tests {
         let record_batch = engine_data.try_into_record_batch().unwrap();
 
         assert_eq!(record_batch, expected);
-    }
-
-    #[test]
-    fn test_protocol_into_engine_data_empty_features() {
-        let engine = ExprEngine::new();
-        let protocol =
-            Protocol::try_new_modern(TableFeature::EMPTY_LIST, TableFeature::EMPTY_LIST).unwrap();
-
-        let engine_data = protocol
-            .into_engine_data(Protocol::to_schema().into(), &engine)
-            .unwrap();
-        let record_batch = engine_data.try_into_record_batch().unwrap();
-
-        assert_eq!(record_batch.num_rows(), 1);
-        assert_eq!(record_batch.num_columns(), 4);
-
-        // reader/writer features are Some([]) lists
-        let reader_features_col = record_batch
-            .column(2)
-            .as_any()
-            .downcast_ref::<ListArray>()
-            .unwrap();
-        assert_eq!(reader_features_col.len(), 1);
-        assert_eq!(reader_features_col.value(0).len(), 0); // empty list
-        let writer_features_col = record_batch
-            .column(3)
-            .as_any()
-            .downcast_ref::<ListArray>()
-            .unwrap();
-        assert_eq!(writer_features_col.len(), 1);
-        assert_eq!(writer_features_col.value(0).len(), 0); // empty list
-    }
-
-    #[test]
-    fn test_protocol_into_engine_data_no_features() {
-        let engine = ExprEngine::new();
-        let protocol = Protocol::try_new_legacy(1, 2).unwrap();
-
-        let engine_data = protocol
-            .into_engine_data(Protocol::to_schema().into(), &engine)
-            .unwrap();
-        let record_batch = engine_data.try_into_record_batch().unwrap();
-
-        assert_eq!(record_batch.num_rows(), 1);
-        assert_eq!(record_batch.num_columns(), 4);
-
-        // reader/writer features are null
-        assert!(record_batch.column(2).is_null(0));
-        assert!(record_batch.column(3).is_null(0));
     }
 
     #[test]
@@ -2736,6 +3132,77 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_add_deserializes_complete_wire_shape() {
+        let json = r#"{
+            "path":"file.parquet",
+            "partitionValues":{"present":"value","null_partition":null},
+            "size":300,
+            "modificationTime":1234567890,
+            "dataChange":false,
+            "stats":"{\"numRecords\":1}",
+            "tags":{"tag":"value","nullable":null},
+            "deletionVector":{
+                "storageType":"i",
+                "pathOrInlineDv":"",
+                "sizeInBytes":0,
+                "cardinality":0
+            },
+            "baseRowId":10,
+            "defaultRowCommitVersion":20,
+            "clusteringProvider":"liquid",
+            "backReference":{"manifest":"manifest.parquet","pos":3}
+        }"#;
+
+        let add: Add = serde_json::from_str(json).unwrap();
+        let data: StructData = add.clone().into();
+        StructData::try_new(data.fields().to_vec(), data.values().to_vec())
+            .expect("complete add must match its derived schema");
+        assert_eq!(
+            add.partition_values,
+            HashMap::from([("present".to_string(), "value".to_string())])
+        );
+        assert_eq!(add.stats.as_deref(), Some(r#"{"numRecords":1}"#));
+        assert_eq!(
+            add.tags,
+            Some(HashMap::from([
+                ("tag".to_string(), Some("value".to_string())),
+                ("nullable".to_string(), None),
+            ]))
+        );
+        assert_eq!(
+            add.deletion_vector.as_ref().unwrap().storage_type,
+            deletion_vector::DeletionVectorStorageType::Inline
+        );
+        assert_eq!(add.base_row_id, Some(10));
+        assert_eq!(add.default_row_commit_version, Some(20));
+        assert_eq!(add.clustering_provider.as_deref(), Some("liquid"));
+        #[cfg(feature = "adaptive-metadata-in-dev")]
+        assert_eq!(
+            add.back_reference(),
+            Some(&BackReference {
+                manifest: "manifest.parquet".to_string(),
+                pos: 3,
+            })
+        );
+    }
+
+    #[test]
+    fn test_add_partition_values_duplicate_key_uses_last_value() {
+        let json = r#"{
+            "path":"file.parquet",
+            "partitionValues":{"part":"value","part":null},
+            "size":1,
+            "modificationTime":0,
+            "dataChange":false
+        }"#;
+
+        let add: Add = serde_json::from_str(json).unwrap();
+        assert!(add.partition_values.is_empty());
+        #[cfg(feature = "adaptive-metadata-in-dev")]
+        assert!(add.back_reference().is_none());
+    }
+
     #[cfg(feature = "adaptive-metadata-in-dev")]
     #[test]
     fn test_checkpoint_action_schema() {
@@ -2769,8 +3236,8 @@ mod tests {
                 SIDECAR_NAME,
             ]
         );
-        // `commitInfo` must NOT be a checkpoint-array element; the RFC routes it to the top-level
-        // Delta log.
+        // `commitInfo` must NOT be a checkpoint-array element; adaptiveMetadata routes it to the
+        // top-level Delta log.
         assert!(!field_names.contains(&COMMIT_INFO_NAME));
 
         // Every element type is an optional (union member) struct.
@@ -2805,73 +3272,19 @@ mod tests {
         "memory:///table/metadata/root.parquet",
         Ok(2048)
     )]
-    #[case::absolute_path(
-        "memory:///table/",
-        "s3://bucket/table/metadata/root.parquet",
-        2048,
-        "s3://bucket/table/metadata/root.parquet",
-        Ok(2048)
-    )]
     #[case::negative_size(
         "memory:///table/",
         "metadata/root.parquet",
         -1,
         "memory:///table/metadata/root.parquet",
-        Err("Failed to convert checkpoint contentRoot size -1")
-    )]
-    #[case::table_root_without_trailing_slash_gets_one(
-        "memory:///table",
-        "metadata/root.parquet",
-        2048,
-        "memory:///table/metadata/root.parquet",
-        Ok(2048)
-    )]
-    #[case::single_char_scheme_treated_as_absolute(
-        "memory:///table/",
-        "c:/foo/root.parquet",
-        2048,
-        "c:/foo/root.parquet",
-        Ok(2048)
-    )]
-    // A colon inside a relative path segment is not a scheme delimiter (a `/` precedes it), so
-    // the path stays relative.
-    #[case::colon_in_relative_segment_stays_relative(
-        "memory:///table/",
-        "metadata/snap-123:456.parquet",
-        2048,
-        "memory:///table/metadata/snap-123:456.parquet",
-        Ok(2048)
-    )]
-    // RFC 3986 requires the first scheme char to be ALPHA; a leading digit is not a scheme.
-    #[case::leading_digit_scheme_treated_as_relative(
-        "memory:///table/",
-        "3com/root.parquet",
-        2048,
-        "memory:///table/3com/root.parquet",
-        Ok(2048)
-    )]
-    // A non-ASCII leading letter (Greek alpha, U+03B1) is not a valid scheme char.
-    #[case::non_ascii_scheme_treated_as_relative(
-        "memory:///table/",
-        "\u{03b1}scheme/root.parquet",
-        2048,
-        "memory:///table/%CE%B1scheme/root.parquet",
-        Ok(2048)
-    )]
-    // A multi-char, non-alphanumeric scheme (`git+ssh`) is absolute and used as-is.
-    #[case::compound_scheme_treated_as_absolute(
-        "memory:///table/",
-        "git+ssh://host/repo/root.parquet",
-        2048,
-        "git+ssh://host/repo/root.parquet",
-        Ok(2048)
+        Err("Failed to convert checkpoint contentRoot 'metadata/root.parquet' size -1")
     )]
     fn test_checkpoint_action_root_filemeta(
         #[case] table_root: &str,
         #[case] path: &str,
         #[case] size_in_bytes: i64,
         #[case] expected_location: &str,
-        #[case] expected: Result<FileSize, &str>,
+        #[case] expected: KernelResult<FileSize, &str>,
     ) {
         let table_root = Url::parse(table_root).unwrap();
         let checkpoint_action = CheckpointAction {
@@ -2907,7 +3320,7 @@ mod tests {
             path: path.to_string(),
             size_in_bytes: 100,
             modification_time: 1,
-            tags: None,
+            tags: Some(HashMap::from([("tag".to_string(), "value".to_string())])),
         };
         CheckpointAction {
             version: 42,
@@ -2935,12 +3348,11 @@ mod tests {
 
     #[cfg(feature = "adaptive-metadata-in-dev")]
     #[test]
-    fn test_checkpoint_action_into_engine_data_round_trip() -> DeltaResult<()> {
+    fn test_checkpoint_action_scalar_round_trip() -> KernelResult<()> {
         let engine = ExprEngine::new();
         let action = sample_checkpoint_action();
-        let data = action
-            .clone()
-            .into_engine_data(LOG_CHECKPOINT_SCHEMA.clone(), &engine)?;
+        let scalar = action.clone().try_into_scalar()?;
+        let data = create_row(&engine, LOG_CHECKPOINT_SCHEMA.clone(), scalar)?;
         let back = CheckpointAction::try_new_from_data(data.as_ref())?
             .expect("checkpoint action should round-trip");
         assert_eq!(action, back);
@@ -2949,10 +3361,10 @@ mod tests {
 
     // The `contentRoot.version <= checkpointMetadata.version` invariant is enforced on the
     // serialize path too, not just when parsing. `content_root_version_too_high` in visitors.rs
-    // covers the parse-path guard; this covers the `validate()` call inside `into_engine_data`.
+    // covers the parse-path guard; this covers the `validate()` call during scalar conversion.
     #[cfg(feature = "adaptive-metadata-in-dev")]
     #[test]
-    fn test_checkpoint_action_into_engine_data_rejects_invalid_content_root_version() {
+    fn test_checkpoint_action_scalar_rejects_invalid_content_root_version() {
         let base = sample_checkpoint_action();
         let action = CheckpointAction {
             content_root: ContentRoot {
@@ -2961,24 +3373,20 @@ mod tests {
             },
             ..sample_checkpoint_action()
         };
-        let engine = ExprEngine::new();
-        let result = action.into_engine_data(LOG_CHECKPOINT_SCHEMA.clone(), &engine);
+        let result = action.try_into_scalar();
         assert_result_error_with_message(result, "exceeds checkpointMetadata.version");
     }
 
     #[cfg(feature = "adaptive-metadata-in-dev")]
     #[test]
-    fn test_checkpoint_action_wire_format() -> DeltaResult<()> {
-        use crate::engine::to_json_bytes;
-        use crate::engine_data::FilteredEngineData;
-
+    fn test_checkpoint_action_wire_format() -> KernelResult<()> {
         // Build the action's engine data, then write it out through the engine JSON writer and
         // pin the exact bytes. This is the only guard on the wire format: element order, camelCase
         // field names, the sidecar `type` discriminator, and the JSON writer's null omission (the
         // null union siblings collapse each element to a single-key tagged object).
         let engine = ExprEngine::new();
-        let data =
-            sample_checkpoint_action().into_engine_data(LOG_CHECKPOINT_SCHEMA.clone(), &engine)?;
+        let scalar = sample_checkpoint_action().try_into_scalar()?;
+        let data = create_row(&engine, LOG_CHECKPOINT_SCHEMA.clone(), scalar)?;
         let filtered = FilteredEngineData::with_all_rows_selected(data);
         let bytes = to_json_bytes(std::iter::once(Ok(filtered)))?;
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
@@ -2998,8 +3406,8 @@ mod tests {
                 } },
                 { "txn": { "appId": "myApp", "version": 3 } },
                 { "domainMetadata": { "domain": "myDomain", "configuration": "cfg", "removed": false } },
-                { "sidecar": { "type": "txn", "path": "txn-sidecar.parquet", "sizeInBytes": 100, "modificationTime": 1 } },
-                { "sidecar": { "type": "domainMetadata", "path": "dm-sidecar.parquet", "sizeInBytes": 100, "modificationTime": 1 } },
+                { "sidecar": { "type": "txn", "path": "txn-sidecar.parquet", "sizeInBytes": 100, "modificationTime": 1, "tags": { "tag": "value" } } },
+                { "sidecar": { "type": "domainMetadata", "path": "dm-sidecar.parquet", "sizeInBytes": 100, "modificationTime": 1, "tags": { "tag": "value" } } },
             ] })
         );
         Ok(())
@@ -3007,7 +3415,7 @@ mod tests {
 
     #[cfg(feature = "adaptive-metadata-in-dev")]
     #[test]
-    fn test_try_new_from_data_returns_none_when_no_checkpoint_action() -> DeltaResult<()> {
+    fn test_try_new_from_data_returns_none_when_no_checkpoint_action() -> KernelResult<()> {
         // `action_batch` carries many action kinds but no `checkpoint` array, so parsing yields
         // `Ok(None)` rather than an error.
         let data = crate::unit_test_utils::action_batch();
@@ -3017,7 +3425,7 @@ mod tests {
 
     #[cfg(feature = "adaptive-metadata-in-dev")]
     #[test]
-    fn test_checkpoint_action_round_trip_multiple_and_empty_collections() -> DeltaResult<()> {
+    fn test_checkpoint_action_round_trip_multiple_and_empty_collections() -> KernelResult<()> {
         // Exercise the write loops and the reader's accumulation for count > 1 (two txns, two
         // domainMetadata, two same-type sidecars) and count 0 (empty domainMetadata sidecars).
         let sidecar = |path: &str| Sidecar {
@@ -3063,9 +3471,8 @@ mod tests {
             domain_metadata_sidecars: vec![],
         };
         let engine = ExprEngine::new();
-        let data = action
-            .clone()
-            .into_engine_data(LOG_CHECKPOINT_SCHEMA.clone(), &engine)?;
+        let scalar = action.clone().try_into_scalar()?;
+        let data = create_row(&engine, LOG_CHECKPOINT_SCHEMA.clone(), scalar)?;
         let back = CheckpointAction::try_new_from_data(data.as_ref())?
             .expect("checkpoint action should round-trip");
         assert_eq!(action, back);
@@ -3074,9 +3481,9 @@ mod tests {
 
     #[cfg(feature = "adaptive-metadata-in-dev")]
     #[test]
-    fn test_checkpoint_action_round_trip_protocol_with_features() -> DeltaResult<()> {
+    fn test_checkpoint_action_round_trip_protocol_with_features() -> KernelResult<()> {
         // A (3, 7) protocol with the same ReaderWriter feature in both lists (required by the
-        // read-time feature-consistency check) must survive `into_engine_data` -> parse.
+        // read-time feature-consistency check) must survive scalar conversion -> parse.
         let action = CheckpointAction {
             protocol: Protocol::new_unchecked(
                 3,
@@ -3087,12 +3494,155 @@ mod tests {
             ..sample_checkpoint_action()
         };
         let engine = ExprEngine::new();
-        let data = action
-            .clone()
-            .into_engine_data(LOG_CHECKPOINT_SCHEMA.clone(), &engine)?;
+        let scalar = action.clone().try_into_scalar()?;
+        let data = create_row(&engine, LOG_CHECKPOINT_SCHEMA.clone(), scalar)?;
         let back = CheckpointAction::try_new_from_data(data.as_ref())?
             .expect("checkpoint action should round-trip");
         assert_eq!(action, back);
         Ok(())
+    }
+
+    /// The hand-written serde folds/expands the array losslessly: an action expands to the
+    /// tagged-element array and folds back to the identical action.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[test]
+    fn test_checkpoint_action_serde_round_trip() {
+        let action = sample_checkpoint_action();
+        let json = serde_json::to_value(&action).unwrap();
+        assert!(json.is_array(), "checkpoint action serializes to an array");
+        let back: CheckpointAction = serde_json::from_value(json).unwrap();
+        assert_eq!(back, action);
+    }
+
+    /// The `Serialize` path validates before emitting, mirroring `try_into_scalar`: an action whose
+    /// `contentRoot.version` exceeds the checkpoint version fails to serialize rather than writing
+    /// an out-of-spec array.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[test]
+    fn test_checkpoint_action_serde_rejects_invalid_content_root_version() {
+        let base = sample_checkpoint_action();
+        let action = CheckpointAction {
+            content_root: ContentRoot {
+                version: base.version + 1,
+                ..base.content_root
+            },
+            ..sample_checkpoint_action()
+        };
+        let err = serde_json::to_value(&action).expect_err("invalid action must not serialize");
+        assert!(
+            err.to_string()
+                .contains("exceeds checkpointMetadata.version"),
+            "expected content-root-version error, got: {err}"
+        );
+    }
+
+    /// The synthesized `checkpointMetadata` element omits `tags` entirely (via
+    /// `skip_serializing_if`) rather than emitting `"tags": null`, matching the EngineData wire
+    /// form. The symmetric round-trip tests cannot observe this because both an absent key and an
+    /// explicit null parse back to `None`.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[test]
+    fn test_checkpoint_action_serde_omits_checkpoint_metadata_tags() {
+        let json = serde_json::to_value(sample_checkpoint_action()).unwrap();
+        let checkpoint_metadata = json
+            .as_array()
+            .and_then(|elements| elements.first())
+            .and_then(|element| element.get("checkpointMetadata"))
+            .expect("first element is checkpointMetadata");
+        assert_eq!(checkpoint_metadata, &json!({ "version": 42 }));
+        assert!(
+            checkpoint_metadata.get("tags").is_none(),
+            "checkpointMetadata must omit the tags key, got: {checkpoint_metadata}"
+        );
+    }
+
+    /// Fully-populated array elements, used to build valid and malformed variants for the serde
+    /// fold-error cases below. Mirrors `checkpoint_elements` in `visitors.rs` so the serde path and
+    /// the EngineData path are checked against the same inputs.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    mod checkpoint_serde_elements {
+        pub(super) const CHECKPOINT_METADATA: &str = r#"{"checkpointMetadata":{"version":42}}"#;
+        pub(super) const CONTENT_ROOT: &str =
+            r#"{"contentRoot":{"path":"p","sizeInBytes":1,"version":40}}"#;
+        pub(super) const PROTOCOL: &str =
+            r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}"#;
+        pub(super) const METADATA: &str = r#"{"metaData":{"id":"id","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[]}","partitionColumns":[],"configuration":{}}}"#;
+    }
+
+    /// The serde fold applies the same enumerated checks as the EngineData `CheckpointVisitor`,
+    /// with identical error messages (compare `test_parse_checkpoint_action_errors` in
+    /// `visitors.rs`): required singletons, no duplicates, known sidecar `type`, and the
+    /// `contentRoot.version` invariant. Unknown elements are the intended exception -- the
+    /// serde path fails closed on them while the visitor skips them -- and are not covered
+    /// here.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[rstest]
+    #[case::duplicate_metadata(&[
+        checkpoint_serde_elements::CHECKPOINT_METADATA, checkpoint_serde_elements::CONTENT_ROOT,
+        checkpoint_serde_elements::PROTOCOL, checkpoint_serde_elements::METADATA,
+        checkpoint_serde_elements::METADATA,
+    ], "duplicate `metaData` element in checkpoint action")]
+    #[case::duplicate_checkpoint_metadata(&[
+        checkpoint_serde_elements::CHECKPOINT_METADATA, checkpoint_serde_elements::CHECKPOINT_METADATA,
+        checkpoint_serde_elements::CONTENT_ROOT, checkpoint_serde_elements::PROTOCOL,
+        checkpoint_serde_elements::METADATA,
+    ], "duplicate `checkpointMetadata` element in checkpoint action")]
+    #[case::missing_protocol(&[
+        checkpoint_serde_elements::CHECKPOINT_METADATA, checkpoint_serde_elements::CONTENT_ROOT,
+        checkpoint_serde_elements::METADATA,
+    ], "checkpoint action is missing required `protocol` element")]
+    #[case::missing_content_root(&[
+        checkpoint_serde_elements::CHECKPOINT_METADATA, checkpoint_serde_elements::PROTOCOL,
+        checkpoint_serde_elements::METADATA,
+    ], "checkpoint action is missing required `contentRoot` element")]
+    #[case::missing_metadata(&[
+        checkpoint_serde_elements::CHECKPOINT_METADATA, checkpoint_serde_elements::CONTENT_ROOT,
+        checkpoint_serde_elements::PROTOCOL,
+    ], "checkpoint action is missing required `metaData` element")]
+    #[case::empty_array(&[], "checkpoint action is missing required `checkpointMetadata` element")]
+    #[case::bad_sidecar_type(&[
+        checkpoint_serde_elements::CHECKPOINT_METADATA, checkpoint_serde_elements::CONTENT_ROOT,
+        checkpoint_serde_elements::PROTOCOL, checkpoint_serde_elements::METADATA,
+        r#"{"sidecar":{"type":"bogus","path":"s.parquet","sizeInBytes":1,"modificationTime":0}}"#,
+    ], "checkpoint sidecar has unsupported type `bogus`")]
+    #[case::content_root_version_too_high(&[
+        checkpoint_serde_elements::CHECKPOINT_METADATA,
+        r#"{"contentRoot":{"path":"p","sizeInBytes":1,"version":99}}"#,
+        checkpoint_serde_elements::PROTOCOL, checkpoint_serde_elements::METADATA,
+    ], "checkpoint contentRoot.version 99 exceeds checkpointMetadata.version 42")]
+    fn test_checkpoint_action_serde_fold_errors(
+        #[case] elements: &[&str],
+        #[case] expected_msg: &str,
+    ) {
+        let array = format!("[{}]", elements.join(","));
+        let err = serde_json::from_str::<CheckpointAction>(&array)
+            .expect_err("checkpoint action should fail to fold");
+        assert!(
+            err.to_string().contains(expected_msg),
+            "expected error containing {expected_msg:?}, got: {err}"
+        );
+    }
+
+    /// The serde path deliberately fails closed on an unrecognized element key, unlike the
+    /// forward-compatible EngineData `CheckpointElementVisitor`, which skips unknown elements. Pins
+    /// that intended asymmetry: an otherwise-valid array carrying a future element kind fails the
+    /// whole-hint parse (so the reader falls back to log replay).
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[test]
+    fn test_checkpoint_action_serde_fails_closed_on_unknown_element() {
+        let array = format!(
+            "[{},{},{},{},{}]",
+            checkpoint_serde_elements::CHECKPOINT_METADATA,
+            checkpoint_serde_elements::CONTENT_ROOT,
+            checkpoint_serde_elements::PROTOCOL,
+            checkpoint_serde_elements::METADATA,
+            r#"{"someNewAction":{"foo":1}}"#,
+        );
+        let err = serde_json::from_str::<CheckpointAction>(&array)
+            .expect_err("unknown element must fail the parse");
+        assert!(
+            err.to_string().contains("unknown variant"),
+            "expected an unknown-variant error, got: {err}"
+        );
     }
 }

@@ -13,12 +13,12 @@ use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::expressions::column_name;
 use delta_kernel::schema::schema_ref;
 use delta_kernel::snapshot::Snapshot;
+use delta_kernel::transaction::CommitResult;
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
-use delta_kernel::transaction::CommitResult;
 use rstest::rstest;
 use test_utils::{
-    generate_batch, read_add_infos, read_scan, test_table_setup_mt, write_batch_to_table, IntoArray,
+    IntoArray, generate_batch, read_add_infos, read_scan, test_table_setup_mt, write_batch_to_table,
 };
 
 /// Full lifecycle: create a clustered table, write data, verify stats include clustering columns,
@@ -41,7 +41,7 @@ async fn test_clustered_table_write_and_checkpoint(
     let expected_clustering = vec![column_name!("id"), column_name!("city")];
 
     // Create table clustered on "id" and "city"
-    let create_result = create_table(&table_path, schema, "Test/1.0")
+    let create_result = create_table(&table_path, schema, "Test/1.0", true)
         .with_data_layout(DataLayout::Clustered {
             columns: expected_clustering.clone(),
         })
@@ -54,11 +54,11 @@ async fn test_clustered_table_write_and_checkpoint(
         Snapshot::builder_for(table_url).build(engine.as_ref())?
     } else {
         match create_result {
-            CommitResult::CommittedTransaction(committed) => committed
+            CommitResult::Committed(committed) => committed
                 .post_commit_snapshot()
                 .expect("post-commit snapshot should exist")
                 .clone(),
-            other => panic!("Expected CommittedTransaction, got: {other:?}"),
+            other => panic!("Expected Committed, got: {other:?}"),
         }
     };
 
@@ -154,7 +154,7 @@ async fn test_clustered_table_write_all_null_clustering_column() {
     };
 
     // Create table clustered on "category" and "region_id"
-    let create_result = create_table(&table_path, schema, "Test/1.0")
+    let create_result = create_table(&table_path, schema, "Test/1.0", true)
         .with_data_layout(DataLayout::Clustered {
             columns: vec![column_name!("category"), column_name!("region_id")],
         })

@@ -14,8 +14,9 @@
 
 use chrono::{DateTime, NaiveDate, Utc};
 
-use crate::expressions::{DecimalData, Scalar};
-use crate::{DeltaResult, Error};
+use crate::expressions::{DecimalData, IntervalYearMonthData, MONTHS_PER_YEAR, Scalar};
+use crate::schema::IntervalYearToMonthType;
+use crate::{KernelError, KernelResult};
 
 /// The UNIX epoch (1970-01-01) expressed as a CE day number for chrono's
 /// `NaiveDate::from_num_days_from_ce_opt`, which counts from 0001-01-01.
@@ -72,12 +73,13 @@ pub(crate) fn would_serialize_to_null(value: &Scalar) -> bool {
 /// `Scalar::Null`, empty `Scalar::String`, and empty `Scalar::Binary`. Non-null partition
 /// values are serialized according to protocol rules; readers interpret the stored value
 /// against the table schema. Returns `Err` for non-null values of types that cannot be
-/// partition columns (Struct, Array, Map) or for binary values that are not valid UTF-8.
+/// partition columns (Struct, Array, Map), binary values that are not valid UTF-8, or
+/// `interval year` values whose total months are not divisible by 12.
 ///
 /// The inverse of [`PrimitiveType::parse_scalar`].
 ///
 /// [`PrimitiveType::parse_scalar`]: crate::schema::PrimitiveType::parse_scalar
-pub fn serialize_partition_value(value: &Scalar) -> DeltaResult<Option<String>> {
+pub fn serialize_partition_value(value: &Scalar) -> KernelResult<Option<String>> {
     match value {
         Scalar::Null(_) => Ok(None),
         Scalar::String(s) if s.is_empty() => Ok(None),
@@ -92,15 +94,17 @@ pub fn serialize_partition_value(value: &Scalar) -> DeltaResult<Option<String>> 
         Scalar::Date(days) => Ok(Some(format_date(*days)?)),
         Scalar::Timestamp(us) => Ok(Some(format_timestamp(*us)?)),
         Scalar::TimestampNtz(us) => Ok(Some(format_timestamp_ntz(*us)?)),
-        Scalar::IntervalYearMonth(months) => Ok(Some(format_year_month_interval(*months))),
+        Scalar::IntervalYearMonth(data) => Ok(Some(format_year_month_interval(data)?)),
         Scalar::IntervalDayTime(micros) => Ok(Some(format_day_time_interval(*micros))),
         Scalar::Decimal(d) => Ok(Some(format_decimal(d))),
         Scalar::Binary(b) if b.is_empty() => Ok(None),
         Scalar::Binary(b) => Ok(Some(format_binary(b)?)),
-        Scalar::Struct(_) | Scalar::Array(_) | Scalar::Map(_) => Err(Error::generic(format!(
-            "cannot serialize partition value: type {:?} is not a valid partition column type",
-            value.data_type()
-        ))),
+        Scalar::Struct(_) | Scalar::Array(_) | Scalar::Map(_) => {
+            Err(KernelError::generic(format!(
+                "cannot serialize partition value: type {:?} is not a valid partition column type",
+                value.data_type()
+            )))
+        }
     }
 }
 
@@ -135,11 +139,7 @@ macro_rules! format_java_float {
         let abs = v.abs();
         if (1e-3..1e7).contains(&abs) {
             let s = v.to_string();
-            if s.contains('.') {
-                s
-            } else {
-                format!("{s}.0")
-            }
+            if s.contains('.') { s } else { format!("{s}.0") }
         } else {
             let s = format!("{v:e}").replace('e', "E");
             if s.contains('.') {
@@ -160,43 +160,62 @@ fn format_f64(v: f64) -> String {
 }
 
 /// Formats a date value (days since UNIX epoch) as "YYYY-MM-DD".
-fn format_date(days: i32) -> DeltaResult<String> {
+fn format_date(days: i32) -> KernelResult<String> {
     let ce_days = UNIX_EPOCH_CE_DAYS.checked_add(days).ok_or_else(|| {
-        Error::generic(format!("date value {days} days from epoch is out of range"))
+        KernelError::generic(format!("date value {days} days from epoch is out of range"))
     })?;
     NaiveDate::from_num_days_from_ce_opt(ce_days)
         .map(|d| d.format("%Y-%m-%d").to_string())
-        .ok_or_else(|| Error::generic(format!("date value {days} days from epoch is out of range")))
+        .ok_or_else(|| {
+            KernelError::generic(format!("date value {days} days from epoch is out of range"))
+        })
 }
 
 /// Converts microseconds since epoch to a [`DateTime`], returning an error if out of range.
-fn micros_to_datetime(micros: i64, label: &str) -> DeltaResult<DateTime<Utc>> {
+fn micros_to_datetime(micros: i64, label: &str) -> KernelResult<DateTime<Utc>> {
     let secs = micros.div_euclid(1_000_000);
     let subsec_nanos = (micros.rem_euclid(1_000_000) as u32) * 1000;
     DateTime::from_timestamp(secs, subsec_nanos).ok_or_else(|| {
-        Error::generic(format!(
+        KernelError::generic(format!(
             "{label} value {micros} microseconds from epoch is out of range"
         ))
     })
 }
 
 /// Formats a timestamp (microseconds since epoch) as ISO 8601: "YYYY-MM-DDTHH:MM:SS.ffffffZ".
-fn format_timestamp(micros: i64) -> DeltaResult<String> {
+fn format_timestamp(micros: i64) -> KernelResult<String> {
     micros_to_datetime(micros, "timestamp")
         .map(|dt| dt.format("%Y-%m-%dT%H:%M:%S%.6fZ").to_string())
 }
 
 /// Formats a timestamp without timezone (microseconds) as "YYYY-MM-DD HH:MM:SS.ffffff".
 /// Space separator, no Z suffix (there is no timezone).
-fn format_timestamp_ntz(micros: i64) -> DeltaResult<String> {
+fn format_timestamp_ntz(micros: i64) -> KernelResult<String> {
     micros_to_datetime(micros, "timestamp_ntz")
         .map(|dt| dt.naive_utc().format("%Y-%m-%d %H:%M:%S%.6f").to_string())
 }
 
-fn format_year_month_interval(months: i32) -> String {
+fn format_year_month_interval(data: &IntervalYearMonthData) -> KernelResult<String> {
+    let months = data.months();
     let sign = if months < 0 { "-" } else { "" };
     let abs = months.unsigned_abs();
-    format!("INTERVAL '{sign}{}-{}' YEAR TO MONTH", abs / 12, abs % 12)
+    let months_per_year = MONTHS_PER_YEAR as u32;
+    match data.ty() {
+        IntervalYearToMonthType::IntervalYear => {
+            if months % MONTHS_PER_YEAR != 0 {
+                return Err(KernelError::invalid_partition_values(format!(
+                    "interval year partition value {months} months is not divisible by {MONTHS_PER_YEAR}"
+                )));
+            }
+            Ok(format!("INTERVAL '{sign}{}' YEAR", abs / months_per_year))
+        }
+        IntervalYearToMonthType::IntervalMonth => Ok(format!("INTERVAL '{months}' MONTH")),
+        IntervalYearToMonthType::IntervalYearToMonth => Ok(format!(
+            "INTERVAL '{sign}{}-{}' YEAR TO MONTH",
+            abs / months_per_year,
+            abs % months_per_year
+        )),
+    }
 }
 
 fn format_day_time_interval(micros: i64) -> String {
@@ -236,10 +255,12 @@ fn format_decimal(d: &DecimalData) -> String {
 ///
 /// Returns an error if the bytes are not valid UTF-8. For example, `[0x48, 0x49]`
 /// ("HI") succeeds, but `[0xDE, 0xAD]` fails because those bytes are not valid UTF-8.
-fn format_binary(bytes: &[u8]) -> DeltaResult<String> {
+fn format_binary(bytes: &[u8]) -> KernelResult<String> {
     std::str::from_utf8(bytes)
         .map(|s| s.to_string())
-        .map_err(|e| Error::generic(format!("binary partition value is not valid UTF-8: {e}")))
+        .map_err(|e| {
+            KernelError::generic(format!("binary partition value is not valid UTF-8: {e}"))
+        })
 }
 
 #[cfg(test)]
@@ -248,7 +269,9 @@ mod tests {
 
     use super::*;
     use crate::expressions::{ArrayData, MapData, Scalar, StructData};
-    use crate::schema::{ArrayType, DataType, MapType, PrimitiveType, StructField};
+    use crate::schema::{
+        ArrayType, DataType, IntervalYearToMonthType, MapType, PrimitiveType, StructField,
+    };
 
     // ============================================================================
     // Spark reference: null and empty values
@@ -542,11 +565,34 @@ mod tests {
         Scalar::decimal(1_230_000_000_000_000_000i128, 38, 18).unwrap(),
         PrimitiveType::decimal(38, 18).unwrap()
     )]
-    #[case::interval_ym(Scalar::IntervalYearMonth(30), PrimitiveType::IntervalYearMonth)]
-    #[case::interval_ym_neg(Scalar::IntervalYearMonth(-18), PrimitiveType::IntervalYearMonth)]
-    #[case::interval_ym_zero(Scalar::IntervalYearMonth(0), PrimitiveType::IntervalYearMonth)]
-    #[case::interval_ym_min(Scalar::IntervalYearMonth(i32::MIN), PrimitiveType::IntervalYearMonth)]
-    #[case::interval_ym_max(Scalar::IntervalYearMonth(i32::MAX), PrimitiveType::IntervalYearMonth)]
+    #[case::interval_ym(
+        Scalar::interval_year_month(30, IntervalYearToMonthType::IntervalYearToMonth).unwrap(),
+        PrimitiveType::interval_year_month(IntervalYearToMonthType::IntervalYearToMonth)
+    )]
+    #[case::interval_year(
+        Scalar::interval_year_month(24, IntervalYearToMonthType::IntervalYear).unwrap(),
+        PrimitiveType::interval_year_month(IntervalYearToMonthType::IntervalYear)
+    )]
+    #[case::interval_month(
+        Scalar::interval_year_month(30, IntervalYearToMonthType::IntervalMonth).unwrap(),
+        PrimitiveType::interval_year_month(IntervalYearToMonthType::IntervalMonth)
+    )]
+    #[case::interval_ym_neg(
+        Scalar::interval_year_month(-18, IntervalYearToMonthType::IntervalYearToMonth).unwrap(),
+        PrimitiveType::interval_year_month(IntervalYearToMonthType::IntervalYearToMonth)
+    )]
+    #[case::interval_ym_zero(
+        Scalar::interval_year_month(0, IntervalYearToMonthType::IntervalYearToMonth).unwrap(),
+        PrimitiveType::interval_year_month(IntervalYearToMonthType::IntervalYearToMonth)
+    )]
+    #[case::interval_ym_min(
+        Scalar::interval_year_month(i32::MIN, IntervalYearToMonthType::IntervalYearToMonth).unwrap(),
+        PrimitiveType::interval_year_month(IntervalYearToMonthType::IntervalYearToMonth)
+    )]
+    #[case::interval_ym_max(
+        Scalar::interval_year_month(i32::MAX, IntervalYearToMonthType::IntervalYearToMonth).unwrap(),
+        PrimitiveType::interval_year_month(IntervalYearToMonthType::IntervalYearToMonth)
+    )]
     #[case::interval_dt(
         Scalar::IntervalDayTime(131_445_000_000),
         PrimitiveType::IntervalDayTime
@@ -563,8 +609,14 @@ mod tests {
     /// Interval partition values serialize to Spark ANSI interval literal strings. The
     /// year-month spelling is verified against the DAT `intv_003` workload.
     #[rstest]
-    #[case(Scalar::IntervalYearMonth(12), "INTERVAL '1-0' YEAR TO MONTH")]
-    #[case(Scalar::IntervalYearMonth(30), "INTERVAL '2-6' YEAR TO MONTH")]
+    #[case(
+        Scalar::interval_year_month(12, IntervalYearToMonthType::IntervalYearToMonth).unwrap(),
+        "INTERVAL '1-0' YEAR TO MONTH"
+    )]
+    #[case(
+        Scalar::interval_year_month(30, IntervalYearToMonthType::IntervalYearToMonth).unwrap(),
+        "INTERVAL '2-6' YEAR TO MONTH"
+    )]
     #[case(
         Scalar::IntervalDayTime(131_445_000_000),
         "INTERVAL '1 12:30:45' DAY TO SECOND"
@@ -573,6 +625,69 @@ mod tests {
         assert_eq!(
             serialize_partition_value(&input).unwrap(),
             Some(expected.to_string())
+        );
+    }
+
+    #[rstest]
+    #[case::year_zero(0, IntervalYearToMonthType::IntervalYear, "INTERVAL '0' YEAR")]
+    #[case::year_positive(24, IntervalYearToMonthType::IntervalYear, "INTERVAL '2' YEAR")]
+    #[case::year_negative(-24, IntervalYearToMonthType::IntervalYear, "INTERVAL '-2' YEAR")]
+    #[case::year_max_aligned(
+        2_147_483_640,
+        IntervalYearToMonthType::IntervalYear,
+        "INTERVAL '178956970' YEAR"
+    )]
+    #[case::year_min_aligned(
+        -2_147_483_640,
+        IntervalYearToMonthType::IntervalYear,
+        "INTERVAL '-178956970' YEAR"
+    )]
+    #[case::month_zero(0, IntervalYearToMonthType::IntervalMonth, "INTERVAL '0' MONTH")]
+    #[case::month_positive(30, IntervalYearToMonthType::IntervalMonth, "INTERVAL '30' MONTH")]
+    #[case::month_min(
+        i32::MIN,
+        IntervalYearToMonthType::IntervalMonth,
+        "INTERVAL '-2147483648' MONTH"
+    )]
+    #[case::month_max(
+        i32::MAX,
+        IntervalYearToMonthType::IntervalMonth,
+        "INTERVAL '2147483647' MONTH"
+    )]
+    #[case::full_zero(
+        0,
+        IntervalYearToMonthType::IntervalYearToMonth,
+        "INTERVAL '0-0' YEAR TO MONTH"
+    )]
+    #[case::full_positive(
+        30,
+        IntervalYearToMonthType::IntervalYearToMonth,
+        "INTERVAL '2-6' YEAR TO MONTH"
+    )]
+    #[case::full_negative_one(
+        -1,
+        IntervalYearToMonthType::IntervalYearToMonth,
+        "INTERVAL '-0-1' YEAR TO MONTH"
+    )]
+    #[case::full_min(
+        i32::MIN,
+        IntervalYearToMonthType::IntervalYearToMonth,
+        "INTERVAL '-178956970-8' YEAR TO MONTH"
+    )]
+    #[case::full_max(
+        i32::MAX,
+        IntervalYearToMonthType::IntervalYearToMonth,
+        "INTERVAL '178956970-7' YEAR TO MONTH"
+    )]
+    fn test_year_month_interval_formats_by_qualifier(
+        #[case] months: i32,
+        #[case] qualifier: IntervalYearToMonthType,
+        #[case] expected: &str,
+    ) {
+        let input = Scalar::interval_year_month(months, qualifier).unwrap();
+        assert_eq!(
+            serialize_partition_value(&input).unwrap().as_deref(),
+            Some(expected)
         );
     }
 

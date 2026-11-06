@@ -12,13 +12,14 @@ use super::LogSegment;
 #[cfg(all(feature = "adaptive-metadata-in-dev", feature = "declarative-plans"))]
 use crate::actions::CHECKPOINT_ACTION_NAME;
 #[cfg(feature = "adaptive-metadata-in-dev")]
-use crate::actions::{CheckpointAction, CHECKPOINT_ACTION_FIELD};
-use crate::actions::{Metadata, Protocol, METADATA_FIELD, PROTOCOL_FIELD};
+use crate::actions::{CHECKPOINT_ACTION_FIELD, CheckpointAction, LastManifestCommit};
+use crate::actions::{METADATA_FIELD, Metadata, PROTOCOL_FIELD, Protocol};
 #[cfg(feature = "declarative-plans")]
 use crate::actions::{METADATA_NAME, PROTOCOL_NAME};
 use crate::crc::Crc;
 use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
-use crate::log_replay::ActionsBatch;
+#[cfg(feature = "declarative-plans")]
+use crate::expressions::{Predicate, col};
 use crate::metrics::ProtocolMetadataSource;
 use crate::path::ParsedLogPath;
 #[cfg(feature = "declarative-plans")]
@@ -26,54 +27,38 @@ use crate::plans::ir::nodes::Agg;
 #[cfg(feature = "declarative-plans")]
 use crate::plans::ir::nodes::FileType;
 #[cfg(feature = "declarative-plans")]
+use crate::plans::ir::plan::Plan;
+#[cfg(feature = "declarative-plans")]
 use crate::plans::{Operation, PlanBuilder, PlanExecutor};
 use crate::schema::{
-    column_name, schema_ref, ColumnName, ColumnNamesAndTypes, DataType, MetadataColumnSpec,
-    StructField, StructType,
+    ColumnName, ColumnNamesAndTypes, DataType, MetadataColumnSpec, StructField, StructType,
+    column_name, schema_ref,
 };
-use crate::{DeltaResult, Engine, EngineData, Error, Version};
+use crate::{
+    Engine, EngineData, KernelError, KernelResult, KernelResultIterator, Version, version_as_i64,
+};
 
 impl LogSegment {
     /// Read the latest Protocol and Metadata from this log segment, using CRC when available.
-    /// Returns an error if either is missing, and the [`ProtocolMetadataSource`] describing how
-    /// P&M was resolved.
-    ///
-    /// This is the checked variant of [`Self::read_protocol_metadata_opt`], used for fresh
-    /// snapshot creation where both Protocol and Metadata must exist.
-    pub(crate) fn read_protocol_metadata(
-        &self,
-        engine: &dyn Engine,
-        crc: Option<&Arc<Crc>>,
-    ) -> DeltaResult<(Metadata, Protocol, ProtocolMetadataSource)> {
-        match self.read_protocol_metadata_opt(engine, crc)? {
-            (Some(m), Some(p), source) => Ok((m, p, source)),
-            (None, Some(_), _) => Err(Error::MissingMetadata),
-            (Some(_), None, _) => Err(Error::MissingProtocol),
-            (None, None, _) => Err(Error::MissingMetadataAndProtocol),
-        }
-    }
-
-    /// Read the latest Protocol and Metadata from this log segment, using CRC when available.
-    /// Returns `None` for either if not found.
-    ///
-    /// This is the unchecked variant of [`Self::read_protocol_metadata`], used for incremental
-    /// snapshot updates where the caller can fall back to an existing snapshot's Protocol and
-    /// Metadata.
+    /// The result's `metadata` and `protocol` are `None` if not found.
     ///
     /// The `crc` parameter is the CRC eagerly resolved by the caller; it is used to
     /// short-circuit or seed the replay.
-    #[instrument(name = "log_seg.load_p_m", skip_all, err)]
+    ///
+    /// Under `adaptive-metadata-in-dev`, the result's `captured_checkpoint_action` is the latest
+    /// AMT checkpoint action when replay captured it, for the caller to store on the
+    /// [`Snapshot`](crate::Snapshot).
+    #[instrument(name = "log_seg.load_p_m", skip_all, fields(enable_call_frame), err)]
     pub(crate) fn read_protocol_metadata_opt(
         &self,
         engine: &dyn Engine,
         crc: Option<&Arc<Crc>>,
-    ) -> DeltaResult<(Option<Metadata>, Option<Protocol>, ProtocolMetadataSource)> {
+    ) -> KernelResult<PmResolution> {
         // Case 1: If CRC at target version, use it directly and exit early.
         if let Some(crc) = crc.filter(|c| c.version == self.end_version) {
             info!("P&M from CRC at target version {}", self.end_version);
-            return Ok((
-                Some(crc.metadata.clone()),
-                Some(crc.protocol.clone()),
+            return Ok(PmResolution::from_crc(
+                crc,
                 ProtocolMetadataSource::CrcAtTarget,
             ));
         }
@@ -94,53 +79,38 @@ impl LogSegment {
                 crc.version
             );
             let pruned = self.segment_after_version(crc.version);
-            let PmCandidate {
-                metadata: metadata_opt,
-                protocol: protocol_opt,
-            } = pruned.replay_for_pm(engine)?;
             // Ignore pruned P&M at or below the CRC version: a lagging AMT checkpoint action can
-            // carry it, and the CRC's P&M is at least as new.
-            let metadata_opt = metadata_opt
-                .filter(|(v, _)| *v > crc.version as i64)
-                .map(|(_, m)| m);
-            let protocol_opt = protocol_opt
-                .filter(|(v, _)| *v > crc.version as i64)
-                .map(|(_, p)| p);
-
-            if metadata_opt.is_some() && protocol_opt.is_some() {
+            // carry it, and the CRC's P&M is at least as new. A captured checkpoint action is still
+            // the latest: any action at or below the CRC is older.
+            let mut resolution = pruned
+                .replay_for_pm(engine)?
+                .newer_than(version_as_i64(crc.version)?)
+                .into_resolution(ProtocolMetadataSource::CrcSeededPmOnlyReplay);
+            if resolution.metadata.is_some() && resolution.protocol.is_some() {
                 info!("Found P&M from pruned log replay");
-                return Ok((
-                    metadata_opt,
-                    protocol_opt,
-                    ProtocolMetadataSource::CrcSeededPmOnlyReplay,
-                ));
+                return Ok(resolution);
             }
 
-            // Case 2(b): P&M incomplete or older than the CRC, use the CRC.
-            // Use `or_else` so any newer P or M found in the pruned replay takes priority
-            // over the (older) CRC values.
+            // Case 2(b): P&M incomplete or older than the CRC, use the CRC. Any newer P or M found
+            // in the pruned replay takes priority over the (older) CRC values.
             info!("P&M fallback to CRC (no P&M changes after CRC version)");
-            return Ok((
-                metadata_opt.or_else(|| Some(crc.metadata.clone())),
-                protocol_opt.or_else(|| Some(crc.protocol.clone())),
-                ProtocolMetadataSource::CrcSeededPmOnlyReplay,
-            ));
+            resolution
+                .metadata
+                .get_or_insert_with(|| crc.metadata.clone());
+            resolution
+                .protocol
+                .get_or_insert_with(|| crc.protocol.clone());
+            return Ok(resolution);
         }
 
         // Case 3: Full P&M log replay.
-        let PmCandidate {
-            metadata: metadata_opt,
-            protocol: protocol_opt,
-        } = self.replay_for_pm(engine)?;
-        Ok((
-            metadata_opt.map(|(_, m)| m),
-            protocol_opt.map(|(_, p)| p),
-            ProtocolMetadataSource::FullReplay,
-        ))
+        Ok(self
+            .replay_for_pm(engine)?
+            .into_resolution(ProtocolMetadataSource::FullReplay))
     }
 
     /// Replays the log segment for the latest Protocol and Metadata, each with its version.
-    fn replay_for_pm(&self, engine: &dyn Engine) -> DeltaResult<PmCandidate> {
+    fn replay_for_pm(&self, engine: &dyn Engine) -> KernelResult<PmCandidate> {
         #[cfg(feature = "declarative-plans")]
         if let Some(executor) = engine.plan_executor() {
             return resolve_pm_batches(self.read_pm_batches_via_plan(executor.as_ref())?);
@@ -148,13 +118,9 @@ impl LogSegment {
         resolve_pm_batches(self.read_pm_batches(engine)?)
     }
 
-    /// Reads the P&M commit cover and checkpoint via the declarative plan, tagging each batch with
-    /// its version.
+    /// Builds the declarative plan that selects the latest Protocol and Metadata actions.
     #[cfg(feature = "declarative-plans")]
-    fn read_pm_batches_via_plan(
-        &self,
-        executor: &dyn PlanExecutor,
-    ) -> DeltaResult<impl Iterator<Item = DeltaResult<VersionedBatch>> + Send> {
+    fn build_pm_plan(&self) -> KernelResult<Plan> {
         #[cfg(feature = "adaptive-metadata-in-dev")]
         let versioned_schema = schema_ref! {
             (&PROTOCOL_FIELD),
@@ -184,7 +150,18 @@ impl LogSegment {
             })
             .transpose()?;
 
-        let plan = PlanBuilder::union_all(std::iter::once(commits).chain(checkpoint))?
+        // Required fields are non-null exactly when their Protocol or Metadata action is present.
+        // Filter on required leaf fields so readers can use row group skipping.
+        let relevant_action = Predicate::or(
+            col!(PROTOCOL_NAME, "minReaderVersion").is_not_null(),
+            col!(METADATA_NAME, "id").is_not_null(),
+        );
+        #[cfg(feature = "adaptive-metadata-in-dev")]
+        let relevant_action =
+            Predicate::or(relevant_action, col!(CHECKPOINT_ACTION_NAME).is_not_null());
+
+        PlanBuilder::union_all(std::iter::once(commits).chain(checkpoint))?
+            .filter(relevant_action)?
             .aggregate_ungrouped(|a| {
                 let protocol = || column_name!(PROTOCOL_NAME);
                 let metadata = || column_name!(METADATA_NAME);
@@ -209,20 +186,33 @@ impl LogSegment {
                 );
                 a
             })?
-            .build()?;
+            .build()
+    }
+
+    /// Reads the P&M commit cover and checkpoint via the declarative plan, tagging each batch with
+    /// its version.
+    #[cfg(feature = "declarative-plans")]
+    fn read_pm_batches_via_plan(
+        &self,
+        executor: &dyn PlanExecutor,
+    ) -> KernelResult<impl KernelResultIterator<VersionedBatch> + use<>> {
+        let plan = self.build_pm_plan()?;
 
         let batches = executor
             .execute_op(Operation::QueryPlan(plan))?
             .into_data()?
-            .map(|batch| {
-                // Mark as a log batch so the checkpoint action is read from it.
-                let batch = ActionsBatch::new(batch?, true);
+            .map(|actions| {
+                let actions = actions?;
                 let (protocol_version, metadata_version) =
-                    pm_versions_from_plan_output(batch.actions.as_ref())?;
+                    pm_versions_from_plan_output(actions.as_ref())?;
                 Ok(VersionedBatch {
                     protocol_version,
                     metadata_version,
-                    batch,
+                    // The plan reads every file with one schema, which includes the checkpoint
+                    // action.
+                    #[cfg(feature = "adaptive-metadata-in-dev")]
+                    projects_checkpoint_action: true,
+                    actions,
                 })
             });
         Ok(batches)
@@ -232,7 +222,7 @@ impl LogSegment {
     fn read_pm_batches(
         &self,
         engine: &dyn Engine,
-    ) -> DeltaResult<impl Iterator<Item = DeltaResult<VersionedBatch>> + Send> {
+    ) -> KernelResult<impl KernelResultIterator<VersionedBatch> + use<>> {
         let (commit_schema, checkpoint_schema) = pm_replay_schemas();
         // Commit schema only: `_file` in the checkpoint schema would break its skipping predicate.
         let file_column =
@@ -249,7 +239,6 @@ impl LogSegment {
                 None,
                 None,
                 None,
-                None,
             )?
             .actions;
         Ok(batches.map(move |batch| {
@@ -258,58 +247,148 @@ impl LogSegment {
             let version = if batch.is_log_batch {
                 batch_version(batch.actions.as_ref())? as i64
             } else {
-                checkpoint_version
-                    .ok_or_else(|| Error::internal_error("checkpoint batch without a version"))?
+                checkpoint_version.ok_or_else(|| {
+                    KernelError::internal_error("checkpoint batch without a version")
+                })?
             };
             Ok(VersionedBatch {
                 protocol_version: Some(version),
                 metadata_version: Some(version),
-                batch,
+                // Only the commit schema projects the checkpoint action.
+                #[cfg(feature = "adaptive-metadata-in-dev")]
+                projects_checkpoint_action: batch.is_log_batch,
+                actions: batch.actions,
             })
         }))
     }
 }
 
+/// How a snapshot's `lastManifestCommit` was resolved at build time, stored on the
+/// [`Snapshot`](crate::Snapshot) so consumers can read it without opening the log.
+#[cfg(feature = "adaptive-metadata-in-dev")]
+#[derive(Debug, Clone)]
+pub(crate) enum LastManifestCommitResolution {
+    /// Read from the CRC at the snapshot version or the committing transaction. `None` means the
+    /// table has no manifest commit at this version.
+    Resolved(Option<LastManifestCommit>),
+    /// The build never read the snapshot version's commitInfo; consumers read it from that
+    /// version's commit file.
+    Unresolved,
+}
+
+/// Result of a P&M resolution (see [`LogSegment::read_protocol_metadata_opt`]).
+pub(crate) struct PmResolution {
+    pub(crate) metadata: Option<Metadata>,
+    pub(crate) protocol: Option<Protocol>,
+    /// How the Protocol and Metadata were resolved.
+    pub(crate) source: ProtocolMetadataSource,
+    /// The latest AMT `checkpoint` action, when replay happened to read it. This only saves a
+    /// read: `lastManifestCommit`, which the CRC or the snapshot version's `commitInfo` always
+    /// carries, is the authority on the action and the snapshot follows it when this is `None`.
+    /// A hit is the latest action, since replay keeps the highest `checkpointMetadata.version`
+    /// it reaches and checkpoint versions strictly increase.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    pub(crate) captured_checkpoint_action: Option<Arc<CheckpointAction>>,
+    /// How the segment's `lastManifestCommit` was resolved. See [`LastManifestCommitResolution`].
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    pub(crate) last_manifest_commit: LastManifestCommitResolution,
+}
+
+impl PmResolution {
+    /// P&M taken from a CRC that short-circuits replay. With no replay to capture the checkpoint
+    /// action, the CRC's [`LastManifestCommit`] is what later locates it.
+    pub(crate) fn from_crc(crc: &Crc, source: ProtocolMetadataSource) -> Self {
+        Self {
+            metadata: Some(crc.metadata.clone()),
+            protocol: Some(crc.protocol.clone()),
+            source,
+            #[cfg(feature = "adaptive-metadata-in-dev")]
+            captured_checkpoint_action: None,
+            #[cfg(feature = "adaptive-metadata-in-dev")]
+            last_manifest_commit: LastManifestCommitResolution::Resolved(
+                crc.last_manifest_commit_opt.clone(),
+            ),
+        }
+    }
+}
+
 /// Protocol and Metadata, each tagged with the version it was found at. Holds both a single
 /// batch's parse and the newest resolved across batches.
+#[derive(Default)]
 struct PmCandidate {
     protocol: Option<(i64, Protocol)>,
     metadata: Option<(i64, Metadata)>,
+    /// The AMT checkpoint action found in this batch, or the latest one across batches, tagged
+    /// with its `checkpointMetadata.version` so it ranks the same way as Protocol and Metadata.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    checkpoint: Option<(i64, CheckpointAction)>,
+}
+
+impl PmCandidate {
+    /// Drops the Protocol and Metadata found at or below `version`.
+    fn newer_than(mut self, version: i64) -> Self {
+        self.protocol = self.protocol.filter(|(v, _)| *v > version);
+        self.metadata = self.metadata.filter(|(v, _)| *v > version);
+        self
+    }
+
+    /// The resolution this replay result gives the snapshot, resolved through `source`.
+    fn into_resolution(self, source: ProtocolMetadataSource) -> PmResolution {
+        PmResolution {
+            metadata: self.metadata.map(|(_, m)| m),
+            protocol: self.protocol.map(|(_, p)| p),
+            source,
+            #[cfg(feature = "adaptive-metadata-in-dev")]
+            captured_checkpoint_action: self.checkpoint.map(|(_, c)| Arc::new(c)),
+            #[cfg(feature = "adaptive-metadata-in-dev")]
+            last_manifest_commit: LastManifestCommitResolution::Unresolved,
+        }
+    }
+
+    /// Folds `other`, parsed from a batch replay reached later, into this result. Each field keeps
+    /// its higher-versioned value, so the order batches merge in only matters on a version tie,
+    /// where `other` wins.
+    fn merge(self, other: PmCandidate) -> Self {
+        PmCandidate {
+            protocol: newer(self.protocol, other.protocol),
+            metadata: newer(self.metadata, other.metadata),
+            #[cfg(feature = "adaptive-metadata-in-dev")]
+            checkpoint: newer(self.checkpoint, other.checkpoint),
+        }
+    }
 }
 
 /// A P&M-projected batch with the versions to rank its Protocol and Metadata at.
 struct VersionedBatch {
     protocol_version: Option<i64>,
     metadata_version: Option<i64>,
-    batch: ActionsBatch,
+    /// Whether `actions` has the AMT checkpoint action column.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    projects_checkpoint_action: bool,
+    actions: Box<dyn EngineData>,
 }
 
 /// The newest Protocol and Metadata across `batches`.
 fn resolve_pm_batches(
-    batches: impl Iterator<Item = DeltaResult<VersionedBatch>>,
-) -> DeltaResult<PmCandidate> {
-    let mut metadata: Option<(i64, Metadata)> = None;
-    let mut protocol: Option<(i64, Protocol)> = None;
+    batches: impl KernelResultIterator<VersionedBatch>,
+) -> KernelResult<PmCandidate> {
+    let mut resolved = PmCandidate::default();
     for batch in batches {
-        let VersionedBatch {
-            protocol_version,
-            metadata_version,
-            batch,
-        } = batch?;
-        let batch_version = protocol_version.max(metadata_version);
-        let candidate = pm_candidate(&batch, protocol_version, metadata_version)?;
-        metadata = newer(metadata, candidate.metadata);
-        protocol = newer(protocol, candidate.protocol);
+        let batch = batch?;
+        let batch_version = batch.protocol_version.max(batch.metadata_version);
+        resolved = resolved.merge(pm_candidate(&batch)?);
         // A checkpoint action's P&M can be older than its commit, so check version not presence.
-        if is_final(&protocol, batch_version) && is_final(&metadata, batch_version) {
+        if is_final(&resolved.protocol, batch_version)
+            && is_final(&resolved.metadata, batch_version)
+        {
             break;
         }
     }
-    Ok(PmCandidate { protocol, metadata })
+    Ok(resolved)
 }
 
 /// Parses the log version from a batch's `_file` metadata column.
-fn batch_version(data: &dyn EngineData) -> DeltaResult<Version> {
+fn batch_version(data: &dyn EngineData) -> KernelResult<Version> {
     #[derive(Default)]
     struct FilePathVisitor {
         file: Option<String>,
@@ -324,7 +403,7 @@ fn batch_version(data: &dyn EngineData) -> DeltaResult<Version> {
             &mut self,
             row_count: usize,
             getters: &[&'a dyn GetData<'a>],
-        ) -> DeltaResult<()> {
+        ) -> KernelResult<()> {
             if self.file.is_none() && row_count > 0 {
                 self.file = getters[0].get_opt(0, "_file")?;
             }
@@ -335,12 +414,12 @@ fn batch_version(data: &dyn EngineData) -> DeltaResult<Version> {
     visitor.visit_rows_of(data)?;
     let file = visitor
         .file
-        .ok_or_else(|| Error::internal_error("commit batch missing _file column"))?;
+        .ok_or_else(|| KernelError::internal_error("commit batch missing _file column"))?;
     let url = Url::parse(&file)
-        .map_err(|e| Error::internal_error(format!("batch has invalid _file {file}: {e}")))?;
-    ParsedLogPath::try_from(url)?
+        .map_err(|e| KernelError::internal_error(format!("batch has invalid _file {file}: {e}")))?;
+    ParsedLogPath::new(url)
         .map(|path| path.version)
-        .ok_or_else(|| Error::internal_error(format!("batch from non-log file {file}")))
+        .ok_or_else(|| KernelError::internal_error(format!("batch from non-log file {file}")))
 }
 
 /// Whether `winner` is set at a version at least `batch_version`.
@@ -349,6 +428,17 @@ fn is_final<T>(winner: &Option<(i64, T)>, batch_version: Option<i64>) -> bool {
         (Some((version, _)), Some(bv)) => *version >= bv,
         _ => false,
     }
+}
+
+/// The Protocol and Metadata nested in a checkpoint action, each tagged with the action's
+/// `checkpointMetadata.version`.
+#[cfg(feature = "adaptive-metadata-in-dev")]
+fn checkpoint_pm(checkpoint: &CheckpointAction) -> ((i64, Protocol), (i64, Metadata)) {
+    let version = checkpoint.version();
+    (
+        (version, checkpoint.protocol().clone()),
+        (version, checkpoint.metadata().clone()),
+    )
 }
 
 /// The higher-versioned of `a` and `b`; on a tie, `b` wins.
@@ -383,58 +473,44 @@ fn pm_replay_schemas() -> (Arc<StructType>, Arc<StructType>) {
     (commit_schema, checkpoint_schema)
 }
 
-/// The Protocol and Metadata in `batch`, tagged with the given versions, plus any AMT checkpoint
+/// The Protocol and Metadata in `batch`, tagged with its versions, plus any AMT checkpoint
 /// action's nested P&M at its own version.
-fn pm_candidate(
-    batch: &ActionsBatch,
-    protocol_version: Option<i64>,
-    metadata_version: Option<i64>,
-) -> DeltaResult<PmCandidate> {
+fn pm_candidate(batch: &VersionedBatch) -> KernelResult<PmCandidate> {
     let actions = batch.actions.as_ref();
-    let protocol = protocol_version.zip(Protocol::try_new_from_data(actions)?);
-    let metadata = metadata_version.zip(Metadata::try_new_from_data(actions)?);
-    let (checkpoint_protocol, checkpoint_metadata) = match checkpoint_pm(batch)? {
-        Some((version, p, m)) => (Some((version, p)), Some((version, m))),
-        None => (None, None),
-    };
-    Ok(PmCandidate {
-        protocol: newer(protocol, checkpoint_protocol),
-        metadata: newer(metadata, checkpoint_metadata),
-    })
-}
+    let protocol = batch
+        .protocol_version
+        .zip(Protocol::try_new_from_data(actions)?);
+    let metadata = batch
+        .metadata_version
+        .zip(Metadata::try_new_from_data(actions)?);
 
-/// The Protocol and Metadata nested in `batch`'s `checkpoint` action, at the action's own
-/// `checkpointMetadata.version`.
-fn checkpoint_pm(batch: &ActionsBatch) -> DeltaResult<Option<(i64, Protocol, Metadata)>> {
     #[cfg(feature = "adaptive-metadata-in-dev")]
     {
-        if !batch.is_log_batch {
-            return Ok(None);
-        }
-
-        let checkpoint = CheckpointAction::try_new_from_data(batch.actions.as_ref())?;
-
-        Ok(checkpoint.map(|checkpoint| {
-            (
-                checkpoint.version(),
-                checkpoint.protocol().clone(),
-                checkpoint.metadata().clone(),
-            )
-        }))
+        // Parsing an action needs its column in the batch's schema. A checkpoint action's nested
+        // P&M rank at its `checkpointMetadata.version`.
+        let checkpoint = if batch.projects_checkpoint_action {
+            CheckpointAction::try_new_from_data(actions)?
+        } else {
+            None
+        };
+        let (checkpoint_protocol, checkpoint_metadata) =
+            checkpoint.as_ref().map(checkpoint_pm).unzip();
+        Ok(PmCandidate {
+            protocol: newer(protocol, checkpoint_protocol),
+            metadata: newer(metadata, checkpoint_metadata),
+            checkpoint: checkpoint.map(|c| (c.version(), c)),
+        })
     }
 
     #[cfg(not(feature = "adaptive-metadata-in-dev"))]
-    {
-        let _ = batch;
-        Ok(None)
-    }
+    Ok(PmCandidate { protocol, metadata })
 }
 
 /// Reads the `protocol_version` and `metadata_version` columns the plan aggregate emits.
 #[cfg(feature = "declarative-plans")]
 fn pm_versions_from_plan_output(
     actions: &dyn EngineData,
-) -> DeltaResult<(Option<i64>, Option<i64>)> {
+) -> KernelResult<(Option<i64>, Option<i64>)> {
     #[derive(Default)]
     struct PmVersionsVisitor {
         protocol: Option<i64>,
@@ -458,7 +534,7 @@ fn pm_versions_from_plan_output(
             &mut self,
             row_count: usize,
             getters: &[&'a dyn GetData<'a>],
-        ) -> DeltaResult<()> {
+        ) -> KernelResult<()> {
             if row_count > 0 {
                 self.protocol = getters[0].get_opt(0, "protocol_version")?;
                 self.metadata = getters[1].get_opt(0, "metadata_version")?;
@@ -480,22 +556,26 @@ mod tests {
     use itertools::Itertools;
     use test_log::test;
 
+    use crate::Snapshot;
     use crate::engine::sync::SyncEngine;
     #[cfg(feature = "declarative-plans")]
     use crate::engine::test_delegating::DelegatingEngine;
     #[cfg(feature = "declarative-plans")]
-    use crate::plans::{Operation, PlanExecutor, PlanResult};
-    use crate::Snapshot;
+    use crate::expressions::{Predicate, expr};
     #[cfg(feature = "declarative-plans")]
-    use crate::{DeltaResult, Error};
+    use crate::plans::ir::nodes::Operator;
+    #[cfg(feature = "declarative-plans")]
+    use crate::plans::{Operation, PlanExecutor, PlanResult};
+    #[cfg(feature = "declarative-plans")]
+    use crate::{KernelError, KernelResult};
 
     #[cfg(feature = "declarative-plans")]
     struct FailingPlanExecutor;
 
     #[cfg(feature = "declarative-plans")]
     impl PlanExecutor for FailingPlanExecutor {
-        fn execute_op(&self, _op: Operation) -> DeltaResult<PlanResult> {
-            Err(Error::generic("plan executor deliberately failed"))
+        fn execute_op(&self, _op: Operation) -> KernelResult<PlanResult> {
+            Err(KernelError::generic("plan executor deliberately failed"))
         }
     }
 
@@ -539,6 +619,38 @@ mod tests {
         // read parts 1 and 5 (4 in all instead of 2) because row group skipping is disabled for
         // missing columns, but can still skip part 3 because has valid nullcount stats for P&M.
         assert_eq!(data.len(), 4);
+    }
+
+    #[cfg(feature = "declarative-plans")]
+    #[test]
+    fn test_declarative_pm_plan_filters_irrelevant_actions() {
+        let path =
+            std::fs::canonicalize(PathBuf::from("./tests/data/app-txn-checkpoint/")).unwrap();
+        let url = url::Url::from_directory_path(path).unwrap();
+        let snapshot = Snapshot::builder_for(url)
+            .build(&SyncEngine::new())
+            .unwrap();
+        let plan = snapshot.log_segment().build_pm_plan().unwrap();
+
+        let filter = plan
+            .nodes
+            .iter()
+            .find_map(|node| match &node.op {
+                Operator::Filter(filter) => Some(filter),
+                _ => None,
+            })
+            .expect("P&M plan must filter irrelevant actions");
+
+        let expected = Predicate::from_expr(expr!(or(
+            is_not_null(col("protocol.minReaderVersion")),
+            is_not_null(col("metaData.id"))
+        )));
+        #[cfg(feature = "adaptive-metadata-in-dev")]
+        let expected = Predicate::or(
+            expected,
+            Predicate::from_expr(expr!(is_not_null(col("checkpoint")))),
+        );
+        assert_eq!(filter.predicate.as_ref(), &expected);
     }
 
     // With the `declarative-plans` feature flag on, `SyncEngine` resolves P&M through the
@@ -595,5 +707,103 @@ mod tests {
             result.is_err(),
             "plan failure must surface, not fall back to legacy replay"
         );
+    }
+
+    // `rstest` cases glob-import their parent module, where `test_log::test` would shadow `test`.
+    mod pm_candidate {
+        use rstest::rstest;
+
+        use super::super::PmCandidate;
+        use crate::actions::{Metadata, Protocol};
+        use crate::metrics::ProtocolMetadataSource;
+
+        // A Protocol and Metadata that `writer_version` tells apart, found at the given versions.
+        #[cfg_attr(
+            not(feature = "adaptive-metadata-in-dev"),
+            allow(clippy::needless_update)
+        )]
+        fn candidate(
+            writer_version: i32,
+            protocol_version: Option<i64>,
+            metadata_version: Option<i64>,
+        ) -> PmCandidate {
+            PmCandidate {
+                protocol: protocol_version.map(|v| (v, protocol(writer_version))),
+                metadata: metadata_version.map(|v| (v, metadata(writer_version))),
+                ..Default::default()
+            }
+        }
+
+        fn protocol(writer_version: i32) -> Protocol {
+            Protocol::try_new_legacy(1, writer_version).unwrap()
+        }
+
+        fn metadata(writer_version: i32) -> Metadata {
+            Metadata::default().with_configuration_entry("writer", writer_version.to_string())
+        }
+
+        #[rstest]
+        #[case::above_version_kept(Some(3), Some(4), Some(3), Some(4))]
+        #[case::at_version_dropped(Some(2), Some(3), None, Some(3))]
+        #[case::below_version_dropped(Some(1), Some(2), None, None)]
+        fn test_newer_than_drops_pm_at_or_below_version(
+            #[case] protocol_version: Option<i64>,
+            #[case] metadata_version: Option<i64>,
+            #[case] expected_protocol_version: Option<i64>,
+            #[case] expected_metadata_version: Option<i64>,
+        ) {
+            let candidate = candidate(1, protocol_version, metadata_version).newer_than(2);
+            assert_eq!(
+                candidate.protocol.map(|(v, _)| v),
+                expected_protocol_version
+            );
+            assert_eq!(
+                candidate.metadata.map(|(v, _)| v),
+                expected_metadata_version
+            );
+        }
+
+        #[rstest]
+        #[case::self_newer(2, 1, 1)]
+        #[case::other_newer(1, 2, 2)]
+        #[case::tie_goes_to_other(1, 1, 2)]
+        fn test_merge_keeps_newer_pm(
+            #[case] self_version: i64,
+            #[case] other_version: i64,
+            #[case] expected_writer_version: i32,
+        ) {
+            let merged = candidate(1, Some(self_version), Some(self_version)).merge(candidate(
+                2,
+                Some(other_version),
+                Some(other_version),
+            ));
+            let expected_version = self_version.max(other_version);
+            assert_eq!(
+                merged.protocol,
+                Some((expected_version, protocol(expected_writer_version)))
+            );
+            assert_eq!(
+                merged.metadata,
+                Some((expected_version, metadata(expected_writer_version)))
+            );
+        }
+
+        #[test]
+        fn test_merge_keeps_pm_missing_from_one_side() {
+            let merged = candidate(1, Some(1), None).merge(candidate(2, None, Some(1)));
+            assert_eq!(merged.protocol, Some((1, protocol(1))));
+            assert_eq!(merged.metadata, Some((1, metadata(2))));
+        }
+
+        #[test]
+        fn test_into_resolution_drops_versions() {
+            let resolution =
+                candidate(1, Some(3), Some(4)).into_resolution(ProtocolMetadataSource::FullReplay);
+            assert_eq!(resolution.protocol, Some(protocol(1)));
+            assert_eq!(resolution.metadata, Some(metadata(1)));
+            assert_eq!(resolution.source, ProtocolMetadataSource::FullReplay);
+            #[cfg(feature = "adaptive-metadata-in-dev")]
+            assert!(resolution.captured_checkpoint_action.is_none());
+        }
     }
 }

@@ -7,38 +7,45 @@ use tracing::instrument;
 use super::Crc;
 use crate::metrics::events::CRC_READ_COMPLETED_SPAN;
 use crate::path::{AsUrl as _, ParsedLogPath};
-use crate::{DeltaResult, Engine, Error};
+use crate::{Engine, KernelError, KernelResult};
 
 /// Attempt to read and parse a CRC file.
 ///
 /// Reads raw bytes via the storage handler and deserializes with serde_json.
 ///
 /// Returns `Ok(Crc)` on success, `Err` on any failure (file not readable, corrupt JSON,
-/// missing required fields). The caller should handle errors gracefully by falling back to log
+/// missing required fields). Cancellation must propagate; other failures may fall back to log
 /// replay.
 ///
 /// Reports metrics: `CrcReadSuccess` or `CrcReadFailure`.
-#[instrument(name = CRC_READ_COMPLETED_SPAN, err(level = "warn"), skip_all, fields(report, bytes_read, path = ?crc_path.location.location))]
-pub(crate) fn try_read_crc_file(engine: &dyn Engine, crc_path: &ParsedLogPath) -> DeltaResult<Crc> {
+#[instrument(name = CRC_READ_COMPLETED_SPAN, err(level = "warn"), skip_all, fields(report, enable_call_frame, bytes_read, path = ?crc_path.location.location))]
+pub(crate) fn try_read_crc_file(
+    engine: &dyn Engine,
+    crc_path: &ParsedLogPath,
+) -> KernelResult<Crc> {
     let storage = engine.storage_handler();
     let url = crc_path.location.as_url().clone();
     let data = storage
         .read_files(vec![(url, None)])?
         .next()
-        .ok_or_else(|| Error::generic("CRC file read returned no data"))??;
+        .ok_or_else(|| KernelError::generic("CRC file read returned no data"))??;
     tracing::Span::current().record("bytes_read", data.len() as u64);
     Crc::try_from_json_bytes(&data, crc_path.version)
 }
 
-/// Read a CRC file, returning `None` if it cannot be read.
+/// Read an optional CRC, propagating cancellation and ignoring other read failures.
 ///
 /// CRC files are optional, so an unreadable one is not an error: the caller proceeds without
 /// it. The failure is logged and metered by [`try_read_crc_file`]'s instrumentation.
 pub(crate) fn read_crc_file_or_none(
     engine: &dyn Engine,
     crc_file: &ParsedLogPath,
-) -> Option<Arc<Crc>> {
-    try_read_crc_file(engine, crc_file).ok().map(Arc::new)
+) -> KernelResult<Option<Arc<Crc>>> {
+    match try_read_crc_file(engine, crc_file) {
+        Ok(crc) => Ok(Some(Arc::new(crc))),
+        Err(KernelError::Cancelled) => Err(KernelError::Cancelled),
+        Err(_) => Ok(None),
+    }
 }
 
 #[cfg(test)]
@@ -51,15 +58,43 @@ mod tests {
 
     use super::*;
     use crate::actions::{Format, Metadata, Protocol};
+    use crate::engine::CancellableEngine;
     use crate::engine::sync::SyncEngine;
     use crate::metrics::MetricEvent;
     use crate::path::ParsedLogPath;
     use crate::table_features::TableFeature;
-    use crate::unit_test_utils::{install_thread_local_metrics_reporter, CapturingReporter};
+    use crate::unit_test_utils::{
+        CapturingReporter, TestCancellationToken, install_thread_local_metrics_reporter,
+    };
 
     fn test_table_root(dir: &str) -> url::Url {
         let path = std::fs::canonicalize(PathBuf::from(dir)).unwrap();
         url::Url::from_directory_path(path).unwrap()
+    }
+
+    #[rstest::rstest]
+    #[case("crc-full", 0, Some(0))]
+    #[case("crc-malformed", 0, None)]
+    #[case("crc-full", 999, None)]
+    fn optional_crc_read_preserves_cancellation(
+        #[case] fixture: &str,
+        #[case] version: u64,
+        #[case] expected: Option<u64>,
+        #[values(false, true)] cancelled: bool,
+    ) {
+        let table_root = test_table_root(&format!("./tests/data/{fixture}/"));
+        let crc_path = ParsedLogPath::create_parsed_crc(&table_root, version);
+        let token = Arc::new(TestCancellationToken::default());
+        if cancelled {
+            token.cancel();
+        }
+        let engine = CancellableEngine::new(&SyncEngine::new(), token);
+        let result = read_crc_file_or_none(&engine, &crc_path);
+        if cancelled {
+            assert!(matches!(result, Err(KernelError::Cancelled)), "{result:?}");
+        } else {
+            assert_eq!(result.unwrap().map(|crc| crc.version), expected);
+        }
     }
 
     #[test]
@@ -133,12 +168,16 @@ mod tests {
         let dms = crc.domain_metadata_state.expect_complete();
         assert_eq!(dms.len(), 3);
 
-        assert!(dms["delta.clustering"]
-            .configuration()
-            .contains("clusteringColumns"));
-        assert!(dms["delta.rowTracking"]
-            .configuration()
-            .contains("rowIdHighWaterMark"));
+        assert!(
+            dms["delta.clustering"]
+                .configuration()
+                .contains("clusteringColumns")
+        );
+        assert!(
+            dms["delta.rowTracking"]
+                .configuration()
+                .contains("rowIdHighWaterMark")
+        );
         assert!(dms["myApp.metadata"].configuration().contains("key"));
 
         // Verify set transactions
@@ -158,12 +197,22 @@ mod tests {
         assert!(hist.file_counts[1..].iter().all(|&c| c == 0));
         assert!(hist.total_bytes[1..].iter().all(|&b| b == 0));
 
-        // These fields are on the Crc struct but not yet round-tripped through CrcRaw.
-        assert!(crc.txn_id.is_none());
-        assert!(crc.all_files.is_none());
-        assert!(crc.num_deleted_records_opt.is_none());
-        assert!(crc.num_deletion_vectors_opt.is_none());
-        assert!(crc.deleted_record_counts_histogram_opt.is_none());
+        assert_eq!(
+            crc.txn_id.as_deref(),
+            Some("29ebf587-9705-4bb4-ac40-2f02324065c8")
+        );
+        let all_files = crc.all_files.as_ref().unwrap();
+        assert_eq!(all_files.len(), 10);
+        assert_eq!(all_files.iter().map(|add| add.size).sum::<i64>(), 5259);
+        assert_eq!(crc.num_deleted_records_opt, Some(0));
+        assert_eq!(crc.num_deletion_vectors_opt, Some(0));
+        assert_eq!(
+            crc.deleted_record_counts_histogram_opt
+                .as_ref()
+                .unwrap()
+                .deleted_record_counts,
+            [10, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+        );
 
         let crc_events: Vec<_> = reporter
             .events()

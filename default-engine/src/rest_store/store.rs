@@ -8,22 +8,22 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::{
-    Attributes, CopyOptions, Error as ObjectStoreError, GetOptions, GetRange, GetResult,
+    self, Attributes, CopyOptions, Error as ObjectStoreError, GetOptions, GetRange, GetResult,
     GetResultPayload, ListResult, MultipartUpload, ObjectMeta, ObjectStore, PutMode,
     PutMultipartOptions, PutOptions, PutPayload, PutResult, Result as ObjectStoreResult,
 };
-use futures::stream::BoxStream;
 use futures::StreamExt as _;
-use reqwest::header::HeaderMap;
+use futures::stream::BoxStream;
 use reqwest::Client;
+use reqwest::header::HeaderMap;
 use tracing::{info, warn};
 
 use super::auth::AuthHeaderProvider;
 use super::config::RestEndpointConfig;
 use super::generic_error;
 use super::response::{
-    classify_put_create_response, ensure_list_response, ensure_success_response,
-    is_retryable_http_status, is_transient, PutCreateDisposition, RetryFailure,
+    PutCreateDisposition, RetryFailure, classify_put_create_response, ensure_list_response,
+    ensure_success_response, is_retryable_http_status, is_transient,
 };
 
 /// A generic REST/HTTP-backed [`ObjectStore`]. See the [module docs](super).
@@ -187,7 +187,7 @@ impl RestObjectStore {
                     return Err(ObjectStoreError::AlreadyExists {
                         path: path.to_string(),
                         source: "verified conflicting write".into(),
-                    })
+                    });
                 }
                 Ok(WriteState::Absent) => {}
                 Err(e) if retries >= self.max_retries => {
@@ -358,20 +358,20 @@ impl RestObjectStore {
                 };
                 for meta in page.objects {
                     // Enforce the exclusive-offset contract client-side.
-                    if let Some(off) = &exclusive_offset {
-                        if meta.location <= *off {
-                            continue;
-                        }
+                    if let Some(off) = &exclusive_offset
+                        && meta.location <= *off
+                    {
+                        continue;
                     }
-                    if let Some(last) = &last_path {
-                        if meta.location < *last {
-                            yield Err(generic_error(format!(
-                                "REST listing returned out-of-order entry `{}` after `{}`; \
-                                 RestEndpointConfig must return lexicographically sorted paths",
-                                meta.location, last
-                            )));
-                            break 'pages;
-                        }
+                    if let Some(last) = &last_path
+                        && meta.location < *last
+                    {
+                        yield Err(generic_error(format!(
+                            "REST listing returned out-of-order entry `{}` after `{}`; \
+                             RestEndpointConfig must return lexicographically sorted paths",
+                            meta.location, last
+                        )));
+                        break 'pages;
                     }
                     last_path = Some(meta.location.clone());
                     yield Ok(meta);
@@ -427,10 +427,7 @@ fn not_supported(op: &str) -> ObjectStoreError {
 
 /// A successful PUT result; this store surfaces no etag or version.
 fn put_result() -> PutResult {
-    PutResult {
-        e_tag: None,
-        version: None,
-    }
+    object_store::delta_kernel_compat::empty_put_result()
 }
 
 /// Outcome of reading a file back to compare against bytes we tried to write.
@@ -500,12 +497,12 @@ impl ObjectStore for RestObjectStore {
             let meta = self.head_meta(path_str, location).await?;
             options.check_preconditions(&meta)?;
             let size = meta.size;
-            return Ok(GetResult {
-                payload: GetResultPayload::Stream(Box::pin(futures::stream::empty())),
-                range: 0..size,
+            return Ok(object_store::delta_kernel_compat::get_result(
+                GetResultPayload::Stream(Box::pin(futures::stream::empty())),
                 meta,
-                attributes: Attributes::new(),
-            });
+                0..size,
+                Attributes::new(),
+            ));
         }
 
         let range_header = options.range.as_ref().map(get_range_to_header);
@@ -565,12 +562,12 @@ impl ObjectStore for RestObjectStore {
         options.check_preconditions(&meta)?;
 
         let stream = Box::pin(futures::stream::once(futures::future::ready(Ok(content))));
-        Ok(GetResult {
-            payload: GetResultPayload::Stream(stream),
+        Ok(object_store::delta_kernel_compat::get_result(
+            GetResultPayload::Stream(stream),
             meta,
             range,
-            attributes: Attributes::new(),
-        })
+            Attributes::new(),
+        ))
     }
 
     async fn put_opts(

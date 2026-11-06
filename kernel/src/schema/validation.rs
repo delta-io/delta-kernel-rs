@@ -4,32 +4,74 @@
 
 use std::collections::HashSet;
 
+use crate::schema::collation_utils::validate_collation_annotations;
 use crate::schema::{StructField, StructType};
+use crate::table_changes::{
+    CHANGE_TYPE_COL_NAME, COMMIT_TIMESTAMP_COL_NAME, COMMIT_VERSION_COL_NAME,
+};
 use crate::table_features::ColumnMappingMode;
-use crate::transforms::SchemaTransform;
-use crate::{transform_output_type, DeltaResult, Error};
+use crate::transforms::{SchemaTransform, transform_output_type};
+use crate::utils::require;
+use crate::{KernelError, KernelResult};
 
 /// Characters that are invalid in Parquet column names when column mapping is disabled.
 /// These characters have special meaning in Parquet schema syntax.
 const INVALID_PARQUET_CHARS: &[char] = &[' ', ',', ';', '{', '}', '(', ')', '\n', '\t', '='];
 
-/// Validates a schema for CREATE TABLE or ALTER TABLE.
+/// Validates a schema and its metadata annotations for CREATE TABLE or ALTER TABLE.
 ///
-/// Performs the following checks:
-/// 1. No duplicate column names (case-insensitive, including nested fields)
-/// 2. Column names contain only valid characters
-/// 3. Rejects fields with `delta.invariants` metadata (SQL expression invariants are not supported
-///    by kernel)
+/// Applies column-name rules for `column_mapping_mode` and CDF restrictions when `cdf_enabled` is
+/// true. Returns an error if schema or metadata annotation validation fails.
 pub(crate) fn validate_schema(
     schema: &StructType,
     column_mapping_mode: ColumnMappingMode,
-) -> DeltaResult<()> {
+    cdf_enabled: bool,
+) -> KernelResult<()> {
     let mut validator = SchemaValidator::new(column_mapping_mode);
     // We reuse the SchemaTransform trait for its recursive traversal machinery.
     // The validator never transforms the schema -- it only inspects fields and
     // collects errors. The return value is intentionally discarded.
     validator.transform_struct(schema);
-    validator.into_result()
+    validator.into_result()?;
+    validate_collation_annotations(schema)?;
+    if cdf_enabled {
+        validate_cdf_column_names(schema, column_mapping_mode)?;
+    }
+    Ok(())
+}
+
+/// Rejects CDF-reserved top-level logical names and top-level physical name `_change_type`
+/// (case-insensitive). Among the CDF-reserved column names, only `_change_type` is stored in
+/// parquet, so for top-level physical name we only need to check it.
+fn validate_cdf_column_names(
+    schema: &StructType,
+    column_mapping_mode: ColumnMappingMode,
+) -> KernelResult<()> {
+    for field in schema.fields() {
+        let name = field.name();
+        require!(
+            ![
+                CHANGE_TYPE_COL_NAME,
+                COMMIT_VERSION_COL_NAME,
+                COMMIT_TIMESTAMP_COL_NAME,
+            ]
+            .iter()
+            .any(|reserved| name.eq_ignore_ascii_case(reserved)),
+            KernelError::schema(format!(
+                "Column '{name}' is reserved for Change Data Feed and cannot appear in the \
+                 table schema when delta.enableChangeDataFeed is true"
+            ))
+        );
+        let physical_name = field.physical_name(column_mapping_mode);
+        require!(
+            !physical_name.eq_ignore_ascii_case(CHANGE_TYPE_COL_NAME),
+            KernelError::schema(format!(
+                "Column '{name}' has physical name '{physical_name}', which is reserved for \
+                 Change Data Feed when delta.enableChangeDataFeed is true"
+            ))
+        );
+    }
+    Ok(())
 }
 
 /// Schema visitor that validates field names, detects duplicates, and rejects
@@ -59,11 +101,11 @@ impl SchemaValidator {
         }
     }
 
-    fn into_result(self) -> DeltaResult<()> {
+    fn into_result(self) -> KernelResult<()> {
         if self.errors.is_empty() {
             Ok(())
         } else {
-            Err(Error::generic(format!(
+            Err(KernelError::generic(format!(
                 "Schema validation failed:\n- {}",
                 self.errors.join("\n- ")
             )))
@@ -123,14 +165,14 @@ impl<'a> SchemaTransform<'a> for SchemaValidator {
 /// When column mapping is enabled, only rejects newlines since physical names are
 /// auto-generated but newlines in column names break metadata serialization regardless
 /// of column mapping mode.
-fn validate_field_name(name: &str, cm_enabled: bool) -> DeltaResult<()> {
+fn validate_field_name(name: &str, cm_enabled: bool) -> KernelResult<()> {
     if name.is_empty() {
-        return Err(Error::generic("Column name cannot be empty"));
+        return Err(KernelError::generic("Column name cannot be empty"));
     }
     if cm_enabled {
         // Newlines break metadata serialization regardless of column mapping mode.
         if name.contains('\n') {
-            return Err(Error::generic(format!(
+            return Err(KernelError::generic(format!(
                 "Column name '{name}' contains a newline character, which is not allowed"
             )));
         }
@@ -139,7 +181,7 @@ fn validate_field_name(name: &str, cm_enabled: bool) -> DeltaResult<()> {
             .chars()
             .filter(|c| INVALID_PARQUET_CHARS.contains(c))
             .collect();
-        return Err(Error::generic(format!(
+        return Err(KernelError::generic(format!(
             "Column name '{name}' contains invalid character(s) {invalid:?} that are not \
              allowed in Parquet column names. \
              Enable column mapping to use special characters in column names."
@@ -151,10 +193,11 @@ fn validate_field_name(name: &str, cm_enabled: bool) -> DeltaResult<()> {
 #[cfg(test)]
 mod tests {
     use rstest::rstest;
+    use test_utils::assert_result_error_with_message;
 
     use super::*;
     use crate::schema::{
-        schema, ArrayType, ColumnMetadataKey, DataType, MetadataValue, StructField, StructType,
+        ArrayType, ColumnMetadataKey, DataType, MetadataValue, StructField, StructType, schema,
     };
 
     // === Schema builders for test cases ===
@@ -261,7 +304,7 @@ mod tests {
     fn field_with_invariant(name: &str, data_type: DataType, nullable: bool) -> StructField {
         let mut field = StructField::new(name, data_type, nullable);
         field.metadata.insert(
-            ColumnMetadataKey::Invariants.as_ref().to_string(),
+            ColumnMetadataKey::Invariants.as_ref().into(),
             MetadataValue::String(r#"{"expression": {"expression": "x > 0"}}"#.to_string()),
         );
         field
@@ -310,7 +353,103 @@ mod tests {
     #[case::empty_cm_name(schema! {}, ColumnMappingMode::Name)]
     #[case::empty_cm_id(schema! {}, ColumnMappingMode::Id)]
     fn valid_schema_accepted(#[case] schema: StructType, #[case] cm: ColumnMappingMode) {
-        assert!(validate_schema(&schema, cm).is_ok());
+        assert!(validate_schema(&schema, cm, false /* cdf_enabled */).is_ok());
+    }
+
+    #[rstest]
+    #[case::ordinary(schema! { nullable "value": STRING })]
+    #[case::nested(schema! {
+        nullable "nested": {
+            nullable "_change_type": STRING,
+            nullable "_commit_version": LONG,
+            nullable "_commit_timestamp": TIMESTAMP,
+        },
+    })]
+    #[case::nested_physical(schema! {
+        nullable "nested": {
+            (StructField::nullable("value", DataType::STRING).with_metadata([
+                (ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(), "_change_type"),
+            ])),
+        },
+    })]
+    #[case::physical_commit_metadata(schema! {
+        (StructField::nullable("version", DataType::LONG).with_metadata([
+            (ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(), "_commit_version"),
+        ])),
+        (StructField::nullable("timestamp", DataType::TIMESTAMP).with_metadata([
+            (ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(), "_commit_timestamp"),
+        ])),
+    })]
+    fn non_reserved_cdf_column_names_accepted(
+        #[case] schema: StructType,
+        #[values(
+            ColumnMappingMode::None,
+            ColumnMappingMode::Name,
+            ColumnMappingMode::Id
+        )]
+        cm: ColumnMappingMode,
+    ) {
+        validate_schema(&schema, cm, true /* cdf_enabled */).unwrap();
+    }
+
+    #[rstest]
+    #[case::cdf_enabled(true, Some("reserved for Change Data Feed"))]
+    #[case::cdf_disabled(false, None)]
+    fn reserved_cdf_column_names_rejected_when_cdf_enabled(
+        #[case] cdf_enabled: bool,
+        #[case] expected_error: Option<&str>,
+        #[values(
+            "_change_type",
+            "_commit_version",
+            "_commit_timestamp",
+            "_CHANGE_TYPE",
+            "_COMMIT_VERSION",
+            "_COMMIT_TIMESTAMP",
+            "_Change_Type",
+            "_Commit_Version",
+            "_Commit_Timestamp"
+        )]
+        name: &str,
+        #[values(
+            ColumnMappingMode::None,
+            ColumnMappingMode::Name,
+            ColumnMappingMode::Id
+        )]
+        cm: ColumnMappingMode,
+    ) {
+        let schema = schema! { (StructField::nullable(name, DataType::STRING)) };
+        let result = validate_schema(&schema, cm, cdf_enabled);
+        if let Some(expected_error) = expected_error {
+            assert_result_error_with_message(result, expected_error);
+        } else {
+            result.unwrap();
+        }
+    }
+
+    #[rstest]
+    #[case::name_cdf_enabled(ColumnMappingMode::Name, true, Some("has physical name"))]
+    #[case::id_cdf_enabled(ColumnMappingMode::Id, true, Some("has physical name"))]
+    #[case::none_cdf_enabled(ColumnMappingMode::None, true, None)]
+    #[case::name_cdf_disabled(ColumnMappingMode::Name, false, None)]
+    #[case::id_cdf_disabled(ColumnMappingMode::Id, false, None)]
+    #[case::none_cdf_disabled(ColumnMappingMode::None, false, None)]
+    fn reserved_cdf_physical_name_rejected_when_mapping_and_cdf_enabled(
+        #[case] cm: ColumnMappingMode,
+        #[case] cdf_enabled: bool,
+        #[case] expected_error: Option<&str>,
+        #[values("_change_type", "_CHANGE_TYPE", "_Change_Type")] physical_name: &str,
+    ) {
+        let schema = schema! {
+            (StructField::nullable("value", DataType::STRING).with_metadata([
+                (ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(), physical_name),
+            ])),
+        };
+        let result = validate_schema(&schema, cm, cdf_enabled);
+        if let Some(expected_error) = expected_error {
+            assert_result_error_with_message(result, expected_error);
+        } else {
+            result.unwrap();
+        }
     }
 
     // === Invalid schemas ===
@@ -326,12 +465,22 @@ mod tests {
     #[case::top_level_dup(schema_top_level_dup(), ColumnMappingMode::None, &["duplicate"])]
     #[case::array_element_dup(schema_array_dup(), ColumnMappingMode::None, &["duplicate"])]
     #[case::multi_error(schema_multi_bad(), ColumnMappingMode::None, &["bad column", "col;name"])]
+    #[case::malformed_collation_metadata(
+        schema! {
+            (StructField::nullable("field", DataType::STRING).with_metadata([(
+                ColumnMetadataKey::Collations.as_ref(),
+                MetadataValue::Other(serde_json::json!({"field": 12})),
+            )])),
+        },
+        ColumnMappingMode::None,
+        &["__COLLATIONS", "string identifier"]
+    )]
     fn invalid_schema_rejected(
         #[case] schema: StructType,
         #[case] cm: ColumnMappingMode,
         #[case] expected_errs: &[&str],
     ) {
-        let result = validate_schema(&schema, cm);
+        let result = validate_schema(&schema, cm, false /* cdf_enabled */);
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         for expected in expected_errs {
@@ -350,7 +499,11 @@ mod tests {
     #[case::array_nested(schema_array_nested_invariant(), "arr.child")]
     #[case::map_nested(schema_map_nested_invariant(), "map.child")]
     fn invariants_metadata_rejected(#[case] schema: StructType, #[case] expected_path: &str) {
-        let result = validate_schema(&schema, ColumnMappingMode::None);
+        let result = validate_schema(
+            &schema,
+            ColumnMappingMode::None,
+            false, /* cdf_enabled */
+        );
         let err = result.expect_err("expected delta.invariants metadata rejection");
         let msg = err.to_string();
         assert!(

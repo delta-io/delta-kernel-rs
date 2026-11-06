@@ -14,7 +14,7 @@
 //!
 //! // Step 2: Build and commit the create-table transaction
 //! let disk_props = get_required_properties_for_disk(&staging_info.table_id);
-//! let create_table_txn = kernel::create_table(path, schema, "MyApp/1.0")
+//! let create_table_txn = kernel::create_table(path, schema, "MyApp/1.0", /* data_change */ true)
 //!     .with_table_properties(disk_props)
 //!     .build(engine, committer);
 //! create_table_txn.commit(engine)?;
@@ -28,7 +28,7 @@
 use std::collections::{HashMap, HashSet};
 
 use delta_kernel::actions::Protocol;
-use delta_kernel::{DeltaResult, Engine, Error, Snapshot};
+use delta_kernel::{Engine, KernelError, KernelResult, Snapshot};
 use unity_catalog_delta_client_api::{
     CreateTableRequest, Protocol as WireProtocol, StorageCredential,
 };
@@ -116,9 +116,9 @@ pub fn build_uc_create_table_request(
     snapshot: &Snapshot,
     engine: &dyn Engine,
     table_name: impl Into<String>,
-) -> DeltaResult<CreateTableRequest> {
+) -> KernelResult<CreateTableRequest> {
     if snapshot.version() != 0 {
-        return Err(Error::generic(format!(
+        return Err(KernelError::generic(format!(
             "build_uc_create_table_request is only valid for version 0 (table creation) \
              snapshots, but snapshot is at version {}",
             snapshot.version()
@@ -126,7 +126,7 @@ pub fn build_uc_create_table_request(
     }
 
     let columns = serde_json::to_value(snapshot.schema().as_ref())
-        .map_err(|e| Error::generic(format!("Failed to serialize table schema: {e}")))?;
+        .map_err(|e| KernelError::generic(format!("Failed to serialize table schema: {e}")))?;
 
     let table_config = snapshot.table_configuration();
     let metadata = table_config.metadata();
@@ -143,15 +143,17 @@ pub fn build_uc_create_table_request(
     // UC only recognizes the `delta.clustering` and `delta.rowTracking` domain metadatas.
     let uc_recognized_domains = HashSet::from([CLUSTERING_DOMAIN_NAME, ROW_TRACKING_DOMAIN_NAME]);
     let mut domain_metadata: HashMap<String, serde_json::Value> = HashMap::new();
-    for (domain, dm) in
-        snapshot.get_domain_metadatas_internal(engine, Some(&uc_recognized_domains))?
+    for (domain, dm) in snapshot
+        .reader()
+        .get_domain_metadatas_internal(engine, Some(&uc_recognized_domains))?
     {
-        let value = serde_json::from_str(dm.configuration())
-            .map_err(|e| Error::generic(format!("malformed {domain} domain metadata: {e}")))?;
+        let value = serde_json::from_str(dm.configuration()).map_err(|e| {
+            KernelError::generic(format!("malformed {domain} domain metadata: {e}"))
+        })?;
         domain_metadata.insert(domain, value);
     }
 
-    let in_commit_timestamp_ms = snapshot.get_timestamp(engine)?;
+    let in_commit_timestamp_ms = snapshot.reader().get_timestamp(engine)?;
 
     Ok(CreateTableRequest {
         name: table_name.into(),
@@ -194,8 +196,9 @@ mod tests {
 
     use delta_kernel::expressions::column_name;
     use delta_kernel::object_store::memory::InMemory;
-    use delta_kernel::schema::{schema_ref, SchemaRef};
+    use delta_kernel::schema::{SchemaRef, schema_ref};
     use delta_kernel::snapshot::Snapshot;
+    use delta_kernel::transaction::UpdateTableOperation;
     use delta_kernel::transaction::create_table::create_table;
     use delta_kernel::transaction::data_layout::DataLayout;
     use delta_kernel_default_engine::DefaultEngineBuilder;
@@ -213,7 +216,7 @@ mod tests {
         disk_props: HashMap<String, String>,
         data_layout: DataLayout,
     ) -> CreateTableRequest {
-        create_table(table_path, schema, "Test/1.0")
+        create_table(table_path, schema, "Test/1.0", true)
             .with_table_properties(disk_props)
             .with_data_layout(data_layout)
             .build(engine, Box::new(TestCatalogCommitter))
@@ -264,16 +267,18 @@ mod tests {
 
         assert_eq!(req.protocol.min_reader_version, 3);
         assert_eq!(req.protocol.min_writer_version, 7);
-        assert!(req
-            .protocol
-            .reader_features
-            .iter()
-            .any(|f| f == "catalogManaged"));
-        assert!(req
-            .protocol
-            .writer_features
-            .iter()
-            .any(|f| f == "inCommitTimestamp"));
+        assert!(
+            req.protocol
+                .reader_features
+                .iter()
+                .any(|f| f == "catalogManaged")
+        );
+        assert!(
+            req.protocol
+                .writer_features
+                .iter()
+                .any(|f| f == "inCommitTimestamp")
+        );
 
         assert_eq!(
             req.properties["io.unitycatalog.tableId"],
@@ -341,11 +346,11 @@ mod tests {
             "delta.feature.domainMetadata".to_string(),
             "supported".to_string(),
         );
-        create_table(table_path, schema, "Test/1.0")
+        create_table(table_path, schema, "Test/1.0", true)
             .with_table_properties(disk_props)
+            .with_domain_metadata("myApp.retention", r#"{"days":30}"#)
             .build(&engine, Box::new(TestCatalogCommitter))
             .unwrap()
-            .with_domain_metadata("myApp.retention".to_string(), r#"{"days":30}"#.to_string())
             .commit(&engine)
             .unwrap()
             .unwrap_committed();
@@ -415,7 +420,7 @@ mod tests {
 
         // Create a table (version 0) and append (version 1).
         let disk_props = get_required_properties_for_disk("test-table-id");
-        let _ = create_table(table_path, schema, "Test/1.0")
+        let _ = create_table(table_path, schema, "Test/1.0", true)
             .with_table_properties(disk_props)
             .build(&engine, Box::new(TestCatalogCommitter))
             .unwrap()
@@ -426,7 +431,8 @@ mod tests {
             .build(&engine)
             .unwrap();
         let result = v0_snapshot
-            .transaction(Box::new(TestCatalogCommitter), &engine)
+            .update_table(UpdateTableOperation::Write, "test-engine", true)
+            .build(&engine, Box::new(TestCatalogCommitter))
             .unwrap()
             .commit(&engine)
             .unwrap();

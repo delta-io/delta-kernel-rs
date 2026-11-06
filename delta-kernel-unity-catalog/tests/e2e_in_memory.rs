@@ -2,15 +2,19 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use delta_kernel::arrow::array::{ArrayRef, Int32Array, StringArray};
+use delta_kernel::commit_range::CommitRange;
 use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::schema::schema_ref;
+use delta_kernel::transaction::UpdateTableOperation;
 use delta_kernel::transaction::create_table::create_table;
-use delta_kernel::{Engine, Snapshot};
-use delta_kernel_default_engine::executor::tokio::TokioMultiThreadExecutor;
+use delta_kernel::{Engine, KernelError, Snapshot};
 use delta_kernel_default_engine::DefaultEngine;
+use delta_kernel_default_engine::executor::tokio::TokioMultiThreadExecutor;
 use delta_kernel_unity_catalog::{
-    get_required_properties_for_disk, snapshot_builder_from_load_table, UCCommitter,
+    UCCommitter, get_required_properties_for_disk, log_tail_from_commits,
+    snapshot_builder_from_load_table,
 };
+use rstest::rstest;
 use test_utils::{insert_data_with, read_scan};
 use unity_catalog_delta_client_api::{
     Commit, InMemoryUpdateTableClient, TableData, TableIdentifier,
@@ -122,8 +126,8 @@ fn commit(
 ) -> Result<Arc<Snapshot>, TestError> {
     Ok(snapshot
         .clone()
-        .transaction(Box::new(uc_committer(update_table_client)), engine)?
-        .with_operation("WRITE".to_string())
+        .update_table(UpdateTableOperation::Write, "test-engine", true)
+        .build(engine, Box::new(uc_committer(update_table_client)))?
         .commit(engine)?
         .unwrap_post_commit_snapshot())
 }
@@ -169,6 +173,198 @@ async fn test_scan_returns_fixture_rows() -> Result<(), TestError> {
     Ok(())
 }
 
+/// `published_names[i]` selects whether the catalog names version `i + 1` by its published or
+/// staged filename. Every version up to the last published name also gets a published file,
+/// matching in-order backfill.
+#[rstest]
+#[case::published_prefix(&[true, false])]
+#[case::published_suffix(&[false, true])]
+#[case::all_published(&[true, true])]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_snapshot_from_catalog_response_with_published_commits(
+    #[case] published_names: &[bool],
+    #[values(0, 1)] base_version: u64,
+) -> Result<(), TestError> {
+    let TestSetup {
+        engine,
+        table_uri,
+        _tmp_dir: tmp_dir,
+        ..
+    } = setup().await?;
+    let engine = Arc::new(engine);
+    let log_dir = tmp_dir.path().join("_delta_log");
+    // (version, timestamp, uuid, file size, modification time) of the fixture's staged commits.
+    let staged = [
+        (
+            1,
+            1749830871085,
+            "4cb9708e-b478-44de-b203-53f9ba9b2876",
+            889,
+            1749830870833,
+        ),
+        (
+            2,
+            1749830881799,
+            "5b9bba4a-0085-430d-a65e-b0d38c1afbe9",
+            891,
+            1749830881779,
+        ),
+    ];
+    let last_published_idx = published_names
+        .iter()
+        .rposition(|published| *published)
+        .ok_or("expected a published commit")?;
+
+    let mut catalog_commits = vec![];
+    for (i, &(version, ts, uuid, size, mod_ts)) in staged.iter().enumerate() {
+        let staged_name = format!("{version:020}.{uuid}.json");
+        let published_name = format!("{version:020}.json");
+        if i <= last_published_idx {
+            std::fs::copy(
+                log_dir.join("_staged_commits").join(&staged_name),
+                log_dir.join(&published_name),
+            )?;
+        }
+        let file_name = if published_names[i] {
+            published_name
+        } else {
+            staged_name
+        };
+        catalog_commits.push(Commit::new(version, ts, file_name, size, mod_ts));
+    }
+    let client = Arc::new(InMemoryUpdateTableClient::new());
+    client.insert_table(
+        TABLE_ID,
+        TableData {
+            max_ratified_version: 2,
+            catalog_commits,
+        },
+    );
+
+    let snapshot = build_snapshot(&client, &engine, &table_uri)?;
+    assert_eq!(snapshot.version(), 2);
+    // Publishing copies only staged commits above this watermark.
+    assert_eq!(
+        snapshot.log_segment().listed.max_published_version,
+        Some(last_published_idx as u64 + 1)
+    );
+    let scan = snapshot.clone().scan_builder().build()?;
+    let rows: usize = read_scan(&scan, engine.clone() as Arc<dyn Engine>)?
+        .iter()
+        .map(|b| b.num_rows())
+        .sum();
+    assert_eq!(rows, 200);
+
+    let listing = snapshot
+        .clone()
+        .incremental_scan_builder(base_version)
+        .build(engine.as_ref())?
+        .expect("snapshot must cover the incremental scan range")
+        .into_listing()?;
+    assert_eq!(listing.summary.base_version, base_version);
+    assert_eq!(listing.summary.target_version, 2);
+    assert!(listing.summary.removes.is_empty());
+    let mut added_paths: Vec<_> = listing
+        .summary
+        .live_adds
+        .iter()
+        .map(|key| key.path())
+        .collect();
+    added_paths.sort_unstable();
+    let expected_paths = [
+        "part1=0/part-00000-13fefaba-8ec2-4762-b17e-aeda657451c5.c000.snappy.parquet",
+        "part1=1/part-00000-8afb1c56-2018-4af2-aa4f-4336c1b39efd.c000.snappy.parquet",
+    ];
+    assert_eq!(added_paths, expected_paths[base_version as usize..]);
+    let selected_adds: usize = listing
+        .add_files
+        .iter()
+        .map(|batch| {
+            batch
+                .selection_vector()
+                .iter()
+                .filter(|selected| **selected)
+                .count()
+        })
+        .sum();
+    assert_eq!(selected_adds, 2 - base_version as usize);
+
+    let resp = client.load_table_response(TABLE_ID, table_uri.as_str())?;
+    let range = CommitRange::builder_for(table_uri.as_str(), 0)
+        .with_log_tail(log_tail_from_commits(&resp.commits, table_uri.clone())?, 2)
+        .build(engine.as_ref())?;
+    assert_eq!(range.end_version(), 2);
+
+    // Checkpointing a new commit requires publishing it on top of the mixed log tail.
+    commit(&snapshot, &client, &engine)?
+        .publish(engine.as_ref(), &uc_committer(&client))?
+        .checkpoint(engine.as_ref(), None)?;
+    let snapshot = Snapshot::builder_for(table_uri)
+        .with_max_catalog_version(3)
+        .build(engine.as_ref())?;
+    assert_eq!(snapshot.log_segment().checkpoint_version, Some(3));
+    Ok(())
+}
+
+#[rstest]
+#[case::two_published([true, true])]
+#[case::published_and_staged([true, false])]
+#[case::two_staged([false, false])]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_catalog_response_rejects_duplicate_commit_versions(
+    #[case] published_names: [bool; 2],
+) -> Result<(), TestError> {
+    let TestSetup {
+        update_table_client,
+        engine,
+        table_uri,
+        _tmp_dir,
+        ..
+    } = setup().await?;
+    let mut resp = update_table_client.load_table_response(TABLE_ID, table_uri.as_str())?;
+    let uuids = [
+        "4cb9708e-b478-44de-b203-53f9ba9b2876",
+        "5b9bba4a-0085-430d-a65e-b0d38c1afbe9",
+    ];
+    resp.commits = published_names
+        .into_iter()
+        .zip(uuids)
+        .map(|(published, uuid)| {
+            let filename = if published {
+                "00000000000000000001.json".to_string()
+            } else {
+                format!("00000000000000000001.{uuid}.json")
+            };
+            Commit::new(1, 1749830871085, filename, 889, 1749830870833)
+        })
+        .collect();
+    resp.latest_table_version = Some(1);
+
+    let snapshot_error = snapshot_builder_from_load_table(&resp)?
+        .build(&engine)
+        .unwrap_err();
+    assert!(matches!(
+        snapshot_error,
+        KernelError::LogTailVersionsNotContiguous {
+            first_version: 1,
+            second_version: 1,
+        }
+    ));
+
+    let range_error = CommitRange::builder_for(table_uri.as_str(), 0)
+        .with_log_tail(log_tail_from_commits(&resp.commits, table_uri)?, 1)
+        .build(&engine)
+        .unwrap_err();
+    assert!(matches!(
+        range_error,
+        KernelError::LogTailVersionsNotContiguous {
+            first_version: 1,
+            second_version: 1,
+        }
+    ));
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn test_insert_without_publish_hits_limit() -> Result<(), TestError> {
     let TestSetup {
@@ -190,11 +386,12 @@ async fn test_insert_without_publish_hits_limit() -> Result<(), TestError> {
     let committer = Box::new(uc_committer(&update_table_client));
     let err = snapshot
         .clone()
-        .transaction(committer, &engine)?
+        .update_table(UpdateTableOperation::Write, "test-engine", true)
+        .build(&engine, committer)?
         .commit(&engine)
         .unwrap_err();
     assert!(
-        matches!(err, delta_kernel::Error::Generic(msg) if msg.contains("Max unpublished commits"))
+        matches!(err, delta_kernel::KernelError::Generic(msg) if msg.contains("Max unpublished commits"))
     );
     Ok(())
 }
@@ -234,7 +431,10 @@ async fn test_cannot_checkpoint_unpublished_snapshot() -> Result<(), TestError> 
 
     let snapshot = commit(&snapshot, &update_table_client, &engine)?;
     let err = snapshot.checkpoint(&engine, None).unwrap_err();
-    assert!(matches!(err, delta_kernel::Error::Generic(msg) if msg.contains("not published")));
+    assert!(matches!(
+        err,
+        delta_kernel::KernelError::UnpublishedVersion(1)
+    ));
     Ok(())
 }
 
@@ -261,7 +461,7 @@ async fn test_append_scan_back_and_incremental_read() -> Result<(), TestError> {
     };
 
     // v0 create: writes 000.json directly to storage, does not call the catalog.
-    create_table(table_uri.as_str(), schema, "delta-kernel-uc-test")
+    create_table(table_uri.as_str(), schema, "delta-kernel-uc-test", true)
         .with_table_properties(get_required_properties_for_disk(TABLE_ID))
         .build(engine.as_ref(), Box::new(uc_committer(&client)))?
         .commit(engine.as_ref())?

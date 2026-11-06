@@ -41,11 +41,11 @@ use delta_kernel_default_engine::storage::store_from_url;
 use delta_kernel_default_engine::DefaultEngine;
 use delta_kernel::schema::{DataType, StructField, StructType};
 use delta_kernel::transaction::create_table::create_table;
-use delta_kernel::transaction::CommitResult;
-use delta_kernel::{DeltaResult, Snapshot};
+use delta_kernel::transaction::{CommitResult, UpdateTableOperation};
+use delta_kernel::{KernelResult, Snapshot};
 
 #[tokio::main]
-async fn main() -> DeltaResult<()> {
+async fn main() -> KernelResult<()> {
     let table_path = std::env::args()
         .nth(1)
         .expect("usage: delta_write_example <TABLE_DIR>");
@@ -60,7 +60,7 @@ async fn main() -> DeltaResult<()> {
         StructField::nullable("name", DataType::STRING),
     ])?);
 
-    create_table(url.as_str(), schema.clone(), "quick-start/1.0")
+    create_table(url.as_str(), schema.clone(), "quick-start/1.0", /* data_change */ true)
         .build(&engine, Box::new(FileSystemCommitter::new()))?
         .commit(&engine)?;
     println!("Created table at {url}");
@@ -69,10 +69,12 @@ async fn main() -> DeltaResult<()> {
     let snapshot = Snapshot::builder_for(url.clone()).build(&engine)?;
 
     let mut txn = snapshot
-        .transaction(Box::new(FileSystemCommitter::new()), &engine)?
-        .with_operation("INSERT".to_string())
-        .with_engine_info("quick-start/1.0")
-        .with_data_change(true);
+        .update_table(
+            UpdateTableOperation::Custom("INSERT".to_string()),
+            "quick-start/1.0",
+            /* data_change */ true,
+        )
+        .build(&engine, Box::new(FileSystemCommitter::new()))?;
 
     // Build an Arrow RecordBatch
     let arrow_schema: delta_kernel::arrow::datatypes::Schema =
@@ -87,7 +89,7 @@ async fn main() -> DeltaResult<()> {
 
     // Write Parquet and add file metadata to the transaction
     let write_state = txn.write_state()?;
-    let write_context = write_state.unpartitioned_write_context()?;
+    let write_context = write_state.write_context_builder().build()?;
     let data = ArrowEngineData::new(batch);
     let file_metadata = engine
         .write_parquet(&data, &write_context)
@@ -96,13 +98,13 @@ async fn main() -> DeltaResult<()> {
 
     // Commit
     match txn.commit(&engine)? {
-        CommitResult::CommittedTransaction(committed) => {
+        CommitResult::Committed(committed) => {
             println!("Committed version {}", committed.commit_version());
         }
-        CommitResult::ConflictedTransaction(_) => {
+        CommitResult::Conflicted(_) => {
             panic!("unexpected conflict on a brand new table");
         }
-        CommitResult::RetryableTransaction(retry) => {
+        CommitResult::Retryable(retry) => {
             panic!("commit failed with retryable error: {}", retry.error);
         }
     }
@@ -112,10 +114,10 @@ async fn main() -> DeltaResult<()> {
     let scan = snapshot.scan_builder().build()?;
     let batches: Vec<RecordBatch> = scan
         .execute(Arc::new(engine))?
-        .map(|data| -> DeltaResult<RecordBatch> {
+        .map(|data| -> KernelResult<RecordBatch> {
             Ok(data?.try_into_record_batch()?)
         })
-        .collect::<DeltaResult<Vec<_>>>()?;
+        .collect::<KernelResult<Vec<_>>>()?;
     print_batches(&batches)?;
 
     Ok(())
@@ -132,7 +134,7 @@ let schema = Arc::new(StructType::try_new(vec![
     StructField::nullable("name", DataType::STRING),
 ])?);
 
-create_table(url.as_str(), schema.clone(), "quick-start/1.0")
+create_table(url.as_str(), schema.clone(), "quick-start/1.0", /* data_change */ true)
     .build(&engine, Box::new(FileSystemCommitter::new()))?
     .commit(&engine)?;
 ```
@@ -155,9 +157,12 @@ The write flow has four parts:
 **Start a transaction:**
 ```rust,ignore
 let mut txn = snapshot
-    .transaction(Box::new(FileSystemCommitter::new()), &engine)?
-    .with_operation("INSERT".to_string())
-    .with_data_change(true);
+    .update_table(
+        UpdateTableOperation::Custom("INSERT".to_string()),
+        "quick-start/1.0",
+        /* data_change */ true,
+    )
+    .build(&engine, Box::new(FileSystemCommitter::new()))?;
 ```
 
 **Build your data as an Arrow RecordBatch and wrap it:**
@@ -177,7 +182,7 @@ let data = ArrowEngineData::new(batch);
 **Write the Parquet file and collect file metadata:**
 ```rust,ignore
 let write_state = txn.write_state()?;
-let write_context = write_state.unpartitioned_write_context()?;
+let write_context = write_state.write_context_builder().build()?;
 let file_metadata = engine
     .write_parquet(&data, &write_context)
     .await?;
@@ -185,7 +190,7 @@ txn.add_files(file_metadata);
 ```
 
 `write_state()` captures the transaction's table-wide write configuration.
-`unpartitioned_write_context()` binds that state into a `BoundWriteContext` with the target
+`write_context_builder().build()` binds that state into a `BoundWriteContext` with the target
 directory, schema, and stats configuration.
 `write_parquet` writes a Parquet file and returns metadata (path, size, stats) that the
 transaction needs. `add_files` registers that metadata with the transaction.
@@ -193,14 +198,14 @@ transaction needs. `add_files` registers that metadata with the transaction.
 **Commit:**
 ```rust,ignore
 match txn.commit(&engine)? {
-    CommitResult::CommittedTransaction(committed) => { /* success */ }
-    CommitResult::ConflictedTransaction(_) => { /* another writer won */ }
-    CommitResult::RetryableTransaction(retry) => { /* transient error, retry */ }
+    CommitResult::Committed(committed) => { /* success */ }
+    CommitResult::Conflicted(_) => { /* another writer won */ }
+    CommitResult::Retryable(retry) => { /* transient error, retry */ }
 }
 ```
 
 `commit()` returns a `CommitResult` with three variants. For blind appends to a table with no
-concurrent writers, you'll always get `CommittedTransaction`.
+concurrent writers, you'll always get `CommitResult::Committed`.
 
 ## Run it
 

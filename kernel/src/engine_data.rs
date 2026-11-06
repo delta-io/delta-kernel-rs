@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 use std::ops::Range;
 
+use derive_more::Constructor;
 use tracing::debug;
 
 use crate::actions::visitors::SelectionVectorVisitor;
@@ -10,7 +11,7 @@ use crate::expressions::ArrayData;
 use crate::log_replay::HasSelectionVector;
 use crate::schema::{ColumnName, DataType, SchemaRef};
 use crate::utils::require;
-use crate::{AsAny, DeltaResult, Error};
+use crate::{AsAny, KernelError, KernelResult};
 
 /// Engine data paired with a selection vector indicating which rows are logically selected.
 ///
@@ -30,9 +31,9 @@ pub struct FilteredEngineData {
 }
 
 impl FilteredEngineData {
-    pub fn try_new(data: Box<dyn EngineData>, selection_vector: Vec<bool>) -> DeltaResult<Self> {
+    pub fn try_new(data: Box<dyn EngineData>, selection_vector: Vec<bool>) -> KernelResult<Self> {
         if selection_vector.len() > data.len() {
-            return Err(Error::InvalidSelectionVector(format!(
+            return Err(KernelError::InvalidSelectionVector(format!(
                 "Selection vector is larger than data length: {} > {}",
                 selection_vector.len(),
                 data.len()
@@ -72,7 +73,7 @@ impl FilteredEngineData {
 
     /// Apply the contained selection vector and return an engine data with only the selected rows
     /// included. This consumes the `FilteredEngineData`.
-    pub fn apply_selection_vector(self) -> DeltaResult<Box<dyn EngineData>> {
+    pub fn apply_selection_vector(self) -> KernelResult<Box<dyn EngineData>> {
         self.data.apply_selection_vector(self.selection_vector)
     }
 }
@@ -126,16 +127,13 @@ pub trait StringArrayAccessor {
 /// A pre-resolved view into a single row's list of strings. The string array type is resolved
 /// once at construction, so subsequent element accesses use virtual dispatch rather than
 /// repeated downcasting.
+#[derive(Constructor)]
 pub struct ListItem<'a> {
     values: &'a dyn StringArrayAccessor,
     offsets: Range<usize>,
 }
 
 impl<'a> ListItem<'a> {
-    pub fn new(values: &'a dyn StringArrayAccessor, offsets: Range<usize>) -> ListItem<'a> {
-        ListItem { values, offsets }
-    }
-
     pub fn len(&self) -> usize {
         self.offsets.len()
     }
@@ -167,6 +165,7 @@ impl<'a> ListItem<'a> {
 /// materialize the map using [`MapItem::get`].
 ///
 /// [`materialize`]: MapItem::materialize
+#[derive(Constructor)]
 pub struct MapItem<'a> {
     keys: &'a dyn StringArrayAccessor,
     values: &'a dyn StringArrayAccessor,
@@ -174,18 +173,6 @@ pub struct MapItem<'a> {
 }
 
 impl<'a> MapItem<'a> {
-    pub fn new(
-        keys: &'a dyn StringArrayAccessor,
-        values: &'a dyn StringArrayAccessor,
-        offsets: Range<usize>,
-    ) -> MapItem<'a> {
-        MapItem {
-            keys,
-            values,
-            offsets,
-        }
-    }
-
     pub fn get(&self, key: &str) -> Option<&'a str> {
         let idx = self
             .offsets
@@ -197,7 +184,7 @@ impl<'a> MapItem<'a> {
 
     /// Returns the map's keys in storage order, including keys whose value is null. Unlike
     /// [`MapItem::materialize`], which drops null-valued entries, this exposes the full key set.
-    pub(crate) fn keys(&self) -> impl Iterator<Item = &'a str> + 'a {
+    pub(crate) fn keys(&self) -> impl Iterator<Item = &'a str> + use<'a> {
         let keys = self.keys;
         self.offsets.clone().map(move |idx| keys.value(idx))
     }
@@ -227,25 +214,22 @@ pub trait StructListAccessor {
         row_index: usize,
         column_names: &[ColumnName],
         visitor: &mut dyn RowVisitor,
-    ) -> DeltaResult<()>;
+    ) -> KernelResult<()>;
 }
 
 /// A handle to a single row's array of element structs. Unlike [`ListItem`], which materializes
 /// strings, the elements are structs visited in place by a nested [`RowVisitor`].
+#[derive(Constructor)]
 pub struct StructList<'a> {
     list: &'a dyn StructListAccessor,
     row_index: usize,
 }
 
 impl<'a> StructList<'a> {
-    pub fn new(list: &'a dyn StructListAccessor, row_index: usize) -> StructList<'a> {
-        StructList { list, row_index }
-    }
-
     /// Drives a nested [`RowVisitor`] over this row's element structs, one visited row per
     /// element. The visitor's columns resolve against the element struct's schema, not the outer
     /// row's. Errors if any element struct in this row is null.
-    pub fn visit_with(&self, visitor: &mut dyn RowVisitor) -> DeltaResult<()> {
+    pub fn visit_with(&self, visitor: &mut dyn RowVisitor) -> KernelResult<()> {
         let column_names = visitor.selected_column_names_and_types().0;
         self.list
             .visit_elems_of_row(self.row_index, column_names, visitor)
@@ -255,9 +239,9 @@ impl<'a> StructList<'a> {
 macro_rules! impl_default_get {
     ( $(($name: ident, $typ: ty)), * ) => {
         $(
-            fn $name(&'a self, _row_index: usize, field_name: &str) -> DeltaResult<Option<$typ>> {
+            fn $name(&'a self, _row_index: usize, field_name: &str) -> KernelResult<Option<$typ>> {
                 debug!("Asked for type {} on {field_name}, but using default error impl.", stringify!($typ));
-                Err(Error::UnexpectedColumnType(format!("{field_name} is not of type {}", stringify!($typ))).with_backtrace())
+                Err(KernelError::UnexpectedColumnType(format!("{field_name} is not of type {}", stringify!($typ))).with_backtrace())
             }
         )*
     };
@@ -265,7 +249,7 @@ macro_rules! impl_default_get {
 
 /// When calling back into a [`RowVisitor`], the engine needs to provide a slice of items that
 /// implement this trait. This allows type_safe extraction from the raw data by the kernel. By
-/// default all these methods will return an `Error` that an incorrect type has been asked
+/// default all these methods will return a `KernelError` that an incorrect type has been asked
 /// for. Therefore, for each "data container" an Engine has, it is only necessary to implement the
 /// `get_x` method for the type it holds.
 ///
@@ -293,7 +277,7 @@ pub trait GetData<'a> {
 macro_rules! impl_null_get {
     ( $(($name: ident, $typ: ty)), * ) => {
         $(
-            fn $name(&'a self, _row_index: usize, _field_name: &str) -> DeltaResult<Option<$typ>> {
+            fn $name(&'a self, _row_index: usize, _field_name: &str) -> KernelResult<Option<$typ>> {
                 Ok(None)
             }
         )*
@@ -323,11 +307,12 @@ impl<'a> GetData<'a> for () {
 /// This is a convenience wrapper over `GetData` to allow code like: `let name: Option<String> =
 /// getters[1].get_opt(row_index, "metadata.name")?;`
 pub trait TypedGetData<'a, T> {
-    fn get_opt(&'a self, row_index: usize, field_name: &str) -> DeltaResult<Option<T>>;
-    fn get(&'a self, row_index: usize, field_name: &str) -> DeltaResult<T> {
+    fn get_opt(&'a self, row_index: usize, field_name: &str) -> KernelResult<Option<T>>;
+    fn get(&'a self, row_index: usize, field_name: &str) -> KernelResult<T> {
         let val = self.get_opt(row_index, field_name)?;
         val.ok_or_else(|| {
-            Error::MissingData(format!("Data missing for field {field_name}")).with_backtrace()
+            KernelError::MissingData(format!("Data missing for field {field_name}"))
+                .with_backtrace()
         })
     }
 }
@@ -336,7 +321,7 @@ macro_rules! impl_typed_get_data {
     ( $(($name: ident, $typ: ty)), * ) => {
         $(
             impl<'a> TypedGetData<'a, $typ> for dyn GetData<'a> +'_ {
-                fn get_opt(&'a self, row_index: usize, field_name: &str) -> DeltaResult<Option<$typ>> {
+                fn get_opt(&'a self, row_index: usize, field_name: &str) -> KernelResult<Option<$typ>> {
                     self.$name(row_index, field_name)
                 }
             }
@@ -363,7 +348,7 @@ impl_typed_get_data!(
 );
 
 impl<'a> TypedGetData<'a, String> for dyn GetData<'a> + '_ {
-    fn get_opt(&'a self, row_index: usize, field_name: &str) -> DeltaResult<Option<String>> {
+    fn get_opt(&'a self, row_index: usize, field_name: &str) -> KernelResult<Option<String>> {
         self.get_str(row_index, field_name)
             .map(|s| s.map(|s| s.to_string()))
     }
@@ -372,7 +357,7 @@ impl<'a> TypedGetData<'a, String> for dyn GetData<'a> + '_ {
 /// Provide an impl to get a list field as a `Vec<String>`. Note that this will allocate the vector
 /// and allocate for each string entry.
 impl<'a> TypedGetData<'a, Vec<String>> for dyn GetData<'a> + '_ {
-    fn get_opt(&'a self, row_index: usize, field_name: &str) -> DeltaResult<Option<Vec<String>>> {
+    fn get_opt(&'a self, row_index: usize, field_name: &str) -> KernelResult<Option<Vec<String>>> {
         let list_opt: Option<ListItem<'_>> = self.get_opt(row_index, field_name)?;
         Ok(list_opt.map(|list| list.materialize()))
     }
@@ -385,7 +370,7 @@ impl<'a> TypedGetData<'a, HashMap<String, String>> for dyn GetData<'a> + '_ {
         &'a self,
         row_index: usize,
         field_name: &str,
-    ) -> DeltaResult<Option<HashMap<String, String>>> {
+    ) -> KernelResult<Option<HashMap<String, String>>> {
         let map_opt: Option<MapItem<'_>> = self.get_opt(row_index, field_name)?;
         Ok(map_opt.map(|map| map.materialize()))
     }
@@ -453,13 +438,13 @@ pub trait FilteredRowVisitor {
         &mut self,
         getters: &[&'a dyn GetData<'a>],
         rows: RowIndexIterator<'_>,
-    ) -> DeltaResult<()>;
+    ) -> KernelResult<()>;
 
     /// Visit the rows of a [`FilteredEngineData`], automatically respecting the selection vector.
     ///
     /// Extracts the selection vector and passes a [`RowIndexIterator`] of selected row indices
     /// to [`FilteredRowVisitor::visit_filtered`].
-    fn visit_rows_of(&mut self, data: &FilteredEngineData) -> DeltaResult<()>
+    fn visit_rows_of(&mut self, data: &FilteredEngineData) -> KernelResult<()>
     where
         Self: Sized,
     {
@@ -484,7 +469,7 @@ impl<V: FilteredRowVisitor> RowVisitor for FilteredVisitorBridge<'_, V> {
         self.visitor.selected_column_names_and_types()
     }
 
-    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
+    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> KernelResult<()> {
         let rows = RowIndexIterator::new(row_count, self.selection_vector);
         self.visitor.visit_filtered(getters, rows)
     }
@@ -507,12 +492,12 @@ pub trait RowVisitor {
     /// for each row. You can `use` the `TypedGetData` trait if you want to have a way to extract
     /// typed data that will fail if the "getter" is for an unexpected type.  The data in `getters`
     /// does not outlive the call to this function (i.e. it should be copied if needed).
-    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()>;
+    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> KernelResult<()>;
 
     /// Visit the rows of an [`EngineData`], selecting the leaf column names given by
     /// [`RowVisitor::selected_column_names_and_types`]. This is a thin wrapper around
     /// [`EngineData::visit_rows`] which in turn will eventually invoke [`RowVisitor::visit`].
-    fn visit_rows_of(&mut self, data: &dyn EngineData) -> DeltaResult<()>
+    fn visit_rows_of(&mut self, data: &dyn EngineData) -> KernelResult<()>
     where
         Self: Sized,
     {
@@ -524,7 +509,7 @@ pub trait RowVisitor {
 /// work is in the [`EngineData::visit_rows`] method. See the docs for that method for more details.
 /// ```rust
 /// # use std::any::Any;
-/// # use delta_kernel::DeltaResult;
+/// # use delta_kernel::KernelResult;
 /// # use delta_kernel::engine_data::{RowVisitor, EngineData, GetData};
 /// # use delta_kernel::expressions::{ArrayData, ColumnName};
 /// # use delta_kernel::schema::SchemaRef;
@@ -537,7 +522,11 @@ pub trait RowVisitor {
 /// }
 ///
 /// impl EngineData for MyDataType {
-///   fn visit_rows(&self, leaf_columns: &[ColumnName], visitor: &mut dyn RowVisitor) -> DeltaResult<()> {
+///   fn visit_rows(
+///     &self,
+///     leaf_columns: &[ColumnName],
+///     visitor: &mut dyn RowVisitor,
+///   ) -> KernelResult<()> {
 ///     let getters = self.do_extraction(); // do the extraction
 ///     visitor.visit(self.len(), &getters); // call the visitor back with the getters
 ///     Ok(())
@@ -545,10 +534,17 @@ pub trait RowVisitor {
 ///   fn len(&self) -> usize {
 ///     todo!() // actually get the len here
 ///   }
-///   fn append_columns(&self, schema: SchemaRef, columns: Vec<ArrayData>) -> DeltaResult<Box<dyn EngineData>> {
+///   fn append_columns(
+///     &self,
+///     schema: SchemaRef,
+///     columns: Vec<ArrayData>,
+///   ) -> KernelResult<Box<dyn EngineData>> {
 ///     todo!() // convert `SchemaRef` and `ArrayData` into local representation and append them
 ///   }
-///   fn apply_selection_vector(self: Box<Self>, selection_vector: Vec<bool>) -> DeltaResult<Box<dyn EngineData>> {
+///   fn apply_selection_vector(
+///     self: Box<Self>,
+///     selection_vector: Vec<bool>,
+///   ) -> KernelResult<Box<dyn EngineData>> {
 ///     todo!() // filter out unselected rows; rows beyond the selection vector's end are selected
 ///   }
 ///   fn has_field(&self, name: &ColumnName) -> bool {
@@ -567,7 +563,7 @@ pub trait EngineData: AsAny {
         &self,
         column_names: &[ColumnName],
         visitor: &mut dyn RowVisitor,
-    ) -> DeltaResult<()>;
+    ) -> KernelResult<()>;
 
     /// Return the number of items (rows) in blob
     fn len(&self) -> usize;
@@ -602,7 +598,7 @@ pub trait EngineData: AsAny {
         &self,
         schema: SchemaRef,
         columns: Vec<ArrayData>,
-    ) -> DeltaResult<Box<dyn EngineData>>;
+    ) -> KernelResult<Box<dyn EngineData>>;
 
     /// Apply a selection vector to the data and return a data where only the selected rows are
     /// included. This consumes the EngineData, allowing engines to implement this "in place" if
@@ -611,11 +607,11 @@ pub trait EngineData: AsAny {
     /// The selection vector may be shorter than the data; rows beyond its end are selected and
     /// must be retained (see [`FilteredEngineData`]). An empty selection vector selects all rows.
     /// A selection vector longer than the data is invalid and must be rejected, e.g. with
-    /// [`Error::InvalidSelectionVector`].
+    /// [`KernelError::InvalidSelectionVector`].
     fn apply_selection_vector(
         self: Box<Self>,
         selection_vector: Vec<bool>,
-    ) -> DeltaResult<Box<dyn EngineData>>;
+    ) -> KernelResult<Box<dyn EngineData>>;
 
     /// Returns `true` if a field at the given (possibly nested) path exists in this data's schema.
     ///
@@ -629,13 +625,13 @@ pub trait EngineData: AsAny {
 pub(crate) fn filter_by_predicate(
     filter: &dyn crate::PredicateEvaluator,
     batch: Box<dyn EngineData>,
-) -> DeltaResult<Box<dyn EngineData>> {
+) -> KernelResult<Box<dyn EngineData>> {
     let predicate_result = filter.evaluate(batch.as_ref())?;
     let mut visitor = SelectionVectorVisitor::default();
     visitor.visit_rows_of(predicate_result.as_ref())?;
     require!(
         visitor.selection_vector.len() == batch.len(),
-        Error::internal_error(format!(
+        KernelError::internal_error(format!(
             "predicate output length {} != batch length {}",
             visitor.selection_vector.len(),
             batch.len()
@@ -753,9 +749,10 @@ mod tests {
         // Should return an error
         assert!(result.is_err());
         if let Err(e) = result {
-            assert!(e
-                .to_string()
-                .contains("Selection vector is larger than data length"));
+            assert!(
+                e.to_string()
+                    .contains("Selection vector is larger than data length")
+            );
             assert!(e.to_string().contains("3 > 2"));
         }
     }
@@ -810,7 +807,7 @@ mod tests {
         let getter: &dyn GetData<'_> = &binary_array;
 
         // Test using get() for missing required field should error
-        let result: DeltaResult<&[u8]> = getter.get(0, "binary_field");
+        let result: KernelResult<&[u8]> = getter.get(0, "binary_field");
         assert!(result.is_err());
         if let Err(e) = result {
             assert!(e.to_string().contains("Data missing for field"));

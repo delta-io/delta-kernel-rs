@@ -10,7 +10,7 @@
 #![cfg(feature = "integration-test")]
 
 use unity_catalog_delta_client_api::{CreateStagingTableRequest, Operation};
-use unity_catalog_delta_rest_client::{ClientConfig, UCClient};
+use unity_catalog_delta_rest_client::{ClientConfig, UCDeltaTableClient};
 
 /// Reads the server URL + token from the environment, or `None` to skip the test.
 fn server_env() -> Option<(String, String)> {
@@ -19,11 +19,11 @@ fn server_env() -> Option<(String, String)> {
     Some((url, token))
 }
 
-fn client(url: &str, token: &str) -> UCClient {
+fn client(url: &str, token: &str) -> UCDeltaTableClient {
     let config = ClientConfig::build(url, token)
         .build()
         .expect("failed to build ClientConfig");
-    UCClient::new(config).expect("failed to build UCClient")
+    UCDeltaTableClient::new(config).expect("failed to build UCDeltaTableClient")
 }
 
 #[tokio::test(flavor = "multi_thread")]

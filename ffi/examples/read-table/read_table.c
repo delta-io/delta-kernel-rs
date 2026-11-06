@@ -11,6 +11,19 @@
 #include "kernel_schema_visitor.h"
 #include "kernel_utils.h"
 
+static void frame_callback(FrameEvent event)
+{
+  switch (event.tag) {
+    case FrameEventOPEN:
+      (void)event.open.span_id;
+      (void)event.open.name;
+      break;
+    case FrameEventCLOSE:
+      (void)event.close.span_id;
+      break;
+  }
+}
+
 // Print the content of a selection vector if `VERBOSE` is defined in read_table.h
 void print_selection_vector(const char* indent, const KernelBoolSlice* selection_vec)
 {
@@ -319,6 +332,74 @@ void print_snapshot_file_stats(SharedSnapshot* snapshot)
   }
 }
 
+static void print_optional_string(const char* label, OptionalValueKernelStringSlice value) {
+  if (value.tag == SomeKernelStringSlice) {
+    printf("%s: %.*s\n", label, (int)value.some.len, value.some.ptr);
+  } else {
+    printf("%s: None\n", label);
+  }
+}
+
+static int compare_map_keys(const void* a, const void* b) {
+  const KernelStringSlice* left = &(*(const FfiStringMapEntry* const*)a)->key;
+  const KernelStringSlice* right = &(*(const FfiStringMapEntry* const*)b)->key;
+  uintptr_t len = left->len < right->len ? left->len : right->len;
+  int cmp = len == 0 ? 0 : memcmp(left->ptr, right->ptr, len);
+  if (cmp != 0) {
+    return cmp;
+  }
+  return (left->len > right->len) - (left->len < right->len);
+}
+
+static void print_string_map(const char* label, FfiStringMap map) {
+  printf("%s:\n", label);
+  if (map.len == 0) {
+    return;
+  }
+  const FfiStringMapEntry** sorted = malloc(sizeof(*sorted) * map.len);
+  if (sorted == NULL) {
+    fprintf(stderr, "Failed to allocate %s sort buffer\n", label);
+    exit(-1);
+  }
+  for (uintptr_t i = 0; i < map.len; i++) {
+    sorted[i] = &map.ptr[i];
+  }
+  // Map order isn't guaranteed, so sort by key to keep the golden test output deterministic.
+  qsort(sorted, map.len, sizeof(*sorted), compare_map_keys);
+  for (uintptr_t i = 0; i < map.len; i++) {
+    const FfiStringMapEntry* entry = sorted[i];
+    printf("  %.*s: %.*s\n",
+           (int)entry->key.len,
+           entry->key.ptr,
+           (int)entry->value.len,
+           entry->value.ptr);
+  }
+  free(sorted);
+}
+
+static void print_snapshot_metadata(NullableCvoid context, const FfiMetadata* metadata) {
+  bool* visited = context;
+  *visited = true;
+  printf("id: %.*s\n", (int)metadata->id.len, metadata->id.ptr);
+  print_optional_string("name", metadata->name);
+  print_optional_string("description", metadata->description);
+  printf(
+    "format_provider: %.*s\n", (int)metadata->format_provider.len, metadata->format_provider.ptr);
+  print_string_map("format_options", metadata->format_options);
+  printf("schema_string: %.*s\n", (int)metadata->schema_string.len, metadata->schema_string.ptr);
+  printf("partition_columns:\n");
+  for (uintptr_t i = 0; i < metadata->partition_columns.len; i++) {
+    const KernelStringSlice* column = &metadata->partition_columns.ptr[i];
+    printf("  %.*s\n", (int)column->len, column->ptr);
+  }
+  if (metadata->created_time.tag == Somei64) {
+    printf("created_time: %" PRId64 "\n", metadata->created_time.some);
+  } else {
+    printf("created_time: None\n");
+  }
+  print_string_map("configuration", metadata->configuration);
+}
+
 static const char *LEVEL_STRING[] = {
   "ERROR", "WARN", "INFO", "DEBUG", "TRACE"
 };
@@ -370,8 +451,10 @@ int main(int argc, char* argv[])
 {
   char* requested_cols = NULL;
   bool use_arrow_metadata = false;
+  bool print_scan_schema = false;
+  bool print_metadata_only = false;
   int c;
-  while ((c = getopt (argc, argv, "ac:")) != -1) {
+  while ((c = getopt (argc, argv, "ac:ms")) != -1) {
     switch (c) {
     case 'a':
       // Use the Arrow batch-mode scan metadata path (scan_metadata_next_arrow) instead of
@@ -383,6 +466,15 @@ int main(int argc, char* argv[])
       break;
     case 'c':
       requested_cols = optarg;
+      break;
+    case 'm':
+      // Print the snapshot metadata visited by snapshot_visit_metadata, then exit without scanning.
+      print_metadata_only = true;
+      break;
+    case 's':
+      // Print the scan's logical schema (scan_logical_schema) as "Scan schema". Useful to check
+      // that a schema requested with -c was honored.
+      print_scan_schema = true;
       break;
     case '?':
       if (optopt == 'c') {
@@ -403,7 +495,13 @@ int main(int argc, char* argv[])
   }
 
   if (optind != (argc - 1)) {
-    printf("Usage: %s [-a] [-c top_level_column1,top_level_column2] table/path\n", argv[0]);
+    printf("Usage: %s [-a] [-c top_level_column1,top_level_column2] [-s] [-m] table/path\n",
+           argv[0]);
+    return -1;
+  }
+
+  if (print_metadata_only && (use_arrow_metadata || requested_cols != NULL || print_scan_schema)) {
+    fprintf(stderr, "-m cannot be combined with -a, -c, or -s\n");
     return -1;
   }
 
@@ -415,7 +513,9 @@ int main(int argc, char* argv[])
 #endif
 
   char* table_path = argv[optind];
-  printf("Reading table at %s\n", table_path);
+  if (!print_metadata_only) {
+    printf("Reading table at %s\n", table_path);
+  }
 
 #ifdef VERBOSE
   enable_event_tracing(tracing_callback, TRACE);
@@ -427,12 +527,13 @@ int main(int argc, char* argv[])
 #else
   enable_event_tracing(tracing_callback, WARN);
 #endif
+  (void)enable_frame_reporting(frame_callback);
 
   KernelStringSlice table_path_slice = { table_path, strlen(table_path) };
 
-  ExternResultEngineBuilder engine_builder_res =
-    get_engine_builder(table_path_slice, allocate_error);
-  if (engine_builder_res.tag != OkEngineBuilder) {
+  ExternResultHandleExclusiveEngineBuilder engine_builder_res =
+    get_engine_builder(table_path_slice, &error_allocators);
+  if (engine_builder_res.tag != OkHandleExclusiveEngineBuilder) {
     print_error("Could not get engine builder.", (Error*)engine_builder_res.err);
     free_error((Error*)engine_builder_res.err);
     return -1;
@@ -442,13 +543,13 @@ int main(int argc, char* argv[])
   // keys accepted here come from object_store's configuration vocabulary (e.g. "aws_region",
   // "aws_access_key_id"). They are object-store-specific and only meaningful when the table URL
   // points at that backend -- for a local file:// table the setters have no effect.
-  EngineBuilder* engine_builder = engine_builder_res.ok;
-  if (!set_builder_opt(engine_builder, "aws_region", "us-west-2")) {
+  HandleExclusiveEngineBuilder engine_builder = engine_builder_res.ok;
+  if (!set_builder_opt(&engine_builder, "aws_region", "us-west-2")) {
     return -1;
   }
   // potentially set credentials here
-  // set_builder_opt(engine_builder, "aws_access_key_id" , "[redacted]");
-  // set_builder_opt(engine_builder, "aws_secret_access_key", "[redacted]");
+  // set_builder_opt(&engine_builder, "aws_access_key_id" , "[redacted]");
+  // set_builder_opt(&engine_builder, "aws_secret_access_key", "[redacted]");
   ExternResultHandleSharedExternEngine engine_res = builder_build(engine_builder);
 
   // alternately if we don't care to set any options on the builder:
@@ -463,8 +564,8 @@ int main(int argc, char* argv[])
 
   SharedExternEngine* engine = engine_res.ok;
 
-  ExternResultHandleMutableFfiSnapshotBuilder snapshot_builder_res = get_snapshot_builder(table_path_slice, engine);
-  if (snapshot_builder_res.tag != OkHandleMutableFfiSnapshotBuilder) {
+  ExternResultHandleExclusiveSnapshotBuilder snapshot_builder_res = get_snapshot_builder(table_path_slice, engine);
+  if (snapshot_builder_res.tag != OkHandleExclusiveSnapshotBuilder) {
     print_error("Failed to get snapshot builder.", (Error*)snapshot_builder_res.err);
     free_error((Error*)snapshot_builder_res.err);
     free_engine(engine);
@@ -485,8 +586,20 @@ int main(int argc, char* argv[])
   uint64_t v = version(snapshot);
   printf("version: %" PRIu64 "\n\n", v);
 
+  if (print_metadata_only) {
+    bool visited = false;
+    snapshot_visit_metadata(snapshot, &visited, print_snapshot_metadata);
+    free_snapshot(snapshot);
+    free_engine(engine);
+    if (!visited) {
+      fprintf(stderr, "snapshot_visit_metadata did not invoke the visitor\n");
+      return -1;
+    }
+    return 0;
+  }
+
   CSchema *cschema = get_cschema(snapshot, engine);
-  print_cschema(cschema);
+  print_cschema("Schema", cschema);
 
   char* table_root = snapshot_table_root(snapshot, allocate_string);
   print_diag("Table root: %s\n", table_root);
@@ -538,6 +651,12 @@ int main(int argc, char* argv[])
 
   SharedSchema* logical_schema = scan_logical_schema(scan);
   SharedSchema* physical_schema = scan_physical_schema(scan);
+
+  if (print_scan_schema) {
+    CSchema* scan_cschema = build_cschema(logical_schema, engine);
+    print_cschema("Scan schema", scan_cschema);
+    free_cschema(scan_cschema);
+  }
   struct EngineContext context = {
     logical_schema,
     physical_schema,

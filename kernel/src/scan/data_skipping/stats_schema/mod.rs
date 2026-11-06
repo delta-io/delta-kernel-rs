@@ -7,12 +7,12 @@ use std::borrow::Cow;
 use column_filter::StatsColumnFilter;
 pub(crate) use column_filter::StatsConfig;
 
+use crate::KernelResult;
 use crate::actions::{MAX_VALUES, MIN_VALUES, NULL_COUNT, NUM_RECORDS, TIGHT_BOUNDS};
 use crate::schema::{
     ArrayType, ColumnName, DataType, MapType, PrimitiveType, Schema, StructField, StructType,
 };
-use crate::transforms::{transform_output_type, SchemaTransform};
-use crate::DeltaResult;
+use crate::transforms::{SchemaTransform, transform_output_type};
 
 /// Generates the expected schema for file statistics.
 ///
@@ -27,15 +27,26 @@ use crate::DeltaResult;
 /// It tracks the count of null values for each column. All leaf fields from the base schema
 /// are converted to LONG type (since null counts are always integers).
 ///
-/// Note: Array, Map, and Variant types are included in `nullCount` (null counts are meaningful
-/// for these types) but excluded from `minValues`/`maxValues` (not eligible for data skipping).
-/// They count as leaf columns against the indexed column limit. The `nullCount` schema also
+/// Note: Array and Map types are included in `nullCount` (null counts are meaningful for these
+/// types) but excluded from `minValues`/`maxValues` (not eligible for data skipping). Variant is
+/// treated the same by default; [`StatsConfig::variant_min_max`] opts it into `minValues`/
+/// `maxValues`.
+#[cfg_attr(
+    feature = "geo-type-in-dev",
+    doc = "[`StatsConfig::geometry_min_max`] requests Geometry bounds."
+)]
+#[cfg_attr(
+    not(feature = "geo-type-in-dev"),
+    doc = "The Geometry bounds option requires `geo-type-in-dev`."
+)]
+/// All of them count as leaf columns against the indexed column limit. The `nullCount` schema also
 /// includes primitive types that aren't eligible for min/max (e.g., Boolean, Binary) since null
 /// counts are still meaningful for those types.
 ///
 /// The `minValues`/`maxValues` struct fields are also nested structures mirroring the table's
-/// column hierarchy. They additionally filter out leaf fields with non-eligible data types
-/// (e.g., Boolean, Binary) via [`is_skipping_eligible_datatype`].
+/// column hierarchy. Scalar fields are filtered via [`is_skipping_eligible_datatype`] (excluding
+/// e.g. Boolean and Binary). Variant and Geometry are governed by their separate options above;
+/// including their statistics does not make them eligible for scalar min/max pruning.
 ///
 /// ## Stats value rules
 ///
@@ -43,10 +54,14 @@ use crate::DeltaResult;
 ///
 /// - `numRecords`: the total number of rows in the file.
 /// - `nullCount`: the number of null values in the column. Always present for included columns.
-/// - `minValues`/`maxValues`: the smallest/largest non-null value in the column. When a column
-///   contains only null values, there are no non-null values to aggregate, so the column has no
-///   entry in `minValues`/`maxValues`. The `nullCount` entry is still present and equals
+/// - Scalar `minValues`/`maxValues`: the smallest/largest non-null value in the column. When a
+///   column contains only null values, there are no non-null values to aggregate, so the column has
+///   no entry in `minValues`/`maxValues`. The `nullCount` entry is still present and equals
 ///   `numRecords`.
+/// - Geometry `minValues`/`maxValues`: the lower-left `(min_x, min_y)` and upper-right `(max_x,
+///   max_y)` corner points, respectively, of the column's axis-aligned 2D bounding rectangle for
+///   the file, expressed in the column's CRS. These coordinate bounds do not define scalar ordering
+///   for Geometry values.
 /// - String min/max values must be truncated to a prefix no longer than 32 characters. For min
 ///   values, simple prefix truncation is valid (the truncated value is always <= the original). For
 ///   max values, a tie-breaker character must be appended after truncation to ensure the result is
@@ -134,7 +149,7 @@ pub(crate) fn expected_stats_schema(
     config: &StatsConfig<'_>,
     required_columns: Option<&[ColumnName]>,
     requested_columns: Option<&[ColumnName]>,
-) -> DeltaResult<Schema> {
+) -> KernelResult<Schema> {
     let mut fields = Vec::with_capacity(5);
     fields.push(StructField::nullable(NUM_RECORDS, DataType::LONG));
 
@@ -156,7 +171,11 @@ pub(crate) fn expected_stats_schema(
         ));
 
         // include only min/max skipping eligible fields (data types)
-        let mut min_max_transform = MinMaxStatsTransform;
+        let mut min_max_transform = MinMaxStatsTransform {
+            variant_min_max: config.variant_min_max,
+            #[cfg(feature = "geo-type-in-dev")]
+            geometry_min_max: config.geometry_min_max,
+        };
         if let Some(min_max_schema) = min_max_transform.transform_struct(&base_schema) {
             let min_max_schema = min_max_schema.into_owned();
             fields.push(StructField::nullable(MIN_VALUES, min_max_schema.clone()));
@@ -339,30 +358,46 @@ impl<'a> SchemaTransform<'a> for BaseStatsTransform<'_> {
     fn transform_variant(&mut self, vtype: &'a StructType) -> Option<Cow<'a, StructType>> {
         self.include_leaf().then_some(Cow::Borrowed(vtype))
     }
+
+    /// A `file` column is excluded from statistics. Its inner fields are protocol-defined, not
+    /// user columns, so they are not recursed into.
+    fn transform_file(&mut self, _stype: &'a StructType) -> Option<Cow<'a, StructType>> {
+        None
+    }
 }
 
 // removes all fields with non eligible data types
 //
 // should only be applied to schema processed via `BaseStatsTransform`.
-#[allow(unused)]
-struct MinMaxStatsTransform;
+struct MinMaxStatsTransform {
+    variant_min_max: bool,
+    #[cfg(feature = "geo-type-in-dev")]
+    geometry_min_max: bool,
+}
 
 impl<'a> SchemaTransform<'a> for MinMaxStatsTransform {
     transform_output_type!(|'a, T| Option<Cow<'a, T>>);
 
-    // Array, Map, and Variant fields pass through BaseStatsTransform (for nullCount) but must
-    // be excluded from min/max stats.
+    // Array and Map fields pass through BaseStatsTransform (for nullCount) but must be excluded
+    // from min/max stats.
     fn transform_array(&mut self, _: &'a ArrayType) -> Option<Cow<'a, ArrayType>> {
         None
     }
     fn transform_map(&mut self, _: &'a MapType) -> Option<Cow<'a, MapType>> {
         None
     }
-    fn transform_variant(&mut self, _: &'a StructType) -> Option<Cow<'a, StructType>> {
-        None
+
+    /// Not recursed into: the `metadata` and `value` binaries are the statistic's own encoding, not
+    /// columns that carry statistics of their own.
+    fn transform_variant(&mut self, stype: &'a StructType) -> Option<Cow<'a, StructType>> {
+        self.variant_min_max.then_some(Cow::Borrowed(stype))
     }
 
     fn transform_primitive(&mut self, ptype: &'a PrimitiveType) -> Option<Cow<'a, PrimitiveType>> {
+        #[cfg(feature = "geo-type-in-dev")]
+        if matches!(ptype, PrimitiveType::Geometry(_)) {
+            return self.geometry_min_max.then_some(Cow::Borrowed(ptype));
+        }
         is_skipping_eligible_datatype(ptype).then_some(Cow::Borrowed(ptype))
     }
 }
@@ -423,6 +458,7 @@ mod tests {
         StatsConfig {
             data_skipping_stats_columns: properties.data_skipping_stats_columns.as_deref(),
             data_skipping_num_indexed_cols: properties.data_skipping_num_indexed_cols,
+            ..Default::default()
         }
     }
 
@@ -855,6 +891,155 @@ mod tests {
         assert_eq!(&expected, &stats_schema);
     }
 
+    /// `nullCount` stays a scalar LONG whether or not variant min/max is enabled.
+    #[test]
+    fn test_stats_schema_variant_min_max_is_opt_in() {
+        let properties: TableProperties = [("key", "value")].into();
+        let file_schema = schema! {
+            nullable "id": LONG,
+            nullable "v": unshredded_variant(),
+        };
+        let stats_schema = |variant_min_max| {
+            let config = StatsConfig {
+                variant_min_max,
+                ..stats_config_from_table_properties(&properties)
+            };
+            expected_stats_schema(&file_schema, &config, None, None).unwrap()
+        };
+        let expected_null_count = schema! {
+            nullable "id": LONG,
+            nullable "v": LONG,
+        };
+
+        assert_eq!(
+            stats_schema(false),
+            expected_stats(expected_null_count.clone(), schema! { nullable "id": LONG },),
+        );
+        assert_eq!(
+            stats_schema(true),
+            expected_stats(
+                expected_null_count,
+                schema! {
+                    nullable "id": LONG,
+                    nullable "v": unshredded_variant(),
+                },
+            ),
+        );
+    }
+
+    /// A `file` column is excluded from statistics and takes no slot of the indexed-column limit,
+    /// so the columns around it keep theirs.
+    #[test]
+    fn test_stats_schema_excludes_file_columns() {
+        let properties: TableProperties = [(
+            "delta.dataSkippingNumIndexedCols".to_string(),
+            "2".to_string(),
+        )]
+        .into();
+        let file_schema = StructType::new_unchecked([
+            StructField::nullable("id", DataType::LONG),
+            StructField::nullable("f", DataType::file_type()),
+            StructField::nullable("name", DataType::STRING),
+        ]);
+
+        let stats_schema = expected_stats_schema(
+            &file_schema,
+            &stats_config_from_table_properties(&properties),
+            None,
+            None,
+        )
+        .unwrap();
+
+        // With a limit of 2, both `id` and `name` get statistics; `f` takes no slot and has none.
+        assert_eq!(
+            stats_schema,
+            expected_stats(
+                schema! { nullable "id": LONG, nullable "name": LONG },
+                schema! { nullable "id": LONG, nullable "name": STRING },
+            )
+        );
+    }
+
+    #[cfg(feature = "geo-type-in-dev")]
+    #[rstest]
+    fn geometry_and_variant_bounds_are_independent_of_scalar_eligibility(
+        #[values(false, true)] geometry_min_max: bool,
+        #[values(false, true)] variant_min_max: bool,
+    ) {
+        let geometry = DataType::from(GeometryType::try_new("EPSG:4326").unwrap());
+        let nested_geometry = DataType::from(GeometryType::try_new("EPSG:3857").unwrap());
+        let file_schema = schema! {
+            not_null "id": LONG,
+            not_null "g": (geometry.clone()),
+            nullable "v": unshredded_variant(),
+            not_null "nested": {
+                not_null "g": (nested_geometry.clone()),
+            },
+        };
+        let config = StatsConfig {
+            geometry_min_max,
+            variant_min_max,
+            ..Default::default()
+        };
+        let actual = expected_stats_schema(&file_schema, &config, None, None).unwrap();
+        let null_count = schema! {
+            nullable "id": LONG,
+            nullable "g": LONG,
+            nullable "v": LONG,
+            nullable "nested": {
+                nullable "g": LONG,
+            },
+        };
+        let mut min_max = vec![StructField::nullable("id", DataType::LONG)];
+        if geometry_min_max {
+            min_max.push(StructField::nullable("g", geometry));
+        }
+        if variant_min_max {
+            min_max.push(StructField::nullable("v", DataType::unshredded_variant()));
+        }
+        if geometry_min_max {
+            min_max.push(StructField::nullable(
+                "nested",
+                schema! { nullable "g": (nested_geometry) },
+            ));
+        }
+        assert_eq!(
+            actual,
+            expected_stats(null_count, StructType::try_new(min_max).unwrap())
+        );
+    }
+
+    #[cfg(feature = "geo-type-in-dev")]
+    #[rstest]
+    fn geometry_min_max_does_not_produce_geography_stat(
+        #[values(false, true)] geometry_min_max: bool,
+        #[values(false, true)] variant_min_max: bool,
+    ) {
+        let geography =
+            GeographyType::try_new("EPSG:4326", EdgeInterpolationAlgorithm::Spherical).unwrap();
+        let file_schema = schema! {
+            nullable "geography": (geography.clone()),
+            nullable "nested": { nullable "geography": (geography) },
+        };
+        let config = StatsConfig {
+            geometry_min_max,
+            variant_min_max,
+            ..Default::default()
+        };
+        let actual = expected_stats_schema(&file_schema, &config, None, None).unwrap();
+        assert_eq!(
+            actual,
+            schema! {
+                nullable NUM_RECORDS: LONG,
+                nullable NULL_COUNT: {
+                    nullable "geography": LONG,
+                    nullable "nested": { nullable "geography": LONG },
+                },
+                nullable TIGHT_BOUNDS: BOOLEAN,
+            }
+        );
+    }
+
     #[test]
     fn test_stats_schema_complex_type_consumes_slot_before_primitive() {
         // Validates that a complex type consuming a slot causes a subsequent primitive to
@@ -908,10 +1093,7 @@ mod tests {
             },
         };
 
-        let config = StatsConfig {
-            data_skipping_stats_columns: properties.data_skipping_stats_columns.as_deref(),
-            data_skipping_num_indexed_cols: properties.data_skipping_num_indexed_cols,
-        };
+        let config = stats_config_from_table_properties(&properties);
         let columns = stats_column_names(&file_schema, &config, None);
 
         // With default settings, all leaf columns should be included
@@ -940,10 +1122,7 @@ mod tests {
             nullable "d": DOUBLE,
         };
 
-        let config = StatsConfig {
-            data_skipping_stats_columns: properties.data_skipping_stats_columns.as_deref(),
-            data_skipping_num_indexed_cols: properties.data_skipping_num_indexed_cols,
-        };
+        let config = stats_config_from_table_properties(&properties);
         let columns = stats_column_names(&file_schema, &config, None);
 
         // Only first 2 columns should be included
@@ -967,10 +1146,7 @@ mod tests {
             nullable "extra": STRING,
         };
 
-        let config = StatsConfig {
-            data_skipping_stats_columns: properties.data_skipping_stats_columns.as_deref(),
-            data_skipping_num_indexed_cols: properties.data_skipping_num_indexed_cols,
-        };
+        let config = stats_config_from_table_properties(&properties);
         let columns = stats_column_names(&file_schema, &config, None);
 
         // Only specified columns should be included (user.name and extra excluded)
@@ -989,10 +1165,7 @@ mod tests {
             nullable "name": STRING,
         };
 
-        let config = StatsConfig {
-            data_skipping_stats_columns: properties.data_skipping_stats_columns.as_deref(),
-            data_skipping_num_indexed_cols: properties.data_skipping_num_indexed_cols,
-        };
+        let config = stats_config_from_table_properties(&properties);
         let columns = stats_column_names(&file_schema, &config, None);
 
         // Array, Map, and Variant are leaf columns and included in the stats column list

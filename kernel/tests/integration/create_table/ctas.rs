@@ -11,20 +11,20 @@ use delta_kernel::actions::MIN_VALUES;
 use delta_kernel::arrow::array::{Array, Int64Array, StringArray, StructArray};
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
-use delta_kernel::expressions::{column_name, ColumnName};
+use delta_kernel::expressions::{ColumnName, column_name};
 use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::{DynObjectStore, ObjectStoreExt as _};
 use delta_kernel::snapshot::Snapshot;
 use delta_kernel::table_features::{
-    get_any_level_column_physical_name, ColumnMappingMode, TableFeature,
+    ColumnMappingMode, TableFeature, get_any_level_column_physical_name,
 };
+use delta_kernel::transaction::CommitResult;
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
-use delta_kernel::transaction::CommitResult;
 use delta_kernel::{Engine, FileMeta};
-use test_utils::delta_kernel_default_engine::executor::tokio::TokioMultiThreadExecutor;
 use test_utils::delta_kernel_default_engine::DefaultEngineBuilder;
+use test_utils::delta_kernel_default_engine::executor::tokio::TokioMultiThreadExecutor;
 use test_utils::{
     assert_schema_has_field, nested_batches, nested_schema, read_add_infos, test_table_setup,
     write_batch_to_table,
@@ -102,6 +102,7 @@ fn verify_column_names_in_clustering_metadata(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let schema = snapshot.schema();
     let clustering_columns = snapshot
+        .reader()
         .get_physical_clustering_columns(engine)?
         .expect("Clustering columns should be present");
 
@@ -212,7 +213,7 @@ async fn run_ctas_test(
     );
 
     let mut src_snapshot = {
-        let mut builder = create_table(&src_table_path, schema.clone(), "ctas-test");
+        let mut builder = create_table(&src_table_path, schema.clone(), "ctas-test", true);
         if let Some(mode_str) = cm_mode_property(src_cm) {
             builder = builder.with_table_properties([("delta.columnMapping.mode", mode_str)]);
         }
@@ -223,7 +224,7 @@ async fn run_ctas_test(
             .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
             .commit(engine.as_ref())?;
         match result {
-            CommitResult::CommittedTransaction(c) => c
+            CommitResult::Committed(c) => c
                 .post_commit_snapshot()
                 .expect("should have post_commit_snapshot")
                 .clone(),
@@ -251,7 +252,7 @@ async fn run_ctas_test(
     let (_tgt_tmp, tgt_table_path, _) = test_table_setup()?;
     let tgt_url = Url::from_directory_path(&tgt_table_path).unwrap();
 
-    let mut tgt_builder = create_table(&tgt_table_path, schema.clone(), "ctas-test");
+    let mut tgt_builder = create_table(&tgt_table_path, schema.clone(), "ctas-test", true);
     if let Some(mode_str) = cm_mode_property(tgt_cm) {
         tgt_builder = tgt_builder.with_table_properties([("delta.columnMapping.mode", mode_str)]);
     }
@@ -260,7 +261,7 @@ async fn run_ctas_test(
     }
     let mut tgt_txn = tgt_builder.build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
 
-    let write_context = tgt_txn.write_state()?.unpartitioned_write_context()?;
+    let write_context = tgt_txn.write_state()?.write_context_builder().build()?;
     let add_meta = engine
         .write_parquet(&ArrowEngineData::new(source_data), &write_context)
         .await?;
@@ -268,7 +269,7 @@ async fn run_ctas_test(
 
     let commit_result = tgt_txn.commit(engine.as_ref())?;
     let tgt_snapshot = match commit_result {
-        CommitResult::CommittedTransaction(c) => c
+        CommitResult::Committed(c) => c
             .post_commit_snapshot()
             .expect("should have post_commit_snapshot")
             .clone(),

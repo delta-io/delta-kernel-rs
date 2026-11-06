@@ -15,7 +15,7 @@ use crate::actions::DomainMetadata;
 use crate::expressions::ColumnName;
 use crate::scan::data_skipping::stats_schema::is_skipping_eligible_datatype;
 use crate::schema::{DataType, StructType};
-use crate::{DeltaResult, Error};
+use crate::{KernelError, KernelResult};
 
 /// Domain metadata structure for clustering columns.
 ///
@@ -81,19 +81,21 @@ pub(crate) struct ClusteringColumnInfo {
 pub(crate) fn validate_clustering_columns(
     schema: &StructType,
     columns: &[ColumnName],
-) -> DeltaResult<()> {
+) -> KernelResult<()> {
     use std::collections::HashSet;
 
     // Structural validation: at least one column required
     if columns.is_empty() {
-        return Err(Error::generic("Clustering requires at least one column"));
+        return Err(KernelError::generic(
+            "Clustering requires at least one column",
+        ));
     }
 
     // Validate each column and check for duplicates
     let mut seen = HashSet::new();
     for col in columns {
         if !seen.insert(col) {
-            return Err(Error::generic(format!(
+            return Err(KernelError::generic(format!(
                 "Duplicate clustering column: '{col}'"
             )));
         }
@@ -102,7 +104,7 @@ pub(crate) fn validate_clustering_columns(
         match field.data_type() {
             DataType::Primitive(ptype) if is_skipping_eligible_datatype(ptype) => {}
             dt => {
-                return Err(Error::generic(format!(
+                return Err(KernelError::generic(format!(
                     "Clustering column '{col}' has unsupported type '{dt}'. \
                      Supported types: Byte, Short, Integer, Long, Float, Double, \
                      Decimal, Date, Timestamp, TimestampNtz, String"
@@ -139,7 +141,7 @@ pub(crate) fn create_clustering_domain_metadata(columns: &[ColumnName]) -> Domai
 /// Parses clustering columns from a JSON configuration string.
 ///
 /// Returns `Ok(columns)` if the configuration is valid, or an error if malformed.
-pub(crate) fn parse_clustering_columns(json_str: &str) -> DeltaResult<Vec<ColumnName>> {
+pub(crate) fn parse_clustering_columns(json_str: &str) -> KernelResult<Vec<ColumnName>> {
     let metadata: ClusteringDomainMetadata = serde_json::from_str(json_str)?;
     Ok(metadata
         .clustering_columns
@@ -152,7 +154,7 @@ pub(crate) fn parse_clustering_columns(json_str: &str) -> DeltaResult<Vec<Column
 mod tests {
     use super::*;
     use crate::expressions::column_name;
-    use crate::schema::{schema, DataType, StructField};
+    use crate::schema::{DataType, StructField, schema};
 
     #[rstest::rstest]
     #[case::simple(
@@ -197,10 +199,12 @@ mod tests {
         let columns = vec![column_name!("nonexistent")];
         let result = validate_clustering_columns(&schema, &columns);
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("not found in schema"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("not found in schema")
+        );
     }
 
     #[test]
@@ -242,10 +246,12 @@ mod tests {
         let columns = vec![column_name!("flat_col", "child")];
         let result = validate_clustering_columns(&schema, &columns);
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("is not a struct type"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("is not a struct type")
+        );
     }
 
     #[test]
@@ -258,10 +264,12 @@ mod tests {
         let columns = vec![column_name!("parent", "nonexistent")];
         let result = validate_clustering_columns(&schema, &columns);
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("not found in schema"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("not found in schema")
+        );
     }
 
     #[test]

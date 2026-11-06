@@ -4,10 +4,11 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use chrono::{NaiveDate, NaiveDateTime, TimeZone, Utc};
+use delta_kernel::Snapshot;
 use delta_kernel::actions::{MAX_VALUES, MIN_VALUES, NULL_COUNT};
 use delta_kernel::arrow::array::{
     Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float32Array,
-    Float64Array, Int16Array, Int32Array, Int64Array, Int8Array, RecordBatch, StringArray,
+    Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, RecordBatch, StringArray,
     TimestampMicrosecondArray,
 };
 use delta_kernel::arrow::datatypes::Schema as ArrowSchema;
@@ -15,15 +16,13 @@ use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::expressions::Scalar;
-use delta_kernel::schema::{schema, schema_ref, DataType, StructType};
+use delta_kernel::schema::{DataType, IntervalYearToMonthType, StructType, schema, schema_ref};
 use delta_kernel::table_features::ColumnMappingMode;
+use delta_kernel::transaction::UpdateTableOperation;
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
-use delta_kernel::Snapshot;
 use rstest::rstest;
-use test_utils::{
-    begin_transaction, get_column, read_scan, test_table_setup_mt, write_batch_to_table,
-};
+use test_utils::{get_column, read_scan, test_table_setup_mt, write_batch_to_table};
 use url::Url;
 
 use crate::common::read_utils::read_parquet_file;
@@ -131,13 +130,22 @@ async fn test_write_partitioned_normal_values_roundtrip(
     Ok(())
 }
 
-/// Writes an interval partition column, asserts the partitionValues entry is the Spark ANSI
-/// interval literal (CM=None), and verifies the value round-trips through a scan.
+/// Checks interval partition serialization and scanned values.
 #[rstest]
 #[case::year_month(
     DataType::INTERVAL_YEAR_MONTH,
-    Scalar::IntervalYearMonth(30),
+    Scalar::interval_year_month(30, IntervalYearToMonthType::IntervalYearToMonth).unwrap(),
     "INTERVAL '2-6' YEAR TO MONTH"
+)]
+#[case::year(
+    DataType::INTERVAL_YEAR,
+    Scalar::interval_year_month(24, IntervalYearToMonthType::IntervalYear).unwrap(),
+    "INTERVAL '2' YEAR"
+)]
+#[case::month(
+    DataType::INTERVAL_MONTH,
+    Scalar::interval_year_month(30, IntervalYearToMonthType::IntervalMonth).unwrap(),
+    "INTERVAL '30' MONTH"
 )]
 #[case::day_time(
     DataType::INTERVAL_DAY_TIME,
@@ -154,6 +162,22 @@ async fn test_write_partitioned_interval_roundtrip(
         ColumnMappingMode::Name,
         ColumnMappingMode::Id
     )]
+    cm_mode: ColumnMappingMode,
+) {
+    write_partitioned_interval_roundtrip(
+        interval,
+        partition_value,
+        expected_partition_value,
+        cm_mode,
+    )
+    .await
+    .unwrap();
+}
+
+async fn write_partitioned_interval_roundtrip(
+    interval: DataType,
+    partition_value: Scalar,
+    expected_partition_value: &str,
     cm_mode: ColumnMappingMode,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let schema = schema_ref! {
@@ -176,15 +200,17 @@ async fn test_write_partitioned_interval_roundtrip(
     )
     .await?;
 
-    // CM=None: the raw partitionValues entry is the Spark ANSI interval literal.
-    if cm_mode == ColumnMappingMode::None {
-        let (add, _rel) = read_single_add(&table_path, 1)?;
-        assert_eq!(
-            add["partitionValues"]["period"].as_str(),
-            Some(expected_partition_value),
-            "interval partition value should serialize to the ANSI literal"
-        );
-    }
+    let logical_schema = snapshot.schema();
+    let period_physical = logical_schema
+        .field("period")
+        .unwrap()
+        .physical_name(cm_mode);
+    let (add, _rel) = read_single_add(&table_path, 1)?;
+    assert_eq!(
+        add["partitionValues"][period_physical].as_str(),
+        Some(expected_partition_value),
+        "interval partition value should serialize to the ANSI literal"
+    );
 
     // The partition value round-trips: scan materializes `period` back as its physical integer.
     let sorted = read_sorted(&snapshot, engine as Arc<dyn delta_kernel::Engine>)?;
@@ -198,13 +224,61 @@ async fn test_write_partitioned_interval_roundtrip(
     Ok(())
 }
 
-/// Materialized interval partition columns are written into the Parquet file as physical integer
-/// values and still round-trip through scan output as logical partition columns.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_write_rejects_qualifier_mismatch() -> Result<(), Box<dyn std::error::Error>> {
+    let schema = schema_ref! {
+        nullable "value": INTEGER,
+        nullable "period": INTERVAL_YEAR,
+    };
+    let (_tmp_dir, table_path, engine) = test_table_setup_mt()?;
+    let snapshot = create_interval_partitioned_table(
+        &table_path,
+        engine.as_ref(),
+        schema,
+        ColumnMappingMode::None,
+        false,
+    )?;
+    let data_schema = schema! { nullable "value": INTEGER };
+    let batch = RecordBatch::try_new(
+        Arc::new((&data_schema).try_into_arrow()?),
+        vec![Arc::new(Int32Array::from(vec![7]))],
+    )?;
+    let partition_value = Scalar::interval_year_month(24, IntervalYearToMonthType::IntervalMonth)?;
+    let error = write_batch_to_table(
+        &snapshot,
+        engine.as_ref(),
+        batch,
+        HashMap::from([("period".to_string(), partition_value)]),
+    )
+    .await
+    .expect_err("mismatched partition qualifier should fail");
+    assert!(
+        error
+            .to_string()
+            .contains("partition column 'period' has type")
+    );
+
+    let latest = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
+    assert_eq!(latest.version(), snapshot.version());
+    Ok(())
+}
+
+/// Checks partitionValues spelling before validating materialized Parquet columns and scans.
 #[rstest]
 #[case::year_month(
     DataType::INTERVAL_YEAR_MONTH,
-    Scalar::IntervalYearMonth(30),
+    Scalar::interval_year_month(30, IntervalYearToMonthType::IntervalYearToMonth).unwrap(),
     "INTERVAL '2-6' YEAR TO MONTH"
+)]
+#[case::year(
+    DataType::INTERVAL_YEAR,
+    Scalar::interval_year_month(24, IntervalYearToMonthType::IntervalYear).unwrap(),
+    "INTERVAL '2' YEAR"
+)]
+#[case::month(
+    DataType::INTERVAL_MONTH,
+    Scalar::interval_year_month(30, IntervalYearToMonthType::IntervalMonth).unwrap(),
+    "INTERVAL '30' MONTH"
 )]
 #[case::day_time(
     DataType::INTERVAL_DAY_TIME,
@@ -221,6 +295,22 @@ async fn test_materialized_partitioned_interval_roundtrip(
         ColumnMappingMode::Name,
         ColumnMappingMode::Id
     )]
+    cm_mode: ColumnMappingMode,
+) {
+    materialized_partitioned_interval_roundtrip(
+        interval,
+        partition_value,
+        expected_partition_value,
+        cm_mode,
+    )
+    .await
+    .unwrap();
+}
+
+async fn materialized_partitioned_interval_roundtrip(
+    interval: DataType,
+    partition_value: Scalar,
+    expected_partition_value: &str,
     cm_mode: ColumnMappingMode,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let schema = schema_ref! {
@@ -683,7 +773,7 @@ fn assert_interval_value(batch: &RecordBatch, column_name: &str, expected: &Scal
         Scalar::IntervalYearMonth(months) => {
             assert_eq!(
                 get_column!(batch, column_name, Int32Array).value(0),
-                *months,
+                months.months(),
                 "interval year-month column {column_name}"
             );
         }
@@ -778,7 +868,7 @@ fn create_interval_partitioned_table(
     if cm_mode != ColumnMappingMode::None {
         properties.push(("delta.columnMapping.mode", cm_mode_str(cm_mode)));
     }
-    let snapshot = create_table(table_path, schema, "test/1.0")
+    let snapshot = create_table(table_path, schema, "test/1.0", true)
         .with_data_layout(DataLayout::partitioned(["period"]))
         .with_table_properties(properties)
         .build(engine, Box::new(FileSystemCommitter::new()))?
@@ -795,7 +885,7 @@ fn create_partitioned_table(
     cm_mode: ColumnMappingMode,
     write_partition_values_parsed: bool,
 ) -> Result<Arc<Snapshot>, Box<dyn std::error::Error>> {
-    let mut builder = create_table(table_path, schema, "test/1.0")
+    let mut builder = create_table(table_path, schema, "test/1.0", true)
         .with_data_layout(DataLayout::partitioned(partition_cols))
         .with_table_properties([(
             // `delta.checkpoint.writeStatsAsStruct` is what turns on `partitionValues_parsed`,
@@ -984,8 +1074,8 @@ fn read_single_add(
 /// `partitionValues`. Verifies that contract end-to-end through the kernel `create_table`
 /// builder.
 #[tokio::test(flavor = "multi_thread")]
-async fn test_materialized_partition_columns_excluded_from_stats(
-) -> Result<(), Box<dyn std::error::Error>> {
+async fn test_materialized_partition_columns_excluded_from_stats()
+-> Result<(), Box<dyn std::error::Error>> {
     let _ = tracing_subscriber::fmt::try_init();
 
     let partition_col = "partition";
@@ -995,14 +1085,20 @@ async fn test_materialized_partition_columns_excluded_from_stats(
     };
 
     let (_tmp_dir, table_path, engine) = test_table_setup_mt()?;
-    let _ = create_table(&table_path, table_schema.clone(), "test/1.0")
+    let _ = create_table(&table_path, table_schema.clone(), "test/1.0", true)
         .with_data_layout(DataLayout::partitioned([partition_col]))
         .with_table_properties([("delta.feature.materializePartitionColumns", "supported")])
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
         .commit(engine.as_ref())?;
 
-    let mut txn = test_utils::load_and_begin_transaction(&table_path, engine.as_ref())?
-        .with_engine_info("default engine");
+    let mut txn = test_utils::load_and_begin_transaction_with(
+        &table_path,
+        engine.as_ref(),
+        UpdateTableOperation::Write,
+        "default engine",
+        true,
+        |builder| builder,
+    )?;
 
     // Data batch must not contain the partition column.
     let data_schema = schema_ref! { nullable "number": INTEGER };
@@ -1014,10 +1110,13 @@ async fn test_materialized_partition_columns_excluded_from_stats(
     let data = Box::new(ArrowEngineData::new(batch));
 
     let write_state = txn.write_state()?;
-    let write_context = write_state.partitioned_write_context(HashMap::from([(
-        partition_col.to_string(),
-        Scalar::String("a".into()),
-    )]))?;
+    let write_context = write_state
+        .write_context_builder()
+        .with_partition_values(HashMap::from([(
+            partition_col.to_string(),
+            Scalar::String("a".into()),
+        )]))
+        .build()?;
     let result = engine.write_parquet(&data, &write_context).await?;
     txn.add_files(result);
     assert!(txn.commit(engine.as_ref())?.is_committed());
@@ -1070,7 +1169,7 @@ async fn test_materialize_partition_columns_e2e(
     };
 
     let (_tmp_dir, table_path, engine) = test_table_setup_mt()?;
-    let _ = create_table(&table_path, table_schema, "test/1.0")
+    let _ = create_table(&table_path, table_schema, "test/1.0", true)
         .with_data_layout(DataLayout::partitioned(["p1", "p2"]))
         .with_table_properties([
             ("delta.feature.materializePartitionColumns", "supported"),
@@ -1106,15 +1205,17 @@ async fn test_materialize_partition_columns_e2e(
 
     // A single commit writing two distinct partitions.
     let mut txn = snapshot
-        .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
-        .with_engine_info("default engine")
-        .with_data_change(true);
+        .update_table(UpdateTableOperation::Write, "default engine", true)
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
     let write_state = txn.write_state()?;
     for (d1, d2, p1, p2) in [
         (vec![1, 2, 3], vec![10, 20, 30], "x", 5),
         (vec![4, 5], vec![40, 50], "y", 6),
     ] {
-        let wc = write_state.partitioned_write_context(partition_values(p1, p2))?;
+        let wc = write_state
+            .write_context_builder()
+            .with_partition_values(partition_values(p1, p2))
+            .build()?;
         let add = engine
             .write_parquet(&ArrowEngineData::new(make_batch(d1, d2)), &wc)
             .await?;
@@ -1183,7 +1284,7 @@ async fn test_materialize_partition_columns_e2e(
 async fn test_materialize_all_primitive_partition_types() -> Result<(), Box<dyn std::error::Error>>
 {
     let (_tmp_dir, table_path, engine) = test_table_setup_mt()?;
-    let _ = create_table(&table_path, all_types_schema(), "test/1.0")
+    let _ = create_table(&table_path, all_types_schema(), "test/1.0", true)
         .with_data_layout(DataLayout::partitioned(PARTITION_COLS.iter().copied()))
         .with_table_properties([("delta.feature.materializePartitionColumns", "supported")])
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
@@ -1245,14 +1346,20 @@ async fn test_input_data_with_partition_column_errors(
     if materialized {
         properties.push(("delta.feature.materializePartitionColumns", "supported"));
     }
-    let _ = create_table(&table_path, table_schema.clone(), "test/1.0")
+    let _ = create_table(&table_path, table_schema.clone(), "test/1.0", true)
         .with_data_layout(DataLayout::partitioned([partition_col]))
         .with_table_properties(properties)
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
         .commit(engine.as_ref())?;
 
-    let txn = test_utils::load_and_begin_transaction(&table_path, engine.as_ref())?
-        .with_engine_info("default engine");
+    let txn = test_utils::load_and_begin_transaction_with(
+        &table_path,
+        engine.as_ref(),
+        UpdateTableOperation::Write,
+        "default engine",
+        true,
+        |builder| builder,
+    )?;
 
     // Contract violation: the batch includes the `partition` column.
     let arrow_schema = Arc::new(table_schema.as_ref().try_into_arrow()?);
@@ -1266,10 +1373,13 @@ async fn test_input_data_with_partition_column_errors(
     let data = Box::new(ArrowEngineData::new(batch));
 
     let write_state = txn.write_state()?;
-    let write_context = write_state.partitioned_write_context(HashMap::from([(
-        partition_col.to_string(),
-        Scalar::String("a".into()),
-    )]))?;
+    let write_context = write_state
+        .write_context_builder()
+        .with_partition_values(HashMap::from([(
+            partition_col.to_string(),
+            Scalar::String("a".into()),
+        )]))
+        .build()?;
     let err = engine
         .write_parquet(&data, &write_context)
         .await
@@ -1343,23 +1453,33 @@ async fn test_partition_null_validation(
     if materialized {
         properties.push(("delta.feature.materializePartitionColumns", "supported"));
     }
-    let _ = create_table(&table_path, schema, "test/1.0")
+    let _ = create_table(&table_path, schema, "test/1.0", true)
         .with_data_layout(DataLayout::partitioned(["p"]))
         .with_table_properties(properties)
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
         .commit(engine.as_ref())?;
     let snapshot = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
 
-    let txn = begin_transaction(snapshot, engine.as_ref())?.with_engine_info("default engine");
+    let txn = test_utils::begin_transaction_with(
+        snapshot,
+        engine.as_ref(),
+        UpdateTableOperation::Write,
+        "default engine",
+        true,
+        |builder| builder,
+    )?;
     let write_state = txn.write_state()?;
-    let result = write_state.partitioned_write_context(HashMap::from([("p".to_string(), value)]));
+    let result = write_state
+        .write_context_builder()
+        .with_partition_values(HashMap::from([("p".to_string(), value)]))
+        .build();
 
     match expected_err {
         Some(needle) => {
             let err = result
                 .err()
                 .ok_or(
-                    "expected partitioned_write_context to error for a null-equivalent value into NOT NULL partition",
+                    "expected write-context build to reject a null-equivalent value for a NOT NULL partition",
                 )?
                 .to_string();
             assert!(err.contains(needle), "{err}");
@@ -1404,24 +1524,39 @@ async fn test_partition_null_validation_mixed_nullability(
         false, // write_partition_values_parsed; unused, no checkpoint in this test
     )?;
 
-    let txn = begin_transaction(snapshot, engine.as_ref())?.with_engine_info("default engine");
+    let txn = test_utils::begin_transaction_with(
+        snapshot,
+        engine.as_ref(),
+        UpdateTableOperation::Write,
+        "default engine",
+        true,
+        |builder| builder,
+    )?;
     let write_state = txn.write_state()?;
 
-    write_state.partitioned_write_context(HashMap::from([
-        ("p_required".to_string(), Scalar::String("a".into())),
-        ("p_optional".to_string(), Scalar::Null(DataType::STRING)),
-    ]))?;
+    write_state
+        .write_context_builder()
+        .with_partition_values(HashMap::from([
+            ("p_required".to_string(), Scalar::String("a".into())),
+            ("p_optional".to_string(), Scalar::Null(DataType::STRING)),
+        ]))
+        .build()?;
 
-    write_state.partitioned_write_context(HashMap::from([
-        ("p_required".to_string(), Scalar::String("a".into())),
-        ("p_optional".to_string(), Scalar::String(String::new())),
-    ]))?;
+    write_state
+        .write_context_builder()
+        .with_partition_values(HashMap::from([
+            ("p_required".to_string(), Scalar::String("a".into())),
+            ("p_optional".to_string(), Scalar::String(String::new())),
+        ]))
+        .build()?;
 
     let err = write_state
-        .partitioned_write_context(HashMap::from([
+        .write_context_builder()
+        .with_partition_values(HashMap::from([
             ("p_required".to_string(), Scalar::Null(DataType::STRING)),
             ("p_optional".to_string(), Scalar::String("b".into())),
         ]))
+        .build()
         .unwrap_err()
         .to_string();
     assert!(err.contains("not nullable"), "{err}");

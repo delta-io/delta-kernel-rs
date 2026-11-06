@@ -20,6 +20,22 @@
 //! NOTE: While shared handles could conceptually impl [`Clone`], cloning would require unsafe code
 //! and so we can't actually implement the trait. Use [`Handle::clone_handle`] instead.
 
+use std::ptr::NonNull;
+
+/// Emulates the standard library associated function `Box::into_non_null`, which is not stable
+/// until 1.99+. Call as [`BoxExt::into_non_null`] to avoid `unstable_name_collisions` warnings.
+pub(crate) trait BoxExt<T: ?Sized> {
+    /// Converts `self` into a [`NonNull`] pointer, transferring ownership to the caller.
+    fn into_non_null(self) -> NonNull<T>;
+}
+
+impl<T: ?Sized> BoxExt<T> for Box<T> {
+    fn into_non_null(self) -> NonNull<T> {
+        // SAFETY: `Box::into_raw` never returns a null pointer.
+        unsafe { NonNull::new_unchecked(Box::into_raw(self)) }
+    }
+}
+
 /// Describes the kind of handle a given opaque pointer type represents.
 ///
 /// It is not normally necessary to implement this trait directly; instead, use the provided
@@ -142,7 +158,7 @@ mod private {
         ///
         /// * No mutable references can overlap with the returned reference.
         pub unsafe fn as_ref(&self) -> &H::Target {
-            H::as_ref(self.ptr.cast().as_ptr())
+            unsafe { H::as_ref(self.ptr.cast().as_ptr()) }
         }
 
         /// Consumes this handle and returns the resource it was originally created `From`: A
@@ -152,7 +168,7 @@ mod private {
         ///
         /// Caller asserts that the handle is [valid][Handle#Validity].
         pub unsafe fn into_inner(self) -> H::From {
-            H::into_inner(self.ptr.cast().as_ptr())
+            unsafe { H::into_inner(self.ptr.cast().as_ptr()) }
         }
         /// Drops this handle. Dropping a mutable handle always drops the underlying object as well;
         /// dropping a shared handle only drops the underlying object if the handle was the last
@@ -162,14 +178,19 @@ mod private {
         ///
         /// Caller asserts that the handle is [valid][Handle#Validity].
         pub unsafe fn drop_handle(self) {
-            drop(self.into_inner())
+            drop(unsafe { self.into_inner() })
         }
 
         /// In testing code we want to simulate what c code can do where a pointer can be used
         /// without consuming it. This creates a "new" handle just by copying the underlying pointer
-        /// without increasing the arc refcount. This is dangerous! Do not use outside testing code!
+        /// without increasing the arc refcount.
+        ///
+        /// # Safety
+        ///
+        /// This is dangerous! Do not use outside testing code! Caller must ensure a valid handle
+        /// outlives this new fake one, or it will dangle.
         #[cfg(test)]
-        pub fn shallow_copy(&self) -> Self {
+        pub unsafe fn shallow_copy(&self) -> Self {
             Handle { ptr: self.ptr }
         }
     }
@@ -196,7 +217,7 @@ mod private {
         ///   reference. In particular, this means the caller must ensure no other thread can access
         ///   this handle while the returned reference is still alive.
         pub unsafe fn as_mut(&mut self) -> &mut T {
-            H::as_mut(self.ptr.cast().as_ptr())
+            unsafe { H::as_mut(self.ptr.cast().as_ptr()) }
         }
     }
 
@@ -217,7 +238,7 @@ mod private {
         ///
         /// Caller asserts that the handle is [valid][Handle#Validity].
         pub unsafe fn clone_handle(&self) -> Self {
-            self.clone_as_arc().into()
+            unsafe { self.clone_as_arc() }.into()
         }
 
         /// Clones a new `Arc<T>` out of this handle, increasing the underlying object's refcount by
@@ -227,7 +248,7 @@ mod private {
         ///
         /// Caller asserts that the handle is [valid][Handle#Validity].
         pub unsafe fn clone_as_arc(&self) -> Arc<T> {
-            H::clone_arc(self.ptr.cast().as_ptr())
+            unsafe { H::clone_arc(self.ptr.cast().as_ptr()) }
         }
     }
 
@@ -343,13 +364,13 @@ mod private {
         type Raw = T;
 
         fn into_handle_ptr(val: Box<T>) -> NonNull<T> {
-            Box::leak(val).into()
+            BoxExt::into_non_null(val)
         }
         unsafe fn as_ref<'a>(ptr: *const T) -> &'a T {
-            &*ptr
+            unsafe { &*ptr }
         }
         unsafe fn into_inner(ptr: *mut T) -> Box<T> {
-            Box::from_raw(ptr)
+            unsafe { Box::from_raw(ptr) }
         }
     }
 
@@ -358,7 +379,7 @@ mod private {
         H: HandleDescriptor<Target = T, Mutable = True, Sized = True>,
     {
         unsafe fn as_mut<'a>(ptr: *mut T) -> &'a mut T {
-            &mut *ptr
+            unsafe { &mut *ptr }
         }
     }
 
@@ -377,10 +398,10 @@ mod private {
             unsafe { NonNull::new_unchecked(ptr) } // into_raw guarantees non-null
         }
         unsafe fn as_ref<'a>(ptr: *const T) -> &'a T {
-            &*ptr
+            unsafe { &*ptr }
         }
         unsafe fn into_inner(ptr: *mut T) -> Arc<T> {
-            Arc::from_raw(ptr)
+            unsafe { Arc::from_raw(ptr) }
         }
     }
 
@@ -390,8 +411,10 @@ mod private {
         H: HandleDescriptor<Target = T, Mutable = False, Sized = True>,
     {
         unsafe fn clone_arc(ptr: *const T) -> Arc<T> {
-            Arc::increment_strong_count(ptr);
-            Arc::from_raw(ptr)
+            unsafe {
+                Arc::increment_strong_count(ptr);
+                Arc::from_raw(ptr)
+            }
         }
     }
 
@@ -406,14 +429,14 @@ mod private {
 
         fn into_handle_ptr(val: Box<T>) -> NonNull<Box<T>> {
             // Double-boxing needed in order to obtain a thin pointer
-            Box::leak(Box::new(val)).into()
+            BoxExt::into_non_null(Box::new(val))
         }
         unsafe fn as_ref<'a>(ptr: *const Box<T>) -> &'a T {
             let boxed = unsafe { &*ptr };
             boxed.as_ref()
         }
         unsafe fn into_inner(ptr: *mut Box<T>) -> Box<T> {
-            *Box::from_raw(ptr)
+            unsafe { *Box::from_raw(ptr) }
         }
     }
 
@@ -439,14 +462,14 @@ mod private {
 
         fn into_handle_ptr(val: Arc<T>) -> NonNull<Arc<T>> {
             // Double-boxing needed in order to obtain a thin pointer
-            Box::leak(Box::new(val)).into()
+            BoxExt::into_non_null(Box::new(val))
         }
         unsafe fn as_ref<'a>(ptr: *const Arc<T>) -> &'a T {
             let arc = unsafe { &*ptr };
             arc.as_ref()
         }
         unsafe fn into_inner(ptr: *mut Arc<T>) -> Arc<T> {
-            *Box::from_raw(ptr)
+            unsafe { *Box::from_raw(ptr) }
         }
     }
 
@@ -499,6 +522,19 @@ mod tests {
     use delta_kernel_ffi_macros::handle_descriptor;
 
     use super::*;
+
+    // Fails when workspace MSRV is high enough to stabilize `Box::into_non_null`, so that `BoxExt`
+    // trait (and this test) can be removed.
+    #[test]
+    fn box_ext_is_required_by_msrv() {
+        let mut parts = env!("CARGO_PKG_RUST_VERSION").split('.');
+        let major: u32 = parts.next().unwrap().parse().unwrap();
+        let minor: u32 = parts.next().unwrap().parse().unwrap();
+        assert!(
+            (major, minor) < (1, 99),
+            "BoxExt is now obsolete. Delete the trait and use Box::into_non_null instead"
+        );
+    }
 
     #[allow(dead_code)]
     #[derive(Debug)]

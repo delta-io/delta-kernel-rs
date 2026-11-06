@@ -7,4 +7,5 @@ mod history_manager;
 mod log_compaction;
 mod log_tail;
 mod snapshot_build;
+mod v1_checkpoints;
 mod v2_checkpoints;

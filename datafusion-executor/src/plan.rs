@@ -11,7 +11,7 @@
 
 use std::sync::Arc;
 
-use datafusion::common::DataFusionError;
+use datafusion::common::{DataFusionError, Result as DFResult};
 use datafusion::logical_expr::LogicalPlan as DFLogicalPlan;
 use delta_kernel::plans::ir::plan::Plan as KernelPlan;
 use itertools::Itertools;
@@ -23,7 +23,7 @@ use crate::operator::lower_operator;
 ///
 /// # Errors
 /// Returns an error if `plan` has no nodes, or if lowering any individual node fails.
-pub(crate) fn to_df_plan(plan: &KernelPlan) -> Result<DFLogicalPlan, DataFusionError> {
+pub(crate) fn to_df_plan(plan: &KernelPlan) -> DFResult<DFLogicalPlan> {
     // A node is identified by its index, and `nodes` is topologically ordered: every input index is
     // strictly less than the node's own, so a single forward pass leaves each node's inputs already
     // lowered by the time it is reached.
@@ -67,15 +67,15 @@ mod tests {
     use datafusion::arrow::record_batch::RecordBatch;
     use datafusion::assert_batches_eq;
     use datafusion::prelude::SessionContext;
+    use delta_kernel::PlanBuilder;
     use delta_kernel::expressions::{
-        col, Expression as KernelExpr, Predicate as KernelPredicate, Scalar as KernelScalar,
+        Expression as KernelExpr, Predicate as KernelPredicate, Scalar as KernelScalar, col, expr,
     };
     use delta_kernel::plans::ir::nodes::{
         Filter as KernelFilter, Project as KernelProject, Values as KernelValues,
     };
     use delta_kernel::plans::ir::plan::PlanNode as KernelPlanNode;
-    use delta_kernel::schema::{schema, DataType, StructField, StructType};
-    use delta_kernel::PlanBuilder;
+    use delta_kernel::schema::{DataType, StructField, StructType, schema};
     use rstest::rstest;
 
     use super::*;
@@ -92,7 +92,7 @@ mod tests {
         KernelPlanNode::new(KernelValues::new(test_schema(), rows), vec![])
     }
 
-    async fn execute(plan: &KernelPlan) -> Result<Vec<RecordBatch>, DataFusionError> {
+    async fn execute(plan: &KernelPlan) -> DFResult<Vec<RecordBatch>> {
         SessionContext::new()
             .execute_logical_plan(to_df_plan(plan)?)
             .await?
@@ -104,7 +104,11 @@ mod tests {
 
     #[test]
     fn empty_plan_is_rejected() {
-        let err = to_df_plan(&KernelPlan { nodes: vec![] }).unwrap_err();
+        let err = to_df_plan(&KernelPlan {
+            schema: Arc::new(test_schema()),
+            nodes: vec![],
+        })
+        .unwrap_err();
         assert!(err.to_string().contains("no nodes"), "{err}");
     }
 
@@ -112,6 +116,7 @@ mod tests {
     async fn terminal_node_is_the_plans_output() {
         // Two independent sources; the last node is the terminal one, so its rows are the output.
         let plan = KernelPlan {
+            schema: Arc::new(test_schema()),
             nodes: vec![
                 values_node(vec![vec![1i64.into()]]),
                 values_node(vec![vec![2i64.into()], vec![3i64.into()]]),
@@ -130,7 +135,11 @@ mod tests {
     #[case::far_out_of_range(42)]
     fn invalid_input_reference_is_rejected(#[case] input_index: usize) {
         let node = KernelPlanNode::new(KernelValues::new(test_schema(), vec![]), vec![input_index]);
-        let err = to_df_plan(&KernelPlan { nodes: vec![node] }).unwrap_err();
+        let err = to_df_plan(&KernelPlan {
+            schema: Arc::new(test_schema()),
+            nodes: vec![node],
+        })
+        .unwrap_err();
         let message = err.to_string();
         assert!(message.contains("node 0 (values)"), "{message}");
         assert!(
@@ -147,7 +156,7 @@ mod tests {
             vec![vec![KernelScalar::null(DataType::LONG)], vec![2i64.into()]],
         )
         .unwrap()
-        .filter(KernelPredicate::is_null(col!("a")))
+        .filter(KernelPredicate::from_expr(expr!(is_null(col("a")))))
         .unwrap()
         .build()
         .unwrap();
@@ -162,12 +171,13 @@ mod tests {
         );
         let project = KernelProject {
             expr: KernelExpr::struct_from([col!("a")]).into(),
-            schema: project_schema,
+            schema: project_schema.clone(),
         };
         let filter = KernelFilter {
-            predicate: KernelPredicate::is_not_null(col!("projected")).into(),
+            predicate: KernelPredicate::from_expr(expr!(is_not_null(col("projected")))).into(),
         };
         let plan = KernelPlan {
+            schema: project_schema,
             nodes: vec![
                 values_node(vec![vec![1i64.into()]]),
                 KernelPlanNode::new(project, vec![0]),

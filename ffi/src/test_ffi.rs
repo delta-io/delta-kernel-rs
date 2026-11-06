@@ -4,17 +4,20 @@
 
 use std::sync::Arc;
 
+use delta_kernel::KernelResult;
 use delta_kernel::expressions::{
-    col, column_name, column_pred, lit, null_lit, ArrayData, BinaryExpressionOp, BinaryPredicateOp,
-    Expression as Expr, ExpressionStructPatchBuilder, MapData, OpaqueExpressionOp,
-    OpaquePredicateOp, Predicate as Pred, Scalar, ScalarExpressionEvaluator, StructData,
+    ArrayData, BinaryExpressionOp, BinaryPredicateOp, Expression as Expr,
+    ExpressionStructPatchBuilder, MapData, MapToStructOptions, OpaqueExpressionOp,
+    OpaquePredicateOp, Predicate as Pred, Scalar, ScalarExpressionEvaluator, StructData, col,
+    column_name, column_pred, expr, lit, null_lit,
 };
 use delta_kernel::kernel_predicates::{
     DirectDataSkippingPredicateEvaluator, DirectPredicateEvaluator,
     IndirectDataSkippingPredicateEvaluator,
 };
-use delta_kernel::schema::{ArrayType, DataType, MapType, StructField, StructType};
-use delta_kernel::DeltaResult;
+use delta_kernel::schema::{
+    ArrayType, DataType, IntervalYearToMonthType, MapType, StructField, StructType,
+};
 
 use crate::expressions::{SharedExpression, SharedPredicate};
 use crate::handle::Handle;
@@ -30,7 +33,7 @@ impl OpaqueExpressionOp for OpaqueTestOp {
         &self,
         _eval_expr: &ScalarExpressionEvaluator<'_>,
         _exprs: &[Expr],
-    ) -> DeltaResult<Scalar> {
+    ) -> KernelResult<Scalar> {
         unimplemented!()
     }
 }
@@ -46,7 +49,7 @@ impl OpaquePredicateOp for OpaqueTestOp {
         _evaluator: &DirectPredicateEvaluator<'_>,
         _exprs: &[Expr],
         _inverted: bool,
-    ) -> DeltaResult<Option<bool>> {
+    ) -> KernelResult<Option<bool>> {
         unimplemented!()
     }
 
@@ -75,7 +78,7 @@ impl OpaquePredicateOp for OpaqueTestOp {
 /// # Safety
 /// The caller is responsible for freeing the returned memory, either by calling
 /// [`crate::expressions::free_kernel_expression`], or [`crate::handle::Handle::drop_handle`].
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn get_testing_kernel_expression() -> Handle<SharedExpression> {
     let array_type = ArrayType::new(
         DataType::Primitive(delta_kernel::schema::PrimitiveType::Short),
@@ -158,9 +161,25 @@ pub unsafe extern "C" fn get_testing_kernel_expression() -> Handle<SharedExpress
         Expr::struct_from([lit(5_i32), lit(20_i64)]),
         Expr::opaque(OpaqueTestOp("foo".to_string()), vec![lit(42), lit(1.111)]),
         Expr::unknown("mystery"),
-        Expr::map_to_struct(col!("pv")),
-        Expr::coalesce([col!("col"), lit(0_i32)]),
+        Expr::map_to_struct(col!("pv"), MapToStructOptions::default()),
+        Expr::map_to_struct(
+            col!("pv"),
+            MapToStructOptions::default().with_timestamp_timezone("America/Los_Angeles"),
+        ),
+        expr!(coalesce(col("col"), 0_i32)),
         Expr::array([lit(1_i32), lit(2_i32)]),
+        Expr::case_when(
+            [
+                (column_pred!("flag"), lit(10_i32)),
+                (column_pred!("other_flag"), lit(20_i32)),
+            ],
+            lit(30_i32),
+        ),
+        Expr::case_when(
+            [(column_pred!("flag"), lit(10_i32))],
+            null_lit(DataType::INTEGER),
+        ),
+        Expr::case_when([], lit(40_i32)),
     ];
     sub_exprs.extend(
         [
@@ -182,7 +201,7 @@ pub unsafe extern "C" fn get_testing_kernel_expression() -> Handle<SharedExpress
 /// # Safety
 /// The caller is responsible for freeing the returned memory, either by calling
 /// [`crate::expressions::free_kernel_predicate`], or [`crate::handle::Handle::drop_handle`].
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn get_testing_kernel_predicate() -> Handle<SharedPredicate> {
     let array_type = ArrayType::new(
         DataType::Primitive(delta_kernel::schema::PrimitiveType::Short),
@@ -205,10 +224,14 @@ pub unsafe extern "C" fn get_testing_kernel_predicate() -> Handle<SharedPredicat
             lit(10),
             Scalar::Array(array_data),
         )),
-        Pred::or_from(vec![Pred::eq(lit(5), lit(10)), Pred::ne(lit(20), lit(10))]),
-        Pred::is_not_null(col!("col")),
+        Pred::from_expr(expr!(or(5 == 10, 20 != 10))),
+        Pred::from_expr(expr!(is_not_null(col("col")))),
         Pred::opaque(OpaqueTestOp("bar".to_string()), vec![lit(42), lit(1.111)]),
         Pred::unknown("intrigue"),
+        Pred::from_expr(Expr::case_when(
+            [(column_pred!("flag"), lit(true))],
+            lit(false),
+        )),
     ];
     sub_exprs.extend(
         [
@@ -232,7 +255,7 @@ pub unsafe extern "C" fn get_testing_kernel_predicate() -> Handle<SharedPredicat
 ///
 /// # Safety
 /// The caller is responsible for freeing the returned memory.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn get_simple_testing_kernel_expression() -> Handle<SharedExpression> {
     let sub_exprs = vec![
         col!("simple_col"),
@@ -245,7 +268,9 @@ pub unsafe extern "C" fn get_simple_testing_kernel_expression() -> Handle<Shared
         lit(Scalar::Date(19000)),
         lit(Scalar::Timestamp(1234567890)),
         lit(Scalar::TimestampNtz(9876543210)),
-        lit(Scalar::IntervalYearMonth(-13)),
+        lit(
+            Scalar::interval_year_month(-13, IntervalYearToMonthType::IntervalYearToMonth).unwrap(),
+        ),
         lit(Scalar::IntervalDayTime(9_876_543_210)),
         null_lit(DataType::INTEGER),
         null_lit(DataType::decimal(10, 5).unwrap()),
@@ -254,7 +279,11 @@ pub unsafe extern "C" fn get_simple_testing_kernel_expression() -> Handle<Shared
         Expr::binary(BinaryExpressionOp::Multiply, lit(5), lit(6)),
         Expr::binary(BinaryExpressionOp::Divide, lit(100), lit(4)),
         Expr::struct_from([lit(1_i32), lit(2_i64), lit(3.0_f64)]),
-        Expr::map_to_struct(col!("partitionValues")),
+        Expr::map_to_struct(col!("partitionValues"), MapToStructOptions::default()),
+        Expr::map_to_struct(
+            col!("partitionValues"),
+            MapToStructOptions::default().with_timestamp_timezone("America/Los_Angeles"),
+        ),
     ];
     Arc::new(Expr::struct_from(sub_exprs)).into()
 }
@@ -266,7 +295,7 @@ pub unsafe extern "C" fn get_simple_testing_kernel_expression() -> Handle<Shared
 /// # Safety
 /// The caller must free the returned handle with
 /// [`crate::expressions::free_kernel_expression`].
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn get_testing_dotted_field_column() -> Handle<SharedExpression> {
     Arc::new(Expr::column(["a", "b.c", "d"])).into()
 }
@@ -276,23 +305,23 @@ pub unsafe extern "C" fn get_testing_dotted_field_column() -> Handle<SharedExpre
 ///
 /// # Safety
 /// The caller is responsible for freeing the returned memory.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn get_simple_testing_kernel_predicate() -> Handle<SharedPredicate> {
     let sub_preds = vec![
         column_pred!("pred_col"),
         Pred::TRUE,
         Pred::FALSE,
-        Pred::eq(lit(10), lit(10)),
-        Pred::ne(lit(5), lit(10)),
-        Pred::lt(lit(5), lit(10)),
-        Pred::le(lit(10), lit(10)),
-        Pred::gt(lit(20), lit(10)),
-        Pred::ge(lit(10), lit(10)),
-        Pred::distinct(lit(1), lit(2)),
-        Pred::is_null(col!("nullable_col")),
-        Pred::is_not_null(col!("nonnull_col")),
-        Pred::not(Pred::FALSE),
-        Pred::or_from(vec![Pred::eq(lit(1), lit(1)), Pred::eq(lit(2), lit(2))]),
+        Pred::from_expr(expr!(10 == 10)),
+        Pred::from_expr(expr!(5 != 10)),
+        Pred::from_expr(expr!(5 < 10)),
+        Pred::from_expr(expr!(10 <= 10)),
+        Pred::from_expr(expr!(20 > 10)),
+        Pred::from_expr(expr!(10 >= 10)),
+        Pred::from_expr(expr!(distinct(1, 2))),
+        Pred::from_expr(expr!(is_null(col("nullable_col")))),
+        Pred::from_expr(expr!(is_not_null(col("nonnull_col")))),
+        Pred::from_expr(expr!(not(false))),
+        Pred::from_expr(expr!(or(1 == 1, 2 == 2))),
     ];
     Arc::new(Pred::and_from(sub_preds)).into()
 }
@@ -302,13 +331,13 @@ pub unsafe extern "C" fn get_simple_testing_kernel_predicate() -> Handle<SharedP
 ///
 /// # Safety
 /// Both expr1 and expr2 must be valid SharedExpression handles.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn expressions_are_equal(
     expr1: &Handle<SharedExpression>,
     expr2: &Handle<SharedExpression>,
 ) -> bool {
-    let expr1: &Expr = expr1.as_ref();
-    let expr2: &Expr = expr2.as_ref();
+    let expr1: &Expr = unsafe { expr1.as_ref() };
+    let expr2: &Expr = unsafe { expr2.as_ref() };
     expr1 == expr2
 }
 
@@ -317,12 +346,12 @@ pub unsafe extern "C" fn expressions_are_equal(
 ///
 /// # Safety
 /// Both pred1 and pred2 must be valid SharedPredicate handles.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn predicates_are_equal(
     pred1: &Handle<SharedPredicate>,
     pred2: &Handle<SharedPredicate>,
 ) -> bool {
-    let pred1: &Pred = pred1.as_ref();
-    let pred2: &Pred = pred2.as_ref();
+    let pred1: &Pred = unsafe { pred1.as_ref() };
+    let pred2: &Pred = unsafe { pred2.as_ref() };
     pred1 == pred2
 }

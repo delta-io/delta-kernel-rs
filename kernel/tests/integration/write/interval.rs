@@ -2,8 +2,8 @@
 
 use std::sync::Arc;
 
-use delta_kernel::schema::{schema_ref, DataType};
-use test_utils::load_and_begin_transaction;
+use delta_kernel::schema::{DataType, schema_ref};
+use test_utils::load_and_begin_transaction_with;
 
 mod supported {
     use std::collections::HashMap;
@@ -54,15 +54,21 @@ mod supported {
         };
 
         let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
-        let snapshot = create_table_transaction(&table_path, schema.clone(), "Test/1.0")
+        let snapshot = create_table_transaction(&table_path, schema.clone(), "Test/1.0", true)
             .with_table_properties([("delta.checkpoint.writeStatsAsStruct", "true")])
             .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
             .commit(engine.as_ref())?
             .unwrap_post_commit_snapshot();
         let table_url = snapshot.table_root().clone();
 
-        let mut txn = load_and_begin_transaction(table_url.clone(), engine.as_ref())?
-            .with_engine_info("default engine");
+        let mut txn = load_and_begin_transaction_with(
+            table_url.clone(),
+            engine.as_ref(),
+            delta_kernel::transaction::UpdateTableOperation::Write,
+            "default engine",
+            true,
+            |builder| builder,
+        )?;
         let arrow_schema: ArrowSchema = schema.as_ref().try_into_arrow()?;
         let arrow_schema = Arc::new(arrow_schema);
         let nested_fields = match arrow_schema.field_with_name("nested").unwrap().data_type() {
@@ -85,7 +91,7 @@ mod supported {
             ],
         )?;
 
-        let write_context = txn.write_state()?.unpartitioned_write_context()?;
+        let write_context = txn.write_state()?.write_context_builder().build()?;
         let add_files_metadata = engine
             .write_parquet(&ArrowEngineData::new(data.clone()), &write_context)
             .await?;
@@ -203,7 +209,7 @@ mod supported {
         };
 
         let (_temp_dir, table_path, engine) = test_table_setup()?;
-        let snapshot = create_table_transaction(&table_path, schema.clone(), "Test/1.0")
+        let snapshot = create_table_transaction(&table_path, schema.clone(), "Test/1.0", true)
             .with_table_properties([(property_name, property_value)])
             .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
             .commit(engine.as_ref())?
@@ -241,7 +247,10 @@ mod supported {
         );
         for category in ["nullCount", "minValues", "maxValues"] {
             assert!(
-                stats.get(category).and_then(|value| value.get("iv")).is_none(),
+                stats
+                    .get(category)
+                    .and_then(|value| value.get("iv"))
+                    .is_none(),
                 "interval column excluded by {property_name} must not have {category}; got: {stats}",
             );
         }

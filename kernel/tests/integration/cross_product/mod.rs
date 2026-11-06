@@ -2,12 +2,13 @@ use std::sync::Arc;
 
 use delta_kernel::schema::MetadataColumnSpec;
 use delta_kernel::snapshot::ChecksumWriteResult;
-use delta_kernel::{DeltaResult, Engine, Snapshot};
+use delta_kernel::{Engine, KernelResult, Snapshot};
 use rstest::rstest;
 use rstest_reuse::apply;
 use test_utils::delta_kernel_default_engine::DefaultEngineBuilder;
 use test_utils::table_builder::{
-    all_features_cm_id, all_features_cm_name, checkpoint_at_end, checkpoint_at_end_crc_at_end,
+    DataLayoutConfig, FeatureSet, LogState, TableConfig, VersionTarget, all_features_cm_id,
+    all_features_cm_name, checkpoint_at_end, checkpoint_at_end_crc_at_end,
     checkpoint_at_end_no_hint, checkpoint_at_end_no_hint_post_cleanup,
     checkpoint_at_end_post_cleanup, checkpoint_mid, checkpoint_mid_crc_above_mid_post_cleanup,
     checkpoint_mid_crc_at_end_post_cleanup, checkpoint_mid_crc_at_mid_post_cleanup,
@@ -18,7 +19,6 @@ use test_utils::table_builder::{
     two_checkpoints_stale_hint_post_cleanup, unpartitioned, version_at_mid,
     version_at_timestamp_max, version_incremental_from_mid_to_latest,
     version_incremental_from_mid_to_pre_latest, version_latest, with_json_stats, with_struct_stats,
-    DataLayoutConfig, FeatureSet, LogState, TableConfig, VersionTarget,
 };
 use test_utils::{assert_row_ids_unique, build_snapshot, default_sweep, read_scan};
 
@@ -39,7 +39,7 @@ fn test_cross_product_read_write(
     feature_set: FeatureSet,
     layout_config: (DataLayoutConfig, TableConfig),
     version_target: VersionTarget,
-) -> DeltaResult<()> {
+) -> KernelResult<()> {
     let (data_layout, table_config) = layout_config;
     let table = test_table(log_state.clone(), feature_set, data_layout, table_config);
     let engine: Arc<dyn Engine> =
@@ -94,7 +94,7 @@ fn write_and_assert_checksum(
     log_state: &LogState,
     version: u64,
     engine: &dyn Engine,
-) -> DeltaResult<()> {
+) -> KernelResult<()> {
     let expected_result = if log_state.crcs_at().contains(&version) {
         ChecksumWriteResult::AlreadyExists
     } else {

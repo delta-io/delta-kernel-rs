@@ -44,6 +44,10 @@ We also encourage contributors to optimize their PRs for review:
 - Code structure and doc comments optimized for understandability (e.g. avoid bloat, redundancy, and
 convoluted control flow).
 
+See [documentation ownership](AGENTS.md#documentation-ownership) for where an explanation belongs
+and the [comment and documentation style](AGENTS.md#comment--doc-style) for Rustdoc and code
+comments.
+
 PRs that do not follow these principles are much more time consuming to review, and less likely to
 get prompt reviews.
 
@@ -140,5 +144,6 @@ If it was tested in a way different from regular unit tests, please clarify how 
 
 ## Resources
 
+- [Release process](RELEASING.md) - Maintainer runbook for changelogs, publishing, and tags
 - [Delta Protocol](https://github.com/delta-io/delta/blob/master/PROTOCOL.md)
 - [Delta Lake Slack](https://go.delta.io/slack) - Join us in the `#delta-kernel` channel

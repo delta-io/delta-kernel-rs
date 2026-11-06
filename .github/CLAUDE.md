@@ -51,6 +51,12 @@ rationale. Commands exempt from `--locked`: `cargo +nightly fmt` (no dep
 resolution), `cargo msrv verify/show` (wrapper tool), `cargo miri setup` (tooling
 setup).
 
+## Rust API checks
+
+Result alias and public signature changes need doctests and user-guide example compilation in
+addition to workspace checks. Root workspace commands exclude `datafusion-executor` and
+`integration-tests`. Validate those workspaces separately with their supported Arrow features.
+
 ## Action safety
 
 When writing any github action, consider safety including mitigating common attack
@@ -67,3 +73,11 @@ env:
 run: |
     echo "Comment: $COMMENT_BODY"
 ```
+
+## Release tooling checks
+
+The `release-tooling` job in `build.yml` fetches full history and tags because release branches
+verify the pending changelog against every PR since the previous Kernel release. Keep
+`fetch-depth: 0` on that checkout. The regression tests run on every pull request, while live
+verification is restricted to branches whose names start with `release/`; otherwise the window
+between merging a release PR and pushing its tag could block unrelated pull requests.

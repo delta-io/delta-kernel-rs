@@ -9,6 +9,7 @@ use std::str::FromStr;
 use std::sync::{Arc, LazyLock};
 
 use delta_kernel_derive::internal_api;
+use derive_more::From;
 use indexmap::IndexMap;
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
@@ -17,15 +18,16 @@ use strum::{Display as StrumDisplay, EnumString};
 use tracing::warn;
 
 // re-export because many call sites that use schemas do not necessarily use expressions
-pub(crate) use crate::expressions::{column_name, ColumnName};
+pub(crate) use crate::expressions::{ColumnName, column_name};
 use crate::reserved_field_ids::FILE_NAME;
+use crate::schema::collation_utils::rewrite_collation_field_prefix;
 use crate::table_features::{
-    validate_and_extract_column_mapping_annotations, validate_column_mapping_id, ColumnMappingMode,
-    StaleAnnotationPolicy,
+    ColumnMappingMode, StaleAnnotationPolicy, validate_and_extract_column_mapping_annotations,
+    validate_column_mapping_id,
 };
-use crate::transforms::{transform_output_type, SchemaTransform};
-use crate::utils::{require, CollectInto};
-use crate::{DeltaResult, Error};
+use crate::transforms::{SchemaTransform, transform_output_type};
+use crate::utils::{CollectInto, require};
+use crate::{KernelError, KernelResult};
 
 pub(crate) mod column_default;
 pub use column_default::ColumnDefault;
@@ -33,12 +35,22 @@ pub(crate) use column_default::{try_collect_column_defaults, validate_column_def
 pub(crate) mod compare;
 #[cfg(feature = "schema-diff")]
 pub(crate) mod diff;
+pub(crate) mod generated_column;
+pub use generated_column::GeneratedColumn;
+mod metadata_key;
+pub use metadata_key::MetadataKey;
 
+pub(crate) mod collation_utils;
 #[cfg(feature = "internal-api")]
 pub mod derive_macro_utils;
 #[cfg(not(feature = "internal-api"))]
 pub(crate) mod derive_macro_utils;
+pub(crate) mod file_utils;
+#[cfg(feature = "udt-in-dev")]
+mod user_defined;
 pub(crate) mod validation;
+#[cfg(feature = "udt-in-dev")]
+pub use user_defined::UserDefinedType;
 pub(crate) mod variant_utils;
 pub(crate) mod void_utils;
 
@@ -150,7 +162,7 @@ pub(crate) use delta_kernel_derive::schema;
 pub(crate) use delta_kernel_derive::schema_ref;
 /// Like [`schema`], but validates field names at every level of the schema (each struct,
 /// including nested ones, is built via [`StructType::try_new`] and yields
-/// [`DeltaResult<StructType>`]. Use when field names are runtime values that could duplicate
+/// [`KernelResult<StructType>`]. Use when field names are runtime values that could duplicate
 /// in ways the macro cannot see.
 #[internal_api]
 #[doc(inline)]
@@ -195,11 +207,14 @@ pub(crate) trait ToSchema {
     fn to_schema() -> StructType;
 }
 
-#[derive(Debug, Serialize, Deserialize, PartialEq, Clone, Eq)]
+#[derive(Debug, Serialize, Deserialize, PartialEq, Clone, Eq, From)]
 #[serde(untagged)]
 pub enum MetadataValue {
+    #[from]
     Number(i64),
+    #[from(String, &String, &str)]
     String(String),
+    #[from]
     Boolean(bool),
     // The [PROTOCOL](https://github.com/delta-io/delta/blob/master/PROTOCOL.md#struct-field) states
     // only that the metadata is "A JSON map containing information about this column.", so we can
@@ -219,39 +234,19 @@ impl Display for MetadataValue {
     }
 }
 
-impl From<String> for MetadataValue {
-    fn from(value: String) -> Self {
-        Self::String(value)
-    }
-}
-
-impl From<&String> for MetadataValue {
-    fn from(value: &String) -> Self {
-        Self::String(value.clone())
-    }
-}
-
-impl From<&str> for MetadataValue {
-    fn from(value: &str) -> Self {
-        Self::String(value.to_string())
-    }
-}
-
-impl From<i64> for MetadataValue {
-    fn from(value: i64) -> Self {
-        Self::Number(value)
-    }
-}
-
-impl From<bool> for MetadataValue {
-    fn from(value: bool) -> Self {
-        Self::Boolean(value)
-    }
-}
-
-#[derive(Debug)]
+#[derive(Debug, strum::AsRefStr, strum::EnumString, strum::IntoStaticStr)]
+#[cfg_attr(test, derive(strum::EnumIter))]
 pub enum ColumnMetadataKey {
+    /// Collation identifiers keyed by field-relative path, stored as a JSON object.
+    ///
+    /// Kernel preserves these identifiers; string predicates use UTF-8 binary semantics.
+    /// See [`ScanBuilder::with_predicate`](crate::scan::ScanBuilder::with_predicate) and the
+    /// [collation RFC](https://github.com/delta-io/delta/blob/master/protocol_rfcs/collated-string-type.md).
+    #[strum(serialize = "__COLLATIONS")]
+    Collations,
+    #[strum(serialize = "delta.columnMapping.id")]
     ColumnMappingId,
+    #[strum(serialize = "delta.columnMapping.physicalName")]
     ColumnMappingPhysicalName,
     /// Parquet field IDs for the synthesized `element` / `key` / `value` fields of an Array or
     /// Map. Stored on the *nearest ancestor* StructField as a JSON object whose keys are
@@ -271,48 +266,39 @@ pub enum ColumnMetadataKey {
     ///   }
     /// }
     /// ```
+    #[strum(serialize = "delta.columnMapping.nested.ids")]
     ColumnMappingNestedIds,
+    // "parquet.field.id" is not defined by the Delta protocol, but follows the convention
+    // established by delta-spark and other Delta ecosystem implementations for storing
+    // Parquet field IDs in StructField metadata.
+    #[strum(serialize = "parquet.field.id")]
     ParquetFieldId,
+    // The Delta protocol defines this key for IcebergCompatV2/V3 nested field ids. It is
+    // legacy and will be replaced by `delta.columnMapping.nested.ids` (which kernel
+    // uses everywhere). Kept here for protocol compatibility only.
+    // Tracking issue: <https://github.com/delta-io/delta/issues/6688>
+    #[strum(serialize = "parquet.field.nested.ids")]
     ParquetFieldNestedIds,
+    #[strum(serialize = "delta.generationExpression")]
     GenerationExpression,
+    #[strum(serialize = "CURRENT_DEFAULT")]
     CurrentDefault,
+    #[strum(serialize = "delta.identity.start")]
     IdentityStart,
+    #[strum(serialize = "delta.identity.step")]
     IdentityStep,
+    #[strum(serialize = "delta.identity.highWaterMark")]
     IdentityHighWaterMark,
+    #[strum(serialize = "delta.identity.allowExplicitInsert")]
     IdentityAllowExplicitInsert,
+    #[strum(serialize = "delta.isInternalColumn")]
     InternalColumn,
+    #[strum(serialize = "delta.invariants")]
     Invariants,
+    #[strum(serialize = "delta.metadataSpec")]
     MetadataSpec,
+    #[strum(serialize = "delta.typeChanges")]
     TypeChanges,
-}
-
-impl AsRef<str> for ColumnMetadataKey {
-    fn as_ref(&self) -> &str {
-        match self {
-            Self::ColumnMappingId => "delta.columnMapping.id",
-            Self::ColumnMappingPhysicalName => "delta.columnMapping.physicalName",
-            Self::ColumnMappingNestedIds => "delta.columnMapping.nested.ids",
-            // "parquet.field.id" is not defined by the Delta protocol, but follows the convention
-            // established by delta-spark and other Delta ecosystem implementations for storing
-            // Parquet field IDs in StructField metadata.
-            Self::ParquetFieldId => "parquet.field.id",
-            // The Delta protocol defines this key for IcebergCompatV2/V3 nested field ids. It is
-            // legacy and will be replaced by `delta.columnMapping.nested.ids` (which kernel
-            // uses everywhere). Kept here for protocol compatibility only.
-            // Tracking issue: <https://github.com/delta-io/delta/issues/6688>
-            Self::ParquetFieldNestedIds => "parquet.field.nested.ids",
-            Self::GenerationExpression => "delta.generationExpression",
-            Self::CurrentDefault => "CURRENT_DEFAULT",
-            Self::IdentityAllowExplicitInsert => "delta.identity.allowExplicitInsert",
-            Self::IdentityHighWaterMark => "delta.identity.highWaterMark",
-            Self::IdentityStart => "delta.identity.start",
-            Self::IdentityStep => "delta.identity.step",
-            Self::InternalColumn => "delta.isInternalColumn",
-            Self::Invariants => "delta.invariants",
-            Self::MetadataSpec => "delta.metadataSpec",
-            Self::TypeChanges => "delta.typeChanges",
-        }
-    }
 }
 
 /// Enumeration of metadata columns recognized by Delta Kernel.
@@ -367,15 +353,17 @@ impl MetadataColumnSpec {
 }
 
 impl FromStr for MetadataColumnSpec {
-    type Err = Error;
+    type Err = KernelError;
 
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
+    fn from_str(s: &str) -> KernelResult<Self> {
         match s {
             "row_index" => Ok(Self::RowIndex),
             "row_id" => Ok(Self::RowId),
             "row_commit_version" => Ok(Self::RowCommitVersion),
             "_file" => Ok(Self::FilePath),
-            _ => Err(Error::Schema(format!("Unknown metadata column spec: {s}"))),
+            _ => Err(KernelError::Schema(format!(
+                "Unknown metadata column spec: {s}"
+            ))),
         }
     }
 }
@@ -390,7 +378,7 @@ pub struct StructField {
     /// Denotes whether this Field can be null
     pub nullable: bool,
     /// A JSON map containing information about this column
-    pub metadata: HashMap<String, MetadataValue>,
+    pub metadata: HashMap<MetadataKey, MetadataValue>,
 }
 
 /// Parsed (and validated) pre-existing column-mapping annotations on a single field, as
@@ -440,7 +428,7 @@ impl StructField {
     pub fn create_metadata_column(name: impl Into<String>, spec: MetadataColumnSpec) -> Self {
         let mut metadata = HashMap::new();
         metadata.insert(
-            ColumnMetadataKey::MetadataSpec.as_ref().to_string(),
+            ColumnMetadataKey::MetadataSpec.as_ref().into(),
             MetadataValue::String(spec.text_value().to_string()),
         );
 
@@ -470,7 +458,7 @@ impl StructField {
     /// Replaces `self.metadata` with the list of <key, value> pairs in `metadata`.
     pub fn with_metadata(
         mut self,
-        metadata: impl IntoIterator<Item = (impl Into<String>, impl Into<MetadataValue>)>,
+        metadata: impl IntoIterator<Item = (impl Into<MetadataKey>, impl Into<MetadataValue>)>,
     ) -> Self {
         self.metadata = metadata
             .into_iter()
@@ -482,7 +470,7 @@ impl StructField {
     /// Extends `self.metadata` to include the <key, value> pairs in `metadata`.
     pub fn add_metadata(
         mut self,
-        metadata: impl IntoIterator<Item = (impl Into<String>, impl Into<MetadataValue>)>,
+        metadata: impl IntoIterator<Item = (impl Into<MetadataKey>, impl Into<MetadataValue>)>,
     ) -> Self {
         self.metadata
             .extend(metadata.into_iter().map(|(k, v)| (k.into(), v.into())));
@@ -529,6 +517,27 @@ impl StructField {
         self.metadata.get(key.as_ref())
     }
 
+    /// Returns this field's `key` metadata as a string, or `None` when the field has no such
+    /// metadata.
+    ///
+    /// # Errors
+    ///
+    /// Returns a schema error if the metadata is present but not a [`MetadataValue::String`].
+    pub(crate) fn get_string_config_value(
+        &self,
+        key: &ColumnMetadataKey,
+    ) -> KernelResult<Option<&str>> {
+        match self.get_config_value(key) {
+            None => Ok(None),
+            Some(MetadataValue::String(value)) => Ok(Some(value)),
+            Some(other) => Err(KernelError::schema(format!(
+                "Field '{}' has a non-string `{}` annotation: {other}",
+                self.name,
+                key.as_ref(),
+            ))),
+        }
+    }
+
     /// Returns this field's `delta.columnMapping.id` annotation if present and well-formed.
     /// Returns `None` if the annotation is missing or carries a non-numeric value.
     pub fn column_mapping_id(&self) -> Option<i64> {
@@ -546,19 +555,12 @@ impl StructField {
     /// - `Err(_)` -- either not a [`MetadataValue::String`] (corrupt: the protocol defines
     ///   `CURRENT_DEFAULT` as a SQL string, the only form the kernel writes), or rejected by
     ///   [`ColumnDefault`] (a non-NULL default on a Variant column, which the protocol forbids).
-    pub fn column_default(&self) -> DeltaResult<Option<ColumnDefault<'_>>> {
-        let raw_sql = match self.get_config_value(&ColumnMetadataKey::CurrentDefault) {
-            None => return Ok(None),
-            Some(MetadataValue::String(s)) => s.clone(),
-            Some(other) => {
-                return Err(Error::schema(format!(
-                    "Field '{}' has a non-string `{}` annotation: {other}",
-                    self.name,
-                    ColumnMetadataKey::CurrentDefault.as_ref(),
-                )))
-            }
+    pub fn column_default(&self) -> KernelResult<Option<ColumnDefault<'_>>> {
+        let Some(raw_sql) = self.get_string_config_value(&ColumnMetadataKey::CurrentDefault)?
+        else {
+            return Ok(None);
         };
-        ColumnDefault::new(raw_sql, &self.data_type).map(Some)
+        ColumnDefault::new(raw_sql.to_string(), &self.data_type).map(Some)
     }
 
     /// Validates and extracts pre-existing column-mapping annotations on this field, returning
@@ -583,16 +585,16 @@ impl StructField {
     /// error).
     pub(crate) fn validate_and_extract_existing_column_mapping_annotations(
         &self,
-    ) -> DeltaResult<ExistingColumnMappingAnnotations<'_>> {
+    ) -> KernelResult<ExistingColumnMappingAnnotations<'_>> {
         let id = match self.get_config_value(&ColumnMetadataKey::ColumnMappingId) {
             Some(MetadataValue::Number(n)) => {
                 validate_column_mapping_id(*n)
-                    .map_err(|e| Error::schema(format!("Field '{}': {e}", self.name)))?;
+                    .map_err(|e| KernelError::schema(format!("Field '{}': {e}", self.name)))?;
                 Some(*n)
             }
             None => None,
             Some(_) => {
-                return Err(Error::schema(format!(
+                return Err(KernelError::schema(format!(
                     "Field '{}' has a non-numeric `{}` annotation",
                     self.name,
                     ColumnMetadataKey::ColumnMappingId.as_ref(),
@@ -602,7 +604,7 @@ impl StructField {
         let physical_name =
             match self.get_config_value(&ColumnMetadataKey::ColumnMappingPhysicalName) {
                 Some(MetadataValue::String(s)) if s.is_empty() => {
-                    return Err(Error::schema(format!(
+                    return Err(KernelError::schema(format!(
                         "Field '{}' has an empty `{}` annotation",
                         self.name,
                         ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
@@ -611,7 +613,7 @@ impl StructField {
                 Some(MetadataValue::String(s)) => Some(s.as_str()),
                 None => None,
                 Some(_) => {
-                    return Err(Error::schema(format!(
+                    return Err(KernelError::schema(format!(
                         "Field '{}' has a non-string `{}` annotation",
                         self.name,
                         ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
@@ -714,7 +716,7 @@ impl StructField {
     }
 
     #[inline]
-    pub const fn metadata(&self) -> &HashMap<String, MetadataValue> {
+    pub const fn metadata(&self) -> &HashMap<MetadataKey, MetadataValue> {
         &self.metadata
     }
 
@@ -732,6 +734,9 @@ impl StructField {
     /// `Id` or `Name`, this is specified in [`ColumnMetadataKey::ColumnMappingPhysicalName`].
     /// Otherwise, the field's logical name is used.
     ///
+    /// Collation annotation paths use the physical field name as their owning-field prefix.
+    /// The logical field's annotations are unchanged.
+    ///
     /// Returns an error if a field has invalid or inconsistent column mapping annotations (e.g.
     /// missing or wrong-typed when column mapping is enabled), or if a metadata column is
     /// encountered (metadata columns should not participate in column mapping). When column
@@ -744,7 +749,7 @@ impl StructField {
     pub(crate) fn make_physical(
         &self,
         column_mapping_mode: ColumnMappingMode,
-    ) -> DeltaResult<Self> {
+    ) -> KernelResult<Self> {
         MakePhysical::new(column_mapping_mode)
             .transform_struct_field(self)
             .map(|f| f.into_owned())
@@ -753,6 +758,12 @@ impl StructField {
     pub(crate) fn has_invariants(&self) -> bool {
         self.metadata
             .contains_key(ColumnMetadataKey::Invariants.as_ref())
+    }
+
+    /// Returns whether this field carries `__COLLATIONS` metadata.
+    pub(crate) fn has_collations(&self) -> bool {
+        self.metadata
+            .contains_key(ColumnMetadataKey::Collations.as_ref())
     }
 
     /// Converts logical schema StructField metadata to physical schema metadata
@@ -766,7 +777,7 @@ impl StructField {
     fn logical_to_physical_metadata(
         &self,
         column_mapping_mode: ColumnMappingMode,
-    ) -> HashMap<String, MetadataValue> {
+    ) -> HashMap<MetadataKey, MetadataValue> {
         let mut base_metadata = self.metadata.clone();
         let physical_name_key = ColumnMetadataKey::ColumnMappingPhysicalName.as_ref();
         let field_id_key = ColumnMetadataKey::ColumnMappingId.as_ref();
@@ -777,15 +788,15 @@ impl StructField {
                 let Some(MetadataValue::Number(fid)) = field_id else {
                     // `validate_and_extract_column_mapping_annotations` should have verified that
                     // this has a field Id
-                    warn!("StructField with name {} is missing field id in the Id column mapping mode", self.name());
+                    warn!(
+                        "StructField with name {} is missing field id in the Id column mapping mode",
+                        self.name()
+                    );
                     debug_assert!(false);
                     return base_metadata;
                 };
                 // Insert the parquet field id matching the column mapping id
-                base_metadata.insert(
-                    parquet_field_id_key.to_string(),
-                    MetadataValue::Number(*fid),
-                );
+                base_metadata.insert(parquet_field_id_key.into(), MetadataValue::Number(*fid));
                 // Ensure that physical name is present
                 debug_assert!(base_metadata.contains_key(physical_name_key));
             }
@@ -798,14 +809,14 @@ impl StructField {
                 // Parquet files carry field IDs in Name mode as well (matching
                 // the Delta protocol requirement and Delta Spark behaviour).
                 let Some(MetadataValue::Number(fid)) = field_id else {
-                    warn!("StructField with name {} is missing field id in the Name column mapping mode", self.name());
+                    warn!(
+                        "StructField with name {} is missing field id in the Name column mapping mode",
+                        self.name()
+                    );
                     debug_assert!(false);
                     return base_metadata;
                 };
-                base_metadata.insert(
-                    parquet_field_id_key.to_string(),
-                    MetadataValue::Number(*fid),
-                );
+                base_metadata.insert(parquet_field_id_key.into(), MetadataValue::Number(*fid));
                 // TODO(#1070): Remove nested column ids when they are supported in kernel
             }
             ColumnMappingMode::None => {
@@ -814,6 +825,11 @@ impl StructField {
                 base_metadata.remove(parquet_field_id_key);
                 // TODO(#1070): Remove nested column ids when they are supported in kernel
             }
+        }
+        // Keep collation paths rooted at the physical field name, as required by the protocol.
+        let physical_name = self.physical_name(column_mapping_mode);
+        if let Some(annotation) = base_metadata.get_mut(ColumnMetadataKey::Collations.as_ref()) {
+            rewrite_collation_field_prefix(annotation, self.name(), physical_name);
         }
         base_metadata
     }
@@ -883,7 +899,7 @@ impl StructTypeBuilder {
         self
     }
 
-    pub fn build(self) -> DeltaResult<StructType> {
+    pub fn build(self) -> KernelResult<StructType> {
         StructType::try_new(self.fields.into_values())
     }
 
@@ -900,7 +916,7 @@ impl StructType {
     ///   case-insensitive per the protocol)
     /// - the schema contains duplicate metadata columns
     /// - the schema contains nested metadata columns
-    pub fn try_new(fields: impl IntoIterator<Item = StructField>) -> DeltaResult<Self> {
+    pub fn try_new(fields: impl IntoIterator<Item = StructField>) -> KernelResult<Self> {
         let mut field_map = IndexMap::new();
         let mut metadata_columns = HashMap::new();
         let mut seen_lowercase_names = HashSet::new();
@@ -913,19 +929,19 @@ impl StructType {
             }
 
             // Check for duplicate metadata columns
-            if let Some(metadata_column_spec) = field.get_metadata_column_spec() {
-                if metadata_columns.insert(metadata_column_spec, i).is_some() {
-                    return Err(Error::schema(format!(
-                        "Duplicate metadata column: {metadata_column_spec:?}",
-                    )));
-                }
+            if let Some(metadata_column_spec) = field.get_metadata_column_spec()
+                && metadata_columns.insert(metadata_column_spec, i).is_some()
+            {
+                return Err(KernelError::schema(format!(
+                    "Duplicate metadata column: {metadata_column_spec:?}",
+                )));
             }
 
             // Delta column names are case-insensitive; reject schemas with duplicates that differ
             // only by case.
             let key = field.name.to_lowercase();
             if !seen_lowercase_names.insert(key) {
-                return Err(Error::schema(format!(
+                return Err(KernelError::schema(format!(
                     "Duplicate field name (case-insensitive): '{}'",
                     field.name
                 )));
@@ -945,9 +961,9 @@ impl StructType {
     ///
     /// This constructor collects all fields from the iterator, returning the first error
     /// encountered, or a new [`StructType`] if all fields are successfully collected and validated.
-    pub fn try_from_results<E: Into<Error>>(
-        fields: impl IntoIterator<Item = Result<StructField, E>>,
-    ) -> DeltaResult<Self> {
+    pub fn try_from_results<E: Into<KernelError>>(
+        fields: impl IntoIterator<Item = KernelResult<StructField, E>>,
+    ) -> KernelResult<Self> {
         fields
             .into_iter()
             .map(|result| result.map_err(Into::into))
@@ -984,12 +1000,12 @@ impl StructType {
     /// Gets a [`StructType`] containing [`StructField`]s of the given names. The order of fields in
     /// the returned schema will match the order passed to this function, which can be different
     /// from this order in this schema. Returns an Err if a specified field doesn't exist.
-    pub fn project_as_struct(&self, names: &[impl AsRef<str>]) -> DeltaResult<StructType> {
+    pub fn project_as_struct(&self, names: &[impl AsRef<str>]) -> KernelResult<StructType> {
         let fields = names.iter().map(|name| {
             self.fields
                 .get(name.as_ref())
                 .cloned()
-                .ok_or_else(|| Error::missing_column(name.as_ref()))
+                .ok_or_else(|| KernelError::missing_column(name.as_ref()))
         });
         Self::try_from_results(fields)
     }
@@ -997,13 +1013,13 @@ impl StructType {
     /// Gets a [`SchemaRef`] containing [`StructField`]s of the given names. The order of fields in
     /// the returned schema will match the order passed to this function, which can be different
     /// from this order in this schema. Returns an Err if a specified field doesn't exist.
-    pub fn project(&self, names: &[impl AsRef<str>]) -> DeltaResult<SchemaRef> {
+    pub fn project(&self, names: &[impl AsRef<str>]) -> KernelResult<SchemaRef> {
         let struct_type = self.project_as_struct(names)?;
         Ok(Arc::new(struct_type))
     }
 
     /// Adds fields to this [`StructType`], returning a new [`StructType`].
-    pub fn add(&self, fields: impl IntoIterator<Item = StructField>) -> DeltaResult<Self> {
+    pub fn add(&self, fields: impl IntoIterator<Item = StructField>) -> KernelResult<Self> {
         Self::try_new(self.fields.values().cloned().chain(fields))
     }
 
@@ -1012,7 +1028,7 @@ impl StructType {
         &self,
         name: impl Into<String>,
         spec: MetadataColumnSpec,
-    ) -> DeltaResult<Self> {
+    ) -> KernelResult<Self> {
         self.add([StructField::create_metadata_column(name, spec)])
     }
 
@@ -1045,10 +1061,10 @@ impl StructType {
     ///
     /// Returns an error if the path is empty, a field is not found, or an intermediate field is not
     /// a struct type.
-    pub fn field_at<'a>(&'a self, col: &ColumnName) -> DeltaResult<&'a StructField> {
+    pub fn field_at<'a>(&'a self, col: &ColumnName) -> KernelResult<&'a StructField> {
         let mut field = None;
         self.visit_fields_of_path(col, |f| field = Some(f))?;
-        field.ok_or_else(|| Error::generic("Empty path"))
+        field.ok_or_else(|| KernelError::generic("Empty path"))
     }
 
     /// Checks whether this schema contains the field at the given column path.
@@ -1066,7 +1082,7 @@ impl StructType {
         &'a self,
         col: &ColumnName,
         visit_field: impl FnMut(&'a StructField),
-    ) -> DeltaResult<()> {
+    ) -> KernelResult<()> {
         self.visit_fields_of_path_by(col, |s, name| s.field(name), visit_field)
     }
 
@@ -1082,7 +1098,7 @@ impl StructType {
     pub(crate) fn fields_of_path<'a>(
         &'a self,
         col: &ColumnName,
-    ) -> DeltaResult<Vec<&'a StructField>> {
+    ) -> KernelResult<Vec<&'a StructField>> {
         let mut result = Vec::with_capacity(col.path().len());
         self.visit_fields_of_path(col, |f| result.push(f))?;
         Ok(result)
@@ -1097,25 +1113,25 @@ impl StructType {
         col: &ColumnName,
         find_field: F,
         mut visit_field: impl FnMut(&'a StructField),
-    ) -> DeltaResult<()>
+    ) -> KernelResult<()>
     where
         F: for<'b> Fn(&'b StructType, &str) -> Option<&'b StructField>,
     {
         let path = col.path();
         if path.is_empty() {
-            return Err(Error::generic("Column path cannot be empty"));
+            return Err(KernelError::generic("Column path cannot be empty"));
         }
         let mut current_struct = self;
         for (i, field_name) in path.iter().enumerate() {
             let field = find_field(current_struct, field_name).ok_or_else(|| {
-                Error::generic(format!(
+                KernelError::generic(format!(
                     "Could not resolve column '{col}': field '{field_name}' not found in schema"
                 ))
             })?;
             visit_field(field);
             if i < path.len() - 1 {
                 let DataType::Struct(inner) = field.data_type() else {
-                    return Err(Error::generic(format!(
+                    return Err(KernelError::generic(format!(
                         "Cannot resolve column '{col}': intermediate field '{field_name}' \
                          is not a struct type"
                     )));
@@ -1153,6 +1169,7 @@ impl StructType {
     }
 
     /// Gets a mutable reference to the underlying field map.
+    #[internal_api]
     pub(crate) fn field_map_mut(&mut self) -> &mut IndexMap<String, StructField> {
         &mut self.fields
     }
@@ -1275,7 +1292,7 @@ impl StructType {
     pub(crate) fn make_physical(
         &self,
         column_mapping_mode: ColumnMappingMode,
-    ) -> DeltaResult<Self> {
+    ) -> KernelResult<Self> {
         let mut transformer = MakePhysical::new(column_mapping_mode);
         transformer.transform_struct(self).map(|s| s.into_owned())
     }
@@ -1283,7 +1300,7 @@ impl StructType {
     /// Validates that there are no metadata columns in the given fields.
     pub(crate) fn ensure_no_metadata_columns(
         fields: &mut dyn Iterator<Item = &StructField>,
-    ) -> DeltaResult<()> {
+    ) -> KernelResult<()> {
         for field in fields {
             Self::ensure_no_metadata_columns_in_field(field)?;
         }
@@ -1291,9 +1308,9 @@ impl StructType {
     }
 
     /// Validates that there are no metadata columns in the given field.
-    pub(crate) fn ensure_no_metadata_columns_in_field(field: &StructField) -> DeltaResult<()> {
+    pub(crate) fn ensure_no_metadata_columns_in_field(field: &StructField) -> KernelResult<()> {
         if field.is_metadata_column() {
-            return Err(Error::schema(
+            return Err(KernelError::schema(
                 "Metadata columns are only allowed at the top level of a schema".to_string(),
             ));
         }
@@ -1318,9 +1335,11 @@ impl StructType {
                     Self::ensure_no_metadata_columns(&mut struct_type.fields())?;
                 }
             }
-            // Primitive types cannot contain nested metadata columns and variant types are
-            // validated at creation
-            DataType::Primitive(_) | DataType::Variant(_) => {}
+            // Primitive types cannot contain nested metadata columns, and variant and file types
+            // are validated at creation
+            DataType::Primitive(_) | DataType::Variant(_) | DataType::File(_) => {}
+            #[cfg(feature = "udt-in-dev")]
+            DataType::UserDefined(_) => {}
         };
 
         Ok(())
@@ -1331,7 +1350,7 @@ impl StructType {
     pub fn with_fields_filtered(
         &self,
         predicate: impl Fn(&StructField) -> bool,
-    ) -> DeltaResult<Self> {
+    ) -> KernelResult<Self> {
         Self::try_new(self.fields().filter(|f| predicate(f)).cloned())
     }
 
@@ -1343,7 +1362,7 @@ impl StructType {
     pub fn with_fields_filtered_nonempty(
         &self,
         predicate: impl Fn(&StructField) -> bool,
-    ) -> DeltaResult<Option<Self>> {
+    ) -> KernelResult<Option<Self>> {
         let filtered = self.with_fields_filtered(predicate)?;
         if filtered.num_fields() == 0 {
             Ok(None)
@@ -1430,7 +1449,7 @@ impl<'a> IntoIterator for &'a StructType {
 /// # Examples
 ///
 /// ```
-/// # use delta_kernel::Error;
+/// # use delta_kernel::KernelError;
 /// use delta_kernel::schema::{StructType, StructField, DataType};
 ///
 /// let fields = vec![
@@ -1443,7 +1462,7 @@ impl<'a> IntoIterator for &'a StructType {
 /// for field in struct_type {
 ///     println!("Field: {} ({})", field.name(), field.data_type());
 /// }
-/// # Ok::<(), Error>(())
+/// # Ok::<(), KernelError>(())
 /// ```
 ///
 /// [`IndexMap`]: indexmap::IndexMap
@@ -1503,7 +1522,7 @@ impl DoubleEndedIterator for StructFieldIntoIter {
 /// # Examples
 ///
 /// ```
-/// # use delta_kernel::Error;
+/// # use delta_kernel::KernelError;
 /// use delta_kernel::schema::{StructType, StructField, DataType};
 ///
 /// let fields = vec![
@@ -1524,7 +1543,7 @@ impl DoubleEndedIterator for StructFieldIntoIter {
 /// for field in struct_type.fields() {
 ///     println!("Field type: {}", field.data_type());
 /// }
-/// # Ok::<(), Error>(())
+/// # Ok::<(), KernelError>(())
 /// ```
 ///
 /// [`StructType::fields()`]: StructType::fields
@@ -1560,13 +1579,13 @@ impl DoubleEndedIterator for StructFieldRefIter<'_> {
     }
 }
 
-struct InvariantChecker;
+struct FieldMetadataKeyChecker(ColumnMetadataKey);
 
-impl<'a> SchemaTransform<'a> for InvariantChecker {
-    transform_output_type!(|'a, T| Result<(), ()>);
+impl<'a> SchemaTransform<'a> for FieldMetadataKeyChecker {
+    transform_output_type!(|'a, T| KernelResult<(), ()>);
 
-    fn transform_struct_field(&mut self, field: &'a StructField) -> Result<(), ()> {
-        if field.has_invariants() {
+    fn transform_struct_field(&mut self, field: &'a StructField) -> KernelResult<(), ()> {
+        if field.metadata.contains_key(self.0.as_ref()) {
             Err(())
         } else {
             self.recurse_into_struct_field(field)
@@ -1579,7 +1598,9 @@ impl<'a> SchemaTransform<'a> for InvariantChecker {
 /// This traverses the entire schema to check for the presence of the `delta.invariants`
 /// metadata key.
 pub(crate) fn schema_has_invariants(schema: &Schema) -> bool {
-    InvariantChecker.transform_struct(schema).is_err()
+    FieldMetadataKeyChecker(ColumnMetadataKey::Invariants)
+        .transform_struct(schema)
+        .is_err()
 }
 
 /// Visitor that reports whether any non-null (`nullable: false`) field exists in a schema.
@@ -1587,16 +1608,16 @@ pub(crate) fn schema_has_invariants(schema: &Schema) -> bool {
 struct NonNullFieldChecker;
 
 impl<'a> SchemaTransform<'a> for NonNullFieldChecker {
-    transform_output_type!(|'a, T| Result<(), ()>);
+    transform_output_type!(|'a, T| KernelResult<(), ()>);
 
     /// Skip recursion into variant internals. The `metadata` and `value` fields inside a
     /// `Variant` are protocol-defined, always non-null, and not user-controlled, so they
     /// must not be treated as user-declared non-null columns.
-    fn transform_variant(&mut self, _stype: &'a StructType) -> Result<(), ()> {
+    fn transform_variant(&mut self, _stype: &'a StructType) -> KernelResult<(), ()> {
         Ok(())
     }
 
-    fn transform_struct_field(&mut self, field: &'a StructField) -> Result<(), ()> {
+    fn transform_struct_field(&mut self, field: &'a StructField) -> KernelResult<(), ()> {
         if !field.is_nullable() {
             return Err(());
         }
@@ -1660,18 +1681,12 @@ pub(crate) fn normalize_column_names_to_schema_casing(
 
 /// Helper for RowVisitor implementations
 #[internal_api]
-#[derive(Clone, Default)]
+#[derive(Clone, Default, From)]
 pub(crate) struct ColumnNamesAndTypes(Vec<ColumnName>, Vec<DataType>);
 impl ColumnNamesAndTypes {
     #[internal_api]
     pub(crate) fn as_ref(&self) -> (&[ColumnName], &[DataType]) {
         (&self.0, &self.1)
-    }
-}
-
-impl From<(Vec<ColumnName>, Vec<DataType>)> for ColumnNamesAndTypes {
-    fn from((names, fields): (Vec<ColumnName>, Vec<DataType>)) -> Self {
-        ColumnNamesAndTypes(names, fields)
     }
 }
 
@@ -1684,7 +1699,7 @@ struct StructTypeSerDeHelper {
 }
 
 impl Serialize for StructType {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    fn serialize<S>(&self, serializer: S) -> KernelResult<S::Ok, S::Error>
     where
         S: serde::Serializer,
     {
@@ -1697,7 +1712,7 @@ impl Serialize for StructType {
 }
 
 impl<'de> Deserialize<'de> for StructType {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    fn deserialize<D>(deserializer: D) -> KernelResult<Self, D::Error>
     where
         D: serde::Deserializer<'de>,
         Self: Sized,
@@ -1800,33 +1815,33 @@ fn default_true() -> bool {
 /// colon, no comma, and no surrounding whitespace. Validating the value against the full set of
 /// recognized CRSes is future work.
 #[cfg(feature = "geo-type-in-dev")]
-fn validate_crs(crs: &str) -> DeltaResult<()> {
+fn validate_crs(crs: &str) -> KernelResult<()> {
     require!(
         crs == crs.trim(),
-        Error::invalid_geo_params(format!(
+        KernelError::invalid_geo_params(format!(
             "CRS '{crs}' must not have leading or trailing whitespace"
         ))
     );
     require!(
         !crs.contains(','),
-        Error::invalid_geo_params(format!("CRS '{crs}' must not contain a comma"))
+        KernelError::invalid_geo_params(format!("CRS '{crs}' must not contain a comma"))
     );
 
     let [authority, code] = crs.split(':').collect::<Vec<_>>()[..] else {
-        return Err(Error::invalid_geo_params(format!(
+        return Err(KernelError::invalid_geo_params(format!(
             "CRS '{crs}' must be in 'AUTHORITY:CODE' format"
         )));
     };
 
     require!(
         !authority.is_empty(),
-        Error::invalid_geo_params(format!(
+        KernelError::invalid_geo_params(format!(
             "CRS '{crs}' must have an authority before the colon"
         ))
     );
     require!(
         !code.is_empty(),
-        Error::invalid_geo_params(format!("CRS '{crs}' must have a code after the colon"))
+        KernelError::invalid_geo_params(format!("CRS '{crs}' must have a code after the colon"))
     );
     Ok(())
 }
@@ -1870,7 +1885,7 @@ pub struct GeometryType {
 impl GeometryType {
     /// Constructs a GeometryType from the given CRS, or returns an error if the CRS is
     /// not in AUTHORITY:CODE form.
-    pub fn try_new(crs: &str) -> DeltaResult<Self> {
+    pub fn try_new(crs: &str) -> KernelResult<Self> {
         validate_crs(crs)?;
         Ok(Self {
             crs: crs.to_string(),
@@ -1903,7 +1918,7 @@ pub struct GeographyType {
 impl GeographyType {
     /// Constructs a GeographyType from the given CRS and edge interpolation algorithm, or
     /// returns an error if the CRS is not in AUTHORITY:CODE form.
-    pub fn try_new(crs: &str, algorithm: EdgeInterpolationAlgorithm) -> DeltaResult<Self> {
+    pub fn try_new(crs: &str, algorithm: EdgeInterpolationAlgorithm) -> KernelResult<Self> {
         validate_crs(crs)?;
         Ok(Self {
             crs: crs.to_string(),
@@ -1935,16 +1950,16 @@ pub struct DecimalType {
 
 impl DecimalType {
     /// Check if the given precision and scale are valid for a decimal type.
-    pub fn try_new(precision: u8, scale: u8) -> DeltaResult<Self> {
+    pub fn try_new(precision: u8, scale: u8) -> KernelResult<Self> {
         require!(
             0 < precision && precision <= 38,
-            Error::invalid_decimal(format!(
+            KernelError::invalid_decimal(format!(
                 "precision must be in range 1..38 inclusive, found: {precision}."
             ))
         );
         require!(
             scale <= precision,
-            Error::invalid_decimal(format!(
+            KernelError::invalid_decimal(format!(
                 "scale must be in range 0..{precision} inclusive, found: {scale}."
             ))
         );
@@ -1960,7 +1975,7 @@ impl DecimalType {
     }
 }
 
-#[derive(Debug, Serialize, PartialEq, Clone, Eq)]
+#[derive(Debug, Serialize, PartialEq, Clone, Eq, From)]
 #[serde(rename_all = "camelCase")]
 pub enum PrimitiveType {
     /// UTF-8 encoded string of characters
@@ -1986,39 +2001,44 @@ pub enum PrimitiveType {
     #[serde(rename = "timestamp_ntz")]
     TimestampNtz,
     Void,
-    /// Year-month interval: a signed count of months (ANSI `INTERVAL YEAR TO MONTH` and its
-    /// narrowed `YEAR` / `MONTH` spellings). The serde rename is the `schemaString` type-name
-    /// string -- spelled with spaces, unlike the single-word siblings, so the mapping is not
-    /// self-evident.
-    #[serde(rename = "interval year to month")]
-    IntervalYearMonth,
     /// Day-time interval: a signed count of microseconds (ANSI `INTERVAL DAY TO SECOND` and
-    /// its narrowed `DAY` / `HOUR` / `MINUTE` / `SECOND` spellings). As with the year-month
-    /// variant above, the serde rename is the multi-word `schemaString` type-name string.
+    /// its narrowed `DAY` / `HOUR` / `MINUTE` / `SECOND` spellings).
     #[serde(rename = "interval day to second")]
     IntervalDayTime,
+    #[from]
     #[serde(serialize_with = "serialize_decimal", untagged)]
     Decimal(DecimalType),
     /// Geometry column with an associated coordinate reference system (CRS).
     #[cfg(feature = "geo-type-in-dev")]
+    #[from(GeometryType)]
     #[serde(serialize_with = "serialize_geotype", untagged)]
     Geometry(Box<GeometryType>),
     /// Geography column with an associated CRS and edge interpolation algorithm.
     #[cfg(feature = "geo-type-in-dev")]
+    #[from(GeographyType)]
     #[serde(serialize_with = "serialize_geotype", untagged)]
     Geography(Box<GeographyType>),
+    /// Year-month interval: a signed count of months (ANSI `INTERVAL YEAR TO MONTH` and its
+    /// narrowed `YEAR` / `MONTH` spellings).
+    #[serde(serialize_with = "serialize_interval_year_month", untagged)]
+    IntervalYearMonth(IntervalYearToMonthType),
 }
 
 impl PrimitiveType {
-    pub fn decimal(precision: u8, scale: u8) -> DeltaResult<Self> {
+    pub fn decimal(precision: u8, scale: u8) -> KernelResult<Self> {
         Ok(DecimalType::try_new(precision, scale)?.into())
+    }
+
+    /// Constructs a year-month interval primitive with the given ANSI qualifier.
+    pub fn interval_year_month(ty: IntervalYearToMonthType) -> Self {
+        Self::IntervalYearMonth(ty)
     }
 
     /// Returns whether this is one of the ANSI interval primitive types.
     #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
     #[internal_api]
     pub(crate) fn is_interval(&self) -> bool {
-        matches!(self, Self::IntervalYearMonth | Self::IntervalDayTime)
+        matches!(self, Self::IntervalYearMonth(_) | Self::IntervalDayTime)
     }
 
     /// Returns `true` if this primitive type can be widened to the `target` type.
@@ -2048,27 +2068,34 @@ impl PrimitiveType {
         )
     }
 
-    /// Returns `true` if `self` is a physical integer type that some checkpoint writers
-    /// produce when they omit Parquet logical type annotations for date or timestamp columns.
+    /// Returns `true` if `self` can back `target` in the given checkpoint field.
     ///
     /// Specifically:
     /// - Integer -> Date (int32 stored without DATE annotation)
     /// - Long -> Timestamp/TimestampNtz (int64 stored without TIMESTAMP annotation)
+    /// - Binary -> Geometry (statistics only; the engine validates and decodes the WKB bounds)
     ///
     /// These are **not** Delta protocol type widening rules and must not be used outside of
     /// checkpoint compatibility checks.
     ///
-    /// NOTE: The Arrow-level equivalent lives in `check_cast_compat` in
-    /// `engine/ensure_data_types.rs`. Changes here must be mirrored there.
-    pub(crate) fn is_checkpoint_cast_compatible(&self, target: &Self) -> bool {
-        matches!(
-            (self, target),
-            (Self::Integer, Self::Date) | (Self::Long, Self::Timestamp | Self::TimestampNtz)
-        )
+    /// The date/timestamp rules must match `check_cast_compat` in `engine/ensure_data_types.rs`.
+    /// Geometry decoding and its in-memory representation remain engine-specific.
+    pub(crate) fn is_checkpoint_cast_compatible(
+        &self,
+        target: &Self,
+        kind: CheckpointFieldKind,
+    ) -> bool {
+        match (self, target, kind) {
+            (Self::Integer, Self::Date, _)
+            | (Self::Long, Self::Timestamp | Self::TimestampNtz, _) => true,
+            #[cfg(feature = "geo-type-in-dev")]
+            (Self::Binary, Self::Geometry(_), CheckpointFieldKind::Stats) => true,
+            _ => false,
+        }
     }
 
     /// Returns `true` if this primitive type is compatible with `target` for reading
-    /// `stats_parsed` columns from checkpoint parquet files.
+    /// `stats_parsed` or `partitionValues_parsed` columns from checkpoint parquet files.
     ///
     /// This is a superset of [`can_widen_to`]: it includes all Delta protocol type widening
     /// rules plus physical Parquet encoding accommodations for checkpoint interop (see
@@ -2076,31 +2103,79 @@ impl PrimitiveType {
     ///
     /// [`can_widen_to`]: PrimitiveType::can_widen_to
     /// [`is_checkpoint_cast_compatible`]: PrimitiveType::is_checkpoint_cast_compatible
-    pub(crate) fn is_stats_type_compatible_with(&self, target: &Self) -> bool {
-        self == target || self.can_widen_to(target) || self.is_checkpoint_cast_compatible(target)
+    pub(crate) fn is_stats_type_compatible_with(
+        &self,
+        target: &Self,
+        kind: CheckpointFieldKind,
+    ) -> bool {
+        self == target
+            || self.can_widen_to(target)
+            || self.is_checkpoint_cast_compatible(target, kind)
     }
+}
+
+/// Selects the physical encoding rules for a parsed checkpoint field.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CheckpointFieldKind {
+    Stats,
+    PartitionValues,
 }
 
 fn serialize_decimal<S: serde::Serializer>(
     dtype: &DecimalType,
     serializer: S,
-) -> Result<S::Ok, S::Error> {
+) -> KernelResult<S::Ok, S::Error> {
     serializer.serialize_str(&format!("decimal({},{})", dtype.precision(), dtype.scale()))
+}
+
+/// The supported qualifiers for Delta's year-month interval family.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum IntervalYearToMonthType {
+    /// ANSI `INTERVAL YEAR`, stored as a signed count of months.
+    #[serde(rename = "interval year")]
+    IntervalYear,
+    /// ANSI `INTERVAL MONTH`, stored as a signed count of months.
+    #[serde(rename = "interval month")]
+    IntervalMonth,
+    /// ANSI `INTERVAL YEAR TO MONTH`, stored as a signed count of months.
+    #[serde(rename = "interval year to month")]
+    IntervalYearToMonth,
+}
+
+impl Display for IntervalYearToMonthType {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::IntervalYear => write!(f, "interval year"),
+            Self::IntervalMonth => write!(f, "interval month"),
+            Self::IntervalYearToMonth => write!(f, "interval year to month"),
+        }
+    }
+}
+
+fn serialize_interval_year_month<S: serde::Serializer>(
+    dtype: &IntervalYearToMonthType,
+    serializer: S,
+) -> KernelResult<S::Ok, S::Error> {
+    serializer.serialize_str(&dtype.to_string())
 }
 
 #[cfg(feature = "geo-type-in-dev")]
 fn serialize_geotype<T: std::fmt::Display, S: serde::Serializer>(
     value: &T,
     serializer: S,
-) -> Result<S::Ok, S::Error> {
+) -> KernelResult<S::Ok, S::Error> {
     serializer.serialize_str(&value.to_string())
 }
 
 fn serialize_variant<S: serde::Serializer>(
     _: &StructType,
     serializer: S,
-) -> Result<S::Ok, S::Error> {
+) -> KernelResult<S::Ok, S::Error> {
     serializer.serialize_str("variant")
+}
+
+fn serialize_file<S: serde::Serializer>(_: &StructType, serializer: S) -> Result<S::Ok, S::Error> {
+    serializer.serialize_str("file")
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2120,13 +2195,25 @@ pub(crate) struct IntervalFieldRange {
 }
 
 impl IntervalFieldRange {
-    fn primitive_type(self) -> PrimitiveType {
-        match self.start {
-            IntervalField::Year | IntervalField::Month => PrimitiveType::IntervalYearMonth,
-            IntervalField::Day
-            | IntervalField::Hour
-            | IntervalField::Minute
-            | IntervalField::Second => PrimitiveType::IntervalDayTime,
+    fn primitive_type(self) -> Option<PrimitiveType> {
+        match (self.start, self.end) {
+            (IntervalField::Year, IntervalField::Year) => Some(PrimitiveType::IntervalYearMonth(
+                IntervalYearToMonthType::IntervalYear,
+            )),
+            (IntervalField::Month, IntervalField::Month) => Some(PrimitiveType::IntervalYearMonth(
+                IntervalYearToMonthType::IntervalMonth,
+            )),
+            (IntervalField::Year, IntervalField::Month) => Some(PrimitiveType::IntervalYearMonth(
+                IntervalYearToMonthType::IntervalYearToMonth,
+            )),
+            (
+                IntervalField::Day
+                | IntervalField::Hour
+                | IntervalField::Minute
+                | IntervalField::Second,
+                _,
+            ) => Some(PrimitiveType::IntervalDayTime),
+            _ => None,
         }
     }
 }
@@ -2154,14 +2241,14 @@ pub(crate) fn parse_interval_type(s: &str) -> Option<IntervalFieldRange> {
 }
 
 fn normalize_interval_type(s: &str) -> Option<PrimitiveType> {
-    parse_interval_type(s).map(IntervalFieldRange::primitive_type)
+    parse_interval_type(s).and_then(IntervalFieldRange::primitive_type)
 }
 
 // Custom Deserialize to provide clear error messages for unsupported types.
 // The derived impl would produce: "unknown variant `interval second`, expected one of ..."
 // This impl produces: "Unsupported Delta table type: 'interval second'"
 impl<'de> serde::Deserialize<'de> for PrimitiveType {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    fn deserialize<D>(deserializer: D) -> KernelResult<Self, D::Error>
     where
         D: serde::Deserializer<'de>,
     {
@@ -2262,7 +2349,7 @@ impl Display for PrimitiveType {
             PrimitiveType::Date => write!(f, "date"),
             PrimitiveType::Timestamp => write!(f, "timestamp"),
             PrimitiveType::TimestampNtz => write!(f, "timestamp_ntz"),
-            PrimitiveType::IntervalYearMonth => write!(f, "interval year to month"),
+            PrimitiveType::IntervalYearMonth(dtype) => write!(f, "{dtype}"),
             PrimitiveType::IntervalDayTime => write!(f, "interval day to second"),
             PrimitiveType::Decimal(dtype) => {
                 write!(f, "decimal({},{})", dtype.precision(), dtype.scale())
@@ -2276,51 +2363,45 @@ impl Display for PrimitiveType {
     }
 }
 
-#[derive(Debug, Serialize, PartialEq, Clone, Eq)]
+#[derive(Debug, Serialize, PartialEq, Clone, Eq, From)]
 #[serde(untagged, rename_all = "camelCase")]
 pub enum DataType {
     /// UTF-8 encoded string of characters
+    #[from(PrimitiveType, DecimalType)]
     Primitive(PrimitiveType),
     /// An array stores a variable length collection of items of some type.
+    #[from(ArrayType)]
     Array(Box<ArrayType>),
     /// A struct is used to represent both the top-level schema of the table as well
     /// as struct columns that contain nested columns.
+    #[from(StructType)]
     Struct(Box<StructType>),
     /// A map stores an arbitrary length collection of key-value pairs
     /// with a single keyType and a single valueType
+    #[from(MapType)]
     Map(Box<MapType>),
     /// The Variant data type. The physical representation can be flexible to support shredded
     /// reads. The unshredded schema is `Variant(StructType<metadata: BINARY, value: BINARY>)`.
     #[serde(serialize_with = "serialize_variant")]
     Variant(Box<StructType>),
+    /// An engine annotation over a physical Delta type.
+    /// Retains logical type information in schemas; physical operations use the enclosed
+    /// `sql_type`. See [`UserDefinedType`] for a schema example.
+    #[cfg(feature = "udt-in-dev")]
+    #[from(UserDefinedType)]
+    UserDefined(UserDefinedType),
+    /// The File data type. A reference to a range of bytes located inline or in an external file.
+    /// Physically a group of six optional fields: `uri`, `offset`, `size`, `content_type`,
+    /// `checksum`, and `inline`. Like Variant, the type identity is carried in the Delta schema;
+    /// the physical representation is a plain struct.
+    #[serde(serialize_with = "serialize_file")]
+    File(Box<StructType>),
 }
 
-impl From<DecimalType> for PrimitiveType {
-    fn from(dtype: DecimalType) -> Self {
-        PrimitiveType::Decimal(dtype)
-    }
-}
-impl From<DecimalType> for DataType {
-    fn from(dtype: DecimalType) -> Self {
-        PrimitiveType::from(dtype).into()
-    }
-}
-#[cfg(feature = "geo-type-in-dev")]
-impl From<GeometryType> for PrimitiveType {
-    fn from(gtype: GeometryType) -> Self {
-        PrimitiveType::Geometry(Box::new(gtype))
-    }
-}
 #[cfg(feature = "geo-type-in-dev")]
 impl From<GeometryType> for DataType {
     fn from(gtype: GeometryType) -> Self {
         PrimitiveType::from(gtype).into()
-    }
-}
-#[cfg(feature = "geo-type-in-dev")]
-impl From<GeographyType> for PrimitiveType {
-    fn from(gtype: GeographyType) -> Self {
-        PrimitiveType::Geography(Box::new(gtype))
     }
 }
 #[cfg(feature = "geo-type-in-dev")]
@@ -2329,29 +2410,6 @@ impl From<GeographyType> for DataType {
         PrimitiveType::from(gtype).into()
     }
 }
-impl From<PrimitiveType> for DataType {
-    fn from(ptype: PrimitiveType) -> Self {
-        DataType::Primitive(ptype)
-    }
-}
-impl From<MapType> for DataType {
-    fn from(map_type: MapType) -> Self {
-        DataType::Map(Box::new(map_type))
-    }
-}
-
-impl From<StructType> for DataType {
-    fn from(struct_type: StructType) -> Self {
-        DataType::Struct(Box::new(struct_type))
-    }
-}
-
-impl From<ArrayType> for DataType {
-    fn from(array_type: ArrayType) -> Self {
-        DataType::Array(Box::new(array_type))
-    }
-}
-
 impl From<SchemaRef> for DataType {
     fn from(schema: SchemaRef) -> Self {
         Arc::unwrap_or_clone(schema).into()
@@ -2363,7 +2421,7 @@ impl From<SchemaRef> for DataType {
 // clear "Unsupported Delta table type: 'X'" message. We deserialize to Value first, then
 // dispatch based on structure (string -> Primitive/Variant, object -> Array/Struct/Map).
 impl<'de> serde::Deserialize<'de> for DataType {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    fn deserialize<D>(deserializer: D) -> KernelResult<Self, D::Error>
     where
         D: serde::Deserializer<'de>,
     {
@@ -2372,13 +2430,16 @@ impl<'de> serde::Deserialize<'de> for DataType {
 
         let value = Value::deserialize(deserializer)?;
 
-        // String values are either primitive types or "variant"
+        // String values are either primitive types, "variant" or "file"
         if let Value::String(s) = &value {
             if s == "variant" {
                 return match DataType::unshredded_variant() {
                     DataType::Variant(st) => Ok(DataType::Variant(st)),
                     _ => Err(Error::custom("Failed to create variant type")),
                 };
+            }
+            if s == "file" {
+                return Ok(DataType::file_type());
             }
 
             // Try PrimitiveType - this will give us good error messages for unsupported types
@@ -2388,21 +2449,25 @@ impl<'de> serde::Deserialize<'de> for DataType {
         }
 
         // Object values are complex types - dispatch based on "type" field
-        if let Value::Object(map) = &value {
-            if let Some(Value::String(type_str)) = map.get("type") {
-                return match type_str.as_str() {
-                    "array" => ArrayType::deserialize(value)
-                        .map(DataType::from)
-                        .map_err(|e| Error::custom(e.to_string())),
-                    "struct" => StructType::deserialize(value)
-                        .map(DataType::from)
-                        .map_err(|e| Error::custom(e.to_string())),
-                    "map" => MapType::deserialize(value)
-                        .map(DataType::from)
-                        .map_err(|e| Error::custom(e.to_string())),
-                    _ => Err(unsupported_delta_type_error(type_str)),
-                };
-            }
+        if let Value::Object(map) = &value
+            && let Some(Value::String(type_str)) = map.get("type")
+        {
+            return match type_str.as_str() {
+                "array" => ArrayType::deserialize(value)
+                    .map(DataType::from)
+                    .map_err(|e| Error::custom(e.to_string())),
+                "struct" => StructType::deserialize(value)
+                    .map(DataType::from)
+                    .map_err(|e| Error::custom(e.to_string())),
+                "map" => MapType::deserialize(value)
+                    .map(DataType::from)
+                    .map_err(|e| Error::custom(e.to_string())),
+                #[cfg(feature = "udt-in-dev")]
+                "udt" => UserDefinedType::deserialize(value)
+                    .map(DataType::UserDefined)
+                    .map_err(Error::custom),
+                _ => Err(unsupported_delta_type_error(type_str)),
+            };
         }
 
         // Fallback error with the actual value that failed
@@ -2414,6 +2479,18 @@ impl<'de> serde::Deserialize<'de> for DataType {
 }
 
 /// cbindgen:ignore
+/// The sub-fields of a [`DataType::File`], in the canonical order; see [`DataType::file_type`].
+pub(crate) static FILE_FIELDS: LazyLock<StructType> = LazyLock::new(|| {
+    StructType::new_unchecked([
+        StructField::nullable("uri", DataType::STRING),
+        StructField::nullable("offset", DataType::LONG),
+        StructField::nullable("size", DataType::LONG),
+        StructField::nullable("content_type", DataType::STRING),
+        StructField::nullable("checksum", DataType::STRING),
+        StructField::nullable("inline", DataType::BINARY),
+    ])
+});
+
 impl DataType {
     pub const STRING: Self = DataType::Primitive(PrimitiveType::String);
     pub const LONG: Self = DataType::Primitive(PrimitiveType::Long);
@@ -2428,8 +2505,57 @@ impl DataType {
     pub const TIMESTAMP: Self = DataType::Primitive(PrimitiveType::Timestamp);
     pub const TIMESTAMP_NTZ: Self = DataType::Primitive(PrimitiveType::TimestampNtz);
     pub const VOID: Self = DataType::Primitive(PrimitiveType::Void);
-    pub const INTERVAL_YEAR_MONTH: Self = DataType::Primitive(PrimitiveType::IntervalYearMonth);
+    /// ANSI `INTERVAL YEAR`, stored as a signed month count aligned to whole years.
+    pub const INTERVAL_YEAR: Self = DataType::Primitive(PrimitiveType::IntervalYearMonth(
+        IntervalYearToMonthType::IntervalYear,
+    ));
+    /// ANSI `INTERVAL MONTH`, stored as a signed month count.
+    pub const INTERVAL_MONTH: Self = DataType::Primitive(PrimitiveType::IntervalYearMonth(
+        IntervalYearToMonthType::IntervalMonth,
+    ));
+    /// ANSI `INTERVAL YEAR TO MONTH`, stored as a signed month count.
+    pub const INTERVAL_YEAR_MONTH: Self = DataType::Primitive(PrimitiveType::IntervalYearMonth(
+        IntervalYearToMonthType::IntervalYearToMonth,
+    ));
     pub const INTERVAL_DAY_TIME: Self = DataType::Primitive(PrimitiveType::IntervalDayTime);
+
+    /// Resolves a path to a mutable nested struct.
+    ///
+    /// Struct fields are matched case-insensitively. The `element`, `key`, and `value` path
+    /// segments traverse array elements, map keys, and map values, respectively.
+    ///
+    /// Returns an error if a field does not exist, a path segment does not match the current data
+    /// type, or the path target is not a struct.
+    pub fn struct_at_path<'a>(&'a mut self, path: &[String]) -> KernelResult<&'a mut StructType> {
+        let mut data_type = self;
+        for segment in path {
+            data_type = match (segment.as_str(), data_type) {
+                ("element", DataType::Array(array)) => &mut array.element_type,
+                ("key", DataType::Map(map)) => &mut map.key_type,
+                ("value", DataType::Map(map)) => &mut map.value_type,
+                (name, DataType::Struct(parent)) => {
+                    let lowered = name.to_lowercase();
+                    &mut parent
+                        .field_map_mut()
+                        .values_mut()
+                        .find(|field| field.name().to_lowercase() == lowered)
+                        .ok_or_else(|| {
+                            KernelError::schema(format!("field '{name}' does not exist"))
+                        })?
+                        .data_type
+                }
+                (segment, data_type) => {
+                    return Err(KernelError::schema(format!(
+                        "path segment {segment:?} does not match {data_type}"
+                    )));
+                }
+            };
+        }
+        let DataType::Struct(target) = data_type else {
+            return Err(KernelError::schema("path target is not a struct"));
+        };
+        Ok(target)
+    }
 
     /// Compact type name for diagnostics that must not expand nested schemas.
     pub(crate) fn kind_name(&self) -> String {
@@ -2439,23 +2565,46 @@ impl DataType {
             Self::Struct(_) => "struct".to_string(),
             Self::Map(_) => "map".to_string(),
             Self::Variant(_) => "variant".to_string(),
+            #[cfg(feature = "udt-in-dev")]
+            Self::UserDefined(_) => "udt".to_string(),
+            Self::File(_) => "file".to_string(),
+        }
+    }
+
+    /// Returns the storage type used to represent this data type.
+    ///
+    /// A UDT is stored as its `sqlType`; every other type is stored as itself.
+    #[cfg_attr(
+        not(any(feature = "arrow-conversion", feature = "arrow-expression")),
+        allow(dead_code)
+    )]
+    pub(crate) fn physical_type(&self) -> &DataType {
+        match self {
+            #[cfg(feature = "udt-in-dev")]
+            Self::UserDefined(udt) => udt.sql_type(),
+            data_type => data_type,
         }
     }
 
     /// Create a new decimal type with the given precision and scale.
-    pub fn decimal(precision: u8, scale: u8) -> DeltaResult<Self> {
+    pub fn decimal(precision: u8, scale: u8) -> KernelResult<Self> {
         Ok(PrimitiveType::decimal(precision, scale)?.into())
     }
 
+    /// Constructs a year-month interval data type with the given ANSI qualifier.
+    pub fn interval_year_month(ty: IntervalYearToMonthType) -> Self {
+        PrimitiveType::interval_year_month(ty).into()
+    }
+
     /// Create a new struct type with the given fields.
-    pub fn try_struct_type(fields: impl IntoIterator<Item = StructField>) -> DeltaResult<Self> {
+    pub fn try_struct_type(fields: impl IntoIterator<Item = StructField>) -> KernelResult<Self> {
         Ok(StructType::try_new(fields)?.into())
     }
 
     /// Create a new struct type from a fallible iterator of fields.
-    pub fn try_struct_type_from_results<E: Into<Error>>(
-        fields: impl IntoIterator<Item = Result<StructField, E>>,
-    ) -> DeltaResult<Self> {
+    pub fn try_struct_type_from_results<E: Into<KernelError>>(
+        fields: impl IntoIterator<Item = KernelResult<StructField, E>>,
+    ) -> KernelResult<Self> {
         StructType::try_from_results(fields).map(Self::from)
     }
 
@@ -2473,15 +2622,23 @@ impl DataType {
         }))
     }
 
+    /// Create a new [`DataType::File`] with the canonical physical layout: a struct of six
+    /// nullable fields — `uri`: STRING, `offset`: LONG, `size`: LONG, `content_type`: STRING,
+    /// `checksum`: STRING, `inline`: BINARY. Like Variant, the type identity is carried in the
+    /// Delta schema; physically a `file` is this struct.
+    pub fn file_type() -> Self {
+        DataType::File(Box::new(FILE_FIELDS.clone()))
+    }
+
     /// Create a new [`DataType::Variant`] from the provided fields. For unshredded variants, you
     /// should prefer using [`DataType::unshredded_variant`].
-    pub fn variant_type(fields: impl IntoIterator<Item = StructField>) -> DeltaResult<Self> {
+    pub fn variant_type(fields: impl IntoIterator<Item = StructField>) -> KernelResult<Self> {
         // Different from regular StructTypes, Variants are not allowed to contain metadata columns
         // at all, so we also need to check their top-level primitive types.
         Ok(DataType::Variant(Box::new(StructType::try_from_results(
             fields.into_iter().map(|field| {
                 if field.is_metadata_column() {
-                    Err(Error::schema(
+                    Err(KernelError::schema(
                         "Metadata columns are not allowed in Variant types".to_string(),
                     ))
                 } else {
@@ -2552,6 +2709,9 @@ impl Display for DataType {
             }
             DataType::Map(m) => write!(f, "map<{}, {}>", m.key_type, m.value_type),
             DataType::Variant(_) => write!(f, "variant"),
+            #[cfg(feature = "udt-in-dev")]
+            DataType::UserDefined(udt) => write!(f, "udt({})", udt.sql_type()),
+            DataType::File(_) => write!(f, "file"),
         }
     }
 }
@@ -2641,7 +2801,7 @@ impl<'a> MakePhysical<'a> {
     pub(crate) fn validate_schema_column_mapping(
         mode: ColumnMappingMode,
         schema: &'a StructType,
-    ) -> DeltaResult<()> {
+    ) -> KernelResult<()> {
         let mut walker = Self {
             mode: MakePhysicalMode::ValidateStrict,
             ..Self::new(mode)
@@ -2652,8 +2812,8 @@ impl<'a> MakePhysical<'a> {
     fn transform_inner<T>(
         &mut self,
         logical_name: &'a str,
-        transform: impl FnOnce(&mut Self) -> DeltaResult<T>,
-    ) -> DeltaResult<T> {
+        transform: impl FnOnce(&mut Self) -> KernelResult<T>,
+    ) -> KernelResult<T> {
         self.logical_path.push(logical_name);
         let result = transform(self);
         self.logical_path.pop();
@@ -2661,28 +2821,28 @@ impl<'a> MakePhysical<'a> {
     }
 }
 impl<'a> SchemaTransform<'a> for MakePhysical<'a> {
-    transform_output_type!(|'a, T| DeltaResult<Cow<'a, T>>);
+    transform_output_type!(|'a, T| KernelResult<Cow<'a, T>>);
 
-    fn transform_struct(&mut self, stype: &'a StructType) -> DeltaResult<Cow<'a, StructType>> {
+    fn transform_struct(&mut self, stype: &'a StructType) -> KernelResult<Cow<'a, StructType>> {
         self.sibling_names_stack.push(HashMap::new());
         let result = self.recurse_into_struct(stype);
         self.sibling_names_stack.pop();
         result
     }
 
-    fn transform_array_element(&mut self, etype: &'a DataType) -> DeltaResult<Cow<'a, DataType>> {
+    fn transform_array_element(&mut self, etype: &'a DataType) -> KernelResult<Cow<'a, DataType>> {
         self.transform_inner("<array element>", |this| this.transform(etype))
     }
-    fn transform_map_key(&mut self, ktype: &'a DataType) -> DeltaResult<Cow<'a, DataType>> {
+    fn transform_map_key(&mut self, ktype: &'a DataType) -> KernelResult<Cow<'a, DataType>> {
         self.transform_inner("<map key>", |this| this.transform(ktype))
     }
-    fn transform_map_value(&mut self, vtype: &'a DataType) -> DeltaResult<Cow<'a, DataType>> {
+    fn transform_map_value(&mut self, vtype: &'a DataType) -> KernelResult<Cow<'a, DataType>> {
         self.transform_inner("<map value>", |this| this.transform(vtype))
     }
     fn transform_struct_field(
         &mut self,
         field: &'a StructField,
-    ) -> DeltaResult<Cow<'a, StructField>> {
+    ) -> KernelResult<Cow<'a, StructField>> {
         let (physical_name, _id) = validate_and_extract_column_mapping_annotations(
             field,
             self.column_mapping_mode,
@@ -2697,19 +2857,30 @@ impl<'a> SchemaTransform<'a> for MakePhysical<'a> {
         }
 
         self.transform_inner(field.name(), |this| {
-            let field = this.recurse_into_struct_field(field)?;
             if this.mode == MakePhysicalMode::ValidateStrict {
-                return Ok(field);
+                return this.recurse_into_struct_field(field);
             }
+            let data_type = this.transform(field.data_type())?.into_owned();
             let metadata = field.logical_to_physical_metadata(this.column_mapping_mode);
-            let name = physical_name.to_owned();
-            Ok(Cow::Owned(field.with_name(name).with_metadata(metadata)))
+            Ok(Cow::Owned(StructField {
+                name: physical_name.to_owned(),
+                data_type,
+                nullable: field.nullable,
+                metadata,
+            }))
         })
     }
 
-    fn transform_variant(&mut self, stype: &'a StructType) -> DeltaResult<Cow<'a, StructType>> {
+    fn transform_variant(&mut self, stype: &'a StructType) -> KernelResult<Cow<'a, StructType>> {
         // There is no column mapping metadata inside the struct fields of a variant, so
         // we do not recurse into the variant fields
+        Ok(Cow::Borrowed(stype))
+    }
+
+    fn transform_file(&mut self, stype: &'a StructType) -> KernelResult<Cow<'a, StructType>> {
+        // The FILE group's inner field names (`uri`, `offset`, ...) are fixed literals that are not
+        // subject to column mapping and carry no column mapping metadata, so we do not recurse
+        // into them.
         Ok(Cow::Borrowed(stype))
     }
 }
@@ -2809,7 +2980,8 @@ mod tests {
     #[case("geography(vincenty)", "expected 'geography(<crs>, <algorithm>)'")]
     #[case("geography(EPSG:4326, vincenty, karney)", "Matching variant not found")]
     fn test_invalid_geo_format(#[case] invalid_type: &str, #[case] expected_error: &str) {
-        let result: Result<StructField, _> = serde_json::from_str(&geo_field_json(invalid_type));
+        let result: KernelResult<StructField, _> =
+            serde_json::from_str(&geo_field_json(invalid_type));
         let err = result.expect_err(&format!("expected '{invalid_type}' to be rejected"));
         assert!(
             err.to_string().contains(expected_error),
@@ -2876,6 +3048,31 @@ mod tests {
                     "delta.identity.start": 2147483648
                 }
             }"#
+    }
+
+    #[test]
+    fn test_serde_file_type() {
+        let file = DataType::file_type();
+        assert_eq!(serde_json::to_string(&file).unwrap(), "\"file\"");
+        assert_eq!(serde_json::from_str::<DataType>("\"file\"").unwrap(), file);
+
+        // The canonical file has exactly the six protocol-defined, nullable fields.
+        let DataType::File(fields) = &file else {
+            panic!("expected a file type");
+        };
+        let names: Vec<_> = fields.fields().map(|f| f.name().as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "uri",
+                "offset",
+                "size",
+                "content_type",
+                "checksum",
+                "inline"
+            ]
+        );
+        assert!(fields.fields().all(|f| f.is_nullable()));
     }
 
     #[test]
@@ -3082,7 +3279,7 @@ mod tests {
                 "metadata": {{}}
             }}"#
         );
-        let result: Result<StructField, _> = serde_json::from_str(&data);
+        let result: KernelResult<StructField, _> = serde_json::from_str(&data);
         assert!(result.is_err());
         let err = result.unwrap_err();
         let expected_msg = format!("Unsupported Delta table type: '{unsupported_type}'");
@@ -3090,6 +3287,15 @@ mod tests {
             err.to_string().contains(&expected_msg),
             "Expected error message about unsupported type '{unsupported_type}', got: {err}"
         );
+    }
+
+    #[test]
+    fn test_invalid_interval_field_range_has_no_primitive_type() {
+        let range = IntervalFieldRange {
+            start: IntervalField::Month,
+            end: IntervalField::Year,
+        };
+        assert_eq!(range.primitive_type(), None);
     }
 
     #[rstest]
@@ -3105,8 +3311,8 @@ mod tests {
     #[case("date", DataType::DATE)]
     #[case("timestamp", DataType::TIMESTAMP)]
     #[case("timestamp_ntz", DataType::TIMESTAMP_NTZ)]
-    #[case("interval year", DataType::INTERVAL_YEAR_MONTH)]
-    #[case("interval month", DataType::INTERVAL_YEAR_MONTH)]
+    #[case("interval year", DataType::INTERVAL_YEAR)]
+    #[case("interval month", DataType::INTERVAL_MONTH)]
     #[case("interval year to month", DataType::INTERVAL_YEAR_MONTH)]
     #[case("interval day", DataType::INTERVAL_DAY_TIME)]
     #[case("interval hour", DataType::INTERVAL_DAY_TIME)]
@@ -3168,7 +3374,7 @@ mod tests {
                 "metadata": {{}}
             }}"#
         );
-        let result: Result<StructField, _> = serde_json::from_str(&data);
+        let result: KernelResult<StructField, _> = serde_json::from_str(&data);
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(
@@ -3205,6 +3411,8 @@ mod tests {
     #[case("\"date\"", DataType::DATE)]
     #[case("\"timestamp\"", DataType::TIMESTAMP)]
     #[case("\"timestamp_ntz\"", DataType::TIMESTAMP_NTZ)]
+    #[case("\"interval year\"", DataType::INTERVAL_YEAR)]
+    #[case("\"interval month\"", DataType::INTERVAL_MONTH)]
     #[case("\"interval year to month\"", DataType::INTERVAL_YEAR_MONTH)]
     #[case("\"interval day to second\"", DataType::INTERVAL_DAY_TIME)]
     #[case("\"variant\"", DataType::unshredded_variant())]
@@ -3214,7 +3422,18 @@ mod tests {
     }
 
     #[rstest]
-    #[case(PrimitiveType::IntervalYearMonth, "interval year to month")]
+    #[case(
+        PrimitiveType::interval_year_month(IntervalYearToMonthType::IntervalYear),
+        "interval year"
+    )]
+    #[case(
+        PrimitiveType::interval_year_month(IntervalYearToMonthType::IntervalMonth),
+        "interval month"
+    )]
+    #[case(
+        PrimitiveType::interval_year_month(IntervalYearToMonthType::IntervalYearToMonth),
+        "interval year to month"
+    )]
     #[case(PrimitiveType::IntervalDayTime, "interval day to second")]
     fn test_interval_type_name_round_trips(#[case] ptype: PrimitiveType, #[case] name: &str) {
         assert_eq!(ptype.to_string(), name);
@@ -3229,18 +3448,44 @@ mod tests {
     }
 
     #[test]
+    fn test_nested_interval_year_month_schema_round_trips_exact_qualifiers() {
+        let schema = StructType::try_new([
+            StructField::nullable("year", DataType::INTERVAL_YEAR),
+            StructField::nullable(
+                "month_array",
+                ArrayType::new(DataType::INTERVAL_MONTH, true),
+            ),
+            StructField::nullable(
+                "full_map",
+                MapType::new(DataType::STRING, DataType::INTERVAL_YEAR_MONTH, true),
+            ),
+        ])
+        .unwrap();
+
+        let json = serde_json::to_string(&schema).unwrap();
+        assert!(json.contains(r#""type":"interval year""#));
+        assert!(json.contains(r#""elementType":"interval month""#));
+        assert!(json.contains(r#""valueType":"interval year to month""#));
+        assert_eq!(serde_json::from_str::<StructType>(&json).unwrap(), schema);
+    }
+
+    #[test]
     fn test_make_physical_no_column_mapping() {
         let field =
             StructField::nullable("e", ArrayType::new(schema! { not_null "d": INTEGER }, true));
         let physical_field = field.make_physical(ColumnMappingMode::None).unwrap();
 
         assert_eq!(physical_field.name, "e");
-        assert!(physical_field
-            .get_config_value(&ColumnMetadataKey::ColumnMappingId)
-            .is_none());
-        assert!(physical_field
-            .get_config_value(&ColumnMetadataKey::ColumnMappingPhysicalName)
-            .is_none());
+        assert!(
+            physical_field
+                .get_config_value(&ColumnMetadataKey::ColumnMappingId)
+                .is_none()
+        );
+        assert!(
+            physical_field
+                .get_config_value(&ColumnMetadataKey::ColumnMappingPhysicalName)
+                .is_none()
+        );
 
         let DataType::Array(atype) = physical_field.data_type else {
             panic!("Expected an Array");
@@ -3250,6 +3495,69 @@ mod tests {
         };
         let struct_field = stype.fields.get_index(0).unwrap().1;
         assert_eq!(struct_field.name, "d");
+    }
+
+    #[rstest]
+    #[case::string(DataType::STRING, "")]
+    #[case::array(DataType::from(ArrayType::new(DataType::STRING, true)), ".element")]
+    #[case::nested_array(
+        DataType::from(ArrayType::new(ArrayType::new(DataType::STRING, true), true)),
+        ".element.element"
+    )]
+    #[case::map_key(
+        DataType::from(MapType::new(DataType::STRING, DataType::INTEGER, true)),
+        ".key"
+    )]
+    #[case::map_value(
+        DataType::from(MapType::new(DataType::INTEGER, DataType::STRING, true)),
+        ".value"
+    )]
+    #[case::array_map(
+        DataType::from(ArrayType::new(
+            MapType::new(DataType::STRING, DataType::STRING, true),
+            true
+        )),
+        ".element.value"
+    )]
+    fn physical_collation_annotations_resolve_to_physical_fields(
+        #[case] data_type: DataType,
+        #[case] suffix: &str,
+        #[values(
+            ColumnMappingMode::None,
+            ColumnMappingMode::Name,
+            ColumnMappingMode::Id
+        )]
+        mode: ColumnMappingMode,
+    ) {
+        let logical_path = format!("name{suffix}");
+        let annotation = MetadataValue::Other(serde_json::json!({
+            &logical_path: "test.ASCII_CI"
+        }));
+        let logical = StructField::nullable("name", data_type).with_metadata([
+            (ColumnMetadataKey::Collations.as_ref(), annotation.clone()),
+            (
+                ColumnMetadataKey::ColumnMappingId.as_ref(),
+                MetadataValue::Number(1),
+            ),
+            (
+                ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
+                MetadataValue::String("col-physical".to_string()),
+            ),
+        ]);
+        let physical = logical.make_physical(mode).unwrap();
+        let physical_path = format!("{}{suffix}", physical.name());
+        assert_eq!(
+            physical.get_config_value(&ColumnMetadataKey::Collations),
+            Some(&MetadataValue::Other(serde_json::json!({
+                physical_path: "test.ASCII_CI"
+            })))
+        );
+        assert_eq!(
+            logical.get_config_value(&ColumnMetadataKey::Collations),
+            Some(&annotation)
+        );
+        collation_utils::validate_collation_annotations(&StructType::try_new([physical]).unwrap())
+            .unwrap();
     }
 
     #[test]
@@ -3263,12 +3571,16 @@ mod tests {
         let physical = field.make_physical(ColumnMappingMode::None).unwrap();
 
         assert_eq!(physical.name, "e");
-        assert!(!physical
-            .metadata
-            .contains_key(ColumnMetadataKey::ColumnMappingId.as_ref()));
-        assert!(!physical
-            .metadata
-            .contains_key(ColumnMetadataKey::ColumnMappingPhysicalName.as_ref()));
+        assert!(
+            !physical
+                .metadata
+                .contains_key(ColumnMetadataKey::ColumnMappingId.as_ref())
+        );
+        assert!(
+            !physical
+                .metadata
+                .contains_key(ColumnMetadataKey::ColumnMappingPhysicalName.as_ref())
+        );
         // Non-column-mapping metadata is untouched.
         assert!(physical.metadata.contains_key("delta.identity.start"));
 
@@ -3281,12 +3593,16 @@ mod tests {
         };
         let leaf = stype.fields().next().unwrap();
         assert_eq!(leaf.name, "d");
-        assert!(!leaf
-            .metadata
-            .contains_key(ColumnMetadataKey::ColumnMappingId.as_ref()));
-        assert!(!leaf
-            .metadata
-            .contains_key(ColumnMetadataKey::ColumnMappingPhysicalName.as_ref()));
+        assert!(
+            !leaf
+                .metadata
+                .contains_key(ColumnMetadataKey::ColumnMappingId.as_ref())
+        );
+        assert!(
+            !leaf
+                .metadata
+                .contains_key(ColumnMetadataKey::ColumnMappingPhysicalName.as_ref())
+        );
     }
 
     #[test]
@@ -3502,11 +3818,11 @@ mod tests {
     #[test]
     fn test_read_schemas() {
         let file = std::fs::File::open("./tests/serde/schema.json").unwrap();
-        let schema: Result<Schema, _> = serde_json::from_reader(file);
+        let schema: KernelResult<Schema, _> = serde_json::from_reader(file);
         assert!(schema.is_ok());
 
         let file = std::fs::File::open("./tests/serde/checkpoint_schema.json").unwrap();
-        let schema: Result<Schema, _> = serde_json::from_reader(file);
+        let schema: KernelResult<Schema, _> = serde_json::from_reader(file);
         assert!(schema.is_ok())
     }
 
@@ -3586,7 +3902,7 @@ mod tests {
         // Schema with top-level invariant
         let mut field = StructField::nullable("c", DataType::STRING);
         field.metadata.insert(
-            ColumnMetadataKey::Invariants.as_ref().to_string(),
+            ColumnMetadataKey::Invariants.as_ref().into(),
             MetadataValue::String("c > 0".to_string()),
         );
 
@@ -3601,7 +3917,7 @@ mod tests {
             ({
                 let mut field = StructField::nullable("d", DataType::INTEGER);
                 field.metadata.insert(
-                    ColumnMetadataKey::Invariants.as_ref().to_string(),
+                    ColumnMetadataKey::Invariants.as_ref().into(),
                     MetadataValue::String("d > 0".to_string()),
                 );
                 field
@@ -3620,7 +3936,7 @@ mod tests {
             ({
                 let mut field = StructField::nullable("d", DataType::INTEGER);
                 field.metadata.insert(
-                    ColumnMetadataKey::Invariants.as_ref().to_string(),
+                    ColumnMetadataKey::Invariants.as_ref().into(),
                     MetadataValue::String("d > 0".to_string()),
                 );
                 field
@@ -3639,7 +3955,7 @@ mod tests {
             ({
                 let mut field = StructField::nullable("d", DataType::INTEGER);
                 field.metadata.insert(
-                    ColumnMetadataKey::Invariants.as_ref().to_string(),
+                    ColumnMetadataKey::Invariants.as_ref().into(),
                     MetadataValue::String("d > 0".to_string()),
                 );
                 field
@@ -4093,7 +4409,7 @@ mod tests {
     }
 
     #[test]
-    fn test_metadata_column_spec() -> DeltaResult<()> {
+    fn test_metadata_column_spec() -> KernelResult<()> {
         // Test text_value
         assert_eq!(MetadataColumnSpec::RowIndex.text_value(), "row_index");
         assert_eq!(MetadataColumnSpec::RowId.text_value(), "row_id");
@@ -4184,7 +4500,7 @@ mod tests {
     }
 
     #[test]
-    fn test_add_column() -> DeltaResult<()> {
+    fn test_add_column() -> KernelResult<()> {
         let schema = schema! { nullable "col1": STRING };
 
         let new_field = StructField::nullable("col2", DataType::INTEGER);
@@ -4197,7 +4513,7 @@ mod tests {
     }
 
     #[test]
-    fn test_add_metadata_column() -> DeltaResult<()> {
+    fn test_add_metadata_column() -> KernelResult<()> {
         let schema = schema! { nullable "regular_col": STRING };
 
         let schema_with_metadata =
@@ -4214,7 +4530,7 @@ mod tests {
     }
 
     #[test]
-    fn test_duplicate_metadata_columns() -> DeltaResult<()> {
+    fn test_duplicate_metadata_columns() -> KernelResult<()> {
         let schema = schema! { nullable "regular_col": STRING };
 
         let schema_with_metadata =
@@ -4249,7 +4565,7 @@ mod tests {
     }
 
     #[test]
-    fn test_nested_metadata_columns_validation_struct() -> DeltaResult<()> {
+    fn test_nested_metadata_columns_validation_struct() -> KernelResult<()> {
         // Test that metadata columns in nested structs are rejected
         let nested_field_with_metadata =
             StructField::create_metadata_column("nested_row_index", MetadataColumnSpec::RowIndex);
@@ -4274,7 +4590,7 @@ mod tests {
     }
 
     #[test]
-    fn test_nested_metadata_columns_validation_array() -> DeltaResult<()> {
+    fn test_nested_metadata_columns_validation_array() -> KernelResult<()> {
         // Test that metadata columns in array element structs are rejected
         let nested_field_with_metadata =
             StructField::create_metadata_column("nested_row_index", MetadataColumnSpec::RowIndex);
@@ -4300,7 +4616,7 @@ mod tests {
     }
 
     #[test]
-    fn test_nested_metadata_columns_validation_map() -> DeltaResult<()> {
+    fn test_nested_metadata_columns_validation_map() -> KernelResult<()> {
         // Test that metadata columns in map key structs or map value structs are rejected
         let nested_field_with_metadata =
             StructField::create_metadata_column("nested_row_index", MetadataColumnSpec::RowIndex);
@@ -4331,7 +4647,7 @@ mod tests {
     }
 
     #[test]
-    fn test_column_identifier_trait() -> DeltaResult<()> {
+    fn test_column_identifier_trait() -> KernelResult<()> {
         let schema = schema! {
             nullable "regular_col": STRING,
             (StructField::create_metadata_column(
@@ -4356,7 +4672,7 @@ mod tests {
     }
 
     #[test]
-    fn test_metadata_column_serialization() -> DeltaResult<()> {
+    fn test_metadata_column_serialization() -> KernelResult<()> {
         let field = StructField::create_metadata_column("test_row_id", MetadataColumnSpec::RowId);
 
         // Test that serialization works
@@ -4375,7 +4691,7 @@ mod tests {
     }
 
     #[test]
-    fn test_all_metadata_column_specs() -> DeltaResult<()> {
+    fn test_all_metadata_column_specs() -> KernelResult<()> {
         let schema = schema! { nullable "regular_col": STRING };
 
         let schema = schema
@@ -4487,7 +4803,7 @@ mod tests {
     }
 
     #[test]
-    fn test_display_struct_type_stable_output() -> DeltaResult<()> {
+    fn test_display_struct_type_stable_output() -> KernelResult<()> {
         let nested_field_with_metadata =
             StructField::create_metadata_column("nested_row_index", MetadataColumnSpec::RowIndex);
         let inner_struct = schema! { not_null "q": LONG };

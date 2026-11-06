@@ -25,9 +25,9 @@ cargo build -p delta_kernel_ffi --release
 |---------|---------|-------------|
 | `default-engine-rustls` | yes | Includes the `DefaultEngine` with rustls TLS |
 | `default-engine-native-tls` | no | Includes the `DefaultEngine` with native TLS (instead of rustls) |
-| `arrow` | yes | Enables Arrow integration (selects `arrow-59` by default) |
-| `arrow-59` | yes | Pin to Arrow 59 explicitly (enabled transitively by `arrow`) |
-| `arrow-58` | no | Pin to Arrow 58 explicitly |
+| `arrow` | yes | Enables Arrow integration (selects `arrow-60` by default) |
+| `arrow-60` | yes | Pin to Arrow 60 explicitly (enabled transitively by `arrow`) |
+| `arrow-59` | no | Pin to Arrow 59 explicitly |
 | `delta-kernel-unity-catalog` | no | Enables Unity Catalog integration for catalog-managed tables |
 | `tracing` | no | Enables tracing/logging support via `tracing-subscriber` |
 
@@ -40,17 +40,19 @@ cargo build -p delta_kernel_ffi --release
 Objects that cross the FFI boundary are wrapped in **handles**. These are opaque pointers
 that carry ownership semantics. There are two kinds:
 
-- **Mutable handles** (`Box`-like) represent exclusive ownership. Dropping the handle
+- **Exclusive handles** (`Box`-like) represent exclusive ownership. Dropping the handle
   drops the underlying object. These are neither `Copy` nor `Clone`.
 - **Shared handles** (`Arc`-like) represent shared ownership. Dropping the handle only
   drops the underlying object if it was the last reference.
 
-Every handle has a corresponding `free_*` function that you must call to release it.
-For example, `free_engine`, `free_snapshot`, `free_scan`, `free_transaction`.
+Every handle has a corresponding `free_*` function. Call it to release a handle that you haven't
+passed to a consuming function.
+For example, `free_engine`, `free_snapshot`, `free_scan`, `free_update_table_txn`.
 
-Several FFI functions _consume_ their handle argument and return a new handle. After
-calling such a function, you must not use the old handle. The function documentation
-notes this with "CONSUMES the handle."
+Several FFI functions _consume_ their handle arguments, including when they return an error. After
+calling such a function, don't use or free the consumed handles. A consuming setter returns a
+replacement handle only on success. Each function's safety documentation states which inputs it
+borrows and which it consumes.
 
 ## Core API surface
 
@@ -60,7 +62,7 @@ is needed for reads):
 ```text
 get_default_engine()        ->  Handle<SharedExternEngine>
         |
-get_snapshot_builder()      ->  Handle<MutableFfiSnapshotBuilder>
+get_snapshot_builder()      ->  Handle<ExclusiveSnapshotBuilder>
         |
 snapshot_builder_build()    ->  Handle<SharedSnapshot>
         |
@@ -76,13 +78,14 @@ A typical write flow:
 ```text
 get_default_engine()  ->  Handle<SharedExternEngine>
         |
-    transaction()     ->  Handle<ExclusiveTransaction>
+new_update_table_txn_builder(snapshot, operation, engine_info, data_change, engine)
+    -> ExternResult<Handle<ExclusiveUpdateTableTransactionBuilder>>
         |
-  with_engine_info()  ->  Handle<ExclusiveTransaction>
+update_table_txn_builder_build() -> Handle<ExclusiveUpdateTableTransaction>
         |
-    add_files()
+    update_table_txn_add_files()
         |
-    commit()          ->  ExternResult<u64>  (committed version)
+    update_table_txn_commit() -> Handle<ExclusiveCommittedTransaction>
 ```
 
 For more control over scans, you can use the scan builder API instead of the
@@ -95,7 +98,7 @@ scan_builder_with_predicate() ->  Handle<ExclusiveScanBuilder>
         |
 scan_builder_with_schema()    ->  Handle<ExclusiveScanBuilder>
         |
-scan_builder_with_stats()     ->  Handle<ExclusiveScanBuilder>
+scan_builder_with_stats()     ->  ExternResult<Handle<ExclusiveScanBuilder>>
         |
 scan_builder_with_partition_values()
                               ->  Handle<ExclusiveScanBuilder>
@@ -115,10 +118,14 @@ authoritative list and signatures, consult the generated
 | Function | Purpose |
 |----------|---------|
 | `get_default_engine` | Create an engine from a table path with default options |
-| `get_engine_builder` / `set_builder_option` / `builder_build` | Create an engine with custom storage options |
-| `set_builder_with_multithreaded_executor` | Configure the builder to use a multi-threaded tokio executor |
-| `set_builder_with_io_concurrency` | Configure read-path I/O concurrency (buffer size and batch size) for the JSON and Parquet handlers |
+| `get_engine_builder` / `builder_with_option` / `builder_build` | Create an engine with custom storage options |
+| `builder_with_multithreaded_executor` | Configure the builder to use a multi-threaded tokio executor |
+| `builder_with_io_concurrency` | Configure read-path I/O concurrency (buffer size and batch size) for the JSON and Parquet handlers |
 | `free_engine` | Release the engine handle |
+
+Builder `with_*` functions consume their input handle and return the updated handle on success.
+Replace the input handle with the result; on error, the builder has been dropped. `build` and
+`free` also consume the builder.
 
 **Snapshots**
 
@@ -126,9 +133,10 @@ authoritative list and signatures, consult the generated
 |----------|---------|
 | `get_snapshot_builder` | Create a snapshot builder from a table path |
 | `get_snapshot_builder_from` | Create a snapshot builder incrementally from an existing snapshot |
-| `snapshot_builder_set_version` | Pin the snapshot to a specific table version |
-| `snapshot_builder_set_log_tail` | Provide a log tail for catalog-managed tables |
-| `snapshot_builder_set_max_catalog_version` | Bound the snapshot to the version the catalog has ratified |
+| `snapshot_builder_with_version` | Pin the snapshot to a specific table version |
+| `snapshot_builder_with_incremental_crc_replay` | Set the stale CRC replay mode for fresh or incremental builds (`Disabled`, `UpToCommits`, or `Unlimited`) |
+| `snapshot_builder_with_log_tail` | Provide a log tail for catalog-managed tables |
+| `snapshot_builder_with_max_catalog_version` | Bound the snapshot to the version the catalog has ratified |
 | `snapshot_builder_build` | Consume the builder and produce the snapshot |
 | `free_snapshot_builder` / `free_snapshot` | Release snapshot-related handles |
 
@@ -143,14 +151,14 @@ partition columns without building a scan.
 | `snapshot_timestamp` | Return the snapshot's commit timestamp (milliseconds since epoch) |
 | `snapshot_table_root` | Return the table root URL as an engine-allocated string |
 | `logical_schema` | Return the table's logical schema as a `Handle<SharedSchema>` |
-| `snapshot_get_metadata` | Clone the table metadata into a `Handle<SharedMetadata>` |
+| `snapshot_visit_metadata` | Invoke one callback with the complete metadata action as a borrowed `FfiMetadata`. Copy any values you keep before the callback returns |
 | `snapshot_get_protocol` | Clone the protocol into a `Handle<SharedProtocol>` |
 | `get_partition_column_count` / `get_partition_columns` | Count partition columns and iterate their names as a `StringSliceIterator` |
 | `string_slice_next` / `free_string_slice_data` | Iterate and release a `StringSliceIterator` (e.g. returned by `get_partition_columns`) |
 | `get_app_id_version` | Look up the last committed transaction version for an `app_id` (the read side of [idempotent writes](../writing/idempotent_writes.md)) |
-| `free_metadata` / `free_protocol` / `free_schema` | Release the corresponding handles |
+| `free_protocol` / `free_schema` | Release the corresponding handles |
 
-**Schema and metadata visitors**
+**Schema and protocol visitors**
 
 Kernel exposes schemas, protocols, and metadata through visitor callbacks so
 the engine can materialize them into its own types without Kernel allocating
@@ -160,9 +168,7 @@ engine-owned memory.
 |----------|---------|
 | `visit_schema` | Walk a `SharedSchema` by invoking per-field callbacks on an `EngineSchemaVisitor` |
 | `visit_protocol` | Invoke a `visit_versions` callback, then a `visit_feature` callback per reader/writer feature |
-| `visit_metadata` | Invoke a single callback with `(id, name, description, format_provider, has_created_time, created_time_ms)` |
-| `visit_metadata_configuration` | Iterate the `configuration` key/value map (takes a snapshot handle, not a metadata handle) |
-| `visit_string_map` / `get_from_string_map` | Iterate or look up entries in an opaque `CStringMap` (used by both metadata and scan-metadata surfaces) |
+| `visit_string_map` / `get_from_string_map` | Iterate or look up entries in an opaque `CStringMap` (used by scan-metadata partition values) |
 
 See [Visitor callbacks](#visitor-callbacks) below for the pattern.
 
@@ -170,14 +176,21 @@ See [Visitor callbacks](#visitor-callbacks) below for the pattern.
 
 The build-side counterpart to `visit_schema`: per-field callbacks that let the
 engine construct a Kernel `StructType` from its own type system (for example,
-to pass to `scan_builder_with_schema`).
+to pass to `scan_builder_with_schema`). Every field function takes a nullable
+`const EngineMetadata*` descriptor: an opaque engine-owned value plus a synchronous callback that
+inserts the field's metadata into a Kernel-owned `CMetadataMap`. A null descriptor means the field
+has no metadata. Kernel copies incoming keys and values; it doesn't retain the descriptor or
+borrowed slices. Don't retain the callback's state.
 
 | Function | Purpose |
 |----------|---------|
 | `visit_field_byte` / `visit_field_short` / `visit_field_integer` / `visit_field_long` / `visit_field_float` / `visit_field_double` / `visit_field_boolean` | Build a numeric or boolean primitive `StructField` |
+| `visit_field_void` | Build a void primitive `StructField` |
 | `visit_field_string` / `visit_field_binary` / `visit_field_date` / `visit_field_timestamp` / `visit_field_timestamp_ntz` | Build a string, binary, or date/time primitive `StructField` |
 | `visit_field_decimal` | Build a decimal `StructField` with explicit precision and scale |
+| `visit_field_geometry` / `visit_field_geography` | Build a geospatial `StructField` (geometry with a CRS; geography with a CRS and edge-interpolation algorithm) |
 | `visit_field_struct` / `visit_field_array` / `visit_field_map` / `visit_field_variant` | Build a complex `StructField` (struct, array, map, or variant) from previously created field or struct IDs |
+| `visit_metadata_value` | Insert a UTF-8 value tagged with `CMetadataValueKind` into the active field metadata map |
 
 **Reading (scans)**
 
@@ -215,23 +228,39 @@ feature is enabled; the rest are always available.
 
 | Function | Purpose |
 |----------|---------|
-| `transaction` | Start a write transaction on the latest snapshot |
-| `transaction_with_committer` | Start a transaction with a custom committer |
-| `with_engine_info` | Record a free-form engine identifier on the transaction (consumes and returns a new handle) |
-| `with_transaction_id` | Set an `(app_id, version)` pair for idempotent writes (consumes and returns a new handle; see [Idempotent Writes](../writing/idempotent_writes.md)) |
-| `with_domain_metadata` / `with_domain_metadata_removed` | Attach or remove a domain-metadata entry (each consumes and returns a new handle) |
-| `add_files` | Append file-level write metadata to the transaction |
-| `set_data_change` | Toggle the transaction's data-change flag (does not consume the handle) |
-| `remove_files` | Register Remove actions for the files selected by a scan-metadata batch |
-| `commit` | Commit the transaction and return the new version number |
-| `free_transaction` | Release the transaction handle without committing |
+| `new_update_table_txn_builder` | Create a builder from a snapshot, typed operation, required connector name/version, and `data_change` |
+| `update_table_txn_builder_with_correlation_id` | Attach a correlation identifier to transaction metrics |
+| `new_update_table_txn_builder_with_custom_operation` | Create a builder from a snapshot, connector-defined operation, required connector name/version, and `data_change` |
+| `update_table_txn_builder_with_operation_parameters` | Replace the operation parameters recorded in `commitInfo` |
+| `update_table_txn_builder_with_operation_metrics` / `update_table_txn_with_operation_metrics` | Set metrics before writing or replace them with write-time results |
+| `update_table_txn_builder_with_commit_info` / `update_table_txn_with_commit_info` | Set connector commit information before writing or before commit |
+| `update_table_txn_builder_with_transaction_id` | Add an `(app_id, version)` pair for idempotent writes (see [Idempotent Writes](../writing/idempotent_writes.md)) |
+| `update_table_txn_builder_with_blind_append` | Assert blind-append semantics before `build()` |
+| `update_table_txn_builder_add_column` / `update_table_txn_builder_add_column_at` / `update_table_txn_builder_set_nullable` | Configure schema evolution before `build()` |
+| `update_table_txn_builder_with_domain_metadata` / `update_table_txn_builder_with_domain_metadata_removed` | Add or remove user domain metadata |
+| `update_table_txn_builder_build` / `update_table_txn_builder_build_with_committer` | Consume the builder and produce a transaction |
+| `free_update_table_txn_builder` | Release a builder without building it |
+| `update_table_txn_with_domain_metadata` / `update_table_txn_with_domain_metadata_removed` | Add or remove late-bound domain metadata on a built transaction |
+| `update_table_txn_add_files` | Append file-level write metadata to the transaction |
+| `update_table_txn_remove_files` | Register Remove actions for the files selected by a scan-metadata batch |
+| `update_table_txn_commit` | Commit the transaction and return a committed-transaction handle |
+| `free_update_table_txn` | Release the transaction handle without committing |
+| `committed_transaction_version` / `committed_transaction_post_commit_snapshot` | Inspect a committed transaction without consuming it. The returned snapshot is independently owned |
+| `free_committed_transaction` | Release the committed-transaction handle |
 
 **Write context and file writing**
 
 Use a `BoundWriteContext` to learn where to write parquet files and what schema to
 write. For unpartitioned writes, one context serves the whole transaction.
 For partitioned writes, create one context per partition by passing a
-`PartitionValueMap` to `get_partitioned_write_context`.
+`PartitionValueMap` to `update_table_txn_get_partitioned_write_context`.
+
+For distributed writes, `update_table_txn_write_state` borrows the transaction and returns an owned
+`SharedWriteState` that remains valid after the transaction is committed or freed. Encode it on the
+driver with `write_state_encode`, decode it on workers running the same Kernel version with
+`write_state_decode`, and create one `ExclusiveWriteContextBuilder` per output partition.
+Builders and built contexts retain their own state reference, so callers may free the original
+state after creating them.
 
 Engines must append their own `<uuid>.parquet` filename (and any subdirectory
 layout) onto the returned table root. For partitioned tables, use
@@ -242,8 +271,15 @@ unpartitioned writes.
 
 | Function | Purpose |
 |----------|---------|
-| `get_unpartitioned_write_context` | Get a `SharedWriteContext` covering all rows in the transaction |
-| `get_partitioned_write_context` | Get a `SharedWriteContext` for one partition (requires a `PartitionValueMap`) |
+| `update_table_txn_write_state` | Borrow a transaction and return owned, immutable write state |
+| `write_state_encode` / `write_state_decode` | Transport write state between processes using the same Kernel version |
+| `write_context_builder` | Borrow write state and create a builder that retains its own state reference |
+| `write_context_builder_with_partition_values` / `write_context_builder_with_physical_partition_values` | Bind logical or physical partition values |
+| `write_context_builder_with_row_tracking_columns` / `write_context_builder_build` | Bind row-tracking columns and build the context |
+| `get_write_state_stats_columns` | Visit physical columns that require statistics |
+| `free_write_state` / `free_write_context_builder` | Release unused owned handles |
+| `update_table_txn_get_unpartitioned_write_context` | Get a `SharedWriteContext` covering all rows in the transaction |
+| `update_table_txn_get_partitioned_write_context` | Get a `SharedWriteContext` for one partition (requires a `PartitionValueMap`) |
 | `get_write_dir` | Return the recommended write subdirectory for a partitioned `SharedWriteContext` |
 | `get_write_path` | Return the table root URL from a `SharedWriteContext` (engines append their own subdirectory and filename) |
 | `get_write_schema` | Return the logical (user-facing) write schema from a `SharedWriteContext` |
@@ -260,17 +296,42 @@ unpartitioned writes.
 
 | Function | Purpose |
 |----------|---------|
-| `get_create_table_builder` | Create a builder for a new Delta table with a schema |
-| `create_table_builder_with_table_property` | Add a table property to the builder |
-| `create_table_builder_build` | Consume the builder and produce a create-table transaction using the default (filesystem) committer |
-| `create_table_builder_build_with_committer` | Consume the builder and produce a create-table transaction with a custom committer |
-| `create_table_with_engine_info` | Attach a free-form engine identifier to a create-table transaction (consumes and returns a new handle) |
-| `create_table_set_data_change` | Toggle the data-change flag on a create-table transaction (does not consume the handle) |
-| `create_table_get_unpartitioned_write_context` | Get a `BoundWriteContext` to stage initial data files during table creation |
-| `create_table_add_files` | Register file metadata for initial data being written alongside the CREATE TABLE commit |
-| `create_table_commit` | Commit the create-table transaction |
-| `free_create_table_builder` | Release a create-table builder handle (before it is consumed by `create_table_builder_build*`) |
-| `create_table_free_transaction` | Release a create-table transaction handle (after build, before commit) |
+| `new_create_table_txn_builder` | Create a builder from a path, schema, engine info, and `data_change` |
+| `create_table_txn_builder_with_table_property` | Add a table property to the builder |
+| `create_table_txn_builder_with_correlation_id` | Attach a correlation identifier to transaction metrics |
+| `create_table_txn_builder_with_operation_parameters` | Replace the operation parameters recorded in `commitInfo` |
+| `create_table_txn_builder_with_operation_metrics` / `create_table_txn_with_operation_metrics` | Set metrics before writing or replace them with write-time results |
+| `create_table_txn_builder_with_commit_info` / `create_table_txn_with_commit_info` | Set connector commit information before writing or before commit |
+| `create_table_txn_builder_with_transaction_id` | Add an `(app_id, version)` pair to the create commit |
+| `create_table_txn_builder_with_domain_metadata` / `create_table_txn_with_domain_metadata` | Add domain metadata before writing or before commit |
+| `create_table_txn_builder_with_partition_columns` / `create_table_txn_builder_with_clustering_columns` | Configure the table's data layout before `build()` |
+| `create_table_txn_builder_build` | Consume the builder and produce a create-table transaction using the default (filesystem) committer |
+| `create_table_txn_builder_build_with_committer` | Consume the builder and produce a create-table transaction with a custom committer |
+| `create_table_txn_get_unpartitioned_write_context` | Get a `SharedWriteContext` to stage initial data files during table creation |
+| `create_table_txn_add_files` | Register file metadata for initial data being written alongside the CREATE TABLE commit |
+| `create_table_txn_commit` | Commit the create-table transaction |
+| `free_create_table_txn_builder` | Release a create-table builder handle (before it is consumed by `create_table_txn_builder_build*`) |
+| `free_create_table_txn` | Release a create-table transaction handle (after build, before commit) |
+
+All transaction-builder constructors require a `data_change` boolean before the engine handle.
+Kernel uses this value for file actions and preserves it through empty commits. It cannot be
+changed on a builder or transaction. Use `true` for logical data changes and `false` for
+metadata-only changes or rewrites that preserve logical data. Build validation rejects
+`ALTER TABLE` with `true` and blind append with `false`; commit validation checks staged files.
+
+**Commit ranges**
+
+Read a range of raw commits. Mirrors the Rust `CommitRange` API.
+
+| Function | Purpose |
+|----------|---------|
+| `commit_range_builder_for` | Create a commit range builder from a table path and start version |
+| `commit_range_builder_with_end_version` / `commit_range_builder_with_log_tail` / `commit_range_builder_with_max_catalog_version` | Bound the range and supply the catalog log tail for catalog-managed tables |
+| `commit_range_builder_with_commit_range_validation` / `commit_range_builder_with_fail_on_data_loss` | Relax build-time validation and choose whether the commit-files iterator fails on missing versions |
+| `commit_range_builder_build` | Consume the builder and produce a `SharedCommitRange` |
+| `commit_range_commits` / `commit_range_commits_with_snapshot` / `commit_range_commits_next` | Iterate commits as `SharedCommitAction` handles; requires a range built with commit range validation |
+| `commit_range_commit_files` / `commit_range_commit_files_next` | Return an iterator of commit files |
+| `free_commit_range_builder` / `free_commit_range` / `free_commit_action` / `free_commit_actions_iter` / `free_commit_files_iter` | Release commit-range handles |
 
 **Change data feed (table changes)**
 
@@ -312,7 +373,7 @@ catalog-aware committer without implementing the committer trait from scratch.
 | Function | Purpose |
 |----------|---------|
 | `get_uc_commit_client` | Wrap an engine-provided `CCommit` callback in a `SharedFfiUCCommitClient` |
-| `get_uc_committer` | Produce a `MutableCommitter` bound to a specific `table_id`, ready to pass to `transaction_with_committer` |
+| `get_uc_committer` | Produce a `MutableCommitter` bound to a specific `table_id`, ready to pass to `update_table_txn_builder_build_with_committer` |
 | `free_uc_commit_client` / `free_uc_committer` | Release the corresponding handles |
 
 **Expressions and predicates**
@@ -368,8 +429,8 @@ calls return `false`.
 
 Several FFI entry points take a visitor struct (for example,
 `EngineSchemaVisitor` for `visit_schema`, `EngineExpressionVisitor` for
-`visit_expression`) or individual callbacks (as in `visit_metadata`). The
-pattern is the same in every case:
+`visit_expression`) or individual callbacks (as in `snapshot_visit_metadata`).
+The pattern is the same in every case:
 
 1. You allocate a context (a `NullableCvoid` you own) that the callbacks can
    write into. Kernel does not interpret this value.
@@ -377,12 +438,12 @@ pattern is the same in every case:
    passing the context plus node-specific arguments (names, types, literal
    values, child handles). For tree-structured inputs (schemas, expressions,
    predicates), callbacks fire in depth-first order; for flat inputs (e.g.
-   `visit_metadata`), the callback fires once.
+   `snapshot_visit_metadata`), the callback fires once.
 3. When `visit_*` returns, the context holds your engine-side representation.
 
 Callbacks run synchronously on the same thread that called `visit_*`. Strings
 passed to callbacks (`KernelStringSlice`) are borrowed for the duration of the
-call; copy them if you need to retain them beyond the callback.
+call. Copy them if you need to retain them beyond the callback.
 
 ## Error handling
 
@@ -405,7 +466,7 @@ callback to allocate error objects in your memory space whenever an operation fa
 Because the engine allocates these errors, the engine is also responsible for freeing
 them. Kernel returns the error pointer immediately and does not retain it.
 
-The `EngineError` struct contains a `KernelError` enum that classifies the error type
+The `EngineError` struct contains a `FFIKernelError` enum that classifies the error type
 (e.g., `GenericError`, `FileNotFoundError`, `InvalidUrlError`). The error message
 string passed to `allocate_error` is only valid for the duration of the callback, so
 you must copy it if you need to keep it.
@@ -421,8 +482,8 @@ exercises a different slice of the API.
 |---------|--------------|
 | [`read-table`](https://github.com/delta-io/delta-kernel-rs/tree/main/ffi/examples/read-table) | The full read path: schema visiting, scan-metadata iteration, and Arrow data handling. Pass `-a` to switch from the callback-based scan-metadata path to the Arrow batch-mode path (`scan_metadata_next_arrow`). |
 | [`read-table-changes`](https://github.com/delta-io/delta-kernel-rs/tree/main/ffi/examples/read-table-changes) | Reading a [change data feed](../reading/change_data_feed.md) using `table_changes_*` and consuming `ArrowFFIData` batches from `scan_table_changes_next`. |
-| [`create-table`](https://github.com/delta-io/delta-kernel-rs/tree/main/ffi/examples/create-table) | Creating a new Delta table via the `get_create_table_builder` / `create_table_builder_build` / `create_table_commit` flow. |
-| [`write-table`](https://github.com/delta-io/delta-kernel-rs/tree/main/ffi/examples/write-table) | Appending data to an existing table via the `transaction` / `add_files` / `commit` flow. |
+| [`create-table`](https://github.com/delta-io/delta-kernel-rs/tree/main/ffi/examples/create-table) | Creating a new Delta table via the `new_create_table_txn_builder` / `create_table_txn_builder_build` / `create_table_txn_commit` flow. |
+| [`write-table`](https://github.com/delta-io/delta-kernel-rs/tree/main/ffi/examples/write-table) | Appending data to an existing table via the `update_table_txn_builder_*` / `update_table_txn_add_files` / `update_table_txn_commit` flow. |
 
 The high-level flow in the `read-table` example:
 
@@ -432,7 +493,7 @@ ExternResultHandleSharedExternEngine engine_res =
     get_default_engine(table_path, allocate_error);
 
 // 2. Build a snapshot
-ExternResultHandleMutableFfiSnapshotBuilder builder_res =
+ExternResultHandleExclusiveSnapshotBuilder builder_res =
     get_snapshot_builder(table_path, engine);
 ExternResultHandleSharedSnapshot snap_res =
     snapshot_builder_build(builder);

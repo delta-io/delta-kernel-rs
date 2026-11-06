@@ -5,13 +5,33 @@ use std::convert::Infallible;
 use std::num::ParseIntError;
 use std::str::Utf8Error;
 
+use crate::Version;
 #[cfg(feature = "default-engine-base")]
 use crate::arrow::error::ArrowError;
 #[cfg(feature = "default-engine-base")]
 use crate::object_store;
 use crate::schema::{DataType, StructType};
 use crate::table_properties::ParseIntervalError;
-use crate::Version;
+
+mod delta_error;
+mod delta_error_condition;
+
+pub use delta_error::{DeltaError, DeltaErrorParameter};
+pub use delta_error_condition::DeltaErrorCondition;
+
+/// An error returned by a Delta Kernel operation.
+#[derive(Debug, thiserror::Error)]
+// TODO(#2630): Remove non_exhaustive once the Engine variant is introduced.
+#[non_exhaustive]
+pub enum Error {
+    /// A stable, user-facing Delta failure.
+    #[error(transparent)]
+    Delta(#[from] DeltaError),
+
+    /// A failure represented by a kernel implementation error.
+    #[error(transparent)]
+    Kernel(KernelError),
+}
 
 /// Details of a failed conversion from a scalar into a Rust value.
 ///
@@ -71,30 +91,142 @@ impl std::error::Error for ScalarConversionError {}
 ///
 /// Other error variants are returned unchanged: a field's `TryFrom<Scalar>` implementation may
 /// report a failure unrelated to scalar shape, and this helper must not reclassify it.
-pub(crate) fn add_scalar_path_context(error: Error, element: impl Into<String>) -> Error {
+pub(crate) fn add_scalar_path_context(
+    error: KernelError,
+    element: impl Into<String>,
+) -> KernelError {
     match error {
-        Error::ScalarConversion(error) => Error::ScalarConversion(error.add_path_context(element)),
+        KernelError::ScalarConversion(error) => {
+            KernelError::ScalarConversion(error.add_path_context(element))
+        }
         other => other,
     }
 }
 
-/// A [`std::result::Result`] that has the kernel [`Error`] as the error variant
-pub type DeltaResult<T, E = Error> = std::result::Result<T, E>;
+/// A result whose error is the top-level [`Error`].
+// Note: `delta_kernel::Result` is currently unused as part of the error migration tracked in:
+// https://github.com/delta-io/delta-kernel-rs/issues/3421.
+// First usages will come when the first `KernelError` is migrated to a `DeltaError`.
+pub type Result<T> = std::result::Result<T, Error>;
 
-/// A boxed, `Send` iterator of [`DeltaResult<T>`] items.
+/// A result whose error defaults to [`KernelError`].
+pub type KernelResult<T, E = KernelError> = std::result::Result<T, E>;
+
+/// A `Send` iterator of [`KernelResult<T>`] items.
 ///
-/// Convenience alias for the common pattern of returning a streaming, fallible iterator from
-/// kernel APIs.
-pub type DeltaResultIterator<'a, T> = Box<dyn Iterator<Item = DeltaResult<T>> + Send + 'a>;
+/// Use `impl KernelResultIterator<T>` for unboxed streams. At `dyn` and stored-iterator
+/// boundaries, erase with `Box<dyn KernelResultIterator<T>>` (`'static`) or
+/// `Box<dyn KernelResultIterator<T> + '_>` (borrowed).
+pub trait KernelResultIterator<T>: Iterator<Item = KernelResult<T>> + Send {}
 
-/// `'static` counterpart to [`DeltaResultIterator`] for cases where the iterator does not
-/// reference borrowed data.
-pub type DeltaResultIteratorStatic<T> = DeltaResultIterator<'static, T>;
+impl<T, I> KernelResultIterator<T> for I where I: Iterator<Item = KernelResult<T>> + Send {}
+
+/// An error validating connector-provided state for snapshot construction.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum SnapshotHintError {
+    /// A hint was combined with a log tail.
+    #[error("Invalid snapshot hint: A snapshot hint cannot be combined with a log tail")]
+    LogTail,
+    /// A hint was combined with incremental CRC replay.
+    #[error(
+        "Invalid snapshot hint: A snapshot hint cannot be combined with incremental CRC replay"
+    )]
+    IncrementalReplay,
+    /// The builder requested a version different from the hint's version.
+    #[error(
+        "Invalid snapshot hint: Requested version {requested} does not match snapshot hint version {hint}"
+    )]
+    VersionMismatch {
+        /// The version requested from the snapshot builder.
+        requested: Version,
+        /// The version described by the snapshot hint.
+        hint: Version,
+    },
+    /// The maximum catalog version differs from the hint when no time-travel version was
+    /// requested.
+    #[error(
+        "Invalid snapshot hint: Max catalog version {max_catalog_version} does not match snapshot \
+         hint version {hint}"
+    )]
+    MaxCatalogVersionMismatch {
+        /// The maximum version ratified by the catalog.
+        max_catalog_version: Version,
+        /// The version described by the snapshot hint.
+        hint: Version,
+    },
+    /// A hint marked latest conflicts with a later catalog-ratified version.
+    #[error(
+        "Invalid snapshot hint: version {hint} is marked latest but max catalog version is {max_catalog_version}"
+    )]
+    LatestVersionConflict {
+        /// The version described by the snapshot hint.
+        hint: Version,
+        /// The latest version ratified by the catalog.
+        max_catalog_version: Version,
+    },
+    /// The supplied log files contain log compaction files, which snapshot hints do not support.
+    #[error("Invalid snapshot hint: log compaction files are not supported")]
+    LogCompaction,
+    /// A supplied log file is not beneath the table's `_delta_log` root.
+    #[error("Invalid snapshot hint: log path '{path}' is not beneath log root '{log_root}'")]
+    LogPathOutsideRoot {
+        /// The supplied log file path.
+        path: String,
+        /// The expected table log root.
+        log_root: String,
+    },
+    /// The supplied log files cannot form a valid log segment.
+    #[error("Invalid snapshot hint: supplied log files do not form a valid log segment")]
+    LogSegment {
+        /// The log-segment construction error.
+        #[source]
+        source: Box<KernelError>,
+    },
+    /// The hint includes a published version after its snapshot version.
+    #[error("Invalid snapshot hint: max_published_version exceeds snapshot hint version {hint}")]
+    MaxPublishedVersion {
+        /// The version described by the snapshot hint.
+        hint: Version,
+    },
+    /// The hint has neither a complete checkpoint nor commit version zero.
+    #[error("Invalid snapshot hint: snapshot history does not start at version 0")]
+    MissingHistoryAnchor,
+    /// The supplied CRC describes a different table version.
+    #[error("Invalid snapshot hint: CRC version {crc} does not match snapshot hint version {hint}")]
+    CrcVersion {
+        /// The version described by the CRC.
+        crc: Version,
+        /// The version described by the snapshot hint.
+        hint: Version,
+    },
+    /// The supplied CRC protocol differs from the hint protocol.
+    #[error("Invalid snapshot hint: CRC protocol does not match snapshot hint protocol")]
+    CrcProtocol,
+    /// The supplied CRC metadata differs from the hint metadata.
+    #[error("Invalid snapshot hint: CRC metadata does not match snapshot hint metadata")]
+    CrcMetadata,
+    /// A connector reported invalid snapshot-hint state, optionally with an underlying error.
+    #[error("Invalid snapshot hint: {message}")]
+    Connector {
+        /// A description of the invalid connector state.
+        message: String,
+        /// The underlying validation error, if available.
+        #[source]
+        source: Option<Box<KernelError>>,
+    },
+}
+
+impl From<SnapshotHintError> for KernelError {
+    fn from(error: SnapshotHintError) -> Self {
+        Box::new(error).into()
+    }
+}
 
 /// All the types of errors that the kernel can run into
 #[non_exhaustive]
 #[derive(thiserror::Error, Debug)]
-pub enum Error {
+pub enum KernelError {
     /// This is an error that includes a backtrace. To have a particular type of error include such
     /// backtrace (when RUST_BACKTRACE=1), annotate the error with `#[error(transparent)]` and then
     /// add the error type and enum variant to the `from_with_backtrace!` macro invocation
@@ -128,6 +260,10 @@ pub enum Error {
     /// A generic error with a message
     #[error("Generic delta kernel error: {0}")]
     Generic(String),
+
+    /// Commit range configuration or construction failed.
+    #[error("Commit range error: {0}")]
+    CommitRange(String),
 
     /// A generic error wrapping another error
     #[error("Generic error: {source}")]
@@ -199,9 +335,36 @@ pub enum Error {
     #[error("Expected is missing: {0}")]
     MissingData(String),
 
-    /// A version for the delta table could not be found in the log
+    /// No table versions were found for the requested log operation.
     #[error("No table version found.")]
-    MissingVersion,
+    EmptyLog,
+
+    /// One or more table versions required by a log operation are unavailable.
+    ///
+    /// The payload is the lowest version that the operation requires but cannot obtain.
+    #[error("Table version {0} is missing or unavailable for this log operation.")]
+    MissingVersion(Version),
+
+    /// The requested start version is unavailable from the queried log segment, though later
+    /// versions remain.
+    #[error(
+        "Start version {requested} is not available; earliest available version is {earliest}."
+    )]
+    StartVersionNotFound {
+        /// The start version the caller requested.
+        requested: Version,
+        /// The earliest version servable from the queried log segment (always > `requested`).
+        /// This is the lowest version this producer can serve, not a promise about the lowest
+        /// version readable on disk: a checkpoint may have trimmed the segment past commits a
+        /// path-based read could still serve.
+        earliest: Version,
+    },
+
+    /// A table version required by an operation has not been published to the Delta log.
+    ///
+    /// The payload is the first unpublished version.
+    #[error("Table version {0} has not been published to the Delta log.")]
+    UnpublishedVersion(Version),
 
     /// An error occurred while working with deletion vectors
     #[error("Deletion Vector error: {0}")]
@@ -266,6 +429,10 @@ pub enum Error {
     #[error("Invalid decimal: {0}")]
     InvalidDecimal(String),
 
+    /// Interval value cannot be represented by its declared qualifier
+    #[error("Invalid interval: {0}")]
+    InvalidInterval(String),
+
     /// Invalid CRS or other parameter for a Geometry / Geography type
     #[error("Invalid geo parameters: {0}")]
     InvalidGeoParams(String),
@@ -282,9 +449,27 @@ pub enum Error {
     #[error("Invalid log path: {0}")]
     InvalidLogPath(String),
 
+    /// The assembled log segment is inconsistent with its declared file kinds, ordering, or
+    /// version bounds. Malformed checkpoint file sets use [`KernelError::InvalidCheckpoint`].
+    #[error("Invalid log segment: {0}")]
+    InvalidLogSegment(String),
+
+    /// Snapshot-hint validation failed. Log-segment errors caused by supplied hint state,
+    /// including invalid paths and checkpoints, are wrapped in `SnapshotHintError::LogSegment`.
+    /// Failures outside hint validation retain their existing categories.
+    #[error(transparent)]
+    SnapshotHint(#[from] Box<SnapshotHintError>),
+
     /// The file already exists at the path, prohibiting a non-overwrite write
     #[error("File already exists: {0}")]
     FileAlreadyExists(String),
+
+    /// A Delta table was found during create-table validation.
+    ///
+    /// The payload is the caller-supplied table path, not the normalized table URL. Concurrent
+    /// create attempts that pass validation surface as a commit conflict instead of this error.
+    #[error("Table already exists at path: {0}")]
+    TableAlreadyExistsAtPath(String),
 
     /// Some functionality is currently unsupported
     #[error("Unsupported: {0}")]
@@ -316,12 +501,6 @@ pub enum Error {
     #[error("Invalid Checkpoint: {0}")]
     InvalidCheckpoint(String),
 
-    /// Error while transforming a schema + leaves into an Expression of literals
-    #[error(transparent)]
-    LiteralExpressionTransformError(
-        #[from] crate::expressions::literal_expression_transform::Error,
-    ),
-
     /// Schema mismatch has occurred or invalid/not-kernel-supported schema used somewhere
     #[error("Schema error: {0}")]
     Schema(String),
@@ -335,7 +514,9 @@ pub enum Error {
     LogHistory(#[from] Box<crate::history_manager::error::LogHistoryError>),
 
     #[cfg(feature = "declarative-plans")]
-    #[error("Declarative plan execution yielded the incorrect type: expected PlanResult::{expected}, got PlanResult::{actual}")]
+    #[error(
+        "Declarative plan execution yielded the incorrect type: expected PlanResult::{expected}, got PlanResult::{actual}"
+    )]
     PlanResultTypeMismatch {
         expected: &'static str,
         actual: &'static str,
@@ -343,14 +524,14 @@ pub enum Error {
 
     /// The operation was cancelled via a [`CancellationToken`](crate::CancellationToken).
     ///
-    /// Surfaced by cancellation-aware reads as a terminal error, distinct from normal iterator
-    /// exhaustion. See [`CancellableIterator`](crate::cancellation) for the enforced contract.
+    /// Surfaced by cancellation-aware operations when a cancellation is detected. See the
+    /// [Engine operation cancellation contract](crate::cancellation#engine-operation-contract).
     #[error("Operation cancelled")]
     Cancelled,
 }
 
-// Convenience constructors for Error types that take a String argument
-impl Error {
+// Convenience constructors for KernelError types that take a String argument
+impl KernelError {
     pub(crate) fn scalar_conversion(
         expected: impl Into<String>,
         actual: impl Into<String>,
@@ -403,6 +584,11 @@ impl Error {
     pub fn invalid_decimal(msg: impl ToString) -> Self {
         Self::InvalidDecimal(msg.to_string())
     }
+    /// Creates an InvalidInterval error. The message explains why the interval value cannot be
+    /// represented by its qualifier.
+    pub fn invalid_interval(msg: impl ToString) -> Self {
+        Self::InvalidInterval(msg.to_string())
+    }
     #[cfg(feature = "geo-type-in-dev")]
     pub fn invalid_geo_params(msg: impl ToString) -> Self {
         Self::InvalidGeoParams(msg.to_string())
@@ -415,6 +601,10 @@ impl Error {
     }
     pub(crate) fn invalid_log_path(msg: impl ToString) -> Self {
         Self::InvalidLogPath(msg.to_string())
+    }
+
+    pub(crate) fn invalid_log_segment(msg: impl ToString) -> Self {
+        Self::InvalidLogSegment(msg.to_string())
     }
 
     pub fn internal_error(msg: impl ToString) -> Self {
@@ -435,8 +625,9 @@ impl Error {
     pub fn change_data_feed_unsupported(version: impl Into<Version>) -> Self {
         Self::ChangeDataFeedUnsupported(version.into())
     }
-    /// Creates an [`Error::RowTrackingChangeFeedUnsupported`] for the given version, used when row
-    /// tracking is not enabled at some point in a row-tracking change feed's version range.
+    /// Creates a [`KernelError::RowTrackingChangeFeedUnsupported`] for the given version, used
+    /// when row tracking is not enabled at some point in a row-tracking change feed's version
+    /// range.
     pub(crate) fn row_tracking_change_feed_unsupported(version: impl Into<Version>) -> Self {
         Self::RowTrackingChangeFeedUnsupported(version.into())
     }
@@ -476,6 +667,16 @@ impl Error {
         Self::PlanResultTypeMismatch { expected, actual }
     }
 
+    /// Returns the first error that is not wrapped by [`KernelError::Backtraced`].
+    ///
+    /// If this error has no backtrace wrapper, this returns `self`.
+    pub fn without_backtrace(&self) -> &Self {
+        match self {
+            Self::Backtraced { source, .. } => source.without_backtrace(),
+            error => error,
+        }
+    }
+
     // Capture a backtrace when the error is constructed.
     #[must_use]
     pub fn with_backtrace(self) -> Self {
@@ -493,7 +694,7 @@ impl Error {
 macro_rules! from_with_backtrace(
     ( $(($error_type: ty, $error_variant: ident)), * ) => {
         $(
-            impl From<$error_type> for Error {
+            impl From<$error_type> for KernelError {
                 fn from(value: $error_type) -> Self {
                     Self::$error_variant(value).with_backtrace()
                 }
@@ -508,14 +709,14 @@ from_with_backtrace!(
 );
 
 #[cfg(feature = "default-engine-base")]
-impl From<ArrowError> for Error {
+impl From<ArrowError> for KernelError {
     fn from(value: ArrowError) -> Self {
         Self::Arrow(value).with_backtrace()
     }
 }
 
 #[cfg(feature = "default-engine-base")]
-impl From<object_store::Error> for Error {
+impl From<object_store::Error> for KernelError {
     fn from(value: object_store::Error) -> Self {
         match value {
             object_store::Error::NotFound { path, .. } => Self::file_not_found(path),
@@ -524,11 +725,11 @@ impl From<object_store::Error> for Error {
     }
 }
 
-/// This impl is needed so the `?` operator can auto-convert `Result<T, Infallible>` to
-/// `DeltaResult<T>`. For example, `TryFrom` impls for infallible conversions use `Infallible` as
+/// This impl is needed so the `?` operator can auto-convert `KernelResult<T, Infallible>` to
+/// `KernelResult<T>`. For example, `TryFrom` impls for infallible conversions use `Infallible` as
 /// their error type, and this allows those results to be propagated with `?` in functions
-/// returning `DeltaResult`. The match is unreachable since `Infallible` has no variants.
-impl From<Infallible> for Error {
+/// returning `KernelResult`. The match is unreachable since `Infallible` has no variants.
+impl From<Infallible> for KernelError {
     fn from(value: Infallible) -> Self {
         match value {}
     }

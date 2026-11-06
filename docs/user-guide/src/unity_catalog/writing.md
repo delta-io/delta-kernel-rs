@@ -3,9 +3,9 @@
 <!-- Page type: How-to -->
 <!-- Crates: delta-kernel-unity-catalog, unity-catalog-delta-client-api, unity-catalog-delta-rest-client -->
 
-To write to a Unity Catalog-managed Delta table, you create a `UCCommitter`,
-pass it to a Kernel transaction, and then publish the staged commit to make it
-visible in `_delta_log/`.
+To write to a Unity Catalog-managed Delta table, you create a `UCCommitter`, pass it to
+`UpdateTableTransactionBuilder::build()`, and then publish the staged commit to make it visible in
+`_delta_log/`.
 
 Before reading this page, make sure you understand the generic
 [catalog-managed write lifecycle](../catalog_managed/writing.md) and the
@@ -69,6 +69,7 @@ Catalog to ratify. Construct it with the commit client and the table's
 three-part name plus its table ID.
 
 ```rust,ignore
+use delta_kernel::transaction::UpdateTableOperation;
 use delta_kernel_unity_catalog::UCCommitter;
 use unity_catalog_delta_client_api::TableIdentifier;
 
@@ -78,8 +79,13 @@ let committer = Box::new(UCCommitter::new(
     table_id.clone(),
     TableIdentifier::new("my_catalog", "my_schema", "my_table"),
 ));
-let mut txn = snapshot.clone().transaction(committer, &engine)?
-    .with_operation("INSERT".to_string());
+let mut txn = snapshot.clone()
+    .update_table(
+        UpdateTableOperation::Custom("INSERT".to_string()),
+        "my-app/1.0",
+        /* data_change */ true,
+    )
+    .build(&engine, committer)?;
 ```
 
 `UCCommitter` requires a multi-threaded tokio runtime. The default Kernel
@@ -101,9 +107,12 @@ From this point, writing data works the same as any Kernel transaction. Get the
 write context, write Parquet files to the table's storage location, and add the
 resulting file metadata to the transaction.
 
+This example writes to an unpartitioned table. For a partitioned table, call
+`with_partition_values(...)` before `build()`.
+
 ```rust,ignore
 let write_state = txn.write_state()?;
-let write_context = write_state.unpartitioned_write_context()?;
+let write_context = write_state.write_context_builder().build()?;
 // ... write Parquet files using write_context ...
 txn.add_files(file_metadata);
 ```
@@ -119,30 +128,29 @@ Call `txn.commit()` to stage the commit and ratify it through UC.
 use delta_kernel::transaction::CommitResult;
 
 match txn.commit(&engine)? {
-    CommitResult::CommittedTransaction(committed) => {
+    CommitResult::Committed(committed) => {
         let version = committed.commit_version();
         let post_commit_snapshot = committed
             .post_commit_snapshot()
             .expect("post-commit snapshot");
         // Proceed to publish (next step)
     }
-    CommitResult::ConflictedTransaction(conflicted) => {
+    CommitResult::Conflicted(conflicted) => {
         // Another writer committed this version first. Rebase onto the new
         // snapshot and retry. UCCommitter does not retry at this level.
     }
-    CommitResult::RetryableTransaction(_retryable) => {
+    CommitResult::Retryable(_retryable) => {
         // Transient I/O or server error after the UC HTTP client's own retry
         // budget was exhausted. Retry the commit from scratch.
     }
 }
 ```
 
-The REST client automatically retries transport-level failures (HTTP 5xx,
-connection errors) according to the retry knobs on `ClientConfigBuilder`. See
-[Client configuration and retries](./overview.md#client-configuration-and-retries).
-Once that budget is exhausted, `UCCommitter` surfaces the failure as
-`CommitResult::RetryableTransaction`. Transaction-level retries (including
-rebasing after a `ConflictedTransaction`) are the connector's responsibility;
+The REST client automatically retries transport-level failures (HTTP 5xx, connection errors)
+according to the retry knobs on `ClientConfigBuilder`. See [Client configuration and
+retries](./overview.md#client-configuration-and-retries).  Once that budget is exhausted,
+`UCCommitter` surfaces the failure as `CommitResult::Retryable`. Transaction-level retries
+(including rebasing after a `CommitResult::Conflicted`) are the connector's responsibility;
 `UCCommitter` does not retry commits itself.
 
 Under the hood, `UCCommitter::commit` does two things for versions >= 1:
@@ -159,10 +167,10 @@ See [Creating UC Tables](./creating_tables.md) for the creation flow and
 generic ratification flow.
 
 > [!WARNING]
-> `UCCommitter` does not support ALTER TABLE operations (protocol changes,
-> metadata changes, or clustering column changes). It also rejects attempts to
-> upgrade a path-based table to catalog-managed or downgrade a catalog-managed
-> table to path-based. Attempting any of these returns an error.
+> For existing-table writes, `UCCommitter` rejects protocol, table-metadata, and clustering-column
+> changes. This blocks both standalone ALTER TABLE and schema evolution during writes, regardless
+> of `data_change`. It also rejects attempts to upgrade a path-based table to catalog-managed or
+> downgrade a catalog-managed table to path-based. Attempting any of these returns an error.
 
 ## Publish staged commits
 
@@ -249,7 +257,7 @@ checkpointing fails because it can only operate on published versions.
 
 ```rust,ignore
 use std::sync::Arc;
-use delta_kernel::transaction::CommitResult;
+use delta_kernel::transaction::{CommitResult, UpdateTableOperation};
 use delta_kernel_unity_catalog::{snapshot_builder_from_load_table, UCCommitter};
 use unity_catalog_delta_client_api::{Operation, TableIdentifier};
 use unity_catalog_delta_rest_client::{ClientConfig, UCClient, UCUpdateTableRestClient};
@@ -283,12 +291,17 @@ let committer = Box::new(UCCommitter::new(
     table_id.clone(),
     TableIdentifier::new("my_catalog", "my_schema", "my_table"),
 ));
-let mut txn = snapshot.clone().transaction(committer, &engine)?
-    .with_operation("INSERT".to_string());
+let mut txn = snapshot.clone()
+    .update_table(
+        UpdateTableOperation::Custom("INSERT".to_string()),
+        "my-app/1.0",
+        /* data_change */ true,
+    )
+    .build(&engine, committer)?;
 
 // 6. Write data
 let write_state = txn.write_state()?;
-let write_context = write_state.unpartitioned_write_context()?;
+let write_context = write_state.write_context_builder().build()?;
 // ... write Parquet files using write_context ...
 txn.add_files(file_metadata);
 
@@ -300,7 +313,7 @@ let committer_for_publish: Box<dyn delta_kernel::committer::Committer> = Box::ne
 ));
 
 match txn.commit(&engine)? {
-    CommitResult::CommittedTransaction(committed) => {
+    CommitResult::Committed(committed) => {
         let post_commit_snapshot = committed
             .post_commit_snapshot()
             .expect("post-commit snapshot");
@@ -312,8 +325,8 @@ match txn.commit(&engine)? {
         // Checkpoint the published snapshot
         published_snapshot.checkpoint(&engine, None)?;
     }
-    CommitResult::ConflictedTransaction(_) => { /* rebase and retry */ }
-    CommitResult::RetryableTransaction(_) => { /* retry the commit */ }
+    CommitResult::Conflicted(_) => { /* rebase and retry */ }
+    CommitResult::Retryable(_) => { /* retry the commit */ }
 }
 ```
 

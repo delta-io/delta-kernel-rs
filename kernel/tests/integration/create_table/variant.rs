@@ -6,16 +6,16 @@
 
 use std::sync::Arc;
 
+use delta_kernel::KernelResult;
 use delta_kernel::committer::FileSystemCommitter;
-use delta_kernel::schema::{schema_ref, StructType};
+use delta_kernel::schema::{StructType, schema_ref};
 use delta_kernel::snapshot::Snapshot;
 use delta_kernel::table_features::{
-    ColumnMappingMode, TableFeature, TABLE_FEATURES_MIN_READER_VERSION,
-    TABLE_FEATURES_MIN_WRITER_VERSION,
+    ColumnMappingMode, TABLE_FEATURES_MIN_READER_VERSION, TABLE_FEATURES_MIN_WRITER_VERSION,
+    TableFeature,
 };
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
-use delta_kernel::DeltaResult;
 use test_utils::{
     assert_result_error_with_message, cm_properties, multiple_variant_schema,
     nested_variant_schema, test_table_setup, top_level_variant_schema,
@@ -49,10 +49,10 @@ fn test_create_table_with_variant(
     )]
     schema: Arc<StructType>,
     #[values("none", "name", "id")] cm_mode: &str,
-) -> DeltaResult<()> {
+) -> KernelResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
-    let _ = create_table(&table_path, schema.clone(), "Test/1.0")
+    let _ = create_table(&table_path, schema.clone(), "Test/1.0", true)
         .with_table_properties(cm_properties(cm_mode))
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
         .commit(engine.as_ref())?;
@@ -91,7 +91,7 @@ fn test_create_table_with_variant(
 
 /// A schema without variant columns should not add the variantType feature.
 #[test]
-fn test_create_table_no_variant_no_feature() -> DeltaResult<()> {
+fn test_create_table_no_variant_no_feature() -> KernelResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
     let schema = schema_ref! {
@@ -99,7 +99,7 @@ fn test_create_table_no_variant_no_feature() -> DeltaResult<()> {
         nullable "name": STRING,
     };
 
-    let _ = create_table(&table_path, schema, "Test/1.0")
+    let _ = create_table(&table_path, schema, "Test/1.0", true)
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
         .commit(engine.as_ref())?;
 
@@ -117,10 +117,10 @@ fn test_create_table_no_variant_no_feature() -> DeltaResult<()> {
 
 /// Clustering on a variant column is rejected per the Delta spec.
 #[test]
-fn test_create_table_variant_clustering_rejected() -> DeltaResult<()> {
+fn test_create_table_variant_clustering_rejected() -> KernelResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
-    let result = create_table(&table_path, top_level_variant_schema(), "Test/1.0")
+    let result = create_table(&table_path, top_level_variant_schema(), "Test/1.0", true)
         .with_data_layout(DataLayout::clustered(["col"]))
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()));
 

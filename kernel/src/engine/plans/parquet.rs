@@ -8,8 +8,8 @@ use url::Url;
 use crate::plans::{IoOperation, Operation, PlanBuilder, PlanExecutor};
 use crate::schema::SchemaRef;
 use crate::{
-    DeltaResult, DeltaResultIteratorStatic, EngineData, Error, FileDataReadResultIterator,
-    FileMeta, ParquetFooter, ParquetHandler, PredicateRef,
+    EngineData, FileDataReadResultIterator, FileMeta, FileSize, KernelError, KernelResult,
+    KernelResultIterator, ParquetFooter, ParquetHandler, PredicateRef,
 };
 
 /// A [`ParquetHandler`] that delegates to a [`PlanExecutor`].
@@ -41,7 +41,7 @@ impl ParquetHandler for PlanBasedParquetHandler {
         files: &[FileMeta],
         physical_schema: SchemaRef,
         _predicate: Option<PredicateRef>,
-    ) -> DeltaResult<FileDataReadResultIterator> {
+    ) -> KernelResult<FileDataReadResultIterator> {
         // TODO: `_predicate` is dropped. Re-apply it as a Filter node over the scan; the
         // single-node executor can then match the filter -> scan shape.
         let query = PlanBuilder::scan_parquet(files.to_vec(), &[], physical_schema)?.build()?;
@@ -53,10 +53,10 @@ impl ParquetHandler for PlanBasedParquetHandler {
     fn write_parquet_file(
         &self,
         location: Url,
-        data: DeltaResultIteratorStatic<Box<dyn EngineData>>,
-    ) -> DeltaResult<()> {
+        data: Box<dyn KernelResultIterator<Box<dyn EngineData>>>,
+    ) -> KernelResult<FileSize> {
         let Some(fallback) = &self.fallback else {
-            return Err(Error::unsupported(
+            return Err(KernelError::unsupported(
                 "PlanBasedParquetHandler does not support write_parquet_file yet, and no fallback \
                  handler is configured",
             ));
@@ -65,7 +65,7 @@ impl ParquetHandler for PlanBasedParquetHandler {
         fallback.write_parquet_file(location, data)
     }
 
-    fn read_parquet_footer(&self, file: &FileMeta) -> DeltaResult<ParquetFooter> {
+    fn read_parquet_footer(&self, file: &FileMeta) -> KernelResult<ParquetFooter> {
         let op = IoOperation::parquet_footer(file.clone());
         self.executor
             .execute_op(Operation::IoOperation(op))?
@@ -87,10 +87,10 @@ mod tests {
     use crate::arrow::array::{Array, Int64Array, RecordBatch};
     use crate::engine::arrow_conversion::TryIntoKernel as _;
     use crate::engine::arrow_data::ArrowEngineData;
-    use crate::engine::sync::plan::SyncPlanExecutor;
     use crate::engine::sync::SyncEngine;
+    use crate::engine::sync::plan::SyncPlanExecutor;
     use crate::parquet::arrow::arrow_writer::ArrowWriter;
-    use crate::schema::{schema_ref, SchemaRef};
+    use crate::schema::{SchemaRef, schema_ref};
     use crate::{Engine as _, EngineData, FileMeta, ParquetHandler as _};
 
     fn make_handler() -> PlanBasedParquetHandler {

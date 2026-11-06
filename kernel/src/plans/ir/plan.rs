@@ -1,6 +1,7 @@
 //! Plan containers ([`Plan`], [`PlanNode`]).
 
 pub use super::nodes::Operator;
+use crate::schema::SchemaRef;
 
 // ============================================================================
 // Plan nodes
@@ -41,6 +42,8 @@ impl PlanNode {
 ///   `Project`.
 /// - `inputs` is a `Vec<usize>` naming the indices of the upstream nodes the operator reads from.
 ///
+/// `schema` is the terminal node's output schema.
+///
 /// A node depends on another when one of its `inputs` is that node's index. `nodes` is stored in
 /// topological order: every node appears after the nodes it consumes (each input index is
 /// strictly less than the node's own index), so an engine can evaluate `nodes` in slice order;
@@ -68,6 +71,7 @@ impl PlanNode {
 ///
 /// ```text
 /// Plan {
+///     schema: ...,
 ///     nodes: vec![
 ///         PlanNode { op: ScanParquet(..), inputs: vec![]     },  // node 0
 ///         PlanNode { op: ScanParquet(..), inputs: vec![]     },  // node 1
@@ -96,5 +100,7 @@ impl PlanNode {
 /// node to the caller.
 #[derive(Debug, Clone)]
 pub struct Plan {
+    /// The terminal node's output schema.
+    pub schema: SchemaRef,
     pub nodes: Vec<PlanNode>,
 }

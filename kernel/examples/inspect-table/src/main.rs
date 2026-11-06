@@ -5,20 +5,20 @@ use std::sync::{Arc, LazyLock};
 use clap::{Parser, Subcommand};
 use common::{LocationArgs, ParseWithExamples};
 use delta_kernel::actions::visitors::{
-    visit_metadata_at, visit_protocol_at, AddVisitor, CdcVisitor, RemoveVisitor,
-    SetTransactionVisitor, SidecarVisitor,
+    AddVisitor, CdcVisitor, RemoveVisitor, SetTransactionVisitor, SidecarVisitor,
+    visit_metadata_at, visit_protocol_at,
 };
 use delta_kernel::actions::{
-    get_all_actions_schema, ADD_NAME, CDC_NAME, METADATA_NAME, PROTOCOL_NAME, REMOVE_NAME,
-    SET_TRANSACTION_NAME, SIDECAR_NAME,
+    ADD_NAME, CDC_NAME, METADATA_NAME, PROTOCOL_NAME, REMOVE_NAME, SET_TRANSACTION_NAME,
+    SIDECAR_NAME, get_all_actions_schema,
 };
 use delta_kernel::engine_data::{GetData, RowVisitor, TypedGetData as _};
 use delta_kernel::expressions::ColumnName;
 use delta_kernel::metrics::{LoggingMetricsReporter, WithMetricsReporterLayer};
-use delta_kernel::scan::state::ScanFile;
 use delta_kernel::scan::ScanBuilder;
+use delta_kernel::scan::state::ScanFile;
 use delta_kernel::schema::{ColumnNamesAndTypes, DataType};
-use delta_kernel::{DeltaResult, Error, Snapshot};
+use delta_kernel::{KernelError, KernelResult, Snapshot};
 use tracing_subscriber::layer::SubscriberExt as _;
 use tracing_subscriber::util::SubscriberInitExt as _;
 
@@ -114,10 +114,10 @@ impl RowVisitor for LogVisitor {
     fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
         NAMES_AND_TYPES.as_ref()
     }
-    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
+    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> KernelResult<()> {
         let expected = NAMES_AND_TYPES.as_ref().0.len();
         if getters.len() != expected {
-            return Err(Error::InternalError(format!(
+            return Err(KernelError::InternalError(format!(
                 "Wrong number of LogVisitor getters: {}, expected {expected}",
                 getters.len()
             )));
@@ -195,7 +195,7 @@ fn print_scan_file(_: &mut (), file: ScanFile) {
     );
 }
 
-fn try_main() -> DeltaResult<()> {
+fn try_main() -> KernelResult<()> {
     let cli = Cli::parse_with_examples(env!("CARGO_PKG_NAME"), "Inspect", "inspect", "<COMMAND>");
 
     let url = delta_kernel::try_parse_uri(&cli.location_args.path)?;

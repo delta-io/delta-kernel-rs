@@ -11,6 +11,7 @@
 #
 #   BASE_REF   - base branch ref (e.g. "main")
 #   HEAD_SHA   - full SHA of the PR head commit
+#   RUNNER_TEMP - directory for isolated Criterion output and temporary comparisons
 #   COMMENT    - (optional) /bench PR comment body. Unset under the
 #                pull_request auto-trigger path; set to the comment
 #                body under the issue_comment path.
@@ -26,7 +27,7 @@ shopt -s extglob
 
 # ---------------------------------------------------------------------------
 # 1. Parse the /bench comment
-#    Syntax: /bench [--tags <csv>] [--filter <regex>]
+#    Syntax: /bench [--tags <csv>] [--filter <regex>] [--archive]
 #      --tags    sets BENCH_TAGS (comma-separated tag list); defaults to "base"
 #                when the comment is just /bench (or COMMENT is unset, i.e.
 #                the auto-trigger path)
@@ -41,6 +42,7 @@ ARGS="${ARGS##+( )}"
 
 TAGS=""
 FILTER=""
+ARCHIVE_RESULTS=false
 
 if [[ -z "$ARGS" ]]; then
   # Bare /bench with no args: default to the "base" tag
@@ -58,6 +60,7 @@ else
     case "${TOKENS[$i]}" in
       --tags)   i=$((i + 1)); TAGS="${TOKENS[$i]:-}"   ;;
       --filter) i=$((i + 1)); FILTER="${TOKENS[$i]:-}" ;;
+      --archive) ARCHIVE_RESULTS=true ;;
       *)        echo "Unknown token: '${TOKENS[$i]}'" >&2; exit 1 ;;
     esac
     i=$((i + 1))
@@ -91,17 +94,25 @@ echo "==========================="
 # ---------------------------------------------------------------------------
 # HEAD is the merge commit checked out by the workflow; capture it so step 5 can
 # restore this tree after the base checkout below.
+BENCH_RESULTS_DIR=$(mktemp -d "$RUNNER_TEMP/bench-results.XXXXXX")
+if [[ -n "${GITHUB_OUTPUT:-}" ]]; then
+  printf 'results_dir=%s\narchive_results=true\n' "$BENCH_RESULTS_DIR" >> "$GITHUB_OUTPUT"
+fi
+BENCH_COMPARISON_DIR=$(mktemp -d "$RUNNER_TEMP/bench-comparison.XXXXXX")
 MERGE_SHA=$(git rev-parse HEAD)
-(cd benchmarks && cargo bench --locked --bench workload_bench -- --save-baseline changes "$FILTER")
+printf 'Benchmark phase: changes, commit: %s\n' "$MERGE_SHA"
+(cd benchmarks && CRITERION_HOME="$BENCH_RESULTS_DIR/changes/criterion" \
+  cargo bench --locked --bench workload_bench -- --save-baseline changes "$FILTER")
 
 # ---------------------------------------------------------------------------
 # 4. Switch to the base branch and benchmark it
-#    The benchmarks/target/ directory is not tracked by git, so the
-#    "changes" baseline files are preserved across the branch switch.
+#    Criterion output is outside the checkout, so both measurement trees survive.
 # ---------------------------------------------------------------------------
 git fetch origin -- "$BASE_REF"
 git checkout FETCH_HEAD
-(cd benchmarks && cargo bench --locked --bench workload_bench -- --save-baseline base "$FILTER")
+printf 'Benchmark phase: base, commit: %s\n' "$(git rev-parse HEAD)"
+(cd benchmarks && CRITERION_HOME="$BENCH_RESULTS_DIR/base/criterion" \
+  cargo bench --locked --bench workload_bench -- --save-baseline base "$FILTER")
 
 # ---------------------------------------------------------------------------
 # 5. Compare baselines with critcmp and format as a markdown comment
@@ -114,17 +125,19 @@ git checkout FETCH_HEAD
 # PR's own formatter (a formatter change is then exercised on the PR that
 # introduces it). The raw PR-head SHA is not reachable in the shallow merge-ref
 # checkout, so restore the merge commit captured in step 3. Only tracked sources
-# move; the `base`/`changes` criterion baselines live in gitignored
-# benchmarks/target/ and survive the checkout.
+# move; the Criterion output stays in RUNNER_TEMP.
 git checkout "$MERGE_SHA"
-# Use `critcmp` to compare the criterion output for `base` and `changes`. We use `critcmp` instead of manually
-# parsing criterion outputs because criterion may update its output format. By using `critcmp`, we inherit all
-# updated criterion output parsing.
+# Use `critcmp` to compare the Criterion output for `base` and `changes`, so its parser handles the
+# output format rather than duplicating that parsing here.
 #
 # parse_critcmp.py records whether any benchmark regressed past its fail
 # threshold in this file; benchmark.yml's gate step reads it to fail the job.
 export BENCH_REGRESSION_FILE=/tmp/bench-regression.txt
-COMPARISON=$((cd benchmarks && critcmp base changes) | python3 benchmarks/ci/parse_critcmp.py)
+critcmp --target-dir "$BENCH_RESULTS_DIR/base" --export base > "$BENCH_COMPARISON_DIR/base.json"
+critcmp --target-dir "$BENCH_RESULTS_DIR/changes" --export changes \
+  > "$BENCH_COMPARISON_DIR/changes.json"
+COMPARISON=$(critcmp "$BENCH_COMPARISON_DIR/base.json" "$BENCH_COMPARISON_DIR/changes.json" \
+  | python3 benchmarks/ci/parse_critcmp.py)
 
 # ---------------------------------------------------------------------------
 # 6. Write results to /tmp/bench-comment.md
@@ -150,3 +163,11 @@ SUMMARY+=" &middot; Updated: $(TZ=America/Los_Angeles date '+%Y-%m-%d %H:%M %Z')
   echo "$COMPARISON"
   echo "<sub>${SUMMARY}</sub>"
 } > /tmp/bench-comment.md
+
+REGRESSED=$(cat "$BENCH_REGRESSION_FILE")
+if [[ "$REGRESSED" == "true" ]]; then
+  ARCHIVE_RESULTS=true
+fi
+if [[ -n "${GITHUB_OUTPUT:-}" ]]; then
+  printf 'archive_results=%s\n' "$ARCHIVE_RESULTS" >> "$GITHUB_OUTPUT"
+fi

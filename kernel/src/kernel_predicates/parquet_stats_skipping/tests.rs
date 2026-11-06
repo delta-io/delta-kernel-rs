@@ -1,7 +1,9 @@
+use derive_more::Constructor;
+
 use super::*;
-use crate::expressions::{col, lit, Expression as Expr, Predicate as Pred};
-use crate::kernel_predicates::KernelPredicateEvaluator as _;
 use crate::DataType;
+use crate::expressions::{Expression as Expr, Predicate as Pred, col, expr};
+use crate::kernel_predicates::KernelPredicateEvaluator as _;
 
 const TRUE: Option<bool> = Some(true);
 const FALSE: Option<bool> = Some(false);
@@ -129,14 +131,12 @@ fn test_junctions() {
     }
 }
 
+#[derive(Constructor)]
 struct MinMaxTestFilter {
     min: Option<Scalar>,
     max: Option<Scalar>,
 }
 impl MinMaxTestFilter {
-    fn new(min: Option<Scalar>, max: Option<Scalar>) -> Self {
-        Self { min, max }
-    }
     fn get_stat_value(stat: &Option<Scalar>, data_type: &DataType) -> Option<Scalar> {
         stat.as_ref()
             .filter(|v| v.data_type() == *data_type)
@@ -169,12 +169,12 @@ fn test_eval_binary_comparisons() {
     const NULL_VAL: Scalar = Scalar::Null(DataType::INTEGER);
 
     let predicates = [
-        Pred::lt(col!("x"), lit(10)),
-        Pred::le(col!("x"), lit(10)),
-        Pred::eq(col!("x"), lit(10)),
-        Pred::ne(col!("x"), lit(10)),
-        Pred::gt(col!("x"), lit(10)),
-        Pred::ge(col!("x"), lit(10)),
+        Pred::from_expr(expr!(col("x") < 10)),
+        Pred::from_expr(expr!(col("x") <= 10)),
+        Pred::from_expr(expr!(col("x") == 10)),
+        Pred::from_expr(expr!(col("x") != 10)),
+        Pred::from_expr(expr!(col("x") > 10)),
+        Pred::from_expr(expr!(col("x") >= 10)),
     ];
 
     let do_test = |min: Scalar, max: Scalar, expected: &[Option<bool>]| {
@@ -204,17 +204,10 @@ fn test_eval_binary_comparisons() {
     do_test(FIVE, FIFTEEN, &[TRUE, TRUE, TRUE, TRUE, TRUE, TRUE]);
 }
 
+#[derive(Constructor)]
 struct NullCountTestFilter {
     nullcount: Option<i64>,
     rowcount: i64,
-}
-impl NullCountTestFilter {
-    fn new(nullcount: Option<i64>, rowcount: i64) -> Self {
-        Self {
-            nullcount,
-            rowcount,
-        }
-    }
 }
 impl ParquetStatsProvider for NullCountTestFilter {
     fn get_parquet_min_stat(&self, _col: &ColumnName, _data_type: &DataType) -> Option<Scalar> {
@@ -236,7 +229,10 @@ impl ParquetStatsProvider for NullCountTestFilter {
 
 #[test]
 fn test_eval_is_null() {
-    let expressions = [Pred::is_null(col!("x")), Pred::is_not_null(col!("x"))];
+    let expressions = [
+        Pred::from_expr(expr!(is_null(col("x")))),
+        Pred::from_expr(expr!(is_not_null(col("x")))),
+    ];
 
     let do_test = |nullcount: i64, expected: &[Option<bool>]| {
         let filter = NullCountTestFilter::new(Some(nullcount), 2);

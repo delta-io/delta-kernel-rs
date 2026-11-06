@@ -1,20 +1,22 @@
 use std::ops::{Add, Div, Mul, Sub};
 
-use rstest::rstest;
 use Expression as Expr;
 use Predicate as Pred;
+use rstest::rstest;
 
 use super::*;
+use crate::KernelResult;
 use crate::arrow::array::{
-    create_array, Array, ArrayRef, AsArray, BinaryViewArray, BooleanArray, GenericStringArray,
-    Int32Array, Int32Builder, ListArray, ListViewArray, MapArray, MapBuilder, MapFieldNames,
-    StringArray, StringBuilder, StringViewArray, StructArray, TimestampNanosecondArray,
+    Array, ArrayRef, AsArray, BinaryViewArray, BooleanArray, GenericStringArray, Int32Array,
+    Int32Builder, ListArray, ListViewArray, MapArray, MapBuilder, MapFieldNames, StringArray,
+    StringBuilder, StringViewArray, StructArray, TimestampNanosecondArray, create_array,
 };
 use crate::arrow::buffer::{BooleanBuffer, NullBuffer, OffsetBuffer, ScalarBuffer};
 use crate::arrow::compute::kernels::cmp::{gt_eq, lt};
 use crate::arrow::datatypes::{
     DataType, Field, Fields, Schema, TimeUnit, TimestampMicrosecondType,
 };
+use crate::engine::arrow_conversion::TryIntoKernel as _;
 use crate::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt as _};
 use crate::engine::arrow_expression::evaluate_expression::to_json;
 use crate::engine::arrow_expression::opaque::{
@@ -30,12 +32,12 @@ use crate::kernel_predicates::{
 #[cfg(feature = "geo-type-in-dev")]
 use crate::schema::EdgeInterpolationAlgorithm;
 use crate::schema::{
-    schema, schema_ref, ArrayType, DataType as KernelDataType, MapType, StructField, StructType,
+    ArrayType, DataType as KernelDataType, IntervalYearToMonthType, MapType, StructField,
+    StructType, schema, schema_ref,
 };
 use crate::unit_test_utils::assert_result_error_with_message;
 #[cfg(feature = "geo-type-in-dev")]
 use crate::unit_test_utils::{geography_type, geometry_type};
-use crate::EvaluationHandlerExtension as _;
 
 #[test]
 fn test_array_column() {
@@ -67,6 +69,25 @@ fn test_array_column() {
 
     let result = evaluate_predicate(&in_op, &batch, true).unwrap();
     assert_eq!(result, expected_not_in);
+}
+
+/// Verifies that null UDT scalars materialize as their physical Arrow type and remain compatible
+/// with the logical UDT.
+#[cfg(feature = "udt-in-dev")]
+#[rstest]
+#[case(KernelDataType::LONG)]
+#[case(KernelDataType::from(schema! { nullable "x": LONG }))]
+#[case(KernelDataType::from(ArrayType::new(KernelDataType::LONG, true)))]
+#[case(KernelDataType::from(MapType::new(KernelDataType::STRING, KernelDataType::LONG, true)))]
+fn null_udt_scalar_uses_physical_type(#[case] sql_type: KernelDataType) {
+    let udt = KernelDataType::from(
+        crate::schema::UserDefinedType::try_new(sql_type.clone(), Default::default()).unwrap(),
+    );
+    let array = Scalar::null(udt.clone()).to_array(3).unwrap();
+    let expected = Scalar::null(sql_type).to_array(3).unwrap();
+    assert_eq!(array.as_ref(), expected.as_ref());
+    assert!(top_level_types_compatible(&udt, array.data_type()));
+    assert!(!top_level_types_compatible(&udt, &DataType::Boolean));
 }
 
 #[test]
@@ -148,58 +169,57 @@ fn test_in_predicate_with_list_view_column() {
 #[case::utf8view(
     Arc::new(StringViewArray::from(vec![None, Some("apple"), Some("hello"), Some("zebra")])) as ArrayRef,
     DataType::Utf8View,
-    lit("hello"),
+    Scalar::from("hello"),
 )]
 #[case::large_utf8(
     Arc::new(GenericStringArray::<i64>::from(vec![None, Some("apple"), Some("hello"), Some("zebra")])) as ArrayRef,
     DataType::LargeUtf8,
-    lit("hello"),
+    Scalar::from("hello"),
 )]
 #[case::binary_view(
     Arc::new(BinaryViewArray::from(vec![None, Some(b"apple".as_ref()), Some(b"hello"), Some(b"zebra")])) as ArrayRef,
     DataType::BinaryView,
-    lit(b"hello".as_ref()),
+    Scalar::from(b"hello".as_ref()),
 )]
 fn test_binary_predicate_with_view_types(
     #[case] array: ArrayRef,
     #[case] dtype: DataType,
-    #[case] lit: Expr,
+    #[case] value: Scalar,
 ) {
     let schema = Schema::new([Arc::new(Field::new("col", dtype, true))]);
     let batch = RecordBatch::try_new(Arc::new(schema), vec![array]).unwrap();
-    let column = col!("col");
 
-    let predicate_lt = column.clone().lt(lit.clone());
+    let predicate_lt = Pred::from_expr(expr!(col("col") < lit(value.clone())));
     let results = evaluate_predicate(&predicate_lt, &batch, false).unwrap();
     let expected_lt = BooleanArray::from(vec![None, Some(true), Some(false), Some(false)]);
     assert_eq!(results, expected_lt);
 
-    let predicate_le = column.clone().le(lit.clone());
+    let predicate_le = Pred::from_expr(expr!(col("col") <= lit(value.clone())));
     let results = evaluate_predicate(&predicate_le, &batch, false).unwrap();
     let expected_le = BooleanArray::from(vec![None, Some(true), Some(true), Some(false)]);
     assert_eq!(results, expected_le);
 
-    let predicate_gt = column.clone().gt(lit.clone());
+    let predicate_gt = Pred::from_expr(expr!(col("col") > lit(value.clone())));
     let results = evaluate_predicate(&predicate_gt, &batch, false).unwrap();
     let expected_gt = BooleanArray::from(vec![None, Some(false), Some(false), Some(true)]);
     assert_eq!(results, expected_gt);
 
-    let predicate_ge = column.clone().ge(lit.clone());
+    let predicate_ge = Pred::from_expr(expr!(col("col") >= lit(value.clone())));
     let results = evaluate_predicate(&predicate_ge, &batch, false).unwrap();
     let expected_ge = BooleanArray::from(vec![None, Some(false), Some(true), Some(true)]);
     assert_eq!(results, expected_ge);
 
-    let predicate_eq = column.clone().eq(lit.clone());
+    let predicate_eq = Pred::from_expr(expr!(col("col") == lit(value.clone())));
     let results = evaluate_predicate(&predicate_eq, &batch, false).unwrap();
     let expected_eq = BooleanArray::from(vec![None, Some(false), Some(true), Some(false)]);
     assert_eq!(results, expected_eq);
 
-    let predicate_ne = column.clone().ne(lit.clone());
+    let predicate_ne = Pred::from_expr(expr!(col("col") != lit(value.clone())));
     let results = evaluate_predicate(&predicate_ne, &batch, false).unwrap();
     let expected_ne = BooleanArray::from(vec![None, Some(true), Some(false), Some(true)]);
     assert_eq!(results, expected_ne);
 
-    let predicate_distinct = column.clone().distinct(lit.clone());
+    let predicate_distinct = Pred::from_expr(expr!(distinct(col("col"), lit(value.clone()))));
     let results = evaluate_predicate(&predicate_distinct, &batch, false).unwrap();
     let expected_distinct =
         BooleanArray::from(vec![Some(true), Some(true), Some(false), Some(true)]);
@@ -250,6 +270,20 @@ fn test_literal_type_array() {
     let result = evaluate_predicate(&not_in_op, &batch, true).unwrap();
     let in_expected = BooleanArray::from(vec![false]);
     assert_eq!(result, in_expected);
+}
+
+#[test]
+fn null_variant_scalar_builds_null_struct_array() {
+    use crate::arrow::array::{Array as _, AsArray as _};
+    // A variant is physically a struct, so a null variant scalar must build as an all-null struct
+    // array rather than erroring ("Variant is not supported as scalar yet").
+    let arr = Scalar::null(KernelDataType::unshredded_variant())
+        .to_array(3)
+        .expect("null variant scalar should build a null struct array");
+    assert_eq!(arr.len(), 3);
+    assert_eq!(arr.null_count(), 3);
+    // The underlying representation is a struct.
+    assert_eq!(arr.as_struct().len(), 3);
 }
 
 #[test]
@@ -325,15 +359,19 @@ fn test_literal_complex_type_array() {
     // each nested array value has three elements, the middle one NULL
     let expected_valid = [true, false, true];
     let expected_valid = (0..5).flat_map(|_| expected_valid.iter().cloned());
-    assert!(expected_valid
-        .zip(struct_values.nulls().unwrap())
-        .all(|(a, b)| a == b));
+    assert!(
+        expected_valid
+            .zip(struct_values.nulls().unwrap())
+            .all(|(a, b)| a == b)
+    );
 
     let expected_values = [Some(42), None, Some(42)];
     let expected_values = (0..5).flat_map(|_| expected_values.iter().cloned());
-    assert!(expected_values
-        .zip(struct_values.column(0).as_primitive::<Int32Type>())
-        .all(|(a, b)| a == b));
+    assert!(
+        expected_values
+            .zip(struct_values.column(0).as_primitive::<Int32Type>())
+            .all(|(a, b)| a == b)
+    );
     assert_eq!(struct_values.column(2).null_count(), 15);
 
     // The leaf value column has 40 elements (not 60) becuase 1/3 of the parent structs are NULL.
@@ -342,9 +380,11 @@ fn test_literal_complex_type_array() {
     assert_eq!(list_values.len(), 40);
     let expected_values = [Some(1), Some(2), None, Some(3)];
     let expected_values = (0..10).flat_map(|_| expected_values.iter().cloned());
-    assert!(expected_values
-        .zip(list_values.as_primitive::<Int32Type>())
-        .all(|(a, b)| a == b));
+    assert!(
+        expected_values
+            .zip(list_values.as_primitive::<Int32Type>())
+            .all(|(a, b)| a == b)
+    );
 
     let map_values = struct_values.column(3);
     let map_array = map_values.as_map();
@@ -530,34 +570,33 @@ fn test_binary_cmp() {
     let schema = Schema::new(vec![Field::new("a", DataType::Int32, false)]);
     let values = Int32Array::from(vec![1, 2, 3]);
     let batch = RecordBatch::try_new(Arc::new(schema.clone()), vec![Arc::new(values)]).unwrap();
-    let column = col!("a");
 
-    let predicate_lt = column.clone().lt(lit(2));
+    let predicate_lt = Pred::from_expr(expr!(col("a") < 2));
     let results = evaluate_predicate(&predicate_lt, &batch, false).unwrap();
     let expected_lt = BooleanArray::from(vec![true, false, false]);
     assert_eq!(results, expected_lt);
 
-    let predicate_le = column.clone().le(lit(2));
+    let predicate_le = Pred::from_expr(expr!(col("a") <= 2));
     let results = evaluate_predicate(&predicate_le, &batch, false).unwrap();
     let expected_le = BooleanArray::from(vec![true, true, false]);
     assert_eq!(results, expected_le);
 
-    let predicate_gt = column.clone().gt(lit(2));
+    let predicate_gt = Pred::from_expr(expr!(col("a") > 2));
     let results = evaluate_predicate(&predicate_gt, &batch, false).unwrap();
     let expected_gt = BooleanArray::from(vec![false, false, true]);
     assert_eq!(results, expected_gt);
 
-    let predicate_ge = column.clone().ge(lit(2));
+    let predicate_ge = Pred::from_expr(expr!(col("a") >= 2));
     let results = evaluate_predicate(&predicate_ge, &batch, false).unwrap();
     let expected_ge = BooleanArray::from(vec![false, true, true]);
     assert_eq!(results, expected_ge);
 
-    let predicate_eq = column.clone().eq(lit(2));
+    let predicate_eq = Pred::from_expr(expr!(col("a") == 2));
     let results = evaluate_predicate(&predicate_eq, &batch, false).unwrap();
     let expected_eq = BooleanArray::from(vec![false, true, false]);
     assert_eq!(results, expected_eq);
 
-    let predicate_ne = column.clone().ne(lit(2));
+    let predicate_ne = Pred::from_expr(expr!(col("a") != 2));
     let results = evaluate_predicate(&predicate_ne, &batch, false).unwrap();
     let expected_ne = BooleanArray::from(vec![true, false, true]);
     assert_eq!(results, expected_ne);
@@ -600,25 +639,22 @@ fn test_logical() {
         ],
     )
     .unwrap();
-    let column_a = column_pred!("a");
-    let column_b = column_pred!("b");
-
-    let pred_and_col = Pred::and(column_a.clone(), column_b.clone());
+    let pred_and_col = Pred::from_expr(expr!(and(col("a"), col("b"))));
     let results = evaluate_predicate(&pred_and_col, &batch, false).unwrap();
     let expected = BooleanArray::from(vec![t, f, f, f, n, f]);
     assert_eq!(results, expected);
 
-    let pred_and_lit = Pred::and(column_a.clone(), Pred::TRUE);
+    let pred_and_lit = Pred::from_expr(expr!(and(col("a"), true)));
     let results = evaluate_predicate(&pred_and_lit, &batch, false).unwrap();
     let expected = BooleanArray::from(vec![t, t, f, f, t, f]);
     assert_eq!(results, expected);
 
-    let pred_or_col = Pred::or(column_a.clone(), column_b);
+    let pred_or_col = Pred::from_expr(expr!(or(col("a"), col("b"))));
     let results = evaluate_predicate(&pred_or_col, &batch, false).unwrap();
     let expected = BooleanArray::from(vec![t, t, t, f, t, n]);
     assert_eq!(results, expected);
 
-    let pred_or_lit = Pred::or(column_a.clone(), Pred::FALSE);
+    let pred_or_lit = Pred::from_expr(expr!(or(col("a"), false)));
     let results = evaluate_predicate(&pred_or_lit, &batch, false).unwrap();
     let expected = BooleanArray::from(vec![t, t, f, f, t, f]);
     assert_eq!(results, expected);
@@ -654,7 +690,7 @@ impl OpaqueLessThanOp {
         args: &[Expression],
         batch: &RecordBatch,
         inverted: bool,
-    ) -> DeltaResult<BooleanArray> {
+    ) -> KernelResult<BooleanArray> {
         let op_fn = match inverted {
             true => gt_eq,
             false => lt,
@@ -678,7 +714,7 @@ impl ArrowOpaqueExpressionOp for OpaqueLessThanOp {
         &self,
         _eval_expr: &ScalarExpressionEvaluator<'_>,
         _exprs: &[Expression],
-    ) -> DeltaResult<Scalar> {
+    ) -> KernelResult<Scalar> {
         unimplemented!() // OpaqueExpressionOp is already tested
     }
 
@@ -687,7 +723,7 @@ impl ArrowOpaqueExpressionOp for OpaqueLessThanOp {
         args: &[Expression],
         batch: &RecordBatch,
         result_type: Option<&KernelDataType>,
-    ) -> DeltaResult<ArrayRef> {
+    ) -> KernelResult<ArrayRef> {
         assert!(matches!(result_type, None | Some(&KernelDataType::BOOLEAN)));
         let result = self.eval_pred(args, batch, false)?;
         Ok(Arc::new(result))
@@ -704,7 +740,7 @@ impl ArrowOpaquePredicateOp for OpaqueLessThanOp {
         args: &[Expression],
         batch: &RecordBatch,
         inverted: bool,
-    ) -> DeltaResult<BooleanArray> {
+    ) -> KernelResult<BooleanArray> {
         self.eval_pred(args, batch, inverted)
     }
 
@@ -714,7 +750,7 @@ impl ArrowOpaquePredicateOp for OpaqueLessThanOp {
         _eval_pred: &DirectPredicateEvaluator<'_>,
         _exprs: &[Expression],
         _inverted: bool,
-    ) -> DeltaResult<Option<bool>> {
+    ) -> KernelResult<Option<bool>> {
         unimplemented!() // OpaquePredicateOp is already tested
     }
 
@@ -773,7 +809,7 @@ fn test_opaque() {
 }
 
 #[test]
-fn test_null_row() {
+fn test_create_many_all_null_row() {
     // note that we _allow_ nested nulls, since the top-level struct can be NULL
     let schema = schema_ref! {
         nullable "x": {
@@ -783,7 +819,11 @@ fn test_null_row() {
         nullable "c": STRING,
     };
     let handler = ArrowEvaluationHandler;
-    let result = handler.null_row(schema.clone()).unwrap();
+    let row: Vec<Scalar> = schema
+        .fields()
+        .map(|f| Scalar::null(f.data_type().clone()))
+        .collect();
+    let result = handler.create_many(schema.clone(), vec![row]).unwrap();
     let expected = RecordBatch::try_new(
         Arc::new(schema.as_ref().try_into_arrow().unwrap()),
         vec![
@@ -805,186 +845,20 @@ fn test_null_row() {
 }
 
 #[test]
-fn test_null_row_err() {
+fn test_create_many_rejects_null_in_non_nullable_field() {
     let not_null_schema = schema_ref! {
         not_null "a": STRING,
     };
     let handler = ArrowEvaluationHandler;
+    let row = vec![Scalar::null(KernelDataType::STRING)];
     assert_result_error_with_message(
-        handler.null_row(not_null_schema),
+        handler.create_many(not_null_schema, vec![row]),
         "Invalid argument error: Column 'a' is declared as non-nullable but contains null values",
     );
 }
 
-// helper to take values/schema to pass to `create_one` and assert the result = expected
-fn assert_create_one(values: &[Scalar], schema: SchemaRef, expected: RecordBatch) {
-    let handler = ArrowEvaluationHandler;
-    let actual = handler.create_one(schema, values).unwrap();
-    let actual_rb = actual.try_into_record_batch().unwrap();
-    assert_eq!(actual_rb, expected);
-}
-
 #[test]
-fn test_create_one() {
-    let values: &[Scalar] = &[
-        1.into(),
-        "B".into(),
-        3.into(),
-        Scalar::Null(KernelDataType::INTEGER),
-    ];
-    let schema = schema_ref! {
-        nullable "a": INTEGER,
-        nullable "b": STRING,
-        not_null "c": INTEGER,
-        nullable "d": INTEGER,
-    };
-
-    let expected_schema = Arc::new(Schema::new(vec![
-        Field::new("a", DataType::Int32, true),
-        Field::new("b", DataType::Utf8, true),
-        Field::new("c", DataType::Int32, false),
-        Field::new("d", DataType::Int32, true),
-    ]));
-    let expected = RecordBatch::try_new(
-        expected_schema,
-        vec![
-            create_array!(Int32, [1]),
-            create_array!(Utf8, ["B"]),
-            create_array!(Int32, [3]),
-            create_array!(Int32, [None]),
-        ],
-    )
-    .unwrap();
-    assert_create_one(values, schema, expected);
-}
-
-#[test]
-fn test_create_one_nested() {
-    let values: &[Scalar] = &[1.into(), 2.into()];
-    let schema = schema_ref! {
-        not_null "a": {
-            nullable "b": INTEGER,
-            not_null "c": INTEGER,
-        },
-    };
-    let expected_schema = Arc::new(Schema::new(vec![Field::new(
-        "a",
-        DataType::Struct(
-            vec![
-                Field::new("b", DataType::Int32, true),
-                Field::new("c", DataType::Int32, false),
-            ]
-            .into(),
-        ),
-        false,
-    )]));
-    let expected = RecordBatch::try_new(
-        expected_schema,
-        vec![Arc::new(StructArray::from(vec![
-            (
-                Arc::new(Field::new("b", DataType::Int32, true)),
-                create_array!(Int32, [1]) as ArrayRef,
-            ),
-            (
-                Arc::new(Field::new("c", DataType::Int32, false)),
-                create_array!(Int32, [2]) as ArrayRef,
-            ),
-        ]))],
-    )
-    .unwrap();
-    assert_create_one(values, schema, expected);
-}
-
-#[test]
-fn test_create_one_nested_null() {
-    let values: &[Scalar] = &[Scalar::Null(KernelDataType::INTEGER), 1.into()];
-    let schema = schema_ref! {
-        not_null "a": {
-            nullable "b": INTEGER,
-            not_null "c": INTEGER,
-        },
-    };
-    let expected_schema = Arc::new(Schema::new(vec![Field::new(
-        "a",
-        DataType::Struct(
-            vec![
-                Field::new("b", DataType::Int32, true),
-                Field::new("c", DataType::Int32, false),
-            ]
-            .into(),
-        ),
-        false,
-    )]));
-    let expected = RecordBatch::try_new(
-        expected_schema,
-        vec![Arc::new(StructArray::from(vec![
-            (
-                Arc::new(Field::new("b", DataType::Int32, true)),
-                create_array!(Int32, [None]) as ArrayRef,
-            ),
-            (
-                Arc::new(Field::new("c", DataType::Int32, false)),
-                create_array!(Int32, [1]) as ArrayRef,
-            ),
-        ]))],
-    )
-    .unwrap();
-    assert_create_one(values, schema, expected);
-}
-
-#[test]
-fn test_create_one_mismatching_scalar_types() {
-    // Scalar is a LONG but schema specifies INTEGER
-    let values: &[Scalar] = &[Scalar::Long(10)];
-    let schema = schema_ref! {
-        not_null "version": INTEGER,
-    };
-    let handler = ArrowEvaluationHandler;
-    assert_result_error_with_message(
-        handler.create_one(schema, values),
-        "Schema error: Mismatched scalar type while creating Expression: expected Integer, got Long",
-    );
-}
-
-#[test]
-fn test_create_one_not_null_struct() {
-    // Creating a NOT NULL struct field with null values should error.
-    // The error comes from Arrow's RecordBatch validation (non-nullable column has nulls).
-    let values: &[Scalar] = &[
-        Scalar::Null(KernelDataType::INTEGER),
-        Scalar::Null(KernelDataType::INTEGER),
-    ];
-    let schema = schema_ref! {
-        not_null "a": {
-            not_null "b": INTEGER,
-            nullable "c": INTEGER,
-        },
-    };
-    let handler = ArrowEvaluationHandler;
-    assert_result_error_with_message(
-        handler.create_one(schema, values),
-        "Column 'a' is declared as non-nullable but contains null values",
-    );
-}
-
-#[test]
-fn test_create_one_top_level_null() {
-    // Creating a NOT NULL field with null value should error.
-    // The error comes from Arrow's RecordBatch validation.
-    let values = &[Scalar::Null(KernelDataType::INTEGER)];
-    let handler = ArrowEvaluationHandler;
-
-    let schema = schema_ref! {
-        not_null "col_1": INTEGER,
-    };
-    assert_result_error_with_message(
-        handler.create_one(schema, values),
-        "Column 'col_1' is declared as non-nullable but contains null values",
-    );
-}
-
-#[test]
-fn test_scalar_map() -> DeltaResult<()> {
+fn test_scalar_map() -> KernelResult<()> {
     // making an 2-row array each with a map with 2 pairs.
     // result: { key1: 1, key2: null }, { key1: 1, key2: null }
     let map_type = MapType::new(KernelDataType::STRING, KernelDataType::INTEGER, true);
@@ -1021,7 +895,7 @@ fn test_scalar_map() -> DeltaResult<()> {
 }
 
 #[test]
-fn test_null_scalar_map() -> DeltaResult<()> {
+fn test_null_scalar_map() -> KernelResult<()> {
     let map_type = MapType::new(KernelDataType::STRING, KernelDataType::STRING, false);
     let null_scalar_map = Scalar::null(map_type);
     let arrow_array = null_scalar_map.to_array(1)?;
@@ -1247,6 +1121,35 @@ fn mixed_string_kernel_schema() -> StructType {
     }
 }
 
+#[rstest]
+#[case::then_only(Predicate::TRUE, ["a", "b", "c"])]
+#[case::else_only(Predicate::FALSE, ["fallback"; 3])]
+#[case::both(col!("s").eq(lit("a")), ["a", "fallback", "fallback"])]
+fn test_evaluator_case_when_strings(#[case] condition: Predicate, #[case] expected: [&str; 3]) {
+    let batch = ArrowEngineData::new(
+        RecordBatch::try_from_iter([(
+            "s",
+            Arc::new(StringArray::from(vec!["a", "b", "c"])) as ArrayRef,
+        )])
+        .unwrap(),
+    );
+    let expression = Expr::case_when([(condition, col!("s"))], lit("fallback"));
+    let result = ArrowEvaluationHandler
+        .new_expression_evaluator(
+            schema_ref! { nullable "s": STRING },
+            Arc::new(expression),
+            KernelDataType::STRING,
+        )
+        .unwrap()
+        .evaluate(&batch)
+        .try_into_record_batch()
+        .unwrap();
+    assert_eq!(
+        result.column(0).to_data(),
+        StringArray::from(expected.to_vec()).to_data()
+    );
+}
+
 /// Evaluator must succeed when a struct contains Utf8, LargeUtf8, and Utf8View columns in the
 /// empty patch branch. The output schema is derived from actual column types, so
 /// `LargeUtf8` and `Utf8View` columns remain valid even though the kernel type is `STRING`.
@@ -1296,19 +1199,21 @@ fn test_evaluator_mixed_string_types_struct_expression() {
         .unwrap();
 }
 
-/// End-to-end through `ExpressionEvaluator`, on the shape that actually breaks: a `stats_parsed`
-/// struct read from a Spark-written checkpoint. Spark writes timestamps as Parquet INT96, arrow
-/// decodes INT96 as `Timestamp(Nanosecond, None)`, and kernel's `TIMESTAMP` is
-/// `Timestamp(Microsecond, "UTC")`. An engine that asks the evaluator for `TIMESTAMP` min/max
-/// columns and gets nanosecond columns back downcasts by the type it requested, gets nothing, and
-/// reads that as null min/max. The result is no file skipping at all, with no error anywhere.
-#[test]
-fn test_evaluator_output_schema_honors_timestamp_cast() {
+#[rstest]
+#[case::struct_output(true)]
+#[case::scalar_output(false)]
+fn test_evaluator_output_schema_honors_timestamp_cast(
+    #[case] struct_output: bool,
+    #[values(KernelDataType::TIMESTAMP, KernelDataType::TIMESTAMP_NTZ)]
+    timestamp_type: KernelDataType,
+) {
     let min_ts: ArrayRef = Arc::new(TimestampNanosecondArray::from(vec![
-        1_700_000_000_123_456_000i64,
+        Some(1_700_000_000_123_456_000i64),
+        None,
     ]));
     let max_ts: ArrayRef = Arc::new(TimestampNanosecondArray::from(vec![
-        1_700_000_003_987_654_000i64,
+        Some(1_700_000_003_987_654_000i64),
+        None,
     ]));
     let nanos = min_ts.data_type().clone();
     let batch = RecordBatch::try_new(
@@ -1321,28 +1226,39 @@ fn test_evaluator_output_schema_honors_timestamp_cast() {
     .unwrap();
 
     let input_schema = schema_ref! {
-        nullable "minTs": TIMESTAMP,
-        nullable "maxTs": TIMESTAMP,
+        nullable "minTs": TIMESTAMP_NTZ,
+        nullable "maxTs": TIMESTAMP_NTZ,
     };
-    let output_type = KernelDataType::from(schema! {
-        nullable "minTs": TIMESTAMP,
-        nullable "maxTs": TIMESTAMP,
-    });
-    let expression: ExpressionRef = Arc::new(Expr::struct_from([col!("minTs"), col!("maxTs")]));
+    let (expression, output_type) = if struct_output {
+        (
+            expr!(make_struct(col("minTs"), col("maxTs"))),
+            KernelDataType::from(schema! {
+                nullable "minTs": (timestamp_type.clone()),
+                nullable "maxTs": (timestamp_type.clone()),
+            }),
+        )
+    } else {
+        (col!("minTs"), timestamp_type.clone())
+    };
 
     let output = ArrowEvaluationHandler
-        .new_expression_evaluator(input_schema, expression, output_type)
+        .new_expression_evaluator(input_schema, Arc::new(expression), output_type)
         .unwrap()
         .evaluate(&ArrowEngineData::new(batch))
         .unwrap()
         .try_into_record_batch()
         .unwrap();
 
-    let micros = DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()));
-    for (col, expected) in [(0, 1_700_000_000_123_456i64), (1, 1_700_000_003_987_654)] {
-        // The schema the engine sees must be the schema it asked for.
+    let micros = (&timestamp_type).try_into_arrow().unwrap();
+    assert_eq!(output.num_rows(), 2);
+    assert_eq!(output.num_columns(), if struct_output { 2 } else { 1 });
+    for (col, expected) in [1_700_000_000_123_456i64, 1_700_000_003_987_654]
+        .into_iter()
+        .take(output.num_columns())
+        .enumerate()
+    {
         assert_eq!(output.schema().field(col).data_type(), &micros);
-        // And the values must survive the cast.
+        assert!(output.column(col).is_null(1));
         assert_eq!(
             output
                 .column(col)
@@ -1353,8 +1269,389 @@ fn test_evaluator_output_schema_honors_timestamp_cast() {
     }
 }
 
+#[rstest]
+#[case::empty(expr!(make_struct()))]
+#[case::coalesced(expr!(coalesce(guarded_struct(col("keep")), make_struct())))]
+fn public_evaluator_empty_struct_output_preserves_row_count(
+    #[case] expression: Expression,
+    #[values(0, 3)] num_rows: usize,
+) {
+    let batch = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![Field::new(
+            "keep",
+            DataType::Boolean,
+            true,
+        )])),
+        vec![Arc::new(BooleanArray::from(vec![
+            Some(true),
+            Some(false),
+            None,
+        ]))],
+    )
+    .unwrap()
+    .slice(0, num_rows);
+    let input = ArrowEngineData::new(batch);
+    let output = ArrowEvaluationHandler
+        .new_expression_evaluator(
+            schema_ref! { nullable "keep": BOOLEAN },
+            Arc::new(expression),
+            KernelDataType::from(schema! {}),
+        )
+        .unwrap()
+        .evaluate(&input)
+        .try_into_record_batch()
+        .unwrap();
+
+    assert_eq!(output.num_rows(), num_rows);
+    assert_eq!(output.num_columns(), 0);
+}
+
+#[rstest]
+#[case::unguarded(expr!(make_struct(make_struct())), vec![true, true, true])]
+#[case::guarded(
+    expr!(make_struct(guarded_struct(col("keep")))),
+    vec![true, false, false],
+)]
+#[case::coalesced(
+    expr!(make_struct(coalesce(guarded_struct(col("keep")), make_struct()))),
+    vec![true, true, true],
+)]
+fn public_evaluator_nested_empty_structs_preserve_validity(
+    #[case] expression: Expression,
+    #[case] expected_valid: Vec<bool>,
+    #[values(0, 3)] num_rows: usize,
+) {
+    let batch = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![Field::new(
+            "keep",
+            DataType::Boolean,
+            true,
+        )])),
+        vec![Arc::new(BooleanArray::from(vec![
+            Some(true),
+            Some(false),
+            None,
+        ]))],
+    )
+    .unwrap()
+    .slice(0, num_rows);
+    let input = ArrowEngineData::new(batch);
+    let output = ArrowEvaluationHandler
+        .new_expression_evaluator(
+            schema_ref! { nullable "keep": BOOLEAN },
+            Arc::new(expression),
+            KernelDataType::from(schema! { nullable "nested": {} }),
+        )
+        .unwrap()
+        .evaluate(&input)
+        .try_into_record_batch()
+        .unwrap();
+    let expected = StructArray::new_empty_fields(
+        num_rows,
+        Some(NullBuffer::from(expected_valid).slice(0, num_rows)),
+    );
+
+    assert_eq!(output.num_rows(), num_rows);
+    assert_eq!(output.column(0).as_ref(), &expected);
+}
+
+#[derive(Clone, Copy, Debug)]
+enum EvaluatorKind {
+    Expression,
+    Predicate,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum TopLevelSchemaMismatch {
+    MissingField,
+    ReorderedFields,
+    RenamedField,
+    WrongType,
+}
+
+impl TopLevelSchemaMismatch {
+    fn expected_schema(self) -> SchemaRef {
+        schema_ref! {
+            nullable "a": INTEGER,
+            nullable "b": STRING,
+        }
+    }
+
+    fn data_schema(self) -> Schema {
+        match self {
+            Self::MissingField => Schema::new(vec![Field::new("a", DataType::Int32, true)]),
+            Self::ReorderedFields => Schema::new(vec![
+                Field::new("b", DataType::Utf8, true),
+                Field::new("a", DataType::Int32, true),
+            ]),
+            Self::RenamedField => Schema::new(vec![
+                Field::new("a", DataType::Int32, true),
+                Field::new("c", DataType::Utf8, true),
+            ]),
+            Self::WrongType => Schema::new(vec![
+                Field::new("a", DataType::Int64, true),
+                Field::new("b", DataType::Utf8, true),
+            ]),
+        }
+    }
+
+    fn expected_error(self) -> &'static str {
+        match self {
+            // Validation treats a renamed field as a missing expected field.
+            Self::MissingField | Self::RenamedField => {
+                "Expected schema field 'b' is missing in data schema fields"
+            }
+            Self::ReorderedFields => {
+                "Expected schema field 'b' is out of order in data schema fields"
+            }
+            Self::WrongType => "Expected schema type for 'a' does not match the data schema type",
+        }
+    }
+}
+
+#[rstest]
+#[case::missing_field(TopLevelSchemaMismatch::MissingField)]
+#[case::reordered_fields(TopLevelSchemaMismatch::ReorderedFields)]
+#[case::renamed_field(TopLevelSchemaMismatch::RenamedField)]
+#[case::wrong_type(TopLevelSchemaMismatch::WrongType)]
+fn evaluator_rejects_mismatched_top_level_schema(
+    #[values(EvaluatorKind::Expression, EvaluatorKind::Predicate)] evaluator_kind: EvaluatorKind,
+    #[case] mismatch: TopLevelSchemaMismatch,
+) {
+    let expected_schema = mismatch.expected_schema();
+    let data_schema = mismatch.data_schema();
+    let batch = ArrowEngineData::new(RecordBatch::new_empty(Arc::new(data_schema)));
+    let handler = ArrowEvaluationHandler;
+    let result = match evaluator_kind {
+        EvaluatorKind::Expression => handler
+            .new_expression_evaluator(
+                expected_schema,
+                Arc::new(col!("a")),
+                KernelDataType::INTEGER,
+            )
+            .unwrap()
+            .evaluate(&batch),
+        EvaluatorKind::Predicate => handler
+            .new_predicate_evaluator(expected_schema, Arc::new(Predicate::TRUE))
+            .unwrap()
+            .evaluate(&batch),
+    };
+
+    assert_result_error_with_message(result, mismatch.expected_error());
+}
+
+#[rstest]
+fn evaluator_accepts_extra_top_level_fields(
+    #[values(EvaluatorKind::Expression, EvaluatorKind::Predicate)] evaluator_kind: EvaluatorKind,
+) {
+    let expected_schema = schema_ref! {
+        nullable "a": INTEGER,
+        nullable "b": STRING,
+    };
+    let data_schema = Schema::new(vec![
+        Field::new("before", DataType::Duration(TimeUnit::Second), true),
+        Field::new("a", DataType::Int32, true),
+        Field::new("between", DataType::Boolean, true),
+        Field::new("b", DataType::Utf8, true),
+        Field::new("after", DataType::Boolean, true),
+    ]);
+    let batch = ArrowEngineData::new(RecordBatch::new_empty(Arc::new(data_schema)));
+    let handler = ArrowEvaluationHandler;
+
+    match evaluator_kind {
+        EvaluatorKind::Expression => handler
+            .new_expression_evaluator(
+                expected_schema,
+                Arc::new(col!("a")),
+                KernelDataType::INTEGER,
+            )
+            .unwrap()
+            .evaluate(&batch)
+            .unwrap(),
+        EvaluatorKind::Predicate => handler
+            .new_predicate_evaluator(expected_schema, Arc::new(Predicate::TRUE))
+            .unwrap()
+            .evaluate(&batch)
+            .unwrap(),
+    };
+}
+
+#[test]
+fn evaluator_accepts_nested_schema_differences() {
+    let input_schema = schema_ref! {
+        nullable "s": { not_null "a": INTEGER },
+    };
+    let batch_schema = Schema::new(vec![Field::new(
+        "s",
+        DataType::Struct(
+            vec![Field::new(
+                "unsupported",
+                DataType::Duration(TimeUnit::Second),
+                true,
+            )]
+            .into(),
+        ),
+        true,
+    )]);
+
+    validate_data_schema_top_level(&input_schema, &batch_schema).unwrap();
+}
+
+#[test]
+fn evaluator_accepts_conflicting_nested_field_type() {
+    let input_schema = schema_ref! {
+        nullable "s": { not_null "a": INTEGER },
+    };
+    let batch_schema = schema_ref! {
+        nullable "s": { nullable "a": STRING },
+    };
+    let batch_schema: Schema = batch_schema.as_ref().try_into_arrow().unwrap();
+
+    validate_data_schema_top_level(&input_schema, &batch_schema).unwrap();
+}
+
+#[test]
+fn evaluator_accepts_variant_arrow_struct_representation() {
+    let input_schema = schema_ref! {
+        nullable "v": (KernelDataType::unshredded_variant()),
+    };
+    let batch_schema = Schema::new(vec![Field::new(
+        "v",
+        DataType::Struct(
+            vec![
+                Field::new("metadata", DataType::Binary, false),
+                Field::new("value", DataType::Binary, false),
+            ]
+            .into(),
+        ),
+        true,
+    )]);
+
+    validate_data_schema_top_level(&input_schema, &batch_schema).unwrap();
+}
+
+fn kernel_int_array_type() -> KernelDataType {
+    ArrayType::new(KernelDataType::INTEGER, true).into()
+}
+
+fn arrow_int_array_element() -> Arc<Field> {
+    Arc::new(Field::new("element", DataType::Int32, true))
+}
+
+fn arrow_int_string_map_type() -> DataType {
+    let entries = Field::new(
+        "entries",
+        DataType::Struct(
+            vec![
+                Field::new("key", DataType::Int32, false),
+                Field::new("value", DataType::Utf8, true),
+            ]
+            .into(),
+        ),
+        false,
+    );
+    DataType::Map(Arc::new(entries), false)
+}
+
+#[test]
+fn evaluator_accepts_round_trippable_arrow_representations() {
+    // Each Arrow type maps unambiguously to a Kernel type through `TryIntoKernel`.
+    let arrow_types = [
+        DataType::Utf8,
+        DataType::LargeUtf8,
+        DataType::Utf8View,
+        DataType::Int64,
+        DataType::UInt64,
+        DataType::Int32,
+        DataType::UInt32,
+        DataType::Int16,
+        DataType::UInt16,
+        DataType::Int8,
+        DataType::UInt8,
+        DataType::Null,
+        DataType::Float32,
+        DataType::Float64,
+        DataType::Boolean,
+        DataType::Binary,
+        DataType::FixedSizeBinary(16),
+        DataType::LargeBinary,
+        DataType::BinaryView,
+        DataType::Decimal128(10, 2),
+        DataType::Date32,
+        DataType::Date64,
+        DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+        DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
+        DataType::Timestamp(TimeUnit::Millisecond, Some("UTC".into())),
+        DataType::Timestamp(TimeUnit::Microsecond, None),
+        DataType::Timestamp(TimeUnit::Nanosecond, None),
+        DataType::Timestamp(TimeUnit::Millisecond, None),
+        DataType::Struct(Fields::empty()),
+        DataType::List(arrow_int_array_element()),
+        DataType::ListView(arrow_int_array_element()),
+        DataType::LargeList(arrow_int_array_element()),
+        DataType::LargeListView(arrow_int_array_element()),
+        DataType::FixedSizeList(arrow_int_array_element(), 3),
+        arrow_int_string_map_type(),
+        DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+        DataType::Dictionary(
+            Box::new(DataType::Int32),
+            Box::new(DataType::Dictionary(
+                Box::new(DataType::Int16),
+                Box::new(DataType::Utf8),
+            )),
+        ),
+    ];
+
+    for data_type in arrow_types {
+        let expected_type = (&data_type).try_into_kernel().unwrap();
+        assert_top_level_type_compatible(expected_type, data_type);
+    }
+}
+
+// Some Kernel types, such as interval types, are not round-trippable through Arrow. This test
+// ensures `validate_data_schema_top_level` accepts their Arrow representations.
+#[rstest]
+#[case::year_month(KernelDataType::INTERVAL_YEAR_MONTH, DataType::Int32)]
+#[case::year_month_unsigned(KernelDataType::INTERVAL_YEAR_MONTH, DataType::UInt32)]
+#[case::day_time(KernelDataType::INTERVAL_DAY_TIME, DataType::Int64)]
+#[case::day_time_unsigned(KernelDataType::INTERVAL_DAY_TIME, DataType::UInt64)]
+fn evaluator_accepts_non_round_trippable_interval_arrow_representation(
+    #[case] expected_type: KernelDataType,
+    #[case] data_type: DataType,
+) {
+    assert_top_level_type_compatible(expected_type, data_type);
+}
+
+fn assert_top_level_type_compatible(expected_type: KernelDataType, data_type: DataType) {
+    let expected_schema =
+        Arc::new(StructType::try_new([StructField::nullable("value", expected_type)]).unwrap());
+    let data_schema = Schema::new(vec![Field::new("value", data_type, true)]);
+    validate_data_schema_top_level(&expected_schema, &data_schema).unwrap();
+}
+
+#[rstest]
+#[case::container_and_primitive(empty_struct_type(), DataType::Int32)]
+#[case::different_container_kinds(kernel_int_array_type(), arrow_int_string_map_type())]
+fn evaluator_rejects_incompatible_top_level_container_types(
+    #[case] expected_type: KernelDataType,
+    #[case] data_type: DataType,
+) {
+    let expected_schema =
+        Arc::new(StructType::try_new([StructField::nullable("value", expected_type)]).unwrap());
+    let data_schema = Schema::new(vec![Field::new("value", data_type, true)]);
+
+    assert_result_error_with_message(
+        validate_data_schema_top_level(&expected_schema, &data_schema),
+        "Expected schema type for 'value' does not match the data schema type",
+    );
+}
+
+fn empty_struct_type() -> KernelDataType {
+    StructType::try_new([]).unwrap().into()
+}
+
 // helper to build a RecordBatch via `create_many` and assert it equals `expected`
-fn assert_create_many(rows: &[&[Scalar]], schema: SchemaRef, expected: RecordBatch) {
+fn assert_create_many(rows: Vec<Vec<Scalar>>, schema: SchemaRef, expected: RecordBatch) {
     let handler = ArrowEvaluationHandler;
     let actual = handler.create_many(schema, rows).unwrap();
     let actual_rb = actual.try_into_record_batch().unwrap();
@@ -1363,9 +1660,9 @@ fn assert_create_many(rows: &[&[Scalar]], schema: SchemaRef, expected: RecordBat
 
 #[test]
 fn test_create_many_multiple_rows() {
-    let row1: &[Scalar] = &[1.into(), "A".into()];
-    let row2: &[Scalar] = &[2.into(), "B".into()];
-    let row3: &[Scalar] = &[Scalar::Null(KernelDataType::INTEGER), "C".into()];
+    let row1 = vec![1.into(), "A".into()];
+    let row2 = vec![2.into(), "B".into()];
+    let row3 = vec![Scalar::Null(KernelDataType::INTEGER), "C".into()];
     let schema = schema_ref! {
         nullable "id": INTEGER,
         nullable "name": STRING,
@@ -1382,7 +1679,7 @@ fn test_create_many_multiple_rows() {
         ],
     )
     .unwrap();
-    assert_create_many(&[row1, row2, row3], schema, expected);
+    assert_create_many(vec![row1, row2, row3], schema, expected);
 }
 
 #[test]
@@ -1392,7 +1689,7 @@ fn test_create_many_empty_rows_returns_zero_row_batch() {
         nullable "b": STRING,
     };
     let handler = ArrowEvaluationHandler;
-    let result = handler.create_many(schema.clone(), &[]).unwrap();
+    let result = handler.create_many(schema.clone(), vec![]).unwrap();
     assert_eq!(result.len(), 0);
     let rb = result.try_into_record_batch().unwrap();
     assert_eq!(rb.num_rows(), 0);
@@ -1406,10 +1703,10 @@ fn test_create_many_wrong_field_count_returns_error() {
         nullable "b": STRING,
     };
     // Row has 3 scalars but schema has 2 fields
-    let bad_row: &[Scalar] = &[1.into(), "x".into(), 99.into()];
+    let bad_row = vec![1.into(), "x".into(), 99.into()];
     let handler = ArrowEvaluationHandler;
     assert_result_error_with_message(
-        handler.create_many(schema, &[bad_row]),
+        handler.create_many(schema, vec![bad_row]),
         "Row 0 has 3 scalars but schema has 2 fields",
     );
 }
@@ -1421,40 +1718,13 @@ fn test_create_many_wrong_field_type_returns_error() {
         nullable "b": STRING,
     };
     // Row 1 passes a Long where an Integer is expected for field "a"
-    let good_row: &[Scalar] = &[1.into(), "x".into()];
-    let bad_row: &[Scalar] = &[1i64.into(), "y".into()];
+    let good_row = vec![1.into(), "x".into()];
+    let bad_row = vec![1i64.into(), "y".into()];
     let handler = ArrowEvaluationHandler;
     assert_result_error_with_message(
-        handler.create_many(schema, &[good_row, bad_row]),
+        handler.create_many(schema, vec![good_row, bad_row]),
         "Row 1, field 'a' (expected type integer, got long): Invalid expression evaluation: Invalid builder for long",
     );
-}
-
-#[test]
-fn test_create_many_single_row_matches_create_one() {
-    // create_many with one row should produce the same result as create_one
-    let values: &[Scalar] = &[
-        1.into(),
-        "hello".into(),
-        Scalar::Null(KernelDataType::INTEGER),
-    ];
-    let schema = schema_ref! {
-        nullable "a": INTEGER,
-        nullable "b": STRING,
-        nullable "c": INTEGER,
-    };
-    let handler = ArrowEvaluationHandler;
-    let from_one = handler
-        .create_one(schema.clone(), values)
-        .unwrap()
-        .try_into_record_batch()
-        .unwrap();
-    let from_many = handler
-        .create_many(schema, &[values])
-        .unwrap()
-        .try_into_record_batch()
-        .unwrap();
-    assert_eq!(from_one, from_many);
 }
 
 #[test]
@@ -1470,7 +1740,7 @@ fn test_create_many_nested_struct() {
     };
 
     // Row 1: inner = Struct { x: 10, y: "hello" }, flag = true
-    let row1: &[Scalar] = &[
+    let row1 = vec![
         Scalar::Struct(
             crate::expressions::StructData::try_new(
                 vec![
@@ -1484,7 +1754,7 @@ fn test_create_many_nested_struct() {
         true.into(),
     ];
     // Row 2: inner = null struct, flag = false
-    let row2: &[Scalar] = &[Scalar::Null(inner_type), false.into()];
+    let row2 = vec![Scalar::Null(inner_type), false.into()];
 
     let arrow_inner_fields: Fields = vec![
         Field::new("x", DataType::Int32, true),
@@ -1511,7 +1781,7 @@ fn test_create_many_nested_struct() {
         vec![inner_col, create_array!(Boolean, [true, false])],
     )
     .unwrap();
-    assert_create_many(&[row1, row2], schema, expected);
+    assert_create_many(vec![row1, row2], schema, expected);
 }
 
 #[test]
@@ -1524,7 +1794,18 @@ fn test_void_scalar_to_array() {
 
 // Interval scalars materialize as their physical integer arrays (Int32 months / Int64 micros).
 #[rstest]
-#[case::year_month(Scalar::IntervalYearMonth(30), DataType::Int32)]
+#[case::year_month(
+    Scalar::interval_year_month(30, IntervalYearToMonthType::IntervalYearToMonth).unwrap(),
+    DataType::Int32
+)]
+#[case::year(
+    Scalar::interval_year_month(24, IntervalYearToMonthType::IntervalYear).unwrap(),
+    DataType::Int32
+)]
+#[case::month(
+    Scalar::interval_year_month(30, IntervalYearToMonthType::IntervalMonth).unwrap(),
+    DataType::Int32
+)]
 #[case::day_time(Scalar::IntervalDayTime(5), DataType::Int64)]
 fn test_interval_scalar_to_array(#[case] scalar: Scalar, #[case] arrow_type: DataType) {
     let array = scalar.to_array(2).unwrap();
@@ -1544,7 +1825,7 @@ fn test_geo_append_null_unsupported(#[case] dt: KernelDataType) {
         Box::new(crate::arrow::array::BinaryBuilder::new());
     let err = Scalar::append_null(builder.as_mut(), &dt, 1).unwrap_err();
     assert!(
-        matches!(err, Error::Unsupported(_)),
+        matches!(err, KernelError::Unsupported(_)),
         "expected Unsupported, got: {err:?}"
     );
 }

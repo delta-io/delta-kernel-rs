@@ -4,14 +4,14 @@ use std::sync::Arc;
 
 use delta_kernel::plans::proto::schema as proto_schema;
 use delta_kernel::schema::StructType;
-use delta_kernel::{DeltaResult, Error, Operation, ParquetFooter, PlanExecutor, PlanResult};
+use delta_kernel::{KernelError, KernelResult, Operation, ParquetFooter, PlanExecutor, PlanResult};
 use delta_kernel_ffi_macros::handle_descriptor;
 use prost::Message as _;
 
 use crate::error::EngineExecResult;
 use crate::plans::iter::{FfiBytesIter, FfiEngineDataIter, FfiFileMetaIter};
 use crate::plans::result::{CParquetFooter, CPlanResult};
-use crate::{kernel_bytes_slice, KernelBytesSlice, NullableCvoid};
+use crate::{KernelBytesSlice, NullableCvoid, kernel_bytes_slice};
 
 /// A shared (`Arc`-like) handle to an [`PlanExecutor`].
 #[handle_descriptor(target=dyn PlanExecutor, mutable=false)]
@@ -57,20 +57,21 @@ unsafe impl Send for FfiPlanExecutor {}
 unsafe impl Sync for FfiPlanExecutor {}
 
 impl PlanExecutor for FfiPlanExecutor {
-    fn execute_op(&self, op: Operation) -> DeltaResult<PlanResult> {
+    fn execute_op(&self, op: Operation) -> KernelResult<PlanResult> {
         let plan_proto_bytes = op.to_proto_bytes();
         let plan_proto_slice = kernel_bytes_slice!(plan_proto_bytes);
 
         let mut out = EngineExecResult::Uninit;
         (self.callback)(self.context, plan_proto_slice, &mut out);
-        let plan_result =
-            match out {
-                EngineExecResult::Success(plan) => plan,
-                EngineExecResult::Failure(err) => return Err(err.into()),
-                EngineExecResult::Uninit => return Err(Error::internal_error(
+        let plan_result = match out {
+            EngineExecResult::Success(plan) => plan,
+            EngineExecResult::Failure(err) => return Err(err.into()),
+            EngineExecResult::Uninit => {
+                return Err(KernelError::internal_error(
                     "FFI engine returned from execute_op upcall without writing the plan result",
-                )),
-            };
+                ));
+            }
+        };
         match plan_result {
             CPlanResult::Unit => Ok(PlanResult::Unit),
             CPlanResult::Data(it) => Ok(PlanResult::Data(Box::new(FfiEngineDataIter::new(it)))),
@@ -90,11 +91,12 @@ impl PlanExecutor for FfiPlanExecutor {
 /// Consumes the embedded [`ExclusiveRustBytes`](crate::ExclusiveRustBytes) handle carrying
 /// the proto-serialized schema, returning an error if the bytes are not a valid schema proto
 /// message.
-fn decode_parquet_footer(footer: CParquetFooter) -> DeltaResult<ParquetFooter> {
+fn decode_parquet_footer(footer: CParquetFooter) -> KernelResult<ParquetFooter> {
     let CParquetFooter { schema_proto } = footer;
     // SAFETY: ExclusiveRustBytes should only have a single owner, so consuming here is safe.
     let bytes = *unsafe { schema_proto.into_inner() };
-    let proto = proto_schema::StructType::decode(bytes.as_slice()).map_err(Error::generic_err)?;
+    let proto =
+        proto_schema::StructType::decode(bytes.as_slice()).map_err(KernelError::generic_err)?;
     let schema = Arc::new(StructType::try_from(proto)?);
     Ok(ParquetFooter { schema })
 }
@@ -105,22 +107,22 @@ mod tests {
     use std::ptr::NonNull;
     use std::sync::{Arc, Mutex};
 
+    use delta_kernel::KernelError;
     use delta_kernel::arrow::array::ffi::FFI_ArrowArray;
     use delta_kernel::plans::proto::{operation as proto, schema as proto_schema};
-    use delta_kernel::schema::{schema, DataType as KernelDataType};
-    use delta_kernel::Error;
+    use delta_kernel::schema::{DataType as KernelDataType, schema};
     use prost::Message;
     use url::Url;
 
     use super::*;
-    use crate::error::{EngineExecError, KernelError};
+    use crate::error::{EngineExecError, FFIKernelError};
     use crate::handle::Handle;
     use crate::plans::get_plan_executor;
     use crate::plans::iter::{CBytesIterator, CEngineDataIterator, CFileMetaIterator};
     use crate::plans::result::CParquetFooter;
     use crate::{
-        allocate_kernel_bytes, kernel_bytes_slice, ExclusiveEngineData, ExclusiveRustString,
-        OptionalValue,
+        ExclusiveEngineData, ExclusiveRustString, OptionalValue, allocate_kernel_bytes,
+        kernel_bytes_slice,
     };
 
     extern "C" fn noop_free(_state: NullableCvoid) {}
@@ -143,7 +145,7 @@ mod tests {
 
     /// Executes a dummy plan operation against a `PlanExecutor` whose callback returns the given
     /// `expected_plan_result`, returning the raw result of `execute_op`.
-    fn try_execute_dummy_op(expected_plan_result: CPlanResult) -> DeltaResult<PlanResult> {
+    fn try_execute_dummy_op(expected_plan_result: CPlanResult) -> KernelResult<PlanResult> {
         let cell: Mutex<Option<CPlanResult>> = Mutex::new(Some(expected_plan_result));
         let context = NonNull::new(&cell as *const Mutex<Option<CPlanResult>> as *mut c_void);
         let executor = unsafe { get_plan_executor(context, mock_execute_op) };
@@ -181,7 +183,7 @@ mod tests {
             // Mirror the engine downcalling `allocate_kernel_string` to build the message handle.
             let message: Handle<ExclusiveRustString> = Box::new("kaboom".to_string()).into();
             let err = EngineExecError {
-                etype: KernelError::UnsupportedError,
+                etype: FFIKernelError::UnsupportedError,
                 message,
             };
             unsafe { out.write(EngineExecResult::Failure(err)) };
@@ -197,8 +199,8 @@ mod tests {
             panic!("execute_op should surface the engine failure");
         };
         assert!(
-            matches!(err, Error::Unsupported(ref msg) if msg == "kaboom"),
-            "expected Error::Unsupported(\"kaboom\"), got {err:?}"
+            matches!(err, KernelError::Unsupported(ref msg) if msg == "kaboom"),
+            "expected KernelError::Unsupported(\"kaboom\"), got {err:?}"
         );
     }
 
@@ -315,7 +317,7 @@ mod tests {
             panic!("invalid schema proto bytes should fail to decode");
         };
         assert!(
-            matches!(err, Error::GenericError { .. }),
+            matches!(err, KernelError::GenericError { .. }),
             "expected a proto decode error, got {err:?}"
         );
     }

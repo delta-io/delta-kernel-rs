@@ -158,7 +158,7 @@ int main(int argc, char* argv[])
     KernelStringSlice table_name_slice = { .ptr = table_name, .len = strlen(table_name) };
 
     ExternResultHandleMutableCommitter committer_res = get_uc_committer(
-        uc_client, table_id_slice, catalog_slice, schema_slice, table_name_slice, allocate_error);
+        uc_client, table_id_slice, catalog_slice, schema_slice, table_name_slice, &error_allocators);
 
     if (committer_res.tag != OkHandleMutableCommitter) {
         print_error("Failed to create UC committer", (Error*)committer_res.err);
@@ -171,10 +171,10 @@ int main(int argc, char* argv[])
 
     // Get the default engine
     KernelStringSlice table_path_slice = { .ptr = table_path, .len = strlen(table_path) };
-    ExternResultEngineBuilder engine_builder_res =
-        get_engine_builder(table_path_slice, allocate_error);
+    ExternResultHandleExclusiveEngineBuilder engine_builder_res =
+        get_engine_builder(table_path_slice, &error_allocators);
 
-    if (engine_builder_res.tag != OkEngineBuilder) {
+    if (engine_builder_res.tag != OkHandleExclusiveEngineBuilder) {
         print_error("Could not get engine builder", (Error*)engine_builder_res.err);
         free_error((Error*)engine_builder_res.err);
         free_uc_committer(uc_committer);
@@ -182,7 +182,7 @@ int main(int argc, char* argv[])
         return -1;
     }
 
-    EngineBuilder* engine_builder = engine_builder_res.ok;
+    HandleExclusiveEngineBuilder engine_builder = engine_builder_res.ok;
     ExternResultHandleSharedExternEngine engine_res = builder_build(engine_builder);
 
     if (engine_res.tag != OkHandleSharedExternEngine) {
@@ -195,8 +195,8 @@ int main(int argc, char* argv[])
 
     SharedExternEngine* engine = engine_res.ok;
 
-    ExternResultHandleMutableFfiSnapshotBuilder snapshot_builder_res = get_snapshot_builder(table_path_slice, engine);
-    if (snapshot_builder_res.tag != OkHandleMutableFfiSnapshotBuilder) {
+    ExternResultHandleExclusiveSnapshotBuilder snapshot_builder_res = get_snapshot_builder(table_path_slice, engine);
+    if (snapshot_builder_res.tag != OkHandleExclusiveSnapshotBuilder) {
       print_error("Failed to get snapshot builder.", (Error*)snapshot_builder_res.err);
       free_error((Error*)snapshot_builder_res.err);
       free_engine(engine);
@@ -206,7 +206,8 @@ int main(int argc, char* argv[])
     }
     // The test table is catalog-managed, so we must set the max catalog version.
     // Version 0 is the only commit on disk (staged commits are not loaded here).
-    snapshot_builder_set_max_catalog_version(&snapshot_builder_res.ok, 0);
+    snapshot_builder_res.ok =
+        snapshot_builder_with_max_catalog_version(snapshot_builder_res.ok, 0);
     ExternResultHandleSharedSnapshot snapshot_res = snapshot_builder_build(snapshot_builder_res.ok);
     if (snapshot_res.tag != OkHandleSharedSnapshot) {
       print_error("Failed to create snapshot.", (Error*)snapshot_res.err);
@@ -219,11 +220,26 @@ int main(int argc, char* argv[])
 
     SharedSnapshot* snapshot = snapshot_res.ok;
 
-    // Create a transaction with the UC committer
-    ExternResultHandleExclusiveTransaction txn_res =
-      transaction_with_committer(snapshot, engine, uc_committer);
+    const char* engine_info = "uc_example_engine";
+    KernelStringSlice engine_info_slice = { .ptr = engine_info, .len = strlen(engine_info) };
+    ExternResultHandleExclusiveUpdateTableTransactionBuilder builder_res =
+        new_update_table_txn_builder(
+            snapshot, KernelUpdateTableOperationWrite, engine_info_slice,
+            /* data_change */ false, engine);
+    if (builder_res.tag != OkHandleExclusiveUpdateTableTransactionBuilder) {
+        print_error("Failed to create transaction builder", (Error*)builder_res.err);
+        free_error((Error*)builder_res.err);
+        free_engine(engine);
+        free_uc_committer(uc_committer);
+        free_uc_commit_client(uc_client);
+        free_snapshot(snapshot);
+        return -1;
+    }
+    ExternResultHandleExclusiveUpdateTableTransaction txn_res =
+      update_table_txn_builder_build_with_committer(
+          builder_res.ok, engine, uc_committer);
 
-    if (txn_res.tag != OkHandleExclusiveTransaction) {
+    if (txn_res.tag != OkHandleExclusiveUpdateTableTransaction) {
         print_error("Failed to create transaction with UC committer", (Error*)txn_res.err);
         free_error((Error*)txn_res.err);
         free_engine(engine);
@@ -232,29 +248,12 @@ int main(int argc, char* argv[])
         return -1;
     }
 
-    HandleExclusiveTransaction txn = txn_res.ok;
+    HandleExclusiveUpdateTableTransaction txn_with_info = txn_res.ok;
 
-    // In a real txn we could now add files using add_files()
-
-    // Add engine info to the transaction
-    const char* engine_info = "uc_example_engine";
-    KernelStringSlice engine_info_slice = { .ptr = engine_info, .len = strlen(engine_info) };
-
-    ExternResultHandleExclusiveTransaction txn_with_info_res =
-        with_engine_info(txn, engine_info_slice, engine);
-
-    if (txn_with_info_res.tag != OkHandleExclusiveTransaction) {
-        print_error("Failed to set engine info", (Error*)txn_with_info_res.err);
-        free_error((Error*)txn_with_info_res.err);
-        free_engine(engine);
-        free_uc_commit_client(uc_client);
-        free_snapshot(snapshot);
-        return -1;
-    }
-
-    HandleExclusiveTransaction txn_with_info = txn_with_info_res.ok;
+    // This example commits no files. To append new records with update_table_txn_add_files(),
+    // construct the builder with data_change=true.
     // calling commit here will end up calling our callback
-    ExternResultHandleExclusiveCommittedTransaction commit_res = commit(txn_with_info, engine);
+    ExternResultHandleExclusiveCommittedTransaction commit_res = update_table_txn_commit(txn_with_info, engine);
 
     if (commit_res.tag != OkHandleExclusiveCommittedTransaction) {
         print_error("Commit failed", (Error*)commit_res.err);
@@ -271,7 +270,7 @@ int main(int argc, char* argv[])
     free_committed_transaction(committed);
 
     // Cleanup
-    // Note: txn_with_info was consumed by commit(), so we don't free it
+    // Note: txn_with_info was consumed by update_table_txn_commit(), so we don't free it
     free_engine(engine);
     free_uc_commit_client(uc_client);
     free_snapshot(snapshot);

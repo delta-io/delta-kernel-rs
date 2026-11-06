@@ -2,6 +2,7 @@
 
 use std::sync::Arc;
 
+use delta_kernel::Snapshot;
 use delta_kernel::arrow::array::Int32Array;
 use delta_kernel::arrow::record_batch::RecordBatch;
 use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
@@ -10,11 +11,10 @@ use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::{DynObjectStore, ObjectStoreExt as _};
 use delta_kernel::schema::SchemaRef;
 use delta_kernel::transaction::CommitResult;
-use delta_kernel::Snapshot;
 use tempfile::TempDir;
-use test_utils::delta_kernel_default_engine::executor::tokio::TokioBackgroundExecutor;
 use test_utils::delta_kernel_default_engine::DefaultEngine;
-use test_utils::{engine_store_setup, load_and_begin_transaction};
+use test_utils::delta_kernel_default_engine::executor::tokio::TokioBackgroundExecutor;
+use test_utils::{engine_store_setup, load_and_begin_transaction_with};
 use url::Url;
 
 use crate::common::write_utils::get_simple_int_schema;
@@ -65,7 +65,7 @@ async fn generate_and_add_data_file(
         vec![Arc::new(Int32Array::from(values))],
     )?;
 
-    let write_context = txn.write_state()?.unpartitioned_write_context()?;
+    let write_context = txn.write_state()?.write_context_builder().build()?;
     let file_meta = engine
         .write_parquet(&ArrowEngineData::new(data), &write_context)
         .await?;
@@ -108,8 +108,14 @@ async fn test_ict_commit_e2e() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-    let mut txn =
-        load_and_begin_transaction(table_url.clone(), &engine)?.with_engine_info("ict test");
+    let mut txn = load_and_begin_transaction_with(
+        table_url.clone(),
+        &engine,
+        delta_kernel::transaction::UpdateTableOperation::Write,
+        "ict test",
+        true,
+        |builder| builder,
+    )?;
 
     // Add some data
     generate_and_add_data_file(&mut txn, &engine, schema.clone(), vec![1, 2, 3]).await?;
@@ -117,20 +123,20 @@ async fn test_ict_commit_e2e() -> Result<(), Box<dyn std::error::Error>> {
     // First commit
     let commit_result = txn.commit(&engine)?;
     match commit_result {
-        CommitResult::CommittedTransaction(committed) => {
+        CommitResult::Committed(committed) => {
             assert_eq!(
                 committed.commit_version(),
                 1,
                 "First commit should result in version 1"
             );
         }
-        CommitResult::ConflictedTransaction(conflicted) => {
+        CommitResult::Conflicted(conflicted) => {
             panic!(
                 "First commit should not conflict, got conflict at version {}",
                 conflicted.conflict_version()
             );
         }
-        CommitResult::RetryableTransaction(_) => {
+        CommitResult::Retryable(_) => {
             panic!("First commit should not be retryable error");
         }
     }
@@ -153,8 +159,14 @@ async fn test_ict_commit_e2e() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-    let mut txn2 =
-        load_and_begin_transaction(table_url.clone(), &engine)?.with_engine_info("ict test 2");
+    let mut txn2 = load_and_begin_transaction_with(
+        table_url.clone(),
+        &engine,
+        delta_kernel::transaction::UpdateTableOperation::Write,
+        "ict test 2",
+        true,
+        |builder| builder,
+    )?;
 
     // Add more data
     generate_and_add_data_file(&mut txn2, &engine, schema, vec![4, 5, 6]).await?;
@@ -162,20 +174,20 @@ async fn test_ict_commit_e2e() -> Result<(), Box<dyn std::error::Error>> {
     // Second commit
     let commit_result2 = txn2.commit(&engine)?;
     match commit_result2 {
-        CommitResult::CommittedTransaction(committed) => {
+        CommitResult::Committed(committed) => {
             assert_eq!(
                 committed.commit_version(),
                 2,
                 "Second commit should result in version 2"
             );
         }
-        CommitResult::ConflictedTransaction(conflicted) => {
+        CommitResult::Conflicted(conflicted) => {
             panic!(
                 "Second commit should not conflict, got conflict at version {}",
                 conflicted.conflict_version()
             );
         }
-        CommitResult::RetryableTransaction(_) => {
+        CommitResult::Retryable(_) => {
             panic!("Second commit should not be retryable error");
         }
     }

@@ -17,12 +17,13 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use delta_kernel_derive::internal_api;
+use derive_more::Constructor;
 use tracing::{debug, warn};
+use url::Url;
 
 use crate::engine_data::GetData;
 use crate::log_replay::deduplicator::{Deduplicator, FileActionInfo};
-use crate::scan::data_skipping::DataSkippingFilter;
-use crate::{DeltaResult, EngineData};
+use crate::{EngineData, KernelResult};
 
 pub(crate) mod deduplicator;
 
@@ -35,7 +36,10 @@ pub struct FileActionKey {
 }
 
 impl FileActionKey {
-    /// Build a key from a path and optional deletion-vector unique id.
+    /// Build a key from a path and optional deletion-vector unique id. Derive the id with
+    /// [`DeletionVectorDescriptor::unique_id_for`] so it matches the keys kernel produces.
+    ///
+    /// [`DeletionVectorDescriptor::unique_id_for`]: crate::actions::deletion_vector::DeletionVectorDescriptor::unique_id_for
     pub fn new(path: impl Into<String>, dv_unique_id: Option<String>) -> Self {
         let path = path.into();
         Self { path, dv_unique_id }
@@ -84,9 +88,14 @@ pub(crate) struct FileActionDeduplicator<'seen> {
     add_dv_start_index: usize,
     /// Starting index for remove action deletion vector columns
     remove_dv_start_index: usize,
+    /// Table root for normalizing paths. `Some` iff adaptiveMetadata is enabled.
+    dv_normalization_root: Option<Url>,
 }
 
 impl<'seen> FileActionDeduplicator<'seen> {
+    // Hand-written (not `#[derive(Constructor)]`) so the eight-field constructor can carry the
+    // `too_many_arguments` allow; the positional field order is the call-site argument order.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         seen_file_keys: &'seen mut HashSet<FileActionKey>,
         is_log_batch: bool,
@@ -95,6 +104,7 @@ impl<'seen> FileActionDeduplicator<'seen> {
         remove_path_index: usize,
         add_dv_start_index: usize,
         remove_dv_start_index: usize,
+        dv_normalization_root: Option<Url>,
     ) -> Self {
         Self {
             seen_file_keys,
@@ -104,6 +114,7 @@ impl<'seen> FileActionDeduplicator<'seen> {
             remove_path_index,
             add_dv_start_index,
             remove_dv_start_index,
+            dv_normalization_root,
         }
     }
 }
@@ -158,7 +169,7 @@ impl Deduplicator for FileActionDeduplicator<'_> {
         i: usize,
         getters: &[&'a dyn GetData<'a>],
         skip_removes: bool,
-    ) -> DeltaResult<Option<FileActionInfo>> {
+    ) -> KernelResult<Option<FileActionInfo>> {
         // Try to extract an add action by the required path column
         if let Some(path) = getters[self.add_path_index].get_str(i, "add.path")? {
             let size = match getters[self.add_size_index].get_long(i, "add.size")? {
@@ -206,9 +217,14 @@ impl Deduplicator for FileActionDeduplicator<'_> {
     fn is_log_batch(&self) -> bool {
         self.is_log_batch
     }
+
+    fn dv_normalization_root(&self) -> Option<&Url> {
+        self.dv_normalization_root.as_ref()
+    }
 }
 
 #[internal_api]
+#[derive(Constructor)]
 pub(crate) struct ActionsBatch {
     /// The batch of actions to be processed: each row is an action from the log.
     pub actions: Box<dyn EngineData>,
@@ -217,20 +233,6 @@ pub(crate) struct ActionsBatch {
 }
 
 impl ActionsBatch {
-    /// Creates a new `ActionsBatch` instance. See [`LogReplayProcessor::process_actions_batch`] for
-    /// usage.
-    ///
-    /// # Parameters
-    /// - `actions`: A boxed [`EngineData`] instance representing the actions batch.
-    /// - `is_log_batch`: A boolean indicating whether the batch is from a commit log (`true`) or a
-    ///   checkpoint/CRC/elsewhere (`false`).
-    pub(crate) fn new(actions: Box<dyn EngineData>, is_log_batch: bool) -> Self {
-        Self {
-            actions,
-            is_log_batch,
-        }
-    }
-
     /// HACK: a duplication of the pub(crate) field `actions` to allow us to export as
     /// 'internal-api' and let inspect-table example use it.
     #[allow(unused)]
@@ -243,7 +245,10 @@ impl ActionsBatch {
 #[internal_api]
 pub(crate) trait ParallelLogReplayProcessor {
     type Output;
-    fn process_actions_batch(&self, actions_batch: ActionsBatch) -> DeltaResult<Self::Output>;
+    fn process_actions_batch_parallel(
+        &self,
+        actions_batch: ActionsBatch,
+    ) -> KernelResult<Self::Output>;
 }
 
 impl<T> ParallelLogReplayProcessor for Arc<T>
@@ -252,141 +257,12 @@ where
 {
     type Output = T::Output;
 
-    fn process_actions_batch(&self, actions_batch: ActionsBatch) -> DeltaResult<Self::Output> {
-        T::process_actions_batch(self, actions_batch)
+    fn process_actions_batch_parallel(
+        &self,
+        actions_batch: ActionsBatch,
+    ) -> KernelResult<Self::Output> {
+        T::process_actions_batch_parallel(self, actions_batch)
     }
-}
-
-/// A trait for processing batches of actions from Delta transaction logs during log replay.
-///
-/// Log replay processors scan transaction logs in **reverse chronological order** (newest to
-/// oldest), filtering and transforming action batches into specialized output types. These
-/// processors:
-///
-/// - **Track and deduplicate file actions** to apply appropriate `Remove` actions to corresponding
-///   `Add` actions (and omit the file from the log replay output)
-/// - **Maintain selection vectors** to indicate which actions in each batch should be included.
-/// - **Apply custom filtering logic** based on the processor’s purpose (e.g., checkpointing,
-///   scanning).
-/// - **Data skipping** filters are applied to the initial selection vector to reduce the number of
-///   rows processed by the processor, (if a filter is provided).
-///
-/// # Implementations
-///
-/// - [`ScanLogReplayProcessor`]: Used for table scans, this processor filters and selects
-///   deduplicated `Add` actions from log batches to reconstruct the view of the table at a specific
-///   point in time. Note that scans do not expose `Remove` actions. Data skipping may be applied
-///   when a predicate is provided.
-///
-/// - [`ActionReconciliationProcessor`]: Used for action reconciliation (including checkpoint
-///   writing), this processor filters and selects actions from log batches for inclusion in V1 spec
-///   checkpoint files. Unlike scans, action reconciliation processing includes additional actions,
-///   such as `Remove`, `Metadata`, and `Protocol`, required to fully reconstruct table state. Data
-///   skipping is not applied during action reconciliation processing.
-///
-/// [`ActionReconciliationProcessor`]: crate::action_reconciliation::log_replay::ActionReconciliationProcessor
-///
-/// # Action Iterator Input
-///
-/// The [`LogReplayProcessor::process_actions_iter`] method is the entry point for log replay
-/// processing. It takes as input an iterator of (actions batch, is_commit_batch flag) tuples and
-/// returns an iterator of processor-specific output types with selection vectors. The
-/// is_commit_batch bool flag in each tuple indicates whether the batch came from a commit log
-/// (`true`) or checkpoint (`false`). Action batches **must** be sorted by the order of the actions
-/// in the log from most recent to oldest.
-///
-/// Each row that is selected in the returned output **must** be included in the processor's result
-/// (e.g., in scan results or checkpoint files), while non-selected rows **must** be ignored.
-///
-/// # Output Types
-///
-/// The [`LogReplayProcessor::Output`] type represents the material result of log replay, and it
-/// must implement the [`HasSelectionVector`] trait to allow filtering of irrelevant rows:
-///
-/// - For **scans**, the output type is [`ScanMetadata`], which contains the file actions (`Add`
-///   actions) that need to be applied to build the table's view, accompanied by a **selection
-///   vector** that identifies which rows should be included. A transform vector may also be
-///   included to handle schema changes, such as renaming columns or modifying data types.
-///
-/// - For **checkpoints**, the output type is [`FilteredEngineData`], which includes the actions
-///   necessary to write to the checkpoint file (`Add`, `Remove`, `Metadata`, `Protocol` actions),
-///   filtered by the **selection vector** to determine which rows are included in the final
-///   checkpoint.
-///
-/// TODO: Refactor the Change Data Feed (CDF) processor to use this trait.
-#[allow(rustdoc::broken_intra_doc_links, rustdoc::private_intra_doc_links)]
-#[internal_api]
-pub(crate) trait LogReplayProcessor: Sized {
-    /// The type of results produced by this processor must implement the
-    /// [`HasSelectionVector`] trait to allow filtering out batches with no selected rows.
-    type Output: HasSelectionVector;
-
-    /// Processes a batch of actions and returns the filtered results.
-    /// # Parameters
-    /// - `actions_batch` - An [`ActionsBatch`] which includes a boxed [`EngineData`] instance
-    ///   representing a batch of actions and a boolean flag indicating whether the batch originates
-    ///   from a commit log, `false` if from a checkpoint.
-    ///
-    /// Returns a [`DeltaResult`] containing the processor’s output, which includes only selected
-    /// actions.
-    ///
-    /// Note: Since log replay is stateful, processing may update internal processor state (e.g.,
-    /// deduplication sets).
-    fn process_actions_batch(&mut self, actions_batch: ActionsBatch) -> DeltaResult<Self::Output>;
-
-    /// Applies the processor to an actions iterator and filters out empty results.
-    ///
-    /// This method:
-    /// 1. Applies `process_actions_batch` to each action batch
-    /// 2. Maintains processor state across all batches
-    /// 3. Automatically filters out batches with no selected rows
-    ///
-    /// # Parameters
-    /// - `action_iter`: Iterator of [`ActionsBatch`], where each batch contains actions and the
-    ///   boolean flag indicates whether the batch came from a commit log (`true`) or checkpoint
-    ///   (`false`). Actions _must_ be provided in reverse chronological order.
-    ///
-    /// # Returns
-    /// An iterator that yields the output type of the processor, containing only non-empty results
-    /// (batches where at least one row was selected).
-    fn process_actions_iter(
-        mut self,
-        action_iter: impl Iterator<Item = DeltaResult<ActionsBatch>>,
-    ) -> impl Iterator<Item = DeltaResult<Self::Output>> {
-        action_iter
-            .map(move |actions_batch| self.process_actions_batch(actions_batch?))
-            .filter(|res| {
-                res.as_ref()
-                    .ok()
-                    .is_none_or(|result| result.has_selected_rows())
-            })
-    }
-
-    /// Builds the initial selection vector for the action batch, used to filter out rows that
-    /// are not relevant to the current processor's purpose (e.g., checkpointing, scanning).
-    /// This method performs a first pass of filtering using an optional [`DataSkippingFilter`].
-    /// If no filter is provided, it assumes that all rows should be selected.
-    ///
-    /// The selection vector is further updated based on the processor's logic in the
-    /// `process_actions_batch` method.
-    ///
-    /// # Parameters
-    /// - `batch`: A reference to the batch of actions to be processed.
-    ///
-    /// # Returns
-    /// A `DeltaResult<Vec<bool>>`, where each boolean indicates if the corresponding row should be
-    /// included. If no filter is provided, all rows are selected.
-    fn build_selection_vector(&self, batch: &dyn EngineData) -> DeltaResult<Vec<bool>> {
-        match self.data_skipping_filter() {
-            Some(filter) => filter.apply(batch),
-            None => Ok(vec![true; batch.len()]), // If no filter is provided, select all rows
-        }
-    }
-
-    /// Returns an optional reference to the [`DataSkippingFilter`] used to filter rows
-    /// when building the initial selection vector in `build_selection_vector`.
-    /// If `None` is returned, no filter is applied, and all rows are selected.
-    fn data_skipping_filter(&self) -> Option<&DataSkippingFilter>;
 }
 
 /// This trait is used to determine if a processor's output contains any selected rows.
@@ -405,8 +281,10 @@ mod tests {
 
     use super::deduplicator::CheckpointDeduplicator;
     use super::*;
+    use crate::KernelResult;
     use crate::engine_data::GetData;
-    use crate::DeltaResult;
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    use crate::unit_test_utils::assert_result_error_with_message;
 
     /// Mock GetData implementation for testing
     struct MockGetData {
@@ -441,9 +319,9 @@ mod tests {
     }
 
     impl<'a> GetData<'a> for MockGetData {
-        fn get_str(&'a self, row_index: usize, field_name: &str) -> DeltaResult<Option<&'a str>> {
+        fn get_str(&'a self, row_index: usize, field_name: &str) -> KernelResult<Option<&'a str>> {
             if let Some(error_msg) = self.errors.get(&(row_index, field_name.to_string())) {
-                return Err(crate::Error::Generic(error_msg.clone()));
+                return Err(crate::KernelError::Generic(error_msg.clone()));
             }
             Ok(self
                 .string_values
@@ -451,9 +329,9 @@ mod tests {
                 .map(|s| s.as_str()))
         }
 
-        fn get_int(&'a self, row_index: usize, field_name: &str) -> DeltaResult<Option<i32>> {
+        fn get_int(&'a self, row_index: usize, field_name: &str) -> KernelResult<Option<i32>> {
             if let Some(error_msg) = self.errors.get(&(row_index, field_name.to_string())) {
-                return Err(crate::Error::Generic(error_msg.clone()));
+                return Err(crate::KernelError::Generic(error_msg.clone()));
             }
             Ok(self
                 .int_values
@@ -461,9 +339,9 @@ mod tests {
                 .cloned())
         }
 
-        fn get_long(&'a self, row_index: usize, field_name: &str) -> DeltaResult<Option<i64>> {
+        fn get_long(&'a self, row_index: usize, field_name: &str) -> KernelResult<Option<i64>> {
             if let Some(error_msg) = self.errors.get(&(row_index, field_name.to_string())) {
-                return Err(crate::Error::Generic(error_msg.clone()));
+                return Err(crate::KernelError::Generic(error_msg.clone()));
             }
             Ok(self
                 .long_values
@@ -477,6 +355,14 @@ mod tests {
         seen: &mut HashSet<FileActionKey>,
         is_log_batch: bool,
     ) -> FileActionDeduplicator<'_> {
+        create_deduplicator_with_root(seen, is_log_batch, None)
+    }
+
+    fn create_deduplicator_with_root(
+        seen: &mut HashSet<FileActionKey>,
+        is_log_batch: bool,
+        dv_normalization_root: Option<Url>,
+    ) -> FileActionDeduplicator<'_> {
         FileActionDeduplicator::new(
             seen,
             is_log_batch,
@@ -485,7 +371,19 @@ mod tests {
             5, // remove_path_index
             2, // add_dv_start_index
             6, // remove_dv_start_index
+            dv_normalization_root,
         )
+    }
+
+    /// A file action row for `path_field` carrying a DV at offset 4.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    fn file_action_with_dv(path_field: &str, storage_type: &str, dv_path: &str) -> MockGetData {
+        let mut mock = MockGetData::new();
+        mock.add_string(0, path_field, "f.parquet");
+        mock.add_string(0, "deletionVector.storageType", storage_type);
+        mock.add_string(0, "deletionVector.pathOrInlineDv", dv_path);
+        mock.add_int(0, "deletionVector.offset", 4);
+        mock
     }
 
     /// Helper to create a getters array with mocks at specific positions
@@ -510,6 +408,82 @@ mod tests {
         ]
     }
 
+    // A newer remove encodes the DV as `'r'` and an older add encodes the same DV file as `'u'`.
+    // Only under adaptiveMetadata (a normalization root) does the remove cancel the add.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[rstest]
+    #[case::normalized(
+        Some("s3://mytable/"),
+        "rab/deletion_vector_d2c639aa-8816-431a-aaf6-d3fe2512ff61.bin@4",
+        true
+    )]
+    #[case::legacy(None, "uab^-aqEH.-t@S}K{vb[*k^@4", false)]
+    fn test_remove_cancels_add_across_dv_storage_types(
+        #[case] root: Option<&str>,
+        #[case] expected_add_dv_id: &str,
+        #[case] expect_cancelled: bool,
+    ) -> KernelResult<()> {
+        let mut seen = HashSet::new();
+        let root = root.map(|r| Url::parse(r).unwrap());
+        let mut deduplicator = create_deduplicator_with_root(&mut seen, true, root.clone());
+        let remove = file_action_with_dv(
+            "remove.path",
+            "r",
+            "ab/deletion_vector_d2c639aa-8816-431a-aaf6-d3fe2512ff61.bin",
+        );
+        let add = file_action_with_dv("add.path", "u", "ab^-aqEH.-t@S}K{vb[*k^");
+
+        let remove_key = deduplicator
+            .extract_file_action(0, &create_getters_with_mocks(None, Some(&remove)), false)?
+            .unwrap()
+            .key;
+        let add_key = deduplicator
+            .extract_file_action(0, &create_getters_with_mocks(Some(&add), None), false)?
+            .unwrap()
+            .key;
+        assert_eq!(
+            remove_key.dv_unique_id(),
+            Some("rab/deletion_vector_d2c639aa-8816-431a-aaf6-d3fe2512ff61.bin@4")
+        );
+        assert_eq!(add_key.dv_unique_id(), Some(expected_add_dv_id));
+
+        let commit_removes = HashSet::from([remove_key.clone()]);
+        assert!(!deduplicator.check_and_record_seen(remove_key));
+        assert_eq!(
+            deduplicator.check_and_record_seen(add_key),
+            expect_cancelled
+        );
+
+        // The same add read from a checkpoint is filtered against the removes seen in commits.
+        let mut checkpoint = CheckpointDeduplicator::try_new(&commit_removes, 0, 1, 2, root)?;
+        let checkpoint_add_key = checkpoint
+            .extract_file_action(0, &create_getters_with_mocks(Some(&add), None), false)?
+            .unwrap()
+            .key;
+        assert_eq!(
+            checkpoint.check_and_record_seen(checkpoint_add_key),
+            expect_cancelled
+        );
+        Ok(())
+    }
+
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[test]
+    fn test_normalized_dv_identity_rejects_unknown_storage_type() {
+        let mut seen = HashSet::new();
+        let root = Url::parse("s3://mytable/").unwrap();
+        let deduplicator = create_deduplicator_with_root(&mut seen, true, Some(root));
+        let add = file_action_with_dv("add.path", "z", "ABC");
+        assert_result_error_with_message(
+            deduplicator.extract_file_action(
+                0,
+                &create_getters_with_mocks(Some(&add), None),
+                false,
+            ),
+            "unsupported deletion vector storage type: z",
+        );
+    }
+
     #[rstest]
     #[case::valid_size(Some(100), 100)]
     #[case::missing_size_defaults_to_zero(None, 0)]
@@ -517,7 +491,7 @@ mod tests {
     fn test_extract_file_action_add(
         #[case] raw_size: Option<i64>,
         #[case] expected_size: u64,
-    ) -> DeltaResult<()> {
+    ) -> KernelResult<()> {
         let mut seen = HashSet::new();
         let deduplicator = create_deduplicator(&mut seen, true);
 
@@ -539,7 +513,7 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_file_action_remove() -> DeltaResult<()> {
+    fn test_extract_file_action_remove() -> KernelResult<()> {
         let mut seen = HashSet::new();
         let deduplicator = create_deduplicator(&mut seen, true);
 
@@ -557,7 +531,7 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_file_action_with_deletion_vector() -> DeltaResult<()> {
+    fn test_extract_file_action_with_deletion_vector() -> KernelResult<()> {
         let mut seen = HashSet::new();
         let deduplicator = create_deduplicator(&mut seen, true);
 
@@ -581,7 +555,7 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_file_action_skip_removes() -> DeltaResult<()> {
+    fn test_extract_file_action_skip_removes() -> KernelResult<()> {
         let mut seen = HashSet::new();
         let deduplicator = create_deduplicator(&mut seen, true);
 
@@ -590,27 +564,33 @@ mod tests {
         let getters = create_getters_with_mocks(None, Some(&mock_remove));
 
         // With skip_removes=true, should return None
-        assert!(deduplicator
-            .extract_file_action(0, &getters, true)?
-            .is_none());
+        assert!(
+            deduplicator
+                .extract_file_action(0, &getters, true)?
+                .is_none()
+        );
 
         // With skip_removes=false, should return Some
-        assert!(deduplicator
-            .extract_file_action(0, &getters, false)?
-            .is_some());
+        assert!(
+            deduplicator
+                .extract_file_action(0, &getters, false)?
+                .is_some()
+        );
 
         Ok(())
     }
 
     #[test]
-    fn test_extract_file_action_no_action_found() -> DeltaResult<()> {
+    fn test_extract_file_action_no_action_found() -> KernelResult<()> {
         let mut seen = HashSet::new();
         let deduplicator = create_deduplicator(&mut seen, true);
 
         let getters = create_getters_with_mocks(None, None);
-        assert!(deduplicator
-            .extract_file_action(0, &getters, false)?
-            .is_none());
+        assert!(
+            deduplicator
+                .extract_file_action(0, &getters, false)?
+                .is_none()
+        );
 
         Ok(())
     }
@@ -681,9 +661,9 @@ mod tests {
     // ==================== CheckpointDeduplicator Tests ====================
 
     #[test]
-    fn test_checkpoint_extract_file_action_add() -> DeltaResult<()> {
+    fn test_checkpoint_extract_file_action_add() -> KernelResult<()> {
         let seen = HashSet::new();
-        let deduplicator = CheckpointDeduplicator::try_new(&seen, 0, 2, 3)?;
+        let deduplicator = CheckpointDeduplicator::try_new(&seen, 0, 2, 3, None)?;
 
         let mut mock_add = MockGetData::new();
         mock_add.add_string(0, "add.path", "checkpoint_file.parquet");
@@ -700,9 +680,9 @@ mod tests {
     }
 
     #[test]
-    fn test_checkpoint_extract_file_action_with_deletion_vector() -> DeltaResult<()> {
+    fn test_checkpoint_extract_file_action_with_deletion_vector() -> KernelResult<()> {
         let seen = HashSet::new();
-        let deduplicator = CheckpointDeduplicator::try_new(&seen, 0, 1, 2)?;
+        let deduplicator = CheckpointDeduplicator::try_new(&seen, 0, 1, 2, None)?;
 
         let mut mock_dv = MockGetData::new();
         mock_dv.add_string(0, "add.path", "file_with_dv.parquet");
@@ -725,7 +705,7 @@ mod tests {
     }
 
     #[test]
-    fn test_checkpoint_deduplicator_filters_commit_duplicates() -> DeltaResult<()> {
+    fn test_checkpoint_deduplicator_filters_commit_duplicates() -> KernelResult<()> {
         let mut seen = HashSet::new();
 
         // Files "seen" during commit processing
@@ -735,7 +715,7 @@ mod tests {
             Some("dv123".to_string()),
         ));
 
-        let mut deduplicator = CheckpointDeduplicator::try_new(&seen, 0, 2, 3)?;
+        let mut deduplicator = CheckpointDeduplicator::try_new(&seen, 0, 2, 3, None)?;
 
         // File modified in commit - should be filtered from checkpoint
         let commit_modified = FileActionKey::new("modified_in_commit.parquet", None);

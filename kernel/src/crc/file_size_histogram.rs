@@ -7,10 +7,11 @@
 //!
 //! [FileSizeHistogram]: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#file-size-histogram-schema
 
+use delta_kernel_derive::internal_api;
 use serde::{Deserialize, Serialize};
 
 use crate::utils::require;
-use crate::{DeltaResult, Error};
+use crate::{KernelError, KernelResult};
 
 const KB: i64 = 1024;
 const MB: i64 = KB * 1024;
@@ -107,24 +108,25 @@ impl FileSizeHistogram {
     /// Creates a new histogram with the given arrays, after validation.
     ///
     /// Validates that:
-    /// - All arrays have the same length (>= 2)
+    /// - All arrays have the same length (at least two)
     /// - The first boundary is 0
-    /// - Boundaries are sorted in ascending order
+    /// - Boundaries are sorted in strictly ascending order
+    #[internal_api]
     pub(crate) fn try_new(
         sorted_bin_boundaries: Vec<i64>,
         file_counts: Vec<i64>,
         total_bytes: Vec<i64>,
-    ) -> DeltaResult<Self> {
+    ) -> KernelResult<Self> {
         require!(
             sorted_bin_boundaries.len() >= 2,
-            Error::internal_error(format!(
+            KernelError::internal_error(format!(
                 "sorted_bin_boundaries must have at least 2 elements, got {}",
                 sorted_bin_boundaries.len()
             ))
         );
         require!(
             sorted_bin_boundaries[0] == 0,
-            Error::internal_error(format!(
+            KernelError::internal_error(format!(
                 "First boundary must be 0, got {}",
                 sorted_bin_boundaries[0]
             ))
@@ -132,7 +134,7 @@ impl FileSizeHistogram {
         require!(
             sorted_bin_boundaries.len() == file_counts.len()
                 && sorted_bin_boundaries.len() == total_bytes.len(),
-            Error::internal_error(format!(
+            KernelError::internal_error(format!(
                 "All arrays must have the same length: boundaries={}, file_counts={}, total_bytes={}",
                 sorted_bin_boundaries.len(),
                 file_counts.len(),
@@ -141,7 +143,7 @@ impl FileSizeHistogram {
         );
         require!(
             sorted_bin_boundaries.windows(2).all(|w| w[0] < w[1]),
-            Error::internal_error(
+            KernelError::internal_error(
                 "sorted_bin_boundaries must be sorted in strictly ascending order"
             )
         );
@@ -158,7 +160,7 @@ impl FileSizeHistogram {
     /// histograms that match, so that `try_apply_delta` succeeds during merge.
     pub(crate) fn create_empty_with_boundaries(
         sorted_bin_boundaries: Vec<i64>,
-    ) -> DeltaResult<Self> {
+    ) -> KernelResult<Self> {
         let len = sorted_bin_boundaries.len();
         Self::try_new(sorted_bin_boundaries, vec![0; len], vec![0; len])
     }
@@ -192,10 +194,13 @@ impl FileSizeHistogram {
 
     /// Adds a file of the given size to the histogram, incrementing the appropriate bin's
     /// file count and total bytes.
-    pub(crate) fn insert(&mut self, file_size: i64) -> DeltaResult<()> {
+    pub(crate) fn insert(&mut self, file_size: i64) -> KernelResult<()> {
         require!(
             file_size >= 0,
-            Error::internal_error(format!("File size must be non-negative, got {}", file_size))
+            KernelError::internal_error(format!(
+                "File size must be non-negative, got {}",
+                file_size
+            ))
         );
         let idx = self.get_bin_index(file_size);
         self.file_counts[idx] += 1;
@@ -208,10 +213,13 @@ impl FileSizeHistogram {
     ///
     /// Does not validate that the bin remains non-negative, since this is used to build delta
     /// histograms where removes may exceed adds in a given bin.
-    pub(crate) fn remove(&mut self, file_size: i64) -> DeltaResult<()> {
+    pub(crate) fn remove(&mut self, file_size: i64) -> KernelResult<()> {
         require!(
             file_size >= 0,
-            Error::internal_error(format!("File size must be non-negative, got {}", file_size))
+            KernelError::internal_error(format!(
+                "File size must be non-negative, got {}",
+                file_size
+            ))
         );
         let idx = self.get_bin_index(file_size);
         self.file_counts[idx] -= 1;
@@ -228,10 +236,10 @@ impl FileSizeHistogram {
     pub(crate) fn try_apply_delta(
         &self,
         delta: &FileSizeHistogram,
-    ) -> DeltaResult<FileSizeHistogram> {
+    ) -> KernelResult<FileSizeHistogram> {
         require!(
             self.sorted_bin_boundaries == delta.sorted_bin_boundaries,
-            Error::internal_error("Cannot add histograms with different bin boundaries")
+            KernelError::internal_error("Cannot add histograms with different bin boundaries")
         );
         let len = self.sorted_bin_boundaries.len();
         let mut file_counts = Vec::with_capacity(len);
@@ -241,7 +249,7 @@ impl FileSizeHistogram {
             let bytes = self.total_bytes[i] + delta.total_bytes[i];
             require!(
                 count >= 0 && bytes >= 0,
-                Error::internal_error(format!(
+                KernelError::internal_error(format!(
                     "Merge would result in negative counts or bytes at bin {}",
                     i
                 ))
@@ -261,11 +269,11 @@ impl FileSizeHistogram {
     /// Returns `Ok(self)` if valid, or an error indicating the first bin that is negative.
     /// Used to validate a delta histogram before using it as an absolute histogram (e.g. for
     /// version zero where the delta represents the full table state).
-    pub(crate) fn check_non_negative(self) -> DeltaResult<Self> {
+    pub(crate) fn check_non_negative(self) -> KernelResult<Self> {
         for i in 0..self.sorted_bin_boundaries.len() {
             require!(
                 self.file_counts[i] >= 0 && self.total_bytes[i] >= 0,
-                Error::internal_error(format!(
+                KernelError::internal_error(format!(
                     "Histogram has negative counts or bytes at bin {}",
                     i
                 ))

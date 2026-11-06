@@ -11,10 +11,10 @@
 use std::borrow::Cow;
 use std::sync::Arc;
 
-use super::{schema_ref, DataType, PrimitiveType, Schema, SchemaRef, StructField, StructType};
+use super::{DataType, PrimitiveType, Schema, SchemaRef, StructField, StructType, schema_ref};
 use crate::expressions::ExpressionStructPatchBuilder;
-use crate::transforms::{transform_output_type, SchemaTransform};
-use crate::{DeltaResult, Error};
+use crate::transforms::{SchemaTransform, transform_output_type};
+use crate::{KernelError, KernelResult};
 
 /// Returns true when this struct directly contains no non-void fields. The check is local --
 /// it does not recurse into nested structs, because the caller (`ValidateForWrite`) walks every
@@ -70,7 +70,7 @@ pub(crate) fn strip_void_from_schema(schema: SchemaRef) -> SchemaRef {
 ///   values to drop them.
 /// - A struct contains no non-void fields (would produce an empty Parquet struct)
 /// - The table schema contains no non-void columns (would produce an empty Parquet schema)
-pub(crate) fn validate_schema_for_write(schema: &Schema) -> DeltaResult<()> {
+pub(crate) fn validate_schema_for_write(schema: &Schema) -> KernelResult<()> {
     ValidateForWrite {
         container_depth: 0,
         depth: 0,
@@ -84,9 +84,9 @@ struct ValidateForWrite {
 }
 
 impl ValidateForWrite {
-    fn descend_into_container(&mut self, etype: &DataType, position: &str) -> DeltaResult<()> {
+    fn descend_into_container(&mut self, etype: &DataType, position: &str) -> KernelResult<()> {
         if *etype == DataType::VOID {
-            return Err(Error::schema(format!(
+            return Err(KernelError::schema(format!(
                 "Void type is not allowed as {position}"
             )));
         }
@@ -98,11 +98,11 @@ impl ValidateForWrite {
 }
 
 impl<'a> SchemaTransform<'a> for ValidateForWrite {
-    transform_output_type!(|'a, T| DeltaResult<()>);
+    transform_output_type!(|'a, T| KernelResult<()>);
 
-    fn transform_struct(&mut self, stype: &'a StructType) -> DeltaResult<()> {
+    fn transform_struct(&mut self, stype: &'a StructType) -> KernelResult<()> {
         if has_no_non_void_fields(stype) {
-            return Err(Error::schema(if self.container_depth > 0 {
+            return Err(KernelError::schema(if self.container_depth > 0 {
                 "A struct nested in Array or Map must contain at least one non-void field"
             } else if self.depth == 0 {
                 "Table schema must contain at least one non-void column"
@@ -116,7 +116,7 @@ impl<'a> SchemaTransform<'a> for ValidateForWrite {
         result
     }
 
-    fn transform_struct_field(&mut self, field: &'a StructField) -> DeltaResult<()> {
+    fn transform_struct_field(&mut self, field: &'a StructField) -> KernelResult<()> {
         // Reject void inside a struct nested in Array or Map. `StripVoidFields` can drop
         // the field from the physical schema, but the logical-to-physical write transform
         // built by `add_void_stripping_inner` descends only through struct fields. Allowing
@@ -125,22 +125,22 @@ impl<'a> SchemaTransform<'a> for ValidateForWrite {
         // time. Lifting this restriction requires extending the runtime transform to descend
         // into Array elements and Map keys/values.
         if self.container_depth > 0 && *field.data_type() == DataType::VOID {
-            return Err(Error::schema(
+            return Err(KernelError::schema(
                 "Void type is not allowed inside a struct nested in Array or Map",
             ));
         }
         self.recurse_into_struct_field(field)
     }
 
-    fn transform_array_element(&mut self, etype: &'a DataType) -> DeltaResult<()> {
+    fn transform_array_element(&mut self, etype: &'a DataType) -> KernelResult<()> {
         self.descend_into_container(etype, "an array element type")
     }
 
-    fn transform_map_key(&mut self, etype: &'a DataType) -> DeltaResult<()> {
+    fn transform_map_key(&mut self, etype: &'a DataType) -> KernelResult<()> {
         self.descend_into_container(etype, "a map key type")
     }
 
-    fn transform_map_value(&mut self, etype: &'a DataType) -> DeltaResult<()> {
+    fn transform_map_value(&mut self, etype: &'a DataType) -> KernelResult<()> {
         self.descend_into_container(etype, "a map value type")
     }
 }
@@ -190,8 +190,8 @@ fn add_void_stripping_inner<'a>(
 mod tests {
     use super::*;
     use crate::schema::{
-        schema, ArrayType, ColumnMetadataKey, DataType, MapType, MetadataValue, StructField,
-        StructType,
+        ArrayType, ColumnMetadataKey, DataType, MapType, MetadataValue, StructField, StructType,
+        schema,
     };
 
     // ---- validate_schema_for_write tests ----

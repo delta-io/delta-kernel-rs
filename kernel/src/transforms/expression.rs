@@ -2,16 +2,16 @@ use std::borrow::{Cow, ToOwned};
 use std::sync::Arc;
 
 use crate::expressions::{
-    BinaryExpression, BinaryPredicate, CastExpression, ColumnName, Expression, ExpressionRef,
-    ExpressionStructPatch, JunctionPredicate, MapToStructExpression, OpaqueExpression,
-    OpaquePredicate, ParseJsonExpression, Predicate, Scalar, UnaryExpression, UnaryPredicate,
-    VariadicExpression,
+    BinaryExpression, BinaryPredicate, CaseWhenExpression, CastExpression, ColumnName, Expression,
+    ExpressionRef, ExpressionStructPatch, JunctionPredicate, MapToStructExpression,
+    OpaqueExpression, OpaquePredicate, ParseJsonExpression, Predicate, Scalar, UnaryExpression,
+    UnaryPredicate, VariadicExpression,
 };
 use crate::transforms::{
-    map_owned_children_or_else, map_owned_or_else, map_owned_pair_or_else, transform_output_type,
-    Carrier,
+    Carrier, carrier_into_inner_opt, carrier_try_none, map_owned_children_or_else,
+    map_owned_or_else, map_owned_pair_or_else, transform_output_type,
 };
-use crate::{DeltaResult, Error};
+use crate::{KernelError, KernelResult};
 
 /// Generic framework for recursive bottom-up transforms of expressions and predicates.
 ///
@@ -43,6 +43,9 @@ use crate::{DeltaResult, Error};
 ///   Otherwise, if at least one child changed or was filtered out, build a new parent around the
 ///   children. Otherwise, return the parent unchanged.
 ///
+/// * CASE WHEN - If any direct condition, result, or ELSE was filtered out, filter out the parent.
+///   Otherwise, rebuild only if a child changed.
+///
 /// Implementations can call these as needed but will generally not need to override them.
 ///
 /// # Transform carrier selection
@@ -51,9 +54,9 @@ use crate::{DeltaResult, Error};
 /// performed. That carrier determines the return type of each transform method.
 ///
 /// For example, a simple read-only visitor would use `()` as a carrier, while a validity checker
-/// could use `DeltaResult<()>` instead. A mutating transform uses `Cow<_>`, returning `Cow::Owned`
+/// could use `Result<()>` instead. A mutating transform uses `Cow<_>`, returning `Cow::Owned`
 /// for changed/replaced nodes, and a filtering transform uses `Option<Cow<_>>`, where `None`
-/// indicates the node should be dropped rather than replaced. `DeltaResult<Cow<_>>` and
+/// indicates the node should be dropped rather than replaced. `Result<Cow<_>>` and
 /// `Result<Option<Cow<_>>, E>` round out the set as fallible mutating and fitering transforms that
 /// short circuit immediately upon `Err`.
 pub trait ExpressionTransform<'a> {
@@ -196,6 +199,15 @@ pub trait ExpressionTransform<'a> {
         self.recurse_into_expr_variadic(expr)
     }
 
+    /// Called for each CASE WHEN expression encountered during the traversal. The provided
+    /// implementation just forwards to [`Self::recurse_into_expr_case_when`].
+    fn transform_expr_case_when(
+        &mut self,
+        expr: &'a CaseWhenExpression,
+    ) -> Self::Output<CaseWhenExpression> {
+        self.recurse_into_expr_case_when(expr)
+    }
+
     /// Called for each junction predicate encountered during the traversal. The provided
     /// implementation just forwards to [`Self::recurse_into_pred_junction`].
     fn transform_pred_junction(
@@ -255,6 +267,10 @@ pub trait ExpressionTransform<'a> {
             Expression::Variadic(v) => {
                 let child = self.transform_expr_variadic(v);
                 map_owned_or_else(expr, child, Expression::Variadic)
+            }
+            Expression::CaseWhen(c) => {
+                let child = self.transform_expr_case_when(c);
+                map_owned_or_else(expr, child, Expression::CaseWhen)
             }
             Expression::Opaque(o) => {
                 let child = self.transform_expr_opaque(o);
@@ -344,7 +360,8 @@ pub trait ExpressionTransform<'a> {
         expr: &'a MapToStructExpression,
     ) -> Self::Output<MapToStructExpression> {
         let nested = self.transform_expr(&expr.map_expr);
-        map_owned_or_else(expr, nested, MapToStructExpression::new)
+        let rebuild = |map_expr| MapToStructExpression::new(map_expr, expr.options.clone());
+        map_owned_or_else(expr, nested, rebuild)
     }
 
     /// Recursively transforms the child expression of a cast expression (unary).
@@ -414,6 +431,40 @@ pub trait ExpressionTransform<'a> {
     ) -> Self::Output<VariadicExpression> {
         let children = v.exprs.iter().map(|e| self.transform_expr(e));
         map_owned_children_or_else(v, children, |exprs| VariadicExpression::new(v.op, exprs))
+    }
+
+    /// Recursively transforms CASE WHEN branches and ELSE. Filtering any direct condition, result,
+    /// or ELSE filters out the entire CASE.
+    fn recurse_into_expr_case_when(
+        &mut self,
+        c: &'a CaseWhenExpression,
+    ) -> Self::Output<CaseWhenExpression> {
+        let mut changed = false;
+        let mut branches = Vec::new();
+        for (condition, result) in &c.branches {
+            let condition = carrier_into_inner_opt!(self.transform_pred(condition));
+            let result = carrier_into_inner_opt!(self.transform_expr(result));
+            if let (Some(condition), Some(result)) = (condition, result) {
+                changed |= matches!(condition, Cow::Owned(_)) || matches!(result, Cow::Owned(_));
+                branches.push((condition, result));
+            }
+        }
+        let else_expr = carrier_into_inner_opt!(self.transform_expr(&c.else_expr));
+        // Visit all children before propagating filtering: visitor carriers also produce None.
+        if branches.len() != c.branches.len() || else_expr.is_none() {
+            carrier_try_none!();
+        }
+        changed |= matches!(else_expr, Some(Cow::Owned(_)));
+        let result = match else_expr {
+            Some(else_expr) if changed => Cow::Owned(CaseWhenExpression::new(
+                branches
+                    .into_iter()
+                    .map(|(condition, result)| (condition.into_owned(), result.into_owned())),
+                else_expr.into_owned(),
+            )),
+            _ => Cow::Borrowed(c),
+        };
+        Carrier::from_inner(result)
     }
 
     /// Recursively transforms a junction predicate's children (variadic).
@@ -487,14 +538,14 @@ impl ExpressionDepthChecker {
     // Triggers the requested recursion only doing so would not exceed the depth limit.
     fn depth_limited<'a, T: std::fmt::Debug + ToOwned + ?Sized>(
         &mut self,
-        recurse: impl FnOnce(&mut Self, &'a T) -> DeltaResult<()>,
+        recurse: impl FnOnce(&mut Self, &'a T) -> KernelResult<()>,
         arg: &'a T,
-    ) -> DeltaResult<()> {
+    ) -> KernelResult<()> {
         self.call_count += 1;
         if self.current_depth > self.max_depth_seen {
             self.max_depth_seen = self.current_depth;
             if self.current_depth > self.depth_limit {
-                return Err(Error::schema(format!(
+                return Err(KernelError::schema(format!(
                     "Max expression depth {} exceeded by {arg:?}",
                     self.depth_limit
                 )));
@@ -508,49 +559,56 @@ impl ExpressionDepthChecker {
 }
 
 impl<'a> ExpressionTransform<'a> for ExpressionDepthChecker {
-    transform_output_type!(|'a, T| DeltaResult<()>);
+    transform_output_type!(|'a, T| KernelResult<()>);
 
-    fn transform_expr_cast(&mut self, expr: &'a CastExpression) -> DeltaResult<()> {
+    fn transform_expr_cast(&mut self, expr: &'a CastExpression) -> KernelResult<()> {
         self.depth_limited(Self::recurse_into_expr_cast, expr)
     }
 
-    fn transform_expr_struct(&mut self, fields: &'a [ExpressionRef]) -> DeltaResult<()> {
+    fn transform_expr_struct(&mut self, fields: &'a [ExpressionRef]) -> KernelResult<()> {
         self.depth_limited(Self::recurse_into_expr_struct, fields)
     }
 
-    fn transform_expr_pred(&mut self, pred: &'a Predicate) -> DeltaResult<()> {
+    fn transform_expr_pred(&mut self, pred: &'a Predicate) -> KernelResult<()> {
         self.depth_limited(Self::recurse_into_expr_pred, pred)
     }
 
-    fn transform_pred_not(&mut self, pred: &'a Predicate) -> DeltaResult<()> {
+    fn transform_pred_not(&mut self, pred: &'a Predicate) -> KernelResult<()> {
         self.depth_limited(Self::recurse_into_pred_not, pred)
     }
 
-    fn transform_pred_unary(&mut self, pred: &'a UnaryPredicate) -> DeltaResult<()> {
+    fn transform_pred_unary(&mut self, pred: &'a UnaryPredicate) -> KernelResult<()> {
         self.depth_limited(Self::recurse_into_pred_unary, pred)
     }
 
-    fn transform_expr_binary(&mut self, expr: &'a BinaryExpression) -> DeltaResult<()> {
+    fn transform_expr_binary(&mut self, expr: &'a BinaryExpression) -> KernelResult<()> {
         self.depth_limited(Self::recurse_into_expr_binary, expr)
     }
 
-    fn transform_pred_binary(&mut self, pred: &'a BinaryPredicate) -> DeltaResult<()> {
+    fn transform_expr_case_when(&mut self, expr: &'a CaseWhenExpression) -> KernelResult<()> {
+        self.depth_limited(Self::recurse_into_expr_case_when, expr)
+    }
+
+    fn transform_pred_binary(&mut self, pred: &'a BinaryPredicate) -> KernelResult<()> {
         self.depth_limited(Self::recurse_into_pred_binary, pred)
     }
 
-    fn transform_pred_junction(&mut self, pred: &'a JunctionPredicate) -> DeltaResult<()> {
+    fn transform_pred_junction(&mut self, pred: &'a JunctionPredicate) -> KernelResult<()> {
         self.depth_limited(Self::recurse_into_pred_junction, pred)
     }
 
-    fn transform_pred_opaque(&mut self, pred: &'a OpaquePredicate) -> DeltaResult<()> {
+    fn transform_pred_opaque(&mut self, pred: &'a OpaquePredicate) -> KernelResult<()> {
         self.depth_limited(Self::recurse_into_pred_opaque, pred)
     }
 
-    fn transform_expr_opaque(&mut self, expr: &'a OpaqueExpression) -> DeltaResult<()> {
+    fn transform_expr_opaque(&mut self, expr: &'a OpaqueExpression) -> KernelResult<()> {
         self.depth_limited(Self::recurse_into_expr_opaque, expr)
     }
 
-    fn transform_expr_map_to_struct(&mut self, expr: &'a MapToStructExpression) -> DeltaResult<()> {
+    fn transform_expr_map_to_struct(
+        &mut self,
+        expr: &'a MapToStructExpression,
+    ) -> KernelResult<()> {
         self.depth_limited(Self::recurse_into_expr_map_to_struct, expr)
     }
 }
@@ -563,15 +621,15 @@ mod tests {
     use super::*;
     use crate::expressions::VariadicExpressionOp::Coalesce;
     use crate::expressions::{
-        col, column_name, column_pred, lit, Expression, Expression as Expr, OpaqueExpressionOp,
-        OpaquePredicateOp, ParseJsonExpression, Predicate as Pred, Scalar,
-        ScalarExpressionEvaluator, VariadicExpression,
+        Expression, Expression as Expr, MapToStructOptions, OpaqueExpressionOp, OpaquePredicateOp,
+        ParseJsonExpression, Predicate as Pred, Scalar, ScalarExpressionEvaluator,
+        VariadicExpression, col, column_name, column_pred, expr, lit,
     };
     use crate::kernel_predicates::{
         DirectDataSkippingPredicateEvaluator, DirectPredicateEvaluator,
         IndirectDataSkippingPredicateEvaluator,
     };
-    use crate::schema::{schema_ref, DataType, StructType};
+    use crate::schema::{DataType, StructType, schema_ref};
 
     #[derive(Debug, PartialEq)]
     struct OpaqueTestOp(String);
@@ -584,7 +642,7 @@ mod tests {
             &self,
             _eval_expr: &ScalarExpressionEvaluator<'_>,
             _exprs: &[Expression],
-        ) -> DeltaResult<Scalar> {
+        ) -> KernelResult<Scalar> {
             unimplemented!()
         }
     }
@@ -600,7 +658,7 @@ mod tests {
             _evaluator: &DirectPredicateEvaluator<'_>,
             _exprs: &[Expr],
             _inverted: bool,
-        ) -> DeltaResult<Option<bool>> {
+        ) -> KernelResult<Option<bool>> {
             unimplemented!()
         }
 
@@ -628,15 +686,16 @@ mod tests {
         transform_output_type!(|'a, T| Cow<'a, T>);
     }
 
-    struct ColumnReplacer;
+    struct ColumnReplacer(Option<&'static str>);
     impl<'a> ExpressionTransform<'a> for ColumnReplacer {
-        transform_output_type!(|'a, T| Cow<'a, T>);
+        transform_output_type!(|'a, T| Option<Cow<'a, T>>);
 
-        fn transform_expr_column(&mut self, name: &'a ColumnName) -> Cow<'a, ColumnName> {
+        fn transform_expr_column(&mut self, name: &'a ColumnName) -> Option<Cow<'a, ColumnName>> {
             if name.len() == 1 && name[0] == "old_col" {
-                Cow::Owned(column_name!("new_col"))
+                self.0
+                    .map(|replacement| Cow::Owned(ColumnName::new([replacement])))
             } else {
-                Cow::Borrowed(name)
+                Some(Cow::Borrowed(name))
             }
         }
     }
@@ -655,6 +714,33 @@ mod tests {
         }
     }
 
+    fn case_when_columns(names: [&str; 5]) -> Expr {
+        let [c1, r1, c2, r2, fallback] = names.map(|name| Expr::column([name]));
+        Expr::case_when(
+            [
+                (Pred::BooleanExpression(c1), r1),
+                (Pred::BooleanExpression(c2), r2),
+            ],
+            fallback,
+        )
+    }
+
+    #[test]
+    fn test_transform_expr_case_when_visitor_visits_all_children() {
+        struct ColumnCollector(Vec<ColumnName>);
+        impl<'a> ExpressionTransform<'a> for ColumnCollector {
+            transform_output_type!(|'a, T| ());
+            fn transform_expr_column(&mut self, name: &'a ColumnName) {
+                self.0.push(name.clone());
+            }
+        }
+        let names = ["c1", "r1", "c2", "r2", "fallback"];
+        let expr = case_when_columns(names);
+        let mut collector = ColumnCollector(Vec::new());
+        collector.transform_expr(&expr);
+        assert_eq!(collector.0, names.map(|name| ColumnName::new([name])));
+    }
+
     #[test]
     fn test_transform_expr_variadic_empty_input() {
         // Test edge case with empty children list
@@ -667,39 +753,57 @@ mod tests {
         assert!(matches!(result, Cow::Borrowed(_)));
     }
 
-    #[test]
-    fn test_transform_expr_variadic_child_transformation() {
-        // Test transformation of child expressions - should return Cow::Owned
-        let variadic_expr = VariadicExpression::new(
-            Coalesce,
-            vec![lit(1), col!("old_col"), col!("unchanged_col"), lit("test")],
+    #[rstest::rstest]
+    #[case::case_when_first_condition(|name: Option<&str>| name.map(|n| {
+        case_when_columns([n, "x", "x", "x", "x"])
+    }))]
+    #[case::case_when_first_result(
+        |name: Option<&str>| name.map(|n| case_when_columns(["x", n, "x", "x", "x"])),
+    )]
+    #[case::case_when_first_branch(
+        |name: Option<&str>| name.map(|n| case_when_columns([n, n, "x", "x", "x"])),
+    )]
+    #[case::case_when_second_condition(|name: Option<&str>| name.map(|n| {
+        case_when_columns(["x", "x", n, "x", "x"])
+    }))]
+    #[case::case_when_second_result(|name: Option<&str>| name.map(|n| {
+        case_when_columns(["x", "x", "x", n, "x"])
+    }))]
+    #[case::case_when_else(
+        |name: Option<&str>| name.map(|n| case_when_columns(["x", "x", "x", "x", n])),
+    )]
+    #[case::case_when_all_children(|name: Option<&str>| name.map(|n| case_when_columns([n; 5])))]
+    #[case::case_when_no_match(|_| Some(case_when_columns(["x"; 5])))]
+    #[case::case_when_empty(|name: Option<&str>| name.map(|n| {
+        Expr::CaseWhen(CaseWhenExpression::new([], Expr::column([n])))
+    }))]
+    #[case::case_when_empty_no_match(|_| Some(Expr::CaseWhen(
+        CaseWhenExpression::new([], col!("x")),
+    )))]
+    #[case::parse_json(|name: Option<&str>| name.map(|n| {
+        Expr::ParseJson(ParseJsonExpression::new(Expr::column([n]), test_output_schema()))
+    }))]
+    #[case::parse_json_no_match(|_| Some(Expr::ParseJson(
+        ParseJsonExpression::new(col!("unchanged_col"), test_output_schema()),
+    )))]
+    #[case::variadic(|name: Option<&str>| Some(Expr::coalesce([
+        Some(lit(1)),
+        name.map(|n| Expr::column([n])),
+        Some(col!("unchanged_col")),
+        Some(lit("test")),
+    ].into_iter().flatten())))]
+    fn test_transform_expr_child_transformation(
+        #[case] make_expr: fn(Option<&'static str>) -> Option<Expr>,
+        #[values(Some("new_col"), None)] replacement: Option<&'static str>,
+    ) {
+        let input = make_expr(Some("old_col")).unwrap();
+        let expected = make_expr(replacement);
+        let result = ColumnReplacer(replacement).transform_expr(&input);
+        assert_eq!(result.as_deref(), expected.as_ref());
+        assert_eq!(
+            matches!(result, Some(Cow::Borrowed(_))),
+            expected.as_ref() == Some(&input)
         );
-
-        let result = ColumnReplacer.transform_expr_variadic(&variadic_expr);
-
-        assert!(matches!(result, Cow::Owned(_)));
-        if let Cow::Owned(result_expr) = result {
-            assert_eq!(result_expr.op, Coalesce);
-            assert_eq!(result_expr.exprs.len(), 4);
-
-            // Check that the column was replaced
-            if let Expr::Column(col) = &result_expr.exprs[1] {
-                assert_eq!(col.len(), 1);
-                assert_eq!(col[0], "new_col");
-            } else {
-                panic!("Expected column expression");
-            }
-
-            // Check that other expressions are unchanged
-            assert_eq!(result_expr.exprs[0], lit(1));
-            if let Expr::Column(col) = &result_expr.exprs[2] {
-                assert_eq!(col.len(), 1);
-                assert_eq!(col[0], "unchanged_col");
-            } else {
-                panic!("Expected column expression");
-            }
-            assert_eq!(result_expr.exprs[3], lit("test"));
-        }
     }
 
     #[test]
@@ -857,59 +961,23 @@ mod tests {
     }
 
     #[test]
-    fn test_transform_expr_parse_json_child_transformation() {
-        // Test transformation of child expression - should return Cow::Owned
-        let parse_json_expr = ParseJsonExpression::new(col!("old_col"), test_output_schema());
-
-        let result = ColumnReplacer.transform_expr_parse_json(&parse_json_expr);
-
-        assert!(matches!(result, Cow::Owned(_)));
-        if let Cow::Owned(result_expr) = result {
-            // Check that the column was replaced
-            if let Expr::Column(col) = result_expr.json_expr.as_ref() {
-                assert_eq!(col.len(), 1);
-                assert_eq!(col[0], "new_col");
-            } else {
-                panic!("Expected column expression");
-            }
-            // Schema should be preserved
-            assert_eq!(result_expr.output_schema, test_output_schema());
-        }
-    }
-
-    #[test]
-    fn test_transform_expr_parse_json_child_unchanged() {
-        // Test when child column doesn't match replacement criteria - should return Cow::Borrowed
-        let parse_json_expr = ParseJsonExpression::new(col!("unchanged_col"), test_output_schema());
-
-        let result = ColumnReplacer.transform_expr_parse_json(&parse_json_expr);
-
-        // Since "json_col" doesn't match "old_col", nothing changes
-        assert!(matches!(result, Cow::Borrowed(_)));
-    }
-
-    #[test]
-    fn test_transform_expr_parse_json_child_removal() {
-        // Test removal of child expression - should return None
-        struct ColumnRemover;
-        impl<'a> ExpressionTransform<'a> for ColumnRemover {
-            transform_output_type!(|'a, T| Option<Cow<'a, T>>);
-
-            fn transform_expr_column(
-                &mut self,
-                _name: &'a ColumnName,
-            ) -> Option<Cow<'a, ColumnName>> {
-                None // Remove all column references
-            }
-        }
-
-        let parse_json_expr = ParseJsonExpression::new(col!("json_col"), test_output_schema());
-
-        let mut transform = ColumnRemover;
-        let result = transform.transform_expr_parse_json(&parse_json_expr);
-
-        // Child was removed, so the whole ParseJson should be None
-        assert!(result.is_none());
+    fn test_map_to_struct_options_survive_child_transform() {
+        let expr = Expr::map_to_struct(
+            col!("old_col"),
+            MapToStructOptions::default().with_timestamp_timezone("Europe/Berlin"),
+        );
+        let Expr::MapToStruct(transformed) = ColumnReplacer(Some("new_col"))
+            .transform_expr(&expr)
+            .unwrap()
+            .into_owned()
+        else {
+            panic!("expected map-to-struct expression");
+        };
+        assert_eq!(transformed.map_expr.as_ref(), &col!("new_col"));
+        assert_eq!(
+            transformed.options.timestamp_timezone(),
+            Some("Europe/Berlin")
+        );
     }
 
     #[test]
@@ -951,6 +1019,16 @@ mod tests {
     }
 
     #[test]
+    fn test_case_when_depth_checker_counts_nested_cases() {
+        let mut expr = lit(1);
+        for _ in 0..8 {
+            expr = Expr::case_when([(Pred::TRUE, expr)], lit(0));
+        }
+        assert_eq!(ExpressionDepthChecker::check_expr(&expr, 10), 7);
+        assert_eq!(ExpressionDepthChecker::check_expr(&expr, 3), 4);
+    }
+
+    #[test]
     fn test_depth_checker() {
         let pred = Pred::or_from([
             Pred::and_from([
@@ -959,11 +1037,11 @@ mod tests {
                     vec![lit(10) + col!("x"), Expr::unknown("unknown") - col!("b")],
                 ),
                 Pred::TRUE,
-                Pred::not(Pred::TRUE),
+                Pred::from_expr(expr!(not(true))),
             ]),
             Pred::and_from([
-                Pred::is_null(col!("b")),
-                Pred::gt(lit(10), col!("x")),
+                Pred::from_expr(expr!(is_null(col("b")))),
+                Pred::from_expr(expr!(10 > col("x"))),
                 Pred::or(
                     Pred::gt(
                         lit(5)
@@ -1114,7 +1192,7 @@ mod tests {
             }
         }
 
-        let pred = Pred::and(column_pred!("x"), Pred::TRUE);
+        let pred = Pred::from_expr(expr!(and(col("x"), true)));
         let mut transform = LiteralRemover;
         let result = transform.transform_pred(&pred);
         let result = result.map(Cow::into_owned);
@@ -1138,7 +1216,7 @@ mod tests {
             }
         }
 
-        let pred = Pred::and(column_pred!("x"), column_pred!("y"));
+        let pred = Pred::from_expr(expr!(and(col("x"), col("y"))));
         let mut transform = ColumnRemover;
         assert!(transform.transform_pred(&pred).is_none());
     }

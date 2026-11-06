@@ -4,12 +4,15 @@
 //! compile + link cycle. Each topic lives in its own submodule below and is
 //! organized by file/directory.
 
-#[macro_use]
+#[macro_use(assert_batches_sorted_eq, sort_lines)]
+extern crate test_utils;
+
 mod common;
 
 mod create_table;
 mod cross_product;
 mod data_skipping;
+mod error;
 mod features;
 mod golden_tables;
 mod hdfs;

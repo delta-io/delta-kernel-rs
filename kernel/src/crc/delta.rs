@@ -12,8 +12,10 @@ use super::file_stats::FileStatsDelta;
 use super::{
     Crc, DomainMetadataState, FileSizeHistogram, FileStats, FileStatsState, SetTransactionState,
 };
-use crate::actions::{DomainMetadata, Metadata, Protocol, SetTransaction};
 use crate::Version;
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use crate::actions::LastManifestCommit;
+use crate::actions::{DomainMetadata, Metadata, Protocol, SetTransaction};
 
 /// CRC-relevant changes aggregated over commits `(X, Y]`.
 #[derive(Debug, Clone, Default)]
@@ -31,10 +33,16 @@ pub(crate) struct CrcDelta {
     /// In-commit timestamp at `Y`. Replaces the base's ICT unconditionally
     /// (whether `Some` or `None`).
     pub(crate) in_commit_timestamp: Option<i64>,
+    /// `lastManifestCommit` at `Y`. Replaces the base's value unconditionally (whether `Some` or
+    /// `None`), since every adaptiveMetadata commit carries the value forward.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    pub(crate) last_manifest_commit: Option<LastManifestCommit>,
     /// Whether the file-stats portion of this delta can be applied incrementally. When `false`,
     /// [`Crc::apply`] transitions [`FileStatsState`] to `Indeterminate`. Producers set this to
-    /// `false` whenever they observe a signal that makes incremental tracking unsound (for
-    /// example, a non-incremental operation such as `ANALYZE STATS`).
+    /// `false` when file-stat changes cannot be tracked safely or their policy excludes
+    /// incremental construction. Replay rejects unknown operations only when their commit
+    /// contains file actions; transactions exclude custom operations even without file
+    /// actions.
     pub(crate) is_incremental_safe: bool,
 }
 
@@ -87,6 +95,8 @@ impl CrcDelta {
             domain_metadata_state,
             set_transaction_state,
             in_commit_timestamp_opt: self.in_commit_timestamp,
+            #[cfg(feature = "adaptive-metadata-in-dev")]
+            last_manifest_commit_opt: self.last_manifest_commit,
             ..Default::default()
         })
     }
@@ -98,6 +108,7 @@ impl Crc {
     ///
     /// - Protocol / metadata: replaced when present in the delta, kept otherwise.
     /// - ICT: unconditional replace; the delta carries ICT at `Y` (whether `Some` or `None`).
+    /// - `lastManifestCommit`: unconditional replace, same as ICT.
     /// - Domain metadata: tombstones (`is_removed()`) drop the key from the base map; all others
     ///   upsert by domain. Set transactions: upsert by app_id. The `Complete`/`Partial` variant is
     ///   preserved in both cases.
@@ -136,12 +147,24 @@ impl Crc {
         // In-commit timestamp at `Y` (end of the range). Unconditional replace; `None` is a
         // legal value (ICT disabled at `Y`).
         self.in_commit_timestamp_opt = delta.in_commit_timestamp;
+        #[cfg(feature = "adaptive-metadata-in-dev")]
+        {
+            self.last_manifest_commit_opt = delta.last_manifest_commit;
+        }
 
         self.file_stats_state = transition_file_stats(
             &self.file_stats_state,
             &delta.file_stats,
             delta.is_incremental_safe,
         );
+
+        // These fields describe one exact table version and are not maintained by incremental
+        // replay. Keeping them would make the advanced CRC expose stale state.
+        self.txn_id = None;
+        self.all_files = None;
+        self.num_deleted_records_opt = None;
+        self.num_deletion_vectors_opt = None;
+        self.deleted_record_counts_histogram_opt = None;
 
         self.version = new_version;
         self
@@ -217,8 +240,11 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
-    use crate::actions::{DomainMetadata, Metadata, Protocol};
-    use crate::crc::{is_incremental_safe_operation, FileSizeHistogram, SetTransactionState};
+    use crate::actions::{Add, DomainMetadata, Metadata, Protocol};
+    use crate::crc::{
+        DeletedRecordCountsHistogram, FileSizeHistogram, SetTransactionState,
+        is_incremental_safe_operation,
+    };
 
     fn base_crc() -> Crc {
         Crc {
@@ -295,6 +321,7 @@ mod tests {
             "UPDATE",
             "DELETE",
             "OPTIMIZE",
+            "REORG",
             "CREATE TABLE",
             "REPLACE TABLE",
             "CREATE TABLE AS SELECT",
@@ -335,6 +362,27 @@ mod tests {
         assert_eq!(stats.table_size_bytes(), 1600); // 1000 + 600
         assert!(crc.file_stats_state.is_complete());
         assert_eq!(crc.version, 1);
+    }
+
+    #[test]
+    fn test_apply_drops_version_specific_extended_fields() {
+        let crc = Crc {
+            txn_id: Some("txn".to_string()),
+            all_files: Some(vec![Add::default()]),
+            num_deleted_records_opt: Some(0),
+            num_deletion_vectors_opt: Some(0),
+            deleted_record_counts_histogram_opt: Some(
+                DeletedRecordCountsHistogram::try_new(vec![1, 0, 0, 0, 0, 0, 0, 0, 0, 0]).unwrap(),
+            ),
+            ..base_crc()
+        }
+        .apply(CrcDelta::default(), 1);
+
+        assert_eq!(crc.txn_id, None);
+        assert_eq!(crc.all_files, None);
+        assert_eq!(crc.num_deleted_records_opt, None);
+        assert_eq!(crc.num_deletion_vectors_opt, None);
+        assert_eq!(crc.deleted_record_counts_histogram_opt, None);
     }
 
     /// Applies multiple commit deltas sequentially.
@@ -453,6 +501,29 @@ mod tests {
         assert_eq!(crc.in_commit_timestamp_opt, None);
     }
 
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[rstest]
+    fn test_apply_replaces_last_manifest_commit(
+        #[values(None, Some((2, 1)))] base: Option<(i64, i64)>,
+        #[values(None, Some((5, 5)))] delta: Option<(i64, i64)>,
+    ) {
+        let to_lmc = |pair: Option<(i64, i64)>| {
+            pair.map(|(version, content_root)| {
+                LastManifestCommit::new(version, content_root).unwrap()
+            })
+        };
+        let delta = CrcDelta {
+            last_manifest_commit: to_lmc(delta),
+            ..add_files_delta(0, 0)
+        };
+        let crc = Crc {
+            last_manifest_commit_opt: to_lmc(base),
+            ..base_crc()
+        }
+        .apply(delta.clone(), 1);
+        assert_eq!(crc.last_manifest_commit_opt, delta.last_manifest_commit);
+    }
+
     // ===== CrcDelta::into_complete_crc tests =====
 
     fn test_protocol() -> Protocol {
@@ -536,6 +607,20 @@ mod tests {
         };
         let crc = delta.into_complete_crc(0).unwrap();
         assert_eq!(crc.in_commit_timestamp_opt, Some(12345));
+    }
+
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[test]
+    fn test_into_complete_crc_with_last_manifest_commit() {
+        let last_manifest_commit = Some(LastManifestCommit::new(3, 2).unwrap());
+        let delta = CrcDelta {
+            protocol: Some(test_protocol()),
+            metadata: Some(Metadata::default()),
+            last_manifest_commit: last_manifest_commit.clone(),
+            ..add_files_delta(0, 0)
+        };
+        let crc = delta.into_complete_crc(0).unwrap();
+        assert_eq!(crc.last_manifest_commit_opt, last_manifest_commit);
     }
 
     #[test]

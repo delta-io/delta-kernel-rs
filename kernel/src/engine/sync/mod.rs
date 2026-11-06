@@ -1,9 +1,11 @@
-//! A simple, single threaded, test-only `Engine`.
+//! Synchronous I/O support for kernel tests and the test plan executor.
 //!
-//! All I/O goes through an `ObjectStore`. `SyncEngine::new` uses a [`LocalFileSystem`]
-//! built lazily per-URL (rooted at the URL's drive on Windows, or `/` on Unix), so any
-//! `file://` URL is supported. `SyncEngine::new_with_store` takes any other store
-//! (e.g. `InMemory`) and uses it directly for all URLs.
+//! `SyncEngine` is compiled only for kernel unit tests. The plan executor is also available to
+//! dependent crate tests through the test feature combination.
+//!
+//! All I/O goes through an `ObjectStore`. Without an explicit store, a [`LocalFileSystem`] is
+//! built lazily per-URL (rooted at the URL's drive on Windows, or `/` on Unix), so any `file://`
+//! URL is supported. An explicit store (e.g. `InMemory`) is used directly for all URLs.
 //!
 //! Async work is driven via [`futures::executor::block_on`], which is sufficient for stores
 //! that do not require a tokio reactor (`LocalFileSystem`, `InMemory`). Cloud-backed stores
@@ -20,15 +22,15 @@ use itertools::Itertools;
 use tracing::debug;
 use url::Url;
 
+#[cfg(test)]
 use super::arrow_expression::ArrowEvaluationHandler;
 use crate::engine::arrow_data::ArrowEngineData;
 use crate::object_store::local::LocalFileSystem;
 use crate::object_store::path::Path;
 use crate::object_store::{DynObjectStore, ObjectStoreExt as _};
-use crate::{
-    DeltaResult, Engine, Error, EvaluationHandler, FileMeta, JsonHandler, ParquetHandler,
-    PredicateRef, SchemaRef, StorageHandler,
-};
+#[cfg(test)]
+use crate::{Engine, EvaluationHandler, JsonHandler, ParquetHandler, StorageHandler};
+use crate::{FileMeta, KernelError, KernelResult, KernelResultIterator, PredicateRef, SchemaRef};
 
 pub(crate) mod json;
 mod parquet;
@@ -38,13 +40,42 @@ mod storage;
 mod aggs;
 
 #[cfg(feature = "declarative-plans")]
-pub(crate) mod plan;
+mod prefix_sum;
 
 #[cfg(feature = "declarative-plans")]
+pub mod plan;
+
+#[cfg(all(test, feature = "declarative-plans"))]
 use plan::SyncPlanExecutor;
 
+#[cfg(feature = "declarative-plans")]
+use crate::arrow::array::{Array as _, Int64Array, RecordBatch};
+#[cfg(feature = "declarative-plans")]
+use crate::engine::arrow_expression::evaluate_expression::extract_column_ref;
+#[cfg(feature = "declarative-plans")]
+use crate::expressions::ColumnName;
+
+/// Extracts `name` from `batch` as a LONG column.
+///
+/// # Errors
+///
+/// Returns an error if the column is missing or is not LONG.
+#[cfg(feature = "declarative-plans")]
+fn extract_long_column<'a>(
+    batch: &'a RecordBatch,
+    name: &ColumnName,
+) -> KernelResult<&'a Int64Array> {
+    let array = extract_column_ref(batch, name)?;
+    array.as_any().downcast_ref::<Int64Array>().ok_or_else(|| {
+        KernelError::unsupported(format!(
+            "SyncPlanExecutor operand `{name}` has non-LONG type"
+        ))
+    })
+}
+
 /// A simple (test-only) implementation of [`Engine`]. See module docs for supported stores.
-pub(crate) struct SyncEngine {
+#[cfg(test)]
+pub struct SyncEngine {
     storage_handler: Arc<storage::SyncStorageHandler>,
     json_handler: Arc<json::SyncJsonHandler>,
     parquet_handler: Arc<parquet::SyncParquetHandler>,
@@ -53,16 +84,17 @@ pub(crate) struct SyncEngine {
     plan_executor: Arc<SyncPlanExecutor>,
 }
 
+#[cfg(test)]
 impl SyncEngine {
     /// Create a SyncEngine that reads from the local filesystem via [`LocalFileSystem`].
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         Self::new_inner(None)
     }
 
     /// Create a SyncEngine backed by `store`. All I/O is performed synchronously via
     /// [`futures::executor::block_on`]. See module docs for the deadlock caveat on
     /// reactor-dependent stores.
-    pub(crate) fn new_with_store(store: Arc<DynObjectStore>) -> Self {
+    pub fn new_with_store(store: Arc<DynObjectStore>) -> Self {
         Self::new_inner(Some(store))
     }
 
@@ -78,6 +110,14 @@ impl SyncEngine {
     }
 }
 
+#[cfg(test)]
+impl Default for SyncEngine {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(test)]
 impl Engine for SyncEngine {
     fn evaluation_handler(&self) -> Arc<dyn EvaluationHandler> {
         self.evaluation_handler.clone()
@@ -119,7 +159,7 @@ impl Engine for SyncEngine {
 pub(super) fn resolve_scope(
     default_store: Option<&Arc<DynObjectStore>>,
     url: &Url,
-) -> DeltaResult<(Arc<DynObjectStore>, Url, Path)> {
+) -> KernelResult<(Arc<DynObjectStore>, Url, Path)> {
     if let Some(store) = default_store {
         let mut base_url = url.clone();
         base_url.set_path("/");
@@ -127,13 +167,13 @@ pub(super) fn resolve_scope(
         return Ok((store.clone(), base_url, path));
     }
     if url.scheme() != "file" {
-        return Err(Error::generic(format!(
+        return Err(KernelError::generic(format!(
             "SyncEngine without an explicit store can only access file:// URLs, got: {url}"
         )));
     }
     let file_path = url
         .to_file_path()
-        .map_err(|()| Error::generic(format!("Invalid file URL: {url}")))?;
+        .map_err(|()| KernelError::generic(format!("Invalid file URL: {url}")))?;
     // Use the deepest existing ancestor of the URL's directory as the store prefix:
     // `LocalFileSystem::new_with_prefix` canonicalizes its argument (which requires the path
     // to exist), and operating on a non-existent path is a valid case for `list_from` on a
@@ -143,25 +183,25 @@ pub(super) fn resolve_scope(
     } else {
         file_path
             .parent()
-            .ok_or_else(|| Error::generic(format!("File URL has no parent: {url}")))?
+            .ok_or_else(|| KernelError::generic(format!("File URL has no parent: {url}")))?
             .to_path_buf()
     };
     let mut prefix = target_dir.as_path();
     while !prefix.exists() {
-        prefix = prefix
-            .parent()
-            .ok_or_else(|| Error::generic(format!("No existing ancestor for {target_dir:?}")))?;
+        prefix = prefix.parent().ok_or_else(|| {
+            KernelError::generic(format!("No existing ancestor for {target_dir:?}"))
+        })?;
     }
     let prefix = prefix.to_path_buf();
     let relative = file_path
         .strip_prefix(&prefix)
-        .map_err(|e| Error::generic(format!("Failed to strip prefix: {e}")))?;
+        .map_err(|e| KernelError::generic(format!("Failed to strip prefix: {e}")))?;
     let path = Path::from_iter(relative.components().filter_map(|c| match c {
         std::path::Component::Normal(s) => s.to_str().map(String::from),
         _ => None,
     }));
     let base_url = Url::from_directory_path(&prefix)
-        .map_err(|()| Error::generic(format!("Could not URL-encode prefix {prefix:?}")))?;
+        .map_err(|()| KernelError::generic(format!("Could not URL-encode prefix {prefix:?}")))?;
     let store: Arc<DynObjectStore> = Arc::new(LocalFileSystem::new_with_prefix(&prefix)?);
     Ok((store, base_url, path))
 }
@@ -170,7 +210,7 @@ pub(super) fn resolve_scope(
 pub(super) fn get_bytes(
     default_store: Option<&Arc<DynObjectStore>>,
     location: &Url,
-) -> DeltaResult<Bytes> {
+) -> KernelResult<Bytes> {
     let (store, _, path) = resolve_scope(default_store, location)?;
     let get_result = futures::executor::block_on(store.get(&path))?;
     Ok(futures::executor::block_on(get_result.bytes())?)
@@ -180,21 +220,20 @@ pub(super) fn get_bytes(
 ///
 /// For `file://` URLs the parent directory is created if missing (matching the local FS
 /// behavior callers expect; `LocalFileSystem::put` itself does not create parents). When
-/// `overwrite` is false, an existing file at `location` produces [`Error::FileAlreadyExists`].
+/// `overwrite` is false, an existing file at `location` produces
+/// [`KernelError::FileAlreadyExists`].
 pub(super) fn put_bytes(
     default_store: Option<&Arc<DynObjectStore>>,
     location: &Url,
     data: Bytes,
     overwrite: bool,
-) -> DeltaResult<()> {
-    if location.scheme() == "file" {
-        if let Ok(file_path) = location.to_file_path() {
-            if let Some(parent) = file_path.parent() {
-                if !parent.exists() {
-                    std::fs::create_dir_all(parent)?;
-                }
-            }
-        }
+) -> KernelResult<()> {
+    if location.scheme() == "file"
+        && let Ok(file_path) = location.to_file_path()
+        && let Some(parent) = file_path.parent()
+        && !parent.exists()
+    {
+        std::fs::create_dir_all(parent)?;
     }
     let (store, _, object_path) = resolve_scope(default_store, location)?;
     let opts = if overwrite {
@@ -208,9 +247,9 @@ pub(super) fn put_bytes(
     futures::executor::block_on(store.put_opts(&object_path, data.into(), opts)).map_err(|e| {
         match e {
             crate::object_store::Error::AlreadyExists { .. } => {
-                Error::FileAlreadyExists(location.to_string())
+                KernelError::FileAlreadyExists(location.to_string())
             }
-            other => Error::generic(other.to_string()),
+            other => KernelError::generic(other.to_string()),
         }
     })?;
     Ok(())
@@ -223,10 +262,10 @@ fn read_files_arrow<F, I>(
     schema: SchemaRef,
     predicate: Option<PredicateRef>,
     mut try_create_from_bytes: F,
-) -> impl Iterator<Item = DeltaResult<ArrowEngineData>> + Send + 'static
+) -> impl KernelResultIterator<ArrowEngineData> + 'static + use<F, I>
 where
-    I: Iterator<Item = DeltaResult<ArrowEngineData>> + Send + 'static,
-    F: FnMut(Bytes, SchemaRef, Option<PredicateRef>, String) -> DeltaResult<I> + Send + 'static,
+    I: KernelResultIterator<ArrowEngineData> + 'static,
+    F: FnMut(Bytes, SchemaRef, Option<PredicateRef>, String) -> KernelResult<I> + Send + 'static,
 {
     debug!("Reading files: {files:#?} with schema {schema:#?} and predicate {predicate:#?}");
     let files = files.to_vec(); // Clone for static iterator (clippy hates chained to_vec+into_iter)

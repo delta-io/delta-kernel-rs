@@ -15,15 +15,15 @@ use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_conversion::TryFromKernel;
 use delta_kernel::expressions::Scalar;
 use delta_kernel::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-use delta_kernel::schema::{schema, schema_ref, StructType};
+use delta_kernel::schema::{StructType, schema, schema_ref};
+use delta_kernel::transaction::CommitResult;
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
-use delta_kernel::transaction::CommitResult;
-use delta_kernel::{DeltaResult, Engine, Snapshot};
+use delta_kernel::{Engine, KernelResult, Snapshot};
 use itertools::Itertools;
 use test_utils::delta_kernel_default_engine::executor::TaskExecutor;
 use test_utils::{
-    begin_transaction, create_add_files_metadata, create_table_and_load_snapshot, insert_data,
+    begin_transaction_with, create_add_files_metadata, create_table_and_load_snapshot, insert_data,
     load_test_data, read_add_infos, read_scan, test_table_setup_mt, write_batch_to_table,
 };
 
@@ -33,7 +33,7 @@ use crate::common::write_utils::{
     simple_id_batch,
 };
 
-fn read_v2_checkpoint_table(test_name: impl AsRef<str>) -> DeltaResult<Vec<RecordBatch>> {
+fn read_v2_checkpoint_table(test_name: impl AsRef<str>) -> KernelResult<Vec<RecordBatch>> {
     let test_dir = load_test_data("tests/data", test_name.as_ref()).unwrap();
     let test_path = test_dir.path().join(test_name.as_ref());
 
@@ -50,7 +50,7 @@ fn read_v2_checkpoint_table(test_name: impl AsRef<str>) -> DeltaResult<Vec<Recor
 fn test_v2_checkpoint_with_table(
     table_name: &str,
     mut expected_table: Vec<String>,
-) -> DeltaResult<()> {
+) -> KernelResult<()> {
     let batches = read_v2_checkpoint_table(table_name)?;
 
     sort_lines!(expected_table);
@@ -192,7 +192,7 @@ fn get_without_sidecars_table() -> Vec<String> {
 /// - `last checkpoint contains correct schema for v1/v2 Checkpoints` ->
 ///   `v2_checkpoints_parquet_with_last_checkpoint`
 #[test]
-fn v2_checkpoints_json_with_sidecars() -> DeltaResult<()> {
+fn v2_checkpoints_json_with_sidecars() -> KernelResult<()> {
     test_v2_checkpoint_with_table(
         "v2-checkpoints-json-with-sidecars",
         generate_sidecar_expected_data(),
@@ -200,7 +200,7 @@ fn v2_checkpoints_json_with_sidecars() -> DeltaResult<()> {
 }
 
 #[test]
-fn v2_checkpoints_parquet_with_sidecars() -> DeltaResult<()> {
+fn v2_checkpoints_parquet_with_sidecars() -> KernelResult<()> {
     test_v2_checkpoint_with_table(
         "v2-checkpoints-parquet-with-sidecars",
         generate_sidecar_expected_data(),
@@ -208,7 +208,7 @@ fn v2_checkpoints_parquet_with_sidecars() -> DeltaResult<()> {
 }
 
 #[test]
-fn v2_checkpoints_json_without_sidecars() -> DeltaResult<()> {
+fn v2_checkpoints_json_without_sidecars() -> KernelResult<()> {
     test_v2_checkpoint_with_table(
         "v2-checkpoints-json-without-sidecars",
         get_without_sidecars_table(),
@@ -216,7 +216,7 @@ fn v2_checkpoints_json_without_sidecars() -> DeltaResult<()> {
 }
 
 #[test]
-fn v2_checkpoints_parquet_without_sidecars() -> DeltaResult<()> {
+fn v2_checkpoints_parquet_without_sidecars() -> KernelResult<()> {
     test_v2_checkpoint_with_table(
         "v2-checkpoints-parquet-without-sidecars",
         get_without_sidecars_table(),
@@ -224,12 +224,12 @@ fn v2_checkpoints_parquet_without_sidecars() -> DeltaResult<()> {
 }
 
 #[test]
-fn v2_classic_checkpoint_json() -> DeltaResult<()> {
+fn v2_classic_checkpoint_json() -> KernelResult<()> {
     test_v2_checkpoint_with_table("v2-classic-checkpoint-json", get_classic_checkpoint_table())
 }
 
 #[test]
-fn v2_classic_checkpoint_parquet() -> DeltaResult<()> {
+fn v2_classic_checkpoint_parquet() -> KernelResult<()> {
     test_v2_checkpoint_with_table(
         "v2-classic-checkpoint-parquet",
         get_classic_checkpoint_table(),
@@ -237,7 +237,7 @@ fn v2_classic_checkpoint_parquet() -> DeltaResult<()> {
 }
 
 #[test]
-fn v2_checkpoints_json_with_last_checkpoint() -> DeltaResult<()> {
+fn v2_checkpoints_json_with_last_checkpoint() -> KernelResult<()> {
     test_v2_checkpoint_with_table(
         "v2-checkpoints-json-with-last-checkpoint",
         get_simple_id_table(),
@@ -245,7 +245,7 @@ fn v2_checkpoints_json_with_last_checkpoint() -> DeltaResult<()> {
 }
 
 #[test]
-fn v2_checkpoints_parquet_with_last_checkpoint() -> DeltaResult<()> {
+fn v2_checkpoints_parquet_with_last_checkpoint() -> KernelResult<()> {
     test_v2_checkpoint_with_table(
         "v2-checkpoints-parquet-with-last-checkpoint",
         get_simple_id_table(),
@@ -258,12 +258,12 @@ fn v2_checkpoints_parquet_with_last_checkpoint() -> DeltaResult<()> {
 /// batches. All batches in a parquet file must share the same schema. This test verifies
 /// that `snapshot.checkpoint()` can write a V2 checkpoint without schema mismatch errors.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_v2_checkpoint_parquet_write() -> DeltaResult<()> {
+async fn test_v2_checkpoint_parquet_write() -> KernelResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
     let table_url = delta_kernel::try_parse_uri(&table_path)?;
 
     let schema = schema_ref! { nullable "value": INTEGER };
-    let _ = create_table(&table_path, schema.clone(), "Test/1.0")
+    let _ = create_table(&table_path, schema.clone(), "Test/1.0", true)
         .with_table_properties([("delta.feature.v2Checkpoint", "supported")])
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
         .commit(engine.as_ref())?;
@@ -277,8 +277,8 @@ async fn test_v2_checkpoint_parquet_write() -> DeltaResult<()> {
     )
     .await?;
 
-    let CommitResult::CommittedTransaction(committed) = result else {
-        panic!("Expected CommittedTransaction");
+    let CommitResult::Committed(committed) = result else {
+        panic!("Expected Committed");
     };
 
     let snapshot = committed
@@ -330,7 +330,7 @@ async fn test_v2_checkpoint_parquet_write() -> DeltaResult<()> {
 /// `_last_checkpoint`, the checkpoint parquet contents, and performs a scan to verify the data
 /// is correct.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_v2_checkpoint_with_sidecars() -> DeltaResult<()> {
+async fn test_v2_checkpoint_with_sidecars() -> KernelResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
     let table_url = delta_kernel::try_parse_uri(&table_path)?;
 
@@ -358,10 +358,16 @@ async fn test_v2_checkpoint_with_sidecars() -> DeltaResult<()> {
     .await?
     .unwrap_post_commit_snapshot();
 
-    let post_ckpt_snapshot = begin_transaction(post_ckpt_snapshot, engine.as_ref())?
-        .with_domain_metadata("app.settings".to_string(), r#"{"version":3}"#.to_string())
-        .commit(engine.as_ref())?
-        .unwrap_post_commit_snapshot();
+    let post_ckpt_snapshot = begin_transaction_with(
+        post_ckpt_snapshot,
+        engine.as_ref(),
+        delta_kernel::transaction::UpdateTableOperation::Write,
+        "test-engine",
+        true,
+        |builder| builder.with_domain_metadata("app.settings", r#"{"version":3}"#),
+    )?
+    .commit(engine.as_ref())?
+    .unwrap_post_commit_snapshot();
 
     // === Step 4: Validate `_last_checkpoint` (version, size, sizeInBytes, numOfAddFiles) ===
     let last_ckpt = read_last_checkpoint(&table_path);
@@ -523,17 +529,23 @@ async fn test_v2_checkpoint_with_sidecars() -> DeltaResult<()> {
 
     // === Step 7: Verify domain metadata (including post-checkpoint update) ===
     assert_eq!(
-        fresh_snapshot.get_domain_metadata("app.settings", engine.as_ref())?,
+        fresh_snapshot
+            .reader()
+            .get_domain_metadata("app.settings", engine.as_ref())?,
         Some(r#"{"version":3}"#.to_string()),
         "app.settings domain metadata should reflect the post-checkpoint update"
     );
     assert_eq!(
-        fresh_snapshot.get_domain_metadata("app.feature_flags", engine.as_ref())?,
+        fresh_snapshot
+            .reader()
+            .get_domain_metadata("app.feature_flags", engine.as_ref())?,
         Some(r#"{"dark_mode":true}"#.to_string()),
         "app.feature_flags domain metadata should be preserved across checkpoint"
     );
     assert_eq!(
-        fresh_snapshot.get_domain_metadata("app.analytics", engine.as_ref())?,
+        fresh_snapshot
+            .reader()
+            .get_domain_metadata("app.analytics", engine.as_ref())?,
         Some(r#"{"tracking":false}"#.to_string()),
         "app.analytics domain metadata should be preserved across checkpoint"
     );
@@ -568,8 +580,7 @@ async fn test_v2_checkpoint_with_sidecars() -> DeltaResult<()> {
 /// then read the raw checkpoint parquet to verify `stats_parsed`, `stats`, and
 /// `partitionValues_parsed` fields are correctly populated.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_v2_checkpoint_partition_values_parsed_and_stats(
-) -> Result<(), Box<dyn std::error::Error>> {
+async fn test_v2_checkpoint_partition_values_parsed_and_stats() -> KernelResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
     let table_url = delta_kernel::try_parse_uri(&table_path)?;
 
@@ -760,13 +771,13 @@ async fn test_checkpoint_spec_rejected(
     #[case] enable_v2checkpoint: bool,
     #[case] spec: CheckpointSpec,
     #[case] err_substring: &str,
-) -> DeltaResult<()> {
+) -> KernelResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
     let table_url = delta_kernel::try_parse_uri(&table_path)?;
 
     let schema = schema_ref! { nullable "value": INTEGER };
 
-    let mut builder = create_table(&table_path, schema, "Test/1.0");
+    let mut builder = create_table(&table_path, schema, "Test/1.0", true);
     if enable_v2checkpoint {
         builder = builder.with_table_properties([("delta.feature.v2Checkpoint", "supported")]);
     }
@@ -790,14 +801,14 @@ async fn test_checkpoint_spec_rejected(
 /// sidecar files, the main checkpoint contains no `sidecar` action rows, and `_last_checkpoint`
 /// reports `numOfAddFiles = 0` and `sizeInBytes` equal to the main checkpoint file size.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_v2_sidecar_checkpoint_with_no_file_actions() -> DeltaResult<()> {
+async fn test_v2_sidecar_checkpoint_with_no_file_actions() -> KernelResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
     let table_url = delta_kernel::try_parse_uri(&table_path)?;
 
     let schema = schema_ref! { nullable "value": INTEGER };
 
     // v2 table, no data commits -> only protocol + metadata at version 0.
-    let _ = create_table(&table_path, schema, "Test/1.0")
+    let _ = create_table(&table_path, schema, "Test/1.0", true)
         .with_table_properties([("delta.feature.v2Checkpoint", "supported")])
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
         .commit(engine.as_ref())?;
@@ -863,7 +874,7 @@ async fn v2_table_with_domain_metadata_and_txn<E: TaskExecutor>(
     table_path: &str,
     table_url: &url::Url,
     engine: &Arc<test_utils::delta_kernel_default_engine::DefaultEngine<E>>,
-) -> DeltaResult<Arc<Snapshot>> {
+) -> KernelResult<Arc<Snapshot>> {
     fn make_info_array(names: &[&str]) -> ArrayRef {
         let name_array: ArrayRef = Arc::new(StringArray::from(
             names.iter().map(|s| Some(*s)).collect::<Vec<_>>(),
@@ -886,7 +897,7 @@ async fn v2_table_with_domain_metadata_and_txn<E: TaskExecutor>(
         },
     };
 
-    let _ = create_table(table_path, schema.clone(), "Test/1.0")
+    let _ = create_table(table_path, schema.clone(), "Test/1.0", true)
         .with_table_properties([
             ("delta.feature.v2Checkpoint", "supported"),
             ("delta.feature.domainMetadata", "supported"),
@@ -907,40 +918,63 @@ async fn v2_table_with_domain_metadata_and_txn<E: TaskExecutor>(
 
     // Domain metadata commit (no data) -- exercises the empty-file-batch skip path in the
     // sidecar splitter. Sets two domains initially.
-    snapshot = begin_transaction(snapshot, engine.as_ref())?
-        .with_domain_metadata("app.settings".to_string(), r#"{"version":1}"#.to_string())
-        .with_domain_metadata(
-            "app.feature_flags".to_string(),
-            r#"{"dark_mode":true}"#.to_string(),
-        )
-        .commit(engine.as_ref())?
-        .unwrap_post_commit_snapshot();
+    snapshot = begin_transaction_with(
+        snapshot,
+        engine.as_ref(),
+        delta_kernel::transaction::UpdateTableOperation::Write,
+        "test-engine",
+        true,
+        |builder| {
+            builder
+                .with_domain_metadata("app.settings", r#"{"version":1}"#)
+                .with_domain_metadata("app.feature_flags", r#"{"dark_mode":true}"#)
+        },
+    )?
+    .commit(engine.as_ref())?
+    .unwrap_post_commit_snapshot();
 
     // Another domain metadata commit -- updates "app.settings" to verify reconciliation
     // picks the latest value, and adds a new domain.
-    snapshot = begin_transaction(snapshot, engine.as_ref())?
-        .with_domain_metadata(
-            "app.analytics".to_string(),
-            r#"{"tracking":false}"#.to_string(),
-        )
-        .with_domain_metadata("app.settings".to_string(), r#"{"version":2}"#.to_string())
-        .commit(engine.as_ref())?
-        .unwrap_post_commit_snapshot();
+    snapshot = begin_transaction_with(
+        snapshot,
+        engine.as_ref(),
+        delta_kernel::transaction::UpdateTableOperation::Write,
+        "test-engine",
+        true,
+        |builder| {
+            builder
+                .with_domain_metadata("app.analytics", r#"{"tracking":false}"#)
+                .with_domain_metadata("app.settings", r#"{"version":2}"#)
+        },
+    )?
+    .commit(engine.as_ref())?
+    .unwrap_post_commit_snapshot();
 
     // SetTransaction commits -- exercise `txn` actions in checkpoint. Two distinct app_ids
     // plus a second update to `app1` to verify reconciliation picks the latest version.
     for (app_id, version) in [("app1", 1i64), ("app2", 5), ("app1", 3)] {
-        snapshot = begin_transaction(snapshot, engine.as_ref())?
-            .with_transaction_id(app_id.to_string(), version)
-            .commit(engine.as_ref())?
-            .unwrap_post_commit_snapshot();
+        snapshot = test_utils::begin_transaction_with(
+            snapshot,
+            engine.as_ref(),
+            delta_kernel::transaction::UpdateTableOperation::Write,
+            "test-engine",
+            true,
+            |builder| builder.with_transaction_id(app_id, version),
+        )?
+        .commit(engine.as_ref())?
+        .unwrap_post_commit_snapshot();
     }
 
     // Remove all 8 files -> 8 remove tombstones
     let scan = snapshot.clone().scan_builder().build()?;
-    let mut txn = begin_transaction(snapshot, engine.as_ref())?
-        .with_operation("DELETE".to_string())
-        .with_data_change(true);
+    let mut txn = begin_transaction_with(
+        snapshot,
+        engine.as_ref(),
+        delta_kernel::transaction::UpdateTableOperation::Delete,
+        "test-engine",
+        true,
+        |builder| builder,
+    )?;
     for sm in scan.scan_metadata(engine.as_ref())? {
         txn.remove_files(sm?.scan_files);
     }
@@ -1119,14 +1153,14 @@ async fn create_partitioned_stats_table<E: TaskExecutor>(
     table_path: &str,
     table_url: &url::Url,
     engine: &Arc<test_utils::delta_kernel_default_engine::DefaultEngine<E>>,
-) -> Result<Arc<Snapshot>, Box<dyn std::error::Error>> {
+) -> KernelResult<Arc<Snapshot>> {
     let schema = schema_ref! {
         nullable "id": LONG,
         nullable "name": STRING,
         nullable "part_key": STRING,
     };
 
-    let _ = create_table(table_path, schema.clone(), "Test/1.0")
+    let _ = create_table(table_path, schema.clone(), "Test/1.0", true)
         .with_table_properties([
             ("delta.feature.v2Checkpoint", "supported"),
             ("delta.checkpoint.writeStatsAsStruct", "true"),
@@ -1190,7 +1224,7 @@ async fn create_partitioned_stats_table<E: TaskExecutor>(
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_snapshot_checkpoint_default_on_v2_table(
     #[case] spec: Option<CheckpointSpec>,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> KernelResult<()> {
     let schema = get_simple_schema();
     let (_tmp_dir, table_path, engine) = test_table_setup_mt()?;
     let mut snapshot = create_table_and_load_snapshot(
@@ -1244,7 +1278,7 @@ async fn test_snapshot_checkpoint_default_on_v2_table(
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_v2_sidecar_checkpoint_cross_feature(
     #[case] features: Vec<CrossFeature>,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> KernelResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
     let table_url = delta_kernel::try_parse_uri(&table_path)?;
 
@@ -1305,7 +1339,7 @@ async fn test_v2_sidecar_checkpoint_cross_feature(
 /// loads from that checkpoint with no trailing commits, and the scan returns the union
 /// of both write phases.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_v2_sidecar_consecutive_checkpoints() -> Result<(), Box<dyn std::error::Error>> {
+async fn test_v2_sidecar_consecutive_checkpoints() -> KernelResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
     let table_url = delta_kernel::try_parse_uri(&table_path)?;
 
@@ -1404,14 +1438,13 @@ async fn test_v2_sidecar_consecutive_checkpoints() -> Result<(), Box<dyn std::er
 /// On a table with `deletionVectors` + `rowTracking` enabled, insert data, apply DV and write a
 /// V2 sidecar checkpoint. Scan back and make sure the DV and row-tracking columns are present.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_v2_sidecar_preserves_dv_and_row_tracking_on_add(
-) -> Result<(), Box<dyn std::error::Error>> {
+async fn test_v2_sidecar_preserves_dv_and_row_tracking_on_add() -> KernelResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
     let table_url = delta_kernel::try_parse_uri(&table_path)?;
     let schema = get_simple_schema();
 
     // === Step 1: Create v2 + DV + row-tracking table. ===
-    let _ = create_table(&table_path, schema.clone(), "Test/1.0")
+    let _ = create_table(&table_path, schema.clone(), "Test/1.0", true)
         .with_table_properties([
             ("delta.feature.v2Checkpoint", "supported"),
             ("delta.feature.deletionVectors", "supported"),
@@ -1449,11 +1482,19 @@ async fn test_v2_sidecar_preserves_dv_and_row_tracking_on_add(
         .scan_metadata(engine.as_ref())?
         .map_ok(|sm| sm.scan_files)
         .try_collect()?;
-    let mut txn = begin_transaction(snapshot, engine.as_ref())?.with_data_change(true);
+    let mut txn = begin_transaction_with(
+        snapshot,
+        engine.as_ref(),
+        delta_kernel::transaction::UpdateTableOperation::Write,
+        "test-engine",
+        true,
+        |builder| builder,
+    )?;
     txn.update_deletion_vectors(
         HashMap::from([(path, dv.clone())]),
         scan_files.into_iter().map(Ok),
     )?;
+    txn.ack_row_tracking_preservation();
     let snapshot = txn.commit(engine.as_ref())?.unwrap_post_commit_snapshot();
 
     // === Step 4: Write a V2 sidecar checkpoint. ===
@@ -1500,7 +1541,7 @@ async fn test_v2_sidecar_preserves_dv_and_row_tracking_on_add(
 /// across 60 batches of 1000 (so the splitter cuts cleanly at the 50k boundary) must
 /// produce exactly 2 sidecar files.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_v2_sidecar_default_hint_splits_at_50k() -> Result<(), Box<dyn std::error::Error>> {
+async fn test_v2_sidecar_default_hint_splits_at_50k() -> KernelResult<()> {
     const PER_COMMIT: usize = 1_000;
     const COMMITS: usize = 60;
 
@@ -1508,7 +1549,7 @@ async fn test_v2_sidecar_default_hint_splits_at_50k() -> Result<(), Box<dyn std:
     let table_url = delta_kernel::try_parse_uri(&table_path)?;
 
     // === Step 1: Create v2Checkpoint table. ===
-    let _ = create_table(&table_path, get_simple_schema(), "Test/1.0")
+    let _ = create_table(&table_path, get_simple_schema(), "Test/1.0", true)
         .with_table_properties([("delta.feature.v2Checkpoint", "supported")])
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
         .commit(engine.as_ref())?;
@@ -1516,7 +1557,14 @@ async fn test_v2_sidecar_default_hint_splits_at_50k() -> Result<(), Box<dyn std:
     // === Step 2: Run 60 commits of 1_000 synthetic adds each (60_000 total). ===
     let mut snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
     for c in 0..COMMITS {
-        let mut txn = begin_transaction(snapshot, engine.as_ref())?.with_data_change(true);
+        let mut txn = begin_transaction_with(
+            snapshot,
+            engine.as_ref(),
+            delta_kernel::transaction::UpdateTableOperation::Write,
+            "test-engine",
+            true,
+            |builder| builder,
+        )?;
         let add_files_schema = txn.add_files_schema().clone();
         let paths: Vec<String> = (0..PER_COMMIT)
             .map(|i| format!("part-{c:03}-{i:04}.parquet"))
@@ -1582,7 +1630,7 @@ async fn build_v2_table_with_feature<E: TaskExecutor>(
     table_url: &url::Url,
     engine: &Arc<test_utils::delta_kernel_default_engine::DefaultEngine<E>>,
     features: &[CrossFeature],
-) -> Result<Arc<Snapshot>, Box<dyn std::error::Error>> {
+) -> KernelResult<Arc<Snapshot>> {
     let schema = cross_feature_schema();
 
     let mut props: Vec<(&str, &str)> = vec![("delta.feature.v2Checkpoint", "supported")];
@@ -1612,7 +1660,7 @@ async fn build_v2_table_with_feature<E: TaskExecutor>(
     }
 
     let mut builder =
-        create_table(table_path, schema.clone(), "Test/1.0").with_table_properties(props);
+        create_table(table_path, schema.clone(), "Test/1.0", true).with_table_properties(props);
     if let Some(layout) = layout {
         builder = builder.with_data_layout(layout);
     }
@@ -1664,12 +1712,12 @@ async fn build_v2_table_with_feature<E: TaskExecutor>(
 /// A version holding two complete checkpoints must load from the uuid-named one, since it outranks
 /// the classic-named one.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn snapshot_selects_uuid_checkpoint_over_classic_at_one_version() -> DeltaResult<()> {
+async fn snapshot_selects_uuid_checkpoint_over_classic_at_one_version() -> KernelResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
     let table_url = delta_kernel::try_parse_uri(&table_path)?;
 
     let schema = schema_ref! { nullable "value": INTEGER };
-    let _ = create_table(&table_path, schema, "Test/1.0")
+    let _ = create_table(&table_path, schema, "Test/1.0", true)
         .with_table_properties([("delta.feature.v2Checkpoint", "supported")])
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
         .commit(engine.as_ref())?;

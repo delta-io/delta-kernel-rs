@@ -10,9 +10,9 @@
 //! A generic trait [TaskExecutor] can be implemented with your preferred async
 //! runtime. Behind the `tokio` feature flag, we provide a both a single-threaded
 //! and multi-threaded executor based on Tokio.
-use delta_kernel::DeltaResult;
-use futures::future::BoxFuture;
+use delta_kernel::KernelResult;
 use futures::Future;
+use futures::future::BoxFuture;
 
 /// An executor that can be used to run async tasks. This is used by IO functions
 /// within the `DefaultEngine`.
@@ -40,7 +40,7 @@ pub trait TaskExecutor: Send + Sync + 'static {
     where
         F: Future<Output = ()> + Send + 'static;
 
-    fn spawn_blocking<T, R>(&self, task: T) -> BoxFuture<'_, DeltaResult<R>>
+    fn spawn_blocking<T, R>(&self, task: T) -> BoxFuture<'_, KernelResult<R>>
     where
         T: FnOnce() -> R + Send + 'static,
         R: Send + 'static;
@@ -53,7 +53,7 @@ pub mod tokio {
     use std::mem::ManuallyDrop;
     use std::sync::mpsc::channel;
 
-    use delta_kernel::{DeltaResult, Error};
+    use delta_kernel::{KernelError, KernelResult};
     use futures::future::BoxFuture;
     use futures::{Future, TryFutureExt};
     use tokio::runtime::{EnterGuard, Handle, RuntimeFlavor};
@@ -174,12 +174,12 @@ pub mod tokio {
             self.send_future(Box::pin(task));
         }
 
-        fn spawn_blocking<T, R>(&self, task: T) -> BoxFuture<'_, DeltaResult<R>>
+        fn spawn_blocking<T, R>(&self, task: T) -> BoxFuture<'_, KernelResult<R>>
         where
             T: FnOnce() -> R + Send + 'static,
             R: Send + 'static,
         {
-            Box::pin(tokio::task::spawn_blocking(task).map_err(Error::join_failure))
+            Box::pin(tokio::task::spawn_blocking(task).map_err(KernelError::join_failure))
         }
 
         fn enter(&self) -> EnterGuard<'_> {
@@ -227,7 +227,7 @@ pub mod tokio {
         pub fn new_owned_runtime(
             worker_threads: Option<usize>,
             max_blocking_threads: Option<usize>,
-        ) -> DeltaResult<Self> {
+        ) -> KernelResult<Self> {
             let mut builder = tokio::runtime::Builder::new_multi_thread();
             builder.enable_all();
 
@@ -238,9 +238,9 @@ pub mod tokio {
                 builder.max_blocking_threads(max_blocking);
             }
 
-            let runtime = builder
-                .build()
-                .map_err(|e| Error::generic(format!("Failed to create Tokio runtime: {e}")))?;
+            let runtime = builder.build().map_err(|e| {
+                KernelError::generic(format!("Failed to create Tokio runtime: {e}"))
+            })?;
 
             let handle = runtime.handle().clone();
             Ok(Self {
@@ -299,12 +299,12 @@ pub mod tokio {
             self.handle.spawn(task);
         }
 
-        fn spawn_blocking<T, R>(&self, task: T) -> BoxFuture<'_, DeltaResult<R>>
+        fn spawn_blocking<T, R>(&self, task: T) -> BoxFuture<'_, KernelResult<R>>
         where
             T: FnOnce() -> R + Send + 'static,
             R: Send + 'static,
         {
-            Box::pin(tokio::task::spawn_blocking(task).map_err(Error::join_failure))
+            Box::pin(tokio::task::spawn_blocking(task).map_err(KernelError::join_failure))
         }
 
         fn enter(&self) -> EnterGuard<'_> {

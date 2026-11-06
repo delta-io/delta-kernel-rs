@@ -4,19 +4,23 @@
 use std::collections::HashSet;
 use std::sync::{Arc, LazyLock};
 
+use url::Url;
+
 use crate::engine_data::{FilteredEngineData, GetData, RowVisitor};
-use crate::expressions::{column_name, ColumnName};
+use crate::expressions::{ColumnName, column_name};
 use crate::log_replay::deduplicator::{Deduplicator, FileActionInfo};
 use crate::log_replay::{FileActionDeduplicator, FileActionKey};
 use crate::scan::data_skipping::DataSkippingFilter;
-use crate::scan::{PhysicalPredicate, COMMIT_READ_SCHEMA};
+use crate::scan::{
+    COMMIT_READ_SCHEMA, PartitionValuesOptions, PhysicalPredicate, map_to_struct_options,
+};
 use crate::schema::{ColumnNamesAndTypes, DataType};
 use crate::snapshot::SnapshotRef;
 use crate::table_features::Operation;
 use crate::utils::require;
 use crate::{
-    DeltaResult, Engine, EngineData, Error, FileDataReadResultIterator, FileMeta, PredicateRef,
-    Version,
+    Engine, EngineData, FileDataReadResultIterator, FileMeta, KernelError, KernelResult,
+    PredicateRef, Version,
 };
 
 /// Builder for an incremental scan over `(base_version, target_version]`. Construct via
@@ -27,6 +31,7 @@ pub struct IncrementalScanBuilder {
     target_snapshot: SnapshotRef,
     base_version: Version,
     predicate: Option<PredicateRef>,
+    partition_values_options: PartitionValuesOptions,
 }
 
 impl IncrementalScanBuilder {
@@ -36,6 +41,7 @@ impl IncrementalScanBuilder {
             target_snapshot: target_snapshot.into(),
             base_version,
             predicate: None,
+            partition_values_options: PartitionValuesOptions::default(),
         }
     }
 
@@ -55,6 +61,21 @@ impl IncrementalScanBuilder {
     /// regardless.
     pub fn with_predicate(mut self, predicate: impl Into<Option<PredicateRef>>) -> Self {
         self.predicate = predicate.into();
+        self
+    }
+
+    /// Configure how partition values are interpreted when pruning with [`Self::with_predicate`].
+    /// The timezone option has no effect without a predicate on partition columns.
+    ///
+    /// Defaults to [`PartitionValuesOptions::default`].
+    ///
+    /// Kernel does not yet support [`PartitionValuesOptions::with_struct`] in incremental scans.
+    /// Passing it causes [`Self::build`] to return an error.
+    pub fn with_partition_values(
+        mut self,
+        partition_values_options: PartitionValuesOptions,
+    ) -> Self {
+        self.partition_values_options = partition_values_options;
         self
     }
 
@@ -78,11 +99,12 @@ impl IncrementalScanBuilder {
     ///
     /// # Errors
     /// - `Err` if `base_version >= target_snapshot.version()` (caller error).
-    /// - [`Error::MissingColumn`] if a [`with_predicate`](Self::with_predicate) predicate
+    /// - [`KernelError::Unsupported`] if typed partition value output is requested.
+    /// - [`KernelError::MissingColumn`] if a [`with_predicate`](Self::with_predicate) predicate
     ///   references a column absent from the table schema.
     /// - `Err` if the target snapshot's protocol contains an unsupported reader feature.
     /// - `Err` if the engine fails to open the commit stream.
-    pub fn build(self, engine: &dyn Engine) -> DeltaResult<Option<IncrementalScanStream>> {
+    pub fn build(self, engine: &dyn Engine) -> KernelResult<Option<IncrementalScanStream>> {
         // TODO(#2493): the version validation, the snapshot-commit-list extraction and
         // clipping below, and the "snapshot covers the range" check should all be replaced
         // by a single `CommitRangeBuilder::from_snapshot(...).build(engine)` call once
@@ -90,10 +112,17 @@ impl IncrementalScanBuilder {
         let target_version = self.target_snapshot.version();
         require!(
             self.base_version < target_version,
-            Error::generic(format!(
+            KernelError::generic(format!(
                 "IncrementalScanBuilder: base_version ({}) must be less than target_version ({})",
                 self.base_version, target_version
             ))
+        );
+        // TODO(#3702): Support returning parsed partition values in incremental scans.
+        require!(
+            !self.partition_values_options.parsed_struct,
+            KernelError::unsupported(
+                "Kernel does not yet support returning parsed partition values in incremental scans"
+            )
         );
         // Resolve the predicate into an Add-side skipping strategy up front so `build` can
         // fail fast on a malformed predicate (e.g. references to unknown columns), rather
@@ -102,7 +131,7 @@ impl IncrementalScanBuilder {
         // `base_version < target_version` above guarantees `base_version < u64::MAX`, but use
         // `checked_add` to make the dependency explicit and panic-free.
         let start_version = self.base_version.checked_add(1).ok_or_else(|| {
-            Error::generic("IncrementalScanBuilder: base_version + 1 overflowed u64")
+            KernelError::generic("IncrementalScanBuilder: base_version + 1 overflowed u64")
         })?;
 
         // TODO(#2552): surface in-range protocol/metadata changes to the consumer.
@@ -124,8 +153,8 @@ impl IncrementalScanBuilder {
         let snapshot_first_version = snapshot_commits.first().map(|c| c.version);
 
         // TODO(#2493): this "snapshot covers range" check becomes a typed error from
-        // `CommitRange::build` (e.g. `Error::CommitsUnavailable { missing: Range<Version> }`),
-        // pattern-matched here to return `None`.
+        // `CommitRange::build` (e.g. `KernelError::CommitsUnavailable { missing: Range<Version>
+        // }`), pattern-matched here to return `None`.
         if snapshot_first_version.is_none_or(|v| v > start_version) {
             return Ok(None);
         }
@@ -158,6 +187,10 @@ impl IncrementalScanBuilder {
             live_adds: HashSet::new(),
             removes: HashSet::new(),
             errored: false,
+            dv_normalization_root: self
+                .target_snapshot
+                .table_configuration()
+                .dv_normalization_root(),
         }))
     }
 
@@ -168,7 +201,7 @@ impl IncrementalScanBuilder {
     /// constructed. [`AddSkipping::SkipAll`] when the predicate statically excludes every file
     /// ([`PhysicalPredicate::StaticSkipAll`]); the stream still reports Removes but yields no
     /// live Adds. [`AddSkipping::Filter`] carries the reusable [`DataSkippingFilter`].
-    fn resolve_add_skipping(&self, engine: &dyn Engine) -> DeltaResult<AddSkipping> {
+    fn resolve_add_skipping(&self, engine: &dyn Engine) -> KernelResult<AddSkipping> {
         let Some(predicate) = self.predicate.as_ref() else {
             return Ok(AddSkipping::KeepAll);
         };
@@ -184,11 +217,19 @@ impl IncrementalScanBuilder {
                 // parse stats from `add.stats` JSON and partition values from
                 // `add.partitionValues`, then skip against the shared `DataSkippingFilter`.
                 // `None` (predicate ineligible for skipping) degrades to keep-all.
+                //
+                // Here we pass the timezone to MapToStruct unconditionally, even if the predicate
+                // does not reference a TIMESTAMP partition column. As a result, data skipping fails
+                // for an invalid timezone whenever it evaluates a predicate on any partition
+                // column. This is an intentional choice to reduce branches.
                 let filter = DataSkippingFilter::for_raw_action_batch(
                     engine,
                     physical_predicate,
                     table_configuration,
                     COMMIT_READ_SCHEMA.clone(),
+                    map_to_struct_options(
+                        self.partition_values_options.timestamp_timezone.as_deref(),
+                    ),
                 );
                 Ok(filter.map_or(AddSkipping::KeepAll, |f| AddSkipping::Filter(Arc::new(f))))
             }
@@ -233,10 +274,12 @@ pub struct IncrementalScanStream {
     live_adds: HashSet<FileActionKey>,
     removes: HashSet<FileActionKey>,
     errored: bool,
+    /// Table root for normalizing paths. `Some` iff adaptiveMetadata is enabled.
+    dv_normalization_root: Option<Url>,
 }
 
 impl Iterator for IncrementalScanStream {
-    type Item = DeltaResult<FilteredEngineData>;
+    type Item = KernelResult<FilteredEngineData>;
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.errored {
@@ -254,6 +297,7 @@ impl Iterator for IncrementalScanStream {
                     &mut self.seen_file_keys,
                     &mut self.live_adds,
                     &mut self.removes,
+                    self.dv_normalization_root.clone(),
                 ) {
                     Ok(Some(filtered)) => return Some(Ok(filtered)),
                     Ok(None) => continue,
@@ -273,20 +317,20 @@ impl IncrementalScanStream {
     /// data structure they prefer.
     ///
     /// # Errors
-    /// - [`Error::IOError`], [`Error::ObjectStore`], or [`Error::Reqwest`] on transient I/O while
-    ///   reading commit JSONs. Retryable by rebuilding the stream.
-    /// - [`Error::FileNotFound`] if a commit was vacuumed between [`IncrementalScanBuilder::build`]
-    ///   and stream consumption. Rebuilding will likely return `Ok(None)` (commits unavailable);
-    ///   fall back to [`crate::Snapshot::scan_builder`].
-    /// - [`Error::MalformedJson`] or [`Error::Arrow`] (default-engine) on commit JSON corruption.
-    ///   Not retryable.
-    /// - [`Error::Generic`] on malformed `deletionVector` fields in a commit row, or on "cannot
-    ///   finish a stream that previously errored" when a terminal method is called after a prior
-    ///   `next()` returned `Err`. Rebuild to retry the latter; the former indicates table
+    /// - [`KernelError::IOError`], [`KernelError::ObjectStore`], or [`KernelError::Reqwest`] on
+    ///   transient I/O while reading commit JSONs. Retryable by rebuilding the stream.
+    /// - [`KernelError::FileNotFound`] if a commit was vacuumed between
+    ///   [`IncrementalScanBuilder::build`] and stream consumption. Rebuilding will likely return
+    ///   `Ok(None)` (commits unavailable); fall back to [`crate::Snapshot::scan_builder`].
+    /// - [`KernelError::MalformedJson`] or [`KernelError::Arrow`] (default-engine) on commit JSON
+    ///   corruption. Not retryable.
+    /// - [`KernelError::Generic`] on malformed `deletionVector` fields in a commit row, or on
+    ///   "cannot finish a stream that previously errored" when a terminal method is called after a
+    ///   prior `next()` returned `Err`. Rebuild to retry the latter; the former indicates table
     ///   corruption.
-    pub fn into_summary(mut self) -> DeltaResult<IncrementalScanSummary> {
+    pub fn into_summary(mut self) -> KernelResult<IncrementalScanSummary> {
         if self.errored {
-            return Err(Error::generic(
+            return Err(KernelError::generic(
                 "IncrementalScanStream: cannot finish a stream that previously errored",
             ));
         }
@@ -317,7 +361,7 @@ impl IncrementalScanStream {
     ///
     /// [`into_summary`]: Self::into_summary
     /// [`ActionsBatch`]: crate::log_replay::ActionsBatch
-    pub fn into_listing(mut self) -> DeltaResult<IncrementalListing> {
+    pub fn into_listing(mut self) -> KernelResult<IncrementalListing> {
         let mut add_files: Vec<FilteredEngineData> = Vec::new();
         for item in self.by_ref() {
             add_files.push(item?);
@@ -349,7 +393,7 @@ impl IncrementalScanStream {
     pub fn into_summary_against_base_iter<'a>(
         self,
         base_keys: impl IntoIterator<Item = &'a FileActionKey>,
-    ) -> DeltaResult<IncrementalScanSummaryAgainstBase> {
+    ) -> KernelResult<IncrementalScanSummaryAgainstBase> {
         let summary = self.into_summary()?;
         let duplicate_adds: HashSet<FileActionKey> = base_keys
             .into_iter()
@@ -382,7 +426,7 @@ impl IncrementalScanStream {
     pub fn into_summary_against_base_closure(
         self,
         base_contains: impl Fn(&FileActionKey) -> bool,
-    ) -> DeltaResult<IncrementalScanSummaryAgainstBase> {
+    ) -> KernelResult<IncrementalScanSummaryAgainstBase> {
         let summary = self.into_summary()?;
         let duplicate_adds: HashSet<FileActionKey> = summary
             .live_adds
@@ -415,7 +459,7 @@ impl IncrementalScanStream {
     pub fn into_listing_against_base_iter<'a>(
         mut self,
         base_keys: impl IntoIterator<Item = &'a FileActionKey>,
-    ) -> DeltaResult<IncrementalListingAgainstBase> {
+    ) -> KernelResult<IncrementalListingAgainstBase> {
         let mut add_files: Vec<FilteredEngineData> = Vec::new();
         for item in self.by_ref() {
             add_files.push(item?);
@@ -436,7 +480,7 @@ impl IncrementalScanStream {
     pub fn into_listing_against_base_closure(
         mut self,
         base_contains: impl Fn(&FileActionKey) -> bool,
-    ) -> DeltaResult<IncrementalListingAgainstBase> {
+    ) -> KernelResult<IncrementalListingAgainstBase> {
         let mut add_files: Vec<FilteredEngineData> = Vec::new();
         for item in self.by_ref() {
             add_files.push(item?);
@@ -465,6 +509,12 @@ impl std::fmt::Debug for IncrementalScanStream {
 /// on the full key rather than just the path: the same path with different DV ids (e.g. an
 /// `add(P, dv=new) + remove(P, dv=old)` DV-replacement pair) refers to distinct logical
 /// files, and collapsing to path alone loses that distinction.
+///
+/// To compare against keys built from a [`DeletionVectorDescriptor`], derive the DV id with
+/// [`DeletionVectorDescriptor::unique_id_for`] using the scan's target snapshot.
+///
+/// [`DeletionVectorDescriptor`]: crate::actions::deletion_vector::DeletionVectorDescriptor
+/// [`DeletionVectorDescriptor::unique_id_for`]: crate::actions::deletion_vector::DeletionVectorDescriptor::unique_id_for
 #[derive(Debug)]
 #[non_exhaustive]
 pub struct IncrementalScanSummary {
@@ -561,7 +611,8 @@ fn process_batch(
     seen_file_keys: &mut HashSet<FileActionKey>,
     live_adds: &mut HashSet<FileActionKey>,
     removes: &mut HashSet<FileActionKey>,
-) -> DeltaResult<Option<FilteredEngineData>> {
+    dv_normalization_root: Option<Url>,
+) -> KernelResult<Option<FilteredEngineData>> {
     let row_count = batch.len();
     let mut adds_sel = vec![false; row_count];
 
@@ -583,6 +634,7 @@ fn process_batch(
         REMOVE_PATH_INDEX,
         ADD_DV_START_INDEX,
         REMOVE_DV_START_INDEX,
+        dv_normalization_root,
     );
     let mut visitor = IncrementalDedupVisitor {
         deduplicator,
@@ -656,10 +708,10 @@ impl RowVisitor for IncrementalDedupVisitor<'_, '_> {
         (names, types)
     }
 
-    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
+    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> KernelResult<()> {
         require!(
             getters.len() == NUM_GETTERS,
-            Error::InternalError(format!(
+            KernelError::InternalError(format!(
                 "IncrementalDedupVisitor expected {NUM_GETTERS} getters, got {}",
                 getters.len()
             ))

@@ -33,9 +33,9 @@ Decimals have a precision (1 to 38 inclusive) and a scale (0 to precision inclus
 
 ```rust,no_run
 # extern crate delta_kernel;
-# use delta_kernel::DeltaResult;
+# use delta_kernel::KernelResult;
 # use delta_kernel::schema::DataType;
-# fn main() -> DeltaResult<()> {
+# fn main() -> KernelResult<()> {
 let price_type = DataType::decimal(18, 2)?;
 # Ok(())
 # }
@@ -77,8 +77,8 @@ A named collection of fields (see [Schemas](#schemas) below). Structs can be nes
 ```rust,no_run
 # extern crate delta_kernel;
 # use delta_kernel::schema::{DataType, StructField, StructType};
-# use delta_kernel::DeltaResult;
-# fn main() -> DeltaResult<()> {
+# use delta_kernel::KernelResult;
+# fn main() -> KernelResult<()> {
 let address_type = StructType::try_new([
     StructField::nullable("street", DataType::STRING),
     StructField::nullable("city", DataType::STRING),
@@ -113,9 +113,9 @@ aliases `Schema` and `SchemaRef` (`Arc<StructType>`) are used throughout the API
 
 ```rust,no_run
 # extern crate delta_kernel;
-# use delta_kernel::DeltaResult;
+# use delta_kernel::KernelResult;
 # use delta_kernel::schema::{DataType, StructField, StructType};
-# fn main() -> DeltaResult<()> {
+# fn main() -> KernelResult<()> {
 let schema = StructType::try_new([
     StructField::not_null("id", DataType::LONG),
     StructField::nullable("name", DataType::STRING),
@@ -132,9 +132,9 @@ let schema = StructType::try_new([
 
 ```rust,no_run
 # extern crate delta_kernel;
-# use delta_kernel::DeltaResult;
+# use delta_kernel::KernelResult;
 # use delta_kernel::schema::{DataType, StructField, StructType};
-# fn main() -> DeltaResult<()> {
+# fn main() -> KernelResult<()> {
 let schema = StructType::builder()
     .add_field(StructField::not_null("id", DataType::LONG))
     .add_field(StructField::nullable("name", DataType::STRING))
@@ -198,13 +198,29 @@ let score = StructField::nullable("score", DataType::DOUBLE);
 
 Fields can carry arbitrary key-value metadata:
 
-```rust,ignore
-let field = StructField::nullable("price", DataType::decimal(18, 2)?)
+```rust
+# extern crate delta_kernel;
+# use delta_kernel::schema::{DataType, MetadataValue, StructField};
+# use delta_kernel::KernelResult;
+# fn main() -> KernelResult<()> {
+let mut field = StructField::nullable("price", DataType::decimal(18, 2)?)
     .with_metadata([("description", "Unit price in USD")]);
+
+field.metadata.insert("comment".into(), "Retail price".into());
+assert_eq!(
+    field.metadata.get("comment"),
+    Some(&MetadataValue::String("Retail price".into()))
+);
+let key = String::from("comment");
+assert!(field.metadata.get(key.as_str()).is_some());
+# Ok(())
+# }
 ```
 
-Metadata is stored as a `HashMap<String, MetadataValue>`. The `MetadataValue` enum
-supports strings, numbers (`i64`), booleans, and arbitrary JSON.
+Metadata is stored as a `HashMap<MetadataKey, MetadataValue>`. `MetadataKey` shares storage
+for common keys and preserves custom key names. To insert a key directly, convert it with
+`.into()`. To look up a key, use `&str`; for a `String` key, pass `key.as_str()`.
+The `MetadataValue` enum supports strings, numbers (`i64`), booleans, and arbitrary JSON.
 
 ## Reading a table's schema
 
@@ -215,8 +231,8 @@ Every `Snapshot` exposes the table's schema:
 # extern crate delta_kernel_default_engine;
 # use delta_kernel_default_engine::DefaultEngine;
 # use delta_kernel_default_engine::storage::store_from_url;
-# use delta_kernel::{DeltaResult, Snapshot};
-# fn main() -> DeltaResult<()> {
+# use delta_kernel::{KernelResult, Snapshot};
+# fn main() -> KernelResult<()> {
 # let url = delta_kernel::try_parse_uri("/tmp/table")?;
 # let engine = DefaultEngine::builder(store_from_url(&url)?).build();
 let snapshot = Snapshot::builder_for(url).build(&engine)?;

@@ -135,7 +135,10 @@ connector reads or writes a UC-managed table.
  │  1. UCClient::load_table("cat", "schema", "table")        │
  │  2. UCClient::get_table_credentials(.., ReadWrite)        │
  │  3. snapshot_builder_from_load_table(&resp)?.build(..)    │
- │  4. snapshot.transaction(UCCommitter).commit(engine)?     │
+ │  4. snapshot.update_table(                                │
+ │       UpdateTableOperation::Write, engine_info, true)     │
+ │       .build(&engine, Box::new(UCCommitter::new(...)))?   │
+ │       .commit(&engine)?                                   │
  └──────┬─────────────────────────┬──────────────────────────┘
         │                         │
         ▼                         ▼
@@ -190,9 +193,9 @@ The `delta-kernel-unity-catalog` crate has the following feature flags:
 
 | Feature | Default | Description |
 |---------|---------|-------------|
-| `arrow` | Yes | Enables Arrow integration (currently delegates to `arrow-59`) |
-| `arrow-59` | Via `arrow` | Uses Arrow version 59 |
-| `arrow-58` | No | Uses Arrow version 58 |
+| `arrow` | Yes | Enables Arrow integration (currently delegates to `arrow-60`) |
+| `arrow-60` | Via `arrow` | Uses Arrow version 60 |
+| `arrow-59` | No | Uses Arrow version 59 |
 
 The `unity-catalog-delta-client-api` crate has one feature flag:
 
@@ -256,13 +259,12 @@ let config = ClientConfig::build(&endpoint, &token)
     .build()?;
 ```
 
-The REST client automatically retries requests that fail with server errors
-(HTTP 5xx) or transient network errors, using linear backoff bounded by
-`retry_base_delay` and `retry_max_delay`. Successful 2xx and client errors
-(HTTP 4xx) are not retried. These retries apply to transport-level failures
-only. Transaction-level conflicts (another writer won the version) must be
-handled by the connector through the `CommitResult::ConflictedTransaction`
-branch. See [Writing to UC Tables](./writing.md) for the full retry model.
+The REST client automatically retries requests that fail with server errors (HTTP 5xx) or transient
+network errors, using linear backoff bounded by `retry_base_delay` and `retry_max_delay`. Successful
+2xx and client errors (HTTP 4xx) are not retried. These retries apply to transport-level failures
+only. Transaction-level conflicts (another writer won the version) must be handled by the connector
+through the `CommitResult::Conflicted` branch. See [Writing to UC Tables](./writing.md) for the full
+retry model.
 
 ## When not to use this
 

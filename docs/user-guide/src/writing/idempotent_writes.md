@@ -21,7 +21,7 @@ is up to you.
 
 ## Writing with a transaction ID
 
-Call `with_transaction_id()` on the transaction and check `get_app_id_version()` before
+Call `with_transaction_id()` on the transaction builder and check `get_app_id_version()` before
 committing:
 
 ```rust,no_run
@@ -32,10 +32,10 @@ committing:
 # use delta_kernel::committer::FileSystemCommitter;
 # use delta_kernel_default_engine::DefaultEngine;
 # use delta_kernel_default_engine::storage::store_from_url;
-# use delta_kernel::transaction::CommitResult;
-# use delta_kernel::{DeltaResult, Snapshot};
+# use delta_kernel::transaction::{CommitResult, UpdateTableOperation};
+# use delta_kernel::{KernelResult, Snapshot};
 # #[tokio::main]
-# async fn main() -> DeltaResult<()> {
+# async fn main() -> KernelResult<()> {
 # let url = delta_kernel::try_parse_uri("/tmp/table")?;
 # let engine = DefaultEngine::builder(store_from_url(&url)?).build();
 # let snapshot = Snapshot::builder_for(url).build(&engine)?;
@@ -43,7 +43,7 @@ let app_id = "my-streaming-job";
 let batch_version: i64 = 42;
 
 // Check if this batch was already committed
-if let Some(committed_version) = snapshot.get_app_id_version(app_id, &engine)? {
+if let Some(committed_version) = snapshot.reader().get_app_id_version(app_id, &engine)? {
     if committed_version >= batch_version {
         println!("batch {batch_version} already committed (table has {committed_version})");
         return Ok(());
@@ -52,9 +52,9 @@ if let Some(committed_version) = snapshot.get_app_id_version(app_id, &engine)? {
 
 // Not yet committed. Proceed with the write.
 let txn = snapshot
-    .transaction(Box::new(FileSystemCommitter::new()), &engine)?
+    .update_table(UpdateTableOperation::StreamingUpdate, "my-app/1.0", /* data_change */ true)
     .with_transaction_id(app_id.to_string(), batch_version)
-    .with_operation("STREAMING UPDATE".to_string());
+    .build(&engine, Box::new(FileSystemCommitter::new()))?;
 
 // ... write data, add files, commit ...
 # Ok(())
@@ -70,11 +70,11 @@ the next run, `get_app_id_version()` will find it and the duplicate write is ski
 
 ## Reading the latest transaction version
 
-`Snapshot::get_app_id_version()` scans the log for the latest `SetTransaction` with the
+`SnapshotReader::get_app_id_version()` scans the log for the latest `SetTransaction` with the
 given `app_id`:
 
 ```rust,ignore
-let latest: Option<i64> = snapshot.get_app_id_version("my-app", &engine)?;
+let latest: Option<i64> = snapshot.reader().get_app_id_version("my-app", &engine)?;
 ```
 
 Returns `None` if no transaction with that `app_id` has been committed.

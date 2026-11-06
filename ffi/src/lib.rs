@@ -7,22 +7,23 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
 use std::default::Default;
+use std::fmt;
 use std::os::raw::{c_char, c_void};
 use std::ptr::NonNull;
 use std::sync::Arc;
 
-use delta_kernel::actions::{Metadata, Protocol};
+use delta_kernel::actions::Protocol;
 use delta_kernel::checkpoint::{CheckpointSpec, V2CheckpointConfig};
 use delta_kernel::history_manager::{
-    first_version_after as kernel_first_version_after,
+    CommitAt, HistoryCommitType, first_version_after as kernel_first_version_after,
     get_earliest_commit as kernel_get_earliest_commit,
-    latest_version_as_of as kernel_latest_version_as_of, CommitAt, HistoryCommitType,
+    latest_version_as_of as kernel_latest_version_as_of,
 };
 #[cfg(feature = "default-engine-base")]
 use delta_kernel::object_store::ObjectStore;
 use delta_kernel::schema::Schema;
-use delta_kernel::snapshot::{CheckpointWriteResult, Snapshot, SnapshotRef};
-use delta_kernel::{DeltaResult, Engine, EngineData, FileStats, LogPath, Version};
+use delta_kernel::snapshot::{CheckpointWriteResult, LogSegmentStats, Snapshot, SnapshotRef};
+use delta_kernel::{Engine, EngineData, FileStats, KernelResult, Version};
 use delta_kernel_ffi_macros::handle_descriptor;
 use tracing::debug;
 use url::Url;
@@ -51,8 +52,12 @@ mod alloc_stats;
 
 pub mod column_default;
 pub mod commit_range;
+pub mod delta_types;
 mod domain_metadata;
-pub use domain_metadata::get_domain_metadata;
+pub use domain_metadata::{
+    ROW_TRACKING_INITIAL_HIGH_WATER_MARK, get_domain_metadata,
+    snapshot_row_tracking_high_water_mark,
+};
 pub mod engine_data;
 pub mod engine_funcs;
 pub mod error;
@@ -60,7 +65,7 @@ pub mod error;
 pub mod rest_engine;
 #[cfg(feature = "default-engine-base")]
 pub mod table_changes;
-use error::{AllocateError, AllocateErrorFn, ExternResult, IntoExternResult};
+use error::{AllocateError, ErrorAllocators, ExternResult, IntoExternResult};
 #[cfg(feature = "delta-kernel-unity-catalog")]
 pub mod delta_kernel_unity_catalog;
 pub mod expressions;
@@ -70,11 +75,22 @@ pub mod ffi_metrics;
 pub mod ffi_tracing;
 pub mod incremental_scan;
 pub mod log_path;
+pub mod log_segment;
 #[cfg(feature = "declarative-plans")]
 pub mod plans;
 pub mod scan;
 pub mod schema;
 pub mod schema_visitor;
+pub mod snapshot;
+/// Preserves the `snapshot_hint` import path for Rust callers.
+#[doc(hidden)]
+pub use snapshot::hint as snapshot_hint;
+pub use snapshot::{
+    ExclusiveSnapshotBuilder, FfiIncrementalReplay, FfiSnapshotBuilder, free_snapshot_builder,
+    get_snapshot_builder, get_snapshot_builder_from, snapshot_builder_build,
+    snapshot_builder_with_incremental_crc_replay, snapshot_builder_with_log_tail,
+    snapshot_builder_with_max_catalog_version, snapshot_builder_with_version,
+};
 
 #[cfg(test)]
 mod ffi_test_utils;
@@ -110,6 +126,104 @@ impl Iterator for EngineIterator {
             Some(next_item)
         }
     }
+}
+
+/// A borrowed slice passed across the FFI boundary.
+///
+/// The array and all borrowed storage reachable from its elements are valid only for the receiving
+/// call or callback. The receiver must deep-copy any elements and borrowed payloads it retains. For
+/// a non-empty slice, `ptr` must address `len` aligned, initialized values. A zero-length slice is
+/// empty whether `ptr` is null or non-null.
+///
+/// Note that we _explicitly_ do not implement `Copy` on this struct despite all types being `Copy`,
+/// to avoid accidental misuse of the pointer.
+#[repr(C)]
+pub struct FfiSlice<T> {
+    /// Pointer to the first element, or any pointer value when `len` is zero.
+    pub ptr: *const T,
+    /// Number of elements in the slice.
+    pub len: usize,
+}
+
+impl<T> Clone for FfiSlice<T> {
+    fn clone(&self) -> Self {
+        Self {
+            ptr: self.ptr,
+            len: self.len,
+        }
+    }
+}
+
+impl<T> fmt::Debug for FfiSlice<T> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("FfiSlice")
+            .field("ptr", &self.ptr)
+            .field("len", &self.len)
+            .finish()
+    }
+}
+
+impl<T> FfiSlice<T> {
+    /// Creates an empty borrowed FFI slice.
+    pub fn empty() -> Self {
+        Self {
+            ptr: std::ptr::null(),
+            len: 0,
+        }
+    }
+
+    /// Creates a borrowed FFI slice from a source slice.
+    ///
+    /// # Safety
+    ///
+    /// Caller must guarantee that `source` remains valid for every use of the returned slice.
+    pub(crate) unsafe fn new_unsafe(source: &[T]) -> Self {
+        Self {
+            ptr: source.as_ptr(),
+            len: source.len(),
+        }
+    }
+
+    /// Borrows the pointed-to values as a Rust slice.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `len` is nonzero and `ptr` is null.
+    ///
+    /// # Safety
+    ///
+    /// For nonzero `len`, `ptr` must be aligned and address `len` initialized values. The backing
+    /// storage must remain valid for the lifetime of the returned slice.
+    pub(crate) unsafe fn try_as_slice(&self) -> KernelResult<&[T]> {
+        if self.len == 0 {
+            return Ok(&[]);
+        }
+        if self.ptr.is_null() {
+            return Err(delta_kernel::KernelError::generic(format!(
+                "slice pointer is null with length {}",
+                self.len
+            )));
+        }
+        Ok(unsafe { std::slice::from_raw_parts(self.ptr, self.len) })
+    }
+
+    /// Converts this value into a borrowed Rust slice.
+    ///
+    /// # Safety
+    ///
+    /// The pointer must still be valid and reference `len` initialized values.
+    #[cfg(test)]
+    unsafe fn as_ref(&self) -> &[T] {
+        unsafe { self.try_as_slice() }.unwrap()
+    }
+}
+
+/// Returns a borrowed pointer to `value`, or null when it is absent.
+///
+/// The returned pointer does not extend the lifetime of the referenced value.
+pub(crate) fn optional_pointer<T>(value: Option<&T>) -> *const T {
+    value.map_or(std::ptr::null(), std::ptr::from_ref)
 }
 
 /// A non-owned slice of a UTF8 string, intended for arg-passing between kernel and engine. The
@@ -163,6 +277,26 @@ impl KernelStringSlice {
         }
     }
 
+    /// Copies this borrowed UTF-8 slice into an owned string.
+    ///
+    /// # Safety
+    ///
+    /// For nonzero `len`, `ptr` must address `len` initialized bytes and remain valid for the
+    /// duration of this call.
+    pub(crate) unsafe fn try_to_string(&self) -> KernelResult<String> {
+        if self.len == 0 {
+            return Ok(String::new());
+        }
+        if self.ptr.is_null() {
+            return Err(delta_kernel::KernelError::generic(format!(
+                "string pointer is null with length {}",
+                self.len
+            )));
+        }
+        let value: &str = unsafe { TryFromStringSlice::try_from_slice(self) }?;
+        Ok(value.to_string())
+    }
+
     #[cfg(feature = "tracing")]
     pub(crate) fn empty() -> Self {
         KernelStringSlice {
@@ -187,49 +321,39 @@ impl KernelBytesSlice {
     ///
     /// # Safety
     /// Caller must guarantee that the source will outlive the created KernelBytesSlice.
-    #[cfg(feature = "declarative-plans")]
     pub(crate) unsafe fn new_unsafe(source: &[u8]) -> Self {
         Self {
             ptr: source.as_ptr(),
             len: source.len(),
         }
     }
-}
 
-/// A non-owned slice of signed 64-bit integers intended for passing variable-length arrays from
-/// kernel to an engine callback.
-///
-/// The pointed-to data is valid only for the duration of the callback receiving this value. The
-/// callback must copy any values it needs to retain after returning.
-#[repr(C)]
-pub struct KernelI64Slice {
-    ptr: *const i64,
-    len: usize,
-}
-
-impl KernelI64Slice {
-    /// Creates a new integer slice from a source slice.
+    /// Returns the borrowed bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `ptr` is null and `len` is not zero.
     ///
     /// # Safety
     ///
-    /// Caller must guarantee that `source` remains valid for every use of the returned slice.
-    unsafe fn new_unsafe(source: &[i64]) -> Self {
-        Self {
-            ptr: source.as_ptr(),
-            len: source.len(),
+    /// For nonzero `len`, `ptr` must address `len` initialized bytes and remain valid for the
+    /// returned slice's lifetime.
+    pub(crate) unsafe fn try_as_slice(&self) -> KernelResult<&[u8]> {
+        if self.len == 0 {
+            return Ok(&[]);
         }
-    }
-
-    /// Converts this value into a borrowed Rust slice.
-    ///
-    /// # Safety
-    ///
-    /// The pointer must still be valid and reference `len` initialized `i64` values.
-    #[cfg(test)]
-    unsafe fn as_ref(&self) -> &[i64] {
-        unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
+        if self.ptr.is_null() {
+            return Err(delta_kernel::KernelError::generic(format!(
+                "byte pointer is null with length {}",
+                self.len
+            )));
+        }
+        Ok(unsafe { std::slice::from_raw_parts(self.ptr, self.len) })
     }
 }
+
+/// A borrowed slice of signed 64-bit integers.
+pub type KernelI64Slice = FfiSlice<i64>;
 
 /// FFI-safe implementation for Rust's `Option<T>`
 #[derive(PartialEq, Debug)]
@@ -250,6 +374,15 @@ impl<T> From<Option<T>> for OptionalValue<T> {
 
 impl<T> From<OptionalValue<T>> for Option<T> {
     fn from(value: OptionalValue<T>) -> Self {
+        match value {
+            OptionalValue::Some(value) => Some(value),
+            OptionalValue::None => None,
+        }
+    }
+}
+
+impl<'a, T> From<&'a OptionalValue<T>> for Option<&'a T> {
+    fn from(value: &'a OptionalValue<T>) -> Self {
         match value {
             OptionalValue::Some(value) => Some(value),
             OptionalValue::None => None,
@@ -284,7 +417,6 @@ pub(crate) use kernel_string_slice;
 ///
 /// Refer to [`kernel_string_slice!`](kernel_string_slice) for safety and implementation
 /// notes.
-#[cfg(feature = "declarative-plans")]
 macro_rules! kernel_bytes_slice {
     ( $source:ident ) => {{
         fn do_it(b: &[u8]) -> $crate::KernelBytesSlice {
@@ -293,11 +425,10 @@ macro_rules! kernel_bytes_slice {
         do_it(&$source)
     }};
 }
-#[cfg(feature = "declarative-plans")]
 pub(crate) use kernel_bytes_slice;
 
 trait TryFromStringSlice<'a>: Sized {
-    unsafe fn try_from_slice(slice: &'a KernelStringSlice) -> DeltaResult<Self>;
+    unsafe fn try_from_slice(slice: &'a KernelStringSlice) -> KernelResult<Self>;
 }
 
 impl<'a> TryFromStringSlice<'a> for String {
@@ -307,7 +438,7 @@ impl<'a> TryFromStringSlice<'a> for String {
     ///
     /// The slice must be a valid (non-null) pointer, and must point to the indicated number of
     /// valid utf8 bytes.
-    unsafe fn try_from_slice(slice: &'a KernelStringSlice) -> DeltaResult<Self> {
+    unsafe fn try_from_slice(slice: &'a KernelStringSlice) -> KernelResult<Self> {
         let slice: &str = unsafe { TryFromStringSlice::try_from_slice(slice) }?;
         Ok(slice.into())
     }
@@ -321,7 +452,7 @@ impl<'a> TryFromStringSlice<'a> for &'a str {
     ///
     /// The slice must be a valid (non-null) pointer, and must point to the indicated number of
     /// valid utf8 bytes.
-    unsafe fn try_from_slice(slice: &'a KernelStringSlice) -> DeltaResult<Self> {
+    unsafe fn try_from_slice(slice: &'a KernelStringSlice) -> KernelResult<Self> {
         let slice = unsafe { std::slice::from_raw_parts(slice.ptr.cast(), slice.len) };
         Ok(std::str::from_utf8(slice)?)
     }
@@ -330,6 +461,15 @@ impl<'a> TryFromStringSlice<'a> for &'a str {
 /// Allow engines to allocate strings of their own type. the contract of calling a passed allocate
 /// function is that `kernel_str` is _only_ valid until the return from this function
 pub type AllocateStringFn = extern "C" fn(kernel_str: KernelStringSlice) -> NullableCvoid;
+
+/// Lets an engine copy borrowed bytes into its own memory. `kernel_bytes` is valid only for the
+/// duration of the callback.
+pub type AllocateBytesFn = extern "C" fn(kernel_bytes: KernelBytesSlice) -> NullableCvoid;
+
+/// Lets an engine copy borrowed physical column names into its own memory. The array and its nested
+/// slices are valid only for the duration of the callback.
+pub type AllocateColumnNamesFn =
+    extern "C" fn(column_names: delta_types::FfiColumnNameArray) -> NullableCvoid;
 
 /// An opaque type that rust will understand as a string. This can be obtained by calling
 /// [`allocate_kernel_string`] with a [`KernelStringSlice`]
@@ -341,18 +481,23 @@ pub struct ExclusiveRustString;
 ///
 /// # Safety
 ///
+/// `error_allocators` must be non-null, aligned, and point to an initialized [`ErrorAllocators`]
+/// for this call. Its callbacks and context must satisfy [`ErrorAllocators`]'s requirements until
+/// this call returns.
+///
 /// Caller is responsible for passing a valid KernelStringSlice
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn allocate_kernel_string(
     kernel_str: KernelStringSlice,
-    error_fn: AllocateErrorFn,
+    error_allocators: *const ErrorAllocators,
 ) -> ExternResult<Handle<ExclusiveRustString>> {
-    allocate_kernel_string_impl(kernel_str).into_extern_result(&error_fn)
+    let result = allocate_kernel_string_impl(kernel_str);
+    unsafe { result.into_extern_result(&*error_allocators) }
 }
 
 fn allocate_kernel_string_impl(
     kernel_str: KernelStringSlice,
-) -> DeltaResult<Handle<ExclusiveRustString>> {
+) -> KernelResult<Handle<ExclusiveRustString>> {
     let s = unsafe { String::try_from_slice(&kernel_str) }?;
     Ok(Box::new(s).into())
 }
@@ -372,7 +517,7 @@ pub struct ExclusiveRustBytes;
 /// Caller is responsible for passing a valid [`KernelBytesSlice`] whose pointer references at least
 /// `len` readable bytes. The slice only needs to remain valid until after this call returns.
 #[cfg(feature = "declarative-plans")]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn allocate_kernel_bytes(
     bytes: KernelBytesSlice,
 ) -> Handle<ExclusiveRustBytes> {
@@ -388,6 +533,16 @@ pub unsafe extern "C" fn allocate_kernel_bytes(
 // directly. It can only be created by converting `From<Vec<bool>>`.
 mod private {
     use std::ptr::NonNull;
+
+    use crate::handle::BoxExt;
+
+    /// Convert a `Vec<T>` into a thin `(ptr, len)` pair, shrinking capacity to `len`.
+    ///
+    /// Pair with [`Vec::from_raw_parts(ptr.as_ptr(), len, len)`](Vec::from_raw_parts).
+    fn vec_into_ffi_ptr<T>(val: Vec<T>) -> (NonNull<T>, usize) {
+        let ptr = BoxExt::into_non_null(val.into_boxed_slice());
+        (ptr.cast(), ptr.len())
+    }
 
     /// Represents an owned slice of boolean values allocated by the kernel. Any time the engine
     /// receives a `KernelBoolSlice` as a return value from a kernel method, engine is responsible
@@ -436,11 +591,7 @@ mod private {
     #[cfg(feature = "declarative-plans")]
     impl From<Vec<u8>> for KernelOwnedBytes {
         fn from(val: Vec<u8>) -> Self {
-            let len = val.len();
-            let boxed = val.into_boxed_slice();
-            let leaked_ptr = Box::leak(boxed).as_mut_ptr();
-            // safety: Box::leak always returns a valid, non-null pointer
-            let ptr = unsafe { NonNull::new_unchecked(leaked_ptr) };
+            let (ptr, len) = vec_into_ffi_ptr(val);
             KernelOwnedBytes { ptr, len }
         }
     }
@@ -491,20 +642,14 @@ mod private {
             if self.len == 0 {
                 Default::default()
             } else {
-                Vec::from_raw_parts(self.ptr.as_ptr(), self.len, self.len)
+                unsafe { Vec::from_raw_parts(self.ptr.as_ptr(), self.len, self.len) }
             }
         }
     }
 
     impl From<Vec<bool>> for KernelBoolSlice {
         fn from(val: Vec<bool>) -> Self {
-            let len = val.len();
-            let boxed = val.into_boxed_slice();
-            let leaked_ptr = Box::leak(boxed).as_mut_ptr();
-            // safety: Box::leak always returns a valid, non-null pointer
-            #[allow(clippy::expect_used)]
-            let ptr = NonNull::new(leaked_ptr)
-                .expect("This should never be null please report this bug.");
+            let (ptr, len) = vec_into_ffi_ptr(val);
             KernelBoolSlice { ptr, len }
         }
     }
@@ -540,7 +685,7 @@ mod private {
         /// The slice must have been originally created `From<Vec<u64>>`, and must not have
         /// already been consumed by a previous call to this method.
         pub unsafe fn into_vec(self) -> Vec<u64> {
-            Vec::from_raw_parts(self.ptr.as_ptr(), self.len, self.len)
+            unsafe { Vec::from_raw_parts(self.ptr.as_ptr(), self.len, self.len) }
         }
 
         /// Creates an empty slice.
@@ -554,13 +699,7 @@ mod private {
 
     impl From<Vec<u64>> for KernelRowIndexArray {
         fn from(vec: Vec<u64>) -> Self {
-            let len = vec.len();
-            let boxed = vec.into_boxed_slice();
-            let leaked_ptr = Box::leak(boxed).as_mut_ptr();
-            // safety: Box::leak always returns a valid, non-null pointer
-            #[allow(clippy::expect_used)]
-            let ptr = NonNull::new(leaked_ptr)
-                .expect("This should never be null please report this bug.");
+            let (ptr, len) = vec_into_ffi_ptr(vec);
             KernelRowIndexArray { ptr, len }
         }
     }
@@ -572,7 +711,7 @@ pub use private::{KernelBoolSlice, KernelRowIndexArray};
 /// # Safety
 ///
 /// Caller is responsible for passing a valid handle.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn free_bool_slice(slice: KernelBoolSlice) {
     let vec = unsafe { slice.into_vec() };
     debug!("Dropping bool slice. It is {vec:#?}");
@@ -581,9 +720,9 @@ pub unsafe extern "C" fn free_bool_slice(slice: KernelBoolSlice) {
 /// # Safety
 ///
 /// Caller is responsible for passing a valid handle.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn free_row_indexes(slice: KernelRowIndexArray) {
-    let _ = slice.into_vec();
+    let _ = unsafe { slice.into_vec() };
 }
 
 /// Free a [`KernelOwnedBytes`] buffer obtained from kernel.
@@ -592,7 +731,7 @@ pub unsafe extern "C" fn free_row_indexes(slice: KernelRowIndexArray) {
 ///
 /// Caller is responsible for passing a valid buffer, and must not use it again afterwards.
 #[cfg(feature = "declarative-plans")]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn free_kernel_bytes(bytes: KernelOwnedBytes) {
     let _ = unsafe { bytes.into_vec() };
 }
@@ -613,14 +752,16 @@ pub struct ExclusiveEngineData;
 /// # Safety
 ///
 /// Caller is responsible for passing a valid handle as engine_data
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn free_engine_data(engine_data: Handle<ExclusiveEngineData>) {
-    engine_data.drop_handle();
+    unsafe { engine_data.drop_handle() }
 }
 
-// A wrapper for Engine which defines additional FFI-specific methods.
+/// An engine and the connector callbacks used to return its FFI errors.
 pub trait ExternEngine: Send + Sync {
+    /// Returns a shared reference to the engine used for Kernel operations.
     fn engine(&self) -> Arc<dyn Engine>;
+    /// Returns the registered allocator for errors from operations using this engine.
     fn error_allocator(&self) -> &dyn AllocateError;
 }
 
@@ -631,7 +772,7 @@ pub struct SharedExternEngine;
 struct ExternEngineVtable {
     // Actual engine instance to use
     engine: Arc<dyn Engine>,
-    allocate_error: AllocateErrorFn,
+    error_allocators: ErrorAllocators,
 }
 
 #[cfg(feature = "default-engine-base")]
@@ -641,64 +782,45 @@ impl Drop for ExternEngineVtable {
     }
 }
 
-/// # Safety
-///
-/// Kernel doesn't use any threading or concurrency. If engine chooses to do so, engine is
-/// responsible for handling  any races that could result.
-#[cfg(feature = "default-engine-base")]
-unsafe impl Send for ExternEngineVtable {}
-
-/// # Safety
-///
-/// Kernel doesn't use any threading or concurrency. If engine chooses to do so, engine is
-/// responsible for handling any races that could result.
-///
-/// These are needed because anything wrapped in Arc "should" implement it
-/// Basically, by failing to implement these traits, we forbid the engine from being able to declare
-/// its thread-safety (because rust assumes it is not threadsafe). By implementing them, we leave it
-/// up to the engine to enforce thread safety if engine chooses to use threads at all.
-#[cfg(feature = "default-engine-base")]
-unsafe impl Sync for ExternEngineVtable {}
-
 #[cfg(feature = "default-engine-base")]
 impl ExternEngine for ExternEngineVtable {
     fn engine(&self) -> Arc<dyn Engine> {
         self.engine.clone()
     }
     fn error_allocator(&self) -> &dyn AllocateError {
-        &self.allocate_error
+        &self.error_allocators
     }
 }
 
 /// # Safety
 ///
 /// Caller is responsible for passing a valid path pointer.
-unsafe fn unwrap_and_parse_path_as_url(path: KernelStringSlice) -> DeltaResult<Url> {
+unsafe fn unwrap_and_parse_path_as_url(path: KernelStringSlice) -> KernelResult<Url> {
     let path: &str = unsafe { TryFromStringSlice::try_from_slice(&path) }?;
     delta_kernel::try_parse_uri(path)
 }
 
-/// How [`EngineBuilder`] resolves an [`ObjectStore`](delta_kernel::object_store::ObjectStore) at
+/// How [`FfiEngineBuilder`] resolves an [`ObjectStore`](delta_kernel::object_store::ObjectStore) at
 /// build time.
 #[cfg(feature = "default-engine-base")]
 #[derive(Default)]
 pub(crate) enum ObjectStoreBackend {
-    /// `url` and [`set_builder_option`] keys are passed to [`store_from_url_opts`].
+    /// `url` and [`builder_with_option`] keys are passed to [`store_from_url_opts`].
     #[default]
     UrlScheme,
-    /// REST file API; configured via [`set_builder_rest_object_store`].
+    /// REST file API; configured via [`builder_with_rest_object_store`].
     Rest(Box<rest_engine::RestBuilderState>),
 }
 
 /// A builder that allows setting options on the `Engine` before actually building it.
 ///
 /// For a normal object store backend, `url` is the table storage location (`s3://…`, `file://…`).
-/// For REST, call [`set_builder_rest_object_store`] with a [`rest_engine::CRestEndpointConfig`]
+/// For REST, call [`builder_with_rest_object_store`] with a [`rest_engine::CRestEndpointConfig`]
 /// and set `url` to the REST service base URL; see [`rest_engine`] for TLS and auth options.
 #[cfg(feature = "default-engine-base")]
-pub struct EngineBuilder {
+pub struct FfiEngineBuilder {
     url: Url,
-    allocate_fn: AllocateErrorFn,
+    error_allocators: ErrorAllocators,
     options: HashMap<String, String>,
     object_store_backend: ObjectStoreBackend,
     /// Configuration for multithreaded executor. If Some, use a multi-threaded executor
@@ -729,68 +851,101 @@ pub(crate) struct MultithreadedExecutorConfig {
 }
 
 #[cfg(feature = "default-engine-base")]
-impl EngineBuilder {
+impl FfiEngineBuilder {
     fn set_option(&mut self, key: String, val: String) {
         self.options.insert(key, val);
     }
 }
 
-/// Get a "builder" that can be used to construct an engine. The function
-/// [`set_builder_option`] can be used to set options on the builder prior to constructing the
-/// actual engine
+/// An opaque handle with exclusive (Box-like) ownership of a [`FfiEngineBuilder`].
+#[cfg(feature = "default-engine-base")]
+#[handle_descriptor(target=FfiEngineBuilder, mutable=true, sized=true)]
+pub struct ExclusiveEngineBuilder;
+
+/// Get a builder that can be used to construct an engine. The function
+/// [`builder_with_option`] can be used to set options on the builder prior to constructing the
+/// actual engine. The caller owns the returned builder and must eventually pass it to either
+/// [`builder_build`] or [`free_engine_builder`].
 ///
 /// # Safety
+///
+/// `error_allocators` must be non-null, aligned, and point to an initialized [`ErrorAllocators`]
+/// for this call. The table is copied; its callbacks and context must satisfy [`ErrorAllocators`]'s
+/// requirements for the lifetime of the returned builder and any engine built from it.
 /// Caller is responsible for passing a valid path pointer.
 #[cfg(feature = "default-engine-base")]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn get_engine_builder(
     path: KernelStringSlice,
-    allocate_error: AllocateErrorFn,
-) -> ExternResult<*mut EngineBuilder> {
+    error_allocators: *const ErrorAllocators,
+) -> ExternResult<Handle<ExclusiveEngineBuilder>> {
+    let error_allocators = unsafe { *error_allocators };
     let url = unsafe { unwrap_and_parse_path_as_url(path) };
-    get_engine_builder_impl(url, allocate_error).into_extern_result(&allocate_error)
+    let result = get_engine_builder_impl(url, error_allocators);
+    unsafe { result.into_extern_result(&error_allocators) }
 }
 
 #[cfg(feature = "default-engine-base")]
 fn get_engine_builder_impl(
-    url: DeltaResult<Url>,
-    allocate_fn: AllocateErrorFn,
-) -> DeltaResult<*mut EngineBuilder> {
-    let builder = Box::new(EngineBuilder {
+    url: KernelResult<Url>,
+    error_allocators: ErrorAllocators,
+) -> KernelResult<Handle<ExclusiveEngineBuilder>> {
+    let builder = Box::new(FfiEngineBuilder {
         url: url?,
-        allocate_fn,
+        error_allocators,
         options: HashMap::default(),
         object_store_backend: ObjectStoreBackend::default(),
         multithreaded_executor_config: None,
         io_config: IoConcurrencyConfig::default(),
     });
-    Ok(Box::into_raw(builder))
+    Ok(builder.into())
 }
 
-/// Set an option on the builder
+/// Free an engine builder without building an engine.
 ///
 /// # Safety
 ///
-/// Caller must pass a valid EngineBuilder pointer, and valid slices for key and value
+/// `builder` must be a valid handle returned by [`get_engine_builder`]. It is consumed and must not
+/// be used or freed again after this call.
 #[cfg(feature = "default-engine-base")]
-#[no_mangle]
-pub unsafe extern "C" fn set_builder_option(
-    builder: &mut EngineBuilder,
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn free_engine_builder(builder: Handle<ExclusiveEngineBuilder>) {
+    unsafe { builder.drop_handle() }
+}
+
+/// Set an option on the builder and return the updated builder handle on success.
+///
+/// # Errors
+///
+/// Returns an error if `key` or `value` is not valid UTF-8.
+///
+/// # Safety
+///
+/// Caller must pass a valid engine builder handle and valid slices for key and value. The builder
+/// is consumed unconditionally and must not be used or freed after this call. On error, the
+/// builder is dropped.
+#[cfg(feature = "default-engine-base")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn builder_with_option(
+    builder: Handle<ExclusiveEngineBuilder>,
     key: KernelStringSlice,
     value: KernelStringSlice,
-) -> ExternResult<bool> {
-    set_builder_option_impl(builder, key, value).into_extern_result(&builder.allocate_fn)
+) -> ExternResult<Handle<ExclusiveEngineBuilder>> {
+    let mut builder = unsafe { builder.into_inner() };
+    let error_allocators = builder.error_allocators;
+    let result = builder_with_option_impl(&mut builder, key, value).map(|_| builder.into());
+    unsafe { result.into_extern_result(&error_allocators) }
 }
 #[cfg(feature = "default-engine-base")]
-fn set_builder_option_impl(
-    builder: &mut EngineBuilder,
+fn builder_with_option_impl(
+    builder: &mut FfiEngineBuilder,
     key: KernelStringSlice,
     value: KernelStringSlice,
-) -> DeltaResult<bool> {
+) -> KernelResult<()> {
     let key = unsafe { String::try_from_slice(&key) }?;
     let value = unsafe { String::try_from_slice(&value) }?;
     builder.set_option(key, value);
-    Ok(true)
+    Ok(())
 }
 
 /// Configure the builder to use a multi-threaded executor instead of the default
@@ -803,14 +958,16 @@ fn set_builder_option_impl(
 ///
 /// # Safety
 ///
-/// Caller must pass a valid EngineBuilder pointer.
+/// Caller must pass a valid engine builder handle. The input handle is consumed; the returned
+/// handle owns the builder with the executor configuration applied.
 #[cfg(feature = "default-engine-base")]
-#[no_mangle]
-pub unsafe extern "C" fn set_builder_with_multithreaded_executor(
-    builder: &mut EngineBuilder,
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn builder_with_multithreaded_executor(
+    builder: Handle<ExclusiveEngineBuilder>,
     worker_threads: usize,
     max_blocking_threads: usize,
-) {
+) -> Handle<ExclusiveEngineBuilder> {
+    let mut builder = unsafe { builder.into_inner() };
     let worker_threads = (worker_threads != 0).then_some(worker_threads);
     let max_blocking_threads = (max_blocking_threads != 0).then_some(max_blocking_threads);
 
@@ -818,6 +975,7 @@ pub unsafe extern "C" fn set_builder_with_multithreaded_executor(
         worker_threads,
         max_blocking_threads,
     });
+    builder.into()
 }
 
 /// Configure read-path I/O concurrency for the engine's JSON and Parquet handlers.
@@ -835,111 +993,133 @@ pub unsafe extern "C" fn set_builder_with_multithreaded_executor(
 ///
 /// # Safety
 ///
-/// Caller must pass a valid EngineBuilder pointer.
+/// Caller must pass a valid engine builder handle. The input handle is consumed; the returned
+/// handle owns the builder with the I/O configuration applied.
 #[cfg(feature = "default-engine-base")]
-#[no_mangle]
-pub unsafe extern "C" fn set_builder_with_io_concurrency(
-    builder: &mut EngineBuilder,
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn builder_with_io_concurrency(
+    builder: Handle<ExclusiveEngineBuilder>,
     buffer_size: usize,
     batch_size: usize,
-) {
+) -> Handle<ExclusiveEngineBuilder> {
+    let mut builder = unsafe { builder.into_inner() };
     // `NonZero::new` maps 0 -> `None`, which the engine reads as "use the default".
     builder.io_config = IoConcurrencyConfig {
         buffer_size: NonZero::new(buffer_size),
         batch_size: NonZero::new(batch_size),
     };
+    builder.into()
 }
 
 /// Select a REST-backed object store. See [`rest_engine`] for setup, option keys, and callbacks.
 ///
+/// # Errors
+///
+/// Returns an error if `endpoint_config` is null, contains invalid UTF-8, or omits a required
+/// field.
+///
 /// # Safety
 ///
-/// Caller must pass a valid builder pointer and a non-null `endpoint_config`. When `callback` is
-/// non-null, `context` must remain valid for the engine lifetime and the callback must be safe to
-/// invoke from any thread concurrently (see [`rest_engine::CAuthHeaderCallback`]).
+/// Caller must pass a valid builder handle and a non-null `endpoint_config`. The builder is
+/// consumed unconditionally and must not be used or freed after this call. On error, the builder
+/// is dropped. When `callback` is non-null, `context` must remain valid for the engine lifetime and
+/// the callback must be safe to invoke from any thread concurrently (see
+/// [`rest_engine::CAuthHeaderCallback`]).
 #[cfg(feature = "default-engine-base")]
-#[no_mangle]
-pub unsafe extern "C" fn set_builder_rest_object_store(
-    builder: &mut EngineBuilder,
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn builder_with_rest_object_store(
+    builder: Handle<ExclusiveEngineBuilder>,
     endpoint_config: *const rest_engine::CRestEndpointConfig,
     callback: Option<rest_engine::CAuthHeaderCallback>,
     context: NullableCvoid,
-) -> ExternResult<bool> {
-    set_builder_rest_object_store_impl(builder, endpoint_config, callback, context)
-        .into_extern_result(&builder.allocate_fn)
+) -> ExternResult<Handle<ExclusiveEngineBuilder>> {
+    let mut builder = unsafe { builder.into_inner() };
+    let error_allocators = builder.error_allocators;
+    let result =
+        builder_with_rest_object_store_impl(&mut builder, endpoint_config, callback, context)
+            .map(|_| builder.into());
+    unsafe { result.into_extern_result(&error_allocators) }
 }
 
 #[cfg(feature = "default-engine-base")]
-fn set_builder_rest_object_store_impl(
-    builder: &mut EngineBuilder,
+fn builder_with_rest_object_store_impl(
+    builder: &mut FfiEngineBuilder,
     endpoint_config: *const rest_engine::CRestEndpointConfig,
     callback: Option<rest_engine::CAuthHeaderCallback>,
     context: NullableCvoid,
-) -> DeltaResult<bool> {
+) -> KernelResult<()> {
     // SAFETY: caller guarantees a non-null, valid `endpoint_config` for the duration of the call.
     let endpoint_config = unsafe { endpoint_config.as_ref() }
-        .ok_or_else(|| delta_kernel::Error::generic("null CRestEndpointConfig pointer"))?;
+        .ok_or_else(|| delta_kernel::KernelError::generic("null CRestEndpointConfig pointer"))?;
     builder.object_store_backend =
         ObjectStoreBackend::Rest(Box::new(rest_engine::rest_builder_state_from_ffi(
             endpoint_config,
             callback,
             context,
-            builder.allocate_fn,
+            builder.error_allocators,
         )?));
-    Ok(true)
+    Ok(())
 }
 
-/// Consume the builder and return a `default` engine. After calling, the passed pointer is _no
-/// longer valid_. Note that this _consumes_ and frees the builder, so there is no need to
-/// drop/free it afterwards.
+/// Consume the builder and return a default engine. The builder is consumed regardless of the
+/// result and must not be used or freed after this call.
 ///
 ///
 /// # Safety
 ///
-/// Caller is responsible to pass a valid EngineBuilder pointer, and to not use it again afterwards
+/// Caller must pass a valid engine builder handle. The handle is consumed before any fallible work
+/// and must not be used or freed after this call, regardless of the result.
 #[cfg(feature = "default-engine-base")]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn builder_build(
-    builder: *mut EngineBuilder,
+    builder: Handle<ExclusiveEngineBuilder>,
 ) -> ExternResult<Handle<SharedExternEngine>> {
-    let builder_box = unsafe { Box::from_raw(builder) };
-    get_default_engine_impl(
+    let builder_box = unsafe { builder.into_inner() };
+    let result = get_default_engine_impl(
         builder_box.url,
         builder_box.options,
         builder_box.object_store_backend,
         builder_box.multithreaded_executor_config,
         builder_box.io_config,
-        builder_box.allocate_fn,
-    )
-    .into_extern_result(&builder_box.allocate_fn)
+        builder_box.error_allocators,
+    );
+    unsafe { result.into_extern_result(&builder_box.error_allocators) }
 }
 
+/// Creates a default engine for `path` and retains a copy of its error allocation callbacks.
+///
+/// Returns an engine handle, or an allocated error if the path or engine configuration is invalid.
+///
 /// # Safety
 ///
-/// Caller is responsible for passing a valid path pointer.
+/// `error_allocators` must be non-null, aligned, and point to an initialized [`ErrorAllocators`]
+/// for this call. Its callbacks and context must satisfy [`ErrorAllocators`]'s requirements for
+/// the lifetime of the returned engine. `path` must reference readable memory for its length.
 #[cfg(feature = "default-engine-base")]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn get_default_engine(
     path: KernelStringSlice,
-    allocate_error: AllocateErrorFn,
+    error_allocators: *const ErrorAllocators,
 ) -> ExternResult<Handle<SharedExternEngine>> {
+    let error_allocators = unsafe { *error_allocators };
     let url = unsafe { unwrap_and_parse_path_as_url(path) };
-    get_default_default_engine_impl(url, allocate_error).into_extern_result(&allocate_error)
+    let result = get_default_default_engine_impl(url, error_allocators);
+    unsafe { result.into_extern_result(&error_allocators) }
 }
 
 // get the default version of the default engine :)
 #[cfg(feature = "default-engine-base")]
 fn get_default_default_engine_impl(
-    url: DeltaResult<Url>,
-    allocate_error: AllocateErrorFn,
-) -> DeltaResult<Handle<SharedExternEngine>> {
+    url: KernelResult<Url>,
+    error_allocators: ErrorAllocators,
+) -> KernelResult<Handle<SharedExternEngine>> {
     get_default_engine_impl(
         url?,
         Default::default(),
         ObjectStoreBackend::default(),
         None,
         IoConcurrencyConfig::default(),
-        allocate_error,
+        error_allocators,
     )
 }
 
@@ -949,11 +1129,11 @@ fn get_default_default_engine_impl(
 #[cfg(feature = "default-engine-base")]
 fn engine_to_handle(
     engine: Arc<dyn Engine>,
-    allocate_error: AllocateErrorFn,
+    error_allocators: ErrorAllocators,
 ) -> Handle<SharedExternEngine> {
     let engine: Arc<dyn ExternEngine> = Arc::new(ExternEngineVtable {
         engine,
-        allocate_error,
+        error_allocators,
     });
     engine.into()
 }
@@ -969,8 +1149,8 @@ fn get_default_engine_impl(
     object_store_backend: ObjectStoreBackend,
     executor_config: Option<MultithreadedExecutorConfig>,
     io_config: IoConcurrencyConfig,
-    allocate_error: AllocateErrorFn,
-) -> DeltaResult<Handle<SharedExternEngine>> {
+    error_allocators: ErrorAllocators,
+) -> KernelResult<Handle<SharedExternEngine>> {
     use delta_kernel_default_engine::storage::store_from_url_opts;
 
     let store = match object_store_backend {
@@ -979,7 +1159,7 @@ fn get_default_engine_impl(
             rest_engine::build_rest_object_store(&url, &options, rest.as_ref())?
         }
     };
-    build_engine_from_store(store, executor_config, io_config, allocate_error)
+    build_engine_from_store(store, executor_config, io_config, error_allocators)
 }
 
 /// Assemble a default engine from a pre-built [`ObjectStore`], applying executor and read-path I/O
@@ -989,8 +1169,8 @@ pub(crate) fn build_engine_from_store(
     store: Arc<dyn ObjectStore>,
     executor_config: Option<MultithreadedExecutorConfig>,
     io_config: IoConcurrencyConfig,
-    allocate_error: AllocateErrorFn,
-) -> DeltaResult<Handle<SharedExternEngine>> {
+    error_allocators: ErrorAllocators,
+) -> KernelResult<Handle<SharedExternEngine>> {
     use delta_kernel_default_engine::DefaultEngineBuilder;
 
     // The builder is generic over the executor type, so apply the shared I/O config via a generic
@@ -1021,16 +1201,16 @@ pub(crate) fn build_engine_from_store(
         Arc::new(builder.build())
     };
 
-    Ok(engine_to_handle(engine, allocate_error))
+    Ok(engine_to_handle(engine, error_allocators))
 }
 
 /// # Safety
 ///
 /// Caller is responsible for passing a valid handle.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn free_engine(engine: Handle<SharedExternEngine>) {
     debug!("engine released engine");
-    engine.drop_handle();
+    unsafe { engine.drop_handle() }
 }
 
 #[handle_descriptor(target=Schema, mutable=false, sized=true)]
@@ -1112,204 +1292,13 @@ impl FfiCheckpointSpec {
 #[handle_descriptor(target=Protocol, mutable=false, sized=true)]
 pub struct SharedProtocol;
 
-#[handle_descriptor(target=Metadata, mutable=false, sized=true)]
-pub struct SharedMetadata;
-
-/// Opaque builder for constructing a [`SharedSnapshot`].
-///
-/// Create with [`get_snapshot_builder`] (from a table path) or [`get_snapshot_builder_from`]
-/// (incrementally from an existing snapshot). Configure with [`snapshot_builder_set_version`],
-/// [`snapshot_builder_set_log_tail`], and [`snapshot_builder_set_max_catalog_version`] (for
-/// catalog-managed tables). Finally, call [`snapshot_builder_build`] to consume the builder and
-/// obtain the snapshot. If you need to discard the builder without building, call
-/// [`free_snapshot_builder`].
-pub struct FfiSnapshotBuilder {
-    engine: Arc<dyn ExternEngine>,
-    source: FfiSnapshotBuilderSource,
-    version: Option<Version>,
-    log_tail: Vec<LogPath>,
-    max_catalog_version: Option<Version>,
-}
-
-/// An opaque handle with exclusive (Box-like) ownership of a [`FfiSnapshotBuilder`].
-#[handle_descriptor(target=FfiSnapshotBuilder, mutable=true, sized=true)]
-pub struct MutableFfiSnapshotBuilder;
-
-enum FfiSnapshotBuilderSource {
-    TableRoot(Url),
-    ExistingSnapshot(SnapshotRef),
-}
-
-fn make_snapshot_builder(
-    source: FfiSnapshotBuilderSource,
-    engine: Arc<dyn ExternEngine>,
-) -> DeltaResult<Handle<MutableFfiSnapshotBuilder>> {
-    Ok(Box::new(FfiSnapshotBuilder {
-        engine,
-        source,
-        version: None,
-        log_tail: Vec::new(),
-        max_catalog_version: None,
-    })
-    .into())
-}
-
-/// Get a builder for creating a [`SharedSnapshot`] from a table path.
-///
-/// Use [`snapshot_builder_set_version`] to pin a specific version, then call
-/// [`snapshot_builder_build`] to obtain the snapshot. The caller owns the returned handle and must
-/// eventually call either [`snapshot_builder_build`] to produce a [`SharedSnapshot`], or
-/// [`free_snapshot_builder`] to drop it without building.
-///
-/// # Safety
-///
-/// Caller is responsible for passing a valid path and engine handle.
-#[no_mangle]
-pub unsafe extern "C" fn get_snapshot_builder(
-    path: KernelStringSlice,
-    engine: Handle<SharedExternEngine>,
-) -> ExternResult<Handle<MutableFfiSnapshotBuilder>> {
-    let engine_ref = unsafe { engine.as_ref() };
-    let engine_arc = unsafe { engine.clone_as_arc() };
-    let url = unsafe { unwrap_and_parse_path_as_url(path) };
-    let source = match url {
-        Ok(url) => FfiSnapshotBuilderSource::TableRoot(url),
-        Err(e) => return DeltaResult::Err(e).into_extern_result(&engine_ref),
-    };
-    make_snapshot_builder(source, engine_arc).into_extern_result(&engine_ref)
-}
-
-/// Get a builder for incrementally updating an existing snapshot.
-///
-/// This avoids re-reading the full log. Use [`snapshot_builder_set_version`] to target a specific
-/// version, then call [`snapshot_builder_build`] to obtain the updated snapshot. The caller owns
-/// the returned handle and must eventually call either [`snapshot_builder_build`] to produce a
-/// [`SharedSnapshot`], or [`free_snapshot_builder`] to drop it without building.
-///
-/// # Safety
-///
-/// Caller is responsible for passing valid handles.
-#[no_mangle]
-pub unsafe extern "C" fn get_snapshot_builder_from(
-    prev_snapshot: Handle<SharedSnapshot>,
-    engine: Handle<SharedExternEngine>,
-) -> ExternResult<Handle<MutableFfiSnapshotBuilder>> {
-    let engine_ref = unsafe { engine.as_ref() };
-    let engine_arc = unsafe { engine.clone_as_arc() };
-    let snapshot_arc = unsafe { prev_snapshot.clone_as_arc() };
-    make_snapshot_builder(
-        FfiSnapshotBuilderSource::ExistingSnapshot(snapshot_arc),
-        engine_arc,
-    )
-    .into_extern_result(&engine_ref)
-}
-
-/// Set the target version on a snapshot builder. When omitted, the snapshot is created at the
-/// latest version of the table.
-///
-/// # Safety
-///
-/// Caller must pass a valid builder pointer.
-#[no_mangle]
-pub unsafe extern "C" fn snapshot_builder_set_version(
-    builder: &mut Handle<MutableFfiSnapshotBuilder>,
-    version: Version,
-) {
-    unsafe { builder.as_mut() }.version = Some(version);
-}
-
-/// Set the log tail on a snapshot builder for catalog-managed tables.
-///
-/// # Safety
-///
-/// Caller must pass a valid builder pointer. The log_tail array and its contents must remain valid
-/// for the duration of this call.
-#[no_mangle]
-pub unsafe extern "C" fn snapshot_builder_set_log_tail(
-    builder: &mut Handle<MutableFfiSnapshotBuilder>,
-    log_tail: log_path::LogPathArray,
-) -> ExternResult<bool> {
-    let builder_mut = unsafe { builder.as_mut() };
-    let engine_arc = builder_mut.engine.clone();
-    let engine_ref = engine_arc.as_ref();
-    snapshot_builder_set_log_tail_impl(builder_mut, log_tail).into_extern_result(&engine_ref)
-}
-
-unsafe fn snapshot_builder_set_log_tail_impl(
-    builder: &mut FfiSnapshotBuilder,
-    log_tail: log_path::LogPathArray,
-) -> DeltaResult<bool> {
-    builder.log_tail = unsafe { log_tail.log_paths() }?;
-    Ok(true)
-}
-
-/// Set the max catalog version on a snapshot builder for catalog-managed tables. This bounds the
-/// snapshot version to what the catalog has ratified.
-///
-/// # Safety
-///
-/// Caller must pass a valid builder pointer.
-#[no_mangle]
-pub unsafe extern "C" fn snapshot_builder_set_max_catalog_version(
-    builder: &mut Handle<MutableFfiSnapshotBuilder>,
-    max_catalog_version: Version,
-) {
-    unsafe { builder.as_mut() }.max_catalog_version = Some(max_catalog_version);
-}
-
-/// Consume the builder and return a snapshot. After calling, the builder pointer is _no longer
-/// valid_. The builder is always freed by this call, whether or not it succeeds.
-///
-/// # Safety
-///
-/// Caller must pass a valid builder pointer and must not use it again after this call.
-#[no_mangle]
-pub unsafe extern "C" fn snapshot_builder_build(
-    mut builder: Handle<MutableFfiSnapshotBuilder>,
-) -> ExternResult<Handle<SharedSnapshot>> {
-    // Clone the engine Arc before consuming the handle so we can still use it for error reporting
-    let engine_arc = unsafe { builder.as_mut() }.engine.clone();
-    let engine_ref = engine_arc.as_ref();
-    let builder_box = unsafe { builder.into_inner() };
-    snapshot_builder_build_impl(*builder_box).into_extern_result(&engine_ref)
-}
-
-fn snapshot_builder_build_impl(builder: FfiSnapshotBuilder) -> DeltaResult<Handle<SharedSnapshot>> {
-    let engine = builder.engine.engine();
-    let mut rust_builder = match builder.source {
-        FfiSnapshotBuilderSource::TableRoot(url) => Snapshot::builder_for(url),
-        FfiSnapshotBuilderSource::ExistingSnapshot(snap) => Snapshot::builder_from(snap),
-    };
-    if let Some(v) = builder.version {
-        rust_builder = rust_builder.at_version(v);
-    }
-    if !builder.log_tail.is_empty() {
-        rust_builder = rust_builder.with_log_tail(builder.log_tail);
-    }
-    if let Some(mcv) = builder.max_catalog_version {
-        rust_builder = rust_builder.with_max_catalog_version(mcv);
-    }
-    let snapshot = rust_builder.build(engine.as_ref())?;
-    Ok(snapshot.into())
-}
-
-/// Free a snapshot builder without building a snapshot (e.g. on an error path).
-///
-/// # Safety
-///
-/// Caller must pass a valid builder pointer and must not use it again after this call.
-#[no_mangle]
-pub unsafe extern "C" fn free_snapshot_builder(builder: Handle<MutableFfiSnapshotBuilder>) {
-    builder.drop_handle();
-}
-
 /// # Safety
 ///
 /// Caller is responsible for passing a valid handle.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn free_snapshot(snapshot: Handle<SharedSnapshot>) {
     debug!("engine released snapshot");
-    snapshot.drop_handle();
+    unsafe { snapshot.drop_handle() }
 }
 
 /// Perform a checkpoint write on the given snapshot. Mirrors the kernel's
@@ -1328,7 +1317,7 @@ pub unsafe extern "C" fn free_snapshot(snapshot: Handle<SharedSnapshot>) {
 ///
 /// Caller is responsible for passing valid handles. The `spec` pointer, if non-null, must point
 /// to a valid `FfiCheckpointSpec` for the duration of the call.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn checkpoint_snapshot(
     snapshot: Handle<SharedSnapshot>,
     engine: Handle<SharedExternEngine>,
@@ -1337,10 +1326,10 @@ pub unsafe extern "C" fn checkpoint_snapshot(
     let engine_ref = unsafe { engine.as_ref() };
     let snapshot_ref: SnapshotRef = unsafe { snapshot.clone_as_arc() };
     let kernel_spec = spec.map(|s| s.to_kernel());
-    snapshot_ref
+    let result = snapshot_ref
         .checkpoint(engine_ref.engine().as_ref(), kernel_spec.as_ref())
-        .map(|(result, updated)| FfiCheckpointWriteResult::from_kernel(result, updated))
-        .into_extern_result(&engine_ref)
+        .map(|(result, updated)| FfiCheckpointWriteResult::from_kernel(result, updated));
+    unsafe { result.into_extern_result(&engine_ref) }
 }
 
 /// Publish unpublished catalog commits on a catalog-managed snapshot.
@@ -1351,14 +1340,14 @@ pub unsafe extern "C" fn checkpoint_snapshot(
 ///
 /// Caller owns the returned handle ([`free_snapshot`]). The input snapshot is borrowed; the
 /// committer is consumed (do not free). The returned snapshot carries the published watermark
-/// used by subsequent catalog commits -- use it for the next `transaction_with_committer` /
-/// checkpoint.
+/// used by subsequent catalog commits -- use it for the next
+/// `update_table_txn_builder_build_with_committer` call or checkpoint.
 ///
 /// # Safety
 ///
-/// Caller must pass valid snapshot, committer, and engine handles. The committer handle is
-/// consumed and must not be used or freed afterward.
-#[no_mangle]
+/// All handles must be valid. This call borrows `snapshot` and `engine` and unconditionally
+/// consumes `committer`, including on error. Do not use or free `committer` afterward.
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn snapshot_publish_with_committer(
     snapshot: Handle<SharedSnapshot>,
     committer: Handle<MutableCommitter>,
@@ -1367,10 +1356,10 @@ pub unsafe extern "C" fn snapshot_publish_with_committer(
     let engine_ref = unsafe { engine.as_ref() };
     let snapshot_ref: SnapshotRef = unsafe { snapshot.clone_as_arc() };
     let committer = unsafe { committer.into_inner() };
-    snapshot_ref
+    let result = snapshot_ref
         .publish(engine_ref.engine().as_ref(), committer.as_ref())
-        .map(|updated| updated.into())
-        .into_extern_result(&engine_ref)
+        .map(|updated| updated.into());
+    unsafe { result.into_extern_result(&engine_ref) }
 }
 
 /// Get the version of the specified snapshot
@@ -1378,7 +1367,7 @@ pub unsafe extern "C" fn snapshot_publish_with_committer(
 /// # Safety
 ///
 /// Caller is responsible for passing a valid handle.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn version(snapshot: Handle<SharedSnapshot>) -> u64 {
     let snapshot = unsafe { snapshot.as_ref() };
     snapshot.version()
@@ -1396,16 +1385,62 @@ pub unsafe extern "C" fn version(snapshot: Handle<SharedSnapshot>) -> u64 {
 /// # Safety
 ///
 /// Caller is responsible for passing valid snapshot handle and engine handle.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn snapshot_timestamp(
     snapshot: Handle<SharedSnapshot>,
     engine: Handle<SharedExternEngine>,
 ) -> ExternResult<i64> {
     let engine_ref = unsafe { engine.as_ref() };
     let snapshot = unsafe { snapshot.as_ref() };
-    snapshot
-        .get_timestamp(engine_ref.engine().as_ref())
-        .into_extern_result(&engine_ref)
+    let result = snapshot
+        .reader()
+        .get_timestamp(engine_ref.engine().as_ref());
+    unsafe { result.into_extern_result(&engine_ref) }
+}
+
+/// Statistics for the commit files selected to replay a snapshot's log segment.
+///
+/// Includes published and staged commits, and selected compactions in place of covered commits.
+/// Excludes checkpoints, sidecars, CRCs, and commits retained only for timestamp lookup.
+#[derive(Debug, PartialEq, Eq)]
+#[repr(C)]
+pub struct FfiLogSegmentStats {
+    /// Number of selected commit files, counting each selected compaction as one file.
+    pub num_commit_files: u64,
+    /// Sum of the selected commit file sizes in bytes.
+    pub total_commit_file_bytes: u64,
+}
+
+impl From<LogSegmentStats> for FfiLogSegmentStats {
+    fn from(stats: LogSegmentStats) -> Self {
+        Self {
+            num_commit_files: stats.num_commit_files,
+            total_commit_file_bytes: stats.total_commit_file_bytes,
+        }
+    }
+}
+
+/// Returns selected replay commit file statistics from `snapshot` without I/O.
+///
+/// Borrows both handles. Uses `engine` only to allocate errors. The returned value needs no
+/// release. Returns zero counts and bytes when a checkpoint covers the entire snapshot.
+///
+/// # Errors
+///
+/// Returns an error if the total commit file size exceeds `u64::MAX`.
+///
+/// # Safety
+///
+/// Caller must pass valid snapshot and engine handles, and retain ownership of both handles.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn snapshot_log_segment_stats(
+    snapshot: Handle<SharedSnapshot>,
+    engine: Handle<SharedExternEngine>,
+) -> ExternResult<FfiLogSegmentStats> {
+    let engine_ref = unsafe { engine.as_ref() };
+    let snapshot = unsafe { snapshot.as_ref() };
+    let result = snapshot.log_segment_stats().map(FfiLogSegmentStats::from);
+    unsafe { result.into_extern_result(&engine_ref) }
 }
 
 /// File-level statistics for a snapshot, sourced from the snapshot's CRC.
@@ -1439,7 +1474,7 @@ impl From<FileStats> for FfiFileStats {
 /// # Safety
 ///
 /// Caller is responsible for passing a valid snapshot handle.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn snapshot_file_stats(
     snapshot: Handle<SharedSnapshot>,
 ) -> OptionalValue<FfiFileStats> {
@@ -1476,7 +1511,7 @@ pub type FileSizeHistogramVisitor = extern "C" fn(
 /// Caller is responsible for passing a valid snapshot handle, an `engine_context` value suitable
 /// for the visitor (which may be null), and a valid `visitor` function pointer. The visitor must
 /// not retain the passed slices.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn visit_file_size_histogram(
     snapshot: Handle<SharedSnapshot>,
     engine_context: NullableCvoid,
@@ -1537,7 +1572,7 @@ impl From<FfiHistoryCommitType> for HistoryCommitType {
 /// # Safety
 ///
 /// Caller is responsible for passing a valid `log_root` string slice and a valid engine handle.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn get_earliest_commit(
     engine: Handle<SharedExternEngine>,
     log_root: KernelStringSlice,
@@ -1546,21 +1581,21 @@ pub unsafe extern "C" fn get_earliest_commit(
 ) -> ExternResult<Version> {
     let engine_ref = unsafe { engine.as_ref() };
     let log_root = unsafe { unwrap_and_parse_path_as_url(log_root) };
-    get_earliest_commit_impl(
+    let result = get_earliest_commit_impl(
         engine_ref,
         log_root,
         earliest_ratified_commit_version,
         commit_type,
-    )
-    .into_extern_result(&engine_ref)
+    );
+    unsafe { result.into_extern_result(&engine_ref) }
 }
 
 fn get_earliest_commit_impl(
     extern_engine: &dyn ExternEngine,
-    log_root: DeltaResult<Url>,
+    log_root: KernelResult<Url>,
     earliest_ratified_commit_version: OptionalValue<Version>,
     commit_type: FfiHistoryCommitType,
-) -> DeltaResult<Version> {
+) -> KernelResult<Version> {
     kernel_get_earliest_commit(
         extern_engine.engine().as_ref(),
         &log_root?,
@@ -1601,7 +1636,7 @@ impl From<CommitAt> for FfiCommitAt {
 /// # Safety
 ///
 /// Caller is responsible for passing a valid snapshot handle and a valid engine handle.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn latest_version_as_of(
     snapshot: Handle<SharedSnapshot>,
     engine: Handle<SharedExternEngine>,
@@ -1610,14 +1645,14 @@ pub unsafe extern "C" fn latest_version_as_of(
 ) -> ExternResult<FfiCommitAt> {
     let engine_ref = unsafe { engine.as_ref() };
     let snapshot = unsafe { snapshot.as_ref() };
-    kernel_latest_version_as_of(
+    let result = kernel_latest_version_as_of(
         snapshot,
         engine_ref.engine().as_ref(),
         timestamp,
         commit_type.into(),
     )
-    .map(FfiCommitAt::from)
-    .into_extern_result(&engine_ref)
+    .map(FfiCommitAt::from);
+    unsafe { result.into_extern_result(&engine_ref) }
 }
 
 /// Get the first commit (version and timestamp) within `snapshot`'s version range with a
@@ -1631,7 +1666,7 @@ pub unsafe extern "C" fn latest_version_as_of(
 /// # Safety
 ///
 /// Caller is responsible for passing a valid snapshot handle and a valid engine handle.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn first_version_after(
     snapshot: Handle<SharedSnapshot>,
     engine: Handle<SharedExternEngine>,
@@ -1640,14 +1675,14 @@ pub unsafe extern "C" fn first_version_after(
 ) -> ExternResult<FfiCommitAt> {
     let engine_ref = unsafe { engine.as_ref() };
     let snapshot = unsafe { snapshot.as_ref() };
-    kernel_first_version_after(
+    let result = kernel_first_version_after(
         snapshot,
         engine_ref.engine().as_ref(),
         timestamp,
         commit_type.into(),
     )
-    .map(FfiCommitAt::from)
-    .into_extern_result(&engine_ref)
+    .map(FfiCommitAt::from);
+    unsafe { result.into_extern_result(&engine_ref) }
 }
 
 /// Get the logical schema of the specified snapshot
@@ -1655,19 +1690,34 @@ pub unsafe extern "C" fn first_version_after(
 /// # Safety
 ///
 /// Caller is responsible for passing a valid snapshot handle.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn logical_schema(snapshot: Handle<SharedSnapshot>) -> Handle<SharedSchema> {
     let snapshot = unsafe { snapshot.as_ref() };
     snapshot.schema().into()
+}
+
+/// Returns the full table physical schema, including `VOID` fields and partition columns that are
+/// not stored in data files. Use a bound write context's physical write schema when shaping a
+/// Parquet file.
+/// The caller owns the returned schema and must release it with [`free_schema`].
+///
+/// # Safety
+/// The snapshot handle is borrowed and must be valid.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn snapshot_physical_schema(
+    snapshot: Handle<SharedSnapshot>,
+) -> Handle<SharedSchema> {
+    let snapshot = unsafe { snapshot.as_ref() };
+    snapshot.table_configuration().physical_schema().into()
 }
 
 /// Free a schema
 ///
 /// # Safety
 /// Engine is responsible for providing a valid schema handle.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn free_schema(schema: Handle<SharedSchema>) {
-    schema.drop_handle();
+    unsafe { schema.drop_handle() }
 }
 
 /// Get the resolved root of the table. This should be used in any future calls that require
@@ -1676,7 +1726,7 @@ pub unsafe extern "C" fn free_schema(schema: Handle<SharedSchema>) {
 /// # Safety
 ///
 /// Caller is responsible for passing a valid snapshot handle.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn snapshot_table_root(
     snapshot: Handle<SharedSnapshot>,
     allocate_fn: AllocateStringFn,
@@ -1690,7 +1740,7 @@ pub unsafe extern "C" fn snapshot_table_root(
 ///
 /// # Safety
 /// Caller is responsible for passing a valid snapshot handle
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn get_partition_column_count(snapshot: Handle<SharedSnapshot>) -> usize {
     let snapshot = unsafe { snapshot.as_ref() };
     snapshot
@@ -1703,7 +1753,7 @@ pub unsafe extern "C" fn get_partition_column_count(snapshot: Handle<SharedSnaps
 ///
 /// # Safety
 /// Caller is responsible for passing a valid snapshot handle.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn get_partition_columns(
     snapshot: Handle<SharedSnapshot>,
 ) -> Handle<StringSliceIterator> {
@@ -1717,44 +1767,13 @@ pub unsafe extern "C" fn get_partition_columns(
     iter.into()
 }
 
-/// Visit each metadata configuration (key/value pair) for the specified snapshot by invoking the
-/// provided `visitor` callback once per entry.
-///
-/// # Safety
-///
-/// Caller is responsible for passing a valid snapshot handle, a valid `engine_context` as an
-/// opaque pointer passed to each `visitor` invocation, and a valid `visitor` function pointer.
-#[no_mangle]
-pub unsafe extern "C" fn visit_metadata_configuration(
-    snapshot: Handle<SharedSnapshot>,
-    engine_context: NullableCvoid,
-    visitor: extern "C" fn(
-        engine_context: NullableCvoid,
-        key: KernelStringSlice,
-        value: KernelStringSlice,
-    ),
-) {
-    let snapshot = unsafe { snapshot.as_ref() };
-    snapshot
-        .table_configuration()
-        .metadata()
-        .configuration()
-        .iter()
-        .for_each(|(key, value)| {
-            visitor(
-                engine_context,
-                kernel_string_slice!(key),
-                kernel_string_slice!(value),
-            );
-        });
-}
 // === Protocol handle FFI ===
 
 /// Get the protocol for this snapshot. The returned handle must be freed with [`free_protocol`].
 ///
 /// # Safety
 /// Caller is responsible for providing a valid snapshot handle.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn snapshot_get_protocol(
     snapshot: Handle<SharedSnapshot>,
 ) -> Handle<SharedProtocol> {
@@ -1766,9 +1785,9 @@ pub unsafe extern "C" fn snapshot_get_protocol(
 ///
 /// # Safety
 /// Caller is responsible for providing a valid, non-freed protocol handle.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn free_protocol(protocol: Handle<SharedProtocol>) {
-    protocol.drop_handle();
+    unsafe { protocol.drop_handle() }
 }
 
 /// Visit all fields of the protocol in a single FFI call. The caller provides:
@@ -1780,7 +1799,7 @@ pub unsafe extern "C" fn free_protocol(protocol: Handle<SharedProtocol>) {
 /// # Safety
 /// Caller is responsible for providing a valid protocol handle, a valid `context` pointer, and
 /// valid function pointers for `visit_versions` and `visit_feature`.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn visit_protocol(
     protocol: Handle<SharedProtocol>,
     context: NullableCvoid,
@@ -1811,82 +1830,27 @@ pub unsafe extern "C" fn visit_protocol(
     }
 }
 
-// === Metadata handle FFI ===
+// === Metadata FFI ===
 
-/// Get the metadata for this snapshot. The returned handle must be freed with [`free_metadata`].
+/// Visits the snapshot's complete metadata action without engine I/O.
+///
+/// Borrows `snapshot` and invokes `visitor` once with `context` and a borrowed metadata view.
+/// The view and all nested pointers are valid only until the callback returns. Callers must copy
+/// any values they retain. The original schema JSON is preserved without reserialization.
 ///
 /// # Safety
-/// Caller is responsible for providing a valid snapshot handle.
-#[no_mangle]
-pub unsafe extern "C" fn snapshot_get_metadata(
+///
+/// `snapshot` must be a valid, live handle for the duration of the call. `visitor` must not unwind
+/// or invalidate the snapshot. Any non-null `context` must satisfy the visitor's requirements.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn snapshot_visit_metadata(
     snapshot: Handle<SharedSnapshot>,
-) -> Handle<SharedMetadata> {
-    let snapshot = unsafe { snapshot.as_ref() };
-    Arc::new(snapshot.table_configuration().metadata().clone()).into()
-}
-
-/// Free a metadata handle obtained from [`snapshot_get_metadata`].
-///
-/// # Safety
-/// Caller is responsible for providing a valid, non-freed metadata handle.
-#[no_mangle]
-pub unsafe extern "C" fn free_metadata(metadata: Handle<SharedMetadata>) {
-    metadata.drop_handle();
-}
-
-/// Visit all fields of the metadata in a single FFI call. String fields are passed as
-/// [`KernelStringSlice`] references that borrow from the metadata handle -- they are only valid
-/// for the duration of the callback.
-///
-/// The visitor receives:
-/// - `id`: always present
-/// - `name`: `OptionalValue::None` if not set
-/// - `description`: `OptionalValue::None` if not set
-/// - `format_provider`: always present
-/// - `has_created_time`: whether `created_time_ms` is meaningful
-/// - `created_time_ms`: milliseconds since epoch (only valid when `has_created_time` is true)
-///
-/// # Safety
-/// Caller is responsible for providing a valid metadata handle, a valid `context` pointer, and
-/// a valid `visit_metadata_fields` function pointer. String slices must not be retained past
-/// the callback return.
-#[no_mangle]
-pub unsafe extern "C" fn visit_metadata(
-    metadata: Handle<SharedMetadata>,
     context: NullableCvoid,
-    visit_metadata_fields: extern "C" fn(
-        context: NullableCvoid,
-        id: KernelStringSlice,
-        name: OptionalValue<KernelStringSlice>,
-        description: OptionalValue<KernelStringSlice>,
-        format_provider: KernelStringSlice,
-        has_created_time: bool,
-        created_time_ms: i64,
-    ),
+    visitor: extern "C" fn(NullableCvoid, *const delta_types::FfiMetadata),
 ) {
-    let metadata = unsafe { metadata.as_ref() };
-    let id_str = metadata.id();
-    let id = kernel_string_slice!(id_str);
-    let name = metadata.name().map(|s| kernel_string_slice!(s)).into();
-    let description = metadata
-        .description()
-        .map(|s| kernel_string_slice!(s))
-        .into();
-    let fp_str = metadata.format_provider();
-    let format_provider = kernel_string_slice!(fp_str);
-    let (has_created_time, created_time_ms) = match metadata.created_time() {
-        Some(t) => (true, t),
-        None => (false, 0),
-    };
-    visit_metadata_fields(
-        context,
-        id,
-        name,
-        description,
-        format_provider,
-        has_created_time,
-        created_time_ms,
-    );
+    let snapshot = unsafe { snapshot.as_ref() };
+    let backing = delta_types::MetadataBacking::new(snapshot.table_configuration().metadata());
+    visitor(context, &backing.as_ffi());
 }
 
 // === Snapshot-level computed property FFI ===
@@ -1903,7 +1867,7 @@ pub struct StringSliceIterator;
 ///
 /// [`scan_metadata_iter_init`]: crate::scan::scan_metadata_iter_init
 /// [`free_scan_metadata_iter`]: crate::scan::free_scan_metadata_iter
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn string_slice_next(
     data: Handle<StringSliceIterator>,
     engine_context: NullableCvoid,
@@ -1929,9 +1893,9 @@ fn string_slice_next_impl(
 /// # Safety
 ///
 /// Caller is responsible for (at most once) passing a valid pointer to a [`StringSliceIterator`]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn free_string_slice_data(data: Handle<StringSliceIterator>) {
-    data.drop_handle();
+    unsafe { data.drop_handle() }
 }
 
 /// A set that can identify its contents by address
@@ -1990,31 +1954,37 @@ mod tests {
     use std::collections::HashMap;
     use std::ptr::NonNull;
 
+    use delta_kernel::actions::Metadata;
     use delta_kernel::object_store::memory::InMemory;
     use delta_kernel::object_store::path::Path;
     use delta_kernel::object_store::{DynObjectStore, ObjectStoreExt as _};
     use delta_kernel::schema::schema_ref;
-    use delta_kernel_default_engine::executor::tokio::TokioMultiThreadExecutor;
     use delta_kernel_default_engine::DefaultEngineBuilder;
+    use delta_kernel_default_engine::executor::tokio::TokioMultiThreadExecutor;
     use rstest::rstest;
     use serde_json::Value;
+    use test_utils::table_builder::{LogState, TestTableBuilder};
     use test_utils::{
-        actions_to_string, actions_to_string_catalog_managed, actions_to_string_partitioned,
-        actions_to_string_with_metadata, add_commit, add_staged_commit, create_table, TestAction,
         METADATA, METADATA_WITH_FEATURES, METADATA_WITH_TABLE_PROPERTIES,
-        TEST_ICT_ENABLEMENT_TIMESTAMP,
+        TEST_ICT_ENABLEMENT_TIMESTAMP, TestAction, actions_to_string,
+        actions_to_string_catalog_managed, actions_to_string_partitioned,
+        actions_to_string_with_metadata, add_commit, add_staged_commit,
+        assert_result_error_with_message, create_table,
     };
     use url::Url;
 
     use super::*;
-    use crate::error::{EngineError, KernelError};
+    use crate::error::FFIKernelError;
     use crate::ffi_test_utils::{
-        allocate_err, allocate_str, assert_extern_result_error_with_message, build_snapshot,
-        ok_or_panic, recover_string, setup_snapshot,
+        TEST_ERROR_ALLOCATORS, allocate_str, assert_extern_result_error_contains,
+        assert_extern_result_error_with_message, build_snapshot, ok_or_panic, recover_string,
+        setup_snapshot,
     };
 
-    #[no_mangle]
-    extern "C" fn allocate_null_err(_: KernelError, _: KernelStringSlice) -> *mut EngineError {
+    unsafe extern "C" fn allocate_null_err(
+        _: *mut std::ffi::c_void,
+        _: *const crate::error::allocation::KernelErrorInfo,
+    ) -> *mut std::ffi::c_void {
         std::ptr::null_mut()
     }
 
@@ -2049,6 +2019,85 @@ mod tests {
     }
 
     #[test]
+    fn ffi_slice_pointer_length_contract() {
+        let values = [3, 5];
+        let null_empty = FfiSlice::<i32>::empty();
+        let nonnull_empty = FfiSlice {
+            ptr: values.as_ptr(),
+            len: 0,
+        };
+        let nonnull_nonempty = FfiSlice {
+            ptr: values.as_ptr(),
+            len: values.len(),
+        };
+        let null_nonempty = FfiSlice::<i32> {
+            ptr: std::ptr::null(),
+            len: 1,
+        };
+
+        assert!(unsafe { null_empty.try_as_slice() }.unwrap().is_empty());
+        assert!(unsafe { nonnull_empty.try_as_slice() }.unwrap().is_empty());
+        assert_eq!(unsafe { nonnull_nonempty.try_as_slice() }.unwrap(), &values);
+        assert_result_error_with_message(
+            unsafe { null_nonempty.try_as_slice() },
+            "slice pointer is null with length 1",
+        );
+    }
+
+    #[test]
+    fn kernel_bytes_slice_pointer_length_contract() {
+        let null_empty = KernelBytesSlice {
+            ptr: std::ptr::null(),
+            len: 0,
+        };
+        let null_nonempty = KernelBytesSlice {
+            ptr: std::ptr::null(),
+            len: 4,
+        };
+
+        assert!(unsafe { null_empty.try_as_slice() }.unwrap().is_empty());
+        assert!(matches!(
+            unsafe { null_nonempty.try_as_slice() },
+            Err(delta_kernel::KernelError::Generic(_))
+        ));
+    }
+
+    #[test]
+    fn log_path_array_empty_constructs_empty_slice() {
+        let empty = log_path::LogPathArray::empty();
+
+        assert!(unsafe { empty.log_paths() }.unwrap().is_empty());
+    }
+
+    #[test]
+    fn snapshot_builder_log_tail_rejects_null_nonempty_pointer() {
+        let engine = engine_to_handle(
+            Arc::new(DefaultEngineBuilder::new(Arc::new(InMemory::new())).build()),
+            TEST_ERROR_ALLOCATORS,
+        );
+        let table_root = "memory:///test_table/";
+        let builder = unsafe {
+            ok_or_panic(get_snapshot_builder(
+                kernel_string_slice!(table_root),
+                engine.shallow_copy(),
+            ))
+        };
+        let log_tail = log_path::LogPathArray {
+            ptr: std::ptr::null(),
+            len: 1,
+        };
+
+        unsafe {
+            assert_extern_result_error_with_message(
+                snapshot_builder_with_log_tail(builder, log_tail),
+                FFIKernelError::GenericError,
+                Some("Generic delta kernel error: slice pointer is null with length 1"),
+            );
+            free_engine(engine);
+        }
+    }
+
+    #[test]
     fn bool_slice() {
         let bools = vec![true, false, true];
         let bool_slice = KernelBoolSlice::from(bools);
@@ -2062,14 +2111,11 @@ mod tests {
     /// engine and snapshot handles.
     async fn make_engine_and_v0_snapshot(
         path: &str,
-    ) -> Result<
-        (
-            Arc<InMemory>,
-            Handle<SharedExternEngine>,
-            Handle<SharedSnapshot>,
-        ),
-        Box<dyn std::error::Error>,
-    > {
+    ) -> KernelResult<(
+        Arc<InMemory>,
+        Handle<SharedExternEngine>,
+        Handle<SharedSnapshot>,
+    )> {
         let storage = Arc::new(InMemory::new());
         add_commit(
             path,
@@ -2080,7 +2126,7 @@ mod tests {
         .await?;
         let engine = engine_to_handle(
             Arc::new(DefaultEngineBuilder::new(storage.clone()).build()),
-            allocate_err,
+            TEST_ERROR_ALLOCATORS,
         );
         let snap = unsafe { build_snapshot(kernel_string_slice!(path), engine.shallow_copy()) };
         Ok((storage, engine, snap))
@@ -2090,14 +2136,11 @@ mod tests {
     /// snapshot is built with `max_catalog_version = 0`.
     async fn make_catalog_managed_engine_and_v0_snapshot(
         path: &str,
-    ) -> Result<
-        (
-            Arc<InMemory>,
-            Handle<SharedExternEngine>,
-            Handle<SharedSnapshot>,
-        ),
-        Box<dyn std::error::Error>,
-    > {
+    ) -> KernelResult<(
+        Arc<InMemory>,
+        Handle<SharedExternEngine>,
+        Handle<SharedSnapshot>,
+    )> {
         let storage = Arc::new(InMemory::new());
         add_commit(
             path,
@@ -2108,14 +2151,14 @@ mod tests {
         .await?;
         let engine = engine_to_handle(
             Arc::new(DefaultEngineBuilder::new(storage.clone()).build()),
-            allocate_err,
+            TEST_ERROR_ALLOCATORS,
         );
         let snap = unsafe {
-            let mut ptr = ok_or_panic(get_snapshot_builder(
+            let ptr = ok_or_panic(get_snapshot_builder(
                 kernel_string_slice!(path),
                 engine.shallow_copy(),
             ));
-            snapshot_builder_set_max_catalog_version(&mut ptr, 0);
+            let ptr = snapshot_builder_with_max_catalog_version(ptr, 0);
             ok_or_panic(snapshot_builder_build(ptr))
         };
         Ok((storage, engine, snap))
@@ -2130,18 +2173,22 @@ mod tests {
         log_tail: log_path::LogPathArray,
         max_catalog_version: Option<Version>,
     ) -> ExternResult<Handle<SharedSnapshot>> {
-        let mut ptr = ok_or_panic(get_snapshot_builder(path, engine));
-        snapshot_builder_set_version(&mut ptr, version);
-        ok_or_panic(snapshot_builder_set_log_tail(&mut ptr, log_tail));
-        if let Some(mcv) = max_catalog_version {
-            snapshot_builder_set_max_catalog_version(&mut ptr, mcv);
+        unsafe {
+            let ptr = ok_or_panic(get_snapshot_builder(path, engine));
+            let ptr = snapshot_builder_with_version(ptr, version);
+            let ptr = ok_or_panic(snapshot_builder_with_log_tail(ptr, log_tail));
+            let ptr = if let Some(mcv) = max_catalog_version {
+                snapshot_builder_with_max_catalog_version(ptr, mcv)
+            } else {
+                ptr
+            };
+            snapshot_builder_build(ptr)
         }
-        snapshot_builder_build(ptr)
     }
 
     pub(crate) fn get_default_engine(path: &str) -> Handle<SharedExternEngine> {
         let path = kernel_string_slice!(path);
-        let builder = unsafe { ok_or_panic(get_engine_builder(path, allocate_err)) };
+        let builder = unsafe { ok_or_panic(get_engine_builder(path, &TEST_ERROR_ALLOCATORS)) };
         unsafe { ok_or_panic(builder_build(builder)) }
     }
 
@@ -2153,8 +2200,98 @@ mod tests {
         }
     }
 
+    #[test]
+    fn free_engine_builder_drops_unbuilt_builder() {
+        let path = "memory:///doesntmatter/foo";
+        unsafe {
+            let builder = ok_or_panic(get_engine_builder(
+                kernel_string_slice!(path),
+                &TEST_ERROR_ALLOCATORS,
+            ));
+            free_engine_builder(builder);
+        }
+    }
+
+    #[test]
+    fn engine_builder_with_option_returns_builder() {
+        let path = "memory:///doesntmatter/foo";
+        let key = "custom-option";
+        let value = "value";
+        unsafe {
+            let builder = ok_or_panic(get_engine_builder(
+                kernel_string_slice!(path),
+                &TEST_ERROR_ALLOCATORS,
+            ));
+            let builder = ok_or_panic(builder_with_option(
+                builder,
+                kernel_string_slice!(key),
+                kernel_string_slice!(value),
+            ));
+            assert_eq!(
+                builder.as_ref().options.get(key).map(String::as_str),
+                Some(value)
+            );
+            free_engine_builder(builder);
+        }
+    }
+
+    #[test]
+    fn engine_builder_with_option_invalid_utf8_consumes_builder() {
+        let path = "memory:///doesntmatter/foo";
+        let value = "value";
+        let invalid_utf8 = [0xff];
+        let invalid_key = KernelStringSlice {
+            ptr: invalid_utf8.as_ptr().cast(),
+            len: invalid_utf8.len(),
+        };
+        unsafe {
+            let builder = ok_or_panic(get_engine_builder(
+                kernel_string_slice!(path),
+                &TEST_ERROR_ALLOCATORS,
+            ));
+            assert_extern_result_error_with_message(
+                builder_with_option(builder, invalid_key, kernel_string_slice!(value)),
+                FFIKernelError::Utf8Error,
+                None,
+            );
+        }
+        // No builder cleanup: the call consumes it on error, which Miri's leak check verifies.
+    }
+
+    #[test]
+    fn builder_build_error_consumes_builder() {
+        let path = "unsupported-scheme:///doesntmatter/foo";
+        unsafe {
+            let builder = ok_or_panic(get_engine_builder(
+                kernel_string_slice!(path),
+                &TEST_ERROR_ALLOCATORS,
+            ));
+            assert_extern_result_error_contains(
+                builder_build(builder),
+                FFIKernelError::ObjectStoreError,
+                "unsupported-scheme",
+            );
+        }
+    }
+
+    #[test]
+    fn rest_object_store_error_consumes_builder() {
+        let path = "memory:///doesntmatter/foo";
+        unsafe {
+            let builder = ok_or_panic(get_engine_builder(
+                kernel_string_slice!(path),
+                &TEST_ERROR_ALLOCATORS,
+            ));
+            assert_extern_result_error_contains(
+                builder_with_rest_object_store(builder, std::ptr::null(), None, None),
+                FFIKernelError::GenericError,
+                "null CRestEndpointConfig pointer",
+            );
+        }
+    }
+
     #[tokio::test]
-    async fn test_snapshot() -> Result<(), Box<dyn std::error::Error>> {
+    async fn test_snapshot() -> KernelResult<()> {
         let table_root = "memory:///test_table/";
         let (_, engine, snapshot1) = make_engine_and_v0_snapshot(table_root).await?;
 
@@ -2164,11 +2301,11 @@ mod tests {
 
         // Test getting snapshot at version
         let snapshot2 = unsafe {
-            let mut ptr = ok_or_panic(get_snapshot_builder(
+            let ptr = ok_or_panic(get_snapshot_builder(
                 kernel_string_slice!(table_root),
                 engine.shallow_copy(),
             ));
-            snapshot_builder_set_version(&mut ptr, 0);
+            let ptr = snapshot_builder_with_version(ptr, 0);
             ok_or_panic(snapshot_builder_build(ptr))
         };
         let version2 = unsafe { version(snapshot2.shallow_copy()) };
@@ -2176,14 +2313,18 @@ mod tests {
 
         // Test getting non-existent snapshot
         let snapshot_at_non_existent_version = unsafe {
-            let mut ptr = ok_or_panic(get_snapshot_builder(
+            let ptr = ok_or_panic(get_snapshot_builder(
                 kernel_string_slice!(table_root),
                 engine.shallow_copy(),
             ));
-            snapshot_builder_set_version(&mut ptr, 1);
+            let ptr = snapshot_builder_with_version(ptr, 1);
             snapshot_builder_build(ptr)
         };
-        assert_extern_result_error_with_message(snapshot_at_non_existent_version, KernelError::GenericError, Some("Generic delta kernel error: LogSegment end version 0 not the same as the specified end version 1"));
+        assert_extern_result_error_with_message(
+            snapshot_at_non_existent_version,
+            FFIKernelError::MissingVersionError,
+            Some("Table version 1 is missing or unavailable for this log operation."),
+        );
 
         let snapshot_table_root_str =
             unsafe { snapshot_table_root(snapshot1.shallow_copy(), allocate_str) };
@@ -2197,12 +2338,69 @@ mod tests {
         Ok(())
     }
 
+    #[rstest]
+    #[case::default(None, false)]
+    #[case::disabled(Some(FfiIncrementalReplay::Disabled), false)]
+    #[case::zero_budget(Some(FfiIncrementalReplay::UpToCommits(0)), false)]
+    #[case::sufficient_budget(Some(FfiIncrementalReplay::UpToCommits(1)), true)]
+    #[case::unlimited(Some(FfiIncrementalReplay::Unlimited), true)]
+    fn snapshot_builder_incremental_crc_replay_applies_to_fresh_and_incremental_builds(
+        #[case] mode: Option<FfiIncrementalReplay>,
+        #[case] expect_file_stats: bool,
+        #[values(false, true)] from_existing: bool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let table = TestTableBuilder::new()
+            .with_log_state(LogState::with_latest_version(1).with_crc_at([0]))
+            .build()?;
+        let table_root = table.table_root();
+        let engine = engine_to_handle(Arc::new(table.engine()), TEST_ERROR_ALLOCATORS);
+
+        let snapshot = unsafe {
+            let builder = if from_existing {
+                let base_builder = ok_or_panic(get_snapshot_builder(
+                    kernel_string_slice!(table_root),
+                    engine.shallow_copy(),
+                ));
+                let base_builder = snapshot_builder_with_version(base_builder, 0);
+                let base = ok_or_panic(snapshot_builder_build(base_builder));
+                let builder = ok_or_panic(get_snapshot_builder_from(
+                    base.shallow_copy(),
+                    engine.shallow_copy(),
+                ));
+                free_snapshot(base);
+                builder
+            } else {
+                ok_or_panic(get_snapshot_builder(
+                    kernel_string_slice!(table_root),
+                    engine.shallow_copy(),
+                ))
+            };
+            let builder = snapshot_builder_with_version(builder, 1);
+            let builder = match mode {
+                Some(mode) => snapshot_builder_with_incremental_crc_replay(builder, mode),
+                None => builder,
+            };
+            ok_or_panic(snapshot_builder_build(builder))
+        };
+        let stats = unsafe { snapshot_file_stats(snapshot.shallow_copy()) };
+        assert_eq!(stats != OptionalValue::None, expect_file_stats);
+        if let OptionalValue::Some(stats) = stats {
+            assert_eq!(stats.num_files, 1);
+        }
+
+        unsafe {
+            free_snapshot(snapshot);
+            free_engine(engine);
+        }
+        Ok(())
+    }
+
     #[test]
-    fn test_snapshot_file_stats_present() -> Result<(), Box<dyn std::error::Error>> {
+    fn test_snapshot_file_stats_present() -> KernelResult<()> {
         // The crc-full fixture has a CRC at version 0 with complete file stats.
         let table_path = std::fs::canonicalize("../kernel/tests/data/crc-full/")?;
         let table_root = Url::from_directory_path(&table_path)
-            .map_err(|()| delta_kernel::Error::generic("invalid table path"))?
+            .map_err(|()| delta_kernel::KernelError::generic("invalid table path"))?
             .to_string();
 
         let engine = get_default_engine(&table_root);
@@ -2242,9 +2440,54 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn test_snapshot_row_tracking_high_water_mark_present() -> KernelResult<()> {
+        let table_path = std::fs::canonicalize("../kernel/tests/data/crc-full/")?;
+        let table_root = Url::from_directory_path(&table_path)
+            .map_err(|()| delta_kernel::KernelError::generic("invalid table path"))?
+            .to_string();
+
+        let engine = get_default_engine(&table_root);
+        let snapshot =
+            unsafe { build_snapshot(kernel_string_slice!(table_root), engine.shallow_copy()) };
+
+        assert_eq!(
+            unsafe {
+                ok_or_panic(snapshot_row_tracking_high_water_mark(
+                    snapshot.shallow_copy(),
+                    engine.shallow_copy(),
+                ))
+            },
+            OptionalValue::Some(9),
+        );
+
+        unsafe { free_snapshot(snapshot) }
+        unsafe { free_engine(engine) }
+        Ok(())
+    }
+
     #[tokio::test]
-    async fn test_snapshot_file_stats_absent_without_crc() -> Result<(), Box<dyn std::error::Error>>
-    {
+    async fn test_snapshot_row_tracking_high_water_mark_absent() -> KernelResult<()> {
+        let table_root = "memory:///test_row_tracking_high_water_mark_absent/";
+        let (_storage, engine, snapshot) = make_engine_and_v0_snapshot(table_root).await?;
+
+        assert_eq!(
+            unsafe {
+                ok_or_panic(snapshot_row_tracking_high_water_mark(
+                    snapshot.shallow_copy(),
+                    engine.shallow_copy(),
+                ))
+            },
+            OptionalValue::None,
+        );
+
+        unsafe { free_snapshot(snapshot) }
+        unsafe { free_engine(engine) }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_snapshot_file_stats_absent_without_crc() -> KernelResult<()> {
         // A metadata-only table has no CRC, so file stats are absent.
         let table_root = "memory:///test_file_stats_no_crc/";
         let (_storage, engine, snapshot) = make_engine_and_v0_snapshot(table_root).await?;
@@ -2322,7 +2565,7 @@ mod tests {
                     .unwrap();
                 engine_to_handle(
                     Arc::new(DefaultEngineBuilder::new(storage).build()),
-                    allocate_err,
+                    TEST_ERROR_ALLOCATORS,
                 )
             }
             EarliestCommitTableSetupScenario::NoCommits => get_default_engine(table_root),
@@ -2352,13 +2595,13 @@ mod tests {
         EarliestCommitTableSetupScenario::NoCommits,
         OptionalValue::Some(0),
         FfiHistoryCommitType::Published,
-        Err(KernelError::GenericError)
+        Err(FFIKernelError::GenericError)
     )]
     #[case::empty_log_errors(
         EarliestCommitTableSetupScenario::NoCommits,
         OptionalValue::None,
         FfiHistoryCommitType::Published,
-        Err(KernelError::LogHistoryError)
+        Err(FFIKernelError::LogHistoryError)
     )]
     #[case::checkpoint_published(
         EarliestCommitTableSetupScenario::FilesystemV4CheckpointWithEarliestCommitAtV2,
@@ -2377,8 +2620,8 @@ mod tests {
         #[case] setup: EarliestCommitTableSetupScenario,
         #[case] earliest_ratified: OptionalValue<Version>,
         #[case] commit_type: FfiHistoryCommitType,
-        #[case] expected: Result<Version, KernelError>,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+        #[case] expected: KernelResult<Version, FFIKernelError>,
+    ) -> KernelResult<()> {
         let table_root = "memory:///earliest_commit/";
         let log_root = "memory:///earliest_commit/_delta_log/";
         let engine = setup_earliest_commit_table(&setup, table_root).await;
@@ -2404,7 +2647,7 @@ mod tests {
     // TODO: (PR #2307) will introduce a helper function for setting up storage, engine.
     // The test will need to refactor to use the helper function.
     #[tokio::test]
-    async fn test_snapshot_timestamp_no_ict() -> Result<(), Box<dyn std::error::Error>> {
+    async fn test_snapshot_timestamp_no_ict() -> KernelResult<()> {
         let storage = Arc::new(InMemory::new());
         let table_root = "memory:///test_table/";
         add_commit(
@@ -2416,7 +2659,7 @@ mod tests {
         .await?;
 
         let engine = DefaultEngineBuilder::new(storage.clone()).build();
-        let engine = engine_to_handle(Arc::new(engine), allocate_err);
+        let engine = engine_to_handle(Arc::new(engine), TEST_ERROR_ALLOCATORS);
         let snap =
             unsafe { build_snapshot(kernel_string_slice!(table_root), engine.shallow_copy()) };
 
@@ -2445,7 +2688,7 @@ mod tests {
     // TODO: (PR #2307) will introduce a helper function for setting up storage, engine.
     // The test will need to refactor to use the helper function.
     #[tokio::test]
-    async fn test_snapshot_timestamp_ict_enabled() -> Result<(), Box<dyn std::error::Error>> {
+    async fn test_snapshot_timestamp_ict_enabled() -> KernelResult<()> {
         let storage = Arc::new(InMemory::new());
         let table_root = "memory:///test_table/";
 
@@ -2465,7 +2708,7 @@ mod tests {
         .await?;
 
         let engine = DefaultEngineBuilder::new(storage.clone()).build();
-        let engine = engine_to_handle(Arc::new(engine), allocate_err);
+        let engine = engine_to_handle(Arc::new(engine), TEST_ERROR_ALLOCATORS);
         let snap =
             unsafe { build_snapshot(kernel_string_slice!(table_root), engine.shallow_copy()) };
 
@@ -2492,16 +2735,16 @@ mod tests {
     #[rstest]
     #[case::latest_version_query_at_ict(latest_version_as_of, TEST_ICT_ENABLEMENT_TIMESTAMP, Ok((0, TEST_ICT_ENABLEMENT_TIMESTAMP)))]
     #[case::first_version_after_query_at_ict(first_version_after, TEST_ICT_ENABLEMENT_TIMESTAMP, Ok((0, TEST_ICT_ENABLEMENT_TIMESTAMP)))]
-    #[case::latest_version_query_out_of_range(latest_version_as_of, TEST_ICT_ENABLEMENT_TIMESTAMP - 1, Err(KernelError::LogHistoryError))]
-    #[case::first_version_after_query_out_of_range(first_version_after, TEST_ICT_ENABLEMENT_TIMESTAMP + 1, Err(KernelError::LogHistoryError))]
+    #[case::latest_version_query_out_of_range(latest_version_as_of, TEST_ICT_ENABLEMENT_TIMESTAMP - 1, Err(FFIKernelError::LogHistoryError))]
+    #[case::first_version_after_query_out_of_range(first_version_after, TEST_ICT_ENABLEMENT_TIMESTAMP + 1, Err(FFIKernelError::LogHistoryError))]
     #[tokio::test]
     async fn test_snapshot_version_at_timestamp_cases(
         #[case] query: HistoryQueryFn,
         #[case] timestamp: i64,
-        #[case] expected: Result<(Version, i64), KernelError>,
+        #[case] expected: KernelResult<(Version, i64), FFIKernelError>,
         #[values(FfiHistoryCommitType::Published, FfiHistoryCommitType::Recreatable)]
         commit_type: FfiHistoryCommitType,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> KernelResult<()> {
         let storage = Arc::new(InMemory::new());
         let table_root = "memory:///test_table/";
 
@@ -2517,7 +2760,7 @@ mod tests {
         .await?;
 
         let engine = DefaultEngineBuilder::new(storage.clone()).build();
-        let engine = engine_to_handle(Arc::new(engine), allocate_err);
+        let engine = engine_to_handle(Arc::new(engine), TEST_ERROR_ALLOCATORS);
         let snap =
             unsafe { build_snapshot(kernel_string_slice!(table_root), engine.shallow_copy()) };
 
@@ -2544,59 +2787,6 @@ mod tests {
         Ok(())
     }
 
-    #[rstest]
-    #[case(
-        METADATA_WITH_TABLE_PROPERTIES,
-        HashMap::from([
-            (String::from("delta.appendOnly"), String::from("true")),
-            (String::from("custom.key"), String::from("custom_value")),
-        ])
-    )]
-    #[case(METADATA, HashMap::new())]
-    #[tokio::test]
-    async fn test_visit_metadata_configuration(
-        #[case] metadata: &str,
-        #[case] expected: HashMap<String, String>,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        let table_root = "memory:///";
-        let storage = Arc::new(InMemory::new());
-        add_commit(
-            table_root,
-            storage.as_ref(),
-            0,
-            actions_to_string_with_metadata(vec![TestAction::Metadata], metadata),
-        )
-        .await?;
-
-        let engine = DefaultEngineBuilder::new(storage.clone()).build();
-        let engine = engine_to_handle(Arc::new(engine), allocate_err);
-
-        let snap =
-            unsafe { build_snapshot(kernel_string_slice!(table_root), engine.shallow_copy()) };
-
-        extern "C" fn collect_property(
-            engine_context: NullableCvoid,
-            key: KernelStringSlice,
-            value: KernelStringSlice,
-        ) {
-            let map =
-                unsafe { &mut *(engine_context.unwrap().as_ptr() as *mut HashMap<String, String>) };
-            let k = unsafe { String::try_from_slice(&key) }.unwrap();
-            let v = unsafe { String::try_from_slice(&value) }.unwrap();
-            map.insert(k, v);
-        }
-
-        let mut collected: HashMap<String, String> = HashMap::new();
-        let ctx = NonNull::new(&mut collected as *mut _ as *mut c_void);
-        unsafe { visit_metadata_configuration(snap.shallow_copy(), ctx, collect_property) };
-
-        assert_eq!(collected, expected);
-
-        unsafe { free_snapshot(snap) }
-        unsafe { free_engine(engine) }
-        Ok(())
-    }
-
     // V2 protocol + metadata declaring the `v2Checkpoint` reader+writer feature.
     //
     // Two columns (id INT, val STRING), no partitions, no extra table properties. Used by every
@@ -2614,7 +2804,7 @@ mod tests {
         storage: &DynObjectStore,
         table_root: &str,
         num_add_actions: usize,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> KernelResult<()> {
         add_commit(
             table_root,
             storage,
@@ -2640,7 +2830,7 @@ mod tests {
         storage: &InMemory,
         table_root: &str,
         num_add_actions: usize,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> KernelResult<()> {
         add_commit(
             table_root,
             storage,
@@ -2698,14 +2888,11 @@ mod tests {
     async fn setup_checkpoint_test(
         is_v2: bool,
         num_add_actions: usize,
-    ) -> Result<
-        (
-            Arc<InMemory>,
-            Handle<SharedExternEngine>,
-            Handle<SharedSnapshot>,
-        ),
-        Box<dyn std::error::Error>,
-    > {
+    ) -> KernelResult<(
+        Arc<InMemory>,
+        Handle<SharedExternEngine>,
+        Handle<SharedSnapshot>,
+    )> {
         let storage = Arc::new(InMemory::new());
         let table_root = "memory:///";
         if is_v2 {
@@ -2723,7 +2910,7 @@ mod tests {
                     .with_task_executor(executor)
                     .build(),
             ),
-            allocate_err,
+            TEST_ERROR_ALLOCATORS,
         );
         let snapshot =
             unsafe { build_snapshot(kernel_string_slice!(table_root), engine.shallow_copy()) };
@@ -2775,7 +2962,7 @@ mod tests {
         #[case] num_add_actions: usize,
         #[case] spec: Option<FfiCheckpointSpec>,
         #[case] expected_sidecars: usize,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> KernelResult<()> {
         let (storage, engine, snapshot) = setup_checkpoint_test(is_v2, num_add_actions).await?;
 
         let result = unsafe {
@@ -2800,8 +2987,8 @@ mod tests {
     // A zero sidecar hint is invalid: the kernel requires `file_actions_per_sidecar_hint > 0`,
     // surfaced through the FFI as `CheckpointWriteError`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_checkpoint_snapshot_v2_with_sidecars_zero_hint_returns_error(
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    async fn test_checkpoint_snapshot_v2_with_sidecars_zero_hint_returns_error() -> KernelResult<()>
+    {
         let (_storage, engine, snapshot) = setup_checkpoint_test(true, 3).await?;
 
         let spec = FfiCheckpointSpec::V2WithSidecar {
@@ -2812,7 +2999,7 @@ mod tests {
         };
         assert_extern_result_error_with_message(
             extern_result,
-            KernelError::CheckpointWriteError,
+            FFIKernelError::CheckpointWriteError,
             Some("Error writing checkpoint: file_actions_per_sidecar_hint must be greater than 0"),
         );
 
@@ -2821,10 +3008,10 @@ mod tests {
         Ok(())
     }
 
-    // Checkpoint on V1 table with V2 spec => `KernelError::CheckpointWriteError`.
+    // Checkpoint on V1 table with V2 spec => `FFIKernelError::CheckpointWriteError`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_checkpoint_snapshot_v2_on_non_v2_table_returns_checkpoint_write_error(
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    async fn test_checkpoint_snapshot_v2_on_non_v2_table_returns_checkpoint_write_error()
+    -> KernelResult<()> {
         let (_storage, engine, snapshot) = setup_checkpoint_test(false, 1).await?;
 
         let spec = FfiCheckpointSpec::V2NoSidecar;
@@ -2833,8 +3020,10 @@ mod tests {
         };
         assert_extern_result_error_with_message(
             extern_result,
-            KernelError::CheckpointWriteError,
-            Some("Error writing checkpoint: CheckpointSpec::V2 requires the v2Checkpoint table feature to be supported"),
+            FFIKernelError::CheckpointWriteError,
+            Some(
+                "Error writing checkpoint: CheckpointSpec::V2 requires the v2Checkpoint table feature to be supported",
+            ),
         );
 
         unsafe { free_snapshot(snapshot) }
@@ -2862,8 +3051,8 @@ mod tests {
         ignore = "writes checkpoint parquet (no unique unsafe); minutes under Miri"
     )]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_checkpoint_snapshot_second_call_returns_consistent_snapshot(
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    async fn test_checkpoint_snapshot_second_call_returns_consistent_snapshot() -> KernelResult<()>
+    {
         let (_storage, engine, snapshot) = setup_checkpoint_test(false, 2).await?;
         let input_version = unsafe { version(snapshot.shallow_copy()) };
 
@@ -2911,8 +3100,7 @@ mod tests {
         ignore = "writes checkpoint parquet (no unique unsafe); minutes under Miri"
     )]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_checkpoint_snapshot_written_snapshot_is_usable(
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    async fn test_checkpoint_snapshot_written_snapshot_is_usable() -> KernelResult<()> {
         let (storage, engine, snapshot) = setup_checkpoint_test(false, 2).await?;
         let input_version = unsafe { version(snapshot.shallow_copy()) };
 
@@ -2970,11 +3158,11 @@ mod tests {
     //
     // Miri anchor for checkpoint FFI: covers the success-path checkpoint_snapshot -> Written
     // handle -> free_snapshot that the skipped checkpoint tests share, and uniquely covers
-    // set_builder_with_multithreaded_executor (no other test calls it). Skipping it drops that
+    // builder_with_multithreaded_executor (no other test calls it). Skipping it drops that
     // coverage under Miri.
     #[cfg(feature = "default-engine-base")]
     #[test]
-    fn test_setting_multithread_executor() -> Result<(), Box<dyn std::error::Error>> {
+    fn test_setting_multithread_executor() -> KernelResult<()> {
         use delta_kernel::object_store::local::LocalFileSystem;
         use tempfile::tempdir;
 
@@ -2982,7 +3170,7 @@ mod tests {
         let tmp_path = tmp_dir.path();
         let table_root = tmp_path
             .to_str()
-            .ok_or_else(|| delta_kernel::Error::generic("Invalid path"))?;
+            .ok_or_else(|| delta_kernel::KernelError::generic("Invalid path"))?;
         let storage = Arc::new(LocalFileSystem::new());
 
         // Use a temporary runtime for async setup, then drop it before the FFI calls so the engine
@@ -2996,10 +3184,10 @@ mod tests {
         let builder = unsafe {
             ok_or_panic(get_engine_builder(
                 kernel_string_slice!(table_root),
-                allocate_err,
+                &TEST_ERROR_ALLOCATORS,
             ))
         };
-        unsafe { set_builder_with_multithreaded_executor(builder.as_mut().unwrap(), 2, 0) };
+        let builder = unsafe { builder_with_multithreaded_executor(builder, 2, 0) };
         let engine = unsafe { ok_or_panic(builder_build(builder)) };
 
         let snapshot =
@@ -3037,7 +3225,7 @@ mod tests {
     fn test_setting_io_concurrency(
         #[case] buffer_size: usize,
         #[case] batch_size: usize,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> KernelResult<()> {
         use delta_kernel::object_store::local::LocalFileSystem;
         use tempfile::tempdir;
 
@@ -3045,7 +3233,7 @@ mod tests {
         let tmp_path = tmp_dir.path();
         let table_root = tmp_path
             .to_str()
-            .ok_or_else(|| delta_kernel::Error::generic("Invalid path"))?;
+            .ok_or_else(|| delta_kernel::KernelError::generic("Invalid path"))?;
         let storage = Arc::new(LocalFileSystem::new());
 
         let protocol_and_metadata = METADATA
@@ -3068,19 +3256,17 @@ mod tests {
                     ]),
                 )
                 .await?;
-                Ok::<_, Box<dyn std::error::Error>>(())
+                Ok::<_, delta_kernel::KernelError>(())
             })?;
         }
 
         let builder = unsafe {
             ok_or_panic(get_engine_builder(
                 kernel_string_slice!(table_root),
-                allocate_err,
+                &TEST_ERROR_ALLOCATORS,
             ))
         };
-        unsafe {
-            set_builder_with_io_concurrency(builder.as_mut().unwrap(), buffer_size, batch_size)
-        };
+        let builder = unsafe { builder_with_io_concurrency(builder, buffer_size, batch_size) };
         let engine = unsafe { ok_or_panic(builder_build(builder)) };
 
         let snapshot =
@@ -3094,7 +3280,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_snapshot_partition_cols() -> Result<(), Box<dyn std::error::Error>> {
+    async fn test_snapshot_partition_cols() -> KernelResult<()> {
         let storage = Arc::new(InMemory::new());
         let table_root = "memory:///test_table/";
 
@@ -3106,7 +3292,7 @@ mod tests {
         )
         .await?;
         let engine = DefaultEngineBuilder::new(storage.clone()).build();
-        let engine = engine_to_handle(Arc::new(engine), allocate_err);
+        let engine = engine_to_handle(Arc::new(engine), TEST_ERROR_ALLOCATORS);
 
         let snapshot =
             unsafe { build_snapshot(kernel_string_slice!(table_root), engine.shallow_copy()) };
@@ -3116,7 +3302,7 @@ mod tests {
 
         let partition_iter = unsafe { get_partition_columns(snapshot.shallow_copy()) };
 
-        #[no_mangle]
+        #[unsafe(no_mangle)]
         extern "C" fn visit_partition(_context: NullableCvoid, slice: KernelStringSlice) {
             let s = unsafe { String::try_from_slice(&slice) }.unwrap();
             assert_eq!(s.as_str(), "val", "Partition col should be 'val'");
@@ -3132,7 +3318,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn allocate_null_err_okay() -> Result<(), Box<dyn std::error::Error>> {
+    async fn allocate_null_err_okay() -> KernelResult<()> {
         let storage = Arc::new(InMemory::new());
         let table_root = "memory:///";
 
@@ -3144,15 +3330,21 @@ mod tests {
         )
         .await?;
         let engine = DefaultEngineBuilder::new(storage.clone()).build();
-        let engine = engine_to_handle(Arc::new(engine), allocate_null_err);
+        let engine = engine_to_handle(
+            Arc::new(engine),
+            ErrorAllocators {
+                allocate_kernel_error: allocate_null_err,
+                ..TEST_ERROR_ALLOCATORS
+            },
+        );
 
         // Get a non-existent snapshot, this will call allocate_null_err
         let snapshot_at_non_existent_version = unsafe {
-            let mut ptr = ok_or_panic(get_snapshot_builder(
+            let ptr = ok_or_panic(get_snapshot_builder(
                 kernel_string_slice!(table_root),
                 engine.shallow_copy(),
             ));
-            snapshot_builder_set_version(&mut ptr, 1);
+            let ptr = snapshot_builder_with_version(ptr, 1);
             snapshot_builder_build(ptr)
         };
         assert!(snapshot_at_non_existent_version.is_err());
@@ -3162,7 +3354,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_snapshot_log_tail() -> Result<(), Box<dyn std::error::Error>> {
+    async fn test_snapshot_log_tail() -> KernelResult<()> {
         let table_root = "memory:///test_table/";
         let (storage, engine, snap) =
             make_catalog_managed_engine_and_v0_snapshot(table_root).await?;
@@ -3188,12 +3380,12 @@ mod tests {
             len: log_tail.len(),
         };
         let snapshot = unsafe {
-            let mut ptr = ok_or_panic(get_snapshot_builder(
+            let ptr = ok_or_panic(get_snapshot_builder(
                 kernel_string_slice!(table_root),
                 engine.shallow_copy(),
             ));
-            ok_or_panic(snapshot_builder_set_log_tail(&mut ptr, log_tail.clone()));
-            snapshot_builder_set_max_catalog_version(&mut ptr, 1);
+            let ptr = ok_or_panic(snapshot_builder_with_log_tail(ptr, log_tail.clone()));
+            let ptr = snapshot_builder_with_max_catalog_version(ptr, 1);
             ok_or_panic(snapshot_builder_build(ptr))
         };
         let snapshot_version = unsafe { version(snapshot.shallow_copy()) };
@@ -3211,23 +3403,23 @@ mod tests {
         };
         assert_extern_result_error_with_message(
             invalid_snapshot,
-            KernelError::GenericError,
+            FFIKernelError::MaxCatalogVersionError,
             Some(concat!(
                 "Max catalog version error: Max catalog version is required when providing ",
-                "staged commits in the log tail. ",
+                "staged commits. ",
                 "Use with_max_catalog_version()."
             )),
         );
 
         // Test getting snapshot at version
         let snapshot2 = unsafe {
-            let mut ptr = ok_or_panic(get_snapshot_builder(
+            let ptr = ok_or_panic(get_snapshot_builder(
                 kernel_string_slice!(table_root),
                 engine.shallow_copy(),
             ));
-            snapshot_builder_set_version(&mut ptr, 1);
-            ok_or_panic(snapshot_builder_set_log_tail(&mut ptr, log_tail));
-            snapshot_builder_set_max_catalog_version(&mut ptr, 1);
+            let ptr = snapshot_builder_with_version(ptr, 1);
+            let ptr = ok_or_panic(snapshot_builder_with_log_tail(ptr, log_tail));
+            let ptr = snapshot_builder_with_max_catalog_version(ptr, 1);
             ok_or_panic(snapshot_builder_build(ptr))
         };
         let snapshot_version = unsafe { version(snapshot2.shallow_copy()) };
@@ -3239,9 +3431,67 @@ mod tests {
         Ok(())
     }
 
+    #[rstest]
+    #[case::catalog_managed_without_max_catalog_version(
+        true,
+        None,
+        concat!(
+            "Max catalog version error: Max catalog version is required when loading a ",
+            "catalog-managed table. Use with_max_catalog_version()."
+        )
+    )]
+    #[case::non_catalog_managed_with_max_catalog_version(
+        false,
+        Some(0),
+        concat!(
+            "Max catalog version error: Max catalog version 0 must not be set for a ",
+            "non-catalog-managed table"
+        )
+    )]
     #[tokio::test]
-    async fn test_builder_from_existing_snapshot_advances_to_latest_and_pinned_version(
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    async fn test_snapshot_catalog_managed_mode_mismatch_returns_typed_error(
+        #[case] catalog_managed: bool,
+        #[case] max_catalog_version: Option<Version>,
+        #[case] expected_message: &str,
+    ) -> KernelResult<()> {
+        let storage = Arc::new(InMemory::new());
+        let table_root = "memory:///test_table/";
+        let actions = if catalog_managed {
+            actions_to_string_catalog_managed(vec![TestAction::Metadata])
+        } else {
+            actions_to_string(vec![TestAction::Metadata])
+        };
+        add_commit(table_root, storage.as_ref(), 0, actions).await?;
+        let engine = engine_to_handle(
+            Arc::new(DefaultEngineBuilder::new(storage).build()),
+            TEST_ERROR_ALLOCATORS,
+        );
+
+        let result = unsafe {
+            let builder = ok_or_panic(get_snapshot_builder(
+                kernel_string_slice!(table_root),
+                engine.shallow_copy(),
+            ));
+            let builder = if let Some(max_catalog_version) = max_catalog_version {
+                snapshot_builder_with_max_catalog_version(builder, max_catalog_version)
+            } else {
+                builder
+            };
+            snapshot_builder_build(builder)
+        };
+        assert_extern_result_error_with_message(
+            result,
+            FFIKernelError::MaxCatalogVersionError,
+            Some(expected_message),
+        );
+
+        unsafe { free_engine(engine) }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_builder_from_existing_snapshot_advances_to_latest_and_pinned_version()
+    -> KernelResult<()> {
         let path = "memory:///";
         let (storage, engine, snapshot_at_v0) = make_engine_and_v0_snapshot(path).await?;
         assert_eq!(unsafe { version(snapshot_at_v0.shallow_copy()) }, 0);
@@ -3271,11 +3521,11 @@ mod tests {
         assert_eq!(unsafe { version(snapshot_at_v2.shallow_copy()) }, 2);
 
         let snapshot_at_v1 = unsafe {
-            let mut ptr = ok_or_panic(get_snapshot_builder_from(
+            let ptr = ok_or_panic(get_snapshot_builder_from(
                 snapshot_at_v0.shallow_copy(),
                 engine.shallow_copy(),
             ));
-            snapshot_builder_set_version(&mut ptr, 1);
+            let ptr = snapshot_builder_with_version(ptr, 1);
             ok_or_panic(snapshot_builder_build(ptr))
         };
         assert_eq!(unsafe { version(snapshot_at_v1.shallow_copy()) }, 1);
@@ -3288,8 +3538,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_builder_from_existing_snapshot_rejects_earlier_version(
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    async fn test_builder_from_existing_snapshot_rejects_earlier_version() -> KernelResult<()> {
         let path = "memory:///";
         let (storage, engine, snapshot_at_v0) = make_engine_and_v0_snapshot(path).await?;
 
@@ -3320,17 +3569,19 @@ mod tests {
 
         // pinning to a version older than the hint snapshot is rejected
         let result = unsafe {
-            let mut ptr = ok_or_panic(get_snapshot_builder_from(
+            let ptr = ok_or_panic(get_snapshot_builder_from(
                 snapshot_at_v2.shallow_copy(),
                 engine.shallow_copy(),
             ));
-            snapshot_builder_set_version(&mut ptr, 1);
+            let ptr = snapshot_builder_with_version(ptr, 1);
             snapshot_builder_build(ptr)
         };
         assert_extern_result_error_with_message(
             result,
-            KernelError::GenericError,
-            Some("Generic delta kernel error: Requested snapshot version 1 is older than snapshot hint version 2"),
+            FFIKernelError::GenericError,
+            Some(
+                "Generic delta kernel error: Requested snapshot version 1 is older than snapshot hint version 2",
+            ),
         );
 
         unsafe { free_snapshot(snapshot_at_v2) }
@@ -3340,8 +3591,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_snapshot_with_prev_snapshot_and_log_tail(
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    async fn test_snapshot_with_prev_snapshot_and_log_tail() -> KernelResult<()> {
         let path = "memory:///";
         let (storage, engine, snapshot_at_v0) =
             make_catalog_managed_engine_and_v0_snapshot(path).await?;
@@ -3387,27 +3637,24 @@ mod tests {
         };
 
         let snapshot_at_v2 = unsafe {
-            let mut ptr = ok_or_panic(get_snapshot_builder_from(
+            let ptr = ok_or_panic(get_snapshot_builder_from(
                 snapshot_at_v0.shallow_copy(),
                 engine.shallow_copy(),
             ));
-            ok_or_panic(snapshot_builder_set_log_tail(
-                &mut ptr,
-                log_tail_array.clone(),
-            ));
-            snapshot_builder_set_max_catalog_version(&mut ptr, 2);
+            let ptr = ok_or_panic(snapshot_builder_with_log_tail(ptr, log_tail_array.clone()));
+            let ptr = snapshot_builder_with_max_catalog_version(ptr, 2);
             ok_or_panic(snapshot_builder_build(ptr))
         };
         assert_eq!(unsafe { version(snapshot_at_v2.shallow_copy()) }, 2);
 
         let snapshot_at_v1 = unsafe {
-            let mut ptr = ok_or_panic(get_snapshot_builder_from(
+            let ptr = ok_or_panic(get_snapshot_builder_from(
                 snapshot_at_v0.shallow_copy(),
                 engine.shallow_copy(),
             ));
-            snapshot_builder_set_version(&mut ptr, 1);
-            ok_or_panic(snapshot_builder_set_log_tail(&mut ptr, log_tail_array));
-            snapshot_builder_set_max_catalog_version(&mut ptr, 2);
+            let ptr = snapshot_builder_with_version(ptr, 1);
+            let ptr = ok_or_panic(snapshot_builder_with_log_tail(ptr, log_tail_array));
+            let ptr = snapshot_builder_with_max_catalog_version(ptr, 2);
             ok_or_panic(snapshot_builder_build(ptr))
         };
         assert_eq!(unsafe { version(snapshot_at_v1.shallow_copy()) }, 1);
@@ -3420,8 +3667,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_builder_from_table_path_builds_latest_version(
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    async fn test_builder_from_table_path_builds_latest_version() -> KernelResult<()> {
         let storage = Arc::new(InMemory::new());
         let path = "memory:///";
         add_commit(
@@ -3440,7 +3686,7 @@ mod tests {
         .await?;
         let engine = engine_to_handle(
             Arc::new(DefaultEngineBuilder::new(storage).build()),
-            allocate_err,
+            TEST_ERROR_ALLOCATORS,
         );
 
         let snapshot_at_v1 = unsafe {
@@ -3458,8 +3704,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_free_snapshot_builder_without_building() -> Result<(), Box<dyn std::error::Error>>
-    {
+    async fn test_free_snapshot_builder_without_building() -> KernelResult<()> {
         let path = "memory:///";
         let (_, engine, snap) = make_engine_and_v0_snapshot(path).await?;
         unsafe { free_snapshot(snap) };
@@ -3477,6 +3722,20 @@ mod tests {
     }
 
     // === Shared visitor state and callbacks for protocol/metadata tests ===
+
+    const METADATA_WITH_FORMAT_OPTIONS: &str = concat!(
+        r#"{"commitInfo":{"timestamp":1587968586154,"operation":"WRITE","#,
+        r#""operationParameters":{},"isBlindAppend":true}}"#,
+        "\n",
+        r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}"#,
+        "\n",
+        r#"{"metaData":{"id":"5fba94ed-9794-4965-ba6e-6ee3c0d22af9","#,
+        r#""name":"my_table","description":"A test table","#,
+        r#""format":{"provider":"parquet","options":{"compression":"zstd","#,
+        r#""custom.option":"arbitrary value"}},"#,
+        r#""schemaString":"{\"type\":\"struct\",\"fields\":[]}","#,
+        r#""partitionColumns":[],"configuration":{},"createdTime":1587968585495}}"#,
+    );
 
     struct ProtocolVisitState {
         min_reader: i32,
@@ -3533,71 +3792,10 @@ mod tests {
         state
     }
 
-    struct MetadataVisitState {
-        id: Option<String>,
-        name: Option<String>,
-        description: Option<String>,
-        format_provider: Option<String>,
-        has_created_time: bool,
-        created_time_ms: i64,
-    }
-
-    impl MetadataVisitState {
-        fn new() -> Self {
-            Self {
-                id: None,
-                name: None,
-                description: None,
-                format_provider: None,
-                has_created_time: false,
-                created_time_ms: 0,
-            }
-        }
-    }
-
-    /// Convert a [`KernelStringSlice`] to a [`String`] (test-only helper).
-    fn slice_to_string(slice: KernelStringSlice) -> String {
-        unsafe { String::try_from_slice(&slice) }.unwrap()
-    }
-
-    extern "C" fn metadata_visit_cb(
-        ctx: NullableCvoid,
-        id: KernelStringSlice,
-        name: OptionalValue<KernelStringSlice>,
-        description: OptionalValue<KernelStringSlice>,
-        format_provider: KernelStringSlice,
-        has_created_time: bool,
-        created_time_ms: i64,
-    ) {
-        let state = unsafe { &mut *(ctx.unwrap().as_ptr() as *mut MetadataVisitState) };
-        state.id = Some(slice_to_string(id));
-        state.name = match name {
-            OptionalValue::Some(s) => Some(slice_to_string(s)),
-            OptionalValue::None => None,
-        };
-        state.description = match description {
-            OptionalValue::Some(s) => Some(slice_to_string(s)),
-            OptionalValue::None => None,
-        };
-        state.format_provider = Some(slice_to_string(format_provider));
-        state.has_created_time = has_created_time;
-        state.created_time_ms = created_time_ms;
-    }
-
-    /// Visit metadata on a snapshot and return the collected state.
-    fn collect_metadata_state(snap: &handle::Handle<SharedSnapshot>) -> MetadataVisitState {
-        let meta = unsafe { snapshot_get_metadata(snap.shallow_copy()) };
-        let mut state = MetadataVisitState::new();
-        let ctx = NonNull::new(&mut state as *mut MetadataVisitState as *mut c_void);
-        unsafe { visit_metadata(meta.shallow_copy(), ctx, metadata_visit_cb) };
-        unsafe { free_metadata(meta) };
-        state
-    }
-
     // === visit_protocol tests ===
 
     #[tokio::test]
-    async fn test_visit_protocol_legacy() -> Result<(), Box<dyn std::error::Error>> {
+    async fn test_visit_protocol_legacy() -> KernelResult<()> {
         let (engine, snap) = setup_snapshot(METADATA.to_string()).await?;
         let state = collect_protocol_state(&snap);
 
@@ -3612,12 +3810,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_builder_with_nonexistent_path_returns_error(
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    async fn test_builder_with_nonexistent_path_returns_error() -> KernelResult<()> {
         let storage = Arc::new(InMemory::new());
         let engine = engine_to_handle(
             Arc::new(DefaultEngineBuilder::new(storage).build()),
-            allocate_err,
+            TEST_ERROR_ALLOCATORS,
         );
 
         let result = unsafe {
@@ -3626,7 +3823,7 @@ mod tests {
         };
         assert_extern_result_error_with_message(
             result,
-            KernelError::InvalidTableLocationError,
+            FFIKernelError::InvalidTableLocationError,
             None,
         );
 
@@ -3635,28 +3832,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_builder_at_nonexistent_version_returns_error(
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    async fn test_builder_at_nonexistent_version_returns_error() -> KernelResult<()> {
         let path = "memory:///";
         let (_, engine, snap) = make_engine_and_v0_snapshot(path).await?;
         unsafe { free_snapshot(snap) };
 
         let result = unsafe {
-            let mut ptr = ok_or_panic(get_snapshot_builder(
+            let ptr = ok_or_panic(get_snapshot_builder(
                 kernel_string_slice!(path),
                 engine.shallow_copy(),
             ));
-            snapshot_builder_set_version(&mut ptr, 99);
+            let ptr = snapshot_builder_with_version(ptr, 99);
             snapshot_builder_build(ptr)
         };
-        assert_extern_result_error_with_message(result, KernelError::GenericError, None);
+        assert_extern_result_error_with_message(
+            result,
+            FFIKernelError::MissingVersionError,
+            Some("Table version 1 is missing or unavailable for this log operation."),
+        );
 
         unsafe { free_engine(engine) }
         Ok(())
     }
 
     #[tokio::test]
-    async fn test_visit_protocol_with_features() -> Result<(), Box<dyn std::error::Error>> {
+    async fn test_visit_protocol_with_features() -> KernelResult<()> {
         let (engine, snap) = setup_snapshot(METADATA_WITH_FEATURES.to_string()).await?;
         let state = collect_protocol_state(&snap);
 
@@ -3672,92 +3872,99 @@ mod tests {
         Ok(())
     }
 
+    const METADATA_WITHOUT_CREATED_TIME: &str = concat!(
+        r#"{"commitInfo":{"timestamp":1587968586154,"operation":"WRITE","operationParameters":{},"isBlindAppend":true}}"#,
+        "\n",
+        r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}"#,
+        "\n",
+        r#"{"metaData":{"id":"5fba94ed-9794-4965-ba6e-6ee3c0d22af9","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[]}","partitionColumns":[],"configuration":{}}}"#,
+    );
+
+    #[rstest]
+    #[case::default(
+        METADATA,
+        "5fba94ed-9794-4965-ba6e-6ee3c0d22af9",
+        None,
+        None,
+        Some(1587968585495),
+        &[],
+        &[]
+    )]
+    #[case::with_name_and_configuration(
+        METADATA_WITH_FEATURES,
+        "deadbeef-1234-5678-abcd-000000000000",
+        Some("test_table"),
+        None,
+        Some(1234567890000),
+        &[],
+        &[
+            ("delta.columnMapping.mode", "name"),
+            ("delta.rowTracking.enabled", "true"),
+            ("delta.rowTracking.materializedRowIdColumnName", "_row_id"),
+            ("delta.rowTracking.materializedRowCommitVersionColumnName", "_row_commit_version"),
+        ]
+    )]
+    #[case::with_description_and_format_options(
+        METADATA_WITH_FORMAT_OPTIONS,
+        "5fba94ed-9794-4965-ba6e-6ee3c0d22af9",
+        Some("my_table"),
+        Some("A test table"),
+        Some(1587968585495),
+        &[("compression", "zstd"), ("custom.option", "arbitrary value")],
+        &[]
+    )]
+    #[case::with_table_properties(
+        METADATA_WITH_TABLE_PROPERTIES,
+        "5fba94ed-9794-4965-ba6e-6ee3c0d22af9",
+        None,
+        None,
+        Some(1587968585495),
+        &[],
+        &[("delta.appendOnly", "true"), ("custom.key", "custom_value")]
+    )]
+    #[case::without_created_time(
+        METADATA_WITHOUT_CREATED_TIME,
+        "5fba94ed-9794-4965-ba6e-6ee3c0d22af9",
+        None,
+        None,
+        None,
+        &[],
+        &[]
+    )]
     #[tokio::test]
-    async fn test_visit_metadata_default() -> Result<(), Box<dyn std::error::Error>> {
-        let (engine, snap) = setup_snapshot(METADATA.to_string()).await?;
-        let state = collect_metadata_state(&snap);
+    async fn test_visit_metadata(
+        #[case] metadata: &str,
+        #[case] id: &str,
+        #[case] name: Option<&str>,
+        #[case] description: Option<&str>,
+        #[case] created_time: Option<i64>,
+        #[case] format_options: &[(&str, &str)],
+        #[case] configuration: &[(&str, &str)],
+    ) -> KernelResult<()> {
+        fn to_map(entries: &[(&str, &str)]) -> HashMap<String, String> {
+            entries
+                .iter()
+                .map(|(key, value)| (key.to_string(), value.to_string()))
+                .collect()
+        }
+        // Copies the borrowed view into an owned `Metadata` before the callback returns.
+        extern "C" fn collect(ctx: NullableCvoid, metadata: *const delta_types::FfiMetadata) {
+            let result = unsafe { &mut *(ctx.unwrap().as_ptr() as *mut Option<Metadata>) };
+            *result = Some(unsafe { (*metadata).try_to_kernel() }.unwrap());
+        }
+        let (engine, snap) = setup_snapshot(metadata.to_string()).await?;
 
-        assert_eq!(
-            state.id.as_deref(),
-            Some("5fba94ed-9794-4965-ba6e-6ee3c0d22af9")
-        );
-        assert!(
-            state.name.is_none(),
-            "name should be None for default metadata"
-        );
-        assert!(
-            state.description.is_none(),
-            "description should be None for default metadata"
-        );
-        assert_eq!(state.format_provider.as_deref(), Some("parquet"));
-        assert!(state.has_created_time);
-        assert_eq!(state.created_time_ms, 1587968585495);
-
-        unsafe { free_snapshot(snap) };
-        unsafe { free_engine(engine) };
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_visit_metadata_with_name() -> Result<(), Box<dyn std::error::Error>> {
-        let (engine, snap) = setup_snapshot(METADATA_WITH_FEATURES.to_string()).await?;
-        let state = collect_metadata_state(&snap);
-
-        assert_eq!(
-            state.id.as_deref(),
-            Some("deadbeef-1234-5678-abcd-000000000000")
-        );
-        assert_eq!(state.name.as_deref(), Some("test_table"));
-        assert!(state.description.is_none(), "description should be None");
-        assert_eq!(state.format_provider.as_deref(), Some("parquet"));
-        assert!(state.has_created_time);
-        assert_eq!(state.created_time_ms, 1234567890000);
-
-        unsafe { free_snapshot(snap) };
-        unsafe { free_engine(engine) };
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_visit_metadata_with_description() -> Result<(), Box<dyn std::error::Error>> {
-        let metadata_with_desc = concat!(
-            r#"{"commitInfo":{"timestamp":1587968586154,"operation":"WRITE","operationParameters":{},"isBlindAppend":true}}"#,
-            "\n",
-            r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}"#,
-            "\n",
-            r#"{"metaData":{"id":"5fba94ed-9794-4965-ba6e-6ee3c0d22af9","name":"my_table","description":"A test table","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[]}","partitionColumns":[],"configuration":{},"createdTime":1587968585495}}"#,
-        );
-        let (engine, snap) = setup_snapshot(metadata_with_desc.to_string()).await?;
-        let state = collect_metadata_state(&snap);
-
-        assert_eq!(state.name.as_deref(), Some("my_table"));
-        assert_eq!(state.description.as_deref(), Some("A test table"));
-        assert_eq!(state.format_provider.as_deref(), Some("parquet"));
-        assert!(state.has_created_time);
-
-        unsafe { free_snapshot(snap) };
-        unsafe { free_engine(engine) };
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_visit_metadata_without_created_time() -> Result<(), Box<dyn std::error::Error>> {
-        let metadata_no_time = concat!(
-            r#"{"commitInfo":{"timestamp":1587968586154,"operation":"WRITE","operationParameters":{},"isBlindAppend":true}}"#,
-            "\n",
-            r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}"#,
-            "\n",
-            r#"{"metaData":{"id":"5fba94ed-9794-4965-ba6e-6ee3c0d22af9","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[]}","partitionColumns":[],"configuration":{}}}"#,
-        );
-        let (engine, snap) = setup_snapshot(metadata_no_time.to_string()).await?;
-        let state = collect_metadata_state(&snap);
-
-        assert_eq!(
-            state.id.as_deref(),
-            Some("5fba94ed-9794-4965-ba6e-6ee3c0d22af9")
-        );
-        assert!(!state.has_created_time);
-        assert_eq!(state.created_time_ms, 0);
+        let mut visited: Option<Metadata> = None;
+        let ctx = Some(NonNull::from(&mut visited).cast());
+        unsafe { snapshot_visit_metadata(snap.shallow_copy(), ctx, collect) };
+        let visited = visited.expect("visitor was not invoked");
+        assert_eq!(visited.id(), id);
+        assert_eq!(visited.name(), name);
+        assert_eq!(visited.description(), description);
+        assert_eq!(visited.format_provider(), "parquet");
+        assert_eq!(visited.format_options(), &to_map(format_options));
+        assert_eq!(visited.created_time(), created_time);
+        assert_eq!(visited.configuration(), &to_map(configuration));
 
         unsafe { free_snapshot(snap) };
         unsafe { free_engine(engine) };

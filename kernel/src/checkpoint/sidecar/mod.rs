@@ -6,12 +6,12 @@ use crate::action_reconciliation::ActionReconciliationIterator;
 use crate::actions::{ADD_NAME, REMOVE_NAME, SIDECAR_NAME};
 use crate::engine_data::filter_by_predicate;
 use crate::expressions::{
-    col, null_lit, Expression, ExpressionStructPatchBuilder, Predicate, Scalar, StructData,
+    Expression, ExpressionStructPatchBuilder, Predicate, Scalar, StructData, col, expr, null_lit,
 };
-use crate::schema::{try_schema, DataType, SchemaRef, StructField};
+use crate::schema::{DataType, SchemaRef, StructField, try_schema};
 use crate::{
-    DeltaResult, Engine, EngineData, Error, EvaluationHandler, ExpressionEvaluator, FileMeta,
-    PredicateEvaluator,
+    Engine, EngineData, EvaluationHandler, ExpressionEvaluator, FileMeta, KernelError,
+    KernelResult, PredicateEvaluator,
 };
 
 /// Field names of the `sidecar` action struct.
@@ -35,7 +35,7 @@ pub(super) fn create_sidecar_action_batch(
     engine: &dyn Engine,
     checkpoint_data_schema: &SchemaRef,
     sidecar_metas: &[(String, FileMeta)],
-) -> DeltaResult<Option<Box<dyn EngineData>>> {
+) -> KernelResult<Option<Box<dyn EngineData>>> {
     if sidecar_metas.is_empty() {
         return Ok(None);
     }
@@ -46,9 +46,9 @@ pub(super) fn create_sidecar_action_batch(
         .iter()
         .enumerate()
         .find(|(_, f)| f.name() == SIDECAR_NAME)
-        .ok_or_else(|| Error::internal_error("checkpoint schema missing sidecar field"))?;
+        .ok_or_else(|| KernelError::internal_error("checkpoint schema missing sidecar field"))?;
     let DataType::Struct(sidecar_struct) = sidecar_field.data_type() else {
-        return Err(Error::internal_error(format!(
+        return Err(KernelError::internal_error(format!(
             "expected sidecar field to be struct, got {:?}",
             sidecar_field.data_type()
         )));
@@ -64,7 +64,7 @@ pub(super) fn create_sidecar_action_batch(
     // Build one row per sidecar.
     let rows: Vec<Vec<Scalar>> = sidecar_metas
         .iter()
-        .map(|(filename, meta)| -> DeltaResult<Vec<Scalar>> {
+        .map(|(filename, meta)| -> KernelResult<Vec<Scalar>> {
             let size_in_bytes = meta.size_as_i64()?;
 
             // Sidecar struct values, ordered to match `sidecar_fields`.
@@ -81,7 +81,7 @@ pub(super) fn create_sidecar_action_batch(
                     // We explicitly fill it with `Scalar::Null` here, since
                     // `StructData::try_new` requires one value per schema field.
                     SIDECAR_SCHEMA_TAGS => Ok(Scalar::Null(field.data_type().clone())),
-                    other => Err(Error::CheckpointWrite(format!(
+                    other => Err(KernelError::CheckpointWrite(format!(
                         "Unexpected sidecar field: {other}"
                     ))),
                 })
@@ -94,10 +94,9 @@ pub(super) fn create_sidecar_action_batch(
         })
         .try_collect()?;
 
-    let row_refs: Vec<&[Scalar]> = rows.iter().map(Vec::as_slice).collect();
     let batch = engine
         .evaluation_handler()
-        .create_many(checkpoint_data_schema.clone(), &row_refs)?;
+        .create_many(checkpoint_data_schema.clone(), rows)?;
     Ok(Some(batch))
 }
 
@@ -108,7 +107,7 @@ struct NonNullRowsPicker {
 }
 
 impl NonNullRowsPicker {
-    fn pick(&self, batch: &dyn EngineData) -> DeltaResult<Box<dyn EngineData>> {
+    fn pick(&self, batch: &dyn EngineData) -> KernelResult<Box<dyn EngineData>> {
         let transformed = self.transform.evaluate(batch)?;
         filter_by_predicate(self.null_row_filter.as_ref(), transformed)
     }
@@ -158,23 +157,25 @@ impl SidecarSplitter {
         checkpoint_data_iterator: ActionReconciliationIterator,
         eval_handler: &dyn EvaluationHandler,
         checkpoint_data_schema: SchemaRef,
-    ) -> DeltaResult<Self> {
+    ) -> KernelResult<Self> {
         // Derive sidecar output schema from the checkpoint data schema (add + remove only).
         let add_field = checkpoint_data_schema.field(ADD_NAME).ok_or_else(|| {
-            Error::checkpoint_write(format!("Checkpoint data schema missing '{ADD_NAME}' field"))
+            KernelError::checkpoint_write(format!(
+                "Checkpoint data schema missing '{ADD_NAME}' field"
+            ))
         })?;
         let remove_field = checkpoint_data_schema.field(REMOVE_NAME).ok_or_else(|| {
-            Error::checkpoint_write(format!(
+            KernelError::checkpoint_write(format!(
                 "Checkpoint data schema missing '{REMOVE_NAME}' field"
             ))
         })?;
         if !add_field.is_nullable() {
-            return Err(Error::checkpoint_write(format!(
+            return Err(KernelError::checkpoint_write(format!(
                 "Checkpoint data schema '{ADD_NAME}' field must be nullable"
             )));
         }
         if !remove_field.is_nullable() {
-            return Err(Error::checkpoint_write(format!(
+            return Err(KernelError::checkpoint_write(format!(
                 "Checkpoint data schema '{REMOVE_NAME}' field must be nullable"
             )));
         }
@@ -194,8 +195,8 @@ impl SidecarSplitter {
         let file_actions_null_row_filter = eval_handler.new_predicate_evaluator(
             sidecar_output_schema,
             Arc::new(Predicate::or(
-                Predicate::is_not_null(col!(ADD_NAME)),
-                Predicate::is_not_null(col!(REMOVE_NAME)),
+                col!(ADD_NAME).is_not_null(),
+                col!(REMOVE_NAME).is_not_null(),
             )),
         )?;
 
@@ -217,7 +218,7 @@ impl SidecarSplitter {
                 checkpoint_data_schema
                     .fields()
                     .filter(|f| f.name != ADD_NAME && f.name != REMOVE_NAME)
-                    .map(|f| Expression::column([&f.name]).is_not_null()),
+                    .map(|f| Predicate::from_expr(expr!(is_not_null(path(&f.name))))),
             );
             eval_handler.new_predicate_evaluator(checkpoint_data_schema, Arc::new(predicate))?
         };
@@ -239,12 +240,12 @@ impl SidecarSplitter {
 
     /// Creates a new `SidecarSplitter` wrapped in `Arc<Mutex<_>>` for
     /// shared mutable access. This is useful for passing [`SingleSidecarDataIterator`] to
-    /// [`ParquetHandler::write_parquet_file`], which requires `Box<dyn Iterator + Send>`.
+    /// [`ParquetHandler::write_parquet_file`], which requires `Box<dyn KernelResultIterator<_>>`.
     pub(super) fn new_mut_shared(
         checkpoint_data_iterator: ActionReconciliationIterator,
         eval_handler: &dyn EvaluationHandler,
         checkpoint_data_schema: SchemaRef,
-    ) -> DeltaResult<Arc<Mutex<Self>>> {
+    ) -> KernelResult<Arc<Mutex<Self>>> {
         Self::new(
             checkpoint_data_iterator,
             eval_handler,
@@ -265,7 +266,7 @@ impl SidecarSplitter {
     /// Pull the next batch from the inner iterator, split it into file-action and non-file-action
     /// parts. Buffers the non-file-action part; returns the next non-empty file-action batch.
     /// Returns `None` and sets `exhausted` when the inner iterator is exhausted.
-    fn next_file_actions_batch(&mut self) -> Option<DeltaResult<Box<dyn EngineData>>> {
+    fn next_file_actions_batch(&mut self) -> Option<KernelResult<Box<dyn EngineData>>> {
         loop {
             let result = self.checkpoint_data_iter.next().or_else(|| {
                 self.exhausted = true;
@@ -303,9 +304,9 @@ impl SingleSidecarDataIterator {
     pub(super) fn new(
         splitter: Arc<Mutex<SidecarSplitter>>,
         max_file_actions_hint: usize,
-    ) -> DeltaResult<Self> {
+    ) -> KernelResult<Self> {
         if max_file_actions_hint == 0 {
-            return Err(Error::checkpoint_write(
+            return Err(KernelError::checkpoint_write(
                 "max_file_actions_hint must be greater than 0",
             ));
         }
@@ -318,7 +319,7 @@ impl SingleSidecarDataIterator {
 }
 
 impl Iterator for SingleSidecarDataIterator {
-    type Item = DeltaResult<Box<dyn EngineData>>;
+    type Item = KernelResult<Box<dyn EngineData>>;
 
     /// Yields the next file-action batch for current sidecar.
     ///
@@ -332,9 +333,9 @@ impl Iterator for SingleSidecarDataIterator {
         let mut splitter = match self.splitter.lock() {
             Ok(guard) => guard,
             Err(e) => {
-                return Some(Err(Error::internal_error(format!(
+                return Some(Err(KernelError::internal_error(format!(
                     "sidecar splitter lock poisoned: {e}"
-                ))))
+                ))));
             }
         };
         match splitter.next_file_actions_batch() {

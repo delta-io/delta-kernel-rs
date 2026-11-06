@@ -5,15 +5,15 @@ use std::time::Instant;
 
 use tracing::field::{Field, Visit};
 use tracing::span::{Attributes, Id, Record};
-use tracing::{event, warn, Level, Span, Subscriber};
-use tracing_subscriber::layer::Context;
+use tracing::{Level, Span, Subscriber, event, warn};
 use tracing_subscriber::Layer;
+use tracing_subscriber::layer::Context;
 
 use super::events::{
-    storage_metric_from_attrs, CrcReadSuccess, DomainMetadataLoadSuccess, JsonReadCompleted,
-    LogSegmentLoadSuccess, MetricEvent, ParquetReadCompleted, ProtocolMetadataLoadSuccess,
+    CrcReadSuccess, DomainMetadataLoadSuccess, JsonReadCompleted, LogSegmentLoadSuccess,
+    MetricEvent, ParquetReadCompleted, ProtocolMetadataLoadSuccess, STORAGE_SPAN,
     ScanMetadataCompleted, SetTransactionLoadSuccess, SnapshotBuildSuccess,
-    TransactionCommitSuccess, STORAGE_SPAN,
+    TransactionCommitSuccess, storage_metric_from_attrs,
 };
 
 // ====================================================================
@@ -298,7 +298,7 @@ mod tests {
     use std::io::Error;
     use std::sync::{Arc, Mutex};
 
-    use test_utils::{ensure_metrics_compatible_global_subscriber, LogWriter};
+    use test_utils::{LogWriter, ensure_metrics_compatible_global_subscriber};
     use tracing::field::Empty;
     use tracing::subscriber::with_default;
     use tracing::{info, info_span, instrument};
@@ -309,7 +309,7 @@ mod tests {
 
     use crate::metrics::events::SNAPSHOT_COMPLETED_SPAN;
     use crate::metrics::{MetricEvent, WithMetricsReporterLayer as _};
-    use crate::unit_test_utils::{install_thread_local_metrics_reporter, CapturingReporter};
+    use crate::unit_test_utils::{CapturingReporter, install_thread_local_metrics_reporter};
 
     /// Run `f` under a subscriber that layers the metrics layer over an fmt layer capturing to a
     /// buffer, and return the captured log text -- so a test can assert on the warnings the metrics

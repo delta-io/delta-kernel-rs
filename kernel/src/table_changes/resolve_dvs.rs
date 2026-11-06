@@ -3,7 +3,7 @@ use url::Url;
 use super::scan_file::CdfScanFileType;
 use crate::actions::deletion_vector::{deletion_treemap_to_bools, selection_treemap_to_bools};
 use crate::table_changes::scan_file::CdfScanFile;
-use crate::{DeltaResult, Engine, Error};
+use crate::{Engine, KernelError, KernelResult};
 
 /// A [`CdfScanFile`] with its associated `selection_vector`. The `scan_type` is resolved to
 /// match the `_change_type` that its rows will have in the change data feed.
@@ -37,7 +37,7 @@ pub(crate) fn resolve_scan_file_dv(
     engine: &dyn Engine,
     table_root: &Url,
     scan_file: CdfScanFile,
-) -> DeltaResult<impl Iterator<Item = ResolvedCdfScanFile>> {
+) -> KernelResult<impl Iterator<Item = ResolvedCdfScanFile> + use<>> {
     let add_dv = scan_file.dv_info.get_treemap(engine, table_root)?;
     let rm_dv = scan_file
         .remove_dv
@@ -46,12 +46,12 @@ pub(crate) fn resolve_scan_file_dv(
         .transpose()?;
     let (add_dv, rm_dv) = match (add_dv, rm_dv, &scan_file.scan_type) {
         (_, Some(_), CdfScanFileType::Remove) => {
-            return Err(Error::generic(
+            return Err(KernelError::generic(
                 "CdfScanFile with type remove cannot have a remove deletion vector",
             ));
         }
         (_, Some(_), CdfScanFileType::Cdc) => {
-            return Err(Error::generic(
+            return Err(KernelError::generic(
                 "CdfScanFile with type cdc cannot have a remove deletion vector",
             ));
         }
@@ -163,11 +163,11 @@ mod tests {
     use roaring::RoaringTreemap;
 
     use super::resolve_scan_file_dv;
+    use crate::KernelError;
     use crate::actions::deletion_vector::{DeletionVectorDescriptor, DeletionVectorStorageType};
     use crate::engine::sync::SyncEngine;
     use crate::scan::state::DvInfo;
     use crate::table_changes::scan_file::{CdfScanFile, CdfScanFileType};
-    use crate::Error;
 
     fn treemap_to_dv_descriptor(map: RoaringTreemap) -> DeletionVectorDescriptor {
         let buf = Vec::new();
@@ -358,7 +358,7 @@ mod tests {
         let mut scan_file = get_scan_file(CdfScanFileType::Cdc, Default::default(), remove_dv);
 
         let expected_err =
-            Error::generic("CdfScanFile with type cdc cannot have a remove deletion vector");
+            KernelError::generic("CdfScanFile with type cdc cannot have a remove deletion vector");
 
         let res = resolve_scan_file_dv(&engine, &table_root, scan_file.clone())
             .err()
@@ -366,8 +366,9 @@ mod tests {
         assert_eq!(res.to_string(), expected_err.to_string());
 
         scan_file.scan_type = CdfScanFileType::Remove;
-        let expected_err =
-            Error::generic("CdfScanFile with type remove cannot have a remove deletion vector");
+        let expected_err = KernelError::generic(
+            "CdfScanFile with type remove cannot have a remove deletion vector",
+        );
         let res = resolve_scan_file_dv(&engine, &table_root, scan_file)
             .err()
             .unwrap();

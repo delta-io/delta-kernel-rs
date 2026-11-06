@@ -5,21 +5,24 @@ use std::sync::Arc;
 use itertools::Itertools;
 use url::Url;
 
-use super::log_replay::{table_changes_action_iter, TableChangesScanMetadata};
+use super::log_replay::{TableChangesScanMetadata, table_changes_action_iter};
 use super::physical_to_logical::{get_cdf_transform_expr, scan_file_physical_schema};
-use super::resolve_dvs::{resolve_scan_file_dv, ResolvedCdfScanFile};
+use super::resolve_dvs::{ResolvedCdfScanFile, resolve_scan_file_dv};
 use super::scan_file::scan_metadata_to_scan_file;
 use super::{CdfMode, TableChanges};
 use crate::actions::deletion_vector::split_vector;
 use crate::scan::field_classifiers::CdfTransformFieldClassifier;
 use crate::scan::state_info::StateInfo;
 use crate::scan::{PartitionValuesOptions, PhysicalPredicate, StatsOptions};
-use crate::schema::SchemaRef;
+use crate::schema::{MetadataColumnSpec, SchemaRef};
 use crate::utils::FoldWithOption as _;
-use crate::{DeltaResult, Engine, EngineData, Error, FileMeta, PredicateRef};
+use crate::{
+    Engine, EngineData, FileMeta, KernelError, KernelResult, KernelResultIterator, PredicateRef,
+};
 
 /// The result of building a [`TableChanges`] scan over a table. This can be used to get the change
 /// data feed from the table.
+// TODO(#3609): Support connector-provided timezone in CDF scans.
 #[derive(Debug)]
 pub struct TableChangesScan {
     // The [`TableChanges`] that specifies this scan's start and end versions
@@ -108,11 +111,11 @@ impl TableChangesScanBuilder {
     /// provided schema make sense, and to prepare some metadata that the scan will need.  The
     /// [`TableChangesScan`] type itself can be used to fetch the files and associated metadata
     /// required to perform actual data reads.
-    pub fn build(self) -> DeltaResult<TableChangesScan> {
+    pub fn build(self) -> KernelResult<TableChangesScan> {
         // Row-tracking CDF requires row-level reconciliation by row IDs, which this
         // scanner does not perform.
         if self.table_changes.mode != CdfMode::ChangeDataFeed {
-            return Err(Error::unsupported(
+            return Err(KernelError::unsupported(
                 "A row-tracking TableChanges cannot be scanned for data; use \
                  TableChanges::scan_file_listing instead",
             ));
@@ -123,6 +126,13 @@ impl TableChangesScanBuilder {
         let table_schema: SchemaRef = self.table_changes.schema().clone().into();
         // If no projection is supplied, default to the full CDF-extended schema (SELECT *).
         let logical_read_schema = self.schema.unwrap_or_else(|| table_schema.clone());
+        if logical_read_schema.contains_metadata_column(&MetadataColumnSpec::RowId)
+            || logical_read_schema.contains_metadata_column(&MetadataColumnSpec::RowCommitVersion)
+        {
+            return Err(KernelError::unsupported(
+                "Row ID and Row Commit Version metadata are unsupported in CDF scans",
+            ));
+        }
 
         // Create StateInfo using CDF field classifier
         // CDF doesn't support stats output
@@ -153,7 +163,7 @@ impl TableChangesScan {
     fn scan_metadata(
         &self,
         engine: Arc<dyn Engine>,
-    ) -> DeltaResult<impl Iterator<Item = DeltaResult<TableChangesScanMetadata>>> {
+    ) -> KernelResult<impl KernelResultIterator<TableChangesScanMetadata> + use<>> {
         let commits = self
             .table_changes
             .log_segment
@@ -210,7 +220,7 @@ impl TableChangesScan {
     pub fn execute(
         &self,
         engine: Arc<dyn Engine>,
-    ) -> DeltaResult<impl Iterator<Item = DeltaResult<Box<dyn EngineData>>>> {
+    ) -> KernelResult<impl KernelResultIterator<Box<dyn EngineData>> + use<>> {
         let scan_metadata = self.scan_metadata(engine.clone())?;
         let scan_files = scan_metadata_to_scan_file(scan_metadata);
 
@@ -226,7 +236,7 @@ impl TableChangesScan {
                 resolve_scan_file_dv(dv_engine_ref.as_ref(), &table_root, scan_file?)
             }) // Iterator-Result-Iterator
             .flatten_ok() // Iterator-Result
-            .map(move |resolved_scan_file| -> DeltaResult<_> {
+            .map(move |resolved_scan_file| -> KernelResult<_> {
                 read_scan_file(
                     engine.as_ref(),
                     resolved_scan_file?,
@@ -250,7 +260,7 @@ fn read_scan_file(
     table_root: &Url,
     state_info: &StateInfo,
     _physical_predicate: Option<PredicateRef>,
-) -> DeltaResult<impl Iterator<Item = DeltaResult<Box<dyn EngineData>>>> {
+) -> KernelResult<impl KernelResultIterator<Box<dyn EngineData>> + use<>> {
     let ResolvedCdfScanFile {
         scan_file,
         mut selection_vector,
@@ -279,7 +289,7 @@ fn read_scan_file(
         size: match scan_file.size {
             Some(s) => s
                 .try_into()
-                .map_err(|_| Error::generic(format!("invalid file size: {s}")))?,
+                .map_err(|_| KernelError::generic(format!("invalid file size: {s}")))?,
             None => 0,
         },
         location,
@@ -290,7 +300,7 @@ fn read_scan_file(
             .parquet_handler()
             .read_parquet_files(&[file], physical_schema, None)?;
 
-    let result = read_result_iter.map(move |batch| -> DeltaResult<_> {
+    let result = read_result_iter.map(move |batch| -> KernelResult<_> {
         let batch = batch?;
         // Transform the physical data into the correct logical form, or pass through unchanged.
         let logical = if let Some(ref eval) = phys_to_logical_eval {
@@ -355,16 +365,19 @@ fn read_scan_file(
 mod tests {
     use std::sync::Arc;
 
+    use rstest::rstest;
+
+    use crate::Predicate;
     use crate::committer::FileSystemCommitter;
     use crate::engine::sync::SyncEngine;
-    use crate::expressions::{col, lit};
+    use crate::expressions::expr;
     use crate::object_store::memory::InMemory;
-    use crate::scan::transform_spec::FieldTransformSpec;
     use crate::scan::PhysicalPredicate;
-    use crate::schema::schema_ref;
-    use crate::table_changes::{TableChanges, COMMIT_VERSION_COL_NAME};
+    use crate::scan::transform_spec::FieldTransformSpec;
+    use crate::schema::{MetadataColumnSpec, schema_ref};
+    use crate::table_changes::{COMMIT_VERSION_COL_NAME, TableChanges};
     use crate::transaction::create_table::create_table;
-    use crate::Predicate;
+    use crate::unit_test_utils::assert_result_error_with_message;
 
     #[test]
     fn simple_table_changes_scan_builder() {
@@ -437,7 +450,7 @@ mod tests {
             .schema()
             .project(&["id", COMMIT_VERSION_COL_NAME])
             .unwrap();
-        let predicate = Arc::new(Predicate::gt(col!("id"), lit(10)));
+        let predicate = Arc::new(Predicate::from_expr(expr!(col("id") > 10)));
         let scan = table_changes
             .into_scan_builder()
             .with_schema(schema.clone())
@@ -485,6 +498,32 @@ mod tests {
         ));
     }
 
+    #[rstest]
+    #[case::row_id(MetadataColumnSpec::RowId)]
+    #[case::row_commit_version(MetadataColumnSpec::RowCommitVersion)]
+    fn cdf_scan_rejects_row_tracking_metadata(#[case] metadata_spec: MetadataColumnSpec) {
+        let path = "./tests/data/table-with-cdf";
+        let engine = SyncEngine::new();
+        let url = delta_kernel::try_parse_uri(path).unwrap();
+        let table_changes = TableChanges::try_new(url, &engine, 0, Some(1)).unwrap();
+        let schema = Arc::new(
+            table_changes
+                .schema()
+                .add_metadata_column("row_tracking", metadata_spec)
+                .unwrap(),
+        );
+
+        let result = table_changes
+            .into_scan_builder()
+            .with_schema(schema)
+            .build();
+
+        assert_result_error_with_message(
+            result,
+            "Row ID and Row Commit Version metadata are unsupported in CDF scans",
+        );
+    }
+
     // Regression for issue #2468 on the CDF path
     #[test]
     fn cdf_predicate_on_unprojected_data_column_in_table_schema_succeeds() {
@@ -496,7 +535,7 @@ mod tests {
             nullable "id": INTEGER,
             nullable "part": STRING,
         };
-        create_table(url_str, schema, "DefaultEngine")
+        create_table(url_str, schema, "DefaultEngine", true)
             .with_table_properties([("delta.enableChangeDataFeed", "true")])
             .build(&engine, Box::new(FileSystemCommitter::new()))
             .unwrap()
@@ -512,7 +551,7 @@ mod tests {
 
         // Project only "part"; predicate references unprojected "id".
         let schema = table_changes.schema().project(&["part"]).unwrap();
-        let predicate = Arc::new(Predicate::gt(col!("id"), lit(10)));
+        let predicate = Arc::new(Predicate::from_expr(expr!(col("id") > 10)));
         let scan = table_changes
             .into_scan_builder()
             .with_schema(schema)
@@ -535,7 +574,7 @@ mod tests {
 
         // Project only "id"; predicate references unprojected `_commit_version`.
         let schema = table_changes.schema().project(&["id"]).unwrap();
-        let predicate = Arc::new(Predicate::ge(col!("_commit_version"), lit(0_i64)));
+        let predicate = Arc::new(Predicate::from_expr(expr!(col("_commit_version") >= 0_i64)));
         let scan = table_changes
             .into_scan_builder()
             .with_schema(schema)

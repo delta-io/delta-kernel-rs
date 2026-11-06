@@ -1,14 +1,28 @@
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
+
 use proc_macro2::{Ident, Span, TokenStream};
-use quote::{quote, quote_spanned, ToTokens};
+use quote::{format_ident, quote, quote_spanned};
 use syn::parse::Parser;
 use syn::punctuated::Punctuated;
 use syn::spanned::Spanned;
 use syn::{
-    parse_macro_input, Attribute, Data, DataStruct, DeriveInput, Error, Expr, ExprLit, Field,
-    Fields, Item, Lit, Meta, PathArguments, Token, Type, Visibility,
+    Attribute, Data, DataStruct, DeriveInput, Error, Expr, ExprLit, Field, Fields, Item, ItemMacro,
+    Lit, Meta, PathArguments, Token, Type, Visibility, parse_macro_input,
 };
 
+mod expr_macro;
 mod schema_macro;
+
+/// Backend for `delta_kernel::expressions::expr!`. Input is a Kernel crate path, a semicolon,
+/// and an expression; invalid syntax or constructors produce a compile error.
+#[doc(hidden)]
+#[proc_macro]
+pub fn expr(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
+    expr_macro::expand(input.into())
+        .unwrap_or_else(Error::into_compile_error)
+        .into()
+}
 
 // Builds a `StructType`; see `delta_kernel::schema::schema` re-export for details.
 #[doc(hidden)]
@@ -23,7 +37,7 @@ pub fn schema(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
 pub fn try_schema(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
     // Wrap the block in a closure that anchors the block's `?` operators
     schema_macro::parse_schema(input, true, |block| {
-        quote! { (|| -> delta_kernel::DeltaResult<_> #block)() }
+        quote! { (|| -> delta_kernel::KernelResult<_> #block)() }
     })
 }
 
@@ -130,8 +144,9 @@ fn validate_single_segment(segment: &str, span: Span) -> Result<(), Error> {
 ///   `HashMap`). Those mappings will be dropped when converting to an actual rust `HashMap`.
 ///   Currently this can _only_ be set on `HashMap` fields.
 /// - `#[skip_schema]`: Excludes this field from the generated schema (and, on a struct that also
-///   derives `IntoEngineData` / `IntoStructData`, from the produced engine data / struct scalar).
-///   NOTE: `TryFromStructData` rejects skipped fields because it cannot reconstruct them.
+///   derives `IntoStructData`, from the produced struct scalar).
+///
+/// NOTE: `TryFromStructData` rejects skipped fields because it cannot reconstruct them.
 #[proc_macro_derive(
     ToSchema,
     attributes(allow_null_container_values, field_id, nested_field_id, skip_schema)
@@ -398,6 +413,15 @@ fn try_from_struct_data_fields<'a>(
             "TryFromStructData does not support #[skip_schema] fields",
         ));
     }
+    if let Some(field) = fields
+        .iter()
+        .find(|field| has_named_attr(&field.attrs, "allow_null_container_values"))
+    {
+        return Err(Error::new(
+            field.span(),
+            "TryFromStructData does not support #[allow_null_container_values] fields",
+        ));
+    }
     Ok(fields)
 }
 
@@ -407,58 +431,16 @@ fn gen_schema_fields(data: &Data, span: Span) -> Result<TokenStream, Error> {
     Ok(quote! { #(#fields),* })
 }
 
-/// Derive an IntoEngineData trait for a struct that has all fields implement `TryInto<Scalar>`.
-///
-/// This is a relatively simple macro to produce the boilerplate for converting a struct into
-/// EngineData using the `create_one` method. TODO: (doc)tests included in the delta_kernel crate:
-/// `IntoEngineData` trait.
-#[proc_macro_derive(IntoEngineData)]
-pub fn into_engine_data_derive(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
-    let input = parse_macro_input!(input as DeriveInput);
-    let struct_name = &input.ident;
-
-    let fields = match schema_fields(&input.data, "IntoEngineData", struct_name.span()) {
-        Ok(fields) => fields,
-        Err(e) => return e.to_compile_error().into(),
-    };
-    let (field_idents, field_types): (Vec<_>, Vec<_>) =
-        fields.into_iter().map(|f| (&f.ident, &f.ty)).unzip();
-
-    let expanded = quote! {
-        #[automatically_derived]
-        impl delta_kernel::IntoEngineData for #struct_name
-        where
-            #(#field_types: TryInto<delta_kernel::expressions::Scalar>,)*
-            #(delta_kernel::Error: From<<#field_types as TryInto<delta_kernel::expressions::Scalar>>::Error>,)*
-        {
-            fn into_engine_data(
-                self,
-                schema: delta_kernel::schema::SchemaRef,
-                engine: &dyn delta_kernel::Engine)
-            -> delta_kernel::DeltaResult<Box<dyn delta_kernel::EngineData>> {
-                // NB: we `use` here to avoid polluting the caller's namespace
-                use delta_kernel::EvaluationHandlerExtension as _;
-                let values = [
-                    #(self.#field_idents.try_into()?),*
-                ];
-                let evaluator = engine.evaluation_handler();
-                evaluator.create_one(schema, &values)
-            }
-        }
-    };
-
-    proc_macro::TokenStream::from(expanded)
-}
-
 /// Derive `From` conversions into `StructData` and `Scalar` for a rust struct.
 ///
 /// Emits both:
 /// - `From<Self> for StructData` — field values via `.into()`, schema from `ToSchema`
 /// - `From<Self> for Scalar` — `Scalar::Struct(self.into())`
 ///
-/// Honors `#[skip_schema]`, producing the same field set as `ToSchema`. Every schema field type
-/// must implement `Into<Scalar>` (and the struct must implement `ToSchema`).
-#[proc_macro_derive(IntoStructData)]
+/// Honors `#[skip_schema]`, producing the same field set as `ToSchema`, and
+/// `#[allow_null_container_values]`, preserving nullable map values in the scalar type. Every
+/// schema field type must implement `Into<Scalar>` (and the struct must implement `ToSchema`).
+#[proc_macro_derive(IntoStructData, attributes(allow_null_container_values, skip_schema))]
 pub fn into_struct_data_derive(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
     let struct_name = &input.ident;
@@ -467,8 +449,18 @@ pub fn into_struct_data_derive(input: proc_macro::TokenStream) -> proc_macro::To
         Ok(fields) => fields,
         Err(e) => return e.to_compile_error().into(),
     };
-    let (field_idents, field_types): (Vec<_>, Vec<_>) =
-        fields.into_iter().map(|f| (&f.ident, &f.ty)).unzip();
+    let field_types = fields.iter().map(|field| &field.ty);
+    let field_values = fields.iter().map(|field| {
+        let ident = &field.ident;
+        if has_named_attr(&field.attrs, "allow_null_container_values") {
+            quote_spanned! { field.span() =>
+                delta_kernel::schema::derive_macro_utils::IntoNullableContainerScalar::
+                    into_nullable_container_scalar(value.#ident)
+            }
+        } else {
+            quote_spanned! { field.span() => value.#ident.into() }
+        }
+    });
 
     let expanded = quote! {
         #[automatically_derived]
@@ -480,7 +472,7 @@ pub fn into_struct_data_derive(input: proc_macro::TokenStream) -> proc_macro::To
             fn from(value: #struct_name) -> Self {
                 Self::from_values_unchecked(
                     <#struct_name as delta_kernel::schema::ToSchema>::to_schema(),
-                    vec![ #(value.#field_idents.into()),* ],
+                    vec![ #(#field_values),* ],
                 )
             }
         }
@@ -508,9 +500,14 @@ pub fn into_struct_data_derive(input: proc_macro::TokenStream) -> proc_macro::To
 /// - `TryFrom<Scalar> for Self` — unwraps `Scalar::Struct`, else errors
 ///
 /// Missing, duplicate, and unknown fields are errors. Every field type must implement
-/// `TryFrom<Scalar, Error = Error>`. `#[skip_schema]` is rejected because the reverse conversion
-/// cannot infer a value or schema for a field omitted by `ToSchema`.
-#[proc_macro_derive(TryFromStructData, attributes(skip_schema))]
+/// `TryFrom<Scalar, Error = KernelError>`. `#[skip_schema]` is rejected because the reverse
+/// conversion cannot infer a value or schema for a field omitted by `ToSchema`.
+/// `#[allow_null_container_values]` is rejected because its map scalar type cannot be converted
+/// by the standard `HashMap` conversion.
+#[proc_macro_derive(
+    TryFromStructData,
+    attributes(allow_null_container_values, skip_schema)
+)]
 pub fn try_from_struct_data_derive(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
     try_from_struct_data_impl(&input)
@@ -540,13 +537,13 @@ fn try_from_struct_data_impl(input: &DeriveInput) -> Result<TokenStream, Error> 
         where
             #struct_name: delta_kernel::schema::ToSchema,
             #(#field_types:
-                TryFrom<delta_kernel::expressions::Scalar, Error = delta_kernel::Error>,)*
+                TryFrom<delta_kernel::expressions::Scalar, Error = delta_kernel::KernelError>,)*
         {
-            type Error = delta_kernel::Error;
+            type Error = delta_kernel::KernelError;
 
             fn try_from(
                 value: delta_kernel::expressions::StructData,
-            ) -> delta_kernel::DeltaResult<Self> {
+            ) -> delta_kernel::KernelResult<Self> {
                 let mut fields =
                     delta_kernel::schema::derive_macro_utils::StructDataFields::try_new(
                         value,
@@ -565,14 +562,14 @@ fn try_from_struct_data_impl(input: &DeriveInput) -> Result<TokenStream, Error> 
         where
             #struct_name: TryFrom<
                 delta_kernel::expressions::StructData,
-                Error = delta_kernel::Error,
+                Error = delta_kernel::KernelError,
             >,
         {
-            type Error = delta_kernel::Error;
+            type Error = delta_kernel::KernelError;
 
             fn try_from(
                 value: delta_kernel::expressions::Scalar,
-            ) -> delta_kernel::DeltaResult<Self> {
+            ) -> delta_kernel::KernelResult<Self> {
                 match value {
                     delta_kernel::expressions::Scalar::Struct(data) => data.try_into(),
                     other => Err(other.conversion_error(stringify!(#struct_name))),
@@ -582,7 +579,61 @@ fn try_from_struct_data_impl(input: &DeriveInput) -> Result<TokenStream, Error> 
     })
 }
 
+/// Expose a `macro_rules!` declaration as a public macro at its declaration site.
+///
+/// The macro's crate-root implementation is exported under a doc-hidden generated name.
+/// Other item types and macros already marked `#[macro_export]` produce a compile error.
+///
+/// ```
+/// mod first {
+///     use delta_kernel_derive::pub_macro;
+///
+///     #[pub_macro]
+///     macro_rules! identity {
+///         () => { 1 };
+///     }
+/// }
+///
+/// mod second {
+///     use delta_kernel_derive::pub_macro;
+///
+///     #[pub_macro]
+///     macro_rules! identity {
+///         () => { 2 };
+///     }
+/// }
+///
+/// assert_eq!(first::identity!(), 1);
+/// assert_eq!(second::identity!(), 2);
+/// ```
+///
+/// Distinct declarations can use the same public name because the hidden name includes a hash of
+/// the declaration's tokens. Only token-identical declarations with the same name collide.
+///
+/// The expansion has this shape:
+///
+/// ```text
+/// #[macro_export]
+/// #[doc(hidden)]
+/// macro_rules! __identity_<hash> { ... }
+///
+/// #[doc(inline)]
+/// pub use __identity_<hash> as identity;
+/// ```
+#[proc_macro_attribute]
+pub fn pub_macro(
+    _attr: proc_macro::TokenStream,
+    item: proc_macro::TokenStream,
+) -> proc_macro::TokenStream {
+    let input = parse_macro_input!(item as Item);
+    expand_attribute(input, pub_macro_impl).into()
+}
+
 /// Mark items as `internal_api` to make them public iff the `internal-api` feature is enabled.
+///
+/// A `macro_rules!` declaration is exposed through a hidden implementation and a re-export at the
+/// declaration site. The implementation and re-export are public only when the `internal-api`
+/// feature is enabled; otherwise the re-export is crate-visible.
 ///
 /// NOTE: This macro does not support `mod` declarations because of nuances in how the mod expander
 /// and proc macro system interact for non-inline modules such as `mod foo;`. Use explicit
@@ -593,23 +644,105 @@ pub fn internal_api(
     item: proc_macro::TokenStream,
 ) -> proc_macro::TokenStream {
     let input = parse_macro_input!(item as Item);
+    expand_attribute(input, internal_api_impl).into()
+}
+
+fn expand_attribute(
+    input: Item,
+    implementation: impl FnOnce(Item) -> Result<TokenStream, Error>,
+) -> TokenStream {
+    match implementation(input.clone()) {
+        Ok(output) => output,
+        Err(error) => {
+            let error = error.into_compile_error();
+            quote!(#input #error)
+        }
+    }
+}
+
+fn internal_api_impl(input: Item) -> Result<TokenStream, Error> {
+    let (macro_definition, input) = match input {
+        Item::Macro(item) if item.mac.path.is_ident("macro_rules") => {
+            let Some(public_name) = item.ident.clone() else {
+                return Ok(quote!(#item)); // malformed, let compiler deal with it
+            };
+            let macro_export =
+                syn::parse_quote!(#[cfg_attr(feature = "internal-api", macro_export)]);
+            let (definition, reexport) = make_macro_api(item, public_name, macro_export)?;
+            (Some(definition), reexport)
+        }
+        input => (None, input),
+    };
 
     // Create a version with public visibility for the unstable feature
-    let public_version = make_public(input.clone());
+    let public_version = make_public(input.clone())?;
 
     // The original item stays as-is for the non-unstable case
-    let output = quote! {
+    Ok(quote! {
+        #macro_definition
+
         #[cfg(feature = "internal-api")]
         #public_version
 
         #[cfg(not(feature = "internal-api"))]
         #input
-    };
-
-    output.into()
+    })
 }
 
-fn make_public(mut item: Item) -> Item {
+fn pub_macro_impl(input: Item) -> Result<TokenStream, Error> {
+    match input {
+        Item::Macro(item) if item.mac.path.is_ident("macro_rules") => {
+            let Some(public_name) = item.ident.clone() else {
+                return Ok(quote!(#item)); // malformed, let compiler deal with it
+            };
+            let macro_export = syn::parse_quote!(#[macro_export]);
+            let (definition, reexport) = make_macro_api(item, public_name, macro_export)?;
+            let reexport = make_public(reexport)?;
+            Ok(quote! {
+                #definition
+                #reexport
+            })
+        }
+        input => Err(Error::new(
+            input.span(),
+            "macro_rules! declaration expected",
+        )),
+    }
+}
+
+fn make_macro_api(
+    mut item: ItemMacro,
+    public_name: Ident,
+    macro_export: Attribute,
+) -> Result<(Item, Item), Error> {
+    if item
+        .attrs
+        .iter()
+        .any(|attr| attr.path().is_ident("macro_export"))
+    {
+        return Err(Error::new(item.span(), "macro is already #[macro_export]"));
+    }
+
+    let implementation_name = hidden_macro_name(&item, &public_name);
+    item.ident = Some(implementation_name.clone());
+    item.attrs.push(macro_export);
+    item.attrs.push(syn::parse_quote!(#[doc(hidden)]));
+
+    let reexport: Item = syn::parse_quote! {
+        #[doc(inline)]
+        pub(crate) use #implementation_name as #public_name;
+    };
+
+    Ok((Item::Macro(item), reexport))
+}
+
+fn hidden_macro_name(item: &ItemMacro, public_name: &Ident) -> Ident {
+    let mut hasher = DefaultHasher::new();
+    quote!(#item).to_string().hash(&mut hasher);
+    format_ident!("__{}_{:016x}", public_name, hasher.finish())
+}
+
+fn make_public(mut item: Item) -> Result<Item, Error> {
     /// Transforms the passed visibility to be `pub`. We pass the original span that the visibility
     /// came from, and attach it to the newly created pub token. This means that the compiler treats
     /// it as user-written code and normal lints apply. We want this because it allows us to catch
@@ -633,7 +766,7 @@ fn make_public(mut item: Item) -> Item {
         }};
     }
 
-    let result = match &mut item {
+    match &mut item {
         Item::Fn(f) => set_vis!(f),
         Item::Struct(s) => set_vis!(s),
         Item::Enum(e) => set_vis!(e),
@@ -648,23 +781,111 @@ fn make_public(mut item: Item) -> Item {
             item.span(),
             format!("unsupported item type for #[internal_api]: {item:?}"),
         )),
-    };
-
-    if let Err(err) = result {
-        let error = err.to_compile_error();
-        let mut tokens = item.to_token_stream();
-        tokens.extend(error);
-        return syn::parse_quote!(#tokens);
-    }
-
-    item
+    }?;
+    Ok(item)
 }
 
 #[cfg(test)]
 mod tests {
     use rstest::rstest;
+    use syn::parse_quote;
 
     use super::*;
+
+    fn implementation_name(input: &Item) -> Ident {
+        let Item::Macro(item) = input else {
+            panic!("expected macro item");
+        };
+        hidden_macro_name(item, item.ident.as_ref().unwrap())
+    }
+
+    fn identity_macro() -> Item {
+        parse_quote! {
+            #[doc = "Returns its argument."]
+            macro_rules! identity {
+                ($value:expr) => {
+                    $value
+                };
+            }
+        }
+    }
+
+    #[test]
+    fn internal_api_rejects_public_items() {
+        let input = parse_quote!(
+            pub fn already_public() {}
+        );
+
+        assert!(internal_api_impl(input).is_err());
+    }
+
+    #[test]
+    fn attribute_errors_preserve_input() {
+        let input: Item = parse_quote!(
+            pub fn preserved() {}
+        );
+        let output = expand_attribute(input, |item| {
+            Err(Error::new(item.span(), "attribute rejected item"))
+        })
+        .to_string();
+
+        assert!(output.contains("pub fn preserved"));
+        assert!(output.contains("compile_error"));
+        assert!(output.contains("attribute rejected item"));
+    }
+
+    #[test]
+    fn pub_macro_generates_complete_macro_rules_api() {
+        let input = identity_macro();
+        let implementation_name = implementation_name(&input);
+        let expected = quote! {
+            #[doc = "Returns its argument."]
+            #[macro_export]
+            #[doc(hidden)]
+            macro_rules! #implementation_name {
+                ($value:expr) => {
+                    $value
+                };
+            }
+
+            #[doc(inline)]
+            pub use #implementation_name as identity;
+        };
+
+        assert_eq!(
+            pub_macro_impl(input).unwrap().to_string(),
+            expected.to_string()
+        );
+    }
+
+    #[test]
+    fn internal_api_generates_complete_macro_rules_api() {
+        let input = identity_macro();
+        let implementation_name = implementation_name(&input);
+        let expected = quote! {
+            #[doc = "Returns its argument."]
+            #[cfg_attr(feature = "internal-api", macro_export)]
+            #[doc(hidden)]
+            macro_rules! #implementation_name {
+                ($value:expr) => {
+                    $value
+                };
+            }
+
+            #[cfg(feature = "internal-api")]
+            #[doc(inline)]
+            pub use #implementation_name as identity;
+
+            #[cfg(not(feature = "internal-api"))]
+            #[doc(inline)]
+            pub(crate) use #implementation_name as identity;
+        };
+
+        assert_eq!(
+            internal_api_impl(input).unwrap().to_string(),
+            expected.to_string()
+        );
+    }
 
     /// Expand `gen_schema_fields` for `input` and return the generated tokens as a string. Macro
     /// errors are embedded as `compile_error!` tokens in that string; `Err` only signals that the
@@ -773,25 +994,25 @@ mod tests {
         );
     }
 
-    #[test]
-    fn try_from_struct_data_rejects_skipped_field() {
-        let input = syn::parse_str::<DeriveInput>(
-            r#"
-            struct TestStruct {
-                #[skip_schema]
-                skipped: String,
-                kept: i32,
-            }
-            "#,
-        )
-        .unwrap();
+    #[rstest]
+    #[case::skipped(
+        "#[skip_schema]",
+        "TryFromStructData does not support #[skip_schema] fields"
+    )]
+    #[case::nullable_container_values(
+        "#[allow_null_container_values]",
+        "TryFromStructData does not support #[allow_null_container_values] fields"
+    )]
+    fn try_from_struct_data_rejects_unsupported_field(
+        #[case] attribute: &str,
+        #[case] expected: &str,
+    ) {
+        let input = format!("struct TestStruct {{ {attribute} field: String }}");
+        let input = syn::parse_str::<DeriveInput>(&input).unwrap();
         let error =
             try_from_struct_data_fields(&input.data, "TryFromStructData", input.ident.span())
                 .unwrap_err();
-        assert_eq!(
-            error.to_string(),
-            "TryFromStructData does not support #[skip_schema] fields"
-        );
+        assert_eq!(error.to_string(), expected);
     }
 
     #[rstest]

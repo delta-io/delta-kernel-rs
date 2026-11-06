@@ -145,7 +145,7 @@ The golden V2 checkpoint tables have a different protocol (v1/v2, no table featu
 | Table | Location | Schema | Protocol (R/W) | Features | Description | Tests |
 |-------|----------|--------|----------|----------|-------------|-------|
 | `app-txn-checkpoint` | data/ | `id: string, value: int, modified: string` partitioned by `modified` | v1/v2 | | `txn` for `appId="my-app"`. Two partitions. Has checkpoint. | `hdfs.rs::read_table_version_hdfs`, `set_transaction.rs::test_txn` |
-| `app-txn-no-checkpoint` | data/ | `id: string, value: int, modified: string` partitioned by `modified` | v1/v2 | | Same as above but no checkpoint | `commit.rs::test_commit_phase_processes_commits`, `checkpoint/mod.rs` (doc example), `set_transaction.rs::test_txn` |
+| `app-txn-no-checkpoint` | data/ | `id: string, value: int, modified: string` partitioned by `modified` | v1/v2 | | Same as above but no checkpoint | `log_segment/tests.rs::test_commit_phase_processes_commits`, `checkpoint/mod.rs` (doc example), `set_transaction.rs::test_txn` |
 | `app-txn-with-last-updated` | data/ | `a: long, b: long` | v1/v2 | `setTransactionRetentionDuration="interval 1 days"` | `txn` with `lastUpdated` timestamps and retention config | `set_transaction.rs::test_txn_retention_filtering` |
 
 ## CRC (Checksum) Files

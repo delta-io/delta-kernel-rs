@@ -15,8 +15,8 @@ use delta_kernel::engine::arrow_conversion::TryIntoArrow;
 use delta_kernel::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt};
 use delta_kernel::schema::{DataType, SchemaRef, StructField, StructType};
 use delta_kernel::transaction::create_table::create_table as create_delta_table;
-use delta_kernel::transaction::{CommitResult, RetryableTransaction};
-use delta_kernel::{DeltaResult, Engine, Error, Snapshot, SnapshotRef};
+use delta_kernel::transaction::{CommitResult, RetryableTransaction, UpdateTableOperation};
+use delta_kernel::{Engine, KernelError, KernelResult, Snapshot, SnapshotRef};
 use delta_kernel_default_engine::executor::tokio::TokioBackgroundExecutor;
 use delta_kernel_default_engine::{DefaultEngine, DefaultEngineBuilder};
 use itertools::Itertools;
@@ -59,13 +59,13 @@ async fn main() -> ExitCode {
 }
 
 // TODO: Update the example once official write APIs are introduced (issue#1123)
-async fn try_main() -> DeltaResult<()> {
+async fn try_main() -> KernelResult<()> {
     let cli = Cli::parse_with_examples(env!("CARGO_PKG_NAME"), "Write", "write", "");
 
     // Check if path is a directory and if not, create it
     if !Path::new(&cli.location_args.path).exists() {
         create_dir_all(&cli.location_args.path).map_err(|e| {
-            Error::generic(format!(
+            KernelError::generic(format!(
                 "Failed to create directory {}: {e}",
                 cli.location_args.path
             ))
@@ -88,13 +88,15 @@ async fn try_main() -> DeltaResult<()> {
     // Write sample data to the table
     let committer = Box::new(FileSystemCommitter::new());
     let mut txn = snapshot
-        .transaction(committer, &engine)?
-        .with_operation("INSERT".to_string())
-        .with_engine_info("default_engine/write-table-example")
-        .with_data_change(true);
+        .update_table(
+            UpdateTableOperation::Custom("INSERT".to_string()),
+            "default_engine/write-table-example",
+            /* data_change */ true,
+        )
+        .build(&engine, committer)?;
 
-    // Write the data using the engine
-    let write_context = txn.write_state()?.unpartitioned_write_context()?;
+    // This example assumes the table is unpartitioned.
+    let write_context = txn.write_state()?.write_context_builder().build()?;
     let file_metadata = engine.write_parquet(&sample_data, &write_context).await?;
 
     // Add the file metadata to the transaction
@@ -104,18 +106,20 @@ async fn try_main() -> DeltaResult<()> {
     let mut retries = 0;
     let committed = loop {
         if retries > 5 {
-            return Err(Error::generic(
+            return Err(KernelError::generic(
                 "Exceeded maximum 5 retries for committing transaction",
             ));
         }
         txn = match txn.commit(&engine)? {
-            CommitResult::CommittedTransaction(committed) => break committed,
-            CommitResult::ConflictedTransaction(conflicted) => {
+            CommitResult::Committed(committed) => break committed,
+            CommitResult::Conflicted(conflicted) => {
                 let conflicting_version = conflicted.conflict_version();
-                println!("✗ Failed to write data, transaction conflicted with version: {conflicting_version}");
-                return Err(Error::generic("Commit failed"));
+                println!(
+                    "✗ Failed to write data, transaction conflicted with version: {conflicting_version}"
+                );
+                return Err(KernelError::generic("Commit failed"));
             }
-            CommitResult::RetryableTransaction(RetryableTransaction { transaction, error }) => {
+            CommitResult::Retryable(RetryableTransaction { transaction, error }) => {
                 println!("✗ Failed to commit, retrying... retryable error: {error}");
                 transaction
             }
@@ -139,7 +143,7 @@ async fn create_or_get_base_snapshot(
     url: &Url,
     engine: &dyn Engine,
     schema_str: &str,
-) -> DeltaResult<SnapshotRef> {
+) -> KernelResult<SnapshotRef> {
     // Check if table already exists
     match Snapshot::builder_for(url.clone()).build(engine) {
         Ok(snapshot) => {
@@ -157,13 +161,13 @@ async fn create_or_get_base_snapshot(
 }
 
 /// Parse a schema string into a SchemaRef.
-fn parse_schema(schema_str: &str) -> DeltaResult<SchemaRef> {
+fn parse_schema(schema_str: &str) -> KernelResult<SchemaRef> {
     let fields = schema_str
         .split(',')
         .map(|field| {
             let parts: Vec<&str> = field.split(':').collect();
             if parts.len() != 2 {
-                return Err(Error::generic(format!(
+                return Err(KernelError::generic(format!(
                     "Invalid field specification: {field}. Expected format: field_name:data_type"
                 )));
             }
@@ -177,7 +181,7 @@ fn parse_schema(schema_str: &str) -> DeltaResult<SchemaRef> {
                 "boolean" => DataType::BOOLEAN,
                 "timestamp" => DataType::TIMESTAMP,
                 _ => {
-                    return Err(Error::generic(format!(
+                    return Err(KernelError::generic(format!(
                         "Unsupported data type: {data_type}"
                     )));
                 }
@@ -185,25 +189,34 @@ fn parse_schema(schema_str: &str) -> DeltaResult<SchemaRef> {
 
             Ok(StructField::nullable(name, data_type))
         })
-        .collect::<DeltaResult<Vec<_>>>()?;
+        .collect::<KernelResult<Vec<_>>>()?;
 
     Ok(Arc::new(StructType::try_new(fields)?))
 }
 
 /// Create a new Delta table with the given schema using the official CreateTable API.
-async fn create_table(table_url: &Url, schema: &SchemaRef, engine: &dyn Engine) -> DeltaResult<()> {
+async fn create_table(
+    table_url: &Url,
+    schema: &SchemaRef,
+    engine: &dyn Engine,
+) -> KernelResult<()> {
     // Use the create_table API to create the table
     let table_path = table_url.as_str();
-    let _result = create_delta_table(table_path, schema.clone(), "write-table-example/1.0")
-        .build(engine, Box::new(FileSystemCommitter::new()))?
-        .commit(engine)?;
+    let _result = create_delta_table(
+        table_path,
+        schema.clone(),
+        "write-table-example/1.0",
+        /* data_change */ true,
+    )
+    .build(engine, Box::new(FileSystemCommitter::new()))?
+    .commit(engine)?;
 
     println!("✓ Created Delta table with schema: {schema:#?}");
     Ok(())
 }
 
 /// Create sample data based on the schema.
-fn create_sample_data(schema: &SchemaRef, num_rows: usize) -> DeltaResult<ArrowEngineData> {
+fn create_sample_data(schema: &SchemaRef, num_rows: usize) -> KernelResult<ArrowEngineData> {
     let fields = schema.fields();
     let mut columns = Vec::new();
 
@@ -237,7 +250,7 @@ fn create_sample_data(schema: &SchemaRef, num_rows: usize) -> DeltaResult<ArrowE
                 Arc::new(TimestampMicrosecondArray::from(data))
             }
             _ => {
-                return Err(Error::generic(format!(
+                return Err(KernelError::generic(format!(
                     "Unsupported data type for sample data: {:?}",
                     field.data_type()
                 )));
@@ -256,7 +269,7 @@ fn create_sample_data(schema: &SchemaRef, num_rows: usize) -> DeltaResult<ArrowE
 async fn read_and_display_data(
     table_url: &Url,
     engine: DefaultEngine<TokioBackgroundExecutor>,
-) -> DeltaResult<()> {
+) -> KernelResult<()> {
     let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
     let scan = snapshot.scan_builder().build()?;
 

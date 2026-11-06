@@ -13,20 +13,20 @@ use std::sync::Arc;
 
 use delta_kernel::arrow::array::ffi::from_ffi;
 use delta_kernel::arrow::array::{
-    make_array, Array, ArrayRef, BooleanArray, RecordBatch, StructArray,
+    Array, ArrayRef, BooleanArray, RecordBatch, StructArray, make_array,
 };
 use delta_kernel::arrow::datatypes::{Field, Fields, Schema};
 use delta_kernel::engine::arrow_expression::evaluate_expression::evaluate_expression;
 use delta_kernel::engine::arrow_expression::opaque::{
     ArrowOpaquePredicate as _, ArrowOpaquePredicateOp,
 };
-use delta_kernel::expressions::{null_lit, Expression, ExpressionRef, ScalarExpressionEvaluator};
+use delta_kernel::expressions::{Expression, ExpressionRef, ScalarExpressionEvaluator, null_lit};
 use delta_kernel::kernel_predicates::{
     DirectDataSkippingPredicateEvaluator, DirectPredicateEvaluator,
     IndirectDataSkippingPredicateEvaluator, KernelPredicateEvaluator,
 };
 use delta_kernel::schema::DataType;
-use delta_kernel::{DeltaResult, Error, Predicate};
+use delta_kernel::{KernelError, KernelResult, Predicate};
 
 use super::opaque_eval::{COpaqueEvalCallbacks, FfiOpaqueEvalCallbacks};
 use crate::engine_data::ArrowFFIData;
@@ -120,7 +120,7 @@ impl Eq for FfiOpaquePredicateOp {}
 ///
 /// `Expression::Struct` args (produced by the stats-mode rewrite) get a dedicated path because
 /// kernel's evaluator needs a `DataType::Struct` result type to name fields, which we don't have.
-fn evaluate_args(args: &[Expression], batch: &RecordBatch) -> DeltaResult<RecordBatch> {
+fn evaluate_args(args: &[Expression], batch: &RecordBatch) -> KernelResult<RecordBatch> {
     // Zero-arg ops (e.g. NOW(), RAND()): empty-schema batch with explicit row count so the
     // engine knows how many rows to emit.
     if args.is_empty() {
@@ -130,7 +130,9 @@ fn evaluate_args(args: &[Expression], batch: &RecordBatch) -> DeltaResult<Record
             vec![],
             &delta_kernel::arrow::array::RecordBatchOptions::new().with_row_count(Some(n_rows)),
         )
-        .map_err(|e| Error::Generic(format!("zero-arg opaque eval batch construction: {e}")));
+        .map_err(|e| {
+            KernelError::Generic(format!("zero-arg opaque eval batch construction: {e}"))
+        });
     }
 
     let arrays: Vec<ArrayRef> = args
@@ -139,7 +141,7 @@ fn evaluate_args(args: &[Expression], batch: &RecordBatch) -> DeltaResult<Record
             Expression::Struct(fields, _nullability) => evaluate_struct_arg(fields, batch),
             _ => evaluate_expression(arg, batch, None),
         })
-        .collect::<DeltaResult<_>>()?;
+        .collect::<KernelResult<_>>()?;
 
     let fields: Vec<Field> = arrays
         .iter()
@@ -149,7 +151,7 @@ fn evaluate_args(args: &[Expression], batch: &RecordBatch) -> DeltaResult<Record
     let schema = Arc::new(Schema::new(fields));
 
     RecordBatch::try_new(schema, arrays)
-        .map_err(|e| Error::Generic(format!("opaque eval batch construction: {e}")))
+        .map_err(|e| KernelError::Generic(format!("opaque eval batch construction: {e}")))
 }
 
 /// Lift a column type hint from the first `Literal` arg (kernel-native lifts the same way from
@@ -202,11 +204,11 @@ fn rewrite_stat_arg(
 /// (`minValues.<col>`, `maxValues.<col>`, nullcount, rowcount); evaluating them against the stats
 /// batch resolves each to the actual per-file values. The results are packed into a `StructArray`
 /// with positional field names (`f0`, `f1`, ...) since the engine reads the struct by index.
-fn evaluate_struct_arg(fields: &[ExpressionRef], batch: &RecordBatch) -> DeltaResult<ArrayRef> {
+fn evaluate_struct_arg(fields: &[ExpressionRef], batch: &RecordBatch) -> KernelResult<ArrayRef> {
     let arrays: Vec<ArrayRef> = fields
         .iter()
         .map(|f| evaluate_expression(f, batch, None))
-        .collect::<DeltaResult<_>>()?;
+        .collect::<KernelResult<_>>()?;
     let arrow_fields: Fields = arrays
         .iter()
         .enumerate()
@@ -214,17 +216,17 @@ fn evaluate_struct_arg(fields: &[ExpressionRef], batch: &RecordBatch) -> DeltaRe
         .collect();
     StructArray::try_new(arrow_fields, arrays, None)
         .map(|sa| Arc::new(sa) as ArrayRef)
-        .map_err(|e| Error::Generic(format!("struct arg construction: {e}")))
+        .map_err(|e| KernelError::Generic(format!("struct arg construction: {e}")))
 }
 
 /// Import an engine-produced `ArrowFFIData` into an `ArrayRef`, consuming the Arrow C Data
 /// Interface handles.
-fn import_ffi_array(ffi: ArrowFFIData) -> DeltaResult<ArrayRef> {
+fn import_ffi_array(ffi: ArrowFFIData) -> KernelResult<ArrayRef> {
     // A released (empty) array means the engine reported success without populating the result
     // slot. This check is load-bearing: `from_ffi` asserts on the empty structs' null pointers,
     // and kernel must never panic -- so reject the unpopulated case with an error up front.
     if ffi.array.is_released() {
-        return Err(Error::Generic(
+        return Err(KernelError::Generic(
             "engine callback returned success but no result array".into(),
         ));
     }
@@ -234,13 +236,13 @@ fn import_ffi_array(ffi: ArrowFFIData) -> DeltaResult<ArrayRef> {
     // SAFETY: the engine promised these structs are valid Arrow C Data
     // Interface payloads it produced and handed to us.
     let array_data = unsafe { from_ffi(array, &schema) }
-        .map_err(|e| Error::Generic(format!("from_ffi: {e}")))?;
+        .map_err(|e| KernelError::Generic(format!("from_ffi: {e}")))?;
     Ok(make_array(array_data))
 }
 
-fn require_boolean_array(arr: ArrayRef, expected_rows: usize) -> DeltaResult<BooleanArray> {
+fn require_boolean_array(arr: ArrayRef, expected_rows: usize) -> KernelResult<BooleanArray> {
     if arr.len() != expected_rows {
-        return Err(Error::Generic(format!(
+        return Err(KernelError::Generic(format!(
             "opaque predicate eval_pred returned {} rows, expected {expected_rows}",
             arr.len()
         )));
@@ -249,7 +251,7 @@ fn require_boolean_array(arr: ArrayRef, expected_rows: usize) -> DeltaResult<Boo
         .downcast_ref::<BooleanArray>()
         .cloned()
         .ok_or_else(|| {
-            Error::Generic(format!(
+            KernelError::Generic(format!(
                 "opaque predicate eval_pred returned non-boolean array of type {:?}",
                 arr.data_type()
             ))
@@ -262,7 +264,7 @@ fn call_eval_pred(
     args_batch: RecordBatch,
     mode: EvalMode,
     inverted: bool,
-) -> DeltaResult<BooleanArray> {
+) -> KernelResult<BooleanArray> {
     let num_rows = args_batch.num_rows();
     let args_ffi = ArrowFFIData::try_from_record_batch(args_batch)?;
 
@@ -272,23 +274,21 @@ fn call_eval_pred(
     // -- transferring ownership of the written Arrow C Data Interface structs -- or Failure(err).
     let mut result = EngineExecResult::Uninit;
 
+    let name = kernel_string_slice!(op_name);
+    let eval = match mode {
+        EvalMode::RowMode => cb.eval_pred_rows,
+        EvalMode::StatsMode => cb.eval_pred_stats,
+    };
     // SAFETY: callback was supplied by the engine. `args_ffi` is moved into the call (engine owns
     // it now), and `result` is a writable slot valid for the duration of the call.
-    unsafe {
-        let name = kernel_string_slice!(op_name);
-        let eval = match mode {
-            EvalMode::RowMode => cb.eval_pred_rows,
-            EvalMode::StatsMode => cb.eval_pred_stats,
-        };
-        eval(cb.engine_state, name, args_ffi, inverted, &mut result);
-    }
+    unsafe { eval(cb.engine_state, name, args_ffi, inverted, &mut result) };
     let result_ffi = match result {
         EngineExecResult::Success(result_ffi) => result_ffi,
         EngineExecResult::Failure(err) => return Err(err.into()),
         EngineExecResult::Uninit => {
-            return Err(Error::Generic(format!(
+            return Err(KernelError::Generic(format!(
                 "engine opaque-eval callback for `{op_name}` returned without writing a result"
-            )))
+            )));
         }
     };
 
@@ -308,7 +308,7 @@ impl ArrowOpaquePredicateOp for FfiOpaquePredicateOp {
         args: &[Expression],
         batch: &RecordBatch,
         inverted: bool,
-    ) -> DeltaResult<BooleanArray> {
+    ) -> KernelResult<BooleanArray> {
         // Materialize the args batch. StatsMode pruning is best-effort: if the rewrite referenced a
         // stats column the batch doesn't carry, abstain (keep every file) rather than abort the
         // scan. RowMode has no safe abstain, so its errors propagate.
@@ -341,7 +341,7 @@ impl ArrowOpaquePredicateOp for FfiOpaquePredicateOp {
         _eval_pred: &DirectPredicateEvaluator<'_>,
         _exprs: &[Expression],
         _inverted: bool,
-    ) -> DeltaResult<Option<bool>> {
+    ) -> KernelResult<Option<bool>> {
         // Abstains from scalar evaluation (e.g. partition pruning).
         // TODO: support it by invoking the engine callback with a one-row stats batch.
         Ok(None)
@@ -391,20 +391,20 @@ mod tests {
 
     use std::ffi::c_void;
     use std::ptr;
-    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
-    use delta_kernel::arrow::array::ffi::{from_ffi, FFI_ArrowArray, FFI_ArrowSchema};
+    use delta_kernel::arrow::array::ffi::{FFI_ArrowArray, FFI_ArrowSchema, from_ffi};
     use delta_kernel::arrow::array::{
         ArrayRef, BooleanArray, Int32Array, RecordBatch, StringArray, StructArray,
     };
     use delta_kernel::arrow::datatypes::{DataType as ArrowDataType, Field, Schema};
     use delta_kernel::engine::arrow_expression::evaluate_expression::evaluate_predicate;
-    use delta_kernel::expressions::{col, lit, Expression, Predicate};
+    use delta_kernel::expressions::{Expression, Predicate, col, expr, lit};
 
     use super::*;
-    use crate::expressions::opaque_eval::EngineEvalRowsFn;
     use crate::KernelStringSlice;
+    use crate::expressions::opaque_eval::EngineEvalRowsFn;
 
     // === Engine-side test stubs ===================================================
     //
@@ -651,7 +651,7 @@ mod tests {
         ) {
             let _ = unsafe { take_ffi_record_batch(args_in) };
             let err = crate::error::EngineExecError {
-                etype: crate::error::KernelError::GenericError,
+                etype: crate::error::FFIKernelError::GenericError,
                 message: Box::new("boom from engine".to_string()).into(),
             };
             unsafe { *out = EngineExecResult::Failure(err) };
@@ -845,15 +845,15 @@ mod tests {
         use std::cmp::Ordering;
         use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
+        use delta_kernel::Predicate;
         use delta_kernel::arrow::array::Int64Array;
         use delta_kernel::arrow::datatypes::DataType as ArrowDataType;
         use delta_kernel::expressions::{
-            col, column_name, joined_column_expr, lit, BinaryExpressionOp, BinaryPredicateOp,
-            ColumnName, Expression, JunctionPredicateOp, OpaquePredicateOpRef, Scalar,
+            BinaryExpressionOp, BinaryPredicateOp, ColumnName, Expression, JunctionPredicateOp,
+            OpaquePredicateOpRef, Scalar, col, column_name, joined_column_expr, lit,
         };
         use delta_kernel::kernel_predicates::DataSkippingPredicateEvaluator;
         use delta_kernel::schema::DataType;
-        use delta_kernel::Predicate;
 
         use super::*;
 
@@ -1168,7 +1168,7 @@ mod tests {
         #[test]
         fn recursively_rewrites_predicate_child() {
             let op = op_with_callbacks("OP");
-            let inner = Predicate::lt(col!("col"), lit(5i64));
+            let inner = Predicate::from_expr(expr!(col("col") < 5i64));
             let args = [Expression::Predicate(Box::new(inner))];
 
             let pred = rewrite(&op, &args, &rewriter(), false).expect("rewrite should succeed");
@@ -1220,7 +1220,7 @@ mod tests {
         #[test]
         fn preserves_arity_for_mixed_args() {
             let op = op_with_callbacks("OP");
-            let inner = Predicate::lt(col!("y"), lit(5i64));
+            let inner = Predicate::from_expr(expr!(col("y") < 5i64));
             let args = [
                 col!("col"),
                 lit(1i64),

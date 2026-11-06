@@ -4,7 +4,7 @@ use url::Url;
 
 use crate::path::{LogPathFileType, ParsedLogPath};
 use crate::utils::require;
-use crate::{DeltaResult, Error, FileMeta, Version};
+use crate::{FileMeta, KernelError, KernelResult, Version};
 
 /// A catalog commit that has been ratified by the catalog but not yet published to the Delta log.
 ///
@@ -27,10 +27,10 @@ impl CatalogCommit {
     pub(crate) fn try_new(
         log_root: &Url,
         catalog_commit: &ParsedLogPath<FileMeta>,
-    ) -> DeltaResult<Self> {
+    ) -> KernelResult<Self> {
         require!(
             catalog_commit.file_type == LogPathFileType::StagedCommit,
-            Error::Generic(format!(
+            KernelError::Generic(format!(
                 "Cannot construct CatalogCommit. Expected a StagedCommit, got {:?}",
                 catalog_commit.file_type
             ))
@@ -98,7 +98,7 @@ impl PublishMetadata {
     pub fn try_new(
         publish_to_version: Version,
         commits_to_publish: Vec<CatalogCommit>,
-    ) -> DeltaResult<Self> {
+    ) -> KernelResult<Self> {
         Self::validate_contiguous(&commits_to_publish)?;
         Self::validate_end_version(&commits_to_publish, publish_to_version)?;
         Ok(Self {
@@ -117,13 +117,13 @@ impl PublishMetadata {
         &self.commits_to_publish
     }
 
-    fn validate_contiguous(commits_to_publish: &[CatalogCommit]) -> DeltaResult<()> {
+    fn validate_contiguous(commits_to_publish: &[CatalogCommit]) -> KernelResult<()> {
         commits_to_publish
             .windows(2)
             .all(|c| c[0].version() + 1 == c[1].version())
             .then_some(())
             .ok_or_else(|| {
-                Error::Generic(format!(
+                KernelError::Generic(format!(
                     "Catalog commits must be contiguous: got versions {:?}",
                     commits_to_publish
                         .iter()
@@ -136,13 +136,13 @@ impl PublishMetadata {
     fn validate_end_version(
         commits_to_publish: &[CatalogCommit],
         publish_to_version: Version,
-    ) -> DeltaResult<()> {
+    ) -> KernelResult<()> {
         match commits_to_publish.last().map(|c| c.version()) {
             Some(v) if v == publish_to_version => Ok(()),
-            Some(v) => Err(Error::Generic(format!(
+            Some(v) => Err(KernelError::Generic(format!(
                 "Catalog commits must end with snapshot version {publish_to_version}, but got {v}"
             ))),
-            None => Err(Error::Generic(format!(
+            None => Err(KernelError::Generic(format!(
                 "Catalog commits are empty, expected snapshot version {publish_to_version}"
             ))),
         }
@@ -167,10 +167,12 @@ mod tests {
         let parsed_staged_commit = ParsedLogPath::create_parsed_staged_commit(&table_root(), 10);
         let catalog_commit = CatalogCommit::try_new(&log_root(), &parsed_staged_commit).unwrap();
         assert_eq!(catalog_commit.version(), 10);
-        assert!(catalog_commit
-            .location()
-            .as_str()
-            .starts_with("memory:///_delta_log/_staged_commits/00000000000000000010"));
+        assert!(
+            catalog_commit
+                .location()
+                .as_str()
+                .starts_with("memory:///_delta_log/_staged_commits/00000000000000000010")
+        );
         assert_eq!(
             catalog_commit.published_location().as_str(),
             "memory:///_delta_log/00000000000000000010.json"

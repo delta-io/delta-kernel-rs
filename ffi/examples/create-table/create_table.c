@@ -16,16 +16,13 @@
 // Demonstrates:
 //   - Building a schema via the KernelSchemaVisitorState API (engine-side -> kernel-side
 //     schema conversion): visit_field_long, visit_field_string, visit_field_struct.
-//   - get_create_table_builder with a static schema spec.
-//   - create_table_builder_with_table_property to set `delta.enableChangeDataFeed`.
-//   - create_table_builder_build -> create_table_commit.
+//   - new_create_table_txn_builder with a static schema spec.
+//   - create_table_txn_builder_with_table_property to set `delta.enableChangeDataFeed`.
+//   - create_table_txn_builder_build -> create_table_txn_commit.
 //   - Opening a snapshot on the freshly-created table to confirm the commit landed.
 //
-// Note: get_create_table_builder takes engine_info and stores it on the builder, so the
-// transaction is already labelled by the time we call create_table_commit. The example
-// therefore does NOT call create_table_with_engine_info -- that function exists for
-// engines that want to override the engine_info after building (and is exercised by the
-// existing-table write path in write-table).
+// Note: new_create_table_txn_builder takes engine_info and stores it on the builder, so the
+// transaction is already labelled by the time we call create_table_txn_commit.
 //
 // The example does not stage any initial files. The
 // add_files flow requires constructing an Arrow batch matching Transaction::add_files_schema,
@@ -63,10 +60,10 @@ static uintptr_t build_schema(void* data, KernelSchemaVisitorState* state) {
     ExternResultusize r;
     switch (f->type) {
       case FIELD_LONG:
-        r = visit_field_long(state, name, f->nullable, allocate_error);
+        r = visit_field_long(state, name, f->nullable, NULL, &error_allocators);
         break;
       case FIELD_STRING:
-        r = visit_field_string(state, name, f->nullable, allocate_error);
+        r = visit_field_string(state, name, f->nullable, NULL, &error_allocators);
         break;
       default:
         fprintf(stderr, "Unknown field type %d\n", f->type);
@@ -85,7 +82,7 @@ static uintptr_t build_schema(void* data, KernelSchemaVisitorState* state) {
   // pass a stable placeholder.
   KernelStringSlice root_name = { "root", 4 };
   ExternResultusize root = visit_field_struct(
-      state, root_name, child_ids, spec->field_count, /*nullable*/ false, allocate_error);
+      state, root_name, child_ids, spec->field_count, /*nullable*/ false, NULL, &error_allocators);
   free(child_ids);
   if (root.tag != Okusize) {
     print_error("visit_field_struct failed for top-level", (Error*)root.err);
@@ -105,9 +102,9 @@ int main(int argc, char* argv[]) {
   KernelStringSlice table_path_slice = { table_path, strlen(table_path) };
 
   // === Build engine ===
-  ExternResultEngineBuilder engine_builder_res =
-      get_engine_builder(table_path_slice, allocate_error);
-  if (engine_builder_res.tag != OkEngineBuilder) {
+  ExternResultHandleExclusiveEngineBuilder engine_builder_res =
+      get_engine_builder(table_path_slice, &error_allocators);
+  if (engine_builder_res.tag != OkHandleExclusiveEngineBuilder) {
     print_error("Could not get engine builder.", (Error*)engine_builder_res.err);
     free_error((Error*)engine_builder_res.err);
     return 1;
@@ -133,24 +130,25 @@ int main(int argc, char* argv[]) {
   // === Get create-table builder ===
   const char* engine_info_str = "create_table_example";
   KernelStringSlice engine_info_slice = { engine_info_str, strlen(engine_info_str) };
-  ExternResultHandleExclusiveCreateTableBuilder builder_res =
-      get_create_table_builder(table_path_slice, &engine_schema, engine_info_slice, engine);
-  if (builder_res.tag != OkHandleExclusiveCreateTableBuilder) {
+  ExternResultHandleExclusiveCreateTableTransactionBuilder builder_res =
+      new_create_table_txn_builder(
+          table_path_slice, &engine_schema, engine_info_slice, /* data_change */ true, engine);
+  if (builder_res.tag != OkHandleExclusiveCreateTableTransactionBuilder) {
     print_error("Failed to get create-table builder.", (Error*)builder_res.err);
     free_error((Error*)builder_res.err);
     free_engine(engine);
     return 1;
   }
-  ExclusiveCreateTableBuilder* builder = builder_res.ok;
+  ExclusiveCreateTableTransactionBuilder* builder = builder_res.ok;
 
   // === Chain a table property (CONSUMES and RETURNS the builder handle) ===
   const char* prop_key = "delta.enableChangeDataFeed";
   const char* prop_val = "true";
   KernelStringSlice prop_key_slice = { prop_key, strlen(prop_key) };
   KernelStringSlice prop_val_slice = { prop_val, strlen(prop_val) };
-  ExternResultHandleExclusiveCreateTableBuilder prop_res = create_table_builder_with_table_property(
+  ExternResultHandleExclusiveCreateTableTransactionBuilder prop_res = create_table_txn_builder_with_table_property(
       builder, prop_key_slice, prop_val_slice, engine);
-  if (prop_res.tag != OkHandleExclusiveCreateTableBuilder) {
+  if (prop_res.tag != OkHandleExclusiveCreateTableTransactionBuilder) {
     // IMPORTANT: the old builder handle is consumed unconditionally, including on error.
     print_error("Failed to set table property.", (Error*)prop_res.err);
     free_error((Error*)prop_res.err);
@@ -160,20 +158,20 @@ int main(int argc, char* argv[]) {
   builder = prop_res.ok;
 
   // === Build -> produces a create-table transaction ===
-  ExternResultHandleExclusiveCreateTransaction txn_res =
-      create_table_builder_build(builder, engine);
-  if (txn_res.tag != OkHandleExclusiveCreateTransaction) {
-    print_error("create_table_builder_build failed.", (Error*)txn_res.err);
+  ExternResultHandleExclusiveCreateTableTransaction txn_res =
+      create_table_txn_builder_build(builder, engine);
+  if (txn_res.tag != OkHandleExclusiveCreateTableTransaction) {
+    print_error("create_table_txn_builder_build failed.", (Error*)txn_res.err);
     free_error((Error*)txn_res.err);
     free_engine(engine);
     return 1;
   }
-  ExclusiveCreateTransaction* txn = txn_res.ok;
+  ExclusiveCreateTableTransaction* txn = txn_res.ok;
 
   // === Commit ===
-  ExternResultHandleExclusiveCommittedTransaction commit_res = create_table_commit(txn, engine);
+  ExternResultHandleExclusiveCommittedTransaction commit_res = create_table_txn_commit(txn, engine);
   if (commit_res.tag != OkHandleExclusiveCommittedTransaction) {
-    print_error("create_table_commit failed.", (Error*)commit_res.err);
+    print_error("create_table_txn_commit failed.", (Error*)commit_res.err);
     free_error((Error*)commit_res.err);
     free_engine(engine);
     return 1;
@@ -183,9 +181,9 @@ int main(int argc, char* argv[]) {
   free_committed_transaction(committed);
 
   // === Open a snapshot on the new table to confirm it landed ===
-  ExternResultHandleMutableFfiSnapshotBuilder snapshot_builder_res =
+  ExternResultHandleExclusiveSnapshotBuilder snapshot_builder_res =
       get_snapshot_builder(table_path_slice, engine);
-  if (snapshot_builder_res.tag != OkHandleMutableFfiSnapshotBuilder) {
+  if (snapshot_builder_res.tag != OkHandleExclusiveSnapshotBuilder) {
     print_error("Failed to get snapshot builder.", (Error*)snapshot_builder_res.err);
     free_error((Error*)snapshot_builder_res.err);
     free_engine(engine);

@@ -6,37 +6,40 @@ use delta_kernel::arrow::compute::concat_batches;
 use delta_kernel::arrow::datatypes::{DataType, Field, Fields, Schema, SchemaRef};
 use delta_kernel::arrow::util::pretty::pretty_format_batches;
 use delta_kernel::engine::arrow_data::EngineDataArrowExt as _;
-use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::object_store::ObjectStore;
+use delta_kernel::object_store::local::LocalFileSystem;
+#[allow(deprecated)]
 use delta_kernel::parquet::arrow::async_reader::{
     ParquetObjectReader, ParquetRecordBatchStreamBuilder,
 };
 use delta_kernel::snapshot::Snapshot;
-use delta_kernel::{DeltaResult, Engine, Error};
-use futures::stream::TryStreamExt;
+use delta_kernel::{Engine, KernelError, KernelResult};
 use futures::StreamExt;
+use futures::stream::TryStreamExt;
 use itertools::Itertools;
 
+use crate::acceptance_workloads::validation::assert_aligned_data_matches;
 use crate::{TestCaseInfo, TestResult};
 
-pub async fn read_golden(path: &Path, _version: Option<&str>) -> DeltaResult<RecordBatch> {
+#[allow(deprecated)]
+pub async fn read_golden(path: &Path, _version: Option<&str>) -> KernelResult<RecordBatch> {
     let expected_root = path.join("expected").join("latest").join("table_content");
     let store = Arc::new(LocalFileSystem::new_with_prefix(&expected_root)?);
     let files: Vec<_> = store.list(None).try_collect().await?;
     let mut batches = vec![];
     let mut schema = None;
     for meta in files.into_iter() {
-        if let Some(ext) = meta.location.extension() {
-            if ext == "parquet" {
-                let reader = ParquetObjectReader::new(store.clone(), meta.location);
-                let builder = ParquetRecordBatchStreamBuilder::new(reader).await?;
-                if schema.is_none() {
-                    schema = Some(builder.schema().clone());
-                }
-                let mut stream = builder.build()?;
-                while let Some(batch) = stream.next().await {
-                    batches.push(batch?);
-                }
+        if let Some(ext) = meta.location.extension()
+            && ext == "parquet"
+        {
+            let reader = ParquetObjectReader::new(store.clone(), meta.location);
+            let builder = ParquetRecordBatchStreamBuilder::new(reader).await?;
+            if schema.is_none() {
+                schema = Some(builder.schema().clone());
+            }
+            let mut stream = builder.build()?;
+            while let Some(batch) = stream.next().await {
+                batches.push(batch?);
             }
         }
     }
@@ -44,11 +47,11 @@ pub async fn read_golden(path: &Path, _version: Option<&str>) -> DeltaResult<Rec
     Ok(all_data)
 }
 
-fn assert_schema_fields_match(schema: &Schema, golden: &Schema) -> DeltaResult<()> {
+fn assert_schema_fields_match(schema: &Schema, golden: &Schema) -> KernelResult<()> {
     let schema_stripped = strip_metadata(schema);
     let golden_stripped = strip_metadata(golden);
     if schema_stripped.fields() != golden_stripped.fields() {
-        return Err(Error::generic(format!(
+        return Err(KernelError::generic(format!(
             "Schema mismatch:\nActual: {:?}\nExpected: {:?}",
             schema_stripped.fields(),
             golden_stripped.fields()
@@ -86,7 +89,7 @@ pub fn assert_data_matches(
     result: Vec<RecordBatch>,
     result_schema: &SchemaRef,
     expected: RecordBatch,
-) -> DeltaResult<()> {
+) -> KernelResult<()> {
     let all_data = concat_batches(result_schema, result.iter())?;
 
     // Validate schemas match
@@ -94,10 +97,10 @@ pub fn assert_data_matches(
 
     // Format both batches as strings for order-independent comparison
     let actual_str = pretty_format_batches(std::slice::from_ref(&all_data))
-        .map_err(|e| Error::generic(format!("Failed to format actual: {}", e)))?
+        .map_err(|e| KernelError::generic(format!("Failed to format actual: {}", e)))?
         .to_string();
     let expected_str = pretty_format_batches(std::slice::from_ref(&expected))
-        .map_err(|e| Error::generic(format!("Failed to format expected: {}", e)))?
+        .map_err(|e| KernelError::generic(format!("Failed to format expected: {}", e)))?
         .to_string();
 
     let mut actual_lines: Vec<&str> = actual_str.trim().lines().collect();
@@ -115,7 +118,7 @@ pub fn assert_data_matches(
 
     // Compare sorted lines
     if actual_lines != expected_lines {
-        return Err(Error::generic(format!(
+        return Err(KernelError::generic(format!(
             "Data mismatch:\nExpected:\n{}\nActual:\n{}",
             expected_lines.join("\n"),
             actual_lines.join("\n")
@@ -135,7 +138,7 @@ pub async fn assert_scan_metadata(
     let mut schema = None;
     let batches: Vec<RecordBatch> = scan
         .execute(engine)?
-        .map(|data| -> DeltaResult<_> {
+        .map(|data| -> KernelResult<_> {
             let record_batch = data?.try_into_record_batch()?;
             if schema.is_none() {
                 schema = Some(record_batch.schema());
@@ -144,7 +147,7 @@ pub async fn assert_scan_metadata(
         })
         .try_collect()?;
     let golden = read_golden(test_case.root_dir(), None).await?;
-    assert_data_matches(batches, &schema.unwrap(), golden)?;
+    assert_aligned_data_matches(batches, &schema.unwrap(), golden)?;
 
     Ok(())
 }

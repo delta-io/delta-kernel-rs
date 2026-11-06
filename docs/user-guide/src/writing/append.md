@@ -31,10 +31,10 @@ may differ.
 # use delta_kernel::engine::arrow_data::ArrowEngineData;
 # use delta_kernel_default_engine::DefaultEngine;
 # use delta_kernel_default_engine::storage::store_from_url;
-# use delta_kernel::transaction::CommitResult;
-# use delta_kernel::{DeltaResult, Snapshot};
+# use delta_kernel::transaction::{CommitResult, UpdateTableOperation};
+# use delta_kernel::{KernelResult, Snapshot};
 # #[tokio::main]
-# async fn main() -> DeltaResult<()> {
+# async fn main() -> KernelResult<()> {
 # let url = delta_kernel::try_parse_uri("/tmp/table")?;
 # let engine = DefaultEngine::builder(store_from_url(&url)?).build();
 // 1. Get a snapshot
@@ -42,19 +42,22 @@ let snapshot = Snapshot::builder_for(url).build(&engine)?;
 
 // 2. Create a transaction
 let mut txn = snapshot
-    .transaction(Box::new(FileSystemCommitter::new()), &engine)?
-    .with_operation("INSERT".to_string())
-    .with_engine_info("my-app/1.0")
-    .with_data_change(true);
+    .update_table(UpdateTableOperation::Write, "my-app/1.0", /* data_change */ true)
+    .build(&engine, Box::new(FileSystemCommitter::new()))?;
 
 // 3. Create write state and bind a write context
 let write_state = txn.write_state()?;
-let write_context = write_state.unpartitioned_write_context()?;
+let write_context = write_state.write_context_builder().build()?;
 
 // 4. Write Parquet file(s)
 // Assumes the table schema is: name (STRING), age (INTEGER), city (STRING)
 let batch = RecordBatch::try_new(
-    Arc::new(write_context.logical_schema().as_ref().try_into_arrow()?),
+    Arc::new(
+        write_context
+            .logical_data_schema()
+            .as_ref()
+            .try_into_arrow()?,
+    ),
     vec![
         Arc::new(StringArray::from(vec!["Dave", "Eve", "Frank"])),
         Arc::new(Int32Array::from(vec![4, 5, 6])),
@@ -71,7 +74,7 @@ txn.add_files(file_metadata);
 
 // 6. Commit
 match txn.commit(&engine)? {
-    CommitResult::CommittedTransaction(committed) => {
+    CommitResult::Committed(committed) => {
         println!("Committed version {}", committed.commit_version());
     }
     _ => eprintln!("commit did not succeed"),
@@ -87,21 +90,29 @@ writing against:
 
 ```rust,ignore
 let mut txn = snapshot
-    .transaction(Box::new(FileSystemCommitter::new()), &engine)?
-    .with_operation("INSERT".to_string())
-    .with_engine_info("my-app/1.0")
-    .with_data_change(true);
+    .update_table(UpdateTableOperation::Write, "my-app/1.0", /* data_change */ true)
+    .build(&engine, Box::new(FileSystemCommitter::new()))?;
 ```
 
-The builder methods:
-
-| Method | Purpose |
-|--------|---------|
-| `with_operation(String)` | Operation name stored in the commit log (e.g. `"INSERT"`, `"MERGE"`) |
-| `with_engine_info(impl Into<String>)` | Identifies your application in the commit log |
-| `with_data_change(bool)` | Whether this commit materially changes data (`true`) or just reorganizes it (`false`, e.g. OPTIMIZE) |
+Pass the operation, connector name/version, and `data_change` to
+`snapshot.update_table(operation, engine_info, data_change)`. Use `true` for appends that add records.
+Kernel records the operation and connector name/version in the commit log.
+Use `UpdateTableOperation::Custom` for connector-specific operation names.
+These inputs cannot be changed on the returned builder or transaction.
 
 ## WriteState and BoundWriteContext
+
+If the table declares column defaults, resolve any defaults your input needs and acknowledge them
+before requesting write state. See [Column defaults](./column_defaults.md) for both Kernel-parsed
+and connector-evaluated defaults.
+
+If the table declares CHECK constraints, acknowledge that your connector enforces them before
+requesting write state. See [Check constraints](./check_constraints.md) for discovery and
+validation.
+
+If the table has generated columns, acknowledge that your connector enforces them before requesting
+write state. See [Generated columns](./generated_columns.md) for discovery, computing, and
+verification.
 
 Before writing data, obtain a `WriteState` from the transaction. Bind the state to create a
 `BoundWriteContext`, which bundles everything needed to correctly write Parquet files:
@@ -110,11 +121,32 @@ Before writing data, obtain a `WriteState` from the transaction. Bind the state 
 let write_state = txn.write_state()?;
 
 // For unpartitioned tables
-let write_context = write_state.unpartitioned_write_context()?;
+let write_context = write_state.write_context_builder().build()?;
 
 // For partitioned tables, pass the partition values for this file
-let write_context = write_state.partitioned_write_context(partition_values)?;
+let write_context = write_state
+    .write_context_builder()
+    .with_partition_values(partition_values)
+    .build()?;
 ```
+
+If the connector input data contains materialized Row IDs or Row Commit Versions, provide their
+logical column names to the builder:
+
+```rust,ignore
+use delta_kernel::transaction::RowTrackingMetadataColumns;
+
+let write_context = write_state
+    .write_context_builder()
+    .with_row_tracking_columns(RowTrackingMetadataColumns {
+        row_id_col_name: Some("row_id"),
+        row_commit_version_col_name: Some("row_commit_version"),
+    })
+    .build()?;
+```
+
+Kernel maps each provided logical row-tracking metadata column to the corresponding physical
+column configured on the table. Row Tracking must be enabled when these options are provided.
 
 For partitioned tables, see
 [Writing to Partitioned Tables](./partitioned_writes.md).
@@ -125,8 +157,8 @@ For partitioned tables, see
 |--------|---------|---------|
 | `table_root_dir()` | `&Url` | The table root URL |
 | `write_dir()` | `Url` | The URL for writing files |
-| `logical_schema()` | `&SchemaRef` | The schema your logical data should conform to |
-| `physical_schema()` | `&SchemaRef` | The schema for the on-disk physical data |
+| `logical_data_schema()` | `&SchemaRef` | The schema your connector input data must conform to when using this write context |
+| `physical_data_schema()` | `&SchemaRef` | The schema for the data written to Parquet |
 | `logical_to_physical()` | `ExpressionRef` | Expression that transforms logical data to physical |
 | `column_mapping_mode()` | `ColumnMappingMode` | The column mapping mode for this table |
 | `stats_columns()` | `&[ColumnName]` | Columns that should have statistics collected |
@@ -135,7 +167,7 @@ For partitioned tables, see
 ## Writing Parquet files
 
 Start with the logical `data: EngineData` you want to write. Its schema should conform to
-`write_context.logical_schema()`.
+`write_context.logical_data_schema()`.
 
 ### Using `DefaultEngine`
 
@@ -148,8 +180,7 @@ let file_metadata = engine
 ```
 
 - **`data`**: An `ArrowEngineData` wrapping a `RecordBatch` matching the logical schema
-- **`write_context`**: Bound from a `WriteState` with `unpartitioned_write_context()` or
-  `partitioned_write_context()`
+- **`write_context`**: Built from a `WriteState` with `write_context_builder()`
 
 `DefaultEngine::write_parquet` handles the logical-to-physical transformation, generates a unique filename,
 writes the file, collects statistics, and returns file metadata that you pass to
@@ -170,9 +201,9 @@ If you do not use `DefaultEngine`, write the files yourself. The expected flow i
 
 // 1. Transform logical data into physical data
 let evaluator = engine.evaluation_handler().new_expression_evaluator(
-    write_context.logical_schema().clone(),
+    write_context.logical_data_schema().clone(),
     write_context.logical_to_physical(),
-    write_context.physical_schema().clone().into(),
+    write_context.physical_data_schema().clone().into(),
 )?;
 let physical_data = evaluator.evaluate(data.as_ref())?;
 
@@ -185,9 +216,9 @@ txn.add_files(add_file_metadata);
 You can call `add_files` multiple times to write multiple files in one transaction.
 
 > [!NOTE]
-> Transaction methods that prepare or register data files (`write_state`, `add_files`, and
-> `stats_schema`) are gated by the `SupportsDataFiles` trait bound. They're available on standard
-> write transactions but not on metadata-only transaction states such as `AlterTable`.
+> Set `data_change` in the builder constructor. Use `true` when adding records and `false` for
+> rewrites that preserve logical data. Kernel preserves your value, including when no files are
+> staged; it does not infer it from the operation or staged batches.
 
 ## Committing
 
@@ -195,7 +226,7 @@ You can call `add_files` multiple times to write multiple files in one transacti
 
 ```rust,ignore
 match txn.commit(&engine)? {
-    CommitResult::CommittedTransaction(committed) => {
+    CommitResult::Committed(committed) => {
         println!("Committed version {}", committed.commit_version());
     }
     _ => {
@@ -205,10 +236,10 @@ match txn.commit(&engine)? {
 ```
 
 > [!NOTE]
-> `commit()` returns a `CommitResult` with three variants: `CommittedTransaction` on success,
-> `ConflictedTransaction` if another writer committed first, and `RetryableTransaction` for
-> transient IO errors. Automatic conflict resolution is not yet supported. A blind append to
-> a table with no concurrent writers always succeeds.
+> `commit()` returns a `CommitResult` with three variants: `Committed` on success, `Conflicted` if
+> another writer committed first, and `Retryable` for transient IO errors. Automatic conflict
+> resolution is not yet supported. A blind append to a table with no concurrent writers always
+> succeeds.
 
 ## Blind appends
 
@@ -218,25 +249,29 @@ construction:
 
 ```rust,ignore
 let txn = snapshot
-    .transaction(Box::new(FileSystemCommitter::new()), &engine)?
-    .with_operation("INSERT".to_string())
-    .with_blind_append();
+    .update_table(
+        UpdateTableOperation::Custom("INSERT".to_string()),
+        "my-app/1.0",
+        /* data_change */ true,
+    )
+    .with_blind_append()
+    .build(&engine, Box::new(FileSystemCommitter::new()))?;
 ```
 
 Kernel records `isBlindAppend: true` in the commit's `commitInfo` action. This flag
 enables conflict resolution optimizations: two blind appends to the same table can never
 conflict with each other, because neither depends on the other's output.
 
-Kernel validates the following rules at commit time. If any rule is violated, `commit()`
-returns an error:
+Kernel rejects incompatible intent during `build()`: `ALTER TABLE`, schema changes, and
+`dataChange = false`. During `commit()`, Kernel requires staged Add metadata and rejects staged
+Remove metadata or deletion-vector batches. These checks use batch presence, so empty or fully
+unselected batches still count as staged.
 
 | Rule | Rationale |
 |------|-----------|
 | The transaction must add at least one file | A blind append with no data is meaningless |
-| `data_change` must be `true` | Blind appends are logical data additions, not reorganizations |
 | The transaction must not remove any files | Removing files means the write depends on existing state |
 | The transaction must not update deletion vectors | Deletion vector updates depend on existing state |
-| The transaction must not be a create-table transaction | Table creation is not an append |
 
 > [!TIP]
 > Mark your transaction as a blind append whenever you are inserting new data without reading
@@ -250,8 +285,14 @@ that action, call `with_commit_info()` with your custom data and its schema:
 
 ```rust,ignore
 let txn = snapshot
-    .transaction(Box::new(FileSystemCommitter::new()), &engine)?
-    .with_operation("INSERT".to_string())
+    .update_table(
+        UpdateTableOperation::Custom("INSERT".to_string()),
+        "my-app/1.0",
+        /* data_change */ true,
+    )
+    .with_operation_parameters([("mode", Some("Append")), ("predicate", None)])
+    .with_operation_metrics([("numFiles", Some("1"))])
+    .build(&engine, Box::new(FileSystemCommitter::new()))?
     .with_commit_info(engine_commit_info, commit_info_schema);
 ```
 
@@ -262,20 +303,22 @@ into the final `commitInfo` action.
 Kernel reserves certain fields and overrides them regardless of what you provide. Do not set
 these fields in your custom commit info:
 
-| Field | Set by Kernel to |
-|-------|------------------|
-| `timestamp` | The transaction's commit timestamp |
-| `inCommitTimestamp` | The in-commit timestamp (if ICT is enabled on the table) |
-| `operation` | The value from `with_operation()` |
-| `operationParameters` | Operation parameters (if any) |
-| `kernelVersion` | The Kernel library version |
-| `isBlindAppend` | `true` if `with_blind_append()` was called, omitted otherwise |
-| `engineInfo` | The value from `with_engine_info()` |
-| `txnId` | A unique transaction identifier |
+| Field | Meaning | Value written by Kernel |
+|-------|---------|-------------------------|
+| `timestamp` | The transaction's commit timestamp | Current time when the transaction is created |
+| `inCommitTimestamp` | The table's in-commit timestamp | The in-commit timestamp when enabled. Omitted otherwise |
+| `operation` | The operation name | The required `UpdateTableOperation` for existing tables. Fixed to `CREATE TABLE` for creation |
+| `operationParameters` | Parameters describing the operation | The value from `with_operation_parameters()`, defaulting to `{}` |
+| `operationMetrics` | Metrics recorded for the operation | The value from `with_operation_metrics()`. Omitted when unset. An explicitly empty map is written as `{}` |
+| `kernelVersion` | The Kernel library version | Current Kernel version |
+| `isBlindAppend` | Whether the commit is a blind append | `true` after `with_blind_append()`. Omitted (`false`) otherwise |
+| `engineInfo` | The engine identifier | Always written using the connector name and version required by the transaction constructor |
+| `txnId` | A unique transaction identifier | A new UUID generated for the commit |
 
-Any field in your custom data that shares a name with a Kernel-reserved field is replaced
-with Kernel's value. Fields with names that do not collide are preserved as-is in the final
-`commitInfo`.
+Kernel ignores reserved fields in custom commit info. Use `with_operation_parameters()` and
+`with_operation_metrics()` to set those fields. Each setter replaces the complete map. A `None`
+value is written as `null`. If a key appears more than once, the last value wins. Fields with names
+that do not collide are preserved as-is.
 
 ## After committing
 
@@ -284,7 +327,7 @@ snapshot and post-commit statistics:
 
 ```rust,ignore
 let committed = match txn.commit(&engine)? {
-    CommitResult::CommittedTransaction(c) => c,
+    CommitResult::Committed(c) => c,
     _ => panic!("unexpected result"),
 };
 

@@ -7,26 +7,26 @@ use url::Url;
 use crate::action_reconciliation::{
     ActionReconciliationIterator, ActionReconciliationIteratorState,
 };
-use crate::actions::{Add, ADD_NAME, MAX_VALUES, MIN_VALUES, NULL_COUNT, NUM_RECORDS};
+use crate::actions::{ADD_NAME, Add, MAX_VALUES, MIN_VALUES, NULL_COUNT, NUM_RECORDS};
 use crate::arrow::array::{Array, ArrayRef, AsArray, RecordBatch, StructArray};
 use crate::arrow::datatypes::{ArrowPrimitiveType, Int32Type, Int64Type};
+use crate::checkpoint::CheckpointWriter;
 use crate::checkpoint::sidecar::{SidecarSplitter, SingleSidecarDataIterator};
 use crate::checkpoint::tests::{
     create_add_action, create_metadata_action, create_metadata_with_stats_config_and_partitions,
     create_remove_action, create_v2_checkpoint_protocol_action, new_in_memory_store,
     write_commit_to_store,
 };
-use crate::checkpoint::CheckpointWriter;
 use crate::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt};
 use crate::engine::arrow_expression::ArrowEvaluationHandler;
 use crate::engine::sync::SyncEngine;
+use crate::object_store::ObjectStoreExt as _;
 use crate::object_store::memory::InMemory;
 use crate::object_store::path::Path;
-use crate::object_store::ObjectStoreExt as _;
 use crate::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-use crate::schema::{schema, schema_ref, DataType, StructType};
+use crate::schema::{DataType, StructType, schema, schema_ref};
 use crate::unit_test_utils::Action;
-use crate::{DeltaResult, Engine, EngineData, Snapshot};
+use crate::{Engine, EngineData, KernelResult, Snapshot};
 
 struct CheckpointParts {
     sidecar_files: Vec<Url>,
@@ -42,10 +42,9 @@ fn generate_checkpoint_parts(
     writer: &CheckpointWriter,
     engine: &dyn Engine,
     file_actions_per_sidecar_hint: usize,
-) -> DeltaResult<CheckpointParts> {
-    let data_iter = writer.checkpoint_data(engine)?;
+) -> KernelResult<CheckpointParts> {
+    let (data_iter, output_schema) = writer.checkpoint_data_with_schema(engine)?;
     let iter_state = data_iter.state();
-    let output_schema = writer.output_schema.clone();
 
     let splitter = SidecarSplitter::new_mut_shared(
         data_iter,
@@ -201,50 +200,50 @@ fn verify_non_file_batches(batches: &[Box<dyn EngineData>], expected: &ExpectedN
         let rb = arrow.record_batch();
         for row in 0..rb.num_rows() {
             let mut has_non_file_action = false;
-            if let Some(col) = rb.column_by_name("protocol") {
-                if col.is_valid(row) {
-                    has_non_file_action = true;
-                    protocol_count += 1;
-                    let parent_struct = col.as_struct();
-                    let reader_v =
-                        struct_field_value::<Int32Type>(parent_struct, "minReaderVersion", row);
-                    let writer_v =
-                        struct_field_value::<Int32Type>(parent_struct, "minWriterVersion", row);
-                    assert_eq!(
-                        reader_v, expected.reader_version,
-                        "protocol minReaderVersion mismatch"
-                    );
-                    assert_eq!(
-                        writer_v, expected.writer_version,
-                        "protocol minWriterVersion mismatch"
-                    );
-                }
+            if let Some(col) = rb.column_by_name("protocol")
+                && col.is_valid(row)
+            {
+                has_non_file_action = true;
+                protocol_count += 1;
+                let parent_struct = col.as_struct();
+                let reader_v =
+                    struct_field_value::<Int32Type>(parent_struct, "minReaderVersion", row);
+                let writer_v =
+                    struct_field_value::<Int32Type>(parent_struct, "minWriterVersion", row);
+                assert_eq!(
+                    reader_v, expected.reader_version,
+                    "protocol minReaderVersion mismatch"
+                );
+                assert_eq!(
+                    writer_v, expected.writer_version,
+                    "protocol minWriterVersion mismatch"
+                );
             }
 
-            if let Some(col) = rb.column_by_name("metaData") {
-                if col.is_valid(row) {
-                    has_non_file_action = true;
-                    metadata_count += 1;
-                    let ms = col.as_struct();
-                    assert_eq!(
-                        struct_field_string(ms, "name", row),
-                        expected.table_name,
-                        "metadata name mismatch"
-                    );
-                }
+            if let Some(col) = rb.column_by_name("metaData")
+                && col.is_valid(row)
+            {
+                has_non_file_action = true;
+                metadata_count += 1;
+                let ms = col.as_struct();
+                assert_eq!(
+                    struct_field_string(ms, "name", row),
+                    expected.table_name,
+                    "metadata name mismatch"
+                );
             }
 
-            if let Some(col) = rb.column_by_name("checkpointMetadata") {
-                if col.is_valid(row) {
-                    has_non_file_action = true;
-                    checkpoint_metadata_count += 1;
-                    let cs = col.as_struct();
-                    let version = struct_field_value::<Int64Type>(cs, "version", row);
-                    assert_eq!(
-                        version, expected.checkpoint_version,
-                        "checkpointMetadata version mismatch"
-                    );
-                }
+            if let Some(col) = rb.column_by_name("checkpointMetadata")
+                && col.is_valid(row)
+            {
+                has_non_file_action = true;
+                checkpoint_metadata_count += 1;
+                let cs = col.as_struct();
+                let version = struct_field_value::<Int64Type>(cs, "version", row);
+                assert_eq!(
+                    version, expected.checkpoint_version,
+                    "checkpointMetadata version mismatch"
+                );
             }
 
             if let Some(add_col) = rb.column_by_name("add") {
@@ -278,7 +277,7 @@ fn verify_non_file_batches(batches: &[Box<dyn EngineData>], expected: &ExpectedN
 /// Verifies: exactly 1 sidecar file, non-file batches buffered, iterator exhausted,
 /// action counts correct.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_generate_sidecars_single_sidecar() -> DeltaResult<()> {
+async fn test_generate_sidecars_single_sidecar() -> KernelResult<()> {
     let (store, _) = new_in_memory_store();
     let engine = new_sync_engine(store.clone());
 
@@ -341,7 +340,7 @@ async fn test_generate_sidecars_single_sidecar() -> DeltaResult<()> {
 /// batches with both file and non-file actions correctly split, and the row count of the
 /// file and non-file batches is correct.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_generate_sidecars_multiple_chunks() -> DeltaResult<()> {
+async fn test_generate_sidecars_multiple_chunks() -> KernelResult<()> {
     let (store, _) = new_in_memory_store();
     let engine = new_sync_engine(store.clone());
 
@@ -451,7 +450,7 @@ async fn test_generate_sidecars_multiple_chunks() -> DeltaResult<()> {
 /// V2 table with adds across multiple commits, hint=1 (very small).
 /// Verifies: produces multiple sidecar files, splitter is exhausted.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_generate_sidecars_hint_one_per_batch() -> DeltaResult<()> {
+async fn test_generate_sidecars_hint_one_per_batch() -> KernelResult<()> {
     let (store, _) = new_in_memory_store();
     let engine = new_sync_engine(store.clone());
 
@@ -521,7 +520,7 @@ async fn test_generate_sidecars_hint_one_per_batch() -> DeltaResult<()> {
 /// 4. Validate the output schema includes `stats_parsed` and `partitionValues_parsed`.
 /// 5. Validate the actual values in `stats_parsed` and `partitionValues_parsed` match the input.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_generate_sidecars_stats_and_partition_values() -> DeltaResult<()> {
+async fn test_generate_sidecars_stats_and_partition_values() -> KernelResult<()> {
     let (store, _) = new_in_memory_store();
     let engine = new_sync_engine(store.clone());
 
@@ -557,7 +556,7 @@ async fn test_generate_sidecars_stats_and_partition_values() -> DeltaResult<()> 
     let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
     let writer = snapshot.create_checkpoint_writer(&engine)?;
 
-    let data_iter = writer.checkpoint_data(&engine)?;
+    let (data_iter, schema) = writer.checkpoint_data_with_schema(&engine)?;
     let mut all_batches = Vec::new();
     for batch_result in data_iter {
         let batch = batch_result?;
@@ -566,7 +565,6 @@ async fn test_generate_sidecars_stats_and_partition_values() -> DeltaResult<()> 
     }
 
     // Validate the checkpoint data schema
-    let schema = &writer.output_schema;
     let add_field = schema.field(ADD_NAME).expect("schema should have 'add'");
     if let DataType::Struct(ref add_struct) = add_field.data_type {
         assert!(
@@ -633,7 +631,7 @@ async fn test_generate_sidecars_stats_and_partition_values() -> DeltaResult<()> 
 /// V2 table with only protocol + metadata (no adds/removes).
 /// Verifies: SidecarSplitter yields no file-action rows and buffers all non-file actions.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_splitter_no_file_actions() -> DeltaResult<()> {
+async fn test_splitter_no_file_actions() -> KernelResult<()> {
     let (store, _) = new_in_memory_store();
     let engine = new_sync_engine(store.clone());
 
@@ -651,8 +649,7 @@ async fn test_splitter_no_file_actions() -> DeltaResult<()> {
     let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
     let writer = snapshot.create_checkpoint_writer(&engine)?;
 
-    let data_iter = writer.checkpoint_data(&engine)?;
-    let output_schema = writer.output_schema.clone();
+    let (data_iter, output_schema) = writer.checkpoint_data_with_schema(&engine)?;
 
     let splitter = SidecarSplitter::new_mut_shared(
         data_iter,

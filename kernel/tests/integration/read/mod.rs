@@ -1,39 +1,43 @@
 // Scan-metadata cancellation is a read-path concern, so its coverage lives alongside the other
 // read tests.
 mod scan_cancellation;
+#[cfg(feature = "udt-in-dev")]
+mod user_defined;
 
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::vec;
 
 use delta_kernel::actions::deletion_vector::split_vector;
-use delta_kernel::arrow::array::{ArrayRef, AsArray as _, RecordBatch, TimestampMicrosecondArray};
+use delta_kernel::arrow::array::{
+    ArrayRef, AsArray as _, Int64Array, ListArray, RecordBatch, TimestampMicrosecondArray,
+};
 use delta_kernel::arrow::compute::{concat_batches, filter_record_batch};
 use delta_kernel::arrow::datatypes::{
-    DataType as ArrowDataType, Field as ArrowField, Int64Type, Schema as ArrowSchema, TimeUnit,
+    DataType as ArrowDataType, Field as ArrowField, Int32Type, Int64Type, Schema as ArrowSchema,
+    TimeUnit,
 };
 use delta_kernel::engine::arrow_conversion::TryFromKernel as _;
 use delta_kernel::engine::arrow_data::EngineDataArrowExt as _;
 use delta_kernel::expressions::{
-    col, column_pred, lit, null_lit, Expression as Expr, ExpressionRef, Predicate as Pred,
-    PredicateRef, Scalar,
+    Expression as Expr, ExpressionRef, Predicate as Pred, PredicateRef, Scalar, col, expr, lit,
 };
 use delta_kernel::log_segment::LogSegment;
+use delta_kernel::object_store::ObjectStoreExt as _;
 use delta_kernel::object_store::memory::InMemory;
 use delta_kernel::object_store::path::Path;
-use delta_kernel::object_store::ObjectStoreExt as _;
 use delta_kernel::parquet::file::properties::{EnabledStatistics, WriterProperties};
 use delta_kernel::path::ParsedLogPath;
-use delta_kernel::scan::state::{transform_to_logical, ScanFile};
+use delta_kernel::scan::state::{ScanFile, transform_to_logical};
 use delta_kernel::scan::{Scan, StatsOptions};
-use delta_kernel::schema::{schema_ref, DataType, MetadataColumnSpec, Schema, StructField};
+use delta_kernel::schema::{DataType, MetadataColumnSpec, Schema, StructField, schema_ref};
 use delta_kernel::{Engine, FileMeta, Snapshot};
 use itertools::Itertools;
 use test_utils::delta_kernel_default_engine::DefaultEngineBuilder;
 use test_utils::{
-    actions_to_string, add_commit, generate_batch, generate_simple_batch, into_record_batch,
-    load_test_data, read_scan, record_batch_to_bytes, record_batch_to_bytes_with_props, IntoArray,
-    TestAction, METADATA,
+    IntoArray, METADATA, TestAction, actions_to_string, add_commit, generate_batch,
+    generate_simple_batch, into_record_batch, load_test_data, read_scan, record_batch_to_bytes,
+    record_batch_to_bytes_with_props,
 };
 use url::Url;
 
@@ -603,27 +607,27 @@ fn table_for_letters(letters: &[char]) -> Vec<String> {
 
 #[rstest::rstest]
 #[case::less_than(
-    col!("number").lt(lit(4i64)),
+    Pred::from_expr(expr!(col("number") < 4i64)),
     table_for_numbers(vec![1, 2, 3])
 )]
 #[case::less_than_or_equal(
-    col!("number").le(lit(4i64)),
+    Pred::from_expr(expr!(col("number") <= 4i64)),
     table_for_numbers(vec![1, 2, 3, 4])
 )]
 #[case::greater_than(
-    col!("number").gt(lit(4i64)),
+    Pred::from_expr(expr!(col("number") > 4i64)),
     table_for_numbers(vec![5, 6])
 )]
 #[case::greater_than_or_equal(
-    col!("number").ge(lit(4i64)),
+    Pred::from_expr(expr!(col("number") >= 4i64)),
     table_for_numbers(vec![4, 5, 6])
 )]
 #[case::equal(
-    col!("number").eq(lit(4i64)),
+    Pred::from_expr(expr!(col("number") == 4i64)),
     table_for_numbers(vec![4])
 )]
 #[case::not_equal(
-    col!("number").ne(lit(4i64)),
+    Pred::from_expr(expr!(col("number") != 4i64)),
     table_for_numbers(vec![1, 2, 3, 5, 6])
 )]
 fn predicate_on_number(
@@ -641,7 +645,7 @@ fn predicate_on_number(
 
 #[rstest::rstest]
 #[case::is_null(
-    col!("letter").is_null(),
+    Pred::from_expr(expr!(is_null(col("letter")))),
     vec![
         "+--------+--------+",
         "| letter | number |",
@@ -654,31 +658,31 @@ fn predicate_on_number(
     .collect()
 )]
 #[case::is_not_null(
-    col!("letter").is_not_null(),
+    Pred::from_expr(expr!(is_not_null(col("letter")))),
     table_for_letters(&['a', 'b', 'c', 'e'])
 )]
 #[case::less_than(
-    col!("letter").lt(lit("c")),
+    Pred::from_expr(expr!(col("letter") < "c")),
     table_for_letters(&['a', 'b'])
 )]
 #[case::less_than_or_equal(
-    col!("letter").le(lit("c")),
+    Pred::from_expr(expr!(col("letter") <= "c")),
     table_for_letters(&['a', 'b', 'c'])
 )]
 #[case::greater_than(
-    col!("letter").gt(lit("c")),
+    Pred::from_expr(expr!(col("letter") > "c")),
     table_for_letters(&['e'])
 )]
 #[case::greater_than_or_equal(
-    col!("letter").ge(lit("c")),
+    Pred::from_expr(expr!(col("letter") >= "c")),
     table_for_letters(&['c', 'e'])
 )]
 #[case::equal(
-    col!("letter").eq(lit("c")),
+    Pred::from_expr(expr!(col("letter") == "c")),
     table_for_letters(&['c'])
 )]
 #[case::not_equal(
-    col!("letter").ne(lit("c")),
+    Pred::from_expr(expr!(col("letter") != "c")),
     table_for_letters(&['a', 'b', 'e'])
 )]
 fn predicate_on_letter(
@@ -698,10 +702,7 @@ fn predicate_on_letter(
 
 #[rstest::rstest]
 #[case::or_with_pruning(
-    Pred::or(
-        col!("letter").gt(lit("a")),
-        col!("number").gt(lit(3i64)),
-    ),
+    Pred::from_expr(expr!(or(col("letter") > "a", col("number") > 3i64))),
     // Unified data skipping evaluates partition + data predicates in a single pass.
     // File a/1 (letter='a', max(number)=1): OR('a'>'a', 1>3) = FALSE -> pruned
     vec![
@@ -720,20 +721,17 @@ fn predicate_on_letter(
     .collect()
 )]
 #[case::and_with_pruning(
-    Pred::and(
-        col!("letter").gt(lit("a")), // numbers 2, 3, 5
-        col!("number").gt(lit(3i64)), // letters a, e
-    ),
+    Pred::from_expr(expr!(and(
+        col("letter") > "a", // numbers 2, 3, 5
+        col("number") > 3i64, // letters a, e
+    ))),
     table_for_letters(&['e'])
 )]
 #[case::and_with_nested_or(
-    Pred::and(
-        col!("letter").gt(lit("a")), // numbers 2, 3, 5
-        Pred::or(
-            col!("letter").eq(lit("c")),
-            col!("number").eq(lit(3i64)),
-        ),
-    ),
+    Pred::from_expr(expr!(and(
+        col("letter") > "a", // numbers 2, 3, 5
+        or(col("letter") == "c", col("number") == 3i64),
+    ))),
     // Unified data skipping evaluates the full expression:
     // b/2: AND(TRUE, OR(FALSE, FALSE)) = FALSE -> pruned
     // c/3: AND(TRUE, OR(TRUE, TRUE)) = TRUE -> kept
@@ -759,7 +757,7 @@ fn predicate_on_letter_and_number(
 #[rstest::rstest]
 #[case::predicate_on_unprojected_data_column_in_table_schema_succeeds(
     // `number` is a data column not present in the projected schema (`a_float`).
-    col!("number").gt(lit(4i64)),
+    Pred::from_expr(expr!(col("number") > 4i64)),
     vec![
         "+---------+",
         "| a_float |",
@@ -773,7 +771,7 @@ fn predicate_on_letter_and_number(
     .collect()
 )]
 #[case::predicate_on_partition_column_in_table_schema_succeeds(
-    col!("letter").eq(lit("a")),
+    Pred::from_expr(expr!(col("letter") == "a")),
     vec![
         "+---------+",
         "| a_float |",
@@ -788,10 +786,7 @@ fn predicate_on_letter_and_number(
 )]
 #[case::predicate_on_mixed_projected_and_unprojected_columns_succeeds(
     // a_float is projected, number is unprojected
-    Pred::and(
-        col!("a_float").gt(lit(4.0)),
-        col!("number").lt(lit(6i64)),
-    ),
+    Pred::from_expr(expr!(and(col("a_float") > 4.0, col("number") < 6i64))),
     vec![
         "+---------+",
         "| a_float |",
@@ -827,7 +822,7 @@ fn predicate_on_unprojected_column(
 #[rstest::rstest]
 #[case::partition_only_prunes_one_partition(
     // Partition-only predicate: modified = '2021-02-02' should prune 2021-02-01 files
-    col!("modified").eq(lit("2021-02-02")),
+    Pred::from_expr(expr!(col("modified") == "2021-02-02")),
     vec![
         "+----+------------+-------+",
         "| id | modified   | value |",
@@ -846,7 +841,7 @@ fn predicate_on_unprojected_column(
 )]
 #[case::partition_prunes_other_partition(
     // modified = '2021-02-01' should prune 2021-02-02 files, keeping all 2021-02-01 rows
-    col!("modified").eq(lit("2021-02-01")),
+    Pred::from_expr(expr!(col("modified") == "2021-02-01")),
     vec![
         "+----+------------+-------+",
         "| id | modified   | value |",
@@ -898,10 +893,7 @@ fn partition_pruning_with_checkpoint_parsed_values(
     // Data skipping keeps 2021-02-01 files (partition matches, max(value)=11 > 9) and
     // prunes 2021-02-02 files (partition mismatch). All rows from kept files are returned
     // since kernel does not apply row-level predicate filtering.
-    Pred::and(
-        col!("modified").eq(lit("2021-02-01")),
-        col!("value").gt(lit(9i32)),
-    ),
+    Pred::from_expr(expr!(and(col("modified") == "2021-02-01", col("value") > 9i32))),
     vec![
         "+----+------------+-------+",
         "| id | modified   | value |",
@@ -931,19 +923,13 @@ fn partition_pruning_with_checkpoint_parsed_values(
 #[case::and_prunes_all_files(
     // 2021-02-02: partition matches but data stats fail (max value=3, NOT > 3).
     // 2021-02-01: partition mismatch. All 4 files pruned.
-    Pred::and(
-        col!("modified").eq(lit("2021-02-02")),
-        col!("value").gt(lit(3i32)),
-    ),
+    Pred::from_expr(expr!(and(col("modified") == "2021-02-02", col("value") > 3i32))),
     vec![]
 )]
 #[case::or_prunes_by_both_partition_and_stats(
     // 2021-02-01 pruned: partition mismatch AND max(value)=11 NOT > 11.
     // 2021-02-02 kept by partition match. Only 2021-02-02 rows returned.
-    Pred::or(
-        col!("modified").eq(lit("2021-02-02")),
-        col!("value").gt(lit(11i32)),
-    ),
+    Pred::from_expr(expr!(or(col("modified") == "2021-02-02", col("value") > 11i32))),
     vec![
         "+----+------------+-------+",
         "| id | modified   | value |",
@@ -963,10 +949,7 @@ fn partition_pruning_with_checkpoint_parsed_values(
 #[case::or_keeps_all_files(
     // 2021-02-02 kept by partition match, 2021-02-01 kept by data stats (max=11 > 9).
     // All rows from all 4 files are returned.
-    Pred::or(
-        col!("modified").eq(lit("2021-02-02")),
-        col!("value").gt(lit(9i32)),
-    ),
+    Pred::from_expr(expr!(or(col("modified") == "2021-02-02", col("value") > 9i32))),
     vec![
         "+----+------------+-------+",
         "| id | modified   | value |",
@@ -1021,17 +1004,14 @@ fn mixed_predicate_with_checkpoint_parsed_columns(
 #[rstest::rstest]
 #[case::partition_only(
     // Partition-only predicate: category = 'A' prunes the category=B file
-    Arc::new(Pred::eq(col!("category"), lit("A"))),
+    Arc::new(Pred::from_expr(expr!(col("category") == "A"))),
     None,
     1
 )]
 #[case::mixed_partition_and_data(
     // Mixed predicate: category = 'A' OR val > 'z'. Category=A kept by partition match.
     // Category=B: partition mismatch, but max(val)='z' NOT > 'z', so data skipping prunes it.
-    Arc::new(Pred::or(
-        Pred::eq(col!("category"), lit("A")),
-        Pred::gt(col!("val"), lit("z")),
-    )),
+    Arc::new(Pred::from_expr(expr!(or(col("category") == "A", col("val") > "z")))),
     None,
     1
 )]
@@ -1039,7 +1019,7 @@ fn mixed_predicate_with_checkpoint_parsed_columns(
     // Project only "category"; predicate references unprojected "val" (logical) whose
     // physical name is "phys_val". Kernel must resolve to phys_val via the full table
     // schema and prune both files: max(phys_val)='z' is NOT > 'z'.
-    Arc::new(Pred::gt(col!("val"), lit("z"))),
+    Arc::new(Pred::from_expr(expr!(col("val") > "z"))),
     Some(vec!["category"]),
     0
 )]
@@ -1047,7 +1027,7 @@ fn mixed_predicate_with_checkpoint_parsed_columns(
     // Project only "val"; predicate references unprojected partition column "category"
     // (logical, physical name "phys_category"). Partition pruning must still kick in
     // using the physical partition name, keeping only the category=A file.
-    Arc::new(Pred::eq(col!("category"), lit("A"))),
+    Arc::new(Pred::from_expr(expr!(col("category") == "A"))),
     Some(vec!["val"]),
     1
 )]
@@ -1151,27 +1131,27 @@ async fn test_partition_pruning_with_column_mapping(
 
 #[rstest::rstest]
 #[case::not_less_than(
-    Pred::not(col!("number").lt(lit(4i64))),
+    Pred::from_expr(expr!(not(col("number") < 4i64))),
     table_for_numbers(vec![4, 5, 6])
 )]
 #[case::not_less_than_or_equal(
-    Pred::not(col!("number").le(lit(4i64))),
+    Pred::from_expr(expr!(not(col("number") <= 4i64))),
     table_for_numbers(vec![5, 6])
 )]
 #[case::not_greater_than(
-    Pred::not(col!("number").gt(lit(4i64))),
+    Pred::from_expr(expr!(not(col("number") > 4i64))),
     table_for_numbers(vec![1, 2, 3, 4])
 )]
 #[case::not_greater_than_or_equal(
-    Pred::not(col!("number").ge(lit(4i64))),
+    Pred::from_expr(expr!(not(col("number") >= 4i64))),
     table_for_numbers(vec![1, 2, 3])
 )]
 #[case::not_equal(
-    Pred::not(col!("number").eq(lit(4i64))),
+    Pred::from_expr(expr!(not(col("number") == 4i64))),
     table_for_numbers(vec![1, 2, 3, 5, 6])
 )]
 #[case::not_not_equal(
-    Pred::not(col!("number").ne(lit(4i64))),
+    Pred::from_expr(expr!(not(col("number") != 4i64))),
     table_for_numbers(vec![4])
 )]
 fn predicate_on_number_not(
@@ -1200,10 +1180,10 @@ fn predicate_on_number_with_not_null() -> Result<(), Box<dyn std::error::Error>>
     read_table_data_str(
         "./tests/data/basic_partitioned",
         Some(&["a_float", "number"]),
-        Some(Pred::and(
-            col!("number").is_not_null(),
-            col!("number").lt(lit(3i64)),
-        )),
+        Some(Pred::from_expr(expr!(and(
+            is_not_null(col("number")),
+            col("number") < 3i64
+        )))),
         expected,
     )?;
     Ok(())
@@ -1215,7 +1195,7 @@ fn predicate_null() -> Result<(), Box<dyn std::error::Error>> {
     read_table_data_str(
         "./tests/data/basic_partitioned",
         Some(&["a_float", "number"]),
-        Some(col!("number").is_null()),
+        Some(Pred::from_expr(expr!(is_null(col("number"))))),
         expected,
     )?;
     Ok(())
@@ -1242,7 +1222,7 @@ fn mixed_null() -> Result<(), Box<dyn std::error::Error>> {
     read_table_data_str(
         "./tests/data/mixed-nulls",
         Some(&["part", "n"]),
-        Some(col!("n").is_null()),
+        Some(Pred::from_expr(expr!(is_null(col("n"))))),
         expected,
     )?;
     Ok(())
@@ -1269,7 +1249,7 @@ fn mixed_not_null() -> Result<(), Box<dyn std::error::Error>> {
     read_table_data_str(
         "./tests/data/mixed-nulls",
         Some(&["part", "n"]),
-        Some(col!("n").is_not_null()),
+        Some(Pred::from_expr(expr!(is_not_null(col("n"))))),
         expected,
     )?;
     Ok(())
@@ -1277,31 +1257,19 @@ fn mixed_not_null() -> Result<(), Box<dyn std::error::Error>> {
 
 #[rstest::rstest]
 #[case::and_both_conditions(
-    Pred::and(
-        col!("number").gt(lit(4i64)),
-        col!("a_float").gt(lit(5.5)),
-    ),
+    Pred::from_expr(expr!(and(col("number") > 4i64, col("a_float") > 5.5))),
     table_for_numbers(vec![6])
 )]
 #[case::and_with_negation(
-    Pred::and(
-        col!("number").gt(lit(4i64)),
-        Pred::not(col!("a_float").gt(lit(5.5))),
-    ),
+    Pred::from_expr(expr!(and(col("number") > 4i64, not(col("a_float") > 5.5)))),
     table_for_numbers(vec![5])
 )]
 #[case::or_either_condition(
-    Pred::or(
-        col!("number").gt(lit(4i64)),
-        col!("a_float").gt(lit(5.5)),
-    ),
+    Pred::from_expr(expr!(or(col("number") > 4i64, col("a_float") > 5.5))),
     table_for_numbers(vec![5, 6])
 )]
 #[case::or_with_negation(
-    Pred::or(
-        col!("number").gt(lit(4i64)),
-        Pred::not(col!("a_float").gt(lit(5.5))),
-    ),
+    Pred::from_expr(expr!(or(col("number") > 4i64, not(col("a_float") > 5.5)))),
     table_for_numbers(vec![1, 2, 3, 4, 5, 6])
 )]
 fn and_or_predicates(
@@ -1319,31 +1287,19 @@ fn and_or_predicates(
 
 #[rstest::rstest]
 #[case::not_and_both_conditions(
-    Pred::not(Pred::and(
-        col!("number").gt(lit(4i64)),
-        col!("a_float").gt(lit(5.5)),
-    )),
+    Pred::from_expr(expr!(not(and(col("number") > 4i64, col("a_float") > 5.5)))),
     table_for_numbers(vec![1, 2, 3, 4, 5])
 )]
 #[case::not_and_with_negation(
-    Pred::not(Pred::and(
-        col!("number").gt(lit(4i64)),
-        Pred::not(col!("a_float").gt(lit(5.5))),
-    )),
+    Pred::from_expr(expr!(not(and(col("number") > 4i64, not(col("a_float") > 5.5))))),
     table_for_numbers(vec![1, 2, 3, 4, 6])
 )]
 #[case::not_or_either_condition(
-    Pred::not(Pred::or(
-        col!("number").gt(lit(4i64)),
-        col!("a_float").gt(lit(5.5)),
-    )),
+    Pred::from_expr(expr!(not(or(col("number") > 4i64, col("a_float") > 5.5)))),
     table_for_numbers(vec![1, 2, 3, 4])
 )]
 #[case::not_or_with_negation(
-    Pred::not(Pred::or(
-        col!("number").gt(lit(4i64)),
-        Pred::not(col!("a_float").gt(lit(5.5))),
-    )),
+    Pred::from_expr(expr!(not(or(col("number") > 4i64, not(col("a_float") > 5.5))))),
     vec![]
 )]
 fn not_and_or_predicates(
@@ -1362,7 +1318,7 @@ fn not_and_or_predicates(
 #[rstest::rstest]
 #[case::literal_false(Pred::FALSE, table_for_numbers(vec![]))]
 #[case::and_with_literal_false(
-    Pred::and(column_pred!("number"), Pred::FALSE),
+    Pred::from_expr(expr!(and(col("number"), false))),
     table_for_numbers(vec![])
 )]
 #[case::literal_true(
@@ -1374,19 +1330,19 @@ fn not_and_or_predicates(
     table_for_numbers(vec![1, 2, 3, 4, 5, 6])
 )]
 #[case::distinct_value(
-    col!("number").distinct(lit(3i64)),
+    Pred::from_expr(expr!(distinct(col("number"), 3i64))),
     table_for_numbers(vec![1, 2, 4, 5, 6])
 )]
 #[case::distinct_null(
-    col!("number").distinct(null_lit(DataType::LONG)),
+    Pred::from_expr(expr!(distinct(col("number"), null(LONG)))),
     table_for_numbers(vec![1, 2, 3, 4, 5, 6])
 )]
 #[case::not_distinct_value(
-    Pred::not(col!("number").distinct(lit(3i64))),
+    Pred::from_expr(expr!(not(distinct(col("number"), 3i64)))),
     table_for_numbers(vec![3])
 )]
 #[case::not_distinct_null(
-    Pred::not(col!("number").distinct(null_lit(DataType::LONG))),
+    Pred::from_expr(expr!(not(distinct(col("number"), null(LONG))))),
     table_for_numbers(vec![])
 )]
 #[case::gt_empty_struct(
@@ -1429,7 +1385,7 @@ fn with_predicate_and_removes() -> Result<(), Box<dyn std::error::Error>> {
     read_table_data_str(
         "./tests/data/table-with-dv-small/",
         None,
-        Some(Pred::gt(col!("value"), lit(3))),
+        Some(Pred::from_expr(expr!(col("value") > 3))),
         expected,
     )?;
     Ok(())
@@ -1467,7 +1423,7 @@ async fn predicate_on_non_nullable_partition_column() -> Result<(), Box<dyn std:
     let engine = Arc::new(DefaultEngineBuilder::new(storage.clone()).build());
     let snapshot = Snapshot::builder_for(table_root).build(engine.as_ref())?;
 
-    let predicate = Pred::eq(col!("id"), lit(2));
+    let predicate = Pred::from_expr(expr!(col("id") == 2));
     let scan = snapshot
         .scan_builder()
         .with_predicate(Arc::new(predicate))
@@ -1525,7 +1481,7 @@ async fn predicate_on_non_nullable_column_missing_stats() -> Result<(), Box<dyn 
     let engine = Arc::new(DefaultEngineBuilder::new(storage.clone()).build());
     let snapshot = Snapshot::builder_for(table_root).build(engine.as_ref())?;
 
-    let predicate = Pred::eq(col!("val"), lit("g"));
+    let predicate = Pred::from_expr(expr!(col("val") == "g"));
     let scan = snapshot
         .scan_builder()
         .with_predicate(Arc::new(predicate))
@@ -1615,7 +1571,7 @@ fn type_widening_basic() -> Result<(), Box<dyn std::error::Error>> {
         "| 1                   | 2                   | 3.4000000953674316 | 5.0            | 6.0            | 7.0            | 2024-09-09T00:00:00        |",
         "| 9223372036854775807 | 9223372036854775807 | 1.234567890123     | 1.234567890123 | 1.234567890123 | 1.234567890123 | 2024-09-09T12:34:56.123456 |",
         "+---------------------+---------------------+--------------------+----------------+----------------+----------------+----------------------------+",
-   ];
+    ];
     let select_cols: Option<&[&str]> = Some(&[
         "byte_long",
         "int_long",
@@ -1627,6 +1583,103 @@ fn type_widening_basic() -> Result<(), Box<dyn std::error::Error>> {
     ]);
 
     read_table_data_str("./tests/data/type-widening/", select_cols, None, expected)
+}
+
+#[tokio::test]
+async fn array_element_type_widening_reads_older_files() -> Result<(), Box<dyn std::error::Error>> {
+    let table_root = "memory:///";
+    let file_name = "part-v0.parquet";
+    let storage = Arc::new(InMemory::new());
+    let values: ListArray =
+        ListArray::from_iter_primitive::<Int32Type, _, _>([Some(vec![Some(1), Some(2), Some(3)])]);
+    let batch = RecordBatch::try_from_iter([
+        ("id", Arc::new(Int64Array::from(vec![1])) as ArrayRef),
+        ("vals", Arc::new(values) as ArrayRef),
+    ])?;
+    let parquet_bytes = record_batch_to_bytes(&batch);
+
+    let schema = |element_type: &str| {
+        let field_metadata = if element_type == "long" {
+            serde_json::json!({
+                "delta.typeChanges": [{
+                    "fromType": "integer",
+                    "toType": "long",
+                    "fieldPath": "element",
+                }],
+            })
+        } else {
+            serde_json::json!({})
+        };
+        serde_json::json!({
+            "type": "struct",
+            "fields": [
+                {"name": "id", "type": "long", "nullable": true, "metadata": {}},
+                {
+                    "name": "vals",
+                    "type": {
+                        "type": "array",
+                        "elementType": element_type,
+                        "containsNull": true,
+                    },
+                    "nullable": true,
+                    "metadata": field_metadata,
+                },
+            ],
+        })
+        .to_string()
+    };
+    let metadata = |schema_string: String| {
+        serde_json::json!({
+            "metaData": {
+                "id": "array-widen",
+                "format": {"provider": "parquet", "options": {}},
+                "schemaString": schema_string,
+                "partitionColumns": [],
+                "configuration": {"delta.enableTypeWidening": "true"},
+            },
+        })
+        .to_string()
+    };
+    let add = serde_json::json!({
+        "add": {
+            "path": file_name,
+            "partitionValues": {},
+            "size": parquet_bytes.len(),
+            "modificationTime": 1000,
+            "dataChange": true,
+        },
+    });
+    let protocol = serde_json::json!({
+        "protocol": {
+            "minReaderVersion": 3,
+            "minWriterVersion": 7,
+            "readerFeatures": ["typeWidening"],
+            "writerFeatures": ["typeWidening"],
+        },
+    });
+    add_commit(
+        table_root,
+        storage.as_ref(),
+        0,
+        format!("{protocol}\n{}\n{add}", metadata(schema("integer"))),
+    )
+    .await?;
+    add_commit(table_root, storage.as_ref(), 1, metadata(schema("long"))).await?;
+    storage
+        .put(&Path::from(file_name), parquet_bytes.into())
+        .await?;
+
+    let engine = Arc::new(DefaultEngineBuilder::new(storage).build());
+    let snapshot = Snapshot::builder_for(table_root).build(engine.as_ref())?;
+    let scan = snapshot.scan_builder().build()?;
+    let batches = read_scan(&scan, engine)?;
+
+    assert_eq!(batches.len(), 1);
+    let values = batches[0].column_by_name("vals").unwrap().as_list::<i32>();
+    assert_eq!(values.value_type(), ArrowDataType::Int64);
+    let elements = values.values().as_primitive::<Int64Type>();
+    assert_eq!(elements.values().as_ref(), &[1, 2, 3]);
+    Ok(())
 }
 
 #[test]
@@ -1676,7 +1729,7 @@ fn predicate_references_invalid_missing_column() -> Result<(), Box<dyn std::erro
         "| {date32: 1971-01-05, timestamp: 1970-02-01T12:00:00Z, timestamp_ntz: 1970-01-02T00:04:00} |         |",
         "+-------------------------------------------------------------------------------------------+---------+",
     ];
-    let predicate = col!("missing").lt(lit(10i64));
+    let predicate = Pred::from_expr(expr!(col("missing") < 10i64));
     read_table_data_str(
         "./tests/data/parquet_row_group_skipping/",
         Some(columns),
@@ -1697,7 +1750,7 @@ fn predicate_references_invalid_missing_column() -> Result<(), Box<dyn std::erro
         "| {date32: 1971-01-05, timestamp: 1970-02-01T12:00:00Z, timestamp_ntz: 1970-01-02T00:04:00} |",
         "+-------------------------------------------------------------------------------------------+",
     ];
-    let predicate = col!("invalid").lt(lit(10));
+    let predicate = Pred::from_expr(expr!(col("invalid") < 10));
     read_table_data_str(
         "./tests/data/parquet_row_group_skipping/",
         Some(columns),
@@ -2000,7 +2053,7 @@ async fn test_unsupported_metadata_columns() -> Result<(), Box<dyn std::error::E
         (
             "row_commit_version",
             MetadataColumnSpec::RowCommitVersion,
-            "Row commit versions not supported",
+            "Row commit versions are not enabled on this table",
         ),
     ];
 
@@ -2159,7 +2212,7 @@ fn checkpoint_stats_skipping(
         "| 5  | value_5 |",
         "+----+---------+",
     ];
-    let predicate = col!("id").gt(lit(3i64));
+    let predicate = Pred::from_expr(expr!(col("id") > 3i64));
     read_table_data_str(&table_path, None, Some(predicate), expected)?;
     Ok(())
 }
@@ -2169,7 +2222,7 @@ fn checkpoint_stats_skipping(
 // schema (id: long, value: string), 5 files with 1 row each, checkpoint at v5.
 // Cross-product covers all five checkpoint variants against four stats option
 // shapes: ScanFile.stats should be populated via the COALESCE/ToJson fallback
-// when both `json=true` and `struct_stats=All` are set; otherwise null on these
+// when both `json=true` and `struct_stats=AllIndexed` are set; otherwise null on these
 // struct-stats-only checkpoints.
 #[rstest::rstest]
 #[case::default_json_only(StatsOptions::default(), false)]
@@ -2279,7 +2332,7 @@ fn struct_stats_only_preserves_data_skipping(
     let engine = test_utils::create_default_engine(&url)?;
     let snapshot = Snapshot::builder_for(url).build(engine.as_ref())?;
 
-    let predicate: PredicateRef = Arc::new(col!("id").gt(lit(3i64)));
+    let predicate: PredicateRef = Arc::new(Pred::from_expr(expr!(col("id") > 3i64)));
     let scan = snapshot
         .scan_builder()
         .with_stats(StatsOptions::all_struct())
@@ -2321,7 +2374,7 @@ fn partition_values_parsed_skipping() -> Result<(), Box<dyn std::error::Error>> 
         "| 3  | value_3 | 0    |",
         "+----+---------+------+",
     ];
-    let predicate = col!("part").eq(lit(0i32));
+    let predicate = Pred::from_expr(expr!(col("part") == 0i32));
     read_table_data_str(
         "./tests/data/v1-multi-part-partitioned-struct-stats-only/",
         None,
@@ -2341,8 +2394,8 @@ fn partition_values_parsed_skipping() -> Result<(), Box<dyn std::error::Error>> 
 //   file 2: truncated max=4s > adjusted predicate (3_999_401) -> kept (truncation safe)
 //   file 3: max=8s >> adjusted predicate -> kept
 #[tokio::test]
-async fn timestamp_max_stat_truncation_does_not_over_prune(
-) -> Result<(), Box<dyn std::error::Error>> {
+async fn timestamp_max_stat_truncation_does_not_over_prune()
+-> Result<(), Box<dyn std::error::Error>> {
     let ts_metadata = "{\
         \"id\":\"test-ts-table\",\
         \"format\":{\"provider\":\"parquet\",\"options\":{}},\
@@ -2441,10 +2494,9 @@ async fn timestamp_max_stat_truncation_does_not_over_prune(
     let snapshot = Snapshot::builder_for(table_root).build(engine.as_ref())?;
 
     let row_count = |predicate_us: i64| -> Result<usize, Box<dyn std::error::Error>> {
-        let predicate = Arc::new(Pred::gt(
-            col!("ts_col"),
-            lit(Scalar::Timestamp(predicate_us)),
-        ));
+        let predicate = Arc::new(Pred::from_expr(expr!(
+            col("ts_col") > lit(Scalar::Timestamp(predicate_us))
+        )));
         let scan = snapshot
             .clone()
             .scan_builder()
@@ -2563,7 +2615,9 @@ fn timestamp_truncation_real_table_gt() -> Result<(), Box<dyn std::error::Error>
     read_table_data_str(
         "./tests/data/timestamp-truncation-stats",
         None,
-        Some(Pred::gt(col!("ts_col"), lit(Scalar::Timestamp(4_000_400)))),
+        Some(Pred::from_expr(expr!(
+            col("ts_col") > lit(Scalar::Timestamp(4_000_400))
+        ))),
         vec![
             "+----+-----------------------------+",
             "| id | ts_col                      |",
@@ -2579,8 +2633,8 @@ fn timestamp_truncation_real_table_gt() -> Result<(), Box<dyn std::error::Error>
 
 // Verify that an explicit projection including a void column returns it as null.
 #[tokio::test]
-async fn explicit_projection_with_void_column_returns_nulls(
-) -> Result<(), Box<dyn std::error::Error>> {
+async fn explicit_projection_with_void_column_returns_nulls()
+-> Result<(), Box<dyn std::error::Error>> {
     let batch = generate_batch(vec![("id", vec![1, 2, 3].into_arrow_array())])?;
 
     let storage = Arc::new(InMemory::new());
@@ -2751,7 +2805,9 @@ fn timestamp_truncation_real_table_ge() -> Result<(), Box<dyn std::error::Error>
     read_table_data_str(
         "./tests/data/timestamp-truncation-stats",
         None,
-        Some(Pred::ge(col!("ts_col"), lit(Scalar::Timestamp(4_000_400)))),
+        Some(Pred::from_expr(expr!(
+            col("ts_col") >= lit(Scalar::Timestamp(4_000_400))
+        ))),
         vec![
             "+----+-----------------------------+",
             "| id | ts_col                      |",
@@ -2771,7 +2827,9 @@ fn timestamp_truncation_real_table_lt() -> Result<(), Box<dyn std::error::Error>
     read_table_data_str(
         "./tests/data/timestamp-truncation-stats",
         None,
-        Some(Pred::lt(col!("ts_col"), lit(Scalar::Timestamp(4_000_400)))),
+        Some(Pred::from_expr(expr!(
+            col("ts_col") < lit(Scalar::Timestamp(4_000_400))
+        ))),
         vec![
             "+----+-----------------------------+",
             "| id | ts_col                      |",
@@ -2791,7 +2849,9 @@ fn timestamp_truncation_real_table_le() -> Result<(), Box<dyn std::error::Error>
     read_table_data_str(
         "./tests/data/timestamp-truncation-stats",
         None,
-        Some(Pred::le(col!("ts_col"), lit(Scalar::Timestamp(4_000_400)))),
+        Some(Pred::from_expr(expr!(
+            col("ts_col") <= lit(Scalar::Timestamp(4_000_400))
+        ))),
         vec![
             "+----+-----------------------------+",
             "| id | ts_col                      |",
@@ -2812,7 +2872,9 @@ fn timestamp_truncation_real_table_eq() -> Result<(), Box<dyn std::error::Error>
     read_table_data_str(
         "./tests/data/timestamp-truncation-stats",
         None,
-        Some(Pred::eq(col!("ts_col"), lit(Scalar::Timestamp(4_000_400)))),
+        Some(Pred::from_expr(expr!(
+            col("ts_col") == lit(Scalar::Timestamp(4_000_400))
+        ))),
         vec![
             "+----+-----------------------------+",
             "| id | ts_col                      |",
@@ -3069,7 +3131,7 @@ async fn read_with_predicate_on_void_column() -> Result<(), Box<dyn std::error::
     let snapshot = Snapshot::builder_for(location).build(engine.as_ref())?;
 
     // Predicate: void_col IS NULL — always true for void, should return all rows
-    let predicate = Arc::new(col!("void_col").is_null());
+    let predicate = Arc::new(Pred::from_expr(expr!(is_null(col("void_col")))));
     let scan = snapshot
         .clone()
         .scan_builder()
@@ -3083,7 +3145,7 @@ async fn read_with_predicate_on_void_column() -> Result<(), Box<dyn std::error::
     // Predicate: void_col IS NOT NULL — always false for void. The Add action above has no
     // `stats` string, so kernel has nothing to skip on. All rows are returned.
     // Skipping driven by `nullCount` is exercised by `void_predicate_skips_via_null_count`.
-    let predicate_not_null = Arc::new(col!("void_col").is_not_null());
+    let predicate_not_null = Arc::new(Pred::from_expr(expr!(is_not_null(col("void_col")))));
     let scan_not_null = snapshot
         .scan_builder()
         .with_predicate(predicate_not_null)
@@ -3105,7 +3167,7 @@ async fn read_with_predicate_on_void_column() -> Result<(), Box<dyn std::error::
 // that pruning (not row-level filtering) is what produces the empty result here.
 #[rstest::rstest]
 #[case::is_null(
-    col!("void_col").is_null(),
+    Pred::from_expr(expr!(is_null(col("void_col")))),
     vec![
         "+----+----------+",
         "| id | void_col |",
@@ -3116,7 +3178,7 @@ async fn read_with_predicate_on_void_column() -> Result<(), Box<dyn std::error::
         "+----+----------+",
     ]
 )]
-#[case::is_not_null(col!("void_col").is_not_null(), vec![])]
+#[case::is_not_null(Pred::from_expr(expr!(is_not_null(col("void_col")))), vec![])]
 fn void_predicate_skips_via_null_count(
     #[case] predicate: Pred,
     #[case] expected: Vec<&str>,
@@ -3129,8 +3191,8 @@ fn void_predicate_skips_via_null_count(
 // Spark fixture's `nullCount.void_col == numRecords` stats, `IS NOT NULL` prunes all 3 files
 // and `IS NULL` keeps all 3.
 #[rstest::rstest]
-#[case::is_null_keeps_all(col!("void_col").is_null(), 3)]
-#[case::is_not_null_prunes_all(col!("void_col").is_not_null(), 0)]
+#[case::is_null_keeps_all(Pred::from_expr(expr!(is_null(col("void_col")))), 3)]
+#[case::is_not_null_prunes_all(Pred::from_expr(expr!(is_not_null(col("void_col")))), 0)]
 fn void_predicate_pruning_scan_file_count(
     #[case] predicate: Pred,
     #[case] expected_files: usize,

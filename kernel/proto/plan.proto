@@ -50,6 +50,13 @@ message ValuesNode {
   repeated ValuesRow rows = 2;
 }
 
+// Reads all rows of a relation retained by a plan executor.
+// `id` is engine-assigned and opaque to kernel; `schema` is the relation's output schema.
+message RelationSourceNode {
+  string id = 1;
+  delta.kernel.schema.StructType schema = 2;
+}
+
 // ============================================================================
 // Transform payloads (1+ inputs)
 // ============================================================================
@@ -64,6 +71,13 @@ message FilterNode {
 }
 
 message UnionAllNode {}
+
+message WriteJsonNode {
+  string file_path = 1;
+  delta.kernel.schema.StructType schema = 2;
+  bool overwrite = 3;
+  bool ordered = 4;
+}
 
 enum FileType {
   FILE_TYPE_UNSPECIFIED = 0;
@@ -133,6 +147,12 @@ message SemiJoinNode {
   repeated delta.kernel.expressions.ColumnName build_keys = 3;
 }
 
+message PrefixSumNode {
+  delta.kernel.expressions.ColumnName input = 1;
+  string output = 2;
+  delta.kernel.schema.StructType schema = 3;
+}
+
 // ============================================================================
 // Operator
 // ============================================================================
@@ -143,6 +163,7 @@ message Operator {
     ScanParquetNode scan_parquet = 1;
     ScanJsonNode scan_json = 2;
     ValuesNode values = 3;
+    RelationSourceNode relation_source = 10;
     // Transforms (1+ inputs)
     ProjectNode project = 4;
     FilterNode filter = 5;
@@ -150,6 +171,9 @@ message Operator {
     DynamicScanNode dynamic_scan = 7;
     AggregateNode aggregate = 8;
     SemiJoinNode semi_join = 9;
+    PrefixSumNode prefix_sum = 12;
+    // Sinks (write nodes)
+    WriteJsonNode write_json = 11;
   }
 }
 

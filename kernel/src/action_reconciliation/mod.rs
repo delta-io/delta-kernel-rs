@@ -20,7 +20,7 @@
 use std::time::Duration;
 
 use crate::table_properties::TableProperties;
-use crate::{DeltaResult, Error};
+use crate::{KernelError, KernelResult};
 
 pub(crate) mod log_replay;
 
@@ -55,7 +55,7 @@ pub(crate) trait RetentionCalculator {
     /// `deletion_timestamp` field format for comparison.
     ///
     /// Note: The default retention period is 7 days, matching delta-spark's behavior.
-    fn deleted_file_retention_timestamp(&self) -> DeltaResult<i64> {
+    fn deleted_file_retention_timestamp(&self) -> KernelResult<i64> {
         let retention_duration = self.table_properties().deleted_file_retention_duration;
 
         deleted_file_retention_timestamp_with_time(
@@ -77,7 +77,7 @@ pub(crate) trait RetentionCalculator {
     /// # Errors
     /// Returns an error if the current system time cannot be obtained or if the retention
     /// duration exceeds the maximum representable value for i64.
-    fn get_transaction_expiration_timestamp(&self) -> DeltaResult<Option<i64>> {
+    fn get_transaction_expiration_timestamp(&self) -> KernelResult<Option<i64>> {
         calculate_transaction_expiration_timestamp(self.table_properties())
     }
 }
@@ -95,17 +95,19 @@ pub(crate) trait RetentionCalculator {
 pub(crate) fn deleted_file_retention_timestamp_with_time(
     retention_duration: Option<Duration>,
     now_duration: Duration,
-) -> DeltaResult<i64> {
+) -> KernelResult<i64> {
     // Use provided retention duration or default (7 days)
     let retention_duration =
         retention_duration.unwrap_or_else(|| Duration::from_secs(DEFAULT_RETENTION_SECS));
 
     // Convert to milliseconds for remove action deletion_timestamp comparison
-    let now_ms = i64::try_from(now_duration.as_millis())
-        .map_err(|_| Error::checkpoint_write("Current timestamp exceeds i64 millisecond range"))?;
+    let now_ms = i64::try_from(now_duration.as_millis()).map_err(|_| {
+        KernelError::checkpoint_write("Current timestamp exceeds i64 millisecond range")
+    })?;
 
-    let retention_ms = i64::try_from(retention_duration.as_millis())
-        .map_err(|_| Error::checkpoint_write("Retention duration exceeds i64 millisecond range"))?;
+    let retention_ms = i64::try_from(retention_duration.as_millis()).map_err(|_| {
+        KernelError::checkpoint_write("Retention duration exceeds i64 millisecond range")
+    })?;
 
     // Simple subtraction - will produce negative values if retention > now
     Ok(now_ms - retention_ms)
@@ -115,14 +117,15 @@ pub(crate) fn deleted_file_retention_timestamp_with_time(
 /// Returns None if set_transaction_retention_duration is not set.
 pub(crate) fn calculate_transaction_expiration_timestamp(
     table_properties: &TableProperties,
-) -> DeltaResult<Option<i64>> {
+) -> KernelResult<Option<i64>> {
     table_properties
         .set_transaction_retention_duration
-        .map(|duration| -> DeltaResult<i64> {
+        .map(|duration| -> KernelResult<i64> {
             let now_ms = crate::utils::current_time_ms()?;
 
-            let expiration_ms = i64::try_from(duration.as_millis())
-                .map_err(|_| Error::generic("Retention duration exceeds i64 millisecond range"))?;
+            let expiration_ms = i64::try_from(duration.as_millis()).map_err(|_| {
+                KernelError::generic("Retention duration exceeds i64 millisecond range")
+            })?;
 
             Ok(now_ms - expiration_ms)
         })
@@ -133,10 +136,13 @@ pub(crate) fn calculate_transaction_expiration_timestamp(
 mod tests {
     use std::time::Duration;
 
+    use derive_more::Constructor;
+
     use super::*;
+    use crate::KernelResult;
 
     #[test]
-    fn test_deleted_file_retention_timestamp_with_time() -> DeltaResult<()> {
+    fn test_deleted_file_retention_timestamp_with_time() -> KernelResult<()> {
         // Test with default retention (7 days)
         let reference_time = Duration::from_secs(1_000_000_000);
         let result = deleted_file_retention_timestamp_with_time(None, reference_time)?;
@@ -166,10 +172,12 @@ mod tests {
         let result =
             deleted_file_retention_timestamp_with_time(Some(large_retention), reference_time);
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("Retention duration exceeds i64 millisecond range"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Retention duration exceeds i64 millisecond range")
+        );
     }
 
     #[test]
@@ -179,14 +187,16 @@ mod tests {
         let retention = Duration::from_secs(1);
         let result = deleted_file_retention_timestamp_with_time(Some(retention), reference_time);
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("Current timestamp exceeds i64 millisecond range"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Current timestamp exceeds i64 millisecond range")
+        );
     }
 
     #[test]
-    fn test_calculate_transaction_expiration_timestamp() -> DeltaResult<()> {
+    fn test_calculate_transaction_expiration_timestamp() -> KernelResult<()> {
         // No set_transaction_retention_duration
         let properties = TableProperties::default();
         let result = calculate_transaction_expiration_timestamp(&properties)?;
@@ -222,21 +232,18 @@ mod tests {
         };
         let result = calculate_transaction_expiration_timestamp(&properties);
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("Retention duration exceeds i64 millisecond range"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Retention duration exceeds i64 millisecond range")
+        );
     }
 
     // Mock implementation of RetentionCalculator for testing trait methods
+    #[derive(Constructor)]
     struct MockRetentionCalculator {
         properties: TableProperties,
-    }
-
-    impl MockRetentionCalculator {
-        fn new(properties: TableProperties) -> Self {
-            Self { properties }
-        }
     }
 
     impl RetentionCalculator for MockRetentionCalculator {
@@ -246,7 +253,7 @@ mod tests {
     }
 
     #[test]
-    fn test_retention_calculator_trait_deleted_file_retention_timestamp() -> DeltaResult<()> {
+    fn test_retention_calculator_trait_deleted_file_retention_timestamp() -> KernelResult<()> {
         // Test with default retention
         let properties = TableProperties::default();
         let calculator = MockRetentionCalculator::new(properties);
@@ -275,7 +282,7 @@ mod tests {
     }
 
     #[test]
-    fn test_retention_calculator_trait_get_transaction_expiration_timestamp() -> DeltaResult<()> {
+    fn test_retention_calculator_trait_get_transaction_expiration_timestamp() -> KernelResult<()> {
         // Test with no transaction retention
         let properties = TableProperties::default();
         let calculator = MockRetentionCalculator::new(properties);

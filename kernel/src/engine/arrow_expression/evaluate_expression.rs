@@ -7,40 +7,42 @@ use chrono::Utc;
 use itertools::Itertools;
 use tracing::warn;
 
+use super::timestamp_timezone::TimestampTimezone;
 use crate::arrow::array::types::*;
 use crate::arrow::array::{
-    self as arrow_array, make_array, new_null_array, Array, ArrayBuilder, ArrayData, ArrayRef,
-    AsArray, BooleanArray, Datum, ListArray, MapArray, MutableArrayData, NullBufferBuilder,
-    RecordBatch, StringArray, StructArray,
+    self as arrow_array, Array, ArrayBuilder, ArrayData, ArrayRef, AsArray, BooleanArray, Datum,
+    ListArray, MapArray, MutableArrayData, NullBufferBuilder, RecordBatch, StringArray,
+    StructArray, make_array, new_null_array,
 };
 use crate::arrow::buffer::{NullBuffer, OffsetBuffer};
-use crate::arrow::compute::kernels::cast_utils::{string_to_datetime, Parser};
+use crate::arrow::compute::kernels::cast_utils::{Parser, string_to_datetime};
 use crate::arrow::compute::kernels::cmp::{distinct, eq, gt, gt_eq, lt, lt_eq, neq, not_distinct};
 use crate::arrow::compute::kernels::comparison::in_list_utf8;
+use crate::arrow::compute::kernels::interleave::interleave;
 use crate::arrow::compute::kernels::numeric::{add, div, mul, sub};
 use crate::arrow::compute::{
-    and_kleene, can_cast_types, cast, is_not_null, is_null, not, or_kleene,
+    and_kleene, can_cast_types, cast, filter_record_batch, is_not_null, is_null, not, or_kleene,
 };
 use crate::arrow::datatypes::{
     DataType as ArrowDataType, Field as ArrowField, Fields as ArrowFields, IntervalUnit,
     Schema as ArrowSchema, TimeUnit,
 };
 use crate::arrow::error::ArrowError;
-use crate::arrow::json::writer::{make_encoder, EncoderOptions};
 use crate::arrow::json::StructMode;
+use crate::arrow::json::writer::{EncoderOptions, make_encoder};
 use crate::delta_kernel_derive::internal_api;
-use crate::engine::arrow_conversion::{TryFromKernel, TryIntoArrow, LIST_ARRAY_ROOT};
+use crate::engine::arrow_conversion::{LIST_ARRAY_ROOT, TryFromKernel, TryIntoArrow};
 use crate::engine::arrow_expression::opaque::{
     ArrowOpaqueExpressionOpAdaptor, ArrowOpaquePredicateOpAdaptor,
 };
-use crate::engine::arrow_utils::{parse_json_impl, prim_array_cmp};
-use crate::engine::ensure_data_types::{ensure_data_types, ValidationMode};
-use crate::error::{DeltaResult, Error};
+use crate::engine::arrow_utils::{list_type_with_element, parse_json_impl, prim_array_cmp};
+use crate::engine::ensure_data_types::{ValidationMode, ensure_data_types};
+use crate::error::{KernelError, KernelResult};
 use crate::expressions::{
-    BinaryExpression, BinaryExpressionOp, BinaryPredicate, BinaryPredicateOp, Expression,
-    ExpressionRef, ExpressionStructPatch, JunctionPredicate, JunctionPredicateOp, OpaqueExpression,
-    OpaquePredicate, Predicate, Scalar, UnaryExpression, UnaryExpressionOp, UnaryPredicate,
-    UnaryPredicateOp, VariadicExpression, VariadicExpressionOp,
+    BinaryExpression, BinaryExpressionOp, BinaryPredicate, BinaryPredicateOp, CaseWhenExpression,
+    Expression, ExpressionRef, ExpressionStructPatch, JunctionPredicate, JunctionPredicateOp,
+    OpaqueExpression, OpaquePredicate, Predicate, Scalar, UnaryExpression, UnaryExpressionOp,
+    UnaryPredicate, UnaryPredicateOp, VariadicExpression, VariadicExpressionOp,
 };
 use crate::schema::{DataType, PrimitiveType, StructField, StructType};
 
@@ -87,7 +89,7 @@ impl ProvidesColumnByName for StructArray {
 pub(crate) fn extract_column(
     parent: &dyn ProvidesColumnByName,
     col: &[impl AsRef<str>],
-) -> DeltaResult<ArrayRef> {
+) -> KernelResult<ArrayRef> {
     Ok(extract_column_ref(parent, col)?.clone())
 }
 
@@ -96,7 +98,7 @@ pub(crate) fn extract_column(
 pub(crate) fn extract_column_ref<'a>(
     mut parent: &'a dyn ProvidesColumnByName,
     col: &[impl AsRef<str>],
-) -> DeltaResult<&'a ArrayRef> {
+) -> KernelResult<&'a ArrayRef> {
     let mut field_names = col.iter();
     let mut field_name = match field_names.next() {
         Some(name) => name.as_ref(),
@@ -123,9 +125,9 @@ fn evaluate_struct_expression(
     batch: &RecordBatch,
     output_schema: &StructType,
     nullability_predicate: Option<&ExpressionRef>,
-) -> DeltaResult<ArrayRef> {
+) -> KernelResult<ArrayRef> {
     if fields.len() != output_schema.num_fields() {
-        return Err(Error::generic(format!(
+        return Err(KernelError::generic(format!(
             "Struct expression field count mismatch: {} fields in expression but {} in schema",
             fields.len(),
             output_schema.num_fields()
@@ -154,7 +156,9 @@ fn evaluate_struct_expression(
         let bool_array = predicate_array
             .as_any()
             .downcast_ref::<BooleanArray>()
-            .ok_or_else(|| Error::generic("Nullability predicate must evaluate to boolean"))?;
+            .ok_or_else(|| {
+                KernelError::generic("Nullability predicate must evaluate to boolean")
+            })?;
         let values = bool_array.values();
         let combined = match bool_array.nulls() {
             Some(nulls) => values & nulls.inner(),
@@ -164,7 +168,13 @@ fn evaluate_struct_expression(
     } else {
         None
     };
-    let data = StructArray::try_new(output_fields.into(), output_cols, null_buffer)?;
+    // Empty structs have no child arrays from which Arrow can infer the batch length.
+    let data = StructArray::try_new_with_length(
+        output_fields.into(),
+        output_cols,
+        null_buffer,
+        batch.num_rows(),
+    )?;
     Ok(Arc::new(data))
 }
 
@@ -173,7 +183,7 @@ fn evaluate_struct_patch_expression(
     patch: &ExpressionStructPatch,
     batch: &RecordBatch,
     output_schema: &StructType,
-) -> DeltaResult<ArrayRef> {
+) -> KernelResult<ArrayRef> {
     let mut used_field_patches = 0;
 
     // Collect output columns directly to avoid creating intermediate Expr::Column instances.
@@ -185,7 +195,7 @@ fn evaluate_struct_patch_expression(
         output_schema_iter
             .next()
             .map(|field| field.data_type())
-            .ok_or_else(|| Error::generic("Too few fields in output schema"))
+            .ok_or_else(|| KernelError::generic("Too few fields in output schema"))
     };
 
     // Handle prepends (insertions before any field)
@@ -203,7 +213,7 @@ fn evaluate_struct_patch_expression(
         Some(ref array) => array
             .as_any()
             .downcast_ref::<StructArray>()
-            .ok_or_else(|| Error::generic("Input path must point to a struct"))?,
+            .ok_or_else(|| KernelError::generic("Input path must point to a struct"))?,
         None => batch,
     };
 
@@ -233,7 +243,7 @@ fn evaluate_struct_patch_expression(
         .filter(|ft| !ft.optional)
         .count();
     if used_field_patches < required_count {
-        return Err(Error::generic(
+        return Err(KernelError::generic(
             "Some non-optional field patches reference invalid input field names",
         ));
     }
@@ -245,7 +255,7 @@ fn evaluate_struct_patch_expression(
 
     // Verify we consumed all output schema fields
     if output_schema_iter.next().is_some() {
-        return Err(Error::generic("Too many fields in output schema"));
+        return Err(KernelError::generic("Too many fields in output schema"));
     }
 
     // Build the final struct, preserving null bitmap for nested patches
@@ -277,7 +287,7 @@ pub fn evaluate_expression(
     expression: &Expression,
     batch: &RecordBatch,
     result_type: Option<&DataType>,
-) -> DeltaResult<ArrayRef> {
+) -> KernelResult<ArrayRef> {
     use BinaryExpressionOp::*;
     use Expression::*;
     use UnaryExpressionOp::*;
@@ -290,20 +300,20 @@ pub fn evaluate_expression(
         (Struct(fields, nullability), Some(DataType::Struct(output_schema))) => {
             evaluate_struct_expression(fields, batch, output_schema, nullability.as_ref())
         }
-        (Struct(..), dt) => Err(Error::Generic(format!(
+        (Struct(..), dt) => Err(KernelError::Generic(format!(
             "Struct expression expects a DataType::Struct result, but got {dt:?}"
         ))),
         (StructPatch(patch), Some(DataType::Struct(output_schema))) => {
             evaluate_struct_patch_expression(patch, batch, output_schema)
         }
-        (StructPatch(_), _) => Err(Error::generic(
+        (StructPatch(_), _) => Err(KernelError::generic(
             "Data type is required to evaluate struct patch expressions",
         )),
         (Predicate(pred), None | Some(&DataType::BOOLEAN)) => {
             let result = evaluate_predicate(pred, batch, false)?;
             Ok(Arc::new(result))
         }
-        (Predicate(_), Some(data_type)) => Err(Error::generic(format!(
+        (Predicate(_), Some(data_type)) => Err(KernelError::generic(format!(
             "Predicate evaluation produces boolean output, but caller expects {data_type:?}"
         ))),
         (Unary(UnaryExpression { op: ToJson, expr }), result_type) => match result_type {
@@ -311,7 +321,7 @@ pub fn evaluate_expression(
                 let input = evaluate_expression(expr, batch, None)?;
                 Ok(to_json(&input)?)
             }
-            Some(data_type) => Err(Error::generic(format!(
+            Some(data_type) => Err(KernelError::generic(format!(
                 "ToJson operator requires STRING output, but got {data_type:?}"
             ))),
         },
@@ -319,7 +329,7 @@ pub fn evaluate_expression(
             let left_arr = evaluate_expression(left.as_ref(), batch, None)?;
             let right_arr = evaluate_expression(right.as_ref(), batch, None)?;
 
-            type Operation = fn(&dyn Datum, &dyn Datum) -> Result<ArrayRef, ArrowError>;
+            type Operation = fn(&dyn Datum, &dyn Datum) -> KernelResult<ArrayRef, ArrowError>;
             let eval: Operation = match op {
                 Plus => add,
                 Minus => sub,
@@ -361,7 +371,7 @@ pub fn evaluate_expression(
                 .downcast_ref::<ArrowOpaqueExpressionOpAdaptor>()
             {
                 Some(op) => op.eval_expr(exprs, batch, result_type),
-                None => Err(Error::unsupported(format!(
+                None => Err(KernelError::unsupported(format!(
                     "Unsupported opaque expression: {op:?}"
                 ))),
             }
@@ -389,10 +399,11 @@ pub fn evaluate_expression(
         }
         (MapToStruct(m), Some(DataType::Struct(output_schema))) => {
             let map_arr = evaluate_expression(&m.map_expr, batch, None)?;
-            let result = evaluate_map_to_struct(&map_arr, output_schema)?;
+            let timestamp_timezone = TimestampTimezone::try_from_options(&m.options)?;
+            let result = evaluate_map_to_struct(&map_arr, output_schema, timestamp_timezone)?;
             Ok(Arc::new(result) as ArrayRef)
         }
-        (MapToStruct(_), dt) => Err(Error::Generic(format!(
+        (MapToStruct(_), dt) => Err(KernelError::Generic(format!(
             "MapToStruct expression requires a DataType::Struct result type, but got {dt:?}"
         ))),
         (Cast(c), result_type) => {
@@ -407,7 +418,10 @@ pub fn evaluate_expression(
             };
             validate_array_type(output, result_type)
         }
-        (Unknown(name), _) => Err(Error::unsupported(format!("Unknown expression: {name:?}"))),
+        (CaseWhen(case_when), result_type) => evaluate_case_when(case_when, batch, result_type),
+        (Unknown(name), _) => Err(KernelError::unsupported(format!(
+            "Unknown expression: {name:?}"
+        ))),
     }
 }
 
@@ -427,13 +441,13 @@ fn evaluate_array_expression(
     exprs: &[Expression],
     batch: &RecordBatch,
     result_type: Option<&DataType>,
-) -> DeltaResult<ArrayRef> {
+) -> KernelResult<ArrayRef> {
     let num_rows = batch.num_rows();
 
     let array_type = match result_type {
         Some(DataType::Array(arr_ty)) => Some(arr_ty.as_ref()),
         Some(other) => {
-            return Err(Error::generic(format!(
+            return Err(KernelError::generic(format!(
                 "Array expression requires a DataType::Array result type, but got {other:?}"
             )));
         }
@@ -449,7 +463,7 @@ fn evaluate_array_expression(
 
     let element_type = element_arrays
         .first()
-        .ok_or_else(|| Error::generic("Array expression requires at least one element"))?
+        .ok_or_else(|| KernelError::generic("Array expression requires at least one element"))?
         .data_type()
         .clone();
     // Single pass over the evaluated inputs: every input must evaluate to the shared element
@@ -457,14 +471,14 @@ fn evaluate_array_expression(
     // otherwise the output's field metadata would lie about the values it holds.
     for (i, arr) in element_arrays.iter().enumerate() {
         if arr.data_type() != &element_type {
-            return Err(Error::generic(format!(
+            return Err(KernelError::generic(format!(
                 "Array expression inputs must share the same element type; input 0 evaluates \
                  to {element_type:?} but input {i} evaluates to {:?}",
                 arr.data_type()
             )));
         }
         if !contains_null && arr.null_count() > 0 {
-            return Err(Error::generic(format!(
+            return Err(KernelError::generic(format!(
                 "Array expression declares non-nullable elements (result_type contains_null \
                  is false) but input {i} contains {} null value(s)",
                 arr.null_count()
@@ -478,14 +492,14 @@ fn evaluate_array_expression(
     // (num_rows * n)-sized indices buffer that `arrow_select::interleave` would require.
     let array_data: Vec<ArrayData> = element_arrays.iter().map(|a| a.to_data()).collect();
     let total_len = num_rows.checked_mul(n).ok_or_else(|| {
-        Error::generic(format!(
+        KernelError::generic(format!(
             "Array expression length overflows usize: num_rows={num_rows} * inputs={n}"
         ))
     })?;
     let mut mutable = MutableArrayData::new(array_data.iter().collect(), false, total_len);
     for row in 0..num_rows {
         for col in 0..n {
-            mutable.extend(col, row, row + 1);
+            mutable.try_extend(col, row, row + 1)?;
         }
     }
     let values = make_array(mutable.freeze());
@@ -494,7 +508,7 @@ fn evaluate_array_expression(
     // but panics on i32 overflow, so guard first (`LargeListArray` would be needed beyond
     // i32::MAX). `total_len == num_rows * n` was overflow-checked as usize above.
     i32::try_from(total_len).map_err(|_| {
-        Error::generic(format!(
+        KernelError::generic(format!(
             "Array expression offsets overflow i32: num_rows={num_rows} * inputs={n}; \
              LargeListArray would be required"
         ))
@@ -510,6 +524,95 @@ fn evaluate_array_expression(
     // consistent with the other expression arms. (Element nullability is enforced above, since
     // `validate_array_type` runs in TypesAndNames mode where nullability checks are a no-op.)
     validate_array_type(Arc::new(list), result_type)
+}
+
+fn evaluate_case_when(
+    case_when: &CaseWhenExpression,
+    batch: &RecordBatch,
+    result_type: Option<&DataType>,
+) -> KernelResult<ArrayRef> {
+    let mut remaining_batch = batch.clone();
+    let mut remaining_rows: Vec<_> = (0..batch.num_rows()).collect();
+    // arrays holds each evaluated branch's results. For each original row, output_row_sources
+    // stores (array_index, row_index), identifying its value in arrays[array_index] at row_index.
+    // interleave uses this mapping to restore the original row order.
+    let mut arrays: Vec<ArrayRef> = Vec::new();
+    let mut output_row_sources = vec![(0, 0); batch.num_rows()];
+    let mut append_result =
+        |expr: &Expression, input: &RecordBatch, output_rows: &mut dyn Iterator<Item = usize>| {
+            let values = evaluate_expression(expr, input, result_type)?;
+            if values.len() != input.num_rows() && values.len() != 1 {
+                return Err(KernelError::internal_error(format!(
+                    "CASE WHEN result has {} rows, expected {} or 1",
+                    values.len(),
+                    input.num_rows(),
+                )));
+            }
+            let array_index = arrays.len();
+            let is_scalar = values.len() == 1;
+            arrays.push(values);
+            // Scalar results, like literal-only IN, use source row 0 for every output row.
+            for (row, original_row) in output_rows.enumerate() {
+                output_row_sources[original_row] = (array_index, if is_scalar { 0 } else { row });
+            }
+            Ok(())
+        };
+
+    for (condition, result) in &case_when.branches {
+        if remaining_rows.is_empty() {
+            break;
+        }
+        let condition = evaluate_predicate(condition, &remaining_batch, false)?;
+        if condition.true_count() == 0 {
+            continue;
+        }
+        // Literal-only IN predicates return one value for the whole batch. A singleton reaching
+        // this point is TRUE, so broadcast it to all remaining rows.
+        let selected = if condition.len() == 1 {
+            BooleanArray::from_iter(std::iter::repeat_n(Some(true), remaining_rows.len()))
+        } else {
+            BooleanArray::from_iter(condition.iter().map(|value| Some(value == Some(true))))
+        };
+        let selected_batch = filter_record_batch(&remaining_batch, &selected)?;
+        let mut selected_rows = remaining_rows
+            .iter()
+            .enumerate()
+            .filter_map(|(row, &original_row)| selected.value(row).then_some(original_row));
+        append_result(result, &selected_batch, &mut selected_rows)?;
+
+        // Later conditions and results see only rows not selected by an earlier WHEN.
+        // For example, remaining_rows = [2, 5, 8] and selected = [false, true, false]
+        // leaves [2, 8]: original row 5 was handled by this WHEN.
+        remaining_rows = remaining_rows
+            .into_iter()
+            .enumerate()
+            .filter_map(|(row, original_row)| (!selected.value(row)).then_some(original_row))
+            .collect();
+        if !remaining_rows.is_empty() {
+            remaining_batch = filter_record_batch(&remaining_batch, &not(&selected)?)?;
+        }
+    }
+
+    // Empty batches still evaluate ELSE to establish the result type.
+    if batch.num_rows() == 0 || !remaining_rows.is_empty() {
+        append_result(
+            &case_when.else_expr,
+            &remaining_batch,
+            &mut remaining_rows.iter().copied(),
+        )?;
+    }
+
+    if arrays.len() == 1 && arrays[0].len() == batch.num_rows() {
+        return validate_array_type(arrays.remove(0), result_type);
+    }
+    let data_type = arrays[0].data_type();
+    if arrays.iter().any(|values| values.data_type() != data_type) {
+        return Err(KernelError::generic(
+            "CASE WHEN branches must have the same type",
+        ));
+    }
+    let values = arrays.iter().map(|array| array.as_ref()).collect_vec();
+    validate_array_type(interleave(&values, &output_row_sources)?, result_type)
 }
 
 /// Direction for casting between Arrow view and non-view string/binary types.
@@ -535,7 +638,7 @@ fn cast_list_elements(
     vals: &Arc<dyn Array>,
     field: &Arc<ArrowField>,
     dir: ViewCast,
-) -> DeltaResult<Arc<dyn Array>> {
+) -> KernelResult<Arc<dyn Array>> {
     let to_type = match dir {
         ViewCast::ToView => match field.data_type() {
             ArrowDataType::Utf8 | ArrowDataType::LargeUtf8 => ArrowDataType::Utf8View,
@@ -559,22 +662,13 @@ fn cast_list_elements(
         },
     };
     let new_field = Arc::new(field.as_ref().clone().with_data_type(to_type));
-    let container = match (vals.data_type(), dir) {
-        (ArrowDataType::List(_), _) => ArrowDataType::List(new_field),
-        (ArrowDataType::LargeList(_), _) => ArrowDataType::LargeList(new_field),
-        (ArrowDataType::ListView(_), ViewCast::ToView) => ArrowDataType::ListView(new_field),
-        (ArrowDataType::ListView(_), ViewCast::ToNonView) => ArrowDataType::List(new_field),
-        (ArrowDataType::LargeListView(_), ViewCast::ToView) => {
-            ArrowDataType::LargeListView(new_field)
+    let container = list_type_with_element(vals.data_type(), new_field)?;
+    let container = match (container, dir) {
+        (ArrowDataType::ListView(field), ViewCast::ToNonView) => ArrowDataType::List(field),
+        (ArrowDataType::LargeListView(field), ViewCast::ToNonView) => {
+            ArrowDataType::LargeList(field)
         }
-        (ArrowDataType::LargeListView(_), ViewCast::ToNonView) => {
-            ArrowDataType::LargeList(new_field)
-        }
-        (dt, _) => {
-            return Err(Error::generic(format!(
-                "cast_list_elements: expected a list type, got {dt:?}"
-            )))
-        }
+        (container, _) => container,
     };
     Ok(cast(vals, &container)?)
 }
@@ -582,7 +676,7 @@ fn cast_list_elements(
 /// This function converts ArrowView types to their non-view type equivalents. This is used for
 /// [`evaluate_predicate`] conversion, currently does not support nested conversion. This only
 /// supports limited conversions (see code for exactly which).
-fn arrow_convert_to_non_view_type(vals: Arc<dyn Array>) -> DeltaResult<Arc<dyn Array>> {
+fn arrow_convert_to_non_view_type(vals: Arc<dyn Array>) -> KernelResult<Arc<dyn Array>> {
     match vals.data_type() {
         ArrowDataType::List(field) => cast_list_elements(&vals, field, ViewCast::ToNonView),
         ArrowDataType::LargeList(field) => cast_list_elements(&vals, field, ViewCast::ToNonView),
@@ -596,10 +690,9 @@ fn arrow_convert_to_non_view_type(vals: Arc<dyn Array>) -> DeltaResult<Arc<dyn A
     }
 }
 
-/// This function converts  Arrow types to their Arrow view type equivalents. This is used for
-/// [`evaluate_predicate`] conversion, currently does not support nested conversion. This only
-/// supports limited conversions (see code for exactly which).
-fn arrow_convert_to_view_type(vals: Arc<dyn Array>) -> DeltaResult<Arc<dyn Array>> {
+/// Converts Arrow string/binary arrays and their list elements to view representations.
+/// Other nested types are preserved.
+fn arrow_convert_to_view_type(vals: Arc<dyn Array>) -> KernelResult<Arc<dyn Array>> {
     match vals.data_type() {
         ArrowDataType::List(field) => cast_list_elements(&vals, field, ViewCast::ToView),
         ArrowDataType::LargeList(field) => cast_list_elements(&vals, field, ViewCast::ToView),
@@ -620,7 +713,7 @@ pub fn evaluate_predicate(
     predicate: &Predicate,
     batch: &RecordBatch,
     inverted: bool,
-) -> DeltaResult<BooleanArray> {
+) -> KernelResult<BooleanArray> {
     use BinaryPredicateOp::*;
     use Predicate::*;
 
@@ -638,7 +731,7 @@ pub fn evaluate_predicate(
             let arr = evaluate_expression(expr, batch, Some(&DataType::BOOLEAN))?;
             match arr.as_any().downcast_ref::<BooleanArray>() {
                 Some(arr) => Ok(maybe_inverted(Cow::Borrowed(arr))?),
-                None => Err(Error::generic("expected boolean array")),
+                None => Err(KernelError::generic("expected boolean array")),
             }
         }
         Not(pred) => evaluate_predicate(pred, batch, !inverted),
@@ -663,13 +756,12 @@ pub fn evaluate_predicate(
 
                     let right = evaluate_expression(right, batch, None)?;
                     let right = arrow_convert_to_non_view_type(right)?;
-                    if let Some(string_arr) = left.as_string_opt::<i32>() {
-                        if let Some(list_arr) = right.as_list_opt::<i32>() {
-                            if list_arr.value_type() == ArrowDataType::Utf8 {
-                                let result = in_list_utf8(string_arr, list_arr)?;
-                                return Ok(result);
-                            }
-                        }
+                    if let Some(string_arr) = left.as_string_opt::<i32>()
+                        && let Some(list_arr) = right.as_list_opt::<i32>()
+                        && list_arr.value_type() == ArrowDataType::Utf8
+                    {
+                        let result = in_list_utf8(string_arr, list_arr)?;
+                        return Ok(result);
                     }
 
                     use ArrowDataType::*;
@@ -714,7 +806,7 @@ pub fn evaluate_predicate(
                     let exists = ad.array_elements().iter().any(|e| lit.logical_eq(e));
                     Ok(BooleanArray::from(vec![exists]))
                 }
-                (l, r) => Err(Error::invalid_expression(format!(
+                (l, r) => Err(KernelError::invalid_expression(format!(
                     "Invalid right value for (NOT) IN comparison, left is: {l} right is: {r}"
                 ))),
             };
@@ -756,7 +848,8 @@ pub fn evaluate_predicate(
             // In case of an empty junction, we return a default value of TRUE (FALSE) for AND (OR),
             // as a "hidden" extra child: AND(TRUE, ...) = AND(...) and OR(FALSE, ...) = OR(...).
             use JunctionPredicateOp::*;
-            type Operation = fn(&BooleanArray, &BooleanArray) -> Result<BooleanArray, ArrowError>;
+            type Operation =
+                fn(&BooleanArray, &BooleanArray) -> KernelResult<BooleanArray, ArrowError>;
             let (reducer, default): (Operation, _) = match (op, inverted) {
                 (And, false) | (Or, true) => (and_kleene, true),
                 (Or, false) | (And, true) => (or_kleene, false),
@@ -770,12 +863,14 @@ pub fn evaluate_predicate(
         Opaque(OpaquePredicate { op, exprs }) => {
             match op.any_ref().downcast_ref::<ArrowOpaquePredicateOpAdaptor>() {
                 Some(op) => op.eval_pred(exprs, batch, inverted),
-                None => Err(Error::unsupported(format!(
+                None => Err(KernelError::unsupported(format!(
                     "Unsupported opaque predicate: {op:?}"
                 ))),
             }
         }
-        Unknown(name) => Err(Error::unsupported(format!("Unknown predicate: {name:?}"))),
+        Unknown(name) => Err(KernelError::unsupported(format!(
+            "Unknown predicate: {name:?}"
+        ))),
     }
 }
 
@@ -793,7 +888,8 @@ const STATS_TIMESTAMP_TZ_FORMAT: &str = "%Y-%m-%dT%H:%M:%S%.3fZ";
 const STATS_TIMESTAMP_NTZ_FORMAT: &str = "%Y-%m-%dT%H:%M:%S%.3f";
 
 /// Converts a StructArray to JSON-encoded strings
-pub fn to_json(input: &dyn Datum) -> Result<ArrayRef, ArrowError> {
+#[internal_api]
+pub(crate) fn to_json(input: &dyn Datum) -> KernelResult<ArrayRef, ArrowError> {
     let (array_ref, _is_scalar) = input.get();
     match array_ref.data_type() {
         ArrowDataType::Struct(_) => {
@@ -878,10 +974,10 @@ pub fn to_json(input: &dyn Datum) -> Result<ArrayRef, ArrowError> {
 /// - **Mismatched row counts**: Not all arrays have the same number of rows.
 /// - **Mismatched data types**: Not all arrays have exactly the same data type.
 /// - **Invalid result type**: If `result_type` is provided but doesn't match the arrays' data type.
-pub fn coalesce_arrays(
+fn coalesce_arrays(
     arrays: &[ArrayRef],
     result_type: Option<&DataType>,
-) -> Result<ArrayRef, ArrowError> {
+) -> KernelResult<ArrayRef, ArrowError> {
     let Some((first, rest)) = arrays.split_first() else {
         return Err(ArrowError::InvalidArgumentError(
             "The default engine currently does not support empty COALESCE statements".into(),
@@ -932,9 +1028,9 @@ pub fn coalesce_arrays(
     for row in 0..first.len() {
         // Find first non-null value for this row
         match arrays.iter().enumerate().find(|(_, arr)| arr.is_valid(row)) {
-            Some((array_idx, _)) => mutable.extend(array_idx, row, row + 1),
-            None => mutable.extend_nulls(1),
-        }
+            Some((array_idx, _)) => mutable.try_extend(array_idx, row, row + 1)?,
+            None => mutable.try_extend_nulls(1)?,
+        };
     }
 
     Ok(make_array(mutable.freeze()))
@@ -943,33 +1039,34 @@ pub fn coalesce_arrays(
 /// Parses one raw partition-value string into its target [`Scalar`], or `None` for a null value.
 ///
 /// An empty string casts via [`PrimitiveType::empty_string_partition_cast`].
-///
-/// Date and timestamp use arrow's `Date32Type::parse` / `string_to_datetime`, which are much
-/// faster than `parse_scalar`'s chrono path and yield the same value for valid Delta partition
-/// values. These arrow parsers accept a superset of the canonical formats (e.g. `20240115`, or a
-/// timestamp carrying an explicit offset) and interpret no-offset timestamps as UTC, matching
-/// `parse_scalar`; spec-compliant writers only emit canonical values, so the extra leniency is
-/// harmless on the read path. All other types go through `parse_scalar`.
-fn parse_partition_scalar(prim: &PrimitiveType, raw: &str) -> DeltaResult<Option<Scalar>> {
+/// `timestamp_timezone` applies only to `TIMESTAMP` values without an embedded offset or named
+/// timezone; it does not affect `DATE` or `TIMESTAMP_NTZ`.
+fn parse_partition_scalar(
+    prim: &PrimitiveType,
+    raw: &str,
+    timestamp_timezone: TimestampTimezone,
+) -> KernelResult<Option<Scalar>> {
     if raw.is_empty() {
         return Ok(prim.empty_string_partition_cast());
     }
     match prim {
         PrimitiveType::Date => {
             let days = Date32Type::parse(raw).ok_or_else(|| {
-                Error::ParseError(raw.to_string(), DataType::Primitive(prim.clone()))
+                KernelError::ParseError(raw.to_string(), DataType::Primitive(prim.clone()))
             })?;
             return Ok(Some(Scalar::Date(days)));
         }
         PrimitiveType::Timestamp => {
-            let micros = string_to_datetime(&Utc, raw)
-                .map_err(|_| Error::ParseError(raw.to_string(), DataType::Primitive(prim.clone())))?
-                .timestamp_micros();
+            let micros = timestamp_timezone.parse_timestamp(raw).ok_or_else(|| {
+                KernelError::ParseError(raw.to_string(), DataType::Primitive(prim.clone()))
+            })?;
             return Ok(Some(Scalar::Timestamp(micros)));
         }
         PrimitiveType::TimestampNtz => {
             let micros = string_to_datetime(&Utc, raw)
-                .map_err(|_| Error::ParseError(raw.to_string(), DataType::Primitive(prim.clone())))?
+                .map_err(|_| {
+                    KernelError::ParseError(raw.to_string(), DataType::Primitive(prim.clone()))
+                })?
                 .timestamp_micros();
             return Ok(Some(Scalar::TimestampNtz(micros)));
         }
@@ -982,29 +1079,31 @@ fn parse_partition_scalar(prim: &PrimitiveType, raw: &str) -> DeltaResult<Option
 /// Evaluates `MAP_TO_STRUCT(map_col, output_schema)`: extracts keys from a `Map<String, String>`
 /// and parses each value into its target type, producing a `StructArray`. An empty-string value
 /// casts via [`PrimitiveType::empty_string_partition_cast`].
+/// `timestamp_timezone` controls `TIMESTAMP` values without an embedded offset or named timezone.
 ///
 /// - Missing keys produce null values
 /// - Parse errors are propagated (indicating a broken table)
-/// - Duplicate map keys are resolved by taking the rightmost entry
+/// - Duplicate keys are invalid input and their result is undefined
 fn evaluate_map_to_struct(
     map_arr: &ArrayRef,
     output_schema: &StructType,
-) -> DeltaResult<StructArray> {
+    timestamp_timezone: TimestampTimezone,
+) -> KernelResult<StructArray> {
     let map_array = map_arr
         .as_any()
         .downcast_ref::<MapArray>()
-        .ok_or_else(|| Error::generic("MapToStruct requires a MapArray as input"))?;
+        .ok_or_else(|| KernelError::generic("MapToStruct requires a MapArray as input"))?;
 
     let map_keys = map_array
         .keys()
         .as_any()
         .downcast_ref::<StringArray>()
-        .ok_or_else(|| Error::generic("MapToStruct requires maps with string keys"))?;
+        .ok_or_else(|| KernelError::generic("MapToStruct requires maps with string keys"))?;
     let map_values = map_array
         .values()
         .as_any()
         .downcast_ref::<StringArray>()
-        .ok_or_else(|| Error::generic("MapToStruct requires maps with string values"))?;
+        .ok_or_else(|| KernelError::generic("MapToStruct requires maps with string values"))?;
 
     let num_rows = map_array.len();
     let fields: Vec<&StructField> = output_schema.fields().collect();
@@ -1016,7 +1115,7 @@ fn evaluate_map_to_struct(
         let prim = match field.data_type() {
             DataType::Primitive(p) => p,
             other => {
-                return Err(Error::generic(format!(
+                return Err(KernelError::generic(format!(
                     "MapToStruct only supports primitive target types, got {other:?}"
                 )));
             }
@@ -1069,7 +1168,7 @@ fn evaluate_map_to_struct(
             // and where the value is non-null.
             if entry_idx >= entry_start && map_values.is_valid(entry_idx as usize) {
                 let raw = map_values.value(entry_idx as usize);
-                match parse_partition_scalar(target_types[i], raw)? {
+                match parse_partition_scalar(target_types[i], raw, timestamp_timezone)? {
                     Some(scalar) => scalar.append_to(builder, 1)?,
                     None => Scalar::append_null(builder, field.data_type(), 1)?,
                 }
@@ -1104,7 +1203,7 @@ fn evaluate_map_to_struct(
     )?)
 }
 
-fn validate_array_type(array: ArrayRef, expected: Option<&DataType>) -> DeltaResult<ArrayRef> {
+fn validate_array_type(array: ArrayRef, expected: Option<&DataType>) -> KernelResult<ArrayRef> {
     if let Some(expected) = expected {
         ensure_data_types(expected, array.data_type(), ValidationMode::TypesAndNames)?;
     }
@@ -1117,23 +1216,25 @@ mod tests {
 
     use rstest::rstest;
 
+    use super::super::expected_timestamp_micros;
     use super::*;
     use crate::arrow::array::{
-        ArrayRef, BinaryArray, BooleanArray, Float64Array, Int32Array, Int64Array,
-        LargeStringArray, ListArray, MapBuilder, StringArray, StringBuilder, StructArray,
-        TimestampMicrosecondArray,
+        ArrayData as ArrowArrayData, ArrayRef, BinaryArray, BooleanArray, Date32Array,
+        Float64Array, Int32Array, Int64Array, LargeStringArray, ListArray, MapBuilder, StringArray,
+        StringBuilder, StructArray, TimestampMicrosecondArray,
     };
     use crate::arrow::buffer::{OffsetBuffer, ScalarBuffer};
     use crate::arrow::datatypes::{
         DataType as ArrowDataType, Field as ArrowField, Fields, Schema as ArrowSchema,
     };
+    use crate::engine::arrow_conversion::TryIntoKernel;
     use crate::expressions::{
-        col, column_expr_ref, lit, null_lit, ArrayData, BinaryExpressionOp, BinaryPredicateOp,
-        Expression as Expr, ExpressionStructPatchBuilder, JunctionPredicateOp, MapData,
-        Predicate as Pred, StructData,
+        ArrayData, BinaryExpressionOp, BinaryPredicateOp, Expression as Expr,
+        ExpressionStructPatchBuilder, JunctionPredicateOp, MapData, MapToStructOptions,
+        Predicate as Pred, StructData, col, column_expr_ref, column_pred, expr, lit, null_lit,
     };
     use crate::schema::{
-        schema, schema_ref, ArrayType, DataType, MapType, StructField, StructType,
+        ArrayType, DataType, MapType, StructField, StructType, schema, schema_ref,
     };
     use crate::unit_test_utils::assert_result_error_with_message;
 
@@ -1425,10 +1526,12 @@ mod tests {
         let expr = Expr::struct_patch(patch).unwrap();
         let result =
             evaluate_expression(&expr, &batch, Some(&DataType::from(output_schema.clone())));
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("reference invalid input field names"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("reference invalid input field names")
+        );
 
         // Test unused insertion keys
         let insertion_patch =
@@ -1438,10 +1541,12 @@ mod tests {
         let result2 =
             evaluate_expression(&expr2, &batch, Some(&DataType::from(output_schema.clone())));
         assert!(result2.is_err());
-        assert!(result2
-            .unwrap_err()
-            .to_string()
-            .contains("reference invalid input field names"));
+        assert!(
+            result2
+                .unwrap_err()
+                .to_string()
+                .contains("reference invalid input field names")
+        );
 
         // Test column count mismatch -- too many output schema fields
         let drop_patch = ExpressionStructPatchBuilder::new().drop("a");
@@ -1456,10 +1561,12 @@ mod tests {
         let result3 =
             evaluate_expression(&expr3, &batch, Some(&DataType::from(wrong_output_schema)));
         assert!(result3.is_err());
-        assert!(result3
-            .unwrap_err()
-            .to_string()
-            .contains("Too many fields in output schema"));
+        assert!(
+            result3
+                .unwrap_err()
+                .to_string()
+                .contains("Too many fields in output schema")
+        );
 
         // Test column count mismatch -- too few output schema fields
         let drop_patch = ExpressionStructPatchBuilder::new().drop("a");
@@ -1470,20 +1577,24 @@ mod tests {
         let result3 =
             evaluate_expression(&expr3, &batch, Some(&DataType::from(wrong_output_schema)));
         assert!(result3.is_err());
-        assert!(result3
-            .unwrap_err()
-            .to_string()
-            .contains("Too few fields in output schema"));
+        assert!(
+            result3
+                .unwrap_err()
+                .to_string()
+                .contains("Too few fields in output schema")
+        );
 
         // Test missing output schema
         let patch = ExpressionStructPatchBuilder::new();
         let expr4 = Expr::struct_patch(patch).unwrap();
         let result4 = evaluate_expression(&expr4, &batch, None);
         assert!(result4.is_err());
-        assert!(result4
-            .unwrap_err()
-            .to_string()
-            .contains("Data type is required"));
+        assert!(
+            result4
+                .unwrap_err()
+                .to_string()
+                .contains("Data type is required")
+        );
     }
 
     #[test]
@@ -1551,10 +1662,12 @@ mod tests {
         };
         let expr = Expr::struct_patch(patch).unwrap();
         let result = evaluate_expression(&expr, &batch, Some(&DataType::from(output_schema)));
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("reference invalid input field names"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("reference invalid input field names")
+        );
     }
 
     #[test]
@@ -1753,7 +1866,7 @@ mod tests {
         // Create coalesce expression with column that has no nulls, followed by
         // a reference to a non-existent column. If short-circuit works, the
         // non-existent column is never evaluated and no error occurs.
-        let expr = Expression::coalesce([col!("a"), col!("nonexistent")]);
+        let expr = expr!(coalesce(col("a"), col("nonexistent")));
 
         // Should return column "a" directly (short-circuit skips evaluating "nonexistent")
         let result = evaluate_expression(&expr, &batch, Some(&DataType::INTEGER)).unwrap();
@@ -1778,7 +1891,7 @@ mod tests {
 
         // Create coalesce expression: a has nulls, b has none, c doesn't exist.
         // Short-circuit should stop after evaluating b.
-        let expr = Expression::coalesce([col!("a"), col!("b"), col!("nonexistent")]);
+        let expr = expr!(coalesce(col("a"), col("b"), col("nonexistent")));
 
         // Should coalesce a and b, never evaluate "nonexistent"
         let result = evaluate_expression(&expr, &batch, Some(&DataType::INTEGER)).unwrap();
@@ -1797,7 +1910,7 @@ mod tests {
         let a_values = Int32Array::from(vec![1, 2, 3]); // No nulls - would short-circuit
         let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(a_values)]).unwrap();
 
-        let expr = Expression::coalesce([col!("a")]);
+        let expr = expr!(coalesce(col("a")));
 
         // Request STRING type but array is INT32 - should fail even with short-circuit
         let result = evaluate_expression(&expr, &batch, Some(&DataType::STRING));
@@ -1908,7 +2021,7 @@ mod tests {
         )
         .unwrap();
 
-        let pred = Pred::distinct(col!("l"), col!("r"));
+        let pred = Pred::from_expr(expr!(distinct(col("l"), col("r"))));
         let result = evaluate_predicate(&pred, &batch, false).unwrap();
         assert_eq!(result.null_count(), 0);
         assert_eq!(result.value(0), expected);
@@ -2041,7 +2154,7 @@ mod tests {
         )
         .unwrap();
 
-        let pred = Pred::is_null(col!("n"));
+        let pred = Pred::from_expr(expr!(is_null(col("n"))));
         let result = evaluate_predicate(&pred, &batch, inverted).unwrap();
         assert_eq!(result.null_count(), 0);
         assert_eq!(result.values().iter().collect::<Vec<_>>(), expected);
@@ -2690,7 +2803,7 @@ mod tests {
             nullable "date": DATE,
         };
         let result_type = DataType::from(output_schema);
-        let expr = Expr::map_to_struct(col!("pv"));
+        let expr = Expr::map_to_struct(col!("pv"), MapToStructOptions::default());
         let result = evaluate_expression(&expr, &batch, Some(&result_type)).unwrap();
         let structs = result.as_any().downcast_ref::<StructArray>().unwrap();
 
@@ -2731,7 +2844,7 @@ mod tests {
         let batch = create_partition_map_batch();
         let output_schema = schema! { nullable "nonexistent": STRING };
         let result_type = DataType::from(output_schema);
-        let expr = Expr::map_to_struct(col!("pv"));
+        let expr = Expr::map_to_struct(col!("pv"), MapToStructOptions::default());
         let result = evaluate_expression(&expr, &batch, Some(&result_type)).unwrap();
         let structs = result.as_any().downcast_ref::<StructArray>().unwrap();
         let col = structs
@@ -2766,7 +2879,7 @@ mod tests {
 
         let output_schema = schema! { nullable "region": STRING };
         let result_type = DataType::from(output_schema);
-        let expr = Expr::map_to_struct(col!("pv"));
+        let expr = Expr::map_to_struct(col!("pv"), MapToStructOptions::default());
         let result = evaluate_expression(&expr, &batch, Some(&result_type)).unwrap();
         let structs = result.as_any().downcast_ref::<StructArray>().unwrap();
 
@@ -2797,7 +2910,7 @@ mod tests {
 
         let output_schema = schema! { nullable "count": INTEGER };
         let result_type = DataType::from(output_schema);
-        let expr = Expr::map_to_struct(col!("pv"));
+        let expr = Expr::map_to_struct(col!("pv"), MapToStructOptions::default());
         let result = evaluate_expression(&expr, &batch, Some(&result_type));
         assert!(result.is_err());
     }
@@ -2819,7 +2932,7 @@ mod tests {
 
         let output_schema = schema! { nullable "ts": TIMESTAMP };
         let result_type = DataType::from(output_schema);
-        let expr = Expr::map_to_struct(col!("pv"));
+        let expr = Expr::map_to_struct(col!("pv"), MapToStructOptions::default());
         let result = evaluate_expression(&expr, &batch, Some(&result_type)).unwrap();
         let structs = result.as_any().downcast_ref::<StructArray>().unwrap();
         let ts = structs
@@ -2828,6 +2941,190 @@ mod tests {
             .downcast_ref::<TimestampMicrosecondArray>()
             .unwrap();
         assert_eq!(ts.value(0), 1718443800000000); // 2024-06-15T09:30:00Z
+    }
+
+    fn evaluate_map_to_struct_field(
+        raw: &str,
+        target: DataType,
+        timestamp_timezone: Option<&str>,
+    ) -> KernelResult<ArrayRef> {
+        let mut builder = MapBuilder::new(None, StringBuilder::new(), StringBuilder::new());
+        builder.keys().append_value("ts");
+        builder.values().append_value(raw);
+        builder.append(true).unwrap();
+        let map = builder.finish();
+        let schema = ArrowSchema::new(vec![ArrowField::new("pv", map.data_type().clone(), true)]);
+        let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(map)]).unwrap();
+        let output_schema = StructType::new_unchecked(vec![StructField::nullable("ts", target)]);
+        let result_type = DataType::from(output_schema);
+        let options = timestamp_timezone.map_or_else(MapToStructOptions::default, |timezone| {
+            MapToStructOptions::default().with_timestamp_timezone(timezone)
+        });
+        let expr = Expr::map_to_struct(col!("pv"), options);
+        let result = evaluate_expression(&expr, &batch, Some(&result_type))?;
+        let result = result.as_any().downcast_ref::<StructArray>().unwrap();
+        Ok(result.column(0).clone())
+    }
+
+    fn evaluate_map_timestamp_timezone(
+        raw: &str,
+        target: DataType,
+        timestamp_timezone: Option<&str>,
+    ) -> KernelResult<Option<i64>> {
+        let field = evaluate_map_to_struct_field(raw, target, timestamp_timezone)?;
+        let timestamps = field
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .unwrap();
+        Ok(timestamps.is_valid(0).then(|| timestamps.value(0)))
+    }
+
+    #[rstest]
+    #[case::default_compatibility(
+        None,
+        "2024-01-15 12:30:45.123456",
+        "2024-01-15T12:30:45.123456Z"
+    )]
+    #[case::iana_winter(
+        Some("America/Los_Angeles"),
+        "2024-01-15 12:30:45.123456",
+        "2024-01-15T20:30:45.123456Z"
+    )]
+    #[case::iana_summer(
+        Some("America/Los_Angeles"),
+        "2024-06-15 08:00:00.500500",
+        "2024-06-15T15:00:00.500500Z"
+    )]
+    #[case::fixed_minute_offset(
+        Some("+05:30"),
+        "2024-01-15 12:30:45.123456",
+        "2024-01-15T07:00:45.123456Z"
+    )]
+    #[case::positive_fixed_offset_limit(
+        Some("+18:00"),
+        "2024-01-15 12:30:45.123456",
+        "2024-01-14T18:30:45.123456Z"
+    )]
+    #[case::negative_fixed_offset_limit(
+        Some("-18:00"),
+        "2024-01-15 12:30:45.123456",
+        "2024-01-16T06:30:45.123456Z"
+    )]
+    #[case::explicit_input_offset(
+        Some("America/Los_Angeles"),
+        "2024-01-15 12:30:45+02:00",
+        "2024-01-15T10:30:45Z"
+    )]
+    #[case::explicit_input_offset_over_fixed_reader(
+        Some("+05:30"),
+        "2024-01-15 12:30:45+02:00",
+        "2024-01-15T10:30:45Z"
+    )]
+    #[case::normalized_utc(
+        Some("America/Los_Angeles"),
+        "2024-01-15T12:30:45.123456Z",
+        "2024-01-15T12:30:45.123456Z"
+    )]
+    #[case::embedded_iana_timezone(
+        Some("Europe/Berlin"),
+        "2024-01-15 12:30:45 America/New_York",
+        "2024-01-15T17:30:45Z"
+    )]
+    #[case::embedded_iana_timezone_with_default_options(
+        None,
+        "2024-01-15 12:30:45 America/New_York",
+        "2024-01-15T17:30:45Z"
+    )]
+    #[case::dst_overlap(
+        Some("America/Los_Angeles"),
+        "2024-11-03 01:30:00",
+        "2024-11-03T08:30:00Z"
+    )]
+    #[case::dst_gap(
+        Some("America/Los_Angeles"),
+        "2024-03-10 02:30:00",
+        "2024-03-10T10:30:00Z"
+    )]
+    #[case::thirty_minute_dst_gap(
+        Some("Australia/Lord_Howe"),
+        "2024-10-06 02:15:00",
+        "2024-10-05T15:45:00Z"
+    )]
+    #[case::skipped_day(Some("Pacific/Apia"), "2011-12-30 12:00:00", "2011-12-30T22:00:00Z")]
+    fn test_map_to_struct_timestamp_timezone(
+        #[case] timestamp_timezone: Option<&str>,
+        #[case] raw: &str,
+        #[case] expected: &str,
+    ) {
+        assert_eq!(
+            evaluate_map_timestamp_timezone(raw, DataType::TIMESTAMP, timestamp_timezone).unwrap(),
+            Some(expected_timestamp_micros(expected))
+        );
+    }
+
+    #[test]
+    fn test_map_to_struct_timestamp_timezone_does_not_affect_timestamp_ntz() {
+        let raw = "2024-01-15 12:30:45.123456";
+        assert_eq!(
+            evaluate_map_timestamp_timezone(
+                raw,
+                DataType::TIMESTAMP_NTZ,
+                Some("America/Los_Angeles")
+            )
+            .unwrap(),
+            Some(expected_timestamp_micros("2024-01-15T12:30:45.123456Z"))
+        );
+    }
+
+    #[rstest]
+    #[case::default(None)]
+    #[case::configured(Some("America/Los_Angeles"))]
+    fn test_map_to_struct_timestamp_timezone_does_not_affect_date(
+        #[case] timestamp_timezone: Option<&str>,
+    ) {
+        let field =
+            evaluate_map_to_struct_field("2024-01-15", DataType::DATE, timestamp_timezone).unwrap();
+        let dates = field.as_any().downcast_ref::<Date32Array>().unwrap();
+        assert_eq!(dates.value(0), 19_737);
+    }
+
+    #[test]
+    fn test_map_to_struct_timestamp_timezone_reports_invalid_inputs() {
+        for timezone in [
+            "Not/AZone",
+            "+05",
+            "+0530",
+            "+05:60",
+            "+18:00:01",
+            "+19:00",
+            "+05:00:60",
+            "+05:00:00:00",
+        ] {
+            let error = evaluate_map_timestamp_timezone(
+                "2024-01-15 12:30:45",
+                DataType::TIMESTAMP,
+                Some(timezone),
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains(timezone));
+        }
+
+        assert!(matches!(
+            evaluate_map_timestamp_timezone(
+                "not a timestamp",
+                DataType::TIMESTAMP,
+                Some("America/Los_Angeles")
+            ),
+            Err(KernelError::ParseError(..))
+        ));
+        assert!(matches!(
+            evaluate_map_timestamp_timezone(
+                "2024-01-15 12:30:45+02:00 America/New_York",
+                DataType::TIMESTAMP,
+                None,
+            ),
+            Err(KernelError::ParseError(..))
+        ));
     }
 
     #[test]
@@ -2849,7 +3146,7 @@ mod tests {
 
         let output_schema = schema! { nullable "x": STRING };
         let result_type = DataType::from(output_schema);
-        let expr = Expr::map_to_struct(col!("pv"));
+        let expr = Expr::map_to_struct(col!("pv"), MapToStructOptions::default());
         let result = evaluate_expression(&expr, &batch, Some(&result_type)).unwrap();
         let structs = result.as_any().downcast_ref::<StructArray>().unwrap();
         let col = structs
@@ -2857,7 +3154,8 @@ mod tests {
             .as_any()
             .downcast_ref::<StringArray>()
             .unwrap();
-        // Rightmost entry wins
+        // The current implementation selects the rightmost entry. The public contract leaves
+        // duplicate-key behavior undefined because partitionValues maps must not contain them.
         assert_eq!(col.value(0), "last");
     }
 
@@ -2903,7 +3201,7 @@ mod tests {
             not_null "id": INTEGER,
         };
         let result_type = DataType::from(output_schema);
-        let expr = Expr::map_to_struct(col!("pv"));
+        let expr = Expr::map_to_struct(col!("pv"), MapToStructOptions::default());
         let result = evaluate_expression(&expr, &batch, Some(&result_type)).unwrap();
         let structs = result.as_any().downcast_ref::<StructArray>().unwrap();
 
@@ -2939,7 +3237,10 @@ mod tests {
 
         let output_schema = schema! { not_null "date": DATE };
         let result_type = DataType::from(output_schema);
-        let expr = Expr::coalesce([col!("pv_parsed"), Expr::map_to_struct(col!("pv"))]);
+        let expr = Expr::coalesce([
+            col!("pv_parsed"),
+            Expr::map_to_struct(col!("pv"), MapToStructOptions::default()),
+        ]);
         let result = evaluate_expression(&expr, &batch, Some(&result_type)).unwrap();
         let structs = result.as_any().downcast_ref::<StructArray>().unwrap();
 
@@ -2957,7 +3258,7 @@ mod tests {
 
         let output_schema = schema! { nullable "x": STRING };
         let result_type = DataType::from(output_schema);
-        let expr = Expr::map_to_struct(col!("s"));
+        let expr = Expr::map_to_struct(col!("s"), MapToStructOptions::default());
         let result = evaluate_expression(&expr, &batch, Some(&result_type));
         assert!(result.is_err());
     }
@@ -2989,7 +3290,7 @@ mod tests {
             nullable "count": INTEGER,
         };
         let result_type = DataType::from(output_schema);
-        let expr = Expr::map_to_struct(col!("pv"));
+        let expr = Expr::map_to_struct(col!("pv"), MapToStructOptions::default());
         let result = evaluate_expression(&expr, &batch, Some(&result_type)).unwrap();
         let structs = result.as_any().downcast_ref::<StructArray>().unwrap();
 
@@ -3041,7 +3342,7 @@ mod tests {
             nullable "ts": TIMESTAMP_NTZ,
         };
         let result_type = DataType::from(output_schema);
-        let expr = Expr::map_to_struct(col!("pv"));
+        let expr = Expr::map_to_struct(col!("pv"), MapToStructOptions::default());
         let result = evaluate_expression(&expr, &batch, Some(&result_type)).unwrap();
         let structs = result.as_any().downcast_ref::<StructArray>().unwrap();
 
@@ -3083,60 +3384,140 @@ mod tests {
     }
 
     #[rstest]
-    // Fast path: no nulls in predicate array — values bitmap used directly.
+    // A guard without NULLs lets the struct reuse the guard's values bitmap.
     #[case::fast_path(
+        expr!(guarded_struct(col("is_valid"), col("a"))),
         vec![Some(1), Some(2), Some(3)],
         vec![Some(true), Some(false), Some(true)],
         vec![true, false, true],
+        vec![Some(1), Some(2), Some(3)],
     )]
-    // Slow path: predicate has nulls — Kleene AND; both false and null → null struct.
+    // A guard with NULLs combines values and validity so NULL guards yield NULL structs.
     #[case::slow_path(
+        expr!(guarded_struct(col("is_valid"), col("a"))),
         vec![Some(1), Some(2), Some(3), Some(4)],
         vec![Some(true), Some(false), None, Some(true)],
         vec![true, false, false, true],
+        vec![Some(1), Some(2), Some(3), Some(4)],
     )]
-    fn test_struct_with_nullability_predicate(
+    #[case::unguarded_null_fields(
+        expr!(make_struct(col("a"))),
+        vec![None, None, None],
+        vec![Some(true), Some(false), None],
+        vec![true, true, true],
+        vec![None, None, None],
+    )]
+    #[case::predicate_guard(
+        expr!(guarded_struct(col("is_valid") == true, col("a"))),
+        vec![Some(1), Some(2), Some(3)],
+        vec![Some(true), Some(false), None],
+        vec![true, false, false],
+        vec![Some(1), Some(2), Some(3)],
+    )]
+    #[case::coalesce_guard(
+        expr!(guarded_struct(coalesce(col("is_valid"), false), col("a"))),
+        vec![Some(1), Some(2), Some(3)],
+        vec![Some(true), Some(false), None],
+        vec![true, false, false],
+        vec![Some(1), Some(2), Some(3)],
+    )]
+    #[case::coalesce_structs(
+        expr!(coalesce(guarded_struct(col("is_valid"), col("a")), make_struct(99))),
+        vec![Some(1), Some(2), Some(3), None],
+        vec![Some(true), Some(false), None, Some(true)],
+        vec![true, true, true, true],
+        vec![Some(1), Some(99), Some(99), None],
+    )]
+    fn struct_macro_preserves_row_validity_and_values(
+        #[case] expr: Expr,
         #[case] a_vals: Vec<Option<i32>>,
         #[case] pred_vals: Vec<Option<bool>>,
         #[case] expected_valid: Vec<bool>,
+        #[case] expected_values: Vec<Option<i32>>,
     ) {
         let batch = create_batch_with_bool_col(a_vals, pred_vals);
         let schema = DataType::from(schema! { nullable "a": INTEGER });
-        let expr = Expr::struct_with_nullability_from(
-            [column_expr_ref!("a")],
-            column_expr_ref!("is_valid"),
-        );
         let result = evaluate_expression(&expr, &batch, Some(&schema)).unwrap();
-        let struct_result = result.as_any().downcast_ref::<StructArray>().unwrap();
-        for (i, valid) in expected_valid.iter().enumerate() {
-            assert_eq!(struct_result.is_valid(i), *valid, "row {i}");
-        }
+        let expected = StructArray::new(
+            vec![Arc::new(ArrowField::new("a", ArrowDataType::Int32, true))].into(),
+            vec![Arc::new(Int32Array::from(expected_values))],
+            Some(NullBuffer::from(expected_valid)),
+        );
+        assert_eq!(result.as_ref(), &expected);
     }
 
-    #[test]
-    fn test_struct_with_nullability_predicate_nested_schema() {
-        // Nested struct as schema: outer struct has one field that is itself a struct.
+    #[rstest]
+    #[case::unguarded(expr!(make_struct()), vec![true, true, true])]
+    #[case::guarded(expr!(guarded_struct(col("is_valid"))), vec![true, false, false])]
+    #[case::coalesced(
+        expr!(coalesce(guarded_struct(col("is_valid")), make_struct())),
+        vec![true, true, true],
+    )]
+    fn empty_struct_macro_preserves_row_count_and_validity(
+        #[case] expr: Expr,
+        #[case] expected_valid: Vec<bool>,
+        #[values(0, 3)] num_rows: usize,
+    ) {
         let batch = create_batch_with_bool_col(
             vec![Some(1), Some(2), Some(3)],
-            vec![Some(true), Some(false), Some(true)],
+            vec![Some(true), Some(false), None],
+        )
+        .slice(0, num_rows);
+        let schema = DataType::from(schema! {});
+        let result = evaluate_expression(&expr, &batch, Some(&schema)).unwrap();
+        let expected = StructArray::new_empty_fields(
+            num_rows,
+            Some(NullBuffer::from(expected_valid).slice(0, num_rows)),
+        );
+        assert_eq!(result.as_ref(), &expected);
+    }
+
+    #[rstest]
+    #[case::guarded_outer(
+        expr!(guarded_struct(col("a") > 0, make_struct(col("a")))),
+        vec![true, false, true, false],
+        vec![true, true, true, true],
+    )]
+    #[case::guarded_inner(
+        expr!(make_struct(guarded_struct(col("is_valid"), col("a")))),
+        vec![true, true, true, true],
+        vec![false, true, true, false],
+    )]
+    #[case::both_guarded(
+        expr!(guarded_struct(col("a") > 0, guarded_struct(col("is_valid"), col("a")))),
+        vec![true, false, true, false],
+        vec![false, true, true, false],
+    )]
+    fn nested_struct_macro_preserves_independent_guards(
+        #[case] expr: Expr,
+        #[case] outer_valid: Vec<bool>,
+        #[case] inner_valid: Vec<bool>,
+    ) {
+        let values = vec![Some(1), Some(-1), Some(2), None];
+        let batch = create_batch_with_bool_col(
+            values.clone(),
+            vec![Some(false), Some(true), Some(true), None],
         );
         let schema = DataType::from(schema! {
             nullable "nested": { nullable "a": INTEGER },
         });
-        let inner_expr = Expr::struct_from([column_expr_ref!("a")]);
-        let expr = Expr::struct_with_nullability_from([inner_expr], column_expr_ref!("is_valid"));
         let result = evaluate_expression(&expr, &batch, Some(&schema)).unwrap();
-        let struct_result = result.as_any().downcast_ref::<StructArray>().unwrap();
-        assert!(struct_result.is_valid(0));
-        assert!(struct_result.is_null(1));
-        assert!(struct_result.is_valid(2));
-        // The "nested" column should itself be a StructArray with 3 rows
-        let nested = struct_result
-            .column(0)
-            .as_any()
-            .downcast_ref::<StructArray>()
-            .unwrap();
-        assert_eq!(nested.len(), 3);
+        let inner = StructArray::new(
+            vec![Arc::new(ArrowField::new("a", ArrowDataType::Int32, true))].into(),
+            vec![Arc::new(Int32Array::from(values))],
+            Some(NullBuffer::from(inner_valid)),
+        );
+        let expected = StructArray::new(
+            vec![Arc::new(ArrowField::new(
+                "nested",
+                inner.data_type().clone(),
+                true,
+            ))]
+            .into(),
+            vec![Arc::new(inner)],
+            Some(NullBuffer::from(outer_valid)),
+        );
+        assert_eq!(result.as_ref(), &expected);
     }
 
     #[test]
@@ -3388,7 +3769,7 @@ mod tests {
         vec![col!("a") + col!("b"),
              col!("b") - col!("a"),
              col!("a") * col!("b"),
-             Expr::coalesce([col!("a"), col!("b")])],
+             expr!(coalesce(col("a"), col("b")))],
         vec![vec![11, 9, 10, 1], vec![22, 18, 40, 2], vec![33, 27, 90, 3]])]
     #[case::empty_batch_n1(int_a_batch(vec![], false), vec![col!("a")], vec![])]
     #[case::empty_batch_n2(int_a_batch(vec![], false),
@@ -3658,5 +4039,401 @@ mod tests {
         assert_eq!(result.len(), 2);
         assert_eq!(result.null_count(), 2);
         assert_eq!(result.data_type(), &ArrowDataType::Date32);
+    }
+
+    fn case_when_batch() -> RecordBatch {
+        let strings = StringArray::from(vec![Some("first"), None, Some("last")]);
+        RecordBatch::try_from_iter([
+            ("a", Arc::new(Int32Array::from(vec![1, 2, 3])) as ArrayRef),
+            (
+                "b",
+                Arc::new(Int32Array::from(vec![Some(10), None, Some(30)])),
+            ),
+            (
+                "flag",
+                Arc::new(BooleanArray::from(vec![Some(true), None, Some(false)])),
+            ),
+            ("s", Arc::new(strings.clone())),
+            (
+                "large_s",
+                cast(&strings, &ArrowDataType::LargeUtf8).unwrap(),
+            ),
+            ("view_s", cast(&strings, &ArrowDataType::Utf8View).unwrap()),
+        ])
+        .unwrap()
+    }
+
+    fn case_when_struct_data(values: Vec<Option<i32>>, valid: Vec<bool>) -> ArrowArrayData {
+        StructArray::new(
+            vec![ArrowField::new("value", ArrowDataType::Int32, true)].into(),
+            vec![Arc::new(Int32Array::from(values))],
+            Some(NullBuffer::from(valid)),
+        )
+        .to_data()
+    }
+
+    #[rstest]
+    #[case::first_true_wins(
+        [Expr::case_when(
+            [
+                (col!("a").gt(lit(1)), lit(10)),
+                (col!("a").gt(lit(0)), lit(20)),
+            ],
+            lit(30),
+        )],
+        Ok(Int32Array::from(vec![Some(20), Some(10), Some(10)]).to_data()),
+    )]
+    #[case::null_condition_falls_through(
+        [Expr::case_when(
+            [
+                (column_pred!("flag"), lit(1)),
+                (Predicate::TRUE, lit(2)),
+            ],
+            null_lit(DataType::INTEGER),
+        )],
+        Ok(Int32Array::from(vec![Some(1), Some(2), Some(2)]).to_data()),
+    )]
+    #[case::null_condition_uses_else(
+        [Expr::case_when([(column_pred!("flag"), lit(1))], lit(2))],
+        Ok(Int32Array::from(vec![Some(1), Some(2), Some(2)]).to_data()),
+    )]
+    #[case::null_expressions_use_else(
+        [
+            Predicate::NULL,
+            Predicate::not(Predicate::NULL),
+            Predicate::and(Predicate::NULL, Predicate::TRUE),
+            Predicate::or(Predicate::NULL, Predicate::FALSE),
+            Predicate::not(Predicate::or(Predicate::NULL, Predicate::FALSE)),
+            Predicate::from_expr(Expr::cast(null_lit(DataType::STRING), DataType::BOOLEAN)),
+            Predicate::from_expr(Expr::case_when(
+                [(Predicate::TRUE, Predicate::NULL.into())], lit(true),
+            )),
+            Predicate::from_expr(Expr::case_when(
+                [(Predicate::TRUE, Predicate::not(Predicate::or(
+                    Predicate::NULL, Predicate::FALSE,
+                )).into())], lit(true),
+            )),
+        ].map(|condition| Expr::case_when([(condition, lit(1))], lit(2))),
+        Ok(Int32Array::from(vec![Some(2); 3]).to_data()),
+    )]
+    #[case::typed_null_else(
+        [Expr::case_when(
+            [(col!("a").gt(lit(2)), lit(10))],
+            null_lit(DataType::INTEGER),
+        )],
+        Ok(Int32Array::from(vec![None, None, Some(10)]).to_data()),
+    )]
+    #[case::typed_null_else_in_arithmetic(
+        [Expr::case_when(
+            [(col!("a").gt(lit(2)), lit(10))],
+            null_lit(DataType::INTEGER),
+        ) + lit(1)],
+        Ok(Int32Array::from(vec![None, None, Some(11)]).to_data()),
+    )]
+    #[case::selected_null_does_not_fall_through(
+        [Expr::case_when(
+            [
+                (Predicate::TRUE, null_lit(DataType::INTEGER)),
+                (Predicate::TRUE, lit(2)),
+            ],
+            lit(3),
+        )],
+        Ok(Int32Array::from(vec![None, None, None]).to_data()),
+    )]
+    #[case::skip_unreachable_condition_and_else(
+        [Expr::case_when(
+            [
+                (Predicate::TRUE, lit(1)),
+                (Predicate::unknown("unselected"), lit(1) / lit(0)),
+            ],
+            lit(1) / lit(0),
+        )],
+        Ok(Int32Array::from(vec![Some(1), Some(1), Some(1)]).to_data()),
+    )]
+    #[case::then_sees_only_selected_rows(
+        [Expr::case_when(
+            [(
+                col!("a").ne(lit(1)),
+                lit(10) / (col!("a") - lit(1)),
+            )],
+            lit(0),
+        )],
+        Ok(Int32Array::from(vec![Some(0), Some(10), Some(5)]).to_data()),
+    )]
+    #[case::else_sees_only_unmatched_rows(
+        [Expr::case_when(
+            [(col!("a").eq(lit(1)), lit(0))],
+            lit(10) / (col!("a") - lit(1)),
+        )],
+        Ok(Int32Array::from(vec![Some(0), Some(10), Some(5)]).to_data()),
+    )]
+    #[case::later_condition_sees_only_unmatched_rows(
+        [Expr::case_when(
+            [
+                (col!("a").eq(lit(1)), lit(0)),
+                (
+                    (lit(10) / (col!("a") - lit(1)))
+                        .gt(lit(8)),
+                    lit(7),
+                ),
+            ],
+            lit(9),
+        )],
+        Ok(Int32Array::from(vec![Some(0), Some(7), Some(9)]).to_data()),
+    )]
+    #[case::skip_branch_matching_only_already_selected_rows(
+        [Expr::case_when(
+            [
+                (col!("a").lt(lit(3)), lit(10)),
+                (col!("a").lt(lit(3)), lit(1) / lit(0)),
+            ],
+            lit(20),
+        )],
+        Ok(Int32Array::from(vec![Some(10), Some(10), Some(20)]).to_data()),
+    )]
+    #[case::nested_case_when(
+        [Expr::case_when(
+            [(col!("a").lt(lit(2)), lit(0))],
+            Expr::case_when(
+                [(col!("a").gt(lit(2)), lit(100))],
+                col!("a"),
+            ),
+        )],
+        Ok(Int32Array::from(vec![Some(0), Some(2), Some(100)]).to_data()),
+    )]
+    #[case::arithmetic_branches(
+        [Expr::case_when(
+            [((col!("a") + col!("a")).gt(lit(3)),
+              col!("a") * col!("b"))],
+            col!("b") - col!("a"),
+        )],
+        Ok(Int32Array::from(vec![Some(9), None, Some(90)]).to_data()),
+    )]
+    #[case::preserves_element_nulls(
+        [Expr::case_when(
+            [(col!("a").ge(lit(2)), col!("b"))],
+            lit(0),
+        )],
+        Ok(Int32Array::from(vec![Some(0), None, Some(30)]).to_data()),
+    )]
+    #[case::nonadjacent_rows_keep_order(
+        [Expr::case_when(
+            [(col!("a").ne(lit(2)), col!("b"))],
+            lit(0),
+        )],
+        Ok(Int32Array::from(vec![Some(10), Some(0), Some(30)]).to_data()),
+    )]
+    #[case::scalar_in_condition_broadcasts(
+        [Expr::case_when(
+            [(
+                Predicate::binary(
+                    BinaryPredicateOp::In,
+                    lit(1),
+                    Scalar::Array(ArrayData::try_new(
+                        ArrayType::new(DataType::INTEGER, false), vec![Scalar::Integer(1)],
+                    ).unwrap()),
+                ),
+                col!("a"),
+            )],
+            lit(0),
+        )],
+        Ok(Int32Array::from(vec![Some(1), Some(2), Some(3)]).to_data()),
+    )]
+    #[case::strings_literal_else(
+        [Expr::case_when(
+            [(col!("a").ge(lit(2)), col!("s"))],
+            lit("fallback"),
+        )],
+        Ok(StringArray::from(vec![Some("fallback"), None, Some("last")]).to_data()),
+    )]
+    #[case::strings_null_else(
+        [Expr::case_when(
+            [(col!("a").ge(lit(2)), col!("s"))],
+            null_lit(DataType::STRING),
+        )],
+        Ok(StringArray::from(vec![None, None, Some("last")]).to_data()),
+    )]
+    #[case::struct_literal_else(
+        [Expr::case_when(
+            [(col!("a").ge(lit(2)), Expr::struct_from([col!("b")]))],
+            Expr::struct_from([lit(0)]),
+        )],
+        Ok(case_when_struct_data(vec![Some(0), None, Some(30)], vec![true, true, true])),
+    )]
+    #[case::struct_null_else(
+        [Expr::case_when(
+            [(col!("a").ge(lit(2)), Expr::struct_from([col!("b")]))],
+            null_lit(StructType::new_unchecked([
+                StructField::nullable("value", DataType::INTEGER),
+            ])),
+        )],
+        Ok(case_when_struct_data(vec![None, None, Some(30)], vec![false, true, true])),
+    )]
+    #[case::mismatched_when_type(
+        [Expr::case_when(
+            [
+                (col!("a").gt(lit(2)), lit(1)),
+                (Predicate::TRUE, lit("text")),
+            ],
+            lit(0),
+        )],
+        Err("CASE WHEN branches must have the same type"),
+    )]
+    #[case::mismatched_else_type(
+        [Expr::case_when(
+            [(col!("a").gt(lit(2)), lit(1))],
+            lit("text"),
+        )],
+        Err("CASE WHEN branches must have the same type"),
+    )]
+    #[case::mismatched_null_type(
+        [Expr::case_when(
+            [(col!("a").gt(lit(2)), null_lit(DataType::INTEGER))],
+            null_lit(DataType::STRING),
+        )],
+        Err("CASE WHEN branches must have the same type"),
+    )]
+    #[case::mismatched_numeric_width(
+        [Expr::case_when(
+            [(col!("a").gt(lit(2)), lit(1))],
+            lit(0_i64),
+        )],
+        Err("CASE WHEN branches must have the same type"),
+    )]
+    fn test_evaluate_case_when(
+        #[case] exprs: impl IntoIterator<Item = Expr>,
+        #[case] expected: Result<ArrowArrayData, &str>,
+    ) {
+        let batch = case_when_batch();
+        for expr in exprs {
+            let expected = match &expected {
+                Ok(expected) => expected,
+                Err(message) => {
+                    assert_result_error_with_message(
+                        evaluate_expression(&expr, &batch, None),
+                        message,
+                    );
+                    continue;
+                }
+            };
+            let output_type: DataType = expected.data_type().try_into_kernel().unwrap();
+            for result_type in [None, Some(&output_type)] {
+                // Struct expressions require an explicit output schema.
+                if result_type.is_none() && matches!(output_type, DataType::Struct(_)) {
+                    continue;
+                }
+                let result = evaluate_expression(&expr, &batch, result_type).unwrap();
+                assert_eq!(result.to_data(), *expected, "{expr:?}, {result_type:?}");
+            }
+        }
+    }
+
+    #[rstest]
+    #[case::all(Predicate::TRUE, [true; 3])]
+    #[case::first_row(col!("a").eq(lit(1)), [true, false, false])]
+    #[case::nonadjacent_rows(col!("a").ne(lit(2)), [true, false, true])]
+    #[case::none(Predicate::FALSE, [false; 3])]
+    fn test_evaluate_case_when_scalar_results(
+        #[case] condition: Predicate,
+        #[case] selected: [bool; 3],
+        #[values(true, false)] scalar_then: bool,
+        #[values(0, 1, 3)] num_rows: usize,
+        #[values(None, Some(&DataType::BOOLEAN))] result_type: Option<&DataType>,
+    ) {
+        let scalar = Predicate::binary(
+            BinaryPredicateOp::In,
+            lit(1),
+            Scalar::Array(
+                ArrayData::try_new(
+                    ArrayType::new(DataType::INTEGER, false),
+                    vec![Scalar::Integer(1)],
+                )
+                .unwrap(),
+            ),
+        )
+        .into();
+        let (then_expr, else_expr) = if scalar_then {
+            (scalar, lit(false))
+        } else {
+            (lit(false), scalar)
+        };
+        let expr = Expr::case_when([(condition, then_expr)], else_expr);
+        let batch = case_when_batch().slice(0, num_rows);
+        let result = evaluate_expression(&expr, &batch, result_type).unwrap();
+        let expected = BooleanArray::from_iter(
+            selected
+                .into_iter()
+                .take(num_rows)
+                .map(|selected| Some(selected == scalar_then)),
+        );
+        assert_eq!(result.to_data(), expected.to_data());
+    }
+
+    #[rstest]
+    fn test_evaluate_case_when_string_types(
+        #[values("s", "large_s", "view_s")] column: &str,
+        #[values(false, true)] nested: bool,
+        #[values(false, true)] null_else: bool,
+    ) {
+        let source = case_when_batch();
+        let strings = source.column_by_name(column).unwrap().clone();
+        let values: ArrayRef = if nested {
+            Arc::new(StructArray::from(vec![(
+                Arc::new(ArrowField::new("value", strings.data_type().clone(), true)),
+                strings,
+            )]))
+        } else {
+            strings
+        };
+        let batch = RecordBatch::try_from_iter([
+            ("a", source.column_by_name("a").unwrap().clone()),
+            ("value", values.clone()),
+        ])
+        .unwrap();
+        let output_type: DataType = values.data_type().try_into_kernel().unwrap();
+        let fallback = if null_else {
+            null_lit(output_type)
+        } else {
+            col!("value")
+        };
+        let expr = Expr::case_when([(col!("a").gt(lit(2)), col!("value"))], fallback);
+        let result = evaluate_expression(&expr, &batch, None);
+        if null_else && column != "s" {
+            assert_result_error_with_message(result, "CASE WHEN branches must have the same type");
+        } else {
+            let expected: ArrayRef = if null_else {
+                let strings = Arc::new(StringArray::from(vec![None, None, Some("last")]));
+                if nested {
+                    Arc::new(StructArray::new(
+                        values.as_struct().fields().clone(),
+                        vec![strings],
+                        Some(NullBuffer::from(vec![false, false, true])),
+                    ))
+                } else {
+                    strings
+                }
+            } else {
+                values
+            };
+            assert_eq!(result.unwrap().to_data(), expected.to_data());
+        }
+    }
+
+    #[rstest]
+    fn test_evaluate_case_when_without_matches(
+        #[values(0, 1)] num_branches: usize,
+        #[values(None, Some(9))] else_value: Option<i32>,
+        #[values(0, 3)] num_rows: usize,
+        #[values(None, Some(&DataType::INTEGER))] result_type: Option<&DataType>,
+    ) {
+        let branches = (0..num_branches).map(|_| (col!("a").lt(lit(0)), lit(1) / lit(0)));
+        let fallback = else_value.map_or_else(|| null_lit(DataType::INTEGER), lit);
+        let expr = Expr::case_when(branches, fallback);
+        let batch = case_when_batch().slice(0, num_rows);
+        let result = evaluate_expression(&expr, &batch, result_type).unwrap();
+        assert_eq!(
+            result.to_data(),
+            Int32Array::from(vec![else_value; num_rows]).to_data()
+        );
     }
 }

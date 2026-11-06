@@ -59,7 +59,7 @@
 //! both halves can pair its dense field list with the expressions this walk produces rather than
 //! deriving the field names again.
 
-use std::collections::{hash_map, HashMap};
+use std::collections::{HashMap, hash_map};
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
@@ -67,7 +67,28 @@ use serde::{Deserialize, Serialize};
 use crate::expressions::{ColumnName, Expression, ExpressionRef};
 use crate::schema::{DataType, SchemaRef, StructField, StructType};
 use crate::utils::{CollectInto, FoldWithOption as _};
-use crate::{DeltaResult, Error};
+use crate::{KernelError, KernelResult};
+
+/// Projects a nested struct to `schema` while preserving a null source struct.
+///
+/// Each struct level is rebuilt so fields absent from `schema` are omitted.
+pub(crate) fn project_struct_preserving_nulls(
+    root: impl CollectInto<ColumnName>,
+    schema: &StructType,
+) -> Expression {
+    let root = root.collect_into();
+    let fields = schema.fields().map(|field| {
+        let column = root.join(&ColumnName::new([field.name()]));
+        match field.data_type() {
+            DataType::Struct(schema) => project_struct_preserving_nulls(column, schema),
+            _ => Expression::from(column),
+        }
+    });
+    Expression::struct_with_nullability_from(
+        fields,
+        Expression::from_pred(Expression::from(root.clone()).is_not_null()),
+    )
+}
 
 // === Raw expression patch ===
 
@@ -140,7 +161,7 @@ pub struct StructPatchBuilder<Item> {
     root: StructPatchNode<Item>,
     /// The first error produced by a builder call, surfaced by `build`. Once set, later calls are
     /// skipped so the original (most relevant) error is preserved.
-    error: DeltaResult<()>,
+    error: KernelResult<()>,
 }
 
 /// The patch builder internally represents the in-progress patch specification as a tree of struct
@@ -383,7 +404,7 @@ impl<Item> StructPatchBuilder<Item> {
     fn apply_at(
         mut self,
         struct_path: impl CollectInto<ColumnName>,
-        op: impl FnOnce(&mut StructPatchNode<Item>) -> DeltaResult<()>,
+        op: impl FnOnce(&mut StructPatchNode<Item>) -> KernelResult<()>,
     ) -> Self {
         if self.error.is_ok() {
             let path = struct_path.collect_into();
@@ -395,7 +416,7 @@ impl<Item> StructPatchBuilder<Item> {
     fn begin_build(
         self,
         input_schema: &StructType,
-    ) -> DeltaResult<(StructPatchNode<Item>, Option<ColumnName>, &StructType)> {
+    ) -> KernelResult<(StructPatchNode<Item>, Option<ColumnName>, &StructType)> {
         self.error?;
         let source_schema = resolve_input_schema(input_schema, self.input_path.as_ref())?;
         Ok((self.root, self.input_path, source_schema))
@@ -408,10 +429,10 @@ impl<Item> StructPatchNode<Item> {
         &mut self,
         field_name: impl Into<String>,
         item: impl Into<Item>,
-    ) -> DeltaResult<()> {
+    ) -> KernelResult<()> {
         let entry = self.field_patch_mut(field_name.into(), |field_name, entry| {
             if entry.action.is_optional_drop() {
-                return Err(Error::generic(format!(
+                return Err(KernelError::generic(format!(
                     "Field '{field_name}' cannot combine optional drop with insert-after"
                 )));
             }
@@ -423,7 +444,7 @@ impl<Item> StructPatchNode<Item> {
 
     /// Records a drop of the named input field. `optional` tolerates an absent field at evaluation
     /// time, but cannot combine with insertions after that field.
-    fn drop(&mut self, field_name: impl Into<String>, optional: bool) -> DeltaResult<()> {
+    fn drop(&mut self, field_name: impl Into<String>, optional: bool) -> KernelResult<()> {
         self.set_action(field_name, FieldPatchOp::Drop { optional })
     }
 
@@ -433,15 +454,15 @@ impl<Item> StructPatchNode<Item> {
         &mut self,
         field_name: impl Into<String>,
         action: FieldPatchOp<Item>,
-    ) -> DeltaResult<()> {
+    ) -> KernelResult<()> {
         let entry = self.field_patch_mut(field_name.into(), |field_name, entry| {
             if !entry.action.is_keep() {
-                return Err(Error::generic(format!(
+                return Err(KernelError::generic(format!(
                     "Field '{field_name}' has multiple input field actions"
                 )));
             }
             if action.is_optional_drop() && !entry.insert_after.is_empty() {
-                return Err(Error::generic(format!(
+                return Err(KernelError::generic(format!(
                     "Field '{field_name}' cannot combine optional drop with insert-after"
                 )));
             }
@@ -451,7 +472,7 @@ impl<Item> StructPatchNode<Item> {
         Ok(())
     }
 
-    fn child_at_mut(&mut self, path: &[String]) -> DeltaResult<&mut Self> {
+    fn child_at_mut(&mut self, path: &[String]) -> KernelResult<&mut Self> {
         let Some((field_name, remaining)) = path.split_first() else {
             return Ok(self);
         };
@@ -462,7 +483,7 @@ impl<Item> StructPatchNode<Item> {
             state.action = FieldPatchOp::Nested(Box::default());
         }
         let FieldPatchOp::Nested(node) = &mut state.action else {
-            return Err(Error::generic(format!(
+            return Err(KernelError::generic(format!(
                 "Cannot patch nested fields under dropped/replaced field '{field_name}'"
             )));
         };
@@ -475,8 +496,8 @@ impl<Item> StructPatchNode<Item> {
     fn field_patch_mut(
         &mut self,
         field_name: String,
-        validate_existing: impl FnOnce(&str, &FieldPatchNode<Item>) -> DeltaResult<()>,
-    ) -> DeltaResult<&mut FieldPatchNode<Item>> {
+        validate_existing: impl FnOnce(&str, &FieldPatchNode<Item>) -> KernelResult<()>,
+    ) -> KernelResult<&mut FieldPatchNode<Item>> {
         match self.fields.entry(field_name) {
             hash_map::Entry::Vacant(entry) => Ok(entry.insert(FieldPatchNode::default())),
             hash_map::Entry::Occupied(entry) => {
@@ -491,14 +512,14 @@ impl<Item> StructPatchNode<Item> {
 fn resolve_input_schema<'a>(
     input_schema: &'a StructType,
     input_path: Option<&ColumnName>,
-) -> DeltaResult<&'a StructType> {
+) -> KernelResult<&'a StructType> {
     let input_path = match input_path {
         Some(input_path) if !input_path.path().is_empty() => input_path,
         _ => return Ok(input_schema),
     };
     let field = input_schema.field_at(input_path)?;
     let DataType::Struct(nested_schema) = field.data_type() else {
-        return Err(Error::generic(format!(
+        return Err(KernelError::generic(format!(
             "Patching failed: input path '{input_path}' references a non-struct field"
         )));
     };
@@ -515,16 +536,16 @@ impl StructPatchBuilder<ExpressionRef> {
     /// Returns an error when builder calls request multiple drop/replace operations for the
     /// same field, or when a destructive operation on one field overlapped with an operation on a
     /// nested child field.
-    pub fn build(self) -> DeltaResult<ExpressionStructPatch> {
+    pub fn build(self) -> KernelResult<ExpressionStructPatch> {
         self.error?;
         Ok(self.root.to_expr_patch(self.input_path))
     }
 }
 
 impl TryFrom<StructPatchBuilder<ExpressionRef>> for ExpressionStructPatch {
-    type Error = Error;
+    type Error = KernelError;
 
-    fn try_from(builder: StructPatchBuilder<ExpressionRef>) -> DeltaResult<Self> {
+    fn try_from(builder: StructPatchBuilder<ExpressionRef>) -> KernelResult<Self> {
         builder.build()
     }
 }
@@ -611,7 +632,7 @@ impl StructPatchBuilder<StructField> {
     /// Returns an error if a builder call produced a conflicting operation, the input path cannot
     /// be resolved to a struct, a required field patch references a missing input field, a nested
     /// field patch targets a non-struct field, or the resulting output schema is invalid.
-    pub fn build(self, input_schema: &StructType) -> DeltaResult<StructType> {
+    pub fn build(self, input_schema: &StructType) -> KernelResult<StructType> {
         let (root, _input_path, source_schema) = self.begin_build(input_schema)?;
         StructType::try_new(schema_walk(root, source_schema)?)
     }
@@ -645,7 +666,7 @@ impl SchemaPatchItem for ProjectionItem {
 fn schema_walk<Item: SchemaPatchItem>(
     node: StructPatchNode<Item>,
     input_schema: &StructType,
-) -> DeltaResult<Vec<StructField>> {
+) -> KernelResult<Vec<StructField>> {
     let mut fields = node.fields;
     let mut output: Vec<_> = Item::into_fields(node.prepended_fields).collect();
     output.reserve(input_schema.num_fields() + fields.len());
@@ -659,7 +680,7 @@ fn schema_walk<Item: SchemaPatchItem>(
             FieldPatchOp::Replace(item) => output.push(item.into_field()),
             FieldPatchOp::Nested(node) => {
                 let DataType::Struct(nested_schema) = input_field.data_type() else {
-                    return Err(Error::generic(format!(
+                    return Err(KernelError::generic(format!(
                         "Cannot patch nested fields under non-struct field '{}'",
                         input_field.name()
                     )));
@@ -680,7 +701,7 @@ fn schema_walk<Item: SchemaPatchItem>(
         .iter()
         .find(|(_, state)| !state.action.is_optional_drop())
     {
-        return Err(Error::generic(format!(
+        return Err(KernelError::generic(format!(
             "Field to patch does not exist: {field_name}"
         )));
     }
@@ -720,7 +741,7 @@ impl<'a> ProjectionStructPatchBuilder<'a> {
         &self,
         struct_path: &ColumnName,
         field_name: &str,
-    ) -> DeltaResult<StructField> {
+    ) -> KernelResult<StructField> {
         let field_path: ColumnName = [
             self.inner.input_path.clone().unwrap_or_default(),
             struct_path.clone(),
@@ -750,7 +771,7 @@ impl<'a> ProjectionStructPatchBuilder<'a> {
     }
 
     /// Returns the schema this projection patch is applied to.
-    pub fn input_schema(&self) -> &StructType {
+    pub fn input_schema(&self) -> &'a StructType {
         self.input_schema
     }
 
@@ -913,7 +934,7 @@ impl<'a> ProjectionStructPatchBuilder<'a> {
     /// Returns an error if a `with_*` call produced a conflicting operation, the input path cannot
     /// be resolved to a struct, a required field patch references a missing input field, a nested
     /// field patch targets a non-struct field, or the resulting output schema is invalid.
-    pub fn build(self) -> DeltaResult<(SchemaRef, ExpressionRef)> {
+    pub fn build(self) -> KernelResult<(SchemaRef, ExpressionRef)> {
         let (root, input_path, source_schema) = self.inner.begin_build(self.input_schema)?;
         let patch = root.to_expr_patch(input_path);
         let schema = StructType::try_new(schema_walk(root, source_schema)?)?;
@@ -934,9 +955,9 @@ mod tests {
     use rstest::rstest;
 
     use crate::expressions::{
-        lit, Expression as Expr, ExpressionRef, ExpressionStructPatch, ExpressionStructPatchBuilder,
+        Expression as Expr, ExpressionRef, ExpressionStructPatch, ExpressionStructPatchBuilder, lit,
     };
-    use crate::schema::{schema, DataType, SchemaStructPatchBuilder, StructField, StructType};
+    use crate::schema::{DataType, SchemaStructPatchBuilder, StructField, StructType, schema};
     use crate::struct_patch::ProjectionStructPatchBuilder;
     use crate::unit_test_utils::assert_result_error_with_message;
 

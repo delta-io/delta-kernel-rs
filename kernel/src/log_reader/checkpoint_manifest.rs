@@ -1,23 +1,22 @@
 //! Manifest phase for log replay - processes single-part checkpoints and manifest checkpoints.
 
-use std::sync::{Arc, LazyLock};
+use std::sync::Arc;
 
 use itertools::Itertools;
 use url::Url;
 
 use crate::actions::visitors::SidecarVisitor;
-use crate::actions::{ADD_FIELD, REMOVE_FIELD, SIDECAR_FIELD};
 use crate::log_replay::ActionsBatch;
 use crate::path::ParsedLogPath;
-use crate::schema::{lazy_schema_ref, SchemaRef};
+use crate::schema::SchemaRef;
 use crate::utils::require;
-use crate::{DeltaResult, DeltaResultIteratorStatic, Engine, Error, FileMeta, RowVisitor};
+use crate::{Engine, FileMeta, KernelError, KernelResult, KernelResultIterator, RowVisitor};
 
 /// Phase that processes single-part checkpoint. This also treats the checkpoint as a manifest file
 /// and extracts the sidecar actions during iteration.
 #[allow(unused)]
 pub(crate) struct CheckpointManifestReader {
-    actions: DeltaResultIteratorStatic<ActionsBatch>,
+    actions: Box<dyn KernelResultIterator<ActionsBatch>>,
     sidecar_visitor: SidecarVisitor,
     log_root: Url,
     is_complete: bool,
@@ -25,40 +24,37 @@ pub(crate) struct CheckpointManifestReader {
 }
 
 impl CheckpointManifestReader {
-    /// Create a new manifest phase for a single-part checkpoint.
+    /// Creates a manifest reader for a single-part checkpoint.
     ///
-    /// The schema is automatically augmented with the sidecar column since the manifest
-    /// phase needs to extract sidecar references for phase transitions.
+    /// `read_schema` must include the `sidecar` action field so this reader can discover sidecar
+    /// files.
     ///
     /// # Parameters
-    /// - `manifest_file`: The checkpoint manifest file to process
-    /// - `log_root`: Root URL for resolving sidecar paths
-    /// - `engine`: Engine for reading files
+    ///
+    /// - `engine`: Engine for reading the checkpoint manifest.
+    /// - `manifest`: Checkpoint manifest to process.
+    /// - `log_root`: Root URL for resolving sidecar paths.
+    /// - `read_schema`: Schema for reading the manifest actions.
     #[allow(unused)]
     pub(crate) fn try_new(
         engine: Arc<dyn Engine>,
         manifest: &ParsedLogPath,
         log_root: Url,
-    ) -> DeltaResult<Self> {
-        static MANIFEST_READ_SCHMEA: LazyLock<SchemaRef> = lazy_schema_ref! {
-            (&ADD_FIELD),
-            (&REMOVE_FIELD),
-            (&SIDECAR_FIELD),
-        };
-
+        read_schema: SchemaRef,
+    ) -> KernelResult<Self> {
         let actions = match manifest.extension.as_str() {
             "json" => engine.json_handler().read_json_files(
                 std::slice::from_ref(&manifest.location),
-                MANIFEST_READ_SCHMEA.clone(),
+                read_schema.clone(),
                 None,
             )?,
             "parquet" => engine.parquet_handler().read_parquet_files(
                 std::slice::from_ref(&manifest.location),
-                MANIFEST_READ_SCHMEA.clone(),
+                read_schema,
                 None,
             )?,
             extension => {
-                return Err(Error::generic(format!(
+                return Err(KernelError::generic(format!(
                     "Unsupported checkpoint extension: {extension}",
                 )));
             }
@@ -77,10 +73,10 @@ impl CheckpointManifestReader {
     /// Extract the sidecars from the manifest file if there were any.
     /// NOTE: The iterator must be completely exhausted before calling this
     #[allow(unused)]
-    pub(crate) fn extract_sidecars(self) -> DeltaResult<Vec<FileMeta>> {
+    pub(crate) fn extract_sidecars(self) -> KernelResult<Vec<FileMeta>> {
         require!(
             self.is_complete,
-            Error::generic(format!(
+            KernelError::generic(format!(
                 "Cannot extract sidecars from in-progress ManifestReader for file: {}",
                 self.manifest_file.location
             ))
@@ -98,7 +94,7 @@ impl CheckpointManifestReader {
 }
 
 impl Iterator for CheckpointManifestReader {
-    type Item = DeltaResult<ActionsBatch>;
+    type Item = KernelResult<ActionsBatch>;
 
     fn next(&mut self) -> Option<Self::Item> {
         let Some(result) = self.actions.next() else {
@@ -120,10 +116,12 @@ mod tests {
     use itertools::Itertools;
 
     use super::*;
+    use crate::actions::{ADD_FIELD, REMOVE_FIELD, SIDECAR_FIELD};
     use crate::arrow::array::{Array, StringArray, StructArray};
     use crate::engine::arrow_data::EngineDataArrowExt as _;
+    use crate::schema::schema_ref;
     use crate::unit_test_utils::{assert_result_error_with_message, load_test_table};
-    use crate::SnapshotRef;
+    use crate::{KernelResult, SnapshotRef};
 
     /// Helper function to test manifest phase with expected add paths and sidecars
     fn verify_manifest_phase(
@@ -131,13 +129,17 @@ mod tests {
         snapshot: SnapshotRef,
         expected_add_paths: &[&str],
         expected_sidecars: &[&str],
-    ) -> DeltaResult<()> {
+    ) -> KernelResult<()> {
         let log_segment = snapshot.log_segment();
         let log_root = log_segment.log_root.clone();
         assert_eq!(log_segment.listed.checkpoint_parts.len(), 1);
         let checkpoint_file = &log_segment.listed.checkpoint_parts[0];
-        let mut manifest_phase =
-            CheckpointManifestReader::try_new(engine.clone(), checkpoint_file, log_root)?;
+        let mut manifest_phase = CheckpointManifestReader::try_new(
+            engine.clone(),
+            checkpoint_file,
+            log_root,
+            manifest_read_schema(),
+        )?;
 
         // Extract add file paths and verify expectations
         let mut file_paths = vec![];
@@ -200,7 +202,7 @@ mod tests {
     }
 
     #[test]
-    fn test_manifest_phase_extracts_file_paths() -> DeltaResult<()> {
+    fn test_manifest_phase_extracts_file_paths() -> KernelResult<()> {
         let (engine, snapshot, _tempdir) = load_test_table("with_checkpoint_no_last_checkpoint")?;
         verify_manifest_phase(
             engine,
@@ -211,13 +213,14 @@ mod tests {
     }
 
     #[test]
-    fn test_manifest_phase_early_finalize_error() -> DeltaResult<()> {
+    fn test_manifest_phase_early_finalize_error() -> KernelResult<()> {
         let (engine, snapshot, _tempdir) = load_test_table("with_checkpoint_no_last_checkpoint")?;
 
         let manifest_phase = CheckpointManifestReader::try_new(
             engine.clone(),
             &snapshot.log_segment().listed.checkpoint_parts[0],
             snapshot.log_segment().log_root.clone(),
+            manifest_read_schema(),
         )?;
 
         let result = manifest_phase.extract_sidecars();
@@ -229,7 +232,7 @@ mod tests {
     }
 
     #[test]
-    fn test_manifest_phase_collects_sidecars() -> DeltaResult<()> {
+    fn test_manifest_phase_collects_sidecars() -> KernelResult<()> {
         let (engine, snapshot, _tempdir) = load_test_table("v2-checkpoints-json-with-sidecars")?;
         verify_manifest_phase(
             engine,
@@ -243,7 +246,7 @@ mod tests {
     }
 
     #[test]
-    fn test_manifest_phase_collects_sidecars_parquet() -> DeltaResult<()> {
+    fn test_manifest_phase_collects_sidecars_parquet() -> KernelResult<()> {
         let (engine, snapshot, _tempdir) = load_test_table("v2-checkpoints-parquet-with-sidecars")?;
         verify_manifest_phase(
             engine,
@@ -254,5 +257,13 @@ mod tests {
                 "00000000000000000006.checkpoint.0000000002.0000000002.4367b29c-0e87-447f-8e81-9814cc01ad1f.parquet",
             ],
         )
+    }
+
+    fn manifest_read_schema() -> SchemaRef {
+        schema_ref! {
+            (&ADD_FIELD),
+            (&REMOVE_FIELD),
+            (&SIDECAR_FIELD),
+        }
     }
 }

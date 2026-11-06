@@ -3,7 +3,9 @@
 mod clustering;
 mod column_mapping;
 mod ctas;
+mod file;
 mod iceberg_compat;
+mod iceberg_native_v4;
 mod ict;
 mod interval;
 mod partitioned;
@@ -15,23 +17,23 @@ use std::sync::Arc;
 
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::schema::{
-    schema_ref, ColumnMetadataKey, DataType, MetadataValue, StructField, StructType,
+    ColumnMetadataKey, DataType, MetadataValue, StructField, StructType, schema_ref,
 };
 use delta_kernel::snapshot::Snapshot;
 use delta_kernel::table_features::{
-    TableFeature, TABLE_FEATURES_MIN_READER_VERSION, TABLE_FEATURES_MIN_WRITER_VERSION,
+    TABLE_FEATURES_MIN_READER_VERSION, TABLE_FEATURES_MIN_WRITER_VERSION, TableFeature,
 };
-use delta_kernel::table_properties::TableProperties;
-use delta_kernel::transaction::create_table::{create_table, CreateTableTransaction};
+use delta_kernel::table_properties::{ParquetCompressionCodec, TableProperties};
+use delta_kernel::transaction::create_table::{CreateTableTransaction, create_table};
 use delta_kernel::transaction::data_layout::DataLayout;
-use delta_kernel::DeltaResult;
+use delta_kernel::{KernelError, KernelResult};
 use rstest::rstest;
 use serde_json::Value;
 use test_utils::{assert_result_error_with_message, test_table_setup, test_table_setup_mt};
 
 /// Helper to create a simple two-column schema for tests.
 /// Shared with sub-modules.
-pub(crate) fn simple_schema() -> DeltaResult<Arc<StructType>> {
+pub(crate) fn simple_schema() -> KernelResult<Arc<StructType>> {
     Ok(schema_ref! {
         nullable "id": INTEGER,
         nullable "value": STRING,
@@ -40,7 +42,7 @@ pub(crate) fn simple_schema() -> DeltaResult<Arc<StructType>> {
 
 /// Helper to create a three-column schema for partition tests (id, date, value).
 /// Shared with sub-modules.
-pub(crate) fn partition_test_schema() -> DeltaResult<Arc<StructType>> {
+pub(crate) fn partition_test_schema() -> KernelResult<Arc<StructType>> {
     Ok(schema_ref! {
         nullable "id": INTEGER,
         nullable "date": DATE,
@@ -49,7 +51,7 @@ pub(crate) fn partition_test_schema() -> DeltaResult<Arc<StructType>> {
 }
 
 #[tokio::test]
-async fn test_create_simple_table() -> DeltaResult<()> {
+async fn test_create_simple_table() -> KernelResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
     // Create schema for an events table
@@ -62,7 +64,7 @@ async fn test_create_simple_table() -> DeltaResult<()> {
     };
 
     // Create table using new API
-    let _ = create_table(&table_path, schema.clone(), "DeltaKernel-RS/0.17.0")
+    let _ = create_table(&table_path, schema.clone(), "DeltaKernel-RS/0.17.0", true)
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
         .commit(engine.as_ref())?;
 
@@ -105,14 +107,110 @@ async fn test_create_simple_table() -> DeltaResult<()> {
     Ok(())
 }
 
+#[rstest]
+#[case::cdf_enabled(Some("true"), Some("reserved for Change Data Feed"))]
+#[case::cdf_supported_only(None, None)]
 #[tokio::test]
-async fn test_create_table_with_user_domain_metadata() -> DeltaResult<()> {
+async fn create_table_validates_cdf_column_names(
+    #[case] cdf_enabled: Option<&str>,
+    #[case] expected_error: Option<&str>,
+    #[values(
+        "_change_type",
+        "_commit_version",
+        "_commit_timestamp",
+        "_CHANGE_TYPE",
+        "_COMMIT_VERSION",
+        "_COMMIT_TIMESTAMP"
+    )]
+    column_name: &str,
+    #[values("none", "name", "id")] cm_mode: &str,
+) -> KernelResult<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+    let schema = schema_ref! { (StructField::nullable(column_name, DataType::STRING)) };
+    let mut properties = vec![
+        ("delta.feature.changeDataFeed", "supported"),
+        ("delta.columnMapping.mode", cm_mode),
+    ];
+    if let Some(value) = cdf_enabled {
+        properties.push(("delta.enableChangeDataFeed", value));
+    }
+    let result = create_table(&table_path, schema, "test", true)
+        .with_table_properties(properties)
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()));
+
+    if let Some(expected_error) = expected_error {
+        assert_result_error_with_message(result, expected_error);
+    } else {
+        let snapshot = result?
+            .commit(engine.as_ref())?
+            .unwrap_post_commit_snapshot();
+        assert!(snapshot.schema().contains(column_name));
+        assert_eq!(
+            snapshot.table_properties().enable_change_data_feed,
+            cdf_enabled.map(|v| v == "true")
+        );
+    }
+    Ok(())
+}
+
+#[rstest]
+#[case::name_cdf_enabled("name", true, Some("has physical name"))]
+#[case::id_cdf_enabled("id", true, Some("has physical name"))]
+#[case::none_cdf_enabled("none", true, None)]
+#[case::name_cdf_supported_only("name", false, None)]
+#[case::id_cdf_supported_only("id", false, None)]
+#[case::none_cdf_supported_only("none", false, None)]
+#[tokio::test]
+async fn create_table_validates_cdf_reserved_physical_column_names(
+    #[case] cm_mode: &str,
+    #[case] cdf_enabled: bool,
+    #[case] expected_error: Option<&str>,
+) -> KernelResult<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+    let schema = schema_ref! {
+        (StructField::nullable("value", DataType::STRING).with_metadata([
+            (ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(), "_change_type"),
+        ])),
+    };
+    let mut properties = vec![
+        ("delta.feature.changeDataFeed", "supported"),
+        ("delta.columnMapping.mode", cm_mode),
+    ];
+    if cdf_enabled {
+        properties.push(("delta.enableChangeDataFeed", "true"));
+    }
+    let result = create_table(&table_path, schema, "test", true)
+        .with_table_properties(properties)
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()));
+
+    if let Some(expected_error) = expected_error {
+        assert_result_error_with_message(result, expected_error);
+    } else {
+        let snapshot = result?
+            .commit(engine.as_ref())?
+            .unwrap_post_commit_snapshot();
+        let expected_physical_name =
+            (cm_mode != "none").then(|| MetadataValue::String("_change_type".into()));
+        assert_eq!(
+            snapshot
+                .schema()
+                .field("value")
+                .unwrap()
+                .get_config_value(&ColumnMetadataKey::ColumnMappingPhysicalName),
+            expected_physical_name.as_ref()
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_create_table_with_user_domain_metadata() -> KernelResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
     let schema = simple_schema()?;
 
     // Create table with domainMetadata feature enabled
-    let txn = create_table(&table_path, schema, "Test/1.0")
+    let txn = create_table(&table_path, schema, "Test/1.0", true)
         .with_table_properties([("delta.feature.domainMetadata", "supported")])
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
 
@@ -137,7 +235,9 @@ async fn test_create_table_with_user_domain_metadata() -> DeltaResult<()> {
     );
 
     // Verify domain metadata string was persisted correctly
-    let retrieved_config = snapshot.get_domain_metadata(domain, engine.as_ref())?;
+    let retrieved_config = snapshot
+        .reader()
+        .get_domain_metadata(domain, engine.as_ref())?;
     assert_eq!(
         retrieved_config,
         Some(config.to_string()),
@@ -150,14 +250,16 @@ async fn test_create_table_with_user_domain_metadata() -> DeltaResult<()> {
     assert_eq!(parsed["enabled"], true);
 
     // Verify non-existent domain returns None
-    let missing = snapshot.get_domain_metadata("nonexistent.domain", engine.as_ref())?;
+    let missing = snapshot
+        .reader()
+        .get_domain_metadata("nonexistent.domain", engine.as_ref())?;
     assert!(missing.is_none(), "Non-existent domain should return None");
 
     Ok(())
 }
 
 #[tokio::test]
-async fn test_create_table_already_exists() -> DeltaResult<()> {
+async fn test_create_table_already_exists() -> KernelResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
     // Create schema for a user profiles table
@@ -170,28 +272,41 @@ async fn test_create_table_already_exists() -> DeltaResult<()> {
     };
 
     // Create table first time
-    let _ = create_table(&table_path, schema.clone(), "UserManagementService/1.2.0")
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
-        .commit(engine.as_ref())?;
+    let _ = create_table(
+        &table_path,
+        schema.clone(),
+        "UserManagementService/1.2.0",
+        true,
+    )
+    .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+    .commit(engine.as_ref())?;
 
     // Try to create again - should fail at build time (table already exists)
-    let result = create_table(&table_path, schema.clone(), "UserManagementService/1.2.0")
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()));
+    let result = create_table(
+        &table_path,
+        schema.clone(),
+        "UserManagementService/1.2.0",
+        true,
+    )
+    .build(engine.as_ref(), Box::new(FileSystemCommitter::new()));
 
-    assert_result_error_with_message(result, "already exists");
+    assert!(matches!(
+        result,
+        Err(KernelError::TableAlreadyExistsAtPath(path)) if path == table_path
+    ));
 
     Ok(())
 }
 
 #[tokio::test]
-async fn test_create_table_empty_schema_succeeds() -> DeltaResult<()> {
+async fn test_create_table_empty_schema_succeeds() -> KernelResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
     // CREATE TABLE with no columns is a valid Delta operation; users may add columns
     // later via ALTER TABLE ADD COLUMN.
     let schema = schema_ref! {};
 
-    create_table(&table_path, schema, "EmptySchemaApp/0.1.0")
+    create_table(&table_path, schema, "EmptySchemaApp/0.1.0", true)
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
         .commit(engine.as_ref())?
         .unwrap_committed();
@@ -215,11 +330,11 @@ async fn test_create_table_empty_schema_succeeds() -> DeltaResult<()> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_create_table_empty_schema_checkpoint_round_trip(
     #[case] cm_mode: Option<&str>,
-) -> DeltaResult<()> {
+) -> KernelResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
 
     let schema = schema_ref! {};
-    let mut builder = create_table(&table_path, schema, "EmptySchemaApp/0.1.0");
+    let mut builder = create_table(&table_path, schema, "EmptySchemaApp/0.1.0", true);
     if let Some(mode) = cm_mode {
         builder = builder.with_table_properties([("delta.columnMapping.mode", mode)]);
     }
@@ -253,11 +368,11 @@ async fn test_create_table_empty_schema_checkpoint_round_trip(
 async fn test_create_table_empty_schema_layout_errors(
     #[case] layout: DataLayout,
     #[case] expected_err: &str,
-) -> DeltaResult<()> {
+) -> KernelResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
     let schema = schema_ref! {};
-    let result = create_table(&table_path, schema, "EmptySchemaApp/0.1.0")
+    let result = create_table(&table_path, schema, "EmptySchemaApp/0.1.0", true)
         .with_data_layout(layout)
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()));
 
@@ -289,10 +404,10 @@ fn nested_non_null_schema() -> Arc<StructType> {
 #[case::nested_non_null(nested_non_null_schema())]
 fn test_create_table_with_non_null_columns_auto_enables_invariants(
     #[case] schema: Arc<StructType>,
-) -> DeltaResult<()> {
+) -> KernelResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
-    let _ = create_table(&table_path, schema, "Test/1.0")
+    let _ = create_table(&table_path, schema, "Test/1.0", true)
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
         .commit(engine.as_ref())?;
 
@@ -321,13 +436,13 @@ fn test_create_table_with_non_null_columns_auto_enables_invariants(
 /// together must not duplicate the entry. This also verifies users can pre-enable the
 /// feature so a later ALTER TABLE ADD COLUMN NOT NULL does not need a protocol upgrade.
 #[tokio::test]
-async fn test_create_table_with_invariants_feature_signal_allowed() -> DeltaResult<()> {
+async fn test_create_table_with_invariants_feature_signal_allowed() -> KernelResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
     // Non-null schema auto-enables Invariants; the feature signal also tries to add it.
     // Both code paths firing together must produce exactly one Invariants entry.
     let schema = top_level_non_null_schema();
 
-    let _ = create_table(&table_path, schema, "Test/1.0")
+    let _ = create_table(&table_path, schema, "Test/1.0", true)
         .with_table_properties([("delta.feature.invariants", "supported")])
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
         .commit(engine.as_ref())?;
@@ -358,17 +473,17 @@ async fn test_create_table_with_invariants_feature_signal_allowed() -> DeltaResu
 /// CREATE TABLE rejects any schema with `delta.invariants` metadata annotations
 /// because kernel cannot evaluate SQL expression invariants.
 #[tokio::test]
-async fn test_create_table_rejects_delta_invariants_metadata() -> DeltaResult<()> {
+async fn test_create_table_rejects_delta_invariants_metadata() -> KernelResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
     let mut field = StructField::nullable("x", DataType::INTEGER);
     field.metadata.insert(
-        ColumnMetadataKey::Invariants.as_ref().to_string(),
+        ColumnMetadataKey::Invariants.as_ref().into(),
         MetadataValue::String(r#"{"expression": {"expression": "x > 0"}}"#.to_string()),
     );
     let schema = schema_ref! { (field) };
 
-    let result = create_table(&table_path, schema, "Test/1.0")
+    let result = create_table(&table_path, schema, "Test/1.0", true)
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()));
 
     assert_result_error_with_message(result, "delta.invariants");
@@ -376,8 +491,14 @@ async fn test_create_table_rejects_delta_invariants_metadata() -> DeltaResult<()
     Ok(())
 }
 
+#[rstest]
+#[case::builder_metrics(false)]
+#[case::transaction_metrics_replace_builder_metrics(true)]
 #[tokio::test]
-async fn test_create_table_log_actions() -> DeltaResult<()> {
+async fn test_create_table_log_actions(
+    #[case] replace_metrics_after_build: bool,
+    #[values("AuditService/2.1.0", "")] engine_info: &str,
+) -> KernelResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
     // Create schema
@@ -386,12 +507,19 @@ async fn test_create_table_log_actions() -> DeltaResult<()> {
         nullable "action": STRING,
     };
 
-    let engine_info = "AuditService/2.1.0";
-
     // Create table
-    let _ = create_table(&table_path, schema, engine_info)
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
-        .commit(engine.as_ref())?;
+    let mut txn = create_table(&table_path, schema, engine_info, true)
+        .with_operation_parameters([("mode", Some("Create")), ("description", None)])
+        .with_operation_metrics(if replace_metrics_after_build {
+            [("staleMetric", Some("1"))]
+        } else {
+            [("numFiles", Some("0"))]
+        })
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
+    if replace_metrics_after_build {
+        txn = txn.with_operation_metrics([("numFiles", Some("0"))]);
+    }
+    let _ = txn.commit(engine.as_ref())?;
 
     // Read the actual Delta log file
     let log_file_path = format!("{table_path}/_delta_log/00000000000000000000.json");
@@ -434,6 +562,14 @@ async fn test_create_table_log_actions() -> DeltaResult<()> {
     assert_eq!(
         commit_info["operation"], "CREATE TABLE",
         "Operation should be CREATE TABLE"
+    );
+    assert_eq!(
+        commit_info["operationParameters"],
+        serde_json::json!({"description": null, "mode": "Create"})
+    );
+    assert_eq!(
+        commit_info["operationMetrics"],
+        serde_json::json!({"numFiles": "0"})
     );
 
     // Verify Protocol action
@@ -495,7 +631,7 @@ async fn test_create_table_log_actions() -> DeltaResult<()> {
 }
 
 /// Helper to create a `CreateTableTransaction` for tests.
-fn create_test_create_table_txn() -> DeltaResult<(
+fn create_test_create_table_txn() -> KernelResult<(
     Arc<impl delta_kernel::Engine>,
     CreateTableTransaction,
     tempfile::TempDir,
@@ -505,13 +641,13 @@ fn create_test_create_table_txn() -> DeltaResult<(
         nullable "id": INTEGER,
         nullable "name": STRING,
     };
-    let txn = create_table(&table_path, schema, "test_engine")
+    let txn = create_table(&table_path, schema, "test_engine", true)
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
     Ok((engine, txn, tempdir))
 }
 
 #[tokio::test]
-async fn test_create_table_txn_debug() -> DeltaResult<()> {
+async fn test_create_table_txn_debug() -> KernelResult<()> {
     let (_engine, txn, _tempdir) = create_test_create_table_txn()?;
     let debug_str = format!("{txn:?}");
     assert!(
@@ -523,40 +659,54 @@ async fn test_create_table_txn_debug() -> DeltaResult<()> {
 
 #[rstest]
 // ReaderWriter features (AlwaysIfSupported)
-#[case("vacuumProtocolCheck", TableFeature::VacuumProtocolCheck, true, true)]
-#[case("v2Checkpoint", TableFeature::V2Checkpoint, true, true)]
-#[case("variantType", TableFeature::VariantType, true, true)]
-#[case("variantShredding", TableFeature::VariantShredding, true, true)]
+#[case(
+    "vacuumProtocolCheck",
+    TableFeature::VacuumProtocolCheck,
+    true,
+    true,
+    false
+)]
+#[case("v2Checkpoint", TableFeature::V2Checkpoint, true, true, false)]
+#[case("variantType", TableFeature::VariantType, true, true, false)]
+#[case("variantShredding", TableFeature::VariantShredding, true, true, false)]
 // ReaderWriter features (EnabledIf -- feature signal alone does not enable)
-#[case("deletionVectors", TableFeature::DeletionVectors, true, false)]
-#[case("typeWidening", TableFeature::TypeWidening, true, false)]
+#[case("deletionVectors", TableFeature::DeletionVectors, true, false, false)]
+#[case("typeWidening", TableFeature::TypeWidening, true, false, false)]
 // WriterOnly features (EnabledIf -- feature signal alone does not enable)
-#[case("appendOnly", TableFeature::AppendOnly, false, false)]
-#[case("changeDataFeed", TableFeature::ChangeDataFeed, false, false)]
-#[case("rowTracking", TableFeature::RowTracking, false, false)]
+#[case("appendOnly", TableFeature::AppendOnly, false, false, false)]
+#[case("changeDataFeed", TableFeature::ChangeDataFeed, false, false, false)]
+#[case("rowTracking", TableFeature::RowTracking, false, false, true)]
+#[case("domainMetadata", TableFeature::DomainMetadata, false, true, true)]
+#[case("collations", TableFeature::Collations, false, true, true)]
 // WriterOnly features (AlwaysIfSupported)
 #[case(
     "materializePartitionColumns",
     TableFeature::MaterializePartitionColumns,
     false,
-    true
+    true,
+    false
 )]
 fn test_create_table_with_feature_signal(
     #[case] feature_name: &str,
     #[case] feature: TableFeature,
     #[case] is_reader_writer: bool,
     #[case] enabled_when_supported: bool,
-) -> DeltaResult<()> {
+    #[case] expects_domain_metadata: bool,
+) -> KernelResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
     let property_key = format!("delta.feature.{feature_name}");
-    let _ = create_table(&table_path, simple_schema()?, "Test/1.0")
+    let _ = create_table(&table_path, simple_schema()?, "Test/1.0", true)
         .with_table_properties([(property_key.as_str(), "supported")])
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
         .commit(engine.as_ref())?;
 
     let snapshot = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
     let table_config = snapshot.table_configuration();
+    assert_eq!(
+        table_config.is_feature_supported(&TableFeature::DomainMetadata),
+        expects_domain_metadata,
+    );
 
     assert!(
         table_config.is_feature_supported(&feature),
@@ -586,14 +736,77 @@ fn test_create_table_with_feature_signal(
     Ok(())
 }
 
+#[rstest]
+fn create_table_rejects_preview_feature_signals(
+    #[values(
+        "collations-preview",
+        "typeWidening-preview",
+        "variantType-preview",
+        "variantShredding-preview",
+        "catalogOwned-preview",
+        "adaptiveMetadata-preview"
+    )]
+    feature_name: &str,
+) -> KernelResult<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+    let key = format!("delta.feature.{feature_name}");
+    let result = create_table(&table_path, simple_schema()?, "Test/1.0", false)
+        .with_table_properties([(key.as_str(), "supported")])
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()));
+    assert_result_error_with_message(
+        result,
+        &format!(
+            "Enabling feature '{feature_name}' via '{key}' is not supported during CREATE TABLE"
+        ),
+    );
+    Ok(())
+}
+
+#[rstest]
+#[case::plain(&[], DataLayout::None, false)]
+#[case::row_tracking_property(&[("delta.enableRowTracking", "true")], DataLayout::None, true)]
+#[case::row_tracking_dependency(&[("delta.enableIcebergCompatV3", "true")], DataLayout::None, true)]
+#[case::clustered(&[], DataLayout::clustered(["id"]), true)]
+#[case::deduplicated(
+    &[("delta.feature.domainMetadata", "supported"), ("delta.enableRowTracking", "true")],
+    DataLayout::clustered(["id"]),
+    true
+)]
+fn create_resolves_domain_metadata_after_all_feature_selection(
+    #[case] properties: &[(&str, &str)],
+    #[case] layout: DataLayout,
+    #[case] expects_domain_metadata: bool,
+) -> KernelResult<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+    let snapshot = create_table(&table_path, simple_schema()?, "test", true)
+        .with_table_properties(properties.iter().copied())
+        .with_data_layout(layout)
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .commit(engine.as_ref())?
+        .unwrap_post_commit_snapshot();
+    let features = snapshot
+        .table_configuration()
+        .protocol()
+        .writer_features()
+        .unwrap();
+    assert_eq!(
+        features
+            .iter()
+            .filter(|feature| **feature == TableFeature::DomainMetadata)
+            .count(),
+        usize::from(expects_domain_metadata),
+    );
+    Ok(())
+}
+
 #[test]
-fn test_create_table_with_variant_shredding_has_variant_feature() -> DeltaResult<()> {
+fn test_create_table_with_variant_shredding_has_variant_feature() -> KernelResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
     let schema = schema_ref! {
         nullable "id": INTEGER,
     };
 
-    let _ = create_table(&table_path, schema, "Test/1.0")
+    let _ = create_table(&table_path, schema, "Test/1.0", true)
         .with_table_properties([("delta.feature.variantShredding", "supported")])
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
         .commit(engine.as_ref())?;
@@ -621,10 +834,10 @@ fn test_create_table_with_variant_shredding_has_variant_feature() -> DeltaResult
 fn test_create_table_checkpoint_policy_auto_enables_v2_checkpoint(
     #[case] policy: &str,
     #[case] expect_v2_checkpoint: bool,
-) -> DeltaResult<()> {
+) -> KernelResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
-    let _ = create_table(&table_path, simple_schema()?, "Test/1.0")
+    let _ = create_table(&table_path, simple_schema()?, "Test/1.0", true)
         .with_table_properties([("delta.checkpointPolicy", policy)])
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
         .commit(engine.as_ref())?;
@@ -658,13 +871,13 @@ fn test_create_table_checkpoint_policy_auto_enables_v2_checkpoint(
 fn test_create_table_with_checkpoint_stats_properties(
     #[values(true, false)] write_stats_as_json: bool,
     #[values(true, false)] write_stats_as_struct: bool,
-) -> DeltaResult<()> {
+) -> KernelResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
     let json_val = write_stats_as_json.to_string();
     let struct_val = write_stats_as_struct.to_string();
 
-    let _ = create_table(&table_path, simple_schema()?, "Test/1.0")
+    let _ = create_table(&table_path, simple_schema()?, "Test/1.0", true)
         .with_table_properties([
             ("delta.checkpoint.writeStatsAsJson", json_val.as_str()),
             ("delta.checkpoint.writeStatsAsStruct", struct_val.as_str()),
@@ -684,6 +897,67 @@ fn test_create_table_with_checkpoint_stats_properties(
 }
 
 #[rstest]
+#[case::zstd("zstd", ParquetCompressionCodec::Zstd)]
+#[case::uncompressed("uncompressed", ParquetCompressionCodec::Uncompressed)]
+#[case::none_alias("none", ParquetCompressionCodec::Uncompressed)]
+#[case::snappy("snappy", ParquetCompressionCodec::Snappy)]
+#[case::gzip("gzip", ParquetCompressionCodec::Gzip)]
+#[case::lz4("lz4", ParquetCompressionCodec::Lz4)]
+#[case::lz4_raw("lz4_raw", ParquetCompressionCodec::Lz4Raw)]
+#[case::mixed_case("zStD", ParquetCompressionCodec::Zstd)]
+#[case::uppercase("ZSTD", ParquetCompressionCodec::Zstd)]
+#[case::uppercase_none_alias("NONE", ParquetCompressionCodec::Uncompressed)]
+fn create_table_compression_codec_round_trips(
+    #[case] codec: &str,
+    #[case] expected: ParquetCompressionCodec,
+) -> KernelResult<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+    let property = "delta.parquet.compression.codec";
+    let value = codec.to_string();
+
+    create_table(&table_path, simple_schema()?, "test", true)
+        .with_table_properties([(property, value.as_str())])
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .commit(engine.as_ref())?
+        .unwrap_committed();
+
+    let snapshot = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
+    assert_eq!(
+        snapshot
+            .table_configuration()
+            .metadata()
+            .configuration()
+            .get(property),
+        Some(&value)
+    );
+    let properties = snapshot.table_properties();
+    assert_eq!(properties.parquet_compression_codec, Some(expected));
+    assert_eq!(properties.compression_codec_or_default(), expected);
+    assert!(!properties.unknown_properties.contains_key(property));
+
+    Ok(())
+}
+
+#[rstest]
+fn create_table_rejects_invalid_compression_codec(
+    #[values(
+        "brotli", "BROTLI", "lzo", "LZO", "foobar", "FOOBAR", "", " zstd", "zstd "
+    )]
+    codec: &str,
+) -> KernelResult<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+    let result = create_table(&table_path, simple_schema()?, "test", true)
+        .with_table_properties([("delta.parquet.compression.codec", codec)])
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()));
+
+    assert_result_error_with_message(
+        result,
+        &format!("Invalid value '{codec}' for 'delta.parquet.compression.codec'"),
+    );
+    Ok(())
+}
+
+#[rstest]
 // ReaderWriter features
 #[case("delta.enableDeletionVectors", TableFeature::DeletionVectors, true)]
 #[case("delta.enableTypeWidening", TableFeature::TypeWidening, true)]
@@ -696,11 +970,11 @@ fn test_create_table_with_enablement_property(
     #[case] feature: TableFeature,
     #[case] is_reader_writer: bool,
     #[values(true, false)] expect_enabled: bool,
-) -> DeltaResult<()> {
+) -> KernelResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
     let value = expect_enabled.to_string();
 
-    let _ = create_table(&table_path, simple_schema()?, "Test/1.0")
+    let _ = create_table(&table_path, simple_schema()?, "Test/1.0", true)
         .with_table_properties([(property, value.as_str())])
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
         .commit(engine.as_ref())?;
@@ -742,7 +1016,7 @@ fn test_create_table_with_enablement_property(
 #[rstest]
 #[case::without_cm(false)]
 #[case::with_cm(true)]
-fn test_create_table_special_char_column_name(#[case] cm_enabled: bool) -> DeltaResult<()> {
+fn test_create_table_special_char_column_name(#[case] cm_enabled: bool) -> KernelResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
     let schema = schema_ref! {
@@ -750,7 +1024,7 @@ fn test_create_table_special_char_column_name(#[case] cm_enabled: bool) -> Delta
         nullable "bad column": STRING,
     };
 
-    let mut builder = create_table(&table_path, schema, "Test/1.0");
+    let mut builder = create_table(&table_path, schema, "Test/1.0", true);
     if cm_enabled {
         builder = builder.with_table_properties([("delta.columnMapping.mode", "name")]);
     }

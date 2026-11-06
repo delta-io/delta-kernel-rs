@@ -8,23 +8,25 @@ use std::sync::{Arc, LazyLock};
 use itertools::Itertools;
 use tracing::info;
 
-use crate::actions::visitors::{visit_deletion_vector_at, InCommitTimestampVisitor};
+use crate::actions::visitors::{InCommitTimestampVisitor, visit_deletion_vector_at};
 use crate::actions::{
-    Metadata, Protocol, ADD_FIELD, CDC_FIELD, COMMIT_INFO_NAME, LOG_ADD_SCHEMA, METADATA_FIELD,
-    PROTOCOL_FIELD, REMOVE_FIELD,
+    ADD_FIELD, CDC_FIELD, COMMIT_INFO_NAME, METADATA_FIELD, Metadata, PROTOCOL_FIELD, Protocol,
+    REMOVE_FIELD,
 };
 use crate::engine_data::{GetData, TypedGetData};
-use crate::expressions::{column_name, ColumnName};
+use crate::expressions::{ColumnName, MapToStructOptions, column_name};
 use crate::path::{AsUrl, ParsedLogPath};
 use crate::scan::data_skipping::DataSkippingFilter;
 use crate::scan::state::DvInfo;
-use crate::schema::{schema_ref, ColumnNamesAndTypes, DataType, SchemaRef};
-use crate::table_changes::scan_file::{cdf_scan_row_expression, cdf_scan_row_schema};
+use crate::schema::{ColumnNamesAndTypes, DataType, SchemaRef, schema_ref};
 use crate::table_changes::CdfMode;
+use crate::table_changes::scan_file::{cdf_scan_row_expression, cdf_scan_row_schema};
 use crate::table_configuration::TableConfiguration;
-use crate::table_features::{format_features, Operation, TableFeature};
+use crate::table_features::{Operation, TableFeature, format_features};
 use crate::utils::require;
-use crate::{DeltaResult, Engine, EngineData, Error, PredicateRef, RowVisitor};
+use crate::{
+    Engine, EngineData, KernelError, KernelResult, KernelResultIterator, PredicateRef, RowVisitor,
+};
 
 #[cfg(test)]
 mod tests;
@@ -49,13 +51,17 @@ pub(crate) struct TableChangesScanMetadata {
 ///
 /// Note: The [`ParsedLogPath`]s in the `commit_files` iterator must be ordered, contiguous
 /// (JSON) commit files.
-pub(crate) fn table_changes_action_iter(
+pub(crate) fn table_changes_action_iter<I>(
     engine: Arc<dyn Engine>,
     start_table_configuration: &TableConfiguration,
-    commit_files: impl IntoIterator<Item = ParsedLogPath>,
+    commit_files: I,
     table_schema: SchemaRef,
     physical_predicate: Option<(PredicateRef, SchemaRef)>,
-) -> DeltaResult<impl Iterator<Item = DeltaResult<TableChangesScanMetadata>>> {
+) -> KernelResult<impl KernelResultIterator<TableChangesScanMetadata> + use<I>>
+where
+    I: IntoIterator<Item = ParsedLogPath>,
+    I::IntoIter: Send,
+{
     // The data-reading (`execute`) path always uses change-data-file semantics.
     table_changes_action_iter_with_mode(
         engine,
@@ -72,14 +78,18 @@ pub(crate) fn table_changes_action_iter(
 /// [`CdfMode::ChangeDataFeed`] uses `AddCDCFile` actions because they contain changes recorded by
 /// the writer. [`CdfMode::RowTracking`] ignores those actions and reconstructs changes from
 /// row lineage in the data files referenced by `add` and `remove` actions.
-pub(crate) fn table_changes_action_iter_with_mode(
+pub(crate) fn table_changes_action_iter_with_mode<I>(
     engine: Arc<dyn Engine>,
     start_table_configuration: &TableConfiguration,
-    commit_files: impl IntoIterator<Item = ParsedLogPath>,
+    commit_files: I,
     table_schema: SchemaRef,
     physical_predicate: Option<(PredicateRef, SchemaRef)>,
     mode: CdfMode,
-) -> DeltaResult<impl Iterator<Item = DeltaResult<TableChangesScanMetadata>>> {
+) -> KernelResult<impl KernelResultIterator<TableChangesScanMetadata> + use<I>>
+where
+    I: IntoIterator<Item = ParsedLogPath>,
+    I::IntoIter: Send,
+{
     // Skip against the raw `{ add, remove, ... }` action batch: table_changes must resolve
     // deletion vector pairs before filtering, so unlike the scan path it operates on raw
     // batches with stats parsed from `add.stats` JSON.
@@ -89,7 +99,8 @@ pub(crate) fn table_changes_action_iter_with_mode(
                 engine.as_ref(),
                 predicate,
                 start_table_configuration,
-                LOG_ADD_SCHEMA.clone(),
+                FileActionSelectionVisitor::schema(),
+                MapToStructOptions::default(),
             )
         })
         .map(Arc::new);
@@ -97,7 +108,7 @@ pub(crate) fn table_changes_action_iter_with_mode(
     let mut current_configuration = start_table_configuration.clone();
     let result = commit_files
         .into_iter()
-        .map(move |commit_file| -> DeltaResult<_> {
+        .map(move |commit_file| -> KernelResult<_> {
             let scanner = LogReplayScanner::try_new(
                 engine.as_ref(),
                 &mut current_configuration,
@@ -182,7 +193,7 @@ impl LogReplayScanner {
         commit_file: ParsedLogPath,
         table_schema: &SchemaRef,
         mode: CdfMode,
-    ) -> DeltaResult<Self> {
+    ) -> KernelResult<Self> {
         let visitor_schema = PreparePhaseVisitor::schema();
 
         // Note: We do not perform data skipping yet because we need to visit all add and
@@ -235,7 +246,7 @@ impl LogReplayScanner {
                 // Compatibility is evaluated against the end version's logical schema.
                 require!(
                     mode.schemas_compatible(&schema, table_schema.as_ref()),
-                    Error::change_data_feed_incompatible_schema_at_version(
+                    KernelError::change_data_feed_incompatible_schema_at_version(
                         table_schema,
                         &schema,
                         commit_file.version
@@ -298,7 +309,7 @@ impl LogReplayScanner {
         let timestamp = if table_configuration.is_feature_enabled(&TableFeature::InCommitTimestamp)
         {
             let Some(in_commit_timestamp) = in_commit_timestamp_opt else {
-                return Err(Error::generic(format!(
+                return Err(KernelError::generic(format!(
                     "In-commit timestamp is enabled but not found in commit at version {}",
                     commit_file.version
                 )));
@@ -332,7 +343,7 @@ impl LogReplayScanner {
         self,
         engine: Arc<dyn Engine>,
         filter: Option<Arc<DataSkippingFilter>>,
-    ) -> DeltaResult<impl Iterator<Item = DeltaResult<TableChangesScanMetadata>>> {
+    ) -> KernelResult<impl KernelResultIterator<TableChangesScanMetadata> + use<>> {
         let Self {
             has_cdc_action,
             remove_dvs,
@@ -345,20 +356,20 @@ impl LogReplayScanner {
         let schema = FileActionSelectionVisitor::schema();
         let action_iter = engine.json_handler().read_json_files(
             slice::from_ref(&commit_file.location),
-            schema,
+            schema.clone(),
             None,
         )?;
         let commit_version = commit_file
             .version
             .try_into()
-            .map_err(|_| Error::generic("Failed to convert commit version to i64"))?;
+            .map_err(|_| KernelError::generic("Failed to convert commit version to i64"))?;
         let evaluator = engine.evaluation_handler().new_expression_evaluator(
-            LOG_ADD_SCHEMA.clone(),
+            schema,
             Arc::new(cdf_scan_row_expression(timestamp, commit_version)),
             cdf_scan_row_schema().into(),
         )?;
 
-        let result = action_iter.map(move |actions| -> DeltaResult<_> {
+        let result = action_iter.map(move |actions| -> KernelResult<_> {
             let actions = actions?;
 
             // Apply data skipping to get back a selection vector for actions that passed skipping.
@@ -433,10 +444,10 @@ impl RowVisitor for PreparePhaseVisitor<'_> {
         NAMES_AND_TYPES.as_ref()
     }
 
-    fn visit<'b>(&mut self, row_count: usize, getters: &[&'b dyn GetData<'b>]) -> DeltaResult<()> {
+    fn visit<'b>(&mut self, row_count: usize, getters: &[&'b dyn GetData<'b>]) -> KernelResult<()> {
         require!(
             getters.len() == 11,
-            Error::InternalError(format!(
+            KernelError::InternalError(format!(
                 "Wrong number of PreparePhaseVisitor getters: {}",
                 getters.len()
             ))
@@ -512,10 +523,10 @@ impl RowVisitor for FileActionSelectionVisitor<'_> {
         NAMES_AND_TYPES.as_ref()
     }
 
-    fn visit<'b>(&mut self, row_count: usize, getters: &[&'b dyn GetData<'b>]) -> DeltaResult<()> {
+    fn visit<'b>(&mut self, row_count: usize, getters: &[&'b dyn GetData<'b>]) -> KernelResult<()> {
         require!(
             getters.len() == 5,
-            Error::InternalError(format!(
+            KernelError::InternalError(format!(
                 "Wrong number of FileActionSelectionVisitor getters: {}",
                 getters.len()
             ))

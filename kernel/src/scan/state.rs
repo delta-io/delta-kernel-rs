@@ -3,31 +3,29 @@
 use std::collections::HashMap;
 use std::sync::LazyLock;
 
+use derive_more::From;
 use roaring::RoaringTreemap;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tracing::warn;
 
-use super::log_replay::SCAN_ROW_SCHEMA;
 use super::ScanMetadata;
-use crate::actions::deletion_vector::{deletion_treemap_to_bools, DeletionVectorDescriptor};
+use super::log_replay::SCAN_ROW_SCHEMA;
+use crate::actions::deletion_vector::{DeletionVectorDescriptor, deletion_treemap_to_bools};
 use crate::actions::visitors::visit_deletion_vector_at;
 use crate::engine_data::{FilteredRowVisitor, GetData, RowIndexIterator, TypedGetData};
 use crate::scan::get_transform_for_row;
 use crate::schema::{ColumnName, ColumnNamesAndTypes, DataType, Schema, SchemaRef};
 use crate::utils::require;
-use crate::{DeltaResult, Engine, EngineData, Error, ExpressionRef};
+use crate::{Engine, EngineData, ExpressionRef, KernelError, KernelResult};
 
-/// this struct can be used by an engine to materialize a selection vector
-#[derive(Default, Debug, Clone, PartialEq, Eq)]
+/// Deletion-vector metadata used by an engine to materialize a selection vector.
+///
+/// Its serde representation supports transport between processes running the same Kernel version.
+/// The serialized representation may change between Kernel versions.
+#[derive(Default, Debug, Clone, PartialEq, Eq, From, Serialize, Deserialize)]
+#[from(DeletionVectorDescriptor)]
 pub struct DvInfo {
     pub(crate) deletion_vector: Option<DeletionVectorDescriptor>,
-}
-
-impl From<DeletionVectorDescriptor> for DvInfo {
-    fn from(deletion_vector: DeletionVectorDescriptor) -> Self {
-        let deletion_vector = Some(deletion_vector);
-        DvInfo { deletion_vector }
-    }
 }
 
 /// Give engines an easy way to consume stats
@@ -42,6 +40,20 @@ pub struct Stats {
 }
 
 impl DvInfo {
+    /// Returns the number of rows the deletion vector removes, or `None` if there is no deletion
+    /// vector. This reads the descriptor metadata without loading the deletion vector.
+    ///
+    /// Returns [`KernelError::DeletionVector`] if the stored cardinality is negative.
+    pub fn cardinality(&self) -> KernelResult<Option<u64>> {
+        self.deletion_vector
+            .as_ref()
+            .map(|dv| {
+                u64::try_from(dv.cardinality)
+                    .map_err(|_| KernelError::deletion_vector("cardinality must be non-negative"))
+            })
+            .transpose()
+    }
+
     /// Check if this DvInfo contains a Deletion Vector. This is mostly used to know if the
     /// associated [`Stats`] struct has fully accurate information or not.
     pub fn has_vector(&self) -> bool {
@@ -52,7 +64,7 @@ impl DvInfo {
         &self,
         engine: &dyn Engine,
         table_root: &url::Url,
-    ) -> DeltaResult<Option<RoaringTreemap>> {
+    ) -> KernelResult<Option<RoaringTreemap>> {
         self.deletion_vector
             .as_ref()
             .map(|dv_descriptor| {
@@ -66,7 +78,7 @@ impl DvInfo {
         &self,
         engine: &dyn Engine,
         table_root: &url::Url,
-    ) -> DeltaResult<Option<Vec<bool>>> {
+    ) -> KernelResult<Option<Vec<bool>>> {
         let dv_treemap = self.get_treemap(engine, table_root)?;
         Ok(dv_treemap.map(deletion_treemap_to_bools))
     }
@@ -76,7 +88,7 @@ impl DvInfo {
         &self,
         engine: &dyn Engine,
         table_root: &url::Url,
-    ) -> DeltaResult<Option<Vec<u64>>> {
+    ) -> KernelResult<Option<Vec<u64>>> {
         self.deletion_vector
             .as_ref()
             .map(|dv| {
@@ -95,7 +107,7 @@ pub fn transform_to_logical(
     physical_schema: &SchemaRef,
     logical_schema: &Schema,
     transform: Option<ExpressionRef>,
-) -> DeltaResult<Box<dyn EngineData>> {
+) -> KernelResult<Box<dyn EngineData>> {
     match transform {
         Some(transform) => engine
             .evaluation_handler()
@@ -156,7 +168,7 @@ pub type ScanCallback<T> = fn(context: &mut T, scan_file: ScanFile);
 /// }
 /// ```
 impl ScanMetadata {
-    pub fn visit_scan_files<T>(&self, context: T, callback: ScanCallback<T>) -> DeltaResult<T> {
+    pub fn visit_scan_files<T>(&self, context: T, callback: ScanCallback<T>) -> KernelResult<T> {
         let mut visitor = ScanFileVisitor {
             callback,
             transforms: &self.scan_file_transforms,
@@ -182,10 +194,10 @@ impl<T> FilteredRowVisitor for ScanFileVisitor<'_, T> {
         &mut self,
         getters: &[&'a dyn GetData<'a>],
         rows: RowIndexIterator<'_>,
-    ) -> DeltaResult<()> {
+    ) -> KernelResult<()> {
         require!(
             getters.len() == 14,
-            Error::InternalError(format!(
+            KernelError::InternalError(format!(
                 "Wrong number of ScanFileVisitor getters: {}",
                 getters.len()
             ))
@@ -207,7 +219,7 @@ impl<T> FilteredRowVisitor for ScanFileVisitor<'_, T> {
 
                 let dv_index = SCAN_ROW_SCHEMA
                     .index_of("deletionVector")
-                    .ok_or_else(|| Error::missing_column("deletionVector"))?;
+                    .ok_or_else(|| KernelError::missing_column("deletionVector"))?;
                 let deletion_vector = visit_deletion_vector_at(row_index, &getters[dv_index..])?;
                 let dv_info = DvInfo { deletion_vector };
                 let partition_values =
@@ -230,9 +242,82 @@ impl<T> FilteredRowVisitor for ScanFileVisitor<'_, T> {
 
 #[cfg(test)]
 mod tests {
-    use crate::actions::get_commit_schema;
-    use crate::scan::state::ScanFile;
+    use rstest::rstest;
+
+    use crate::KernelError;
+    use crate::actions::deletion_vector::{DeletionVectorDescriptor, DeletionVectorStorageType};
+    use crate::scan::COMMIT_READ_SCHEMA;
+    use crate::scan::state::{DvInfo, ScanFile};
     use crate::scan::test_utils::{add_batch_simple, run_with_validate_callback};
+
+    #[rstest]
+    #[case::negative(-1)]
+    #[case::minimum(i64::MIN)]
+    fn test_cardinality_rejects_negative_count(#[case] cardinality: i64) {
+        let dv_info = DvInfo::from(DeletionVectorDescriptor {
+            storage_type: DeletionVectorStorageType::Inline,
+            path_or_inline_dv: String::new(),
+            offset: None,
+            size_in_bytes: 0,
+            cardinality,
+        });
+
+        let error = dv_info.cardinality().unwrap_err();
+        assert!(matches!(&error, KernelError::DeletionVector(_)), "{error}");
+        assert_eq!(
+            error.to_string(),
+            "Deletion Vector error: cardinality must be non-negative"
+        );
+    }
+
+    #[test]
+    fn dv_info_serde_json_round_trips() {
+        // The absent case serializes as a `deletion_vector: null` wrapper and round-trips to None.
+        let empty = DvInfo::default();
+        let empty_json = serde_json::to_string(&empty).unwrap();
+        assert_eq!(empty_json, r#"{"deletion_vector":null}"#);
+        assert_eq!(serde_json::from_str::<DvInfo>(&empty_json).unwrap(), empty);
+
+        // The present case pins the exact wire shape: snake_case wrapper, camelCase descriptor.
+        let dv_info = DvInfo::from(DeletionVectorDescriptor {
+            storage_type: DeletionVectorStorageType::PersistedAbsolute,
+            path_or_inline_dv:
+                "s3://mytable/deletion_vector_d2c639aa-8816-431a-aaf6-d3fe2512ff61.bin".to_string(),
+            offset: Some(4),
+            size_in_bytes: 40,
+            cardinality: 6,
+        });
+        let json = serde_json::to_string(&dv_info).unwrap();
+        assert_eq!(
+            json,
+            r#"{"deletion_vector":{"storageType":"p","pathOrInlineDv":"s3://mytable/deletion_vector_d2c639aa-8816-431a-aaf6-d3fe2512ff61.bin","offset":4,"sizeInBytes":40,"cardinality":6}}"#
+        );
+        assert_eq!(serde_json::from_str::<DvInfo>(&json).unwrap(), dv_info);
+    }
+
+    #[test]
+    fn dv_info_deserialize_rejects_invalid_nested_descriptor() {
+        // Validation runs through `DeletionVectorDescriptor::try_from`, so an inline descriptor
+        // carrying an offset (forbidden by the protocol) must fail to deserialize.
+        let invalid = r#"{"deletion_vector":{"storageType":"i","pathOrInlineDv":"","offset":1,"sizeInBytes":0,"cardinality":0}}"#;
+        assert!(serde_json::from_str::<DvInfo>(invalid).is_err());
+    }
+
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[test]
+    fn dv_info_serde_json_round_trips_unencoded_relative() {
+        let descriptor = DeletionVectorDescriptor::try_new(
+            DeletionVectorStorageType::PersistedUnencodedRelative,
+            "data/deletion_vector_x.bin",
+            Some(1),
+            4,
+            2,
+        )
+        .unwrap();
+        let dv_info = DvInfo::from(descriptor);
+        let json = serde_json::to_string(&dv_info).unwrap();
+        assert_eq!(serde_json::from_str::<DvInfo>(&json).unwrap(), dv_info);
+    }
 
     #[derive(Clone)]
     struct TestContext {
@@ -253,9 +338,10 @@ mod tests {
             Some(&"2017-12-10".to_string())
         );
         assert_eq!(scan_file.partition_values.get("non-existent"), None);
+        assert_eq!(scan_file.dv_info.cardinality().unwrap(), Some(2_u64));
         assert!(scan_file.dv_info.deletion_vector.is_some());
         let dv = scan_file.dv_info.deletion_vector.unwrap();
-        assert_eq!(dv.unique_id(), "uvBn[lx{q8@P<9BNH/isA@1");
+        assert_eq!(dv.legacy_unique_id(), "uvBn[lx{q8@P<9BNH/isA@1");
         assert!(scan_file.transform.is_none());
         assert_eq!(context.id, 2);
     }
@@ -264,7 +350,7 @@ mod tests {
     fn test_simple_visit_scan_metadata() {
         let context = TestContext { id: 2 };
         run_with_validate_callback(
-            vec![add_batch_simple(get_commit_schema().clone())],
+            vec![add_batch_simple(COMMIT_READ_SCHEMA.clone())],
             None, // not testing schema
             None, // not testing transform
             &[true, false],

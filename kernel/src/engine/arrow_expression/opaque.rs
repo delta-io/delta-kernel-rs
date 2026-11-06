@@ -1,3 +1,5 @@
+use derive_more::Deref;
+
 use crate::arrow::array::{ArrayRef, BooleanArray, RecordBatch};
 use crate::expressions::{
     Expression, OpaqueExpressionOp, OpaquePredicateOp, Predicate, Scalar, ScalarExpressionEvaluator,
@@ -7,7 +9,7 @@ use crate::kernel_predicates::{
     IndirectDataSkippingPredicateEvaluator,
 };
 use crate::schema::DataType;
-use crate::{DeltaResult, DynPartialEq};
+use crate::{DynPartialEq, KernelResult};
 
 /// An arrow-enhanced opaque expression op that supports full expression evaluation over arrow data.
 ///
@@ -24,7 +26,7 @@ pub trait ArrowOpaqueExpressionOp: DynPartialEq + std::fmt::Debug {
         args: &[Expression],
         batch: &RecordBatch,
         result_type: Option<&DataType>,
-    ) -> DeltaResult<ArrayRef>;
+    ) -> KernelResult<ArrayRef>;
 
     /// See [`OpaqueExpressionOp::name`].
     fn name(&self) -> &str;
@@ -34,7 +36,7 @@ pub trait ArrowOpaqueExpressionOp: DynPartialEq + std::fmt::Debug {
         &self,
         eval_expr: &ScalarExpressionEvaluator<'_>,
         exprs: &[Expression],
-    ) -> DeltaResult<Scalar>;
+    ) -> KernelResult<Scalar>;
 }
 
 /// An arrow-enhanced opaque predicate op that supports full predicate evaluation over arrow data.
@@ -53,7 +55,7 @@ pub trait ArrowOpaquePredicateOp: DynPartialEq + std::fmt::Debug {
         args: &[Expression],
         batch: &RecordBatch,
         inverted: bool,
-    ) -> DeltaResult<BooleanArray>;
+    ) -> KernelResult<BooleanArray>;
 
     /// See [`OpaquePredicateOp::name`].
     fn name(&self) -> &str;
@@ -65,7 +67,7 @@ pub trait ArrowOpaquePredicateOp: DynPartialEq + std::fmt::Debug {
         eval_pred: &DirectPredicateEvaluator<'_>,
         exprs: &[Expression],
         inverted: bool,
-    ) -> DeltaResult<Option<bool>>;
+    ) -> KernelResult<Option<bool>>;
 
     /// See [`OpaquePredicateOp::eval_as_data_skipping_predicate`].
     fn eval_as_data_skipping_predicate(
@@ -128,16 +130,10 @@ impl ArrowOpaquePredicate for Predicate {
 /// there would be no way to recover a &dyn ArrowOpaqueExpressionOp` from it. Instead, we must
 /// downcast from `&dyn OpaqueExpressionOp` to the concrete `ArrowOpaqueExpressionOpAdaptor` type
 /// that implements both traits, and extract its inner `dyn ArrowOpaqueExpressionOp`.
-#[derive(Debug)]
-pub(crate) struct ArrowOpaqueExpressionOpAdaptor(Box<dyn ArrowOpaqueExpressionOp>);
-
-impl std::ops::Deref for ArrowOpaqueExpressionOpAdaptor {
-    type Target = dyn ArrowOpaqueExpressionOp;
-
-    fn deref(&self) -> &Self::Target {
-        self.0.deref()
-    }
-}
+#[derive(Debug, Deref)]
+pub(crate) struct ArrowOpaqueExpressionOpAdaptor(
+    #[deref(forward)] Box<dyn ArrowOpaqueExpressionOp>,
+);
 
 impl PartialEq for ArrowOpaqueExpressionOpAdaptor {
     fn eq(&self, other: &Self) -> bool {
@@ -155,7 +151,7 @@ impl OpaqueExpressionOp for ArrowOpaqueExpressionOpAdaptor {
         &self,
         eval_expr: &ScalarExpressionEvaluator<'_>,
         exprs: &[Expression],
-    ) -> DeltaResult<Scalar> {
+    ) -> KernelResult<Scalar> {
         (**self).eval_expr_scalar(eval_expr, exprs)
     }
 }
@@ -168,16 +164,8 @@ impl OpaqueExpressionOp for ArrowOpaqueExpressionOpAdaptor {
 /// would be no way to recover a &dyn ArrowOpaquePredicateOp` from it. Instead, we must downcast
 /// from `&dyn OpaquePredicateOp` to the concrete `ArrowOpaquePredicateOpAdaptor` type that
 /// implements both traits, and extract its inner `dyn ArrowOpaquePredicateOp`.
-#[derive(Debug)]
-pub(crate) struct ArrowOpaquePredicateOpAdaptor(Box<dyn ArrowOpaquePredicateOp>);
-
-impl std::ops::Deref for ArrowOpaquePredicateOpAdaptor {
-    type Target = dyn ArrowOpaquePredicateOp;
-
-    fn deref(&self) -> &Self::Target {
-        self.0.deref()
-    }
-}
+#[derive(Debug, Deref)]
+pub(crate) struct ArrowOpaquePredicateOpAdaptor(#[deref(forward)] Box<dyn ArrowOpaquePredicateOp>);
 
 impl PartialEq for ArrowOpaquePredicateOpAdaptor {
     fn eq(&self, other: &Self) -> bool {
@@ -197,7 +185,7 @@ impl OpaquePredicateOp for ArrowOpaquePredicateOpAdaptor {
         eval_pred: &DirectPredicateEvaluator<'_>,
         exprs: &[Expression],
         inverted: bool,
-    ) -> DeltaResult<Option<bool>> {
+    ) -> KernelResult<Option<bool>> {
         (**self).eval_pred_scalar(eval_expr, eval_pred, exprs, inverted)
     }
 

@@ -139,10 +139,15 @@ message VariadicExpression {
   repeated Expression exprs = 2;
 }
 
-message IfExpression {
+message CaseWhenBranch {
   Predicate condition = 1;
-  Expression then_expr = 2;
-  Expression else_expr = 3;
+  Expression result = 2;
+}
+
+// Ordered branches and a required ELSE. All results must have the same logical type.
+message CaseWhenExpression {
+  repeated CaseWhenBranch branches = 1;
+  Expression else_expr = 2;
 }
 
 message ParseJsonExpression {
@@ -150,8 +155,16 @@ message ParseJsonExpression {
   delta.kernel.schema.StructType output_schema = 2;
 }
 
+message MapToStructOptions {
+  // Optional connector-supplied IANA timezone or normalized fixed offset (`+HH:MM` or `-HH:MM`)
+  // for offset-less TIMESTAMP values. Kernel never infers this from the host or table metadata. A
+  // timezone or offset in a value takes precedence; absence means UTC.
+  optional string timestamp_timezone = 1;
+}
+
 message MapToStructExpression {
   Expression map_expr = 1;
+  MapToStructOptions options = 2;
 }
 
 // `nullability_predicate` is optional: when set and it evaluates to false/null, the whole
@@ -233,8 +246,7 @@ message Expression {
     UnaryExpression unary = 6;
     BinaryExpression binary = 7;
     VariadicExpression variadic = 8;
-    // TODO: IfExpression is not yet available in Kernel but will be needed in the future.
-    IfExpression if_expr = 9;
+    CaseWhenExpression case_when = 9;
     OpaqueExpression opaque = 10;
     ParseJsonExpression parse_json = 11;
     MapToStructExpression map_to_struct = 12;

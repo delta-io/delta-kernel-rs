@@ -1,13 +1,19 @@
+use delta_kernel::KernelResult;
 use delta_kernel::snapshot::Snapshot;
-use delta_kernel::DeltaResult;
 
 use crate::error::{ExternResult, IntoExternResult};
 use crate::expressions::kernel_visitor::NullTypeTag;
 use crate::handle::Handle;
 use crate::{
-    kernel_string_slice, AllocateStringFn, ExternEngine, KernelStringSlice, NullableCvoid,
-    OptionalValue, SharedExternEngine, SharedSnapshot, TryFromStringSlice,
+    AllocateStringFn, ExternEngine, KernelStringSlice, NullableCvoid, OptionalValue,
+    SharedExternEngine, SharedSnapshot, TryFromStringSlice, kernel_string_slice,
 };
+
+/// The row-tracking high-water mark before any fresh row IDs have been assigned.
+pub const ROW_TRACKING_INITIAL_HIGH_WATER_MARK: i64 = -1;
+
+const _: [(); 1] = [(); (ROW_TRACKING_INITIAL_HIGH_WATER_MARK
+    == delta_kernel::ROW_TRACKING_INITIAL_HIGH_WATER_MARK) as usize];
 
 /// Get the domain metadata as an optional string allocated by `AllocatedStringFn` for a specific
 /// domain in this snapshot
@@ -15,7 +21,7 @@ use crate::{
 /// # Safety
 ///
 /// Caller is responsible for passing in a valid handle
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn get_domain_metadata(
     snapshot: Handle<SharedSnapshot>,
     domain: KernelStringSlice,
@@ -26,18 +32,44 @@ pub unsafe extern "C" fn get_domain_metadata(
     let engine = unsafe { engine.as_ref() };
     let domain = unsafe { String::try_from_slice(&domain) };
 
-    get_domain_metadata_impl(snapshot, domain, engine, allocate_fn).into_extern_result(&engine)
+    let result = get_domain_metadata_impl(snapshot, domain, engine, allocate_fn);
+    unsafe { result.into_extern_result(&engine) }
 }
 
 fn get_domain_metadata_impl(
     snapshot: &Snapshot,
-    domain: DeltaResult<String>,
+    domain: KernelResult<String>,
     extern_engine: &dyn ExternEngine,
     allocate_fn: AllocateStringFn,
-) -> DeltaResult<NullableCvoid> {
+) -> KernelResult<NullableCvoid> {
     Ok(snapshot
+        .reader()
         .get_domain_metadata(&domain?, extern_engine.engine().as_ref())?
         .and_then(|config| allocate_fn(kernel_string_slice!(config))))
+}
+
+/// Get the row-tracking high-water mark for this snapshot.
+///
+/// Returns [`OptionalValue::None`] when the snapshot has no active `delta.rowTracking` domain
+/// metadata. [`OptionalValue::Some`] with a value of `ROW_TRACKING_INITIAL_HIGH_WATER_MARK` means
+/// row tracking is active but no row IDs have been assigned yet. Returns an error if the domain
+/// metadata cannot be read or its JSON configuration is malformed.
+///
+/// # Safety
+///
+/// Caller is responsible for passing valid snapshot and engine handles.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn snapshot_row_tracking_high_water_mark(
+    snapshot: Handle<SharedSnapshot>,
+    engine: Handle<SharedExternEngine>,
+) -> ExternResult<OptionalValue<i64>> {
+    let engine_ref = unsafe { engine.as_ref() };
+    let snapshot = unsafe { snapshot.as_ref() };
+    let result = snapshot
+        .reader()
+        .get_row_tracking_high_water_mark(engine_ref.engine().as_ref())
+        .map(OptionalValue::from);
+    unsafe { result.into_extern_result(&engine_ref) }
 }
 
 /// Signature of the callback invoked once per clustering column by
@@ -84,7 +116,7 @@ pub type ClusteringColumnVisitor = extern "C" fn(
 /// Caller is responsible for passing in a valid snapshot and engine handle, a valid
 /// `engine_context` opaque pointer forwarded to each `visitor` invocation, and a valid
 /// `visitor` function pointer.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn visit_clustering_columns(
     snapshot: Handle<SharedSnapshot>,
     engine: Handle<SharedExternEngine>,
@@ -93,8 +125,8 @@ pub unsafe extern "C" fn visit_clustering_columns(
 ) -> ExternResult<OptionalValue<usize>> {
     let snapshot = unsafe { snapshot.as_ref() };
     let engine = unsafe { engine.as_ref() };
-    visit_clustering_columns_impl(snapshot, engine, engine_context, visitor)
-        .into_extern_result(&engine)
+    let result = visit_clustering_columns_impl(snapshot, engine, engine_context, visitor);
+    unsafe { result.into_extern_result(&engine) }
 }
 
 fn visit_clustering_columns_impl(
@@ -102,8 +134,11 @@ fn visit_clustering_columns_impl(
     extern_engine: &dyn ExternEngine,
     engine_context: NullableCvoid,
     visitor: ClusteringColumnVisitor,
-) -> DeltaResult<OptionalValue<usize>> {
-    let Some(infos) = snapshot.get_clustering_column_infos(extern_engine.engine().as_ref())? else {
+) -> KernelResult<OptionalValue<usize>> {
+    let Some(infos) = snapshot
+        .reader()
+        .get_clustering_column_infos(extern_engine.engine().as_ref())?
+    else {
         return Ok(OptionalValue::None);
     };
     for info in &infos {
@@ -128,7 +163,7 @@ fn visit_clustering_columns_impl(
 /// # Safety
 ///
 /// Caller is responsible for passing in a valid handle
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn visit_domain_metadata(
     snapshot: Handle<SharedSnapshot>,
     engine: Handle<SharedExternEngine>,
@@ -142,8 +177,8 @@ pub unsafe extern "C" fn visit_domain_metadata(
     let snapshot = unsafe { snapshot.as_ref() };
     let engine = unsafe { engine.as_ref() };
 
-    visit_domain_metadata_impl(snapshot, engine, engine_context, visitor)
-        .into_extern_result(&engine)
+    let result = visit_domain_metadata_impl(snapshot, engine, engine_context, visitor);
+    unsafe { result.into_extern_result(&engine) }
 }
 
 fn visit_domain_metadata_impl(
@@ -155,8 +190,10 @@ fn visit_domain_metadata_impl(
         key: KernelStringSlice,
         value: KernelStringSlice,
     ),
-) -> DeltaResult<bool> {
-    let res = snapshot.get_all_domain_metadata(extern_engine.engine().as_ref())?;
+) -> KernelResult<bool> {
+    let res = snapshot
+        .reader()
+        .get_all_domain_metadata(extern_engine.engine().as_ref())?;
     res.iter().for_each(|metadata| {
         let domain = &metadata.domain();
         let configuration = &metadata.configuration();
@@ -176,27 +213,27 @@ mod tests {
     use std::ptr::NonNull;
     use std::sync::Arc;
 
+    use delta_kernel::KernelResult;
     use delta_kernel::object_store::memory::InMemory;
-    use delta_kernel::DeltaResult;
     use delta_kernel_default_engine::DefaultEngineBuilder;
     use rstest::rstest;
     use serde_json::json;
     use test_utils::add_commit;
 
     use super::*;
-    use crate::error::KernelError;
+    use crate::error::FFIKernelError;
     use crate::ffi_test_utils::{
-        allocate_err, allocate_str, assert_extern_result_error_with_message, build_snapshot,
-        ok_or_panic, recover_string,
+        TEST_ERROR_ALLOCATORS, allocate_str, assert_extern_result_error_with_message,
+        build_snapshot, ok_or_panic, recover_string,
     };
     use crate::{engine_to_handle, free_engine, free_snapshot, kernel_string_slice};
 
     #[tokio::test]
-    async fn test_domain_metadata() -> DeltaResult<()> {
+    async fn test_domain_metadata() -> KernelResult<()> {
         let storage = Arc::new(InMemory::new());
 
         let engine = DefaultEngineBuilder::new(storage.clone()).build();
-        let engine = engine_to_handle(Arc::new(engine), allocate_err);
+        let engine = engine_to_handle(Arc::new(engine), TEST_ERROR_ALLOCATORS);
         let table_root = "memory:///test_table/";
 
         // commit0
@@ -295,7 +332,13 @@ mod tests {
 
         let domain3 = "delta.domain3";
         let res = get_domain_metadata_helper(domain3);
-        assert_extern_result_error_with_message(res, KernelError::GenericError, Some("Generic delta kernel error: User DomainMetadata are not allowed to use system-controlled 'delta.*' domain"));
+        assert_extern_result_error_with_message(
+            res,
+            FFIKernelError::GenericError,
+            Some(
+                "Generic delta kernel error: User DomainMetadata are not allowed to use system-controlled 'delta.*' domain",
+            ),
+        );
 
         // Secondly, we visit the entire domain metadata
 
@@ -309,15 +352,11 @@ mod tests {
             key: KernelStringSlice,
             value: KernelStringSlice,
         ) {
-            let mut collected_metadata = unsafe {
-                Box::from_raw(
-                    state.unwrap().as_ptr() as *mut std::collections::HashMap<String, String>
-                )
-            };
-            let key: DeltaResult<String> = unsafe { TryFromStringSlice::try_from_slice(&key) };
-            let value: DeltaResult<String> = unsafe { TryFromStringSlice::try_from_slice(&value) };
+            let ptr: *mut HashMap<String, String> = state.unwrap().as_ptr().cast();
+            let collected_metadata = unsafe { &mut *ptr };
+            let key: KernelResult<String> = unsafe { TryFromStringSlice::try_from_slice(&key) };
+            let value: KernelResult<String> = unsafe { TryFromStringSlice::try_from_slice(&value) };
             collected_metadata.insert(key.unwrap(), value.unwrap());
-            Box::leak(collected_metadata);
         }
 
         // Visit all (user) domain metadata
@@ -438,11 +477,11 @@ mod tests {
             precision: u8,
             scale: u8,
         ) {
-            let mut columns =
-                unsafe { Box::from_raw(state.unwrap().as_ptr() as *mut Vec<VisitedColumn>) };
-            let logical: DeltaResult<String> =
+            let ptr: *mut Vec<VisitedColumn> = state.unwrap().as_ptr().cast();
+            let columns = unsafe { &mut *ptr };
+            let logical: KernelResult<String> =
                 unsafe { TryFromStringSlice::try_from_slice(&logical_column) };
-            let physical: DeltaResult<String> =
+            let physical: KernelResult<String> =
                 unsafe { TryFromStringSlice::try_from_slice(&physical_column) };
             columns.push((
                 logical.unwrap(),
@@ -451,7 +490,6 @@ mod tests {
                 precision,
                 scale,
             ));
-            Box::leak(columns);
         }
 
         let count: Option<usize> = ok_or_panic(unsafe {
@@ -479,7 +517,7 @@ mod tests {
     ) {
         let storage = Arc::new(InMemory::new());
         let engine = DefaultEngineBuilder::new(storage.clone()).build();
-        let engine = engine_to_handle(Arc::new(engine), allocate_err);
+        let engine = engine_to_handle(Arc::new(engine), TEST_ERROR_ALLOCATORS);
 
         let mut actions = vec![
             protocol_action(clustering_feature),
@@ -509,7 +547,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_get_clustering_domain_metadata_user_facing_path_still_rejects() -> DeltaResult<()>
+    async fn test_get_clustering_domain_metadata_user_facing_path_still_rejects() -> KernelResult<()>
     {
         let table_root = "memory:///test_clustering_user_facing_rejected/";
         let (engine, snapshot) = build_clustering_snapshot(
@@ -531,7 +569,7 @@ mod tests {
         };
         assert_extern_result_error_with_message(
             rejected,
-            KernelError::GenericError,
+            FFIKernelError::GenericError,
             Some(
                 "Generic delta kernel error: User DomainMetadata are not allowed to use \
                  system-controlled 'delta.*' domain",
@@ -627,7 +665,7 @@ mod tests {
         #[case] follow_up: Option<(&str, bool)>,
         #[case] expected: Option<Vec<(&str, &str, u8)>>,
         #[case] table_root: &str,
-    ) -> DeltaResult<()> {
+    ) -> KernelResult<()> {
         let follow_up_commits: Vec<serde_json::Value> = follow_up
             .into_iter()
             .map(|(config, removed)| clustering_domain_action(config, removed))
@@ -668,12 +706,12 @@ mod tests {
 
     // Decimal is the only tag carrying a payload, so pin precision/scale explicitly.
     #[tokio::test]
-    async fn test_visit_clustering_columns_decimal_reports_precision_and_scale() -> DeltaResult<()>
+    async fn test_visit_clustering_columns_decimal_reports_precision_and_scale() -> KernelResult<()>
     {
         const TAG_DECIMAL: u8 = 12;
         let storage = Arc::new(InMemory::new());
         let engine = DefaultEngineBuilder::new(storage.clone()).build();
-        let engine = engine_to_handle(Arc::new(engine), allocate_err);
+        let engine = engine_to_handle(Arc::new(engine), TEST_ERROR_ALLOCATORS);
         let table_root = "memory:///test_clustering_decimal/";
 
         let schema = json!({
@@ -711,10 +749,10 @@ mod tests {
     // With column mapping the domain stores physical identifiers, so the visitor must report the
     // schema-resolved logical name alongside the physical one the domain (and per-file stats) use.
     #[tokio::test]
-    async fn test_visit_clustering_columns_column_mapping_reports_both_names() -> DeltaResult<()> {
+    async fn test_visit_clustering_columns_column_mapping_reports_both_names() -> KernelResult<()> {
         let storage = Arc::new(InMemory::new());
         let engine = DefaultEngineBuilder::new(storage.clone()).build();
-        let engine = engine_to_handle(Arc::new(engine), allocate_err);
+        let engine = engine_to_handle(Arc::new(engine), TEST_ERROR_ALLOCATORS);
         let table_root = "memory:///test_clustering_column_mapping/";
 
         // `region` is stored physically as `col-region-phys`; clustering names the physical id.
@@ -781,7 +819,7 @@ mod tests {
     // A clustering column absent from the schema cannot resolve to a logical name, so the
     // symbol surfaces an `ExternResult::Err` rather than reporting the table as unclustered.
     #[tokio::test]
-    async fn test_visit_clustering_columns_column_not_in_schema_errors() -> DeltaResult<()> {
+    async fn test_visit_clustering_columns_column_not_in_schema_errors() -> KernelResult<()> {
         let table_root = "memory:///test_clustering_col_missing/";
         // "ghost" is not one of id/val/addr in clustering_test_schema_json().
         let (engine, snapshot) = build_clustering_snapshot(
@@ -809,7 +847,7 @@ mod tests {
                 visitor,
             )
         };
-        assert_extern_result_error_with_message(res, KernelError::GenericError, None);
+        assert_extern_result_error_with_message(res, FFIKernelError::GenericError, None);
 
         unsafe { free_snapshot(snapshot) }
         unsafe { free_engine(engine) }

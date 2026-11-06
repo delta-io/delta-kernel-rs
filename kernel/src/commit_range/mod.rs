@@ -1,7 +1,12 @@
-//! Read a contiguous range of raw Delta commits.
+//! Read a range of raw Delta commits.
 //!
 //! A [`CommitRange`] holds an inclusive `[start_version, end_version]` range and the list of
 //! commit files; reads are lazy (no JSON I/O until [`CommitRange::commits`] is called).
+//!
+//! By default, [`CommitRangeBuilder::build`] validates that the range's commits are present and
+//! contiguous. With the `internal-api` feature, a path-based builder may disable that build-time
+//! validation; `CommitRange::commit_files` then detects version gaps lazily, and
+//! [`CommitRange::commits`] returns [`KernelError::CommitRange`].
 //!
 //! Two construction paths, differing only in how `_delta_log/` is listed at build time:
 //! - [`CommitRange::builder_for`]: lists `_delta_log/` for the requested range.
@@ -19,7 +24,7 @@
 //! ```no_run
 //! use std::sync::Arc;
 //! use delta_kernel::commit_range::{CommitRange, DeltaAction};
-//! use delta_kernel::{Engine, Error, Snapshot};
+//! use delta_kernel::{Engine, KernelError, Snapshot};
 //! use delta_kernel::object_store::local::LocalFileSystem;
 //! use test_utils::delta_kernel_default_engine::DefaultEngineBuilder;
 //!
@@ -41,7 +46,7 @@
 //!         let _batch = batch?;
 //!     }
 //! }
-//! # Ok::<(), Error>(())
+//! # Ok::<(), KernelError>(())
 //! ```
 
 mod actions;
@@ -52,22 +57,27 @@ use std::sync::Arc;
 
 pub use actions::{CommitAction, DeltaAction};
 pub use builder::{CommitOrdering, CommitRangeBuilder};
+use delta_kernel_derive::internal_api;
 use url::Url;
 
 use crate::actions::{
-    Metadata, Protocol, ADD_FIELD, CDC_FIELD, CHECKPOINT_METADATA_FIELD, COMMIT_INFO_FIELD,
-    DOMAIN_METADATA_FIELD, METADATA_FIELD, PROTOCOL_FIELD, REMOVE_FIELD, SET_TRANSACTION_FIELD,
+    ADD_FIELD, CDC_FIELD, CHECKPOINT_METADATA_FIELD, COMMIT_INFO_FIELD, DOMAIN_METADATA_FIELD,
+    METADATA_FIELD, Metadata, PROTOCOL_FIELD, Protocol, REMOVE_FIELD, SET_TRANSACTION_FIELD,
     SIDECAR_FIELD,
 };
 use crate::path::ParsedLogPath;
 use crate::schema::{ArrayType, MapType, SchemaRef, StructField, StructType};
 use crate::snapshot::SnapshotRef;
 use crate::table_features::Operation;
-use crate::transforms::{transform_output_type, SchemaTransform};
-use crate::{DeltaResult, Engine, Error, Version};
+use crate::transforms::{SchemaTransform, transform_output_type};
+use crate::utils::require;
+use crate::{Engine, KernelError, KernelResult, KernelResultIterator, Version};
 
-/// A contiguous range of Delta commits, holding resolved `[start_version, end_version]` bounds
-/// plus the materialized commit-file pointers in `commit_files`.
+/// A range of Delta commits, holding resolved `[start_version, end_version]` bounds plus the
+/// materialized commit-file pointers in `commit_files`.
+///
+/// The commit files are contiguous when the range was built with commit range validation
+/// enabled. Otherwise, they may contain gaps.
 ///
 /// The pointer order matches the [`CommitOrdering`] requested at build time (ascending by
 /// default; reversed if [`CommitOrdering::DescendingOrder`]). Reading the underlying actions is
@@ -79,6 +89,9 @@ pub struct CommitRange {
     start_version: Version,
     end_version: Version,
     commit_ordering: CommitOrdering,
+    supports_commit_actions: bool,
+    supports_commit_files: bool,
+    fail_on_data_loss: bool,
 }
 
 impl CommitRange {
@@ -111,6 +124,37 @@ impl CommitRange {
         &self.table_root
     }
 
+    /// Iterator over the range's commit files in ascending version order.
+    ///
+    /// Version gaps are detected lazily as the iterator advances. When the range was built with
+    /// `fail_on_data_loss` enabled, a missing start version yields
+    /// [`KernelError::StartVersionNotFound`], and any later gap up to the end version, including
+    /// one after the last listed file, yields [`KernelError::MissingVersion`]. The iterator ends
+    /// after its first error. Otherwise, available files are yielded across gaps.
+    ///
+    /// Returns [`KernelError::CommitRange`] if the range was not built with
+    /// [`CommitOrdering::AscendingOrder`].
+    #[internal_api]
+    #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
+    pub(crate) fn commit_files(
+        &self,
+    ) -> KernelResult<impl KernelResultIterator<ParsedLogPath> + use<>> {
+        require!(
+            self.supports_commit_files,
+            KernelError::CommitRange(
+                "Commit file iteration is not supported for this range".to_string()
+            )
+        );
+        Ok(CommitFileIterator {
+            files: self.commit_files.clone().into_iter(),
+            start_version: self.start_version,
+            end_version: self.end_version,
+            expected_version: Some(self.start_version),
+            fail_on_data_loss: self.fail_on_data_loss,
+            done: false,
+        })
+    }
+
     /// Iterator over the commits in the range, yielding one [`CommitAction`] per commit.
     ///
     /// - `engine`: performs the per-commit JSON reads.
@@ -125,23 +169,37 @@ impl CommitRange {
     /// records and does NOT impose change-data-feed support (`Operation::Cdf`). It does not
     /// materialize a change data feed.
     ///
-    /// Returns `Err` if `actions` is empty or contains duplicate kinds, or if `start_snapshot`
-    /// belongs to a different table, its version does not match the range anchor, or its table
-    /// does not support scanning.
+    /// In ascending order, each commit is validated against the protocol and metadata carried
+    /// forward from earlier versions, so the range must be contiguous as validated by
+    /// [`CommitRangeBuilder::build`]. Ranges built with commit range validation disabled may
+    /// contain gaps; enumerate their raw files with `commit_files` instead.
+    ///
+    /// Returns [`KernelError::CommitRange`] if the range was built with commit range validation
+    /// disabled, if `actions` is empty, or if `start_snapshot` belongs to a different table or its
+    /// version does not match the range anchor. Returns `Err` if `actions` contains duplicate kinds
+    /// or the table does not support scanning.
     pub fn commits(
         &self,
         engine: Arc<dyn Engine>,
         start_snapshot: Option<SnapshotRef>,
         actions: &[DeltaAction],
-    ) -> DeltaResult<impl Iterator<Item = DeltaResult<CommitAction>> + Send> {
+    ) -> KernelResult<impl KernelResultIterator<CommitAction> + use<>> {
+        require!(
+            self.supports_commit_actions,
+            KernelError::CommitRange(
+                "Commit action iteration is not supported for this range".to_string()
+            )
+        );
         if actions.is_empty() {
-            return Err(Error::generic("at least one DeltaAction must be requested"));
+            return Err(KernelError::CommitRange(
+                "at least one DeltaAction must be requested".to_string(),
+            ));
         }
 
         let (latest_protocol, latest_metadata) = match &start_snapshot {
             Some(snapshot) => {
                 if snapshot.table_root() != &self.table_root {
-                    return Err(Error::generic(format!(
+                    return Err(KernelError::CommitRange(format!(
                         "snapshot table root ({}) does not match commit range table root ({})",
                         snapshot.table_root(),
                         self.table_root,
@@ -152,7 +210,7 @@ impl CommitRange {
                     CommitOrdering::DescendingOrder => (self.end_version, "end_version"),
                 };
                 if snapshot.version() != anchor_version {
-                    return Err(Error::generic(format!(
+                    return Err(KernelError::CommitRange(format!(
                         "snapshot version {} does not match {anchor_name} ({anchor_version})",
                         snapshot.version(),
                     )));
@@ -181,6 +239,57 @@ impl CommitRange {
     }
 }
 
+/// Iterator yielded by [`CommitRange::commit_files`]. Tracks the next expected version to detect
+/// gaps lazily, and fuses after its first error.
+#[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
+struct CommitFileIterator {
+    files: std::vec::IntoIter<ParsedLogPath>,
+    start_version: Version,
+    end_version: Version,
+    /// `None` once a file at `Version::MAX` was yielded, so no later version can be expected.
+    expected_version: Option<Version>,
+    fail_on_data_loss: bool,
+    done: bool,
+}
+
+impl Iterator for CommitFileIterator {
+    type Item = KernelResult<ParsedLogPath>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.done {
+            return None;
+        }
+        let Some(file) = self.files.next() else {
+            self.done = true;
+            return match self.expected_version {
+                Some(expected) if self.fail_on_data_loss && expected <= self.end_version => {
+                    Some(Err(KernelError::MissingVersion(expected)))
+                }
+                _ => None,
+            };
+        };
+        if self.fail_on_data_loss && self.expected_version != Some(file.version) {
+            self.done = true;
+            let err = match self.expected_version {
+                Some(expected) if expected == self.start_version => {
+                    KernelError::StartVersionNotFound {
+                        requested: self.start_version,
+                        earliest: file.version,
+                    }
+                }
+                Some(expected) => KernelError::MissingVersion(expected),
+                None => KernelError::internal_error(format!(
+                    "Commit file version {} follows the maximum version",
+                    file.version
+                )),
+            };
+            return Some(Err(err));
+        }
+        self.expected_version = file.version.checked_add(1);
+        Some(Ok(file))
+    }
+}
+
 /// Iterator yielded by [`CommitRange::commits`]. Holds the iterator's accumulated
 /// `latest_protocol` / `latest_metadata` and
 /// constructs a fresh [`CommitAction`] for each commit, running per-commit protocol
@@ -204,7 +313,7 @@ impl CommitActionsIterator {
     /// Commits below the anchor are validated/timestamped best-effort against only their own
     /// actions. Another solution is to walk the commit in ascending then reversing in the
     /// [`CommitOrdering::DescendingOrder`] scenario.
-    fn try_advance(&mut self, log_path: ParsedLogPath) -> DeltaResult<CommitAction> {
+    fn try_advance(&mut self, log_path: ParsedLogPath) -> KernelResult<CommitAction> {
         let version = log_path.version;
         let commit_action = CommitAction::try_new(
             self.engine.as_ref(),
@@ -230,19 +339,22 @@ impl CommitActionsIterator {
     }
 }
 
-/// Prepend `commit v={version}` context to `err`, preserving the original variant for the two
-/// kernel error kinds that protocol validation surfaces ([`Error::Unsupported`] and
-/// [`Error::InvalidProtocol`]). Other variants fall back to [`Error::generic`].
-fn with_version_context(version: Version, err: Error) -> Error {
+/// Adds commit-version context while preserving protocol error kinds and typed cancellation.
+fn with_version_context(version: Version, err: KernelError) -> KernelError {
     match err {
-        Error::Unsupported(msg) => Error::Unsupported(format!("commit v={version}: {msg}")),
-        Error::InvalidProtocol(msg) => Error::InvalidProtocol(format!("commit v={version}: {msg}")),
-        other => Error::generic(format!("commit v={version}: {other}")),
+        KernelError::Cancelled => KernelError::Cancelled,
+        KernelError::Unsupported(msg) => {
+            KernelError::Unsupported(format!("commit v={version}: {msg}"))
+        }
+        KernelError::InvalidProtocol(msg) => {
+            KernelError::InvalidProtocol(format!("commit v={version}: {msg}"))
+        }
+        other => KernelError::generic(format!("commit v={version}: {other}")),
     }
 }
 
 impl Iterator for CommitActionsIterator {
-    type Item = DeltaResult<CommitAction>;
+    type Item = KernelResult<CommitAction>;
 
     fn next(&mut self) -> Option<Self::Item> {
         let log_path = self.log_path_iter.next()?;
@@ -314,17 +426,20 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::Arc;
 
-    use test_utils::add_commit;
+    use test_utils::{add_commit, assert_result_error_with_message};
 
     use super::*;
+    use crate::Snapshot;
     use crate::actions::visitors::{AddVisitor, RemoveVisitor};
     use crate::actions::{Add, Remove};
     use crate::arrow::array::{Array, AsArray, MapArray, StringArray, StructArray};
+    use crate::engine::CancellableEngine;
     use crate::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt};
     use crate::engine::sync::SyncEngine;
     use crate::engine_data::RowVisitor;
     use crate::object_store::memory::InMemory;
-    use crate::Snapshot;
+    use crate::unit_test_utils::TestCancellationToken;
+    use crate::utils::FoldWithOption as _;
 
     /// Open a `CommitRange` over `table-with-dv-small` with a matching anchor snapshot.
     /// `start_version` drives both the range's start version and the snapshot's version.
@@ -358,7 +473,7 @@ mod tests {
         let collected = range
             .commits(engine, Some(anchor_snapshot), &actions)
             .unwrap()
-            .collect::<DeltaResult<Vec<_>>>()
+            .collect::<KernelResult<Vec<_>>>()
             .unwrap();
 
         assert_eq!(collected.len(), 2, "yield one CommitAction per commit");
@@ -369,6 +484,25 @@ mod tests {
                 files[i].location.last_modified,
                 "commit {i} timestamp must match file last_modified",
             );
+        }
+    }
+
+    #[rstest::rstest]
+    fn commit_header_read_preserves_cancellation(#[values(false, true)] cancelled: bool) {
+        let (range, engine, snapshot) = open_test_range_at(0);
+        let token = Arc::new(TestCancellationToken::default());
+        let engine = Arc::new(CancellableEngine::new(engine.as_ref(), token.clone()));
+        let mut commits = range
+            .commits(engine, Some(snapshot), &[DeltaAction::Add])
+            .unwrap();
+        if cancelled {
+            token.cancel();
+        }
+        let result = commits.next().unwrap();
+        if cancelled {
+            assert!(matches!(result, Err(KernelError::Cancelled)));
+        } else {
+            assert_eq!(result.unwrap().version(), 0);
         }
     }
 
@@ -671,7 +805,7 @@ mod tests {
         engine: Arc<dyn Engine>,
         start_snapshot: Option<SnapshotRef>,
         actions: &[DeltaAction],
-    ) -> DeltaResult<()> {
+    ) -> KernelResult<()> {
         for commit_res in range.commits(engine.clone(), start_snapshot, actions)? {
             let commit = commit_res?;
             for batch_res in commit.get_actions(engine.as_ref())? {
@@ -691,16 +825,16 @@ mod tests {
     #[rstest::rstest]
     #[case::too_high_reader_version(
         r#"{"protocol":{"minReaderVersion":99,"minWriterVersion":99}}"#,
-        |err: &Error| matches!(err, Error::Unsupported(_)),
+        |err: &KernelError| matches!(err, KernelError::Unsupported(_)),
     )]
     #[case::too_low_reader_version(
         r#"{"protocol":{"minReaderVersion":0,"minWriterVersion":1}}"#,
-        |err: &Error| matches!(err, Error::InvalidProtocol(_)),
+        |err: &KernelError| matches!(err, KernelError::InvalidProtocol(_)),
     )]
     #[tokio::test]
     async fn test_commits_errors_on_unsupported_reader_version(
         #[case] v1: &str,
-        #[case] is_expected_err: fn(&Error) -> bool,
+        #[case] is_expected_err: fn(&KernelError) -> bool,
     ) {
         let v0 = format!("{}\n{}", VALID_PROTOCOL_LINE, VALID_METADATA_LINE);
         let (engine, table_root) = engine_with_commits(&[(0, &v0), (1, v1)]).await;
@@ -808,8 +942,31 @@ mod tests {
             .commits(engine, Some(bad_snapshot), &[DeltaAction::Add])
             .err()
             .unwrap();
-        let msg = format!("{err}");
-        assert!(msg.contains(expected_anchor_name));
+        assert!(matches!(
+            err,
+            KernelError::CommitRange(message) if message.contains(expected_anchor_name)
+        ));
+    }
+
+    #[test]
+    fn test_commits_errors_on_snapshot_table_root_mismatch() {
+        let (range, engine, _) = open_test_range_at(0);
+        let other_path =
+            std::fs::canonicalize(PathBuf::from("./tests/data/table-without-dv-small/")).unwrap();
+        let other_table_root = url::Url::from_directory_path(other_path).unwrap();
+        let other_snapshot = Snapshot::builder_for(other_table_root.as_str())
+            .at_version(0)
+            .build(engine.as_ref())
+            .unwrap();
+
+        let err = range
+            .commits(engine, Some(other_snapshot), &[DeltaAction::Add])
+            .err()
+            .unwrap();
+        assert!(matches!(
+            err,
+            KernelError::CommitRange(message) if message.contains("table root")
+        ));
     }
 
     #[test]
@@ -819,8 +976,10 @@ mod tests {
             .commits(engine, Some(anchor_snapshot), &[])
             .err()
             .unwrap();
-        let msg = format!("{err}");
-        assert!(msg.contains("DeltaAction"), "got: {msg}");
+        assert!(matches!(
+            err,
+            KernelError::CommitRange(message) if message.contains("DeltaAction")
+        ));
     }
 
     #[rstest::rstest]
@@ -870,7 +1029,7 @@ mod tests {
     fn collect_adds_and_removes(
         commit: &CommitAction,
         engine: &dyn Engine,
-    ) -> DeltaResult<(Vec<Add>, Vec<Remove>)> {
+    ) -> KernelResult<(Vec<Add>, Vec<Remove>)> {
         let mut add_visitor = AddVisitor::default();
         let mut remove_visitor = RemoveVisitor::default();
         for batch_res in commit.get_actions(engine)? {
@@ -901,31 +1060,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_error_on_start_snapshot_unsupported_for_scan() {
+    async fn snapshot_load_rejects_unsupported_reader_feature() {
         let v0 = format!("{}\n{}", UNSUPPORTED_PROTOCOL_LINE, VALID_METADATA_LINE,);
         let (engine, table_root) = engine_with_commits(&[(0, &v0)]).await;
 
-        let snapshot = Snapshot::builder_for(table_root)
-            .at_version(0)
-            .build(engine.as_ref())
-            .expect("snapshot with unknown feature should still build");
-
-        let range = CommitRange::builder_for(table_root, 0)
-            .with_end_version(0)
-            .build(engine.as_ref())
-            .unwrap();
-
-        let actions = [DeltaAction::Add];
-        let err = range
-            .commits(engine, Some(snapshot), &actions)
-            .err()
-            .expect(
-                "commits must reject snapshot with unsupported feature before iteration begins",
-            );
-        match err {
-            Error::Unsupported(msg) => assert!(msg.contains("futureFeature"), "got: {msg}"),
-            other => panic!("expected Error::Unsupported, got: {other:?}"),
-        }
+        assert_result_error_with_message(
+            Snapshot::builder_for(table_root)
+                .at_version(0)
+                .build(engine.as_ref()),
+            "futureFeature",
+        );
     }
 
     #[rstest::rstest]
@@ -969,8 +1113,8 @@ mod tests {
         if expects_unsupported {
             let err = result.expect_err("commit-driven validation must reject");
             assert!(
-                matches!(err, Error::Unsupported(_)),
-                "expected Error::Unsupported, got: {err:?}",
+                matches!(err, KernelError::Unsupported(_)),
+                "expected KernelError::Unsupported, got: {err:?}",
             );
         } else {
             result.expect("snapshot-less range must drain cleanly");
@@ -998,10 +1142,10 @@ mod tests {
         let v0_result = iter.next().expect("v=0 commit yield slot");
         match v0_result {
             Ok(_) => panic!("v=0 must reject during iter.next()"),
-            Err(Error::Unsupported(msg)) => {
+            Err(KernelError::Unsupported(msg)) => {
                 assert!(msg.contains("futureFeature"), "got: {msg}")
             }
-            Err(other) => panic!("expected Error::Unsupported, got: {other:?}"),
+            Err(other) => panic!("expected KernelError::Unsupported, got: {other:?}"),
         }
     }
 
@@ -1146,5 +1290,181 @@ mod tests {
             .expect_err("missing in-commit timestamp must error");
         let msg = format!("{err}");
         assert!(msg.contains("in-commit timestamp"), "got: {msg}");
+    }
+
+    #[rstest::rstest]
+    #[case::validated_ascending_supports_both(true, CommitOrdering::AscendingOrder, None, None)]
+    #[case::validated_descending_rejects_commit_files(
+        true,
+        CommitOrdering::DescendingOrder,
+        None,
+        Some("Commit file iteration is not supported for this range")
+    )]
+    #[case::relaxed_ascending_rejects_commits_even_when_contiguous(
+        false,
+        CommitOrdering::AscendingOrder,
+        Some("Commit action iteration is not supported for this range"),
+        None
+    )]
+    #[tokio::test]
+    async fn test_iterator_support_follows_validation_and_ordering(
+        #[case] commit_range_validation: bool,
+        #[case] ordering: CommitOrdering,
+        #[case] expected_commits_err: Option<&str>,
+        #[case] expected_commit_files_err: Option<&str>,
+    ) {
+        let (engine, table_root) =
+            engine_with_commits(&[(0, VALID_PROTOCOL_LINE), (1, VALID_PROTOCOL_LINE)]).await;
+        let range = CommitRange::builder_for(table_root, 0)
+            .with_ordering(ordering)
+            .with_commit_range_validation(commit_range_validation)
+            .build(engine.as_ref())
+            .unwrap();
+        let ordered_versions: &[Version] = match ordering {
+            CommitOrdering::AscendingOrder => &[0, 1],
+            CommitOrdering::DescendingOrder => &[1, 0],
+        };
+
+        let commits = range.commits(engine, None, &[DeltaAction::Protocol]);
+        match expected_commits_err {
+            Some(msg) => {
+                assert!(matches!(commits, Err(KernelError::CommitRange(_))));
+                assert_result_error_with_message(commits, msg);
+            }
+            None => {
+                let versions: Vec<_> = commits
+                    .unwrap()
+                    .map(|commit| commit.unwrap().version())
+                    .collect();
+                assert_eq!(versions, ordered_versions);
+            }
+        }
+
+        let commit_files = range.commit_files();
+        match expected_commit_files_err {
+            Some(msg) => {
+                assert!(matches!(commit_files, Err(KernelError::CommitRange(_))));
+                assert_result_error_with_message(commit_files, msg);
+            }
+            None => {
+                let versions: Vec<_> = commit_files
+                    .unwrap()
+                    .map(|file| file.unwrap().version)
+                    .collect();
+                assert_eq!(versions, [0, 1]);
+            }
+        }
+    }
+
+    #[rstest::rstest]
+    #[case::fail_on_data_loss_errors_at_internal_gap(
+        &[0, 1, 3, 4],
+        None,
+        true,
+        &[0, 1],
+        Some(KernelError::MissingVersion(2)),
+    )]
+    #[case::no_fail_on_data_loss_skips_internal_gap(
+        &[0, 1, 3, 4],
+        None,
+        false,
+        &[0, 1, 3, 4],
+        None,
+    )]
+    #[case::fail_on_data_loss_yields_contiguous_commits(
+        &[0, 1, 2, 3],
+        None,
+        true,
+        &[0, 1, 2, 3],
+        None,
+    )]
+    #[case::fail_on_data_loss_errors_before_earliest_commit(
+        &[2, 3],
+        None,
+        true,
+        &[],
+        Some(KernelError::StartVersionNotFound { requested: 0, earliest: 2 }),
+    )]
+    #[case::no_fail_on_data_loss_starts_at_earliest_commit(
+        &[2, 3],
+        None,
+        false,
+        &[2, 3],
+        None,
+    )]
+    #[case::fail_on_data_loss_errors_at_missing_suffix(
+        &[0, 1],
+        Some(3),
+        true,
+        &[0, 1],
+        Some(KernelError::MissingVersion(2)),
+    )]
+    #[case::no_fail_on_data_loss_ignores_missing_suffix(&[0, 1], Some(3), false, &[0, 1], None)]
+    #[case::fail_on_data_loss_errors_when_final_version_is_missing(
+        &[0, 1],
+        Some(2),
+        true,
+        &[0, 1],
+        Some(KernelError::MissingVersion(2)),
+    )]
+    #[tokio::test]
+    async fn test_relaxed_commit_files_reports_gaps_per_fail_on_data_loss(
+        #[case] versions: &[Version],
+        #[case] end_version: Option<Version>,
+        #[case] fail_on_data_loss: bool,
+        #[case] expected_versions: &[Version],
+        #[case] expected_err: Option<KernelError>,
+    ) {
+        let commits: Vec<_> = versions.iter().map(|v| (*v, VALID_PROTOCOL_LINE)).collect();
+        let (engine, table_root) = engine_with_commits(&commits).await;
+        let range = CommitRange::builder_for(table_root, 0)
+            .with_commit_range_validation(false)
+            .with_fail_on_data_loss(fail_on_data_loss)
+            .fold_with(end_version, CommitRangeBuilder::with_end_version)
+            .build(engine.as_ref())
+            .unwrap();
+        if let Some(end_version) = end_version {
+            assert_eq!(range.end_version(), end_version);
+        }
+
+        let mut iter = range.commit_files().unwrap();
+        let mut yielded = Vec::new();
+        let mut first_err = None;
+        for file in iter.by_ref() {
+            match file {
+                Ok(file) => yielded.push(file.version),
+                Err(err) => {
+                    first_err = Some(err);
+                    break;
+                }
+            }
+        }
+        // The iterator is exhausted or fused after its first error.
+        assert!(iter.next().is_none());
+
+        assert_eq!(yielded, expected_versions);
+        match (&first_err, &expected_err) {
+            (None, None) => {}
+            (
+                Some(KernelError::MissingVersion(actual)),
+                Some(KernelError::MissingVersion(expected)),
+            ) => {
+                assert_eq!(actual, expected)
+            }
+            (
+                Some(KernelError::StartVersionNotFound {
+                    requested,
+                    earliest,
+                }),
+                Some(KernelError::StartVersionNotFound {
+                    requested: expected_requested,
+                    earliest: expected_earliest,
+                }),
+            ) => assert_eq!(
+                (requested, earliest),
+                (expected_requested, expected_earliest)
+            ),
+            _ => panic!("expected error {expected_err:?}, got {first_err:?}"),
+        }
     }
 }

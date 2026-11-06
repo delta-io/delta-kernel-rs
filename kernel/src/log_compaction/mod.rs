@@ -32,16 +32,19 @@
 //! ```no_run
 //! # use std::sync::Arc;
 //! # use delta_kernel::{ActionReconciliationIterator, LogCompactionWriter};
-//! # use delta_kernel::{Engine, Snapshot, DeltaResult, Error, FileMeta};
+//! # use delta_kernel::{Engine, Snapshot, KernelResult, KernelError, FileMeta};
 //! # use url::Url;
 //!
 //! // Engine-specific function to write compaction data
-//! fn write_compaction_file(path: &Url, data: ActionReconciliationIterator) -> DeltaResult<FileMeta> {
+//! fn write_compaction_file(
+//!     path: &Url,
+//!     data: ActionReconciliationIterator,
+//! ) -> KernelResult<FileMeta> {
 //!     // In a real implementation, this would write the data to cloud storage
 //!     todo!("Write data batches to storage at path: {}", path)
 //! }
 //!
-//! # fn example(engine: &dyn Engine) -> DeltaResult<()> {
+//! # fn example(engine: &dyn Engine) -> KernelResult<()> {
 //! // Create a snapshot for the table
 //! let table_root = Url::parse("file:///path/to/table")?;
 //! let snapshot = Snapshot::builder_for(table_root).build(engine)?;
@@ -83,11 +86,11 @@ use crate::actions::{
     ADD_FIELD, DOMAIN_METADATA_FIELD, METADATA_FIELD, PROTOCOL_FIELD, REMOVE_FIELD,
     SET_TRANSACTION_FIELD, SIDECAR_FIELD,
 };
-use crate::schema::{lazy_schema_ref, SchemaRef};
+use crate::schema::{SchemaRef, lazy_schema_ref};
 
 mod writer;
 
-pub use writer::{should_compact, LogCompactionWriter};
+pub use writer::{LogCompactionWriter, should_compact};
 
 #[cfg(test)]
 mod tests;

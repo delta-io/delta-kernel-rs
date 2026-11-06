@@ -2,15 +2,16 @@
 ///
 /// Not intended for use by normal code.
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use bytes::Bytes;
 use delta_kernel_derive::internal_api;
 
 use crate::error::add_scalar_path_context;
-use crate::expressions::{Scalar, StructData};
+use crate::expressions::{MapData, Scalar, StructData};
 use crate::schema::{ArrayType, DataType, MapType, StructField, StructType, ToSchema};
 use crate::utils::require;
-use crate::{DeltaResult, Error};
+use crate::{KernelError, KernelResult};
 
 /// Converts a type to a [`DataType`]. Implemented for the primitive types and automatically derived
 /// for all types that implement [`ToSchema`].
@@ -51,6 +52,7 @@ macro_rules! impl_to_data_type {
 
 impl_to_data_type!(
     (String, DataType::STRING),
+    (Arc<String>, DataType::STRING),
     (Bytes, DataType::BINARY),
     (i64, DataType::LONG),
     (i32, DataType::INTEGER),
@@ -132,6 +134,38 @@ impl<K: ToDataType, V: ToDataType> ToNullableContainerType for HashMap<K, V> {
     }
 }
 
+/// Converts a container into a scalar whose type permits null container values.
+///
+/// This supports `IntoStructData` fields annotated with `#[allow_null_container_values]`.
+#[internal_api]
+pub(crate) trait IntoNullableContainerScalar {
+    /// Consumes the container while retaining nullable values in the scalar's data type.
+    fn into_nullable_container_scalar(self) -> Scalar;
+}
+
+impl<K, V> IntoNullableContainerScalar for HashMap<K, V>
+where
+    K: Into<Scalar> + ToDataType,
+    V: Into<Scalar> + ToDataType,
+{
+    fn into_nullable_container_scalar(self) -> Scalar {
+        Scalar::Map(MapData::from_pairs::<K, V>(self, true))
+    }
+}
+
+impl<K, V> IntoNullableContainerScalar for Option<HashMap<K, V>>
+where
+    K: Into<Scalar> + ToDataType,
+    V: Into<Scalar> + ToDataType,
+{
+    fn into_nullable_container_scalar(self) -> Scalar {
+        match self {
+            Some(map) => map.into_nullable_container_scalar(),
+            None => Scalar::Null(MapType::new(K::to_data_type(), V::to_data_type(), true).into()),
+        }
+    }
+}
+
 // The [`delta_kernel_derive::ToSchema`] macro uses this to convert a struct field's name + type
 // into a `StructField` definition for a container with nullable values, when the struct field was
 // annotated with the `allow_null_container_values` attribute.
@@ -165,18 +199,18 @@ pub(crate) struct StructDataFields {
 }
 
 impl StructDataFields {
-    pub(crate) fn try_new(data: StructData, expected: StructType) -> DeltaResult<Self> {
+    pub(crate) fn try_new(data: StructData, expected: StructType) -> KernelResult<Self> {
         let (actual_fields, values) = data.into_parts();
         require!(
             actual_fields.len() == values.len(),
-            Error::scalar_conversion(
+            KernelError::scalar_conversion(
                 format!("{} struct values", actual_fields.len()),
                 format!("{} struct values", values.len()),
             )
         );
         require!(
             actual_fields.len() == expected.num_fields(),
-            Error::scalar_conversion(
+            KernelError::scalar_conversion(
                 format!("struct with {} fields", expected.num_fields()),
                 format!("struct with {} fields", actual_fields.len()),
             )
@@ -190,7 +224,7 @@ impl StructDataFields {
                 }
                 std::collections::hash_map::Entry::Occupied(entry) => {
                     return Err(add_scalar_path_context(
-                        Error::scalar_conversion("one field", "duplicate fields"),
+                        KernelError::scalar_conversion("one field", "duplicate fields"),
                         entry.key().clone(),
                     ));
                 }
@@ -199,25 +233,25 @@ impl StructDataFields {
         Ok(Self { expected, fields })
     }
 
-    pub(crate) fn take_field<T: TryFrom<Scalar, Error = Error>>(
+    pub(crate) fn take_field<T: TryFrom<Scalar, Error = KernelError>>(
         &mut self,
         field_name: &str,
-    ) -> DeltaResult<T> {
+    ) -> KernelResult<T> {
         let expected = self.expected.field(field_name).ok_or_else(|| {
-            Error::InternalError(format!(
+            KernelError::InternalError(format!(
                 "Derived schema does not contain generated field {field_name:?}"
             ))
         })?;
         let (actual_field, value) = self.fields.remove(field_name).ok_or_else(|| {
             add_scalar_path_context(
-                Error::scalar_conversion("present field", "missing field"),
+                KernelError::scalar_conversion("present field", "missing field"),
                 field_name,
             )
         })?;
         require!(
             actual_field.is_nullable() == expected.is_nullable(),
             add_scalar_path_context(
-                Error::scalar_conversion(
+                KernelError::scalar_conversion(
                     if expected.is_nullable() {
                         "nullable field"
                     } else {
@@ -237,15 +271,145 @@ impl StructDataFields {
     }
 
     /// Verifies that every named field was consumed.
-    pub(crate) fn finish(self) -> DeltaResult<()> {
+    pub(crate) fn finish(self) -> KernelResult<()> {
         if self.fields.is_empty() {
             return Ok(());
         }
         let mut extra: Vec<_> = self.fields.keys().collect();
         extra.sort_unstable();
-        Err(Error::scalar_conversion(
+        Err(KernelError::scalar_conversion(
             "no additional fields",
             format!("fields {extra:?}"),
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    // The derive macro reads each field's type, not its value, so the fields look unused.
+    #![allow(dead_code)]
+
+    use std::collections::{HashMap, HashSet};
+
+    use bytes::Bytes;
+    use delta_kernel_derive::ToSchema;
+
+    use crate::schema::{ToSchema, schema};
+
+    #[derive(ToSchema)]
+    struct AllPrimitivesNotNull {
+        string_field: String,
+        binary_field: Bytes,
+        long_field: i64,
+        integer_field: i32,
+        short_field: i16,
+        byte_field: i8,
+        float_field: f32,
+        double_field: f64,
+        boolean_field: bool,
+    }
+
+    #[test]
+    fn to_schema_all_primitives_not_null() {
+        let expected = schema! {
+            not_null "stringField": STRING,
+            not_null "binaryField": BINARY,
+            not_null "longField": LONG,
+            not_null "integerField": INTEGER,
+            not_null "shortField": SHORT,
+            not_null "byteField": BYTE,
+            not_null "floatField": FLOAT,
+            not_null "doubleField": DOUBLE,
+            not_null "booleanField": BOOLEAN,
+        };
+        assert_eq!(AllPrimitivesNotNull::to_schema(), expected);
+    }
+
+    #[derive(ToSchema)]
+    struct AllPrimitivesNullable {
+        string_field: Option<String>,
+        binary_field: Option<Bytes>,
+        long_field: Option<i64>,
+        integer_field: Option<i32>,
+        short_field: Option<i16>,
+        byte_field: Option<i8>,
+        float_field: Option<f32>,
+        double_field: Option<f64>,
+        boolean_field: Option<bool>,
+    }
+
+    #[test]
+    fn to_schema_all_primitives_nullable() {
+        let expected = schema! {
+            nullable "stringField": STRING,
+            nullable "binaryField": BINARY,
+            nullable "longField": LONG,
+            nullable "integerField": INTEGER,
+            nullable "shortField": SHORT,
+            nullable "byteField": BYTE,
+            nullable "floatField": FLOAT,
+            nullable "doubleField": DOUBLE,
+            nullable "booleanField": BOOLEAN,
+        };
+        assert_eq!(AllPrimitivesNullable::to_schema(), expected);
+    }
+
+    #[derive(ToSchema)]
+    struct Containers {
+        list_field: Vec<String>,
+        int_list: Vec<i64>,
+        nullable_element_list: Vec<Option<String>>,
+        optional_list: Option<Vec<String>>,
+        string_set: HashSet<String>,
+        map_field: HashMap<String, String>,
+        nullable_value_map: HashMap<String, Option<String>>,
+        #[allow_null_container_values]
+        null_value_map: HashMap<String, String>,
+        #[allow_null_container_values]
+        optional_null_value_map: Option<HashMap<String, String>>,
+    }
+
+    #[test]
+    fn to_schema_containers() {
+        let expected = schema! {
+            not_null "listField": [not_null STRING],
+            not_null "intList": [not_null LONG],
+            not_null "nullableElementList": [nullable STRING],
+            nullable "optionalList": [not_null STRING],
+            not_null "stringSet": [not_null STRING],
+            not_null "mapField": {STRING => not_null STRING},
+            not_null "nullableValueMap": {STRING => nullable STRING},
+            not_null "nullValueMap": {STRING => nullable STRING},
+            nullable "optionalNullValueMap": {STRING => nullable STRING},
+        };
+        assert_eq!(Containers::to_schema(), expected);
+    }
+
+    #[derive(ToSchema)]
+    struct Inner {
+        inner_field: String,
+    }
+
+    #[derive(ToSchema)]
+    struct Outer {
+        inner: Inner,
+        maybe_inner: Option<Inner>,
+        inner_list: Vec<Inner>,
+    }
+
+    #[test]
+    fn to_schema_nested_structs() {
+        let expected = schema! {
+            not_null "inner": {
+                not_null "innerField": STRING,
+            },
+            nullable "maybeInner": {
+                not_null "innerField": STRING,
+            },
+            not_null "innerList": [not_null {
+                not_null "innerField": STRING,
+            }],
+        };
+        assert_eq!(Outer::to_schema(), expected);
     }
 }

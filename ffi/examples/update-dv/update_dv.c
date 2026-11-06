@@ -99,24 +99,24 @@ int main(int argc, char* argv[]) {
 
   // Owned handles start NULL and are released by the cleanup ladder below. Each FFI call
   // that consumes a handle (e.g. `dv_descriptor_map_insert`, `snapshot_builder_build`,
-  // `transaction_update_deletion_vectors`, `commit`) is paired with an explicit NULL
+  // `update_table_txn_update_deletion_vectors`, `update_table_txn_commit`) is paired with an explicit NULL
   // assignment so the cleanup block does not double-free.
   int rc = 1;
   Error* err = NULL;
   HandleSharedExternEngine engine = NULL;
-  HandleExclusiveTransaction txn = NULL;
+  HandleExclusiveUpdateTableTransaction txn = NULL;
   HandleExclusiveDvDescriptorMap map = NULL;
   HandleExclusiveDvDescriptor descriptor = NULL;
-  HandleMutableFfiSnapshotBuilder snapshot_builder = NULL;
+  HandleExclusiveSnapshotBuilder snapshot_builder = NULL;
   HandleSharedSnapshot snapshot = NULL;
   HandleSharedScan scan_handle = NULL;
   HandleSharedScanMetadataIterator scan_iter = NULL;
   HandleExclusiveCommittedTransaction committed = NULL;
 
   // === Build engine ===
-  ExternResultEngineBuilder engine_builder_res =
-      get_engine_builder(table_path_slice, allocate_error);
-  if (engine_builder_res.tag != OkEngineBuilder) {
+  ExternResultHandleExclusiveEngineBuilder engine_builder_res =
+      get_engine_builder(table_path_slice, &error_allocators);
+  if (engine_builder_res.tag != OkHandleExclusiveEngineBuilder) {
     err = (Error*)engine_builder_res.err;
     print_error("Could not get engine builder.", err);
     goto cleanup;
@@ -128,27 +128,6 @@ int main(int argc, char* argv[]) {
     goto cleanup;
   }
   engine = engine_res.ok;
-
-  // === Start transaction ===
-  ExternResultHandleExclusiveTransaction txn_res = transaction(table_path_slice, engine);
-  if (txn_res.tag != OkHandleExclusiveTransaction) {
-    err = (Error*)txn_res.err;
-    print_error("Failed to start transaction.", err);
-    goto cleanup;
-  }
-  txn = txn_res.ok;
-
-  const char* engine_info = "update_dv_example";
-  KernelStringSlice engine_info_slice = { engine_info, strlen(engine_info) };
-  ExternResultHandleExclusiveTransaction with_info_res =
-      with_engine_info(txn, engine_info_slice, engine);
-  txn = NULL; // consumed by with_engine_info regardless of result
-  if (with_info_res.tag != OkHandleExclusiveTransaction) {
-    err = (Error*)with_info_res.err;
-    print_error("with_engine_info failed.", err);
-    goto cleanup;
-  }
-  txn = with_info_res.ok;
 
   // === Build descriptor map ===
   map = dv_descriptor_map_new();
@@ -163,17 +142,17 @@ int main(int argc, char* argv[]) {
 
   ExternResultbool insert_res =
       dv_descriptor_map_insert(map, data_file_path_slice, descriptor, engine);
+  descriptor = NULL; // consumed by dv_descriptor_map_insert regardless of result
   if (insert_res.tag != Okbool) {
     err = (Error*)insert_res.err;
     print_error("dv_descriptor_map_insert failed.", err);
     goto cleanup;
   }
-  descriptor = NULL; // consumed by dv_descriptor_map_insert on success
 
   // === Build a fresh scan metadata iterator for the update call ===
-  ExternResultHandleMutableFfiSnapshotBuilder snapshot_builder_res =
+  ExternResultHandleExclusiveSnapshotBuilder snapshot_builder_res =
       get_snapshot_builder(table_path_slice, engine);
-  if (snapshot_builder_res.tag != OkHandleMutableFfiSnapshotBuilder) {
+  if (snapshot_builder_res.tag != OkHandleExclusiveSnapshotBuilder) {
     err = (Error*)snapshot_builder_res.err;
     print_error("Failed to get snapshot builder.", err);
     goto cleanup;
@@ -188,6 +167,28 @@ int main(int argc, char* argv[]) {
     goto cleanup;
   }
   snapshot = snapshot_res.ok;
+
+  // === Configure and build transaction intent ===
+  const char* engine_info = "update_dv_example";
+  KernelStringSlice engine_info_slice = { engine_info, strlen(engine_info) };
+  ExternResultHandleExclusiveUpdateTableTransactionBuilder builder_res =
+      new_update_table_txn_builder(
+          snapshot, KernelUpdateTableOperationUpdate, engine_info_slice,
+          /* data_change */ true, engine);
+  if (builder_res.tag != OkHandleExclusiveUpdateTableTransactionBuilder) {
+    err = (Error*)builder_res.err;
+    print_error("Failed to create transaction builder.", err);
+    goto cleanup;
+  }
+  ExclusiveUpdateTableTransactionBuilder* txn_builder = builder_res.ok;
+  ExternResultHandleExclusiveUpdateTableTransaction txn_res =
+      update_table_txn_builder_build(txn_builder, engine);
+  if (txn_res.tag != OkHandleExclusiveUpdateTableTransaction) {
+    err = (Error*)txn_res.err;
+    print_error("Failed to build transaction.", err);
+    goto cleanup;
+  }
+  txn = txn_res.ok;
 
   ExternResultHandleSharedScan scan_res = scan(snapshot, engine, NULL, NULL);
   if (scan_res.tag != OkHandleSharedScan) {
@@ -207,18 +208,18 @@ int main(int argc, char* argv[]) {
   scan_iter = iter_res.ok;
 
   ExternResultbool update_res =
-      transaction_update_deletion_vectors(txn, map, scan_iter, engine);
-  // map and scan_iter are consumed by transaction_update_deletion_vectors even on error.
+      update_table_txn_update_deletion_vectors(txn, map, scan_iter, engine);
+  // map and scan_iter are consumed by update_table_txn_update_deletion_vectors even on error.
   map = NULL;
   scan_iter = NULL;
   if (update_res.tag != Okbool) {
     err = (Error*)update_res.err;
-    print_error("transaction_update_deletion_vectors failed.", err);
+    print_error("update_table_txn_update_deletion_vectors failed.", err);
     goto cleanup;
   }
 
   // === Commit ===
-  ExternResultHandleExclusiveCommittedTransaction commit_res = commit(txn, engine);
+  ExternResultHandleExclusiveCommittedTransaction commit_res = update_table_txn_commit(txn, engine);
   txn = NULL; // consumed by commit
   if (commit_res.tag != OkHandleExclusiveCommittedTransaction) {
     err = (Error*)commit_res.err;
@@ -239,7 +240,7 @@ cleanup:
   if (snapshot_builder) free_snapshot_builder(snapshot_builder);
   if (descriptor) free_dv_descriptor(descriptor);
   if (map) free_dv_descriptor_map(map);
-  if (txn) free_transaction(txn);
+  if (txn) free_update_table_txn(txn);
   if (engine) free_engine(engine);
   return rc;
 }

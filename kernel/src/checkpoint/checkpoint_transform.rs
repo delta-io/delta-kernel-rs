@@ -16,12 +16,14 @@
 use std::sync::{Arc, LazyLock};
 
 use crate::actions::{ADD_NAME, STATS_PARSED as STATS_PARSED_FIELD};
-use crate::expressions::{col, Expression, ExpressionRef, UnaryExpressionOp};
+use crate::expressions::{
+    Expression, ExpressionRef, MapToStructOptions, UnaryExpressionOp, col, column_name,
+};
 use crate::schema::{DataType, SchemaRef, SchemaStructPatchBuilder, StructField, StructType};
 use crate::struct_patch::ProjectionStructPatchBuilder;
 use crate::table_properties::TableProperties;
 use crate::utils::FoldWithOption as _;
-use crate::{DeltaResult, Error};
+use crate::{KernelError, KernelResult};
 
 pub(crate) const STATS_FIELD: &str = "stats";
 pub(crate) const PARTITION_VALUES_FIELD: &str = "partitionValues";
@@ -50,6 +52,8 @@ impl StatsTransformConfig {
 /// - When `writeStatsAsJson=false`: drop `stats` field
 /// - When `writeStatsAsStruct=true`: `stats_parsed = COALESCE(stats_parsed, ParseJson(stats))`
 /// - When `writeStatsAsStruct=false`: drop `stats_parsed` field
+///
+/// When the parsed input and output schemas differ, rebuilds parsed stats from JSON.
 ///
 /// For partitioned tables when `writeStatsAsStruct=true`, it also populates:
 /// - `partitionValues_parsed = COALESCE(partitionValues_parsed, MAP_TO_STRUCT(partitionValues))`
@@ -84,7 +88,7 @@ pub(crate) fn build_checkpoint_transform(
     read_schema: &StructType,
     stats_schema: &SchemaRef,
     partition_schema: Option<&SchemaRef>,
-) -> DeltaResult<(SchemaRef, ExpressionRef)> {
+) -> KernelResult<(SchemaRef, ExpressionRef)> {
     let mut patch_builder = ProjectionStructPatchBuilder::new(read_schema);
 
     // Handle stats field
@@ -100,12 +104,22 @@ pub(crate) fn build_checkpoint_transform(
 
     // Handle stats_parsed field
     // Note: stats_parsed was added to read schema (via build_checkpoint_read_schema),
-    // so we always need to either replace it (with COALESCE) or drop it.
+    // so we always need to either replace it or drop it.
     if config.write_stats_as_struct {
-        // Populate stats_parsed from JSON stats (for commits that only have JSON stats)
-        let stats_parsed_expr = build_stats_parsed_expr(stats_schema);
-        patch_builder =
-            patch_builder.replace_expr_at([ADD_NAME], STATS_PARSED_FIELD, stats_parsed_expr);
+        let stats_field = StructField::nullable(STATS_PARSED_FIELD, stats_schema.as_ref().clone());
+        let input_field = read_schema.field_at(&column_name!(ADD_NAME, STATS_PARSED_FIELD))?;
+        let stats_parsed_expr = if input_field.data_type() == stats_field.data_type() {
+            build_stats_parsed_expr(stats_schema)
+        } else {
+            // Sampled collation fields are absent from the read projection; full JSON retains them.
+            Expression::parse_json(STATS_JSON_EXPR.as_ref().clone(), stats_schema.clone()).into()
+        };
+        patch_builder = patch_builder.replace_at(
+            [ADD_NAME],
+            STATS_PARSED_FIELD,
+            stats_field,
+            stats_parsed_expr,
+        );
     } else {
         // Drop stats_parsed field when not writing as struct
         patch_builder = patch_builder.drop_at([ADD_NAME], STATS_PARSED_FIELD);
@@ -147,16 +161,16 @@ pub(crate) fn build_checkpoint_read_schema(
     base_schema: &StructType,
     stats_schema: &StructType,
     partition_schema: Option<&StructType>,
-) -> DeltaResult<SchemaRef> {
+) -> KernelResult<SchemaRef> {
     transform_add_schema(base_schema, |add_struct| {
         // Validate fields aren't already present
         if add_struct.field(STATS_PARSED_FIELD).is_some() {
-            return Err(Error::generic(
+            return Err(KernelError::generic(
                 "stats_parsed field already exists in Add schema",
             ));
         }
         if partition_schema.is_some() && add_struct.field(PARTITION_VALUES_PARSED_FIELD).is_some() {
-            return Err(Error::generic(
+            return Err(KernelError::generic(
                 "partitionValues_parsed field already exists in Add schema",
             ));
         }
@@ -207,11 +221,19 @@ fn build_stats_parsed_expr(stats_schema: &SchemaRef) -> ExpressionRef {
 /// JSON null on write) reconstructs into the checkpoint identically to how the scan reconstructs it
 /// from a commit.
 ///
+/// Checkpoint construction has no reader timezone. It preserves a native value read from an earlier
+/// checkpoint; for a JSON commit, the fallback parses the raw string map as UTC. The resulting
+/// native value is written to the checkpoint and read back without a reader-timezone
+/// transformation, while the raw `partitionValues` map remains unchanged.
+///
 /// Column paths are relative to the full batch, not the nested Add struct.
 fn build_partition_values_parsed_expr() -> ExpressionRef {
     Arc::new(Expression::coalesce([
         col!(ADD_NAME, PARTITION_VALUES_PARSED_FIELD),
-        Expression::map_to_struct(col!(ADD_NAME, PARTITION_VALUES_FIELD)),
+        Expression::map_to_struct(
+            col!(ADD_NAME, PARTITION_VALUES_FIELD),
+            MapToStructOptions::default(),
+        ),
     ]))
 }
 
@@ -241,15 +263,15 @@ static STATS_JSON_EXPR: LazyLock<ExpressionRef> = LazyLock::new(|| {
 /// - The `add` field is not a struct type
 fn transform_add_schema(
     base_schema: &StructType,
-    transform_fn: impl FnOnce(&StructType) -> DeltaResult<StructType>,
-) -> DeltaResult<SchemaRef> {
+    transform_fn: impl FnOnce(&StructType) -> KernelResult<StructType>,
+) -> KernelResult<SchemaRef> {
     // Find and validate the add field
     let add_field = base_schema
         .field(ADD_NAME)
-        .ok_or_else(|| Error::generic("Expected 'add' field in checkpoint schema"))?;
+        .ok_or_else(|| KernelError::generic("Expected 'add' field in checkpoint schema"))?;
 
     let DataType::Struct(add_struct) = &add_field.data_type else {
-        return Err(Error::generic(format!(
+        return Err(KernelError::generic(format!(
             "Expected 'add' field to be a struct type, got {:?}",
             add_field.data_type
         )));
@@ -272,7 +294,7 @@ mod tests {
     use super::*;
     use crate::actions::NUM_RECORDS;
     use crate::expressions::ExpressionStructPatch;
-    use crate::schema::{schema, schema_ref, MapType};
+    use crate::schema::{MapType, schema, schema_ref};
 
     #[test]
     fn test_config_defaults() {

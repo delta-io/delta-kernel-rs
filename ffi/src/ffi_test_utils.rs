@@ -6,40 +6,63 @@ use std::ptr::NonNull;
 use std::sync::Arc;
 
 #[cfg(test)]
-use delta_kernel::object_store::memory::InMemory;
+use delta_kernel::{Engine, KernelResult, object_store::memory::InMemory};
 #[cfg(test)]
 use delta_kernel_default_engine::DefaultEngineBuilder;
 #[cfg(test)]
 use test_utils::add_commit;
 
-use crate::error::{EngineError, ExternResult, KernelError};
+use crate::error::allocation::{DeltaErrorInfo, KernelErrorInfo};
+use crate::error::{AllocateError, ErrorAllocators, ExternResult, FFIKernelError};
 #[cfg(test)]
 use crate::{
-    engine_to_handle, get_snapshot_builder, kernel_string_slice, snapshot_builder_build,
-    SharedExternEngine, SharedSnapshot,
+    ExternEngine, SharedExternEngine, SharedSnapshot, engine_to_handle, free_snapshot,
+    get_snapshot_builder, kernel_string_slice, snapshot_builder_build,
+    transaction::{
+        ExclusiveUpdateTableTransaction, KernelUpdateTableOperation, new_update_table_txn_builder,
+        update_table_txn_builder_build,
+    },
 };
-use crate::{KernelStringSlice, NullableCvoid, TryFromStringSlice};
+use crate::{KernelBytesSlice, KernelStringSlice, NullableCvoid, TryFromStringSlice};
 
-// Used to allocate EngineErrors with test information from Rust tests
+// Connector-owned diagnostic storage used by FFI tests.
 #[cfg(test)]
-#[repr(C)]
 pub(crate) struct EngineErrorWithMessage {
-    pub(crate) etype: KernelError,
+    pub(crate) etype: FFIKernelError,
     pub(crate) message: String,
 }
 
-#[no_mangle]
-pub(crate) extern "C" fn allocate_err(
-    etype: KernelError,
-    message: KernelStringSlice,
-) -> *mut EngineError {
-    let message = unsafe { String::try_from_slice(&message).unwrap() };
-    let boxed = Box::new(EngineErrorWithMessage { etype, message });
+pub(crate) const TEST_ERROR_ALLOCATORS: ErrorAllocators = ErrorAllocators {
+    context: std::ptr::null_mut(),
+    allocate_kernel_error: allocate_kernel_err,
+    allocate_delta_error: allocate_delta_err,
+};
 
-    Box::into_raw(boxed) as *mut EngineError
+unsafe extern "C" fn allocate_kernel_err(
+    _: *mut c_void,
+    info: *const KernelErrorInfo,
+) -> *mut c_void {
+    let info = unsafe { &*info };
+    let error = EngineErrorWithMessage {
+        etype: info.code,
+        message: unsafe { info.message.try_to_string().unwrap() },
+    };
+    Box::into_raw(Box::new(error)).cast()
 }
 
-#[no_mangle]
+unsafe extern "C" fn allocate_delta_err(
+    _: *mut c_void,
+    info: *const DeltaErrorInfo,
+) -> *mut c_void {
+    let info = unsafe { &*info };
+    let error = EngineErrorWithMessage {
+        etype: FFIKernelError::UnknownError,
+        message: unsafe { info.message.try_to_string().unwrap() },
+    };
+    Box::into_raw(Box::new(error)).cast()
+}
+
+#[unsafe(no_mangle)]
 pub(crate) extern "C" fn allocate_str(kernel_str: KernelStringSlice) -> NullableCvoid {
     let s = unsafe { String::try_from_slice(&kernel_str) };
     let ptr = Box::into_raw(Box::new(s.unwrap())).cast(); // never null
@@ -47,9 +70,15 @@ pub(crate) extern "C" fn allocate_str(kernel_str: KernelStringSlice) -> Nullable
     Some(ptr)
 }
 
-/// Recover an error from 'allocate_err'
-pub(crate) unsafe fn recover_error(ptr: *mut EngineError) -> EngineErrorWithMessage {
-    *Box::from_raw(ptr as *mut EngineErrorWithMessage)
+#[unsafe(no_mangle)]
+pub(crate) extern "C" fn allocate_bytes(bytes: KernelBytesSlice) -> NullableCvoid {
+    let bytes = unsafe { bytes.try_as_slice() }.unwrap().to_vec();
+    NonNull::new(Box::into_raw(Box::new(bytes)).cast())
+}
+
+/// Takes ownership of an error allocated by [`TEST_ERROR_ALLOCATORS`].
+pub(crate) unsafe fn recover_error(ptr: *mut c_void) -> EngineErrorWithMessage {
+    unsafe { *Box::from_raw(ptr as *mut EngineErrorWithMessage) }
 }
 
 /// Recover a string from `allocate_str`
@@ -58,17 +87,44 @@ pub(crate) fn recover_string(ptr: NonNull<c_void>) -> String {
     *unsafe { Box::from_raw(ptr) }
 }
 
+/// Recover bytes from `allocate_bytes`.
+pub(crate) fn recover_bytes(ptr: NonNull<c_void>) -> Vec<u8> {
+    *unsafe { Box::from_raw(ptr.as_ptr().cast()) }
+}
+
 pub(crate) fn ok_or_panic<T>(result: ExternResult<T>) -> T {
     match result {
         ExternResult::Ok(t) => t,
-        ExternResult::Err(e) => unsafe {
-            let error = recover_error(e);
+        ExternResult::Err(e) => {
+            let error = unsafe { recover_error(e) };
             panic!(
                 "Got engine error with type {:?} message: {}",
                 error.etype, error.message
             );
-        },
+        }
     }
+}
+
+struct ErrorOnlyExternEngine {
+    error_allocators: ErrorAllocators,
+}
+
+impl ExternEngine for ErrorOnlyExternEngine {
+    fn engine(&self) -> Arc<dyn Engine> {
+        panic!("error-only test engine does not expose a kernel engine")
+    }
+
+    fn error_allocator(&self) -> &dyn AllocateError {
+        &self.error_allocators
+    }
+}
+
+/// Return a lightweight engine handle for tests that only exercise FFI error allocation.
+pub(crate) fn error_only_engine_handle() -> crate::handle::Handle<SharedExternEngine> {
+    let engine: Arc<dyn ExternEngine> = Arc::new(ErrorOnlyExternEngine {
+        error_allocators: TEST_ERROR_ALLOCATORS,
+    });
+    engine.into()
 }
 
 /// Build a latest-version snapshot via the FFI builder API. Panics on error.
@@ -77,8 +133,35 @@ pub(crate) unsafe fn build_snapshot(
     path: KernelStringSlice,
     engine: crate::handle::Handle<SharedExternEngine>,
 ) -> crate::handle::Handle<SharedSnapshot> {
-    let builder = ok_or_panic(get_snapshot_builder(path, engine));
-    ok_or_panic(snapshot_builder_build(builder))
+    let builder = ok_or_panic(unsafe { get_snapshot_builder(path, engine) });
+    ok_or_panic(unsafe { snapshot_builder_build(builder) })
+}
+
+/// Build a `WRITE` transaction through the FFI snapshot and transaction-builder APIs.
+///
+/// Returns an error if the transaction cannot be built. Panics if the snapshot cannot be loaded.
+///
+/// # Safety
+///
+/// `path` and `engine` must be valid. This call borrows both inputs. The caller retains ownership.
+#[cfg(test)]
+pub(crate) unsafe fn build_update_table_txn(
+    path: KernelStringSlice,
+    engine: crate::handle::Handle<SharedExternEngine>,
+) -> ExternResult<crate::handle::Handle<ExclusiveUpdateTableTransaction>> {
+    let snapshot = unsafe { build_snapshot(path, engine.shallow_copy()) };
+    let engine_info = "test-engine/1.0";
+    let builder = ok_or_panic(unsafe {
+        new_update_table_txn_builder(
+            snapshot.shallow_copy(),
+            KernelUpdateTableOperation::Write,
+            kernel_string_slice!(engine_info),
+            true,
+            engine.shallow_copy(),
+        )
+    });
+    unsafe { free_snapshot(snapshot) };
+    unsafe { update_table_txn_builder_build(builder, engine) }
 }
 
 /// Wrap an already-seeded object store in an engine handle. Caller must free it.
@@ -90,7 +173,7 @@ pub(crate) fn engine_handle_for_store(
     store: Arc<delta_kernel::object_store::DynObjectStore>,
 ) -> crate::handle::Handle<SharedExternEngine> {
     let engine = DefaultEngineBuilder::new(store).build();
-    engine_to_handle(Arc::new(engine), allocate_err)
+    engine_to_handle(Arc::new(engine), TEST_ERROR_ALLOCATORS)
 }
 
 /// Create an in-memory engine and snapshot from the given commit data. Returns
@@ -98,18 +181,15 @@ pub(crate) fn engine_handle_for_store(
 #[cfg(test)]
 pub(crate) async fn setup_snapshot(
     commit_data: String,
-) -> Result<
-    (
-        crate::handle::Handle<crate::SharedExternEngine>,
-        crate::handle::Handle<crate::SharedSnapshot>,
-    ),
-    Box<dyn std::error::Error>,
-> {
+) -> KernelResult<(
+    crate::handle::Handle<crate::SharedExternEngine>,
+    crate::handle::Handle<crate::SharedSnapshot>,
+)> {
     let table_root = "memory:///";
     let storage = Arc::new(InMemory::new());
     add_commit(table_root, storage.as_ref(), 0, commit_data).await?;
     let engine = DefaultEngineBuilder::new(storage.clone()).build();
-    let engine = engine_to_handle(Arc::new(engine), allocate_err);
+    let engine = engine_to_handle(Arc::new(engine), TEST_ERROR_ALLOCATORS);
     let snap = unsafe { build_snapshot(kernel_string_slice!(table_root), engine.shallow_copy()) };
     Ok((engine, snap))
 }
@@ -117,18 +197,41 @@ pub(crate) async fn setup_snapshot(
 /// Check error type and message while also recovering the error to prevent leaks
 pub(crate) fn assert_extern_result_error_with_message<T>(
     res: ExternResult<T>,
-    expected_etype: KernelError,
+    expected_etype: FFIKernelError,
     opt_message: Option<&str>,
 ) {
+    let error = expect_extern_result_error(res, expected_etype);
+    if let Some(expected_message) = opt_message {
+        assert_eq!(error.message, expected_message);
+    }
+}
+
+/// Check the error type and a stable message substring while recovering the error to prevent
+/// leaks.
+pub(crate) fn assert_extern_result_error_contains<T>(
+    res: ExternResult<T>,
+    expected_etype: FFIKernelError,
+    expected_message: &str,
+) {
+    let error = expect_extern_result_error(res, expected_etype);
+    assert!(
+        error.message.contains(expected_message),
+        "expected error message to contain '{expected_message}', got '{}'",
+        error.message
+    );
+}
+
+fn expect_extern_result_error<T>(
+    res: ExternResult<T>,
+    expected_etype: FFIKernelError,
+) -> EngineErrorWithMessage {
     match res {
         ExternResult::Err(e) => {
             let error = unsafe { recover_error(e) };
             assert_eq!(error.etype, expected_etype);
-            if let Some(expected_message) = opt_message {
-                assert_eq!(error.message, expected_message);
-            }
+            error
         }
-        _ => panic!("Expected error of type '{expected_etype:?}' and message '{opt_message:?}'"),
+        _ => panic!("Expected error of type '{expected_etype:?}'"),
     }
 }
 
@@ -156,13 +259,9 @@ mod tests {
     fn test_ok_or_panic_with_error() {
         // Create a test error
         let message = "Test error message";
-        let error_ptr = allocate_err(
-            KernelError::GenericError,
-            KernelStringSlice {
-                ptr: message.as_ptr() as *const i8,
-                len: message.len(),
-            },
-        );
+        let error_ptr = unsafe {
+            TEST_ERROR_ALLOCATORS.allocate_kernel_error(delta_kernel::KernelError::generic(message))
+        };
         let result = ExternResult::<i32>::Err(error_ptr);
 
         // Test that ok_or_panic panics with the expected message

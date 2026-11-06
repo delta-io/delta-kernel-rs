@@ -52,7 +52,7 @@ To begin a write, create a transaction with your catalog's `Committer`, add file
 call `commit()`:
 
 ```rust,ignore
-// transaction() moves the Box<dyn Committer> into the Transaction, and commit()
+// build() moves the Box<dyn Committer> into the Transaction, and commit()
 // consumes the Transaction, so the boxed committer is gone by the time you need
 // to publish. Construct a second committer for publish() in Phase 3 and clone
 // any catalog-client state you need to keep in scope across both calls.
@@ -61,14 +61,20 @@ let committer = Box::new(MyCatalogCommitter::new(
     table_id.clone(),
 ));
 let mut txn = snapshot
-    .transaction(committer, &engine)?
-    .with_operation("INSERT".to_string());
+    .update_table(
+        UpdateTableOperation::Custom("INSERT".to_string()),
+        "my-app/1.0",
+        /* data_change */ true,
+    )
+    .build(&engine, committer)?;
 
 // Drive your Parquet writer from the write context, then hand the resulting
 // add-file metadata batch to the transaction. See the
 // [Appending data](../writing/append.md) how-to for the full Parquet-writing flow.
+// This example writes to an unpartitioned table. For a partitioned table, call
+// with_partition_values(...) before build().
 let write_state = txn.write_state()?;
-let write_context = write_state.unpartitioned_write_context()?;
+let write_context = write_state.write_context_builder().build()?;
 // ... use write_context to produce add_metadata: Box<dyn EngineData>
 //     matching txn.add_files_schema() ...
 txn.add_files(add_metadata);
@@ -107,7 +113,7 @@ snapshot** that reflects the newly committed state:
 use delta_kernel::transaction::CommitResult;
 
 match commit_result {
-    CommitResult::CommittedTransaction(committed) => {
+    CommitResult::Committed(committed) => {
         let version = committed.commit_version();
         // post_commit_snapshot() returns an Option. For catalog-managed
         // commits today, Kernel returns Some. The Option exists for
@@ -116,7 +122,7 @@ match commit_result {
         // problem surfaces loudly if the invariant ever changes.
         let post_commit = committed
             .post_commit_snapshot()
-            .ok_or_else(|| Error::generic("missing post-commit snapshot"))?;
+            .ok_or_else(|| KernelError::generic("missing post-commit snapshot"))?;
 
         // commit() consumed the Box<dyn Committer> from Phase 2. publish() only
         // needs &dyn Committer, so construct a fresh instance here. This moves
@@ -128,15 +134,15 @@ match commit_result {
         // Proceed to publish (Phase 4).
         let published_snapshot = post_commit.publish(&engine, &publish_committer)?;
     }
-    CommitResult::ConflictedTransaction(conflicted) => {
+    CommitResult::Conflicted(conflicted) => {
         // Another writer already committed at this version.
         // `conflicted.conflict_version()` returns the version this transaction
         // attempted. Rebase onto the new table state and retry.
     }
-    CommitResult::RetryableTransaction(retryable) => {
+    CommitResult::Retryable(retryable) => {
         // Transient I/O error. `retryable.error` gives the underlying cause;
         // `retryable.transaction` is the original transaction you can retry
-        // without rebasing. Kernel reaches this arm only for `Error::IOError`
+        // without rebasing. Kernel reaches this arm only for `KernelError::IOError`
         // variants; return other error kinds as-is rather than disguising
         // them as IOError to force retry.
     }

@@ -5,12 +5,12 @@ use clap::Parser;
 use common::{LocationArgs, ParseWithExamples};
 use delta_kernel::arrow::array::RecordBatch;
 use delta_kernel::engine::arrow_data::EngineDataArrowExt;
-use delta_kernel::parquet::arrow::async_writer::AsyncFileWriter;
 use delta_kernel::parquet::arrow::AsyncArrowWriter;
+use delta_kernel::parquet::arrow::async_writer::AsyncFileWriter;
 use delta_kernel::parquet::errors::Result as ParquetResult;
-use delta_kernel::{ActionReconciliationIterator, DeltaResult, Error, Snapshot};
-use delta_kernel_default_engine::executor::tokio::TokioMultiThreadExecutor;
+use delta_kernel::{ActionReconciliationIterator, KernelError, KernelResult, Snapshot};
 use delta_kernel_default_engine::DefaultEngineBuilder;
+use delta_kernel_default_engine::executor::tokio::TokioMultiThreadExecutor;
 use futures::future::{BoxFuture, FutureExt};
 
 /// An example program that checkpoints a table.
@@ -48,7 +48,7 @@ async fn write_data<W: AsyncFileWriter>(
     first_batch: &RecordBatch,
     batch_iter: &mut ActionReconciliationIterator,
     parquet_writer: &mut AsyncArrowWriter<W>,
-) -> DeltaResult<()> {
+) -> KernelResult<()> {
     parquet_writer.write(first_batch).await?;
     for data_res in batch_iter {
         let data = data_res?.apply_selection_vector()?;
@@ -58,7 +58,7 @@ async fn write_data<W: AsyncFileWriter>(
     Ok(())
 }
 
-async fn try_main() -> DeltaResult<()> {
+async fn try_main() -> KernelResult<()> {
     let cli = Cli::parse_with_examples(env!("CARGO_PKG_NAME"), "Write", "write", "");
 
     let url = delta_kernel::try_parse_uri(&cli.location_args.path)?;
@@ -90,7 +90,7 @@ async fn try_main() -> DeltaResult<()> {
         // we'll use the first batch to determine the schema
         let first = batch_iter.next();
         let Some(first) = first else {
-            return Err(Error::generic("No batches in checkpoint data"));
+            return Err(KernelError::generic("No batches in checkpoint data"));
         };
         // Note that with `FilteredEngineData` it's important to `apply_selection_vector` to remove
         // any filtered out rows. It's also possible to use `into_parts` to get the

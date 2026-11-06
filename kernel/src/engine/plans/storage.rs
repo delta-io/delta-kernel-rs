@@ -3,68 +3,61 @@
 use std::sync::Arc;
 
 use bytes::Bytes;
+use derive_more::Constructor;
 use itertools::Itertools as _;
 use url::Url;
 
 use crate::plans::{IoOperation, Operation, PlanExecutor, PlanResult};
-use crate::{DeltaResult, Error, FileMeta, FileSlice, StorageHandler};
+use crate::{FileMeta, FileSlice, KernelError, KernelResult, KernelResultIterator, StorageHandler};
 
 /// A [`StorageHandler`] that delegates to a [`PlanExecutor`].
+#[derive(Constructor)]
 pub struct PlanBasedStorageHandler {
     executor: Arc<dyn PlanExecutor>,
 }
 
 impl PlanBasedStorageHandler {
-    pub fn new(executor: Arc<dyn PlanExecutor>) -> Self {
-        Self { executor }
-    }
-
-    fn execute_io(&self, op: IoOperation) -> DeltaResult<PlanResult> {
+    fn execute_io(&self, op: IoOperation) -> KernelResult<PlanResult> {
         self.executor.execute_op(Operation::IoOperation(op))
     }
 }
 
 impl StorageHandler for PlanBasedStorageHandler {
-    fn list_from(
-        &self,
-        path: &Url,
-    ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<FileMeta>>>> {
-        Ok(self
-            .execute_io(IoOperation::file_listing(path.clone()))?
-            .into_file_meta()?)
+    fn list_from(&self, path: &Url) -> KernelResult<Box<dyn KernelResultIterator<FileMeta>>> {
+        self.execute_io(IoOperation::file_listing(path.clone()))?
+            .into_file_meta()
     }
 
     fn read_files(
         &self,
         files: Vec<FileSlice>,
-    ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<Bytes>>>> {
-        Ok(self
-            .execute_io(IoOperation::read_bytes(files))?
-            .into_bytes()?)
+    ) -> KernelResult<Box<dyn KernelResultIterator<Bytes>>> {
+        self.execute_io(IoOperation::read_bytes(files))?
+            .into_bytes()
     }
 
-    fn copy_atomic(&self, src: &Url, dest: &Url) -> DeltaResult<()> {
+    fn copy_atomic(&self, src: &Url, dest: &Url) -> KernelResult<()> {
         self.execute_io(IoOperation::atomic_copy(src.clone(), dest.clone()))?
             .into_unit()
     }
 
-    fn put(&self, path: &Url, data: Bytes, overwrite: bool) -> DeltaResult<()> {
+    fn put(&self, path: &Url, data: Bytes, overwrite: bool) -> KernelResult<()> {
         self.execute_io(IoOperation::write_bytes(path.clone(), data, overwrite))?
             .into_unit()
     }
 
-    fn head(&self, path: &Url) -> DeltaResult<FileMeta> {
+    fn head(&self, path: &Url) -> KernelResult<FileMeta> {
         self.execute_io(IoOperation::head_file(path.clone()))?
             .into_file_meta()?
             .exactly_one()
-            .map_err(|e| Error::generic(format!("Expected exactly one file meta: {e}")))?
+            .map_err(|e| KernelError::generic(format!("Expected exactly one file meta: {e}")))?
     }
 
-    fn delete(&self, _path: &Url) -> DeltaResult<()> {
+    fn delete(&self, _path: &Url) -> KernelResult<()> {
         // TODO(#2820): implement here once supported as IoOperation.
         // Intentionally do not use a fallback because we expect this SHOULD be implemented via
         // plan-execution.
-        Err(Error::unsupported(
+        Err(KernelError::unsupported(
             "PlanBasedStorageHandler does not yet implement delete",
         ))
     }
@@ -84,7 +77,7 @@ mod tests {
 
     use super::PlanBasedStorageHandler;
     use crate::engine::sync::plan::SyncPlanExecutor;
-    use crate::{Error, StorageHandler as _};
+    use crate::{KernelError, StorageHandler as _};
 
     fn make_handler() -> PlanBasedStorageHandler {
         PlanBasedStorageHandler::new(Arc::new(SyncPlanExecutor::default()))
@@ -147,7 +140,7 @@ mod tests {
         let err = storage
             .put(&url, bytes::Bytes::from_static(b"second"), false)
             .unwrap_err();
-        assert!(matches!(err, Error::FileAlreadyExists(_)));
+        assert!(matches!(err, KernelError::FileAlreadyExists(_)));
 
         // With `overwrite = true`, the second write succeeds.
         storage
@@ -169,6 +162,6 @@ mod tests {
         // Errors on missing file
         let url = Url::from_file_path(tmp.path().join("missing.json")).unwrap();
         let err = make_handler().head(&url).unwrap_err();
-        assert!(matches!(err, Error::FileNotFound(_)));
+        assert!(matches!(err, KernelError::FileNotFound(_)));
     }
 }

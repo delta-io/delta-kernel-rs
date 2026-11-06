@@ -13,11 +13,11 @@ use super::log_replay::TableChangesScanMetadata;
 use crate::actions::deletion_vector::DeletionVectorDescriptor;
 use crate::actions::visitors::visit_deletion_vector_at;
 use crate::engine_data::{GetData, TypedGetData};
-use crate::expressions::{col, lit, Expression};
+use crate::expressions::{Expression, col, lit};
 use crate::scan::state::DvInfo;
-use crate::schema::{lazy_schema_ref, ColumnName, ColumnNamesAndTypes, DataType, SchemaRef};
+use crate::schema::{ColumnName, ColumnNamesAndTypes, DataType, SchemaRef, lazy_schema_ref};
 use crate::utils::require;
-use crate::{DeltaResult, Error, RowVisitor};
+use crate::{KernelError, KernelResult, KernelResultIterator, RowVisitor};
 
 // The type of action associated with a [`CdfScanFile`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -131,19 +131,19 @@ pub(crate) struct TableChangesFileAction {
 
 impl TableChangesFileAction {
     /// Converts a scan file, preserving both sides of a same-commit deletion-vector update.
-    pub(crate) fn try_from_scan_file(scan_file: CdfScanFile) -> DeltaResult<Self> {
+    pub(crate) fn try_from_scan_file(scan_file: CdfScanFile) -> KernelResult<Self> {
         match scan_file.scan_type {
             CdfScanFileType::Add => {
                 require!(
                     scan_file.base_row_id.is_some(),
-                    Error::missing_data(format!(
+                    KernelError::missing_data(format!(
                         "baseRowId for row-tracking add action at path {} in version {}",
                         scan_file.path, scan_file.commit_version
                     ))
                 );
                 require!(
                     scan_file.default_row_commit_version.is_some(),
-                    Error::missing_data(format!(
+                    KernelError::missing_data(format!(
                         "defaultRowCommitVersion for row-tracking add action at path {} in \
                          version {}",
                         scan_file.path, scan_file.commit_version
@@ -167,7 +167,7 @@ impl TableChangesFileAction {
                     scan_file.dv_info.deletion_vector.clone(),
                 )),
             }),
-            CdfScanFileType::Cdc => Err(Error::internal_error(format!(
+            CdfScanFileType::Cdc => Err(KernelError::internal_error(format!(
                 "Row-tracking change feed listing unexpectedly produced a cdc scan file: \
                  path={}, version={}",
                 scan_file.path, scan_file.commit_version
@@ -197,10 +197,10 @@ impl TableChangesScanFile {
 /// Transforms an iterator of [`TableChangesScanMetadata`] into an iterator of
 /// [`CdfScanFile`] by visiting the engine data.
 pub(crate) fn scan_metadata_to_scan_file(
-    scan_metadata: impl Iterator<Item = DeltaResult<TableChangesScanMetadata>>,
-) -> impl Iterator<Item = DeltaResult<CdfScanFile>> {
+    scan_metadata: impl KernelResultIterator<TableChangesScanMetadata>,
+) -> impl KernelResultIterator<CdfScanFile> {
     scan_metadata
-        .map(|scan_metadata| -> DeltaResult<_> {
+        .map(|scan_metadata| -> KernelResult<_> {
             let scan_metadata = scan_metadata?;
             let callback: CdfScanCallback<Vec<CdfScanFile>> =
                 |context, scan_file| context.push(scan_file);
@@ -240,7 +240,7 @@ pub(crate) fn visit_cdf_scan_files<T>(
     scan_metadata: &TableChangesScanMetadata,
     context: T,
     callback: CdfScanCallback<T>,
-) -> DeltaResult<T> {
+) -> KernelResult<T> {
     let mut visitor = CdfScanFileVisitor {
         callback,
         context,
@@ -310,7 +310,7 @@ fn read_file_side<'a>(
     row_index: usize,
     getters: &[&'a dyn GetData<'a>],
     spec: &FileSideSpec,
-) -> DeltaResult<Option<FileSide>> {
+) -> KernelResult<Option<FileSide>> {
     let Some(path) = getters[spec.start_index].get_opt(row_index, spec.path_field)? else {
         return Ok(None);
     };
@@ -336,10 +336,10 @@ fn read_file_side<'a>(
 }
 
 impl<T> RowVisitor for CdfScanFileVisitor<'_, T> {
-    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
+    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> KernelResult<()> {
         require!(
             getters.len() == CDF_SCAN_FILE_GETTER_COUNT,
-            Error::InternalError(format!(
+            KernelError::InternalError(format!(
                 "Wrong number of CdfScanFileVisitor getters: {}",
                 getters.len()
             ))
@@ -486,25 +486,25 @@ mod tests {
     use itertools::Itertools;
     use rstest::rstest;
 
-    use super::{scan_metadata_to_scan_file, CdfScanFile, CdfScanFileType, TableChangesFileAction};
+    use super::{CdfScanFile, CdfScanFileType, TableChangesFileAction, scan_metadata_to_scan_file};
+    use crate::Engine as _;
     use crate::actions::deletion_vector::{DeletionVectorDescriptor, DeletionVectorStorageType};
     use crate::actions::{Add, Cdc, Remove};
     use crate::engine::sync::SyncEngine;
     use crate::log_segment::LogSegment;
     use crate::scan::state::DvInfo;
     use crate::schema::schema_ref;
+    use crate::table_changes::CdfMode;
     use crate::table_changes::log_replay::{
         table_changes_action_iter, table_changes_action_iter_with_mode,
     };
     use crate::table_changes::test_utils::{row_tracking_table_config, test_deletion_vector};
-    use crate::table_changes::CdfMode;
     use crate::table_features::ColumnMappingMode;
     use crate::table_properties::ENABLE_CHANGE_DATA_FEED;
     use crate::unit_test_utils::{
-        assert_result_error_with_message, Action, LocalMockTable, MockProtocolBuilder,
-        MockTableConfigurationBuilder,
+        Action, LocalMockTable, MockProtocolBuilder, MockTableConfigurationBuilder,
+        assert_result_error_with_message,
     };
-    use crate::Engine as _;
 
     fn row_tracking_add(
         path: &str,
@@ -784,9 +784,11 @@ mod tests {
 
         // The cdc action in commit 1 is ignored: only add/remove-derived files appear. The
         // metadata-only add (`data_change == false`) in commit 3 is also excluded.
-        assert!(scan_files
-            .iter()
-            .all(|f| f.scan_type != CdfScanFileType::Cdc));
+        assert!(
+            scan_files
+                .iter()
+                .all(|f| f.scan_type != CdfScanFileType::Cdc)
+        );
         assert!(
             !scan_files.iter().any(|f| f.path == "path_6"),
             "metadata-only add (data_change=false) must be excluded"

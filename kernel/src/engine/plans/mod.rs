@@ -103,10 +103,10 @@ mod tests {
     use crate::arrow::array::{Array, Int64Array, RecordBatch, StringArray};
     use crate::engine::arrow_data::ArrowEngineData;
     use crate::engine::arrow_expression::ArrowEvaluationHandler;
-    use crate::engine::sync::plan::SyncPlanExecutor;
     use crate::engine::sync::SyncEngine;
+    use crate::engine::sync::plan::SyncPlanExecutor;
     use crate::engine_data::FilteredEngineData;
-    use crate::{Engine as _, EngineData, Error};
+    use crate::{Engine as _, EngineData, KernelError};
 
     fn plan_engine(fallback: Option<Arc<dyn crate::Engine>>) -> PlanBasedEngine {
         PlanBasedEngine::new(fallback, Arc::new(SyncPlanExecutor::default()))
@@ -128,11 +128,13 @@ mod tests {
     fn uses_arrow_evaluation_handler_without_fallback() {
         let engine = plan_engine(None);
 
-        assert!(engine
-            .evaluation_handler()
-            .as_ref()
-            .any_ref()
-            .is::<ArrowEvaluationHandler>());
+        assert!(
+            engine
+                .evaluation_handler()
+                .as_ref()
+                .any_ref()
+                .is::<ArrowEvaluationHandler>()
+        );
     }
 
     #[test]
@@ -194,12 +196,12 @@ mod tests {
             .json_handler()
             .write_json_file(&location, Box::new(std::iter::empty()), false)
             .expect_err("no fallback is configured");
-        assert!(matches!(json_err, Error::Unsupported(_)));
+        assert!(matches!(json_err, KernelError::Unsupported(_)));
 
         let parquet_err = engine
             .parquet_handler()
             .write_parquet_file(location, Box::new(std::iter::empty()))
             .expect_err("no fallback is configured");
-        assert!(matches!(parquet_err, Error::Unsupported(_)));
+        assert!(matches!(parquet_err, KernelError::Unsupported(_)));
     }
 }

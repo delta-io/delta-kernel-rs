@@ -14,7 +14,7 @@
 use std::collections::HashMap;
 
 use crate::table_changes::scan_file::{TableChangesFileAction, TableChangesScanFile};
-use crate::{DeltaResult, Error};
+use crate::{KernelError, KernelResult};
 
 /// One flattened side of a per-commit [`TableChangesFileAction`], tagged with which side it is so a
 /// path's boundaries can be ordered. `is_add` sorts a remove before an add at the same commit.
@@ -51,7 +51,7 @@ struct Side {
 /// a deterministic listing, since the intermediate path map has no defined iteration order.
 pub(super) fn collapse_net_changes(
     actions: Vec<TableChangesFileAction>,
-) -> DeltaResult<Vec<TableChangesFileAction>> {
+) -> KernelResult<Vec<TableChangesFileAction>> {
     let mut by_path: HashMap<String, Vec<Side>> = HashMap::new();
     for action in actions {
         if let Some(add) = action.add {
@@ -74,7 +74,7 @@ pub(super) fn collapse_net_changes(
         let (Some(earliest), Some(latest)) =
             (sides.iter().min_by_key(key), sides.iter().max_by_key(key))
         else {
-            return Err(Error::internal_error(format!(
+            return Err(KernelError::internal_error(format!(
                 "net-changes collapse produced an empty side slot for path {path}"
             )));
         };

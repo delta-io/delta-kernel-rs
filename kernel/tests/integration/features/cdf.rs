@@ -1,4 +1,3 @@
-use std::error;
 use std::sync::Arc;
 
 use delta_kernel::arrow::array::RecordBatch;
@@ -6,10 +5,10 @@ use delta_kernel::arrow::datatypes::Schema as ArrowSchema;
 use delta_kernel::arrow::util::pretty::pretty_format_batches;
 use delta_kernel::engine::arrow_conversion::TryFromKernel as _;
 use delta_kernel::engine::arrow_data::EngineDataArrowExt as _;
-use delta_kernel::expressions::{col, lit, Predicate as Pred};
+use delta_kernel::expressions::{Predicate as Pred, expr};
 use delta_kernel::schema::schema_ref;
 use delta_kernel::table_changes::TableChanges;
-use delta_kernel::{DeltaResult, Error, PredicateRef, Version};
+use delta_kernel::{KernelError, KernelResult, PredicateRef, Version};
 use itertools::Itertools;
 use test_utils::{
     add_commit, create_default_engine, create_default_engine_with_batch, create_table,
@@ -22,7 +21,7 @@ fn read_cdf_for_table(
     start_version: Version,
     end_version: impl Into<Option<Version>>,
     predicate: impl Into<Option<PredicateRef>>,
-) -> DeltaResult<Vec<RecordBatch>> {
+) -> KernelResult<Vec<RecordBatch>> {
     read_cdf_for_table_with_batch_size(test_name, start_version, end_version, predicate, None)
 }
 
@@ -32,7 +31,7 @@ fn read_cdf_for_table_with_batch_size(
     end_version: impl Into<Option<Version>>,
     predicate: impl Into<Option<PredicateRef>>,
     batch_size: Option<usize>,
-) -> DeltaResult<Vec<RecordBatch>> {
+) -> KernelResult<Vec<RecordBatch>> {
     let test_dir = load_test_data("tests/data", test_name.as_ref()).unwrap();
     let test_path = test_dir.path().join(test_name.as_ref());
     let test_path = delta_kernel::try_parse_uri(test_path.to_str().expect("table path to string"))?;
@@ -62,7 +61,7 @@ fn read_cdf_for_table_with_batch_size(
         ArrowSchema::try_from_kernel(scan.logical_schema().as_ref()).unwrap();
     let batches: Vec<RecordBatch> = scan
         .execute(engine)?
-        .map(|data| -> DeltaResult<_> {
+        .map(|data| -> KernelResult<_> {
             let record_batch = data?.try_into_record_batch()?;
             // Verify that the arrow record batches match the expected schema
             assert_eq!(record_batch.schema().as_ref(), &scan_schema_as_arrow);
@@ -73,7 +72,7 @@ fn read_cdf_for_table_with_batch_size(
 }
 
 #[test]
-fn cdf_with_deletion_vector() -> Result<(), Box<dyn error::Error>> {
+fn cdf_with_deletion_vector() -> KernelResult<()> {
     let batches = read_cdf_for_table("cdf-table-with-dv", 0, None, None)?;
     // Each commit performs the following:
     // 0. Insert  0..=9
@@ -119,7 +118,7 @@ fn cdf_with_deletion_vector() -> Result<(), Box<dyn error::Error>> {
 }
 
 #[test]
-fn cdf_with_deletion_vector_is_batch_size_invariant() -> Result<(), Box<dyn error::Error>> {
+fn cdf_with_deletion_vector_is_batch_size_invariant() -> KernelResult<()> {
     let expected = read_cdf_for_table("cdf-table-with-dv", 0, None, None)?;
     for batch_size in [1usize, 2, 3, 4, 7] {
         let actual = read_cdf_for_table_with_batch_size(
@@ -144,7 +143,7 @@ fn cdf_with_deletion_vector_is_batch_size_invariant() -> Result<(), Box<dyn erro
 }
 
 #[test]
-fn basic_cdf() -> Result<(), Box<dyn error::Error>> {
+fn basic_cdf() -> KernelResult<()> {
     let batches = read_cdf_for_table("cdf-table", 0, None, None)?;
     let mut expected = vec![
         "+----+--------+------------+------------------+-----------------+",
@@ -181,38 +180,38 @@ fn basic_cdf() -> Result<(), Box<dyn error::Error>> {
 }
 
 #[test]
-fn cdf_non_partitioned() -> Result<(), Box<dyn error::Error>> {
+fn cdf_non_partitioned() -> KernelResult<()> {
     let batches = read_cdf_for_table("cdf-table-non-partitioned", 0, None, None)?;
     let mut expected = vec![
-             "+----+--------+------------+-------------------+---------------+--------------+----------------+------------------+-----------------+",
-             "| id | name   | birthday   | long_field        | boolean_field | double_field | smallint_field | _change_type     | _commit_version |",
-             "+----+--------+------------+-------------------+---------------+--------------+----------------+------------------+-----------------+",
-             "| 1  | Steve  | 2024-04-14 | 1                 | true          | 3.14         | 1              | insert           | 0               |",
-             "| 2  | Bob    | 2024-04-15 | 1                 | true          | 3.14         | 1              | insert           | 0               |",
-             "| 3  | Dave   | 2024-04-15 | 2                 | true          | 3.14         | 1              | insert           | 0               |",
-             "| 4  | Kate   | 2024-04-15 | 3                 | true          | 3.14         | 1              | insert           | 0               |",
-             "| 5  | Emily  | 2024-04-16 | 4                 | true          | 3.14         | 1              | insert           | 0               |",
-             "| 6  | Carl   | 2024-04-16 | 5                 | true          | 3.14         | 1              | insert           | 0               |",
-             "| 7  | Dennis | 2024-04-16 | 6                 | true          | 3.14         | 1              | insert           | 0               |",
-             "| 8  | Claire | 2024-04-17 | 7                 | true          | 3.14         | 1              | insert           | 0               |",
-             "| 9  | Ada    | 2024-04-17 | 8                 | true          | 3.14         | 1              | insert           | 0               |",
-             "| 10 | Borb   | 2024-04-17 | 99999999999999999 | true          | 3.14         | 1              | insert           | 0               |",
-             "| 3  | Dave   | 2024-04-15 | 2                 | true          | 3.14         | 1              | update_preimage  | 1               |",
-             "| 3  | Dave   | 2024-04-14 | 2                 | true          | 3.14         | 1              | update_postimage | 1               |",
-             "| 4  | Kate   | 2024-04-15 | 3                 | true          | 3.14         | 1              | update_preimage  | 1               |",
-             "| 4  | Kate   | 2024-04-14 | 3                 | true          | 3.14         | 1              | update_postimage | 1               |",
-             "| 2  | Bob    | 2024-04-15 | 1                 | true          | 3.14         | 1              | update_preimage  | 1               |",
-             "| 2  | Bob    | 2024-04-14 | 1                 | true          | 3.14         | 1              | update_postimage | 1               |",
-             "| 7  | Dennis | 2024-04-16 | 6                 | true          | 3.14         | 1              | update_preimage  | 2               |",
-             "| 7  | Dennis | 2024-04-14 | 6                 | true          | 3.14         | 1              | update_postimage | 2               |",
-             "| 5  | Emily  | 2024-04-16 | 4                 | true          | 3.14         | 1              | update_preimage  | 2               |",
-             "| 5  | Emily  | 2024-04-14 | 4                 | true          | 3.14         | 1              | update_postimage | 2               |",
-             "| 6  | Carl   | 2024-04-16 | 5                 | true          | 3.14         | 1              | update_preimage  | 2               |",
-             "| 6  | Carl   | 2024-04-14 | 5                 | true          | 3.14         | 1              | update_postimage | 2               |",
-             "| 7  | Dennis | 2024-04-14 | 6                 | true          | 3.14         | 1              | delete           | 3               |",
-             "| 1  | Alex   | 2024-04-14 | 1                 | true          | 3.14         | 1              | insert           | 4               |",
-             "| 2  | Alan   | 2024-04-15 | 1                 | true          | 3.14         | 1              | insert           | 4               |",
-             "+----+--------+------------+-------------------+---------------+--------------+----------------+------------------+-----------------+"
+        "+----+--------+------------+-------------------+---------------+--------------+----------------+------------------+-----------------+",
+        "| id | name   | birthday   | long_field        | boolean_field | double_field | smallint_field | _change_type     | _commit_version |",
+        "+----+--------+------------+-------------------+---------------+--------------+----------------+------------------+-----------------+",
+        "| 1  | Steve  | 2024-04-14 | 1                 | true          | 3.14         | 1              | insert           | 0               |",
+        "| 2  | Bob    | 2024-04-15 | 1                 | true          | 3.14         | 1              | insert           | 0               |",
+        "| 3  | Dave   | 2024-04-15 | 2                 | true          | 3.14         | 1              | insert           | 0               |",
+        "| 4  | Kate   | 2024-04-15 | 3                 | true          | 3.14         | 1              | insert           | 0               |",
+        "| 5  | Emily  | 2024-04-16 | 4                 | true          | 3.14         | 1              | insert           | 0               |",
+        "| 6  | Carl   | 2024-04-16 | 5                 | true          | 3.14         | 1              | insert           | 0               |",
+        "| 7  | Dennis | 2024-04-16 | 6                 | true          | 3.14         | 1              | insert           | 0               |",
+        "| 8  | Claire | 2024-04-17 | 7                 | true          | 3.14         | 1              | insert           | 0               |",
+        "| 9  | Ada    | 2024-04-17 | 8                 | true          | 3.14         | 1              | insert           | 0               |",
+        "| 10 | Borb   | 2024-04-17 | 99999999999999999 | true          | 3.14         | 1              | insert           | 0               |",
+        "| 3  | Dave   | 2024-04-15 | 2                 | true          | 3.14         | 1              | update_preimage  | 1               |",
+        "| 3  | Dave   | 2024-04-14 | 2                 | true          | 3.14         | 1              | update_postimage | 1               |",
+        "| 4  | Kate   | 2024-04-15 | 3                 | true          | 3.14         | 1              | update_preimage  | 1               |",
+        "| 4  | Kate   | 2024-04-14 | 3                 | true          | 3.14         | 1              | update_postimage | 1               |",
+        "| 2  | Bob    | 2024-04-15 | 1                 | true          | 3.14         | 1              | update_preimage  | 1               |",
+        "| 2  | Bob    | 2024-04-14 | 1                 | true          | 3.14         | 1              | update_postimage | 1               |",
+        "| 7  | Dennis | 2024-04-16 | 6                 | true          | 3.14         | 1              | update_preimage  | 2               |",
+        "| 7  | Dennis | 2024-04-14 | 6                 | true          | 3.14         | 1              | update_postimage | 2               |",
+        "| 5  | Emily  | 2024-04-16 | 4                 | true          | 3.14         | 1              | update_preimage  | 2               |",
+        "| 5  | Emily  | 2024-04-14 | 4                 | true          | 3.14         | 1              | update_postimage | 2               |",
+        "| 6  | Carl   | 2024-04-16 | 5                 | true          | 3.14         | 1              | update_preimage  | 2               |",
+        "| 6  | Carl   | 2024-04-14 | 5                 | true          | 3.14         | 1              | update_postimage | 2               |",
+        "| 7  | Dennis | 2024-04-14 | 6                 | true          | 3.14         | 1              | delete           | 3               |",
+        "| 1  | Alex   | 2024-04-14 | 1                 | true          | 3.14         | 1              | insert           | 4               |",
+        "| 2  | Alan   | 2024-04-15 | 1                 | true          | 3.14         | 1              | insert           | 4               |",
+        "+----+--------+------------+-------------------+---------------+--------------+----------------+------------------+-----------------+",
     ];
     sort_lines!(expected);
     assert_batches_sorted_eq!(expected, &batches);
@@ -220,7 +219,7 @@ fn cdf_non_partitioned() -> Result<(), Box<dyn error::Error>> {
 }
 
 #[test]
-fn cdf_with_cdc_and_dvs() -> Result<(), Box<dyn error::Error>> {
+fn cdf_with_cdc_and_dvs() -> KernelResult<()> {
     let batches = read_cdf_for_table("cdf-table-with-cdc-and-dvs", 0, None, None)?;
     let mut expected = vec![
         "+----+--------------------+------------------+-----------------+",
@@ -277,7 +276,7 @@ fn cdf_with_cdc_and_dvs() -> Result<(), Box<dyn error::Error>> {
 }
 
 #[test]
-fn simple_cdf_version_ranges() -> DeltaResult<()> {
+fn simple_cdf_version_ranges() -> KernelResult<()> {
     let batches = read_cdf_for_table("cdf-table-simple", 0, 0, None)?;
     let mut expected = vec![
         "+----+--------------+-----------------+",
@@ -371,7 +370,7 @@ fn simple_cdf_version_ranges() -> DeltaResult<()> {
 }
 
 #[test]
-fn update_operations() -> DeltaResult<()> {
+fn update_operations() -> KernelResult<()> {
     let batches = read_cdf_for_table("cdf-table-update-ops", 0, 2, None)?;
     // Note: `update_pre` and `update_post` are technically not part of the delta spec, and instead
     // should be `update_preimage` and `update_postimage` respectively. However, the tests in
@@ -408,7 +407,7 @@ fn update_operations() -> DeltaResult<()> {
 }
 
 #[test]
-fn false_data_change_is_ignored() -> DeltaResult<()> {
+fn false_data_change_is_ignored() -> KernelResult<()> {
     let batches = read_cdf_for_table("cdf-table-data-change", 0, 1, None)?;
     let mut expected = vec![
         "+----+--------------+-----------------+",
@@ -436,18 +435,17 @@ fn invalid_range_end_before_start() {
     let res = read_cdf_for_table("cdf-table-simple", 1, 0, None);
     let expected_msg =
         "Failed to build LogSegment: start_version cannot be greater than end_version";
-    assert!(matches!(res, Err(Error::Generic(msg)) if msg == expected_msg));
+    assert!(matches!(res, Err(KernelError::Generic(msg)) if msg == expected_msg));
 }
 
 #[test]
 fn invalid_range_start_after_last_version_of_table() {
     let res = read_cdf_for_table("cdf-table-simple", 3, 4, None);
-    let expected_msg = "Expected the first commit to have version 3, got None";
-    assert!(matches!(res, Err(Error::Generic(msg)) if msg == expected_msg));
+    assert!(matches!(res, Err(KernelError::EmptyLog)));
 }
 
 #[test]
-fn partition_table() -> DeltaResult<()> {
+fn partition_table() -> KernelResult<()> {
     let batches = read_cdf_for_table("cdf-table-partitioned", 0, 2, None)?;
     let mut expected = vec![
         "+----+------+------+------------------+-----------------+",
@@ -473,7 +471,7 @@ fn partition_table() -> DeltaResult<()> {
 }
 
 #[test]
-fn backtick_column_names() -> DeltaResult<()> {
+fn backtick_column_names() -> KernelResult<()> {
     let batches = read_cdf_for_table("cdf-table-backtick-column-names", 0, None, None)?;
     let mut expected = vec![
         "+--------+----------+--------------------------+--------------+-----------------+",
@@ -492,7 +490,7 @@ fn backtick_column_names() -> DeltaResult<()> {
 }
 
 #[test]
-fn unconditional_delete() -> DeltaResult<()> {
+fn unconditional_delete() -> KernelResult<()> {
     let batches = read_cdf_for_table("cdf-table-delete-unconditional", 0, None, None)?;
     let mut expected = vec![
         "+----+--------------+-----------------+",
@@ -526,7 +524,7 @@ fn unconditional_delete() -> DeltaResult<()> {
 }
 
 #[test]
-fn conditional_delete_all_rows() -> DeltaResult<()> {
+fn conditional_delete_all_rows() -> KernelResult<()> {
     let batches = read_cdf_for_table("cdf-table-delete-conditional-all-rows", 0, None, None)?;
     let mut expected = vec![
         "+----+--------------+-----------------+",
@@ -560,7 +558,7 @@ fn conditional_delete_all_rows() -> DeltaResult<()> {
 }
 
 #[test]
-fn conditional_delete_two_rows() -> DeltaResult<()> {
+fn conditional_delete_two_rows() -> KernelResult<()> {
     let batches = read_cdf_for_table("cdf-table-delete-conditional-two-rows", 0, None, None)?;
     let mut expected = vec![
         "+----+--------------+-----------------+",
@@ -586,7 +584,7 @@ fn conditional_delete_two_rows() -> DeltaResult<()> {
 }
 
 #[test]
-fn cdf_with_column_mapping_name_mode() -> Result<(), Box<dyn error::Error>> {
+fn cdf_with_column_mapping_name_mode() -> KernelResult<()> {
     // NOTE: these tables only have CDF enabled in version 1+, so we start reading from 1. This is
     // due to pyspark limitation while writing: we were unable to create a table with column
     // mapping + CDF enabled in commit 0, so we created with column mapping and enabled CDF in
@@ -629,7 +627,7 @@ fn cdf_with_column_mapping_name_mode() -> Result<(), Box<dyn error::Error>> {
 /// `table_changes` log-replay, so `execute()` never tries to read the phantom parquet
 /// file and returns zero rows.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn cdf_per_cell_null_on_malformed_stats() -> Result<(), Box<dyn error::Error>> {
+async fn cdf_per_cell_null_on_malformed_stats() -> KernelResult<()> {
     let schema = schema_ref! {
         nullable "EventTime": TIMESTAMP,
         nullable "UserId": LONG,
@@ -663,7 +661,7 @@ async fn cdf_per_cell_null_on_malformed_stats() -> Result<(), Box<dyn error::Err
     let engine = create_default_engine(&table_url)?;
     let table_changes = TableChanges::try_new(table_url.clone(), engine.as_ref(), 1, Some(1))?;
 
-    let predicate: PredicateRef = Arc::new(Pred::gt(col!("UserId"), lit(1000i64)));
+    let predicate: PredicateRef = Arc::new(Pred::from_expr(expr!(col("UserId") > 1000i64)));
     let scan = table_changes
         .into_scan_builder()
         .with_predicate(predicate)
@@ -674,7 +672,7 @@ async fn cdf_per_cell_null_on_malformed_stats() -> Result<(), Box<dyn error::Err
     // the predicate pruned the file before reading.
     let batches: Vec<RecordBatch> = scan
         .execute(engine)?
-        .map(|data| -> DeltaResult<_> { data?.try_into_record_batch() })
+        .map(|data| -> KernelResult<_> { data?.try_into_record_batch() })
         .try_collect()?;
     let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
     assert_eq!(
@@ -685,7 +683,7 @@ async fn cdf_per_cell_null_on_malformed_stats() -> Result<(), Box<dyn error::Err
 }
 
 #[test]
-fn cdf_with_column_mapping_id_mode() -> Result<(), Box<dyn error::Error>> {
+fn cdf_with_column_mapping_id_mode() -> KernelResult<()> {
     // NOTE: these tables only have CDF enabled in version 1+, so we start reading from 1. This is
     // due to pyspark limitation while writing: we were unable to create a table with column
     // mapping + CDF enabled in commit 0, so we created with column mapping and enabled CDF in

@@ -6,6 +6,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
 
+use derive_more::From;
 use itertools::Itertools;
 use strum::Display;
 use url::Url;
@@ -13,9 +14,9 @@ use url::Url;
 use crate::actions::deletion_vector::DeletionVectorDescriptor;
 use crate::error::add_scalar_path_context;
 use crate::expressions::{ColumnName, ExpressionRef, PredicateRef, Scalar, StructData};
-use crate::schema::{DataType, SchemaRef, StructField, StructType, ToSchema};
+use crate::schema::{DataType, SchemaRef, StructField, StructType, ToSchema, lazy_schema_ref};
 use crate::utils::CollectInto;
-use crate::{DeltaResult, Error, FileMeta};
+use crate::{FileMeta, KernelError, KernelResult};
 
 // ============================================================================
 // Operator: enumerates every operator kind
@@ -25,52 +26,135 @@ use crate::{DeltaResult, Error, FileMeta};
 /// documenting that operator's semantics, invariants, and output shape.
 ///
 /// An operator that reshapes its rows (a source, projection, aggregation, or file scan) carries a
-/// caller-declared `schema` field holding its output schema. The rest emit rows they were given, so
-/// they inherit an input's schema; each payload's docs name which input.
-#[derive(Debug, Clone, Display)]
+/// caller-declared `schema` field holding its output schema. File writes emit [`FILE_META_SCHEMA`].
+/// The remaining operators inherit an input's schema; each payload's docs name which input.
+#[derive(Debug, Clone, Display, From)]
 #[strum(serialize_all = "snake_case")]
 pub enum Operator {
     // === Source operators (0 inputs) =========================================
+    // TODO(#3517): Unify JSON and Parquet scan/write nodes.
     ScanParquet(ScanParquet),
     ScanJson(ScanJson),
     Values(Values),
+    /// Reads all rows of a relation previously retained by the engine. The [`RelationRef`]'s
+    /// schema is this node's output schema.
+    RelationSource(RelationRef),
 
     // === Unary operators (1 input) ===========================================
     Project(Project),
     Filter(Filter),
     DynamicScan(DynamicScan),
     Aggregate(Aggregate),
+    PrefixSum(PrefixSum),
 
     // === Binary operators (2 inputs) =========================================
     SemiJoin(SemiJoin),
 
     // === N-ary operators (variable inputs) ===================================
     UnionAll(UnionAll),
+    WriteJson(WriteJson),
 }
 
-/// Generate `From<Payload> for Operator` for each listed variant, wrapping the payload in the
-/// same-named [`Operator`] variant. Example: `Filter { .. }.into()` yields `Operator::Filter`).
-macro_rules! impl_from_payload_for_operator {
-    ($($variant:ident),+ $(,)?) => {
-        $(impl From<$variant> for Operator {
-            fn from(payload: $variant) -> Self {
-                Operator::$variant(payload)
-            }
-        })+
-    };
+/// Output schema of [`WriteJson`]: the file's fully qualified `location`,
+/// `size` in bytes, and `last_modified` in milliseconds since the Unix epoch.
+pub static FILE_META_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
+    not_null "location": STRING,
+    not_null "size": LONG,
+    not_null "last_modified": LONG,
+};
+
+/// Writes all rows from its inputs to one newline-delimited JSON file at `file_path`.
+/// Outputs exactly one row matching [`FILE_META_SCHEMA`] after the write succeeds.
+///
+/// # Implementation Contract
+///
+/// - The declared `schema` supplies the JSON field names and types. Every input batch must match
+///   it, including field order, nullability, and metadata. A schema mismatch is an error and must
+///   leave the destination untouched.
+/// - When `overwrite` is false, the destination must be created atomically without replacing an
+///   existing or otherwise return a FileAlreadyExists error. When true, existing files may be
+///   replaced.
+/// - When `ordered` is true, all rows from input N must be written before any rows from input N+1,
+///   following the order of [`PlanNode::inputs`](super::plan::PlanNode::inputs). Row order within
+///   each input is unspecified. When false, rows from different inputs may be interleaved. See
+///   example below.
+/// - No rows across all inputs is considered invalid (Delta metadata files, e.g. commits and
+///   checkpoints, should never be empty). It is recommended that implementors reject such inputs
+///   with an error, however kernel does not rely on such behavior and will perform its own
+///   pre-write validations to ensure this does not happen.
+/// - Behavior can be undefined if a single plan contains multiple writes to the same destination,
+///   because execution order is unspecified and executors may optimize away common table
+///   expressions.
+///
+/// # Ordering Example
+///
+/// Suppose input 0 contains `{"id":1}` and `{"id":2}`, and input 1 contains `{"id":3}`.
+/// With `ordered = true`, the file may contain:
+///
+/// ```text
+/// {"id":1}
+/// {"id":2}
+/// {"id":3}
+/// ```
+///
+/// The first two lines may be swapped, but `{"id":3}` must follow both.
+///
+/// # Errors
+///
+/// - [`KernelError::Schema`] if the declared schema is unsupported or an input batch does not match
+///   it.
+/// - [`KernelError::FileAlreadyExists`] if the destination exists and `overwrite` is false.
+#[derive(Debug, Clone)]
+pub struct WriteJson {
+    /// Declared schema for the output rows.
+    pub schema: SchemaRef,
+    /// Fully qualified URL of the destination file.
+    pub file_path: Url,
+    /// Whether an existing destination may be replaced.
+    pub overwrite: bool,
+    /// Whether inputs must be written in their declared order; ordering within an input is
+    /// unspecified. For example, Delta uses this to write the `commitInfo` action before other
+    /// actions in a commit.
+    pub ordered: bool,
 }
 
-impl_from_payload_for_operator!(
-    ScanParquet,
-    ScanJson,
-    Values,
-    Project,
-    Filter,
-    DynamicScan,
-    Aggregate,
-    SemiJoin,
-    UnionAll,
-);
+/// An engine-assigned identifier for a relation retained by a
+/// [`PlanExecutor`](crate::plans::PlanExecutor). Opaque to kernel.
+pub type RelationId = String;
+
+/// An opaque handle to a relation retained by the engine's
+/// [`PlanExecutor`](crate::plans::PlanExecutor). See [`Operator::RelationSource`].
+///
+/// Kernel holds only the [`RelationId`] and the relation's output schema; the rows themselves are
+/// never materialized into kernel. An executor can produce a handle when it retains a relation,
+/// including through
+/// [`ScopedPlanExecutor::execute_and_retain`](crate::plans::ScopedPlanExecutor::execute_and_retain).
+/// An [`Operator::RelationSource`] node reads it while the executor retains it.
+#[derive(Debug, Clone)]
+pub struct RelationRef {
+    id: RelationId,
+    schema: SchemaRef,
+}
+
+impl RelationRef {
+    /// A handle to the relation identified by `id`, producing rows matching `schema`.
+    pub fn new(id: impl Into<RelationId>, schema: impl Into<SchemaRef>) -> Self {
+        Self {
+            id: id.into(),
+            schema: schema.into(),
+        }
+    }
+
+    /// The engine-assigned identifier of the retained relation.
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    /// The output schema of the retained relation.
+    pub fn schema(&self) -> &SchemaRef {
+        &self.schema
+    }
+}
 
 /// One file to scan plus literal values broadcast to every row read from that file.
 ///
@@ -297,11 +381,11 @@ impl<T: Into<StructData> + ToSchema> FromIterator<T> for Values {
 /// [`TryFrom`].
 impl<T> TryFrom<Values> for Vec<T>
 where
-    T: TryFrom<StructData, Error = Error> + ToSchema,
+    T: TryFrom<StructData, Error = KernelError> + ToSchema,
 {
-    type Error = Error;
+    type Error = KernelError;
 
-    fn try_from(Values { schema, rows }: Values) -> DeltaResult<Self> {
+    fn try_from(Values { schema, rows }: Values) -> KernelResult<Self> {
         rows.into_iter()
             .enumerate()
             .map(|(index, row)| {
@@ -379,10 +463,11 @@ pub enum FileType {
 /// [`ScanParquet::file_constant_columns`]. Each named input field must have the same type and
 /// nullability as its output field. See the example below.
 ///
-/// `dv_column` names a nullable column on the upstream row holding a Delta
+/// `dv_column`, when set, names a nullable column on the upstream row holding a Delta
 /// [`DeletionVectorDescriptor`] struct. The engine resolves it into a roaring bitmap
 /// and drops file rows whose row index appears in the DV. A NULL value for a given
-/// input row means "no DV for this file", so all file rows are emitted.
+/// input row means "no DV for this file", so all file rows are emitted. `None` means the
+/// scan has no deletion-vector column at all, so no DV is applied and every file row is emitted.
 ///
 /// [`DeletionVectorDescriptor`]: crate::actions::deletion_vector::DeletionVectorDescriptor
 ///
@@ -442,8 +527,9 @@ pub struct DynamicScan {
     pub file_size_column: ColumnName,
     /// Non-nullable input column with the last-modified timestamp in milliseconds since epoch.
     pub last_modified_column: ColumnName,
-    /// Nullable input column with the schema of [`DeletionVectorDescriptor`].
-    pub dv_column: ColumnName,
+    /// Optional nullable input column with the schema of [`DeletionVectorDescriptor`]; `None`
+    /// when the scanned files never carry deletion vectors.
+    pub dv_column: Option<ColumnName>,
 }
 
 impl DynamicScan {
@@ -455,7 +541,7 @@ impl DynamicScan {
     /// # Errors
     ///
     /// Returns an error when `base_url` is not hierarchical or does not end in `/`; when a required
-    /// metadata or deletion-vector column is absent from `input_schema`, has an incompatible type,
+    /// metadata column or a configured deletion-vector column is absent, has an incompatible type,
     /// or has invalid nullability; or when a file-constant column is absent from either schema, is
     /// a metadata column, or has different input and output types or nullability.
     #[allow(clippy::too_many_arguments)]
@@ -468,8 +554,8 @@ impl DynamicScan {
         path_column: ColumnName,
         file_size_column: ColumnName,
         last_modified_column: ColumnName,
-        dv_column: ColumnName,
-    ) -> DeltaResult<Self> {
+        dv_column: Option<ColumnName>,
+    ) -> KernelResult<Self> {
         let schema = output_schema.into();
         let file_constant_columns = file_constant_columns
             .into_iter()
@@ -497,15 +583,15 @@ impl DynamicScan {
     /// # Errors
     ///
     /// Returns an error when `base_url` is not hierarchical or does not end in `/`; when a required
-    /// metadata or deletion-vector column is absent, has an incompatible type, or has invalid
-    /// nullability; or when a file-constant column is absent from either schema, is a metadata
-    /// column, or has different input and output types or nullability.
-    pub fn validate_input(&self, input_schema: &SchemaRef) -> DeltaResult<()> {
+    /// metadata column or a configured deletion-vector column is absent, has an incompatible type,
+    /// or has invalid nullability; or when a file-constant column is absent from either schema, is
+    /// a metadata column, or has different input and output types or nullability.
+    pub fn validate_input(&self, input_schema: &SchemaRef) -> KernelResult<()> {
         static DELETION_VECTOR_DATA_TYPE: LazyLock<DataType> =
             LazyLock::new(|| DataType::from(DeletionVectorDescriptor::to_schema()));
 
         if self.base_url.cannot_be_a_base() || !self.base_url.path().ends_with('/') {
-            return Err(Error::generic(format!(
+            return Err(KernelError::generic(format!(
                 "dynamic scan: base URL `{}` must be hierarchical and end in `/`",
                 self.base_url
             )));
@@ -520,30 +606,30 @@ impl DynamicScan {
             &self.file_constant_columns,
         )?;
 
-        let fields = input_schema
-            .fields_of_path(&self.dv_column)
-            .map_err(|err| {
-                Error::generic(format!(
-                    "dynamic scan: deletion-vector column `{}` is invalid: {err}",
-                    self.dv_column
+        if let Some(dv_column) = &self.dv_column {
+            let fields = input_schema.fields_of_path(dv_column).map_err(|err| {
+                KernelError::generic(format!(
+                    "dynamic scan: deletion-vector column `{dv_column}` is invalid: {err}"
                 ))
             })?;
-        let Some((field, _ancestors)) = fields.split_last() else {
-            return Err(Error::internal_error("fields_of_path returned no fields"));
-        };
-        let expected = &*DELETION_VECTOR_DATA_TYPE;
-        if field.data_type() != expected {
-            return Err(Error::generic(format!(
-                "dynamic scan: deletion-vector column `{}` must have type {expected}, found {}",
-                self.dv_column,
-                field.data_type()
-            )));
-        }
-        if !field.is_nullable() {
-            return Err(Error::generic(format!(
-                "dynamic scan: deletion-vector column `{}` must be nullable",
-                self.dv_column
-            )));
+            let Some((field, _ancestors)) = fields.split_last() else {
+                return Err(KernelError::internal_error(
+                    "fields_of_path returned no fields",
+                ));
+            };
+            let expected = &*DELETION_VECTOR_DATA_TYPE;
+            if field.data_type() != expected {
+                return Err(KernelError::generic(format!(
+                    "dynamic scan: deletion-vector column `{dv_column}` must have type \
+                     {expected}, found {}",
+                    field.data_type()
+                )));
+            }
+            if !field.is_nullable() {
+                return Err(KernelError::generic(format!(
+                    "dynamic scan: deletion-vector column `{dv_column}` must be nullable"
+                )));
+            }
         }
 
         Ok(())
@@ -553,19 +639,21 @@ impl DynamicScan {
         schema: &SchemaRef,
         column: &ColumnName,
         expected_type: &DataType,
-    ) -> DeltaResult<()> {
+    ) -> KernelResult<()> {
         let fields = schema.fields_of_path(column)?;
         let Some((field, ancestors)) = fields.split_last() else {
-            return Err(Error::internal_error("fields_of_path returned no fields"));
+            return Err(KernelError::internal_error(
+                "fields_of_path returned no fields",
+            ));
         };
         if field.data_type() != expected_type {
-            return Err(Error::generic(format!(
+            return Err(KernelError::generic(format!(
                 "dynamic scan: column `{column}` must have type {expected_type}, found {}",
                 field.data_type()
             )));
         }
         if field.is_nullable() || ancestors.iter().any(|field| field.is_nullable()) {
-            return Err(Error::generic(format!(
+            return Err(KernelError::generic(format!(
                 "dynamic scan: required column `{column}` is nullable"
             )));
         }
@@ -576,35 +664,35 @@ impl DynamicScan {
         input_schema: &SchemaRef,
         output_schema: &SchemaRef,
         file_constant_columns: &[String],
-    ) -> DeltaResult<()> {
+    ) -> KernelResult<()> {
         for name in file_constant_columns {
             let Some(input_field) = input_schema.field(name) else {
-                return Err(Error::generic(format!(
+                return Err(KernelError::generic(format!(
                     "dynamic scan file_constant source: column `{name}` not found; schema has \
                      {:?}",
                     Vec::from_iter(input_schema.fields().map(|field| field.name())),
                 )));
             };
             if input_field.is_metadata_column() {
-                return Err(Error::generic(format!(
+                return Err(KernelError::generic(format!(
                     "dynamic scan file_constant source: column `{name}` is a metadata column"
                 )));
             }
             let Some(output_field) = output_schema.field(name) else {
-                return Err(Error::generic(format!(
+                return Err(KernelError::generic(format!(
                     "dynamic scan file_constant: column `{name}` not found; schema has {:?}",
                     Vec::from_iter(output_schema.fields().map(|field| field.name())),
                 )));
             };
             if output_field.is_metadata_column() {
-                return Err(Error::generic(format!(
+                return Err(KernelError::generic(format!(
                     "dynamic scan file_constant: column `{name}` is a metadata column"
                 )));
             }
             if input_field.data_type() != output_field.data_type()
                 || input_field.is_nullable() != output_field.is_nullable()
             {
-                return Err(Error::generic(format!(
+                return Err(KernelError::generic(format!(
                     "dynamic scan file_constant: column `{name}` must have the same type and \
                      nullability in input and output"
                 )));
@@ -885,7 +973,7 @@ impl Agg {
         &self,
         input_schema: &StructType,
         alias: Option<String>,
-    ) -> DeltaResult<StructField> {
+    ) -> KernelResult<StructField> {
         // `output_data_type: None` preserves the input field's type and metadata; `Some` overrides
         // the type and strips metadata (new column).
         let resolve = |value: &ColumnName, output_data_type: Option<DataType>, nullable: bool| {
@@ -1002,7 +1090,7 @@ impl AggregateBuilder {
     ///
     /// Returns an error if a group key or an aggregate's operand column is not found in the input
     /// schema, or if two output columns would share a name (case-insensitive).
-    pub fn build(self) -> DeltaResult<Aggregate> {
+    pub fn build(self) -> KernelResult<Aggregate> {
         let mut fields = Vec::with_capacity(self.group_by.len() + self.aggs.len());
         for key in &self.group_by {
             fields.push(self.input_schema.field_at(key)?.clone());
@@ -1022,10 +1110,104 @@ impl AggregateBuilder {
 }
 
 impl TryFrom<AggregateBuilder> for Aggregate {
-    type Error = Error;
+    type Error = KernelError;
 
-    fn try_from(builder: AggregateBuilder) -> DeltaResult<Self> {
+    fn try_from(builder: AggregateBuilder) -> KernelResult<Self> {
         builder.build()
+    }
+}
+
+/// Exclusive prefix sum of one LONG input column, appended as a new output column with the same
+/// nullability as the input (respecting parent column nullability). All other input columns pass
+/// through unchanged.
+///
+/// # Semantics
+///
+/// The output for row `i` is `SUM(input[0..i])`, or `0` for `i=0`. NULL inputs do not contribute
+/// and produce NULL outputs for their respective rows. Zero-valued inputs are valid but produce
+/// duplicate outputs (because they do not increase the value of the sum). Input rows are consumed
+/// exactly once in any order and output rows can be produced in any order.
+///
+/// # Output schema
+///
+/// `schema` is the input schema with one appended LONG column named `output`. That column's
+/// nullability is true if the `input` field or any of its ancestor structs is nullable.
+///
+/// # Example
+///
+/// ```text
+/// PrefixSum { input: numRecords, output: offset, schema: { path, numRecords, offset } }
+/// ```
+///
+/// One valid output (encounter order):
+///
+/// ```text
+/// path | numRecords | offset
+/// -----+------------+-------
+///  a   |         10 |      0
+///  b   |       NULL |   NULL
+///  c   |          0 |     10
+///  d   |          0 |     10
+///  e   |          5 |     10
+///  f   |         20 |     15
+/// ```
+/// This produces the ranges `[0..10, 10..10, 10..10, 10..15, 15..35]`.
+///
+/// Another valid output (input and output rows both permuted):
+///
+/// ```text
+/// path | numRecords | offset
+/// -----+------------+-------
+///  b   |       NULL |   NULL
+///  f   |         20 |     0
+///  a   |         10 |     25
+///  d   |          0 |     20
+///  c   |          0 |     25
+///  e   |          5 |     20
+/// ```
+/// This produces the ranges `[0..20, 20..20, 20..25, 25..25, 25..35]`.
+#[derive(Debug, Clone)]
+pub struct PrefixSum {
+    /// LONG column to accumulate. May be nested (e.g. `stats.numRecords`).
+    pub input: ColumnName,
+    /// Name of the new top-level LONG column holding exclusive prefixes.
+    pub output: String,
+    /// Input schema with [`Self::output`] appended.
+    pub schema: SchemaRef,
+}
+
+impl PrefixSum {
+    /// Builds a [`PrefixSum`] that appends exclusive prefixes of `input` as `output`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `input` is absent from `input_schema`, is not LONG, or if appending
+    /// `output` would duplicate a top-level field name (case-insensitive).
+    pub fn try_new(
+        input_schema: &StructType,
+        input: impl Into<ColumnName>,
+        output: impl Into<String>,
+    ) -> KernelResult<Self> {
+        let input = input.into();
+        let output = output.into();
+        let fields = input_schema.fields_of_path(&input)?;
+        let field = fields[fields.len() - 1];
+        if field.data_type() != &DataType::LONG {
+            return Err(KernelError::generic(format!(
+                "prefix sum: input `{input}` must be LONG, got {}",
+                field.data_type()
+            )));
+        }
+        let schema = Arc::new(input_schema.add([StructField::new(
+            output.clone(),
+            DataType::LONG,
+            fields.iter().any(|field| field.nullable),
+        )])?);
+        Ok(Self {
+            input,
+            output,
+            schema,
+        })
     }
 }
 
@@ -1112,7 +1294,7 @@ mod tests {
 
     use super::*;
     use crate::expressions::column_name;
-    use crate::schema::{schema_ref, DataType, MetadataValue, StructField};
+    use crate::schema::{DataType, MetadataValue, StructField, schema, schema_ref};
     use crate::unit_test_utils::assert_result_error_with_message;
 
     /// Builds a flat `LONG` schema from `(name, nullable)` pairs.
@@ -1334,5 +1516,71 @@ mod tests {
             Vec::<Person>::try_from(values),
             "[0].id: expected i32, found string",
         );
+    }
+    #[rstest::rstest]
+    #[case::top_level(column_name!("numRecords"), false)]
+    #[case::non_null_parent(column_name!("required.numRecords"), false)]
+    #[case::nullable_parent(column_name!("optional.numRecords"), true)]
+    #[case::non_null_ancestors(column_name!("required.required.numRecords"), false)]
+    #[case::nullable_parent_under_non_null_ancestor(
+        column_name!("required.optional.numRecords"), true
+    )]
+    #[case::nullable_ancestor_over_non_null_parent(
+        column_name!("optional.required.numRecords"), true
+    )]
+    #[case::nullable_ancestors(column_name!("optional.optional.numRecords"), true)]
+    fn prefix_sum_appends_long_output_matching_path_nullability(
+        #[case] column: ColumnName,
+        #[case] ancestor_nullable: bool,
+        #[values(true, false)] leaf_nullable: bool,
+    ) {
+        let field = StructField::new("numRecords", DataType::LONG, leaf_nullable);
+        let leaf = schema! { (field.clone()), };
+        let nested = schema! {
+            (field.clone()),
+            not_null "required": (leaf.clone()),
+            nullable "optional": (leaf),
+        };
+        let input = schema_ref! {
+            not_null "path": STRING,
+            (field),
+            not_null "required": (nested.clone()),
+            nullable "optional": (nested),
+        };
+        let prefix = PrefixSum::try_new(input.as_ref(), column.clone(), "offset").unwrap();
+        let names: Vec<&str> = prefix.schema.fields().map(|f| f.name().as_str()).collect();
+        assert_eq!(
+            names,
+            ["path", "numRecords", "required", "optional", "offset"]
+        );
+        let offset = prefix.schema.field("offset").unwrap();
+        assert_eq!(offset.data_type(), &DataType::LONG);
+        assert_eq!(offset.nullable, leaf_nullable || ancestor_nullable);
+        assert_eq!(prefix.output, "offset");
+        assert_eq!(prefix.input, column);
+    }
+
+    #[test]
+    fn prefix_sum_rejects_non_long_input() {
+        let input = Arc::new(StructType::new_unchecked([StructField::not_null(
+            "s",
+            DataType::STRING,
+        )]));
+        let result = PrefixSum::try_new(input.as_ref(), column_name!("s"), "off");
+        assert_result_error_with_message(result, "must be LONG");
+    }
+
+    #[test]
+    fn prefix_sum_rejects_missing_input_column() {
+        let input = schema(&[("n", true)]);
+        let result = PrefixSum::try_new(input.as_ref(), column_name!("missing"), "off");
+        assert_result_error_with_message(result, "missing");
+    }
+
+    #[test]
+    fn prefix_sum_rejects_duplicate_output_name() {
+        let input = schema(&[("n", true)]);
+        let result = PrefixSum::try_new(input.as_ref(), column_name!("n"), "n");
+        assert_result_error_with_message(result, "Duplicate field name");
     }
 }

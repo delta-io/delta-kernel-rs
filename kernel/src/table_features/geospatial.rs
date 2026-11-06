@@ -3,9 +3,9 @@
 use super::TableFeature;
 use crate::schema::{PrimitiveType, Schema};
 use crate::table_configuration::TableConfiguration;
-use crate::transforms::{transform_output_type, SchemaTransform};
+use crate::transforms::{SchemaTransform, transform_output_type};
 use crate::utils::require;
-use crate::{DeltaResult, Error};
+use crate::{KernelError, KernelResult};
 
 /// Returns `true` if the schema contains at least one geometry or geography column,
 /// including nested structs, arrays, and maps.
@@ -16,9 +16,9 @@ fn schema_contains_geospatial(schema: &Schema) -> bool {
 struct UsesGeo;
 
 impl<'a> SchemaTransform<'a> for UsesGeo {
-    transform_output_type!(|'a, T| Result<(), ()>);
+    transform_output_type!(|'a, T| KernelResult<(), ()>);
 
-    fn transform_primitive(&mut self, ptype: &'a PrimitiveType) -> Result<(), ()> {
+    fn transform_primitive(&mut self, ptype: &'a PrimitiveType) -> KernelResult<(), ()> {
         match ptype {
             PrimitiveType::Geometry(_) | PrimitiveType::Geography(_) => Err(()),
             _ => Ok(()),
@@ -28,11 +28,12 @@ impl<'a> SchemaTransform<'a> for UsesGeo {
 
 /// Validates that if a table schema contains geometry or geography columns, the table must have
 /// the `geospatial` feature in both reader and writer features.
-pub(crate) fn validate_geospatial_feature_support(tc: &TableConfiguration) -> DeltaResult<()> {
+pub(crate) fn validate_geospatial_feature_support(tc: &TableConfiguration) -> KernelResult<()> {
     if schema_contains_geospatial(&tc.logical_schema()) {
         require!(
-            tc.protocol().has_table_feature(&TableFeature::GeospatialType),
-            Error::unsupported(
+            tc.protocol()
+                .has_table_feature(&TableFeature::GeospatialType),
+            KernelError::unsupported(
                 "Table contains geometry or geography columns but does not have the required 'geospatial' feature in reader and writer features"
             )
         );
@@ -47,7 +48,7 @@ mod tests {
     use super::*;
     use crate::actions::Protocol;
     use crate::schema::{
-        schema, ArrayType, DataType, EdgeInterpolationAlgorithm, MapType, StructType,
+        ArrayType, DataType, EdgeInterpolationAlgorithm, MapType, StructType, schema,
     };
     use crate::unit_test_utils::{assert_schema_feature_validation, geography_type, geometry_type};
 

@@ -18,8 +18,8 @@ use delta_kernel::object_store::DynObjectStore;
 use delta_kernel::schema::Schema;
 use delta_kernel::transaction::BoundWriteContext;
 use delta_kernel::{
-    CancellationTokenRef, DeltaResult, Engine, EngineData, Error, EvaluationHandler, JsonHandler,
-    ParquetHandler, StorageHandler,
+    CancellationTokenRef, Engine, EngineData, EvaluationHandler, JsonHandler, KernelError,
+    KernelResult, KernelResultIterator, ParquetHandler, StorageHandler,
 };
 use futures::future::{self, Either};
 use futures::stream::{BoxStream, StreamExt as _};
@@ -39,7 +39,13 @@ pub mod rest_store;
 pub mod stats;
 pub mod storage;
 
-/// Converts a Stream-producing future to a synchronous iterator.
+#[cfg(test)]
+mod stats_verifier_tests;
+
+/// Converts a Stream-producing future to a synchronous iterator, each blocking poll raced against
+/// the cancellation token. When the token fires, the iterator yields a single
+/// `Err(KernelError::Cancelled)` and then ends, abandoning the in-flight read (dropping the stream
+/// releases its buffered work). With a `None` token, cancellation never fires.
 ///
 /// This method performs the initial blocking call to extract the stream from the future, and each
 /// subsequent call to `next` on the iterator translates to a blocking `stream.next()` call, using
@@ -51,36 +57,23 @@ pub mod storage;
 ///
 /// This is an internal utility for bridging object_store's async API to
 /// Delta Kernel's synchronous handler traits.
-pub(crate) fn stream_future_to_iter<T: Send + 'static, E: executor::TaskExecutor>(
-    task_executor: Arc<E>,
-    stream_future: impl Future<Output = DeltaResult<BoxStream<'static, T>>> + Send + 'static,
-) -> DeltaResult<Box<dyn Iterator<Item = T> + Send>> {
-    Ok(Box::new(BlockingStreamIterator {
-        stream: Some(task_executor.block_on(stream_future)?),
-        task_executor,
-    }))
-}
-
-/// Like [`stream_future_to_iter`], but each blocking poll is raced against the cancellation
-/// token. When the token fires, the iterator yields a single `Err(Error::Cancelled)` and then
-/// ends, abandoning the in-flight read (dropping the stream releases its buffered work).
-///
-/// Restricted to `DeltaResult` streams so cancellation can be surfaced as an item. With a `None`
-/// token, behavior is identical to [`stream_future_to_iter`].
 pub(crate) fn stream_future_to_cancellable_iter<U: Send + 'static, E: executor::TaskExecutor>(
     task_executor: Arc<E>,
-    stream_future: impl Future<Output = DeltaResult<BoxStream<'static, DeltaResult<U>>>>
-        + Send
-        + 'static,
+    stream_future: impl Future<Output = KernelResult<BoxStream<'static, KernelResult<U>>>>
+    + Send
+    + 'static,
     cancellation_token: Option<CancellationTokenRef>,
-) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<U>> + Send>> {
+) -> KernelResult<Box<dyn KernelResultIterator<U>>> {
     let Some(token) = cancellation_token else {
-        return stream_future_to_iter(task_executor, stream_future);
+        return Ok(Box::new(BlockingStreamIterator {
+            stream: Some(task_executor.block_on(stream_future)?),
+            task_executor,
+        }));
     };
     // Race even the initial stream-producing future against cancellation.
     let stream = match block_on_or_cancelled(&task_executor, token.clone(), stream_future) {
         Some(result) => result?,
-        None => return Err(Error::Cancelled),
+        None => return Err(KernelError::Cancelled),
     };
     Ok(Box::new(CancellableStreamIterator {
         stream: Some(stream),
@@ -138,15 +131,15 @@ impl<T: Send + 'static, E: executor::TaskExecutor> Iterator for BlockingStreamIt
 
 /// Cancellation-aware counterpart to [`BlockingStreamIterator`]: each `next()` races the blocking
 /// `stream.next()` against the token and, once cancelled, drops the stream and yields exactly one
-/// terminal `Err(Error::Cancelled)`.
+/// terminal `Err(KernelError::Cancelled)`.
 struct CancellableStreamIterator<U: Send + 'static, E: executor::TaskExecutor> {
-    stream: Option<BoxStream<'static, DeltaResult<U>>>,
+    stream: Option<BoxStream<'static, KernelResult<U>>>,
     task_executor: Arc<E>,
     token: CancellationTokenRef,
 }
 
 impl<U: Send + 'static, E: executor::TaskExecutor> Iterator for CancellableStreamIterator<U, E> {
-    type Item = DeltaResult<U>;
+    type Item = KernelResult<U>;
 
     fn next(&mut self) -> Option<Self::Item> {
         let mut stream = self.stream.take()?;
@@ -163,7 +156,7 @@ impl<U: Send + 'static, E: executor::TaskExecutor> Iterator for CancellableStrea
             }
             // Cancelled: `stream` was moved into the (now-dropped) future, releasing buffered
             // work. Emit one terminal error; the taken `self.stream` stays `None`, fusing us.
-            None => Some(Err(Error::Cancelled)),
+            None => Some(Err(KernelError::Cancelled)),
         }
     }
 }
@@ -377,10 +370,10 @@ impl<E: TaskExecutor> DefaultEngine<E> {
         &self,
         data: &ArrowEngineData,
         write_context: &BoundWriteContext,
-    ) -> DeltaResult<Box<dyn EngineData>> {
+    ) -> KernelResult<Box<dyn EngineData>> {
         let transform = write_context.logical_to_physical();
         let input_schema = Schema::try_from_arrow(data.record_batch().schema())?;
-        let output_schema = write_context.physical_schema();
+        let output_schema = write_context.physical_data_schema();
         let logical_to_physical_expr = self.evaluation_handler().new_expression_evaluator(
             input_schema.into(),
             transform.clone(),
@@ -408,7 +401,7 @@ impl<E: TaskExecutor> DefaultEngine<E> {
 pub fn build_add_file_metadata(
     file_metadata: parquet::DataFileMetadata,
     write_context: &BoundWriteContext,
-) -> DeltaResult<Box<dyn EngineData>> {
+) -> KernelResult<Box<dyn EngineData>> {
     let add_path = write_context.resolve_file_path(file_metadata.location())?;
     file_metadata.as_record_batch(write_context.physical_partition_values(), &add_path)
 }
@@ -590,7 +583,7 @@ mod tests {
         // 0, 1, then a pending tail that never resolves on its own.
         let make_stream = async move {
             let head = stream::iter(vec![Ok(0i32), Ok(1i32)]);
-            let tail = stream::once(std::future::pending::<DeltaResult<i32>>());
+            let tail = stream::once(std::future::pending::<KernelResult<i32>>());
             Ok(head.chain(tail).boxed())
         };
         let mut iter = stream_future_to_cancellable_iter(executor, make_stream, Some(ct)).unwrap();
@@ -604,7 +597,7 @@ mod tests {
             firing.cancel();
         });
 
-        assert!(matches!(iter.next(), Some(Err(Error::Cancelled))));
+        assert!(matches!(iter.next(), Some(Err(KernelError::Cancelled))));
         assert!(
             iter.next().is_none(),
             "iterator must fuse after cancellation"

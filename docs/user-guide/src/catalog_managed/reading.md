@@ -50,23 +50,23 @@ commits, then translates each one into a `LogPath`:
 ```rust,ignore
 use delta_kernel::LogPath;
 
-let log_path = LogPath::staged_commit(
-    table_url.clone(),                              // table root URL (must end with '/')
-    "00000000000000000008.<uuid>.json",             // staged filename: <version>.<uuid>.json
+let log_path = LogPath::from_commit_filename(
+    table_url.clone(),                              // table root URL
+    8,                                              // version the catalog reported
+    "00000000000000000008.<uuid>.json",             // filename the catalog reported
     1234567890,                                     // last modified timestamp
     4096,                                           // file size in bytes
 )?;
 ```
 
-The filename follows the Delta staged-commit convention: a zero-padded 20-digit version,
-the UUID assigned when the commit was staged, and a `.json` extension. Kernel mints the
+A staged commit filename follows the Delta staged-commit convention: a zero-padded 20-digit
+version, the UUID assigned when the commit was staged, and a `.json` extension. Kernel mints the
 UUID inside `CommitMetadata::staged_commit_path()` at write time; the writer passes the
 resulting path to the catalog, and the catalog returns that same path on reads. If your
 catalog returns commits as `(version, uuid, ...)` tuples, format the filename as
-`{version:020}.{uuid}.json` before calling `LogPath::staged_commit`. Published commit
-files use `{version:020}.json` and are loaded via `LogPath::try_new`, not
-`LogPath::staged_commit`. The `table_url` argument must end with `/`, otherwise
-`LogPath::staged_commit` returns an error.
+`{version:020}.{uuid}.json`. Catalogs may also report a commit that is already published by its
+`{version:020}.json` filename; `LogPath::from_commit_filename` resolves either form to the
+right directory. It returns an error if the filename's version does not match `version`.
 
 Then pass the resulting `Vec<LogPath>` to `SnapshotBuilder` along with the maximum
 catalog-ratified version:

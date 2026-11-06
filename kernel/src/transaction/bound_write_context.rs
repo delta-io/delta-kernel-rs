@@ -8,15 +8,17 @@ use url::Url;
 use super::WriteState;
 use crate::actions::deletion_vector::DeletionVectorPath;
 use crate::expressions::{ColumnName, ExpressionRef};
-use crate::partition::hive::{build_partition_path, uri_encode_path};
+use crate::partition::hive::build_partition_path;
+use crate::path_encoding::uri_encode_path;
 use crate::schema::SchemaRef;
 use crate::table_features::ColumnMappingMode;
-use crate::{DeltaResult, Error};
+use crate::{KernelError, KernelResult};
 
 /// A write context for a specific partition or an unpartitioned table. Created by a
-/// [`WriteState`](super::WriteState).
+/// [`BoundWriteContextBuilder`](super::BoundWriteContextBuilder).
 ///
-/// Note: clustered tables are unpartitioned and use `unpartitioned_write_context`.
+/// Note: clustered tables are unpartitioned and use [`BoundWriteContextBuilder::build`] without
+/// calling [`with_partition_values`].
 ///
 /// Contains both table-wide state and per-partition state (serialized partition values with
 /// physical column names as keys). How you use a `BoundWriteContext` depends on your engine:
@@ -29,13 +31,17 @@ use crate::{DeltaResult, Error};
 /// - **Fully custom (non-Arrow) engines**: use [`physical_partition_values`] to build the
 ///   `partitionValues` map in Add actions directly.
 ///
-/// [`WriteState::partitioned_write_context`]: super::WriteState::partitioned_write_context
-/// [`WriteState::unpartitioned_write_context`]: super::WriteState::unpartitioned_write_context
 /// [`Transaction::add_files`]: super::Transaction::add_files
 /// [`physical_partition_values`]: BoundWriteContext::physical_partition_values
+/// [`BoundWriteContextBuilder::build`]: super::BoundWriteContextBuilder::build
+/// [`with_partition_values`]: super::BoundWriteContextBuilder::with_partition_values
 #[derive(Debug)]
 pub struct BoundWriteContext {
     pub(super) write_state: Arc<WriteState>,
+    /// Schema expected for to-be-written logical data.
+    pub(super) logical_data_schema: SchemaRef,
+    /// Schema expected in the written Parquet file.
+    pub(super) physical_data_schema: SchemaRef,
     /// Transforms logical data to physical data for writing. The logical data must not contain
     /// any partition columns. The expression injects the partition columns when needed.
     pub(super) logical_to_physical: ExpressionRef,
@@ -135,15 +141,19 @@ impl BoundWriteContext {
         url
     }
 
-    /// Returns the schema which connectors' logical data should conform to.
-    pub fn logical_schema(&self) -> &SchemaRef {
-        &self.write_state.logical_schema
+    /// Returns the schema expected for to-be-written logical data.
+    ///
+    /// This schema contains the Delta schema excluding partition columns, followed by any
+    /// connector-specified Row ID and Row Commit Version columns. If both are present, the Row ID
+    /// column precedes the Row Commit Version column. If the table requires materialized partition
+    /// columns, Kernel inserts them during the logical-to-physical transform.
+    pub fn logical_data_schema(&self) -> &SchemaRef {
+        &self.logical_data_schema
     }
 
-    /// Returns the physical schema (partition columns removed if applicable, column mapping
-    /// applied). Partition columns are kept when `materializePartitionColumns` is enabled.
-    pub fn physical_schema(&self) -> &SchemaRef {
-        &self.write_state.physical_schema
+    /// Returns the schema for data written to Parquet.
+    pub fn physical_data_schema(&self) -> &SchemaRef {
+        &self.physical_data_schema
     }
 
     /// Returns the expression that transforms logical data to physical data for writing.
@@ -158,9 +168,10 @@ impl BoundWriteContext {
 
     /// Returns the column names that should have statistics collected during writes.
     ///
-    /// Based on table configuration (dataSkippingNumIndexedCols, dataSkippingStatsColumns).
+    /// The list includes columns selected by the table's data-skipping configuration and any
+    /// clustering columns.
     pub fn stats_columns(&self) -> &[ColumnName] {
-        &self.write_state.stats_columns
+        self.write_state.stats_columns()
     }
 
     /// Returns the serialized partition values for this write context. Keys are physical
@@ -209,19 +220,19 @@ impl BoundWriteContext {
     /// - `s3://bucket/table/year=2024/abc.parquet` -> `"year=2024/abc.parquet"`
     ///
     /// Returns an error if the file is not under the table root.
-    pub fn resolve_file_path(&self, file_location: &Url) -> DeltaResult<String> {
+    pub fn resolve_file_path(&self, file_location: &Url) -> KernelResult<String> {
         let relative = self
             .write_state
             .table_root
             .make_relative(file_location)
             .ok_or_else(|| {
-                Error::internal_error(format!(
+                KernelError::internal_error(format!(
                     "file '{}' is not under table root '{}'",
                     file_location, self.write_state.table_root
                 ))
             })?;
         if relative.starts_with("..") {
-            return Err(Error::internal_error(format!(
+            return Err(KernelError::internal_error(format!(
                 "file '{}' is not under table root '{}'",
                 file_location, self.write_state.table_root
             )));
@@ -244,7 +255,7 @@ impl BoundWriteContext {
     ///
     /// ```rust,ignore
     /// let write_state = transaction.write_state()?;
-    /// let write_context = write_state.unpartitioned_write_context()?;
+    /// let write_context = write_state.write_context_builder().build()?;
     /// let dv_path = write_context.new_deletion_vector_path(String::from(rand_string()));
     /// ```
     // TODO(#2357): generate the random prefix internally based on table properties
@@ -288,8 +299,12 @@ mod tests {
         let write_state = Arc::new(WriteState {
             table_root: Url::parse("s3://bucket/table/").unwrap(),
             full_logical_schema: schema.clone(),
-            logical_schema: schema.clone(),
-            physical_schema: schema.clone(),
+            base_logical_data_schema: schema.clone(),
+            base_physical_data_schema: schema.clone(),
+            materialized_row_id_column_name: None,
+            materialized_row_commit_version_column_name: None,
+            row_tracking_enabled: false,
+            iceberg_compat_v3_enabled: false,
             column_mapping_mode: cm_mode,
             stats_columns: vec![],
             logical_partition_columns: partition_columns,
@@ -300,6 +315,8 @@ mod tests {
         });
         BoundWriteContext {
             write_state,
+            logical_data_schema: schema.clone(),
+            physical_data_schema: schema,
             logical_to_physical: Arc::new(lit(true)),
             physical_partition_values: partition_values,
         }
@@ -590,7 +607,7 @@ mod tests {
     #[case::error_different_host("s3://other-bucket/table/abc.parquet", Err(()))]
     #[case::error_outside_table_root("s3://bucket/other/abc.parquet", Err(()))]
     #[test]
-    fn test_resolve_file_path(#[case] file_url: &str, #[case] expected: Result<&str, ()>) {
+    fn test_resolve_file_path(#[case] file_url: &str, #[case] expected: KernelResult<&str, ()>) {
         let wc = make_write_context(ColumnMappingMode::None, vec![], HashMap::new(), false, 2);
         let file = Url::parse(file_url).unwrap();
         match expected {

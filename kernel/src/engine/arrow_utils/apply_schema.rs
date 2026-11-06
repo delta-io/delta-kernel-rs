@@ -1,25 +1,28 @@
 use std::borrow::Borrow;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use itertools::Itertools;
 
 use super::super::arrow_conversion::{
-    kernel_flat_parquet_id_to_arrow_metadata, lookup_nested_field_id, parquet_field_id_metadata,
-    LIST_ARRAY_ROOT, MAP_KEY_DEFAULT, MAP_VALUE_DEFAULT,
+    LIST_ARRAY_ROOT, MAP_KEY_DEFAULT, MAP_VALUE_DEFAULT, kernel_flat_parquet_id_to_arrow_metadata,
+    lookup_nested_field_id, parquet_field_id_metadata,
 };
 use super::make_arrow_error;
+use crate::KernelResult;
 use crate::arrow::array::{
-    Array, ArrayRef, AsArray, ListArray, MapArray, RecordBatch, StructArray,
+    Array, ArrayRef, AsArray, ListArray, MapArray, RecordBatch, RecordBatchOptions, StructArray,
 };
 use crate::arrow::compute::cast;
 use crate::arrow::datatypes::{
     DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
 };
-use crate::engine::ensure_data_types::{ensure_data_types, DataTypeCompat, ValidationMode};
-use crate::error::{DeltaResult, Error};
+use crate::engine::ensure_data_types::{DataTypeCompat, ValidationMode, ensure_data_types};
+use crate::error::KernelError;
 use crate::parquet::arrow::PARQUET_FIELD_ID_META_KEY;
-use crate::schema::{ArrayType, ColumnMetadataKey, DataType, MapType, Schema, StructField};
+use crate::schema::{
+    ArrayType, ColumnMetadataKey, DataType, FILE_FIELDS, MapType, Schema, StructField,
+};
 
 // Apply a schema to an array. The array _must_ be a `StructArray`. Returns a `RecordBatch` where
 // the names of fields, nullable, and metadata in the struct have been transformed to match those
@@ -29,18 +32,21 @@ use crate::schema::{ArrayType, ColumnMetadataKey, DataType, MapType, Schema, Str
 // those nulls propagated. Arrow's JSON reader does this automatically, and parquet data goes
 // through `fix_nested_null_masks` which handles it. We decompose the struct and discard its null
 // buffer since RecordBatch cannot have top-level nulls.
-pub(crate) fn apply_schema(array: &dyn Array, schema: &DataType) -> DeltaResult<RecordBatch> {
+pub(crate) fn apply_schema(array: &dyn Array, schema: &DataType) -> KernelResult<RecordBatch> {
     let DataType::Struct(struct_schema) = schema else {
-        return Err(Error::generic(
+        return Err(KernelError::generic(
             "apply_schema at top-level must be passed a struct schema",
         ));
     };
     let applied = apply_schema_to_struct(array, struct_schema)?;
+    // Zero-column batches still need an explicit row count.
+    let num_rows = applied.len();
     let (fields, columns, _nulls) = applied.into_parts();
 
-    Ok(RecordBatch::try_new(
+    Ok(RecordBatch::try_new_with_options(
         Arc::new(ArrowSchema::new(fields)),
         columns,
+        &RecordBatchOptions::new().with_row_count(Some(num_rows)),
     )?)
 }
 
@@ -68,14 +74,14 @@ fn new_field_with_metadata(
 fn transform_struct(
     struct_array: &StructArray,
     target_fields: impl Iterator<Item = impl Borrow<StructField>>,
-) -> DeltaResult<StructArray> {
+) -> KernelResult<StructArray> {
     let (input_fields, arrow_cols, nulls) = struct_array.clone().into_parts();
     let input_col_count = arrow_cols.len();
     let result_iter = arrow_cols
         .into_iter()
         .zip(input_fields.iter())
         .zip(target_fields)
-        .map(|((sa_col, input_field), target_field)| -> DeltaResult<_> {
+        .map(|((sa_col, input_field), target_field)| -> KernelResult<_> {
             let target_field = target_field.borrow();
             let transformed_col = apply_schema_to_inner(
                 &sa_col,
@@ -93,13 +99,12 @@ fn transform_struct(
             if let (Some(input_id), Some(target_id)) = (
                 input_field.metadata().get(PARQUET_FIELD_ID_META_KEY),
                 arrow_metadata.get(PARQUET_FIELD_ID_META_KEY),
-            ) {
-                if input_id != target_id {
-                    return Err(Error::generic(format!(
-                        "Field '{}': input field ID {} conflicts with target field ID {}",
-                        target_field.name, input_id, target_id
-                    )));
-                }
+            ) && input_id != target_id
+            {
+                return Err(KernelError::generic(format!(
+                    "Field '{}': input field ID {} conflicts with target field ID {}",
+                    target_field.name, input_id, target_id
+                )));
             }
             let transformed_field = new_field_with_metadata(
                 &target_field.name,
@@ -112,15 +117,16 @@ fn transform_struct(
     let (transformed_fields, transformed_cols): (Vec<ArrowField>, Vec<ArrayRef>) =
         result_iter.process_results(|iter| iter.unzip())?;
     if transformed_cols.len() != input_col_count {
-        return Err(Error::internal_error(format!(
+        return Err(KernelError::internal_error(format!(
             "Passed struct had {input_col_count} columns, but transformed column has {}",
             transformed_cols.len()
         )));
     }
-    Ok(StructArray::try_new(
+    Ok(StructArray::try_new_with_length(
         transformed_fields.into(),
         transformed_cols,
         nulls,
+        struct_array.len(),
     )?)
 }
 
@@ -128,7 +134,7 @@ fn transform_struct(
 pub(crate) fn apply_schema_to_struct(
     array: &dyn Array,
     kernel_fields: &Schema,
-) -> DeltaResult<StructArray> {
+) -> KernelResult<StructArray> {
     let Some(sa) = array.as_struct_opt() else {
         return Err(make_arrow_error(
             "Arrow claimed to be a struct but isn't a StructArray",
@@ -145,7 +151,7 @@ fn apply_schema_to_list(
     target_inner_type: &ArrayType,
     nearest_ancestor_struct_field: Option<&StructField>,
     relative_path: &str,
-) -> DeltaResult<ListArray> {
+) -> KernelResult<ListArray> {
     let Some(la) = array.as_list_opt() else {
         return Err(make_arrow_error(
             "Arrow claimed to be a list but isn't a ListArray",
@@ -189,7 +195,7 @@ fn apply_schema_to_map(
     kernel_map_type: &MapType,
     ancestor: Option<&StructField>,
     relative_path: &str,
-) -> DeltaResult<MapArray> {
+) -> KernelResult<MapArray> {
     let Some(ma) = array.as_map_opt() else {
         return Err(make_arrow_error(
             "Arrow claimed to be a map but isn't a MapArray",
@@ -201,7 +207,7 @@ fn apply_schema_to_map(
     let (arrow_input_fields, mut arrow_cols, arrow_struct_nulls) =
         arrow_map_struct_array.into_parts();
     if arrow_cols.len() != 2 || arrow_input_fields.len() != 2 {
-        return Err(Error::internal_error(format!(
+        return Err(KernelError::internal_error(format!(
             "Map entries struct must have exactly 2 columns (key, value), got {}",
             arrow_cols.len()
         )));
@@ -269,16 +275,56 @@ fn apply_schema_to_map(
     )?)
 }
 
+// Rebuild a `file` struct with its sub-fields in the kernel's order. A `file`'s sub-fields are
+// matched by name, in any order (see [`ensure_data_types`]), whereas [`apply_schema_to_struct`]
+// matches by position, so they are first picked by name. As for any struct, the rebuilt fields
+// take the kernel's metadata, so sub-field ids a writer put on them are dropped.
+fn apply_schema_to_file(array: &ArrayRef) -> KernelResult<StructArray> {
+    // Every `file` has the canonical sub-fields, so the canonical type is the kernel schema.
+    static KERNEL_FILE_TYPE: LazyLock<DataType> = LazyLock::new(DataType::file_type);
+    ensure_data_types(&KERNEL_FILE_TYPE, array.data_type(), ValidationMode::Full)?;
+    let Some(struct_array) = array.as_struct_opt() else {
+        return Err(make_arrow_error(
+            "Arrow claimed to be a struct but isn't a StructArray",
+        ));
+    };
+    let index_by_name: HashMap<&str, usize> = struct_array
+        .fields()
+        .iter()
+        .enumerate()
+        .map(|(index, field)| (field.name().as_str(), index))
+        .collect();
+    let (fields, columns): (Vec<_>, Vec<_>) = FILE_FIELDS
+        .fields()
+        .map(|kernel_field| {
+            let index = *index_by_name
+                .get(kernel_field.name().as_str())
+                .ok_or_else(|| {
+                    make_arrow_error(format!(
+                        "File struct is missing field `{}`",
+                        kernel_field.name()
+                    ))
+                })?;
+            Ok::<_, KernelError>((
+                struct_array.fields()[index].clone(),
+                struct_array.column(index).clone(),
+            ))
+        })
+        .process_results(|iter| iter.unzip())?;
+    let ordered = StructArray::try_new(fields.into(), columns, struct_array.nulls().cloned())?;
+    apply_schema_to_struct(&ordered, &FILE_FIELDS)
+}
+
 // Apply `schema` to `array`. This handles renaming, and adjusting nullability and metadata. if the
 // actual data types don't match, this will return an error.
-pub(crate) fn apply_schema_to(array: &ArrayRef, schema: &DataType) -> DeltaResult<ArrayRef> {
+pub(crate) fn apply_schema_to(array: &ArrayRef, schema: &DataType) -> KernelResult<ArrayRef> {
     apply_schema_to_inner(array, schema, None, "")
 }
 
 /// Recursive worker for [`apply_schema_to`]. Rebuilds `array` recursively so that its schema is
 /// aligned with the kernel-side schema. This will try to change the name, nullability, and
-/// metadata of the input `array` to match the kernel-side schema. Data values, offsets, and null
-/// buffers pass through unchanged. Specifically:
+/// metadata of the input `array` to match the kernel-side schema. Compatible leaf types are cast
+/// when needed; otherwise data buffers are shared. Specifically:
 ///
 /// - Name: use the kernel-side name when kernel has one (e.g. on a [`StructField`]); retain the
 ///   input Arrow name when kernel has none (e.g. on a list `element` or map `key`/`value`; kernel's
@@ -363,17 +409,22 @@ fn apply_schema_to_inner(
     schema: &DataType,
     ancestor: Option<&StructField>,
     relative_path: &str,
-) -> DeltaResult<ArrayRef> {
+) -> KernelResult<ArrayRef> {
     use DataType::*;
     let array: ArrayRef = match schema {
+        #[cfg(feature = "udt-in-dev")]
+        UserDefined(udt) => {
+            // Check physical type compatibility before rebuilding with logical nullability.
+            ensure_data_types(udt.sql_type(), array.data_type(), ValidationMode::TypesOnly)?;
+            // Column-mapping ancestry ends at the UDT boundary: nothing under `sqlType` carries a
+            // field ID.
+            apply_schema_to_inner(array, udt.sql_type(), None, "")?
+        }
         Struct(stype) => Arc::new(apply_schema_to_struct(array, stype)?),
+        File(_) => Arc::new(apply_schema_to_file(array)?),
         Array(atype) => Arc::new(apply_schema_to_list(array, atype, ancestor, relative_path)?),
         Map(mtype) => Arc::new(apply_schema_to_map(array, mtype, ancestor, relative_path)?),
-        // A leaf whose arrow type is only cast-compatible with the kernel type must actually be
-        // cast, the same way `reorder_struct_array` resolves `NeedsCast` on the parquet read
-        // path. Skipping the cast here would hand back an array whose type contradicts the
-        // schema this function was asked to apply, and callers derive the output field type from
-        // the returned array, so the mismatch is silent.
+        // A leaf whose type is not identical to the passed schema needs to be cast.
         _ => match ensure_data_types(schema, array.data_type(), ValidationMode::Full)? {
             DataTypeCompat::NeedsCast(target) => cast(array, &target)?,
             DataTypeCompat::Identical | DataTypeCompat::Nested => array.clone(),
@@ -398,15 +449,74 @@ mod apply_schema_validation_tests {
         DataType as ArrowDataType, Field as ArrowField, Fields, Schema as ArrowSchema, TimeUnit,
         TimestampMicrosecondType,
     };
+    #[cfg(feature = "udt-in-dev")]
+    use crate::engine::arrow_conversion::TryIntoArrow as _;
     use crate::parquet::arrow::PARQUET_FIELD_ID_META_KEY;
     use crate::schema::{
-        schema, ColumnMetadataKey, DataType, MetadataValue, StructField, StructType,
+        ColumnMetadataKey, DataType, MetadataValue, StructField, StructType, schema,
     };
     use crate::unit_test_utils::{
         array_in_map_arrow_data_without_field_ids, array_in_map_kernel_schema,
         array_in_map_with_field_ids, assert_result_error_with_message,
         collect_arrow_field_metadata, complex_nested_with_field_ids,
     };
+
+    /// Verifies that applying a UDT schema restores logical child nullability without changing
+    /// its physical container shape.
+    #[cfg(feature = "udt-in-dev")]
+    #[rstest]
+    #[case::struct_type(
+        DataType::from(schema! { nullable "x": LONG }),
+        DataType::from(schema! { not_null "x": LONG }),
+    )]
+    #[case::array(
+        DataType::from(crate::schema::ArrayType::new(DataType::LONG, true)),
+        DataType::from(crate::schema::ArrayType::new(DataType::LONG, false))
+    )]
+    #[case::map(
+        DataType::from(crate::schema::MapType::new(DataType::STRING, DataType::LONG, true)),
+        DataType::from(crate::schema::MapType::new(DataType::STRING, DataType::LONG, false))
+    )]
+    fn apply_schema_normalizes_udt_child_nullability(
+        #[case] logical: DataType,
+        #[case] physical: DataType,
+    ) {
+        let physical: ArrowDataType = (&physical).try_into_arrow().unwrap();
+        let input = crate::arrow::array::new_empty_array(&physical);
+        let udt =
+            crate::schema::UserDefinedType::try_new(logical.clone(), Default::default()).unwrap();
+        let output = apply_schema_to(&input, &DataType::from(udt)).unwrap();
+        let expected: ArrowDataType = (&logical).try_into_arrow().unwrap();
+        assert_eq!(output.data_type(), &expected);
+    }
+
+    /// Verifies that a struct-backed UDT rejects physical structs with a different arity before
+    /// rebuilding child fields.
+    #[cfg(feature = "udt-in-dev")]
+    #[rstest]
+    fn apply_schema_rejects_udt_struct_field_count_mismatch(#[values(1, 3)] count: usize) {
+        let sql_type = DataType::from(schema! { nullable "x": LONG, nullable "y": LONG });
+        let udt = crate::schema::UserDefinedType::try_new(sql_type, Default::default()).unwrap();
+        let fields: Fields = (0..count)
+            .map(|i| ArrowField::new(format!("field{i}"), ArrowDataType::Int64, false))
+            .collect();
+        let input = crate::arrow::array::new_empty_array(&ArrowDataType::Struct(fields));
+        assert_result_error_with_message(
+            apply_schema_to(&input, &DataType::from(udt)),
+            "Struct field count mismatch",
+        );
+    }
+
+    /// Verifies that schema application rejects an Arrow value incompatible with the UDT's
+    /// physical type.
+    #[cfg(feature = "udt-in-dev")]
+    #[test]
+    fn apply_schema_rejects_udt_long_over_utf8() {
+        let input: ArrayRef = Arc::new(crate::arrow::array::StringArray::from(vec!["42"]));
+        let udt =
+            crate::schema::UserDefinedType::try_new(DataType::LONG, Default::default()).unwrap();
+        assert!(apply_schema_to(&input, &DataType::from(udt)).is_err());
+    }
 
     #[rstest]
     fn apply_schema_accepts_any_binary_representation_for_variant(
@@ -436,9 +546,7 @@ mod apply_schema_validation_tests {
         assert_eq!(result.data_type(), variant.data_type());
     }
 
-    // Build a `stats_parsed`-shaped struct whose timestamp leaves are nanoseconds, which is what
-    // arrow hands back for the INT96 timestamps Spark writes by default. Kernel's `TIMESTAMP` is
-    // `Timestamp(Microsecond, "UTC")`, so every leaf here is `NeedsCast`.
+    // Model the nanosecond timestamp leaves Arrow decodes from INT96 checkpoint stats.
     fn nanosecond_stats_input() -> StructArray {
         // Micro-aligned values: a Delta table stores micros, so the INT96 Spark writes for it
         // carries a zero sub-microsecond remainder and the cast is exact.
@@ -478,11 +586,6 @@ mod apply_schema_validation_tests {
         })
     }
 
-    // `apply_schema` must return data that actually matches the schema it was asked to apply.
-    // `transform_struct` derives each output field's arrow type from the *returned array*, so a
-    // leaf that is left uncast makes `apply_schema` emit `Timestamp(Nanosecond, None)` for a field
-    // the caller asked to be `TIMESTAMP`. No error is raised, which is why the reported symptom is
-    // null min/max and no file skipping rather than a failure.
     #[test]
     fn apply_schema_casts_cast_compatible_timestamp_leaf() {
         let result = apply_schema(&nanosecond_stats_input(), &nanosecond_stats_target()).unwrap();
@@ -667,8 +770,9 @@ mod apply_schema_validation_tests {
                 .with_metadata([(field_id_key.to_string(), MetadataValue::Number(42))])),
         };
 
-        let arrow_field = ArrowField::new("a", ArrowDataType::Int32, false)
-            .with_metadata([(PARQUET_FIELD_ID_META_KEY.to_string(), "42".to_string())].into());
+        let arrow_field = ArrowField::new("a", ArrowDataType::Int32, false).with_metadata(
+            HashMap::from([(PARQUET_FIELD_ID_META_KEY.to_string(), "42".to_string())]),
+        );
         let input_array = StructArray::try_new(
             vec![arrow_field].into(),
             vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
@@ -690,8 +794,9 @@ mod apply_schema_validation_tests {
                 .with_metadata([(field_id_key.to_string(), MetadataValue::Number(42))])),
         };
 
-        let arrow_field = ArrowField::new("a", ArrowDataType::Int32, false)
-            .with_metadata([(PARQUET_FIELD_ID_META_KEY.to_string(), "99".to_string())].into());
+        let arrow_field = ArrowField::new("a", ArrowDataType::Int32, false).with_metadata(
+            HashMap::from([(PARQUET_FIELD_ID_META_KEY.to_string(), "99".to_string())]),
+        );
         let input_array = StructArray::try_new(
             vec![arrow_field].into(),
             vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
@@ -861,5 +966,203 @@ mod apply_schema_validation_tests {
             None,
         )
         .unwrap()
+    }
+}
+
+#[cfg(test)]
+mod file_tests {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::arrow::array::{BinaryArray, Int64Array, StringArray};
+    use crate::arrow::buffer::{NullBuffer, OffsetBuffer};
+    use crate::arrow::datatypes::Int64Type;
+    use crate::engine::arrow_conversion::TryIntoArrow as _;
+    use crate::schema::StructType;
+
+    /// Two `file` values whose sub-fields are in reverse order and carry field ids; the second
+    /// value is null.
+    fn reversed_file() -> StructArray {
+        let column = |name: &str, data_type: ArrowDataType, id: i32, values: ArrayRef| {
+            let field = ArrowField::new(name, data_type, true).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                id.to_string(),
+            )]));
+            (Arc::new(field), values)
+        };
+        let (fields, columns): (Vec<_>, Vec<_>) = [
+            column(
+                "inline",
+                ArrowDataType::Binary,
+                7,
+                Arc::new(BinaryArray::from(vec![None::<&[u8]>, None])),
+            ),
+            column(
+                "checksum",
+                ArrowDataType::Utf8,
+                6,
+                Arc::new(StringArray::from(vec![None::<&str>, None])),
+            ),
+            column(
+                "content_type",
+                ArrowDataType::Utf8,
+                5,
+                Arc::new(StringArray::from(vec![Some("image/png"), None])),
+            ),
+            column(
+                "size",
+                ArrowDataType::Int64,
+                4,
+                Arc::new(Int64Array::from(vec![Some(10), None])),
+            ),
+            column(
+                "offset",
+                ArrowDataType::Int64,
+                3,
+                Arc::new(Int64Array::from(vec![Some(4), None])),
+            ),
+            column(
+                "uri",
+                ArrowDataType::Utf8,
+                2,
+                Arc::new(StringArray::from(vec![Some("s3://b/a"), None])),
+            ),
+        ]
+        .into_iter()
+        .unzip();
+        let fields: Vec<ArrowField> = fields.into_iter().map(|f| f.as_ref().clone()).collect();
+        StructArray::try_new(
+            fields.into(),
+            columns,
+            Some(NullBuffer::from(vec![true, false])),
+        )
+        .unwrap()
+    }
+
+    /// Asserts that `file` has the kernel's `file` type and holds [`reversed_file`]'s values.
+    fn assert_canonical(file: &StructArray) {
+        let expected_type: ArrowDataType = (&DataType::file_type()).try_into_arrow().unwrap();
+        assert_eq!(file.data_type(), &expected_type);
+        let offset = file
+            .column_by_name("offset")
+            .unwrap()
+            .as_primitive::<Int64Type>();
+        let size = file
+            .column_by_name("size")
+            .unwrap()
+            .as_primitive::<Int64Type>();
+        assert_eq!((offset.value(0), size.value(0)), (4, 10));
+        assert_eq!(file.column(0).as_string::<i32>().value(0), "s3://b/a");
+        assert!(
+            file.is_valid(0) && file.is_null(1),
+            "the null value stays null"
+        );
+    }
+
+    /// A `file` struct whose sub-fields are in another order and carry field ids comes back in the
+    /// kernel's order, without the ids, with each value under its own name and nulls kept.
+    #[test]
+    fn test_apply_schema_to_file_matches_sub_fields_by_name() {
+        let file = reversed_file();
+        let schema = StructType::new_unchecked([StructField::nullable("f", DataType::file_type())]);
+        let data = StructArray::from(vec![(
+            Arc::new(ArrowField::new("f", file.data_type().clone(), true)),
+            Arc::new(file) as ArrayRef,
+        )]);
+
+        let batch = apply_schema(&data, &DataType::Struct(Box::new(schema))).unwrap();
+
+        assert_canonical(batch.column(0).as_struct());
+    }
+
+    /// The same holds for `file` values that are list elements.
+    #[test]
+    fn test_apply_schema_to_file_in_list() {
+        let file = reversed_file();
+        let list = ListArray::new(
+            Arc::new(ArrowField::new("element", file.data_type().clone(), true)),
+            OffsetBuffer::from_lengths([2]),
+            Arc::new(file),
+            None,
+        );
+        let schema = StructType::new_unchecked([StructField::nullable(
+            "a",
+            ArrayType::new(DataType::file_type(), true),
+        )]);
+        let data = StructArray::from(vec![(
+            Arc::new(ArrowField::new("a", list.data_type().clone(), true)),
+            Arc::new(list) as ArrayRef,
+        )]);
+
+        let batch = apply_schema(&data, &DataType::Struct(Box::new(schema))).unwrap();
+
+        assert_canonical(batch.column(0).as_list::<i32>().values().as_struct());
+    }
+
+    /// Wraps `values` as the values of a one-row map column `m`, with one string key per value.
+    fn map_column(values: ArrayRef, value_type: DataType) -> (StructArray, StructType) {
+        let keys = StringArray::from_iter_values((0..values.len()).map(|i| i.to_string()));
+        let entries = StructArray::from(vec![
+            (
+                Arc::new(ArrowField::new("key", ArrowDataType::Utf8, false)),
+                Arc::new(keys) as ArrayRef,
+            ),
+            (
+                Arc::new(ArrowField::new("value", values.data_type().clone(), true)),
+                values,
+            ),
+        ]);
+        let map = MapArray::new(
+            Arc::new(ArrowField::new(
+                "key_value",
+                ArrowDataType::Struct(entries.fields().clone()),
+                false,
+            )),
+            OffsetBuffer::from_lengths([entries.len()]),
+            entries,
+            None,
+            false,
+        );
+        let schema = StructType::new_unchecked([StructField::nullable(
+            "m",
+            MapType::new(DataType::STRING, value_type, true),
+        )]);
+        let data = StructArray::from(vec![(
+            Arc::new(ArrowField::new("m", map.data_type().clone(), true)),
+            Arc::new(map) as ArrayRef,
+        )]);
+        (data, schema)
+    }
+
+    /// The same holds for `file` values that are map values.
+    #[test]
+    fn test_apply_schema_to_file_in_map() {
+        let (data, schema) = map_column(Arc::new(reversed_file()), DataType::file_type());
+
+        let batch = apply_schema(&data, &DataType::Struct(Box::new(schema))).unwrap();
+
+        assert_canonical(batch.column(0).as_map().values().as_struct());
+    }
+
+    /// The same holds for `file` values that are list elements in a map value.
+    #[test]
+    fn test_apply_schema_to_file_in_list_in_map() {
+        let file = reversed_file();
+        let list = ListArray::new(
+            Arc::new(ArrowField::new("element", file.data_type().clone(), true)),
+            OffsetBuffer::from_lengths([2]),
+            Arc::new(file),
+            None,
+        );
+        let (data, schema) = map_column(
+            Arc::new(list),
+            ArrayType::new(DataType::file_type(), true).into(),
+        );
+
+        let batch = apply_schema(&data, &DataType::Struct(Box::new(schema))).unwrap();
+
+        let list = batch.column(0).as_map().values().as_list::<i32>();
+        assert_canonical(list.values().as_struct());
     }
 }

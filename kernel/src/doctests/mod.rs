@@ -1,3 +1,5 @@
-// doctests for macros
-mod into_engine_data;
+//! Compile-time checks for public API contracts.
+
+mod snapshot_reader;
 mod to_schema;
+mod transaction;

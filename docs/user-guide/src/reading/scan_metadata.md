@@ -46,9 +46,9 @@ For example:
 ```rust,no_run
 # extern crate delta_kernel;
 # use delta_kernel::scan::state::ScanFile;
-# use delta_kernel::{DeltaResult, Engine};
+# use delta_kernel::{KernelResult, Engine};
 # fn perform_read(_chunk: &[ScanFile]) {}
-# fn example(scan: &delta_kernel::scan::Scan, engine: &dyn Engine) -> DeltaResult<()> {
+# fn example(scan: &delta_kernel::scan::Scan, engine: &dyn Engine) -> KernelResult<()> {
 fn collect_files(files: &mut Vec<ScanFile>, file: ScanFile) {
     files.push(file);
 }
@@ -109,7 +109,7 @@ Resolve the file path against the table root and read with the physical schema:
 
 ```rust,ignore
 let file_url = scan.table_root().join(&scan_file.path)?;
-let size: u64 = scan_file.size.try_into().map_err(|_| Error::generic("negative file size"))?;
+let size: u64 = scan_file.size.try_into().map_err(|_| KernelError::generic("negative file size"))?;
 let file_meta = FileMeta::new(file_url, scan_file.modification_time, size);
 
 let read_results = engine
@@ -153,8 +153,9 @@ for batch in read_results {
 > [!WARNING]
 > If `ScanFile.transform` is present, you must apply it before returning data. Omitting the
 > transform produces incorrect output — missing partition columns, wrong logical names, or nulls
-> where data should appear. If `transform` is `None`, the physical data already matches the
-> logical schema and no transformation is needed.
+> where data should appear. If you disable row transforms through `without_row_transforms` or
+> `with_timestamp_timezone`, your connector must reconstruct logical rows itself, even though
+> `transform` is `None`. Otherwise, `None` means no per-file transform is needed.
 
 ### Applying deletion vectors
 
@@ -262,8 +263,8 @@ To have Kernel hand you the typed values directly, opt in with `with_partition_v
 # use delta_kernel_default_engine::DefaultEngine;
 # use delta_kernel_default_engine::storage::store_from_url;
 # use delta_kernel::scan::PartitionValuesOptions;
-# use delta_kernel::{DeltaResult, Snapshot};
-# fn example() -> DeltaResult<()> {
+# use delta_kernel::{KernelResult, Snapshot};
+# fn example() -> KernelResult<()> {
 # let url = delta_kernel::try_parse_uri("/tmp/table")?;
 # let store = store_from_url(&url)?;
 # let engine = DefaultEngine::builder(store).build();
@@ -278,8 +279,29 @@ let scan = snapshot
 
 Scan metadata output then gains a top-level `partitionValues_parsed` column with one typed,
 nullable field per partition column (by physical name). You read it as a typed column instead
-of parsing the string map per file. The raw string map is still present, so this option only
-adds the typed column.
+of parsing the string map per file. The raw string map is still present.
+
+By default, offset-less `TIMESTAMP` partition strings are interpreted in UTC. Use
+`PartitionValuesOptions::with_timestamp_timezone` with a recognized IANA timezone or a normalized
+`+HH:MM` or `-HH:MM` fixed offset to interpret offset-less partition values in another timezone. The
+configured timezone must match the timezone used when they were written. An explicit offset in a
+partition value takes precedence. When Kernel parses the partition string map, this setting affects
+both partition pruning and returned parsed partition values.
+
+When a checkpoint stores compatible `partitionValues_parsed`, Kernel uses those values directly
+instead of reparsing the offset-less `TIMESTAMP` partition strings with the supplied timezone. The
+`TIMESTAMP` values in that column already represent timezone-independent instants. Each value
+represents an integer number of microseconds since the Unix epoch; for example, `0` represents
+`1970-01-01T00:00:00Z` (UTC).
+
+Kernel doesn't yet support timezone-aware row transforms for `TIMESTAMP` partitions.
+`PartitionValuesOptions::with_timestamp_timezone` omits per-file row transforms when the table has
+`TIMESTAMP` partitions. As a result, `Scan::execute` returns an error in this case.
+`Scan::parallel_scan_metadata` and `Scan::declarative_metadata_scan_plan` also return errors in this
+case. You can use `scan_metadata` and reconstruct logical rows in your connector.
+
+`TIMESTAMP_NTZ` remains timezone-independent. For daylight-saving transitions, ambiguous local times
+use the earlier instant, and nonexistent local times use the offset from before the transition.
 
 > [!TIP]
 > When the checkpoint already stores typed partition values, Kernel reads that column directly
@@ -308,27 +330,24 @@ let scan = snapshot
     .build()?;
 
 for metadata in scan.scan_metadata(engine)? {
-    let metadata = metadata?; // yields Err(Error::Cancelled) once the token fires
+    let metadata = metadata?; // may yield Err(KernelError::Cancelled) if cancellation stops replay
     // ... process the batch ...
 }
 ```
 
-Cancellation is cooperative and always visible as an error, so a cancelled scan can never be
-mistaken for a complete one:
+Cancellation is cooperative. Kernel passes the token to the Engine's
+[cancellation-aware operations](../connector/implementing_engine.md#cancellation-aware-reads),
+which prevent new I/O after detecting cancellation. An Engine may also interrupt I/O already in
+flight.
 
-- Kernel polls the token at each action-batch boundary, so replay stops between reads even if the
-  engine ignores the token.
-- If the engine implements the [cancellation-aware read
-  variants](../connector/implementing_engine.md#cancellation-aware-reads), an I/O already in flight
-  can be interrupted rather than running to completion — this is what lets a scan stuck on one slow
-  file read stop promptly.
-- Either way, the outcome surfaces as `Error::Cancelled`: either returned directly from
-  `scan_metadata()` (when the token is already cancelled before replay begins) or as the terminal
-  item of its iterator. It is never a short or empty result.
+Cancellation can race with successful completion. Work already initiated may complete and its
+results may still be returned. If cancellation stops replay before completion, it surfaces as
+`KernelError::Cancelled` rather than a partial result that appears complete.
 
-Without a token, the scan is not cancellable and runs to completion as usual. Cancellation applies
-to the lazy `scan_metadata()` path; [`parallel_scan_metadata()`](./parallel_scan_metadata.md) does
-not support it and rejects a token rather than silently ignoring it.
+Without a scan token, Kernel leaves I/O cancellation to your engine's handlers, and it does
+not check cancellation while consuming cached metadata passed to `scan_metadata_from`.
+[`parallel_scan_metadata()`](./parallel_scan_metadata.md) rejects a scan token; it doesn't provide
+end-to-end cancellation across its distributed phases.
 
 ## What's next
 

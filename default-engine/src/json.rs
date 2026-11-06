@@ -20,11 +20,11 @@ use delta_kernel::object_store::{
 };
 use delta_kernel::schema::SchemaRef;
 use delta_kernel::{
-    CancellationTokenRef, DeltaResult, DeltaResultIterator, EngineData, Error,
-    FileDataReadResultIterator, FileMeta, FileSize, JsonHandler, PredicateRef,
+    CancellationTokenRef, EngineData, FileDataReadResultIterator, FileMeta, FileSize, JsonHandler,
+    KernelError, KernelResult, KernelResultIterator, PredicateRef,
 };
 use futures::stream::{self, BoxStream};
-use futures::{ready, StreamExt, TryStreamExt};
+use futures::{StreamExt, TryStreamExt, ready};
 use url::Url;
 
 use crate::executor::TaskExecutor;
@@ -91,7 +91,7 @@ async fn read_json_files_impl(
     _predicate: Option<PredicateRef>,
     batch_size: usize,
     buffer_size: usize,
-) -> DeltaResult<BoxStream<'static, DeltaResult<Box<dyn EngineData>>>> {
+) -> KernelResult<BoxStream<'static, KernelResult<Box<dyn EngineData>>>> {
     if files.is_empty() {
         return Ok(Box::pin(stream::empty()));
     }
@@ -114,7 +114,7 @@ async fn read_json_files_impl(
             let tagged = batch_stream
                 .map(move |result| fixup_json_read(result?, &reorder_indices, &file_path))
                 .boxed();
-            Ok::<_, Error>(tagged)
+            Ok::<_, KernelError>(tagged)
         }
     });
 
@@ -134,7 +134,7 @@ async fn write_json_file_impl(
     path: Url,
     buffer: Vec<u8>,
     overwrite: bool,
-) -> DeltaResult<FileSize> {
+) -> KernelResult<FileSize> {
     let size = buffer.len() as FileSize;
     let put_mode = if overwrite {
         PutMode::Overwrite
@@ -145,7 +145,9 @@ async fn write_json_file_impl(
     let path = Path::from_url_path(path.path())?;
     let result = store.put_opts(&path, buffer.into(), put_mode.into()).await;
     result.map_err(|e| match e {
-        object_store::Error::AlreadyExists { .. } => Error::FileAlreadyExists(path.to_string()),
+        object_store::Error::AlreadyExists { .. } => {
+            KernelError::FileAlreadyExists(path.to_string())
+        }
         e => e.into(),
     })?;
     Ok(size)
@@ -156,7 +158,7 @@ impl<E: TaskExecutor> JsonHandler for DefaultJsonHandler<E> {
         &self,
         json_strings: Box<dyn EngineData>,
         output_schema: SchemaRef,
-    ) -> DeltaResult<Box<dyn EngineData>> {
+    ) -> KernelResult<Box<dyn EngineData>> {
         arrow_parse_json(json_strings, output_schema)
     }
 
@@ -165,7 +167,7 @@ impl<E: TaskExecutor> JsonHandler for DefaultJsonHandler<E> {
         files: &[FileMeta],
         physical_schema: SchemaRef,
         predicate: Option<PredicateRef>,
-    ) -> DeltaResult<FileDataReadResultIterator> {
+    ) -> KernelResult<FileDataReadResultIterator> {
         self.read_json_files_with_cancellation(files, physical_schema, predicate, None)
     }
 
@@ -175,7 +177,7 @@ impl<E: TaskExecutor> JsonHandler for DefaultJsonHandler<E> {
         physical_schema: SchemaRef,
         predicate: Option<PredicateRef>,
         cancellation_token: Option<CancellationTokenRef>,
-    ) -> DeltaResult<FileDataReadResultIterator> {
+    ) -> KernelResult<FileDataReadResultIterator> {
         let future = read_json_files_impl(
             self.store.clone(),
             files.to_vec(),
@@ -195,9 +197,9 @@ impl<E: TaskExecutor> JsonHandler for DefaultJsonHandler<E> {
     fn write_json_file(
         &self,
         path: &Url,
-        data: DeltaResultIterator<'_, FilteredEngineData>,
+        data: Box<dyn KernelResultIterator<FilteredEngineData> + '_>,
         overwrite: bool,
-    ) -> DeltaResult<FileSize> {
+    ) -> KernelResult<FileSize> {
         self.task_executor.block_on(write_json_file_impl(
             self.store.clone(),
             path.clone(),
@@ -213,7 +215,7 @@ async fn open_json_file(
     schema: ArrowSchemaRef,
     batch_size: usize,
     file_meta: FileMeta,
-) -> DeltaResult<BoxStream<'static, DeltaResult<RecordBatch>>> {
+) -> KernelResult<BoxStream<'static, KernelResult<RecordBatch>>> {
     let path = Path::from_url_path(file_meta.location.path())?;
     let result = store.get(&path).await?;
     let builder = ReaderBuilder::new(schema)
@@ -222,7 +224,7 @@ async fn open_json_file(
     match result.payload {
         GetResultPayload::File(file, _) => {
             let reader = builder.build(BufReader::new(file))?;
-            let reader = futures::stream::iter(reader).map_err(Error::from);
+            let reader = futures::stream::iter(reader).map_err(KernelError::from);
 
             // Emit exactly one error, then stop the stream. We check seen_error BEFORE
             // updating it so the first error passes through, but subsequent items don't.
@@ -239,7 +241,7 @@ async fn open_json_file(
         }
         GetResultPayload::Stream(s) => {
             let mut decoder = builder.build_decoder()?;
-            let mut input = s.map_err(Error::from);
+            let mut input = s.map_err(KernelError::from);
             let mut buffered = Bytes::new();
             let s = futures::stream::poll_fn(move |cx| {
                 loop {
@@ -269,7 +271,7 @@ async fn open_json_file(
                     }
                 }
 
-                Poll::Ready(decoder.flush().map_err(Error::from).transpose())
+                Poll::Ready(decoder.flush().map_err(KernelError::from).transpose())
             });
             Ok(s.boxed())
         }
@@ -281,7 +283,7 @@ mod tests {
     use std::collections::{HashMap, HashSet, VecDeque};
     use std::ops::Range;
     use std::path::PathBuf;
-    use std::sync::{mpsc, Arc, Mutex};
+    use std::sync::{Arc, Mutex, mpsc};
     use std::task::Waker;
 
     use delta_kernel::actions::get_commit_schema;
@@ -292,7 +294,7 @@ mod tests {
     use delta_kernel::object_store::memory::InMemory;
     use delta_kernel::object_store::{
         CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
-        PutMultipartOptions, PutOptions, PutPayload, PutResult, Result,
+        PutMultipartOptions, PutOptions, PutPayload, PutResult, Result as ObjectStoreResult,
     };
     use delta_kernel::schema::schema_ref;
     use delta_kernel_default_engine_test_utils::{into_record_batch, string_array_to_engine_data};
@@ -365,7 +367,7 @@ mod tests {
             location: &Path,
             payload: PutPayload,
             opts: PutOptions,
-        ) -> Result<PutResult> {
+        ) -> ObjectStoreResult<PutResult> {
             self.inner.put_opts(location, payload, opts).await
         }
 
@@ -373,7 +375,7 @@ mod tests {
             &self,
             location: &Path,
             opts: PutMultipartOptions,
-        ) -> Result<Box<dyn MultipartUpload>> {
+        ) -> ObjectStoreResult<Box<dyn MultipartUpload>> {
             self.inner.put_multipart_opts(location, opts).await
         }
 
@@ -381,8 +383,12 @@ mod tests {
         // - if yes, remove the path from the queue and proceed with the GET request, then wake the
         //   next path in order
         // - if no, register the waker and wait
-        async fn get_opts(&self, location: &Path, options: GetOptions) -> Result<GetResult> {
-            // object_store 0.13 implements `head()` via `get_opts(..., head = true)`.
+        async fn get_opts(
+            &self,
+            location: &Path,
+            options: GetOptions,
+        ) -> ObjectStoreResult<GetResult> {
+            // object_store implements `head()` via `get_opts(..., head = true)`.
             // The ordering queue is only meant to serialize content reads for the test, so
             // skip queue accounting for HEAD probes used while constructing FileMeta.
             if options.head {
@@ -418,10 +424,10 @@ mod tests {
                     //    completed
                     // 3. the next key is the last key in the queue, in which case there is nothing
                     //    left to do (no need to wake anyone)
-                    if let Some(next_key) = state.ordered_keys.front().cloned() {
-                        if let Some(waker) = state.wakers.remove(&next_key) {
-                            waker.wake(); // NOTE: Not async, returns instantly.
-                        }
+                    if let Some(next_key) = state.ordered_keys.front().cloned()
+                        && let Some(waker) = state.wakers.remove(&next_key)
+                    {
+                        waker.wake(); // NOTE: Not async, returns instantly.
                     }
                     Poll::Ready(())
                 } else {
@@ -447,18 +453,22 @@ mod tests {
             result
         }
 
-        async fn get_ranges(&self, location: &Path, ranges: &[Range<u64>]) -> Result<Vec<Bytes>> {
+        async fn get_ranges(
+            &self,
+            location: &Path,
+            ranges: &[Range<u64>],
+        ) -> ObjectStoreResult<Vec<Bytes>> {
             self.inner.get_ranges(location, ranges).await
         }
 
         fn delete_stream(
             &self,
-            locations: BoxStream<'static, Result<Path>>,
-        ) -> BoxStream<'static, Result<Path>> {
+            locations: BoxStream<'static, ObjectStoreResult<Path>>,
+        ) -> BoxStream<'static, ObjectStoreResult<Path>> {
             self.inner.delete_stream(locations)
         }
 
-        fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, Result<ObjectMeta>> {
+        fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, ObjectStoreResult<ObjectMeta>> {
             self.inner.list(prefix)
         }
 
@@ -466,15 +476,23 @@ mod tests {
             &self,
             prefix: Option<&Path>,
             offset: &Path,
-        ) -> BoxStream<'static, Result<ObjectMeta>> {
+        ) -> BoxStream<'static, ObjectStoreResult<ObjectMeta>> {
             self.inner.list_with_offset(prefix, offset)
         }
 
-        async fn list_with_delimiter(&self, prefix: Option<&Path>) -> Result<ListResult> {
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&Path>,
+        ) -> ObjectStoreResult<ListResult> {
             self.inner.list_with_delimiter(prefix).await
         }
 
-        async fn copy_opts(&self, from: &Path, to: &Path, options: CopyOptions) -> Result<()> {
+        async fn copy_opts(
+            &self,
+            from: &Path,
+            to: &Path,
+            options: CopyOptions,
+        ) -> ObjectStoreResult<()> {
             self.inner.copy_opts(from, to, options).await
         }
     }
@@ -691,7 +709,7 @@ mod tests {
     }
 
     #[test]
-    fn test_read_invalid_json() -> Result<(), Box<dyn std::error::Error>> {
+    fn test_read_invalid_json() -> KernelResult<()> {
         let _ = tracing_subscriber::fmt().try_init();
         let (_temp_file1, file_url1) = make_invalid_named_temp();
         let (_temp_file2, file_url2) = make_invalid_named_temp();
@@ -835,7 +853,7 @@ mod tests {
     }
 
     // Helper function to create test data
-    fn create_test_data(values: Vec<&str>) -> DeltaResult<Box<dyn EngineData>> {
+    fn create_test_data(values: Vec<&str>) -> KernelResult<Box<dyn EngineData>> {
         let schema = Arc::new(ArrowSchema::new(vec![Field::new(
             "dog",
             DataType::Utf8,
@@ -850,7 +868,7 @@ mod tests {
     async fn read_json_file(
         store: &Arc<InMemory>,
         path: &Path,
-    ) -> DeltaResult<Vec<serde_json::Value>> {
+    ) -> KernelResult<Vec<serde_json::Value>> {
         let content = store.get(path).await?;
         let file_bytes = content.bytes().await?;
         let file_string =
@@ -866,16 +884,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_write_json_file_without_overwrite() -> DeltaResult<()> {
+    async fn test_write_json_file_without_overwrite() -> KernelResult<()> {
         do_test_write_json_file(false).await
     }
 
     #[tokio::test]
-    async fn test_write_json_file_overwrite() -> DeltaResult<()> {
+    async fn test_write_json_file_overwrite() -> KernelResult<()> {
         do_test_write_json_file(true).await
     }
 
-    async fn do_test_write_json_file(overwrite: bool) -> DeltaResult<()> {
+    async fn do_test_write_json_file(overwrite: bool) -> KernelResult<()> {
         let store = Arc::new(InMemory::new());
         let executor = Arc::new(TokioBackgroundExecutor::new());
         let handler = DefaultJsonHandler::new(store.clone(), executor);
@@ -909,7 +927,7 @@ mod tests {
         } else {
             // Verify the second write fails with FileAlreadyExists error
             match result {
-                Err(Error::FileAlreadyExists(err_path)) => {
+                Err(KernelError::FileAlreadyExists(err_path)) => {
                     assert_eq!(err_path, object_path.to_string());
                 }
                 _ => panic!("Expected FileAlreadyExists error, got: {result:?}"),
@@ -920,7 +938,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_write_empty_json_file_reports_zero_size() -> DeltaResult<()> {
+    async fn test_write_empty_json_file_reports_zero_size() -> KernelResult<()> {
         let store = Arc::new(InMemory::new());
         let handler =
             DefaultJsonHandler::new(store.clone(), Arc::new(TokioBackgroundExecutor::new()));

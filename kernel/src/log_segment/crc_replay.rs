@@ -16,27 +16,31 @@ use std::sync::{Arc, LazyLock};
 use tracing::{instrument, warn};
 
 use super::LogSegment;
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use crate::actions::visitors::visit_last_manifest_commit_at;
 use crate::actions::visitors::{
-    visit_metadata_at, visit_protocol_at, METADATA_LEAVES, PROTOCOL_LEAVES,
+    METADATA_LEAVES, PROTOCOL_LEAVES, visit_metadata_at, visit_protocol_at,
 };
 use crate::actions::{
-    DomainMetadata, SetTransaction, ADD_NAME, COMMIT_INFO_NAME, DOMAIN_METADATA_FIELD,
-    METADATA_FIELD, PROTOCOL_FIELD, REMOVE_NAME, SET_TRANSACTION_FIELD,
+    ADD_NAME, COMMIT_INFO_NAME, DOMAIN_METADATA_FIELD, DomainMetadata, METADATA_FIELD,
+    PROTOCOL_FIELD, REMOVE_NAME, SET_TRANSACTION_FIELD, SetTransaction,
 };
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use crate::actions::{LAST_MANIFEST_COMMIT_FIELD, LastManifestCommit};
 use crate::crc::{
-    is_incremental_safe_operation, read_crc_file_or_none, size_to_u64, Crc, CrcDelta,
-    FileSizeHistogram, FileStatsDelta,
+    Crc, CrcDelta, FileSizeHistogram, FileStatsDelta, is_incremental_safe_operation,
+    read_crc_file_or_none, size_to_u64,
 };
 use crate::engine_data::{GetData, TypedGetData as _};
 use crate::metrics::ProtocolMetadataSource;
 use crate::path::ParsedLogPath;
 use crate::schema::{
-    column_name, lazy_schema_ref, ColumnName, ColumnNamesAndTypes, DataType, MetadataColumnSpec,
-    SchemaRef, StructField,
+    ColumnName, ColumnNamesAndTypes, DataType, MetadataColumnSpec, SchemaRef, StructField,
+    StructType, column_name, lazy_schema_ref,
 };
 use crate::snapshot::IncrementalReplay;
 use crate::utils::require;
-use crate::{DeltaResult, Engine, Error, FileMeta, RowVisitor, Version};
+use crate::{Engine, FileMeta, KernelError, KernelResult, RowVisitor, Version};
 
 static REPLAY_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
     // size is the only Add leaf the visitor reads, and it is required, so its presence marks
@@ -52,12 +56,23 @@ static REPLAY_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
     (&METADATA_FIELD),
     (&SET_TRANSACTION_FIELD),
     (&DOMAIN_METADATA_FIELD),
-    nullable COMMIT_INFO_NAME: {
-        nullable "operation": STRING,
-        nullable "inCommitTimestamp": LONG,
-    },
+    (&REPLAY_COMMIT_INFO_FIELD),
     (StructField::create_metadata_column("_file", MetadataColumnSpec::FilePath)),
 };
+
+/// The commitInfo leaves CRC replay reads. `lastManifestCommit` is read only with
+/// adaptiveMetadata, so a differently shaped value there cannot fail the read in other builds.
+static REPLAY_COMMIT_INFO_FIELD: LazyLock<StructField> = LazyLock::new(|| {
+    let fields = [
+        StructField::nullable("operation", DataType::STRING),
+        StructField::nullable("inCommitTimestamp", DataType::LONG),
+    ];
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    let fields = fields
+        .into_iter()
+        .chain([LAST_MANIFEST_COMMIT_FIELD.clone()]);
+    StructField::nullable(COMMIT_INFO_NAME, StructType::new_unchecked(fields))
+});
 
 impl LogSegment {
     /// Try to build the CRC at this segment's `end_version` from the caller's resolved `base` CRC.
@@ -71,7 +86,7 @@ impl LogSegment {
         engine: &dyn Engine,
         base: Option<&Arc<Crc>>,
         incremental_replay: IncrementalReplay,
-    ) -> DeltaResult<Option<(Arc<Crc>, ProtocolMetadataSource)>> {
+    ) -> KernelResult<Option<(Arc<Crc>, ProtocolMetadataSource)>> {
         let Some(base) = base else {
             return Ok(None);
         };
@@ -90,42 +105,49 @@ impl LogSegment {
 
     /// Pick the latest CRC to use as an advance base: this segment's on-disk CRC or
     /// `in_memory_base`, whichever is newer, falling back to `in_memory_base` on a failed on-disk
-    /// read. Drops a base below the checkpoint; returns None when no candidate remains.
+    /// read, except cancellation. Drops a base below the checkpoint; returns None when no candidate
+    /// remains.
     pub(crate) fn pick_latest_base_crc(
         &self,
         engine: &dyn Engine,
         in_memory_base: Option<&Arc<Crc>>,
-    ) -> Option<Arc<Crc>> {
+    ) -> KernelResult<Option<Arc<Crc>>> {
         let preferred_disk_crc = self
             .listed
             .latest_crc_file
             .as_ref()
             .filter(|f| in_memory_base.is_none_or(|m| f.version > m.version));
-        preferred_disk_crc
-            .and_then(|f| read_crc_file_or_none(engine, f))
-            .or_else(|| in_memory_base.cloned())
-            .filter(|crc| {
-                self.checkpoint_version
-                    .is_none_or(|ckpt| crc.version >= ckpt)
-            })
+        let disk_crc = preferred_disk_crc
+            .map(|file| read_crc_file_or_none(engine, file))
+            .transpose()?
+            .flatten();
+        Ok(disk_crc.or_else(|| in_memory_base.cloned()).filter(|crc| {
+            self.checkpoint_version
+                .is_none_or(|ckpt| crc.version >= ckpt)
+        }))
     }
 
     /// Read this segment's latest on-disk CRC (`latest_crc_file`), at whatever version it sits.
-    /// Returns None when there is no CRC file or the read fails. The returned CRC may be stale
-    /// (older than `end_version`).
-    pub(crate) fn read_latest_crc(&self, engine: &dyn Engine) -> Option<Arc<Crc>> {
+    /// Returns None when there is no CRC file or a non-cancellation read failure. The CRC may be
+    /// stale (older than `end_version`).
+    pub(crate) fn read_latest_crc(&self, engine: &dyn Engine) -> KernelResult<Option<Arc<Crc>>> {
         self.pick_latest_base_crc(engine, /* in_memory_base */ None)
     }
 
     /// Produce a fresh `Crc` at `self.end_version` by reverse-replaying the commits in
     /// `(base_crc.version, self.end_version]` and applying the resulting delta to
     /// `base_crc` via [`Crc::apply`].
-    #[instrument(name = "log_seg.build_crc_from_base", skip_all, err)]
+    #[instrument(
+        name = "log_seg.build_crc_from_base",
+        skip_all,
+        fields(enable_call_frame),
+        err
+    )]
     pub(crate) fn build_crc_from_base(
         &self,
         engine: &dyn Engine,
         base_crc: &Crc,
-    ) -> DeltaResult<Crc> {
+    ) -> KernelResult<Crc> {
         let seed_histogram = base_crc
             .file_stats()
             .and_then(|s| s.file_size_histogram())
@@ -150,23 +172,16 @@ impl LogSegment {
     pub(crate) fn build_crc_from_checkpoint(
         &self,
         engine: &dyn Engine,
-    ) -> DeltaResult<Option<Crc>> {
+    ) -> KernelResult<Option<Crc>> {
         let Some(version) = self.checkpoint_version else {
             return Ok(None);
         };
-        // No commit boundaries here, so the delta stays incremental-safe. It covers the full
-        // table, which `into_complete_crc` turns into a Complete CRC.
+        // The checkpoint covers the full table, so `into_complete_crc` produces a Complete CRC.
+        // Invalid Add sizes mark replay unsafe and degrade its file stats to `Indeterminate`.
         let mut acc = CrcReplayAccumulator::new(Some(FileSizeHistogram::create_default()));
         // Read only the checkpoint parquet plus any V2 sidecars via `create_checkpoint_stream`.
         let batches = self
-            .create_checkpoint_stream(
-                engine,
-                CHECKPOINT_CRC_SCHEMA.clone(),
-                None,
-                None,
-                None,
-                None,
-            )?
+            .create_checkpoint_stream(engine, CHECKPOINT_CRC_SCHEMA.clone(), None, None, None)?
             .actions;
         for batch in batches {
             let batch = batch?;
@@ -185,24 +200,19 @@ impl LogSegment {
     pub(crate) fn build_crc_from_version_zero(
         &self,
         engine: &dyn Engine,
-    ) -> DeltaResult<Option<Crc>> {
+    ) -> KernelResult<Option<Crc>> {
         require!(
             self.checkpoint_version.is_none(),
-            Error::internal_error("build_crc_from_version_zero called with a checkpoint present")
+            KernelError::internal_error(
+                "build_crc_from_version_zero called with a checkpoint present"
+            )
         );
         let Some(first) = self.listed.ascending_commit_files.first() else {
             return Ok(None);
         };
         // A log with no checkpoint must start at version 0; a higher first version means a table
         // truncated without a checkpoint.
-        require!(
-            first.version == 0,
-            Error::generic(format!(
-                "Cannot build CRC: log has no checkpoint but its first commit is at version {} \
-                 (expected 0); the log appears truncated without a checkpoint",
-                first.version
-            ))
-        );
+        require!(first.version == 0, KernelError::MissingVersion(0));
         let delta = self.replay_commits_into_crc_delta(
             engine,
             self.listed.ascending_commit_files.iter(),
@@ -222,10 +232,10 @@ impl LogSegment {
         engine: &dyn Engine,
         base_version: Version,
         seed_histogram: Option<FileSizeHistogram>,
-    ) -> DeltaResult<CrcDelta> {
+    ) -> KernelResult<CrcDelta> {
         require!(
             base_version < self.end_version,
-            Error::internal_error(format!(
+            KernelError::internal_error(format!(
                 "build_crc_delta_from_base: base_version ({}) must be strictly less \
                  than end_version ({})",
                 base_version, self.end_version,
@@ -242,7 +252,7 @@ impl LogSegment {
         let first_above = deltas.first().map(|c| c.version);
         require!(
             first_above == Some(base_version + 1),
-            Error::internal_error(format!(
+            KernelError::internal_error(format!(
                 "build_crc_delta_from_base: segment is missing commit {} \
                  (lowest commit above base_version is {:?})",
                 base_version + 1,
@@ -260,12 +270,14 @@ impl LogSegment {
     fn replay_commits_into_crc_delta<'a>(
         &self,
         engine: &dyn Engine,
-        ascending_commits: impl DoubleEndedIterator<Item = &'a ParsedLogPath>,
+        mut ascending_commits: impl DoubleEndedIterator<Item = &'a ParsedLogPath>,
         seed_histogram: Option<FileSizeHistogram>,
-    ) -> DeltaResult<CrcDelta> {
+    ) -> KernelResult<CrcDelta> {
         // Replay newest-first: ICT capture reads from the newest commit only.
-        let locations: Vec<FileMeta> = ascending_commits
-            .rev()
+        let newest = ascending_commits.next_back();
+        let locations: Vec<FileMeta> = newest
+            .into_iter()
+            .chain(ascending_commits.rev())
             .map(|c| c.location.clone())
             .collect();
         let mut acc = CrcReplayAccumulator::new(seed_histogram);
@@ -285,7 +297,12 @@ impl LogSegment {
         // will trigger it.
         acc.process_commit_file_end();
 
-        Ok(acc.into_crc_delta())
+        let delta = acc.into_crc_delta();
+        #[cfg(feature = "adaptive-metadata-in-dev")]
+        if let (Some(newest), Some(last_manifest_commit)) = (newest, &delta.last_manifest_commit) {
+            last_manifest_commit.ensure_at_or_before(newest.version)?;
+        }
+        Ok(delta)
     }
 }
 
@@ -318,6 +335,9 @@ struct CrcReplayAccumulator {
     /// [`is_incremental_safe_operation`] safelist. If false at commit end and the commit
     /// had file actions, we can't trust the file-stats delta and mark it unsafe.
     current_commit_saw_safe_op: bool,
+
+    /// Operation name retained for diagnostics at the commit boundary.
+    current_commit_operation: Option<String>,
 }
 
 impl CrcReplayAccumulator {
@@ -335,6 +355,7 @@ impl CrcReplayAccumulator {
             current_file_url: None,
             current_commit_saw_file_action: false,
             current_commit_saw_safe_op: false,
+            current_commit_operation: None,
         }
     }
 
@@ -359,6 +380,7 @@ impl CrcReplayAccumulator {
         // Covers both "no commitInfo at all" and "commitInfo with no `operation` field".
         if self.current_commit_saw_file_action && !self.current_commit_saw_safe_op {
             warn!(
+                operation = ?self.current_commit_operation,
                 "CRC reverse-replay: commit at {} carried file actions but no safe-classified \
                  operation; defaulting to non-incremental-safe",
                 self.current_file_url.as_deref().unwrap_or("?")
@@ -367,28 +389,36 @@ impl CrcReplayAccumulator {
         }
         self.current_commit_saw_file_action = false;
         self.current_commit_saw_safe_op = false;
+        self.current_commit_operation = None;
     }
 
     // ===== Row-level updates (also the seams used by `on_*` unit tests) =====
 
-    /// Called by the visitor once per commitInfo row (gated on operation or ict being
-    /// present). Handles both pieces: `operation` drives per-commit safety classification,
-    /// `ict` is captured into the delta from the newest commit only.
-    fn on_commit_info(&mut self, operation: Option<&str>, ict: Option<i64>) {
-        if let Some(op) = operation {
-            if is_incremental_safe_operation(op) {
-                self.current_commit_saw_safe_op = true;
-            } else {
-                warn!("CRC reverse-replay: non-incremental op {op}");
-                self.delta.is_incremental_safe = false;
-            }
+    /// Called by the visitor once per commitInfo row (gated on any of its fields being present).
+    /// `operation` drives per-commit safety classification; `ict` and `last_manifest_commit` are
+    /// captured into the delta from the newest commit only, so an absent value there stays `None`.
+    fn on_commit_info(
+        &mut self,
+        operation: Option<&str>,
+        ict: Option<i64>,
+        #[cfg(feature = "adaptive-metadata-in-dev")] last_manifest_commit: Option<
+            LastManifestCommit,
+        >,
+    ) {
+        self.current_commit_operation = operation.map(str::to_owned);
+        if operation.is_some_and(is_incremental_safe_operation) {
+            self.current_commit_saw_safe_op = true;
         }
         if self.is_first_commit {
             self.delta.in_commit_timestamp = ict;
+            #[cfg(feature = "adaptive-metadata-in-dev")]
+            {
+                self.delta.last_manifest_commit = last_manifest_commit;
+            }
         }
     }
 
-    fn on_add(&mut self, size: i64) -> DeltaResult<()> {
+    fn on_add(&mut self, size: i64) -> KernelResult<()> {
         self.current_commit_saw_file_action = true;
         // Once the delta is no longer incremental-safe, [`Crc::apply`] will transition the
         // file-stats state to `Indeterminate` and discard the accumulated file stats and
@@ -396,10 +426,13 @@ impl CrcReplayAccumulator {
         if !self.delta.is_incremental_safe {
             return Ok(());
         }
+        if size < 0 {
+            warn!("CRC reverse-replay: add action has negative size {size}");
+            self.delta.is_incremental_safe = false;
+            return Ok(());
+        }
         let fs = &mut self.delta.file_stats;
         fs.gross_add_files += 1;
-        // TODO(#2676): a negative size errors here and fails the snapshot load; degrade to
-        //              Indeterminate instead, like a missing remove size.
         fs.gross_add_bytes += size_to_u64(size)?;
         if let Some(hist) = fs.net_histogram.as_mut() {
             hist.insert(size)?;
@@ -409,7 +442,7 @@ impl CrcReplayAccumulator {
 
     /// `size = None` means the remove row had a path but no size, which makes incremental
     /// tracking impossible.
-    fn on_remove(&mut self, path: &str, size: Option<i64>) -> DeltaResult<()> {
+    fn on_remove(&mut self, path: &str, size: Option<i64>) -> KernelResult<()> {
         self.current_commit_saw_file_action = true;
         // Once the delta is no longer incremental-safe, [`Crc::apply`] will transition the
         // file-stats state to `Indeterminate` and discard the accumulated file stats and
@@ -418,6 +451,10 @@ impl CrcReplayAccumulator {
             return Ok(());
         }
         match size {
+            Some(s) if s < 0 => {
+                warn!("CRC reverse-replay: remove action at {path} has negative size {s}");
+                self.delta.is_incremental_safe = false;
+            }
             Some(s) => {
                 let fs = &mut self.delta.file_stats;
                 fs.gross_remove_files += 1;
@@ -461,7 +498,7 @@ impl CrcReplayAccumulator {
         &mut self,
         i: usize,
         shared: &[&'a dyn GetData<'a>],
-    ) -> DeltaResult<()> {
+    ) -> KernelResult<()> {
         // `add.size` (required) marks an Add row.
         if let Some(size) = shared[SHARED_COL_ADD_SIZE].get_opt(i, "add.size")? {
             self.on_add(size)?;
@@ -548,12 +585,12 @@ fn check_visitor_getters(
     getters: &[&dyn GetData<'_>],
     n_fixed: usize,
     visitor_name: &str,
-) -> DeltaResult<()> {
+) -> KernelResult<()> {
     let n_protocol_leaves = PROTOCOL_LEAVES.as_ref().0.len();
     let n_metadata_leaves = METADATA_LEAVES.as_ref().0.len();
     require!(
         getters.len() == n_fixed + n_protocol_leaves + n_metadata_leaves,
-        Error::internal_error(format!(
+        KernelError::internal_error(format!(
             "Wrong number of {visitor_name} getters: {}",
             getters.len()
         ))
@@ -572,7 +609,14 @@ const COL_OP: usize = 1;
 const COL_ICT: usize = 2;
 const COL_REMOVE_PATH: usize = 3;
 const COL_REMOVE_SIZE: usize = 4;
+#[cfg(feature = "adaptive-metadata-in-dev")]
+const COL_LMC_VERSION: usize = 5;
+#[cfg(feature = "adaptive-metadata-in-dev")]
+const COL_LMC_CONTENT_ROOT_VERSION: usize = 6;
 /// Source-specific columns end here; the shared columns follow.
+#[cfg(feature = "adaptive-metadata-in-dev")]
+const N_CRC_SPECIFIC_COLS: usize = COL_LMC_CONTENT_ROOT_VERSION + 1;
+#[cfg(not(feature = "adaptive-metadata-in-dev"))]
 const N_CRC_SPECIFIC_COLS: usize = COL_REMOVE_SIZE + 1;
 const N_FIXED_COLS: usize = N_CRC_SPECIFIC_COLS + N_SHARED_SINGLE_LEAF_COLS;
 
@@ -592,13 +636,24 @@ impl RowVisitor for CommitCrcVisitor<'_> {
                 (DataType::STRING, column_name!("remove.path")),
                 (DataType::LONG, column_name!("remove.size")),
             ];
+            #[cfg(feature = "adaptive-metadata-in-dev")]
+            fixed.extend([
+                (
+                    DataType::LONG,
+                    column_name!("commitInfo.lastManifestCommit.version"),
+                ),
+                (
+                    DataType::LONG,
+                    column_name!("commitInfo.lastManifestCommit.contentRootVersion"),
+                ),
+            ]);
             fixed.extend(shared_columns());
             append_protocol_metadata_leaves(fixed).into()
         });
         NAMES_AND_TYPES.as_ref()
     }
 
-    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
+    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> KernelResult<()> {
         check_visitor_getters(getters, N_FIXED_COLS, "CommitCrcVisitor")?;
         if row_count == 0 {
             return Ok(());
@@ -611,8 +666,21 @@ impl RowVisitor for CommitCrcVisitor<'_> {
         for i in 0..row_count {
             let operation: Option<String> = getters[COL_OP].get_opt(i, "commitInfo.operation")?;
             let ict: Option<i64> = getters[COL_ICT].get_opt(i, "commitInfo.inCommitTimestamp")?;
-            if operation.is_some() || ict.is_some() {
-                self.acc.on_commit_info(operation.as_deref(), ict);
+            let is_commit_info = operation.is_some() || ict.is_some();
+            #[cfg(feature = "adaptive-metadata-in-dev")]
+            let last_manifest_commit = visit_last_manifest_commit_at(
+                i,
+                &getters[COL_LMC_VERSION..=COL_LMC_CONTENT_ROOT_VERSION],
+            )?;
+            #[cfg(feature = "adaptive-metadata-in-dev")]
+            let is_commit_info = is_commit_info || last_manifest_commit.is_some();
+            if is_commit_info {
+                self.acc.on_commit_info(
+                    operation.as_deref(),
+                    ict,
+                    #[cfg(feature = "adaptive-metadata-in-dev")]
+                    last_manifest_commit,
+                );
             }
 
             let remove_path: Option<String> = getters[COL_REMOVE_PATH].get_opt(i, "remove.path")?;
@@ -659,7 +727,7 @@ impl RowVisitor for CheckpointCrcVisitor<'_> {
         NAMES_AND_TYPES.as_ref()
     }
 
-    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
+    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> KernelResult<()> {
         check_visitor_getters(getters, N_SHARED_SINGLE_LEAF_COLS, "CheckpointCrcVisitor")?;
         for i in 0..row_count {
             self.acc.apply_shared_columns(i, getters)?;
@@ -677,7 +745,7 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
 
-    use test_utils::{add_commit, assert_result_error_with_message};
+    use test_utils::{LoggingTest, add_commit, assert_result_error_with_message};
 
     use super::*;
     use crate::crc::{DomainMetadataState, FileStats, FileStatsState, SetTransactionState};
@@ -685,25 +753,86 @@ mod tests {
     use crate::object_store::memory::InMemory;
     use crate::table_features::TableFeature;
 
+    impl CrcReplayAccumulator {
+        /// [`Self::on_commit_info`] for a commitInfo row without a `lastManifestCommit`.
+        fn on_commit_info_without_lmc(&mut self, operation: Option<&str>, ict: Option<i64>) {
+            self.on_commit_info(
+                operation,
+                ict,
+                #[cfg(feature = "adaptive-metadata-in-dev")]
+                None,
+            );
+        }
+    }
+
     // ===== Unit tests on `on_*` methods =====
 
     // ===== commitInfo =====
 
     #[rstest::rstest]
-    #[case::safe("WRITE", true)]
-    #[case::streaming_update("STREAMING UPDATE", true)]
-    #[case::unsafe_op("ANALYZE STATS", false)]
-    fn on_commit_info_classifies_operation(#[case] op: &str, #[case] is_safe: bool) {
+    #[case::safe(Some("WRITE"), true)]
+    #[case::streaming_update(Some("STREAMING UPDATE"), true)]
+    #[case::reorg(Some("REORG"), true)]
+    #[case::reorg_upgrade_uniform(Some("REORG TABLE UPGRADE UNIFORM"), false)]
+    #[case::unsafe_op(Some("ANALYZE STATS"), false)]
+    #[case::vacuum_start(Some("VACUUM START"), false)]
+    #[case::vacuum_end(Some("VACUUM END"), false)]
+    #[case::set_properties(Some("SET TBLPROPERTIES"), false)]
+    #[case::missing_operation(None, false)]
+    fn commit_safety_depends_on_operation_only_with_file_actions(
+        #[case] op: Option<&str>,
+        #[case] is_safe: bool,
+        #[values(false, true)] has_file_action: bool,
+        #[values(false, true)] commit_info_first: bool,
+    ) {
         let mut acc = CrcReplayAccumulator::new(None);
-        acc.on_commit_info(Some(op), None);
+        acc.process_batch_start("v1.json");
+        if commit_info_first {
+            acc.on_commit_info_without_lmc(op, None);
+        }
+        if has_file_action {
+            acc.on_add(0).unwrap();
+            acc.on_remove("a", Some(0)).unwrap();
+        }
+        if !commit_info_first {
+            acc.on_commit_info_without_lmc(op, None);
+        }
         assert_eq!(acc.current_commit_saw_safe_op, is_safe);
-        assert_eq!(acc.delta.is_incremental_safe, is_safe);
+        acc.process_commit_file_end();
+        assert_eq!(acc.delta.is_incremental_safe, !has_file_action || is_safe);
+    }
+
+    #[rstest::rstest]
+    #[case::unknown_operation(Some("ANALYZE STATS"), "operation=Some(\"ANALYZE STATS\")")]
+    #[case::missing_operation(None, "operation=None")]
+    fn unsafe_commit_warning_includes_operation_only_after_file_actions(
+        #[case] operation: Option<&str>,
+        #[case] expected_operation: &str,
+    ) {
+        let logging = LoggingTest::new();
+        let mut acc = CrcReplayAccumulator::new(None);
+        acc.process_batch_start("v2.json");
+        acc.on_commit_info_without_lmc(Some("VACUUM END"), None);
+        acc.process_batch_start("v1.json");
+        if let Some(operation) = operation {
+            acc.on_commit_info_without_lmc(Some(operation), None);
+        }
+        assert!(logging.logs().is_empty());
+
+        acc.on_add(0).unwrap();
+        assert!(logging.logs().is_empty());
+        acc.process_commit_file_end();
+
+        let logs = logging.logs();
+        assert!(logs.contains("commit at v1.json"), "{logs}");
+        assert!(logs.contains(expected_operation), "{logs}");
+        assert!(!logs.contains("VACUUM END"), "{logs}");
     }
 
     #[test]
     fn on_commit_info_ict_only_no_operation_does_not_mark_saw_safe_op() {
         let mut acc = CrcReplayAccumulator::new(None);
-        acc.on_commit_info(None, Some(1234));
+        acc.on_commit_info_without_lmc(None, Some(1234));
         assert!(!acc.current_commit_saw_safe_op);
         assert!(acc.delta.is_incremental_safe);
         assert_eq!(acc.delta.in_commit_timestamp, Some(1234));
@@ -713,10 +842,10 @@ mod tests {
     fn on_commit_info_captures_ict_only_on_first_commit() {
         let mut acc = CrcReplayAccumulator::new(None);
         acc.process_batch_start("v2.json");
-        acc.on_commit_info(Some("WRITE"), Some(2000));
+        acc.on_commit_info_without_lmc(Some("WRITE"), Some(2000));
         assert_eq!(acc.delta.in_commit_timestamp, Some(2000));
         acc.process_batch_start("v1.json");
-        acc.on_commit_info(Some("WRITE"), Some(1000));
+        acc.on_commit_info_without_lmc(Some("WRITE"), Some(1000));
         assert_eq!(acc.delta.in_commit_timestamp, Some(2000));
     }
 
@@ -724,11 +853,34 @@ mod tests {
     fn on_commit_info_first_commit_none_ict_does_not_get_overwritten_by_older() {
         let mut acc = CrcReplayAccumulator::new(None);
         acc.process_batch_start("v2.json");
-        acc.on_commit_info(Some("WRITE"), None);
+        acc.on_commit_info_without_lmc(Some("WRITE"), None);
         assert_eq!(acc.delta.in_commit_timestamp, None);
         acc.process_batch_start("v1.json");
-        acc.on_commit_info(Some("WRITE"), Some(1000));
+        acc.on_commit_info_without_lmc(Some("WRITE"), Some(1000));
         assert_eq!(acc.delta.in_commit_timestamp, None);
+    }
+
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[test]
+    fn on_commit_info_captures_last_manifest_commit_only_on_first_commit() {
+        let lmc = |v| Some(LastManifestCommit::new(v, v).unwrap());
+        let mut acc = CrcReplayAccumulator::new(None);
+        acc.process_batch_start("v3.json");
+        acc.on_commit_info(Some("WRITE"), None, lmc(3));
+        acc.process_batch_start("v2.json");
+        acc.on_commit_info(Some("WRITE"), None, lmc(1));
+        assert_eq!(acc.delta.last_manifest_commit, lmc(3));
+    }
+
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[test]
+    fn on_commit_info_absent_last_manifest_commit_on_newest_commit_is_not_backfilled_by_older() {
+        let mut acc = CrcReplayAccumulator::new(None);
+        acc.process_batch_start("v3.json");
+        acc.on_commit_info_without_lmc(Some("WRITE"), None);
+        acc.process_batch_start("v2.json");
+        acc.on_commit_info(None, None, Some(LastManifestCommit::new(1, 1).unwrap()));
+        assert_eq!(acc.delta.last_manifest_commit, None);
     }
 
     // ===== add =====
@@ -743,6 +895,14 @@ mod tests {
         assert!(acc.delta.is_incremental_safe);
     }
 
+    #[test]
+    fn on_add_negative_size_trips_is_incremental_safe() {
+        let mut acc = CrcReplayAccumulator::new(Some(FileSizeHistogram::create_default()));
+        acc.on_add(-1).unwrap();
+        assert!(!acc.delta.is_incremental_safe);
+        assert!(acc.current_commit_saw_file_action);
+    }
+
     // ===== remove =====
 
     #[test]
@@ -754,10 +914,20 @@ mod tests {
         assert!(acc.delta.is_incremental_safe);
     }
 
-    #[test]
-    fn on_remove_missing_size_trips_is_incremental_safe() {
+    #[rstest::rstest]
+    fn on_remove_missing_size_trips_is_incremental_safe(#[values("WRITE", "REORG")] op: &str) {
         let mut acc = CrcReplayAccumulator::new(None);
+        acc.on_commit_info_without_lmc(Some(op), None);
+        assert!(acc.delta.is_incremental_safe);
         acc.on_remove("p", None).unwrap();
+        assert!(!acc.delta.is_incremental_safe);
+        assert!(acc.current_commit_saw_file_action);
+    }
+
+    #[test]
+    fn on_remove_negative_size_trips_is_incremental_safe() {
+        let mut acc = CrcReplayAccumulator::new(Some(FileSizeHistogram::create_default()));
+        acc.on_remove("p", Some(-1)).unwrap();
         assert!(!acc.delta.is_incremental_safe);
         assert!(acc.current_commit_saw_file_action);
     }
@@ -848,13 +1018,13 @@ mod tests {
     // reachable by driving the accumulator directly.
 
     #[test]
-    fn per_commit_invariant_holds_when_file_action_and_commit_info_split_across_batches_of_one_file(
-    ) {
+    fn per_commit_invariant_holds_when_file_action_and_commit_info_split_across_batches_of_one_file()
+     {
         let mut acc = CrcReplayAccumulator::new(None);
         acc.process_batch_start("v1.json");
         acc.on_add(0).unwrap();
         acc.process_batch_start("v1.json");
-        acc.on_commit_info(Some("WRITE"), None);
+        acc.on_commit_info_without_lmc(Some("WRITE"), None);
         acc.process_commit_file_end();
         assert!(acc.delta.is_incremental_safe);
     }
@@ -874,7 +1044,7 @@ mod tests {
         let mut acc = CrcReplayAccumulator::new(None);
         acc.process_batch_start("v1.json");
         acc.on_add(100).unwrap();
-        acc.on_commit_info(None, Some(42));
+        acc.on_commit_info_without_lmc(None, Some(42));
         acc.process_commit_file_end();
         assert!(!acc.delta.is_incremental_safe);
     }
@@ -952,7 +1122,6 @@ mod tests {
             vec![],
             None,
             Some(2),
-            None,
         )
         .unwrap();
 
@@ -974,12 +1143,14 @@ mod tests {
         assert_eq!(crc.version, 2);
         assert_eq!(crc.protocol.min_writer_version(), 7);
         assert!(crc.protocol.has_table_feature(&TableFeature::RowTracking));
-        assert!(crc
-            .protocol
-            .has_table_feature(&TableFeature::InCommitTimestamp));
-        assert!(crc
-            .protocol
-            .has_table_feature(&TableFeature::DomainMetadata));
+        assert!(
+            crc.protocol
+                .has_table_feature(&TableFeature::InCommitTimestamp)
+        );
+        assert!(
+            crc.protocol
+                .has_table_feature(&TableFeature::DomainMetadata)
+        );
         assert_eq!(crc.metadata.id(), "id-2");
         assert_eq!(crc.in_commit_timestamp_opt, Some(9999));
 
@@ -1030,7 +1201,6 @@ mod tests {
             vec![],
             None,
             Some(0),
-            None,
         )
         .unwrap();
         for base in [0, 5] {
@@ -1061,12 +1231,11 @@ mod tests {
             vec![],
             None,
             Some(1),
-            None,
         )
         .unwrap();
-        assert_result_error_with_message(
+        assert!(matches!(
             segment.build_crc_from_version_zero(&engine),
-            "log appears truncated without a checkpoint",
-        );
+            Err(KernelError::MissingVersion(0))
+        ));
     }
 }

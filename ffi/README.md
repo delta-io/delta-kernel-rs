@@ -2,6 +2,87 @@
 
 This crate provides a C foreign function interface (ffi) for delta-kernel-rs.
 
+## Source layout
+
+Snapshot builders live in [`src/snapshot/builder.rs`](src/snapshot/builder.rs), with typed hint bindings
+in [`src/snapshot/hint/`](src/snapshot/hint/). Snapshot accessors live in
+[`src/lib.rs`](src/lib.rs). See the [source layout guidance](AGENTS.md#source-layout) for module
+organization conventions.
+
+## Selecting scan statistics
+
+Pass `FfiStatsOptions` to `scan_builder_with_stats` to choose JSON output, indexed structured
+statistics, or logical column paths through `StructColumns` and `AllStructWithExtraIndexed`.
+The setter replaces previous statistics options, borrows the engine and options, and copies column
+paths before returning. It consumes the builder on success and error.
+
+`FfiStatsOptions` is now a tagged union rather than a scalar enum. The setter takes a pointer to
+the options and an engine handle, and returns an `ExternResult`. This changes the C ABI: rebuild
+connectors against the regenerated headers and update their calls together with the native library.
+
+## Building an update transaction
+
+Connectors configure transaction intent on a builder and use the built transaction for
+write-dependent information and staged actions. Every `update_table_txn_builder_with_*` function
+consumes its builder handle and returns a replacement on success, so callers must overwrite the old
+handle. On error, the builder is dropped. Don't use or free the old handle. Transaction builder,
+setter, and commit calls borrow the engine handle. The caller retains ownership.
+
+```c
+HandleSharedSnapshot snapshot = /* unwrap(snapshot_builder_build(...)) */;
+HandleExclusiveUpdateTableTransactionBuilder builder =
+    unwrap(new_update_table_txn_builder(
+        snapshot, KernelUpdateTableOperationWrite, slice("my-engine/1.0"),
+        /* data_change */ true, engine));
+
+HandleExclusiveUpdateTableTransaction txn = unwrap(update_table_txn_builder_build(builder, engine));
+/* Write files, then call update_table_txn_add_files(txn, metadata). */
+txn = unwrap(update_table_txn_with_operation_metrics(txn, &metrics, engine));
+HandleExclusiveCommittedTransaction committed = unwrap(update_table_txn_commit(txn, engine));
+uint64_t version = committed_transaction_version(&committed);
+free_committed_transaction(committed);
+```
+
+Here `slice` and `unwrap` stand for the connector's usual `KernelStringSlice` and `ExternResult`
+helpers.
+
+The update operation, engine info, and `data_change` are required at construction and cannot be changed.
+For connector-defined names, use
+`new_update_table_txn_builder_with_custom_operation(snapshot, name, engine_info, data_change, engine)`.
+Both constructors validate UTF-8 before retaining the snapshot and borrow all inputs.
+The create-table constructor also requires `data_change` before the engine handle.
+
+Use `data_change = true` for logical data changes and `false` for metadata-only changes or
+data-preserving rewrites. Build validation rejects `KernelUpdateTableOperationAlterTable` with
+`true` and blind append with `false`. Configure schema operations before building in both
+standalone ALTER TABLE and schema-evolution transactions. See
+[ALTER TABLE versus schema evolution](../docs/user-guide/src/writing/alter_table.md).
+
+The typed constructor returns an `ExternResult`, not a bare builder handle. When migrating from
+setter-based configuration, update constructor calls and rebuild C/C++ connectors against the
+generated headers. The typed constructor's parameters and return type are not ABI-compatible.
+The `update_table_txn_builder_with_operation`, `update_table_txn_builder_with_custom_operation`,
+and `update_table_txn_builder_with_engine_info` setters are removed.
+
+Create-table connectors use the same shape: call `new_create_table_txn_builder`, apply
+`create_table_txn_builder_with_*` functions, then call `create_table_txn_builder_build`. Application
+transaction identifiers are available on both builders. Metadata removals are update-only. Nested
+schema changes use `update_table_txn_builder_add_column_at` and
+`update_table_txn_builder_set_nullable` with segmented `FfiColumnName` paths. A snapshot returned
+by `committed_transaction_post_commit_snapshot` is independently owned and must be released with
+`free_snapshot`.
+
+`create_table_txn_builder_with_clustering_columns` accepts `FfiColumnNameArray`, with each column
+represented by literal UTF-8 field-name segments. This supports nested paths and preserves dots
+inside field names. It replaces the flat string-array and count arguments, changing the C ABI.
+Rebuild connectors against the generated headers and update their calls together with the native
+library. Partition columns remain top-level names.
+
+The Rust builders share a generic `TransactionBuilder<T>` implementation, but the C API uses
+distinct create-table and update-table handles and function families. Shared setters call the
+common Rust implementation; custom setters remain specific to their transaction type. No generic
+type parameters or builder state cross the C boundary.
+
 ## Building
 
 ### Building Kernel and Headers
@@ -41,7 +122,7 @@ make
 ./read_table ../../../../kernel/tests/data/table-with-dv-small
 ```
 
-Note there are two configurations that can currently be configured in cmake:
+Available CMake options include:
 ```bash
 # turn on VERBOSE mode (default is off) - print more diagnostics
 $ cmake -DVERBOSE=yes ..
@@ -60,6 +141,10 @@ cmake -DPRINT_DATA=no ..
 ```
 
 and the example will only print out the schema of the table, not the data.
+
+The [UDT annotation test instructions](examples/read-table/README.md#udt-annotation-tests) describe
+building the Rust library with `udt-in-dev` and enabling CMake's `UDT_IN_DEV=ON` option to run the
+schema round-trip test.
 
 ### 2. Visit Expression Example (`examples/visit-expression`)
 
@@ -114,3 +199,20 @@ By default the VSCode C/C++ Extension does not use any defines flags. You can op
         "DEFINE_SYNC_ENGINE"
     ]
 ```
+
+## Error allocation
+
+Register both error callbacks by passing a pointer to `ErrorAllocators` to engine constructors.
+Builders and engines copy the table, so the table itself need only live through registration.
+Callback code and connector context must remain valid for every call, including concurrent calls
+when the engine is shared. Standalone FFI functions borrow an allocator table directly.
+
+Kernel errors provide `KernelErrorInfo` (numeric code and message). Delta errors provide
+`DeltaErrorInfo` (condition, optional SQLSTATE, named parameters, and message). Callbacks must copy
+any information they retain after returning. Each callback returns a connector-owned error object
+as `void*`, or NULL if allocation fails. `ExternResult::Err` returns that pointer unchanged; the
+connector frees it. Callbacks must not unwind across FFI. See `examples/common/kernel_utils.c` for
+both callbacks and their shared registration table.
+
+This changes constructor and standalone function signatures and removes the `EngineError` layout
+requirement. Rebuild bindings against the generated headers and supply both callbacks.

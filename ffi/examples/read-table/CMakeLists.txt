@@ -2,6 +2,7 @@ cmake_minimum_required(VERSION 3.12)
 project(read_table)
 option(PRINT_DATA "Print out the table data. Requires arrow-glib" ON)
 option(VERBOSE "Enable for more diagnostics messages." OFF)
+option(UDT_IN_DEV "Test UDT schema round trips. Requires delta_kernel_ffi with udt-in-dev." OFF)
 option(
   GEO_TYPE_IN_DEV
   "Register the geometry/geography schema test. Requires delta_kernel_ffi built with --features geo-type-in-dev."
@@ -15,8 +16,29 @@ target_link_directories(read_table PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/../../../
 target_link_libraries(read_table PUBLIC delta_kernel_ffi)
 target_compile_options(read_table PUBLIC)
 
-# Add the test
+# The C string model rejects embedded NULs. UDT_IN_DEV enables the engine-backed annotation
+# round trip against the schema-only Delta fixture.
 include(CTest)
+add_executable(udt_annotation_test udt_annotation_test.c ../common/kernel_utils.c)
+target_compile_definitions(udt_annotation_test PUBLIC DEFINE_DEFAULT_ENGINE_BASE)
+target_include_directories(udt_annotation_test PUBLIC
+  "${CMAKE_CURRENT_SOURCE_DIR}/../../../target/ffi-headers"
+  "${CMAKE_CURRENT_SOURCE_DIR}/../common")
+target_link_directories(udt_annotation_test PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/../../../target/debug")
+target_link_libraries(udt_annotation_test PUBLIC delta_kernel_ffi)
+add_test(NAME udt_annotation_rejects_embedded_nul COMMAND udt_annotation_test --embedded-nul)
+set_tests_properties(udt_annotation_rejects_embedded_nul PROPERTIES WILL_FAIL TRUE)
+if(UDT_IN_DEV)
+  add_test(NAME udt_annotation_round_trip COMMAND udt_annotation_test
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../tests/read-table-testing/udt-annotations/")
+endif()
+add_executable(commit_range_commit_files commit_range_commit_files.c ../common/kernel_utils.c)
+target_compile_definitions(commit_range_commit_files PUBLIC DEFINE_DEFAULT_ENGINE_BASE)
+target_include_directories(commit_range_commit_files PUBLIC
+  "${CMAKE_CURRENT_SOURCE_DIR}/../../../target/ffi-headers"
+  "${CMAKE_CURRENT_SOURCE_DIR}/../common")
+target_link_directories(commit_range_commit_files PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/../../../target/debug")
+target_link_libraries(commit_range_commit_files PUBLIC delta_kernel_ffi)
 set(TestRunner "../../../tests/read-table-testing/run_test.sh")
 set(DatPath "../../../../acceptance/tests/dat/out/reader_tests/generated")
 set(ExpectedPath "../../../tests/read-table-testing/expected-data")
@@ -27,6 +49,7 @@ add_test(NAME read_and_print_nested COMMAND ${TestRunner} ${DatPath}/nested_type
 add_test(NAME read_and_print_nested_cols COMMAND ${TestRunner} ${DatPath}/nested_types/delta/ ${ExpectedPath}/nested-types-cols.expected -cmap,struct,array)
 add_test(NAME read_and_print_basic_partitioned COMMAND ${TestRunner} ${DatPath}/basic_partitioned/delta/ ${ExpectedPath}/basic-partitioned.expected)
 add_test(NAME read_and_print_with_dv_small COMMAND ${TestRunner} ${KernelTestPath}/table-with-dv-small/ ${ExpectedPath}/table-with-dv-small.expected)
+add_test(NAME read_and_print_void_col COMMAND ${TestRunner} ${KernelTestPath}/void-column/ ${ExpectedPath}/void-column.expected -cid,void_col)
 add_test(NAME read_and_print_with_short_dv COMMAND ${TestRunner} ${KernelTestPath}/with-short-dv/ ${ExpectedPath}/with-short-dv.expected)
 # Exercises the Arrow batch-mode scan metadata path (scan_metadata_next_arrow). The arrow path
 # does not call read_parquet_file, so the data section is "[No data]"; this test still
@@ -36,8 +59,16 @@ add_test(NAME read_arrow_metadata_basic COMMAND ${TestRunner} ${DatPath}/basic_p
 # `delta.columnMapping.id`, which the schema visitor reads back via get_from_metadata_map and
 # prints per field.
 add_test(NAME read_column_mapping_metadata COMMAND ${TestRunner} ${DatPath}/column_mapping/delta/ ${ExpectedPath}/column-mapping-arrow-metadata.expected -a)
+add_test(NAME read_projected_column_mapping COMMAND ${TestRunner} ${DatPath}/column_mapping/delta/ ${ExpectedPath}/column-mapping-projected.expected -cletter,new_int)
+add_test(NAME snapshot_visit_metadata COMMAND ${TestRunner} ${KernelTestPath}/partition_cm/none/ ${ExpectedPath}/snapshot-metadata.expected -m)
+add_test(NAME commit_range_commit_files_basic_partitioned
+  COMMAND "${CMAKE_CURRENT_SOURCE_DIR}/../../tests/read-table-testing/run_commit_range_commit_files_test.sh"
+  "${CMAKE_CURRENT_SOURCE_DIR}/../../../acceptance/tests/dat/out/reader_tests/generated/basic_partitioned/delta/"
+  "${CMAKE_CURRENT_SOURCE_DIR}/../../tests/read-table-testing/expected-data/commit-range-commit-files-basic-partitioned.expected")
 if(GEO_TYPE_IN_DEV)
+  target_compile_definitions(read_table PUBLIC DEFINE_GEO_TYPE_IN_DEV)
   add_test(NAME read_and_print_geo COMMAND ${TestRunner} ${KernelTestPath}/table-with-geo/ ${ExpectedPath}/table-with-geo.expected)
+  add_test(NAME read_and_print_projected_geo COMMAND ${TestRunner} ${KernelTestPath}/table-with-geo/ ${ExpectedPath}/table-with-geo-cols.expected "-cgeom,geog -s")
 endif()
 
 if(WIN32)
@@ -47,10 +78,16 @@ endif(WIN32)
 
 if(MSVC)
   target_compile_options(read_table PRIVATE /W3 /WX)
+  target_compile_options(udt_annotation_test PRIVATE /W3 /WX)
+  target_compile_options(commit_range_commit_files PRIVATE /W3 /WX)
 else()
   # no-strict-prototypes because arrow headers have fn defs without prototypes
   target_compile_options(read_table PRIVATE -Wall -Wextra -Wpedantic -Werror -Wno-strict-prototypes -g -fsanitize=address)
   target_link_options(read_table PRIVATE -g -fsanitize=address)
+  target_compile_options(udt_annotation_test PRIVATE -Wall -Wextra -Wpedantic -Werror -Wno-strict-prototypes -g -fsanitize=address)
+  target_link_options(udt_annotation_test PRIVATE -g -fsanitize=address)
+  target_compile_options(commit_range_commit_files PRIVATE -Wall -Wextra -Wpedantic -Werror -Wno-strict-prototypes -g -fsanitize=address)
+  target_link_options(commit_range_commit_files PRIVATE -g -fsanitize=address)
 endif()
 
 if(VERBOSE)
