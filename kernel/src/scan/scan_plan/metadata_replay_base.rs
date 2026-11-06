@@ -68,8 +68,8 @@ mod tests {
     use super::*;
     use crate::Result;
     use crate::crc::Crc;
+    use crate::engine::DelegatingEngine;
     use crate::engine::arrow_data::EngineDataArrowExt as _;
-    use crate::engine::test_delegating::DelegatingEngine;
     use crate::plans::Operation as PlanOperation;
     use crate::plans::ir::nodes::Operator;
     use crate::scan::scan_plan::tests::log_segment;

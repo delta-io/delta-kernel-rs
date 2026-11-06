@@ -3,18 +3,17 @@ use std::error::Error as _;
 use std::ptr::NonNull;
 use std::sync::Arc;
 
+use delta_kernel::FileMeta;
 use delta_kernel::actions::Metadata;
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use delta_kernel::actions::{Add, LastManifestCommit};
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use delta_kernel::crc::Crc;
+use delta_kernel::engine::PanicEngine;
 use delta_kernel::last_checkpoint_hint::{LastCheckpointHint, LastCheckpointV2};
 use delta_kernel::log_segment::LogSegment;
 use delta_kernel::path::ParsedLogPath;
 use delta_kernel::snapshot::{IncrementalReplay, PublicationWatermark, Snapshot};
-use delta_kernel::{
-    Engine, EvaluationHandler, FileMeta, JsonHandler, ParquetHandler, StorageHandler,
-};
 use test_utils::table_builder::{LogState, TestTableBuilder};
 use test_utils::{TestCatalogCommitter, compacted_log_path_for_versions, create_log_path};
 
@@ -140,7 +139,7 @@ fn empty_crc() -> FfiCrc {
 }
 
 fn test_engine() -> Handle<SharedExternEngine> {
-    engine_to_handle(Arc::new(NoIoEngine), TEST_ERROR_ALLOCATORS)
+    engine_to_handle(Arc::new(PanicEngine), TEST_ERROR_ALLOCATORS)
 }
 
 #[rstest::rstest]
@@ -204,26 +203,6 @@ fn log_segment_stats_borrows_handles_and_propagates_errors_without_io(
     unsafe {
         free_snapshot(snapshot);
         free_engine(engine);
-    }
-}
-
-struct NoIoEngine;
-
-impl Engine for NoIoEngine {
-    fn evaluation_handler(&self) -> Arc<dyn EvaluationHandler> {
-        panic!("snapshot hints must not require evaluation")
-    }
-
-    fn storage_handler(&self) -> Arc<dyn StorageHandler> {
-        panic!("snapshot hints must not require storage")
-    }
-
-    fn json_handler(&self) -> Arc<dyn JsonHandler> {
-        panic!("snapshot hints must not require JSON I/O")
-    }
-
-    fn parquet_handler(&self) -> Arc<dyn ParquetHandler> {
-        panic!("snapshot hints must not require Parquet I/O")
     }
 }
 
