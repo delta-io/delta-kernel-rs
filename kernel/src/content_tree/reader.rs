@@ -35,7 +35,7 @@ use crate::content_tree::{
 use crate::engine_data::{
     EngineData, FilteredEngineData, GetData, RowVisitor, StructList, TypedGetData as _,
 };
-use crate::expressions::{ArrayData, ColumnName, Expression, MapData, Scalar, lit};
+use crate::expressions::{ArrayData, ColumnName, Expression, MapData, Scalar, expr, lit};
 use crate::scan::log_replay::{
     BASE_ROW_ID_NAME, DATA_CHANGE_NAME, DEFAULT_ROW_COMMIT_VERSION_NAME, DELETION_VECTOR_NAME,
     MODIFICATION_TIME_NAME, PARTITION_VALUES_NAME, PATH_NAME, SIZE_NAME,
@@ -410,10 +410,10 @@ impl LeafReadContext {
         let parent_sequence_number = require(parent.sequence_number, SEQUENCE_NUMBER)?;
         let sources = AddFieldSources {
             base_row_id: Expression::column([FIRST_ROW_ID_HELPER]),
-            default_row_commit_version: Expression::coalesce([
-                Expression::column([TRACKING, SEQUENCE_NUMBER]),
+            default_row_commit_version: expr!(coalesce(
+                path(TRACKING, SEQUENCE_NUMBER),
                 lit(parent_sequence_number),
-            ]),
+            )),
         };
         Ok(Self {
             next_first_row_id: require(parent.first_row_id, FIRST_ROW_ID)?,

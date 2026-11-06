@@ -15,7 +15,8 @@ use crate::arrow::datatypes::{
 };
 use crate::engine::reader_options;
 use crate::expressions::{
-    Expression, OpaquePredicateOp, ScalarExpressionEvaluator, col, column_name, column_pred, lit,
+    Expression, OpaquePredicateOp, ScalarExpressionEvaluator, col, column_name, column_pred, expr,
+    lit,
 };
 use crate::kernel_predicates::{
     DataSkippingPredicateEvaluator as _, DirectDataSkippingPredicateEvaluator,
@@ -71,23 +72,23 @@ fn test_get_stat_values() {
     let metadata = ArrowReaderMetadata::load(&file, reader_options()).unwrap();
 
     // The predicate doesn't matter -- it just needs to mention all the columns we care about.
-    let columns = Predicate::and_from(vec![
-        column_pred!("varlen.utf8"),
-        column_pred!("numeric.ints.int64"),
-        column_pred!("numeric.ints.int32"),
-        column_pred!("numeric.ints.int16"),
-        column_pred!("numeric.ints.int8"),
-        column_pred!("numeric.floats.float32"),
-        column_pred!("numeric.floats.float64"),
-        column_pred!("bool"),
-        column_pred!("varlen.binary"),
-        column_pred!("numeric.decimals.decimal32"),
-        column_pred!("numeric.decimals.decimal64"),
-        column_pred!("numeric.decimals.decimal128"),
-        column_pred!("chrono.date32"),
-        column_pred!("chrono.timestamp"),
-        column_pred!("chrono.timestamp_ntz"),
-    ]);
+    let columns = Predicate::from_expr(expr!(and(
+        col("varlen.utf8"),
+        col("numeric.ints.int64"),
+        col("numeric.ints.int32"),
+        col("numeric.ints.int16"),
+        col("numeric.ints.int8"),
+        col("numeric.floats.float32"),
+        col("numeric.floats.float64"),
+        col("bool"),
+        col("varlen.binary"),
+        col("numeric.decimals.decimal32"),
+        col("numeric.decimals.decimal64"),
+        col("numeric.decimals.decimal128"),
+        col("chrono.date32"),
+        col("chrono.timestamp"),
+        col("chrono.timestamp_ntz")
+    )));
     let filter = RowGroupFilter::new(metadata.metadata().row_group(0), &columns);
 
     assert_eq!(filter.get_rowcount_stat(), Some(5i64.into()));
@@ -591,26 +592,26 @@ fn timestamp_footer_stat_overflow_keeps_row_group(
 
     assert!(RowGroupFilter::apply(
         row_group,
-        &Predicate::lt(col!("ts"), lit(scalar(0)))
+        &Predicate::from_expr(expr!(col("ts") < lit(scalar(0))))
     ));
     assert!(RowGroupFilter::apply(
         row_group,
-        &Predicate::gt(col!("ts"), lit(scalar(0)))
+        &Predicate::from_expr(expr!(col("ts") > lit(scalar(0))))
     ));
     assert!(RowGroupFilter::apply(
         row_group,
-        &Predicate::eq(col!("ts"), lit(scalar(0)))
+        &Predicate::from_expr(expr!(col("ts") == lit(scalar(0))))
     ));
     if let Some(min) = expected_min {
         assert!(!RowGroupFilter::apply(
             row_group,
-            &Predicate::lt(col!("ts"), lit(scalar(min)))
+            &Predicate::from_expr(expr!(col("ts") < lit(scalar(min))))
         ));
     }
     if let Some(max) = expected_max {
         assert!(!RowGroupFilter::apply(
             row_group,
-            &Predicate::gt(col!("ts"), lit(scalar(max)))
+            &Predicate::from_expr(expr!(col("ts") > lit(scalar(max))))
         ));
     }
 }
@@ -665,19 +666,19 @@ fn timestamp_row_group_skipping_uses_only_available_bounds(
     );
     assert!(RowGroupFilter::apply(
         &row_group,
-        &Predicate::eq(col!("ts"), lit(scalar(1_000_000)))
+        &Predicate::from_expr(expr!(col("ts") == lit(scalar(1_000_000))))
     ));
     assert_eq!(
         RowGroupFilter::apply(
             &row_group,
-            &Predicate::lt(col!("ts"), lit(scalar(1_000_000)))
+            &Predicate::from_expr(expr!(col("ts") < lit(scalar(1_000_000))))
         ),
         !has_min
     );
     assert_eq!(
         RowGroupFilter::apply(
             &row_group,
-            &Predicate::gt(col!("ts"), lit(scalar(2_000_000)))
+            &Predicate::from_expr(expr!(col("ts") > lit(scalar(2_000_000))))
         ),
         !has_max
     );
@@ -797,7 +798,7 @@ fn timestamp_checkpoint_meta_predicate_preserves_truncated_max(
     );
     let (_, scalar) = timestamp_kind(timezone);
     let predicate = as_checkpoint_skipping_predicate(
-        &Predicate::gt(col!("ts"), lit(scalar(1_001_500))),
+        &Predicate::from_expr(expr!(col("ts") > lit(scalar(1_001_500)))),
         &HashSet::new(),
         &HashSet::new(),
         &HashSet::from([column_name!("ts")]),
@@ -875,11 +876,11 @@ fn test_row_group_filter_is_null_prunes_when_nullcount_is_zero() {
 
     assert!(!RowGroupFilter::apply(
         row_group,
-        &Predicate::is_null(col!("varlen.utf8"))
+        &Predicate::from_expr(expr!(is_null(col("varlen.utf8"))))
     ));
     assert!(RowGroupFilter::apply(
         row_group,
-        &Predicate::is_null(col!("bool"))
+        &Predicate::from_expr(expr!(is_null(col("bool"))))
     ));
 }
 
@@ -1057,7 +1058,7 @@ fn checkpoint_filter_returns_stats_when_no_nulls_in_stat_columns() {
     let metadata = checkpoint_row_group_metadata(&tmp);
     let row_group = metadata.row_group(0);
 
-    let predicate = Predicate::gt(col!("x"), lit(50i64));
+    let predicate = Predicate::from_expr(expr!(col("x") > 50i64));
     let filter = CheckpointRowGroupFilter::new(row_group, &predicate, &NO_PARTITIONS);
 
     // All stat columns are non-null, so stats should be available.
@@ -1092,7 +1093,7 @@ fn checkpoint_filter_returns_none_when_stat_column_has_nulls() {
     let metadata = checkpoint_row_group_metadata(&tmp);
     let row_group = metadata.row_group(0);
 
-    let predicate = Predicate::gt(col!("x"), lit(50i64));
+    let predicate = Predicate::from_expr(expr!(col("x") > 50i64));
     let filter = CheckpointRowGroupFilter::new(row_group, &predicate, &NO_PARTITIONS);
 
     // Stat columns have nulls (row 1), so footer aggregates are unreliable.
@@ -1121,10 +1122,7 @@ fn checkpoint_filter_partition_columns_always_available() {
     let row_group = metadata.row_group(0);
 
     let partition_columns: HashSet<String> = ["part_col".to_string()].into();
-    let predicate = Predicate::and(
-        Predicate::gt(col!("x"), lit(50i64)),
-        Predicate::eq(col!("part_col"), lit("a")),
-    );
+    let predicate = Predicate::from_expr(expr!(and(col("x") > 50i64, col("part_col") == "a")));
     let filter = CheckpointRowGroupFilter::new(row_group, &predicate, &partition_columns);
 
     // Partition column stats should always be available (not null-guarded).
@@ -1158,7 +1156,7 @@ fn checkpoint_filter_apply_keeps_row_group_with_missing_stats() {
     let metadata = checkpoint_row_group_metadata(&tmp);
     let row_group = metadata.row_group(0);
 
-    let predicate = Predicate::gt(col!("x"), lit(500i64));
+    let predicate = Predicate::from_expr(expr!(col("x") > 500i64));
     // Without null guarding, footer max=100 < 500 would falsely prune this row group.
     assert!(CheckpointRowGroupFilter::apply(
         row_group,
@@ -1180,7 +1178,7 @@ fn checkpoint_filter_apply_prunes_row_group_with_all_stats_present() {
     let metadata = checkpoint_row_group_metadata(&tmp);
     let row_group = metadata.row_group(0);
 
-    let predicate = Predicate::gt(col!("x"), lit(500i64));
+    let predicate = Predicate::from_expr(expr!(col("x") > 500i64));
     assert!(!CheckpointRowGroupFilter::apply(
         row_group,
         &predicate,
@@ -1202,7 +1200,7 @@ fn checkpoint_filter_is_null_with_all_stats_present() {
     let row_group = metadata.row_group(0);
 
     // IS NULL(x): at least one file has nullCount > 0, so keep the row group.
-    let predicate = Predicate::is_null(col!("x"));
+    let predicate = Predicate::from_expr(expr!(is_null(col("x"))));
     assert!(CheckpointRowGroupFilter::apply(
         row_group,
         &predicate,
@@ -1224,7 +1222,7 @@ fn checkpoint_filter_is_null_all_zero_nullcounts() {
     let metadata = checkpoint_row_group_metadata(&tmp);
     let row_group = metadata.row_group(0);
 
-    let predicate = Predicate::is_null(col!("x"));
+    let predicate = Predicate::from_expr(expr!(is_null(col("x"))));
     let filter = CheckpointRowGroupFilter::new(row_group, &predicate, &NO_PARTITIONS);
 
     // All nullCount entries are present (no nulls in the stat column), so the null guard
@@ -1249,7 +1247,7 @@ fn checkpoint_filter_is_not_null_never_prunes() {
     let metadata = checkpoint_row_group_metadata(&tmp);
     let row_group = metadata.row_group(0);
 
-    let predicate = Predicate::is_not_null(col!("x"));
+    let predicate = Predicate::from_expr(expr!(is_not_null(col("x"))));
     let filter = CheckpointRowGroupFilter::new(row_group, &predicate, &NO_PARTITIONS);
 
     // IS NOT NULL checks nullcount != rowcount. Since rowcount is None, the evaluator
@@ -1305,7 +1303,7 @@ fn checkpoint_filter_unknown_column_returns_none() {
     let row_group = metadata.row_group(0);
 
     // Predicate references column "y" which doesn't exist in the checkpoint.
-    let predicate = Predicate::gt(col!("y"), lit(50i64));
+    let predicate = Predicate::from_expr(expr!(col("y") > 50i64));
     let filter = CheckpointRowGroupFilter::new(row_group, &predicate, &NO_PARTITIONS);
 
     assert_eq!(
@@ -1337,10 +1335,7 @@ fn checkpoint_filter_mixed_partition_and_data_predicate() {
     let partition_columns: HashSet<String> = ["part_col".to_string()].into();
 
     // x > 500: data stats have nulls, can't prune. Overall AND can't prune.
-    let predicate = Predicate::and(
-        Predicate::eq(col!("part_col"), lit("a")),
-        Predicate::gt(col!("x"), lit(500i64)),
-    );
+    let predicate = Predicate::from_expr(expr!(and(col("part_col") == "a", col("x") > 500i64)));
     assert!(CheckpointRowGroupFilter::apply(
         row_group,
         &predicate,
@@ -1350,10 +1345,7 @@ fn checkpoint_filter_mixed_partition_and_data_predicate() {
     // part_col = "c": partition stats show min="a", max="b", so "c" is out of range.
     // But x stats are unreliable. AND("c" not in [a,b], x unknown) -- the partition arm
     // is false, so the AND is false -> can prune!
-    let predicate = Predicate::and(
-        Predicate::eq(col!("part_col"), lit("c")),
-        Predicate::gt(col!("x"), lit(5i64)),
-    );
+    let predicate = Predicate::from_expr(expr!(and(col("part_col") == "c", col("x") > 5i64)));
     assert!(!CheckpointRowGroupFilter::apply(
         row_group,
         &predicate,
@@ -1476,7 +1468,7 @@ fn checkpoint_filter_partition_is_null_prunes_when_all_values_present() {
     let row_group = metadata.row_group(0);
 
     let partition_columns: HashSet<String> = ["part_col".to_string()].into();
-    let predicate = Predicate::is_null(col!("part_col"));
+    let predicate = Predicate::from_expr(expr!(is_null(col("part_col"))));
     let filter = CheckpointRowGroupFilter::new(row_group, &predicate, &partition_columns);
 
     assert_eq!(
@@ -1557,7 +1549,7 @@ fn checkpoint_filter_multi_row_group_skipping() {
     let builder = parquet_reader(file);
     assert_eq!(builder.metadata().num_row_groups(), 2);
 
-    let predicate = Predicate::gt(col!("x"), lit(500i64));
+    let predicate = Predicate::from_expr(expr!(col("x") > 500i64));
     let builder = builder.with_checkpoint_row_group_filter(&predicate, &NO_PARTITIONS, None);
 
     // Only RG1 (x in [400, 600]) survives: max(x) = 600 > 500.
@@ -1582,16 +1574,16 @@ fn checkpoint_filter_nested_struct_column_stats() {
     let metadata = checkpoint_row_group_metadata(&tmp);
     let row_group = metadata.row_group(0);
 
-    let col = column_name!("a.b");
-    let predicate = Predicate::gt(col.clone(), Scalar::from(500i64));
+    let column = column_name!("a.b");
+    let predicate = Predicate::from_expr(expr!(col("a.b") > 500i64));
     let filter = CheckpointRowGroupFilter::new(row_group, &predicate, &NO_PARTITIONS);
 
     assert_eq!(
-        filter.get_min_stat(&col, &DataType::LONG),
+        filter.get_min_stat(&column, &DataType::LONG),
         Some(10i64.into())
     );
     assert_eq!(
-        filter.get_max_stat(&col, &DataType::LONG),
+        filter.get_max_stat(&column, &DataType::LONG),
         Some(200i64.into())
     );
     // max(x) = 200 < 500 -> can prune.

@@ -27,8 +27,8 @@ use crate::engine_data::FilteredEngineData;
 use crate::error::KernelError;
 use crate::expressions::UnaryExpressionOp::ToJson;
 use crate::expressions::{
-    ArrayData, ColumnName, ExpressionStructPatch, ExpressionStructPatchBuilder, col, column_name,
-    lit, null_lit,
+    ArrayData, ColumnName, ExpressionStructPatch, ExpressionStructPatchBuilder, Predicate, col,
+    column_name, lit, null_lit,
 };
 use crate::log_replay::HasSelectionVector;
 use crate::metrics::CommitFailureReason;
@@ -49,7 +49,7 @@ use crate::table_features::TableFeature;
 use crate::utils::require;
 use crate::{
     DataType, Engine, EngineData, Expression, ExpressionEvaluator, KernelResult,
-    KernelResultIterator, Predicate, RowVisitor, Version, create_row, version_as_i64,
+    KernelResultIterator, RowVisitor, Version, create_row, version_as_i64,
 };
 
 mod update_table;
@@ -779,17 +779,17 @@ fn build_remove_struct_patch(
     // Note: The Delta protocol requires `partitionValues`, `size`, and `tags` when
     // `extendedFileMetadata` is true. We require only `partitionValues` and `size` to match Spark.
     // Under adaptiveMetadata both are guaranteed present
-    let extended_file_metadata = Predicate::and_from([
+    let extended_file_metadata = Expression::from_pred(Predicate::and(
         col!(SIZE_NAME).is_not_null(),
         col!(FILE_CONSTANT_VALUES_NAME, PARTITION_VALUES_NAME).is_not_null(),
-    ]);
+    ));
     let mut patch = ExpressionStructPatchBuilder::new()
         // deletionTimestamp
         .insert_after("path", deletion_timestamp)
         // dataChange
         .insert_after("path", lit(data_change))
         // extended_file_metadata
-        .insert_after("path", Expression::from(extended_file_metadata))
+        .insert_after("path", extended_file_metadata)
         .insert_after(
             "path",
             col!(FILE_CONSTANT_VALUES_NAME, PARTITION_VALUES_NAME),
@@ -1054,10 +1054,10 @@ mod tests {
         } else {
             lit(commit_timestamp)
         };
-        let expected_extended_file_metadata = Expression::from_pred(Predicate::and_from([
+        let expected_extended_file_metadata = Expression::from_pred(Predicate::and(
             col!(SIZE_NAME).is_not_null(),
             col!(FILE_CONSTANT_VALUES_NAME, PARTITION_VALUES_NAME).is_not_null(),
-        ]));
+        ));
         assert_eq!(deletion_timestamp.as_ref(), &expected_deletion_timestamp);
         assert_eq!(
             extended_file_metadata.as_ref(),

@@ -15,7 +15,7 @@ use delta_kernel::arrow::compute::{concat_batches, sort_to_indices, take};
 use delta_kernel::arrow::datatypes::{
     DataType as ArrowDataType, Field, Int64Type, Schema as ArrowSchema, TimestampMicrosecondType,
 };
-use delta_kernel::expressions::{Scalar, col, lit};
+use delta_kernel::expressions::{Predicate, Scalar, expr};
 use delta_kernel::object_store::ObjectStoreExt as _;
 use delta_kernel::object_store::memory::InMemory;
 use delta_kernel::object_store::path::Path;
@@ -600,7 +600,7 @@ async fn test_scan_schema_evolved_table_with_checkpoint_predicate_on_new_column(
 
     // Scan with predicate on `id` (present in checkpoint stats_parsed) should work
     let snapshot = Snapshot::builder_for(table_root.clone()).build(engine.as_ref())?;
-    let predicate = Arc::new(col!("id").gt(lit(2i64)));
+    let predicate = Arc::new(Predicate::from_expr(expr!(col("id") > 2i64)));
     let scan = snapshot.scan_builder().with_predicate(predicate).build()?;
     let batches = read_scan(&scan, engine.clone())?;
     let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
@@ -609,7 +609,7 @@ async fn test_scan_schema_evolved_table_with_checkpoint_predicate_on_new_column(
     // Scan with predicate on `age` (missing from checkpoint stats_parsed) should NOT panic.
     // The kernel should handle the missing stats column gracefully.
     let snapshot = Snapshot::builder_for(table_root).build(engine.as_ref())?;
-    let predicate = Arc::new(col!("age").gt(lit(30i64)));
+    let predicate = Arc::new(Predicate::from_expr(expr!(col("age") > 30i64)));
     let scan = snapshot.scan_builder().with_predicate(predicate).build()?;
     let batches = read_scan(&scan, engine.clone())?;
     let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();

@@ -1225,7 +1225,7 @@ mod tests {
     use crate::expressions::{
         ArrayData, BinaryExpressionOp, BinaryPredicateOp, Expression as Expr,
         ExpressionStructPatchBuilder, JunctionPredicateOp, MapData, MapToStructOptions,
-        Predicate as Pred, StructData, col, column_expr_ref, column_pred, lit, null_lit,
+        Predicate as Pred, StructData, col, column_expr_ref, column_pred, expr, lit, null_lit,
     };
     use crate::schema::{
         ArrayType, DataType, MapType, StructField, StructType, schema, schema_ref,
@@ -1860,7 +1860,7 @@ mod tests {
         // Create coalesce expression with column that has no nulls, followed by
         // a reference to a non-existent column. If short-circuit works, the
         // non-existent column is never evaluated and no error occurs.
-        let expr = Expression::coalesce([col!("a"), col!("nonexistent")]);
+        let expr = expr!(coalesce(col("a"), col("nonexistent")));
 
         // Should return column "a" directly (short-circuit skips evaluating "nonexistent")
         let result = evaluate_expression(&expr, &batch, Some(&DataType::INTEGER)).unwrap();
@@ -1885,7 +1885,7 @@ mod tests {
 
         // Create coalesce expression: a has nulls, b has none, c doesn't exist.
         // Short-circuit should stop after evaluating b.
-        let expr = Expression::coalesce([col!("a"), col!("b"), col!("nonexistent")]);
+        let expr = expr!(coalesce(col("a"), col("b"), col("nonexistent")));
 
         // Should coalesce a and b, never evaluate "nonexistent"
         let result = evaluate_expression(&expr, &batch, Some(&DataType::INTEGER)).unwrap();
@@ -1904,7 +1904,7 @@ mod tests {
         let a_values = Int32Array::from(vec![1, 2, 3]); // No nulls - would short-circuit
         let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(a_values)]).unwrap();
 
-        let expr = Expression::coalesce([col!("a")]);
+        let expr = expr!(coalesce(col("a")));
 
         // Request STRING type but array is INT32 - should fail even with short-circuit
         let result = evaluate_expression(&expr, &batch, Some(&DataType::STRING));
@@ -2015,7 +2015,7 @@ mod tests {
         )
         .unwrap();
 
-        let pred = Pred::distinct(col!("l"), col!("r"));
+        let pred = Pred::from_expr(expr!(distinct(col("l"), col("r"))));
         let result = evaluate_predicate(&pred, &batch, false).unwrap();
         assert_eq!(result.null_count(), 0);
         assert_eq!(result.value(0), expected);
@@ -2148,7 +2148,7 @@ mod tests {
         )
         .unwrap();
 
-        let pred = Pred::is_null(col!("n"));
+        let pred = Pred::from_expr(expr!(is_null(col("n"))));
         let result = evaluate_predicate(&pred, &batch, inverted).unwrap();
         assert_eq!(result.null_count(), 0);
         assert_eq!(result.values().iter().collect::<Vec<_>>(), expected);
@@ -3683,7 +3683,7 @@ mod tests {
         vec![col!("a") + col!("b"),
              col!("b") - col!("a"),
              col!("a") * col!("b"),
-             Expr::coalesce([col!("a"), col!("b")])],
+             expr!(coalesce(col("a"), col("b")))],
         vec![vec![11, 9, 10, 1], vec![22, 18, 40, 2], vec![33, 27, 90, 3]])]
     #[case::empty_batch_n1(int_a_batch(vec![], false), vec![col!("a")], vec![])]
     #[case::empty_batch_n2(int_a_batch(vec![], false),

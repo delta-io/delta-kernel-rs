@@ -400,7 +400,7 @@ mod tests {
     };
     use delta_kernel::arrow::datatypes::{DataType as ArrowDataType, Field, Schema};
     use delta_kernel::engine::arrow_expression::evaluate_expression::evaluate_predicate;
-    use delta_kernel::expressions::{Expression, Predicate, col, lit};
+    use delta_kernel::expressions::{Expression, Predicate, col, expr, lit};
 
     use super::*;
     use crate::KernelStringSlice;
@@ -1168,7 +1168,7 @@ mod tests {
         #[test]
         fn recursively_rewrites_predicate_child() {
             let op = op_with_callbacks("OP");
-            let inner = Predicate::lt(col!("col"), lit(5i64));
+            let inner = Predicate::from_expr(expr!(col("col") < 5i64));
             let args = [Expression::Predicate(Box::new(inner))];
 
             let pred = rewrite(&op, &args, &rewriter(), false).expect("rewrite should succeed");
@@ -1220,7 +1220,7 @@ mod tests {
         #[test]
         fn preserves_arity_for_mixed_args() {
             let op = op_with_callbacks("OP");
-            let inner = Predicate::lt(col!("y"), lit(5i64));
+            let inner = Predicate::from_expr(expr!(col("y") < 5i64));
             let args = [
                 col!("col"),
                 lit(1i64),

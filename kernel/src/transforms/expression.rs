@@ -623,7 +623,7 @@ mod tests {
     use crate::expressions::{
         Expression, Expression as Expr, MapToStructOptions, OpaqueExpressionOp, OpaquePredicateOp,
         ParseJsonExpression, Predicate as Pred, Scalar, ScalarExpressionEvaluator,
-        VariadicExpression, col, column_name, column_pred, lit,
+        VariadicExpression, col, column_name, column_pred, expr, lit,
     };
     use crate::kernel_predicates::{
         DirectDataSkippingPredicateEvaluator, DirectPredicateEvaluator,
@@ -1037,11 +1037,11 @@ mod tests {
                     vec![lit(10) + col!("x"), Expr::unknown("unknown") - col!("b")],
                 ),
                 Pred::TRUE,
-                Pred::not(Pred::TRUE),
+                Pred::from_expr(expr!(not(true))),
             ]),
             Pred::and_from([
-                Pred::is_null(col!("b")),
-                Pred::gt(lit(10), col!("x")),
+                Pred::from_expr(expr!(is_null(col("b")))),
+                Pred::from_expr(expr!(10 > col("x"))),
                 Pred::or(
                     Pred::gt(
                         lit(5)
@@ -1192,7 +1192,7 @@ mod tests {
             }
         }
 
-        let pred = Pred::and(column_pred!("x"), Pred::TRUE);
+        let pred = Pred::from_expr(expr!(and(col("x"), true)));
         let mut transform = LiteralRemover;
         let result = transform.transform_pred(&pred);
         let result = result.map(Cow::into_owned);
@@ -1216,7 +1216,7 @@ mod tests {
             }
         }
 
-        let pred = Pred::and(column_pred!("x"), column_pred!("y"));
+        let pred = Pred::from_expr(expr!(and(col("x"), col("y"))));
         let mut transform = ColumnRemover;
         assert!(transform.transform_pred(&pred).is_none());
     }
