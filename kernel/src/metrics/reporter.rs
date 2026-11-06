@@ -10,7 +10,7 @@ use tracing_subscriber::Layer;
 use tracing_subscriber::layer::Context;
 
 use super::events::{
-    CrcReadSuccess, DomainMetadataLoadSuccess, JsonReadCompleted, LogSegmentLoadSuccess,
+    CrcReadSuccess, CrcWrite, DomainMetadataLoadSuccess, JsonReadCompleted, LogSegmentLoadSuccess,
     MetricEvent, ParquetReadCompleted, ProtocolMetadataLoadSuccess, STORAGE_SPAN,
     ScanMetadataCompleted, SetTransactionLoadSuccess, SnapshotBuildSuccess,
     TransactionCommitSuccess, storage_metric_from_attrs,
@@ -129,6 +129,7 @@ where
             CrcReadSuccess::SPAN_NAME => Some(MetricEvent::CrcReadSuccess(
                 CrcReadSuccess::from_attrs(attrs),
             )),
+            CrcWrite::SPAN_NAME => Some(MetricEvent::CrcWrite(CrcWrite::from_attrs(attrs))),
             JsonReadCompleted::SPAN_NAME => Some(MetricEvent::JsonReadCompleted(
                 JsonReadCompleted::from_attrs(attrs),
             )),
@@ -150,7 +151,7 @@ where
 
     // RUNTIME CHANNEL. on_event carries log lines, not metric writes; its only metric effect is the
     // `#[instrument(err)]` failure signal, which FailureFlipVisitor turns into the event's failure
-    // counterpart.
+    // variant or error outcome.
     fn on_event(&self, event: &tracing::Event<'_>, ctx: Context<'_, S>) {
         let Some(span) = ctx.event_span(event) else {
             return;

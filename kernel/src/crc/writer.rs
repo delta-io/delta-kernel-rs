@@ -10,7 +10,8 @@ use crate::{Engine, KernelError, KernelResult};
 /// Serialize and write a CRC file to storage.
 ///
 /// Serializes the [`Crc`] to JSON via serde and writes the raw bytes using the storage
-/// handler. Returns [`KernelError::ChecksumWriteUnsupported`] if:
+/// handler. Returns the serialized byte count on success. Returns
+/// [`KernelError::ChecksumWriteUnsupported`] if:
 /// - `file_stats_state` is not `Complete` (only `Complete` CRCs have a well-defined on-disk
 ///   representation); or
 /// - `delta.enableInCommitTimestamps` is `true` but `inCommitTimestampOpt` is absent.
@@ -18,7 +19,7 @@ use crate::{Engine, KernelError, KernelResult};
 /// Per the Delta protocol, writers MUST NOT overwrite existing CRC files, so this always
 /// writes with `overwrite = false`. If the file already exists, returns
 /// `Err(KernelError::FileAlreadyExists)`.
-pub(crate) fn try_write_crc_file(engine: &dyn Engine, path: &Url, crc: &Crc) -> KernelResult<()> {
+pub(crate) fn try_write_crc_file(engine: &dyn Engine, path: &Url, crc: &Crc) -> KernelResult<u64> {
     require!(
         crc.file_stats_state.is_complete(),
         KernelError::ChecksumWriteUnsupported(format!(
@@ -41,9 +42,11 @@ pub(crate) fn try_write_crc_file(engine: &dyn Engine, path: &Url, crc: &Crc) -> 
         )
     );
     let data = serde_json::to_vec(crc)?;
+    let bytes_written = data.len() as u64;
     engine
         .storage_handler()
-        .put(path, data.into(), false /* overwrite */)
+        .put(path, data.into(), false /* overwrite */)?;
+    Ok(bytes_written)
 }
 
 #[cfg(test)]

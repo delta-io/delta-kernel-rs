@@ -88,14 +88,14 @@ mod streaming_metrics_iterator;
 use std::sync::Arc;
 
 pub use events::{
-    CommitFailureReason, CrcReadSuccess, DomainMetadataLoadSuccess, JsonReadCompleted,
-    LogSegmentLoadFailure, LogSegmentLoadSuccess, LogSegmentLoadType, MetricEvent, MetricId,
-    ParquetReadCompleted, ProtocolMetadataLoadFailure, ProtocolMetadataLoadSuccess,
-    ProtocolMetadataSource, ScanMetadataCompleted, ScanType, SetTransactionLoadSuccess,
-    SnapshotBuildFailure, SnapshotBuildSuccess, SnapshotLoadMetricContext, SnapshotLoadType,
-    StorageCopyCompleted, StorageListCompleted, StorageReadCompleted, TableType,
-    TransactionCommitFailure, TransactionCommitSuccess, emit_json_read_completed,
-    emit_parquet_read_completed,
+    CommitFailureReason, CrcReadSuccess, CrcWrite, CrcWriteOutcome, CrcWriteResolutionMode,
+    DomainMetadataLoadSuccess, JsonReadCompleted, LogSegmentLoadFailure, LogSegmentLoadSuccess,
+    LogSegmentLoadType, MetricEvent, MetricId, ParquetReadCompleted, ProtocolMetadataLoadFailure,
+    ProtocolMetadataLoadSuccess, ProtocolMetadataSource, ScanMetadataCompleted, ScanType,
+    SetTransactionLoadSuccess, SnapshotBuildFailure, SnapshotBuildSuccess,
+    SnapshotLoadMetricContext, SnapshotLoadType, StorageCopyCompleted, StorageListCompleted,
+    StorageReadCompleted, TableType, TransactionCommitFailure, TransactionCommitSuccess,
+    emit_json_read_completed, emit_parquet_read_completed,
 };
 pub(crate) use events::{
     emit_log_segment_load, emit_log_segment_load_failure, emit_protocol_metadata_load,
