@@ -469,6 +469,33 @@ mod tests {
         assert_eq!(columns, expected);
     }
 
+    /// A required `file` column expands to its six sub-fields, like a required struct, even past
+    /// the column limit.
+    #[test]
+    fn test_required_file_column_expands_to_sub_fields() {
+        let props = make_props_with_num_cols(1);
+        let required_cols = vec![column_name!("f")];
+        let schema = StructType::new_unchecked([
+            StructField::nullable("a", DataType::LONG),
+            StructField::nullable("f", DataType::file_type()),
+        ]);
+
+        let columns = collect_stats_columns(&props, Some(&required_cols), &schema);
+        let expected: Vec<_> = [
+            "a",
+            "f.uri",
+            "f.offset",
+            "f.size",
+            "f.content_type",
+            "f.checksum",
+            "f.inline",
+        ]
+        .into_iter()
+        .map(ColumnName::from_naive_str_split)
+        .collect();
+        assert_eq!(columns, expected);
+    }
+
     #[test]
     fn test_required_column_not_in_schema() {
         // Required column that doesn't exist in schema should be silently ignored

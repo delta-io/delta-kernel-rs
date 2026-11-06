@@ -632,15 +632,32 @@ fn scan_file_count(
 }
 
 /// A predicate on a `file` sub-field with min/max statistics skips data files, like one on any
-/// column, with or without column mapping. `inline` has only `nullCount`, which `IS NULL`
-/// predicates use; predicates on `checksum` skip nothing.
+/// column, with or without column mapping, and with statistics read from commits or from a
+/// checkpoint's struct statistics. `inline` has only `nullCount`, which `IS NULL` predicates use;
+/// predicates on `checksum` skip nothing.
 #[rstest]
 #[tokio::test(flavor = "multi_thread")]
 async fn test_predicate_on_file_sub_field_skips_files(
     #[values("none", "name")] cm_mode: &str,
+    #[values(false, true)] checkpoint: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let (_tmp_dir, _table_path, engine, snapshot) =
-        write_table(cm_mode, DataType::file_type(), Arc::new(file_values())).await?;
+    let ids: ArrayRef = Arc::new(Int32Array::from_iter_values(0..3));
+    let (_tmp_dir, _table_path, engine, snapshot) = write_columns(
+        vec![
+            (StructField::nullable("id", DataType::INTEGER), ids),
+            (
+                StructField::nullable("c", DataType::file_type()),
+                Arc::new(file_values()),
+            ),
+        ],
+        &[
+            ("delta.columnMapping.mode", cm_mode),
+            // A checkpoint then holds only struct statistics, so skipping must use them.
+            ("delta.checkpoint.writeStatsAsStruct", "true"),
+            ("delta.checkpoint.writeStatsAsJson", "false"),
+        ],
+    )
+    .await?;
     let mut snapshot = snapshot?;
     // A second data file, with one larger file at another `uri`.
     let files = file_array(&[Some((Some("s3://bucket/b.png"), None, Some(1000), None))]);
@@ -654,6 +671,10 @@ async fn test_predicate_on_file_sub_field_skips_files(
         vec![Arc::new(Int32Array::from(vec![10])), Arc::new(files)],
     )?;
     snapshot = write_batch_to_table(&snapshot, engine.as_ref(), batch, HashMap::new()).await?;
+    if checkpoint {
+        snapshot.checkpoint(engine.as_ref(), None)?;
+        snapshot = Snapshot::builder_for(snapshot.table_root().clone()).build(engine.as_ref())?;
+    }
 
     // (Predicates resolve only leaf columns, so a predicate on the whole `file` column, like one
     // on a whole struct, is rejected when the scan is built.)

@@ -290,12 +290,10 @@ impl<'a> SchemaTransform<'a> for NullCountStatsTransform {
         match &field.data_type {
             DataType::Struct(_) => self.recurse_into_struct_field(field),
             // A `file` column's sub-fields are leaves; its counts are a plain struct of them.
-            DataType::File(stype) => Cow::Owned(StructField {
-                name: field.name.clone(),
-                data_type: DataType::Struct(Box::new(self.transform_struct(stype).into_owned())),
-                nullable: true,
-                metadata: field.metadata.clone(),
-            }),
+            DataType::File(file_fields) => make_nullable_field(
+                field,
+                Cow::Owned(self.transform_struct(file_fields).into_owned().into()),
+            ),
             _ => Cow::Owned(StructField {
                 name: field.name.clone(),
                 data_type: DataType::LONG,
@@ -387,22 +385,18 @@ impl<'a> SchemaTransform<'a> for MinMaxStatsTransform {
 
     /// A `file` column's bounds are a plain struct of the sub-fields that have min/max statistics.
     fn transform_struct_field(&mut self, field: &'a StructField) -> Option<Cow<'a, StructField>> {
-        let DataType::File(stype) = &field.data_type else {
+        let DataType::File(file_fields) = &field.data_type else {
             return self.recurse_into_struct_field(field);
         };
-        let sub_fields: Vec<_> = stype
+        let sub_fields: Vec<_> = file_fields
             .fields()
             .filter(|f| file_sub_field_has_min_max(f.name()))
             .filter_map(|f| self.transform_struct_field(f))
             .map(Cow::into_owned)
             .collect();
         (!sub_fields.is_empty()).then(|| {
-            Cow::Owned(StructField {
-                name: field.name.clone(),
-                data_type: DataType::Struct(Box::new(StructType::new_unchecked(sub_fields))),
-                nullable: true,
-                metadata: field.metadata.clone(),
-            })
+            let data_type = StructType::new_unchecked(sub_fields).into();
+            make_nullable_field(field, Cow::Owned(data_type))
         })
     }
 
