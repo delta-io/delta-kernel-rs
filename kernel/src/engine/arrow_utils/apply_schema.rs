@@ -11,10 +11,11 @@ use super::super::arrow_conversion::{
 use super::make_arrow_error;
 use crate::KernelResult;
 use crate::arrow::array::{
-    Array, ArrayRef, AsArray, ListArray, MapArray, RecordBatch, StructArray,
+    Array, ArrayRef, AsArray, GenericListArray, GenericListViewArray, MapArray, OffsetSizeTrait,
+    RecordBatch, StructArray,
 };
 use crate::arrow::datatypes::{
-    DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
+    DataType as ArrowDataType, Field as ArrowField, FieldRef, Schema as ArrowSchema,
 };
 use crate::engine::ensure_data_types::{ValidationMode, ensure_data_types};
 use crate::error::KernelError;
@@ -138,48 +139,129 @@ pub(crate) fn apply_schema_to_struct(
     transform_struct(sa, kernel_fields.fields())
 }
 
-// Rebuild a [`ListArray`] under the contract of [`apply_schema_to_inner`] (see that fn's doc
-// for an example). The inner value field's `PARQUET:field_id` (if any) is looked up at
-// `<relative_path>.element` on `nearest_ancestor_struct_field`'s nested-ids JSON.
+// Rebuild a `List`, `LargeList`, `ListView`, or `LargeListView` array under the contract of
+// [`apply_schema_to_inner`] (see that fn's doc for an example). The rebuilt array keeps the
+// input's Arrow list type and reuses its offsets, sizes, and null buffer.
 fn apply_schema_to_list(
+    array: &ArrayRef,
+    target_inner_type: &ArrayType,
+    ancestor: Option<&StructField>,
+    relative_path: &str,
+) -> KernelResult<ArrayRef> {
+    let rebuilt: ArrayRef = match array.data_type() {
+        ArrowDataType::LargeList(_) => Arc::new(apply_schema_to_generic_list::<i64>(
+            array,
+            target_inner_type,
+            ancestor,
+            relative_path,
+        )?),
+        ArrowDataType::ListView(_) => Arc::new(apply_schema_to_generic_list_view::<i32>(
+            array,
+            target_inner_type,
+            ancestor,
+            relative_path,
+        )?),
+        ArrowDataType::LargeListView(_) => Arc::new(apply_schema_to_generic_list_view::<i64>(
+            array,
+            target_inner_type,
+            ancestor,
+            relative_path,
+        )?),
+        _ => Arc::new(apply_schema_to_generic_list::<i32>(
+            array,
+            target_inner_type,
+            ancestor,
+            relative_path,
+        )?),
+    };
+    Ok(rebuilt)
+}
+
+fn apply_schema_to_generic_list<O: OffsetSizeTrait>(
     array: &dyn Array,
     target_inner_type: &ArrayType,
-    nearest_ancestor_struct_field: Option<&StructField>,
+    ancestor: Option<&StructField>,
     relative_path: &str,
-) -> KernelResult<ListArray> {
-    let Some(la) = array.as_list_opt() else {
+) -> KernelResult<GenericListArray<O>> {
+    let Some(la) = array.as_list_opt::<O>() else {
         return Err(make_arrow_error(
             "Arrow claimed to be a list but isn't a ListArray",
         ));
     };
-    let (arrow_element_field, offset_buffer, arrow_values, nulls) = la.clone().into_parts();
+    let (element_field, offsets, values, nulls) = la.clone().into_parts();
+    let (element_field, values) = apply_schema_to_list_element(
+        &element_field,
+        &values,
+        target_inner_type,
+        ancestor,
+        relative_path,
+    )?;
+    Ok(GenericListArray::try_new(
+        element_field,
+        offsets,
+        values,
+        nulls,
+    )?)
+}
 
+fn apply_schema_to_generic_list_view<O: OffsetSizeTrait>(
+    array: &dyn Array,
+    target_inner_type: &ArrayType,
+    ancestor: Option<&StructField>,
+    relative_path: &str,
+) -> KernelResult<GenericListViewArray<O>> {
+    let Some(lv) = array.as_list_view_opt::<O>() else {
+        return Err(make_arrow_error(
+            "Arrow claimed to be a list view but isn't a ListViewArray",
+        ));
+    };
+    let (element_field, offsets, sizes, values, nulls) = lv.clone().into_parts();
+    let (element_field, values) = apply_schema_to_list_element(
+        &element_field,
+        &values,
+        target_inner_type,
+        ancestor,
+        relative_path,
+    )?;
+    Ok(GenericListViewArray::try_new(
+        element_field,
+        offsets,
+        sizes,
+        values,
+        nulls,
+    )?)
+}
+
+// Rebuild a list's element field and values. The element field's `PARQUET:field_id` (if any) is
+// looked up at `<relative_path>.element` on `ancestor`'s nested-ids JSON.
+fn apply_schema_to_list_element(
+    element_field: &ArrowField,
+    values: &ArrayRef,
+    target_inner_type: &ArrayType,
+    ancestor: Option<&StructField>,
+    relative_path: &str,
+) -> KernelResult<(FieldRef, ArrayRef)> {
     let element_path = format!("{relative_path}.{LIST_ARRAY_ROOT}");
-    let element_id = nearest_ancestor_struct_field
+    let element_id = ancestor
         .map(|f| lookup_nested_field_id(f, &element_path))
         .transpose()?
         .flatten();
-    let transformed_arrow_values = apply_schema_to_inner(
-        &arrow_values,
+    let transformed_values = apply_schema_to_inner(
+        values,
         &target_inner_type.element_type,
-        nearest_ancestor_struct_field,
+        ancestor,
         &element_path,
     )?;
 
     // Bare element type carries no kernel-side metadata; `PARQUET:field_id` is the only
     // metadata to set, looked up from the ancestor's nested-ids JSON.
-    let transformed_arrow_element_field = ArrowField::new(
-        arrow_element_field.name(),
-        transformed_arrow_values.data_type().clone(),
+    let transformed_field = ArrowField::new(
+        element_field.name(),
+        transformed_values.data_type().clone(),
         target_inner_type.contains_null,
     )
     .with_metadata(parquet_field_id_metadata(element_id));
-    Ok(ListArray::try_new(
-        Arc::new(transformed_arrow_element_field),
-        offset_buffer,
-        transformed_arrow_values,
-        nulls,
-    )?)
+    Ok((Arc::new(transformed_field), transformed_values))
 }
 
 // Rebuild a [`MapArray`] under the contract of [`apply_schema_to_inner`] (see that fn's doc
@@ -417,7 +499,7 @@ fn apply_schema_to_inner(
         }
         Struct(stype) => Arc::new(apply_schema_to_struct(array, stype)?),
         File(_) => Arc::new(apply_schema_to_file(array)?),
-        Array(atype) => Arc::new(apply_schema_to_list(array, atype, ancestor, relative_path)?),
+        Array(atype) => apply_schema_to_list(array, atype, ancestor, relative_path)?,
         Map(mtype) => Arc::new(apply_schema_to_map(array, mtype, ancestor, relative_path)?),
         _ => {
             ensure_data_types(schema, array.data_type(), ValidationMode::Full)?;
@@ -435,8 +517,10 @@ mod apply_schema_validation_tests {
     use rstest::rstest;
 
     use super::*;
-    use crate::arrow::array::{ArrayRef, BinaryArray, Int32Array, RecordBatch, StructArray};
-    use crate::arrow::buffer::{BooleanBuffer, NullBuffer};
+    use crate::arrow::array::{
+        ArrayRef, BinaryArray, Int32Array, ListArray, RecordBatch, StructArray, make_array,
+    };
+    use crate::arrow::buffer::{BooleanBuffer, NullBuffer, OffsetBuffer};
     use crate::arrow::compute::cast;
     use crate::arrow::datatypes::{
         DataType as ArrowDataType, Field as ArrowField, Fields, Schema as ArrowSchema,
@@ -536,6 +620,60 @@ mod apply_schema_validation_tests {
         let result = apply_schema_to(&variant, &DataType::unshredded_variant()).unwrap();
 
         assert_eq!(result.data_type(), variant.data_type());
+    }
+
+    /// A list column keeps its Arrow list type and data, and takes the kernel's element
+    /// nullability and nested field id.
+    #[rstest]
+    fn test_apply_schema_keeps_arrow_list_type(
+        #[values(
+            ArrowDataType::List,
+            ArrowDataType::LargeList,
+            ArrowDataType::ListView,
+            ArrowDataType::LargeListView
+        )]
+        list_type: fn(FieldRef) -> ArrowDataType,
+    ) {
+        let element = |nullable: bool, metadata: HashMap<String, String>| {
+            Arc::new(
+                ArrowField::new("custom_item", ArrowDataType::Int32, nullable)
+                    .with_metadata(metadata),
+            )
+        };
+        let list = ListArray::new(
+            element(false, HashMap::new()),
+            OffsetBuffer::from_lengths([1, 2, 0, 1]),
+            Arc::new(Int32Array::from(vec![1, 2, 3, 4])),
+            Some(NullBuffer::from(vec![true, true, false, true])),
+        );
+        // Sliced so the first offset is non-zero.
+        let input = cast(&list, &list_type(element(false, HashMap::new())))
+            .unwrap()
+            .slice(1, 3);
+        let schema = schema! {
+            (StructField::nullable("a", ArrayType::new(DataType::INTEGER, true)).with_metadata([(
+                ColumnMetadataKey::ColumnMappingNestedIds.as_ref().to_string(),
+                MetadataValue::Other(test_utils::nested_ids_json(&[("a.element", 7)])),
+            )])),
+        };
+        let data = StructArray::from(vec![(
+            Arc::new(ArrowField::new("a", input.data_type().clone(), true)),
+            input.clone(),
+        )]);
+
+        let batch = apply_schema(&data, &DataType::from(schema)).unwrap();
+
+        let field_id = HashMap::from([(PARQUET_FIELD_ID_META_KEY.to_string(), "7".to_string())]);
+        let expected_type = list_type(element(true, field_id));
+        let expected = make_array(
+            input
+                .to_data()
+                .into_builder()
+                .data_type(expected_type)
+                .build()
+                .unwrap(),
+        );
+        assert_eq!(batch.column(0).as_ref(), expected.as_ref());
     }
 
     #[test]
@@ -907,7 +1045,7 @@ mod file_tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::arrow::array::{BinaryArray, Int64Array, StringArray};
+    use crate::arrow::array::{BinaryArray, Int64Array, ListArray, StringArray};
     use crate::arrow::buffer::{NullBuffer, OffsetBuffer};
     use crate::arrow::datatypes::Int64Type;
     use crate::engine::arrow_conversion::TryIntoArrow as _;

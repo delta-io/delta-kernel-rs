@@ -1,11 +1,13 @@
 //! Integration tests for type-specific writes (timestampNtz, variant, shredded variant).
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use delta_kernel::arrow::array::{
-    ArrayRef, BinaryArray, Int32Array, StructArray, TimestampMicrosecondArray, new_null_array,
+    Array, ArrayRef, BinaryArray, Int32Array, Int32Builder, LargeListArray, LargeListBuilder,
+    StringArray, StringBuilder, StructArray, TimestampMicrosecondArray, new_null_array,
 };
-use delta_kernel::arrow::buffer::NullBuffer;
+use delta_kernel::arrow::buffer::{NullBuffer, OffsetBuffer};
 use delta_kernel::arrow::datatypes::{DataType as ArrowDataType, Field};
 use delta_kernel::arrow::record_batch::RecordBatch;
 use delta_kernel::committer::FileSystemCommitter;
@@ -22,7 +24,8 @@ use rstest::rstest;
 use serde_json::Deserializer;
 use tempfile::tempdir;
 use test_utils::{
-    create_add_files_metadata, create_table, engine_store_setup, test_read, test_table_setup,
+    create_add_files_metadata, create_table, create_table_and_load_snapshot, engine_store_setup,
+    test_read, test_table_setup, write_batch_to_table,
 };
 use url::Url;
 
@@ -618,6 +621,76 @@ async fn test_not_null_data_column_rejects_null_in_batch(
         "batch construction should reject null in NOT NULL column ({data_type:?}); got: {result:?}",
     );
 
+    Ok(())
+}
+
+/// Writes `LargeList` columns (a list of strings, a list of structs, and a list inside a struct)
+/// through the logical-to-physical transform and reads them back. The batch is sliced so every
+/// list's first offset is non-zero.
+#[rstest]
+#[tokio::test]
+async fn test_write_large_list_columns(
+    #[values("none", "id", "name")] column_mapping_mode: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let schema = schema_ref! {
+        nullable "tags": [ nullable STRING ],
+        nullable "items": [ nullable { nullable "label": STRING } ],
+        nullable "meta": { nullable "ids": [ nullable INTEGER ] },
+    };
+    let (_tmp_dir, table_path, engine) = test_table_setup()?;
+    let snapshot = create_table_and_load_snapshot(
+        &table_path,
+        schema,
+        engine.as_ref(),
+        &[("delta.columnMapping.mode", column_mapping_mode)],
+    )?;
+
+    let mut tags = LargeListBuilder::new(StringBuilder::new());
+    tags.extend([
+        Some(vec![Some("dropped")]),
+        Some(vec![Some("a"), None]),
+        None,
+        Some(vec![]),
+    ]);
+    let tags = tags.finish();
+    let labels: ArrayRef = Arc::new(StringArray::from(vec![
+        Some("dropped"),
+        Some("x"),
+        None,
+        Some("z"),
+    ]));
+    let item_values = StructArray::from(vec![(
+        Arc::new(Field::new("label", ArrowDataType::Utf8, true)),
+        labels,
+    )]);
+    let items = LargeListArray::new(
+        Arc::new(Field::new_list_field(item_values.data_type().clone(), true)),
+        OffsetBuffer::from_lengths([1, 2, 0, 1]),
+        Arc::new(item_values),
+        Some(NullBuffer::from(vec![true, true, false, true])),
+    );
+    let mut ids = LargeListBuilder::new(Int32Builder::new());
+    ids.extend([
+        Some(vec![Some(0)]),
+        Some(vec![Some(1), Some(2)]),
+        None,
+        Some(vec![]),
+    ]);
+    let ids = ids.finish();
+    let meta = StructArray::from(vec![(
+        Arc::new(Field::new("ids", ids.data_type().clone(), true)),
+        Arc::new(ids) as ArrayRef,
+    )]);
+    let data = RecordBatch::try_from_iter([
+        ("tags", Arc::new(tags) as ArrayRef),
+        ("items", Arc::new(items) as ArrayRef),
+        ("meta", Arc::new(meta) as ArrayRef),
+    ])?
+    .slice(1, 3);
+
+    write_batch_to_table(&snapshot, engine.as_ref(), data.clone(), HashMap::new()).await?;
+
+    test_read(&ArrowEngineData::new(data), snapshot.table_root(), engine)?;
     Ok(())
 }
 
