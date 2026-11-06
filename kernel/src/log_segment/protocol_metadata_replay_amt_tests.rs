@@ -1479,11 +1479,9 @@ async fn segment_with_compaction(
 }
 
 // A log compaction holds the P&M in effect at its last version, so non-plan replay ranks it there.
-// Each case leaves Protocol or Metadata only in the pointed action, so replay reads it. A
-// compaction that hides the pointed commit and a later Metadata change beats the pointed action's
-// older Metadata, while one without Metadata leaves the pointed action's Metadata in place. The
-// plan path never reads such a compaction: it reads the pointed commit itself and only commits
-// after it.
+// Each case leaves Protocol or Metadata only in the newest commit's lagging checkpoint action,
+// whose version falls inside the compaction. A compaction holding a later Metadata change beats
+// that action's older Metadata, while one without Metadata leaves the action's Metadata in place.
 #[rstest]
 #[case::later_metadata_in_compaction_wins(
     metadata_commit(one_column_schema()),
@@ -1504,9 +1502,9 @@ async fn non_plan_replay_ranks_compaction_at_its_last_version(
     let commits = [
         first_commit,
         txn_commit(),
-        checkpoint_commit(2, &[], one_column_schema()),
+        txn_commit(),
         compacted_commit.clone(),
-        commit_info(Some((2, 2))),
+        carrying_pointer((4, 2), checkpoint_action(2, &[], one_column_schema())),
     ];
     assert_compaction_ranked(
         &commits,
