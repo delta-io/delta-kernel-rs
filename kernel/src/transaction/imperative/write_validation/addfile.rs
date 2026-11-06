@@ -227,15 +227,13 @@ mod tests {
     use test_utils::replace_column;
 
     use super::*;
-    use crate::actions::NUM_RECORDS;
-    use crate::arrow::array::{ArrayRef, BooleanArray, Int64Array, StringArray, StructArray};
-    use crate::arrow::datatypes::{DataType as ArrowDataType, Field};
+    use crate::arrow::array::{ArrayRef, Int64Array, StringArray};
     use crate::arrow::record_batch::RecordBatch;
     use crate::engine::arrow_data::ArrowEngineData;
     use crate::expressions::column_name;
     use crate::unit_test_utils::{
         add_files_with_partition_values, assert_result_error_with_message, nullable_add_file,
-        nullable_add_files, set_field_as_null,
+        nullable_add_files, set_field_as_null, tight_stats_struct,
     };
 
     /// Test helper that provides an empty file-action (addFile, removeFile) uniqueness validator.
@@ -487,23 +485,15 @@ mod tests {
         paths: &[&str],
         tight_stats: Option<&[Option<bool>]>,
     ) -> Box<dyn EngineData> {
-        let num_records: ArrayRef = Arc::new(Int64Array::from(vec![1; paths.len()]));
-        let mut stats_fields = vec![(
-            Arc::new(Field::new(NUM_RECORDS, ArrowDataType::Int64, true)),
-            num_records,
-        )];
-        if let Some(values) = tight_stats {
-            stats_fields.push((
-                Arc::new(Field::new(TIGHT_STATS, ArrowDataType::Boolean, true)),
-                Arc::new(BooleanArray::from(values.to_vec())),
-            ));
-        }
         let batch = RecordBatch::try_from_iter([
             (
                 "path",
                 Arc::new(StringArray::from(paths.to_vec())) as ArrayRef,
             ),
-            (STATS_NAME, Arc::new(StructArray::from(stats_fields))),
+            (
+                STATS_NAME,
+                Arc::new(tight_stats_struct(paths.len(), tight_stats)),
+            ),
         ])
         .unwrap();
         Box::new(ArrowEngineData::new(batch))

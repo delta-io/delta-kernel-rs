@@ -854,9 +854,7 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
-    use crate::actions::{
-        ADD_SCHEMA, MAX_VALUES, MIN_VALUES, NULL_COUNT, NUM_RECORDS, TIGHT_STATS,
-    };
+    use crate::actions::{ADD_SCHEMA, MAX_VALUES, MIN_VALUES, NULL_COUNT, NUM_RECORDS};
     use crate::arrow::array::builder::{MapBuilder, MapFieldNames, StringBuilder};
     use crate::arrow::array::{
         Array, ArrayRef, BooleanArray, Int64Array, StringArray, StructArray, new_null_array,
@@ -878,7 +876,7 @@ mod tests {
     use crate::transaction::operation::UpdateTableOperation;
     use crate::unit_test_utils::{
         MockProtocolBuilder, MockTableConfigurationBuilder, assert_result_error_with_message,
-        copy_test_table, create_valid_add_file_batch, test_schema_flat,
+        copy_test_table, create_valid_add_file_batch, test_schema_flat, tight_stats_struct,
     };
     use crate::{EvaluationHandler, ExpressionEvaluator, PredicateEvaluator, Snapshot};
 
@@ -1467,16 +1465,7 @@ mod tests {
     /// A valid add-file row whose `stats` struct is `{numRecords, tightStats}`.
     fn add_file_with_tight_stats(tight_stats: Option<bool>) -> Box<dyn EngineData> {
         let batch = create_valid_add_file_batch(true /* all_nullable */);
-        let stats = StructArray::from(vec![
-            (
-                Arc::new(Field::new(NUM_RECORDS, ArrowDataType::Int64, true)),
-                Arc::new(Int64Array::from(vec![1])) as ArrayRef,
-            ),
-            (
-                Arc::new(Field::new(TIGHT_STATS, ArrowDataType::Boolean, true)),
-                Arc::new(BooleanArray::from(vec![tight_stats])),
-            ),
-        ]);
+        let stats = tight_stats_struct(1, Some(&[tight_stats]));
         let schema = batch.schema();
         let stats_index = schema.index_of(STATS_NAME).unwrap();
         let mut fields = schema.fields().to_vec();
