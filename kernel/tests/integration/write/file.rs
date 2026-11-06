@@ -14,7 +14,7 @@ use delta_kernel::arrow::datatypes::{
 };
 use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
 use delta_kernel::engine::{FileGroup, file_groups};
-use delta_kernel::expressions::{Predicate as Pred, Scalar, column_expr};
+use delta_kernel::expressions::{Predicate as Pred, expr};
 use delta_kernel::object_store::DynObjectStore;
 use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::schema::{
@@ -485,17 +485,14 @@ async fn test_predicate_on_file_column_skips_no_files() -> Result<(), Box<dyn st
     // resolve only leaf columns, so a predicate on the whole `file` column, like one on a whole
     // struct, is rejected when the scan is built.)
     for predicate in [
-        Pred::eq(
-            column_expr!("c.uri"),
-            Scalar::from("s3://bucket/missing.png"),
-        ),
-        Pred::gt(column_expr!("c.size"), Scalar::from(1_000_000i64)),
+        Pred::from_expr(expr!(col("c.uri") == "s3://bucket/missing.png")),
+        Pred::from_expr(expr!(col("c.size") > 1_000_000i64)),
     ] {
         let files = scan_file_count(&snapshot, engine.as_ref(), predicate.clone())?;
         assert_eq!(files, 2, "{predicate:?}");
     }
     // The control: `id` has statistics, so `id >= 10` skips the first data file.
-    let skipping = Pred::ge(column_expr!("id"), Scalar::from(10));
+    let skipping = Pred::from_expr(expr!(col("id") >= 10));
     assert_eq!(scan_file_count(&snapshot, engine.as_ref(), skipping)?, 1);
     Ok(())
 }
@@ -540,17 +537,17 @@ async fn test_predicate_on_file_column_ignores_file_stats() -> Result<(), Box<dy
 
     // Each predicate contradicts both files' statistics for the `file` column.
     for predicate in [
-        Pred::eq(column_expr!("c.uri"), Scalar::from("s3://b/other")),
-        Pred::gt(column_expr!("c.offset"), Scalar::from(100i64)),
-        Pred::lt(column_expr!("c.size"), Scalar::from(5i64)),
-        Pred::eq(column_expr!("c.content_type"), Scalar::from("text/plain")),
-        Pred::is_null(column_expr!("c.uri")),
+        Pred::from_expr(expr!(col("c.uri") == "s3://b/other")),
+        Pred::from_expr(expr!(col("c.offset") > 100i64)),
+        Pred::from_expr(expr!(col("c.size") < 5i64)),
+        Pred::from_expr(expr!(col("c.content_type") == "text/plain")),
+        Pred::from_expr(expr!(is_null(col("c.uri")))),
     ] {
         let files = scan_file_count(&snapshot, engine.as_ref(), predicate.clone())?;
         assert_eq!(files, 2, "{predicate:?}");
     }
     // The control: `id` statistics are used, so `id = 2` skips `a.parquet`.
-    let skipping = Pred::eq(column_expr!("id"), Scalar::from(2));
+    let skipping = Pred::from_expr(expr!(col("id") == 2));
     assert_eq!(scan_file_count(&snapshot, engine.as_ref(), skipping)?, 1);
     Ok(())
 }
