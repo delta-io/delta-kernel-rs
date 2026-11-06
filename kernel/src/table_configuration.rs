@@ -248,21 +248,16 @@ fn strip_metadata(schema: SchemaRef) -> SchemaRef {
 /// Builds one side of [`StatsOutputSchemas`] for explicitly selected columns.
 ///
 /// Logical and physical output schemas both use this path so they follow the canonical stats
-/// selection rules and omit table-column metadata.
-fn build_stats_schema_for_columns(
+/// selection rules and omit table-column metadata. `base` supplies every option except the
+/// column selection.
+fn build_stats_schema_for_columns<'a>(
     data_schema: &StructType,
-    selected_columns: &[ColumnName],
-    variant_min_max: bool,
-    #[cfg(feature = "geo-type-in-dev")] geometry_min_max: bool,
-    tight_stats: bool,
+    selected_columns: &'a [ColumnName],
+    base: &StatsConfig<'a>,
 ) -> KernelResult<SchemaRef> {
     let config = StatsConfig {
         data_skipping_stats_columns: Some(selected_columns),
-        data_skipping_num_indexed_cols: None,
-        variant_min_max,
-        #[cfg(feature = "geo-type-in-dev")]
-        geometry_min_max,
-        tight_stats,
+        ..*base
     };
     let required_columns = None;
     let requested_columns = None;
@@ -659,13 +654,17 @@ impl TableConfiguration {
         variant_min_max: bool,
         #[cfg(feature = "geo-type-in-dev")] geometry_min_max: bool,
     ) -> KernelResult<Option<StatsOutputSchemas>> {
-        let logical = build_stats_schema_for_columns(
-            &self.logical_schema_without_partition_columns(),
-            logical_columns,
+        let base = StatsConfig {
             variant_min_max,
             #[cfg(feature = "geo-type-in-dev")]
             geometry_min_max,
-            self.is_adaptive_metadata_enabled(),
+            tight_stats: self.is_adaptive_metadata_enabled(),
+            ..Default::default()
+        };
+        let logical = build_stats_schema_for_columns(
+            &self.logical_schema_without_partition_columns(),
+            logical_columns,
+            &base,
         )?;
         // `expected_stats_schema` emits `nullCount` only when a data column is selected.
         if logical.field(NULL_COUNT).is_none() {
@@ -675,10 +674,7 @@ impl TableConfiguration {
         let physical = build_stats_schema_for_columns(
             &self.physical_data_schema_without_partition_columns(),
             physical_columns,
-            variant_min_max,
-            #[cfg(feature = "geo-type-in-dev")]
-            geometry_min_max,
-            self.is_adaptive_metadata_enabled(),
+            &base,
         )?;
 
         Ok(Some(StatsOutputSchemas::try_new(logical, physical)?))
