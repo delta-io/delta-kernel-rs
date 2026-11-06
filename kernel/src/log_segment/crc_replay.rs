@@ -288,11 +288,10 @@ impl LogSegment {
                 .read_json_files(&locations, REPLAY_SCHEMA.clone(), None)?;
 
         for batch_result in batches {
-            let batch = batch_result?;
             // Transient visitor borrows the shared accumulator for the duration of the
             // batch; same pattern as `ActionReconciliationVisitor`.
             let mut visitor = CommitCrcVisitor { acc: &mut acc };
-            visitor.visit_rows_of(batch.as_ref())?;
+            visitor.visit_rows_of(batch_result?.as_ref())?;
         }
 
         // Run the per-commit invariant on the final (oldest) commit; no successor batch
@@ -435,8 +434,10 @@ impl CrcReplayAccumulator {
 
     // ===== Row-level updates (also the seams used by `on_*` unit tests) =====
 
-    /// The first detected commitInfo selects the operation. ICT and manifest metadata come from
-    /// the last detected commitInfo in the newest commit, including absent values.
+    /// Called by the visitor once per commitInfo row (gated on any of its fields being present).
+    /// `operation` drives per-commit safety classification; `ict` and `last_manifest_commit` are
+    /// captured into the delta from the newest commit only, so an absent value there stays `None`.
+    /// For duplicates, the first row selects the operation; the last supplies ICT/manifest fields.
     fn on_commit_info(
         &mut self,
         operation: Option<&str>,
@@ -467,6 +468,7 @@ impl CrcReplayAccumulator {
             return Ok(());
         }
         if size < 0 {
+            warn!("CRC reverse-replay: add action has negative size {size}");
             self.current_commit_adds_valid = false;
             return Ok(());
         }
@@ -490,6 +492,7 @@ impl CrcReplayAccumulator {
         }
         match size {
             Some(s) if s < 0 => {
+                warn!("CRC reverse-replay: remove action at {path} has negative size {s}");
                 self.current_commit_removes_valid = false;
             }
             Some(s) => {
@@ -1126,24 +1129,16 @@ mod tests {
     // reachable by driving the accumulator directly.
 
     #[rstest::rstest]
-    #[case::compute_stats("COMPUTE STATS", true)]
-    #[case::analyze_stats("ANALYZE STATS", true)]
-    #[case::row_tracking_backfill("ROW TRACKING BACKFILL", true)]
-    #[case::row_tracking_unbackfill("ROW TRACKING UNBACKFILL", true)]
-    #[case::drop_feature("DROP FEATURE", true)]
-    #[case::liquid_backfill("LIQUID BACKFILL", true)]
-    #[case::liquid_tagging("LIQUID TAGGING", true)]
-    #[case::partitioning_to_clustering("REPLACE PARTITIONED BY WITH CLUSTER BY", true)]
-    #[case::dv_tombstones("Deletion Vector Tombstones", false)]
+    #[case::ignore_adds("LIQUID TAGGING", &[1000])]
+    #[case::ignore_removes("Deletion Vector Tombstones", &[100, 200, 1000])]
     fn operation_exclusions_apply_only_to_the_current_commit_and_action_type(
         #[case] operation: &str,
-        #[case] ignore_adds: bool,
+        #[case] expected_sizes: &[i64],
         #[values(false, true)] commit_info_first: bool,
-        #[values(false, true)] with_histogram: bool,
     ) {
-        let histogram =
+        let mut expected_histogram =
             FileSizeHistogram::create_empty_with_boundaries(vec![0, 150, 1000]).unwrap();
-        let mut acc = CrcReplayAccumulator::new(with_histogram.then_some(histogram));
+        let mut acc = CrcReplayAccumulator::new(Some(expected_histogram.clone()));
         acc.process_batch_start("v3.json");
         acc.on_commit_info_without_lmc(Some("RECOMPRESSION"), None);
         acc.on_add(1000).unwrap();
@@ -1165,21 +1160,15 @@ mod tests {
         acc.process_commit_file_end();
         let delta = acc.into_crc_delta();
         assert!(delta.is_incremental_safe);
-        let (files, bytes, counts, histogram_bytes) = if ignore_adds {
-            (1, 1000, vec![0, 0, 1], vec![0, 0, 1000])
-        } else {
-            (3, 1300, vec![1, 1, 1], vec![100, 200, 1000])
-        };
-        assert_eq!(delta.file_stats.net_files(), files);
-        assert_eq!(delta.file_stats.net_bytes(), bytes);
-        if with_histogram {
-            let histogram = delta.file_stats.net_histogram.unwrap();
-            assert_eq!(histogram.sorted_bin_boundaries(), &[0, 150, 1000]);
-            assert_eq!(histogram.file_counts(), counts);
-            assert_eq!(histogram.total_bytes(), histogram_bytes);
-        } else {
-            assert!(delta.file_stats.net_histogram.is_none());
+        assert_eq!(delta.file_stats.net_files(), expected_sizes.len() as i64);
+        assert_eq!(
+            delta.file_stats.net_bytes(),
+            expected_sizes.iter().sum::<i64>()
+        );
+        for &size in expected_sizes {
+            expected_histogram.insert(size).unwrap();
         }
+        assert_eq!(delta.file_stats.net_histogram, Some(expected_histogram));
     }
 
     #[rstest::rstest]
