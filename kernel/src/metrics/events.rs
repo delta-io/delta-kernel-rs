@@ -326,7 +326,7 @@ impl fmt::Display for MetricEvent {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, StrumDisplay, AsRefStr, IntoStaticStr)]
 #[strum(serialize_all = "snake_case")]
 pub enum CheckpointWriteOutcome {
-    /// Checkpoint data, hint finalization, and returned snapshot construction succeeded.
+    /// The checkpoint was written and the API returned its updated snapshot.
     Written {
         /// Size and action counts from the completed checkpoint write.
         stats: CheckpointWriteStats,
