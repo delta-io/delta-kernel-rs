@@ -154,10 +154,12 @@ Kernel:
 
 - **`SnapshotBuilder::with_max_catalog_version(Version)`** caps the snapshot
   version at the catalog's latest ratified version. Kernel requires this for
-  latest requests that resolve to catalog-managed state and for fresh staged
-  tails. Explicit-version reads don't infer the table's current management state
-  from its historical protocol. See [Reading catalog-managed tables](./reading.md)
-  for time-travel and downgrade behavior.
+  latest version requests that resolve to catalog-managed state and for staged
+  commits supplied through `with_log_tail`. Explicit-version reads don't infer
+  the table's current management state from its historical protocol. Staged paths
+  retained in an existing snapshot or complete hint don't independently require
+  a bound. See [Reading catalog-managed tables](./reading.md) for time-travel and
+  downgrade behavior.
 
 - **`Committer` trait** defines how transactions are committed. A catalog
   committer implements `commit()` to stage and ratify commits through the

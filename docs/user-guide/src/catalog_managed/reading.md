@@ -89,7 +89,7 @@ return a suffix of recent commits, not the full history). When you supply
 - With `.at_version(v)`, `N` must be `>= v`, and `v` must not exceed
   `max_catalog_version`.
 
-If you supply staged paths in a fresh log tail, you must also supply `max_catalog_version`.
+If you supply staged paths through `with_log_tail`, you must also supply `max_catalog_version`.
 This requirement applies even when those commits have published copies in `_delta_log/`.
 A tail containing only published paths doesn't itself require a catalog bound.
 
@@ -126,6 +126,24 @@ with the catalog bound when its commit is supplied in the catalog tail, or alrea
 published and omitted from that tail. An unpublished commit must remain available through
 the supplied tail or a retained Snapshot or complete hint. To discover later filesystem
 commits, refresh without the old bound.
+
+## Publication evidence and snapshot reuse
+
+Publication can advance without changing a snapshot's version. Snapshot reuse can retain older
+publication evidence even when a supplied tail or filesystem listing establishes further
+publication. As a result, checkpointing can return `UnpublishedVersion` after the required commits
+have been published. This limitation is tracked in
+[issue #3845](https://github.com/delta-io/delta-kernel-rs/issues/3845).
+
+To refresh publication evidence, build a fresh snapshot with `Snapshot::builder_for(table_root)`
+after publication, supplying the catalog bound and tail when required by the request. The fresh
+build must observe the published copies to record their publication.
+
+`skip_new_checkpoints()` lists after the cached snapshot version, so it cannot observe publication
+at that version. Complete snapshot hints perform no engine I/O and preserve the publication
+evidence supplied in the hint.
+
+## Reading the snapshot
 
 For a complete Unity Catalog example, see
 [Reading Unity Catalog tables](../unity_catalog/reading.md).

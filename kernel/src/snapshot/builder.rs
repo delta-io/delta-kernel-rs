@@ -226,7 +226,8 @@ impl<Mode> SnapshotBuilder<Mode> {
     ///
     /// An explicit target does not require a catalog bound solely because its historical protocol
     /// is catalog-managed. The caller remains responsible for catalog discovery when required by
-    /// the table's current management state. Fresh staged tails still require
+    /// the table's current management state. Staged commits supplied through
+    /// [`with_log_tail`](Self::with_log_tail) require
     /// [`with_max_catalog_version`](Self::with_max_catalog_version), and any supplied bound
     /// applies.
     pub fn at_version(mut self, version: Version) -> Self {
@@ -261,6 +262,9 @@ impl<Mode> SnapshotBuilder<Mode> {
     /// used as the effective target version. An explicit target must not exceed a supplied bound.
     /// Without a bound, a latest-version request fails if the resolved protocol is catalog-managed.
     /// An explicit-version request does not infer current management from historical protocol.
+    /// The bound is authoritative regardless of the resolved management state. Without an explicit
+    /// target, an older available bound selects that older version even for filesystem-managed
+    /// tables.
     ///
     /// The caller must obtain this bound from the catalog, independently of which commits the
     /// catalog still stores. An empty tail does not remove the need to supply the catalog bound.

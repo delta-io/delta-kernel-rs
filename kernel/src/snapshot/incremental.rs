@@ -156,6 +156,7 @@ impl Snapshot {
             // Case A: re-requesting the same version.
             if requested_version == existing_snapshot_version {
                 // TODO(#3833): Reconcile cached freshness with the new request before reuse.
+                // TODO(#3845): Preserve publication evidence from the supplied tail before reuse.
                 return Ok(existing_snapshot.clone());
             }
             // Case B: incremental path only moves forward.
@@ -372,6 +373,7 @@ impl Snapshot {
                 // no such commit exists in the log.
                 Some(_) => Err(KernelError::MissingVersion(existing_snapshot_version + 1)),
                 // Case C.2: no new commits and no explicit target; latest is existing.
+                // TODO(#3845): Define publication refresh when cached versions are not listed.
                 None => Ok(NewSegment::Unchanged),
             };
         }
@@ -420,6 +422,7 @@ impl Snapshot {
             // We must check checkpoint_version here: if a checkpoint at or below the existing
             // snapshot version was discovered, we still need to fall through to advance the
             // checkpoint base even though the version did not change.
+            // TODO(#3845): Preserve observed publication evidence when the version is unchanged.
             return Ok(NewSegment::Unchanged);
         }
 
