@@ -4,6 +4,7 @@ use std::sync::Arc;
 use delta_kernel::arrow::array::{ArrayRef, Int32Array, StringArray};
 use delta_kernel::commit_range::CommitRange;
 use delta_kernel::object_store::local::LocalFileSystem;
+use delta_kernel::path::LogPathFileType;
 use delta_kernel::schema::schema_ref;
 use delta_kernel::transaction::UpdateTableOperation;
 use delta_kernel::transaction::create_table::create_table;
@@ -416,6 +417,181 @@ async fn test_checkpoint_after_publish() -> Result<(), TestError> {
         .build(&engine)?;
     assert_eq!(snapshot.log_segment().checkpoint_version, Some(3));
 
+    Ok(())
+}
+
+/// The catalog names staged commits 1 and 2 even after published files exist for those versions.
+/// Verify actual reads after staged-file deletion, both with and without new commits to publish.
+#[rstest]
+#[case::commit_2_needs_publishing(1)]
+#[case::all_commits_already_published(2)]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_published_snapshot_reads_after_staged_files_are_deleted(
+    #[case] published_through: u64,
+) -> Result<(), TestError> {
+    // GIVEN: catalog-supplied staged paths for 1 and 2, and published files through 1 or 2.
+    let TestSetup {
+        update_table_client,
+        engine,
+        snapshot,
+        table_uri,
+        _tmp_dir: tmp_dir,
+    } = setup().await?;
+    let engine = Arc::new(engine);
+    let log_dir = tmp_dir.path().join("_delta_log");
+    for file in &snapshot.log_segment().listed.ascending_commit_files {
+        if file.file_type == LogPathFileType::StagedCommit && file.version <= published_through {
+            std::fs::copy(
+                file.location.location.to_file_path().unwrap(),
+                log_dir.join(format!("{:020}.json", file.version)),
+            )?;
+        }
+    }
+
+    // The catalog still names the staged files, even where listing establishes publication.
+    let source = build_snapshot(&update_table_client, &engine, &table_uri)?;
+    assert_eq!(
+        source.log_segment().listed.max_published_version,
+        Some(published_through)
+    );
+    assert_eq!(
+        source
+            .log_segment()
+            .listed
+            .latest_commit_file
+            .as_ref()
+            .unwrap()
+            .file_type,
+        LogPathFileType::StagedCommit
+    );
+
+    // WHEN: publish and remove staged files. If all commits are already published, remove them
+    // first to verify that publish() does not need to read the staged files.
+    let staged_dir = log_dir.join("_staged_commits");
+    if published_through == source.version() {
+        std::fs::remove_dir_all(&staged_dir)?;
+    }
+    let published = source.publish(engine.as_ref(), &uc_committer(&update_table_client))?;
+    if staged_dir.exists() {
+        std::fs::remove_dir_all(&staged_dir)?;
+    }
+
+    let latest = published
+        .log_segment()
+        .listed
+        .latest_commit_file
+        .as_ref()
+        .unwrap();
+    let ict = 1749830881799;
+
+    // THEN: read the in-commit timestamp, scan 200 rows, and create a checkpoint without staged
+    // files. With no CRC at version 2, get_timestamp() must read commitInfo from the published
+    // commit file.
+    assert_ne!(latest.location.last_modified, ict);
+    assert!(published.crc_at_version().is_none());
+    assert_eq!(published.reader().get_timestamp(engine.as_ref())?, ict);
+
+    let scan = published.clone().scan_builder().build()?;
+    let rows: usize = read_scan(&scan, engine.clone() as Arc<dyn Engine>)?
+        .iter()
+        .map(|batch| batch.num_rows())
+        .sum();
+    assert_eq!(rows, 200);
+    let (_, checkpointed) = published.checkpoint(engine.as_ref(), None)?;
+    assert_eq!(checkpointed.log_segment().checkpoint_version, Some(2));
+    assert_eq!(checkpointed.reader().get_timestamp(engine.as_ref())?, ict);
+    Ok(())
+}
+
+/// A checkpoint at version 2 supplies the table state, but timestamp reads still need commit 2.
+/// `publish()` must replace its staged path even though `ascending_commit_files` is empty.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_published_snapshot_reads_timestamp_at_checkpoint_version() -> Result<(), TestError> {
+    // GIVEN: checkpoint 2 and a catalog response that still names staged commit 2.
+    let TestSetup {
+        update_table_client,
+        engine,
+        snapshot,
+        table_uri,
+        _tmp_dir: tmp_dir,
+    } = setup().await?;
+    snapshot
+        .publish(&engine, &uc_committer(&update_table_client))?
+        .checkpoint(&engine, None)?;
+
+    let source = build_snapshot(&update_table_client, &engine, &table_uri)?;
+    let source_segment = source.log_segment();
+    assert!(source_segment.listed.ascending_commit_files.is_empty());
+    assert_eq!(source_segment.checkpoint_version, Some(2));
+    assert_eq!(source_segment.listed.max_published_version, Some(2));
+    assert_eq!(
+        source_segment
+            .listed
+            .latest_commit_file
+            .as_ref()
+            .unwrap()
+            .file_type,
+        LogPathFileType::StagedCommit
+    );
+
+    // WHEN: delete staged files and request a snapshot with published commit paths.
+    std::fs::remove_dir_all(tmp_dir.path().join("_delta_log/_staged_commits"))?;
+
+    let published = source.publish(&engine, &uc_committer(&update_table_client))?;
+
+    // THEN: read commit 2's in-commit timestamp from its published file, without a cached CRC.
+    assert!(published.crc_at_version().is_none());
+    assert_eq!(published.reader().get_timestamp(&engine)?, 1749830881799);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_publish_retries_after_partial_copy_failure() -> Result<(), TestError> {
+    // GIVEN: commits 1 and 2 need publishing, but commit 2's staged file is temporarily missing.
+    let TestSetup {
+        update_table_client,
+        engine,
+        snapshot,
+        _tmp_dir: tmp_dir,
+        ..
+    } = setup().await?;
+    let engine = Arc::new(engine);
+    let staged_latest = snapshot
+        .log_segment()
+        .listed
+        .latest_commit_file
+        .as_ref()
+        .unwrap()
+        .location
+        .location
+        .to_file_path()
+        .unwrap();
+    let saved_latest = tmp_dir.path().join("saved-latest.json");
+    std::fs::rename(&staged_latest, &saved_latest)?;
+
+    // WHEN: publishing copies commit 1 and then fails to read commit 2.
+    let error = snapshot
+        .publish(engine.as_ref(), &uc_committer(&update_table_client))
+        .unwrap_err();
+    assert!(matches!(error, KernelError::FileNotFound(_)));
+
+    // THEN: commit 1's published file exists, but commit 2's does not.
+    let log_dir = tmp_dir.path().join("_delta_log");
+    assert!(log_dir.join("00000000000000000001.json").is_file());
+    assert!(!log_dir.join("00000000000000000002.json").exists());
+
+    // WHEN: restore staged commit 2 and retry from the original snapshot.
+    std::fs::rename(saved_latest, staged_latest)?;
+    let published = snapshot.publish(engine.as_ref(), &uc_committer(&update_table_client))?;
+
+    // THEN: accept commit 1's existing published file, publish commit 2, and read after cleanup.
+    std::fs::remove_dir_all(log_dir.join("_staged_commits"))?;
+    let scan = published.scan_builder().build()?;
+    let rows: usize = read_scan(&scan, engine as Arc<dyn Engine>)?
+        .iter()
+        .map(|batch| batch.num_rows())
+        .sum();
+    assert_eq!(rows, 200);
     Ok(())
 }
 
