@@ -85,7 +85,8 @@ impl<MODE: ExecutionMode> Transaction<UpdateTable, MODE> {
         Ok(self)
     }
 
-    /// Stages `file` to be committed as the table's root manifest.
+    /// Stages `file` to be committed as the table's root manifest. The root manifest must include
+    /// every file change up to the read snapshot's version.
     ///
     /// Mutually exclusive with [`with_manifest_commit`](Transaction::with_manifest_commit), which
     /// has kernel build the tree instead.

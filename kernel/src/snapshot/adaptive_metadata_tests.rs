@@ -10,9 +10,9 @@ use crate::actions::{
     LastManifestCommit, SetTransaction,
 };
 use crate::engine::sync::SyncEngine;
-use crate::unit_test_utils::Action;
 use crate::unit_test_utils::adaptive_metadata_fixtures::{
-    checkpoint_line, setup_adaptive_metadata_table, write_ict_commit, write_sidecar,
+    checkpoint_line, domain_metadata_line, setup_adaptive_metadata_table, txn_line,
+    write_ict_commit, write_sidecar,
 };
 use crate::{Snapshot, SnapshotRef, Version};
 
@@ -97,10 +97,6 @@ fn txn(app_id: &str, version: i64) -> SetTransaction {
     SetTransaction::new(app_id.to_string(), version, None)
 }
 
-fn txn_line(app_id: &str, version: i64) -> String {
-    serde_json::to_string(&Action::Txn(txn(app_id, version))).unwrap()
-}
-
 /// The action's txns, which the consistent cases also commit before it.
 const ACTION_TXNS: &[(&str, i64)] = &[("a", 1), ("b", 2), ("d", 4)];
 
@@ -177,10 +173,6 @@ fn dm(domain: &str, configuration: &str) -> DomainMetadata {
     DomainMetadata::new(domain.to_string(), configuration.to_string())
 }
 
-fn dm_line(dm: DomainMetadata) -> String {
-    serde_json::to_string(&Action::DomainMetadata(dm)).unwrap()
-}
-
 /// The action's domains, which the consistent cases also commit before it.
 const ACTION_DOMAINS: &[(&str, &str)] = &[("a", "a1"), ("b", "b1"), ("d", "d1")];
 
@@ -198,12 +190,12 @@ fn domain_metadata_comes_from_checkpoint_action_and_later_commits(
 ) {
     let before = before
         .iter()
-        .map(|(domain, configuration)| dm_line(dm(domain, configuration)))
+        .map(|(domain, configuration)| domain_metadata_line(dm(domain, configuration)))
         .join("\n");
     let after = format!(
         "{}\n{}",
-        dm_line(dm("a", "a2")),
-        dm_line(DomainMetadata::remove("b".to_string(), String::new()))
+        domain_metadata_line(dm("a", "a2")),
+        domain_metadata_line(DomainMetadata::remove("b".to_string(), String::new()))
     );
     let (engine, snapshot) = table_with_checkpoint_action(
         &before,
