@@ -1346,10 +1346,19 @@ async fn test_write_checksum_ignores_metadata_readds_and_counts_subsequent_white
 
     let scan = snap.scan_builder().build()?;
     let batches = read_scan(&scan, engine.clone())?;
+    #[rustfmt::skip]
     test_utils::assert_batches_sorted_eq!(
         vec![
-            "+----+", "| id |", "+----+", "| 1  |", "| 2  |", "| 3  |", "| 4  |", "| 5  |",
-            "| 6  |", "+----+"
+            "+----+",
+            "| id |",
+            "+----+",
+            "| 1  |",
+            "| 2  |",
+            "| 3  |",
+            "| 4  |",
+            "| 5  |",
+            "| 6  |",
+            "+----+",
         ],
         &batches
     );
