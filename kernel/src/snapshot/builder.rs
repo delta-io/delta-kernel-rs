@@ -438,6 +438,14 @@ impl<Mode> SnapshotBuilder<Mode> {
 
         // Post-build validations for catalog-managed tables
         Self::validate_catalog_managed_build_result(&snapshot, max_catalog_version)?;
+        let snapshot = if snapshot.is_built_as_latest()
+            && max_catalog_version.is_some_and(|max| max > snapshot.version())
+        {
+            // A newer catalog bound supersedes freshness inherited from a retained snapshot.
+            snapshot.without_latest_claim()
+        } else {
+            snapshot
+        };
         tracing::Span::current().record("version", snapshot.version());
         Ok(snapshot)
     }
