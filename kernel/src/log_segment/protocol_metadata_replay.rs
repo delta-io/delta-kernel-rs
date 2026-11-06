@@ -819,13 +819,11 @@ fn resolve_pm_batches(
             if resolved.checkpoint.is_none()
                 && batch.projects_checkpoint_action
                 && batch_version == Some(pointer.version)
-            {
-                if let Some(checkpoint) =
+                && let Some(checkpoint) =
                     CheckpointAction::try_new_from_data(batch.actions.as_ref())?
-                {
-                    let checkpoint = require_pointed_checkpoint_action(&pointer, Some(checkpoint))?;
-                    resolved = resolved.with_checkpoint(checkpoint);
-                }
+            {
+                let checkpoint = require_pointed_checkpoint_action(&pointer, Some(checkpoint))?;
+                resolved = resolved.with_checkpoint(checkpoint);
             }
         }
         // A checkpoint action's P&M can be older than its commit, so check version not presence.
