@@ -18,7 +18,8 @@ use tracing_subscriber::util::SubscriberInitExt as _;
 use url::Url;
 
 use crate::actions::{
-    Add, Cdc, CommitInfo, Metadata, Protocol, Remove, SetTransaction, get_all_actions_schema,
+    Add, Cdc, CommitInfo, DomainMetadata, Metadata, Protocol, Remove, SetTransaction,
+    get_all_actions_schema,
 };
 use crate::arrow::array::{
     ArrayRef, Int64Array, MapArray, RecordBatch, StringArray, StructArray, new_empty_array,
@@ -123,6 +124,9 @@ pub(crate) enum Action {
     #[allow(unused)]
     #[serde(rename = "txn")]
     Txn(SetTransaction),
+    #[allow(unused)]
+    #[serde(rename = "domainMetadata")]
+    DomainMetadata(DomainMetadata),
 }
 
 use crate::schema::{
