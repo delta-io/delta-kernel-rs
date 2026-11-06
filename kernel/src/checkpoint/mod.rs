@@ -169,12 +169,12 @@ pub(crate) mod tests;
 pub struct LastCheckpointHintStats {
     /// The total number of actions stored in the checkpoint (including actions created
     /// outside the reconciliation iterator, e.g. sidecar actions).
-    num_actions: i64,
+    pub(crate) num_actions: i64,
     /// The total size in bytes of the checkpoint. For V2 checkpoint with sidecars,
     /// this is the sum of the main checkpoint file size and all sidecar file sizes.
-    size_in_bytes: i64,
+    pub(crate) size_in_bytes: i64,
     /// The number of Add-file actions in the checkpoint.
-    num_of_add_files: i64,
+    pub(crate) num_of_add_files: i64,
 }
 
 impl LastCheckpointHintStats {
@@ -233,6 +233,10 @@ pub(crate) struct WrittenCheckpointInfo {
     pub(crate) file_meta: FileMeta,
     /// Stats for the `_last_checkpoint` hint.
     pub(crate) last_checkpoint_stats: LastCheckpointHintStats,
+    /// Retained Remove actions selected by reconciliation.
+    pub(crate) num_remove_files: u64,
+    /// Actual sidecar files written, excluding the main checkpoint file.
+    pub(crate) num_sidecars: u64,
 }
 
 /// Schemas and configs needed for building the checkpoint read/output schemas.
@@ -513,6 +517,7 @@ impl CheckpointWriter {
                 filtered_data: FilteredEngineData::try_new(transformed, sv)?,
                 actions_count: batch.actions_count,
                 add_actions_count: batch.add_actions_count,
+                remove_actions_count: batch.remove_actions_count,
             })
         });
 
@@ -742,6 +747,7 @@ impl CheckpointWriter {
             filtered_data,
             actions_count: 1,
             add_actions_count: 0,
+            remove_actions_count: 0,
         })
     }
 
@@ -891,6 +897,7 @@ fn build_written_checkpoint_info(
         .ok_or_else(|| {
             KernelError::internal_error("checkpoint total size_in_bytes overflowed u64")
         })?;
+    let num_remove_files = state.remove_actions_count() as u64;
     let state = Arc::into_inner(state).ok_or_else(|| {
         KernelError::internal_error("ActionReconciliationIteratorState Arc has other references")
     })?;
@@ -902,5 +909,7 @@ fn build_written_checkpoint_info(
     Ok(WrittenCheckpointInfo {
         file_meta,
         last_checkpoint_stats,
+        num_remove_files,
+        num_sidecars: sidecar_count,
     })
 }
