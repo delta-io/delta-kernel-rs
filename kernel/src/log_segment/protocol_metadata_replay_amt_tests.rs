@@ -10,10 +10,10 @@ use rstest::rstest;
 use test_utils::compacted_log_path_for_versions;
 use test_utils::{add_commit, assert_result_error_with_message, delta_path_for_version};
 
-use super::LastManifestCommitResolution;
 #[cfg(feature = "declarative-plans")]
 use super::LogSegment;
 use super::tests::{add_checkpoint_to_store, latest_log_segment};
+use super::{LastManifestCommitResolution, PmResolution};
 #[cfg(feature = "declarative-plans")]
 use crate::KernelResult;
 #[cfg(feature = "declarative-plans")]
@@ -84,6 +84,14 @@ fn checkpoint_action(version: i64, extra_features: &[TableFeature], schema: Sche
 fn metadata_commit(schema: SchemaRef) -> String {
     let config = adaptive_metadata_table_configuration(schema, &[]);
     serde_json::json!({ "metaData": config.metadata() }).to_string()
+}
+
+// The resolution of a replay that read the pointer `(version, content_root_version)`.
+#[cfg(feature = "declarative-plans")]
+fn resolved_pointer(version: i64, content_root_version: i64) -> LastManifestCommitResolution {
+    LastManifestCommitResolution::Resolved(Some(
+        LastManifestCommit::new(version, content_root_version).unwrap(),
+    ))
 }
 
 // Builds a commit holding only a `txn` action: no commitInfo, Protocol, or Metadata.
@@ -391,17 +399,18 @@ async fn assert_replay_resolution<E: Engine>(
     expected_version: Option<i64>,
     make_engine: impl FnOnce(Arc<InMemory>) -> E,
 ) {
-    let version = replay_checkpoint_action(commits, make_engine)
+    let version = replay_pm(commits, make_engine)
         .await
+        .captured_checkpoint_action
         .map(|action| action.version);
     assert_eq!(version, expected_version);
 }
 
 // Writes `commits` as versions 0.. and replays P&M at the latest version.
-async fn replay_checkpoint_action<E: Engine>(
+async fn replay_pm<E: Engine>(
     commits: &[String],
     make_engine: impl FnOnce(Arc<InMemory>) -> E,
-) -> Option<Arc<CheckpointAction>> {
+) -> PmResolution {
     let (store, table_root) = commit_table(commits).await;
 
     let engine = make_engine(store);
@@ -410,7 +419,6 @@ async fn replay_checkpoint_action<E: Engine>(
     log_segment
         .read_protocol_metadata_opt(&engine, None)
         .unwrap()
-        .captured_checkpoint_action
 }
 
 // The plan path finds checkpoint actions only through `lastManifestCommit`, so an older action is
@@ -493,7 +501,7 @@ async fn plan_replay_errors_on_invalid_pointer(
     #[case] commits: Vec<String>,
     #[case] expected_error: &str,
 ) {
-    assert_replay_errors(&commits, expected_error, |store| {
+    assert_replay_errors(&commits, None, expected_error, |store| {
         SyncEngine::new_with_store(store)
     })
     .await;
@@ -502,13 +510,15 @@ async fn plan_replay_errors_on_invalid_pointer(
 #[cfg(feature = "declarative-plans")]
 async fn assert_replay_errors<E: Engine>(
     commits: &[String],
+    crc: Option<&Arc<Crc>>,
     expected_error: &str,
     make_engine: impl FnOnce(Arc<InMemory>) -> E,
 ) {
     let (store, table_root) = commit_table(commits).await;
 
     let engine = make_engine(store);
-    let result = Snapshot::builder_for(table_root).build(&engine);
+    let log_segment = latest_log_segment(&table_root, &engine);
+    let result = log_segment.read_protocol_metadata_opt(&engine, crc);
     assert!(matches!(&result, Err(KernelError::InvalidLogSegment(_))));
     assert_result_error_with_message(result, expected_error);
 }
@@ -1157,11 +1167,12 @@ async fn replay_resolves_last_manifest_commit_from_newest_commit(
     };
     assert_replay_last_manifest_commit(
         &later_commits,
+        None,
         &LastManifestCommitResolution::Unresolved,
         non_plan_engine,
     )
     .await;
-    assert_replay_last_manifest_commit(&later_commits, &expected, |store| {
+    assert_replay_last_manifest_commit(&later_commits, None, &expected, |store| {
         SyncEngine::new_with_store(store)
     })
     .await;
@@ -1170,6 +1181,7 @@ async fn replay_resolves_last_manifest_commit_from_newest_commit(
 #[cfg(feature = "declarative-plans")]
 async fn assert_replay_last_manifest_commit<E: Engine>(
     later_commits: &[String],
+    crc: Option<&Arc<Crc>>,
     expected: &LastManifestCommitResolution,
     make_engine: impl FnOnce(Arc<InMemory>) -> E,
 ) {
@@ -1178,7 +1190,7 @@ async fn assert_replay_last_manifest_commit<E: Engine>(
     let log_segment = latest_log_segment(&table_root, &engine);
 
     let resolution = log_segment
-        .read_protocol_metadata_opt(&engine, None)
+        .read_protocol_metadata_opt(&engine, crc)
         .unwrap();
     assert_eq!(&resolution.last_manifest_commit, expected);
 }
@@ -1214,7 +1226,7 @@ async fn plan_replay_rejects_pointer_after_newest_commit(
         checkpoint_commit(1, &[], test_schema_flat_with_column_mapping()),
         commit_info(Some((1, 1))),
     ],
-    (1, 1)
+    resolved_pointer(1, 1),
 )]
 #[case::covers_manifest_commit_past_its_content_root(
     vec![
@@ -1225,20 +1237,17 @@ async fn plan_replay_rejects_pointer_after_newest_commit(
         ),
         commit_info(Some((2, 1))),
     ],
-    (2, 1)
+    resolved_pointer(2, 1),
 )]
 #[tokio::test]
 async fn plan_replay_reads_commits_a_compaction_covers(
     #[case] later_commits: Vec<String>,
-    #[case] (pointer_version, content_root_version): (i64, i64),
+    #[case] expected: LastManifestCommitResolution,
 ) {
-    let pointer = LastManifestCommit::new(pointer_version, content_root_version).unwrap();
-    assert_compacted_replay(
-        &later_commits,
-        &test_schema_flat_with_column_mapping(),
-        &LastManifestCommitResolution::Resolved(Some(pointer)),
-        |store| SyncEngine::new_with_store(store),
-    )
+    let schema = test_schema_flat_with_column_mapping();
+    assert_compacted_replay(&later_commits, &schema, &expected, |store| {
+        SyncEngine::new_with_store(store)
+    })
     .await;
 }
 
@@ -1246,7 +1255,7 @@ async fn plan_replay_reads_commits_a_compaction_covers(
 async fn assert_compacted_replay<E: Engine>(
     later_commits: &[String],
     expected_schema: &SchemaRef,
-    expected_pointer: &LastManifestCommitResolution,
+    expected: &LastManifestCommitResolution,
     make_engine: impl FnOnce(Arc<InMemory>) -> E,
 ) {
     let (store, table_root) = manifest_commit_table(later_commits).await;
@@ -1259,7 +1268,16 @@ async fn assert_compacted_replay<E: Engine>(
         .unwrap();
     let schema = resolution.metadata.unwrap().parse_schema().unwrap();
     assert_eq!(&schema, expected_schema.as_ref());
-    assert_eq!(&resolution.last_manifest_commit, expected_pointer);
+    // These fixtures' checkpoint actions are at their content root version.
+    let captured_version = resolution
+        .captured_checkpoint_action
+        .map(|action| action.version);
+    let expected_version = match expected {
+        LastManifestCommitResolution::Resolved(Some(pointer)) => Some(pointer.content_root_version),
+        _ => None,
+    };
+    assert_eq!(captured_version, expected_version);
+    assert_eq!(&resolution.last_manifest_commit, expected);
 }
 
 // Writes a log compaction covering the newest two commits and returns a segment that uses it.
