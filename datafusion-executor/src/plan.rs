@@ -69,7 +69,7 @@ mod tests {
     use datafusion::prelude::SessionContext;
     use delta_kernel::PlanBuilder;
     use delta_kernel::expressions::{
-        Expression as KernelExpr, Predicate as KernelPredicate, Scalar as KernelScalar, col,
+        Expression as KernelExpr, Predicate as KernelPredicate, Scalar as KernelScalar, col, expr,
     };
     use delta_kernel::plans::ir::nodes::{
         Filter as KernelFilter, Project as KernelProject, Values as KernelValues,
@@ -156,7 +156,7 @@ mod tests {
             vec![vec![KernelScalar::null(DataType::LONG)], vec![2i64.into()]],
         )
         .unwrap()
-        .filter(KernelPredicate::is_null(col!("a")))
+        .filter(KernelPredicate::from_expr(expr!(is_null(col("a")))))
         .unwrap()
         .build()
         .unwrap();
@@ -174,7 +174,7 @@ mod tests {
             schema: project_schema.clone(),
         };
         let filter = KernelFilter {
-            predicate: KernelPredicate::is_not_null(col!("projected")).into(),
+            predicate: KernelPredicate::from_expr(expr!(is_not_null(col("projected")))).into(),
         };
         let plan = KernelPlan {
             schema: project_schema,

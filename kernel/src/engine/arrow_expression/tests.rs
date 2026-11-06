@@ -167,58 +167,57 @@ fn test_in_predicate_with_list_view_column() {
 #[case::utf8view(
     Arc::new(StringViewArray::from(vec![None, Some("apple"), Some("hello"), Some("zebra")])) as ArrayRef,
     DataType::Utf8View,
-    lit("hello"),
+    Scalar::from("hello"),
 )]
 #[case::large_utf8(
     Arc::new(GenericStringArray::<i64>::from(vec![None, Some("apple"), Some("hello"), Some("zebra")])) as ArrayRef,
     DataType::LargeUtf8,
-    lit("hello"),
+    Scalar::from("hello"),
 )]
 #[case::binary_view(
     Arc::new(BinaryViewArray::from(vec![None, Some(b"apple".as_ref()), Some(b"hello"), Some(b"zebra")])) as ArrayRef,
     DataType::BinaryView,
-    lit(b"hello".as_ref()),
+    Scalar::from(b"hello".as_ref()),
 )]
 fn test_binary_predicate_with_view_types(
     #[case] array: ArrayRef,
     #[case] dtype: DataType,
-    #[case] lit: Expr,
+    #[case] value: Scalar,
 ) {
     let schema = Schema::new([Arc::new(Field::new("col", dtype, true))]);
     let batch = RecordBatch::try_new(Arc::new(schema), vec![array]).unwrap();
-    let column = col!("col");
 
-    let predicate_lt = column.clone().lt(lit.clone());
+    let predicate_lt = Pred::from_expr(expr!(col("col") < lit(value.clone())));
     let results = evaluate_predicate(&predicate_lt, &batch, false).unwrap();
     let expected_lt = BooleanArray::from(vec![None, Some(true), Some(false), Some(false)]);
     assert_eq!(results, expected_lt);
 
-    let predicate_le = column.clone().le(lit.clone());
+    let predicate_le = Pred::from_expr(expr!(col("col") <= lit(value.clone())));
     let results = evaluate_predicate(&predicate_le, &batch, false).unwrap();
     let expected_le = BooleanArray::from(vec![None, Some(true), Some(true), Some(false)]);
     assert_eq!(results, expected_le);
 
-    let predicate_gt = column.clone().gt(lit.clone());
+    let predicate_gt = Pred::from_expr(expr!(col("col") > lit(value.clone())));
     let results = evaluate_predicate(&predicate_gt, &batch, false).unwrap();
     let expected_gt = BooleanArray::from(vec![None, Some(false), Some(false), Some(true)]);
     assert_eq!(results, expected_gt);
 
-    let predicate_ge = column.clone().ge(lit.clone());
+    let predicate_ge = Pred::from_expr(expr!(col("col") >= lit(value.clone())));
     let results = evaluate_predicate(&predicate_ge, &batch, false).unwrap();
     let expected_ge = BooleanArray::from(vec![None, Some(false), Some(true), Some(true)]);
     assert_eq!(results, expected_ge);
 
-    let predicate_eq = column.clone().eq(lit.clone());
+    let predicate_eq = Pred::from_expr(expr!(col("col") == lit(value.clone())));
     let results = evaluate_predicate(&predicate_eq, &batch, false).unwrap();
     let expected_eq = BooleanArray::from(vec![None, Some(false), Some(true), Some(false)]);
     assert_eq!(results, expected_eq);
 
-    let predicate_ne = column.clone().ne(lit.clone());
+    let predicate_ne = Pred::from_expr(expr!(col("col") != lit(value.clone())));
     let results = evaluate_predicate(&predicate_ne, &batch, false).unwrap();
     let expected_ne = BooleanArray::from(vec![None, Some(true), Some(false), Some(true)]);
     assert_eq!(results, expected_ne);
 
-    let predicate_distinct = column.clone().distinct(lit.clone());
+    let predicate_distinct = Pred::from_expr(expr!(distinct(col("col"), lit(value.clone()))));
     let results = evaluate_predicate(&predicate_distinct, &batch, false).unwrap();
     let expected_distinct =
         BooleanArray::from(vec![Some(true), Some(true), Some(false), Some(true)]);
@@ -569,34 +568,33 @@ fn test_binary_cmp() {
     let schema = Schema::new(vec![Field::new("a", DataType::Int32, false)]);
     let values = Int32Array::from(vec![1, 2, 3]);
     let batch = RecordBatch::try_new(Arc::new(schema.clone()), vec![Arc::new(values)]).unwrap();
-    let column = col!("a");
 
-    let predicate_lt = column.clone().lt(lit(2));
+    let predicate_lt = Pred::from_expr(expr!(col("a") < 2));
     let results = evaluate_predicate(&predicate_lt, &batch, false).unwrap();
     let expected_lt = BooleanArray::from(vec![true, false, false]);
     assert_eq!(results, expected_lt);
 
-    let predicate_le = column.clone().le(lit(2));
+    let predicate_le = Pred::from_expr(expr!(col("a") <= 2));
     let results = evaluate_predicate(&predicate_le, &batch, false).unwrap();
     let expected_le = BooleanArray::from(vec![true, true, false]);
     assert_eq!(results, expected_le);
 
-    let predicate_gt = column.clone().gt(lit(2));
+    let predicate_gt = Pred::from_expr(expr!(col("a") > 2));
     let results = evaluate_predicate(&predicate_gt, &batch, false).unwrap();
     let expected_gt = BooleanArray::from(vec![false, false, true]);
     assert_eq!(results, expected_gt);
 
-    let predicate_ge = column.clone().ge(lit(2));
+    let predicate_ge = Pred::from_expr(expr!(col("a") >= 2));
     let results = evaluate_predicate(&predicate_ge, &batch, false).unwrap();
     let expected_ge = BooleanArray::from(vec![false, true, true]);
     assert_eq!(results, expected_ge);
 
-    let predicate_eq = column.clone().eq(lit(2));
+    let predicate_eq = Pred::from_expr(expr!(col("a") == 2));
     let results = evaluate_predicate(&predicate_eq, &batch, false).unwrap();
     let expected_eq = BooleanArray::from(vec![false, true, false]);
     assert_eq!(results, expected_eq);
 
-    let predicate_ne = column.clone().ne(lit(2));
+    let predicate_ne = Pred::from_expr(expr!(col("a") != 2));
     let results = evaluate_predicate(&predicate_ne, &batch, false).unwrap();
     let expected_ne = BooleanArray::from(vec![true, false, true]);
     assert_eq!(results, expected_ne);
@@ -639,25 +637,22 @@ fn test_logical() {
         ],
     )
     .unwrap();
-    let column_a = column_pred!("a");
-    let column_b = column_pred!("b");
-
-    let pred_and_col = Pred::and(column_a.clone(), column_b.clone());
+    let pred_and_col = Pred::from_expr(expr!(and(col("a"), col("b"))));
     let results = evaluate_predicate(&pred_and_col, &batch, false).unwrap();
     let expected = BooleanArray::from(vec![t, f, f, f, n, f]);
     assert_eq!(results, expected);
 
-    let pred_and_lit = Pred::and(column_a.clone(), Pred::TRUE);
+    let pred_and_lit = Pred::from_expr(expr!(and(col("a"), true)));
     let results = evaluate_predicate(&pred_and_lit, &batch, false).unwrap();
     let expected = BooleanArray::from(vec![t, t, f, f, t, f]);
     assert_eq!(results, expected);
 
-    let pred_or_col = Pred::or(column_a.clone(), column_b);
+    let pred_or_col = Pred::from_expr(expr!(or(col("a"), col("b"))));
     let results = evaluate_predicate(&pred_or_col, &batch, false).unwrap();
     let expected = BooleanArray::from(vec![t, t, t, f, t, n]);
     assert_eq!(results, expected);
 
-    let pred_or_lit = Pred::or(column_a.clone(), Pred::FALSE);
+    let pred_or_lit = Pred::from_expr(expr!(or(col("a"), false)));
     let results = evaluate_predicate(&pred_or_lit, &batch, false).unwrap();
     let expected = BooleanArray::from(vec![t, t, f, f, t, f]);
     assert_eq!(results, expected);

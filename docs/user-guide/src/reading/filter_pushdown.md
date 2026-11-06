@@ -46,9 +46,8 @@ The full set of comparison constructors:
 | `Predicate::ge(a, b)` | `a >= b` |
 | `Predicate::distinct(a, b)` | `a IS DISTINCT FROM b` |
 
-`distinct` is a NULL-safe inequality: it returns true when `a` and `b` differ, even when
-one or both are NULL. The other comparisons follow SQL NULL semantics and produce NULL when
-either input is NULL.
+`distinct` returns true when non-NULL operands differ or exactly one operand is NULL.
+It returns false for two NULL operands. Other comparisons produce NULL when either operand is NULL.
 
 Each constructor takes `impl Into<Expression>` for both arguments, so you can pass
 `col!()` / `lit()` results, `Scalar` values, or any `Expression` directly.
@@ -73,7 +72,7 @@ let pred = Predicate::or(
     Predicate::eq(col!("status"), lit("pending")),
 );
 
-// NOT (archived)
+// NOT (archived == true)
 let pred = Predicate::not(
     Predicate::eq(col!("archived"), lit(true)),
 );

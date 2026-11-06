@@ -19,7 +19,7 @@ use crate::actions::{
 use crate::checkpoint::collation_stats::source_collation_stats;
 use crate::checkpoint::{CheckpointShape, CheckpointType};
 use crate::expressions::{
-    ColumnName, Expression as Expr, Predicate, UnaryExpressionOp, col, column_name,
+    ColumnName, Expression as Expr, Predicate, UnaryExpressionOp, col, column_name, expr,
     joined_column_expr, lit,
 };
 use crate::log_segment::LogSegment;
@@ -266,7 +266,7 @@ impl<'a> MetadataPlanner<'a> {
                 })
                 .fold_with(self.stats_filter.as_ref(), |patch, _| {
                     let field = StructField::not_null(IS_ADD, DataType::BOOLEAN);
-                    patch.append(field, Expr::from(col!("add.path").is_not_null()))
+                    patch.append(field, expr!(is_not_null(col("add.path"))))
                 })
         })?;
         Ok((plan, stats))
@@ -405,7 +405,7 @@ impl Scan {
             .project_patch(|patch| patch.drop(FILE_ACTION_KEY))?;
 
         let commit_live_adds = deduped_commit
-            .filter(col!("add").is_not_null())?
+            .filter(Predicate::from_expr(expr!(is_not_null(col("add")))))?
             .project_patch(|patch| patch.drop(FILE_ACTION_KEY))?;
 
         PlanBuilder::union_all([commit_live_adds, base_live_adds])?.build_opt()
@@ -496,7 +496,7 @@ impl Scan {
         };
         planner
             .build_metadata_scan(available_file_schema, false, |schema| {
-                source(schema)?.filter(col!("add.path").is_not_null())
+                source(schema)?.filter(Predicate::from_expr(expr!(is_not_null(col("add.path")))))
             })?
             .project_patch(|patch| {
                 patch
@@ -538,10 +538,12 @@ impl Scan {
         };
         planner
             .build_metadata_scan(get_all_actions_schema(), true, |schema| {
-                PlanBuilder::scan_json(commit_files, &[VERSION], schema)?.filter(Predicate::or(
-                    col!("add.path").is_not_null(),
-                    col!("remove.path").is_not_null(),
-                ))
+                PlanBuilder::scan_json(commit_files, &[VERSION], schema)?.filter(
+                    Predicate::from_expr(expr!(or(
+                        is_not_null(col("add.path")),
+                        is_not_null(col("remove.path")),
+                    ))),
+                )
             })?
             .project_patch(|patch| {
                 patch
@@ -924,7 +926,7 @@ mod tests {
         mock_snapshot(segment)
             .unwrap()
             .scan_builder()
-            .with_predicate(Arc::new(col!("x").gt(lit(5i64))))
+            .with_predicate(Arc::new(Predicate::from_expr(expr!(col("x") > 5i64))))
             .with_stats(StatsOptions::all())
             .build()
             .unwrap()
@@ -999,7 +1001,7 @@ mod tests {
         let scan = mock_snapshot(segment)?
             .scan_builder()
             .with_stats(stats)
-            .with_predicate(Arc::new(col!("x").gt(lit(5i64))))
+            .with_predicate(Arc::new(Predicate::from_expr(expr!(col("x") > 5i64))))
             .with_partition_values(partition_values)
             .build()?;
         let shape = CheckpointShape {
@@ -1426,7 +1428,9 @@ mod tests {
         let scan = mock_snapshot(segment)?
             .scan_builder()
             .with_stats(stats)
-            .with_predicate(Arc::new(col!("x").gt(lit(lower_bound))))
+            .with_predicate(Arc::new(Predicate::from_expr(expr!(
+                col("x") > lit(lower_bound)
+            ))))
             .build()?;
         let (read_schema, kind, _) =
             MetadataPlanner::try_new(&scan)?.read_schema(&file_schema, false)?;
@@ -1474,7 +1478,9 @@ mod tests {
         let scan = mock_snapshot(segment)?
             .scan_builder()
             .with_stats(stats)
-            .with_predicate(Arc::new(col!("x").gt(lit(lower_bound))))
+            .with_predicate(Arc::new(Predicate::from_expr(expr!(
+                col("x") > lit(lower_bound)
+            ))))
             .build()?;
         let plan = scan
             .build_metadata_scan_plan(

@@ -612,7 +612,7 @@ mod tests {
     };
     use delta_kernel::engine::arrow_conversion::TryIntoKernel as _;
     use delta_kernel::engine::arrow_data::ArrowEngineData;
-    use delta_kernel::expressions::{Predicate, Scalar, col, lit};
+    use delta_kernel::expressions::{Predicate, Scalar, expr};
     use delta_kernel::object_store::local::LocalFileSystem;
     use delta_kernel::object_store::memory::InMemory;
     use delta_kernel::object_store::{
@@ -985,10 +985,9 @@ mod tests {
         );
 
         let predicate = lower_bound_us.map(|bound| {
-            Arc::new(Predicate::gt(
-                col!("ts_ntz"),
-                lit(Scalar::TimestampNtz(bound)),
-            ))
+            Arc::new(Predicate::from_expr(expr!(
+                col("ts_ntz") > lit(Scalar::TimestampNtz(bound))
+            )))
         });
         let data: Vec<RecordBatch> = handler
             .read_parquet_files(

@@ -686,7 +686,7 @@ pub(crate) mod tests {
     use super::*;
     use crate::KernelResult;
     use crate::actions::{MAX_VALUES, MIN_VALUES};
-    use crate::expressions::{Predicate as Pred, col, column_name, lit};
+    use crate::expressions::{Predicate as Pred, column_name, expr};
     #[cfg(feature = "geo-type-in-dev")]
     use crate::scan::build_stats_output_schemas;
     #[cfg(feature = "geo-type-in-dev")]
@@ -1013,7 +1013,7 @@ pub(crate) mod tests {
             nullable "value": LONG,
         };
 
-        let predicate = Arc::new(col!("value").gt(lit(10i64)));
+        let predicate = Arc::new(Pred::from_expr(expr!(col("value") > 10i64)));
 
         let state_info = get_state_info(
             schema.clone(),
@@ -1402,7 +1402,7 @@ pub(crate) mod tests {
             nullable "value": LONG,
         };
 
-        let predicate = Arc::new(col!("value").gt(lit(10i64)));
+        let predicate = Arc::new(Pred::from_expr(expr!(col("value") > 10i64)));
 
         let state_info = get_state_info_with_stats(
             schema,
@@ -1437,7 +1437,7 @@ pub(crate) mod tests {
             nullable "extra": LONG,
         };
 
-        let predicate = Arc::new(col!("extra").gt(lit(5i64)));
+        let predicate = Arc::new(Pred::from_expr(expr!(col("extra") > 5i64)));
 
         let state_info = get_state_info_with_stats(
             schema,
@@ -1538,7 +1538,7 @@ pub(crate) mod tests {
             (cm_field("value", 3, "col-value-phys", DataType::LONG)),
         };
 
-        let predicate = Arc::new(col!("date").lt(lit(100i32)));
+        let predicate = Arc::new(Pred::from_expr(expr!(col("date") < 100i32)));
 
         let state_info = get_state_info(
             schema,
@@ -1645,7 +1645,7 @@ pub(crate) mod tests {
 
         // Request col_a via stats_columns (logical), and reference col_b via predicate (logical).
         // Both must be translated to physical names in the output stats schema.
-        let predicate = Arc::new(col!("col_b").gt(lit(5i64)));
+        let predicate = Arc::new(Pred::from_expr(expr!(col("col_b") > 5i64)));
 
         let state_info = get_state_info_with_stats(
             schema,
@@ -1893,7 +1893,7 @@ pub(crate) mod tests {
     #[test]
     fn predicate_on_past_cap_column_drops_stats_schema() {
         let schema = flat_long_schema(5);
-        let predicate = Arc::new(col!("c4").gt(lit(10i64)));
+        let predicate = Arc::new(Pred::from_expr(expr!(col("c4") > 10i64)));
         let state_info = get_state_info(
             schema,
             vec![],
@@ -1919,10 +1919,10 @@ pub(crate) mod tests {
     #[test]
     fn predicate_on_mixed_indexed_and_past_cap_keeps_indexed_only() {
         let schema = flat_long_schema(5);
-        let predicate = Arc::new(Pred::and(
-            col!("c0").gt(lit(10i64)),
-            col!("c4").gt(lit(10i64)),
-        ));
+        let predicate = Arc::new(Pred::from_expr(expr!(and(
+            col("c0") > 10i64,
+            col("c4") > 10i64
+        ))));
         let state_info = get_state_info(
             schema,
             vec![],
@@ -1952,7 +1952,7 @@ pub(crate) mod tests {
             },
         };
         // Predicate only on the past-cap leaf -> stats schema goes empty -> None.
-        let predicate = Arc::new(col!("s.c").gt(lit(10i64)));
+        let predicate = Arc::new(Pred::from_expr(expr!(col("s.c") > 10i64)));
         let state_info = get_state_info(
             schema,
             vec![],
@@ -2009,10 +2009,10 @@ pub(crate) mod tests {
                 nullable "d": LONG,
             },
         };
-        let predicate = Arc::new(Pred::and(
-            col!("s.c").gt(lit(10i64)),
-            col!("s.d").gt(lit(10i64)),
-        ));
+        let predicate = Arc::new(Pred::from_expr(expr!(and(
+            col("s.c") > 10i64,
+            col("s.d") > 10i64
+        ))));
         let state_info = get_state_info(
             schema,
             vec![],
@@ -2171,7 +2171,7 @@ pub(crate) mod tests {
         let state_info = get_state_info_with_stats(
             flat_long_schema(5),
             vec![],
-            Some(Arc::new(col!("c4").gt(lit(10i64)))),
+            Some(Arc::new(Pred::from_expr(expr!(col("c4") > 10i64)))),
             &[],
             num_indexed_cols_config(2),
             vec![],

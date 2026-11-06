@@ -714,7 +714,7 @@ mod tests {
     use crate::arrow::array::StructArray;
     use crate::arrow::buffer::{BooleanBuffer, NullBuffer};
     use crate::engine::sync::get_bytes;
-    use crate::expressions::{Predicate, StructData, col, column_name, lit};
+    use crate::expressions::{Predicate, StructData, column_name, expr};
     use crate::object_store::memory::InMemory;
     use crate::plans::PlanBuilder;
     use crate::schema::{ToSchema as _, schema, schema_ref};
@@ -786,7 +786,7 @@ mod tests {
             PlanBuilder::values(schema.clone(), vec![vec![0i64.into()]])?,
             PlanBuilder::values(schema.clone(), vec![vec![7i64.into()], vec![6i64.into()]])?,
         ])?
-        .filter(Predicate::gt(col!("id"), lit(1i64)))?;
+        .filter(Predicate::from_expr(expr!(col("id") > 1i64)))?;
         let second = PlanBuilder::union_all([
             PlanBuilder::values(schema.clone(), vec![vec![3i64.into()], vec![4i64.into()]])?,
             PlanBuilder::values(schema.clone(), vec![vec![2i64.into()]])?,
@@ -971,14 +971,14 @@ mod tests {
             schema.clone(),
             vec![vec![1i64.into()], vec![2i64.into()], vec![3i64.into()]],
         )?
-        .filter(Predicate::gt(col!("id"), lit(1i64)))?
+        .filter(Predicate::from_expr(expr!(col("id") > 1i64)))?
         .build()?;
         let first = scoped.execute_and_retain("filtered", source)?;
         assert_eq!(first.schema(), &schema);
         assert!(first.id().starts_with("filtered-"));
 
         let second_source = PlanBuilder::relation_source(first.clone())
-            .filter(Predicate::lt(col!("id"), lit(3i64)))?
+            .filter(Predicate::from_expr(expr!(col("id") < 3i64)))?
             .build()?;
         let second = scoped.execute_and_retain("refiltered", second_source)?;
         assert_ne!(first.id(), second.id());

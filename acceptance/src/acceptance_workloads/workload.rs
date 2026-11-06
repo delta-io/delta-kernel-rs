@@ -220,7 +220,7 @@ pub fn execute_and_validate_workload(
 mod tests {
     use delta_kernel::arrow::array::{Int32Array, RecordBatch};
     use delta_kernel::arrow::datatypes::{DataType as ArrowDataType, Field, Schema as ArrowSchema};
-    use delta_kernel::expressions::{Predicate, col, lit};
+    use delta_kernel::expressions::{Predicate, expr};
 
     use super::*;
 
@@ -238,7 +238,7 @@ mod tests {
             ],
         )
         .unwrap();
-        let predicate = Predicate::gt(col!("filter"), lit(1));
+        let predicate = Predicate::from_expr(expr!(col("filter") > 1));
 
         assert_eq!(
             scan_columns(&["selected".to_string()], Some(&predicate)),
