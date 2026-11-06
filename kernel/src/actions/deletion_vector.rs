@@ -586,21 +586,17 @@ impl DeletionVectorDescriptor {
                 let is_puffin = dv_data.starts_with(&PUFFIN_MAGIC);
 
                 let mut cursor = Cursor::new(dv_data);
-                if !is_puffin {
-                    let mut version_buf = [0; 1];
-                    cursor.read(&mut version_buf).map_err(|err| {
-                        KernelError::DeletionVector(format!(
-                            "Failed to read version from {path}: {err}"
-                        ))
-                    })?;
-                    let version = u8::from_be_bytes(version_buf);
-                    require!(
-                        version == 1,
-                        KernelError::DeletionVector(format!(
-                            "Invalid version {version} for {path}"
-                        ))
-                    );
-                }
+                let mut version_buf = [0; 1];
+                cursor.read(&mut version_buf).map_err(|err| {
+                    KernelError::DeletionVector(format!(
+                        "Failed to read version from {path}: {err}"
+                    ))
+                })?;
+                let version = u8::from_be_bytes(version_buf);
+                require!(
+                    version == 1 || is_puffin,
+                    KernelError::DeletionVector(format!("Invalid version {version} for {path}"))
+                );
 
                 // DV blob layout, starting at this_dv_start (the descriptor's offset):
                 // +---------------+-----------------+ <- this_dv_start
