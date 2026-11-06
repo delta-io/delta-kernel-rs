@@ -50,6 +50,8 @@ pub(crate) enum PublicationWatermark {
     /// Preserve the highest observed published version independently of the supplied paths.
     ///
     /// Retained paths may omit published commits or still name their staged locations.
+    /// Kernel trusts this evidence when allowing filesystem writes; supply only publication
+    /// actually observed, never a version inferred from ratification or snapshot freshness.
     PublishedThrough(Version),
 }
 

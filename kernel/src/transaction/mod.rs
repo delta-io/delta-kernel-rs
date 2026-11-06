@@ -2108,6 +2108,18 @@ mod tests {
                 .build(&engine, Box::new(FileSystemCommitter::new()))?
                 .commit(&engine);
             assert!(matches!(stale, Err(KernelError::UnpublishedVersion(1))));
+            let skipped = Snapshot::builder_from(snapshot.clone())
+                .skip_new_checkpoints()
+                .build(&engine)?;
+            assert_eq!(skipped.log_segment().listed.max_published_version, Some(0));
+            let still_unconfirmed = skipped
+                .update_table(UpdateTableOperation::Write, "test-engine", true)
+                .build(&engine, Box::new(FileSystemCommitter::new()))?
+                .commit(&engine);
+            assert!(matches!(
+                still_unconfirmed,
+                Err(KernelError::UnpublishedVersion(1))
+            ));
             let events_before_refresh = reporter.events().len();
             let refreshed = if incremental_refresh {
                 Snapshot::builder_from(snapshot.clone()).build(&engine)?

@@ -43,8 +43,8 @@ impl Snapshot {
     ///
     /// - `T` = effective target version: the time-travel version from
     ///   [`SnapshotBuilder::at_version`] when set, otherwise the `max_catalog_version` from
-    ///   [`SnapshotBuilder::with_max_catalog_version`] for catalog-managed tables, otherwise unset
-    ///   (defaults to latest).
+    ///   [`SnapshotBuilder::with_max_catalog_version`] when supplied, otherwise unset (defaults to
+    ///   latest).
     /// - `S1` = existing snapshot version.
     /// - `S2` = new snapshot version (= end version of the new listing). When `T` is set, the
     ///   listing is upper-bounded by `T`, so `S2 == T`.
@@ -64,7 +64,7 @@ impl Snapshot {
     /// Case A:     C1 ........ S1 (= T)            -            -          return existing
     /// Case B:     C1 .. T .. S1                   -            -          error (T < S1)
     /// Case C.1:   C1 .. S1 .. T                   empty        -          error (T unreachable)
-    /// Case C.2:   C1 .. S1                        empty        -          return existing
+    /// Case C.2:   C1 .. S1                        empty        -          refresh publication
     /// Case D.1:   C1 .. S1 .. C2 ===== S2         [C1+1, S2]   [C2, S2]   rebuild from C2
     /// Case D.2:   C1 . C2 .. S1 ====== S2         [C1+1, S2]   (S1, S2]   advance base, -> F
     /// Case E:     C1 .. S1 (= S2)                 [C1+1, S1]   -          refresh publication
@@ -81,7 +81,8 @@ impl Snapshot {
     ///   no existing checkpoint), and one of the following applies:
     ///   - **C.** Listing is empty:
     ///     - **C.1.** `T` is set: error (target is newer than anything in the log).
-    ///     - **C.2.** `T` is unset: return the existing snapshot.
+    ///     - **C.2.** `T` is unset: reuse the existing table state, advancing its publication
+    ///       watermark from the listing.
     ///   - **D.** Listing contains a checkpoint:
     ///     - **D.1.** `C2 > S1`: the new checkpoint at `C2` already captures the table state
     ///       through version `C2`, including changes in `(S1, C2]`, so we can use it as the new
@@ -535,7 +536,9 @@ impl Snapshot {
             .log_segment
             .listed
             .max_published_version
-            .max(max_published_version);
+            .max(max_published_version)
+            // Listing can observe commits beyond the version selected by the supplied tail.
+            .map(|version| version.min(existing.version()));
         if existing.built_as_latest == built_as_latest
             && existing.skipped_new_checkpoints == skipped_new_checkpoints
             && existing.log_segment.listed.max_published_version == max_published_version
