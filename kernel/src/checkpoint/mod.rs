@@ -754,7 +754,7 @@ impl CheckpointWriter {
         engine: &dyn Engine,
     ) -> KernelResult<CheckpointSchemaContext> {
         let tc = snapshot.table_configuration();
-        let config = StatsTransformConfig::from_table_properties(snapshot.table_properties());
+        let config = StatsTransformConfig::from_table_configuration(tc);
 
         // Select schema based on V2 checkpoint support
         let is_v2 = tc.is_feature_supported(&TableFeature::V2Checkpoint);
@@ -794,7 +794,7 @@ pub(crate) fn ensure_standalone_checkpoint_supported(
 ) -> KernelResult<()> {
     // TODO(#3683): support standalone checkpoints for adaptiveMetadata tables.
     #[cfg(feature = "adaptive-metadata-in-dev")]
-    if table_configuration.is_feature_enabled(&TableFeature::AdaptiveMetadataPreview) {
+    if table_configuration.is_adaptive_metadata_enabled() {
         return Err(KernelError::unsupported(
             "Standalone checkpoints are not yet supported for tables with adaptiveMetadata enabled",
         ));
