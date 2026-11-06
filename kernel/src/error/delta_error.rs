@@ -100,13 +100,23 @@ impl DeltaError {
     /// Creates a `DELTA_PATH_DOES_NOT_EXIST` error for a table root that does not exist or has no
     /// Delta log.
     ///
-    /// `path` is the table root as the caller supplied it, and `source` is the Kernel error that
-    /// detected the missing table.
-    pub(crate) fn path_does_not_exist(path: &str, source: KernelError) -> Self {
+    /// `path` is the table root as the caller supplied it. Supply `source` when a Kernel error
+    /// detected the missing table, or `None` when there is no underlying cause.
+    ///
+    /// ```
+    /// use delta_kernel::{DeltaError, DeltaErrorCondition};
+    /// use std::error::Error as _;
+    ///
+    /// let error = DeltaError::path_does_not_exist("/path/to/table", None);
+    /// assert_eq!(error.condition(), DeltaErrorCondition::DeltaPathDoesNotExist);
+    /// assert_eq!(error.parameters()[0].value(), "/path/to/table");
+    /// assert!(error.source().is_none());
+    /// ```
+    pub fn path_does_not_exist(path: &str, source: Option<KernelError>) -> Self {
         Self::new(
             DeltaErrorCondition::DeltaPathDoesNotExist,
             vec![DeltaErrorParameter::new("path", path)],
-            Some(Box::new(source)),
+            source.map(|source| Box::new(source) as _),
         )
     }
 
