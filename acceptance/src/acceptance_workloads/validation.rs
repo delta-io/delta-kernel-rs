@@ -26,7 +26,8 @@ use tracing::debug;
 use super::workload::{ReadResult, SnapshotResult};
 use crate::data::assert_data_matches;
 
-fn assert_aligned_data_matches(
+/// Compare rows after losslessly aligning the expected Parquet data to the result schema.
+pub(crate) fn assert_aligned_data_matches(
     result: Vec<RecordBatch>,
     result_schema: &SchemaRef,
     expected: RecordBatch,
