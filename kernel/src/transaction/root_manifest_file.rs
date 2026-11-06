@@ -177,9 +177,9 @@ mod tests {
     use crate::snapshot::Snapshot;
     use crate::transaction::create_table::create_table;
     use crate::unit_test_utils::adaptive_metadata_fixtures::{
-        adaptive_metadata_protocol_and_metadata, domain_metadata_line, minimal_checkpoint_action,
-        setup_table, txn_line, write_commit, write_commit_after_manifest_commit,
-        write_manifest_commit,
+        adaptive_metadata_protocol_and_metadata, commit_info_line, domain, domain_metadata_line,
+        minimal_checkpoint_action, setup_table, txn_line, write_commit,
+        write_commit_after_manifest_commit, write_manifest_commit,
     };
     use crate::unit_test_utils::{
         MockTableConfigurationBuilder, assert_result_error_with_message, parse_json_batch,
@@ -296,7 +296,7 @@ mod tests {
                 txn_line("app-1", 5),
             ]
         } else {
-            vec![json!({ "commitInfo": { "timestamp": 1 } }).to_string()]
+            vec![commit_info_line(1, None)]
         };
         let v1: Vec<_> = v1.iter().map(String::as_str).collect();
         write_commit(&engine, &table_root, 1, parse_json_batch(v1.into()))?;
@@ -324,10 +324,6 @@ mod tests {
             &[],
             &[],
         )
-    }
-
-    fn domain(name: &str, configuration: &str) -> DomainMetadata {
-        DomainMetadata::new(name.to_string(), configuration.to_string())
     }
 
     #[rstest]

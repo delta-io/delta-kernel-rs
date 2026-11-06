@@ -405,6 +405,11 @@ pub(crate) mod adaptive_metadata_fixtures {
         serde_json::json!({ "txn": txn }).to_string()
     }
 
+    /// A domain metadata action for `domain` with `configuration`.
+    pub(crate) fn domain(domain: &str, configuration: &str) -> DomainMetadata {
+        DomainMetadata::new(domain.to_string(), configuration.to_string())
+    }
+
     /// A commit line holding `domain_metadata`.
     pub(crate) fn domain_metadata_line(domain_metadata: DomainMetadata) -> String {
         serde_json::json!({ "domainMetadata": domain_metadata }).to_string()
