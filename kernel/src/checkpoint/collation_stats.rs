@@ -10,7 +10,7 @@ use std::sync::{Arc, LazyLock};
 use serde_json::Value;
 
 use crate::action_reconciliation::log_replay::ActionReconciliationBatch;
-use crate::actions::{NUM_RECORDS, TIGHT_BOUNDS};
+use crate::actions::{NUM_RECORDS, TIGHT_BOUNDS, TIGHT_STATS};
 use crate::engine_data::{FilteredRowVisitor, GetData, RowIndexIterator, TypedGetData};
 use crate::expressions::{
     ColumnName, Expression, ExpressionRef, UnaryExpressionOp, col, column_name,
@@ -61,6 +61,13 @@ pub(crate) fn build_collation_stats_read_transform(
         Some(_) => return Err(KernelError::schema("stats_parsed must be a struct")),
         None => schema! { nullable NUM_RECORDS: LONG, nullable TIGHT_BOUNDS: BOOLEAN },
     };
+    // This read has no table configuration, but only adaptiveMetadata stats schemas have
+    // `tightStats`, and those stats are written at full precision.
+    let json_op = if stats.field(TIGHT_STATS).is_some() {
+        UnaryExpressionOp::ToJsonFullPrecision
+    } else {
+        UnaryExpressionOp::ToJson
+    };
     let stats = SchemaStructPatchBuilder::new()
         .append(source.clone())
         .build(&stats)?;
@@ -75,7 +82,7 @@ pub(crate) fn build_collation_stats_read_transform(
     );
     let json = Expression::coalesce([
         col!("add.stats"),
-        Expression::unary(UnaryExpressionOp::ToJson, col!("add.stats_parsed")),
+        Expression::unary(json_op, col!("add.stats_parsed")),
     ]);
     let mut patch = ProjectionStructPatchBuilder::new(&read_schema).replace_expr_at(
         ["add"],
@@ -226,7 +233,7 @@ mod tests {
 
     use super::*;
     use crate::action_reconciliation::log_replay::ActionReconciliationProcessor;
-    use crate::actions::{Metadata, Protocol};
+    use crate::actions::{MIN_VALUES, Metadata, Protocol};
     use crate::arrow::array::StringArray;
     use crate::checkpoint::checkpoint_transform::build_checkpoint_read_schema;
     use crate::checkpoint::{CHECKPOINT_ACTIONS_SCHEMA_V1, CheckpointWriter};
@@ -565,6 +572,52 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[rstest]
+    #[case::tight_stats(true, "2026-07-02T15:55:55.298677Z")]
+    #[case::no_tight_stats(false, "2026-07-02T15:55:55.298Z")]
+    fn read_transform_rebuilds_full_precision_json_only_with_tight_stats(
+        #[case] tight_stats: bool,
+        #[case] expected_bound: &str,
+    ) -> KernelResult<()> {
+        let source =
+            StructField::nullable(COLLATION_STATS, schema! { nullable "custom.ci.1": STRING });
+        let mut parsed_fields = vec![StructField::nullable(
+            MIN_VALUES,
+            schema! { nullable "ts": TIMESTAMP },
+        )];
+        let mut parsed_stats = json!({ MIN_VALUES: { "ts": "2026-07-02T15:55:55.298677Z" } });
+        if tight_stats {
+            parsed_fields.push(StructField::nullable(TIGHT_STATS, DataType::BOOLEAN));
+            parsed_stats[TIGHT_STATS] = json!(true);
+        }
+        let requested = schema! {
+            nullable "add": {
+                nullable "stats": STRING,
+                nullable "stats_parsed": (StructType::try_new(parsed_fields)?),
+            },
+        };
+        let transform = build_collation_stats_read_transform(&requested, Some(&source))?.unwrap();
+
+        let engine = SyncEngine::new();
+        let input = parse_actions(
+            &engine,
+            transform.read_schema.clone(),
+            &[json!({ "add": { "stats": null, "stats_parsed": parsed_stats } })],
+        )?;
+        let output = engine
+            .evaluation_handler()
+            .new_expression_evaluator(
+                transform.read_schema,
+                transform.expression,
+                transform.output_schema.as_ref().clone().into(),
+            )?
+            .evaluate(input.as_ref())?;
+        let rows = json_rows([Ok(FilteredEngineData::with_all_rows_selected(output))].into_iter())?;
+        let stats: Value = serde_json::from_str(rows[0]["add"]["stats"].as_str().unwrap())?;
+        assert_eq!(stats[MIN_VALUES]["ts"], expected_bound, "{stats}");
+        Ok(())
     }
 
     #[rstest]

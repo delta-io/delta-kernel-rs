@@ -553,13 +553,13 @@ impl<STATE, MODE: ExecutionMode> Transaction<STATE, MODE> {
     ///   minValues: { ... },   // Nested struct, only min/max eligible types
     ///   maxValues: { ... },   // Nested struct, only min/max eligible types
     ///   tightBounds: boolean,
-    ///   tightStats: boolean,  // adaptiveMetadata tables only; must be null
+    ///   tightStats: boolean,  // adaptiveMetadata tables only
     /// }
     /// ```
     ///
     /// Engines should collect statistics matching this schema structure when writing files.
     /// A non-null `tightStats` (`true` or `false`) promises timestamp bounds at microsecond
-    /// precision, which commit cannot preserve, so commit rejects add files that set it.
+    /// precision.
     ///
     /// Per the Delta protocol, required columns (e.g. clustering columns) are always included
     /// in statistics, regardless of `dataSkippingStatsColumns` or `dataSkippingNumIndexedCols`
