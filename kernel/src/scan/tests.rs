@@ -20,7 +20,7 @@ use crate::engine::parquet_row_group_skipping::ParquetRowGroupSkipping;
 use crate::engine::sync::SyncEngine;
 use crate::engine::test_delegating::DelegatingEngine;
 use crate::expressions::{
-    Expression as Expr, Predicate as Pred, Scalar, col, column_name, column_pred, expr,
+    Expression as Expr, Predicate as Pred, Scalar, col, column_name, column_pred, expr, lit,
 };
 use crate::object_store::memory::InMemory;
 use crate::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
