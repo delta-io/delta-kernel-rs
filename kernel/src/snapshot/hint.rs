@@ -417,7 +417,9 @@ mod tests {
     use crate::snapshot::builder::tests::catalog_managed_tests::{
         create_log_path as create_catalog_log_path, setup_catalog_managed_test,
     };
-    use crate::snapshot::builder::tests::{create_table, measuring_reporter, setup_test};
+    use crate::snapshot::builder::tests::{
+        create_table, measuring_reporter, scan_paths, setup_test,
+    };
     use crate::snapshot::{FromTableRoot, SnapshotBuilder};
     use crate::table_features::TableFeature;
     use crate::unit_test_utils::{
@@ -1492,7 +1494,7 @@ mod tests {
             .with_snapshot_hint(snapshot.to_snapshot_hint()?)
             .build(engine.as_ref())?;
         assert_eq!(originally_latest.version(), 1);
-        // TODO(#3779): Derive hint freshness from the request when its catalog bound is newer.
+        // TODO(#3833): Derive hint freshness from the request when its catalog bound is newer.
         assert!(originally_latest.is_built_as_latest());
         Ok(())
     }
@@ -1502,7 +1504,7 @@ mod tests {
     #[case::at_downgrade(4)]
     #[case::after_downgrade(3)]
     #[test_log::test(tokio::test(flavor = "multi_thread"))]
-    async fn snapshot_hint_round_trip_after_incremental_downgrade(
+    async fn snapshot_hint_round_trip_after_incremental_downgrade_and_reupgrade(
         #[case] downgrade_version: Version,
         #[values(None, Some(2), Some(5))] checkpoint_version: Option<Version>,
         #[values(false, true)] skip_new_checkpoints: bool,
@@ -1676,14 +1678,8 @@ mod tests {
         assert_eq!(hinted.version(), updated.version());
         assert_eq!(hinted.log_segment().listed, updated.log_segment().listed);
         assert_eq!(hinted.crc_at_version(), updated.crc_at_version());
-        let scan = hinted.clone().scan_builder().build()?;
-        let mut paths = Vec::new();
-        for batch in scan.scan_metadata(engine.as_ref())? {
-            paths = batch?.visit_scan_files(paths, |paths, file| paths.push(file.path))?;
-        }
-        paths.sort();
         assert_eq!(
-            paths,
+            scan_paths(hinted.clone(), engine.as_ref())?,
             (1..=6)
                 .map(|version| format!("file_{version}.parquet"))
                 .collect_vec()
@@ -1700,6 +1696,51 @@ mod tests {
         assert_eq!(rebuilt.version(), 7);
         assert!(!rebuilt.table_configuration().is_catalog_managed());
         assert_eq!(rebuilt.log_segment().listed, advanced.log_segment().listed);
+
+        let upgrade = serde_json::json!({"protocol": Protocol::try_new_modern(
+            [TableFeature::CatalogManaged],
+            [TableFeature::CatalogManaged, TableFeature::InCommitTimestamp],
+        )?});
+        add_commit(
+            &table_root,
+            store.as_ref(),
+            8,
+            format!("{}\n{upgrade}", commit_actions(8)),
+        )
+        .await?;
+        let staged = add_staged_commit(&table_root, store.as_ref(), 9, commit_actions(9)).await?;
+        let tail = vec![create_catalog_log_path(&table_root, staged)];
+        let updated = Snapshot::builder_from(rebuilt)
+            .with_log_tail(tail.clone())
+            .with_max_catalog_version(9)
+            .with_incremental_crc_replay(replay)
+            .build(engine.as_ref())?;
+        let fresh = Snapshot::builder_for(&table_root)
+            .with_log_tail(tail)
+            .with_max_catalog_version(9)
+            .build(engine.as_ref())?;
+        assert_eq!(updated.version(), 9);
+        assert!(updated.table_configuration().is_catalog_managed());
+        assert_eq!(updated.table_configuration(), fresh.table_configuration());
+        let hint = updated.to_snapshot_hint()?;
+        assert!(matches!(
+            Snapshot::builder_for(&table_root)
+                .with_snapshot_hint(hint.clone())
+                .build(engine.as_ref()),
+            Err(KernelError::MaxCatalogVersion(_))
+        ));
+        let hinted = Snapshot::builder_for(&table_root)
+            .at_version(9)
+            .with_snapshot_hint(hint)
+            .build(engine.as_ref())?;
+        for snapshot in [updated, fresh, hinted] {
+            assert_eq!(
+                scan_paths(snapshot, engine.as_ref())?,
+                (1..=9)
+                    .map(|version| format!("file_{version}.parquet"))
+                    .collect_vec()
+            );
+        }
         Ok(())
     }
 

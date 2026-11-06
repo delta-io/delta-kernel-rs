@@ -566,6 +566,20 @@ pub(super) mod tests {
         (engine, store, table_root)
     }
 
+    /// Returns the snapshot's active file paths in sorted order.
+    pub(in crate::snapshot) fn scan_paths(
+        snapshot: SnapshotRef,
+        engine: &dyn Engine,
+    ) -> KernelResult<Vec<String>> {
+        let scan = snapshot.scan_builder().build()?;
+        let mut paths = Vec::new();
+        for batch in scan.scan_metadata(engine)? {
+            paths = batch?.visit_scan_files(paths, |paths, file| paths.push(file.path))?;
+        }
+        paths.sort();
+        Ok(paths)
+    }
+
     pub(in crate::snapshot) async fn create_table(
         store: &Arc<DynObjectStore>,
         table_root: &str,
@@ -971,8 +985,13 @@ pub(super) mod tests {
         }
 
         #[rstest]
+        #[case::catalog_commit(false, false)]
+        #[case::unpublished_downgrade(true, false)]
+        #[case::published_downgrade(true, true)]
         #[test_log::test(tokio::test)]
         async fn test_staged_commits_without_max_catalog_version_errors(
+            #[case] downgrade: bool,
+            #[case] published: bool,
             #[values(None, Some(0), Some(1))] requested_version: Option<Version>,
             #[values(false, true)] incremental: bool,
         ) -> KernelResult<(), Box<dyn std::error::Error>> {
@@ -980,8 +999,19 @@ pub(super) mod tests {
             let base = SnapshotBuilder::new_for(&table_root)
                 .with_max_catalog_version(0)
                 .build(engine.as_ref())?;
-            let path1 =
-                add_staged_commit(&table_root, store.as_ref(), 1, String::from("{}")).await?;
+            let actions = if downgrade {
+                json!({"protocol": Protocol::try_new_modern(
+                    std::iter::empty::<TableFeature>(),
+                    [TableFeature::InCommitTimestamp],
+                )?})
+                .to_string()
+            } else {
+                "{}".into()
+            };
+            let path1 = add_staged_commit(&table_root, store.as_ref(), 1, actions.clone()).await?;
+            if published {
+                add_commit(&table_root, store.as_ref(), 1, actions).await?;
+            }
 
             let log_tail = vec![create_log_path(&table_root, path1)];
 
@@ -1188,14 +1218,8 @@ pub(super) mod tests {
             ] {
                 assert_eq!(count, usize::from(base_version != Some(expected_version)));
             }
-            let scan = snapshot.scan_builder().build()?;
-            let mut paths = Vec::new();
-            for batch in scan.scan_metadata(engine.as_ref())? {
-                paths = batch?.visit_scan_files(paths, |paths, file| paths.push(file.path))?;
-            }
-            paths.sort();
             assert_eq!(
-                paths,
+                scan_paths(snapshot, engine.as_ref())?,
                 (1..=expected_version)
                     .map(|version| format!("file_{version}.parquet"))
                     .collect_vec()
@@ -1218,8 +1242,12 @@ pub(super) mod tests {
         ) -> KernelResult<(), Box<dyn std::error::Error>> {
             let (engine, store, table_root) = setup_test();
             let engine = Arc::new(MeteredDeltaEngine::new(engine));
-            let initial_actions = actions_to_string_catalog_managed(vec![TestAction::Metadata])
-                .replace("catalogManaged", catalog_feature);
+            let initial_actions = actions_to_string_catalog_managed(vec![
+                TestAction::Metadata,
+                TestAction::Add("retained.parquet".into()),
+                TestAction::Add("removed.parquet".into()),
+            ])
+            .replace("catalogManaged", catalog_feature);
             add_commit(&table_root, store.as_ref(), 0, initial_actions).await?;
             let base = SnapshotBuilder::new_for(&table_root)
                 .with_max_catalog_version(0)
@@ -1236,6 +1264,13 @@ pub(super) mod tests {
                 )?
             })
             .to_string();
+            let downgrade = format!(
+                "{downgrade}\n{}",
+                actions_to_string(vec![
+                    TestAction::Remove("removed.parquet".into()),
+                    TestAction::Add("downgrade.parquet".into()),
+                ])
+            );
             let staged_downgrade =
                 add_staged_commit(&table_root, store.as_ref(), 1, downgrade.clone()).await?;
             let expected_commit = create_log_path(
@@ -1315,6 +1350,280 @@ pub(super) mod tests {
                     .count(),
                 1
             );
+            let hinted = SnapshotBuilder::new_for(&table_root)
+                .with_snapshot_hint(snapshot.to_snapshot_hint()?)
+                .build(engine.as_ref())?;
+            for snapshot in [snapshot, hinted] {
+                assert_eq!(
+                    scan_paths(snapshot, engine.as_ref())?,
+                    ["downgrade.parquet", "retained.parquet"]
+                );
+            }
+            Ok(())
+        }
+
+        #[derive(Clone, Copy, PartialEq, Eq)]
+        enum DowngradeRefresh {
+            Unpublished,
+            Published,
+            Checksum,
+            EarlierCheckpoint,
+            TerminalCheckpoint,
+            FilesystemSuccessor,
+            Upgrade,
+            MissingPublishedPredecessor,
+        }
+
+        #[rstest]
+        #[case::empty_listing(1, DowngradeRefresh::Unpublished)]
+        #[case::older_listing(2, DowngradeRefresh::Unpublished)]
+        #[case::published(2, DowngradeRefresh::Published)]
+        #[case::checksum_at_unpublished_version(2, DowngradeRefresh::Checksum)]
+        #[case::new_checkpoint_before_downgrade(2, DowngradeRefresh::EarlierCheckpoint)]
+        #[case::new_checkpoint_at_downgrade(2, DowngradeRefresh::TerminalCheckpoint)]
+        #[case::new_filesystem_commit(2, DowngradeRefresh::FilesystemSuccessor)]
+        #[case::new_upgrade_requires_catalog_bound(2, DowngradeRefresh::Upgrade)]
+        #[case::missing_published_history(3, DowngradeRefresh::MissingPublishedPredecessor)]
+        #[test_log::test(tokio::test(flavor = "multi_thread"))]
+        async fn test_cached_downgrade_refresh_uses_retained_ratified_history(
+            #[case] downgrade_version: Version,
+            #[case] refresh: DowngradeRefresh,
+        ) -> KernelResult<(), Box<dyn std::error::Error>> {
+            let (engine, store, table_root) = setup_catalog_managed_test().await;
+            let engine = Arc::new(MeteredDeltaEngine::new(engine));
+            for version in 1..downgrade_version {
+                add_commit(&table_root, store.as_ref(), version, "{}".into()).await?;
+            }
+            let downgrade = format!(
+                "{}\n{}",
+                json!({"commitInfo": {"inCommitTimestamp": 1587968586155i64}}),
+                json!({"protocol": Protocol::try_new_modern(
+                    std::iter::empty::<TableFeature>(),
+                    [TableFeature::InCommitTimestamp],
+                )?}),
+            );
+            let staged = add_staged_commit(
+                &table_root,
+                store.as_ref(),
+                downgrade_version,
+                downgrade.clone(),
+            )
+            .await?;
+            let source = Snapshot::builder_for(&table_root)
+                .with_log_tail(vec![create_log_path(&table_root, staged)])
+                .with_max_catalog_version(downgrade_version)
+                .build(engine.as_ref())?;
+            let source_files = source.log_segment().listed.clone();
+            let missing = Snapshot::builder_from(source.clone())
+                .at_version(downgrade_version + 1)
+                .build(engine.as_ref());
+            assert!(matches!(missing, Err(KernelError::MissingVersion(_))));
+
+            if matches!(
+                refresh,
+                DowngradeRefresh::Published
+                    | DowngradeRefresh::TerminalCheckpoint
+                    | DowngradeRefresh::FilesystemSuccessor
+                    | DowngradeRefresh::Upgrade
+            ) {
+                add_commit(&table_root, store.as_ref(), downgrade_version, downgrade).await?;
+            }
+            match refresh {
+                DowngradeRefresh::Checksum => {
+                    source.clone().write_checksum(engine.as_ref())?;
+                }
+                DowngradeRefresh::EarlierCheckpoint | DowngradeRefresh::TerminalCheckpoint => {
+                    let version = if refresh == DowngradeRefresh::EarlierCheckpoint {
+                        downgrade_version - 1
+                    } else {
+                        downgrade_version
+                    };
+                    Snapshot::builder_for(&table_root)
+                        .at_version(version)
+                        .with_max_catalog_version(version)
+                        .build(engine.as_ref())?
+                        .checkpoint(engine.as_ref(), None)?;
+                }
+                DowngradeRefresh::FilesystemSuccessor | DowngradeRefresh::Upgrade => {
+                    let actions = if refresh == DowngradeRefresh::Upgrade {
+                        json!({"protocol": Protocol::try_new_modern(
+                            [TableFeature::CatalogManaged],
+                            [TableFeature::CatalogManaged, TableFeature::InCommitTimestamp],
+                        )?})
+                        .to_string()
+                    } else {
+                        "{}".into()
+                    };
+                    add_commit(&table_root, store.as_ref(), downgrade_version + 1, actions).await?;
+                }
+                DowngradeRefresh::MissingPublishedPredecessor => {
+                    store
+                        .delete(&test_utils::delta_path_for_version(
+                            downgrade_version - 1,
+                            "json",
+                        ))
+                        .await?;
+                }
+                DowngradeRefresh::Unpublished | DowngradeRefresh::Published => {}
+            }
+
+            let (reporter, _guard) = measuring_reporter();
+            let result = Snapshot::builder_from(source.clone()).build(engine.as_ref());
+            assert_eq!(source.log_segment().listed, source_files);
+            match refresh {
+                DowngradeRefresh::MissingPublishedPredecessor => {
+                    assert!(matches!(result, Err(KernelError::MissingVersion(version))
+                        if version == downgrade_version - 1));
+                }
+                DowngradeRefresh::Upgrade => {
+                    assert!(matches!(result, Err(KernelError::MaxCatalogVersion(_))));
+                }
+                _ => {
+                    let updated = result?;
+                    assert_eq!(
+                        updated.version(),
+                        downgrade_version
+                            + u64::from(refresh == DowngradeRefresh::FilesystemSuccessor)
+                    );
+                    assert!(!updated.table_configuration().is_catalog_managed());
+                    if matches!(
+                        refresh,
+                        DowngradeRefresh::Unpublished
+                            | DowngradeRefresh::Published
+                            | DowngradeRefresh::Checksum
+                    ) {
+                        assert!(Arc::ptr_eq(&updated, &source));
+                        assert!(!reporter.events().iter().any(|event| matches!(
+                            event,
+                            MetricEvent::StorageReadCompleted(_)
+                                | MetricEvent::JsonReadCompleted(_)
+                                | MetricEvent::ParquetReadCompleted(_)
+                        )));
+                    }
+                    if matches!(
+                        refresh,
+                        DowngradeRefresh::EarlierCheckpoint | DowngradeRefresh::TerminalCheckpoint
+                    ) {
+                        assert_eq!(
+                            updated.log_segment().checkpoint_version,
+                            Some(
+                                downgrade_version
+                                    - u64::from(refresh == DowngradeRefresh::EarlierCheckpoint)
+                            )
+                        );
+                    }
+                    let rebuilt = Snapshot::builder_for(&table_root)
+                        .with_snapshot_hint(updated.to_snapshot_hint()?)
+                        .build(engine.as_ref())?;
+                    assert_eq!(rebuilt.log_segment().listed, updated.log_segment().listed);
+                }
+            }
+            assert_eq!(
+                reporter
+                    .events()
+                    .iter()
+                    .filter(|event| matches!(event, MetricEvent::StorageListCompleted(_)))
+                    .count(),
+                1
+            );
+            Ok(())
+        }
+
+        #[rstest]
+        #[case::single_retained(2, None)]
+        #[case::two_retained(3, None)]
+        #[case::published_prefix(3, Some(2))]
+        #[test_log::test(tokio::test(flavor = "multi_thread"))]
+        async fn test_incremental_catalog_tail_reuses_retained_staged_commits(
+            #[case] source_version: Version,
+            #[case] publish_through: Option<Version>,
+            #[values(false, true)] explicit_version: bool,
+            #[values(false, true)] restore_hint: bool,
+            #[values(false, true)] new_checkpoint: bool,
+        ) -> KernelResult<(), Box<dyn std::error::Error>> {
+            let (engine, store, table_root) = setup_catalog_managed_test().await;
+            add_commit(
+                &table_root,
+                store.as_ref(),
+                1,
+                actions_to_string(vec![TestAction::Add("file_1.parquet".into())]),
+            )
+            .await?;
+            let target_version = source_version + 1;
+            let commit_actions = |version| {
+                actions_to_string(vec![TestAction::Add(format!("file_{version}.parquet"))])
+            };
+            let mut tail = Vec::new();
+            for version in 2..=target_version {
+                let staged = add_staged_commit(
+                    &table_root,
+                    store.as_ref(),
+                    version,
+                    commit_actions(version),
+                )
+                .await?;
+                tail.push(create_log_path(&table_root, staged));
+            }
+            let source = Snapshot::builder_for(&table_root)
+                .with_log_tail(tail[..tail.len() - 1].to_vec())
+                .with_max_catalog_version(source_version)
+                .build(engine.as_ref())?;
+            let source = if restore_hint {
+                Snapshot::builder_for(&table_root)
+                    .at_version(source_version)
+                    .with_snapshot_hint(source.to_snapshot_hint()?)
+                    .build(engine.as_ref())?
+            } else {
+                source
+            };
+            if let Some(publish_through) = publish_through {
+                for version in 2..=publish_through {
+                    add_commit(
+                        &table_root,
+                        store.as_ref(),
+                        version,
+                        commit_actions(version),
+                    )
+                    .await?;
+                }
+            }
+            if new_checkpoint {
+                Snapshot::builder_for(&table_root)
+                    .at_version(1)
+                    .build(engine.as_ref())?
+                    .checkpoint(engine.as_ref(), None)?;
+            }
+            let updated = Snapshot::builder_from(source)
+                .with_log_tail(vec![tail.last().unwrap().clone()])
+                .with_max_catalog_version(target_version)
+                .fold_with(
+                    explicit_version.then_some(target_version),
+                    SnapshotBuilder::at_version,
+                )
+                .build(engine.as_ref())?;
+            let fresh = Snapshot::builder_for(&table_root)
+                .with_log_tail(tail)
+                .with_max_catalog_version(target_version)
+                .build(engine.as_ref())?;
+            assert_eq!(updated.version(), target_version);
+            assert_eq!(updated.table_configuration(), fresh.table_configuration());
+            assert_eq!(updated.log_segment().listed, fresh.log_segment().listed);
+            assert_eq!(
+                updated.log_segment().listed.max_published_version,
+                Some(publish_through.unwrap_or(1))
+            );
+            let hinted = Snapshot::builder_for(&table_root)
+                .at_version(target_version)
+                .with_snapshot_hint(updated.to_snapshot_hint()?)
+                .build(engine.as_ref())?;
+            for snapshot in [updated, fresh, hinted] {
+                assert_eq!(
+                    scan_paths(snapshot, engine.as_ref())?,
+                    (1..=target_version)
+                        .map(|version| format!("file_{version}.parquet"))
+                        .collect_vec()
+                );
+            }
             Ok(())
         }
 

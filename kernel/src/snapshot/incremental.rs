@@ -155,6 +155,7 @@ impl Snapshot {
             tracing::Span::current().record("version", requested_version);
             // Case A: re-requesting the same version.
             if requested_version == existing_snapshot_version {
+                // TODO(#3833): Reconcile cached freshness with the new request before reuse.
                 return Ok(existing_snapshot.clone());
             }
             // Case B: incremental path only moves forward.
@@ -350,7 +351,7 @@ impl Snapshot {
             // No version can follow Version::MAX.
             return Ok(NewSegment::Unchanged);
         };
-        let new_listed_files = LogSegmentFiles::list_with_checkpoint_handling(
+        let mut new_listed_files = LogSegmentFiles::list_with_checkpoint_handling(
             storage.as_ref(),
             &log_root,
             log_tail,
@@ -375,6 +376,9 @@ impl Snapshot {
             };
         }
 
+        new_listed_files.retain_staged_commits(&existing_log_segment.listed, listing_start);
+
+        // TODO(#3834): Validate the leading replay boundary without a covering checkpoint.
         // create a log segment just from existing_checkpoint.version -> new_version
         // OR could be from 1 -> new_version
         // Save the latest_commit before moving new_listed_files
