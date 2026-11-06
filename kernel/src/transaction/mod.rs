@@ -295,7 +295,7 @@ pub struct Transaction<STATE = UpdateTable, MODE: ExecutionMode = Imperative> {
     // Whether to emit a Protocol action. True for CREATE TABLE, false otherwise.
     should_emit_protocol: bool,
     // Whether to emit a Metadata action. True for CREATE TABLE and transactions with staged
-    // schema changes, false otherwise.
+    // schema or property changes, false otherwise.
     should_emit_metadata: bool,
     committer: Box<dyn Committer>,
     operation: CommitOperation,
@@ -1091,7 +1091,7 @@ impl<STATE, MODE: ExecutionMode> Transaction<STATE, MODE> {
                 if !self.should_emit_metadata =>
             {
                 Err(KernelError::invalid_transaction_state(
-                    "ALTER TABLE requires at least one schema change",
+                    "ALTER TABLE requires at least one table change",
                 ))
             }
             (false, CommitOperation::UpdateTable(UpdateTableOperation::AlterTable))
@@ -2930,7 +2930,7 @@ mod tests {
     #[case::alter_without_schema_changes(
         false,
         CommitOperation::UpdateTable(UpdateTableOperation::AlterTable),
-        "ALTER TABLE requires at least one schema change"
+        "ALTER TABLE requires at least one table change"
     )]
     #[case::empty_custom_operation(
         false,
