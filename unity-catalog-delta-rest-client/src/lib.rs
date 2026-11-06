@@ -6,7 +6,9 @@
 //! # Example
 //!
 //! ```no_run
-//! use unity_catalog_delta_rest_client::{ClientConfig, UCDeltaTableClient};
+//! use unity_catalog_delta_rest_client::{
+//!     ClientConfig, LoadTableClient, TableIdentifier, UCDeltaTableClient,
+//! };
 //!
 //! #[tokio::main]
 //! async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -15,7 +17,8 @@
 //!         .build()?;
 //!     let client = UCDeltaTableClient::new(config)?;
 //!
-//!     let resp = client.load_table("main", "default", "my_table").await?;
+//!     let target = TableIdentifier::new("main", "default", "my_table");
+//!     let resp = LoadTableClient::load_table(&client, &target).await?;
 //!     println!("table id: {}", resp.metadata.table_uuid);
 //!     Ok(())
 //! }
@@ -33,6 +36,8 @@ pub use clients::{UCDeltaTableClient, UCUpdateTableRestClient};
 pub use config::{ClientConfig, ClientConfigBuilder};
 pub use error::{Error, Result};
 pub use unity_catalog_delta_client_api as api;
-pub use unity_catalog_delta_client_api::UpdateTableClient;
 pub use unity_catalog_delta_client_api::credentials::*;
 pub use unity_catalog_delta_client_api::models::*;
+pub use unity_catalog_delta_client_api::{
+    GetCredentialsClient, LoadTableClient, UpdateTableClient,
+};

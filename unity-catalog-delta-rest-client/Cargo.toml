@@ -26,6 +26,10 @@ thiserror = "2.0"
 tracing = "0.1"
 url = "2.5"
 
+[dev-dependencies]
+rstest = "0.23"
+wiremock = "0.6"
+
 [features]
 default = []
 test-utils = ["unity-catalog-delta-client-api/test-utils"]
