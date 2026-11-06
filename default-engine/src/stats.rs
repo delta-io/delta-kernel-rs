@@ -23,7 +23,9 @@ use delta_kernel::arrow::datatypes::{
 use delta_kernel::column_trie::ColumnTrie;
 use delta_kernel::engine::arrow_utils::fix_nested_null_masks;
 use delta_kernel::expressions::ColumnName;
-use delta_kernel::schema::{DataType as KernelDataType, StructType};
+use delta_kernel::schema::{
+    DataType as KernelDataType, StructType, is_null_count_only_file_sub_field,
+};
 use delta_kernel::{KernelError, KernelResult};
 
 /// Maximum prefix length for string statistics (Delta protocol requirement).
@@ -504,7 +506,7 @@ pub fn collect_stats(
     stats_columns: &[ColumnName],
     physical_schema: &StructType,
 ) -> KernelResult<StructArray> {
-    let null_count_only_columns = interval_column_names(physical_schema, stats_columns);
+    let null_count_only_columns = null_count_only_column_names(physical_schema, stats_columns);
     reduce_stats(
         &collect_stats_raw(batch, stats_columns, &null_count_only_columns)?,
         TruncateStats::Yes,
@@ -662,7 +664,7 @@ impl FileStatsAccumulator {
     /// only) from integer columns.
     pub fn new(stats_columns: &[ColumnName], physical_schema: &StructType) -> Self {
         Self {
-            null_count_only_columns: interval_column_names(physical_schema, stats_columns),
+            null_count_only_columns: null_count_only_column_names(physical_schema, stats_columns),
             stats_columns: stats_columns.to_vec(),
             batch_schema: None,
             state: AccumulatorState::Open(None),
@@ -905,15 +907,21 @@ fn is_interval_type(data_type: &KernelDataType) -> bool {
     primitive_type.is_interval()
 }
 
-fn interval_column_names(schema: &StructType, stats_columns: &[ColumnName]) -> Vec<ColumnName> {
+/// Returns the `stats_columns` that get only `nullCount`: intervals, and the `file` sub-fields
+/// without min/max statistics (`checksum` and `inline`).
+fn null_count_only_column_names(
+    schema: &StructType,
+    stats_columns: &[ColumnName],
+) -> Vec<ColumnName> {
     stats_columns
         .iter()
         .filter(|col| {
-            schema
-                .fields_of_path(col)
-                .ok()
-                .and_then(|fields| fields.last().map(|field| field.data_type()))
-                .is_some_and(is_interval_type)
+            schema.fields_of_path(col).is_ok_and(|path| {
+                is_null_count_only_file_sub_field(&path)
+                    || path
+                        .last()
+                        .is_some_and(|leaf| is_interval_type(leaf.data_type()))
+            })
         })
         .cloned()
         .collect()
@@ -933,7 +941,7 @@ mod tests {
     use delta_kernel::engine::arrow_expression::evaluate_expression::to_json;
     use delta_kernel::expressions::column_name;
     use delta_kernel::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-    use delta_kernel::schema::schema;
+    use delta_kernel::schema::{StructField, schema};
     use test_utils::{assert_batches_sorted_eq, assert_result_error_with_message};
 
     use super::*;
@@ -2927,6 +2935,54 @@ mod tests {
             // The sibling column still gets bounds, so the exclusion is targeted.
             assert!(child_struct(&merged, section).column_by_name("n").is_some());
         }
+    }
+
+    /// The null-count-only columns are intervals and the `file` sub-fields `checksum` and
+    /// `inline`, at top level or nested in a struct, but no other `file` sub-field.
+    #[test]
+    fn test_null_count_only_column_names() {
+        let schema = StructType::try_new([
+            StructField::nullable("span", KernelDataType::INTERVAL_DAY_TIME),
+            StructField::nullable("f", KernelDataType::file_type()),
+            StructField::nullable(
+                "s",
+                StructType::try_new([StructField::nullable("f", KernelDataType::file_type())])
+                    .unwrap(),
+            ),
+            StructField::nullable(
+                "checksum",
+                StructType::try_new([StructField::nullable("checksum", KernelDataType::STRING)])
+                    .unwrap(),
+            ),
+        ])
+        .unwrap();
+        let columns: Vec<_> = [
+            "span",
+            "f.uri",
+            "f.offset",
+            "f.size",
+            "f.content_type",
+            "f.checksum",
+            "f.inline",
+            "s.f.size",
+            "s.f.checksum",
+            "s.f.inline",
+            "checksum.checksum",
+        ]
+        .into_iter()
+        .map(ColumnName::from_naive_str_split)
+        .collect();
+        let expected: Vec<_> = [
+            "span",
+            "f.checksum",
+            "f.inline",
+            "s.f.checksum",
+            "s.f.inline",
+        ]
+        .into_iter()
+        .map(ColumnName::from_naive_str_split)
+        .collect();
+        assert_eq!(null_count_only_column_names(&schema, &columns), expected);
     }
 
     #[test]

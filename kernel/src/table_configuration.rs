@@ -19,7 +19,8 @@ use url::Url;
 use crate::actions::{Metadata, NULL_COUNT, Protocol};
 use crate::expressions::ColumnName;
 use crate::scan::data_skipping::stats_schema::{
-    StatsConfig, StripFieldMetadataTransform, expected_stats_schema, stats_column_names,
+    StatsConfig, StripFieldMetadataTransform, expected_stats_schema, is_skipping_eligible_datatype,
+    stats_column_names,
 };
 use crate::schema::collation_utils::validate_collations_feature_support;
 pub(crate) use crate::schema::file_utils::validate_file_type_feature_support;
@@ -27,8 +28,8 @@ use crate::schema::generated_column::collect_generated_columns;
 pub(crate) use crate::schema::variant_utils::validate_variant_type_feature_support;
 use crate::schema::void_utils::strip_void_from_schema;
 use crate::schema::{
-    ColumnMetadataKey, GeneratedColumn, SchemaRef, StructField, StructType, schema_has_invariants,
-    validate_column_defaults_metadata,
+    ColumnMetadataKey, DataType, GeneratedColumn, SchemaRef, StructField, StructType,
+    is_null_count_only_file_sub_field, schema_has_invariants, validate_column_defaults_metadata,
 };
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::table_features::V4_VALIDATOR;
@@ -705,12 +706,33 @@ impl TableConfiguration {
     /// Stats-column set for `DataSkippingFilter`'s predicate-rewrite gate. The gate tests
     /// every column reference in the rewritten predicate against this set; every data-skipping
     /// call site shares this entry point so their gate input stays in lockstep.
+    ///
+    /// It leaves out the `file` sub-fields without min/max statistics whose type the gate would
+    /// still treat as having them, so predicates on them skip no files. The gate decides min/max
+    /// eligibility by the compared value's type with [`is_skipping_eligible_datatype`], and this
+    /// set uses the same check: `checksum` is a string, so it is left out; `inline` is binary,
+    /// which the gate already treats as having no min/max, so it stays and its `nullCount` is used.
+    /// Leaving `checksum` out also gives up `IS NULL` skipping on it, though its `nullCount` is
+    /// collected.
     pub(crate) fn physical_stats_columns_set(
         &self,
         required_columns: Option<&[ColumnName]>,
     ) -> HashSet<ColumnName> {
+        // TODO(#3608): track null-count eligibility apart from min/max, so `checksum` keeps
+        // `IS NULL` skipping.
+        let schema = self.physical_data_schema_without_partition_columns();
+        let lacks_min_max_of_its_type = |col: &ColumnName| {
+            schema.fields_of_path(col).is_ok_and(|path| {
+                is_null_count_only_file_sub_field(&path)
+                    && path.last().is_some_and(|leaf| {
+                        matches!(leaf.data_type(), DataType::Primitive(ptype)
+                            if is_skipping_eligible_datatype(ptype))
+                    })
+            })
+        };
         self.physical_stats_column_names(required_columns)
             .into_iter()
+            .filter(|col| !lacks_min_max_of_its_type(col))
             .collect()
     }
 
@@ -3231,6 +3253,43 @@ mod test {
             vec![column_name!("phys_col_a"), column_name!("phys_col_b"),],
             "Expected physical column names, not logical names"
         );
+    }
+
+    /// The skipping gate keeps a `file` column's sub-fields except `checksum`, whose string type
+    /// would otherwise admit min/max predicates although it has no min/max statistics, at top
+    /// level or nested. A plain string field named `checksum` stays.
+    #[test]
+    fn test_physical_stats_columns_set_leaves_out_file_checksum() {
+        let schema = schema_ref! {
+            nullable "id": LONG,
+            nullable "f": (DataType::file_type()),
+            nullable "s": {
+                nullable "f": (DataType::file_type()),
+                nullable "checksum": STRING,
+            },
+        };
+        let config = MockTableConfigurationBuilder::new()
+            .with_schema(schema)
+            .with_protocol(
+                MockProtocolBuilder::new()
+                    .with_features([TableFeature::FileTypePreview])
+                    .build(),
+            )
+            .build();
+        let mut columns: Vec<_> = config
+            .physical_stats_columns_set(None)
+            .into_iter()
+            .map(|col| col.to_string())
+            .collect();
+        columns.sort();
+        let file_columns = |prefix: &str| {
+            ["content_type", "inline", "offset", "size", "uri"]
+                .map(|name| format!("{prefix}.{name}"))
+        };
+        let mut expected = [file_columns("f"), file_columns("s.f")].concat();
+        expected.extend(["id".to_string(), "s.checksum".to_string()]);
+        expected.sort();
+        assert_eq!(columns, expected);
     }
 
     #[test]

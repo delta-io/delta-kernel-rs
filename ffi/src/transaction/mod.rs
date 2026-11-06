@@ -3730,7 +3730,7 @@ mod tests {
     )]
     #[case::traverse_primitive(
         vec![vec!["id", "child"]],
-        "intermediate field 'id' is not a struct type"
+        "intermediate field 'id' is not a struct or `file` type"
     )]
     #[case::struct_as_leaf(vec![vec!["parent"]], "has unsupported type")]
     #[case::duplicate_nested_path(
