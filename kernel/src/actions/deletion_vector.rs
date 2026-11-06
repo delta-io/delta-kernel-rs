@@ -674,17 +674,8 @@ impl DeletionVectorDescriptor {
         Ok(self.read(storage, parent)?.into_iter().collect())
     }
 
-    /// Validates the deletion vector file's framing against the descriptor's `offset`.
-    ///
-    /// A Delta DV file opens with a 1-byte version header (`0x01`); an Iceberg Puffin file opens
-    /// with the 4-byte `PFA1` magic and ends with a footer. Both wrap byte-identical DV blobs, and
-    /// a `deletion-vector-v1` blob is always uncompressed, so the blob addressed by `offset` and
-    /// `size_in_bytes` reads the same from either framing (the Puffin footer is never consulted).
-    /// Accepting Puffin framing is a deliberate reader-side leniency for Iceberg interop; kernel
-    /// only ever writes Delta framing.
-    ///
-    /// Errors on an unrecognized header, or on a Puffin file whose descriptor lacks an explicit
-    /// offset past the magic -- the blob cannot begin inside the `PFA1` bytes.
+    /// Validates the deletion vector file's framing: a Delta DV file or, as a reader-side leniency
+    /// for Iceberg interop, a Puffin file.
     fn validate_framing(&self, dv_data: &[u8], path: &Url) -> KernelResult<()> {
         if dv_data.starts_with(&PUFFIN_MAGIC) {
             require!(
