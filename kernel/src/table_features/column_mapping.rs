@@ -704,9 +704,9 @@ fn assign_nested_cm_ids(schema: &StructType, max_id: &mut i64) -> KernelResult<S
             DataType::Struct(inner) => Ok(DataType::from(assign_nested_cm_ids(inner, max_id)?)),
             DataType::Array(array_type) => {
                 let element_path = format!("{path}.element");
-                *max_id += 1;
-                nested_ids.insert(element_path.clone(), serde_json::Value::from(*max_id));
-                let slot_id = *max_id;
+                let id = next_column_mapping_id(max_id)?;
+                nested_ids.insert(element_path.clone(), serde_json::Value::from(id));
+                let slot_id = id;
                 reserve_file_subfield_ids(array_type.element_type(), slot_id, max_id)?;
                 let new_element =
                     walk(array_type.element_type(), max_id, &element_path, nested_ids)?;
@@ -718,14 +718,14 @@ fn assign_nested_cm_ids(schema: &StructType, max_id: &mut i64) -> KernelResult<S
             DataType::Map(map_type) => {
                 let key_path = format!("{path}.key");
                 let value_path = format!("{path}.value");
-                *max_id += 1;
-                nested_ids.insert(key_path.clone(), serde_json::Value::from(*max_id));
-                let slot_id = *max_id;
+                let id = next_column_mapping_id(max_id)?;
+                nested_ids.insert(key_path.clone(), serde_json::Value::from(id));
+                let slot_id = id;
                 reserve_file_subfield_ids(map_type.key_type(), slot_id, max_id)?;
                 let new_key = walk(map_type.key_type(), max_id, &key_path, nested_ids)?;
-                *max_id += 1;
-                nested_ids.insert(value_path.clone(), serde_json::Value::from(*max_id));
-                let slot_id = *max_id;
+                let id = next_column_mapping_id(max_id)?;
+                nested_ids.insert(value_path.clone(), serde_json::Value::from(id));
+                let slot_id = id;
                 reserve_file_subfield_ids(map_type.value_type(), slot_id, max_id)?;
                 let new_value = walk(map_type.value_type(), max_id, &value_path, nested_ids)?;
                 Ok(DataType::from(MapType::new(
@@ -2044,6 +2044,33 @@ mod tests {
     /// Allocating a sibling next to a preserved id at the protocol cap must error with the
     /// allocator-flavored bound message (distinct from the `i64::MAX` overflow message; the
     /// `checked_add` succeeds, then the bound check trips).
+
+    #[test]
+    fn test_nested_column_mapping_id_allocator_bounds() {
+        for data_type in [
+            DataType::Array(Box::new(ArrayType::new(DataType::STRING, true))),
+            DataType::Map(Box::new(MapType::new(
+                DataType::STRING,
+                DataType::STRING,
+                true,
+            ))),
+        ] {
+            let field = StructField::new("test", data_type, true)
+                .with_metadata([(
+                    "delta.columnMapping.physicalName".to_string(),
+                    "col-test".to_string(),
+                )]);
+
+            let schema = StructType::new_unchecked([field]);
+            let mut max_id = i32::MAX as i64;
+
+            assert!(
+                super::assign_nested_cm_ids(&schema, &mut max_id).is_err(),
+                "nested allocation must reject IDs above i32::MAX"
+            );
+        }
+    }
+
     #[test]
     fn test_assign_column_mapping_metadata_errors_when_allocation_would_exceed_protocol_max() {
         // Field 1 preserves id = i32::MAX; field 2 has only physicalName so allocation fires.
