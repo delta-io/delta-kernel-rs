@@ -1450,7 +1450,7 @@ impl Snapshot {
     /// - If Kernel does not support reading or writing the table.
     /// - [`KernelError::ChecksumWriteUnsupported`] if no CRC can be resolved for this version, if
     ///   the resolved CRC's `file_stats_state` is `Indeterminate` (a non-incremental operation like
-    ///   ANALYZE STATS, or a file action with a missing size; recoverable with a full state
+    ///   Manual Update, or a counted file action with a missing size; recoverable with a full state
     ///   reconstruction in the future), or if `delta.enableInCommitTimestamps` is `true` but
     ///   `inCommitTimestampOpt` is absent.
     /// - The underlying read error if in-commit timestamps are enabled but the timestamp cannot be
@@ -1578,7 +1578,10 @@ impl Snapshot {
             )?;
             require!(
                 delta.is_incremental_safe,
-                unresolved_crc("commits after the checkpoint are not incremental-safe")
+                unresolved_crc(&match &delta.unsupported_operation {
+                    Some(operation) => format!("unsupported operation {operation:?}"),
+                    None => "commits after the checkpoint are not incremental-safe".to_string(),
+                })
             );
             let base = log_segment
                 .build_crc_from_checkpoint(engine)?

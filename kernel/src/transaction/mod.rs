@@ -1427,6 +1427,8 @@ impl<STATE, MODE: ExecutionMode> Transaction<STATE, MODE> {
             #[cfg(feature = "adaptive-metadata-in-dev")]
             last_manifest_commit: commit_info.last_manifest_commit,
             is_incremental_safe,
+            unsupported_operation: (!is_incremental_safe)
+                .then(|| self.operation.as_str().to_string()),
         })
     }
 

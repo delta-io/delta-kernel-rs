@@ -103,31 +103,109 @@ pub(crate) struct FileStatsDelta {
     pub(crate) net_histogram: Option<FileSizeHistogram>,
 }
 
-const INCREMENTAL_SAFE_OPS: &[&str] = &[
-    "WRITE",
-    "STREAMING UPDATE",
-    "MERGE",
-    "UPDATE",
-    "DELETE",
-    "OPTIMIZE",
-    "REORG",
-    "CREATE TABLE",
-    "REPLACE TABLE",
-    "CREATE TABLE AS SELECT",
-    "REPLACE TABLE AS SELECT",
-    "CREATE OR REPLACE TABLE AS SELECT",
-];
+/// How a commit's file actions contribute to incremental statistics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FileStatsPolicy {
+    ApplyAll,
+    IgnoreAdds,
+    IgnoreRemoves,
+    Unsupported,
+}
+
+impl FileStatsPolicy {
+    /// Selects which file actions contribute to incremental checksum statistics.
+    pub(crate) fn for_operation(operation: &str) -> Self {
+        // These operation-name heuristics depend on writer conventions. The protocol proposal at
+        // https://github.com/delta-io/delta/pull/6798 makes the add/remove policy explicit through
+        // `commitInfo.incremental`.
+        match operation {
+            // These operations update metadata on existing files by re-adding them.
+            "COMPUTE STATS"
+            | "ROW TRACKING BACKFILL"
+            | "ROW TRACKING UNBACKFILL"
+            | "DROP FEATURE"
+            | "LIQUID BACKFILL"
+            | "LIQUID TAGGING"
+            | "REPLACE PARTITIONED BY WITH CLUSTER BY" => Self::IgnoreAdds,
+            // These tombstones protect deletion vectors from VACUUM without removing data files.
+            "Deletion Vector Tombstones" => Self::IgnoreRemoves,
+            // Data writes.
+            "WRITE"
+            | "STREAMING UPDATE"
+            | "DELETE"
+            | "UPDATE"
+            | "MERGE"
+            | "TRUNCATE"
+            // Table creation and replacement.
+            | "CREATE TABLE"
+            | "CREATE TABLE AS SELECT"
+            | "REPLACE TABLE"
+            | "REPLACE TABLE AS SELECT"
+            | "CREATE OR REPLACE TABLE AS SELECT"
+            // Schema and table metadata changes.
+            | "ADD COLUMNS"
+            | "DROP COLUMNS"
+            | "RENAME COLUMN"
+            | "CHANGE COLUMN"
+            | "CHANGE COLUMNS"
+            | "REPLACE COLUMNS"
+            | "UPDATE SCHEMA"
+            | "REMOVE COLUMN MAPPING"
+            | "SET TBLPROPERTIES"
+            | "ADD CONSTRAINT"
+            | "DROP CONSTRAINT"
+            | "UPGRADE PROTOCOL"
+            // Maintenance operations.
+            | "OPTIMIZE"
+            | "RECOMPRESSION"
+            | "REORG"
+            | "VACUUM START"
+            | "VACUUM END"
+            | "REPAIR METADATA"
+            | "CLUSTER BY"
+            | "Empty Commit"
+            | "DOMAIN METADATA CLEANUP" => Self::ApplyAll,
+            // Manual updates and unrecognized operations have no trusted file-action policy.
+            _ => Self::Unsupported,
+        }
+    }
+}
 
 /// Returns `true` if the given operation can be safely tracked by incremental file stats.
 ///
-/// Incremental-safe operations produce add/remove actions whose net counts give correct file
-/// stats. Unknown operations return `false`. For example, ANALYZE STATS re-adds existing files
-/// with updated statistics; naively counting those adds would double-count file stats.
+/// Replay accepts known operation names and applies their add/remove exclusions before counting
+/// file actions. Unknown operations return `false`.
 pub(crate) fn is_incremental_safe_operation(operation: &str) -> bool {
-    INCREMENTAL_SAFE_OPS.contains(&operation)
+    FileStatsPolicy::for_operation(operation) != FileStatsPolicy::Unsupported
 }
 
 impl FileStatsDelta {
+    /// Adds another delta's gross totals and net histogram, using matching bin boundaries.
+    /// If either delta has no histogram, the combined delta has none.
+    pub(crate) fn accumulate(&mut self, source: &Self) {
+        self.gross_add_files += source.gross_add_files;
+        self.gross_remove_files += source.gross_remove_files;
+        self.gross_add_bytes += source.gross_add_bytes;
+        self.gross_remove_bytes += source.gross_remove_bytes;
+        if let (Some(target), Some(source)) = (&mut self.net_histogram, &source.net_histogram) {
+            target.accumulate(source);
+        } else {
+            self.net_histogram = None;
+        }
+    }
+
+    /// Clears counters and histogram bins while retaining boundaries and allocations.
+    pub(crate) fn clear(&mut self) {
+        if let Some(histogram) = self.net_histogram.as_mut() {
+            histogram.file_counts.fill(0);
+            histogram.total_bytes.fill(0);
+        }
+        *self = Self {
+            net_histogram: self.net_histogram.take(),
+            ..Default::default()
+        };
+    }
+
     /// Net change in file count (added minus removed).
     pub(crate) fn net_files(&self) -> i64 {
         self.gross_add_files as i64 - self.gross_remove_files as i64

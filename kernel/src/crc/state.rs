@@ -22,7 +22,7 @@ use crate::{KernelError, KernelResult};
 ///
 /// # State transitions during `Crc::apply`
 ///
-/// | Current       | + safe op     | + unsafe op or missing remove.size |
+/// | Current       | + safe op     | + unsafe op or missing counted size |
 /// |---------------|---------------|------------------------------------|
 /// | Complete      | Complete      | Indeterminate                      |
 /// | Indeterminate | Indeterminate | Indeterminate                      |
@@ -34,9 +34,9 @@ pub enum FileStatsState {
     /// without histogram).
     Complete(FileStats),
     /// File stats cannot be determined incrementally. Reasons include a non-incremental
-    /// operation (like `ANALYZE STATS`) that re-adds files without corresponding removes,
-    /// or a remove action with a missing `size` field. A full add/remove reconciliation pass
-    /// can recover `Complete`.
+    /// operation (like `Manual Update`) that may violate file-action invariants,
+    /// or a counted remove action with a missing `size` field. A full add/remove reconciliation
+    /// pass can recover `Complete`.
     Indeterminate,
 }
 
