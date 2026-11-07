@@ -16,6 +16,9 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  # Pin the link checker for compatibility with mdBook's JSON format.
+  # Validate the guide when updating this version or the install-action commit.
+  MDBOOK_LINKCHECK_VERSION: "0.13.0"
 
 jobs:
   user-guide:
@@ -31,19 +34,29 @@ jobs:
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           cache-bin: false
+          # make test cleans target to avoid duplicate .rmeta files; cache only dependency sources.
+          cache-targets: false
           save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
       # mdbook: builds and serves the book.
       # mdbook-mermaid: preprocessor that renders ```mermaid blocks as diagrams.
+      # mdbook-linkcheck2: backend that checks internal links and section anchors.
+      # install-action's pinned manifests select the mdBook and mdbook-mermaid versions.
       - uses: taiki-e/install-action@7bc99eee1f1b8902a125006cf790a1f4c8461e63 # v2.69.8
+        env:
+          # Use upstream release binaries, with a locked source build if no asset is available.
+          BINSTALL_STRATEGIES: crate-meta-data,compile
         with:
-          tool: mdbook,mdbook-mermaid
-      # mdbook-linkcheck2: backend that fails the build on broken internal
-      # `[link](../foo.md)` references and missing #section anchors. It's a
-      # maintained fork of mdbook-linkcheck; the original is incompatible
-      # with mdbook 0.5+. Not in taiki-e/install-action's catalog, so we
-      # cargo install it directly.
-      - name: Install mdbook-linkcheck2
-        run: cargo install --locked mdbook-linkcheck2
+          tool: mdbook,mdbook-mermaid,mdbook-linkcheck2@${{ env.MDBOOK_LINKCHECK_VERSION }}
+          # The link checker is outside install-action's tool catalog.
+          fallback: cargo-binstall
+      # book.toml makes mdbook-linkcheck2 optional for local builds. Require a runnable executable
+      # at the requested version so CI cannot silently skip link checks.
+      - name: Verify link checker
+        shell: bash
+        run: |
+          version=$("${CARGO_HOME:-$HOME/.cargo}/bin/mdbook-linkcheck2" --version)
+          echo "$version"
+          test "$version" = "mdbook-linkcheck2 ${MDBOOK_LINKCHECK_VERSION}"
       # Compiles every Rust code block in the guide via mdbook test, using the
       # kernel deps that the Makefile builds first.
       - name: Test that all code examples compile

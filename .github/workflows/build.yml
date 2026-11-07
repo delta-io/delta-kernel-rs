@@ -367,6 +367,9 @@ jobs:
         uses: ./.github/actions/use-homebrew-tools
         with:
           tools: "apache-arrow apache-arrow-glib"
+          # The ~4.5 min in #2707 includes 84-150s building an archive that fails to save.
+          # Disable archiving; brew install still runs.
+          cache: "no"
       - name: Install minimal stable
         uses: actions-rust-lang/setup-rust-toolchain@150fca883cd4034361b621bd4e6a9d34e5143606 # v1.15.4
         with:
