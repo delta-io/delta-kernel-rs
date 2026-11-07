@@ -390,6 +390,9 @@ impl From<&Predicate> for proto_expr::Predicate {
             Predicate::Binary(binary) => Kind::Binary(Box::new(binary.into())),
             Predicate::Junction(junction) => Kind::Junction(junction.into()),
             Predicate::Opaque(opaque) => Kind::Opaque(opaque.into()),
+            // No proto node for manifest deletion vector lookups; serialize as an opaque unknown.
+            #[cfg(feature = "adaptive-metadata-in-dev")]
+            Predicate::ManifestDvContains(m) => Kind::Unknown(m.unknown_name().to_string()),
             Predicate::Unknown(name) => Kind::Unknown(name.clone()),
         };
         proto_expr::Predicate { kind: Some(kind) }
@@ -1101,6 +1104,8 @@ mod tests {
     };
     use crate::plans::ir::plan::{Plan, PlanNode};
     use crate::plans::proto::expressions::expression::Kind as ExprKind;
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    use crate::plans::proto::expressions::predicate::Kind as PredKind;
     use crate::plans::proto::{
         expressions as proto_expr, operation as proto_op, plan as proto_plan,
         schema as proto_schema,
@@ -1812,6 +1817,16 @@ mod tests {
             Kind::Unknown(_) => "unknown",
         };
         assert_eq!(kind, expected);
+    }
+
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[test]
+    fn from_manifest_dv_contains_lowers_to_unknown() {
+        let pred = Predicate::manifest_dv_contains(col!("dv"), col!("pos"));
+        assert_eq!(
+            proto_expr::Predicate::from(&pred).kind,
+            Some(PredKind::Unknown("manifest_dv_contains".to_string()))
+        );
     }
 
     #[test]

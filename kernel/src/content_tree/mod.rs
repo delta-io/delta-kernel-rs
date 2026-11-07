@@ -9,7 +9,7 @@ mod builder;
 mod checkpoint_action_stream;
 mod checkpoint_sidecar;
 mod dv_conversion;
-mod mumbling;
+pub(crate) mod mumbling;
 mod reader;
 pub(crate) mod stats;
 #[cfg(test)]

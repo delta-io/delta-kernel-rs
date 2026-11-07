@@ -385,6 +385,9 @@ pub trait KernelPredicateEvaluator {
             Junction(JunctionPredicate { op, preds }) => {
                 self.eval_pred_junction(*op, preds, inverted)
             }
+            // Manifest deletion vectors never drive data skipping.
+            #[cfg(feature = "adaptive-metadata-in-dev")]
+            ManifestDvContains(_) => None,
             Opaque(OpaquePredicate { op, exprs }) => self.eval_pred_opaque(op, exprs, inverted),
             Unknown(_) => None, // not supported by definition
         }

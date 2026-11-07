@@ -1,6 +1,8 @@
 use std::borrow::{Cow, ToOwned};
 use std::sync::Arc;
 
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use crate::expressions::ManifestDvContainsPredicate;
 use crate::expressions::{
     BinaryExpression, BinaryPredicate, CaseWhenExpression, CastExpression, ColumnName, Expression,
     ExpressionRef, ExpressionStructPatch, JunctionPredicate, MapToStructExpression,
@@ -323,6 +325,11 @@ pub trait ExpressionTransform<'a> {
                 let child = self.transform_pred_junction(j);
                 map_owned_or_else(pred, child, |j| Predicate::junction(j.op, j.preds))
             }
+            #[cfg(feature = "adaptive-metadata-in-dev")]
+            Predicate::ManifestDvContains(m) => {
+                let child = self.recurse_into_pred_manifest_dv_contains(m);
+                map_owned_or_else(pred, child, Predicate::ManifestDvContains)
+            }
             Predicate::Opaque(o) => {
                 let child = self.transform_pred_opaque(o);
                 map_owned_or_else(pred, child, Predicate::Opaque)
@@ -405,6 +412,18 @@ pub trait ExpressionTransform<'a> {
         let right = self.transform_expr(&b.right);
         let f = |(left, right)| BinaryPredicate::new(b.op, left, right);
         map_owned_pair_or_else(b, left, right, f)
+    }
+
+    /// Recursively transforms the children of a manifest deletion vector lookup (binary).
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    fn recurse_into_pred_manifest_dv_contains(
+        &mut self,
+        m: &'a ManifestDvContainsPredicate,
+    ) -> Self::Output<ManifestDvContainsPredicate> {
+        let dv = self.transform_expr(&m.dv);
+        let position = self.transform_expr(&m.position);
+        let f = |(dv, position)| ManifestDvContainsPredicate::new(dv, position);
+        map_owned_pair_or_else(m, dv, position, f)
     }
 
     /// Recursively transforms a unary expression's child (unary).
@@ -806,6 +825,20 @@ mod tests {
         assert_eq!(
             matches!(result, Some(Cow::Borrowed(_))),
             expected.as_ref() == Some(&input)
+        );
+    }
+
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[test]
+    fn test_transform_pred_manifest_dv_contains_rewrites_both_children() {
+        let pred = Pred::manifest_dv_contains(col!("old_col"), col!("old_col"));
+        let result = ColumnReplacer(Some("new_col")).transform_pred(&pred);
+        assert_eq!(
+            result.as_deref(),
+            Some(&Pred::manifest_dv_contains(
+                col!("new_col"),
+                col!("new_col")
+            ))
         );
     }
 

@@ -474,6 +474,23 @@ pub enum CastMode {
     Strict,
 }
 
+/// A predicate that is TRUE when an adaptiveMetadata manifest deletion vector removes the manifest
+/// entry at `position`.
+///
+/// `dv` is a BINARY manifest deletion vector in the serialized form of a DataManifest entry's
+/// `manifestInfo.dv`, and `position` is a LONG entry position within the manifest it applies to.
+/// The predicate is FALSE when `dv` is NULL or `position` lies outside the positions a manifest
+/// deletion vector can hold, and NULL when `position` is NULL. A `dv` that does not parse fails
+/// evaluation.
+#[cfg(feature = "adaptive-metadata-in-dev")]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ManifestDvContainsPredicate {
+    /// The manifest deletion vector.
+    pub dv: Box<Expression>,
+    /// The manifest entry position to look up.
+    pub position: Box<Expression>,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct JunctionPredicate {
     /// The operator.
@@ -656,6 +673,10 @@ pub enum Predicate {
     Binary(BinaryPredicate),
     /// A junction operation (AND/OR).
     Junction(JunctionPredicate),
+    /// Whether a manifest deletion vector removes a manifest entry. See
+    /// [`ManifestDvContainsPredicate`].
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    ManifestDvContains(ManifestDvContainsPredicate),
     /// A predicate that the engine defines and implements. Kernel interacts with the predicate
     /// only through methods provided by the [`OpaquePredicateOp`] trait.
     #[serde(serialize_with = "fail_serialize_opaque_predicate")]
@@ -915,6 +936,23 @@ impl CastExpression {
 impl CastMode {
     fn is_safe(&self) -> bool {
         *self == CastMode::Safe
+    }
+}
+
+#[cfg(feature = "adaptive-metadata-in-dev")]
+impl ManifestDvContainsPredicate {
+    pub(crate) fn new(dv: impl Into<Expression>, position: impl Into<Expression>) -> Self {
+        Self {
+            dv: Box::new(dv.into()),
+            position: Box::new(position.into()),
+        }
+    }
+
+    /// The name this predicate is lowered to where a boundary has no node for it and must pass it
+    /// as [`Predicate::Unknown`].
+    #[internal_api]
+    pub(crate) fn unknown_name(&self) -> &'static str {
+        "manifest_dv_contains"
     }
 }
 
@@ -1222,6 +1260,16 @@ impl Predicate {
     }
 
     /// Create a new predicate `self AND other`
+    /// Creates a predicate that is TRUE when the manifest deletion vector `dv` removes the entry at
+    /// `position`. See [`ManifestDvContainsPredicate`].
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    pub fn manifest_dv_contains(
+        dv: impl Into<Expression>,
+        position: impl Into<Expression>,
+    ) -> Self {
+        Self::ManifestDvContains(ManifestDvContainsPredicate::new(dv, position))
+    }
+
     pub fn and(a: impl Into<Self>, b: impl Into<Self>) -> Self {
         Self::and_from([a.into(), b.into()])
     }
@@ -1467,6 +1515,10 @@ impl Display for Predicate {
                     JunctionPredicateOp::Or => "OR",
                 };
                 write!(f, "{op}({})", format_child_list(preds))
+            }
+            #[cfg(feature = "adaptive-metadata-in-dev")]
+            ManifestDvContains(ManifestDvContainsPredicate { dv, position }) => {
+                write!(f, "MANIFEST_DV_CONTAINS({dv}, {position})")
             }
             Opaque(OpaquePredicate { op, exprs }) => {
                 write!(f, "{op:?}({})", format_child_list(exprs))
@@ -1812,6 +1864,17 @@ mod tests {
                 let expr = Expression::binary(op, col!("a"), lit(10));
                 assert_roundtrip(&expr);
             }
+        }
+
+        #[cfg(feature = "adaptive-metadata-in-dev")]
+        #[test]
+        fn test_manifest_dv_contains_roundtrip_and_display() {
+            let pred = Predicate::manifest_dv_contains(col!("dv"), col!("pos"));
+            assert_roundtrip(&pred);
+            assert_eq!(
+                pred.to_string(),
+                "MANIFEST_DV_CONTAINS(Column(dv), Column(pos))"
+            );
         }
 
         #[test]

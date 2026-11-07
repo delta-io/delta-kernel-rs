@@ -804,6 +804,10 @@ fn visit_predicate_impl(
         Predicate::Opaque(OpaquePredicate { op, exprs }) => {
             visit_predicate_opaque(visitor, op, exprs, sibling_list_id)
         }
+        #[cfg(feature = "adaptive-metadata-in-dev")]
+        Predicate::ManifestDvContains(m) => {
+            visit_unknown(visitor, sibling_list_id, m.unknown_name())
+        }
         Predicate::Unknown(name) => visit_unknown(visitor, sibling_list_id, name),
     }
 }

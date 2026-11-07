@@ -4,6 +4,8 @@ use std::collections::HashMap;
 use std::fmt::Display;
 use std::sync::Arc;
 
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use bytes::Bytes;
 use chrono::Utc;
 use itertools::Itertools;
 use tracing::warn;
@@ -32,6 +34,8 @@ use crate::arrow::error::ArrowError;
 use crate::arrow::json::StructMode;
 use crate::arrow::json::writer::{EncoderOptions, make_encoder};
 use crate::arrow::util::display::array_value_to_string;
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use crate::content_tree::mumbling::MumblingBitmap;
 use crate::delta_kernel_derive::internal_api;
 use crate::engine::arrow_conversion::{LIST_ARRAY_ROOT, TryFromKernel, TryIntoArrow};
 use crate::engine::arrow_expression::opaque::{
@@ -40,6 +44,8 @@ use crate::engine::arrow_expression::opaque::{
 use crate::engine::arrow_utils::{list_type_with_element, parse_json_impl, prim_array_cmp};
 use crate::engine::ensure_data_types::{ValidationMode, ensure_data_types};
 use crate::error::{KernelError, KernelResult};
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use crate::expressions::ManifestDvContainsPredicate;
 use crate::expressions::{
     BinaryExpression, BinaryExpressionOp, BinaryPredicate, BinaryPredicateOp, CaseWhenExpression,
     CastExpression, CastMode, Expression, ExpressionRef, ExpressionStructPatch, JunctionPredicate,
@@ -912,6 +918,11 @@ pub fn evaluate_predicate(
                 .reduce(|l, r| Ok(reducer(&l?, &r?)?))
                 .unwrap_or_else(|| Ok(BooleanArray::from(vec![default; batch.num_rows()])))
         }
+        #[cfg(feature = "adaptive-metadata-in-dev")]
+        ManifestDvContains(pred) => {
+            let contains = evaluate_manifest_dv_contains(pred, batch)?;
+            Ok(if inverted { not(&contains)? } else { contains })
+        }
         Opaque(OpaquePredicate { op, exprs }) => {
             match op.any_ref().downcast_ref::<ArrowOpaquePredicateOpAdaptor>() {
                 Some(op) => op.eval_pred(exprs, batch, inverted),
@@ -1012,6 +1023,62 @@ fn map_string_rows<'a, T>(
             "{op} requires a string input, got {other}"
         ))),
     }
+}
+
+/// Evaluates [`ManifestDvContainsPredicate`] row by row. A literal deletion vector, the common case
+/// of one manifest's deletion vector applied to that manifest's entries, is parsed once.
+#[cfg(feature = "adaptive-metadata-in-dev")]
+fn evaluate_manifest_dv_contains(
+    pred: &ManifestDvContainsPredicate,
+    batch: &RecordBatch,
+) -> KernelResult<BooleanArray> {
+    let parse = |bytes: &[u8]| {
+        MumblingBitmap::deserialize(Bytes::copy_from_slice(bytes)).map_err(|e| {
+            KernelError::invalid_checkpoint(format!("Malformed manifest deletion vector: {e}"))
+        })
+    };
+    let positions = evaluate_expression(&pred.position, batch, Some(&DataType::LONG))?;
+    let positions = positions.as_primitive_opt::<Int64Type>().ok_or_else(|| {
+        KernelError::invalid_expression(format!(
+            "MANIFEST_DV_CONTAINS position must be LONG, got {}",
+            positions.data_type()
+        ))
+    })?;
+    let contains = |dv: Option<&MumblingBitmap>, position: i64| {
+        dv.is_some_and(|dv| u32::try_from(position).is_ok_and(|pos| dv.contains(pos)))
+    };
+    if let Expression::Literal(literal) = pred.dv.as_ref() {
+        let dv = match literal {
+            Scalar::Binary(bytes) => Some(parse(bytes)?),
+            Scalar::Null(DataType::BINARY) => None,
+            other => {
+                return Err(KernelError::invalid_expression(format!(
+                    "MANIFEST_DV_CONTAINS deletion vector must be BINARY, got {other:?}"
+                )));
+            }
+        };
+        return Ok(positions
+            .iter()
+            .map(|position| position.map(|position| contains(dv.as_ref(), position)))
+            .collect());
+    }
+    let dvs = evaluate_expression(&pred.dv, batch, Some(&DataType::BINARY))?;
+    let dvs = dvs.as_binary_opt::<i32>().ok_or_else(|| {
+        KernelError::invalid_expression(format!(
+            "MANIFEST_DV_CONTAINS deletion vector must be BINARY, got {}",
+            dvs.data_type()
+        ))
+    })?;
+    dvs.iter()
+        .zip(positions.iter())
+        .map(|(dv, position)| {
+            let Some(position) = position else {
+                return Ok(None);
+            };
+            let dv = dv.map(parse).transpose()?;
+            Ok(Some(contains(dv.as_ref(), position)))
+        })
+        .collect()
 }
 
 /// `chrono` formats implementing the timestamp encoding [`UnaryExpressionOp::ToJson`] requires.
@@ -1368,6 +1435,8 @@ mod tests {
     use crate::arrow::datatypes::{
         DataType as ArrowDataType, Field as ArrowField, Fields, Schema as ArrowSchema,
     };
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    use crate::content_tree::mumbling::tests::encode_positions;
     use crate::engine::arrow_conversion::TryIntoKernel;
     use crate::expressions::{
         ArrayData, BinaryExpressionOp, BinaryPredicateOp, Expression as Expr,
@@ -2281,6 +2350,88 @@ mod tests {
         assert_result_error_with_message(
             evaluate_predicate(&pred, &batch, false),
             "Invalid right value for (NOT) IN comparison",
+        );
+    }
+
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    fn manifest_dv_batch() -> RecordBatch {
+        let positions = Int64Array::from(vec![
+            Some(0),
+            Some(1),
+            Some(2),
+            None,
+            Some(-1),
+            Some(1 << 33),
+        ]);
+        RecordBatch::try_from_iter([("pos", Arc::new(positions) as ArrayRef)]).unwrap()
+    }
+
+    /// Positions that are NULL stay NULL; positions no manifest deletion vector can hold are
+    /// never removed.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[rstest]
+    #[case::removes_position_one(
+        lit(Scalar::Binary(encode_positions(&[1]).to_vec())),
+        false,
+        &[Some(false), Some(true), Some(false), None, Some(false), Some(false)]
+    )]
+    #[case::inverted(
+        lit(Scalar::Binary(encode_positions(&[1]).to_vec())),
+        true,
+        &[Some(true), Some(false), Some(true), None, Some(true), Some(true)]
+    )]
+    #[case::null_dv_removes_nothing(
+        null_lit(DataType::BINARY),
+        false,
+        &[Some(false), Some(false), Some(false), None, Some(false), Some(false)]
+    )]
+    fn test_manifest_dv_contains(
+        #[case] dv: Expr,
+        #[case] inverted: bool,
+        #[case] expected: &[Option<bool>],
+    ) {
+        let pred = Pred::manifest_dv_contains(dv, col!("pos"));
+        let result = evaluate_predicate(&pred, &manifest_dv_batch(), inverted).unwrap();
+        assert_eq!(result, BooleanArray::from(expected.to_vec()));
+    }
+
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[test]
+    fn test_manifest_dv_contains_reads_a_deletion_vector_per_row() {
+        let dvs = BinaryArray::from(vec![
+            Some(encode_positions(&[0]).as_ref()),
+            Some(encode_positions(&[0]).as_ref()),
+            None,
+        ]);
+        let positions = Int64Array::from(vec![0, 1, 0]);
+        let batch = RecordBatch::try_from_iter([
+            ("dv", Arc::new(dvs) as ArrayRef),
+            ("pos", Arc::new(positions) as ArrayRef),
+        ])
+        .unwrap();
+        let pred = Pred::manifest_dv_contains(col!("dv"), col!("pos"));
+        let result = evaluate_predicate(&pred, &batch, false).unwrap();
+        assert_eq!(result, BooleanArray::from(vec![true, false, false]));
+    }
+
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[rstest]
+    #[case::malformed_dv(lit(Scalar::Binary(vec![1, 2, 3])), col!("pos"), "Malformed manifest deletion vector: Generic delta kernel error: Mumbling bitmap is truncated")]
+    #[case::non_binary_dv(lit(7), col!("pos"), "deletion vector must be BINARY")]
+    #[case::non_long_position(
+        lit(Scalar::Binary(encode_positions(&[1]).to_vec())),
+        lit(1i32),
+        "position must be LONG"
+    )]
+    fn test_manifest_dv_contains_rejects_bad_input(
+        #[case] dv: Expr,
+        #[case] position: Expr,
+        #[case] expected_error: &str,
+    ) {
+        let pred = Pred::manifest_dv_contains(dv, position);
+        assert_result_error_with_message(
+            evaluate_predicate(&pred, &manifest_dv_batch(), false),
+            expected_error,
         );
     }
 
