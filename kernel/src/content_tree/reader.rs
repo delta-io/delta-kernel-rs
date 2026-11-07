@@ -1166,10 +1166,10 @@ mod tests {
         test_dv_info, with_field, write_manifest,
     };
     use crate::content_tree::{DeletionVectorInfo, ManifestInfo};
+    use crate::engine::DelegatingEngine;
     use crate::engine::arrow_conversion::TryFromArrow as _;
     use crate::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt as _};
     use crate::engine::sync::SyncEngine;
-    use crate::engine::test_delegating::DelegatingEngine;
     use crate::expressions::StructData;
     use crate::object_store::memory::InMemory;
     use crate::scan::state::DvInfo;

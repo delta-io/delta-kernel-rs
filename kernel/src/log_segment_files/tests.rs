@@ -5,9 +5,8 @@ use rstest::rstest;
 use url::Url;
 
 use super::*;
-use crate::engine::CancellableEngine;
 use crate::engine::sync::SyncEngine;
-use crate::engine::test_delegating::DelegatingEngine;
+use crate::engine::{CancellableEngine, DelegatingEngine};
 use crate::object_store::ObjectStoreExt as _;
 use crate::object_store::memory::InMemory;
 use crate::object_store::path::Path as ObjectPath;

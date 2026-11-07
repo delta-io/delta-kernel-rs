@@ -563,9 +563,8 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
-    use crate::engine::CancellableEngine;
     use crate::engine::sync::SyncEngine;
-    use crate::engine::test_delegating::DelegatingEngine;
+    use crate::engine::{CancellableEngine, DelegatingEngine};
     #[cfg(feature = "adaptive-metadata-in-dev")]
     use crate::object_store::memory::InMemory;
     use crate::schema::schema;

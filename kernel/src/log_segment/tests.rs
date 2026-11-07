@@ -18,11 +18,11 @@ use crate::actions::{
     SIDECAR_NAME, Sidecar, get_all_actions_schema, get_commit_schema,
 };
 use crate::arrow::array::{StringArray, StructArray};
+use crate::engine::DelegatingEngine;
 use crate::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt as _};
 use crate::engine::arrow_expression::evaluate_expression::extract_column_ref;
 use crate::engine::sync::SyncEngine;
 use crate::engine::sync::json::SyncJsonHandler;
-use crate::engine::test_delegating::DelegatingEngine;
 use crate::expressions::{col, column_name};
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::last_checkpoint_hint::{AmtCheckpoint, CheckpointType};
