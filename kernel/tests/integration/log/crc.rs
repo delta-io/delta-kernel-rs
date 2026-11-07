@@ -23,15 +23,16 @@ use delta_kernel::transaction::data_layout::DataLayout;
 use delta_kernel::transaction::{UpdateTableOperation, UpdateTableTransactionBuilder};
 use delta_kernel::{
     Engine, EngineData, EvaluationHandler, FileDataReadResultIterator, FileMeta, FileSize,
-    FileStats, JsonHandler, KernelError, KernelResult, KernelResultIterator, ParquetFooter,
-    ParquetHandler, PredicateRef, StorageHandler, Version,
+    FileStats, JsonHandler, KernelResult, KernelResultIterator, ParquetFooter, ParquetHandler,
+    PredicateRef, StorageHandler, Version,
 };
 use rstest::rstest;
 use test_utils::delta_kernel_default_engine::executor::TaskExecutor;
 use test_utils::delta_kernel_default_engine::{DefaultEngine, DefaultEngineBuilder};
 use test_utils::{
-    add_commit, begin_transaction_with, copy_directory, insert_data, insert_data_with,
-    read_actions_from_commit, read_scan, test_table_setup, test_table_setup_mt,
+    add_commit, assert_result_error_with_message, begin_transaction_with, copy_directory,
+    insert_data, insert_data_with, read_actions_from_commit, read_scan, test_table_setup,
+    test_table_setup_mt,
 };
 use url::Url;
 
@@ -651,11 +652,9 @@ async fn test_post_commit_crc_tracks_domain_metadata_changes() -> KernelResult<(
     Ok(())
 }
 
-#[rstest]
 #[tokio::test]
-async fn test_post_commit_crc_metadata_only_custom_op_makes_file_stats_indeterminate(
-    #[values("CUSTOM OP", "VACUUM END", "SET TBLPROPERTIES")] operation: &str,
-) -> delta_kernel::Result<()> {
+async fn test_post_commit_crc_metadata_only_custom_op_makes_file_stats_indeterminate()
+-> delta_kernel::Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
     // ===== GIVEN: Create table (v0) and insert data (v1) =====
@@ -672,7 +671,7 @@ async fn test_post_commit_crc_metadata_only_custom_op_makes_file_stats_indetermi
     let committed = begin_transaction_with(
         snapshot_v1.clone(),
         engine.as_ref(),
-        UpdateTableOperation::Custom(operation.to_string()),
+        UpdateTableOperation::Custom("CUSTOM OP".to_string()),
         "test-engine",
         true,
         |builder| builder,
@@ -685,23 +684,16 @@ async fn test_post_commit_crc_metadata_only_custom_op_makes_file_stats_indetermi
     let snapshot_v2 = committed.post_commit_snapshot().unwrap();
     let crc_v2 = snapshot_v2.crc_at_version().unwrap();
     assert!(crc_v2.file_stats_state().is_indeterminate());
-    assert!(matches!(
+    assert_result_error_with_message(
         snapshot_v2.write_checksum(engine.as_ref()),
-        Err(KernelError::ChecksumWriteUnsupported(_))
-    ));
+        "unsupported operation \"CUSTOM OP\"",
+    );
 
     let fresh = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
-    if operation == "CUSTOM OP" {
-        assert!(matches!(
-            fresh.write_checksum(engine.as_ref()),
-            Err(KernelError::ChecksumWriteUnsupported(_))
-        ));
-    } else {
-        assert_eq!(
-            fresh.write_checksum(engine.as_ref())?.0,
-            ChecksumWriteResult::Written
-        );
-    }
+    assert_result_error_with_message(
+        fresh.write_checksum(engine.as_ref()),
+        "unsupported operation \"CUSTOM OP\"",
+    );
 
     Ok(())
 }
@@ -772,7 +764,7 @@ async fn test_write_checksum_double_write_returns_already_exists(
 async fn test_write_checksum_preserves_stats_across_metadata_only_commits(
     #[case] root: WriteRoot,
     #[case] checkpoint: Option<CheckpointSpec>,
-    #[values("VACUUM START", "VACUUM END", "SET TBLPROPERTIES", "FSCK")] operation: &str,
+    #[values("VACUUM START", "VACUUM END", "SET TBLPROPERTIES", "Empty Commit")] operation: &str,
 ) -> delta_kernel::Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
     let mut builder = create_table(
@@ -809,16 +801,22 @@ async fn test_write_checksum_preserves_stats_across_metadata_only_commits(
                 .await?
                 .unwrap_post_commit_snapshot()
         } else {
-            snap.update_table(
-                UpdateTableOperation::Custom(operation.to_string()),
-                "test_engine",
-                false,
-            )
-            .with_domain_metadata("metadata_only", format!("v{version}"))
-            .with_transaction_id("metadata_only", version)
-            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
-            .commit(engine.as_ref())?
-            .unwrap_post_commit_snapshot()
+            let actions = [
+                serde_json::json!({"commitInfo": {"operation": operation}}),
+                serde_json::json!({"domainMetadata": {
+                    "domain": "metadata_only",
+                    "configuration": format!("v{version}"),
+                    "removed": false,
+                }}),
+                serde_json::json!({"txn": {"appId": "metadata_only", "version": version}}),
+            ];
+            let commit = actions
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("\n");
+            add_commit(&table_path, &LocalFileSystem::new(), version, commit).await?;
+            Snapshot::builder_for(&table_path).build(engine.as_ref())?
         };
     }
 
@@ -1318,14 +1316,10 @@ async fn test_write_checksum_ignores_metadata_readds_and_counts_subsequent_white
     let snap = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
     assert_eq!(snap.get_file_stats_if_present(), Some(expected));
 
-    insert_data_with(
+    insert_data(
         snap,
         &engine,
         vec![Arc::new(Int32Array::from(vec![4, 5, 6]))],
-        Box::new(FileSystemCommitter::new()),
-        "COPY INTO",
-        true,
-        false,
     )
     .await?
     .unwrap_committed();
@@ -1366,11 +1360,13 @@ async fn test_write_checksum_ignores_metadata_readds_and_counts_subsequent_white
 }
 
 #[rstest]
-#[case::checkpoint(true)]
-#[case::stale_crc(false)]
+#[case::checkpoint(true, IncrementalReplay::Disabled)]
+#[case::stale_crc(false, IncrementalReplay::Disabled)]
+#[case::advanced_crc(false, IncrementalReplay::Unlimited)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_write_checksum_rejects_file_actions_with_unsafe_operation(
     #[case] with_checkpoint: bool,
+    #[case] replay: IncrementalReplay,
     #[values("Manual Update", "UNKNOWN")] operation: &str,
 ) -> delta_kernel::Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
@@ -1404,18 +1400,21 @@ async fn test_write_checksum_rejects_file_actions_with_unsafe_operation(
     .unwrap_committed();
 
     let fresh = Snapshot::builder_for(&table_path)
-        .with_incremental_crc_replay(IncrementalReplay::Unlimited)
+        .with_incremental_crc_replay(replay)
         .build(engine.as_ref())?;
     assert_eq!(fresh.version(), 2);
-    assert_eq!(fresh.crc_at_version().is_some(), !with_checkpoint);
+    assert_eq!(
+        fresh.crc_at_version().is_some(),
+        !with_checkpoint && replay == IncrementalReplay::Unlimited
+    );
     assert_eq!(fresh.get_file_stats_if_present(), None);
     if let Some(crc) = fresh.crc_at_version() {
         assert!(crc.file_stats_state().is_indeterminate());
     }
-    assert!(matches!(
+    assert_result_error_with_message(
         fresh.write_checksum(engine.as_ref()),
-        Err(delta_kernel::KernelError::ChecksumWriteUnsupported(_))
-    ));
+        &format!("unsupported operation {operation:?}"),
+    );
 
     Ok(())
 }

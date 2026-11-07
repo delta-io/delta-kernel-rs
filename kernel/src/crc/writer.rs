@@ -21,10 +21,14 @@ use crate::{Engine, KernelError, KernelResult};
 pub(crate) fn try_write_crc_file(engine: &dyn Engine, path: &Url, crc: &Crc) -> KernelResult<()> {
     require!(
         crc.file_stats_state.is_complete(),
-        KernelError::ChecksumWriteUnsupported(format!(
-            "Cannot write CRC file with {:?} file stats",
-            crc.file_stats_state
-        ))
+        KernelError::ChecksumWriteUnsupported(match &crc.unsupported_operation {
+            Some(operation) =>
+                format!("Cannot write CRC file incrementally: unsupported operation {operation:?}"),
+            None => format!(
+                "Cannot write CRC file with {:?} file stats",
+                crc.file_stats_state
+            ),
+        })
     );
     // If ICT is enabled, the CRC must carry an ICT value.
     let ict_enabled = crc

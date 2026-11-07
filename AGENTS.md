@@ -196,7 +196,7 @@ staged-file checks. `UpdateTableOperation::AlterTable` records schema-changing D
 introducing a separate transaction type.
 
 Incremental CRC replay accepts known operation names with operation-specific exclusions in
-`FileStatsPolicy` (`kernel/src/crc/file_stats.rs`). Excluded operation names must also be rejected for
+`FileStatsPolicy` (`kernel/src/crc/file_stats.rs`). Accepted operation names must also be rejected for
 `UpdateTableOperation::Custom`. Represent update-table
 operations with typed variants so name reservation is automatic, and mirror them in the FFI.
 

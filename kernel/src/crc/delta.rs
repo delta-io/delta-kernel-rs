@@ -44,6 +44,8 @@ pub(crate) struct CrcDelta {
     /// when their commit contains file actions; transactions exclude custom operations even
     /// without file actions.
     pub(crate) is_incremental_safe: bool,
+    /// Unsupported operation, when known, if `is_incremental_safe` is false.
+    pub(crate) unsupported_operation: Option<String>,
 }
 
 impl CrcDelta {
@@ -90,6 +92,7 @@ impl CrcDelta {
         Some(Crc {
             version,
             file_stats_state,
+            unsupported_operation: self.unsupported_operation,
             protocol,
             metadata,
             domain_metadata_state,
@@ -152,6 +155,9 @@ impl Crc {
             self.last_manifest_commit_opt = delta.last_manifest_commit;
         }
 
+        if self.file_stats_state.is_complete() && !delta.is_incremental_safe {
+            self.unsupported_operation = delta.unsupported_operation;
+        }
         self.file_stats_state = transition_file_stats(
             &self.file_stats_state,
             &delta.file_stats,
@@ -404,6 +410,7 @@ mod tests {
     fn test_indeterminate_stays_indeterminate() {
         let unsafe_change = CrcDelta {
             is_incremental_safe: false,
+            unsupported_operation: Some("UNKNOWN".to_string()),
             ..add_files_delta(1, 100)
         };
         let crc = base_crc().apply(unsafe_change, 1);
@@ -413,6 +420,16 @@ mod tests {
         let crc = crc.apply(add_files_delta(5, 500), 2);
         assert!(crc.file_stats_state.is_indeterminate());
         assert_eq!(crc.version, 2);
+        assert_eq!(crc.unsupported_operation.as_deref(), Some("UNKNOWN"));
+
+        let crc = crc.apply(
+            CrcDelta {
+                unsupported_operation: Some("ANOTHER UNKNOWN".to_string()),
+                ..CrcDelta::default()
+            },
+            3,
+        );
+        assert_eq!(crc.unsupported_operation.as_deref(), Some("UNKNOWN"));
     }
 
     // ===== apply: non-file-stats field updates =====
