@@ -18,6 +18,7 @@ use futures::StreamExt;
 use futures::stream::TryStreamExt;
 use itertools::Itertools;
 
+use crate::acceptance_workloads::validation::assert_aligned_data_matches;
 use crate::{TestCaseInfo, TestResult};
 
 #[allow(deprecated)]
@@ -146,7 +147,7 @@ pub async fn assert_scan_metadata(
         })
         .try_collect()?;
     let golden = read_golden(test_case.root_dir(), None).await?;
-    assert_data_matches(batches, &schema.unwrap(), golden)?;
+    assert_aligned_data_matches(batches, &schema.unwrap(), golden)?;
 
     Ok(())
 }

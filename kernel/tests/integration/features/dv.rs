@@ -329,6 +329,94 @@ async fn test_write_deletion_vectors_end_to_end() -> KernelResult<()> {
     Ok(())
 }
 
+/// A DV blob is byte-identical in a Delta DV file and an Iceberg Puffin file; only the framing
+/// differs. Scans a table whose log references a Puffin-framed DV and confirms the deleted rows are
+/// filtered.
+#[tokio::test]
+async fn test_scan_reads_puffin_framed_deletion_vector() -> KernelResult<()> {
+    let schema = schema_ref! {
+        nullable "id": INTEGER,
+        nullable "value": STRING,
+    };
+
+    let temp_dir = tempdir()?;
+    let base_url = url::Url::from_directory_path(temp_dir.path()).unwrap();
+    let (store, engine, table_url) = engine_store_setup("test_table", Some(&base_url));
+    let engine = Arc::new(engine);
+
+    // v0: protocol 3/7 + metadata with the deletionVectors feature.
+    create_table(
+        store.clone(),
+        table_url.clone(),
+        schema.clone(),
+        &[],
+        true,
+        vec!["deletionVectors"],
+        vec!["deletionVectors"],
+    )
+    .await?;
+
+    // A 10-row data file: ids 0..=9.
+    let data = generate_batch(vec![
+        ("id", vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9].into_arrow_array()),
+        (
+            "value",
+            vec!["a", "b", "c", "d", "e", "f", "g", "h", "i", "j"].into_arrow_array(),
+        ),
+    ])?;
+    let (data_file_path, data_len) = write_parquet_file(&store, &table_url, "1", &data).await?;
+
+    // A real Iceberg Puffin file (produced by iceberg-rust's PuffinWriter) holding a
+    // `deletion-vector-v1` blob that deletes row positions 0 and 9.
+    let puffin =
+        std::fs::read("./tests/data/deletion-vector-puffin/deletion-vector-61d16c75.puffin")?;
+    let dv_url = table_url.join("deletion_vectors/dv.puffin")?;
+    let dv_object_path = delta_kernel::object_store::path::Path::from_url_path(dv_url.path())?;
+    store.put(&dv_object_path, puffin.into()).await?;
+
+    // v1: add the data file, pointing its deletionVector at the Puffin file. The blob starts after
+    // the 4-byte magic (offset 4); sizeInBytes/cardinality match the fixture blob.
+    let add = serde_json::json!({
+        "add": {
+            "path": data_file_path,
+            "partitionValues": {},
+            "size": data_len as i64,
+            "modificationTime": 1,
+            "dataChange": true,
+            "stats": "{\"numRecords\":10}",
+            "deletionVector": {
+                "storageType": "p",
+                "pathOrInlineDv": dv_url.to_string(),
+                "offset": 4,
+                "sizeInBytes": 36,
+                "cardinality": 2,
+            },
+        }
+    });
+    add_commit(
+        table_url.as_str(),
+        store.as_ref(),
+        1,
+        serde_json::to_string(&add)?,
+    )
+    .await?;
+
+    // Positions 0 and 9 are deleted, so ids 1..=8 survive.
+    let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
+    let scan = snapshot.scan_builder().build()?;
+    let batches: Vec<_> = scan
+        .execute(engine.clone())?
+        .map(|result| result.map(into_record_batch))
+        .collect::<KernelResult<Vec<_>>>()?;
+    verify_sorted_scan_results(
+        batches,
+        vec![1, 2, 3, 4, 5, 6, 7, 8],
+        &["b", "c", "d", "e", "f", "g", "h", "i"],
+    )?;
+
+    Ok(())
+}
+
 #[rstest::rstest]
 #[case::tight_bounds_true(Some(true))]
 #[case::tight_bounds_false(Some(false))]

@@ -28,18 +28,17 @@ pub(crate) enum ValidationMode {
     Full,
 }
 
-/// Ensure a kernel data type matches an arrow data type. This only ensures that the actual "type"
-/// is the same, but does so recursively into structs, and ensures lists and maps have the correct
-/// associated types as well.
+/// Checks whether an Arrow type is compatible with a Kernel type, recursively through containers.
+///
+/// This checks compatibility without converting data. Callers that normalize data must apply
+/// [`DataTypeCompat::NeedsCast`] conversions and inspect compatible nested types for leaf casts.
 ///
 /// The `mode` parameter controls how struct fields are matched and whether nullability/metadata
 /// are checked. See [`ValidationMode`] for details.
 ///
-/// This returns an `Ok(DataTypeCompat)` if the types are compatible, and
-/// will indicate what kind of compatibility they have, or an error if the types do not match. If
-/// there is a `struct` type included and the mode uses name-based matching, we only ensure that
-/// the named fields that the kernel is asking for exist, and that for those fields the types
-/// match. Un-selected fields are ignored.
+/// Returns the kind of compatibility, or an error if the types are incompatible. In name-based
+/// struct matching, only requested fields must exist and have compatible types; unselected fields
+/// are ignored.
 #[internal_api]
 pub(crate) fn ensure_data_types(
     kernel_type: &DataType,
@@ -58,12 +57,11 @@ struct EnsureDataTypes {
 #[cfg_attr(test, derive(Debug, PartialEq))]
 #[internal_api]
 pub(crate) enum DataTypeCompat {
-    /// The two types are the same
+    /// The types are compatible without a cast.
     Identical,
-    /// What is read from parquet needs to be cast to the associated type
+    /// The source must be cast to the associated Arrow target type.
     NeedsCast(ArrowDataType),
-    /// Types are compatible, but are nested types. This is used when comparing types where casting
-    /// is not desired (i.e. in the expression evaluator)
+    /// Nested types are compatible, but normalization may still require individual leaf casts.
     Nested,
 }
 

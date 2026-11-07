@@ -674,12 +674,12 @@ mod tests {
     #[case::tail_shorter_than_explicit_end(
         Some(2),
         2,
-        Some("Log tail version 1 is less than requested version 2")
+        Some("Latest commit version 1 is less than requested version 2")
     )]
     #[case::tail_does_not_reach_max_catalog_version(
         None,
         2,
-        Some("Log tail version 1 does not match max catalog version 2")
+        Some("Latest commit version 1 does not match max catalog version 2")
     )]
     fn test_catalog_log_tail_end_version_validation(
         #[case] end_version: Option<Version>,

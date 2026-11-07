@@ -41,8 +41,8 @@ impl Snapshot {
     ///
     /// - `T` = effective target version: the time-travel version from
     ///   [`SnapshotBuilder::at_version`] when set, otherwise the `max_catalog_version` from
-    ///   [`SnapshotBuilder::with_max_catalog_version`] for catalog-managed tables, otherwise unset
-    ///   (defaults to latest).
+    ///   [`SnapshotBuilder::with_max_catalog_version`] when supplied, otherwise unset (defaults to
+    ///   latest).
     /// - `S1` = existing snapshot version.
     /// - `S2` = new snapshot version (= end version of the new listing). When `T` is set, the
     ///   listing is upper-bounded by `T`, so `S2 == T`.
@@ -53,6 +53,9 @@ impl Snapshot {
     ///
     /// The log listing is catalog-log-tail aware: any `log_tail` provided to the builder is
     /// merged with filesystem listings.
+    /// [`SnapshotBuilder::build`] validates catalog inputs before this update and requires a
+    /// catalog bound when a latest version request returns a catalog-managed snapshot, including
+    /// cached reuse.
     ///
     /// Position layout per case (`....` is the version axis; `====` marks the range read for
     /// P+M replay; `listed` is the listing range; `read` is what's read for P+M):
@@ -99,6 +102,7 @@ impl Snapshot {
     ///
     /// [`SnapshotBuilder::at_version`]: crate::snapshot::SnapshotBuilder::at_version
     /// [`SnapshotBuilder::with_max_catalog_version`]: crate::snapshot::SnapshotBuilder::with_max_catalog_version
+    /// [`SnapshotBuilder::build`]: crate::snapshot::SnapshotBuilder::build
     #[allow(clippy::too_many_arguments)]
     #[instrument(skip_all, fields(path = %existing_snapshot.table_root(), enable_call_frame, version, operation_id = %metric_context.operation_id, correlation_id = metric_context.correlation_id.as_deref().unwrap_or(""), incremental_replay = ?incremental_replay, built_as_latest = built_as_latest))]
     pub(super) fn try_new_from(
@@ -155,6 +159,8 @@ impl Snapshot {
             tracing::Span::current().record("version", requested_version);
             // Case A: re-requesting the same version.
             if requested_version == existing_snapshot_version {
+                // TODO(#3833): Reconcile cached freshness with the new request before reuse.
+                // TODO(#3845): Preserve publication evidence from the supplied tail before reuse.
                 return Ok(existing_snapshot.clone());
             }
             // Case B: incremental path only moves forward.
@@ -371,10 +377,14 @@ impl Snapshot {
                 // no such commit exists in the log.
                 Some(_) => Err(KernelError::MissingVersion(existing_snapshot_version + 1)),
                 // Case C.2: no new commits and no explicit target; latest is existing.
+                // TODO(#3845): Define publication refresh when cached versions are not listed.
                 None => Ok(NewSegment::Unchanged),
             };
         }
 
+        // TODO(#3851): Combine cached staged history before validating a new listing, including
+        // requests with a shortened or absent catalog tail.
+        // TODO(#3834): Validate the leading replay boundary without a covering checkpoint.
         // create a log segment just from existing_checkpoint.version -> new_version
         // OR could be from 1 -> new_version
         // Save the latest_commit before moving new_listed_files
@@ -388,8 +398,6 @@ impl Snapshot {
 
         let new_end_version = new_log_segment.end_version;
         if new_end_version < existing_snapshot_version {
-            // we should never see a new log segment with a version < the existing snapshot
-            // version, that would mean a commit was incorrectly deleted from the log
             return Err(KernelError::invalid_log_segment(format!(
                 "Unexpected state: the newest version in the log {new_end_version} is \
                  older than the existing snapshot version {existing_snapshot_version}"
@@ -416,6 +424,7 @@ impl Snapshot {
             // We must check checkpoint_version here: if a checkpoint at or below the existing
             // snapshot version was discovered, we still need to fall through to advance the
             // checkpoint base even though the version did not change.
+            // TODO(#3845): Preserve observed publication evidence when the version is unchanged.
             return Ok(NewSegment::Unchanged);
         }
 

@@ -7,13 +7,15 @@ use rstest::rstest;
 use super::*;
 use crate::KernelResult;
 use crate::arrow::array::{
-    Array, ArrayRef, BinaryViewArray, BooleanArray, GenericStringArray, Int32Array, Int32Builder,
-    ListArray, ListViewArray, MapArray, MapBuilder, MapFieldNames, StringArray, StringBuilder,
-    StringViewArray, StructArray, create_array,
+    Array, ArrayRef, AsArray, BinaryViewArray, BooleanArray, GenericStringArray, Int32Array,
+    Int32Builder, ListArray, ListViewArray, MapArray, MapBuilder, MapFieldNames, StringArray,
+    StringBuilder, StringViewArray, StructArray, TimestampNanosecondArray, create_array,
 };
 use crate::arrow::buffer::{BooleanBuffer, NullBuffer, OffsetBuffer, ScalarBuffer};
 use crate::arrow::compute::kernels::cmp::{gt_eq, lt};
-use crate::arrow::datatypes::{DataType, Field, Fields, Schema, TimeUnit};
+use crate::arrow::datatypes::{
+    DataType, Field, Fields, Schema, TimeUnit, TimestampMicrosecondType,
+};
 use crate::engine::arrow_conversion::TryIntoKernel as _;
 use crate::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt as _};
 use crate::engine::arrow_expression::evaluate_expression::to_json;
@@ -1195,6 +1197,79 @@ fn test_evaluator_mixed_string_types_struct_expression() {
         .unwrap()
         .evaluate(&engine_data)
         .unwrap();
+}
+
+#[rstest]
+#[case::struct_output(expr!(make_struct(col("minTs"), col("maxTs"))), true)]
+#[case::scalar_output(col!("minTs"), false)]
+#[case::empty_struct_patch(Expr::StructPatch(ExpressionStructPatch::default()), true)]
+fn test_evaluator_output_schema_honors_timestamp_cast(
+    #[case] expression: Expr,
+    #[case] struct_output: bool,
+    #[values(KernelDataType::TIMESTAMP, KernelDataType::TIMESTAMP_NTZ)]
+    timestamp_type: KernelDataType,
+) {
+    let min_ts: ArrayRef = Arc::new(TimestampNanosecondArray::from(vec![
+        Some(1_700_000_000_123_456_000i64),
+        None,
+        Some(1_999),
+        Some(-1_999),
+    ]));
+    let max_ts: ArrayRef = Arc::new(TimestampNanosecondArray::from(vec![
+        Some(1_700_000_003_987_654_000i64),
+        None,
+        Some(1_999),
+        Some(-1_999),
+    ]));
+    let nanos = min_ts.data_type().clone();
+    let batch = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("minTs", nanos.clone(), true),
+            Field::new("maxTs", nanos, true),
+        ])),
+        vec![min_ts, max_ts],
+    )
+    .unwrap();
+
+    let input_schema = schema_ref! {
+        nullable "minTs": TIMESTAMP_NTZ,
+        nullable "maxTs": TIMESTAMP_NTZ,
+    };
+    let output_type = if struct_output {
+        KernelDataType::from(schema! {
+            nullable "minTs": (timestamp_type.clone()),
+            nullable "maxTs": (timestamp_type.clone()),
+        })
+    } else {
+        timestamp_type.clone()
+    };
+
+    let output = ArrowEvaluationHandler
+        .new_expression_evaluator(input_schema, Arc::new(expression), output_type)
+        .unwrap()
+        .evaluate(&ArrowEngineData::new(batch))
+        .unwrap()
+        .try_into_record_batch()
+        .unwrap();
+
+    let micros = (&timestamp_type).try_into_arrow().unwrap();
+    assert_eq!(output.num_rows(), 4);
+    assert_eq!(output.num_columns(), if struct_output { 2 } else { 1 });
+    for (col, expected) in [1_700_000_000_123_456i64, 1_700_000_003_987_654]
+        .into_iter()
+        .take(output.num_columns())
+        .enumerate()
+    {
+        assert_eq!(output.schema().field(col).data_type(), &micros);
+        assert_eq!(
+            output
+                .column(col)
+                .as_primitive::<TimestampMicrosecondType>()
+                .iter()
+                .collect::<Vec<_>>(),
+            vec![Some(expected), None, Some(1), Some(-1)]
+        );
+    }
 }
 
 #[rstest]
