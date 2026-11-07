@@ -81,6 +81,8 @@ pub(crate) struct ActionReconciliationBatch {
     pub(crate) actions_count: i64,
     /// The number of add actions in the batch.
     pub(crate) add_actions_count: i64,
+    /// The number of retained remove actions in the batch.
+    pub(crate) remove_actions_count: i64,
 }
 
 impl HasSelectionVector for ActionReconciliationBatch {
@@ -89,23 +91,31 @@ impl HasSelectionVector for ActionReconciliationBatch {
     }
 }
 
-/// Stats for ActionReconciliationIterator
+/// Counts of selected actions in batches consumed from an [`ActionReconciliationIterator`].
 #[derive(Debug, Default)]
 pub struct ActionReconciliationIteratorState {
     actions_count: AtomicI64,
     add_actions_count: AtomicI64,
+    remove_actions_count: AtomicI64,
     is_exhausted: AtomicBool,
 }
 
 impl ActionReconciliationIteratorState {
-    /// Get the total number of actions processed
+    /// Returns the number of selected actions in the consumed batches.
     pub fn actions_count(&self) -> i64 {
         self.actions_count.load(Ordering::Acquire)
     }
 
-    /// Get the total number of add actions processed
+    /// Returns the number of selected Add-file actions in the consumed batches.
     pub fn add_actions_count(&self) -> i64 {
         self.add_actions_count.load(Ordering::Acquire)
+    }
+
+    /// Returns the number of retained Remove-file actions in the consumed batches.
+    ///
+    /// Duplicate file actions and expired tombstones do not contribute to this count.
+    pub fn remove_actions_count(&self) -> i64 {
+        self.remove_actions_count.load(Ordering::Acquire)
     }
 
     /// True if the iterator has been exhausted (all batches processed)
@@ -119,6 +129,7 @@ impl ActionReconciliationIteratorState {
         Self {
             actions_count: AtomicI64::new(actions_count),
             add_actions_count: AtomicI64::new(add_actions_count),
+            remove_actions_count: AtomicI64::new(0),
             is_exhausted: AtomicBool::new(true),
         }
     }
@@ -163,6 +174,9 @@ impl ActionReconciliationIterator {
             self.state
                 .add_actions_count
                 .fetch_add(batch.add_actions_count, Ordering::Release);
+            self.state
+                .remove_actions_count
+                .fetch_add(batch.remove_actions_count, Ordering::Release);
             batch.filtered_data
         }))
     }
@@ -192,8 +206,7 @@ impl ActionReconciliationProcessor {
     ///
     /// This method delegates the filtering logic to the [`ActionReconciliationVisitor`], which
     /// implements the deduplication rules described in the module documentation. The method
-    /// tracks statistics about processed actions (total count, add actions count) and maintains
-    /// state for cross-batch deduplication.
+    /// counts selected actions and maintains state for cross-batch deduplication.
     pub(crate) fn process_actions_batch(
         &mut self,
         actions_batch: ActionsBatch,
@@ -229,6 +242,7 @@ impl ActionReconciliationProcessor {
             filtered_data,
             actions_count: visitor.actions_count,
             add_actions_count: visitor.add_actions_count,
+            remove_actions_count: visitor.remove_actions_count,
         })
     }
 
@@ -304,6 +318,7 @@ pub(crate) struct ActionReconciliationVisitor<'seen> {
     actions_count: i64,
     // i64 to match the `_last_checkpoint` file schema
     add_actions_count: i64,
+    remove_actions_count: i64,
     // i64 for comparison with remove.deletionTimestamp
     minimum_file_retention_timestamp: i64,
     // Flag to track if we've seen a protocol action so we can keep only the first protocol action
@@ -394,6 +409,7 @@ impl ActionReconciliationVisitor<'_> {
             selection_vector,
             actions_count: 0,
             add_actions_count: 0,
+            remove_actions_count: 0,
             minimum_file_retention_timestamp,
             seen_protocol,
             seen_metadata,
@@ -459,9 +475,11 @@ impl ActionReconciliationVisitor<'_> {
         } else if is_add {
             self.add_actions_count += 1;
             true
+        } else if self.is_expired_tombstone(i, getters[Self::REMOVE_DELETION_TIMESTAMP.index])? {
+            false
         } else {
-            // Expired remove actions are not valid
-            !self.is_expired_tombstone(i, getters[Self::REMOVE_DELETION_TIMESTAMP.index])?
+            self.remove_actions_count += 1;
+            true
         };
         Ok(Some(is_valid))
     }
@@ -759,6 +777,7 @@ mod tests {
 
         assert_eq!(visitor.actions_count, 5);
         assert_eq!(visitor.add_actions_count, 1);
+        assert_eq!(visitor.remove_actions_count, 1);
         assert!(visitor.seen_protocol);
         assert!(visitor.seen_metadata);
         assert_eq!(visitor.seen_txns.len(), 1);
@@ -810,6 +829,67 @@ mod tests {
         assert_eq!(visitor.selection_vector, expected);
         assert_eq!(visitor.actions_count, 1);
         assert_eq!(visitor.add_actions_count, 0);
+        assert_eq!(visitor.remove_actions_count, 1);
+        Ok(())
+    }
+
+    #[rstest::rstest]
+    #[case::all_retained(98, 3)]
+    #[case::oldest_expired(99, 2)]
+    #[case::two_expired(100, 1)]
+    #[case::all_expired(101, 0)]
+    fn reconciliation_counts_retained_unique_file_actions_across_batches(
+        #[case] minimum_file_retention_timestamp: i64,
+        #[case] expected_remove_count: i64,
+    ) -> KernelResult<()> {
+        let input_batches = vec![
+            create_batch(vec![
+                r#"{"remove":{"path":"removed","deletionTimestamp":100,"dataChange":true}}"#,
+                r#"{"remove":{"path":"removed","deletionTimestamp":100,"dataChange":true}}"#,
+                r#"{"remove":{"path":"second","deletionTimestamp":101,"dataChange":true}}"#,
+                concat!(
+                    r#"{"add":{"path":"active","partitionValues":{},"size":1,"#,
+                    r#""modificationTime":1,"dataChange":true}}"#,
+                ),
+                r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}"#,
+            ])?,
+            create_batch(vec![
+                concat!(
+                    r#"{"add":{"path":"removed","partitionValues":{},"size":1,"#,
+                    r#""modificationTime":1,"dataChange":true}}"#,
+                ),
+                r#"{"remove":{"path":"active","deletionTimestamp":100,"dataChange":true}}"#,
+                r#"{"remove":{"path":"second","deletionTimestamp":101,"dataChange":true}}"#,
+                r#"{"remove":{"path":"third","deletionTimestamp":99,"dataChange":true}}"#,
+            ])?,
+        ];
+        let mut processor =
+            ActionReconciliationProcessor::new(minimum_file_retention_timestamp, None, None);
+        let iterator = ActionReconciliationIterator::new(Box::new(
+            input_batches
+                .into_iter()
+                .map(move |batch| processor.process_actions_batch(batch)),
+        ));
+        let state = iterator.state();
+        assert!(!state.is_exhausted());
+
+        let batches: Vec<_> = iterator.try_collect()?;
+
+        assert!(state.is_exhausted());
+        assert_eq!(state.add_actions_count(), 1);
+        assert_eq!(state.remove_actions_count(), expected_remove_count);
+        assert_eq!(state.actions_count(), expected_remove_count + 2);
+        let selected_rows: usize = batches
+            .iter()
+            .map(|batch| {
+                batch
+                    .selection_vector()
+                    .iter()
+                    .filter(|selected| **selected)
+                    .count()
+            })
+            .sum();
+        assert_eq!(selected_rows as i64, state.actions_count());
         Ok(())
     }
 
@@ -843,6 +923,7 @@ mod tests {
         assert_eq!(visitor.selection_vector, expected);
         assert_eq!(visitor.actions_count, 1);
         assert_eq!(visitor.add_actions_count, 1);
+        assert_eq!(visitor.remove_actions_count, 0);
         // The action should NOT be added to the seen_file_keys set as it's a reconciled batch
         // and actions in reconciled batches do not conflict with each other.
         // This is a key difference from log batches, where actions can conflict.
@@ -885,6 +966,7 @@ mod tests {
         assert_eq!(visitor.selection_vector, expected);
         assert_eq!(visitor.actions_count, 3);
         assert_eq!(visitor.add_actions_count, 1);
+        assert_eq!(visitor.remove_actions_count, 2);
 
         Ok(())
     }

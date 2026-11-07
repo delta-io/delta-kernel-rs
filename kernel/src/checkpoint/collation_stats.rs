@@ -328,6 +328,7 @@ mod tests {
             filtered_data: FilteredEngineData::with_all_rows_selected(data),
             actions_count: 1,
             add_actions_count: 1,
+            remove_actions_count: 0,
         };
         let mut batches = std::iter::once(Ok(batch)).chain(std::iter::once_with(|| {
             panic!("read past the first Add batch")
