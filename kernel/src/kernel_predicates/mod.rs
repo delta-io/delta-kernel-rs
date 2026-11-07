@@ -131,6 +131,7 @@ pub trait KernelPredicateEvaluator {
     /// operator for `<value> op CAST(<col>)`). Unsupported by default so a cast never drives file
     /// pruning. A per-row evaluator that resolves the column to its exact value can override it; a
     /// range-based evaluator can only do so soundly when the cast preserves order over the range.
+    /// Only called for [`CastMode::Safe`] casts, so a value that fails to cast is NULL.
     fn eval_pred_cast(
         &self,
         _op: BinaryPredicateOp,
@@ -336,8 +337,7 @@ pub trait KernelPredicateEvaluator {
                 Distinct => self.eval_pred_distinct(col, val, inverted),
                 In => None, // arg order is semantically important
             },
-            // Cast pruning assumes a failed cast is NULL, which a strict cast would instead report
-            // as an error, so only safe casts take part.
+            // Strict casts can fail instead of yielding NULL, so they don't drive pruning.
             (Cast(c), Literal(val)) if c.mode == CastMode::Safe => match c.expr.as_ref() {
                 Column(col) => self.eval_pred_cast(op, col, &c.target, val, inverted),
                 _ => None,
@@ -719,28 +719,37 @@ impl<R: ResolveColumnAsScalar> DefaultKernelPredicateEvaluator<R> {
     }
 }
 
-/// Casts a scalar following SQL `CAST` semantics: a string source is parsed into a primitive target
-/// via [`PrimitiveType::parse_scalar`](crate::schema::PrimitiveType::parse_scalar), and a source
-/// already of the target type passes through. An unparseable string yields `Scalar::Null` under
-/// [`CastMode::Safe`] and `None` under [`CastMode::Strict`].
+/// Casts a scalar according to `mode`: a string source is parsed into a primitive target via
+/// [`PrimitiveType::parse_scalar`](crate::schema::PrimitiveType::parse_scalar), and a source
+/// already of the target type passes through. A string that does not parse to a value yields
+/// `Scalar::Null` under [`CastMode::Safe`]. Under [`CastMode::Strict`] it yields `None`, since the
+/// cast fails rather than producing a value.
 ///
 /// String-to-primitive, identity, and null-source conversions are handled; any other source/target
 /// combination yields `None`, including numeric/temporal casts like `Long -> Int` that the arrow
 /// path can perform. The accepted string formats are a strict subset of arrow's (e.g. arrow parses
-/// the hyphen-less `20240115` as a date but `parse_scalar` does not), so this path is only ever
-/// more conservative than arrow: a form it rejects becomes NULL, never a differing non-null value.
+/// the hyphen-less `20240115` as a date but `parse_scalar` does not), so a safe cast here is only
+/// ever more conservative than arrow: a form it rejects becomes NULL, never a differing non-null
+/// value.
 fn cast_scalar(value: Scalar, target: &DataType, mode: CastMode) -> Option<Scalar> {
     if value.data_type() == *target {
         return Some(value);
     }
     match (value, target) {
-        // A strict cast that fails has no value to skip with, so it disables skipping.
-        (Scalar::String(raw), DataType::Primitive(ptype)) => match (ptype.parse_scalar(&raw), mode)
-        {
-            (Ok(parsed), _) => Some(parsed),
-            (Err(_), CastMode::Safe) => Some(Scalar::Null(target.clone())),
-            (Err(_), CastMode::Strict) => None,
-        },
+        // `parse_scalar` reads an empty string as NULL, which a strict cast must reject too.
+        (Scalar::String(raw), DataType::Primitive(ptype)) => {
+            match ptype
+                .parse_scalar(&raw)
+                .ok()
+                .filter(|parsed| !parsed.is_null())
+            {
+                Some(parsed) => Some(parsed),
+                None => (mode == CastMode::Safe).then(|| Scalar::Null(target.clone())),
+            }
+        }
+        // Only a string source is known to cast to every primitive type, so a strict cast of any
+        // other NULL may be an unsupported pair, which fails rather than yielding NULL.
+        (Scalar::Null(source), _) if mode == CastMode::Strict && source != DataType::STRING => None,
         (Scalar::Null(_), _) => Some(Scalar::Null(target.clone())),
         _ => None,
     }
