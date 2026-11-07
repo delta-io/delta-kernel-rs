@@ -751,6 +751,14 @@ fn test_eval_expr_evaluates_only_safe_casts(#[case] expr: Expr, #[case] expected
     assert_eq!(filter.eval_expr(&expr), expected);
 }
 
+#[cfg(feature = "adaptive-metadata-in-dev")]
+#[test]
+fn test_manifest_dv_contains_is_never_evaluated_for_skipping() {
+    let filter = DefaultKernelPredicateEvaluator::from(Scalar::Long(1));
+    let pred = Pred::manifest_dv_contains(lit(Scalar::Binary(vec![])), col!("pos"));
+    assert_eq!(filter.eval(&pred), None);
+}
+
 #[derive(Debug, PartialEq)]
 struct OpaqueLessThanOp;
 impl OpaqueLessThanOp {
