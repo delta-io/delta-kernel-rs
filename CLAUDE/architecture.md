@@ -112,12 +112,14 @@ set), `data_skipping.rs` (rewrite predicates against min/max/nullCount stats and
   calls `transform_to_logical` / `DvInfo::get_selection_vector`
 - `scan.parallel_scan_metadata(engine)`: two-phase distributed log replay (requires the
   `internal-api` feature)
-- Declarative scans, single-part checkpoint reconstruction, and minor log compaction share
+- Declarative scans, checkpoint reconstruction, and minor log compaction share
   `action_reconciliation::plan` replay. `ActionSet` selects source schemas, required-leaf filters,
   and replay identities. `MetadataPlanner` normalizes each source before replay; scans prune before
   reconciliation and checkpoints apply retention afterward. Non-file-only V2 source reads skip
   sidecars. `Snapshot::declarative_log_compaction_data_plan` replays a published commit interval
-  without retention. Writes and publication are separate.
+  without retention. V2 checkpoint reconstruction returns independent content and non-content
+  plans; sidecar references and fresh checkpointMetadata belong to write orchestration. Writes
+  and publication are separate.
 
 **Incremental read:** `Snapshot::incremental_scan_builder(base_version)` streams the file-action
 diff over `(base_version, target_version]`: live Adds as a `FilteredEngineData` iterator
