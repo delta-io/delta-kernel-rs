@@ -10,8 +10,10 @@ use crate::content_tree::{
     DeletionVectorInfo, KEY_METADATA, LOCATION,
 };
 use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
-use crate::expressions::{ArrayData, Expression, Scalar, expr, lit};
-use crate::schema::{ArrayType, ColumnName, DataType, SchemaRef, column_name, lazy_schema_ref};
+use crate::expressions::{ArrayData, Expression, Predicate, Scalar, lit, null_lit};
+use crate::schema::{
+    ArrayType, ColumnName, DataType, SchemaRef, ToSchema as _, column_name, lazy_schema_ref,
+};
 use crate::{EngineData, KernelError, KernelResult};
 
 /// Extracts deletion vector content from a DeletionVectorDescriptor.
@@ -86,36 +88,41 @@ pub(crate) static ADD_DV_HELPER_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
 /// entry's `deletionVector` column plus the [`ADD_DV_HELPER_SCHEMA`] columns: the inverse of
 /// [`extract_deletion_vector_content`].
 ///
-/// The descriptor is null for every entry [`AddDeletionVectorColumns`] pushed as null, and is
-/// otherwise built from the entry validated by [`AddDeletionVectorColumns::try_push`]. A relative
-/// location becomes a `PersistedUnencodedRelative` (`'r'`) descriptor; an absolute one becomes
+/// The descriptor is null wherever `kept` is not TRUE, such as [`kept_deletion_vector`]. A kept
+/// entry must have been validated by [`AddDeletionVectorColumns::try_push`], and evaluation fails
+/// if its offset or Delta size does not fit the descriptor's i32 fields. A relative location
+/// becomes a `PersistedUnencodedRelative` (`'r'`) descriptor; an absolute one becomes
 /// `PersistedAbsolute` (`'p'`).
-pub(crate) fn add_deletion_vector_expression() -> Expression {
+pub(crate) fn add_deletion_vector_expression(kept: Predicate) -> Expression {
     let dv_field = |field: &str| Expression::column([DV_INFO, field]);
     // Only the storage type and an absolute location's percent-encoding need per-row work, so only
     // they come from helper columns; every other field passes through.
-    Expression::struct_with_nullability_from(
-        [
-            Expression::column([DV_STORAGE_TYPE_HELPER]),
-            Expression::coalesce([
-                Expression::column([DV_ABSOLUTE_PATH_HELPER]),
-                dv_field(LOCATION),
-            ]),
-            // TODO(#3750): use a cast that fails on overflow. Until then these would null out an
-            // out-of-range value, which `try_push` rejects up front.
-            Expression::cast(dv_field(DV_INFO_OFFSET), DataType::INTEGER),
-            // Undo the +8 framing of `extract_deletion_vector_content`.
-            Expression::cast(
-                dv_field(DV_INFO_SIZE_IN_BYTES) - lit(8i64),
-                DataType::INTEGER,
-            ),
-            dv_field(DV_INFO_CARDINALITY),
-        ],
-        // Keyed off the storage type helper, not `deletionVector`: row visitors read leaves
-        // without the parent's null mask, so the descriptor must be null exactly where its
-        // `storageType` leaf is, including for entries the caller drops.
-        expr!(is_not_null(path(DV_STORAGE_TYPE_HELPER))),
+    let descriptor = Expression::struct_from([
+        Expression::column([DV_STORAGE_TYPE_HELPER]),
+        Expression::coalesce([
+            Expression::column([DV_ABSOLUTE_PATH_HELPER]),
+            dv_field(LOCATION),
+        ]),
+        Expression::cast_strict(dv_field(DV_INFO_OFFSET), DataType::INTEGER),
+        // Undo the +8 framing of `extract_deletion_vector_content`.
+        Expression::cast_strict(
+            dv_field(DV_INFO_SIZE_IN_BYTES) - lit(8i64),
+            DataType::INTEGER,
+        ),
+        dv_field(DV_INFO_CARDINALITY),
+    ]);
+    // A dropped entry is never validated, so only kept entries may reach the strict casts. Row
+    // visitors read leaves without the parent's null mask, and the null struct has null leaves.
+    Expression::case_when(
+        [(kept, descriptor)],
+        null_lit(DeletionVectorDescriptor::to_schema()),
     )
+}
+
+/// The entries whose deletion vector [`AddDeletionVectorColumns`] kept: the `kept` predicate of
+/// [`add_deletion_vector_expression`] for a batch carrying those helper columns.
+pub(crate) fn kept_deletion_vector() -> Predicate {
+    Expression::column([DV_STORAGE_TYPE_HELPER]).is_not_null()
 }
 
 /// Accumulates the [`ADD_DV_HELPER_SCHEMA`] columns for one entry batch, one row per entry: the
@@ -194,14 +201,12 @@ impl AddDeletionVectorColumns {
         let invalid = |message: String| {
             KernelError::DeletionVector(format!("Deletion vector '{location}' {message}"))
         };
-        // The expression casts these into the descriptor's i32 fields, so they must fit.
-        if i32::try_from(offset).is_err() || offset < 0 {
-            return Err(invalid(format!(
-                "offset {offset} is not a non-negative i32"
-            )));
+        // The descriptor's strict casts reject values too large for its i32 fields, but not
+        // negative ones.
+        if offset < 0 {
+            return Err(invalid(format!("offset {offset} is negative")));
         }
-        let delta_size = size_in_bytes.checked_sub(8);
-        if delta_size.is_none_or(|size| size < 0 || i32::try_from(size).is_err()) {
+        if size_in_bytes < 8 {
             return Err(invalid(format!(
                 "sizeInBytes {size_in_bytes} is not a valid Iceberg blob size"
             )));
@@ -878,7 +883,9 @@ mod tests {
         let output = handler
             .new_expression_evaluator(
                 Arc::new(input_schema),
-                Arc::new(Expression::struct_from([add_deletion_vector_expression()])),
+                Arc::new(Expression::struct_from([add_deletion_vector_expression(
+                    kept_deletion_vector(),
+                )])),
                 output_type.into(),
             )?
             .evaluate(entries.as_ref())?;
@@ -1005,16 +1012,16 @@ mod tests {
         "not a valid Iceberg blob size"
     )]
     #[case::size_overflow(
-        DeletionVectorInfo { size_in_bytes: i64::from(i32::MAX) + 9, ..test_dv_info() },
-        "not a valid Iceberg blob size"
+        DeletionVectorInfo { size_in_bytes: i64::from(i32::MAX) + 10, ..test_dv_info() },
+        "Int64 value '2147483649' to integer failed"
     )]
     #[case::negative_offset(
         DeletionVectorInfo { offset: -1, ..test_dv_info() },
-        "offset -1 is not a non-negative i32"
+        "offset -1 is negative"
     )]
     #[case::offset_overflow(
         DeletionVectorInfo { offset: i64::from(i32::MAX) + 1, ..test_dv_info() },
-        "is not a non-negative i32"
+        "Int64 value '2147483648' to integer failed"
     )]
     #[case::negative_cardinality(
         DeletionVectorInfo { cardinality: -1, ..test_dv_info() },
