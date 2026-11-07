@@ -311,6 +311,27 @@ impl StatsOptions {
         self
     }
 
+    /// JSON synthesis must preserve native stats outside the requested structured output.
+    #[cfg(feature = "declarative-plans")]
+    pub(crate) fn json_synthesis_schema(
+        &self,
+        config: &TableConfiguration,
+    ) -> KernelResult<Option<SchemaRef>> {
+        if !self.synthesize_json {
+            return Ok(None);
+        }
+        let columns = config
+            .physical_data_schema_without_partition_columns()
+            .leaves(None);
+        let builder = config
+            .stats_schema_builder()
+            .with_required_physical_columns(Some(columns.as_ref().0))
+            .with_variant_min_max(self.variant_min_max);
+        #[cfg(feature = "geo-type-in-dev")]
+        let builder = builder.with_geometry_min_max(self.geometry_min_max);
+        builder.build().map(Some)
+    }
+
     /// Checks that the options form a supported combination.
     ///
     /// # Errors
@@ -921,7 +942,7 @@ pub struct Scan {
 }
 
 /// Builds the consumer-visible stats schemas without predicate-only fields.
-fn build_stats_output_schemas(
+pub(crate) fn build_stats_output_schemas(
     table_configuration: &TableConfiguration,
     stats: &StatsOptions,
 ) -> KernelResult<Option<StatsOutputSchemas>> {

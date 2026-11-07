@@ -3,73 +3,50 @@
 //! [`Scan::declarative_metadata_scan_plan`](super::Scan::declarative_metadata_scan_plan) reconciles
 //! checkpoint and commit actions into live adds, applying metadata pruning before
 //! newest-action-wins replay.
-use std::borrow::Cow;
-use std::sync::{Arc, LazyLock};
 
-use url::Url;
+use std::borrow::Cow;
+#[cfg(test)]
+use std::sync::Arc;
 
 use super::data_skipping::as_sql_data_skipping_predicate_with_stats_columns;
 use super::state_info::StateInfo;
 use super::{PhysicalPredicate, Scan};
-use crate::actions::{
-    ADD_FIELD, ADD_NAME, ADD_SCHEMA, Add, LOG_ADD_SCHEMA, REMOVE_FIELD, REMOVE_NAME, SIDECAR_FIELD,
-    SIDECAR_NAME, STATS_PARSED, get_all_actions_schema,
-};
-use crate::checkpoint::collation_stats::source_collation_stats;
-use crate::checkpoint::{CheckpointShape, CheckpointType};
-use crate::expressions::{
-    ColumnName, Expression as Expr, Predicate, UnaryExpressionOp, col, column_name, expr,
-    joined_column_expr, lit,
-};
-use crate::log_segment::LogSegment;
-use crate::plans::ir::nodes::{DynamicScan, FileType, ScanFile};
-use crate::plans::ir::plan::Plan;
-use crate::schema::{
-    CheckpointFieldKind, DataType, SchemaRef, SchemaStructPatchBuilder, StructField, StructType,
-    lazy_schema_ref, schema, schema_ref,
-};
-use crate::struct_patch::ProjectionStructPatchBuilder;
-use crate::transforms::{ExpressionTransform, transform_output_type};
-use crate::utils::FoldWithOption as _;
-use crate::{KernelError, KernelResult, PlanBuilder, Version};
-
-#[path = "../action_reconciliation/plan/metadata_planner.rs"]
-mod metadata_planner;
-mod metadata_replay_base;
-#[path = "../action_reconciliation/plan/sources.rs"]
-mod sources;
-
-use metadata_planner::FILE_ACTION_KEY;
-pub(super) use metadata_planner::MetadataPlanner;
+use crate::action_reconciliation::plan::ACTION_KEY;
+pub(super) use crate::action_reconciliation::plan::MetadataPlanner;
 #[cfg(test)]
-use metadata_planner::StatsKind;
+use crate::action_reconciliation::plan::StatsKind;
+#[cfg(test)]
+use crate::actions::ADD_SCHEMA;
+use crate::actions::{ADD_NAME, ActionSet, STATS_PARSED};
+#[cfg(test)]
+use crate::checkpoint::CheckpointShape;
+#[cfg(test)]
+use crate::expressions::Expression as Expr;
+use crate::expressions::{ColumnName, Predicate, column_name, expr, lit};
+use crate::plans::ir::plan::Plan;
+#[cfg(test)]
+use crate::schema::{
+    DataType, SchemaRef, SchemaStructPatchBuilder, StructField, schema, schema_ref,
+};
+use crate::transforms::{ExpressionTransform, transform_output_type};
+#[cfg(test)]
+use crate::utils::FoldWithOption as _;
+use crate::{KernelResult, PlanBuilder};
+
+mod metadata_replay_base;
+
 pub(super) use metadata_replay_base::MetadataReplayBase;
 // === Internal column names ===
 
+#[cfg(test)]
 const STATS: &str = "stats";
-const PARTITION_VALUES: &str = "partitionValues";
 const PARTITION_VALUES_PARSED: &str = "partitionValues_parsed";
+#[cfg(test)]
 const IS_ADD: &str = "is_add";
 const VERSION: &str = "version";
 
 impl<'a> MetadataPlanner<'a> {
     pub(super) fn try_new(scan: &'a Scan) -> KernelResult<Self> {
-        let stats_schema = if scan.stats.synthesize_json {
-            let config = scan.snapshot.table_configuration();
-            let columns = config
-                .physical_data_schema_without_partition_columns()
-                .leaves(None);
-            // JSON synthesis must retain stats outside the scan's requested and indexed columns.
-            let builder = config
-                .stats_schema_builder()
-                .with_required_physical_columns(Some(columns.as_ref().0))
-                .with_variant_min_max(scan.stats.variant_min_max);
-            #[cfg(feature = "geo-type-in-dev")]
-            let builder = builder.with_geometry_min_max(scan.stats.geometry_min_max);
-            Some(builder.build()?)
-        } else {
-            scan.state_info.physical_stats_read_schema().cloned()
-        };
         let enable_metadata_filter =
             !scan.stats.synthesize_json || scan.state_info.physical_stats_output_schema().is_some();
         let stats_filter = enable_metadata_filter
@@ -82,13 +59,21 @@ impl<'a> MetadataPlanner<'a> {
             .flatten();
 
         Ok(Self {
-            scan,
-            stats_schema,
-            parsed_partition_schema,
+            stats: scan.stats.clone(),
+            partitions: scan.partition_values_options.clone(),
+            stats_schema: scan
+                .stats
+                .json_synthesis_schema(scan.snapshot.table_configuration())?
+                .or_else(|| scan.state_info.physical_stats_read_schema().cloned()),
+            output_stats_schema: scan.state_info.physical_stats_output_schema().cloned(),
+            parsed_partition_schema: parsed_partition_schema.cloned(),
+            read_collations: scan.needs_collation_stats_schema(),
             stats_filter,
+            ..Self::new(scan.snapshot.log_segment(), ActionSet::files())
         })
     }
 }
+
 impl Scan {
     /// Build the live-add metadata plan from checkpoint and commit actions.
     ///
@@ -109,35 +94,41 @@ impl Scan {
             return Ok(None);
         }
 
-        let commit_actions = self.commit_arm(base.version(), planner)?;
+        let commit_actions = planner.commit_actions(base.version())?;
+        let base_planner = MetadataPlanner {
+            actions: ActionSet::adds(),
+            ..planner.clone()
+        };
 
-        let deduped_commit = commit_actions.aggregate_by([column_name!(FILE_ACTION_KEY)], |a| {
-            // Each group with a non-null FILE_ACTION_KEY contains the adds and removes for a given
+        let deduped_commit = commit_actions.aggregate_by([column_name!(ACTION_KEY)], |a| {
+            // Each group with a non-null ACTION_KEY contains the adds and removes for a given
             // file; winning adds pass through unchanged while winning removes produce NULL. Non-
-            // file actions have NULL FILE_ACTION_KEY and map to their own NULL group.
+            // file actions have a NULL file-identity lane and group by their own identity lanes.
             a.max_non_null_by(
                 column_name!(ADD_NAME),
-                column_name!(FILE_ACTION_KEY),
+                column_name!(ACTION_KEY),
                 column_name!(VERSION),
             )
         })?;
 
         let base_adds = match base {
-            MetadataReplayBase::Crc { files, .. } => self.crc_arm(files, planner),
-            MetadataReplayBase::Checkpoint { shape, .. } => self.checkpoint_arm(&shape, planner),
+            MetadataReplayBase::Crc { version, files } => base_planner.crc_adds(version, files),
+            MetadataReplayBase::Checkpoint { shape, .. } => base_planner
+                .with_checkpoint_shape(shape)
+                .checkpoint_actions(),
         }?;
 
         let base_live_adds = base_adds
             .anti_join(
                 deduped_commit.clone(),
-                [column_name!(FILE_ACTION_KEY)],
-                [column_name!(FILE_ACTION_KEY)],
+                [column_name!(ACTION_KEY)],
+                [column_name!(ACTION_KEY)],
             )?
-            .project_patch(|patch| patch.drop(FILE_ACTION_KEY))?;
+            .project_patch(|patch| patch.drop(ACTION_KEY).drop(VERSION))?;
 
         let commit_live_adds = deduped_commit
             .filter(Predicate::from_expr(expr!(is_not_null(col("add")))))?
-            .project_patch(|patch| patch.drop(FILE_ACTION_KEY))?;
+            .project_patch(|patch| patch.drop(ACTION_KEY))?;
 
         PlanBuilder::union_all([commit_live_adds, base_live_adds])?.build_opt()
     }
@@ -155,7 +146,6 @@ impl Scan {
         self.build_metadata_scan_plan_with(base, planner)
     }
 }
-
 // === Helpers ===
 
 /// Physical checkpoint schema used by plan-shape tests.
@@ -231,10 +221,13 @@ mod execution_tests;
 mod tests {
     use ::test_utils::record_batch_to_bytes;
     use serde_json::json;
+    use url::Url;
 
     use super::execution_tests::{declarative_metadata, metadata_row_count};
     use super::*;
     use crate::arrow::array::{AsArray as _, StringArray, StructArray};
+    use crate::checkpoint::CheckpointType;
+    use crate::checkpoint::collation_stats::source_collation_stats;
     use crate::crc::Crc;
     use crate::engine::arrow_data::EngineDataArrowExt as _;
     use crate::engine::arrow_utils::parse_json_impl;
@@ -245,7 +238,7 @@ mod tests {
     use crate::object_store::memory::InMemory;
     use crate::object_store::path::Path;
     use crate::plans::Operation as PlanOperation;
-    use crate::plans::ir::nodes::Operator;
+    use crate::plans::ir::nodes::{FileType, Operator};
     use crate::scan::data_skipping::stats_schema::expected_stats_schema;
     use crate::scan::{PartitionValuesOptions, StatsOptions};
     use crate::schema::StructType;
@@ -891,9 +884,9 @@ mod tests {
             .with_stats(StatsOptions::all_struct())
             .build()?;
         let planner = MetadataPlanner::try_new(&scan)?;
-        let file_schema = parquet_read_schema(planner.stats_schema.as_ref(), None)?;
+        let file_shape = shape(CheckpointType::Leaf, planner.stats_schema.clone());
         let plan = planner
-            .build_metadata_scan(&file_schema, false, |schema| {
+            .build_metadata_plan(Some(&file_shape), |schema| {
                 PlanBuilder::values(schema, vec![])
             })?
             .build()?;
@@ -942,8 +935,12 @@ mod tests {
                 col("x") > lit(lower_bound)
             ))))
             .build()?;
+        let file_shape = CheckpointShape {
+            checkpoint_type: CheckpointType::Leaf,
+            leaf_checkpoint_schema: Some(file_schema),
+        };
         let (read_schema, kind, _) =
-            MetadataPlanner::try_new(&scan)?.read_schema(&file_schema, false)?;
+            MetadataPlanner::try_new(&scan)?.read_schema(Some(&file_shape))?;
         assert!(kind == StatsKind::Json);
         assert_eq!(add_struct(&read_schema), &*ADD_SCHEMA);
         let batches = declarative_metadata(&scan, &SyncEngine::new_with_store(store))?;
