@@ -172,6 +172,12 @@ unsafe fn snapshot_builder_with_snapshot_hint_impl(
 /// the same URL form as the table root. Build performs the remaining structural and
 /// table-configuration validation. `Latest` makes `is_built_as_latest()` true, and kernel trusts
 /// that caller claim. `Unverified` makes it false.
+/// The caller must ensure the protocol and metadata came from the supplied files and all staged
+/// commits were catalog-ratified. Staged paths in a hint do not by themselves require
+/// [`snapshot_builder_with_max_catalog_version`]. Without an explicit target, a catalog-managed
+/// snapshot still requires that bound. An explicit target must not exceed a supplied bound.
+///
+/// [`snapshot_builder_with_max_catalog_version`]: crate::snapshot_builder_with_max_catalog_version
 ///
 /// # Errors
 ///

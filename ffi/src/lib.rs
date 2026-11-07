@@ -3432,27 +3432,11 @@ mod tests {
     }
 
     #[rstest]
-    #[case::catalog_managed_without_max_catalog_version(
-        true,
-        None,
-        concat!(
-            "Max catalog version error: Max catalog version is required when loading a ",
-            "catalog-managed table. Use with_max_catalog_version()."
-        )
-    )]
-    #[case::non_catalog_managed_with_max_catalog_version(
-        false,
-        Some(0),
-        concat!(
-            "Max catalog version error: Max catalog version 0 must not be set for a ",
-            "non-catalog-managed table"
-        )
-    )]
     #[tokio::test]
-    async fn test_snapshot_catalog_managed_mode_mismatch_returns_typed_error(
-        #[case] catalog_managed: bool,
-        #[case] max_catalog_version: Option<Version>,
-        #[case] expected_message: &str,
+    async fn test_snapshot_catalog_bound_validation_for_latest_and_explicit_versions(
+        #[values(false, true)] catalog_managed: bool,
+        #[values(None, Some(0), Some(1))] requested_version: Option<Version>,
+        #[values(None, Some(0))] max_catalog_version: Option<Version>,
     ) -> KernelResult<()> {
         let storage = Arc::new(InMemory::new());
         let table_root = "memory:///test_table/";
@@ -3462,6 +3446,7 @@ mod tests {
             actions_to_string(vec![TestAction::Metadata])
         };
         add_commit(table_root, storage.as_ref(), 0, actions).await?;
+        add_commit(table_root, storage.as_ref(), 1, "{}".into()).await?;
         let engine = engine_to_handle(
             Arc::new(DefaultEngineBuilder::new(storage).build()),
             TEST_ERROR_ALLOCATORS,
@@ -3472,6 +3457,11 @@ mod tests {
                 kernel_string_slice!(table_root),
                 engine.shallow_copy(),
             ));
+            let builder = if let Some(version) = requested_version {
+                snapshot_builder_with_version(builder, version)
+            } else {
+                builder
+            };
             let builder = if let Some(max_catalog_version) = max_catalog_version {
                 snapshot_builder_with_max_catalog_version(builder, max_catalog_version)
             } else {
@@ -3479,11 +3469,30 @@ mod tests {
             };
             snapshot_builder_build(builder)
         };
-        assert_extern_result_error_with_message(
-            result,
-            FFIKernelError::MaxCatalogVersionError,
-            Some(expected_message),
-        );
+        let expected_error = if requested_version == Some(1) && max_catalog_version == Some(0) {
+            Some("Max catalog version error: Requested version 1 exceeds max catalog version 0")
+        } else if catalog_managed && requested_version.is_none() && max_catalog_version.is_none() {
+            Some(concat!(
+                "Max catalog version error: Max catalog version is required when loading the ",
+                "latest catalog-managed snapshot. Use with_max_catalog_version()."
+            ))
+        } else {
+            None
+        };
+        if let Some(message) = expected_error {
+            assert_extern_result_error_with_message(
+                result,
+                FFIKernelError::MaxCatalogVersionError,
+                Some(message),
+            );
+        } else {
+            let snapshot = ok_or_panic(result);
+            assert_eq!(
+                unsafe { version(snapshot.shallow_copy()) },
+                requested_version.or(max_catalog_version).unwrap_or(1)
+            );
+            unsafe { free_snapshot(snapshot) };
+        }
 
         unsafe { free_engine(engine) }
         Ok(())
