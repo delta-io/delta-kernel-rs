@@ -2,6 +2,8 @@
 //!
 //! **NOTE:** Log compaction is currently disabled on both reads and writes due to
 //! insufficient integration test coverage. See issue #2337 for re-enablement tracking.
+//! With `declarative-plans`, `Snapshot::declarative_log_compaction_data_plan` builds compaction
+//! rows without enabling automatic compaction or publishing files.
 //!
 //! This module provides an API for writing log compaction files that aggregate
 //! multiple commit JSON files into single compacted files. This improves performance
@@ -88,6 +90,8 @@ use crate::actions::{
 };
 use crate::schema::{SchemaRef, lazy_schema_ref};
 
+#[cfg(feature = "declarative-plans")]
+mod plan;
 mod writer;
 
 pub use writer::{LogCompactionWriter, should_compact};
