@@ -141,7 +141,7 @@ where
 /// Deserialize a string representing a boolean into an `Option<bool>`. Returns `Some` if
 /// successfully parses, and `None` otherwise.
 pub(crate) fn parse_bool(s: &str) -> Option<bool> {
-    match s {
+    match s.to_lowercase().as_str() {
         "true" => Some(true),
         "false" => Some(false),
         _ => None,
@@ -246,7 +246,11 @@ mod tests {
     #[test]
     fn test_parse_bool() {
         assert!(parse_bool("true").unwrap());
+        assert!(parse_bool("True").unwrap());
+        assert!(parse_bool("TRUE").unwrap());
         assert!(!parse_bool("false").unwrap());
+        assert!(!parse_bool("False").unwrap());
+        assert!(!parse_bool("FALSE").unwrap());
         assert_eq!(parse_bool("whatever"), None);
     }
 
