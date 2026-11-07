@@ -11,19 +11,18 @@ use std::sync::Arc;
 use super::data_skipping::as_sql_data_skipping_predicate_with_stats_columns;
 use super::state_info::StateInfo;
 use super::{PhysicalPredicate, Scan};
-#[cfg(test)]
-use crate::KernelError;
+use crate::KernelResult;
 pub(super) use crate::action_reconciliation::plan::MetadataPlanner;
 #[cfg(test)]
 use crate::action_reconciliation::plan::StatsKind;
 #[cfg(test)]
 use crate::actions::ADD_SCHEMA;
-use crate::actions::{ACTION_KEY, ADD_NAME, ActionSet, STATS_PARSED};
+use crate::actions::{ADD_NAME, ActionSet, STATS_PARSED};
 #[cfg(test)]
 use crate::checkpoint::CheckpointShape;
+use crate::expressions::{ColumnName, Predicate, lit};
 #[cfg(test)]
-use crate::expressions::Expression as Expr;
-use crate::expressions::{ColumnName, Predicate, column_name, expr, lit};
+use crate::expressions::{Expression as Expr, expr};
 use crate::plans::ir::plan::Plan;
 #[cfg(test)]
 use crate::schema::{
@@ -32,7 +31,8 @@ use crate::schema::{
 use crate::transforms::{ExpressionTransform, transform_output_type};
 #[cfg(test)]
 use crate::utils::FoldWithOption as _;
-use crate::{KernelResult, PlanBuilder};
+#[cfg(test)]
+use crate::{KernelError, PlanBuilder};
 
 mod metadata_replay_base;
 
@@ -44,6 +44,7 @@ const STATS: &str = "stats";
 const PARTITION_VALUES_PARSED: &str = "partitionValues_parsed";
 #[cfg(test)]
 const IS_ADD: &str = "is_add";
+#[cfg(test)]
 const VERSION: &str = "version";
 
 impl<'a> MetadataPlanner<'a> {
@@ -59,19 +60,20 @@ impl<'a> MetadataPlanner<'a> {
             .then(|| scan.state_info.physical_partition_schema.as_ref())
             .flatten();
 
-        Ok(Self {
-            stats: scan.stats.clone(),
-            partitions: scan.partition_values_options.clone(),
-            stats_schema: scan
-                .stats
-                .json_synthesis_schema(scan.snapshot.table_configuration())?
-                .or_else(|| scan.state_info.physical_stats_read_schema().cloned()),
-            output_stats_schema: scan.state_info.physical_stats_output_schema().cloned(),
-            parsed_partition_schema: parsed_partition_schema.cloned(),
-            read_collations: scan.needs_collation_stats_schema(),
-            stats_filter,
-            ..Self::new(scan.snapshot.log_segment(), ActionSet::files())
-        })
+        Ok(Self::new(scan.snapshot.log_segment(), ActionSet::files())
+            .with_stats(scan.stats.clone())
+            .with_stats_schemas(
+                scan.stats
+                    .json_synthesis_schema(scan.snapshot.table_configuration())?
+                    .or_else(|| scan.state_info.physical_stats_read_schema().cloned()),
+                scan.state_info.physical_stats_output_schema().cloned(),
+            )
+            .with_partition_values(
+                scan.partition_values_options.clone(),
+                parsed_partition_schema.cloned(),
+            )
+            .with_read_collations(scan.needs_collation_stats_schema())
+            .with_stats_filter(stats_filter))
     }
 }
 
@@ -88,50 +90,22 @@ impl Scan {
     pub(super) fn build_metadata_scan_plan_with(
         &self,
         base: MetadataReplayBase,
-        planner: &MetadataPlanner<'_>,
+        mut planner: MetadataPlanner<'_>,
     ) -> KernelResult<Option<Plan>> {
         let state = &self.state_info;
         if state.physical_predicate == PhysicalPredicate::StaticSkipAll {
             return Ok(None);
         }
 
-        let commit_actions = planner.commit_actions(base.version())?;
-        let base_planner = MetadataPlanner {
-            actions: ActionSet::adds(),
-            ..planner.clone()
-        };
-
-        let deduped_commit = commit_actions.aggregate_by([column_name!(ACTION_KEY)], |a| {
-            // Each group with a non-null ACTION_KEY contains the adds and removes for a given
-            // file; winning adds pass through unchanged while winning removes produce NULL. Non-
-            // file actions have a NULL file-identity lane and group by their own identity lanes.
-            a.max_non_null_by(
-                column_name!(ADD_NAME),
-                column_name!(ACTION_KEY),
-                column_name!(VERSION),
-            )
-        })?;
-
-        let base_adds = match base {
-            MetadataReplayBase::Crc { version, files } => base_planner.crc_adds(version, files),
-            MetadataReplayBase::Checkpoint { shape, .. } => base_planner
-                .with_checkpoint_shape(shape)
-                .checkpoint_actions(),
+        let base_version = base.version();
+        let checkpoint = match base {
+            MetadataReplayBase::Crc { version, files } => planner.crc_adds(version, files),
+            MetadataReplayBase::Checkpoint { shape, .. } => {
+                planner = planner.with_checkpoint_shape(shape);
+                planner.checkpoint_actions()
+            }
         }?;
-
-        let base_live_adds = base_adds
-            .anti_join(
-                deduped_commit.clone(),
-                [column_name!(ACTION_KEY)],
-                [column_name!(ACTION_KEY)],
-            )?
-            .project_patch(|patch| patch.drop(ACTION_KEY).drop(VERSION))?;
-
-        let commit_live_adds = deduped_commit
-            .filter(Predicate::from_expr(expr!(is_not_null(col("add")))))?
-            .project_patch(|patch| patch.drop(ACTION_KEY))?;
-
-        PlanBuilder::union_all([commit_live_adds, base_live_adds])?.build_opt()
+        planner.replay_scan(base_version, checkpoint)
     }
 
     #[cfg(test)]
@@ -144,7 +118,7 @@ impl Scan {
             version: self.snapshot.log_segment().checkpoint_version,
             shape: shape.clone(),
         };
-        self.build_metadata_scan_plan_with(base, planner)
+        self.build_metadata_scan_plan_with(base, planner.clone())
     }
 }
 // === Helpers ===
@@ -447,8 +421,7 @@ mod tests {
         "filter",    // keep file actions
         "project",   // add replay columns
         "aggregate", // newest-action-per-key
-        "filter",    // live commit adds
-        "project",   // extract add
+        "project",   // drop action key
     ];
 
     #[rstest::rstest]
@@ -484,7 +457,7 @@ mod tests {
 
         let mut expected: Vec<&str> = COMMIT_ARM_TAGS.to_vec();
         expected.extend(checkpoint_arm_tags);
-        expected.push("union_all"); // terminal
+        expected.extend(["union_all", "filter", "project"]); // keep live adds
         assert_eq!(tags(&plan), expected);
         Ok(())
     }
@@ -617,25 +590,27 @@ mod tests {
         let plan = scan
             .build_metadata_scan_plan(&no_checkpoint(), &MetadataPlanner::try_new(&scan)?)?
             .expect("non-empty");
-        assert_eq!(tags(&plan), COMMIT_ARM_TAGS.to_vec());
+        let mut expected = COMMIT_ARM_TAGS.to_vec();
+        expected.extend(["filter", "project"]); // keep live adds
+        assert_eq!(tags(&plan), expected);
         Ok(())
     }
 
     #[rstest::rstest]
     #[case::leaf_parquet(shape(CheckpointType::Leaf, None), FileType::Parquet,
-        vec!["scan_parquet", "filter", "project", "project"])]
+        vec!["scan_parquet", "filter", "project", "project", "filter", "project"])]
     #[case::leaf_json(shape(CheckpointType::Leaf, None), FileType::Json,
-        vec!["scan_json", "filter", "project", "project"])]
+        vec!["scan_json", "filter", "project", "project", "filter", "project"])]
     #[case::manifest(shape(CheckpointType::Manifest, None), FileType::Parquet,
         vec!["scan_parquet", "filter", "project", "dynamic_scan", "filter", "project",
-            "project"])]
+            "project", "filter", "project"])]
     #[case::checkpoint_without_add(
         CheckpointShape {
             checkpoint_type: CheckpointType::Leaf,
             leaf_checkpoint_schema: Some(schema_ref! {}),
         },
         FileType::Parquet,
-        vec!["scan_parquet", "filter", "project", "project"]
+        vec!["scan_parquet", "filter", "project", "project", "filter", "project"]
     )]
     fn metadata_plan_checkpoint_only(
         #[case] shape: CheckpointShape,

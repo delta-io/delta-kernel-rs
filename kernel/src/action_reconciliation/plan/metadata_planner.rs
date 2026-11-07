@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use super::sources;
 use crate::actions::{
-    ACTION_KEY, ADD_FIELD, ADD_NAME, ADD_SCHEMA, ActionSet, Add, STATS_PARSED,
+    ACTION_KEY, ADD_FIELD, ADD_NAME, ADD_SCHEMA, ActionSet, Add, REMOVE_NAME, STATS_PARSED,
     get_all_actions_schema,
 };
 use crate::checkpoint::CheckpointShape;
@@ -11,6 +11,7 @@ use crate::expressions::{
     ColumnName, Expression as Expr, Predicate, UnaryExpressionOp, col, column_name, expr,
 };
 use crate::log_segment::LogSegment;
+use crate::plans::Plan;
 use crate::scan::{PartitionValuesOptions, StatsOptions, map_to_struct_options};
 use crate::schema::{
     CheckpointFieldKind, DataType, SchemaRef, SchemaStructPatchBuilder, StructField, StructType,
@@ -124,6 +125,21 @@ impl<'a> MetadataPlanner<'a> {
         let commits = self.commit_actions(self.segment.checkpoint_version)?;
         let checkpoint = self.checkpoint_actions()?;
         self.replay_actions(commits, checkpoint)
+    }
+
+    /// Replays file actions into live scan adds, omitting replay-only columns.
+    /// The caller supplies its selected checkpoint or CRC base; commit reads retain removes so
+    /// that deleted files cancel older adds before the live-add filter.
+    pub(crate) fn replay_scan(
+        &self,
+        base_version: Option<Version>,
+        checkpoint: PlanBuilder,
+    ) -> KernelResult<Option<Plan>> {
+        let commits = self.commit_actions(base_version)?;
+        self.replay_actions(commits, checkpoint)?
+            .filter(col!(ADD_NAME, "path").is_not_null())?
+            .project_patch(|patch| patch.drop(REMOVE_NAME).drop(VERSION))?
+            .build_opt()
     }
 
     /// Build normalized CRC adds with the supplied version and action key.
