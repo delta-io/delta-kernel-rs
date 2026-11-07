@@ -626,7 +626,16 @@ pub(crate) fn filter_by_predicate(
     filter: &dyn crate::PredicateEvaluator,
     batch: Box<dyn EngineData>,
 ) -> KernelResult<Box<dyn EngineData>> {
-    let predicate_result = filter.evaluate(batch.as_ref())?;
+    let selection_vector = evaluate_selection_vector(filter, batch.as_ref())?;
+    batch.apply_selection_vector(selection_vector)
+}
+
+/// Evaluates a predicate that never yields NULL on the batch, returning one flag per row.
+pub(crate) fn evaluate_selection_vector(
+    filter: &dyn crate::PredicateEvaluator,
+    batch: &dyn EngineData,
+) -> KernelResult<Vec<bool>> {
+    let predicate_result = filter.evaluate(batch)?;
     let mut visitor = SelectionVectorVisitor::default();
     visitor.visit_rows_of(predicate_result.as_ref())?;
     require!(
@@ -637,7 +646,7 @@ pub(crate) fn filter_by_predicate(
             batch.len()
         ))
     );
-    batch.apply_selection_vector(visitor.selection_vector)
+    Ok(visitor.selection_vector)
 }
 
 #[cfg(test)]
