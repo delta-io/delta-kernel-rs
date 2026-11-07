@@ -371,19 +371,20 @@ impl LogSegment {
             // A log file's versions are parsed from its `_file`; a checkpoint batch uses the
             // constant. A log compaction holds the P&M in effect at its last version, so it ranks
             // there.
-            let (first_version, rank_version) = if batch.is_log_batch {
-                let path = batch_log_path(batch.actions.as_ref())?;
-                (path.version as i64, path.last_version() as i64)
-            } else {
-                let version = checkpoint_version.ok_or_else(|| {
+            let log_path = batch
+                .is_log_batch
+                .then(|| batch_log_path(batch.actions.as_ref()))
+                .transpose()?;
+            let rank_version = match &log_path {
+                Some(path) => path.last_version() as i64,
+                None => checkpoint_version.ok_or_else(|| {
                     KernelError::internal_error("checkpoint batch without a version")
-                })?;
-                (version, version)
+                })?,
             };
             // Only commit batches can hold a checkpoint action or `commitInfo`; the checkpoint
             // read schema excludes both.
             #[cfg(feature = "adaptive-metadata-in-dev")]
-            let commit_version = batch.is_log_batch.then_some(first_version);
+            let commit_version = log_path.map(|path| path.version as i64);
             Ok(VersionedBatch {
                 protocol_version: Some(rank_version),
                 metadata_version: Some(rank_version),
