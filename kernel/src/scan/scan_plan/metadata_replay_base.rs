@@ -1,7 +1,39 @@
+use std::sync::Arc;
+
 use super::MetadataPlanner;
 use crate::actions::Add;
-use crate::checkpoint::CheckpointShape;
-use crate::{Engine, KernelResult, Snapshot, Version};
+use crate::checkpoint::{CheckpointProbe, CheckpointShape, CheckpointType};
+use crate::schema::SchemaRef;
+use crate::{Engine, FileMeta, KernelResult, Snapshot, Version};
+
+/// A completed snapshot cache or a temporary probe that cannot supply a full sidecar list.
+pub(in crate::scan) enum ScanCheckpoint {
+    Resolved(Arc<CheckpointShape>),
+    Probed(CheckpointProbe),
+}
+
+impl ScanCheckpoint {
+    pub(super) fn checkpoint_type(&self) -> CheckpointType {
+        match self {
+            Self::Resolved(shape) => shape.checkpoint_type(),
+            Self::Probed(probe) => probe.checkpoint_type.clone(),
+        }
+    }
+
+    pub(super) fn leaf_checkpoint_schema(&self) -> Option<&SchemaRef> {
+        match self {
+            Self::Resolved(shape) => shape.leaf_checkpoint_schema(),
+            Self::Probed(probe) => probe.leaf_checkpoint_schema.as_ref(),
+        }
+    }
+
+    pub(super) fn complete_sidecars(&self) -> Option<&[FileMeta]> {
+        match self {
+            Self::Resolved(shape) => Some(&shape.sidecars),
+            Self::Probed(_) => None,
+        }
+    }
+}
 
 /// Reconciled table state from which metadata replay starts.
 pub(in crate::scan) enum MetadataReplayBase {
@@ -10,7 +42,7 @@ pub(in crate::scan) enum MetadataReplayBase {
     /// Checkpoint replay base, or an empty base when no checkpoint exists.
     Checkpoint {
         version: Option<Version>,
-        shape: CheckpointShape,
+        shape: ScanCheckpoint,
     },
 }
 
@@ -36,13 +68,16 @@ impl MetadataReplayBase {
             });
         }
 
-        // Resolve the checkpoint shape once. The planner owns the decision to retain the file-
-        // action schema; checkpoint discovery owns how that schema is obtained.
-        let plan_executor = engine.require_plan_executor()?;
-        let shape = if planner.requires_checkpoint_add_schema() {
-            CheckpointShape::try_new_with_leaf_schema(plan_executor.as_ref(), snapshot)?
-        } else {
-            CheckpointShape::try_new(plan_executor.as_ref(), snapshot)?
+        let shape = match snapshot.cached_checkpoint_shape() {
+            Some(shape) => ScanCheckpoint::Resolved(shape),
+            None => {
+                let executor = engine.require_plan_executor()?;
+                ScanCheckpoint::Probed(CheckpointProbe::try_new(
+                    executor.as_ref(),
+                    snapshot.log_segment(),
+                    planner.requires_checkpoint_add_schema(),
+                )?)
+            }
         };
         Ok(Self::Checkpoint {
             version: checkpoint_version,

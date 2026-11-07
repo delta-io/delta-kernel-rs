@@ -5,8 +5,13 @@ use std::ptr::NonNull;
 #[cfg(test)]
 use std::sync::Arc;
 
+#[cfg(all(test, feature = "declarative-plans"))]
+use delta_kernel::plans::{Operation, PlanExecutor, PlanResult};
 #[cfg(test)]
-use delta_kernel::{Engine, KernelResult, object_store::memory::InMemory};
+use delta_kernel::{
+    Engine, EvaluationHandler, JsonHandler, KernelResult, ParquetHandler, StorageHandler,
+    object_store::memory::InMemory,
+};
 #[cfg(test)]
 use delta_kernel_default_engine::DefaultEngineBuilder;
 #[cfg(test)]
@@ -24,6 +29,41 @@ use crate::{
     },
 };
 use crate::{KernelBytesSlice, KernelStringSlice, NullableCvoid, TryFromStringSlice};
+
+/// Test engine that rejects handler access and declarative execution to assert a path needs no I/O.
+#[cfg(test)]
+pub(crate) struct NoIoEngine;
+
+#[cfg(test)]
+impl Engine for NoIoEngine {
+    fn evaluation_handler(&self) -> Arc<dyn EvaluationHandler> {
+        panic!("unexpected evaluation")
+    }
+
+    fn storage_handler(&self) -> Arc<dyn StorageHandler> {
+        panic!("unexpected storage read")
+    }
+
+    fn json_handler(&self) -> Arc<dyn JsonHandler> {
+        panic!("unexpected JSON read")
+    }
+
+    fn parquet_handler(&self) -> Arc<dyn ParquetHandler> {
+        panic!("unexpected Parquet read")
+    }
+
+    #[cfg(feature = "declarative-plans")]
+    fn plan_executor(&self) -> Option<Arc<dyn PlanExecutor>> {
+        Some(Arc::new(Self))
+    }
+}
+
+#[cfg(all(test, feature = "declarative-plans"))]
+impl PlanExecutor for NoIoEngine {
+    fn execute_op(&self, _op: Operation) -> KernelResult<PlanResult> {
+        panic!("unexpected declarative execution")
+    }
+}
 
 // Connector-owned diagnostic storage used by FFI tests.
 #[cfg(test)]

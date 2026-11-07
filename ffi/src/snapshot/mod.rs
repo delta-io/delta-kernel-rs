@@ -1,6 +1,8 @@
 //! FFI interfaces for snapshot construction and retained state.
 
 mod builder;
+#[cfg(feature = "declarative-plans")]
+pub mod checkpoint;
 pub mod hint;
 
 pub use builder::{

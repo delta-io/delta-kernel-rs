@@ -15,6 +15,8 @@ use crate::actions::visitors::LastManifestCommitVisitor;
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::actions::{COMMIT_INFO_NAME, LAST_MANIFEST_COMMIT_FIELD, LastManifestCommit};
 use crate::engine_data::RowVisitor;
+#[cfg(feature = "declarative-plans")]
+use crate::plans::ir::nodes::FileType;
 use crate::schema::SchemaRef;
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::schema::lazy_schema_ref;
@@ -367,6 +369,16 @@ impl<Location: AsUrl> ParsedLogPath<Location> {
     #[allow(dead_code)] // not all cfgs exercise this
     pub(crate) fn is_json(&self) -> bool {
         self.extension == "json"
+    }
+
+    /// Physical format of a checkpoint part. UUID-named roots may be JSON; other parts are Parquet.
+    #[cfg(feature = "declarative-plans")]
+    pub(crate) fn checkpoint_file_type(&self) -> FileType {
+        if self.is_json() {
+            FileType::Json
+        } else {
+            FileType::Parquet
+        }
     }
 }
 

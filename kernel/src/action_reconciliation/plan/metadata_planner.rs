@@ -26,8 +26,7 @@ pub(super) enum StatsKind {
 }
 
 impl<'a> MetadataPlanner<'a> {
-    /// Whether [`CheckpointShape`] should inspect the leaf-level checkpoint schema to choose the
-    /// statistics representation and identify compatible structured partition values.
+    /// Whether choosing statistics or structured partitions requires the checkpoint leaf schema.
     pub(super) fn requires_checkpoint_add_schema(&self) -> bool {
         self.stats_schema.is_some() || self.parsed_partition_schema.is_some()
     }

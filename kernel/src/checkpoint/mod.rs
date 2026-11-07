@@ -109,8 +109,12 @@ use tracing::info;
 use url::Url;
 
 #[cfg(feature = "declarative-plans")]
+pub use crate::action_reconciliation::checkpoint_shape::CheckpointInfo;
+#[cfg(feature = "declarative-plans")]
 #[allow(unused_imports)]
-pub(crate) use crate::action_reconciliation::checkpoint_shape::{CheckpointShape, CheckpointType};
+pub(crate) use crate::action_reconciliation::checkpoint_shape::{
+    CheckpointProbe, CheckpointShape, CheckpointType,
+};
 use crate::action_reconciliation::file_metadata::{
     StatsTransformConfig, build_checkpoint_read_schema, build_checkpoint_transform,
 };

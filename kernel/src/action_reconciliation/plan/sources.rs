@@ -50,16 +50,16 @@ impl Scan {
     /// fields above. A parsed field is omitted when its schema is absent.
     pub(super) fn checkpoint_arm(
         &self,
-        shape: &CheckpointShape,
+        shape: &ScanCheckpoint,
         planner: &MetadataPlanner<'_>,
     ) -> KernelResult<PlanBuilder> {
         let log_segment = self.snapshot.log_segment();
         let available_file_schema = shape
-            .leaf_checkpoint_schema
-            .as_deref()
+            .leaf_checkpoint_schema()
+            .map(AsRef::as_ref)
             .unwrap_or(get_all_actions_schema());
         let checkpoint = log_segment.checkpoint_version_tagged_scan_files()?;
-        let source = |schema| match (&shape.checkpoint_type, checkpoint) {
+        let source = |schema| match (shape.checkpoint_type(), checkpoint) {
             (CheckpointType::Leaf, Some((FileType::Parquet, parts))) => {
                 PlanBuilder::scan_parquet(parts, &[VERSION], schema)
             }
@@ -67,11 +67,22 @@ impl Scan {
                 PlanBuilder::scan_json(parts, &[VERSION], schema)
             }
             (CheckpointType::Manifest, Some((file_type, parts))) => {
-                match log_segment.checkpoint_hint_version_tagged_sidecar_scan_files()? {
-                    Some(sidecars) => PlanBuilder::scan_parquet(sidecars, &[VERSION], schema),
-                    // Without a complete hint, load the sidecars referenced by the
-                    // manifest.
-                    None => sidecar_actions(file_type, parts, schema, &log_segment.log_root),
+                if let Some(files) = shape.complete_sidecars() {
+                    let constants = parts
+                        .first()
+                        .map(|part| part.file_constants.clone())
+                        .unwrap_or_default();
+                    let sidecars = files.iter().map(|file| ScanFile {
+                        meta: file.clone(),
+                        file_constants: constants.clone(),
+                    });
+                    PlanBuilder::scan_parquet(sidecars, &[VERSION], schema)
+                } else if let Some(sidecars) =
+                    log_segment.checkpoint_hint_version_tagged_sidecar_scan_files()?
+                {
+                    PlanBuilder::scan_parquet(sidecars, &[VERSION], schema)
+                } else {
+                    sidecar_actions(file_type, parts, schema, &log_segment.log_root)
                 }
             }
             (CheckpointType::None, _) | (_, None) => PlanBuilder::values(schema, vec![]),
