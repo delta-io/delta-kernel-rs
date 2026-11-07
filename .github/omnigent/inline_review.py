@@ -199,12 +199,22 @@ def build_review_payload(
     run_url: str,
     history: Any = None,
     trusted_bot_logins: Collection[str] = DEFAULT_TRUSTED_BOT_LOGINS,
+    review_diff: str | None = None,
 ) -> tuple[dict[str, Any], list[str], list[str]]:
-    """Build a non-blocking review and classify unmapped and duplicate findings."""
+    """Build a review using GitHub's ``diff`` for publication coordinates.
+
+    When supplied, ``review_diff`` restricts inline positions to the reviewed scope. LEFT positions
+    from a different review diff remain in the body because their base-file coordinates may
+    refer to different code. Return the payload, unmapped IDs, and duplicate IDs; raise
+    ValueError for an invalid head SHA.
+    """
     if re.fullmatch(r"[0-9a-f]{40}", head_sha) is None:
         raise ValueError("head SHA must be a 40-character lowercase hex value")
 
     allowed_positions = diff_positions(diff)
+    reviewed_positions = (
+        diff_positions(review_diff) if review_diff is not None else allowed_positions
+    )
     comments: list[dict[str, Any]] = []
     unmapped: list[str] = []
     duplicates: list[str] = []
@@ -237,7 +247,11 @@ def build_review_payload(
             continue
         seen_ids.add(finding_id)
 
-        if (path, line, side) not in allowed_positions:
+        if (
+            (path, line, side) not in allowed_positions
+            or (path, line, side) not in reviewed_positions
+            or (side == "LEFT" and review_diff is not None and review_diff != diff)
+        ):
             unmapped.append(finding_id)
             continue
         if (path, line, side, canonical_finding_body(body)) in prior_comments:
@@ -472,6 +486,8 @@ def main() -> None:
     parser.add_argument("--review", required=True, type=Path)
     parser.add_argument("--findings", required=True, type=Path)
     parser.add_argument("--diff", required=True, type=Path)
+    parser.add_argument("--review-diff", type=Path)
+    parser.add_argument("--fallback-output", type=Path)
     parser.add_argument("--head-sha", required=True)
     parser.add_argument("--run-url", required=True)
     parser.add_argument("--history", required=True, type=Path)
@@ -484,16 +500,24 @@ def main() -> None:
 
     history = _load_history(args.history)
     trusted_bot_logins = _load_trusted_bot_logins(args.trusted_bot_logins)
+    review = args.review.read_text()
     payload, unmapped, duplicates = build_review_payload(
-        review=args.review.read_text(),
+        review=review,
         findings=json.loads(args.findings.read_text()),
         diff=args.diff.read_text(errors="replace"),
         head_sha=args.head_sha,
         run_url=args.run_url,
         history=history,
         trusted_bot_logins=trusted_bot_logins,
+        review_diff=args.review_diff.read_text(errors="replace") if args.review_diff else None,
     )
     args.output.write_text(json.dumps(payload))
+    if args.fallback_output:
+        args.fallback_output.write_text(
+            _format_review_body(
+                _remove_finding_sections(review, set(duplicates)), args.run_url, collapsed=True
+            )
+        )
     args.unmapped_output.write_text("\n".join(unmapped) + ("\n" if unmapped else ""))
     args.duplicate_output.write_text(
         "\n".join(duplicates) + ("\n" if duplicates else "")

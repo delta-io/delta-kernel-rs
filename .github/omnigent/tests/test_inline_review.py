@@ -1009,6 +1009,136 @@ class InlineReviewTest(unittest.TestCase):
         self.assertEqual(unmapped, [])
         self.assertEqual(duplicates, [])
 
+    def test_left_positions_from_a_different_stack_base_remain_in_review_body(self) -> None:
+        review = (
+            "### Blocker1\nDeleted parent line.\n\n### Nit1\nChild change.\n\n## Summary\nReview."
+        )
+        findings = [
+            {
+                "id": finding_id,
+                "path": "kernel/src/example.rs",
+                "line": 9,
+                "side": side,
+                "body": body,
+            }
+            for finding_id, side, body in (
+                ("Blocker1", "LEFT", "Deleted parent line."),
+                ("Nit1", "RIGHT", "Child change."),
+            )
+        ]
+        for review_diff, expected_unmapped in (
+            (None, []),
+            (DIFF, []),
+            (DIFF.replace("old_call();", "parent_call();"), ["Blocker1"]),
+        ):
+            with self.subTest(review_diff=review_diff):
+                payload, unmapped, _ = self.inline_review.build_review_payload(
+                    review=review,
+                    findings=findings,
+                    diff=DIFF,
+                    review_diff=review_diff,
+                    head_sha="f" * 40,
+                    run_url="https://github.com/delta-io/delta-kernel-rs/actions/runs/1",
+                )
+                self.assertEqual(unmapped, expected_unmapped)
+                self.assertEqual(len(payload["comments"]), 2 - len(expected_unmapped))
+                self.assertEqual("### Blocker1" in payload["body"], bool(expected_unmapped))
+                self.assertNotIn("### Nit1", payload["body"])
+
+    def test_github_only_positions_are_not_published_inline(self) -> None:
+        payload, unmapped, _ = self.inline_review.build_review_payload(
+            review="### Nit1\nAncestor change.",
+            findings=[{
+                "id": "Nit1", "path": "kernel/src/example.rs", "line": 50,
+                "side": "RIGHT", "body": "Ancestor change.",
+            }],
+            diff=DIFF + "@@ -50 +50 @@\n-ancestor_old();\n+ancestor_new();\n",
+            review_diff=DIFF,
+            head_sha="f" * 40,
+            run_url="https://github.com/delta-io/delta-kernel-rs/actions/runs/1",
+        )
+
+        self.assertEqual(payload["comments"], [])
+        self.assertEqual(unmapped, ["Nit1"])
+        self.assertIn("### Nit1", payload["body"])
+
+    def test_workflow_inline_rejection_preserves_mapped_and_unmapped_findings(self) -> None:
+        repo_root = Path(__file__).resolve().parents[3]
+        workflow = yaml.safe_load((repo_root / ".github/workflows/ai-review.yml").read_text())
+        publish_step = next(
+            step
+            for job in workflow["jobs"].values()
+            for step in job["steps"]
+            if step.get("name") == "Post inline review"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "review_output.txt").write_text(
+                "## Blocking issues\n### Blocker1\nDeleted parent line.\n\n"
+                "## Non-blocking notes\n### Nit1\nChild change.\n\n## Summary\nTwo findings."
+            )
+            findings = [
+                {
+                    "id": finding_id,
+                    "path": "kernel/src/example.rs",
+                    "line": 9,
+                    "side": side,
+                    "body": body,
+                }
+                for finding_id, side, body in (
+                    ("Blocker1", "LEFT", "Deleted parent line."),
+                    ("Nit1", "RIGHT", "Child change."),
+                )
+            ]
+            (root / "inline_findings.json").write_text(json.dumps(findings))
+            (root / "github_pr_diff.txt").write_text(DIFF)
+            (root / "pr_diff.txt").write_text(DIFF.replace("old_call();", "parent_call();"))
+            (root / "pr_history.json").write_text("{}")
+            (root / "trusted_bot_logins.json").write_text('["github-actions"]')
+            (root / "python3").symlink_to(sys.executable)
+            gh = root / "gh"
+            gh.write_text(
+                f"#!{sys.executable}\n"
+                "import os, pathlib, sys\n"
+                "root = pathlib.Path(os.environ['TEST_ROOT'])\n"
+                "if sys.argv[1] == 'api':\n"
+                "    payload = pathlib.Path(sys.argv[sys.argv.index('--input') + 1])\n"
+                "    (root / 'submitted.json').write_text(payload.read_text())\n"
+                "    raise SystemExit(1)\n"
+                "assert sys.argv[1:3] == ['pr', 'comment']\n"
+                "body = pathlib.Path(sys.argv[sys.argv.index('--body-file') + 1])\n"
+                "(root / 'published.md').write_text(body.read_text())\n"
+            )
+            gh.chmod(0o700)
+            result = subprocess.run(
+                [
+                    "bash", "-euo", "pipefail", "-c",
+                    publish_step["run"].replace("/tmp/", f"{root}/"),
+                ],
+                cwd=repo_root,
+                env={
+                    **os.environ,
+                    "PATH": f"{root}:{os.environ['PATH']}",
+                    "TEST_ROOT": str(root),
+                    "HEAD_SHA": "f" * 40,
+                    "PR_NUMBER": "2",
+                    "REPO": "delta-io/delta-kernel-rs",
+                    "RUN_URL": "https://github.com/delta-io/delta-kernel-rs/actions/runs/1",
+                },
+                capture_output=True,
+                text=True,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            submitted = json.loads((root / "submitted.json").read_text())
+            self.assertEqual(len(submitted["comments"]), 1)
+            self.assertEqual(submitted["comments"][0]["side"], "RIGHT")
+            self.assertIn("### Blocker1", submitted["body"])
+            self.assertNotIn("### Nit1", submitted["body"])
+            published = (root / "published.md").read_text()
+            for finding in ("### Blocker1", "Deleted parent line.", "### Nit1", "Child change."):
+                self.assertIn(finding, published)
+
     def test_exact_duplicate_inline_body_is_skipped_without_new_comments(self) -> None:
         review = "## Summary\nNo new findings."
         prior_body = self.review_publish.format_review_body(
