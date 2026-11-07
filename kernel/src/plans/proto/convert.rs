@@ -11,7 +11,7 @@ use super::{
     expressions as proto_expr, operation as proto_op, plan as proto_plan, schema as proto_schema,
 };
 use crate::expressions::{
-    ArrayData, BinaryExpression, BinaryExpressionOp, BinaryPredicate, BinaryPredicateOp, CastMode,
+    ArrayData, BinaryExpression, BinaryExpressionOp, BinaryPredicate, BinaryPredicateOp,
     ColumnName, DecimalData, Expression, ExpressionFieldPatch, ExpressionStructPatch,
     JunctionPredicate, JunctionPredicateOp, MapData, MapToStructExpression, MapToStructOptions,
     OpaqueExpression, OpaquePredicate, ParseJsonExpression, Predicate, Scalar, StructData,
@@ -374,13 +374,7 @@ impl From<&Expression> for proto_expr::Expression {
                 }))
             }
             // No proto cast node yet; serialize as an opaque unknown.
-            Expression::Cast(cast) => {
-                let prefix = match cast.mode {
-                    CastMode::Safe => "cast_to",
-                    CastMode::Strict => "strict_cast_to",
-                };
-                Kind::Unknown(format!("{prefix}_{}", cast.target))
-            }
+            Expression::Cast(cast) => Kind::Unknown(cast.unknown_name()),
         };
         proto_expr::Expression { kind: Some(kind) }
     }
@@ -1106,6 +1100,7 @@ mod tests {
         ScanFile, ScanJson, ScanParquet, SemiJoin, UnionAll, Values, WriteJson,
     };
     use crate::plans::ir::plan::{Plan, PlanNode};
+    use crate::plans::proto::expressions::expression::Kind as ExprKind;
     use crate::plans::proto::{
         expressions as proto_expr, operation as proto_op, plan as proto_plan,
         schema as proto_schema,
@@ -1779,6 +1774,22 @@ mod tests {
             Kind::Unknown(_) => "unknown",
         };
         assert_eq!(kind, expected);
+    }
+
+    #[rstest]
+    #[case::safe(Expression::cast(col!("n"), DataType::INTEGER), "cast_to_integer")]
+    #[case::strict(
+        Expression::cast_strict(col!("n"), DataType::INTEGER),
+        "strict_cast_to_integer"
+    )]
+    fn from_cast_expression_keeps_mode_in_unknown_name(
+        #[case] expr: Expression,
+        #[case] expected: &str,
+    ) {
+        assert_eq!(
+            proto_expr::Expression::from(&expr).kind,
+            Some(ExprKind::Unknown(expected.to_string()))
+        );
     }
 
     #[rstest]

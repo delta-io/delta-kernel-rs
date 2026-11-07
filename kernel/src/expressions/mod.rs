@@ -4,6 +4,7 @@ use std::collections::HashSet;
 use std::fmt::{Display, Formatter};
 use std::sync::Arc;
 
+use delta_kernel_derive::internal_api;
 use derive_more::From;
 use itertools::Itertools;
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de, ser};
@@ -450,16 +451,15 @@ pub struct ParseJsonExpression {
     pub output_schema: SchemaRef,
 }
 
-/// An expression that casts a child expression to a target type. What happens to a value that
-/// cannot be represented in the target type depends on [`CastMode`].
+/// An expression that casts a child expression to a target type.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct CastExpression {
     /// The expression whose value is cast.
     pub expr: Box<Expression>,
     /// The type the value is cast to.
     pub target: DataType,
-    /// How a value that cannot be represented in `target` is handled.
-    #[serde(default)]
+    /// See [`CastMode`].
+    #[serde(default, skip_serializing_if = "CastMode::is_safe")]
     pub mode: CastMode,
 }
 
@@ -898,6 +898,23 @@ impl CastExpression {
             target,
             mode,
         }
+    }
+
+    /// The name a cast is lowered to where a boundary has no cast node and must pass it as
+    /// [`Expression::Unknown`].
+    #[internal_api]
+    pub(crate) fn unknown_name(&self) -> String {
+        let prefix = match self.mode {
+            CastMode::Safe => "cast_to",
+            CastMode::Strict => "strict_cast_to",
+        };
+        format!("{prefix}_{}", self.target)
+    }
+}
+
+impl CastMode {
+    fn is_safe(&self) -> bool {
+        *self == CastMode::Safe
     }
 }
 
@@ -1815,15 +1832,13 @@ mod tests {
             assert_roundtrip(&expr);
         }
 
+        /// A safe cast serializes exactly as it did before casts had a mode, so older readers
+        /// still accept it.
         #[test]
-        fn test_cast_without_mode_deserializes_as_safe() {
-            let mut json =
+        fn test_safe_cast_serializes_without_mode() {
+            let json =
                 serde_json::to_value(Expression::cast(col!("n"), DataType::INTEGER)).unwrap();
-            json["Cast"].as_object_mut().unwrap().remove("mode");
-            assert_eq!(
-                serde_json::from_value::<Expression>(json).unwrap(),
-                Expression::cast(col!("n"), DataType::INTEGER)
-            );
+            assert_eq!(json["Cast"].get("mode"), None);
         }
 
         #[rstest::rstest]

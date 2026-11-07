@@ -783,6 +783,9 @@ mod tests {
     #[case::parse_json(|name: Option<&str>| name.map(|n| {
         Expr::ParseJson(ParseJsonExpression::new(Expr::column([n]), test_output_schema()))
     }))]
+    #[case::strict_cast(|name: Option<&str>| name.map(|n| {
+        Expr::cast_strict(Expr::column([n]), DataType::INTEGER)
+    }))]
     #[case::parse_json_no_match(|_| Some(Expr::ParseJson(
         ParseJsonExpression::new(col!("unchanged_col"), test_output_schema()),
     )))]

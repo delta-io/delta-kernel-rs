@@ -22,8 +22,7 @@ use crate::arrow::compute::kernels::comparison::in_list_utf8;
 use crate::arrow::compute::kernels::interleave::interleave;
 use crate::arrow::compute::kernels::numeric::{add, div, mul, sub};
 use crate::arrow::compute::{
-    CastOptions, and_kleene, can_cast_types, cast, cast_with_options, filter_record_batch,
-    is_not_null, is_null, not, or_kleene,
+    and_kleene, can_cast_types, cast, filter_record_batch, is_not_null, is_null, not, or_kleene,
 };
 use crate::arrow::datatypes::{
     DataType as ArrowDataType, Field as ArrowField, Fields as ArrowFields, IntervalUnit,
@@ -32,6 +31,7 @@ use crate::arrow::datatypes::{
 use crate::arrow::error::ArrowError;
 use crate::arrow::json::StructMode;
 use crate::arrow::json::writer::{EncoderOptions, make_encoder};
+use crate::arrow::util::display::array_value_to_string;
 use crate::delta_kernel_derive::internal_api;
 use crate::engine::arrow_conversion::{LIST_ARRAY_ROOT, TryFromKernel, TryIntoArrow};
 use crate::engine::arrow_expression::opaque::{
@@ -626,7 +626,7 @@ enum ViewCast {
     ToNonView,
 }
 
-/// Casts `input` to the target of `cast`, following its [`CastMode`].
+/// Casts `input` to `cast_expr.target`, following its [`CastMode`].
 fn evaluate_cast(cast_expr: &CastExpression, input: &ArrayRef) -> KernelResult<ArrayRef> {
     let target = ArrowDataType::try_from_kernel(&cast_expr.target)?;
     let supported = can_cast_types(input.data_type(), &target);
@@ -635,24 +635,40 @@ fn evaluate_cast(cast_expr: &CastExpression, input: &ArrayRef) -> KernelResult<A
         // that to an all-NULL column so an unsupported cast keeps the file.
         CastMode::Safe if !supported => Ok(new_null_array(&target, input.len())),
         CastMode::Safe => Ok(cast(input, &target)?),
-        CastMode::Strict if !supported => Err(KernelError::invalid_expression(format!(
-            "Cannot cast {} to {}",
-            input.data_type(),
-            cast_expr.target
-        ))),
-        CastMode::Strict => {
-            let options = CastOptions {
-                safe: false,
-                ..Default::default()
-            };
-            cast_with_options(input, &target, &options).map_err(|e| {
-                KernelError::invalid_expression(format!(
-                    "Strict cast of {} to {} failed: {e}",
-                    input.data_type(),
-                    cast_expr.target
-                ))
-            })
+        CastMode::Strict if !supported || target.is_nested() => {
+            Err(KernelError::invalid_expression(format!(
+                "Strict cast of {} to {} is not supported",
+                input.data_type(),
+                cast_expr.target
+            )))
         }
+        CastMode::Strict => strict_cast(input, &target, &cast_expr.target),
+    }
+}
+
+/// Casts `input` to the primitive `target`, failing on the first non-null value that cannot be
+/// represented.
+///
+/// Casting with arrow's `safe: false` would also fail on values arrow stores but never exposes,
+/// such as an unused dictionary entry, so this compares the null masks of a safe cast instead.
+fn strict_cast(
+    input: &ArrayRef,
+    target: &ArrowDataType,
+    kernel_target: &DataType,
+) -> KernelResult<ArrayRef> {
+    let output = cast(input, target)?;
+    if output.null_count() == input.logical_null_count() {
+        return Ok(output);
+    }
+    let input_nulls = input.logical_nulls();
+    let is_input_null = |row| input_nulls.as_ref().is_some_and(|nulls| nulls.is_null(row));
+    match (0..input.len()).find(|&row| output.is_null(row) && !is_input_null(row)) {
+        Some(row) => Err(KernelError::invalid_expression(format!(
+            "Strict cast of {} value '{}' to {kernel_target} failed",
+            input.data_type(),
+            array_value_to_string(input, row)?
+        ))),
+        None => Ok(output),
     }
 }
 
@@ -1344,8 +1360,9 @@ mod tests {
     use super::*;
     use crate::arrow::array::{
         ArrayData as ArrowArrayData, ArrayRef, BinaryArray, BooleanArray, Date32Array,
-        Float64Array, Int32Array, Int64Array, LargeStringArray, ListArray, MapBuilder, StringArray,
-        StringBuilder, StringViewArray, StructArray, TimestampMicrosecondArray,
+        DictionaryArray, Float64Array, Int32Array, Int64Array, LargeStringArray, ListArray,
+        MapBuilder, StringArray, StringBuilder, StringViewArray, StructArray,
+        TimestampMicrosecondArray,
     };
     use crate::arrow::buffer::{OffsetBuffer, ScalarBuffer};
     use crate::arrow::datatypes::{
@@ -4289,68 +4306,99 @@ mod tests {
         assert!(evaluate_expression(&expr, &batch, Some(&DataType::DATE)).is_ok());
     }
 
-    #[test]
-    fn test_cast_unsupported_type_pair_yields_null() {
-        // Arrow has no cast from Boolean to Date; the cast degrades to an all-NULL column.
-        let schema = ArrowSchema::new(vec![ArrowField::new("flag", ArrowDataType::Boolean, true)]);
-        let flags = BooleanArray::from(vec![Some(true), Some(false)]);
-        let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(flags)]).unwrap();
-
-        let expr = Expr::cast(col!("flag"), DataType::DATE);
-        let result = evaluate_expression(&expr, &batch, None).unwrap();
-
-        assert_eq!(result.len(), 2);
-        assert_eq!(result.null_count(), 2);
-        assert_eq!(result.data_type(), &ArrowDataType::Date32);
+    /// Runs a cast of column `c` in `mode` and returns the result.
+    fn cast_column(values: ArrayRef, target: DataType, mode: CastMode) -> KernelResult<ArrayRef> {
+        let batch = RecordBatch::try_from_iter([("c", values)]).unwrap();
+        let expr = Expr::Cast(CastExpression::new(col!("c"), target, mode));
+        evaluate_expression(&expr, &batch, None)
     }
 
-    /// A strict cast keeps every representable value, including NULLs, and fails on the first
-    /// value it cannot represent.
     #[rstest]
-    #[case::fits(vec![Some(1), None, Some(i64::from(i32::MAX))], None)]
-    #[case::overflows(vec![Some(1), Some(i64::from(i32::MAX) + 1)], Some("Strict cast of Int64 to integer failed"))]
-    #[case::underflows(vec![Some(i64::from(i32::MIN) - 1)], Some("Strict cast of Int64 to integer failed"))]
-    fn test_strict_cast_long_to_int(
-        #[case] values: Vec<Option<i64>>,
-        #[case] expected_error: Option<&str>,
-    ) {
-        let batch =
-            RecordBatch::try_from_iter([("n", Arc::new(Int64Array::from(values.clone())) as _)])
-                .unwrap();
-        let expr = Expr::cast_strict(col!("n"), DataType::INTEGER);
-        let result = evaluate_expression(&expr, &batch, Some(&DataType::INTEGER));
-        match expected_error {
-            Some(message) => assert_result_error_with_message(result, message),
-            None => {
-                let expected: Vec<Option<i32>> =
-                    values.iter().map(|v| v.map(|v| v as i32)).collect();
-                assert_eq!(
-                    result.unwrap().as_primitive::<Int32Type>(),
-                    &Int32Array::from(expected)
-                );
-            }
-        }
+    #[case::safe(CastMode::Safe)]
+    #[case::strict(CastMode::Strict)]
+    fn test_cast_long_to_int_keeps_values_that_fit(#[case] mode: CastMode) {
+        let values = vec![
+            Some(1),
+            None,
+            Some(i64::from(i32::MAX)),
+            Some(i64::from(i32::MIN)),
+        ];
+        let result = cast_column(
+            Arc::new(Int64Array::from(values.clone())),
+            DataType::INTEGER,
+            mode,
+        )
+        .unwrap();
+        let expected: Vec<Option<i32>> = values.iter().map(|v| v.map(|v| v as i32)).collect();
+        assert_eq!(
+            result.as_primitive::<Int32Type>(),
+            &Int32Array::from(expected)
+        );
     }
 
-    #[test]
-    fn test_strict_cast_unparseable_string_fails() {
-        let parts = StringArray::from(vec![Some("2025-04-11"), Some("not-a-date")]);
-        let batch = RecordBatch::try_from_iter([("part", Arc::new(parts) as _)]).unwrap();
-        let expr = Expr::cast_strict(col!("part"), DataType::DATE);
+    /// A safe cast nulls a value it cannot represent, while a strict cast fails and names it.
+    #[rstest]
+    #[case::overflow(
+        Arc::new(Int64Array::from(vec![Some(1), Some(i64::from(i32::MAX) + 1)])),
+        DataType::INTEGER,
+        "Strict cast of Int64 value '2147483648' to integer failed"
+    )]
+    #[case::underflow(
+        Arc::new(Int64Array::from(vec![i64::from(i32::MIN) - 1])),
+        DataType::INTEGER,
+        "Strict cast of Int64 value '-2147483649' to integer failed"
+    )]
+    #[case::unparseable_string(
+        Arc::new(StringArray::from(vec![Some("2025-04-11"), Some("not-a-date")])),
+        DataType::DATE,
+        "Strict cast of Utf8 value 'not-a-date' to date failed"
+    )]
+    #[case::empty_string(
+        Arc::new(StringArray::from(vec![""])),
+        DataType::INTEGER,
+        "Strict cast of Utf8 value '' to integer failed"
+    )]
+    #[case::unsupported_pair(
+        Arc::new(BooleanArray::from(vec![Some(true), Some(false)])),
+        DataType::DATE,
+        "Strict cast of Boolean to date is not supported"
+    )]
+    fn test_cast_of_unrepresentable_value(
+        #[case] values: ArrayRef,
+        #[case] target: DataType,
+        #[case] strict_error: &str,
+    ) {
+        let safe = cast_column(values.clone(), target.clone(), CastMode::Safe).unwrap();
+        assert!(safe.null_count() > 0);
         assert_result_error_with_message(
-            evaluate_expression(&expr, &batch, None),
-            "Strict cast of Utf8 to date failed",
+            cast_column(values, target, CastMode::Strict),
+            strict_error,
         );
     }
 
     #[test]
-    fn test_strict_cast_unsupported_type_pair_fails() {
-        let flags = BooleanArray::from(vec![Some(true)]);
-        let batch = RecordBatch::try_from_iter([("flag", Arc::new(flags) as _)]).unwrap();
-        let expr = Expr::cast_strict(col!("flag"), DataType::DATE);
+    fn test_strict_cast_ignores_unused_dictionary_values() {
+        let keys = Int32Array::from(vec![Some(0), None]);
+        let dictionary = StringArray::from(vec!["7", "not-a-number"]);
+        let values = Arc::new(DictionaryArray::try_new(keys, Arc::new(dictionary)).unwrap());
+        let result = cast_column(values, DataType::INTEGER, CastMode::Strict).unwrap();
+        assert_eq!(
+            result.as_primitive::<Int32Type>(),
+            &Int32Array::from(vec![Some(7), None])
+        );
+    }
+
+    #[test]
+    fn test_strict_cast_to_nested_type_is_unsupported() {
+        let struct_type =
+            StructType::new_unchecked([StructField::nullable("a", DataType::INTEGER)]);
+        let values = Arc::new(StructArray::from(vec![(
+            Arc::new(ArrowField::new("a", ArrowDataType::Int64, true)),
+            Arc::new(Int64Array::from(vec![1])) as ArrayRef,
+        )]));
         assert_result_error_with_message(
-            evaluate_expression(&expr, &batch, None),
-            "Cannot cast Boolean to date",
+            cast_column(values, struct_type.into(), CastMode::Strict),
+            "is not supported",
         );
     }
 

@@ -103,6 +103,8 @@ StructExpression
   Unknown(mystery)
   UriEncodeFileLocation
     Column(location)
+  Unknown(cast_to_integer)
+  Unknown(strict_cast_to_integer)
   MapToStruct
     Column(pv)
   MapToStruct(timestamp_timezone=America/Los_Angeles)

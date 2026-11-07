@@ -4,7 +4,7 @@ use std::ffi::c_void;
 
 use delta_kernel::expressions::{
     ArrayData, BinaryExpression, BinaryExpressionOp, BinaryPredicate, BinaryPredicateOp,
-    CaseWhenExpression, CastMode, ColumnName, Expression, ExpressionRef, ExpressionStructPatch,
+    CaseWhenExpression, ColumnName, Expression, ExpressionRef, ExpressionStructPatch,
     JunctionPredicate, JunctionPredicateOp, MapData, MapToStructExpression, OpaqueExpression,
     OpaqueExpressionOpRef, OpaquePredicate, OpaquePredicateOpRef, ParseJsonExpression, Predicate,
     Scalar, StructData, UnaryExpression, UnaryExpressionOp, UnaryPredicate, UnaryPredicateOp,
@@ -759,17 +759,7 @@ fn visit_expression_impl(
             );
         }
         // TODO(#2975): Add a dedicated visitor callback for cast expressions.
-        Expression::Cast(cast) => {
-            let prefix = match cast.mode {
-                CastMode::Safe => "cast_to",
-                CastMode::Strict => "strict_cast_to",
-            };
-            visit_unknown(
-                visitor,
-                sibling_list_id,
-                &format!("{prefix}_{}", cast.target),
-            )
-        }
+        Expression::Cast(cast) => visit_unknown(visitor, sibling_list_id, &cast.unknown_name()),
         Expression::Unknown(name) => visit_unknown(visitor, sibling_list_id, name),
     }
 }

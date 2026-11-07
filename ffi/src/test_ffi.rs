@@ -162,6 +162,8 @@ pub unsafe extern "C" fn get_testing_kernel_expression() -> Handle<SharedExpress
         Expr::opaque(OpaqueTestOp("foo".to_string()), vec![lit(42), lit(1.111)]),
         Expr::unknown("mystery"),
         Expr::unary(UnaryExpressionOp::UriEncodeFileLocation, col!("location")),
+        Expr::cast(col!("c"), DataType::INTEGER),
+        Expr::cast_strict(col!("c"), DataType::INTEGER),
         Expr::map_to_struct(col!("pv"), MapToStructOptions::default()),
         Expr::map_to_struct(
             col!("pv"),
