@@ -22,7 +22,8 @@ use crate::arrow::compute::kernels::comparison::in_list_utf8;
 use crate::arrow::compute::kernels::interleave::interleave;
 use crate::arrow::compute::kernels::numeric::{add, div, mul, sub};
 use crate::arrow::compute::{
-    and_kleene, can_cast_types, cast, filter_record_batch, is_not_null, is_null, not, or_kleene,
+    CastOptions, and_kleene, can_cast_types, cast, cast_with_options, filter_record_batch,
+    is_not_null, is_null, not, or_kleene,
 };
 use crate::arrow::datatypes::{
     DataType as ArrowDataType, Field as ArrowField, Fields as ArrowFields, IntervalUnit,
@@ -41,9 +42,9 @@ use crate::engine::ensure_data_types::{ValidationMode, ensure_data_types};
 use crate::error::{KernelError, KernelResult};
 use crate::expressions::{
     BinaryExpression, BinaryExpressionOp, BinaryPredicate, BinaryPredicateOp, CaseWhenExpression,
-    Expression, ExpressionRef, ExpressionStructPatch, JunctionPredicate, JunctionPredicateOp,
-    OpaqueExpression, OpaquePredicate, Predicate, Scalar, UnaryExpression, UnaryExpressionOp,
-    UnaryPredicate, UnaryPredicateOp, VariadicExpression, VariadicExpressionOp,
+    CastExpression, CastMode, Expression, ExpressionRef, ExpressionStructPatch, JunctionPredicate,
+    JunctionPredicateOp, OpaqueExpression, OpaquePredicate, Predicate, Scalar, UnaryExpression,
+    UnaryExpressionOp, UnaryPredicate, UnaryPredicateOp, VariadicExpression, VariadicExpressionOp,
 };
 use crate::schema::{DataType, PrimitiveType, StructField, StructType};
 use crate::uri_reference::{scheme_len, uri_encode_location};
@@ -418,14 +419,7 @@ pub fn evaluate_expression(
         ))),
         (Cast(c), result_type) => {
             let input = evaluate_expression(&c.expr, batch, None)?;
-            let target = ArrowDataType::try_from_kernel(&c.target)?;
-            // Arrow errors (rather than nulls per-value) on a type pair it cannot cast; degrade
-            // that to an all-NULL column so an unsupported cast keeps the file.
-            let output = if can_cast_types(input.data_type(), &target) {
-                cast(&input, &target)?
-            } else {
-                new_null_array(&target, input.len())
-            };
+            let output = evaluate_cast(c, &input)?;
             validate_array_type(output, result_type)
         }
         (CaseWhen(case_when), result_type) => evaluate_case_when(case_when, batch, result_type),
@@ -630,6 +624,36 @@ fn evaluate_case_when(
 enum ViewCast {
     ToView,
     ToNonView,
+}
+
+/// Casts `input` to the target of `cast`, following its [`CastMode`].
+fn evaluate_cast(cast_expr: &CastExpression, input: &ArrayRef) -> KernelResult<ArrayRef> {
+    let target = ArrowDataType::try_from_kernel(&cast_expr.target)?;
+    let supported = can_cast_types(input.data_type(), &target);
+    match cast_expr.mode {
+        // Arrow errors (rather than nulls per-value) on a type pair it cannot cast; degrade
+        // that to an all-NULL column so an unsupported cast keeps the file.
+        CastMode::Safe if !supported => Ok(new_null_array(&target, input.len())),
+        CastMode::Safe => Ok(cast(input, &target)?),
+        CastMode::Strict if !supported => Err(KernelError::invalid_expression(format!(
+            "Cannot cast {} to {}",
+            input.data_type(),
+            cast_expr.target
+        ))),
+        CastMode::Strict => {
+            let options = CastOptions {
+                safe: false,
+                ..Default::default()
+            };
+            cast_with_options(input, &target, &options).map_err(|e| {
+                KernelError::invalid_expression(format!(
+                    "Strict cast of {} to {} failed: {e}",
+                    input.data_type(),
+                    cast_expr.target
+                ))
+            })
+        }
+    }
 }
 
 /// Casts list element types between view and non-view string/binary variants.
@@ -4278,6 +4302,56 @@ mod tests {
         assert_eq!(result.len(), 2);
         assert_eq!(result.null_count(), 2);
         assert_eq!(result.data_type(), &ArrowDataType::Date32);
+    }
+
+    /// A strict cast keeps every representable value, including NULLs, and fails on the first
+    /// value it cannot represent.
+    #[rstest]
+    #[case::fits(vec![Some(1), None, Some(i64::from(i32::MAX))], None)]
+    #[case::overflows(vec![Some(1), Some(i64::from(i32::MAX) + 1)], Some("Strict cast of Int64 to integer failed"))]
+    #[case::underflows(vec![Some(i64::from(i32::MIN) - 1)], Some("Strict cast of Int64 to integer failed"))]
+    fn test_strict_cast_long_to_int(
+        #[case] values: Vec<Option<i64>>,
+        #[case] expected_error: Option<&str>,
+    ) {
+        let batch =
+            RecordBatch::try_from_iter([("n", Arc::new(Int64Array::from(values.clone())) as _)])
+                .unwrap();
+        let expr = Expr::cast_strict(col!("n"), DataType::INTEGER);
+        let result = evaluate_expression(&expr, &batch, Some(&DataType::INTEGER));
+        match expected_error {
+            Some(message) => assert_result_error_with_message(result, message),
+            None => {
+                let expected: Vec<Option<i32>> =
+                    values.iter().map(|v| v.map(|v| v as i32)).collect();
+                assert_eq!(
+                    result.unwrap().as_primitive::<Int32Type>(),
+                    &Int32Array::from(expected)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_strict_cast_unparseable_string_fails() {
+        let parts = StringArray::from(vec![Some("2025-04-11"), Some("not-a-date")]);
+        let batch = RecordBatch::try_from_iter([("part", Arc::new(parts) as _)]).unwrap();
+        let expr = Expr::cast_strict(col!("part"), DataType::DATE);
+        assert_result_error_with_message(
+            evaluate_expression(&expr, &batch, None),
+            "Strict cast of Utf8 to date failed",
+        );
+    }
+
+    #[test]
+    fn test_strict_cast_unsupported_type_pair_fails() {
+        let flags = BooleanArray::from(vec![Some(true)]);
+        let batch = RecordBatch::try_from_iter([("flag", Arc::new(flags) as _)]).unwrap();
+        let expr = Expr::cast_strict(col!("flag"), DataType::DATE);
+        assert_result_error_with_message(
+            evaluate_expression(&expr, &batch, None),
+            "Cannot cast Boolean to date",
+        );
     }
 
     fn case_when_batch() -> RecordBatch {

@@ -11,7 +11,7 @@ use super::{
     expressions as proto_expr, operation as proto_op, plan as proto_plan, schema as proto_schema,
 };
 use crate::expressions::{
-    ArrayData, BinaryExpression, BinaryExpressionOp, BinaryPredicate, BinaryPredicateOp,
+    ArrayData, BinaryExpression, BinaryExpressionOp, BinaryPredicate, BinaryPredicateOp, CastMode,
     ColumnName, DecimalData, Expression, ExpressionFieldPatch, ExpressionStructPatch,
     JunctionPredicate, JunctionPredicateOp, MapData, MapToStructExpression, MapToStructOptions,
     OpaqueExpression, OpaquePredicate, ParseJsonExpression, Predicate, Scalar, StructData,
@@ -374,7 +374,13 @@ impl From<&Expression> for proto_expr::Expression {
                 }))
             }
             // No proto cast node yet; serialize as an opaque unknown.
-            Expression::Cast(cast) => Kind::Unknown(format!("cast_to_{}", cast.target)),
+            Expression::Cast(cast) => {
+                let prefix = match cast.mode {
+                    CastMode::Safe => "cast_to",
+                    CastMode::Strict => "strict_cast_to",
+                };
+                Kind::Unknown(format!("{prefix}_{}", cast.target))
+            }
         };
         proto_expr::Expression { kind: Some(kind) }
     }

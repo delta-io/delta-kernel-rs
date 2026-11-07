@@ -9,9 +9,9 @@ use tracing::{debug, warn};
 
 use crate::expressions::{
     BinaryExpression, BinaryExpressionOp, BinaryPredicate, BinaryPredicateOp, CaseWhenExpression,
-    ColumnName, Expression as Expr, JunctionPredicate, JunctionPredicateOp, OpaqueExpression,
-    OpaqueExpressionOpRef, OpaquePredicate, OpaquePredicateOpRef, Predicate as Pred, Scalar,
-    UnaryPredicate, UnaryPredicateOp,
+    CastMode, ColumnName, Expression as Expr, JunctionPredicate, JunctionPredicateOp,
+    OpaqueExpression, OpaqueExpressionOpRef, OpaquePredicate, OpaquePredicateOpRef,
+    Predicate as Pred, Scalar, UnaryPredicate, UnaryPredicateOp,
 };
 use crate::schema::DataType;
 
@@ -336,11 +336,13 @@ pub trait KernelPredicateEvaluator {
                 Distinct => self.eval_pred_distinct(col, val, inverted),
                 In => None, // arg order is semantically important
             },
-            (Cast(c), Literal(val)) => match c.expr.as_ref() {
+            // Cast pruning assumes a failed cast is NULL, which a strict cast would instead report
+            // as an error, so only safe casts take part.
+            (Cast(c), Literal(val)) if c.mode == CastMode::Safe => match c.expr.as_ref() {
                 Column(col) => self.eval_pred_cast(op, col, &c.target, val, inverted),
                 _ => None,
             },
-            (Literal(val), Cast(c)) => match c.expr.as_ref() {
+            (Literal(val), Cast(c)) if c.mode == CastMode::Safe => match c.expr.as_ref() {
                 // Commute so the cast column is on the left.
                 Column(col) => match op {
                     LessThan => self.eval_pred_cast(GreaterThan, col, &c.target, val, inverted),
@@ -709,7 +711,7 @@ impl<R: ResolveColumnAsScalar> DefaultKernelPredicateEvaluator<R> {
                     warn!("Failed to evaluate {:?}: {err:?}", op.as_ref());
                 })
                 .ok(),
-            Expr::Cast(c) => cast_scalar(self.eval_expr(&c.expr)?, &c.target),
+            Expr::Cast(c) => cast_scalar(self.eval_expr(&c.expr)?, &c.target, c.mode),
             // ParseJson and MapToStruct produce structured output, not scalar values
             Expr::ParseJson(_) | Expr::MapToStruct(_) => None,
             Expr::Unknown(_) => None,
@@ -719,23 +721,26 @@ impl<R: ResolveColumnAsScalar> DefaultKernelPredicateEvaluator<R> {
 
 /// Casts a scalar following SQL `CAST` semantics: a string source is parsed into a primitive target
 /// via [`PrimitiveType::parse_scalar`](crate::schema::PrimitiveType::parse_scalar), and a source
-/// already of the target type passes through. An unparseable string yields `Scalar::Null`.
+/// already of the target type passes through. An unparseable string yields `Scalar::Null` under
+/// [`CastMode::Safe`] and `None` under [`CastMode::Strict`].
 ///
 /// String-to-primitive, identity, and null-source conversions are handled; any other source/target
 /// combination yields `None`, including numeric/temporal casts like `Long -> Int` that the arrow
 /// path can perform. The accepted string formats are a strict subset of arrow's (e.g. arrow parses
 /// the hyphen-less `20240115` as a date but `parse_scalar` does not), so this path is only ever
 /// more conservative than arrow: a form it rejects becomes NULL, never a differing non-null value.
-fn cast_scalar(value: Scalar, target: &DataType) -> Option<Scalar> {
+fn cast_scalar(value: Scalar, target: &DataType, mode: CastMode) -> Option<Scalar> {
     if value.data_type() == *target {
         return Some(value);
     }
     match (value, target) {
-        (Scalar::String(raw), DataType::Primitive(ptype)) => Some(
-            ptype
-                .parse_scalar(&raw)
-                .unwrap_or_else(|_| Scalar::Null(target.clone())),
-        ),
+        // A strict cast that fails has no value to skip with, so it disables skipping.
+        (Scalar::String(raw), DataType::Primitive(ptype)) => match (ptype.parse_scalar(&raw), mode)
+        {
+            (Ok(parsed), _) => Some(parsed),
+            (Err(_), CastMode::Safe) => Some(Scalar::Null(target.clone())),
+            (Err(_), CastMode::Strict) => None,
+        },
         (Scalar::Null(_), _) => Some(Scalar::Null(target.clone())),
         _ => None,
     }
@@ -798,7 +803,7 @@ impl<R: ResolveColumnAsScalar> KernelPredicateEvaluator for DefaultKernelPredica
         val: &Scalar,
         inverted: bool,
     ) -> Option<bool> {
-        let col = cast_scalar(self.resolve_column(col)?, target)?;
+        let col = cast_scalar(self.resolve_column(col)?, target, CastMode::Safe)?;
         self.eval_pred_binary_scalars(op, &col, val, inverted)
     }
 

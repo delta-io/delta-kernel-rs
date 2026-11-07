@@ -450,14 +450,28 @@ pub struct ParseJsonExpression {
     pub output_schema: SchemaRef,
 }
 
-/// An expression that casts a child expression to a target type, following SQL `CAST` semantics: a
-/// value that cannot be represented in the target type evaluates to NULL rather than erroring.
+/// An expression that casts a child expression to a target type. What happens to a value that
+/// cannot be represented in the target type depends on [`CastMode`].
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct CastExpression {
     /// The expression whose value is cast.
     pub expr: Box<Expression>,
     /// The type the value is cast to.
     pub target: DataType,
+    /// How a value that cannot be represented in `target` is handled.
+    #[serde(default)]
+    pub mode: CastMode,
+}
+
+/// How a [`CastExpression`] handles a value that cannot be represented in the target type, such as
+/// an integer that overflows or a string that does not parse.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum CastMode {
+    /// The value becomes NULL, like SQL `TRY_CAST`.
+    #[default]
+    Safe,
+    /// Evaluation fails, like ANSI SQL `CAST`. A type pair the evaluator cannot cast also fails.
+    Strict,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -878,10 +892,11 @@ impl MapToStructExpression {
 }
 
 impl CastExpression {
-    pub(crate) fn new(expr: impl Into<Expression>, target: DataType) -> Self {
+    pub(crate) fn new(expr: impl Into<Expression>, target: DataType, mode: CastMode) -> Self {
         Self {
             expr: Box::new(expr.into()),
             target,
+            mode,
         }
     }
 }
@@ -1085,10 +1100,16 @@ impl Expression {
         Self::MapToStruct(MapToStructExpression::new(map_expr, options))
     }
 
-    /// Creates a new cast of `expr` to `target`, following SQL `CAST` semantics (unrepresentable
-    /// values become NULL). See [`CastExpression`].
+    /// Creates a new cast of `expr` to `target` in which unrepresentable values become NULL. See
+    /// [`CastMode::Safe`].
     pub fn cast(expr: impl Into<Expression>, target: DataType) -> Self {
-        Self::Cast(CastExpression::new(expr, target))
+        Self::Cast(CastExpression::new(expr, target, CastMode::Safe))
+    }
+
+    /// Creates a new cast of `expr` to `target` that fails evaluation on an unrepresentable value.
+    /// See [`CastMode::Strict`].
+    pub fn cast_strict(expr: impl Into<Expression>, target: DataType) -> Self {
+        Self::Cast(CastExpression::new(expr, target, CastMode::Strict))
     }
 }
 
@@ -1399,7 +1420,10 @@ impl Display for Expression {
                 }
                 None => write!(f, "MAP_TO_STRUCT({})", m.map_expr),
             },
-            Cast(c) => write!(f, "CAST({} AS {})", c.expr, c.target),
+            Cast(c) => match c.mode {
+                CastMode::Safe => write!(f, "CAST({} AS {})", c.expr, c.target),
+                CastMode::Strict => write!(f, "STRICT_CAST({} AS {})", c.expr, c.target),
+            },
         }
     }
 }
@@ -1533,6 +1557,10 @@ mod tests {
             (
                 Expr::unary(UnaryExpressionOp::UriEncodeFileLocation, col!("x")),
                 "URI_ENCODE_FILE_LOCATION(Column(x))",
+            ),
+            (
+                Expr::cast_strict(col!("x"), DataType::INTEGER),
+                "STRICT_CAST(Column(x) AS integer)",
             ),
             (
                 Expr::case_when([(col!("x").is_null(), lit(0))], col!("x")),
@@ -1782,8 +1810,20 @@ mod tests {
             Expression::cast(col!("part"), DataType::STRING),
             DataType::INTEGER,
         ))]
+        #[case::strict(Expression::cast_strict(col!("n"), DataType::INTEGER))]
         fn test_cast_expression_roundtrip(#[case] expr: Expression) {
             assert_roundtrip(&expr);
+        }
+
+        #[test]
+        fn test_cast_without_mode_deserializes_as_safe() {
+            let mut json =
+                serde_json::to_value(Expression::cast(col!("n"), DataType::INTEGER)).unwrap();
+            json["Cast"].as_object_mut().unwrap().remove("mode");
+            assert_eq!(
+                serde_json::from_value::<Expression>(json).unwrap(),
+                Expression::cast(col!("n"), DataType::INTEGER)
+            );
         }
 
         #[rstest::rstest]
