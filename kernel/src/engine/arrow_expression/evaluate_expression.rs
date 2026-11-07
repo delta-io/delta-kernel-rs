@@ -266,7 +266,7 @@ fn evaluate_struct_patch_expression(
             ArrowField::new(
                 output_field.name(),
                 output_col.data_type().clone(),
-                output_col.is_nullable(),
+                output_field.nullable,
             )
         })
         .collect();

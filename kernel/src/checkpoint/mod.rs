@@ -141,6 +141,8 @@ use crate::{
 };
 
 pub(crate) mod collation_stats;
+#[cfg(feature = "declarative-plans")]
+mod plan;
 mod sidecar;
 
 use sidecar::{SidecarSplitter, SingleSidecarDataIterator, create_sidecar_action_batch};

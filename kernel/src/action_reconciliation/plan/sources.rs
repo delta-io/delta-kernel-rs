@@ -1,146 +1,111 @@
-use super::metadata_planner::{FILE_ACTION_KEY_FIELD, file_action_key_expr};
-use super::*;
+//! Physical action reads using the caller's requested schema.
 
-impl Scan {
-    pub(super) fn crc_arm(
-        &self,
-        files: Vec<Add>,
-        planner: &MetadataPlanner<'_>,
-    ) -> KernelResult<PlanBuilder> {
-        planner
-            .build_metadata_scan(&LOG_ADD_SCHEMA, false, |schema| {
-                PlanBuilder::values(
-                    LOG_ADD_SCHEMA.clone(),
-                    files.into_iter().map(|add| vec![add.into()]).collect(),
-                )?
-                .project_patch(|patch| {
-                    // Canonical CRC adds can only omit JSON stats from the read schema.
-                    if schema.field_at(&column_name!(ADD_NAME, STATS)).is_ok() {
-                        patch
-                    } else {
-                        patch.drop_at([ADD_NAME], STATS)
-                    }
-                })
-            })?
-            .project_patch(|patch| {
-                patch.append(
-                    FILE_ACTION_KEY_FIELD.clone(),
-                    file_action_key_expr(|col| joined_column_expr!("add", col)),
-                )
-            })
-    }
+use std::sync::LazyLock;
 
-    /// Build normalized checkpoint adds. Returns an empty relation when no checkpoint exists.
-    ///
-    /// ## SQL equivalent:
-    //
-    /// SELECT STRUCT(
-    ///          add.* EXCEPT (
-    ///            stats_parsed, partitionValues_parsed
-    ///          ),
-    ///          add.stats_parsed AS stats_parsed,
-    ///          add.partitionValues_parsed AS partitionValues_parsed
-    ///        ) AS add,
-    ///        file_key(add) AS key
-    /// FROM checkpoint_actions
-    /// WHERE add.path IS NOT NULL
-    ///
-    /// When the checkpoint lacks native parsed metadata, `FROM_JSON(add.stats, physical_stats)`
-    /// and `MAP_TO_STRUCT(add.partitionValues, physical_partitions)` replace the corresponding
-    /// fields above. A parsed field is omitted when its schema is absent.
-    pub(super) fn checkpoint_arm(
-        &self,
-        shape: &CheckpointShape,
-        planner: &MetadataPlanner<'_>,
-    ) -> KernelResult<PlanBuilder> {
-        let log_segment = self.snapshot.log_segment();
-        let available_file_schema = shape
-            .leaf_checkpoint_schema
-            .as_deref()
-            .unwrap_or(get_all_actions_schema());
-        let checkpoint = log_segment.checkpoint_version_tagged_scan_files()?;
-        let source = |schema| match (&shape.checkpoint_type, checkpoint) {
-            (CheckpointType::Leaf, Some((FileType::Parquet, parts))) => {
-                PlanBuilder::scan_parquet(parts, &[VERSION], schema)
-            }
-            (CheckpointType::Leaf, Some((FileType::Json, parts))) => {
-                PlanBuilder::scan_json(parts, &[VERSION], schema)
-            }
-            (CheckpointType::Manifest, Some((file_type, parts))) => {
-                match log_segment.checkpoint_hint_version_tagged_sidecar_scan_files()? {
-                    Some(sidecars) => PlanBuilder::scan_parquet(sidecars, &[VERSION], schema),
-                    // Without a complete hint, load the sidecars referenced by the
-                    // manifest.
-                    None => sidecar_actions(file_type, parts, schema, &log_segment.log_root),
+use url::Url;
+
+use super::VERSION;
+use crate::actions::{
+    ADD_NAME, ActionSet, Add, LOG_ADD_SCHEMA, REMOVE_FIELD, SIDECAR_FIELD, SIDECAR_NAME,
+};
+use crate::checkpoint::{CheckpointShape, CheckpointType};
+use crate::expressions::{Expression as Expr, col, column_name, lit, null_lit};
+use crate::log_segment::LogSegment;
+use crate::plans::ir::nodes::{DynamicScan, FileType, ScanFile};
+use crate::schema::{DataType, SchemaRef, StructField, lazy_schema_ref};
+use crate::{KernelError, KernelResult, PlanBuilder, Version};
+
+const STATS: &str = "stats";
+
+/// Reads selected checkpoint actions. Non-content metadata reads use the root without sidecar
+/// discovery.
+/// Supplies `version`; absent checkpoints and empty selections return an empty relation.
+pub(crate) fn checkpoint_actions(
+    segment: &LogSegment,
+    shape: Option<&CheckpointShape>,
+    actions: ActionSet,
+    schema: SchemaRef,
+) -> KernelResult<PlanBuilder> {
+    let Some((file_type, parts)) = segment.checkpoint_version_tagged_scan_files()? else {
+        // The plan builder eliminates this empty relation from replay unions.
+        return PlanBuilder::values(schema, vec![]);
+    };
+    let scan = match file_type {
+        FileType::Json => PlanBuilder::scan_json,
+        FileType::Parquet => PlanBuilder::scan_parquet,
+    };
+    match (
+        actions.contains_content_actions(),
+        shape.map(|shape| &shape.checkpoint_type),
+    ) {
+        (false, _) if !actions.contains_non_content_actions() => {
+            PlanBuilder::values(schema, vec![])
+        }
+        (false, _) | (true, Some(CheckpointType::Leaf)) => scan(parts, &[VERSION], schema),
+        (true, None) => Err(KernelError::schema("File reads require a checkpoint shape")),
+        (true, Some(CheckpointType::None)) => PlanBuilder::values(schema, vec![]),
+        (true, Some(CheckpointType::Manifest)) => {
+            let files = match segment.checkpoint_hint_version_tagged_sidecar_scan_files()? {
+                Some(sidecars) => PlanBuilder::scan_parquet(sidecars, &[VERSION], schema.clone()),
+                // Without a complete hint, load the sidecars referenced by the manifest.
+                None => {
+                    sidecar_actions(file_type, parts.clone(), schema.clone(), &segment.log_root)
                 }
+            }?;
+            if !actions.contains_non_content_actions() {
+                return Ok(files);
             }
-            (CheckpointType::None, _) | (_, None) => PlanBuilder::values(schema, vec![]),
-        };
-        planner
-            .build_metadata_scan(available_file_schema, false, |schema| {
-                source(schema)?.filter(Predicate::from_expr(expr!(is_not_null(col("add.path")))))
-            })?
-            .project_patch(|patch| {
-                patch
-                    .append(
-                        FILE_ACTION_KEY_FIELD.clone(),
-                        file_action_key_expr(|col| joined_column_expr!("add", col)),
-                    )
-                    .drop(VERSION)
-            })
+            PlanBuilder::union_all([
+                files.filter(actions.content_predicate())?,
+                scan(parts, &[VERSION], schema)?.filter(actions.non_content_predicate())?,
+            ])
+        }
     }
+}
 
-    /// Build the normalized commit JSON arm.
-    /// When `base_version` is set, only commits newer than that base are read.
-    ///
-    /// ## SQL equivalent:
-    ///
-    /// SELECT STRUCT(
-    ///          add.* EXCEPT (stats_parsed, partitionValues_parsed),
-    ///          FROM_JSON(add.stats, physical_stats) AS stats_parsed,
-    ///          MAP_TO_STRUCT(add.partitionValues, physical_partitions) AS partitionValues_parsed
-    ///        ) AS add,
-    ///        version,
-    ///        file_key(COALESCE(add, remove)) AS key
-    /// FROM json_commits
-    /// WHERE add.path IS NOT NULL OR remove.path IS NOT NULL
-    ///
-    /// A parsed field is omitted when its schema is absent.
-    pub(super) fn commit_arm(
-        &self,
-        base_version: Option<Version>,
-        planner: &MetadataPlanner<'_>,
-    ) -> KernelResult<PlanBuilder> {
-        let log_segment = self.snapshot.log_segment();
-        let commit_files = match base_version {
-            Some(version) => log_segment
-                .segment_after_version(version)
-                .commit_cover_version_tagged_scan_files()?,
-            None => log_segment.commit_cover_version_tagged_scan_files()?,
-        };
-        planner
-            .build_metadata_scan(get_all_actions_schema(), true, |schema| {
-                PlanBuilder::scan_json(commit_files, &[VERSION], schema)?.filter(
-                    Predicate::from_expr(expr!(or(
-                        is_not_null(col("add.path")),
-                        is_not_null(col("remove.path")),
-                    ))),
-                )
-            })?
-            .project_patch(|patch| {
-                patch
-                    .append(
-                        FILE_ACTION_KEY_FIELD.clone(),
-                        file_action_key_expr(|col| {
-                            Expr::coalesce([
-                                joined_column_expr!("add", col),
-                                joined_column_expr!("remove", col),
-                            ])
-                        }),
-                    )
-                    .drop(REMOVE_NAME)
-            })
-    }
+/// Build add rows from CRC files with the supplied `version`.
+/// Requested remove columns are NULL because CRCs contain only live adds.
+pub(crate) fn crc_arm(
+    files: Vec<Add>,
+    version: Version,
+    includes_removes: bool,
+    schema: SchemaRef,
+) -> KernelResult<PlanBuilder> {
+    let version = crate::version_as_i64(version)?;
+    PlanBuilder::values(
+        LOG_ADD_SCHEMA.clone(),
+        files.into_iter().map(|add| vec![add.into()]).collect(),
+    )?
+    .project_patch(|mut patch| {
+        if includes_removes {
+            patch = patch.append(
+                REMOVE_FIELD.clone(),
+                null_lit(REMOVE_FIELD.data_type().clone()),
+            );
+        }
+        let patch = patch.append(StructField::nullable(VERSION, DataType::LONG), lit(version));
+        if schema.field_at(&column_name!(ADD_NAME, STATS)).is_ok() {
+            patch
+        } else {
+            patch.drop_at([ADD_NAME], STATS)
+        }
+    })
+}
+
+/// Build the commit JSON source with file versions in `version`.
+/// When `base_version` is set, only commits newer than that base are read.
+pub(crate) fn commit_arm(
+    log_segment: &LogSegment,
+    base_version: Option<Version>,
+    schema: SchemaRef,
+) -> KernelResult<PlanBuilder> {
+    let commit_files = match base_version {
+        Some(version) => log_segment
+            .segment_after_version(version)
+            .commit_cover_version_tagged_scan_files()?,
+        None => log_segment.commit_cover_version_tagged_scan_files()?,
+    };
+    PlanBuilder::scan_json(commit_files, &[VERSION], schema)
 }
 
 /// Read actions from V2 checkpoint sidecars.
