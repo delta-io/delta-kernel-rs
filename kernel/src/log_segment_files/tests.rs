@@ -228,53 +228,6 @@ fn list_and_destructure(
     )
 }
 
-#[rstest]
-#[case::below_listing_start(3, None, 3, false)]
-#[case::at_checkpoint(0, Some(2), 3, false)]
-#[case::below_checkpoint(0, Some(3), 4, false)]
-#[case::published_entry_takes_precedence(0, None, 2, false)]
-#[case::retained_commit_becomes_latest(0, None, 1, true)]
-fn retain_staged_commits_preserves_listing_boundaries_and_metadata(
-    #[case] listing_start: Version,
-    #[case] checkpoint_version: Option<Version>,
-    #[case] listed_version: Version,
-    #[case] retain_staged: bool,
-) {
-    let path = |version, file_type| {
-        let location = Url::parse("memory:///")
-            .unwrap()
-            .join(&log_path_for_file_type(version, &file_type))
-            .unwrap();
-        ParsedLogPath::new(FileMeta::new(location, 0, 1)).unwrap()
-    };
-    let staged = path(2, StagedCommit);
-    let published = path(listed_version, Commit);
-    let existing = LogSegmentFiles {
-        ascending_commit_files: vec![staged.clone()],
-        latest_commit_file: Some(staged.clone()),
-        ..Default::default()
-    };
-    let mut listed = LogSegmentFiles {
-        ascending_commit_files: vec![published.clone()],
-        latest_commit_file: Some(published),
-        checkpoint_parts: checkpoint_version
-            .map(|version| path(version, ClassicCheckpoint))
-            .into_iter()
-            .collect(),
-        max_published_version: Some(listed_version),
-        ..Default::default()
-    };
-    let mut expected = listed.clone();
-    if retain_staged {
-        expected.ascending_commit_files.push(staged.clone());
-        expected.latest_commit_file = Some(staged);
-    }
-
-    listed.retain_staged_commits(&existing, listing_start);
-
-    assert_eq!(listed, expected);
-}
-
 // ===== list() tests =====
 
 #[tokio::test]

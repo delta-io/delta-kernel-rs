@@ -185,6 +185,7 @@ pub(crate) fn validate_catalog_managed_log_tail(
     let has_staged_commits = log_tail
         .iter()
         .any(|path| path.file_type == LogPathFileType::StagedCommit);
+    // Newly supplied staged commits require a bound even when the tail ends in a downgrade.
     require!(
         !has_staged_commits || max_catalog_version.is_some(),
         KernelError::MaxCatalogVersion(

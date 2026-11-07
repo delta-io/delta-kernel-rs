@@ -58,9 +58,9 @@ pub(crate) enum PublicationWatermark {
 /// Kernel validates the log-segment shape, table configuration, and optional CRC consistency
 /// before constructing the snapshot. It does not replay the log to verify the supplied state's
 /// provenance, and records the connector-provided freshness without validating it.
-/// The caller must ensure that retained staged commits were ratified. Their publication state does
-/// not require a new catalog bound. Without an explicit target, catalog-managed snapshot state
-/// still requires a bound. Explicit targets must respect any supplied bound.
+/// The caller must ensure that retained staged commits were ratified. Staged paths in a hint do not
+/// by themselves require the caller to supply `max_catalog_version`. Without an explicit target, a
+/// catalog-managed snapshot still requires that bound. Explicit targets respect any supplied bound.
 #[derive(Debug, Clone)]
 #[internal_api]
 pub(crate) struct SnapshotHint {
@@ -307,6 +307,8 @@ impl SnapshotHint {
             .as_ref()
             .or_else(|| log_segment_files.ascending_commit_files.last())
             .map(|path| path.version);
+        // Retained staged paths can remain after a published downgrade. Their presence alone does
+        // not impose the MCV requirement for newly supplied catalog tails.
         validate_catalog_managed_versions(
             requested_version,
             max_catalog_version,
@@ -425,6 +427,7 @@ mod tests {
     use crate::unit_test_utils::{
         TestCancellationToken, create_log_path, create_log_path_with_size,
     };
+    use crate::utils::FoldWithOption;
 
     fn hint_from_snapshot(
         snapshot: &SnapshotRef,
@@ -1506,6 +1509,7 @@ mod tests {
     #[test_log::test(tokio::test(flavor = "multi_thread"))]
     async fn snapshot_hint_round_trip_after_incremental_downgrade_and_reupgrade(
         #[case] downgrade_version: Version,
+        #[values(false, true)] explicit_version: bool,
         #[values(None, Some(2), Some(5))] checkpoint_version: Option<Version>,
         #[values(false, true)] skip_new_checkpoints: bool,
         #[values(IncrementalReplay::Disabled, IncrementalReplay::Unlimited)]
@@ -1606,7 +1610,7 @@ mod tests {
                 .checkpoint(engine.as_ref(), None)?;
         }
         let builder = Snapshot::builder_from(cached.clone())
-            .at_version(6)
+            .fold_with(explicit_version.then_some(6), SnapshotBuilder::at_version)
             .with_incremental_crc_replay(replay);
         let builder = if skip_new_checkpoints {
             builder.skip_new_checkpoints()
@@ -1678,12 +1682,19 @@ mod tests {
         assert_eq!(hinted.version(), updated.version());
         assert_eq!(hinted.log_segment().listed, updated.log_segment().listed);
         assert_eq!(hinted.crc_at_version(), updated.crc_at_version());
-        assert_eq!(
-            scan_paths(hinted.clone(), engine.as_ref())?,
-            (1..=6)
-                .map(|version| format!("file_{version}.parquet"))
-                .collect_vec()
-        );
+        let fresh = Snapshot::builder_for(&table_root)
+            .fold_with(explicit_version.then_some(6), SnapshotBuilder::at_version)
+            .build(engine.as_ref())?;
+        assert_eq!(fresh.version(), 6);
+        assert_eq!(fresh.table_configuration(), updated.table_configuration());
+        for snapshot in [fresh, updated, hinted.clone()] {
+            assert_eq!(
+                scan_paths(snapshot, engine.as_ref())?,
+                (1..=6)
+                    .map(|version| format!("file_{version}.parquet"))
+                    .collect_vec()
+            );
+        }
 
         add_commit(&table_root, store.as_ref(), 7, commit_actions(7)).await?;
         let advanced = Snapshot::builder_from(hinted)

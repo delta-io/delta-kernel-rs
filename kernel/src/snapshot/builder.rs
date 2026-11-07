@@ -221,15 +221,16 @@ impl<Mode> SnapshotBuilder<Mode> {
 
     /// Sets the target version of the [`Snapshot`].
     ///
-    /// Without a snapshot hint, omitting this targets the latest table version. With a hint,
-    /// omitting this uses the hint version and its supplied freshness.
+    /// Without a snapshot hint, omitting this uses the supplied
+    /// [`max_catalog_version`](Self::with_max_catalog_version), or discovers the latest version if
+    /// no bound is supplied. With a hint, omitting this uses the hint version and its supplied
+    /// freshness.
     ///
-    /// An explicit target does not require a catalog bound solely because its historical protocol
-    /// is catalog-managed. The caller remains responsible for catalog discovery when required by
-    /// the table's current management state. Staged commits supplied through
-    /// [`with_log_tail`](Self::with_log_tail) require
-    /// [`with_max_catalog_version`](Self::with_max_catalog_version), and any supplied bound
-    /// applies.
+    /// An explicit target does not require a catalog bound solely because that version is
+    /// catalog-managed. The caller must still obtain catalog information when required to read the
+    /// table. Passing any staged paths through [`with_log_tail`](Self::with_log_tail) still
+    /// requires [`with_max_catalog_version`](Self::with_max_catalog_version), even with an
+    /// explicit target. Any supplied bound applies.
     pub fn at_version(mut self, version: Version) -> Self {
         self.version = Some(version);
         self
@@ -238,12 +239,9 @@ impl<Mode> SnapshotBuilder<Mode> {
     /// Set the log tail to use when building the snapshot. This allows catalogs or external
     /// systems to provide an up-to-date log tail when used to build a snapshot.
     ///
-    /// Staged commits must be ratified by the managing catalog. The caller is responsible for
-    /// obtaining this authoritative tail. Discovering a staged file does not establish
-    /// ratification.
+    /// Staged commits supplied in the tail must have been ratified by the managing catalog.
     ///
-    /// Note that the log tail must be a contiguous sequence of commits from M..=N where N is the
-    /// target version of the snapshot and 0 <= M <= N.
+    /// A nonempty tail must be an ascending, contiguous sequence of commits without duplicates.
     ///
     /// See [`with_max_catalog_version`] for additional constraints when loading catalog-managed
     /// tables.
@@ -254,36 +252,23 @@ impl<Mode> SnapshotBuilder<Mode> {
         self
     }
 
-    /// Set the maximum catalog-ratified version. When set, the snapshot will not load versions
-    /// beyond this limit, even if later commits exist on the filesystem. This ensures the catalog
-    /// remains the source of truth for catalog-managed tables.
+    /// Sets the maximum version ratified by the catalog as the snapshot's version bound.
     ///
-    /// When no explicit time-travel version is set via [`at_version`], `max_catalog_version` is
-    /// used as the effective target version. An explicit target must not exceed a supplied bound.
-    /// Without a bound, a latest-version request fails if the resolved protocol is catalog-managed.
-    /// An explicit-version request does not infer current management from historical protocol.
-    /// The bound is authoritative regardless of the resolved management state. Without an explicit
-    /// target, an older available bound selects that older version even for filesystem-managed
-    /// tables.
+    /// Without [`at_version`], the snapshot is built at this version even if newer filesystem
+    /// commits exist. An explicit target must not exceed the bound. These rules apply whether or
+    /// not the resulting snapshot is catalog-managed.
     ///
-    /// The caller must obtain this bound from the catalog, independently of which commits the
-    /// catalog still stores. An empty tail does not remove the need to supply the catalog bound.
-    /// A ratified downgrade can produce a non-catalog-managed snapshot at the bound, and explicit
-    /// time travel can select non-catalog-managed history below it. Publication is not required,
-    /// provided unpublished commits are supplied through the log tail or retained in an existing
-    /// snapshot or complete hint. Published history can be discovered through the filesystem.
-    /// Kernel trusts the bound. It does not load newer protocol state or independently verify a
-    /// management-mode transition.
-    ///
-    /// To discover filesystem commits after a downgrade, refresh without the old catalog bound.
-    /// Repeating a bounded request still returns the bounded version, even if newer commits exist.
+    /// Supply the catalog's bound when loading its latest ratified version, including a downgrade.
+    /// An empty catalog tail does not remove this requirement. Kernel rejects a latest version
+    /// request without a bound if the resulting snapshot is catalog-managed. An explicit target
+    /// does not require a bound solely because that version is catalog-managed.
     ///
     /// # Log tail requirements
     ///
-    /// When a nonempty log tail is supplied with `max_catalog_version` and no time-travel version,
-    /// its last entry must match `max_catalog_version` exactly. When time-travelling, the last log
-    /// tail entry must be >= the requested version. Published history missing from the tail is
-    /// discovered through the filesystem. Supplied catalog commits take precedence over duplicates.
+    /// With a bound and no explicit target, the last log-tail entry, if any, must match the bound.
+    /// With an explicit target, the last entry, if any, must be at least the target version.
+    /// Staged commits supplied through [`with_log_tail`](Self::with_log_tail) require a bound.
+    /// Supplied catalog commits take precedence over filesystem copies at the same version.
     ///
     /// [`at_version`]: Self::at_version
     pub fn with_max_catalog_version(mut self, max_catalog_version: Version) -> Self {
@@ -485,7 +470,8 @@ impl<Mode> SnapshotBuilder<Mode> {
         validate_catalog_managed_log_tail(version, max_catalog_version, log_tail)
     }
 
-    /// Require a catalog bound for latest catalog-managed discovery, not historical protocol.
+    /// Require a catalog bound when a latest version request resolves to a catalog-managed
+    /// snapshot.
     fn validate_catalog_managed_build_result(
         snapshot: &SnapshotRef,
         requested_version: Option<Version>,
@@ -501,8 +487,9 @@ impl<Mode> SnapshotBuilder<Mode> {
                     .to_string()
             )
         );
-        // A catalog bound can select a ratified downgrade or non-catalog-managed history before
-        // an upgrade. Neither requires a staged terminal path or another protocol read.
+        // A non-catalog-managed protocol cannot distinguish a downgrade from an ordinary filesystem
+        // commit. Trust the caller's catalog bound without reading another protocol.
+        // TODO(#3852): Enforce publication before filesystem writes in Transaction::commit.
         Ok(())
     }
 
@@ -1102,6 +1089,7 @@ pub(super) mod tests {
             #[values(false, true)] with_catalog_bound: bool,
             #[values(None, Some(0), Some(1))] base_version: Option<Version>,
         ) -> KernelResult<(), Box<dyn std::error::Error>> {
+            // Given: published history that can cross catalog-managed boundaries.
             let (engine, store, table_root) = setup_test();
             let engine = Arc::new(MeteredDeltaEngine::new(engine));
             let catalog_protocol = Protocol::try_new_modern(
@@ -1160,6 +1148,7 @@ pub(super) mod tests {
                 3
             });
             let max_catalog_version = with_catalog_bound.then_some(catalog_version);
+            // When: build the requested version from the root or an older snapshot.
             let (reporter, _guard) = measuring_reporter();
             let result = if base_version.is_some() {
                 SnapshotBuilder::new_from(base)
@@ -1178,6 +1167,7 @@ pub(super) mod tests {
                     )
                     .build(engine.as_ref())
             };
+            // Then: validate the request, reconstructed state, hint round trip, and replay I/O.
             if (with_catalog_bound && expected_version > catalog_version)
                 || (!with_catalog_bound
                     && requested_version.is_none()
@@ -1244,6 +1234,7 @@ pub(super) mod tests {
             #[values(false, true)] incremental: bool,
             #[values(false, true)] checkpointed: bool,
         ) -> KernelResult<(), Box<dyn std::error::Error>> {
+            // Given: a ratified downgrade with the selected publication and checkpoint state.
             let (engine, store, table_root) = setup_test();
             let engine = Arc::new(MeteredDeltaEngine::new(engine));
             let initial_actions = actions_to_string_catalog_managed(vec![
@@ -1295,6 +1286,7 @@ pub(super) mod tests {
                 add_commit(&table_root, store.as_ref(), 1, downgrade).await?;
             }
 
+            // When: load the downgrade through catalog discovery.
             let (reporter, _guard) = measuring_reporter();
             let result = if incremental {
                 SnapshotBuilder::new_from(base)
@@ -1307,6 +1299,7 @@ pub(super) mod tests {
                     .with_max_catalog_version(1)
                     .build(engine.as_ref())
             };
+            // Then: require available history and preserve normal replay I/O and tail precedence.
             if !published && !supply_tail {
                 assert!(matches!(result, Err(KernelError::MissingVersion(1))));
                 return Ok(());
@@ -1368,31 +1361,25 @@ pub(super) mod tests {
 
         #[derive(Clone, Copy, PartialEq, Eq)]
         enum DowngradeRefresh {
-            Unpublished,
             Published,
-            Checksum,
             EarlierCheckpoint,
             TerminalCheckpoint,
             FilesystemSuccessor,
             Upgrade,
-            MissingPublishedPredecessor,
         }
 
         #[rstest]
-        #[case::empty_listing(1, DowngradeRefresh::Unpublished)]
-        #[case::older_listing(2, DowngradeRefresh::Unpublished)]
-        #[case::published(2, DowngradeRefresh::Published)]
-        #[case::checksum_at_unpublished_version(2, DowngradeRefresh::Checksum)]
-        #[case::new_checkpoint_before_downgrade(2, DowngradeRefresh::EarlierCheckpoint)]
-        #[case::new_checkpoint_at_downgrade(2, DowngradeRefresh::TerminalCheckpoint)]
-        #[case::new_filesystem_commit(2, DowngradeRefresh::FilesystemSuccessor)]
-        #[case::new_upgrade_requires_catalog_bound(2, DowngradeRefresh::Upgrade)]
-        #[case::missing_published_history(3, DowngradeRefresh::MissingPublishedPredecessor)]
+        #[case::published(DowngradeRefresh::Published)]
+        #[case::new_checkpoint_before_downgrade(DowngradeRefresh::EarlierCheckpoint)]
+        #[case::new_checkpoint_at_downgrade(DowngradeRefresh::TerminalCheckpoint)]
+        #[case::new_filesystem_commit(DowngradeRefresh::FilesystemSuccessor)]
+        #[case::new_upgrade_requires_catalog_bound(DowngradeRefresh::Upgrade)]
         #[test_log::test(tokio::test(flavor = "multi_thread"))]
-        async fn test_cached_downgrade_refresh_uses_retained_ratified_history(
-            #[case] downgrade_version: Version,
+        async fn test_cached_downgrade_refresh_after_publication(
             #[case] refresh: DowngradeRefresh,
         ) -> KernelResult<(), Box<dyn std::error::Error>> {
+            // Given: a cached snapshot of a ratified downgrade before publication.
+            let downgrade_version = 2;
             let (engine, store, table_root) = setup_catalog_managed_test().await;
             let engine = Arc::new(MeteredDeltaEngine::new(engine));
             for version in 1..downgrade_version {
@@ -1423,19 +1410,9 @@ pub(super) mod tests {
                 .build(engine.as_ref());
             assert!(matches!(missing, Err(KernelError::MissingVersion(_))));
 
-            if matches!(
-                refresh,
-                DowngradeRefresh::Published
-                    | DowngradeRefresh::TerminalCheckpoint
-                    | DowngradeRefresh::FilesystemSuccessor
-                    | DowngradeRefresh::Upgrade
-            ) {
-                add_commit(&table_root, store.as_ref(), downgrade_version, downgrade).await?;
-            }
+            // When: publish the downgrade and discover any later filesystem changes.
+            add_commit(&table_root, store.as_ref(), downgrade_version, downgrade).await?;
             match refresh {
-                DowngradeRefresh::Checksum => {
-                    source.clone().write_checksum(engine.as_ref())?;
-                }
                 DowngradeRefresh::EarlierCheckpoint | DowngradeRefresh::TerminalCheckpoint => {
                     let version = if refresh == DowngradeRefresh::EarlierCheckpoint {
                         downgrade_version - 1
@@ -1460,25 +1437,14 @@ pub(super) mod tests {
                     };
                     add_commit(&table_root, store.as_ref(), downgrade_version + 1, actions).await?;
                 }
-                DowngradeRefresh::MissingPublishedPredecessor => {
-                    store
-                        .delete(&test_utils::delta_path_for_version(
-                            downgrade_version - 1,
-                            "json",
-                        ))
-                        .await?;
-                }
-                DowngradeRefresh::Unpublished | DowngradeRefresh::Published => {}
+                DowngradeRefresh::Published => {}
             }
 
             let (reporter, _guard) = measuring_reporter();
             let result = Snapshot::builder_from(source.clone()).build(engine.as_ref());
+            // Then: preserve the source snapshot and require a catalog bound after re-upgrade.
             assert_eq!(source.log_segment().listed, source_files);
             match refresh {
-                DowngradeRefresh::MissingPublishedPredecessor => {
-                    assert!(matches!(result, Err(KernelError::MissingVersion(version))
-                        if version == downgrade_version - 1));
-                }
                 DowngradeRefresh::Upgrade => {
                     assert!(matches!(result, Err(KernelError::MaxCatalogVersion(_))));
                 }
@@ -1490,12 +1456,7 @@ pub(super) mod tests {
                             + u64::from(refresh == DowngradeRefresh::FilesystemSuccessor)
                     );
                     assert!(!updated.table_configuration().is_catalog_managed());
-                    if matches!(
-                        refresh,
-                        DowngradeRefresh::Unpublished
-                            | DowngradeRefresh::Published
-                            | DowngradeRefresh::Checksum
-                    ) {
+                    if refresh == DowngradeRefresh::Published {
                         assert!(Arc::ptr_eq(&updated, &source));
                         assert!(!reporter.events().iter().any(|event| matches!(
                             event,
@@ -1538,13 +1499,14 @@ pub(super) mod tests {
         #[case::two_retained(3, None)]
         #[case::published_prefix(3, Some(2))]
         #[test_log::test(tokio::test(flavor = "multi_thread"))]
-        async fn test_incremental_catalog_tail_reuses_retained_staged_commits(
+        async fn test_incremental_catalog_tail_matches_full_replay(
             #[case] source_version: Version,
             #[case] publish_through: Option<Version>,
             #[values(false, true)] explicit_version: bool,
             #[values(false, true)] restore_hint: bool,
             #[values(false, true)] new_checkpoint: bool,
         ) -> KernelResult<(), Box<dyn std::error::Error>> {
+            // Given: cached catalog history and a complete ratified tail through the new target.
             let (engine, store, table_root) = setup_catalog_managed_test().await;
             add_commit(
                 &table_root,
@@ -1597,8 +1559,9 @@ pub(super) mod tests {
                     .build(engine.as_ref())?
                     .checkpoint(engine.as_ref(), None)?;
             }
+            // When: refresh from the snapshot using the catalog tail, including cached versions.
             let updated = Snapshot::builder_from(source)
-                .with_log_tail(vec![tail.last().unwrap().clone()])
+                .with_log_tail(tail.clone())
                 .with_max_catalog_version(target_version)
                 .fold_with(
                     explicit_version.then_some(target_version),
@@ -1609,6 +1572,7 @@ pub(super) mod tests {
                 .with_log_tail(tail)
                 .with_max_catalog_version(target_version)
                 .build(engine.as_ref())?;
+            // Then: full, incremental, and hinted reads agree on the log and scanned files.
             assert_eq!(updated.version(), target_version);
             assert_eq!(updated.table_configuration(), fresh.table_configuration());
             assert_eq!(updated.log_segment().listed, fresh.log_segment().listed);
@@ -1642,6 +1606,7 @@ pub(super) mod tests {
             #[case] changed_metadata: bool,
             #[values(false, true)] staged_snapshot: bool,
         ) -> KernelResult<(), Box<dyn std::error::Error>> {
+            // Given: a published downgrade cached using either its staged or published path.
             let (engine, store, table_root) = setup_catalog_managed_test().await;
             let engine = Arc::new(MeteredDeltaEngine::new(engine));
             let downgrade = json!({
@@ -1679,11 +1644,13 @@ pub(super) mod tests {
                 }
                 Some(true) => vec![staged],
             };
+            // When: request the same catalog version with independently reported file metadata.
             let (reporter, _guard) = measuring_reporter();
             let result = SnapshotBuilder::new_from(snapshot.clone())
                 .with_log_tail(log_tail)
                 .with_max_catalog_version(1)
                 .build(engine.as_ref())?;
+            // Then: reuse the immutable snapshot without rereading the commit.
             assert!(Arc::ptr_eq(&snapshot, &result));
             assert!(!reporter.events().iter().any(|event| matches!(
                 event,
@@ -1745,6 +1712,7 @@ pub(super) mod tests {
         async fn test_catalog_downgrade_stays_bounded_after_publication_without_io_on_reuse(
             #[values(false, true)] with_checksum: bool,
         ) -> KernelResult<(), Box<dyn std::error::Error>> {
+            // Given: a cached ratified downgrade whose publication may advance independently.
             let (engine, store, table_root) = setup_catalog_managed_test().await;
             let engine = Arc::new(MeteredDeltaEngine::new(engine));
             let downgrade = format!(
@@ -1778,6 +1746,7 @@ pub(super) mod tests {
                 snapshot
             };
             let hint = snapshot.to_snapshot_hint()?;
+            // When: repeat the catalog-bounded request before and after filesystem advancement.
             for published in [false, true] {
                 if published {
                     add_commit(&table_root, store.as_ref(), 1, downgrade.clone()).await?;
@@ -1794,6 +1763,7 @@ pub(super) mod tests {
                     .with_log_tail(log_tail.clone())
                     .with_max_catalog_version(1)
                     .build(engine.as_ref())?;
+                // Then: cached reuse and hint reconstruction stay at the bound without I/O.
                 assert!(Arc::ptr_eq(&snapshot, &reused));
                 assert_eq!(reused.version(), 1);
                 let without_tail = SnapshotBuilder::new_from(snapshot.clone())
@@ -1848,6 +1818,7 @@ pub(super) mod tests {
                 .with_snapshot_hint(published_only.to_snapshot_hint()?)
                 .build(engine.as_ref())?;
             assert_eq!(hinted.version(), 1);
+            // Without the old bound, discovery can advance to the published filesystem successor.
             let latest = SnapshotBuilder::new_from(snapshot).build(engine.as_ref())?;
             assert_eq!(latest.version(), 2);
             assert!(!latest.table_configuration().is_catalog_managed());
@@ -1862,6 +1833,7 @@ pub(super) mod tests {
             #[case] catalog_feature: &str,
             #[values(false, true)] incremental: bool,
         ) -> KernelResult<(), Box<dyn std::error::Error>> {
+            // Given: a table that repeatedly downgrades and re-upgrades.
             let (engine, store, table_root) = setup_test();
             add_commit(
                 &table_root,
@@ -1889,6 +1861,7 @@ pub(super) mod tests {
             })
             .to_string();
 
+            // When: read each boundary with its catalog bound.
             for downgrade_version in [1, 3] {
                 let staged = add_staged_commit(
                     &table_root,
@@ -1952,6 +1925,7 @@ pub(super) mod tests {
                 }?;
                 assert_eq!(snapshot.version(), upgrade_version);
                 assert!(snapshot.table_configuration().is_catalog_managed());
+                // Then: a latest version request after re-upgrade still requires a bound.
                 let without_catalog_bound =
                     SnapshotBuilder::new_from(snapshot.clone()).build(engine.as_ref());
                 assert!(matches!(

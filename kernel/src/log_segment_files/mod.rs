@@ -529,35 +529,6 @@ impl LogSegmentFiles {
         &mut self.ascending_commit_files
     }
 
-    /// Retains cached ratified staged commits missing from this listing's replay range.
-    pub(crate) fn retain_staged_commits(&mut self, existing: &Self, listing_start: Version) {
-        let checkpoint_version = self.checkpoint_parts.first().map(|path| path.version);
-        let missing: Vec<_> = existing
-            .staged_commits()
-            .filter(|path| {
-                path.version >= listing_start
-                    && checkpoint_version.is_none_or(|version| path.version > version)
-            })
-            .filter(|path| {
-                self.ascending_commit_files
-                    .binary_search_by_key(&path.version, |listed| listed.version)
-                    .is_err()
-            })
-            .cloned()
-            .collect();
-        if missing.is_empty() {
-            return;
-        }
-        // Retained staged entries are known ratified even without a new catalog tail. Merge after
-        // listing so they cannot hide newer filesystem commits. Missing published entries remain
-        // subject to the segment's gap and version-regression checks.
-        self.ascending_commit_files = std::mem::take(&mut self.ascending_commit_files)
-            .into_iter()
-            .merge_by(missing, |left, right| left.version < right.version)
-            .collect();
-        self.latest_commit_file = self.ascending_commit_files.last().cloned();
-    }
-
     pub(crate) fn checkpoint_parts(&self) -> &Vec<ParsedLogPath> {
         &self.checkpoint_parts
     }

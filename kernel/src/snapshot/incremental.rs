@@ -53,6 +53,9 @@ impl Snapshot {
     ///
     /// The log listing is catalog-log-tail aware: any `log_tail` provided to the builder is
     /// merged with filesystem listings.
+    /// [`SnapshotBuilder::build`] validates catalog inputs before this update and requires a
+    /// catalog bound when a latest version request returns a catalog-managed snapshot, including
+    /// cached reuse.
     ///
     /// Position layout per case (`....` is the version axis; `====` marks the range read for
     /// P+M replay; `listed` is the listing range; `read` is what's read for P+M):
@@ -99,6 +102,7 @@ impl Snapshot {
     ///
     /// [`SnapshotBuilder::at_version`]: crate::snapshot::SnapshotBuilder::at_version
     /// [`SnapshotBuilder::with_max_catalog_version`]: crate::snapshot::SnapshotBuilder::with_max_catalog_version
+    /// [`SnapshotBuilder::build`]: crate::snapshot::SnapshotBuilder::build
     #[allow(clippy::too_many_arguments)]
     #[instrument(skip_all, fields(path = %existing_snapshot.table_root(), enable_call_frame, version, operation_id = %metric_context.operation_id, correlation_id = metric_context.correlation_id.as_deref().unwrap_or(""), incremental_replay = ?incremental_replay, built_as_latest = built_as_latest))]
     pub(super) fn try_new_from(
@@ -352,7 +356,7 @@ impl Snapshot {
             // No version can follow Version::MAX.
             return Ok(NewSegment::Unchanged);
         };
-        let mut new_listed_files = LogSegmentFiles::list_with_checkpoint_handling(
+        let new_listed_files = LogSegmentFiles::list_with_checkpoint_handling(
             storage.as_ref(),
             &log_root,
             log_tail,
@@ -378,8 +382,7 @@ impl Snapshot {
             };
         }
 
-        new_listed_files.retain_staged_commits(&existing_log_segment.listed, listing_start);
-
+        // TODO(#3851): Combine cached staged history before validating a shorter catalog tail.
         // TODO(#3834): Validate the leading replay boundary without a covering checkpoint.
         // create a log segment just from existing_checkpoint.version -> new_version
         // OR could be from 1 -> new_version

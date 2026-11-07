@@ -125,10 +125,10 @@ pub unsafe extern "C" fn get_snapshot_builder_from(
 /// latest listed version. A hint and explicit target must match or build returns
 /// `InvalidSnapshotHint`.
 ///
-/// An explicit target does not require a catalog bound solely because its historical protocol is
-/// catalog-managed. The caller remains responsible for catalog discovery for the table's current
-/// management state. Staged commits supplied through [`snapshot_builder_with_log_tail`] require a
-/// bound, and any supplied bound still applies.
+/// An explicit target does not require a catalog bound solely because that version is
+/// catalog-managed. The caller must still obtain catalog information when required to read the
+/// table. Passing any staged paths through [`snapshot_builder_with_log_tail`] still requires a
+/// bound, even with an explicit target. Any supplied bound applies.
 ///
 /// # Safety
 ///
@@ -167,8 +167,7 @@ pub unsafe extern "C" fn snapshot_builder_with_incremental_crc_replay(
 
 /// Set the catalog-supplied log tail on a snapshot builder.
 ///
-/// Staged commits must be ratified by the managing catalog. The caller is responsible for
-/// obtaining this authoritative tail. Discovering a staged file does not establish ratification.
+/// Staged commits supplied in the tail must have been ratified by the managing catalog.
 ///
 /// # Errors
 ///
@@ -196,12 +195,13 @@ pub unsafe extern "C" fn snapshot_builder_with_log_tail(
 
 /// Bound the snapshot version to what the catalog has ratified.
 ///
-/// Without an explicit target, this selects the catalog version even when the resulting snapshot
-/// is non-catalog-managed, such as a ratified downgrade. Publication is not required, provided
-/// unpublished commits are supplied through the log tail or retained in an existing snapshot or
-/// complete hint. Published history can be discovered through the filesystem.
-/// An empty catalog tail does not remove the need to supply its bound. A latest version request
-/// resolving to catalog-managed state without a bound fails with `MaxCatalogVersionError`.
+/// Without an explicit target, this selects the catalog version even if newer filesystem commits
+/// exist. An explicit target must not exceed the bound. These rules apply whether or not the
+/// resulting snapshot is catalog-managed.
+///
+/// Supply the catalog's bound when loading its latest ratified version, including a downgrade.
+/// An empty catalog tail does not remove this requirement. A latest version request that returns
+/// a catalog-managed snapshot without a bound fails with `MaxCatalogVersionError`.
 ///
 /// # Safety
 ///

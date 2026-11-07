@@ -89,12 +89,18 @@ return a suffix of recent commits, not the full history). When you supply
 - With `.at_version(v)`, `N` must be `>= v`, and `v` must not exceed
   `max_catalog_version`.
 
-If you supply staged paths through `with_log_tail`, you must also supply `max_catalog_version`.
-This requirement applies even when those commits have published copies in `_delta_log/`.
-A tail containing only published paths doesn't itself require a catalog bound.
+If the tail passed to `with_log_tail` contains any staged paths, you must supply `max_catalog_version`,
+even for an explicit-version load using `.at_version(v)`. This requirement applies even when
+those commits have published copies in `_delta_log/`. A nonempty tail containing only published
+paths doesn't itself require a catalog bound.
 
 The order of `.at_version()`, `.with_log_tail()`, and `.with_max_catalog_version()`
 doesn't matter.
+
+For incremental updates, supply the catalog's current tail, including unpublished commits
+already represented in the cached Snapshot. Supplying only the new suffix can fail before
+Kernel combines it with the cached history. Support for that shorter tail is tracked in
+[issue #3851](https://github.com/delta-io/delta-kernel-rs/issues/3851).
 
 The log tail can overlap with published commits already in `_delta_log/`. For any
 version present in both, Kernel uses the log-tail entry, as the Delta spec requires
@@ -111,21 +117,42 @@ travel. The requested version must not exceed the bound, regardless of the proto
 that version. Without an explicit target, Kernel rejects a Snapshot whose protocol is
 catalog-managed unless you supply a bound.
 
-For an explicit target, Kernel doesn't require a bound solely because that historical
+For an explicit target, Kernel doesn't require a bound solely because that
 version was catalog-managed. For example, after a published downgrade, you can read an
 earlier catalog-managed version from published history without a bound. Your connector
-must still perform catalog discovery when required by the table's current management
-state. Kernel doesn't load newer protocol state to validate this obligation.
+must still obtain catalog information when required to read the table. Kernel doesn't
+load newer protocol state to validate this obligation. The explicit-version exemption
+also applies when the requested version happens to be the latest.
 
-Retained staged paths in an existing Snapshot or complete snapshot hint don't themselves
-require a new bound: their ratification is already part of the Snapshot or hint's contract.
-Any supplied bound still applies to an explicit target.
+Staged paths retained in an existing Snapshot or complete snapshot hint don't by themselves
+require you to supply a bound. For example, a filesystem-managed Snapshot can retain historical
+staged paths after their commits were published and the table was downgraded. Any supplied bound
+still applies to an explicit target.
 
-A catalog-ratified downgrade produces a non-catalog-managed Snapshot. You can read it
-with the catalog bound when its commit is supplied in the catalog tail, or already
-published and omitted from that tail. An unpublished commit must remain available through
-the supplied tail or a retained Snapshot or complete hint. To discover later filesystem
-commits, refresh without the old bound.
+To load the catalog's latest ratified version, supply its bound and available tail for both
+fresh and incremental builds, including when that version is a downgrade. An empty tail is
+valid if the required history is otherwise available. A staged file's existence alone doesn't
+prove ratification, so obtain staged entries from the catalog.
+
+A ratified downgrade produces a non-catalog-managed Snapshot. Kernel cannot distinguish it
+from an ordinary filesystem commit using that protocol alone. It therefore cannot always
+reject a missing bound at a downgrade. It does reject a missing bound when a latest version
+request returns a catalog-managed Snapshot, including at an upgrade, or when you supply staged
+paths through `with_log_tail`.
+
+After the downgrade is published, refresh without the old bound to discover later filesystem
+commits. Keeping the old bound still selects the downgrade version when you omit `.at_version()`.
+Newer filesystem commits don't invalidate that bounded read.
+
+For example, suppose version 5 downgrades the table and version 6 is its latest filesystem commit.
+Both are published, and the filesystem contains the history needed to read them. For a fresh
+build with no log tail or snapshot hint:
+
+| Explicit target | `max_catalog_version` | Result |
+|-----------------|-----------------------|--------|
+| Omitted | `5` | Read version 5, even though version 6 exists and version 5 is no longer catalog-managed. |
+| `.at_version(6)` | `5` | Reject with `MaxCatalogVersion` because the requested version exceeds the bound. |
+| Omitted | Omitted | Discover and read version 6. |
 
 ## Publication evidence and snapshot reuse
 

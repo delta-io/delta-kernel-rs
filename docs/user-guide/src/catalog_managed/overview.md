@@ -154,9 +154,9 @@ Kernel:
 
 - **`SnapshotBuilder::with_max_catalog_version(Version)`** caps the snapshot
   version at the catalog's latest ratified version. Kernel requires this for
-  latest version requests that resolve to catalog-managed state and for staged
-  commits supplied through `with_log_tail`. Explicit-version reads don't infer
-  the table's current management state from its historical protocol. Staged paths
+  latest version requests that return a catalog-managed Snapshot and for staged
+  commits supplied through `with_log_tail`. An explicit target doesn't require
+  the bound solely because that version is catalog-managed. Staged paths
   retained in an existing snapshot or complete hint don't independently require
   a bound. See [Reading catalog-managed tables](./reading.md) for time-travel and
   downgrade behavior.
