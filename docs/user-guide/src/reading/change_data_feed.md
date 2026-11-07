@@ -27,8 +27,7 @@ version, and an optional end version to
 # use delta_kernel_default_engine::DefaultEngine;
 # use delta_kernel_default_engine::storage::store_from_url;
 # use delta_kernel::table_changes::TableChanges;
-# use delta_kernel::KernelResult;
-# fn example() -> KernelResult<()> {
+# fn example() -> delta_kernel::Result<()> {
 # let url = delta_kernel::try_parse_uri("/tmp/my-table")?;
 # let store = store_from_url(&url)?;
 # let engine = DefaultEngine::builder(store).build();
@@ -47,8 +46,7 @@ table at the time of the call.
 # use delta_kernel_default_engine::DefaultEngine;
 # use delta_kernel_default_engine::storage::store_from_url;
 # use delta_kernel::table_changes::TableChanges;
-# use delta_kernel::KernelResult;
-# fn example() -> KernelResult<()> {
+# fn example() -> delta_kernel::Result<()> {
 # let url = delta_kernel::try_parse_uri("/tmp/my-table")?;
 # let store = store_from_url(&url)?;
 # let engine = DefaultEngine::builder(store).build();
@@ -64,7 +62,7 @@ let table_changes = TableChanges::try_new("/tmp/my-table", &engine, 0, None)?;
 - The table schema at the start and end versions must be identical.
 - No unsupported reader features (other than deletion vectors) are enabled.
 
-If any check fails, it returns a `KernelError`.
+If any check fails, `try_new` returns an error.
 
 ## CDF metadata columns
 
@@ -94,8 +92,8 @@ project columns with `with_schema` and filter rows with `with_predicate`.
 # use delta_kernel_default_engine::storage::store_from_url;
 # use delta_kernel::expressions::{col, lit};
 # use delta_kernel::table_changes::TableChanges;
-# use delta_kernel::{KernelResult, Predicate};
-# fn example() -> KernelResult<()> {
+# use delta_kernel::Predicate;
+# fn example() -> delta_kernel::Result<()> {
 # let url = delta_kernel::try_parse_uri("/tmp/my-table")?;
 # let store = store_from_url(&url)?;
 # let engine = DefaultEngine::builder(store).build();
@@ -151,8 +149,7 @@ after building the scan), use `scan_builder` on an `Arc<TableChanges>` instead o
 # use delta_kernel_default_engine::DefaultEngine;
 # use delta_kernel_default_engine::storage::store_from_url;
 # use delta_kernel::table_changes::TableChanges;
-# use delta_kernel::KernelResult;
-# fn example() -> KernelResult<()> {
+# fn example() -> delta_kernel::Result<()> {
 # let url = delta_kernel::try_parse_uri("/tmp/my-table")?;
 # let store = store_from_url(&url)?;
 # let engine = DefaultEngine::builder(store).build();

@@ -10,7 +10,7 @@
 //! # use std::sync::Arc;
 //! # use test_utils::delta_kernel_default_engine::{DefaultEngine, DefaultEngineBuilder};
 //! # use delta_kernel::expressions::{col, lit};
-//! # use delta_kernel::{Predicate, Snapshot, SnapshotRef, KernelError, Engine};
+//! # use delta_kernel::{Predicate, Snapshot, SnapshotRef, Engine};
 //! # use delta_kernel::table_changes::TableChanges;
 //! let path = "./tests/data/table-with-cdf";
 //! # let url = delta_kernel::try_parse_uri(path)?;
@@ -34,7 +34,7 @@
 //!
 //! // Execute the table changes scan to get a fallible iterator of `Box<dyn EngineData>`s
 //! let table_change_batches = table_changes_scan.execute(engine.clone())?;
-//! # Ok::<(), KernelError>(())
+//! # Ok::<(), delta_kernel::Error>(())
 //! ```
 use std::sync::{Arc, LazyLock};
 
@@ -55,7 +55,7 @@ use crate::table_properties::{
     MATERIALIZED_ROW_COMMIT_VERSION_COLUMN_NAME, MATERIALIZED_ROW_ID_COLUMN_NAME,
 };
 use crate::utils::{require, try_parse_uri};
-use crate::{Engine, KernelError, KernelResult, KernelResultIterator, Version};
+use crate::{Engine, KernelError, KernelResult, KernelResultIterator, Result, Version};
 
 mod log_replay;
 mod net_changes;
@@ -212,13 +212,13 @@ static CDF_FIELDS: LazyLock<[StructField; 3]> = LazyLock::new(|| {
 ///  Get `TableChanges` for versions 0 to 1 (inclusive)
 ///  ```rust
 ///  # use test_utils::delta_kernel_default_engine::{storage::store_from_url, DefaultEngineBuilder};
-///  # use delta_kernel::{SnapshotRef, KernelError};
+///  # use delta_kernel::SnapshotRef;
 ///  # use delta_kernel::table_changes::TableChanges;
 ///  let path = "./tests/data/table-with-cdf";
 ///  # let url = delta_kernel::try_parse_uri(path)?;
 ///  # let engine = DefaultEngineBuilder::new(store_from_url(&url)?).build();
 ///  let table_changes = TableChanges::try_new(path, &engine, 0, Some(1))?;
-///  # Ok::<(), KernelError>(())
+///  # Ok::<(), delta_kernel::Error>(())
 ///  ````
 /// For more details, see the following sections of the protocol:
 /// - [Add CDC File](https://github.com/delta-io/delta/blob/master/PROTOCOL.md#add-cdc-file)
@@ -259,7 +259,7 @@ impl TableChanges {
         engine: &dyn Engine,
         start_version: Version,
         end_version: Option<Version>,
-    ) -> KernelResult<Self> {
+    ) -> Result<Self> {
         let table_root = try_parse_uri(table_root)?;
         Self::try_new_internal(
             table_root,
@@ -301,7 +301,7 @@ impl TableChanges {
         engine: &dyn Engine,
         start_version: Version,
         end_version: Option<Version>,
-    ) -> KernelResult<Self> {
+    ) -> Result<Self> {
         Self::try_new_internal(
             table_root,
             engine,
@@ -317,8 +317,8 @@ impl TableChanges {
         start_version: Version,
         end_version: Option<Version>,
         mode: CdfMode,
-    ) -> KernelResult<Self> {
-        let log_root = table_root.join("_delta_log/")?;
+    ) -> Result<Self> {
+        let log_root = table_root.join("_delta_log/").map_err(KernelError::from)?;
         let log_segment = LogSegment::for_table_changes(
             engine.storage_handler().as_ref(),
             log_root,
@@ -371,6 +371,7 @@ impl TableChanges {
                     end_snapshot.version(),
                     MATERIALIZED_ROW_ID_COLUMN_NAME
                 ))
+                .into()
             );
             require!(
                 properties
@@ -381,6 +382,7 @@ impl TableChanges {
                     end_snapshot.version(),
                     MATERIALIZED_ROW_COMMIT_VERSION_COLUMN_NAME
                 ))
+                .into()
             );
         }
 
@@ -389,7 +391,9 @@ impl TableChanges {
         let start_schema = start_snapshot.schema();
         let end_schema = end_snapshot.schema();
         if !mode.schemas_compatible(start_schema.as_ref(), end_schema.as_ref()) {
-            return Err(mode.boundary_schema_error(start_schema.as_ref(), end_schema.as_ref()));
+            return Err(mode
+                .boundary_schema_error(start_schema.as_ref(), end_schema.as_ref())
+                .into());
         }
 
         let schema = try_schema! {
@@ -578,7 +582,7 @@ mod tests {
         Action, LocalMockTable, assert_result_error_with_message,
         test_schema_flat_with_column_mapping,
     };
-    use crate::{Engine, KernelError};
+    use crate::{Engine, Error, KernelError};
 
     fn listing_test_schema() -> Arc<StructType> {
         schema_ref! {
@@ -617,7 +621,7 @@ mod tests {
             );
             assert!(matches!(
                 res,
-                Err(KernelError::ChangeDataFeedUnsupported(_))
+                Err(Error::Kernel(KernelError::ChangeDataFeedUnsupported(_)))
             ))
         }
     }
@@ -630,7 +634,10 @@ mod tests {
 
         // A field in the schema goes from being nullable to non-nullable
         let table_changes_res = TableChanges::try_new(url, engine.as_ref(), 3, Some(4));
-        assert!(matches!(table_changes_res, Err(KernelError::Generic(msg)) if msg == expected_msg));
+        assert!(matches!(
+            table_changes_res,
+            Err(Error::Kernel(KernelError::Generic(msg))) if msg == expected_msg
+        ));
     }
 
     #[rstest::rstest]
@@ -680,7 +687,10 @@ mod tests {
             path.to_str().unwrap().to_owned()
         };
         let result = TableChanges::try_new(table_root, &SyncEngine::new(), 0, Some(1));
-        assert!(matches!(result, Err(KernelError::InvalidTableLocation(_))));
+        assert!(matches!(
+            result,
+            Err(Error::Kernel(KernelError::InvalidTableLocation(_)))
+        ));
     }
 
     #[test]
@@ -743,7 +753,12 @@ mod tests {
         let url = delta_kernel::try_parse_uri(path).unwrap();
         let res = TableChanges::try_new_row_tracking_cdf_listing(url, engine.as_ref(), 0, Some(1));
         assert!(
-            matches!(&res, Err(KernelError::RowTrackingChangeFeedUnsupported(_))),
+            matches!(
+                &res,
+                Err(Error::Kernel(
+                    KernelError::RowTrackingChangeFeedUnsupported(_)
+                ))
+            ),
             "expected a row-tracking-disabled error, got {res:?}"
         );
     }
@@ -794,7 +809,9 @@ mod tests {
         assert!(
             matches!(
                 &res,
-                Err(KernelError::ChangeDataFeedIncompatibleSchema(_, _))
+                Err(Error::Kernel(
+                    KernelError::ChangeDataFeedIncompatibleSchema(_, _)
+                ))
             ),
             "expected an incompatible start schema to be rejected, got {res:?}"
         );

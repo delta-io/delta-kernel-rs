@@ -97,15 +97,36 @@ impl DeltaError {
         &self.backtrace
     }
 
+    /// Creates a `DELTA_PATH_DOES_NOT_EXIST` error for a table root that does not exist or has no
+    /// Delta log.
+    ///
+    /// `path` is the table root as the caller supplied it. `source` is the error that detected
+    /// the missing table and is preserved for downcasting through [`StdError::source`].
+    ///
+    /// ```
+    /// use delta_kernel::{DeltaError, DeltaErrorCondition};
+    /// use std::error::Error as _;
+    /// use std::io;
+    ///
+    /// let source = io::Error::from(io::ErrorKind::NotFound);
+    /// let error = DeltaError::path_does_not_exist("/path/to/table", source);
+    /// assert_eq!(error.condition(), DeltaErrorCondition::DeltaPathDoesNotExist);
+    /// assert_eq!(error.parameters()[0].value(), "/path/to/table");
+    /// let source = error.source().unwrap().downcast_ref::<io::Error>().unwrap();
+    /// assert_eq!(source.kind(), io::ErrorKind::NotFound);
+    /// ```
+    pub fn path_does_not_exist(path: &str, source: impl StdError + Send + Sync + 'static) -> Self {
+        Self::new(
+            DeltaErrorCondition::DeltaPathDoesNotExist,
+            vec![DeltaErrorParameter::new("path", path)],
+            Some(Box::new(source)),
+        )
+    }
+
     /// Creates an error with an optional diagnostic cause and captures its backtrace.
     ///
     /// `parameters` must contain exactly [`DeltaErrorCondition::parameter_names`], in that order.
     /// Condition-specific factories must maintain this invariant.
-    // TODO(#3421): Remove this dead code attribute when the first delta error factory is introduced
-    #[allow(
-        dead_code,
-        reason = "Reserved for condition-specific factories (see #3421)."
-    )]
     fn new(
         condition: DeltaErrorCondition,
         parameters: Vec<DeltaErrorParameter>,
@@ -177,11 +198,6 @@ impl DeltaErrorParameter {
         &self.value
     }
 
-    // TODO(#3421): Remove this dead code attribute when the first delta error factory is introduced
-    #[allow(
-        dead_code,
-        reason = "Reserved for condition-specific factories (see #3421)."
-    )]
     fn new(name: &'static str, value: impl ToString) -> Self {
         Self {
             name,

@@ -45,7 +45,7 @@ use delta_kernel::transaction::{CommitResult, UpdateTableOperation};
 use delta_kernel::{KernelResult, Snapshot};
 
 #[tokio::main]
-async fn main() -> KernelResult<()> {
+async fn main() -> KernelResult<(), Box<dyn std::error::Error>> {
     let table_path = std::env::args()
         .nth(1)
         .expect("usage: delta_write_example <TABLE_DIR>");
