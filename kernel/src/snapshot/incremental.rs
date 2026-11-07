@@ -382,7 +382,8 @@ impl Snapshot {
             };
         }
 
-        // TODO(#3851): Combine cached staged history before validating a shorter catalog tail.
+        // TODO(#3851): Combine cached staged history before validating a new listing, including
+        // requests with a shortened or absent catalog tail.
         // TODO(#3834): Validate the leading replay boundary without a covering checkpoint.
         // create a log segment just from existing_checkpoint.version -> new_version
         // OR could be from 1 -> new_version
@@ -397,8 +398,6 @@ impl Snapshot {
 
         let new_end_version = new_log_segment.end_version;
         if new_end_version < existing_snapshot_version {
-            // we should never see a new log segment with a version < the existing snapshot
-            // version, that would mean a commit was incorrectly deleted from the log
             return Err(KernelError::invalid_log_segment(format!(
                 "Unexpected state: the newest version in the log {new_end_version} is \
                  older than the existing snapshot version {existing_snapshot_version}"

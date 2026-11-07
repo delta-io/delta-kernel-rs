@@ -9,7 +9,7 @@ use crate::crc::Crc;
 use crate::error::SnapshotHintError;
 use crate::last_checkpoint_hint::LastCheckpointHint;
 use crate::log_path::LogPath;
-use crate::log_segment::{LogSegment, validate_catalog_managed_versions};
+use crate::log_segment::{LogSegment, validate_catalog_version_bounds};
 use crate::log_segment_files::{CheckpointHandling, LogSegmentFiles};
 use crate::path::{DELTA_LOG_DIR_WITH_SLASH, LogPathFileType, ParsedLogPath};
 use crate::snapshot::{IncrementalReplay, SnapshotRef};
@@ -60,7 +60,8 @@ pub(crate) enum PublicationWatermark {
 /// provenance, and records the connector-provided freshness without validating it.
 /// The caller must ensure that retained staged commits were ratified. Staged paths in a hint do not
 /// by themselves require the caller to supply `max_catalog_version`. Without an explicit target, a
-/// catalog-managed snapshot still requires that bound. Explicit targets respect any supplied bound.
+/// catalog-managed snapshot still requires that bound. Explicit targets must not exceed a supplied
+/// bound.
 #[derive(Debug, Clone)]
 #[internal_api]
 pub(crate) struct SnapshotHint {
@@ -309,7 +310,7 @@ impl SnapshotHint {
             .map(|path| path.version);
         // Retained staged paths can remain after a published downgrade. Their presence alone does
         // not impose the MCV requirement for newly supplied catalog tails.
-        validate_catalog_managed_versions(
+        validate_catalog_version_bounds(
             requested_version,
             max_catalog_version,
             latest_commit_version,

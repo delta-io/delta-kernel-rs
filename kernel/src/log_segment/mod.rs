@@ -195,7 +195,7 @@ pub(crate) fn validate_catalog_managed_log_tail(
         )
     );
 
-    validate_catalog_managed_versions(
+    validate_catalog_version_bounds(
         requested_version,
         max_catalog_version,
         log_tail.last().map(|path| path.version),
@@ -203,7 +203,7 @@ pub(crate) fn validate_catalog_managed_log_tail(
 }
 
 /// Validate requested and terminal commit versions against a supplied catalog bound.
-pub(crate) fn validate_catalog_managed_versions(
+pub(crate) fn validate_catalog_version_bounds(
     requested_version: Option<Version>,
     max_catalog_version: Option<Version>,
     latest_commit_version: Option<Version>,
@@ -227,8 +227,8 @@ pub(crate) fn validate_catalog_managed_versions(
             require!(
                 latest_commit_version >= requested_version,
                 KernelError::MaxCatalogVersion(format!(
-                    "Log tail version {} is less than requested version {requested_version} for \
-                     max catalog version {max_catalog_version}",
+                    "Latest commit version {} is less than requested version {requested_version} \
+                     for max catalog version {max_catalog_version}",
                     latest_commit_version
                 ))
             );
@@ -236,7 +236,7 @@ pub(crate) fn validate_catalog_managed_versions(
             require!(
                 latest_commit_version == max_catalog_version,
                 KernelError::MaxCatalogVersion(format!(
-                    "Log tail version {} does not match max catalog version \
+                    "Latest commit version {} does not match max catalog version \
                      {max_catalog_version}",
                     latest_commit_version
                 ))

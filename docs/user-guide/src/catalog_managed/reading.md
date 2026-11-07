@@ -99,12 +99,15 @@ doesn't matter.
 
 For incremental updates, supply the catalog's current tail, including unpublished commits
 already represented in the cached Snapshot. Supplying only the new suffix can fail before
-Kernel combines it with the cached history. Support for that shorter tail is tracked in
+Kernel combines it with the cached history. Omitting both the bound and tail while a cached
+downgrade remains unpublished can also fail. These incremental-discovery limitations are tracked in
 [issue #3851](https://github.com/delta-io/delta-kernel-rs/issues/3851).
 
 The log tail can overlap with published commits already in `_delta_log/`. For any
 version present in both, Kernel uses the log-tail entry, as the Delta spec requires
 readers to prefer the catalog-supplied commit when the catalog provides one.
+For commit replay, Kernel ignores filesystem commit files from the tail's first version onward,
+including filesystem commits newer than the tail.
 
 Call `.with_max_catalog_version(N)` to tell Kernel the highest version the catalog has
 ratified. This prevents Kernel from loading filesystem commits beyond what the catalog
@@ -119,10 +122,10 @@ catalog-managed unless you supply a bound.
 
 For an explicit target, Kernel doesn't require a bound solely because that
 version was catalog-managed. For example, after a published downgrade, you can read an
-earlier catalog-managed version from published history without a bound. Your connector
-must still obtain catalog information when required to read the table. Kernel doesn't
-load newer protocol state to validate this obligation. The explicit-version exemption
-also applies when the requested version happens to be the latest.
+earlier catalog-managed version from published history without a bound. If the table is currently
+catalog-managed, obtain its catalog bound and ratified tail even for an explicit-version load.
+Kernel doesn't load newer protocol state to determine whether this obligation applies. The
+explicit-version exemption also applies when the requested version happens to be the latest.
 
 Staged paths retained in an existing Snapshot or complete snapshot hint don't by themselves
 require you to supply a bound. For example, a filesystem-managed Snapshot can retain historical

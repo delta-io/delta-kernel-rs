@@ -222,15 +222,12 @@ impl<Mode> SnapshotBuilder<Mode> {
     /// Sets the target version of the [`Snapshot`].
     ///
     /// Without a snapshot hint, omitting this uses the supplied
-    /// [`max_catalog_version`](Self::with_max_catalog_version), or discovers the latest version if
-    /// no bound is supplied. With a hint, omitting this uses the hint version and its supplied
-    /// freshness.
+    /// [`max_catalog_version`](Self::with_max_catalog_version), or discovers the latest version
+    /// using the filesystem and any supplied [`log tail`](Self::with_log_tail) if no bound is set.
+    /// With a hint, omitting this uses the hint version and its supplied freshness.
     ///
     /// An explicit target does not require a catalog bound solely because that version is
-    /// catalog-managed. The caller must still obtain catalog information when required to read the
-    /// table. Passing any staged paths through [`with_log_tail`](Self::with_log_tail) still
-    /// requires [`with_max_catalog_version`](Self::with_max_catalog_version), even with an
-    /// explicit target. Any supplied bound applies.
+    /// catalog-managed. An explicit target must not exceed a supplied catalog bound.
     pub fn at_version(mut self, version: Version) -> Self {
         self.version = Some(version);
         self
@@ -239,12 +236,15 @@ impl<Mode> SnapshotBuilder<Mode> {
     /// Set the log tail to use when building the snapshot. This allows catalogs or external
     /// systems to provide an up-to-date log tail when used to build a snapshot.
     ///
-    /// Staged commits supplied in the tail must have been ratified by the managing catalog.
-    ///
     /// A nonempty tail must be an ascending, contiguous sequence of commits without duplicates.
+    /// For replay, it replaces filesystem commit files from its first version onward, including
+    /// filesystem commits newer than the tail.
     ///
-    /// See [`with_max_catalog_version`] for additional constraints when loading catalog-managed
-    /// tables.
+    /// Staged commits supplied in the tail must have been ratified by the managing catalog and
+    /// require [`with_max_catalog_version`] even with an explicit target.
+    ///
+    /// See [`with_max_catalog_version`] for constraints on the last tail version when a bound is
+    /// supplied.
     ///
     /// [`with_max_catalog_version`]: Self::with_max_catalog_version
     pub fn with_log_tail(mut self, log_tail: Vec<LogPath>) -> Self {
@@ -260,15 +260,13 @@ impl<Mode> SnapshotBuilder<Mode> {
     ///
     /// Supply the catalog's bound when loading its latest ratified version, including a downgrade.
     /// An empty catalog tail does not remove this requirement. Kernel rejects a latest version
-    /// request without a bound if the resulting snapshot is catalog-managed. An explicit target
-    /// does not require a bound solely because that version is catalog-managed.
+    /// request without a bound if the resulting snapshot is catalog-managed.
     ///
     /// # Log tail requirements
     ///
     /// With a bound and no explicit target, the last log-tail entry, if any, must match the bound.
     /// With an explicit target, the last entry, if any, must be at least the target version.
-    /// Staged commits supplied through [`with_log_tail`](Self::with_log_tail) require a bound.
-    /// Supplied catalog commits take precedence over filesystem copies at the same version.
+    /// See [`with_log_tail`](Self::with_log_tail) for staged-commit input requirements.
     ///
     /// [`at_version`]: Self::at_version
     pub fn with_max_catalog_version(mut self, max_catalog_version: Version) -> Self {
