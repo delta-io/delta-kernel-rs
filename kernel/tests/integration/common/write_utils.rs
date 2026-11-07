@@ -543,3 +543,40 @@ pub fn create_dv_update_transaction(
             Box::new(delta_kernel::committer::FileSystemCommitter::new()),
         )
 }
+
+/// Builds compaction data with the declarative planner when enabled, otherwise the legacy writer.
+pub fn log_compaction_data(
+    snapshot: &Arc<Snapshot>,
+    engine: &dyn Engine,
+    store: Arc<DynObjectStore>,
+    start: Version,
+    end: Version,
+) -> KernelResult<(Url, Vec<FilteredEngineData>)> {
+    #[cfg(feature = "declarative-plans")]
+    {
+        use delta_kernel::engine::sync::plan::SyncPlanExecutor;
+        use delta_kernel::plans::{Operation, PlanExecutor};
+
+        let plan = snapshot.declarative_log_compaction_data_plan(engine, start, end)?;
+        let data = SyncPlanExecutor::new(Some(store))
+            .execute_op(Operation::QueryPlan(plan))?
+            .into_data()?
+            .map(|batch| batch.map(FilteredEngineData::from))
+            .collect::<KernelResult<Vec<_>>>()?;
+        let path = snapshot
+            .table_root()
+            .join(&format!("_delta_log/{start:020}.{end:020}.compacted.json"))?;
+        Ok((path, data))
+    }
+    #[cfg(not(feature = "declarative-plans"))]
+    {
+        let _ = store;
+        let mut writer = snapshot.clone().log_compaction_writer(start, end)?;
+        Ok((
+            writer.compaction_path().clone(),
+            writer
+                .compaction_data(engine)?
+                .collect::<KernelResult<_>>()?,
+        ))
+    }
+}
