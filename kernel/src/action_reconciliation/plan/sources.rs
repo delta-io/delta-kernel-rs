@@ -1,59 +1,95 @@
+//! Physical action reads using the caller's requested schema.
+
 use std::sync::LazyLock;
 
 use url::Url;
 
-use crate::actions::{ADD_NAME, Add, LOG_ADD_SCHEMA, SIDECAR_FIELD, SIDECAR_NAME};
+use super::VERSION;
+use crate::actions::{
+    ADD_NAME, ActionSet, Add, LOG_ADD_SCHEMA, REMOVE_FIELD, SIDECAR_FIELD, SIDECAR_NAME,
+};
 use crate::checkpoint::{CheckpointShape, CheckpointType};
-use crate::expressions::{Expression as Expr, col, column_name};
+use crate::expressions::{Expression as Expr, col, column_name, lit, null_lit};
 use crate::log_segment::LogSegment;
 use crate::plans::ir::nodes::{DynamicScan, FileType, ScanFile};
-use crate::schema::{SchemaRef, lazy_schema_ref};
-use crate::{KernelResult, PlanBuilder, Version};
+use crate::schema::{DataType, SchemaRef, StructField, lazy_schema_ref};
+use crate::{KernelError, KernelResult, PlanBuilder, Version};
 
-const VERSION: &str = "version";
 const STATS: &str = "stats";
 
-/// Build add rows from CRC files.
-pub(crate) fn crc_arm(files: Vec<Add>, schema: SchemaRef) -> KernelResult<PlanBuilder> {
+/// Reads selected checkpoint actions. Non-content metadata reads use the root without sidecar
+/// discovery.
+/// Supplies `version`; absent checkpoints and empty selections return an empty relation.
+pub(crate) fn checkpoint_actions(
+    segment: &LogSegment,
+    shape: Option<&CheckpointShape>,
+    actions: ActionSet,
+    schema: SchemaRef,
+) -> KernelResult<PlanBuilder> {
+    let Some((file_type, parts)) = segment.checkpoint_version_tagged_scan_files()? else {
+        // The plan builder eliminates this empty relation from replay unions.
+        return PlanBuilder::values(schema, vec![]);
+    };
+    let scan = match file_type {
+        FileType::Json => PlanBuilder::scan_json,
+        FileType::Parquet => PlanBuilder::scan_parquet,
+    };
+    match (
+        actions.contains_content_actions(),
+        shape.map(|shape| &shape.checkpoint_type),
+    ) {
+        (false, _) if !actions.contains_non_content_actions() => {
+            PlanBuilder::values(schema, vec![])
+        }
+        (false, _) | (true, Some(CheckpointType::Leaf)) => scan(parts, &[VERSION], schema),
+        (true, None) => Err(KernelError::schema("File reads require a checkpoint shape")),
+        (true, Some(CheckpointType::None)) => PlanBuilder::values(schema, vec![]),
+        (true, Some(CheckpointType::Manifest)) => {
+            let files = match segment.checkpoint_hint_version_tagged_sidecar_scan_files()? {
+                Some(sidecars) => PlanBuilder::scan_parquet(sidecars, &[VERSION], schema.clone()),
+                // Without a complete hint, load the sidecars referenced by the manifest.
+                None => {
+                    sidecar_actions(file_type, parts.clone(), schema.clone(), &segment.log_root)
+                }
+            }?;
+            if !actions.contains_non_content_actions() {
+                return Ok(files);
+            }
+            PlanBuilder::union_all([
+                files.filter(actions.content_predicate())?,
+                scan(parts, &[VERSION], schema)?.filter(actions.non_content_predicate())?,
+            ])
+        }
+    }
+}
+
+/// Build add rows from CRC files with the supplied `version`.
+/// Requested remove columns are NULL because CRCs contain only live adds.
+pub(crate) fn crc_arm(
+    files: Vec<Add>,
+    version: Version,
+    includes_removes: bool,
+    schema: SchemaRef,
+) -> KernelResult<PlanBuilder> {
+    let version = crate::version_as_i64(version)?;
     PlanBuilder::values(
         LOG_ADD_SCHEMA.clone(),
         files.into_iter().map(|add| vec![add.into()]).collect(),
     )?
-    .project_patch(|patch| {
-        // Canonical CRC adds can only omit JSON stats from the read schema.
+    .project_patch(|mut patch| {
+        if includes_removes {
+            patch = patch.append(
+                REMOVE_FIELD.clone(),
+                null_lit(REMOVE_FIELD.data_type().clone()),
+            );
+        }
+        let patch = patch.append(StructField::nullable(VERSION, DataType::LONG), lit(version));
         if schema.field_at(&column_name!(ADD_NAME, STATS)).is_ok() {
             patch
         } else {
             patch.drop_at([ADD_NAME], STATS)
         }
     })
-}
-
-/// Build a leaf-checkpoint or V2 sidecar source with file versions in `version`.
-/// Returns an empty relation when no checkpoint exists.
-pub(crate) fn checkpoint_arm(
-    log_segment: &LogSegment,
-    shape: &CheckpointShape,
-    schema: SchemaRef,
-) -> KernelResult<PlanBuilder> {
-    let checkpoint = log_segment.checkpoint_version_tagged_scan_files()?;
-    match (&shape.checkpoint_type, checkpoint) {
-        (CheckpointType::Leaf, Some((FileType::Parquet, parts))) => {
-            PlanBuilder::scan_parquet(parts, &[VERSION], schema)
-        }
-        (CheckpointType::Leaf, Some((FileType::Json, parts))) => {
-            PlanBuilder::scan_json(parts, &[VERSION], schema)
-        }
-        (CheckpointType::Manifest, Some((file_type, parts))) => {
-            match log_segment.checkpoint_hint_version_tagged_sidecar_scan_files()? {
-                Some(sidecars) => PlanBuilder::scan_parquet(sidecars, &[VERSION], schema),
-                // Without a complete hint, load the sidecars referenced by the
-                // manifest.
-                None => sidecar_actions(file_type, parts, schema, &log_segment.log_root),
-            }
-        }
-        (CheckpointType::None, _) | (_, None) => PlanBuilder::values(schema, vec![]),
-    }
 }
 
 /// Build the commit JSON source with file versions in `version`.
