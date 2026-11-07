@@ -119,8 +119,8 @@ impl PublishMetadata {
 
     fn validate_contiguous(commits_to_publish: &[CatalogCommit]) -> KernelResult<()> {
         commits_to_publish
-            .windows(2)
-            .all(|c| c[0].version() + 1 == c[1].version())
+            .array_windows()
+            .all(|[a, b]| a.version() + 1 == b.version())
             .then_some(())
             .ok_or_else(|| {
                 KernelError::Generic(format!(

@@ -422,10 +422,8 @@ fn retain_relation(
     batches: Vec<RecordBatch>,
 ) -> KernelResult<RelationRef> {
     validate_relation_batches(&schema, &batches)?;
-    // `try_update` is unavailable at the crate's MSRV.
-    #[allow(deprecated)]
     let counter = NEXT_RELATION_ID
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
         .map_err(|_| KernelError::internal_error("relation id space exhausted"))?;
     let id = format!("{name}-{counter}");
     relation_store

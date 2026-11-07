@@ -825,7 +825,7 @@ mod tests {
                 unsafe {
                     visit_partition_values(
                         context.shallow_copy(),
-                        std::ptr::NonNull::new((&mut collected as *mut Vec<_>).cast()),
+                        Some(std::ptr::NonNull::from_mut(&mut collected).cast()),
                         collect_partition_value,
                     );
                 }
@@ -937,9 +937,7 @@ mod tests {
 
             // The serialized partition values surface the physical name and value.
             let mut collected: Vec<(String, String, bool)> = Vec::new();
-            let ctx = std::ptr::NonNull::new(
-                &mut collected as *mut Vec<(String, String, bool)> as *mut std::ffi::c_void,
-            );
+            let ctx = Some(std::ptr::NonNull::from_mut(&mut collected).cast());
             unsafe {
                 visit_partition_values(write_context.shallow_copy(), ctx, collect_partition_value)
             };
@@ -1137,9 +1135,7 @@ mod tests {
             });
 
             let mut collected: Vec<(String, String, bool)> = Vec::new();
-            let ctx = std::ptr::NonNull::new(
-                &mut collected as *mut Vec<(String, String, bool)> as *mut std::ffi::c_void,
-            );
+            let ctx = Some(std::ptr::NonNull::from_mut(&mut collected).cast());
             unsafe {
                 visit_partition_values(write_context.shallow_copy(), ctx, collect_partition_value)
             };
@@ -1202,9 +1198,7 @@ mod tests {
             });
 
             let mut collected: Vec<(String, String, bool)> = Vec::new();
-            let ctx = std::ptr::NonNull::new(
-                &mut collected as *mut Vec<(String, String, bool)> as *mut std::ffi::c_void,
-            );
+            let ctx = Some(std::ptr::NonNull::from_mut(&mut collected).cast());
             unsafe {
                 visit_partition_values(write_context.shallow_copy(), ctx, collect_partition_value)
             };
