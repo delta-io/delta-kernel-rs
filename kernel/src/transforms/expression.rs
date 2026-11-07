@@ -366,7 +366,7 @@ pub trait ExpressionTransform<'a> {
 
     /// Recursively transforms the child expression of a cast expression (unary).
     fn recurse_into_expr_cast(&mut self, expr: &'a CastExpression) -> Self::Output<CastExpression> {
-        let f = |child| CastExpression::new(child, expr.target.clone());
+        let f = |child| CastExpression::new(child, expr.target.clone(), expr.mode);
         map_owned_or_else(expr, self.transform_expr(&expr.expr), f)
     }
 
