@@ -29,12 +29,14 @@ use delta_kernel::schema::{
     PrimitiveType, StructField, StructType,
 };
 #[cfg(feature = "geo-type-in-dev")]
-use delta_kernel::schema::{EdgeInterpolationAlgorithm, GeographyType, GeometryType};
+use delta_kernel::schema::{GeographyType, GeometryType};
 use delta_kernel::{KernelError, KernelResult};
 use tracing::warn;
 
 use crate::delta_types::FfiNullableStringMap;
 use crate::scan::{CMetadataMap, CMetadataValueKind};
+#[cfg(feature = "geo-type-in-dev")]
+use crate::schema::FfiEdgeInterpolationAlgorithm;
 use crate::{
     ErrorAllocators, ExternResult, IntoExternResult, KernelStringSlice, ReferenceSet,
     TryFromStringSlice,
@@ -639,8 +641,8 @@ fn visit_field_geometry_impl(
 /// Visit a geography field with the given coordinate reference system and edge interpolation
 /// algorithm.
 ///
-/// Returns an error if the field name, CRS, or algorithm is invalid UTF-8, if the CRS is not in
-/// `AUTHORITY:CODE` form, or if the algorithm is not a recognized Delta protocol token.
+/// Returns an error if the field name or CRS is invalid UTF-8, or if the CRS is not in
+/// `AUTHORITY:CODE` form.
 ///
 /// # Safety
 ///
@@ -648,7 +650,8 @@ fn visit_field_geometry_impl(
 /// for this call. Its callbacks and context must satisfy [`ErrorAllocators`]'s requirements
 /// until this call returns.
 ///
-/// `state`, `name`, `crs`, and `algorithm` must be valid for the call. Non-null `metadata` must
+/// `state`, `name`, and `crs` must be valid for the call. `algorithm` must be one of the defined
+/// `FfiEdgeInterpolationAlgorithm` values. Non-null `metadata` must
 /// point to a valid descriptor and callback.
 #[cfg(feature = "geo-type-in-dev")]
 #[unsafe(no_mangle)]
@@ -656,14 +659,13 @@ pub unsafe extern "C" fn visit_field_geography(
     state: &mut KernelSchemaVisitorState,
     name: KernelStringSlice,
     crs: KernelStringSlice,
-    algorithm: KernelStringSlice,
+    algorithm: FfiEdgeInterpolationAlgorithm,
     nullable: bool,
     metadata: *const EngineMetadata,
     error_allocators: *const ErrorAllocators,
 ) -> ExternResult<usize> {
     let name_str = unsafe { TryFromStringSlice::try_from_slice(&name) };
     let crs = unsafe { TryFromStringSlice::try_from_slice(&crs) };
-    let algorithm = unsafe { TryFromStringSlice::try_from_slice(&algorithm) };
     let metadata = visit_engine_metadata(unsafe { metadata.as_ref() });
     let result = visit_field_geography_impl(state, name_str, crs, algorithm, nullable, metadata);
     unsafe { result.into_extern_result(&*error_allocators) }
@@ -674,18 +676,11 @@ fn visit_field_geography_impl(
     state: &mut KernelSchemaVisitorState,
     name: KernelResult<&str>,
     crs: KernelResult<&str>,
-    algorithm: KernelResult<&str>,
+    algorithm: FfiEdgeInterpolationAlgorithm,
     nullable: bool,
     metadata: KernelResult<HashMap<MetadataKey, MetadataValue>>,
 ) -> KernelResult<usize> {
-    let algorithm = algorithm?
-        .parse::<EdgeInterpolationAlgorithm>()
-        .map_err(|err| {
-            KernelError::invalid_geo_params(format!(
-                "Invalid geography edge interpolation algorithm: {err}"
-            ))
-        })?;
-    let geography = GeographyType::try_new(crs?, algorithm)?;
+    let geography = GeographyType::try_new(crs?, algorithm.into())?;
     visit_field_primitive_impl(
         state,
         name,
@@ -1834,7 +1829,7 @@ mod tests {
                 geography,
                 "geography",
                 KernelStringSlice::new_unsafe("OGC:CRS84"),
-                KernelStringSlice::new_unsafe("spherical")
+                FfiEdgeInterpolationAlgorithm::Spherical
             );
         }
     }
@@ -1842,12 +1837,11 @@ mod tests {
     #[cfg(feature = "geo-type-in-dev")]
     #[rstest]
     #[case::bad_geometry_crs("geom", "EPSG:4326 ", None)]
-    #[case::bad_geography_crs("geog", "EPSG:4326 ", Some("spherical"))]
-    #[case::bad_geography_algorithm("geog", "OGC:CRS84", Some("not-an-algorithm"))]
+    #[case::bad_geography_crs("geog", "EPSG:4326 ", Some(FfiEdgeInterpolationAlgorithm::Spherical))]
     fn invalid_geo_field_parameters_return_recoverable_errors_without_inserting_fields(
         #[case] name: &str,
         #[case] crs: &str,
-        #[case] algorithm: Option<&str>,
+        #[case] algorithm: Option<FfiEdgeInterpolationAlgorithm>,
     ) {
         let mut state = KernelSchemaVisitorState::default();
         let result = match algorithm {
@@ -1866,7 +1860,7 @@ mod tests {
                     &mut state,
                     KernelStringSlice::new_unsafe(name),
                     KernelStringSlice::new_unsafe(crs),
-                    KernelStringSlice::new_unsafe(algorithm),
+                    algorithm,
                     true,
                     null(),
                     &TEST_ERROR_ALLOCATORS,
@@ -1890,8 +1884,8 @@ mod tests {
             visit_field_geography(
                 &mut state,
                 KernelStringSlice::new_unsafe("geog"),
-                KernelStringSlice::new_unsafe("OGC:CRS84"),
-                KernelStringSlice::new_unsafe("not-an-algorithm"),
+                KernelStringSlice::new_unsafe("EPSG:4326 "),
+                FfiEdgeInterpolationAlgorithm::Spherical,
                 true,
                 null(),
                 &TEST_ERROR_ALLOCATORS,
@@ -1909,7 +1903,7 @@ mod tests {
             state,
             "geog",
             KernelStringSlice::new_unsafe("OGC:CRS84"),
-            KernelStringSlice::new_unsafe("spherical"),
+            FfiEdgeInterpolationAlgorithm::Spherical,
             true,
             null()
         );
@@ -2248,7 +2242,7 @@ mod tests {
             state,
             "col_geography",
             KernelStringSlice::new_unsafe("OGC:CRS84"),
-            KernelStringSlice::new_unsafe("spherical"),
+            FfiEdgeInterpolationAlgorithm::Spherical,
             false,
             null()
         );
