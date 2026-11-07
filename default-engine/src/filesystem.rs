@@ -72,7 +72,14 @@ async fn list_from_impl(
         .map(move |meta| {
             let meta = meta?;
             let mut location = path.clone();
-            location.set_path(&format!("/{}", meta.location.as_ref()));
+            // Unlike set_path, this escapes literal '%' characters in object keys.
+            location
+                .path_segments_mut()
+                .map_err(|()| {
+                    KernelError::InvalidTableLocation(format!("Invalid listing URL: {path}"))
+                })?
+                .clear()
+                .extend(meta.location.parts());
             Ok(FileMeta {
                 location,
                 last_modified: meta.last_modified.timestamp_millis(),
@@ -468,6 +475,217 @@ mod tests {
             len += 1;
         }
         assert_eq!(len, 10, "list_from should have returned 10 files");
+    }
+
+    #[rstest::rstest]
+    #[case("table", "table")]
+    #[case("table%2F", "table%252F")]
+    #[case("table%252F", "table%25252F")]
+    #[case("table%41", "table%2541")]
+    #[case("table%20", "table%2520")]
+    #[case("table%", "table%25")]
+    #[case("table name", "table%20name")]
+    #[case("table?#", "table%3F%23")]
+    #[case("table\u{e9}", "table%C3%A9")]
+    #[case("parent/%2E", "parent/%252E")]
+    #[case("parent/%2e%2e", "parent/%252e%252e")]
+    #[tokio::test]
+    async fn list_from_preserves_table_paths(
+        #[case] raw_table_name: &str,
+        #[case] encoded_table_name: &str,
+        #[values(1, 3)] file_count: usize,
+    ) {
+        // === Prepare objects under the literal table name ===
+        let store = Arc::new(InMemory::new());
+        for index in (0..file_count).rev() {
+            let key = Path::parse(format!("{raw_table_name}/file_{index}.json")).unwrap();
+            store.put(&key, "data".into()).await.unwrap();
+        }
+
+        // === Call the listing implementation using the escaped directory URL ===
+        let directory_url = Url::parse(&format!("s3://bucket/{encoded_table_name}/")).unwrap();
+        let files: Vec<_> = list_from_impl(store, directory_url)
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+
+        // === Check that every returned URL preserves the table name and file order ===
+        assert_eq!(files.len(), file_count);
+        for (index, file) in files.iter().enumerate() {
+            assert_eq!(
+                file.location.as_str(),
+                format!("s3://bucket/{encoded_table_name}/file_{index}.json")
+            );
+        }
+    }
+
+    // Decoding a listed URL must recover the raw key, including literal text such as "%2F".
+    // Cloud URL schemes use an in-memory store here, so the test needs no network access.
+    #[rstest::rstest]
+    #[case("table", "table")]
+    #[case("table%2F", "table%252F")]
+    #[case("table%252F", "table%25252F")]
+    #[case("table%41", "table%2541")]
+    #[case("table%20", "table%2520")]
+    #[case("table%", "table%25")]
+    #[case("table name", "table%20name")]
+    #[case("table?#", "table%3F%23")]
+    #[case("table\u{e9}", "table%C3%A9")]
+    #[tokio::test]
+    async fn in_memory_store_listing_preserves_object_keys(
+        #[case] raw_name: &str,
+        #[case] encoded_name: &str,
+        #[values(
+            "s3://bucket/",
+            "gs://bucket/",
+            "az://container/",
+            "https://example.test/"
+        )]
+        base_url: &str,
+    ) {
+        // === Prepare objects using their literal names ===
+        let store = Arc::new(InMemory::new());
+        let expected_data = Bytes::from("kernel-data");
+        let expected_keys: Vec<_> = (0..3)
+            .map(|version| {
+                Path::parse(format!(
+                    "{raw_name}/_delta_log/{version:020}.{raw_name}.json"
+                ))
+                .unwrap()
+            })
+            .collect();
+
+        // Insert in reverse order so the assertions below also check the returned version order.
+        for key in expected_keys.iter().rev() {
+            store.put(key, expected_data.clone().into()).await.unwrap();
+        }
+
+        let engine = DefaultEngineBuilder::new(store.clone()).build();
+        let storage = engine.storage_handler();
+
+        // === List using the correctly escaped directory URL ===
+        let directory_url = Url::parse(&format!("{base_url}{encoded_name}/_delta_log/")).unwrap();
+        let listed_files: Vec<_> = storage
+            .list_from(&directory_url)
+            .unwrap()
+            .try_collect()
+            .unwrap();
+
+        // === Check the listing and read each returned URL ===
+        assert_eq!(listed_files.len(), expected_keys.len());
+        for (version, (file, key)) in listed_files.iter().zip(&expected_keys).enumerate() {
+            // For example, raw "table%2F" must appear as "table%252F" in the URL.
+            assert_eq!(
+                file.location.as_str(),
+                format!("{directory_url}{version:020}.{encoded_name}.json")
+            );
+            assert_eq!(Path::from_url_path(file.location.path()).unwrap(), *key);
+
+            // Constructing the URL must preserve the object's size and modification time.
+            let metadata = store.head(key).await.unwrap();
+            assert_eq!(file.size, metadata.size);
+            assert_eq!(
+                file.last_modified,
+                metadata.last_modified.timestamp_millis()
+            );
+
+            // Reading a listed URL must return the original bytes.
+            let read_back: Vec<_> = storage
+                .read_files(vec![(file.location.clone(), None)])
+                .unwrap()
+                .try_collect()
+                .unwrap();
+            assert_eq!(read_back, vec![expected_data.clone()]);
+        }
+
+        // Resuming after the first listed URL must exclude that file and keep the remaining order.
+        let after_first: Vec<_> = storage
+            .list_from(&listed_files[0].location)
+            .unwrap()
+            .try_collect()
+            .unwrap();
+        assert_eq!(after_first, listed_files[1..]);
+    }
+
+    #[rstest::rstest]
+    #[tokio::test]
+    async fn listed_url_reads_original_object_when_decoded_key_exists(
+        #[values(
+            "s3://bucket/",
+            "gs://bucket/",
+            "az://container/",
+            "https://example.test/"
+        )]
+        base_url: &str,
+    ) {
+        let store = Arc::new(InMemory::new());
+        let expected_data = Bytes::from("kernel-data");
+        let original_key = Path::parse("table%41/file%41.json").unwrap();
+        store
+            .put(&original_key, expected_data.clone().into())
+            .await
+            .unwrap();
+
+        // "%41" decodes to "A". Different bytes expose a read from the wrong existing key.
+        let decoy_key = Path::parse("tableA/fileA.json").unwrap();
+        store.put(&decoy_key, "wrong file".into()).await.unwrap();
+
+        let engine = DefaultEngineBuilder::new(store).build();
+        let storage = engine.storage_handler();
+        let directory_url = Url::parse(&format!("{base_url}table%2541/")).unwrap();
+        let listed_files: Vec<_> = storage
+            .list_from(&directory_url)
+            .unwrap()
+            .try_collect()
+            .unwrap();
+        assert_eq!(listed_files.len(), 1);
+
+        let read_back: Vec<_> = storage
+            .read_files(vec![(listed_files[0].location.clone(), None)])
+            .unwrap()
+            .try_collect()
+            .unwrap();
+        assert_eq!(read_back, vec![expected_data]);
+    }
+
+    // Check the same name preservation on disk, where reading file:// URLs uses OS path conversion.
+    #[rstest::rstest]
+    #[tokio::test]
+    async fn listing_preserves_literal_percent_in_local_paths(
+        #[values("table", "table%2F", "table%252F", "table%41", "table%20", "table%")]
+        raw_directory: &str,
+    ) {
+        // === Prepare a real file inside the literal directory name ===
+        let (tmp, store, storage) = setup_test();
+        let file_path = tmp
+            .path()
+            .join(raw_directory)
+            .join("_delta_log/00000000000000000001.json");
+        let key = Path::from_absolute_path(&file_path).unwrap();
+        let expected_data = Bytes::from("kernel-data");
+        store.put(&key, expected_data.clone().into()).await.unwrap();
+
+        // === List the directory using a file:// URL ===
+        let directory_url = Url::from_directory_path(file_path.parent().unwrap()).unwrap();
+        let listed_files: Vec<_> = storage
+            .list_from(&directory_url)
+            .unwrap()
+            .try_collect()
+            .unwrap();
+
+        // === Check that the listed URL points to the file we created and reads its bytes ===
+        let expected_url = Url::from_file_path(&file_path).unwrap();
+        assert_eq!(listed_files.len(), 1);
+        assert_eq!(listed_files[0].location, expected_url);
+
+        let read_back: Vec<_> = storage
+            .read_files(vec![(listed_files[0].location.clone(), None)])
+            .unwrap()
+            .try_collect()
+            .unwrap();
+        assert_eq!(read_back, vec![expected_data]);
     }
 
     #[tokio::test]
