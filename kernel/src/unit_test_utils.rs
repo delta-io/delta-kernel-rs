@@ -1,3 +1,5 @@
+#[cfg(feature = "declarative-plans")]
+pub(crate) mod plans;
 pub(crate) mod recording_reads;
 
 use std::borrow::Borrow;
