@@ -1499,7 +1499,10 @@ impl Snapshot {
             )?;
             require!(
                 delta.is_incremental_safe,
-                unresolved_crc("commits after the checkpoint are not incremental-safe")
+                unresolved_crc(&match &delta.unsupported_operation {
+                    Some(operation) => format!("unsupported operation {operation:?}"),
+                    None => "commits after the checkpoint are not incremental-safe".to_string(),
+                })
             );
             let base = log_segment
                 .build_crc_from_checkpoint(engine)?

@@ -45,7 +45,7 @@ pub enum UpdateTableOperation {
     /// protocol checks still apply. Custom operations do not qualify for incremental version
     /// checksum construction in post-commit snapshots.
     ///
-    /// Names whose checksum replay policy excludes file actions are also reserved.
+    /// All operation names accepted by checksum replay are also reserved.
     ///
     /// Custom names are not guaranteed to remain valid across Kernel versions. Adding a typed
     /// variant reserves its exact name. Callers using that custom name must select the typed
@@ -148,10 +148,7 @@ fn validate_custom_name(name: &str) -> Result<(), String> {
     }
     if UpdateTableOperation::iter().any(|operation| operation.as_str() == name)
         || RESERVED_TABLE_OPERATION_NAMES.contains(&name)
-        || matches!(
-            FileStatsPolicy::for_operation(name),
-            FileStatsPolicy::IgnoreAdds | FileStatsPolicy::IgnoreRemoves
-        )
+        || FileStatsPolicy::for_operation(name) != FileStatsPolicy::Unsupported
     {
         return Err(format!("custom operation name '{name}' is reserved"));
     }
@@ -214,7 +211,6 @@ mod tests {
                     "REPLACE TABLE AS SELECT",
                     "CREATE OR REPLACE TABLE AS SELECT",
                     "COMPUTE STATS",
-                    "ANALYZE STATS",
                     "ROW TRACKING BACKFILL",
                     "ROW TRACKING UNBACKFILL",
                     "DROP FEATURE",
@@ -222,6 +218,8 @@ mod tests {
                     "LIQUID TAGGING",
                     "REPLACE PARTITIONED BY WITH CLUSTER BY",
                     "Deletion Vector Tombstones",
+                    "TRUNCATE",
+                    "SET TBLPROPERTIES",
                 ]
                 .map(str::to_owned),
             )
@@ -252,6 +250,7 @@ mod tests {
             " LIQUID TAGGING ",
             "deletion vector tombstones",
             "Manual Update",
+            "UNSET TBLPROPERTIES",
         ] {
             let operation = UpdateTableOperation::Custom(name.to_string());
             assert!(operation.validate().is_ok());

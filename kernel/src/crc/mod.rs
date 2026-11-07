@@ -78,6 +78,8 @@ pub struct Crc {
     pub protocol: Protocol,
     /// File-level statistics as a typed state. See [`FileStatsState`].
     pub(crate) file_stats_state: FileStatsState,
+    /// Unsupported operation, when known. Only relevant when file stats are `Indeterminate`.
+    pub(crate) unsupported_operation: Option<String>,
 
     // ===== Optional fields =====
     /// The in-commit timestamp of this version. Present iff In-Commit Timestamps are enabled.
@@ -147,6 +149,7 @@ impl Crc {
             metadata,
             protocol,
             file_stats_state,
+            unsupported_operation: None,
             in_commit_timestamp_opt,
             set_transaction_state,
             domain_metadata_state,

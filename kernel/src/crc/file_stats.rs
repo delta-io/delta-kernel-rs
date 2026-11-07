@@ -120,9 +120,7 @@ impl FileStatsPolicy {
         // `commitInfo.incremental`.
         match operation {
             // These operations update metadata on existing files by re-adding them.
-            // ANALYZE STATS is a compatibility alias for statistics-only metadata updates.
             "COMPUTE STATS"
-            | "ANALYZE STATS"
             | "ROW TRACKING BACKFILL"
             | "ROW TRACKING UNBACKFILL"
             | "DROP FEATURE"
@@ -138,14 +136,11 @@ impl FileStatsPolicy {
             | "UPDATE"
             | "MERGE"
             | "TRUNCATE"
-            | "COPY INTO"
-            | "TRANSACTION"
             // Table creation and replacement.
             | "CREATE TABLE"
             | "CREATE TABLE AS SELECT"
             | "REPLACE TABLE"
             | "REPLACE TABLE AS SELECT"
-            | "CREATE OR REPLACE TABLE"
             | "CREATE OR REPLACE TABLE AS SELECT"
             // Schema and table metadata changes.
             | "ADD COLUMNS"
@@ -157,20 +152,19 @@ impl FileStatsPolicy {
             | "UPDATE SCHEMA"
             | "REMOVE COLUMN MAPPING"
             | "SET TBLPROPERTIES"
-            | "UNSET TBLPROPERTIES"
             | "ADD CONSTRAINT"
             | "DROP CONSTRAINT"
             | "UPGRADE PROTOCOL"
             // Maintenance operations.
             | "OPTIMIZE"
-            | "OPTIMIZE CHECKPOINT"
             | "RECOMPRESSION"
             | "REORG"
             | "VACUUM START"
             | "VACUUM END"
-            | "FSCK"
             | "REPAIR METADATA"
-            | "CLUSTER BY" => Self::ApplyAll,
+            | "CLUSTER BY"
+            | "Empty Commit"
+            | "DOMAIN METADATA CLEANUP" => Self::ApplyAll,
             // Manual updates and unrecognized operations have no trusted file-action policy.
             _ => Self::Unsupported,
         }

@@ -421,6 +421,9 @@ impl CrcReplayAccumulator {
                     self.current_file_url.as_deref().unwrap_or("?")
                 );
                 self.delta.is_incremental_safe = false;
+                if policy == FileStatsPolicy::Unsupported {
+                    self.delta.unsupported_operation = self.current_commit_operation.take();
+                }
             }
         }
         self.current_commit_adds_valid = true;
@@ -1197,6 +1200,25 @@ mod tests {
             delta.file_stats.net_histogram,
             Some(FileSizeHistogram::create_default())
         );
+    }
+
+    #[rstest::rstest]
+    #[case::ignore_adds("LIQUID TAGGING", 100, None)]
+    #[case::ignore_removes("Deletion Vector Tombstones", -1, Some(100))]
+    fn invalid_counted_actions_are_not_masked_by_valid_ignored_actions(
+        #[case] operation: &str,
+        #[case] add_size: i64,
+        #[case] remove_size: Option<i64>,
+    ) {
+        let mut acc = CrcReplayAccumulator::new(None);
+        acc.process_batch_start("v1.json");
+        acc.on_add(add_size).unwrap();
+        acc.on_remove("a", remove_size).unwrap();
+        acc.on_commit_info_without_lmc(Some(operation), None);
+        acc.process_commit_file_end();
+        let delta = acc.into_crc_delta();
+        assert!(!delta.is_incremental_safe);
+        assert!(delta.unsupported_operation.is_none());
     }
 
     #[test]
