@@ -19,7 +19,7 @@ impl MetadataReplayBase {
     pub(in crate::scan) fn try_new(
         snapshot: &Snapshot,
         engine: &dyn Engine,
-        planner: &MetadataPlanner<'_>,
+        planner: &MetadataPlanner,
     ) -> KernelResult<Self> {
         let checkpoint_version = snapshot.log_segment().checkpoint_version;
         // Keep replay eligibility independent of SnapshotCrc's validation.
