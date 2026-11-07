@@ -140,7 +140,8 @@ impl LogSegment {
     }
 
     /// Whether replaying this segment for `candidate` read its newest commit's `commitInfo`. Replay
-    /// stops inside that commit only once the commit has both P&M, possibly before its `commitInfo`.
+    /// stops inside that commit only once the commit has both P&M, possibly before its
+    /// `commitInfo`.
     #[cfg(feature = "adaptive-metadata-in-dev")]
     fn read_newest_commit_info(&self, candidate: &PmCandidate) -> KernelResult<bool> {
         Ok(self.newest_commit_after_checkpoint().is_some()
