@@ -332,7 +332,7 @@ impl PlanBuilder {
     /// Writes this input to files according to `write`, returning its descriptor relation.
     /// Empty input produces an empty descriptor relation and creates no files.
     ///
-    /// Returns an error when [`MultiFileWrite::validate_input`] rejects this input's schema or
+    /// Returns an error when [`MultiFileWrite::output_schema`] rejects this input's schema or
     /// the write contract. Shared clones retain the same write node's identity in the built DAG.
     pub fn multi_file_write(self, write: MultiFileWrite) -> KernelResult<Self> {
         let schema = write.output_schema(self.schema())?;

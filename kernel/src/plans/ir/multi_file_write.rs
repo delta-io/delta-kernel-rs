@@ -82,7 +82,7 @@ impl MultiFileWrite {
             file_namer,
             stats,
         };
-        write.validate_input(input_schema)?;
+        write.output_schema(input_schema)?;
         Ok(write)
     }
 
@@ -133,11 +133,6 @@ impl MultiFileWrite {
                 .chain(stats_schema.fields())
                 .cloned(),
         )?))
-    }
-
-    /// Validates the input and contract without retaining the derived schema.
-    pub fn validate_input(&self, input_schema: &SchemaRef) -> KernelResult<()> {
-        self.output_schema(input_schema).map(|_| ())
     }
 }
 
@@ -551,7 +546,7 @@ mod tests {
     fn rejects_incompatible_write_fields(#[case] schema: SchemaRef) {
         let mut write = write_with_stats(|a| a).unwrap();
         write.write_schema = schema;
-        assert!(write.validate_input(&input_schema()).is_err());
+        assert!(write.output_schema(&input_schema()).is_err());
     }
 
     #[rstest]
@@ -562,7 +557,7 @@ mod tests {
     fn rejects_invalid_base_url(#[case] url: &str) {
         let mut write = write_with_stats(|a| a).unwrap();
         write.base_url = Url::parse(url).unwrap();
-        assert!(write.validate_input(&input_schema()).is_err());
+        assert!(write.output_schema(&input_schema()).is_err());
     }
 
     #[test]
