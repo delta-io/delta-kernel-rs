@@ -76,6 +76,9 @@ pub fn to_df_expr(
             UnaryExpressionOp::ToJson => Err(KernelError::unsupported(
                 "converting the ToJson expression is not yet supported",
             )),
+            UnaryExpressionOp::UriScheme => Err(KernelError::unsupported(
+                "converting the UriScheme expression is not yet supported",
+            )),
         },
 
         KernelExpression::CaseWhen(_) => Err(KernelError::unsupported(

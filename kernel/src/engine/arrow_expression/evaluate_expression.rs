@@ -44,6 +44,7 @@ use crate::expressions::{
     OpaqueExpression, OpaquePredicate, Predicate, Scalar, UnaryExpression, UnaryExpressionOp,
     UnaryPredicate, UnaryPredicateOp, VariadicExpression, VariadicExpressionOp,
 };
+use crate::path_encoding::scheme_len;
 use crate::schema::{DataType, PrimitiveType, StructField, StructType};
 
 #[internal_api]
@@ -323,6 +324,21 @@ pub fn evaluate_expression(
             }
             Some(data_type) => Err(KernelError::generic(format!(
                 "ToJson operator requires STRING output, but got {data_type:?}"
+            ))),
+        },
+        (
+            Unary(UnaryExpression {
+                op: UriScheme,
+                expr,
+            }),
+            result_type,
+        ) => match result_type {
+            None | Some(&DataType::STRING) => {
+                let input = evaluate_expression(expr, batch, None)?;
+                uri_schemes(&input)
+            }
+            Some(data_type) => Err(KernelError::generic(format!(
+                "UriScheme operator requires STRING output, but got {data_type:?}"
             ))),
         },
         (Binary(BinaryExpression { op, left, right }), _) => {
@@ -874,6 +890,30 @@ pub fn evaluate_predicate(
     }
 }
 
+/// Evaluates [`UnaryExpressionOp::UriScheme`] over a string array of any string representation.
+fn uri_schemes(input: &ArrayRef) -> KernelResult<ArrayRef> {
+    let input = arrow_convert_to_non_view_type(input.clone())?;
+    let scheme = |reference: &str| scheme_len(reference).map(|len| reference[..len].to_string());
+    let schemes: StringArray = match input.data_type() {
+        ArrowDataType::Utf8 => input
+            .as_string::<i32>()
+            .iter()
+            .map(|r| r.and_then(scheme))
+            .collect(),
+        ArrowDataType::LargeUtf8 => input
+            .as_string::<i64>()
+            .iter()
+            .map(|r| r.and_then(scheme))
+            .collect(),
+        other => {
+            return Err(KernelError::invalid_expression(format!(
+                "UriScheme requires a string input, got {other}"
+            )));
+        }
+    };
+    Ok(Arc::new(schemes))
+}
+
 /// `chrono` formats implementing the timestamp encoding [`UnaryExpressionOp::ToJson`] requires.
 ///
 /// `%.3f` truncates rather than rounds, and floors below the epoch. Reader subtracts .000999
@@ -1221,7 +1261,7 @@ mod tests {
     use crate::arrow::array::{
         ArrayData as ArrowArrayData, ArrayRef, BinaryArray, BooleanArray, Date32Array,
         Float64Array, Int32Array, Int64Array, LargeStringArray, ListArray, MapBuilder, StringArray,
-        StringBuilder, StructArray, TimestampMicrosecondArray,
+        StringBuilder, StringViewArray, StructArray, TimestampMicrosecondArray,
     };
     use crate::arrow::buffer::{OffsetBuffer, ScalarBuffer};
     use crate::arrow::datatypes::{
@@ -2140,6 +2180,55 @@ mod tests {
         assert_result_error_with_message(
             evaluate_predicate(&pred, &batch, false),
             "Invalid right value for (NOT) IN comparison",
+        );
+    }
+
+    #[rstest]
+    #[case::utf8(Arc::new(StringArray::from(uri_scheme_inputs())) as ArrayRef)]
+    #[case::large_utf8(Arc::new(LargeStringArray::from(uri_scheme_inputs())) as ArrayRef)]
+    #[case::utf8_view(Arc::new(StringViewArray::from(uri_scheme_inputs())) as ArrayRef)]
+    fn test_uri_scheme(#[case] references: ArrayRef) {
+        let batch = RecordBatch::try_from_iter([("r", references)]).unwrap();
+        let expr = Expr::unary(UnaryExpressionOp::UriScheme, col!("r"));
+        let result = evaluate_expression(&expr, &batch, Some(&DataType::STRING)).unwrap();
+        let expected = StringArray::from(vec![
+            Some("s3"),
+            Some("abfss"),
+            Some("C"),
+            Some("x+y.z-1"),
+            None,
+            None,
+            None,
+            None,
+            None,
+        ]);
+        assert_eq!(result.as_string::<i32>(), &expected);
+    }
+
+    /// One reference per [`test_uri_scheme`] case: absolute ones, then relative ones and a NULL.
+    fn uri_scheme_inputs() -> Vec<Option<&'static str>> {
+        vec![
+            Some("s3://bucket/a.parquet"),
+            Some("abfss://c@a.dfs.core.windows.net/t/a.parquet"),
+            Some("C:/data"),
+            Some("x+y.z-1:rest"),
+            Some("data/a.parquet"),
+            Some("1abc:/a"),
+            Some(":a"),
+            Some("data/a:b.parquet"),
+            None,
+        ]
+    }
+
+    #[test]
+    fn test_uri_scheme_rejects_non_string_input() {
+        let batch =
+            RecordBatch::try_from_iter([("n", Arc::new(Int32Array::from(vec![1])) as ArrayRef)])
+                .unwrap();
+        let expr = Expr::unary(UnaryExpressionOp::UriScheme, col!("n"));
+        assert_result_error_with_message(
+            evaluate_expression(&expr, &batch, None),
+            "UriScheme requires a string input, got Int32",
         );
     }
 

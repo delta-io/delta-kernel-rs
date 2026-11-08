@@ -536,6 +536,7 @@ impl From<UnaryExpressionOp> for proto_expr::UnaryExpressionOp {
     fn from(op: UnaryExpressionOp) -> Self {
         match op {
             UnaryExpressionOp::ToJson => proto_expr::UnaryExpressionOp::ToJson,
+            UnaryExpressionOp::UriScheme => proto_expr::UnaryExpressionOp::UriScheme,
         }
     }
 }
@@ -1980,6 +1981,7 @@ mod tests {
 
     #[rstest]
     #[case(UnaryExpressionOp::ToJson, proto_expr::UnaryExpressionOp::ToJson)]
+    #[case(UnaryExpressionOp::UriScheme, proto_expr::UnaryExpressionOp::UriScheme)]
     fn from_unary_expression_op(
         #[case] op: UnaryExpressionOp,
         #[case] expected: proto_expr::UnaryExpressionOp,

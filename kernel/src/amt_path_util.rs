@@ -5,7 +5,7 @@
 
 use url::{ParseError, Url};
 
-use crate::path_encoding::{uri_decode_path, uri_encode_path};
+use crate::path_encoding::{scheme_len, uri_decode_path, uri_encode_path};
 use crate::utils::{require, to_file_size};
 use crate::{FileMeta, KernelError, KernelResult};
 
@@ -126,37 +126,6 @@ pub(crate) fn validate_table_relative(path: &str) -> KernelResult<()> {
         ))
     );
     Ok(())
-}
-
-/// Returns the byte length of `location`'s URI scheme (excluding the terminating `:`), or `None`
-/// if `location` does not begin with one, per [RFC 3986 section 3.1]:
-/// `scheme = ALPHA *( ALPHA / DIGIT / "+" / "-" / "." )`, terminated by `:`.
-///
-/// A path without a scheme is relative (per the Iceberg V4 path spec).
-///
-/// [RFC 3986 section 3.1]: https://datatracker.ietf.org/doc/html/rfc3986#section-3.1
-fn scheme_len(location: &str) -> Option<usize> {
-    for (position, ch) in location.char_indices() {
-        if ch == ':' {
-            return (position > 0).then_some(position);
-        }
-        if !is_scheme_char(ch, position) {
-            return None;
-        }
-    }
-    None
-}
-
-/// Returns whether `ch` is allowed at `position` in a URI scheme, per [RFC 3986 section 3.1]:
-/// the first character must be `ALPHA`; subsequent characters may also be `DIGIT`, `+`, `-`, or
-/// `.`. Schemes are restricted to US-ASCII, so non-ASCII letters are rejected.
-///
-/// [RFC 3986 section 3.1]: https://datatracker.ietf.org/doc/html/rfc3986#section-3.1
-fn is_scheme_char(ch: char, position: usize) -> bool {
-    if ch.is_ascii_alphabetic() {
-        return true;
-    }
-    position > 0 && (ch.is_ascii_digit() || ch == '+' || ch == '-' || ch == '.')
 }
 
 /// Resolves a relative `path` against `table_root`: percent-encodes `path` so reserved URI
