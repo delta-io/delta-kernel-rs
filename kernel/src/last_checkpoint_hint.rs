@@ -28,8 +28,8 @@ const LAST_CHECKPOINT_FILE_NAME: &str = "_last_checkpoint";
 /// Delta-Spark defaults for `lastCheckpoint.{sidecars,nonFileActions}.threshold` (both 30), which
 /// drop the whole field by count when it exceeds the cap:
 /// <https://github.com/delta-io/delta/blob/83002ef0bfdae90914edbcb0cae23dae5a9b9af5/spark/src/main/scala/org/apache/spark/sql/delta/sources/DeltaSQLConf.scala#L1431-L1461>
-const LAST_CHECKPOINT_SIDECARS_THRESHOLD: usize = 30;
-const LAST_CHECKPOINT_NON_FILE_ACTIONS_THRESHOLD: usize = 30;
+pub(crate) const LAST_CHECKPOINT_SIDECARS_THRESHOLD: usize = 30;
+pub(crate) const LAST_CHECKPOINT_NON_FILE_ACTIONS_THRESHOLD: usize = 30;
 
 /// Portable checkpoint metadata matching the fields of `_last_checkpoint`.
 // Note: Schema can not be derived because the checkpoint schema is only known at runtime.
