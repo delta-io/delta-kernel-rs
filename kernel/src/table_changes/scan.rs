@@ -5,9 +5,9 @@ use std::sync::Arc;
 use itertools::Itertools;
 use url::Url;
 
-use super::log_replay::{table_changes_action_iter, TableChangesScanMetadata};
+use super::log_replay::{TableChangesScanMetadata, table_changes_action_iter};
 use super::physical_to_logical::{get_cdf_transform_expr, scan_file_physical_schema};
-use super::resolve_dvs::{resolve_scan_file_dv, ResolvedCdfScanFile};
+use super::resolve_dvs::{ResolvedCdfScanFile, resolve_scan_file_dv};
 use super::scan_file::scan_metadata_to_scan_file;
 use super::{CdfMode, TableChanges};
 use crate::actions::deletion_vector::split_vector;
@@ -54,7 +54,7 @@ pub struct TableChangesScan {
 /// # let url = delta_kernel::try_parse_uri(path).unwrap();
 /// # use test_utils::delta_kernel_default_engine::{storage::store_from_url, DefaultEngineBuilder};
 /// # let engine = DefaultEngineBuilder::new(store_from_url(&url).unwrap()).build();
-/// # let table_changes = TableChanges::try_new(url, &engine, 0, Some(1)).unwrap();
+/// # let table_changes = TableChanges::try_new(path, &engine, 0, Some(1)).unwrap();
 /// let schema = table_changes
 ///     .schema()
 ///     .project(&["id", "_commit_version"])
@@ -163,7 +163,7 @@ impl TableChangesScan {
     fn scan_metadata(
         &self,
         engine: Arc<dyn Engine>,
-    ) -> KernelResult<impl KernelResultIterator<TableChangesScanMetadata>> {
+    ) -> KernelResult<impl KernelResultIterator<TableChangesScanMetadata> + use<>> {
         let commits = self
             .table_changes
             .log_segment
@@ -220,7 +220,7 @@ impl TableChangesScan {
     pub fn execute(
         &self,
         engine: Arc<dyn Engine>,
-    ) -> KernelResult<impl KernelResultIterator<Box<dyn EngineData>>> {
+    ) -> KernelResult<impl KernelResultIterator<Box<dyn EngineData>> + use<>> {
         let scan_metadata = self.scan_metadata(engine.clone())?;
         let scan_files = scan_metadata_to_scan_file(scan_metadata);
 
@@ -260,7 +260,7 @@ fn read_scan_file(
     table_root: &Url,
     state_info: &StateInfo,
     _physical_predicate: Option<PredicateRef>,
-) -> KernelResult<impl KernelResultIterator<Box<dyn EngineData>>> {
+) -> KernelResult<impl KernelResultIterator<Box<dyn EngineData>> + use<>> {
     let ResolvedCdfScanFile {
         scan_file,
         mut selection_vector,
@@ -367,17 +367,17 @@ mod tests {
 
     use rstest::rstest;
 
+    use crate::Predicate;
     use crate::committer::FileSystemCommitter;
     use crate::engine::sync::SyncEngine;
-    use crate::expressions::{col, lit};
+    use crate::expressions::expr;
     use crate::object_store::memory::InMemory;
-    use crate::scan::transform_spec::FieldTransformSpec;
     use crate::scan::PhysicalPredicate;
-    use crate::schema::{schema_ref, MetadataColumnSpec};
-    use crate::table_changes::{TableChanges, COMMIT_VERSION_COL_NAME};
+    use crate::scan::transform_spec::FieldTransformSpec;
+    use crate::schema::{MetadataColumnSpec, schema_ref};
+    use crate::table_changes::{COMMIT_VERSION_COL_NAME, TableChanges};
     use crate::transaction::create_table::create_table;
     use crate::unit_test_utils::assert_result_error_with_message;
-    use crate::Predicate;
 
     #[test]
     fn simple_table_changes_scan_builder() {
@@ -450,7 +450,7 @@ mod tests {
             .schema()
             .project(&["id", COMMIT_VERSION_COL_NAME])
             .unwrap();
-        let predicate = Arc::new(Predicate::gt(col!("id"), lit(10)));
+        let predicate = Arc::new(Predicate::from_expr(expr!(col("id") > 10)));
         let scan = table_changes
             .into_scan_builder()
             .with_schema(schema.clone())
@@ -551,7 +551,7 @@ mod tests {
 
         // Project only "part"; predicate references unprojected "id".
         let schema = table_changes.schema().project(&["part"]).unwrap();
-        let predicate = Arc::new(Predicate::gt(col!("id"), lit(10)));
+        let predicate = Arc::new(Predicate::from_expr(expr!(col("id") > 10)));
         let scan = table_changes
             .into_scan_builder()
             .with_schema(schema)
@@ -574,7 +574,7 @@ mod tests {
 
         // Project only "id"; predicate references unprojected `_commit_version`.
         let schema = table_changes.schema().project(&["id"]).unwrap();
-        let predicate = Arc::new(Predicate::ge(col!("_commit_version"), lit(0_i64)));
+        let predicate = Arc::new(Predicate::from_expr(expr!(col("_commit_version") >= 0_i64)));
         let scan = table_changes
             .into_scan_builder()
             .with_schema(schema)

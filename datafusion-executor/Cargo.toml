@@ -1,7 +1,7 @@
 [package]
 name = "datafusion_executor"
 description = "DataFusion-based PlanExecutor for delta_kernel declarative plans."
-edition = "2021"
+edition = "2024"
 homepage = "https://delta.io"
 license = "Apache-2.0"
 repository = "https://github.com/delta-io/delta-kernel-rs"

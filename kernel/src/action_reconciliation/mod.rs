@@ -22,6 +22,9 @@ use std::time::Duration;
 use crate::table_properties::TableProperties;
 use crate::{KernelError, KernelResult};
 
+#[cfg(feature = "declarative-plans")]
+pub(crate) mod checkpoint_shape;
+pub(crate) mod file_metadata;
 pub(crate) mod log_replay;
 
 pub use log_replay::{ActionReconciliationIterator, ActionReconciliationIteratorState};
@@ -172,10 +175,12 @@ mod tests {
         let result =
             deleted_file_retention_timestamp_with_time(Some(large_retention), reference_time);
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("Retention duration exceeds i64 millisecond range"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Retention duration exceeds i64 millisecond range")
+        );
     }
 
     #[test]
@@ -185,10 +190,12 @@ mod tests {
         let retention = Duration::from_secs(1);
         let result = deleted_file_retention_timestamp_with_time(Some(retention), reference_time);
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("Current timestamp exceeds i64 millisecond range"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Current timestamp exceeds i64 millisecond range")
+        );
     }
 
     #[test]
@@ -228,10 +235,12 @@ mod tests {
         };
         let result = calculate_transaction_expiration_timestamp(&properties);
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("Retention duration exceeds i64 millisecond range"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Retention duration exceeds i64 millisecond range")
+        );
     }
 
     // Mock implementation of RetentionCalculator for testing trait methods

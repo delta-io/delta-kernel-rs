@@ -12,10 +12,10 @@ use super::*;
 use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
 use crate::log_segment::DomainMetadataMap;
 use crate::schema::{
-    column_name, lazy_schema_ref, ColumnName, ColumnNamesAndTypes, DataType, Schema, SchemaRef,
+    ColumnName, ColumnNamesAndTypes, DataType, Schema, SchemaRef, column_name, lazy_schema_ref,
 };
 #[cfg(feature = "adaptive-metadata-in-dev")]
-use crate::schema::{schema, StructField};
+use crate::schema::{StructField, schema};
 use crate::utils::require;
 use crate::{KernelError, KernelResult};
 
@@ -648,7 +648,7 @@ pub(crate) fn visit_metadata_at<'a>(
         name,
         description,
         format,
-        schema_string,
+        schema_string: schema_string.into(),
         partition_columns,
         created_time,
         configuration,
@@ -1027,7 +1027,7 @@ impl RowVisitor for CheckpointElementVisitor {
                     other => {
                         return Err(KernelError::generic(format!(
                             "checkpoint sidecar has unsupported type `{other}`"
-                        )))
+                        )));
                     }
                 }
             }
@@ -1068,10 +1068,11 @@ fn visit_content_root_at<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[cfg(feature = "adaptive-metadata-in-dev")]
-    use crate::actions::deletion_vector::DeletionVectorStorageType;
+    use crate::Engine;
     #[cfg(feature = "adaptive-metadata-in-dev")]
     use crate::actions::LOG_CHECKPOINT_SCHEMA;
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    use crate::actions::deletion_vector::DeletionVectorStorageType;
     use crate::arrow::array::{BooleanArray, StringArray};
     #[cfg(feature = "adaptive-metadata-in-dev")]
     use crate::arrow::array::{Int32Array, Int64Array};
@@ -1085,11 +1086,10 @@ mod tests {
     use crate::engine::to_json_bytes;
     #[cfg(feature = "adaptive-metadata-in-dev")]
     use crate::engine_data::FilteredEngineData;
-    use crate::expressions::{column_expr_ref, Expression};
+    use crate::expressions::{Expression, column_expr_ref};
     use crate::schema::schema_ref;
     use crate::table_features::TableFeature;
     use crate::unit_test_utils::{action_batch, parse_json_batch, string_array_to_engine_data};
-    use crate::Engine;
 
     #[rstest::rstest]
     #[case::empty(0)]
@@ -1512,7 +1512,7 @@ mod tests {
                 provider: "parquet".into(),
                 options: Default::default(),
             },
-            schema_string: r#"{"type":"struct","fields":[{"name":"value","type":"integer","nullable":true,"metadata":{}}]}"#.to_string(),
+            schema_string: r#"{"type":"struct","fields":[{"name":"value","type":"integer","nullable":true,"metadata":{}}]}"#.to_string().into(),
             partition_columns: Vec::new(),
             created_time: Some(1677811175819),
             configuration,

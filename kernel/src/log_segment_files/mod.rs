@@ -21,7 +21,7 @@ use url::Url;
 use crate::last_checkpoint_hint::LastCheckpointHint;
 use crate::path::LogPathFileType::*;
 use crate::path::{
-    may_begin_listable_log_path, CheckpointInstance, LogPathFileType, ParsedLogPath,
+    CheckpointInstance, LogPathFileType, ParsedLogPath, may_begin_listable_log_path,
 };
 use crate::{KernelError, KernelResult, KernelResultIterator, StorageHandler, Version};
 
@@ -73,7 +73,7 @@ pub(crate) fn list_delta_log_from_storage(
     log_root: &Url,
     start_version: Version,
     end_version: Version,
-) -> KernelResult<impl KernelResultIterator<ParsedLogPath>> {
+) -> KernelResult<impl KernelResultIterator<ParsedLogPath> + use<>> {
     let start_from = log_root.join(&format!("{start_version:020}"))?;
     let log_root_str = log_root.to_string();
     let files = storage
@@ -155,11 +155,10 @@ fn group_checkpoint_parts(
                 // a multi-part checkpoint
                 if let Some(part_files) = checkpoints.get_mut(&CheckpointInstance::MultiPart {
                     num_parts: *num_parts,
-                }) {
-                    if *part_num as usize == 1 + part_files.len() {
-                        // Safe to append because all previous parts exist
-                        part_files.push(part_file);
-                    }
+                }) && *part_num as usize == 1 + part_files.len()
+                {
+                    // Safe to append because all previous parts exist
+                    part_files.push(part_file);
                 }
             }
             Commit | StagedCommit | CompactedCommit { .. } | Crc | Unknown => {}
@@ -719,10 +718,9 @@ impl LogSegmentFiles {
         };
         if latest_checkpoint.version != checkpoint_metadata.version {
             info!(
-            "_last_checkpoint hint is out of date. _last_checkpoint version: {}. Using actual most recent: {}",
-            checkpoint_metadata.version,
-            latest_checkpoint.version
-        );
+                "_last_checkpoint hint is out of date. _last_checkpoint version: {}. Using actual most recent: {}",
+                checkpoint_metadata.version, latest_checkpoint.version
+            );
         } else if !checkpoint_metadata.applies_to(&listed_files.checkpoint_parts) {
             // Expected whenever a writer checkpoints a version another writer already checkpointed
             // and leaves the hint alone. `applies_to` also makes `LogSegment::checkpoint_hint`
@@ -776,6 +774,7 @@ impl LogSegmentFiles {
         // upper is the exclusive upper bound of the next window; adding 1 includes end_version
         // in the first window. The inclusive range passed to list_delta_log_from_storage is
         // [lower, upper - 1].
+        // TODO(#3835): Handle the exclusive upper bound when end_version is Version::MAX.
         let mut upper = end_version + 1;
         while upper > 0 {
             let lower = upper.saturating_sub(BACKWARD_SCAN_WINDOW_SIZE);

@@ -10,24 +10,24 @@ use url::Url;
 use crate::actions::LOG_METADATA_SCHEMA;
 use crate::arrow::array::{Int32Array, StringArray};
 use crate::committer::FileSystemCommitter;
+use crate::engine::CancellableEngine;
 use crate::engine::arrow_data::EngineDataArrowExt;
 use crate::engine::sync::SyncEngine;
 use crate::engine::test_delegating::DelegatingEngine;
-use crate::engine::CancellableEngine;
 use crate::metrics::{MeteredDeltaEngine, MetricEvent};
 use crate::object_store::memory::InMemory;
-use crate::schema::{schema_ref, ColumnName};
+use crate::schema::{ColumnName, schema_ref};
 use crate::transaction::create_table::create_table;
 use crate::transaction::data_layout::DataLayout;
 use crate::unit_test_utils::recording_reads::{Read, RecordingReads};
 use crate::unit_test_utils::{
-    install_thread_local_metrics_reporter, string_array_to_engine_data, CapturingReporter,
-    TestCancellationToken,
+    CapturingReporter, TestCancellationToken, install_thread_local_metrics_reporter,
+    string_array_to_engine_data,
 };
 use crate::utils::try_parse_uri;
 use crate::{
-    CancellationTokenRef, Engine, EngineData, FileMeta, FileSlice, FilteredEngineData, KernelError,
-    KernelResult, KernelResultIterator, Snapshot, SnapshotReader, StorageHandler,
+    CancellationTokenRef, Engine, EngineData, Error, FileMeta, FileSlice, FilteredEngineData,
+    KernelError, KernelResult, KernelResultIterator, Snapshot, SnapshotReader, StorageHandler,
 };
 
 /// Handler entry point selected for a read.
@@ -255,7 +255,10 @@ fn cancelled_snapshot_reports_correlated_failure_with_metered_handlers(
     let result = Snapshot::builder_for(format!("tests/data/{table}"))
         .with_correlation_id("cancelled-snapshot")
         .build(engine.as_ref());
-    assert!(matches!(result, Err(KernelError::Cancelled)), "{result:?}");
+    assert!(
+        matches!(result, Err(Error::Kernel(KernelError::Cancelled))),
+        "{result:?}"
+    );
 
     let events = reporter.events();
     let failure = events
@@ -284,9 +287,11 @@ fn cancelled_snapshot_reports_correlated_failure_with_metered_handlers(
         Some((failure.operation_id, Some("cancelled-snapshot"))),
         "{events:?}"
     );
-    assert!(!events
-        .iter()
-        .any(|event| matches!(event, MetricEvent::SnapshotBuildSuccess(_))));
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, MetricEvent::SnapshotBuildSuccess(_)))
+    );
 }
 
 /// Checks nested read overrides, cumulative HEAD preflight, and unscoped storage writes.
@@ -502,7 +507,7 @@ fn snapshot_reads_keep_builder_token(
     let events = reads.events.lock().unwrap();
     assert!(events.contains(&read));
     if cancel {
-        assert!(matches!(result, Err(KernelError::Cancelled)));
+        assert!(matches!(result, Err(Error::Kernel(KernelError::Cancelled))));
         assert_eq!(events.last(), Some(&read));
     } else if incremental {
         assert_eq!(result.unwrap().version(), 1);
@@ -525,7 +530,7 @@ fn discovery_keeps_builder_token(#[case] read: Read) {
     let result = Snapshot::builder_for("tests/data/table-without-dv-small")
         .with_cancellation_token(token)
         .build(&reads.engine());
-    assert!(matches!(result, Err(KernelError::Cancelled)));
+    assert!(matches!(result, Err(Error::Kernel(KernelError::Cancelled))));
     assert_eq!(reads.events.lock().unwrap().last(), Some(&read));
 }
 
@@ -538,7 +543,7 @@ fn completed_snapshot_does_not_retain_build_scope() {
         Snapshot::builder_for("tests/data/table-without-dv-small")
             .with_cancellation_token(cancelled)
             .build(&engine),
-        Err(KernelError::Cancelled)
+        Err(Error::Kernel(KernelError::Cancelled))
     ));
     let token: CancellationTokenRef = Arc::new(TestCancellationToken::default());
     let weak = Arc::downgrade(&token);
@@ -639,12 +644,16 @@ fn post_build_metadata_reads_inherit_operation_token(
                 let infos = reader.get_clustering_column_infos(engine)?.unwrap();
                 assert_eq!(infos[0].physical_column, ColumnName::new(["id"]));
             }
-            MetadataRead::Domains => assert!(reader
-                .get_domain_metadatas_internal(engine, None)?
-                .contains_key("test")),
-            MetadataRead::InternalDomain => assert!(reader
-                .get_domain_metadata_internal("delta.clustering", engine)?
-                .is_some()),
+            MetadataRead::Domains => assert!(
+                reader
+                    .get_domain_metadatas_internal(engine, None)?
+                    .contains_key("test")
+            ),
+            MetadataRead::InternalDomain => assert!(
+                reader
+                    .get_domain_metadata_internal("delta.clustering", engine)?
+                    .is_some()
+            ),
             MetadataRead::UserDomains => {
                 assert_eq!(reader.get_all_domain_metadata(engine)?.len(), 1)
             }

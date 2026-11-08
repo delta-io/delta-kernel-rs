@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use super::struct_expr_from_schema;
-use crate::expressions::{null_lit, Expression};
+use crate::expressions::{Expression, expr, null_lit};
 use crate::schema::{DataType, SchemaRef, StructField, StructType};
 use crate::{Engine, EngineData, ExpressionEvaluator, KernelError, KernelResult};
 
@@ -13,12 +13,10 @@ use crate::{Engine, EngineData, ExpressionEvaluator, KernelError, KernelResult};
 ///
 /// For example, projecting `add` batches onto a read schema of `{add, remove}` keeps each row's
 /// `add` and makes its `remove` null.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(super) struct ActionProjector {
     evaluator: Arc<dyn ExpressionEvaluator>,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl ActionProjector {
     /// Builds a projector from `source`, the schema of the batches to project, onto `read_schema`.
     /// Fields of `read_schema.<action>` that `source.<action>` has are copied; every other nullable
@@ -58,10 +56,8 @@ impl ActionProjector {
                 }
             })
             .collect::<KernelResult<Vec<_>>>()?;
-        let action_expr = Expression::struct_with_nullability_from(
-            fields,
-            Expression::from_pred(Expression::column([action]).is_not_null()),
-        );
+        let action_expr =
+            Expression::struct_with_nullability_from(fields, expr!(is_not_null(path(action))));
         let expr = struct_expr_from_schema(&read_schema, |name| {
             (name == action).then(|| action_expr.clone())
         })?;
@@ -96,14 +92,14 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
-    use crate::actions::{Add, ADD_NAME, ADD_SCHEMA, LOG_ADD_SCHEMA, REMOVE_FIELD, REMOVE_NAME};
+    use crate::actions::{ADD_NAME, ADD_SCHEMA, Add, LOG_ADD_SCHEMA, REMOVE_FIELD, REMOVE_NAME};
     use crate::arrow::array::{AsArray as _, RecordBatch, StringArray};
     use crate::engine::arrow_data::EngineDataArrowExt as _;
     use crate::engine::sync::SyncEngine;
     use crate::object_store::memory::InMemory;
     use crate::schema::schema_ref;
     use crate::unit_test_utils::{
-        assert_result_error_with_message, string_array_to_engine_data, Action,
+        Action, assert_result_error_with_message, string_array_to_engine_data,
     };
 
     /// A batch of `add` actions (matching [`LOG_ADD_SCHEMA`]) for `paths`, with a null `add` for

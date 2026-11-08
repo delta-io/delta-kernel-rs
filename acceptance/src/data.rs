@@ -6,18 +6,19 @@ use delta_kernel::arrow::compute::concat_batches;
 use delta_kernel::arrow::datatypes::{DataType, Field, Fields, Schema, SchemaRef};
 use delta_kernel::arrow::util::pretty::pretty_format_batches;
 use delta_kernel::engine::arrow_data::EngineDataArrowExt as _;
-use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::object_store::ObjectStore;
+use delta_kernel::object_store::local::LocalFileSystem;
 #[allow(deprecated)]
 use delta_kernel::parquet::arrow::async_reader::{
     ParquetObjectReader, ParquetRecordBatchStreamBuilder,
 };
 use delta_kernel::snapshot::Snapshot;
 use delta_kernel::{Engine, KernelError, KernelResult};
-use futures::stream::TryStreamExt;
 use futures::StreamExt;
+use futures::stream::TryStreamExt;
 use itertools::Itertools;
 
+use crate::acceptance_workloads::validation::assert_aligned_data_matches;
 use crate::{TestCaseInfo, TestResult};
 
 #[allow(deprecated)]
@@ -28,17 +29,17 @@ pub async fn read_golden(path: &Path, _version: Option<&str>) -> KernelResult<Re
     let mut batches = vec![];
     let mut schema = None;
     for meta in files.into_iter() {
-        if let Some(ext) = meta.location.extension() {
-            if ext == "parquet" {
-                let reader = ParquetObjectReader::new(store.clone(), meta.location);
-                let builder = ParquetRecordBatchStreamBuilder::new(reader).await?;
-                if schema.is_none() {
-                    schema = Some(builder.schema().clone());
-                }
-                let mut stream = builder.build()?;
-                while let Some(batch) = stream.next().await {
-                    batches.push(batch?);
-                }
+        if let Some(ext) = meta.location.extension()
+            && ext == "parquet"
+        {
+            let reader = ParquetObjectReader::new(store.clone(), meta.location);
+            let builder = ParquetRecordBatchStreamBuilder::new(reader).await?;
+            if schema.is_none() {
+                schema = Some(builder.schema().clone());
+            }
+            let mut stream = builder.build()?;
+            while let Some(batch) = stream.next().await {
+                batches.push(batch?);
             }
         }
     }
@@ -146,7 +147,7 @@ pub async fn assert_scan_metadata(
         })
         .try_collect()?;
     let golden = read_golden(test_case.root_dir(), None).await?;
-    assert_data_matches(batches, &schema.unwrap(), golden)?;
+    assert_aligned_data_matches(batches, &schema.unwrap(), golden)?;
 
     Ok(())
 }

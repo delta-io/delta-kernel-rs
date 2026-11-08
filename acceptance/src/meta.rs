@@ -3,9 +3,9 @@ use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use delta_kernel::object_store::ObjectStore;
 use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::object_store::path::Path as ObjectPath;
-use delta_kernel::object_store::ObjectStore;
 use delta_kernel::{Engine, KernelError, Snapshot, Version};
 use futures::stream::TryStreamExt;
 use serde::{Deserialize, Serialize};
@@ -17,7 +17,13 @@ pub enum AssertionError {
     InvalidTestCase,
 
     #[error("Kernel error: {0}")]
-    KernelError(#[from] KernelError),
+    KernelError(#[from] delta_kernel::Error),
+}
+
+impl From<KernelError> for AssertionError {
+    fn from(error: KernelError) -> Self {
+        Self::KernelError(error.into())
+    }
 }
 
 pub type TestResult<T, E = AssertionError> = std::result::Result<T, E>;

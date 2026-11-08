@@ -34,17 +34,22 @@ pub enum UpdateTableOperation {
     Merge,
     /// A data-file reorganization.
     Optimize,
+    /// A data-file reorganization that preserves logical table data.
+    Reorg,
     /// An operation name recorded verbatim in commit history and successful transaction metrics.
     ///
-    /// The name must be nonempty and must not exactly match a typed operation's name or a reserved
-    /// create/replace-table name. This comparison is case-sensitive. Kernel does not infer
-    /// built-in operation semantics from the name, but all other transaction and protocol
-    /// checks still apply. Custom operations do not qualify for incremental version checksum
-    /// construction.
+    /// The name must be nonempty and must not match a reserved operation name, such as `REORG` or
+    /// `ALTER TABLE`. The full set consists of all [typed operation names](UpdateTableOperation)
+    /// and [`RESERVED_TABLE_OPERATION_NAMES`][ops]. Name matching is case-sensitive. Kernel does
+    /// not infer built-in operation semantics from the name, but all other transaction and
+    /// protocol checks still apply. Custom operations do not qualify for incremental version
+    /// checksum construction.
     ///
     /// Custom names are not guaranteed to remain valid across Kernel versions. Adding a typed
     /// variant reserves its exact name. Callers using that custom name must select the typed
     /// variant before building a transaction.
+    ///
+    /// [ops]: https://github.com/delta-io/delta-kernel-rs/blob/main/kernel/src/transaction/operation.rs
     #[strum(disabled)]
     Custom(String),
 }
@@ -60,6 +65,7 @@ impl UpdateTableOperation {
             Self::Update => "UPDATE",
             Self::Merge => "MERGE",
             Self::Optimize => "OPTIMIZE",
+            Self::Reorg => "REORG",
             Self::Custom(operation) => operation,
         }
     }
@@ -141,9 +147,7 @@ fn validate_custom_name(name: &str) -> Result<(), String> {
     if UpdateTableOperation::iter().any(|operation| operation.as_str() == name)
         || RESERVED_TABLE_OPERATION_NAMES.contains(&name)
     {
-        return Err(format!(
-            "custom operation name '{name}' is reserved; use the matching transaction builder or typed update-table operation"
-        ));
+        return Err(format!("custom operation name '{name}' is reserved"));
     }
     Ok(())
 }
@@ -168,6 +172,7 @@ mod tests {
             ("UPDATE", UpdateTableOperation::Update, true),
             ("MERGE", UpdateTableOperation::Merge, true),
             ("OPTIMIZE", UpdateTableOperation::Optimize, true),
+            ("REORG", UpdateTableOperation::Reorg, true),
         ];
         for (name, operation, incremental_safe) in cases {
             assert_eq!(operation.as_str(), name);
@@ -221,7 +226,7 @@ mod tests {
 
     #[test]
     fn custom_name_validation_is_case_sensitive_and_preserves_whitespace() {
-        for name in ["write", "Write", " WRITE ", "INSERT"] {
+        for name in ["write", "Write", " WRITE ", "reorg", " REORG ", "INSERT"] {
             let operation = UpdateTableOperation::Custom(name.to_string());
             assert!(operation.validate().is_ok());
             assert_eq!(operation.as_str(), name);
@@ -230,15 +235,22 @@ mod tests {
 
     #[test]
     fn empty_custom_operation_is_rejected() {
-        assert!(UpdateTableOperation::Custom(String::new())
-            .validate()
-            .unwrap_err()
-            .contains("cannot be empty"));
+        assert!(
+            UpdateTableOperation::Custom(String::new())
+                .validate()
+                .unwrap_err()
+                .contains("cannot be empty")
+        );
     }
 
     #[test]
     fn custom_operations_are_never_incremental_safe() {
-        for name in ["vendor.custom/write-v2", "CREATE TABLE AS SELECT", "WRITE"] {
+        for name in [
+            "vendor.custom/write-v2",
+            "CREATE TABLE AS SELECT",
+            "WRITE",
+            "REORG",
+        ] {
             assert!(!UpdateTableOperation::Custom(name.to_string()).is_incremental_safe());
         }
     }

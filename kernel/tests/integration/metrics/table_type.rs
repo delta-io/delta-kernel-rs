@@ -12,8 +12,8 @@ use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::{Engine, KernelResult, Snapshot};
 use rstest::rstest;
 use test_utils::{
-    add_commit, engine_store_setup, insert_data_with, install_thread_local_metrics_reporter,
-    test_table_setup_mt, CapturingReporter, TestCatalogCommitter,
+    CapturingReporter, TestCatalogCommitter, add_commit, engine_store_setup, insert_data_with,
+    install_thread_local_metrics_reporter, test_table_setup_mt,
 };
 
 use super::simple_schema;
@@ -22,11 +22,13 @@ use super::simple_schema;
 #[case::path_based(false)]
 #[case::catalog_managed(true)]
 #[tokio::test(flavor = "multi_thread")]
-async fn test_metric_events_carry_table_type(#[case] catalog_managed: bool) -> KernelResult<()> {
+async fn test_metric_events_carry_table_type(
+    #[case] catalog_managed: bool,
+) -> delta_kernel::Result<()> {
     let (_tmp, table_path, engine) = test_table_setup_mt()?;
     let table_url = delta_kernel::try_parse_uri(&table_path)?;
 
-    let build_snapshot = |max_catalog_version: u64| -> KernelResult<Arc<Snapshot>> {
+    let build_snapshot = |max_catalog_version: u64| -> delta_kernel::Result<Arc<Snapshot>> {
         let builder = Snapshot::builder_for(table_url.clone());
         let builder = if catalog_managed {
             builder.with_max_catalog_version(max_catalog_version)
@@ -132,17 +134,17 @@ async fn test_protocol_metadata_load_failure_carries_table_type(#[case] catalog_
     );
 }
 
-/// Validation fails after the protocol read succeeds, so events carry the requested mode (the
-/// documented best guess), not the protocol truth.
+/// Events carry the requested discovery mode, even when it differs from the resolved protocol.
 #[rstest]
 #[case::catalog_version_on_path_based(false, true, TableType::CatalogManaged)]
 #[case::no_catalog_version_on_catalog_managed(true, false, TableType::PathBased)]
 #[tokio::test(flavor = "multi_thread")]
-async fn test_build_validation_mismatch_events_carry_requested_table_type(
+async fn test_build_events_carry_requested_table_type_across_protocol_mismatch(
     #[case] create_catalog_managed: bool,
     #[case] request_catalog_version: bool,
     #[case] expected: TableType,
-) -> KernelResult<()> {
+    #[values(false, true)] explicit_version: bool,
+) -> delta_kernel::Result<()> {
     let (_tmp, table_path, engine) = test_table_setup_mt()?;
     let table_url = delta_kernel::try_parse_uri(&table_path)?;
 
@@ -157,11 +159,23 @@ async fn test_build_validation_mismatch_events_carry_requested_table_type(
     } else {
         builder
     };
-    assert!(builder.build(engine.as_ref()).is_err());
+    let builder = if explicit_version {
+        builder.at_version(0)
+    } else {
+        builder
+    };
+    let result = builder.build(engine.as_ref());
+    let expected_build_event = if create_catalog_managed && !explicit_version {
+        assert!(result.is_err());
+        "SnapshotBuildFailure"
+    } else {
+        assert_eq!(result?.version(), 0);
+        "SnapshotBuildSuccess"
+    };
 
     assert_table_types(
         &reporter.events(),
-        &["ProtocolMetadataLoadSuccess", "SnapshotBuildFailure"],
+        &["ProtocolMetadataLoadSuccess", expected_build_event],
         expected,
     );
     Ok(())

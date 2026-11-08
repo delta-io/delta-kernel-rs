@@ -3,7 +3,7 @@
 
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::object_store::local::LocalFileSystem;
-use delta_kernel::schema::{schema_ref, DataType, StructField};
+use delta_kernel::schema::{DataType, StructField, schema_ref};
 use delta_kernel::table_properties::CheckConstraint;
 use delta_kernel::transaction::{Transaction, UpdateTableOperation};
 use delta_kernel::{Engine, KernelError, KernelResult, Snapshot, SnapshotRef};
@@ -109,7 +109,7 @@ async fn write_table(
 #[tokio::test(flavor = "multi_thread")]
 async fn snapshot_and_transaction_return_stored_constraints_in_name_order(
     #[values(false, true)] checkpoint: bool,
-) -> KernelResult<()> {
+) -> delta_kernel::Result<()> {
     let (_tmp, table_path, engine) = test_table_setup_mt()?;
     let constraints = [
         ("NonEmptyName", "name != ''"),
@@ -150,7 +150,7 @@ async fn write_state_and_commits_require_ack_only_on_tables_with_constraints(
     #[values(true, false)] declares_constraints: bool,
     #[values(true, false)] acknowledge: bool,
     #[values(true, false)] discover_first: bool,
-) -> KernelResult<()> {
+) -> delta_kernel::Result<()> {
     let (_tmp, table_path, engine) = test_table_setup()?;
     let constraints = if declares_constraints {
         POSITIVE_AMOUNT
@@ -209,7 +209,8 @@ async fn write_state_and_commits_require_ack_only_on_tables_with_constraints(
 }
 
 #[tokio::test]
-async fn constraints_without_feature_are_discoverable_but_txn_build_fails() -> KernelResult<()> {
+async fn constraints_without_feature_are_discoverable_but_txn_build_fails()
+-> delta_kernel::Result<()> {
     let (_tmp, table_path, engine) = test_table_setup()?;
     let table_url = write_table(&table_path, &[], POSITIVE_AMOUNT).await?;
 
@@ -227,7 +228,7 @@ async fn constraints_without_feature_are_discoverable_but_txn_build_fails() -> K
 #[tokio::test]
 async fn alter_table_commit_succeeds_only_with_ack_and_keeps_constraints(
     #[values(true, false)] acknowledge: bool,
-) -> KernelResult<()> {
+) -> delta_kernel::Result<()> {
     let (_tmp, table_path, engine) = test_table_setup()?;
     let table_url = write_table(&table_path, CHECK_CONSTRAINTS_FEATURE, POSITIVE_AMOUNT).await?;
 

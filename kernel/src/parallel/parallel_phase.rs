@@ -132,12 +132,13 @@ mod tests {
     use super::*;
     use crate::engine::arrow_data::ArrowEngineData;
     use crate::engine::sync::SyncEngine;
+    use crate::expressions::{Predicate, expr};
     use crate::log_replay::FileActionKey;
     use crate::log_segment::CheckpointReadInfo;
     use crate::metrics::{MetricEvent, ScanType, WithMetricsReporterLayer};
+    use crate::object_store::ObjectStoreExt as _;
     use crate::object_store::memory::InMemory;
     use crate::object_store::path::Path;
-    use crate::object_store::ObjectStoreExt as _;
     use crate::parallel::parallel_scan_metadata::{
         AfterSequentialScanMetadata, ParallelScanMetadata, ParallelState,
     };
@@ -148,12 +149,12 @@ mod tests {
     use crate::scan::state::ScanFile;
     use crate::scan::state_info::tests::get_simple_state_info;
     use crate::scan::{ScanBuilder, StatsOptions};
-    use crate::schema::{schema_ref, DataType, StructField, StructType};
+    use crate::schema::{DataType, StructField, StructType, schema_ref};
     use crate::unit_test_utils::{
-        install_thread_local_metrics_reporter, load_test_table, parse_json_batch, CapturingReporter,
+        CapturingReporter, install_thread_local_metrics_reporter, load_test_table, parse_json_batch,
     };
     use crate::utils::FoldWithOption as _;
-    use crate::{PredicateRef, SnapshotRef};
+    use crate::{PredicateRef, Result, SnapshotRef};
 
     // ============================================================
     // Test helpers for focused ParallelPhase tests
@@ -407,7 +408,7 @@ mod tests {
         with_serde: bool,
         one_file_per_worker: bool,
         dispatcher: Option<tracing::Dispatch>,
-    ) -> KernelResult<()> {
+    ) -> Result<()> {
         let (engine, snapshot, _tempdir) = load_test_table(table_name)?;
 
         let expected_paths = get_expected_paths(engine.as_ref(), &snapshot, predicate.clone())?;
@@ -508,12 +509,11 @@ mod tests {
     fn parallel_scan_metadata_phases_carry_correlation_id(
         #[case] with_serde: bool,
         #[case] expected_parallel: Option<&str>,
-    ) -> KernelResult<()> {
-        // This table has checkpoint sidecars, so the sequential phase yields a parallel phase.
-        let (engine, snapshot, _tempdir) = load_test_table("v2-checkpoints-json-with-sidecars")?;
-
+    ) -> Result<()> {
         let reporter = Arc::new(CapturingReporter::default());
         let _guard = install_thread_local_metrics_reporter(reporter.clone());
+        // This table has checkpoint sidecars, so the sequential phase yields a parallel phase.
+        let (engine, snapshot, _tempdir) = load_test_table("v2-checkpoints-json-with-sidecars")?;
 
         let scan = snapshot
             .scan_builder()
@@ -784,10 +784,7 @@ mod tests {
     #[case::data_skipping(ParallelLogReplayCase {
         // Tests data skipping filtering based on column stats (min/max values)
         path: "v2-checkpoints-json-with-sidecars",
-        predicate: Some({
-            use crate::expressions::{col, lit, Expression as Expr};
-            Arc::new(Expr::gt(col!("id"), lit(20i64)))
-        }),
+        predicate: Some(Arc::new(Predicate::from_expr(expr!(col("id") > 20i64)))),
         expected_sequential_metrics: ExpectedMetrics {
             add_files_seen: 0,
             add_files_seen_from_delta_files: 0,
@@ -817,10 +814,7 @@ mod tests {
         // guard (OR(NOT is_add, pred)) only protects Remove/non-file rows, not Adds with null
         // partition values -- those are correctly filtered since is_add=true for them.
         path: "basic_partitioned",
-        predicate: Some({
-            use crate::expressions::{col, lit, Expression as Expr};
-            Arc::new(Expr::eq(col!("letter"), lit("a")))
-        }),
+        predicate: Some(Arc::new(Predicate::from_expr(expr!(col("letter") == "a")))),
         expected_sequential_metrics: ExpectedMetrics {
             // Columnar filtering prunes all 4 non-matching files (b, c, e, null), but
             // add_files_seen counts all 6 input Adds.
@@ -991,7 +985,7 @@ mod tests {
         #[case] test_case: ParallelLogReplayCase,
         #[values(false, true)] with_serde: bool,
         #[values(false, true)] one_file_per_worker: bool,
-    ) -> KernelResult<()> {
+    ) -> Result<()> {
         use test_utils::LoggingTest;
 
         // Set up log capture
@@ -1021,7 +1015,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parallel_with_skip_stats() -> KernelResult<()> {
+    fn test_parallel_with_skip_stats() -> Result<()> {
         let (engine, snapshot, _tempdir) = load_test_table("v2-checkpoints-json-with-sidecars")?;
 
         // Get expected paths using single-node scan_metadata with skip_stats=true
@@ -1094,7 +1088,7 @@ mod tests {
     /// Sequential-only tables (single-part checkpoint, no sidecars) emit exactly one
     /// `ScanMetadataCompleted` event with `ScanType::SequentialPhase` when `finish()` is called.
     #[test]
-    fn sequential_done_phase_emits_sequential_scan_metadata_completed_event() -> KernelResult<()> {
+    fn sequential_done_phase_emits_sequential_scan_metadata_completed_event() -> Result<()> {
         let reporter = Arc::new(CapturingReporter::default());
         let _guard = install_thread_local_metrics_reporter(reporter.clone());
 
@@ -1131,7 +1125,7 @@ mod tests {
     /// `ScanMetadataCompleted` events. The `operation_id` must be the same on both
     /// events so callers can correlate them.
     #[test]
-    fn parallel_scan_emits_correlated_sequential_and_parallel_events() -> KernelResult<()> {
+    fn parallel_scan_emits_correlated_sequential_and_parallel_events() -> Result<()> {
         let reporter = Arc::new(CapturingReporter::default());
         let _guard = install_thread_local_metrics_reporter(reporter.clone());
 

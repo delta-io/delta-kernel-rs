@@ -149,7 +149,7 @@ pub mod utils;
 pub(crate) mod utils;
 
 #[cfg(feature = "internal-api")]
-pub use utils::{try_parse_uri, CollectInto, FoldWithOption};
+pub use utils::{CollectInto, FoldWithOption, try_parse_uri};
 
 // for the below modules, we cannot introduce a macro to clean this up. rustfmt doesn't follow into
 // macros, and so will not format the files associated with these modules if we get too clever. see:
@@ -188,7 +188,7 @@ pub mod parallel;
 pub(crate) mod parallel;
 
 pub use action_reconciliation::{ActionReconciliationIterator, ActionReconciliationIteratorState};
-use cancellation::{check_cancelled, CancellableIterator};
+use cancellation::{CancellableIterator, check_cancelled};
 pub use cancellation::{CancellationToken, CancellationTokenRef, CancelledFuture};
 pub use delta_kernel_derive;
 pub use engine_data::{
@@ -200,7 +200,7 @@ pub use error::{
 };
 use expressions::Scalar;
 pub use expressions::{Expression, ExpressionRef, Predicate, PredicateRef};
-pub use log_compaction::{should_compact, LogCompactionWriter};
+pub use log_compaction::{LogCompactionWriter, should_compact};
 #[cfg(feature = "declarative-plans")]
 pub use plans::{IoOperation, Operation, PlanBuilder, PlanExecutor, PlanResult};
 use schema::StructField;
@@ -484,9 +484,13 @@ pub trait EvaluationHandler: AsAny {
     ///
     /// If the provided output type is a struct, its fields describe the columns of output produced
     /// by the evaluator. Otherwise, the output schema is a single column named "output" of the
-    /// specified `output_type`. In all cases, the output schema is only used for its names (all
-    /// field names will be updated to match) and nullability (non-nullable columns can be converted
-    /// to nullable). Any mismatch in types (including number of columns) will produce an error.
+    /// specified `output_type`. Output field names and nullability are updated to match
+    /// `output_type` (non-nullable columns can be made nullable). Incompatible types or a different
+    /// number of columns produce an error.
+    ///
+    /// The Arrow-based evaluator casts compatible leaf types to the requested output types. It
+    /// uses Arrow's safe casts: reducing timestamp precision truncates toward zero, and values
+    /// that cannot be converted (for example, timestamp scaling overflow) become null.
     ///
     /// # Parameters
     ///
@@ -1122,11 +1126,12 @@ mod tests {
         let meta = FileMeta::new(Url::parse("file:///x").unwrap(), 0, size);
         match expected {
             Some(v) => assert_eq!(meta.size_as_i64().unwrap(), v),
-            None => assert!(meta
-                .size_as_i64()
-                .unwrap_err()
-                .to_string()
-                .contains("exceeds i64::MAX")),
+            None => assert!(
+                meta.size_as_i64()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("exceeds i64::MAX")
+            ),
         }
     }
 }

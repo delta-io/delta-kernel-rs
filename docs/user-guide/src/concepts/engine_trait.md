@@ -90,12 +90,12 @@ reader does not inherit the token used to build its `Snapshot`.
 
 ```rust,no_run
 # extern crate delta_kernel;
-# use delta_kernel::{CancellationTokenRef, Engine, KernelResult, Snapshot};
+# use delta_kernel::{CancellationTokenRef, Engine, Snapshot};
 # fn read_metadata(
 #     engine: &dyn Engine,
 #     table_root: &str,
 #     token: CancellationTokenRef,
-# ) -> KernelResult<()> {
+# ) -> delta_kernel::Result<()> {
 let snapshot = Snapshot::builder_for(table_root)
     .with_cancellation_token(token.clone())
     .build(engine)?;

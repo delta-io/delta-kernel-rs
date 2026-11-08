@@ -6,20 +6,20 @@ use std::sync::Arc;
 
 use delta_kernel_derive::internal_api;
 
+use crate::KernelResult;
 use crate::error::KernelError;
 use crate::expressions::ColumnName;
 use crate::schema::validation::validate_schema;
 use crate::schema::{ColumnMetadataKey, DataType, SchemaRef, StructField, StructType};
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::{
-    find_max_column_id_in_schema, schema_has_column_mapping_metadata,
-    strip_stray_column_mapping_metadata, try_assign_flat_column_mapping_info,
-    validate_column_mapping_id, ColumnMappingMode, TableFeature,
+    ColumnMappingMode, TableFeature, find_max_column_id_in_schema,
+    schema_has_column_mapping_metadata, strip_stray_column_mapping_metadata,
+    try_assign_flat_column_mapping_info, validate_column_mapping_id,
 };
 use crate::table_properties::COLUMN_MAPPING_MAX_COLUMN_ID;
-use crate::transforms::{transform_output_type, SchemaTransform};
+use crate::transforms::{SchemaTransform, transform_output_type};
 use crate::utils::FoldWithOption as _;
-use crate::KernelResult;
 
 /// A schema evolution operation to be applied to a table.
 ///
@@ -76,7 +76,7 @@ impl<'a> SchemaTransform<'a> for AddedFieldMetadataValidator {
     fn transform_struct_field(&mut self, field: &'a StructField) -> KernelResult<()> {
         if let Some(key) = field.metadata.keys().find(|key| {
             key.as_str() == ColumnMetadataKey::GenerationExpression.as_ref()
-                || key.starts_with("delta.identity.")
+                || key.as_str().starts_with("delta.identity.")
         }) {
             return Err(KernelError::schema(format!(
                 "Cannot add column '{}': metadata annotation '{}' is not supported",
@@ -238,7 +238,7 @@ pub(crate) fn apply_schema_operations(
         Ordering::Less => {
             return Err(KernelError::internal_error(
                 "max column ID went backwards during schema evolution",
-            ))
+            ));
         }
     };
     Ok(SchemaEvolutionResult {
@@ -306,10 +306,10 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
-    use crate::expressions::{column_name, ColumnName};
+    use crate::expressions::{ColumnName, column_name};
     use crate::schema::{
-        schema, ArrayType, ColumnMetadataKey, DataType, MapType, MetadataColumnSpec, MetadataValue,
-        StructField, StructType,
+        ArrayType, ColumnMetadataKey, DataType, MapType, MetadataColumnSpec, MetadataValue,
+        StructField, StructType, schema,
     };
 
     fn simple_schema() -> StructType {
@@ -963,7 +963,7 @@ mod tests {
     fn field_with_id_only(name: &str, ty: DataType, id: i64) -> StructField {
         let mut f = StructField::nullable(name, ty);
         f.metadata.insert(
-            ColumnMetadataKey::ColumnMappingId.as_ref().to_string(),
+            ColumnMetadataKey::ColumnMappingId.as_ref().into(),
             MetadataValue::Number(id),
         );
         f
@@ -999,9 +999,7 @@ mod tests {
     fn add_column_with_only_physical_name_allocates_id() {
         let mut field = StructField::nullable("named", DataType::STRING);
         field.metadata.insert(
-            ColumnMetadataKey::ColumnMappingPhysicalName
-                .as_ref()
-                .to_string(),
+            ColumnMetadataKey::ColumnMappingPhysicalName.as_ref().into(),
             MetadataValue::String("user-supplied-name".to_string()),
         );
         let ops = vec![SchemaOperation::add_column(None, field)];
@@ -1054,7 +1052,7 @@ mod tests {
     fn add_column_with_wrong_typed_id_is_rejected() {
         let mut field = StructField::nullable("bad", DataType::STRING);
         field.metadata.insert(
-            ColumnMetadataKey::ColumnMappingId.as_ref().to_string(),
+            ColumnMetadataKey::ColumnMappingId.as_ref().into(),
             MetadataValue::String("not-a-number".to_string()),
         );
         let ops = vec![SchemaOperation::add_column(None, field)];
@@ -1080,7 +1078,7 @@ mod tests {
     fn stale_max_column_id_is_self_healed_by_schema_walk() {
         let mut existing = StructField::nullable("existing", DataType::STRING);
         existing.metadata.insert(
-            ColumnMetadataKey::ColumnMappingId.as_ref().to_string(),
+            ColumnMetadataKey::ColumnMappingId.as_ref().into(),
             MetadataValue::Number(42),
         );
         let schema = schema! {

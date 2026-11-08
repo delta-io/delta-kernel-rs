@@ -104,6 +104,17 @@ pub(crate) fn try_parse_uri(uri: impl AsRef<str>) -> KernelResult<Url> {
     Ok(url)
 }
 
+/// Returns whether `uri` resolves, as in [`try_parse_uri`], to a local path that does not exist.
+///
+/// Returns `false` for non-local URLs and for paths whose existence cannot be determined, for
+/// example because of a permission error: such a failure does not prove that the path is absent.
+pub(crate) fn is_absent_local_path(uri: &str) -> bool {
+    matches!(
+        resolve_uri_type(uri),
+        Ok(UriType::LocalPath(path)) if matches!(path.try_exists(), Ok(false))
+    )
+}
+
 #[allow(unused)]
 #[derive(Debug)]
 enum UriType {
@@ -311,8 +322,8 @@ mod tests {
     }
 
     mod on_complete_tests {
-        use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
         use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
         use super::*;
 

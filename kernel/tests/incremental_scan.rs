@@ -12,18 +12,18 @@ use delta_kernel::arrow::array::{Int32Array, MapArray, RecordBatch, StringArray,
 use delta_kernel::arrow::datatypes::Schema as ArrowSchema;
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
-use delta_kernel::expressions::{col, lit, Predicate as Pred, PredicateRef, Scalar};
+use delta_kernel::expressions::{Predicate as Pred, PredicateRef, Scalar, expr};
 use delta_kernel::incremental_scan::{
     IncrementalListing, IncrementalListingAgainstBase, IncrementalScanStream,
     IncrementalScanSummary,
 };
 use delta_kernel::log_replay::FileActionKey;
+use delta_kernel::object_store::ObjectStoreExt;
 use delta_kernel::object_store::memory::InMemory;
 use delta_kernel::object_store::path::Path as ObjectStorePath;
-use delta_kernel::object_store::ObjectStoreExt;
-use delta_kernel::scan::state::ScanFile;
 use delta_kernel::scan::PartitionValuesOptions;
-use delta_kernel::schema::{schema_ref, StructType};
+use delta_kernel::scan::state::ScanFile;
+use delta_kernel::schema::{StructType, schema_ref};
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
 use delta_kernel::{
@@ -34,11 +34,11 @@ use test_utils::delta_kernel_default_engine::executor::tokio::TokioBackgroundExe
 use test_utils::delta_kernel_default_engine::json::DefaultJsonHandler;
 use test_utils::delta_kernel_default_engine::{DefaultEngine, DefaultEngineBuilder};
 use test_utils::{
-    actions_to_string, actions_to_string_catalog_managed, actions_to_string_partitioned,
-    add_commit, add_staged_commit, assert_result_error_with_message,
+    TestAction, actions_to_string, actions_to_string_catalog_managed,
+    actions_to_string_partitioned, add_commit, add_staged_commit, assert_result_error_with_message,
     compacted_log_path_for_versions, create_log_path, create_table_and_load_snapshot,
     delta_path_for_version, get_column, into_record_batch, test_table_setup_mt,
-    write_batch_to_table, TestAction,
+    write_batch_to_table,
 };
 use url::Url;
 
@@ -409,8 +409,8 @@ async fn dv_update_remove_no_dv_add_with_dv() -> Result<(), Box<dyn std::error::
 // `FileNotFound` while reading the missing commit. Consumers fall back to a full scan
 // on any stream error.
 #[tokio::test]
-async fn missing_commit_file_surfaces_error_during_iteration(
-) -> Result<(), Box<dyn std::error::Error>> {
+async fn missing_commit_file_surfaces_error_during_iteration()
+-> Result<(), Box<dyn std::error::Error>> {
     let (storage, engine, table_url) = setup_test();
     let table_root = table_url.as_str();
 
@@ -638,8 +638,8 @@ async fn into_summary_returns_live_keys() -> Result<(), Box<dyn std::error::Erro
 // descending commit-version order. Commits whose Adds were all cancelled by later
 // Removes do not produce an item, but they still update dedup state for older commits.
 #[tokio::test]
-async fn streaming_yields_batches_newest_first_skipping_cancelled_commits(
-) -> Result<(), Box<dyn std::error::Error>> {
+async fn streaming_yields_batches_newest_first_skipping_cancelled_commits()
+-> Result<(), Box<dyn std::error::Error>> {
     let (storage, engine, table_url) = setup_test();
     let table_root = table_url.as_str();
 
@@ -1010,8 +1010,8 @@ async fn classifies_metadata_only_re_adds(
 // `into_summary_against_base_iter(base_keys)`. This is the documented streaming consumer
 // pattern.
 #[tokio::test]
-async fn into_summary_after_manual_streaming_classifies_duplicates(
-) -> Result<(), Box<dyn std::error::Error>> {
+async fn into_summary_after_manual_streaming_classifies_duplicates()
+-> Result<(), Box<dyn std::error::Error>> {
     let (storage, engine, table_url) = setup_test();
     let table_root = table_url.as_str();
 
@@ -1287,8 +1287,8 @@ async fn partitioned_snapshot(
 }
 
 #[tokio::test]
-async fn incremental_scan_rejects_requested_parsed_partition_values(
-) -> Result<(), Box<dyn std::error::Error>> {
+async fn incremental_scan_rejects_requested_parsed_partition_values()
+-> Result<(), Box<dyn std::error::Error>> {
     let (engine, target) = partitioned_snapshot(Partitioning::Timestamp).await?;
     let result = target
         .incremental_scan_builder(0 /* base_version */)
@@ -1345,90 +1345,90 @@ async fn incremental_scan_preserves_raw_partition_values_without_parsed_partitio
 // Under UTC, the offset-less value is interpreted as 2024-01-15T12:30:45.123456Z (UTC).
 // The file is expected not to be pruned.
 #[case::utc_before(
-    col!("p_ts").lt(lit(Scalar::Timestamp(
+    Pred::from_expr(expr!(col("p_ts") < lit(Scalar::Timestamp(
         1_705_334_400_000_000 /* 2024-01-15T16:00:00Z (UTC) */
-    ))),
+    )))),
     None /* timezone: default UTC */,
     1 /* expected surviving file count */
 )]
 // Under UTC, the offset-less value is interpreted as 2024-01-15T12:30:45.123456Z (UTC).
 // The file is expected to be pruned.
 #[case::utc_after(
-    col!("p_ts").gt(lit(Scalar::Timestamp(
+    Pred::from_expr(expr!(col("p_ts") > lit(Scalar::Timestamp(
         1_705_334_400_000_000 /* 2024-01-15T16:00:00Z (UTC) */
-    ))),
+    )))),
     None /* timezone: default UTC */,
     0 /* expected surviving file count */
 )]
 // Under America/Los_Angeles, the offset-less value is interpreted as
 // 2024-01-15T20:30:45.123456Z (UTC). The file is expected to be pruned.
 #[case::los_angeles_before(
-    col!("p_ts").lt(lit(Scalar::Timestamp(
+    Pred::from_expr(expr!(col("p_ts") < lit(Scalar::Timestamp(
         1_705_334_400_000_000 /* 2024-01-15T16:00:00Z (UTC) */
-    ))),
+    )))),
     Some("America/Los_Angeles") /* timezone */,
     0 /* expected surviving file count */
 )]
 // Under America/Los_Angeles, the offset-less value is interpreted as
 // 2024-01-15T20:30:45.123456Z (UTC). The file is expected not to be pruned.
 #[case::los_angeles_after(
-    col!("p_ts").gt(lit(Scalar::Timestamp(
+    Pred::from_expr(expr!(col("p_ts") > lit(Scalar::Timestamp(
         1_705_334_400_000_000 /* 2024-01-15T16:00:00Z (UTC) */
-    ))),
+    )))),
     Some("America/Los_Angeles") /* timezone */,
     1 /* expected surviving file count */
 )]
 // Under UTC, the offset-less value is interpreted as 2024-01-15T12:30:45.123456Z (UTC).
 // The file is expected not to be pruned.
 #[case::utc_equal(
-    col!("p_ts").eq(lit(Scalar::Timestamp(
+    Pred::from_expr(expr!(col("p_ts") == lit(Scalar::Timestamp(
         1_705_321_845_123_456 /* 2024-01-15T12:30:45.123456Z (UTC) */
-    ))),
+    )))),
     None /* timezone: default UTC */,
     1 /* expected surviving file count */
 )]
 // Under UTC, the offset-less value is interpreted as 2024-01-15T12:30:45.123456Z (UTC).
 // The file is expected not to be pruned.
 #[case::utc_less_than_or_equal(
-    col!("p_ts").le(lit(Scalar::Timestamp(
+    Pred::from_expr(expr!(col("p_ts") <= lit(Scalar::Timestamp(
         1_705_321_845_123_456 /* 2024-01-15T12:30:45.123456Z (UTC) */
-    ))),
+    )))),
     None /* timezone: default UTC */,
     1 /* expected surviving file count */
 )]
 // Under UTC, the offset-less value is interpreted as 2024-01-15T12:30:45.123456Z (UTC).
 // The file is expected not to be pruned.
 #[case::utc_greater_than_or_equal(
-    col!("p_ts").ge(lit(Scalar::Timestamp(
+    Pred::from_expr(expr!(col("p_ts") >= lit(Scalar::Timestamp(
         1_705_321_845_123_456 /* 2024-01-15T12:30:45.123456Z (UTC) */
-    ))),
+    )))),
     None /* timezone: default UTC */,
     1 /* expected surviving file count */
 )]
 // Under America/Los_Angeles, the offset-less value is interpreted as
 // 2024-01-15T20:30:45.123456Z (UTC). The file is expected not to be pruned.
 #[case::los_angeles_equal(
-    col!("p_ts").eq(lit(Scalar::Timestamp(
+    Pred::from_expr(expr!(col("p_ts") == lit(Scalar::Timestamp(
         1_705_350_645_123_456 /* 2024-01-15T20:30:45.123456Z (UTC) */
-    ))),
+    )))),
     Some("America/Los_Angeles") /* timezone */,
     1 /* expected surviving file count */
 )]
 // Under America/Los_Angeles, the offset-less value is interpreted as
 // 2024-01-15T20:30:45.123456Z (UTC). The file is expected not to be pruned.
 #[case::los_angeles_less_than_or_equal(
-    col!("p_ts").le(lit(Scalar::Timestamp(
+    Pred::from_expr(expr!(col("p_ts") <= lit(Scalar::Timestamp(
         1_705_350_645_123_456 /* 2024-01-15T20:30:45.123456Z (UTC) */
-    ))),
+    )))),
     Some("America/Los_Angeles") /* timezone */,
     1 /* expected surviving file count */
 )]
 // Under America/Los_Angeles, the offset-less value is interpreted as
 // 2024-01-15T20:30:45.123456Z (UTC). The file is expected not to be pruned.
 #[case::los_angeles_greater_than_or_equal(
-    col!("p_ts").ge(lit(Scalar::Timestamp(
+    Pred::from_expr(expr!(col("p_ts") >= lit(Scalar::Timestamp(
         1_705_350_645_123_456 /* 2024-01-15T20:30:45.123456Z (UTC) */
-    ))),
+    )))),
     Some("America/Los_Angeles") /* timezone */,
     1 /* expected surviving file count */
 )]
@@ -1457,13 +1457,13 @@ async fn incremental_scan_partition_predicate_uses_timezone(
 #[rstest]
 #[case::timestamp_partition(
     Partitioning::Timestamp,
-    col!("p_ts").gt(lit(Scalar::Timestamp(
+    Pred::from_expr(expr!(col("p_ts") > lit(Scalar::Timestamp(
         1_705_334_400_000_000 /* 2024-01-15T16:00:00Z (UTC) */
-    ))),
+    )))),
 )]
 #[case::int_partition(
     Partitioning::Integer,
-    col!("p_int").gt(lit(0)),
+    Pred::from_expr(expr!(col("p_int") > 0)),
 )]
 #[tokio::test]
 async fn incremental_scan_reports_invalid_timezone_when_expression_used(
@@ -1492,11 +1492,11 @@ async fn incremental_scan_reports_invalid_timezone_when_expression_used(
 )]
 #[case::unpartitioned(
     Partitioning::Unpartitioned,
-    Some(col!("p_ts").gt(lit(Scalar::Timestamp(0)))),
+    Some(Pred::from_expr(expr!(col("p_ts") > lit(Scalar::Timestamp(0))))),
 )]
 #[case::data_column_predicate(
     Partitioning::Timestamp,
-    Some(col!("value").gt(lit(0))),
+    Some(Pred::from_expr(expr!(col("value") > 0))),
 )]
 #[tokio::test]
 async fn incremental_scan_ignores_invalid_timezone_without_partition_predicate(
@@ -1519,15 +1519,15 @@ async fn incremental_scan_ignores_invalid_timezone_without_partition_predicate(
 
 #[rstest]
 #[case::less_than(
-    col!("ts").lt(lit(Scalar::Timestamp(
+    Pred::from_expr(expr!(col("ts") < lit(Scalar::Timestamp(
         1_705_350_645_123_456 /* 2024-01-15T20:30:45.123456Z (UTC) */
-    ))),
+    )))),
     &["base_before.parquet", "incremental_before.parquet"],
 )]
 #[case::less_than_or_equal(
-    col!("ts").le(lit(Scalar::Timestamp(
+    Pred::from_expr(expr!(col("ts") <= lit(Scalar::Timestamp(
         1_705_350_645_123_456 /* 2024-01-15T20:30:45.123456Z (UTC) */
-    ))),
+    )))),
     &[
         "base_before.parquet",
         "base_equal.parquet",
@@ -1536,15 +1536,15 @@ async fn incremental_scan_ignores_invalid_timezone_without_partition_predicate(
     ],
 )]
 #[case::equal(
-    col!("ts").eq(lit(Scalar::Timestamp(
+    Pred::from_expr(expr!(col("ts") == lit(Scalar::Timestamp(
         1_705_350_645_123_456 /* 2024-01-15T20:30:45.123456Z (UTC) */
-    ))),
+    )))),
     &["base_equal.parquet", "incremental_equal.parquet"],
 )]
 #[case::greater_than_or_equal(
-    col!("ts").ge(lit(Scalar::Timestamp(
+    Pred::from_expr(expr!(col("ts") >= lit(Scalar::Timestamp(
         1_705_350_645_123_456 /* 2024-01-15T20:30:45.123456Z (UTC) */
-    ))),
+    )))),
     &[
         "base_equal.parquet",
         "base_after.parquet",
@@ -1553,9 +1553,9 @@ async fn incremental_scan_ignores_invalid_timezone_without_partition_predicate(
     ],
 )]
 #[case::greater_than(
-    col!("ts").gt(lit(Scalar::Timestamp(
+    Pred::from_expr(expr!(col("ts") > lit(Scalar::Timestamp(
         1_705_350_645_123_456 /* 2024-01-15T20:30:45.123456Z (UTC) */
-    ))),
+    )))),
     &["base_after.parquet", "incremental_after.parquet"],
 )]
 #[tokio::test]
@@ -1739,7 +1739,7 @@ fn add_with_dv_and_id_stats(
 // vector agrees with `live_adds` (no summary/stream drift).
 #[rstest]
 #[case::pushdown(
-    Some(Arc::new(col!("id").gt(lit(25i32))) as PredicateRef),
+    Some(Arc::new(Pred::from_expr(expr!(col("id") > 25i32))) as PredicateRef),
     vec!["high.parquet"],
 )]
 #[case::no_predicate(None, vec!["low.parquet", "mid.parquet", "high.parquet"])]
@@ -1815,7 +1815,7 @@ async fn added_file_without_stats_is_always_kept() -> Result<(), Box<dyn std::er
         .at_version(1)
         .build(engine.as_ref())?;
 
-    let predicate: PredicateRef = Arc::new(col!("id").gt(lit(25i32)));
+    let predicate: PredicateRef = Arc::new(Pred::from_expr(expr!(col("id") > 25i32)));
     let listing = unwrap_listing(
         target
             .incremental_scan_builder(0)
@@ -1867,7 +1867,7 @@ async fn removes_are_never_filtered_by_predicate() -> Result<(), Box<dyn std::er
         .at_version(2)
         .build(engine.as_ref())?;
 
-    let predicate: PredicateRef = Arc::new(col!("id").gt(lit(25i32)));
+    let predicate: PredicateRef = Arc::new(Pred::from_expr(expr!(col("id") > 25i32)));
     let listing = unwrap_listing(
         target
             .incremental_scan_builder(0)
@@ -1894,8 +1894,8 @@ async fn removes_are_never_filtered_by_predicate() -> Result<(), Box<dyn std::er
 // stream, but Removes are still reported. A tautology (`id > 25 OR TRUE`) is useless for
 // skipping and behaves like no predicate.
 #[rstest]
-#[case::static_skip_all(Pred::and(col!("id").gt(lit(25i32)), Pred::FALSE), 0)]
-#[case::tautology(Pred::or(col!("id").gt(lit(25i32)), Pred::TRUE), 2)]
+#[case::static_skip_all(Pred::from_expr(expr!(and(col("id") > 25i32, false))), 0)]
+#[case::tautology(Pred::from_expr(expr!(or(col("id") > 25i32, true))), 2)]
 #[tokio::test]
 async fn static_skip_all_and_tautology(
     #[case] predicate: Pred,
@@ -1945,8 +1945,8 @@ async fn static_skip_all_and_tautology(
 // intersection runs over the predicate-pruned live Adds, so a base key whose file the
 // predicate dropped is not reported as a duplicate.
 #[tokio::test]
-async fn against_base_classification_composes_with_predicate(
-) -> Result<(), Box<dyn std::error::Error>> {
+async fn against_base_classification_composes_with_predicate()
+-> Result<(), Box<dyn std::error::Error>> {
     let (storage, engine, table_url) = setup_test();
     let table_root = table_url.as_str();
 
@@ -1972,7 +1972,7 @@ async fn against_base_classification_composes_with_predicate(
     // Both files are in the consumer's base. Only the predicate-surviving one should classify
     // as a duplicate; the dropped file was pruned before base intersection.
     let base_keys = [key("matches.parquet"), key("dropped.parquet")];
-    let predicate: PredicateRef = Arc::new(col!("id").gt(lit(25i32)));
+    let predicate: PredicateRef = Arc::new(Pred::from_expr(expr!(col("id") > 25i32)));
     let stream = target
         .incremental_scan_builder(0)
         .with_predicate(predicate)
@@ -1996,8 +1996,8 @@ async fn against_base_classification_composes_with_predicate(
 // metadata does not match the predicate, so a cold scan at the target would exclude it too --
 // net zero live Adds. Guards the "record seen regardless of the mask" invariant.
 #[tokio::test]
-async fn pruned_newest_add_suppresses_older_matching_duplicate(
-) -> Result<(), Box<dyn std::error::Error>> {
+async fn pruned_newest_add_suppresses_older_matching_duplicate()
+-> Result<(), Box<dyn std::error::Error>> {
     let (storage, engine, table_url) = setup_test();
     let table_root = table_url.as_str();
 
@@ -2029,7 +2029,7 @@ async fn pruned_newest_add_suppresses_older_matching_duplicate(
         .at_version(2)
         .build(engine.as_ref())?;
 
-    let predicate: PredicateRef = Arc::new(col!("id").gt(lit(25i32)));
+    let predicate: PredicateRef = Arc::new(Pred::from_expr(expr!(col("id") > 25i32)));
     let listing = unwrap_listing(
         target
             .incremental_scan_builder(0)
@@ -2072,7 +2072,7 @@ async fn unknown_column_predicate_fails_at_build() -> Result<(), Box<dyn std::er
         .at_version(1)
         .build(engine.as_ref())?;
 
-    let predicate: PredicateRef = Arc::new(col!("nonexistent").gt(lit(1i32)));
+    let predicate: PredicateRef = Arc::new(Pred::from_expr(expr!(col("nonexistent") > 1i32)));
     let result = target
         .incremental_scan_builder(0)
         .with_predicate(predicate)
@@ -2113,7 +2113,7 @@ async fn partition_column_predicate_prunes_added_files() -> Result<(), Box<dyn s
         .at_version(1)
         .build(engine.as_ref())?;
 
-    let predicate: PredicateRef = Arc::new(col!("val").eq(lit("x")));
+    let predicate: PredicateRef = Arc::new(Pred::from_expr(expr!(col("val") == "x")));
     let listing = unwrap_listing(
         target
             .incremental_scan_builder(0)
@@ -2134,8 +2134,8 @@ async fn partition_column_predicate_prunes_added_files() -> Result<(), Box<dyn s
 // `add.stats`, the partition conjunct skips on `add.partitionValues`. Only the file satisfying
 // both survives; a file failing either is dropped.
 #[tokio::test]
-async fn mixed_data_and_partition_predicate_prunes_on_both(
-) -> Result<(), Box<dyn std::error::Error>> {
+async fn mixed_data_and_partition_predicate_prunes_on_both()
+-> Result<(), Box<dyn std::error::Error>> {
     let (storage, engine, table_url) = setup_test();
     let table_root = table_url.as_str();
 
@@ -2160,10 +2160,10 @@ async fn mixed_data_and_partition_predicate_prunes_on_both(
         .at_version(1)
         .build(engine.as_ref())?;
 
-    let predicate: PredicateRef = Arc::new(Pred::and(
-        col!("id").gt(lit(25i32)),
-        col!("val").eq(lit("x")),
-    ));
+    let predicate: PredicateRef = Arc::new(Pred::from_expr(expr!(and(
+        col("id") > 25i32,
+        col("val") == "x"
+    ))));
     let listing = unwrap_listing(
         target
             .incremental_scan_builder(0)
@@ -2209,7 +2209,7 @@ async fn pushdown_resolves_column_mapping_physical_names() -> Result<(), Box<dyn
         .at_version(1)
         .build(engine.as_ref())?;
 
-    let predicate: PredicateRef = Arc::new(col!("id").gt(lit(25i32)));
+    let predicate: PredicateRef = Arc::new(Pred::from_expr(expr!(col("id") > 25i32)));
     let listing = unwrap_listing(
         target
             .incremental_scan_builder(0)
@@ -2252,7 +2252,7 @@ async fn pushdown_prunes_dv_bearing_adds_keyed_by_dv() -> Result<(), Box<dyn std
         .at_version(1)
         .build(engine.as_ref())?;
 
-    let predicate: PredicateRef = Arc::new(col!("id").gt(lit(25i32)));
+    let predicate: PredicateRef = Arc::new(Pred::from_expr(expr!(col("id") > 25i32)));
     let listing = unwrap_listing(
         target
             .incremental_scan_builder(0)
@@ -2370,8 +2370,8 @@ fn full_scan_surviving_paths(
 // even though the base prunes via the checkpoint's `stats_parsed` while the incremental delta
 // prunes via `add.stats` JSON. Guards the stats-parsing divergence the two paths could exhibit.
 #[tokio::test(flavor = "multi_thread")]
-async fn predicate_pushdown_reconciled_with_base_matches_full_scan_across_checkpoint(
-) -> Result<(), Box<dyn std::error::Error>> {
+async fn predicate_pushdown_reconciled_with_base_matches_full_scan_across_checkpoint()
+-> Result<(), Box<dyn std::error::Error>> {
     let (_tmp_dir, table_path, engine) = test_table_setup_mt()?;
     let table_url = Url::from_directory_path(&table_path).map_err(|_| "invalid table path")?;
     let schema = id_schema();
@@ -2404,7 +2404,7 @@ async fn predicate_pushdown_reconciled_with_base_matches_full_scan_across_checkp
     }
     let target_version = snapshot.version();
 
-    let predicate: PredicateRef = Arc::new(col!("id").gt(lit(20i32)));
+    let predicate: PredicateRef = Arc::new(Pred::from_expr(expr!(col("id") > 20i32)));
 
     // Base full scan (reads the checkpoint's `stats_parsed`) and target full scan, both loaded
     // fresh off disk so they replay through the checkpoint.

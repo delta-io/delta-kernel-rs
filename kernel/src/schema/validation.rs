@@ -10,7 +10,7 @@ use crate::table_changes::{
     CHANGE_TYPE_COL_NAME, COMMIT_TIMESTAMP_COL_NAME, COMMIT_VERSION_COL_NAME,
 };
 use crate::table_features::ColumnMappingMode;
-use crate::transforms::{transform_output_type, SchemaTransform};
+use crate::transforms::{SchemaTransform, transform_output_type};
 use crate::utils::require;
 use crate::{KernelError, KernelResult};
 
@@ -197,7 +197,7 @@ mod tests {
 
     use super::*;
     use crate::schema::{
-        schema, ArrayType, ColumnMetadataKey, DataType, MetadataValue, StructField, StructType,
+        ArrayType, ColumnMetadataKey, DataType, MetadataValue, StructField, StructType, schema,
     };
 
     // === Schema builders for test cases ===
@@ -304,7 +304,7 @@ mod tests {
     fn field_with_invariant(name: &str, data_type: DataType, nullable: bool) -> StructField {
         let mut field = StructField::new(name, data_type, nullable);
         field.metadata.insert(
-            ColumnMetadataKey::Invariants.as_ref().to_string(),
+            ColumnMetadataKey::Invariants.as_ref().into(),
             MetadataValue::String(r#"{"expression": {"expression": "x > 0"}}"#.to_string()),
         );
         field

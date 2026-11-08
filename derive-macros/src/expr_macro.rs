@@ -2,7 +2,7 @@
 //! and comparison syntax; this module restricts calls to the constructors documented by `expr!`.
 //! Arguments to `lit` and `path` remain Rust expressions, so callers can supply computed values.
 
-use proc_macro2::TokenStream;
+use proc_macro2::{Span, TokenStream};
 use quote::{quote, quote_spanned};
 use syn::ext::IdentExt;
 use syn::parse::{ParseStream, Parser};
@@ -64,7 +64,7 @@ fn emit(expr: &Expr, kernel: &Path) -> syn::Result<TokenStream> {
                     return Err(Error::new_spanned(
                         binary.op,
                         "supported operators are ==, !=, <, <=, >, >=",
-                    ))
+                    ));
                 }
             };
             let method = Ident::new(method, binary.op.span());
@@ -106,7 +106,7 @@ fn emit_call(call: &ExprCall, kernel: &Path) -> syn::Result<TokenStream> {
                     call,
                     "col() requires one string literal; \
                      use path() for explicit or computed column segments",
-                ))
+                ));
             }
         };
         return Ok(quote! { #kernel::expressions::col!(#path) });
@@ -114,24 +114,24 @@ fn emit_call(call: &ExprCall, kernel: &Path) -> syn::Result<TokenStream> {
     let arity = match name.as_str() {
         "lit" | "null" | "not" | "is_null" | "is_not_null" => Some(1),
         "eq" | "ne" | "lt" | "le" | "gt" | "ge" | "distinct" => Some(2),
-        "coalesce" | "and" | "or" | "path" => None,
+        "coalesce" | "and" | "or" | "path" | "make_struct" | "guarded_struct" => None,
         _ => {
             return Err(Error::new_spanned(
                 method,
                 format!("unsupported expression call: {name}"),
-            ))
-        }
-    };
-    if let Some(arity) = arity {
-        if args.len() != arity {
-            return Err(Error::new_spanned(
-                call,
-                format!(
-                    "{name}() requires {arity} argument{}",
-                    if arity == 1 { "" } else { "s" }
-                ),
             ));
         }
+    };
+    if let Some(arity) = arity
+        && args.len() != arity
+    {
+        return Err(Error::new_spanned(
+            call,
+            format!(
+                "{name}() requires {arity} argument{}",
+                if arity == 1 { "" } else { "s" }
+            ),
+        ));
     }
     match name.as_str() {
         "lit" => Ok(quote! { #kernel::expressions::lit(#args) }),
@@ -166,6 +166,26 @@ fn emit_call(call: &ExprCall, kernel: &Path) -> syn::Result<TokenStream> {
                 ])
             })
         }
+        "guarded_struct" => {
+            let mut args = args.iter();
+            let guard = args.next().ok_or_else(|| {
+                Error::new_spanned(call, "guarded_struct() requires a guard before its fields")
+            })?;
+            let guard = emit(guard, kernel)?;
+            let fields = args
+                .map(|arg| emit(arg, kernel))
+                .collect::<syn::Result<Vec<_>>>()?;
+            let guard_binding = Ident::new("__kernel_struct_guard", Span::mixed_site());
+            // The builder takes fields first. Bind the guard first without capturing names in
+            // caller-supplied field arguments.
+            Ok(quote! {{
+                let #guard_binding = #guard;
+                #kernel::expressions::Expression::struct_with_nullability_from(
+                    ::std::vec::Vec::<#kernel::expressions::Expression>::from([#(#fields),*]),
+                    #guard_binding,
+                )
+            }})
+        }
         _ => {
             let children = args
                 .iter()
@@ -174,6 +194,11 @@ fn emit_call(call: &ExprCall, kernel: &Path) -> syn::Result<TokenStream> {
             match name.as_str() {
                 "coalesce" => Ok(quote! {
                     #kernel::expressions::Expression::coalesce(
+                        ::std::vec::Vec::<#kernel::expressions::Expression>::from([#(#children),*]),
+                    )
+                }),
+                "make_struct" => Ok(quote! {
+                    #kernel::expressions::Expression::struct_from(
                         ::std::vec::Vec::<#kernel::expressions::Expression>::from([#(#children),*]),
                     )
                 }),
@@ -207,10 +232,9 @@ fn emit_call(call: &ExprCall, kernel: &Path) -> syn::Result<TokenStream> {
 // Forwarded `:literal` and `:expr` fragments arrive in invisible groups, which must preserve the
 // same constructor rules as the original tokens. Explicit parentheses remain part of the syntax.
 fn ungroup(mut expr: &Expr) -> &Expr {
-    while let Expr::Group(group) = expr {
-        if !group.attrs.is_empty() {
-            break;
-        }
+    while let Expr::Group(group) = expr
+        && group.attrs.is_empty()
+    {
         expr = &group.expr;
     }
     expr
@@ -232,6 +256,11 @@ mod tests {
     #[case::missing_binary_arg(quote!(gt("a")), "requires 2 argument")]
     #[case::extra_binary_arg(quote!(eq("a", 1, 2)), "requires 2 argument")]
     #[case::extra_null_predicate_arg(quote!(is_null("a", "b")), "requires 1 argument")]
+    #[case::missing_struct_guard(quote!(guarded_struct()), "requires a guard")]
+    #[case::invalid_struct_field(quote!(make_struct(value)), "expected an expr! constructor")]
+    #[case::invalid_struct_guard(quote!(guarded_struct(guard, 1)), "expected an expr! constructor")]
+    #[case::unknown_struct_field(quote!(make_struct(unknown(1))), "unsupported expression call")]
+    #[case::unknown_struct_guard(quote!(guarded_struct(unknown(1))), "unsupported expression call")]
     #[case::empty_path(quote!(path()), "at least one column segment")]
     #[case::missing_literal_arg(quote!(lit()), "requires 1 argument")]
     #[case::extra_literal_arg(quote!(lit(1, 2)), "requires 1 argument")]
@@ -287,6 +316,8 @@ mod tests {
     #[case::missing_operand(quote!("a" >=))]
     #[case::missing_comma(quote!(and("a" > 0 "b" < 1)))]
     #[case::extra_tokens(quote!("a" > 1; "b"))]
+    #[case::missing_struct_comma(quote!(make_struct(1 2)))]
+    #[case::missing_struct_guard(quote!(guarded_struct(, 1)))]
     fn rejects_structurally_invalid_input(#[case] input: TokenStream) {
         assert!(expand(quote! { kernel; #input }).is_err());
     }

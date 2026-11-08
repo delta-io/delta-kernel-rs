@@ -2,14 +2,14 @@
 
 use std::sync::Arc;
 
+use delta_kernel::KernelResult;
 use delta_kernel::committer::FileSystemCommitter;
-use delta_kernel::expressions::{column_name, ColumnName};
-use delta_kernel::schema::{schema_ref, DataType, StructField, StructType};
+use delta_kernel::expressions::{ColumnName, column_name};
+use delta_kernel::schema::{DataType, StructField, StructType, schema_ref};
 use delta_kernel::snapshot::Snapshot;
 use delta_kernel::table_features::TableFeature;
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
-use delta_kernel::KernelResult;
 use rstest::rstest;
 use test_utils::{assert_result_error_with_message, test_table_setup};
 
@@ -45,7 +45,9 @@ fn clustering_test_schema() -> KernelResult<Arc<StructType>> {
 #[case::nested_mismatched_casing(vec![vec!["ADDRESS", "CITY"]])]
 #[case::mixed(vec![vec!["id"], vec!["name"], vec!["address", "city"], vec!["address", "zip"], vec!["l1", "l2", "l3", "l4", "value"]])]
 #[tokio::test]
-async fn test_create_clustered_table(#[case] col_paths: Vec<Vec<&str>>) -> KernelResult<()> {
+async fn test_create_clustered_table(
+    #[case] col_paths: Vec<Vec<&str>>,
+) -> delta_kernel::Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
     let schema = clustering_test_schema()?;
     let input_cols: Vec<ColumnName> = col_paths
@@ -102,7 +104,7 @@ async fn test_create_clustered_table(#[case] col_paths: Vec<Vec<&str>>) -> Kerne
 /// AND uses `DataLayout::Clustered`. Both would try to add DomainMetadata, but we should
 /// only have it once in the feature lists.
 #[tokio::test]
-async fn test_clustering_with_explicit_feature_signal_no_duplicates() -> KernelResult<()> {
+async fn test_clustering_with_explicit_feature_signal_no_duplicates() -> delta_kernel::Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
     let schema = simple_schema()?;

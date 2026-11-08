@@ -15,7 +15,6 @@ use crate::{Engine, KernelResult, KernelResultIterator};
 /// Each sidecar is a Parquet file that, like a V2 checkpoint sidecar, holds one action per row in
 /// a top-level `action` column described by `source_schema`, and whose path is relative to the
 /// `_delta_log/_sidecars/` directory under `log_root` (see [`Sidecar::to_filemeta`]).
-#[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn read_sidecar_actions(
     engine: &dyn Engine,
     log_root: &LogRoot,
@@ -51,21 +50,21 @@ mod tests {
     use url::Url;
 
     use super::*;
+    use crate::KernelError;
     use crate::actions::{
-        DomainMetadata, SetTransaction, DOMAIN_METADATA_NAME, LOG_DOMAIN_METADATA_SCHEMA,
-        LOG_TXN_SCHEMA, SET_TRANSACTION_NAME,
+        DOMAIN_METADATA_NAME, DomainMetadata, LOG_DOMAIN_METADATA_SCHEMA, LOG_TXN_SCHEMA,
+        SET_TRANSACTION_NAME, SetTransaction,
     };
     use crate::arrow::array::{AsArray as _, RecordBatch};
     use crate::cancellation::CancellationTokenRef;
+    use crate::engine::CancellableEngine;
     use crate::engine::arrow_data::EngineDataArrowExt as _;
     use crate::engine::sync::SyncEngine;
-    use crate::engine::CancellableEngine;
     use crate::expressions::Scalar;
     use crate::object_store::memory::InMemory;
     use crate::schema::StructType;
     use crate::unit_test_utils::adaptive_metadata_fixtures::write_sidecar;
-    use crate::unit_test_utils::{assert_result_error_with_message, TestCancellationToken};
-    use crate::KernelError;
+    use crate::unit_test_utils::{TestCancellationToken, assert_result_error_with_message};
 
     fn table_root() -> Url {
         Url::parse("memory:///").unwrap()

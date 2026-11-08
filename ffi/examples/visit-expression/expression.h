@@ -67,6 +67,7 @@ enum ExpressionType {
   OpaquePredicate,
   Unknown,
   MapToStruct,
+  CaseWhen,
 };
 enum VariadicType {
   And,
@@ -132,6 +133,11 @@ struct Column {
 struct MapToStructExpr {
   ExpressionItemList child_expr;
   char* timestamp_timezone;
+};
+struct CaseWhenExpr {
+  ExpressionItemList conditions;
+  ExpressionItemList results;
+  ExpressionItemList else_expr;
 };
 struct BinaryData {
   uint8_t* buf;
@@ -341,6 +347,18 @@ DEFINE_VARIADIC(visit_expr_struct_expr, StructExpression)
 DEFINE_VARIADIC(visit_expr_coalesce, Coalesce)
 DEFINE_VARIADIC(visit_expr_array, ArrayConstructor)
 #undef DEFINE_VARIADIC
+
+void visit_expr_case_when(void* data,
+                          uintptr_t sibling_list_id,
+                          uintptr_t condition_list_id,
+                          uintptr_t result_list_id,
+                          uintptr_t else_list_id) {
+  struct CaseWhenExpr* case_when = malloc(sizeof(struct CaseWhenExpr));
+  case_when->conditions = get_expr_list(data, condition_list_id);
+  case_when->results = get_expr_list(data, result_list_id);
+  case_when->else_expr = get_expr_list(data, else_list_id);
+  put_expr_item(data, sibling_list_id, case_when, CaseWhen);
+}
 
 // Sort by field name, breaking ties by pointer address to ensure stability.
 int patch_op_cmp(const void* a, const void* b) {
@@ -559,6 +577,7 @@ ExpressionItemList construct_expression(SharedExpression* expression) {
     .visit_map_to_struct = visit_map_to_struct_expr,
     .visit_coalesce = visit_expr_coalesce,
     .visit_array = visit_expr_array,
+    .visit_case_when = visit_expr_case_when,
   };
   uintptr_t top_level_id = visit_expression(&expression, &visitor);
   ExpressionItemList top_level_expr = data.lists[top_level_id];
@@ -610,6 +629,7 @@ ExpressionItemList construct_predicate(SharedPredicate* predicate) {
     .visit_map_to_struct = visit_map_to_struct_expr,
     .visit_coalesce = visit_expr_coalesce,
     .visit_array = visit_expr_array,
+    .visit_case_when = visit_expr_case_when,
   };
   uintptr_t top_level_id = visit_predicate(&predicate, &visitor);
   ExpressionItemList top_level_expr = data.lists[top_level_id];
@@ -736,6 +756,14 @@ void free_expression_item(ExpressionItem ref) {
       free_expression_list(m2s->child_expr);
       free(m2s->timestamp_timezone);
       free(m2s);
+      break;
+    }
+    case CaseWhen: {
+      struct CaseWhenExpr* case_when = ref.ref;
+      free_expression_list(case_when->conditions);
+      free_expression_list(case_when->results);
+      free_expression_list(case_when->else_expr);
+      free(case_when);
       break;
     }
   }

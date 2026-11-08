@@ -13,11 +13,11 @@ use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::{KernelError, KernelResult, Snapshot, Version};
 use rstest::rstest;
 use serde_json::json;
-use test_utils::delta_kernel_default_engine::executor::TaskExecutor;
 use test_utils::delta_kernel_default_engine::DefaultEngine;
+use test_utils::delta_kernel_default_engine::executor::TaskExecutor;
 use test_utils::{
-    add_commit, assert_result_error_with_message, engine_store_setup, insert_data_with,
-    test_table_setup_mt, TestCatalogCommitter,
+    TestCatalogCommitter, add_commit, assert_result_error_with_message, engine_store_setup,
+    insert_data_with, test_table_setup_mt,
 };
 
 /// The newest version of the table built by [`setup_multi_version_table`].
@@ -76,7 +76,7 @@ async fn setup_multi_version_table<E: TaskExecutor>(
     engine: &Arc<DefaultEngine<E>>,
     table_path: &str,
     kind: TableKind,
-) -> KernelResult<()> {
+) -> delta_kernel::Result<()> {
     let schema = schema_ref! { nullable "id": INTEGER };
     let builder = create_table(table_path, schema, "test_engine", true);
     let builder = match kind {
@@ -136,7 +136,10 @@ async fn deeply_nested_schema_snapshot_load_returns_schema_error() -> KernelResu
             "recursion limit: recursion limit exceeded"
         ),
     );
-    let error = match result.unwrap_err() {
+    let delta_kernel::Error::Kernel(error) = result.unwrap_err() else {
+        panic!("expected a kernel error");
+    };
+    let error = match error {
         KernelError::Backtraced { source, .. } => *source,
         error => error,
     };
@@ -172,7 +175,7 @@ async fn deeply_nested_schema_snapshot_load_returns_schema_error() -> KernelResu
 #[case::unsupported_writer_only(SnapshotLoadProtocolCase {
     min_reader_version: 3,
     reader_features: &["deletionVectors"],
-    writer_features: &["deletionVectors", "generatedColumns"],
+    writer_features: &["deletionVectors", "identityColumns"],
     expected_error: None,
 })]
 #[case::future_reader_version(SnapshotLoadProtocolCase {
@@ -195,7 +198,7 @@ async fn snapshot_load_validates_reader_protocol(
     #[case] case: SnapshotLoadProtocolCase,
     #[values(false, true)] incremental: bool,
     #[values(false, true)] time_travel: bool,
-) -> KernelResult<()> {
+) -> delta_kernel::Result<()> {
     let (store, engine, table_url) = engine_store_setup("snapshot_feature_validation", None);
     create_table(
         table_url.as_str(),
@@ -259,7 +262,7 @@ async fn row_tracking_configuration_rejects_only_enabled_and_suspended(
     #[case] suspended: Option<bool>,
     #[case] expect_error: bool,
     #[values(false, true)] incremental: bool,
-) -> KernelResult<()> {
+) -> delta_kernel::Result<()> {
     let configuration: HashMap<_, _> = [
         ("delta.enableRowTracking", enabled),
         ("delta.rowTrackingSuspended", suspended),
@@ -308,7 +311,7 @@ async fn row_tracking_configuration_rejects_only_enabled_and_suspended(
 async fn built_as_latest_is_inherited_by_derived_snapshots(
     #[values(true, false)] base_snap_time_travel_to_latest: bool,
     #[values(TableKind::FileSystem, TableKind::CatalogManaged)] kind: TableKind,
-) -> KernelResult<()> {
+) -> delta_kernel::Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
     setup_multi_version_table(&engine, &table_path, kind).await?;
 
@@ -353,7 +356,7 @@ async fn built_as_latest_is_inherited_by_derived_snapshots(
 async fn built_as_latest_on_fresh_and_incremental_build(
     #[values(None, Some(1), Some(3))] time_travel_version: Option<Version>,
     #[values(TableKind::FileSystem, TableKind::CatalogManaged)] kind: TableKind,
-) -> KernelResult<()> {
+) -> delta_kernel::Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
     setup_multi_version_table(&engine, &table_path, kind).await?;
 

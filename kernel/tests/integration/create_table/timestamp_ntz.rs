@@ -7,14 +7,13 @@
 use std::sync::Arc;
 
 use delta_kernel::committer::FileSystemCommitter;
-use delta_kernel::schema::{schema_ref, StructType};
+use delta_kernel::schema::{StructType, schema_ref};
 use delta_kernel::snapshot::Snapshot;
 use delta_kernel::table_features::{
-    ColumnMappingMode, TableFeature, TABLE_FEATURES_MIN_READER_VERSION,
-    TABLE_FEATURES_MIN_WRITER_VERSION,
+    ColumnMappingMode, TABLE_FEATURES_MIN_READER_VERSION, TABLE_FEATURES_MIN_WRITER_VERSION,
+    TableFeature,
 };
 use delta_kernel::transaction::create_table::create_table;
-use delta_kernel::KernelResult;
 use test_utils::{
     cm_properties, multiple_ntz_schema, nested_ntz_schema, test_table_setup, top_level_ntz_schema,
 };
@@ -44,7 +43,7 @@ fn test_create_table_with_timestamp_ntz(
         StructType,
     >,
     #[values("none", "name", "id")] cm_mode: &str,
-) -> KernelResult<()> {
+) -> delta_kernel::Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
     let _ = create_table(&table_path, schema.clone(), "Test/1.0", true)
@@ -84,7 +83,7 @@ fn test_create_table_with_timestamp_ntz(
 
 /// A schema without TimestampNTZ columns should not add the timestampNtz feature.
 #[test]
-fn test_create_table_no_timestamp_ntz_no_feature() -> KernelResult<()> {
+fn test_create_table_no_timestamp_ntz_no_feature() -> delta_kernel::Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
     let schema = schema_ref! {
@@ -110,7 +109,7 @@ fn test_create_table_no_timestamp_ntz_no_feature() -> KernelResult<()> {
 
 /// A schema with both TimestampNTZ and Variant columns enables both features.
 #[test]
-fn test_create_table_timestamp_ntz_and_variant() -> KernelResult<()> {
+fn test_create_table_timestamp_ntz_and_variant() -> delta_kernel::Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
     let schema = schema_ref! {

@@ -8,9 +8,9 @@ use tracing::{debug, error};
 use crate::actions::visitors::SelectionVectorVisitor;
 use crate::actions::{MAX_VALUES, MIN_VALUES, NULL_COUNT, NUM_RECORDS};
 use crate::expressions::{
-    col, column_name, column_pred, lit, BinaryPredicateOp, ColumnName, Expression as Expr,
-    ExpressionRef, JunctionPredicateOp, MapToStructOptions, OpaquePredicateOpRef,
-    Predicate as Pred, PredicateRef, Scalar,
+    BinaryPredicateOp, ColumnName, Expression as Expr, ExpressionRef, JunctionPredicateOp,
+    MapToStructOptions, OpaquePredicateOpRef, Predicate as Pred, PredicateRef, Scalar, col,
+    column_name, expr, lit,
 };
 use crate::kernel_predicates::{
     DataSkippingPredicateEvaluator, KernelPredicateEvaluator, KernelPredicateEvaluatorDefaults,
@@ -18,7 +18,7 @@ use crate::kernel_predicates::{
 use crate::scan::data_skipping::stats_schema::is_skipping_eligible_datatype;
 use crate::scan::log_replay::PARTITION_VALUES_PARSED_NAME;
 use crate::scan::metrics::ScanMetrics;
-use crate::schema::{lazy_schema_ref, schema_ref, DataType, PrimitiveType, SchemaRef};
+use crate::schema::{DataType, PrimitiveType, SchemaRef, lazy_schema_ref, schema_ref};
 use crate::table_configuration::TableConfiguration;
 use crate::utils::require;
 use crate::{
@@ -148,7 +148,7 @@ impl DataSkippingFilter {
         metrics: Option<Arc<ScanMetrics>>,
     ) -> Option<Self> {
         static FILTER_PRED: LazyLock<PredicateRef> =
-            LazyLock::new(|| Arc::new(col!("output").distinct(lit(false))));
+            LazyLock::new(|| Arc::new(Pred::from_expr(expr!(distinct(col("output"), false)))));
         static FILTER_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
             nullable "output": BOOLEAN,
         };
@@ -279,7 +279,7 @@ impl DataSkippingFilter {
             col!("add.partitionValues"),
             map_to_struct_options,
         ));
-        let is_add_expr = Arc::new(Pred::is_not_null(col!("add.path")).into());
+        let is_add_expr = Arc::new(expr!(is_not_null(col("add.path"))));
         Self::new(
             engine,
             Some(physical_predicate),
@@ -632,7 +632,7 @@ impl<'a> DataSkippingPredicateCreator<'a> {
     /// (op-computed verdicts bypass kernel's null-stats folding). The `is_add` column ensures
     /// non-Add rows always pass the filter.
     fn guard_for_removes(&self, pred: Pred) -> Pred {
-        Pred::or(Pred::not(column_pred!("is_add")), pred)
+        Pred::or(Pred::from_expr(expr!(not(col("is_add")))), pred)
     }
 }
 

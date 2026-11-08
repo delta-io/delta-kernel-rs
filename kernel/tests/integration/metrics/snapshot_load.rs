@@ -7,36 +7,36 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+#[cfg(feature = "internal-api")]
+use delta_kernel::LogPath;
 use delta_kernel::arrow::array::Int32Array;
 use delta_kernel::committer::FileSystemCommitter;
 #[cfg(feature = "internal-api")]
 use delta_kernel::crc::Crc;
 use delta_kernel::engine::to_json_bytes;
 use delta_kernel::metrics::SnapshotLoadType;
+use delta_kernel::object_store::ObjectStoreExt as _;
 use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::object_store::path::Path;
-use delta_kernel::object_store::ObjectStoreExt as _;
 use delta_kernel::snapshot::IncrementalReplay;
 #[cfg(feature = "internal-api")]
 use delta_kernel::snapshot::{PublicationWatermark, SnapshotHint, SnapshotHintFreshness};
+use delta_kernel::transaction::UpdateTableOperation;
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
-use delta_kernel::transaction::UpdateTableOperation;
-#[cfg(feature = "internal-api")]
-use delta_kernel::LogPath;
-use delta_kernel::{KernelResult, Snapshot};
+use delta_kernel::{KernelError, KernelResult, Snapshot};
 use rstest::rstest;
 use test_utils::delta_kernel_default_engine::DefaultEngineBuilder;
 #[cfg(feature = "internal-api")]
 use test_utils::table_builder::{FeatureSet, LastCheckpointHintState};
 use test_utils::{
-    insert_data, test_table_setup, test_table_setup_mt, CountingReporter, SnapshotCompletionStatus,
+    CountingReporter, SnapshotCompletionStatus, insert_data, test_table_setup, test_table_setup_mt,
 };
 use url::Url;
 
 use super::{
-    insert_rows, measuring_engine, setup_table_with_v1_checkpoint, simple_schema, LogState,
-    TestTableBuilder,
+    LogState, TestTableBuilder, insert_rows, measuring_engine, setup_table_with_v1_checkpoint,
+    simple_schema,
 };
 
 fn assert_full_snapshot_completed(reporter: &CountingReporter) {
@@ -49,7 +49,7 @@ fn assert_full_snapshot_completed(reporter: &CountingReporter) {
 
 #[cfg(feature = "internal-api")]
 #[test]
-fn external_snapshot_hint_api_builds_without_storage_io() -> KernelResult<()> {
+fn external_snapshot_hint_api_builds_without_storage_io() -> delta_kernel::Result<()> {
     let table = TestTableBuilder::new()
         .with_log_state(LogState::with_latest_version(1))
         .with_data(1, 1)
@@ -123,7 +123,7 @@ fn snapshot_to_hint_round_trip_without_storage_io(
     #[case] v2_checkpoint: bool,
     #[case] replay: IncrementalReplay,
     #[values(false, true)] historical: bool,
-) -> KernelResult<()> {
+) -> delta_kernel::Result<()> {
     let features = if v2_checkpoint {
         FeatureSet::new().v2_checkpoint()
     } else {
@@ -161,7 +161,7 @@ fn snapshot_to_hint_round_trip_without_storage_io(
 
 #[cfg(feature = "internal-api")]
 #[test]
-fn external_snapshot_hint_accepts_parsed_advanced_crc() -> KernelResult<()> {
+fn external_snapshot_hint_accepts_parsed_advanced_crc() -> delta_kernel::Result<()> {
     let table = TestTableBuilder::new()
         .with_log_state(LogState::with_latest_version(2).with_crc_at([1]))
         .with_data(1, 1)
@@ -180,7 +180,8 @@ fn external_snapshot_hint_accepts_parsed_advanced_crc() -> KernelResult<()> {
             .version,
         1
     );
-    let crc_bytes = serde_json::to_vec(snapshot.crc_at_version().unwrap())?;
+    let crc_bytes =
+        serde_json::to_vec(snapshot.crc_at_version().unwrap()).map_err(KernelError::from)?;
     let parsed_crc = Arc::new(Crc::try_from_json_bytes(&crc_bytes, snapshot.version())?);
     let listed = &snapshot.log_segment().listed;
     let log_paths = listed
@@ -215,7 +216,7 @@ fn external_snapshot_hint_accepts_parsed_advanced_crc() -> KernelResult<()> {
 }
 
 #[test]
-fn incremental_snapshot_build_emits_incremental_completion() -> KernelResult<()> {
+fn incremental_snapshot_build_emits_incremental_completion() -> delta_kernel::Result<()> {
     let table = TestTableBuilder::new()
         .with_log_state(LogState::with_latest_version(1))
         .with_data(1, 1)
@@ -247,7 +248,7 @@ fn incremental_snapshot_build_emits_incremental_completion() -> KernelResult<()>
 /// reports exactly the commit file count and triggers one JSON read call covering all
 /// commit files.
 #[test]
-fn delta_only_snapshot_emits_expected_metrics() -> KernelResult<()> {
+fn delta_only_snapshot_emits_expected_metrics() -> delta_kernel::Result<()> {
     let table = TestTableBuilder::new()
         .with_log_state(LogState::with_latest_version(1))
         .with_data(1, 1)
@@ -283,7 +284,8 @@ fn delta_only_snapshot_emits_expected_metrics() -> KernelResult<()> {
 /// a fresh snapshot sees one checkpoint file, one tail commit, and performs a single
 /// parquet read (checkpoint) plus a single JSON read (tail commit).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn snapshot_with_v1_checkpoint_and_tail_commit_emits_expected_metrics() -> KernelResult<()> {
+async fn snapshot_with_v1_checkpoint_and_tail_commit_emits_expected_metrics()
+-> delta_kernel::Result<()> {
     let (table_url, setup_engine, _temp_dir) = setup_table_with_v1_checkpoint().await?;
 
     // commit 2: insert another row after the checkpoint
@@ -330,7 +332,7 @@ async fn snapshot_with_v1_checkpoint_and_tail_commit_emits_expected_metrics() ->
 /// has zero commit files and the JSON handler is called with an empty file list.
 /// read_commit_actions always invokes read_json_files even for an empty commit cover.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn snapshot_at_checkpoint_tip_emits_expected_metrics() -> KernelResult<()> {
+async fn snapshot_at_checkpoint_tip_emits_expected_metrics() -> delta_kernel::Result<()> {
     let (table_url, _setup_engine, _temp_dir) = setup_table_with_v1_checkpoint().await?;
 
     let (measure_engine, reporter, _guard) = measuring_engine(Arc::new(LocalFileSystem::new()));
@@ -363,7 +365,7 @@ async fn snapshot_at_checkpoint_tip_emits_expected_metrics() -> KernelResult<()>
 // TODO(#2337): re-enable when log compaction is re-enabled
 #[ignore = "log compaction is temporarily disabled (#2337)"]
 #[tokio::test]
-async fn snapshot_with_log_compaction_emits_expected_metrics() -> KernelResult<()> {
+async fn snapshot_with_log_compaction_emits_expected_metrics() -> delta_kernel::Result<()> {
     let table = TestTableBuilder::new()
         .with_log_state(LogState::with_latest_version(2))
         .with_schema(simple_schema())
@@ -417,7 +419,7 @@ async fn snapshot_with_log_compaction_emits_expected_metrics() -> KernelResult<(
 /// When a CRC file exists at the target snapshot version, Protocol+Metadata are loaded
 /// directly from it, skipping all JSON log replay. The JSON handler is never called.
 #[tokio::test]
-async fn snapshot_with_crc_at_target_version_skips_json_replay() -> KernelResult<()> {
+async fn snapshot_with_crc_at_target_version_skips_json_replay() -> delta_kernel::Result<()> {
     // The crc-full golden table has commit 0 + a CRC file at version 0.
     let path = std::fs::canonicalize(PathBuf::from("./tests/data/crc-full/"))
         .map_err(|e| delta_kernel::KernelError::generic(e.to_string()))?;
@@ -469,7 +471,7 @@ async fn snapshot_with_crc_at_target_version_skips_json_replay() -> KernelResult
 async fn crc_at_prior_version_roots_replay_at_crc_for_both_modes(
     #[case] mode: IncrementalReplay,
     #[case] expected_crc_version: Option<u64>,
-) -> KernelResult<()> {
+) -> delta_kernel::Result<()> {
     let (_temp_dir, table_path, setup_engine) = test_table_setup_mt()?;
     let table_url = delta_kernel::try_parse_uri(&table_path)?;
 
@@ -536,7 +538,8 @@ async fn crc_at_prior_version_roots_replay_at_crc_for_both_modes(
 /// are read in a single JSON call and both byte counters are non-zero. The specific counts
 /// here reflect this table's setup: checkpoint at v1, three tail commits.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn checkpoint_with_multiple_tail_commits_emits_expected_metrics() -> KernelResult<()> {
+async fn checkpoint_with_multiple_tail_commits_emits_expected_metrics() -> delta_kernel::Result<()>
+{
     let (table_url, setup_engine, _temp_dir) = setup_table_with_v1_checkpoint().await?;
 
     // commits 2, 3, 4: insert more data after the checkpoint
@@ -588,7 +591,8 @@ async fn checkpoint_with_multiple_tail_commits_emits_expected_metrics() -> Kerne
 /// The specific count (`json_read_calls = 1`) reflects this test's table: 2 commits, no
 /// checkpoint, no CRC. Tables with different log structures will produce different counts.
 #[test]
-fn get_domain_metadata_when_no_latest_crc_incurs_additional_log_replay() -> KernelResult<()> {
+fn get_domain_metadata_when_no_latest_crc_incurs_additional_log_replay() -> delta_kernel::Result<()>
+{
     let table = TestTableBuilder::new()
         .with_log_state(LogState::with_latest_version(1))
         .with_data(1, 1)
@@ -655,7 +659,7 @@ async fn setup_table_with_dms_and_set_txns(
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn write_transaction_loads_domain_metadata_internally(
     #[case] with_crc: bool,
-) -> KernelResult<()> {
+) -> delta_kernel::Result<()> {
     let (table_url, _temp_dir) = setup_table_with_dms_and_set_txns(with_crc).await?;
 
     let (engine, reporter, _guard) = measuring_engine(Arc::new(LocalFileSystem::new()));
@@ -683,7 +687,9 @@ async fn write_transaction_loads_domain_metadata_internally(
 #[case::log_replay(false)]
 #[case::crc_cache(true)]
 #[tokio::test]
-async fn get_app_id_version_load_emits_loaded_metric(#[case] with_crc: bool) -> KernelResult<()> {
+async fn get_app_id_version_load_emits_loaded_metric(
+    #[case] with_crc: bool,
+) -> delta_kernel::Result<()> {
     let (table_url, _temp_dir) = setup_table_with_dms_and_set_txns(with_crc).await?;
 
     let (engine, reporter, _guard) = measuring_engine(Arc::new(LocalFileSystem::new()));
@@ -717,7 +723,9 @@ async fn get_app_id_version_load_emits_loaded_metric(#[case] with_crc: bool) -> 
 #[case::log_replay(false)]
 #[case::crc_cache(true)]
 #[tokio::test]
-async fn get_domain_metadata_load_emits_loaded_metric(#[case] with_crc: bool) -> KernelResult<()> {
+async fn get_domain_metadata_load_emits_loaded_metric(
+    #[case] with_crc: bool,
+) -> delta_kernel::Result<()> {
     let (table_url, _temp_dir) = setup_table_with_dms_and_set_txns(with_crc).await?;
 
     let (engine, reporter, _guard) = measuring_engine(Arc::new(LocalFileSystem::new()));
@@ -725,10 +733,11 @@ async fn get_domain_metadata_load_emits_loaded_metric(#[case] with_crc: bool) ->
 
     // Hit on the user domain.
     reporter.reset();
-    assert!(snap
-        .reader()
-        .get_domain_metadata("myapp.config", &engine)?
-        .is_some());
+    assert!(
+        snap.reader()
+            .get_domain_metadata("myapp.config", &engine)?
+            .is_some()
+    );
     assert_eq!(reporter.domain_metadata_loads.get(), 1);
     assert_eq!(reporter.domain_metadata_cache_hits.get(), with_crc as u64);
     assert_eq!(reporter.domain_metadata_domains_returned.get(), 1);
@@ -736,10 +745,11 @@ async fn get_domain_metadata_load_emits_loaded_metric(#[case] with_crc: bool) ->
     // Miss on a nonexistent domain. A Complete CRC answers the miss from cache; without a CRC it
     // falls back to log replay.
     reporter.reset();
-    assert!(snap
-        .reader()
-        .get_domain_metadata("does.not.exist", &engine)?
-        .is_none());
+    assert!(
+        snap.reader()
+            .get_domain_metadata("does.not.exist", &engine)?
+            .is_none()
+    );
     assert_eq!(reporter.domain_metadata_loads.get(), 1);
     assert_eq!(reporter.domain_metadata_cache_hits.get(), with_crc as u64);
     assert_eq!(reporter.domain_metadata_domains_returned.get(), 0);
@@ -748,7 +758,7 @@ async fn get_domain_metadata_load_emits_loaded_metric(#[case] with_crc: bool) ->
 }
 
 #[tokio::test]
-async fn failed_loads_emit_failure_metric() -> KernelResult<()> {
+async fn failed_loads_emit_failure_metric() -> delta_kernel::Result<()> {
     let (table_url, _temp_dir) = setup_table_with_dms_and_set_txns(false).await?;
 
     let (engine, reporter, _guard) = measuring_engine(Arc::new(LocalFileSystem::new()));
@@ -759,10 +769,11 @@ async fn failed_loads_emit_failure_metric() -> KernelResult<()> {
     std::fs::remove_file(log_dir.join("00000000000000000001.json")).unwrap();
 
     reporter.reset();
-    assert!(snap
-        .reader()
-        .get_domain_metadata("myapp.config", &engine)
-        .is_err());
+    assert!(
+        snap.reader()
+            .get_domain_metadata("myapp.config", &engine)
+            .is_err()
+    );
     assert!(snap.reader().get_app_id_version("my-app", &engine).is_err());
     assert_eq!(reporter.domain_metadata_loads.get(), 0);
     assert_eq!(reporter.set_transaction_loads.get(), 0);

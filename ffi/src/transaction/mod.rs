@@ -2,6 +2,7 @@
 mod committed;
 mod create_table;
 mod deletion_vector;
+mod deletion_vector_writer;
 mod partition_value;
 mod transaction_id;
 mod update_table;
@@ -16,10 +17,16 @@ pub use committed::{
 };
 pub use create_table::*;
 pub use deletion_vector::{
-    dv_descriptor_map_insert, dv_descriptor_map_new, dv_descriptor_new, free_dv_descriptor,
-    free_dv_descriptor_map, update_table_txn_update_deletion_vectors, ExclusiveDvDescriptor,
-    ExclusiveDvDescriptorMap, KernelDvStorageType,
+    ExclusiveDvDescriptor, ExclusiveDvDescriptorMap, KernelDvStorageType, dv_descriptor_map_insert,
+    dv_descriptor_map_new, dv_descriptor_new, free_dv_descriptor, free_dv_descriptor_map,
+    update_table_txn_update_deletion_vectors,
 };
+pub use deletion_vector_writer::{
+    DvFlushFn, DvWriteFn, ExclusiveDeletionVector, ExclusiveDvWriter, FfiDvWriteResult,
+    FfiDvWriterOutput, deletion_vector_add_indexes, dv_writer_finalize, dv_writer_write,
+    free_deletion_vector, free_dv_writer, new_deletion_vector, new_dv_writer,
+};
+use delta_kernel::EngineData;
 use delta_kernel::committer::{Committer, FileSystemCommitter};
 use delta_kernel::schema::SchemaRef;
 use delta_kernel::transaction::create_table::{
@@ -29,17 +36,16 @@ use delta_kernel::transaction::data_layout::DataLayout;
 use delta_kernel::transaction::{
     CommittedTransaction, Transaction, UpdateTableOperation, UpdateTableTransactionBuilder,
 };
-use delta_kernel::EngineData;
 use delta_kernel_ffi_macros::handle_descriptor;
 pub use partition_value::{
-    free_partition_value_map, partition_value_map_insert_binary, partition_value_map_insert_bool,
-    partition_value_map_insert_byte, partition_value_map_insert_date,
-    partition_value_map_insert_decimal, partition_value_map_insert_double,
-    partition_value_map_insert_float, partition_value_map_insert_int,
-    partition_value_map_insert_long, partition_value_map_insert_null,
-    partition_value_map_insert_short, partition_value_map_insert_string,
-    partition_value_map_insert_timestamp, partition_value_map_insert_timestamp_ntz,
-    partition_value_map_new, ExclusivePartitionValueMap,
+    ExclusivePartitionValueMap, free_partition_value_map, partition_value_map_insert_binary,
+    partition_value_map_insert_bool, partition_value_map_insert_byte,
+    partition_value_map_insert_date, partition_value_map_insert_decimal,
+    partition_value_map_insert_double, partition_value_map_insert_float,
+    partition_value_map_insert_int, partition_value_map_insert_long,
+    partition_value_map_insert_null, partition_value_map_insert_short,
+    partition_value_map_insert_string, partition_value_map_insert_timestamp,
+    partition_value_map_insert_timestamp_ntz, partition_value_map_new,
 };
 pub use update_table::*;
 #[cfg(feature = "adaptive-metadata-in-dev")]
@@ -51,7 +57,7 @@ use crate::engine_funcs::FileMeta;
 use crate::error::{ExternResult, IntoExternResult};
 use crate::handle::Handle;
 use crate::scan::EngineSchema;
-use crate::schema_visitor::{extract_kernel_schema, KernelSchemaVisitorState};
+use crate::schema_visitor::{KernelSchemaVisitorState, extract_kernel_schema};
 use crate::{
     ExclusiveEngineData, ExternEngine, KernelResult, KernelStringSlice, SharedExternEngine,
     SharedSnapshot, TryFromStringSlice,
@@ -111,8 +117,8 @@ use create_table::{collect_create_table_columns, create_table_txn_builder_with_d
 #[cfg(test)]
 mod tests {
     use std::os::raw::c_void;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use delta_kernel::arrow::array::{Array, ArrayRef, Int32Array, StringArray, StructArray};
     use delta_kernel::arrow::datatypes::Schema as ArrowSchema;
@@ -129,41 +135,41 @@ mod tests {
     use delta_kernel::parquet::arrow::arrow_writer::ArrowWriter;
     use delta_kernel::parquet::file::properties::WriterProperties;
     use delta_kernel::schema::{
-        schema_ref, ColumnMetadataKey, DataType, MetadataValue, SchemaRef, StructField, StructType,
+        ColumnMetadataKey, DataType, MetadataValue, SchemaRef, StructField, StructType, schema_ref,
     };
     use delta_kernel::table_features::TableFeature;
     use delta_kernel::transaction::create_table::create_table;
-    use delta_kernel::{KernelResult, Snapshot};
+    use delta_kernel::{KernelError, KernelResult, Snapshot};
     use delta_kernel_ffi::delta_types::{
         FfiColumnNameArray, FfiNullableStringMap, FfiNullableStringMapEntry, FfiStringArray,
     };
-    use delta_kernel_ffi::engine_data::{get_engine_data, ArrowFFIData};
+    use delta_kernel_ffi::engine_data::{ArrowFFIData, get_engine_data};
     use delta_kernel_ffi::error::FFIKernelError;
     use delta_kernel_ffi::ffi_test_utils::{
-        allocate_bytes, allocate_err, allocate_str, assert_extern_result_error_contains,
+        TEST_ERROR_ALLOCATORS, allocate_bytes, allocate_str, assert_extern_result_error_contains,
         assert_extern_result_error_with_message, build_snapshot, build_update_table_txn,
         engine_handle_for_store, ok_or_panic, recover_bytes, recover_error, recover_string,
     };
     use delta_kernel_ffi::tests::get_default_engine;
     use itertools::Itertools;
     use rstest::rstest;
-    use serde_json::{json, Deserializer};
+    use serde_json::{Deserializer, json};
     use tempfile::tempdir;
-    use test_utils::delta_kernel_default_engine::executor::tokio::TokioBackgroundExecutor;
     use test_utils::delta_kernel_default_engine::DefaultEngine;
+    use test_utils::delta_kernel_default_engine::executor::tokio::TokioBackgroundExecutor;
     use test_utils::{
-        install_thread_local_metrics_reporter, set_json_value, setup_test_tables, test_read,
-        CapturingReporter,
+        CapturingReporter, install_thread_local_metrics_reporter, set_json_value,
+        setup_test_tables, test_read,
     };
     use write_context::{
+        FfiRowTrackingMetadataColumns, SharedWriteContext,
         create_table_txn_get_partitioned_write_context,
         create_table_txn_get_unpartitioned_write_context, free_write_context,
         get_logical_to_physical, get_physical_write_schema, get_write_dir, get_write_path,
         get_write_schema, resolve_file_path, update_table_txn_get_partitioned_write_context,
         update_table_txn_get_unpartitioned_write_context, visit_partition_values,
         write_context_builder_build, write_context_builder_with_partition_values,
-        write_context_builder_with_physical_partition_values, FfiRowTrackingMetadataColumns,
-        SharedWriteContext,
+        write_context_builder_with_physical_partition_values,
     };
 
     use super::*;
@@ -175,8 +181,8 @@ mod tests {
         visit_field_integer, visit_field_long, visit_field_string, visit_field_struct,
     };
     use crate::{
-        free_engine, free_schema, free_snapshot, kernel_bytes_slice, kernel_string_slice,
-        logical_schema, version, KernelStringSlice, NullableCvoid, OptionalValue, Url,
+        KernelStringSlice, NullableCvoid, OptionalValue, Url, free_engine, free_schema,
+        free_snapshot, kernel_bytes_slice, kernel_string_slice, logical_schema, version,
     };
 
     const ZERO_UUID: &str = "00000000-0000-0000-0000-000000000000";
@@ -511,7 +517,7 @@ mod tests {
             )?;
 
             let file_info_engine_data = ok_or_panic(unsafe {
-                get_engine_data(file_info.array, &file_info.schema, allocate_err)
+                get_engine_data(file_info.array, &file_info.schema, &TEST_ERROR_ALLOCATORS)
             });
 
             unsafe { update_table_txn_add_files(txn.shallow_copy(), file_info_engine_data) };
@@ -865,7 +871,7 @@ mod tests {
         miri,
         ignore = "local-filesystem commit calls `linkat`, unsupported under Miri"
     )]
-    async fn test_partitioned_append() -> KernelResult<()> {
+    async fn test_partitioned_append() -> delta_kernel::Result<()> {
         // Partition column `part` is listed last in the schema; the physical write schema must
         // exclude it (CM=none, partition columns are not materialized).
         let schema = schema_ref! {
@@ -923,7 +929,7 @@ mod tests {
             let write_dir_str = recover_string(
                 unsafe { get_write_dir(write_context.shallow_copy(), allocate_str) }.unwrap(),
             );
-            let write_dir_url = Url::parse(&write_dir_str)?;
+            let write_dir_url = Url::parse(&write_dir_str).map_err(KernelError::from)?;
             assert!(
                 write_dir_url.path().ends_with("part=100/"),
                 "unexpected write dir: {write_dir_str}"
@@ -955,22 +961,25 @@ mod tests {
             ])
             .unwrap();
             let dir_path = write_dir_url.to_file_path().unwrap();
-            std::fs::create_dir_all(&dir_path)?;
+            std::fs::create_dir_all(&dir_path).map_err(KernelError::from)?;
             let file_name = "my_file.parquet";
             let file_fs_path = dir_path.join(file_name);
-            let parquet_file = std::fs::File::create(&file_fs_path)?;
+            let parquet_file = std::fs::File::create(&file_fs_path).map_err(KernelError::from)?;
             let mut writer = ArrowWriter::try_new(
                 parquet_file,
                 batch.schema(),
                 Some(WriterProperties::builder().build()),
-            )?;
-            writer.write(&batch)?;
-            let parquet_meta = writer.close()?;
+            )
+            .map_err(KernelError::from)?;
+            writer.write(&batch).map_err(KernelError::from)?;
+            let parquet_meta = writer.close().map_err(KernelError::from)?;
             let num_rows = parquet_meta.file_metadata().num_rows();
-            let size = std::fs::metadata(&file_fs_path)?.len();
+            let size = std::fs::metadata(&file_fs_path)
+                .map_err(KernelError::from)?
+                .len();
 
             // Resolve the relative add.path from the absolute file URL.
-            let file_url = write_dir_url.join(file_name)?;
+            let file_url = write_dir_url.join(file_name).map_err(KernelError::from)?;
             let file_url_str = file_url.as_str();
             let add_path = recover_string(
                 ok_or_panic(unsafe {
@@ -991,10 +1000,11 @@ mod tests {
             );
             let metadata_schema = unsafe { txn.shallow_copy().as_ref().add_files_schema() }
                 .as_ref()
-                .try_into_arrow()?;
+                .try_into_arrow()
+                .map_err(KernelError::from)?;
             let file_info = create_arrow_ffi_from_json(metadata_schema, &metadata_json)?;
             let file_info_engine_data = ok_or_panic(unsafe {
-                get_engine_data(file_info.array, &file_info.schema, allocate_err)
+                get_engine_data(file_info.array, &file_info.schema, &TEST_ERROR_ALLOCATORS)
             });
             unsafe { update_table_txn_add_files(txn.shallow_copy(), file_info_engine_data) };
 
@@ -1008,10 +1018,13 @@ mod tests {
                 .unwrap();
             let commit1 = store
                 .get(&Path::from_url_path(commit1_url.path()).unwrap())
-                .await?;
-            let parsed_commits: Vec<_> = Deserializer::from_slice(&commit1.bytes().await?)
-                .into_iter::<serde_json::Value>()
-                .try_collect()?;
+                .await
+                .map_err(KernelError::from)?;
+            let parsed_commits: Vec<_> =
+                Deserializer::from_slice(&commit1.bytes().await.map_err(KernelError::from)?)
+                    .into_iter::<serde_json::Value>()
+                    .try_collect()
+                    .map_err(KernelError::from)?;
             let add = &parsed_commits[1]["add"];
             assert_eq!(add["path"], json!("part=100/my_file.parquet"));
             assert_eq!(add["partitionValues"], json!({ "part": "100" }));
@@ -1410,7 +1423,9 @@ mod tests {
         assert_extern_result_error_with_message(
             result,
             FFIKernelError::GenericError,
-            Some("Generic delta kernel error: Cannot modify domains that start with 'delta.' as those are system controlled"),
+            Some(
+                "Generic delta kernel error: Cannot modify domains that start with 'delta.' as those are system controlled",
+            ),
         );
 
         unsafe { free_engine(engine) };
@@ -1536,7 +1551,7 @@ mod tests {
             .try_into_arrow()?;
         let file_info = create_file_metadata("file.parquet", 1, 2, metadata_schema)?;
         let file_info_engine_data = ok_or_panic(unsafe {
-            get_engine_data(file_info.array, &file_info.schema, allocate_err)
+            get_engine_data(file_info.array, &file_info.schema, &TEST_ERROR_ALLOCATORS)
         });
         unsafe { update_table_txn_add_files(txn.shallow_copy(), file_info_engine_data) };
 
@@ -1570,7 +1585,7 @@ mod tests {
             .try_into_arrow()?;
         let file_info = create_file_metadata("file.parquet", 1, 2, metadata_schema)?;
         let file_info_engine_data = ok_or_panic(unsafe {
-            get_engine_data(file_info.array, &file_info.schema, allocate_err)
+            get_engine_data(file_info.array, &file_info.schema, &TEST_ERROR_ALLOCATORS)
         });
         unsafe { update_table_txn_add_files(txn.shallow_copy(), file_info_engine_data) };
 
@@ -1627,7 +1642,9 @@ mod tests {
         assert_extern_result_error_with_message(
             result,
             FFIKernelError::GenericError,
-            Some("Generic delta kernel error: Metadata for domain dup already specified in this transaction"),
+            Some(
+                "Generic delta kernel error: Metadata for domain dup already specified in this transaction",
+            ),
         );
 
         unsafe { free_engine(engine) };
@@ -1682,7 +1699,9 @@ mod tests {
         assert_extern_result_error_with_message(
             result,
             FFIKernelError::UnsupportedError,
-            Some("Unsupported: Domain metadata operations require writer version 7 and the 'domainMetadata' writer feature"),
+            Some(
+                "Unsupported: Domain metadata operations require writer version 7 and the 'domainMetadata' writer feature",
+            ),
         );
 
         unsafe { free_engine(engine) };
@@ -1700,9 +1719,9 @@ mod tests {
             cast_test_context, get_test_context, recover_test_context,
         };
         use crate::delta_kernel_unity_catalog::{
-            free_uc_commit_client, get_uc_commit_client, get_uc_committer, CommitRequest,
+            CommitRequest, free_uc_commit_client, get_uc_commit_client, get_uc_committer,
         };
-        use crate::{snapshot_publish_with_committer, Handle, NullableCvoid, OptionalValue};
+        use crate::{Handle, NullableCvoid, OptionalValue, snapshot_publish_with_committer};
 
         #[unsafe(no_mangle)]
         extern "C" fn test_uc_commit(
@@ -1771,7 +1790,7 @@ mod tests {
                     kernel_string_slice!(catalog),
                     kernel_string_slice!(schema),
                     kernel_string_slice!(table_name),
-                    allocate_err,
+                    &TEST_ERROR_ALLOCATORS,
                 ))
             };
 
@@ -1822,7 +1841,7 @@ mod tests {
             .await?;
 
             let file_info_engine_data = ok_or_panic(unsafe {
-                get_engine_data(file_info.array, &file_info.schema, allocate_err)
+                get_engine_data(file_info.array, &file_info.schema, &TEST_ERROR_ALLOCATORS)
             });
 
             unsafe { update_table_txn_add_files(txn.shallow_copy(), file_info_engine_data) };
@@ -1847,7 +1866,7 @@ mod tests {
                     kernel_string_slice!(catalog),
                     kernel_string_slice!(schema),
                     kernel_string_slice!(table_name),
-                    allocate_err,
+                    &TEST_ERROR_ALLOCATORS,
                 ))
             };
             let published_snapshot = ok_or_panic(unsafe {
@@ -1889,7 +1908,7 @@ mod tests {
                     kernel_string_slice!(catalog),
                     kernel_string_slice!(schema),
                     kernel_string_slice!(table_name),
-                    allocate_err,
+                    &TEST_ERROR_ALLOCATORS,
                 ))
             };
             let republished_snapshot = ok_or_panic(unsafe {
@@ -2010,21 +2029,21 @@ mod tests {
                             kernel_string_slice!(name),
                             nullable,
                             std::ptr::null(),
-                            allocate_err,
+                            &TEST_ERROR_ALLOCATORS,
                         ),
                         DataType::STRING => visit_field_string(
                             state,
                             kernel_string_slice!(name),
                             nullable,
                             std::ptr::null(),
-                            allocate_err,
+                            &TEST_ERROR_ALLOCATORS,
                         ),
                         DataType::LONG => visit_field_long(
                             state,
                             kernel_string_slice!(name),
                             nullable,
                             std::ptr::null(),
-                            allocate_err,
+                            &TEST_ERROR_ALLOCATORS,
                         ),
                         _ => panic!("Unsupported test field type: {:?}", field.data_type),
                     })
@@ -2040,7 +2059,7 @@ mod tests {
                 field_ids.len(),
                 false,
                 std::ptr::null(),
-                allocate_err,
+                &TEST_ERROR_ALLOCATORS,
             ))
         }
     }
@@ -2056,7 +2075,7 @@ mod tests {
                 kernel_string_slice!(field),
                 true,
                 std::ptr::null(),
-                allocate_err,
+                &TEST_ERROR_ALLOCATORS,
             ))
         }
     }
@@ -2117,7 +2136,7 @@ mod tests {
     async fn create_table_transaction_ids(
         #[case] builder_ids: usize,
         #[case] duplicate_app_id: bool,
-    ) -> KernelResult<()> {
+    ) -> delta_kernel::Result<()> {
         let (store, test_engine, table_url) =
             test_utils::engine_store_setup("test_create_transaction_ids", None);
         let (_table_path, engine, mut builder) = create_table_txn_builder(
@@ -2338,7 +2357,7 @@ mod tests {
                 kernel_string_slice!(crs),
                 true,
                 std::ptr::null(),
-                allocate_err,
+                &TEST_ERROR_ALLOCATORS,
             ))
         };
         let field_ids = [field_id];
@@ -2351,7 +2370,7 @@ mod tests {
                 field_ids.len(),
                 false,
                 std::ptr::null(),
-                allocate_err,
+                &TEST_ERROR_ALLOCATORS,
             ))
         }
     }
@@ -3136,7 +3155,7 @@ mod tests {
             .try_into_arrow()?;
         let file_info = create_file_metadata("file.parquet", 1, 2, metadata_schema)?;
         let metadata = ok_or_panic(unsafe {
-            get_engine_data(file_info.array, &file_info.schema, allocate_err)
+            get_engine_data(file_info.array, &file_info.schema, &TEST_ERROR_ALLOCATORS)
         });
         unsafe { update_table_txn_add_files(txn.shallow_copy(), metadata) };
 
@@ -3328,6 +3347,7 @@ mod tests {
     #[case(KernelUpdateTableOperation::Update, "UPDATE")]
     #[case(KernelUpdateTableOperation::Merge, "MERGE")]
     #[case(KernelUpdateTableOperation::Optimize, "OPTIMIZE")]
+    #[case(KernelUpdateTableOperation::Reorg, "REORG")]
     #[tokio::test]
     async fn update_table_operation_variants_commit_expected_history_name(
         #[case] operation: KernelUpdateTableOperation,
@@ -3617,7 +3637,7 @@ mod tests {
     #[tokio::test]
     async fn test_create_table_with_clustering_column_paths(
         #[case] column_mapping: bool,
-    ) -> KernelResult<()> {
+    ) -> delta_kernel::Result<()> {
         let (store, test_engine, table_url) =
             test_utils::engine_store_setup("clustering_paths", None);
         let engine = engine_handle_for_store(Arc::clone(&store));
@@ -3691,10 +3711,12 @@ mod tests {
         for info in &infos {
             assert_eq!(info.physical_column != info.logical_column, column_mapping);
         }
-        assert!(snapshot
-            .table_configuration()
-            .logical_partition_columns()
-            .is_empty());
+        assert!(
+            snapshot
+                .table_configuration()
+                .logical_partition_columns()
+                .is_empty()
+        );
         unsafe { free_engine(engine) };
         Ok(())
     }
@@ -4367,7 +4389,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_update_table_txn_builder_applies_nested_schema_changes() -> KernelResult<()> {
+    async fn test_update_table_txn_builder_applies_nested_schema_changes()
+    -> delta_kernel::Result<()> {
         let (store, kernel_engine, table_url) =
             test_utils::engine_store_setup("test_nested_schema_changes", None);
         let nested =
@@ -4554,7 +4577,7 @@ mod tests {
             get_engine_data(
                 file_info.array,
                 &file_info.schema,
-                crate::ffi_test_utils::allocate_err,
+                &crate::ffi_test_utils::TEST_ERROR_ALLOCATORS,
             )
         });
         unsafe { update_table_txn_add_files(txn.shallow_copy(), file_info_engine_data) };
@@ -4567,7 +4590,7 @@ mod tests {
     fn assert_no_active_files(
         kernel_engine: &Arc<dyn delta_kernel::Engine>,
         table_path: &str,
-    ) -> KernelResult<()> {
+    ) -> delta_kernel::Result<()> {
         let snapshot =
             delta_kernel::snapshot::Snapshot::builder_for(delta_kernel::try_parse_uri(table_path)?)
                 .build(kernel_engine.as_ref())?;
@@ -4598,7 +4621,7 @@ mod tests {
     async fn setup_remove_files_test(
         store: &Arc<DynObjectStore>,
         table_url: &Url,
-    ) -> KernelResult<(
+    ) -> delta_kernel::Result<(
         Box<dyn delta_kernel::EngineData>,
         Vec<bool>,
         Handle<ExclusiveUpdateTableTransaction>,
@@ -4638,7 +4661,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_remove_files_with_null_sv_commits_and_removes_all() -> KernelResult<()> {
+    async fn test_remove_files_with_null_sv_commits_and_removes_all() -> delta_kernel::Result<()> {
         let (store, _test_engine, table_url) =
             test_utils::engine_store_setup("test_remove_files", None);
         let (data, sv, txn, engine, kernel_engine, table_path) =
@@ -4689,15 +4712,15 @@ mod tests {
 
     /// End-to-end FFI round trip for connector-authored deletion vector updates.
     #[tokio::test]
-    async fn test_dv_update_round_trip_via_ffi() -> KernelResult<()> {
+    async fn test_dv_update_round_trip_via_ffi() -> delta_kernel::Result<()> {
         use delta_kernel::actions::deletion_vector_writer::{
             KernelDeletionVector, StreamingDeletionVectorWriter,
         };
         use delta_kernel::object_store::path::Path as ObjectStorePath;
         use delta_kernel_ffi::scan::{free_scan, scan, scan_metadata_iter_init};
         use delta_kernel_ffi::transaction::{
-            dv_descriptor_map_insert, dv_descriptor_map_new, dv_descriptor_new,
-            update_table_txn_update_deletion_vectors, KernelDvStorageType,
+            KernelDvStorageType, dv_descriptor_map_insert, dv_descriptor_map_new,
+            dv_descriptor_new, update_table_txn_update_deletion_vectors,
         };
         use test_utils::record_batch_to_bytes;
 
@@ -4721,17 +4744,19 @@ mod tests {
         let batch = RecordBatch::try_from_iter(vec![(
             "id",
             Arc::new(Int32Array::from(vec![10, 20, 30, 40])) as ArrayRef,
-        )])?;
+        )])
+        .map_err(KernelError::from)?;
         let parquet_bytes = record_batch_to_bytes(&batch);
         let parquet_len = parquet_bytes.len();
         let data_file_path = "data_file.parquet".to_string();
-        let data_url = table_url.join(&data_file_path)?;
+        let data_url = table_url.join(&data_file_path).map_err(KernelError::from)?;
         store
             .put(
-                &ObjectStorePath::from_url_path(data_url.path())?,
+                &ObjectStorePath::from_url_path(data_url.path()).map_err(KernelError::from)?,
                 parquet_bytes.into(),
             )
-            .await?;
+            .await
+            .map_err(KernelError::from)?;
 
         // Add the file via a kernel transaction so the table has something to scan.
         // Build the kernel engine over the seeded store: `create_default_engine` resolves a fresh
@@ -4760,13 +4785,16 @@ mod tests {
         let mut dv_writer = StreamingDeletionVectorWriter::new(&mut dv_bytes);
         let dv_write_result = dv_writer.write_deletion_vector(dv)?;
         dv_writer.finalize()?;
-        let dv_url = table_url.join("connector_dv.bin")?;
+        let dv_url = table_url
+            .join("connector_dv.bin")
+            .map_err(KernelError::from)?;
         store
             .put(
-                &ObjectStorePath::from_url_path(dv_url.path())?,
+                &ObjectStorePath::from_url_path(dv_url.path()).map_err(KernelError::from)?,
                 dv_bytes.into(),
             )
-            .await?;
+            .await
+            .map_err(KernelError::from)?;
 
         // === FFI surface under test ===
         let table_path_str = table_url.as_str();
@@ -4854,7 +4882,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_remove_files_with_non_empty_sv_exercises_from_raw_parts() -> KernelResult<()> {
+    async fn test_remove_files_with_non_empty_sv_exercises_from_raw_parts()
+    -> delta_kernel::Result<()> {
         // Exercises the from_raw_parts code path in the remove_files FFI wrapper by passing
         // a non-null selection vector pointer with non-zero length. The null-SV test always
         // passes a null pointer because scan_metadata for a single-file table returns an

@@ -9,7 +9,7 @@ use itertools::Itertools;
 use super::arrow_conversion::TryIntoArrow as _;
 use crate::arrow::datatypes::{DataType as ArrowDataType, Field as ArrowField, TimeUnit};
 use crate::engine::arrow_utils::make_arrow_error;
-use crate::schema::{DataType, MetadataValue, StructField};
+use crate::schema::{DataType, MetadataKey, MetadataValue, StructField};
 use crate::utils::require;
 use crate::{KernelError, KernelResult};
 
@@ -28,18 +28,17 @@ pub(crate) enum ValidationMode {
     Full,
 }
 
-/// Ensure a kernel data type matches an arrow data type. This only ensures that the actual "type"
-/// is the same, but does so recursively into structs, and ensures lists and maps have the correct
-/// associated types as well.
+/// Checks whether an Arrow type is compatible with a Kernel type, recursively through containers.
+///
+/// This checks compatibility without converting data. Callers that normalize data must apply
+/// [`DataTypeCompat::NeedsCast`] conversions and inspect compatible nested types for leaf casts.
 ///
 /// The `mode` parameter controls how struct fields are matched and whether nullability/metadata
 /// are checked. See [`ValidationMode`] for details.
 ///
-/// This returns an `Ok(DataTypeCompat)` if the types are compatible, and
-/// will indicate what kind of compatibility they have, or an error if the types do not match. If
-/// there is a `struct` type included and the mode uses name-based matching, we only ensure that
-/// the named fields that the kernel is asking for exist, and that for those fields the types
-/// match. Un-selected fields are ignored.
+/// Returns the kind of compatibility, or an error if the types are incompatible. In name-based
+/// struct matching, only requested fields must exist and have compatible types; unselected fields
+/// are ignored.
 #[internal_api]
 pub(crate) fn ensure_data_types(
     kernel_type: &DataType,
@@ -58,12 +57,11 @@ struct EnsureDataTypes {
 #[cfg_attr(test, derive(Debug, PartialEq))]
 #[internal_api]
 pub(crate) enum DataTypeCompat {
-    /// The two types are the same
+    /// The types are compatible without a cast.
     Identical,
-    /// What is read from parquet needs to be cast to the associated type
+    /// The source must be cast to the associated Arrow target type.
     NeedsCast(ArrowDataType),
-    /// Types are compatible, but are nested types. This is used when comparing types where casting
-    /// is not desired (i.e. in the expression evaluator)
+    /// Nested types are compatible, but normalization may still require individual leaf casts.
     Nested,
 }
 
@@ -340,14 +338,14 @@ impl PartialEq<String> for MetadataValue {
 
 // Compare kernel metadata with Arrow's version-specific metadata container.
 fn metadata_eq<'a>(
-    kernel_metadata: &HashMap<String, MetadataValue>,
+    kernel_metadata: &HashMap<MetadataKey, MetadataValue>,
     arrow_metadata: impl IntoIterator<Item = (&'a String, &'a String)>,
 ) -> bool {
     let mut arrow_len = 0;
     for (key, value) in arrow_metadata {
         arrow_len += 1;
         if !kernel_metadata
-            .get(key)
+            .get(key.as_str())
             .is_some_and(|kernel_value| *kernel_value == *value)
         {
             return false;
@@ -365,7 +363,7 @@ mod tests {
     use super::*;
     use crate::arrow::datatypes::{DataType as ArrowDataType, Field as ArrowField, Fields};
     use crate::engine::arrow_conversion::TryFromKernel as _;
-    use crate::schema::{schema, ArrayType, CheckpointFieldKind, DataType, MapType, PrimitiveType};
+    use crate::schema::{ArrayType, CheckpointFieldKind, DataType, MapType, PrimitiveType, schema};
     use crate::unit_test_utils::assert_result_error_with_message;
 
     #[test]
@@ -662,12 +660,14 @@ mod tests {
 
     #[test]
     fn ensure_decimals() {
-        assert!(ensure_data_types(
-            &DataType::decimal(5, 2).unwrap(),
-            &ArrowDataType::Decimal128(5, 2),
-            ValidationMode::TypesAndNames
-        )
-        .is_ok());
+        assert!(
+            ensure_data_types(
+                &DataType::decimal(5, 2).unwrap(),
+                &ArrowDataType::Decimal128(5, 2),
+                ValidationMode::TypesAndNames
+            )
+            .is_ok()
+        );
         assert_result_error_with_message(
             ensure_data_types(
                 &DataType::decimal(5, 2).unwrap(),
@@ -688,12 +688,14 @@ mod tests {
             false,
             false,
         );
-        assert!(ensure_data_types(
-            &DataType::from(MapType::new(DataType::LONG, DataType::STRING, true)),
-            arrow_field.data_type(),
-            ValidationMode::TypesAndNames
-        )
-        .is_ok());
+        assert!(
+            ensure_data_types(
+                &DataType::from(MapType::new(DataType::LONG, DataType::STRING, true)),
+                arrow_field.data_type(),
+                ValidationMode::TypesAndNames
+            )
+            .is_ok()
+        );
 
         assert_result_error_with_message(
             ensure_data_types(
@@ -715,18 +717,22 @@ mod tests {
 
     #[test]
     fn ensure_list() {
-        assert!(ensure_data_types(
-            &DataType::from(ArrayType::new(DataType::LONG, true)),
-            &ArrowDataType::new_list(ArrowDataType::Int64, true),
-            ValidationMode::TypesAndNames
-        )
-        .is_ok());
-        assert!(ensure_data_types(
-            &DataType::from(ArrayType::new(DataType::LONG, true)),
-            &ArrowDataType::new_large_list(ArrowDataType::Int64, true),
-            ValidationMode::TypesAndNames
-        )
-        .is_ok());
+        assert!(
+            ensure_data_types(
+                &DataType::from(ArrayType::new(DataType::LONG, true)),
+                &ArrowDataType::new_list(ArrowDataType::Int64, true),
+                ValidationMode::TypesAndNames
+            )
+            .is_ok()
+        );
+        assert!(
+            ensure_data_types(
+                &DataType::from(ArrayType::new(DataType::LONG, true)),
+                &ArrowDataType::new_large_list(ArrowDataType::Int64, true),
+                ValidationMode::TypesAndNames
+            )
+            .is_ok()
+        );
         assert_result_error_with_message(
             ensure_data_types(
                 &DataType::from(ArrayType::new(DataType::STRING, true)),
@@ -774,12 +780,14 @@ mod tests {
             ]),
             true,
         );
-        assert!(ensure_data_types(
-            &kernel_simple,
-            arrow_simple_ok.data_type(),
-            ValidationMode::Full
-        )
-        .is_ok());
+        assert!(
+            ensure_data_types(
+                &kernel_simple,
+                arrow_simple_ok.data_type(),
+                ValidationMode::Full
+            )
+            .is_ok()
+        );
 
         let arrow_missing_simple = ArrowField::new_struct(
             "arrow_struct",

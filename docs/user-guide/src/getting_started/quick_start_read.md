@@ -47,7 +47,7 @@ use delta_kernel_default_engine::storage::store_from_url;
 use delta_kernel_default_engine::DefaultEngine;
 use delta_kernel::{KernelResult, Snapshot};
 
-fn main() -> KernelResult<()> {
+fn main() -> KernelResult<(), Box<dyn std::error::Error>> {
     // 1. Parse the table location
     let table_path = std::env::args().nth(1).expect("usage: delta_read_example <TABLE_PATH>");
     let url = delta_kernel::try_parse_uri(&table_path)?;

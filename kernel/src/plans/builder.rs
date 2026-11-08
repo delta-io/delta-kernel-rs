@@ -43,9 +43,9 @@ use delta_kernel_derive::internal_api;
 use url::Url;
 
 use super::ir::nodes::{
-    Aggregate, AggregateBuilder, DynamicScan, FileType, Filter, Operator, PrefixSum, Project,
-    RelationRef, ScanFile, ScanJson, ScanParquet, SemiJoin, UnionAll, Values, WriteJson,
-    FILE_META_SCHEMA,
+    Aggregate, AggregateBuilder, DynamicScan, FILE_META_SCHEMA, FileType, Filter, Operator,
+    PrefixSum, Project, RelationRef, ScanFile, ScanJson, ScanParquet, SemiJoin, UnionAll, Values,
+    WriteJson,
 };
 use super::ir::plan::{Plan, PlanNode};
 use crate::expressions::{ColumnName, Expression, ExpressionRef, PredicateRef, Scalar, StructData};
@@ -621,7 +621,7 @@ impl PlanBuilder {
             // An absent build side matches nothing, so an anti-join forwards an unfiltered
             // probe side while a semi-join is uninhabited.
             PlanBuilderRoot::Absent(_) if inverted => {
-                return Ok(PlanBuilder(PlanBuilderRoot::Present(probe)))
+                return Ok(PlanBuilder(PlanBuilderRoot::Present(probe)));
             }
             PlanBuilderRoot::Absent(_) => return Ok(Self::absent(Arc::clone(&probe.schema))),
         };
@@ -788,13 +788,13 @@ mod tests {
     use test_utils::assert_result_error_with_message;
 
     use super::*;
+    use crate::FileMeta;
     use crate::actions::deletion_vector::DeletionVectorDescriptor;
-    use crate::expressions::{col, column_name, lit, Expression};
+    use crate::expressions::{Expression, Predicate, col, column_name, expr, lit};
     use crate::plans::ir::nodes::FileType;
     use crate::schema::{
-        schema, schema_ref, DataType, MetadataColumnSpec, StructField, StructType,
+        DataType, MetadataColumnSpec, StructField, StructType, schema, schema_ref,
     };
-    use crate::FileMeta;
 
     /// A single-file scan (present), no file-constant columns -- the trivial scan fixture.
     fn scan(schema: SchemaRef) -> PlanBuilder {
@@ -878,7 +878,7 @@ mod tests {
     #[test]
     fn relation_source_supports_downstream_transforms() -> KernelResult<()> {
         let filtered = PlanBuilder::relation_source(RelationRef::new("relation-1", id_schema()))
-            .filter(col!("id").is_not_null())?;
+            .filter(Predicate::from_expr(expr!(is_not_null(col("id")))))?;
         assert_eq!(filtered.schema(), &id_schema());
         assert_plan(filtered, &[(&[], "relation_source"), (&[0], "filter")]);
         Ok(())
@@ -933,7 +933,8 @@ mod tests {
     /// Filter passes the input schema through unchanged.
     #[test]
     fn filter_preserves_schema() -> KernelResult<()> {
-        let filtered = vals(id_schema()).filter(col!("id").is_not_null())?;
+        let filtered =
+            vals(id_schema()).filter(Predicate::from_expr(expr!(is_not_null(col("id")))))?;
         assert_eq!(filtered.schema(), &id_schema());
         Ok(())
     }
@@ -943,8 +944,8 @@ mod tests {
     fn monadic_chain_is_topological() -> KernelResult<()> {
         assert_plan(
             scan(id_schema())
-                .filter(col!("id").is_not_null())?
-                .filter(col!("id").is_null())?,
+                .filter(Predicate::from_expr(expr!(is_not_null(col("id")))))?
+                .filter(Predicate::from_expr(expr!(is_null(col("id")))))?,
             &[(&[], "scan_parquet"), (&[0], "filter"), (&[1], "filter")],
         );
         Ok(())
@@ -955,8 +956,10 @@ mod tests {
     #[test]
     fn shared_source_emitted_once() -> KernelResult<()> {
         let a = vals(id_schema());
-        let b = a.clone().filter(col!("id").is_not_null())?;
-        let c = a.filter(col!("id").is_null())?;
+        let b = a
+            .clone()
+            .filter(Predicate::from_expr(expr!(is_not_null(col("id")))))?;
+        let c = a.filter(Predicate::from_expr(expr!(is_null(col("id")))))?;
 
         // `a` is emitted once as node 0; both filters reference it.
         assert_plan(
@@ -975,8 +978,10 @@ mod tests {
     #[test]
     fn unreachable_nodes_are_dropped() -> KernelResult<()> {
         let src = vals(id_schema());
-        let _dead = src.clone().filter(col!("id").is_null())?; // never reaches the terminal
-        let kept = src.filter(col!("id").is_not_null())?;
+        let _dead = src
+            .clone()
+            .filter(Predicate::from_expr(expr!(is_null(col("id")))))?; // never reaches the terminal
+        let kept = src.filter(Predicate::from_expr(expr!(is_not_null(col("id")))))?;
 
         // Only src(0) and the kept filter(1) survive.
         assert_plan(kept, &[(&[], "values"), (&[0], "filter")]);
@@ -987,9 +992,11 @@ mod tests {
     /// and both consumers reference its single index.
     #[test]
     fn shared_intermediate_emitted_once_diamond() -> KernelResult<()> {
-        let mid = vals(id_schema()).filter(col!("id").is_not_null())?;
-        let left = mid.clone().filter(col!("id").is_not_null())?;
-        let right = mid.filter(col!("id").is_null())?;
+        let mid = vals(id_schema()).filter(Predicate::from_expr(expr!(is_not_null(col("id")))))?;
+        let left = mid
+            .clone()
+            .filter(Predicate::from_expr(expr!(is_not_null(col("id")))))?;
+        let right = mid.filter(Predicate::from_expr(expr!(is_null(col("id")))))?;
 
         // src(0) and mid(1) each emitted once; left(2) and right(3) both reference mid.
         assert_plan(
@@ -1089,7 +1096,7 @@ mod tests {
     #[case::empty_parquet(PlanBuilder::scan_parquet(Vec::<FileMeta>::new(), &[], id_schema()))]
     #[case::empty_json(PlanBuilder::scan_json(Vec::<FileMeta>::new(), &[], id_schema()))]
     #[case::empty_values(PlanBuilder::values(id_schema(), vec![]))]
-    #[case::filter(absent_src().filter(col!("id").is_not_null()))]
+    #[case::filter(absent_src().filter(Predicate::from_expr(expr!(is_not_null(col("id"))))))]
     #[case::project(absent_src().project(Expression::struct_from([col!("id")]), id_schema()))]
     #[case::project_patch(absent_src().project_patch(|p| p.drop("id")))]
     #[case::dynamic_scan({
@@ -1545,9 +1552,10 @@ mod tests {
         || PlanBuilder::values(id_schema(), vec![vec!["a".into(), "b".into()]]))]
     // transforms referencing an absent column
     #[case::filter_unknown_column("`nope` not found",
-        || vals(id_schema()).filter(col!("nope").is_not_null()))]
+        || vals(id_schema()).filter(Predicate::from_expr(expr!(is_not_null(col("nope"))))))]
     #[case::relation_source_unknown_column("`nope` not found",
-        || PlanBuilder::relation_source(RelationRef::new("relation-0", id_schema())).filter(col!("nope").is_not_null()))]
+        || PlanBuilder::relation_source(RelationRef::new("relation-0", id_schema()))
+            .filter(Predicate::from_expr(expr!(is_not_null(col("nope"))))))]
     #[case::project_unknown_column("`nope` not found",
         || vals(id_schema()).project(Expression::struct_from([col!("nope")]), id_schema()))]
     #[case::project_patch_missing_field("does not exist",

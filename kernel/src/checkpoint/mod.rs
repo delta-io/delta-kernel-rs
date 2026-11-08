@@ -84,7 +84,7 @@
 //! // Finalize the checkpoint by passing the stats
 //! writer.finalize(engine, &last_checkpoint_stats)?;
 //!
-//! # Ok::<_, KernelError>(())
+//! # Ok::<_, delta_kernel::Error>(())
 //! ```
 //!
 //! ## Warning
@@ -108,6 +108,12 @@ use itertools::Itertools;
 use tracing::info;
 use url::Url;
 
+#[cfg(feature = "declarative-plans")]
+#[allow(unused_imports)]
+pub(crate) use crate::action_reconciliation::checkpoint_shape::{CheckpointShape, CheckpointType};
+use crate::action_reconciliation::file_metadata::{
+    StatsTransformConfig, build_checkpoint_read_schema, build_checkpoint_transform,
+};
 use crate::action_reconciliation::log_replay::{
     ActionReconciliationBatch, ActionReconciliationProcessor,
 };
@@ -115,7 +121,7 @@ use crate::action_reconciliation::{
     ActionReconciliationIterator, ActionReconciliationIteratorState, RetentionCalculator,
 };
 use crate::actions::{
-    CheckpointMetadata, ADD_FIELD, CHECKPOINT_METADATA_FIELD, CHECKPOINT_METADATA_NAME,
+    ADD_FIELD, CHECKPOINT_METADATA_FIELD, CHECKPOINT_METADATA_NAME, CheckpointMetadata,
     DOMAIN_METADATA_FIELD, METADATA_FIELD, PROTOCOL_FIELD, REMOVE_FIELD, SET_TRANSACTION_FIELD,
     SIDECAR_FIELD,
 };
@@ -124,31 +130,22 @@ use crate::expressions::Scalar;
 use crate::last_checkpoint_hint::LastCheckpointHint;
 use crate::log_replay::HasSelectionVector;
 use crate::path::{self, ParsedLogPath};
-use crate::schema::{lazy_schema_ref, SchemaRef, StructField};
+use crate::schema::{SchemaRef, StructField, lazy_schema_ref};
 use crate::snapshot::SnapshotRef;
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::TableFeature;
 use crate::table_properties::TableProperties;
 use crate::{
-    version_as_i64, Engine, EngineData, FileMeta, KernelError, KernelResult, KernelResultIterator,
-    Version,
+    Engine, EngineData, FileMeta, KernelError, KernelResult, KernelResultIterator, Version,
+    version_as_i64,
 };
 
-#[cfg(feature = "declarative-plans")]
-mod checkpoint_shape;
-mod checkpoint_transform;
 pub(crate) mod collation_stats;
 mod sidecar;
 
-#[cfg(feature = "declarative-plans")]
-#[allow(unused_imports)]
-pub(crate) use checkpoint_shape::{CheckpointShape, CheckpointType};
-use checkpoint_transform::{
-    build_checkpoint_read_schema, build_checkpoint_transform, StatsTransformConfig,
-};
-use sidecar::{create_sidecar_action_batch, SidecarSplitter, SingleSidecarDataIterator};
+use sidecar::{SidecarSplitter, SingleSidecarDataIterator, create_sidecar_action_batch};
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 /// Information about a freshly-written checkpoint. Pass it to
 /// [`CheckpointWriter::finalize`] to produce the `_last_checkpoint` hint file.
@@ -335,7 +332,7 @@ static CHECKPOINT_ACTIONS_SCHEMA_V1: LazyLock<SchemaRef> =
 
 /// Schema for V2 checkpoints (includes checkpointMetadata action). JSON checkpoints do not embed
 /// a schema, so readers assume this schema for them.
-static CHECKPOINT_ACTIONS_SCHEMA_V2: LazyLock<SchemaRef> = lazy_schema_ref! {
+pub(crate) static CHECKPOINT_ACTIONS_SCHEMA_V2: LazyLock<SchemaRef> = lazy_schema_ref! {
     ..(base_checkpoint_action_fields()),
     (&CHECKPOINT_METADATA_FIELD),
 };
@@ -557,15 +554,15 @@ impl CheckpointWriter {
         // Skip writing `_last_checkpoint` if the existing hint already points to a newer
         // checkpoint, to avoid regressing the hint.
         let checkpoint_version = self.snapshot.version();
-        if let Some(hint_version) = self.snapshot.log_segment().last_checkpoint_version() {
-            if hint_version > checkpoint_version {
-                info!(
-                    hint_version,
-                    checkpoint_version,
-                    "Skipping _last_checkpoint write: existing hint is newer than checkpoint"
-                );
-                return Ok(());
-            }
+        if let Some(hint_version) = self.snapshot.log_segment().last_checkpoint_version()
+            && hint_version > checkpoint_version
+        {
+            info!(
+                hint_version,
+                checkpoint_version,
+                "Skipping _last_checkpoint write: existing hint is newer than checkpoint"
+            );
+            return Ok(());
         }
 
         let data = create_last_checkpoint_data(

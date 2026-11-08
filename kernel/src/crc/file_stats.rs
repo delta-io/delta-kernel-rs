@@ -110,6 +110,7 @@ const INCREMENTAL_SAFE_OPS: &[&str] = &[
     "UPDATE",
     "DELETE",
     "OPTIMIZE",
+    "REORG",
     "CREATE TABLE",
     "REPLACE TABLE",
     "CREATE TABLE AS SELECT",
@@ -120,9 +121,8 @@ const INCREMENTAL_SAFE_OPS: &[&str] = &[
 /// Returns `true` if the given operation can be safely tracked by incremental file stats.
 ///
 /// Incremental-safe operations produce add/remove actions whose net counts give correct file
-/// stats. Unknown or missing operations are treated as unsafe. For example, ANALYZE STATS
-/// re-adds existing files with updated statistics; naively counting those adds would
-/// double-count file stats.
+/// stats. Unknown operations return `false`. For example, ANALYZE STATS re-adds existing files
+/// with updated statistics; naively counting those adds would double-count file stats.
 pub(crate) fn is_incremental_safe_operation(operation: &str) -> bool {
     INCREMENTAL_SAFE_OPS.contains(&operation)
 }
@@ -286,7 +286,7 @@ impl RowVisitor for FileStatsVisitor<'_, '_> {
 #[cfg(test)]
 mod tests {
     use rstest::rstest;
-    use test_utils::{generate_batch, IntoArray};
+    use test_utils::{IntoArray, generate_batch};
 
     use super::*;
     use crate::engine::arrow_data::ArrowEngineData;
@@ -394,11 +394,13 @@ mod tests {
     #[test]
     fn try_compute_histogram_with_selection_vectors() {
         let adds = vec![size_batch(vec![100, 200])];
-        let removes = vec![FilteredEngineData::try_new(
-            size_batch(vec![300, 400, 500]),
-            vec![true, false, true], // 300 selected, 400 skipped, 500 selected
-        )
-        .unwrap()];
+        let removes = vec![
+            FilteredEngineData::try_new(
+                size_batch(vec![300, 400, 500]),
+                vec![true, false, true], // 300 selected, 400 skipped, 500 selected
+            )
+            .unwrap(),
+        ];
         let stats = FileStatsDelta::try_compute_for_txn(&adds, &removes, None).unwrap();
 
         // Net bin 0: 2 adds - 2 removes = 0 files, 300 - 800 = -500 bytes

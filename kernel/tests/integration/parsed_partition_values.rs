@@ -12,25 +12,26 @@ use delta_kernel::arrow::compute::filter_record_batch;
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
-use delta_kernel::expressions::{col, lit, ColumnName, Predicate, Scalar};
-use delta_kernel::object_store::local::LocalFileSystem;
+use delta_kernel::expressions::{ColumnName, Predicate, Scalar, expr};
 use delta_kernel::object_store::DynObjectStore;
+use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::parquet::arrow::ArrowWriter;
-use delta_kernel::scan::state::ScanFile;
 use delta_kernel::scan::PartitionValuesOptions;
-use delta_kernel::schema::{schema_ref, DataType, StructField};
-use delta_kernel::table_features::{get_any_level_column_physical_name, ColumnMappingMode};
+use delta_kernel::scan::state::ScanFile;
+use delta_kernel::schema::{DataType, StructField, schema_ref};
+use delta_kernel::table_features::{ColumnMappingMode, get_any_level_column_physical_name};
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
 use delta_kernel::{Engine, Snapshot, SnapshotRef};
 use rstest::rstest;
 use test_utils::delta_kernel_default_engine::DefaultEngineBuilder;
 use test_utils::table_builder::{
-    partitioned, unpartitioned, version_latest, FeatureSet, LogState, TableConfig, TestTableBuilder,
+    FeatureSet, LogState, TableConfig, TestTableBuilder, partitioned, unpartitioned, version_latest,
 };
 use test_utils::{
-    add_commit, assert_result_error_with_message, create_default_engine_mt_executor, get_column,
-    install_thread_local_metrics_reporter, test_context, test_table_setup_mt, CountingReporter,
+    CountingReporter, add_commit, assert_result_error_with_message,
+    create_default_engine_mt_executor, get_column, install_thread_local_metrics_reporter,
+    test_context, test_table_setup_mt,
 };
 use url::Url;
 
@@ -360,30 +361,32 @@ async fn empty_string_partition_pruning(#[values(false, true)] native_checkpoint
 
     // The empty-string value is a real "", so equality and null predicates treat it as such.
     assert_eq!(
-        surviving(Predicate::eq(col!("p_str"), lit(""))),
+        surviving(Predicate::from_expr(expr!(col("p_str") == ""))),
         vec![empty.clone()],
         "empty-string file must be kept under p_str = ''"
     );
     assert_eq!(
-        surviving(Predicate::eq(col!("p_str"), lit("other"))),
+        surviving(Predicate::from_expr(expr!(col("p_str") == "other"))),
         vec![other.clone()],
         "empty-string file must be pruned under p_str = 'other'"
     );
     // Both partition values are non-null ("" and "other"), so IS NULL prunes both and IS NOT NULL
     // keeps both.
     assert!(
-        surviving(Predicate::is_null(col!("p_str"))).is_empty(),
+        surviving(Predicate::from_expr(expr!(is_null(col("p_str"))))).is_empty(),
         "no file has a null p_str, so IS NULL prunes both (the empty file's value is \"\", not null)"
     );
     assert_eq!(
-        surviving(Predicate::is_not_null(col!("p_str"))),
+        surviving(Predicate::from_expr(expr!(is_not_null(col("p_str"))))),
         both,
         "both files must be kept under p_str IS NOT NULL"
     );
 
     // The binary column reconstructs "" as empty bytes, pruned the same way.
     assert_eq!(
-        surviving(Predicate::eq(col!("p_bin"), lit(b"other".as_slice()))),
+        surviving(Predicate::from_expr(expr!(
+            col("p_bin") == lit(b"other".as_slice())
+        ))),
         vec![other.clone()],
         "empty-bytes file must be pruned under p_bin = X'6f74686572'"
     );
@@ -532,7 +535,9 @@ async fn offset_less_timestamp_partition_read_with_json_and_checkpoint(
 
 #[rstest]
 #[case::utc_before(
-    col!("p_ts").lt(lit(Scalar::Timestamp(timestamp_micros("2024-01-15T16:00:00Z")))),
+    Predicate::from_expr(expr!(
+        col("p_ts") < lit(Scalar::Timestamp(timestamp_micros("2024-01-15T16:00:00Z")))
+    )),
     None,
     &[
         ("offset-less-in-checkpoint.parquet", "2024-01-15T12:30:45.123456Z"),
@@ -541,7 +546,9 @@ async fn offset_less_timestamp_partition_read_with_json_and_checkpoint(
     true /* write_parsed_partition */
 )]
 #[case::utc_after(
-    col!("p_ts").gt(lit(Scalar::Timestamp(timestamp_micros("2024-01-15T16:00:00Z")))),
+    Predicate::from_expr(expr!(
+        col("p_ts") > lit(Scalar::Timestamp(timestamp_micros("2024-01-15T16:00:00Z")))
+    )),
     None,
     &[
         ("utc-in-checkpoint.parquet", "2024-01-15T18:30:45.123456Z"),
@@ -550,13 +557,17 @@ async fn offset_less_timestamp_partition_read_with_json_and_checkpoint(
     true /* write_parsed_partition */
 )]
 #[case::los_angeles_before(
-    col!("p_ts").lt(lit(Scalar::Timestamp(timestamp_micros("2024-01-15T16:00:00Z")))),
+    Predicate::from_expr(expr!(
+        col("p_ts") < lit(Scalar::Timestamp(timestamp_micros("2024-01-15T16:00:00Z")))
+    )),
     Some("America/Los_Angeles"),
     &[("offset-less-in-checkpoint.parquet", "2024-01-15T12:30:45.123456Z")],
     true /* write_parsed_partition */
 )]
 #[case::los_angeles_after(
-    col!("p_ts").gt(lit(Scalar::Timestamp(timestamp_micros("2024-01-15T16:00:00Z")))),
+    Predicate::from_expr(expr!(
+        col("p_ts") > lit(Scalar::Timestamp(timestamp_micros("2024-01-15T16:00:00Z")))
+    )),
     Some("America/Los_Angeles"),
     &[
         ("offset-less-in-json.parquet", "2024-01-15T20:30:45.123456Z"),
@@ -566,7 +577,9 @@ async fn offset_less_timestamp_partition_read_with_json_and_checkpoint(
     true /* write_parsed_partition */
 )]
 #[case::los_angeles_before_without_parsed(
-    col!("p_ts").lt(lit(Scalar::Timestamp(timestamp_micros("2024-01-15T16:00:00Z")))),
+    Predicate::from_expr(expr!(
+        col("p_ts") < lit(Scalar::Timestamp(timestamp_micros("2024-01-15T16:00:00Z")))
+    )),
     Some("America/Los_Angeles"),
     &[],
     false /* write_parsed_partition */

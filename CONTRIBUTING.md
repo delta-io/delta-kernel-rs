@@ -44,6 +44,10 @@ We also encourage contributors to optimize their PRs for review:
 - Code structure and doc comments optimized for understandability (e.g. avoid bloat, redundancy, and
 convoluted control flow).
 
+See [documentation ownership](AGENTS.md#documentation-ownership) for where an explanation belongs
+and the [comment and documentation style](AGENTS.md#comment--doc-style) for Rustdoc and code
+comments.
+
 PRs that do not follow these principles are much more time consuming to review, and less likely to
 get prompt reviews.
 

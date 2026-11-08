@@ -1,7 +1,7 @@
 //! Some utilities for working with arrow data types
 
 pub(crate) mod apply_schema;
-mod file_values;
+pub(crate) mod file_type_validation;
 
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
@@ -14,34 +14,34 @@ use itertools::Itertools;
 use tracing::debug;
 
 use self::apply_schema::apply_schema_to_struct;
-use self::file_values::validate_file_values;
+use self::file_type_validation::validate_file_values_for_read;
 use crate::arrow::array::cast::AsArray;
 use crate::arrow::array::{
-    make_array, new_null_array, Array as ArrowArray, ArrayRef as ArrowArrayRef, GenericListArray,
-    GenericListViewArray, MapArray, OffsetSizeTrait, PrimitiveArray, RecordBatch,
-    RecordBatchOptions, StringArray, StructArray,
+    Array as ArrowArray, ArrayRef as ArrowArrayRef, GenericListArray, GenericListViewArray,
+    MapArray, OffsetSizeTrait, PrimitiveArray, RecordBatch, RecordBatchOptions, StringArray,
+    StructArray, make_array, new_null_array,
 };
 use crate::arrow::buffer::NullBuffer;
-use crate::arrow::compute::{cast_with_options, CastOptions};
+use crate::arrow::compute::{CastOptions, cast_with_options};
 use crate::arrow::datatypes::{
     DataType as ArrowDataType, Field as ArrowField, FieldRef as ArrowFieldRef,
     Fields as ArrowFields, Int64Type, Schema as ArrowSchema, SchemaRef as ArrowSchemaRef,
 };
-use crate::arrow::json::writer::{make_encoder, LineDelimited, NullableEncoder};
+use crate::arrow::json::writer::{LineDelimited, NullableEncoder, make_encoder};
 use crate::arrow::json::{Encoder, EncoderFactory, EncoderOptions, ReaderBuilder, WriterBuilder};
 use crate::engine::arrow_conversion::{TryFromKernel as _, TryIntoArrow as _};
 use crate::engine::arrow_data::ArrowEngineData;
 use crate::engine::ensure_data_types::DataTypeCompat;
 use crate::engine_data::FilteredEngineData;
 use crate::parquet::arrow::arrow_reader::ArrowReaderMetadata;
-use crate::parquet::arrow::{ProjectionMask, PARQUET_FIELD_ID_META_KEY};
+use crate::parquet::arrow::{PARQUET_FIELD_ID_META_KEY, ProjectionMask};
 use crate::parquet::file::metadata::RowGroupMetaData;
 use crate::parquet::schema::types::SchemaDescriptor;
 use crate::schema::{
-    schema, ArrayType, ColumnMetadataKey, DataType, MapType, MetadataColumnSpec, MetadataValue,
-    PrimitiveType, Schema, SchemaRef, StructField, StructType,
+    ArrayType, ColumnMetadataKey, DataType, MapType, MetadataColumnSpec, MetadataValue,
+    PrimitiveType, Schema, SchemaRef, StructField, StructType, schema,
 };
-use crate::transforms::{transform_output_type, SchemaTransform};
+use crate::transforms::{SchemaTransform, transform_output_type};
 use crate::utils::require;
 use crate::{EngineData, KernelError, KernelResult, KernelResultIterator};
 
@@ -232,15 +232,18 @@ impl RowIndexBuilder {
 ///   via `ArrowSchema::new`).
 ///
 /// **Type validation.** `apply_schema_to_struct` runs `ensure_data_types(.., Full)` at every
-/// primitive leaf. This is safe because `reorder_struct_array` above has already resolved every
+/// primitive leaf. On this path `reorder_struct_array` above has already resolved every
 /// `DataTypeCompat::NeedsCast` into an actual `arrow::compute::cast`, so post-reorder leaf types
-/// are `Identical` to the kernel target.
+/// are `Identical` to the kernel target and the leaf cast is a no-op. Note that `apply_schema` has
+/// other callers (the expression evaluator) with no such pre-cast step, so it resolves
+/// `NeedsCast` itself rather than relying on this invariant.
 ///
-/// **File values.** A non-null `file` value that resolves to no referent (neither `uri` nor
-/// `inline` set, or `offset` set without `uri`) fails the read, as the File type requires.
+/// **File values.** A non-null `file` value that the File type requires readers to reject fails
+/// the read; `validate_file_values_for_read` in `file_type_validation.rs` lists the rules.
 ///
-/// **Cost.** O(F) per batch where F is the total number of fields (including nested). Row data
-/// (Arrow buffers, offsets, null buffers) is shared via `Arc` and never copied.
+/// **Cost.** O(F) per batch where F is the total number of fields (including nested), plus O(R)
+/// per `file` column for R rows. Row data (Arrow buffers, offsets, null buffers) is shared via
+/// `Arc` and never copied.
 #[internal_api]
 pub(crate) fn fixup_parquet_read(
     batch: RecordBatch,
@@ -253,12 +256,24 @@ pub(crate) fn fixup_parquet_read(
     let data = fix_nested_null_masks(data);
     let data = if let Some(schema) = target_schema {
         let data = apply_schema_to_struct(&data, schema)?;
-        validate_file_values(&data, schema)?;
+        validate_file_values_for_read(&data, schema)?;
         data
     } else {
         data
     };
     Ok(data.into())
+}
+
+/// Fails if a `file` value in `batch` is invalid for a writer to write: it breaks a rule reads
+/// apply (see [`fixup_parquet_read`]) or has a malformed `checksum`, so a writer never writes a
+/// data file that readers reject. Columns are matched to `kernel_schema` by name, and a `file`
+/// column missing from `batch` is an error.
+#[internal_api]
+pub(crate) fn validate_file_values_for_write(
+    batch: &RecordBatch,
+    kernel_schema: &StructType,
+) -> KernelResult<()> {
+    file_type_validation::validate_file_values_for_write(&batch.clone().into(), kernel_schema)
 }
 
 /*
@@ -715,7 +730,7 @@ fn get_indices(
                         DataTypeCompat::Nested => {
                             return Err(KernelError::internal_error(
                                 "Comparing nested types in get_indices",
-                            ))
+                            ));
                         }
                     }
                     found_fields.insert(requested_field.name());
@@ -1716,8 +1731,8 @@ mod tests {
     use crate::parquet::file::metadata::ColumnChunkMetaData;
     use crate::parquet::schema::types::{SchemaDescriptor, Type};
     use crate::schema::{
-        schema, schema_ref, ArrayType, ColumnMetadataKey, DataType, MapType, MetadataColumnSpec,
-        MetadataValue, StructField, StructType,
+        ArrayType, ColumnMetadataKey, DataType, MapType, MetadataColumnSpec, MetadataKey,
+        MetadataValue, StructField, StructType, schema, schema_ref,
     };
     use crate::table_features::ColumnMappingMode;
     use crate::unit_test_utils::assert_result_error_with_message;
@@ -1756,7 +1771,7 @@ mod tests {
     fn column_mapping_metadata(
         field_id: i64,
         mode: ColumnMappingMode,
-    ) -> HashMap<String, MetadataValue> {
+    ) -> HashMap<MetadataKey, MetadataValue> {
         match mode {
             ColumnMappingMode::None => HashMap::new(),
             _ => kernel_fid_and_name(field_id, physical_name(field_id)),
@@ -1770,16 +1785,17 @@ mod tests {
 
     /// Generates appropriate column mapping metadata for a kernel struct field with column mapping
     /// id `field_id`.
-    fn kernel_fid_and_name(field_id: i64, name: impl AsRef<str>) -> HashMap<String, MetadataValue> {
+    fn kernel_fid_and_name(
+        field_id: i64,
+        name: impl AsRef<str>,
+    ) -> HashMap<MetadataKey, MetadataValue> {
         HashMap::from([
             (
-                ColumnMetadataKey::ColumnMappingId.as_ref().to_string(),
+                ColumnMetadataKey::ColumnMappingId.as_ref().into(),
                 field_id.into(),
             ),
             (
-                ColumnMetadataKey::ColumnMappingPhysicalName
-                    .as_ref()
-                    .to_string(),
+                ColumnMetadataKey::ColumnMappingPhysicalName.as_ref().into(),
                 name.as_ref().to_string().into(),
             ),
         ])
@@ -2418,15 +2434,17 @@ mod tests {
             .into();
 
             // The key and value may have field ids not present in the delta schema
-            let parquet_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new_map(
-                parquet_name(0, mode),
-                "entries",
-                ArrowField::new("i", ArrowDataType::Int32, false),
-                ArrowField::new("s", ArrowDataType::Utf8, false),
-                false,
-                false,
-            )
-            .with_metadata(arrow_fid(1))]));
+            let parquet_schema = Arc::new(ArrowSchema::new(vec![
+                ArrowField::new_map(
+                    parquet_name(0, mode),
+                    "entries",
+                    ArrowField::new("i", ArrowDataType::Int32, false),
+                    ArrowField::new("s", ArrowDataType::Utf8, false),
+                    false,
+                    false,
+                )
+                .with_metadata(arrow_fid(1)),
+            ]));
             let (mask_indices, reorder_indices) =
                 get_requested_indices(&requested_schema, &parquet_schema).unwrap();
             let expect_mask = vec![0, 1];

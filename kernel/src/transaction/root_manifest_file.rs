@@ -5,13 +5,13 @@ use std::sync::Arc;
 use crate::action_reconciliation::calculate_transaction_expiration_timestamp;
 use crate::actions::visitors::SetTransactionMap;
 use crate::actions::{CheckpointAction, ContentRoot, DomainMetadata, SetTransaction};
-use crate::crc::{merge_domain_metadata, DomainMetadataState, SetTransactionState};
+use crate::crc::{DomainMetadataState, SetTransactionState, merge_domain_metadata};
 use crate::error::KernelError;
 use crate::log_segment::DomainMetadataMap;
 use crate::snapshot::SnapshotRef;
 use crate::table_configuration::TableConfiguration;
 use crate::utils::require;
-use crate::{version_as_i64, Engine, FileMeta, KernelResult, Version};
+use crate::{Engine, FileMeta, KernelResult, Version, version_as_i64};
 
 /// A pointer to an on-disk root manifest file to be committed as the table's content root via a
 /// `checkpoint` action.
@@ -170,7 +170,7 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
-    use crate::actions::{Sidecar, LOG_DOMAIN_METADATA_SCHEMA, LOG_TXN_SCHEMA};
+    use crate::actions::{LOG_DOMAIN_METADATA_SCHEMA, LOG_TXN_SCHEMA, Sidecar};
     use crate::committer::FileSystemCommitter;
     use crate::crc::{Crc, DomainMetadataState, SetTransactionState};
     use crate::engine::sync::SyncEngine;
@@ -180,10 +180,10 @@ mod tests {
     use crate::transaction::create_table::create_table;
     use crate::unit_test_utils::adaptive_metadata_fixtures::{
         adaptive_metadata_protocol_and_metadata, minimal_checkpoint_action, setup_table,
-        write_commit,
+        write_commit, write_commit_after_manifest_commit, write_manifest_commit,
     };
-    use crate::unit_test_utils::{assert_result_error_with_message, MockTableConfigurationBuilder};
-    use crate::{create_row, KernelResult};
+    use crate::unit_test_utils::{MockTableConfigurationBuilder, assert_result_error_with_message};
+    use crate::{KernelResult, Result, create_row};
 
     fn manifest_file(location: &str, size: u64) -> KernelResult<FileMeta> {
         Ok(FileMeta {
@@ -210,7 +210,7 @@ mod tests {
     }
 
     #[test]
-    fn compute_checkpoint_action_builds_a_self_contained_action() -> KernelResult<()> {
+    fn compute_checkpoint_action_builds_a_self_contained_action() -> Result<()> {
         let (engine, table_root) = setup_table()?;
         let snapshot = Snapshot::builder_for(table_root.clone()).build(&engine)?;
         let manifest = root_manifest(
@@ -249,11 +249,11 @@ mod tests {
     }
 
     #[test]
-    fn compute_checkpoint_action_allows_replacing_a_checkpoint_that_covers_the_snapshot(
-    ) -> KernelResult<()> {
+    fn compute_checkpoint_action_allows_replacing_a_checkpoint_that_covers_the_snapshot()
+    -> Result<()> {
         let (engine, table_root) = setup_table()?;
         let existing = minimal_checkpoint_action("metadata/root-v1.parquet", 1)?;
-        write_commit(&engine, &table_root, 1, existing.into_engine_data(&engine)?)?;
+        write_manifest_commit(&engine, &table_root, 1, existing)?;
 
         let snapshot = Snapshot::builder_for(table_root.clone()).build(&engine)?;
         assert_eq!(snapshot.version(), 1);
@@ -276,15 +276,16 @@ mod tests {
     }
 
     #[test]
-    fn compute_checkpoint_action_rejects_a_stale_checkpoint() -> KernelResult<()> {
+    fn compute_checkpoint_action_rejects_a_stale_checkpoint() -> Result<()> {
         let (engine, table_root) = setup_table()?;
         let existing = minimal_checkpoint_action("metadata/root-v1.parquet", 1)?;
-        write_commit(&engine, &table_root, 1, existing.into_engine_data(&engine)?)?;
+        write_manifest_commit(&engine, &table_root, 1, existing)?;
         let domain_metadata = DomainMetadata::new("test.domain".to_string(), "{}".to_string());
-        write_commit(
+        write_commit_after_manifest_commit(
             &engine,
             &table_root,
             2,
+            1,
             create_row(&engine, LOG_DOMAIN_METADATA_SCHEMA.clone(), domain_metadata)?,
         )?;
 
@@ -309,7 +310,7 @@ mod tests {
     }
 
     #[test]
-    fn compute_checkpoint_action_prunes_expired_transactions() -> KernelResult<()> {
+    fn compute_checkpoint_action_prunes_expired_transactions() -> Result<()> {
         let (engine, table_root) = setup_table()?;
         let expired = SetTransaction::new("app-1".to_string(), 5, Some(0));
         write_commit(
@@ -334,7 +335,7 @@ mod tests {
     }
 
     #[test]
-    fn compute_checkpoint_action_new_change_wins() -> KernelResult<()> {
+    fn compute_checkpoint_action_new_change_wins() -> Result<()> {
         let (engine, table_root) = setup_table()?;
         let write = |version, data| write_commit(&engine, &table_root, version, data);
 
@@ -377,7 +378,7 @@ mod tests {
     }
 
     #[test]
-    fn new_preserves_an_absolute_file_location() -> KernelResult<()> {
+    fn new_preserves_an_absolute_file_location() -> Result<()> {
         let engine = SyncEngine::new_with_store(Arc::new(InMemory::new()));
         let schema = schema_ref! { nullable "id": INTEGER };
         let _ = create_table("memory:///t/", schema, "test", true)
@@ -394,8 +395,7 @@ mod tests {
     // A checkpoint holds complete state, so its inline entries win and stale top-level entries
     // from before it are ignored.
     #[test]
-    fn scan_non_content_metadata_prefers_checkpoint_inline_over_stale_top_level() -> KernelResult<()>
-    {
+    fn scan_non_content_metadata_prefers_checkpoint_inline_over_stale_top_level() -> Result<()> {
         let (engine, table_root) = setup_table()?;
         let write = |version, data| write_commit(&engine, &table_root, version, data);
 
@@ -421,7 +421,7 @@ mod tests {
                 "{}".to_string(),
             )],
         );
-        write(3, checkpoint.into_engine_data(&engine)?)?;
+        write_manifest_commit(&engine, &table_root, 3, checkpoint)?;
 
         let manifest = root_manifest(
             &table_root,
@@ -442,8 +442,7 @@ mod tests {
     // (as an external writer would, with no tombstone), must not come back in the rebuilt
     // checkpoint from those older log entries.
     #[test]
-    fn compute_checkpoint_action_does_not_resurrect_entries_the_checkpoint_dropped(
-    ) -> KernelResult<()> {
+    fn compute_checkpoint_action_does_not_resurrect_entries_the_checkpoint_dropped() -> Result<()> {
         let (engine, table_root) = setup_table()?;
         let write = |version, data| write_commit(&engine, &table_root, version, data);
 
@@ -456,7 +455,7 @@ mod tests {
         write(2, create_row(&engine, LOG_TXN_SCHEMA.clone(), transaction)?)?;
         // Complete checkpoint at the tip that omits both.
         let existing = minimal_checkpoint_action("metadata/root-v3.parquet", 3)?;
-        write(3, existing.into_engine_data(&engine)?)?;
+        write_manifest_commit(&engine, &table_root, 3, existing)?;
 
         let snapshot = Snapshot::builder_for(table_root.clone()).build(&engine)?;
         assert_eq!(snapshot.version(), 3);
@@ -482,8 +481,7 @@ mod tests {
     // The existing checkpoint spilled txns/domain metadata into sidecar files that can't be read
     // yet; replacing it would drop that state, so the commit is refused.
     #[test]
-    fn compute_checkpoint_action_rejects_a_checkpoint_that_spills_to_sidecars() -> KernelResult<()>
-    {
+    fn compute_checkpoint_action_rejects_a_checkpoint_that_spills_to_sidecars() -> Result<()> {
         let (engine, table_root) = setup_table()?;
         let (protocol, metadata) = adaptive_metadata_protocol_and_metadata();
         let mut existing = CheckpointAction::new(
@@ -502,7 +500,7 @@ mod tests {
         };
         existing.txn_sidecars = vec![sidecar()];
         existing.domain_metadata_sidecars = vec![sidecar()];
-        write_commit(&engine, &table_root, 1, existing.into_engine_data(&engine)?)?;
+        write_manifest_commit(&engine, &table_root, 1, existing)?;
 
         let snapshot = Snapshot::builder_for(table_root.clone()).build(&engine)?;
         let manifest = root_manifest(
@@ -527,9 +525,9 @@ mod tests {
     // domain metadata and a transaction. Every commit records an In-Commit Timestamp and, from v1
     // on, the `lastManifestCommit` that locates the checkpoint action, as an AMT writer does.
     #[test]
-    fn scan_non_content_metadata_uses_crc_fast_path_with_existing_checkpoint() -> KernelResult<()> {
+    fn scan_non_content_metadata_uses_crc_fast_path_with_existing_checkpoint() -> Result<()> {
         let engine = SyncEngine::new_with_store(Arc::new(InMemory::new()));
-        let table_root = url::Url::parse("memory:///")?;
+        let table_root = url::Url::parse("memory:///").map_err(KernelError::from)?;
         let (protocol, metadata) = adaptive_metadata_protocol_and_metadata();
         let commit_info = |ict: i64, last_manifest_commit: Option<i64>| {
             let mut commit_info = serde_json::json!({ "timestamp": ict, "inCommitTimestamp": ict });
@@ -567,11 +565,13 @@ mod tests {
                 serde_json::json!({ "txn": { "appId": "app-1", "version": 5 } }),
             ],
         ];
-        let log_root = table_root.join("_delta_log/")?;
+        let log_root = table_root.join("_delta_log/").map_err(KernelError::from)?;
         for (version, actions) in commits.iter().enumerate() {
             let lines = actions.iter().map(|action| action.to_string()).join("\n");
             engine.storage_handler().put(
-                &log_root.join(&format!("{version:020}.json"))?,
+                &log_root
+                    .join(&format!("{version:020}.json"))
+                    .map_err(KernelError::from)?,
                 lines.into(),
                 false,
             )?;
@@ -594,7 +594,7 @@ mod tests {
     }
 
     #[test]
-    fn scan_non_content_metadata_uses_crc_fast_path() -> KernelResult<()> {
+    fn scan_non_content_metadata_uses_crc_fast_path() -> Result<()> {
         let (engine, table_root) = setup_table()?;
         let write = |version, data| write_commit(&engine, &table_root, version, data);
 
@@ -630,24 +630,21 @@ mod tests {
     fn compute_checkpoint_action_folds_prior_checkpoint_nested_set(
         #[case] dm_changes: Vec<DomainMetadata>,
         #[case] domain_kept: bool,
-    ) -> KernelResult<()> {
+    ) -> Result<()> {
         let (engine, table_root) = setup_table()?;
-        let config = Snapshot::builder_for(table_root.clone())
-            .build(&engine)?
-            .table_configuration()
-            .clone();
+        let (protocol, metadata) = adaptive_metadata_protocol_and_metadata();
         let existing = CheckpointAction::new(
             1,
             ContentRoot::new("metadata/root-v1.parquet".to_string(), 1024, 1),
-            config.protocol().clone(),
-            config.metadata().clone(),
+            protocol,
+            metadata,
             vec![SetTransaction::new("app-1".to_string(), 5, None)],
             vec![DomainMetadata::new(
                 "test.domain".to_string(),
                 "{}".to_string(),
             )],
         );
-        write_commit(&engine, &table_root, 1, existing.into_engine_data(&engine)?)?;
+        write_manifest_commit(&engine, &table_root, 1, existing)?;
 
         let snapshot = Snapshot::builder_for(table_root.clone()).build(&engine)?;
         assert!(snapshot.crc_at_version().is_none());
@@ -678,7 +675,7 @@ mod tests {
     }
 
     #[test]
-    fn scan_non_content_metadata_scans_past_a_partial_crc() -> KernelResult<()> {
+    fn scan_non_content_metadata_scans_past_a_partial_crc() -> Result<()> {
         let (engine, table_root) = setup_table()?;
         let write = |version, data| write_commit(&engine, &table_root, version, data);
 

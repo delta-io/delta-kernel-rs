@@ -30,8 +30,8 @@ use crate::arrow::error::ArrowError;
 use crate::error::KernelError;
 use crate::parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 use crate::schema::{
-    ArrayType, ColumnMetadataKey, DataType, MapType, MetadataValue, PrimitiveType, StructField,
-    StructType,
+    ArrayType, ColumnMetadataKey, DataType, MapType, MetadataKey, MetadataValue, PrimitiveType,
+    StructField, StructType,
 };
 
 pub(crate) const LIST_ARRAY_ROOT: &str = "element";
@@ -49,10 +49,10 @@ pub(crate) fn kernel_flat_parquet_id_to_arrow_metadata(
         .metadata()
         .iter()
         .map(|(key, val)| {
-            let transformed_key = if key == ColumnMetadataKey::ParquetFieldId.as_ref() {
+            let transformed_key = if key.as_str() == ColumnMetadataKey::ParquetFieldId.as_ref() {
                 PARQUET_FIELD_ID_META_KEY.to_string()
             } else {
-                key.clone()
+                key.to_string()
             };
             match val {
                 MetadataValue::String(s) => Ok((transformed_key, s.clone())),
@@ -373,7 +373,7 @@ impl TryFromKernel<&DataType> for ArrowDataType {
                         Ok(ArrowDataType::Timestamp(TimeUnit::Microsecond, None))
                     }
                     PrimitiveType::Void => Ok(ArrowDataType::Null),
-                    PrimitiveType::IntervalYearMonth => Ok(ArrowDataType::Int32),
+                    PrimitiveType::IntervalYearMonth(_) => Ok(ArrowDataType::Int32),
                     PrimitiveType::IntervalDayTime => Ok(ArrowDataType::Int64),
                     #[cfg(feature = "geo-type-in-dev")]
                     PrimitiveType::Geometry(_) | PrimitiveType::Geography(_) => {
@@ -444,19 +444,18 @@ impl TryFromArrow<&ArrowField> for StructField {
         if let (Some(arrow_id), Some(kernel_id)) = (
             arrow_metadata.get(PARQUET_FIELD_ID_META_KEY),
             arrow_metadata.get(ColumnMetadataKey::ParquetFieldId.as_ref()),
-        ) {
-            if arrow_id != kernel_id {
-                return Err(ArrowError::SchemaError(format!(
-                    "Field '{}': conflicting parquet field IDs: '{}' ({}) vs '{}' ({})",
-                    arrow_field.name(),
-                    arrow_id,
-                    PARQUET_FIELD_ID_META_KEY,
-                    kernel_id,
-                    ColumnMetadataKey::ParquetFieldId.as_ref(),
-                )));
-            }
+        ) && arrow_id != kernel_id
+        {
+            return Err(ArrowError::SchemaError(format!(
+                "Field '{}': conflicting parquet field IDs: '{}' ({}) vs '{}' ({})",
+                arrow_field.name(),
+                arrow_id,
+                PARQUET_FIELD_ID_META_KEY,
+                kernel_id,
+                ColumnMetadataKey::ParquetFieldId.as_ref(),
+            )));
         }
-        let mut kernel_metadata: HashMap<String, MetadataValue> = arrow_metadata
+        let mut kernel_metadata: HashMap<MetadataKey, MetadataValue> = arrow_metadata
             .iter()
             .map(|(k, v)| -> Result<_, ArrowError> {
                 // Transform "PARQUET:field_id" to "parquet.field.id" when reading from Parquet.
@@ -470,7 +469,7 @@ impl TryFromArrow<&ArrowField> for StructField {
                         ))
                     })?;
                     return Ok((
-                        ColumnMetadataKey::ParquetFieldId.as_ref().to_string(),
+                        ColumnMetadataKey::ParquetFieldId.as_ref().into(),
                         MetadataValue::Number(id),
                     ));
                 }
@@ -481,9 +480,9 @@ impl TryFromArrow<&ArrowField> for StructField {
                             arrow_field.name()
                         ))
                     })?;
-                    return Ok((k.clone(), MetadataValue::Other(value)));
+                    return Ok((k.as_str().into(), MetadataValue::Other(value)));
                 }
-                Ok((k.clone(), MetadataValue::from(v)))
+                Ok((k.as_str().into(), MetadataValue::from(v)))
             })
             .collect::<Result<_, _>>()?;
         let mut nested_ids = serde_json::Map::new();
@@ -494,9 +493,7 @@ impl TryFromArrow<&ArrowField> for StructField {
         )?;
         if !nested_ids.is_empty() {
             kernel_metadata.insert(
-                ColumnMetadataKey::ColumnMappingNestedIds
-                    .as_ref()
-                    .to_string(),
+                ColumnMetadataKey::ColumnMappingNestedIds.as_ref().into(),
                 MetadataValue::Other(serde_json::Value::Object(nested_ids)),
             );
         }
@@ -546,7 +543,7 @@ fn collect_nested_field_ids_from_arrow(
             other => {
                 return Err(ArrowError::SchemaError(format!(
                     "Map entries must be a struct with exactly 2 fields (key, value), got {other}"
-                )))
+                )));
             }
         },
         // Dictionary is a transparent wrapper (kernel side collapses it to its value type), so
@@ -686,24 +683,24 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
+    use crate::KernelResult;
     use crate::engine::arrow_conversion::ArrowField;
     use crate::engine::arrow_data::unshredded_variant_arrow_type;
     use crate::parquet::arrow::PARQUET_FIELD_ID_META_KEY;
-    use crate::schema::collation_utils::validate_collation_annotations;
     #[cfg(feature = "geo-type-in-dev")]
     use crate::schema::EdgeInterpolationAlgorithm;
+    use crate::schema::collation_utils::validate_collation_annotations;
     use crate::schema::{
-        schema, ArrayType, ColumnMetadataKey, DataType, MapType, MetadataValue, PrimitiveType,
-        StructField, StructType,
+        ArrayType, ColumnMetadataKey, DataType, MapType, MetadataValue, PrimitiveType, StructField,
+        StructType, schema,
     };
-    use crate::transforms::{transform_output_type, SchemaTransform};
+    use crate::transforms::{SchemaTransform, transform_output_type};
     use crate::unit_test_utils::{
         array_in_map_kernel_schema, assert_result_error_with_message, collect_arrow_field_metadata,
         complex_nested_with_field_ids,
     };
     #[cfg(feature = "geo-type-in-dev")]
     use crate::unit_test_utils::{geography_type, geometry_type};
-    use crate::KernelResult;
 
     #[cfg(feature = "geo-type-in-dev")]
     #[rstest]
@@ -760,10 +757,12 @@ mod tests {
     fn invalid_arrow_collation_json_is_rejected() {
         let field = ArrowField::new("field", ArrowDataType::Utf8, true)
             .with_metadata(HashMap::from([("__COLLATIONS".into(), "{invalid".into())]));
-        assert!(StructField::try_from_arrow(&field)
-            .unwrap_err()
-            .to_string()
-            .contains("__COLLATIONS"));
+        assert!(
+            StructField::try_from_arrow(&field)
+                .unwrap_err()
+                .to_string()
+                .contains("__COLLATIONS")
+        );
     }
 
     // Delta tables can have void columns. The kernel should parse them and convert
@@ -883,10 +882,12 @@ mod tests {
             StructField::nullable("typed_value", DataType::INTEGER),
         ])?;
         let shredded_variant_arrow = ArrowDataType::try_from_kernel(&shredded_variant);
-        assert!(shredded_variant_arrow
-            .unwrap_err()
-            .to_string()
-            .contains("Incorrect Variant Schema"));
+        assert!(
+            shredded_variant_arrow
+                .unwrap_err()
+                .to_string()
+                .contains("Incorrect Variant Schema")
+        );
         Ok(())
     }
 
@@ -1163,9 +1164,11 @@ mod tests {
             .try_into_kernel()
             .unwrap();
         let array_in_map = kernel_schema.fields().next().unwrap();
-        assert!(!array_in_map
-            .metadata()
-            .contains_key(ColumnMetadataKey::ColumnMappingNestedIds.as_ref()));
+        assert!(
+            !array_in_map
+                .metadata()
+                .contains_key(ColumnMetadataKey::ColumnMappingNestedIds.as_ref())
+        );
     }
 
     /// A non-integer `PARQUET:field_id` on an inner list/map field must produce a clear error

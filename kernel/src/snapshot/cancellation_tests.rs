@@ -11,9 +11,9 @@ use crate::engine::sync::SyncEngine;
 use crate::metrics::{LogSegmentLoadType, MetricEvent, SnapshotLoadType};
 use crate::unit_test_utils::recording_reads::{Read, RecordingReads};
 use crate::unit_test_utils::{
-    copy_test_table, install_thread_local_metrics_reporter, CapturingReporter,
+    CapturingReporter, copy_test_table, install_thread_local_metrics_reporter,
 };
-use crate::{CancellationTokenRef, KernelError, Snapshot};
+use crate::{CancellationTokenRef, Error, KernelError, Snapshot};
 
 #[rstest]
 #[case::json("table-without-dv-small", Read::Json)]
@@ -43,7 +43,10 @@ fn ordinary_protocol_metadata_replay_propagates_cancellation_after_batch() {
     let result = Snapshot::builder_for(url)
         .with_cancellation_token(token)
         .build(&reads.engine());
-    assert!(matches!(result, Err(KernelError::Cancelled)), "{result:?}");
+    assert!(
+        matches!(result, Err(Error::Kernel(KernelError::Cancelled))),
+        "{result:?}"
+    );
     assert_eq!(
         reads
             .events
@@ -84,7 +87,7 @@ fn stale_crc_replay_keeps_builder_token(
             .build(&engine)
     };
     if cancel_after_batch.is_some() {
-        assert!(matches!(result, Err(KernelError::Cancelled)));
+        assert!(matches!(result, Err(Error::Kernel(KernelError::Cancelled))));
     } else {
         let snapshot = result.unwrap();
         assert_eq!(snapshot.version(), 1);
@@ -141,7 +144,7 @@ fn only_cancelled_crc_read_blocks_incremental_snapshot_build(
         return;
     }
 
-    assert!(matches!(result, Err(KernelError::Cancelled)));
+    assert!(matches!(result, Err(Error::Kernel(KernelError::Cancelled))));
     assert_eq!(read_events.last(), Some(&Read::Crc));
     assert!(!read_events.contains(&Read::Json));
     let events = reporter.events();
@@ -154,8 +157,10 @@ fn only_cancelled_crc_read_blocks_incremental_snapshot_build(
             )
         })
         .collect();
-    let [MetricEvent::ProtocolMetadataLoadFailure(pm), MetricEvent::SnapshotBuildFailure(build)] =
-        failures.as_slice()
+    let [
+        MetricEvent::ProtocolMetadataLoadFailure(pm),
+        MetricEvent::SnapshotBuildFailure(build),
+    ] = failures.as_slice()
     else {
         panic!("expected one protocol/metadata and snapshot failure: {events:?}");
     };
@@ -179,7 +184,7 @@ fn engine_reported_crc_cancellation_is_not_optional() {
     let mut reads = RecordingReads::new(Some(Read::Crc));
     Arc::get_mut(&mut reads).unwrap().expected_token = None;
     let result = Snapshot::builder_for("tests/data/crc-full").build(&reads.engine());
-    assert!(matches!(result, Err(KernelError::Cancelled)));
+    assert!(matches!(result, Err(Error::Kernel(KernelError::Cancelled))));
     assert_eq!(reads.events.lock().unwrap().last(), Some(&Read::Crc));
 }
 
