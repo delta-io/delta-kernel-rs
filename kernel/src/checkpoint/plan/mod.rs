@@ -1,5 +1,7 @@
 //! Checkpoint reconstruction using shared metadata planning and action replay.
 
+mod write_metadata;
+
 use super::CheckpointWriter;
 use crate::action_reconciliation::RetentionCalculator as _;
 use crate::action_reconciliation::plan::action_set::ActionSet;

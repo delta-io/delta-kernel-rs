@@ -13,7 +13,7 @@ use crate::action_reconciliation::file_metadata::{
 use crate::action_reconciliation::log_replay::ActionReconciliationProcessor;
 use crate::action_reconciliation::plan::VERSION;
 use crate::action_reconciliation::plan::action_set::ActionSet;
-use crate::arrow::array::StringArray;
+use crate::arrow::array::{Int64Array, StringArray};
 use crate::arrow::compute::{filter_record_batch, is_not_null, or};
 use crate::arrow::record_batch::RecordBatch;
 use crate::checkpoint::{CheckpointSpec, V2CheckpointConfig};
@@ -21,6 +21,8 @@ use crate::engine::arrow_conversion::TryFromArrow as _;
 use crate::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt as _};
 use crate::engine::arrow_utils::parse_json_impl;
 use crate::engine::sync::SyncEngine;
+use crate::engine::sync::plan::SyncPlanExecutor;
+use crate::plans::{Operation, PlanExecutor as _, ScopedPlanExecutor as _};
 use crate::schema::{StructType, schema};
 use crate::unit_test_utils::copy_test_table;
 use crate::unit_test_utils::plans::{execute_plan as execute, json_rows};
@@ -340,6 +342,37 @@ async fn checkpoint_plan_reconciles_all_groups_and_retains_after_replay(
         ))?
         .project_patch(|patch| patch.drop(VERSION))?
         .build()?;
+    // Counts use the retained output after replay and retention, including tombstones and
+    // non-content actions. Compare with the existing checkpoint implementation's rows.
+    let executor = SyncPlanExecutor::new(Some(store.clone())).get_scoped();
+    let retained = executor.execute_and_retain("checkpoint", plan.clone())?;
+    let counts = CheckpointWriter::declarative_checkpoint_counts_plan(retained)?;
+    let mut rows = executor
+        .execute_op(Operation::QueryPlan(counts))?
+        .into_data()?;
+    let batch = rows.next().unwrap()?.try_into_record_batch()?;
+    let count = |column| {
+        batch
+            .column(column)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0) as usize
+    };
+    assert_eq!(
+        count(0),
+        expected.iter().map(RecordBatch::num_rows).sum::<usize>()
+    );
+    assert_eq!(
+        count(1),
+        expected
+            .iter()
+            .map(|batch| {
+                let adds = batch.column_by_name("add").unwrap();
+                adds.len() - adds.null_count()
+            })
+            .sum::<usize>()
+    );
     let actual = assert_checkpoint_plan(&engine, plan, ActionSet::ALL, &expected)?;
     if v2 {
         return Ok(());
