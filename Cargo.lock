@@ -1549,6 +1549,7 @@ dependencies = [
  "hdfs-native-object-store 0.16.0",
  "indexmap",
  "itertools 0.14.0",
+ "md-5 0.10.6",
  "object_store 0.13.2",
  "object_store 0.14.2",
  "parquet 59.3.0",
