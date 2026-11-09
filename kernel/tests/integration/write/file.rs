@@ -623,7 +623,7 @@ fn test_clustering_on_null_count_only_file_sub_field_is_rejected(
 #[rstest]
 #[tokio::test(flavor = "multi_thread")]
 async fn test_clustering_on_file_sub_field(
-    #[values("none", "name")] cm_mode: &str,
+    #[values("none", "id", "name")] cm_mode: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (_tmp_dir, table_path, engine) = test_table_setup_mt()?;
     let _ = create_clustered_table(
@@ -827,7 +827,7 @@ async fn test_predicate_on_file_sub_field_skips_files_in_other_scans(
 async fn test_predicate_on_file_sub_field_skips_files(
     #[case] predicate: Pred,
     #[case] expected: usize,
-    #[values("none", "name")] cm_mode: &str,
+    #[values("none", "id", "name")] cm_mode: &str,
     #[values(false /* checkpoint */, true /* checkpoint */)] checkpoint: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let properties = [
