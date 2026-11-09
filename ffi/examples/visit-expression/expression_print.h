@@ -293,6 +293,9 @@ void print_tree_helper(ExpressionItem ref, int depth) {
         case Cardinality:
           printf("Cardinality\n");
           break;
+        case Lower:
+          printf("Lower\n");
+          break;
       }
 
       print_expression_item_list(unary->sub_expr, depth + 1);

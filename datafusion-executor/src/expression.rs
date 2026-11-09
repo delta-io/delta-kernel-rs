@@ -9,6 +9,7 @@ use datafusion::common::{
     Column as DFColumn, DFSchema, DataFusionError, Result as DFResult, ScalarValue as DFScalarValue,
 };
 use datafusion::functions::core::expr_fn::{coalesce, get_field, named_struct, nullif};
+use datafusion::functions::string::expr_fn::lower;
 use datafusion::functions_nested::expr_fn::{array_length, make_array};
 use datafusion::logical_expr::{
     Case, ColumnarValue, Expr as DFExpr, ExprSchemable, Operator, ScalarFunctionArgs, ScalarUDF,
@@ -135,7 +136,8 @@ fn binary_expr_to_df_expr(
     Ok(binary_expr(left, op, right))
 }
 
-/// Lowers `Cardinality` to `CAST(array_length(..) AS INT)`; other unary ops are unsupported.
+/// Lowers `Cardinality` to `CAST(array_length(..) AS INT)` and `Lower` to `CAST(lower(..) AS
+/// STRING)`; other unary ops are unsupported.
 fn unary_to_df_expr(unary: &UnaryExpression, input_schema: &StructType) -> KernelResult<DFExpr> {
     match unary.op {
         UnaryExpressionOp::Cardinality => {
@@ -145,11 +147,14 @@ fn unary_to_df_expr(unary: &UnaryExpression, input_schema: &StructType) -> Kerne
             // kernel evaluator does.
             Ok(cast(array_length(array), ArrowDataType::Int32))
         }
-        op @ (UnaryExpressionOp::ToJson | UnaryExpressionOp::UriEncodeLocation) => {
-            Err(KernelError::unsupported(format!(
-                "converting the {op} expression is not yet supported"
-            )))
+        UnaryExpressionOp::Lower => {
+            let string = to_df_expr(&unary.expr, input_schema, None)?;
+            // `lower` keeps its input's string representation; the kernel evaluator yields Utf8.
+            Ok(cast(lower(string), ArrowDataType::Utf8))
         }
+        op @ (UnaryExpressionOp::ToJson | UnaryExpressionOp::UriEncodeLocation) => Err(KernelError::unsupported(format!(
+            "converting the {op} expression is not yet supported"
+        ))),
     }
 }
 
@@ -1023,6 +1028,61 @@ mod tests {
         let expected = StringArray::from(expected);
         assert_eq!(actual.as_string::<i32>(), &expected);
         assert_eq!(from_kernel.as_string::<i32>(), &expected);
+    }
+
+    #[rstest]
+    fn lower_matches_kernel_evaluator(
+        #[values(
+            |s| Arc::new(StringArray::from(s)) as ArrayRef,
+            |s| Arc::new(LargeStringArray::from(s)) as ArrayRef,
+            |s| Arc::new(StringViewArray::from(s)) as ArrayRef
+        )]
+        make_array: fn(Vec<Option<&'static str>>) -> ArrayRef,
+    ) {
+        let input_schema = schema! { nullable "s": STRING };
+        let strings = make_array(vec![
+            Some("Parquet"),
+            None,
+            Some("\u{c4}.BIN"),
+            Some("\u{130}"),
+        ]);
+        let batch = RecordBatch::try_from_iter([("s", strings)]).unwrap();
+        let kernel = KernelExpr::unary(UnaryExpressionOp::Lower, col!("s"));
+
+        let logical = to_df_expr(&kernel, &input_schema, None).unwrap();
+        let physical = physical_expr(&logical, batch.schema().as_ref().clone());
+        let actual = physical
+            .evaluate(&batch)
+            .unwrap()
+            .into_array(batch.num_rows())
+            .unwrap();
+        let from_kernel = kernel_expression::evaluate_expression(&kernel, &batch, None).unwrap();
+
+        let expected = StringArray::from(vec![
+            Some("parquet"),
+            None,
+            Some("\u{e4}.bin"),
+            Some("i\u{307}"),
+        ]);
+        assert_eq!(actual.as_string::<i32>(), &expected);
+        assert_eq!(from_kernel.as_string::<i32>(), &expected);
+    }
+
+    #[test]
+    fn lower_rejects_non_string_input() {
+        let kernel = KernelExpr::unary(UnaryExpressionOp::Lower, col!("b"));
+        let logical = to_df_expr(&kernel, &test_schema(), None).unwrap();
+        let arrow_schema: ArrowSchema = (&test_schema()).try_into_arrow().unwrap();
+        let batch = RecordBatch::new_empty(Arc::new(arrow_schema.clone()));
+        let err = create_physical_expr(
+            &logical,
+            &DFSchema::try_from(arrow_schema).unwrap(),
+            &ExecutionProps::new(),
+            &PhysicalPlanningContext::default(),
+        )
+        .and_then(|physical| physical.evaluate(&batch))
+        .unwrap_err();
+        assert!(err.to_string().contains("lower"), "{err}");
     }
 
     #[rstest]

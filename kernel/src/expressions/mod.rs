@@ -204,6 +204,15 @@ pub enum UnaryExpressionOp {
     /// CARDINALITY(ARRAY())                      -- 0
     /// ```
     Cardinality,
+    /// SQL `lower(expr)`: a STRING converted to lowercase with the Unicode default case mapping,
+    /// which can change a value's byte length. A NULL input yields NULL, and other input types are
+    /// an error.
+    ///
+    /// ```text
+    /// LOWER('Parquet')  -- 'parquet'
+    /// LOWER('ÄÖ.Bin')   -- 'äö.bin'
+    /// ```
+    Lower,
 }
 
 /// A binary arithmetic operator over two numeric operands.
@@ -1321,6 +1330,7 @@ impl Display for UnaryExpressionOp {
             ToJson => write!(f, "TO_JSON"),
             UriEncodeLocation => write!(f, "URI_ENCODE_LOCATION"),
             Cardinality => write!(f, "CARDINALITY"),
+            Lower => write!(f, "LOWER"),
         }
     }
 }
@@ -1591,6 +1601,10 @@ mod tests {
                 "CARDINALITY(Column(x))",
             ),
             (
+                Expr::unary(UnaryExpressionOp::Lower, col!("x")),
+                "LOWER(Column(x))",
+            ),
+            (
                 Expr::string_concat([lit("a/"), col!("x")]),
                 "('a/' || Column(x))",
             ),
@@ -1815,7 +1829,8 @@ mod tests {
             #[values(
                 UnaryExpressionOp::ToJson,
                 UnaryExpressionOp::UriEncodeLocation,
-                UnaryExpressionOp::Cardinality
+                UnaryExpressionOp::Cardinality,
+                UnaryExpressionOp::Lower
             )]
             op: UnaryExpressionOp,
         ) {

@@ -540,6 +540,7 @@ impl From<UnaryExpressionOp> for proto_expr::UnaryExpressionOp {
                 proto_expr::UnaryExpressionOp::UriEncodeLocation
             }
             UnaryExpressionOp::Cardinality => proto_expr::UnaryExpressionOp::Cardinality,
+            UnaryExpressionOp::Lower => proto_expr::UnaryExpressionOp::Lower,
         }
     }
 }
@@ -1997,6 +1998,7 @@ mod tests {
         UnaryExpressionOp::Cardinality,
         proto_expr::UnaryExpressionOp::Cardinality
     )]
+    #[case(UnaryExpressionOp::Lower, proto_expr::UnaryExpressionOp::Lower)]
     fn from_unary_expression_op(
         #[case] op: UnaryExpressionOp,
         #[case] expected: proto_expr::UnaryExpressionOp,

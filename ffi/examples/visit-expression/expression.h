@@ -77,7 +77,7 @@ enum VariadicType {
   ArrayConstructor,
   StringConcat,
 };
-enum UnaryType { Not, IsNull, HasUriScheme, IsValidFileLocation, UriEncodeLocation, Cardinality };
+enum UnaryType { Not, IsNull, HasUriScheme, IsValidFileLocation, UriEncodeLocation, Cardinality, Lower };
 typedef struct {
   void* ref;
   enum ExpressionType type;
@@ -501,6 +501,7 @@ DEFINE_UNARY(visit_expr_has_uri_scheme, HasUriScheme)
 DEFINE_UNARY(visit_expr_is_valid_file_location, IsValidFileLocation)
 DEFINE_UNARY(visit_expr_uri_encode_location, UriEncodeLocation)
 DEFINE_UNARY(visit_expr_cardinality, Cardinality)
+DEFINE_UNARY(visit_expr_lower, Lower)
 DEFINE_UNARY(visit_expr_not, Not)
 #undef DEFINE_UNARY
 
@@ -568,6 +569,7 @@ ExpressionItemList construct_expression(SharedExpression* expression) {
     .visit_is_valid_file_location = visit_expr_is_valid_file_location,
     .visit_uri_encode_location = visit_expr_uri_encode_location,
     .visit_cardinality = visit_expr_cardinality,
+    .visit_lower = visit_expr_lower,
     .visit_lt = visit_expr_lt,
     .visit_gt = visit_expr_gt,
     .visit_eq = visit_expr_eq,
@@ -627,6 +629,7 @@ ExpressionItemList construct_predicate(SharedPredicate* predicate) {
     .visit_is_valid_file_location = visit_expr_is_valid_file_location,
     .visit_uri_encode_location = visit_expr_uri_encode_location,
     .visit_cardinality = visit_expr_cardinality,
+    .visit_lower = visit_expr_lower,
     .visit_lt = visit_expr_lt,
     .visit_gt = visit_expr_gt,
     .visit_eq = visit_expr_eq,

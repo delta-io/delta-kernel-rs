@@ -105,6 +105,8 @@ StructExpression
     Column(location)
   Cardinality
     Column(list)
+  Lower
+    Column(format)
   MapToStruct
     Column(pv)
   MapToStruct(timestamp_timezone=America/Los_Angeles)

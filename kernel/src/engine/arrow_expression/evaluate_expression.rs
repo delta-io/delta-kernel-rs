@@ -325,15 +325,16 @@ pub fn evaluate_expression(
         ))),
         (Unary(UnaryExpression { op, expr }), result_type) => {
             let output_type = match op {
-                ToJson | UriEncodeLocation => DataType::STRING,
+                ToJson | UriEncodeLocation | Lower => DataType::STRING,
                 Cardinality => DataType::INTEGER,
             };
             require_output_type(op, &output_type, result_type)?;
             let input = evaluate_expression(expr, batch, None)?;
             match op {
                 ToJson => Ok(to_json(&input)?),
-                UriEncodeLocation => map_strings(&input, op, uri_encode_location),
+                UriEncodeLocation => map_strings(&input, "UriEncodeLocation", uri_encode_location),
                 Cardinality => cardinalities(&input),
+                Lower => map_strings(&input, "Lower", str::to_lowercase),
             }
         }
         (Binary(BinaryExpression { op, left, right }), _) => {
@@ -962,17 +963,23 @@ fn evaluate_string_concat(exprs: &[Expression], batch: &RecordBatch) -> KernelRe
     Ok(cast(&concatenated, &ArrowDataType::Utf8)?)
 }
 
-/// [`map_string_rows`] collected into a Utf8 array, whatever the input representation.
+/// Maps every non-NULL row of a string array of any representation to a new string with `f`,
+/// keeping NULLs. Other array types are an error naming `op`.
 fn map_strings<'a, T: AsRef<str>>(
     input: &'a ArrayRef,
-    op: impl Display,
+    op: &str,
     f: impl FnMut(&'a str) -> T,
 ) -> KernelResult<ArrayRef> {
     let mapped = map_string_rows(input, op, f)?;
-    // Large offsets keep the build from overflowing; the cast to Utf8 then returns an error where
-    // building a Utf8 array directly would panic.
-    let mapped = LargeStringArray::from_iter(mapped);
-    Ok(cast(&mapped, &ArrowDataType::Utf8)?)
+    // A mapping can grow a value, and arrow panics rather than errors on offset overflow.
+    let total_len: usize = mapped.iter().flatten().map(|row| row.as_ref().len()).sum();
+    require!(
+        i32::try_from(total_len).is_ok(),
+        KernelError::invalid_expression(format!(
+            "{op} output of {total_len} bytes does not fit in one string array"
+        ))
+    );
+    Ok(Arc::new(StringArray::from_iter(mapped)))
 }
 
 /// Evaluates [`UnaryExpressionOp::Cardinality`] over any list representation kernel reads as an
@@ -2311,42 +2318,55 @@ mod tests {
     }
 
     #[rstest]
-    fn test_uri_encode_path(
-        #[values(
-            |l| Arc::new(StringArray::from(l)) as ArrayRef,
-            |l| Arc::new(LargeStringArray::from(l)) as ArrayRef,
-            |l| Arc::new(StringViewArray::from(l)) as ArrayRef
-        )]
-        make_array: fn(Vec<Option<&'static str>>) -> ArrayRef,
+    #[case::uri_encode_location(
+        UnaryExpressionOp::UriEncodeLocation,
+        &[
+            (Some("data/a b.parquet"), Some("data/a%20b.parquet")),
+            (Some("s3://bucket/a#1.parquet"), Some("s3://bucket/a%231.parquet")),
+            (Some("data/a.parquet"), Some("data/a.parquet")),
+            (None, None),
+        ]
+    )]
+    #[case::lower(
+        UnaryExpressionOp::Lower,
+        &[
+            (Some("Parquet"), Some("parquet")),
+            (Some("parquet"), Some("parquet")),
+            (Some("\u{c4}\u{d6}.BIN"), Some("\u{e4}\u{f6}.bin")),
+            (Some("\u{130}"), Some("i\u{307}")),
+            (Some(""), Some("")),
+            (None, None),
+        ]
+    )]
+    fn test_string_valued_unary_ops(
+        #[case] op: UnaryExpressionOp,
+        #[case] cases: &[(Option<&'static str>, Option<&'static str>)],
+        #[values(utf8, large_utf8, utf8_view)] make_array: fn(
+            Vec<Option<&'static str>>,
+        ) -> ArrayRef,
         #[values(None, Some(&DataType::STRING))] result_type: Option<&'static DataType>,
     ) {
-        let locations = vec![
-            Some("data/a b.parquet"),
-            Some("s3://bucket/a#1.parquet"),
-            Some("data/a.parquet"),
-            None,
-        ];
-        let batch = RecordBatch::try_from_iter([("l", make_array(locations))]).unwrap();
-        let expr = Expr::unary(UnaryExpressionOp::UriEncodeLocation, col!("l"));
+        let inputs = cases.iter().map(|(input, _)| *input).collect();
+        let batch = RecordBatch::try_from_iter([("s", make_array(inputs))]).unwrap();
+        let expr = Expr::unary(op, col!("s"));
         let result = evaluate_expression(&expr, &batch, result_type).unwrap();
-        let expected = StringArray::from(vec![
-            Some("data/a%20b.parquet"),
-            Some("s3://bucket/a%231.parquet"),
-            Some("data/a.parquet"),
-            None,
-        ]);
+        let expected = StringArray::from_iter(cases.iter().map(|(_, output)| *output));
         assert_eq!(result.as_string::<i32>(), &expected);
     }
 
-    #[test]
-    fn test_uri_encode_path_rejects_non_string_input() {
+    #[rstest]
+    fn test_string_valued_unary_ops_reject_non_string_input(
+        #[values(UnaryExpressionOp::UriEncodeLocation, UnaryExpressionOp::Lower)]
+        op: UnaryExpressionOp,
+    ) {
         let batch =
             RecordBatch::try_from_iter([("n", Arc::new(Int32Array::from(vec![1])) as ArrayRef)])
                 .unwrap();
-        let expr = Expr::unary(UnaryExpressionOp::UriEncodeLocation, col!("n"));
+        let expr = Expr::unary(op, col!("n"));
         let err = evaluate_expression(&expr, &batch, None).unwrap_err();
         assert!(
-            matches!(err, KernelError::InvalidExpressionEvaluation(_)),
+            matches!(&err, KernelError::InvalidExpressionEvaluation(message)
+                if message.contains("requires a string input")),
             "{err}"
         );
     }
@@ -2355,6 +2375,7 @@ mod tests {
     #[case::to_json(UnaryExpressionOp::ToJson, DataType::INTEGER)]
     #[case::uri_encode_location(UnaryExpressionOp::UriEncodeLocation, DataType::INTEGER)]
     #[case::cardinality(UnaryExpressionOp::Cardinality, DataType::STRING)]
+    #[case::lower(UnaryExpressionOp::Lower, DataType::INTEGER)]
     fn test_unary_expression_rejects_mismatched_output_type(
         #[case] op: UnaryExpressionOp,
         #[case] requested: DataType,
@@ -2554,6 +2575,18 @@ mod tests {
     ];
 
     type MakePredicate = fn(Expr) -> Pred;
+
+    fn utf8(rows: Vec<Option<&'static str>>) -> ArrayRef {
+        Arc::new(StringArray::from(rows))
+    }
+
+    fn large_utf8(rows: Vec<Option<&'static str>>) -> ArrayRef {
+        Arc::new(LargeStringArray::from(rows))
+    }
+
+    fn utf8_view(rows: Vec<Option<&'static str>>) -> ArrayRef {
+        Arc::new(StringViewArray::from(rows))
+    }
 
     #[rstest]
     #[case::has_uri_scheme(Pred::has_uri_scheme, HAS_URI_SCHEME_CASES)]

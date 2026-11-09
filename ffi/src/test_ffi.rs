@@ -163,6 +163,7 @@ pub unsafe extern "C" fn get_testing_kernel_expression() -> Handle<SharedExpress
         Expr::unknown("mystery"),
         Expr::unary(UnaryExpressionOp::UriEncodeLocation, col!("location")),
         Expr::unary(UnaryExpressionOp::Cardinality, col!("list")),
+        Expr::unary(UnaryExpressionOp::Lower, col!("format")),
         Expr::map_to_struct(col!("pv"), MapToStructOptions::default()),
         Expr::map_to_struct(
             col!("pv"),

@@ -194,6 +194,10 @@ pub struct EngineExpressionVisitor {
     /// `sibling_list_id`. The sub-expression will be in a _one_ item list identified by
     /// `child_list_id`. See [`UnaryExpressionOp::Cardinality`].
     pub visit_cardinality: VisitUnaryFn,
+    /// Visits the `Lower` unary operator belonging to the list identified by `sibling_list_id`.
+    /// The sub-expression will be in a _one_ item list identified by `child_list_id`. See
+    /// [`UnaryExpressionOp::Lower`] for the semantics the implementation must follow.
+    pub visit_lower: VisitUnaryFn,
     /// Visits the `ParseJson` expression belonging to the list identified by `sibling_list_id`.
     /// The sub-expression (JSON string) will be in a _one_ item list identified by
     /// `child_list_id`. The `output_schema` handle specifies the schema to parse the JSON
@@ -695,6 +699,7 @@ fn visit_expression_impl(
                 UnaryExpressionOp::ToJson => visitor.visit_to_json,
                 UnaryExpressionOp::UriEncodeLocation => visitor.visit_uri_encode_location,
                 UnaryExpressionOp::Cardinality => visitor.visit_cardinality,
+                UnaryExpressionOp::Lower => visitor.visit_lower,
             };
             visit_fn(visitor.data, sibling_list_id, child_list_id);
         }
@@ -1026,6 +1031,7 @@ mod tests {
             visit_to_json: ignore_child_list,
             visit_uri_encode_location: ignore_child_list,
             visit_cardinality: ignore_child_list,
+            visit_lower: ignore_child_list,
             visit_parse_json: ignore_parse_json,
             visit_map_to_struct,
             visit_lt: ignore_child_list,
