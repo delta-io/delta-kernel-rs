@@ -231,6 +231,10 @@ pub struct EngineExpressionVisitor {
     /// `sibling_list_id`. The element expressions will be in a list identified by
     /// `child_list_id`.
     pub visit_array: VisitVariadicFn,
+    /// Visits the `Concat` variadic operator belonging to the list identified by
+    /// `sibling_list_id`. The operands will be in a list identified by `child_list_id`. See
+    /// [`VariadicExpressionOp::Concat`].
+    pub visit_concat: VisitVariadicFn,
     /// Visits a `column` belonging to the list identified by `sibling_list_id`.
     ///
     /// `parts` contains the ordered field-name parts of the column. Each part is valid only for
@@ -704,6 +708,7 @@ fn visit_expression_impl(
             let visit_fn = match op {
                 VariadicExpressionOp::Coalesce => visitor.visit_coalesce,
                 VariadicExpressionOp::Array => visitor.visit_array,
+                VariadicExpressionOp::Concat => visitor.visit_concat,
             };
             visit_fn(visitor.data, sibling_list_id, child_list_id);
         }
@@ -1021,6 +1026,7 @@ mod tests {
             visit_divide: ignore_child_list,
             visit_coalesce: ignore_child_list,
             visit_array: ignore_child_list,
+            visit_concat: ignore_child_list,
             visit_column,
             visit_struct_expr: ignore_child_list,
             visit_struct_patch_expr: ignore_struct_patch,

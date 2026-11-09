@@ -169,6 +169,7 @@ pub unsafe extern "C" fn get_testing_kernel_expression() -> Handle<SharedExpress
         ),
         expr!(coalesce(col("col"), 0_i32)),
         Expr::array([lit(1_i32), lit(2_i32)]),
+        Expr::concat([lit("s3://b/"), col!("location")]),
         Expr::case_when(
             [
                 (column_pred!("flag"), lit(10_i32)),

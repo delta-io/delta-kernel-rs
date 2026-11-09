@@ -238,6 +238,15 @@ pub enum VariadicExpressionOp {
     /// [`Scalar::Array`] instead. The difference is that `Array` is evaluated at runtime, while
     /// `Scalar::Array` is evaluated at compile time.
     Array,
+    /// SQL `expr || expr || ...`: the STRING concatenation of every input, which must all be
+    /// STRING. Any NULL input yields NULL, unlike some engines' `concat` function, which skips
+    /// NULLs. Requires at least one input.
+    ///
+    /// ```text
+    /// CONCAT('s3://bucket/', 'a.parquet')  -- 's3://bucket/a.parquet'
+    /// CONCAT('a', NULL)                    -- NULL
+    /// ```
+    Concat,
 }
 
 /// A junction (AND/OR) predicate operator over N child predicates.
@@ -1039,6 +1048,11 @@ impl Expression {
         Self::variadic(VariadicExpressionOp::Array, exprs)
     }
 
+    /// Creates a new string concatenation expression. See [`VariadicExpressionOp::Concat`].
+    pub fn concat(exprs: impl IntoIterator<Item = impl Into<Expression>>) -> Self {
+        Self::variadic(VariadicExpressionOp::Concat, exprs)
+    }
+
     /// Creates a searched CASE expression from ordered condition/result `branches` and an
     /// `else_expr` fallback. Empty `branches` return `else_expr` directly.
     /// All branch results and `else_expr` must have the same logical type, including typed NULLs;
@@ -1299,6 +1313,7 @@ impl Display for VariadicExpressionOp {
         match self {
             Coalesce => write!(f, "COALESCE"),
             Array => write!(f, "ARRAY"),
+            Concat => write!(f, "CONCAT"),
         }
     }
 }
@@ -1533,6 +1548,10 @@ mod tests {
             (
                 Expr::unary(UnaryExpressionOp::UriEncodeFileLocation, col!("x")),
                 "URI_ENCODE_FILE_LOCATION(Column(x))",
+            ),
+            (
+                Expr::concat([lit("a/"), col!("x")]),
+                "CONCAT('a/', Column(x))",
             ),
             (
                 Expr::case_when([(col!("x").is_null(), lit(0))], col!("x")),
@@ -1771,8 +1790,8 @@ mod tests {
 
         #[test]
         fn test_variadic_expression_roundtrip() {
-            let expr = expr!(coalesce(col("a"), col("b"), "default"));
-            assert_roundtrip(&expr);
+            assert_roundtrip(&expr!(coalesce(col("a"), col("b"), "default")));
+            assert_roundtrip(&Expression::concat([lit("s3://b/"), col!("location")]));
         }
 
         #[rstest::rstest]

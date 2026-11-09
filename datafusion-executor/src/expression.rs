@@ -141,11 +141,12 @@ fn binary_expr_to_df_expr(
     Ok(binary_expr(left, op, right))
 }
 
-/// Lowers a variadic expression: `Coalesce` to `coalesce(..)` and `Array` to `make_array(..)`, each
-/// over the converted arguments. `Coalesce` forwards `output_type` to construct schema-dependent
-/// arguments before DataFusion performs common-type resolution and supported implicit conversions.
-/// A known `Array<E>` target is peeled to `E` and forwarded to each element so an array of structs
-/// gets its element schema; an unknown target leaves elements untyped.
+/// Lowers a variadic expression: `Coalesce` to `coalesce(..)`, `Array` to `make_array(..)`, and
+/// `Concat` to a chain of `||`, each over the converted arguments. `Coalesce` forwards
+/// `output_type` to construct schema-dependent arguments before DataFusion performs common-type
+/// resolution and supported implicit conversions. A known `Array<E>` target is peeled to `E` and
+/// forwarded to each element so an array of structs gets its element schema; an unknown target
+/// leaves elements untyped.
 fn variadic_to_df_expr(
     variadic: &VariadicExpression,
     input_schema: &StructType,
@@ -162,6 +163,7 @@ fn variadic_to_df_expr(
             }
             None => None,
         },
+        VariadicExpressionOp::Concat => None,
     };
     let args: KernelResult<Vec<DFExpr>> = variadic
         .exprs
@@ -171,6 +173,11 @@ fn variadic_to_df_expr(
     match variadic.op {
         VariadicExpressionOp::Coalesce => Ok(coalesce(args?)),
         VariadicExpressionOp::Array => Ok(make_array(args?)),
+        // `||` yields NULL for any NULL operand; DataFusion's `concat` would skip NULLs instead.
+        VariadicExpressionOp::Concat => args?
+            .into_iter()
+            .reduce(|left, right| binary_expr(left, Operator::StringConcat, right))
+            .ok_or_else(|| KernelError::generic("CONCAT requires at least one input")),
     }
 }
 
@@ -643,8 +650,8 @@ mod tests {
     use datafusion::assert_batches_eq;
     use datafusion::common::DFSchema;
     use datafusion::logical_expr::physical_planning_context::PhysicalPlanningContext;
-    use datafusion::physical_expr::create_physical_expr;
     use datafusion::physical_expr::execution_props::ExecutionProps;
+    use datafusion::physical_expr::{PhysicalExpr, create_physical_expr};
     use delta_kernel::expressions::{
         ColumnName as KernelColumnName, Expression as KernelExpr, ExpressionStructPatch,
         ExpressionStructPatchBuilder, MapToStructOptions, UnaryExpressionOp, col, expr, lit,
@@ -861,6 +868,49 @@ mod tests {
     ) {
         let kernel = KernelExpr::unary(op, col!("b"));
         to_df_expr(&kernel, &test_schema(), None).unwrap_err();
+    }
+
+    /// Plans `logical` against `schema` for evaluation over a batch with that schema.
+    fn physical_expr(logical: &DFExpr, schema: ArrowSchema) -> Arc<dyn PhysicalExpr> {
+        create_physical_expr(
+            logical,
+            &DFSchema::try_from(schema).unwrap(),
+            &ExecutionProps::new(),
+            &PhysicalPlanningContext::default(),
+        )
+        .unwrap()
+    }
+
+    /// DataFusion's `CONCAT` lowering agrees with the kernel evaluator, including NULL inputs.
+    #[test]
+    fn concat_matches_kernel_evaluator() {
+        let input_schema = schema! { nullable "s": STRING };
+        let strings = StringArray::from(vec![Some("a.parquet"), None, Some("")]);
+        let batch = RecordBatch::try_from_iter([("s", Arc::new(strings) as ArrayRef)]).unwrap();
+        let kernel = KernelExpr::concat([lit("s3://b/"), col!("s"), lit("!")]);
+
+        let logical = to_df_expr(&kernel, &input_schema, None).unwrap();
+        let physical = physical_expr(&logical, batch.schema().as_ref().clone());
+        let actual = physical
+            .evaluate(&batch)
+            .unwrap()
+            .into_array(batch.num_rows())
+            .unwrap();
+        let from_kernel = kernel_expression::evaluate_expression(&kernel, &batch, None).unwrap();
+
+        let expected = StringArray::from(vec![Some("s3://b/a.parquet!"), None, Some("s3://b/!")]);
+        assert_eq!(actual.as_string::<i32>(), &expected);
+        assert_eq!(from_kernel.as_string::<i32>(), &expected);
+    }
+
+    #[test]
+    fn concat_without_inputs_is_an_error() {
+        to_df_expr(
+            &KernelExpr::concat(Vec::<KernelExpr>::new()),
+            &test_schema(),
+            None,
+        )
+        .unwrap_err();
     }
 
     #[test]
@@ -1237,14 +1287,7 @@ mod tests {
             Some(&DataType::from(target)),
         )
         .unwrap();
-        let df_schema = DFSchema::try_from(arrow_schema).unwrap();
-        let physical = create_physical_expr(
-            &logical,
-            &df_schema,
-            &ExecutionProps::new(),
-            &PhysicalPlanningContext::default(),
-        )
-        .unwrap();
+        let physical = physical_expr(&logical, arrow_schema);
         let result = physical.evaluate(&batch).unwrap().into_array(2).unwrap();
         let result = result.as_struct();
         let ids = result
@@ -1297,14 +1340,7 @@ mod tests {
             Some(&DataType::from(schema! { nullable "ts": TIMESTAMP })),
         )
         .unwrap();
-        let df_schema = DFSchema::try_from(arrow_schema).unwrap();
-        let physical = create_physical_expr(
-            &logical,
-            &df_schema,
-            &ExecutionProps::new(),
-            &PhysicalPlanningContext::default(),
-        )
-        .unwrap();
+        let physical = physical_expr(&logical, arrow_schema);
 
         let error = physical.evaluate(&batch).unwrap_err().to_string();
         assert!(error.contains("Invalid timestamp timezone: Not/AZone"));
@@ -1343,14 +1379,7 @@ mod tests {
         )
         .unwrap();
 
-        let df_schema = DFSchema::try_from(arrow_schema).unwrap();
-        let physical = create_physical_expr(
-            &logical,
-            &df_schema,
-            &ExecutionProps::new(),
-            &PhysicalPlanningContext::default(),
-        )
-        .unwrap();
+        let physical = physical_expr(&logical, arrow_schema);
         physical
             .evaluate(&batch)
             .unwrap()
