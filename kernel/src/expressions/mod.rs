@@ -204,13 +204,17 @@ pub enum UnaryExpressionOp {
     /// CARDINALITY(ARRAY())                      -- 0
     /// ```
     Cardinality,
-    /// SQL `lower(expr)`: a STRING converted to lowercase with the Unicode default case mapping,
-    /// which can change a value's byte length. A NULL input yields NULL, and other input types are
-    /// an error.
+    /// SQL `lower(expr)`: lowercases a STRING with the Unicode default full case conversion. It is
+    /// locale-independent and applies the context-sensitive final-sigma rule, as Rust's
+    /// [`str::to_lowercase`] and Java's `toLowerCase(Locale.ROOT)` do. Per-code-point or
+    /// locale-sensitive lowercasing differs on inputs like the ones below. This is not case
+    /// folding, so `'ß'` stays `'ß'`. The output is STRING, a NULL input yields NULL, and other
+    /// input types are an error.
     ///
     /// ```text
     /// LOWER('Parquet')  -- 'parquet'
-    /// LOWER('ÄÖ.Bin')   -- 'äö.bin'
+    /// LOWER('ΟΔΟΣ')     -- 'οδος' (word-final sigma)
+    /// LOWER('İ')        -- 'i̇' (U+0069 U+0307)
     /// ```
     Lower,
 }

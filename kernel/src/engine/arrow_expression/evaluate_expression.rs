@@ -332,9 +332,9 @@ pub fn evaluate_expression(
             let input = evaluate_expression(expr, batch, None)?;
             match op {
                 ToJson => Ok(to_json(&input)?),
-                UriEncodeLocation => map_strings(&input, "UriEncodeLocation", uri_encode_location),
+                UriEncodeLocation => map_strings(&input, op, uri_encode_location),
                 Cardinality => cardinalities(&input),
-                Lower => map_strings(&input, "Lower", str::to_lowercase),
+                Lower => map_strings(&input, op, str::to_lowercase),
             }
         }
         (Binary(BinaryExpression { op, left, right }), _) => {
@@ -963,23 +963,17 @@ fn evaluate_string_concat(exprs: &[Expression], batch: &RecordBatch) -> KernelRe
     Ok(cast(&concatenated, &ArrowDataType::Utf8)?)
 }
 
-/// Maps every non-NULL row of a string array of any representation to a new string with `f`,
-/// keeping NULLs. Other array types are an error naming `op`.
+/// [`map_string_rows`] collected into a Utf8 array, whatever the input representation.
 fn map_strings<'a, T: AsRef<str>>(
     input: &'a ArrayRef,
-    op: &str,
+    op: impl Display,
     f: impl FnMut(&'a str) -> T,
 ) -> KernelResult<ArrayRef> {
     let mapped = map_string_rows(input, op, f)?;
-    // A mapping can grow a value, and arrow panics rather than errors on offset overflow.
-    let total_len: usize = mapped.iter().flatten().map(|row| row.as_ref().len()).sum();
-    require!(
-        i32::try_from(total_len).is_ok(),
-        KernelError::invalid_expression(format!(
-            "{op} output of {total_len} bytes does not fit in one string array"
-        ))
-    );
-    Ok(Arc::new(StringArray::from_iter(mapped)))
+    // Large offsets keep the build from overflowing; the cast to Utf8 then returns an error where
+    // building a Utf8 array directly would panic.
+    let mapped = LargeStringArray::from_iter(mapped);
+    Ok(cast(&mapped, &ArrowDataType::Utf8)?)
 }
 
 /// Evaluates [`UnaryExpressionOp::Cardinality`] over any list representation kernel reads as an
@@ -2334,11 +2328,12 @@ mod tests {
             (Some("parquet"), Some("parquet")),
             (Some("\u{c4}\u{d6}.BIN"), Some("\u{e4}\u{f6}.bin")),
             (Some("\u{130}"), Some("i\u{307}")),
+            (Some("\u{39f}\u{394}\u{39f}\u{3a3}"), Some("\u{3bf}\u{3b4}\u{3bf}\u{3c2}")),
             (Some(""), Some("")),
             (None, None),
         ]
     )]
-    fn test_string_valued_unary_ops(
+    fn test_string_to_string_unary_ops(
         #[case] op: UnaryExpressionOp,
         #[case] cases: &[(Option<&'static str>, Option<&'static str>)],
         #[values(utf8, large_utf8, utf8_view)] make_array: fn(
@@ -2355,7 +2350,7 @@ mod tests {
     }
 
     #[rstest]
-    fn test_string_valued_unary_ops_reject_non_string_input(
+    fn test_string_to_string_unary_ops_reject_non_string_input(
         #[values(UnaryExpressionOp::UriEncodeLocation, UnaryExpressionOp::Lower)]
         op: UnaryExpressionOp,
     ) {

@@ -1,5 +1,6 @@
 //! Conversion from a kernel [`Expression`](KernelExpression) to a DataFusion [`Expr`](DFExpr).
 
+use std::fmt::Display;
 use std::sync::Arc;
 
 use datafusion::arrow::array::{ArrayRef, RecordBatch, StructArray, new_null_array};
@@ -9,7 +10,7 @@ use datafusion::common::{
     Column as DFColumn, DFSchema, DataFusionError, Result as DFResult, ScalarValue as DFScalarValue,
 };
 use datafusion::functions::core::expr_fn::{coalesce, get_field, named_struct, nullif};
-use datafusion::functions::string::expr_fn::lower;
+use datafusion::functions::string::expr_fn::lower as df_lower;
 use datafusion::functions_nested::expr_fn::{array_length, make_array};
 use datafusion::logical_expr::{
     Case, ColumnarValue, Expr as DFExpr, ExprSchemable, Operator, ScalarFunctionArgs, ScalarUDF,
@@ -73,7 +74,7 @@ pub fn to_df_expr(
         }
         KernelExpression::ParseJson(parse) => parse_json_to_df_expr(parse, input_schema),
 
-        KernelExpression::Unary(unary) => unary_to_df_expr(unary, input_schema),
+        KernelExpression::Unary(unary) => unary_to_df_expr(unary, input_schema, output_type),
 
         KernelExpression::CaseWhen(_) => Err(KernelError::unsupported(
             "converting a CaseWhen expression is not yet supported",
@@ -136,11 +137,16 @@ fn binary_expr_to_df_expr(
     Ok(binary_expr(left, op, right))
 }
 
-/// Lowers `Cardinality` to `CAST(array_length(..) AS INT)` and `Lower` to `CAST(lower(..) AS
-/// STRING)`; other unary ops are unsupported.
-fn unary_to_df_expr(unary: &UnaryExpression, input_schema: &StructType) -> KernelResult<DFExpr> {
+/// Lowers `Cardinality` to `CAST(array_length(..) AS INT)` and `Lower` to `lower(..)`; other unary
+/// ops are unsupported.
+fn unary_to_df_expr(
+    unary: &UnaryExpression,
+    input_schema: &StructType,
+    output_type: Option<&KernelDataType>,
+) -> KernelResult<DFExpr> {
     match unary.op {
         UnaryExpressionOp::Cardinality => {
+            require_output_type(unary.op, &KernelDataType::INTEGER, output_type)?;
             let array = to_df_expr(&unary.expr, input_schema, None)?;
             // `array_length` counts top-level elements as UInt64; `cardinality` would also count
             // the elements of nested arrays. `cast` (not `try_cast`) errors on overflow, as the
@@ -148,13 +154,14 @@ fn unary_to_df_expr(unary: &UnaryExpression, input_schema: &StructType) -> Kerne
             Ok(cast(array_length(array), ArrowDataType::Int32))
         }
         UnaryExpressionOp::Lower => {
-            let string = to_df_expr(&unary.expr, input_schema, None)?;
-            // `lower` keeps its input's string representation; the kernel evaluator yields Utf8.
-            Ok(cast(lower(string), ArrowDataType::Utf8))
+            require_output_type(unary.op, &KernelDataType::STRING, output_type)?;
+            Ok(df_lower(to_df_expr(&unary.expr, input_schema, None)?))
         }
-        op @ (UnaryExpressionOp::ToJson | UnaryExpressionOp::UriEncodeLocation) => Err(KernelError::unsupported(format!(
-            "converting the {op} expression is not yet supported"
-        ))),
+        op @ (UnaryExpressionOp::ToJson | UnaryExpressionOp::UriEncodeLocation) => {
+            Err(KernelError::unsupported(format!(
+                "converting the {op} expression is not yet supported"
+            )))
+        }
     }
 }
 
@@ -180,14 +187,10 @@ fn variadic_to_df_expr(
             }
             None => None,
         },
-        VariadicExpressionOp::StringConcat => match output_type {
-            None | Some(&KernelDataType::STRING) => None,
-            Some(other) => {
-                return Err(KernelError::invalid_expression(format!(
-                    "StringConcat operator produces string, but caller expects {other}"
-                )));
-            }
-        },
+        VariadicExpressionOp::StringConcat => {
+            require_output_type(variadic.op, &KernelDataType::STRING, output_type)?;
+            None
+        }
     };
     let args: KernelResult<Vec<DFExpr>> = variadic
         .exprs
@@ -226,6 +229,20 @@ fn string_concat_to_df_expr(args: Vec<DFExpr>, input_schema: &StructType) -> Ker
     args.try_fold(first, |left, right| {
         Ok(binary_expr(left, Operator::StringConcat, right?))
     })
+}
+
+/// Errors unless the caller's `output_type`, if any, is the type `op` produces.
+fn require_output_type(
+    op: impl Display,
+    produces: &KernelDataType,
+    output_type: Option<&KernelDataType>,
+) -> KernelResult<()> {
+    match output_type {
+        Some(expected) if expected != produces => Err(KernelError::invalid_expression(format!(
+            "{op} operator produces {produces}, but caller expects {expected}"
+        ))),
+        _ => Ok(()),
+    }
 }
 
 /// Extracts the target struct type for a struct-shaped arm from the caller's `output_type`,
@@ -697,6 +714,7 @@ mod tests {
     use datafusion::arrow::compute::cast as cast_array;
     use datafusion::arrow::datatypes::{Field as ArrowField, Int32Type};
     use datafusion::assert_batches_eq;
+    use datafusion::common::Result as DFResult;
     use datafusion::logical_expr::physical_planning_context::PhysicalPlanningContext;
     use datafusion::physical_expr::execution_props::ExecutionProps;
     use datafusion::physical_expr::{PhysicalExpr, create_physical_expr};
@@ -920,13 +938,16 @@ mod tests {
 
     /// Plans `logical` against `schema` for evaluation over a batch with that schema.
     fn physical_expr(logical: &DFExpr, schema: ArrowSchema) -> Arc<dyn PhysicalExpr> {
+        try_physical_expr(logical, schema).unwrap()
+    }
+
+    fn try_physical_expr(logical: &DFExpr, schema: ArrowSchema) -> DFResult<Arc<dyn PhysicalExpr>> {
         create_physical_expr(
             logical,
-            &DFSchema::try_from(schema).unwrap(),
+            &DFSchema::try_from(schema)?,
             &ExecutionProps::new(),
             &PhysicalPlanningContext::default(),
         )
-        .unwrap()
     }
 
     /// Rows: `[[1, 2], NULL, []]`, `[]`, NULL, `[[3]]`.
@@ -977,92 +998,95 @@ mod tests {
         let batch = RecordBatch::try_from_iter([("l", lists)]).unwrap();
         let kernel = KernelExpr::unary(UnaryExpressionOp::Cardinality, col!("l"));
 
-        let logical = to_df_expr(&kernel, &input_schema, None).unwrap();
-        let physical = physical_expr(&logical, batch.schema().as_ref().clone());
-        let actual = physical
-            .evaluate(&batch)
-            .unwrap()
-            .into_array(batch.num_rows())
-            .unwrap();
-        let from_kernel = kernel_expression::evaluate_expression(&kernel, &batch, None).unwrap();
+        let (actual, from_kernel) = evaluate_both(&kernel, &input_schema, &batch);
 
         let expected = Int32Array::from(expected);
         assert_eq!(actual.as_primitive::<Int32Type>(), &expected);
         assert_eq!(from_kernel.as_primitive::<Int32Type>(), &expected);
     }
 
-    #[rstest]
-    fn string_concat_matches_kernel_evaluator(
-        #[values(
-            |s| Arc::new(StringArray::from(s)) as ArrayRef,
-            |s| Arc::new(LargeStringArray::from(s)) as ArrayRef,
-            |s| Arc::new(StringViewArray::from(s)) as ArrayRef
-        )]
-        make_array: fn(Vec<Option<&'static str>>) -> ArrayRef,
-        #[values(false, true)] single_input: bool,
-    ) {
-        let input_schema = schema! { nullable "s": STRING };
-        let strings = make_array(vec![Some("a.parquet"), None, Some("")]);
-        let batch = RecordBatch::try_from_iter([("s", strings)]).unwrap();
-        let (kernel, expected) = if single_input {
-            (
-                KernelExpr::string_concat([col!("s")]),
-                vec![Some("a.parquet"), None, Some("")],
-            )
-        } else {
-            (
-                KernelExpr::string_concat([lit("s3://b/"), col!("s"), lit("!")]),
-                vec![Some("s3://b/a.parquet!"), None, Some("s3://b/!")],
-            )
-        };
+    fn utf8(rows: Vec<Option<&'static str>>) -> ArrayRef {
+        Arc::new(StringArray::from(rows))
+    }
 
-        let logical = to_df_expr(&kernel, &input_schema, None).unwrap();
-        let physical = physical_expr(&logical, batch.schema().as_ref().clone());
-        let actual = physical
-            .evaluate(&batch)
+    fn large_utf8(rows: Vec<Option<&'static str>>) -> ArrayRef {
+        Arc::new(LargeStringArray::from(rows))
+    }
+
+    fn utf8_view(rows: Vec<Option<&'static str>>) -> ArrayRef {
+        Arc::new(StringViewArray::from(rows))
+    }
+
+    /// Evaluates `kernel` over `batch` through both DataFusion and the kernel evaluator.
+    fn evaluate_both(
+        kernel: &KernelExpr,
+        input_schema: &StructType,
+        batch: &RecordBatch,
+    ) -> (ArrayRef, ArrayRef) {
+        let logical = to_df_expr(kernel, input_schema, None).unwrap();
+        let actual = physical_expr(&logical, batch.schema().as_ref().clone())
+            .evaluate(batch)
             .unwrap()
             .into_array(batch.num_rows())
             .unwrap();
-        let from_kernel = kernel_expression::evaluate_expression(&kernel, &batch, None).unwrap();
+        let from_kernel = kernel_expression::evaluate_expression(kernel, batch, None).unwrap();
+        (actual, from_kernel)
+    }
 
+    #[rstest]
+    #[case::concat_single(
+        KernelExpr::string_concat([col!("s")]),
+        vec![Some("A.parquet"), None, Some("")]
+    )]
+    #[case::concat_many(
+        KernelExpr::string_concat([lit("s3://b/"), col!("s"), lit("!")]),
+        vec![Some("s3://b/A.parquet!"), None, Some("s3://b/!")]
+    )]
+    #[case::lower(
+        KernelExpr::unary(UnaryExpressionOp::Lower, col!("s")),
+        vec![Some("a.parquet"), None, Some("")]
+    )]
+    fn string_expressions_match_kernel_evaluator(
+        #[case] kernel: KernelExpr,
+        #[case] expected: Vec<Option<&str>>,
+        #[values(utf8, large_utf8, utf8_view)] make_array: fn(
+            Vec<Option<&'static str>>,
+        ) -> ArrayRef,
+    ) {
+        let input_schema = schema! { nullable "s": STRING };
+        let strings = make_array(vec![Some("A.parquet"), None, Some("")]);
+        let batch = RecordBatch::try_from_iter([("s", strings)]).unwrap();
+        let (actual, from_kernel) = evaluate_both(&kernel, &input_schema, &batch);
+
+        // The plan boundary, not each lowering, casts results to their declared layout.
+        let actual = cast_array(&actual, &ArrowDataType::Utf8).unwrap();
         let expected = StringArray::from(expected);
         assert_eq!(actual.as_string::<i32>(), &expected);
         assert_eq!(from_kernel.as_string::<i32>(), &expected);
     }
 
+    /// Context-sensitive and length-changing mappings agree between DataFusion and the kernel.
     #[rstest]
-    fn lower_matches_kernel_evaluator(
-        #[values(
-            |s| Arc::new(StringArray::from(s)) as ArrayRef,
-            |s| Arc::new(LargeStringArray::from(s)) as ArrayRef,
-            |s| Arc::new(StringViewArray::from(s)) as ArrayRef
-        )]
-        make_array: fn(Vec<Option<&'static str>>) -> ArrayRef,
+    fn lower_matches_kernel_evaluator_beyond_ascii(
+        #[values(utf8, large_utf8, utf8_view)] make_array: fn(
+            Vec<Option<&'static str>>,
+        ) -> ArrayRef,
     ) {
         let input_schema = schema! { nullable "s": STRING };
         let strings = make_array(vec![
-            Some("Parquet"),
-            None,
             Some("\u{c4}.BIN"),
             Some("\u{130}"),
+            Some("\u{39f}\u{394}\u{39f}\u{3a3}"),
         ]);
         let batch = RecordBatch::try_from_iter([("s", strings)]).unwrap();
         let kernel = KernelExpr::unary(UnaryExpressionOp::Lower, col!("s"));
+        let (actual, from_kernel) = evaluate_both(&kernel, &input_schema, &batch);
 
-        let logical = to_df_expr(&kernel, &input_schema, None).unwrap();
-        let physical = physical_expr(&logical, batch.schema().as_ref().clone());
-        let actual = physical
-            .evaluate(&batch)
-            .unwrap()
-            .into_array(batch.num_rows())
-            .unwrap();
-        let from_kernel = kernel_expression::evaluate_expression(&kernel, &batch, None).unwrap();
-
+        let actual = cast_array(&actual, &ArrowDataType::Utf8).unwrap();
         let expected = StringArray::from(vec![
-            Some("parquet"),
-            None,
-            Some("\u{e4}.bin"),
-            Some("i\u{307}"),
+            "\u{e4}.bin",
+            "i\u{307}",
+            "\u{3bf}\u{3b4}\u{3bf}\u{3c2}",
         ]);
         assert_eq!(actual.as_string::<i32>(), &expected);
         assert_eq!(from_kernel.as_string::<i32>(), &expected);
@@ -1074,14 +1098,9 @@ mod tests {
         let logical = to_df_expr(&kernel, &test_schema(), None).unwrap();
         let arrow_schema: ArrowSchema = (&test_schema()).try_into_arrow().unwrap();
         let batch = RecordBatch::new_empty(Arc::new(arrow_schema.clone()));
-        let err = create_physical_expr(
-            &logical,
-            &DFSchema::try_from(arrow_schema).unwrap(),
-            &ExecutionProps::new(),
-            &PhysicalPlanningContext::default(),
-        )
-        .and_then(|physical| physical.evaluate(&batch))
-        .unwrap_err();
+        let err = try_physical_expr(&logical, arrow_schema)
+            .and_then(|physical| physical.evaluate(&batch))
+            .unwrap_err();
         assert!(err.to_string().contains("lower"), "{err}");
     }
 
@@ -1093,7 +1112,15 @@ mod tests {
         KernelExpr::string_concat([lit("a")]),
         Some(DataType::INTEGER)
     )]
-    fn string_concat_lowering_rejects_invalid_expression(
+    #[case::lower_non_string_output(
+        KernelExpr::unary(UnaryExpressionOp::Lower, lit("A")),
+        Some(DataType::INTEGER)
+    )]
+    #[case::cardinality_non_integer_output(
+        KernelExpr::unary(UnaryExpressionOp::Cardinality, col!("b")),
+        Some(DataType::STRING)
+    )]
+    fn lowering_rejects_invalid_expression(
         #[case] kernel: KernelExpr,
         #[case] output_type: Option<DataType>,
     ) {
