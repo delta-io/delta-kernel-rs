@@ -363,7 +363,7 @@ pub(crate) mod adaptive_metadata_fixtures {
 
     use super::*;
     use crate::actions::{
-        CheckpointAction, ContentRoot, LOG_METADATA_SCHEMA, LOG_PROTOCOL_SCHEMA,
+        CheckpointAction, ContentRoot, DomainMetadata, LOG_METADATA_SCHEMA, LOG_PROTOCOL_SCHEMA,
         LastManifestCommit, Sidecar,
     };
     use crate::arrow::array::{Array as _, AsArray as _};
@@ -423,6 +423,22 @@ pub(crate) mod adaptive_metadata_fixtures {
     /// A commit line holding `checkpoint`.
     pub(crate) fn checkpoint_line(checkpoint: &CheckpointAction) -> String {
         serde_json::json!({ "checkpoint": checkpoint }).to_string()
+    }
+
+    /// A commit line holding a `txn` for `app_id` at `version`.
+    pub(crate) fn txn_line(app_id: &str, version: i64) -> String {
+        let txn = SetTransaction::new(app_id.to_string(), version, None);
+        serde_json::json!({ "txn": txn }).to_string()
+    }
+
+    /// A domain metadata action for `domain` with `configuration`.
+    pub(crate) fn domain(domain: &str, configuration: &str) -> DomainMetadata {
+        DomainMetadata::new(domain.to_string(), configuration.to_string())
+    }
+
+    /// A commit line holding `domain_metadata`.
+    pub(crate) fn domain_metadata_line(domain_metadata: DomainMetadata) -> String {
+        serde_json::json!({ "domainMetadata": domain_metadata }).to_string()
     }
 
     /// A minimal `checkpoint` action referencing `path` as the content root at `version`.
