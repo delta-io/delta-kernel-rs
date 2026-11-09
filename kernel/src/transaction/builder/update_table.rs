@@ -141,8 +141,9 @@ impl<MODE: ExecutionMode> TransactionBuilder<UpdateTable, MODE> {
     ///
     /// Feature-enabling `delta.*` properties (for example `delta.enableDeletionVectors`),
     /// `delta.feature.*` signals, CHECK constraints, and unknown `delta.*` keys are rejected.
-    /// Property changes are applied during [`build`](Self::build) and cause a Metadata action to
-    /// be emitted.
+    /// Property changes are applied during [`build`](Self::build). Entries that already match the
+    /// current configuration are skipped, so a Metadata action is emitted only when at least one
+    /// added value actually changes.
     pub fn with_table_properties_added<I, K, V>(mut self, properties: I) -> Self
     where
         I: IntoIterator<Item = (K, V)>,
@@ -407,12 +408,30 @@ fn try_new_update_table<MODE: ExecutionMode>(
         IcebergCompatValidationContext::Write,
     )?;
 
-    let has_property_changes = !properties_added.is_empty();
-    let should_emit_metadata = schema_changes.is_some() || has_property_changes;
+    let has_schema_changes = schema_changes.is_some();
     let effective_table_config = match schema_changes {
         Some(changes) => apply_schema_changes(effective_table_config, changes)?,
         None => effective_table_config,
     };
+    // Drop adds that already match the current configuration so identical re-sets do not rewrite
+    // Metadata (matches Java Metadata.filterOutUnchangedProperties).
+    let properties_added = if properties_added.is_empty() {
+        properties_added
+    } else {
+        let validated = validate_and_canonicalize_properties_added(properties_added)?;
+        effective_table_config
+            .metadata()
+            .filter_out_unchanged_properties(validated)
+    };
+    let has_property_changes = !properties_added.is_empty();
+    let should_emit_metadata = has_schema_changes || has_property_changes;
+    // validate() treats any requested property add as a table change. After dropping identical
+    // values, an ALTER TABLE may have nothing left to apply.
+    if operation == UpdateTableOperation::AlterTable && !should_emit_metadata {
+        return Err(KernelError::invalid_transaction_state(
+            "ALTER TABLE requires at least one table change",
+        ));
+    }
     let effective_table_config = if has_property_changes {
         apply_table_properties_added(effective_table_config, properties_added)?
     } else {
@@ -463,13 +482,14 @@ fn apply_schema_changes(
     evolve_table_config(&table_config, changes)
 }
 
-/// Validates, canonicalizes, and merges `properties_added` into `table_config`'s metadata.
+/// Merges already-validated, changed `properties_added` into `table_config`'s metadata.
+///
+/// Callers must validate/canonicalize and drop unchanged entries first.
 fn apply_table_properties_added(
     table_config: TableConfiguration,
     properties_added: HashMap<String, String>,
 ) -> KernelResult<TableConfiguration> {
-    let validated = validate_and_canonicalize_properties_added(properties_added)?;
-    let metadata = validated
+    let metadata = properties_added
         .into_iter()
         .fold(table_config.metadata().clone(), |metadata, (key, value)| {
             metadata.with_configuration_entry(key, value)
@@ -815,6 +835,45 @@ mod tests {
             .configuration();
         assert!(transaction.should_emit_metadata);
         assert_eq!(after.get(expected_key).map(String::as_str), Some(value));
+        Ok(())
+    }
+
+    #[test]
+    fn with_table_properties_added_skips_identical_values() -> Result<()> {
+        let engine = Arc::new(SyncEngine::new_with_store(Arc::new(InMemory::new())));
+        let snapshot = create_table("memory:///", test_schema_flat(), "test-engine", true)
+            .with_table_properties([("app.owner", "kernel"), ("app.team", "delta")])
+            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+            .commit(engine.as_ref())?
+            .unwrap_post_commit_snapshot();
+
+        let unchanged = snapshot
+            .clone()
+            .update_table(UpdateTableOperation::Write, "test-engine", true)
+            .with_table_properties_added([("app.owner", "kernel")])
+            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
+        assert!(!unchanged.should_emit_metadata);
+
+        let alter_unchanged = snapshot
+            .clone()
+            .update_table(UpdateTableOperation::AlterTable, "test-engine", false)
+            .with_table_properties_added([("app.owner", "kernel")])
+            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()));
+        assert!(matches!(
+            &alter_unchanged,
+            Err(KernelError::InvalidTransactionState(message))
+            if message == "ALTER TABLE requires at least one table change"
+        ));
+
+        let mixed = snapshot
+            .update_table(UpdateTableOperation::Write, "test-engine", true)
+            .with_table_properties_added([("app.owner", "kernel"), ("app.region", "eu")])
+            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
+        let after = mixed.effective_table_config.metadata().configuration();
+        assert!(mixed.should_emit_metadata);
+        assert_eq!(after.get("app.owner").map(String::as_str), Some("kernel"));
+        assert_eq!(after.get("app.team").map(String::as_str), Some("delta"));
+        assert_eq!(after.get("app.region").map(String::as_str), Some("eu"));
         Ok(())
     }
 

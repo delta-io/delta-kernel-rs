@@ -550,6 +550,21 @@ impl Metadata {
         self
     }
 
+    /// Drops entries from `new_properties` that already match this metadata's configuration.
+    ///
+    /// A key is kept when it is absent from the current configuration or when its value differs.
+    /// Comparison is exact (case-sensitive for both key and value).
+    #[internal_api]
+    pub(crate) fn filter_out_unchanged_properties(
+        &self,
+        new_properties: HashMap<String, String>,
+    ) -> HashMap<String, String> {
+        new_properties
+            .into_iter()
+            .filter(|(key, value)| self.configuration.get(key) != Some(value))
+            .collect()
+    }
+
     #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new_unchecked(
