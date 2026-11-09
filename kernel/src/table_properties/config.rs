@@ -5,44 +5,41 @@ use super::deserialize::{parse_bool, parse_column_names, parse_interval, parse_p
 use super::{
     APPEND_ONLY, AUTO_COMPACT, CHECKPOINT_INTERVAL, CHECKPOINT_POLICY,
     CHECKPOINT_WRITE_STATS_AS_JSON, CHECKPOINT_WRITE_STATS_AS_STRUCT, COLUMN_MAPPING_MAX_COLUMN_ID,
-    COLUMN_MAPPING_MODE, CheckpointPolicy, DATA_SKIPPING_NUM_INDEXED_COLS,
-    DATA_SKIPPING_STATS_COLUMNS, DELETED_FILE_RETENTION_DURATION, DELTA_PROPERTY_PREFIX,
-    DataSkippingNumIndexedCols, ENABLE_CHANGE_DATA_FEED, ENABLE_DELETION_VECTORS,
-    ENABLE_EXPIRED_LOG_CLEANUP, ENABLE_ICEBERG_COMPAT_V1, ENABLE_ICEBERG_COMPAT_V2,
-    ENABLE_ICEBERG_COMPAT_V3, ENABLE_ICEBERG_NATIVE_V4, ENABLE_IN_COMMIT_TIMESTAMPS,
-    ENABLE_ROW_TRACKING, ENABLE_TYPE_WIDENING, IN_COMMIT_TIMESTAMP_ENABLEMENT_TIMESTAMP,
-    IN_COMMIT_TIMESTAMP_ENABLEMENT_VERSION, ISOLATION_LEVEL, IsolationLevel,
-    LOG_RETENTION_DURATION, MATERIALIZED_ROW_COMMIT_VERSION_COLUMN_NAME,
-    MATERIALIZED_ROW_ID_COLUMN_NAME, OPTIMIZE_WRITE, PARQUET_COMPRESSION_CODEC,
-    PARQUET_FORMAT_VERSION, ParquetCompressionCodec, RANDOM_PREFIX_LENGTH, RANDOMIZE_FILE_PREFIXES,
-    ROW_TRACKING_SUSPENDED, SET_TRANSACTION_RETENTION_DURATION, TARGET_FILE_SIZE,
-    TUNE_FILE_SIZES_FOR_REWRITES, strip_check_constraint_prefix,
+    COLUMN_MAPPING_MODE, DATA_SKIPPING_NUM_INDEXED_COLS, DATA_SKIPPING_STATS_COLUMNS,
+    DELETED_FILE_RETENTION_DURATION, DELTA_PROPERTY_PREFIX, DataSkippingNumIndexedCols,
+    ENABLE_CHANGE_DATA_FEED, ENABLE_DELETION_VECTORS, ENABLE_EXPIRED_LOG_CLEANUP,
+    ENABLE_ICEBERG_COMPAT_V1, ENABLE_ICEBERG_COMPAT_V2, ENABLE_ICEBERG_COMPAT_V3,
+    ENABLE_ICEBERG_NATIVE_V4, ENABLE_IN_COMMIT_TIMESTAMPS, ENABLE_ROW_TRACKING,
+    ENABLE_TYPE_WIDENING, IN_COMMIT_TIMESTAMP_ENABLEMENT_TIMESTAMP,
+    IN_COMMIT_TIMESTAMP_ENABLEMENT_VERSION, ISOLATION_LEVEL, LOG_RETENTION_DURATION,
+    MATERIALIZED_ROW_COMMIT_VERSION_COLUMN_NAME, MATERIALIZED_ROW_ID_COLUMN_NAME, OPTIMIZE_WRITE,
+    PARQUET_COMPRESSION_CODEC, PARQUET_FORMAT_VERSION, ParquetCompressionCodec,
+    RANDOM_PREFIX_LENGTH, RANDOMIZE_FILE_PREFIXES, ROW_TRACKING_SUSPENDED,
+    SET_TRANSACTION_RETENTION_DURATION, TARGET_FILE_SIZE, TUNE_FILE_SIZES_FOR_REWRITES,
+    strip_check_constraint_prefix,
 };
-use crate::table_features::ColumnMappingMode;
 use crate::{KernelError, KernelResult};
 
 /// Definition of one recognized `delta.*` table property.
 #[derive(Clone, Copy)]
 struct TablePropertyDef {
     key: &'static str,
-    editable: bool,
-    /// Returns `true` when `value` is syntactically valid for this property.
-    validate: fn(&str) -> bool,
+    /// Returns `true` when `value` is syntactically valid. `None` means the property is
+    /// recognized but not editable, so values are never validated.
+    validate: Option<fn(&str) -> bool>,
 }
 
 const fn editable(key: &'static str, validate: fn(&str) -> bool) -> TablePropertyDef {
     TablePropertyDef {
         key,
-        editable: true,
-        validate,
+        validate: Some(validate),
     }
 }
 
-const fn recognized(key: &'static str, validate: fn(&str) -> bool) -> TablePropertyDef {
+const fn recognized(key: &'static str) -> TablePropertyDef {
     TablePropertyDef {
         key,
-        editable: false,
-        validate,
+        validate: None,
     }
 }
 
@@ -58,32 +55,12 @@ fn validate_interval(value: &str) -> bool {
     parse_interval(value).is_some()
 }
 
-fn validate_non_empty(value: &str) -> bool {
-    !value.is_empty()
-}
-
 fn validate_column_names(value: &str) -> bool {
     parse_column_names(value).is_some()
 }
 
-fn validate_column_mapping_mode(value: &str) -> bool {
-    value.parse::<ColumnMappingMode>().is_ok()
-}
-
-fn validate_isolation_level(value: &str) -> bool {
-    value.parse::<IsolationLevel>().is_ok()
-}
-
-fn validate_i64(value: &str) -> bool {
-    value.parse::<i64>().is_ok()
-}
-
 fn validate_data_skipping_num_indexed_cols(value: &str) -> bool {
     DataSkippingNumIndexedCols::try_from(value).is_ok()
-}
-
-fn validate_checkpoint_policy(value: &str) -> bool {
-    value.parse::<CheckpointPolicy>().is_ok()
 }
 
 fn validate_compression_codec(value: &str) -> bool {
@@ -107,43 +84,40 @@ const EDITABLE_CONFIG_PROPERTIES: &[TablePropertyDef] = &[
 
 /// TODO: change these to editable once protocol-preparation code is added
 const FEATURE_ENABLEMENT_PROPERTIES: &[TablePropertyDef] = &[
-    recognized(APPEND_ONLY, validate_bool),
-    recognized(COLUMN_MAPPING_MODE, validate_column_mapping_mode),
-    recognized(ENABLE_CHANGE_DATA_FEED, validate_bool),
-    recognized(ENABLE_DELETION_VECTORS, validate_bool),
-    recognized(ENABLE_TYPE_WIDENING, validate_bool),
-    recognized(ENABLE_ICEBERG_COMPAT_V1, validate_bool),
-    recognized(ENABLE_ICEBERG_COMPAT_V2, validate_bool),
-    recognized(ENABLE_ICEBERG_COMPAT_V3, validate_bool),
-    recognized(ENABLE_ICEBERG_NATIVE_V4, validate_bool),
-    recognized(CHECKPOINT_POLICY, validate_checkpoint_policy),
-    recognized(ENABLE_ROW_TRACKING, validate_bool),
-    recognized(ENABLE_IN_COMMIT_TIMESTAMPS, validate_bool),
+    recognized(APPEND_ONLY),
+    recognized(COLUMN_MAPPING_MODE),
+    recognized(ENABLE_CHANGE_DATA_FEED),
+    recognized(ENABLE_DELETION_VECTORS),
+    recognized(ENABLE_TYPE_WIDENING),
+    recognized(ENABLE_ICEBERG_COMPAT_V1),
+    recognized(ENABLE_ICEBERG_COMPAT_V2),
+    recognized(ENABLE_ICEBERG_COMPAT_V3),
+    recognized(ENABLE_ICEBERG_NATIVE_V4),
+    recognized(CHECKPOINT_POLICY),
+    recognized(ENABLE_ROW_TRACKING),
+    recognized(ENABLE_IN_COMMIT_TIMESTAMPS),
 ];
 
 /// TODO: ICT version/timestamp remain non-editable here until ICT protocol-preparation is added
 const KERNEL_MANAGED_PROPERTIES: &[TablePropertyDef] = &[
-    recognized(COLUMN_MAPPING_MAX_COLUMN_ID, validate_i64),
-    recognized(MATERIALIZED_ROW_ID_COLUMN_NAME, validate_non_empty),
-    recognized(
-        MATERIALIZED_ROW_COMMIT_VERSION_COLUMN_NAME,
-        validate_non_empty,
-    ),
-    recognized(IN_COMMIT_TIMESTAMP_ENABLEMENT_VERSION, validate_i64),
-    recognized(IN_COMMIT_TIMESTAMP_ENABLEMENT_TIMESTAMP, validate_i64),
-    recognized(ROW_TRACKING_SUSPENDED, validate_bool),
+    recognized(COLUMN_MAPPING_MAX_COLUMN_ID),
+    recognized(MATERIALIZED_ROW_ID_COLUMN_NAME),
+    recognized(MATERIALIZED_ROW_COMMIT_VERSION_COLUMN_NAME),
+    recognized(IN_COMMIT_TIMESTAMP_ENABLEMENT_VERSION),
+    recognized(IN_COMMIT_TIMESTAMP_ENABLEMENT_TIMESTAMP),
+    recognized(ROW_TRACKING_SUSPENDED),
 ];
 
 const OTHER_RECOGNIZED_PROPERTIES: &[TablePropertyDef] = &[
-    recognized(SET_TRANSACTION_RETENTION_DURATION, validate_interval),
-    recognized(PARQUET_FORMAT_VERSION, validate_non_empty),
-    recognized(AUTO_COMPACT, validate_bool),
-    recognized(OPTIMIZE_WRITE, validate_bool),
-    recognized(ISOLATION_LEVEL, validate_isolation_level),
-    recognized(RANDOMIZE_FILE_PREFIXES, validate_bool),
-    recognized(RANDOM_PREFIX_LENGTH, validate_positive_int),
-    recognized(TARGET_FILE_SIZE, validate_positive_int),
-    recognized(TUNE_FILE_SIZES_FOR_REWRITES, validate_bool),
+    recognized(SET_TRANSACTION_RETENTION_DURATION),
+    recognized(PARQUET_FORMAT_VERSION),
+    recognized(AUTO_COMPACT),
+    recognized(OPTIMIZE_WRITE),
+    recognized(ISOLATION_LEVEL),
+    recognized(RANDOMIZE_FILE_PREFIXES),
+    recognized(RANDOM_PREFIX_LENGTH),
+    recognized(TARGET_FILE_SIZE),
+    recognized(TUNE_FILE_SIZES_FOR_REWRITES),
 ];
 
 /// All known `delta.*` properties, grouped by editability / ownership.
@@ -161,7 +135,7 @@ fn find_property_def(key: &str) -> Option<&'static TablePropertyDef> {
         .find(|def| key.eq_ignore_ascii_case(def.key))
 }
 
-fn is_delta_property_key(key: &str) -> bool {
+pub(crate) fn is_delta_property_key(key: &str) -> bool {
     key.get(..DELTA_PROPERTY_PREFIX.len())
         .is_some_and(|prefix| prefix.eq_ignore_ascii_case(DELTA_PROPERTY_PREFIX))
 }
@@ -183,26 +157,26 @@ pub(crate) fn validate_and_normalize_property_for_update(
     }
 
     if strip_check_constraint_prefix(&key.to_ascii_lowercase()).is_some() {
-        return Err(KernelError::generic(format!(
+        return Err(KernelError::invalid_transaction_state(format!(
             "Cannot modify the table property '{key}'"
         )));
     }
 
     let Some(def) = find_property_def(&key) else {
-        return Err(KernelError::generic(format!(
+        return Err(KernelError::invalid_transaction_state(format!(
             "Unknown configuration key '{key}'"
         )));
     };
 
-    if !def.editable {
-        return Err(KernelError::generic(format!(
+    let Some(validate) = def.validate else {
+        return Err(KernelError::invalid_transaction_state(format!(
             "Cannot modify the table property '{}'",
             def.key
         )));
-    }
+    };
 
-    if !(def.validate)(&value) {
-        return Err(KernelError::generic(format!(
+    if !validate(&value) {
+        return Err(KernelError::invalid_transaction_state(format!(
             "Invalid value '{value}' for table property '{}'",
             def.key
         )));
@@ -307,7 +281,9 @@ mod tests {
     #[test]
     fn editable_keys_match_java_config_only_valid_properties() {
         assert!(
-            EDITABLE_CONFIG_PROPERTIES.iter().all(|def| def.editable),
+            EDITABLE_CONFIG_PROPERTIES
+                .iter()
+                .all(|def| def.validate.is_some()),
             "EDITABLE_CONFIG_PROPERTIES must only contain editable entries"
         );
         assert!(
@@ -315,7 +291,7 @@ mod tests {
                 .iter()
                 .chain(KERNEL_MANAGED_PROPERTIES.iter())
                 .chain(OTHER_RECOGNIZED_PROPERTIES.iter())
-                .all(|def| !def.editable),
+                .all(|def| !def.validate.is_some()),
             "non-editable groups must not contain editable entries"
         );
 
@@ -351,14 +327,10 @@ mod tests {
 
         for def in non_editable {
             assert!(
-                !def.editable,
+                !def.validate.is_some(),
                 "expected non-editable registry entry for {}",
                 def.key
             );
-
-            // Cover validator bodies that the update path never reaches for non-editable keys.
-            let _ = (def.validate)("true");
-            let _ = (def.validate)("");
 
             for key in [def.key.to_string(), def.key.to_ascii_uppercase()] {
                 let error = validate_and_normalize_property_for_update(&key, "true").unwrap_err();

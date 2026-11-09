@@ -16,7 +16,7 @@ use crate::table_features::{
     IcebergCompatValidationContext, Operation, TableFeature, V2_VALIDATOR, V3_VALIDATOR,
     validate_iceberg_compat_if_needed,
 };
-use crate::table_properties::{DELTA_PROPERTY_PREFIX, validate_and_normalize_property_for_update};
+use crate::table_properties::{is_delta_property_key, validate_and_normalize_property_for_update};
 use crate::transaction::domain_metadata::validate_unique_domains;
 use crate::transaction::schema_evolution::{SchemaOperation, evolve_table_config};
 use crate::transaction::{
@@ -153,10 +153,7 @@ impl<MODE: ExecutionMode> TransactionBuilder<UpdateTable, MODE> {
         for (key, value) in properties {
             let key = key.into();
             let value = value.into();
-            if key
-                .get(..DELTA_PROPERTY_PREFIX.len())
-                .is_some_and(|prefix| prefix.eq_ignore_ascii_case(DELTA_PROPERTY_PREFIX))
-            {
+            if is_delta_property_key(&key) {
                 self.local_state
                     .properties_added
                     .retain(|existing, _| !existing.eq_ignore_ascii_case(&key));
