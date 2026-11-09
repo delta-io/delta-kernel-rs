@@ -323,7 +323,7 @@ fn take(bytes: &mut Bytes, n: usize) -> KernelResult<Bytes> {
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use std::collections::BTreeMap;
+    use bbtree::unsync::BBTreeMap;
 
     use super::*;
 
@@ -334,7 +334,7 @@ pub(crate) mod tests {
             .iter()
             .max()
             .map_or(0, |&max| split_position(max).0 + 1);
-        let mut by_container: BTreeMap<usize, Vec<u8>> = BTreeMap::new();
+        let mut by_container: BBTreeMap<usize, Vec<u8>> = BBTreeMap::new();
         for &pos in positions {
             let (container, value) = split_position(pos);
             by_container.entry(container).or_default().push(value);
@@ -563,7 +563,7 @@ pub(crate) mod tests {
     fn round_trip_across_many_containers() {
         let positions = [0u32, 255, 256, 0x12345, 40000, 0x1FFFF];
         let container_count = (*positions.iter().max().unwrap() as usize / 256) + 1;
-        let mut by_container: BTreeMap<usize, Vec<u8>> = BTreeMap::new();
+        let mut by_container: BBTreeMap<usize, Vec<u8>> = BBTreeMap::new();
         for &p in &positions {
             by_container
                 .entry(p as usize >> 8)

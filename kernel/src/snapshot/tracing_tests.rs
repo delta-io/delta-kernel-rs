@@ -1,6 +1,6 @@
-use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 
+use bbtree::unsync::{BBTreeMap, BBTreeSet};
 use test_utils::{METADATA, TestAction, actions_to_string, add_commit, delta_path_for_version};
 use tracing::field::{Field, Visit};
 use tracing::span::{Attributes, Id, Record};
@@ -21,14 +21,14 @@ use crate::utils::try_parse_uri;
 const FRESH_CONSTRUCTOR_SPAN: &str = "try_new_from_log_segment";
 const INCREMENTAL_CONSTRUCTOR_SPAN: &str = "try_new_from";
 
-type TraceFields = BTreeMap<&'static str, String>;
+type TraceFields = BBTreeMap<&'static str, String>;
 type CapturedTraces = Vec<(&'static str, TraceFields)>;
 
 /// Captures the parts of snapshot tracing that these regression tests distinguish.
 #[derive(Clone, Default)]
 struct SnapshotTraceCaptureLayer {
     /// Field names declared by each span, including fields whose values start empty.
-    declared_fields: Arc<Mutex<BTreeMap<&'static str, BTreeSet<&'static str>>>>,
+    declared_fields: Arc<Mutex<BBTreeMap<&'static str, BBTreeSet<&'static str>>>>,
     /// Values attached when each span is created.
     initial_values: Arc<Mutex<CapturedTraces>>,
     /// Values supplied later through `Span::record`.
@@ -228,7 +228,7 @@ async fn snapshot_spans_avoid_heavy_context_and_constructors_capture_failure_arg
             );
         }
 
-        let required_constructor_fields = BTreeSet::from([
+        let required_constructor_fields = BBTreeSet::from([
             "path",
             "version",
             "operation_id",
@@ -240,7 +240,7 @@ async fn snapshot_spans_avoid_heavy_context_and_constructors_capture_failure_arg
             assert!(required_constructor_fields.is_subset(&declared_fields[span_name]));
         }
 
-        let denied_fields = BTreeSet::from([
+        let denied_fields = BBTreeSet::from([
             "self",
             "existing_snapshot",
             "log_segment",
@@ -285,8 +285,8 @@ async fn snapshot_spans_avoid_heavy_context_and_constructors_capture_failure_arg
             .iter()
             .filter(|(span_name, _)| *span_name == INCREMENTAL_CONSTRUCTOR_SPAN)
             .filter_map(|(_, fields)| fields.get("version").map(String::as_str))
-            .collect::<BTreeSet<_>>(),
-        BTreeSet::from(["0", "1"])
+            .collect::<BBTreeSet<_>>(),
+        BBTreeSet::from(["0", "1"])
     );
 
     let same_version = SnapshotBuilder::new_from(updated.clone())
@@ -445,8 +445,8 @@ async fn snapshot_rebuild_failure_emits_inner_and_outer_constructor_errors()
         error_events
             .iter()
             .map(|(span_name, _)| *span_name)
-            .collect::<BTreeSet<_>>(),
-        BTreeSet::from([FRESH_CONSTRUCTOR_SPAN, INCREMENTAL_CONSTRUCTOR_SPAN])
+            .collect::<BBTreeSet<_>>(),
+        BBTreeSet::from([FRESH_CONSTRUCTOR_SPAN, INCREMENTAL_CONSTRUCTOR_SPAN])
     );
     let outer = trace_fields(&error_events, INCREMENTAL_CONSTRUCTOR_SPAN);
     assert!(outer["log_segment"].contains("00000000000000000001.checkpoint.parquet"));

@@ -156,6 +156,7 @@ prost-build = { version = "0.13", optional = true }
 protoc-bin-vendored = { version = "3.2", optional = true }
 
 [dev-dependencies]
+bbtree = "=0.2.0"
 delta_kernel = { path = ".", features = ["internal-api", "test-utils"] }
 # NOTE: test_utils forcibly pulls the default engine and arrow-59. By default it ALSO pulls
 # arrow-60, which takes precedence and would make it impossible to test against arrow-59.
