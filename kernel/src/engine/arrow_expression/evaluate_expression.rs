@@ -13,21 +13,21 @@ use crate::arrow::array::types::*;
 use crate::arrow::array::{
     self as arrow_array, Array, ArrayBuilder, ArrayData, ArrayRef, AsArray, BooleanArray, Datum,
     Int32Array, LargeStringArray, ListArray, MapArray, MutableArrayData, NullBufferBuilder,
-    OffsetSizeTrait, RecordBatch, StringArray, StringArrayType, StructArray, make_array,
-    new_null_array,
+    RecordBatch, StringArray, StringArrayType, StructArray, make_array, new_null_array,
 };
 use crate::arrow::buffer::{NullBuffer, OffsetBuffer};
 use crate::arrow::compute::kernels::cast_utils::{Parser, string_to_datetime};
 use crate::arrow::compute::kernels::cmp::{distinct, eq, gt, gt_eq, lt, lt_eq, neq, not_distinct};
 use crate::arrow::compute::kernels::comparison::in_list_utf8;
 use crate::arrow::compute::kernels::interleave::interleave;
+use crate::arrow::compute::kernels::length::length;
 use crate::arrow::compute::kernels::numeric::{add, div, mul, sub};
 use crate::arrow::compute::{
     and_kleene, can_cast_types, cast, filter_record_batch, is_not_null, is_null, not, or_kleene,
 };
 use crate::arrow::datatypes::{
-    ArrowNativeType, DataType as ArrowDataType, Field as ArrowField, Fields as ArrowFields,
-    IntervalUnit, Schema as ArrowSchema, TimeUnit,
+    DataType as ArrowDataType, Field as ArrowField, Fields as ArrowFields, IntervalUnit,
+    Schema as ArrowSchema, TimeUnit,
 };
 use crate::arrow::error::ArrowError;
 use crate::arrow::json::StructMode;
@@ -902,42 +902,24 @@ fn map_strings<'a, T: AsRef<str>>(
     Ok(cast(&mapped, &ArrowDataType::Utf8)?)
 }
 
-/// Evaluates [`UnaryExpressionOp::Cardinality`] over a list array of any representation.
+/// Evaluates [`UnaryExpressionOp::Cardinality`] over any list representation kernel reads as an
+/// ARRAY.
 fn cardinalities(input: &ArrayRef) -> KernelResult<ArrayRef> {
-    fn offset_lengths<O: OffsetSizeTrait>(offsets: &[O]) -> impl Iterator<Item = usize> + '_ {
-        offsets.windows(2).map(|w| (w[1] - w[0]).as_usize())
-    }
-    fn to_int32(
-        lengths: impl Iterator<Item = usize>,
-        nulls: Option<&NullBuffer>,
-    ) -> KernelResult<ArrayRef> {
-        let lengths = lengths
-            .map(|len| {
+    match input.data_type() {
+        ArrowDataType::List(_) | ArrowDataType::ListView(_) | ArrowDataType::FixedSizeList(..) => {
+            Ok(length(input)?)
+        }
+        ArrowDataType::LargeList(_) | ArrowDataType::LargeListView(_) => {
+            let lengths = length(input)?;
+            // `try_unary` skips NULL rows, whose offsets may span any number of elements.
+            let lengths: Int32Array = lengths.as_primitive::<Int64Type>().try_unary(|len| {
                 i32::try_from(len).map_err(|_| {
                     KernelError::invalid_expression(format!(
                         "Cardinality of {len} elements does not fit in an INTEGER"
                     ))
                 })
-            })
-            .try_collect()?;
-        Ok(Arc::new(Int32Array::try_new(lengths, nulls.cloned())?))
-    }
-    match input.data_type() {
-        ArrowDataType::List(_) => {
-            let list = input.as_list::<i32>();
-            to_int32(offset_lengths(list.value_offsets()), list.nulls())
-        }
-        ArrowDataType::LargeList(_) => {
-            let list = input.as_list::<i64>();
-            to_int32(offset_lengths(list.value_offsets()), list.nulls())
-        }
-        ArrowDataType::ListView(_) => {
-            let list = input.as_list_view::<i32>();
-            to_int32(list.sizes().iter().map(|s| s.as_usize()), list.nulls())
-        }
-        ArrowDataType::LargeListView(_) => {
-            let list = input.as_list_view::<i64>();
-            to_int32(list.sizes().iter().map(|s| s.as_usize()), list.nulls())
+            })?;
+            Ok(Arc::new(lengths))
         }
         other => Err(KernelError::invalid_expression(format!(
             "Cardinality requires an array input, got {other}"
@@ -1320,10 +1302,11 @@ mod tests {
     use super::*;
     use crate::arrow::array::{
         ArrayData as ArrowArrayData, ArrayRef, BinaryArray, BooleanArray, Date32Array,
-        Float64Array, Int32Array, Int64Array, LargeStringArray, ListArray, MapBuilder, StringArray,
-        StringBuilder, StringViewArray, StructArray, TimestampMicrosecondArray,
+        FixedSizeListArray, Float64Array, Int32Array, Int64Array, LargeListArray, LargeStringArray,
+        ListArray, MapBuilder, NullArray, StringArray, StringBuilder, StringViewArray, StructArray,
+        TimestampMicrosecondArray,
     };
-    use crate::arrow::buffer::{OffsetBuffer, ScalarBuffer};
+    use crate::arrow::buffer::{NullBuffer, OffsetBuffer, ScalarBuffer};
     use crate::arrow::datatypes::{
         DataType as ArrowDataType, Field as ArrowField, FieldRef, Fields, Schema as ArrowSchema,
     };
@@ -2315,45 +2298,91 @@ mod tests {
         let expr = Expr::unary(op, col!("s"));
         let err = evaluate_expression(&expr, &batch, Some(&requested)).unwrap_err();
         assert!(
-            matches!(err, KernelError::InvalidExpressionEvaluation(_)),
+            matches!(&err, KernelError::InvalidExpressionEvaluation(msg) if msg.contains("caller expects")),
             "{err}"
         );
-    }
-
-    /// Rows: `[1, NULL, 3]`, NULL, `[]`.
-    fn cardinality_input(make_list: fn(ListArray) -> ArrayRef) -> RecordBatch {
-        let list = ListArray::from_iter_primitive::<Int32Type, _, _>([
-            Some(vec![Some(1), None, Some(3)]),
-            None,
-            Some(vec![]),
-        ]);
-        RecordBatch::try_from_iter([("l", make_list(list))]).unwrap()
-    }
-
-    /// Casts an INT list to another list representation built by `to`.
-    fn cast_int_list(list: ListArray, to: fn(FieldRef) -> ArrowDataType) -> ArrayRef {
-        let field = Arc::new(ArrowField::new_list_field(ArrowDataType::Int32, true));
-        cast(&list, &to(field)).unwrap()
     }
 
     #[rstest]
     fn test_cardinality(
         #[values(
-            |l| Arc::new(l) as ArrayRef,
-            |l| cast_int_list(l, ArrowDataType::LargeList),
-            |l| cast_int_list(l, ArrowDataType::ListView),
-            |l| cast_int_list(l, ArrowDataType::LargeListView)
+            ArrowDataType::List,
+            ArrowDataType::LargeList,
+            ArrowDataType::ListView,
+            ArrowDataType::LargeListView
         )]
-        make_list: fn(ListArray) -> ArrayRef,
+        list_type: fn(FieldRef) -> ArrowDataType,
         #[values(None, Some(&DataType::INTEGER))] result_type: Option<&'static DataType>,
+        #[values(false, true)] sliced: bool,
     ) {
-        let batch = cardinality_input(make_list);
+        let list = ListArray::from_iter_primitive::<Int32Type, _, _>([
+            Some(vec![Some(1), None, Some(3)]),
+            None,
+            Some(vec![]),
+        ]);
+        let field = Arc::new(ArrowField::new_list_field(ArrowDataType::Int32, true));
+        let list = cast(&list, &list_type(field)).unwrap();
+        let mut expected = vec![Some(3), None, Some(0)];
+        let list = if sliced {
+            expected.remove(0);
+            list.slice(1, 2)
+        } else {
+            list
+        };
+        let batch = RecordBatch::try_from_iter([("l", list)]).unwrap();
         let expr = Expr::unary(UnaryExpressionOp::Cardinality, col!("l"));
         let result = evaluate_expression(&expr, &batch, result_type).unwrap();
         assert_eq!(
             result.as_primitive::<Int32Type>(),
-            &Int32Array::from(vec![Some(3), None, Some(0)])
+            &Int32Array::from(expected)
         );
+    }
+
+    #[test]
+    fn test_cardinality_fixed_size_list() {
+        let list = FixedSizeListArray::from_iter_primitive::<Int32Type, _, _>(
+            [Some(vec![Some(1), None, Some(3)]), None],
+            3,
+        );
+        let batch = RecordBatch::try_from_iter([("l", Arc::new(list) as ArrayRef)]).unwrap();
+        let expr = Expr::unary(UnaryExpressionOp::Cardinality, col!("l"));
+        let result = evaluate_expression(&expr, &batch, Some(&DataType::INTEGER)).unwrap();
+        assert_eq!(
+            result.as_primitive::<Int32Type>(),
+            &Int32Array::from(vec![Some(3), None])
+        );
+    }
+
+    /// A `NullArray` child needs no buffers, so a list longer than `i32::MAX` is cheap to build.
+    #[rstest]
+    #[case::fits(i32::MAX as usize, true, Some(i32::MAX))]
+    #[case::overflows(i32::MAX as usize + 1, true, None)]
+    #[case::null_row_is_not_counted(i32::MAX as usize + 1, false, None)]
+    fn test_cardinality_large_list_integer_range(
+        #[case] len: usize,
+        #[case] valid: bool,
+        #[case] expected: Option<i32>,
+    ) {
+        let field = Arc::new(ArrowField::new_list_field(ArrowDataType::Null, true));
+        let list = LargeListArray::new(
+            field,
+            OffsetBuffer::from_lengths([len]),
+            Arc::new(NullArray::new(len)),
+            Some(NullBuffer::from(vec![valid])),
+        );
+        let batch = RecordBatch::try_from_iter([("l", Arc::new(list) as ArrayRef)]).unwrap();
+        let expr = Expr::unary(UnaryExpressionOp::Cardinality, col!("l"));
+        let result = evaluate_expression(&expr, &batch, None);
+        match (valid, expected) {
+            (true, None) => assert!(
+                matches!(result, Err(KernelError::InvalidExpressionEvaluation(_))),
+                "{result:?}"
+            ),
+            _ => assert_eq!(
+                result.unwrap().as_primitive::<Int32Type>(),
+                &Int32Array::from(vec![expected])
+            ),
+        }
     }
 
     #[test]
