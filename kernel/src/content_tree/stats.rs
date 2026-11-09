@@ -145,16 +145,52 @@ fn get_field_id(field: &StructField) -> Option<i32> {
     }
 }
 
-/// Every stat of a leaf's stats struct with its field ID offset from the leaf's stats base, in
-/// field order.
-const STATS: [(&str, i32); 6] = [
-    (LOWER_BOUND, STATS_OFFSET_LOWER_BOUND),
-    (UPPER_BOUND, STATS_OFFSET_UPPER_BOUND),
-    (VALUE_COUNT, STATS_OFFSET_VALUE_COUNT),
-    (NULL_VALUE_COUNT, STATS_OFFSET_NULL_VALUE_COUNT),
-    (NAN_VALUE_COUNT, STATS_OFFSET_NAN_VALUE_COUNT),
-    (TOTAL_BYTES, STATS_OFFSET_TOTAL_BYTES),
-];
+/// A sub-field of a leaf's stats struct. Per-stat properties are exhaustive matches on this enum,
+/// so a new stat must decide each of them explicitly.
+#[derive(Clone, Copy)]
+enum Stat {
+    LowerBound,
+    UpperBound,
+    ValueCount,
+    NullValueCount,
+    NanValueCount,
+    TotalBytes,
+}
+
+impl Stat {
+    /// Every stat, in field order.
+    const ALL: [Stat; 6] = [
+        Stat::LowerBound,
+        Stat::UpperBound,
+        Stat::ValueCount,
+        Stat::NullValueCount,
+        Stat::NanValueCount,
+        Stat::TotalBytes,
+    ];
+
+    fn name(self) -> &'static str {
+        match self {
+            Stat::LowerBound => LOWER_BOUND,
+            Stat::UpperBound => UPPER_BOUND,
+            Stat::ValueCount => VALUE_COUNT,
+            Stat::NullValueCount => NULL_VALUE_COUNT,
+            Stat::NanValueCount => NAN_VALUE_COUNT,
+            Stat::TotalBytes => TOTAL_BYTES,
+        }
+    }
+
+    /// The field ID offset from the leaf's stats base.
+    fn offset(self) -> i32 {
+        match self {
+            Stat::LowerBound => STATS_OFFSET_LOWER_BOUND,
+            Stat::UpperBound => STATS_OFFSET_UPPER_BOUND,
+            Stat::ValueCount => STATS_OFFSET_VALUE_COUNT,
+            Stat::NullValueCount => STATS_OFFSET_NULL_VALUE_COUNT,
+            Stat::NanValueCount => STATS_OFFSET_NAN_VALUE_COUNT,
+            Stat::TotalBytes => STATS_OFFSET_TOTAL_BYTES,
+        }
+    }
+}
 
 /// Which Delta JSON stat categories a leaf appears in. Selects which sub-fields
 /// [`build_stats_struct`] emits under the projection (see [`Self::backs`]).
@@ -179,13 +215,13 @@ impl StatCategories {
     /// `value_count`/`null_value_count`<-`nullCount`, `nan_value_count`<-either bound category.
     /// `total_bytes` has no backing category, so it is never kept -- and `null_value_count`, though
     /// independent of nullability, is not kept for a leaf absent from `nullCount`.
-    fn backs(&self, stat: &str) -> bool {
+    fn backs(&self, stat: Stat) -> bool {
         match stat {
-            LOWER_BOUND => self.min_values,
-            UPPER_BOUND => self.max_values,
-            VALUE_COUNT | NULL_VALUE_COUNT => self.null_count,
-            NAN_VALUE_COUNT => self.min_values || self.max_values,
-            _ => false,
+            Stat::LowerBound => self.min_values,
+            Stat::UpperBound => self.max_values,
+            Stat::ValueCount | Stat::NullValueCount => self.null_count,
+            Stat::NanValueCount => self.min_values || self.max_values,
+            Stat::TotalBytes => false,
         }
     }
 }
@@ -219,15 +255,15 @@ fn build_stats_struct(
         _ => (false, false),
     };
 
-    let fields = STATS.into_iter().filter_map(|(stat, offset)| {
+    let fields = Stat::ALL.into_iter().filter_map(|stat| {
         let (data_type, type_eligible) = match stat {
-            LOWER_BOUND | UPPER_BOUND => (bounds_type.clone(), true),
-            NAN_VALUE_COUNT => (DataType::LONG, has_nan_count),
-            TOTAL_BYTES => (DataType::LONG, has_size_stats),
-            _ => (DataType::LONG, true),
+            Stat::LowerBound | Stat::UpperBound => (bounds_type.clone(), true),
+            Stat::ValueCount | Stat::NullValueCount => (DataType::LONG, true),
+            Stat::NanValueCount => (DataType::LONG, has_nan_count),
+            Stat::TotalBytes => (DataType::LONG, has_size_stats),
         };
         let include = type_eligible && categories.is_none_or(|c| c.backs(stat));
-        include.then(|| field_with_id(stat, data_type, true, base_field_id + offset))
+        include.then(|| field_with_id(stat.name(), data_type, true, base_field_id + stat.offset()))
     });
 
     StructType::new_unchecked(fields)
