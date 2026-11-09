@@ -32,7 +32,9 @@ use crate::table_features::{
 };
 use crate::table_properties::TableProperties;
 use crate::utils::{require, to_file_size};
-use crate::{DeltaError, EngineData, Error, FileMeta, KernelError, KernelResult, RowVisitor as _};
+use crate::{
+    DeltaError, EngineData, Error, FileMeta, KernelError, KernelResult, Result, RowVisitor as _,
+};
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::{Engine, Version, create_row};
 
@@ -502,7 +504,7 @@ impl Metadata {
     /// return [`KernelError::MalformedJson`]. The original parser failure is retained as a cause
     /// of the Delta error.
     #[internal_api]
-    pub(crate) fn parse_schema(&self) -> KernelResult<StructType> {
+    pub(crate) fn parse_schema(&self) -> Result<StructType> {
         schema_deserializer::parse(&self.schema_string, SCHEMA_RECURSION_LIMIT)
     }
 
@@ -2363,7 +2365,10 @@ mod tests {
                     "metaData.schemaString reached the JSON recursion limit of 1000"
                 ),
             );
-            let error = match result.unwrap_err() {
+            let Error::Kernel(error) = result.unwrap_err() else {
+                panic!("expected Kernel error")
+            };
+            let error = match error {
                 KernelError::Backtraced { source, .. } => *source,
                 error => error,
             };
@@ -2419,7 +2424,10 @@ mod tests {
         };
         // Error conversion captures a backtrace only when enabled, so normalize both forms before
         // checking the underlying error.
-        let error = match metadata.parse_schema().unwrap_err() {
+        let Error::Kernel(error) = metadata.parse_schema().unwrap_err() else {
+            panic!("expected Kernel error")
+        };
+        let error = match error {
             KernelError::Backtraced { source, .. } => *source,
             error => error,
         };

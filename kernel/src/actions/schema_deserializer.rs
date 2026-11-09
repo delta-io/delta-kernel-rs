@@ -226,9 +226,9 @@ mod tests {
     use serde::Deserialize;
 
     use super::{Budget, parse};
-    use crate::KernelError;
     use crate::actions::SCHEMA_RECURSION_LIMIT;
     use crate::schema::{ArrayType, DataType, MapType, StructField, StructType};
+    use crate::{Error, KernelError};
 
     #[derive(Debug, Deserialize, PartialEq)]
     struct NestedArrays(Vec<Vec<u8>>);
@@ -289,8 +289,11 @@ mod tests {
             assert_eq!(cloned, expected);
             assert_eq!(serde_json::to_string(&cloned).unwrap(), json);
         } else {
+            let Error::Kernel(error) = result.unwrap_err() else {
+                panic!("expected Kernel error");
+            };
             assert_eq!(
-                result.unwrap_err().without_backtrace().to_string(),
+                error.without_backtrace().to_string(),
                 "Schema error: Table schema is too deeply nested: decoding \
                  metaData.schemaString reached the JSON recursion limit of 1000"
             );
@@ -372,7 +375,9 @@ mod tests {
         if succeeds {
             assert_eq!(result.unwrap(), expected);
         } else {
-            let error = result.unwrap_err();
+            let Error::Kernel(error) = result.unwrap_err() else {
+                panic!("expected Kernel error");
+            };
             assert!(matches!(error.without_backtrace(), KernelError::Schema(_)));
             assert_eq!(
                 error.without_backtrace().to_string(),
@@ -399,7 +404,9 @@ mod tests {
     #[case::unclosed_ignored_array(r#"{"type":"struct","fields":[],"x":[[0]}"#)]
     #[case::ignored_array_trailing_comma(r#"{"type":"struct","fields":[],"x":[0,]}"#)]
     fn parse_schema_rejects_malformed_json(#[case] json: &str) {
-        let error = parse(json, SCHEMA_RECURSION_LIMIT).unwrap_err();
+        let Error::Kernel(error) = parse(json, SCHEMA_RECURSION_LIMIT).unwrap_err() else {
+            panic!("expected Kernel error");
+        };
         assert!(matches!(
             error.without_backtrace(),
             KernelError::MalformedJson(_)
