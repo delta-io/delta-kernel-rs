@@ -98,7 +98,7 @@ fn checkpoint_action(snapshot: &Snapshot) -> CheckpointAction {
 }
 
 #[rstest]
-fn newer_catalog_bound_preserves_populated_adaptive_metadata_caches(
+fn freshness_changes_preserve_populated_adaptive_metadata_caches(
     #[values(None, Some(CHECKPOINT_VERSION + 1))] crc_version: Option<Version>,
 ) {
     // GIVEN a latest snapshot with populated adaptive-metadata caches and an optional CRC.
@@ -119,19 +119,29 @@ fn newer_catalog_bound_preserves_populated_adaptive_metadata_caches(
         .with_max_catalog_version(source.version() + 1)
         .build(&engine)
         .unwrap();
-    // THEN only the result's freshness changes, preserving the populated caches without I/O.
+    // THEN the newer bound clears freshness without changing the source.
     assert!(!historical.is_built_as_latest());
     assert!(source.is_built_as_latest());
-    assert!(Arc::ptr_eq(
-        historical
-            .checkpoint_action
-            .get()
-            .unwrap()
-            .as_ref()
-            .unwrap(),
-        &checkpoint,
-    ));
-    assert_eq!(historical.last_manifest_commit.get(), Some(&Some(manifest)));
+
+    // WHEN a matching bound confirms the same version as latest again.
+    let promoted = Snapshot::builder_from(historical.clone())
+        .with_max_catalog_version(historical.version())
+        .build(&engine)
+        .unwrap();
+
+    // THEN both derived snapshots preserve populated caches without I/O or source mutation.
+    assert!(promoted.is_built_as_latest());
+    assert!(!historical.is_built_as_latest());
+    for snapshot in [&historical, &promoted] {
+        assert!(Arc::ptr_eq(
+            snapshot.checkpoint_action.get().unwrap().as_ref().unwrap(),
+            &checkpoint,
+        ));
+        assert_eq!(
+            snapshot.last_manifest_commit.get().unwrap().as_ref(),
+            Some(&manifest)
+        );
+    }
     assert!(!reporter.events().iter().any(is_io_event));
 }
 

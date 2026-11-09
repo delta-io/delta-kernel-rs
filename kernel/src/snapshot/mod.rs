@@ -684,8 +684,12 @@ impl Snapshot {
     /// latest version, a post-commit snapshot, or a snapshot hint marked `Latest` by its connector.
     /// Kernel does not independently verify hint freshness. This is not a liveness guarantee:
     /// another writer may commit a newer version afterward, so a `true` snapshot can already be
-    /// stale. Rebuilding this version from this snapshot or its hint with a newer catalog bound
-    /// clears the returned snapshot's flag. This snapshot remains unchanged.
+    /// stale.
+    ///
+    /// When rebuilding the same version from a snapshot or complete hint, a catalog bound equal
+    /// to that version sets the returned snapshot's flag to `true`, even if the source claim was
+    /// unverified. A newer bound clears the flag. Without a bound or new discovery, the source
+    /// claim is preserved. The source snapshot remains unchanged.
     ///
     /// Version-preserving derivations ([`Self::checkpoint`], [`Self::write_checksum`],
     /// [`Self::publish`]) do not change this flag: they carry it over from the source snapshot.
@@ -1807,6 +1811,16 @@ impl Snapshot {
             self.skipped_new_checkpoints,
         )?))
     }
+}
+
+/// A catalog bound establishes freshness independently of the inherited or discovered claim.
+/// Bound validation rejects versions above the bound separately.
+fn resolve_latest_claim(
+    version: Version,
+    max_catalog_version: Option<Version>,
+    latest_claim: bool,
+) -> bool {
+    max_catalog_version.map_or(latest_claim, |max| max == version)
 }
 
 // TODO: unify this and lots of stuff in LogSegment tests and test_utils.
