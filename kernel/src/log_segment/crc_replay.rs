@@ -391,12 +391,10 @@ impl CrcReplayAccumulator {
             return;
         }
         let policy = match self.current_commit_operation.as_deref() {
+            _ if !self.current_commit_saw_file_action => FileStatsPolicy::ApplyAll,
             Some(operation) => FileStatsPolicy::for_operation(operation),
-            // Checkpoints have reconciled adds and no commitInfo. Metadata-only commits also
-            // preserve file statistics without an operation name.
-            None if self.current_file_url.is_none() || !self.current_commit_saw_file_action => {
-                FileStatsPolicy::ApplyAll
-            }
+            // Checkpoints have reconciled adds and no commitInfo.
+            None if self.current_file_url.is_none() => FileStatsPolicy::ApplyAll,
             None => FileStatsPolicy::Unsupported,
         };
         let fs = &mut self.delta.file_stats;
@@ -817,6 +815,7 @@ mod tests {
     #[case::streaming_update(Some("STREAMING UPDATE"), true)]
     #[case::reorg(Some("REORG"), true)]
     #[case::reorg_upgrade_uniform(Some("REORG TABLE UPGRADE UNIFORM"), false)]
+    #[case::alter_table(Some("ALTER TABLE"), false)]
     #[case::unsafe_op(Some("ANALYZE STATS"), false)]
     #[case::manual_update(Some("Manual Update"), false)]
     #[case::vacuum_start(Some("VACUUM START"), true)]
@@ -843,10 +842,7 @@ mod tests {
             acc.on_commit_info_without_lmc(op, None);
         }
         acc.process_commit_file_end();
-        assert_eq!(
-            acc.delta.is_incremental_safe,
-            is_safe || (op.is_none() && !has_file_action)
-        );
+        assert_eq!(acc.delta.is_incremental_safe, !has_file_action || is_safe);
     }
 
     #[rstest::rstest]
