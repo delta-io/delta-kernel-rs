@@ -278,7 +278,7 @@ where
             try_create_from_bytes(bytes, schema.clone(), predicate.clone(), location_string)
         })
         .flatten_ok()
-        .map(|data| data?)
+        .map(Result::flatten)
 }
 
 // TODO(#2618): Restore once the engine contract helpers move to test_utils and SyncEngine can

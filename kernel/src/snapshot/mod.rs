@@ -684,7 +684,8 @@ impl Snapshot {
     /// latest version, a post-commit snapshot, or a snapshot hint marked `Latest` by its connector.
     /// Kernel does not independently verify hint freshness. This is not a liveness guarantee:
     /// another writer may commit a newer version afterward, so a `true` snapshot can already be
-    /// stale.
+    /// stale. Rebuilding this version from this snapshot or its hint with a newer catalog bound
+    /// clears the returned snapshot's flag. This snapshot remains unchanged.
     ///
     /// Version-preserving derivations ([`Self::checkpoint`], [`Self::write_checksum`],
     /// [`Self::publish`]) do not change this flag: they carry it over from the source snapshot.
@@ -1771,8 +1772,8 @@ impl Snapshot {
 
         require!(
             unpublished_catalog_commits
-                .windows(2)
-                .all(|commits| commits[0].version() + 1 == commits[1].version()),
+                .array_windows()
+                .all(|[a, b]| a.version() + 1 == b.version()),
             KernelError::generic(format!(
                 "Expected ordered and contiguous unpublished catalog commits. \
                  Got: {unpublished_catalog_commits:?}"

@@ -170,12 +170,12 @@ pub(crate) fn validate_catalog_managed_log_tail(
             path.file_type, path.location.location
         )));
     }
-    for pair in log_tail.windows(2) {
+    for [a, b] in log_tail.array_windows() {
         require!(
-            pair[0].version.checked_add(1) == Some(pair[1].version),
+            a.version.checked_add(1) == Some(b.version),
             KernelError::LogTailVersionsNotContiguous {
-                first_version: pair[0].version,
-                second_version: pair[1].version,
+                first_version: a.version,
+                second_version: b.version,
             }
         );
     }
@@ -2010,13 +2010,12 @@ pub(crate) fn validate_commit_file_types(commits: &[ParsedLogPath]) -> KernelRes
 
 /// Validates that commit versions are in strictly increasing order.
 pub(crate) fn validate_commit_files_sorted(commits: &[ParsedLogPath]) -> KernelResult<()> {
-    if let Some(pair) = commits
-        .windows(2)
-        .find(|pair| pair[0].version >= pair[1].version)
+    if let Some([a, b]) = commits
+        .array_windows()
+        .find(|[a, b]| a.version >= b.version)
     {
         return Err(KernelError::invalid_log_segment(format!(
-            "ascending_commit_files is not sorted: {:?} -> {:?}",
-            pair[0], pair[1]
+            "ascending_commit_files is not sorted: {a:?} -> {b:?}"
         )));
     }
     Ok(())
@@ -2047,14 +2046,13 @@ pub(crate) fn validate_start_version_available(
 
 /// Validates that each commit version immediately follows the previous version.
 pub(crate) fn validate_commit_files_contiguous(commits: &[ParsedLogPath]) -> KernelResult<()> {
-    for pair in commits.windows(2) {
-        let Some(expected_version) = pair[0].version.checked_add(1) else {
+    for [prev, next] in commits.array_windows() {
+        let Some(expected_version) = prev.version.checked_add(1) else {
             return Err(KernelError::invalid_log_segment(format!(
-                "Expected contiguous commit files, but the version after {:?} overflows",
-                pair[0]
+                "Expected contiguous commit files, but the version after {prev:?} overflows"
             )));
         };
-        if expected_version != pair[1].version {
+        if expected_version != next.version {
             return Err(KernelError::MissingVersion(expected_version));
         }
     }

@@ -919,8 +919,8 @@ fn ordering_needs_transform(requested_ordering: &[ReorderIndex]) -> bool {
     // Check for all elements if we need a transform. This is true if any elements are not in order
     // (i.e. element[i].index < element[i+1].index), or any element needs a transform
     requested_ordering
-        .windows(2)
-        .any(|ri| (ri[0].index >= ri[1].index) || ri[1].needs_transform())
+        .array_windows()
+        .any(|[a, b]| a.index >= b.index || b.needs_transform())
 }
 
 /// Check if an ordering requires row index computation.
