@@ -99,6 +99,10 @@ pub enum UnaryPredicateOp {
     ///
     /// [RFC 3986 section 3.1]: https://datatracker.ietf.org/doc/html/rfc3986#section-3.1
     HasUriScheme,
+    /// `true` when any `/`-separated segment of a STRING path is `.` or `..`, such as
+    /// `'a/../b'` or `'./a'`. Names that merely contain dots, like `'a/.hidden'`, do not count. A
+    /// NULL input yields NULL, and so does its `NOT`. Other input types are an error.
+    HasDotSegment,
 }
 
 /// A binary predicate operator.
@@ -1169,6 +1173,11 @@ impl Predicate {
         Self::unary(UnaryPredicateOp::HasUriScheme, expr)
     }
 
+    /// Create a new predicate `HAS_DOT_SEGMENT(expr)`; see [`UnaryPredicateOp::HasDotSegment`].
+    pub fn has_dot_segment(expr: impl Into<Expression>) -> Self {
+        Self::unary(UnaryPredicateOp::HasDotSegment, expr)
+    }
+
     /// Create a new predicate `self == other`
     pub fn eq(a: impl Into<Expression>, b: impl Into<Expression>) -> Self {
         Self::binary(BinaryPredicateOp::Equal, a, b)
@@ -1446,6 +1455,7 @@ impl Display for Predicate {
             Unary(UnaryPredicate { op, expr }) => match op {
                 UnaryPredicateOp::IsNull => write!(f, "{expr} IS NULL"),
                 UnaryPredicateOp::HasUriScheme => write!(f, "HAS_URI_SCHEME({expr})"),
+                UnaryPredicateOp::HasDotSegment => write!(f, "HAS_DOT_SEGMENT({expr})"),
             },
             Junction(JunctionPredicate { op, preds }) => {
                 let op = match op {
@@ -1651,6 +1661,10 @@ mod tests {
             (
                 Pred::not(Pred::has_uri_scheme(col!("x"))),
                 "NOT(HAS_URI_SCHEME(Column(x)))",
+            ),
+            (
+                Pred::has_dot_segment(col!("x")),
+                "HAS_DOT_SEGMENT(Column(x))",
             ),
         ];
 
@@ -1987,6 +2001,7 @@ mod tests {
                 Predicate::from_expr(expr!(is_null(col("nullable_col")))),
                 Predicate::from_expr(expr!(is_not_null(col("nullable_col")))),
                 Predicate::has_uri_scheme(col!("location")),
+                Predicate::has_dot_segment(col!("location")),
             ];
 
             for pred in &cases {

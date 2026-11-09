@@ -24,6 +24,12 @@ pub(crate) fn scheme_len(location: &str) -> Option<usize> {
     None
 }
 
+/// Returns whether any `/`-separated segment of `path` is `.` or `..`.
+pub(crate) fn has_dot_segment(path: &str) -> bool {
+    path.split('/')
+        .any(|segment| segment == "." || segment == "..")
+}
+
 /// Percent-encodes the path of a raw URI reference with [`uri_encode_path`], keeping the
 /// `scheme:[//authority]` prefix of an absolute reference verbatim. A relative reference is
 /// encoded whole. Returns [`Cow::Borrowed`] when nothing needs encoding.
@@ -94,6 +100,19 @@ mod tests {
     #[case::non_ascii_mid("a\u{e9}:x", None)]
     fn test_scheme_len(#[case] location: &str, #[case] expected: Option<usize>) {
         assert_eq!(scheme_len(location), expected);
+    }
+
+    #[rstest]
+    #[case::dot_dot("a/../b", true)]
+    #[case::leading_dot("./a", true)]
+    #[case::trailing_dot("a/.", true)]
+    #[case::bare_dot_dot("..", true)]
+    #[case::absolute("s3://b/x/../y", true)]
+    #[case::dotted_name("a/.hidden/b..c", false)]
+    #[case::empty("", false)]
+    #[case::plain("a/b.parquet", false)]
+    fn test_has_dot_segment(#[case] path: &str, #[case] expected: bool) {
+        assert_eq!(has_dot_segment(path), expected);
     }
 
     #[rstest]

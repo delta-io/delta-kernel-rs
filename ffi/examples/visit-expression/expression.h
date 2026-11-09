@@ -77,7 +77,7 @@ enum VariadicType {
   ArrayConstructor,
   StringConcat,
 };
-enum UnaryType { Not, IsNull, HasUriScheme, UriEncodeLocation, Cardinality };
+enum UnaryType { Not, IsNull, HasUriScheme, HasDotSegment, UriEncodeLocation, Cardinality };
 typedef struct {
   void* ref;
   enum ExpressionType type;
@@ -498,6 +498,7 @@ void visit_expr_unary(void* data,
 }
 DEFINE_UNARY(visit_expr_is_null, IsNull)
 DEFINE_UNARY(visit_expr_has_uri_scheme, HasUriScheme)
+DEFINE_UNARY(visit_expr_has_dot_segment, HasDotSegment)
 DEFINE_UNARY(visit_expr_uri_encode_location, UriEncodeLocation)
 DEFINE_UNARY(visit_expr_cardinality, Cardinality)
 DEFINE_UNARY(visit_expr_not, Not)
@@ -564,6 +565,7 @@ ExpressionItemList construct_expression(SharedExpression* expression) {
     .visit_not = visit_expr_not,
     .visit_is_null = visit_expr_is_null,
     .visit_has_uri_scheme = visit_expr_has_uri_scheme,
+    .visit_has_dot_segment = visit_expr_has_dot_segment,
     .visit_uri_encode_location = visit_expr_uri_encode_location,
     .visit_cardinality = visit_expr_cardinality,
     .visit_lt = visit_expr_lt,
@@ -622,6 +624,7 @@ ExpressionItemList construct_predicate(SharedPredicate* predicate) {
     .visit_not = visit_expr_not,
     .visit_is_null = visit_expr_is_null,
     .visit_has_uri_scheme = visit_expr_has_uri_scheme,
+    .visit_has_dot_segment = visit_expr_has_dot_segment,
     .visit_uri_encode_location = visit_expr_uri_encode_location,
     .visit_cardinality = visit_expr_cardinality,
     .visit_lt = visit_expr_lt,

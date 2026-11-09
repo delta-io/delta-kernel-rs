@@ -6,7 +6,7 @@
 use url::Url;
 
 use crate::path_encoding::uri_encode_path;
-use crate::uri_reference::{scheme_len, uri_decode_location, uri_encode_location};
+use crate::uri_reference::{has_dot_segment, scheme_len, uri_decode_location, uri_encode_location};
 use crate::utils::{require, to_file_size};
 use crate::{FileMeta, KernelError, KernelResult};
 
@@ -151,9 +151,7 @@ fn encode_and_join(path: &str, table_root: &Url) -> KernelResult<Url> {
 /// relative navigation, and URL parsing would otherwise silently collapse such segments.
 pub(crate) fn reject_dot_segments(path: &str) -> KernelResult<()> {
     require!(
-        !path
-            .split('/')
-            .any(|segment| segment == "." || segment == ".."),
+        !has_dot_segment(path),
         KernelError::generic(format!(
             "AMT path {path:?} contains a '.' or '..' segment, which is not supported"
         ))
