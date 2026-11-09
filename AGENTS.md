@@ -298,6 +298,12 @@ This list is non-exhaustive: when in doubt, browse the source files directly
   `(&kernel_data_type).try_into_arrow()` for `DataType`,
   `(&kernel_struct_type).try_into_arrow()` for `StructType` -> Arrow `Schema`.
 
+**Handler access and overrides (from `delta_kernel::engine`, with `test-utils`)**
+
+- `PanicEngine`: assert that an operation requests no required engine handler.
+- `DelegatingEngine`: override selected handlers while delegating the rest to an inner engine.
+  See the types' rustdoc for override and executor selection behavior.
+
 **Engine + table setup (from `test_utils`)**
 
 - `test_table_setup()` / `test_table_setup_mt()`: engine + temp table path. Use the `_mt`
