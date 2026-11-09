@@ -327,6 +327,7 @@ pub trait KernelPredicateEvaluator {
                 Equal => self.eval_pred_eq(col, val, inverted),
                 Distinct => self.eval_pred_distinct(col, val, inverted),
                 In => self.eval_pred_in(col, val, inverted),
+                StartsWith => None,
             },
             (Literal(val), Column(col)) => match op {
                 // NOTE: The column has to be on the left, so e.g. `10 < x` becomes `x > 10`
@@ -334,7 +335,7 @@ pub trait KernelPredicateEvaluator {
                 GreaterThan => self.eval_pred_lt(col, val, inverted),
                 Equal => self.eval_pred_eq(col, val, inverted),
                 Distinct => self.eval_pred_distinct(col, val, inverted),
-                In => None, // arg order is semantically important
+                In | StartsWith => None, // arg order is semantically important
             },
             (Cast(c), Literal(val)) => match c.expr.as_ref() {
                 Column(col) => self.eval_pred_cast(op, col, &c.target, val, inverted),
@@ -347,7 +348,7 @@ pub trait KernelPredicateEvaluator {
                     GreaterThan => self.eval_pred_cast(LessThan, col, &c.target, val, inverted),
                     Equal => self.eval_pred_cast(Equal, col, &c.target, val, inverted),
                     Distinct => self.eval_pred_cast(Distinct, col, &c.target, val, inverted),
-                    In => None, // arg order is semantically important
+                    In | StartsWith => None, // arg order is semantically important
                 },
                 _ => None,
             },
@@ -610,7 +611,7 @@ impl KernelPredicateEvaluatorDefaults {
             Equal => Self::partial_cmp_scalars(Ordering::Equal, left, right, inverted),
             LessThan => Self::partial_cmp_scalars(Ordering::Less, left, right, inverted),
             GreaterThan => Self::partial_cmp_scalars(Ordering::Greater, left, right, inverted),
-            Distinct | In => {
+            Distinct | In | StartsWith => {
                 debug!("Unsupported binary operator: {left:?} {op:?} {right:?}");
                 None
             }

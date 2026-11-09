@@ -146,6 +146,17 @@ pub enum BinaryPredicateOp {
     /// reason the operands sit this way around rather than the more familiar
     /// column-on-the-left form.
     In,
+    /// SQL `starts_with(left, right)`: `true` when the STRING `left` begins with the STRING
+    /// `right`, compared byte for byte (case-sensitive, no collation). Every string starts with
+    /// `''`. A NULL on either side yields NULL, and so does its `NOT`. Other input types are an
+    /// error.
+    ///
+    /// ```text
+    /// STARTS_WITH('/abs/dv.bin', '/')  -- true
+    /// STARTS_WITH('a/b', '')           -- true
+    /// STARTS_WITH('A/b', 'a')          -- false
+    /// ```
+    StartsWith,
 }
 
 /// A unary expression operator.
@@ -695,7 +706,7 @@ impl BinaryPredicateOp {
     pub(crate) fn is_null_intolerant(&self) -> bool {
         use BinaryPredicateOp::*;
         match self {
-            LessThan | GreaterThan | Equal => true,
+            LessThan | GreaterThan | Equal | StartsWith => true,
             Distinct | In => false, // tolerates NULL input
         }
     }
@@ -1221,6 +1232,11 @@ impl Predicate {
         Self::binary(BinaryPredicateOp::Distinct, a, b)
     }
 
+    /// Create a new predicate `STARTS_WITH(expr, prefix)`; see [`BinaryPredicateOp::StartsWith`].
+    pub fn starts_with(expr: impl Into<Expression>, prefix: impl Into<Expression>) -> Self {
+        Self::binary(BinaryPredicateOp::StartsWith, expr, prefix)
+    }
+
     /// Create a new predicate `self AND other`
     pub fn and(a: impl Into<Self>, b: impl Into<Self>) -> Self {
         Self::and_from([a.into(), b.into()])
@@ -1355,6 +1371,7 @@ impl Display for BinaryPredicateOp {
             // in our code we take care of this, but theirs might not ...
             Distinct => write!(f, "DISTINCT"),
             In => write!(f, "IN"),
+            StartsWith => write!(f, "STARTS_WITH"),
         }
     }
 }
@@ -1455,10 +1472,10 @@ impl Display for Predicate {
             BooleanExpression(expr) => write!(f, "{expr}"),
             Not(pred) => write!(f, "NOT({pred})"),
             Binary(BinaryPredicate {
-                op: BinaryPredicateOp::Distinct,
+                op: op @ (BinaryPredicateOp::Distinct | BinaryPredicateOp::StartsWith),
                 left,
                 right,
-            }) => write!(f, "DISTINCT({left}, {right})"),
+            }) => write!(f, "{op}({left}, {right})"),
             Binary(BinaryPredicate { op, left, right }) => write!(f, "{left} {op} {right}"),
             Unary(UnaryPredicate { op, expr }) => match op {
                 UnaryPredicateOp::IsNull => write!(f, "{expr} IS NULL"),
@@ -1673,6 +1690,10 @@ mod tests {
             (
                 Pred::has_dot_segment(col!("x")),
                 "HAS_DOT_SEGMENT(Column(x))",
+            ),
+            (
+                Pred::not(Pred::starts_with(col!("x"), lit("/"))),
+                "NOT(STARTS_WITH(Column(x), '/'))",
             ),
         ];
 
@@ -2010,6 +2031,8 @@ mod tests {
                 Predicate::from_expr(expr!(is_not_null(col("nullable_col")))),
                 Predicate::has_uri_scheme(col!("location")),
                 Predicate::has_dot_segment(col!("location")),
+                // Binary predicates
+                Predicate::starts_with(col!("location"), lit("/")),
             ];
 
             for pred in &cases {

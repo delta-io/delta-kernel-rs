@@ -80,6 +80,9 @@ void print_tree_helper(ExpressionItem ref, int depth) {
         case Distinct:
           printf("Distinct\n");
           break;
+        case StartsWith:
+          printf("StartsWith\n");
+          break;
       }
       print_expression_item_list(op->exprs, depth + 1);
       break;

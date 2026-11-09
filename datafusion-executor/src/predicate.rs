@@ -1,6 +1,7 @@
 //! Conversion from a kernel [`Predicate`](KernelPredicate) to a boolean-valued DataFusion
 //! [`Expr`](DFExpr).
 
+use datafusion::functions::string::expr_fn::starts_with;
 use datafusion::functions_nested::expr_fn::array_has;
 use datafusion::logical_expr::expr::InList;
 use datafusion::logical_expr::utils::{conjunction, disjunction};
@@ -80,6 +81,11 @@ fn binary_to_df_predicate_expr(
         KernelBinaryPredicateOp::LessThan => Operator::Lt,
         KernelBinaryPredicateOp::GreaterThan => Operator::Gt,
         KernelBinaryPredicateOp::Distinct => Operator::IsDistinctFrom,
+        KernelBinaryPredicateOp::StartsWith => {
+            let string = to_df_expr(&binary.left, input_schema, None)?;
+            let prefix = to_df_expr(&binary.right, input_schema, None)?;
+            return Ok(starts_with(string, prefix));
+        }
     };
     let left = to_df_expr(&binary.left, input_schema, None)?;
     let right = to_df_expr(&binary.right, input_schema, None)?;
@@ -193,13 +199,15 @@ mod tests {
     use std::sync::Arc;
 
     use datafusion::arrow::array::{
-        Array, AsArray, Int64Array, ListArray, RecordBatch, new_null_array,
+        Array, ArrayRef, AsArray, BooleanArray, Int64Array, LargeStringArray, ListArray,
+        RecordBatch, StringArray, StringViewArray, new_null_array,
     };
     use datafusion::arrow::buffer::{OffsetBuffer, ScalarBuffer};
     use datafusion::arrow::datatypes::{DataType as ArrowDataType, Schema as ArrowSchema};
     use datafusion::common::DFSchema;
     use datafusion::prelude::SessionContext;
     use delta_kernel::engine::arrow_conversion::TryIntoArrow;
+    use delta_kernel::engine::arrow_expression::evaluate_expression::evaluate_predicate;
     use delta_kernel::expressions::{
         ArrayData as KernelArrayData, Expression as KernelExpr, Predicate as KernelPred, col, expr,
         lit, null_lit,
@@ -388,6 +396,66 @@ mod tests {
     #[case::has_dot_segment(KernelPred::has_dot_segment(col!("a")))]
     fn unsupported_predicate_is_an_error(#[case] pred: KernelPred) {
         to_df_predicate_expr(&pred, &test_schema()).unwrap_err();
+    }
+
+    /// DataFusion's `starts_with` lowering agrees with the kernel evaluator for every string
+    /// representation, with a column or literal prefix, with or without `NOT`.
+    #[rstest]
+    #[case::column_prefix(col!("p"), [Some(true), Some(false), Some(true), None, None])]
+    #[case::literal_prefix(lit("/"), [Some(true), Some(false), Some(false), None, Some(true)])]
+    fn starts_with_matches_kernel_evaluator(
+        #[case] prefix: KernelExpr,
+        #[case] expected: [Option<bool>; 5],
+        #[values(
+            |s| Arc::new(StringArray::from(s)) as ArrayRef,
+            |s| Arc::new(LargeStringArray::from(s)) as ArrayRef,
+            |s| Arc::new(StringViewArray::from(s)) as ArrayRef
+        )]
+        make_array: fn(Vec<Option<&'static str>>) -> ArrayRef,
+        #[values(false, true)] negated: bool,
+    ) {
+        let input_schema = schema! { nullable "s": STRING, nullable "p": STRING };
+        let strings = make_array(vec![Some("/a"), Some("a/b"), Some(""), None, Some("/b")]);
+        let prefixes = make_array(vec![Some("/"), Some("/"), Some(""), Some("/"), None]);
+        let batch = RecordBatch::try_from_iter([("s", strings), ("p", prefixes)]).unwrap();
+        let starts_with = KernelPred::starts_with(col!("s"), prefix);
+        let pred = if negated {
+            KernelPred::not(starts_with)
+        } else {
+            starts_with
+        };
+
+        let df_expr = to_df_predicate_expr(&pred, &input_schema).unwrap();
+        let df_schema = DFSchema::try_from(batch.schema()).unwrap();
+        let actual = SessionContext::new()
+            .create_physical_expr(df_expr, &df_schema)
+            .unwrap()
+            .evaluate(&batch)
+            .unwrap()
+            .into_array(batch.num_rows())
+            .unwrap();
+        let from_kernel = evaluate_predicate(&pred, &batch, false).unwrap();
+
+        let expected: BooleanArray = expected.iter().map(|m| m.map(|m| m != negated)).collect();
+        assert_eq!(actual.as_boolean(), &expected);
+        assert_eq!(from_kernel, expected);
+    }
+
+    /// Like the kernel evaluator, DataFusion rejects a non-string `starts_with` operand rather
+    /// than casting it to a string.
+    #[rstest]
+    fn starts_with_rejects_non_string_input(#[values(false, true)] non_string_prefix: bool) {
+        let pred = if non_string_prefix {
+            KernelPred::starts_with(lit("1"), col!("a"))
+        } else {
+            KernelPred::starts_with(col!("a"), lit("1"))
+        };
+        let df_expr = to_df_predicate_expr(&pred, &test_schema()).unwrap();
+        let arrow_schema: ArrowSchema = (&test_schema()).try_into_arrow().unwrap();
+        let df_schema = DFSchema::try_from(arrow_schema).unwrap();
+        SessionContext::new()
+            .create_physical_expr(df_expr, &df_schema)
+            .unwrap_err();
     }
 
     /// `IN` answers true or false but never null, so it still works under a `NOT`. Membership uses

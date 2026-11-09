@@ -171,6 +171,9 @@ And
     Column(location)
   HasDotSegment
     Column(location)
+  StartsWith
+    Column(location)
+    String(/)
   OpaquePredicate(bar)
     Integer(42)
     Double(1.111000)

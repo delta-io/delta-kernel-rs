@@ -867,7 +867,9 @@ impl DataSkippingPredicateEvaluator for CheckpointDataSkippingPredicateCreator<'
             BinaryPredicateOp::LessThan => Ordering::Less,
             BinaryPredicateOp::Equal => Ordering::Equal,
             BinaryPredicateOp::GreaterThan => Ordering::Greater,
-            BinaryPredicateOp::Distinct | BinaryPredicateOp::In => return None,
+            BinaryPredicateOp::Distinct | BinaryPredicateOp::In | BinaryPredicateOp::StartsWith => {
+                return None;
+            }
         };
         let cast = Expr::cast(partition_value_expr(col), target.clone());
         Some(comparison_predicate(ord, cast, val, inverted))

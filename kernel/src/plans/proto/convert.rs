@@ -581,6 +581,7 @@ impl From<BinaryPredicateOp> for proto_expr::BinaryPredicateOp {
             BinaryPredicateOp::Equal => proto_expr::BinaryPredicateOp::Equal,
             BinaryPredicateOp::Distinct => proto_expr::BinaryPredicateOp::Distinct,
             BinaryPredicateOp::In => proto_expr::BinaryPredicateOp::In,
+            BinaryPredicateOp::StartsWith => proto_expr::BinaryPredicateOp::StartsWith,
         }
     }
 }
@@ -2067,6 +2068,10 @@ mod tests {
     #[case(BinaryPredicateOp::Equal, proto_expr::BinaryPredicateOp::Equal)]
     #[case(BinaryPredicateOp::Distinct, proto_expr::BinaryPredicateOp::Distinct)]
     #[case(BinaryPredicateOp::In, proto_expr::BinaryPredicateOp::In)]
+    #[case(
+        BinaryPredicateOp::StartsWith,
+        proto_expr::BinaryPredicateOp::StartsWith
+    )]
     fn from_binary_predicate_op(
         #[case] op: BinaryPredicateOp,
         #[case] expected: proto_expr::BinaryPredicateOp,

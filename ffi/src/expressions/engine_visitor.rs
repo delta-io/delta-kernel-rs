@@ -220,6 +220,11 @@ pub struct EngineExpressionVisitor {
     /// Visits the `In` binary operator belonging to the list identified by `sibling_list_id`.
     /// The operands will be in a _two_ item list identified by `child_list_id`
     pub visit_in: VisitBinaryFn,
+    /// Visits the `StartsWith` binary operator belonging to the list identified by
+    /// `sibling_list_id`. The string and the prefix will be in a _two_ item list identified by
+    /// `child_list_id`. See [`BinaryPredicateOp::StartsWith`] for the semantics the
+    /// implementation must follow.
+    pub visit_starts_with: VisitBinaryFn,
     /// Visits the `Add` binary operator belonging to the list identified by `sibling_list_id`.
     /// The operands will be in a _two_ item list identified by `child_list_id`
     pub visit_add: VisitBinaryFn,
@@ -815,6 +820,7 @@ fn visit_predicate_impl(
                 BinaryPredicateOp::Equal => visitor.visit_eq,
                 BinaryPredicateOp::Distinct => visitor.visit_distinct,
                 BinaryPredicateOp::In => visitor.visit_in,
+                BinaryPredicateOp::StartsWith => visitor.visit_starts_with,
             };
             visit_fn(visitor.data, sibling_list_id, child_list_id);
         }
@@ -1033,6 +1039,7 @@ mod tests {
             visit_eq: ignore_child_list,
             visit_distinct: ignore_child_list,
             visit_in: ignore_child_list,
+            visit_starts_with: ignore_child_list,
             visit_add: ignore_child_list,
             visit_minus: ignore_child_list,
             visit_multiply: ignore_child_list,

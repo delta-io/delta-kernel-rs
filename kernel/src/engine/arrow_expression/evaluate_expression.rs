@@ -18,7 +18,7 @@ use crate::arrow::array::{
 use crate::arrow::buffer::{NullBuffer, OffsetBuffer};
 use crate::arrow::compute::kernels::cast_utils::{Parser, string_to_datetime};
 use crate::arrow::compute::kernels::cmp::{distinct, eq, gt, gt_eq, lt, lt_eq, neq, not_distinct};
-use crate::arrow::compute::kernels::comparison::in_list_utf8;
+use crate::arrow::compute::kernels::comparison::{in_list_utf8, starts_with};
 use crate::arrow::compute::kernels::concat_elements::concat_elements_utf8_many;
 use crate::arrow::compute::kernels::interleave::interleave;
 use crate::arrow::compute::kernels::length::length;
@@ -848,11 +848,17 @@ pub fn evaluate_predicate(
                 (Equal, true) => neq,
                 (Distinct, false) => distinct,
                 (Distinct, true) => not_distinct,
+                (StartsWith, false) => starts_with,
+                (StartsWith, true) => not_starts_with,
                 (In, _) => return Ok(maybe_inverted(Cow::Owned(eval_in()?))?),
             };
 
             let left = evaluate_expression(left, batch, None)?;
             let right = evaluate_expression(right, batch, None)?;
+            if *op == StartsWith {
+                require_string_input(&left, "StartsWith")?;
+                require_string_input(&right, "StartsWith")?;
+            }
 
             // If the types differ (e.g. one side is a view type and the other is not),
             // normalize both to view types since benchamrking results show that casting from
@@ -930,16 +936,7 @@ fn evaluate_string_concat(exprs: &[Expression], batch: &RecordBatch) -> KernelRe
         .iter()
         .map(|expr| {
             let input = evaluate_expression(expr, batch, None)?;
-            require!(
-                matches!(
-                    input.data_type(),
-                    ArrowDataType::Utf8 | ArrowDataType::LargeUtf8 | ArrowDataType::Utf8View
-                ),
-                KernelError::invalid_expression(format!(
-                    "StringConcat requires a string input, got {}",
-                    input.data_type()
-                ))
-            );
+            require_string_input(&input, "StringConcat")?;
             let input = match input.len() {
                 len if len == num_rows => input,
                 1 => take(&input, &UInt32Array::from(vec![0; num_rows]), None)?,
@@ -1004,6 +1001,29 @@ fn cardinalities(input: &ArrayRef) -> KernelResult<ArrayRef> {
 }
 
 /// Evaluates [`UnaryPredicateOp::HasUriScheme`] over any string representation.
+/// `NOT STARTS_WITH`, keeping NULLs.
+fn not_starts_with(
+    string: &dyn Datum,
+    prefix: &dyn Datum,
+) -> KernelResult<BooleanArray, ArrowError> {
+    not(&starts_with(string, prefix)?)
+}
+
+/// Errors unless `input` is a string array of any representation, naming `op`.
+fn require_string_input(input: &ArrayRef, op: &str) -> KernelResult<()> {
+    require!(
+        matches!(
+            input.data_type(),
+            ArrowDataType::Utf8 | ArrowDataType::LargeUtf8 | ArrowDataType::Utf8View
+        ),
+        KernelError::invalid_expression(format!(
+            "{op} requires a string input, got {}",
+            input.data_type()
+        ))
+    );
+    Ok(())
+}
+
 /// Applies `f` to every non-NULL row of a string array of any representation, keeping NULLs.
 /// Other array types are an error naming `op`.
 fn map_string_rows<'a, T>(
@@ -2583,8 +2603,13 @@ mod tests {
     }
 
     #[rstest]
-    fn test_uri_predicates_reject_non_string_input(
-        #[values(|e| Pred::has_uri_scheme(e), |e| Pred::has_dot_segment(e))]
+    fn test_string_predicates_reject_non_string_input(
+        #[values(
+            |e| Pred::has_uri_scheme(e),
+            |e| Pred::has_dot_segment(e),
+            |e| Pred::starts_with(e, lit("a")),
+            |e| Pred::starts_with(lit("a"), e)
+        )]
         make_pred: MakePredicate,
     ) {
         let batch =
@@ -2595,6 +2620,39 @@ mod tests {
             matches!(err, KernelError::InvalidExpressionEvaluation(_)),
             "{err}"
         );
+    }
+
+    #[rstest]
+    #[case::literal_prefix(lit("/"), [Some(true), Some(false), Some(false), None, Some(true)])]
+    #[case::column_prefix(col!("p"), [Some(true), Some(false), Some(true), None, None])]
+    fn test_starts_with(
+        #[case] prefix: Expr,
+        #[case] expected: [Option<bool>; 5],
+        #[values(
+            |r| Arc::new(StringArray::from(r)) as ArrayRef,
+            |r| Arc::new(LargeStringArray::from(r)) as ArrayRef,
+            |r| Arc::new(StringViewArray::from(r)) as ArrayRef
+        )]
+        make_array: fn(Vec<Option<&'static str>>) -> ArrayRef,
+        #[values(false, true)] inverted: bool,
+    ) {
+        let strings = vec![
+            Some("/a/dv.bin"),
+            Some("a/dv.bin"),
+            Some(""),
+            None,
+            Some("/b"),
+        ];
+        let prefixes = StringArray::from(vec![Some("/"), Some("/"), Some(""), Some("/"), None]);
+        let batch = RecordBatch::try_from_iter([
+            ("s", make_array(strings)),
+            ("p", Arc::new(prefixes) as ArrayRef),
+        ])
+        .unwrap();
+        let result =
+            evaluate_predicate(&Pred::starts_with(col!("s"), prefix), &batch, inverted).unwrap();
+        let expected: BooleanArray = expected.iter().map(|m| m.map(|m| m != inverted)).collect();
+        assert_eq!(result, expected);
     }
 
     #[rstest]
