@@ -449,8 +449,8 @@ impl TrackingStatus {
         }
     }
 
-    /// The statuses of entries that contribute rows to reads, surfaced as `Add` actions. The rest
-    /// (`Deleted`, `Replaced`) do not.
+    /// The statuses of entries that contribute rows to reads, surfaced as `Add` actions. Other
+    /// statuses do not.
     pub(crate) const LIVE: [Self; 3] = [Self::Existing, Self::Added, Self::Modified];
 
     /// Whether this entry contributes rows to reads; see [`Self::LIVE`].

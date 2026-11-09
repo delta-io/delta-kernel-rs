@@ -10,7 +10,9 @@ use url::Url;
 
 use super::get_files_for_scan;
 use crate::arrow::array::StringArray;
-use crate::content_tree::test_utils::{added_data_entry, data_manifest_entry, write_manifest};
+use crate::content_tree::test_utils::{
+    added_data_entry, data_manifest_entry, mumbling_bitmap, write_manifest,
+};
 use crate::content_tree::{ContentTreeNodeEntry, TrackingInfo, TrackingStatus};
 use crate::engine::sync::SyncEngine;
 use crate::expressions::{Predicate as Pred, col, lit};
@@ -101,8 +103,10 @@ fn scan_reads_latest_tree_then_later_commits(#[case] version: Version, #[case] e
     );
 }
 
-#[test]
-fn scan_reads_leaf_manifests() {
+#[rstest]
+#[case::no_manifest_dv(None, &["l1.parquet", "l2.parquet", "r.parquet"])]
+#[case::manifest_dv(Some(&[0][..]), &["l2.parquet", "r.parquet"])]
+fn scan_reads_leaf_manifests(#[case] manifest_dv: Option<&[u32]>, #[case] expected: &[&str]) {
     let (engine, _) = setup_adaptive_metadata_table();
     let leaf_path = "metadata/leaf.parquet";
     let leaf = write_manifest(
@@ -120,12 +124,15 @@ fn scan_reads_leaf_manifests() {
         first_row_id: Some(10),
         ..leaf_entry.tracking
     };
+    if let Some(info) = leaf_entry.manifest_info.as_mut() {
+        info.dv = manifest_dv.map(mumbling_bitmap);
+    }
     let root = [added_data_entry("r.parquet", 1, 1, 0, 1), leaf_entry];
     let version = commit_root_manifest(&engine, &table_root(), "metadata/root.parquet", &root);
 
     assert_eq!(
         scan_paths(&engine, snapshot_at(&engine, version)),
-        strings(&["l1.parquet", "l2.parquet", "r.parquet"])
+        strings(expected)
     );
 }
 
