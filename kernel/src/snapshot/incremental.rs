@@ -16,7 +16,7 @@ use crate::metrics::{
 };
 use crate::path::ParsedLogPath;
 use crate::table_configuration::TableConfiguration;
-use crate::{Engine, KernelError, KernelResult, Version};
+use crate::{Engine, KernelError, KernelResult, Result, Version};
 
 /// The assembled outcome of the listing phase of an incremental update. Listing/assembly
 /// failures surface as `Err` from [`Snapshot::build_new_segment`], not a variant here.
@@ -116,7 +116,7 @@ impl Snapshot {
         incremental_replay: IncrementalReplay,
         checkpoint_handling: CheckpointHandling,
         built_as_latest: bool,
-    ) -> KernelResult<Arc<Self>> {
+    ) -> Result<Arc<Self>> {
         let requested_version = target_version.into();
         let mut current_segment = None;
         let result = Self::try_new_from_impl(
@@ -157,7 +157,7 @@ impl Snapshot {
         checkpoint_handling: CheckpointHandling,
         built_as_latest: bool,
         current_segment: &mut Option<LogSegment>,
-    ) -> KernelResult<Arc<Self>> {
+    ) -> Result<Arc<Self>> {
         let existing_snapshot_version = existing_snapshot.version();
         if let Some(requested_version) = requested_version {
             tracing::Span::current().record("version", requested_version);
@@ -178,7 +178,8 @@ impl Snapshot {
                 return Err(KernelError::Generic(format!(
                     "Requested snapshot version {requested_version} is older than snapshot \
                     hint version {existing_snapshot_version}"
-                )));
+                ))
+                .into());
             }
         } else {
             tracing::Span::current().record("version", existing_snapshot_version);
@@ -986,7 +987,7 @@ mod tests {
         );
         assert!(matches!(
             older_version,
-            Err(KernelError::Generic(msg)) if msg.contains("older than snapshot hint version")
+            Err(Error::Kernel(KernelError::Generic(msg))) if msg.contains("older than snapshot hint version")
         ));
 
         Ok(())

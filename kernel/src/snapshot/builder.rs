@@ -578,13 +578,14 @@ fn classify_table_root_error(table_root: &str, error: KernelError) -> Error {
 fn classify_log_segment_error(
     table_root: &str,
     target_version: Option<Version>,
-    error: KernelError,
+    error: Error,
 ) -> Error {
     match error {
-        KernelError::EmptyLog if target_version.is_none() => {
-            DeltaError::path_does_not_exist(table_root, Some(Box::new(error))).into()
+        Error::Kernel(KernelError::EmptyLog) if target_version.is_none() => {
+            DeltaError::path_does_not_exist(table_root, Some(Box::new(KernelError::EmptyLog)))
+                .into()
         }
-        error => error.into(),
+        error => error,
     }
 }
 

@@ -49,7 +49,7 @@ use crate::schema::{
 use crate::utils::require;
 use crate::{
     DeltaError, Engine, Error, FileMeta, KernelError, KernelResult, KernelResultIterator,
-    Predicate, PredicateRef, RowVisitor, StorageHandler, Version,
+    Predicate, PredicateRef, Result, RowVisitor, StorageHandler, Version,
 };
 
 mod crc_replay;
@@ -552,7 +552,7 @@ impl LogSegment {
         log_tail: Vec<ParsedLogPath>,
         time_travel_version: impl Into<Option<Version>>,
         metric_context: SnapshotLoadMetricContext,
-    ) -> KernelResult<Self> {
+    ) -> Result<Self> {
         let time_travel_version = time_travel_version.into();
         let start = std::time::Instant::now();
         let build = || {
@@ -590,7 +590,7 @@ impl LogSegment {
         log_tail: Vec<ParsedLogPath>,
         checkpoint_hint: Option<LastCheckpointHint>,
         time_travel_version: Option<Version>,
-    ) -> KernelResult<Self> {
+    ) -> Result<Self> {
         // The end_version is the time_travel_version, if present
         // TODO: When max catalog version is implemented, we would use that as end_version if
         // time_travel_version is not present
