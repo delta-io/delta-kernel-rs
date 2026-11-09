@@ -16,13 +16,13 @@ pub(super) fn eval_prefix_sum(
     input: &[RecordBatch],
 ) -> KernelResult<Vec<RecordBatch>> {
     let output_schema = Arc::new(ArrowSchema::try_from_kernel(&prefix_sum.schema)?);
-    let mut running_total = 0i64;
+    let mut running_total = prefix_sum.start;
     let mut output = Vec::with_capacity(input.len());
     for batch in input {
         let values = super::extract_long_column(batch, &prefix_sum.input)?;
         let path = prefix_sum.input.path();
 
-        // Compute a null buffer ny unioning across the entire path because a child may contain
+        // Compute a null buffer by unioning across the entire path because a child may contain
         // hidden values that should be masked by an ancestor's nulls.
         let mut nulls = values.nulls().cloned();
         for len in 1..path.len() {
@@ -63,13 +63,15 @@ mod tests {
         assert_eq!(formatted.trim(), expected.trim());
     }
 
-    /// Prefix-sums `numRecords` of the fixture schema into an appended `offset` column.
-    fn test_eval_prefix_sum(input: &[RecordBatch]) -> KernelResult<Vec<RecordBatch>> {
+    /// Prefix-sums `numRecords` of the fixture schema, starting at `start`, into an appended
+    /// `offset` column.
+    fn test_eval_prefix_sum(input: &[RecordBatch], start: i64) -> KernelResult<Vec<RecordBatch>> {
         let schema = schema_ref! {
             not_null "path": STRING,
             nullable "numRecords": LONG,
         };
-        let prefix_sum = PrefixSum::try_new(&schema, column_name!("numRecords"), "offset")?;
+        let prefix_sum =
+            PrefixSum::try_new(&schema, column_name!("numRecords"), "offset")?.with_start(start);
         eval_prefix_sum(&prefix_sum, input)
     }
 
@@ -81,6 +83,7 @@ mod tests {
 
     #[rstest::rstest]
     #[case::encounter_order(
+        0,
         vec![batch(&["a", "b", "c"], vec![Some(10), Some(5), Some(20)])],
         "\
 +------+------------+--------+
@@ -92,6 +95,7 @@ mod tests {
 +------+------------+--------+"
     )]
     #[case::nulls_and_zeros(
+        0,
         vec![batch(
             &["a", "b", "c", "d"],
             vec![Some(10), None, Some(0), Some(5)],
@@ -108,6 +112,7 @@ mod tests {
     )]
     // pretty_format_batches concatenates rows from every batch into one table.
     #[case::across_batches(
+        0,
         vec![
             batch(&["a"], vec![Some(10)]),
             batch(&["b", "c"], vec![Some(5), Some(20)]),
@@ -121,11 +126,39 @@ mod tests {
 | c    | 20         | 15     |
 +------+------------+--------+"
     )]
+    #[case::positive_start(
+        101,
+        vec![
+            batch(&["a", "b"], vec![Some(10), None]),
+            batch(&["c", "d"], vec![Some(0), Some(5)]),
+        ],
+        "\
++------+------------+--------+
+| path | numRecords | offset |
++------+------------+--------+
+| a    | 10         | 101    |
+| b    |            |        |
+| c    | 0          | 111    |
+| d    | 5          | 111    |
++------+------------+--------+"
+    )]
+    #[case::negative_start(
+        -3,
+        vec![batch(&["a", "b"], vec![Some(3), Some(4)])],
+        "\
++------+------------+--------+
+| path | numRecords | offset |
++------+------------+--------+
+| a    | 3          | -3     |
+| b    | 4          | 0      |
++------+------------+--------+"
+    )]
     fn exclusive_prefix_sum(
+        #[case] start: i64,
         #[case] input: Vec<RecordBatch>,
         #[case] expected: &str,
     ) -> KernelResult<()> {
-        assert_batches_eq(&test_eval_prefix_sum(&input)?, expected);
+        assert_batches_eq(&test_eval_prefix_sum(&input, start)?, expected);
         Ok(())
     }
 
@@ -215,14 +248,16 @@ mod tests {
 
     #[test]
     fn empty_input_yields_empty_output() -> KernelResult<()> {
-        assert!(test_eval_prefix_sum(&[])?.is_empty());
+        assert!(test_eval_prefix_sum(&[], 0)?.is_empty());
         Ok(())
     }
 
-    #[test]
-    fn overflow_is_an_error() {
-        let input = batch(&["a", "b"], vec![Some(i64::MAX), Some(1)]);
-        let err = test_eval_prefix_sum(&[input]).unwrap_err();
+    #[rstest::rstest]
+    #[case::from_zero(0, batch(&["a", "b"], vec![Some(i64::MAX), Some(1)]))]
+    #[case::from_start(1, batch(&["a"], vec![Some(i64::MAX)]))]
+    #[case::start_at_max(i64::MAX, batch(&["a"], vec![Some(1)]))]
+    fn overflow_is_an_error(#[case] start: i64, #[case] input: RecordBatch) {
+        let err = test_eval_prefix_sum(&[input], start).unwrap_err();
         assert!(err.to_string().contains("overflowed i64"), "{err}");
     }
 }

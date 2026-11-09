@@ -547,7 +547,21 @@ impl PlanBuilder {
         input: impl Into<ColumnName>,
         output: impl Into<String>,
     ) -> KernelResult<Self> {
-        let prefix_sum = PrefixSum::try_new(self.schema(), input, output)?;
+        self.prefix_sum_with_start(input, output, 0)
+    }
+
+    /// Like [`Self::prefix_sum`], with offsets starting at `start` instead of `0`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error under the same conditions as [`PrefixSum::try_new`].
+    pub fn prefix_sum_with_start(
+        self,
+        input: impl Into<ColumnName>,
+        output: impl Into<String>,
+        start: i64,
+    ) -> KernelResult<Self> {
+        let prefix_sum = PrefixSum::try_new(self.schema(), input, output)?.with_start(start);
         let schema = Arc::clone(&prefix_sum.schema);
         Ok(self.unary_op_or_absent(schema, prefix_sum))
     }
@@ -1233,9 +1247,19 @@ mod tests {
     }
 
     /// `prefix_sum` appends the exclusive-prefix column and records a unary PrefixSum node.
-    #[test]
-    fn prefix_sum_appends_output_column() -> KernelResult<()> {
-        let plan = vals(x_schema()).prefix_sum(column_name!("x"), "offset")?;
+    #[rstest::rstest]
+    #[case::default_start(None, 0)]
+    #[case::explicit_start(Some(7), 7)]
+    fn prefix_sum_appends_output_column(
+        #[case] start: Option<i64>,
+        #[case] expected_start: i64,
+    ) -> KernelResult<()> {
+        let plan = match start {
+            None => vals(x_schema()).prefix_sum(column_name!("x"), "offset")?,
+            Some(start) => {
+                vals(x_schema()).prefix_sum_with_start(column_name!("x"), "offset", start)?
+            }
+        };
         let schema = plan.schema();
         assert_eq!(
             schema
@@ -1250,6 +1274,7 @@ mod tests {
         };
         assert_eq!(node.input, column_name!("x"));
         assert_eq!(node.output, "offset");
+        assert_eq!(node.start, expected_start);
         Ok(())
     }
 
