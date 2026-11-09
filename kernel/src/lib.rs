@@ -119,6 +119,11 @@ pub mod table_features;
 pub mod table_properties;
 pub mod transaction;
 pub mod transforms;
+#[cfg(any(
+    feature = "adaptive-metadata-in-dev",
+    all(feature = "arrow-expression", feature = "default-engine-base")
+))]
+pub(crate) mod uri_reference;
 
 pub use crc::{FileSizeHistogram, FileStats};
 pub use log_path::LogPath;
