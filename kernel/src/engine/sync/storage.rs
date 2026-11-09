@@ -5,7 +5,7 @@ use derive_more::Constructor;
 use futures::StreamExt as _;
 use url::Url;
 
-use super::{put_bytes, resolve_scope};
+use super::{get_bytes, put_bytes, resolve_scope};
 use crate::object_store::path::Path;
 use crate::object_store::{DynObjectStore, ObjectStoreExt as _};
 use crate::{FileMeta, FileSlice, KernelError, KernelResult, KernelResultIterator, StorageHandler};
@@ -88,9 +88,13 @@ impl StorageHandler for SyncStorageHandler {
     }
 
     fn copy_atomic(&self, src: &Url, dest: &Url) -> KernelResult<()> {
-        let (store, _, path) = resolve_scope(self.store.as_ref(), src)?;
-        let bytes = futures::executor::block_on(async { store.get(&path).await?.bytes().await })?;
-        put_bytes(self.store.as_ref(), dest, bytes, false)
+        // Create-only put makes the destination appear atomically without overwriting it.
+        put_bytes(
+            self.store.as_ref(),
+            dest,
+            get_bytes(self.store.as_ref(), src)?,
+            false,
+        )
     }
 
     fn head(&self, url: &Url) -> KernelResult<FileMeta> {
@@ -133,6 +137,7 @@ mod tests {
 
     #[rstest]
     fn atomic_copy_preserves_existing_destination(#[values(false, true)] in_memory: bool) {
+        // GIVEN a destination copied from the original source, in memory or on disk.
         let dir = tempfile::tempdir().unwrap();
         let (storage, root) = if in_memory {
             (
@@ -154,10 +159,12 @@ mod tests {
         storage
             .put(&src, Bytes::from_static(b"replacement"), true)
             .unwrap();
-        assert!(matches!(
-            storage.copy_atomic(&src, &dest),
-            Err(KernelError::FileAlreadyExists(_))
-        ));
+
+        // WHEN replacement bytes are copied to the existing destination.
+        let result = storage.copy_atomic(&src, &dest);
+
+        // THEN the copy fails without changing either file.
+        assert!(matches!(result, Err(KernelError::FileAlreadyExists(_))));
         let read = |path| {
             storage
                 .read_files(vec![(path, None)])
@@ -168,13 +175,15 @@ mod tests {
         };
         assert_eq!(read(src), Bytes::from_static(b"replacement"));
         assert_eq!(read(dest), Bytes::from_static(b"original"));
-        assert!(matches!(
-            storage.copy_atomic(
-                &root.join("missing.json").unwrap(),
-                &root.join("new.json").unwrap()
-            ),
-            Err(KernelError::FileNotFound(_))
-        ));
+
+        // WHEN the source does not exist.
+        let result = storage.copy_atomic(
+            &root.join("missing.json").unwrap(),
+            &root.join("new.json").unwrap(),
+        );
+
+        // THEN the missing source is reported.
+        assert!(matches!(result, Err(KernelError::FileNotFound(_))));
     }
 
     /// generate json filenames that follow the spec (numbered padded to 20 chars)

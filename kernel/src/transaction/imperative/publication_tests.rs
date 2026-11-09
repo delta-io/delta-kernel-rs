@@ -295,6 +295,7 @@ async fn filesystem_commit_publishes_downgrade(
     #[values(false, true)] checkpointed: bool,
     #[values(false, true)] already_published: bool,
 ) -> KernelResult<(), Box<dyn std::error::Error>> {
+    // GIVEN a ratified downgrade at version 2, with its prefix published and staged paths retained.
     let store = Arc::new(InMemory::new());
     let engine = Arc::new(SyncEngine::new_with_store(store.clone()));
     let snapshot = read_snapshot(
@@ -323,9 +324,13 @@ async fn filesystem_commit_publishes_downgrade(
     }
     let original_watermark = snapshot.log_segment().listed.max_published_version;
     let (write_engine, storage) = observed_engine(engine.clone(), Fault::None);
+
+    // WHEN a filesystem writer attempts version 3 from the selected snapshot source.
     let result = transaction(snapshot.clone(), &write_engine, storage.events.clone())?
         .commit(&write_engine)?
         .unwrap_post_commit_snapshot();
+
+    // THEN only an unpublished downgrade is copied, and version 3 is readable from the filesystem.
     assert_eq!(result.version(), 3);
     assert!(!result.table_configuration().is_catalog_managed());
     let events = storage.events.lock().unwrap();
@@ -363,6 +368,7 @@ async fn publication_failure_or_race(
     #[case] fault: Fault,
     #[case] succeeds: bool,
 ) -> KernelResult<(), Box<dyn std::error::Error>> {
+    // GIVEN an unpublished downgrade and an injected publication failure or competing publisher.
     let store = Arc::new(InMemory::new());
     let engine = Arc::new(SyncEngine::new_with_store(store.clone()));
     let snapshot = read_snapshot(
@@ -374,9 +380,22 @@ async fn publication_failure_or_race(
         true,
     )
     .await?;
+    let staged_source = snapshot
+        .log_segment()
+        .listed
+        .staged_commits()
+        .last()
+        .unwrap()
+        .location
+        .location
+        .to_string();
     let (write_engine, storage) = observed_engine(engine.clone(), fault);
     let txn = transaction(snapshot.clone(), &write_engine, storage.events.clone())?;
+
+    // WHEN the successor attempts to publish the downgrade before committing.
     let result = txn.commit(&write_engine);
+
+    // THEN only successful concurrent publication permits the successor commit.
     assert_eq!(
         storage.events.lock().unwrap().contains(&Event::Commit),
         succeeds
@@ -390,7 +409,9 @@ async fn publication_failure_or_race(
             Err(KernelError::FileNotFound(_))
         ));
         let retry = if fault == Fault::CopyMissing {
-            assert!(matches!(result, Err(KernelError::FileNotFound(_))));
+            assert!(
+                matches!(result, Err(KernelError::FileNotFound(path)) if path == staged_source)
+            );
             transaction(snapshot, &write_engine, storage.events.clone())?
         } else {
             let CommitResult::Retryable(retryable) = result? else {
@@ -398,7 +419,11 @@ async fn publication_failure_or_race(
             };
             retryable.transaction
         };
+
+        // WHEN the injected failure is removed and the transaction is retried.
         *storage.fault.lock().unwrap() = Fault::None;
+
+        // THEN publication completes and the successor can commit.
         retry.commit(&write_engine)?.unwrap_committed();
     }
     Ok(())
@@ -413,13 +438,18 @@ async fn publication_failure_or_race(
 async fn catalog_write_does_not_publish(
     #[case] source: Source,
 ) -> KernelResult<(), Box<dyn std::error::Error>> {
+    // GIVEN a CM snapshot with staged commits and a storage handler that rejects publication HEADs.
     let store = Arc::new(InMemory::new());
     let engine = Arc::new(SyncEngine::new_with_store(store.clone()));
     let snapshot =
         read_snapshot(engine.as_ref(), store.as_ref(), source, false, false, true).await?;
     let (write_engine, storage) = observed_engine(engine, Fault::HeadIo);
+
+    // WHEN the next write uses the catalog committer.
     let result =
         transaction(snapshot, &write_engine, storage.events.clone())?.commit(&write_engine)?;
+
+    // THEN it reaches the committer without synchronous publication, returning its test conflict.
     assert!(matches!(result, CommitResult::Conflicted(_)));
     assert_eq!(*storage.events.lock().unwrap(), vec![Event::Commit]);
     Ok(())
@@ -432,6 +462,8 @@ async fn catalog_write_does_not_publish(
 async fn published_successor_covers_historical_staged_paths(
     #[case] use_hint: bool,
 ) -> KernelResult<(), Box<dyn std::error::Error>> {
+    // GIVEN an incremental snapshot containing a published FS successor and historical staged
+    // paths.
     let store = Arc::new(InMemory::new());
     let engine = Arc::new(SyncEngine::new_with_store(store.clone()));
     let snapshot = read_snapshot(
@@ -469,11 +501,15 @@ async fn published_successor_covers_historical_staged_paths(
         engine.storage_handler().delete(commit.location())?;
     }
     let (write_engine, storage) = observed_engine(engine, Fault::HeadIo);
+
+    // WHEN another filesystem write starts after the staged sources have been cleaned up.
     snapshot
         .update_table(UpdateTableOperation::Write, "test-engine", true)
         .build(&write_engine, Box::new(FileSystemCommitter::new()))?
         .commit(&write_engine)?
         .unwrap_committed();
+
+    // THEN the published successor proves the prefix was published, without publication I/O.
     assert!(storage.events.lock().unwrap().is_empty());
     Ok(())
 }
@@ -481,6 +517,7 @@ async fn published_successor_covers_historical_staged_paths(
 #[tokio::test(flavor = "multi_thread")]
 async fn checkpoint_only_history_does_not_publish() -> KernelResult<(), Box<dyn std::error::Error>>
 {
+    // GIVEN an FS snapshot reconstructed from a checkpoint after its JSON commit was removed.
     let store = Arc::new(InMemory::new());
     let engine = Arc::new(SyncEngine::new_with_store(store.clone()));
     let snapshot = super::super::create_table::create_table(
@@ -498,11 +535,15 @@ async fn checkpoint_only_history_does_not_publish() -> KernelResult<(), Box<dyn 
     )?)?;
     let snapshot = Snapshot::builder_for("memory:///").build(engine.as_ref())?;
     let (write_engine, storage) = observed_engine(engine, Fault::HeadIo);
+
+    // WHEN a filesystem writer commits the next version.
     snapshot
         .update_table(UpdateTableOperation::Write, "test-engine", true)
         .build(&write_engine, Box::new(FileSystemCommitter::new()))?
         .commit(&write_engine)?
         .unwrap_committed();
+
+    // THEN checkpoint-only history requires no staged-commit publication I/O.
     assert!(storage.events.lock().unwrap().is_empty());
     Ok(())
 }
@@ -510,6 +551,7 @@ async fn checkpoint_only_history_does_not_publish() -> KernelResult<(), Box<dyn 
 #[tokio::test(flavor = "multi_thread")]
 async fn published_downgrade_with_crc_survives_staged_source_cleanup()
 -> KernelResult<(), Box<dyn std::error::Error>> {
+    // GIVEN a cached downgrade with a CRC, now published with all retained staged sources deleted.
     let store = Arc::new(InMemory::new());
     let engine = Arc::new(SyncEngine::new_with_store(store.clone()));
     let snapshot = read_snapshot(
@@ -536,9 +578,13 @@ async fn published_downgrade_with_crc_survives_staged_source_cleanup()
         engine.storage_handler().delete(commit.location())?;
     }
     let (write_engine, storage) = observed_engine(engine, Fault::CopyIo);
+
+    // WHEN a filesystem write uses the cached snapshot.
     transaction(snapshot, &write_engine, storage.events.clone())?
         .commit(&write_engine)?
         .unwrap_committed();
+
+    // THEN observing the published downgrade avoids copying deleted sources.
     assert!(
         !storage
             .events
@@ -557,6 +603,8 @@ async fn published_downgrade_with_crc_survives_staged_source_cleanup()
 async fn unpublished_downgrade_survives_published_prefix_cleanup(
     #[case] use_hint: bool,
 ) -> KernelResult<(), Box<dyn std::error::Error>> {
+    // GIVEN an unpublished downgrade at 3 and a published, checkpointed prefix with cleaned-up
+    // files.
     let store = Arc::new(InMemory::new());
     let engine = Arc::new(SyncEngine::new_with_store(store.clone()));
     let base = read_snapshot(
@@ -611,9 +659,13 @@ async fn unpublished_downgrade_survives_published_prefix_cleanup(
         .delete(retained[0].published_location())?;
     assert_eq!(snapshot.log_segment().listed.staged_commits().count(), 3);
     let (write_engine, storage) = observed_engine(engine, Fault::None);
+
+    // WHEN a filesystem writer attempts version 4 from the cached snapshot or its hint.
     let result = transaction(snapshot, &write_engine, storage.events.clone())?
         .commit(&write_engine)?
         .unwrap_post_commit_snapshot();
+
+    // THEN the search stops at published version 2 and only copies downgrade 3 before committing.
     assert_eq!(result.version(), 4);
     assert_eq!(
         *storage.events.lock().unwrap(),
@@ -636,6 +688,7 @@ async fn unpublished_downgrade_survives_published_prefix_cleanup(
 async fn multiple_pending_commits_publish_in_order_and_retry_partial_progress(
     #[case] fault: Fault,
 ) -> KernelResult<(), Box<dyn std::error::Error>> {
+    // GIVEN a ratified tail whose downgrade was staged without publishing its predecessor.
     let store = Arc::new(InMemory::new());
     let engine = Arc::new(SyncEngine::new_with_store(store.clone()));
     let snapshot = read_snapshot(
@@ -650,8 +703,12 @@ async fn multiple_pending_commits_publish_in_order_and_retry_partial_progress(
     let pending = snapshot.log_segment().get_unpublished_catalog_commits()?;
     assert_eq!(pending.len(), 2);
     let (write_engine, storage) = observed_engine(engine.clone(), fault);
+
+    // WHEN a filesystem writer attempts recovery, possibly failing during publication.
     let result =
         transaction(snapshot, &write_engine, storage.events.clone())?.commit(&write_engine)?;
+
+    // THEN publication proceeds in order, and any failure prevents the successor commit.
     if fault == Fault::None {
         result.unwrap_committed();
     } else {
@@ -681,12 +738,18 @@ async fn multiple_pending_commits_publish_in_order_and_retry_partial_progress(
         if fault == Fault::PrefixCopyIo {
             assert!(!storage.events.lock().unwrap().contains(&Event::Copy(2)));
         }
+
+        // WHEN the same transaction retries after the publication failure clears.
         *storage.fault.lock().unwrap() = Fault::None;
+
+        // THEN recovery preserves completed publication and commits the successor.
         retryable
             .transaction
             .commit(&write_engine)?
             .unwrap_committed();
     }
+
+    // THEN both published files match their ratified sources and the successor is readable.
     for commit in pending {
         let bytes = engine
             .storage_handler()

@@ -216,7 +216,8 @@ impl<STATE> Transaction<STATE, Imperative> {
 // Imperative action processing
 // =============================================================================
 impl<STATE> Transaction<STATE, Imperative> {
-    /// Submits actions and returns the committer's response with its elapsed time.
+    /// Publishes required staged commits before a path-based write, then submits the actions.
+    /// The returned elapsed time includes publication and the committer call.
     fn perform_commit(
         &self,
         engine: &dyn Engine,
@@ -231,6 +232,7 @@ impl<STATE> Transaction<STATE, Imperative> {
     }
 
     fn publish_before_path_based_write(&self, engine: &dyn Engine) -> KernelResult<()> {
+        // Only filesystem successors must wait for publication of a ratified downgrade.
         if Self::determine_commit_type(self.is_create_table(), &self.effective_table_config)
             != CommitType::PathBasedWrite
         {
@@ -262,9 +264,13 @@ impl<STATE> Transaction<STATE, Imperative> {
             let commit = CatalogCommit::try_new(&segment.log_root, commit)?;
             match storage.copy_atomic(commit.location(), commit.published_location()) {
                 Ok(()) | Err(KernelError::FileAlreadyExists(_)) => (),
-                Err(KernelError::FileNotFound(_)) => {
+                Err(source_error @ KernelError::FileNotFound(_)) => {
                     // Another publisher may have finished before the staged source was removed.
-                    storage.head(commit.published_location())?;
+                    match storage.head(commit.published_location()) {
+                        Ok(_) => (),
+                        Err(KernelError::FileNotFound(_)) => return Err(source_error),
+                        Err(error) => return Err(error),
+                    }
                 }
                 Err(error) => return Err(error),
             }
