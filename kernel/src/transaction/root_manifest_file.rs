@@ -386,12 +386,18 @@ mod tests {
         let (engine, table_root) = setup_table()?;
         let txn = |version| parse_json_batch(vec![txn_line("app", version).as_str()].into());
         let checkpoint = minimal_checkpoint_action("metadata/root-v2.parquet", 2)?;
-        let write_classic_checkpoint = |version: Version| -> Result<()> {
-            let snapshot = Snapshot::builder_for(table_root.clone())
-                .at_version(version)
-                .build(&engine)?;
-            // One row holding both actions, since the parquet writer rejects the unmasked nulls
-            // JSON parsing leaves in the non-nullable children of an absent action.
+        write_commit(&engine, &table_root, 1, txn(1))?;
+        if classic_version == 1 {
+            Snapshot::builder_for(table_root.clone())
+                .build(&engine)?
+                .checkpoint(&engine, None)?;
+        }
+        write_manifest_commit(&engine, &table_root, 2, checkpoint.clone())?;
+        write_commit_after_manifest_commit(&engine, &table_root, 3, 2, txn(3))?;
+        if classic_version == 3 {
+            // Hand-written since kernel can't checkpoint AMT tables yet (#3683). P&M are in one row
+            // because with a row per action, the parquet write fails on null non-nullable fields.
+            let snapshot = Snapshot::builder_for(table_root.clone()).build(&engine)?;
             let row = json!({
                 "protocol": snapshot.table_configuration().protocol(),
                 "metaData": snapshot.table_configuration().metadata(),
@@ -401,21 +407,11 @@ mod tests {
                 get_commit_schema().project(&[PROTOCOL_NAME, METADATA_NAME])?,
             )?;
             let location = table_root
-                .join(&format!("_delta_log/{version:020}.checkpoint.parquet"))
+                .join("_delta_log/00000000000000000003.checkpoint.parquet")
                 .map_err(KernelError::from)?;
             engine
                 .parquet_handler()
                 .write_parquet_file(location, Box::new(std::iter::once(Ok(data))))?;
-            Ok(())
-        };
-        write_commit(&engine, &table_root, 1, txn(1))?;
-        if classic_version == 1 {
-            write_classic_checkpoint(1)?;
-        }
-        write_manifest_commit(&engine, &table_root, 2, checkpoint.clone())?;
-        write_commit_after_manifest_commit(&engine, &table_root, 3, 2, txn(3))?;
-        if classic_version == 3 {
-            write_classic_checkpoint(3)?;
         }
         write_commit_after_manifest_commit(&engine, &table_root, 4, 2, txn(4))?;
 
