@@ -11,7 +11,7 @@ use crate::expressions::ArrayData;
 use crate::log_replay::HasSelectionVector;
 use crate::schema::{ColumnName, DataType, SchemaRef};
 use crate::utils::require;
-use crate::{AsAny, KernelError, KernelResult};
+use crate::{AsAny, KernelError, KernelResult, PredicateEvaluator};
 
 /// Engine data paired with a selection vector indicating which rows are logically selected.
 ///
@@ -623,16 +623,17 @@ pub trait EngineData: AsAny {
 /// Evaluates a predicate on the batch, extracts the resulting selection vector, and applies
 /// it to filter out rows that don't satisfy the predicate.
 pub(crate) fn filter_by_predicate(
-    filter: &dyn crate::PredicateEvaluator,
+    filter: &dyn PredicateEvaluator,
     batch: Box<dyn EngineData>,
 ) -> KernelResult<Box<dyn EngineData>> {
     let selection_vector = evaluate_selection_vector(filter, batch.as_ref())?;
     batch.apply_selection_vector(selection_vector)
 }
 
-/// Evaluates a predicate that never yields NULL on the batch, returning one flag per row.
+/// Evaluates `filter` on `batch`, returning one flag per row. Errors if the predicate yields NULL
+/// for any row.
 pub(crate) fn evaluate_selection_vector(
-    filter: &dyn crate::PredicateEvaluator,
+    filter: &dyn PredicateEvaluator,
     batch: &dyn EngineData,
 ) -> KernelResult<Vec<bool>> {
     let predicate_result = filter.evaluate(batch)?;
