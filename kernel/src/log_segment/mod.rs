@@ -27,7 +27,7 @@ use crate::checkpoint::collation_stats::{
 use crate::committer::CatalogCommit;
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::content_tree::read_checkpoint_action;
-use crate::expressions::ColumnName;
+use crate::expressions::{ColumnName, UnaryExpressionOp};
 use crate::last_checkpoint_hint::{HintAction, LastCheckpointHint};
 use crate::log_replay::ActionsBatch;
 #[internal_api]
@@ -116,7 +116,7 @@ impl CheckpointReadInfo {
 }
 
 /// Options for reading the checkpoint part of a log segment.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 #[internal_api]
 pub(crate) struct CheckpointReadOptions<'a> {
     /// Conservative predicate readers may use to skip checkpoint data. It is not the query's final
@@ -128,6 +128,23 @@ pub(crate) struct CheckpointReadOptions<'a> {
     /// Partition schema the caller can consume. When the checkpoint has compatible
     /// `partitionValues_parsed`, batches carry it so callers need not parse partition strings.
     pub partition_schema: Option<&'a StructType>,
+    /// Operator that encodes the table's file stats as JSON when a checkpoint's `add.stats` must
+    /// be rebuilt from its parsed stats. Callers that read `add.stats` pass the table
+    /// configuration's `stats_json_op`.
+    pub stats_json_op: UnaryExpressionOp,
+}
+
+impl Default for CheckpointReadOptions<'_> {
+    fn default() -> Self {
+        Self {
+            meta_predicate: None,
+            stats_schema: None,
+            partition_schema: None,
+            // Only adaptiveMetadata tables need full precision, and readers that don't project
+            // `add.stats` never encode stats.
+            stats_json_op: UnaryExpressionOp::TO_JSON,
+        }
+    }
 }
 
 /// Result of reading actions from a log segment, containing both the actions iterator
@@ -1147,7 +1164,8 @@ impl LogSegment {
 
     /// Same as [`Self::read_actions_with_projected_checkpoint_actions`], but uses the same schema
     /// for reading checkpoints and commits. IS NOT NULL predicates are automatically derived from
-    /// the schema, so callers do not need to supply them.
+    /// the schema, so callers do not need to supply them. Checkpoint `add.stats` rebuilt from
+    /// parsed stats uses [`UnaryExpressionOp::ToJson`].
     #[internal_api]
     pub(crate) fn read_actions(
         &self,
@@ -1471,6 +1489,7 @@ impl LogSegment {
             meta_predicate,
             stats_schema,
             partition_schema,
+            stats_json_op,
         } = options;
         let need_file_actions = schema_contains_file_actions(&action_schema);
 
@@ -1519,6 +1538,7 @@ impl LogSegment {
                 .as_deref()
                 .and_then(source_collation_stats)
                 .filter(|_| action_schema.contains_col(["add", "stats"])),
+            stats_json_op,
         )?;
         let read_schema = read_transform
             .as_ref()

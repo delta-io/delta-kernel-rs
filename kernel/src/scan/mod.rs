@@ -1057,6 +1057,7 @@ impl Scan {
             meta_predicate,
             stats_schema: physical_stats_read_schema,
             partition_schema: None,
+            stats_json_op: self.snapshot.table_configuration().stats_json_op(),
         };
         (checkpoint_schema, options)
     }
