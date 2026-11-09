@@ -135,13 +135,14 @@ fn binary_expr_to_df_expr(
     Ok(binary_expr(left, op, right))
 }
 
-/// Lowers a unary expression. Only `Cardinality` has a DataFusion equivalent.
+/// Lowers `Cardinality` to `CAST(array_length(..) AS INT)`; other unary ops are unsupported.
 fn unary_to_df_expr(unary: &UnaryExpression, input_schema: &StructType) -> KernelResult<DFExpr> {
     match unary.op {
         UnaryExpressionOp::Cardinality => {
             let array = to_df_expr(&unary.expr, input_schema, None)?;
             // `array_length` counts top-level elements as UInt64; `cardinality` would also count
-            // the elements of nested arrays.
+            // the elements of nested arrays. `cast` (not `try_cast`) errors on overflow, as the
+            // kernel evaluator does.
             Ok(cast(array_length(array), ArrowDataType::Int32))
         }
         op => Err(KernelError::unsupported(format!(
@@ -649,12 +650,13 @@ mod tests {
         TimestampMicrosecondArray,
     };
     use datafusion::arrow::buffer::{NullBuffer, OffsetBuffer};
+    use datafusion::arrow::compute::cast as cast_array;
     use datafusion::arrow::datatypes::{Field as ArrowField, Int32Type};
     use datafusion::assert_batches_eq;
     use datafusion::common::DFSchema;
     use datafusion::logical_expr::physical_planning_context::PhysicalPlanningContext;
-    use datafusion::physical_expr::create_physical_expr;
     use datafusion::physical_expr::execution_props::ExecutionProps;
+    use datafusion::physical_expr::{PhysicalExpr, create_physical_expr};
     use delta_kernel::expressions::{
         ColumnName as KernelColumnName, Expression as KernelExpr, ExpressionStructPatch,
         ExpressionStructPatchBuilder, MapToStructOptions, UnaryExpressionOp, col, expr, lit,
@@ -873,51 +875,77 @@ mod tests {
         to_df_expr(&kernel, &test_schema(), None).unwrap_err();
     }
 
-    /// `CARDINALITY` counts top-level elements, NULLs included, and keeps a NULL array NULL.
-    #[test]
-    fn cardinality_counts_top_level_elements() {
-        let input_schema = schema! { nullable "l": [ nullable [ nullable LONG ] ] };
-        let kernel = KernelExpr::unary(UnaryExpressionOp::Cardinality, col!("l"));
-        let logical = to_df_expr(&kernel, &input_schema, None).unwrap();
-
-        let arrow_schema: ArrowSchema = (&input_schema).try_into_arrow().unwrap();
-        let ArrowDataType::List(outer_field) = arrow_schema.field(0).data_type().clone() else {
-            panic!("expected a list column");
-        };
-        let ArrowDataType::List(inner_field) = outer_field.data_type().clone() else {
-            panic!("expected a nested list column");
-        };
-        // Inner rows: [1, 2], NULL, []
-        let inner = ListArray::try_new(
-            inner_field,
-            OffsetBuffer::from_lengths([2, 0, 0]),
-            Arc::new(Int64Array::from(vec![1, 2])),
-            Some(NullBuffer::from(vec![true, false, true])),
-        )
-        .unwrap();
-        // Outer rows: [[1, 2], NULL, []], [], NULL
-        let lists = ListArray::try_new(
-            outer_field,
-            OffsetBuffer::from_lengths([3, 0, 0]),
-            Arc::new(inner),
-            Some(NullBuffer::from(vec![true, true, false])),
-        )
-        .unwrap();
-        let batch =
-            RecordBatch::try_new(Arc::new(arrow_schema.clone()), vec![Arc::new(lists)]).unwrap();
-
-        let physical = create_physical_expr(
-            &logical,
-            &DFSchema::try_from(arrow_schema).unwrap(),
+    /// Plans `logical` against `schema` for evaluation over a batch with that schema.
+    fn physical_expr(logical: &DFExpr, schema: ArrowSchema) -> Arc<dyn PhysicalExpr> {
+        create_physical_expr(
+            logical,
+            &DFSchema::try_from(schema).unwrap(),
             &ExecutionProps::new(),
             &PhysicalPlanningContext::default(),
         )
+        .unwrap()
+    }
+
+    /// Rows: `[[1, 2], NULL, []]`, `[]`, NULL, `[[3]]`.
+    fn nested_lists() -> ListArray {
+        let element = Arc::new(ArrowField::new_list_field(ArrowDataType::Int64, true));
+        let inner = ListArray::try_new(
+            element.clone(),
+            OffsetBuffer::from_lengths([2, 0, 0, 1]),
+            Arc::new(Int64Array::from(vec![1, 2, 3])),
+            Some(NullBuffer::from(vec![true, false, true, true])),
+        )
         .unwrap();
-        let result = physical.evaluate(&batch).unwrap().into_array(3).unwrap();
-        assert_eq!(
-            result.as_primitive::<Int32Type>(),
-            &Int32Array::from(vec![Some(3), Some(0), None])
-        );
+        let inner_field = Arc::new(ArrowField::new_list_field(
+            ArrowDataType::List(element),
+            true,
+        ));
+        ListArray::try_new(
+            inner_field,
+            OffsetBuffer::from_lengths([3, 0, 0, 1]),
+            Arc::new(inner),
+            Some(NullBuffer::from(vec![true, true, false, true])),
+        )
+        .unwrap()
+    }
+
+    /// DataFusion's `CARDINALITY` lowering agrees with the kernel evaluator, counting only
+    /// top-level elements.
+    #[rstest]
+    fn cardinality_matches_kernel_evaluator(
+        #[values(false, true)] large: bool,
+        #[values(false, true)] sliced: bool,
+    ) {
+        let input_schema = schema! { nullable "l": [ nullable [ nullable LONG ] ] };
+        let lists = nested_lists();
+        let lists: ArrayRef = if large {
+            let ArrowDataType::List(element) = lists.data_type().clone() else {
+                panic!("expected a list column");
+            };
+            cast_array(&lists, &ArrowDataType::LargeList(element)).unwrap()
+        } else {
+            Arc::new(lists)
+        };
+        let (lists, expected) = if sliced {
+            (lists.slice(1, 3), vec![Some(0), None, Some(1)])
+        } else {
+            (lists, vec![Some(3), Some(0), None, Some(1)])
+        };
+        let batch = RecordBatch::try_from_iter([("l", lists)]).unwrap();
+        let kernel = KernelExpr::unary(UnaryExpressionOp::Cardinality, col!("l"));
+
+        let logical = to_df_expr(&kernel, &input_schema, None).unwrap();
+        let physical = physical_expr(&logical, batch.schema().as_ref().clone());
+        let actual = physical
+            .evaluate(&batch)
+            .unwrap()
+            .into_array(batch.num_rows())
+            .unwrap();
+        let from_kernel = kernel_expression::evaluate_expression(&kernel, &batch, None).unwrap();
+
+        let expected = Int32Array::from(expected);
+        assert_eq!(actual.as_primitive::<Int32Type>(), &expected);
+        assert_eq!(from_kernel.as_primitive::<Int32Type>(), &expected);
     }
 
     #[test]
@@ -1294,14 +1322,7 @@ mod tests {
             Some(&DataType::from(target)),
         )
         .unwrap();
-        let df_schema = DFSchema::try_from(arrow_schema).unwrap();
-        let physical = create_physical_expr(
-            &logical,
-            &df_schema,
-            &ExecutionProps::new(),
-            &PhysicalPlanningContext::default(),
-        )
-        .unwrap();
+        let physical = physical_expr(&logical, arrow_schema);
         let result = physical.evaluate(&batch).unwrap().into_array(2).unwrap();
         let result = result.as_struct();
         let ids = result
@@ -1354,14 +1375,7 @@ mod tests {
             Some(&DataType::from(schema! { nullable "ts": TIMESTAMP })),
         )
         .unwrap();
-        let df_schema = DFSchema::try_from(arrow_schema).unwrap();
-        let physical = create_physical_expr(
-            &logical,
-            &df_schema,
-            &ExecutionProps::new(),
-            &PhysicalPlanningContext::default(),
-        )
-        .unwrap();
+        let physical = physical_expr(&logical, arrow_schema);
 
         let error = physical.evaluate(&batch).unwrap_err().to_string();
         assert!(error.contains("Invalid timestamp timezone: Not/AZone"));
@@ -1400,14 +1414,7 @@ mod tests {
         )
         .unwrap();
 
-        let df_schema = DFSchema::try_from(arrow_schema).unwrap();
-        let physical = create_physical_expr(
-            &logical,
-            &df_schema,
-            &ExecutionProps::new(),
-            &PhysicalPlanningContext::default(),
-        )
-        .unwrap();
+        let physical = physical_expr(&logical, arrow_schema);
         physical
             .evaluate(&batch)
             .unwrap()

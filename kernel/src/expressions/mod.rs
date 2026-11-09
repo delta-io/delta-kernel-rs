@@ -178,12 +178,14 @@ pub enum UnaryExpressionOp {
     /// URI_ENCODE_PATH('data/a%20b.parquet')       -- 'data/a%2520b.parquet'
     /// ```
     UriEncodePath,
-    /// SQL `cardinality`: the number of elements in an ARRAY, as INTEGER. NULL elements count, a
-    /// NULL array yields NULL, and other input types are an error.
+    /// The number of top-level elements in an ARRAY, as INTEGER. A nested array counts as one
+    /// element, NULL elements count, a NULL array yields NULL, and other input types are an error.
+    /// This matches Spark's `cardinality`; some engines' `cardinality` also counts nested elements.
     ///
     /// ```text
-    /// CARDINALITY(ARRAY(1, NULL, 3))  -- 3
-    /// CARDINALITY(ARRAY())            -- 0
+    /// CARDINALITY(ARRAY(1, NULL, 3))            -- 3
+    /// CARDINALITY(ARRAY(ARRAY(1, 2), ARRAY(3)))  -- 2
+    /// CARDINALITY(ARRAY())                      -- 0
     /// ```
     Cardinality,
 }
