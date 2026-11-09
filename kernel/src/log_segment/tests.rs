@@ -6367,3 +6367,76 @@ async fn snapshot_checkpoint_gap_preserves_replay_context(#[case] target: Option
         Err(KernelError::MissingVersion(_)) | Err(KernelError::StartVersionNotFound { .. }),
     ));
 }
+
+#[rstest]
+#[case::commits_only(None, &[0, 1], 2)]
+#[case::checkpoint_only(Some(4), &[], 5)]
+#[case::checkpoint_and_covered_commits(Some(4), &[0, 2, 4], 5)]
+#[case::checkpoint_and_replay_commits(Some(4), &[5, 6], 7)]
+fn snapshot_missing_endpoint_preserves_kernel_error(
+    #[case] checkpoint: Option<Version>,
+    #[case] versions: &[Version],
+    #[case] missing: Version,
+) {
+    let root = Url::parse("file:///_delta_log/").unwrap();
+    let files = LogSegmentFiles {
+        checkpoint_parts: checkpoint
+            .map(|version| create_log_path(&format!("{root}{version:020}.checkpoint.parquet")))
+            .into_iter()
+            .collect(),
+        ascending_commit_files: versions
+            .iter()
+            .map(|version| create_log_path(&format!("{root}{version:020}.json")))
+            .collect(),
+        ..Default::default()
+    };
+    let error = LogSegment::try_new_for_snapshot(files, root, Some(missing + 1), None).unwrap_err();
+    let Error::Kernel(error) = error else {
+        panic!("expected Kernel error")
+    };
+    assert!(matches!(error.without_backtrace(), KernelError::MissingVersion(v) if *v == missing));
+}
+
+#[rstest]
+#[case::from_origin(None, vec![0, 2, 3], "0,2,3", 1)]
+#[case::after_checkpoint(Some(4), vec![5, 7, 9], "5,7,9", 6)]
+#[tokio::test]
+async fn snapshot_commit_gap_reports_full_replay_sequence(
+    #[case] checkpoint: Option<Version>,
+    #[case] versions: Vec<Version>,
+    #[case] expected_versions: &str,
+    #[case] missing: Version,
+) {
+    let mut files: Vec<_> = versions
+        .iter()
+        .map(|v| delta_path_for_version(*v, "json"))
+        .collect();
+    if let Some(checkpoint) = checkpoint {
+        files.push(delta_path_for_version(checkpoint, "checkpoint.parquet"));
+    }
+    let (storage, root) = build_log_with_paths_and_checkpoint(&files, None).await;
+    let error =
+        LogSegment::for_snapshot_impl(storage.as_ref(), root, vec![], None, None).unwrap_err();
+    let Error::Delta(error) = error else {
+        panic!("expected Delta gap")
+    };
+    assert_eq!(error.name(), "DELTA_VERSIONS_NOT_CONTIGUOUS");
+    assert_eq!(error.sql_state(), Some("KD00C"));
+    assert_eq!(error.parameters()[0].value(), expected_versions);
+    assert_eq!(
+        error.parameters()[1].value(),
+        versions.first().unwrap().to_string()
+    );
+    assert_eq!(
+        error.parameters()[2].value(),
+        versions.last().unwrap().to_string()
+    );
+    assert_eq!(
+        error.parameters()[3].value(),
+        versions.last().unwrap().to_string()
+    );
+    assert!(matches!(
+        std::error::Error::source(&error).and_then(|source| source.downcast_ref::<KernelError>()),
+        Some(KernelError::MissingVersion(version)) if *version == missing,
+    ));
+}

@@ -407,8 +407,12 @@ impl Snapshot {
         // hint. If the new segment has a checkpoint, we will return it as is. Otherwise, we
         // will preserve last_checkpoint_metadata when merging the new log segment with the
         // old one.
-        let mut new_log_segment =
-            LogSegment::try_new(new_listed_files, log_root.clone(), requested_version, None)?;
+        let mut new_log_segment = LogSegment::try_new_for_snapshot(
+            new_listed_files,
+            log_root.clone(),
+            requested_version,
+            None,
+        )?;
 
         let new_end_version = new_log_segment.end_version;
         if new_end_version < existing_snapshot_version {
@@ -512,7 +516,7 @@ impl Snapshot {
                 existing_log_segment.last_checkpoint_metadata.clone(),
             )
         };
-        let combined_log_segment = LogSegment::try_new(
+        let combined_log_segment = LogSegment::try_new_for_snapshot(
             LogSegmentFiles {
                 ascending_commit_files,
                 ascending_compaction_files,

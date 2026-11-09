@@ -491,7 +491,36 @@ impl<Mode> SnapshotBuilder<Mode> {
         max_catalog_version: Option<Version>,
         log_tail: &[crate::path::ParsedLogPath],
     ) -> KernelResult<()> {
-        validate_catalog_managed_log_tail(version, max_catalog_version, log_tail)
+        // TODO(#3421): Move this Delta error classification into validate_catalog_managed_log_tail
+        // when CommitRangeBuilder::build and its callers migrate to `Result`.
+        validate_catalog_managed_log_tail(version, max_catalog_version, log_tail).map_err(|error| {
+            match error.without_backtrace() {
+                KernelError::LogTailVersionsNotContiguous {
+                    first_version,
+                    second_version,
+                } if first_version
+                    .checked_add(1)
+                    .is_some_and(|next| next < *second_version)
+                    && log_tail
+                        .windows(2)
+                        .all(|pair| pair[0].version < pair[1].version) =>
+                {
+                    match (log_tail.first(), log_tail.last()) {
+                        (Some(first), Some(last)) => {
+                            Error::Delta(DeltaError::versions_not_contiguous(
+                                log_tail.iter().map(|file| file.version),
+                                first.version,
+                                last.version,
+                                version.or(max_catalog_version).unwrap_or(last.version),
+                                Some(Box::new(error)),
+                            ))
+                        }
+                        _ => Error::Kernel(error),
+                    }
+                }
+                _ => Error::Kernel(error),
+            }
+        })
     }
 
     /// Require a catalog bound when a latest version request resolves to a catalog-managed

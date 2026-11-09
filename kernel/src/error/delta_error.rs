@@ -132,6 +132,32 @@ impl DeltaError {
         )
     }
 
+    /// Reports the observed `versions` and required bounds while loading `version_to_load`.
+    /// Bounds describe the commit interval being validated, not the table's retained history.
+    pub fn versions_not_contiguous(
+        versions: impl IntoIterator<Item = Version>,
+        start_version: Version,
+        end_version: Version,
+        version_to_load: Version,
+        source: Option<Box<dyn StdError + Send + Sync + 'static>>,
+    ) -> Self {
+        let versions = versions
+            .into_iter()
+            .map(|v| v.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        Self::new(
+            DeltaErrorCondition::DeltaVersionsNotContiguous,
+            vec![
+                DeltaErrorParameter::new("versionList", versions),
+                DeltaErrorParameter::new("startVersion", start_version),
+                DeltaErrorParameter::new("endVersion", end_version),
+                DeltaErrorParameter::new("versionToLoad", version_to_load),
+            ],
+            source,
+        )
+    }
+
     /// Reports missing replay files for `version` after `checkpoint_version` in `log_path`.
     /// The original listing or read failure remains available as the diagnostic source.
     pub fn log_file_not_found(
