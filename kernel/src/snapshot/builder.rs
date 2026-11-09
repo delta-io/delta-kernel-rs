@@ -160,9 +160,10 @@ impl SnapshotBuilder<FromTableRoot> {
 
     /// Sets the JSON recursion limit used to decode this table's schema. The default is 128.
     ///
-    /// A non-default limit bounds all JSON objects and arrays in `metaData.schemaString`,
-    /// including field metadata and unknown fields. Decoding fails when nesting reaches the
-    /// limit. This counts JSON containers, not columns: each nested struct adds three containers.
+    /// Bounds JSON objects and arrays decoded from `metaData.schemaString`, including field
+    /// metadata. Unknown fields skipped by the deserializer do not count toward the limit.
+    /// Decoding fails when nesting reaches the limit. This counts JSON containers, not columns:
+    /// each nested struct adds three containers.
     /// Derived snapshots retain this setting, including incremental loads and metadata updates.
     ///
     /// The supported range is 1 through 1000; [`build`](Self::build) rejects other values.
