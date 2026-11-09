@@ -46,6 +46,7 @@ use crate::expressions::{
 };
 use crate::schema::{DataType, PrimitiveType, StructField, StructType};
 use crate::uri_reference::{scheme_len, uri_encode_location};
+use crate::utils::require;
 
 #[internal_api]
 pub(crate) trait ProvidesColumnByName {
@@ -317,17 +318,22 @@ pub fn evaluate_expression(
         (Predicate(_), Some(data_type)) => Err(KernelError::generic(format!(
             "Predicate evaluation produces boolean output, but caller expects {data_type:?}"
         ))),
-        (Unary(UnaryExpression { op, expr }), None | Some(&DataType::STRING)) => {
+        (Unary(UnaryExpression { op, expr }), result_type) => {
+            let output_type = match op {
+                ToJson | UriEncodePath => DataType::STRING,
+            };
+            if let Some(expected) = result_type
+                && *expected != output_type
+            {
+                return Err(KernelError::invalid_expression(format!(
+                    "{op} operator produces {output_type}, but caller expects {expected}"
+                )));
+            }
             let input = evaluate_expression(expr, batch, None)?;
             match op {
                 ToJson => Ok(to_json(&input)?),
                 UriEncodePath => uri_encode_locations(&input),
             }
-        }
-        (Unary(UnaryExpression { op, .. }), Some(data_type)) => {
-            Err(KernelError::invalid_expression(format!(
-                "{op} operator requires STRING output, but got {data_type:?}"
-            )))
         }
         (Binary(BinaryExpression { op, left, right }), _) => {
             let left_arr = evaluate_expression(left.as_ref(), batch, None)?;
@@ -882,39 +888,47 @@ pub fn evaluate_predicate(
 
 /// Evaluates [`UnaryExpressionOp::UriEncodePath`] over any string representation.
 fn uri_encode_locations(input: &ArrayRef) -> KernelResult<ArrayRef> {
-    fn eval<'a>(locations: impl StringArrayType<'a>) -> StringArray {
-        locations
-            .iter()
-            .map(|l| l.map(uri_encode_location))
-            .collect()
-    }
-    let encoded = match input.data_type() {
-        ArrowDataType::Utf8 => eval(input.as_string::<i32>()),
-        ArrowDataType::LargeUtf8 => eval(input.as_string::<i64>()),
-        ArrowDataType::Utf8View => eval(input.as_string_view()),
-        other => {
-            return Err(KernelError::invalid_expression(format!(
-                "UriEncodePath requires a string input, got {other}"
-            )));
-        }
-    };
-    Ok(Arc::new(encoded))
+    let encoded = map_string_rows(input, "UriEncodePath", uri_encode_location)?;
+    // Encoding can triple a value's size, and arrow panics rather than errors on offset overflow.
+    let total_len: usize = encoded
+        .iter()
+        .flatten()
+        .map(|location| location.len())
+        .sum();
+    require!(
+        i32::try_from(total_len).is_ok(),
+        KernelError::invalid_expression(format!(
+            "UriEncodePath output of {total_len} bytes does not fit in one string array"
+        ))
+    );
+    Ok(Arc::new(StringArray::from_iter(encoded)))
 }
 
 /// Evaluates [`UnaryPredicateOp::HasUriScheme`] over any string representation.
 fn has_uri_scheme(input: &ArrayRef) -> KernelResult<BooleanArray> {
-    fn eval<'a>(references: impl StringArrayType<'a>) -> BooleanArray {
-        references
-            .iter()
-            .map(|r| r.map(|r| scheme_len(r).is_some()))
-            .collect()
+    let has_scheme = map_string_rows(input, "HasUriScheme", |r| scheme_len(r).is_some())?;
+    Ok(BooleanArray::from(has_scheme))
+}
+
+/// Applies `f` to every non-NULL row of a string array of any representation, keeping NULLs.
+/// Other array types are an error naming `op`.
+fn map_string_rows<'a, T>(
+    input: &'a ArrayRef,
+    op: &str,
+    f: impl FnMut(&'a str) -> T,
+) -> KernelResult<Vec<Option<T>>> {
+    fn map_rows<'a, T>(
+        rows: impl StringArrayType<'a>,
+        mut f: impl FnMut(&'a str) -> T,
+    ) -> Vec<Option<T>> {
+        rows.iter().map(|row| row.map(&mut f)).collect()
     }
     match input.data_type() {
-        ArrowDataType::Utf8 => Ok(eval(input.as_string::<i32>())),
-        ArrowDataType::LargeUtf8 => Ok(eval(input.as_string::<i64>())),
-        ArrowDataType::Utf8View => Ok(eval(input.as_string_view())),
+        ArrowDataType::Utf8 => Ok(map_rows(input.as_string::<i32>(), f)),
+        ArrowDataType::LargeUtf8 => Ok(map_rows(input.as_string::<i64>(), f)),
+        ArrowDataType::Utf8View => Ok(map_rows(input.as_string_view(), f)),
         other => Err(KernelError::invalid_expression(format!(
-            "HasUriScheme requires a string input, got {other}"
+            "{op} requires a string input, got {other}"
         ))),
     }
 }
@@ -2213,6 +2227,7 @@ mod tests {
             |l| Arc::new(StringViewArray::from(l)) as ArrayRef
         )]
         make_array: fn(Vec<Option<&'static str>>) -> ArrayRef,
+        #[values(None, Some(&DataType::STRING))] result_type: Option<&'static DataType>,
     ) {
         let locations = vec![
             Some("data/a b.parquet"),
@@ -2222,7 +2237,7 @@ mod tests {
         ];
         let batch = RecordBatch::try_from_iter([("l", make_array(locations))]).unwrap();
         let expr = Expr::unary(UnaryExpressionOp::UriEncodePath, col!("l"));
-        let result = evaluate_expression(&expr, &batch, Some(&DataType::STRING)).unwrap();
+        let result = evaluate_expression(&expr, &batch, result_type).unwrap();
         let expected = StringArray::from(vec![
             Some("data/a%20b.parquet"),
             Some("s3://bucket/a%231.parquet"),
