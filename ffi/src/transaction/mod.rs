@@ -142,6 +142,7 @@ mod tests {
     use delta_kernel::{KernelError, KernelResult, Snapshot};
     use delta_kernel_ffi::delta_types::{
         FfiColumnNameArray, FfiNullableStringMap, FfiNullableStringMapEntry, FfiStringArray,
+        FfiStringMap, FfiStringMapEntry,
     };
     use delta_kernel_ffi::engine_data::{ArrowFFIData, get_engine_data};
     use delta_kernel_ffi::error::FFIKernelError;
@@ -3407,7 +3408,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn update_table_builder_adds_table_property_via_ffi() -> KernelResult<()> {
+    async fn update_table_builder_adds_table_properties_via_ffi() -> KernelResult<()> {
         let (table_url, _store, engine) =
             setup_domain_metadata_table("test_update_builder_add_property", false).await?;
         let snapshot =
@@ -3425,19 +3426,21 @@ mod tests {
         let owner_value = "kernel";
         let interval_key = "DELTA.checkpointInterval";
         let interval_value = "7";
+        let properties = [
+            FfiStringMapEntry {
+                key: kernel_string_slice!(owner_key),
+                value: kernel_string_slice!(owner_value),
+            },
+            FfiStringMapEntry {
+                key: kernel_string_slice!(interval_key),
+                value: kernel_string_slice!(interval_value),
+            },
+        ];
+        let properties = unsafe { FfiStringMap::new_unsafe(&properties) };
         let builder = ok_or_panic(unsafe {
-            update_table_txn_builder_with_table_property_added(
+            update_table_txn_builder_with_table_properties_added(
                 builder,
-                kernel_string_slice!(owner_key),
-                kernel_string_slice!(owner_value),
-                engine.shallow_copy(),
-            )
-        });
-        let builder = ok_or_panic(unsafe {
-            update_table_txn_builder_with_table_property_added(
-                builder,
-                kernel_string_slice!(interval_key),
-                kernel_string_slice!(interval_value),
+                &properties,
                 engine.shallow_copy(),
             )
         });
@@ -3482,11 +3485,15 @@ mod tests {
         };
         let key = "delta.enableChangeDataFeed";
         let value = "true";
+        let properties = [FfiStringMapEntry {
+            key: kernel_string_slice!(key),
+            value: kernel_string_slice!(value),
+        }];
+        let properties = unsafe { FfiStringMap::new_unsafe(&properties) };
         let builder = ok_or_panic(unsafe {
-            update_table_txn_builder_with_table_property_added(
+            update_table_txn_builder_with_table_properties_added(
                 builder,
-                kernel_string_slice!(key),
-                kernel_string_slice!(value),
+                &properties,
                 engine.shallow_copy(),
             )
         });
