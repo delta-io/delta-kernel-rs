@@ -447,10 +447,9 @@ mod tests {
         Ok(())
     }
 
-    // A checkpoint holds complete state, so its inline entries win and stale top-level entries
-    // from before it are ignored.
+    // A checkpoint holds complete state, so top-level entries from commits before it are ignored.
     #[test]
-    fn scan_non_content_metadata_prefers_checkpoint_inline_over_stale_top_level() -> Result<()> {
+    fn scan_non_content_metadata_ignores_top_level_entries_before_checkpoint() -> Result<()> {
         let (engine, table_root) = setup_table()?;
         let write = |version, data| write_commit(&engine, &table_root, version, data);
 
