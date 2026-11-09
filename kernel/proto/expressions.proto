@@ -21,6 +21,7 @@ import "schema.proto";
 enum UnaryPredicateOp {
   UNARY_PREDICATE_OP_UNSPECIFIED = 0;
   UNARY_PREDICATE_OP_IS_NULL = 1;
+  UNARY_PREDICATE_OP_HAS_URI_SCHEME = 2;
 }
 
 enum BinaryPredicateOp {
@@ -35,7 +36,6 @@ enum BinaryPredicateOp {
 enum UnaryExpressionOp {
   UNARY_EXPRESSION_OP_UNSPECIFIED = 0;
   UNARY_EXPRESSION_OP_TO_JSON = 1;
-  UNARY_EXPRESSION_OP_URI_SCHEME = 2;
 }
 
 enum BinaryExpressionOp {

@@ -85,6 +85,20 @@ pub enum UnaryPredicateOp {
     /// SQL `expr IS NULL`: `true` when the input is null and `false` otherwise, never null itself.
     /// A wrapping `NOT` inverts it to `IS NOT NULL`.
     IsNull,
+    /// `true` when a STRING URI reference begins with a scheme followed by `:`, per
+    /// [RFC 3986 section 3.1]: `ALPHA *( ALPHA / DIGIT / "+" / "-" / "." ) ":"`. Equivalent to
+    /// `regexp_like(expr, '^[A-Za-z][A-Za-z0-9+.\-]*:')`. A reference without a scheme is
+    /// relative. A NULL input yields NULL, and so does its `NOT`. Other input types are an error.
+    ///
+    /// ```text
+    /// HAS_URI_SCHEME('s3://bucket/a b.parquet')  -- true
+    /// HAS_URI_SCHEME('C:/data')                  -- true
+    /// HAS_URI_SCHEME('data/a:b.parquet')         -- false
+    /// HAS_URI_SCHEME('1abc:/a')                  -- false
+    /// ```
+    ///
+    /// [RFC 3986 section 3.1]: https://datatracker.ietf.org/doc/html/rfc3986#section-3.1
+    HasUriScheme,
 }
 
 /// A binary predicate operator.
@@ -155,20 +169,6 @@ pub enum UnaryExpressionOp {
         /// Encode timestamps with all six microsecond digits instead of three.
         full_precision_timestamps: bool,
     },
-    /// The scheme of a raw (not percent-encoded) URI reference, like `parse_url(expr, 'PROTOCOL')`:
-    /// the leading `ALPHA *( ALPHA / DIGIT / "+" / "-" / "." )` run that a `:` ends, per
-    /// [RFC 3986 section 3.1]. The input must be a STRING and the output is STRING. A relative
-    /// reference, which has no scheme, and a NULL input both produce NULL, so
-    /// `URI_SCHEME(x) IS NULL` tests whether `x` is relative:
-    ///
-    /// ```text
-    /// URI_SCHEME('s3://bucket/a.parquet')  -- 's3'
-    /// URI_SCHEME('data/a.parquet')         -- NULL
-    /// URI_SCHEME('C:/data')                -- 'C'
-    /// ```
-    ///
-    /// [RFC 3986 section 3.1]: https://datatracker.ietf.org/doc/html/rfc3986#section-3.1
-    UriScheme,
 }
 
 impl UnaryExpressionOp {
@@ -1141,6 +1141,11 @@ impl Predicate {
         Self::not(Self::is_null(expr))
     }
 
+    /// Create a new predicate `HAS_URI_SCHEME(expr)`; see [`UnaryPredicateOp::HasUriScheme`].
+    pub fn has_uri_scheme(expr: impl Into<Expression>) -> Self {
+        Self::unary(UnaryPredicateOp::HasUriScheme, expr)
+    }
+
     /// Create a new predicate `self == other`
     pub fn eq(a: impl Into<Expression>, b: impl Into<Expression>) -> Self {
         Self::binary(BinaryPredicateOp::Equal, a, b)
@@ -1269,7 +1274,6 @@ impl Display for UnaryExpressionOp {
         use UnaryExpressionOp::*;
         match self {
             ToJson { .. } => write!(f, "TO_JSON"),
-            UriScheme => write!(f, "URI_SCHEME"),
         }
     }
 }
@@ -1418,6 +1422,7 @@ impl Display for Predicate {
             Binary(BinaryPredicate { op, left, right }) => write!(f, "{left} {op} {right}"),
             Unary(UnaryPredicate { op, expr }) => match op {
                 UnaryPredicateOp::IsNull => write!(f, "{expr} IS NULL"),
+                UnaryPredicateOp::HasUriScheme => write!(f, "HAS_URI_SCHEME({expr})"),
             },
             Junction(JunctionPredicate { op, preds }) => {
                 let op = match op {
@@ -1543,10 +1548,6 @@ mod tests {
                 "TO_JSON(Column(x), full_precision_timestamps)",
             ),
             (
-                Expr::unary(UnaryExpressionOp::UriScheme, col!("x")),
-                "URI_SCHEME(Column(x))",
-            ),
-            (
                 Expr::case_when([(col!("x").is_null(), lit(0))], col!("x")),
                 "CASE WHEN Column(x) IS NULL THEN 0 ELSE Column(x) END",
             ),
@@ -1624,6 +1625,10 @@ mod tests {
             (
                 Pred::from_expr(expr!(col("x") == "foo")),
                 "Column(x) = 'foo'",
+            ),
+            (
+                Pred::not(Pred::has_uri_scheme(col!("x"))),
+                "NOT(HAS_URI_SCHEME(Column(x)))",
             ),
         ];
 
@@ -1755,15 +1760,12 @@ mod tests {
         // ==================== Expression Operations Tests ====================
 
         #[rstest::rstest]
-        fn test_unary_expression_roundtrip(
-            #[values(
-                UnaryExpressionOp::TO_JSON,
-                UnaryExpressionOp::ToJson { full_precision_timestamps: true },
-                UnaryExpressionOp::UriScheme
-            )]
-            op: UnaryExpressionOp,
-        ) {
-            assert_roundtrip(&Expression::unary(op, col!("data")));
+        fn test_unary_expression_roundtrip(#[values(false, true)] full_precision_timestamps: bool) {
+            let op = UnaryExpressionOp::ToJson {
+                full_precision_timestamps,
+            };
+            let expr = Expression::unary(op, col!("data"));
+            assert_roundtrip(&expr);
         }
 
         #[test]
@@ -1956,6 +1958,7 @@ mod tests {
                 // Unary predicates
                 Predicate::from_expr(expr!(is_null(col("nullable_col")))),
                 Predicate::from_expr(expr!(is_not_null(col("nullable_col")))),
+                Predicate::has_uri_scheme(col!("location")),
             ];
 
             for pred in &cases {

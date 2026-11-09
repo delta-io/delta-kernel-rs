@@ -255,6 +255,9 @@ pub trait KernelPredicateEvaluator {
                     None
                 }
             },
+            // Column min/max stats can't bound whether a value has a scheme, so this never
+            // prunes.
+            UnaryPredicateOp::HasUriScheme => None,
         }
     }
 
