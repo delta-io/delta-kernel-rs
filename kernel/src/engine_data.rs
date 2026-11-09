@@ -11,7 +11,7 @@ use crate::expressions::ArrayData;
 use crate::log_replay::HasSelectionVector;
 use crate::schema::{ColumnName, DataType, SchemaRef};
 use crate::utils::require;
-use crate::{AsAny, KernelError, KernelResult, PredicateEvaluator};
+use crate::{AsAny, KernelError, KernelResult};
 
 /// Engine data paired with a selection vector indicating which rows are logically selected.
 ///
@@ -623,20 +623,10 @@ pub trait EngineData: AsAny {
 /// Evaluates a predicate on the batch, extracts the resulting selection vector, and applies
 /// it to filter out rows that don't satisfy the predicate.
 pub(crate) fn filter_by_predicate(
-    filter: &dyn PredicateEvaluator,
+    filter: &dyn crate::PredicateEvaluator,
     batch: Box<dyn EngineData>,
 ) -> KernelResult<Box<dyn EngineData>> {
-    let selection_vector = evaluate_selection_vector(filter, batch.as_ref())?;
-    batch.apply_selection_vector(selection_vector)
-}
-
-/// Evaluates `filter` on `batch`, returning one flag per row. Errors if the predicate yields NULL
-/// for any row.
-pub(crate) fn evaluate_selection_vector(
-    filter: &dyn PredicateEvaluator,
-    batch: &dyn EngineData,
-) -> KernelResult<Vec<bool>> {
-    let predicate_result = filter.evaluate(batch)?;
+    let predicate_result = filter.evaluate(batch.as_ref())?;
     let mut visitor = SelectionVectorVisitor::default();
     visitor.visit_rows_of(predicate_result.as_ref())?;
     require!(
@@ -647,7 +637,7 @@ pub(crate) fn evaluate_selection_vector(
             batch.len()
         ))
     );
-    Ok(visitor.selection_vector)
+    batch.apply_selection_vector(visitor.selection_vector)
 }
 
 #[cfg(test)]

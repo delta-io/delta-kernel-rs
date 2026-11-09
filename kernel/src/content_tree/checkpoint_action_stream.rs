@@ -124,11 +124,8 @@ fn read_tree_adds(
     // The engine's handlers carry any cancellation token bound to this read.
     let adds = read_add_actions_from_amt(engine, checkpoint, &ctx, None)?;
     Ok(Box::new(adds.map(move |batch| {
-        // `ActionsBatch` does not take a `FilteredEngineData` yet, so drop the deselected rows
-        // here; otherwise replay would read them as live adds.
-        let selected = batch?.apply_selection_vector()?;
         Ok(ActionsBatch::new(
-            projector.project(selected.as_ref())?,
+            projector.project(batch?.as_ref())?,
             false,
         ))
     })))
