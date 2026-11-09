@@ -89,7 +89,8 @@ pub use snapshot::{
     ExclusiveSnapshotBuilder, FfiIncrementalReplay, FfiSnapshotBuilder, free_snapshot_builder,
     get_snapshot_builder, get_snapshot_builder_from, snapshot_builder_build,
     snapshot_builder_with_incremental_crc_replay, snapshot_builder_with_log_tail,
-    snapshot_builder_with_max_catalog_version, snapshot_builder_with_version,
+    snapshot_builder_with_max_catalog_version, snapshot_builder_with_schema_recursion_limit,
+    snapshot_builder_with_version,
 };
 
 #[cfg(test)]
@@ -1958,7 +1959,7 @@ mod tests {
     use delta_kernel::object_store::memory::InMemory;
     use delta_kernel::object_store::path::Path;
     use delta_kernel::object_store::{DynObjectStore, ObjectStoreExt as _};
-    use delta_kernel::schema::schema_ref;
+    use delta_kernel::schema::{DataType, StructField, StructType, schema_ref};
     use delta_kernel_default_engine::DefaultEngineBuilder;
     use delta_kernel_default_engine::executor::tokio::TokioMultiThreadExecutor;
     use rstest::rstest;
@@ -2130,6 +2131,80 @@ mod tests {
         );
         let snap = unsafe { build_snapshot(kernel_string_slice!(path), engine.shallow_copy()) };
         Ok((storage, engine, snap))
+    }
+
+    #[rstest]
+    #[case::default_limit(128, 42, false)]
+    #[case::raised_limit(256, 42, true)]
+    #[case::maximum_limit(1000, 331, true)]
+    #[case::invalid_zero(0, 42, false)]
+    #[case::invalid_large(1001, 42, false)]
+    #[tokio::test]
+    async fn snapshot_builder_schema_recursion_limit(
+        #[case] limit: usize,
+        #[case] depth: usize,
+        #[case] succeeds: bool,
+    ) -> KernelResult<()> {
+        let path = "memory:///";
+        let (storage, engine, initial) = make_engine_and_v0_snapshot(path).await?;
+        let schema = (0..depth).fold(
+            StructType::try_new([StructField::nullable("leaf", DataType::INTEGER)])?,
+            |schema, level| {
+                StructType::try_new([StructField::nullable(format!("level_{level}"), schema)])
+                    .unwrap()
+            },
+        );
+        let metadata = serde_json::json!({"metaData": {
+            "id": "nested-schema",
+            "format": {"provider": "parquet", "options": {}},
+            "schemaString": serde_json::to_string(&schema)?,
+            "partitionColumns": [], "configuration": {}
+        }});
+        add_commit(path, storage.as_ref(), 1, metadata.to_string()).await?;
+        unsafe {
+            let builder = ok_or_panic(get_snapshot_builder(
+                kernel_string_slice!(path),
+                engine.shallow_copy(),
+            ));
+            let builder = snapshot_builder_with_schema_recursion_limit(builder, limit);
+            let result = snapshot_builder_build(builder);
+            if succeeds {
+                let snapshot = ok_or_panic(result);
+                assert_eq!(snapshot.as_ref().schema().as_ref(), &schema);
+                let mut next_metadata = metadata.clone();
+                next_metadata["metaData"]["name"] = serde_json::json!("updated-metadata");
+                add_commit(path, storage.as_ref(), 2, next_metadata.to_string()).await?;
+                let builder = ok_or_panic(get_snapshot_builder_from(
+                    snapshot.shallow_copy(),
+                    engine.shallow_copy(),
+                ));
+                let updated = ok_or_panic(snapshot_builder_build(builder));
+                assert_eq!(updated.as_ref().version(), 2);
+                assert_eq!(updated.as_ref().schema().as_ref(), &schema);
+                free_snapshot(updated);
+                let builder = ok_or_panic(get_snapshot_builder_from(
+                    snapshot.shallow_copy(),
+                    engine.shallow_copy(),
+                ));
+                let builder = snapshot_builder_with_schema_recursion_limit(builder, 128);
+                assert_extern_result_error_contains(
+                    snapshot_builder_build(builder),
+                    FFIKernelError::GenericError,
+                    "inherit their schema JSON recursion limit",
+                );
+                free_snapshot(snapshot);
+            } else {
+                let etype = if limit == 128 {
+                    FFIKernelError::SchemaError
+                } else {
+                    FFIKernelError::GenericError
+                };
+                assert_extern_result_error_contains(result, etype, "recursion limit");
+            }
+            free_snapshot(initial);
+            free_engine(engine);
+        }
+        Ok(())
     }
 
     /// Like [`make_engine_and_v0_snapshot`] but creates a catalog-managed table. The returned

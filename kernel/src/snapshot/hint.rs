@@ -261,6 +261,7 @@ impl SnapshotHint {
         log_tail: Vec<LogPath>,
         max_catalog_version: Option<Version>,
         incremental_replay: IncrementalReplay,
+        schema_recursion_limit: usize,
     ) -> KernelResult<SnapshotRef> {
         require!(log_tail.is_empty(), SnapshotHintError::LogTail.into());
         require!(
@@ -352,8 +353,13 @@ impl SnapshotHint {
                     .is_some_and(|path| path.version == 0),
             SnapshotHintError::MissingHistoryAnchor.into()
         );
-        let table_configuration =
-            TableConfiguration::try_new(metadata, protocol, table_url, version)?;
+        let table_configuration = TableConfiguration::try_new_with_recursion_limit(
+            metadata,
+            protocol,
+            table_url,
+            version,
+            schema_recursion_limit,
+        )?;
         if let Some(crc) = crc.as_ref() {
             require!(
                 crc.version == version,

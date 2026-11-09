@@ -43,6 +43,7 @@ pub struct FromSnapshot;
 /// # }
 /// ```
 pub struct SnapshotBuilder<Mode = FromTableRoot> {
+    schema_recursion_limit: usize,
     table_root: Option<String>,
     existing_snapshot: Option<SnapshotRef>,
     version: Option<Version>,
@@ -70,6 +71,7 @@ pub type IncrementalSnapshotBuilder = SnapshotBuilder<FromSnapshot>;
 impl<Mode> std::fmt::Debug for SnapshotBuilder<Mode> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SnapshotBuilder")
+            .field("schema_recursion_limit", &self.schema_recursion_limit)
             .field("table_root", &self.table_root)
             .field("existing_snapshot", &self.existing_snapshot)
             .field("version", &self.version)
@@ -140,6 +142,7 @@ impl SnapshotBuilder<FromTableRoot> {
 
     pub(crate) fn new_for(table_root: impl AsRef<str>) -> Self {
         Self {
+            schema_recursion_limit: crate::actions::DEFAULT_SCHEMA_RECURSION_LIMIT,
             table_root: Some(table_root.as_ref().to_string()),
             existing_snapshot: None,
             version: None,
@@ -153,6 +156,20 @@ impl SnapshotBuilder<FromTableRoot> {
             cancellation_token: None,
             mode: PhantomType::default(),
         }
+    }
+
+    /// Sets the JSON recursion limit used to decode this table's schema. The default is 128.
+    ///
+    /// A non-default limit bounds all JSON objects and arrays in `metaData.schemaString`,
+    /// including field metadata and unknown fields. Decoding fails when nesting reaches the
+    /// limit. This counts JSON containers, not columns: each nested struct adds three containers.
+    /// Derived snapshots retain this setting, including incremental loads and metadata updates.
+    ///
+    /// The supported range is 1 through 1000; [`build`](Self::build) rejects other values.
+    /// The upper bound limits recursion in schema operations beyond JSON decoding.
+    pub fn with_schema_recursion_limit(mut self, recursion_limit: usize) -> Self {
+        self.schema_recursion_limit = recursion_limit;
+        self
     }
 
     /// Supply complete snapshot state that Kernel can validate and construct without engine I/O.
@@ -184,6 +201,7 @@ impl SnapshotBuilder<FromTableRoot> {
 impl SnapshotBuilder<FromSnapshot> {
     pub(crate) fn new_from(existing_snapshot: SnapshotRef) -> Self {
         Self {
+            schema_recursion_limit: existing_snapshot.table_configuration.schema_recursion_limit,
             table_root: None,
             existing_snapshot: Some(existing_snapshot),
             version: None,
@@ -378,6 +396,7 @@ impl<Mode> SnapshotBuilder<Mode> {
 
         // Destructure self so fields can be moved independently
         let Self {
+            schema_recursion_limit,
             table_root,
             existing_snapshot,
             version,
@@ -391,6 +410,15 @@ impl<Mode> SnapshotBuilder<Mode> {
             cancellation_token,
             mode: _,
         } = self;
+
+        require!(
+            (1..=crate::actions::MAX_SCHEMA_RECURSION_LIMIT).contains(&schema_recursion_limit),
+            KernelError::generic(format!(
+                "Schema JSON recursion limit must be between 1 and {}",
+                crate::actions::MAX_SCHEMA_RECURSION_LIMIT
+            ))
+            .into()
+        );
 
         let metric_context = SnapshotLoadMetricContext {
             operation_id,
@@ -406,6 +434,7 @@ impl<Mode> SnapshotBuilder<Mode> {
                 log_tail,
                 max_catalog_version,
                 incremental_replay,
+                schema_recursion_limit,
             )?
         } else {
             let scoped_engine =
@@ -449,6 +478,7 @@ impl<Mode> SnapshotBuilder<Mode> {
                     metric_context,
                     incremental_replay,
                     built_as_latest,
+                    schema_recursion_limit,
                 )
                 .map(Into::into)?
             } else {
@@ -605,6 +635,7 @@ pub(super) mod tests {
     use crate::object_store::memory::InMemory;
     use crate::object_store::path::Path;
     use crate::object_store::{DynObjectStore, ObjectStoreExt as _};
+    use crate::schema::{ArrayType, DataType, MapType, StructField, StructType};
     use crate::unit_test_utils::{CapturingReporter, install_thread_local_metrics_reporter};
     use crate::utils::FoldWithOption as _;
 
@@ -668,6 +699,73 @@ pub(super) mod tests {
             .build(engine)?;
         assert_eq!(snapshot.version(), 0);
 
+        Ok(())
+    }
+
+    #[rstest::rstest]
+    #[case::formerly_rejected(42, "struct")]
+    #[case::struct_boundary(331, "struct")]
+    #[case::array_boundary(996, "array")]
+    #[case::map_boundary(996, "map")]
+    #[test_log::test(tokio::test)]
+    async fn snapshot_schema_recursion_limit_is_inherited(
+        #[case] depth: usize,
+        #[case] container: &str,
+    ) -> KernelResult<(), Box<dyn std::error::Error>> {
+        let (engine, store, table_root) = setup_test();
+        let data_type = (0..depth).fold(DataType::INTEGER, |nested, level| match container {
+            "struct" => {
+                StructType::try_new([StructField::nullable(format!("level_{level}"), nested)])
+                    .unwrap()
+                    .into()
+            }
+            "array" => ArrayType::new(nested, true).into(),
+            "map" => MapType::new(DataType::STRING, nested, true).into(),
+            _ => panic!("unknown schema container"),
+        });
+        let schema = StructType::try_new([StructField::nullable("nested", data_type)])?;
+        let mut metadata = json!({"metaData": {
+            "id": "nested-schema",
+            "format": {"provider": "parquet", "options": {}},
+            "schemaString": serde_json::to_string(&schema)?,
+            "partitionColumns": [],
+            "configuration": {}
+        }});
+        let protocol = json!({"protocol": {"minReaderVersion": 1, "minWriterVersion": 2}});
+        add_commit(
+            &table_root,
+            store.as_ref(),
+            0,
+            format!("{protocol}\n{metadata}"),
+        )
+        .await?;
+        assert!(
+            Snapshot::builder_for(&table_root)
+                .build(engine.as_ref())
+                .is_err()
+        );
+        let initial = Snapshot::builder_for(&table_root)
+            .with_schema_recursion_limit(1000)
+            .build(engine.as_ref())?;
+        assert_eq!(initial.schema().as_ref(), &schema);
+        let scan = initial.clone().scan_builder().build()?;
+        assert_eq!(scan.logical_schema().as_ref(), &schema);
+
+        metadata["metaData"]["name"] = json!("updated-metadata");
+        add_commit(&table_root, store.as_ref(), 1, metadata.to_string()).await?;
+        let updated = Snapshot::builder_from(initial).build(engine.as_ref())?;
+        assert_eq!(updated.version(), 1);
+        assert_eq!(
+            updated.table_configuration.metadata().name(),
+            Some("updated-metadata")
+        );
+        assert_eq!(updated.schema().as_ref(), &schema);
+        let rebuilt = Snapshot::builder_for(&table_root)
+            .with_schema_recursion_limit(1000)
+            .with_snapshot_hint(updated.to_snapshot_hint()?)
+            .build(engine.as_ref())?;
+        assert_eq!(rebuilt.schema().as_ref(), &schema);
+        assert_eq!(rebuilt.table_configuration.schema_recursion_limit, 1000);
         Ok(())
     }
 

@@ -242,7 +242,9 @@ impl LogReplayScanner {
             let has_protocol_update = protocol_opt.is_some();
 
             if let Some(ref metadata) = metadata_opt {
-                let schema = metadata.parse_schema()?;
+                let schema = metadata.parse_schema_with_recursion_limit(
+                    table_configuration.schema_recursion_limit,
+                )?;
                 // Compatibility is evaluated against the end version's logical schema.
                 require!(
                     mode.schemas_compatible(&schema, table_schema.as_ref()),

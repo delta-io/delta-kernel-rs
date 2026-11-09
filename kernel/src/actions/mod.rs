@@ -38,6 +38,8 @@ use crate::{EngineData, FileMeta, KernelError, KernelResult, RowVisitor as _};
 
 const KERNEL_VERSION: &str = env!("CARGO_PKG_VERSION");
 const SERDE_JSON_RECURSION_LIMIT_ERROR_PREFIX: &str = "recursion limit exceeded";
+pub(crate) const DEFAULT_SCHEMA_RECURSION_LIMIT: usize = 128;
+pub(crate) const MAX_SCHEMA_RECURSION_LIMIT: usize = 1000;
 const UNKNOWN_OPERATION: &str = "UNKNOWN";
 pub(crate) const ROW_TRACKING_PRESERVED_TAG: &str = "delta.rowTracking.preserved";
 
@@ -490,8 +492,29 @@ impl Metadata {
     /// JSON decoding failures.
     #[internal_api]
     pub(crate) fn parse_schema(&self) -> KernelResult<StructType> {
-        // TODO(#1896): Increase the supported nesting depth or use non-recursive schema decoding.
-        serde_json::from_str(&self.schema_string).map_err(|error| {
+        self.parse_schema_with_recursion_limit(DEFAULT_SCHEMA_RECURSION_LIMIT)
+    }
+
+    pub(crate) fn parse_schema_with_recursion_limit(
+        &self,
+        recursion_limit: usize,
+    ) -> KernelResult<StructType> {
+        require!(
+            (1..=MAX_SCHEMA_RECURSION_LIMIT).contains(&recursion_limit),
+            KernelError::generic(format!(
+                "Schema JSON recursion limit must be between 1 and {MAX_SCHEMA_RECURSION_LIMIT}"
+            ))
+        );
+        let result = if recursion_limit == DEFAULT_SCHEMA_RECURSION_LIMIT {
+            serde_json::from_str(&self.schema_string)
+        } else {
+            check_schema_json_depth(&self.schema_string, recursion_limit)?;
+            let mut deserializer = serde_json::Deserializer::from_str(&self.schema_string);
+            deserializer.disable_recursion_limit();
+            StructType::deserialize(serde_stacker::Deserializer::new(&mut deserializer))
+                .and_then(|schema| deserializer.end().map(|()| schema))
+        };
+        result.map_err(|error| {
             // serde_json keeps ErrorCode::RecursionLimitExceeded private, so we use string
             // matching.
             if error.is_syntax()
@@ -573,6 +596,46 @@ impl Metadata {
             configuration,
         }
     }
+}
+
+// serde_json has no setter for a finite recursion limit. Bound the JSON containers before
+// disabling its built-in check; quoted braces and escaped quotes do not affect nesting.
+fn check_schema_json_depth(json: &str, recursion_limit: usize) -> KernelResult<()> {
+    require!(
+        recursion_limit > 0,
+        KernelError::generic("Schema JSON recursion limit must be positive")
+    );
+    let mut depth: usize = 0;
+    let mut in_string = false;
+    let mut escaped = false;
+    for byte in json.bytes() {
+        if escaped {
+            escaped = false;
+        } else if in_string {
+            match byte {
+                b'\\' => escaped = true,
+                b'"' => in_string = false,
+                _ => {}
+            }
+        } else {
+            match byte {
+                b'"' => in_string = true,
+                b'{' | b'[' => {
+                    depth += 1;
+                    require!(
+                        depth < recursion_limit,
+                        KernelError::schema(format!(
+                            "Table schema is too deeply nested: decoding metaData.schemaString \
+                             reached the configured JSON recursion limit of {recursion_limit}"
+                        ))
+                    );
+                }
+                b'}' | b']' => depth = depth.saturating_sub(1),
+                _ => {}
+            }
+        }
+    }
+    Ok(())
 }
 
 #[derive(
@@ -2122,7 +2185,7 @@ mod tests {
     #[cfg(feature = "adaptive-metadata-in-dev")]
     use crate::engine_data::FilteredEngineData;
     use crate::expressions::{Scalar, StructData};
-    use crate::schema::{DataType, MapType, StructField, schema, schema_ref};
+    use crate::schema::{ArrayType, DataType, MapType, StructField, schema, schema_ref};
     use crate::unit_test_utils::assert_result_error_with_message;
     use crate::{
         Engine, EvaluationHandler, JsonHandler, ParquetHandler, StorageHandler, create_row,
@@ -2269,6 +2332,120 @@ mod tests {
     }
 
     #[rstest]
+    #[case::raised_limit(42, 256, true)]
+    #[case::raised_boundary(83, 256, true)]
+    #[case::raised_exceeded(84, 256, false)]
+    #[case::maximum_boundary(331, 1000, true)]
+    #[case::maximum_exceeded(332, 1000, false)]
+    #[case::lowered_limit(41, 100, false)]
+    #[case::zero(1, 0, false)]
+    #[case::unsupported_limit(1, 1001, false)]
+    fn parse_schema_configured_recursion_limit(
+        #[case] depth: usize,
+        #[case] recursion_limit: usize,
+        #[case] succeeds: bool,
+    ) {
+        let expected = nested_schema(depth);
+        let metadata = Metadata {
+            schema_string: Arc::new(serde_json::to_string(&expected).unwrap()),
+            ..Default::default()
+        };
+        let result = metadata.parse_schema_with_recursion_limit(recursion_limit);
+        if succeeds {
+            let parsed = result.unwrap();
+            let cloned = parsed.clone();
+            assert_eq!(cloned, expected);
+            assert_eq!(
+                serde_json::to_string(&cloned).unwrap(),
+                *metadata.schema_string
+            );
+        } else {
+            assert!(result.unwrap_err().to_string().contains("recursion limit"));
+        }
+    }
+
+    #[rstest]
+    #[case::raised(160, 256, true)]
+    #[case::boundary(252, 256, true)]
+    #[case::exceeded(253, 256, false)]
+    #[case::maximum_boundary(996, 1000, true)]
+    #[case::maximum_exceeded(997, 1000, false)]
+    fn parse_schema_configured_collection_recursion_limit(
+        #[values(false, true)] map: bool,
+        #[case] depth: usize,
+        #[case] recursion_limit: usize,
+        #[case] succeeds: bool,
+    ) {
+        let data_type = (0..depth).fold(DataType::INTEGER, |nested, _| {
+            if map {
+                MapType::new(DataType::STRING, nested, true).into()
+            } else {
+                ArrayType::new(nested, true).into()
+            }
+        });
+        let expected = StructType::try_new([StructField::nullable("nested", data_type)]).unwrap();
+        let metadata = Metadata {
+            schema_string: Arc::new(serde_json::to_string(&expected).unwrap()),
+            ..Default::default()
+        };
+        assert!(metadata.parse_schema().is_err());
+        let result = metadata.parse_schema_with_recursion_limit(recursion_limit);
+        if succeeds {
+            let parsed = result.unwrap();
+            let cloned = parsed.clone();
+            assert_eq!(cloned, expected);
+            assert_eq!(
+                serde_json::to_string(&cloned).unwrap(),
+                *metadata.schema_string
+            );
+        } else {
+            assert!(result.unwrap_err().to_string().contains("recursion limit"));
+        }
+    }
+
+    #[test]
+    fn parse_schema_default_retains_unknown_field_handling() {
+        let json = format!(
+            r#"{{"type":"struct","fields":[],"ignored":{}0{}}}"#,
+            "[".repeat(300),
+            "]".repeat(300),
+        );
+        let metadata = Metadata {
+            schema_string: Arc::new(json),
+            ..Default::default()
+        };
+        assert!(metadata.parse_schema().is_ok());
+        assert!(metadata.parse_schema_with_recursion_limit(256).is_err());
+    }
+
+    #[rstest]
+    #[case::quoted_brackets(r#"{"[\\\"{":"\\\\}]"}"#, 2, true)]
+    #[case::array_boundary("[[0]]", 3, true)]
+    #[case::array_exceeded("[[[0]]]", 3, false)]
+    #[case::object_boundary(r#"{"a":{"b":0}}"#, 3, true)]
+    #[case::object_exceeded(r#"{"a":{"b":{}}}"#, 3, false)]
+    fn schema_json_depth_counts_containers_outside_strings(
+        #[case] json: &str,
+        #[case] limit: usize,
+        #[case] succeeds: bool,
+    ) {
+        assert!(serde_json::from_str::<serde_json::Value>(json).is_ok());
+        assert_eq!(check_schema_json_depth(json, limit).is_ok(), succeeds);
+    }
+
+    #[rstest]
+    #[case::trailing_object(r#"{"type":"struct","fields":[]} {}"#)]
+    #[case::trailing_text(r#"{"type":"struct","fields":[]} garbage"#)]
+    #[case::unclosed_string(r#"{"type":"struct","fields":[],"x":"abc}"#)]
+    fn parse_schema_override_rejects_malformed_json(#[case] json: &str) {
+        let metadata = Metadata {
+            schema_string: Arc::new(json.to_string()),
+            ..Default::default()
+        };
+        assert!(metadata.parse_schema_with_recursion_limit(256).is_err());
+    }
+
+    #[rstest]
     // Syntax error -> MalformedJson.
     #[case::malformed_syntax("{", "MalformedJson")]
     // Data error lacking the unsupported-type prefix (invalid decimal) -> MalformedJson, NOT
@@ -2307,6 +2484,7 @@ mod tests {
     fn parse_schema_error_classification(
         #[case] schema_string: &str,
         #[case] expected_error: &str,
+        #[values(128, 256)] recursion_limit: usize,
     ) {
         let metadata = Metadata {
             schema_string: Arc::new(schema_string.to_string()),
@@ -2314,7 +2492,10 @@ mod tests {
         };
         // Error conversion captures a backtrace only when enabled, so normalize both forms before
         // checking the underlying error.
-        let error = match metadata.parse_schema().unwrap_err() {
+        let error = match metadata
+            .parse_schema_with_recursion_limit(recursion_limit)
+            .unwrap_err()
+        {
             KernelError::Backtraced { source, .. } => *source,
             error => error,
         };
