@@ -11,7 +11,12 @@ use crate::actions::{
     CheckpointAction, ContentRoot, DomainMetadata, LOG_DOMAIN_METADATA_SCHEMA, LOG_TXN_SCHEMA,
     LastManifestCommit, SetTransaction,
 };
+use crate::content_tree::test_utils::{
+    added_data_entry, data_manifest_entry, write_manifest_with_stats, x_full_stats, x_stats,
+};
+use crate::content_tree::{ContentTreeNodeEntry, TrackingStatus};
 use crate::engine::sync::SyncEngine;
+use crate::expressions::{Predicate, col, lit};
 use crate::metrics::MeteredDeltaEngine;
 use crate::snapshot::builder::tests::measuring_reporter;
 use crate::unit_test_utils::adaptive_metadata_fixtures::{
@@ -274,4 +279,75 @@ fn domain_metadata_comes_from_checkpoint_action_and_later_commits(
         all.iter().map(|dm| dm.domain()).sorted().collect_vec(),
         ["a", "d"]
     );
+}
+
+/// A checkpoint action at [`CHECKPOINT_VERSION`] whose root manifest references two leaf
+/// manifests, one holding `a.parquet` with `id` in `[1, 9]` and one holding `b.parquet` with `id`
+/// in `[20, 30]`. Every entry records the `content_stats` of its file or leaf.
+fn checkpoint_action_with_two_leaves(
+    engine: &SyncEngine,
+    table_root: &Url,
+    snapshot: &Snapshot,
+) -> CheckpointAction {
+    // The manifests key `content_stats` by field ID 1, the table's `id` column.
+    let write = |path: &str, entries: &[(ContentTreeNodeEntry, [i64; 2])]| {
+        let (entries, stats): (Vec<_>, Vec<_>) = entries
+            .iter()
+            .map(|(entry, [lower, upper])| {
+                let stats = x_stats(&x_full_stats(), &[*lower, *upper, 10, 0]);
+                (entry.clone(), stats)
+            })
+            .unzip();
+        let location = table_root.join(path).unwrap();
+        write_manifest_with_stats(engine, location, &entries, &x_full_stats(), stats)
+    };
+    let leaf = |file: &str, bounds: [i64; 2], first_row_id: i64| {
+        let path = format!("metadata/leaf-{file}");
+        let manifest = write(
+            &path,
+            &[(added_data_entry(file, 100, 10, first_row_id, 1), bounds)],
+        );
+        let entry = data_manifest_entry(&path, manifest.size as i64, TrackingStatus::Added);
+        (entry, bounds)
+    };
+    let root_path = "metadata/root.parquet";
+    let root = write(
+        root_path,
+        &[
+            leaf("a.parquet", [1, 9], 0),
+            leaf("b.parquet", [20, 30], 10),
+        ],
+    );
+    let version = CHECKPOINT_VERSION as i64;
+    CheckpointAction {
+        content_root: ContentRoot::new(root_path.to_string(), root.size as i64, version),
+        ..checkpoint_action(snapshot)
+    }
+}
+
+#[rstest]
+#[case::skips_first_leaf(Some(col!("id").gt(lit(15i64))), &["b.parquet"])]
+#[case::skips_second_leaf(Some(col!("id").lt(lit(5i64))), &["a.parquet"])]
+#[case::skips_both_leaves(Some(col!("id").gt(lit(100i64))), &[])]
+#[case::no_predicate(None, &["a.parquet", "b.parquet"])]
+fn scan_skips_leaf_manifests_whose_stats_prove_no_match(
+    #[case] predicate: Option<Predicate>,
+    #[case] expected_paths: &[&str],
+) {
+    let (engine, snapshot) =
+        table_with_checkpoint_action("", checkpoint_action_with_two_leaves, "", None);
+
+    let mut builder = snapshot.scan_builder();
+    if let Some(predicate) = predicate {
+        builder = builder.with_predicate(Arc::new(predicate));
+    }
+    let mut paths = Vec::new();
+    for batch in builder.build().unwrap().scan_metadata(&engine).unwrap() {
+        paths = batch
+            .unwrap()
+            .visit_scan_files(paths, |paths, file| paths.push(file.path))
+            .unwrap();
+    }
+    paths.sort();
+    assert_eq!(paths, expected_paths);
 }

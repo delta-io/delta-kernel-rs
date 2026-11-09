@@ -27,6 +27,7 @@ use crate::content_tree::dv_conversion::{
     ADD_DV_HELPER_SCHEMA, AddDeletionVectorColumns, add_deletion_vector_expression,
 };
 use crate::content_tree::mumbling::MumblingBitmap;
+use crate::content_tree::skipping::leaf_skipping_filter;
 use crate::content_tree::stats::{parsed_stats_expression, projected_stats_schema};
 use crate::content_tree::{
     AMT_FORMAT_VERSION, COLUMN_FILES, CONTENT_TYPE, ColumnFile, ContentTreeNodeEntry,
@@ -38,7 +39,9 @@ use crate::content_tree::{
 use crate::engine_data::{
     EngineData, FilteredEngineData, GetData, RowVisitor, StructList, TypedGetData as _,
 };
-use crate::expressions::{ArrayData, ColumnName, Expression, MapData, Scalar, expr, lit};
+use crate::expressions::{
+    ArrayData, ColumnName, Expression, MapData, PredicateRef, Scalar, expr, lit,
+};
 use crate::scan::log_replay::{
     BASE_ROW_ID_NAME, DATA_CHANGE_NAME, DEFAULT_ROW_COMMIT_VERSION_NAME, DELETION_VECTOR_NAME,
     MODIFICATION_TIME_NAME, PARTITION_VALUES_NAME, PATH_NAME, SIZE_NAME,
@@ -82,6 +85,15 @@ pub(crate) fn read_add_actions_from_amt(
     let table_root = &ctx.table_root;
     let root = checkpoint.root_filemeta(table_root)?;
     let schemas = ManifestReadSchema::new(ctx.content_stats());
+    let leaf_skipping = ctx.stats.as_ref().and_then(|stats| {
+        leaf_skipping_filter(
+            engine,
+            ctx.predicate.clone(),
+            &stats.schema,
+            stats.content_stats.as_ref()?,
+            schemas.root.clone(),
+        )
+    });
     let converter = make_root_entry_converter(engine, ctx)?;
     let mut root_actions = Vec::new();
     let mut leaves = LeafRefVisitor::new(table_root);
@@ -95,6 +107,10 @@ pub(crate) fn read_add_actions_from_amt(
         )?;
     for batch in batches {
         let batch = batch?;
+        leaves.selection = match &leaf_skipping {
+            Some(filter) => filter.apply(batch.as_ref())?,
+            None => Vec::new(),
+        };
         leaves.visit_rows_of(batch.as_ref())?;
         root_actions.push(converter.convert(batch.as_ref(), RemovedEntries::default())?);
     }
@@ -122,6 +138,9 @@ pub(crate) struct ReadContext {
     /// The Delta stats to emit as `Add.stats_parsed`, or `None` to emit no `stats_parsed`. Must
     /// be built for the checkpoint being read.
     pub(crate) stats: Option<StatsRead>,
+    /// The scan predicate over physical column names, or `None` to read every leaf manifest. A
+    /// leaf whose root entry's `content_stats` prove that none of its rows match is not read.
+    pub(crate) predicate: Option<PredicateRef>,
 }
 
 impl ReadContext {
@@ -968,12 +987,15 @@ impl RowVisitor for AddSelectionVisitor<'_> {
     }
 }
 
-/// Collects a [`LeafRef`] for every live `DataManifest` entry of the root-manifest entry batches
-/// it visits, in row order across batches. Non-live `DataManifest` entries and all other entries
-/// are skipped.
+/// Collects a [`LeafRef`] for every live, selected `DataManifest` entry of the root-manifest entry
+/// batches it visits, in row order across batches. Non-live or deselected `DataManifest` entries
+/// and all other entries are skipped.
 struct LeafRefVisitor<'u> {
     /// The table root URL relative leaf locations resolve against.
     table_root: &'u Url,
+    /// Which rows of the next visited batch are selected; rows past its end are selected, so the
+    /// default (empty) selection keeps every row.
+    selection: Vec<bool>,
     leaves: Vec<LeafRef>,
 }
 
@@ -981,6 +1003,7 @@ impl<'u> LeafRefVisitor<'u> {
     fn new(table_root: &'u Url) -> Self {
         Self {
             table_root,
+            selection: Vec::new(),
             leaves: Vec::new(),
         }
     }
@@ -1007,7 +1030,9 @@ impl RowVisitor for LeafRefVisitor<'_> {
                 continue;
             }
             let status = getters[status_index].get(row, TRACKING_STATUS)?;
-            if !TrackingStatus::try_from_repr(status)?.is_live() {
+            if !TrackingStatus::try_from_repr(status)?.is_live()
+                || !self.selection.get(row).copied().unwrap_or(true)
+            {
                 continue;
             }
             let leaf = LeafRef::try_from_getters(row, &getters[1..], self.table_root)?;
@@ -1248,6 +1273,7 @@ impl RowVisitor for LeafEntryVisitor<'_> {
 #[cfg(test)]
 mod tests {
     use std::slice;
+    use std::sync::Mutex;
 
     use rstest::rstest;
     use uuid::Uuid;
@@ -1270,14 +1296,14 @@ mod tests {
     use crate::content_tree::test_utils::{
         action_paths, added_data_entry, data_manifest_entry, entry_batch, mumbling_bitmap,
         struct_batch, test_dv_info, with_field, write_manifest, write_manifest_with_stats,
-        x_full_stats, x_full_stats_value, x_upper_bound_stats,
+        x_full_stats, x_full_stats_value, x_stats, x_upper_bound_stats,
     };
     use crate::content_tree::{DeletionVectorInfo, ManifestInfo};
     use crate::engine::DelegatingEngine;
     use crate::engine::arrow_conversion::TryFromArrow as _;
     use crate::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt as _};
     use crate::engine::sync::SyncEngine;
-    use crate::expressions::StructData;
+    use crate::expressions::{Predicate, StructData, col};
     use crate::object_store::memory::InMemory;
     use crate::scan::state::DvInfo;
     use crate::schema::StructType;
@@ -1293,6 +1319,7 @@ mod tests {
             modification_time: 1234,
             data_change: false,
             stats: None,
+            predicate: None,
         }
     }
 
@@ -1621,6 +1648,38 @@ mod tests {
         }
     }
 
+    /// A test [`ParquetHandler`] that forwards reads to `inner` and records the location of every
+    /// file they read.
+    struct RecordingParquetHandler {
+        inner: Arc<dyn ParquetHandler>,
+        files: Arc<Mutex<Vec<Url>>>,
+    }
+
+    impl ParquetHandler for RecordingParquetHandler {
+        fn read_parquet_files(
+            &self,
+            files: &[FileMeta],
+            schema: SchemaRef,
+            predicate: Option<PredicateRef>,
+        ) -> KernelResult<FileDataReadResultIterator> {
+            let locations = files.iter().map(|file| file.location.clone());
+            self.files.lock().unwrap().extend(locations);
+            self.inner.read_parquet_files(files, schema, predicate)
+        }
+
+        fn read_parquet_footer(&self, file: &FileMeta) -> KernelResult<ParquetFooter> {
+            self.inner.read_parquet_footer(file)
+        }
+
+        fn write_parquet_file(
+            &self,
+            location: Url,
+            data: Box<dyn KernelResultIterator<Box<dyn EngineData>>>,
+        ) -> KernelResult<FileSize> {
+            self.inner.write_parquet_file(location, data)
+        }
+    }
+
     /// Splits one read batch into a zero-row batch followed by one batch per row.
     fn split_batch(
         batch: KernelResult<Box<dyn EngineData>>,
@@ -1812,6 +1871,106 @@ mod tests {
             expected_adds(("a.parquet", 100, 1000, 5, 10)),
         ];
         assert_eq!(actual, expected);
+    }
+
+    /// The physical Delta stats schema of a scan reading every stat of `phys_id`, the column the
+    /// checkpoint's schema (see `checkpoint_action_with_root`) gives field ID 1.
+    fn phys_id_stats_schema() -> StructType {
+        let leaf = || StructType::new_unchecked([StructField::nullable("phys_id", DataType::LONG)]);
+        StructType::new_unchecked([
+            StructField::nullable(NUM_RECORDS, DataType::LONG),
+            StructField::nullable(NULL_COUNT, leaf()),
+            StructField::nullable(MIN_VALUES, leaf()),
+            StructField::nullable(MAX_VALUES, leaf()),
+        ])
+    }
+
+    /// A predicate skips the leaf manifests whose root entry's `content_stats` prove that none of
+    /// their rows match, without reading them. `a.parquet`'s leaf holds `phys_id` in `[1, 9]` and
+    /// `b.parquet`'s in `[20, 30]`. The root's own data file `root.parquet`, between the two leaf
+    /// entries, holds `phys_id` in `[10, 12]`: no predicate matches it, but leaf skipping never
+    /// drops a data file. Splitting the root into one batch per row checks that each batch is
+    /// filtered by its own selection.
+    #[rstest]
+    #[case::matches_second_leaf(Some(col!("phys_id").gt(lit(15i64))), &["b.parquet"])]
+    #[case::matches_first_leaf(Some(col!("phys_id").lt(lit(5i64))), &["a.parquet"])]
+    #[case::matches_no_leaf(Some(col!("phys_id").gt(lit(100i64))), &[])]
+    #[case::no_predicate(None, &["a.parquet", "b.parquet"])]
+    fn read_add_actions_from_amt_skips_leaves_by_content_stats(
+        #[case] predicate: Option<Predicate>,
+        #[case] expected_leaf_paths: &[&str],
+        #[values(ReadShape::AsIs, ReadShape::Split)] shape: ReadShape,
+    ) {
+        let sync = Arc::new(memory_engine());
+        let reads = Arc::new(Mutex::default());
+        // Records one read per manifest file, before the reshaping splits it into batches.
+        let recording = Arc::new(RecordingParquetHandler {
+            inner: sync.parquet_handler(),
+            files: reads.clone(),
+        });
+        let shaped = Arc::new(ShapedParquetHandler {
+            inner: recording,
+            shape,
+        });
+        let engine = DelegatingEngine::new(sync).with_parquet_handler(shaped);
+        // Every entry records the stats of a 10-row `phys_id` in `bounds`, with no nulls.
+        let write = |path: &str, entries: &[(ContentTreeNodeEntry, [i64; 2])]| {
+            let location = table_root().join(path).unwrap();
+            let (entries, stats): (Vec<_>, Vec<_>) = entries
+                .iter()
+                .map(|(entry, [lower, upper])| {
+                    let stats = x_stats(&x_full_stats(), &[*lower, *upper, 10, 0]);
+                    (entry.clone(), stats)
+                })
+                .unzip();
+            write_manifest_with_stats(&engine, location, &entries, &x_full_stats(), stats)
+        };
+        // A root entry for a leaf holding only `file`, its stats those of the leaf's one entry.
+        let leaf = |file: &str, bounds: [i64; 2], first_row_id: i64| {
+            let path = format!("metadata/leaf-{file}");
+            let manifest = write(
+                &path,
+                &[(leaf_entry(file, 100, 10, None, None, None), bounds)],
+            );
+            let mut entry = data_manifest_entry(&path, manifest.size as i64, TrackingStatus::Added);
+            entry.tracking = parent_tracking(Some(1), Some(5), Some(5), Some(first_row_id));
+            (entry, bounds)
+        };
+        let root = write(
+            ROOT_PATH,
+            &[
+                leaf("a.parquet", [1, 9], 0),
+                (added_data_entry("root.parquet", 50, 10, 600, 4), [10, 12]),
+                leaf("b.parquet", [20, 30], 10),
+            ],
+        );
+        let checkpoint = checkpoint_action_with_root(ROOT_PATH, root.size as i64, 1).unwrap();
+        let ctx = ReadContext {
+            stats: Some(StatsRead::try_new(&checkpoint, phys_id_stats_schema()).unwrap()),
+            predicate: predicate.map(Arc::new),
+            ..read_ctx()
+        };
+
+        let paths: Vec<String> = read_add_actions_from_amt(&engine, &checkpoint, &ctx, None)
+            .unwrap()
+            .flat_map(|batch| {
+                let batch = filtered_to_batch(batch.unwrap())
+                    .try_into_record_batch()
+                    .unwrap();
+                let adds = batch.column_by_name(ADD_NAME).unwrap().as_struct();
+                let paths = adds.column_by_name(PATH_NAME).unwrap().as_string::<i32>();
+                paths
+                    .iter()
+                    .map(|p| p.unwrap().to_string())
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        let expected_paths: Vec<_> = iter::once("root.parquet")
+            .chain(expected_leaf_paths.iter().copied())
+            .collect();
+        assert_eq!(paths, expected_paths);
+        // The root manifest, then only the leaves that were not skipped.
+        assert_eq!(reads.lock().unwrap().len(), 1 + expected_leaf_paths.len());
     }
 
     /// A live entry's deletion vector reaches its `Add` as a descriptor for the writer's DV file:

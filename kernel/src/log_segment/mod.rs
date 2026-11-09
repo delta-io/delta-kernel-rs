@@ -1055,6 +1055,8 @@ impl LogSegment {
     /// checkpoint's adds carry `stats_schema` as `add.stats_parsed`, read from the content tree's
     /// `content_stats`. Those are keyed by the checkpoint's schema, so the caller sets it only when
     /// `stats_schema` is derived from that same schema; otherwise the tree's adds carry no stats.
+    /// `predicate`, over physical column names, skips the manifests whose stats prove that none of
+    /// their files match.
     #[cfg(feature = "adaptive-metadata-in-dev")]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn read_actions_with_checkpoint_action(
@@ -1066,6 +1068,7 @@ impl LogSegment {
         checkpoint_read_schema: SchemaRef,
         stats_schema: Option<&StructType>,
         stats_parsed: bool,
+        predicate: Option<PredicateRef>,
     ) -> KernelResult<ActionsWithCheckpointInfo<Box<dyn KernelResultIterator<ActionsBatch>>>> {
         let version = Version::try_from(checkpoint.version())
             .ok()
@@ -1119,6 +1122,7 @@ impl LogSegment {
             &LogRoot::new(table_root.clone())?,
             checkpoint_read_schema.clone(),
             stats_parsed_schema,
+            predicate,
         )
         .map_err(KernelError::generic_err)?;
         Ok(ActionsWithCheckpointInfo {

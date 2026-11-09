@@ -145,6 +145,12 @@ pub(crate) fn field_with_id(
     )])
 }
 
+/// The name of the `content_stats` field holding the stats of the leaf at `path` (root to leaf):
+/// the leaf's full dotted path, with any segment containing a dot backtick-escaped.
+pub(crate) fn content_stats_leaf_name(path: &[String]) -> String {
+    ColumnName::new(path).to_string()
+}
+
 /// Extracts the parquet field ID from a [`StructField`]'s metadata, or `None` if absent.
 fn get_field_id(field: &StructField) -> Option<i32> {
     match field.get_config_value(&ColumnMetadataKey::ParquetFieldId) {
@@ -360,7 +366,7 @@ fn leaf_stats_field(
 
     // Keyed by the base stats field ID, not the source column's field ID, and without its logical
     // (column-mapping) metadata.
-    let name = ColumnName::new(path).to_string();
+    let name = content_stats_leaf_name(path);
     Ok(Some(field_with_id(
         &name,
         stats_struct.into(),

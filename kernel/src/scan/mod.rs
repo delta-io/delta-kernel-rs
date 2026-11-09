@@ -1509,6 +1509,7 @@ impl Scan {
                     checkpoint_schema,
                     physical_stats_read_schema,
                     stats_parsed,
+                    self.physical_predicate(),
                 );
         }
         // Checkpoints already represent reconciled state, so scans project only Add actions. This
