@@ -7,7 +7,8 @@ use std::borrow::Cow;
 
 use url::{ParseError, Url};
 
-use crate::path_encoding::{scheme_len, uri_decode_path, uri_encode_path, with_trailing_slash};
+use crate::path_encoding::{uri_decode_path, uri_encode_path, with_trailing_slash};
+use crate::uri_reference::scheme_len;
 use crate::utils::{require, to_file_size};
 use crate::{FileMeta, KernelError, KernelResult};
 
