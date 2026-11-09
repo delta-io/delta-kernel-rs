@@ -5,12 +5,12 @@ use super::deserialize::{parse_bool, parse_column_names, parse_interval, parse_p
 use super::{
     APPEND_ONLY, AUTO_COMPACT, CHECKPOINT_INTERVAL, CHECKPOINT_POLICY,
     CHECKPOINT_WRITE_STATS_AS_JSON, CHECKPOINT_WRITE_STATS_AS_STRUCT, COLUMN_MAPPING_MAX_COLUMN_ID,
-    COLUMN_MAPPING_MODE, DATA_SKIPPING_NUM_INDEXED_COLS, DATA_SKIPPING_STATS_COLUMNS,
-    DELETED_FILE_RETENTION_DURATION, DELTA_PROPERTY_PREFIX, DataSkippingNumIndexedCols,
-    ENABLE_CHANGE_DATA_FEED, ENABLE_DELETION_VECTORS, ENABLE_EXPIRED_LOG_CLEANUP,
-    ENABLE_ICEBERG_COMPAT_V1, ENABLE_ICEBERG_COMPAT_V2, ENABLE_ICEBERG_COMPAT_V3,
-    ENABLE_ICEBERG_NATIVE_V4, ENABLE_IN_COMMIT_TIMESTAMPS, ENABLE_ROW_TRACKING,
-    ENABLE_TYPE_WIDENING, IN_COMMIT_TIMESTAMP_ENABLEMENT_TIMESTAMP,
+    COLUMN_MAPPING_MODE, CheckpointPolicy, DATA_SKIPPING_NUM_INDEXED_COLS,
+    DATA_SKIPPING_STATS_COLUMNS, DELETED_FILE_RETENTION_DURATION, DELTA_PROPERTY_PREFIX,
+    DataSkippingNumIndexedCols, ENABLE_CHANGE_DATA_FEED, ENABLE_DELETION_VECTORS,
+    ENABLE_EXPIRED_LOG_CLEANUP, ENABLE_ICEBERG_COMPAT_V1, ENABLE_ICEBERG_COMPAT_V2,
+    ENABLE_ICEBERG_COMPAT_V3, ENABLE_ICEBERG_NATIVE_V4, ENABLE_IN_COMMIT_TIMESTAMPS,
+    ENABLE_ROW_TRACKING, ENABLE_TYPE_WIDENING, IN_COMMIT_TIMESTAMP_ENABLEMENT_TIMESTAMP,
     IN_COMMIT_TIMESTAMP_ENABLEMENT_VERSION, ISOLATION_LEVEL, LOG_RETENTION_DURATION,
     MATERIALIZED_ROW_COMMIT_VERSION_COLUMN_NAME, MATERIALIZED_ROW_ID_COLUMN_NAME, OPTIMIZE_WRITE,
     PARQUET_COMPRESSION_CODEC, PARQUET_FORMAT_VERSION, ParquetCompressionCodec,
@@ -18,7 +18,7 @@ use super::{
     SET_TRANSACTION_RETENTION_DURATION, TARGET_FILE_SIZE, TUNE_FILE_SIZES_FOR_REWRITES,
     strip_check_constraint_prefix,
 };
-use crate::table_features::SET_TABLE_FEATURE_SUPPORTED_PREFIX;
+use crate::table_features::{ColumnMappingMode, SET_TABLE_FEATURE_SUPPORTED_PREFIX};
 use crate::{KernelError, KernelResult};
 
 /// Definition of one recognized `delta.*` table property.
@@ -58,6 +58,14 @@ fn validate_interval(value: &str) -> bool {
 
 fn validate_column_names(value: &str) -> bool {
     parse_column_names(value).is_some()
+}
+
+fn validate_column_mapping_mode(value: &str) -> bool {
+    value.parse::<ColumnMappingMode>().is_ok()
+}
+
+fn validate_checkpoint_policy(value: &str) -> bool {
+    value.parse::<CheckpointPolicy>().is_ok()
 }
 
 fn validate_data_skipping_num_indexed_cols(value: &str) -> bool {
@@ -102,23 +110,25 @@ const EDITABLE_CONFIG_PROPERTIES: &[TablePropertyDef] = &[
     editable(PARQUET_FORMAT_VERSION, validate_parquet_format_version),
 ];
 
-/// TODO: change these to editable once protocol-preparation code is added
+/// Feature-enablement properties. Setting these on UPDATE upgrades the protocol via
+/// [`crate::transaction::protocol_prep`].
 const FEATURE_ENABLEMENT_PROPERTIES: &[TablePropertyDef] = &[
-    recognized(APPEND_ONLY),
-    recognized(COLUMN_MAPPING_MODE),
-    recognized(ENABLE_CHANGE_DATA_FEED),
-    recognized(ENABLE_DELETION_VECTORS),
-    recognized(ENABLE_TYPE_WIDENING),
-    recognized(ENABLE_ICEBERG_COMPAT_V1),
-    recognized(ENABLE_ICEBERG_COMPAT_V2),
-    recognized(ENABLE_ICEBERG_COMPAT_V3),
-    recognized(ENABLE_ICEBERG_NATIVE_V4),
-    recognized(CHECKPOINT_POLICY),
-    recognized(ENABLE_ROW_TRACKING),
-    recognized(ENABLE_IN_COMMIT_TIMESTAMPS),
+    editable(APPEND_ONLY, validate_bool),
+    editable(COLUMN_MAPPING_MODE, validate_column_mapping_mode),
+    editable(ENABLE_CHANGE_DATA_FEED, validate_bool),
+    editable(ENABLE_DELETION_VECTORS, validate_bool),
+    editable(ENABLE_TYPE_WIDENING, validate_bool),
+    editable(ENABLE_ICEBERG_COMPAT_V1, validate_bool),
+    editable(ENABLE_ICEBERG_COMPAT_V2, validate_bool),
+    editable(ENABLE_ICEBERG_COMPAT_V3, validate_bool),
+    editable(ENABLE_ICEBERG_NATIVE_V4, validate_bool),
+    editable(CHECKPOINT_POLICY, validate_checkpoint_policy),
+    editable(ENABLE_ROW_TRACKING, validate_bool),
+    editable(ENABLE_IN_COMMIT_TIMESTAMPS, validate_bool),
 ];
 
-/// TODO: ICT version/timestamp remain non-editable here until ICT protocol-preparation is added
+/// Kernel-managed keys. Writers must not set these directly; protocol prep stamps ICT
+/// enablement version/timestamp at commit time when ICT is newly enabled.
 const KERNEL_MANAGED_PROPERTIES: &[TablePropertyDef] = &[
     recognized(COLUMN_MAPPING_MAX_COLUMN_ID),
     recognized(MATERIALIZED_ROW_ID_COLUMN_NAME),
@@ -255,6 +265,11 @@ mod tests {
         "2.12.0",
         "delta.parquet.format.version"
     )]
+    #[case::feature_enablement(
+        "delta.enableDeletionVectors",
+        "true",
+        "delta.enableDeletionVectors"
+    )]
     fn accepts_editable_and_user_properties(
         #[case] key: &str,
         #[case] value: &str,
@@ -268,12 +283,6 @@ mod tests {
 
     #[rstest]
     #[case::unknown("delta.unknownProperty", "true", "Unknown configuration key")]
-    #[case::not_editable("delta.appendOnly", "true", "Cannot modify the table property")]
-    #[case::feature_enablement(
-        "delta.enableChangeDataFeed",
-        "true",
-        "Cannot modify the table property"
-    )]
     #[case::feature_signal(
         "delta.feature.deletionVectors",
         "supported",
@@ -331,31 +340,32 @@ mod tests {
         );
     }
 
-    /// Config-only keys that `create_table` accepts without protocol enablement. Keep these
-    /// editable on update so create and update do not drift on shared configuration keys.
-    const CREATE_TABLE_CONFIG_ONLY_PROPERTIES: &[&str] = &[
-        CHECKPOINT_WRITE_STATS_AS_JSON,
-        CHECKPOINT_WRITE_STATS_AS_STRUCT,
-        DATA_SKIPPING_NUM_INDEXED_COLS,
-        DATA_SKIPPING_STATS_COLUMNS,
-        SET_TRANSACTION_RETENTION_DURATION,
-        PARQUET_FORMAT_VERSION,
-        PARQUET_COMPRESSION_CODEC,
-        LOG_RETENTION_DURATION,
-        DELETED_FILE_RETENTION_DURATION,
-        ENABLE_EXPIRED_LOG_CLEANUP,
-        CHECKPOINT_INTERVAL,
-    ];
-
+    /// Config-only and feature-enablement UPDATE keys must stay editable; kernel-managed and
+    /// other recognized keys must not.
     #[test]
-    fn editable_keys_include_create_table_config_only_properties() {
-        let mut editable: Vec<&str> = EDITABLE_CONFIG_PROPERTIES
+    fn editable_and_non_editable_groups_are_consistent() {
+        assert!(
+            EDITABLE_CONFIG_PROPERTIES
+                .iter()
+                .chain(FEATURE_ENABLEMENT_PROPERTIES.iter())
+                .all(|def| def.validate.is_some()),
+            "config-only and feature-enablement groups must be editable"
+        );
+        assert!(
+            KERNEL_MANAGED_PROPERTIES
+                .iter()
+                .chain(OTHER_RECOGNIZED_PROPERTIES.iter())
+                .all(|def| def.validate.is_none()),
+            "kernel-managed and other recognized groups must not be editable"
+        );
+
+        let mut config_only: Vec<&str> = EDITABLE_CONFIG_PROPERTIES
             .iter()
             .map(|def| def.key)
             .collect();
-        editable.sort_unstable();
+        config_only.sort_unstable();
         assert_eq!(
-            editable,
+            config_only,
             [
                 "delta.checkpoint.writeStatsAsJson",
                 "delta.checkpoint.writeStatsAsStruct",
@@ -370,22 +380,14 @@ mod tests {
                 "delta.setTransactionRetentionDuration",
             ]
         );
-
-        for key in CREATE_TABLE_CONFIG_ONLY_PROPERTIES {
-            assert!(
-                EDITABLE_CONFIG_PROPERTIES.iter().any(|def| def.key == *key),
-                "{key} is accepted by create_table as config-only but is not editable on update"
-            );
-        }
     }
 
     /// Every recognized non-editable key must resolve through `find_property_def` and reject with
     /// "Cannot modify" (not "Unknown"), including case-insensitive spellings.
     #[test]
     fn rejects_every_non_editable_recognized_key() {
-        let non_editable = FEATURE_ENABLEMENT_PROPERTIES
+        let non_editable = KERNEL_MANAGED_PROPERTIES
             .iter()
-            .chain(KERNEL_MANAGED_PROPERTIES.iter())
             .chain(OTHER_RECOGNIZED_PROPERTIES.iter());
 
         for def in non_editable {

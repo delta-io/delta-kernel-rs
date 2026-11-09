@@ -2157,17 +2157,111 @@ async fn write_with_property_add_emits_metadata() -> delta_kernel::Result<()> {
 }
 
 #[tokio::test]
-async fn alter_table_rejects_feature_enabling_property() -> delta_kernel::Result<()> {
+async fn alter_table_enabling_ict_stamps_enablement_version_and_timestamp()
+-> delta_kernel::Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
     let snapshot =
         create_table_and_load_snapshot(&table_path, simple_schema(), engine.as_ref(), &[])?;
 
-    let result = snapshot
+    snapshot
+        .update_table(UpdateTableOperation::AlterTable, "test-engine", false)
+        .with_table_properties_added([("delta.enableInCommitTimestamps", "true")])
+        .build(engine.as_ref(), committer())?
+        .commit(engine.as_ref())?
+        .unwrap_committed();
+
+    let reloaded = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
+    let props = reloaded.table_properties();
+    assert_eq!(props.enable_in_commit_timestamps, Some(true));
+    assert_eq!(props.in_commit_timestamp_enablement_version, Some(1));
+    assert!(props.in_commit_timestamp_enablement_timestamp.is_some());
+    Ok(())
+}
+
+#[tokio::test]
+async fn alter_table_disabling_ict_clears_enablement_info() -> delta_kernel::Result<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+    let snapshot = create_table_and_load_snapshot(
+        &table_path,
+        simple_schema(),
+        engine.as_ref(),
+        &[("delta.enableInCommitTimestamps", "true")],
+    )?;
+
+    snapshot
+        .update_table(UpdateTableOperation::AlterTable, "test-engine", false)
+        .with_table_properties_added([("delta.enableInCommitTimestamps", "false")])
+        .build(engine.as_ref(), committer())?
+        .commit(engine.as_ref())?
+        .unwrap_committed();
+
+    let reloaded = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
+    let props = reloaded.table_properties();
+    assert_eq!(props.enable_in_commit_timestamps, Some(false));
+    assert_eq!(props.in_commit_timestamp_enablement_version, None);
+    assert_eq!(props.in_commit_timestamp_enablement_timestamp, None);
+    Ok(())
+}
+
+#[tokio::test]
+async fn alter_table_enabling_column_mapping_assigns_ids_and_physical_names()
+-> delta_kernel::Result<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+    let snapshot =
+        create_table_and_load_snapshot(&table_path, simple_schema(), engine.as_ref(), &[])?;
+
+    snapshot
+        .update_table(UpdateTableOperation::AlterTable, "test-engine", false)
+        .with_table_properties_added([("delta.columnMapping.mode", "name")])
+        .build(engine.as_ref(), committer())?
+        .commit(engine.as_ref())?
+        .unwrap_committed();
+
+    let reloaded = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
+    assert_eq!(
+        reloaded.table_properties().column_mapping_mode,
+        Some(delta_kernel::table_features::ColumnMappingMode::Name)
+    );
+    assert_eq!(
+        reloaded.table_properties().column_mapping_max_column_id,
+        Some(reloaded.schema().fields().count() as i64)
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn alter_table_enables_feature_property_and_upgrades_protocol() -> delta_kernel::Result<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+    let snapshot =
+        create_table_and_load_snapshot(&table_path, simple_schema(), engine.as_ref(), &[])?;
+    assert_ne!(
+        snapshot.table_properties().enable_change_data_feed,
+        Some(true)
+    );
+
+    snapshot
         .update_table(UpdateTableOperation::AlterTable, "test-engine", false)
         .with_table_properties_added([("delta.enableChangeDataFeed", "true")])
-        .build(engine.as_ref(), committer());
+        .build(engine.as_ref(), committer())?
+        .commit(engine.as_ref())?
+        .unwrap_committed();
 
-    assert_result_error_with_message(result, "Cannot modify the table property");
+    let reloaded = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
+    assert_eq!(
+        reloaded.table_properties().enable_change_data_feed,
+        Some(true)
+    );
+    let protocol_actions = read_actions_from_commit(reloaded.table_root(), 1, "protocol")?;
+    assert_eq!(protocol_actions.len(), 1);
+    let writer_features = protocol_actions[0]["writerFeatures"]
+        .as_array()
+        .expect("writerFeatures array");
+    assert!(
+        writer_features
+            .iter()
+            .any(|feature| feature.as_str() == Some("changeDataFeed")),
+        "protocol={protocol_actions:?}"
+    );
     Ok(())
 }
 
