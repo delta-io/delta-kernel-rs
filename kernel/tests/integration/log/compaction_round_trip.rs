@@ -6,6 +6,7 @@ use delta_kernel::commit_range::{CommitRange, DeltaAction};
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine_data::FilteredEngineData;
 use delta_kernel::expressions::{Predicate, PredicateRef, expr};
+use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::{DynObjectStore, ObjectStoreExt};
 use delta_kernel::scan::{AfterSequentialScanMetadata, ParallelScanMetadata};
@@ -24,14 +25,17 @@ use serde_json::json;
 use test_utils::delta_kernel_default_engine::DefaultEngineBuilder;
 use test_utils::delta_kernel_default_engine::executor::tokio::TokioMultiThreadExecutor;
 use test_utils::table_builder::{FeatureSet, LogState, TestTableBuilder, all_features_cm_name};
-use test_utils::{add_commit, begin_transaction, into_record_batch, read_scan};
+use test_utils::{
+    add_commit, assert_result_error_with_message, begin_transaction, into_record_batch,
+    load_test_data, read_scan,
+};
 use url::Url;
 
 #[rstest]
 #[tokio::test(flavor = "multi_thread")]
 async fn partial_compaction_preserves_suppression(
     #[values(false, true)] checkpoint_prefix: bool,
-    #[values("domain", "file", "transaction")] action: &str,
+    #[values("domain", "file", "file_without_timestamp", "transaction")] action: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let table = TestTableBuilder::new()
         .with_log_state(LogState::with_latest_version(1))
@@ -65,15 +69,24 @@ async fn partial_compaction_preserves_suppression(
             .build(engine.as_ref())?
             .checkpoint(engine.as_ref(), None)?;
     }
-    // The builder cannot express historical deletion/transaction timestamps.
+    // The builder cannot express historical or missing deletion/transaction timestamps.
+    let mut remove = json!({"path": data_path.as_ref(), "dataChange": true});
+    if action != "file_without_timestamp" {
+        remove["deletionTimestamp"] = json!(1);
+    }
     add_commit(
-        table.table_root(), table.store().as_ref(), 3,
+        table.table_root(),
+        table.store().as_ref(),
+        3,
         [
-            json!({"remove": {"path": data_path.as_ref(), "deletionTimestamp": 1, "dataChange": true}}),
+            json!({"remove": remove}),
             json!({"domainMetadata": {"domain": "test", "configuration": "", "removed": true}}),
             json!({"txn": {"appId": "app", "version": 2, "lastUpdated": 1}}),
-        ].map(|action| action.to_string()).join("\n"),
-    ).await?;
+        ]
+        .map(|action| action.to_string())
+        .join("\n"),
+    )
+    .await?;
     add_commit(
         table.table_root(),
         table.store().as_ref(),
@@ -113,7 +126,7 @@ async fn partial_compaction_preserves_suppression(
                 .get_app_id_version("app", engine.as_ref())?,
             None
         ),
-        "file" => {
+        "file" | "file_without_timestamp" => {
             assert!(read_scan(&compacted.scan_builder().build()?, engine.clone())?.is_empty())
         }
         _ => panic!("unknown action"),
@@ -156,9 +169,17 @@ async fn compaction_reads_match_commits(
         let snapshot = Snapshot::builder_for(table.table_root())
             .at_version(version)
             .build(engine.as_ref())?;
-        baselines.push((snapshot.clone(), scan_rows(snapshot, engine.clone())?));
+        baselines.push((snapshot.clone(), scan_results(snapshot, engine.clone())?));
     }
-    let latest = baselines.last().unwrap().0.clone();
+    let (latest, expected) = baselines.last().unwrap();
+    let all_files = expected[0].files.len();
+    assert!(!expected[1].files.is_empty());
+    assert!(expected[1].files.len() < all_files);
+    if mapped_partitioned {
+        assert!(!expected[2].files.is_empty());
+        assert!(expected[2].files.len() < all_files);
+    }
+    let latest = latest.clone();
     let mut paths = vec![];
     for &(start, end) in &ranges {
         paths.push(write_compaction(&latest, engine.as_ref(), start, end)?);
@@ -175,7 +196,7 @@ async fn compaction_reads_match_commits(
             baseline.table_configuration().protocol()
         );
         assert_eq!(fresh.table_properties(), baseline.table_properties());
-        assert_eq!(scan_rows(fresh.clone(), engine.clone())?, *expected);
+        assert_eq!(scan_results(fresh.clone(), engine.clone())?, *expected);
         let eligible = ranges.iter().any(|&(start, end)| {
             end <= baseline.version() && (!checkpoint || baseline.version() < 2 || start > 2)
         });
@@ -194,13 +215,13 @@ async fn compaction_reads_match_commits(
         let updated = Snapshot::builder_from(baselines[0].0.clone())
             .at_version(baseline.version())
             .build(engine.as_ref())?;
-        assert_eq!(scan_rows(updated, engine.clone())?, *expected);
+        assert_eq!(scan_results(updated, engine.clone())?, *expected);
     }
     let compacted = Snapshot::builder_for(table.table_root()).build(engine.as_ref())?;
     compacted.checkpoint(engine.as_ref(), None)?;
     let reloaded = Snapshot::builder_for(table.table_root()).build(engine.as_ref())?;
     assert_eq!(
-        scan_rows(reloaded.clone(), engine.clone())?,
+        scan_results(reloaded.clone(), engine.clone())?,
         baselines.last().unwrap().1
     );
     let committed = begin_transaction(reloaded, engine.as_ref())?
@@ -247,12 +268,16 @@ async fn unusable_compaction_does_not_return_partial_state(
 #[tokio::test(flavor = "multi_thread")]
 async fn compaction_requires_readable_source_commits(
     #[values(false, true)] malformed: bool,
+    #[values(false, true)] existing_compaction: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let table = TestTableBuilder::new()
         .with_log_state(LogState::with_latest_version(3))
         .build()?;
     let engine = recording_engine(table.store().clone(), 1);
     let snapshot = Snapshot::builder_for(table.table_root()).build(engine.as_ref())?;
+    if existing_compaction {
+        write_compaction(&snapshot, engine.as_ref(), 1, 3)?;
+    }
     let path = Path::from("_delta_log/00000000000000000002.json");
     if malformed {
         table.store().put(&path, "{".into()).await?;
@@ -264,6 +289,199 @@ async fn compaction_requires_readable_source_commits(
         .compaction_data(engine.as_ref())
         .and_then(|data| data.collect::<KernelResult<Vec<_>>>());
     assert!(result.is_err());
+    if !malformed {
+        assert!(
+            Snapshot::builder_for(table.table_root())
+                .build(engine.as_ref())
+                .is_err()
+        );
+    }
+    Ok(())
+}
+
+#[rstest]
+#[case::missing(None, false)]
+#[case::behind(Some(1), false)]
+#[case::missing_newer_checkpoint_rejected(Some(9), true)]
+#[tokio::test(flavor = "multi_thread")]
+async fn checkpoint_hint_behavior_with_compaction(
+    #[case] hint_version: Option<u64>,
+    #[case] fails: bool,
+    #[values(false, true)] compact: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let table = TestTableBuilder::new()
+        .with_log_state(LogState::with_latest_version(5).with_checkpoint_at([1, 3]))
+        .with_schema(schema_ref! { nullable "id": INTEGER })
+        .build()?;
+    let engine = recording_engine(table.store().clone(), 1);
+    let baseline = Snapshot::builder_for(table.table_root()).build(engine.as_ref())?;
+    let expected = scan_results(baseline.clone(), engine.clone())?;
+    let compaction = compact
+        .then(|| write_compaction(&baseline, engine.as_ref(), 4, 5))
+        .transpose()?;
+    let hint = Path::from("_delta_log/_last_checkpoint");
+    if let Some(version) = hint_version {
+        table
+            .store()
+            .put(
+                &hint,
+                json!({"version": version, "size": 1}).to_string().into(),
+            )
+            .await?;
+    } else {
+        table.store().delete(&hint).await?;
+    }
+    engine.json.reads.lock().unwrap().clear();
+    let result = Snapshot::builder_for(table.table_root()).build(engine.as_ref());
+    if fails {
+        assert_result_error_with_message(
+            result,
+            "Had a _last_checkpoint hint but didn't find any checkpoints",
+        );
+    } else {
+        let snapshot = result?;
+        assert_eq!(snapshot.version(), baseline.version());
+        assert_eq!(scan_results(snapshot, engine.clone())?, expected);
+        if let Some(path) = compaction {
+            assert!(engine.json.reads.lock().unwrap().contains(&path));
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn compaction_cannot_advance_latest_version() -> Result<(), Box<dyn std::error::Error>> {
+    let table = TestTableBuilder::new()
+        .with_log_state(LogState::with_latest_version(3))
+        .with_schema(schema_ref! { nullable "id": INTEGER })
+        .build()?;
+    let engine = recording_engine(table.store().clone(), 1);
+    let baseline = Snapshot::builder_for(table.table_root()).build(engine.as_ref())?;
+    let expected = scan_results(baseline.clone(), engine.clone())?;
+    let path = write_compaction(&baseline, engine.as_ref(), 1, 3)?;
+    let source = Path::from_url_path(path.path())?;
+    let future = Path::from("_delta_log/00000000000000000001.00000000000000000004.compacted.json");
+    let contents = table.store().get(&source).await?.bytes().await?;
+    table.store().put(&future, contents.into()).await?;
+    table.store().delete(&source).await?;
+    engine.json.reads.lock().unwrap().clear();
+    let snapshot = Snapshot::builder_for(table.table_root()).build(engine.as_ref())?;
+    assert_eq!(snapshot.version(), 3);
+    assert_eq!(scan_results(snapshot, engine.clone())?, expected);
+    assert!(
+        !engine
+            .json
+            .reads
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|p| p.path().ends_with(".compacted.json"))
+    );
+    Ok(())
+}
+
+#[rstest]
+#[tokio::test(flavor = "multi_thread")]
+async fn compaction_without_adds_preserves_state(
+    #[values("domain", "transaction", "removal", "empty")] action: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let table = TestTableBuilder::new()
+        .with_log_state(LogState::with_latest_version(1))
+        .with_schema(schema_ref! { nullable "id": INTEGER })
+        .with_features(FeatureSet::new().domain_metadata())
+        .build()?;
+    let engine = recording_engine(table.store().clone(), 1);
+    let mut snapshot = Snapshot::builder_for(table.table_root()).build(engine.as_ref())?;
+    for version in 1..=3 {
+        let mut txn = begin_transaction(snapshot.clone(), engine.as_ref())?;
+        match action {
+            "transaction" => txn = txn.with_transaction_id("app".into(), version),
+            "domain" => txn = txn.with_domain_metadata("app.config".into(), version.to_string()),
+            "removal" => {
+                for batch in snapshot
+                    .scan_builder()
+                    .build()?
+                    .scan_metadata(engine.as_ref())?
+                {
+                    txn.remove_files(batch?.scan_files);
+                }
+            }
+            "empty" => (),
+            _ => panic!("unknown action"),
+        }
+        snapshot = txn.commit(engine.as_ref())?.unwrap_post_commit_snapshot();
+    }
+    let expected_rows = scan_results(snapshot.clone(), engine.clone())?;
+    if action == "removal" {
+        assert!(expected_rows[0].files.is_empty());
+    }
+    let path = write_compaction(&snapshot, engine.as_ref(), 2, 4)?;
+    engine.json.reads.lock().unwrap().clear();
+    let fresh = Snapshot::builder_for(table.table_root()).build(engine.as_ref())?;
+    assert_eq!(fresh.version(), 4);
+    if action == "transaction" {
+        assert_eq!(
+            fresh.reader().get_app_id_version("app", engine.as_ref())?,
+            Some(3)
+        );
+    } else if action == "domain" {
+        assert_eq!(
+            fresh
+                .reader()
+                .get_domain_metadata("app.config", engine.as_ref())?
+                .as_deref(),
+            Some("3")
+        );
+    }
+    assert_eq!(scan_results(fresh, engine.clone())?, expected_rows);
+    if action == "empty" {
+        assert_eq!(
+            table
+                .store()
+                .head(&Path::from_url_path(path.path())?)
+                .await?
+                .size,
+            0
+        );
+    }
+    assert_eq!(
+        engine.json.reads.lock().unwrap().contains(&path),
+        action != "empty"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn compaction_preserves_nested_variant_data() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = load_test_data("./tests/data", "unshredded-variant")?;
+    let table_root = Url::from_directory_path(directory.path().join("unshredded-variant"))
+        .unwrap()
+        .to_string();
+    let engine = recording_engine(Arc::new(LocalFileSystem::new()), 1);
+    // Version 1 precedes the fixture's checkpoint, so the scan must replay the compaction.
+    let baseline = Snapshot::builder_for(&table_root)
+        .at_version(1)
+        .build(engine.as_ref())?;
+    let predicates = vec![
+        None,
+        Some(Arc::new(Predicate::from_expr(expr!(col("id") >= 50i64)))),
+    ];
+    let expected =
+        scan_results_with_predicates(baseline.clone(), engine.clone(), predicates.clone())?;
+    assert!(!expected[0].files.is_empty());
+    assert!(!expected[1].files.is_empty());
+    assert!(expected[1].files.len() < expected[0].files.len());
+    let path = write_compaction(&baseline, engine.as_ref(), 0, 1)?;
+    engine.json.reads.lock().unwrap().clear();
+    let fresh = Snapshot::builder_for(&table_root)
+        .at_version(1)
+        .build(engine.as_ref())?;
+    assert_eq!(fresh.schema(), baseline.schema());
+    assert_eq!(
+        scan_results_with_predicates(fresh, engine.clone(), predicates)?,
+        expected
+    );
+    assert!(engine.json.reads.lock().unwrap().contains(&path));
     Ok(())
 }
 
@@ -347,14 +565,14 @@ async fn compaction_preserves_schema_changes(
             .commit(engine.as_ref())?
             .unwrap_post_commit_snapshot();
     }
-    let expected = scan_rows(latest.clone(), engine.clone())?;
+    let expected = scan_results(latest.clone(), engine.clone())?;
     let path = write_compaction(&latest, engine.as_ref(), 2, 3)?;
     engine.json.reads.lock().unwrap().clear();
     let fresh = Snapshot::builder_for(table.table_root()).build(engine.as_ref())?;
     let incremental = Snapshot::builder_from(old).build(engine.as_ref())?;
     for snapshot in [fresh, incremental] {
         assert_eq!(snapshot.schema(), latest.schema());
-        assert_eq!(scan_rows(snapshot, engine.clone())?, expected);
+        assert_eq!(scan_results(snapshot, engine.clone())?, expected);
     }
     assert!(engine.json.reads.lock().unwrap().contains(&path));
     Ok(())
@@ -413,8 +631,8 @@ async fn compaction_preserves_protocol_upgrades(
         assert_eq!(config.protocol(), expected);
         assert!(config.is_feature_supported(&TableFeature::TimestampWithoutTimezone));
         assert_eq!(
-            scan_rows(snapshot, engine.clone())?,
-            scan_rows(latest.clone(), engine.clone())?
+            scan_results(snapshot, engine.clone())?,
+            scan_results(latest.clone(), engine.clone())?
         );
     }
     assert!(engine.json.reads.lock().unwrap().contains(&path));
@@ -474,10 +692,37 @@ async fn parallel_metadata_uses_compaction(
     Ok(())
 }
 
-fn scan_rows(
+#[derive(Debug, PartialEq, Eq)]
+struct ScanResult {
+    files: Vec<String>,
+    rows: Vec<String>,
+}
+
+fn scan_results(
     snapshot: Arc<Snapshot>,
     engine: Arc<dyn Engine>,
-) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+) -> Result<Vec<ScanResult>, Box<dyn std::error::Error>> {
+    let mut predicates = vec![
+        None,
+        Some(Arc::new(Predicate::from_expr(expr!(col("id") >= 3000)))),
+    ];
+    if snapshot
+        .schema()
+        .fields()
+        .any(|field| field.name() == "part")
+    {
+        predicates.push(Some(Arc::new(Predicate::from_expr(expr!(
+            col("part") == "part_1000"
+        )))));
+    }
+    scan_results_with_predicates(snapshot, engine, predicates)
+}
+
+fn scan_results_with_predicates(
+    snapshot: Arc<Snapshot>,
+    engine: Arc<dyn Engine>,
+    predicates: Vec<Option<PredicateRef>>,
+) -> Result<Vec<ScanResult>, Box<dyn std::error::Error>> {
     let mut schema = snapshot.schema().as_ref().clone();
     if snapshot.table_properties().enable_row_tracking == Some(true) {
         schema = schema
@@ -485,10 +730,7 @@ fn scan_rows(
             .add_metadata_column("row_commit_version", MetadataColumnSpec::RowCommitVersion)?;
     }
     let mut results = vec![];
-    for predicate in [
-        None,
-        Some(Arc::new(Predicate::from_expr(expr!(col("id") >= 200)))),
-    ] {
+    for predicate in predicates {
         let mut builder = snapshot
             .clone()
             .scan_builder()
@@ -496,14 +738,21 @@ fn scan_rows(
         if let Some(p) = predicate {
             builder = builder.with_predicate(p);
         }
-        let batches = read_scan(&builder.build()?, engine.clone())?;
+        let scan = builder.build()?;
+        let mut files = vec![];
+        for batch in scan.scan_metadata(engine.as_ref())? {
+            files =
+                batch?.visit_scan_files(files, |paths: &mut Vec<String>, f| paths.push(f.path))?;
+        }
+        files.sort();
+        let batches = read_scan(&scan, engine.clone())?;
         let mut rows = pretty_format_batches(&batches)?
             .to_string()
             .lines()
             .map(str::to_owned)
             .collect::<Vec<_>>();
         rows.sort();
-        results.push(rows.join("\n"));
+        results.push(ScanResult { files, rows });
     }
     Ok(results)
 }
