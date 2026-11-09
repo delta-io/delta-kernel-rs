@@ -526,7 +526,7 @@ mod tests {
         summary: &Handle<SharedIncrementalScanSummary>,
     ) -> Vec<(String, Option<String>)> {
         let keys = RefCell::new(Vec::new());
-        let ctx = std::ptr::NonNull::new(&keys as *const _ as *mut std::ffi::c_void);
+        let ctx = Some(std::ptr::NonNull::from_ref(&keys).cast());
         unsafe {
             incremental_scan_summary_visit_live_adds(summary.shallow_copy(), ctx, collect_key)
         };
@@ -537,7 +537,7 @@ mod tests {
         summary: &Handle<SharedIncrementalScanSummary>,
     ) -> Vec<(String, Option<String>)> {
         let keys = RefCell::new(Vec::new());
-        let ctx = std::ptr::NonNull::new(&keys as *const _ as *mut std::ffi::c_void);
+        let ctx = Some(std::ptr::NonNull::from_ref(&keys).cast());
         unsafe { incremental_scan_summary_visit_removes(summary.shallow_copy(), ctx, collect_key) };
         keys.into_inner()
     }

@@ -2290,9 +2290,9 @@ async fn test_file_histogram_tracks_adds_and_removes_across_bins() -> KernelResu
     // Find the exact bin for the large file based on its actual size
     let boundaries = hist.sorted_bin_boundaries();
     let large_bin = boundaries
-        .windows(2)
+        .array_windows()
         .enumerate()
-        .find(|(_, w)| large_size >= w[0] && large_size < w[1])
+        .find(|(_, [lo, hi])| large_size >= *lo && large_size < *hi)
         .map(|(i, _)| i)
         .unwrap_or(boundaries.len() - 1);
     assert_eq!(
