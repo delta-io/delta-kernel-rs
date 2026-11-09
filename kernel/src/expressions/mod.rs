@@ -161,9 +161,12 @@ pub enum UnaryExpressionOp {
     ///
     /// [Per-file Statistics]: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#per-file-statistics
     ToJson,
-    /// Percent-encodes the path of a raw (unencoded) STRING URI reference: space, `"`, `#`, `%`,
-    /// `<`, `>`, `?`, `[`, `\`, `]`, `^`, `` ` ``, `{`, `|`, `}`, ASCII controls, and every byte of
-    /// a non-ASCII character become `%XX`. Everything else, including `/` and `:`, is kept.
+    /// Percent-encodes the path of a raw (unencoded) STRING URI reference the way kernel encodes
+    /// `add.path`. Characters that are not legal in a URI path, such as space, `#`, `%` and `?`,
+    /// become `%XX`. Path separators (`/`), `.` and `:` are kept. The exact set of encoded
+    /// characters follows kernel's `add.path` encoding and may change with it, for example in how
+    /// non-ASCII characters are written.
+    ///
     /// When the reference begins with a scheme (see [`UnaryPredicateOp::HasUriScheme`]), its
     /// `scheme:` and any `//authority` (up to the next `/`) are kept verbatim. Existing `%XX`
     /// escapes are not recognized, so an already-encoded input is encoded again. The output is
