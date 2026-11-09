@@ -24,6 +24,12 @@ pub enum UpdateTableOperation {
     /// build time. Commit validation retains the data-change check and rejects any staged data-file
     /// batches or manifest writes, including empty or fully unselected data-file batches. See the
     /// builder's [schema-change workflows](super::UpdateTableTransactionBuilder#schema-changes).
+    ///
+    /// Writes `commitInfo.operation = "ALTER TABLE"`. Delta Spark records finer-grained names for
+    /// the same kinds of change (`ADD COLUMNS`, `CHANGE COLUMN`, `SET TBLPROPERTIES`,
+    /// `UNSET TBLPROPERTIES`, and so on). Connectors that need Spark-matching history names can
+    /// pass [`Custom`](Self::Custom) with that string instead; Kernel still applies the same
+    /// metadata-change rules when the builder stages schema or property updates.
     AlterTable,
     /// A row deletion.
     Delete,
