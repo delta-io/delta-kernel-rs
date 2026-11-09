@@ -655,17 +655,14 @@ impl StructField {
     /// annotation may still be present (it is ignored, and the logical name is returned).
     #[internal_api]
     pub(crate) fn physical_name(&self, column_mapping_mode: ColumnMappingMode) -> &str {
-        match column_mapping_mode {
-            ColumnMappingMode::None => &self.name,
-            ColumnMappingMode::Id | ColumnMappingMode::Name => {
-                match self
-                    .metadata
-                    .get(ColumnMetadataKey::ColumnMappingPhysicalName.as_ref())
-                {
-                    Some(MetadataValue::String(physical_name)) => physical_name,
-                    _ => &self.name,
-                }
-            }
+        if let ColumnMappingMode::Id | ColumnMappingMode::Name = column_mapping_mode
+            && let Some(MetadataValue::String(physical_name)) = self
+                .metadata
+                .get(ColumnMetadataKey::ColumnMappingPhysicalName.as_ref())
+        {
+            physical_name
+        } else {
+            &self.name
         }
     }
 

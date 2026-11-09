@@ -142,7 +142,7 @@ impl FileSizeHistogram {
             ))
         );
         require!(
-            sorted_bin_boundaries.windows(2).all(|w| w[0] < w[1]),
+            sorted_bin_boundaries.array_windows().all(|[a, b]| a < b),
             KernelError::internal_error(
                 "sorted_bin_boundaries must be sorted in strictly ascending order"
             )
