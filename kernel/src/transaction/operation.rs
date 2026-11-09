@@ -219,7 +219,6 @@ mod tests {
                     "REPLACE PARTITIONED BY WITH CLUSTER BY",
                     "Deletion Vector Tombstones",
                     "TRUNCATE",
-                    "SET TBLPROPERTIES",
                 ]
                 .map(str::to_owned),
             )
@@ -250,6 +249,7 @@ mod tests {
             " LIQUID TAGGING ",
             "deletion vector tombstones",
             "Manual Update",
+            "SET TBLPROPERTIES",
             "UNSET TBLPROPERTIES",
         ] {
             let operation = UpdateTableOperation::Custom(name.to_string());

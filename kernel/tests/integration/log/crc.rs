@@ -1367,7 +1367,7 @@ async fn test_write_checksum_ignores_metadata_readds_and_counts_subsequent_white
 async fn test_write_checksum_rejects_file_actions_with_unsafe_operation(
     #[case] with_checkpoint: bool,
     #[case] replay: IncrementalReplay,
-    #[values("ANALYZE STATS", "Manual Update", "UNKNOWN")] operation: &str,
+    #[values("ANALYZE STATS", "Manual Update", "UNKNOWN", "SET TBLPROPERTIES")] operation: &str,
 ) -> delta_kernel::Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
     let snap = create_table_and_commit(&table_path, engine.as_ref())?

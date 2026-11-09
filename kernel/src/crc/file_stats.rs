@@ -152,7 +152,6 @@ impl FileStatsPolicy {
             | "REPLACE COLUMNS"
             | "UPDATE SCHEMA"
             | "REMOVE COLUMN MAPPING"
-            | "SET TBLPROPERTIES"
             | "ADD CONSTRAINT"
             | "DROP CONSTRAINT"
             | "UPGRADE PROTOCOL"

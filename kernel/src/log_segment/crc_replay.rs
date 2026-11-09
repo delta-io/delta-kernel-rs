@@ -820,7 +820,7 @@ mod tests {
     #[case::manual_update(Some("Manual Update"), false)]
     #[case::vacuum_start(Some("VACUUM START"), true)]
     #[case::vacuum_end(Some("VACUUM END"), true)]
-    #[case::set_properties(Some("SET TBLPROPERTIES"), true)]
+    #[case::set_properties(Some("SET TBLPROPERTIES"), false)]
     #[case::unknown(Some("FUTURE OPERATION"), false)]
     #[case::missing_operation(None, false)]
     fn commit_safety_depends_on_operation_only_with_file_actions(
