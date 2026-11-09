@@ -687,14 +687,15 @@ fn visit_expression_impl(
             visit_fn(visitor.data, sibling_list_id, child_list_id);
         }
         Expression::Variadic(VariadicExpression { op, exprs }) => {
+            let visit_fn = match op {
+                VariadicExpressionOp::Coalesce => visitor.visit_coalesce,
+                VariadicExpressionOp::Array => visitor.visit_array,
+                VariadicExpressionOp::Map => return visit_unknown(visitor, sibling_list_id, "map"),
+            };
             let child_list_id = call!(visitor, make_field_list, exprs.len());
             for expr in exprs {
                 visit_expression_impl(visitor, expr, child_list_id);
             }
-            let visit_fn = match op {
-                VariadicExpressionOp::Coalesce => visitor.visit_coalesce,
-                VariadicExpressionOp::Array => visitor.visit_array,
-            };
             visit_fn(visitor.data, sibling_list_id, child_list_id);
         }
         Expression::CaseWhen(CaseWhenExpression {

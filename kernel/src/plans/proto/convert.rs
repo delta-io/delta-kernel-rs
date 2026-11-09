@@ -401,8 +401,10 @@ impl From<&Expression> for proto_expr::Expression {
                     else_expr: Some(Box::new(case_when.else_expr.as_ref().into())),
                 }))
             }
-            // No proto cast node yet; serialize as an opaque unknown.
-            Expression::Cast(cast) => Kind::Unknown(format!("cast_to_{}", cast.target)),
+            Expression::Cast(cast) => Kind::Cast(Box::new(proto_expr::CastExpression {
+                expr: Some(Box::new(cast.expr.as_ref().into())),
+                target: Some((&cast.target).into()),
+            })),
         };
         proto_expr::Expression { kind: Some(kind) }
     }
@@ -584,6 +586,7 @@ impl From<VariadicExpressionOp> for proto_expr::VariadicExpressionOp {
         match op {
             VariadicExpressionOp::Coalesce => proto_expr::VariadicExpressionOp::Coalesce,
             VariadicExpressionOp::Array => proto_expr::VariadicExpressionOp::Array,
+            VariadicExpressionOp::Map => proto_expr::VariadicExpressionOp::Map,
         }
     }
 }
@@ -1813,6 +1816,8 @@ mod tests {
     #[case(Expression::unary(UnaryExpressionOp::ToJson, lit(1)), "unary")]
     #[case(Expression::binary(BinaryExpressionOp::Plus, lit(1), lit(2)), "binary")]
     #[case(expr!(coalesce(1, 2)), "variadic")]
+    #[case(Expression::map([(lit("tag"), lit(1))]), "variadic")]
+    #[case(Expression::cast(col!("count"), DataType::STRING), "cast")]
     #[case(Expression::opaque(TestOpaqueExprOp, [lit(1)]), "opaque")]
     #[case(Expression::parse_json(lit("{}"), sample_schema()), "parse_json")]
     #[case(
@@ -1843,6 +1848,7 @@ mod tests {
             Kind::Opaque(_) => "opaque",
             Kind::ParseJson(_) => "parse_json",
             Kind::MapToStruct(_) => "map_to_struct",
+            Kind::Cast(_) => "cast",
             Kind::Unknown(_) => "unknown",
         };
         assert_eq!(kind, expected);
@@ -1930,6 +1936,36 @@ mod tests {
             proto_expr::VariadicExpressionOp::Coalesce as i32
         );
         assert_eq!(variadic.exprs.len(), 3);
+    }
+
+    #[test]
+    fn map_with_cast_survives_protobuf_wire_encoding() {
+        use proto_expr::expression::Kind;
+        let expr = Expression::map([(
+            lit("literalTag"),
+            Expression::cast(col!("count"), DataType::STRING),
+        )]);
+        let proto = proto_expr::Expression::from(&expr);
+        let bytes = prost::Message::encode_to_vec(&proto);
+        let decoded: proto_expr::Expression = prost::Message::decode(bytes.as_slice()).unwrap();
+        assert_eq!(decoded, proto);
+        let Some(Kind::Variadic(map)) = decoded.kind else {
+            panic!("expected map")
+        };
+        assert_eq!(map.op, proto_expr::VariadicExpressionOp::Map as i32);
+        assert_eq!(map.exprs.len(), 2);
+        assert_eq!(
+            map.exprs[0],
+            proto_expr::Expression::from(&lit("literalTag"))
+        );
+        let Some(Kind::Cast(cast)) = &map.exprs[1].kind else {
+            panic!("expected cast")
+        };
+        assert_eq!(cast.target, Some((&DataType::STRING).into()));
+        assert_eq!(
+            cast.expr,
+            Some(Box::new(proto_expr::Expression::from(&col!("count"))))
+        );
     }
 
     #[test]
@@ -2088,6 +2124,7 @@ mod tests {
         proto_expr::VariadicExpressionOp::Coalesce
     )]
     #[case(VariadicExpressionOp::Array, proto_expr::VariadicExpressionOp::Array)]
+    #[case(VariadicExpressionOp::Map, proto_expr::VariadicExpressionOp::Map)]
     fn from_variadic_expression_op(
         #[case] op: VariadicExpressionOp,
         #[case] expected: proto_expr::VariadicExpressionOp,

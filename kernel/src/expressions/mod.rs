@@ -204,6 +204,11 @@ pub enum VariadicExpressionOp {
     /// [`Scalar::Array`] instead. The difference is that `Array` is evaluated at runtime, while
     /// `Scalar::Array` is evaluated at compile time.
     Array,
+    /// A map from alternating key/value operands. Keys must have one shared type, values must
+    /// have one shared type, and neither side receives implicit casts. Null or duplicate keys
+    /// within a row are errors; values may be null unless the result type disallows them.
+    /// Every result row is a non-null map. Empty maps require a caller-supplied map result type.
+    Map,
 }
 
 /// A junction (AND/OR) predicate operator over N child predicates.
@@ -1005,6 +1010,14 @@ impl Expression {
         Self::variadic(VariadicExpressionOp::Array, exprs)
     }
 
+    /// Creates a map from key/value expressions. See [`VariadicExpressionOp::Map`].
+    pub fn map(entries: impl IntoIterator<Item = (Expression, Expression)>) -> Self {
+        Self::variadic(
+            VariadicExpressionOp::Map,
+            entries.into_iter().flat_map(|(key, value)| [key, value]),
+        )
+    }
+
     /// Creates a searched CASE expression from ordered condition/result `branches` and an
     /// `else_expr` fallback. Empty `branches` return `else_expr` directly.
     /// All branch results and `else_expr` must have the same logical type, including typed NULLs;
@@ -1259,6 +1272,7 @@ impl Display for VariadicExpressionOp {
         match self {
             Coalesce => write!(f, "COALESCE"),
             Array => write!(f, "ARRAY"),
+            Map => write!(f, "MAP"),
         }
     }
 }
@@ -1718,9 +1732,10 @@ mod tests {
             }
         }
 
-        #[test]
-        fn test_variadic_expression_roundtrip() {
-            let expr = expr!(coalesce(col("a"), col("b"), "default"));
+        #[rstest::rstest]
+        #[case(expr!(coalesce(col("a"), col("b"), "default")))]
+        #[case(Expression::map([(lit("tag"), Expression::cast(col!("count"), DataType::STRING))]))]
+        fn test_variadic_expression_roundtrip(#[case] expr: Expression) {
             assert_roundtrip(&expr);
         }
 
