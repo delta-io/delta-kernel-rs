@@ -43,10 +43,9 @@ pub(crate) const ROW_TRACKING_PRESERVED_TAG: &str = "delta.rowTracking.preserved
 
 #[cfg(feature = "declarative-plans")]
 pub(crate) mod action_set;
-#[cfg(feature = "declarative-plans")]
-pub(crate) use action_set::ACTION_KEY;
-
 pub mod deletion_vector;
+#[cfg(feature = "declarative-plans")]
+pub(crate) use action_set::{ACTION_KEY, ActionSet};
 pub mod deletion_vector_writer;
 pub mod set_transaction;
 

@@ -18,7 +18,7 @@ pub(super) use crate::action_reconciliation::plan::MetadataPlanner;
 use crate::action_reconciliation::plan::StatsKind;
 #[cfg(test)]
 use crate::actions::ADD_SCHEMA;
-use crate::actions::{ACTION_KEY, ADD_NAME, STATS_PARSED};
+use crate::actions::{ACTION_KEY, ADD_NAME, ActionSet, STATS_PARSED};
 #[cfg(test)]
 use crate::checkpoint::CheckpointShape;
 #[cfg(test)]
@@ -46,24 +46,8 @@ const PARTITION_VALUES_PARSED: &str = "partitionValues_parsed";
 const IS_ADD: &str = "is_add";
 const VERSION: &str = "version";
 
-impl MetadataPlanner {
-    pub(super) fn try_new(scan: &Scan) -> KernelResult<Self> {
-        let stats_schema = if scan.stats.synthesize_json {
-            let config = scan.snapshot.table_configuration();
-            let columns = config
-                .physical_data_schema_without_partition_columns()
-                .leaves(None);
-            // JSON synthesis must retain stats outside the scan's requested and indexed columns.
-            let builder = config
-                .stats_schema_builder()
-                .with_required_physical_columns(Some(columns.as_ref().0))
-                .with_variant_min_max(scan.stats.variant_min_max);
-            #[cfg(feature = "geo-type-in-dev")]
-            let builder = builder.with_geometry_min_max(scan.stats.geometry_min_max);
-            Some(builder.build()?)
-        } else {
-            scan.state_info.physical_stats_read_schema().cloned()
-        };
+impl<'a> MetadataPlanner<'a> {
+    pub(super) fn try_new(scan: &'a Scan) -> KernelResult<Self> {
         let enable_metadata_filter =
             !scan.stats.synthesize_json || scan.state_info.physical_stats_output_schema().is_some();
         let stats_filter = enable_metadata_filter
@@ -78,11 +62,15 @@ impl MetadataPlanner {
         Ok(Self {
             stats: scan.stats.clone(),
             partitions: scan.partition_values_options.clone(),
-            stats_schema,
+            stats_schema: scan
+                .stats
+                .json_synthesis_schema(scan.snapshot.table_configuration())?
+                .or_else(|| scan.state_info.physical_stats_read_schema().cloned()),
             output_stats_schema: scan.state_info.physical_stats_output_schema().cloned(),
             parsed_partition_schema: parsed_partition_schema.cloned(),
             read_collations: scan.needs_collation_stats_schema(),
             stats_filter,
+            ..Self::new(scan.snapshot.log_segment(), ActionSet::files())
         })
     }
 }
@@ -100,20 +88,23 @@ impl Scan {
     pub(super) fn build_metadata_scan_plan_with(
         &self,
         base: MetadataReplayBase,
-        planner: &MetadataPlanner,
+        planner: &MetadataPlanner<'_>,
     ) -> KernelResult<Option<Plan>> {
         let state = &self.state_info;
         if state.physical_predicate == PhysicalPredicate::StaticSkipAll {
             return Ok(None);
         }
 
-        let log_segment = self.snapshot.log_segment();
-        let commit_actions = planner.commit_arm_with_action_key(log_segment, base.version())?;
+        let commit_actions = planner.commit_actions(base.version())?;
+        let base_planner = MetadataPlanner {
+            actions: ActionSet::adds(),
+            ..planner.clone()
+        };
 
         let deduped_commit = commit_actions.aggregate_by([column_name!(ACTION_KEY)], |a| {
             // Each group with a non-null ACTION_KEY contains the adds and removes for a given
             // file; winning adds pass through unchanged while winning removes produce NULL. Non-
-            // file actions have NULL ACTION_KEY and map to their own NULL group.
+            // file actions have a NULL file-identity lane and group by their own identity lanes.
             a.max_non_null_by(
                 column_name!(ADD_NAME),
                 column_name!(ACTION_KEY),
@@ -122,10 +113,10 @@ impl Scan {
         })?;
 
         let base_adds = match base {
-            MetadataReplayBase::Crc { files, .. } => planner.crc_arm_with_action_key(files),
-            MetadataReplayBase::Checkpoint { shape, .. } => {
-                planner.checkpoint_arm_with_action_key(log_segment, &shape)
-            }
+            MetadataReplayBase::Crc { version, files } => base_planner.crc_adds(version, files),
+            MetadataReplayBase::Checkpoint { shape, .. } => base_planner
+                .with_checkpoint_shape(shape)
+                .checkpoint_actions(),
         }?;
 
         let base_live_adds = base_adds
@@ -134,7 +125,7 @@ impl Scan {
                 [column_name!(ACTION_KEY)],
                 [column_name!(ACTION_KEY)],
             )?
-            .project_patch(|patch| patch.drop(ACTION_KEY))?;
+            .project_patch(|patch| patch.drop(ACTION_KEY).drop(VERSION))?;
 
         let commit_live_adds = deduped_commit
             .filter(Predicate::from_expr(expr!(is_not_null(col("add")))))?
@@ -147,7 +138,7 @@ impl Scan {
     fn build_metadata_scan_plan(
         &self,
         shape: &CheckpointShape,
-        planner: &MetadataPlanner,
+        planner: &MetadataPlanner<'_>,
     ) -> KernelResult<Option<Plan>> {
         let base = MetadataReplayBase::Checkpoint {
             version: self.snapshot.log_segment().checkpoint_version,
@@ -910,9 +901,9 @@ mod tests {
             .with_stats(StatsOptions::all_struct())
             .build()?;
         let planner = MetadataPlanner::try_new(&scan)?;
-        let file_schema = parquet_read_schema(planner.stats_schema.as_ref(), None)?;
+        let file_shape = shape(CheckpointType::Leaf, planner.stats_schema.clone());
         let plan = planner
-            .build_metadata_scan(&file_schema, false, |schema| {
+            .build_metadata_plan(Some(&file_shape), |schema| {
                 PlanBuilder::values(schema, vec![])
             })?
             .build()?;
@@ -961,8 +952,12 @@ mod tests {
                 col("x") > lit(lower_bound)
             ))))
             .build()?;
+        let file_shape = CheckpointShape {
+            checkpoint_type: CheckpointType::Leaf,
+            leaf_checkpoint_schema: Some(file_schema),
+        };
         let (read_schema, kind, _) =
-            MetadataPlanner::try_new(&scan)?.read_schema(&file_schema, false)?;
+            MetadataPlanner::try_new(&scan)?.read_schema(Some(&file_shape))?;
         assert!(kind == StatsKind::Json);
         assert_eq!(add_struct(&read_schema), &*ADD_SCHEMA);
         let batches = declarative_metadata(&scan, &SyncEngine::new_with_store(store))?;
