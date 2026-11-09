@@ -3510,7 +3510,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn update_table_builder_removes_table_property_via_ffi() -> KernelResult<()> {
+    async fn update_table_builder_removes_table_properties_via_ffi() -> KernelResult<()> {
         let (table_url, _store, engine) =
             setup_domain_metadata_table("test_update_builder_remove_property", false).await?;
         let snapshot =
@@ -3526,11 +3526,15 @@ mod tests {
         };
         let owner_key = "app.owner";
         let owner_value = "kernel";
+        let properties = [FfiStringMapEntry {
+            key: kernel_string_slice!(owner_key),
+            value: kernel_string_slice!(owner_value),
+        }];
+        let properties = unsafe { FfiStringMap::new_unsafe(&properties) };
         let builder = ok_or_panic(unsafe {
-            update_table_txn_builder_with_table_property_added(
+            update_table_txn_builder_with_table_properties_added(
                 builder,
-                kernel_string_slice!(owner_key),
-                kernel_string_slice!(owner_value),
+                &properties,
                 engine.shallow_copy(),
             )
         });
@@ -3551,10 +3555,12 @@ mod tests {
                 engine.shallow_copy(),
             ))
         };
+        let keys = [kernel_string_slice!(owner_key)];
+        let keys = unsafe { FfiStringArray::new_unsafe(&keys) };
         let builder = ok_or_panic(unsafe {
-            update_table_txn_builder_with_table_property_removed(
+            update_table_txn_builder_with_table_properties_removed(
                 builder,
-                kernel_string_slice!(owner_key),
+                &keys,
                 engine.shallow_copy(),
             )
         });

@@ -4,7 +4,7 @@ use delta_kernel::engine_data::FilteredEngineData;
 
 use super::committed::commit_result_to_committed_handle;
 use super::*;
-use crate::delta_types::FfiStringMap;
+use crate::delta_types::{FfiStringArray, FfiStringMap};
 
 /// A handle for an update-table transaction (`Transaction<UpdateTable>`).
 ///
@@ -378,34 +378,26 @@ pub unsafe extern "C" fn update_table_txn_builder_with_table_properties_added(
         .into_extern_result(&engine)
 }
 
-/// Removes a non-`delta.*` application property from the builder.
+/// Replaces requested table-property removals with a borrowed string array.
 ///
-/// Removing a missing key is not an error. `delta.*` keys and keys also present in
-/// [`update_table_txn_builder_with_table_property_added`] are rejected at build.
+/// Copies keys before returning a replacement builder, or a decoding error. Build rejects Delta
+/// property removals and overlap with additions. An absent ordinary key is a successful no-op.
 ///
 /// # Safety
 ///
-/// All handles and `key` must be valid. This call borrows `engine` and `key` and unconditionally
-/// consumes `builder`, including on error.
+/// All handles and nested string slices must be valid for this call. Borrows `keys` and `engine`
+/// and unconditionally consumes `builder`, including on errors.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn update_table_txn_builder_with_table_property_removed(
+pub unsafe extern "C" fn update_table_txn_builder_with_table_properties_removed(
     builder: Handle<ExclusiveUpdateTableTransactionBuilder>,
-    key: KernelStringSlice,
+    keys: &FfiStringArray,
     engine: Handle<SharedExternEngine>,
 ) -> ExternResult<Handle<ExclusiveUpdateTableTransactionBuilder>> {
-    let engine = unsafe { engine.as_ref() };
     let builder = unsafe { *builder.into_inner() };
-    let key = unsafe { TryFromStringSlice::try_from_slice(&key) };
-    let result = update_table_txn_builder_with_table_property_removed_impl(builder, key);
-    unsafe { result.into_extern_result(&engine) }
-}
-
-fn update_table_txn_builder_with_table_property_removed_impl(
-    builder: UpdateTableTransactionBuilder,
-    key: KernelResult<String>,
-) -> KernelResult<Handle<ExclusiveUpdateTableTransactionBuilder>> {
-    let builder = builder.with_table_properties_removed([key?]);
-    Ok(Box::new(builder).into())
+    let engine = unsafe { engine.as_ref() };
+    unsafe { keys.try_to_strings() }
+        .map(|keys| Box::new(builder.with_table_properties_removed(keys)).into())
+        .into_extern_result(&engine)
 }
 
 fn decode_single_field(schema: &EngineSchema) -> KernelResult<delta_kernel::schema::StructField> {
