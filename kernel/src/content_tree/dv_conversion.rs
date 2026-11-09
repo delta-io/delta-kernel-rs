@@ -113,7 +113,7 @@ pub(crate) fn add_deletion_vector_expression() -> Expression {
         ],
         // Keyed off the storage type helper, not `deletionVector`: row visitors read leaves
         // without the parent's null mask, so the descriptor must be null exactly where its
-        // `storageType` leaf is, including for entries the caller drops.
+        // `storageType` leaf is.
         expr!(is_not_null(path(DV_STORAGE_TYPE_HELPER))),
     )
 }
