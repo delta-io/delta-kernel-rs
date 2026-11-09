@@ -75,6 +75,7 @@ enum VariadicType {
   StructExpression,
   Coalesce,
   ArrayConstructor,
+  Concat,
 };
 enum UnaryType { Not, IsNull, HasUriScheme, UriEncodePath, Cardinality };
 typedef struct {
@@ -346,6 +347,7 @@ DEFINE_VARIADIC(visit_expr_or, Or)
 DEFINE_VARIADIC(visit_expr_struct_expr, StructExpression)
 DEFINE_VARIADIC(visit_expr_coalesce, Coalesce)
 DEFINE_VARIADIC(visit_expr_array, ArrayConstructor)
+DEFINE_VARIADIC(visit_expr_concat, Concat)
 #undef DEFINE_VARIADIC
 
 void visit_expr_case_when(void* data,
@@ -583,6 +585,7 @@ ExpressionItemList construct_expression(SharedExpression* expression) {
     .visit_map_to_struct = visit_map_to_struct_expr,
     .visit_coalesce = visit_expr_coalesce,
     .visit_array = visit_expr_array,
+    .visit_concat = visit_expr_concat,
     .visit_case_when = visit_expr_case_when,
   };
   uintptr_t top_level_id = visit_expression(&expression, &visitor);
@@ -638,6 +641,7 @@ ExpressionItemList construct_predicate(SharedPredicate* predicate) {
     .visit_map_to_struct = visit_map_to_struct_expr,
     .visit_coalesce = visit_expr_coalesce,
     .visit_array = visit_expr_array,
+    .visit_concat = visit_expr_concat,
     .visit_case_when = visit_expr_case_when,
   };
   uintptr_t top_level_id = visit_predicate(&predicate, &visitor);

@@ -115,6 +115,9 @@ StructExpression
   ArrayConstructor
     Integer(1)
     Integer(2)
+  Concat
+    String(s3://b/)
+    Column(location)
   CaseWhen
     Column(flag)
     Integer(10)
