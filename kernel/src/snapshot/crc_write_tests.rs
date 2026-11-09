@@ -19,7 +19,7 @@ use crate::transaction::UpdateTableOperation;
 use crate::transaction::create_table::create_table;
 use crate::unit_test_utils::{CapturingReporter, install_thread_local_metrics_reporter};
 use crate::{
-    Engine, FileMeta, FileSlice, KernelError, KernelResult, KernelResultIterator, Snapshot,
+    Engine, FileMeta, FileSlice, KernelError, KernelResult, KernelResultIterator, Result, Snapshot,
     StorageHandler,
 };
 
@@ -42,7 +42,7 @@ fn create_snapshot(engine: &dyn Engine) -> KernelResult<SnapshotRef> {
         .unwrap_post_commit_snapshot())
 }
 
-fn snapshot_for_root(engine: &dyn Engine, root: CrcRoot) -> KernelResult<SnapshotRef> {
+fn snapshot_for_root(engine: &dyn Engine, root: CrcRoot) -> Result<SnapshotRef> {
     let snapshot = create_snapshot(engine)?;
     match root {
         CrcRoot::Cached => return Ok(snapshot),
@@ -82,11 +82,12 @@ fn write_events(reporter: &CapturingReporter) -> Vec<CrcWrite> {
 fn crc_write_reports_utf8_bytes_and_completes_while_snapshot_is_alive(
     #[case] root: CrcRoot,
     #[case] expected_mode: CrcWriteResolutionMode,
-) -> KernelResult<()> {
-    let engine = SyncEngine::new_with_store(Arc::new(InMemory::new()));
-    let snapshot = snapshot_for_root(&engine, root)?;
+) -> Result<()> {
     let reporter = Arc::new(CapturingReporter::default());
     let _guard = install_thread_local_metrics_reporter(reporter.clone());
+    let engine = SyncEngine::new_with_store(Arc::new(InMemory::new()));
+    let snapshot = snapshot_for_root(&engine, root)?;
+    let initial_write_count = write_events(&reporter).len();
 
     let start = Instant::now();
     let (result, updated) = snapshot.write_checksum(&engine)?;
@@ -94,8 +95,8 @@ fn crc_write_reports_utf8_bytes_and_completes_while_snapshot_is_alive(
     assert_eq!(result, ChecksumWriteResult::Written);
 
     let events = write_events(&reporter);
-    assert_eq!(events.len(), 1);
-    let event = &events[0];
+    assert_eq!(events.len(), initial_write_count + 1);
+    let event = &events[initial_write_count];
     assert_eq!(event.resolution_mode, expected_mode);
     assert!(event.duration > Duration::ZERO);
     assert!(event.duration <= elapsed);
@@ -160,7 +161,9 @@ fn crc_write_already_exists_reports_no_bytes(
 fn crc_write_resolution_or_validation_error_retains_mode_and_duration(
     #[case] root: CrcRoot,
     #[case] expected_mode: CrcWriteResolutionMode,
-) -> KernelResult<()> {
+) -> Result<()> {
+    let reporter = Arc::new(CapturingReporter::default());
+    let _guard = install_thread_local_metrics_reporter(reporter.clone());
     let engine = SyncEngine::new_with_store(Arc::new(InMemory::new()));
     let mut snapshot = snapshot_for_root(&engine, root)?;
     if let CrcRoot::Cached = root {
@@ -178,15 +181,14 @@ fn crc_write_resolution_or_validation_error_retains_mode_and_duration(
             true,
         )?;
     }
-    let reporter = Arc::new(CapturingReporter::default());
-    let _guard = install_thread_local_metrics_reporter(reporter.clone());
+    let initial_write_count = write_events(&reporter).len();
 
     let start = Instant::now();
     assert!(snapshot.write_checksum(&engine).is_err());
     let elapsed = start.elapsed();
     let events = write_events(&reporter);
-    assert_eq!(events.len(), 1);
-    let event = &events[0];
+    assert_eq!(events.len(), initial_write_count + 1);
+    let event = &events[initial_write_count];
     assert_eq!(event.outcome, CrcWriteOutcome::Error);
     assert_eq!(event.resolution_mode, expected_mode);
     assert!(event.duration > Duration::ZERO);
@@ -262,11 +264,11 @@ fn crc_write_duration_includes_storage_even_on_error(
     #[case] root: CrcRoot,
     #[case] expected_mode: CrcWriteResolutionMode,
     #[values(false, true)] fail: bool,
-) -> KernelResult<()> {
-    let engine = Arc::new(SyncEngine::new_with_store(Arc::new(InMemory::new())));
-    let snapshot = snapshot_for_root(engine.as_ref(), root)?;
+) -> Result<()> {
     let reporter = Arc::new(CapturingReporter::default());
     let _guard = install_thread_local_metrics_reporter(reporter.clone());
+    let engine = Arc::new(SyncEngine::new_with_store(Arc::new(InMemory::new())));
+    let snapshot = snapshot_for_root(engine.as_ref(), root)?;
     let delay = Duration::from_millis(10);
     let storage = Arc::new(PutStorage {
         storage: engine.storage_handler(),
@@ -274,16 +276,18 @@ fn crc_write_duration_includes_storage_even_on_error(
         fail,
     });
     let engine = DelegatingEngine::new(engine).with_storage_handler(storage);
+    let initial_write_count = write_events(&reporter).len();
 
     let result = snapshot.write_checksum(&engine);
     assert_eq!(result.is_err(), fail);
     let events = write_events(&reporter);
-    assert_eq!(events.len(), 1);
+    assert_eq!(events.len(), initial_write_count + 1);
+    let event = &events[initial_write_count];
     assert_eq!(
-        events[0].outcome.as_ref(),
+        event.outcome.as_ref(),
         if fail { "error" } else { "written" }
     );
-    assert_eq!(events[0].resolution_mode, expected_mode);
-    assert!(events[0].duration >= delay);
+    assert_eq!(event.resolution_mode, expected_mode);
+    assert!(event.duration >= delay);
     Ok(())
 }

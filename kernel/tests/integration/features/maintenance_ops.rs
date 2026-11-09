@@ -1,7 +1,11 @@
 //! Integration tests for table maintenance operations (checkpoint, checksum).
 
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
 use delta_kernel::checkpoint::{CheckpointSpec, V2CheckpointConfig};
 use delta_kernel::committer::FileSystemCommitter;
+use delta_kernel::metrics::{CrcWriteOutcome, CrcWriteResolutionMode, MetricEvent};
 use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::schema::schema_ref;
 use delta_kernel::snapshot::{CheckpointWriteResult, ChecksumWriteResult};
@@ -9,7 +13,10 @@ use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::{KernelResult, Snapshot};
 use rstest::rstest;
 use serde_json::json;
-use test_utils::{add_commit, assert_result_error_with_message, test_table_setup_mt};
+use test_utils::{
+    CapturingReporter, add_commit, assert_result_error_with_message,
+    install_thread_local_metrics_reporter, test_table_setup_mt,
+};
 use url::Url;
 
 #[rstest]
@@ -190,14 +197,28 @@ async fn checkpoint_crc_writes_reject_unsupported_table_features(
     .join("\n");
     add_commit(table_url.as_str(), &store, 0, commit).await?;
 
+    let reporter = Arc::new(CapturingReporter::default());
+    let _guard = install_thread_local_metrics_reporter(reporter.clone());
     let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
     let checkpoint_result = snapshot
         .checkpoint(engine.as_ref(), checkpoint_spec.as_ref())
         .map(|_| ());
     assert_result_error_with_message(checkpoint_result, "futureFeature");
 
+    let initial_event_count = reporter.events().len();
+    let start = Instant::now();
     let checksum_result = snapshot.write_checksum(engine.as_ref()).map(|_| ());
+    let elapsed = start.elapsed();
     assert_result_error_with_message(checksum_result, "futureFeature");
+
+    let events = reporter.events();
+    let [MetricEvent::CrcWrite(event)] = &events[initial_event_count..] else {
+        panic!("expected one CrcWrite event");
+    };
+    assert_eq!(event.outcome, CrcWriteOutcome::Error);
+    assert_eq!(event.resolution_mode, CrcWriteResolutionMode::NotAttempted);
+    assert!(event.duration > Duration::ZERO);
+    assert!(event.duration <= elapsed);
 
     Ok(())
 }

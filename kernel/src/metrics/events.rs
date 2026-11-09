@@ -1352,7 +1352,7 @@ pub enum CrcWriteResolutionMode {
 pub struct CrcWrite {
     /// Final result returned by the API.
     pub outcome: CrcWriteOutcome,
-    /// CRC construction attempted during this call.
+    /// CRC construction path selected during this call; retained on failure.
     pub resolution_mode: CrcWriteResolutionMode,
     /// Wall-clock time from API entry to return, including errors and snapshot updates.
     pub duration: Duration,

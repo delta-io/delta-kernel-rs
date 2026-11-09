@@ -3,6 +3,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 #[cfg(feature = "internal-api")]
 use delta_kernel::LogPath;
@@ -13,6 +14,7 @@ use delta_kernel::crc::{Crc, DomainMetadataState, SetTransactionState};
 use delta_kernel::engine::arrow_conversion::TryFromKernel;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::engine::{DelegatingEngine, PanicEngine};
+use delta_kernel::metrics::{CrcWriteOutcome, CrcWriteResolutionMode, MetricEvent};
 use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::path::ParsedLogPath;
 use delta_kernel::schema::{SchemaRef, schema_ref};
@@ -30,9 +32,9 @@ use rstest::rstest;
 use test_utils::delta_kernel_default_engine::executor::TaskExecutor;
 use test_utils::delta_kernel_default_engine::{DefaultEngine, DefaultEngineBuilder};
 use test_utils::{
-    add_commit, assert_result_error_with_message, begin_transaction_with, copy_directory,
-    insert_data, insert_data_with, read_actions_from_commit, read_scan, test_table_setup,
-    test_table_setup_mt,
+    CapturingReporter, add_commit, assert_result_error_with_message, begin_transaction_with,
+    copy_directory, insert_data, insert_data_with, install_thread_local_metrics_reporter,
+    read_actions_from_commit, read_scan, test_table_setup, test_table_setup_mt,
 };
 use url::Url;
 
@@ -1241,13 +1243,31 @@ async fn test_write_checksum_from_checkpoint_ict_enabled_but_commit_unreadable_p
         .join(format!("_delta_log/{checkpoint_version:020}.json"));
     std::fs::write(&commit, b"}}} not valid commit json").unwrap();
 
+    let reporter = Arc::new(CapturingReporter::default());
+    let _guard = install_thread_local_metrics_reporter(reporter.clone());
     let fresh = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
     assert!(fresh.crc_at_version().is_none());
+    let start = Instant::now();
     // The failure is the propagated ICT read error, not a laundered `ChecksumWriteUnsupported`.
     assert!(matches!(
         fresh.write_checksum(engine.as_ref()),
         Err(e) if !matches!(e, delta_kernel::KernelError::ChecksumWriteUnsupported(_))
     ));
+    let elapsed = start.elapsed();
+
+    let events: Vec<_> = reporter
+        .events()
+        .into_iter()
+        .filter_map(|event| match event {
+            MetricEvent::CrcWrite(event) => Some(event),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].outcome, CrcWriteOutcome::Error);
+    assert_eq!(events[0].resolution_mode, CrcWriteResolutionMode::Full);
+    assert!(events[0].duration > Duration::ZERO);
+    assert!(events[0].duration <= elapsed);
 
     Ok(())
 }
