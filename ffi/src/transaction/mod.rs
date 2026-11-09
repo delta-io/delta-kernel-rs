@@ -3397,7 +3397,103 @@ mod tests {
         assert_extern_result_error_contains(
             unsafe { update_table_txn_builder_build(builder, engine.shallow_copy()) },
             FFIKernelError::InvalidTransactionStateError,
-            "ALTER TABLE requires at least one schema change",
+            "ALTER TABLE requires at least one table change",
+        );
+        unsafe {
+            free_snapshot(snapshot);
+            free_engine(engine);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn update_table_builder_adds_table_property_via_ffi() -> KernelResult<()> {
+        let (table_url, _store, engine) =
+            setup_domain_metadata_table("test_update_builder_add_property", false).await?;
+        let snapshot =
+            unsafe { build_snapshot(ffi_str(table_url.as_str()), engine.shallow_copy()) };
+        let builder = unsafe {
+            ok_or_panic(new_update_table_txn_builder(
+                snapshot.shallow_copy(),
+                KernelUpdateTableOperation::AlterTable,
+                ffi_str("test-engine/1.0"),
+                false,
+                engine.shallow_copy(),
+            ))
+        };
+        let owner_key = "app.owner";
+        let owner_value = "kernel";
+        let interval_key = "DELTA.checkpointInterval";
+        let interval_value = "7";
+        let builder = ok_or_panic(unsafe {
+            update_table_txn_builder_with_table_property_added(
+                builder,
+                kernel_string_slice!(owner_key),
+                kernel_string_slice!(owner_value),
+                engine.shallow_copy(),
+            )
+        });
+        let builder = ok_or_panic(unsafe {
+            update_table_txn_builder_with_table_property_added(
+                builder,
+                kernel_string_slice!(interval_key),
+                kernel_string_slice!(interval_value),
+                engine.shallow_copy(),
+            )
+        });
+        let txn =
+            ok_or_panic(unsafe { update_table_txn_builder_build(builder, engine.shallow_copy()) });
+        let committed = ok_or_panic(unsafe { update_table_txn_commit(txn, engine.shallow_copy()) });
+        assert_eq!(unsafe { version_and_free(committed) }, 1);
+
+        let reloaded =
+            unsafe { build_snapshot(ffi_str(table_url.as_str()), engine.shallow_copy()) };
+        let props = unsafe { reloaded.as_ref() }.table_properties();
+        assert_eq!(
+            props
+                .unknown_properties
+                .get("app.owner")
+                .map(String::as_str),
+            Some("kernel")
+        );
+        assert_eq!(props.checkpoint_interval.map(|v| v.get()), Some(7));
+        unsafe {
+            free_snapshot(reloaded);
+            free_snapshot(snapshot);
+            free_engine(engine);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn update_table_builder_rejects_feature_enabling_property_via_ffi() -> KernelResult<()> {
+        let (table_url, _store, engine) =
+            setup_domain_metadata_table("test_update_builder_reject_property", false).await?;
+        let snapshot =
+            unsafe { build_snapshot(ffi_str(table_url.as_str()), engine.shallow_copy()) };
+        let builder = unsafe {
+            ok_or_panic(new_update_table_txn_builder(
+                snapshot.shallow_copy(),
+                KernelUpdateTableOperation::AlterTable,
+                ffi_str("test-engine/1.0"),
+                false,
+                engine.shallow_copy(),
+            ))
+        };
+        let key = "delta.enableChangeDataFeed";
+        let value = "true";
+        let builder = ok_or_panic(unsafe {
+            update_table_txn_builder_with_table_property_added(
+                builder,
+                kernel_string_slice!(key),
+                kernel_string_slice!(value),
+                engine.shallow_copy(),
+            )
+        });
+        assert_extern_result_error_contains(
+            unsafe { update_table_txn_builder_build(builder, engine.shallow_copy()) },
+            FFIKernelError::GenericError,
+            "Cannot modify the table property",
         );
         unsafe {
             free_snapshot(snapshot);
