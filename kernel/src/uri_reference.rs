@@ -1,8 +1,10 @@
-//! RFC 3986 URI-reference syntax for raw (unencoded) references: whether a reference is absolute
-//! (has a scheme) or relative, and how to percent-encode it.
+//! RFC 3986 URI-reference syntax: whether a reference is absolute (has a scheme) or relative, and
+//! percent-encoding or decoding its path while keeping any `scheme:[//authority]` prefix.
 
 use std::borrow::Cow;
 
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use crate::path_encoding::uri_decode_path;
 use crate::path_encoding::uri_encode_path;
 
 /// Returns the byte length of `location`'s URI scheme (excluding the terminating `:`), or `None`
@@ -26,26 +28,39 @@ pub(crate) fn scheme_len(location: &str) -> Option<usize> {
 /// `scheme:[//authority]` prefix of an absolute reference verbatim. A relative reference is
 /// encoded whole. Returns [`Cow::Borrowed`] when nothing needs encoding.
 pub(crate) fn uri_encode_location(location: &str) -> Cow<'_, str> {
-    let (prefix, path) = match scheme_len(location) {
-        Some(scheme_len) => split_authority(location, scheme_len),
-        None => ("", location),
-    };
-    match uri_encode_path(path) {
-        Cow::Borrowed(_) => Cow::Borrowed(location),
-        Cow::Owned(encoded) => Cow::Owned(format!("{prefix}{encoded}")),
-    }
+    let (prefix, path) = split_prefix(location);
+    with_prefix(location, prefix, uri_encode_path(path))
 }
 
-/// Splits an absolute `location` whose scheme is `scheme_len` bytes long into its
-/// `scheme:[//authority]` prefix and the raw path that follows. The authority, when present, ends
-/// at the next `/`.
-pub(crate) fn split_authority(location: &str, scheme_len: usize) -> (&str, &str) {
+/// The inverse of [`uri_encode_location`]: percent-decodes the path with [`uri_decode_path`],
+/// keeping any `scheme:[//authority]` prefix verbatim. Returns `None` if the decoded path is not
+/// valid UTF-8.
+#[cfg(feature = "adaptive-metadata-in-dev")]
+pub(crate) fn uri_decode_location(location: &str) -> Option<Cow<'_, str>> {
+    let (prefix, path) = split_prefix(location);
+    Some(with_prefix(location, prefix, uri_decode_path(path)?))
+}
+
+/// Splits `location` into its `scheme:[//authority]` prefix, empty for a relative reference, and
+/// the path that follows. The authority, when present, ends at the next `/`.
+fn split_prefix(location: &str) -> (&str, &str) {
+    let Some(scheme_len) = scheme_len(location) else {
+        return ("", location);
+    };
     let after_scheme = scheme_len + 1;
     let prefix_len = match location[after_scheme..].strip_prefix("//") {
         Some(rest) => after_scheme + 2 + rest.find('/').unwrap_or(rest.len()),
         None => after_scheme,
     };
     location.split_at(prefix_len)
+}
+
+/// Rejoins `prefix` with a transformed `path`, borrowing `location` when the path is unchanged.
+fn with_prefix<'a>(location: &'a str, prefix: &str, path: Cow<'_, str>) -> Cow<'a, str> {
+    match path {
+        Cow::Borrowed(_) => Cow::Borrowed(location),
+        Cow::Owned(path) => Cow::Owned(format!("{prefix}{path}")),
+    }
 }
 
 /// Returns whether `ch` is allowed at `position` in a URI scheme, per [RFC 3986 section 3.1]:
@@ -86,22 +101,22 @@ mod tests {
     #[case::relative_space("data/a b.parquet", "data/a%20b.parquet")]
     #[case::relative_colon_kept("data/a:b.parquet", "data/a:b.parquet")]
     #[case::absolute_path_encoded("s3://bucket/a b#1.parquet", "s3://bucket/a%20b%231.parquet")]
-    #[case::authority_kept(
-        "abfss://c@a.dfs.core.windows.net/t/[x]",
-        "abfss://c@a.dfs.core.windows.net/t/%5Bx%5D"
-    )]
+    #[case::empty_authority("file:///tmp/a b.parquet", "file:///tmp/a%20b.parquet")]
+    #[case::authority_kept_verbatim("s3://[::1]/t/[x]", "s3://[::1]/t/%5Bx%5D")]
     #[case::authority_only("s3://bucket", "s3://bucket")]
     #[case::no_authority("C:/data dir/a", "C:/data%20dir/a")]
     #[case::non_ascii("data/M\u{fc}nchen", "data/M%C3%BCnchen")]
-    fn test_uri_encode_location(#[case] location: &str, #[case] expected: &str) {
-        assert_eq!(uri_encode_location(location), expected);
+    fn test_uri_encode_location_round_trips(#[case] raw: &str, #[case] encoded: &str) {
+        let actual = uri_encode_location(raw);
+        assert_eq!(matches!(actual, Cow::Borrowed(_)), raw == encoded);
+        assert_eq!(actual, encoded);
+        #[cfg(feature = "adaptive-metadata-in-dev")]
+        assert_eq!(uri_decode_location(encoded).unwrap(), raw);
     }
 
+    #[cfg(feature = "adaptive-metadata-in-dev")]
     #[test]
-    fn test_uri_encode_location_borrows_when_unchanged() {
-        assert!(matches!(
-            uri_encode_location("s3://b/a.parquet"),
-            Cow::Borrowed(_)
-        ));
+    fn test_uri_decode_location_rejects_invalid_utf8() {
+        assert_eq!(uri_decode_location("s3://b/%FF"), None);
     }
 }

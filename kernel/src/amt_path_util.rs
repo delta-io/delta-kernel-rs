@@ -3,10 +3,10 @@
 //!
 //! [relative paths specification]: https://iceberg.apache.org/spec/#paths-in-metadata
 
-use url::{ParseError, Url};
+use url::Url;
 
-use crate::path_encoding::{uri_decode_path, uri_encode_path};
-use crate::uri_reference::{scheme_len, split_authority, uri_encode_location};
+use crate::path_encoding::uri_encode_path;
+use crate::uri_reference::{scheme_len, uri_decode_location, uri_encode_location};
 use crate::utils::{require, to_file_size};
 use crate::{FileMeta, KernelError, KernelResult};
 
@@ -52,15 +52,14 @@ pub(crate) fn parse_absolute_amt_location(path: &str) -> KernelResult<Option<Url
 pub(crate) fn raw_amt_location_from_uri(uri: &str) -> KernelResult<String> {
     let invalid =
         |reason: &str| KernelError::generic(format!("Invalid absolute URI {uri:?}: {reason}"));
-    let scheme_len = scheme_len(uri).ok_or_else(|| invalid("no URI scheme"))?;
+    require!(scheme_len(uri).is_some(), invalid("no URI scheme"));
     let url = Url::parse(uri).map_err(|e| invalid(&e.to_string()))?;
     require!(
         url.query().is_none() && url.fragment().is_none(),
         invalid("a query or fragment cannot be stored as an AMT location")
     );
-    let (prefix, encoded_path) = split_authority(uri, scheme_len);
-    let path = uri_decode_path(encoded_path).ok_or_else(|| invalid("path is not valid UTF-8"))?;
-    Ok(format!("{prefix}{path}"))
+    let raw = uri_decode_location(uri).ok_or_else(|| invalid("path is not valid UTF-8"))?;
+    Ok(raw.into_owned())
 }
 
 /// Builds the [`FileMeta`] of an AMT manifest file referenced by `path` (absolute, or relative to
@@ -141,17 +140,11 @@ fn encode_and_join(path: &str, table_root: &Url) -> KernelResult<Url> {
     if !base.ends_with('/') {
         base.push('/');
     }
-    uri_with_encoded_path(&base, path).map_err(|e| {
+    Url::parse(&format!("{base}{}", uri_encode_path(path))).map_err(|e| {
         KernelError::generic(format!(
             "Failed to resolve relative AMT location {path:?} against table root {base}: {e}"
         ))
     })
-}
-
-/// Parses `prefix` followed by the percent-encoded `raw_path`, so reserved characters in the
-/// raw path are not misparsed as URL syntax.
-fn uri_with_encoded_path(prefix: &str, raw_path: &str) -> Result<Url, ParseError> {
-    Url::parse(&format!("{prefix}{}", uri_encode_path(raw_path)))
 }
 
 /// Rejects a `path` containing a `.` or `..` segment: the Iceberg V4 path spec does not support
@@ -296,6 +289,7 @@ mod tests {
         "abfss://c1@acct.dfs.core.windows.net/t/a%20b.bin",
         "abfss://c1@acct.dfs.core.windows.net/t/a b.bin"
     )]
+    #[case::empty_authority("file:///tmp/dv%20a.bin", "file:///tmp/dv a.bin")]
     fn test_raw_amt_location_from_uri_round_trips(#[case] uri: &str, #[case] expected_raw: &str) {
         let raw = raw_amt_location_from_uri(uri).unwrap();
         assert_eq!(raw, expected_raw);
@@ -327,6 +321,17 @@ mod tests {
         assert_result_error_with_message(
             resolve_amt_location(path, &table_root),
             "contains a '.' or '..' segment",
+        );
+    }
+
+    #[rstest]
+    #[case::invalid_port("s3://bucket:port/a.parquet")]
+    #[case::space_in_authority("s3://my bucket/a.parquet")]
+    fn test_resolve_amt_location_rejects_unparseable_absolute(#[case] path: &str) {
+        let table_root = Url::parse("memory:///table/").unwrap();
+        assert_result_error_with_message(
+            resolve_amt_location(path, &table_root),
+            "Failed to parse absolute AMT location",
         );
     }
 }
