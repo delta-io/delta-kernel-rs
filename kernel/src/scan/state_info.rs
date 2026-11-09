@@ -4,7 +4,7 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use tracing::{Level, debug, enabled, warn};
+use tracing::{Level, debug, enabled, trace, warn};
 use url::Url;
 
 use crate::actions::NULL_COUNT;
@@ -484,7 +484,7 @@ impl StateInfo {
                         // just add them as if they're normal physical
                         // columns
                         let physical_field = logical_field.make_physical(column_mapping_mode)?;
-                        debug!("\n\n{logical_field:#?}\nAfter mapping: {physical_field:#?}\n\n");
+                        trace!("\n\n{logical_field:#?}\nAfter mapping: {physical_field:#?}\n\n");
                         let physical_name = physical_field.name.clone();
 
                         if !logical_field.is_metadata_column()

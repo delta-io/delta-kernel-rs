@@ -15,7 +15,7 @@ use std::collections::HashMap;
 
 use delta_kernel_derive::internal_api;
 use itertools::Itertools;
-use tracing::{debug, info, instrument, warn};
+use tracing::{debug, info, instrument, trace, warn};
 use url::Url;
 
 use crate::last_checkpoint_hint::LastCheckpointHint;
@@ -328,7 +328,7 @@ impl ListingAccumulator {
             // }
             // CompactedCommit { .. } => (), // Failed the bounds check above
             CompactedCommit { .. } => {
-                debug!(
+                trace!(
                     "Skipping unsupported log compaction file: {:?}",
                     file.location
                 );
