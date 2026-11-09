@@ -3492,7 +3492,7 @@ mod tests {
         });
         assert_extern_result_error_contains(
             unsafe { update_table_txn_builder_build(builder, engine.shallow_copy()) },
-            FFIKernelError::GenericError,
+            FFIKernelError::InvalidTransactionStateError,
             "Cannot modify the table property",
         );
         unsafe {
