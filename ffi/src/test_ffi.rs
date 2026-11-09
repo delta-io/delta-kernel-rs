@@ -226,6 +226,7 @@ pub unsafe extern "C" fn get_testing_kernel_predicate() -> Handle<SharedPredicat
         )),
         Pred::from_expr(expr!(or(5 == 10, 20 != 10))),
         Pred::from_expr(expr!(is_not_null(col("col")))),
+        Pred::has_uri_scheme(col!("location")),
         Pred::opaque(OpaqueTestOp("bar".to_string()), vec![lit(42), lit(1.111)]),
         Pred::unknown("intrigue"),
         Pred::from_expr(Expr::case_when(

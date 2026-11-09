@@ -536,7 +536,6 @@ impl From<UnaryExpressionOp> for proto_expr::UnaryExpressionOp {
     fn from(op: UnaryExpressionOp) -> Self {
         match op {
             UnaryExpressionOp::ToJson => proto_expr::UnaryExpressionOp::ToJson,
-            UnaryExpressionOp::UriScheme => proto_expr::UnaryExpressionOp::UriScheme,
         }
     }
 }
@@ -565,6 +564,7 @@ impl From<UnaryPredicateOp> for proto_expr::UnaryPredicateOp {
     fn from(op: UnaryPredicateOp) -> Self {
         match op {
             UnaryPredicateOp::IsNull => proto_expr::UnaryPredicateOp::IsNull,
+            UnaryPredicateOp::HasUriScheme => proto_expr::UnaryPredicateOp::HasUriScheme,
         }
     }
 }
@@ -1981,7 +1981,6 @@ mod tests {
 
     #[rstest]
     #[case(UnaryExpressionOp::ToJson, proto_expr::UnaryExpressionOp::ToJson)]
-    #[case(UnaryExpressionOp::UriScheme, proto_expr::UnaryExpressionOp::UriScheme)]
     fn from_unary_expression_op(
         #[case] op: UnaryExpressionOp,
         #[case] expected: proto_expr::UnaryExpressionOp,
@@ -2025,6 +2024,10 @@ mod tests {
 
     #[rstest]
     #[case(UnaryPredicateOp::IsNull, proto_expr::UnaryPredicateOp::IsNull)]
+    #[case(
+        UnaryPredicateOp::HasUriScheme,
+        proto_expr::UnaryPredicateOp::HasUriScheme
+    )]
     fn from_unary_predicate_op(
         #[case] op: UnaryPredicateOp,
         #[case] expected: proto_expr::UnaryPredicateOp,

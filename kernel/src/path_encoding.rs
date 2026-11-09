@@ -1,4 +1,5 @@
-//! URI percent-encoding of raw path components, matching Hadoop's `Path.toUri().toString()`.
+//! URI percent-encoding of raw path components, matching Hadoop's `Path.toUri().toString()`,
+//! and URI scheme detection.
 //!
 //! Used both when encoding a filesystem path into `add.path` (Hive-style partition paths) and
 //! when resolving a raw, table-relative AMT path against the table root.
@@ -53,6 +54,10 @@ pub(crate) fn uri_decode_path(path: &str) -> Option<Cow<'_, str>> {
 /// `scheme = ALPHA *( ALPHA / DIGIT / "+" / "-" / "." )`, terminated by `:`.
 ///
 /// [RFC 3986 section 3.1]: https://datatracker.ietf.org/doc/html/rfc3986#section-3.1
+#[cfg(any(
+    feature = "adaptive-metadata-in-dev",
+    all(feature = "arrow-expression", feature = "default-engine-base")
+))]
 pub(crate) fn scheme_len(location: &str) -> Option<usize> {
     for (position, ch) in location.char_indices() {
         if ch == ':' {
@@ -70,6 +75,10 @@ pub(crate) fn scheme_len(location: &str) -> Option<usize> {
 /// `.`. Schemes are restricted to US-ASCII, so non-ASCII letters are rejected.
 ///
 /// [RFC 3986 section 3.1]: https://datatracker.ietf.org/doc/html/rfc3986#section-3.1
+#[cfg(any(
+    feature = "adaptive-metadata-in-dev",
+    all(feature = "arrow-expression", feature = "default-engine-base")
+))]
 fn is_scheme_char(ch: char, position: usize) -> bool {
     if ch.is_ascii_alphabetic() {
         return true;
@@ -82,6 +91,25 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
+
+    #[cfg(any(
+        feature = "adaptive-metadata-in-dev",
+        all(feature = "arrow-expression", feature = "default-engine-base")
+    ))]
+    #[rstest]
+    #[case::single_char("s3://b/a", Some(2))]
+    #[case::compound("git+ssh://host/repo", Some(7))]
+    #[case::drive_letter("C:/data", Some(1))]
+    #[case::empty("", None)]
+    #[case::no_colon("abc", None)]
+    #[case::leading_colon(":a", None)]
+    #[case::leading_digit("3com:x", None)]
+    #[case::colon_after_slash("data/a:b", None)]
+    #[case::non_ascii_lead("\u{03b1}x:y", None)]
+    #[case::non_ascii_mid("a\u{e9}:x", None)]
+    fn test_scheme_len(#[case] location: &str, #[case] expected: Option<usize>) {
+        assert_eq!(scheme_len(location), expected);
+    }
 
     /// Every ASCII byte: chars in `HADOOP_URI_PATH_ENCODE_SET` (space, `"`, `#`, `%`, `<`,
     /// `>`, `?`, `[`, `\`, `]`, `^`, backtick, `{`, `|`, `}`) plus all controls encode to

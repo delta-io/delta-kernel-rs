@@ -710,6 +710,18 @@ fn test_eval_binary_commutes_literal_and_cast_column(
     );
 }
 
+#[rstest::rstest]
+fn test_has_uri_scheme_is_never_evaluated_for_skipping(
+    #[values(lit("s3://b/a"), col!("location"))] expr: Expr,
+    #[values(false, true)] inverted: bool,
+) {
+    let filter = DefaultKernelPredicateEvaluator::from(Scalar::from("s3://b/a"));
+    assert_eq!(
+        filter.eval_pred(&Pred::has_uri_scheme(expr), inverted),
+        None
+    );
+}
+
 #[derive(Debug, PartialEq)]
 struct OpaqueLessThanOp;
 impl OpaqueLessThanOp {

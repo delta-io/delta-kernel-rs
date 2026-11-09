@@ -160,6 +160,8 @@ And
   Not
     IsNull
       Column(col)
+  HasUriScheme
+    Column(location)
   OpaquePredicate(bar)
     Integer(42)
     Double(1.111000)
