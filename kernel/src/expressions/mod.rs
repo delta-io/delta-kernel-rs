@@ -169,6 +169,18 @@ pub enum UnaryExpressionOp {
         /// Encode timestamps with all six microsecond digits instead of three.
         full_precision_timestamps: bool,
     },
+    /// Percent-encodes the path of a raw (unencoded) STRING URI reference so it can be used as a
+    /// URL: space, `"`, `#`, `%`, `<`, `>`, `?`, `[`, `\`, `]`, `^`, `` ` ``, `{`, `|`, `}`, ASCII
+    /// controls, and every byte of a non-ASCII character become `%XX`. Everything else, including
+    /// `/` and `:`, is kept. When the reference begins with a scheme (see
+    /// [`UnaryPredicateOp::HasUriScheme`]), its `scheme:` and any `//authority` (up to the next
+    /// `/`) are kept verbatim. The output is STRING, and a NULL input yields NULL.
+    ///
+    /// ```text
+    /// URI_ENCODE_PATH('data/a b.parquet')         -- 'data/a%20b.parquet'
+    /// URI_ENCODE_PATH('s3://bucket/a#1.parquet')  -- 's3://bucket/a%231.parquet'
+    /// ```
+    UriEncodePath,
 }
 
 impl UnaryExpressionOp {
@@ -1274,6 +1286,7 @@ impl Display for UnaryExpressionOp {
         use UnaryExpressionOp::*;
         match self {
             ToJson { .. } => write!(f, "TO_JSON"),
+            UriEncodePath => write!(f, "URI_ENCODE_PATH"),
         }
     }
 }
@@ -1548,6 +1561,10 @@ mod tests {
                 "TO_JSON(Column(x), full_precision_timestamps)",
             ),
             (
+                Expr::unary(UnaryExpressionOp::UriEncodePath, col!("x")),
+                "URI_ENCODE_PATH(Column(x))",
+            ),
+            (
                 Expr::case_when([(col!("x").is_null(), lit(0))], col!("x")),
                 "CASE WHEN Column(x) IS NULL THEN 0 ELSE Column(x) END",
             ),
@@ -1757,12 +1774,15 @@ mod tests {
         // ==================== Expression Operations Tests ====================
 
         #[rstest::rstest]
-        fn test_unary_expression_roundtrip(#[values(false, true)] full_precision_timestamps: bool) {
-            let op = UnaryExpressionOp::ToJson {
-                full_precision_timestamps,
-            };
-            let expr = Expression::unary(op, col!("data"));
-            assert_roundtrip(&expr);
+        fn test_unary_expression_roundtrip(
+            #[values(
+                UnaryExpressionOp::TO_JSON,
+                UnaryExpressionOp::ToJson { full_precision_timestamps: true },
+                UnaryExpressionOp::UriEncodePath
+            )]
+            op: UnaryExpressionOp,
+        ) {
+            assert_roundtrip(&Expression::unary(op, col!("data")));
         }
 
         #[test]

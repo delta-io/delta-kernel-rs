@@ -101,6 +101,8 @@ StructExpression
     Integer(42)
     Double(1.111000)
   Unknown(mystery)
+  UriEncodePath
+    Column(location)
   MapToStruct
     Column(pv)
   MapToStruct(timestamp_timezone=America/Los_Angeles)
