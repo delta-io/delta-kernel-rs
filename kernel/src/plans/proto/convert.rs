@@ -539,6 +539,7 @@ impl From<UnaryExpressionOp> for proto_expr::UnaryExpressionOp {
             UnaryExpressionOp::UriEncodeLocation => {
                 proto_expr::UnaryExpressionOp::UriEncodeLocation
             }
+            UnaryExpressionOp::Cardinality => proto_expr::UnaryExpressionOp::Cardinality,
         }
     }
 }
@@ -1987,6 +1988,10 @@ mod tests {
     #[case(
         UnaryExpressionOp::UriEncodeLocation,
         proto_expr::UnaryExpressionOp::UriEncodeLocation
+    )]
+    #[case(
+        UnaryExpressionOp::Cardinality,
+        proto_expr::UnaryExpressionOp::Cardinality
     )]
     fn from_unary_expression_op(
         #[case] op: UnaryExpressionOp,

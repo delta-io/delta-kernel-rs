@@ -9,7 +9,7 @@ use datafusion::common::{
     Column as DFColumn, DataFusionError, Result as DFResult, ScalarValue as DFScalarValue,
 };
 use datafusion::functions::core::expr_fn::{coalesce, get_field, named_struct, nullif};
-use datafusion::functions_nested::expr_fn::make_array;
+use datafusion::functions_nested::expr_fn::{array_length, make_array};
 use datafusion::logical_expr::{
     Case, ColumnarValue, Expr as DFExpr, Operator, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl,
     Signature, Volatility, binary_expr, cast, lit,
@@ -21,7 +21,7 @@ use delta_kernel::engine::parse_json;
 use delta_kernel::expressions::{
     BinaryExpression, BinaryExpressionOp, Expression as KernelExpression, ExpressionRef,
     ExpressionStructPatch, MapToStructExpression, MapToStructOptions, ParseJsonExpression,
-    UnaryExpressionOp, VariadicExpression, VariadicExpressionOp,
+    UnaryExpression, UnaryExpressionOp, VariadicExpression, VariadicExpressionOp,
 };
 use delta_kernel::schema::{
     DataType as KernelDataType, PrimitiveType, SchemaRef as KernelSchemaRef, StructField,
@@ -72,13 +72,7 @@ pub fn to_df_expr(
         }
         KernelExpression::ParseJson(parse) => parse_json_to_df_expr(parse, input_schema),
 
-        KernelExpression::Unary(u) => match u.op {
-            op @ (UnaryExpressionOp::ToJson | UnaryExpressionOp::UriEncodeLocation) => {
-                Err(KernelError::unsupported(format!(
-                    "converting the {op} expression is not yet supported"
-                )))
-            }
-        },
+        KernelExpression::Unary(unary) => unary_to_df_expr(unary, input_schema),
 
         KernelExpression::CaseWhen(_) => Err(KernelError::unsupported(
             "converting a CaseWhen expression is not yet supported",
@@ -139,6 +133,23 @@ fn binary_expr_to_df_expr(
     let left = to_df_expr(&binary.left, input_schema, None)?;
     let right = to_df_expr(&binary.right, input_schema, None)?;
     Ok(binary_expr(left, op, right))
+}
+
+/// Lowers a unary expression. Only `Cardinality` has a DataFusion equivalent.
+fn unary_to_df_expr(unary: &UnaryExpression, input_schema: &StructType) -> KernelResult<DFExpr> {
+    match unary.op {
+        UnaryExpressionOp::Cardinality => {
+            let array = to_df_expr(&unary.expr, input_schema, None)?;
+            // `array_length` counts top-level elements as UInt64; `cardinality` would also count
+            // the elements of nested arrays.
+            Ok(cast(array_length(array), ArrowDataType::Int32))
+        }
+        op @ (UnaryExpressionOp::ToJson | UnaryExpressionOp::UriEncodeLocation) => {
+            Err(KernelError::unsupported(format!(
+                "converting the {op} expression is not yet supported"
+            )))
+        }
+    }
 }
 
 /// Lowers a variadic expression: `Coalesce` to `coalesce(..)` and `Array` to `make_array(..)`, each
@@ -636,10 +647,11 @@ impl ScalarUDFImpl for ParseJsonUdf {
 #[cfg(test)]
 mod tests {
     use datafusion::arrow::array::{
-        Array, AsArray, Int32Array, MapBuilder, StringArray, StringBuilder,
+        Array, AsArray, Int32Array, Int64Array, ListArray, MapBuilder, StringArray, StringBuilder,
         TimestampMicrosecondArray,
     };
-    use datafusion::arrow::datatypes::Field as ArrowField;
+    use datafusion::arrow::buffer::{NullBuffer, OffsetBuffer};
+    use datafusion::arrow::datatypes::{Field as ArrowField, Int32Type};
     use datafusion::assert_batches_eq;
     use datafusion::common::DFSchema;
     use datafusion::logical_expr::physical_planning_context::PhysicalPlanningContext;
@@ -861,6 +873,53 @@ mod tests {
     ) {
         let kernel = KernelExpr::unary(op, col!("b"));
         to_df_expr(&kernel, &test_schema(), None).unwrap_err();
+    }
+
+    /// `CARDINALITY` counts top-level elements, NULLs included, and keeps a NULL array NULL.
+    #[test]
+    fn cardinality_counts_top_level_elements() {
+        let input_schema = schema! { nullable "l": [ nullable [ nullable LONG ] ] };
+        let kernel = KernelExpr::unary(UnaryExpressionOp::Cardinality, col!("l"));
+        let logical = to_df_expr(&kernel, &input_schema, None).unwrap();
+
+        let arrow_schema: ArrowSchema = (&input_schema).try_into_arrow().unwrap();
+        let ArrowDataType::List(outer_field) = arrow_schema.field(0).data_type().clone() else {
+            panic!("expected a list column");
+        };
+        let ArrowDataType::List(inner_field) = outer_field.data_type().clone() else {
+            panic!("expected a nested list column");
+        };
+        // Inner rows: [1, 2], NULL, []
+        let inner = ListArray::try_new(
+            inner_field,
+            OffsetBuffer::from_lengths([2, 0, 0]),
+            Arc::new(Int64Array::from(vec![1, 2])),
+            Some(NullBuffer::from(vec![true, false, true])),
+        )
+        .unwrap();
+        // Outer rows: [[1, 2], NULL, []], [], NULL
+        let lists = ListArray::try_new(
+            outer_field,
+            OffsetBuffer::from_lengths([3, 0, 0]),
+            Arc::new(inner),
+            Some(NullBuffer::from(vec![true, true, false])),
+        )
+        .unwrap();
+        let batch =
+            RecordBatch::try_new(Arc::new(arrow_schema.clone()), vec![Arc::new(lists)]).unwrap();
+
+        let physical = create_physical_expr(
+            &logical,
+            &DFSchema::try_from(arrow_schema).unwrap(),
+            &ExecutionProps::new(),
+            &PhysicalPlanningContext::default(),
+        )
+        .unwrap();
+        let result = physical.evaluate(&batch).unwrap().into_array(3).unwrap();
+        assert_eq!(
+            result.as_primitive::<Int32Type>(),
+            &Int32Array::from(vec![Some(3), Some(0), None])
+        );
     }
 
     #[test]

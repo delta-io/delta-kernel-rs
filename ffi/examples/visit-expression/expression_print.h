@@ -284,6 +284,9 @@ void print_tree_helper(ExpressionItem ref, int depth) {
         case UriEncodeLocation:
           printf("UriEncodeLocation\n");
           break;
+        case Cardinality:
+          printf("Cardinality\n");
+          break;
       }
 
       print_expression_item_list(unary->sub_expr, depth + 1);

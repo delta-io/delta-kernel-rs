@@ -103,6 +103,8 @@ StructExpression
   Unknown(mystery)
   UriEncodeLocation
     Column(location)
+  Cardinality
+    Column(list)
   MapToStruct
     Column(pv)
   MapToStruct(timestamp_timezone=America/Los_Angeles)
