@@ -45,7 +45,7 @@ use crate::expressions::{
     UnaryPredicate, UnaryPredicateOp, VariadicExpression, VariadicExpressionOp,
 };
 use crate::schema::{DataType, PrimitiveType, StructField, StructType};
-use crate::uri_reference::scheme_len;
+use crate::uri_reference::{scheme_len, uri_encode_location};
 
 #[internal_api]
 pub(crate) trait ProvidesColumnByName {
@@ -317,15 +317,18 @@ pub fn evaluate_expression(
         (Predicate(_), Some(data_type)) => Err(KernelError::generic(format!(
             "Predicate evaluation produces boolean output, but caller expects {data_type:?}"
         ))),
-        (Unary(UnaryExpression { op: ToJson, expr }), result_type) => match result_type {
-            None | Some(&DataType::STRING) => {
-                let input = evaluate_expression(expr, batch, None)?;
-                Ok(to_json(&input)?)
+        (Unary(UnaryExpression { op, expr }), None | Some(&DataType::STRING)) => {
+            let input = evaluate_expression(expr, batch, None)?;
+            match op {
+                ToJson => Ok(to_json(&input)?),
+                UriEncodePath => uri_encode_locations(&input),
             }
-            Some(data_type) => Err(KernelError::generic(format!(
-                "ToJson operator requires STRING output, but got {data_type:?}"
-            ))),
-        },
+        }
+        (Unary(UnaryExpression { op, .. }), Some(data_type)) => {
+            Err(KernelError::invalid_expression(format!(
+                "{op} operator requires STRING output, but got {data_type:?}"
+            )))
+        }
         (Binary(BinaryExpression { op, left, right }), _) => {
             let left_arr = evaluate_expression(left.as_ref(), batch, None)?;
             let right_arr = evaluate_expression(right.as_ref(), batch, None)?;
@@ -875,6 +878,27 @@ pub fn evaluate_predicate(
             "Unknown predicate: {name:?}"
         ))),
     }
+}
+
+/// Evaluates [`UnaryExpressionOp::UriEncodePath`] over any string representation.
+fn uri_encode_locations(input: &ArrayRef) -> KernelResult<ArrayRef> {
+    fn eval<'a>(locations: impl StringArrayType<'a>) -> StringArray {
+        locations
+            .iter()
+            .map(|l| l.map(uri_encode_location))
+            .collect()
+    }
+    let encoded = match input.data_type() {
+        ArrowDataType::Utf8 => eval(input.as_string::<i32>()),
+        ArrowDataType::LargeUtf8 => eval(input.as_string::<i64>()),
+        ArrowDataType::Utf8View => eval(input.as_string_view()),
+        other => {
+            return Err(KernelError::invalid_expression(format!(
+                "UriEncodePath requires a string input, got {other}"
+            )));
+        }
+    };
+    Ok(Arc::new(encoded))
 }
 
 /// Evaluates [`UnaryPredicateOp::HasUriScheme`] over any string representation.
@@ -2179,6 +2203,62 @@ mod tests {
         let result = evaluate_predicate(&pred, &batch, inverted).unwrap();
         assert_eq!(result.null_count(), 0);
         assert_eq!(result.values().iter().collect::<Vec<_>>(), expected);
+    }
+
+    #[rstest]
+    fn test_uri_encode_path(
+        #[values(
+            |l| Arc::new(StringArray::from(l)) as ArrayRef,
+            |l| Arc::new(LargeStringArray::from(l)) as ArrayRef,
+            |l| Arc::new(StringViewArray::from(l)) as ArrayRef
+        )]
+        make_array: fn(Vec<Option<&'static str>>) -> ArrayRef,
+    ) {
+        let locations = vec![
+            Some("data/a b.parquet"),
+            Some("s3://bucket/a#1.parquet"),
+            Some("data/a.parquet"),
+            None,
+        ];
+        let batch = RecordBatch::try_from_iter([("l", make_array(locations))]).unwrap();
+        let expr = Expr::unary(UnaryExpressionOp::UriEncodePath, col!("l"));
+        let result = evaluate_expression(&expr, &batch, Some(&DataType::STRING)).unwrap();
+        let expected = StringArray::from(vec![
+            Some("data/a%20b.parquet"),
+            Some("s3://bucket/a%231.parquet"),
+            Some("data/a.parquet"),
+            None,
+        ]);
+        assert_eq!(result.as_string::<i32>(), &expected);
+    }
+
+    #[test]
+    fn test_uri_encode_path_rejects_non_string_input() {
+        let batch =
+            RecordBatch::try_from_iter([("n", Arc::new(Int32Array::from(vec![1])) as ArrayRef)])
+                .unwrap();
+        let expr = Expr::unary(UnaryExpressionOp::UriEncodePath, col!("n"));
+        let err = evaluate_expression(&expr, &batch, None).unwrap_err();
+        assert!(
+            matches!(err, KernelError::InvalidExpressionEvaluation(_)),
+            "{err}"
+        );
+    }
+
+    #[rstest]
+    fn test_unary_expression_rejects_non_string_output(
+        #[values(UnaryExpressionOp::ToJson, UnaryExpressionOp::UriEncodePath)]
+        op: UnaryExpressionOp,
+    ) {
+        let batch =
+            RecordBatch::try_from_iter([("s", Arc::new(StringArray::from(vec!["a"])) as ArrayRef)])
+                .unwrap();
+        let expr = Expr::unary(op, col!("s"));
+        let err = evaluate_expression(&expr, &batch, Some(&DataType::INTEGER)).unwrap_err();
+        assert!(
+            matches!(err, KernelError::InvalidExpressionEvaluation(_)),
+            "{err}"
+        );
     }
 
     /// Each reference paired with whether it has a URI scheme.

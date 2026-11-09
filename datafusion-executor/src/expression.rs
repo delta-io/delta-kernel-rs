@@ -76,6 +76,9 @@ pub fn to_df_expr(
             UnaryExpressionOp::ToJson => Err(KernelError::unsupported(
                 "converting the ToJson expression is not yet supported",
             )),
+            UnaryExpressionOp::UriEncodePath => Err(KernelError::unsupported(
+                "converting the UriEncodePath expression is not yet supported",
+            )),
         },
 
         KernelExpression::CaseWhen(_) => Err(KernelError::unsupported(
@@ -645,7 +648,8 @@ mod tests {
     use datafusion::physical_expr::execution_props::ExecutionProps;
     use delta_kernel::expressions::{
         ColumnName as KernelColumnName, Expression as KernelExpr, ExpressionStructPatch,
-        ExpressionStructPatchBuilder, MapToStructOptions, col, expr, lit, null_lit,
+        ExpressionStructPatchBuilder, MapToStructOptions, UnaryExpressionOp, col, expr, lit,
+        null_lit,
     };
     use delta_kernel::schema::{ArrayType, DataType, MapType, StructType, schema, schema_ref};
     use rstest::rstest;
@@ -849,6 +853,14 @@ mod tests {
             "{rendered}"
         );
         assert!(rendered.ends_with("END"), "{rendered}");
+    }
+
+    #[rstest]
+    fn unary_expression_is_unsupported(
+        #[values(UnaryExpressionOp::ToJson, UnaryExpressionOp::UriEncodePath)] op: UnaryExpressionOp,
+    ) {
+        let kernel = KernelExpr::unary(op, col!("b"));
+        to_df_expr(&kernel, &test_schema(), None).unwrap_err();
     }
 
     #[test]
