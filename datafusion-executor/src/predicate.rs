@@ -59,9 +59,11 @@ fn unary_to_df_predicate_expr(
     let expr = to_df_expr(&unary.expr, input_schema, None)?;
     match unary.op {
         KernelUnaryPredicateOp::IsNull => Ok(DFExpr::IsNull(Box::new(expr))),
-        KernelUnaryPredicateOp::HasUriScheme => Err(KernelError::unsupported(
-            "converting the HasUriScheme predicate is not yet supported",
-        )),
+        op @ (KernelUnaryPredicateOp::HasUriScheme | KernelUnaryPredicateOp::HasDotSegment) => {
+            Err(KernelError::unsupported(format!(
+                "converting the {op:?} predicate is not yet supported"
+            )))
+        }
     }
 }
 
@@ -383,6 +385,7 @@ mod tests {
         KernelPred::binary(KernelBinaryPredicateOp::In, lit(1i64), col!("b"))
     )]
     #[case::has_uri_scheme(KernelPred::has_uri_scheme(col!("a")))]
+    #[case::has_dot_segment(KernelPred::has_dot_segment(col!("a")))]
     fn unsupported_predicate_is_an_error(#[case] pred: KernelPred) {
         to_df_predicate_expr(&pred, &test_schema()).unwrap_err();
     }

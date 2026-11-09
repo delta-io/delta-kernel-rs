@@ -175,6 +175,10 @@ pub struct EngineExpressionVisitor {
     /// The sub-expression will be in a _one_ item list identified by `child_list_id`.
     /// See [`UnaryPredicateOp::HasUriScheme`] for the semantics the implementation must follow.
     pub visit_has_uri_scheme: VisitUnaryFn,
+    /// Visits a `has_dot_segment` predicate belonging to the list identified by
+    /// `sibling_list_id`. The sub-expression will be in a _one_ item list identified by
+    /// `child_list_id`. See [`UnaryPredicateOp::HasDotSegment`].
+    pub visit_has_dot_segment: VisitUnaryFn,
     /// Visits the `ToJson` unary operator belonging to the list identified by `sibling_list_id`.
     /// The sub-expression will be in a _one_ item list identified by `child_list_id`.
     /// See [`UnaryExpressionOp::ToJson`] for the encoding the implementation must produce; in
@@ -796,6 +800,7 @@ fn visit_predicate_impl(
             let visit_fn = match op {
                 UnaryPredicateOp::IsNull => visitor.visit_is_null,
                 UnaryPredicateOp::HasUriScheme => visitor.visit_has_uri_scheme,
+                UnaryPredicateOp::HasDotSegment => visitor.visit_has_dot_segment,
             };
             visit_fn(visitor.data, sibling_list_id, child_list_id);
         }
@@ -1016,6 +1021,7 @@ mod tests {
             visit_not: ignore_child_list,
             visit_is_null: ignore_child_list,
             visit_has_uri_scheme: ignore_child_list,
+            visit_has_dot_segment: ignore_child_list,
             visit_to_json: ignore_child_list,
             visit_uri_encode_path: ignore_child_list,
             visit_cardinality: ignore_child_list,

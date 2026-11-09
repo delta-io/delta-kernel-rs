@@ -49,7 +49,7 @@ use crate::expressions::{
     UnaryPredicate, UnaryPredicateOp, VariadicExpression, VariadicExpressionOp,
 };
 use crate::schema::{DataType, PrimitiveType, StructField, StructType};
-use crate::uri_reference::{scheme_len, uri_encode_location};
+use crate::uri_reference::{has_dot_segment, scheme_len, uri_encode_location};
 use crate::utils::require;
 
 #[internal_api]
@@ -762,6 +762,10 @@ pub fn evaluate_predicate(
                 (UnaryPredicateOp::IsNull, true) => Ok(is_not_null(&arr)?),
                 (UnaryPredicateOp::HasUriScheme, _) => {
                     Ok(maybe_inverted(Cow::Owned(has_uri_scheme(&arr)?))?)
+                }
+                (UnaryPredicateOp::HasDotSegment, _) => {
+                    let has_dot = map_string_rows(&arr, "HasDotSegment", has_dot_segment)?;
+                    Ok(maybe_inverted(Cow::Owned(BooleanArray::from(has_dot)))?)
                 }
             }
         }
@@ -2444,7 +2448,9 @@ mod tests {
         #[case] expected: Vec<Option<&str>>,
     ) {
         let column: ArrayRef = Arc::new(LargeStringArray::from(vec![Some("a"), None, Some("")]));
-        let batch = RecordBatch::try_from_iter([("s", column)]).unwrap().slice(offset, len);
+        let batch = RecordBatch::try_from_iter([("s", column)])
+            .unwrap()
+            .slice(offset, len);
         let expr = Expr::string_concat([col!("s"), lit("/x")]);
         let result = evaluate_expression(&expr, &batch, None).unwrap();
         assert_eq!(result.as_string::<i32>(), &StringArray::from(expected));
@@ -2562,6 +2568,27 @@ mod tests {
         let expected: BooleanArray = HAS_URI_SCHEME_CASES
             .iter()
             .map(|(_, has_scheme)| has_scheme.map(|h| h != inverted))
+            .collect();
+        assert_eq!(result, expected);
+    }
+
+    #[rstest]
+    fn test_has_dot_segment(
+        #[values(
+            |r| Arc::new(StringArray::from(r)) as ArrayRef,
+            |r| Arc::new(LargeStringArray::from(r)) as ArrayRef,
+            |r| Arc::new(StringViewArray::from(r)) as ArrayRef
+        )]
+        make_array: fn(Vec<Option<&'static str>>) -> ArrayRef,
+        #[values(false, true)] inverted: bool,
+    ) {
+        let paths = vec![Some("a/../b"), Some("a/.hidden"), Some(""), None];
+        let batch = RecordBatch::try_from_iter([("p", make_array(paths))]).unwrap();
+        let result =
+            evaluate_predicate(&Pred::has_dot_segment(col!("p")), &batch, inverted).unwrap();
+        let expected: BooleanArray = [Some(true), Some(false), Some(false), None]
+            .into_iter()
+            .map(|has_dot| has_dot.map(|h| h != inverted))
             .collect();
         assert_eq!(result, expected);
     }

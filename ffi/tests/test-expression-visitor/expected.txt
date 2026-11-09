@@ -169,6 +169,8 @@ And
       Column(col)
   HasUriScheme
     Column(location)
+  HasDotSegment
+    Column(location)
   OpaquePredicate(bar)
     Integer(42)
     Double(1.111000)
