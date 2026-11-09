@@ -23,10 +23,10 @@ use crate::scalar::to_df_scalar;
 /// [`Expr`](DFExpr), checking column references against `input_schema`.
 ///
 /// # Errors
-/// Returns [`KernelError::unsupported`] for engine-defined (`Opaque`) or `Unknown` predicates, and
-/// for an `IN` whose right side is neither a literal array nor an array-typed column. Also
-/// propagates errors from child expressions, such as an unresolved column or an interval literal
-/// (which has no Arrow equivalent).
+/// Returns [`KernelError::unsupported`] for engine-defined (`Opaque`) or `Unknown` predicates, for
+/// `HasUriScheme`, and for an `IN` whose right side is neither a literal array nor an array-typed
+/// column. Also propagates errors from child expressions, such as an unresolved column or an
+/// interval literal (which has no Arrow equivalent).
 pub fn to_df_predicate_expr(
     pred: &KernelPredicate,
     input_schema: &StructType,

@@ -44,8 +44,8 @@ use crate::expressions::{
     OpaqueExpression, OpaquePredicate, Predicate, Scalar, UnaryExpression, UnaryExpressionOp,
     UnaryPredicate, UnaryPredicateOp, VariadicExpression, VariadicExpressionOp,
 };
-use crate::path_encoding::scheme_len;
 use crate::schema::{DataType, PrimitiveType, StructField, StructType};
+use crate::uri_reference::scheme_len;
 
 #[internal_api]
 pub(crate) trait ProvidesColumnByName {
