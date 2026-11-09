@@ -3510,6 +3510,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn update_table_builder_removes_table_property_via_ffi() -> KernelResult<()> {
+        let (table_url, _store, engine) =
+            setup_domain_metadata_table("test_update_builder_remove_property", false).await?;
+        let snapshot =
+            unsafe { build_snapshot(ffi_str(table_url.as_str()), engine.shallow_copy()) };
+        let builder = unsafe {
+            ok_or_panic(new_update_table_txn_builder(
+                snapshot.shallow_copy(),
+                KernelUpdateTableOperation::AlterTable,
+                ffi_str("test-engine/1.0"),
+                false,
+                engine.shallow_copy(),
+            ))
+        };
+        let owner_key = "app.owner";
+        let owner_value = "kernel";
+        let builder = ok_or_panic(unsafe {
+            update_table_txn_builder_with_table_property_added(
+                builder,
+                kernel_string_slice!(owner_key),
+                kernel_string_slice!(owner_value),
+                engine.shallow_copy(),
+            )
+        });
+        let txn =
+            ok_or_panic(unsafe { update_table_txn_builder_build(builder, engine.shallow_copy()) });
+        let committed = ok_or_panic(unsafe { update_table_txn_commit(txn, engine.shallow_copy()) });
+        assert_eq!(unsafe { version_and_free(committed) }, 1);
+        unsafe { free_snapshot(snapshot) };
+
+        let snapshot =
+            unsafe { build_snapshot(ffi_str(table_url.as_str()), engine.shallow_copy()) };
+        let builder = unsafe {
+            ok_or_panic(new_update_table_txn_builder(
+                snapshot.shallow_copy(),
+                KernelUpdateTableOperation::AlterTable,
+                ffi_str("test-engine/1.0"),
+                false,
+                engine.shallow_copy(),
+            ))
+        };
+        let builder = ok_or_panic(unsafe {
+            update_table_txn_builder_with_table_properties_removed(
+                builder,
+                kernel_string_slice!(owner_key),
+                engine.shallow_copy(),
+            )
+        });
+        let txn =
+            ok_or_panic(unsafe { update_table_txn_builder_build(builder, engine.shallow_copy()) });
+        let committed = ok_or_panic(unsafe { update_table_txn_commit(txn, engine.shallow_copy()) });
+        assert_eq!(unsafe { version_and_free(committed) }, 2);
+
+        let reloaded =
+            unsafe { build_snapshot(ffi_str(table_url.as_str()), engine.shallow_copy()) };
+        let props = unsafe { reloaded.as_ref() }.table_properties();
+        assert!(!props.unknown_properties.contains_key("app.owner"));
+        unsafe {
+            free_snapshot(reloaded);
+            free_snapshot(snapshot);
+            free_engine(engine);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn update_table_commit_conflict_is_reported_through_ffi() -> KernelResult<()> {
         let (table_url, _store, engine) =
             setup_domain_metadata_table("test_update_commit_conflict", false).await?;
