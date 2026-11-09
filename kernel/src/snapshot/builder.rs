@@ -426,8 +426,9 @@ impl<Mode> SnapshotBuilder<Mode> {
 
             // A snapshot is latest when no explicit time-travel version is requested, or when the
             // requested version is exactly the max_catalog_version.
-            let built_as_latest = version
-                .is_none_or(|version| resolve_latest_claim(version, max_catalog_version, false));
+            let built_as_latest = version.is_none_or(|version| {
+                resolve_latest_claim(version, max_catalog_version, false /* latest_claim */)
+            });
 
             if let Some(table_root) = table_root {
                 let table_url = try_parse_uri(&table_root)
@@ -1893,6 +1894,9 @@ pub(super) mod tests {
             assert_eq!(result.log_segment(), snapshot.log_segment());
             assert!(result.is_built_as_latest());
             assert_eq!(snapshot.is_built_as_latest(), staged_snapshot);
+            if staged_snapshot {
+                assert!(Arc::ptr_eq(&snapshot, &result));
+            }
             assert!(!reporter.events().iter().any(|event| matches!(
                 event,
                 MetricEvent::StorageListCompleted(_)
