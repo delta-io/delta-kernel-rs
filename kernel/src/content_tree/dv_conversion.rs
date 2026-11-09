@@ -10,7 +10,7 @@ use crate::content_tree::{
     DeletionVectorInfo, KEY_METADATA, LOCATION,
 };
 use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
-use crate::expressions::{ArrayData, Expression, Scalar, expr, lit};
+use crate::expressions::{ArrayData, Expression, Predicate, Scalar, lit, null_lit};
 use crate::schema::{ArrayType, ColumnName, DataType, SchemaRef, column_name, lazy_schema_ref};
 use crate::{EngineData, KernelError, KernelResult};
 
@@ -68,9 +68,6 @@ pub(crate) fn extract_deletion_vector_content(
     })
 }
 
-/// Helper column holding each kept entry's `Add.deletionVector.storageType`, null for any other
-/// entry. See [`add_deletion_vector_expression`].
-const DV_STORAGE_TYPE_HELPER: &str = "_dvStorageType";
 /// Helper column holding the percent-encoded URI of each kept entry's absolute deletion vector
 /// location, null for any other entry. See [`add_deletion_vector_expression`].
 const DV_ABSOLUTE_PATH_HELPER: &str = "_dvAbsolutePath";
@@ -78,7 +75,6 @@ const DV_ABSOLUTE_PATH_HELPER: &str = "_dvAbsolutePath";
 /// Schema of the helper columns [`add_deletion_vector_expression`] reads, in
 /// [`AddDeletionVectorColumns::into_columns`] order.
 pub(crate) static ADD_DV_HELPER_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
-    nullable DV_STORAGE_TYPE_HELPER: STRING,
     nullable DV_ABSOLUTE_PATH_HELPER: STRING,
 };
 
@@ -86,17 +82,30 @@ pub(crate) static ADD_DV_HELPER_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
 /// entry's `deletionVector` column plus the [`ADD_DV_HELPER_SCHEMA`] columns: the inverse of
 /// [`extract_deletion_vector_content`].
 ///
-/// The descriptor is null for every entry [`AddDeletionVectorColumns`] pushed as null, and is
-/// otherwise built from the entry validated by [`AddDeletionVectorColumns::try_push`]. A relative
-/// location becomes a `PersistedUnencodedRelative` (`'r'`) descriptor; an absolute one becomes
-/// `PersistedAbsolute` (`'p'`).
+/// The descriptor is null where the entry has no deletion vector, and is otherwise built from the
+/// entry validated by [`AddDeletionVectorColumns::try_push`]. A relative location becomes a
+/// `PersistedUnencodedRelative` (`'r'`) descriptor; an absolute one becomes `PersistedAbsolute`
+/// (`'p'`).
 pub(crate) fn add_deletion_vector_expression() -> Expression {
     let dv_field = |field: &str| Expression::column([DV_INFO, field]);
-    // Only the storage type and an absolute location's percent-encoding need per-row work, so only
-    // they come from helper columns; every other field passes through.
+    let has_dv = || Predicate::is_not_null(Expression::column([DV_INFO]));
+    // Row visitors read leaves without the parent's null mask, so `storageType` must be null
+    // exactly where the descriptor is.
+    let storage_type = Expression::case_when(
+        [
+            (Predicate::not(has_dv()), null_lit(DataType::STRING)),
+            (
+                Predicate::has_uri_scheme(dv_field(LOCATION)),
+                lit(DeletionVectorStorageType::PersistedAbsolute),
+            ),
+        ],
+        lit(DeletionVectorStorageType::PersistedUnencodedRelative),
+    );
+    // Only an absolute location's percent-encoding needs per-row work, so only it comes from a
+    // helper column; every other field passes through.
     Expression::struct_with_nullability_from(
         [
-            Expression::column([DV_STORAGE_TYPE_HELPER]),
+            storage_type,
             Expression::coalesce([
                 Expression::column([DV_ABSOLUTE_PATH_HELPER]),
                 dv_field(LOCATION),
@@ -111,10 +120,7 @@ pub(crate) fn add_deletion_vector_expression() -> Expression {
             ),
             dv_field(DV_INFO_CARDINALITY),
         ],
-        // Keyed off the storage type helper, not `deletionVector`: row visitors read leaves
-        // without the parent's null mask, so the descriptor must be null exactly where its
-        // `storageType` leaf is.
-        expr!(is_not_null(path(DV_STORAGE_TYPE_HELPER))),
+        Expression::from(has_dv()),
     )
 }
 
@@ -122,7 +128,6 @@ pub(crate) fn add_deletion_vector_expression() -> Expression {
 /// per-row values [`add_deletion_vector_expression`] cannot compute.
 #[derive(Default)]
 pub(crate) struct AddDeletionVectorColumns {
-    storage_types: Vec<Scalar>,
     absolute_paths: Vec<Scalar>,
 }
 
@@ -161,18 +166,15 @@ impl AddDeletionVectorColumns {
 
     /// Appends a null row, for an entry that is dropped or has no deletion vector.
     pub(crate) fn push_null(&mut self) {
-        self.storage_types.push(Scalar::Null(DataType::STRING));
         self.absolute_paths.push(Scalar::Null(DataType::STRING));
     }
 
     /// The helper columns, matching [`ADD_DV_HELPER_SCHEMA`].
     pub(crate) fn into_columns(self) -> KernelResult<Vec<ArrayData>> {
-        let string_column =
-            |values| ArrayData::try_new(ArrayType::new(DataType::STRING, true), values);
-        Ok(vec![
-            string_column(self.storage_types)?,
-            string_column(self.absolute_paths)?,
-        ])
+        Ok(vec![ArrayData::try_new(
+            ArrayType::new(DataType::STRING, true),
+            self.absolute_paths,
+        )?])
     }
 
     /// Validates an AMT deletion vector from its parts (see [`DeletionVectorInfo`]) and appends
@@ -209,24 +211,17 @@ impl AddDeletionVectorColumns {
         if cardinality < 0 {
             return Err(invalid(format!("cardinality {cardinality} is negative")));
         }
-        let (storage_type, absolute_path) = match parse_absolute_amt_location(location)? {
-            Some(url) => (
-                DeletionVectorStorageType::PersistedAbsolute,
-                Scalar::String(url.into()),
-            ),
+        let absolute_path = match parse_absolute_amt_location(location)? {
+            Some(url) => Scalar::String(url.into()),
             // Kept verbatim: `'r'` stores the same raw table-relative path. Log replay normalizes
             // DV identities, so it still matches the `'u'`, `'r'`, or `'p'` descriptor the writer
             // started from.
             None => {
                 validate_table_relative(location)?;
                 reject_dot_segments(location)?;
-                (
-                    DeletionVectorStorageType::PersistedUnencodedRelative,
-                    Scalar::Null(DataType::STRING),
-                )
+                Scalar::Null(DataType::STRING)
             }
         };
-        self.storage_types.push(storage_type.into());
         self.absolute_paths.push(absolute_path);
         Ok(())
     }
