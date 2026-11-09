@@ -551,6 +551,23 @@ void print_metric(MetricEvent event) {
     PM_END;
     return;
 
+  case MetricEventCheckpointWrite:
+    PM_START(CheckpointWrite);
+    CheckpointWrite cw = event.checkpoint_write;
+    printf("  outcome: %d,\n", cw.outcome.tag);
+    PM_U64(cw, mode);
+    PM_U64(cw, duration_ns);
+    if (cw.outcome.tag == CheckpointWriteOutcomeWritten) {
+      CheckpointWriteStats stats = cw.outcome.written.stats;
+      PM_U64(stats, bytes_written);
+      PM_U64(stats, num_add_files);
+      PM_U64(stats, num_remove_files);
+      PM_U64(stats, num_actions);
+      PM_U64(stats, num_sidecars);
+    }
+    PM_END;
+    return;
+
   case MetricEventJsonReadCompleted:
     PM_START(MetricEventJsonReadCompleted);
     JsonReadCompleted jrc = event.json_read_completed;

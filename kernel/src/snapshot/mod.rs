@@ -1744,7 +1744,8 @@ impl Snapshot {
             "duration_ns",
             u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX),
         );
-        // TODO: Report separate outcome and duration metrics for `_last_checkpoint` publication.
+        // TODO(#3828): Report separate outcome and duration metrics for `_last_checkpoint`
+        // publication.
         writer.finalize(engine, &info.last_checkpoint_stats)?;
 
         let checkpoint_log_path = ParsedLogPath::new(info.file_meta).ok_or_else(|| {

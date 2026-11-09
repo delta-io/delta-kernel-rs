@@ -54,7 +54,7 @@ async fn checkpoint_reports_reconciled_counts_and_stored_bytes(
     #[case] spec: Option<CheckpointSpec>,
     #[case] mode: CheckpointWriteMode,
     #[case] num_sidecars: u64,
-) -> KernelResult<()> {
+) -> delta_kernel::Result<()> {
     let features = if v2 {
         FeatureSet::new().v2_checkpoint()
     } else {
@@ -65,6 +65,8 @@ async fn checkpoint_reports_reconciled_counts_and_stored_bytes(
         .with_log_state(LogState::with_latest_version(2))
         .with_data(1, 1)
         .build()?;
+    let reporter = Arc::new(CapturingReporter::default());
+    let _guard = install_thread_local_metrics_reporter(reporter.clone());
     let engine = checkpoint_engine(&table);
     let first_data = Snapshot::builder_for(table.table_root())
         .at_version(1)
@@ -79,8 +81,6 @@ async fn checkpoint_reports_reconciled_counts_and_stored_bytes(
     let snapshot = transaction
         .commit(engine.as_ref())?
         .unwrap_post_commit_snapshot();
-    let reporter = Arc::new(CapturingReporter::default());
-    let _guard = install_thread_local_metrics_reporter(reporter.clone());
 
     let (result, checkpointed) = snapshot.checkpoint(engine.as_ref(), spec.as_ref())?;
 
@@ -98,7 +98,12 @@ async fn checkpoint_reports_reconciled_counts_and_stored_bytes(
     assert_eq!(stats.num_sidecars, num_sidecars);
     assert_eq!(stats.num_actions, 4 + u64::from(v2) + num_sidecars);
 
-    let files: Vec<_> = table.store().list(None).try_collect().await?;
+    let files: Vec<_> = table
+        .store()
+        .list(None)
+        .try_collect()
+        .await
+        .map_err(KernelError::from)?;
     let checkpoint_files: Vec<_> = files
         .iter()
         .filter(|file| {
@@ -110,9 +115,17 @@ async fn checkpoint_reports_reconciled_counts_and_stored_bytes(
     let mut bytes_written = 0;
     let mut num_actions = 0;
     for file in checkpoint_files {
-        let bytes = table.store().get(&file.location).await?.bytes().await?;
+        let bytes = table
+            .store()
+            .get(&file.location)
+            .await
+            .map_err(KernelError::from)?
+            .bytes()
+            .await
+            .map_err(KernelError::from)?;
         bytes_written += bytes.len() as u64;
-        num_actions += ParquetRecordBatchReaderBuilder::try_new(bytes)?
+        num_actions += ParquetRecordBatchReaderBuilder::try_new(bytes)
+            .map_err(KernelError::from)?
             .metadata()
             .file_metadata()
             .num_rows() as u64;
@@ -131,14 +144,14 @@ async fn checkpoint_reports_reconciled_counts_and_stored_bytes(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn sidecar_mode_with_no_file_actions_reports_zero_sidecars() -> KernelResult<()> {
+async fn sidecar_mode_with_no_file_actions_reports_zero_sidecars() -> delta_kernel::Result<()> {
     let table = TestTableBuilder::new()
         .with_features(FeatureSet::new().v2_checkpoint())
         .build()?;
-    let engine = checkpoint_engine(&table);
-    let snapshot = Snapshot::builder_for(table.table_root()).build(engine.as_ref())?;
     let reporter = Arc::new(CapturingReporter::default());
     let _guard = install_thread_local_metrics_reporter(reporter.clone());
+    let engine = checkpoint_engine(&table);
+    let snapshot = Snapshot::builder_for(table.table_root()).build(engine.as_ref())?;
     let (result, _checkpointed) = snapshot.checkpoint(
         engine.as_ref(),
         Some(&CheckpointSpec::V2(V2CheckpointConfig::WithSidecar {
@@ -174,7 +187,7 @@ async fn sidecar_mode_with_no_file_actions_reports_zero_sidecars() -> KernelResu
 async fn invalid_checkpoint_spec_reports_error_without_selecting_mode(
     #[case] v2: bool,
     #[case] spec: CheckpointSpec,
-) -> KernelResult<()> {
+) -> delta_kernel::Result<()> {
     let table = TestTableBuilder::new()
         .with_features(if v2 {
             FeatureSet::new().v2_checkpoint()
@@ -182,10 +195,10 @@ async fn invalid_checkpoint_spec_reports_error_without_selecting_mode(
             FeatureSet::empty()
         })
         .build()?;
-    let engine = checkpoint_engine(&table);
-    let snapshot = Snapshot::builder_for(table.table_root()).build(engine.as_ref())?;
     let reporter = Arc::new(CapturingReporter::default());
     let _guard = install_thread_local_metrics_reporter(reporter.clone());
+    let engine = checkpoint_engine(&table);
+    let snapshot = Snapshot::builder_for(table.table_root()).build(engine.as_ref())?;
 
     assert!(snapshot.checkpoint(engine.as_ref(), Some(&spec)).is_err());
 
@@ -200,10 +213,12 @@ async fn invalid_checkpoint_spec_reports_error_without_selecting_mode(
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn checkpoint_duration_includes_data_writes_and_excludes_hint_writes(
     #[values(false, true)] fail_hint: bool,
-) -> KernelResult<()> {
+) -> delta_kernel::Result<()> {
     let table = TestTableBuilder::new()
         .with_log_state(LogState::with_latest_version(1))
         .build()?;
+    let reporter = Arc::new(CapturingReporter::default());
+    let _guard = install_thread_local_metrics_reporter(reporter.clone());
     let checkpoint_delay = Duration::from_millis(20);
     let engine = ControlledCheckpointEngine::new(
         checkpoint_engine(&table),
@@ -213,8 +228,6 @@ async fn checkpoint_duration_includes_data_writes_and_excludes_hint_writes(
         fail_hint,
     );
     let snapshot = Snapshot::builder_for(table.table_root()).build(&engine)?;
-    let reporter = Arc::new(CapturingReporter::default());
-    let _guard = install_thread_local_metrics_reporter(reporter.clone());
 
     let started = Instant::now();
     let result = snapshot.checkpoint(&engine, None);
@@ -250,8 +263,10 @@ async fn checkpoint_duration_includes_data_writes_and_excludes_hint_writes(
 async fn checkpoint_write_errors_preserve_mode_and_duration(
     #[case] error: InjectedWriteError,
     #[case] outcome: CheckpointWriteOutcome,
-) -> KernelResult<()> {
+) -> delta_kernel::Result<()> {
     let table = TestTableBuilder::new().build()?;
+    let reporter = Arc::new(CapturingReporter::default());
+    let _guard = install_thread_local_metrics_reporter(reporter.clone());
     let delay = Duration::from_millis(20);
     let engine = ControlledCheckpointEngine::new(
         checkpoint_engine(&table),
@@ -261,8 +276,6 @@ async fn checkpoint_write_errors_preserve_mode_and_duration(
         false,
     );
     let snapshot = Snapshot::builder_for(table.table_root()).build(&engine)?;
-    let reporter = Arc::new(CapturingReporter::default());
-    let _guard = install_thread_local_metrics_reporter(reporter.clone());
 
     let result = snapshot.checkpoint(&engine, None);
 
@@ -281,10 +294,13 @@ async fn checkpoint_write_errors_preserve_mode_and_duration(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn checkpoint_with_newer_hint_reports_written_without_publishing_hint() -> KernelResult<()> {
+async fn checkpoint_with_newer_hint_reports_written_without_publishing_hint()
+-> delta_kernel::Result<()> {
     let table = TestTableBuilder::new()
         .with_log_state(LogState::with_latest_version(2).with_checkpoint_at([2]))
         .build()?;
+    let reporter = Arc::new(CapturingReporter::default());
+    let _guard = install_thread_local_metrics_reporter(reporter.clone());
     let engine = ControlledCheckpointEngine::new(
         checkpoint_engine(&table),
         Duration::ZERO,
@@ -295,8 +311,6 @@ async fn checkpoint_with_newer_hint_reports_written_without_publishing_hint() ->
     let snapshot = Snapshot::builder_for(table.table_root())
         .at_version(1)
         .build(&engine)?;
-    let reporter = Arc::new(CapturingReporter::default());
-    let _guard = install_thread_local_metrics_reporter(reporter.clone());
 
     let (result, _checkpointed) = snapshot.checkpoint(&engine, None)?;
 
