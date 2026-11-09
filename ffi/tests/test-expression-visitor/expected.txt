@@ -113,7 +113,7 @@ StructExpression
   ArrayConstructor
     Integer(1)
     Integer(2)
-  Concat
+  StringConcat
     String(s3://b/)
     Column(location)
   CaseWhen

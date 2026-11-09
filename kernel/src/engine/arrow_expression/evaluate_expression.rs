@@ -13,16 +13,18 @@ use crate::arrow::array::types::*;
 use crate::arrow::array::{
     self as arrow_array, Array, ArrayBuilder, ArrayData, ArrayRef, AsArray, BooleanArray, Datum,
     LargeStringArray, ListArray, MapArray, MutableArrayData, NullBufferBuilder, RecordBatch,
-    StringArray, StringArrayType, StructArray, make_array, new_null_array,
+    StringArray, StringArrayType, StructArray, UInt32Array, make_array, new_null_array,
 };
 use crate::arrow::buffer::{NullBuffer, OffsetBuffer};
 use crate::arrow::compute::kernels::cast_utils::{Parser, string_to_datetime};
 use crate::arrow::compute::kernels::cmp::{distinct, eq, gt, gt_eq, lt, lt_eq, neq, not_distinct};
 use crate::arrow::compute::kernels::comparison::in_list_utf8;
+use crate::arrow::compute::kernels::concat_elements::concat_elements_utf8_many;
 use crate::arrow::compute::kernels::interleave::interleave;
 use crate::arrow::compute::kernels::numeric::{add, div, mul, sub};
 use crate::arrow::compute::{
     and_kleene, can_cast_types, cast, filter_record_batch, is_not_null, is_null, not, or_kleene,
+    take,
 };
 use crate::arrow::datatypes::{
     DataType as ArrowDataType, Field as ArrowField, Fields as ArrowFields, IntervalUnit,
@@ -370,9 +372,15 @@ pub fn evaluate_expression(
         (Variadic(VariadicExpression { op: Array, exprs }), result_type) => {
             evaluate_array_expression(exprs, batch, result_type)
         }
-        (Variadic(VariadicExpression { op: Concat, exprs }), result_type) => {
-            require_output_type(Concat, &DataType::STRING, result_type)?;
-            evaluate_concat(exprs, batch)
+        (
+            Variadic(VariadicExpression {
+                op: StringConcat,
+                exprs,
+            }),
+            result_type,
+        ) => {
+            require_output_type(StringConcat, &DataType::STRING, result_type)?;
+            evaluate_string_concat(exprs, batch)
         }
         (Opaque(OpaqueExpression { op, exprs }), _) => {
             match op
@@ -885,7 +893,7 @@ pub fn evaluate_predicate(
     }
 }
 
-/// Fails fast when the caller requests a type other than the fixed `output_type` of `op`.
+/// Errors if `requested` is set and differs from `op`'s fixed `output_type`.
 fn require_output_type(
     op: impl Display,
     output_type: &DataType,
@@ -899,39 +907,48 @@ fn require_output_type(
     }
 }
 
-/// Evaluates [`VariadicExpressionOp::Concat`]: row-wise concatenation, NULL if any input is NULL.
-fn evaluate_concat(exprs: &[Expression], batch: &RecordBatch) -> KernelResult<ArrayRef> {
+/// Evaluates [`VariadicExpressionOp::StringConcat`]: row-wise concatenation, NULL if any input
+/// is NULL. A one-row input, such as a literal-only `IN`, applies to every row.
+fn evaluate_string_concat(exprs: &[Expression], batch: &RecordBatch) -> KernelResult<ArrayRef> {
     require!(
         !exprs.is_empty(),
-        KernelError::invalid_expression("CONCAT requires at least one input")
+        KernelError::invalid_expression("StringConcat requires at least one input")
     );
+    let num_rows = batch.num_rows();
+    // Large offsets keep the concatenation itself from overflowing; the final cast to Utf8
+    // returns an error, where building a Utf8 array directly would panic.
     let inputs = exprs
         .iter()
-        .map(|expr| evaluate_expression(expr, batch, None))
-        .try_collect::<_, Vec<_>, _>()?;
-    let columns = inputs
-        .iter()
-        .map(|input| map_string_rows(input, "Concat", |row| row))
-        .try_collect::<_, Vec<_>, _>()?;
-    let mut total_len = 0usize;
-    let rows = (0..batch.num_rows())
-        .map(|row| {
-            let parts: Option<Vec<&str>> = columns.iter().map(|column| column[row]).collect();
-            parts.map(|parts| {
-                let value = parts.concat();
-                total_len += value.len();
-                value
-            })
+        .map(|expr| {
+            let input = evaluate_expression(expr, batch, None)?;
+            require!(
+                matches!(
+                    input.data_type(),
+                    ArrowDataType::Utf8 | ArrowDataType::LargeUtf8 | ArrowDataType::Utf8View
+                ),
+                KernelError::invalid_expression(format!(
+                    "StringConcat requires a string input, got {}",
+                    input.data_type()
+                ))
+            );
+            let input = match input.len() {
+                len if len == num_rows => input,
+                1 => take(&input, &UInt32Array::from(vec![0; num_rows]), None)?,
+                len => {
+                    return Err(KernelError::internal_error(format!(
+                        "StringConcat input has {len} rows, but the batch has {num_rows}"
+                    )));
+                }
+            };
+            Ok(cast(&input, &ArrowDataType::LargeUtf8)?)
         })
+        .try_collect::<_, Vec<_>, KernelError>()?;
+    let inputs = inputs
+        .iter()
+        .map(|input| input.as_string::<i64>())
         .collect_vec();
-    // Arrow panics rather than errors when string offsets overflow.
-    require!(
-        i32::try_from(total_len).is_ok(),
-        KernelError::invalid_expression(format!(
-            "Concat output of {total_len} bytes does not fit in one string array"
-        ))
-    );
-    Ok(Arc::new(StringArray::from_iter(rows)))
+    let concatenated = concat_elements_utf8_many(&inputs)?;
+    Ok(cast(&concatenated, &ArrowDataType::Utf8)?)
 }
 
 /// [`map_string_rows`] collected into a Utf8 array, whatever the input representation.
@@ -2323,7 +2340,12 @@ mod tests {
     #[case::two_strings(vec![lit("s3://b/"), col!("s")], vec![Some("s3://b/a"), None, Some("s3://b/")])]
     #[case::single_input(vec![col!("s")], vec![Some("a"), None, Some("")])]
     #[case::null_literal(vec![col!("s"), null_lit(DataType::STRING)], vec![None, None, None])]
-    fn test_concat(
+    #[case::null_first(vec![null_lit(DataType::STRING), col!("s")], vec![None, None, None])]
+    #[case::one_row_input(
+        vec![col!("s"), Expr::cast(Pred::binary(BinaryPredicateOp::In, lit(1), Scalar::Array(ArrayData::try_new(ArrayType::new(DataType::INTEGER, false), vec![1]).unwrap())), DataType::STRING)],
+        vec![Some("atrue"), None, Some("true")]
+    )]
+    fn test_string_concat(
         #[values(
             |s| Arc::new(StringArray::from(s)) as ArrayRef,
             |s| Arc::new(LargeStringArray::from(s)) as ArrayRef,
@@ -2336,15 +2358,33 @@ mod tests {
     ) {
         let column = make_array(vec![Some("a"), None, Some("")]);
         let batch = RecordBatch::try_from_iter([("s", column)]).unwrap();
-        let result = evaluate_expression(&Expr::concat(inputs), &batch, result_type).unwrap();
+        let result =
+            evaluate_expression(&Expr::string_concat(inputs), &batch, result_type).unwrap();
         assert_eq!(result.as_string::<i32>(), &StringArray::from(expected));
     }
 
     #[rstest]
-    #[case::no_inputs(Expr::concat(Vec::<Expr>::new()), None)]
-    #[case::non_string_input(Expr::concat([col!("n")]), None)]
-    #[case::non_string_output(Expr::concat([lit("a")]), Some(DataType::INTEGER))]
-    fn test_concat_rejects_invalid_expression(
+    #[case::sliced(1, 2, vec![None, Some("/x")])]
+    #[case::empty(0, 0, vec![])]
+    fn test_string_concat_on_sliced_batch(
+        #[case] offset: usize,
+        #[case] len: usize,
+        #[case] expected: Vec<Option<&str>>,
+    ) {
+        let column: ArrayRef = Arc::new(LargeStringArray::from(vec![Some("a"), None, Some("")]));
+        let batch = RecordBatch::try_from_iter([("s", column)])
+            .unwrap()
+            .slice(offset, len);
+        let expr = Expr::string_concat([col!("s"), lit("/x")]);
+        let result = evaluate_expression(&expr, &batch, None).unwrap();
+        assert_eq!(result.as_string::<i32>(), &StringArray::from(expected));
+    }
+
+    #[rstest]
+    #[case::no_inputs(Expr::string_concat(Vec::<Expr>::new()), None)]
+    #[case::non_string_input(Expr::string_concat([col!("n")]), None)]
+    #[case::non_string_output(Expr::string_concat([lit("a")]), Some(DataType::INTEGER))]
+    fn test_string_concat_rejects_invalid_expression(
         #[case] expr: Expr,
         #[case] result_type: Option<DataType>,
     ) {
