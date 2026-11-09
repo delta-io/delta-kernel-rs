@@ -867,38 +867,44 @@ impl LogSegment {
         Ok(new_log_segment)
     }
 
-    /// Replaces retained staged commit references through `published_through` with published paths.
+    /// Replaces retained staged commit references through `max_published_version` with published
+    /// paths.
     ///
     /// The caller establishes which commits have been published; this method performs no storage
     /// reads. Replaced commit references retain the staged file's size and modification time.
-    /// `published_through` cannot exceed `self.end_version` or be less than
-    /// `self.listed.max_published_version`. `None` means no commits are known to be published.
-    /// Returns `None` without cloning if the commit paths and `max_published_version` are
-    /// unchanged.
+    /// `max_published_version` cannot exceed `self.end_version` or be less than
+    /// `self.listed.max_published_version`.
+    ///
+    /// `None` means no published version is known. Callers may pass it when no commits need copying
+    /// and no published version was recorded, including when a checkpoint covers the replay
+    /// commits. It is a no-op if the recorded maximum is also `None`; otherwise it is an error.
+    ///
+    /// Returns `Ok(None)` without cloning if neither the commit paths nor the recorded maximum
+    /// change.
     pub(crate) fn new_as_published(
         &self,
-        published_through: Option<Version>,
+        max_published_version: Option<Version>,
     ) -> KernelResult<Option<Self>> {
         require!(
-            published_through <= Some(self.end_version),
+            max_published_version <= Some(self.end_version),
             KernelError::invalid_log_segment(format!(
-                "publication watermark {published_through:?} exceeds log segment end version {}",
+                "publication watermark {max_published_version:?} exceeds log segment end version {}",
                 self.end_version
             ))
         );
         require!(
-            published_through >= self.listed.max_published_version,
+            max_published_version >= self.listed.max_published_version,
             KernelError::invalid_log_segment(format!(
-                "publication watermark {published_through:?} regresses existing watermark {:?}",
+                "publication watermark {max_published_version:?} regresses existing watermark {:?}",
                 self.listed.max_published_version
             ))
         );
 
         let needs_published_path = |file: &ParsedLogPath| {
             file.file_type == StagedCommit
-                && published_through.is_some_and(|version| file.version <= version)
+                && max_published_version.is_some_and(|version| file.version <= version)
         };
-        if published_through == self.listed.max_published_version
+        if max_published_version == self.listed.max_published_version
             && !self
                 .listed
                 .ascending_commit_files
@@ -926,7 +932,7 @@ impl LogSegment {
         };
 
         let mut new_log_segment = self.clone();
-        new_log_segment.listed.max_published_version = published_through;
+        new_log_segment.listed.max_published_version = max_published_version;
         for file in &mut new_log_segment.listed.ascending_commit_files {
             replace_staged(file)?;
         }

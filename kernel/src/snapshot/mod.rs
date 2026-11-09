@@ -1812,7 +1812,7 @@ impl Snapshot {
     ) -> KernelResult<SnapshotRef> {
         let unpublished_catalog_commits = self.log_segment().get_unpublished_catalog_commits()?;
 
-        let published_through = if unpublished_catalog_commits.is_empty() {
+        let max_published_version = if unpublished_catalog_commits.is_empty() {
             if !self.table_configuration().is_catalog_managed() {
                 return Ok(Arc::clone(self));
             }
@@ -1849,7 +1849,7 @@ impl Snapshot {
             Some(self.version())
         };
 
-        let Some(log_segment) = self.log_segment().new_as_published(published_through)? else {
+        let Some(log_segment) = self.log_segment().new_as_published(max_published_version)? else {
             return Ok(Arc::clone(self));
         };
 
