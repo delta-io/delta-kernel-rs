@@ -213,13 +213,15 @@ impl StatCategories {
     /// Whether a leaf in these categories keeps `stat` under a projection:
     /// `lower_bound`<-`minValues`, `upper_bound`<-`maxValues`,
     /// `value_count`/`null_value_count`<-`nullCount`, `nan_value_count`<-either bound category.
-    /// `total_bytes` has no backing category, so it is never kept -- and `null_value_count`, though
-    /// independent of nullability, is not kept for a leaf absent from `nullCount`.
+    /// `total_bytes` has no backing category, so it is never kept.
     fn backs(&self, stat: Stat) -> bool {
         match stat {
             Stat::LowerBound => self.min_values,
             Stat::UpperBound => self.max_values,
             Stat::ValueCount | Stat::NullValueCount => self.null_count,
+            // The spec forbids NaN bounds, so float/double bounds cover only non-NaN values. Kernel
+            // orders NaN above every number (a NaN row matches `x > 5`), so `upper_bound` is only
+            // safe to skip on when `nan_value_count` is known to be zero.
             Stat::NanValueCount => self.min_values || self.max_values,
             Stat::TotalBytes => false,
         }
@@ -227,10 +229,10 @@ impl StatCategories {
 }
 
 /// Builds a single column's stats struct, with each stat sub-field's ID an offset from
-/// `base_field_id`:
+/// `base_field_id`, per the Iceberg v4 spec's Field Statistics table:
 /// - offset 1/2: `lower_bound` / `upper_bound` (typed as `bounds_type`)
 /// - offset 3: `value_count` (long)
-/// - offset 4: `null_value_count` (long) - emitted regardless of the column's nullability
+/// - offset 4: `null_value_count` (long) - only for a `nullable` column
 /// - offset 5: `nan_value_count` (long) - only for float/double `bounds_type`
 /// - offset 6: `total_bytes` (long) - total uncompressed size of the column's values; for
 ///   string/binary `bounds_type`, or any variant
@@ -244,6 +246,7 @@ impl StatCategories {
 fn build_stats_struct(
     base_field_id: i32,
     bounds_type: &DataType,
+    nullable: bool,
     categories: Option<StatCategories>,
 ) -> StructType {
     let (has_nan_count, has_size_stats) = match bounds_type {
@@ -258,7 +261,8 @@ fn build_stats_struct(
     let fields = Stat::ALL.into_iter().filter_map(|stat| {
         let (data_type, type_eligible) = match stat {
             Stat::LowerBound | Stat::UpperBound => (bounds_type.clone(), true),
-            Stat::ValueCount | Stat::NullValueCount => (DataType::LONG, true),
+            Stat::ValueCount => (DataType::LONG, true),
+            Stat::NullValueCount => (DataType::LONG, nullable),
             Stat::NanValueCount => (DataType::LONG, has_nan_count),
             Stat::TotalBytes => (DataType::LONG, has_size_stats),
         };
@@ -323,13 +327,21 @@ fn leaf_stats_field(
     };
 
     let stats_struct = match field.data_type() {
-        DataType::Primitive(_) => build_stats_struct(base_stats_id, field.data_type(), categories),
+        DataType::Primitive(_) => build_stats_struct(
+            base_stats_id,
+            field.data_type(),
+            field.is_nullable(),
+            categories,
+        ),
         // A variant's inner fields carry no field IDs; the base stats ID covers the whole variant,
         // and its bounds are always recorded as unshredded variants regardless of physical
         // shredding.
-        DataType::Variant(_) => {
-            build_stats_struct(base_stats_id, &DataType::unshredded_variant(), categories)
-        }
+        DataType::Variant(_) => build_stats_struct(
+            base_stats_id,
+            &DataType::unshredded_variant(),
+            field.is_nullable(),
+            categories,
+        ),
         // Array/map/file columns carry no leaf stats.
         _ => return Ok(None),
     };
@@ -698,7 +710,6 @@ mod tests {
         (LOWER_BOUND, 10_401),
         (UPPER_BOUND, 10_402),
         (VALUE_COUNT, 10_403),
-        (NULL_VALUE_COUNT, 10_404),
     ])]
     #[case::optional_string(DataType::STRING, true, 3, &[
         (LOWER_BOUND, 10_601),
@@ -759,7 +770,7 @@ mod tests {
     }
 
     /// Asserts every stats sub-field of `stats_struct` carries the expected offset from `base_id`.
-    /// `null_value_count` is always present. Variants always carry the size stat.
+    /// `null_value_count` is present only for nullable fields. Variants always carry the size stat.
     fn assert_stats_field_ids(stats_struct: &StructType, base_id: i32, field: &StructField) {
         let is_variant = matches!(field.data_type(), DataType::Variant(_));
         let assert_offset = |name: &str, offset: i32| {
@@ -769,7 +780,11 @@ mod tests {
             );
         };
         assert_offset(VALUE_COUNT, STATS_OFFSET_VALUE_COUNT);
-        assert_offset(NULL_VALUE_COUNT, STATS_OFFSET_NULL_VALUE_COUNT);
+        if field.is_nullable() {
+            assert_offset(NULL_VALUE_COUNT, STATS_OFFSET_NULL_VALUE_COUNT);
+        } else {
+            assert!(stats_struct.field(NULL_VALUE_COUNT).is_none());
+        }
         if field.data_type() == &DataType::FLOAT || field.data_type() == &DataType::DOUBLE {
             assert_offset(NAN_VALUE_COUNT, STATS_OFFSET_NAN_VALUE_COUNT);
         }
@@ -783,21 +798,21 @@ mod tests {
         assert_offset(UPPER_BOUND, STATS_OFFSET_UPPER_BOUND);
     }
 
-    // `null_value_count` is always present, so counts include it regardless of nullability.
+    // `null_value_count` is present only for nullable fields, so required cases count one fewer.
     #[rstest]
-    #[case(DataType::INTEGER, false, 1, 10_200, 4)] // fixed-length
+    #[case(DataType::INTEGER, false, 1, 10_200, 3)] // fixed-length
     #[case(DataType::STRING, true, 2, 10_400, 5)] // size stats
     #[case(DataType::DOUBLE, true, 5, 11_000, 5)] // nan count
-    #[case(DataType::FLOAT, false, 100, 30_000, 5)] // nan count
+    #[case(DataType::FLOAT, false, 100, 30_000, 4)] // nan count
     #[case(DataType::LONG, true, 42, 18_400, 4)] // fixed-length
     #[case(DataType::BINARY, true, 3, 10_600, 5)] // size stats
-    #[case(DataType::BINARY, false, 4, 10_800, 5)] // size stats
+    #[case(DataType::BINARY, false, 4, 10_800, 4)] // size stats
     #[case(
         DataType::INTEGER,
         false,
         MAX_DATA_FIELD_ID,
         MAX_DATA_STATS_FIELD_ID,
-        4
+        3
     )] // top of range
     fn stats_schema_primitive_field(
         #[case] data_type: DataType,
@@ -880,10 +895,9 @@ mod tests {
         assert_eq!(stats.fields().count(), 2);
         assert!(stats.field("a").is_none());
 
-        // `b` is a not-null int; it still carries a null_value_count (always present), so 4
-        // sub-fields (lower, upper, value, null).
+        // `b` is a not-null int, so it omits null_value_count: 3 sub-fields (lower, upper, value).
         let b_stats = stats_struct_for_name("a.b", &stats);
-        assert_eq!(b_stats.fields().count(), 4);
+        assert_eq!(b_stats.fields().count(), 3);
         assert_eq!(get_field_id(stats.field("a.b").unwrap()), Some(10_400));
         assert_stats_field_ids(&b_stats, 10_400, &field_b);
 
@@ -960,11 +974,11 @@ mod tests {
         assert!(stats.field("a.b").is_none());
 
         let c_stats = stats_struct_for_name("a.b.c", &stats);
-        // Not-null int; null_value_count is always present, so 4 sub-fields.
-        assert_eq!(c_stats.fields().count(), 4);
+        // Not-null int, so it omits null_value_count: 3 sub-fields.
+        assert_eq!(c_stats.fields().count(), 3);
         assert!(c_stats.field(VALUE_COUNT).is_some());
         assert!(c_stats.field(LOWER_BOUND).is_some());
-        assert!(c_stats.field(NULL_VALUE_COUNT).is_some());
+        assert!(c_stats.field(NULL_VALUE_COUNT).is_none());
         assert_eq!(get_field_id(stats.field("a.b.c").unwrap()), Some(10_600));
     }
 
@@ -1038,19 +1052,21 @@ mod tests {
         ); // 10_000+200*6
     }
 
-    /// `null_value_count` is always emitted, independent of the leaf's or any ancestor's
-    /// nullability. Covers plain and variant leaves, at top level and nested under a not-null
-    /// struct (a not-null leaf under a not-null ancestor must still carry it).
+    /// `null_value_count` is emitted only for optional leaves, per the spec's "Included for:
+    /// optional fields". It follows the leaf's own nullability, not its ancestors': a required leaf
+    /// under an optional struct omits it. Covers plain and variant leaves, at top level and nested.
     #[rstest]
     #[case::top_level_not_null_int(DataType::INTEGER, false, None)]
     #[case::top_level_nullable_variant(DataType::unshredded_variant(), true, None)]
     #[case::not_null_int_under_not_null_struct(DataType::INTEGER, false, Some(false))]
+    #[case::not_null_int_under_nullable_struct(DataType::INTEGER, false, Some(true))]
+    #[case::nullable_int_under_not_null_struct(DataType::INTEGER, true, Some(false))]
     #[case::not_null_variant_under_not_null_struct(
         DataType::unshredded_variant(),
         false,
         Some(false)
     )]
-    fn null_value_count_always_present(
+    fn null_value_count_only_for_nullable_leaves(
         #[case] leaf_type: DataType,
         #[case] leaf_nullable: bool,
         #[case] parent_nullable: Option<bool>,
@@ -1070,7 +1086,7 @@ mod tests {
         };
         let stats = stats_schema(&schema).expect("stats_schema should succeed");
         let leaf_stats = stats_struct_for_name(leaf_name, &stats);
-        assert!(leaf_stats.field(NULL_VALUE_COUNT).is_some());
+        assert_eq!(leaf_stats.field(NULL_VALUE_COUNT).is_some(), leaf_nullable);
     }
 
     #[test]
@@ -1346,12 +1362,14 @@ mod tests {
 
     /// The exact flat stats entry the projection emits for one surviving leaf: the dotted `name`
     /// keyed at the leaf's base stats ID, holding the sub-fields [`build_stats_struct`]
-    /// produces for `bounds_type` restricted to the Delta stat `categories` the leaf appears in
+    /// produces for `bounds_type` and `nullable` restricted to the Delta stat `categories` the leaf
+    /// appears in
     /// (each a [`NULL_COUNT`]/[`MIN_VALUES`]/[`MAX_VALUES`] name). Lets a case assert the full
     /// projected schema by naming a leaf's categories rather than field-presence alone.
     fn expected_leaf(
         name: &str,
         bounds_type: DataType,
+        nullable: bool,
         field_id: i32,
         categories: &[&str],
     ) -> StructField {
@@ -1364,7 +1382,7 @@ mod tests {
             field_id_to_statistics_base(field_id).expect("field id in supported stats range");
         field_with_id(
             name,
-            build_stats_struct(base, &bounds_type, Some(present)).into(),
+            build_stats_struct(base, &bounds_type, nullable, Some(present)).into(),
             true,
             base,
         )
@@ -1394,9 +1412,15 @@ mod tests {
         // `stats_schema` only for the variant, whose `total_bytes` (no backing Delta
         // category) is dropped under the projection.
         let expected = StructType::new_unchecked([
-            expected_leaf("id", DataType::LONG, 0, &STAT_CATEGORIES),
-            expected_leaf("a.b", DataType::INTEGER, 2, &STAT_CATEGORIES),
-            expected_leaf("v", DataType::unshredded_variant(), 3, &STAT_CATEGORIES),
+            expected_leaf("id", DataType::LONG, false, 0, &STAT_CATEGORIES),
+            expected_leaf("a.b", DataType::INTEGER, true, 2, &STAT_CATEGORIES),
+            expected_leaf(
+                "v",
+                DataType::unshredded_variant(),
+                true,
+                3,
+                &STAT_CATEGORIES,
+            ),
         ]);
         assert_eq!(projected, expected);
     }
@@ -1429,8 +1453,13 @@ mod tests {
             Some(stat_cols(["id"])),
         );
         let projected = projected_stats_schema(&table, &delta).expect("should succeed");
-        let expected =
-            StructType::new_unchecked([expected_leaf("id", DataType::LONG, 0, &STAT_CATEGORIES)]);
+        let expected = StructType::new_unchecked([expected_leaf(
+            "id",
+            DataType::LONG,
+            false,
+            0,
+            &STAT_CATEGORIES,
+        )]);
         assert_eq!(projected, expected);
     }
 
@@ -1439,9 +1468,11 @@ mod tests {
     /// projected tests (which build expectations via `build_stats_struct`), the expected sub-field
     /// names here are spelled out per case, so a wrong condition in `build_stats_struct` is caught.
     /// The leaf type varies to exercise the type-specific conditions (`nan_value_count`,
-    /// `total_bytes`). Column `c` is always field id 1.
+    /// `total_bytes`), and each case runs for a required `c` too, which drops `null_value_count`.
+    /// Column `c` is always field id 1.
     #[rstest]
-    // Int: lower<-minValues, upper<-maxValues, value/null_value_count<-nullCount.
+    // Int: lower<-minValues, upper<-maxValues, value/null_value_count<-nullCount (for a nullable
+    // `c`).
     #[case::int_null_count(
         DataType::INTEGER,
         delta_stats(Some(stat_cols(["c"])), None, None),
@@ -1467,11 +1498,21 @@ mod tests {
         delta_stats(Some(stat_cols(["c"])), Some(stat_cols(["c"])), Some(stat_cols(["c"]))),
         &[LOWER_BOUND, UPPER_BOUND, VALUE_COUNT, NULL_VALUE_COUNT],
     )]
-    // Double: nan_value_count rides along with the bounds ...
+    // Float/double: bounds exclude NaN, so nan_value_count rides along with either bound ...
     #[case::double_min_keeps_nan(
         DataType::DOUBLE,
         delta_stats(None, Some(stat_cols(["c"])), None),
         &[LOWER_BOUND, NAN_VALUE_COUNT],
+    )]
+    #[case::double_max_keeps_nan(
+        DataType::DOUBLE,
+        delta_stats(None, None, Some(stat_cols(["c"]))),
+        &[UPPER_BOUND, NAN_VALUE_COUNT],
+    )]
+    #[case::float_max_keeps_nan(
+        DataType::FLOAT,
+        delta_stats(None, None, Some(stat_cols(["c"]))),
+        &[UPPER_BOUND, NAN_VALUE_COUNT],
     )]
     // ... but is pruned when the leaf carries no bounds (nullCount only).
     #[case::double_null_count_drops_nan(
@@ -1495,12 +1536,18 @@ mod tests {
         #[case] leaf_type: DataType,
         #[case] delta: StructType,
         #[case] expected_subfields: &[&str],
+        #[values(true, false)] nullable: bool,
     ) {
-        let table = StructType::new_unchecked([field_with_id("c", leaf_type, false, 1)]);
+        let table = StructType::new_unchecked([field_with_id("c", leaf_type, nullable, 1)]);
         let projected = projected_stats_schema(&table, &delta).expect("should succeed");
         let stats = stats_struct_for_name("c", &projected);
         let names: Vec<&str> = stats.fields().map(|f| f.name().as_str()).collect();
-        assert_eq!(names, expected_subfields);
+        let expected: Vec<&str> = expected_subfields
+            .iter()
+            .copied()
+            .filter(|&name| nullable || name != NULL_VALUE_COUNT)
+            .collect();
+        assert_eq!(names, expected);
     }
 
     /// Nested-leaf membership is decided per leaf: a leaf survives (and is pruned) by its own
@@ -1510,14 +1557,14 @@ mod tests {
     #[case::each_via_a_different_category(
         delta_stats(Some(nested_cat("a", ["c"])), Some(nested_cat("a", ["b"])), None),
         StructType::new_unchecked([
-            expected_leaf("a.b", DataType::INTEGER, 2, &[MIN_VALUES]),
-            expected_leaf("a.c", DataType::STRING, 3, &[NULL_COUNT]),
+            expected_leaf("a.b", DataType::INTEGER, true, 2, &[MIN_VALUES]),
+            expected_leaf("a.c", DataType::STRING, true, 3, &[NULL_COUNT]),
         ]),
     )]
     // Only `a.b` appears anywhere => `a.c` is dropped.
     #[case::sibling_absent_is_dropped(
         delta_stats(None, Some(nested_cat("a", ["b"])), None),
-        StructType::new_unchecked([expected_leaf("a.b", DataType::INTEGER, 2, &[MIN_VALUES])]),
+        StructType::new_unchecked([expected_leaf("a.b", DataType::INTEGER, true, 2, &[MIN_VALUES])]),
     )]
     fn projected_nested_leaf_membership_is_per_leaf(
         #[case] delta: StructType,
@@ -1546,7 +1593,7 @@ mod tests {
         let delta = delta_stats(Some(stat_cols(["d"])), None, None);
         let projected = projected_stats_schema(&table, &delta).expect("should succeed");
         let expected =
-            StructType::new_unchecked([expected_leaf("d", DataType::LONG, 3, &[NULL_COUNT])]);
+            StructType::new_unchecked([expected_leaf("d", DataType::LONG, true, 3, &[NULL_COUNT])]);
         assert_eq!(projected, expected);
     }
 
@@ -1583,7 +1630,7 @@ mod tests {
     #[rstest]
     #[case::present_in_null_count(
         delta_stats(Some(stat_cols(["v"])), None, None),
-        StructType::new_unchecked([expected_leaf("v", DataType::unshredded_variant(), 3, &[NULL_COUNT])]),
+        StructType::new_unchecked([expected_leaf("v", DataType::unshredded_variant(), true, 3, &[NULL_COUNT])]),
     )]
     #[case::absent_from_all(delta_stats(None, None, None), StructType::new_unchecked([]))]
     fn projected_variant_membership_matches_scalar_presence(
@@ -1676,9 +1723,9 @@ mod tests {
 
         let projected = projected_stats_schema(&table, &delta).expect("projected should succeed");
         let expected = StructType::new_unchecked([
-            expected_leaf("id", DataType::LONG, 0, &STAT_CATEGORIES),
-            expected_leaf("s", DataType::STRING, 1, &STAT_CATEGORIES),
-            expected_leaf("v", DataType::unshredded_variant(), 2, &[NULL_COUNT]),
+            expected_leaf("id", DataType::LONG, false, 0, &STAT_CATEGORIES),
+            expected_leaf("s", DataType::STRING, true, 1, &STAT_CATEGORIES),
+            expected_leaf("v", DataType::unshredded_variant(), true, 2, &[NULL_COUNT]),
         ]);
         assert_eq!(projected, expected);
     }
@@ -1731,8 +1778,8 @@ mod tests {
         let projected = projected_stats_schema(&table, &delta).expect("should succeed");
         // `p.x.a` via nullCount, `p.y.b` via minValues -- each pruned to its own category.
         let expected = StructType::new_unchecked([
-            expected_leaf("p.x.a", DataType::INTEGER, 3, &[NULL_COUNT]),
-            expected_leaf("p.y.b", DataType::INTEGER, 5, &[MIN_VALUES]),
+            expected_leaf("p.x.a", DataType::INTEGER, true, 3, &[NULL_COUNT]),
+            expected_leaf("p.y.b", DataType::INTEGER, true, 5, &[MIN_VALUES]),
         ]);
         assert_eq!(projected, expected);
     }
@@ -1742,7 +1789,7 @@ mod tests {
     // not against the top-level category header.
     #[case::leaf_inside_category(
         stat_cols(["nullCount"]),
-        StructType::new_unchecked([expected_leaf("nullCount", DataType::LONG, 1, &[NULL_COUNT])]),
+        StructType::new_unchecked([expected_leaf("nullCount", DataType::LONG, true, 1, &[NULL_COUNT])]),
     )]
     #[case::only_the_category_header(stat_cols(["other"]), StructType::new_unchecked([]))]
     fn projected_handles_column_named_like_a_stat_category(
@@ -1762,7 +1809,7 @@ mod tests {
     #[rstest]
     #[case::included_survives(
         delta_stats(Some(stat_cols(["_row_id"])), None, None),
-        StructType::new_unchecked([expected_leaf("_row_id", DataType::LONG, ROW_ID_FIELD_ID, &[NULL_COUNT])]),
+        StructType::new_unchecked([expected_leaf("_row_id", DataType::LONG, true, ROW_ID_FIELD_ID, &[NULL_COUNT])]),
     )]
     #[case::omitted_dropped(delta_stats(None, None, None), StructType::new_unchecked([]))]
     fn projected_reserved_metadata_leaf_requires_caller_inclusion(
