@@ -405,8 +405,11 @@ fn compute_column_stats(
                 return Ok(ColumnStats::default());
             }
 
-            let null_count: Option<ArrayRef> =
-                Some(Arc::new(Int64Array::from(vec![column.null_count() as i64])));
+            // Logical nulls: a dictionary key can be valid but point at a null value, which
+            // `null_count` does not count.
+            let null_count: Option<ArrayRef> = Some(Arc::new(Int64Array::from(vec![
+                column.logical_null_count() as i64,
+            ])));
 
             let complex_type = matches!(
                 column.data_type(),
@@ -930,8 +933,8 @@ fn null_count_only_column_names(
 #[cfg(test)]
 mod tests {
     use delta_kernel::arrow::array::{
-        Array, AsArray, BinaryArray, Decimal128Array, Float64Array, Int32Array, Int64Array,
-        ListArray, MapArray, NullArray, RecordBatchOptions, StringArray,
+        Array, AsArray, BinaryArray, Decimal128Array, DictionaryArray, Float64Array, Int32Array,
+        Int64Array, ListArray, MapArray, NullArray, RecordBatchOptions, StringArray,
     };
     use delta_kernel::arrow::buffer::{NullBuffer, OffsetBuffer};
     use delta_kernel::arrow::compute::concat_batches;
@@ -1015,6 +1018,42 @@ mod tests {
             .downcast_ref::<Int64Array>()
             .unwrap();
         assert_eq!(value_null_count.value(0), 1);
+    }
+
+    /// A dictionary key that is valid but points at a null value is a null, at top level and
+    /// in a struct, so `nullCount` counts it.
+    #[test]
+    fn test_collect_stats_null_counts_dictionary_null_values() {
+        // Rows: "a", a valid key for a null value, a null key.
+        let dict = || {
+            Arc::new(DictionaryArray::<Int32Type>::new(
+                Int32Array::from(vec![Some(0), Some(1), None]),
+                Arc::new(StringArray::from(vec![Some("a"), None])),
+            )) as ArrayRef
+        };
+        let dict_type = DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8));
+        let child = Field::new("uri", dict_type.clone(), true);
+        // The struct is null in the first row, so its `uri` is null there too.
+        let s = StructArray::new(
+            Fields::from(vec![child.clone()]),
+            vec![dict()],
+            Some(NullBuffer::from(vec![false, true, true])),
+        );
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("d", dict_type, true),
+            Field::new("s", s.data_type().clone(), true),
+        ]));
+        let batch = RecordBatch::try_new(schema, vec![dict(), Arc::new(s)]).unwrap();
+
+        let stats = collect_stats(&batch, &[column_name!("d"), column_name!("s.uri")]).unwrap();
+
+        assert_eq!(flat_stat::<Int64Type>(&stats, NULL_COUNT, "d"), 2);
+        let s_null_counts = child_struct(&stats, NULL_COUNT)
+            .column_by_name("s")
+            .unwrap()
+            .as_struct();
+        let uri = s_null_counts.column_by_name("uri").unwrap();
+        assert_eq!(uri.as_primitive::<Int64Type>().value(0), 3);
     }
 
     #[test]

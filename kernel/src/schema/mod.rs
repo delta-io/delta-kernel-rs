@@ -5114,6 +5114,31 @@ mod tests {
         );
     }
 
+    /// `field_at` resolves each `file` sub-field, at top level and nested in a struct, and rejects
+    /// a path that continues past one.
+    #[rstest]
+    fn test_field_at_file_sub_fields(
+        #[values("uri", "offset", "size", "content_type", "checksum", "inline")] name: &str,
+        #[values("f", "s.f")] file_path: &str,
+    ) {
+        let schema = StructType::new_unchecked([
+            StructField::nullable("f", DataType::file_type()),
+            StructField::nullable(
+                "s",
+                StructType::new_unchecked([StructField::nullable("f", DataType::file_type())]),
+            ),
+        ]);
+        let col = ColumnName::from_naive_str_split(format!("{file_path}.{name}"));
+        let field = schema.field_at(&col).unwrap();
+        assert_eq!(Some(field), FILE_FIELDS.field(name));
+
+        let past = col.join(&ColumnName::new(["x"]));
+        assert_result_error_with_message(
+            schema.field_at(&past),
+            &format!("intermediate field '{name}' is not a struct or `file` type"),
+        );
+    }
+
     /// Every `file` sub-field gets min/max statistics except `checksum` and `inline`.
     #[test]
     fn test_file_min_max_fields() {

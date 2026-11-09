@@ -22,7 +22,7 @@ use crate::transforms::{SchemaTransform, transform_output_type};
 /// - if the table property `delta.dataSkippingStatsColumns` is set, include only those columns.
 ///   Column names may refer to struct or `file` fields in which case all child fields are included.
 /// - otherwise the first `dataSkippingNumIndexedCols` (default 32) leaf fields are included. Each
-///   sub-field of a `file` column is a leaf, as each field of a struct is.
+///   sub-field of a `file` column is a leaf.
 /// - all fields are made nullable.
 ///
 /// The `nullCount` struct field is a nested structure mirroring the table's column hierarchy.
@@ -289,7 +289,7 @@ impl<'a> SchemaTransform<'a> for NullCountStatsTransform {
         // Recurse into struct and `file` fields; convert all other types (leaf fields) to LONG
         match &field.data_type {
             DataType::Struct(_) => self.recurse_into_struct_field(field),
-            // A `file` column's sub-fields are leaves; its counts are a plain struct of them.
+            // A `file` column's null counts form a struct with one LONG field per sub-field.
             DataType::File(file_fields) => make_nullable_field(
                 field,
                 Cow::Owned(self.transform_struct(file_fields).into_owned().into()),
@@ -1015,6 +1015,29 @@ mod tests {
                     nullable "id": LONG,
                     nullable "f": { nullable "uri": STRING, nullable "offset": LONG },
                 },
+            )
+        );
+    }
+
+    /// A `file` in an array or a map does not expand: the array or map takes one slot against
+    /// `dataSkippingNumIndexedCols`, like any array or map.
+    #[test]
+    fn test_stats_schema_file_in_array_or_map_takes_one_slot() {
+        let schema = StructType::new_unchecked([
+            StructField::nullable("a", ArrayType::new(DataType::file_type(), true)),
+            StructField::nullable(
+                "m",
+                MapType::new(DataType::STRING, DataType::file_type(), true),
+            ),
+            StructField::nullable("x", DataType::LONG),
+            StructField::nullable("y", DataType::LONG),
+        ]);
+        let stats = stats_schema_for(&schema, &[("delta.dataSkippingNumIndexedCols", "3")]);
+        assert_eq!(
+            stats,
+            expected_stats(
+                schema! { nullable "a": LONG, nullable "m": LONG, nullable "x": LONG },
+                schema! { nullable "x": LONG },
             )
         );
     }

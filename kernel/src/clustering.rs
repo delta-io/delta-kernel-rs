@@ -71,8 +71,8 @@ pub(crate) struct ClusteringColumnInfo {
 /// **Schema validations:**
 /// 3. Column paths must resolve in the schema (including nested paths through structs and `file`
 ///    columns)
-/// 4. Leaf field must have a data type eligible for statistics collection; a `file` sub-field must
-///    also have min/max statistics, so `checksum` and `inline` are rejected
+/// 4. Leaf field must have a type eligible for min/max statistics. For `file` sub-fields,
+///    `checksum` and `inline` are rejected because they have only null-count statistics.
 ///
 /// Both top-level and nested columns are supported. For nested columns, all intermediate
 /// fields must be struct or `file` types and the leaf field must be a stats-eligible primitive.
