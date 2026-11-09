@@ -156,9 +156,10 @@ message ParseJsonExpression {
 }
 
 message MapToStructOptions {
-  // Optional connector-supplied IANA timezone or normalized fixed offset (`+HH:MM` or `-HH:MM`)
-  // for offset-less TIMESTAMP values. Kernel never infers this from the host or table metadata. A
-  // timezone or offset in a value takes precedence; absence means UTC.
+  // Optional connector-supplied IANA timezone, normalized fixed offset (`+HH:MM[:SS]` or
+  // `-HH:MM[:SS]`), or `Z` (UTC) for offset-less TIMESTAMP values. Kernel never infers this from
+  // the host or table metadata. A timezone or offset in a value takes precedence; absence means
+  // UTC.
   optional string timestamp_timezone = 1;
 }
 
