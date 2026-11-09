@@ -1359,7 +1359,7 @@ async fn test_adds_and_removes_accumulate() {
 // Distinct ways a single commit can lose incremental safety.
 #[rstest]
 #[case::remove_no_size(vec![commit_info("WRITE", None), remove("orphan", None)])]
-#[case::add_with_unsafe_op(vec![commit_info("Manual Update", None), add("a", 100)])]
+#[case::add_with_unsafe_op(vec![commit_info("ANALYZE STATS", None), add("a", 100)])]
 #[case::manual_metadata_only(vec![commit_info("Manual Update", None)])]
 #[case::add_with_no_commit_info(vec![add("a", 100)])]
 #[tokio::test]

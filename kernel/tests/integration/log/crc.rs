@@ -23,8 +23,8 @@ use delta_kernel::transaction::data_layout::DataLayout;
 use delta_kernel::transaction::{UpdateTableOperation, UpdateTableTransactionBuilder};
 use delta_kernel::{
     Engine, EngineData, EvaluationHandler, FileDataReadResultIterator, FileMeta, FileSize,
-    FileStats, JsonHandler, KernelResult, KernelResultIterator, ParquetFooter, ParquetHandler,
-    PredicateRef, StorageHandler, Version,
+    FileStats, JsonHandler, KernelError, KernelResult, KernelResultIterator, ParquetFooter,
+    ParquetHandler, PredicateRef, StorageHandler, Version,
 };
 use rstest::rstest;
 use test_utils::delta_kernel_default_engine::executor::TaskExecutor;
@@ -671,7 +671,7 @@ async fn test_post_commit_crc_metadata_only_custom_op_makes_file_stats_indetermi
     let committed = begin_transaction_with(
         snapshot_v1.clone(),
         engine.as_ref(),
-        UpdateTableOperation::Custom("CUSTOM OP".to_string()),
+        UpdateTableOperation::Custom("ANALYZE STATS".to_string()),
         "test-engine",
         true,
         |builder| builder,
@@ -686,13 +686,13 @@ async fn test_post_commit_crc_metadata_only_custom_op_makes_file_stats_indetermi
     assert!(crc_v2.file_stats_state().is_indeterminate());
     assert_result_error_with_message(
         snapshot_v2.write_checksum(engine.as_ref()),
-        "unsupported operation \"CUSTOM OP\"",
+        "unsupported operation \"ANALYZE STATS\"",
     );
 
     let fresh = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
     assert_result_error_with_message(
         fresh.write_checksum(engine.as_ref()),
-        "unsupported operation \"CUSTOM OP\"",
+        "unsupported operation \"ANALYZE STATS\"",
     );
 
     Ok(())
@@ -1258,7 +1258,7 @@ async fn test_write_checksum_from_checkpoint_ict_enabled_but_commit_unreadable_p
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_write_checksum_ignores_metadata_readds_and_counts_subsequent_whitelisted_writes(
     #[case] root: WriteRoot,
-) -> KernelResult<()> {
+) -> delta_kernel::Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
     let snap = create_table_and_commit(&table_path, engine.as_ref())?
         .post_commit_snapshot()
@@ -1367,7 +1367,7 @@ async fn test_write_checksum_ignores_metadata_readds_and_counts_subsequent_white
 async fn test_write_checksum_rejects_file_actions_with_unsafe_operation(
     #[case] with_checkpoint: bool,
     #[case] replay: IncrementalReplay,
-    #[values("Manual Update", "UNKNOWN")] operation: &str,
+    #[values("ANALYZE STATS", "Manual Update", "UNKNOWN")] operation: &str,
 ) -> delta_kernel::Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
     let snap = create_table_and_commit(&table_path, engine.as_ref())?
@@ -2574,7 +2574,7 @@ async fn test_file_histogram_with_bin_type_and_operation_type(
         let committed = begin_transaction_with(
             fresh_v1,
             engine.as_ref(),
-            delta_kernel::transaction::UpdateTableOperation::Custom("CUSTOM OP".to_string()),
+            delta_kernel::transaction::UpdateTableOperation::Custom("ANALYZE STATS".to_string()),
             "test-engine",
             true,
             |builder| builder,

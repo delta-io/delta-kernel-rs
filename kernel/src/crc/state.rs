@@ -34,7 +34,7 @@ pub enum FileStatsState {
     /// without histogram).
     Complete(FileStats),
     /// File stats cannot be determined incrementally. Reasons include a non-incremental
-    /// operation (like `Manual Update`) that may violate file-action invariants,
+    /// operation (like `ANALYZE STATS`) that re-adds files without corresponding removes,
     /// or a counted remove action with a missing `size` field. A full add/remove reconciliation
     /// pass can recover `Complete`.
     Indeterminate,

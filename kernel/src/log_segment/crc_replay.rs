@@ -817,7 +817,8 @@ mod tests {
     #[case::streaming_update(Some("STREAMING UPDATE"), true)]
     #[case::reorg(Some("REORG"), true)]
     #[case::reorg_upgrade_uniform(Some("REORG TABLE UPGRADE UNIFORM"), false)]
-    #[case::unsafe_op(Some("Manual Update"), false)]
+    #[case::unsafe_op(Some("ANALYZE STATS"), false)]
+    #[case::manual_update(Some("Manual Update"), false)]
     #[case::vacuum_start(Some("VACUUM START"), true)]
     #[case::vacuum_end(Some("VACUUM END"), true)]
     #[case::set_properties(Some("SET TBLPROPERTIES"), true)]
@@ -849,7 +850,7 @@ mod tests {
     }
 
     #[rstest::rstest]
-    #[case::unsupported_operation(Some("Manual Update"), "operation=Some(\"Manual Update\")")]
+    #[case::unknown_operation(Some("ANALYZE STATS"), "operation=Some(\"ANALYZE STATS\")")]
     #[case::missing_operation(None, "operation=None")]
     fn unsafe_commit_warning_includes_operation_only_after_file_actions(
         #[case] operation: Option<&str>,

@@ -322,6 +322,17 @@ mod tests {
     fn test_incremental_safe_operations() {
         for op in [
             "WRITE",
+            "STREAMING UPDATE",
+            "MERGE",
+            "UPDATE",
+            "DELETE",
+            "OPTIMIZE",
+            "REORG",
+            "CREATE TABLE",
+            "REPLACE TABLE",
+            "CREATE TABLE AS SELECT",
+            "REPLACE TABLE AS SELECT",
+            "CREATE OR REPLACE TABLE AS SELECT",
             "ADD COLUMNS",
             "COMPUTE STATS",
             "Deletion Vector Tombstones",
@@ -335,8 +346,9 @@ mod tests {
 
     #[test]
     fn test_non_incremental_safe_operations() {
-        assert!(!is_incremental_safe_operation("Manual Update"));
+        assert!(!is_incremental_safe_operation("ANALYZE STATS"));
         assert!(!is_incremental_safe_operation("UNKNOWN"));
+        assert!(!is_incremental_safe_operation("Manual Update"));
     }
 
     // ===== Crc deserialized from CRC file (default state) =====
