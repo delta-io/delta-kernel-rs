@@ -23,7 +23,8 @@ use crate::expressions::{ArrayData, StructData};
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::schema::{ArrayType, DataType, schema};
 use crate::schema::{
-    SchemaRef, StructField, StructType, ToSchema as _, lazy_schema_ref, schema_ref,
+    DUPLICATE_FIELD_NAME_ERROR_PREFIX, SchemaRef, StructField, StructType, ToSchema as _,
+    is_unsupported_delta_type_error, lazy_schema_ref, schema_ref,
 };
 use crate::table_features::{
     FeatureType, LEGACY_READER_FEATURES, MIN_VALID_RW_VERSION, TABLE_FEATURES_MIN_READER_VERSION,
@@ -31,12 +32,13 @@ use crate::table_features::{
 };
 use crate::table_properties::TableProperties;
 use crate::utils::{require, to_file_size};
+use crate::{DeltaError, EngineData, Error, FileMeta, KernelError, KernelResult, RowVisitor as _};
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::{Engine, Version, create_row};
-use crate::{EngineData, FileMeta, KernelError, KernelResult, RowVisitor as _};
 
 const KERNEL_VERSION: &str = env!("CARGO_PKG_VERSION");
 const SCHEMA_RECURSION_LIMIT: usize = 1000;
+const SERDE_JSON_RECURSION_LIMIT_ERROR_PREFIX: &str = "recursion limit exceeded";
 const UNKNOWN_OPERATION: &str = "UNKNOWN";
 pub(crate) const ROW_TRACKING_PRESERVED_TAG: &str = "delta.rowTracking.preserved";
 
@@ -495,9 +497,10 @@ impl Metadata {
     ///
     /// # Errors
     ///
-    /// Returns [`KernelError::Schema`] when the schema exceeds the supported decoding depth or
-    /// declares a type the kernel doesn't support, or [`KernelError::MalformedJson`] for other
-    /// JSON decoding failures.
+    /// Returns a Delta error for duplicate logical fields in persisted metadata. Unsupported
+    /// types and excessive decoding depth return [`KernelError::Schema`]; other JSON failures
+    /// return [`KernelError::MalformedJson`]. The original parser failure is retained as a cause
+    /// of the Delta error.
     #[internal_api]
     pub(crate) fn parse_schema(&self) -> KernelResult<StructType> {
         schema_deserializer::parse(&self.schema_string, SCHEMA_RECURSION_LIMIT)
@@ -2091,6 +2094,51 @@ impl DomainMetadata {
     }
 }
 
+/// Classifies persisted schema failures while retaining the original Kernel cause.
+fn schema_decode_error(error: serde_json::Error) -> Error {
+    // TODO(3421): Replace error-message parsing with structured schema decoder diagnostics.
+    let message = error.to_string();
+    let diagnostic = if error.line() == 0 {
+        Some(message.as_str())
+    } else {
+        message.strip_suffix(&format!(
+            " at line {} column {}",
+            error.line(),
+            error.column()
+        ))
+    };
+    if let Some(diagnostic) = diagnostic.filter(|_| error.is_data()) {
+        // Remove only the enclosing quotes. Names can contain quotes, escapes, and location text.
+        if let Some(name) = diagnostic
+            .strip_prefix(&format!(
+                "Schema error: {DUPLICATE_FIELD_NAME_ERROR_PREFIX}: '"
+            ))
+            .and_then(|name| name.strip_suffix('\''))
+        {
+            return DeltaError::duplicate_schema_field(
+                name,
+                Some(Box::new(KernelError::from(error))),
+            )
+            .into();
+        }
+    }
+    // serde_json keeps ErrorCode::RecursionLimitExceeded private, so we use string matching.
+    if error.is_syntax() && message.starts_with(SERDE_JSON_RECURSION_LIMIT_ERROR_PREFIX) {
+        KernelError::schema(format!(
+            "Table schema is too deeply nested: decoding metaData.schemaString exceeded \
+             serde_json's recursion limit: {error}"
+        ))
+        .with_backtrace()
+        .into()
+    } else if is_unsupported_delta_type_error(&error) {
+        KernelError::schema(error.to_string())
+            .with_backtrace()
+            .into()
+    } else {
+        KernelError::from(error).into()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -2117,6 +2165,7 @@ mod tests {
     use crate::expressions::{Scalar, StructData};
     use crate::schema::{DataType, MapType, StructField, schema, schema_ref};
     use crate::unit_test_utils::assert_result_error_with_message;
+    use crate::{DeltaErrorCondition, Error, EvaluationHandler, JsonHandler, ParquetHandler, StorageHandler};
 
     #[rstest]
     #[case::add(ADD_NAME, Some("path"))]
@@ -2210,6 +2259,92 @@ mod tests {
     }
 
     #[rstest]
+    #[case::top_level(None)]
+    #[case::nested_struct(Some("struct"))]
+    #[case::nested_array(Some("array"))]
+    #[case::nested_map(Some("map"))]
+    fn persisted_duplicate_fields_report_delta_condition(
+        #[case] container: Option<&str>,
+        #[values(
+            "ID",
+            "O'Brien",
+            "a\"b",
+            r"a\b",
+            "a\nb",
+            "a\tb",
+            "a' at line 12 column 34",
+            "a'"
+        )]
+        name: &str,
+    ) {
+        let duplicate = serde_json::json!({"type": "struct", "fields": [
+            {"name":name.to_lowercase(), "type":"long", "nullable":false, "metadata":{}},
+            {"name":name, "type":"string", "nullable":true, "metadata":{}}
+        ]});
+        let nested = match container {
+            Some("array") => {
+                serde_json::json!({"type":"array", "elementType":duplicate, "containsNull":true})
+            }
+            Some("map") => {
+                serde_json::json!({"type":"map", "keyType":"string", "valueType":duplicate, "valueContainsNull":true})
+            }
+            _ => duplicate.clone(),
+        };
+        let schema = if container.is_some() {
+            serde_json::json!({"type":"struct", "fields":[
+                {"name":"outer", "type":nested, "nullable":true, "metadata":{}}
+            ]})
+        } else {
+            duplicate
+        };
+        let metadata = Metadata {
+            schema_string: schema.to_string().into(),
+            ..Default::default()
+        };
+        let Error::Delta(error) = metadata.parse_schema().unwrap_err() else {
+            panic!("expected Delta error")
+        };
+        assert_eq!(
+            error.condition(),
+            DeltaErrorCondition::DeltaDuplicateColumnsFoundExistingSchema
+        );
+        assert_eq!(error.sql_state(), Some("42711"));
+        assert_eq!(error.parameters()[0].name(), "duplicateCols");
+        assert_eq!(error.parameters()[0].value(), name);
+        let source = std::error::Error::source(&error)
+            .unwrap()
+            .downcast_ref::<KernelError>()
+            .unwrap();
+        let KernelError::MalformedJson(source) = source.without_backtrace() else {
+            panic!("expected original JSON error")
+        };
+        let original = serde_json::from_str::<StructType>(&metadata.schema_string).unwrap_err();
+        assert_eq!(source.to_string(), original.to_string());
+        assert_eq!(source.classify(), original.classify());
+        assert_eq!(
+            (source.line(), source.column()),
+            (original.line(), original.column())
+        );
+    }
+
+    #[test]
+    fn persisted_duplicate_fields_preserve_later_field_decode_failure_precedence() {
+        let schema_string = r#"{"type":"struct","fields":[
+            {"name":"id","type":"long","nullable":true,"metadata":{}},
+            {"name":"ID","type":"long","nullable":"invalid","metadata":{}}
+        ]}"#;
+        let metadata = Metadata {
+            schema_string: schema_string.to_owned().into(),
+            ..Default::default()
+        };
+        assert!(
+            matches!(metadata.parse_schema().unwrap_err(), Error::Kernel(error)
+            if matches!(error.without_backtrace(), KernelError::MalformedJson(_)))
+        );
+        let ordinary = serde_json::from_str::<StructType>(schema_string).unwrap_err();
+        assert!(ordinary.to_string().contains("expected a boolean"));
+    }
+
     #[case::formerly_rejected(42, false)]
     #[case::supported(331, false)]
     #[case::exceeded(332, true)]

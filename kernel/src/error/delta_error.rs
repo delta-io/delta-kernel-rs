@@ -236,6 +236,19 @@ impl DeltaError {
         )
     }
 
+    /// Reports a duplicate logical field `name` in the persisted table schema.
+    /// `source` retains the schema decoder's original failure and location.
+    pub fn duplicate_schema_field(
+        name: &str,
+        source: Option<Box<dyn StdError + Send + Sync + 'static>>,
+    ) -> Self {
+        Self::new(
+            DeltaErrorCondition::DeltaDuplicateColumnsFoundExistingSchema,
+            vec![DeltaErrorParameter::new("duplicateCols", name)],
+            source,
+        )
+    }
+
     /// Adds diagnostic context ahead of the original source without changing catalog metadata.
     pub(crate) fn with_context(mut self, context: String) -> Self {
         self.source = Some(Box::new(DiagnosticContext {

@@ -361,6 +361,12 @@ fn delta_error_matches(expected_code: &str, actual: &DeltaError) -> bool {
             "DELTA_VERSIONS_NOT_CONTIGUOUS.GENERIC",
             DeltaErrorCondition::DeltaVersionsNotContiguous,
         ) => true,
+        // TODO(#3421): Reconcile Spark's duplicate-column condition with Kernel's persisted-schema
+        // condition so this compatibility alias can be removed.
+        (
+            "COLUMN_ALREADY_EXISTS",
+            DeltaErrorCondition::DeltaDuplicateColumnsFoundExistingSchema,
+        ) => true,
         (code, _) => code == actual.name(),
     }
 }
