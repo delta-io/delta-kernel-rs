@@ -90,6 +90,32 @@ impl CapturingReporter {
     }
 }
 
+/// Whether an event reports storage listing, copying, or a storage, JSON, or Parquet read.
+pub(crate) fn is_io_event(event: &MetricEvent) -> bool {
+    match event {
+        MetricEvent::StorageListCompleted(_)
+        | MetricEvent::StorageReadCompleted(_)
+        | MetricEvent::StorageCopyCompleted(_)
+        | MetricEvent::JsonReadCompleted(_)
+        | MetricEvent::ParquetReadCompleted(_) => true,
+        MetricEvent::LogSegmentLoadSuccess(_)
+        | MetricEvent::LogSegmentLoadFailure(_)
+        | MetricEvent::ProtocolMetadataLoadSuccess(_)
+        | MetricEvent::ProtocolMetadataLoadFailure(_)
+        | MetricEvent::SnapshotBuildSuccess(_)
+        | MetricEvent::SnapshotBuildFailure(_)
+        | MetricEvent::TransactionCommitSuccess(_)
+        | MetricEvent::TransactionCommitFailure(_)
+        | MetricEvent::DomainMetadataLoadSuccess(_)
+        | MetricEvent::DomainMetadataLoadFailure
+        | MetricEvent::SetTransactionLoadSuccess(_)
+        | MetricEvent::SetTransactionLoadFailure
+        | MetricEvent::CrcReadSuccess(_)
+        | MetricEvent::CrcReadFailure
+        | MetricEvent::ScanMetadataCompleted(_) => false,
+    }
+}
+
 /// Kernel-internal twin of [`test_utils::install_thread_local_metrics_reporter`].
 ///
 /// Internal tests need their own helper because the trait identity of `MetricsReporter`
