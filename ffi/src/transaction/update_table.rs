@@ -388,7 +388,7 @@ pub unsafe extern "C" fn update_table_txn_builder_with_table_properties_added(
 /// All handles and `key` must be valid. This call borrows `engine` and `key` and unconditionally
 /// consumes `builder`, including on error.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn update_table_txn_builder_with_table_properties_removed(
+pub unsafe extern "C" fn update_table_txn_builder_with_table_property_removed(
     builder: Handle<ExclusiveUpdateTableTransactionBuilder>,
     key: KernelStringSlice,
     engine: Handle<SharedExternEngine>,
@@ -396,11 +396,11 @@ pub unsafe extern "C" fn update_table_txn_builder_with_table_properties_removed(
     let engine = unsafe { engine.as_ref() };
     let builder = unsafe { *builder.into_inner() };
     let key = unsafe { TryFromStringSlice::try_from_slice(&key) };
-    let result = update_table_txn_builder_with_table_properties_removed_impl(builder, key);
+    let result = update_table_txn_builder_with_table_property_removed_impl(builder, key);
     unsafe { result.into_extern_result(&engine) }
 }
 
-fn update_table_txn_builder_with_table_properties_removed_impl(
+fn update_table_txn_builder_with_table_property_removed_impl(
     builder: UpdateTableTransactionBuilder,
     key: KernelResult<String>,
 ) -> KernelResult<Handle<ExclusiveUpdateTableTransactionBuilder>> {

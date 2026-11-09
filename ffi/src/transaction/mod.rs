@@ -3552,7 +3552,7 @@ mod tests {
             ))
         };
         let builder = ok_or_panic(unsafe {
-            update_table_txn_builder_with_table_properties_removed(
+            update_table_txn_builder_with_table_property_removed(
                 builder,
                 kernel_string_slice!(owner_key),
                 engine.shallow_copy(),
