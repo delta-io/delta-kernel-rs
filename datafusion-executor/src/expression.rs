@@ -6,13 +6,13 @@ use datafusion::arrow::array::{ArrayRef, RecordBatch, StructArray, new_null_arra
 use datafusion::arrow::datatypes::{DataType as ArrowDataType, Schema as ArrowSchema};
 use datafusion::common::utils::take_function_args;
 use datafusion::common::{
-    Column as DFColumn, DataFusionError, Result as DFResult, ScalarValue as DFScalarValue,
+    Column as DFColumn, DFSchema, DataFusionError, Result as DFResult, ScalarValue as DFScalarValue,
 };
 use datafusion::functions::core::expr_fn::{coalesce, get_field, named_struct, nullif};
 use datafusion::functions_nested::expr_fn::{array_length, make_array};
 use datafusion::logical_expr::{
-    Case, ColumnarValue, Expr as DFExpr, Operator, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl,
-    Signature, Volatility, binary_expr, cast, lit,
+    Case, ColumnarValue, Expr as DFExpr, ExprSchemable, Operator, ScalarFunctionArgs, ScalarUDF,
+    ScalarUDFImpl, Signature, Volatility, binary_expr, cast, lit,
 };
 use delta_kernel::engine::arrow_conversion::TryIntoArrow;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
@@ -152,7 +152,7 @@ fn unary_to_df_expr(unary: &UnaryExpression, input_schema: &StructType) -> Kerne
 }
 
 /// Lowers a variadic expression: `Coalesce` to `coalesce(..)`, `Array` to `make_array(..)`, and
-/// `Concat` to a chain of `||`, each over the converted arguments. `Coalesce` forwards
+/// `StringConcat` to a chain of `||`, each over the converted arguments. `Coalesce` forwards
 /// `output_type` to construct schema-dependent arguments before DataFusion performs common-type
 /// resolution and supported implicit conversions. A known `Array<E>` target is peeled to `E` and
 /// forwarded to each element so an array of structs gets its element schema; an unknown target
@@ -173,7 +173,14 @@ fn variadic_to_df_expr(
             }
             None => None,
         },
-        VariadicExpressionOp::Concat => None,
+        VariadicExpressionOp::StringConcat => match output_type {
+            None | Some(&KernelDataType::STRING) => None,
+            Some(other) => {
+                return Err(KernelError::invalid_expression(format!(
+                    "StringConcat operator produces string, but caller expects {other}"
+                )));
+            }
+        },
     };
     let args: KernelResult<Vec<DFExpr>> = variadic
         .exprs
@@ -183,12 +190,35 @@ fn variadic_to_df_expr(
     match variadic.op {
         VariadicExpressionOp::Coalesce => Ok(coalesce(args?)),
         VariadicExpressionOp::Array => Ok(make_array(args?)),
-        // `||` yields NULL for any NULL operand; DataFusion's `concat` would skip NULLs instead.
-        VariadicExpressionOp::Concat => args?
-            .into_iter()
-            .reduce(|left, right| binary_expr(left, Operator::StringConcat, right))
-            .ok_or_else(|| KernelError::generic("CONCAT requires at least one input")),
+        VariadicExpressionOp::StringConcat => string_concat_to_df_expr(args?, input_schema),
     }
+}
+
+/// Lowers `StringConcat` to `||` over its arguments cast to Utf8, so the result has the type the
+/// kernel evaluator produces. `||` yields NULL for any NULL operand; DataFusion's `concat` would
+/// skip NULLs instead.
+fn string_concat_to_df_expr(args: Vec<DFExpr>, input_schema: &StructType) -> KernelResult<DFExpr> {
+    let arrow_schema: ArrowSchema = input_schema.try_into_arrow()?;
+    let df_schema = DFSchema::try_from(arrow_schema).map_err(KernelError::generic_err)?;
+    let mut args = args.into_iter().map(|arg| {
+        // DataFusion would coerce a non-string operand of `||` to a string; reject it as the
+        // kernel evaluator does.
+        let arg_type = arg.get_type(&df_schema).map_err(KernelError::generic_err)?;
+        match arg_type {
+            ArrowDataType::Utf8 | ArrowDataType::LargeUtf8 | ArrowDataType::Utf8View => {
+                Ok(cast(arg, ArrowDataType::Utf8))
+            }
+            other => Err(KernelError::invalid_expression(format!(
+                "StringConcat requires a string input, got {other}"
+            ))),
+        }
+    });
+    let first = args.next().ok_or_else(|| {
+        KernelError::invalid_expression("StringConcat requires at least one input")
+    })??;
+    args.try_fold(first, |left, right| {
+        Ok(binary_expr(left, Operator::StringConcat, right?))
+    })
 }
 
 /// Extracts the target struct type for a struct-shaped arm from the caller's `output_type`,
@@ -653,14 +683,13 @@ impl ScalarUDFImpl for ParseJsonUdf {
 #[cfg(test)]
 mod tests {
     use datafusion::arrow::array::{
-        Array, AsArray, Int32Array, Int64Array, ListArray, MapBuilder, StringArray, StringBuilder,
-        TimestampMicrosecondArray,
+        Array, AsArray, Int32Array, Int64Array, LargeStringArray, ListArray, MapBuilder,
+        StringArray, StringBuilder, StringViewArray, TimestampMicrosecondArray,
     };
     use datafusion::arrow::buffer::{NullBuffer, OffsetBuffer};
     use datafusion::arrow::compute::cast as cast_array;
     use datafusion::arrow::datatypes::{Field as ArrowField, Int32Type};
     use datafusion::assert_batches_eq;
-    use datafusion::common::DFSchema;
     use datafusion::logical_expr::physical_planning_context::PhysicalPlanningContext;
     use datafusion::physical_expr::execution_props::ExecutionProps;
     use datafusion::physical_expr::{PhysicalExpr, create_physical_expr};
@@ -955,13 +984,30 @@ mod tests {
         assert_eq!(from_kernel.as_primitive::<Int32Type>(), &expected);
     }
 
-    /// DataFusion's `CONCAT` lowering agrees with the kernel evaluator, including NULL inputs.
-    #[test]
-    fn concat_matches_kernel_evaluator() {
+    #[rstest]
+    fn string_concat_matches_kernel_evaluator(
+        #[values(
+            |s| Arc::new(StringArray::from(s)) as ArrayRef,
+            |s| Arc::new(LargeStringArray::from(s)) as ArrayRef,
+            |s| Arc::new(StringViewArray::from(s)) as ArrayRef
+        )]
+        make_array: fn(Vec<Option<&'static str>>) -> ArrayRef,
+        #[values(false, true)] single_input: bool,
+    ) {
         let input_schema = schema! { nullable "s": STRING };
-        let strings = StringArray::from(vec![Some("a.parquet"), None, Some("")]);
-        let batch = RecordBatch::try_from_iter([("s", Arc::new(strings) as ArrayRef)]).unwrap();
-        let kernel = KernelExpr::concat([lit("s3://b/"), col!("s"), lit("!")]);
+        let strings = make_array(vec![Some("a.parquet"), None, Some("")]);
+        let batch = RecordBatch::try_from_iter([("s", strings)]).unwrap();
+        let (kernel, expected) = if single_input {
+            (
+                KernelExpr::string_concat([col!("s")]),
+                vec![Some("a.parquet"), None, Some("")],
+            )
+        } else {
+            (
+                KernelExpr::string_concat([lit("s3://b/"), col!("s"), lit("!")]),
+                vec![Some("s3://b/a.parquet!"), None, Some("s3://b/!")],
+            )
+        };
 
         let logical = to_df_expr(&kernel, &input_schema, None).unwrap();
         let physical = physical_expr(&logical, batch.schema().as_ref().clone());
@@ -972,19 +1018,28 @@ mod tests {
             .unwrap();
         let from_kernel = kernel_expression::evaluate_expression(&kernel, &batch, None).unwrap();
 
-        let expected = StringArray::from(vec![Some("s3://b/a.parquet!"), None, Some("s3://b/!")]);
+        let expected = StringArray::from(expected);
         assert_eq!(actual.as_string::<i32>(), &expected);
         assert_eq!(from_kernel.as_string::<i32>(), &expected);
     }
 
-    #[test]
-    fn concat_without_inputs_is_an_error() {
-        to_df_expr(
-            &KernelExpr::concat(Vec::<KernelExpr>::new()),
-            &test_schema(),
-            None,
-        )
-        .unwrap_err();
+    #[rstest]
+    #[case::no_inputs(KernelExpr::string_concat(Vec::<KernelExpr>::new()), None)]
+    #[case::single_non_string(KernelExpr::string_concat([col!("b")]), None)]
+    #[case::non_string_with_string(KernelExpr::string_concat([lit("v"), col!("b")]), None)]
+    #[case::non_string_output(
+        KernelExpr::string_concat([lit("a")]),
+        Some(DataType::INTEGER)
+    )]
+    fn string_concat_lowering_rejects_invalid_expression(
+        #[case] kernel: KernelExpr,
+        #[case] output_type: Option<DataType>,
+    ) {
+        let err = to_df_expr(&kernel, &test_schema(), output_type.as_ref()).unwrap_err();
+        assert!(
+            matches!(err, KernelError::InvalidExpressionEvaluation(_)),
+            "{err}"
+        );
     }
 
     #[test]

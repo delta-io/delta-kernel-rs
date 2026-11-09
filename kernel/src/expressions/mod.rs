@@ -245,15 +245,15 @@ pub enum VariadicExpressionOp {
     /// [`Scalar::Array`] instead. The difference is that `Array` is evaluated at runtime, while
     /// `Scalar::Array` is evaluated at compile time.
     Array,
-    /// SQL `expr || expr || ...`: the STRING concatenation of every input, which must all be
-    /// STRING. Any NULL input yields NULL, unlike some engines' `concat` function, which skips
-    /// NULLs. Requires at least one input.
+    /// SQL `expr || expr || ...`: concatenates STRING inputs in order, yielding NULL if any
+    /// input is NULL. This is Spark's `concat`; some engines' `concat` function skips NULLs
+    /// instead. Requires at least one input, and other input types are an error.
     ///
     /// ```text
-    /// CONCAT('s3://bucket/', 'a.parquet')  -- 's3://bucket/a.parquet'
-    /// CONCAT('a', NULL)                    -- NULL
+    /// 's3://bucket/' || 'a.parquet'  -- 's3://bucket/a.parquet'
+    /// 'a' || NULL                    -- NULL
     /// ```
-    Concat,
+    StringConcat,
 }
 
 /// A junction (AND/OR) predicate operator over N child predicates.
@@ -1055,9 +1055,9 @@ impl Expression {
         Self::variadic(VariadicExpressionOp::Array, exprs)
     }
 
-    /// Creates a new string concatenation expression. See [`VariadicExpressionOp::Concat`].
-    pub fn concat(exprs: impl IntoIterator<Item = impl Into<Expression>>) -> Self {
-        Self::variadic(VariadicExpressionOp::Concat, exprs)
+    /// Creates a new string concatenation expression. See [`VariadicExpressionOp::StringConcat`].
+    pub fn string_concat(exprs: impl IntoIterator<Item = impl Into<Expression>>) -> Self {
+        Self::variadic(VariadicExpressionOp::StringConcat, exprs)
     }
 
     /// Creates a searched CASE expression from ordered condition/result `branches` and an
@@ -1321,7 +1321,7 @@ impl Display for VariadicExpressionOp {
         match self {
             Coalesce => write!(f, "COALESCE"),
             Array => write!(f, "ARRAY"),
-            Concat => write!(f, "CONCAT"),
+            StringConcat => write!(f, "||"),
         }
     }
 }
@@ -1387,6 +1387,10 @@ impl Display for Expression {
             }
             Unary(UnaryExpression { op, expr }) => write!(f, "{op}({expr})"),
             Binary(BinaryExpression { op, left, right }) => write!(f, "{left} {op} {right}"),
+            Variadic(VariadicExpression {
+                op: VariadicExpressionOp::StringConcat,
+                exprs,
+            }) => write!(f, "({})", exprs.iter().join(" || ")),
             Variadic(VariadicExpression { op, exprs }) => {
                 write!(f, "{op}({})", format_child_list(exprs))
             }
@@ -1562,8 +1566,8 @@ mod tests {
                 "CARDINALITY(Column(x))",
             ),
             (
-                Expr::concat([lit("a/"), col!("x")]),
-                "CONCAT('a/', Column(x))",
+                Expr::string_concat([lit("a/"), col!("x")]),
+                "('a/' || Column(x))",
             ),
             (
                 Expr::case_when([(col!("x").is_null(), lit(0))], col!("x")),
@@ -1807,7 +1811,10 @@ mod tests {
         #[test]
         fn test_variadic_expression_roundtrip() {
             assert_roundtrip(&expr!(coalesce(col("a"), col("b"), "default")));
-            assert_roundtrip(&Expression::concat([lit("s3://b/"), col!("location")]));
+            assert_roundtrip(&Expression::string_concat([
+                lit("s3://b/"),
+                col!("location"),
+            ]));
         }
 
         #[rstest::rstest]
