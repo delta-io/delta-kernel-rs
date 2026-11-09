@@ -114,6 +114,7 @@ pub(crate) enum FileStatsPolicy {
 
 impl FileStatsPolicy {
     /// Selects which file actions contribute to incremental checksum statistics.
+    /// Operation names are matched exactly, including case.
     pub(crate) fn for_operation(operation: &str) -> Self {
         // These operation-name heuristics depend on writer conventions. The protocol proposal at
         // https://github.com/delta-io/delta/pull/6798 makes the add/remove policy explicit through
