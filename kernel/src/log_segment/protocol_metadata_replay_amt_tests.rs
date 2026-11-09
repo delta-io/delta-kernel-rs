@@ -15,6 +15,8 @@ use super::LastManifestCommitResolution;
 use super::LogSegment;
 use super::tests::{add_checkpoint_to_store, latest_log_segment};
 #[cfg(feature = "declarative-plans")]
+use crate::Error;
+#[cfg(feature = "declarative-plans")]
 use crate::KernelResult;
 use crate::actions::{CheckpointAction, ContentRoot, LastManifestCommit, Protocol};
 use crate::arrow::array::StringArray;
@@ -495,7 +497,10 @@ async fn plan_replay_errors_when_pointed_commit_lacks_matching_action(
 
     let engine = SyncEngine::new_with_store(store);
     let result = Snapshot::builder_for(table_root).build(&engine);
-    assert!(matches!(&result, Err(KernelError::InvalidLogSegment(_))));
+    assert!(matches!(
+        &result,
+        Err(Error::Kernel(KernelError::InvalidLogSegment(_)))
+    ));
     assert_result_error_with_message(result, expected_error);
 }
 
