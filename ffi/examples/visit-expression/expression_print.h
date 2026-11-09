@@ -281,6 +281,9 @@ void print_tree_helper(ExpressionItem ref, int depth) {
         case HasUriScheme:
           printf("HasUriScheme\n");
           break;
+        case UriEncodePath:
+          printf("UriEncodePath\n");
+          break;
       }
 
       print_expression_item_list(unary->sub_expr, depth + 1);
