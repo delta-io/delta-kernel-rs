@@ -1248,7 +1248,7 @@ pub fn fix_nested_null_masks(batch: StructArray) -> StructArray {
 
 /// Propagates parent null masks through a record batch's nested struct columns while preserving
 /// its schema and row count.
-#[cfg(feature = "declarative-plans")]
+#[cfg(all(feature = "declarative-plans", any(test, feature = "test-utils")))]
 pub(crate) fn fix_record_batch_nested_null_masks(batch: RecordBatch) -> KernelResult<RecordBatch> {
     if !batch
         .columns()

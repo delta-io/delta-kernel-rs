@@ -13,7 +13,6 @@ use crate::arrow::datatypes::DataType as ArrowDataType;
 use crate::arrow::row::OwnedRow;
 use crate::engine::arrow_conversion::TryIntoArrow as _;
 use crate::engine::arrow_expression::evaluate_expression::{extract_column, extract_column_ref};
-use crate::engine::arrow_utils::fix_record_batch_nested_null_masks;
 use crate::expressions::ColumnName;
 use crate::plans::ir::nodes::{Agg, Aggregate, NonNullByOperands};
 use crate::schema::DataType;
@@ -46,12 +45,6 @@ pub(super) fn eval_aggregate(
     aggregate: &Aggregate,
     input: &[RecordBatch],
 ) -> KernelResult<Vec<RecordBatch>> {
-    // All aggregate operands and grouping keys must see the same effective nested validity.
-    let input: Vec<_> = input
-        .iter()
-        .cloned()
-        .map(fix_record_batch_nested_null_masks)
-        .try_collect()?;
     let ops: Vec<Box<dyn BoundAggregate>> = aggregate
         .aggs
         .iter()
@@ -89,12 +82,12 @@ pub(super) fn eval_aggregate(
     // Materialize the grouping key columns, followed by agg columns
     let mut output_arrays = Vec::with_capacity(aggregate.schema.fields().len());
     for group_by in &aggregate.group_by {
-        let arrays = extract_column_values(&input, group_by)?;
+        let arrays = extract_column_values(input, group_by)?;
         output_arrays.push(interleave_column_values(&arrays, &reps)?);
     }
     for (agg_idx, op) in ops.iter().enumerate() {
         let states = Vec::from_iter(aggs_by_group.iter().map(|aggs| aggs[agg_idx].as_ref()));
-        output_arrays.push(op.finalize(&states, &input)?);
+        output_arrays.push(op.finalize(&states, input)?);
     }
 
     Ok(vec![RecordBatch::try_new(output_schema, output_arrays)?])
