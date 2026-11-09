@@ -761,7 +761,9 @@ pub fn evaluate_predicate(
                 (UnaryPredicateOp::IsNull, false) => Ok(is_null(&arr)?),
                 (UnaryPredicateOp::IsNull, true) => Ok(is_not_null(&arr)?),
                 (UnaryPredicateOp::HasUriScheme, _) => {
-                    Ok(maybe_inverted(Cow::Owned(has_uri_scheme(&arr)?))?)
+                    let has_scheme =
+                        map_string_rows(&arr, "HasUriScheme", |r| scheme_len(r).is_some())?;
+                    Ok(maybe_inverted(Cow::Owned(BooleanArray::from(has_scheme)))?)
                 }
                 (UnaryPredicateOp::HasDotSegment, _) => {
                     let has_dot = map_string_rows(&arr, "HasDotSegment", has_dot_segment)?;
@@ -1002,11 +1004,6 @@ fn cardinalities(input: &ArrayRef) -> KernelResult<ArrayRef> {
 }
 
 /// Evaluates [`UnaryPredicateOp::HasUriScheme`] over any string representation.
-fn has_uri_scheme(input: &ArrayRef) -> KernelResult<BooleanArray> {
-    let has_scheme = map_string_rows(input, "HasUriScheme", |r| scheme_len(r).is_some())?;
-    Ok(BooleanArray::from(has_scheme))
-}
-
 /// Applies `f` to every non-NULL row of a string array of any representation, keeping NULLs.
 /// Other array types are an error naming `op`.
 fn map_string_rows<'a, T>(
@@ -2551,8 +2548,22 @@ mod tests {
         (None, None),
     ];
 
+    /// Each path paired with whether it has a `.` or `..` segment.
+    const HAS_DOT_SEGMENT_CASES: &[(Option<&str>, Option<bool>)] = &[
+        (Some("a/../b"), Some(true)),
+        (Some("a/.hidden"), Some(false)),
+        (Some(""), Some(false)),
+        (None, None),
+    ];
+
+    type MakePredicate = fn(Expr) -> Pred;
+
     #[rstest]
-    fn test_has_uri_scheme(
+    #[case::has_uri_scheme(|e| Pred::has_uri_scheme(e), HAS_URI_SCHEME_CASES)]
+    #[case::has_dot_segment(|e| Pred::has_dot_segment(e), HAS_DOT_SEGMENT_CASES)]
+    fn test_uri_predicates(
+        #[case] make_pred: MakePredicate,
+        #[case] cases: &[(Option<&'static str>, Option<bool>)],
         #[values(
             |r| Arc::new(StringArray::from(r)) as ArrayRef,
             |r| Arc::new(LargeStringArray::from(r)) as ArrayRef,
@@ -2561,44 +2572,25 @@ mod tests {
         make_array: fn(Vec<Option<&'static str>>) -> ArrayRef,
         #[values(false, true)] inverted: bool,
     ) {
-        let references = HAS_URI_SCHEME_CASES.iter().map(|(r, _)| *r).collect();
-        let batch = RecordBatch::try_from_iter([("r", make_array(references))]).unwrap();
-        let result =
-            evaluate_predicate(&Pred::has_uri_scheme(col!("r")), &batch, inverted).unwrap();
-        let expected: BooleanArray = HAS_URI_SCHEME_CASES
+        let inputs = cases.iter().map(|(input, _)| *input).collect();
+        let batch = RecordBatch::try_from_iter([("s", make_array(inputs))]).unwrap();
+        let result = evaluate_predicate(&make_pred(col!("s")), &batch, inverted).unwrap();
+        let expected: BooleanArray = cases
             .iter()
-            .map(|(_, has_scheme)| has_scheme.map(|h| h != inverted))
+            .map(|(_, matches)| matches.map(|m| m != inverted))
             .collect();
         assert_eq!(result, expected);
     }
 
     #[rstest]
-    fn test_has_dot_segment(
-        #[values(
-            |r| Arc::new(StringArray::from(r)) as ArrayRef,
-            |r| Arc::new(LargeStringArray::from(r)) as ArrayRef,
-            |r| Arc::new(StringViewArray::from(r)) as ArrayRef
-        )]
-        make_array: fn(Vec<Option<&'static str>>) -> ArrayRef,
-        #[values(false, true)] inverted: bool,
+    fn test_uri_predicates_reject_non_string_input(
+        #[values(|e| Pred::has_uri_scheme(e), |e| Pred::has_dot_segment(e))]
+        make_pred: MakePredicate,
     ) {
-        let paths = vec![Some("a/../b"), Some("a/.hidden"), Some(""), None];
-        let batch = RecordBatch::try_from_iter([("p", make_array(paths))]).unwrap();
-        let result =
-            evaluate_predicate(&Pred::has_dot_segment(col!("p")), &batch, inverted).unwrap();
-        let expected: BooleanArray = [Some(true), Some(false), Some(false), None]
-            .into_iter()
-            .map(|has_dot| has_dot.map(|h| h != inverted))
-            .collect();
-        assert_eq!(result, expected);
-    }
-
-    #[test]
-    fn test_has_uri_scheme_rejects_non_string_input() {
         let batch =
             RecordBatch::try_from_iter([("n", Arc::new(Int32Array::from(vec![1])) as ArrayRef)])
                 .unwrap();
-        let err = evaluate_predicate(&Pred::has_uri_scheme(col!("n")), &batch, false).unwrap_err();
+        let err = evaluate_predicate(&make_pred(col!("n")), &batch, false).unwrap_err();
         assert!(
             matches!(err, KernelError::InvalidExpressionEvaluation(_)),
             "{err}"

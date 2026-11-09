@@ -99,9 +99,17 @@ pub enum UnaryPredicateOp {
     ///
     /// [RFC 3986 section 3.1]: https://datatracker.ietf.org/doc/html/rfc3986#section-3.1
     HasUriScheme,
-    /// `true` when any `/`-separated segment of a STRING path is `.` or `..`, such as
-    /// `'a/../b'` or `'./a'`. Names that merely contain dots, like `'a/.hidden'`, do not count. A
-    /// NULL input yields NULL, and so does its `NOT`. Other input types are an error.
+    /// `true` when any `/`-separated segment of a STRING is exactly `.` or `..`, equivalent to
+    /// `regexp_like(expr, '(^|/)\.\.?(/|$)')`. The input is compared as a plain string: it is not
+    /// parsed as a URI or percent-decoded, so apply it to raw (unencoded) paths. A NULL input
+    /// yields NULL, and so does its `NOT`. Other input types are an error.
+    ///
+    /// ```text
+    /// HAS_DOT_SEGMENT('a/../b')          -- true
+    /// HAS_DOT_SEGMENT('s3://b/x/./y')    -- true
+    /// HAS_DOT_SEGMENT('a/.hidden/b..c')  -- false
+    /// HAS_DOT_SEGMENT('a/%2E%2E/b')      -- false
+    /// ```
     HasDotSegment,
 }
 

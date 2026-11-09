@@ -177,7 +177,8 @@ pub struct EngineExpressionVisitor {
     pub visit_has_uri_scheme: VisitUnaryFn,
     /// Visits a `has_dot_segment` predicate belonging to the list identified by
     /// `sibling_list_id`. The sub-expression will be in a _one_ item list identified by
-    /// `child_list_id`. See [`UnaryPredicateOp::HasDotSegment`].
+    /// `child_list_id`. See [`UnaryPredicateOp::HasDotSegment`] for the semantics the
+    /// implementation must follow.
     pub visit_has_dot_segment: VisitUnaryFn,
     /// Visits the `ToJson` unary operator belonging to the list identified by `sibling_list_id`.
     /// The sub-expression will be in a _one_ item list identified by `child_list_id`.

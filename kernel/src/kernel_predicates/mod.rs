@@ -255,7 +255,7 @@ pub trait KernelPredicateEvaluator {
                     None
                 }
             },
-            // Column min/max stats can't bound these string properties, so they never prune.
+            // Min/max stats can't bound a scheme or dot-segment check, so these never prune.
             UnaryPredicateOp::HasUriScheme | UnaryPredicateOp::HasDotSegment => None,
         }
     }
