@@ -47,7 +47,7 @@ use crate::table_features::{
 use crate::table_properties::TableProperties;
 use crate::transforms::SchemaTransform as _;
 use crate::utils::require;
-use crate::{KernelError, KernelResult, Version};
+use crate::{DeltaError, KernelError, KernelResult, Version};
 
 /// Logical and physical schemas for the structured statistics emitted by a scan.
 ///
@@ -278,9 +278,14 @@ fn validate_partition_columns(
     let mut seen = HashSet::new();
     for col in metadata.partition_columns() {
         if !seen.insert(col) {
-            return Err(KernelError::generic(format!(
-                "Duplicate partition column: '{col}'"
-            )));
+            return Err(DeltaError::duplicate_partition_column(
+                col,
+                // TODO(3421): Remove the KernelError generic source following the error migration
+                Some(Box::new(KernelError::generic(format!(
+                    "Duplicate partition column: '{col}'"
+                )))),
+            )
+            .into());
         }
         require!(
             logical_schema.field(col).is_some(),
@@ -1413,7 +1418,6 @@ mod test {
     use rstest::rstest;
 
     use super::{InCommitTimestampEnablement, StatsOutputSchemas, TableConfiguration};
-    use crate::KernelError;
     use crate::actions::{MIN_VALUES, Metadata, Protocol};
     use crate::scan::state_info::StateInfo;
     use crate::scan::{PartitionValuesOptions, StatsOptions};
@@ -1440,6 +1444,7 @@ mod test {
         test_schema_with_array_and_column_mapping, test_schema_with_map,
         test_schema_with_map_and_column_mapping,
     };
+    use crate::{DeltaErrorCondition, Error, KernelError};
 
     #[rstest]
     fn collations_feature_without_annotations_requires_only_domain_metadata_for_writes(
@@ -2077,7 +2082,16 @@ mod test {
             .with_protocol(MockProtocolBuilder::new().with_versions(1, 2).build())
             .try_build();
 
-        assert_result_error_with_message(result, "Duplicate partition column: 'part'");
+        let Error::Delta(error) = result.unwrap_err() else {
+            panic!("expected Delta error")
+        };
+        assert_eq!(
+            error.condition(),
+            DeltaErrorCondition::DeltaDuplicateColumnsFoundPartitionColumns
+        );
+        assert_eq!(error.sql_state(), Some("42711"));
+        assert_eq!(error.parameters()[0].value(), "part");
+        assert!(std::error::Error::source(&error).is_some());
     }
 
     #[test]

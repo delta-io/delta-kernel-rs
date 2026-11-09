@@ -189,6 +189,18 @@ impl DeltaError {
         )
     }
 
+    /// Reports the duplicate partition column `name` stored in table metadata.
+    pub fn duplicate_partition_column(
+        name: &str,
+        source: Option<Box<dyn StdError + Send + Sync + 'static>>,
+    ) -> Self {
+        Self::new(
+            DeltaErrorCondition::DeltaDuplicateColumnsFoundPartitionColumns,
+            vec![DeltaErrorParameter::new("duplicateCols", name)],
+            source,
+        )
+    }
+
     /// Creates an error with an optional diagnostic cause and captures its backtrace.
     ///
     /// `parameters` must contain exactly [`DeltaErrorCondition::parameter_names`], in that order.
