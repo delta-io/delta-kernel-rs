@@ -373,9 +373,9 @@ pub unsafe extern "C" fn update_table_txn_builder_with_table_properties_added(
 ) -> ExternResult<Handle<ExclusiveUpdateTableTransactionBuilder>> {
     let builder = unsafe { *builder.into_inner() };
     let engine = unsafe { engine.as_ref() };
-    unsafe { properties.try_to_hash_map() }
-        .map(|properties| Box::new(builder.with_table_properties_added(properties)).into())
-        .into_extern_result(&engine)
+    let result = unsafe { properties.try_to_hash_map() }
+        .map(|properties| Box::new(builder.with_table_properties_added(properties)).into());
+    unsafe { result.into_extern_result(&engine) }
 }
 
 fn decode_single_field(schema: &EngineSchema) -> KernelResult<delta_kernel::schema::StructField> {
