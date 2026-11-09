@@ -219,6 +219,16 @@ pub trait ExpressionTransform<'a> {
         self.recurse_into_pred_junction(pred)
     }
 
+    /// Called for each manifest deletion vector lookup encountered during the traversal. The
+    /// provided implementation just forwards to [`Self::recurse_into_pred_manifest_dv_contains`].
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    fn transform_pred_manifest_dv_contains(
+        &mut self,
+        pred: &'a ManifestDvContainsPredicate,
+    ) -> Self::Output<ManifestDvContainsPredicate> {
+        self.recurse_into_pred_manifest_dv_contains(pred)
+    }
+
     /// Called for each opaque predicate encountered during the traversal. The provided
     /// implementation just forwards to [`Self::recurse_into_pred_opaque`].
     fn transform_pred_opaque(
@@ -327,7 +337,7 @@ pub trait ExpressionTransform<'a> {
             }
             #[cfg(feature = "adaptive-metadata-in-dev")]
             Predicate::ManifestDvContains(m) => {
-                let child = self.recurse_into_pred_manifest_dv_contains(m);
+                let child = self.transform_pred_manifest_dv_contains(m);
                 map_owned_or_else(pred, child, Predicate::ManifestDvContains)
             }
             Predicate::Opaque(o) => {
@@ -610,6 +620,14 @@ impl<'a> ExpressionTransform<'a> for ExpressionDepthChecker {
 
     fn transform_pred_binary(&mut self, pred: &'a BinaryPredicate) -> KernelResult<()> {
         self.depth_limited(Self::recurse_into_pred_binary, pred)
+    }
+
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    fn transform_pred_manifest_dv_contains(
+        &mut self,
+        pred: &'a ManifestDvContainsPredicate,
+    ) -> KernelResult<()> {
+        self.depth_limited(Self::recurse_into_pred_manifest_dv_contains, pred)
     }
 
     fn transform_pred_junction(&mut self, pred: &'a JunctionPredicate) -> KernelResult<()> {

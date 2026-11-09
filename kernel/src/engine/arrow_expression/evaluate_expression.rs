@@ -1025,17 +1025,24 @@ fn map_string_rows<'a, T>(
     }
 }
 
-/// Evaluates [`ManifestDvContainsPredicate`] row by row. A literal deletion vector, the common case
-/// of one manifest's deletion vector applied to that manifest's entries, is parsed once.
+/// Evaluates [`ManifestDvContainsPredicate`], parsing its literal deletion vector once per batch.
 #[cfg(feature = "adaptive-metadata-in-dev")]
 fn evaluate_manifest_dv_contains(
     pred: &ManifestDvContainsPredicate,
     batch: &RecordBatch,
 ) -> KernelResult<BooleanArray> {
-    let parse = |bytes: &[u8]| {
-        MumblingBitmap::deserialize(Bytes::copy_from_slice(bytes)).map_err(|e| {
-            KernelError::invalid_checkpoint(format!("Malformed manifest deletion vector: {e}"))
-        })
+    let dv = match pred.dv.as_ref() {
+        Expression::Literal(Scalar::Binary(bytes)) => Some(
+            MumblingBitmap::deserialize(Bytes::copy_from_slice(bytes)).map_err(|e| {
+                KernelError::invalid_checkpoint(format!("Malformed manifest deletion vector: {e}"))
+            })?,
+        ),
+        Expression::Literal(Scalar::Null(DataType::BINARY)) => None,
+        other => {
+            return Err(KernelError::invalid_expression(format!(
+                "MANIFEST_DV_CONTAINS deletion vector must be a BINARY literal, got {other}"
+            )));
+        }
     };
     let positions = evaluate_expression(&pred.position, batch, Some(&DataType::LONG))?;
     let positions = positions.as_primitive_opt::<Int64Type>().ok_or_else(|| {
@@ -1044,41 +1051,14 @@ fn evaluate_manifest_dv_contains(
             positions.data_type()
         ))
     })?;
-    let contains = |dv: Option<&MumblingBitmap>, position: i64| {
-        dv.is_some_and(|dv| u32::try_from(position).is_ok_and(|pos| dv.contains(pos)))
+    let contains = |position: i64| {
+        dv.as_ref()
+            .is_some_and(|dv| u32::try_from(position).is_ok_and(|pos| dv.contains(pos)))
     };
-    if let Expression::Literal(literal) = pred.dv.as_ref() {
-        let dv = match literal {
-            Scalar::Binary(bytes) => Some(parse(bytes)?),
-            Scalar::Null(DataType::BINARY) => None,
-            other => {
-                return Err(KernelError::invalid_expression(format!(
-                    "MANIFEST_DV_CONTAINS deletion vector must be BINARY, got {other:?}"
-                )));
-            }
-        };
-        return Ok(positions
-            .iter()
-            .map(|position| position.map(|position| contains(dv.as_ref(), position)))
-            .collect());
-    }
-    let dvs = evaluate_expression(&pred.dv, batch, Some(&DataType::BINARY))?;
-    let dvs = dvs.as_binary_opt::<i32>().ok_or_else(|| {
-        KernelError::invalid_expression(format!(
-            "MANIFEST_DV_CONTAINS deletion vector must be BINARY, got {}",
-            dvs.data_type()
-        ))
-    })?;
-    dvs.iter()
-        .zip(positions.iter())
-        .map(|(dv, position)| {
-            let Some(position) = position else {
-                return Ok(None);
-            };
-            let dv = dv.map(parse).transpose()?;
-            Ok(Some(contains(dv.as_ref(), position)))
-        })
-        .collect()
+    Ok(positions
+        .iter()
+        .map(|position| position.map(contains))
+        .collect())
 }
 
 /// `chrono` formats implementing the timestamp encoding [`UnaryExpressionOp::ToJson`] requires.
@@ -2396,28 +2376,14 @@ mod tests {
     }
 
     #[cfg(feature = "adaptive-metadata-in-dev")]
-    #[test]
-    fn test_manifest_dv_contains_reads_a_deletion_vector_per_row() {
-        let dvs = BinaryArray::from(vec![
-            Some(encode_positions(&[0]).as_ref()),
-            Some(encode_positions(&[0]).as_ref()),
-            None,
-        ]);
-        let positions = Int64Array::from(vec![0, 1, 0]);
-        let batch = RecordBatch::try_from_iter([
-            ("dv", Arc::new(dvs) as ArrayRef),
-            ("pos", Arc::new(positions) as ArrayRef),
-        ])
-        .unwrap();
-        let pred = Pred::manifest_dv_contains(col!("dv"), col!("pos"));
-        let result = evaluate_predicate(&pred, &batch, false).unwrap();
-        assert_eq!(result, BooleanArray::from(vec![true, false, false]));
-    }
-
-    #[cfg(feature = "adaptive-metadata-in-dev")]
     #[rstest]
-    #[case::malformed_dv(lit(Scalar::Binary(vec![1, 2, 3])), col!("pos"), "Malformed manifest deletion vector: Generic delta kernel error: Mumbling bitmap is truncated")]
-    #[case::non_binary_dv(lit(7), col!("pos"), "deletion vector must be BINARY")]
+    #[case::malformed_dv(
+        lit(Scalar::Binary(vec![1, 2, 3])),
+        col!("pos"),
+        "Malformed manifest deletion vector"
+    )]
+    #[case::non_binary_dv(lit(7), col!("pos"), "deletion vector must be a BINARY literal")]
+    #[case::column_dv(col!("pos"), col!("pos"), "deletion vector must be a BINARY literal")]
     #[case::non_long_position(
         lit(Scalar::Binary(encode_positions(&[1]).to_vec())),
         lit(1i32),

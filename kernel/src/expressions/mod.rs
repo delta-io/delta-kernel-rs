@@ -477,15 +477,15 @@ pub enum CastMode {
 /// A predicate that is TRUE when an adaptiveMetadata manifest deletion vector removes the manifest
 /// entry at `position`.
 ///
-/// `dv` is a BINARY manifest deletion vector in the serialized form of a DataManifest entry's
-/// `manifestInfo.dv`, and `position` is a LONG entry position within the manifest it applies to.
-/// The predicate is FALSE when `dv` is NULL or `position` lies outside the positions a manifest
-/// deletion vector can hold, and NULL when `position` is NULL. A `dv` that does not parse fails
-/// evaluation.
+/// `dv` is a BINARY literal holding a manifest deletion vector in the serialized form of a
+/// DataManifest entry's `manifestInfo.dv`, and `position` is a LONG entry position within the
+/// manifest it applies to. The predicate is NULL when `position` is NULL, and otherwise FALSE when
+/// `dv` is NULL or `position` lies outside the positions a manifest deletion vector can hold.
+/// Evaluation fails if `dv` is not a literal or does not parse.
 #[cfg(feature = "adaptive-metadata-in-dev")]
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ManifestDvContainsPredicate {
-    /// The manifest deletion vector.
+    /// The manifest deletion vector, a BINARY literal.
     pub dv: Box<Expression>,
     /// The manifest entry position to look up.
     pub position: Box<Expression>,
@@ -947,14 +947,13 @@ impl ManifestDvContainsPredicate {
             position: Box::new(position.into()),
         }
     }
-
-    /// The name this predicate is lowered to where a boundary has no node for it and must pass it
-    /// as [`Predicate::Unknown`].
-    #[internal_api]
-    pub(crate) fn unknown_name(&self) -> &'static str {
-        "manifest_dv_contains"
-    }
 }
+
+/// The name a [`Predicate::ManifestDvContains`] is lowered to where a boundary has no node for it
+/// and must pass it as [`Predicate::Unknown`].
+#[cfg(feature = "adaptive-metadata-in-dev")]
+#[internal_api]
+pub(crate) const MANIFEST_DV_CONTAINS_NAME: &str = "manifest_dv_contains";
 
 impl JunctionPredicate {
     pub(crate) fn new(op: JunctionPredicateOp, preds: Vec<Predicate>) -> Self {
@@ -1259,7 +1258,6 @@ impl Predicate {
         Self::binary(BinaryPredicateOp::Distinct, a, b)
     }
 
-    /// Create a new predicate `self AND other`
     /// Creates a predicate that is TRUE when the manifest deletion vector `dv` removes the entry at
     /// `position`. See [`ManifestDvContainsPredicate`].
     #[cfg(feature = "adaptive-metadata-in-dev")]
@@ -1270,6 +1268,7 @@ impl Predicate {
         Self::ManifestDvContains(ManifestDvContainsPredicate::new(dv, position))
     }
 
+    /// Create a new predicate `self AND other`
     pub fn and(a: impl Into<Self>, b: impl Into<Self>) -> Self {
         Self::and_from([a.into(), b.into()])
     }

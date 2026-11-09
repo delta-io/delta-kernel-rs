@@ -2,6 +2,8 @@
 //! [`Expression`] or [`Predicate`] to an engine's native expression format.
 use std::ffi::c_void;
 
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use delta_kernel::expressions::MANIFEST_DV_CONTAINS_NAME;
 use delta_kernel::expressions::{
     ArrayData, BinaryExpression, BinaryExpressionOp, BinaryPredicate, BinaryPredicateOp,
     CaseWhenExpression, ColumnName, Expression, ExpressionRef, ExpressionStructPatch,
@@ -805,8 +807,8 @@ fn visit_predicate_impl(
             visit_predicate_opaque(visitor, op, exprs, sibling_list_id)
         }
         #[cfg(feature = "adaptive-metadata-in-dev")]
-        Predicate::ManifestDvContains(m) => {
-            visit_unknown(visitor, sibling_list_id, m.unknown_name())
+        Predicate::ManifestDvContains(_) => {
+            visit_unknown(visitor, sibling_list_id, MANIFEST_DV_CONTAINS_NAME)
         }
         Predicate::Unknown(name) => visit_unknown(visitor, sibling_list_id, name),
     }
@@ -829,7 +831,7 @@ fn visit_predicate_internal(predicate: &Predicate, visitor: &mut EngineExpressio
 
 #[cfg(test)]
 mod tests {
-    use delta_kernel::expressions::{Expression, MapToStructOptions, Scalar, lit};
+    use delta_kernel::expressions::{Expression, MapToStructOptions, Scalar, col, lit};
     use delta_kernel::schema::IntervalYearToMonthType;
     use rstest::rstest;
 
@@ -1030,6 +1032,22 @@ mod tests {
             visit_unknown: visit_unknown_name,
             visit_case_when: ignore_case_when,
         }
+    }
+
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[test]
+    fn visit_predicate_lowers_manifest_dv_contains_to_unknown() {
+        let mut builder = TestExpressionBuilder::default();
+        let mut visitor = test_visitor(&mut builder);
+        let pred = Predicate::manifest_dv_contains(lit(Scalar::Binary(vec![])), col!("pos"));
+        visit_predicate_internal(&pred, &mut visitor);
+        assert_eq!(
+            builder.events,
+            vec![LiteralEvent::Unknown {
+                sibling_list_id: 0,
+                name: MANIFEST_DV_CONTAINS_NAME.to_string(),
+            }]
+        );
     }
 
     #[test]

@@ -10,6 +10,8 @@ use super::schema::primitive_type::Kind as PrimitiveTypeKind;
 use super::{
     expressions as proto_expr, operation as proto_op, plan as proto_plan, schema as proto_schema,
 };
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use crate::expressions::MANIFEST_DV_CONTAINS_NAME;
 use crate::expressions::{
     ArrayData, BinaryExpression, BinaryExpressionOp, BinaryPredicate, BinaryPredicateOp,
     ColumnName, DecimalData, Expression, ExpressionFieldPatch, ExpressionStructPatch,
@@ -392,7 +394,9 @@ impl From<&Predicate> for proto_expr::Predicate {
             Predicate::Opaque(opaque) => Kind::Opaque(opaque.into()),
             // No proto node for manifest deletion vector lookups; serialize as an opaque unknown.
             #[cfg(feature = "adaptive-metadata-in-dev")]
-            Predicate::ManifestDvContains(m) => Kind::Unknown(m.unknown_name().to_string()),
+            Predicate::ManifestDvContains(_) => {
+                Kind::Unknown(MANIFEST_DV_CONTAINS_NAME.to_string())
+            }
             Predicate::Unknown(name) => Kind::Unknown(name.clone()),
         };
         proto_expr::Predicate { kind: Some(kind) }
