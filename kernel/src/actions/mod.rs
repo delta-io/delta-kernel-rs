@@ -41,6 +41,11 @@ const SERDE_JSON_RECURSION_LIMIT_ERROR_PREFIX: &str = "recursion limit exceeded"
 const UNKNOWN_OPERATION: &str = "UNKNOWN";
 pub(crate) const ROW_TRACKING_PRESERVED_TAG: &str = "delta.rowTracking.preserved";
 
+#[cfg(feature = "declarative-plans")]
+pub(crate) mod action_set;
+#[cfg(feature = "declarative-plans")]
+pub(crate) use action_set::ACTION_KEY;
+
 pub mod deletion_vector;
 pub mod deletion_vector_writer;
 pub mod set_transaction;
