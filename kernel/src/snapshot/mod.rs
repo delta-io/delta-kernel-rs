@@ -1763,8 +1763,6 @@ impl Snapshot {
             self.built_as_latest,
             false, /* skipped_new_checkpoints */
         )?);
-        // Recording stats selects the Written metric outcome, so all fallible work must finish
-        // first.
         span.record(
             "bytes_written",
             info.last_checkpoint_stats.size_in_bytes as u64,

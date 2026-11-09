@@ -72,7 +72,7 @@ impl From<kernel::CommitFailureReason> for CommitFailureReason {
     }
 }
 
-/// The final result of a [`delta_kernel::Snapshot::checkpoint`] call.
+/// The result of a successful [`delta_kernel::Snapshot::checkpoint`] call.
 ///
 /// cbindgen:prefix-with-name=true
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -85,8 +85,6 @@ pub enum CheckpointWriteOutcome {
     },
     /// The API returned that a checkpoint already exists at this version.
     AlreadyExists,
-    /// The API returned an error, including failures after checkpoint data was written.
-    Error,
 }
 
 impl From<kernel::CheckpointWriteOutcome> for CheckpointWriteOutcome {
@@ -96,7 +94,6 @@ impl From<kernel::CheckpointWriteOutcome> for CheckpointWriteOutcome {
                 stats: stats.into(),
             },
             kernel::CheckpointWriteOutcome::AlreadyExists => Self::AlreadyExists,
-            kernel::CheckpointWriteOutcome::Error => Self::Error,
         }
     }
 }
@@ -315,12 +312,24 @@ pub struct TransactionCommitFailure {
     pub reason: CommitFailureReason,
 }
 
-/// A checkpoint call completed.
+/// A [`delta_kernel::Snapshot::checkpoint`] call returned successfully.
 #[repr(C)]
-pub struct CheckpointWrite {
+pub struct CheckpointWriteSuccess {
+    /// Whether the call wrote a checkpoint or found one already present.
     pub outcome: CheckpointWriteOutcome,
+    /// Selected checkpoint write mode.
     pub mode: CheckpointWriteMode,
     /// API entry through checkpoint data completion, or an earlier return, in nanoseconds.
+    /// Excludes `_last_checkpoint` publication and returned snapshot construction.
+    pub duration_ns: u64,
+}
+
+/// A [`delta_kernel::Snapshot::checkpoint`] call returned an error, including after data writes.
+#[repr(C)]
+pub struct CheckpointWriteFailure {
+    /// Selected write mode, preserved when the call fails.
+    pub mode: CheckpointWriteMode,
+    /// API entry through checkpoint data completion, or an earlier error, in nanoseconds.
     /// Excludes `_last_checkpoint` publication and returned snapshot construction.
     pub duration_ns: u64,
 }
@@ -459,7 +468,8 @@ pub enum MetricEvent {
     StorageListCompleted(StorageListCompleted),
     StorageReadCompleted(StorageReadCompleted),
     StorageCopyCompleted(StorageCopyCompleted),
-    CheckpointWrite(CheckpointWrite),
+    CheckpointWriteSuccess(CheckpointWriteSuccess),
+    CheckpointWriteFailure(CheckpointWriteFailure),
 }
 
 /// Borrow the caller-supplied correlation id as a [`KernelStringSlice`], or an empty slice when
@@ -715,15 +725,21 @@ impl MetricEvent {
                     duration_ns: ns(*duration),
                 })
             }
-            K::CheckpointWrite(kernel::CheckpointWrite {
+            K::CheckpointWriteSuccess(kernel::CheckpointWriteSuccess {
                 outcome,
                 mode,
                 duration,
-            }) => Self::CheckpointWrite(CheckpointWrite {
+            }) => Self::CheckpointWriteSuccess(CheckpointWriteSuccess {
                 outcome: (*outcome).into(),
                 mode: (*mode).into(),
                 duration_ns: ns(*duration),
             }),
+            K::CheckpointWriteFailure(kernel::CheckpointWriteFailure { mode, duration }) => {
+                Self::CheckpointWriteFailure(CheckpointWriteFailure {
+                    mode: (*mode).into(),
+                    duration_ns: ns(*duration),
+                })
+            }
         }
     }
 }
@@ -767,7 +783,7 @@ mod tests {
             let sidecars = u64::from(mode == kernel::CheckpointWriteMode::V2WithSidecars) * 2;
             (101, 3, 5, 11 + sidecars, sidecars)
         };
-        let event = kernel::MetricEvent::CheckpointWrite(kernel::CheckpointWrite {
+        let event = kernel::MetricEvent::CheckpointWriteSuccess(kernel::CheckpointWriteSuccess {
             outcome: kernel::CheckpointWriteOutcome::Written {
                 stats: kernel::CheckpointWriteStats {
                     bytes_written: bytes,
@@ -782,8 +798,8 @@ mod tests {
         });
 
         with_ffi_event(&event, |ffi| {
-            let MetricEvent::CheckpointWrite(e) = ffi else {
-                panic!("expected CheckpointWrite");
+            let MetricEvent::CheckpointWriteSuccess(e) = ffi else {
+                panic!("expected CheckpointWriteSuccess");
             };
             assert_eq!(e.mode, expected_mode);
             assert_eq!(e.duration_ns, 123);
@@ -803,38 +819,45 @@ mod tests {
     }
 
     #[rstest]
-    #[case::already_exists(
-        kernel::CheckpointWriteOutcome::AlreadyExists,
-        CheckpointWriteOutcome::AlreadyExists
+    #[case::not_attempted(
+        kernel::CheckpointWriteMode::NotAttempted,
+        CheckpointWriteMode::NotAttempted
     )]
-    #[case::error(kernel::CheckpointWriteOutcome::Error, CheckpointWriteOutcome::Error)]
-    fn from_kernel_checkpoint_nonwritten_preserves_outcome(
-        #[case] outcome: kernel::CheckpointWriteOutcome,
-        #[case] expected_outcome: CheckpointWriteOutcome,
-        #[values(
-            kernel::CheckpointWriteMode::NotAttempted,
-            kernel::CheckpointWriteMode::V2WithSidecars
-        )]
-        mode: kernel::CheckpointWriteMode,
+    #[case::with_sidecars(
+        kernel::CheckpointWriteMode::V2WithSidecars,
+        CheckpointWriteMode::V2WithSidecars
+    )]
+    fn from_kernel_checkpoint_nonwritten_preserves_mode_and_duration(
+        #[case] mode: kernel::CheckpointWriteMode,
+        #[case] expected_mode: CheckpointWriteMode,
+        #[values(false, true)] failed: bool,
+        #[values(0u64, 456)] duration_ns: u64,
     ) {
-        let event = kernel::MetricEvent::CheckpointWrite(kernel::CheckpointWrite {
-            outcome,
-            mode,
-            duration: Duration::from_nanos(456),
-        });
+        let duration = Duration::from_nanos(duration_ns);
+        let event = if failed {
+            kernel::MetricEvent::CheckpointWriteFailure(kernel::CheckpointWriteFailure {
+                mode,
+                duration,
+            })
+        } else {
+            kernel::MetricEvent::CheckpointWriteSuccess(kernel::CheckpointWriteSuccess {
+                outcome: kernel::CheckpointWriteOutcome::AlreadyExists,
+                mode,
+                duration,
+            })
+        };
 
         with_ffi_event(&event, |ffi| {
-            let MetricEvent::CheckpointWrite(e) = ffi else {
-                panic!("expected CheckpointWrite");
+            let (mode, duration) = match ffi {
+                MetricEvent::CheckpointWriteFailure(e) if failed => (e.mode, e.duration_ns),
+                MetricEvent::CheckpointWriteSuccess(e) if !failed => {
+                    assert_eq!(e.outcome, CheckpointWriteOutcome::AlreadyExists);
+                    (e.mode, e.duration_ns)
+                }
+                _ => panic!("expected checkpoint success or failure matching the kernel event"),
             };
-            assert_eq!(e.outcome, expected_outcome);
-            let expected_mode = if mode == kernel::CheckpointWriteMode::NotAttempted {
-                CheckpointWriteMode::NotAttempted
-            } else {
-                CheckpointWriteMode::V2WithSidecars
-            };
-            assert_eq!(e.mode, expected_mode);
-            assert_eq!(e.duration_ns, 456);
+            assert_eq!(mode, expected_mode);
+            assert_eq!(duration, duration_ns);
         });
     }
 

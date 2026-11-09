@@ -106,7 +106,8 @@ pub enum MetricEvent {
     SetTransactionLoadFailure,
     CrcReadSuccess(CrcReadSuccess),
     CrcReadFailure,
-    CheckpointWrite(CheckpointWrite),
+    CheckpointWriteSuccess(CheckpointWriteSuccess),
+    CheckpointWriteFailure(CheckpointWriteFailure),
     JsonReadCompleted(JsonReadCompleted),
     ParquetReadCompleted(ParquetReadCompleted),
     ScanMetadataCompleted(ScanMetadataCompleted),
@@ -125,7 +126,8 @@ impl MetricEvent {
             Self::DomainMetadataLoadSuccess(e) => e.set_duration(d),
             Self::SetTransactionLoadSuccess(e) => e.set_duration(d),
             Self::CrcReadSuccess(e) => e.set_duration(d),
-            Self::CheckpointWrite(e) => e.duration = d,
+            Self::CheckpointWriteSuccess(e) => e.duration = d,
+            Self::CheckpointWriteFailure(e) => e.duration = d,
 
             // Emit-based success events set their duration as a creation attribute, so the
             // span-close hook must not overwrite it.
@@ -136,7 +138,7 @@ impl MetricEvent {
             | Self::StorageReadCompleted(_)
             | Self::StorageCopyCompleted(_) => {}
 
-            // Failure events carry no duration.
+            // These failure events carry no duration.
             Self::LogSegmentLoadFailure(_)
             | Self::ProtocolMetadataLoadFailure(_)
             | Self::SnapshotBuildFailure(_)
@@ -157,7 +159,7 @@ impl MetricEvent {
             Self::TransactionCommitSuccess(e) => e.record_u64(name, value),
             Self::DomainMetadataLoadSuccess(e) => e.record_u64(name, value),
             Self::CrcReadSuccess(e) => e.record_u64(name, value),
-            Self::CheckpointWrite(e) => e.record_u64(name, value),
+            Self::CheckpointWriteSuccess(e) => e.record_u64(name, value),
 
             Self::LogSegmentLoadSuccess(_) => Err(LogSegmentLoadSuccess::SPAN_NAME),
             Self::ProtocolMetadataLoadSuccess(_) => Err(ProtocolMetadataLoadSuccess::SPAN_NAME),
@@ -169,7 +171,7 @@ impl MetricEvent {
             | Self::StorageReadCompleted(_)
             | Self::StorageCopyCompleted(_) => Err(STORAGE_SPAN),
 
-            // Failure events are built at span close, after any runtime records.
+            // Failure events do not record numeric fields.
             Self::LogSegmentLoadFailure(_) => Err(LogSegmentLoadSuccess::SPAN_NAME),
             Self::ProtocolMetadataLoadFailure(_) => Err(ProtocolMetadataLoadSuccess::SPAN_NAME),
             Self::SnapshotBuildFailure(_) => Err(SnapshotBuildSuccess::SPAN_NAME),
@@ -177,6 +179,7 @@ impl MetricEvent {
             Self::DomainMetadataLoadFailure => Err(DomainMetadataLoadSuccess::SPAN_NAME),
             Self::SetTransactionLoadFailure => Err(SetTransactionLoadSuccess::SPAN_NAME),
             Self::CrcReadFailure => Err(CrcReadSuccess::SPAN_NAME),
+            Self::CheckpointWriteFailure(_) => Err(CheckpointWriteSuccess::SPAN_NAME),
         }
     }
 
@@ -192,7 +195,7 @@ impl MetricEvent {
             Self::ProtocolMetadataLoadSuccess(_) => Err(ProtocolMetadataLoadSuccess::SPAN_NAME),
             Self::SnapshotBuildSuccess(_) => Err(SnapshotBuildSuccess::SPAN_NAME),
             Self::CrcReadSuccess(_) => Err(CrcReadSuccess::SPAN_NAME),
-            Self::CheckpointWrite(_) => Err(CheckpointWrite::SPAN_NAME),
+            Self::CheckpointWriteSuccess(_) => Err(CheckpointWriteSuccess::SPAN_NAME),
             Self::ScanMetadataCompleted(_) => Err(ScanMetadataCompleted::SPAN_NAME),
             Self::JsonReadCompleted(_) => Err(JsonReadCompleted::SPAN_NAME),
             Self::ParquetReadCompleted(_) => Err(ParquetReadCompleted::SPAN_NAME),
@@ -200,7 +203,7 @@ impl MetricEvent {
             | Self::StorageReadCompleted(_)
             | Self::StorageCopyCompleted(_) => Err(STORAGE_SPAN),
 
-            // Failure events are built at span close, after any runtime records.
+            // Failure events do not record bool fields.
             Self::LogSegmentLoadFailure(_) => Err(LogSegmentLoadSuccess::SPAN_NAME),
             Self::ProtocolMetadataLoadFailure(_) => Err(ProtocolMetadataLoadSuccess::SPAN_NAME),
             Self::SnapshotBuildFailure(_) => Err(SnapshotBuildSuccess::SPAN_NAME),
@@ -208,6 +211,7 @@ impl MetricEvent {
             Self::DomainMetadataLoadFailure => Err(DomainMetadataLoadSuccess::SPAN_NAME),
             Self::SetTransactionLoadFailure => Err(SetTransactionLoadSuccess::SPAN_NAME),
             Self::CrcReadFailure => Err(CrcReadSuccess::SPAN_NAME),
+            Self::CheckpointWriteFailure(_) => Err(CheckpointWriteSuccess::SPAN_NAME),
         }
     }
 
@@ -231,7 +235,7 @@ impl MetricEvent {
         }
         match self {
             Self::TransactionCommitSuccess(e) => e.record_str(name, value),
-            Self::CheckpointWrite(e) => e.record_str(name, value),
+            Self::CheckpointWriteSuccess(e) => e.record_str(name, value),
             _ => Ok(()),
         }
     }
@@ -270,9 +274,11 @@ impl MetricEvent {
             Self::DomainMetadataLoadSuccess(_) => Self::DomainMetadataLoadFailure,
             Self::SetTransactionLoadSuccess(_) => Self::SetTransactionLoadFailure,
             Self::CrcReadSuccess(_) => Self::CrcReadFailure,
-            Self::CheckpointWrite(mut e) => {
-                e.outcome = CheckpointWriteOutcome::Error;
-                Self::CheckpointWrite(e)
+            Self::CheckpointWriteSuccess(e) => {
+                Self::CheckpointWriteFailure(CheckpointWriteFailure {
+                    mode: e.mode,
+                    duration: e.duration,
+                })
             }
             // Events with no failure form pass through unchanged.
             // Note: here we list explicitly so adding a lifecycle event without a failure mapping
@@ -284,6 +290,7 @@ impl MetricEvent {
             | Self::DomainMetadataLoadFailure
             | Self::SetTransactionLoadFailure
             | Self::CrcReadFailure
+            | Self::CheckpointWriteFailure(_)
             | Self::JsonReadCompleted(_)
             | Self::ParquetReadCompleted(_)
             | Self::ScanMetadataCompleted(_)
@@ -311,7 +318,8 @@ impl fmt::Display for MetricEvent {
             Self::SetTransactionLoadFailure => f.write_str("SetTransactionLoadFailure"),
             Self::CrcReadSuccess(e) => e.fmt(f),
             Self::CrcReadFailure => f.write_str("CrcReadFailure"),
-            Self::CheckpointWrite(e) => e.fmt(f),
+            Self::CheckpointWriteSuccess(e) => e.fmt(f),
+            Self::CheckpointWriteFailure(e) => e.fmt(f),
             Self::JsonReadCompleted(e) => e.fmt(f),
             Self::ParquetReadCompleted(e) => e.fmt(f),
             Self::ScanMetadataCompleted(e) => e.fmt(f),
@@ -322,7 +330,7 @@ impl fmt::Display for MetricEvent {
     }
 }
 
-/// Final result of a [`crate::Snapshot::checkpoint`] call.
+/// Result of a successful [`crate::Snapshot::checkpoint`] call.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, StrumDisplay, AsRefStr, IntoStaticStr)]
 #[strum(serialize_all = "snake_case")]
 pub enum CheckpointWriteOutcome {
@@ -333,8 +341,6 @@ pub enum CheckpointWriteOutcome {
     },
     /// The API returned [`crate::snapshot::CheckpointWriteResult::AlreadyExists`].
     AlreadyExists,
-    /// The API returned an error, including failures after writing checkpoint data.
-    Error,
 }
 
 /// Checkpoint format and sidecar-writing mode selected during a checkpoint call.
@@ -355,17 +361,30 @@ pub enum CheckpointWriteMode {
     V2WithSidecars,
 }
 
-/// Final result of one [`crate::Snapshot::checkpoint`] call, including errors and early returns.
+/// A [`crate::Snapshot::checkpoint`] call wrote a checkpoint or reported that one already exists.
 #[derive(Debug, Clone)]
-pub struct CheckpointWrite {
-    /// Final API result, including errors from hint publication or snapshot construction.
+pub struct CheckpointWriteSuccess {
+    /// Whether the call wrote checkpoint data or reported that a checkpoint already exists.
     pub outcome: CheckpointWriteOutcome,
-    /// Selected write mode, preserved through later failures.
+    /// Selected write mode, or [`CheckpointWriteMode::NotAttempted`] for an early return.
     pub mode: CheckpointWriteMode,
     /// Elapsed time from API entry through checkpoint data writes and size verification.
     ///
     /// Hint publication and returned snapshot construction are excluded. Calls that return
     /// before checkpoint data completion report elapsed time through that return.
+    pub duration: Duration,
+}
+
+/// A [`crate::Snapshot::checkpoint`] call returned an error.
+///
+/// Checkpoint data may have been written before hint publication or snapshot construction failed.
+#[derive(Debug, Clone)]
+pub struct CheckpointWriteFailure {
+    /// Selected write mode, preserved through the failure.
+    pub mode: CheckpointWriteMode,
+    /// Elapsed time through checkpoint data completion or an earlier error.
+    ///
+    /// Uses the same timing boundary as [`CheckpointWriteSuccess::duration`].
     pub duration: Duration,
 }
 
@@ -385,12 +404,14 @@ pub struct CheckpointWriteStats {
     pub num_sidecars: u64,
 }
 
-impl CheckpointWrite {
+impl CheckpointWriteSuccess {
     pub(crate) const SPAN_NAME: &'static str = "snap.checkpoint";
 
     pub(crate) fn from_attrs(_attrs: &Attributes<'_>) -> Self {
         Self {
-            outcome: CheckpointWriteOutcome::Error,
+            outcome: CheckpointWriteOutcome::Written {
+                stats: CheckpointWriteStats::default(),
+            },
             mode: CheckpointWriteMode::NotAttempted,
             duration: Duration::ZERO,
         }
@@ -429,17 +450,27 @@ impl CheckpointWrite {
     }
 }
 
-impl fmt::Display for CheckpointWrite {
+impl fmt::Display for CheckpointWriteSuccess {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "CheckpointWrite(outcome={}, mode={}, duration={:?}",
+            "CheckpointWriteSuccess(outcome={}, mode={}, duration={:?}",
             self.outcome, self.mode, self.duration,
         )?;
         if let CheckpointWriteOutcome::Written { stats } = self.outcome {
             write!(f, ", stats={stats:?}")?;
         }
         f.write_str(")")
+    }
+}
+
+impl fmt::Display for CheckpointWriteFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "CheckpointWriteFailure(mode={}, duration={:?})",
+            self.mode, self.duration,
+        )
     }
 }
 
@@ -2105,7 +2136,6 @@ mod tests {
         "written"
     )]
     #[case::already_exists(CheckpointWriteOutcome::AlreadyExists, "already_exists")]
-    #[case::error(CheckpointWriteOutcome::Error, "error")]
     fn checkpoint_write_outcome_serializes_to_wire_name(
         #[case] outcome: CheckpointWriteOutcome,
         #[case] wire: &str,

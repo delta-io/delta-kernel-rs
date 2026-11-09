@@ -1,4 +1,4 @@
-//! Completion metrics for checkpoint writes, including reconciled counts and hint publication.
+//! Checkpoint success and failure metrics, including reconciled counts and hint publication.
 
 use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex};
@@ -7,9 +7,7 @@ use std::time::{Duration, Instant};
 use delta_kernel::checkpoint::{CheckpointSpec, V2CheckpointConfig};
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::expressions::PredicateRef;
-use delta_kernel::metrics::{
-    CheckpointWrite, CheckpointWriteMode, CheckpointWriteOutcome, MetricEvent,
-};
+use delta_kernel::metrics::{CheckpointWriteMode, CheckpointWriteOutcome, MetricEvent};
 use delta_kernel::object_store::ObjectStoreExt;
 use delta_kernel::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use delta_kernel::schema::SchemaRef;
@@ -88,7 +86,9 @@ async fn checkpoint_reports_reconciled_counts_and_stored_bytes(
     assert_eq!(checkpointed.version(), snapshot.version());
     let events = checkpoint_events(&reporter);
     assert_eq!(events.len(), 1);
-    let event = &events[0];
+    let MetricEvent::CheckpointWriteSuccess(event) = &events[0] else {
+        panic!("expected CheckpointWriteSuccess");
+    };
     assert_eq!(event.mode, mode);
     let CheckpointWriteOutcome::Written { stats } = event.outcome else {
         panic!("expected Written");
@@ -138,8 +138,11 @@ async fn checkpoint_reports_reconciled_counts_and_stored_bytes(
     assert!(Arc::ptr_eq(&unchanged, &checkpointed));
     let events = checkpoint_events(&reporter);
     assert_eq!(events.len(), 2);
-    assert_eq!(events[1].outcome, CheckpointWriteOutcome::AlreadyExists);
-    assert_eq!(events[1].mode, CheckpointWriteMode::NotAttempted);
+    let MetricEvent::CheckpointWriteSuccess(event) = &events[1] else {
+        panic!("expected CheckpointWriteSuccess");
+    };
+    assert_eq!(event.outcome, CheckpointWriteOutcome::AlreadyExists);
+    assert_eq!(event.mode, CheckpointWriteMode::NotAttempted);
     Ok(())
 }
 
@@ -161,7 +164,9 @@ async fn sidecar_mode_with_no_file_actions_reports_zero_sidecars() -> delta_kern
     assert_eq!(result, CheckpointWriteResult::Written);
     let events = checkpoint_events(&reporter);
     assert_eq!(events.len(), 1);
-    let event = &events[0];
+    let MetricEvent::CheckpointWriteSuccess(event) = &events[0] else {
+        panic!("expected CheckpointWriteSuccess");
+    };
     assert_eq!(event.mode, CheckpointWriteMode::V2WithSidecars);
     let CheckpointWriteOutcome::Written { stats } = event.outcome else {
         panic!("expected Written");
@@ -204,8 +209,10 @@ async fn invalid_checkpoint_spec_reports_error_without_selecting_mode(
 
     let events = checkpoint_events(&reporter);
     assert_eq!(events.len(), 1);
-    assert_eq!(events[0].outcome, CheckpointWriteOutcome::Error);
-    assert_eq!(events[0].mode, CheckpointWriteMode::NotAttempted);
+    let MetricEvent::CheckpointWriteFailure(event) = &events[0] else {
+        panic!("expected CheckpointWriteFailure");
+    };
+    assert_eq!(event.mode, CheckpointWriteMode::NotAttempted);
     Ok(())
 }
 
@@ -235,34 +242,36 @@ async fn checkpoint_duration_includes_data_writes_and_excludes_hint_writes(
 
     let events = checkpoint_events(&reporter);
     assert_eq!(events.len(), 1);
-    let event = &events[0];
-    assert_eq!(event.mode, CheckpointWriteMode::V1);
-    assert!(event.duration >= checkpoint_delay);
-    let hint_duration = engine.json.hint_duration.lock().unwrap().unwrap();
-    assert!(total_duration.saturating_sub(event.duration) >= hint_duration);
-    if fail_hint {
+    let (mode, duration) = if fail_hint {
         assert!(result.is_err());
-        assert_eq!(event.outcome, CheckpointWriteOutcome::Error);
+        let MetricEvent::CheckpointWriteFailure(event) = &events[0] else {
+            panic!("expected CheckpointWriteFailure");
+        };
+        (event.mode, event.duration)
     } else {
         assert_eq!(result?.0, CheckpointWriteResult::Written);
+        let MetricEvent::CheckpointWriteSuccess(event) = &events[0] else {
+            panic!("expected CheckpointWriteSuccess");
+        };
         let CheckpointWriteOutcome::Written { stats } = event.outcome else {
             panic!("expected Written");
         };
         assert_eq!(stats.num_add_files, 1);
-    }
+        (event.mode, event.duration)
+    };
+    assert_eq!(mode, CheckpointWriteMode::V1);
+    assert!(duration >= checkpoint_delay);
+    let hint_duration = engine.json.hint_duration.lock().unwrap().unwrap();
+    assert!(total_duration.saturating_sub(duration) >= hint_duration);
     Ok(())
 }
 
 #[rstest]
-#[case::write_error(InjectedWriteError::Generic, CheckpointWriteOutcome::Error)]
-#[case::already_exists(
-    InjectedWriteError::AlreadyExists,
-    CheckpointWriteOutcome::AlreadyExists
-)]
+#[case::write_error(InjectedWriteError::Generic)]
+#[case::already_exists(InjectedWriteError::AlreadyExists)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn checkpoint_write_errors_preserve_mode_and_duration(
     #[case] error: InjectedWriteError,
-    #[case] outcome: CheckpointWriteOutcome,
 ) -> delta_kernel::Result<()> {
     let table = TestTableBuilder::new().build()?;
     let reporter = Arc::new(CapturingReporter::default());
@@ -279,16 +288,27 @@ async fn checkpoint_write_errors_preserve_mode_and_duration(
 
     let result = snapshot.checkpoint(&engine, None);
 
-    if outcome == CheckpointWriteOutcome::AlreadyExists {
-        assert_eq!(result?.0, CheckpointWriteResult::AlreadyExists);
-    } else {
-        assert!(result.is_err());
-    }
     let events = checkpoint_events(&reporter);
     assert_eq!(events.len(), 1);
-    assert_eq!(events[0].outcome, outcome);
-    assert_eq!(events[0].mode, CheckpointWriteMode::V1);
-    assert!(events[0].duration >= delay);
+    let (mode, duration) = match error {
+        InjectedWriteError::Generic => {
+            assert!(result.is_err());
+            let MetricEvent::CheckpointWriteFailure(event) = &events[0] else {
+                panic!("expected CheckpointWriteFailure");
+            };
+            (event.mode, event.duration)
+        }
+        InjectedWriteError::AlreadyExists => {
+            assert_eq!(result?.0, CheckpointWriteResult::AlreadyExists);
+            let MetricEvent::CheckpointWriteSuccess(event) = &events[0] else {
+                panic!("expected CheckpointWriteSuccess");
+            };
+            assert_eq!(event.outcome, CheckpointWriteOutcome::AlreadyExists);
+            (event.mode, event.duration)
+        }
+    };
+    assert_eq!(mode, CheckpointWriteMode::V1);
+    assert!(duration >= delay);
     assert!(engine.json.hint_duration.lock().unwrap().is_none());
     Ok(())
 }
@@ -318,8 +338,11 @@ async fn checkpoint_with_newer_hint_reports_written_without_publishing_hint()
     assert!(engine.json.hint_duration.lock().unwrap().is_none());
     let events = checkpoint_events(&reporter);
     assert_eq!(events.len(), 1);
-    assert_eq!(events[0].mode, CheckpointWriteMode::V1);
-    let CheckpointWriteOutcome::Written { stats } = events[0].outcome else {
+    let MetricEvent::CheckpointWriteSuccess(event) = &events[0] else {
+        panic!("expected CheckpointWriteSuccess");
+    };
+    assert_eq!(event.mode, CheckpointWriteMode::V1);
+    let CheckpointWriteOutcome::Written { stats } = event.outcome else {
         panic!("expected Written");
     };
     assert_eq!(stats.num_add_files, 1);
@@ -340,13 +363,15 @@ fn checkpoint_engine(table: &TestTable) -> Arc<dyn Engine> {
     )
 }
 
-fn checkpoint_events(reporter: &CapturingReporter) -> Vec<CheckpointWrite> {
+fn checkpoint_events(reporter: &CapturingReporter) -> Vec<MetricEvent> {
     reporter
         .events()
         .into_iter()
-        .filter_map(|event| match event {
-            MetricEvent::CheckpointWrite(event) => Some(event),
-            _ => None,
+        .filter(|event| {
+            matches!(
+                event,
+                MetricEvent::CheckpointWriteSuccess(_) | MetricEvent::CheckpointWriteFailure(_)
+            )
         })
         .collect()
 }

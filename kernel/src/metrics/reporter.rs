@@ -10,7 +10,7 @@ use tracing_subscriber::Layer;
 use tracing_subscriber::layer::Context;
 
 use super::events::{
-    CheckpointWrite, CrcReadSuccess, DomainMetadataLoadSuccess, JsonReadCompleted,
+    CheckpointWriteSuccess, CrcReadSuccess, DomainMetadataLoadSuccess, JsonReadCompleted,
     LogSegmentLoadSuccess, MetricEvent, ParquetReadCompleted, ProtocolMetadataLoadSuccess,
     STORAGE_SPAN, ScanMetadataCompleted, SetTransactionLoadSuccess, SnapshotBuildSuccess,
     TransactionCommitSuccess, storage_metric_from_attrs,
@@ -106,8 +106,8 @@ where
             return;
         };
         let event = match metadata.name() {
-            CheckpointWrite::SPAN_NAME => Some(MetricEvent::CheckpointWrite(
-                CheckpointWrite::from_attrs(attrs),
+            CheckpointWriteSuccess::SPAN_NAME => Some(MetricEvent::CheckpointWriteSuccess(
+                CheckpointWriteSuccess::from_attrs(attrs),
             )),
             LogSegmentLoadSuccess::SPAN_NAME => Some(MetricEvent::LogSegmentLoadSuccess(
                 LogSegmentLoadSuccess::from_attrs(attrs),
@@ -417,27 +417,27 @@ mod tests {
         }
         let events = reporter.events();
         assert_eq!(events.len(), 1);
-        let MetricEvent::CheckpointWrite(event) = &events[0] else {
-            panic!("expected checkpoint completion");
-        };
-        assert_eq!(event.duration, Duration::from_nanos(duration_ns));
-        assert_eq!(event.mode, CheckpointWriteMode::V2WithSidecars);
-        if fail {
-            assert_eq!(event.outcome, CheckpointWriteOutcome::Error);
-        } else {
-            assert_eq!(
-                event.outcome,
-                CheckpointWriteOutcome::Written {
-                    stats: CheckpointWriteStats {
-                        bytes_written: 50,
-                        num_add_files: 1,
-                        num_remove_files: 0,
-                        num_actions: 5,
-                        num_sidecars: 1,
+        let (mode, duration) = match (&events[0], fail) {
+            (MetricEvent::CheckpointWriteFailure(event), true) => (event.mode, event.duration),
+            (MetricEvent::CheckpointWriteSuccess(event), false) => {
+                assert_eq!(
+                    event.outcome,
+                    CheckpointWriteOutcome::Written {
+                        stats: CheckpointWriteStats {
+                            bytes_written: 50,
+                            num_add_files: 1,
+                            num_remove_files: 0,
+                            num_actions: 5,
+                            num_sidecars: 1,
+                        }
                     }
-                }
-            );
-        }
+                );
+                (event.mode, event.duration)
+            }
+            (event, _) => panic!("unexpected checkpoint metric: {event:?}"),
+        };
+        assert_eq!(duration, Duration::from_nanos(duration_ns));
+        assert_eq!(mode, CheckpointWriteMode::V2WithSidecars);
     }
 
     #[test]

@@ -318,6 +318,7 @@ pub(crate) struct ActionReconciliationVisitor<'seen> {
     actions_count: i64,
     // i64 to match the `_last_checkpoint` file schema
     add_actions_count: i64,
+    // i64 to match the other action counters
     remove_actions_count: i64,
     // i64 for comparison with remove.deletionTimestamp
     minimum_file_retention_timestamp: i64,

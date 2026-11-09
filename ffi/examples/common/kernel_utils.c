@@ -551,20 +551,28 @@ void print_metric(MetricEvent event) {
     PM_END;
     return;
 
-  case MetricEventCheckpointWrite:
-    PM_START(CheckpointWrite);
-    CheckpointWrite cw = event.checkpoint_write;
-    printf("  outcome: %d,\n", cw.outcome.tag);
-    PM_U64(cw, mode);
-    PM_U64(cw, duration_ns);
-    if (cw.outcome.tag == CheckpointWriteOutcomeWritten) {
-      CheckpointWriteStats stats = cw.outcome.written.stats;
+  case MetricEventCheckpointWriteSuccess:
+    PM_START(CheckpointWriteSuccess);
+    CheckpointWriteSuccess cps = event.checkpoint_write_success;
+    printf("  outcome: %d,\n", cps.outcome.tag);
+    PM_U64(cps, mode);
+    PM_U64(cps, duration_ns);
+    if (cps.outcome.tag == CheckpointWriteOutcomeWritten) {
+      CheckpointWriteStats stats = cps.outcome.written.stats;
       PM_U64(stats, bytes_written);
       PM_U64(stats, num_add_files);
       PM_U64(stats, num_remove_files);
       PM_U64(stats, num_actions);
       PM_U64(stats, num_sidecars);
     }
+    PM_END;
+    return;
+
+  case MetricEventCheckpointWriteFailure:
+    PM_START(CheckpointWriteFailure);
+    CheckpointWriteFailure cpf = event.checkpoint_write_failure;
+    PM_U64(cpf, mode);
+    PM_U64(cpf, duration_ns);
     PM_END;
     return;
 
