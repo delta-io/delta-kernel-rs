@@ -145,8 +145,19 @@ fn get_field_id(field: &StructField) -> Option<i32> {
     }
 }
 
+/// Every stat of a leaf's stats struct with its field ID offset from the leaf's stats base, in
+/// field order.
+const STATS: [(&str, i32); 6] = [
+    (LOWER_BOUND, STATS_OFFSET_LOWER_BOUND),
+    (UPPER_BOUND, STATS_OFFSET_UPPER_BOUND),
+    (VALUE_COUNT, STATS_OFFSET_VALUE_COUNT),
+    (NULL_VALUE_COUNT, STATS_OFFSET_NULL_VALUE_COUNT),
+    (NAN_VALUE_COUNT, STATS_OFFSET_NAN_VALUE_COUNT),
+    (TOTAL_BYTES, STATS_OFFSET_TOTAL_BYTES),
+];
+
 /// Which Delta JSON stat categories a leaf appears in. Selects which sub-fields
-/// [`build_stats_struct`] emits under the projection (see there).
+/// [`build_stats_struct`] emits under the projection (see [`Self::backs`]).
 #[derive(Clone, Copy)]
 struct StatCategories {
     /// Present in `nullCount` -- backs `value_count`/`null_value_count`.
@@ -158,16 +169,24 @@ struct StatCategories {
 }
 
 impl StatCategories {
-    /// All three categories present: the unprojected case, keeping every type-eligible sub-field.
-    const ALL: StatCategories = StatCategories {
-        null_count: true,
-        min_values: true,
-        max_values: true,
-    };
-
     /// Whether the leaf appears in at least one category (i.e. survives the projection).
     fn any(&self) -> bool {
         self.null_count || self.min_values || self.max_values
+    }
+
+    /// Whether a leaf in these categories keeps `stat` under a projection:
+    /// `lower_bound`<-`minValues`, `upper_bound`<-`maxValues`,
+    /// `value_count`/`null_value_count`<-`nullCount`, `nan_value_count`<-either bound category.
+    /// `total_bytes` has no backing category, so it is never kept -- and `null_value_count`, though
+    /// independent of nullability, is not kept for a leaf absent from `nullCount`.
+    fn backs(&self, stat: &str) -> bool {
+        match stat {
+            LOWER_BOUND => self.min_values,
+            UPPER_BOUND => self.max_values,
+            VALUE_COUNT | NULL_VALUE_COUNT => self.null_count,
+            NAN_VALUE_COUNT => self.min_values || self.max_values,
+            _ => false,
+        }
     }
 }
 
@@ -183,13 +202,9 @@ impl StatCategories {
 /// `bounds_type` is the type the bounds are recorded at: the column's own type for primitives, or
 /// an unshredded variant type for variant columns.
 ///
-/// `categories` restricts the sub-fields to the Delta stat categories the leaf appears in. `None`
-/// (the unprojected path) keeps every type-eligible sub-field. When `Some`, a sub-field is kept
-/// only when a category backing it is present: `lower_bound`<-`minValues`,
-/// `upper_bound`<-`maxValues`, `value_count`/`null_value_count`<-`nullCount`,
-/// `nan_value_count`<-either bound category. `total_bytes` has no
-/// backing category and is dropped whenever projecting -- so `null_value_count`, though independent
-/// of nullability, is still dropped when the leaf is absent from `nullCount`.
+/// `categories` restricts the sub-fields to those backed by the Delta stat categories the leaf
+/// appears in (see [`StatCategories::backs`]). `None` (the unprojected path) keeps every
+/// type-eligible sub-field.
 fn build_stats_struct(
     base_field_id: i32,
     bounds_type: &DataType,
@@ -204,57 +219,15 @@ fn build_stats_struct(
         _ => (false, false),
     };
 
-    // With no projection (`None`), `StatCategories::ALL` makes every category check below `true`,
-    // keeping every type-eligible sub-field.
-    let projecting = categories.is_some();
-    let StatCategories {
-        null_count: has_null,
-        min_values: has_min,
-        max_values: has_max,
-    } = categories.unwrap_or(StatCategories::ALL);
-    let has_bounds = has_min || has_max;
-
-    // (name, type, offset, include) -- kept in declaration order to preserve field ordering.
-    let specs = [
-        (
-            LOWER_BOUND,
-            bounds_type.clone(),
-            STATS_OFFSET_LOWER_BOUND,
-            has_min,
-        ),
-        (
-            UPPER_BOUND,
-            bounds_type.clone(),
-            STATS_OFFSET_UPPER_BOUND,
-            has_max,
-        ),
-        (
-            VALUE_COUNT,
-            DataType::LONG,
-            STATS_OFFSET_VALUE_COUNT,
-            has_null,
-        ),
-        (
-            NULL_VALUE_COUNT,
-            DataType::LONG,
-            STATS_OFFSET_NULL_VALUE_COUNT,
-            has_null,
-        ),
-        (
-            NAN_VALUE_COUNT,
-            DataType::LONG,
-            STATS_OFFSET_NAN_VALUE_COUNT,
-            has_nan_count && has_bounds,
-        ),
-        (
-            TOTAL_BYTES,
-            DataType::LONG,
-            STATS_OFFSET_TOTAL_BYTES,
-            has_size_stats && !projecting,
-        ),
-    ];
-    let fields = specs.into_iter().filter_map(|(name, ty, offset, include)| {
-        include.then(|| field_with_id(name, ty, true, base_field_id + offset))
+    let fields = STATS.into_iter().filter_map(|(stat, offset)| {
+        let (data_type, type_eligible) = match stat {
+            LOWER_BOUND | UPPER_BOUND => (bounds_type.clone(), true),
+            NAN_VALUE_COUNT => (DataType::LONG, has_nan_count),
+            TOTAL_BYTES => (DataType::LONG, has_size_stats),
+            _ => (DataType::LONG, true),
+        };
+        let include = type_eligible && categories.is_none_or(|c| c.backs(stat));
+        include.then(|| field_with_id(stat, data_type, true, base_field_id + offset))
     });
 
     StructType::new_unchecked(fields)
