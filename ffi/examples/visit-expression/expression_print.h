@@ -102,8 +102,8 @@ void print_tree_helper(ExpressionItem ref, int depth) {
         case ArrayConstructor:
           printf("ArrayConstructor\n");
           break;
-        case Concat:
-          printf("Concat\n");
+        case StringConcat:
+          printf("StringConcat\n");
           break;
       }
       print_expression_item_list(var->exprs, depth + 1);

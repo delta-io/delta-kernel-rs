@@ -560,7 +560,7 @@ impl From<VariadicExpressionOp> for proto_expr::VariadicExpressionOp {
         match op {
             VariadicExpressionOp::Coalesce => proto_expr::VariadicExpressionOp::Coalesce,
             VariadicExpressionOp::Array => proto_expr::VariadicExpressionOp::Array,
-            VariadicExpressionOp::Concat => proto_expr::VariadicExpressionOp::Concat,
+            VariadicExpressionOp::StringConcat => proto_expr::VariadicExpressionOp::StringConcat,
         }
     }
 }
@@ -2025,7 +2025,10 @@ mod tests {
         proto_expr::VariadicExpressionOp::Coalesce
     )]
     #[case(VariadicExpressionOp::Array, proto_expr::VariadicExpressionOp::Array)]
-    #[case(VariadicExpressionOp::Concat, proto_expr::VariadicExpressionOp::Concat)]
+    #[case(
+        VariadicExpressionOp::StringConcat,
+        proto_expr::VariadicExpressionOp::StringConcat
+    )]
     fn from_variadic_expression_op(
         #[case] op: VariadicExpressionOp,
         #[case] expected: proto_expr::VariadicExpressionOp,
