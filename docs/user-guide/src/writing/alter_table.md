@@ -157,6 +157,18 @@ let result = snapshot
     .commit(&engine)?;
 ```
 
+Call `with_table_properties_removed` to drop application properties. Only non-`delta.*` keys may be
+removed; removing a missing key is not an error. Adding and removing the same key in one
+transaction is rejected.
+
+```rust,ignore
+let result = snapshot
+    .update_table(UpdateTableOperation::AlterTable, "my-app/1.0", /* data_change */ false)
+    .with_table_properties_removed(["app.owner"])
+    .build(&engine, Box::new(FileSystemCommitter::new()))?
+    .commit(&engine)?;
+```
+
 You can combine property updates with schema operations in one `ALTER TABLE` commit, or set
 properties on a data-changing write.
 

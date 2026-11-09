@@ -565,6 +565,21 @@ impl Metadata {
             .collect()
     }
 
+    /// Returns a new Metadata with the given configuration keys removed.
+    ///
+    /// Missing keys are ignored. All other configuration entries and metadata fields are
+    /// preserved.
+    #[internal_api]
+    pub(crate) fn with_configuration_keys_unset(
+        mut self,
+        keys: impl IntoIterator<Item = impl AsRef<str>>,
+    ) -> Self {
+        for key in keys {
+            self.configuration.remove(key.as_ref());
+        }
+        self
+    }
+
     #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new_unchecked(

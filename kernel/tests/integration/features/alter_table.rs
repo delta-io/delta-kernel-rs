@@ -2170,3 +2170,59 @@ async fn alter_table_rejects_feature_enabling_property() -> delta_kernel::Result
     assert_result_error_with_message(result, "Cannot modify the table property");
     Ok(())
 }
+
+#[tokio::test]
+async fn alter_table_property_removal_round_trips() -> delta_kernel::Result<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+    let snapshot = create_table_and_load_snapshot(
+        &table_path,
+        simple_schema(),
+        engine.as_ref(),
+        &[("app.owner", "kernel"), ("app.team", "delta")],
+    )?;
+
+    snapshot
+        .update_table(UpdateTableOperation::AlterTable, "test-engine", false)
+        .with_table_properties_removed(["app.owner"])
+        .with_table_properties_added([("app.region", "eu")])
+        .build(engine.as_ref(), committer())?
+        .commit(engine.as_ref())?
+        .unwrap_committed();
+
+    let reloaded = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
+    let props = reloaded.table_properties();
+    assert!(!props.unknown_properties.contains_key("app.owner"));
+    assert_eq!(
+        props.unknown_properties.get("app.team").map(String::as_str),
+        Some("delta")
+    );
+    assert_eq!(
+        props
+            .unknown_properties
+            .get("app.region")
+            .map(String::as_str),
+        Some("eu")
+    );
+    Ok(())
+}
+
+#[rstest]
+#[case::checkpoint_interval("delta.checkpointInterval")]
+#[case::feature_enabling("delta.enableTypeWidening")]
+#[case::mixed_case("DELTA.enableTypeWidening")]
+#[tokio::test]
+async fn alter_table_rejects_removing_delta_property(
+    #[case] key: &str,
+) -> delta_kernel::Result<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+    let snapshot =
+        create_table_and_load_snapshot(&table_path, simple_schema(), engine.as_ref(), &[])?;
+
+    let result = snapshot
+        .update_table(UpdateTableOperation::AlterTable, "test-engine", false)
+        .with_table_properties_removed([key])
+        .build(engine.as_ref(), committer());
+
+    assert_result_error_with_message(result, "Unsetting 'delta.' table properties");
+    Ok(())
+}

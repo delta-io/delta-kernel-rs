@@ -1,6 +1,6 @@
 //! Builder for transactions against an existing table.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::marker::PhantomData;
 
 use delta_kernel_derive::internal_api;
@@ -16,7 +16,9 @@ use crate::table_features::{
     IcebergCompatValidationContext, Operation, TableFeature, V2_VALIDATOR, V3_VALIDATOR,
     validate_iceberg_compat_if_needed,
 };
-use crate::table_properties::{is_delta_property_key, validate_and_normalize_property_for_update};
+use crate::table_properties::{
+    DELTA_PROPERTY_PREFIX, is_delta_property_key, validate_and_normalize_property_for_update,
+};
 use crate::transaction::domain_metadata::validate_unique_domains;
 use crate::transaction::schema_evolution::{SchemaOperation, evolve_table_config};
 use crate::transaction::{
@@ -65,13 +67,14 @@ pub struct UpdateTableBuilderState {
     operation: UpdateTableOperation,
     schema_changes: Option<Vec<SchemaOperation>>,
     properties_added: HashMap<String, String>,
+    properties_removed: HashSet<String>,
     domain_metadata_removals: Vec<String>,
     is_blind_append: bool,
 }
 
 impl UpdateTableBuilderState {
     fn has_property_changes(&self) -> bool {
-        !self.properties_added.is_empty()
+        !self.properties_added.is_empty() || !self.properties_removed.is_empty()
     }
 
     fn has_metadata_changes(&self) -> bool {
@@ -92,6 +95,10 @@ impl<MODE: ExecutionMode> std::fmt::Debug for TransactionBuilder<UpdateTable, MO
                 "properties_added_count",
                 &self.local_state.properties_added.len(),
             )
+            .field(
+                "properties_removed_count",
+                &self.local_state.properties_removed.len(),
+            )
             .finish()
     }
 }
@@ -110,6 +117,7 @@ impl TransactionBuilder<UpdateTable> {
                 operation,
                 schema_changes: None,
                 properties_added: HashMap::new(),
+                properties_removed: HashSet::new(),
                 domain_metadata_removals: Vec::new(),
                 is_blind_append: false,
             },
@@ -160,6 +168,23 @@ impl<MODE: ExecutionMode> TransactionBuilder<UpdateTable, MODE> {
             }
             self.local_state.properties_added.insert(key, value);
         }
+        self
+    }
+
+    /// Removes table properties from the metadata configuration.
+    ///
+    /// Only non-`delta.*` application properties may be removed. Removing a key that is not present
+    /// is not an error. Repeated calls accumulate keys. Adding and removing the same key in one
+    /// transaction is rejected during [`build`](Self::build). Removals are applied during
+    /// [`build`](Self::build) and cause a Metadata action to be emitted.
+    pub fn with_table_properties_removed<I, K>(mut self, keys: I) -> Self
+    where
+        I: IntoIterator<Item = K>,
+        K: Into<String>,
+    {
+        self.local_state
+            .properties_removed
+            .extend(keys.into_iter().map(Into::into));
         self
     }
 
@@ -320,6 +345,11 @@ impl<MODE: ExecutionMode> TransactionBuilder<UpdateTable, MODE> {
                 "blind append cannot include property changes",
             ));
         }
+        validate_properties_removed_keys(&self.local_state.properties_removed)?;
+        validate_properties_added_removed_no_overlap(
+            &self.local_state.properties_added,
+            &self.local_state.properties_removed,
+        )?;
 
         let removals = validate_unique_domains(
             self.local_state
@@ -361,6 +391,7 @@ fn try_new_update_table<MODE: ExecutionMode>(
         operation,
         schema_changes,
         properties_added,
+        properties_removed,
         domain_metadata_removals,
         is_blind_append,
     } = local_state;
@@ -405,6 +436,7 @@ fn try_new_update_table<MODE: ExecutionMode>(
         IcebergCompatValidationContext::Write,
     )?;
 
+    let has_property_removes = !properties_removed.is_empty();
     let has_schema_changes = schema_changes.is_some();
     let effective_table_config = match schema_changes {
         Some(changes) => apply_schema_changes(effective_table_config, changes)?,
@@ -420,8 +452,8 @@ fn try_new_update_table<MODE: ExecutionMode>(
             .metadata()
             .filter_out_unchanged_properties(validated)
     };
-    let has_property_changes = !properties_added.is_empty();
-    let should_emit_metadata = has_schema_changes || has_property_changes;
+    let has_property_adds = !properties_added.is_empty();
+    let should_emit_metadata = has_schema_changes || has_property_adds || has_property_removes;
     // validate() treats any requested property add as a table change. After dropping identical
     // values, an ALTER TABLE may have nothing left to apply.
     if operation == UpdateTableOperation::AlterTable && !should_emit_metadata {
@@ -429,8 +461,13 @@ fn try_new_update_table<MODE: ExecutionMode>(
             "ALTER TABLE requires at least one table change",
         ));
     }
-    let effective_table_config = if has_property_changes {
+    let effective_table_config = if has_property_adds {
         apply_table_properties_added(effective_table_config, properties_added)?
+    } else {
+        effective_table_config
+    };
+    let effective_table_config = if has_property_removes {
+        apply_table_properties_removed(effective_table_config, properties_removed)?
     } else {
         effective_table_config
     };
@@ -494,6 +531,18 @@ fn apply_table_properties_added(
     TableConfiguration::try_new_with_schema(&table_config, metadata, table_config.logical_schema())
 }
 
+/// Removes `properties_removed` keys from `table_config`'s metadata. Missing keys are ignored.
+fn apply_table_properties_removed(
+    table_config: TableConfiguration,
+    properties_removed: HashSet<String>,
+) -> KernelResult<TableConfiguration> {
+    let metadata = table_config
+        .metadata()
+        .clone()
+        .with_configuration_keys_unset(properties_removed);
+    TableConfiguration::try_new_with_schema(&table_config, metadata, table_config.logical_schema())
+}
+
 fn validate_and_canonicalize_properties_added(
     properties_added: HashMap<String, String>,
 ) -> KernelResult<HashMap<String, String>> {
@@ -503,6 +552,38 @@ fn validate_and_canonicalize_properties_added(
         validated.insert(canonical_key, value);
     }
     Ok(validated)
+}
+
+fn validate_properties_removed_keys(properties_removed: &HashSet<String>) -> KernelResult<()> {
+    if let Some(key) = properties_removed
+        .iter()
+        .find(|key| is_delta_property_key(key))
+    {
+        return Err(KernelError::generic(format!(
+            "Unsetting '{DELTA_PROPERTY_PREFIX}' table properties is currently unsupported \
+             (requested '{key}')"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_properties_added_removed_no_overlap(
+    properties_added: &HashMap<String, String>,
+    properties_removed: &HashSet<String>,
+) -> KernelResult<()> {
+    let mut overlapping: Vec<&str> = properties_removed
+        .iter()
+        .filter(|key| properties_added.contains_key(key.as_str()))
+        .map(String::as_str)
+        .collect();
+    if overlapping.is_empty() {
+        return Ok(());
+    }
+    overlapping.sort_unstable();
+    Err(KernelError::generic(format!(
+        "Cannot set and unset the same table property in the same transaction. \
+         Properties set and unset: {overlapping:?}"
+    )))
 }
 
 #[cfg(test)]
@@ -893,6 +974,131 @@ mod tests {
             after.get("delta.checkpointInterval").map(String::as_str),
             Some("42")
         );
+        Ok(())
+    }
+
+    #[test]
+    fn with_table_properties_removed_unsets_user_property_and_keeps_protocol() -> Result<()> {
+        let engine = Arc::new(SyncEngine::new_with_store(Arc::new(InMemory::new())));
+        let snapshot = create_table("memory:///", test_schema_flat(), "test-engine", true)
+            .with_table_properties([
+                ("app.owner", "kernel"),
+                ("app.team", "delta"),
+                ("delta.enableChangeDataFeed", "true"),
+            ])
+            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+            .commit(engine.as_ref())?
+            .unwrap_post_commit_snapshot();
+        let protocol_before = snapshot.table_configuration().protocol().clone();
+
+        let transaction = snapshot
+            .update_table(UpdateTableOperation::AlterTable, "test-engine", false)
+            .with_table_properties_removed(["app.owner"])
+            .with_table_properties_added([("app.region", "eu")])
+            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
+
+        let after = transaction
+            .effective_table_config
+            .metadata()
+            .configuration();
+        assert!(transaction.should_emit_metadata);
+        assert!(!after.contains_key("app.owner"));
+        assert_eq!(after.get("app.team").map(String::as_str), Some("delta"));
+        assert_eq!(after.get("app.region").map(String::as_str), Some("eu"));
+        assert_eq!(
+            transaction.effective_table_config.protocol(),
+            &protocol_before
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn with_table_properties_removed_matches_ordinary_keys_case_sensitively() -> Result<()> {
+        let (engine, snapshot, _tempdir) = load_test_table("table-without-dv-small")?;
+        let transaction = snapshot
+            .update_table(UpdateTableOperation::AlterTable, "test-engine", false)
+            .with_table_properties_added([("app.owner", "kernel")])
+            .with_table_properties_removed(["App.Owner"])
+            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
+
+        assert_eq!(
+            transaction
+                .effective_table_config
+                .metadata()
+                .configuration()
+                .get("app.owner")
+                .map(String::as_str),
+            Some("kernel")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn with_table_properties_removed_missing_key_still_emits_metadata() -> Result<()> {
+        let (engine, snapshot, _tempdir) = load_test_table("table-without-dv-small")?;
+        let transaction = snapshot
+            .update_table(UpdateTableOperation::AlterTable, "test-engine", false)
+            .with_table_properties_removed(["app.missing"])
+            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
+
+        assert!(transaction.should_emit_metadata);
+        assert!(
+            !transaction
+                .effective_table_config
+                .metadata()
+                .configuration()
+                .contains_key("app.missing")
+        );
+        Ok(())
+    }
+
+    #[rstest]
+    #[case::delta_property("delta.checkpointInterval", "Unsetting 'delta.' table properties")]
+    #[case::feature_enabling_delta_property(
+        "delta.enableTypeWidening",
+        "Unsetting 'delta.' table properties"
+    )]
+    #[case::delta_property_mixed_case(
+        "DELTA.enableTypeWidening",
+        "Unsetting 'delta.' table properties"
+    )]
+    #[case::overlap_with_add("app.owner", "Cannot set and unset the same table property")]
+    fn with_table_properties_removed_rejects_invalid_keys(
+        #[case] key: &str,
+        #[case] expected: &str,
+    ) -> Result<()> {
+        let (engine, snapshot, _tempdir) = load_test_table("table-without-dv-small")?;
+        let mut builder = snapshot
+            .update_table(UpdateTableOperation::AlterTable, "test-engine", false)
+            .with_table_properties_removed([key]);
+        if key == "app.owner" {
+            builder = builder.with_table_properties_added([("app.owner", "kernel")]);
+        }
+        let error = builder
+            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))
+            .unwrap_err();
+        assert!(
+            error.to_string().contains(expected),
+            "error={error}, expected={expected}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn blind_append_rejects_property_removals() -> Result<()> {
+        let (engine, snapshot, _tempdir) = load_test_table("table-without-dv-small")?;
+        let error = snapshot
+            .update_table(UpdateTableOperation::Write, "test-engine", true)
+            .with_blind_append()
+            .with_table_properties_removed(["app.owner"])
+            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))
+            .unwrap_err();
+
+        assert!(matches!(
+            &error,
+            KernelError::InvalidTransactionState(message)
+            if message == "blind append cannot include property changes"
+        ));
         Ok(())
     }
 
