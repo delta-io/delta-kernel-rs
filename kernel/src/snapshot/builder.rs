@@ -803,16 +803,22 @@ pub(super) mod tests {
         let path = Path::from("_delta_log/00000000000000000000.json");
         store.put(&path, commit0_data.into()).await?;
 
-        // Try to build a snapshot and expect a clear error message
-        let result = SnapshotBuilder::new_for(table_root.clone()).build(engine);
-        assert!(result.is_err());
-
-        let err = result.unwrap_err();
-        let err_msg = err.to_string();
-        assert!(
-            err_msg.contains("Unsupported Delta table type: 'interval year to second'"),
-            "Expected clear error message about unsupported type, got: {err_msg}"
+        let Error::Delta(error) = SnapshotBuilder::new_for(table_root)
+            .build(engine)
+            .unwrap_err()
+        else {
+            panic!("expected Delta error");
+        };
+        assert_eq!(
+            error.condition(),
+            DeltaErrorCondition::DeltaParsingUnsupportedDataType
         );
+        assert_eq!(error.parameters()[0].value(), "interval year to second");
+        let source = std::error::Error::source(&error)
+            .unwrap()
+            .downcast_ref::<KernelError>()
+            .unwrap();
+        assert!(matches!(source.without_backtrace(), KernelError::Schema(_)));
 
         Ok(())
     }

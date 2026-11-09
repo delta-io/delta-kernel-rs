@@ -4,7 +4,7 @@ use std::backtrace::Backtrace;
 use std::error::Error as StdError;
 use std::fmt;
 
-use super::DeltaErrorCondition;
+use super::{BoxedError, DeltaErrorCondition};
 #[cfg(any(test, feature = "test-utils"))]
 use crate::KernelResult;
 use crate::schema::StructType;
@@ -27,7 +27,7 @@ use crate::{KernelError, Version};
 pub struct DeltaError {
     condition: DeltaErrorCondition,
     parameters: Box<[DeltaErrorParameter]>,
-    source: Option<Box<dyn StdError + Send + Sync + 'static>>,
+    source: Option<BoxedError>,
     backtrace: Backtrace,
 }
 
@@ -50,7 +50,7 @@ impl DeltaError {
     pub fn for_test(
         condition: DeltaErrorCondition,
         values: &[&str],
-        source: Option<Box<dyn StdError + Send + Sync + 'static>>,
+        source: Option<BoxedError>,
     ) -> KernelResult<Self> {
         let names = condition.parameter_names();
         if names.len() != values.len() {
@@ -122,10 +122,7 @@ impl DeltaError {
     /// let source = error.source().unwrap().downcast_ref::<io::Error>().unwrap();
     /// assert_eq!(source.kind(), io::ErrorKind::NotFound);
     /// ```
-    pub fn path_does_not_exist(
-        path: &str,
-        source: Option<Box<dyn StdError + Send + Sync + 'static>>,
-    ) -> Self {
+    pub fn path_does_not_exist(path: &str, source: Option<BoxedError>) -> Self {
         Self::new(
             DeltaErrorCondition::DeltaPathDoesNotExist,
             vec![DeltaErrorParameter::new("path", path)],
@@ -140,7 +137,7 @@ impl DeltaError {
         start_version: Version,
         end_version: Version,
         version_to_load: Version,
-        source: Option<Box<dyn StdError + Send + Sync + 'static>>,
+        source: Option<BoxedError>,
     ) -> Self {
         let versions = versions
             .into_iter()
@@ -165,7 +162,7 @@ impl DeltaError {
         version: Version,
         checkpoint_version: Version,
         log_path: impl ToString,
-        source: Option<Box<dyn StdError + Send + Sync + 'static>>,
+        source: Option<BoxedError>,
     ) -> Self {
         Self::new(
             DeltaErrorCondition::DeltaLogFileNotFound,
@@ -179,10 +176,7 @@ impl DeltaError {
     }
 
     /// Reports an invalid signed version from a catalog response, retaining its validation cause.
-    pub fn invalid_version(
-        version: i64,
-        source: Option<Box<dyn StdError + Send + Sync + 'static>>,
-    ) -> Self {
+    pub fn invalid_version(version: i64, source: Option<BoxedError>) -> Self {
         Self::new(
             DeltaErrorCondition::DeltaVersionInvalid,
             vec![DeltaErrorParameter::new("version", version)],
@@ -191,10 +185,7 @@ impl DeltaError {
     }
 
     /// Reports the duplicate partition column `name` stored in table metadata.
-    pub fn duplicate_partition_column(
-        name: &str,
-        source: Option<Box<dyn StdError + Send + Sync + 'static>>,
-    ) -> Self {
+    pub fn duplicate_partition_column(name: &str, source: Option<BoxedError>) -> Self {
         Self::new(
             DeltaErrorCondition::DeltaDuplicateColumnsFoundPartitionColumns,
             vec![DeltaErrorParameter::new("duplicateCols", name)],
@@ -206,7 +197,7 @@ impl DeltaError {
     pub fn partition_column_not_found(
         column: &str,
         schema: &StructType,
-        source: Option<Box<dyn StdError + Send + Sync + 'static>>,
+        source: Option<BoxedError>,
     ) -> Self {
         Self::new(
             DeltaErrorCondition::DeltaPartitionColumnNotFound,
@@ -221,10 +212,7 @@ impl DeltaError {
     /// Reports the explicitly stored column-mapping `mode` incompatible with adaptive metadata.
     /// Accepts a [`crate::table_features::ColumnMappingMode`] or an unrecognized stored value.
     /// `source` retains the protocol validation failure for diagnostics.
-    pub fn adaptive_metadata_mapping_mode(
-        mode: impl ToString,
-        source: Option<Box<dyn StdError + Send + Sync + 'static>>,
-    ) -> Self {
+    pub fn adaptive_metadata_mapping_mode(mode: impl ToString, source: Option<BoxedError>) -> Self {
         Self::new(
             DeltaErrorCondition::DeltaAdaptiveMetadataRequiresColumnMappingIdMode,
             vec![
@@ -238,13 +226,19 @@ impl DeltaError {
 
     /// Reports a duplicate logical field `name` in the persisted table schema.
     /// `source` retains the schema decoder's original failure and location.
-    pub fn duplicate_schema_field(
-        name: &str,
-        source: Option<Box<dyn StdError + Send + Sync + 'static>>,
-    ) -> Self {
+    pub fn duplicate_schema_field(name: &str, source: Option<BoxedError>) -> Self {
         Self::new(
             DeltaErrorCondition::DeltaDuplicateColumnsFoundExistingSchema,
             vec![DeltaErrorParameter::new("duplicateCols", name)],
+            source,
+        )
+    }
+
+    /// Reports an unsupported persisted type token `name`, retaining the legacy schema `source`.
+    pub fn unsupported_schema_type(name: &str, source: Option<BoxedError>) -> Self {
+        Self::new(
+            DeltaErrorCondition::DeltaParsingUnsupportedDataType,
+            vec![DeltaErrorParameter::new("dataType", name)],
             source,
         )
     }
@@ -265,7 +259,7 @@ impl DeltaError {
     fn new(
         condition: DeltaErrorCondition,
         parameters: Vec<DeltaErrorParameter>,
-        source: Option<Box<dyn StdError + Send + Sync + 'static>>,
+        source: Option<BoxedError>,
     ) -> Self {
         debug_assert!(
             parameters
@@ -294,7 +288,7 @@ impl DeltaError {
 #[error("{context}")]
 struct DiagnosticContext {
     context: String,
-    source: Option<Box<dyn StdError + Send + Sync + 'static>>,
+    source: Option<BoxedError>,
 }
 
 /// Renders the catalog message, inserting parameter values verbatim.
@@ -380,7 +374,9 @@ mod tests {
     use rstest::rstest;
 
     use super::{DeltaError, DeltaErrorParameter, render_template};
-    use crate::{DeltaErrorCondition, Error, Result};
+    use crate::schema::StructType;
+    use crate::table_features::ColumnMappingMode;
+    use crate::{BoxedError, DeltaErrorCondition, Error, KernelError, Result};
 
     struct LimitedWriter {
         remaining_bytes: usize,
@@ -393,6 +389,54 @@ mod tests {
                 .checked_sub(text.len())
                 .ok_or(fmt::Error)?;
             Ok(())
+        }
+    }
+
+    #[rstest]
+    #[case::missing_path(|source| DeltaError::path_does_not_exist("table", source))]
+    #[case::version_gap(|source| DeltaError::versions_not_contiguous([0, 2], 0, 2, 2, source))]
+    #[case::missing_log(|source| DeltaError::log_file_not_found(2, 0, "table/_delta_log", source))]
+    #[case::invalid_version(|source| DeltaError::invalid_version(-1, source))]
+    #[case::duplicate_partition(|source| DeltaError::duplicate_partition_column("p", source))]
+    #[case::missing_partition(|source| DeltaError::partition_column_not_found(
+        "p", &StructType::try_new([]).unwrap(), source
+    ))]
+    #[case::adaptive_metadata(|source| DeltaError::adaptive_metadata_mapping_mode(
+        ColumnMappingMode::Name, source
+    ))]
+    #[case::duplicate_schema_field(|source| DeltaError::duplicate_schema_field("a", source))]
+    #[case::unsupported_type(|source| DeltaError::unsupported_schema_type("unknown", source))]
+    fn constructors_preserve_metadata_with_optional_sources(
+        #[case] make_error: fn(Option<BoxedError>) -> DeltaError,
+        #[values("none", "kernel", "io")] source_kind: &str,
+    ) {
+        let without_source = make_error(None);
+        let source: Option<BoxedError> = match source_kind {
+            "none" => None,
+            "kernel" => Some(Box::new(KernelError::generic("original cause"))),
+            "io" => Some(Box::new(io::Error::from(io::ErrorKind::NotFound))),
+            _ => unreachable!(),
+        };
+        let error = make_error(source);
+        assert_eq!(error.condition(), without_source.condition());
+        assert_eq!(error.parameters(), without_source.parameters());
+        assert_eq!(error.message(), without_source.message());
+        match source_kind {
+            "kernel" => assert!(matches!(
+                error.source().unwrap().downcast_ref::<KernelError>(),
+                Some(KernelError::Generic(message)) if message == "original cause"
+            )),
+            "io" => assert_eq!(
+                error
+                    .source()
+                    .unwrap()
+                    .downcast_ref::<io::Error>()
+                    .unwrap()
+                    .kind(),
+                io::ErrorKind::NotFound
+            ),
+            "none" => assert!(error.source().is_none()),
+            _ => unreachable!(),
         }
     }
 
@@ -562,10 +606,7 @@ mod tests {
         );
     }
 
-    fn version_gap_error(
-        version_list: &str,
-        source: Option<Box<dyn StdError + Send + Sync + 'static>>,
-    ) -> DeltaError {
+    fn version_gap_error(version_list: &str, source: Option<BoxedError>) -> DeltaError {
         DeltaError::new(
             DeltaErrorCondition::DeltaVersionsNotContiguous,
             vec![
