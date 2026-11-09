@@ -17,7 +17,7 @@ use crate::snapshot::builder::tests::measuring_reporter;
 use crate::unit_test_utils::adaptive_metadata_fixtures::{
     checkpoint_line, setup_adaptive_metadata_table, write_ict_commit, write_sidecar,
 };
-use crate::unit_test_utils::{Action, is_read_io_event};
+use crate::unit_test_utils::{Action, is_io_event};
 use crate::{Snapshot, SnapshotRef, Version};
 
 /// The version [`table_with_checkpoint_action`] commits its checkpoint action at.
@@ -101,6 +101,7 @@ fn checkpoint_action(snapshot: &Snapshot) -> CheckpointAction {
 fn newer_catalog_bound_preserves_populated_adaptive_metadata_caches(
     #[values(None, Some(CHECKPOINT_VERSION + 1))] crc_version: Option<Version>,
 ) {
+    // GIVEN a latest snapshot with populated adaptive-metadata caches and an optional CRC.
     let (engine, source) = table_with_checkpoint_action(
         "",
         |_, _, snapshot| checkpoint_action(snapshot),
@@ -112,11 +113,13 @@ fn newer_catalog_bound_preserves_populated_adaptive_metadata_caches(
     let engine = MeteredDeltaEngine::new(Arc::new(engine));
     let (reporter, _guard) = measuring_reporter();
 
+    // WHEN the same version is requested with a newer catalog bound.
     let historical = Snapshot::builder_from(source.clone())
         .at_version(source.version())
         .with_max_catalog_version(source.version() + 1)
         .build(&engine)
         .unwrap();
+    // THEN only the result's freshness changes, preserving the populated caches without I/O.
     assert!(!historical.is_built_as_latest());
     assert!(source.is_built_as_latest());
     assert!(Arc::ptr_eq(
@@ -129,7 +132,7 @@ fn newer_catalog_bound_preserves_populated_adaptive_metadata_caches(
         &checkpoint,
     ));
     assert_eq!(historical.last_manifest_commit.get(), Some(&Some(manifest)));
-    assert!(!reporter.events().iter().any(is_read_io_event));
+    assert!(!reporter.events().iter().any(is_io_event));
 }
 
 fn txn(app_id: &str, version: i64) -> SetTransaction {

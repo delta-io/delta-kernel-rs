@@ -201,6 +201,8 @@ impl Snapshot {
         .inspect_err(|_| emit_log_segment_load_failure(metric_context))?
         {
             NewSegment::Unchanged => {
+                // The builder reaches this branch without an effective target: neither an
+                // explicit version nor a catalog bound can contradict the latest claim.
                 let built_as_latest = existing_snapshot.built_as_latest || built_as_latest;
                 return Ok(Self::reuse_with_build_metadata(
                     &existing_snapshot,
