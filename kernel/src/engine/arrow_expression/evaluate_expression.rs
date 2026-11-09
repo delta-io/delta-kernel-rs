@@ -48,6 +48,7 @@ use crate::expressions::{
 };
 use crate::schema::{DataType, PrimitiveType, StructField, StructType};
 use crate::uri_reference::{scheme_len, uri_encode_location};
+use crate::utils::require;
 
 #[internal_api]
 pub(crate) trait ProvidesColumnByName {
@@ -324,13 +325,7 @@ pub fn evaluate_expression(
                 ToJson | UriEncodeLocation => DataType::STRING,
                 Cardinality => DataType::INTEGER,
             };
-            if let Some(expected) = result_type
-                && *expected != output_type
-            {
-                return Err(KernelError::invalid_expression(format!(
-                    "{op} operator produces {output_type}, but caller expects {expected}"
-                )));
-            }
+            require_output_type(op, &output_type, result_type)?;
             let input = evaluate_expression(expr, batch, None)?;
             match op {
                 ToJson => Ok(to_json(&input)?),
@@ -377,6 +372,10 @@ pub fn evaluate_expression(
         }
         (Variadic(VariadicExpression { op: Array, exprs }), result_type) => {
             evaluate_array_expression(exprs, batch, result_type)
+        }
+        (Variadic(VariadicExpression { op: Concat, exprs }), result_type) => {
+            require_output_type(Concat, &DataType::STRING, result_type)?;
+            evaluate_concat(exprs, batch)
         }
         (Opaque(OpaqueExpression { op, exprs }), _) => {
             match op
@@ -887,6 +886,55 @@ pub fn evaluate_predicate(
             "Unknown predicate: {name:?}"
         ))),
     }
+}
+
+/// Fails fast when the caller requests a type other than the fixed `output_type` of `op`.
+fn require_output_type(
+    op: impl Display,
+    output_type: &DataType,
+    requested: Option<&DataType>,
+) -> KernelResult<()> {
+    match requested {
+        Some(requested) if requested != output_type => Err(KernelError::invalid_expression(
+            format!("{op} operator produces {output_type}, but caller expects {requested}"),
+        )),
+        _ => Ok(()),
+    }
+}
+
+/// Evaluates [`VariadicExpressionOp::Concat`]: row-wise concatenation, NULL if any input is NULL.
+fn evaluate_concat(exprs: &[Expression], batch: &RecordBatch) -> KernelResult<ArrayRef> {
+    require!(
+        !exprs.is_empty(),
+        KernelError::invalid_expression("CONCAT requires at least one input")
+    );
+    let inputs = exprs
+        .iter()
+        .map(|expr| evaluate_expression(expr, batch, None))
+        .try_collect::<_, Vec<_>, _>()?;
+    let columns = inputs
+        .iter()
+        .map(|input| map_string_rows(input, "Concat", |row| row))
+        .try_collect::<_, Vec<_>, _>()?;
+    let mut total_len = 0usize;
+    let rows = (0..batch.num_rows())
+        .map(|row| {
+            let parts: Option<Vec<&str>> = columns.iter().map(|column| column[row]).collect();
+            parts.map(|parts| {
+                let value = parts.concat();
+                total_len += value.len();
+                value
+            })
+        })
+        .collect_vec();
+    // Arrow panics rather than errors when string offsets overflow.
+    require!(
+        i32::try_from(total_len).is_ok(),
+        KernelError::invalid_expression(format!(
+            "Concat output of {total_len} bytes does not fit in one string array"
+        ))
+    );
+    Ok(Arc::new(StringArray::from_iter(rows)))
 }
 
 /// [`map_string_rows`] collected into a Utf8 array, whatever the input representation.
@@ -2335,6 +2383,45 @@ mod tests {
         assert_eq!(
             result.as_primitive::<Int32Type>(),
             &Int32Array::from(expected)
+        );
+    }
+
+    #[rstest]
+    #[case::two_strings(vec![lit("s3://b/"), col!("s")], vec![Some("s3://b/a"), None, Some("s3://b/")])]
+    #[case::single_input(vec![col!("s")], vec![Some("a"), None, Some("")])]
+    #[case::null_literal(vec![col!("s"), null_lit(DataType::STRING)], vec![None, None, None])]
+    fn test_concat(
+        #[values(
+            |s| Arc::new(StringArray::from(s)) as ArrayRef,
+            |s| Arc::new(LargeStringArray::from(s)) as ArrayRef,
+            |s| Arc::new(StringViewArray::from(s)) as ArrayRef
+        )]
+        make_array: fn(Vec<Option<&'static str>>) -> ArrayRef,
+        #[case] inputs: Vec<Expr>,
+        #[case] expected: Vec<Option<&str>>,
+        #[values(None, Some(&DataType::STRING))] result_type: Option<&'static DataType>,
+    ) {
+        let column = make_array(vec![Some("a"), None, Some("")]);
+        let batch = RecordBatch::try_from_iter([("s", column)]).unwrap();
+        let result = evaluate_expression(&Expr::concat(inputs), &batch, result_type).unwrap();
+        assert_eq!(result.as_string::<i32>(), &StringArray::from(expected));
+    }
+
+    #[rstest]
+    #[case::no_inputs(Expr::concat(Vec::<Expr>::new()), None)]
+    #[case::non_string_input(Expr::concat([col!("n")]), None)]
+    #[case::non_string_output(Expr::concat([lit("a")]), Some(DataType::INTEGER))]
+    fn test_concat_rejects_invalid_expression(
+        #[case] expr: Expr,
+        #[case] result_type: Option<DataType>,
+    ) {
+        let batch =
+            RecordBatch::try_from_iter([("n", Arc::new(Int32Array::from(vec![1])) as ArrayRef)])
+                .unwrap();
+        let err = evaluate_expression(&expr, &batch, result_type.as_ref()).unwrap_err();
+        assert!(
+            matches!(err, KernelError::InvalidExpressionEvaluation(_)),
+            "{err}"
         );
     }
 
