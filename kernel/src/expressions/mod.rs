@@ -178,6 +178,14 @@ pub enum UnaryExpressionOp {
     /// URI_ENCODE_PATH('data/a%20b.parquet')       -- 'data/a%2520b.parquet'
     /// ```
     UriEncodePath,
+    /// SQL `cardinality`: the number of elements in an ARRAY, as INTEGER. NULL elements count, a
+    /// NULL array yields NULL, and other input types are an error.
+    ///
+    /// ```text
+    /// CARDINALITY(ARRAY(1, NULL, 3))  -- 3
+    /// CARDINALITY(ARRAY())            -- 0
+    /// ```
+    Cardinality,
 }
 
 /// A binary arithmetic operator over two numeric operands.
@@ -1274,6 +1282,7 @@ impl Display for UnaryExpressionOp {
         match self {
             ToJson => write!(f, "TO_JSON"),
             UriEncodePath => write!(f, "URI_ENCODE_PATH"),
+            Cardinality => write!(f, "CARDINALITY"),
         }
     }
 }
@@ -1532,6 +1541,10 @@ mod tests {
                 "URI_ENCODE_PATH(Column(x))",
             ),
             (
+                Expr::unary(UnaryExpressionOp::Cardinality, col!("x")),
+                "CARDINALITY(Column(x))",
+            ),
+            (
                 Expr::case_when([(col!("x").is_null(), lit(0))], col!("x")),
                 "CASE WHEN Column(x) IS NULL THEN 0 ELSE Column(x) END",
             ),
@@ -1745,7 +1758,11 @@ mod tests {
 
         #[rstest::rstest]
         fn test_unary_expression_roundtrip(
-            #[values(UnaryExpressionOp::ToJson, UnaryExpressionOp::UriEncodePath)]
+            #[values(
+                UnaryExpressionOp::ToJson,
+                UnaryExpressionOp::UriEncodePath,
+                UnaryExpressionOp::Cardinality
+            )]
             op: UnaryExpressionOp,
         ) {
             assert_roundtrip(&Expression::unary(op, col!("data")));

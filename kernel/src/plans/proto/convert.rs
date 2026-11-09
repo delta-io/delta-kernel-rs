@@ -537,6 +537,7 @@ impl From<UnaryExpressionOp> for proto_expr::UnaryExpressionOp {
         match op {
             UnaryExpressionOp::ToJson => proto_expr::UnaryExpressionOp::ToJson,
             UnaryExpressionOp::UriEncodePath => proto_expr::UnaryExpressionOp::UriEncodePath,
+            UnaryExpressionOp::Cardinality => proto_expr::UnaryExpressionOp::Cardinality,
         }
     }
 }
@@ -1985,6 +1986,10 @@ mod tests {
     #[case(
         UnaryExpressionOp::UriEncodePath,
         proto_expr::UnaryExpressionOp::UriEncodePath
+    )]
+    #[case(
+        UnaryExpressionOp::Cardinality,
+        proto_expr::UnaryExpressionOp::Cardinality
     )]
     fn from_unary_expression_op(
         #[case] op: UnaryExpressionOp,

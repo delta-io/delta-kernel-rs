@@ -76,7 +76,7 @@ enum VariadicType {
   Coalesce,
   ArrayConstructor,
 };
-enum UnaryType { Not, IsNull, HasUriScheme, UriEncodePath };
+enum UnaryType { Not, IsNull, HasUriScheme, UriEncodePath, Cardinality };
 typedef struct {
   void* ref;
   enum ExpressionType type;
@@ -497,6 +497,7 @@ void visit_expr_unary(void* data,
 DEFINE_UNARY(visit_expr_is_null, IsNull)
 DEFINE_UNARY(visit_expr_has_uri_scheme, HasUriScheme)
 DEFINE_UNARY(visit_expr_uri_encode_path, UriEncodePath)
+DEFINE_UNARY(visit_expr_cardinality, Cardinality)
 DEFINE_UNARY(visit_expr_not, Not)
 #undef DEFINE_UNARY
 
@@ -562,6 +563,7 @@ ExpressionItemList construct_expression(SharedExpression* expression) {
     .visit_is_null = visit_expr_is_null,
     .visit_has_uri_scheme = visit_expr_has_uri_scheme,
     .visit_uri_encode_path = visit_expr_uri_encode_path,
+    .visit_cardinality = visit_expr_cardinality,
     .visit_lt = visit_expr_lt,
     .visit_gt = visit_expr_gt,
     .visit_eq = visit_expr_eq,
@@ -618,6 +620,7 @@ ExpressionItemList construct_predicate(SharedPredicate* predicate) {
     .visit_is_null = visit_expr_is_null,
     .visit_has_uri_scheme = visit_expr_has_uri_scheme,
     .visit_uri_encode_path = visit_expr_uri_encode_path,
+    .visit_cardinality = visit_expr_cardinality,
     .visit_lt = visit_expr_lt,
     .visit_gt = visit_expr_gt,
     .visit_eq = visit_expr_eq,
