@@ -37,6 +37,8 @@ pub(crate) mod compare;
 pub(crate) mod diff;
 pub(crate) mod generated_column;
 pub use generated_column::GeneratedColumn;
+mod metadata_key;
+pub use metadata_key::MetadataKey;
 
 pub(crate) mod collation_utils;
 #[cfg(feature = "internal-api")]
@@ -232,15 +234,19 @@ impl Display for MetadataValue {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, strum::AsRefStr, strum::EnumString, strum::IntoStaticStr)]
+#[cfg_attr(test, derive(strum::EnumIter))]
 pub enum ColumnMetadataKey {
     /// Collation identifiers keyed by field-relative path, stored as a JSON object.
     ///
     /// Kernel preserves these identifiers; string predicates use UTF-8 binary semantics.
     /// See [`ScanBuilder::with_predicate`](crate::scan::ScanBuilder::with_predicate) and the
     /// [collation RFC](https://github.com/delta-io/delta/blob/master/protocol_rfcs/collated-string-type.md).
+    #[strum(serialize = "__COLLATIONS")]
     Collations,
+    #[strum(serialize = "delta.columnMapping.id")]
     ColumnMappingId,
+    #[strum(serialize = "delta.columnMapping.physicalName")]
     ColumnMappingPhysicalName,
     /// Parquet field IDs for the synthesized `element` / `key` / `value` fields of an Array or
     /// Map. Stored on the *nearest ancestor* StructField as a JSON object whose keys are
@@ -260,49 +266,39 @@ pub enum ColumnMetadataKey {
     ///   }
     /// }
     /// ```
+    #[strum(serialize = "delta.columnMapping.nested.ids")]
     ColumnMappingNestedIds,
+    // "parquet.field.id" is not defined by the Delta protocol, but follows the convention
+    // established by delta-spark and other Delta ecosystem implementations for storing
+    // Parquet field IDs in StructField metadata.
+    #[strum(serialize = "parquet.field.id")]
     ParquetFieldId,
+    // The Delta protocol defines this key for IcebergCompatV2/V3 nested field ids. It is
+    // legacy and will be replaced by `delta.columnMapping.nested.ids` (which kernel
+    // uses everywhere). Kept here for protocol compatibility only.
+    // Tracking issue: <https://github.com/delta-io/delta/issues/6688>
+    #[strum(serialize = "parquet.field.nested.ids")]
     ParquetFieldNestedIds,
+    #[strum(serialize = "delta.generationExpression")]
     GenerationExpression,
+    #[strum(serialize = "CURRENT_DEFAULT")]
     CurrentDefault,
+    #[strum(serialize = "delta.identity.start")]
     IdentityStart,
+    #[strum(serialize = "delta.identity.step")]
     IdentityStep,
+    #[strum(serialize = "delta.identity.highWaterMark")]
     IdentityHighWaterMark,
+    #[strum(serialize = "delta.identity.allowExplicitInsert")]
     IdentityAllowExplicitInsert,
+    #[strum(serialize = "delta.isInternalColumn")]
     InternalColumn,
+    #[strum(serialize = "delta.invariants")]
     Invariants,
+    #[strum(serialize = "delta.metadataSpec")]
     MetadataSpec,
+    #[strum(serialize = "delta.typeChanges")]
     TypeChanges,
-}
-
-impl AsRef<str> for ColumnMetadataKey {
-    fn as_ref(&self) -> &str {
-        match self {
-            Self::Collations => "__COLLATIONS",
-            Self::ColumnMappingId => "delta.columnMapping.id",
-            Self::ColumnMappingPhysicalName => "delta.columnMapping.physicalName",
-            Self::ColumnMappingNestedIds => "delta.columnMapping.nested.ids",
-            // "parquet.field.id" is not defined by the Delta protocol, but follows the convention
-            // established by delta-spark and other Delta ecosystem implementations for storing
-            // Parquet field IDs in StructField metadata.
-            Self::ParquetFieldId => "parquet.field.id",
-            // The Delta protocol defines this key for IcebergCompatV2/V3 nested field ids. It is
-            // legacy and will be replaced by `delta.columnMapping.nested.ids` (which kernel
-            // uses everywhere). Kept here for protocol compatibility only.
-            // Tracking issue: <https://github.com/delta-io/delta/issues/6688>
-            Self::ParquetFieldNestedIds => "parquet.field.nested.ids",
-            Self::GenerationExpression => "delta.generationExpression",
-            Self::CurrentDefault => "CURRENT_DEFAULT",
-            Self::IdentityAllowExplicitInsert => "delta.identity.allowExplicitInsert",
-            Self::IdentityHighWaterMark => "delta.identity.highWaterMark",
-            Self::IdentityStart => "delta.identity.start",
-            Self::IdentityStep => "delta.identity.step",
-            Self::InternalColumn => "delta.isInternalColumn",
-            Self::Invariants => "delta.invariants",
-            Self::MetadataSpec => "delta.metadataSpec",
-            Self::TypeChanges => "delta.typeChanges",
-        }
-    }
 }
 
 /// Enumeration of metadata columns recognized by Delta Kernel.
@@ -382,7 +378,7 @@ pub struct StructField {
     /// Denotes whether this Field can be null
     pub nullable: bool,
     /// A JSON map containing information about this column
-    pub metadata: HashMap<String, MetadataValue>,
+    pub metadata: HashMap<MetadataKey, MetadataValue>,
 }
 
 /// Parsed (and validated) pre-existing column-mapping annotations on a single field, as
@@ -432,7 +428,7 @@ impl StructField {
     pub fn create_metadata_column(name: impl Into<String>, spec: MetadataColumnSpec) -> Self {
         let mut metadata = HashMap::new();
         metadata.insert(
-            ColumnMetadataKey::MetadataSpec.as_ref().to_string(),
+            ColumnMetadataKey::MetadataSpec.as_ref().into(),
             MetadataValue::String(spec.text_value().to_string()),
         );
 
@@ -462,7 +458,7 @@ impl StructField {
     /// Replaces `self.metadata` with the list of <key, value> pairs in `metadata`.
     pub fn with_metadata(
         mut self,
-        metadata: impl IntoIterator<Item = (impl Into<String>, impl Into<MetadataValue>)>,
+        metadata: impl IntoIterator<Item = (impl Into<MetadataKey>, impl Into<MetadataValue>)>,
     ) -> Self {
         self.metadata = metadata
             .into_iter()
@@ -474,7 +470,7 @@ impl StructField {
     /// Extends `self.metadata` to include the <key, value> pairs in `metadata`.
     pub fn add_metadata(
         mut self,
-        metadata: impl IntoIterator<Item = (impl Into<String>, impl Into<MetadataValue>)>,
+        metadata: impl IntoIterator<Item = (impl Into<MetadataKey>, impl Into<MetadataValue>)>,
     ) -> Self {
         self.metadata
             .extend(metadata.into_iter().map(|(k, v)| (k.into(), v.into())));
@@ -720,7 +716,7 @@ impl StructField {
     }
 
     #[inline]
-    pub const fn metadata(&self) -> &HashMap<String, MetadataValue> {
+    pub const fn metadata(&self) -> &HashMap<MetadataKey, MetadataValue> {
         &self.metadata
     }
 
@@ -781,7 +777,7 @@ impl StructField {
     fn logical_to_physical_metadata(
         &self,
         column_mapping_mode: ColumnMappingMode,
-    ) -> HashMap<String, MetadataValue> {
+    ) -> HashMap<MetadataKey, MetadataValue> {
         let mut base_metadata = self.metadata.clone();
         let physical_name_key = ColumnMetadataKey::ColumnMappingPhysicalName.as_ref();
         let field_id_key = ColumnMetadataKey::ColumnMappingId.as_ref();
@@ -800,10 +796,7 @@ impl StructField {
                     return base_metadata;
                 };
                 // Insert the parquet field id matching the column mapping id
-                base_metadata.insert(
-                    parquet_field_id_key.to_string(),
-                    MetadataValue::Number(*fid),
-                );
+                base_metadata.insert(parquet_field_id_key.into(), MetadataValue::Number(*fid));
                 // Ensure that physical name is present
                 debug_assert!(base_metadata.contains_key(physical_name_key));
             }
@@ -823,10 +816,7 @@ impl StructField {
                     debug_assert!(false);
                     return base_metadata;
                 };
-                base_metadata.insert(
-                    parquet_field_id_key.to_string(),
-                    MetadataValue::Number(*fid),
-                );
+                base_metadata.insert(parquet_field_id_key.into(), MetadataValue::Number(*fid));
                 // TODO(#1070): Remove nested column ids when they are supported in kernel
             }
             ColumnMappingMode::None => {
@@ -3935,7 +3925,7 @@ mod tests {
         // Schema with top-level invariant
         let mut field = StructField::nullable("c", DataType::STRING);
         field.metadata.insert(
-            ColumnMetadataKey::Invariants.as_ref().to_string(),
+            ColumnMetadataKey::Invariants.as_ref().into(),
             MetadataValue::String("c > 0".to_string()),
         );
 
@@ -3950,7 +3940,7 @@ mod tests {
             ({
                 let mut field = StructField::nullable("d", DataType::INTEGER);
                 field.metadata.insert(
-                    ColumnMetadataKey::Invariants.as_ref().to_string(),
+                    ColumnMetadataKey::Invariants.as_ref().into(),
                     MetadataValue::String("d > 0".to_string()),
                 );
                 field
@@ -3969,7 +3959,7 @@ mod tests {
             ({
                 let mut field = StructField::nullable("d", DataType::INTEGER);
                 field.metadata.insert(
-                    ColumnMetadataKey::Invariants.as_ref().to_string(),
+                    ColumnMetadataKey::Invariants.as_ref().into(),
                     MetadataValue::String("d > 0".to_string()),
                 );
                 field
@@ -3988,7 +3978,7 @@ mod tests {
             ({
                 let mut field = StructField::nullable("d", DataType::INTEGER);
                 field.metadata.insert(
-                    ColumnMetadataKey::Invariants.as_ref().to_string(),
+                    ColumnMetadataKey::Invariants.as_ref().into(),
                     MetadataValue::String("d > 0".to_string()),
                 );
                 field

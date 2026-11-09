@@ -1241,6 +1241,14 @@ impl Scan {
         if matches!(log_segment.checkpoint_version, Some(v) if v > existing_version) {
             return Ok(Box::new(self.scan_metadata_with_engine(engine)?));
         }
+        // Likewise for an AMT checkpoint action: commits at or below its version may no longer be
+        // listed, so a hint from before it cannot be advanced commit by commit.
+        #[cfg(feature = "adaptive-metadata-in-dev")]
+        if let Some(checkpoint) = self.snapshot.latest_checkpoint_action(engine)?
+            && Version::try_from(checkpoint.version()).is_ok_and(|v| v > existing_version)
+        {
+            return Ok(Box::new(self.scan_metadata(engine)?));
+        }
 
         // create a new log segment containing only the commits added after the version hint.
         let mut ascending_commit_files = log_segment.listed.ascending_commit_files.clone();
@@ -1388,6 +1396,8 @@ impl Scan {
                  use scan_metadata instead"
             )
         );
+        #[cfg(feature = "adaptive-metadata-in-dev")]
+        self.require_no_checkpoint_action(engine, "declarative_metadata_scan_plan")?;
 
         // A statically-unsatisfiable predicate (e.g. `x > 10 AND FALSE`) skips the whole table.
         if self.state_info.physical_predicate == PhysicalPredicate::StaticSkipAll {
@@ -1409,10 +1419,23 @@ impl Scan {
     fn replay_for_scan_metadata(
         &self,
         engine: &dyn Engine,
-    ) -> KernelResult<ActionsWithCheckpointInfo<impl KernelResultIterator<ActionsBatch> + use<>>>
-    {
+    ) -> KernelResult<ActionsWithCheckpointInfo<Box<dyn KernelResultIterator<ActionsBatch>>>> {
         let (checkpoint_schema, meta_predicate, physical_stats_read_schema) =
             self.checkpoint_read_options();
+        #[cfg(feature = "adaptive-metadata-in-dev")]
+        if let Some(checkpoint) = self.snapshot.latest_checkpoint_action(engine)? {
+            return self
+                .snapshot
+                .log_segment()
+                .read_actions_with_checkpoint_action(
+                    engine,
+                    &checkpoint,
+                    self.snapshot.table_root(),
+                    COMMIT_READ_SCHEMA.clone(),
+                    checkpoint_schema,
+                    physical_stats_read_schema,
+                );
+        }
         // Checkpoints already represent reconciled state, so scans project only Add actions. This
         // derives `add.path IS NOT NULL` and allows readers to skip non-Add row groups.
         self.snapshot
@@ -1428,6 +1451,24 @@ impl Scan {
                     .as_ref()
                     .map(|s| s.as_ref()),
             )
+    }
+
+    /// Errors when the snapshot has an AMT `checkpoint` action, which `entry_point` does not yet
+    /// read.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    fn require_no_checkpoint_action(
+        &self,
+        engine: &dyn Engine,
+        entry_point: &str,
+    ) -> KernelResult<()> {
+        match self.snapshot.latest_checkpoint_action(engine)? {
+            Some(checkpoint) => Err(KernelError::unsupported(format!(
+                "{entry_point} does not yet read the adaptiveMetadata checkpoint action at version \
+                 {}",
+                checkpoint.version()
+            ))),
+            None => Ok(()),
+        }
     }
 
     /// Builds a predicate for row group skipping in checkpoint and sidecar parquet files.
@@ -1506,13 +1547,13 @@ impl Scan {
     ///
     /// ```no_run
     /// # use std::sync::Arc;
-    /// # use delta_kernel::{Engine, KernelResult};
+    /// # use delta_kernel::Engine;
     /// # use delta_kernel::scan::{AfterSequentialScanMetadata, ParallelScanMetadata};
     /// # use delta_kernel::Snapshot;
     /// # use url::Url;
     /// # use test_utils::delta_kernel_default_engine::DefaultEngineBuilder;
     /// # use delta_kernel::object_store::local::LocalFileSystem;
-    /// # fn main() -> KernelResult<()> {
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// let engine = Arc::new(DefaultEngineBuilder::new(Arc::new(LocalFileSystem::new())).build());
     /// let table_root = Url::parse("file:///path/to/table")?;
     ///
@@ -1574,6 +1615,8 @@ impl Scan {
                  tables with TIMESTAMP partition columns; use scan_metadata"
             )
         );
+        #[cfg(feature = "adaptive-metadata-in-dev")]
+        self.require_no_checkpoint_action(engine.as_ref(), "parallel_scan_metadata")?;
         // For the sequential/parallel phase approach, we use a conservative checkpoint_info
         // since SequentialPhase reads checkpoints via CheckpointManifestReader which doesn't
         // currently support stats_parsed optimization.

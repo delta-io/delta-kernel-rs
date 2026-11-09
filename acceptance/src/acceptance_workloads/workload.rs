@@ -45,7 +45,7 @@ fn build_snapshot(
     engine: &dyn Engine,
     table_root: &Url,
     time_travel: Option<&TimeTravel>,
-) -> KernelResult<Arc<Snapshot>> {
+) -> delta_kernel::Result<Arc<Snapshot>> {
     let version = time_travel
         .map(TimeTravel::as_version)
         .transpose()
@@ -63,7 +63,7 @@ pub fn execute_read_workload(
     engine: Arc<dyn Engine>,
     table_root: &Url,
     read_spec: &ReadSpec,
-) -> KernelResult<ReadResult> {
+) -> delta_kernel::Result<ReadResult> {
     let snapshot = build_snapshot(engine.as_ref(), table_root, read_spec.time_travel.as_ref())?;
 
     let table_schema = snapshot.schema();
@@ -172,7 +172,7 @@ pub fn execute_snapshot_workload(
     engine: Arc<dyn Engine>,
     table_root: &Url,
     snapshot_spec: &SnapshotConstructionSpec,
-) -> KernelResult<SnapshotResult> {
+) -> delta_kernel::Result<SnapshotResult> {
     let snapshot = build_snapshot(
         engine.as_ref(),
         table_root,
@@ -220,7 +220,7 @@ pub fn execute_and_validate_workload(
 mod tests {
     use delta_kernel::arrow::array::{Int32Array, RecordBatch};
     use delta_kernel::arrow::datatypes::{DataType as ArrowDataType, Field, Schema as ArrowSchema};
-    use delta_kernel::expressions::{Predicate, col, lit};
+    use delta_kernel::expressions::{Predicate, expr};
 
     use super::*;
 
@@ -238,7 +238,7 @@ mod tests {
             ],
         )
         .unwrap();
-        let predicate = Predicate::gt(col!("filter"), lit(1));
+        let predicate = Predicate::from_expr(expr!(col("filter") > 1));
 
         assert_eq!(
             scan_columns(&["selected".to_string()], Some(&predicate)),

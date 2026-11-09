@@ -232,9 +232,11 @@ impl RowIndexBuilder {
 ///   via `ArrowSchema::new`).
 ///
 /// **Type validation.** `apply_schema_to_struct` runs `ensure_data_types(.., Full)` at every
-/// primitive leaf. This is safe because `reorder_struct_array` above has already resolved every
+/// primitive leaf. On this path `reorder_struct_array` above has already resolved every
 /// `DataTypeCompat::NeedsCast` into an actual `arrow::compute::cast`, so post-reorder leaf types
-/// are `Identical` to the kernel target.
+/// are `Identical` to the kernel target and the leaf cast is a no-op. Note that `apply_schema` has
+/// other callers (the expression evaluator) with no such pre-cast step, so it resolves
+/// `NeedsCast` itself rather than relying on this invariant.
 ///
 /// **File values.** A non-null `file` value that the File type requires readers to reject fails
 /// the read; `validate_file_values_for_read` in `file_type_validation.rs` lists the rules.
@@ -1729,8 +1731,8 @@ mod tests {
     use crate::parquet::file::metadata::ColumnChunkMetaData;
     use crate::parquet::schema::types::{SchemaDescriptor, Type};
     use crate::schema::{
-        ArrayType, ColumnMetadataKey, DataType, MapType, MetadataColumnSpec, MetadataValue,
-        StructField, StructType, schema, schema_ref,
+        ArrayType, ColumnMetadataKey, DataType, MapType, MetadataColumnSpec, MetadataKey,
+        MetadataValue, StructField, StructType, schema, schema_ref,
     };
     use crate::table_features::ColumnMappingMode;
     use crate::unit_test_utils::assert_result_error_with_message;
@@ -1769,7 +1771,7 @@ mod tests {
     fn column_mapping_metadata(
         field_id: i64,
         mode: ColumnMappingMode,
-    ) -> HashMap<String, MetadataValue> {
+    ) -> HashMap<MetadataKey, MetadataValue> {
         match mode {
             ColumnMappingMode::None => HashMap::new(),
             _ => kernel_fid_and_name(field_id, physical_name(field_id)),
@@ -1783,16 +1785,17 @@ mod tests {
 
     /// Generates appropriate column mapping metadata for a kernel struct field with column mapping
     /// id `field_id`.
-    fn kernel_fid_and_name(field_id: i64, name: impl AsRef<str>) -> HashMap<String, MetadataValue> {
+    fn kernel_fid_and_name(
+        field_id: i64,
+        name: impl AsRef<str>,
+    ) -> HashMap<MetadataKey, MetadataValue> {
         HashMap::from([
             (
-                ColumnMetadataKey::ColumnMappingId.as_ref().to_string(),
+                ColumnMetadataKey::ColumnMappingId.as_ref().into(),
                 field_id.into(),
             ),
             (
-                ColumnMetadataKey::ColumnMappingPhysicalName
-                    .as_ref()
-                    .to_string(),
+                ColumnMetadataKey::ColumnMappingPhysicalName.as_ref().into(),
                 name.as_ref().to_string().into(),
             ),
         ])

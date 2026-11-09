@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use super::*;
 use crate::expressions::{
     ArrayData, Expression as Expr, OpaqueExpressionOp, OpaquePredicateOp, Predicate as Pred,
-    ScalarExpressionEvaluator, StructData, col, column_name, column_pred, lit, null_lit,
+    ScalarExpressionEvaluator, StructData, col, column_name, column_pred, expr, lit, null_lit,
 };
 use crate::kernel_predicates::parquet_stats_skipping::ParquetStatsProvider;
 use crate::scan::data_skipping::as_data_skipping_predicate;
@@ -987,7 +987,7 @@ fn test_eval_opaque_predicate() {
 fn test_eval_opaque_complex() {
     // A contrived example that uses an opaque predicate that references an opaque expression
     let complex_pred = Pred::and(
-        Pred::lt(col!("x"), lit(true)),
+        Pred::from_expr(expr!(col("x") < true)),
         Pred::opaque(
             OpaqueLessThanOp,
             vec![
@@ -1047,7 +1047,7 @@ impl ResolveColumnAsScalar for NullColumnResolver {
 #[test]
 fn test_sql_where() {
     let col_pred = &column_pred!("x");
-    const VAL: Expr = Expr::Literal(Scalar::Integer(1));
+    const VAL: Scalar = Scalar::Integer(1);
     let null_filter = DefaultKernelPredicateEvaluator::from(NullColumnResolver);
     let empty_filter = DefaultKernelPredicateEvaluator::from(EmptyColumnResolver);
 
@@ -1079,43 +1079,43 @@ fn test_sql_where() {
     );
 
     // SQL eval does not modify behavior of IS NULL
-    let pred = &col!("x").is_null();
+    let pred = &Pred::from_expr(expr!(is_null(col("x"))));
     expect_eq!(null_filter.eval_sql_where(pred), Some(true), "{pred}");
 
     // NOT a gets skipped when NULL but not when missing
-    let pred = &Pred::not(col_pred.clone());
+    let pred = &Pred::from_expr(expr!(not(col("x"))));
     expect_eq!(null_filter.eval_sql_where(pred), Some(false), "{pred}");
     expect_eq!(empty_filter.eval_sql_where(pred), None, "{pred}");
 
     // Injected NULL checks only short circuit if inputs are NULL
-    let pred = &Pred::lt(Pred::FALSE, Pred::TRUE);
+    let pred = &Pred::from_expr(expr!(false < true));
     expect_eq!(null_filter.eval_sql_where(pred), Some(true), "{pred}");
     expect_eq!(empty_filter.eval_sql_where(pred), Some(true), "{pred}");
 
     // Contrast normal vs SQL WHERE semantics - comparison
-    let pred = &Pred::lt(col!("x"), VAL);
+    let pred = &Pred::from_expr(expr!(col("x") < lit(VAL)));
     expect_eq!(null_filter.eval(pred), None, "{pred}");
     expect_eq!(null_filter.eval_sql_where(pred), Some(false), "{pred}");
     // NULL check produces NULL due to missing column
     expect_eq!(empty_filter.eval_sql_where(pred), None, "{pred}");
 
-    let pred = &Pred::lt(VAL, col!("x"));
+    let pred = &Pred::from_expr(expr!(lit(VAL) < col("x")));
     expect_eq!(null_filter.eval(pred), None, "{pred}");
     expect_eq!(null_filter.eval_sql_where(pred), Some(false), "{pred}");
     expect_eq!(empty_filter.eval_sql_where(pred), None, "{pred}");
 
-    let pred = &Pred::distinct(VAL, col!("x"));
+    let pred = &Pred::from_expr(expr!(distinct(lit(VAL), col("x"))));
     expect_eq!(null_filter.eval(pred), Some(true), "{pred}");
     expect_eq!(null_filter.eval_sql_where(pred), Some(true), "{pred}");
     expect_eq!(empty_filter.eval_sql_where(pred), None, "{pred}");
 
-    let pred = &Pred::distinct(Pred::NULL, col!("x"));
+    let pred = &Pred::from_expr(expr!(distinct(null(BOOLEAN), col("x"))));
     expect_eq!(null_filter.eval(pred), Some(false), "{pred}");
     expect_eq!(null_filter.eval_sql_where(pred), Some(false), "{pred}");
     expect_eq!(empty_filter.eval_sql_where(pred), None, "{pred}");
 
     // Contrast normal vs SQL WHERE semantics - comparison inside AND
-    let pred = &Pred::and(Pred::TRUE, Pred::lt(col!("x"), VAL));
+    let pred = &Pred::from_expr(expr!(and(true, col("x") < lit(VAL))));
     expect_eq!(null_filter.eval(pred), None, "{pred}");
     expect_eq!(null_filter.eval_sql_where(pred), Some(false), "{pred}");
     expect_eq!(empty_filter.eval_sql_where(pred), None, "{pred}");
@@ -1123,19 +1123,19 @@ fn test_sql_where() {
     // NULL literal is treated as unknown (not false) under eval_sql_where, so it does not
     // force static skipping. This prevents incorrect pruning when indirect data skipping
     // rewriters use NULL as a sentinel for unsupported predicate arms.
-    let pred = &Pred::and(Pred::NULL, Pred::lt(col!("x"), VAL));
+    let pred = &Pred::from_expr(expr!(and(null(BOOLEAN), col("x") < lit(VAL))));
     expect_eq!(null_filter.eval(pred), None, "{pred}");
     expect_eq!(null_filter.eval_sql_where(pred), Some(false), "{pred}");
     expect_eq!(empty_filter.eval_sql_where(pred), None, "{pred}");
 
     // Contrast normal vs. SQL WHERE semantics - comparison inside AND inside AND
-    let pred = &Pred::and(Pred::TRUE, Pred::and(Pred::TRUE, Pred::lt(col!("x"), VAL)));
+    let pred = &Pred::from_expr(expr!(and(true, and(true, col("x") < lit(VAL)))));
     expect_eq!(null_filter.eval(pred), None, "{pred}");
     expect_eq!(null_filter.eval_sql_where(pred), Some(false), "{pred}");
     expect_eq!(empty_filter.eval_sql_where(pred), None, "{pred}");
 
     // Ditto for comparison inside OR inside AND
-    let pred = &Pred::or(Pred::FALSE, Pred::and(Pred::TRUE, Pred::lt(col!("x"), VAL)));
+    let pred = &Pred::from_expr(expr!(or(false, and(true, col("x") < lit(VAL)))));
     expect_eq!(null_filter.eval(pred), None, "{pred}");
     expect_eq!(null_filter.eval_sql_where(pred), Some(false), "{pred}");
     expect_eq!(empty_filter.eval_sql_where(pred), None, "{pred}");

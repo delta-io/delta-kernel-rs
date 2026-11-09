@@ -17,7 +17,10 @@ use tracing::subscriber::DefaultGuard;
 use tracing_subscriber::util::SubscriberInitExt as _;
 use url::Url;
 
-use crate::actions::{Add, Cdc, CommitInfo, Metadata, Protocol, Remove, get_all_actions_schema};
+use crate::actions::{
+    Add, Cdc, CommitInfo, DomainMetadata, Metadata, Protocol, Remove, SetTransaction,
+    get_all_actions_schema,
+};
 use crate::arrow::array::{
     ArrayRef, Int64Array, MapArray, RecordBatch, StringArray, StructArray, new_empty_array,
     new_null_array,
@@ -49,7 +52,7 @@ use crate::table_properties::{
 use crate::transaction::create_table::create_table;
 use crate::transaction::{BASE_ADD_FILES_SCHEMA, CreateTable, Transaction};
 use crate::{
-    Engine, EngineData, FileMeta, KernelError, KernelResult, Snapshot, SnapshotRef, Version,
+    Engine, EngineData, FileMeta, KernelError, KernelResult, Result, Snapshot, SnapshotRef, Version,
 };
 
 /// Parses `path` (a full URL string) into a [`ParsedLogPath`] with zero size, for building
@@ -118,6 +121,12 @@ pub(crate) enum Action {
     #[allow(unused)]
     #[serde(rename = "commitInfo")]
     CommitInfo(CommitInfo),
+    #[allow(unused)]
+    #[serde(rename = "txn")]
+    Txn(SetTransaction),
+    #[allow(unused)]
+    #[serde(rename = "domainMetadata")]
+    DomainMetadata(DomainMetadata),
 }
 
 use crate::schema::{
@@ -332,6 +341,8 @@ pub(crate) mod adaptive_metadata_fixtures {
         LastManifestCommit, Sidecar,
     };
     use crate::arrow::array::{Array as _, AsArray as _};
+    use crate::content_tree::ContentTreeNodeEntry;
+    use crate::content_tree::test_utils::write_manifest;
     use crate::engine_data::FilteredEngineData;
     use crate::expressions::Scalar;
     use crate::path::LogRoot;
@@ -373,18 +384,19 @@ pub(crate) mod adaptive_metadata_fixtures {
     }
 
     /// A `commitInfo` line with In-Commit Timestamp `timestamp` and, when given, a
-    /// `lastManifestCommit` `(version, contentRootVersion)`, as an AMT writer records on every
-    /// commit.
-    pub(crate) fn commit_info_line(timestamp: i64, pointer: Option<(i64, i64)>) -> String {
+    /// `lastManifestCommit` `pointer`, as an AMT writer records on every commit.
+    pub(crate) fn commit_info_line(timestamp: i64, pointer: Option<&LastManifestCommit>) -> String {
         let mut commit_info =
             serde_json::json!({ "timestamp": timestamp, "inCommitTimestamp": timestamp });
-        if let Some((version, content_root_version)) = pointer {
-            commit_info["lastManifestCommit"] = serde_json::json!({
-                "version": version,
-                "contentRootVersion": content_root_version,
-            });
+        if let Some(pointer) = pointer {
+            commit_info["lastManifestCommit"] = serde_json::to_value(pointer).unwrap();
         }
         serde_json::json!({ "commitInfo": commit_info }).to_string()
+    }
+
+    /// A commit line holding `checkpoint`.
+    pub(crate) fn checkpoint_line(checkpoint: &CheckpointAction) -> String {
+        serde_json::json!({ "checkpoint": checkpoint }).to_string()
     }
 
     /// A minimal `checkpoint` action referencing `path` as the content root at `version`.
@@ -443,7 +455,7 @@ pub(crate) mod adaptive_metadata_fixtures {
     }
 
     /// Creates an empty in-memory table and returns its engine and table-root URL.
-    pub(crate) fn setup_table() -> KernelResult<(SyncEngine, Url)> {
+    pub(crate) fn setup_table() -> Result<(SyncEngine, Url)> {
         let engine = SyncEngine::new_with_store(Arc::new(InMemory::new()));
         let schema = schema_ref! { nullable "id": INTEGER };
         let _ = create_table("memory:///", schema, "test", true)
@@ -583,24 +595,36 @@ pub(crate) mod adaptive_metadata_fixtures {
             engine,
             table_root,
             0,
+            None,
             &protocol_and_metadata_lines(test_schema_flat_with_column_mapping(), partition_columns),
         );
     }
 
     /// Writes `actions` (one JSON action per line) as the commit at `version`, after a
-    /// `commitInfo` carrying the In-Commit Timestamp adaptiveMetadata tables require.
+    /// `commitInfo` carrying the In-Commit Timestamp adaptiveMetadata tables require and, when
+    /// given, the `lastManifestCommit` `pointer` (see [`commit_info_line`]).
     pub(crate) fn write_ict_commit(
         engine: &SyncEngine,
         table_root: &Url,
         version: Version,
+        pointer: Option<&LastManifestCommit>,
         actions: &str,
     ) {
-        let commit_info = commit_info_line(version_as_i64(version).unwrap() + 1, None);
+        let commit_info = commit_info_line(version_as_i64(version).unwrap() + 1, pointer);
         let lines: StringArray = iter::once(commit_info.as_str())
             .chain(actions.lines())
             .collect::<Vec<_>>()
             .into();
         write_commit(engine, table_root, version, parse_json_batch(lines)).unwrap();
+    }
+
+    /// Creates an in-memory adaptiveMetadata table at version 0 and returns its engine and
+    /// table-root URL.
+    pub(crate) fn setup_adaptive_metadata_table() -> (SyncEngine, Url) {
+        let engine = SyncEngine::new_with_store(Arc::new(InMemory::new()));
+        let table_root = Url::parse("memory:///").unwrap();
+        create_adaptive_metadata_table(&engine, &table_root, &[]);
+        (engine, table_root)
     }
 
     /// Commits a transaction on the latest snapshot of the table at `table_root` that adds a
@@ -664,6 +688,37 @@ pub(crate) mod adaptive_metadata_fixtures {
             );
         }
         txn.commit(engine)
+            .unwrap()
+            .unwrap_committed()
+            .commit_version()
+    }
+
+    /// Writes `entries` as the root manifest at `path` (relative to `table_root`) and commits it
+    /// as the content root of the table's latest snapshot, returning the commit version.
+    pub(crate) fn commit_root_manifest(
+        engine: &SyncEngine,
+        table_root: &Url,
+        path: &str,
+        entries: &[ContentTreeNodeEntry],
+    ) -> Version {
+        let file = write_manifest(engine, table_root.join(path).unwrap(), entries);
+        commit_root_manifest_file(engine, table_root, file)
+    }
+
+    /// Commits `file`, which need not exist, as the content root of the latest snapshot of the
+    /// table at `table_root`, returning the commit version.
+    pub(crate) fn commit_root_manifest_file(
+        engine: &SyncEngine,
+        table_root: &Url,
+        file: FileMeta,
+    ) -> Version {
+        let snapshot = Snapshot::builder_for(table_root.clone())
+            .build(engine)
+            .unwrap();
+        write_transaction(engine, snapshot)
+            .with_root_manifest_file(file)
+            .unwrap()
+            .commit(engine)
             .unwrap()
             .unwrap_committed()
             .commit_version()
@@ -1618,7 +1673,7 @@ pub(crate) fn copy_test_table(table_name: &str) -> KernelResult<(Url, TempDir)> 
 /// for the duration of the test to prevent premature cleanup of extracted files.
 pub(crate) fn load_test_table(
     table_name: &str,
-) -> KernelResult<(Arc<dyn Engine>, SnapshotRef, Option<TempDir>)> {
+) -> Result<(Arc<dyn Engine>, SnapshotRef, Option<TempDir>)> {
     let (path, tempdir) = resolve_test_table_path(table_name)?;
 
     let url = Url::from_directory_path(&path)

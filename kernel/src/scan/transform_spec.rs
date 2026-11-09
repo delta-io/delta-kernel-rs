@@ -10,7 +10,9 @@ use std::sync::Arc;
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 
-use crate::expressions::{Expression, ExpressionRef, ExpressionStructPatchBuilder, Scalar, lit};
+use crate::expressions::{
+    Expression, ExpressionRef, ExpressionStructPatchBuilder, Scalar, expr, lit,
+};
 use crate::schema::{DataType, SchemaRef, StructType};
 use crate::table_features::ColumnMappingMode;
 use crate::{KernelError, KernelResult};
@@ -171,10 +173,10 @@ pub(crate) fn get_transform_expr(
                         "reconstruction",
                     ))
                 })?;
-                let expr = Arc::new(Expression::coalesce([
-                    Expression::column([field_name]),
-                    lit(default_row_commit_version),
-                ]));
+                let expr = Arc::new(expr!(coalesce(
+                    path(field_name),
+                    lit(default_row_commit_version)
+                )));
                 patch.replace(field_name.clone(), expr)
             }
             MetadataDerivedColumn {
@@ -263,7 +265,7 @@ mod tests {
 
     use super::*;
     use crate::KernelResult;
-    use crate::expressions::{BinaryExpressionOp, col};
+    use crate::expressions::{BinaryExpressionOp, col, expr};
     use crate::schema::{DataType, PrimitiveType, schema, schema_ref};
     use crate::unit_test_utils::assert_result_error_with_message;
 
@@ -718,10 +720,10 @@ mod tests {
         assert!(!row_commit_version_patch.keep_input);
         assert_eq!(
             row_commit_version_patch.insertions,
-            [Arc::new(Expression::coalesce([
-                col!("row_commit_version_col"),
-                lit(5i64),
-            ]))]
+            [Arc::new(expr!(coalesce(
+                col("row_commit_version_col"),
+                5i64
+            )))]
         );
         Ok(())
     }

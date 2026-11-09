@@ -645,7 +645,7 @@ mod tests {
     use datafusion::physical_expr::execution_props::ExecutionProps;
     use delta_kernel::expressions::{
         ColumnName as KernelColumnName, Expression as KernelExpr, ExpressionStructPatch,
-        ExpressionStructPatchBuilder, MapToStructOptions, col, lit, null_lit,
+        ExpressionStructPatchBuilder, MapToStructOptions, col, expr, lit, null_lit,
     };
     use delta_kernel::schema::{ArrayType, DataType, MapType, StructType, schema, schema_ref};
     use rstest::rstest;
@@ -724,7 +724,7 @@ mod tests {
 
     #[rstest]
     #[case::coalesce(
-        KernelExpr::coalesce([col!("a"), col!("b"), lit(0i64)]),
+        expr!(coalesce(col("a"), col("b"), 0i64)),
         "coalesce(a, b, Int64(0))"
     )]
     #[case::array(
@@ -732,7 +732,7 @@ mod tests {
         "make_array(Int64(1), Int64(2))"
     )]
     #[case::nested_coalesce(
-        KernelExpr::coalesce([KernelExpr::coalesce([col!("a"), col!("b")]), col!("x")]),
+        expr!(coalesce(coalesce(col("a"), col("b")), col("x"))),
         "coalesce(coalesce(a, b), x)"
     )]
     #[case::nested_array(
@@ -791,7 +791,7 @@ mod tests {
 
     #[test]
     fn embedded_predicate_delegates_to_predicate_converter() {
-        let kernel = KernelExpr::Predicate(Box::new(col!("b").is_null()));
+        let kernel = expr!(is_null(col("b")));
         assert_eq!(lower(kernel), "b IS NULL");
     }
 
@@ -840,7 +840,7 @@ mod tests {
     fn struct_with_nullability_wraps_in_case() {
         let kernel = KernelExpr::struct_with_nullability_from(
             [col!("b"), lit(1i64)],
-            KernelExpr::Predicate(Box::new(col!("x").is_not_null())),
+            expr!(is_not_null(col("x"))),
         );
         // Kernel models IS NOT NULL as Not(IsNull), so the guard renders as "NOT x IS NULL".
         let rendered = lower_typed(kernel, pq_output_schema().into());

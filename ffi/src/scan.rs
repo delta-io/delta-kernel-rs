@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 
 use delta_kernel::scan::state::{DvInfo, ScanFile};
 use delta_kernel::scan::{PartitionValuesOptions, Scan, ScanBuilder, ScanMetadata, StatsOptions};
-use delta_kernel::schema::MetadataValue;
+use delta_kernel::schema::{MetadataKey, MetadataValue};
 use delta_kernel::snapshot::SnapshotRef;
 use delta_kernel::{Expression, ExpressionRef, KernelError, KernelResult, KernelResultIterator};
 use delta_kernel_ffi_macros::handle_descriptor;
@@ -781,12 +781,12 @@ impl From<&MetadataValue> for CMetadataValueKind {
 /// retain it.
 #[derive(Default, From)]
 pub struct CMetadataMap {
-    values: HashMap<String, MetadataValue>,
+    values: HashMap<MetadataKey, MetadataValue>,
 }
 
 impl CMetadataMap {
     /// Insert a value without replacing an existing key.
-    pub(crate) fn insert(&mut self, key: String, value: MetadataValue) -> KernelResult<()> {
+    pub(crate) fn insert(&mut self, key: MetadataKey, value: MetadataValue) -> KernelResult<()> {
         match self.values.entry(key) {
             Entry::Vacant(entry) => {
                 entry.insert(value);
@@ -800,7 +800,7 @@ impl CMetadataMap {
     }
 
     /// Consume the map and return its metadata values.
-    pub(crate) fn into_values(self) -> HashMap<String, MetadataValue> {
+    pub(crate) fn into_values(self) -> HashMap<MetadataKey, MetadataValue> {
         self.values
     }
 }
@@ -863,6 +863,7 @@ pub unsafe extern "C" fn visit_metadata_map(
     ),
 ) {
     for (key, val) in &map.values {
+        let key = key.as_str();
         let kind = CMetadataValueKind::from(val);
         let value = val.to_string();
         visitor(
@@ -2267,6 +2268,7 @@ mod tests {
         DeletionVectorDescriptor, DeletionVectorStorageType,
     };
     use delta_kernel::scan::state::DvInfo;
+    use delta_kernel::schema::{MetadataKey, MetadataValue};
     use rstest::rstest;
 
     use super::cardinality_from_dv;
@@ -2485,24 +2487,19 @@ mod tests {
 
     #[test]
     fn visit_metadata_map_maps_kind_and_renders_each_variant() {
-        use delta_kernel::schema::MetadataValue;
-
         use super::CMetadataValueKind::*;
 
         // `Number` is i64-only, so a JSON number with a fractional part lands in `Other` -- cover
         // both so the "parse as i64" contract for `MetadataNumber` stays honest.
-        let test_map = HashMap::from([
-            ("num".to_string(), MetadataValue::Number(-7)),
-            ("str".to_string(), MetadataValue::String("hi".into())),
-            ("bool".to_string(), MetadataValue::Boolean(true)),
+        let test_map: HashMap<MetadataKey, MetadataValue> = HashMap::from([
+            ("num".into(), MetadataValue::Number(-7)),
+            ("str".into(), MetadataValue::String("hi".into())),
+            ("bool".into(), MetadataValue::Boolean(true)),
             (
-                "obj".to_string(),
+                "obj".into(),
                 MetadataValue::Other(serde_json::json!({"a": 1})),
             ),
-            (
-                "float".to_string(),
-                MetadataValue::Other(serde_json::json!(1.5)),
-            ),
+            ("float".into(), MetadataValue::Other(serde_json::json!(1.5))),
         ]);
         let cmap: super::CMetadataMap = test_map.into();
 

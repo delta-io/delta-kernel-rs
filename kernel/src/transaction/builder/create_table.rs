@@ -48,8 +48,9 @@ use crate::table_properties::{
     ENABLE_ICEBERG_COMPAT_V2, ENABLE_ICEBERG_COMPAT_V3, ENABLE_ICEBERG_NATIVE_V4,
     ENABLE_IN_COMMIT_TIMESTAMPS, ENABLE_ROW_TRACKING, ENABLE_TYPE_WIDENING, LOG_RETENTION_DURATION,
     MATERIALIZED_ROW_COMMIT_VERSION_COLUMN_NAME, MATERIALIZED_ROW_ID_COLUMN_NAME,
-    PARQUET_FORMAT_VERSION, ROW_TRACKING_SUSPENDED, SET_TRANSACTION_RETENTION_DURATION,
-    TableProperties, strip_check_constraint_prefix,
+    PARQUET_COMPRESSION_CODEC, PARQUET_FORMAT_VERSION, ParquetCompressionCodec,
+    ROW_TRACKING_SUSPENDED, SET_TRANSACTION_RETENTION_DURATION, TableProperties,
+    strip_check_constraint_prefix,
 };
 use crate::transaction::create_table::CreateTableTransaction;
 use crate::transaction::data_layout::DataLayout;
@@ -132,6 +133,8 @@ const ALLOWED_DELTA_PROPERTIES: &[&str] = &[
     SET_TRANSACTION_RETENTION_DURATION,
     // Parquet format version: controls the Parquet writer version for data files
     PARQUET_FORMAT_VERSION,
+    // Advisory compression setting for the connector's Parquet writer.
+    PARQUET_COMPRESSION_CODEC,
     // IcebergCompatV2 enablement: triggers auto-enablement of ColumnMapping.
     ENABLE_ICEBERG_COMPAT_V2,
     // IcebergCompatV3 enablement: triggers auto-enablement of ColumnMapping,
@@ -802,7 +805,8 @@ fn maybe_apply_column_mapping_for_table_create(
 ///
 /// This function:
 /// 1. Validates feature signals (`delta.feature.*`) against `ALLOWED_DELTA_FEATURES`
-/// 2. Validates delta properties (`delta.*`) against `ALLOWED_DELTA_PROPERTIES`
+/// 2. Validates delta property keys (`delta.*`) against `ALLOWED_DELTA_PROPERTIES` and checks
+///    compression codec values with the shared codec parser (case-insensitive, without trimming)
 /// 3. Removes feature signals from properties (they shouldn't be stored in metadata)
 /// 4. Extracts reader/writer features from validated feature signals
 ///
@@ -865,7 +869,7 @@ fn validate_extract_table_features_and_properties(
     }
 
     // Validate remaining delta.* properties against the allow list
-    for key in properties.keys() {
+    for (key, value) in &properties {
         if strip_check_constraint_prefix(key).is_some() {
             return Err(KernelError::generic(format!(
                 "Setting CHECK constraint property '{key}' is not supported during CREATE TABLE"
@@ -877,6 +881,12 @@ fn validate_extract_table_features_and_properties(
             return Err(KernelError::generic(format!(
                 "Setting delta property '{key}' is not supported during CREATE TABLE"
             )));
+        }
+        if key == PARQUET_COMPRESSION_CODEC {
+            // Reject unsupported codecs at creation; snapshot parsing remains tolerant of them.
+            ParquetCompressionCodec::try_from(value.as_str()).map_err(|_| {
+                KernelError::generic(format!("Invalid value '{value}' for '{key}'"))
+            })?;
         }
     }
 
@@ -1055,6 +1065,7 @@ impl<MODE: ExecutionMode> TransactionBuilder<CreateTable, MODE> {
     /// - Schema or metadata annotation validation fails
     /// - The data layout is invalid
     /// - Unsupported delta properties or feature flags are specified
+    /// - The value of `delta.parquet.compression.codec` is not a recognized codec
     /// - Connector commit information does not contain exactly one row
     /// - An application transaction identifier occurs more than once
     #[internal_api]

@@ -59,8 +59,8 @@ use crate::unit_test_utils::{
 use crate::unit_test_utils::{geography_type, geometry_type};
 use crate::{
     EngineData, FileDataReadResultIterator, FileMeta, FileSize, JsonHandler, KernelResult,
-    KernelResultIterator, ParquetFooter, ParquetHandler, Predicate, PredicateRef, RowVisitor,
-    StorageHandler,
+    KernelResultIterator, ParquetFooter, ParquetHandler, Predicate, PredicateRef, Result,
+    RowVisitor, StorageHandler,
 };
 
 /// Processes sidecar files for the given checkpoint batch.
@@ -2345,6 +2345,107 @@ fn commit_cover_after_excludes_compaction_starting_at_or_before_bound(
     assert_eq!(
         cover.into_iter().map(|f| f.location).collect_vec(),
         expected_cover_locations(&log_root, &expected_files)
+    );
+}
+
+// Compaction listing is disabled, so the compactions are added to the listed segment by hand.
+#[rstest]
+#[case::replaces_spanning_compaction_with_commits(
+    (None, 4),
+    &[2],
+    &[
+        ExpectedFile::Commit(4),
+        ExpectedFile::Commit(3),
+        ExpectedFile::Commit(2),
+        ExpectedFile::Compaction(0, 1),
+    ]
+)]
+#[case::spanning_compaction_end(
+    (None, 4),
+    &[1],
+    &[
+        ExpectedFile::Commit(4),
+        ExpectedFile::Compaction(2, 3),
+        ExpectedFile::Commit(1),
+        ExpectedFile::Commit(0),
+    ]
+)]
+#[case::no_compaction_spans_version(
+    (None, 4),
+    &[4],
+    &[ExpectedFile::Commit(4), ExpectedFile::Compaction(2, 3), ExpectedFile::Compaction(0, 1)]
+)]
+#[case::compactions_spanning_either_version(
+    (None, 4),
+    &[0, 3],
+    &[
+        ExpectedFile::Commit(4),
+        ExpectedFile::Commit(3),
+        ExpectedFile::Commit(2),
+        ExpectedFile::Commit(1),
+        ExpectedFile::Commit(0),
+    ]
+)]
+#[case::oldest_exclusive_drops_files_at_or_below_it(
+    (Some(1), 4),
+    &[],
+    &[ExpectedFile::Commit(4), ExpectedFile::Compaction(2, 3)]
+)]
+#[case::newest_inclusive_drops_compaction_past_it(
+    (None, 2),
+    &[],
+    &[ExpectedFile::Commit(2), ExpectedFile::Compaction(0, 1)]
+)]
+#[case::compaction_ending_at_newest_inclusive(
+    (None, 3),
+    &[],
+    &[ExpectedFile::Compaction(2, 3), ExpectedFile::Compaction(0, 1)]
+)]
+#[case::oldest_exclusive_inside_compaction(
+    (Some(0), 4),
+    &[],
+    &[ExpectedFile::Commit(4), ExpectedFile::Compaction(2, 3), ExpectedFile::Commit(1)]
+)]
+#[case::oldest_exclusive_at_compaction_start(
+    (Some(2), 4),
+    &[],
+    &[ExpectedFile::Commit(4), ExpectedFile::Commit(3)]
+)]
+#[case::required_delta_outside_range_is_ignored(
+    (Some(1), 4),
+    &[1],
+    &[ExpectedFile::Commit(4), ExpectedFile::Compaction(2, 3)]
+)]
+#[case::empty_range((Some(4), 4), &[], &[])]
+#[tokio::test]
+async fn commit_cover_in_range_reads_required_commits_as_their_own_files(
+    #[case] (oldest_exclusive, newest_inclusive): (Option<Version>, Version),
+    #[case] required_commits: &[Version],
+    #[case] expected_files: &[ExpectedFile],
+) {
+    let mut log_segment = create_segment_for(LogSegmentConfig {
+        published_commit_versions: &[0, 1, 2, 3, 4],
+        ..Default::default()
+    })
+    .await;
+    let compaction = |lo: Version, hi: Version| {
+        let location = log_segment
+            .log_root
+            .join(&format!("{lo:020}.{hi:020}.compacted.json"))
+            .unwrap();
+        ParsedLogPath::new(FileMeta::new(location, 0, 100)).unwrap()
+    };
+    let compactions = vec![compaction(0, 1), compaction(2, 3)];
+    log_segment.listed.ascending_compaction_files = compactions;
+
+    let cover = log_segment
+        .find_commit_cover_paths_in_range(oldest_exclusive, newest_inclusive, required_commits)
+        .into_iter()
+        .map(|path| path.location.location.clone())
+        .collect_vec();
+    assert_eq!(
+        cover,
+        expected_cover_locations(&log_segment.log_root, expected_files)
     );
 }
 
@@ -5652,7 +5753,7 @@ fn new_for_version_zero_rejects_non_commit_file() {
 }
 
 #[test]
-fn test_commit_phase_processes_commits() -> KernelResult<()> {
+fn test_commit_phase_processes_commits() -> Result<()> {
     let (engine, snapshot, _tempdir) = load_test_table("app-txn-no-checkpoint")?;
     let log_segment = snapshot.log_segment();
 
@@ -5698,9 +5799,26 @@ fn test_commit_phase_processes_commits() -> KernelResult<()> {
 }
 
 #[cfg(feature = "adaptive-metadata-in-dev")]
-#[test]
-fn latest_checkpoint_action_returns_none_without_checkpoint() -> KernelResult<()> {
+#[rstest]
+#[case::no_checkpoint_action(false)]
+#[case::checkpoint_action_in_log(true)]
+fn latest_checkpoint_action_returns_none_on_non_amt_table(
+    #[case] write_checkpoint_action: bool,
+) -> Result<()> {
     let (engine, table_root) = setup_table()?;
+    if write_checkpoint_action {
+        // The action carries the table's own protocol, so adaptiveMetadata stays disabled.
+        let config = Snapshot::builder_for(table_root.clone())
+            .build(&engine)?
+            .table_configuration()
+            .clone();
+        let checkpoint = CheckpointAction {
+            protocol: config.protocol().clone(),
+            metadata: config.metadata().clone(),
+            ..minimal_checkpoint_action("metadata/root-v1.parquet", 1)?
+        };
+        write_manifest_commit(&engine, &table_root, 1, checkpoint)?;
+    }
     let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
     assert!(snapshot.latest_checkpoint_action(&engine)?.is_none());
     Ok(())
@@ -5709,7 +5827,7 @@ fn latest_checkpoint_action_returns_none_without_checkpoint() -> KernelResult<()
 // The log is replayed newest-first, so the most recent `checkpoint` action wins.
 #[cfg(feature = "adaptive-metadata-in-dev")]
 #[test]
-fn latest_checkpoint_action_returns_the_latest_of_multiple() -> KernelResult<()> {
+fn latest_checkpoint_action_returns_the_latest_of_multiple() -> Result<()> {
     let (engine, table_root) = setup_table()?;
     write_manifest_commit(
         &engine,
@@ -5739,7 +5857,7 @@ fn latest_checkpoint_action_returns_the_latest_of_multiple() -> KernelResult<()>
 // A fresh snapshot does observe it.
 #[cfg(feature = "adaptive-metadata-in-dev")]
 #[test]
-fn latest_checkpoint_action_is_stable_when_newer_checkpoint_written_later() -> KernelResult<()> {
+fn latest_checkpoint_action_is_stable_when_newer_checkpoint_written_later() -> Result<()> {
     let (engine, table_root) = setup_table()?;
     write_manifest_commit(
         &engine,
@@ -5820,7 +5938,7 @@ async fn amt_last_checkpoint_hint_bounds_listing(
     #[case] checkpoint_file: Option<Version>,
     #[case] missing_commits: &[Version],
     #[case] end_version: Option<Version>,
-    #[case] expected: Result<(Option<Version>, Vec<Version>), &str>,
+    #[case] expected: KernelResult<(Option<Version>, Vec<Version>), &str>,
 ) {
     let hint = LastCheckpointHint {
         version: 5,
@@ -5860,7 +5978,7 @@ async fn amt_last_checkpoint_hint_bounds_listing(
 // the protocol and metadata come from the manifest commit's checkpoint action, not commit 0.
 #[cfg(feature = "adaptive-metadata-in-dev")]
 #[test]
-fn snapshot_with_amt_last_checkpoint_hint_skips_earlier_commits() -> KernelResult<()> {
+fn snapshot_with_amt_last_checkpoint_hint_skips_earlier_commits() -> Result<()> {
     let (engine, table_root) = setup_table()?;
     write_manifest_commit(
         &engine,
@@ -5885,7 +6003,7 @@ fn snapshot_with_amt_last_checkpoint_hint_skips_earlier_commits() -> KernelResul
         }),
         ..Default::default()
     };
-    let log_root = table_root.join("_delta_log/")?;
+    let log_root = table_root.join("_delta_log/").map_err(KernelError::from)?;
     engine.storage_handler().put(
         &LastCheckpointHint::path(&log_root)?,
         hint.to_json_bytes().into(),

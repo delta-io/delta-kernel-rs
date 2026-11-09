@@ -26,8 +26,8 @@ use crate::unit_test_utils::{
 };
 use crate::utils::try_parse_uri;
 use crate::{
-    CancellationTokenRef, Engine, EngineData, FileMeta, FileSlice, FilteredEngineData, KernelError,
-    KernelResult, KernelResultIterator, Snapshot, SnapshotReader, StorageHandler,
+    CancellationTokenRef, Engine, EngineData, Error, FileMeta, FileSlice, FilteredEngineData,
+    KernelError, KernelResult, KernelResultIterator, Snapshot, SnapshotReader, StorageHandler,
 };
 
 /// Handler entry point selected for a read.
@@ -255,7 +255,10 @@ fn cancelled_snapshot_reports_correlated_failure_with_metered_handlers(
     let result = Snapshot::builder_for(format!("tests/data/{table}"))
         .with_correlation_id("cancelled-snapshot")
         .build(engine.as_ref());
-    assert!(matches!(result, Err(KernelError::Cancelled)), "{result:?}");
+    assert!(
+        matches!(result, Err(Error::Kernel(KernelError::Cancelled))),
+        "{result:?}"
+    );
 
     let events = reporter.events();
     let failure = events
@@ -504,7 +507,7 @@ fn snapshot_reads_keep_builder_token(
     let events = reads.events.lock().unwrap();
     assert!(events.contains(&read));
     if cancel {
-        assert!(matches!(result, Err(KernelError::Cancelled)));
+        assert!(matches!(result, Err(Error::Kernel(KernelError::Cancelled))));
         assert_eq!(events.last(), Some(&read));
     } else if incremental {
         assert_eq!(result.unwrap().version(), 1);
@@ -527,7 +530,7 @@ fn discovery_keeps_builder_token(#[case] read: Read) {
     let result = Snapshot::builder_for("tests/data/table-without-dv-small")
         .with_cancellation_token(token)
         .build(&reads.engine());
-    assert!(matches!(result, Err(KernelError::Cancelled)));
+    assert!(matches!(result, Err(Error::Kernel(KernelError::Cancelled))));
     assert_eq!(reads.events.lock().unwrap().last(), Some(&read));
 }
 
@@ -540,7 +543,7 @@ fn completed_snapshot_does_not_retain_build_scope() {
         Snapshot::builder_for("tests/data/table-without-dv-small")
             .with_cancellation_token(cancelled)
             .build(&engine),
-        Err(KernelError::Cancelled)
+        Err(Error::Kernel(KernelError::Cancelled))
     ));
     let token: CancellationTokenRef = Arc::new(TestCancellationToken::default());
     let weak = Arc::downgrade(&token);

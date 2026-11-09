@@ -44,7 +44,7 @@
 //!     todo!("Write data batches to storage at path: {}", path)
 //! }
 //!
-//! # fn example(engine: &dyn Engine) -> KernelResult<()> {
+//! # fn example(engine: &dyn Engine) -> Result<(), Box<dyn std::error::Error>> {
 //! // Create a snapshot for the table
 //! let table_root = Url::parse("file:///path/to/table")?;
 //! let snapshot = Snapshot::builder_for(table_root).build(engine)?;

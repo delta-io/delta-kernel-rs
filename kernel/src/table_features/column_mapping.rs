@@ -601,9 +601,7 @@ pub(crate) fn try_assign_flat_column_mapping_info(
         (Some(preserved_id), None) => {
             *max_id = (*max_id).max(preserved_id);
             new_field.metadata.insert(
-                ColumnMetadataKey::ColumnMappingPhysicalName
-                    .as_ref()
-                    .to_string(),
+                ColumnMetadataKey::ColumnMappingPhysicalName.as_ref().into(),
                 MetadataValue::String(format!("col-{}", Uuid::new_v4())),
             );
         }
@@ -611,7 +609,7 @@ pub(crate) fn try_assign_flat_column_mapping_info(
         (None, Some(_)) => {
             let new_id = next_column_mapping_id(max_id)?;
             new_field.metadata.insert(
-                ColumnMetadataKey::ColumnMappingId.as_ref().to_string(),
+                ColumnMetadataKey::ColumnMappingId.as_ref().into(),
                 MetadataValue::Number(new_id),
             );
         }
@@ -619,13 +617,11 @@ pub(crate) fn try_assign_flat_column_mapping_info(
         (None, None) => {
             let new_id = next_column_mapping_id(max_id)?;
             new_field.metadata.insert(
-                ColumnMetadataKey::ColumnMappingId.as_ref().to_string(),
+                ColumnMetadataKey::ColumnMappingId.as_ref().into(),
                 MetadataValue::Number(new_id),
             );
             new_field.metadata.insert(
-                ColumnMetadataKey::ColumnMappingPhysicalName
-                    .as_ref()
-                    .to_string(),
+                ColumnMetadataKey::ColumnMappingPhysicalName.as_ref().into(),
                 MetadataValue::String(format!("col-{}", Uuid::new_v4())),
             );
         }
@@ -780,9 +776,7 @@ fn expect_physical_name(field: &StructField) -> KernelResult<String> {
 /// Sets the collected nested ids on `field` under the `delta.columnMapping.nested.ids` key.
 fn insert_nested_field_ids_metadata(field: &mut StructField, ids: NestedFieldIds) {
     field.metadata.insert(
-        ColumnMetadataKey::ColumnMappingNestedIds
-            .as_ref()
-            .to_string(),
+        ColumnMetadataKey::ColumnMappingNestedIds.as_ref().into(),
         MetadataValue::Other(serde_json::Value::Object(ids)),
     );
 }
@@ -2742,7 +2736,7 @@ mod tests {
     fn field_with_id(name: &str, ty: impl Into<DataType>, id: i64) -> StructField {
         let mut f = StructField::nullable(name, ty);
         f.metadata.insert(
-            ColumnMetadataKey::ColumnMappingId.as_ref().to_string(),
+            ColumnMetadataKey::ColumnMappingId.as_ref().into(),
             MetadataValue::Number(id),
         );
         f
@@ -2830,9 +2824,7 @@ mod tests {
             1,
         );
         field.metadata.insert(
-            ColumnMetadataKey::ColumnMappingNestedIds
-                .as_ref()
-                .to_string(),
+            ColumnMetadataKey::ColumnMappingNestedIds.as_ref().into(),
             MetadataValue::Other(serde_json::json!({
                 "m.key":   2,
                 "m.value": 99,

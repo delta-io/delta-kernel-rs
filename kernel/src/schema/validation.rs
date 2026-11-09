@@ -304,7 +304,7 @@ mod tests {
     fn field_with_invariant(name: &str, data_type: DataType, nullable: bool) -> StructField {
         let mut field = StructField::new(name, data_type, nullable);
         field.metadata.insert(
-            ColumnMetadataKey::Invariants.as_ref().to_string(),
+            ColumnMetadataKey::Invariants.as_ref().into(),
             MetadataValue::String(r#"{"expression": {"expression": "x > 0"}}"#.to_string()),
         );
         field

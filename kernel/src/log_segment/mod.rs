@@ -56,7 +56,7 @@ mod crc_replay;
 mod domain_metadata_replay;
 mod protocol_metadata_replay;
 
-pub(crate) use domain_metadata_replay::DomainMetadataMap;
+pub(crate) use domain_metadata_replay::{DomainMetadataMap, scan_domain_metadata_actions};
 #[cfg(feature = "adaptive-metadata-in-dev")]
 pub(crate) use protocol_metadata_replay::LastManifestCommitResolution;
 pub(crate) use protocol_metadata_replay::PmResolution;
@@ -185,21 +185,7 @@ pub(crate) fn validate_catalog_managed_log_tail(
     let has_staged_commits = log_tail
         .iter()
         .any(|path| path.file_type == LogPathFileType::StagedCommit);
-    validate_catalog_managed_versions(
-        requested_version,
-        max_catalog_version,
-        has_staged_commits,
-        log_tail.last().map(|path| path.version),
-    )
-}
-
-/// Validate catalog version bounds against the staged commits available to the caller.
-pub(crate) fn validate_catalog_managed_versions(
-    requested_version: Option<Version>,
-    max_catalog_version: Option<Version>,
-    has_staged_commits: bool,
-    latest_commit_version: Option<Version>,
-) -> KernelResult<()> {
+    // Newly supplied staged commits require a bound even when the tail ends in a downgrade.
     require!(
         !has_staged_commits || max_catalog_version.is_some(),
         KernelError::MaxCatalogVersion(
@@ -209,6 +195,19 @@ pub(crate) fn validate_catalog_managed_versions(
         )
     );
 
+    validate_catalog_version_bounds(
+        requested_version,
+        max_catalog_version,
+        log_tail.last().map(|path| path.version),
+    )
+}
+
+/// Validate requested and terminal commit versions against a supplied catalog bound.
+pub(crate) fn validate_catalog_version_bounds(
+    requested_version: Option<Version>,
+    max_catalog_version: Option<Version>,
+    latest_commit_version: Option<Version>,
+) -> KernelResult<()> {
     if let (Some(requested_version), Some(max_catalog_version)) =
         (requested_version, max_catalog_version)
     {
@@ -228,8 +227,8 @@ pub(crate) fn validate_catalog_managed_versions(
             require!(
                 latest_commit_version >= requested_version,
                 KernelError::MaxCatalogVersion(format!(
-                    "Log tail version {} is less than requested version {requested_version} for \
-                     max catalog version {max_catalog_version}",
+                    "Latest commit version {} is less than requested version {requested_version} \
+                     for max catalog version {max_catalog_version}",
                     latest_commit_version
                 ))
             );
@@ -237,7 +236,7 @@ pub(crate) fn validate_catalog_managed_versions(
             require!(
                 latest_commit_version == max_catalog_version,
                 KernelError::MaxCatalogVersion(format!(
-                    "Log tail version {} does not match max catalog version \
+                    "Latest commit version {} does not match max catalog version \
                      {max_catalog_version}",
                     latest_commit_version
                 ))
@@ -925,8 +924,7 @@ impl LogSegment {
         meta_predicate: Option<PredicateRef>,
         stats_schema: Option<&StructType>,
         partition_schema: Option<&StructType>,
-    ) -> KernelResult<ActionsWithCheckpointInfo<impl KernelResultIterator<ActionsBatch> + use<>>>
-    {
+    ) -> KernelResult<ActionsWithCheckpointInfo<Box<dyn KernelResultIterator<ActionsBatch>>>> {
         // Combine the action-presence predicate with the caller's skipping predicate so readers
         // can omit checkpoint data that cannot contain a relevant action.
         let projection_predicate = checkpoint_action_projection_predicate(&checkpoint_read_schema);
@@ -946,7 +944,7 @@ impl LogSegment {
         )?;
 
         Ok(ActionsWithCheckpointInfo {
-            actions: commit_stream.chain(checkpoint_result.actions),
+            actions: Box::new(commit_stream.chain(checkpoint_result.actions)),
             checkpoint_info: checkpoint_result.checkpoint_info,
         })
     }
@@ -958,7 +956,6 @@ impl LogSegment {
     ///
     /// `table_root` resolves the action's manifest locations.
     #[cfg(feature = "adaptive-metadata-in-dev")]
-    #[cfg_attr(not(test), allow(dead_code))]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn read_actions_with_checkpoint_action(
         &self,
@@ -1125,15 +1122,42 @@ impl LogSegment {
     }
 
     fn find_commit_cover_paths(&self, after: Option<Version>) -> Vec<&ParsedLogPath> {
+        self.find_commit_cover_paths_in_range(after, self.end_version, &[])
+    }
+
+    /// The commit cover over versions in `(oldest_exclusive, newest_inclusive]`, in descending
+    /// order. Each of `required_commits` is read as its own commit file, never through a log
+    /// compaction. A compaction that crosses either end of the range is read as its individual
+    /// commits within the range.
+    fn find_commit_cover_paths_in_range(
+        &self,
+        oldest_exclusive: Option<Version>,
+        newest_inclusive: Version,
+        required_commits: &[Version],
+    ) -> Vec<&ParsedLogPath> {
+        let commits = self
+            .listed
+            .ascending_commit_files
+            .iter()
+            .filter(|commit| commit.version <= newest_inclusive);
+        let compactions = self
+            .listed
+            .ascending_compaction_files
+            .iter()
+            .filter(|compaction| {
+                matches!(
+                    compaction.file_type,
+                    LogPathFileType::CompactedCommit { hi } if hi <= newest_inclusive
+                        && !required_commits.iter().any(|v| (compaction.version..=hi).contains(v))
+                )
+            });
         // Create an iterator sorted in ascending order by (initial version, end version), e.g.
         // [00.json, 00.09.compacted.json, 00.99.compacted.json, 01.json, 02.json, ..., 10.json,
         //  10.19.compacted.json, 11.json, ...]
-        let all_files = itertools::Itertools::merge_by(
-            self.listed.ascending_commit_files.iter(),
-            self.listed.ascending_compaction_files.iter(),
-            |path_a, path_b| path_a.version <= path_b.version,
-        )
-        .filter(|path| after.is_none_or(|after| path.version > after));
+        let all_files = itertools::Itertools::merge_by(commits, compactions, |path_a, path_b| {
+            path_a.version <= path_b.version
+        })
+        .filter(|path| oldest_exclusive.is_none_or(|oldest| path.version > oldest));
 
         let mut last_pushed: Option<&ParsedLogPath> = None;
 
