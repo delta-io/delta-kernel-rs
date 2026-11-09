@@ -1013,6 +1013,7 @@ impl LogSegment {
             checkpoint,
             &LogRoot::new(table_root.clone())?,
             checkpoint_read_schema.clone(),
+            stats_schema,
         )?;
         Ok(ActionsWithCheckpointInfo {
             actions: Box::new(commits.chain(checkpoint_actions)),
