@@ -1,22 +1,24 @@
-//! Validation of content-tree entry batches with predicates instead of row visitors.
+//! Validation of content-tree entry batches against predicate conditions.
 //!
-//! Each check is an [`AssertCondition`]: a predicate every row must satisfy, an id, and the
-//! columns whose values its error reports. A [`ConditionSet`] evaluates all of its conditions with
-//! one evaluator per input schema, and the first failing row becomes the error that the set's
-//! error table builds for that condition's id.
+//! Each [`AssertCondition`] is a predicate every row must satisfy. A [`ConditionChecker`] pairs
+//! conditions with the errors they report and finds the first row of a batch that fails one.
 
-use std::ops::Range;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
 use crate::error::{KernelError, KernelResult};
-use crate::expressions::{ColumnName, Expression, ExpressionRef, Predicate};
+use crate::expressions::{ColumnName, Expression, Predicate, column_name, lit, null_lit};
 use crate::schema::{ColumnNamesAndTypes, DataType, SchemaRef, StructField, StructType};
 use crate::{EngineData, EvaluationHandler, ExpressionEvaluator};
 
-/// A predicate every row of a batch must satisfy. A row fails when the predicate is FALSE or NULL.
-/// When a row fails, the values of `diagnostic_cols` in that row are passed to the error the
-/// condition's `id` selects.
+/// The most diagnostic columns one condition can report.
+const MAX_DIAGNOSTICS: usize = 4;
+
+/// A predicate every row of a batch must satisfy. A row fails when the predicate is FALSE or NULL,
+/// and the values of `diagnostic_cols` in that row are passed to the condition's error.
+///
+/// The predicate must not fail evaluation on any row (no strict casts or checked arithmetic):
+/// all conditions are evaluated together, so one evaluation error would hide every failure.
 #[derive(Debug, Clone)]
 pub(crate) struct AssertCondition {
     pub(crate) id: &'static str,
@@ -24,149 +26,170 @@ pub(crate) struct AssertCondition {
     pub(crate) diagnostic_cols: Vec<ColumnName>,
 }
 
-/// Builds the error for a failed condition from its diagnostic values, in `diagnostic_cols` order,
-/// read as strings. NULL values are `None`.
-pub(crate) type ConditionError = fn(&[Option<String>]) -> KernelError;
+/// Builds the error for a failed condition from its diagnostic values, in `diagnostic_cols` order
+/// and read as strings. NULL values are `None`.
+pub(crate) type ConditionErrorFn = fn(&[Option<&str>]) -> KernelError;
 
-/// A fixed list of conditions and the error table their ids select from. Row visitors need
-/// `'static` column lists, so a set is built once, typically in a `LazyLock`.
-pub(crate) struct ConditionSet {
-    conditions: Vec<AssertCondition>,
-    errors: &'static [(&'static str, ConditionError)],
-    expression: ExpressionRef,
-    output_type: DataType,
-    columns: ColumnNamesAndTypes,
-    field_names: Vec<String>,
+/// A condition and the error it reports.
+#[derive(Debug, Clone)]
+pub(crate) struct Check {
+    pub(crate) condition: AssertCondition,
+    pub(crate) error: ConditionErrorFn,
 }
 
-impl ConditionSet {
-    /// Collects `conditions` into one struct expression: a BOOLEAN field per condition, then each
-    /// condition's diagnostic columns cast to STRING.
-    pub(crate) fn new(
-        conditions: Vec<AssertCondition>,
-        errors: &'static [(&'static str, ConditionError)],
-    ) -> Self {
-        let predicates = conditions.iter().enumerate().map(|(i, condition)| {
-            let field = StructField::nullable(format!("c{i}"), DataType::BOOLEAN);
-            (field, Expression::from(condition.predicate.clone()))
-        });
-        let diagnostics = conditions.iter().enumerate().flat_map(|(i, condition)| {
-            condition
-                .diagnostic_cols
-                .iter()
-                .enumerate()
-                .map(move |(j, col)| {
-                    let field = StructField::nullable(format!("c{i}_d{j}"), DataType::STRING);
-                    (
-                        field,
-                        Expression::cast(Expression::column(col.clone()), DataType::STRING),
-                    )
-                })
-        });
-        let (fields, exprs): (Vec<_>, Vec<_>) = predicates.chain(diagnostics).unzip();
-        let field_names: Vec<String> = fields.iter().map(|field| field.name().clone()).collect();
-        let columns = fields
-            .iter()
-            .map(|field| (ColumnName::new([field.name()]), field.data_type().clone()))
-            .unzip::<_, _, Vec<_>, Vec<_>>()
-            .into();
-        Self {
-            conditions,
-            errors,
-            expression: Arc::new(Expression::struct_from(exprs)),
-            output_type: StructType::new_unchecked(fields).into(),
-            columns,
-            field_names,
-        }
-    }
-
-    /// Creates a checker for batches with `input_schema`.
-    pub(crate) fn checker(
-        &'static self,
-        handler: &dyn EvaluationHandler,
-        input_schema: SchemaRef,
-    ) -> KernelResult<ConditionChecker> {
-        let evaluator = handler.new_expression_evaluator(
-            input_schema,
-            self.expression.clone(),
-            self.output_type.clone(),
-        )?;
-        Ok(ConditionChecker {
-            set: self,
-            evaluator,
-        })
-    }
-
-    /// The error the table builds for a failure of the condition at `index`.
-    fn error(&self, index: usize, diagnostics: &[Option<String>]) -> KernelError {
-        let id = self.conditions[index].id;
-        match self.errors.iter().find(|(entry_id, _)| *entry_id == id) {
-            Some((_, error)) => error(diagnostics),
-            None => {
-                KernelError::internal_error(format!("No error is registered for condition '{id}'"))
-            }
-        }
-    }
-
-    /// The output columns holding the condition at `index`'s diagnostic values.
-    fn diagnostic_range(&self, index: usize) -> Range<usize> {
-        let start = self.conditions.len()
-            + self.conditions[..index]
-                .iter()
-                .map(|condition| condition.diagnostic_cols.len())
-                .sum::<usize>();
-        start..start + self.conditions[index].diagnostic_cols.len()
-    }
-}
-
-/// Checks batches with one input schema against a [`ConditionSet`].
+/// Checks batches with one input schema against a list of [`Check`]s.
 pub(crate) struct ConditionChecker {
-    set: &'static ConditionSet,
-    evaluator: Arc<dyn ExpressionEvaluator>,
+    checks: Vec<Check>,
+    /// Yields, per row, the index of the first failing condition, or NULL when every one passes.
+    first_failure: Arc<dyn ExpressionEvaluator>,
+    /// Per condition, yields its diagnostics as [`MAX_DIAGNOSTICS`] STRING fields, NULL-padded.
+    diagnostics: Vec<Arc<dyn ExpressionEvaluator>>,
 }
 
 impl ConditionChecker {
+    /// Creates a checker for batches with `input_schema`. Errors if a condition has more than
+    /// [`MAX_DIAGNOSTICS`] diagnostic columns, or one that is missing or not a primitive type
+    /// other than BINARY, since only those render as STRING.
+    pub(crate) fn try_new(
+        handler: &dyn EvaluationHandler,
+        input_schema: SchemaRef,
+        checks: Vec<Check>,
+    ) -> KernelResult<Self> {
+        // `CASE WHEN p0 THEN (CASE WHEN p1 THEN .. ELSE 1 END) ELSE 0 END`: CASE takes its ELSE
+        // branch for FALSE and NULL alike, which is exactly a failed condition.
+        let first_failure = checks.iter().enumerate().rev().try_fold(
+            null_lit(DataType::INTEGER),
+            |all_later_pass, (index, check)| {
+                let index = i32::try_from(index).map_err(|_| {
+                    KernelError::internal_error(format!("Too many conditions: {}", checks.len()))
+                })?;
+                Ok::<_, KernelError>(Expression::case_when(
+                    [(check.condition.predicate.clone(), all_later_pass)],
+                    lit(index),
+                ))
+            },
+        )?;
+        let first_failure = handler.new_expression_evaluator(
+            input_schema.clone(),
+            Arc::new(first_failure),
+            DataType::INTEGER,
+        )?;
+        let diagnostics = checks
+            .iter()
+            .map(|check| {
+                let diagnostics = diagnostic_expression(&check.condition, &input_schema)?;
+                handler.new_expression_evaluator(
+                    input_schema.clone(),
+                    Arc::new(diagnostics),
+                    DIAGNOSTICS_SCHEMA.clone().into(),
+                )
+            })
+            .collect::<KernelResult<_>>()?;
+        Ok(Self {
+            checks,
+            first_failure,
+            diagnostics,
+        })
+    }
+
     /// Errors for the first row of `batch` that fails a condition. Within a row, conditions are
-    /// checked in the order the set lists them.
+    /// checked in the order they were given.
     pub(crate) fn check(&self, batch: &dyn EngineData) -> KernelResult<()> {
-        let evaluated = self.evaluator.evaluate(batch)?;
-        let mut visitor = FirstFailureVisitor {
-            set: self.set,
-            failure: None,
+        let mut first_failure = FirstFailureVisitor(None);
+        first_failure.visit_rows_of(self.first_failure.evaluate(batch)?.as_ref())?;
+        let Some((row, index)) = first_failure.0 else {
+            return Ok(());
         };
-        visitor.visit_rows_of(evaluated.as_ref())?;
-        match visitor.failure {
-            Some((index, diagnostics)) => Err(self.set.error(index, &diagnostics)),
-            None => Ok(()),
-        }
+        let check = self.checks.get(index).ok_or_else(|| {
+            KernelError::internal_error(format!("Condition index {index} is out of range"))
+        })?;
+        let mut diagnostics = DiagnosticsVisitor {
+            row,
+            count: check.condition.diagnostic_cols.len(),
+            error: check.error,
+            result: Ok(()),
+        };
+        diagnostics.visit_rows_of(self.diagnostics[index].evaluate(batch)?.as_ref())?;
+        diagnostics.result
     }
 }
 
-/// Finds the first row where a condition is not TRUE and reads that condition's diagnostics.
-struct FirstFailureVisitor {
-    set: &'static ConditionSet,
-    failure: Option<(usize, Vec<Option<String>>)>,
+/// `STRUCT(CAST(d0 AS STRING), ..)` over `condition`'s diagnostic columns, NULL-padded to
+/// [`MAX_DIAGNOSTICS`] fields.
+fn diagnostic_expression(
+    condition: &AssertCondition,
+    input_schema: &StructType,
+) -> KernelResult<Expression> {
+    let cols = &condition.diagnostic_cols;
+    if cols.len() > MAX_DIAGNOSTICS {
+        return Err(KernelError::internal_error(format!(
+            "Condition '{}' has {} diagnostic columns, more than the {MAX_DIAGNOSTICS} supported",
+            condition.id,
+            cols.len()
+        )));
+    }
+    let values = cols.iter().map(|col| match column_type(input_schema, col) {
+        Some(data_type @ DataType::Primitive(_)) if *data_type != DataType::BINARY => Ok(
+            Expression::cast(Expression::column(col.clone()), DataType::STRING),
+        ),
+        other => Err(KernelError::internal_error(format!(
+            "Condition '{}' diagnostic column {col} has type {other:?}, which cannot be \
+                 reported as STRING",
+            condition.id
+        ))),
+    });
+    let padding = (cols.len()..MAX_DIAGNOSTICS).map(|_| Ok(null_lit(DataType::STRING)));
+    Ok(Expression::struct_from(
+        values.chain(padding).collect::<KernelResult<Vec<_>>>()?,
+    ))
 }
+
+/// The type of the (possibly nested) column `col` in `schema`, if it exists.
+fn column_type<'a>(schema: &'a StructType, col: &ColumnName) -> Option<&'a DataType> {
+    let (first, rest) = col.path().split_first()?;
+    let mut data_type = schema.field(first)?.data_type();
+    for name in rest {
+        let DataType::Struct(inner) = data_type else {
+            return None;
+        };
+        data_type = inner.field(name)?.data_type();
+    }
+    Some(data_type)
+}
+
+static FIRST_FAILURE_COLUMNS: LazyLock<ColumnNamesAndTypes> =
+    LazyLock::new(|| (vec![column_name!("output")], vec![DataType::INTEGER]).into());
+
+static DIAGNOSTICS_SCHEMA: LazyLock<StructType> = LazyLock::new(|| {
+    StructType::new_unchecked(
+        (0..MAX_DIAGNOSTICS).map(|i| StructField::nullable(format!("d{i}"), DataType::STRING)),
+    )
+});
+
+static DIAGNOSTICS_COLUMNS: LazyLock<ColumnNamesAndTypes> = LazyLock::new(|| {
+    DIAGNOSTICS_SCHEMA
+        .fields()
+        .map(|field| (ColumnName::new([field.name()]), DataType::STRING))
+        .unzip::<_, _, Vec<_>, Vec<_>>()
+        .into()
+});
+
+/// Finds the first row with a failed condition, as `(row, condition index)`.
+struct FirstFailureVisitor(Option<(usize, usize)>);
 
 impl RowVisitor for FirstFailureVisitor {
     fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
-        self.set.columns.as_ref()
+        FIRST_FAILURE_COLUMNS.as_ref()
     }
 
     fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> KernelResult<()> {
-        let names = &self.set.field_names;
         for row in 0..row_count {
-            for index in 0..self.set.conditions.len() {
-                let passed: Option<bool> = getters[index].get_opt(row, &names[index])?;
-                if passed == Some(true) {
-                    continue;
-                }
-                let diagnostics = self
-                    .set
-                    .diagnostic_range(index)
-                    .map(|column| getters[column].get_opt(row, &names[column]))
-                    .collect::<KernelResult<_>>()?;
-                self.failure = Some((index, diagnostics));
+            let index: Option<i32> = getters[0].get_opt(row, "output")?;
+            if let Some(index) = index {
+                let index = usize::try_from(index).map_err(|_| {
+                    KernelError::internal_error(format!("Negative condition index {index}"))
+                })?;
+                self.0 = Some((row, index));
                 return Ok(());
             }
         }
@@ -174,79 +197,63 @@ impl RowVisitor for FirstFailureVisitor {
     }
 }
 
+/// Reads one row's diagnostics and builds the failed condition's error from them.
+struct DiagnosticsVisitor {
+    row: usize,
+    count: usize,
+    error: ConditionErrorFn,
+    result: KernelResult<()>,
+}
+
+impl RowVisitor for DiagnosticsVisitor {
+    fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
+        DIAGNOSTICS_COLUMNS.as_ref()
+    }
+
+    fn visit<'a>(
+        &mut self,
+        _row_count: usize,
+        getters: &[&'a dyn GetData<'a>],
+    ) -> KernelResult<()> {
+        let values: Vec<Option<&str>> = getters[..self.count]
+            .iter()
+            .enumerate()
+            .map(|(i, getter)| getter.get_opt(self.row, &format!("d{i}")))
+            .collect::<KernelResult<_>>()?;
+        self.result = Err((self.error)(&values));
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use std::sync::LazyLock;
-
     use rstest::rstest;
 
     use super::*;
-    use crate::arrow::array::{ArrayRef, Int32Array, RecordBatch, StringArray};
+    use crate::arrow::array::{
+        ArrayRef, BinaryArray, Int32Array, RecordBatch, StringArray, StructArray,
+    };
+    use crate::arrow::datatypes::{DataType as ArrowDataType, Field as ArrowField, Fields};
     use crate::engine::arrow_data::ArrowEngineData;
     use crate::engine::arrow_expression::ArrowEvaluationHandler;
-    use crate::expressions::{col, column_name, lit};
+    use crate::expressions::col;
     use crate::schema::schema_ref;
 
-    const NON_PARQUET: &str = "NonParquetDataFile";
-    const PARTITION_SPEC: &str = "NonZeroPartitionSpec";
-    const UNREGISTERED: &str = "Unregistered";
+    type Row = (&'static str, Option<&'static str>, Option<i32>);
 
-    fn non_parquet(values: &[Option<String>]) -> KernelError {
-        KernelError::unsupported(format!(
-            "entry {:?} has file format {:?}",
-            values[0], values[1]
-        ))
-    }
-
-    fn partition_spec(values: &[Option<String>]) -> KernelError {
-        KernelError::unsupported(format!("entry {:?} has spec {:?}", values[0], values[1]))
-    }
-
-    static ERRORS: &[(&str, ConditionError)] =
-        &[(NON_PARQUET, non_parquet), (PARTITION_SPEC, partition_spec)];
-
-    static CONDITIONS: LazyLock<ConditionSet> = LazyLock::new(|| {
-        ConditionSet::new(
-            vec![
-                AssertCondition {
-                    id: NON_PARQUET,
-                    predicate: Predicate::eq(col!("format"), lit("parquet")),
-                    diagnostic_cols: vec![column_name!("location"), column_name!("format")],
-                },
-                AssertCondition {
-                    id: PARTITION_SPEC,
-                    predicate: Predicate::or(
-                        Predicate::is_null(col!("spec")),
-                        Predicate::eq(col!("spec"), lit(0)),
-                    ),
-                    diagnostic_cols: vec![column_name!("location"), column_name!("spec")],
-                },
-            ],
-            ERRORS,
-        )
-    });
-
-    static UNREGISTERED_CONDITIONS: LazyLock<ConditionSet> = LazyLock::new(|| {
-        ConditionSet::new(
-            vec![AssertCondition {
-                id: UNREGISTERED,
-                predicate: Predicate::FALSE,
-                diagnostic_cols: vec![],
-            }],
-            ERRORS,
-        )
-    });
-
-    /// Checks one batch of `(location, format, spec)` rows against `set`.
-    fn check(
-        set: &'static ConditionSet,
-        rows: &[(&str, Option<&str>, Option<i32>)],
-    ) -> KernelResult<()> {
-        let schema = schema_ref! {
+    fn input_schema() -> SchemaRef {
+        schema_ref! {
             nullable "location": STRING,
             nullable "format": STRING,
             nullable "spec": INTEGER,
-        };
+            nullable "meta": { nullable "x": INTEGER },
+            nullable "raw": BINARY,
+        }
+    }
+
+    fn batch(rows: &[Row]) -> ArrowEngineData {
+        let meta_fields = Fields::from(vec![ArrowField::new("x", ArrowDataType::Int32, true)]);
+        let meta = StructArray::new_null(meta_fields, rows.len());
         let batch = RecordBatch::try_from_iter([
             (
                 "location",
@@ -260,49 +267,143 @@ mod tests {
                 "spec",
                 Arc::new(Int32Array::from_iter(rows.iter().map(|r| r.2))) as ArrayRef,
             ),
+            ("meta", Arc::new(meta) as ArrayRef),
+            (
+                "raw",
+                Arc::new(BinaryArray::from_iter(rows.iter().map(|_| None::<&[u8]>))) as ArrayRef,
+            ),
         ])
         .unwrap();
-        set.checker(&ArrowEvaluationHandler, schema)?
-            .check(&ArrowEngineData::new(batch))
+        ArrowEngineData::new(batch)
+    }
+
+    fn checks() -> Vec<Check> {
+        vec![
+            Check {
+                condition: AssertCondition {
+                    id: "NonParquetDataFile",
+                    predicate: Predicate::eq(col!("format"), lit("parquet")),
+                    diagnostic_cols: vec![column_name!("location"), column_name!("format")],
+                },
+                error: |values| {
+                    KernelError::unsupported(format!(
+                        "entry '{}' has file format '{}'",
+                        values[0].unwrap_or("NULL"),
+                        values[1].unwrap_or("NULL")
+                    ))
+                },
+            },
+            Check {
+                condition: AssertCondition {
+                    id: "NonZeroPartitionSpec",
+                    predicate: Predicate::or(
+                        Predicate::is_null(col!("spec")),
+                        Predicate::eq(col!("spec"), lit(0)),
+                    ),
+                    diagnostic_cols: vec![column_name!("location"), column_name!("spec")],
+                },
+                error: |values| {
+                    KernelError::unsupported(format!(
+                        "entry '{}' has spec {}",
+                        values[0].unwrap_or("NULL"),
+                        values[1].unwrap_or("NULL")
+                    ))
+                },
+            },
+        ]
+    }
+
+    fn checker(checks: Vec<Check>) -> KernelResult<ConditionChecker> {
+        ConditionChecker::try_new(&ArrowEvaluationHandler, input_schema(), checks)
     }
 
     #[rstest]
-    #[case::no_rows(&[])]
-    #[case::all_pass(&[("a", Some("parquet"), None), ("b", Some("parquet"), Some(0))])]
-    fn test_check_passes_when_every_row_satisfies_every_condition(
-        #[case] rows: &[(&str, Option<&str>, Option<i32>)],
-    ) {
-        check(&CONDITIONS, rows).unwrap();
-    }
-
-    #[rstest]
+    #[case::no_rows(&[], None)]
+    #[case::all_pass(&[("a", Some("parquet"), None), ("b", Some("parquet"), Some(0))], None)]
     #[case::false_predicate(
         &[("a", Some("parquet"), None), ("b", Some("orc"), None)],
-        "entry Some(\"b\") has file format Some(\"orc\")"
+        Some("entry 'b' has file format 'orc'")
     )]
-    #[case::null_predicate(&[("a", None, None)], "entry Some(\"a\") has file format None")]
+    #[case::null_predicate(&[("a", None, None)], Some("entry 'a' has file format 'NULL'"))]
     #[case::first_failing_row_wins(
         &[("a", Some("parquet"), Some(3)), ("b", Some("orc"), None)],
-        "entry Some(\"a\") has spec Some(\"3\")"
+        Some("entry 'a' has spec 3")
     )]
     #[case::earlier_condition_wins_within_a_row(
         &[("a", Some("orc"), Some(3))],
-        "entry Some(\"a\") has file format Some(\"orc\")"
+        Some("entry 'a' has file format 'orc'")
     )]
-    fn test_check_reports_first_failure_with_its_diagnostics(
-        #[case] rows: &[(&str, Option<&str>, Option<i32>)],
-        #[case] message: &str,
-    ) {
-        let err = check(&CONDITIONS, rows).unwrap_err();
+    fn test_check_reports_the_first_failure(#[case] rows: &[Row], #[case] expected: Option<&str>) {
+        let result = checker(checks()).unwrap().check(&batch(rows));
+        match expected {
+            None => result.unwrap(),
+            Some(message) => assert!(
+                matches!(&result, Err(KernelError::Unsupported(m)) if m == message),
+                "{result:?}"
+            ),
+        }
+    }
+
+    #[test]
+    fn test_checker_is_reusable_across_batches() {
+        let checker = checker(checks()).unwrap();
+        checker
+            .check(&batch(&[("a", Some("parquet"), None)]))
+            .unwrap();
+        checker
+            .check(&batch(&[("b", Some("orc"), None)]))
+            .unwrap_err();
+        checker
+            .check(&batch(&[("c", Some("parquet"), Some(0))]))
+            .unwrap();
+    }
+
+    #[test]
+    fn test_condition_without_diagnostics_gets_no_values() {
+        let check = Check {
+            condition: AssertCondition {
+                id: "AlwaysFails",
+                predicate: Predicate::FALSE,
+                diagnostic_cols: vec![],
+            },
+            error: |values| KernelError::unsupported(format!("{} values", values.len())),
+        };
+        let err = checker(vec![check])
+            .unwrap()
+            .check(&batch(&[("a", None, None)]))
+            .unwrap_err();
         assert!(
-            matches!(&err, KernelError::Unsupported(m) if m == message),
+            matches!(&err, KernelError::Unsupported(m) if m == "0 values"),
             "{err}"
         );
     }
 
     #[test]
-    fn test_check_errors_when_a_condition_has_no_registered_error() {
-        let err = check(&UNREGISTERED_CONDITIONS, &[("a", None, None)]).unwrap_err();
-        assert!(err.to_string().contains("Unregistered"), "{err}");
+    fn test_no_conditions_always_pass() {
+        checker(vec![])
+            .unwrap()
+            .check(&batch(&[("a", None, None)]))
+            .unwrap();
+    }
+
+    #[rstest]
+    #[case::missing(vec![column_name!("nope")], "nope")]
+    #[case::struct_type(vec![column_name!("meta")], "meta")]
+    #[case::binary(vec![column_name!("raw")], "raw")]
+    #[case::too_many(vec![column_name!("location"); MAX_DIAGNOSTICS + 1], "more than")]
+    fn test_try_new_rejects_unreportable_diagnostics(
+        #[case] diagnostic_cols: Vec<ColumnName>,
+        #[case] message: &str,
+    ) {
+        let check = Check {
+            condition: AssertCondition {
+                id: "Bad",
+                predicate: Predicate::TRUE,
+                diagnostic_cols,
+            },
+            error: |_| KernelError::unsupported("unused"),
+        };
+        let err = checker(vec![check]).err().unwrap();
+        assert!(err.to_string().contains(message), "{err}");
     }
 }
