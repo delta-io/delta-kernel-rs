@@ -73,6 +73,7 @@ fn binary_to_df_predicate_expr(
     binary: &KernelBinaryPredicate,
     input_schema: &StructType,
 ) -> KernelResult<DFExpr> {
+    let lower = |expr| to_df_expr(expr, input_schema, None);
     let op = match binary.op {
         KernelBinaryPredicateOp::In => {
             return in_to_df_predicate_expr(&binary.left, &binary.right, input_schema);
@@ -82,14 +83,10 @@ fn binary_to_df_predicate_expr(
         KernelBinaryPredicateOp::GreaterThan => Operator::Gt,
         KernelBinaryPredicateOp::Distinct => Operator::IsDistinctFrom,
         KernelBinaryPredicateOp::StartsWith => {
-            let string = to_df_expr(&binary.left, input_schema, None)?;
-            let prefix = to_df_expr(&binary.right, input_schema, None)?;
-            return Ok(starts_with(string, prefix));
+            return Ok(starts_with(lower(&binary.left)?, lower(&binary.right)?));
         }
     };
-    let left = to_df_expr(&binary.left, input_schema, None)?;
-    let right = to_df_expr(&binary.right, input_schema, None)?;
-    Ok(binary_expr(left, op, right))
+    Ok(binary_expr(lower(&binary.left)?, op, lower(&binary.right)?))
 }
 
 /// Lowers an `IN` predicate. Kernel models `x IN (..)` as `Binary(In, value, elements)`, where
@@ -398,8 +395,6 @@ mod tests {
         to_df_predicate_expr(&pred, &test_schema()).unwrap_err();
     }
 
-    /// DataFusion's `starts_with` lowering agrees with the kernel evaluator for every string
-    /// representation, with a column or literal prefix, with or without `NOT`.
     #[rstest]
     #[case::column_prefix(col!("p"), [Some(true), Some(false), Some(true), None, None])]
     #[case::literal_prefix(lit("/"), [Some(true), Some(false), Some(false), None, Some(true)])]
@@ -444,18 +439,20 @@ mod tests {
     /// Like the kernel evaluator, DataFusion rejects a non-string `starts_with` operand rather
     /// than casting it to a string.
     #[rstest]
-    fn starts_with_rejects_non_string_input(#[values(false, true)] non_string_prefix: bool) {
-        let pred = if non_string_prefix {
+    fn starts_with_rejects_non_string_input(
+        #[values(
+            KernelPred::starts_with(col!("a"), lit("1")),
             KernelPred::starts_with(lit("1"), col!("a"))
-        } else {
-            KernelPred::starts_with(col!("a"), lit("1"))
-        };
+        )]
+        pred: KernelPred,
+    ) {
         let df_expr = to_df_predicate_expr(&pred, &test_schema()).unwrap();
         let arrow_schema: ArrowSchema = (&test_schema()).try_into_arrow().unwrap();
         let df_schema = DFSchema::try_from(arrow_schema).unwrap();
-        SessionContext::new()
+        let err = SessionContext::new()
             .create_physical_expr(df_expr, &df_schema)
             .unwrap_err();
+        assert!(err.to_string().contains("starts_with"), "{err}");
     }
 
     /// `IN` answers true or false but never null, so it still works under a `NOT`. Membership uses

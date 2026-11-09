@@ -855,6 +855,7 @@ pub fn evaluate_predicate(
 
             let left = evaluate_expression(left, batch, None)?;
             let right = evaluate_expression(right, batch, None)?;
+            // Arrow's prefix kernel also accepts BINARY, but the op is defined on STRING only.
             if *op == StartsWith {
                 require_string_input(&left, "StartsWith")?;
                 require_string_input(&right, "StartsWith")?;
@@ -1000,7 +1001,6 @@ fn cardinalities(input: &ArrayRef) -> KernelResult<ArrayRef> {
     }
 }
 
-/// Evaluates [`UnaryPredicateOp::HasUriScheme`] over any string representation.
 /// `NOT STARTS_WITH`, keeping NULLs.
 fn not_starts_with(
     string: &dyn Datum,
@@ -1011,17 +1011,14 @@ fn not_starts_with(
 
 /// Errors unless `input` is a string array of any representation, naming `op`.
 fn require_string_input(input: &ArrayRef, op: &str) -> KernelResult<()> {
-    require!(
-        matches!(
-            input.data_type(),
-            ArrowDataType::Utf8 | ArrowDataType::LargeUtf8 | ArrowDataType::Utf8View
-        ),
-        KernelError::invalid_expression(format!(
-            "{op} requires a string input, got {}",
-            input.data_type()
-        ))
-    );
-    Ok(())
+    match input.data_type() {
+        ArrowDataType::Utf8 | ArrowDataType::LargeUtf8 | ArrowDataType::Utf8View => Ok(()),
+        other => Err(not_a_string(op, other)),
+    }
+}
+
+fn not_a_string(op: &str, data_type: &ArrowDataType) -> KernelError {
+    KernelError::invalid_expression(format!("{op} requires a string input, got {data_type}"))
 }
 
 /// Applies `f` to every non-NULL row of a string array of any representation, keeping NULLs.
@@ -1041,9 +1038,7 @@ fn map_string_rows<'a, T>(
         ArrowDataType::Utf8 => Ok(map_rows(input.as_string::<i32>(), f)),
         ArrowDataType::LargeUtf8 => Ok(map_rows(input.as_string::<i64>(), f)),
         ArrowDataType::Utf8View => Ok(map_rows(input.as_string_view(), f)),
-        other => Err(KernelError::invalid_expression(format!(
-            "{op} requires a string input, got {other}"
-        ))),
+        other => Err(not_a_string(op, other)),
     }
 }
 
@@ -2439,12 +2434,9 @@ mod tests {
         vec![Some("atrue"), None, Some("true")]
     )]
     fn test_string_concat(
-        #[values(
-            |s| Arc::new(StringArray::from(s)) as ArrayRef,
-            |s| Arc::new(LargeStringArray::from(s)) as ArrayRef,
-            |s| Arc::new(StringViewArray::from(s)) as ArrayRef
-        )]
-        make_array: fn(Vec<Option<&'static str>>) -> ArrayRef,
+        #[values(utf8, large_utf8, utf8_view)] make_array: fn(
+            Vec<Option<&'static str>>,
+        ) -> ArrayRef,
         #[case] inputs: Vec<Expr>,
         #[case] expected: Vec<Option<&str>>,
         #[values(None, Some(&DataType::STRING))] result_type: Option<&'static DataType>,
@@ -2576,20 +2568,38 @@ mod tests {
         (None, None),
     ];
 
+    /// Each path paired with whether it starts with `/`.
+    const STARTS_WITH_SLASH_CASES: &[(Option<&str>, Option<bool>)] = &[
+        (Some("/a/dv.bin"), Some(true)),
+        (Some("a/dv.bin"), Some(false)),
+        (Some(""), Some(false)),
+        (None, None),
+    ];
+
     type MakePredicate = fn(Expr) -> Pred;
+
+    fn utf8(rows: Vec<Option<&'static str>>) -> ArrayRef {
+        Arc::new(StringArray::from(rows))
+    }
+
+    fn large_utf8(rows: Vec<Option<&'static str>>) -> ArrayRef {
+        Arc::new(LargeStringArray::from(rows))
+    }
+
+    fn utf8_view(rows: Vec<Option<&'static str>>) -> ArrayRef {
+        Arc::new(StringViewArray::from(rows))
+    }
 
     #[rstest]
     #[case::has_uri_scheme(|e| Pred::has_uri_scheme(e), HAS_URI_SCHEME_CASES)]
     #[case::has_dot_segment(|e| Pred::has_dot_segment(e), HAS_DOT_SEGMENT_CASES)]
-    fn test_uri_predicates(
+    #[case::starts_with_slash(|e| Pred::starts_with(e, lit("/")), STARTS_WITH_SLASH_CASES)]
+    fn test_string_predicates(
         #[case] make_pred: MakePredicate,
         #[case] cases: &[(Option<&'static str>, Option<bool>)],
-        #[values(
-            |r| Arc::new(StringArray::from(r)) as ArrayRef,
-            |r| Arc::new(LargeStringArray::from(r)) as ArrayRef,
-            |r| Arc::new(StringViewArray::from(r)) as ArrayRef
-        )]
-        make_array: fn(Vec<Option<&'static str>>) -> ArrayRef,
+        #[values(utf8, large_utf8, utf8_view)] make_array: fn(
+            Vec<Option<&'static str>>,
+        ) -> ArrayRef,
         #[values(false, true)] inverted: bool,
     ) {
         let inputs = cases.iter().map(|(input, _)| *input).collect();
@@ -2611,29 +2621,37 @@ mod tests {
             |e| Pred::starts_with(lit("a"), e)
         )]
         make_pred: MakePredicate,
+        #[values("n", "b")] column: &str,
     ) {
-        let batch =
-            RecordBatch::try_from_iter([("n", Arc::new(Int32Array::from(vec![1])) as ArrayRef)])
-                .unwrap();
-        let err = evaluate_predicate(&make_pred(col!("n")), &batch, false).unwrap_err();
+        let batch = RecordBatch::try_from_iter([
+            ("n", Arc::new(Int32Array::from(vec![1])) as ArrayRef),
+            (
+                "b",
+                Arc::new(BinaryArray::from(vec![&b"a"[..]])) as ArrayRef,
+            ),
+        ])
+        .unwrap();
+        let pred = make_pred(Expr::column([column]));
+        let err = evaluate_predicate(&pred, &batch, false).unwrap_err();
         assert!(
-            matches!(err, KernelError::InvalidExpressionEvaluation(_)),
+            matches!(&err, KernelError::InvalidExpressionEvaluation(message)
+                if message.contains("requires a string input")),
             "{err}"
         );
     }
 
     #[rstest]
-    #[case::literal_prefix(lit("/"), [Some(true), Some(false), Some(false), None, Some(true)])]
-    #[case::column_prefix(col!("p"), [Some(true), Some(false), Some(true), None, None])]
-    fn test_starts_with(
-        #[case] prefix: Expr,
-        #[case] expected: [Option<bool>; 5],
-        #[values(
-            |r| Arc::new(StringArray::from(r)) as ArrayRef,
-            |r| Arc::new(LargeStringArray::from(r)) as ArrayRef,
-            |r| Arc::new(StringViewArray::from(r)) as ArrayRef
-        )]
-        make_array: fn(Vec<Option<&'static str>>) -> ArrayRef,
+    #[case::column_string(col!("s"), [Some(true), Some(false), Some(true), None, None, Some(false)])]
+    #[case::literal_string(
+        lit("/a/dv.bin"),
+        [Some(true), Some(true), Some(true), Some(true), None, Some(false)]
+    )]
+    fn test_starts_with_column_prefix(
+        #[case] string: Expr,
+        #[case] expected: [Option<bool>; 6],
+        #[values(utf8, large_utf8, utf8_view)] make_array: fn(
+            Vec<Option<&'static str>>,
+        ) -> ArrayRef,
         #[values(false, true)] inverted: bool,
     ) {
         let strings = vec![
@@ -2642,15 +2660,13 @@ mod tests {
             Some(""),
             None,
             Some("/b"),
+            Some("A/b"),
         ];
-        let prefixes = StringArray::from(vec![Some("/"), Some("/"), Some(""), Some("/"), None]);
-        let batch = RecordBatch::try_from_iter([
-            ("s", make_array(strings)),
-            ("p", Arc::new(prefixes) as ArrayRef),
-        ])
-        .unwrap();
-        let result =
-            evaluate_predicate(&Pred::starts_with(col!("s"), prefix), &batch, inverted).unwrap();
+        let prefixes = vec![Some("/"), Some("/"), Some(""), Some("/"), None, Some("a")];
+        let batch = RecordBatch::try_from_iter([("s", make_array(strings)), ("p", utf8(prefixes))])
+            .unwrap();
+        let pred = Pred::starts_with(string, col!("p"));
+        let result = evaluate_predicate(&pred, &batch, inverted).unwrap();
         let expected: BooleanArray = expected.iter().map(|m| m.map(|m| m != inverted)).collect();
         assert_eq!(result, expected);
     }

@@ -711,20 +711,38 @@ fn test_eval_binary_commutes_literal_and_cast_column(
 }
 
 #[rstest::rstest]
-fn test_path_predicates_are_never_evaluated_for_skipping(
+fn test_uri_predicates_are_never_evaluated_for_skipping(
     #[values(lit("s3://b/a"), col!("location"))] expr: Expr,
-    #[values(
-        Pred::has_uri_scheme,
-        Pred::has_dot_segment,
-        |e| Pred::starts_with(e, lit("s3://")),
-        |e| Pred::starts_with(e, col!("location")),
-        |e| Pred::starts_with(lit("s3://"), e)
-    )]
-    make_pred: fn(Expr) -> Pred,
+    #[values(Pred::has_uri_scheme, Pred::has_dot_segment)] make_pred: fn(Expr) -> Pred,
     #[values(false, true)] inverted: bool,
 ) {
     let filter = DefaultKernelPredicateEvaluator::from(Scalar::from("s3://b/a"));
     assert_eq!(filter.eval_pred(&make_pred(expr), inverted), None);
+}
+
+#[rstest::rstest]
+#[case::matches(col!("x"), lit("s3://"), Some(true))]
+#[case::no_match(col!("x"), lit("abfss://"), Some(false))]
+#[case::empty_prefix(col!("x"), lit(""), Some(true))]
+#[case::case_sensitive(col!("x"), lit("S3://"), Some(false))]
+#[case::both_columns(col!("x"), col!("x"), Some(true))]
+#[case::both_literals(lit("s3://b"), lit("s3://"), Some(true))]
+#[case::cast_column(Expr::cast(col!("x"), DataType::STRING), lit("s3://"), Some(true))]
+#[case::literal_string_column_prefix(lit("s3://b/a/c"), col!("x"), None)]
+#[case::null_prefix(col!("x"), null_lit(DataType::STRING), None)]
+#[case::non_string(lit(1), lit(1), None)]
+fn test_starts_with_evaluates_resolved_strings(
+    #[case] string: Expr,
+    #[case] prefix: Expr,
+    #[case] expected: Option<bool>,
+    #[values(false, true)] inverted: bool,
+) {
+    let filter = DefaultKernelPredicateEvaluator::from(Scalar::from("s3://b/a"));
+    let pred = Pred::starts_with(string, prefix);
+    assert_eq!(
+        filter.eval_pred(&pred, inverted),
+        expected.map(|e| e != inverted)
+    );
 }
 
 #[derive(Debug, PartialEq)]
@@ -1117,6 +1135,12 @@ fn test_sql_where() {
     expect_eq!(empty_filter.eval_sql_where(pred), None, "{pred}");
 
     let pred = &Pred::from_expr(expr!(lit(VAL) < col("x")));
+    expect_eq!(null_filter.eval(pred), None, "{pred}");
+    expect_eq!(null_filter.eval_sql_where(pred), Some(false), "{pred}");
+    expect_eq!(empty_filter.eval_sql_where(pred), None, "{pred}");
+
+    // STARTS_WITH is NULL-intolerant, so SQL WHERE skips a NULL operand like a comparison
+    let pred = &Pred::starts_with(col!("x"), lit("/"));
     expect_eq!(null_filter.eval(pred), None, "{pred}");
     expect_eq!(null_filter.eval_sql_where(pred), Some(false), "{pred}");
     expect_eq!(empty_filter.eval_sql_where(pred), None, "{pred}");

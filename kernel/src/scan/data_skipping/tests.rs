@@ -665,6 +665,10 @@ fn test_checkpoint_skipping_floating_partition_cast_rewrites_exact_value() {
     ),
     None,
 )]
+#[case::starts_with(
+    Pred::starts_with(Expr::cast(col!("part_col"), DataType::STRING), lit("2026")),
+    None,
+)]
 fn test_checkpoint_skipping_partition_date_cast_comparisons(
     #[case] pred: Pred,
     #[case] expected: Option<&str>,

@@ -115,9 +115,10 @@ pub enum UnaryPredicateOp {
 
 /// A binary predicate operator.
 ///
-/// The ordering and equality comparisons follow SQL three-valued logic, so a NULL operand yields
-/// NULL rather than `false`. [`Distinct`](Self::Distinct) and [`In`](Self::In) instead tolerate
-/// NULL and always answer `true` or `false`.
+/// The ordering and equality comparisons and [`StartsWith`](Self::StartsWith) follow SQL
+/// three-valued logic, so a NULL operand yields NULL rather than `false`.
+/// [`Distinct`](Self::Distinct) and [`In`](Self::In) instead tolerate NULL and always answer
+/// `true` or `false`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum BinaryPredicateOp {
     /// `left < right`.
@@ -148,8 +149,7 @@ pub enum BinaryPredicateOp {
     In,
     /// SQL `starts_with(left, right)`: `true` when the STRING `left` begins with the STRING
     /// `right`, compared byte for byte (case-sensitive, no collation). Every string starts with
-    /// `''`. A NULL on either side yields NULL, and so does its `NOT`. Other input types are an
-    /// error.
+    /// `''`. Other input types are an error.
     ///
     /// ```text
     /// STARTS_WITH('/abs/dv.bin', '/')  -- true

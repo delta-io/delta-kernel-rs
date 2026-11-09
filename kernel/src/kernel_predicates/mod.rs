@@ -283,6 +283,18 @@ pub trait KernelPredicateEvaluator {
         }
     }
 
+    /// A (possibly inverted) prefix test, e.g. `[NOT] STARTS_WITH(<col>, 'prefix')`.
+    ///
+    /// Unsupported by default, but implementations can override it if they wish.
+    fn eval_pred_starts_with(
+        &self,
+        _col: &ColumnName,
+        _prefix: &Scalar,
+        _inverted: bool,
+    ) -> Option<Self::Output> {
+        None
+    }
+
     /// A (possibly inverted) IN-list check, e.g. `<col> [NOT] IN <array-value>`.
     ///
     /// Unsupported by default, but implementations can override it if they wish.
@@ -327,7 +339,7 @@ pub trait KernelPredicateEvaluator {
                 Equal => self.eval_pred_eq(col, val, inverted),
                 Distinct => self.eval_pred_distinct(col, val, inverted),
                 In => self.eval_pred_in(col, val, inverted),
-                StartsWith => None,
+                StartsWith => self.eval_pred_starts_with(col, val, inverted),
             },
             (Literal(val), Column(col)) => match op {
                 // NOTE: The column has to be on the left, so e.g. `10 < x` becomes `x > 10`
@@ -611,7 +623,13 @@ impl KernelPredicateEvaluatorDefaults {
             Equal => Self::partial_cmp_scalars(Ordering::Equal, left, right, inverted),
             LessThan => Self::partial_cmp_scalars(Ordering::Less, left, right, inverted),
             GreaterThan => Self::partial_cmp_scalars(Ordering::Greater, left, right, inverted),
-            Distinct | In | StartsWith => {
+            StartsWith => match (left, right) {
+                (Scalar::String(s), Scalar::String(prefix)) => {
+                    Some(s.starts_with(prefix) != inverted)
+                }
+                _ => None,
+            },
+            Distinct | In => {
                 debug!("Unsupported binary operator: {left:?} {op:?} {right:?}");
                 None
             }
@@ -789,6 +807,16 @@ impl<R: ResolveColumnAsScalar> KernelPredicateEvaluator for DefaultKernelPredica
     fn eval_pred_eq(&self, col: &ColumnName, val: &Scalar, inverted: bool) -> Option<bool> {
         let col = self.resolve_column(col)?;
         self.eval_pred_binary_scalars(BinaryPredicateOp::Equal, &col, val, inverted)
+    }
+
+    fn eval_pred_starts_with(
+        &self,
+        col: &ColumnName,
+        prefix: &Scalar,
+        inverted: bool,
+    ) -> Option<bool> {
+        let col = self.resolve_column(col)?;
+        self.eval_pred_binary_scalars(BinaryPredicateOp::StartsWith, &col, prefix, inverted)
     }
 
     fn eval_pred_cast(
