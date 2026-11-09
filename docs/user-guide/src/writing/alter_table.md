@@ -152,9 +152,15 @@ and value-validated. Repeated calls merge. Two entries for the same `delta.*` ke
 
 Feature-enabling properties (for example `delta.enableChangeDataFeed` or
 `delta.enableDeletionVectors`) are accepted and may upgrade the protocol when the property turns a
-feature on. Unknown `delta.*` keys, `delta.feature.*` signals, and CHECK constraints are rejected.
-Enabling `delta.enableRowTracking` on an existing table is rejected until existing-table enablement
-is supported. Re-setting a property to its current value still counts as an `ALTER TABLE` change.
+feature on. Unknown `delta.*` keys and CHECK constraints are rejected. Enabling
+`delta.enableRowTracking` on an existing table is rejected until existing-table enablement is
+supported. Re-setting a property to its current value still counts as an `ALTER TABLE` change.
+
+To enable a feature without a matching property, pass `delta.feature.<name>` set to `supported`,
+for example `("delta.feature.deletionVectors", "supported")`. Only features that CREATE TABLE also
+accepts through feature signals are allowed, and the signal is applied to the protocol only. Other
+values, unknown features, and rejected features fail the build. Signals cannot be combined with a
+blind append.
 
 ```rust,ignore
 let result = snapshot

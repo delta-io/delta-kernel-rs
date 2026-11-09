@@ -13,14 +13,14 @@ use crate::schema::StructField;
 use crate::snapshot::SnapshotRef;
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::{
-    IcebergCompatValidationContext, Operation, TableFeature, V2_VALIDATOR, V3_VALIDATOR,
-    validate_iceberg_compat_if_needed,
+    IcebergCompatValidationContext, Operation, SET_TABLE_FEATURE_SUPPORTED_PREFIX, TableFeature,
+    V2_VALIDATOR, V3_VALIDATOR, validate_iceberg_compat_if_needed,
 };
 use crate::table_properties::{
     DELTA_PROPERTY_PREFIX, is_delta_property_key, validate_and_normalize_property_for_update,
 };
 use crate::transaction::domain_metadata::validate_unique_domains;
-use crate::transaction::protocol_prep::prepare_protocol_for_update;
+use crate::transaction::protocol_prep::{parse_feature_signal, prepare_protocol_for_update};
 use crate::transaction::schema_evolution::{SchemaOperation, evolve_table_config};
 use crate::transaction::{
     ExecutionMode, Imperative, Transaction, UpdateTable, UpdateTableOperation,
@@ -158,11 +158,13 @@ impl<MODE: ExecutionMode> TransactionBuilder<UpdateTable, MODE> {
     /// canonical form and value-validated during [`build`](Self::build).
     ///
     /// Feature-enablement `delta.*` properties (for example `delta.enableDeletionVectors`) are
-    /// accepted and upgrade the protocol during [`build`](Self::build). `delta.feature.*` signals,
-    /// CHECK constraints, and unknown `delta.*` keys are rejected. Property changes are applied
-    /// during [`build`](Self::build). For `ALTER TABLE`, requested adds always emit Metadata,
-    /// including when every value already matches the current configuration. Data operations skip
-    /// unchanged values so Metadata is emitted only when at least one added value actually changes.
+    /// accepted and upgrade the protocol during [`build`](Self::build).
+    /// `delta.feature.<name>=supported` signals enable the named feature on the protocol; the same
+    /// features CREATE TABLE accepts are allowed. CHECK constraints and unknown `delta.*` keys are
+    /// rejected. Property changes are applied during [`build`](Self::build). For `ALTER TABLE`,
+    /// requested adds always emit Metadata, including when every value already matches the current
+    /// configuration. Data operations skip unchanged values so Metadata is emitted only when at
+    /// least one added value actually changes.
     pub fn with_table_properties_added<I, K, V>(mut self, properties: I) -> Self
     where
         I: IntoIterator<Item = (K, V)>,
@@ -449,6 +451,16 @@ fn try_new_update_table<MODE: ExecutionMode>(
         IcebergCompatValidationContext::Write,
     )?;
 
+    let (feature_signals, properties_added): (HashMap<String, String>, HashMap<String, String>) =
+        properties_added
+            .into_iter()
+            .partition(|(key, _)| key.starts_with(SET_TABLE_FEATURE_SUPPORTED_PREFIX));
+    let feature_signals = feature_signals
+        .iter()
+        .map(|(key, value)| parse_feature_signal(key, value, "UPDATE TABLE"))
+        .collect::<KernelResult<Vec<_>>>()?;
+    let has_feature_signals = !feature_signals.is_empty();
+
     let has_property_removes = !properties_removed.is_empty();
     let has_schema_changes = schema_changes.is_some();
     effective_table_config = match schema_changes {
@@ -483,12 +495,18 @@ fn try_new_update_table<MODE: ExecutionMode>(
     }
 
     // Property-driven feature enablement may upgrade the protocol and apply metadata side effects.
-    let protocol_prep = prepare_protocol_for_update(&read_table_config, effective_table_config)?;
+    let protocol_prep =
+        prepare_protocol_for_update(&read_table_config, effective_table_config, &feature_signals)?;
     effective_table_config = protocol_prep.table_config;
     should_emit_metadata |= protocol_prep.metadata_side_effects;
     let should_emit_protocol = protocol_prep.should_emit_protocol;
     if should_emit_protocol {
         should_emit_metadata = true;
+    }
+    if operation == UpdateTableOperation::AlterTable && !should_emit_metadata {
+        return Err(KernelError::invalid_transaction_state(
+            "ALTER TABLE requires at least one table change",
+        ));
     }
 
     Ok(Transaction {
@@ -1346,6 +1364,102 @@ mod tests {
                 .contains("Enabling or disabling row tracking"),
             "error={error}"
         );
+        Ok(())
+    }
+
+    #[rstest]
+    #[case::change_data_feed("delta.feature.changeDataFeed", TableFeature::ChangeDataFeed)]
+    #[case::deletion_vectors("delta.feature.deletionVectors", TableFeature::DeletionVectors)]
+    #[case::type_widening("delta.feature.typeWidening", TableFeature::TypeWidening)]
+    fn with_table_properties_added_accepts_feature_signal_and_upgrades_protocol(
+        #[case] key: &str,
+        #[case] feature: TableFeature,
+    ) -> Result<()> {
+        let (engine, snapshot, _tempdir) = load_test_table("table-without-dv-small")?;
+        let transaction = snapshot
+            .update_table(UpdateTableOperation::AlterTable, "test-engine", false)
+            .with_table_properties_added([(key, "supported")])
+            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
+
+        assert!(transaction.should_emit_protocol);
+        assert!(
+            transaction
+                .effective_table_config
+                .is_feature_supported(&feature)
+        );
+        assert!(
+            !transaction
+                .effective_table_config
+                .metadata()
+                .configuration()
+                .keys()
+                .any(|k| k.starts_with("delta.feature.")),
+            "feature signals must not be written to table properties"
+        );
+        Ok(())
+    }
+
+    #[rstest]
+    #[case::non_supported_value("delta.feature.deletionVectors", "enabled", "Only 'supported'")]
+    #[case::unknown_feature("delta.feature.notAFeature", "supported", "Enabling feature")]
+    #[case::not_allowlisted("delta.feature.identityColumns", "supported", "during UPDATE TABLE")]
+    #[case::clustering("delta.feature.clustering", "supported", "during UPDATE TABLE")]
+    #[case::row_tracking("delta.feature.rowTracking", "supported", "row tracking")]
+    fn with_table_properties_added_rejects_feature_signal(
+        #[case] key: &str,
+        #[case] value: &str,
+        #[case] expected: &str,
+    ) -> Result<()> {
+        let (engine, snapshot, _tempdir) = load_test_table("table-without-dv-small")?;
+        let error = snapshot
+            .update_table(UpdateTableOperation::AlterTable, "test-engine", false)
+            .with_table_properties_added([(key, value)])
+            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))
+            .unwrap_err();
+        assert!(
+            error.to_string().contains(expected),
+            "error={error}, expected={expected}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn alter_table_feature_signal_for_already_enabled_feature_is_rejected_as_no_op() -> Result<()> {
+        let (engine, snapshot, _tempdir) = load_test_table("table-with-dv-small")?;
+        assert!(
+            snapshot
+                .table_configuration()
+                .is_feature_supported(&TableFeature::DeletionVectors)
+        );
+        let error = snapshot
+            .update_table(UpdateTableOperation::AlterTable, "test-engine", false)
+            .with_table_properties_added([("delta.feature.deletionVectors", "supported")])
+            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("ALTER TABLE requires at least one table change"),
+            "error={error}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn blind_append_rejects_feature_signals() -> Result<()> {
+        let (engine, snapshot, _tempdir) = load_test_table("table-without-dv-small")?;
+        let error = snapshot
+            .update_table(UpdateTableOperation::Write, "test-engine", true)
+            .with_blind_append()
+            .with_table_properties_added([("delta.feature.deletionVectors", "supported")])
+            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))
+            .unwrap_err();
+
+        assert!(matches!(
+            &error,
+            KernelError::InvalidTransactionState(message)
+            if message == "blind append cannot include property changes"
+        ));
         Ok(())
     }
 
