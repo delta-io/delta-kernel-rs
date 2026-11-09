@@ -476,6 +476,7 @@ impl CheckpointWriter {
         let actions = self.snapshot.log_segment().read_actions_for_checkpoint(
             engine,
             self.read_schema.clone(),
+            self.snapshot.table_configuration().stats_json_op(),
             metrics.clone(),
         )?;
 
