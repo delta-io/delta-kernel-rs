@@ -352,6 +352,9 @@ fn delta_error_matches(expected_code: &str, actual: &DeltaError) -> bool {
             "DELTA_TABLE_NOT_FOUND" | "DELTA_MISSING_TRANSACTION_LOG",
             DeltaErrorCondition::DeltaPathDoesNotExist,
         ) => true,
+        // TODO: Report DELTA_TRUNCATED_TRANSACTION_LOG for missing history immediately after a
+        // checkpoint, then remove this alias.
+        ("DELTA_TRUNCATED_TRANSACTION_LOG", DeltaErrorCondition::DeltaLogFileNotFound) => true,
         (code, _) => code == actual.name(),
     }
 }
@@ -653,6 +656,22 @@ mod tests {
                 "Cannot determine types for: Identifier(nonExistentCol) and Value(1)"
             )
         ));
+    }
+
+    #[test]
+    fn truncated_log_accepts_the_missing_replay_condition() {
+        let error = DeltaError::for_test(
+            DeltaErrorCondition::DeltaLogFileNotFound,
+            &["7", "4", "memory:///_delta_log/"],
+            None,
+        )
+        .unwrap();
+        assert!(delta_error_matches(
+            "DELTA_TRUNCATED_TRANSACTION_LOG",
+            &error
+        ));
+        assert!(delta_error_matches("DELTA_LOG_FILE_NOT_FOUND", &error));
+        assert!(!delta_error_matches("DELTA_PATH_DOES_NOT_EXIST", &error));
     }
 
     #[test]

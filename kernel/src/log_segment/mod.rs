@@ -48,8 +48,8 @@ use crate::schema::{
 };
 use crate::utils::require;
 use crate::{
-    Engine, FileMeta, KernelError, KernelResult, KernelResultIterator, Predicate, PredicateRef,
-    RowVisitor, StorageHandler, Version,
+    DeltaError, Engine, Error, FileMeta, KernelError, KernelResult, KernelResultIterator,
+    Predicate, PredicateRef, RowVisitor, StorageHandler, Version,
 };
 
 mod crc_replay;
@@ -630,7 +630,47 @@ impl LogSegment {
             (None, None) => LogSegmentFiles::list(storage, &log_root, log_tail, None, None)?,
         };
 
-        LogSegment::try_new(listed_files, log_root, time_travel_version, checkpoint_hint)
+        let checkpoint_version = listed_files
+            .checkpoint_parts
+            .first()
+            .map(|file| file.version);
+        let first_replay_version = listed_files
+            .ascending_commit_files
+            .iter()
+            .find(|file| checkpoint_version.is_none_or(|checkpoint| file.version > checkpoint))
+            .map(|file| file.version);
+        let target_version = time_travel_version.or_else(|| {
+            listed_files
+                .ascending_commit_files
+                .last()
+                .map(|file| file.version)
+        });
+        LogSegment::try_new(
+            listed_files,
+            log_root.clone(),
+            time_travel_version,
+            checkpoint_hint,
+        )
+        .map_err(|error| {
+            match (
+                error.without_backtrace(),
+                checkpoint_version,
+                target_version,
+            ) {
+                (KernelError::MissingVersion(missing), Some(checkpoint), Some(target))
+                    if checkpoint.checked_add(1) == Some(*missing)
+                        && first_replay_version.is_some_and(|version| version > *missing) =>
+                {
+                    Error::Delta(DeltaError::log_file_not_found(
+                        target,
+                        checkpoint,
+                        &log_root,
+                        Some(error),
+                    ))
+                }
+                _ => Error::Kernel(error),
+            }
+        })
     }
 
     /// Constructs a [`LogSegment`] to be used for `TableChanges`. For a TableChanges between

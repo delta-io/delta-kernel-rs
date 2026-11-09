@@ -59,7 +59,8 @@ use crate::table_properties::TableProperties;
 use crate::transaction::{UpdateTableOperation, UpdateTableTransactionBuilder};
 use crate::utils::require;
 use crate::{
-    Engine, KernelError, KernelResult, KernelResultIterator, LogCompactionWriter, Version,
+    DeltaError, Engine, Error, KernelError, KernelResult, KernelResultIterator,
+    LogCompactionWriter, Version,
 };
 
 #[cfg(all(test, feature = "adaptive-metadata-in-dev"))]
@@ -533,6 +534,19 @@ impl Snapshot {
             Some((crc, crc_source)) => PmResolution::from_crc(crc, *crc_source),
             None => log_segment
                 .read_protocol_metadata_opt(engine, base_crc.as_ref())
+                .map_err(|error| {
+                    match (error.without_backtrace(), log_segment.checkpoint_version) {
+                        (KernelError::FileNotFound(_), Some(checkpoint)) => {
+                            Error::Delta(DeltaError::log_file_not_found(
+                                log_segment.end_version,
+                                checkpoint,
+                                &log_segment.log_root,
+                                Some(Box::new(error)),
+                            ))
+                        }
+                        _ => Error::Kernel(error),
+                    }
+                })
                 .inspect_err(|_| emit_protocol_metadata_load_failure(metric_context))?,
         };
 

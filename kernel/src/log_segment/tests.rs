@@ -58,9 +58,9 @@ use crate::unit_test_utils::{
 #[cfg(feature = "geo-type-in-dev")]
 use crate::unit_test_utils::{geography_type, geometry_type};
 use crate::{
-    EngineData, FileDataReadResultIterator, FileMeta, FileSize, JsonHandler, KernelResult,
+    EngineData, Error, FileDataReadResultIterator, FileMeta, FileSize, JsonHandler, KernelResult,
     KernelResultIterator, ParquetFooter, ParquetHandler, Predicate, PredicateRef, Result,
-    RowVisitor, StorageHandler,
+    RowVisitor, StorageHandler, Version,
 };
 
 /// Processes sidecar files for the given checkpoint batch.
@@ -6321,4 +6321,49 @@ fn snapshot_with_amt_last_checkpoint_hint_skips_earlier_commits() -> Result<()> 
         .expect("checkpoint present");
     assert_eq!(checkpoint.path(), "metadata/root-v2.parquet");
     Ok(())
+}
+
+#[rstest]
+#[case::latest(None)]
+#[case::pinned(Some(7))]
+#[tokio::test]
+async fn snapshot_checkpoint_gap_preserves_replay_context(#[case] target: Option<Version>) {
+    let (storage, log_root) = build_log_with_paths_and_checkpoint(
+        &[
+            delta_path_for_version(4, "checkpoint.parquet"),
+            delta_path_for_version(6, "json"),
+            delta_path_for_version(7, "json"),
+        ],
+        None,
+    )
+    .await;
+    let error =
+        LogSegment::for_snapshot_impl(storage.as_ref(), log_root.clone(), vec![], None, target)
+            .unwrap_err();
+    let Error::Delta(error) = error else {
+        panic!("expected Delta error")
+    };
+    assert_eq!(error.name(), "DELTA_LOG_FILE_NOT_FOUND");
+    assert_eq!(error.sql_state(), Some("42K03"));
+    let parameters: Vec<_> = error
+        .parameters()
+        .iter()
+        .map(|p| (p.name(), p.value()))
+        .collect();
+    assert_eq!(
+        parameters,
+        [
+            ("version", "7"),
+            ("checkpointVersion", "4"),
+            ("logPath", log_root.as_str())
+        ]
+    );
+    assert!(matches!(
+        std::error::Error::source(&error).and_then(|source| source.downcast_ref::<KernelError>()),
+        Some(KernelError::MissingVersion(5)),
+    ));
+    assert!(matches!(
+        LogSegment::for_table_changes(storage.as_ref(), log_root, 4, Some(7)),
+        Err(KernelError::MissingVersion(_)) | Err(KernelError::StartVersionNotFound { .. }),
+    ));
 }

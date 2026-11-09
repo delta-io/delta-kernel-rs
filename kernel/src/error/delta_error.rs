@@ -5,6 +5,9 @@ use std::error::Error as StdError;
 use std::fmt;
 
 use super::DeltaErrorCondition;
+#[cfg(any(test, feature = "test-utils"))]
+use crate::KernelResult;
+use crate::{KernelError, Version};
 
 /// A catalog-defined Delta failure that terminates the current operation.
 ///
@@ -17,6 +20,9 @@ use super::DeltaErrorCondition;
 /// [`fmt::Display`] renders only the catalog message. The original cause is available through
 /// [`StdError::source`], and [`fmt::Debug`] includes every field and the rendered message.
 /// Diagnostic values are not redacted. Connectors are responsible for redacting telemetry.
+///
+/// Condition-specific constructors accept an optional diagnostic source. Passing `None` leaves
+/// the source chain empty; it does not affect the catalog condition or message parameters.
 pub struct DeltaError {
     condition: DeltaErrorCondition,
     parameters: Box<[DeltaErrorParameter]>,
@@ -44,10 +50,10 @@ impl DeltaError {
         condition: DeltaErrorCondition,
         values: &[&str],
         source: Option<Box<dyn StdError + Send + Sync + 'static>>,
-    ) -> super::KernelResult<Self> {
+    ) -> KernelResult<Self> {
         let names = condition.parameter_names();
         if names.len() != values.len() {
-            return Err(super::KernelError::generic(format!(
+            return Err(KernelError::generic(format!(
                 "{} requires {} parameters, got {}",
                 condition.name(),
                 names.len(),
@@ -100,8 +106,8 @@ impl DeltaError {
     /// Creates a `DELTA_PATH_DOES_NOT_EXIST` error for a table root that does not exist or has no
     /// Delta log.
     ///
-    /// `path` is the table root as the caller supplied it. `source` is the error that detected
-    /// the missing table and is preserved for downcasting through [`StdError::source`].
+    /// `path` is the table root as the caller supplied it. An optional `source` preserves the error
+    /// that detected the missing table for downcasting through [`StdError::source`].
     ///
     /// ```
     /// use delta_kernel::{DeltaError, DeltaErrorCondition};
@@ -109,17 +115,39 @@ impl DeltaError {
     /// use std::io;
     ///
     /// let source = io::Error::from(io::ErrorKind::NotFound);
-    /// let error = DeltaError::path_does_not_exist("/path/to/table", source);
+    /// let error = DeltaError::path_does_not_exist("/path/to/table", Some(Box::new(source)));
     /// assert_eq!(error.condition(), DeltaErrorCondition::DeltaPathDoesNotExist);
     /// assert_eq!(error.parameters()[0].value(), "/path/to/table");
     /// let source = error.source().unwrap().downcast_ref::<io::Error>().unwrap();
     /// assert_eq!(source.kind(), io::ErrorKind::NotFound);
     /// ```
-    pub fn path_does_not_exist(path: &str, source: impl StdError + Send + Sync + 'static) -> Self {
+    pub fn path_does_not_exist(
+        path: &str,
+        source: Option<Box<dyn StdError + Send + Sync + 'static>>,
+    ) -> Self {
         Self::new(
             DeltaErrorCondition::DeltaPathDoesNotExist,
             vec![DeltaErrorParameter::new("path", path)],
-            Some(Box::new(source)),
+            source,
+        )
+    }
+
+    /// Reports missing replay files for `version` after `checkpoint_version` in `log_path`.
+    /// The original listing or read failure remains available as the diagnostic source.
+    pub fn log_file_not_found(
+        version: Version,
+        checkpoint_version: Version,
+        log_path: impl ToString,
+        source: Option<Box<dyn StdError + Send + Sync + 'static>>,
+    ) -> Self {
+        Self::new(
+            DeltaErrorCondition::DeltaLogFileNotFound,
+            vec![
+                DeltaErrorParameter::new("version", version),
+                DeltaErrorParameter::new("checkpointVersion", checkpoint_version),
+                DeltaErrorParameter::new("logPath", log_path),
+            ],
+            source,
         )
     }
 
