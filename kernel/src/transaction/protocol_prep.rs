@@ -3,7 +3,8 @@
 //! When UPDATE TABLE sets feature-enablement properties (for example
 //! `delta.enableDeletionVectors=true`), Kernel upgrades the protocol to support the required
 //! features, matching Java Kernel's `autoUpgradeProtocolBasedOnMetadata` path for property-driven
-//! enablement. Explicit `delta.feature.*=supported` overrides are handled separately.
+//! enablement. Explicit `delta.feature.<name>=supported` signals are parsed by
+//! [`parse_feature_signal`] and enabled through the same path.
 
 use std::sync::Arc;
 
@@ -14,6 +15,7 @@ use crate::schema::SchemaRef;
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::{
     ColumnMappingMode, FeatureRequirement, LEGACY_WRITER_FEATURES,
+    SET_TABLE_FEATURE_SUPPORTED_PREFIX, SET_TABLE_FEATURE_SUPPORTED_VALUE,
     TABLE_FEATURES_MIN_READER_VERSION, TABLE_FEATURES_MIN_WRITER_VERSION, TableFeature,
     add_feature_to_lists, assign_column_mapping_metadata, auto_enable_property_driven_features,
     ensure_domain_metadata_dependency, extract_enabled_reader_features,
@@ -28,6 +30,58 @@ use crate::table_properties::{
     ROW_TRACKING_SUSPENDED, TableProperties,
 };
 use crate::{KernelError, KernelResult};
+
+/// Table features that `delta.feature.<name>=supported` may enable, on CREATE TABLE and UPDATE
+/// TABLE.
+///
+/// Feature signals (`delta.feature.X=supported`) are validated against this list.
+/// Only features in this list can be enabled via feature signals.
+pub(crate) const ALLOWED_DELTA_FEATURES: &[TableFeature] = &[
+    // DomainMetadata is required for clustering and other system domain operations
+    TableFeature::DomainMetadata,
+    // ColumnMapping enables column mapping (name/id mode)
+    TableFeature::ColumnMapping,
+    // InCommitTimestamp enables in-commit timestamps (writer-only)
+    TableFeature::InCommitTimestamp,
+    // VacuumProtocolCheck ensures consistent protocol checks during VACUUM
+    TableFeature::VacuumProtocolCheck,
+    // CatalogManaged enables catalog-managed table support
+    TableFeature::CatalogManaged,
+    // Note: Clustering is NOT included here. Users should not enable clustering via
+    // `delta.feature.clustering = supported`. Instead, clustering is enabled by
+    // specifying clustering columns via `with_data_layout()`.
+    TableFeature::DeletionVectors,
+    TableFeature::V2Checkpoint,
+    // Simple protocol-only features: enabling these only updates the protocol action.
+    // They can also be auto-enabled via their enablement properties (e.g. delta.appendOnly=true)
+    // through `maybe_auto_enable_property_driven_features`.
+    TableFeature::AppendOnly,
+    TableFeature::ChangeDataFeed,
+    TableFeature::TypeWidening,
+    TableFeature::RowTracking,
+    TableFeature::VariantType,
+    TableFeature::VariantShredding,
+    // Invariants is auto-enabled by `maybe_enable_invariants` when the schema has non-null
+    // fields. Allowing explicit `delta.feature.invariants=supported` lets users pre-enable
+    // the feature on an all-nullable table so a later ALTER TABLE ADD COLUMN NOT NULL does
+    // not need a protocol upgrade.
+    TableFeature::Invariants,
+    // MaterializePartitionColumns keeps partition columns in the data files instead of
+    // dropping them on write. There is no `delta.*` enablement property; the only opt-in at
+    // create time is the explicit feature signal
+    // `delta.feature.materializePartitionColumns=supported`.
+    TableFeature::MaterializePartitionColumns,
+    TableFeature::Collations,
+    // IcebergCompatV2 is a writer-only feature that gates Iceberg V2 conversion compatibility.
+    // Dependent features (ColumnMapping) are auto-added during create table.
+    TableFeature::IcebergCompatV2,
+    // IcebergCompatV3 is a writer-only feature that gates Iceberg V3 conversion compatibility.
+    // Dependent features (ColumnMapping, RowTracking, DomainMetadata) are auto-added during
+    // create table.
+    TableFeature::IcebergCompatV3,
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    TableFeature::IcebergNativeV4Preview,
+];
 
 /// Features that UPDATE TABLE may auto-add to the protocol from enablement properties.
 const UPDATE_PROPERTY_DRIVEN_FEATURES: &[TableFeature] = &[
@@ -45,6 +99,35 @@ const UPDATE_PROPERTY_DRIVEN_FEATURES: &[TableFeature] = &[
     TableFeature::IcebergCompatV1,
 ];
 
+/// Parses one `delta.feature.<name>=supported` signal. `operation` names the caller in the
+/// rejection message.
+pub(crate) fn parse_feature_signal(
+    key: &str,
+    value: &str,
+    operation: &str,
+) -> KernelResult<TableFeature> {
+    if value != SET_TABLE_FEATURE_SUPPORTED_VALUE {
+        return Err(KernelError::generic(format!(
+            "Invalid value '{value}' for '{key}'. Only '{SET_TABLE_FEATURE_SUPPORTED_VALUE}' is allowed."
+        )));
+    }
+    let Some(feature_name) = key.strip_prefix(SET_TABLE_FEATURE_SUPPORTED_PREFIX) else {
+        return Err(KernelError::generic(format!(
+            "'{key}' is not a feature signal"
+        )));
+    };
+    // Unknown names become TableFeature::Unknown, which is never in the allowlist.
+    let feature: TableFeature = feature_name
+        .parse()
+        .unwrap_or_else(|_| TableFeature::Unknown(feature_name.to_string()));
+    if !ALLOWED_DELTA_FEATURES.contains(&feature) {
+        return Err(KernelError::generic(format!(
+            "Enabling feature '{feature_name}' via '{key}' is not supported during {operation}"
+        )));
+    }
+    Ok(feature)
+}
+
 /// Result of preparing protocol (and possibly metadata) after an existing-table property update.
 pub(crate) struct ProtocolPrepResult {
     pub table_config: TableConfiguration,
@@ -60,8 +143,9 @@ pub(crate) struct ProtocolPrepResult {
 pub(crate) fn prepare_protocol_for_update(
     before: &TableConfiguration,
     after: TableConfiguration,
+    feature_signals: &[TableFeature],
 ) -> KernelResult<ProtocolPrepResult> {
-    reject_row_tracking_toggle(before, &after)?;
+    reject_row_tracking_toggle(before, &after, feature_signals)?;
 
     let mut metadata = after.metadata().clone();
     let mut logical_schema = after.logical_schema();
@@ -78,6 +162,9 @@ pub(crate) fn prepare_protocol_for_update(
     let mut writer_features = extract_enabled_writer_features(after.protocol());
     // Features are only ever added below, so unchanged lengths mean an unchanged feature set.
     let (original_reader_len, original_writer_len) = (reader_features.len(), writer_features.len());
+    for feature in feature_signals {
+        add_feature_to_lists(feature.clone(), &mut reader_features, &mut writer_features);
+    }
 
     auto_enable_property_driven_features(
         UPDATE_PROPERTY_DRIVEN_FEATURES,
@@ -150,6 +237,7 @@ pub(crate) fn with_ict_enablement_info(
 fn reject_row_tracking_toggle(
     before: &TableConfiguration,
     after: &TableConfiguration,
+    feature_signals: &[TableFeature],
 ) -> KernelResult<()> {
     // Compare the property, not feature state: the protocol has not been upgraded yet.
     let before_enabled = before
@@ -160,7 +248,10 @@ fn reject_row_tracking_toggle(
         .table_properties()
         .enable_row_tracking
         .unwrap_or(false);
-    if before_enabled != after_enabled {
+    // A feature signal must not bypass the property check by enabling the feature directly.
+    let signal_enables_row_tracking = feature_signals.contains(&TableFeature::RowTracking)
+        && !before.is_feature_supported(&TableFeature::RowTracking);
+    if before_enabled != after_enabled || signal_enables_row_tracking {
         return Err(KernelError::unsupported(
             "Enabling or disabling row tracking on an existing table is not supported",
         ));
