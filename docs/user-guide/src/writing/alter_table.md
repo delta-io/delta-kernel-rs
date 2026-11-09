@@ -150,9 +150,11 @@ original casing. Recognized config-only `delta.*` keys, such as `delta.checkpoin
 and value-validated. Repeated calls merge. Two entries for the same `delta.*` key in one call
 (including exact duplicates and case variants) are rejected.
 
-Feature-enabling properties (for example `delta.enableChangeDataFeed`), `delta.feature.*` signals,
-unknown `delta.*` keys, and CHECK constraints are rejected. Setting properties does not change the
-protocol. Re-setting a property to its current value still counts as an `ALTER TABLE` change.
+Feature-enabling properties (for example `delta.enableChangeDataFeed` or
+`delta.enableDeletionVectors`) are accepted and may upgrade the protocol when the property turns a
+feature on. Unknown `delta.*` keys, `delta.feature.*` signals, and CHECK constraints are rejected.
+Enabling `delta.enableRowTracking` on an existing table is rejected until existing-table enablement
+is supported. Re-setting a property to its current value still counts as an `ALTER TABLE` change.
 
 ```rust,ignore
 let result = snapshot
@@ -160,6 +162,7 @@ let result = snapshot
     .with_table_properties_added([
         ("app.owner", "analytics"),
         ("delta.checkpointInterval", "10"),
+        ("delta.enableChangeDataFeed", "true"),
     ])
     .build(&engine, Box::new(FileSystemCommitter::new()))?
     .commit(&engine)?;

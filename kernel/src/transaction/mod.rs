@@ -63,6 +63,7 @@ mod domain_metadata;
 mod exec_mode;
 mod imperative;
 mod operation;
+pub(crate) mod protocol_prep;
 pub(crate) use operation::CommitOperation;
 pub use operation::UpdateTableOperation;
 #[cfg(feature = "adaptive-metadata-in-dev")]
@@ -1166,11 +1167,22 @@ impl<STATE, MODE: ExecutionMode> Transaction<STATE, MODE> {
         // must be the larger of:
         // - The time at which the writer attempted the commit
         // - One millisecond later than the previous commit's inCommitTimestamp
-        Ok(self
-            .read_snapshot()?
-            .reader()
-            .get_in_commit_timestamp(engine)?
-            .map(|prev_ict| self.commit_timestamp.max(prev_ict + 1)))
+        let read_snapshot = self.read_snapshot()?;
+        let reader = read_snapshot.reader();
+        let prev_timestamp = match reader.get_in_commit_timestamp(engine)? {
+            Some(prev_ict) => Some(prev_ict),
+            // This commit enables ICT, so the previous commit's file modification time is the
+            // floor.
+            None if protocol_prep::transaction_enables_ict(
+                read_snapshot.table_configuration(),
+                &self.effective_table_config,
+            ) =>
+            {
+                Some(reader.get_timestamp(engine)?)
+            }
+            None => None,
+        };
+        Ok(prev_timestamp.map(|prev| self.commit_timestamp.max(prev + 1)))
     }
 
     /// Returns the commit version for this transaction.
@@ -1259,7 +1271,10 @@ impl<STATE, MODE: ExecutionMode> Transaction<STATE, MODE> {
 
     /// Generate non-file commit actions as in-memory structs, that can then be encoded into the
     /// committable format (e.g EngineData)
-    fn prepare_nonfile_actions(&self, engine: &dyn Engine) -> KernelResult<NonfileCommitActions> {
+    fn prepare_nonfile_actions(
+        &mut self,
+        engine: &dyn Engine,
+    ) -> KernelResult<NonfileCommitActions> {
         let set_transactions = self.set_transactions.clone();
         let in_commit_timestamp = self.get_in_commit_timestamp(engine)?;
         let mut kernel_commit_info = CommitInfo::new(
@@ -1289,8 +1304,33 @@ impl<STATE, MODE: ExecutionMode> Transaction<STATE, MODE> {
 
         #[cfg(feature = "adaptive-metadata-in-dev")]
         self.set_adaptive_metadata_commit_info(engine, &mut kernel_commit_info)?;
+
+        let commit_version = self.get_commit_version();
+        // When UPDATE newly enables ICT, stamp enablement version/timestamp into Metadata
+        // (matches Java InCommitTimestampUtils.getUpdatedMetadataWithICTEnablementInfo).
+        if let (Some(ict), Some(read_snapshot)) =
+            (in_commit_timestamp, self.read_snapshot_opt.as_ref())
+            && protocol_prep::transaction_enables_ict(
+                read_snapshot.table_configuration(),
+                &self.effective_table_config,
+            )
+        {
+            let stamped = protocol_prep::with_ict_enablement_info(
+                self.effective_table_config.metadata().clone(),
+                commit_version,
+                ict,
+            );
+            self.effective_table_config = TableConfiguration::try_new(
+                stamped,
+                self.effective_table_config.protocol().clone(),
+                self.effective_table_config.table_root().clone(),
+                self.effective_table_config.version(),
+            )?;
+            self.should_emit_metadata = true;
+        }
+
         Ok(NonfileCommitActions {
-            commit_version: self.get_commit_version(),
+            commit_version,
             kernel_commit_info,
             protocol: self
                 .should_emit_protocol
