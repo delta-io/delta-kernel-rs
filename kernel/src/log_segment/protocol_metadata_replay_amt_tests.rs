@@ -1345,6 +1345,35 @@ async fn snapshot_with_crc_at_version_serves_last_manifest_commit_from_crc(
     assert_eq!(snapshot.last_manifest_commit(&engine).unwrap(), expected);
 }
 
+// A checkpoint at or after a manifest commit lists only the files added after the manifest tree, so
+// a checksum counted from it would miss the tree's files. Kernel refuses to write such a
+// checkpoint, so it is written by hand, standing in for another writer's.
+#[rstest]
+#[case::checkpoint(vec![])]
+#[case::checkpoint_with_tail(vec![commit_info(Some((0, 0)))])]
+#[tokio::test]
+async fn no_checksum_from_checkpoint_after_manifest_commit(#[case] later_commits: Vec<String>) {
+    let (store, table_root) = manifest_commit_table(&[]).await;
+    put_pm_checkpoint(&store, 0).await;
+    for (version, commit) in later_commits.into_iter().enumerate() {
+        add_commit(
+            table_root.as_str(),
+            store.as_ref(),
+            version as u64 + 1,
+            commit,
+        )
+        .await
+        .unwrap();
+    }
+    let engine = SyncEngine::new_with_store(store);
+    let snapshot = Snapshot::builder_for(table_root).build(&engine).unwrap();
+    assert_eq!(snapshot.log_segment().checkpoint_version, Some(0));
+    assert_result_error_with_message(
+        snapshot.write_checksum(&engine),
+        "checkpoint 0 may not list the files of adaptiveMetadata manifest commit 0",
+    );
+}
+
 // A snapshot that sits on a checkpoint (no CRC, no later commits) cannot read commitInfo during
 // replay, so it reads `lastManifestCommit` from the commit file at the checkpoint version, and
 // errors with `MissingVersion` when that file is gone. P&M replay, and so the snapshot build,

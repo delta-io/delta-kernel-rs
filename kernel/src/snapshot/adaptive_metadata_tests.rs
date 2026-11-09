@@ -9,7 +9,9 @@ use crate::actions::{
     CheckpointAction, ContentRoot, DomainMetadata, LOG_DOMAIN_METADATA_SCHEMA, LOG_TXN_SCHEMA,
     LastManifestCommit, SetTransaction,
 };
+use crate::crc::{Crc, try_write_crc_file};
 use crate::engine::sync::SyncEngine;
+use crate::path::ParsedLogPath;
 use crate::unit_test_utils::Action;
 use crate::unit_test_utils::adaptive_metadata_fixtures::{
     checkpoint_line, setup_adaptive_metadata_table, write_ict_commit, write_sidecar,
@@ -55,7 +57,11 @@ fn table_with_checkpoint_action(
         Some(&pointer),
         &checkpoint_line(&checkpoint),
     );
-    write_crc_at(CHECKPOINT_VERSION);
+    // Kernel won't write a CRC at a manifest commit, so a CRC from there on builds on one written
+    // by hand.
+    if crc_version.is_some_and(|version| version >= CHECKPOINT_VERSION) {
+        write_manifest_commit_crc(&engine, &table_root, CHECKPOINT_VERSION);
+    }
     write_ict_commit(
         &engine,
         &table_root,
@@ -76,6 +82,31 @@ fn table_with_checkpoint_action(
             .is_some()
     );
     (engine, snapshot)
+}
+
+/// Writes the CRC at manifest commit `version`: the CRC before it, with that commit's in-commit
+/// timestamp and `lastManifestCommit`. Like kernel's CRC writer, it ignores the `txn` entries in
+/// the commit's checkpoint action (TODO(#2866)).
+fn write_manifest_commit_crc(engine: &SyncEngine, table_root: &Url, version: Version) {
+    let snapshot_at = |version| {
+        Snapshot::builder_for(table_root.clone())
+            .at_version(version)
+            .build(engine)
+            .unwrap()
+    };
+    let manifest_commit = snapshot_at(version);
+    let crc = Crc {
+        version,
+        in_commit_timestamp_opt: manifest_commit.get_in_commit_timestamp(engine).unwrap(),
+        last_manifest_commit_opt: manifest_commit.last_manifest_commit(engine).unwrap(),
+        ..snapshot_at(version - 1)
+            .resolve_crc_for_write(engine)
+            .unwrap()
+            .as_ref()
+            .clone()
+    };
+    let path = ParsedLogPath::new_crc(table_root, version).unwrap();
+    try_write_crc_file(engine, &path.location, &crc).unwrap();
 }
 
 /// A checkpoint action at [`CHECKPOINT_VERSION`] that carries `snapshot`'s protocol and metadata,
