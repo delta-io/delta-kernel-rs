@@ -7,7 +7,7 @@ mod utils;
 
 pub use committer::UCCommitter;
 use delta_kernel::snapshot::SnapshotBuilder;
-use delta_kernel::{DeltaError, KernelError, KernelResult, LogPath, Snapshot};
+use delta_kernel::{DeltaError, KernelError, LogPath, Result, Snapshot};
 use unity_catalog_delta_client_api::{Commit, LoadTableResponse};
 use url::Url;
 pub use utils::{
@@ -26,7 +26,7 @@ pub use utils::{
 /// Returns an error if a commit's `version` or `file_size` is negative, or if
 /// [`LogPath::from_commit_filename`] rejects its filename (including a filename whose version
 /// differs from the commit's `version`).
-pub fn log_tail_from_commits(commits: &[Commit], table_root: Url) -> KernelResult<Vec<LogPath>> {
+pub fn log_tail_from_commits(commits: &[Commit], table_root: Url) -> Result<Vec<LogPath>> {
     let mut sorted: Vec<&Commit> = commits.iter().collect();
     sorted.sort_by_key(|c| c.version);
     sorted
@@ -48,13 +48,13 @@ pub fn log_tail_from_commits(commits: &[Commit], table_root: Url) -> KernelResul
                     c.file_size
                 ))
             })?;
-            LogPath::from_commit_filename(
+            Ok(LogPath::from_commit_filename(
                 table_root.clone(),
                 version,
                 &c.file_name,
                 c.file_modification_timestamp,
                 file_size,
-            )
+            )?)
         })
         .collect()
 }
@@ -70,7 +70,7 @@ pub fn log_tail_from_commits(commits: &[Commit], table_root: Url) -> KernelResul
 ///
 /// Returns an error if the response's location is not a valid URL, if [`log_tail_from_commits`]
 /// fails, or if `latest_table_version` is negative.
-pub fn snapshot_builder_from_load_table(resp: &LoadTableResponse) -> KernelResult<SnapshotBuilder> {
+pub fn snapshot_builder_from_load_table(resp: &LoadTableResponse) -> Result<SnapshotBuilder> {
     let table_root = Url::parse(&resp.metadata.location)
         .map_err(|e| KernelError::generic(format!("invalid table location: {e}")))?;
     let log_tail = log_tail_from_commits(&resp.commits, table_root.clone())?;
@@ -244,13 +244,16 @@ mod tests {
         let err = log_tail_from_commits(&commits, table_root).unwrap_err();
 
         let expected_kind = if expected_invalid_log_path_error {
-            matches!(err, KernelError::InvalidLogPath(_))
+            matches!(
+                err,
+                delta_kernel::Error::Kernel(KernelError::InvalidLogPath(_))
+            )
         } else if version < 0 {
             matches!(&err, delta_kernel::Error::Delta(error)
                 if error.name() == "DELTA_VERSION_INVALID" && error.parameters()[0].value() == version.to_string()
                 && std::error::Error::source(error).is_some())
         } else {
-            matches!(err, KernelError::Generic(_))
+            matches!(err, delta_kernel::Error::Kernel(KernelError::Generic(_)))
         };
         assert!(expected_kind, "{err:?}");
     }
