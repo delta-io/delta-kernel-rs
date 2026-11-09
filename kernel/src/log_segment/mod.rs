@@ -604,7 +604,7 @@ impl LogSegment {
         log_root: Url,
         time_travel_version: Option<Version>,
         checkpoint_hint: Option<LastCheckpointHint>,
-    ) -> KernelResult<Self> {
+    ) -> Result<Self> {
         // TODO(#3421): Move Delta error classification into the shared constructor when the
         // remaining public APIs and their log-segment callers migrate to `Result`.
         Self::try_new_impl(

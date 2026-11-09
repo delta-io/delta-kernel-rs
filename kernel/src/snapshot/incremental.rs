@@ -349,7 +349,7 @@ impl Snapshot {
         log_tail: Vec<ParsedLogPath>,
         requested_version: Option<Version>,
         checkpoint_handling: CheckpointHandling,
-    ) -> KernelResult<NewSegment> {
+    ) -> Result<NewSegment> {
         let log_root = existing_log_segment.log_root.clone();
         let storage = engine.storage_handler();
 
@@ -389,7 +389,7 @@ impl Snapshot {
                 // Case C.1: caller requested a specific version (necessarily >
                 // existing_snapshot_version since cases A and B were handled above), but
                 // no such commit exists in the log.
-                Some(_) => Err(KernelError::MissingVersion(existing_snapshot_version + 1)),
+                Some(_) => Err(KernelError::MissingVersion(existing_snapshot_version + 1).into()),
                 // Case C.2: no new commits and no explicit target; latest is existing.
                 // TODO(#3845): Define publication refresh when cached versions are not listed.
                 None => Ok(NewSegment::Unchanged),
@@ -419,7 +419,8 @@ impl Snapshot {
             return Err(KernelError::invalid_log_segment(format!(
                 "Unexpected state: the newest version in the log {new_end_version} is \
                  older than the existing snapshot version {existing_snapshot_version}"
-            )));
+            ))
+            .into());
         }
         if let Some(new_checkpoint_version) = new_log_segment.checkpoint_version
             && new_checkpoint_version > existing_snapshot_version
