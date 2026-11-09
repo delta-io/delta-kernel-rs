@@ -16,6 +16,8 @@ pub enum DeltaErrorCondition {
     DeltaDuplicateColumnsFoundPartitionColumns,
     /// `DELTA_LOG_FILE_NOT_FOUND` (SQLSTATE `42K03`).
     DeltaLogFileNotFound,
+    /// `DELTA_PARTITION_COLUMN_NOT_FOUND` (SQLSTATE `42703`).
+    DeltaPartitionColumnNotFound,
     /// `DELTA_PATH_DOES_NOT_EXIST` (SQLSTATE `42K03`).
     DeltaPathDoesNotExist,
     /// `DELTA_VERSIONS_NOT_CONTIGUOUS` (SQLSTATE `KD00C`).
@@ -38,6 +40,12 @@ impl DeltaErrorCondition {
                 sql_state: Some("42K03"),
                 parameter_names: &["version", "checkpointVersion", "logPath"],
                 message_template: "Unable to retrieve the delta log files to construct table version <version> starting from checkpoint version <checkpointVersion> at <logPath>.",
+            },
+            Self::DeltaPartitionColumnNotFound => ConditionMetadata {
+                name: "DELTA_PARTITION_COLUMN_NOT_FOUND",
+                sql_state: Some("42703"),
+                parameter_names: &["columnName", "schemaMap"],
+                message_template: "Partition column <columnName> not found in schema [<schemaMap>]",
             },
             Self::DeltaPathDoesNotExist => ConditionMetadata {
                 name: "DELTA_PATH_DOES_NOT_EXIST",

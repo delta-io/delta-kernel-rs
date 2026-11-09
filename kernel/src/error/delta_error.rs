@@ -7,6 +7,7 @@ use std::fmt;
 use super::DeltaErrorCondition;
 #[cfg(any(test, feature = "test-utils"))]
 use crate::KernelResult;
+use crate::schema::StructType;
 use crate::{KernelError, Version};
 
 /// A catalog-defined Delta failure that terminates the current operation.
@@ -197,6 +198,22 @@ impl DeltaError {
         Self::new(
             DeltaErrorCondition::DeltaDuplicateColumnsFoundPartitionColumns,
             vec![DeltaErrorParameter::new("duplicateCols", name)],
+            source,
+        )
+    }
+
+    /// Reports a declared partition `column` absent from the logical `schema`.
+    pub fn partition_column_not_found(
+        column: &str,
+        schema: &StructType,
+        source: Option<Box<dyn StdError + Send + Sync + 'static>>,
+    ) -> Self {
+        Self::new(
+            DeltaErrorCondition::DeltaPartitionColumnNotFound,
+            vec![
+                DeltaErrorParameter::new("columnName", column),
+                DeltaErrorParameter::new("schemaMap", schema),
+            ],
             source,
         )
     }
