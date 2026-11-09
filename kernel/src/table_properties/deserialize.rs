@@ -185,8 +185,8 @@ pub enum ParseIntervalError {
 /// `stringToInterval`:
 /// https://github.com/apache/spark/blob/5a57efdcee9e6569d8de4272bda258788cf349e3/sql/api/src/main/scala/org/apache/spark/sql/catalyst/util/SparkIntervalUtils.scala#L134
 ///
-/// Notably we don't support months nor years, nor do we support fractional values, and negative
-/// intervals aren't supported.
+/// Notably we don't support months nor years, compound intervals, fractional values, or negative
+/// intervals. Trailing tokens after the first number/unit pair are rejected.
 ///
 /// For now this is adapted from delta-rs' `parse_interval` function:
 /// https://github.com/delta-io/delta-rs/blob/d4f18b3ae9d616e771b5d0e0fa498d0086fd91eb/crates/core/src/table/config.rs#L474
@@ -213,18 +213,31 @@ fn parse_interval_impl(value: &str) -> Result<Duration, ParseIntervalError> {
     // convert to u64 since Duration expects it
     let number = number as u64; // non-negative i64 => always safe
 
-    let duration = match it
+    let unit = it
         .next()
-        .ok_or_else(|| ParseIntervalError::NotAnInterval(value.to_string()))?
-    {
+        .ok_or_else(|| ParseIntervalError::NotAnInterval(value.to_string()))?;
+    // Reject compound intervals and trailing tokens. Silently using only the first number/unit
+    // pair would under-read values such as `interval 1 day 12 hours` or accept
+    // `interval 1 day garbage` as one day.
+    require!(
+        it.next().is_none(),
+        ParseIntervalError::NotAnInterval(value.to_string())
+    );
+
+    let scaled_secs = |unit_secs: u64| {
+        number
+            .checked_mul(unit_secs)
+            .ok_or_else(|| ParseIntervalError::UnsupportedInterval(value.to_string()))
+    };
+    let duration = match unit {
         "nanosecond" | "nanoseconds" => Duration::from_nanos(number),
         "microsecond" | "microseconds" => Duration::from_micros(number),
         "millisecond" | "milliseconds" => Duration::from_millis(number),
         "second" | "seconds" => Duration::from_secs(number),
-        "minute" | "minutes" => Duration::from_secs(number * SECONDS_PER_MINUTE),
-        "hour" | "hours" => Duration::from_secs(number * SECONDS_PER_HOUR),
-        "day" | "days" => Duration::from_secs(number * SECONDS_PER_DAY),
-        "week" | "weeks" => Duration::from_secs(number * SECONDS_PER_WEEK),
+        "minute" | "minutes" => Duration::from_secs(scaled_secs(SECONDS_PER_MINUTE)?),
+        "hour" | "hours" => Duration::from_secs(scaled_secs(SECONDS_PER_HOUR)?),
+        "day" | "days" => Duration::from_secs(scaled_secs(SECONDS_PER_DAY)?),
+        "week" | "weeks" => Duration::from_secs(scaled_secs(SECONDS_PER_WEEK)?),
         unit @ ("month" | "months") => {
             return Err(ParseIntervalError::UnsupportedInterval(unit.to_string()));
         }
@@ -343,6 +356,17 @@ mod tests {
         assert_eq!(
             parse_interval("interval 123 week").unwrap(),
             Duration::from_secs(123 * 604800)
+        );
+    }
+
+    #[rstest]
+    #[case::compound("interval 1 day 12 hours")]
+    #[case::trailing_garbage("interval 1 day garbage")]
+    #[case::overflow("interval 9223372036854775807 weeks")]
+    fn test_parse_interval_rejects_compound_trailing_and_overflow(#[case] value: &str) {
+        assert!(
+            parse_interval(value).is_none(),
+            "{value} should be rejected"
         );
     }
 
