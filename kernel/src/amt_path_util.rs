@@ -6,7 +6,7 @@
 use url::{ParseError, Url};
 
 use crate::path_encoding::{uri_decode_path, uri_encode_path};
-use crate::uri_reference::scheme_len;
+use crate::uri_reference::{scheme_len, split_authority, uri_encode_location};
 use crate::utils::{require, to_file_size};
 use crate::{FileMeta, KernelError, KernelResult};
 
@@ -33,12 +33,11 @@ pub(crate) fn resolve_amt_location(path: &str, table_root: &Url) -> KernelResult
 /// Parses an absolute AMT `path` into a [`Url`] with its path component percent-encoded, as
 /// [`resolve_amt_location`] does, or returns `None` if `path` is relative (has no URI scheme).
 pub(crate) fn parse_absolute_amt_location(path: &str) -> KernelResult<Option<Url>> {
-    let Some(scheme_len) = scheme_len(path) else {
+    if scheme_len(path).is_none() {
         return Ok(None);
-    };
+    }
     reject_dot_segments(path)?;
-    let (prefix, raw_path) = split_authority(path, scheme_len);
-    let url = uri_with_encoded_path(prefix, raw_path).map_err(|e| {
+    let url = Url::parse(&uri_encode_location(path)).map_err(|e| {
         KernelError::generic(format!(
             "Failed to parse absolute AMT location {path:?}: {e}"
         ))
@@ -147,18 +146,6 @@ fn encode_and_join(path: &str, table_root: &Url) -> KernelResult<Url> {
             "Failed to resolve relative AMT location {path:?} against table root {base}: {e}"
         ))
     })
-}
-
-/// Splits an absolute `location` whose scheme is `scheme_len` bytes long into its
-/// `scheme:[//authority]` prefix and the raw path that follows. The authority, when present, ends
-/// at the next `/`.
-fn split_authority(location: &str, scheme_len: usize) -> (&str, &str) {
-    let after_scheme = scheme_len + 1;
-    let prefix_len = match location[after_scheme..].strip_prefix("//") {
-        Some(rest) => after_scheme + 2 + rest.find('/').unwrap_or(rest.len()),
-        None => after_scheme,
-    };
-    location.split_at(prefix_len)
 }
 
 /// Parses `prefix` followed by the percent-encoded `raw_path`, so reserved characters in the

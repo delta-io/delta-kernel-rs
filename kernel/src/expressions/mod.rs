@@ -161,6 +161,18 @@ pub enum UnaryExpressionOp {
     ///
     /// [Per-file Statistics]: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#per-file-statistics
     ToJson,
+    /// Percent-encodes the path of a raw (unencoded) STRING URI reference so it can be used as a
+    /// URL: space, `"`, `#`, `%`, `<`, `>`, `?`, `[`, `\`, `]`, `^`, `` ` ``, `{`, `|`, `}`, ASCII
+    /// controls, and every byte of a non-ASCII character become `%XX`. Everything else, including
+    /// `/` and `:`, is kept. When the reference begins with a scheme (see
+    /// [`UnaryPredicateOp::HasUriScheme`]), its `scheme:` and any `//authority` (up to the next
+    /// `/`) are kept verbatim. The output is STRING, and a NULL input yields NULL.
+    ///
+    /// ```text
+    /// URI_ENCODE_PATH('data/a b.parquet')         -- 'data/a%20b.parquet'
+    /// URI_ENCODE_PATH('s3://bucket/a#1.parquet')  -- 's3://bucket/a%231.parquet'
+    /// ```
+    UriEncodePath,
 }
 
 /// A binary arithmetic operator over two numeric operands.
@@ -1256,6 +1268,7 @@ impl Display for UnaryExpressionOp {
         use UnaryExpressionOp::*;
         match self {
             ToJson => write!(f, "TO_JSON"),
+            UriEncodePath => write!(f, "URI_ENCODE_PATH"),
         }
     }
 }
@@ -1478,8 +1491,8 @@ mod tests {
     use serde::de::DeserializeOwned;
 
     use super::{
-        DataType, Expression as Expr, MapToStructOptions, Predicate as Pred, col, column_pred,
-        expr, lit,
+        DataType, Expression as Expr, MapToStructOptions, Predicate as Pred, UnaryExpressionOp,
+        col, column_pred, expr, lit,
     };
 
     /// Helper function to verify roundtrip serialization/deserialization
@@ -1508,6 +1521,10 @@ mod tests {
             (
                 Expr::cast(col!("x"), DataType::DATE),
                 "CAST(Column(x) AS date)",
+            ),
+            (
+                Expr::unary(UnaryExpressionOp::UriEncodePath, col!("x")),
+                "URI_ENCODE_PATH(Column(x))",
             ),
             (
                 Expr::case_when([(col!("x").is_null(), lit(0))], col!("x")),
@@ -1721,10 +1738,12 @@ mod tests {
 
         // ==================== Expression Operations Tests ====================
 
-        #[test]
-        fn test_unary_expression_roundtrip() {
-            let expr = Expression::unary(UnaryExpressionOp::ToJson, col!("data"));
-            assert_roundtrip(&expr);
+        #[rstest::rstest]
+        fn test_unary_expression_roundtrip(
+            #[values(UnaryExpressionOp::ToJson, UnaryExpressionOp::UriEncodePath)]
+            op: UnaryExpressionOp,
+        ) {
+            assert_roundtrip(&Expression::unary(op, col!("data")));
         }
 
         #[test]
