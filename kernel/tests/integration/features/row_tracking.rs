@@ -14,7 +14,7 @@ use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::{DynObjectStore, ObjectStoreExt};
 use delta_kernel::schema::{MetadataColumnSpec, SchemaRef, StructField, schema_ref};
 use delta_kernel::transaction::CommitResult;
-use delta_kernel::{KernelError, KernelResult, Snapshot};
+use delta_kernel::{Engine, KernelError, KernelResult, Snapshot};
 use itertools::Itertools;
 use rstest::rstest;
 use serde_json::{Deserializer, Value};
@@ -1291,6 +1291,7 @@ fn collect_number_to_column(batches: &[RecordBatch], column_name: &str) -> HashM
 #[tokio::test]
 async fn test_read_row_tracking_metadata_stable_across_deletion_vector_update(
     #[case] deleted_indexes: &[u64],
+    #[values(false, true)] compact: bool,
     #[values(MetadataColumnSpec::RowId, MetadataColumnSpec::RowCommitVersion)]
     metadata_column: MetadataColumnSpec,
 ) -> delta_kernel::Result<()> {
@@ -1361,6 +1362,15 @@ async fn test_read_row_tracking_metadata_stable_across_deletion_vector_update(
     )?;
     txn.ack_row_tracking_preservation();
     txn.commit(engine.as_ref())?.unwrap_committed();
+
+    if compact {
+        let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
+        let mut writer = snapshot.log_compaction_writer(1, 2)?;
+        let data = writer.compaction_data(engine.as_ref())?;
+        engine
+            .json_handler()
+            .write_json_file(writer.compaction_path(), Box::new(data), false)?;
+    }
 
     let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
     let after = collect_number_to_column(
@@ -1650,7 +1660,6 @@ async fn test_read_row_ids_coexist_with_row_index() -> delta_kernel::Result<()> 
 /// correctly through the scan path. This ensures that `baseRowId` and row-tracking domain
 /// metadata survive compaction without being dropped or corrupted.
 #[tokio::test]
-#[ignore = "log compaction is not yet supported, tracked in #2337"]
 async fn test_read_row_ids_after_log_compaction() -> delta_kernel::Result<()> {
     let _ = tracing_subscriber::fmt::try_init();
     let tmp_dir = tempdir().map_err(KernelError::from)?;

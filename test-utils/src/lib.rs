@@ -129,10 +129,12 @@ macro_rules! define_sweeps {
 }
 
 define_sweeps! {
-    // TODO: Log compaction (needs LogState::with_compaction_at, #2337).
     // TODO: Schema history (add/drop/rename) (needs schema-evolution support).
     log_state_values = (
         commits_only(),
+        compaction_at_end(),
+        interior_compactions(),
+        compaction_after_checkpoint(),
         checkpoint_at_end(),
         checkpoint_at_end_no_hint(),
         checkpoint_mid(),

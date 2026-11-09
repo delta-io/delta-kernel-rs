@@ -1,8 +1,5 @@
 //! # Log Compaction
 //!
-//! **NOTE:** Log compaction is currently disabled on both reads and writes due to
-//! insufficient integration test coverage. See issue #2337 for re-enablement tracking.
-//!
 //! This module provides an API for writing log compaction files that aggregate
 //! multiple commit JSON files into single compacted files. This improves performance
 //! by reducing the number of individual log files that need to be processed during
@@ -12,7 +9,7 @@
 //!
 //! Log compaction creates files with the naming pattern
 //! `{start_version}.{end_version}.compacted.json` that contain the reconciled actions from all
-//! commit files in the specified version range. Only commit/compaction files that intersect with
+//! commit files in the inclusive version range. Only the original commits in
 //! [start_version, end_version] are processed. Note that `end_version` must be greater than
 //! `start_version` (equal versions are not allowed). This is similar to checkpoints but operates on
 //! a subset of versions rather than the entire table.
@@ -78,13 +75,14 @@
 //!
 //! - **Checkpoints**: Aggregate the entire table state up to a specific version
 //! - **Log Compaction**: Aggregates only a specific range of commit files
-//! - Both use similar action reconciliation logic but serve different use cases
+//! - Compactions retain removals and transaction markers to suppress state before their range;
+//!   checkpoints may discard expired entries and removed domain metadata.
 
 use std::sync::LazyLock;
 
 use crate::actions::{
     ADD_FIELD, DOMAIN_METADATA_FIELD, METADATA_FIELD, PROTOCOL_FIELD, REMOVE_FIELD,
-    SET_TRANSACTION_FIELD, SIDECAR_FIELD,
+    SET_TRANSACTION_FIELD,
 };
 use crate::schema::{SchemaRef, lazy_schema_ref};
 
@@ -104,5 +102,4 @@ static COMPACTION_ACTIONS_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
     (&PROTOCOL_FIELD),
     (&SET_TRANSACTION_FIELD),
     (&DOMAIN_METADATA_FIELD),
-    (&SIDECAR_FIELD),
 };

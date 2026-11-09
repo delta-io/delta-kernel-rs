@@ -362,8 +362,7 @@ async fn snapshot_at_checkpoint_tip_emits_expected_metrics() -> delta_kernel::Re
 /// When early commits are covered by a compacted log file, the snapshot reports both
 /// the individual commit count and the compaction count. The JSON handler reads the
 /// compaction file and the tail commit in a single call (the minimal cover).
-// TODO(#2337): re-enable when log compaction is re-enabled
-#[ignore = "log compaction is temporarily disabled (#2337)"]
+
 #[tokio::test]
 async fn snapshot_with_log_compaction_emits_expected_metrics() -> delta_kernel::Result<()> {
     let table = TestTableBuilder::new()

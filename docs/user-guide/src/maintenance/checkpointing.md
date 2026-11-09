@@ -177,11 +177,13 @@ reducing the number of files Kernel must read during log replay. The API follows
 pattern to the `CheckpointWriter` API: create a `LogCompactionWriter` from a `Snapshot`,
 retrieve the compaction path and data, then write the data to storage.
 
-> [!NOTE]
-> Log compaction is currently disabled on both reads and writes due to insufficient
-> integration test coverage. See [issue #2337](https://github.com/delta-io/delta-kernel-rs/issues/2337)
-> for tracking. The `Snapshot::log_compaction_writer()` method exists but returns an error
-> if called. This section will be updated when the feature is re-enabled.
+Use an inclusive range with `start_version < end_version <= snapshot.version()`.
+Write every selected row from `compaction_data()` atomically to `compaction_path()` through
+your engine's JSON handler. Keep the original commits: time travel and change-data consumers
+still need them. Kernel chooses usable compactions automatically during snapshot reads.
+
+Compaction requires a published snapshot and a table that Kernel supports reading and writing.
+Tables with adaptiveMetadata enabled do not support compaction writes.
 
 ## What's next
 

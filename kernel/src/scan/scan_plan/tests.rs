@@ -759,6 +759,19 @@ fn declarative_json_only_disables_metadata_pruning(
     no_checkpoint_stats(),
     StatsOptions::all_struct()
 )]
+#[case::compaction(
+    LogState::with_latest_version(3).with_compaction_ranges([(0, 2)]),
+    FeatureSet::new(),
+    checkpoint_json_stats(),
+    StatsOptions::all()
+)]
+#[case::compaction_after_sidecars(
+    LogState::with_latest_version(4).with_checkpoint_at([2])
+        .with_sidecars_if_enabled(Some(1)).with_compaction_ranges([(3, 4)]),
+    FeatureSet::new().v2_checkpoint().column_mapping("name"),
+    checkpoint_struct_stats(),
+    StatsOptions::all_struct()
+)]
 fn declarative_metadata_output_options_across_log_shapes(
     #[case] log_state: LogState,
     #[case] features: FeatureSet,
@@ -1128,10 +1141,16 @@ fn expected_stats_row(id: i64, partition: i32) -> String {
     )
 }
 
-#[test]
-fn declarative_metadata_reconciles_checkpoint_with_later_commits() -> Result<()> {
+#[rstest]
+fn declarative_metadata_reconciles_checkpoint_with_later_commits(
+    #[values(false, true)] compact: bool,
+) -> Result<()> {
+    let mut state = LogState::with_latest_version(4).with_checkpoint_at([2]);
+    if compact {
+        state = state.with_compaction_ranges([(3, 4)]);
+    }
     let table = TestTableBuilder::new()
-        .with_log_state(LogState::with_latest_version(4).with_checkpoint_at([2]))
+        .with_log_state(state)
         .build()
         .expect("build checkpoint-plus-commits table");
     let engine = SyncEngine::new_with_store(table.store().clone());
@@ -1153,6 +1172,17 @@ fn declarative_metadata_reconciles_checkpoint_with_later_commits() -> Result<()>
         .with_stats(StatsOptions::all())
         .with_partition_values(PartitionValuesOptions::with_struct())
         .build()?;
+    let plan = scan.declarative_metadata_scan_plan(&engine)?.unwrap();
+    assert_eq!(
+        plan.nodes.iter().any(|node| match &node.op {
+            Operator::ScanJson(scan) =>
+                scan.files
+                    .iter()
+                    .any(|f| f.meta.location.path().ends_with(".compacted.json")),
+            _ => false,
+        }),
+        compact
+    );
     let actual = declarative_metadata(&scan, &engine)?;
 
     assert_metadata_eq(&actual, &expected, "checkpoint with later commits")?;
