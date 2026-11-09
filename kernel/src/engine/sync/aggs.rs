@@ -127,21 +127,21 @@ fn bind_aggregate(agg: &Agg, output_type: &DataType) -> KernelResult<Box<dyn Bou
         Agg::Sum(value) => LongAccumulatorAgg::try_new(value, output_type, LongAccumulator::Sum),
         Agg::Count(value) => CountAgg::try_new(Some(value), output_type),
         Agg::CountStar => CountAgg::try_new(None, output_type),
-        Agg::FirstNonNull(value) => Ok(Box::new(FirstNonNullAgg::try_new(value, output_type)?)),
+        Agg::FirstNonNull(column) => Ok(Box::new(FirstNonNullAgg::try_new(column, output_type)?)),
         Agg::MinNonNullBy(ops) => NonNullByAgg::try_new(ops, output_type, Comparison::Min),
         Agg::MaxNonNullBy(ops) => NonNullByAgg::try_new(ops, output_type, Comparison::Max),
     }
 }
 
 struct FirstNonNullAgg {
-    value: ColumnName,
+    column: ColumnName,
     output_type: ArrowDataType,
 }
 
 impl FirstNonNullAgg {
-    fn try_new(value: &ColumnName, output_type: &DataType) -> KernelResult<Self> {
+    fn try_new(column: &ColumnName, output_type: &DataType) -> KernelResult<Self> {
         Ok(Self {
-            value: value.clone(),
+            column: column.clone(),
             output_type: output_type.try_into_arrow()?,
         })
     }
@@ -157,20 +157,19 @@ impl BoundAggregate for FirstNonNullAgg {
     fn prepare<'a>(&'a self, batch: &'a RecordBatch) -> KernelResult<Box<dyn AggUpdater + 'a>> {
         Ok(Box::new(FirstNonNullUpdater(extract_column(
             batch,
-            &self.value,
+            &self.column,
         )?)))
     }
 
     fn finalize(&self, states: &[&dyn Any], input: &[RecordBatch]) -> KernelResult<ArrayRef> {
-        let mut arrays = extract_column_values(input, &self.value)?;
+        let mut arrays = extract_column_values(input, &self.column)?;
         arrays.push(new_null_array(&self.output_type, 1));
         let null_row = (input.len(), 0);
         let rows: Vec<_> = states
             .iter()
             .map(|state| -> KernelResult<_> {
-                Ok(downcast_state::<FirstNonNullState>(*state)?
-                    .0
-                    .unwrap_or(null_row))
+                let state = downcast_state::<FirstNonNullState>(*state)?;
+                Ok(state.0.unwrap_or(null_row))
             })
             .try_collect()?;
         interleave_column_values(&arrays, &rows)
@@ -440,12 +439,12 @@ fn downcast_state_mut<T: 'static>(state: &mut dyn Any) -> KernelResult<&mut T> {
 #[cfg(test)]
 mod tests {
     use rstest::rstest;
+    use test_utils::{assert_batches_sorted_eq, sort_lines};
 
     use super::*;
     use crate::arrow::array::{BooleanArray, StringArray, StructArray};
     use crate::arrow::buffer::NullBuffer;
     use crate::arrow::datatypes::Field;
-    use crate::arrow::util::pretty::pretty_format_batches;
     use crate::expressions::column_name;
     use crate::schema::schema_ref;
 
@@ -531,26 +530,22 @@ mod tests {
             ];
             eval_aggregate(&aggregate, &inputs)?
         };
-        let sample = output[0]
-            .column(0)
-            .as_any()
-            .downcast_ref::<StructArray>()
-            .unwrap();
-        assert!(sample.is_valid(0));
-        assert!(sample.column(1).is_null(0));
-        let paths = sample
-            .column(0)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .unwrap();
-        assert_eq!(
-            paths.iter().collect::<Vec<_>>(),
-            [if all_children_null {
-                None
-            } else {
-                Some("missing-size")
-            }]
-        );
+        let expected = if all_children_null {
+            "\
++------------------+
+| sample           |
++------------------+
+| {path: , size: } |
++------------------+"
+        } else {
+            "\
++------------------------------+
+| sample                       |
++------------------------------+
+| {path: missing-size, size: } |
++------------------------------+"
+        };
+        assert_batches_eq(&output, expected);
         Ok(())
     }
 
@@ -593,19 +588,11 @@ mod tests {
         Ok(())
     }
 
-    /// Asserts `batches` pretty-print equal to `expected`, sorting data rows so HashMap group order
-    /// does not matter. `expected` is the full pretty table (header, body, footer).
+    /// Checks a table-formatted expectation without depending on HashMap group order.
     fn assert_batches_eq(batches: &[RecordBatch], expected: &str) {
-        let formatted = pretty_format_batches(batches).unwrap().to_string();
-        let sort_body = |s: &str| -> String {
-            let mut lines: Vec<_> = s.trim().lines().map(str::to_string).collect();
-            let len = lines.len();
-            if len > 3 {
-                lines[2..len - 1].sort_unstable();
-            }
-            lines.join("\n")
-        };
-        assert_eq!(sort_body(&formatted), sort_body(expected));
+        let mut expected_lines: Vec<_> = expected.trim().lines().collect();
+        sort_lines!(expected_lines);
+        assert_batches_sorted_eq!(expected_lines, batches);
     }
 
     #[test]
