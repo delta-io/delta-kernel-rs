@@ -218,6 +218,24 @@ impl DeltaError {
         )
     }
 
+    /// Reports the explicitly stored column-mapping `mode` incompatible with adaptive metadata.
+    /// Accepts a [`crate::table_features::ColumnMappingMode`] or an unrecognized stored value.
+    /// `source` retains the protocol validation failure for diagnostics.
+    pub fn adaptive_metadata_mapping_mode(
+        mode: impl ToString,
+        source: Option<Box<dyn StdError + Send + Sync + 'static>>,
+    ) -> Self {
+        Self::new(
+            DeltaErrorCondition::DeltaAdaptiveMetadataRequiresColumnMappingIdMode,
+            vec![
+                DeltaErrorParameter::new("feature", "adaptiveMetadata-preview"),
+                DeltaErrorParameter::new("prop", "delta.columnMapping.mode"),
+                DeltaErrorParameter::new("mode", mode),
+            ],
+            source,
+        )
+    }
+
     /// Adds diagnostic context ahead of the original source without changing catalog metadata.
     pub(crate) fn with_context(mut self, context: String) -> Self {
         self.source = Some(Box::new(DiagnosticContext {

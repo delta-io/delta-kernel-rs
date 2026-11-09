@@ -37,7 +37,7 @@ use crate::schema::derive_macro_utils::ToDataType;
 use crate::schema::{DataType, Schema, schema_has_invariants};
 use crate::table_properties::TableProperties;
 use crate::utils::require;
-use crate::{KernelError, KernelResult, Result};
+use crate::{DeltaError, KernelError, KernelResult, Result};
 
 mod column_mapping;
 #[cfg(feature = "geo-type-in-dev")]
@@ -813,6 +813,18 @@ static ADAPTIVE_METADATA_PREVIEW_INFO: FeatureInfo = FeatureInfo {
     feature_requirements: &[
         FeatureRequirement::Enabled(TableFeature::ColumnMapping),
         FeatureRequirement::Custom(|_protocol, properties| {
+            if let Some(mode) = properties
+                .column_mapping_mode
+                .filter(|mode| *mode != ColumnMappingMode::Id)
+            {
+                return Err(DeltaError::adaptive_metadata_mapping_mode(
+                    mode,
+                    Some(Box::new(KernelError::invalid_protocol(
+                        "Feature 'adaptiveMetadata-preview' requires column mapping in 'id' mode",
+                    ))),
+                )
+                .into());
+            }
             require!(
                 properties.column_mapping_mode == Some(ColumnMappingMode::Id),
                 KernelError::invalid_protocol(
