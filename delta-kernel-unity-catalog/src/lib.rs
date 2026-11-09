@@ -7,7 +7,7 @@ mod utils;
 
 pub use committer::UCCommitter;
 use delta_kernel::snapshot::SnapshotBuilder;
-use delta_kernel::{KernelError, KernelResult, LogPath, Snapshot};
+use delta_kernel::{DeltaError, KernelError, KernelResult, LogPath, Snapshot};
 use unity_catalog_delta_client_api::{Commit, LoadTableResponse};
 use url::Url;
 pub use utils::{
@@ -33,7 +33,14 @@ pub fn log_tail_from_commits(commits: &[Commit], table_root: Url) -> KernelResul
         .into_iter()
         .map(|c| {
             let version = c.version.try_into().map_err(|_| {
-                KernelError::generic(format!("commit version {} is negative", c.version))
+                // TODO(3421): Remove the KernelError generic source following the error migration
+                DeltaError::invalid_version(
+                    c.version,
+                    Some(Box::new(KernelError::generic(format!(
+                        "commit version {} is negative",
+                        c.version
+                    )))),
+                )
             })?;
             let file_size = c.file_size.try_into().map_err(|_| {
                 KernelError::generic(format!(
@@ -69,9 +76,15 @@ pub fn snapshot_builder_from_load_table(resp: &LoadTableResponse) -> KernelResul
     let log_tail = log_tail_from_commits(&resp.commits, table_root.clone())?;
     let mut builder = Snapshot::builder_for(table_root).with_log_tail(log_tail);
     if let Some(version) = resp.latest_table_version {
-        let max_catalog_version: u64 = version
-            .try_into()
-            .map_err(|_| KernelError::generic("catalog reported a negative table version"))?;
+        let max_catalog_version: u64 = version.try_into().map_err(|_| {
+            DeltaError::invalid_version(
+                version,
+                // TODO(3421): Remove the KernelError generic source following the error migration
+                Some(Box::new(KernelError::generic(
+                    "catalog reported a negative table version",
+                ))),
+            )
+        })?;
         builder = builder.with_max_catalog_version(max_catalog_version);
     }
     Ok(builder)
@@ -154,7 +167,16 @@ mod tests {
     fn snapshot_builder_from_load_table_rejects_negative_version() {
         let resp = load_table_response("memory:///my_table", -1);
         let err = snapshot_builder_from_load_table(&resp).unwrap_err();
-        assert!(err.to_string().contains("negative table version"));
+        let delta_kernel::Error::Delta(error) = err else {
+            panic!("expected Delta error")
+        };
+        assert_eq!(error.name(), "DELTA_VERSION_INVALID");
+        assert_eq!(error.sql_state(), Some("42815"));
+        assert_eq!(error.parameters()[0].name(), "version");
+        assert_eq!(error.parameters()[0].value(), "-1");
+        assert!(matches!(std::error::Error::source(&error)
+            .and_then(|source| source.downcast_ref::<KernelError>()),
+            Some(KernelError::Generic(message)) if message == "catalog reported a negative table version"));
     }
 
     #[test]
@@ -223,6 +245,10 @@ mod tests {
 
         let expected_kind = if expected_invalid_log_path_error {
             matches!(err, KernelError::InvalidLogPath(_))
+        } else if version < 0 {
+            matches!(&err, delta_kernel::Error::Delta(error)
+                if error.name() == "DELTA_VERSION_INVALID" && error.parameters()[0].value() == version.to_string()
+                && std::error::Error::source(error).is_some())
         } else {
             matches!(err, KernelError::Generic(_))
         };

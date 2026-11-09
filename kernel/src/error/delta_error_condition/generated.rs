@@ -18,6 +18,8 @@ pub enum DeltaErrorCondition {
     DeltaPathDoesNotExist,
     /// `DELTA_VERSIONS_NOT_CONTIGUOUS` (SQLSTATE `KD00C`).
     DeltaVersionsNotContiguous,
+    /// `DELTA_VERSION_INVALID` (SQLSTATE `42815`).
+    DeltaVersionInvalid,
 }
 
 impl DeltaErrorCondition {
@@ -40,6 +42,12 @@ impl DeltaErrorCondition {
                 sql_state: Some("KD00C"),
                 parameter_names: &["versionList", "startVersion", "endVersion", "versionToLoad"],
                 message_template: "Versions (<versionList>) are not contiguous. \nA gap in the delta log between versions <startVersion> and <endVersion> was detected while trying to load version <versionToLoad>.",
+            },
+            Self::DeltaVersionInvalid => ConditionMetadata {
+                name: "DELTA_VERSION_INVALID",
+                sql_state: Some("42815"),
+                parameter_names: &["version"],
+                message_template: "The provided version (<version>) is not a valid version.",
             },
         }
     }

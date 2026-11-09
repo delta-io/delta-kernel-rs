@@ -151,6 +151,18 @@ impl DeltaError {
         )
     }
 
+    /// Reports an invalid signed version from a catalog response, retaining its validation cause.
+    pub fn invalid_version(
+        version: i64,
+        source: Option<Box<dyn StdError + Send + Sync + 'static>>,
+    ) -> Self {
+        Self::new(
+            DeltaErrorCondition::DeltaVersionInvalid,
+            vec![DeltaErrorParameter::new("version", version)],
+            source,
+        )
+    }
+
     /// Creates an error with an optional diagnostic cause and captures its backtrace.
     ///
     /// `parameters` must contain exactly [`DeltaErrorCondition::parameter_names`], in that order.
