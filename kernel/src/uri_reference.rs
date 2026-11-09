@@ -1,5 +1,6 @@
-//! RFC 3986 URI-reference syntax: whether a reference is absolute (has a scheme) or relative, and
-//! percent-encoding or decoding its path while keeping any `scheme:[//authority]` prefix.
+//! RFC 3986 URI-reference syntax: whether a reference is absolute (has a scheme) or relative,
+//! whether it has `.` or `..` segments, and percent-encoding or decoding its path while keeping any
+//! `scheme:[//authority]` prefix.
 
 use std::borrow::Cow;
 
@@ -109,6 +110,7 @@ mod tests {
     #[case::bare_dot_dot("..", true)]
     #[case::absolute("s3://b/x/../y", true)]
     #[case::dotted_name("a/.hidden/b..c", false)]
+    #[case::escaped("a/%2E%2E/b", false)]
     #[case::empty("", false)]
     #[case::plain("a/b.parquet", false)]
     fn test_has_dot_segment(#[case] path: &str, #[case] expected: bool) {
