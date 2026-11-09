@@ -992,7 +992,7 @@ async fn remove_on_adaptive_metadata_table_nulls_deletion_timestamp_and_forces_e
 #[tokio::test]
 async fn append_writes_tight_stats_only_on_adaptive_metadata_tables(
     #[values(false, true)] adaptive_metadata: bool,
-) -> KernelResult<()> {
+) -> delta_kernel::Result<()> {
     let (reader_features, column_mapping_mode) = if adaptive_metadata {
         (vec!["adaptiveMetadata-preview"], "id")
     } else {
