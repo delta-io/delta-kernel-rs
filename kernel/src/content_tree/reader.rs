@@ -89,9 +89,10 @@ pub(crate) fn read_add_actions_from_amt(
             cancellation_token.cloned(),
         )?;
     for batch in batches {
-        let selected = transform.select(marker.as_ref(), batch?.as_ref())?;
-        leaves.visit_rows_of(selected.as_ref())?;
-        root_actions.push(transform.convert(selected.as_ref(), vec![])?);
+        let batch = batch?;
+        leaves.visit_rows_of(batch.as_ref())?;
+        let annotated = transform.annotate(marker.as_ref(), batch.as_ref())?;
+        root_actions.push(transform.convert(annotated.as_ref(), vec![])?);
     }
     let leaf_actions = LeafToAddActions::try_new(engine, leaves.leaves, ctx, cancellation_token)?;
     Ok(Box::new(
@@ -130,8 +131,6 @@ struct LeafRef {
     /// The root entry's `manifestInfo.formatVersion`: the format version the leaf was written
     /// with.
     format_version: i32,
-    /// Whether the root entry carries a non-empty `columnFiles` list: column updates to the leaf.
-    has_column_files: bool,
 }
 
 /// The columns [`LeafRef::try_from_getters`] reads, in getter order: the root entry's own fields
@@ -143,14 +142,12 @@ static LEAF_REF_COLUMNS: LazyLock<ColumnNamesAndTypes> = LazyLock::new(|| {
         ColumnName::new([FILE_SIZE_IN_BYTES]),
         ColumnName::new([MANIFEST_INFO, MANIFEST_DV]),
         ColumnName::new([MANIFEST_INFO, FORMAT_VERSION]),
-        ColumnName::new([HAS_COLUMN_FILES_COLUMN]),
     ];
     let types = [
         DataType::STRING,
         DataType::LONG,
         DataType::BINARY,
         DataType::INTEGER,
-        DataType::BOOLEAN,
     ];
     let names = names.into_iter().chain(tracking_names.iter().cloned());
     let types = types.into_iter().chain(tracking_types.iter().cloned());
@@ -192,12 +189,10 @@ impl LeafRef {
             parent_info: TrackingInfo::try_from_getters(row, tracking)?,
             manifest_dv,
             format_version: fields[3].get(row, FORMAT_VERSION)?,
-            has_column_files: fields[4].get(row, HAS_COLUMN_FILES_COLUMN)?,
         })
     }
 
-    /// Rejects a leaf the read path cannot yet read: one written before Iceberg v4, or one whose
-    /// parent has column files, which the read path cannot yet apply to the leaf's entries.
+    /// Rejects a leaf the read path cannot yet read: one written before Iceberg v4.
     fn check_readable(&self) -> KernelResult<()> {
         let location = &self.file_meta.location;
         if self.format_version != AMT_FORMAT_VERSION {
@@ -205,12 +200,6 @@ impl LeafRef {
                 "AMT read path only supports format version {AMT_FORMAT_VERSION} leaf \
                  manifests; DataManifest entry '{location}' has {MANIFEST_INFO}.{FORMAT_VERSION} {}",
                 self.format_version
-            )));
-        }
-        if self.has_column_files {
-            return Err(KernelError::unsupported(format!(
-                "AMT read path does not yet support column files on a leaf manifest; \
-                 DataManifest entry '{location}' has {COLUMN_FILES} set"
             )));
         }
         Ok(())
@@ -370,7 +359,7 @@ struct EntryTransform {
     marked_schema: SchemaRef,
     /// Appends [`SELECTED_COLUMN`] and [`HAS_COLUMN_FILES_COLUMN`] to a batch with the
     /// [`ParentColumns`].
-    selector: Arc<dyn ExpressionEvaluator>,
+    annotator: Arc<dyn ExpressionEvaluator>,
     /// Keeps the rows of a batch whose [`SELECTED_COLUMN`] is true.
     selection_filter: Arc<dyn PredicateEvaluator>,
     /// The kind's [`ManifestKind::helpers`].
@@ -384,22 +373,22 @@ impl EntryTransform {
     fn try_new(engine: &dyn Engine, ctx: &ReadContext, kind: ManifestKind) -> KernelResult<Self> {
         let handler = engine.evaluation_handler();
         let (marked_schema, _) = ParentColumns::none().append_to(&kind.read_schema)?;
-        let (selected_schema, select) = ProjectionStructPatchBuilder::new(&marked_schema)
+        let (annotated_schema, annotate) = ProjectionStructPatchBuilder::new(&marked_schema)
             .append(
                 StructField::nullable(SELECTED_COLUMN, DataType::BOOLEAN),
                 Expression::from(selected_predicate()),
             )
             .append(
-                StructField::nullable(HAS_COLUMN_FILES_COLUMN, DataType::BOOLEAN),
+                StructField::not_null(HAS_COLUMN_FILES_COLUMN, DataType::BOOLEAN),
                 Expression::from(has_column_files_predicate()),
             )
             .build()?;
-        let selector = handler.new_expression_evaluator(
+        let annotator = handler.new_expression_evaluator(
             marked_schema.clone(),
-            select,
-            selected_schema.as_ref().clone().into(),
+            annotate,
+            annotated_schema.as_ref().clone().into(),
         )?;
-        let augmented_schema = schema_with(&selected_schema, &kind.helpers);
+        let augmented_schema = schema_with(&annotated_schema, &kind.helpers);
         let selection_filter = handler.new_predicate_evaluator(
             augmented_schema.clone(),
             Arc::new(Predicate::from_expr(Expression::column([SELECTED_COLUMN]))),
@@ -412,7 +401,7 @@ impl EntryTransform {
         Ok(Self {
             read_schema: kind.read_schema,
             marked_schema,
-            selector,
+            annotator,
             selection_filter,
             helpers: kind.helpers,
             evaluator,
@@ -420,7 +409,7 @@ impl EntryTransform {
     }
 
     /// Builds the evaluator that appends `parent` to the entry batches of one manifest, for
-    /// [`Self::select`].
+    /// [`Self::annotate`].
     fn marker(
         &self,
         engine: &dyn Engine,
@@ -434,19 +423,19 @@ impl EntryTransform {
         )
     }
 
-    /// Appends the manifest's [`ParentColumns`] with `marker` (its [`Self::marker`]), then
-    /// [`SELECTED_COLUMN`] and [`HAS_COLUMN_FILES_COLUMN`], to an entry batch read with
-    /// [`Self::read_schema`]. The result is the input of [`Self::convert`].
-    fn select(
+    /// Appends the [`ParentColumns`] (via `marker`, the manifest's [`Self::marker`]),
+    /// [`SELECTED_COLUMN`], and [`HAS_COLUMN_FILES_COLUMN`] to an entry batch read with
+    /// [`Self::read_schema`], producing the input of [`Self::convert`].
+    fn annotate(
         &self,
         marker: &dyn ExpressionEvaluator,
         entries: &dyn EngineData,
     ) -> KernelResult<Box<dyn EngineData>> {
         let marked = marker.evaluate(entries)?;
-        self.selector.evaluate(marked.as_ref())
+        self.annotator.evaluate(marked.as_ref())
     }
 
-    /// Translates a [`Self::select`]ed entry batch into an `Add`-action batch holding only the
+    /// Translates a [`Self::annotate`]d entry batch into an `Add`-action batch holding only the
     /// entries that read as live data files. `helper_columns` are the kind's
     /// [`ManifestKind::helpers`], one value per entry.
     ///
@@ -463,11 +452,11 @@ impl EntryTransform {
     /// vector with no `Add` equivalent, or if an evaluator fails to evaluate.
     fn convert(
         &self,
-        selected: &dyn EngineData,
+        annotated: &dyn EngineData,
         helper_columns: Vec<ArrayData>,
     ) -> KernelResult<Box<dyn EngineData>> {
-        AddSelectionVisitor.visit_rows_of(selected)?;
-        let augmented = selected.append_columns(self.helpers.clone(), helper_columns)?;
+        AddSelectionVisitor.visit_rows_of(annotated)?;
+        let augmented = annotated.append_columns(self.helpers.clone(), helper_columns)?;
         let selected_entries = filter_by_predicate(self.selection_filter.as_ref(), augmented)?;
         self.evaluator.evaluate(selected_entries.as_ref())
     }
@@ -542,15 +531,13 @@ impl LeafReadContext {
         transform: &EntryTransform,
         entries: &dyn EngineData,
     ) -> KernelResult<Box<dyn EngineData>> {
-        let selected = transform.select(self.marker.as_ref(), entries)?;
+        let annotated = transform.annotate(self.marker.as_ref(), entries)?;
         let (first_row_ids, next_first_row_id) = validate_and_assign_first_row_ids(
-            selected.as_ref(),
+            annotated.as_ref(),
             self.next_first_row_id,
             self.entry_count,
         )?;
-        let first_row_ids =
-            ArrayData::try_new(ArrayType::new(DataType::LONG, true), first_row_ids)?;
-        let adds = transform.convert(selected.as_ref(), vec![first_row_ids])?;
+        let adds = transform.convert(annotated.as_ref(), vec![first_row_ids])?;
         // Only update `self` once the whole batch succeeds, so a failed batch leaves
         // `next_first_row_id` and `entry_count` unchanged.
         self.next_first_row_id = next_first_row_id;
@@ -772,8 +759,8 @@ fn selected_predicate() -> Predicate {
     ])
 }
 
-/// The entries with at least one column file. An empty `columnFiles` list carries no column
-/// updates.
+/// The entries whose `columnFiles` list is non-empty. A null or empty list carries no column
+/// updates, so the result is never null.
 fn has_column_files_predicate() -> Predicate {
     let count = Expression::unary(
         UnaryExpressionOp::Cardinality,
@@ -796,10 +783,12 @@ fn validate_and_assign_first_row_ids(
     entries: &dyn EngineData,
     seed: i64,
     first_position: usize,
-) -> KernelResult<(Vec<Scalar>, i64)> {
+) -> KernelResult<(ArrayData, i64)> {
     let mut visitor = LeafEntryVisitor::new(seed, first_position);
     visitor.visit_rows_of(entries)?;
-    Ok((visitor.first_row_ids, visitor.next_first_row_id))
+    let first_row_ids =
+        ArrayData::try_new(ArrayType::new(DataType::LONG, true), visitor.first_row_ids)?;
+    Ok((first_row_ids, visitor.next_first_row_id))
 }
 
 /// Builds the transform mapping a [`ContentTreeNodeEntry`] row to a `{ add: Add }` struct matching
@@ -870,12 +859,14 @@ fn partition_values_map_type() -> KernelResult<MapType> {
     }
 }
 
-/// Validates the entries of a batch with [`SELECTED_COLUMN`] appended.
+/// Validates the entries of an [`EntryTransform::annotate`]d batch.
 ///
 /// Fails closed on the entries the read path cannot yet represent as an `Add`, rather than silently
 /// dropping or mis-translating them:
 /// - an entry with an unknown content-type or tracking-status value;
 /// - a live delete manifest entry, since dropping it would read the rows it deletes back as live;
+/// - a live data manifest entry with column files, which the read path cannot yet apply to the
+///   leaf's entries;
 /// - a selected entry that is not Parquet or has a non-zero partition spec id;
 /// - a selected entry that carries column files, whose updated values a plain `Add` would drop;
 /// - a selected entry whose deletion vector has no
@@ -928,6 +919,15 @@ impl RowVisitor for AddSelectionVisitor {
                     "AMT read path does not yet support live {content_type:?} entry '{location}'"
                 )));
             }
+            if content_type == DataContentType::DataManifest
+                && status.is_live()
+                && getters[6].get(row, HAS_COLUMN_FILES_COLUMN)?
+            {
+                return Err(KernelError::unsupported(format!(
+                    "AMT read path does not yet support column files on a leaf manifest; \
+                     DataManifest entry '{location}' has {COLUMN_FILES} set"
+                )));
+            }
             if getters[7].get(row, SELECTED_COLUMN)? {
                 check_selected_entry(row, location, getters)?;
             }
@@ -937,8 +937,8 @@ impl RowVisitor for AddSelectionVisitor {
 }
 
 /// Collects a [`LeafRef`] for every live `DataManifest` entry of the root-manifest entry batches
-/// it visits, in row order across batches. Batches must be [`EntryTransform::select`]ed. Non-live
-/// `DataManifest` entries and all other entries are skipped.
+/// it visits, in row order across batches. Non-live `DataManifest` entries and all other entries
+/// are skipped.
 struct LeafRefVisitor<'u> {
     /// The table root URL relative leaf locations resolve against.
     table_root: &'u Url,
@@ -1297,13 +1297,9 @@ mod tests {
             Self { transform, marker }
         }
 
-        fn select(&self, entries: &dyn EngineData) -> KernelResult<Box<dyn EngineData>> {
-            self.transform.select(self.marker.as_ref(), entries)
-        }
-
         fn convert(&self, entries: &dyn EngineData) -> KernelResult<Box<dyn EngineData>> {
-            self.transform
-                .convert(self.select(entries)?.as_ref(), vec![])
+            let annotated = self.transform.annotate(self.marker.as_ref(), entries)?;
+            self.transform.convert(annotated.as_ref(), vec![])
         }
     }
 
@@ -1345,6 +1341,14 @@ mod tests {
 
     /// The expected `{ add: Add }` row for one surviving entry, mirroring
     /// [`build_entry_to_add_expression`].
+    /// A leaf `Added` entry with a null `firstRowId` that is rejected for its column files after
+    /// its row IDs are assigned.
+    fn leaf_entry_with_column_files() -> ContentTreeNodeEntry {
+        let mut entry = leaf_entry("a.parquet", 1, 10, None, None, None);
+        entry.column_files = Some(vec![test_column_file()]);
+        entry
+    }
+
     fn expected_add_row(
         path: &str,
         size: i64,
@@ -1394,20 +1398,10 @@ mod tests {
     /// Collects the leaf references of `batches`, visiting each as its own root entry batch.
     fn collect_leaf_refs(batches: &[&[ContentTreeNodeEntry]]) -> KernelResult<Vec<LeafRef>> {
         let engine = SyncEngine::new();
-        let batches: Vec<_> = batches.iter().map(|e| entry_batch(&engine, e)).collect();
-        collect_leaf_refs_of(&engine, &batches)
-    }
-
-    /// Collects the leaf references of root entry `batches`, as the read path does.
-    fn collect_leaf_refs_of(
-        engine: &dyn Engine,
-        batches: &[Box<dyn EngineData>],
-    ) -> KernelResult<Vec<LeafRef>> {
-        let converter = RootConverter::new(engine, &read_ctx());
         let table_root = Url::parse("memory:///table/").unwrap();
         let mut visitor = LeafRefVisitor::new(&table_root);
-        for batch in batches {
-            visitor.visit_rows_of(converter.select(batch.as_ref())?.as_ref())?;
+        for entries in batches {
+            visitor.visit_rows_of(entry_batch(&engine, entries).as_ref())?;
         }
         Ok(visitor.leaves)
     }
@@ -1511,9 +1505,11 @@ mod tests {
         #[case] message: &str,
     ) {
         let engine = SyncEngine::new();
+        let table_root = Url::parse("memory:///table/").unwrap();
         let entry = data_manifest_entry("leaf.parquet", 1, TrackingStatus::Existing);
         let batch = struct_batch(&engine, &[with_field(&entry.into(), path, value)]);
-        assert_result_error_with_message(collect_leaf_refs_of(&engine, &[batch]), message);
+        let mut visitor = LeafRefVisitor::new(&table_root);
+        assert_result_error_with_message(visitor.visit_rows_of(batch.as_ref()), message);
     }
 
     // === Manifest read schemas ===
@@ -1946,15 +1942,19 @@ mod tests {
     #[rstest]
     #[case::pre_v4_leaf(
         |leaf: &mut ContentTreeNodeEntry| leaf.manifest_info.as_mut().unwrap().format_version = 0,
-        "has manifestInfo.formatVersion 0"
+        "has manifestInfo.formatVersion 0",
+        "'memory:///table/metadata/leaf.parquet'"
     )]
+    // Checked on the root entry, so the error names the stored location.
     #[case::column_files(
         |leaf: &mut ContentTreeNodeEntry| leaf.column_files = Some(vec![test_column_file()]),
-        "has columnFiles set"
+        "has columnFiles set",
+        "'metadata/leaf.parquet'"
     )]
     fn read_add_actions_from_amt_rejects_unreadable_leaf(
         #[case] edit_parent: fn(&mut ContentTreeNodeEntry),
         #[case] message: &str,
+        #[case] location: &str,
     ) {
         let engine = memory_engine();
         let mut leaf = write_leaf(&engine, "metadata/leaf.parquet", &[], 5, 100);
@@ -1962,10 +1962,7 @@ mod tests {
         let checkpoint = write_root(&engine, &[leaf]);
         let err = read_tree(&engine, &checkpoint).unwrap_err().to_string();
         assert!(err.contains(message), "{err}");
-        assert!(
-            err.contains("'memory:///table/metadata/leaf.parquet'"),
-            "{err}"
-        );
+        assert!(err.contains(location), "{err}");
     }
 
     /// Sets `positions` as `leaf`'s manifest deletion vector.
@@ -2835,16 +2832,24 @@ mod tests {
         assert_result_error_with_message(result, &format!("content type {content_type:?}"));
     }
 
-    #[test]
-    fn leaf_empty_batch_yields_empty_and_preserves_next_row_id() {
+    #[rstest]
+    #[case::empty(vec![], None)]
+    #[case::rejected(vec![leaf_entry_with_column_files()], Some("has non-null 'columnFiles'"))]
+    fn leaf_batch_without_adds_preserves_next_row_id_and_entry_count(
+        #[case] entries: Vec<ContentTreeNodeEntry>,
+        #[case] error: Option<&str>,
+    ) {
         let engine = SyncEngine::new();
         let mut ctx = leaf_ctx(&engine, None);
-        let empty = ctx
-            .convert_leaf_entries_to_add_actions(leaf_batch(&engine, &[], 0).as_ref())
-            .unwrap();
-        assert_eq!(empty.len(), 0);
+        let result =
+            ctx.convert_leaf_entries_to_add_actions(leaf_batch(&engine, &entries, 0).as_ref());
+        match error {
+            Some(message) => assert_result_error_with_message(result, message),
+            None => assert_eq!(result.unwrap().len(), 0),
+        }
 
-        // The empty batch consumes no row IDs, so the next entry still starts at 100.
+        // The first batch consumed no row IDs or positions, so the next entry is still at row
+        // index 0 and starts at row ID 100.
         let out = ctx
             .convert_leaf_entries_to_add_actions(
                 leaf_batch(
