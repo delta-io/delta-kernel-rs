@@ -333,7 +333,7 @@ struct CrcReplayAccumulator {
     current_commit_saw_file_action: bool,
 
     // Aggregate adds and removes separately until commitInfo is known. It may follow file
-    // actions, including in a later batch. Memory use depends on histogram bins, not file count.
+    // actions, including in a later batch.
     // None marks invalid file statistics for the current commit.
     current_commit_adds: Option<FileStatsDelta>,
     current_commit_removes: Option<FileStatsDelta>,
