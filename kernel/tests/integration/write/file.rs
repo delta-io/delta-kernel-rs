@@ -919,7 +919,7 @@ fn new_referenced_file_path(
 /// A connector writes the bytes of a new reference at the location from
 /// [`BoundWriteContext::new_referenced_file_path`] and stores its `uri`; a reader finds the bytes
 /// by resolving each `uri` with [`resolve_file_uri`]: a relative `uri` against the table root, an
-/// absolute one as-is.
+/// absolute one by parsing it.
 ///
 /// [`BoundWriteContext::new_referenced_file_path`]:
 ///     delta_kernel::transaction::BoundWriteContext::new_referenced_file_path

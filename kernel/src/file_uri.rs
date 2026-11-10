@@ -133,7 +133,8 @@ pub(crate) fn new_referenced_file_path(
 ///
 /// Per the `file` type protocol, a valid value is either a table-root-relative path under `_files`
 /// (`_files` itself, or `_files/<prefix>`) or an absolute URI outside the table root. A writer must
-/// not write files at any other value, so this returns an error for one.
+/// not write files at any other value, so this returns an error for one. Whether an absolute URI is
+/// outside the table root is decided lexically; see [`is_within`].
 fn write_location_uri_prefix(
     table_root: &Url,
     write_location: Option<&str>,
@@ -190,17 +191,24 @@ pub(crate) fn validate_file_uri(uri: &str) -> Result<(), &'static str> {
     Ok(())
 }
 
-/// Returns whether `url` is `table_root` or under it. The scheme and authority are compared
-/// case-insensitively, and the paths segment by segment after percent-decoding, so an encoded
-/// spelling of the table root (`%74able` for `table`) also counts, but a sibling that only shares
-/// a name prefix (`table2`) does not.
+/// Returns whether `url` is `table_root` or under it.
+///
+/// The paths are percent-decoded before they are split on `/` and `\`, as object stores and
+/// `Url::to_file_path` decode them, and are then compared segment by segment. So an encoded
+/// spelling of the table root (`%74able` for `table`, or `table%2F_files` for `table/_files`)
+/// counts as inside it, but a sibling that only shares a name prefix (`table2`) does not.
+///
+/// The scheme and authority (`scheme://[userinfo@]host[:port]`) are compared as text, ignoring
+/// case. The check is lexical: it doesn't unify scheme aliases such as `s3` and `s3a`, a default
+/// port written out, or userinfo, so a location spelled with one of those counts as outside.
 fn is_within(url: &Url, table_root: &Url) -> bool {
     let authority = |url: &Url| url[..Position::BeforePath].to_ascii_lowercase();
     let segments = |url: &Url| -> Vec<String> {
-        url.path()
-            .split('/')
+        percent_decode_str(url.path())
+            .decode_utf8_lossy()
+            .split(['/', '\\'])
             .filter(|segment| !segment.is_empty())
-            .map(|segment| percent_decode_str(segment).decode_utf8_lossy().into_owned())
+            .map(str::to_owned)
             .collect()
     };
     authority(url) == authority(table_root) && segments(url).starts_with(&segments(table_root))
@@ -287,7 +295,8 @@ mod tests {
         "2024:01/a.png",
         "s3://bucket/table/2024:01/a.png"
     )]
-    // An encoded `/` that adds no `.` or `..` segment stays in the name.
+    // An encoded `/` is accepted when it adds no `.` or `..` segment. Object stores decode it, so
+    // this names `_files/a/b.png`, still under the table root.
     #[case::encoded_slash(
         "s3://bucket/table/",
         "_files/a%2Fb.png",
@@ -394,6 +403,8 @@ mod tests {
     #[case::absolute_same_bucket(Some("s3://bucket/elsewhere"), "s3://bucket/elsewhere/")]
     // Only the table root's own path is inside it, not a sibling that shares its name as a prefix.
     #[case::absolute_sibling_with_shared_prefix(Some("s3://bucket/table2"), "s3://bucket/table2/")]
+    // The check is lexical, so a scheme alias of the table root's scheme counts as outside it.
+    #[case::absolute_scheme_alias(Some("s3a://bucket/table/p1"), "s3a://bucket/table/p1/")]
     fn test_write_location_uri_prefix(#[case] value: Option<&str>, #[case] expected: &str) {
         assert_eq!(write_location_uri_prefix(&root(), value).unwrap(), expected);
     }
@@ -414,6 +425,10 @@ mod tests {
     // An encoded spelling of the table root, or a differently-cased scheme, is still the root.
     #[case::absolute_encoded_table_root("s3://bucket/%74able/p1", "outside the table root")]
     #[case::absolute_upper_case_scheme("S3://bucket/table/p1", "outside the table root")]
+    // An encoded `/` that joins the table root with its subdirectory is still inside the root.
+    #[case::absolute_encoded_slash_upper("s3://bucket/table%2F_files/p1", "outside the table root")]
+    #[case::absolute_encoded_slash_lower("s3://bucket/table%2f_files/p1", "outside the table root")]
+    #[case::absolute_encoded_backslash("s3://bucket/table%5C_files/p1", "outside the table root")]
     #[case::absolute_fragment("s3://other/files#x", "query or fragment")]
     #[case::absolute_not_hierarchical("mailto:files@example.com", "hierarchical URI")]
     fn test_write_location_uri_prefix_rejects(#[case] value: &str, #[case] reason: &str) {
@@ -422,6 +437,17 @@ mod tests {
             .to_string();
         assert!(err.contains("delta.fileType.writeLocation"), "{err}");
         assert!(err.contains(reason), "{err}");
+    }
+
+    /// On a local table, an encoded `/` in an absolute write location is decoded by
+    /// `Url::to_file_path`, so `file:///tmp%2Ftable/x` is inside `file:///tmp/table/`.
+    #[test]
+    fn test_write_location_uri_prefix_rejects_encoded_local_table_root() {
+        let root = Url::parse("file:///tmp/table/").unwrap();
+        let err = write_location_uri_prefix(&root, Some("file:///tmp%2Ftable/x"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("outside the table root"), "{err}");
     }
 
     #[rstest]
