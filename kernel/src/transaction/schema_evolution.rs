@@ -17,6 +17,7 @@ use crate::table_features::{
     try_assign_flat_column_mapping_info, validate_column_mapping_id,
 };
 use crate::table_properties::COLUMN_MAPPING_MAX_COLUMN_ID;
+use crate::transaction::protocol_prep::protocol_with_timestamp_ntz;
 use crate::transforms::{SchemaTransform, transform_output_type};
 use crate::utils::FoldWithOption as _;
 use crate::{KernelResult, Result};
@@ -297,8 +298,19 @@ pub(crate) fn evolve_table_config(
             evolved_metadata.with_configuration_entry(COLUMN_MAPPING_MAX_COLUMN_ID, id.to_string())
         });
 
-    // Validates the evolved metadata against the protocol.
-    TableConfiguration::try_new_with_schema(table_config, evolved_metadata, evolved_schema)
+    // Validates the evolved metadata against the protocol, which must already carry any
+    // feature the evolved schema requires.
+    match protocol_with_timestamp_ntz(table_config.protocol(), &evolved_schema)? {
+        Some(protocol) => TableConfiguration::try_new_with_schema_and_protocol(
+            table_config,
+            evolved_metadata,
+            evolved_schema,
+            protocol,
+        ),
+        None => {
+            TableConfiguration::try_new_with_schema(table_config, evolved_metadata, evolved_schema)
+        }
+    }
 }
 
 #[cfg(test)]
