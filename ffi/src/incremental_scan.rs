@@ -17,8 +17,8 @@
 //! `into_summary` call fails; rebuild the stream to retry.
 //!
 //! [`incremental_scan_builder_build`] returns [`OptionalValue::None`] (not an error) when the
-//! range can't be served from the target snapshot's commits, which is the signal to fall back to
-//! a full scan.
+//! target snapshot's commit list can't cover the range, which is the signal to fall back to a
+//! full scan.
 //!
 //! The Arrow batch step (`incremental_scan_stream_next_arrow`, which reuses
 //! [`crate::scan::ScanMetadataArrowResult`]) requires the `default-engine-base` feature; the
@@ -149,16 +149,13 @@ fn incremental_scan_builder_with_predicate_impl(
 }
 
 /// Consume the builder and return the incremental scan stream, or [`OptionalValue::None`] when
-/// `(base_version, target_version]` can't be served from the target snapshot's commits (see
-/// [`IncrementalScanBuilder::build`]).
+/// the target snapshot's commit list can't cover `(base_version, target_version]`.
 ///
 /// [`OptionalValue::None`] is not an error. It means an incremental advance isn't possible
-/// (for example, the target snapshot no longer retains commit `base_version + 1`, the first
-/// version in the range, typically because a checkpoint above `base_version` truncated it), so the
-/// caller should fall back to a full scan. The builder is always freed by this call, whether or
-/// not it succeeds.
-///
-/// [`IncrementalScanBuilder::build`]: delta_kernel::incremental_scan::IncrementalScanBuilder::build
+/// (the target snapshot no longer retains commit `base_version + 1`, the first version in the
+/// range, typically because a checkpoint above `base_version` truncated it), so the caller
+/// should fall back to a full scan. The builder is always freed by this call, whether or not it
+/// succeeds.
 ///
 /// Returns an error if `base_version >= target_version`, the target snapshot's protocol has an
 /// unsupported reader feature, a [`incremental_scan_builder_with_predicate`] predicate references

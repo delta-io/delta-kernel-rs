@@ -411,14 +411,11 @@ pub(crate) mod adaptive_metadata_fixtures {
         )
     }
 
-    /// A `WRITE` `commitInfo` line with In-Commit Timestamp `timestamp` and, when given, a
+    /// A `commitInfo` line with In-Commit Timestamp `timestamp` and, when given, a
     /// `lastManifestCommit` `pointer`, as an AMT writer records on every commit.
     pub(crate) fn commit_info_line(timestamp: i64, pointer: Option<&LastManifestCommit>) -> String {
-        let mut commit_info = serde_json::json!({
-            "timestamp": timestamp,
-            "inCommitTimestamp": timestamp,
-            "operation": "WRITE",
-        });
+        let mut commit_info =
+            serde_json::json!({ "timestamp": timestamp, "inCommitTimestamp": timestamp });
         if let Some(pointer) = pointer {
             commit_info["lastManifestCommit"] = serde_json::to_value(pointer).unwrap();
         }
@@ -461,32 +458,16 @@ pub(crate) mod adaptive_metadata_fixtures {
         size_in_bytes: i64,
         version: Version,
     ) -> KernelResult<CheckpointAction> {
-        let version = version_as_i64(version)?;
-        Ok(checkpoint_action_with_content_root(
-            path,
-            size_in_bytes,
-            version,
-            version,
-        ))
-    }
-
-    /// A minimal `checkpoint` action at `version` referencing a `size_in_bytes` content root at
-    /// `path`, written at `content_root_version`.
-    pub(crate) fn checkpoint_action_with_content_root(
-        path: &str,
-        size_in_bytes: i64,
-        version: i64,
-        content_root_version: i64,
-    ) -> CheckpointAction {
         let (protocol, metadata) = adaptive_metadata_protocol_and_metadata();
-        CheckpointAction::new(
+        let version = version_as_i64(version)?;
+        Ok(CheckpointAction::new(
             version,
-            ContentRoot::new(path.to_string(), size_in_bytes, content_root_version),
+            ContentRoot::new(path.to_string(), size_in_bytes, version),
             protocol,
             metadata,
             vec![],
             vec![],
-        )
+        ))
     }
 
     /// Writes `rows` (each a value of `schema`'s single action field) as the checkpoint sidecar
@@ -679,6 +660,45 @@ pub(crate) mod adaptive_metadata_fixtures {
             .collect::<Vec<_>>()
             .into();
         write_commit(engine, table_root, version, parse_json_batch(lines)).unwrap();
+    }
+
+    /// An adaptiveMetadata table whose commits 1 and 2 add `a.parquet` and `b.parquet` and carry
+    /// the given `lastManifestCommit` pointers. A pointer naming its own commit makes that commit
+    /// a manifest commit, so it also gets a `checkpoint` action at the pointer's content root
+    /// version.
+    pub(crate) fn table_with_pointers(
+        v1_pointer: Option<LastManifestCommit>,
+        v2_pointer: Option<LastManifestCommit>,
+    ) -> (SyncEngine, Url) {
+        let (engine, table_root) = setup_adaptive_metadata_table();
+        for (version, path, pointer) in [(1, "a.parquet", v1_pointer), (2, "b.parquet", v2_pointer)]
+        {
+            let add = serde_json::json!({ "add": {
+                "path": path,
+                "partitionValues": {},
+                "size": 1,
+                "modificationTime": 0,
+                "dataChange": true,
+            } });
+            let mut actions = add.to_string();
+            if let Some(pointer) = pointer.as_ref().filter(|p| p.version == version) {
+                let content_root_version = Version::try_from(pointer.content_root_version).unwrap();
+                let checkpoint = minimal_checkpoint_action(
+                    "_delta_log/_manifests/root.avro",
+                    content_root_version,
+                )
+                .unwrap();
+                actions = format!("{actions}\n{}", checkpoint_line(&checkpoint));
+            }
+            write_ict_commit(
+                &engine,
+                &table_root,
+                version as Version,
+                pointer.as_ref(),
+                &actions,
+            );
+        }
+        (engine, table_root)
     }
 
     /// Creates an in-memory adaptiveMetadata table at version 0 and returns its engine and

@@ -52,6 +52,8 @@ use crate::table_properties::CheckConstraint;
 use crate::table_properties::TableProperties;
 use crate::transaction::{UpdateTableOperation, UpdateTableTransactionBuilder};
 use crate::utils::require;
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use crate::version_as_i64;
 use crate::{
     Engine, KernelError, KernelResult, KernelResultIterator, LogCompactionWriter, Version,
 };
@@ -1243,18 +1245,17 @@ impl Snapshot {
         Ok(self.read_ict_and_last_manifest_commit(engine)?.1)
     }
 
-    /// Whether an adaptiveMetadata manifest commit lies in `(version, self.version()]`. Such a
-    /// commit may record its file actions only in the metadata tree, so replaying commit JSONs
-    /// after `version` would miss them.
+    /// Whether the latest adaptiveMetadata content root was written after `version`.
     #[cfg(feature = "adaptive-metadata-in-dev")]
-    pub(crate) fn has_manifest_commit_after(
+    pub(crate) fn has_content_root_after(
         &self,
         engine: &dyn Engine,
         version: Version,
     ) -> KernelResult<bool> {
+        let version = version_as_i64(version)?;
         Ok(self
             .last_manifest_commit(engine)?
-            .is_some_and(|last| u64::try_from(last.version).is_ok_and(|v| v > version)))
+            .is_some_and(|last| last.content_root_version > version))
     }
 
     #[cfg(feature = "adaptive-metadata-in-dev")]

@@ -15,8 +15,8 @@ use crate::engine::sync::SyncEngine;
 use crate::metrics::MeteredDeltaEngine;
 use crate::snapshot::builder::tests::measuring_reporter;
 use crate::unit_test_utils::adaptive_metadata_fixtures::{
-    checkpoint_line, domain, domain_metadata_line, setup_adaptive_metadata_table, txn_line,
-    write_ict_commit, write_sidecar,
+    checkpoint_line, domain, domain_metadata_line, setup_adaptive_metadata_table,
+    table_with_pointers, txn_line, write_ict_commit, write_sidecar,
 };
 use crate::unit_test_utils::is_io_event;
 use crate::{Snapshot, SnapshotRef, Version};
@@ -273,5 +273,25 @@ fn domain_metadata_comes_from_checkpoint_action_and_later_commits(
     assert_eq!(
         all.iter().map(|dm| dm.domain()).sorted().collect_vec(),
         ["a", "d"]
+    );
+}
+
+#[rstest]
+#[case::no_manifest_commit(None, 0, false)]
+#[case::content_root_after_version(LastManifestCommit::new(2, 2).ok(), 1, true)]
+#[case::content_root_at_version(LastManifestCommit::new(2, 2).ok(), 2, false)]
+#[case::lagging_content_root_after_version(LastManifestCommit::new(2, 1).ok(), 0, true)]
+#[case::lagging_content_root_at_version(LastManifestCommit::new(2, 1).ok(), 1, false)]
+fn has_content_root_after_compares_content_root_version(
+    #[case] v2_pointer: Option<LastManifestCommit>,
+    #[case] version: Version,
+    #[case] expected: bool,
+) {
+    let (engine, table_root) = table_with_pointers(None, v2_pointer);
+    let snapshot = Snapshot::builder_for(table_root).build(&engine).unwrap();
+
+    assert_eq!(
+        snapshot.has_content_root_after(&engine, version).unwrap(),
+        expected
     );
 }
