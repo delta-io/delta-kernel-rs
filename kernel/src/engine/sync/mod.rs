@@ -19,7 +19,7 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use itertools::Itertools;
-use tracing::debug;
+use tracing::trace;
 use url::Url;
 
 #[cfg(test)]
@@ -267,7 +267,7 @@ where
     I: KernelResultIterator<ArrowEngineData> + 'static,
     F: FnMut(Bytes, SchemaRef, Option<PredicateRef>, String) -> KernelResult<I> + Send + 'static,
 {
-    debug!("Reading files: {files:#?} with schema {schema:#?} and predicate {predicate:#?}");
+    trace!("Reading files: {files:#?} with schema {schema:#?} and predicate {predicate:#?}");
     let files = files.to_vec(); // Clone for static iterator (clippy hates chained to_vec+into_iter)
     let store = store.cloned();
     files

@@ -8,7 +8,7 @@ use std::sync::OnceLock;
 use std::time::Instant;
 
 use delta_kernel_derive::internal_api;
-use tracing::{debug, error, info, instrument, warn};
+use tracing::{error, info, instrument, trace, warn};
 use url::Url;
 
 use crate::action_reconciliation::calculate_transaction_expiration_timestamp;
@@ -152,7 +152,7 @@ impl Eq for Snapshot {}
 
 impl Drop for Snapshot {
     fn drop(&mut self) {
-        debug!("Dropping snapshot");
+        trace!("Dropping snapshot");
     }
 }
 

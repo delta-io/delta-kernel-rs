@@ -12,7 +12,7 @@ use delta_kernel_ffi::handle::Handle;
 use delta_kernel_ffi::{KernelStringSlice, OptionalValue, TryFromStringSlice, kernel_string_slice};
 use delta_kernel_ffi_macros::handle_descriptor;
 use delta_kernel_unity_catalog::UCCommitter;
-use tracing::debug;
+use tracing::trace;
 use unity_catalog_delta_client_api::{
     Result as ApiResult, TableIdentifier, UpdateTableClient,
     UpdateTableRequest as ClientUpdateTableRequest,
@@ -158,7 +158,7 @@ pub unsafe extern "C" fn get_uc_commit_client(
 /// Caller is responsible for passing a valid handle.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn free_uc_commit_client(commit_client: Handle<SharedFfiUCCommitClient>) {
-    debug!("released uc commit client");
+    trace!("released uc commit client");
     unsafe { commit_client.drop_handle() }
 }
 
@@ -265,7 +265,7 @@ fn get_uc_committer_impl(
 /// Caller is responsible for passing a valid handle obtained via `get_uc_committer`
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn free_uc_committer(commit_client: Handle<MutableCommitter>) {
-    debug!("released uc committer");
+    trace!("released uc committer");
     unsafe { commit_client.drop_handle() }
 }
 

@@ -11,7 +11,7 @@ use std::sync::{Arc, LazyLock, OnceLock};
 use delta_kernel_derive::internal_api;
 use derive_more::Constructor;
 use itertools::Itertools;
-use tracing::debug;
+use tracing::trace;
 
 use self::apply_schema::apply_schema_to_struct;
 use self::file_type_validation::validate_file_values_for_read;
@@ -521,7 +521,7 @@ fn get_indices(
         kernel_field_info,
     } in matched_parquet_fields
     {
-        debug!(
+        trace!(
             "Getting indices for field {} with offset {parquet_offset}, with index {parquet_index}",
             field.name()
         );
@@ -740,7 +740,7 @@ fn get_indices(
         } else {
             // We're NOT selecting this field, but we still need to track how many leaf columns we
             // skipped over
-            debug!("Skipping over un-selected field: {}", field.name());
+            trace!("Skipping over un-selected field: {}", field.name());
             // offset by number of inner fields. subtract one, because the enumerate still
             // counts this logical "parent" field
             parquet_offset += count_cols(field).saturating_sub(1);
@@ -757,14 +757,14 @@ fn get_indices(
             if !found_fields.contains(field.name()) {
                 match field.get_metadata_column_spec() {
                     Some(MetadataColumnSpec::RowIndex) => {
-                        debug!("Inserting a row index column: {}", field.name());
+                        trace!("Inserting a row index column: {}", field.name());
                         reorder_indices.push(ReorderIndex::row_index(
                             requested_position,
                             Arc::new(field.try_into_arrow()?),
                         ));
                     }
                     Some(MetadataColumnSpec::FilePath) => {
-                        debug!("Inserting a file path column: {}", field.name());
+                        trace!("Inserting a file path column: {}", field.name());
                         reorder_indices.push(ReorderIndex::file_path(
                             requested_position,
                             Arc::new(field.try_into_arrow()?),
@@ -776,7 +776,7 @@ fn get_indices(
                         )));
                     }
                     None if field.nullable => {
-                        debug!("Inserting missing and nullable field: {}", field.name());
+                        trace!("Inserting missing and nullable field: {}", field.name());
                         reorder_indices.push(ReorderIndex::missing(
                             requested_position,
                             Arc::new(field.try_into_arrow()?),
@@ -967,14 +967,14 @@ pub(crate) fn reorder_struct_array(
     mut row_indexes: Option<&mut FlattenedRangeIterator<i64>>,
     file_location: Option<&str>,
 ) -> KernelResult<StructArray> {
-    debug!("Reordering {input_data:?} with ordering: {requested_ordering:?}");
+    trace!("Reordering {input_data:?} with ordering: {requested_ordering:?}");
     if !ordering_needs_transform(requested_ordering) {
         // indices is already sorted, meaning we requested in the order that the columns were
         // stored in the parquet
         Ok(input_data)
     } else {
         // requested an order different from the parquet, reorder
-        debug!("Have requested reorder {requested_ordering:#?} on {input_data:?}");
+        trace!("Have requested reorder {requested_ordering:#?} on {input_data:?}");
         let num_rows = input_data.len();
         let num_cols = requested_ordering.len();
         let (input_fields, input_cols, null_buffer) = input_data.into_parts();
