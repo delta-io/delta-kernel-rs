@@ -665,10 +665,13 @@ mod tests {
     use crate::arrow::array::{ArrayRef, Int32Array, StringArray};
     use crate::arrow::datatypes::Schema as ArrowSchema;
     use crate::arrow::record_batch::RecordBatch;
-    use crate::committer::FileSystemCommitter;
+    use crate::committer::{
+        CommitMetadata, CommitResponse, Committer, FileSystemCommitter, PublishMetadata,
+    };
     use crate::engine::arrow_conversion::TryIntoArrow;
     use crate::engine::arrow_data::ArrowEngineData;
     use crate::engine::sync::SyncEngine;
+    use crate::engine_data::FilteredEngineData;
     #[cfg(feature = "adaptive-metadata-in-dev")]
     use crate::expressions::ColumnName;
     use crate::expressions::column_name;
@@ -684,7 +687,40 @@ mod tests {
     use crate::transaction::create_table::create_table;
     use crate::transaction::{SchemaOperation, UpdateTableOperation};
     use crate::unit_test_utils::{copy_test_table, load_test_table, test_schema_flat};
-    use crate::{Engine, Error, KernelError, Result, SnapshotRef};
+    use crate::{
+        Engine, Error, FileMeta, KernelError, KernelResult, KernelResultIterator, Result,
+        SnapshotRef,
+    };
+
+    /// Writes catalog-managed commits to the published log path so unit tests can create such
+    /// tables without a real catalog.
+    struct PublishingCatalogCommitter;
+
+    impl Committer for PublishingCatalogCommitter {
+        fn commit(
+            &self,
+            engine: &dyn Engine,
+            actions: Box<dyn KernelResultIterator<FilteredEngineData> + '_>,
+            commit_metadata: CommitMetadata,
+        ) -> KernelResult<CommitResponse> {
+            let path = commit_metadata.published_commit_path()?;
+            let written_size =
+                engine
+                    .json_handler()
+                    .write_json_file(&path, Box::new(actions), false)?;
+            Ok(CommitResponse::Committed {
+                file_meta: FileMeta::new(path, commit_metadata.in_commit_timestamp(), written_size),
+            })
+        }
+
+        fn is_catalog_committer(&self) -> bool {
+            true
+        }
+
+        fn publish(&self, _: &dyn Engine, _: PublishMetadata) -> KernelResult<()> {
+            Ok(())
+        }
+    }
 
     #[rstest]
     #[case::write(UpdateTableOperation::Write)]
@@ -1290,78 +1326,102 @@ mod tests {
         Ok(())
     }
 
-    #[rstest]
-    #[case::column_mapping_name("delta.columnMapping.mode", "name")]
-    #[case::column_mapping_id("delta.columnMapping.mode", "id")]
-    #[case::v2_checkpoint_policy("delta.checkpointPolicy", "v2")]
-    #[case::iceberg_compat_v2("delta.enableIcebergCompatV2", "true")]
-    fn with_table_properties_added_applies_protocol_prep_side_effects(
-        #[case] key: &str,
-        #[case] value: &str,
-    ) -> Result<()> {
+    #[test]
+    fn with_table_properties_added_applies_v2_checkpoint_policy_side_effects() -> Result<()> {
         let (engine, snapshot, _tempdir) = load_test_table("table-without-dv-small")?;
         let transaction = snapshot
             .update_table(UpdateTableOperation::AlterTable, "test-engine", false)
-            .with_table_properties_added([(key, value)])
+            .with_table_properties_added([("delta.checkpointPolicy", "v2")])
             .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
 
         assert!(transaction.should_emit_metadata);
         assert!(transaction.should_emit_protocol);
-        let config = &transaction.effective_table_config;
-        match key {
-            "delta.columnMapping.mode" | "delta.enableIcebergCompatV2" => {
-                assert!(config.is_feature_enabled(&TableFeature::ColumnMapping));
-                assert!(
-                    config
-                        .table_properties()
-                        .column_mapping_max_column_id
-                        .is_some()
-                );
-            }
-            _ => assert!(config.is_feature_supported(&TableFeature::V2Checkpoint)),
-        }
-        Ok(())
-    }
-
-    #[rstest]
-    #[case::compat_v2_with_deletion_vectors(
-        &[("delta.enableIcebergCompatV2", "true"), ("delta.enableDeletionVectors", "true")],
-        "cannot be enabled together with"
-    )]
-    #[case::unsupported_column_mapping_mode_for_compat_v2(
-        &[("delta.enableIcebergCompatV2", "true"), ("delta.columnMapping.mode", "none")],
-        "requires 'delta.columnMapping.mode'"
-    )]
-    fn with_table_properties_added_rejects_invalid_feature_combinations(
-        #[case] properties: &[(&str, &str)],
-        #[case] expected: &str,
-    ) -> Result<()> {
-        let (engine, snapshot, _tempdir) = load_test_table("table-without-dv-small")?;
-        let error = snapshot
-            .update_table(UpdateTableOperation::AlterTable, "test-engine", false)
-            .with_table_properties_added(properties.iter().copied())
-            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))
-            .unwrap_err();
         assert!(
-            error.to_string().contains(expected),
-            "error={error}, expected={expected}"
+            transaction
+                .effective_table_config
+                .is_feature_supported(&TableFeature::V2Checkpoint)
         );
         Ok(())
     }
 
-    #[test]
-    fn with_table_properties_added_rejects_row_tracking_toggle() -> Result<()> {
+    #[rstest]
+    #[case::column_mapping_name("delta.columnMapping.mode", "name")]
+    #[case::column_mapping_id("delta.columnMapping.mode", "id")]
+    fn with_table_properties_added_rejects_column_mapping_mode_change(
+        #[case] key: &str,
+        #[case] value: &str,
+    ) -> Result<()> {
         let (engine, snapshot, _tempdir) = load_test_table("table-without-dv-small")?;
         let error = snapshot
             .update_table(UpdateTableOperation::AlterTable, "test-engine", false)
-            .with_table_properties_added([("delta.enableRowTracking", "true")])
+            .with_table_properties_added([(key, value)])
             .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))
             .unwrap_err();
         assert!(
             error
                 .to_string()
-                .contains("Enabling or disabling row tracking"),
+                .contains("Changing column mapping mode on an existing table"),
             "error={error}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn with_table_properties_added_rejects_deletion_vectors_on_iceberg_compat_v2_table()
+    -> Result<()> {
+        let engine = Arc::new(SyncEngine::new_with_store(Arc::new(InMemory::new())));
+        let snapshot = create_table("memory:///", test_schema_flat(), "test-engine", true)
+            .with_table_properties([
+                ("delta.enableIcebergCompatV2", "true"),
+                ("delta.columnMapping.mode", "name"),
+            ])
+            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+            .commit(engine.as_ref())?
+            .unwrap_post_commit_snapshot();
+        let error = snapshot
+            .update_table(UpdateTableOperation::AlterTable, "test-engine", false)
+            .with_table_properties_added([("delta.enableDeletionVectors", "true")])
+            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("cannot be enabled together with"),
+            "error={error}"
+        );
+        Ok(())
+    }
+
+    #[rstest]
+    #[case::row_tracking_property("delta.enableRowTracking", "true", "row tracking")]
+    #[case::row_tracking_signal("delta.feature.rowTracking", "supported", "row tracking")]
+    #[case::iceberg_compat_v1("delta.enableIcebergCompatV1", "true", "IcebergCompatV1")]
+    #[case::iceberg_compat_v2("delta.enableIcebergCompatV2", "true", "IcebergCompatV2")]
+    #[case::iceberg_compat_v3("delta.enableIcebergCompatV3", "true", "IcebergCompatV3")]
+    #[case::iceberg_compat_v2_signal(
+        "delta.feature.icebergCompatV2",
+        "supported",
+        "IcebergCompatV2"
+    )]
+    #[case::iceberg_compat_v3_signal(
+        "delta.feature.icebergCompatV3",
+        "supported",
+        "IcebergCompatV3"
+    )]
+    fn with_table_properties_added_rejects_existing_table_toggle(
+        #[case] key: &str,
+        #[case] value: &str,
+        #[case] expected: &str,
+    ) -> Result<()> {
+        let (engine, snapshot, _tempdir) = load_test_table("table-without-dv-small")?;
+        let error = snapshot
+            .update_table(UpdateTableOperation::AlterTable, "test-engine", false)
+            .with_table_properties_added([(key, value)])
+            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))
+            .unwrap_err();
+        assert!(
+            error.to_string().contains(expected),
+            "error={error}, expected={expected}"
         );
         Ok(())
     }
@@ -1599,18 +1659,28 @@ mod tests {
     }
 
     #[test]
-    fn with_table_properties_added_rejects_enabling_iceberg_compat_v3_on_existing_table()
-    -> Result<()> {
-        let (engine, snapshot, _tempdir) = load_test_table("table-without-dv-small")?;
+    fn with_table_properties_added_rejects_ict_disable_on_catalog_managed_table() -> Result<()> {
+        let engine = Arc::new(SyncEngine::new_with_store(Arc::new(InMemory::new())));
+        let snapshot = create_table("memory:///", test_schema_flat(), "test-engine", true)
+            .with_table_properties([("delta.feature.catalogManaged", "supported")])
+            .build(engine.as_ref(), Box::new(PublishingCatalogCommitter))?
+            .commit(engine.as_ref())?
+            .unwrap_post_commit_snapshot();
+        assert!(
+            snapshot
+                .table_configuration()
+                .is_feature_supported(&TableFeature::CatalogManaged)
+        );
+
         let error = snapshot
             .update_table(UpdateTableOperation::AlterTable, "test-engine", false)
-            .with_table_properties_added([("delta.enableIcebergCompatV3", "true")])
-            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))
+            .with_table_properties_added([("delta.enableInCommitTimestamps", "false")])
+            .build(engine.as_ref(), Box::new(PublishingCatalogCommitter))
             .unwrap_err();
         assert!(
             error
                 .to_string()
-                .contains("IcebergCompatV3 on an existing table"),
+                .contains("Cannot disable inCommitTimestamp on a catalogManaged table"),
             "error={error}"
         );
         Ok(())

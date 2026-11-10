@@ -6,28 +6,25 @@
 //! enablement. Explicit `delta.feature.<name>=supported` signals are parsed by
 //! [`parse_feature_signal`] and enabled through the same path.
 
-use std::sync::Arc;
-
 use uuid::Uuid;
 
 use crate::actions::Protocol;
-use crate::schema::{Schema, SchemaRef};
+use crate::schema::Schema;
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::{
     ColumnMappingMode, FeatureRequirement, LEGACY_WRITER_FEATURES,
     SET_TABLE_FEATURE_SUPPORTED_PREFIX, SET_TABLE_FEATURE_SUPPORTED_VALUE,
     TABLE_FEATURES_MIN_READER_VERSION, TABLE_FEATURES_MIN_WRITER_VERSION, TableFeature,
-    add_feature_to_lists, assign_column_mapping_metadata, auto_enable_property_driven_features,
-    ensure_domain_metadata_dependency, extract_enabled_reader_features,
-    find_max_column_id_in_schema, schema_contains_timestamp_ntz,
+    add_feature_to_lists, auto_enable_property_driven_features, ensure_domain_metadata_dependency,
+    extract_enabled_reader_features, schema_contains_timestamp_ntz,
 };
 use crate::table_properties::{
-    COLUMN_MAPPING_MAX_COLUMN_ID, COLUMN_MAPPING_MODE, CheckpointPolicy, ENABLE_DELETION_VECTORS,
-    ENABLE_ICEBERG_COMPAT_V1, ENABLE_ICEBERG_COMPAT_V2, ENABLE_ICEBERG_COMPAT_V3,
-    ENABLE_ICEBERG_NATIVE_V4, ENABLE_IN_COMMIT_TIMESTAMPS, ENABLE_ROW_TRACKING,
-    IN_COMMIT_TIMESTAMP_ENABLEMENT_TIMESTAMP, IN_COMMIT_TIMESTAMP_ENABLEMENT_VERSION,
-    MATERIALIZED_ROW_COMMIT_VERSION_COLUMN_NAME, MATERIALIZED_ROW_ID_COLUMN_NAME,
-    ROW_TRACKING_SUSPENDED, TableProperties, UNIVERSAL_FORMAT_ENABLED_FORMATS,
+    COLUMN_MAPPING_MODE, CheckpointPolicy, ENABLE_DELETION_VECTORS, ENABLE_ICEBERG_COMPAT_V1,
+    ENABLE_ICEBERG_COMPAT_V2, ENABLE_ICEBERG_COMPAT_V3, ENABLE_ICEBERG_NATIVE_V4,
+    ENABLE_IN_COMMIT_TIMESTAMPS, ENABLE_ROW_TRACKING, IN_COMMIT_TIMESTAMP_ENABLEMENT_TIMESTAMP,
+    IN_COMMIT_TIMESTAMP_ENABLEMENT_VERSION, MATERIALIZED_ROW_COMMIT_VERSION_COLUMN_NAME,
+    MATERIALIZED_ROW_ID_COLUMN_NAME, ROW_TRACKING_SUSPENDED, TableProperties,
+    UNIVERSAL_FORMAT_ENABLED_FORMATS,
 };
 use crate::{KernelError, KernelResult};
 
@@ -172,12 +169,12 @@ pub(crate) fn prepare_protocol_for_update(
     reject_existing_table_toggles(before, &after, feature_signals)?;
 
     let mut metadata = after.metadata().clone();
-    let mut logical_schema = after.logical_schema();
     let mut metadata_side_effects = false;
 
     metadata_side_effects |= apply_iceberg_compat_property_dependencies(&mut metadata)?;
-    metadata_side_effects |=
-        apply_column_mapping_schema_if_needed(before, &mut metadata, &mut logical_schema)?;
+    // Defense in depth: mode changes are rejected above, and dependency helpers no longer fill a
+    // mode. Keep the check so a future fill cannot silently rewrite mapping metadata.
+    reject_column_mapping_mode_change(before, &metadata)?;
     metadata_side_effects |= apply_ict_disablement_cleanup(before, &mut metadata)?;
     metadata_side_effects |= apply_row_tracking_materialized_names(before, &mut metadata)?;
 
@@ -303,25 +300,55 @@ fn reject_existing_table_toggles(
     let toggled = |before: Option<bool>, after: Option<bool>| {
         before.unwrap_or(false) != after.unwrap_or(false)
     };
+    let signal_newly_enables = |feature: &TableFeature| {
+        feature_signals.contains(feature) && !before.is_feature_supported(feature)
+    };
     // A feature signal must not bypass the property check by enabling the feature directly.
-    let signal_enables_row_tracking = feature_signals.contains(&TableFeature::RowTracking)
-        && !before.is_feature_supported(&TableFeature::RowTracking);
     if toggled(
         before_props.enable_row_tracking,
         after_props.enable_row_tracking,
-    ) || signal_enables_row_tracking
+    ) || signal_newly_enables(&TableFeature::RowTracking)
     {
         return Err(KernelError::unsupported(
             "Enabling or disabling row tracking on an existing table is not supported",
         ));
     }
-    if toggled(
-        before_props.enable_iceberg_compat_v3,
-        after_props.enable_iceberg_compat_v3,
-    ) {
+    let before_mode = before_props
+        .column_mapping_mode
+        .unwrap_or(ColumnMappingMode::None);
+    let after_mode = after_props
+        .column_mapping_mode
+        .unwrap_or(ColumnMappingMode::None);
+    if before_mode != after_mode {
         return Err(KernelError::unsupported(
-            "Enabling or disabling IcebergCompatV3 on an existing table is not supported",
+            "Changing column mapping mode on an existing table is not supported",
         ));
+    }
+    for (before_enabled, after_enabled, name, feature) in [
+        (
+            before_props.enable_iceberg_compat_v1,
+            after_props.enable_iceberg_compat_v1,
+            "IcebergCompatV1",
+            TableFeature::IcebergCompatV1,
+        ),
+        (
+            before_props.enable_iceberg_compat_v2,
+            after_props.enable_iceberg_compat_v2,
+            "IcebergCompatV2",
+            TableFeature::IcebergCompatV2,
+        ),
+        (
+            before_props.enable_iceberg_compat_v3,
+            after_props.enable_iceberg_compat_v3,
+            "IcebergCompatV3",
+            TableFeature::IcebergCompatV3,
+        ),
+    ] {
+        if toggled(before_enabled, after_enabled) || signal_newly_enables(&feature) {
+            return Err(KernelError::unsupported(format!(
+                "Enabling or disabling {name} on an existing table is not supported"
+            )));
+        }
     }
     if toggled(
         before_props.enable_iceberg_writer_compat_v1,
@@ -431,7 +458,7 @@ fn apply_iceberg_compat_property_dependencies(
 ) -> KernelResult<bool> {
     let mut changed = false;
     if is_true(metadata, ENABLE_ICEBERG_COMPAT_V2) {
-        changed |= require_column_mapping_mode_name_or_id(metadata, "IcebergCompatV2")?;
+        require_column_mapping_mode_name_or_id(metadata, "IcebergCompatV2")?;
         reject_true_properties(
             metadata,
             "IcebergCompatV2",
@@ -443,7 +470,7 @@ fn apply_iceberg_compat_property_dependencies(
         )?;
     }
     if is_true(metadata, ENABLE_ICEBERG_COMPAT_V3) {
-        changed |= require_column_mapping_mode_name_or_id(metadata, "IcebergCompatV3")?;
+        require_column_mapping_mode_name_or_id(metadata, "IcebergCompatV3")?;
         require_true_property(metadata, ENABLE_ROW_TRACKING, "IcebergCompatV3")?;
         if is_true(metadata, ROW_TRACKING_SUSPENDED) {
             return Err(KernelError::generic(format!(
@@ -457,7 +484,7 @@ fn apply_iceberg_compat_property_dependencies(
         )?;
     }
     if is_true(metadata, ENABLE_ICEBERG_NATIVE_V4) {
-        changed |= require_property_value(metadata, COLUMN_MAPPING_MODE, "id", "IcebergNativeV4")?;
+        require_column_mapping_mode(metadata, "id", "IcebergNativeV4")?;
         changed |=
             require_property_value(metadata, ENABLE_DELETION_VECTORS, "true", "IcebergNativeV4")?;
         changed |= require_property_value(
@@ -485,32 +512,25 @@ fn apply_iceberg_compat_property_dependencies(
     Ok(changed)
 }
 
-fn apply_column_mapping_schema_if_needed(
+fn reject_column_mapping_mode_change(
     before: &TableConfiguration,
-    metadata: &mut crate::actions::Metadata,
-    logical_schema: &mut SchemaRef,
-) -> KernelResult<bool> {
-    let before_mode = before.table_properties().column_mapping_mode;
+    metadata: &crate::actions::Metadata,
+) -> KernelResult<()> {
+    let before_mode = before
+        .table_properties()
+        .column_mapping_mode
+        .unwrap_or(ColumnMappingMode::None);
     let after_mode = metadata
         .configuration()
         .get(COLUMN_MAPPING_MODE)
         .and_then(|v| v.parse::<ColumnMappingMode>().ok())
         .unwrap_or(ColumnMappingMode::None);
-    let enabling = after_mode != ColumnMappingMode::None
-        && before_mode.unwrap_or(ColumnMappingMode::None) == ColumnMappingMode::None;
-    if !enabling {
-        return Ok(false);
+    if before_mode == after_mode {
+        return Ok(());
     }
-
-    let assign_nested = after_mode == ColumnMappingMode::Id;
-    let mut max_id = find_max_column_id_in_schema(logical_schema).unwrap_or(0);
-    let mapped = assign_column_mapping_metadata(logical_schema, &mut max_id, assign_nested)?;
-    *logical_schema = Arc::new(mapped);
-    *metadata = metadata
-        .clone()
-        .with_schema(logical_schema.clone())?
-        .with_configuration_entry(COLUMN_MAPPING_MAX_COLUMN_ID, max_id.to_string());
-    Ok(true)
+    Err(KernelError::unsupported(
+        "Changing column mapping mode on an existing table is not supported",
+    ))
 }
 
 fn maybe_enable_v2_checkpoint_for_policy(
@@ -605,28 +625,28 @@ fn is_true(metadata: &crate::actions::Metadata, key: &str) -> bool {
 }
 
 fn require_column_mapping_mode_name_or_id(
-    metadata: &mut crate::actions::Metadata,
+    metadata: &crate::actions::Metadata,
     feature_name: &str,
-) -> KernelResult<bool> {
+) -> KernelResult<()> {
     match metadata
         .configuration()
         .get(COLUMN_MAPPING_MODE)
         .map(String::as_str)
     {
-        None => {
-            *metadata = metadata
-                .clone()
-                .with_configuration_entry(COLUMN_MAPPING_MODE, "name");
-            Ok(true)
-        }
-        Some("name") | Some("id") => Ok(false),
+        Some("name") | Some("id") => Ok(()),
         Some(other) => Err(KernelError::generic(format!(
             "{feature_name} requires '{COLUMN_MAPPING_MODE}' to be 'name' or 'id', got '{other}'"
+        ))),
+        None => Err(KernelError::generic(format!(
+            "{feature_name} requires '{COLUMN_MAPPING_MODE}' to be 'name' or 'id'"
         ))),
     }
 }
 
 /// Fills `key` with `required` when absent, and errors when it is set to a different value.
+///
+/// Column-mapping mode is excluded: existing tables cannot change mode, so callers must use
+/// [`require_column_mapping_mode`] / [`require_column_mapping_mode_name_or_id`] instead.
 fn require_property_value(
     metadata: &mut crate::actions::Metadata,
     key: &str,
@@ -641,6 +661,26 @@ fn require_property_value(
         Some(value) if value == required => Ok(false),
         Some(other) => Err(KernelError::generic(format!(
             "{feature_name} requires '{key}' to be '{required}', got '{other}'"
+        ))),
+    }
+}
+
+fn require_column_mapping_mode(
+    metadata: &crate::actions::Metadata,
+    required: &str,
+    feature_name: &str,
+) -> KernelResult<()> {
+    match metadata
+        .configuration()
+        .get(COLUMN_MAPPING_MODE)
+        .map(String::as_str)
+    {
+        Some(value) if value == required => Ok(()),
+        Some(other) => Err(KernelError::generic(format!(
+            "{feature_name} requires '{COLUMN_MAPPING_MODE}' to be '{required}', got '{other}'"
+        ))),
+        None => Err(KernelError::generic(format!(
+            "{feature_name} requires '{COLUMN_MAPPING_MODE}' to be '{required}'"
         ))),
     }
 }
