@@ -306,7 +306,10 @@ impl ManifestKind {
                 .into_iter()
                 .chain(unsupported_entry_checks())
                 .collect(),
-            selected_checks: selected_entry_checks(),
+            selected_checks: selected_entry_checks()
+                .into_iter()
+                .chain(root_tracking_checks())
+                .collect(),
         }
     }
 
@@ -966,6 +969,34 @@ fn unknown_enum_error<T>(
         )),
         Err(e) => e,
     }
+}
+
+/// A root entry that becomes an `Add` must carry its own `firstRowId` and `sequenceNumber`: a root
+/// has no parent to inherit them from, and they become the `Add`'s row-tracking fields.
+fn root_tracking_checks() -> [Check; 2] {
+    let required = |field: &str| Predicate::is_not_null(Expression::column([TRACKING, field]));
+    [
+        Check::new(
+            "RootMissingFirstRowId",
+            required(FIRST_ROW_ID),
+            vec![column_name!(LOCATION)],
+            |values| missing_root_tracking_field(FIRST_ROW_ID, values),
+        ),
+        Check::new(
+            "RootMissingSequenceNumber",
+            required(SEQUENCE_NUMBER),
+            vec![column_name!(LOCATION)],
+            |values| missing_root_tracking_field(SEQUENCE_NUMBER, values),
+        ),
+    ]
+}
+
+/// The error for a root entry, whose location is the first of `values`, without tracking `field`.
+fn missing_root_tracking_field(field: &str, values: &[Option<&str>]) -> KernelError {
+    KernelError::missing_data(format!(
+        "AMT root manifest entry '{}' is missing required tracking field '{field}'",
+        diagnostic(values, 0)
+    ))
 }
 
 /// What every leaf entry must satisfy: it is a `Data` entry, and a live entry that is not `Added`
@@ -2640,8 +2671,8 @@ mod tests {
         );
     }
 
-    /// A dropped entry is not validated: an unsupported file format, partition spec, or deletion
-    /// vector on it must not fail the read.
+    /// A dropped entry is not validated: an unsupported file format, partition spec, deletion
+    /// vector, or null tracking values on it must not fail the read.
     #[rstest]
     fn dropped_entry_with_unsupported_fields_is_not_rejected(
         #[values(
@@ -2662,9 +2693,37 @@ mod tests {
             ..test_dv_info()
         });
         entry.tracking.modified_snapshot_id = Some(1);
+        entry.tracking.first_row_id = None;
+        entry.tracking.sequence_number = None;
         entry.column_files = Some(vec![test_column_file()]);
         let entry = with_field(&entry.into(), &[FILE_FORMAT], Scalar::from("orc"));
         assert_eq!(convert_struct(entry).unwrap().len(), 0);
+    }
+
+    #[rstest]
+    fn live_root_entry_with_null_tracking_field_errors(
+        #[values(FIRST_ROW_ID, SEQUENCE_NUMBER)] field: &str,
+        #[values(
+            TrackingStatus::Existing,
+            TrackingStatus::Added,
+            TrackingStatus::Modified
+        )]
+        status: TrackingStatus,
+    ) {
+        let mut entry = added_data_entry("f.parquet", 10, 5, 0, 1);
+        entry.tracking.status = status;
+        match field {
+            FIRST_ROW_ID => entry.tracking.first_row_id = None,
+            _ => entry.tracking.sequence_number = None,
+        }
+        let err = convert(&[entry]).err().unwrap();
+        let expected = format!(
+            "AMT root manifest entry 'f.parquet' is missing required tracking field '{field}'"
+        );
+        assert!(
+            matches!(&err, KernelError::MissingData(m) if *m == expected),
+            "{err}"
+        );
     }
 
     #[rstest]
