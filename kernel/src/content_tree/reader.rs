@@ -22,7 +22,9 @@ use crate::actions::{ADD_NAME, ADD_SCHEMA, CheckpointAction, LOG_ADD_SCHEMA};
 use crate::amt_path_util::amt_manifest_filemeta;
 use crate::cancellation::CancellationTokenRef;
 use crate::content_tree::conditions::{Check, ConditionChecker, diagnostic, diagnostic_i32};
-use crate::content_tree::dv_conversion::{add_deletion_vector_expression, check_deletion_vector};
+use crate::content_tree::dv_conversion::{
+    add_deletion_vector_expression, check_absolute_location, deletion_vector_checks,
+};
 use crate::content_tree::mumbling::MumblingBitmap;
 use crate::content_tree::{
     AMT_FORMAT_VERSION, COLUMN_FILES, CONTENT_TYPE, ColumnFile, ContentTreeNodeEntry, DV_INFO,
@@ -524,7 +526,7 @@ impl EntryTransform {
         let augmented = annotated.append_columns(self.helpers.clone(), helper_columns)?;
         let selected_entries = filter_by_predicate(self.selection_filter.as_ref(), augmented)?;
         self.selected_checker.check(selected_entries.as_ref())?;
-        DeletionVectorCheckVisitor.visit_rows_of(selected_entries.as_ref())?;
+        AbsoluteDeletionVectorVisitor.visit_rows_of(selected_entries.as_ref())?;
         self.evaluator.evaluate(selected_entries.as_ref())
     }
 }
@@ -894,27 +896,31 @@ fn unsupported_entry_checks() -> Vec<Check> {
 }
 
 /// What every selected (live `Data`) entry must satisfy for its `Add` to carry it faithfully: it
-/// has no partition spec and no unrecognized modification, whose values a plain `Add` would drop.
-/// The [`UnsupportedEntryVisitor`] checks its file format and column files.
+/// has no partition spec, passes the [`deletion_vector_checks`], and has no unrecognized
+/// modification, whose values a plain `Add` would drop. The [`UnsupportedEntryVisitor`] checks its
+/// file format and column files.
 fn selected_entry_checks() -> Vec<Check> {
     let spec_id = || col!(PARTITION_SPEC_ID);
-    vec![
-        Check::new(
-            "NonZeroPartitionSpec",
-            Predicate::or(
-                Predicate::is_null(spec_id()),
-                Predicate::eq(spec_id(), lit(0)),
-            ),
-            vec![column_name!(LOCATION), column_name!(PARTITION_SPEC_ID)],
-            |values| {
-                KernelError::unsupported(format!(
-                    "AMT read path does not yet support partition specs; entry '{}' has \
-                     {PARTITION_SPEC_ID} {}",
-                    diagnostic(values, 0),
-                    diagnostic(values, 1)
-                ))
-            },
+    vec![Check::new(
+        "NonZeroPartitionSpec",
+        Predicate::or(
+            Predicate::is_null(spec_id()),
+            Predicate::eq(spec_id(), lit(0)),
         ),
+        vec![column_name!(LOCATION), column_name!(PARTITION_SPEC_ID)],
+        |values| {
+            KernelError::unsupported(format!(
+                "AMT read path does not yet support partition specs; entry '{}' has \
+                     {PARTITION_SPEC_ID} {}",
+                diagnostic(values, 0),
+                diagnostic(values, 1)
+            ))
+        },
+    )]
+    .into_iter()
+    // In the order a reader would hit them: the file, its deletion vector, its modifications.
+    .chain(deletion_vector_checks())
+    .chain([
         // A modification is the only reason to set `modifiedSnapshotId`, and a deletion vector is
         // the only one this path recognizes, so a DV-less entry carrying one has an unrecognized
         // modification.
@@ -929,7 +935,8 @@ fn selected_entry_checks() -> Vec<Check> {
                 unsupported_modification(diagnostic(values, 0), "non-null", MODIFIED_SNAPSHOT_ID)
             },
         ),
-    ]
+    ])
+    .collect()
 }
 
 /// The error for the entry at `location` whose `field` is `state` (e.g. `non-null`), marking a
@@ -1118,19 +1125,29 @@ fn partition_values_map_type() -> KernelResult<MapType> {
     }
 }
 
-/// Validates the deletion vectors of selected entries: each must have a
-/// [`DeletionVectorDescriptor`](crate::actions::deletion_vector::DeletionVectorDescriptor)
-/// equivalent (see [`check_deletion_vector`]).
-struct DeletionVectorCheckVisitor;
+/// Checks the absolute deletion vector locations of selected entries with
+/// [`check_absolute_location`].
+struct AbsoluteDeletionVectorVisitor;
 
-impl RowVisitor for DeletionVectorCheckVisitor {
+impl RowVisitor for AbsoluteDeletionVectorVisitor {
     fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
-        DV_INFO_COLUMNS.as_ref()
+        static NAMES_AND_TYPES: LazyLock<ColumnNamesAndTypes> = LazyLock::new(|| {
+            (
+                vec![ColumnName::new([DV_INFO, LOCATION])],
+                vec![DataType::STRING],
+            )
+                .into()
+        });
+        NAMES_AND_TYPES.as_ref()
     }
 
     fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> KernelResult<()> {
         for row in 0..row_count {
-            check_deletion_vector(row, getters)?;
+            // `location` is a required field of the struct, so it reads null iff the whole
+            // `deletionVector` struct is null.
+            if let Some(location) = getters[0].get_opt(row, LOCATION)? {
+                check_absolute_location(location)?;
+            }
         }
         Ok(())
     }
