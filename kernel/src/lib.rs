@@ -201,7 +201,7 @@ pub use error::{
 };
 use expressions::Scalar;
 pub use expressions::{Expression, ExpressionRef, Predicate, PredicateRef};
-pub use file_uri::resolve_file_uri;
+pub use file_uri::{ReferencedFilePath, resolve_file_uri};
 pub use log_compaction::{LogCompactionWriter, should_compact};
 #[cfg(feature = "declarative-plans")]
 pub use plans::{IoOperation, Operation, PlanBuilder, PlanExecutor, PlanResult};
