@@ -21,9 +21,7 @@ use url::Url;
 use crate::actions::{ADD_NAME, ADD_SCHEMA, CheckpointAction, LOG_ADD_SCHEMA};
 use crate::amt_path_util::amt_manifest_filemeta;
 use crate::cancellation::CancellationTokenRef;
-use crate::content_tree::dv_conversion::{
-    ADD_DV_HELPER_SCHEMA, AddDeletionVectorColumns, add_deletion_vector_expression,
-};
+use crate::content_tree::dv_conversion::{add_deletion_vector_expression, check_deletion_vector};
 use crate::content_tree::mumbling::MumblingBitmap;
 use crate::content_tree::{
     AMT_FORMAT_VERSION, COLUMN_FILES, CONTENT_TYPE, ColumnFile, ContentTreeNodeEntry,
@@ -372,11 +370,9 @@ struct EntryTransform {
     selector: Arc<dyn ExpressionEvaluator>,
     /// Keeps the rows of a batch whose [`SELECTED_COLUMN`] is true.
     selection_filter: Arc<dyn PredicateEvaluator>,
-    /// The kind's [`ManifestKind::helpers`] followed by the [`ADD_DV_HELPER_SCHEMA`] columns
-    /// `Add.deletionVector` is built from.
+    /// The kind's [`ManifestKind::helpers`].
     helper_schema: SchemaRef,
-    /// Evaluates a selected entry batch with the [`Self::helper_schema`] columns (see
-    /// [`add_deletion_vector_expression`]).
+    /// Evaluates a selected entry batch with the [`Self::helper_schema`] columns.
     evaluator: Arc<dyn ExpressionEvaluator>,
 }
 
@@ -396,7 +392,7 @@ impl EntryTransform {
             select,
             selected_schema.as_ref().clone().into(),
         )?;
-        let helper_schema = schema_with(&kind.helpers, [ADD_DV_HELPER_SCHEMA.as_ref()]);
+        let helper_schema = kind.helpers;
         let augmented_schema = schema_with(&selected_schema, [helper_schema.as_ref()]);
         let selection_filter = handler.new_predicate_evaluator(
             augmented_schema.clone(),
@@ -457,10 +453,8 @@ impl EntryTransform {
     ) -> KernelResult<Box<dyn EngineData>> {
         let marked = marker.evaluate(entries)?;
         let with_selected = self.selector.evaluate(marked.as_ref())?;
-        let mut columns = helper_columns(with_selected.as_ref())?;
-        let mut visitor = AddSelectionVisitor::default();
-        visitor.visit_rows_of(with_selected.as_ref())?;
-        columns.extend(visitor.deletion_vectors.into_columns()?);
+        let columns = helper_columns(with_selected.as_ref())?;
+        AddSelectionVisitor.visit_rows_of(with_selected.as_ref())?;
         let augmented = with_selected.append_columns(self.helper_schema.clone(), columns)?;
         let selected_entries = filter_by_predicate(self.selection_filter.as_ref(), augmented)?;
         self.evaluator.evaluate(selected_entries.as_ref())
@@ -862,8 +856,7 @@ fn partition_values_map_type() -> KernelResult<MapType> {
     }
 }
 
-/// Validates the entries of a batch with [`SELECTED_COLUMN`] appended, and builds the
-/// `Add.deletionVector` helper columns of the selected entries.
+/// Validates the entries of a batch with [`SELECTED_COLUMN`] appended.
 ///
 /// Fails closed on the entries the read path cannot yet represent as an `Add`, rather than silently
 /// dropping or mis-translating them:
@@ -874,12 +867,7 @@ fn partition_values_map_type() -> KernelResult<MapType> {
 /// - a selected entry whose deletion vector has no
 ///   [`DeletionVectorDescriptor`](crate::actions::deletion_vector::DeletionVectorDescriptor)
 ///   equivalent.
-#[derive(Default)]
-struct AddSelectionVisitor {
-    /// The helper columns `Add.deletionVector` is built from, with a row for every entry: only a
-    /// selected entry's deletion vector is kept.
-    deletion_vectors: AddDeletionVectorColumns,
-}
+struct AddSelectionVisitor;
 
 /// Index of the first [`DV_INFO_COLUMNS`] getter in [`AddSelectionVisitor`]'s getters, which end
 /// with them.
@@ -927,9 +915,7 @@ impl RowVisitor for AddSelectionVisitor {
                 )));
             }
             if getters[7].get(row, SELECTED_COLUMN)? {
-                check_selected_entry(row, location, getters, &mut self.deletion_vectors)?;
-            } else {
-                self.deletion_vectors.push_null();
+                check_selected_entry(row, location, getters)?;
             }
         }
         Ok(())
@@ -986,13 +972,11 @@ impl RowVisitor for LeafRefVisitor<'_> {
 }
 
 /// Rejects a selected (live `Data`) entry carrying a field the read path cannot yet translate into
-/// its `Add`, and appends its deletion vector to `deletion_vectors`. `getters` is
-/// [`AddSelectionVisitor`]'s column order.
+/// its `Add`. `getters` is [`AddSelectionVisitor`]'s column order.
 fn check_selected_entry<'a>(
     row: usize,
     location: &str,
     getters: &[&'a dyn GetData<'a>],
-    deletion_vectors: &mut AddDeletionVectorColumns,
 ) -> KernelResult<()> {
     let file_format: &str = getters[3].get(row, FILE_FORMAT)?;
     let parquet = DataFileFormat::Parquet.name();
@@ -1009,7 +993,7 @@ fn check_selected_entry<'a>(
              '{location}' has {PARTITION_SPEC_ID} {spec_id}"
         )));
     }
-    let has_deletion_vector = deletion_vectors.try_push(row, &getters[ADD_SELECTION_DV_START..])?;
+    let has_deletion_vector = check_deletion_vector(row, &getters[ADD_SELECTION_DV_START..])?;
     let unsupported_modification = |field: &str| {
         KernelError::unsupported(format!(
             "AMT read path does not yet support a live entry with column files or an \
