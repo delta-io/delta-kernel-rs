@@ -5,6 +5,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use std::sync::OnceLock;
+use std::time::Instant;
 
 use delta_kernel_derive::internal_api;
 use tracing::{debug, error, info, instrument, warn};
@@ -37,7 +38,8 @@ use crate::log_segment::{
 };
 use crate::metrics::events::{DOMAIN_METADATA_LOADED_SPAN, SET_TRANSACTION_LOADED_SPAN};
 use crate::metrics::{
-    SnapshotLoadMetricContext, emit_protocol_metadata_load, emit_protocol_metadata_load_failure,
+    CheckpointWriteMode, CheckpointWriteOutcome, SnapshotLoadMetricContext,
+    emit_protocol_metadata_load, emit_protocol_metadata_load_failure,
 };
 use crate::path::ParsedLogPath;
 use crate::row_tracking::{ROW_TRACKING_DOMAIN_NAME, parse_row_tracking_high_water_mark};
@@ -1637,17 +1639,27 @@ impl Snapshot {
     ///
     /// Note: There is currently no public api for callers to determine whether a table supports V2
     /// checkpoints directly. Tracked in <https://github.com/delta-io/delta-kernel-rs/issues/2450>.
-    #[instrument(parent = &self.span, name = "snap.checkpoint", skip_all, err)]
+    #[instrument(
+        parent = &self.span,
+        name = "snap.checkpoint",
+        skip_all,
+        fields(report, outcome, mode, duration_ns, bytes_written, num_add_files, num_remove_files,
+            num_actions, num_sidecars),
+        err
+    )]
     pub fn checkpoint(
         self: &SnapshotRef,
         engine: &dyn Engine,
         spec: Option<&CheckpointSpec>,
     ) -> KernelResult<(CheckpointWriteResult, SnapshotRef)> {
+        let start = Instant::now();
+        let span = tracing::Span::current();
         if self.log_segment.checkpoint_version == Some(self.log_segment.end_version) {
             info!(
                 "Checkpoint already exists for snapshot version {}",
                 self.version()
             );
+            span.record("outcome", CheckpointWriteOutcome::AlreadyExists.as_ref());
             return Ok((CheckpointWriteResult::AlreadyExists, Arc::clone(self)));
         }
         info!(
@@ -1688,6 +1700,15 @@ impl Snapshot {
             _ => {}
         }
 
+        let mode = match spec {
+            Some(CheckpointSpec::V2(V2CheckpointConfig::WithSidecar { .. })) => {
+                CheckpointWriteMode::V2WithSidecars
+            }
+            _ if v2_supported => CheckpointWriteMode::V2WithoutSidecars,
+            _ => CheckpointWriteMode::V1,
+        };
+        span.record("mode", mode.as_ref());
+
         let writer = Arc::clone(self).create_checkpoint_writer(engine)?;
 
         let write_result = match spec {
@@ -1711,11 +1732,20 @@ impl Snapshot {
                     FileAlreadyExists for version {}",
                     self.version()
                 );
+                span.record("outcome", CheckpointWriteOutcome::AlreadyExists.as_ref());
                 return Ok((CheckpointWriteResult::AlreadyExists, Arc::clone(self)));
             }
             Err(e) => return Err(e),
         };
 
+        // Freeze duration before hint publication. ReportGeneratorLayer waits for the final API
+        // result, so hint and snapshot errors retain the checkpoint data duration.
+        span.record(
+            "duration_ns",
+            u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX),
+        );
+        // TODO(#3828): Report separate outcome and duration metrics for `_last_checkpoint`
+        // publication.
         writer.finalize(engine, &info.last_checkpoint_stats)?;
 
         let checkpoint_log_path = ParsedLogPath::new(info.file_meta).ok_or_else(|| {
@@ -1726,16 +1756,25 @@ impl Snapshot {
             .try_new_with_checkpoint(checkpoint_log_path)?;
         // Carry only an at-version CRC forward: the checkpoint drops the commits below it, so a
         // stale base could no longer be advanced over them.
-        Ok((
-            CheckpointWriteResult::Written,
-            Arc::new(Snapshot::new_with_crc(
-                new_log_segment,
-                self.table_configuration().clone(),
-                self.crc_at_version().cloned(),
-                self.built_as_latest,
-                false, /* skipped_new_checkpoints */
-            )?),
-        ))
+        let new_snapshot = Arc::new(Snapshot::new_with_crc(
+            new_log_segment,
+            self.table_configuration().clone(),
+            self.crc_at_version().cloned(),
+            self.built_as_latest,
+            false, /* skipped_new_checkpoints */
+        )?);
+        span.record(
+            "bytes_written",
+            info.last_checkpoint_stats.size_in_bytes as u64,
+        );
+        span.record(
+            "num_add_files",
+            info.last_checkpoint_stats.num_of_add_files as u64,
+        );
+        span.record("num_remove_files", info.num_remove_files);
+        span.record("num_actions", info.last_checkpoint_stats.num_actions as u64);
+        span.record("num_sidecars", info.num_sidecars);
+        Ok((CheckpointWriteResult::Written, new_snapshot))
     }
 
     /// Publishes all catalog commits at this table version. Applicable only to catalog-managed
