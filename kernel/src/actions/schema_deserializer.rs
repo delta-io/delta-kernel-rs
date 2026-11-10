@@ -24,7 +24,7 @@ pub(super) fn parse(json: &str, recursion_limit: usize) -> KernelResult<StructTy
         if exceeded.get() {
             KernelError::schema(format!(
                 "Table schema is too deeply nested: decoding metaData.schemaString \
-                 reached the configured JSON recursion limit of {recursion_limit}"
+                 reached the JSON recursion limit of {recursion_limit}"
             ))
             .with_backtrace()
         } else {

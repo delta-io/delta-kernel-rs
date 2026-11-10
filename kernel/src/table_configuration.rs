@@ -302,7 +302,6 @@ fn validate_partition_columns(
 #[internal_api]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TableConfiguration {
-    pub(crate) schema_recursion_limit: usize,
     metadata: Metadata,
     protocol: Protocol,
     /// Logical schema: field names are the user-facing (logical) column names.
@@ -349,33 +348,7 @@ impl TableConfiguration {
         version: Version,
     ) -> KernelResult<Self> {
         let logical_schema = Arc::new(metadata.parse_schema()?);
-        Self::try_new_inner(
-            metadata,
-            protocol,
-            table_root,
-            version,
-            logical_schema,
-            crate::actions::DEFAULT_SCHEMA_RECURSION_LIMIT,
-        )
-    }
-
-    pub(crate) fn try_new_with_recursion_limit(
-        metadata: Metadata,
-        protocol: Protocol,
-        table_root: Url,
-        version: Version,
-        schema_recursion_limit: usize,
-    ) -> KernelResult<Self> {
-        let logical_schema =
-            Arc::new(metadata.parse_schema_with_recursion_limit(schema_recursion_limit)?);
-        Self::try_new_inner(
-            metadata,
-            protocol,
-            table_root,
-            version,
-            logical_schema,
-            schema_recursion_limit,
-        )
+        Self::try_new_inner(metadata, protocol, table_root, version, logical_schema)
     }
 
     /// Like [`try_new`](Self::try_new), but reuses `base`'s protocol, table root, and version
@@ -391,7 +364,6 @@ impl TableConfiguration {
             base.table_root.clone(),
             base.version,
             logical_schema,
-            base.schema_recursion_limit,
         )
     }
 
@@ -401,7 +373,6 @@ impl TableConfiguration {
         table_root: Url,
         version: Version,
         logical_schema: SchemaRef,
-        schema_recursion_limit: usize,
     ) -> KernelResult<Self> {
         let table_properties = metadata.parse_table_properties();
         let column_mapping_mode = column_mapping_mode(&protocol, &table_properties);
@@ -433,7 +404,6 @@ impl TableConfiguration {
         };
 
         let mut table_config = Self {
-            schema_recursion_limit,
             logical_schema,
             has_column_with_default: false,
             logical_schema_without_partition_columns,
@@ -511,12 +481,11 @@ impl TableConfiguration {
         // note that while we could pick apart the protocol/metadata updates and validate them
         // individually, instead we just re-parse so that we can recycle the try_new validation
         // (instead of duplicating it here).
-        Self::try_new_with_recursion_limit(
+        Self::try_new(
             new_metadata.unwrap_or_else(|| table_configuration.metadata.clone()),
             new_protocol.unwrap_or_else(|| table_configuration.protocol.clone()),
             table_configuration.table_root.clone(),
             new_version,
-            table_configuration.schema_recursion_limit,
         )
     }
 

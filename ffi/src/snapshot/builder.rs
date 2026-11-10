@@ -26,7 +26,6 @@ use crate::{
 /// Finally, call [`snapshot_builder_build`] to consume the builder and obtain the snapshot. If you
 /// need to discard the builder without building, call [`free_snapshot_builder`].
 pub struct FfiSnapshotBuilder {
-    schema_recursion_limit: Option<usize>,
     pub(super) engine: Arc<dyn ExternEngine>,
     pub(super) source: FfiSnapshotBuilderSource,
     version: Option<Version>,
@@ -141,26 +140,6 @@ pub unsafe extern "C" fn snapshot_builder_with_version(
 ) -> Handle<ExclusiveSnapshotBuilder> {
     let mut builder = unsafe { builder.into_inner() };
     builder.version = Some(version);
-    builder.into()
-}
-
-/// Sets the schema JSON recursion limit for a builder created by [`get_snapshot_builder`].
-///
-/// See [`delta_kernel::snapshot::SnapshotBuilder::with_schema_recursion_limit`] for depth
-/// semantics. The default is 128 and the supported range is 1 through 1000. Build rejects an
-/// invalid limit or an attempt to override the limit on an incremental builder; incremental
-/// snapshots inherit their source snapshot's limit.
-///
-/// # Safety
-///
-/// Caller must pass a valid builder handle. This consumes it and returns the owning handle.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn snapshot_builder_with_schema_recursion_limit(
-    builder: Handle<ExclusiveSnapshotBuilder>,
-    recursion_limit: usize,
-) -> Handle<ExclusiveSnapshotBuilder> {
-    let mut builder = unsafe { builder.into_inner() };
-    builder.schema_recursion_limit = Some(recursion_limit);
     builder.into()
 }
 
@@ -294,7 +273,6 @@ fn make_snapshot_builder(
     engine: Arc<dyn ExternEngine>,
 ) -> KernelResult<Handle<ExclusiveSnapshotBuilder>> {
     Ok(Box::new(FfiSnapshotBuilder {
-        schema_recursion_limit: None,
         engine,
         source,
         version: None,
@@ -318,7 +296,6 @@ fn snapshot_builder_build_impl(
     builder: FfiSnapshotBuilder,
 ) -> delta_kernel::Result<Handle<SharedSnapshot>> {
     let FfiSnapshotBuilder {
-        schema_recursion_limit,
         engine,
         source,
         version,
@@ -379,34 +356,23 @@ fn snapshot_builder_build_impl(
     };
     let snapshot = match source {
         FfiSnapshotBuilderSource::TableRoot(url) => build(
-            match schema_recursion_limit {
-                Some(limit) => Snapshot::builder_for(url).with_schema_recursion_limit(limit),
-                None => Snapshot::builder_for(url),
-            },
+            Snapshot::builder_for(url),
             engine.as_ref(),
             options,
             |builder, hint| Ok(builder.with_snapshot_hint(hint)),
         ),
-        FfiSnapshotBuilderSource::ExistingSnapshot(snapshot) => {
-            if schema_recursion_limit.is_some() {
-                return Err(delta_kernel::KernelError::generic(
-                    "Incremental snapshots inherit their schema JSON recursion limit",
-                )
-                .into());
-            }
-            build(
-                Snapshot::builder_from(snapshot),
-                engine.as_ref(),
-                options,
-                |_, _| {
-                    // The public API rejects this combination; retain the invariant here for
-                    // internal construction paths.
-                    Err(hint::invalid(
-                        "A snapshot hint cannot be used with Snapshot::builder_from",
-                    ))
-                },
-            )
-        }
+        FfiSnapshotBuilderSource::ExistingSnapshot(snapshot) => build(
+            Snapshot::builder_from(snapshot),
+            engine.as_ref(),
+            options,
+            |_, _| {
+                // The public API rejects this combination; retain the invariant here for
+                // internal construction paths.
+                Err(hint::invalid(
+                    "A snapshot hint cannot be used with Snapshot::builder_from",
+                ))
+            },
+        ),
     }?;
     Ok(snapshot.into())
 }

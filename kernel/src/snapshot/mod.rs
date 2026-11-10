@@ -382,7 +382,6 @@ impl Snapshot {
         metric_context: SnapshotLoadMetricContext,
         incremental_replay: IncrementalReplay,
         built_as_latest: bool,
-        schema_recursion_limit: usize,
     ) -> KernelResult<Self> {
         let PreparedSnapshot {
             table_configuration,
@@ -398,7 +397,6 @@ impl Snapshot {
             &metric_context,
             incremental_replay,
             built_as_latest,
-            schema_recursion_limit,
         )?;
 
         Ok(Self::new_with_validated_crc(
@@ -422,7 +420,6 @@ impl Snapshot {
         metric_context: &SnapshotLoadMetricContext,
         incremental_replay: IncrementalReplay,
         built_as_latest: bool,
-        schema_recursion_limit: usize,
     ) -> KernelResult<PreparedSnapshot> {
         Self::resolve_table_configuration_and_crc(
             location,
@@ -430,7 +427,6 @@ impl Snapshot {
             engine,
             metric_context,
             incremental_replay,
-            schema_recursion_limit,
         )
         .inspect_err(|error| {
             error!(
@@ -451,7 +447,6 @@ impl Snapshot {
         engine: &dyn Engine,
         metric_context: &SnapshotLoadMetricContext,
         incremental_replay: IncrementalReplay,
-        schema_recursion_limit: usize,
     ) -> KernelResult<PreparedSnapshot> {
         let pm_start = std::time::Instant::now();
 
@@ -495,12 +490,11 @@ impl Snapshot {
         };
         emit_protocol_metadata_load(metric_context, source, pm_start.elapsed());
 
-        let table_configuration = TableConfiguration::try_new_with_recursion_limit(
+        let table_configuration = TableConfiguration::try_new(
             metadata,
             protocol,
             location.clone(),
             log_segment.end_version,
-            schema_recursion_limit,
         )?;
 
         let crc = crc_at_version.map(|(crc, _)| crc).or(base_crc);

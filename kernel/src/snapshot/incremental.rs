@@ -220,7 +220,6 @@ impl Snapshot {
                     metric_context,
                     incremental_replay,
                     built_as_latest,
-                    existing_snapshot.table_configuration.schema_recursion_limit,
                 )?;
                 let log_segment = current_segment
                     .take()
