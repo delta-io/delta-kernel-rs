@@ -662,27 +662,52 @@ pub(crate) mod adaptive_metadata_fixtures {
         write_commit(engine, table_root, version, parse_json_batch(lines)).unwrap();
     }
 
-    /// An adaptiveMetadata table whose commits 1 and 2 add `a.parquet` and `b.parquet` and carry
-    /// the given `lastManifestCommit` pointers. A pointer naming its own commit makes that commit
-    /// a manifest commit, so it also gets a `checkpoint` action at the pointer's content root
-    /// version.
-    pub(crate) fn table_with_pointers(
-        v1_pointer: Option<LastManifestCommit>,
-        v2_pointer: Option<LastManifestCommit>,
-    ) -> (SyncEngine, Url) {
+    /// One commit of a [`table_with_commits`] table.
+    pub(crate) struct TestCommit {
+        add: &'static str,
+        content_root_version: Option<Version>,
+    }
+
+    impl TestCommit {
+        /// A commit that adds the file `path`.
+        pub(crate) fn add(path: &'static str) -> Self {
+            Self {
+                add: path,
+                content_root_version: None,
+            }
+        }
+
+        /// Makes this commit a manifest commit whose content root is at `content_root_version`.
+        pub(crate) fn manifest_commit(self, content_root_version: Version) -> Self {
+            Self {
+                content_root_version: Some(content_root_version),
+                ..self
+            }
+        }
+    }
+
+    /// An adaptiveMetadata table with `commits` written as versions 1 onward. Every commit from a
+    /// manifest commit on carries its `lastManifestCommit` pointer, as AMT writers do.
+    pub(crate) fn table_with_commits(commits: &[TestCommit]) -> (SyncEngine, Url) {
         let (engine, table_root) = setup_adaptive_metadata_table();
-        for (version, path, pointer) in [(1, "a.parquet", v1_pointer), (2, "b.parquet", v2_pointer)]
-        {
+        let mut pointer = None;
+        for (commit, version) in commits.iter().zip(1..) {
             let add = serde_json::json!({ "add": {
-                "path": path,
+                "path": commit.add,
                 "partitionValues": {},
                 "size": 1,
                 "modificationTime": 0,
                 "dataChange": true,
             } });
             let mut actions = add.to_string();
-            if let Some(pointer) = pointer.as_ref().filter(|p| p.version == version) {
-                let content_root_version = Version::try_from(pointer.content_root_version).unwrap();
+            if let Some(content_root_version) = commit.content_root_version {
+                pointer = Some(
+                    LastManifestCommit::new(
+                        version_as_i64(version).unwrap(),
+                        version_as_i64(content_root_version).unwrap(),
+                    )
+                    .unwrap(),
+                );
                 let checkpoint = minimal_checkpoint_action(
                     "_delta_log/_manifests/root.avro",
                     content_root_version,
@@ -690,13 +715,7 @@ pub(crate) mod adaptive_metadata_fixtures {
                 .unwrap();
                 actions = format!("{actions}\n{}", checkpoint_line(&checkpoint));
             }
-            write_ict_commit(
-                &engine,
-                &table_root,
-                version as Version,
-                pointer.as_ref(),
-                &actions,
-            );
+            write_ict_commit(&engine, &table_root, version, pointer.as_ref(), &actions);
         }
         (engine, table_root)
     }
