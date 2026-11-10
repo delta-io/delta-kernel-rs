@@ -1286,7 +1286,7 @@ fn test_declarative_metadata_scan_plan_no_executor_returns_unsupported() -> Resu
         .declarative_metadata_scan_plan(&no_plan_engine)
         .unwrap_err();
 
-    assert!(matches!(err, crate::KernelError::Unsupported(_)));
+    assert!(matches!(err, KernelError::Unsupported(_)));
 
     let scan = snapshot
         .scan_builder()
