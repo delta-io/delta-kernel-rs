@@ -87,6 +87,8 @@ impl Check {
 /// Checks batches with one input schema against a list of [`Check`]s.
 pub(crate) struct ConditionChecker {
     checks: Vec<Check>,
+    /// Yields, per row, the AND of every condition.
+    all_pass: Arc<dyn ExpressionEvaluator>,
     /// Yields, per row, the index of the first failing condition, or NULL when every one passes.
     first_failure: Arc<dyn ExpressionEvaluator>,
     /// Per condition, yields its diagnostics as [`MAX_DIAGNOSTICS`] STRING fields, NULL-padded.
@@ -121,6 +123,12 @@ impl ConditionChecker {
             Arc::new(first_failure),
             DataType::INTEGER,
         )?;
+        let all_pass = Predicate::and_from(checks.iter().map(|c| c.condition.predicate.clone()));
+        let all_pass = handler.new_expression_evaluator(
+            input_schema.clone(),
+            Arc::new(Expression::from_pred(all_pass)),
+            DataType::BOOLEAN,
+        )?;
         let diagnostics = checks
             .iter()
             .map(|check| {
@@ -134,6 +142,7 @@ impl ConditionChecker {
             .collect::<KernelResult<_>>()?;
         Ok(Self {
             checks,
+            all_pass,
             first_failure,
             diagnostics,
         })
@@ -143,6 +152,13 @@ impl ConditionChecker {
     /// checked in the order they were given.
     pub(crate) fn check(&self, batch: &dyn EngineData) -> KernelResult<()> {
         if self.checks.is_empty() {
+            return Ok(());
+        }
+        // The nested CASE behind `first_failure` costs several times more than an AND of the same
+        // conditions, so it only runs once a batch is known to fail.
+        let mut all_pass = AllPassVisitor(true);
+        all_pass.visit_rows_of(self.all_pass.evaluate(batch)?.as_ref())?;
+        if all_pass.0 {
             return Ok(());
         }
         let mut first_failure = FirstFailureVisitor(None);
@@ -207,6 +223,9 @@ fn column_type<'a>(schema: &'a StructType, col: &ColumnName) -> Option<&'a DataT
     Some(data_type)
 }
 
+static ALL_PASS_COLUMNS: LazyLock<ColumnNamesAndTypes> =
+    LazyLock::new(|| (vec![column_name!("output")], vec![DataType::BOOLEAN]).into());
+
 static FIRST_FAILURE_COLUMNS: LazyLock<ColumnNamesAndTypes> =
     LazyLock::new(|| (vec![column_name!("output")], vec![DataType::INTEGER]).into());
 
@@ -223,6 +242,26 @@ static DIAGNOSTICS_COLUMNS: LazyLock<ColumnNamesAndTypes> = LazyLock::new(|| {
         .unzip::<_, _, Vec<_>, Vec<_>>()
         .into()
 });
+
+/// Records whether every row passes every condition. A NULL fails, as in a condition.
+struct AllPassVisitor(bool);
+
+impl RowVisitor for AllPassVisitor {
+    fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
+        ALL_PASS_COLUMNS.as_ref()
+    }
+
+    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> KernelResult<()> {
+        for row in 0..row_count {
+            let passes: Option<bool> = getters[0].get_opt(row, "output")?;
+            if passes != Some(true) {
+                self.0 = false;
+                return Ok(());
+            }
+        }
+        Ok(())
+    }
+}
 
 /// Finds the first row with a failed condition, as `(row, condition index)`.
 struct FirstFailureVisitor(Option<(usize, usize)>);
