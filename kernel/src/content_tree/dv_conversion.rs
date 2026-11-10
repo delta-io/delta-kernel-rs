@@ -122,12 +122,11 @@ pub(crate) fn add_deletion_vector_expression() -> Expression {
 }
 
 /// Validates an entry's AMT `deletionVector` struct, read from `getters` in [`DV_INFO_COLUMNS`]
-/// order, so [`add_deletion_vector_expression`] can build its descriptor. Returns whether the
-/// entry has a deletion vector.
+/// order, so [`add_deletion_vector_expression`] can build its descriptor.
 pub(crate) fn check_deletion_vector<'a>(
     row: usize,
     getters: &[&'a dyn GetData<'a>],
-) -> KernelResult<bool> {
+) -> KernelResult<()> {
     let expected = DV_INFO_COLUMNS.as_ref().0.len();
     if getters.len() != expected {
         return Err(KernelError::internal_error(format!(
@@ -138,7 +137,7 @@ pub(crate) fn check_deletion_vector<'a>(
     // `location` is a required field of the struct, so it reads null iff the whole
     // `deletionVector` struct is null.
     let Some(location) = getters[0].get_opt(row, LOCATION)? else {
-        return Ok(false);
+        return Ok(());
     };
     let key_metadata: Option<&[u8]> = getters[4].get_opt(row, KEY_METADATA)?;
     check_deletion_vector_parts(
@@ -147,8 +146,7 @@ pub(crate) fn check_deletion_vector<'a>(
         getters[2].get(row, DV_INFO_SIZE_IN_BYTES)?,
         getters[3].get(row, DV_INFO_CARDINALITY)?,
         key_metadata.is_some(),
-    )?;
-    Ok(true)
+    )
 }
 
 /// [`check_deletion_vector`] over a deletion vector's [`DeletionVectorInfo`] fields.
