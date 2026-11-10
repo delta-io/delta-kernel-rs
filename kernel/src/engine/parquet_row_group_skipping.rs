@@ -284,7 +284,7 @@ fn extract_nullcount(stats: Option<&Statistics>) -> Option<i64> {
     Some(stats?.null_count_opt()? as i64)
 }
 
-/// Unscaled minimum of a decimal column chunk, from whichever physical type stores it.
+/// Unscaled minimum of a decimal column chunk from its INT32, INT64 or FIXED_LEN_BYTE_ARRAY stats.
 ///
 /// Legacy `min`/`max` footer fields are rejected for FIXED_LEN_BYTE_ARRAY: writers filled them
 /// using byte-wise comparison, which is not numeric order for multi-byte two's complement.
@@ -311,11 +311,10 @@ fn decimal_max_bits(stats: &Statistics) -> Option<i128> {
     })
 }
 
-/// Widens an unscaled footer bound from the column's Parquet scale to `target`.
-///
-/// Must agree with `can_upcast_to_decimal` in `engine/ensure_data_types.rs`, which admits only
-/// exact widening: a narrower target scale or a value that does not fit `target` yields `None`,
-/// so that bound cannot justify skipping a row group.
+/// Widens an unscaled footer bound from the column's Parquet scale to `target`, using the same
+/// value-preserving multiply as the reader cast admitted by `can_upcast_to_decimal` in
+/// `engine/ensure_data_types.rs`. Returns `None` for a narrower target scale, an overflow, or a
+/// value exceeding `target`'s precision, so that bound cannot justify skipping a row group.
 fn decimal_stat_as(bits: i128, column: &ColumnDescriptor, target: DecimalType) -> Option<Scalar> {
     let scale_increase = target.scale().checked_sub(parquet_decimal_scale(column)?)?;
     let factor = 10i128.checked_pow(scale_increase.into())?;
@@ -326,7 +325,7 @@ fn decimal_stat_as(bits: i128, column: &ColumnDescriptor, target: DecimalType) -
 /// Scale of the values parquet-rs decodes for this column when it is read as a decimal, derived
 /// from the same annotations the reader uses: DECIMAL annotations carry their own scale, signed
 /// and unannotated INT32/INT64 are integers the reader casts by value (scale 0), and any other
-/// annotation is not readable as a decimal.
+/// column is not readable as a decimal.
 fn parquet_decimal_scale(column: &ColumnDescriptor) -> Option<u8> {
     let scale = match column.logical_type_ref() {
         Some(LogicalType::Decimal(decimal)) => decimal.scale,

@@ -629,35 +629,16 @@ fn timestamp_row_group_skipping_rescales_footer_units(
         &[&values[..2], &values[2..3], &values[3..]],
     );
     let (_, scalar) = timestamp_kind(timezone);
-    let bound = lit(scalar(bound));
-    let count_rows = |builder: ParquetRecordBatchReaderBuilder<Bytes>| -> usize {
-        builder
-            .build()
-            .unwrap()
-            .map(|batch| batch.unwrap().num_rows())
-            .sum()
-    };
-    let builder = || parquet_reader(bytes.clone());
-
-    let predicate = comparison(Expression::column(col_path), bound.clone());
-    assert_eq!(
-        count_rows(builder().with_row_group_filter(&predicate, None)),
-        expected_rows
-    );
-
-    let predicate = comparison(col!("ts"), bound);
-    let partition_columns = HashSet::from(["ts".into()]);
-    assert_eq!(
-        count_rows(builder().with_checkpoint_row_group_filter(
-            &predicate,
-            &partition_columns,
-            None
-        )),
-        expected_rows
+    assert_partition_filters_keep(
+        bytes,
+        &col_path,
+        comparison,
+        lit(scalar(bound)),
+        expected_rows,
     );
 }
 
-/// Three scale-2 row groups: `[-40.00, -30.00]`, `[10.50, 20.00]`, `[30.00, 40.00]`.
+/// Scale-2 row groups: `[-40.00, -30.00]`, `[10.50, 20.00]`, `[30.00, 40.00]`.
 const DECIMAL_ROW_GROUPS: &[&[i128]] = &[&[-4_000, -3_000], &[1_050, 2_000], &[3_000, 4_000]];
 
 #[rstest]
@@ -682,36 +663,16 @@ fn decimal_row_group_skipping_rescales_footer_scale(
     let (precision, physical_type) = storage;
     let col_path = ["add", "partitionValues_parsed", "d"];
     let bytes = write_decimal_parquet(precision, 2, &col_path, DECIMAL_ROW_GROUPS);
-    let bound = lit(Scalar::decimal(bound, 12, 4).unwrap());
-    let count_rows = |builder: ParquetRecordBatchReaderBuilder<Bytes>| -> usize {
-        builder
-            .build()
-            .unwrap()
-            .map(|batch| batch.unwrap().num_rows())
-            .sum()
-    };
-    let builder = || parquet_reader(bytes.clone());
     assert_eq!(
-        builder().metadata().row_group(0).column(0).column_type(),
+        parquet_reader(bytes.clone())
+            .metadata()
+            .row_group(0)
+            .column(0)
+            .column_type(),
         physical_type
     );
-
-    let predicate = comparison(Expression::column(col_path), bound.clone());
-    assert_eq!(
-        count_rows(builder().with_row_group_filter(&predicate, None)),
-        expected_rows
-    );
-
-    let predicate = comparison(col!("d"), bound);
-    let partition_columns = HashSet::from(["d".into()]);
-    assert_eq!(
-        count_rows(builder().with_checkpoint_row_group_filter(
-            &predicate,
-            &partition_columns,
-            None
-        )),
-        expected_rows
-    );
+    let bound = lit(Scalar::decimal(bound, 12, 4).unwrap());
+    assert_partition_filters_keep(bytes, &col_path, comparison, bound, expected_rows);
 }
 
 #[rstest]
@@ -726,12 +687,7 @@ fn decimal_row_group_skipping_keeps_groups_for_narrower_literal_scale(
         Expression::column(col_path),
         lit(Scalar::decimal(150, 10, 1).unwrap()),
     );
-    let rows: usize = parquet_reader(bytes)
-        .with_row_group_filter(&predicate, None)
-        .build()
-        .unwrap()
-        .map(|batch| batch.unwrap().num_rows())
-        .sum();
+    let rows = count_rows(parquet_reader(bytes).with_row_group_filter(&predicate, None));
     assert_eq!(rows, 6);
 }
 
@@ -1097,6 +1053,26 @@ fn timestamp_checkpoint_stats_rescale_before_widening(
 }
 
 #[rstest]
+fn decimal_checkpoint_stats_rescale_before_widening(
+    #[values(9, 18, 20)] precision: u8,
+    #[values(MIN_VALUES, MAX_VALUES)] stat: &str,
+) {
+    let col_path = ["add", "stats_parsed", stat, "d"];
+    let bytes = write_decimal_parquet(precision, 2, &col_path, &[&[6_789]]);
+    let builder = parquet_reader(bytes);
+    let predicate = column_pred!("d");
+    let filter =
+        CheckpointRowGroupFilter::new(builder.metadata().row_group(0), &predicate, &NO_PARTITIONS);
+    let data_type = DataType::decimal(20, 5).unwrap();
+    let actual = if stat == MIN_VALUES {
+        filter.get_min_stat(&column_name!("d"), &data_type)
+    } else {
+        filter.get_max_stat(&column_name!("d"), &data_type)
+    };
+    assert_eq!(actual, Some(Scalar::decimal(6_789_000, 20, 5).unwrap()));
+}
+
+#[rstest]
 fn timestamp_checkpoint_meta_predicate_preserves_truncated_max(
     #[values(
         ArrowTimeUnit::Millisecond,
@@ -1123,17 +1099,48 @@ fn timestamp_checkpoint_meta_predicate_preserves_truncated_max(
         &HashSet::from([column_name!("ts")]),
     )
     .unwrap();
-    let rows: usize = parquet_reader(bytes)
-        .with_row_group_filter(&predicate, None)
-        .build()
-        .unwrap()
-        .map(|batch| batch.unwrap().num_rows())
-        .sum();
+    let rows = count_rows(parquet_reader(bytes).with_row_group_filter(&predicate, None));
     assert_eq!(rows, 1);
 }
 
 fn parquet_reader<T: ChunkReader + 'static>(data: T) -> ParquetRecordBatchReaderBuilder<T> {
     ParquetRecordBatchReaderBuilder::try_new_with_options(data, reader_options()).unwrap()
+}
+
+fn count_rows(builder: ParquetRecordBatchReaderBuilder<Bytes>) -> usize {
+    builder
+        .build()
+        .unwrap()
+        .map(|batch| batch.unwrap().num_rows())
+        .sum()
+}
+
+/// Asserts that the data filter on `col_path` (nested under `add.partitionValues_parsed`) and the
+/// checkpoint filter on its leaf as a partition column both keep `expected_rows` rows.
+fn assert_partition_filters_keep(
+    bytes: Bytes,
+    col_path: &[&str],
+    comparison: fn(Expression, Expression) -> Predicate,
+    bound: Expression,
+    expected_rows: usize,
+) {
+    let predicate = comparison(Expression::column(col_path.iter().copied()), bound.clone());
+    assert_eq!(
+        count_rows(parquet_reader(bytes.clone()).with_row_group_filter(&predicate, None)),
+        expected_rows
+    );
+
+    let leaf = *col_path.last().unwrap();
+    let predicate = comparison(Expression::column([leaf]), bound);
+    let partition_columns = HashSet::from([leaf.into()]);
+    assert_eq!(
+        count_rows(parquet_reader(bytes).with_checkpoint_row_group_filter(
+            &predicate,
+            &partition_columns,
+            None
+        )),
+        expected_rows
+    );
 }
 
 fn write_timestamp_parquet(
@@ -1164,7 +1171,7 @@ fn write_decimal_parquet(
     write_row_groups(col_path, arrays)
 }
 
-/// Writes one row group per array, each nested under `col_path`.
+/// Writes one row group per array, each stored as the leaf column at `col_path`.
 fn write_row_groups(col_path: &[&str], row_groups: impl IntoIterator<Item = ArrayRef>) -> Bytes {
     let mut writer = None;
     for array in row_groups {
@@ -1180,7 +1187,8 @@ fn write_row_groups(col_path: &[&str], row_groups: impl IntoIterator<Item = Arra
     writer.unwrap().into_inner().unwrap().into()
 }
 
-/// Builds a single column chunk whose footer carries the given annotations and statistics.
+/// `decimal` is the legacy `(precision, scale)` pair; FIXED_LEN_BYTE_ARRAY columns are 16 bytes
+/// wide.
 fn annotated_chunk(
     physical_type: PhysicalType,
     logical_type: Option<LogicalType>,

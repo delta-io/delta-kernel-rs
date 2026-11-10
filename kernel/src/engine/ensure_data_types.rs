@@ -319,8 +319,7 @@ fn can_upcast_to_decimal(
 
     let (source_precision, source_scale) = match source_type {
         Decimal128(p, s) => (*p, *s),
-        // Allow converting integers to a decimal that can hold all possible values. The scale-0
-        // rule is mirrored by `parquet_decimal_scale` in `engine/parquet_row_group_skipping.rs`.
+        // Allow converting integers to a decimal that can hold all possible values.
         Int8 => (3u8, 0i8),
         Int16 => (5u8, 0i8),
         Int32 => (10u8, 0i8),
