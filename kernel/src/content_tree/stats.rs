@@ -746,11 +746,14 @@ impl<'a> StatsLeafVisitor<'a> for ParsedStatsExprBuilder {
         let exprs = categories.sub_fields().map(|sub_field| {
             sub_field.map(|sub_field| {
                 let expr = match &entry {
+                    // TODO(#3491): AMT float bounds exclude NaN, but Delta readers take a finite
+                    // max as proof the file has no NaN.
                     Some(entry) => {
                         Expression::column([CONTENT_STATS_FIELD_NAME, entry.name(), sub_field])
                     }
                     None if sub_field == NULL_VALUE_COUNT => null_lit(DataType::LONG),
                     // AMT records variant bounds as unshredded variants (see `leaf_stats_field`).
+                    // TODO(#3491): revisit once kernel supports shredded variant table schemas.
                     None if matches!(field.data_type(), DataType::Variant(_)) => {
                         null_lit(DataType::unshredded_variant())
                     }
@@ -2240,19 +2243,33 @@ mod tests {
         assert_eq!(to_batch(actual), to_batch(expected));
     }
 
-    /// A nested Delta stats schema with `numRecords`, the given category sub-structs, and
-    /// `tightBounds`. Mirrors the canonical Delta stats shape for building parsed
-    /// stats targets.
-    fn delta_stats_with_bounds(
+    /// The per-category sub-structs of a Delta stats schema.
+    struct StatCategorySchemas {
         null_count: StructType,
         min_values: StructType,
         max_values: StructType,
-    ) -> StructType {
+    }
+
+    impl StatCategorySchemas {
+        /// Uses `columns` for every category.
+        fn all(columns: StructType) -> Self {
+            Self {
+                null_count: columns.clone(),
+                min_values: columns.clone(),
+                max_values: columns,
+            }
+        }
+    }
+
+    /// A nested Delta stats schema with `numRecords`, the given category sub-structs, and
+    /// `tightBounds`. Mirrors the canonical Delta stats shape for building parsed
+    /// stats targets.
+    fn delta_stats_with_bounds(categories: StatCategorySchemas) -> StructType {
         StructType::new_unchecked([
             StructField::nullable(NUM_RECORDS, DataType::LONG),
-            StructField::nullable(NULL_COUNT, null_count),
-            StructField::nullable(MIN_VALUES, min_values),
-            StructField::nullable(MAX_VALUES, max_values),
+            StructField::nullable(NULL_COUNT, categories.null_count),
+            StructField::nullable(MIN_VALUES, categories.min_values),
+            StructField::nullable(MAX_VALUES, categories.max_values),
             StructField::nullable(TIGHT_BOUNDS, DataType::BOOLEAN),
         ])
     }
@@ -2263,11 +2280,7 @@ mod tests {
             field_with_id("id", DataType::LONG, true, 0),
             field_with_id("score", DataType::LONG, true, 1),
         ]);
-        let delta = delta_stats_with_bounds(
-            stat_cols(["id", "score"]),
-            stat_cols(["id", "score"]),
-            stat_cols(["id", "score"]),
-        );
+        let delta = delta_stats_with_bounds(StatCategorySchemas::all(stat_cols(["id", "score"])));
         let content_stats_schema = projected_stats_schema(&table, &delta).unwrap();
         // Leaf sub-field order (LONG, all categories): lower bound, upper bound, value count, null
         // value count.
@@ -2328,11 +2341,7 @@ mod tests {
             9,
             [field_with_id("b", DataType::LONG, true, 0)],
         )]);
-        let delta = delta_stats_with_bounds(
-            nested_cat("a", ["b"]),
-            nested_cat("a", ["b"]),
-            nested_cat("a", ["b"]),
-        );
+        let delta = delta_stats_with_bounds(StatCategorySchemas::all(nested_cat("a", ["b"])));
         let content_stats_schema = projected_stats_schema(&table, &delta).unwrap();
         let content_stats = struct_scalar(
             &content_stats_schema,
@@ -2382,11 +2391,12 @@ mod tests {
                 1,
             ),
         ]);
-        let delta = delta_stats_with_bounds(
-            stat_cols(["id", "arr"]), // nullCount includes the array
-            stat_cols(["id"]),        // min/max exclude it
-            stat_cols(["id"]),
-        );
+        let delta = delta_stats_with_bounds(StatCategorySchemas {
+            null_count: stat_cols(["id", "arr"]),
+            // Min/max exclude the array.
+            min_values: stat_cols(["id"]),
+            max_values: stat_cols(["id"]),
+        });
         let content_stats_schema = projected_stats_schema(&table, &delta).unwrap();
         // Only "id" has a content_stats entry; "arr" is dropped.
         let content_stats = struct_scalar(
@@ -2432,8 +2442,11 @@ mod tests {
             StructField::nullable("id", DataType::LONG),
             StructField::nullable("a", stat_cols(["b"])),
         ]);
-        let delta =
-            delta_stats_with_bounds(null_cols.clone(), stat_cols(["id"]), stat_cols(["id"]));
+        let delta = delta_stats_with_bounds(StatCategorySchemas {
+            null_count: null_cols.clone(),
+            min_values: stat_cols(["id"]),
+            max_values: stat_cols(["id"]),
+        });
         let content_stats_schema = projected_stats_schema(&table, &delta).unwrap();
         // "a.b" is only in nullCount, so it keeps just value count and null value count.
         let content_stats = struct_scalar(
@@ -2553,8 +2566,7 @@ mod tests {
         #[case] needle: &str,
     ) {
         let table = StructType::new_unchecked([field_with_id("id", DataType::LONG, true, 0)]);
-        let delta =
-            delta_stats_with_bounds(stat_cols(["id"]), stat_cols(["id"]), stat_cols(["id"]));
+        let delta = delta_stats_with_bounds(StatCategorySchemas::all(stat_cols(["id"])));
         let content_stats_schema = projected_stats_schema(&table, &delta).unwrap();
         let mut fields = vec![StructField::nullable(
             content_stats_col,
@@ -2577,11 +2589,11 @@ mod tests {
             field_with_id("id", DataType::LONG, true, 0),
             field_with_id("score", DataType::LONG, true, 1),
         ]);
-        let delta = delta_stats_with_bounds(
-            stat_cols(["score", "id"]),
-            stat_cols(["id", "score"]),
-            stat_cols(["id", "score"]),
-        );
+        let delta = delta_stats_with_bounds(StatCategorySchemas {
+            null_count: stat_cols(["score", "id"]),
+            min_values: stat_cols(["id", "score"]),
+            max_values: stat_cols(["id", "score"]),
+        });
         let input_schema = parsed_stats_input_schema(&table, &delta);
 
         assert_result_error_with_message(
