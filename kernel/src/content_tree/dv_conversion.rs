@@ -14,6 +14,7 @@ use crate::expressions::{
     ArrayData, Expression, Predicate, Scalar, UnaryExpressionOp, lit, null_lit,
 };
 use crate::schema::{ArrayType, ColumnName, DataType, SchemaRef, column_name, lazy_schema_ref};
+use crate::uri_reference::has_uri_safe_prefix;
 use crate::{EngineData, KernelError, KernelResult};
 
 /// Extracts deletion vector content from a DeletionVectorDescriptor.
@@ -98,7 +99,7 @@ pub(crate) fn add_deletion_vector_expression() -> Expression {
     let path = Expression::case_when(
         [(
             is_absolute(),
-            Expression::unary(UnaryExpressionOp::UriEncodePath, dv_field(LOCATION)),
+            Expression::unary(UnaryExpressionOp::UriEncodeFileLocation, dv_field(LOCATION)),
         )],
         dv_field(LOCATION),
     );
@@ -150,8 +151,7 @@ pub(crate) fn check_deletion_vector<'a>(
     Ok(true)
 }
 
-/// Validates an AMT deletion vector from its parts (see [`DeletionVectorInfo`]); see
-/// [`check_deletion_vector`].
+/// [`check_deletion_vector`] over a deletion vector's [`DeletionVectorInfo`] fields.
 fn check_deletion_vector_parts(
     location: &str,
     offset: i64,
@@ -183,12 +183,20 @@ fn check_deletion_vector_parts(
     if cardinality < 0 {
         return Err(invalid(format!("cardinality {cardinality} is negative")));
     }
-    // An absolute location must parse as a URL, so the `'p'` descriptor built from it resolves.
-    if parse_absolute_amt_location(location)?.is_none() {
-        validate_table_relative(location)?;
-        reject_dot_segments(location)?;
+    match parse_absolute_amt_location(location)? {
+        // Parsing rejects dot segments and checks that the `'p'` path the expression emits
+        // resolves. The expression keeps the `scheme:[//authority]` prefix as written, so it must
+        // already be valid URI syntax: `Url` would otherwise re-encode or strip characters there,
+        // or end the authority early at a `?` or `#`.
+        Some(_) if !has_uri_safe_prefix(location) => Err(invalid(
+            "has a URI scheme or authority with characters a URI does not allow there".to_string(),
+        )),
+        Some(_) => Ok(()),
+        None => {
+            validate_table_relative(location)?;
+            reject_dot_segments(location)
+        }
     }
-    Ok(())
 }
 
 /// Intermediate flat decoded-DV columns: path resolved (base85-decoded for relative DVs, verbatim
@@ -884,6 +892,10 @@ mod tests {
         (DeletionVectorStorageType::PersistedAbsolute, "s3://other/dv%20file.bin"),
         (DeletionVectorStorageType::PersistedAbsolute, "s3://other/dv%20file.bin")
     )]
+    #[case::absolute_upper_case_prefix(
+        (DeletionVectorStorageType::PersistedAbsolute, "S3://Other/dv%20file.bin"),
+        (DeletionVectorStorageType::PersistedAbsolute, "S3://Other/dv%20file.bin")
+    )]
     fn test_add_deletion_vector_inverts_extraction(
         #[case] (storage_type, path): (DeletionVectorStorageType, &str),
         #[case] (expected_storage_type, expected_path): (DeletionVectorStorageType, &str),
@@ -997,6 +1009,21 @@ mod tests {
     #[case::relative_dot_segment(
         DeletionVectorInfo { location: "data/../dv.bin".to_string(), ..test_dv_info() },
         "contains a '.' or '..' segment"
+    )]
+    #[case::absolute_unparseable(
+        DeletionVectorInfo { location: "s3://my bucket/dv.bin".to_string(), ..test_dv_info() },
+        "Failed to parse absolute AMT location"
+    )]
+    #[case::absolute_fragment_in_authority(
+        DeletionVectorInfo { location: "s3://bu#ck/dv.bin".to_string(), ..test_dv_info() },
+        "characters a URI does not allow"
+    )]
+    #[case::absolute_space_in_userinfo(
+        DeletionVectorInfo {
+            location: "abfss://my container@acct.dfs.core.windows.net/dv.bin".to_string(),
+            ..test_dv_info()
+        },
+        "characters a URI does not allow"
     )]
     #[case::relative_leading_slash(
         DeletionVectorInfo { location: "/dv.bin".to_string(), ..test_dv_info() },

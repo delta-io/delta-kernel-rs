@@ -24,6 +24,17 @@ pub(crate) fn scheme_len(location: &str) -> Option<usize> {
     None
 }
 
+/// Returns whether the `scheme:[//authority]` prefix of `location` uses only characters RFC 3986
+/// allows in a scheme or authority, so the prefix is valid URI syntax as written. A relative
+/// reference has no prefix.
+#[cfg(feature = "adaptive-metadata-in-dev")]
+pub(crate) fn has_uri_safe_prefix(location: &str) -> bool {
+    let (prefix, _) = split_prefix(location);
+    prefix
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b"-._~!$&'()*+,;=:@[]%/".contains(&b))
+}
+
 /// Percent-encodes the path of a raw URI reference with [`uri_encode_path`], keeping the
 /// `scheme:[//authority]` prefix of an absolute reference verbatim. A relative reference is
 /// encoded whole. Returns [`Cow::Borrowed`] when nothing needs encoding.
@@ -94,6 +105,22 @@ mod tests {
     #[case::non_ascii_mid("a\u{e9}:x", None)]
     fn test_scheme_len(#[case] location: &str, #[case] expected: Option<usize>) {
         assert_eq!(scheme_len(location), expected);
+    }
+
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[rstest]
+    #[case::relative("data/a b#c", true)]
+    #[case::host_and_port("s3://bucket.x-y_z:9000/a b", true)]
+    #[case::userinfo_and_ip_literal("abfss://c%20d@[::1]/a", true)]
+    #[case::no_authority("C:/a b", true)]
+    #[case::fragment_in_authority("s3://bu#ck/a", false)]
+    #[case::query_in_authority("s3://bu?ck/a", false)]
+    #[case::space_in_userinfo("abfss://c d@acct/a", false)]
+    #[case::non_ascii_host("s3://b\u{fc}cket/a", false)]
+    #[case::tab_in_host("s3://buc\tket/a", false)]
+    #[case::backslash_in_host("https://h\\x/a", false)]
+    fn test_has_uri_safe_prefix(#[case] location: &str, #[case] expected: bool) {
+        assert_eq!(has_uri_safe_prefix(location), expected);
     }
 
     #[rstest]
