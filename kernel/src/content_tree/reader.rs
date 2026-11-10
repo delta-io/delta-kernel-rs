@@ -296,7 +296,8 @@ struct ManifestKind {
 
 impl ManifestKind {
     /// A root manifest: read as [`ContentTreeNodeEntry::to_schema`], taking `Add.baseRowId`
-    /// straight off the entry, which always carries `tracking.firstRowId`.
+    /// straight off the entry, whose `tracking.firstRowId` the
+    /// [`root_tracking_checks`] require.
     fn root() -> Self {
         Self {
             read_schema: Arc::new(ContentTreeNodeEntry::to_schema()),
@@ -306,6 +307,8 @@ impl ManifestKind {
                 .into_iter()
                 .chain(unsupported_entry_checks())
                 .collect(),
+            // Unsupported fields are reported before missing tracking, matching the original root
+            // check; a leaf reports its missing `firstRowId` first.
             selected_checks: selected_entry_checks()
                 .into_iter()
                 .chain(root_tracking_checks())
@@ -973,9 +976,9 @@ fn unknown_enum_error<T>(
 
 /// A root entry that becomes an `Add` must carry its own `firstRowId` and `sequenceNumber`: a root
 /// has no parent to inherit them from, and they become the `Add`'s row-tracking fields.
-fn root_tracking_checks() -> [Check; 2] {
+fn root_tracking_checks() -> Vec<Check> {
     let required = |field: &str| Predicate::is_not_null(Expression::column([TRACKING, field]));
-    [
+    vec![
         Check::new(
             "RootMissingFirstRowId",
             required(FIRST_ROW_ID),
@@ -2701,8 +2704,13 @@ mod tests {
     }
 
     #[rstest]
+    #[case::null_first_row_id(None, Some(1), FIRST_ROW_ID)]
+    #[case::null_sequence(Some(0), None, SEQUENCE_NUMBER)]
+    #[case::both_null(None, None, FIRST_ROW_ID)]
     fn live_root_entry_with_null_tracking_field_errors(
-        #[values(FIRST_ROW_ID, SEQUENCE_NUMBER)] field: &str,
+        #[case] first_row_id: Option<i64>,
+        #[case] sequence_number: Option<i64>,
+        #[case] field: &str,
         #[values(
             TrackingStatus::Existing,
             TrackingStatus::Added,
@@ -2712,16 +2720,38 @@ mod tests {
     ) {
         let mut entry = added_data_entry("f.parquet", 10, 5, 0, 1);
         entry.tracking.status = status;
-        match field {
-            FIRST_ROW_ID => entry.tracking.first_row_id = None,
-            _ => entry.tracking.sequence_number = None,
-        }
-        let err = convert(&[entry]).err().unwrap();
-        let expected = format!(
-            "AMT root manifest entry 'f.parquet' is missing required tracking field '{field}'"
+        entry.tracking.first_row_id = first_row_id;
+        entry.tracking.sequence_number = sequence_number;
+        assert_missing_data(
+            convert(&[entry]),
+            &format!(
+                "AMT root manifest entry 'f.parquet' is missing required tracking field '{field}'"
+            ),
         );
+    }
+
+    // A live root DataManifest's tracking is required when its leaf is read, not by the root
+    // `Add` checks.
+    #[rstest]
+    fn live_root_data_manifest_with_null_tracking_is_not_an_add(
+        #[values(
+            TrackingStatus::Existing,
+            TrackingStatus::Added,
+            TrackingStatus::Modified
+        )]
+        status: TrackingStatus,
+    ) {
+        let mut entry = data_manifest_entry("leaf.parquet", 1, status);
+        entry.tracking.first_row_id = None;
+        entry.tracking.sequence_number = None;
+        assert_eq!(add_count(&[entry]), 0);
+    }
+
+    /// Asserts `result` is a `MissingData` error whose message contains `message`.
+    fn assert_missing_data(result: KernelResult<Box<dyn EngineData>>, message: &str) {
+        let err = result.err().unwrap();
         assert!(
-            matches!(&err, KernelError::MissingData(m) if *m == expected),
+            matches!(&err, KernelError::MissingData(m) if m.contains(message)),
             "{err}"
         );
     }
@@ -3153,14 +3183,9 @@ mod tests {
             status,
         );
         let mut ctx = leaf_ctx(&engine, None);
-        let err = ctx
-            .convert_leaf_entries_to_add_actions(leaf_batch(&engine, &[entry], 0).as_ref())
-            .err()
-            .unwrap();
-        let expected = format!("has a null '{expected_field}' (entry 'e.parquet')");
-        assert!(
-            matches!(&err, KernelError::MissingData(m) if m.contains(&expected)),
-            "{err}"
+        assert_missing_data(
+            ctx.convert_leaf_entries_to_add_actions(leaf_batch(&engine, &[entry], 0).as_ref()),
+            &format!("has a null '{expected_field}' (entry 'e.parquet')"),
         );
     }
 
