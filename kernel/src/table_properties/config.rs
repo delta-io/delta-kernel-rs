@@ -1,7 +1,9 @@
 //! Registry of known `delta.*` table properties: canonical names, editability on
 //! existing-table updates, and value validators for property-set APIs.
 
-use super::deserialize::{parse_bool, parse_column_names, parse_interval, parse_positive_int};
+use super::deserialize::{
+    parse_bool, parse_column_names, parse_interval, parse_non_negative, parse_positive_int,
+};
 use super::{
     APPEND_ONLY, AUTO_COMPACT, CHECKPOINT_INTERVAL, CHECKPOINT_POLICY,
     CHECKPOINT_WRITE_STATS_AS_JSON, CHECKPOINT_WRITE_STATS_AS_STRUCT, COLUMN_MAPPING_MAX_COLUMN_ID,
@@ -9,14 +11,15 @@ use super::{
     DATA_SKIPPING_STATS_COLUMNS, DELETED_FILE_RETENTION_DURATION, DELTA_PROPERTY_PREFIX,
     DataSkippingNumIndexedCols, ENABLE_CHANGE_DATA_FEED, ENABLE_DELETION_VECTORS,
     ENABLE_EXPIRED_LOG_CLEANUP, ENABLE_ICEBERG_COMPAT_V1, ENABLE_ICEBERG_COMPAT_V2,
-    ENABLE_ICEBERG_COMPAT_V3, ENABLE_ICEBERG_NATIVE_V4, ENABLE_IN_COMMIT_TIMESTAMPS,
-    ENABLE_ROW_TRACKING, ENABLE_TYPE_WIDENING, IN_COMMIT_TIMESTAMP_ENABLEMENT_TIMESTAMP,
+    ENABLE_ICEBERG_COMPAT_V3, ENABLE_ICEBERG_NATIVE_V4, ENABLE_ICEBERG_WRITER_COMPAT_V1,
+    ENABLE_ICEBERG_WRITER_COMPAT_V3, ENABLE_IN_COMMIT_TIMESTAMPS, ENABLE_ROW_TRACKING,
+    ENABLE_TYPE_WIDENING, ENABLE_VARIANT_SHREDDING, IN_COMMIT_TIMESTAMP_ENABLEMENT_TIMESTAMP,
     IN_COMMIT_TIMESTAMP_ENABLEMENT_VERSION, ISOLATION_LEVEL, LOG_RETENTION_DURATION,
     MATERIALIZED_ROW_COMMIT_VERSION_COLUMN_NAME, MATERIALIZED_ROW_ID_COLUMN_NAME, OPTIMIZE_WRITE,
     PARQUET_COMPRESSION_CODEC, PARQUET_FORMAT_VERSION, ParquetCompressionCodec,
     RANDOM_PREFIX_LENGTH, RANDOMIZE_FILE_PREFIXES, ROW_TRACKING_SUSPENDED,
     SET_TRANSACTION_RETENTION_DURATION, TARGET_FILE_SIZE, TUNE_FILE_SIZES_FOR_REWRITES,
-    strip_check_constraint_prefix,
+    UNIVERSAL_FORMAT_ENABLED_FORMATS, strip_check_constraint_prefix,
 };
 use crate::table_features::{ColumnMappingMode, SET_TABLE_FEATURE_SUPPORTED_PREFIX};
 use crate::{KernelError, KernelResult};
@@ -93,6 +96,22 @@ fn validate_parquet_format_version(value: &str) -> bool {
     }
 }
 
+fn validate_non_negative_long(value: &str) -> bool {
+    parse_non_negative::<i64>(value).is_some()
+}
+
+/// Empty means no formats. Otherwise a comma-separated list of exact format names.
+fn validate_universal_formats(value: &str) -> bool {
+    value.is_empty()
+        || value
+            .split(',')
+            .map(str::trim)
+            .all(|format| UNIVERSAL_FORMATS.contains(&format))
+}
+
+/// Formats accepted in `delta.universalFormat.enabledFormats`.
+const UNIVERSAL_FORMATS: &[&str] = &["iceberg", "hudi"];
+
 const EDITABLE_CONFIG_PROPERTIES: &[TablePropertyDef] = &[
     editable(CHECKPOINT_WRITE_STATS_AS_JSON, validate_bool),
     editable(CHECKPOINT_WRITE_STATS_AS_STRUCT, validate_bool),
@@ -108,6 +127,15 @@ const EDITABLE_CONFIG_PROPERTIES: &[TablePropertyDef] = &[
     editable(PARQUET_COMPRESSION_CODEC, validate_compression_codec),
     editable(SET_TRANSACTION_RETENTION_DURATION, validate_interval),
     editable(PARQUET_FORMAT_VERSION, validate_parquet_format_version),
+    editable(
+        IN_COMMIT_TIMESTAMP_ENABLEMENT_VERSION,
+        validate_non_negative_long,
+    ),
+    editable(
+        IN_COMMIT_TIMESTAMP_ENABLEMENT_TIMESTAMP,
+        validate_non_negative_long,
+    ),
+    editable(UNIVERSAL_FORMAT_ENABLED_FORMATS, validate_universal_formats),
 ];
 
 /// Feature-enablement properties. Setting these on UPDATE upgrades the protocol via
@@ -125,16 +153,16 @@ const FEATURE_ENABLEMENT_PROPERTIES: &[TablePropertyDef] = &[
     editable(CHECKPOINT_POLICY, validate_checkpoint_policy),
     editable(ENABLE_ROW_TRACKING, validate_bool),
     editable(ENABLE_IN_COMMIT_TIMESTAMPS, validate_bool),
+    editable(ENABLE_ICEBERG_WRITER_COMPAT_V1, validate_bool),
+    editable(ENABLE_ICEBERG_WRITER_COMPAT_V3, validate_bool),
+    editable(ENABLE_VARIANT_SHREDDING, validate_bool),
 ];
 
-/// Kernel-managed keys. Writers must not set these directly; protocol prep stamps ICT
-/// enablement version/timestamp at commit time when ICT is newly enabled.
+/// Kernel-managed keys. Writers must not set these directly.
 const KERNEL_MANAGED_PROPERTIES: &[TablePropertyDef] = &[
     recognized(COLUMN_MAPPING_MAX_COLUMN_ID),
     recognized(MATERIALIZED_ROW_ID_COLUMN_NAME),
     recognized(MATERIALIZED_ROW_COMMIT_VERSION_COLUMN_NAME),
-    recognized(IN_COMMIT_TIMESTAMP_ENABLEMENT_VERSION),
-    recognized(IN_COMMIT_TIMESTAMP_ENABLEMENT_TIMESTAMP),
     recognized(ROW_TRACKING_SUSPENDED),
 ];
 
@@ -270,6 +298,26 @@ mod tests {
         "true",
         "delta.enableDeletionVectors"
     )]
+    #[case::writer_compat_property(
+        "delta.enableIcebergWriterCompatV1",
+        "false",
+        "delta.enableIcebergWriterCompatV1"
+    )]
+    #[case::variant_shredding_property(
+        "delta.enableVariantShredding",
+        "true",
+        "delta.enableVariantShredding"
+    )]
+    #[case::universal_formats(
+        "delta.universalFormat.enabledFormats",
+        "iceberg,hudi",
+        "delta.universalFormat.enabledFormats"
+    )]
+    #[case::in_commit_timestamp_enablement_version(
+        "delta.inCommitTimestampEnablementVersion",
+        "5",
+        "delta.inCommitTimestampEnablementVersion"
+    )]
     fn accepts_editable_and_user_properties(
         #[case] key: &str,
         #[case] value: &str,
@@ -328,6 +376,16 @@ mod tests {
         "many",
         "Invalid value 'many' for table property"
     )]
+    #[case::unknown_universal_format(
+        "delta.universalFormat.enabledFormats",
+        "delta",
+        "Invalid value 'delta' for table property"
+    )]
+    #[case::negative_in_commit_timestamp_enablement_version(
+        "delta.inCommitTimestampEnablementVersion",
+        "-1",
+        "Invalid value '-1' for table property"
+    )]
     fn rejects_unsupported_or_invalid(
         #[case] key: &str,
         #[case] value: &str,
@@ -374,10 +432,13 @@ mod tests {
                 "delta.dataSkippingStatsColumns",
                 "delta.deletedFileRetentionDuration",
                 "delta.enableExpiredLogCleanup",
+                "delta.inCommitTimestampEnablementTimestamp",
+                "delta.inCommitTimestampEnablementVersion",
                 "delta.logRetentionDuration",
                 "delta.parquet.compression.codec",
                 "delta.parquet.format.version",
                 "delta.setTransactionRetentionDuration",
+                "delta.universalFormat.enabledFormats",
             ]
         );
     }

@@ -162,6 +162,14 @@ accepts through feature signals are allowed, and the signal is applied to the pr
 values, unknown features, and rejected features fail the build. Signals cannot be combined with a
 blind append.
 
+`delta.enableVariantShredding=true` also enables `variantShredding-preview`, unless the
+`variantShredding` feature is already in the protocol. Setting
+`delta.enableIcebergWriterCompatV1` or `delta.enableIcebergWriterCompatV3` only succeeds when the
+value does not change, because Kernel cannot enable or disable them on an existing table.
+`delta.universalFormat.enabledFormats` accepts `iceberg` and `hudi`. Listing `iceberg` requires
+`delta.enableIcebergCompatV2` or `delta.enableIcebergCompatV3` to be `true`, and both cannot be
+enabled together.
+
 ```rust,ignore
 let result = snapshot
     .update_table(UpdateTableOperation::AlterTable, "my-app/1.0", /* data_change */ false)
