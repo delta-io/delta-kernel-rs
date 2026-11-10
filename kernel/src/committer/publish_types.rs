@@ -2,7 +2,7 @@
 
 use url::Url;
 
-use crate::path::{LogPathFileType, ParsedLogPath};
+use crate::path::{LogPathFileType, ParsedLogPath, published_commit_file_name};
 use crate::utils::require;
 use crate::{FileMeta, KernelError, KernelResult, Version};
 
@@ -38,7 +38,8 @@ impl CatalogCommit {
         Ok(Self {
             version: catalog_commit.version,
             location: catalog_commit.location.location.clone(),
-            published_location: log_root.join(&format!("{:020}.json", catalog_commit.version))?,
+            published_location: log_root
+                .join(&published_commit_file_name(catalog_commit.version))?,
         })
     }
 

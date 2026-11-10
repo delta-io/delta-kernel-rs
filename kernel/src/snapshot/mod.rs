@@ -1778,12 +1778,19 @@ impl Snapshot {
     }
 
     /// Publishes all catalog commits at this table version. Applicable only to catalog-managed
-    /// tables. This method is a no-op for filesystem-managed tables or if there are no catalog
-    /// commits to publish.
+    /// tables. This method is a no-op for filesystem-managed tables with no catalog commits to
+    /// publish.
     ///
     /// Publishing copies ratified catalog commits to the Delta log as published Delta files,
     /// reducing catalog storage requirements and enabling some table maintenance operations,
     /// like checkpointing.
+    ///
+    /// The returned snapshot uses published paths for commits known to be published, even when
+    /// no new commits need copying. The returned snapshot keeps the staged files' sizes and
+    /// modification times.
+    ///
+    /// The input snapshot keeps its original paths. Use the returned snapshot for reads after
+    /// staged commit files are removed.
     ///
     /// # Parameters
     ///
@@ -1805,41 +1812,49 @@ impl Snapshot {
     ) -> KernelResult<SnapshotRef> {
         let unpublished_catalog_commits = self.log_segment().get_unpublished_catalog_commits()?;
 
-        if unpublished_catalog_commits.is_empty() {
-            return Ok(Arc::clone(self));
-        }
-
-        require!(
-            unpublished_catalog_commits
-                .array_windows()
-                .all(|[a, b]| a.version() + 1 == b.version()),
-            KernelError::generic(format!(
-                "Expected ordered and contiguous unpublished catalog commits. \
+        let max_published_version = if unpublished_catalog_commits.is_empty() {
+            if !self.table_configuration().is_catalog_managed() {
+                return Ok(Arc::clone(self));
+            }
+            self.log_segment().listed.max_published_version
+        } else {
+            require!(
+                unpublished_catalog_commits
+                    .array_windows()
+                    .all(|[a, b]| a.version() + 1 == b.version()),
+                KernelError::generic(format!(
+                    "Expected ordered and contiguous unpublished catalog commits. \
                  Got: {unpublished_catalog_commits:?}"
-            ))
-        );
+                ))
+            );
 
-        require!(
-            self.table_configuration().is_catalog_managed(),
-            KernelError::generic(
-                "There are catalog commits that need publishing, but the table is not catalog-managed.",
-            )
-        );
+            require!(
+                self.table_configuration().is_catalog_managed(),
+                KernelError::generic(
+                    "There are catalog commits that need publishing, but the table is not catalog-managed.",
+                )
+            );
 
-        require!(
-            committer.is_catalog_committer(),
-            KernelError::generic(
-                "There are catalog commits that need publishing, but the committer is not a catalog committer.",
-            )
-        );
+            require!(
+                committer.is_catalog_committer(),
+                KernelError::generic(
+                    "There are catalog commits that need publishing, but the committer is not a catalog committer.",
+                )
+            );
 
-        let publish_metadata =
-            PublishMetadata::try_new(self.version(), unpublished_catalog_commits)?;
+            let publish_metadata =
+                PublishMetadata::try_new(self.version(), unpublished_catalog_commits)?;
 
-        committer.publish(engine, publish_metadata)?;
+            committer.publish(engine, publish_metadata)?;
+            Some(self.version())
+        };
+
+        let Some(log_segment) = self.log_segment().new_as_published(max_published_version)? else {
+            return Ok(Arc::clone(self));
+        };
 
         Ok(Arc::new(Snapshot::new_with_crc(
-            self.log_segment().new_as_published()?,
+            log_segment,
             self.table_configuration().clone(),
             self.base_crc().cloned(),
             self.built_as_latest,
@@ -1868,6 +1883,7 @@ async fn commit(
 
 #[cfg(test)]
 mod tests {
+    use std::cell::{Cell, RefCell};
     use std::path::PathBuf;
     use std::sync::Arc;
 
@@ -1879,11 +1895,11 @@ mod tests {
     use test_utils::{add_commit, delta_path_for_version};
 
     use super::{commit, *};
-    use crate::Result;
     use crate::actions::{DomainMetadata, Protocol};
     use crate::arrow::array::StringArray;
     use crate::arrow::record_batch::RecordBatch;
-    use crate::committer::FileSystemCommitter;
+    use crate::committer::{CommitMetadata, CommitResponse, FileSystemCommitter};
+    use crate::engine::PanicEngine;
     use crate::engine::arrow_data::ArrowEngineData;
     use crate::engine::sync::SyncEngine;
     use crate::last_checkpoint_hint::LastCheckpointHint;
@@ -1893,15 +1909,376 @@ mod tests {
     use crate::object_store::memory::InMemory;
     use crate::object_store::path::Path;
     use crate::parquet::arrow::ArrowWriter;
-    use crate::path::ParsedLogPath;
+    use crate::path::{LogPathFileType, ParsedLogPath};
     use crate::schema::{DataType, StructField, StructType, schema_ref};
     use crate::table_features::{
         TABLE_FEATURES_MIN_READER_VERSION, TABLE_FEATURES_MIN_WRITER_VERSION,
     };
     use crate::table_properties::ENABLE_IN_COMMIT_TIMESTAMPS;
     use crate::transaction::create_table::create_table;
-    use crate::unit_test_utils::{assert_result_error_with_message, string_array_to_engine_data};
+    use crate::unit_test_utils::{
+        MockProtocolBuilder, MockTableConfigurationBuilder, assert_result_error_with_message,
+        create_log_path, string_array_to_engine_data,
+    };
     use crate::utils::FoldWithOption as _;
+    use crate::{FilteredEngineData, Result};
+
+    /// Records versions passed to `publish` and can fail the first call.
+    #[derive(Default)]
+    struct RecordingPublishCommitter {
+        calls: RefCell<Vec<Vec<Version>>>,
+        fail_once: Cell<bool>,
+    }
+
+    impl Committer for RecordingPublishCommitter {
+        fn commit(
+            &self,
+            _: &dyn Engine,
+            _: Box<dyn KernelResultIterator<FilteredEngineData> + '_>,
+            _: CommitMetadata,
+        ) -> KernelResult<CommitResponse> {
+            panic!("publication must not commit a transaction")
+        }
+
+        fn is_catalog_committer(&self) -> bool {
+            true
+        }
+
+        fn publish(&self, _: &dyn Engine, metadata: PublishMetadata) -> KernelResult<()> {
+            self.calls.borrow_mut().push(
+                metadata
+                    .commits_to_publish()
+                    .iter()
+                    .map(|commit| commit.version())
+                    .collect(),
+            );
+            assert_eq!(metadata.publish_version(), 2);
+            if self.fail_once.replace(false) {
+                return Err(KernelError::generic("injected publication failure"));
+            }
+            Ok(())
+        }
+    }
+
+    /// Builds a version 2 snapshot with checkpoint 0 and ratified staged commits 1 and 2.
+    /// No files are created, so any attempt to read the commits must fail.
+    fn snapshot_with_staged_commits(
+        max_published_version: Option<Version>,
+        crc_version: Option<Version>,
+        observed_crc: bool,
+    ) -> SnapshotRef {
+        let table_root = Url::parse("memory:///publication/").unwrap();
+        let commits: Vec<_> = [1, 2]
+            .into_iter()
+            .map(|version| {
+                let mut commit = ParsedLogPath::create_parsed_staged_commit(&table_root, version);
+                commit.location.size = 100 + version;
+                commit.location.last_modified = 1000 + version as i64;
+                commit
+            })
+            .collect();
+        let checkpoint = create_log_path(
+            "memory:///publication/_delta_log/00000000000000000000.checkpoint.parquet",
+        );
+        let segment = LogSegment::try_new(
+            LogSegmentFiles {
+                latest_commit_file: commits.last().cloned(),
+                ascending_commit_files: commits,
+                checkpoint_parts: vec![checkpoint],
+                latest_crc_file: observed_crc
+                    .then(|| ParsedLogPath::create_parsed_crc(&table_root, 0)),
+                max_published_version,
+                ..Default::default()
+            },
+            table_root.join("_delta_log/").unwrap(),
+            Some(2),
+            Some(LastCheckpointHint {
+                version: 0,
+                size: 17,
+                ..Default::default()
+            }),
+        )
+        .unwrap();
+        let configuration = MockTableConfigurationBuilder::new()
+            .with_table_root(&table_root)
+            .with_version(2)
+            .with_properties([(ENABLE_IN_COMMIT_TIMESTAMPS, "true")])
+            .with_protocol(
+                MockProtocolBuilder::new()
+                    .with_features([
+                        TableFeature::CatalogManaged,
+                        TableFeature::InCommitTimestamp,
+                    ])
+                    .build(),
+            )
+            .build();
+        let crc = crc_version.map(|version| {
+            Arc::new(Crc {
+                version,
+                metadata: configuration.metadata().clone(),
+                protocol: configuration.protocol().clone(),
+                ..Default::default()
+            })
+        });
+        Arc::new(Snapshot::new_with_crc(segment, configuration, crc, true, true).unwrap())
+    }
+
+    #[rstest]
+    #[case::both_commits_need_publishing(None, vec![vec![1, 2]])]
+    #[case::commit_2_needs_publishing(Some(1), vec![vec![2]])]
+    #[case::all_commits_already_published(Some(2), vec![])]
+    fn test_publish_replaces_staged_paths_and_preserves_snapshot_metadata(
+        #[case] max_published_version: Option<Version>,
+        #[case] expected_calls: Vec<Vec<Version>>,
+        #[values(None, Some(0), Some(2))] crc_version: Option<Version>,
+        #[values(false, true)] observed_crc: bool,
+    ) {
+        // GIVEN: staged paths for commits 1 and 2, with neither, one, or both already published.
+        let source = snapshot_with_staged_commits(max_published_version, crc_version, observed_crc);
+        let original_segment = source.log_segment().clone();
+        let committer = RecordingPublishCommitter::default();
+
+        // WHEN: publish the remaining commits and return a snapshot with published paths.
+        let published = source.publish(&PanicEngine, &committer).unwrap();
+
+        // THEN: request publication only for unpublished commits; keep version, metadata, and CRC.
+        assert_eq!(*committer.calls.borrow(), expected_calls);
+        assert_eq!(published.version(), source.version());
+        assert_eq!(
+            published.table_configuration(),
+            source.table_configuration()
+        );
+        assert_eq!(published.built_as_latest, source.built_as_latest);
+        assert_eq!(
+            published.skipped_new_checkpoints,
+            source.skipped_new_checkpoints
+        );
+        let actual = published.log_segment();
+        assert_eq!(actual.listed.max_published_version, Some(2));
+        assert_eq!(
+            actual.checkpoint_version,
+            original_segment.checkpoint_version
+        );
+        assert_eq!(
+            actual.listed.checkpoint_parts,
+            original_segment.listed.checkpoint_parts
+        );
+        assert_eq!(
+            actual.last_checkpoint_metadata,
+            original_segment.last_checkpoint_metadata
+        );
+        assert_eq!(
+            actual.listed.latest_crc_file,
+            original_segment.listed.latest_crc_file
+        );
+        assert_eq!(
+            actual
+                .listed
+                .ascending_commit_files
+                .iter()
+                .map(|file| (file.version, file.file_type.clone()))
+                .collect::<Vec<_>>(),
+            vec![(1, LogPathFileType::Commit), (2, LogPathFileType::Commit)]
+        );
+        assert_eq!(
+            actual.listed.latest_commit_file.as_ref(),
+            actual.listed.ascending_commit_files.last()
+        );
+        match (published.base_crc(), source.base_crc()) {
+            (Some(actual), Some(expected)) => assert!(Arc::ptr_eq(actual, expected)),
+            (None, None) => {}
+            _ => panic!("publication changed the retained CRC"),
+        }
+        assert_eq!(published.crc_at_version().is_some(), crc_version == Some(2));
+        assert_eq!(source.log_segment(), &original_segment);
+
+        // Publishing the returned snapshot again must neither copy files nor create a new snapshot.
+        let repeated = published.publish(&PanicEngine, &committer).unwrap();
+        assert!(Arc::ptr_eq(&published, &repeated));
+        assert_eq!(*committer.calls.borrow(), expected_calls);
+    }
+
+    /// At version 2, checkpoint 2 supplies all log actions, leaving `ascending_commit_files` empty.
+    /// `latest_commit_file` still names staged commit 2 because timestamp reads need `commitInfo`.
+    /// `publish()` must replace that path when version 2 is published, even with no commits to
+    /// copy.
+    #[rstest]
+    fn test_publish_with_checkpoint_at_snapshot_version(
+        #[values(None, Some(0), Some(1), Some(2))] published_through: Option<Version>,
+    ) {
+        // GIVEN: checkpoint 2 and a staged latest_commit_file, with no at-version CRC.
+        let source = snapshot_with_staged_commits(published_through, None, false);
+        let segment = source
+            .log_segment()
+            .try_new_with_checkpoint(create_log_path(
+                "memory:///publication/_delta_log/00000000000000000002.checkpoint.parquet",
+            ))
+            .unwrap();
+        let source = Arc::new(
+            Snapshot::new_with_crc(
+                segment,
+                source.table_configuration().clone(),
+                None,
+                false,
+                false,
+            )
+            .unwrap(),
+        );
+        let original_segment = source.log_segment().clone();
+
+        // WHEN: publish with nothing left in ascending_commit_files to copy.
+        let result = source
+            .publish(&PanicEngine, &FileSystemCommitter::new())
+            .unwrap();
+
+        // THEN: replace latest_commit_file only if version 2 is known to be published.
+        assert!(
+            result
+                .log_segment()
+                .listed
+                .ascending_commit_files
+                .is_empty()
+        );
+        assert_eq!(
+            result.log_segment().listed.max_published_version,
+            published_through
+        );
+        let latest = result
+            .log_segment()
+            .listed
+            .latest_commit_file
+            .as_ref()
+            .unwrap();
+        if published_through == Some(2) {
+            assert_eq!(latest.file_type, LogPathFileType::Commit);
+            result.log_segment().validate_published().unwrap();
+        } else {
+            assert_eq!(latest.file_type, LogPathFileType::StagedCommit);
+            assert!(result.log_segment().validate_published().is_err());
+            assert!(Arc::ptr_eq(&source, &result));
+        }
+        assert_eq!(source.log_segment(), &original_segment);
+    }
+
+    #[test]
+    fn test_publish_retry_after_committer_failure() {
+        // GIVEN: commit 1 is published, and the committer fails its first attempt to publish 2.
+        let source = snapshot_with_staged_commits(Some(1), Some(0), true);
+        let original_segment = source.log_segment().clone();
+        let committer = RecordingPublishCommitter {
+            fail_once: Cell::new(true),
+            ..Default::default()
+        };
+
+        // WHEN: publication fails.
+        let result = source.publish(&PanicEngine, &committer);
+
+        // THEN: report the failure and leave the input snapshot unchanged.
+        assert_result_error_with_message(result, "injected publication failure");
+        assert_eq!(source.log_segment(), &original_segment);
+
+        // WHEN: retry publication from the same input snapshot.
+        let result = source.publish(&PanicEngine, &committer).unwrap();
+
+        // THEN: retry commit 2 and return published paths for both commits.
+        assert_eq!(*committer.calls.borrow(), vec![vec![2], vec![2]]);
+        assert_eq!(result.log_segment().listed.max_published_version, Some(2));
+        assert!(
+            result
+                .log_segment()
+                .listed
+                .ascending_commit_files
+                .iter()
+                .all(|file| file.file_type == LogPathFileType::Commit)
+        );
+        assert_eq!(source.log_segment(), &original_segment);
+    }
+
+    #[rstest]
+    #[case::filesystem_table(false, true, "table is not catalog-managed")]
+    #[case::filesystem_committer(true, false, "committer is not a catalog committer")]
+    fn test_publish_rejects_unsupported_table_or_committer(
+        #[case] catalog_managed: bool,
+        #[case] catalog_committer: bool,
+        #[case] error: &str,
+    ) {
+        // GIVEN: commit 2 needs publishing, with a non-catalog table or FileSystemCommitter.
+        let mut source = snapshot_with_staged_commits(Some(1), None, false);
+        if !catalog_managed {
+            Arc::get_mut(&mut source).unwrap().table_configuration =
+                MockTableConfigurationBuilder::new()
+                    .with_table_root("memory:///publication/")
+                    .with_version(2)
+                    .build();
+        }
+        let recording = RecordingPublishCommitter::default();
+        let filesystem = FileSystemCommitter::new();
+        let committer: &dyn Committer = if catalog_committer {
+            &recording
+        } else {
+            &filesystem
+        };
+
+        // WHEN: attempt to publish the snapshot.
+        let result = source.publish(&PanicEngine, committer);
+
+        // THEN: reject the unsupported table or committer before copying any files.
+        assert_result_error_with_message(result, error);
+        assert!(recording.calls.borrow().is_empty());
+    }
+
+    #[rstest]
+    #[case::gap(true, "ordered and contiguous")]
+    #[case::missing_snapshot_version(false, "must end with snapshot version")]
+    fn test_publish_rejects_missing_commit_versions(#[case] gap: bool, #[case] error: &str) {
+        // GIVEN: a version 2 snapshot whose unpublished commit versions are [0, 2] or [1].
+        let mut source = snapshot_with_staged_commits(None, None, false);
+        let files = &mut Arc::get_mut(&mut source)
+            .unwrap()
+            .log_segment
+            .listed
+            .ascending_commit_files;
+        if gap {
+            files[0] = ParsedLogPath::create_parsed_staged_commit(
+                &Url::parse("memory:///publication/").unwrap(),
+                0,
+            );
+        } else {
+            files.pop();
+        }
+        let committer = RecordingPublishCommitter::default();
+
+        // WHEN: attempt to publish with a missing version or missing final commit.
+        let result = source.publish(&PanicEngine, &committer);
+
+        // THEN: reject the incomplete commit list before calling the committer.
+        assert_result_error_with_message(result, error);
+        assert!(committer.calls.borrow().is_empty());
+    }
+
+    #[test]
+    fn test_publish_returns_original_filesystem_snapshot() {
+        // GIVEN: a filesystem-managed snapshot containing only published commit paths.
+        let mut source = snapshot_with_staged_commits(Some(2), None, false);
+        let snapshot = Arc::get_mut(&mut source).unwrap();
+        snapshot.table_configuration = MockTableConfigurationBuilder::new()
+            .with_table_root("memory:///publication/")
+            .with_version(2)
+            .build();
+        snapshot.log_segment = snapshot
+            .log_segment
+            .new_as_published(Some(2))
+            .unwrap()
+            .unwrap();
+
+        // WHEN: call publish without any catalog commits to copy.
+        let result = source
+            .publish(&PanicEngine, &FileSystemCommitter::new())
+            .unwrap();
+
+        // THEN: return the original snapshot.
+        assert!(Arc::ptr_eq(&source, &result));
+    }
 
     /// Helper function to create a commitInfo action with optional ICT
     fn create_commit_info(timestamp: i64, ict: Option<i64>) -> serde_json::Value {
