@@ -37,7 +37,10 @@ pub enum FileStatsState {
     /// operation (like `ANALYZE STATS`) that re-adds files without corresponding removes,
     /// or a counted remove action with a missing `size` field. A full add/remove reconciliation
     /// pass can recover `Complete`.
-    Indeterminate,
+    Indeterminate {
+        /// Operation that prevented incremental statistics, when known.
+        unsupported_operation: Option<String>,
+    },
 }
 
 impl FileStatsState {
@@ -60,7 +63,7 @@ impl FileStatsState {
     /// add/remove reconciliation pass to recover.
     #[cfg(any(test, feature = "test-utils"))]
     pub fn is_indeterminate(&self) -> bool {
-        self == &Self::Indeterminate
+        matches!(self, Self::Indeterminate { .. })
     }
 }
 
@@ -283,7 +286,13 @@ mod tests {
 
     #[test]
     fn indeterminate_returns_none_for_file_stats() {
-        assert!(FileStatsState::Indeterminate.file_stats().is_none());
+        assert!(
+            FileStatsState::Indeterminate {
+                unsupported_operation: None,
+            }
+            .file_stats()
+            .is_none()
+        );
     }
 
     #[test]
@@ -292,7 +301,9 @@ mod tests {
         assert!(complete.is_complete());
         assert!(!complete.is_indeterminate());
 
-        let indet = FileStatsState::Indeterminate;
+        let indet = FileStatsState::Indeterminate {
+            unsupported_operation: None,
+        };
         assert!(!indet.is_complete());
         assert!(indet.is_indeterminate());
     }

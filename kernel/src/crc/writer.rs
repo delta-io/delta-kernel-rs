@@ -2,7 +2,7 @@
 
 use url::Url;
 
-use super::Crc;
+use super::{Crc, FileStatsState};
 use crate::table_properties::ENABLE_IN_COMMIT_TIMESTAMPS;
 use crate::utils::require;
 use crate::{Engine, KernelError, KernelResult};
@@ -19,17 +19,19 @@ use crate::{Engine, KernelError, KernelResult};
 /// writes with `overwrite = false`. If the file already exists, returns
 /// `Err(KernelError::FileAlreadyExists)`.
 pub(crate) fn try_write_crc_file(engine: &dyn Engine, path: &Url, crc: &Crc) -> KernelResult<()> {
-    require!(
-        crc.file_stats_state.is_complete(),
-        KernelError::ChecksumWriteUnsupported(match &crc.unsupported_operation {
-            Some(operation) =>
-                format!("Cannot write CRC file incrementally: unsupported operation {operation:?}"),
-            None => format!(
-                "Cannot write CRC file with {:?} file stats",
-                crc.file_stats_state
-            ),
-        })
-    );
+    if let FileStatsState::Indeterminate {
+        unsupported_operation,
+    } = &crc.file_stats_state
+    {
+        return Err(KernelError::ChecksumWriteUnsupported(
+            match unsupported_operation {
+                Some(operation) => format!(
+                    "Cannot write CRC file incrementally: unsupported operation {operation:?}"
+                ),
+                None => "Cannot write CRC file with Indeterminate file stats".to_string(),
+            },
+        ));
+    }
     // If ICT is enabled, the CRC must carry an ICT value.
     let ict_enabled = crc
         .metadata
@@ -240,15 +242,25 @@ mod tests {
         assert!(matches!(result, Err(KernelError::FileAlreadyExists(_))));
     }
 
-    #[test]
-    fn test_write_rejects_indeterminate_file_stats_with_checksum_write_unsupported() {
+    #[rstest]
+    fn test_write_rejects_indeterminate_file_stats_with_checksum_write_unsupported(
+        #[values(None, Some("UNKNOWN"))] unsupported_operation: Option<&str>,
+    ) {
         let (engine, crc_path) = writer_test_env(0);
         let mut crc = test_crc(/* ict_supported */ true, /* ict_enabled */ true);
-        crc.file_stats_state = FileStatsState::Indeterminate;
+        crc.file_stats_state = FileStatsState::Indeterminate {
+            unsupported_operation: unsupported_operation.map(str::to_owned),
+        };
         let result = try_write_crc_file(&engine, crc_path.location.as_url(), &crc);
+        let expected = match unsupported_operation {
+            Some(operation) => {
+                format!("Cannot write CRC file incrementally: unsupported operation {operation:?}")
+            }
+            None => "Cannot write CRC file with Indeterminate file stats".to_string(),
+        };
         assert!(matches!(
             result,
-            Err(KernelError::ChecksumWriteUnsupported(_))
+            Err(KernelError::ChecksumWriteUnsupported(message)) if message == expected
         ));
     }
 

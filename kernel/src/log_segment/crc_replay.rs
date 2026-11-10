@@ -334,10 +334,9 @@ struct CrcReplayAccumulator {
 
     // Aggregate adds and removes separately until commitInfo is known. It may follow file
     // actions, including in a later batch. Memory use depends on histogram bins, not file count.
-    current_commit_adds: FileStatsDelta,
-    current_commit_removes: FileStatsDelta,
-    current_commit_adds_valid: bool,
-    current_commit_removes_valid: bool,
+    // None marks invalid file statistics for the current commit.
+    current_commit_adds: Option<FileStatsDelta>,
+    current_commit_removes: Option<FileStatsDelta>,
 
     /// Operation from the first commitInfo, used to classify file actions at the commit boundary.
     current_commit_operation: Option<String>,
@@ -347,16 +346,14 @@ struct CrcReplayAccumulator {
 impl CrcReplayAccumulator {
     fn new(seed_histogram: Option<FileSizeHistogram>) -> Self {
         Self {
-            current_commit_adds: FileStatsDelta {
+            current_commit_adds: Some(FileStatsDelta {
                 net_histogram: seed_histogram.clone(),
                 ..Default::default()
-            },
-            current_commit_removes: FileStatsDelta {
+            }),
+            current_commit_removes: Some(FileStatsDelta {
                 net_histogram: seed_histogram.clone(),
                 ..Default::default()
-            },
-            current_commit_adds_valid: true,
-            current_commit_removes_valid: true,
+            }),
             delta: CrcDelta {
                 is_incremental_safe: true,
                 file_stats: FileStatsDelta {
@@ -382,6 +379,7 @@ impl CrcReplayAccumulator {
             self.process_commit_file_end();
             self.is_first_commit = false;
         }
+        self.current_commit_saw_commit_info = false;
         self.current_file_url = Some(batch_file_url.to_owned());
     }
 
@@ -398,18 +396,20 @@ impl CrcReplayAccumulator {
             None => FileStatsPolicy::Unsupported,
         };
         let fs = &mut self.delta.file_stats;
-        match policy {
-            FileStatsPolicy::ApplyAll
-                if self.current_commit_adds_valid && self.current_commit_removes_valid =>
-            {
-                fs.accumulate(&self.current_commit_adds);
-                fs.accumulate(&self.current_commit_removes);
+        match (
+            policy,
+            self.current_commit_adds.as_ref(),
+            self.current_commit_removes.as_ref(),
+        ) {
+            (FileStatsPolicy::ApplyAll, Some(adds), Some(removes)) => {
+                fs.accumulate(adds);
+                fs.accumulate(removes);
             }
-            FileStatsPolicy::IgnoreAdds if self.current_commit_removes_valid => {
-                fs.accumulate(&self.current_commit_removes);
+            (FileStatsPolicy::IgnoreAdds, _, Some(removes)) => {
+                fs.accumulate(removes);
             }
-            FileStatsPolicy::IgnoreRemoves if self.current_commit_adds_valid => {
-                fs.accumulate(&self.current_commit_adds);
+            (FileStatsPolicy::IgnoreRemoves, Some(adds), _) => {
+                fs.accumulate(adds);
             }
             _ => {
                 warn!(
@@ -424,13 +424,19 @@ impl CrcReplayAccumulator {
                 }
             }
         }
-        self.current_commit_adds_valid = true;
-        self.current_commit_removes_valid = true;
-        self.current_commit_adds.clear();
-        self.current_commit_removes.clear();
+        for stats in [
+            &mut self.current_commit_adds,
+            &mut self.current_commit_removes,
+        ] {
+            stats
+                .get_or_insert_with(|| FileStatsDelta {
+                    net_histogram: self.delta.file_stats.net_histogram.clone(),
+                    ..Default::default()
+                })
+                .clear();
+        }
         self.current_commit_saw_file_action = false;
         self.current_commit_operation = None;
-        self.current_commit_saw_commit_info = false;
     }
 
     // ===== Row-level updates (also the seams used by `on_*` unit tests) =====
@@ -438,7 +444,7 @@ impl CrcReplayAccumulator {
     /// Called by the visitor once per commitInfo row (gated on any of its fields being present).
     /// `operation` drives per-commit safety classification; `ict` and `last_manifest_commit` are
     /// captured into the delta from the newest commit only, so an absent value there stays `None`.
-    /// For duplicates, the first row selects the operation; the last supplies ICT/manifest fields.
+    /// Duplicate rows are ignored with a warning; the first row supplies all fields.
     fn on_commit_info(
         &mut self,
         operation: Option<&str>,
@@ -447,10 +453,15 @@ impl CrcReplayAccumulator {
             LastManifestCommit,
         >,
     ) {
-        if !self.current_commit_saw_commit_info {
-            self.current_commit_operation = operation.map(str::to_owned);
-            self.current_commit_saw_commit_info = true;
+        if self.current_commit_saw_commit_info {
+            warn!(
+                "CRC reverse-replay: duplicate commitInfo in commit at {}; keeping the first",
+                self.current_file_url.as_deref().unwrap_or("?")
+            );
+            return;
         }
+        self.current_commit_operation = operation.map(str::to_owned);
+        self.current_commit_saw_commit_info = true;
         if self.is_first_commit {
             self.delta.in_commit_timestamp = ict;
             #[cfg(feature = "adaptive-metadata-in-dev")]
@@ -470,10 +481,12 @@ impl CrcReplayAccumulator {
         }
         if size < 0 {
             warn!("CRC reverse-replay: add action has negative size {size}");
-            self.current_commit_adds_valid = false;
+            self.current_commit_adds = None;
             return Ok(());
         }
-        let fs = &mut self.current_commit_adds;
+        let Some(fs) = self.current_commit_adds.as_mut() else {
+            return Ok(());
+        };
         fs.gross_add_files += 1;
         fs.gross_add_bytes += size_to_u64(size)?;
         if let Some(hist) = fs.net_histogram.as_mut() {
@@ -494,10 +507,12 @@ impl CrcReplayAccumulator {
         match size {
             Some(s) if s < 0 => {
                 warn!("CRC reverse-replay: remove action at {path} has negative size {s}");
-                self.current_commit_removes_valid = false;
+                self.current_commit_removes = None;
             }
             Some(s) => {
-                let fs = &mut self.current_commit_removes;
+                let Some(fs) = self.current_commit_removes.as_mut() else {
+                    return Ok(());
+                };
                 fs.gross_remove_files += 1;
                 fs.gross_remove_bytes += size_to_u64(s)?;
                 if let Some(hist) = fs.net_histogram.as_mut() {
@@ -506,7 +521,7 @@ impl CrcReplayAccumulator {
             }
             None => {
                 warn!("CRC reverse-replay: remove action at {path} has missing size");
-                self.current_commit_removes_valid = false;
+                self.current_commit_removes = None;
             }
         }
         Ok(())
@@ -904,14 +919,17 @@ mod tests {
     }
 
     #[rstest::rstest]
-    #[case::apply_first("WRITE", "LIQUID TAGGING", 2, 300)]
-    #[case::ignore_first("LIQUID TAGGING", "WRITE", 1, 200)]
+    #[case::apply_first("WRITE", "LIQUID TAGGING", 2, 300, true)]
+    #[case::ignore_first("LIQUID TAGGING", "WRITE", 1, 200, true)]
+    #[case::unsupported_first("UNKNOWN", "WRITE", 0, 0, false)]
     fn duplicate_commit_info_keeps_first_operation_across_batches_and_resets_at_next_commit(
         #[case] first_operation: &str,
         #[case] duplicate_operation: &str,
         #[case] expected_files: i64,
         #[case] expected_bytes: i64,
+        #[case] is_safe: bool,
     ) {
+        let logging = LoggingTest::new();
         let mut acc = CrcReplayAccumulator::new(None);
         acc.process_batch_start("v2.json");
         acc.on_commit_info_without_lmc(Some(first_operation), None);
@@ -924,31 +942,38 @@ mod tests {
         acc.on_add(200).unwrap();
         acc.process_commit_file_end();
         let delta = acc.into_crc_delta();
-        assert!(delta.is_incremental_safe);
+        assert_eq!(delta.is_incremental_safe, is_safe);
         assert_eq!(delta.file_stats.net_files(), expected_files);
         assert_eq!(delta.file_stats.net_bytes(), expected_bytes);
+        let logs = logging.logs();
+        assert_eq!(logs.matches("duplicate commitInfo").count(), 1, "{logs}");
+        assert!(logs.contains("commit at v2.json"), "{logs}");
     }
 
     #[rstest::rstest]
-    fn duplicate_commit_info_keeps_last_metadata_in_newest_commit(
-        #[values(None, Some(3000))] last_ict: Option<i64>,
+    fn duplicate_commit_info_keeps_first_metadata_in_newest_commit(
+        #[values(None, Some(2000))] first_ict: Option<i64>,
+        #[values(None, Some(3000))] duplicate_ict: Option<i64>,
     ) {
         let mut acc = CrcReplayAccumulator::new(None);
         acc.process_batch_start("v2.json");
+        #[cfg(feature = "adaptive-metadata-in-dev")]
+        let first_manifest_commit = first_ict.map(|_| LastManifestCommit::new(1, 1).unwrap());
         acc.on_commit_info(
             Some("WRITE"),
-            Some(2000),
+            first_ict,
             #[cfg(feature = "adaptive-metadata-in-dev")]
-            Some(LastManifestCommit::new(1, 1).unwrap()),
+            first_manifest_commit.clone(),
         );
         #[cfg(feature = "adaptive-metadata-in-dev")]
-        let last_manifest_commit = last_ict.map(|_| LastManifestCommit::new(2, 2).unwrap());
+        let duplicate_manifest_commit =
+            duplicate_ict.map(|_| LastManifestCommit::new(2, 2).unwrap());
         acc.process_batch_start("v2.json");
         acc.on_commit_info(
             Some("WRITE"),
-            last_ict,
+            duplicate_ict,
             #[cfg(feature = "adaptive-metadata-in-dev")]
-            last_manifest_commit.clone(),
+            duplicate_manifest_commit,
         );
         acc.process_batch_start("v1.json");
         acc.on_commit_info(
@@ -959,9 +984,9 @@ mod tests {
         );
         acc.process_commit_file_end();
         let delta = acc.into_crc_delta();
-        assert_eq!(delta.in_commit_timestamp, last_ict);
+        assert_eq!(delta.in_commit_timestamp, first_ict);
         #[cfg(feature = "adaptive-metadata-in-dev")]
-        assert_eq!(delta.last_manifest_commit, last_manifest_commit);
+        assert_eq!(delta.last_manifest_commit, first_manifest_commit);
     }
 
     #[cfg(feature = "adaptive-metadata-in-dev")]
@@ -1135,6 +1160,7 @@ mod tests {
         #[case] operation: &str,
         #[case] expected_sizes: &[i64],
         #[values(false, true)] commit_info_first: bool,
+        #[values(false, true)] invalid_ignored_action: bool,
     ) {
         let mut expected_histogram =
             FileSizeHistogram::create_empty_with_boundaries(vec![0, 150, 1000]).unwrap();
@@ -1146,6 +1172,13 @@ mod tests {
         acc.process_batch_start("v2.json");
         if commit_info_first {
             acc.on_commit_info_without_lmc(Some(operation), None);
+        }
+        if invalid_ignored_action {
+            if operation == "LIQUID TAGGING" {
+                acc.on_add(-1).unwrap();
+            } else {
+                acc.on_remove("a", None).unwrap();
+            }
         }
         acc.on_add(200).unwrap();
         acc.process_batch_start("v2.json");

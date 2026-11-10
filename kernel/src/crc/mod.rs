@@ -78,8 +78,6 @@ pub struct Crc {
     pub protocol: Protocol,
     /// File-level statistics as a typed state. See [`FileStatsState`].
     pub(crate) file_stats_state: FileStatsState,
-    /// Unsupported operation, when known. Only relevant when file stats are `Indeterminate`.
-    pub(crate) unsupported_operation: Option<String>,
 
     // ===== Optional fields =====
     /// The in-commit timestamp of this version. Present iff In-Commit Timestamps are enabled.
@@ -149,7 +147,6 @@ impl Crc {
             metadata,
             protocol,
             file_stats_state,
-            unsupported_operation: None,
             in_commit_timestamp_opt,
             set_transaction_state,
             domain_metadata_state,
@@ -1438,7 +1435,9 @@ mod tests {
             0,
             Default::default(),
             valid_protocol(),
-            FileStatsState::Indeterminate,
+            FileStatsState::Indeterminate {
+                unsupported_operation: None,
+            },
             None,
             Default::default(),
             Default::default(),
@@ -1741,7 +1740,9 @@ mod tests {
     #[test]
     fn ser_indeterminate_file_stats_returns_error() {
         let crc = Crc {
-            file_stats_state: FileStatsState::Indeterminate,
+            file_stats_state: FileStatsState::Indeterminate {
+                unsupported_operation: None,
+            },
             ..Default::default()
         };
         let err = serde_json::to_string(&crc).unwrap_err().to_string();
@@ -1754,7 +1755,9 @@ mod tests {
     #[test]
     fn try_from_ref_indeterminate_returns_checksum_write_unsupported() {
         let crc = Crc {
-            file_stats_state: FileStatsState::Indeterminate,
+            file_stats_state: FileStatsState::Indeterminate {
+                unsupported_operation: None,
+            },
             ..Default::default()
         };
         let err = CrcRaw::try_from(&crc).unwrap_err();

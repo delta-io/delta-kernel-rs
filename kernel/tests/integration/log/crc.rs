@@ -1256,8 +1256,19 @@ async fn test_write_checksum_from_checkpoint_ict_enabled_but_commit_unreadable_p
 #[case::stale_crc(WriteRoot::StaleCrcIncrementalBuild)]
 #[case::checkpoint(WriteRoot::CheckpointWithTail)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_write_checksum_ignores_metadata_readds_and_counts_subsequent_whitelisted_writes(
+async fn test_write_checksum_ignores_excluded_file_actions_and_counts_subsequent_writes(
     #[case] root: WriteRoot,
+    #[values(
+        "COMPUTE STATS",
+        "ROW TRACKING BACKFILL",
+        "ROW TRACKING UNBACKFILL",
+        "DROP FEATURE",
+        "LIQUID BACKFILL",
+        "LIQUID TAGGING",
+        "REPLACE PARTITIONED BY WITH CLUSTER BY",
+        "Deletion Vector Tombstones"
+    )]
+    operation: &str,
 ) -> delta_kernel::Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
     let snap = create_table_and_commit(&table_path, engine.as_ref())?
@@ -1283,15 +1294,22 @@ async fn test_write_checksum_ignores_metadata_readds_and_counts_subsequent_white
         _ => unreachable!(),
     }
 
-    // Re-add the active file with updated tags, preserving its identity and size.
+    // Metadata re-adds and auxiliary tombstones leave the active files unchanged.
     let table_url = snap.table_root().clone();
     let mut existing = read_actions_from_commit(&table_url, 1, "add")?;
     assert_eq!(existing.len(), 1);
     existing[0]["dataChange"] = serde_json::json!(false);
     existing[0]["tags"] = serde_json::json!({"test.tag": "updated"});
+    let file_action = match operation {
+        "Deletion Vector Tombstones" => serde_json::json!({"remove": {
+            "path": "auxiliary-dv.bin",
+            "dataChange": false,
+        }}),
+        _ => serde_json::json!({"add": existing[0]}),
+    };
     let actions = [
-        serde_json::json!({"add": existing[0]}),
-        serde_json::json!({"commitInfo": {"operation": "LIQUID TAGGING"}}),
+        file_action,
+        serde_json::json!({"commitInfo": {"operation": operation}}),
     ];
     let commit = actions
         .iter()
