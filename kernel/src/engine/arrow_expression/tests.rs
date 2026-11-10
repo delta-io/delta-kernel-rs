@@ -7,9 +7,10 @@ use rstest::rstest;
 use super::*;
 use crate::KernelResult;
 use crate::arrow::array::{
-    Array, ArrayRef, BinaryViewArray, BooleanArray, GenericStringArray, Int32Array, Int32Builder,
-    Int64Array, ListArray, ListViewArray, MapArray, MapBuilder, MapFieldNames, StringArray,
-    StringBuilder, StringViewArray, StructArray, TimestampNanosecondArray, create_array,
+    Array, ArrayRef, AsArray, BinaryViewArray, BooleanArray, GenericStringArray, Int32Array,
+    Int32Builder, Int64Array, ListArray, ListViewArray, MapArray, MapBuilder, MapFieldNames,
+    StringArray, StringBuilder, StringViewArray, StructArray, TimestampNanosecondArray,
+    create_array,
 };
 use crate::arrow::buffer::{BooleanBuffer, NullBuffer, OffsetBuffer, ScalarBuffer};
 use crate::arrow::compute::kernels::cmp::{gt_eq, lt};
