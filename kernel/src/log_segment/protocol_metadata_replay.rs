@@ -962,9 +962,9 @@ mod tests {
     use crate::Snapshot;
     #[cfg(feature = "declarative-plans")]
     use crate::SnapshotRef;
-    use crate::engine::sync::SyncEngine;
     #[cfg(feature = "declarative-plans")]
-    use crate::engine::test_delegating::DelegatingEngine;
+    use crate::engine::DelegatingEngine;
+    use crate::engine::sync::SyncEngine;
     #[cfg(all(feature = "adaptive-metadata-in-dev", feature = "declarative-plans"))]
     use crate::expressions::lit;
     #[cfg(feature = "declarative-plans")]

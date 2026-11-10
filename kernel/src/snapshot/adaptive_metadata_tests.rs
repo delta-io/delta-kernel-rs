@@ -15,9 +15,10 @@ use crate::engine::sync::SyncEngine;
 use crate::metrics::MeteredDeltaEngine;
 use crate::snapshot::builder::tests::measuring_reporter;
 use crate::unit_test_utils::adaptive_metadata_fixtures::{
-    checkpoint_line, setup_adaptive_metadata_table, write_ict_commit, write_sidecar,
+    checkpoint_line, domain, domain_metadata_line, setup_adaptive_metadata_table, txn_line,
+    write_ict_commit, write_sidecar,
 };
-use crate::unit_test_utils::{Action, is_io_event};
+use crate::unit_test_utils::is_io_event;
 use crate::{Snapshot, SnapshotRef, Version};
 
 /// The version [`table_with_checkpoint_action`] commits its checkpoint action at.
@@ -139,10 +140,6 @@ fn txn(app_id: &str, version: i64) -> SetTransaction {
     SetTransaction::new(app_id.to_string(), version, None)
 }
 
-fn txn_line(app_id: &str, version: i64) -> String {
-    serde_json::to_string(&Action::Txn(txn(app_id, version))).unwrap()
-}
-
 /// The action's txns, which the consistent cases also commit before it.
 const ACTION_TXNS: &[(&str, i64)] = &[("a", 1), ("b", 2), ("d", 4)];
 
@@ -215,14 +212,6 @@ fn app_id_versions_come_from_checkpoint_action_and_later_commits(
     assert_eq!(tail_base.map(|crc| crc.version), expected_tail_base);
 }
 
-fn dm(domain: &str, configuration: &str) -> DomainMetadata {
-    DomainMetadata::new(domain.to_string(), configuration.to_string())
-}
-
-fn dm_line(dm: DomainMetadata) -> String {
-    serde_json::to_string(&Action::DomainMetadata(dm)).unwrap()
-}
-
 /// The action's domains, which the consistent cases also commit before it.
 const ACTION_DOMAINS: &[(&str, &str)] = &[("a", "a1"), ("b", "b1"), ("d", "d1")];
 
@@ -240,23 +229,23 @@ fn domain_metadata_comes_from_checkpoint_action_and_later_commits(
 ) {
     let before = before
         .iter()
-        .map(|(domain, configuration)| dm_line(dm(domain, configuration)))
+        .map(|(name, configuration)| domain_metadata_line(domain(name, configuration)))
         .join("\n");
     let after = format!(
         "{}\n{}",
-        dm_line(dm("a", "a2")),
-        dm_line(DomainMetadata::remove("b".to_string(), String::new()))
+        domain_metadata_line(domain("a", "a2")),
+        domain_metadata_line(DomainMetadata::remove("b".to_string(), String::new()))
     );
     let (engine, snapshot) = table_with_checkpoint_action(
         &before,
         |engine, table_root, snapshot| CheckpointAction {
-            domain_metadata: vec![dm("a", "a1"), dm("b", "b1")],
+            domain_metadata: vec![domain("a", "a1"), domain("b", "b1")],
             domain_metadata_sidecars: vec![write_sidecar(
                 engine,
                 table_root,
                 "domains.parquet",
                 LOG_DOMAIN_METADATA_SCHEMA.clone(),
-                vec![dm("d", "d1").into()],
+                vec![domain("d", "d1").into()],
             )],
             ..checkpoint_action(snapshot)
         },

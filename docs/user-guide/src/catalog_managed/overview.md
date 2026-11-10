@@ -165,13 +165,14 @@ Kernel:
   committer implements `commit()` to stage and ratify commits through the
   catalog API, and `publish()` to copy ratified commits to the Delta log.
 
-- **`Snapshot::publish()`** publishes all unpublished catalog commits at the
+- **[`Snapshot::publish()`](https://docs.rs/delta_kernel/latest/delta_kernel/snapshot/struct.Snapshot.html#method.publish)**
+  publishes all unpublished catalog commits at the
   current snapshot version. Published commits become visible to filesystem-based
-  readers and enable maintenance operations like checkpointing. If the snapshot
-  has no unpublished commits, `publish()` is a no-op and returns the same
-  snapshot reference without invoking the committer. If unpublished commits
-  exist, both the snapshot and the committer must be catalog-managed; otherwise
-  `publish()` errors.
+  readers and enable maintenance operations like checkpointing. If no commits need
+  copying, `publish()` skips the committer but can still return a snapshot with
+  staged paths replaced by published paths for commits known to be published.
+  If unpublished commits exist, both the snapshot and the committer must be
+  catalog-managed; otherwise `publish()` errors.
 
 ## Example: the read flow
 

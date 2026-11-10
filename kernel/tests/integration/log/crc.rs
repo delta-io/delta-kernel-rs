@@ -12,6 +12,7 @@ use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::crc::{Crc, DomainMetadataState, SetTransactionState};
 use delta_kernel::engine::arrow_conversion::TryFromKernel;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
+use delta_kernel::engine::{DelegatingEngine, PanicEngine};
 use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::path::ParsedLogPath;
 use delta_kernel::schema::{SchemaRef, schema_ref};
@@ -22,9 +23,8 @@ use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
 use delta_kernel::transaction::{UpdateTableOperation, UpdateTableTransactionBuilder};
 use delta_kernel::{
-    Engine, EngineData, EvaluationHandler, FileDataReadResultIterator, FileMeta, FileSize,
-    FileStats, JsonHandler, KernelError, KernelResult, KernelResultIterator, ParquetFooter,
-    ParquetHandler, PredicateRef, StorageHandler, Version,
+    Engine, EngineData, FileDataReadResultIterator, FileMeta, FileSize, FileStats, KernelError,
+    KernelResult, KernelResultIterator, ParquetFooter, ParquetHandler, PredicateRef, Version,
 };
 use rstest::rstest;
 use test_utils::delta_kernel_default_engine::executor::TaskExecutor;
@@ -1488,24 +1488,6 @@ async fn test_write_checksum_with_no_dms_writes_empty_list(
 // Domain metadata CRC fast path
 // ============================================================================
 
-/// Engine that panics if any handler is accessed.
-struct FailingEngine;
-
-impl Engine for FailingEngine {
-    fn evaluation_handler(&self) -> Arc<dyn delta_kernel::EvaluationHandler> {
-        unimplemented!()
-    }
-    fn storage_handler(&self) -> Arc<dyn delta_kernel::StorageHandler> {
-        unimplemented!()
-    }
-    fn json_handler(&self) -> Arc<dyn delta_kernel::JsonHandler> {
-        unimplemented!()
-    }
-    fn parquet_handler(&self) -> Arc<dyn delta_kernel::ParquetHandler> {
-        unimplemented!()
-    }
-}
-
 #[tokio::test]
 async fn test_get_domain_metadata_with_crc_skips_log_replay() -> delta_kernel::Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
@@ -1572,10 +1554,10 @@ async fn test_get_domain_metadata_with_crc_skips_log_replay() -> delta_kernel::R
     };
 
     // Case 1: Post-commit snapshot with in-memory CRC => DM loaded from CRC (fast path).
-    //         Use NoJsonReadsEngine to prove no log replay occurs.
+    //         Use PanicEngine to prove no log replay occurs.
     let post_commit_snapshot = committed.post_commit_snapshot().unwrap();
     assert!(post_commit_snapshot.crc_at_version().is_some());
-    assert_domain_metadata(post_commit_snapshot, &FailingEngine);
+    assert_domain_metadata(post_commit_snapshot, &PanicEngine);
 
     // Case 2: Fresh snapshot loaded from disk, no CRC file => DM loaded via log replay (slow path)
     let fresh_snapshot_no_crc = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
@@ -1583,12 +1565,12 @@ async fn test_get_domain_metadata_with_crc_skips_log_replay() -> delta_kernel::R
     assert_domain_metadata(&fresh_snapshot_no_crc, engine.as_ref());
 
     // Case 3: Write CRC to disk, then reload fresh snapshot => DM loaded from CRC (fast path)
-    //         Use NoJsonReadsEngine to prove no log replay occurs.
+    //         Use PanicEngine to prove no log replay occurs.
     let _ = post_commit_snapshot.write_checksum(engine.as_ref())?;
 
     let fresh_snapshot_with_crc = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
     assert!(fresh_snapshot_with_crc.crc_at_version().is_some());
-    assert_domain_metadata(&fresh_snapshot_with_crc, &FailingEngine);
+    assert_domain_metadata(&fresh_snapshot_with_crc, &PanicEngine);
 
     Ok(())
 }
@@ -1655,16 +1637,16 @@ async fn test_partial_dm_serves_hits_and_falls_through_for_misses() -> delta_ker
     assert_eq!(
         snapshot_v1
             .reader()
-            .get_domain_metadata("foo", &FailingEngine)?,
+            .get_domain_metadata("foo", &PanicEngine)?,
         Some("bar".to_string())
     );
 
-    // Miss: "zip" is not in this Partial cache; FailingEngine panics, real engine finds it.
+    // Miss: "zip" is not in this Partial cache; PanicEngine panics, real engine finds it.
     assert!(
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             snapshot_v1
                 .reader()
-                .get_domain_metadata("zip", &FailingEngine)
+                .get_domain_metadata("zip", &PanicEngine)
                 .ok()
         }))
         .is_err()
@@ -1735,7 +1717,7 @@ async fn test_set_transaction_crc_tracking_and_fast_path() -> delta_kernel::Resu
     assert_eq!(
         fresh_v0
             .reader()
-            .get_app_id_version("my-app", &FailingEngine)
+            .get_app_id_version("my-app", &PanicEngine)
             .unwrap(),
         None
     );
@@ -1754,14 +1736,14 @@ async fn test_set_transaction_crc_tracking_and_fast_path() -> delta_kernel::Resu
     assert_eq!(
         snapshot_v1
             .reader()
-            .get_app_id_version("my-app", &FailingEngine)
+            .get_app_id_version("my-app", &PanicEngine)
             .unwrap(),
         Some(1)
     );
     assert_eq!(
         snapshot_v1
             .reader()
-            .get_app_id_version("nonexistent", &FailingEngine)
+            .get_app_id_version("nonexistent", &PanicEngine)
             .unwrap(),
         None
     );
@@ -1777,14 +1759,14 @@ async fn test_set_transaction_crc_tracking_and_fast_path() -> delta_kernel::Resu
     assert_eq!(
         fresh_v1
             .reader()
-            .get_app_id_version("my-app", &FailingEngine)
+            .get_app_id_version("my-app", &PanicEngine)
             .unwrap(),
         Some(1)
     );
     assert_eq!(
         fresh_v1
             .reader()
-            .get_app_id_version("nonexistent", &FailingEngine)
+            .get_app_id_version("nonexistent", &PanicEngine)
             .unwrap(),
         None
     );
@@ -1804,14 +1786,14 @@ async fn test_set_transaction_crc_tracking_and_fast_path() -> delta_kernel::Resu
     assert_eq!(
         snapshot_v2
             .reader()
-            .get_app_id_version("my-app", &FailingEngine)
+            .get_app_id_version("my-app", &PanicEngine)
             .unwrap(),
         Some(2)
     );
     assert_eq!(
         snapshot_v2
             .reader()
-            .get_app_id_version("other-app", &FailingEngine)
+            .get_app_id_version("other-app", &PanicEngine)
             .unwrap(),
         Some(1)
     );
@@ -1826,14 +1808,14 @@ async fn test_set_transaction_crc_tracking_and_fast_path() -> delta_kernel::Resu
     assert_eq!(
         fresh_v2
             .reader()
-            .get_app_id_version("my-app", &FailingEngine)
+            .get_app_id_version("my-app", &PanicEngine)
             .unwrap(),
         Some(2)
     );
     assert_eq!(
         fresh_v2
             .reader()
-            .get_app_id_version("other-app", &FailingEngine)
+            .get_app_id_version("other-app", &PanicEngine)
             .unwrap(),
         Some(1)
     );
@@ -1893,16 +1875,16 @@ async fn test_partial_set_txn_serves_hits_and_falls_through_for_misses() -> delt
     assert_eq!(
         snapshot_v2
             .reader()
-            .get_app_id_version("my-app", &FailingEngine)?,
+            .get_app_id_version("my-app", &PanicEngine)?,
         Some(1)
     );
 
-    // Miss: "v1-app" is NOT in the Partial cache; FailingEngine panics, real engine finds it.
+    // Miss: "v1-app" is NOT in the Partial cache; PanicEngine panics, real engine finds it.
     assert!(
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             snapshot_v2
                 .reader()
-                .get_app_id_version("v1-app", &FailingEngine)
+                .get_app_id_version("v1-app", &PanicEngine)
                 .ok()
         }))
         .is_err()
@@ -1978,11 +1960,11 @@ async fn test_set_txn_expiration_via_crc_fast_path(
     // Verify CRC was loaded from disk
     assert!(snapshot.crc_at_version().is_some());
 
-    // FailingEngine proves the CRC fast path is used (no log replay)
+    // PanicEngine proves the CRC fast path is used (no log replay)
     assert_eq!(
         snapshot
             .reader()
-            .get_app_id_version("my-app", &FailingEngine)
+            .get_app_id_version("my-app", &PanicEngine)
             .unwrap(),
         expected
     );
@@ -2041,11 +2023,11 @@ async fn test_partial_set_txn_expired_hit_returns_none_via_fast_path() -> delta_
         .expect_partial();
     assert!(map.contains_key("my-app"));
 
-    // FailingEngine proves the Partial fast path is used; the expiration filter drops the txn.
+    // PanicEngine proves the Partial fast path is used; the expiration filter drops the txn.
     assert_eq!(
         snapshot_v2
             .reader()
-            .get_app_id_version("my-app", &FailingEngine)?,
+            .get_app_id_version("my-app", &PanicEngine)?,
         None
     );
 
@@ -2633,13 +2615,13 @@ async fn test_stale_crc_fresh_build_advance_matrix(
 
     // Define our engines that will be used below.
     let real_engine_iff_crc_missing: &dyn Engine = if expect_crc_present {
-        &FailingEngine
+        &PanicEngine
     } else {
         engine.as_ref()
     };
     let real_engine_iff_crc_missing_or_crc_missing_opt_fields: &dyn Engine =
         if expect_crc_present && !crc_missing_opt_fields {
-            &FailingEngine
+            &PanicEngine
         } else {
             engine.as_ref()
         };
@@ -2761,14 +2743,11 @@ async fn test_stale_crc_fresh_build_fails_load_when_advance_commit_is_corrupt() 
 // Domain metadata rooted in a stale (but authoritative) CRC
 // ============================================================================
 
-/// Delegates every handler to `inner`, but panics on `read_parquet_files`. A domain-metadata query
-/// reads only JSON commits, so the only parquet a scan would touch is the V1 checkpoint; the panic
-/// proves the rooted path skips it. That the pruned tail segment itself excludes the checkpoint and
-/// every commit at/below the base CRC is covered by `test_segment_crc_filtering`.
-struct NoParquetReadsEngine {
-    inner: Arc<dyn Engine>,
-}
-
+/// Rejects Parquet data reads while allowing footer reads and writes.
+///
+/// In these metadata queries, Parquet data reads would read the checkpoint. The separate
+/// `test_segment_crc_filtering` test checks that the segment excludes both the checkpoint and
+/// commits at or below the base CRC.
 struct NoParquetReadsHandler {
     inner: Arc<dyn ParquetHandler>,
 }
@@ -2796,21 +2775,13 @@ impl ParquetHandler for NoParquetReadsHandler {
     }
 }
 
-impl Engine for NoParquetReadsEngine {
-    fn evaluation_handler(&self) -> Arc<dyn EvaluationHandler> {
-        self.inner.evaluation_handler()
-    }
-    fn storage_handler(&self) -> Arc<dyn StorageHandler> {
-        self.inner.storage_handler()
-    }
-    fn json_handler(&self) -> Arc<dyn JsonHandler> {
-        self.inner.json_handler()
-    }
-    fn parquet_handler(&self) -> Arc<dyn ParquetHandler> {
-        Arc::new(NoParquetReadsHandler {
-            inner: self.inner.parquet_handler(),
-        })
-    }
+fn no_parquet_reads_engine(inner: Arc<dyn Engine>) -> DelegatingEngine {
+    let no_parquet_reads_handler = Arc::new(NoParquetReadsHandler {
+        inner: inner.parquet_handler(),
+    });
+    DelegatingEngine::new(inner)
+        .with_parquet_handler(no_parquet_reads_handler)
+        .without_plan_executor()
 }
 
 /// Builds checkpoint@10, commits to v20, and a CRC at v15. Loaded with the default
@@ -2878,7 +2849,7 @@ enum Query {
 }
 
 // Every query shape resolves against a stale Complete CRC by scanning only the commit tail. The
-// NoParquetReadsEngine panics if the v10 checkpoint is read, proving the checkpoint is skipped.
+// NoParquetReadsHandler panics if the v10 checkpoint is read, proving the checkpoint is skipped.
 #[rstest]
 #[case::base_stands(Query::One("dom_before", Some("cfg_before")))]
 #[case::tail_overrides_base(Query::One("dom_updated", Some("cfg_updated_v16")))]
@@ -2903,9 +2874,7 @@ async fn test_dm_query_rooted_in_stale_complete_crc(
         "the stale CRC must not sit at the snapshot version"
     );
 
-    let engine = NoParquetReadsEngine {
-        inner: engine.clone(),
-    };
+    let engine = no_parquet_reads_engine(engine.clone());
     match query {
         Query::One(domain, expected) => assert_eq!(
             fresh.reader().get_domain_metadata(domain, &engine)?,
@@ -2961,11 +2930,9 @@ async fn test_dm_query_stale_partial_crc_falls_through_to_full_scan() -> delta_k
         None
     );
 
-    // A full scan reads the v10 checkpoint, so NoParquetReadsEngine panics: the Partial base did
+    // A full scan reads the v10 checkpoint, so NoParquetReadsHandler panics: the Partial base did
     // NOT take the rooted (checkpoint-skipping) path.
-    let no_parquet = NoParquetReadsEngine {
-        inner: engine.clone(),
-    };
+    let no_parquet = no_parquet_reads_engine(engine.clone());
     assert!(
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             fresh
@@ -3020,7 +2987,7 @@ async fn setup_stale_crc_txn_table<E: TaskExecutor>(
 }
 
 // Every app_id resolves against a stale Complete CRC by scanning only the commit tail. The
-// NoParquetReadsEngine panics if the v10 checkpoint is read, proving the checkpoint is skipped.
+// NoParquetReadsHandler panics if the v10 checkpoint is read, proving the checkpoint is skipped.
 #[rstest]
 #[case::base_stands("app_before", Some(5))]
 #[case::tail_supersedes_base("app_updated", Some(16))]
@@ -3041,9 +3008,7 @@ async fn test_txn_query_rooted_in_stale_complete_crc(
         "the stale CRC must not sit at the snapshot version"
     );
 
-    let engine = NoParquetReadsEngine {
-        inner: engine.clone(),
-    };
+    let engine = no_parquet_reads_engine(engine.clone());
     assert_eq!(
         fresh.reader().get_app_id_version(app_id, &engine)?,
         expected
@@ -3078,11 +3043,9 @@ async fn test_txn_query_stale_partial_crc_falls_through_to_full_scan() -> delta_
         Some(16)
     );
 
-    // A full scan reads the v10 checkpoint, so NoParquetReadsEngine panics: the Partial base did
+    // A full scan reads the v10 checkpoint, so NoParquetReadsHandler panics: the Partial base did
     // NOT take the rooted (checkpoint-skipping) path.
-    let no_parquet = NoParquetReadsEngine {
-        inner: engine.clone(),
-    };
+    let no_parquet = no_parquet_reads_engine(engine.clone());
     assert!(
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             fresh

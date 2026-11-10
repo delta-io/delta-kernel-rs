@@ -380,10 +380,10 @@ impl PartitionValuesOptions {
     /// `timestamp_timezone` when no compatible `add.partitionValues_parsed` exists.
     /// The provided timezone must match the timezone used to write those offset-less values.
     ///
-    /// `timestamp_timezone` must be an IANA timezone identifier recognized by Kernel or a
-    /// normalized fixed offset in `+HH:MM` or `-HH:MM` form. An explicit offset in a partition
-    /// value takes precedence. This option applies to partition pruning in full and incremental
-    /// scans and to returned parsed partition values in full scans. It does not affect
+    /// `timestamp_timezone` must be an IANA timezone identifier recognized by Kernel, a normalized
+    /// fixed offset in `+HH:MM[:SS]` or `-HH:MM[:SS]` form, or `Z` for UTC. An explicit offset in a
+    /// partition value takes precedence. This option applies to partition pruning in full and
+    /// incremental scans and to returned parsed partition values in full scans. It does not affect
     /// `TIMESTAMP_NTZ`.
     ///
     /// For example, if a `TIMESTAMP` partition column `ts` has
