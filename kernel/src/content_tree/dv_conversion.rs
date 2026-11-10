@@ -5,13 +5,14 @@ use crate::amt_path_util::{
     parse_absolute_amt_location, raw_amt_location_from_uri, reject_dot_segments,
     validate_table_relative,
 };
+use crate::content_tree::conditions::{Check, diagnostic};
 use crate::content_tree::{
-    DV_INFO, DV_INFO_CARDINALITY, DV_INFO_COLUMNS, DV_INFO_OFFSET, DV_INFO_SIZE_IN_BYTES,
-    DeletionVectorInfo, KEY_METADATA, LOCATION,
+    DV_INFO, DV_INFO_CARDINALITY, DV_INFO_OFFSET, DV_INFO_SIZE_IN_BYTES, DeletionVectorInfo,
+    KEY_METADATA, LOCATION,
 };
 use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
 use crate::expressions::{
-    ArrayData, Expression, Predicate, Scalar, UnaryExpressionOp, lit, null_lit,
+    ArrayData, Expression, Predicate, Scalar, UnaryExpressionOp, col, lit, null_lit,
 };
 use crate::schema::{ArrayType, ColumnName, DataType, SchemaRef, column_name, lazy_schema_ref};
 use crate::uri_reference::has_uri_safe_prefix;
@@ -74,10 +75,10 @@ pub(crate) fn extract_deletion_vector_content(
 /// Builds `Add.deletionVector` (schema [`DeletionVectorDescriptor::to_schema`]) from a content
 /// entry's `deletionVector` column: the inverse of [`extract_deletion_vector_content`].
 ///
-/// The descriptor is null where the entry has no deletion vector, and is otherwise built from the
-/// entry validated by [`check_deletion_vector`]. A relative location becomes a
-/// `PersistedUnencodedRelative` (`'r'`) descriptor; an absolute one becomes `PersistedAbsolute`
-/// (`'p'`) with its path percent-encoded.
+/// The descriptor is null where the entry has no deletion vector, and is otherwise built from an
+/// entry that passed the [`deletion_vector_checks`] and [`check_absolute_location`]. A relative
+/// location becomes a `PersistedUnencodedRelative` (`'r'`) descriptor; an absolute one becomes
+/// `PersistedAbsolute` (`'p'`) with its path percent-encoded.
 pub(crate) fn add_deletion_vector_expression() -> Expression {
     let dv = || Expression::column([DV_INFO]);
     let dv_field = |field: &str| Expression::column([DV_INFO, field]);
@@ -127,80 +128,112 @@ pub(crate) fn add_deletion_vector_expression() -> Expression {
     )
 }
 
-/// Validates an entry's AMT `deletionVector` struct, read from `getters` in [`DV_INFO_COLUMNS`]
-/// order, so [`add_deletion_vector_expression`] can build its descriptor.
-pub(crate) fn check_deletion_vector<'a>(
-    row: usize,
-    getters: &[&'a dyn GetData<'a>],
-) -> KernelResult<()> {
-    let expected = DV_INFO_COLUMNS.as_ref().0.len();
-    if getters.len() != expected {
-        return Err(KernelError::internal_error(format!(
-            "Expected {expected} AMT deletion vector getters, got {}",
-            getters.len()
-        )));
-    }
-    // `location` is a required field of the struct, so it reads null iff the whole
-    // `deletionVector` struct is null.
-    let Some(location) = getters[0].get_opt(row, LOCATION)? else {
-        return Ok(());
-    };
-    let key_metadata: Option<&[u8]> = getters[4].get_opt(row, KEY_METADATA)?;
-    check_deletion_vector_parts(
-        location,
-        getters[1].get(row, DV_INFO_OFFSET)?,
-        getters[2].get(row, DV_INFO_SIZE_IN_BYTES)?,
-        getters[3].get(row, DV_INFO_CARDINALITY)?,
-        key_metadata.is_some(),
-    )
+/// What an entry's AMT `deletionVector` must satisfy for [`add_deletion_vector_expression`] to
+/// build its descriptor: no encryption, an offset and Delta size that fit the descriptor's
+/// non-negative i32 fields, a non-negative cardinality, and a location that is absolute or
+/// table-relative and has no `.` or `..` segment. An entry without one passes.
+///
+/// An absolute location must also pass [`check_absolute_location`], which no expression can
+/// express.
+pub(crate) fn deletion_vector_checks() -> Vec<Check> {
+    let field = |name: &str| ColumnName::new([DV_INFO, name]);
+    let value = |name: &str| Expression::column([DV_INFO, name]);
+    let location = || value(LOCATION);
+    // An entry without a deletion vector passes every check. Engines need not null out the leaves
+    // of a null struct, so each check tests the struct itself.
+    let absent_or =
+        |predicate: Predicate| Predicate::or(Predicate::is_null(col!(DV_INFO)), predicate);
+    let i32_max = || lit(i64::from(i32::MAX));
+    vec![
+        Check::new(
+            "EncryptedDeletionVector",
+            absent_or(Predicate::is_null(value(KEY_METADATA))),
+            vec![field(LOCATION)],
+            |values| {
+                KernelError::unsupported(format!(
+                    "Encrypted deletion vectors are not supported (deletion vector '{}' has \
+                     keyMetadata)",
+                    diagnostic(values, 0)
+                ))
+            },
+        ),
+        Check::new(
+            "DeletionVectorOffsetRange",
+            absent_or(Predicate::and(
+                value(DV_INFO_OFFSET).ge(lit(0i64)),
+                value(DV_INFO_OFFSET).le(i32_max()),
+            )),
+            vec![field(LOCATION), field(DV_INFO_OFFSET)],
+            |values| invalid_deletion_vector(values, "offset", "is not a non-negative i32"),
+        ),
+        // The descriptor stores the Delta size, `sizeInBytes - 8`, as an i32.
+        Check::new(
+            "DeletionVectorSizeRange",
+            absent_or(Predicate::and(
+                value(DV_INFO_SIZE_IN_BYTES).ge(lit(8i64)),
+                value(DV_INFO_SIZE_IN_BYTES).le(lit(i64::from(i32::MAX) + 8)),
+            )),
+            vec![field(LOCATION), field(DV_INFO_SIZE_IN_BYTES)],
+            |values| {
+                invalid_deletion_vector(values, "sizeInBytes", "is not a valid Iceberg blob size")
+            },
+        ),
+        Check::new(
+            "NegativeDeletionVectorCardinality",
+            absent_or(value(DV_INFO_CARDINALITY).ge(lit(0i64))),
+            vec![field(LOCATION), field(DV_INFO_CARDINALITY)],
+            |values| invalid_deletion_vector(values, "cardinality", "is negative"),
+        ),
+        Check::new(
+            "DeletionVectorNotTableRelative",
+            absent_or(Predicate::or(
+                Predicate::has_uri_scheme(location()),
+                Predicate::and(
+                    location().ne(lit("")),
+                    Predicate::not(Predicate::starts_with(location(), lit("/"))),
+                ),
+            )),
+            vec![field(LOCATION)],
+            |values| rule_error(validate_table_relative(diagnostic(values, 0))),
+        ),
+        Check::new(
+            "DeletionVectorDotSegment",
+            absent_or(Predicate::not(Predicate::has_dot_segment(location()))),
+            vec![field(LOCATION)],
+            |values| rule_error(reject_dot_segments(diagnostic(values, 0))),
+        ),
+    ]
 }
 
-/// [`check_deletion_vector`] over a deletion vector's [`DeletionVectorInfo`] fields.
-fn check_deletion_vector_parts(
-    location: &str,
-    offset: i64,
-    size_in_bytes: i64,
-    cardinality: i64,
-    has_key_metadata: bool,
-) -> KernelResult<()> {
-    if has_key_metadata {
-        return Err(KernelError::unsupported(format!(
-            "Encrypted deletion vectors are not supported (deletion vector '{location}' has \
-             keyMetadata)"
-        )));
-    }
-    let invalid = |message: String| {
-        KernelError::DeletionVector(format!("Deletion vector '{location}' {message}"))
-    };
-    // The expression casts these into the descriptor's i32 fields, so they must fit.
-    if i32::try_from(offset).is_err() || offset < 0 {
-        return Err(invalid(format!(
-            "offset {offset} is not a non-negative i32"
-        )));
-    }
-    let delta_size = size_in_bytes.checked_sub(8);
-    if delta_size.is_none_or(|size| size < 0 || i32::try_from(size).is_err()) {
-        return Err(invalid(format!(
-            "sizeInBytes {size_in_bytes} is not a valid Iceberg blob size"
-        )));
-    }
-    if cardinality < 0 {
-        return Err(invalid(format!("cardinality {cardinality} is negative")));
-    }
+/// Checks an AMT deletion vector `location` that has a URI scheme: it must parse, and its
+/// `scheme:[//authority]` prefix, which the descriptor keeps as written, must already be valid URI
+/// syntax. `Url` would otherwise re-encode or strip characters there, or end the authority early at
+/// a `?` or `#`. A relative location passes.
+pub(crate) fn check_absolute_location(location: &str) -> KernelResult<()> {
     match parse_absolute_amt_location(location)? {
-        // Parsing rejects dot segments and checks that the `'p'` path the expression emits
-        // resolves. The expression keeps the `scheme:[//authority]` prefix as written, so it must
-        // already be valid URI syntax: `Url` would otherwise re-encode or strip characters there,
-        // or end the authority early at a `?` or `#`.
-        Some(_) if !has_uri_safe_prefix(location) => Err(invalid(
-            "has a URI scheme or authority with characters a URI does not allow there".to_string(),
-        )),
-        Some(_) => Ok(()),
-        None => {
-            validate_table_relative(location)?;
-            reject_dot_segments(location)
-        }
+        Some(_) if !has_uri_safe_prefix(location) => Err(KernelError::DeletionVector(format!(
+            "Deletion vector '{location}' has a URI scheme or authority with characters a URI \
+             does not allow there"
+        ))),
+        _ => Ok(()),
     }
+}
+
+/// The error for a deletion vector, whose location and `field` value are `values`, whose `field`
+/// fails `rule`.
+fn invalid_deletion_vector(values: &[Option<&str>], field: &str, rule: &str) -> KernelError {
+    KernelError::DeletionVector(format!(
+        "Deletion vector '{}' {field} {} {rule}",
+        diagnostic(values, 0),
+        diagnostic(values, 1)
+    ))
+}
+
+/// The error a failed condition reports from `check`, the Rust rule it mirrors.
+fn rule_error(check: KernelResult<()>) -> KernelError {
+    check.err().unwrap_or_else(|| {
+        KernelError::internal_error("AMT deletion vector condition failed but its rule passes")
+    })
 }
 
 /// Intermediate flat decoded-DV columns: path resolved (base85-decoded for relative DVs, verbatim
@@ -384,6 +417,7 @@ mod tests {
     use crate::Engine;
     use crate::actions::deletion_vector::{DeletionVectorDescriptor, DeletionVectorStorageType};
     use crate::arrow::array::{AsArray as _, RecordBatch, StructArray};
+    use crate::content_tree::conditions::ConditionChecker;
     use crate::content_tree::test_utils::test_dv_info;
     use crate::engine::arrow_data::ArrowEngineData;
     use crate::engine::sync::SyncEngine;
@@ -820,13 +854,6 @@ mod tests {
     /// [`add_deletion_vector_expression`] over a batch of the entry's `deletionVector` column. A
     /// trailing DV-less row checks that the descriptor (and so each of its leaves) is null there.
     fn descriptor_from_info(info: &DeletionVectorInfo) -> KernelResult<DeletionVectorDescriptor> {
-        check_deletion_vector_parts(
-            &info.location,
-            info.offset,
-            info.size_in_bytes,
-            info.cardinality,
-            info.key_metadata.is_some(),
-        )?;
         let entry_schema = schema_ref! { nullable DV_INFO: (DeletionVectorInfo::to_schema()) };
         let engine = SyncEngine::new();
         let handler = engine.evaluation_handler();
@@ -840,6 +867,13 @@ mod tests {
             both.schema(),
             vec![Arc::new(null_second)],
         )?);
+        ConditionChecker::try_new(
+            handler.as_ref(),
+            entry_schema.clone(),
+            deletion_vector_checks(),
+        )?
+        .check(&entries)?;
+        check_absolute_location(&info.location)?;
         // Wrapped in a `dv` field, since a top-level struct cannot be null.
         let output_type = schema! { nullable "dv": (DeletionVectorDescriptor::to_schema()) };
         let output = handler
