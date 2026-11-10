@@ -21,7 +21,7 @@ use url::Url;
 use crate::actions::{ADD_NAME, ADD_SCHEMA, CheckpointAction, LOG_ADD_SCHEMA};
 use crate::amt_path_util::amt_manifest_filemeta;
 use crate::cancellation::CancellationTokenRef;
-use crate::content_tree::conditions::{AssertCondition, Check, ConditionChecker, diagnostic};
+use crate::content_tree::conditions::{Check, ConditionChecker, diagnostic, diagnostic_i32};
 use crate::content_tree::dv_conversion::{add_deletion_vector_expression, check_deletion_vector};
 use crate::content_tree::mumbling::MumblingBitmap;
 use crate::content_tree::{
@@ -284,7 +284,7 @@ struct ManifestKind {
     base_row_id: Expression,
     /// Columns the caller of [`EntryTransform::convert`] supplies for `base_row_id`.
     helpers: SchemaRef,
-    /// What every entry must satisfy, checked by [`EntryTransform::annotate`].
+    /// Conditions every entry of this kind must satisfy.
     checks: Vec<Check>,
 }
 
@@ -565,16 +565,20 @@ impl LeafReadContext {
     /// checks are skipped.
     ///
     /// # Errors
-    /// Returns an error if an entry fails the [`leaf_entry_checks`], if its `firstRowId` cannot be
-    /// assigned (see [`LeafEntryVisitor`]), or any error from [`EntryTransform::convert`].
+    /// Returns an error if an entry's `_row_index` is not its position in the leaf, if an entry
+    /// fails the [`leaf_entry_checks`], if its `firstRowId` cannot be assigned (see
+    /// [`LeafEntryVisitor`]), or any error from [`EntryTransform::convert`].
     fn convert_leaf_entries_to_add_actions(
         &mut self,
         transform: &EntryTransform,
         entries: &dyn EngineData,
     ) -> KernelResult<Box<dyn EngineData>> {
+        // Removal reads `_row_index` as each entry's position, so check that before any condition
+        // trusts `_removed`.
+        check_row_positions(entries, self.entry_count)?;
         let annotated = transform.annotate(self.marker.as_ref(), entries)?;
         let (first_row_ids, next_first_row_id) =
-            assign_first_row_ids(annotated.as_ref(), self.next_first_row_id, self.entry_count)?;
+            assign_first_row_ids(annotated.as_ref(), self.next_first_row_id)?;
         let adds = transform.convert(annotated.as_ref(), vec![first_row_ids])?;
         // Only update `self` once the whole batch succeeds, so a failed batch leaves
         // `next_first_row_id` and `entry_count` unchanged.
@@ -820,25 +824,27 @@ fn live_status_predicate() -> Predicate {
 }
 
 /// What every leaf entry must satisfy: it is a `Data` entry, and a live entry that is not `Added`
-/// has the `sequenceNumber` it would otherwise inherit and, unless removed, a `firstRowId`.
+/// (so cannot inherit tracking fields) has a `sequenceNumber` and, if it becomes an `Add`, a
+/// `firstRowId`.
 fn leaf_entry_checks() -> Vec<Check> {
-    let column = |path: &[&str]| Expression::column(path.iter().copied());
-    // Only `Added` entries inherit tracking fields, so the others must carry their own.
-    let inherits_or_not_live = || {
-        let added = Predicate::eq(
-            column(&[TRACKING, TRACKING_STATUS]),
+    let added = || {
+        Predicate::eq(
+            Expression::column([TRACKING, TRACKING_STATUS]),
             lit(TrackingStatus::Added),
-        );
-        Predicate::or(added, Predicate::not(live_status_predicate()))
+        )
     };
+    let location = || ColumnName::new([LOCATION]);
     vec![
-        Check {
-            condition: AssertCondition {
-                id: "LeafNonDataEntry",
-                predicate: Predicate::eq(column(&[CONTENT_TYPE]), lit(DataContentType::Data)),
-                diagnostic_cols: vec![ColumnName::new([LOCATION]), ColumnName::new([CONTENT_TYPE])],
-            },
-            error: |values| match enum_from_diagnostic(values, 1, DataContentType::try_from_repr) {
+        Check::new(
+            "LeafNonDataEntry",
+            Predicate::eq(
+                Expression::column([CONTENT_TYPE]),
+                lit(DataContentType::Data),
+            ),
+            vec![location(), ColumnName::new([CONTENT_TYPE])],
+            |values| match diagnostic_i32(values, 1, CONTENT_TYPE)
+                .and_then(DataContentType::try_from_repr)
+            {
                 Ok(content_type) => KernelError::generic(format!(
                     "AMT leaf manifest entry '{}' has content type {content_type:?}; leaf \
                          manifests may only contain Data entries",
@@ -846,60 +852,51 @@ fn leaf_entry_checks() -> Vec<Check> {
                 )),
                 Err(e) => e,
             },
-        },
-        Check {
-            condition: AssertCondition {
-                id: "LeafLiveNonAddedMissingSequenceNumber",
-                predicate: Predicate::or(
-                    inherits_or_not_live(),
-                    Predicate::is_not_null(column(&[TRACKING, SEQUENCE_NUMBER])),
-                ),
-                diagnostic_cols: vec![],
-            },
-            error: |_| {
-                KernelError::missing_data(format!(
-                    "AMT content-tree live non-Added leaf entry has a null '{SEQUENCE_NUMBER}'"
-                ))
-            },
-        },
-        // A missing `firstRowId` only matters for the `Add` the entry becomes, which a removed
-        // entry never does.
-        Check {
-            condition: AssertCondition {
-                id: "LeafLiveNonAddedMissingFirstRowId",
-                predicate: Predicate::or_from([
-                    inherits_or_not_live(),
-                    Predicate::from_expr(column(&[REMOVED_COLUMN])),
-                    Predicate::is_not_null(column(&[TRACKING, FIRST_ROW_ID])),
-                ]),
-                diagnostic_cols: vec![],
-            },
-            error: |_| {
-                KernelError::missing_data(format!(
-                    "AMT content-tree live non-Added leaf entry has a null '{FIRST_ROW_ID}'"
-                ))
-            },
-        },
+        ),
+        Check::new(
+            "LeafLiveNonAddedMissingSequenceNumber",
+            Predicate::or_from([
+                added(),
+                Predicate::not(live_status_predicate()),
+                Predicate::is_not_null(Expression::column([TRACKING, SEQUENCE_NUMBER])),
+            ]),
+            vec![location()],
+            |values| missing_tracking_field(SEQUENCE_NUMBER, values),
+        ),
+        Check::new(
+            "LeafLiveNonAddedMissingFirstRowId",
+            Predicate::or_from([
+                added(),
+                Predicate::not(Predicate::from_expr(Expression::column([SELECTED_COLUMN]))),
+                Predicate::is_not_null(Expression::column([TRACKING, FIRST_ROW_ID])),
+            ]),
+            vec![location()],
+            |values| missing_tracking_field(FIRST_ROW_ID, values),
+        ),
     ]
 }
 
-/// Parses the INTEGER diagnostic at `index` back into an enum with `try_from_repr`, which errors
-/// on an unknown value.
-fn enum_from_diagnostic<T>(
-    values: &[Option<&str>],
-    index: usize,
-    try_from_repr: fn(i32) -> KernelResult<T>,
-) -> KernelResult<T> {
-    let value = diagnostic(values, index);
-    let repr = value.parse().map_err(|_| {
-        KernelError::internal_error(format!("Expected an integer diagnostic, got '{value}'"))
-    })?;
-    try_from_repr(repr)
+/// The error for a live non-`Added` leaf entry, whose location is the first of `values`, that has
+/// a null tracking `field`.
+fn missing_tracking_field(field: &str, values: &[Option<&str>]) -> KernelError {
+    KernelError::missing_data(format!(
+        "AMT content-tree live non-Added leaf entry has a null '{field}' (entry '{}')",
+        diagnostic(values, 0)
+    ))
+}
+
+/// Checks that each leaf entry's `_row_index` is its position in the leaf, where the batch's first
+/// entry is entry `first_position`.
+///
+/// # Errors
+/// Returns an internal error naming the first entry out of position: a reader that numbers rows
+/// differently would otherwise remove the wrong entries.
+fn check_row_positions(entries: &dyn EngineData, first_position: usize) -> KernelResult<()> {
+    RowPositionVisitor { first_position }.visit_rows_of(entries)
 }
 
 /// Resolves each leaf entry's `firstRowId`, starting from `seed`. Returns the per-row values and
-/// the next unassigned row ID. `first_position` is the number of the leaf's
-/// entries in earlier batches, the `_row_index` the batch's first entry must have.
+/// the next unassigned row ID.
 ///
 /// An entry with a `firstRowId` keeps it. An `Added` entry without one gets the next unassigned
 /// ID, which then advances by the entry's `recordCount`. Removed entries (see [`REMOVED_COLUMN`])
@@ -908,12 +905,8 @@ fn enum_from_diagnostic<T>(
 ///
 /// # Errors
 /// See [`LeafEntryVisitor`].
-fn assign_first_row_ids(
-    entries: &dyn EngineData,
-    seed: i64,
-    first_position: usize,
-) -> KernelResult<(ArrayData, i64)> {
-    let mut visitor = LeafEntryVisitor::new(seed, first_position);
+fn assign_first_row_ids(entries: &dyn EngineData, seed: i64) -> KernelResult<(ArrayData, i64)> {
+    let mut visitor = LeafEntryVisitor::new(seed);
     visitor.visit_rows_of(entries)?;
     let first_row_ids =
         ArrayData::try_new(ArrayType::new(DataType::LONG, true), visitor.first_row_ids)?;
@@ -1157,25 +1150,58 @@ impl RowVisitor for ColumnFileCounter {
     }
 }
 
+/// Visitor behind [`check_row_positions`].
+struct RowPositionVisitor {
+    /// The position of the batch's first entry.
+    first_position: usize,
+}
+
+impl RowVisitor for RowPositionVisitor {
+    fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
+        static NAMES_AND_TYPES: LazyLock<ColumnNamesAndTypes> = LazyLock::new(|| {
+            (
+                vec![
+                    ColumnName::new([LEAF_ROW_INDEX_COLUMN]),
+                    ColumnName::new([LOCATION]),
+                ],
+                vec![DataType::LONG, DataType::STRING],
+            )
+                .into()
+        });
+        NAMES_AND_TYPES.as_ref()
+    }
+
+    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> KernelResult<()> {
+        for row in 0..row_count {
+            let row_index: i64 = getters[0].get(row, LEAF_ROW_INDEX_COLUMN)?;
+            let position = self.first_position + row;
+            if usize::try_from(row_index).ok() != Some(position) {
+                let location: &str = getters[1].get(row, LOCATION)?;
+                return Err(KernelError::internal_error(format!(
+                    "AMT leaf manifest entry '{location}' has {LEAF_ROW_INDEX_COLUMN} {row_index}, \
+                     but it is entry {position} of its leaf"
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Visitor behind [`assign_first_row_ids`].
 ///
-/// Errors if an entry's `_row_index` is not its position in the leaf, if its status is unknown,
-/// if an entry needing a `firstRowId` has a negative `recordCount`, or if assignment overflows
-/// `i64`.
+/// Errors if an entry's status is unknown, if an entry needing a `firstRowId` has a negative
+/// `recordCount`, or if assignment overflows `i64`.
 struct LeafEntryVisitor {
     /// Next unassigned `firstRowId`.
     next_first_row_id: i64,
-    /// The `_row_index` of the batch's first entry.
-    first_position: usize,
     /// Resolved `firstRowId` per row, in entry order.
     first_row_ids: Vec<Scalar>,
 }
 
 impl LeafEntryVisitor {
-    fn new(next_first_row_id: i64, first_position: usize) -> Self {
+    fn new(next_first_row_id: i64) -> Self {
         Self {
             next_first_row_id,
-            first_position,
             first_row_ids: Vec::new(),
         }
     }
@@ -1189,16 +1215,8 @@ impl RowVisitor for LeafEntryVisitor {
                     ColumnName::new([RECORD_COUNT]),
                     ColumnName::new([TRACKING, FIRST_ROW_ID]),
                     ColumnName::new([TRACKING, TRACKING_STATUS]),
-                    ColumnName::new([LOCATION]),
-                    ColumnName::new([LEAF_ROW_INDEX_COLUMN]),
                 ],
-                vec![
-                    DataType::LONG,
-                    DataType::LONG,
-                    DataType::INTEGER,
-                    DataType::STRING,
-                    DataType::LONG,
-                ],
+                vec![DataType::LONG, DataType::LONG, DataType::INTEGER],
             )
                 .into()
         });
@@ -1208,18 +1226,6 @@ impl RowVisitor for LeafEntryVisitor {
     fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> KernelResult<()> {
         self.first_row_ids.reserve(row_count);
         for row in 0..row_count {
-            // Removal and the deletion vector's end check both assume an entry's `_row_index` is
-            // its position in the leaf, so a reader that numbers rows differently fails
-            // here instead of removing the wrong entries.
-            let row_index: i64 = getters[4].get(row, LEAF_ROW_INDEX_COLUMN)?;
-            let position = self.first_position + row;
-            if usize::try_from(row_index).ok() != Some(position) {
-                let location: &str = getters[3].get(row, LOCATION)?;
-                return Err(KernelError::internal_error(format!(
-                    "AMT leaf manifest entry '{location}' has {LEAF_ROW_INDEX_COLUMN} {row_index}, \
-                     but it is entry {position} of its leaf"
-                )));
-            }
             let status = TrackingStatus::try_from_repr(getters[2].get(row, TRACKING_STATUS)?)?;
             let assigned = match getters[1].get_opt(row, FIRST_ROW_ID)? {
                 // An already-materialized `firstRowId` is kept and does not consume row IDs.
@@ -1362,12 +1368,18 @@ mod tests {
         entries: &[ContentTreeNodeEntry],
         row_indexes: impl IntoIterator<Item = Scalar>,
     ) -> Box<dyn EngineData> {
+        with_row_indexes(entry_batch(engine, entries), row_indexes)
+    }
+
+    /// `batch` plus a [`LEAF_ROW_INDEX_COLUMN`] holding `row_indexes`.
+    fn with_row_indexes(
+        batch: Box<dyn EngineData>,
+        row_indexes: impl IntoIterator<Item = Scalar>,
+    ) -> Box<dyn EngineData> {
         let column =
             ArrayData::try_new(ArrayType::new(DataType::LONG, false), row_indexes).unwrap();
         let schema = schema_ref! { not_null LEAF_ROW_INDEX_COLUMN: LONG };
-        entry_batch(engine, entries)
-            .append_columns(schema, vec![column])
-            .unwrap()
+        batch.append_columns(schema, vec![column]).unwrap()
     }
 
     /// Builds a root converter and runs it over a single batch.
@@ -2871,26 +2883,37 @@ mod tests {
     #[case::gap(&[0, 2])]
     #[case::repeated(&[0, 0])]
     fn leaf_entry_row_index_must_be_its_position(#[case] row_indexes: &[i64]) {
+        // The manifest DV removes entry 1, which may then lack a `firstRowId`, so a misnumbered
+        // entry must fail on its position before the conditions read `_removed`.
         let engine = SyncEngine::new();
-        let mut ctx = leaf_ctx(&engine, None);
+        let manifest_dv = ManifestDv::try_new(&mumbling_bitmap(&[1])).unwrap();
+        let mut ctx = leaf_ctx(&engine, manifest_dv);
         let entries = [
             leaf_entry("a.parquet", 1, 10, None, None, None),
-            leaf_entry("b.parquet", 1, 20, None, None, None),
+            with_status(
+                leaf_entry("b.parquet", 1, 20, Some(3), Some(4), None),
+                TrackingStatus::Existing,
+            ),
         ];
         let batch = leaf_batch_with_row_indexes(
             &engine,
             &entries,
             row_indexes.iter().copied().map(Scalar::Long),
         );
-        assert_result_error_with_message(
-            ctx.convert_leaf_entries_to_add_actions(batch.as_ref()),
-            "but it is entry",
+        let err = ctx
+            .convert_leaf_entries_to_add_actions(batch.as_ref())
+            .err()
+            .unwrap();
+        assert!(
+            matches!(&err, KernelError::InternalError(m) if m.contains("but it is entry")),
+            "{err}"
         );
     }
 
     #[rstest]
     #[case::null_first_row_id(None, Some(9), FIRST_ROW_ID)]
     #[case::null_sequence(Some(500), None, SEQUENCE_NUMBER)]
+    #[case::both_null(None, None, SEQUENCE_NUMBER)]
     fn leaf_live_non_added_entry_with_null_inherited_field_errors(
         #[case] first_row_id: Option<i64>,
         #[case] sequence_number: Option<i64>,
@@ -2904,9 +2927,15 @@ mod tests {
             status,
         );
         let mut ctx = leaf_ctx(&engine, None);
-        let result =
-            ctx.convert_leaf_entries_to_add_actions(leaf_batch(&engine, &[entry], 0).as_ref());
-        assert_result_error_with_message(result, expected_field);
+        let err = ctx
+            .convert_leaf_entries_to_add_actions(leaf_batch(&engine, &[entry], 0).as_ref())
+            .err()
+            .unwrap();
+        let expected = format!("has a null '{expected_field}' (entry 'e.parquet')");
+        assert!(
+            matches!(&err, KernelError::MissingData(m) if m.contains(&expected)),
+            "{err}"
+        );
     }
 
     #[rstest]
@@ -2954,34 +2983,52 @@ mod tests {
     }
 
     #[rstest]
-    #[case::data_manifest(DataContentType::DataManifest)]
-    #[case::delete_manifest(DataContentType::DeleteManifest)]
-    fn leaf_non_data_entry_errors(#[case] content_type: DataContentType) {
+    #[case::data_manifest(
+        &[CONTENT_TYPE],
+        DataContentType::DataManifest.into(),
+        "has content type DataManifest"
+    )]
+    #[case::delete_manifest(
+        &[CONTENT_TYPE],
+        DataContentType::DeleteManifest.into(),
+        "has content type DeleteManifest"
+    )]
+    #[case::unknown_content_type(
+        &[CONTENT_TYPE],
+        Scalar::Integer(9),
+        "Invalid AMT content type value: 9"
+    )]
+    #[case::unknown_status(
+        &[TRACKING, TRACKING_STATUS],
+        Scalar::Integer(9),
+        "Invalid AMT tracking status value: 9"
+    )]
+    fn leaf_entry_with_bad_enum_value_errors(
+        #[case] path: &[&str],
+        #[case] value: Scalar,
+        #[case] message: &str,
+        #[values(
+            TrackingStatus::Added,
+            TrackingStatus::Existing,
+            TrackingStatus::Deleted
+        )]
+        status: TrackingStatus,
+    ) {
         let engine = SyncEngine::new();
-        let mut entry = leaf_entry("f.parquet", 10, 5, None, None, None);
-        entry.content_type = content_type;
+        let entry = with_status(
+            leaf_entry("f.parquet", 10, 5, None, Some(1), Some(1)),
+            status,
+        );
+        let entry = with_field(&entry.into(), path, value);
+        let batch = with_row_indexes(struct_batch(&engine, &[entry]), [Scalar::Long(0)]);
         let mut ctx = leaf_ctx(&engine, None);
-        let result =
-            ctx.convert_leaf_entries_to_add_actions(leaf_batch(&engine, &[entry], 0).as_ref());
-        assert_result_error_with_message(result, &format!("content type {content_type:?}"));
-    }
-
-    #[test]
-    fn leaf_unknown_content_type_errors() {
-        let engine = SyncEngine::new();
-        let entry: StructData = leaf_entry("f.parquet", 10, 5, None, None, None).into();
-        let entry = with_field(&entry, &[CONTENT_TYPE], Scalar::Integer(9));
-        let row_index = ArrayData::try_new(ArrayType::new(DataType::LONG, false), [0i64]).unwrap();
-        let batch = struct_batch(&engine, &[entry])
-            .append_columns(
-                schema_ref! { not_null LEAF_ROW_INDEX_COLUMN: LONG },
-                vec![row_index],
-            )
+        let err = ctx
+            .convert_leaf_entries_to_add_actions(batch.as_ref())
+            .err()
             .unwrap();
-        let mut ctx = leaf_ctx(&engine, None);
-        assert_result_error_with_message(
-            ctx.convert_leaf_entries_to_add_actions(batch.as_ref()),
-            "Invalid AMT content type value: 9",
+        assert!(
+            matches!(&err, KernelError::Generic(m) if m.contains(message)),
+            "{err}"
         );
     }
 
