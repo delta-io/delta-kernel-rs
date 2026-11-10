@@ -19,7 +19,7 @@ use bytes::Bytes;
 use url::Url;
 
 use crate::actions::{ADD_NAME, ADD_SCHEMA, CheckpointAction, LOG_ADD_SCHEMA};
-use crate::amt_path_util::amt_manifest_filemeta;
+use crate::amt_path_util::{add_path_expression, amt_manifest_filemeta};
 use crate::cancellation::CancellationTokenRef;
 use crate::content_tree::conditions::{Check, ConditionChecker, diagnostic, diagnostic_i32};
 use crate::content_tree::dv_conversion::{
@@ -1121,11 +1121,7 @@ fn build_entry_to_add_expression(
     // from the entry.
     let add = struct_expr_from_schema(&ADD_SCHEMA, |name| {
         Some(match name {
-            // TODO(#3319): `location` is the raw path stored in the AMT root; resolving it to a
-            // table-relative `Add.path` (percent-decoding, and relativizing against a manifest
-            // location for non-root entries) is not yet done -- it flows through verbatim, which
-            // round-trips only the minimal-root case that stored the raw path.
-            n if n == PATH_NAME => Expression::column([LOCATION]),
+            n if n == PATH_NAME => add_path_expression(Expression::column([LOCATION])),
             // TODO(#3320): read partition values from the entry's `partition` tuple once the read
             // path carries a partition spec.
             n if n == PARTITION_VALUES_NAME => empty_partition_values.clone(),
@@ -1414,8 +1410,8 @@ mod tests {
     use crate::arrow::datatypes::Int64Type;
     use crate::content_tree::dv_conversion::extract_deletion_vector_content;
     use crate::content_tree::test_utils::{
-        added_data_entry, data_manifest_entry, entry_batch, mumbling_bitmap, struct_batch,
-        test_dv_info, with_field, write_manifest,
+        action_paths, added_data_entry, data_manifest_entry, entry_batch, mumbling_bitmap,
+        struct_batch, test_dv_info, with_field, write_manifest,
     };
     use crate::content_tree::{DeletionVectorInfo, ManifestInfo};
     use crate::engine::arrow_conversion::TryFromArrow as _;
@@ -2493,6 +2489,40 @@ mod tests {
             read_tree(&engine, &checkpoint),
             "references leaf manifest 'memory:///table/metadata/leaf.parquet' more than once",
         );
+    }
+
+    /// Root and leaf entry locations are encoded into `add.path`; a deleted entry's location is
+    /// neither encoded nor validated, since it does not become an `Add`.
+    #[test]
+    fn read_add_actions_from_amt_encodes_root_and_leaf_paths() {
+        let engine = memory_engine();
+        let leaf = write_leaf(
+            &engine,
+            "metadata/leaf.parquet",
+            &[leaf_entry("c d.parquet", 100, 10, None, None, None)],
+            5,
+            100,
+        );
+        let deleted = with_status(
+            added_data_entry("../gone x.parquet", 1, 1, 0, 0),
+            TrackingStatus::Deleted,
+        );
+        let checkpoint = write_root(
+            &engine,
+            &[
+                added_data_entry("a b.parquet", 100, 10, 0, 5),
+                deleted,
+                leaf,
+            ],
+        );
+
+        let paths: Vec<_> = read_tree(&engine, &checkpoint)
+            .unwrap()
+            .iter()
+            .flat_map(|batch| action_paths(batch, ADD_NAME))
+            .collect();
+
+        assert_eq!(paths, ["a%20b.parquet", "c%20d.parquet"]);
     }
 
     #[test]

@@ -5,6 +5,7 @@
 
 use url::Url;
 
+use crate::expressions::{Expression, UnaryExpressionOp};
 use crate::path_encoding::uri_encode_path;
 use crate::uri_reference::{scheme_len, uri_decode_location, uri_encode_location};
 use crate::utils::{require, to_file_size};
@@ -28,6 +29,14 @@ pub(crate) fn resolve_amt_location(path: &str, table_root: &Url) -> KernelResult
         Some(url) => Ok(url),
         None => encode_and_join(path, table_root),
     }
+}
+
+/// Evaluates a STRING AMT data-file `location` to the `Add.path` it is read through: the path
+/// component percent-encoded as in [`resolve_amt_location`], a scheme and authority kept as
+/// written, and a relative location kept relative. Joining the value onto the table root gives
+/// the [`Url`] [`resolve_amt_location`] returns.
+pub(crate) fn add_path_expression(location: Expression) -> Expression {
+    Expression::unary(UnaryExpressionOp::UriEncodePath, location)
 }
 
 /// Parses an absolute AMT `path` into a [`Url`] with its path component percent-encoded, as
@@ -176,6 +185,77 @@ mod tests {
     use test_utils::assert_result_error_with_message;
 
     use super::*;
+    use crate::Engine as _;
+    use crate::arrow::array::AsArray as _;
+    use crate::engine::arrow_data::EngineDataArrowExt as _;
+    use crate::engine::sync::SyncEngine;
+    use crate::expressions::{Scalar, col};
+    use crate::schema::{DataType, schema_ref};
+
+    type Resolver = fn(&str, &Url) -> KernelResult<Url>;
+
+    /// Evaluates `expression` over a one-row batch whose `location` column holds `location`.
+    fn evaluate_on_location(location: &str, expression: Expression) -> KernelResult<String> {
+        let handler = SyncEngine::new().evaluation_handler();
+        let schema = schema_ref! { not_null "location": STRING };
+        let batch = handler.create_many(schema.clone(), vec![vec![Scalar::from(location)]])?;
+        let value = handler
+            .new_expression_evaluator(schema, expression.into(), DataType::STRING)?
+            .evaluate(batch.as_ref())?
+            .try_into_record_batch()?;
+        Ok(value.column(0).as_string::<i32>().value(0).to_string())
+    }
+
+    /// `expected_url` is where a scan reads the file: `add.path` joined onto the table root.
+    #[rstest]
+    #[case::plain_relative("data/a.parquet", "data/a.parquet", "memory:///table/data/a.parquet")]
+    #[case::spaced_relative(
+        "data/a b.parquet",
+        "data/a%20b.parquet",
+        "memory:///table/data/a%20b.parquet"
+    )]
+    #[case::percent_relative(
+        "data/a%b.parquet",
+        "data/a%25b.parquet",
+        "memory:///table/data/a%25b.parquet"
+    )]
+    #[case::non_ascii_relative(
+        "data/M\u{fc}nchen.parquet",
+        "data/M%C3%BCnchen.parquet",
+        "memory:///table/data/M%C3%BCnchen.parquet"
+    )]
+    #[case::query_and_fragment_relative(
+        "data/a?b#c.parquet",
+        "data/a%3Fb%23c.parquet",
+        "memory:///table/data/a%3Fb%23c.parquet"
+    )]
+    #[case::plain_absolute(
+        "s3://bucket/t/a.parquet",
+        "s3://bucket/t/a.parquet",
+        "s3://bucket/t/a.parquet"
+    )]
+    #[case::spaced_absolute(
+        "s3://bucket/t/a b.parquet",
+        "s3://bucket/t/a%20b.parquet",
+        "s3://bucket/t/a%20b.parquet"
+    )]
+    #[case::spaced_absolute_without_authority(
+        "file:/tmp/a b.parquet",
+        "file:/tmp/a%20b.parquet",
+        "file:///tmp/a%20b.parquet"
+    )]
+    fn test_add_path_expression(
+        #[case] location: &str,
+        #[case] expected: &str,
+        #[case] expected_url: &str,
+    ) {
+        let path = evaluate_on_location(location, add_path_expression(col!("location"))).unwrap();
+        assert_eq!(path, expected);
+        let table_root = Url::parse("memory:///table/").unwrap();
+        let url = table_root.join(&path).unwrap();
+        assert_eq!(url.as_str(), expected_url);
+        assert_eq!(url, resolve_amt_location(location, &table_root).unwrap());
+    }
 
     #[rstest]
     #[case::relative_path(
