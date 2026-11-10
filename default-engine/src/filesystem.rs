@@ -474,6 +474,31 @@ mod tests {
         assert_eq!(len, 10, "list_from should have returned 10 files");
     }
 
+    #[tokio::test]
+    async fn list_from_rejects_url_without_path_segments() {
+        let store = Arc::new(InMemory::new());
+        // A non-empty listing is needed to reach URL construction.
+        store
+            .put(&Path::from("table/file.json"), "data".into())
+            .await
+            .unwrap();
+
+        // mailto: URLs cannot be modified through path_segments_mut().
+        let directory_url = Url::parse("mailto:table/").unwrap();
+        let error = list_from_impl(store, directory_url)
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(&error, KernelError::InvalidTableLocation(message)
+                if message == "Invalid listing URL: mailto:table/"),
+            "unexpected error: {error:?}"
+        );
+    }
+
     #[rstest::rstest]
     #[case("table", "table")]
     #[case("table%2F", "table%252F")]
