@@ -5,6 +5,9 @@
 
 use url::Url;
 
+use crate::content_tree::LOCATION;
+use crate::content_tree::conditions::{Check, ConditionErrorFn};
+use crate::expressions::{ColumnName, Expression, Predicate, UnaryExpressionOp, lit};
 use crate::path_encoding::uri_encode_path;
 use crate::uri_reference::{scheme_len, uri_decode_location, uri_encode_location};
 use crate::utils::{require, to_file_size};
@@ -147,6 +150,56 @@ fn encode_and_join(path: &str, table_root: &Url) -> KernelResult<Url> {
     })
 }
 
+/// The checks that an AMT location `column` is absolute or table-relative (see
+/// [`validate_table_relative`]) and has no `.` or `..` segment (see [`reject_dot_segments`]):
+/// the condition forms of those rules, reporting their errors. `guard` wraps each predicate, e.g.
+/// to pass rows without a location. `ids` name the two checks.
+pub(crate) fn location_checks(
+    column: ColumnName,
+    guard: impl Fn(Predicate) -> Predicate,
+    ids: [&'static str; 2],
+) -> [Check; 2] {
+    let location = || Expression::column(column.clone());
+    let absolute_or_table_relative = Predicate::or(
+        Predicate::has_uri_scheme(location()),
+        Predicate::and(
+            location().ne(lit("")),
+            Predicate::not(Predicate::starts_with(location(), lit("/"))),
+        ),
+    );
+    let table_relative_error: ConditionErrorFn =
+        |values| location_rule_error(values, validate_table_relative);
+    let dot_segment_error: ConditionErrorFn =
+        |values| location_rule_error(values, reject_dot_segments);
+    [
+        Check::new(
+            ids[0],
+            guard(absolute_or_table_relative),
+            vec![column.clone()],
+            table_relative_error,
+        ),
+        Check::new(
+            ids[1],
+            guard(Predicate::not(Predicate::has_dot_segment(location()))),
+            vec![column],
+            dot_segment_error,
+        ),
+    ]
+}
+
+/// The error of `rule`, the Rust form of a failed location condition, for the location in the
+/// first of `values`.
+fn location_rule_error(values: &[Option<&str>], rule: fn(&str) -> KernelResult<()>) -> KernelError {
+    let Some(location) = values.first().copied().flatten() else {
+        return KernelError::missing_data(format!("Data missing for field {LOCATION}"));
+    };
+    rule(location).err().unwrap_or_else(|| {
+        KernelError::internal_error(format!(
+            "AMT location {location:?} failed a condition its rule accepts"
+        ))
+    })
+}
+
 /// Rejects a `path` containing a `.` or `..` segment: the Iceberg V4 path spec does not support
 /// relative navigation, and URL parsing would otherwise silently collapse such segments.
 pub(crate) fn reject_dot_segments(path: &str) -> KernelResult<()> {
@@ -167,6 +220,14 @@ mod tests {
     use test_utils::assert_result_error_with_message;
 
     use super::*;
+    use crate::Engine as _;
+    use crate::arrow::array::AsArray as _;
+    use crate::content_tree::conditions::ConditionChecker;
+    use crate::engine::arrow_data::EngineDataArrowExt as _;
+    use crate::engine::sync::SyncEngine;
+    use crate::expressions::{Scalar, col, column_name};
+    use crate::schema::{DataType, schema_ref};
+
 
     #[rstest]
     #[case::relative_path(
@@ -321,6 +382,45 @@ mod tests {
         assert_result_error_with_message(
             resolve_amt_location(path, &table_root),
             "contains a '.' or '..' segment",
+        );
+    }
+
+    /// The condition forms of [`validate_table_relative`] and [`reject_dot_segments`] in
+    /// [`location_checks`] accept the same locations as the rules, and report their errors.
+    #[rstest]
+    fn test_location_checks_agree_with_rules(
+        #[values(
+            "a/b.bin",
+            "a:b/c.bin",
+            "s3://bucket/a.bin",
+            "C:/a.bin",
+            "",
+            "/a.bin",
+            "a/../b.bin",
+            "./a.bin",
+            "s3://bucket/./a.bin",
+            "a/..b.bin"
+        )]
+        location: &str,
+    ) {
+        let engine = SyncEngine::new();
+        let handler = engine.evaluation_handler();
+        let schema = schema_ref! { not_null "location": STRING };
+        let checks = location_checks(column_name!("location"), |p| p, ["Relative", "Dots"]);
+        let checker =
+            ConditionChecker::try_new(handler.as_ref(), schema.clone(), checks.into()).unwrap();
+        let batch = handler
+            .create_many(schema, vec![vec![Scalar::from(location)]])
+            .unwrap();
+        let rule = match scheme_len(location) {
+            Some(_) => Ok(()),
+            None => validate_table_relative(location),
+        }
+        .and_then(|()| reject_dot_segments(location));
+        let condition = checker.check(batch.as_ref());
+        assert_eq!(
+            condition.map_err(|e| e.to_string()),
+            rule.map_err(|e| e.to_string())
         );
     }
 

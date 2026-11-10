@@ -23,7 +23,7 @@ use crate::amt_path_util::amt_manifest_filemeta;
 use crate::cancellation::CancellationTokenRef;
 use crate::content_tree::conditions::{Check, ConditionChecker, diagnostic, diagnostic_i32};
 use crate::content_tree::dv_conversion::{
-    add_deletion_vector_expression, check_absolute_location, deletion_vector_checks,
+    AbsoluteLocationCheck, add_deletion_vector_expression, deletion_vector_checks,
 };
 use crate::content_tree::mumbling::MumblingBitmap;
 use crate::content_tree::{
@@ -426,6 +426,8 @@ struct EntryTransform {
     selection_filter: Arc<dyn PredicateEvaluator>,
     /// Checks the kind's [`ManifestKind::selected_checks`] on the kept rows.
     selected_checker: ConditionChecker,
+    /// Checks the absolute deletion vector locations of the kept rows.
+    absolute_locations: AbsoluteLocationCheck,
     /// The kind's [`ManifestKind::helpers`].
     helpers: SchemaRef,
     /// Evaluates a selected entry batch with the [`Self::helpers`] columns.
@@ -455,6 +457,8 @@ impl EntryTransform {
             augmented_schema.clone(),
             kind.selected_checks,
         )?;
+        let absolute_locations =
+            AbsoluteLocationCheck::try_new(handler.as_ref(), augmented_schema.clone())?;
         let evaluator = handler.new_expression_evaluator(
             augmented_schema,
             Arc::new(build_entry_to_add_expression(ctx, &kind.base_row_id)?),
@@ -466,6 +470,7 @@ impl EntryTransform {
             checker,
             selection_filter,
             selected_checker,
+            absolute_locations,
             helpers: kind.helpers,
             evaluator,
         })
@@ -526,7 +531,7 @@ impl EntryTransform {
         let augmented = annotated.append_columns(self.helpers.clone(), helper_columns)?;
         let selected_entries = filter_by_predicate(self.selection_filter.as_ref(), augmented)?;
         self.selected_checker.check(selected_entries.as_ref())?;
-        AbsoluteDeletionVectorVisitor.visit_rows_of(selected_entries.as_ref())?;
+        self.absolute_locations.check(selected_entries.as_ref())?;
         self.evaluator.evaluate(selected_entries.as_ref())
     }
 }
@@ -1122,34 +1127,6 @@ fn partition_values_map_type() -> KernelResult<MapType> {
         other => Err(KernelError::generic(format!(
             "Add schema `{PARTITION_VALUES_NAME}` field is not a map: {other:?}"
         ))),
-    }
-}
-
-/// Checks the absolute deletion vector locations of selected entries with
-/// [`check_absolute_location`].
-struct AbsoluteDeletionVectorVisitor;
-
-impl RowVisitor for AbsoluteDeletionVectorVisitor {
-    fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
-        static NAMES_AND_TYPES: LazyLock<ColumnNamesAndTypes> = LazyLock::new(|| {
-            (
-                vec![ColumnName::new([DV_INFO, LOCATION])],
-                vec![DataType::STRING],
-            )
-                .into()
-        });
-        NAMES_AND_TYPES.as_ref()
-    }
-
-    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> KernelResult<()> {
-        for row in 0..row_count {
-            // `location` is a required field of the struct, so it reads null iff the whole
-            // `deletionVector` struct is null.
-            if let Some(location) = getters[0].get_opt(row, LOCATION)? {
-                check_absolute_location(location)?;
-            }
-        }
-        Ok(())
     }
 }
 
@@ -2680,6 +2657,7 @@ mod tests {
         entry.tracking.status = status;
         entry.spec_id = Some(7);
         entry.deletion_vector = Some(DeletionVectorInfo {
+            location: "s3://bu#ck/dv.bin".to_string(),
             size_in_bytes: 7,
             ..test_dv_info()
         });
@@ -2796,15 +2774,28 @@ mod tests {
         assert_unsupported(convert(&[entry]), message);
     }
 
-    // The conversion's error cases are covered in `dv_conversion`; this checks one propagates.
-    #[test]
-    fn live_entry_with_unrepresentable_deletion_vector_errors() {
+    // The conversion's error cases are covered in `dv_conversion`; this checks each kind of check
+    // runs on the read path.
+    #[rstest]
+    #[case::condition(
+        DeletionVectorInfo { size_in_bytes: 7, ..test_dv_info() },
+        "not a valid Iceberg blob size"
+    )]
+    #[case::absolute_location(
+        DeletionVectorInfo { location: "s3://bu#ck/dv.bin".to_string(), ..test_dv_info() },
+        "characters a URI does not allow"
+    )]
+    fn live_entry_with_unrepresentable_deletion_vector_errors(
+        #[case] dv: DeletionVectorInfo,
+        #[case] message: &str,
+    ) {
         let mut entry = added_data_entry("f.parquet", 10, 5, 0, 1);
-        entry.deletion_vector = Some(DeletionVectorInfo {
-            size_in_bytes: 7,
-            ..test_dv_info()
-        });
-        assert_result_error_with_message(convert(&[entry]), "not a valid Iceberg blob size");
+        entry.deletion_vector = Some(dv);
+        let err = convert(&[entry]).err().unwrap();
+        assert!(
+            matches!(&err, KernelError::DeletionVector(m) if m.contains(message)),
+            "{err}"
+        );
     }
 
     #[test]

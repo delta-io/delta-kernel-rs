@@ -8,7 +8,7 @@ mod action_projector;
 mod builder;
 mod checkpoint_action_stream;
 mod checkpoint_sidecar;
-mod conditions;
+pub(crate) mod conditions;
 mod dv_conversion;
 pub(crate) mod mumbling;
 mod reader;
