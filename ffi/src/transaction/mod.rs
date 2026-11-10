@@ -616,14 +616,58 @@ mod tests {
         *unsafe { Box::from_raw(ptr.as_ptr().cast()) }
     }
 
+    // Check the full input matrix natively. The Miri wrapper keeps the distinct ownership,
+    // partition-binding, and release paths without repeating every combination.
     #[rstest]
     #[case::unpartitioned(false)]
     #[case::partitioned(true)]
+    #[cfg_attr(miri, ignore = "unsafe paths covered by distributed_write_state_miri")]
     #[tokio::test]
     async fn test_distributed_write_state_outlives_transaction(
         #[case] partitioned: bool,
         #[values(false, true)] roundtrip: bool,
         #[values(false, true)] physical_partition_keys: bool,
+    ) -> KernelResult<()> {
+        assert_distributed_write_state_outlives_transaction(
+            partitioned,
+            roundtrip,
+            physical_partition_keys,
+        )
+        .await
+    }
+
+    // Miri keeps absent partition metadata, an encoded state with physical keys, and a direct
+    // state with logical keys used after releasing the state handle. The FFI encode/decode
+    // callbacks do not branch on partitioning; physical-key binding consumes the same handle
+    // types for direct and decoded states.
+    #[rstest]
+    #[case::unpartitioned_direct(false, false, false)]
+    #[case::partitioned_encoded_physical(true, true, true)]
+    #[case::partitioned_direct_logical(true, false, false)]
+    #[cfg_attr(
+        not(miri),
+        ignore = "Miri subset; the full write-state matrix runs natively"
+    )]
+    #[tokio::test]
+    async fn distributed_write_state_miri(
+        #[case] partitioned: bool,
+        #[case] roundtrip: bool,
+        #[case] physical_partition_keys: bool,
+    ) -> KernelResult<()> {
+        assert_distributed_write_state_outlives_transaction(
+            partitioned,
+            roundtrip,
+            physical_partition_keys,
+        )
+        .await
+    }
+
+    // Both test wrappers check callback copies, error cleanup, and use of contexts after
+    // releasing the transaction and write-state handles.
+    async fn assert_distributed_write_state_outlives_transaction(
+        partitioned: bool,
+        roundtrip: bool,
+        physical_partition_keys: bool,
     ) -> KernelResult<()> {
         let schema = schema_ref! {
             nullable "number": INTEGER,
