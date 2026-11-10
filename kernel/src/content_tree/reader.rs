@@ -12,7 +12,6 @@
 //! `modificationTime` and `dataChange` have no AMT source and are supplied by the caller via
 //! [`ReadContext`].
 
-use std::borrow::Cow;
 use std::collections::{HashSet, VecDeque};
 use std::sync::{Arc, LazyLock};
 use std::{iter, slice};
@@ -21,7 +20,9 @@ use bytes::Bytes;
 use url::Url;
 
 use crate::actions::{ADD_NAME, ADD_SCHEMA, CheckpointAction, STATS_PARSED};
-use crate::amt_path_util::{amt_location_to_add_path, amt_manifest_filemeta};
+use crate::amt_path_util::{
+    add_path_expression, amt_manifest_filemeta, validate_amt_data_file_location,
+};
 use crate::cancellation::CancellationTokenRef;
 use crate::content_tree::conditions::{Check, ConditionChecker, diagnostic, diagnostic_i32};
 use crate::content_tree::dv_conversion::{
@@ -426,15 +427,6 @@ static FIRST_ROW_ID_HELPER_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
     nullable FIRST_ROW_ID_HELPER: LONG,
 };
 
-/// Column appended to the kept entries of a batch holding each entry's `location` encoded into the
-/// RFC 2396 form `Add.path` uses, or null when encoding leaves it unchanged.
-const ENCODED_PATH_HELPER: &str = "_encodedPath";
-
-/// Columns [`EntryTransform::convert`] appends to the kept entries before the `Add` transform.
-static ADD_HELPER_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
-    nullable ENCODED_PATH_HELPER: STRING,
-};
-
 /// Column holding whether the manifest deletion vector of the entry's leaf removes the entry.
 const REMOVED_COLUMN: &str = "_removed";
 
@@ -542,7 +534,7 @@ impl EntryTransform {
         let dv_locations =
             DeletionVectorLocationCheck::try_new(handler.as_ref(), augmented_schema.clone())?;
         let evaluator = handler.new_expression_evaluator(
-            schema_with(&augmented_schema, &ADD_HELPER_SCHEMA),
+            augmented_schema,
             Arc::new(build_entry_to_add_expression(ctx, &kind.base_row_id)?),
             DataType::from(ctx.add_schema().as_ref().clone()),
         )?;
@@ -603,8 +595,8 @@ impl EntryTransform {
     ///
     /// # Errors
     /// Returns an error if a kept entry fails one of the kind's [`ManifestKind::selected_checks`],
-    /// has a deletion vector with no `Add` equivalent, has a `location` that cannot be encoded as
-    /// an `Add.path` (see [`amt_location_to_add_path`]), or if an evaluator fails to evaluate.
+    /// has a deletion vector with no `Add` equivalent, has a `location` that cannot become an
+    /// `Add.path` (see [`validate_amt_data_file_location`]), or if an evaluator fails to evaluate.
     fn convert(
         &self,
         annotated: &dyn EngineData,
@@ -614,16 +606,8 @@ impl EntryTransform {
         let selected_entries = filter_by_predicate(self.selection_filter.as_ref(), augmented)?;
         self.selected_checker.check(selected_entries.as_ref())?;
         self.dv_locations.check(selected_entries.as_ref())?;
-        let mut paths = EncodedPathVisitor::default();
-        paths.visit_rows_of(selected_entries.as_ref())?;
-        let with_paths = selected_entries.append_columns(
-            ADD_HELPER_SCHEMA.clone(),
-            vec![ArrayData::try_new(
-                ArrayType::new(DataType::STRING, true),
-                paths.encoded_paths,
-            )?],
-        )?;
-        self.evaluator.evaluate(with_paths.as_ref())
+        DataFileLocationVisitor.visit_rows_of(selected_entries.as_ref())?;
+        self.evaluator.evaluate(selected_entries.as_ref())
     }
 }
 
@@ -1203,10 +1187,7 @@ fn build_entry_to_add_expression(
     // TODO(#2866): carry tags across from the entry.
     let add = struct_expr_from_schema(&ctx.action_schema(), |name| {
         Some(match name {
-            n if n == PATH_NAME => Expression::coalesce([
-                Expression::column([ENCODED_PATH_HELPER]),
-                Expression::column([LOCATION]),
-            ]),
+            n if n == PATH_NAME => add_path_expression(Expression::column([LOCATION])),
             // TODO(#3320): read partition values from the entry's `partition` tuple once the read
             // path carries a partition spec.
             n if n == PARTITION_VALUES_NAME => empty_partition_values.clone(),
@@ -1348,14 +1329,11 @@ impl RowVisitor for ColumnFileCounter {
     }
 }
 
-/// Encodes each visited entry's raw `location` (see [`amt_location_to_add_path`]) into
-/// [`ENCODED_PATH_HELPER`] values: the encoded path when encoding changes it, else null.
-#[derive(Default)]
-struct EncodedPathVisitor {
-    encoded_paths: Vec<Scalar>,
-}
+/// Checks that each visited entry's `location` can become an `Add.path` (see
+/// [`validate_amt_data_file_location`]).
+struct DataFileLocationVisitor;
 
-impl RowVisitor for EncodedPathVisitor {
+impl RowVisitor for DataFileLocationVisitor {
     fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
         static NAMES_AND_TYPES: LazyLock<ColumnNamesAndTypes> =
             LazyLock::new(|| (vec![ColumnName::new([LOCATION])], vec![DataType::STRING]).into());
@@ -1363,13 +1341,8 @@ impl RowVisitor for EncodedPathVisitor {
     }
 
     fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> KernelResult<()> {
-        self.encoded_paths.reserve(row_count);
         for row in 0..row_count {
-            let encoded_path = match amt_location_to_add_path(getters[0].get(row, LOCATION)?)? {
-                Cow::Owned(path) => Some(path),
-                Cow::Borrowed(_) => None,
-            };
-            self.encoded_paths.push(encoded_path.into());
+            validate_amt_data_file_location(getters[0].get(row, LOCATION)?)?;
         }
         Ok(())
     }
