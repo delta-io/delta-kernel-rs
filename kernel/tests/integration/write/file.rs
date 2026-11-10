@@ -1,7 +1,6 @@
 //! Write-path integration tests for `file` columns.
 
 use std::collections::HashMap;
-use std::path::Path;
 use std::sync::Arc;
 
 use delta_kernel::arrow::array::{
@@ -35,8 +34,8 @@ use rstest::rstest;
 use test_utils::delta_kernel_default_engine::DefaultEngine;
 use test_utils::delta_kernel_default_engine::executor::tokio::TokioMultiThreadExecutor;
 use test_utils::{
-    add_commit, create_table_and_load_snapshot, read_add_infos, read_scan, test_table_setup,
-    test_table_setup_mt, write_batch_to_table,
+    add_commit, create_table_and_load_snapshot, read_actions_from_commit, read_add_infos,
+    read_scan, test_table_setup, test_table_setup_mt, write_batch_to_table,
 };
 use url::Url;
 
@@ -993,21 +992,16 @@ async fn set_write_location(
     engine: &dyn Engine,
     value: &str,
 ) -> Result<SnapshotRef, Box<dyn std::error::Error>> {
-    let log = Path::new(table_path).join("_delta_log/00000000000000000000.json");
-    let mut metadata = std::fs::read_to_string(log)?
-        .lines()
-        .map(serde_json::from_str::<serde_json::Value>)
-        .collect::<Result<Vec<_>, _>>()?
-        .into_iter()
-        .find(|action| action.get("metaData").is_some())
+    let table_url = Url::from_directory_path(table_path).unwrap();
+    let mut metadata = read_actions_from_commit(&table_url, 0, "metaData")?
+        .pop()
         .expect("the first commit has a metaData action");
-    metadata["metaData"]["configuration"]["delta.fileType.writeLocation"] = value.into();
+    metadata["configuration"]["delta.fileType.writeLocation"] = value.into();
     let commit = [
         r#"{"commitInfo":{"timestamp":1700000000000,"operation":"SET TBLPROPERTIES"}}"#.to_string(),
-        metadata.to_string(),
+        serde_json::json!({ "metaData": metadata }).to_string(),
     ]
     .join("\n");
-    let table_url = Url::from_directory_path(table_path).unwrap();
     let store: Arc<DynObjectStore> = Arc::new(LocalFileSystem::new());
     add_commit(table_url.as_str(), store.as_ref(), 1, commit).await?;
     Ok(Snapshot::builder_for(table_url).build(engine)?)

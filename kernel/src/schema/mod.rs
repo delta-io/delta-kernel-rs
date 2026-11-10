@@ -3071,7 +3071,11 @@ mod tests {
     }
 
     /// A `file` array element or map value is serialized as the bare string `"file"`, like a
-    /// top-level `file` field. The object form `{"type": "file"}` is not a Delta type.
+    /// top-level `file` field and like `"variant"`. The RFC defines `file` as "serialized with a
+    /// single type-name string", and a schema type that is an object is an array, map or struct
+    /// type, so `{"type": "file"}` is not parsed. Spark and Kernel-Java parse schemas the same way.
+    /// The RFC's schema example shows the object form for an array element, which this test does
+    /// not follow.
     #[test]
     fn test_serde_file_in_array_and_map() {
         let array: DataType = ArrayType::new(DataType::file_type(), true).into();
