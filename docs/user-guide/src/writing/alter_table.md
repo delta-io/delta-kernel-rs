@@ -148,28 +148,29 @@ and value-validated. Repeated calls merge. Two entries for the same `delta.*` ke
 
 Feature-enabling properties (for example `delta.enableChangeDataFeed` or
 `delta.enableDeletionVectors`) are accepted and may upgrade the protocol when the property turns a
-feature on. Unknown `delta.*` keys and CHECK constraints are rejected. Enabling
-`delta.enableRowTracking` on an existing table is rejected until existing-table enablement is
-supported. Re-setting a property to its current value still counts as an `ALTER TABLE` change.
+feature on. Unknown `delta.*` keys and CHECK constraints are rejected. Re-setting a property to its
+current value still counts as an `ALTER TABLE` change.
+
+These transitions need a rewrite or backfill, so Kernel rejects them on existing tables: enabling or
+disabling row tracking; any column-mapping mode change; enabling or disabling IcebergCompatV1, V2,
+or V3; enabling or disabling `icebergWriterCompatV1` or `icebergWriterCompatV3`; and disabling ICT
+on a `catalogManaged` table.
 
 To enable a feature without a matching property, pass `delta.feature.<name>` set to `supported`,
 for example `("delta.feature.deletionVectors", "supported")`. Only features that CREATE TABLE also
 accepts through feature signals are allowed, and the signal is applied to the protocol only. Other
 values, unknown features, and rejected features fail the build. Signals cannot be combined with a
-blind append.
+blind append. Feature signals cannot bypass the existing-table toggle rejections above.
 
 `delta.enableVariantShredding=true` also enables `variantShredding-preview`, unless the
-`variantShredding` feature is already in the protocol. Setting
-`delta.enableIcebergWriterCompatV1` or `delta.enableIcebergWriterCompatV3` only succeeds when the
-value does not change, because Kernel cannot enable or disable them on an existing table.
+`variantShredding` feature is already in the protocol.
 `delta.universalFormat.enabledFormats` accepts `iceberg` and `hudi`. Listing `iceberg` requires
 `delta.enableIcebergCompatV2` or `delta.enableIcebergCompatV3` to be `true`, and both cannot be
 enabled together.
 
-Enabling `delta.enableIcebergCompatV3` on an existing table is rejected, the same as the writer
-compatibility properties. Adding a `timestamp_ntz` column enables the `timestampNtz` feature in the
-same commit. Enabling `catalogManaged` through a feature signal also sets
-`delta.enableInCommitTimestamps` to `true`, and an explicit `false` is rejected.
+Adding a `timestamp_ntz` column enables the `timestampNtz` feature in the same commit. Enabling
+`catalogManaged` through a feature signal also sets `delta.enableInCommitTimestamps` to `true`, and
+an explicit `false` is rejected.
 
 ```rust,ignore
 let result = snapshot
