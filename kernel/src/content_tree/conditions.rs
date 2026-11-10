@@ -35,11 +35,53 @@ pub(crate) fn diagnostic<'a>(values: &[Option<&'a str>], index: usize) -> &'a st
     values.get(index).copied().flatten().unwrap_or("NULL")
 }
 
+/// The INTEGER diagnostic value at `index`, read from the `column` it was taken from.
+///
+/// # Errors
+/// Returns a `MissingData` error naming `column` if the value is null, and an internal error if
+/// it does not parse as an integer.
+pub(crate) fn diagnostic_i32(
+    values: &[Option<&str>],
+    index: usize,
+    column: &str,
+) -> KernelResult<i32> {
+    let value = values
+        .get(index)
+        .copied()
+        .flatten()
+        .ok_or_else(|| KernelError::missing_data(format!("Data missing for field {column}")))?;
+    value.parse().map_err(|_| {
+        KernelError::internal_error(format!(
+            "Expected an integer diagnostic for {column}, got '{value}'"
+        ))
+    })
+}
+
 /// A condition and the error it reports.
 #[derive(Debug, Clone)]
 pub(crate) struct Check {
     pub(crate) condition: AssertCondition,
     pub(crate) error: ConditionErrorFn,
+}
+
+impl Check {
+    /// A check that rows satisfy `predicate`, reporting `error` with the values of
+    /// `diagnostic_cols` for the first row that does not.
+    pub(crate) fn new(
+        id: &'static str,
+        predicate: Predicate,
+        diagnostic_cols: Vec<ColumnName>,
+        error: ConditionErrorFn,
+    ) -> Self {
+        Self {
+            condition: AssertCondition {
+                id,
+                predicate,
+                diagnostic_cols,
+            },
+            error,
+        }
+    }
 }
 
 /// Checks batches with one input schema against a list of [`Check`]s.
@@ -100,6 +142,9 @@ impl ConditionChecker {
     /// Errors for the first row of `batch` that fails a condition. Within a row, conditions are
     /// checked in the order they were given.
     pub(crate) fn check(&self, batch: &dyn EngineData) -> KernelResult<()> {
+        if self.checks.is_empty() {
+            return Ok(());
+        }
         let mut first_failure = FirstFailureVisitor(None);
         first_failure.visit_rows_of(self.first_failure.evaluate(batch)?.as_ref())?;
         let Some((row, index)) = first_failure.0 else {
@@ -293,8 +338,8 @@ mod tests {
                 error: |values| {
                     KernelError::unsupported(format!(
                         "entry '{}' has file format '{}'",
-                        values[0].unwrap_or("NULL"),
-                        values[1].unwrap_or("NULL")
+                        diagnostic(values, 0),
+                        diagnostic(values, 1)
                     ))
                 },
             },
@@ -310,8 +355,8 @@ mod tests {
                 error: |values| {
                     KernelError::unsupported(format!(
                         "entry '{}' has spec {}",
-                        values[0].unwrap_or("NULL"),
-                        values[1].unwrap_or("NULL")
+                        diagnostic(values, 0),
+                        diagnostic(values, 1)
                     ))
                 },
             },
@@ -410,5 +455,18 @@ mod tests {
         };
         let err = checker(vec![check]).err().unwrap();
         assert!(err.to_string().contains(message), "{err}");
+    }
+
+    #[rstest]
+    #[case::integer(&[Some("x"), Some("-3")], Ok(-3))]
+    #[case::null(&[Some("x"), None], Err("Data missing for field col"))]
+    #[case::absent(&[Some("x")], Err("Data missing for field col"))]
+    #[case::not_an_integer(&[Some("x"), Some("y")], Err("Expected an integer diagnostic"))]
+    fn test_diagnostic_i32(#[case] values: &[Option<&str>], #[case] expected: Result<i32, &str>) {
+        match (diagnostic_i32(values, 1, "col"), expected) {
+            (Ok(value), Ok(expected)) => assert_eq!(value, expected),
+            (Err(e), Err(message)) => assert!(e.to_string().contains(message), "{e}"),
+            (actual, expected) => panic!("{actual:?} != {expected:?}"),
+        }
     }
 }
