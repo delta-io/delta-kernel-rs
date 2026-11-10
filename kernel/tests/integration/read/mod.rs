@@ -1704,6 +1704,54 @@ fn type_widening_decimal() -> Result<(), Box<dyn std::error::Error>> {
     read_table_data_str("./tests/data/type-widening/", select_cols, None, expected)
 }
 
+#[rstest::rstest]
+#[case::decimal_greater_scale(
+    "decimal_decimal_greater_scale",
+    Scalar::decimal(6_789_000, 20, 5).unwrap(),
+    vec![
+        "+-------------------------------+",
+        "| decimal_decimal_greater_scale |",
+        "+-------------------------------+",
+        "| 67.89000                      |",
+        "+-------------------------------+",
+    ]
+)]
+#[case::byte_decimal(
+    "byte_decimal",
+    Scalar::decimal(10, 4, 1).unwrap(),
+    vec![
+        "+--------------+",
+        "| byte_decimal |",
+        "+--------------+",
+        "| 1.0          |",
+        "+--------------+",
+    ]
+)]
+#[case::long_decimal(
+    "long_decimal",
+    Scalar::decimal(40, 21, 1).unwrap(),
+    vec![
+        "+--------------+",
+        "| long_decimal |",
+        "+--------------+",
+        "| 4.0          |",
+        "+--------------+",
+    ]
+)]
+fn type_widening_decimal_predicate_keeps_older_scale_file(
+    #[case] column: &str,
+    #[case] value: Scalar,
+    #[case] expected: Vec<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let predicate = Pred::eq(Expr::column([column]), lit(value));
+    read_table_data_str(
+        "./tests/data/type-widening/",
+        Some(&[column]),
+        Some(predicate),
+        expected,
+    )
+}
+
 // Verify that predicates over invalid/missing columns do not cause skipping.
 #[test]
 fn predicate_references_invalid_missing_column() -> Result<(), Box<dyn std::error::Error>> {

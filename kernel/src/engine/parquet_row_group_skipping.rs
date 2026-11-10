@@ -32,7 +32,8 @@ pub(crate) trait ParquetRowGroupSkipping {
     /// Build the reader with [`crate::engine::reader_options`] (or equivalent options that ignore
     /// embedded Arrow schema metadata) and cast timestamp output to Kernel's microsecond types.
     /// Footer timestamp units and decimal scales come from Parquet annotations and must agree
-    /// with decoded values.
+    /// with decoded values. Integer columns read as decimals have scale 0 and must be cast by
+    /// value, not reinterpreted as unscaled decimals.
     fn with_row_group_filter(
         self,
         predicate: &Predicate,
@@ -50,8 +51,7 @@ pub(crate) trait ParquetRowGroupSkipping {
     /// in the row group (indicating some files lack that statistic), the stat is treated as
     /// unavailable to prevent false pruning.
     ///
-    /// The reader must satisfy the options and timestamp-cast requirements of
-    /// [`Self::with_row_group_filter`].
+    /// The reader must satisfy the requirements of [`Self::with_row_group_filter`].
     // TODO: remove #[allow(dead_code)] once production callers land
     #[allow(dead_code)]
     fn with_checkpoint_row_group_filter(
@@ -171,7 +171,8 @@ impl ParquetStatsProvider for RowGroupFilter<'_> {
 
 /// Extracts the minimum stat value from a parquet column chunk, converting from the physical
 /// parquet type to the requested logical Delta type. INT64 timestamp stats are rescaled to
-/// microseconds and decimal stats to the requested scale using the column's Parquet annotation.
+/// microseconds and decimal stats widened to the requested scale using the column's Parquet
+/// annotation; a decimal stat that cannot be widened exactly is `None`.
 fn extract_min_scalar(data_type: &DataType, column: &ColumnChunkMetaData) -> Option<Scalar> {
     use PrimitiveType::*;
     let value = match (data_type.as_primitive_opt()?, column.statistics()?) {
@@ -211,18 +212,9 @@ fn extract_min_scalar(data_type: &DataType, column: &ColumnChunkMetaData) -> Opt
         (TimestampNtz, Statistics::Int32(s)) => timestamp_from_date(s.min_opt())?,
         (TimestampNtz, _) => return None, // TODO: Int96 timestamps
         (IntervalYearMonth(_) | IntervalDayTime(_), _) => return None,
-        (Decimal(d), Statistics::Int32(i)) => {
-            decimal_stat_as(*i.min_opt()?, column.column_descr(), *d)?
+        (Decimal(d), stats) => {
+            decimal_stat_as(decimal_min_bits(stats)?, column.column_descr(), *d)?
         }
-        (Decimal(d), Statistics::Int64(i)) => {
-            decimal_stat_as(*i.min_opt()?, column.column_descr(), *d)?
-        }
-        (Decimal(d), Statistics::FixedLenByteArray(b)) => decimal_stat_as(
-            decimal_bits_from_bytes(b.min_bytes_opt())?,
-            column.column_descr(),
-            *d,
-        )?,
-        (Decimal(..), _) => return None,
         // Void columns have no Parquet representation, so no stats exist
         (Void, _) => return None,
         #[cfg(feature = "geo-type-in-dev")]
@@ -233,7 +225,8 @@ fn extract_min_scalar(data_type: &DataType, column: &ColumnChunkMetaData) -> Opt
 
 /// Extracts the maximum stat value from a parquet column chunk, converting from the physical
 /// parquet type to the requested logical Delta type. INT64 timestamp stats are rescaled to
-/// microseconds and decimal stats to the requested scale using the column's Parquet annotation.
+/// microseconds and decimal stats widened to the requested scale using the column's Parquet
+/// annotation; a decimal stat that cannot be widened exactly is `None`.
 fn extract_max_scalar(data_type: &DataType, column: &ColumnChunkMetaData) -> Option<Scalar> {
     use PrimitiveType::*;
     let value = match (data_type.as_primitive_opt()?, column.statistics()?) {
@@ -273,18 +266,9 @@ fn extract_max_scalar(data_type: &DataType, column: &ColumnChunkMetaData) -> Opt
         (TimestampNtz, Statistics::Int32(s)) => timestamp_from_date(s.max_opt())?,
         (TimestampNtz, _) => return None, // TODO: Int96 timestamps
         (IntervalYearMonth(_) | IntervalDayTime(_), _) => return None,
-        (Decimal(d), Statistics::Int32(i)) => {
-            decimal_stat_as(*i.max_opt()?, column.column_descr(), *d)?
+        (Decimal(d), stats) => {
+            decimal_stat_as(decimal_max_bits(stats)?, column.column_descr(), *d)?
         }
-        (Decimal(d), Statistics::Int64(i)) => {
-            decimal_stat_as(*i.max_opt()?, column.column_descr(), *d)?
-        }
-        (Decimal(d), Statistics::FixedLenByteArray(b)) => decimal_stat_as(
-            decimal_bits_from_bytes(b.max_bytes_opt())?,
-            column.column_descr(),
-            *d,
-        )?,
-        (Decimal(..), _) => return None,
         // Void columns have no Parquet representation, so no stats exist
         (Void, _) => return None,
         #[cfg(feature = "geo-type-in-dev")]
@@ -300,45 +284,76 @@ fn extract_nullcount(stats: Option<&Statistics>) -> Option<i64> {
     Some(stats?.null_count_opt()? as i64)
 }
 
-fn decimal_stat_as(
-    bits: impl Into<i128>,
-    column: &ColumnDescriptor,
-    target: DecimalType,
-) -> Option<Scalar> {
-    let scale_increase = target.scale().checked_sub(parquet_decimal_scale(column)?)?;
-    let factor = 10i128.checked_pow(scale_increase.into())?;
-    let bits = bits.into().checked_mul(factor)?;
-    Some(DecimalData::try_new(bits, target).ok()?.into())
+/// Unscaled minimum of a decimal column chunk, from whichever physical type stores it.
+///
+/// Legacy `min`/`max` footer fields are rejected for FIXED_LEN_BYTE_ARRAY: writers filled them
+/// using byte-wise comparison, which is not numeric order for multi-byte two's complement.
+fn decimal_min_bits(stats: &Statistics) -> Option<i128> {
+    Some(match stats {
+        Statistics::Int32(s) => (*s.min_opt()?).into(),
+        Statistics::Int64(s) => (*s.min_opt()?).into(),
+        Statistics::FixedLenByteArray(s) if !stats.is_min_max_deprecated() => {
+            decimal_bits_from_bytes(s.min_bytes_opt()?)?
+        }
+        _ => return None,
+    })
 }
 
+/// Unscaled maximum of a decimal column chunk; see [`decimal_min_bits`].
+fn decimal_max_bits(stats: &Statistics) -> Option<i128> {
+    Some(match stats {
+        Statistics::Int32(s) => (*s.max_opt()?).into(),
+        Statistics::Int64(s) => (*s.max_opt()?).into(),
+        Statistics::FixedLenByteArray(s) if !stats.is_min_max_deprecated() => {
+            decimal_bits_from_bytes(s.max_bytes_opt()?)?
+        }
+        _ => return None,
+    })
+}
+
+/// Widens an unscaled footer bound from the column's Parquet scale to `target`.
+///
+/// Must agree with `can_upcast_to_decimal` in `engine/ensure_data_types.rs`, which admits only
+/// exact widening: a narrower target scale or a value that does not fit `target` yields `None`,
+/// so that bound cannot justify skipping a row group.
+fn decimal_stat_as(bits: i128, column: &ColumnDescriptor, target: DecimalType) -> Option<Scalar> {
+    let scale_increase = target.scale().checked_sub(parquet_decimal_scale(column)?)?;
+    let factor = 10i128.checked_pow(scale_increase.into())?;
+    let bits = bits.checked_mul(factor)?;
+    DecimalData::try_new(bits, target).ok().map(Scalar::Decimal)
+}
+
+/// Scale of the values parquet-rs decodes for this column when it is read as a decimal, derived
+/// from the same annotations the reader uses: DECIMAL annotations carry their own scale, signed
+/// and unannotated INT32/INT64 are integers the reader casts by value (scale 0), and any other
+/// annotation is not readable as a decimal.
 fn parquet_decimal_scale(column: &ColumnDescriptor) -> Option<u8> {
     let scale = match column.logical_type_ref() {
         Some(LogicalType::Decimal(decimal)) => decimal.scale,
         Some(LogicalType::Integer(int)) if int.is_signed => 0,
         Some(_) => return None,
-        None => match (column.converted_type(), column.physical_type()) {
-            (ConvertedType::DECIMAL, _) => column.type_scale(),
-            (ConvertedType::NONE, PhysicalType::INT32 | PhysicalType::INT64) => 0,
-            (
-                ConvertedType::INT_8
-                | ConvertedType::INT_16
-                | ConvertedType::INT_32
-                | ConvertedType::INT_64,
-                _,
-            ) => 0,
-            _ => return None,
-        },
+        None => {
+            use ConvertedType::*;
+            match (column.converted_type(), column.physical_type()) {
+                (DECIMAL, _) => column.type_scale(),
+                (NONE, PhysicalType::INT32 | PhysicalType::INT64) => 0,
+                (INT_8 | INT_16 | INT_32 | INT_64, _) => 0,
+                _ => return None,
+            }
+        }
     };
     u8::try_from(scale).ok()
 }
 
-fn decimal_bits_from_bytes(bytes: Option<&[u8]>) -> Option<i128> {
+fn decimal_bits_from_bytes(bytes: &[u8]) -> Option<i128> {
     // Statistics are a minimal-width big-endian two's-complement integer. Sign-extend to
     // 16 bytes on the stack (no heap alloc) and copy in as little-endian: fill with 0xFF
     // when the sign bit of the most-significant (first, big-endian) byte is set, else 0x00.
     // Zero-padding a negative value would decode it as a large positive i128 and wrongly
     // prune row groups. `(b >> 7) * 0xFF` sets the fill without a data-dependent branch.
-    let bytes = bytes.filter(|b| b.len() <= 16)?;
+    if bytes.len() > 16 {
+        return None;
+    }
     let fill = bytes.first().map_or(0x00, |&b| (b >> 7) * 0xFF);
     let mut le = [fill; 16];
     for (dst, &src) in le.iter_mut().zip(bytes.iter().rev()) {

@@ -288,6 +288,8 @@ fn check_cast_compat(
         (Int32, Int64 | Float64) => Ok(DataTypeCompat::NeedsCast(target_type)),
         (Float32, Float64) => Ok(DataTypeCompat::NeedsCast(target_type)),
         (_, Decimal128(p, s)) if can_upcast_to_decimal(source_type, *p, *s) => {
+            // Decimal bounds returned by `decimal_stat_as` in
+            // `engine/parquet_row_group_skipping.rs` must agree with this upcast.
             Ok(DataTypeCompat::NeedsCast(target_type))
         }
         (Date32, Timestamp(_, None)) => Ok(DataTypeCompat::NeedsCast(target_type)),
@@ -317,7 +319,8 @@ fn can_upcast_to_decimal(
 
     let (source_precision, source_scale) = match source_type {
         Decimal128(p, s) => (*p, *s),
-        // Allow converting integers to a decimal that can hold all possible values.
+        // Allow converting integers to a decimal that can hold all possible values. The scale-0
+        // rule is mirrored by `parquet_decimal_scale` in `engine/parquet_row_group_skipping.rs`.
         Int8 => (3u8, 0i8),
         Int16 => (5u8, 0i8),
         Int32 => (10u8, 0i8),
