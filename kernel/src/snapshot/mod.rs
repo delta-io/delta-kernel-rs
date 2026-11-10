@@ -1895,11 +1895,11 @@ mod tests {
     use test_utils::{add_commit, delta_path_for_version};
 
     use super::{commit, *};
-    use crate::Result;
     use crate::actions::{DomainMetadata, Protocol};
     use crate::arrow::array::StringArray;
     use crate::arrow::record_batch::RecordBatch;
     use crate::committer::{CommitMetadata, CommitResponse, FileSystemCommitter};
+    use crate::engine::PanicEngine;
     use crate::engine::arrow_data::ArrowEngineData;
     use crate::engine::sync::SyncEngine;
     use crate::last_checkpoint_hint::LastCheckpointHint;
@@ -1921,30 +1921,7 @@ mod tests {
         create_log_path, string_array_to_engine_data,
     };
     use crate::utils::FoldWithOption as _;
-    use crate::{
-        EvaluationHandler, FilteredEngineData, JsonHandler, ParquetHandler, StorageHandler,
-    };
-
-    /// Rejects engine handler requests to verify that replacing staged paths needs no storage I/O.
-    struct NoIoPublishEngine;
-
-    impl Engine for NoIoPublishEngine {
-        fn evaluation_handler(&self) -> Arc<dyn EvaluationHandler> {
-            panic!("publication requested an evaluation handler")
-        }
-
-        fn storage_handler(&self) -> Arc<dyn StorageHandler> {
-            panic!("publication requested a storage handler")
-        }
-
-        fn json_handler(&self) -> Arc<dyn JsonHandler> {
-            panic!("publication requested a JSON handler")
-        }
-
-        fn parquet_handler(&self) -> Arc<dyn ParquetHandler> {
-            panic!("publication requested a parquet handler")
-        }
-    }
+    use crate::{FilteredEngineData, Result};
 
     /// Records versions passed to `publish` and can fail the first call.
     #[derive(Default)]
@@ -2062,7 +2039,7 @@ mod tests {
         let committer = RecordingPublishCommitter::default();
 
         // WHEN: publish the remaining commits and return a snapshot with published paths.
-        let published = source.publish(&NoIoPublishEngine, &committer).unwrap();
+        let published = source.publish(&PanicEngine, &committer).unwrap();
 
         // THEN: request publication only for unpublished commits; keep version, metadata, and CRC.
         assert_eq!(*committer.calls.borrow(), expected_calls);
@@ -2116,7 +2093,7 @@ mod tests {
         assert_eq!(source.log_segment(), &original_segment);
 
         // Publishing the returned snapshot again must neither copy files nor create a new snapshot.
-        let repeated = published.publish(&NoIoPublishEngine, &committer).unwrap();
+        let repeated = published.publish(&PanicEngine, &committer).unwrap();
         assert!(Arc::ptr_eq(&published, &repeated));
         assert_eq!(*committer.calls.borrow(), expected_calls);
     }
@@ -2151,7 +2128,7 @@ mod tests {
 
         // WHEN: publish with nothing left in ascending_commit_files to copy.
         let result = source
-            .publish(&NoIoPublishEngine, &FileSystemCommitter::new())
+            .publish(&PanicEngine, &FileSystemCommitter::new())
             .unwrap();
 
         // THEN: replace latest_commit_file only if version 2 is known to be published.
@@ -2194,14 +2171,14 @@ mod tests {
         };
 
         // WHEN: publication fails.
-        let result = source.publish(&NoIoPublishEngine, &committer);
+        let result = source.publish(&PanicEngine, &committer);
 
         // THEN: report the failure and leave the input snapshot unchanged.
         assert_result_error_with_message(result, "injected publication failure");
         assert_eq!(source.log_segment(), &original_segment);
 
         // WHEN: retry publication from the same input snapshot.
-        let result = source.publish(&NoIoPublishEngine, &committer).unwrap();
+        let result = source.publish(&PanicEngine, &committer).unwrap();
 
         // THEN: retry commit 2 and return published paths for both commits.
         assert_eq!(*committer.calls.borrow(), vec![vec![2], vec![2]]);
@@ -2243,7 +2220,7 @@ mod tests {
         };
 
         // WHEN: attempt to publish the snapshot.
-        let result = source.publish(&NoIoPublishEngine, committer);
+        let result = source.publish(&PanicEngine, committer);
 
         // THEN: reject the unsupported table or committer before copying any files.
         assert_result_error_with_message(result, error);
@@ -2272,7 +2249,7 @@ mod tests {
         let committer = RecordingPublishCommitter::default();
 
         // WHEN: attempt to publish with a missing version or missing final commit.
-        let result = source.publish(&NoIoPublishEngine, &committer);
+        let result = source.publish(&PanicEngine, &committer);
 
         // THEN: reject the incomplete commit list before calling the committer.
         assert_result_error_with_message(result, error);
@@ -2296,7 +2273,7 @@ mod tests {
 
         // WHEN: call publish without any catalog commits to copy.
         let result = source
-            .publish(&NoIoPublishEngine, &FileSystemCommitter::new())
+            .publish(&PanicEngine, &FileSystemCommitter::new())
             .unwrap();
 
         // THEN: return the original snapshot.
