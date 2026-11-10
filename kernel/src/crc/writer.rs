@@ -19,19 +19,16 @@ use crate::{Engine, KernelError, KernelResult};
 /// writes with `overwrite = false`. If the file already exists, returns
 /// `Err(KernelError::FileAlreadyExists)`.
 pub(crate) fn try_write_crc_file(engine: &dyn Engine, path: &Url, crc: &Crc) -> KernelResult<()> {
-    if let FileStatsState::Indeterminate {
-        unsupported_operation,
-    } = &crc.file_stats_state
-    {
-        return Err(KernelError::ChecksumWriteUnsupported(
-            match unsupported_operation {
-                Some(operation) => format!(
-                    "Cannot write CRC file incrementally: unsupported operation {operation:?}"
-                ),
-                None => "Cannot write CRC file with Indeterminate file stats".to_string(),
-            },
-        ));
-    }
+    require!(
+        crc.file_stats_state.is_complete(),
+        KernelError::ChecksumWriteUnsupported(match &crc.file_stats_state {
+            FileStatsState::Indeterminate {
+                unsupported_operation: Some(operation),
+            } =>
+                format!("Cannot write CRC file incrementally: unsupported operation {operation:?}"),
+            _ => "Cannot write CRC file with Indeterminate file stats".to_string(),
+        })
+    );
     // If ICT is enabled, the CRC must carry an ICT value.
     let ict_enabled = crc
         .metadata
