@@ -5,6 +5,7 @@ use std::iter;
 use super::action_projector::ActionProjector;
 use super::checkpoint_sidecar::read_sidecar_actions;
 use super::reader::{ReadContext, StatsRead, read_add_actions_from_amt};
+use crate::actions::visitors::{SetTransactionMap, SetTransactionVisitor};
 use crate::actions::{
     ADD_NAME, CheckpointAction, DOMAIN_METADATA_NAME, LOG_DOMAIN_METADATA_SCHEMA,
     LOG_METADATA_SCHEMA, LOG_PROTOCOL_SCHEMA, LOG_TXN_SCHEMA, METADATA_NAME, PROTOCOL_NAME,
@@ -12,10 +13,11 @@ use crate::actions::{
 };
 use crate::expressions::Scalar;
 use crate::log_replay::ActionsBatch;
+use crate::log_segment::{DomainMetadataMap, scan_domain_metadata_actions};
 use crate::path::LogRoot;
 use crate::schema::{SchemaRef, StructType};
 use crate::utils::require;
-use crate::{Engine, KernelError, KernelResult, KernelResultIterator, Result};
+use crate::{Engine, KernelError, KernelResult, KernelResultIterator, Result, RowVisitor as _};
 
 /// The action kinds a read schema may ask a checkpoint action for.
 const CHECKPOINT_ACTION_KINDS: &[&str] = &[
@@ -108,6 +110,34 @@ pub(crate) fn read_checkpoint_action(
     Ok(Box::new(streams.into_iter().flatten()))
 }
 
+/// Returns the set transactions held by `checkpoint`, inline or in its sidecars, keyed by app id.
+pub(crate) fn read_checkpoint_action_transactions(
+    engine: &dyn Engine,
+    checkpoint: &CheckpointAction,
+    log_root: &LogRoot,
+) -> KernelResult<SetTransactionMap> {
+    let mut visitor = SetTransactionVisitor::new(None);
+    for batch in read_non_add_actions(engine, checkpoint, log_root, LOG_TXN_SCHEMA.clone())? {
+        visitor.visit_rows_of(batch?.actions.as_ref())?;
+    }
+    Ok(visitor.set_transactions)
+}
+
+/// Returns the domain metadata held by `checkpoint`, inline or in its sidecars, keyed by domain.
+pub(crate) fn read_checkpoint_action_domain_metadata(
+    engine: &dyn Engine,
+    checkpoint: &CheckpointAction,
+    log_root: &LogRoot,
+) -> KernelResult<DomainMetadataMap> {
+    let actions = read_non_add_actions(
+        engine,
+        checkpoint,
+        log_root,
+        LOG_DOMAIN_METADATA_SCHEMA.clone(),
+    )?;
+    scan_domain_metadata_actions(actions, None)
+}
+
 /// The `add` actions of `checkpoint`'s content tree, projected onto `read_schema`.
 fn read_tree_adds(
     engine: &dyn Engine,
@@ -183,6 +213,18 @@ fn inline_and_sidecar_actions(
     let inline = inline_actions(engine, action, source.clone(), rows, read_schema.clone())?;
     let spilled = read_sidecar_actions(engine, log_root, sidecars, action, source, read_schema)?;
     Ok(Box::new(inline.chain(spilled)))
+}
+
+/// [`read_checkpoint_action`] for a `read_schema` without `add`, which reads no stats.
+fn read_non_add_actions(
+    engine: &dyn Engine,
+    checkpoint: &CheckpointAction,
+    log_root: &LogRoot,
+    read_schema: SchemaRef,
+) -> KernelResult<Box<dyn KernelResultIterator<ActionsBatch>>> {
+    // TODO(#3421): propagate `Result` once the commit path can return Delta errors.
+    read_checkpoint_action(engine, checkpoint, log_root, read_schema, None)
+        .map_err(KernelError::generic_err)
 }
 
 #[cfg(test)]
