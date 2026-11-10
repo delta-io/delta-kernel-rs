@@ -616,14 +616,56 @@ mod tests {
         *unsafe { Box::from_raw(ptr.as_ptr().cast()) }
     }
 
+    // Check the full input matrix natively. The Miri wrapper keeps the distinct ownership,
+    // partition-binding, and release paths without repeating every combination.
     #[rstest]
     #[case::unpartitioned(false)]
     #[case::partitioned(true)]
+    #[cfg_attr(miri, ignore = "unsafe paths covered by distributed_write_state_miri")]
     #[tokio::test]
     async fn test_distributed_write_state_outlives_transaction(
         #[case] partitioned: bool,
         #[values(false, true)] roundtrip: bool,
         #[values(false, true)] physical_partition_keys: bool,
+    ) -> KernelResult<()> {
+        assert_distributed_write_state_outlives_transaction(
+            partitioned,
+            roundtrip,
+            physical_partition_keys,
+        )
+        .await
+    }
+
+    #[rstest]
+    #[case::unpartitioned_direct(false, false, false)]
+    #[case::partitioned_encoded_physical(true, true, true)]
+    #[case::partitioned_direct_logical(true, false, false)]
+    #[cfg_attr(
+        not(miri),
+        ignore = "Miri subset; the full write-state matrix runs natively"
+    )]
+    #[tokio::test]
+    async fn distributed_write_state_miri(
+        #[case] partitioned: bool,
+        #[case] roundtrip: bool,
+        #[case] physical_partition_keys: bool,
+    ) -> KernelResult<()> {
+        assert_distributed_write_state_outlives_transaction(
+            partitioned,
+            roundtrip,
+            physical_partition_keys,
+        )
+        .await
+    }
+
+    // Keep callback copies, error cleanup, and post-release reads shared by both wrappers.
+    // The unpartitioned Miri case covers absent partition metadata; the encoded case covers decoded
+    // state with physical keys. The direct case with logical keys keeps transaction-derived
+    // partition metadata without a decode, then builds and uses contexts after releasing the state.
+    async fn assert_distributed_write_state_outlives_transaction(
+        partitioned: bool,
+        roundtrip: bool,
+        physical_partition_keys: bool,
     ) -> KernelResult<()> {
         let schema = schema_ref! {
             nullable "number": INTEGER,

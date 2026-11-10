@@ -2339,16 +2339,47 @@ mod tests {
         Ok(())
     }
 
+    // Check replay-policy combinations natively. The Miri wrapper shares these assertions and
+    // keeps the builder ownership paths and both optional-statistics outcomes.
     #[rstest]
     #[case::default(None, false)]
     #[case::disabled(Some(FfiIncrementalReplay::Disabled), false)]
     #[case::zero_budget(Some(FfiIncrementalReplay::UpToCommits(0)), false)]
     #[case::sufficient_budget(Some(FfiIncrementalReplay::UpToCommits(1)), true)]
     #[case::unlimited(Some(FfiIncrementalReplay::Unlimited), true)]
+    #[cfg_attr(
+        miri,
+        ignore = "unsafe paths covered by snapshot_builder_crc_replay_miri"
+    )]
     fn snapshot_builder_incremental_crc_replay_applies_to_fresh_and_incremental_builds(
         #[case] mode: Option<FfiIncrementalReplay>,
         #[case] expect_file_stats: bool,
         #[values(false, true)] from_existing: bool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        assert_snapshot_builder_crc_replay(mode, expect_file_stats, from_existing)
+    }
+
+    #[rstest]
+    #[case::fresh_disabled(Some(FfiIncrementalReplay::Disabled), false, false)]
+    #[case::from_existing_with_stats(Some(FfiIncrementalReplay::UpToCommits(1)), true, true)]
+    #[cfg_attr(
+        not(miri),
+        ignore = "Miri subset; the full replay matrix runs natively"
+    )]
+    fn snapshot_builder_crc_replay_miri(
+        #[case] mode: Option<FfiIncrementalReplay>,
+        #[case] expect_file_stats: bool,
+        #[case] from_existing: bool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        assert_snapshot_builder_crc_replay(mode, expect_file_stats, from_existing)
+    }
+
+    // A fresh Disabled builder yields no statistics. UpToCommits(1) from an existing builder yields
+    // statistics and must remain valid after the base snapshot is freed.
+    fn assert_snapshot_builder_crc_replay(
+        mode: Option<FfiIncrementalReplay>,
+        expect_file_stats: bool,
+        from_existing: bool,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let table = TestTableBuilder::new()
             .with_log_state(LogState::with_latest_version(1).with_crc_at([0]))
