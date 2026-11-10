@@ -18,7 +18,7 @@ use crate::unit_test_utils::adaptive_metadata_fixtures::{
     checkpoint_line, domain, domain_metadata_line, setup_adaptive_metadata_table, txn_line,
     write_ict_commit, write_sidecar,
 };
-use crate::unit_test_utils::{Action, is_io_event};
+use crate::unit_test_utils::is_io_event;
 use crate::{Snapshot, SnapshotRef, Version};
 
 /// The version [`table_with_checkpoint_action`] commits its checkpoint action at.
