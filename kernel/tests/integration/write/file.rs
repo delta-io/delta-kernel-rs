@@ -315,6 +315,7 @@ async fn test_write_and_read_nested_file_column(
 #[case::negative_size((Some("s3://b/a"), None, Some(-1), None), "`size` is negative")]
 #[case::uri_leading_slash((Some("/a.png"), None, None, None), "a relative uri must not start with '/'")]
 #[case::uri_parent((Some("_files/../a.png"), None, None, None), "a relative uri must not contain a '.' or '..' segment")]
+#[case::uri_unparseable_absolute((Some("http://[bad/a.png"), None, None, None), "an absolute uri must parse as a URL")]
 #[tokio::test(flavor = "multi_thread")]
 async fn test_write_rejects_invalid_file_value(
     #[case] value: Value<'static>,

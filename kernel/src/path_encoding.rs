@@ -7,6 +7,7 @@
 use std::borrow::Cow;
 
 use percent_encoding::{AsciiSet, CONTROLS, percent_decode_str, utf8_percent_encode};
+use url::Url;
 
 /// Characters encoded by [`uri_encode_path`]: `%`, space, and ASCII chars illegal in a
 /// URI path, plus all ASCII controls via [`CONTROLS`]. Non-ASCII UTF-8 bytes are ALSO
@@ -78,6 +79,16 @@ fn is_scheme_char(ch: char, position: usize) -> bool {
         return true;
     }
     position > 0 && (ch.is_ascii_digit() || ch == '+' || ch == '-' || ch == '.')
+}
+
+/// Returns `url` as a string that ends in `/`, so a relative path can be appended to it with no
+/// further separator.
+pub(crate) fn with_trailing_slash(url: &Url) -> String {
+    let mut base = url.as_str().to_string();
+    if !base.ends_with('/') {
+        base.push('/');
+    }
+    base
 }
 
 #[cfg(test)]

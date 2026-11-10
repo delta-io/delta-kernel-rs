@@ -5,7 +5,7 @@
 
 use url::{ParseError, Url};
 
-use crate::path_encoding::{scheme_len, uri_decode_path, uri_encode_path};
+use crate::path_encoding::{scheme_len, uri_decode_path, uri_encode_path, with_trailing_slash};
 use crate::utils::{require, to_file_size};
 use crate::{FileMeta, KernelError, KernelResult};
 
@@ -137,10 +137,7 @@ pub(crate) fn validate_table_relative(path: &str) -> KernelResult<()> {
 /// Returns an error if the resolved location fails to parse as a [`Url`].
 fn encode_and_join(path: &str, table_root: &Url) -> KernelResult<Url> {
     reject_dot_segments(path)?;
-    let mut base = table_root.as_str().to_string();
-    if !base.ends_with('/') {
-        base.push('/');
-    }
+    let base = with_trailing_slash(table_root);
     uri_with_encoded_path(&base, path).map_err(|e| {
         KernelError::generic(format!(
             "Failed to resolve relative AMT location {path:?} against table root {base}: {e}"
@@ -168,6 +165,10 @@ fn uri_with_encoded_path(prefix: &str, raw_path: &str) -> Result<Url, ParseError
 
 /// Rejects a `path` containing a `.` or `..` segment: the Iceberg V4 path spec does not support
 /// relative navigation, and URL parsing would otherwise silently collapse such segments.
+///
+/// An AMT path is raw: kernel percent-encodes it before parsing, so `%` and `\` are data and only
+/// a literal `.` or `..` segment navigates. A `file` value's `uri` is already percent-encoded, so
+/// `file_uri::validate_relative_uri` also checks decoded and `\`-separated segments.
 pub(crate) fn reject_dot_segments(path: &str) -> KernelResult<()> {
     require!(
         !path

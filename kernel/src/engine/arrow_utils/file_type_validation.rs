@@ -899,12 +899,17 @@ mod tests {
     #[case::absolute("s3://b/a", None)]
     #[case::relative("_files/a.png", None)]
     #[case::relative_outside_files("other/a.png", None)]
-    #[case::leading_slash("/a.png", Some("a relative uri must not start with '/'"))]
+    #[case::leading_slash("/a.png", Some("a relative uri must not start with '/' or '\\'"))]
     #[case::parent(
         "_files/../a.png",
         Some("a relative uri must not contain a '.' or '..' segment")
     )]
     #[case::empty("", Some("a relative uri must have a non-empty path"))]
+    #[case::encoded_parent(
+        "_files/..%2fa.png",
+        Some("a relative uri must not contain a '.' or '..' segment")
+    )]
+    #[case::unparseable_absolute("http://[bad/a.png", Some("an absolute uri must parse as a URL"))]
     #[case::space(
         "_files/a b.png",
         Some("contains a space or an ASCII control character")
@@ -924,16 +929,15 @@ mod tests {
     }
 
     /// A dictionary-encoded `uri` is checked like a plain string one.
-    #[test]
-    fn write_checks_dictionary_encoded_uri() {
-        let uris: DictionaryArray<Int32Type> = vec![Some("/a.png")].into_iter().collect();
+    #[rstest]
+    #[case::relative("/a.png", "a relative uri must not start with '/' or '\\'")]
+    #[case::absolute("http://[bad/a.png", "an absolute uri must parse as a URL")]
+    fn write_checks_dictionary_encoded_uri(#[case] uri: &str, #[case] problem: &str) {
+        let uris: DictionaryArray<Int32Type> = vec![Some(uri)].into_iter().collect();
         let file = with_field(file_array(&[VALID]), "uri", Arc::new(uris));
         let (data, schema) = top_level(file);
-        assert_invalid(
-            validate_file_values_for_write(&data, &schema),
-            "f",
-            "a relative uri must not start with '/'",
-        );
+        validate_file_values_for_read(&data, &schema).unwrap();
+        assert_invalid(validate_file_values_for_write(&data, &schema), "f", problem);
     }
 
     /// Writes check the `checksum` format; reads do not, since readers ignore what they cannot use.
