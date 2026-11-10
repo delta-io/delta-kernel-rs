@@ -200,15 +200,14 @@ storage call may serve multiple higher-level operations.
 > `emit_parquet_read_completed` once per read call so connectors that install
 > the metrics layer still see those events from your handler.
 
-### CRC write events
+### Checksum write events
 
-`Snapshot::write_checksum` reports one `CrcWrite` event per returned call.
-Its `outcome` is `Written { bytes_written }`, `AlreadyExists`, or `Error`.
-Failures use `outcome = Error`; there is no separate failure event.
-The event also includes `resolution_mode` and total call `duration`,
-including CRC resolution and construction of the returned snapshot.
-See [CrcWrite](https://docs.rs/delta_kernel/latest/delta_kernel/metrics/struct.CrcWrite.html)
-for the fields and resolution modes.
+To track checksum write latency and errors, use
+[ChecksumWriteSuccess](https://docs.rs/delta_kernel/latest/delta_kernel/metrics/struct.ChecksumWriteSuccess.html)
+and [ChecksumWriteFailure](https://docs.rs/delta_kernel/latest/delta_kernel/metrics/struct.ChecksumWriteFailure.html).
+A checksum that already exists produces a success event. See
+[Snapshot::write_checksum](https://docs.rs/delta_kernel/latest/delta_kernel/struct.Snapshot.html#method.write_checksum)
+for the call's behavior.
 
 ## Correlating events with MetricId
 

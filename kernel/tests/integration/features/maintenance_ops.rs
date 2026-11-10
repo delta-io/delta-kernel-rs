@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use delta_kernel::checkpoint::{CheckpointSpec, V2CheckpointConfig};
 use delta_kernel::committer::FileSystemCommitter;
-use delta_kernel::metrics::{CrcWriteOutcome, CrcWriteResolutionMode, MetricEvent};
+use delta_kernel::metrics::{ChecksumWriteResolutionMode, MetricEvent};
 use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::schema::schema_ref;
 use delta_kernel::snapshot::{CheckpointWriteResult, ChecksumWriteResult};
@@ -211,12 +211,18 @@ async fn checkpoint_crc_writes_reject_unsupported_table_features(
     let elapsed = start.elapsed();
     assert_result_error_with_message(checksum_result, "futureFeature");
 
-    let events = reporter.events();
-    let [MetricEvent::CrcWrite(event)] = &events[initial_event_count..] else {
-        panic!("expected one CrcWrite event");
+    let events: Vec<_> = reporter
+        .events()
+        .into_iter()
+        .skip(initial_event_count)
+        .collect();
+    let [MetricEvent::ChecksumWriteFailure(event)] = events.as_slice() else {
+        panic!("expected one ChecksumWriteFailure event");
     };
-    assert_eq!(event.outcome, CrcWriteOutcome::Error);
-    assert_eq!(event.resolution_mode, CrcWriteResolutionMode::NotAttempted);
+    assert_eq!(
+        event.resolution_mode,
+        ChecksumWriteResolutionMode::NotAttempted
+    );
     assert!(event.duration > Duration::ZERO);
     assert!(event.duration <= elapsed);
 

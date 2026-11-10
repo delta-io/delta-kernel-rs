@@ -125,12 +125,12 @@ impl From<kernel::CheckpointWriteMode> for CheckpointWriteMode {
     }
 }
 
-/// Final result of a [`delta_kernel::Snapshot::write_checksum`] call.
+/// Outcome of a successful [`delta_kernel::Snapshot::write_checksum`] call.
 ///
 /// cbindgen:prefix-with-name=true
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(C)]
-pub enum CrcWriteOutcome {
+pub enum ChecksumWriteOutcome {
     /// The CRC was written and the returned snapshot was constructed successfully.
     Written {
         /// Exact serialized UTF-8 byte count written by this call.
@@ -138,16 +138,15 @@ pub enum CrcWriteOutcome {
     },
     /// The CRC already existed, including a concurrent writer winning the storage race.
     AlreadyExists,
-    /// The call returned an error, even if the storage write had succeeded.
-    Error,
 }
 
-impl From<kernel::CrcWriteOutcome> for CrcWriteOutcome {
-    fn from(outcome: kernel::CrcWriteOutcome) -> Self {
+impl From<kernel::ChecksumWriteOutcome> for ChecksumWriteOutcome {
+    fn from(outcome: kernel::ChecksumWriteOutcome) -> Self {
         match outcome {
-            kernel::CrcWriteOutcome::Written { bytes_written } => Self::Written { bytes_written },
-            kernel::CrcWriteOutcome::AlreadyExists => Self::AlreadyExists,
-            kernel::CrcWriteOutcome::Error => Self::Error,
+            kernel::ChecksumWriteOutcome::Written { bytes_written } => {
+                Self::Written { bytes_written }
+            }
+            kernel::ChecksumWriteOutcome::AlreadyExists => Self::AlreadyExists,
         }
     }
 }
@@ -157,7 +156,7 @@ impl From<kernel::CrcWriteOutcome> for CrcWriteOutcome {
 /// cbindgen:prefix-with-name=true
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(C)]
-pub enum CrcWriteResolutionMode {
+pub enum ChecksumWriteResolutionMode {
     /// Attempted construction from a checkpoint or version zero, replaying commits as needed.
     Full,
     /// Attempted to advance an older CRC by replaying newer commits.
@@ -168,13 +167,13 @@ pub enum CrcWriteResolutionMode {
     NotAttempted,
 }
 
-impl From<kernel::CrcWriteResolutionMode> for CrcWriteResolutionMode {
-    fn from(mode: kernel::CrcWriteResolutionMode) -> Self {
+impl From<kernel::ChecksumWriteResolutionMode> for ChecksumWriteResolutionMode {
+    fn from(mode: kernel::ChecksumWriteResolutionMode) -> Self {
         match mode {
-            kernel::CrcWriteResolutionMode::Full => Self::Full,
-            kernel::CrcWriteResolutionMode::Incremental => Self::Incremental,
-            kernel::CrcWriteResolutionMode::Cached => Self::Cached,
-            kernel::CrcWriteResolutionMode::NotAttempted => Self::NotAttempted,
+            kernel::ChecksumWriteResolutionMode::Full => Self::Full,
+            kernel::ChecksumWriteResolutionMode::Incremental => Self::Incremental,
+            kernel::ChecksumWriteResolutionMode::Cached => Self::Cached,
+            kernel::ChecksumWriteResolutionMode::NotAttempted => Self::NotAttempted,
         }
     }
 }
@@ -439,14 +438,25 @@ pub struct CrcReadSuccess {
     pub duration_ns: u64,
 }
 
-/// Metrics for one returned [`delta_kernel::Snapshot::write_checksum`] call.
+/// A [`delta_kernel::Snapshot::write_checksum`] call succeeded.
 #[repr(C)]
-pub struct CrcWrite {
-    /// Final API outcome, including the serialized byte count only when written.
-    pub outcome: CrcWriteOutcome,
-    /// CRC construction path selected during this call, including failures.
-    pub resolution_mode: CrcWriteResolutionMode,
-    /// Wall-clock time from API entry to return, including errors and snapshot updates.
+pub struct ChecksumWriteSuccess {
+    /// Whether this call wrote a new CRC or the CRC already existed.
+    pub outcome: ChecksumWriteOutcome,
+    /// CRC construction path selected during this call.
+    pub resolution_mode: ChecksumWriteResolutionMode,
+    /// Wall-clock time from API entry to return.
+    pub duration_ns: u64,
+}
+
+/// A [`delta_kernel::Snapshot::write_checksum`] call failed.
+///
+/// Storage may already contain the CRC if constructing the returned snapshot failed.
+#[repr(C)]
+pub struct ChecksumWriteFailure {
+    /// CRC construction path selected before the error.
+    pub resolution_mode: ChecksumWriteResolutionMode,
+    /// Wall-clock time from API entry to return.
     pub duration_ns: u64,
 }
 
@@ -535,7 +545,8 @@ pub enum MetricEvent {
     StorageCopyCompleted(StorageCopyCompleted),
     CheckpointWriteSuccess(CheckpointWriteSuccess),
     CheckpointWriteFailure(CheckpointWriteFailure),
-    CrcWrite(CrcWrite),
+    ChecksumWriteSuccess(ChecksumWriteSuccess),
+    ChecksumWriteFailure(ChecksumWriteFailure),
 }
 
 /// Borrow the caller-supplied correlation id as a [`KernelStringSlice`], or an empty slice when
@@ -721,12 +732,19 @@ impl MetricEvent {
                 duration_ns: ns(*duration),
             }),
             K::CrcReadFailure => Self::CrcReadFailure,
-            K::CrcWrite(kernel::CrcWrite {
+            K::ChecksumWriteSuccess(kernel::ChecksumWriteSuccess {
                 outcome,
                 resolution_mode,
                 duration,
-            }) => Self::CrcWrite(CrcWrite {
+            }) => Self::ChecksumWriteSuccess(ChecksumWriteSuccess {
                 outcome: (*outcome).into(),
+                resolution_mode: (*resolution_mode).into(),
+                duration_ns: ns(*duration),
+            }),
+            K::ChecksumWriteFailure(kernel::ChecksumWriteFailure {
+                resolution_mode,
+                duration,
+            }) => Self::ChecksumWriteFailure(ChecksumWriteFailure {
                 resolution_mode: (*resolution_mode).into(),
                 duration_ns: ns(*duration),
             }),
@@ -1035,39 +1053,97 @@ mod tests {
 
     #[rstest]
     #[case::written(
-        kernel::CrcWriteOutcome::Written { bytes_written: u64::MAX },
-        CrcWriteOutcome::Written { bytes_written: u64::MAX }
+        kernel::ChecksumWriteOutcome::Written { bytes_written: u64::MAX },
+        ChecksumWriteOutcome::Written { bytes_written: u64::MAX }
     )]
     #[case::written_zero(
-        kernel::CrcWriteOutcome::Written { bytes_written: 0 },
-        CrcWriteOutcome::Written { bytes_written: 0 }
+        kernel::ChecksumWriteOutcome::Written { bytes_written: 0 },
+        ChecksumWriteOutcome::Written { bytes_written: 0 }
     )]
-    #[case::already_exists(kernel::CrcWriteOutcome::AlreadyExists, CrcWriteOutcome::AlreadyExists)]
-    #[case::error(kernel::CrcWriteOutcome::Error, CrcWriteOutcome::Error)]
-    fn from_kernel_crc_write_preserves_payload_mode_and_duration(
-        #[case] outcome: kernel::CrcWriteOutcome,
-        #[case] expected_outcome: CrcWriteOutcome,
+    #[case::already_exists(
+        kernel::ChecksumWriteOutcome::AlreadyExists,
+        ChecksumWriteOutcome::AlreadyExists
+    )]
+    fn from_kernel_checksum_write_success_preserves_payload_mode_and_duration(
+        #[case] outcome: kernel::ChecksumWriteOutcome,
+        #[case] expected_outcome: ChecksumWriteOutcome,
         #[values(
-            (kernel::CrcWriteResolutionMode::Full, CrcWriteResolutionMode::Full),
-            (kernel::CrcWriteResolutionMode::Incremental, CrcWriteResolutionMode::Incremental),
-            (kernel::CrcWriteResolutionMode::Cached, CrcWriteResolutionMode::Cached),
-            (kernel::CrcWriteResolutionMode::NotAttempted, CrcWriteResolutionMode::NotAttempted)
+            (kernel::ChecksumWriteResolutionMode::Full, ChecksumWriteResolutionMode::Full),
+            (
+                kernel::ChecksumWriteResolutionMode::Incremental,
+                ChecksumWriteResolutionMode::Incremental
+            ),
+            (kernel::ChecksumWriteResolutionMode::Cached, ChecksumWriteResolutionMode::Cached),
+            (
+                kernel::ChecksumWriteResolutionMode::NotAttempted,
+                ChecksumWriteResolutionMode::NotAttempted
+            )
         )]
-        modes: (kernel::CrcWriteResolutionMode, CrcWriteResolutionMode),
+        modes: (
+            kernel::ChecksumWriteResolutionMode,
+            ChecksumWriteResolutionMode,
+        ),
+        #[values(
+            (Duration::ZERO, 0),
+            (Duration::from_nanos(123_456_789), 123_456_789),
+            (Duration::from_nanos(u64::MAX), u64::MAX)
+        )]
+        durations: (Duration, u64),
     ) {
         let (mode, expected_mode) = modes;
-        let event = kernel::MetricEvent::CrcWrite(kernel::CrcWrite {
+        let (duration, expected_duration_ns) = durations;
+        let event = kernel::MetricEvent::ChecksumWriteSuccess(kernel::ChecksumWriteSuccess {
             outcome,
             resolution_mode: mode,
-            duration: Duration::from_nanos(123_456_789),
+            duration,
         });
         with_ffi_event(&event, |ffi| {
-            let MetricEvent::CrcWrite(event) = ffi else {
-                panic!("expected CrcWrite");
+            let MetricEvent::ChecksumWriteSuccess(event) = ffi else {
+                panic!("expected ChecksumWriteSuccess");
             };
             assert_eq!(event.outcome, expected_outcome);
             assert_eq!(event.resolution_mode, expected_mode);
-            assert_eq!(event.duration_ns, 123_456_789);
+            assert_eq!(event.duration_ns, expected_duration_ns);
+        });
+    }
+
+    #[rstest]
+    fn from_kernel_checksum_write_failure_preserves_mode_and_duration(
+        #[values(
+            (kernel::ChecksumWriteResolutionMode::Full, ChecksumWriteResolutionMode::Full),
+            (
+                kernel::ChecksumWriteResolutionMode::Incremental,
+                ChecksumWriteResolutionMode::Incremental
+            ),
+            (kernel::ChecksumWriteResolutionMode::Cached, ChecksumWriteResolutionMode::Cached),
+            (
+                kernel::ChecksumWriteResolutionMode::NotAttempted,
+                ChecksumWriteResolutionMode::NotAttempted
+            )
+        )]
+        modes: (
+            kernel::ChecksumWriteResolutionMode,
+            ChecksumWriteResolutionMode,
+        ),
+        #[values(
+            (Duration::ZERO, 0),
+            (Duration::from_nanos(123_456_789), 123_456_789),
+            (Duration::from_nanos(u64::MAX), u64::MAX)
+        )]
+        durations: (Duration, u64),
+    ) {
+        let (mode, expected_mode) = modes;
+        let (duration, expected_duration_ns) = durations;
+        let event = kernel::MetricEvent::ChecksumWriteFailure(kernel::ChecksumWriteFailure {
+            resolution_mode: mode,
+            duration,
+        });
+        with_ffi_event(&event, |ffi| {
+            let MetricEvent::ChecksumWriteFailure(event) = ffi else {
+                panic!("expected ChecksumWriteFailure");
+            };
+            assert_eq!(event.resolution_mode, expected_mode);
+            assert_eq!(event.duration_ns, expected_duration_ns);
         });
     }
 

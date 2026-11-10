@@ -114,7 +114,8 @@ pub(crate) fn is_io_event(event: &MetricEvent) -> bool {
         | MetricEvent::SetTransactionLoadFailure
         | MetricEvent::CrcReadSuccess(_)
         | MetricEvent::CrcReadFailure
-        | MetricEvent::CrcWrite(_)
+        | MetricEvent::ChecksumWriteSuccess(_)
+        | MetricEvent::ChecksumWriteFailure(_)
         | MetricEvent::ScanMetadataCompleted(_) => false,
     }
 }

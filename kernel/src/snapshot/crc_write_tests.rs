@@ -9,9 +9,9 @@ use super::snapshot_crc::SnapshotCrc;
 use super::{ChecksumWriteResult, IncrementalReplay, SnapshotRef};
 use crate::committer::FileSystemCommitter;
 use crate::crc::FileStatsState;
+use crate::engine::DelegatingEngine;
 use crate::engine::sync::SyncEngine;
-use crate::engine::test_delegating::DelegatingEngine;
-use crate::metrics::{CrcWrite, CrcWriteOutcome, CrcWriteResolutionMode, MetricEvent};
+use crate::metrics::{ChecksumWriteOutcome, ChecksumWriteResolutionMode, MetricEvent};
 use crate::object_store::memory::InMemory;
 use crate::path::ParsedLogPath;
 use crate::schema::{DataType, StructField, StructType};
@@ -63,25 +63,27 @@ fn snapshot_for_root(engine: &dyn Engine, root: CrcRoot) -> Result<SnapshotRef> 
         .build(engine)
 }
 
-fn write_events(reporter: &CapturingReporter) -> Vec<CrcWrite> {
+fn write_events(reporter: &CapturingReporter) -> Vec<MetricEvent> {
     reporter
         .events()
         .into_iter()
-        .filter_map(|event| match event {
-            MetricEvent::CrcWrite(event) => Some(event),
-            _ => None,
+        .filter(|event| {
+            matches!(
+                event,
+                MetricEvent::ChecksumWriteSuccess(_) | MetricEvent::ChecksumWriteFailure(_)
+            )
         })
         .collect()
 }
 
 #[rstest]
-#[case::cached(CrcRoot::Cached, CrcWriteResolutionMode::Cached)]
-#[case::stale_crc(CrcRoot::StaleCrc, CrcWriteResolutionMode::Incremental)]
-#[case::version_zero(CrcRoot::VersionZero, CrcWriteResolutionMode::Full)]
-#[case::checkpoint(CrcRoot::Checkpoint, CrcWriteResolutionMode::Full)]
+#[case::cached(CrcRoot::Cached, ChecksumWriteResolutionMode::Cached)]
+#[case::stale_crc(CrcRoot::StaleCrc, ChecksumWriteResolutionMode::Incremental)]
+#[case::version_zero(CrcRoot::VersionZero, ChecksumWriteResolutionMode::Full)]
+#[case::checkpoint(CrcRoot::Checkpoint, ChecksumWriteResolutionMode::Full)]
 fn crc_write_reports_utf8_bytes_and_completes_while_snapshot_is_alive(
     #[case] root: CrcRoot,
-    #[case] expected_mode: CrcWriteResolutionMode,
+    #[case] expected_mode: ChecksumWriteResolutionMode,
 ) -> Result<()> {
     let reporter = Arc::new(CapturingReporter::default());
     let _guard = install_thread_local_metrics_reporter(reporter.clone());
@@ -96,7 +98,9 @@ fn crc_write_reports_utf8_bytes_and_completes_while_snapshot_is_alive(
 
     let events = write_events(&reporter);
     assert_eq!(events.len(), initial_write_count + 1);
-    let event = &events[initial_write_count];
+    let MetricEvent::ChecksumWriteSuccess(event) = &events[initial_write_count] else {
+        panic!("expected ChecksumWriteSuccess");
+    };
     assert_eq!(event.resolution_mode, expected_mode);
     assert!(event.duration > Duration::ZERO);
     assert!(event.duration <= elapsed);
@@ -112,7 +116,7 @@ fn crc_write_reports_utf8_bytes_and_completes_while_snapshot_is_alive(
     assert!(text.len() > text.chars().count());
     assert_eq!(
         event.outcome,
-        CrcWriteOutcome::Written {
+        ChecksumWriteOutcome::Written {
             bytes_written: data.len() as u64,
         }
     );
@@ -121,11 +125,11 @@ fn crc_write_reports_utf8_bytes_and_completes_while_snapshot_is_alive(
 }
 
 #[rstest]
-#[case::early_exists(false, CrcWriteResolutionMode::NotAttempted)]
-#[case::storage_race(true, CrcWriteResolutionMode::Cached)]
+#[case::early_exists(false, ChecksumWriteResolutionMode::NotAttempted)]
+#[case::storage_race(true, ChecksumWriteResolutionMode::Cached)]
 fn crc_write_already_exists_reports_no_bytes(
     #[case] use_original_snapshot: bool,
-    #[case] expected_mode: CrcWriteResolutionMode,
+    #[case] expected_mode: ChecksumWriteResolutionMode,
 ) -> KernelResult<()> {
     let reporter = Arc::new(CapturingReporter::default());
     let _guard = install_thread_local_metrics_reporter(reporter.clone());
@@ -146,8 +150,10 @@ fn crc_write_already_exists_reports_no_bytes(
 
     let events = write_events(&reporter);
     assert_eq!(events.len(), 2);
-    let event = &events[1];
-    assert_eq!(event.outcome, CrcWriteOutcome::AlreadyExists);
+    let MetricEvent::ChecksumWriteSuccess(event) = &events[1] else {
+        panic!("expected ChecksumWriteSuccess");
+    };
+    assert_eq!(event.outcome, ChecksumWriteOutcome::AlreadyExists);
     assert_eq!(event.resolution_mode, expected_mode);
     assert!(event.duration > Duration::ZERO);
     assert!(event.duration <= elapsed);
@@ -155,12 +161,12 @@ fn crc_write_already_exists_reports_no_bytes(
 }
 
 #[rstest]
-#[case::indeterminate_stats(CrcRoot::Cached, CrcWriteResolutionMode::Cached)]
-#[case::stale_crc_read_error(CrcRoot::StaleCrc, CrcWriteResolutionMode::Incremental)]
-#[case::version_zero_read_error(CrcRoot::VersionZero, CrcWriteResolutionMode::Full)]
+#[case::indeterminate_stats(CrcRoot::Cached, ChecksumWriteResolutionMode::Cached)]
+#[case::stale_crc_read_error(CrcRoot::StaleCrc, ChecksumWriteResolutionMode::Incremental)]
+#[case::version_zero_read_error(CrcRoot::VersionZero, ChecksumWriteResolutionMode::Full)]
 fn crc_write_resolution_or_validation_error_retains_mode_and_duration(
     #[case] root: CrcRoot,
-    #[case] expected_mode: CrcWriteResolutionMode,
+    #[case] expected_mode: ChecksumWriteResolutionMode,
 ) -> Result<()> {
     let reporter = Arc::new(CapturingReporter::default());
     let _guard = install_thread_local_metrics_reporter(reporter.clone());
@@ -168,7 +174,9 @@ fn crc_write_resolution_or_validation_error_retains_mode_and_duration(
     let mut snapshot = snapshot_for_root(&engine, root)?;
     if let CrcRoot::Cached = root {
         let mut crc = snapshot.crc_at_version().unwrap().as_ref().clone();
-        crc.file_stats_state = FileStatsState::Indeterminate;
+        crc.file_stats_state = FileStatsState::Indeterminate {
+            unsupported_operation: None,
+        };
         let version = snapshot.version();
         Arc::get_mut(&mut snapshot).unwrap().crc =
             SnapshotCrc::try_new(Some(Arc::new(crc)), version, None)?;
@@ -188,8 +196,9 @@ fn crc_write_resolution_or_validation_error_retains_mode_and_duration(
     let elapsed = start.elapsed();
     let events = write_events(&reporter);
     assert_eq!(events.len(), initial_write_count + 1);
-    let event = &events[initial_write_count];
-    assert_eq!(event.outcome, CrcWriteOutcome::Error);
+    let MetricEvent::ChecksumWriteFailure(event) = &events[initial_write_count] else {
+        panic!("expected ChecksumWriteFailure");
+    };
     assert_eq!(event.resolution_mode, expected_mode);
     assert!(event.duration > Duration::ZERO);
     assert!(event.duration <= elapsed);
@@ -197,7 +206,7 @@ fn crc_write_resolution_or_validation_error_retains_mode_and_duration(
 }
 
 #[test]
-fn crc_write_snapshot_update_error_reports_no_bytes_after_successful_put() -> KernelResult<()> {
+fn crc_write_snapshot_update_error_reports_failure_after_successful_put() -> KernelResult<()> {
     let reporter = Arc::new(CapturingReporter::default());
     let _guard = install_thread_local_metrics_reporter(reporter.clone());
     let engine = SyncEngine::new_with_store(Arc::new(InMemory::new()));
@@ -210,9 +219,11 @@ fn crc_write_snapshot_update_error_reports_no_bytes_after_successful_put() -> Ke
     assert!(engine.storage_handler().head(&path.location).is_ok());
     let events = write_events(&reporter);
     assert_eq!(events.len(), 1);
-    assert_eq!(events[0].outcome, CrcWriteOutcome::Error);
-    assert_eq!(events[0].resolution_mode, CrcWriteResolutionMode::Cached);
-    assert!(events[0].duration > Duration::ZERO);
+    let MetricEvent::ChecksumWriteFailure(event) = &events[0] else {
+        panic!("expected ChecksumWriteFailure");
+    };
+    assert_eq!(event.resolution_mode, ChecksumWriteResolutionMode::Cached);
+    assert!(event.duration > Duration::ZERO);
     Ok(())
 }
 
@@ -256,13 +267,13 @@ impl StorageHandler for PutStorage {
 }
 
 #[rstest]
-#[case::cached(CrcRoot::Cached, CrcWriteResolutionMode::Cached)]
-#[case::stale_crc(CrcRoot::StaleCrc, CrcWriteResolutionMode::Incremental)]
-#[case::version_zero(CrcRoot::VersionZero, CrcWriteResolutionMode::Full)]
-#[case::checkpoint(CrcRoot::Checkpoint, CrcWriteResolutionMode::Full)]
+#[case::cached(CrcRoot::Cached, ChecksumWriteResolutionMode::Cached)]
+#[case::stale_crc(CrcRoot::StaleCrc, ChecksumWriteResolutionMode::Incremental)]
+#[case::version_zero(CrcRoot::VersionZero, ChecksumWriteResolutionMode::Full)]
+#[case::checkpoint(CrcRoot::Checkpoint, ChecksumWriteResolutionMode::Full)]
 fn crc_write_duration_includes_storage_even_on_error(
     #[case] root: CrcRoot,
-    #[case] expected_mode: CrcWriteResolutionMode,
+    #[case] expected_mode: ChecksumWriteResolutionMode,
     #[values(false, true)] fail: bool,
 ) -> Result<()> {
     let reporter = Arc::new(CapturingReporter::default());
@@ -282,12 +293,18 @@ fn crc_write_duration_includes_storage_even_on_error(
     assert_eq!(result.is_err(), fail);
     let events = write_events(&reporter);
     assert_eq!(events.len(), initial_write_count + 1);
-    let event = &events[initial_write_count];
-    assert_eq!(
-        event.outcome.as_ref(),
-        if fail { "error" } else { "written" }
-    );
-    assert_eq!(event.resolution_mode, expected_mode);
-    assert!(event.duration >= delay);
+    let (resolution_mode, duration) = match (&events[initial_write_count], fail) {
+        (MetricEvent::ChecksumWriteSuccess(event), false) => {
+            assert!(matches!(
+                event.outcome,
+                ChecksumWriteOutcome::Written { .. }
+            ));
+            (event.resolution_mode, event.duration)
+        }
+        (MetricEvent::ChecksumWriteFailure(event), true) => (event.resolution_mode, event.duration),
+        (event, _) => panic!("unexpected checksum write event: {event:?}"),
+    };
+    assert_eq!(resolution_mode, expected_mode);
+    assert!(duration >= delay);
     Ok(())
 }

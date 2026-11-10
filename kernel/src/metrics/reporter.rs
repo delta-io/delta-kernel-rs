@@ -10,10 +10,10 @@ use tracing_subscriber::Layer;
 use tracing_subscriber::layer::Context;
 
 use super::events::{
-    CheckpointWriteSuccess, CrcReadSuccess, CrcWrite, DomainMetadataLoadSuccess, JsonReadCompleted,
-    LogSegmentLoadSuccess, MetricEvent, ParquetReadCompleted, ProtocolMetadataLoadSuccess, STORAGE_SPAN,
-    ScanMetadataCompleted, SetTransactionLoadSuccess, SnapshotBuildSuccess,
-    TransactionCommitSuccess, storage_metric_from_attrs,
+    CheckpointWriteSuccess, ChecksumWriteSuccess, CrcReadSuccess, DomainMetadataLoadSuccess,
+    JsonReadCompleted, LogSegmentLoadSuccess, MetricEvent, ParquetReadCompleted,
+    ProtocolMetadataLoadSuccess, STORAGE_SPAN, ScanMetadataCompleted, SetTransactionLoadSuccess,
+    SnapshotBuildSuccess, TransactionCommitSuccess, storage_metric_from_attrs,
 };
 
 // ====================================================================
@@ -132,7 +132,9 @@ where
             CrcReadSuccess::SPAN_NAME => Some(MetricEvent::CrcReadSuccess(
                 CrcReadSuccess::from_attrs(attrs),
             )),
-            CrcWrite::SPAN_NAME => Some(MetricEvent::CrcWrite(CrcWrite::from_attrs(attrs))),
+            ChecksumWriteSuccess::SPAN_NAME => Some(MetricEvent::ChecksumWriteSuccess(
+                ChecksumWriteSuccess::from_attrs(attrs),
+            )),
             JsonReadCompleted::SPAN_NAME => Some(MetricEvent::JsonReadCompleted(
                 JsonReadCompleted::from_attrs(attrs),
             )),
@@ -153,8 +155,7 @@ where
     }
 
     // RUNTIME CHANNEL. on_event carries log lines, not metric writes; its only metric effect is the
-    // `#[instrument(err)]` failure signal, which FailureFlipVisitor turns into the event's failure
-    // variant or error outcome.
+    // `#[instrument(err)]` failure signal, which FailureFlipVisitor turns into the failure variant.
     fn on_event(&self, event: &tracing::Event<'_>, ctx: Context<'_, S>) {
         let Some(span) = ctx.event_span(event) else {
             return;
