@@ -305,13 +305,16 @@ fn metadata_visit_preserves_original_schema_json_and_does_not_consume_snapshot()
 }
 
 #[rstest::rstest]
-#[case::latest(FfiSnapshotHintFreshness::Latest, true)]
-#[case::unverified(FfiSnapshotHintFreshness::Unverified, false)]
+#[case::latest(FfiSnapshotHintFreshness::Latest, false, true)]
+#[case::unverified(FfiSnapshotHintFreshness::Unverified, false, false)]
+#[case::confirmed_latest(FfiSnapshotHintFreshness::Unverified, true, true)]
 fn exported_hint_copy_outlives_snapshot_and_preserves_state(
     #[case] freshness: FfiSnapshotHintFreshness,
+    #[case] with_matching_bound: bool,
     #[case] expected_latest: bool,
     #[values(false, true)] with_crc: bool,
 ) {
+    // GIVEN a complete hint with caller-provided freshness and an optional CRC.
     let engine = test_engine();
     let log_path = FfiLogPath::new(
         slice("memory:///hinted-table/_delta_log/00000000000000000000.json"),
@@ -323,15 +326,19 @@ fn exported_hint_copy_outlives_snapshot_and_preserves_state(
     if with_crc {
         hint.crc = &crc;
     }
-    let builder = unsafe {
+    let mut builder = unsafe {
         ok_or_panic(snapshot_builder_with_snapshot_hint(
             test_builder(&engine),
             &hint,
         ))
     };
+    if with_matching_bound {
+        builder = unsafe { snapshot_builder_with_max_catalog_version(builder, 0) };
+    }
     let snapshot = unsafe { ok_or_panic(snapshot_builder_build(builder)) };
     let expected_segment = unsafe { snapshot.as_ref() }.log_segment().clone();
     let expected_crc = unsafe { snapshot.as_ref() }.crc_at_version().cloned();
+    // WHEN the reconciled freshness is exported and the source snapshot is freed.
     let builder = ok_or_panic(install_through_visitor(
         &snapshot,
         test_builder(&engine),
@@ -340,6 +347,7 @@ fn exported_hint_copy_outlives_snapshot_and_preserves_state(
     unsafe { free_snapshot(snapshot) };
     let rebuilt = unsafe { ok_or_panic(snapshot_builder_build(builder)) };
     let rebuilt_ref = unsafe { rebuilt.as_ref() };
+    // THEN the copied hint preserves freshness and retained state independently of the source.
     assert_eq!(rebuilt_ref.version(), 0);
     assert_eq!(rebuilt_ref.is_built_as_latest(), expected_latest);
     assert_eq!(rebuilt_ref.log_segment(), &expected_segment);

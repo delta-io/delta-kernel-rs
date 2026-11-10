@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use tracing::{error, instrument};
 
-use super::{IncrementalReplay, PreparedSnapshot, Snapshot};
+use super::{IncrementalReplay, PreparedSnapshot, Snapshot, resolve_latest_claim};
 use crate::log_segment::{LogSegment, PmResolution};
 use crate::log_segment_files::{CheckpointHandling, LogSegmentFiles};
 use crate::metrics::{
@@ -76,8 +76,8 @@ impl Snapshot {
     /// only commits in `(S1, S2]` are replayed for newer P+M on top of it. A base CRC newer than
     /// `S1`, when present, serves as the baseline instead.
     ///
-    /// - **A.** `T == S1`: reuse the existing snapshot, clearing its latest claim if the catalog
-    ///   bound is newer than `S1`.
+    /// - **A.** `T == S1`: reuse the existing snapshot, reconciling its latest claim with any
+    ///   catalog bound as described in [`Snapshot::is_built_as_latest`].
     /// - **B.** `T < S1`: error. The incremental path only moves forward.
     /// - Otherwise (`T` unset or `T > S1`), list the log from `C1+1` (or from version 1 if there is
     ///   no existing checkpoint), and one of the following applies:
@@ -163,10 +163,12 @@ impl Snapshot {
             tracing::Span::current().record("version", requested_version);
             // Case A: re-requesting the same version.
             if requested_version == existing_snapshot_version {
-                // TODO(#3833): Promote cached freshness for latest requests.
                 // TODO(#3845): Preserve publication evidence from the supplied tail before reuse.
-                let built_as_latest = existing_snapshot.built_as_latest
-                    && max_catalog_version.is_none_or(|max| max <= existing_snapshot_version);
+                let built_as_latest = resolve_latest_claim(
+                    existing_snapshot_version,
+                    max_catalog_version,
+                    existing_snapshot.built_as_latest,
+                );
                 return Ok(Self::reuse_with_build_metadata(
                     &existing_snapshot,
                     built_as_latest,

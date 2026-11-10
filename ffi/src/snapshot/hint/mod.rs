@@ -170,9 +170,10 @@ unsafe fn snapshot_builder_with_snapshot_hint_impl(
 /// supplied log location must be beneath the builder's table log root, including paths discarded by
 /// checkpoint selection. Kernel preserves the locations; the connector must canonicalize them into
 /// the same URL form as the table root. Build performs the remaining structural and
-/// table-configuration validation. `Latest` makes `is_built_as_latest()` true unless a supplied
-/// catalog bound is newer than the hint version. Kernel otherwise trusts that caller claim.
-/// `Unverified` makes it false.
+/// table-configuration validation. Without a catalog bound, Kernel trusts the hint's freshness:
+/// `Latest` makes `is_built_as_latest()` true, and `Unverified` makes it false. A supplied bound
+/// equal to the hint version establishes freshness regardless of the hint's claim. A newer bound
+/// clears it. See [`Snapshot::is_built_as_latest`](delta_kernel::Snapshot::is_built_as_latest).
 /// The caller must ensure the protocol and metadata came from the supplied files and all staged
 /// commits were catalog-ratified. Staged paths in a hint do not by themselves require
 /// [`snapshot_builder_with_max_catalog_version`]. Without an explicit target, a catalog-managed

@@ -12,16 +12,16 @@ use crate::log_path::LogPath;
 use crate::log_segment::{LogSegment, validate_catalog_version_bounds};
 use crate::log_segment_files::{CheckpointHandling, LogSegmentFiles};
 use crate::path::{DELTA_LOG_DIR_WITH_SLASH, LogPathFileType, ParsedLogPath};
-use crate::snapshot::{IncrementalReplay, SnapshotRef};
+use crate::snapshot::{IncrementalReplay, SnapshotRef, resolve_latest_claim};
 use crate::table_configuration::TableConfiguration;
 use crate::utils::{require, try_parse_uri};
 use crate::{KernelError, KernelResult, Snapshot, Version};
 
 /// The freshness claim for the version carried by a [`SnapshotHint`].
 ///
-/// Kernel trusts this value: [`Latest`](Self::Latest) makes
-/// [`Snapshot::is_built_as_latest`] true unless a supplied catalog bound is newer than the hinted
-/// version, while [`Unverified`](Self::Unverified) makes it false.
+/// Without a catalog bound, Kernel trusts this value: [`Latest`](Self::Latest) makes
+/// [`Snapshot::is_built_as_latest`] true, while [`Unverified`](Self::Unverified) makes it false.
+/// A supplied bound reconciles the claim as described in [`Snapshot::is_built_as_latest`].
 /// Connector inputs supply this claim; exports preserve the snapshot's build-time claim.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(dead_code)]
@@ -58,7 +58,8 @@ pub(crate) enum PublicationWatermark {
 ///
 /// Kernel validates the log-segment shape, table configuration, and optional CRC consistency
 /// before constructing the snapshot. It does not replay the log to verify the supplied state's
-/// provenance. It trusts connector-provided freshness unless a supplied catalog bound is newer.
+/// provenance. Freshness follows [`Snapshot::is_built_as_latest`], using the connector-provided
+/// claim when no catalog bound is supplied.
 /// The caller must ensure that retained staged commits were ratified. Staged paths in a hint do not
 /// by themselves require the caller to supply `max_catalog_version`. Without an explicit target, a
 /// catalog-managed snapshot still requires that bound. Explicit targets must not exceed a supplied
@@ -304,8 +305,11 @@ impl SnapshotHint {
             crc,
             freshness,
         } = *self;
-        let built_as_latest = freshness == SnapshotHintFreshness::Latest
-            && max_catalog_version.is_none_or(|max| max <= version);
+        let built_as_latest = resolve_latest_claim(
+            version,
+            max_catalog_version,
+            freshness == SnapshotHintFreshness::Latest,
+        );
         let latest_commit_version = log_segment_files
             .latest_commit_file
             .as_ref()
@@ -1483,7 +1487,7 @@ mod tests {
             .with_snapshot_hint(hint.clone())
             .build(engine.as_ref())?;
         assert_eq!(latest.version(), 1);
-        assert!(!latest.is_built_as_latest());
+        assert!(latest.is_built_as_latest());
 
         let mut lower_bound_hint = hint.clone();
         lower_bound_hint.freshness = SnapshotHintFreshness::Latest;
@@ -1881,16 +1885,92 @@ mod tests {
     }
 
     #[rstest::rstest]
-    #[case::older_version(1, 0)]
-    #[case::newer_hint_older_target(2, 1)]
-    #[case::newer_version(1, 2)]
+    #[case::cached_upgrade(0, false)]
+    #[case::cached_same_version(1, false)]
+    #[case::hinted_same_version(1, true)]
     #[test_log::test(tokio::test)]
-    async fn snapshot_version_change_with_newer_catalog_bound(
+    async fn matching_catalog_bound_promotes_upgrade_snapshot_and_hint(
+        #[case] source_version: Version,
+        #[case] use_hint: bool,
+        #[values(false, true)] explicit_version: bool,
+    ) -> KernelResult<(), Box<dyn std::error::Error>> {
+        // GIVEN a published upgrade at version 1 and an explicit load with unverified freshness.
+        let (engine, store, table_root) = setup_test();
+        add_commit(
+            &table_root,
+            store.as_ref(),
+            0,
+            actions_to_string(vec![TestAction::Metadata]),
+        )
+        .await?;
+        add_commit(
+            &table_root,
+            store.as_ref(),
+            1,
+            actions_to_string_catalog_managed(vec![TestAction::Metadata]),
+        )
+        .await?;
+        let engine = MeteredDeltaEngine::new(engine);
+        let source = SnapshotBuilder::new_for(&table_root)
+            .at_version(source_version)
+            .build(&engine)?;
+        assert!(!source.is_built_as_latest());
+        let requested_version = explicit_version.then_some(1);
+        let fresh = SnapshotBuilder::new_for(&table_root)
+            .fold_with(requested_version, SnapshotBuilder::at_version)
+            .with_max_catalog_version(1)
+            .build(&engine)?;
+
+        // WHEN the catalog confirms version 1 as latest for a cached or hinted build.
+        let (reporter, _guard) = measuring_reporter();
+        let rebuilt = if use_hint {
+            SnapshotBuilder::new_for(&table_root)
+                .with_snapshot_hint(source.to_snapshot_hint()?)
+                .fold_with(requested_version, SnapshotBuilder::at_version)
+                .with_max_catalog_version(1)
+                .build(&engine)?
+        } else {
+            SnapshotBuilder::new_from(source.clone())
+                .fold_with(requested_version, SnapshotBuilder::at_version)
+                .with_max_catalog_version(1)
+                .build(&engine)?
+        };
+
+        // THEN the result agrees with a fresh build and the source remains unchanged.
+        assert_eq!(rebuilt.version(), 1);
+        assert!(rebuilt.is_built_as_latest());
+        assert!(fresh.is_built_as_latest());
+        assert!(rebuilt.table_configuration().is_catalog_managed());
+        assert_eq!(rebuilt.table_configuration(), fresh.table_configuration());
+        assert!(!source.is_built_as_latest());
+        if source_version == 1 {
+            assert_eq!(rebuilt.log_segment(), source.log_segment());
+            assert!(!reporter.events().iter().any(is_io_event));
+        }
+        let exported = rebuilt.to_snapshot_hint()?;
+        assert_eq!(exported.freshness, SnapshotHintFreshness::Latest);
+        let round_trip = SnapshotBuilder::new_for(&table_root)
+            .at_version(1)
+            .with_snapshot_hint(exported)
+            .build(&engine)?;
+        assert!(round_trip.is_built_as_latest());
+        Ok(())
+    }
+
+    #[rstest::rstest]
+    #[case::older_version(1, 0, 3, false)]
+    #[case::newer_hint_older_target(2, 1, 3, false)]
+    #[case::advance_below_catalog_bound(1, 2, 3, false)]
+    #[case::advance_to_catalog_bound(1, 2, 2, true)]
+    #[test_log::test(tokio::test)]
+    async fn snapshot_version_change_reconciles_catalog_bound(
         #[case] source_version: Version,
         #[case] requested_version: Version,
+        #[case] max_catalog_version: Version,
+        #[case] expected_latest: bool,
         #[values(false, true)] use_hint: bool,
     ) -> KernelResult<(), Box<dyn std::error::Error>> {
-        // GIVEN a CM snapshot marked latest and a fresh build at the requested version below MCV 3.
+        // GIVEN a CM snapshot marked latest and a fresh build at the requested version.
         let (engine, store, table_root) = setup_catalog_managed_test().await;
         for version in 1..=2 {
             add_commit(
@@ -1907,10 +1987,10 @@ mod tests {
             .build(&engine)?;
         let fresh = SnapshotBuilder::new_for(&table_root)
             .at_version(requested_version)
-            .with_max_catalog_version(3)
+            .with_max_catalog_version(max_catalog_version)
             .build(&engine)?;
         assert_eq!(fresh.version(), requested_version);
-        assert!(!fresh.is_built_as_latest());
+        assert_eq!(fresh.is_built_as_latest(), expected_latest);
 
         // WHEN a different version is requested from the cached snapshot or its complete hint.
         let (reporter, _guard) = measuring_reporter();
@@ -1918,17 +1998,17 @@ mod tests {
             SnapshotBuilder::new_for(&table_root)
                 .with_snapshot_hint(source.to_snapshot_hint()?)
                 .at_version(requested_version)
-                .with_max_catalog_version(3)
+                .with_max_catalog_version(max_catalog_version)
                 .build(&engine)
         } else {
             SnapshotBuilder::new_from(source.clone())
                 .at_version(requested_version)
-                .with_max_catalog_version(3)
+                .with_max_catalog_version(max_catalog_version)
                 .build(&engine)
         };
 
         // THEN complete hints reject version mismatches without I/O, while cached builds can
-        // advance but cannot move backward. Successful builds do not claim to be latest.
+        // advance but cannot move backward. Successful builds agree with fresh-build freshness.
         if use_hint {
             let Err(Error::Kernel(KernelError::SnapshotHint(error))) = rebuilt else {
                 panic!("expected snapshot hint version mismatch")
@@ -1948,7 +2028,7 @@ mod tests {
                 incremental.table_configuration(),
                 fresh.table_configuration()
             );
-            assert!(!incremental.is_built_as_latest());
+            assert_eq!(incremental.is_built_as_latest(), expected_latest);
         }
         assert!(source.is_built_as_latest());
         Ok(())
@@ -1998,7 +2078,7 @@ mod tests {
     #[case::cached(false)]
     #[case::hinted(true)]
     #[test_log::test(tokio::test(flavor = "multi_thread"))]
-    async fn snapshot_reuse_clears_latest_claim_for_newer_catalog_bound(
+    async fn snapshot_reuse_reconciles_latest_claim_with_catalog_bound(
         #[case] use_hint: bool,
         #[values(false, true)] originally_latest: bool,
         #[values(None, Some(0), Some(1), Some(2))] bound: Option<Version>,
@@ -2046,7 +2126,12 @@ mod tests {
             return Ok(());
         }
         let rebuilt = rebuilt?;
-        let expected_latest = originally_latest && bound != Some(2);
+        let expected_latest = match bound {
+            None => originally_latest,
+            Some(1) => true,
+            Some(2) => false,
+            _ => unreachable!("invalid bound was rejected above"),
+        };
         assert_eq!(rebuilt.is_built_as_latest(), expected_latest);
         assert_eq!(rebuilt.log_segment(), source.log_segment());
         assert_eq!(rebuilt.crc_at_version(), source.crc_at_version());
@@ -2068,7 +2153,6 @@ mod tests {
         );
         let round_trip = SnapshotBuilder::new_for(&table_root)
             .at_version(1)
-            .with_max_catalog_version(1)
             .with_snapshot_hint(exported)
             .build(&engine)?;
         assert_eq!(round_trip.is_built_as_latest(), expected_latest);
