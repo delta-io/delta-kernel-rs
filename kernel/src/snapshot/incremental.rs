@@ -1183,6 +1183,9 @@ mod tests {
         #[values(false, true)] skip_new_checkpoints: bool,
     ) -> Result<()> {
         // ===== GIVEN =====
+        // Install before building the snapshot so its span and the scans' child spans share a
+        // subscriber; otherwise a global subscriber set by a concurrent test owns the parent span.
+        let logging = LoggingTest::new();
         let ctx = setup_incremental_snapshot_test()?;
         setup_test_table_with_commits(ctx.url.as_str(), &ctx.store, 3).await?;
         let base = Snapshot::builder_for(ctx.url.as_str())
@@ -1198,7 +1201,6 @@ mod tests {
 
         // ===== WHEN =====
         // Build an incremental scan, which consumes exactly the caller-selected commit range.
-        let logging = LoggingTest::new();
         let _incremental_scan = snapshot
             .clone()
             .incremental_scan_builder(0)
