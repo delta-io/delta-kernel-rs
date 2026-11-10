@@ -618,10 +618,11 @@ mod tests {
     ) {
         let log_paths = [
             "memory:///target/_delta_log/00000000000000000001.json",
+            "memory:///target/_delta_log/00000000000000000000.00000000000000000001.compacted.json",
             "memory:///target/_delta_log/00000000000000000000.json",
         ]
         .into_iter()
-        .map(|path| LogPath::try_new(create_log_path(path).location))
+        .map(|path| LogPath::try_new(create_log_path_with_size(path, 1).location))
         .collect::<KernelResult<Vec<_>>>()
         .unwrap();
         let hint = SnapshotHint::try_new(
@@ -645,6 +646,7 @@ mod tests {
                 .collect_vec(),
             vec![0, 1]
         );
+        assert!(hint.log_segment_files.ascending_compaction_files.is_empty());
     }
 
     #[rstest::rstest]
@@ -683,6 +685,7 @@ mod tests {
         None
     )]
     #[case::crc("00000000000000000008.crc", None)]
+    #[case::compacted("00000000000000000007.00000000000000000008.compacted.json", None)]
     fn snapshot_hint_validates_paths_discarded_by_checkpoint_selection(
         #[case] filename: &str,
         #[case] expected_published_version: Option<Version>,
