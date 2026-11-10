@@ -1053,7 +1053,7 @@ fn timestamp_checkpoint_stats_rescale_before_widening(
 }
 
 #[rstest]
-fn decimal_checkpoint_stats_rescale_before_widening(
+fn decimal_checkpoint_stats_rescale_footer_scale(
     #[values(9, 18, 20)] precision: u8,
     #[values(MIN_VALUES, MAX_VALUES)] stat: &str,
 ) {
@@ -1063,13 +1063,13 @@ fn decimal_checkpoint_stats_rescale_before_widening(
     let predicate = column_pred!("d");
     let filter =
         CheckpointRowGroupFilter::new(builder.metadata().row_group(0), &predicate, &NO_PARTITIONS);
-    let data_type = DataType::decimal(20, 5).unwrap();
+    let data_type = DataType::decimal(23, 5).unwrap();
     let actual = if stat == MIN_VALUES {
         filter.get_min_stat(&column_name!("d"), &data_type)
     } else {
         filter.get_max_stat(&column_name!("d"), &data_type)
     };
-    assert_eq!(actual, Some(Scalar::decimal(6_789_000, 20, 5).unwrap()));
+    assert_eq!(actual, Some(Scalar::decimal(6_789_000, 23, 5).unwrap()));
 }
 
 #[rstest]

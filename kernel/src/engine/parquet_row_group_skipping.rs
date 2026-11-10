@@ -313,8 +313,9 @@ fn decimal_max_bits(stats: &Statistics) -> Option<i128> {
 
 /// Widens an unscaled footer bound from the column's Parquet scale to `target`, using the same
 /// value-preserving multiply as the reader cast admitted by `can_upcast_to_decimal` in
-/// `engine/ensure_data_types.rs`. Returns `None` for a narrower target scale, an overflow, or a
-/// value exceeding `target`'s precision, so that bound cannot justify skipping a row group.
+/// `engine/ensure_data_types.rs`. Returns `None` for a column that is not readable as a decimal, a
+/// narrower target scale, an overflow, or a value exceeding `target`'s precision, so that bound
+/// cannot justify skipping a row group.
 fn decimal_stat_as(bits: i128, column: &ColumnDescriptor, target: DecimalType) -> Option<Scalar> {
     let scale_increase = target.scale().checked_sub(parquet_decimal_scale(column)?)?;
     let factor = 10i128.checked_pow(scale_increase.into())?;
