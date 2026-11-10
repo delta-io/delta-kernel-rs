@@ -801,6 +801,7 @@ async fn test_write_checksum_preserves_stats_across_metadata_only_commits(
                 .await?
                 .unwrap_post_commit_snapshot()
         } else {
+            // Hand-write commits to vary the operation name while keeping them metadata-only.
             let actions = [
                 serde_json::json!({"commitInfo": {"operation": operation}}),
                 serde_json::json!({"domainMetadata": {
