@@ -283,10 +283,10 @@ of parsing the string map per file. The raw string map is still present.
 
 By default, offset-less `TIMESTAMP` partition strings are interpreted in UTC. Use
 `PartitionValuesOptions::with_timestamp_timezone` with a recognized IANA timezone or a normalized
-`+HH:MM` or `-HH:MM` fixed offset to interpret offset-less partition values in another timezone. The
-configured timezone must match the timezone used when they were written. An explicit offset in a
-partition value takes precedence. When Kernel parses the partition string map, this setting affects
-both partition pruning and returned parsed partition values.
+`+HH:MM[:SS]` or `-HH:MM[:SS]` fixed offset (`Z` means UTC) to interpret offset-less partition
+values in another timezone. The configured timezone must match the timezone used when they were
+written. An explicit offset in a partition value takes precedence. When Kernel parses the partition
+string map, this setting affects both partition pruning and returned parsed partition values.
 
 When a checkpoint stores compatible `partitionValues_parsed`, Kernel uses those values directly
 instead of reparsing the offset-less `TIMESTAMP` partition strings with the supplied timezone. The
