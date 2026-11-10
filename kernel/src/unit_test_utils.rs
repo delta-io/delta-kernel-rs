@@ -411,11 +411,14 @@ pub(crate) mod adaptive_metadata_fixtures {
         )
     }
 
-    /// A `commitInfo` line with In-Commit Timestamp `timestamp` and, when given, a
+    /// A `WRITE` `commitInfo` line with In-Commit Timestamp `timestamp` and, when given, a
     /// `lastManifestCommit` `pointer`, as an AMT writer records on every commit.
     pub(crate) fn commit_info_line(timestamp: i64, pointer: Option<&LastManifestCommit>) -> String {
-        let mut commit_info =
-            serde_json::json!({ "timestamp": timestamp, "inCommitTimestamp": timestamp });
+        let mut commit_info = serde_json::json!({
+            "timestamp": timestamp,
+            "inCommitTimestamp": timestamp,
+            "operation": "WRITE",
+        });
         if let Some(pointer) = pointer {
             commit_info["lastManifestCommit"] = serde_json::to_value(pointer).unwrap();
         }
@@ -458,16 +461,32 @@ pub(crate) mod adaptive_metadata_fixtures {
         size_in_bytes: i64,
         version: Version,
     ) -> KernelResult<CheckpointAction> {
-        let (protocol, metadata) = adaptive_metadata_protocol_and_metadata();
         let version = version_as_i64(version)?;
-        Ok(CheckpointAction::new(
+        Ok(checkpoint_action_with_content_root(
+            path,
+            size_in_bytes,
             version,
-            ContentRoot::new(path.to_string(), size_in_bytes, version),
+            version,
+        ))
+    }
+
+    /// A minimal `checkpoint` action at `version` referencing a `size_in_bytes` content root at
+    /// `path`, written at `content_root_version`.
+    pub(crate) fn checkpoint_action_with_content_root(
+        path: &str,
+        size_in_bytes: i64,
+        version: i64,
+        content_root_version: i64,
+    ) -> CheckpointAction {
+        let (protocol, metadata) = adaptive_metadata_protocol_and_metadata();
+        CheckpointAction::new(
+            version,
+            ContentRoot::new(path.to_string(), size_in_bytes, content_root_version),
             protocol,
             metadata,
             vec![],
             vec![],
-        ))
+        )
     }
 
     /// Writes `rows` (each a value of `schema`'s single action field) as the checkpoint sidecar

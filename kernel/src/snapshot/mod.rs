@@ -1243,6 +1243,20 @@ impl Snapshot {
         Ok(self.read_ict_and_last_manifest_commit(engine)?.1)
     }
 
+    /// Whether an adaptiveMetadata manifest commit lies in `(version, self.version()]`. Such a
+    /// commit may record its file actions only in the metadata tree, so replaying commit JSONs
+    /// after `version` would miss them.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    pub(crate) fn has_manifest_commit_after(
+        &self,
+        engine: &dyn Engine,
+        version: Version,
+    ) -> KernelResult<bool> {
+        Ok(self
+            .last_manifest_commit(engine)?
+            .is_some_and(|last| u64::try_from(last.version).is_ok_and(|v| v > version)))
+    }
+
     #[cfg(feature = "adaptive-metadata-in-dev")]
     fn has_adaptive_metadata(&self) -> bool {
         self.table_configuration()

@@ -18,8 +18,6 @@ use crate::schema::{ColumnNamesAndTypes, DataType};
 use crate::snapshot::SnapshotRef;
 use crate::table_features::Operation;
 use crate::utils::require;
-#[cfg(feature = "adaptive-metadata-in-dev")]
-use crate::version_as_i64;
 use crate::{
     Engine, EngineData, FileDataReadResultIterator, FileMeta, KernelError, KernelResult,
     PredicateRef, Version,
@@ -107,8 +105,7 @@ impl IncrementalScanBuilder {
     /// - [`KernelError::MissingColumn`] if a [`with_predicate`](Self::with_predicate) predicate
     ///   references a column absent from the table schema.
     /// - `Err` if the target snapshot's protocol contains an unsupported reader feature.
-    /// - `Err` if the engine fails to open the commit stream, or to read the target commit's
-    ///   `commitInfo` on an adaptiveMetadata table.
+    /// - `Err` if the engine fails to read the log.
     pub fn build(self, engine: &dyn Engine) -> KernelResult<Option<IncrementalScanStream>> {
         // TODO(#2493): the version validation, the snapshot-commit-list extraction and
         // clipping below, and the "snapshot covers the range" check should all be replaced
@@ -164,10 +161,13 @@ impl IncrementalScanBuilder {
             return Ok(None);
         }
 
-        // TODO: derive in-range manifest commits' file changes from the metadata tree instead of
-        // falling back.
+        // TODO(#2866): derive in-range manifest commits' file changes from the metadata tree
+        // instead of falling back.
         #[cfg(feature = "adaptive-metadata-in-dev")]
-        if self.has_manifest_commit_in_range(engine)? {
+        if self
+            .target_snapshot
+            .has_manifest_commit_after(engine, self.base_version)?
+        {
             return Ok(None);
         }
 
@@ -246,20 +246,6 @@ impl IncrementalScanBuilder {
                 Ok(filter.map_or(AddSkipping::KeepAll, |f| AddSkipping::Filter(Arc::new(f))))
             }
         }
-    }
-
-    /// Whether an adaptiveMetadata manifest commit lies in `(base_version, target_version]`.
-    ///
-    /// A manifest commit may record its file actions only in the metadata tree, leaving them out
-    /// of the commit JSON this scan reads. The target's `lastManifestCommit` names the latest
-    /// manifest commit at or below the target, so one above `base_version` is in range.
-    #[cfg(feature = "adaptive-metadata-in-dev")]
-    fn has_manifest_commit_in_range(&self, engine: &dyn Engine) -> KernelResult<bool> {
-        let base_version = version_as_i64(self.base_version)?;
-        Ok(self
-            .target_snapshot
-            .last_manifest_commit(engine)?
-            .is_some_and(|last| last.version > base_version))
     }
 }
 
