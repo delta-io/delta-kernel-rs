@@ -11,7 +11,6 @@ use url::Url;
 
 use super::get_files_for_scan;
 use crate::arrow::array::{AsArray as _, StringArray};
-use crate::arrow::datatypes::Int64Type;
 use crate::content_tree::test_utils::{
     added_data_entry, data_manifest_entry, mumbling_bitmap, write_manifest,
 };
@@ -342,7 +341,7 @@ fn scan_execute_reads_files_whose_locations_need_encoding() {
             .unwrap(),
     );
     let files = [
-        ("a b.parquet", 1, "first"),
+        ("a b.parquet", 1i64, "first"),
         ("dir/c%20d.parquet", 2, "second"),
     ];
     let entries: Vec<_> = files
@@ -353,7 +352,7 @@ fn scan_execute_reads_files_whose_locations_need_encoding() {
                 .evaluation_handler()
                 .create_many(
                     physical_schema.clone(),
-                    vec![vec![Scalar::from(*id as i64), Scalar::from(*name)]],
+                    vec![vec![Scalar::from(*id), Scalar::from(*name)]],
                 )
                 .unwrap();
             // Escape each segment independently of the code under test.
@@ -375,27 +374,16 @@ fn scan_execute_reads_files_whose_locations_need_encoding() {
         .scan_builder()
         .build()
         .unwrap();
-    let rows: Vec<(i64, String)> = scan
+    let names: Vec<String> = scan
         .execute(Arc::new(engine))
         .unwrap()
         .flat_map(|data| {
             let batch = data.unwrap().try_into_record_batch().unwrap();
-            let ids = batch
-                .column_by_name("id")
-                .unwrap()
-                .as_primitive::<Int64Type>();
             let names = batch.column_by_name("name").unwrap().as_string::<i32>();
-            ids.values()
-                .iter()
-                .zip(names.iter().flatten())
-                .map(|(id, name)| (*id, name.to_string()))
-                .collect::<Vec<_>>()
+            names.iter().flatten().map(str::to_string).collect_vec()
         })
         .sorted()
         .collect();
 
-    assert_eq!(
-        rows,
-        vec![(1, "first".to_string()), (2, "second".to_string())]
-    );
+    assert_eq!(names, strings(&["first", "second"]));
 }

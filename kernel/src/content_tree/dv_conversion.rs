@@ -2,8 +2,8 @@ use std::sync::{Arc, LazyLock};
 
 use crate::actions::deletion_vector::{DeletionVectorDescriptor, DeletionVectorStorageType};
 use crate::amt_path_util::{
-    parse_absolute_amt_location, raw_amt_location_from_uri, validate_amt_location,
-    validate_table_relative,
+    encode_amt_location_expression, parse_absolute_amt_location, raw_amt_location_from_uri,
+    validate_amt_location, validate_table_relative,
 };
 use crate::content_tree::conditions::{Check, diagnostic};
 use crate::content_tree::{
@@ -11,9 +11,7 @@ use crate::content_tree::{
     KEY_METADATA, LOCATION,
 };
 use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
-use crate::expressions::{
-    ArrayData, Expression, Predicate, Scalar, UnaryExpressionOp, lit, null_lit,
-};
+use crate::expressions::{ArrayData, Expression, Predicate, Scalar, lit, null_lit};
 use crate::schema::{
     ArrayType, ColumnName, ColumnNamesAndTypes, DataType, SchemaRef, StructField, StructType,
     ToSchema as _, column_name, lazy_schema_ref,
@@ -97,7 +95,7 @@ pub(crate) fn add_deletion_vector_expression() -> Expression {
     let path = Expression::case_when(
         [(
             is_absolute(),
-            Expression::unary(UnaryExpressionOp::UriEncodeFileLocation, dv_field(LOCATION)),
+            encode_amt_location_expression(dv_field(LOCATION)),
         )],
         dv_field(LOCATION),
     );

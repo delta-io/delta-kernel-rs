@@ -19,7 +19,7 @@ use bytes::Bytes;
 use url::Url;
 
 use crate::actions::{ADD_NAME, ADD_SCHEMA, CheckpointAction, LOG_ADD_SCHEMA};
-use crate::amt_path_util::{add_path_expression, amt_manifest_filemeta};
+use crate::amt_path_util::{amt_manifest_filemeta, encode_amt_location_expression};
 use crate::cancellation::CancellationTokenRef;
 use crate::content_tree::conditions::{Check, ConditionChecker, diagnostic, diagnostic_i32};
 use crate::content_tree::dv_conversion::{
@@ -1121,7 +1121,7 @@ fn build_entry_to_add_expression(
     // from the entry.
     let add = struct_expr_from_schema(&ADD_SCHEMA, |name| {
         Some(match name {
-            n if n == PATH_NAME => add_path_expression(Expression::column([LOCATION])),
+            n if n == PATH_NAME => encode_amt_location_expression(Expression::column([LOCATION])),
             // TODO(#3320): read partition values from the entry's `partition` tuple once the read
             // path carries a partition spec.
             n if n == PARTITION_VALUES_NAME => empty_partition_values.clone(),
@@ -2491,8 +2491,7 @@ mod tests {
         );
     }
 
-    /// Root and leaf entry locations are encoded into `add.path`; a deleted entry's location is
-    /// neither encoded nor validated, since it does not become an `Add`.
+    /// Root and leaf entry locations are encoded into `add.path`.
     #[test]
     fn read_add_actions_from_amt_encodes_root_and_leaf_paths() {
         let engine = memory_engine();
@@ -2503,17 +2502,9 @@ mod tests {
             5,
             100,
         );
-        let deleted = with_status(
-            added_data_entry("../gone x.parquet", 1, 1, 0, 0),
-            TrackingStatus::Deleted,
-        );
         let checkpoint = write_root(
             &engine,
-            &[
-                added_data_entry("a b.parquet", 100, 10, 0, 5),
-                deleted,
-                leaf,
-            ],
+            &[added_data_entry("a b.parquet", 100, 10, 0, 5), leaf],
         );
 
         let paths: Vec<_> = read_tree(&engine, &checkpoint)

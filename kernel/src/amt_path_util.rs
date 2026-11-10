@@ -31,12 +31,12 @@ pub(crate) fn resolve_amt_location(path: &str, table_root: &Url) -> KernelResult
     }
 }
 
-/// Evaluates a STRING AMT data-file `location` to the `Add.path` it is read through: the path
-/// component percent-encoded as in [`resolve_amt_location`], a scheme and authority kept as
-/// written, and a relative location kept relative. Joining the value onto the table root gives
-/// the [`Url`] [`resolve_amt_location`] returns.
-pub(crate) fn add_path_expression(location: Expression) -> Expression {
-    Expression::unary(UnaryExpressionOp::UriEncodePath, location)
+/// Evaluates a STRING AMT `location` to its URI-reference form, as `Add.path` and a `'p'`
+/// deletion vector path carry it: the path component is percent-encoded and a relative location
+/// stays relative. For a location [`resolve_amt_location`] accepts, joining the result onto the
+/// table root gives the same [`Url`].
+pub(crate) fn encode_amt_location_expression(location: Expression) -> Expression {
+    Expression::unary(UnaryExpressionOp::UriEncodeFileLocation, location)
 }
 
 /// Parses an absolute AMT `path` into a [`Url`] with its path component percent-encoded, as
@@ -206,55 +206,12 @@ mod tests {
         Ok(value.column(0).as_string::<i32>().value(0).to_string())
     }
 
-    /// `expected_url` is where a scan reads the file: `add.path` joined onto the table root.
-    #[rstest]
-    #[case::plain_relative("data/a.parquet", "data/a.parquet", "memory:///table/data/a.parquet")]
-    #[case::spaced_relative(
-        "data/a b.parquet",
-        "data/a%20b.parquet",
-        "memory:///table/data/a%20b.parquet"
-    )]
-    #[case::percent_relative(
-        "data/a%b.parquet",
-        "data/a%25b.parquet",
-        "memory:///table/data/a%25b.parquet"
-    )]
-    #[case::non_ascii_relative(
-        "data/M\u{fc}nchen.parquet",
-        "data/M%C3%BCnchen.parquet",
-        "memory:///table/data/M%C3%BCnchen.parquet"
-    )]
-    #[case::query_and_fragment_relative(
-        "data/a?b#c.parquet",
-        "data/a%3Fb%23c.parquet",
-        "memory:///table/data/a%3Fb%23c.parquet"
-    )]
-    #[case::plain_absolute(
-        "s3://bucket/t/a.parquet",
-        "s3://bucket/t/a.parquet",
-        "s3://bucket/t/a.parquet"
-    )]
-    #[case::spaced_absolute(
-        "s3://bucket/t/a b.parquet",
-        "s3://bucket/t/a%20b.parquet",
-        "s3://bucket/t/a%20b.parquet"
-    )]
-    #[case::spaced_absolute_without_authority(
-        "file:/tmp/a b.parquet",
-        "file:/tmp/a%20b.parquet",
-        "file:///tmp/a%20b.parquet"
-    )]
-    fn test_add_path_expression(
-        #[case] location: &str,
-        #[case] expected: &str,
-        #[case] expected_url: &str,
-    ) {
-        let path = evaluate_on_location(location, add_path_expression(col!("location"))).unwrap();
-        assert_eq!(path, expected);
-        let table_root = Url::parse("memory:///table/").unwrap();
-        let url = table_root.join(&path).unwrap();
-        assert_eq!(url.as_str(), expected_url);
-        assert_eq!(url, resolve_amt_location(location, &table_root).unwrap());
+    /// The encoded location joined onto the table root, as a scan reads `Add.path`.
+    fn resolve_with_encoded_location(path: &str, table_root: &Url) -> KernelResult<Url> {
+        let encoded = evaluate_on_location(path, encode_amt_location_expression(col!("location")))?;
+        let base = format!("{}/", table_root.as_str().trim_end_matches('/'));
+        let base = Url::parse(&base).map_err(KernelError::from)?;
+        base.join(&encoded).map_err(KernelError::from)
     }
 
     #[rstest]
@@ -272,6 +229,11 @@ mod tests {
         "memory:///table",
         "metadata/root.parquet",
         "memory:///table/metadata/root.parquet"
+    )]
+    #[case::absolute_without_authority(
+        "memory:///table/",
+        "file:/tmp/a b.parquet",
+        "file:///tmp/a%20b.parquet"
     )]
     #[case::single_char_scheme_treated_as_absolute(
         "memory:///table/",
@@ -361,6 +323,7 @@ mod tests {
         #[case] table_root: &str,
         #[case] path: &str,
         #[case] expected_location: &str,
+        #[values(resolve_amt_location, resolve_with_encoded_location)] resolve: Resolver,
     ) {
         let table_root = Url::parse(table_root).unwrap();
         let location = resolve_amt_location(path, &table_root).unwrap();
