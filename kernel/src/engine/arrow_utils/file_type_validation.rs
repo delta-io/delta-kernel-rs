@@ -160,7 +160,10 @@ impl<'a> FileColumns<'a> {
                 .as_primitive_opt::<Int64Type>()
                 .ok_or_else(|| make_arrow_error(format!("`file` field '{name}' is not an INT64")))
         };
-        // A dictionary-encoded string is decoded once, so each value can be read as a string.
+        // A dictionary-encoded string is decoded once, so each value can be read as a string. Only
+        // writes check `uri` and `checksum`; reads decode a dictionary-encoded one too, a cost
+        // accepted so reads and writes share one view of the columns. A plain string column is
+        // not copied.
         let string = |name: &str| -> KernelResult<ArrayRef> {
             let array = field(name)?;
             Ok(match array.data_type() {
@@ -910,6 +913,10 @@ mod tests {
         Some("a relative uri must not contain a '.' or '..' segment")
     )]
     #[case::unparseable_absolute("http://[bad/a.png", Some("an absolute uri must parse as a URL"))]
+    #[case::malformed_escape(
+        "_files/a%GG.png",
+        Some("contains a '%' that is not followed by two hex digits")
+    )]
     #[case::space(
         "_files/a b.png",
         Some("contains a space or an ASCII control character")
@@ -932,6 +939,10 @@ mod tests {
     #[rstest]
     #[case::relative("/a.png", "a relative uri must not start with '/' or '\\'")]
     #[case::absolute("http://[bad/a.png", "an absolute uri must parse as a URL")]
+    #[case::malformed_escape(
+        "s3://bucket/a%GG.png",
+        "contains a '%' that is not followed by two hex digits"
+    )]
     fn write_checks_dictionary_encoded_uri(#[case] uri: &str, #[case] problem: &str) {
         let uris: DictionaryArray<Int32Type> = vec![Some(uri)].into_iter().collect();
         let file = with_field(file_array(&[VALID]), "uri", Arc::new(uris));
