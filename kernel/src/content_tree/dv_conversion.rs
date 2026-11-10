@@ -10,7 +10,9 @@ use crate::content_tree::{
     DeletionVectorInfo, KEY_METADATA, LOCATION,
 };
 use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
-use crate::expressions::{ArrayData, Expression, Predicate, Scalar, lit, null_lit};
+use crate::expressions::{
+    ArrayData, Expression, Predicate, Scalar, UnaryExpressionOp, lit, null_lit,
+};
 use crate::schema::{ArrayType, ColumnName, DataType, SchemaRef, column_name, lazy_schema_ref};
 use crate::{EngineData, KernelError, KernelResult};
 
@@ -68,24 +70,13 @@ pub(crate) fn extract_deletion_vector_content(
     })
 }
 
-/// Helper column holding the percent-encoded URI of each kept entry's absolute deletion vector
-/// location, null for any other entry. See [`add_deletion_vector_expression`].
-const DV_ABSOLUTE_PATH_HELPER: &str = "_dvAbsolutePath";
-
-/// Schema of the helper columns [`add_deletion_vector_expression`] reads, in
-/// [`AddDeletionVectorColumns::into_columns`] order.
-pub(crate) static ADD_DV_HELPER_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
-    nullable DV_ABSOLUTE_PATH_HELPER: STRING,
-};
-
 /// Builds `Add.deletionVector` (schema [`DeletionVectorDescriptor::to_schema`]) from a content
-/// entry's `deletionVector` column plus the [`ADD_DV_HELPER_SCHEMA`] columns: the inverse of
-/// [`extract_deletion_vector_content`].
+/// entry's `deletionVector` column: the inverse of [`extract_deletion_vector_content`].
 ///
 /// The descriptor is null where the entry has no deletion vector, and is otherwise built from the
-/// entry validated by [`AddDeletionVectorColumns::try_push`]. A relative location becomes a
+/// entry validated by [`check_deletion_vector`]. A relative location becomes a
 /// `PersistedUnencodedRelative` (`'r'`) descriptor; an absolute one becomes `PersistedAbsolute`
-/// (`'p'`).
+/// (`'p'`) with its path percent-encoded.
 pub(crate) fn add_deletion_vector_expression() -> Expression {
     let dv = || Expression::column([DV_INFO]);
     let dv_field = |field: &str| Expression::column([DV_INFO, field]);
@@ -104,9 +95,11 @@ pub(crate) fn add_deletion_vector_expression() -> Expression {
         // so it still matches the `'u'`, `'r'`, or `'p'` descriptor the writer started from.
         lit(DeletionVectorStorageType::PersistedUnencodedRelative),
     );
-    // Percent-encoding an absolute location needs per-row work, so it comes from a helper column.
     let path = Expression::case_when(
-        [(is_absolute(), Expression::column([DV_ABSOLUTE_PATH_HELPER]))],
+        [(
+            is_absolute(),
+            Expression::unary(UnaryExpressionOp::UriEncodePath, dv_field(LOCATION)),
+        )],
         dv_field(LOCATION),
     );
     Expression::struct_with_nullability_from(
@@ -114,7 +107,7 @@ pub(crate) fn add_deletion_vector_expression() -> Expression {
             storage_type,
             path,
             // TODO(#3750): use a cast that fails on overflow. Until then these would null out an
-            // out-of-range value, which `try_push` rejects up front.
+            // out-of-range value, which `check_deletion_vector` rejects up front.
             Expression::cast(dv_field(DV_INFO_OFFSET), DataType::INTEGER),
             // Undo the +8 framing of `extract_deletion_vector_content`.
             Expression::cast(
@@ -127,104 +120,75 @@ pub(crate) fn add_deletion_vector_expression() -> Expression {
     )
 }
 
-/// Accumulates the [`ADD_DV_HELPER_SCHEMA`] columns for one entry batch, one row per entry: the
-/// per-row values [`add_deletion_vector_expression`] cannot compute.
-#[derive(Default)]
-pub(crate) struct AddDeletionVectorColumns {
-    absolute_paths: Vec<Scalar>,
+/// Validates an entry's AMT `deletionVector` struct, read from `getters` in [`DV_INFO_COLUMNS`]
+/// order, so [`add_deletion_vector_expression`] can build its descriptor. Returns whether the
+/// entry has a deletion vector.
+pub(crate) fn check_deletion_vector<'a>(
+    row: usize,
+    getters: &[&'a dyn GetData<'a>],
+) -> KernelResult<bool> {
+    let expected = DV_INFO_COLUMNS.as_ref().0.len();
+    if getters.len() != expected {
+        return Err(KernelError::internal_error(format!(
+            "Expected {expected} AMT deletion vector getters, got {}",
+            getters.len()
+        )));
+    }
+    // `location` is a required field of the struct, so it reads null iff the whole
+    // `deletionVector` struct is null.
+    let Some(location) = getters[0].get_opt(row, LOCATION)? else {
+        return Ok(false);
+    };
+    let key_metadata: Option<&[u8]> = getters[4].get_opt(row, KEY_METADATA)?;
+    check_deletion_vector_parts(
+        location,
+        getters[1].get(row, DV_INFO_OFFSET)?,
+        getters[2].get(row, DV_INFO_SIZE_IN_BYTES)?,
+        getters[3].get(row, DV_INFO_CARDINALITY)?,
+        key_metadata.is_some(),
+    )?;
+    Ok(true)
 }
 
-impl AddDeletionVectorColumns {
-    /// Validates the next entry's AMT `deletionVector` struct, read from `getters` in
-    /// [`DV_INFO_COLUMNS`] order, and appends its row. Returns whether the entry has a deletion
-    /// vector; a null struct appends a null row.
-    pub(crate) fn try_push<'a>(
-        &mut self,
-        row: usize,
-        getters: &[&'a dyn GetData<'a>],
-    ) -> KernelResult<bool> {
-        let expected = DV_INFO_COLUMNS.as_ref().0.len();
-        if getters.len() != expected {
-            return Err(KernelError::internal_error(format!(
-                "Expected {expected} AMT deletion vector getters, got {}",
-                getters.len()
-            )));
-        }
-        // `location` is a required field of the struct, so it reads null iff the whole
-        // `deletionVector` struct is null.
-        let Some(location) = getters[0].get_opt(row, LOCATION)? else {
-            self.push_null();
-            return Ok(false);
-        };
-        let key_metadata: Option<&[u8]> = getters[4].get_opt(row, KEY_METADATA)?;
-        self.try_push_parts(
-            location,
-            getters[1].get(row, DV_INFO_OFFSET)?,
-            getters[2].get(row, DV_INFO_SIZE_IN_BYTES)?,
-            getters[3].get(row, DV_INFO_CARDINALITY)?,
-            key_metadata.is_some(),
-        )?;
-        Ok(true)
+/// Validates an AMT deletion vector from its parts (see [`DeletionVectorInfo`]); see
+/// [`check_deletion_vector`].
+fn check_deletion_vector_parts(
+    location: &str,
+    offset: i64,
+    size_in_bytes: i64,
+    cardinality: i64,
+    has_key_metadata: bool,
+) -> KernelResult<()> {
+    if has_key_metadata {
+        return Err(KernelError::unsupported(format!(
+            "Encrypted deletion vectors are not supported (deletion vector '{location}' has \
+             keyMetadata)"
+        )));
     }
-
-    /// Appends a null row, for an entry that is dropped or has no deletion vector.
-    pub(crate) fn push_null(&mut self) {
-        self.absolute_paths.push(Scalar::Null(DataType::STRING));
+    let invalid = |message: String| {
+        KernelError::DeletionVector(format!("Deletion vector '{location}' {message}"))
+    };
+    // The expression casts these into the descriptor's i32 fields, so they must fit.
+    if i32::try_from(offset).is_err() || offset < 0 {
+        return Err(invalid(format!(
+            "offset {offset} is not a non-negative i32"
+        )));
     }
-
-    /// The helper columns, matching [`ADD_DV_HELPER_SCHEMA`].
-    pub(crate) fn into_columns(self) -> KernelResult<Vec<ArrayData>> {
-        Ok(vec![ArrayData::try_new(
-            ArrayType::new(DataType::STRING, true),
-            self.absolute_paths,
-        )?])
+    let delta_size = size_in_bytes.checked_sub(8);
+    if delta_size.is_none_or(|size| size < 0 || i32::try_from(size).is_err()) {
+        return Err(invalid(format!(
+            "sizeInBytes {size_in_bytes} is not a valid Iceberg blob size"
+        )));
     }
-
-    /// Validates an AMT deletion vector from its parts (see [`DeletionVectorInfo`]) and appends
-    /// its row. Nothing is appended on error.
-    fn try_push_parts(
-        &mut self,
-        location: &str,
-        offset: i64,
-        size_in_bytes: i64,
-        cardinality: i64,
-        has_key_metadata: bool,
-    ) -> KernelResult<()> {
-        if has_key_metadata {
-            return Err(KernelError::unsupported(format!(
-                "Encrypted deletion vectors are not supported (deletion vector '{location}' has \
-                 keyMetadata)"
-            )));
-        }
-        let invalid = |message: String| {
-            KernelError::DeletionVector(format!("Deletion vector '{location}' {message}"))
-        };
-        // The expression casts these into the descriptor's i32 fields, so they must fit.
-        if i32::try_from(offset).is_err() || offset < 0 {
-            return Err(invalid(format!(
-                "offset {offset} is not a non-negative i32"
-            )));
-        }
-        let delta_size = size_in_bytes.checked_sub(8);
-        if delta_size.is_none_or(|size| size < 0 || i32::try_from(size).is_err()) {
-            return Err(invalid(format!(
-                "sizeInBytes {size_in_bytes} is not a valid Iceberg blob size"
-            )));
-        }
-        if cardinality < 0 {
-            return Err(invalid(format!("cardinality {cardinality} is negative")));
-        }
-        let absolute_path = match parse_absolute_amt_location(location)? {
-            Some(url) => Scalar::String(url.into()),
-            None => {
-                validate_table_relative(location)?;
-                reject_dot_segments(location)?;
-                Scalar::Null(DataType::STRING)
-            }
-        };
-        self.absolute_paths.push(absolute_path);
-        Ok(())
+    if cardinality < 0 {
+        return Err(invalid(format!("cardinality {cardinality} is negative")));
     }
+    // An absolute location must parse as a URL, so the `'p'` descriptor built from it resolves.
+    if parse_absolute_amt_location(location)?.is_none() {
+        validate_table_relative(location)?;
+        reject_dot_segments(location)?;
+    }
+    Ok(())
 }
 
 /// Intermediate flat decoded-DV columns: path resolved (base85-decoded for relative DVs, verbatim
@@ -841,19 +805,16 @@ mod tests {
     }
 
     /// Converts `info` back to the descriptor its `Add` carries, through
-    /// [`add_deletion_vector_expression`] over a batch of the entry's `deletionVector` column and
-    /// the helper columns. A trailing DV-less row checks that the descriptor (and so each of its
-    /// leaves) is null there.
+    /// [`add_deletion_vector_expression`] over a batch of the entry's `deletionVector` column. A
+    /// trailing DV-less row checks that the descriptor (and so each of its leaves) is null there.
     fn descriptor_from_info(info: &DeletionVectorInfo) -> KernelResult<DeletionVectorDescriptor> {
-        let mut columns = AddDeletionVectorColumns::default();
-        columns.try_push_parts(
+        check_deletion_vector_parts(
             &info.location,
             info.offset,
             info.size_in_bytes,
             info.cardinality,
             info.key_metadata.is_some(),
         )?;
-        columns.push_null();
         let entry_schema = schema_ref! { nullable DV_INFO: (DeletionVectorInfo::to_schema()) };
         let engine = SyncEngine::new();
         let handler = engine.evaluation_handler();
@@ -866,23 +827,16 @@ mod tests {
         let entries = ArrowEngineData::new(RecordBatch::try_new(
             both.schema(),
             vec![Arc::new(null_second)],
-        )?)
-        .append_columns(ADD_DV_HELPER_SCHEMA.clone(), columns.into_columns()?)?;
-        let input_schema = StructType::new_unchecked(
-            entry_schema
-                .fields()
-                .chain(ADD_DV_HELPER_SCHEMA.fields())
-                .cloned(),
-        );
+        )?);
         // Wrapped in a `dv` field, since a top-level struct cannot be null.
         let output_type = schema! { nullable "dv": (DeletionVectorDescriptor::to_schema()) };
         let output = handler
             .new_expression_evaluator(
-                Arc::new(input_schema),
+                entry_schema,
                 Arc::new(Expression::struct_from([add_deletion_vector_expression()])),
                 output_type.into(),
             )?
-            .evaluate(entries.as_ref())?;
+            .evaluate(&entries)?;
         let mut visitor = DescriptorVisitor::default();
         visitor.visit_rows_of(output.as_ref())?;
         let [Some(descriptor), None] = <[_; 2]>::try_from(visitor.descriptors).unwrap() else {
@@ -964,7 +918,7 @@ mod tests {
     }
 
     // A relative content-tree location passes through raw as `r`; an absolute one is
-    // percent-encoded as `p`.
+    // percent-encoded as `p`, keeping its `scheme:[//authority]` prefix as written.
     #[rstest]
     #[case::relative(
         "data/dv file.puffin",
@@ -979,7 +933,12 @@ mod tests {
     #[case::drive_letter_is_a_scheme(
         "C:/dv.puffin",
         DeletionVectorStorageType::PersistedAbsolute,
-        "c:/dv.puffin"
+        "C:/dv.puffin"
+    )]
+    #[case::prefix_kept_verbatim(
+        "S3://Bucket/dv file.puffin",
+        DeletionVectorStorageType::PersistedAbsolute,
+        "S3://Bucket/dv%20file.puffin"
     )]
     #[case::absolute_in_root(
         "s3://bucket/table/data/dv file.puffin",
