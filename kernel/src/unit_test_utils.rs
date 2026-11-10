@@ -106,6 +106,8 @@ pub(crate) fn is_io_event(event: &MetricEvent) -> bool {
         | MetricEvent::SnapshotBuildFailure(_)
         | MetricEvent::TransactionCommitSuccess(_)
         | MetricEvent::TransactionCommitFailure(_)
+        | MetricEvent::CheckpointWriteSuccess(_)
+        | MetricEvent::CheckpointWriteFailure(_)
         | MetricEvent::DomainMetadataLoadSuccess(_)
         | MetricEvent::DomainMetadataLoadFailure
         | MetricEvent::SetTransactionLoadSuccess(_)
