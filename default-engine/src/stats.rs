@@ -524,6 +524,7 @@ pub(crate) fn with_tight_stats(stats: StructArray) -> KernelResult<StructArray> 
     if stats.column_by_name(TIGHT_STATS).is_some() {
         return Ok(stats);
     }
+    // TODO(#3491): `tightBounds` does not account for bounds AMT rejects (e.g. NaN float bounds).
     let tight_stats = match stats.column_by_name(TIGHT_BOUNDS) {
         Some(tight_bounds) => tight_bounds.clone(),
         None => Arc::new(BooleanArray::from(vec![false; stats.len()])),
