@@ -14,8 +14,8 @@
 
 use std::borrow::Cow;
 use std::collections::{HashSet, VecDeque};
-use std::slice;
 use std::sync::{Arc, LazyLock};
+use std::{iter, slice};
 
 use bytes::Bytes;
 use url::Url;
@@ -35,7 +35,8 @@ use crate::content_tree::{
     struct_expr_from_schema,
 };
 use crate::expressions::{
-    ArrayData, ColumnName, Expression, ExpressionRef, MapData, Predicate, Scalar, expr, lit,
+    ArrayData, ColumnName, Expression, ExpressionRef, MapData, Predicate, Scalar,
+    UnaryExpressionOp, col, column_name, expr, lit,
 };
 use crate::scan::log_replay::{
     BASE_ROW_ID_NAME, DATA_CHANGE_NAME, DEFAULT_ROW_COMMIT_VERSION_NAME, DELETION_VECTOR_NAME,
@@ -276,7 +277,7 @@ impl LeafRef {
 
 /// Turns the live `DataManifest` entries of root entry batches into [`LeafRef`]s. Unknown
 /// content types and statuses match no leaf reference, so batches must also go through
-/// [`EntryTransform::annotate`], whose [`entry_checks`] reject them.
+/// [`EntryTransform::annotate`], whose [`known_value_checks`] reject them.
 struct LeafRefProjection {
     /// Keeps the leaf references of a batch.
     filter: Arc<dyn PredicateEvaluator>,
@@ -350,8 +351,11 @@ struct ManifestKind {
     base_row_id: Expression,
     /// Columns the caller of [`EntryTransform::convert`] supplies for `base_row_id`.
     helpers: SchemaRef,
-    /// Conditions every entry of this kind must satisfy.
+    /// Conditions every entry of this kind must satisfy, checked by [`EntryTransform::annotate`].
     checks: Vec<Check>,
+    /// Conditions every entry of this kind that becomes an `Add` must satisfy, checked by
+    /// [`EntryTransform::convert`].
+    selected_checks: Vec<Check>,
 }
 
 impl ManifestKind {
@@ -365,7 +369,11 @@ impl ManifestKind {
             )),
             base_row_id: Expression::column([TRACKING, FIRST_ROW_ID]),
             helpers: Arc::new(StructType::new_unchecked([])),
-            checks: vec![],
+            checks: known_value_checks()
+                .into_iter()
+                .chain(unsupported_entry_checks())
+                .collect(),
+            selected_checks: selected_entry_checks(),
         }
     }
 
@@ -388,7 +396,15 @@ impl ManifestKind {
             read_schema: schema_with(&entries, &StructType::new_unchecked(metadata)),
             base_row_id: Expression::column([FIRST_ROW_ID_HELPER]),
             helpers: FIRST_ROW_ID_HELPER_SCHEMA.clone(),
-            checks: leaf_entry_checks(),
+            // A leaf holds only `Data` entries, which the leaf checks reject other content types
+            // for, so the unsupported-entry checks cannot fail there.
+            checks: known_value_checks()
+                .into_iter()
+                .chain(leaf_entry_checks())
+                .collect(),
+            selected_checks: iter::once(leaf_first_row_id_check())
+                .chain(selected_entry_checks())
+                .collect(),
         }
     }
 }
@@ -478,11 +494,11 @@ struct EntryTransform {
     read_schema: SchemaRef,
     /// Appends [`SELECTED_COLUMN`] to a batch with the [`ParentColumns`].
     annotator: Arc<dyn ExpressionEvaluator>,
-    /// Checks the kind's [`ManifestKind::checks`] and the [`entry_checks`] on annotated batches.
+    /// Checks the kind's [`ManifestKind::checks`] on annotated batches.
     checker: ConditionChecker,
     /// Keeps the rows of a batch whose [`SELECTED_COLUMN`] is true.
     selection_filter: Arc<dyn PredicateEvaluator>,
-    /// Checks the [`selected_entry_checks`] on the kept rows.
+    /// Checks the kind's [`ManifestKind::selected_checks`] on the kept rows.
     selected_checker: ConditionChecker,
     /// The kind's [`ManifestKind::helpers`].
     helpers: SchemaRef,
@@ -502,10 +518,7 @@ impl EntryTransform {
             )
             .build()?;
         let annotator = patch_evaluator(engine, &marked_schema, &annotate)?;
-        // A kind's own checks come first: a leaf reports a non-`Data` entry as such, before the
-        // checks that apply to every entry.
-        let checks = kind.checks.into_iter().chain(entry_checks()).collect();
-        let checker = ConditionChecker::try_new(handler.as_ref(), annotate.0.clone(), checks)?;
+        let checker = ConditionChecker::try_new(handler.as_ref(), annotate.0.clone(), kind.checks)?;
         let augmented_schema = schema_with(&annotate.0, &kind.helpers);
         let selection_filter = handler.new_predicate_evaluator(
             augmented_schema.clone(),
@@ -514,7 +527,7 @@ impl EntryTransform {
         let selected_checker = ConditionChecker::try_new(
             handler.as_ref(),
             augmented_schema.clone(),
-            selected_entry_checks(),
+            kind.selected_checks,
         )?;
         let evaluator = handler.new_expression_evaluator(
             schema_with(&augmented_schema, &ADD_HELPER_SCHEMA),
@@ -551,8 +564,7 @@ impl EntryTransform {
     /// of [`Self::convert`].
     ///
     /// # Errors
-    /// Returns the error of the first entry that fails one of the kind's [`ManifestKind::checks`]
-    /// or the [`entry_checks`].
+    /// Returns the error of the first entry that fails one of the kind's [`ManifestKind::checks`].
     fn annotate(
         &self,
         marker: &dyn ExpressionEvaluator,
@@ -575,9 +587,9 @@ impl EntryTransform {
     /// through the `Add`-specific checks. The result has schema [`ReadContext::add_schema`].
     ///
     /// # Errors
-    /// Returns an error if a kept entry fails the [`selected_entry_checks`], has a deletion vector
-    /// with no `Add` equivalent, has a `location` that cannot be encoded as an `Add.path` (see
-    /// [`amt_location_to_add_path`]), or if an evaluator fails to evaluate.
+    /// Returns an error if a kept entry fails one of the kind's [`ManifestKind::selected_checks`],
+    /// has a deletion vector with no `Add` equivalent, has a `location` that cannot be encoded as
+    /// an `Add.path` (see [`amt_location_to_add_path`]), or if an evaluator fails to evaluate.
     fn convert(
         &self,
         annotated: &dyn EngineData,
@@ -917,8 +929,17 @@ fn live_entries_predicate(content_type: DataContentType) -> Predicate {
 
 /// The entries whose tracking status is [live](TrackingStatus::is_live).
 fn live_status_predicate() -> Predicate {
-    let status = || Expression::column([TRACKING, TRACKING_STATUS]);
-    Predicate::or_from(TrackingStatus::LIVE.map(|live| Predicate::eq(status(), lit(live))))
+    column_in(&[TRACKING, TRACKING_STATUS], TrackingStatus::LIVE)
+}
+
+/// The entries whose `column` equals one of `values`.
+fn column_in<T: Into<Scalar>>(column: &[&str], values: impl IntoIterator<Item = T>) -> Predicate {
+    let column = || Expression::column(column.iter().copied());
+    Predicate::or_from(
+        values
+            .into_iter()
+            .map(|value| Predicate::eq(column(), lit(value))),
+    )
 }
 
 /// The entries whose `columnFiles` list is non-empty. A null or empty list carries no column
@@ -931,51 +952,34 @@ fn has_column_files_predicate() -> Predicate {
     Expression::coalesce([count, lit(0)]).gt(lit(0))
 }
 
-/// What every root and leaf entry must satisfy. The read path fails closed on entries it cannot yet
-/// represent, rather than silently dropping or mis-translating them:
-/// - an unknown content-type or tracking-status value;
-/// - a live delete manifest entry, since dropping it would read the rows it deletes back as live;
-/// - a live data manifest entry with column files, which the read path cannot yet apply to the
-///   leaf's entries.
-fn entry_checks() -> Vec<Check> {
-    let location = || ColumnName::new([LOCATION]);
-    let known = |path: &[&str], values: &[Scalar]| {
-        let column = || Expression::column(path.iter().copied());
-        Predicate::or_from(
-            values
-                .iter()
-                .map(|value| Predicate::eq(column(), lit(value.clone()))),
-        )
-    };
-    let content_types = [
-        DataContentType::Data,
-        DataContentType::DataManifest,
-        DataContentType::DeleteManifest,
-    ];
-    let statuses = [
-        TrackingStatus::Existing,
-        TrackingStatus::Added,
-        TrackingStatus::Deleted,
-        TrackingStatus::Replaced,
-        TrackingStatus::Modified,
-    ];
+/// Rejects entries with an unknown content-type or tracking-status value.
+fn known_value_checks() -> Vec<Check> {
     vec![
         Check::new(
             "UnknownContentType",
-            known(&[CONTENT_TYPE], &content_types.map(Scalar::from)),
-            vec![ColumnName::new([CONTENT_TYPE])],
+            column_in(&[CONTENT_TYPE], DataContentType::ALL),
+            vec![column_name!(CONTENT_TYPE)],
             |values| unknown_enum_error(values, CONTENT_TYPE, DataContentType::try_from_repr),
         ),
         Check::new(
             "UnknownTrackingStatus",
-            known(&[TRACKING, TRACKING_STATUS], &statuses.map(Scalar::from)),
+            column_in(&[TRACKING, TRACKING_STATUS], TrackingStatus::ALL),
             vec![ColumnName::new([TRACKING, TRACKING_STATUS])],
             |values| unknown_enum_error(values, TRACKING_STATUS, TrackingStatus::try_from_repr),
         ),
+    ]
+}
+
+/// Rejects root entries the read path cannot yet represent, rather than silently dropping them:
+/// - a live delete manifest entry, since dropping it would read the rows it deletes back as live;
+/// - a live data manifest entry with column files, which the read path cannot yet apply to the
+///   leaf's entries.
+fn unsupported_entry_checks() -> Vec<Check> {
+    vec![
         Check::new(
             "LiveDeleteManifest",
             Predicate::not(live_entries_predicate(DataContentType::DeleteManifest)),
-            vec![location()],
+            vec![column_name!(LOCATION)],
             |values| {
                 KernelError::unsupported(format!(
                     "AMT read path does not yet support live {:?} entry '{}'",
@@ -990,7 +994,7 @@ fn entry_checks() -> Vec<Check> {
                 live_entries_predicate(DataContentType::DataManifest),
                 has_column_files_predicate(),
             )),
-            vec![location()],
+            vec![column_name!(LOCATION)],
             |values| {
                 KernelError::unsupported(format!(
                     "AMT read path does not yet support column files on a leaf manifest; \
@@ -1006,17 +1010,15 @@ fn entry_checks() -> Vec<Check> {
 /// Parquet, has no partition spec, and has no column files or unrecognized modification, whose
 /// values a plain `Add` would drop.
 fn selected_entry_checks() -> Vec<Check> {
-    let location = || ColumnName::new([LOCATION]);
-    let lowercase = |column: Expression| Expression::unary(UnaryExpressionOp::Lower, column);
-    let spec_id = || Expression::column([PARTITION_SPEC_ID]);
+    let spec_id = || col!(PARTITION_SPEC_ID);
     vec![
         Check::new(
             "NonParquetDataFile",
             Predicate::eq(
-                lowercase(Expression::column([FILE_FORMAT])),
+                Expression::unary(UnaryExpressionOp::Lower, col!(FILE_FORMAT)),
                 lit(DataFileFormat::Parquet),
             ),
-            vec![location(), ColumnName::new([FILE_FORMAT])],
+            vec![column_name!(LOCATION), column_name!(FILE_FORMAT)],
             |values| {
                 KernelError::unsupported(format!(
                     "AMT read path only supports {} data files; entry '{}' has file format '{}'",
@@ -1027,12 +1029,12 @@ fn selected_entry_checks() -> Vec<Check> {
             },
         ),
         Check::new(
-            "PartitionSpec",
+            "NonZeroPartitionSpec",
             Predicate::or(
                 Predicate::is_null(spec_id()),
                 Predicate::eq(spec_id(), lit(0)),
             ),
-            vec![location(), ColumnName::new([PARTITION_SPEC_ID])],
+            vec![column_name!(LOCATION), column_name!(PARTITION_SPEC_ID)],
             |values| {
                 KernelError::unsupported(format!(
                     "AMT read path does not yet support partition specs; entry '{}' has \
@@ -1045,8 +1047,8 @@ fn selected_entry_checks() -> Vec<Check> {
         Check::new(
             "ColumnFiles",
             Predicate::not(has_column_files_predicate()),
-            vec![location()],
-            |values| unsupported_modification(values, &format!("non-empty '{COLUMN_FILES}'")),
+            vec![column_name!(LOCATION)],
+            |values| unsupported_modification(values, "non-empty", COLUMN_FILES),
         ),
         // A modification is the only reason to set `modifiedSnapshotId`, and a deletion vector is
         // the only one this path recognizes, so a DV-less entry carrying one has an unrecognized
@@ -1057,20 +1059,18 @@ fn selected_entry_checks() -> Vec<Check> {
                 Predicate::is_null(Expression::column([TRACKING, MODIFIED_SNAPSHOT_ID])),
                 Predicate::is_not_null(Expression::column([DV_INFO])),
             ),
-            vec![location()],
-            |values| {
-                unsupported_modification(values, &format!("non-null '{MODIFIED_SNAPSHOT_ID}'"))
-            },
+            vec![column_name!(LOCATION)],
+            |values| unsupported_modification(values, "non-null", MODIFIED_SNAPSHOT_ID),
         ),
     ]
 }
 
-/// The error for an entry, whose location is the first of `values`, with an unsupported
-/// modification `field`.
-fn unsupported_modification(values: &[Option<&str>], field: &str) -> KernelError {
+/// The error for an entry, whose location is the first of `values`, whose `field` is `state`
+/// (e.g. `non-null`), marking a modification a plain `Add` would drop.
+fn unsupported_modification(values: &[Option<&str>], state: &str, field: &str) -> KernelError {
     KernelError::unsupported(format!(
         "AMT read path does not yet support a live entry with column files or an unrecognized \
-         modification (entry '{}' has {field})",
+         modification (entry '{}' has {state} '{field}')",
         diagnostic(values, 0)
     ))
 }
@@ -1091,8 +1091,8 @@ fn unknown_enum_error<T>(
 }
 
 /// What every leaf entry must satisfy: it is a `Data` entry, and a live entry that is not `Added`
-/// (so cannot inherit tracking fields) has a `sequenceNumber` and, if it becomes an `Add`, a
-/// `firstRowId`.
+/// (so cannot inherit tracking fields) has a `sequenceNumber`. See also
+/// [`leaf_first_row_id_check`].
 fn leaf_entry_checks() -> Vec<Check> {
     let added = || {
         Predicate::eq(
@@ -1130,17 +1130,21 @@ fn leaf_entry_checks() -> Vec<Check> {
             vec![location()],
             |values| missing_tracking_field(SEQUENCE_NUMBER, values),
         ),
-        Check::new(
-            "LeafLiveNonAddedMissingFirstRowId",
-            Predicate::or_from([
-                added(),
-                Predicate::not(Predicate::from_expr(Expression::column([SELECTED_COLUMN]))),
-                Predicate::is_not_null(Expression::column([TRACKING, FIRST_ROW_ID])),
-            ]),
-            vec![location()],
-            |values| missing_tracking_field(FIRST_ROW_ID, values),
-        ),
     ]
+}
+
+/// A leaf entry that becomes an `Add` and is not `Added` (so cannot inherit tracking fields) must
+/// have a `firstRowId` for its `Add.baseRowId`.
+fn leaf_first_row_id_check() -> Check {
+    Check::new(
+        "LeafLiveNonAddedMissingFirstRowId",
+        Predicate::or(
+            Predicate::eq(col!(TRACKING, TRACKING_STATUS), lit(TrackingStatus::Added)),
+            Predicate::is_not_null(col!(TRACKING, FIRST_ROW_ID)),
+        ),
+        vec![column_name!(LOCATION)],
+        |values| missing_tracking_field(FIRST_ROW_ID, values),
+    )
 }
 
 /// The error for a live non-`Added` leaf entry, whose location is the first of `values`, that has
@@ -1168,7 +1172,7 @@ fn check_row_positions(entries: &dyn EngineData, first_position: usize) -> Kerne
 /// An entry with a `firstRowId` keeps it. An `Added` entry without one gets the next unassigned
 /// ID, which then advances by the entry's `recordCount`. Removed entries (see [`REMOVED_COLUMN`])
 /// are assigned IDs the same way. Other entries without one keep a null `firstRowId`, which
-/// [`leaf_entry_checks`] allows only for entries that never become an `Add`.
+/// [`leaf_first_row_id_check`] allows only for entries that never become an `Add`.
 ///
 /// # Errors
 /// See [`LeafEntryVisitor`].
@@ -2819,13 +2823,29 @@ mod tests {
 
     #[rstest]
     fn live_delete_manifest_entry_errors(
-        #[values(TrackingStatus::Existing, TrackingStatus::Added)] status: TrackingStatus,
+        #[values(
+            TrackingStatus::Existing,
+            TrackingStatus::Added,
+            TrackingStatus::Modified
+        )]
+        status: TrackingStatus,
     ) {
         let mut entry = added_data_entry("deletes.parquet", 1, 1, 0, 0);
         entry.content_type = DataContentType::DeleteManifest;
         entry.tracking.status = status;
-        let result = convert(&[entry]);
-        assert_result_error_with_message(result, "live DeleteManifest entry");
+        assert_unsupported(
+            convert(&[entry]),
+            "live DeleteManifest entry 'deletes.parquet'",
+        );
+    }
+
+    /// Asserts `result` is an `Unsupported` error whose message contains `message`.
+    fn assert_unsupported(result: KernelResult<Box<dyn EngineData>>, message: &str) {
+        let err = result.err().unwrap();
+        assert!(
+            matches!(&err, KernelError::Unsupported(m) if m.contains(message)),
+            "{err}"
+        );
     }
 
     /// A dropped entry is not validated: an unsupported file format, partition spec, or deletion
@@ -2844,7 +2864,10 @@ mod tests {
         entry.content_type = content_type;
         entry.tracking.status = status;
         entry.spec_id = Some(7);
-        entry.deletion_vector = Some(test_dv_info());
+        entry.deletion_vector = Some(DeletionVectorInfo {
+            size_in_bytes: 7,
+            ..test_dv_info()
+        });
         entry.tracking.modified_snapshot_id = Some(1);
         entry.column_files = Some(vec![test_column_file()]);
         let entry = with_field(&entry.into(), &[FILE_FORMAT], Scalar::from("orc"));
@@ -2892,7 +2915,27 @@ mod tests {
         let mut entry = added_data_entry("f.parquet", 1, 1, 0, 0);
         entry.spec_id = spec_id;
         let entry = with_field(&entry.into(), &[FILE_FORMAT], Scalar::from(file_format));
-        assert_result_error_with_message(convert_struct(entry), message);
+        assert_unsupported(convert_struct(entry), message);
+    }
+
+    #[rstest]
+    #[case::file_format(&[FILE_FORMAT], Scalar::from("orc"), "entry 'kept.parquet' has file format")]
+    #[case::spec_id(&[PARTITION_SPEC_ID], Scalar::Integer(2), "entry 'kept.parquet' has specId 2")]
+    fn selected_entry_error_names_kept_entry_after_dropped_one(
+        #[case] path: &[&str],
+        #[case] value: Scalar,
+        #[case] message: &str,
+    ) {
+        let dropped = with_status(
+            added_data_entry("dropped.parquet", 1, 1, 0, 0),
+            TrackingStatus::Deleted,
+        );
+        let kept = added_data_entry("kept.parquet", 1, 1, 1, 0);
+        let rows = [dropped, kept].map(|entry| with_field(&entry.into(), path, value.clone()));
+        let engine = SyncEngine::new();
+        let batch = struct_batch(&engine, &rows);
+        let result = convert_root_entries_to_add_actions(&engine, batch.as_ref(), &read_ctx());
+        assert_unsupported(result, message);
     }
 
     #[rstest]
@@ -2935,8 +2978,7 @@ mod tests {
         if set_modified_snapshot_id {
             entry.tracking.modified_snapshot_id = Some(1);
         }
-        let result = convert(&[entry]);
-        assert_result_error_with_message(result, message);
+        assert_unsupported(convert(&[entry]), message);
     }
 
     // The conversion's error cases are covered in `dv_conversion`; this checks one propagates.
@@ -3335,6 +3377,7 @@ mod tests {
             TrackingStatus::Deleted
         )]
         status: TrackingStatus,
+        #[values(false, true)] removed: bool,
     ) {
         let engine = SyncEngine::new();
         let entry = with_status(
@@ -3343,7 +3386,10 @@ mod tests {
         );
         let entry = with_field(&entry.into(), path, value);
         let batch = with_row_indexes(struct_batch(&engine, &[entry]), [Scalar::Long(0)]);
-        let mut ctx = leaf_ctx(&engine, None);
+        let manifest_dv = removed
+            .then(|| ManifestDv::try_new(&mumbling_bitmap(&[0])).unwrap())
+            .flatten();
+        let mut ctx = leaf_ctx(&engine, manifest_dv);
         let err = ctx
             .convert_leaf_entries_to_add_actions(batch.as_ref())
             .err()
