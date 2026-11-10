@@ -7,6 +7,7 @@ use std::borrow::Cow;
 
 use url::Url;
 
+use crate::expressions::{Expression, Predicate, UnaryExpressionOp, lit};
 use crate::path_encoding::{uri_encode_path, with_trailing_slash};
 use crate::uri_reference::{scheme_len, uri_decode_location, uri_encode_location};
 use crate::utils::{require, to_file_size};
@@ -30,6 +31,35 @@ pub(crate) fn resolve_amt_location(path: &str, table_root: &Url) -> KernelResult
         Some(url) => Ok(url),
         None => resolve_table_relative(path, table_root),
     }
+}
+
+/// The expression form of [`resolve_amt_location`] over a STRING `location`: the URI string it
+/// parses, without the dot-segment check. Turn a value into the same [`Url`] with
+/// [`parse_resolved_amt_location`].
+pub(crate) fn resolve_amt_location_expression(
+    location: Expression,
+    table_root: &Url,
+) -> Expression {
+    let encoded = Expression::unary(UnaryExpressionOp::UriEncodePath, location.clone());
+    Expression::case_when(
+        [(Predicate::has_uri_scheme(location), encoded.clone())],
+        Expression::string_concat([lit(with_trailing_slash(table_root)), encoded]),
+    )
+}
+
+/// Parses `resolved`, the [`resolve_amt_location_expression`] value for the AMT `path`, into the
+/// [`Url`] [`resolve_amt_location`] returns for `path`.
+///
+/// # Errors
+///
+/// Returns an error if `path` contains a `.` or `..` segment, or if `resolved` fails to parse.
+pub(crate) fn parse_resolved_amt_location(path: &str, resolved: &str) -> KernelResult<Url> {
+    reject_dot_segments(path)?;
+    Url::parse(resolved).map_err(|e| {
+        KernelError::generic(format!(
+            "Failed to parse AMT location {path:?} (resolved to {resolved:?}): {e}"
+        ))
+    })
 }
 
 /// Parses an absolute AMT `path` into a [`Url`] with its path component percent-encoded, as
@@ -77,8 +107,19 @@ pub(crate) fn amt_manifest_filemeta(
     table_root: &Url,
     context: &str,
 ) -> KernelResult<FileMeta> {
+    let location = resolve_amt_location(path, table_root)?;
+    amt_manifest_filemeta_at(location, path, size_in_bytes, context)
+}
+
+/// [`amt_manifest_filemeta`] for a `path` already resolved to `location`.
+pub(crate) fn amt_manifest_filemeta_at(
+    location: Url,
+    path: &str,
+    size_in_bytes: i64,
+    context: &str,
+) -> KernelResult<FileMeta> {
     Ok(FileMeta {
-        location: resolve_amt_location(path, table_root)?,
+        location,
         last_modified: i64::MAX,
         size: to_file_size(size_in_bytes, format_args!("{context} '{path}'"))?,
     })
