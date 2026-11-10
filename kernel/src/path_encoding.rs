@@ -1,7 +1,8 @@
 //! URI percent-encoding of raw path components, matching Hadoop's `Path.toUri().toString()`.
 //!
 //! Used both when encoding a filesystem path into `add.path` (Hive-style partition paths) and
-//! when resolving a raw, table-relative AMT path against the table root.
+//! when resolving a raw, table-relative AMT path against the table root. Also detects whether a
+//! location has a URI scheme, which decides whether it is absolute or relative.
 
 use std::borrow::Cow;
 
@@ -46,6 +47,37 @@ pub(crate) fn uri_encode_path(path: &str) -> Cow<'_, str> {
 /// bytes are not valid UTF-8.
 pub(crate) fn uri_decode_path(path: &str) -> Option<Cow<'_, str>> {
     percent_decode_str(path).decode_utf8().ok()
+}
+
+/// Returns the byte length of `location`'s URI scheme (excluding the terminating `:`), or `None`
+/// if `location` does not begin with one, per [RFC 3986 section 3.1]:
+/// `scheme = ALPHA *( ALPHA / DIGIT / "+" / "-" / "." )`, terminated by `:`.
+///
+/// A location without a scheme is relative (per the Iceberg V4 path spec).
+///
+/// [RFC 3986 section 3.1]: https://datatracker.ietf.org/doc/html/rfc3986#section-3.1
+pub(crate) fn scheme_len(location: &str) -> Option<usize> {
+    for (position, ch) in location.char_indices() {
+        if ch == ':' {
+            return (position > 0).then_some(position);
+        }
+        if !is_scheme_char(ch, position) {
+            return None;
+        }
+    }
+    None
+}
+
+/// Returns whether `ch` is allowed at `position` in a URI scheme, per [RFC 3986 section 3.1]:
+/// the first character must be `ALPHA`; subsequent characters may also be `DIGIT`, `+`, `-`, or
+/// `.`. Schemes are restricted to US-ASCII, so non-ASCII letters are rejected.
+///
+/// [RFC 3986 section 3.1]: https://datatracker.ietf.org/doc/html/rfc3986#section-3.1
+fn is_scheme_char(ch: char, position: usize) -> bool {
+    if ch.is_ascii_alphabetic() {
+        return true;
+    }
+    position > 0 && (ch.is_ascii_digit() || ch == '+' || ch == '-' || ch == '.')
 }
 
 #[cfg(test)]

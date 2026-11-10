@@ -100,6 +100,7 @@ pub(crate) mod crc;
 pub mod engine_data;
 pub mod error;
 pub mod expressions;
+mod file_uri;
 pub mod incremental_scan;
 mod log_compaction;
 mod log_path;
@@ -200,6 +201,7 @@ pub use error::{
 };
 use expressions::Scalar;
 pub use expressions::{Expression, ExpressionRef, Predicate, PredicateRef};
+pub use file_uri::resolve_file_uri;
 pub use log_compaction::{LogCompactionWriter, should_compact};
 #[cfg(feature = "declarative-plans")]
 pub use plans::{IoOperation, Operation, PlanBuilder, PlanExecutor, PlanResult};

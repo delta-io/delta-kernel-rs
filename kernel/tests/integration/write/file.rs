@@ -1,6 +1,7 @@
 //! Write-path integration tests for `file` columns.
 
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Arc;
 
 use delta_kernel::arrow::array::{
@@ -9,7 +10,7 @@ use delta_kernel::arrow::array::{
 };
 use delta_kernel::arrow::buffer::{NullBuffer, OffsetBuffer};
 use delta_kernel::arrow::datatypes::{
-    DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
+    DataType as ArrowDataType, Field as ArrowField, Int64Type, Schema as ArrowSchema,
 };
 use delta_kernel::checkpoint::{CheckpointSpec, V2CheckpointConfig};
 use delta_kernel::committer::FileSystemCommitter;
@@ -28,7 +29,7 @@ use delta_kernel::snapshot::{Snapshot, SnapshotRef};
 use delta_kernel::table_changes::TableChanges;
 use delta_kernel::transaction::create_table::{CreateTableTransaction, create_table};
 use delta_kernel::transaction::data_layout::DataLayout;
-use delta_kernel::{Engine, KernelResult};
+use delta_kernel::{Engine, KernelResult, resolve_file_uri};
 use rstest::rstest;
 use test_utils::delta_kernel_default_engine::DefaultEngine;
 use test_utils::delta_kernel_default_engine::executor::tokio::TokioMultiThreadExecutor;
@@ -892,5 +893,52 @@ async fn test_predicate_on_file_sub_field_uses_written_stats(
 
     let files = scan_file_count(&snapshot, engine.as_ref(), predicate.clone())?;
     assert_eq!(files, expected, "{predicate:?}");
+    Ok(())
+}
+
+/// A connector reads the bytes a `file` value references by resolving its `uri` with
+/// [`resolve_file_uri`]: a relative `uri` against the table root, an absolute one as-is.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_read_bytes_at_resolved_file_uris() -> Result<(), Box<dyn std::error::Error>> {
+    let external_dir = tempfile::tempdir()?;
+    let external_path = external_dir.path().join("b.png");
+    std::fs::write(&external_path, b"external bytes")?;
+    let external_uri = Url::from_file_path(&external_path).unwrap().to_string();
+    let files = file_array(&[
+        Some((Some("_files/a.png"), Some(9), Some(5), None)),
+        Some((Some(external_uri.as_str()), None, None, None)),
+    ]);
+    let (_tmp_dir, table_path, engine, snapshot) =
+        write_table("none", DataType::file_type(), Arc::new(files)).await?;
+    let snapshot = snapshot?;
+    let files_dir = Path::new(&table_path).join("_files");
+    std::fs::create_dir(&files_dir)?;
+    std::fs::write(files_dir.join("a.png"), b"relative bytes")?;
+
+    let scan = snapshot.scan_builder().build()?;
+    let batches = read_scan(&scan, engine.clone())?;
+    let read = batches[0].column_by_name("c").unwrap().as_struct();
+    let uris = read.column_by_name("uri").unwrap().as_string::<i32>();
+    let offsets = read
+        .column_by_name("offset")
+        .unwrap()
+        .as_primitive::<Int64Type>();
+    let sizes = read
+        .column_by_name("size")
+        .unwrap()
+        .as_primitive::<Int64Type>();
+    let mut bytes = Vec::new();
+    for row in 0..read.len() {
+        let location = resolve_file_uri(scan.table_root(), uris.value(row))?;
+        let range = (!offsets.is_null(row)).then(|| {
+            let start = offsets.value(row) as u64;
+            start..start + sizes.value(row) as u64
+        });
+        let mut read = engine
+            .storage_handler()
+            .read_files(vec![(location, range)])?;
+        bytes.push(read.next().unwrap()?);
+    }
+    assert_eq!(bytes, [&b"bytes"[..], &b"external bytes"[..]]);
     Ok(())
 }

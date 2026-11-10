@@ -15,7 +15,8 @@ use crate::{KernelError, KernelResult};
 
 /// Fails if a non-null `file` value in `data` is invalid under the Parquet `FILE` specification,
 /// which requires readers to reject it; see [`validate_locator`]. Any `uri`, absolute or relative,
-/// is accepted; a relative one resolves against the table root, and reading does not resolve it.
+/// is accepted; a relative one resolves against the table root, and reading does not resolve it
+/// (see [`crate::resolve_file_uri`]).
 ///
 /// Columns are matched to `kernel_schema` by name, and a `file` column missing from `data` is an
 /// error. A value is checked only if it is present: not null, and not under a null struct, list or
