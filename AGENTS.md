@@ -418,6 +418,8 @@ Keep this list updated when new protocol features are added to kernel.
 ## Code Style
 
 - For FFI module organization, follow the [source layout guidance](ffi/AGENTS.md#source-layout).
+- For structs shared by Rust and FFI, follow the
+  [shared struct guidance](ffi/AGENTS.md#shared-rust-and-ffi-structs).
 - Line width is 100 characters. Wrap comments and string literals at 100, not 80.
 - Place `use` imports at the top of the file (for non-test code) or at the top of the
   `mod tests` block (for test code): never inside function bodies.

@@ -57,6 +57,18 @@ hardens bindings, and enlarges the unsafe surface.
 | Object that outlives the call | Opaque handle | The concrete representation is not C-compatible or its lifetime spans calls. |
 | Large tabular data | Arrow C Data Interface | It provides a standard ownership and release protocol for columnar batches. |
 
+#### Shared Rust and FFI structs
+
+When Rust and the FFI use a struct with the same members, define it once in the Rust API with
+`#[repr(C)]` and reuse it directly in FFI signatures. Keep the Rust name (`MyStruct`) rather than
+adding an `FfiMyStruct` duplicate or field-for-field conversions.
+
+All fields, including nested types, must be C-compatible. `#[repr(C)]` fixes the outer layout; it
+does not make fields such as `String`, `Vec`, or Rust-layout structs safe to expose. Use a separate
+FFI representation when field types, ownership, or lifetimes require conversion, such as a borrowed
+slice view over owned Rust data. Ensure cbindgen emits the shared type in both C and C++ headers.
+Changes to its members or layout must account for both the Rust API and the C ABI.
+
 #### Materialized collections
 
 When the producer already owns the complete collection, expose a borrowed entry slice. The owner
@@ -653,6 +665,7 @@ Before approving a new boundary type or function, answer:
 16. Does opaque encoded state cross as bytes, with compatibility checked when required?
 17. Does the C header communicate the same ownership, nullability, and mutation semantics as the
     Rust documentation?
+18. If a struct has the same members in Rust and FFI, does it reuse one `#[repr(C)]` Rust type?
 
 ### Event callback examples and performance evidence
 
