@@ -775,7 +775,7 @@ static VARIANT_TYPE_PREVIEW_INFO: FeatureInfo = FeatureInfo {
 static VARIANT_SHREDDING_INFO: FeatureInfo = FeatureInfo {
     feature_type: FeatureType::ReaderWriter,
     min_legacy_version: None,
-    feature_requirements: &[],
+    feature_requirements: &[FeatureRequirement::Supported(TableFeature::VariantType)],
     kernel_support: KernelSupport::Supported,
     enablement_check: EnablementCheck::AlwaysIfSupported,
 };
@@ -783,7 +783,7 @@ static VARIANT_SHREDDING_INFO: FeatureInfo = FeatureInfo {
 static VARIANT_SHREDDING_PREVIEW_INFO: FeatureInfo = FeatureInfo {
     feature_type: FeatureType::ReaderWriter,
     min_legacy_version: None,
-    feature_requirements: &[],
+    feature_requirements: &[FeatureRequirement::Supported(TableFeature::VariantType)],
     kernel_support: KernelSupport::Supported,
     enablement_check: EnablementCheck::AlwaysIfSupported,
 };

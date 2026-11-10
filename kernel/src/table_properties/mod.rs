@@ -47,6 +47,10 @@ pub(crate) const ENABLE_ICEBERG_COMPAT_V1: &str = "delta.enableIcebergCompatV1";
 pub(crate) const ENABLE_ICEBERG_COMPAT_V2: &str = "delta.enableIcebergCompatV2";
 pub(crate) const ENABLE_ICEBERG_COMPAT_V3: &str = "delta.enableIcebergCompatV3";
 pub(crate) const ENABLE_ICEBERG_NATIVE_V4: &str = "delta.enableIcebergNativeV4";
+pub(crate) const ENABLE_ICEBERG_WRITER_COMPAT_V1: &str = "delta.enableIcebergWriterCompatV1";
+pub(crate) const ENABLE_ICEBERG_WRITER_COMPAT_V3: &str = "delta.enableIcebergWriterCompatV3";
+pub(crate) const ENABLE_VARIANT_SHREDDING: &str = "delta.enableVariantShredding";
+pub(crate) const UNIVERSAL_FORMAT_ENABLED_FORMATS: &str = "delta.universalFormat.enabledFormats";
 pub(crate) const ISOLATION_LEVEL: &str = "delta.isolationLevel";
 pub(crate) const LOG_RETENTION_DURATION: &str = "delta.logRetentionDuration";
 pub(crate) const ENABLE_EXPIRED_LOG_CLEANUP: &str = "delta.enableExpiredLogCleanup";
@@ -162,6 +166,15 @@ pub struct TableProperties {
 
     /// When enabled, table content metadata is kept in the Adaptive Metadata Tree (AMT).
     pub enable_iceberg_native_v4: Option<bool>,
+
+    /// Whether Iceberg writer compatibility V1 is enabled for this table.
+    pub enable_iceberg_writer_compat_v1: Option<bool>,
+
+    /// Whether Iceberg writer compatibility V3 is enabled for this table.
+    pub enable_iceberg_writer_compat_v3: Option<bool>,
+
+    /// Whether variant shredding is enabled for this table.
+    pub enable_variant_shredding: Option<bool>,
 
     /// The degree to which a transaction must be isolated from modifications made by concurrent
     /// transactions.
@@ -665,6 +678,9 @@ mod tests {
             (ENABLE_ICEBERG_COMPAT_V2, "true"),
             (ENABLE_ICEBERG_COMPAT_V3, "true"),
             (ENABLE_ICEBERG_NATIVE_V4, "true"),
+            (ENABLE_ICEBERG_WRITER_COMPAT_V1, "true"),
+            (ENABLE_ICEBERG_WRITER_COMPAT_V3, "false"),
+            (ENABLE_VARIANT_SHREDDING, "true"),
             (ISOLATION_LEVEL, "snapshotIsolation"),
             (LOG_RETENTION_DURATION, "interval 2 seconds"),
             (ENABLE_EXPIRED_LOG_CLEANUP, "true"),
@@ -708,6 +724,9 @@ mod tests {
             enable_iceberg_compat_v2: Some(true),
             enable_iceberg_compat_v3: Some(true),
             enable_iceberg_native_v4: Some(true),
+            enable_iceberg_writer_compat_v1: Some(true),
+            enable_iceberg_writer_compat_v3: Some(false),
+            enable_variant_shredding: Some(true),
             isolation_level: Some(IsolationLevel::SnapshotIsolation),
             log_retention_duration: Some(Duration::new(2, 0)),
             enable_expired_log_cleanup: Some(true),

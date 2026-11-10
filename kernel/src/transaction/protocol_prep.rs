@@ -27,7 +27,7 @@ use crate::table_properties::{
     ENABLE_ICEBERG_NATIVE_V4, ENABLE_IN_COMMIT_TIMESTAMPS, ENABLE_ROW_TRACKING,
     IN_COMMIT_TIMESTAMP_ENABLEMENT_TIMESTAMP, IN_COMMIT_TIMESTAMP_ENABLEMENT_VERSION,
     MATERIALIZED_ROW_COMMIT_VERSION_COLUMN_NAME, MATERIALIZED_ROW_ID_COLUMN_NAME,
-    ROW_TRACKING_SUSPENDED, TableProperties,
+    ROW_TRACKING_SUSPENDED, TableProperties, UNIVERSAL_FORMAT_ENABLED_FORMATS,
 };
 use crate::{KernelError, KernelResult};
 
@@ -145,7 +145,7 @@ pub(crate) fn prepare_protocol_for_update(
     after: TableConfiguration,
     feature_signals: &[TableFeature],
 ) -> KernelResult<ProtocolPrepResult> {
-    reject_row_tracking_toggle(before, &after, feature_signals)?;
+    reject_existing_table_toggles(before, &after, feature_signals)?;
 
     let mut metadata = after.metadata().clone();
     let mut logical_schema = after.logical_schema();
@@ -172,6 +172,17 @@ pub(crate) fn prepare_protocol_for_update(
         &mut reader_features,
         &mut writer_features,
     );
+    // The preview feature is skipped when the GA feature is already in the protocol, so an
+    // opted-in GA table keeps its protocol unchanged.
+    let variant_shredding_ga_enabled = reader_features.contains(&TableFeature::VariantShredding)
+        || writer_features.contains(&TableFeature::VariantShredding);
+    if table_properties.enable_variant_shredding == Some(true) && !variant_shredding_ga_enabled {
+        add_feature_to_lists(
+            TableFeature::VariantShreddingPreview,
+            &mut reader_features,
+            &mut writer_features,
+        );
+    }
     maybe_enable_v2_checkpoint_for_policy(
         &table_properties,
         &mut reader_features,
@@ -198,6 +209,7 @@ pub(crate) fn prepare_protocol_for_update(
     } else {
         after
     };
+    validate_universal_format(&table_config)?;
     // Reject enablement that Kernel cannot write (for example IcebergCompatV1).
     table_config.ensure_write_supported()?;
 
@@ -234,27 +246,72 @@ pub(crate) fn with_ict_enablement_info(
         )
 }
 
-fn reject_row_tracking_toggle(
+/// Rejects changes that Kernel cannot apply to an existing table: toggling row tracking or
+/// Iceberg writer compatibility. Compares properties, not feature state, because the protocol has
+/// not been upgraded yet.
+fn reject_existing_table_toggles(
     before: &TableConfiguration,
     after: &TableConfiguration,
     feature_signals: &[TableFeature],
 ) -> KernelResult<()> {
-    // Compare the property, not feature state: the protocol has not been upgraded yet.
-    let before_enabled = before
-        .table_properties()
-        .enable_row_tracking
-        .unwrap_or(false);
-    let after_enabled = after
-        .table_properties()
-        .enable_row_tracking
-        .unwrap_or(false);
+    let (before_props, after_props) = (before.table_properties(), after.table_properties());
+    let toggled = |before: Option<bool>, after: Option<bool>| {
+        before.unwrap_or(false) != after.unwrap_or(false)
+    };
     // A feature signal must not bypass the property check by enabling the feature directly.
     let signal_enables_row_tracking = feature_signals.contains(&TableFeature::RowTracking)
         && !before.is_feature_supported(&TableFeature::RowTracking);
-    if before_enabled != after_enabled || signal_enables_row_tracking {
+    if toggled(
+        before_props.enable_row_tracking,
+        after_props.enable_row_tracking,
+    ) || signal_enables_row_tracking
+    {
         return Err(KernelError::unsupported(
             "Enabling or disabling row tracking on an existing table is not supported",
         ));
+    }
+    if toggled(
+        before_props.enable_iceberg_writer_compat_v1,
+        after_props.enable_iceberg_writer_compat_v1,
+    ) || toggled(
+        before_props.enable_iceberg_writer_compat_v3,
+        after_props.enable_iceberg_writer_compat_v3,
+    ) {
+        return Err(KernelError::unsupported(
+            "Enabling or disabling Iceberg writer compatibility on an existing table is not supported",
+        ));
+    }
+    Ok(())
+}
+
+/// Mirrors Java's UniForm validation: when `delta.universalFormat.enabledFormats` is present,
+/// at most one of IcebergCompatV2/V3 may be enabled, and the `iceberg` format needs one of them.
+fn validate_universal_format(table_config: &TableConfiguration) -> KernelResult<()> {
+    let Some(formats) = table_config
+        .metadata()
+        .configuration()
+        .get(UNIVERSAL_FORMAT_ENABLED_FORMATS)
+    else {
+        return Ok(());
+    };
+    let props = table_config.table_properties();
+    let compat_v2 = props.enable_iceberg_compat_v2 == Some(true);
+    let compat_v3 = props.enable_iceberg_compat_v3 == Some(true);
+    if compat_v2 && compat_v3 {
+        return Err(KernelError::generic(format!(
+            "'{}' and '{}' cannot be enabled at the same time.",
+            ENABLE_ICEBERG_COMPAT_V2, ENABLE_ICEBERG_COMPAT_V3,
+        )));
+    }
+    let iceberg_enabled = formats
+        .split(',')
+        .map(str::trim)
+        .any(|format| format == "iceberg");
+    if iceberg_enabled && !compat_v2 && !compat_v3 {
+        return Err(KernelError::generic(format!(
+            "One of {} or {} must be set to \"true\" to enable iceberg uniform format.",
+            ENABLE_ICEBERG_COMPAT_V2, ENABLE_ICEBERG_COMPAT_V3,
+        )));
     }
     Ok(())
 }

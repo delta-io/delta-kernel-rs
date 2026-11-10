@@ -1546,6 +1546,87 @@ mod tests {
         Ok(())
     }
 
+    #[rstest]
+    #[case::enable_writer_compat_v1("delta.enableIcebergWriterCompatV1", "true")]
+    #[case::enable_writer_compat_v3("delta.enableIcebergWriterCompatV3", "true")]
+    fn with_table_properties_added_rejects_writer_compat_toggle(
+        #[case] key: &str,
+        #[case] value: &str,
+    ) -> Result<()> {
+        let (engine, snapshot, _tempdir) = load_test_table("table-without-dv-small")?;
+        let error = snapshot
+            .update_table(UpdateTableOperation::AlterTable, "test-engine", false)
+            .with_table_properties_added([(key, value)])
+            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("Enabling or disabling Iceberg writer compatibility"),
+            "error={error}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn with_table_properties_added_enables_variant_shredding_preview() -> Result<()> {
+        let (engine, snapshot, _tempdir) = load_test_table("table-without-dv-small")?;
+        let transaction = snapshot
+            .update_table(UpdateTableOperation::AlterTable, "test-engine", false)
+            .with_table_properties_added([("delta.enableVariantShredding", "true")])
+            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
+
+        let config = &transaction.effective_table_config;
+        assert!(config.is_feature_supported(&TableFeature::VariantShreddingPreview));
+        assert!(config.is_feature_supported(&TableFeature::VariantType));
+        assert!(!config.is_feature_supported(&TableFeature::VariantShredding));
+        Ok(())
+    }
+
+    #[test]
+    fn variant_shredding_ga_signal_adds_variant_type_and_skips_preview() -> Result<()> {
+        let (engine, snapshot, _tempdir) = load_test_table("table-without-dv-small")?;
+        let transaction = snapshot
+            .update_table(UpdateTableOperation::AlterTable, "test-engine", false)
+            .with_table_properties_added([
+                ("delta.enableVariantShredding", "true"),
+                ("delta.feature.variantShredding", "supported"),
+            ])
+            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
+
+        let config = &transaction.effective_table_config;
+        assert!(config.is_feature_supported(&TableFeature::VariantShredding));
+        assert!(config.is_feature_supported(&TableFeature::VariantType));
+        assert!(!config.is_feature_supported(&TableFeature::VariantShreddingPreview));
+        Ok(())
+    }
+
+    #[test]
+    fn with_table_properties_added_rejects_iceberg_uniform_without_compat_v2_or_v3() -> Result<()> {
+        let (engine, snapshot, _tempdir) = load_test_table("table-without-dv-small")?;
+        let error = snapshot
+            .update_table(UpdateTableOperation::AlterTable, "test-engine", false)
+            .with_table_properties_added([("delta.universalFormat.enabledFormats", "iceberg")])
+            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("enable iceberg uniform format"),
+            "error={error}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn with_table_properties_added_accepts_hudi_universal_format() -> Result<()> {
+        let (engine, snapshot, _tempdir) = load_test_table("table-without-dv-small")?;
+        let transaction = snapshot
+            .update_table(UpdateTableOperation::AlterTable, "test-engine", false)
+            .with_table_properties_added([("delta.universalFormat.enabledFormats", "hudi")])
+            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
+        assert!(transaction.should_emit_metadata);
+        Ok(())
+    }
+
     #[test]
     fn blind_append_rejects_property_changes() -> Result<()> {
         let (engine, snapshot, _tempdir) = load_test_table("table-without-dv-small")?;
