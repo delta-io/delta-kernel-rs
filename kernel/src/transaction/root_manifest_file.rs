@@ -31,12 +31,6 @@ impl RootManifestFile {
     /// `commit_version`. A reader restores from it without replaying earlier commits, so it carries
     /// the table's protocol and metadata plus every active domain metadata and set transaction
     /// (this transaction's `dm_changes` and `set_transactions` merged in, newest wins).
-    ///
-    /// Domain metadata and set transactions are handled separately. When no log commits follow the
-    /// existing checkpoint action and this transaction doesn't change one of them, the action's
-    /// entries and sidecars are kept as they are. A change keeps the sidecars and edits only the
-    /// inline entries, unless it touches an entry stored in a sidecar, in which case the whole set
-    /// is written inline. Log commits after the action write the whole set inline.
     pub(super) fn compute_checkpoint_action(
         &self,
         engine: &dyn Engine,
@@ -119,8 +113,12 @@ impl RootManifestFile {
 }
 
 /// Builds one kind of checkpoint-action state (set transactions or domain metadata) as inline
-/// entries plus sidecars, keeping the `existing` checkpoint action's entries and sidecars where
-/// `changes` allow it (see [`RootManifestFile::compute_checkpoint_action`]).
+/// entries plus sidecars.
+///
+/// With no `changes`, the `existing` checkpoint action's entries and sidecars are kept as they are.
+/// Otherwise its sidecars are kept and only the inline entries are edited, unless a change touches
+/// an entry stored in a sidecar, in which case the whole set is written inline. Without an
+/// `existing` action the whole set is read and written inline.
 ///
 /// `read_all` returns every active entry of the kind at the read snapshot's version,
 /// `apply_changes` merges `changes` into a set of entries, and `is_live` drops expired entries
@@ -150,6 +148,7 @@ fn fold_entries<T: Clone>(
                 // The existing checkpoint covers the read snapshot, so an active entry that isn't
                 // inline lives in a sidecar. Kernel can't rewrite sidecars, so changing one of
                 // those entries writes the whole set inline instead.
+                // TODO(#2866): rewrite only the affected sidecars once kernel can write them.
                 let all = read_all()?;
                 let touches_sidecar = changes
                     .iter()
