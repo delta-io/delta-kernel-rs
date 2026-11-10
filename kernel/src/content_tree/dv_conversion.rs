@@ -103,16 +103,22 @@ pub(crate) fn add_deletion_vector_expression() -> Expression {
         )],
         dv_field(LOCATION),
     );
+    // Engines need not null out the leaves of a null struct, so only a present deletion vector's
+    // leaves may reach the strict casts.
+    let present = |value: Expression| {
+        Expression::case_when(
+            [(Predicate::is_not_null(dv()), value)],
+            null_lit(DataType::LONG),
+        )
+    };
     Expression::struct_with_nullability_from(
         [
             storage_type,
             path,
-            // TODO(#3750): use a cast that fails on overflow. Until then these would null out an
-            // out-of-range value, which `check_deletion_vector` rejects up front.
-            Expression::cast(dv_field(DV_INFO_OFFSET), DataType::INTEGER),
+            Expression::cast_strict(present(dv_field(DV_INFO_OFFSET)), DataType::INTEGER),
             // Undo the +8 framing of `extract_deletion_vector_content`.
-            Expression::cast(
-                dv_field(DV_INFO_SIZE_IN_BYTES) - lit(8i64),
+            Expression::cast_strict(
+                present(dv_field(DV_INFO_SIZE_IN_BYTES) - lit(8i64)),
                 DataType::INTEGER,
             ),
             dv_field(DV_INFO_CARDINALITY),
