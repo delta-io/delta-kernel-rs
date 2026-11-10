@@ -3070,6 +3070,32 @@ mod tests {
             }"#
     }
 
+    /// A `file` array element or map value is serialized as the bare string `"file"`, like a
+    /// top-level `file` field. The object form `{"type": "file"}` is not a Delta type.
+    #[test]
+    fn test_serde_file_in_array_and_map() {
+        let array: DataType = ArrayType::new(DataType::file_type(), true).into();
+        let json = r#"{"type":"array","elementType":"file","containsNull":true}"#;
+        assert_eq!(serde_json::to_string(&array).unwrap(), json);
+        assert_eq!(serde_json::from_str::<DataType>(json).unwrap(), array);
+
+        let map: DataType = MapType::new(DataType::STRING, DataType::file_type(), true).into();
+        let json =
+            r#"{"type":"map","keyType":"string","valueType":"file","valueContainsNull":true}"#;
+        assert_eq!(serde_json::to_string(&map).unwrap(), json);
+        assert_eq!(serde_json::from_str::<DataType>(json).unwrap(), map);
+
+        for json in [
+            r#"{"type":"file"}"#,
+            r#"{"type":"array","elementType":{"type":"file"},"containsNull":true}"#,
+        ] {
+            let err = serde_json::from_str::<DataType>(json)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("'file'"), "{json}: {err}");
+        }
+    }
+
     #[test]
     fn test_serde_file_type() {
         let file = DataType::file_type();
