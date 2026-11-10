@@ -21,7 +21,7 @@ use url::Url;
 
 use crate::actions::{ADD_NAME, ADD_SCHEMA, CheckpointAction, STATS_PARSED};
 use crate::amt_path_util::{
-    add_path_expression, amt_manifest_filemeta, validate_amt_data_file_location,
+    amt_manifest_filemeta, encode_amt_location_expression, validate_amt_data_file_location,
 };
 use crate::cancellation::CancellationTokenRef;
 use crate::content_tree::conditions::{Check, ConditionChecker, diagnostic, diagnostic_i32};
@@ -1187,7 +1187,7 @@ fn build_entry_to_add_expression(
     // TODO(#2866): carry tags across from the entry.
     let add = struct_expr_from_schema(&ctx.action_schema(), |name| {
         Some(match name {
-            n if n == PATH_NAME => add_path_expression(Expression::column([LOCATION])),
+            n if n == PATH_NAME => encode_amt_location_expression(Expression::column([LOCATION])),
             // TODO(#3320): read partition values from the entry's `partition` tuple once the read
             // path carries a partition spec.
             n if n == PARTITION_VALUES_NAME => empty_partition_values.clone(),
