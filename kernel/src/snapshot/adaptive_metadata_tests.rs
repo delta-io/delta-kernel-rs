@@ -15,8 +15,8 @@ use crate::engine::sync::SyncEngine;
 use crate::metrics::MeteredDeltaEngine;
 use crate::snapshot::builder::tests::measuring_reporter;
 use crate::unit_test_utils::adaptive_metadata_fixtures::{
-    checkpoint_line, domain, domain_metadata_line, setup_adaptive_metadata_table,
-    table_with_pointers, txn_line, write_ict_commit, write_sidecar,
+    TestCommit, checkpoint_line, domain, domain_metadata_line, setup_adaptive_metadata_table,
+    table_with_commits, txn_line, write_ict_commit, write_sidecar,
 };
 use crate::unit_test_utils::is_io_event;
 use crate::{Snapshot, SnapshotRef, Version};
@@ -277,17 +277,33 @@ fn domain_metadata_comes_from_checkpoint_action_and_later_commits(
 }
 
 #[rstest]
-#[case::no_manifest_commit(None, 0, false)]
-#[case::content_root_after_version(LastManifestCommit::new(2, 2).ok(), 1, true)]
-#[case::content_root_at_version(LastManifestCommit::new(2, 2).ok(), 2, false)]
-#[case::lagging_content_root_after_version(LastManifestCommit::new(2, 1).ok(), 0, true)]
-#[case::lagging_content_root_at_version(LastManifestCommit::new(2, 1).ok(), 1, false)]
+#[case::no_manifest_commit(vec![TestCommit::add("a.parquet"), TestCommit::add("b.parquet")], 0, false)]
+#[case::content_root_after_version(
+    vec![TestCommit::add("a.parquet"), TestCommit::add("b.parquet").manifest_commit(2)],
+    1,
+    true
+)]
+#[case::content_root_at_version(
+    vec![TestCommit::add("a.parquet"), TestCommit::add("b.parquet").manifest_commit(2)],
+    2,
+    false
+)]
+#[case::lagging_content_root_after_version(
+    vec![TestCommit::add("a.parquet"), TestCommit::add("b.parquet").manifest_commit(1)],
+    0,
+    true
+)]
+#[case::lagging_content_root_at_version(
+    vec![TestCommit::add("a.parquet"), TestCommit::add("b.parquet").manifest_commit(1)],
+    1,
+    false
+)]
 fn has_content_root_after_compares_content_root_version(
-    #[case] v2_pointer: Option<LastManifestCommit>,
+    #[case] commits: Vec<TestCommit>,
     #[case] version: Version,
     #[case] expected: bool,
 ) {
-    let (engine, table_root) = table_with_pointers(None, v2_pointer);
+    let (engine, table_root) = table_with_commits(&commits);
     let snapshot = Snapshot::builder_for(table_root).build(&engine).unwrap();
 
     assert_eq!(
