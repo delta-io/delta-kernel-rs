@@ -3,10 +3,9 @@
 //!
 //! [relative paths specification]: https://iceberg.apache.org/spec/#paths-in-metadata
 
-use std::borrow::Cow;
-
 use url::Url;
 
+use crate::expressions::{Expression, UnaryExpressionOp};
 use crate::path_encoding::{uri_encode_path, with_trailing_slash};
 use crate::uri_reference::{scheme_len, uri_decode_location, uri_encode_location};
 use crate::utils::{require, to_file_size};
@@ -30,6 +29,14 @@ pub(crate) fn resolve_amt_location(path: &str, table_root: &Url) -> KernelResult
         Some(url) => Ok(url),
         None => resolve_table_relative(path, table_root),
     }
+}
+
+/// Evaluates a STRING AMT data-file `location` to the `Add.path` it is read through: the path
+/// component percent-encoded as in [`resolve_amt_location`], a scheme and authority kept as
+/// written, and a relative location kept relative. Joining the value onto the table root gives
+/// the [`Url`] [`resolve_amt_location`] returns.
+pub(crate) fn add_path_expression(location: Expression) -> Expression {
+    Expression::unary(UnaryExpressionOp::UriEncodePath, location)
 }
 
 /// Parses an absolute AMT `path` into a [`Url`] with its path component percent-encoded, as
@@ -84,24 +91,20 @@ pub(crate) fn amt_manifest_filemeta(
     })
 }
 
-/// Converts a raw AMT data-file `location` into the RFC 2396 form `add.path` uses: the path
-/// component is percent-encoded as in [`resolve_amt_location`], while a scheme and authority are
-/// kept as-is, and a relative location stays relative. Returns [`Cow::Borrowed`] when nothing
-/// needs encoding.
+/// Checks that a raw AMT data-file `location` can become an `Add.path` that resolves where
+/// [`resolve_amt_location`] does.
 ///
 /// # Errors
 ///
 /// Returns an error if `location` contains a `.` or `..` segment, which [`resolve_amt_location`]
 /// rejects too, or if a relative `location` is empty or begins with `/` (see
 /// [`validate_table_relative`]), which would resolve outside the table root.
-pub(crate) fn amt_location_to_add_path(location: &str) -> KernelResult<Cow<'_, str>> {
+pub(crate) fn validate_amt_data_file_location(location: &str) -> KernelResult<()> {
     reject_dot_segments(location)?;
     if scheme_len(location).is_none() {
         validate_table_relative(location)?;
     }
-    // TODO(#2423): non-ASCII characters are percent-encoded here but left raw by Delta-Spark, so
-    // Add/Remove reconciliation can see two spellings of the same file.
-    Ok(uri_encode_location(location))
+    Ok(())
 }
 
 /// Resolve a strictly table-relative `path` into an absolute [`Url`] under `table_root`.
@@ -199,66 +202,72 @@ mod tests {
     use test_utils::assert_result_error_with_message;
 
     use super::*;
+    use crate::Engine as _;
+    use crate::arrow::array::AsArray as _;
+    use crate::engine::arrow_data::EngineDataArrowExt as _;
+    use crate::engine::sync::SyncEngine;
+    use crate::expressions::{Scalar, col};
+    use crate::schema::{DataType, schema_ref};
+
+    type Resolver = fn(&str, &Url) -> KernelResult<Url>;
+
+    /// Evaluates `expression` over a one-row batch whose `location` column holds `location`.
+    fn evaluate_on_location(location: &str, expression: Expression) -> KernelResult<String> {
+        let handler = SyncEngine::new().evaluation_handler();
+        let schema = schema_ref! { not_null "location": STRING };
+        let batch = handler.create_many(schema.clone(), vec![vec![Scalar::from(location)]])?;
+        let value = handler
+            .new_expression_evaluator(schema, expression.into(), DataType::STRING)?
+            .evaluate(batch.as_ref())?
+            .try_into_record_batch()?;
+        Ok(value.column(0).as_string::<i32>().value(0).to_string())
+    }
 
     /// `expected_url` is where a scan reads the file: `add.path` joined onto the table root.
     #[rstest]
-    #[case::plain_relative(
-        "data/a.parquet",
-        "data/a.parquet",
-        false,
-        "memory:///table/data/a.parquet"
-    )]
+    #[case::plain_relative("data/a.parquet", "data/a.parquet", "memory:///table/data/a.parquet")]
     #[case::spaced_relative(
         "data/a b.parquet",
         "data/a%20b.parquet",
-        true,
         "memory:///table/data/a%20b.parquet"
     )]
     #[case::percent_relative(
         "data/a%b.parquet",
         "data/a%25b.parquet",
-        true,
         "memory:///table/data/a%25b.parquet"
     )]
     #[case::non_ascii_relative(
         "data/M\u{fc}nchen.parquet",
         "data/M%C3%BCnchen.parquet",
-        true,
         "memory:///table/data/M%C3%BCnchen.parquet"
     )]
     #[case::query_and_fragment_relative(
         "data/a?b#c.parquet",
         "data/a%3Fb%23c.parquet",
-        true,
         "memory:///table/data/a%3Fb%23c.parquet"
     )]
     #[case::plain_absolute(
         "s3://bucket/t/a.parquet",
         "s3://bucket/t/a.parquet",
-        false,
         "s3://bucket/t/a.parquet"
     )]
     #[case::spaced_absolute(
         "s3://bucket/t/a b.parquet",
         "s3://bucket/t/a%20b.parquet",
-        true,
         "s3://bucket/t/a%20b.parquet"
     )]
     #[case::spaced_absolute_without_authority(
         "file:/tmp/a b.parquet",
         "file:/tmp/a%20b.parquet",
-        true,
         "file:///tmp/a%20b.parquet"
     )]
-    fn test_amt_location_to_add_path(
+    fn test_add_path_expression(
         #[case] location: &str,
         #[case] expected: &str,
-        #[case] encoded: bool,
         #[case] expected_url: &str,
     ) {
-        let path = amt_location_to_add_path(location).unwrap();
+        let path = evaluate_on_location(location, add_path_expression(col!("location"))).unwrap();
         assert_eq!(path, expected);
-        assert_eq!(matches!(path, Cow::Owned(_)), encoded);
         let table_root = Url::parse("memory:///table/").unwrap();
         let url = table_root.join(&path).unwrap();
         assert_eq!(url.as_str(), expected_url);
@@ -272,11 +281,11 @@ mod tests {
     #[case::empty("", "must not be empty")]
     #[case::leading_slash("/a.parquet", "must not begin with a leading '/'")]
     #[case::network_path("//host/a.parquet", "must not begin with a leading '/'")]
-    fn amt_location_to_add_path_rejects_invalid_locations(
+    fn validate_amt_data_file_location_rejects_invalid_locations(
         #[case] location: &str,
         #[case] message: &str,
     ) {
-        assert_result_error_with_message(amt_location_to_add_path(location), message);
+        assert_result_error_with_message(validate_amt_data_file_location(location), message);
     }
 
     #[rstest]
