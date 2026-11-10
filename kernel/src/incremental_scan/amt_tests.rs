@@ -1,105 +1,155 @@
-//! AMT (adaptiveMetadata) tests for [`IncrementalScanBuilder`]: ranges containing a manifest
-//! commit fall back (`None`) because its file actions may live only in the metadata tree.
+//! AMT (adaptiveMetadata) tests for [`IncrementalScanBuilder`].
 
 use std::collections::HashSet;
-use std::sync::Arc;
 
 use rstest::rstest;
-use test_utils::add_commit;
+use url::Url;
 
-use crate::actions::{CheckpointAction, ContentRoot, LastManifestCommit};
+use crate::actions::LastManifestCommit;
 use crate::engine::sync::SyncEngine;
 use crate::log_replay::FileActionKey;
-use crate::object_store::memory::InMemory;
 use crate::unit_test_utils::adaptive_metadata_fixtures::{
-    adaptive_metadata_protocol_and_metadata, checkpoint_line, commit_info_line,
-    protocol_and_metadata_lines,
+    checkpoint_action_with_content_root, checkpoint_line, setup_adaptive_metadata_table,
+    write_ict_commit,
 };
-use crate::unit_test_utils::test_schema_flat_with_column_mapping;
-use crate::{Snapshot, Version};
+use crate::{KernelResult, Snapshot, SnapshotRef, Version};
 
-const TABLE_ROOT: &str = "memory:///";
+/// How the target snapshot is loaded, which decides where its `lastManifestCommit` comes from.
+#[derive(Clone, Copy, Debug)]
+enum TargetLoad {
+    /// Read lazily from the target commit.
+    Fresh,
+    /// Taken from a CRC at the target version.
+    CrcAtTarget,
+    /// Resolved while updating a snapshot at `base_version` to the latest version.
+    UpdatedFromBase,
+}
 
-// A commit adding `path`, led by the In-Commit Timestamp `commitInfo` the table requires. A
-// `last_manifest_commit` `(version, contentRootVersion)` naming `version` itself makes this a
-// manifest commit, so it also carries the `checkpoint` action for that content root.
-fn add_commit_with_last_manifest_commit(
-    version: Version,
-    path: &str,
-    last_manifest_commit: Option<(i64, i64)>,
-) -> String {
-    let pointer = last_manifest_commit.map(|(v, c)| LastManifestCommit::new(v, c).unwrap());
-    let add = serde_json::json!({ "add": {
-        "path": path,
-        "partitionValues": {},
-        "size": 1,
-        "modificationTime": 0,
-        "dataChange": true,
-    } });
-    let mut lines = vec![commit_info_line(1, pointer.as_ref()), add.to_string()];
-    if let Some(pointer) = pointer.filter(|p| p.version == version as i64) {
-        let (protocol, metadata) = adaptive_metadata_protocol_and_metadata();
-        let content_root = ContentRoot::new(
-            "_delta_log/_manifests/root.avro".to_string(),
-            1024,
-            pointer.content_root_version,
+/// An AMT table whose commits 1 and 2 add `a.parquet` and `b.parquet` and carry the given
+/// `lastManifestCommit` `(version, contentRootVersion)` pointers. A pointer naming its own commit
+/// makes that commit a manifest commit, so it also gets the matching `checkpoint` action.
+fn table_with_pointers(
+    v1_pointer: Option<(i64, i64)>,
+    v2_pointer: Option<(i64, i64)>,
+) -> (SyncEngine, Url) {
+    let (engine, table_root) = setup_adaptive_metadata_table();
+    for (version, path, pointer) in [(1, "a.parquet", v1_pointer), (2, "b.parquet", v2_pointer)] {
+        let pointer = pointer.map(|(v, c)| LastManifestCommit::new(v, c).unwrap());
+        let add = serde_json::json!({ "add": {
+            "path": path,
+            "partitionValues": {},
+            "size": 1,
+            "modificationTime": 0,
+            "dataChange": true,
+        } });
+        let mut actions = add.to_string();
+        if let Some(pointer) = pointer.as_ref().filter(|p| p.version == version) {
+            let checkpoint = checkpoint_action_with_content_root(
+                "_delta_log/_manifests/root.avro",
+                1024,
+                pointer.version,
+                pointer.content_root_version,
+            );
+            actions = format!("{actions}\n{}", checkpoint_line(&checkpoint));
+        }
+        write_ict_commit(
+            &engine,
+            &table_root,
+            version as Version,
+            pointer.as_ref(),
+            &actions,
         );
-        let checkpoint = CheckpointAction::new(
-            pointer.version,
-            content_root,
-            protocol,
-            metadata,
-            vec![],
-            vec![],
-        );
-        lines.push(checkpoint_line(&checkpoint));
     }
-    lines.join("\n")
+    (engine, table_root)
+}
+
+fn load_target(
+    engine: &SyncEngine,
+    table_root: &Url,
+    base_version: Version,
+    load: TargetLoad,
+) -> SnapshotRef {
+    let latest = || {
+        Snapshot::builder_for(table_root.clone())
+            .build(engine)
+            .unwrap()
+    };
+    match load {
+        TargetLoad::Fresh => latest(),
+        TargetLoad::CrcAtTarget => {
+            latest().write_checksum(engine).unwrap();
+            let snapshot = latest();
+            assert!(snapshot.crc_at_version().is_some());
+            snapshot
+        }
+        TargetLoad::UpdatedFromBase => {
+            let base = Snapshot::builder_for(table_root.clone())
+                .at_version(base_version)
+                .build(engine)
+                .unwrap();
+            // Resolve the base's pointer first so that wrongly reusing it would be observable.
+            base.last_manifest_commit(engine).unwrap();
+            Snapshot::builder_from(base).build(engine).unwrap()
+        }
+    }
+}
+
+/// The live adds of an incremental scan from `base_version` to `target`, or `None` on fallback.
+fn incremental_live_adds(
+    engine: &SyncEngine,
+    target: SnapshotRef,
+    base_version: Version,
+) -> KernelResult<Option<HashSet<FileActionKey>>> {
+    let stream = target
+        .incremental_scan_builder(base_version)
+        .build(engine)?;
+    Ok(stream.map(|stream| stream.into_summary().unwrap().live_adds))
+}
+
+fn file_keys(paths: &[&str]) -> HashSet<FileActionKey> {
+    paths
+        .iter()
+        .map(|path| FileActionKey::new(*path, None))
+        .collect()
 }
 
 #[rstest]
-#[case::no_manifest_commit(None, None, 0, true)]
-#[case::manifest_commit_at_base(Some((1, 1)), Some((1, 1)), 1, true)]
-#[case::manifest_commit_is_target(None, Some((2, 2)), 1, false)]
-#[case::manifest_commit_carried_forward_into_range(Some((1, 1)), Some((1, 1)), 0, false)]
-#[case::lagging_content_root_in_range(None, Some((2, 1)), 1, false)]
-#[tokio::test]
-async fn manifest_commit_in_range_falls_back(
-    #[case] v1_last_manifest_commit: Option<(i64, i64)>,
-    #[case] v2_last_manifest_commit: Option<(i64, i64)>,
+#[case::no_manifest_commit(None, None, 0, Some(&["a.parquet", "b.parquet"][..]))]
+#[case::manifest_commit_at_base(Some((1, 1)), Some((1, 1)), 1, Some(&["b.parquet"][..]))]
+#[case::manifest_commit_is_target(None, Some((2, 2)), 1, None)]
+#[case::manifest_commit_carried_forward_into_range(Some((1, 1)), Some((1, 1)), 0, None)]
+// The RFC lets a manifest commit's content root lag its version; the guard must compare
+// `version`, not `contentRootVersion`.
+#[case::lagging_content_root_in_range(None, Some((2, 1)), 1, None)]
+fn falls_back_iff_manifest_commit_in_range(
+    #[case] v1_pointer: Option<(i64, i64)>,
+    #[case] v2_pointer: Option<(i64, i64)>,
     #[case] base_version: Version,
-    #[case] expect_stream: bool,
+    #[case] expected_live_adds: Option<&[&str]>,
+    #[values(
+        TargetLoad::Fresh,
+        TargetLoad::CrcAtTarget,
+        TargetLoad::UpdatedFromBase
+    )]
+    load: TargetLoad,
 ) {
-    let store = Arc::new(InMemory::new());
-    let commits = [
-        format!(
-            "{}\n{}",
-            commit_info_line(1, None),
-            protocol_and_metadata_lines(test_schema_flat_with_column_mapping(), &[])
-        ),
-        add_commit_with_last_manifest_commit(1, "a.parquet", v1_last_manifest_commit),
-        add_commit_with_last_manifest_commit(2, "b.parquet", v2_last_manifest_commit),
-    ];
-    for (version, commit) in commits.into_iter().enumerate() {
-        add_commit(TABLE_ROOT, store.as_ref(), version as Version, commit)
-            .await
-            .unwrap();
-    }
-    let engine = SyncEngine::new_with_store(store);
-    let snapshot = Snapshot::builder_for(TABLE_ROOT).build(&engine).unwrap();
+    let (engine, table_root) = table_with_pointers(v1_pointer, v2_pointer);
+    let target = load_target(&engine, &table_root, base_version, load);
 
-    let stream = snapshot
-        .incremental_scan_builder(base_version)
+    let live_adds = incremental_live_adds(&engine, target, base_version).unwrap();
+
+    assert_eq!(live_adds, expected_live_adds.map(file_keys));
+}
+
+#[test]
+fn manifest_commit_after_time_travel_target_does_not_fall_back() {
+    let (engine, table_root) = table_with_pointers(None, Some((2, 2)));
+    let target = Snapshot::builder_for(table_root)
+        .at_version(1)
         .build(&engine)
         .unwrap();
 
-    assert_eq!(stream.is_some(), expect_stream);
-    if let Some(stream) = stream {
-        let expected: HashSet<_> = ["a.parquet", "b.parquet"]
-            .into_iter()
-            .skip(base_version as usize)
-            .map(|path| FileActionKey::new(path, None))
-            .collect();
-        assert_eq!(stream.into_summary().unwrap().live_adds, expected);
-    }
+    let live_adds = incremental_live_adds(&engine, target, 0).unwrap();
+
+    assert_eq!(live_adds, Some(file_keys(&["a.parquet"])));
 }
