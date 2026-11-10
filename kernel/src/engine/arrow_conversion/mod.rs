@@ -41,28 +41,96 @@ pub(crate) const MAP_VALUE_DEFAULT: &str = "value";
 
 /// Translate a kernel [`StructField`]'s flat (non-nested) parquet field id metadata into Arrow
 /// field metadata: rewrites kernel-side `"parquet.field.id"` to arrow-side `"PARQUET:field_id"`
-/// (see [`PARQUET_FIELD_ID_META_KEY`]). All other entries pass through unchanged.
+/// (see [`PARQUET_FIELD_ID_META_KEY`]) and drops the kernel-side nested field ids, which go onto
+/// list and map entry fields instead. All other entries pass through unchanged.
 pub(crate) fn kernel_flat_parquet_id_to_arrow_metadata(
     field: &StructField,
 ) -> Result<HashMap<String, String>, ArrowError> {
     field
         .metadata()
         .iter()
+        .filter_map(|(key, val)| Some((arrow_metadata_key(key.as_str())?, val)))
         .map(|(key, val)| {
-            let transformed_key = if key.as_str() == ColumnMetadataKey::ParquetFieldId.as_ref() {
-                PARQUET_FIELD_ID_META_KEY.to_string()
-            } else {
-                key.to_string()
+            let val = match val {
+                MetadataValue::String(s) => s.clone(),
+                _ => {
+                    serde_json::to_string(val).map_err(|e| ArrowError::JsonError(e.to_string()))?
+                }
             };
-            match val {
-                MetadataValue::String(s) => Ok((transformed_key, s.clone())),
-                _ => Ok((
-                    transformed_key,
-                    serde_json::to_string(val).map_err(|e| ArrowError::JsonError(e.to_string()))?,
-                )),
-            }
+            Ok((key.to_string(), val))
         })
         .collect()
+}
+
+/// The Arrow field for a column of `data_type` under the kernel field `field`: its name,
+/// nullability, and metadata (see [`kernel_flat_parquet_id_to_arrow_metadata`]).
+pub(crate) fn arrow_field_for(
+    field: &StructField,
+    data_type: ArrowDataType,
+) -> Result<ArrowField, ArrowError> {
+    let metadata = kernel_flat_parquet_id_to_arrow_metadata(field)?;
+    Ok(ArrowField::new(field.name(), data_type, field.is_nullable()).with_metadata(metadata))
+}
+
+/// Whether `arrow_field` has exactly the metadata [`arrow_field_for`] gives `field`. Compares
+/// without building that metadata.
+pub(crate) fn has_arrow_metadata_of(arrow_field: &ArrowField, field: &StructField) -> bool {
+    let metadata = arrow_field.metadata();
+    let mut expected = 0;
+    let all_match = field.metadata().iter().all(|(key, val)| {
+        let Some(key) = arrow_metadata_key(key.as_str()) else {
+            return true;
+        };
+        expected += 1;
+        metadata
+            .get(key)
+            .is_some_and(|actual| is_arrow_metadata_value(actual, val))
+    });
+    all_match && metadata.len() == expected
+}
+
+/// Whether `arrow_field` has exactly the metadata [`parquet_field_id_metadata`] gives `id`.
+pub(crate) fn has_field_id_metadata(arrow_field: &ArrowField, id: Option<i64>) -> bool {
+    let metadata = arrow_field.metadata();
+    match id {
+        None => metadata.is_empty(),
+        Some(id) => {
+            metadata.len() == 1
+                && metadata
+                    .get(PARQUET_FIELD_ID_META_KEY)
+                    .is_some_and(|actual| {
+                        is_arrow_metadata_value(actual, &MetadataValue::Number(id))
+                    })
+        }
+    }
+}
+
+/// The Arrow metadata key of the kernel metadata `key`, or `None` for a key Arrow does not keep.
+fn arrow_metadata_key(key: &str) -> Option<&str> {
+    if key == ColumnMetadataKey::ColumnMappingNestedIds.as_ref() {
+        None
+    } else if key == ColumnMetadataKey::ParquetFieldId.as_ref() {
+        Some(PARQUET_FIELD_ID_META_KEY)
+    } else {
+        Some(key)
+    }
+}
+
+/// Whether `actual` is the Arrow metadata value [`kernel_flat_parquet_id_to_arrow_metadata`]
+/// writes for `value`.
+fn is_arrow_metadata_value(actual: &str, value: &MetadataValue) -> bool {
+    match value {
+        MetadataValue::String(expected) => actual == expected,
+        // JSON writes an integer in canonical decimal: no `+`, no leading zeros, no `-0`.
+        MetadataValue::Number(expected) => {
+            matches!(
+                actual.as_bytes(),
+                [b'0'] | [b'1'..=b'9', ..] | [b'-', b'1'..=b'9', ..]
+            ) && actual.parse::<i64>() == Ok(*expected)
+        }
+        MetadataValue::Boolean(expected) => actual == if *expected { "true" } else { "false" },
+        other => serde_json::to_string(other).is_ok_and(|expected| actual == expected),
+    }
 }
 
 /// Looks up a nested-field id for the given dot-path on a StructField's nested-ids metadata.
@@ -178,12 +246,7 @@ impl TryFromKernel<&StructType> for ArrowSchema {
 
 impl TryFromKernel<&StructField> for ArrowField {
     fn try_from_kernel(f: &StructField) -> Result<Self, ArrowError> {
-        let mut metadata = kernel_flat_parquet_id_to_arrow_metadata(f)?;
-        // `ColumnMetadataKey::ColumnMappingNestedIds` is a kernel-side metadata key, not
-        // retained in Arrow; its content is processed by `kernel_field_into_arrow`.
-        metadata.remove(ColumnMetadataKey::ColumnMappingNestedIds.as_ref());
-        let arrow_type = kernel_field_into_arrow(f, f.name(), f.data_type())?;
-        Ok(ArrowField::new(f.name(), arrow_type, f.is_nullable()).with_metadata(metadata))
+        arrow_field_for(f, kernel_field_into_arrow(f, f.name(), f.data_type())?)
     }
 }
 
@@ -1256,5 +1319,25 @@ mod tests {
                 (PARQUET_FIELD_ID_META_KEY.to_string(), id.to_string()),
             ])),
         )
+    }
+
+    #[rstest]
+    #[case::number("7", MetadataValue::Number(7), true)]
+    #[case::negative_number("-7", MetadataValue::Number(-7), true)]
+    #[case::zero("0", MetadataValue::Number(0), true)]
+    #[case::leading_zero("007", MetadataValue::Number(7), false)]
+    #[case::plus_sign("+7", MetadataValue::Number(7), false)]
+    #[case::negative_zero("-0", MetadataValue::Number(0), false)]
+    #[case::other_number("8", MetadataValue::Number(7), false)]
+    #[case::boolean("true", MetadataValue::Boolean(true), true)]
+    #[case::other_boolean("false", MetadataValue::Boolean(true), false)]
+    #[case::string("x", MetadataValue::String("x".into()), true)]
+    #[case::json("1.5", MetadataValue::Other(1.5.into()), true)]
+    fn test_is_arrow_metadata_value(
+        #[case] actual: &str,
+        #[case] value: MetadataValue,
+        #[case] expected: bool,
+    ) {
+        assert_eq!(is_arrow_metadata_value(actual, &value), expected);
     }
 }
