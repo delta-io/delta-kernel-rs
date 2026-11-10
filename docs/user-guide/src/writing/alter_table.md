@@ -166,6 +166,11 @@ value does not change, because Kernel cannot enable or disable them on an existi
 `delta.enableIcebergCompatV2` or `delta.enableIcebergCompatV3` to be `true`, and both cannot be
 enabled together.
 
+Enabling `delta.enableIcebergCompatV3` on an existing table is rejected, the same as the writer
+compatibility properties. Adding a `timestamp_ntz` column enables the `timestampNtz` feature in the
+same commit. Enabling `catalogManaged` through a feature signal also sets
+`delta.enableInCommitTimestamps` to `true`, and an explicit `false` is rejected.
+
 ```rust,ignore
 let result = snapshot
     .update_table(UpdateTableOperation::AlterTable, "my-app/1.0", /* data_change */ false)

@@ -766,11 +766,6 @@ async fn add_complex_type_column(
     StructField::nullable("NAME", DataType::STRING),
     "already exists"
 )]
-#[case::timestamp_ntz_without_feature(
-    &[],
-    StructField::nullable("ts", DataType::TIMESTAMP_NTZ),
-    "timestampNtz"
-)]
 #[case::non_nullable(&[], StructField::not_null("age", DataType::INTEGER), "non-nullable")]
 #[tokio::test]
 async fn add_column_failures(
@@ -789,6 +784,32 @@ async fn add_column_failures(
     assert!(err.is_err());
     assert!(err.unwrap_err().to_string().contains(error_contains));
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn add_timestamp_ntz_column_upgrades_protocol() -> delta_kernel::Result<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+    let snapshot =
+        create_table_and_load_snapshot(&table_path, simple_schema(), engine.as_ref(), &[])?;
+
+    let post = snapshot
+        .update_table(UpdateTableOperation::AlterTable, "test-engine", false)
+        .add_column(StructField::nullable("ts", DataType::TIMESTAMP_NTZ))
+        .build(engine.as_ref(), committer())?
+        .commit(engine.as_ref())?
+        .unwrap_post_commit_snapshot();
+
+    assert!(
+        post.table_configuration().is_feature_supported(
+            &delta_kernel::table_features::TableFeature::TimestampWithoutTimezone
+        ),
+        "adding a timestamp_ntz column must enable the timestampNtz feature"
+    );
+    let reloaded = Snapshot::builder_for(table_path).build(engine.as_ref())?;
+    assert!(reloaded.table_configuration().is_feature_supported(
+        &delta_kernel::table_features::TableFeature::TimestampWithoutTimezone
+    ));
     Ok(())
 }
 

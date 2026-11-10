@@ -11,7 +11,7 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 use crate::actions::Protocol;
-use crate::schema::SchemaRef;
+use crate::schema::{Schema, SchemaRef};
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::{
     ColumnMappingMode, FeatureRequirement, LEGACY_WRITER_FEATURES,
@@ -19,7 +19,7 @@ use crate::table_features::{
     TABLE_FEATURES_MIN_READER_VERSION, TABLE_FEATURES_MIN_WRITER_VERSION, TableFeature,
     add_feature_to_lists, assign_column_mapping_metadata, auto_enable_property_driven_features,
     ensure_domain_metadata_dependency, extract_enabled_reader_features,
-    find_max_column_id_in_schema,
+    find_max_column_id_in_schema, schema_contains_timestamp_ntz,
 };
 use crate::table_properties::{
     COLUMN_MAPPING_MAX_COLUMN_ID, COLUMN_MAPPING_MODE, CheckpointPolicy, ENABLE_DELETION_VECTORS,
@@ -31,8 +31,7 @@ use crate::table_properties::{
 };
 use crate::{KernelError, KernelResult};
 
-/// Table features that `delta.feature.<name>=supported` may enable, on CREATE TABLE and UPDATE
-/// TABLE.
+/// Table features that `delta.feature.<name>=supported` may enable, on CREATE/UPDATE TABLE
 ///
 /// Feature signals (`delta.feature.X=supported`) are validated against this list.
 /// Only features in this list can be enabled via feature signals.
@@ -61,6 +60,8 @@ pub(crate) const ALLOWED_DELTA_FEATURES: &[TableFeature] = &[
     TableFeature::RowTracking,
     TableFeature::VariantType,
     TableFeature::VariantShredding,
+    // Also derived from any final schema containing timestamp-without-time-zone columns.
+    TableFeature::TimestampWithoutTimezone,
     // Invariants is auto-enabled by `maybe_enable_invariants` when the schema has non-null
     // fields. Allowing explicit `delta.feature.invariants=supported` lets users pre-enable
     // the feature on an all-nullable table so a later ALTER TABLE ADD COLUMN NOT NULL does
@@ -128,6 +129,29 @@ pub(crate) fn parse_feature_signal(
     Ok(feature)
 }
 
+/// Returns `protocol` with `timestampNtz` added when `schema` has timestamp-without-timezone
+/// columns, or `None` when no change is needed.
+pub(crate) fn protocol_with_timestamp_ntz(
+    protocol: &Protocol,
+    schema: &Schema,
+) -> KernelResult<Option<Protocol>> {
+    if !schema_contains_timestamp_ntz(schema) {
+        return Ok(None);
+    }
+    let mut reader = extract_enabled_reader_features(protocol);
+    let mut writer = extract_enabled_writer_features(protocol);
+    let (reader_len, writer_len) = (reader.len(), writer.len());
+    add_feature_to_lists(
+        TableFeature::TimestampWithoutTimezone,
+        &mut reader,
+        &mut writer,
+    );
+    if reader.len() == reader_len && writer.len() == writer_len {
+        return Ok(None);
+    }
+    protocol_with_features(protocol, reader, writer).map(Some)
+}
+
 /// Result of preparing protocol (and possibly metadata) after an existing-table property update.
 pub(crate) struct ProtocolPrepResult {
     pub table_config: TableConfiguration,
@@ -157,14 +181,35 @@ pub(crate) fn prepare_protocol_for_update(
     metadata_side_effects |= apply_ict_disablement_cleanup(before, &mut metadata)?;
     metadata_side_effects |= apply_row_tracking_materialized_names(before, &mut metadata)?;
 
-    let table_properties = TableProperties::from(metadata.configuration().iter());
+    // `after` may already carry protocol changes from schema evolution (timestampNtz), so the
+    // change check compares against `before`. Features are only ever added below.
     let mut reader_features = extract_enabled_reader_features(after.protocol());
     let mut writer_features = extract_enabled_writer_features(after.protocol());
-    // Features are only ever added below, so unchanged lengths mean an unchanged feature set.
-    let (original_reader_len, original_writer_len) = (reader_features.len(), writer_features.len());
+    let original_reader_len = extract_enabled_reader_features(before.protocol()).len();
+    let original_writer_len = extract_enabled_writer_features(before.protocol()).len();
     for feature in feature_signals {
         add_feature_to_lists(feature.clone(), &mut reader_features, &mut writer_features);
     }
+    if reader_features.contains(&TableFeature::CatalogManaged)
+        || writer_features.contains(&TableFeature::CatalogManaged)
+    {
+        // ICT itself is added by the CatalogManaged feature requirement during dependency
+        // expansion; its enablement is property-driven, so the property must be set here.
+        match TableProperties::from(metadata.configuration().iter()).enable_in_commit_timestamps {
+            Some(true) => {}
+            Some(false) => {
+                return Err(KernelError::generic(format!(
+                    "Catalog-managed tables require '{ENABLE_IN_COMMIT_TIMESTAMPS}=true', \
+                     but it was explicitly set to 'false'"
+                )));
+            }
+            None => {
+                metadata = metadata.with_configuration_entry(ENABLE_IN_COMMIT_TIMESTAMPS, "true");
+                metadata_side_effects = true;
+            }
+        }
+    }
+    let table_properties = TableProperties::from(metadata.configuration().iter());
 
     auto_enable_property_driven_features(
         UPDATE_PROPERTY_DRIVEN_FEATURES,
@@ -268,6 +313,14 @@ fn reject_existing_table_toggles(
     {
         return Err(KernelError::unsupported(
             "Enabling or disabling row tracking on an existing table is not supported",
+        ));
+    }
+    if toggled(
+        before_props.enable_iceberg_compat_v3,
+        after_props.enable_iceberg_compat_v3,
+    ) {
+        return Err(KernelError::unsupported(
+            "Enabling or disabling IcebergCompatV3 on an existing table is not supported",
         ));
     }
     if toggled(
@@ -404,7 +457,15 @@ fn apply_iceberg_compat_property_dependencies(
         )?;
     }
     if is_true(metadata, ENABLE_ICEBERG_NATIVE_V4) {
-        changed |= require_column_mapping_mode(metadata, "id", "IcebergNativeV4")?;
+        changed |= require_property_value(metadata, COLUMN_MAPPING_MODE, "id", "IcebergNativeV4")?;
+        changed |=
+            require_property_value(metadata, ENABLE_DELETION_VECTORS, "true", "IcebergNativeV4")?;
+        changed |= require_property_value(
+            metadata,
+            ENABLE_IN_COMMIT_TIMESTAMPS,
+            "true",
+            "IcebergNativeV4",
+        )?;
         require_true_property(metadata, ENABLE_ROW_TRACKING, "IcebergNativeV4")?;
         if is_true(metadata, ROW_TRACKING_SUSPENDED) {
             return Err(KernelError::generic(format!(
@@ -565,25 +626,21 @@ fn require_column_mapping_mode_name_or_id(
     }
 }
 
-fn require_column_mapping_mode(
+/// Fills `key` with `required` when absent, and errors when it is set to a different value.
+fn require_property_value(
     metadata: &mut crate::actions::Metadata,
+    key: &str,
     required: &str,
     feature_name: &str,
 ) -> KernelResult<bool> {
-    match metadata
-        .configuration()
-        .get(COLUMN_MAPPING_MODE)
-        .map(String::as_str)
-    {
+    match metadata.configuration().get(key).map(String::as_str) {
         None => {
-            *metadata = metadata
-                .clone()
-                .with_configuration_entry(COLUMN_MAPPING_MODE, required);
+            *metadata = metadata.clone().with_configuration_entry(key, required);
             Ok(true)
         }
         Some(value) if value == required => Ok(false),
         Some(other) => Err(KernelError::generic(format!(
-            "{feature_name} requires '{COLUMN_MAPPING_MODE}' to be '{required}', got '{other}'"
+            "{feature_name} requires '{key}' to be '{required}', got '{other}'"
         ))),
     }
 }

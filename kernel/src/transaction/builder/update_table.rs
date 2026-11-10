@@ -465,7 +465,6 @@ fn try_new_update_table<MODE: ExecutionMode>(
         .iter()
         .map(|(key, value)| parse_feature_signal(key, value, "UPDATE TABLE"))
         .collect::<KernelResult<Vec<_>>>()?;
-
     let has_schema_changes = schema_changes.is_some();
     effective_table_config = match schema_changes {
         Some(changes) => apply_schema_changes(effective_table_config, changes)?,
@@ -692,7 +691,11 @@ mod tests {
     use crate::schema::{DataType, StructField, schema_ref};
     use crate::snapshot::Snapshot;
     use crate::table_features::TableFeature;
-    use crate::table_properties::{ENABLE_ICEBERG_COMPAT_V2, ENABLE_ICEBERG_COMPAT_V3};
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    use crate::table_properties::ENABLE_DELETION_VECTORS;
+    use crate::table_properties::{
+        ENABLE_ICEBERG_COMPAT_V2, ENABLE_ICEBERG_COMPAT_V3, ENABLE_IN_COMMIT_TIMESTAMPS,
+    };
     use crate::transaction::create_table::create_table;
     use crate::transaction::{SchemaOperation, UpdateTableOperation};
     use crate::unit_test_utils::{copy_test_table, load_test_table, test_schema_flat};
@@ -1404,10 +1407,6 @@ mod tests {
     }
 
     #[rstest]
-    #[case::compat_v3_without_row_tracking(
-        &[("delta.enableIcebergCompatV3", "true")],
-        "requires 'delta.enableRowTracking'"
-    )]
     #[case::compat_v2_with_deletion_vectors(
         &[("delta.enableIcebergCompatV2", "true"), ("delta.enableDeletionVectors", "true")],
         "cannot be enabled together with"
@@ -1454,6 +1453,7 @@ mod tests {
     #[case::change_data_feed("delta.feature.changeDataFeed", TableFeature::ChangeDataFeed)]
     #[case::deletion_vectors("delta.feature.deletionVectors", TableFeature::DeletionVectors)]
     #[case::type_widening("delta.feature.typeWidening", TableFeature::TypeWidening)]
+    #[case::timestamp_ntz("delta.feature.timestampNtz", TableFeature::TimestampWithoutTimezone)]
     fn with_table_properties_added_accepts_feature_signal_and_upgrades_protocol(
         #[case] key: &str,
         #[case] feature: TableFeature,
@@ -1624,6 +1624,141 @@ mod tests {
             .with_table_properties_added([("delta.universalFormat.enabledFormats", "hudi")])
             .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
         assert!(transaction.should_emit_metadata);
+        Ok(())
+    }
+
+    #[test]
+    fn add_timestamp_ntz_column_enables_timestamp_ntz_feature() -> Result<()> {
+        let (engine, snapshot, _tempdir) = load_test_table("table-without-dv-small")?;
+        let transaction = snapshot
+            .update_table(UpdateTableOperation::AlterTable, "test-engine", false)
+            .add_column(StructField::nullable("ts", DataType::TIMESTAMP_NTZ))
+            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
+        assert!(
+            transaction
+                .effective_table_config
+                .is_feature_supported(&TableFeature::TimestampWithoutTimezone)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn with_table_properties_added_catalog_managed_sets_ict_enablement_property() -> Result<()> {
+        let (engine, snapshot, _tempdir) = load_test_table("table-without-dv-small")?;
+        let transaction = snapshot
+            .update_table(UpdateTableOperation::AlterTable, "test-engine", false)
+            .with_table_properties_added([("delta.feature.catalogManaged", "supported")])
+            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
+        let config = &transaction.effective_table_config;
+        assert!(config.is_feature_supported(&TableFeature::CatalogManaged));
+        assert!(config.is_feature_supported(&TableFeature::InCommitTimestamp));
+        assert_eq!(
+            config
+                .metadata()
+                .configuration()
+                .get(ENABLE_IN_COMMIT_TIMESTAMPS)
+                .map(String::as_str),
+            Some("true")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn with_table_properties_added_catalog_managed_rejects_explicit_ict_disable() -> Result<()> {
+        let (engine, snapshot, _tempdir) = load_test_table("table-without-dv-small")?;
+        let error = snapshot
+            .update_table(UpdateTableOperation::AlterTable, "test-engine", false)
+            .with_table_properties_added([
+                ("delta.feature.catalogManaged", "supported"),
+                ("delta.enableInCommitTimestamps", "false"),
+            ])
+            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("Catalog-managed tables require"),
+            "error={error}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn with_table_properties_added_rejects_enabling_iceberg_compat_v3_on_existing_table()
+    -> Result<()> {
+        let (engine, snapshot, _tempdir) = load_test_table("table-without-dv-small")?;
+        let error = snapshot
+            .update_table(UpdateTableOperation::AlterTable, "test-engine", false)
+            .with_table_properties_added([("delta.enableIcebergCompatV3", "true")])
+            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("IcebergCompatV3 on an existing table"),
+            "error={error}"
+        );
+        Ok(())
+    }
+
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[test]
+    fn with_table_properties_added_enables_iceberg_native_v4_fills_dv_and_ict() -> Result<()> {
+        let engine = Arc::new(SyncEngine::new_with_store(Arc::new(InMemory::new())));
+        let snapshot = create_table("memory:///", test_schema_flat(), "test-engine", true)
+            .with_table_properties([
+                ("delta.columnMapping.mode", "id"),
+                ("delta.enableRowTracking", "true"),
+            ])
+            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+            .commit(engine.as_ref())?
+            .unwrap_post_commit_snapshot();
+
+        let transaction = snapshot
+            .update_table(UpdateTableOperation::AlterTable, "test-engine", false)
+            .with_table_properties_added([("delta.enableIcebergNativeV4", "true")])
+            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
+
+        let config = &transaction.effective_table_config;
+        let props = config.metadata().configuration();
+        assert_eq!(
+            props.get(ENABLE_DELETION_VECTORS).map(String::as_str),
+            Some("true")
+        );
+        assert_eq!(
+            props.get(ENABLE_IN_COMMIT_TIMESTAMPS).map(String::as_str),
+            Some("true")
+        );
+        assert!(config.is_feature_enabled(&TableFeature::DeletionVectors));
+        assert!(config.is_feature_enabled(&TableFeature::InCommitTimestamp));
+        assert!(config.is_feature_supported(&TableFeature::IcebergNativeV4Preview));
+        assert!(config.is_feature_supported(&TableFeature::AdaptiveMetadataPreview));
+        Ok(())
+    }
+
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[test]
+    fn with_table_properties_added_rejects_iceberg_native_v4_with_dv_disabled() -> Result<()> {
+        let engine = Arc::new(SyncEngine::new_with_store(Arc::new(InMemory::new())));
+        let snapshot = create_table("memory:///", test_schema_flat(), "test-engine", true)
+            .with_table_properties([
+                ("delta.columnMapping.mode", "id"),
+                ("delta.enableRowTracking", "true"),
+                ("delta.enableDeletionVectors", "false"),
+            ])
+            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+            .commit(engine.as_ref())?
+            .unwrap_post_commit_snapshot();
+
+        let error = snapshot
+            .update_table(UpdateTableOperation::AlterTable, "test-engine", false)
+            .with_table_properties_added([("delta.enableIcebergNativeV4", "true")])
+            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))
+            .unwrap_err();
+        assert!(
+            error.to_string().contains(
+                "IcebergNativeV4 requires 'delta.enableDeletionVectors' to be 'true', got 'false'"
+            ),
+            "error={error}"
+        );
         Ok(())
     }
 
