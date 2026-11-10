@@ -372,16 +372,15 @@ pub enum DataContentType {
 }
 
 impl DataContentType {
+    /// Every content type.
+    pub(crate) const ALL: [Self; 3] = [Self::Data, Self::DataManifest, Self::DeleteManifest];
+
     /// Maps the on-disk integer representation to the enum, erroring on unknown values.
     pub(crate) fn try_from_repr(value: i32) -> KernelResult<Self> {
-        match value {
-            0 => Ok(Self::Data),
-            3 => Ok(Self::DataManifest),
-            4 => Ok(Self::DeleteManifest),
-            other => Err(KernelError::generic(format!(
-                "Invalid AMT content type value: {other}"
-            ))),
-        }
+        Self::ALL
+            .into_iter()
+            .find(|content_type| *content_type as i32 == value)
+            .ok_or_else(|| KernelError::generic(format!("Invalid AMT content type value: {value}")))
     }
 }
 
@@ -435,18 +434,23 @@ pub enum TrackingStatus {
 }
 
 impl TrackingStatus {
+    /// Every tracking status.
+    pub(crate) const ALL: [Self; 5] = [
+        Self::Existing,
+        Self::Added,
+        Self::Deleted,
+        Self::Replaced,
+        Self::Modified,
+    ];
+
     /// Maps the on-disk integer representation to the enum, erroring on unknown values.
     pub(crate) fn try_from_repr(value: i32) -> KernelResult<Self> {
-        match value {
-            0 => Ok(Self::Existing),
-            1 => Ok(Self::Added),
-            2 => Ok(Self::Deleted),
-            3 => Ok(Self::Replaced),
-            4 => Ok(Self::Modified),
-            other => Err(KernelError::generic(format!(
-                "Invalid AMT tracking status value: {other}"
-            ))),
-        }
+        Self::ALL
+            .into_iter()
+            .find(|status| *status as i32 == value)
+            .ok_or_else(|| {
+                KernelError::generic(format!("Invalid AMT tracking status value: {value}"))
+            })
     }
 
     /// The statuses of entries that contribute rows to reads, surfaced as `Add` actions. Other
