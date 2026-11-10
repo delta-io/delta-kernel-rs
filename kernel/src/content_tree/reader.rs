@@ -20,7 +20,7 @@ use url::Url;
 
 use crate::actions::{ADD_NAME, ADD_SCHEMA, CheckpointAction, LOG_ADD_SCHEMA};
 use crate::amt_path_util::{
-    amt_manifest_filemeta_at, parse_resolved_amt_location, resolve_amt_location_expression,
+    amt_manifest_filemeta, parse_resolved_amt_location, resolve_amt_location_expression,
 };
 use crate::cancellation::CancellationTokenRef;
 use crate::content_tree::dv_conversion::{add_deletion_vector_expression, check_deletion_vector};
@@ -95,8 +95,8 @@ pub(crate) fn read_add_actions_from_amt(
     for batch in batches {
         let batch = batch?;
         let annotated = transform.annotate(marker.as_ref(), batch.as_ref())?;
-        leaves.extend(leaf_refs.leaf_refs(batch)?);
         root_actions.push(transform.convert(annotated.as_ref(), vec![])?);
+        leaves.extend(leaf_refs.leaf_refs(batch)?);
     }
     let leaf_actions = LeafToAddActions::try_new(engine, leaves, ctx, cancellation_token)?;
     Ok(Box::new(
@@ -176,7 +176,7 @@ impl LeafRef {
         let resolved =
             parse_resolved_amt_location(location, fields[1].get(row, RESOLVED_LOCATION_COLUMN)?)?;
         let size: i64 = fields[2].get(row, FILE_SIZE_IN_BYTES)?;
-        let file_meta = amt_manifest_filemeta_at(resolved, location, size, "AMT leaf manifest")?;
+        let file_meta = amt_manifest_filemeta(resolved, location, size, "AMT leaf manifest")?;
         let manifest_dv: Option<&[u8]> = fields[3].get_opt(row, MANIFEST_DV)?;
         let manifest_dv = manifest_dv
             .map(ManifestDv::try_new)
@@ -210,13 +210,11 @@ impl LeafRef {
     }
 }
 
-/// Column holding a root entry's `location` resolved against the table root (see
-/// [`resolve_amt_location_expression`]).
-const RESOLVED_LOCATION_COLUMN: &str = "_resolvedLocation";
-
-/// Turns the live `DataManifest` entries of root entry batches into [`LeafRef`]s.
+/// Turns the live `DataManifest` entries of root entry batches into [`LeafRef`]s. Unknown
+/// content types and statuses match no leaf reference, so batches must also go through
+/// [`EntryTransform::convert`], whose checks reject them.
 struct LeafRefProjection {
-    /// Keeps the live `DataManifest` entries of a batch.
+    /// Keeps the leaf references of a batch.
     filter: Arc<dyn PredicateEvaluator>,
     /// Appends [`RESOLVED_LOCATION_COLUMN`] to the kept entries.
     resolver: Arc<dyn ExpressionEvaluator>,
@@ -231,31 +229,22 @@ impl LeafRefProjection {
         table_root: &Url,
     ) -> KernelResult<Self> {
         let handler = engine.evaluation_handler();
-        let live_data_manifest = Predicate::and(
-            Predicate::eq(
-                Expression::column([CONTENT_TYPE]),
-                lit(DataContentType::DataManifest),
-            ),
-            live_status_predicate(),
-        );
-        let filter =
-            handler.new_predicate_evaluator(read_schema.clone(), Arc::new(live_data_manifest))?;
+        let filter = handler.new_predicate_evaluator(
+            read_schema.clone(),
+            Arc::new(live_entries_predicate(DataContentType::DataManifest)),
+        )?;
         let resolved = resolve_amt_location_expression(Expression::column([LOCATION]), table_root);
-        let (resolved_schema, resolve) = ProjectionStructPatchBuilder::new(read_schema)
+        let resolve = ProjectionStructPatchBuilder::new(read_schema)
             .append(
                 StructField::nullable(RESOLVED_LOCATION_COLUMN, DataType::STRING),
                 resolved,
             )
             .build()?;
-        let resolver = handler.new_expression_evaluator(
-            read_schema.clone(),
-            resolve,
-            resolved_schema.as_ref().clone().into(),
-        )?;
+        let resolver = patch_evaluator(engine, read_schema, &resolve)?;
         Ok(Self { filter, resolver })
     }
 
-    /// The [`LeafRef`]s of the live `DataManifest` entries of `entries`, in row order.
+    /// The [`LeafRef`]s of `entries`, in row order.
     fn leaf_refs(&self, entries: Box<dyn EngineData>) -> KernelResult<Vec<LeafRef>> {
         let live_data_manifests = filter_by_predicate(self.filter.as_ref(), entries)?;
         let resolved = self.resolver.evaluate(live_data_manifests.as_ref())?;
@@ -355,6 +344,10 @@ const PARENT_SEQUENCE_NUMBER_COLUMN: &str = "_parentSequenceNumber";
 /// Column holding whether an entry becomes an `Add` (see [`selected_predicate`]).
 const SELECTED_COLUMN: &str = "_selected";
 
+/// Column holding a root entry's `location` resolved against the table root (see
+/// [`resolve_amt_location_expression`]).
+const RESOLVED_LOCATION_COLUMN: &str = "_resolvedLocation";
+
 /// What a leaf's entries take from the root `DataManifest` entry referencing the leaf, appended to
 /// each entry batch as the [`REMOVED_COLUMN`] and [`PARENT_SEQUENCE_NUMBER_COLUMN`] columns. A root
 /// manifest has no parent.
@@ -411,8 +404,6 @@ impl ParentColumns {
 struct EntryTransform {
     /// The schema entry batches are read with.
     read_schema: SchemaRef,
-    /// [`Self::read_schema`] followed by the [`ParentColumns`].
-    marked_schema: SchemaRef,
     /// Appends [`SELECTED_COLUMN`] to a batch with the [`ParentColumns`].
     annotator: Arc<dyn ExpressionEvaluator>,
     /// Keeps the rows of a batch whose [`SELECTED_COLUMN`] is true.
@@ -428,18 +419,14 @@ impl EntryTransform {
     fn try_new(engine: &dyn Engine, ctx: &ReadContext, kind: ManifestKind) -> KernelResult<Self> {
         let handler = engine.evaluation_handler();
         let (marked_schema, _) = ParentColumns::none().append_to(&kind.read_schema)?;
-        let (annotated_schema, annotate) = ProjectionStructPatchBuilder::new(&marked_schema)
+        let annotate = ProjectionStructPatchBuilder::new(&marked_schema)
             .append(
                 StructField::nullable(SELECTED_COLUMN, DataType::BOOLEAN),
                 Expression::from(selected_predicate()),
             )
             .build()?;
-        let annotator = handler.new_expression_evaluator(
-            marked_schema.clone(),
-            annotate,
-            annotated_schema.as_ref().clone().into(),
-        )?;
-        let augmented_schema = schema_with(&annotated_schema, &kind.helpers);
+        let annotator = patch_evaluator(engine, &marked_schema, &annotate)?;
+        let augmented_schema = schema_with(&annotate.0, &kind.helpers);
         let selection_filter = handler.new_predicate_evaluator(
             augmented_schema.clone(),
             Arc::new(Predicate::from_expr(Expression::column([SELECTED_COLUMN]))),
@@ -451,7 +438,6 @@ impl EntryTransform {
         )?;
         Ok(Self {
             read_schema: kind.read_schema,
-            marked_schema,
             annotator,
             selection_filter,
             helpers: kind.helpers,
@@ -466,11 +452,10 @@ impl EntryTransform {
         engine: &dyn Engine,
         parent: ParentColumns,
     ) -> KernelResult<Arc<dyn ExpressionEvaluator>> {
-        let (_, mark) = parent.append_to(&self.read_schema)?;
-        engine.evaluation_handler().new_expression_evaluator(
-            self.read_schema.clone(),
-            mark,
-            self.marked_schema.as_ref().clone().into(),
+        patch_evaluator(
+            engine,
+            &self.read_schema,
+            &parent.append_to(&self.read_schema)?,
         )
     }
 
@@ -617,6 +602,20 @@ impl LeafReadContext {
 }
 
 // === Helpers ===
+
+/// An evaluator applying `patch`, a struct patch of batches with `input_schema` and the schema it
+/// produces.
+fn patch_evaluator(
+    engine: &dyn Engine,
+    input_schema: &SchemaRef,
+    (output_schema, patch): &(SchemaRef, ExpressionRef),
+) -> KernelResult<Arc<dyn ExpressionEvaluator>> {
+    engine.evaluation_handler().new_expression_evaluator(
+        input_schema.clone(),
+        patch.clone(),
+        output_schema.as_ref().clone().into(),
+    )
+}
 
 /// `schema` followed by the fields of `extra`.
 fn schema_with(schema: &StructType, extra: &StructType) -> SchemaRef {
@@ -798,14 +797,18 @@ impl RowVisitor for FilePathVisitor {
 
 /// The entries that become `Add` actions: live, not removed `Data` entries.
 fn selected_predicate() -> Predicate {
-    Predicate::and_from([
-        Predicate::eq(
-            Expression::column([CONTENT_TYPE]),
-            lit(DataContentType::Data),
-        ),
-        live_status_predicate(),
+    Predicate::and(
+        live_entries_predicate(DataContentType::Data),
         Predicate::not(Predicate::from_expr(Expression::column([REMOVED_COLUMN]))),
-    ])
+    )
+}
+
+/// The [live](TrackingStatus::is_live) entries of `content_type`.
+fn live_entries_predicate(content_type: DataContentType) -> Predicate {
+    Predicate::and(
+        Predicate::eq(Expression::column([CONTENT_TYPE]), lit(content_type)),
+        live_status_predicate(),
+    )
 }
 
 /// The entries whose tracking status is [live](TrackingStatus::is_live).
@@ -981,8 +984,7 @@ impl RowVisitor for AddSelectionVisitor {
     }
 }
 
-/// Collects a [`LeafRef`] for every row of the [`LeafRefProjection`] batches it visits, in row
-/// order across batches.
+/// Collects a [`LeafRef`] for every row of a [`LeafRefProjection`] batch, in row order.
 #[derive(Default)]
 struct LeafRefVisitor {
     leaves: Vec<LeafRef>,
@@ -1454,25 +1456,18 @@ mod tests {
         Ok(leaves)
     }
 
-    /// Collects the leaf references of `batches`, each read as its own root entry batch.
+    /// [`collect_leaf_refs`] over one root entry batch per slice of `batches`.
     fn collect_entry_leaf_refs(batches: &[&[ContentTreeNodeEntry]]) -> KernelResult<Vec<LeafRef>> {
         let engine = SyncEngine::new();
-        let batches = batches.iter().map(|entries| entry_batch(&engine, entries));
-        collect_leaf_refs(&engine, batches.collect::<Vec<_>>())
+        collect_leaf_refs(
+            &engine,
+            batches.iter().map(|entries| entry_batch(&engine, entries)),
+        )
     }
 
     #[rstest]
-    #[case::relative("metadata/leaf.parquet", "memory:///table/metadata/leaf.parquet")]
-    #[case::relative_encoded(
-        "metadata/leaf 1%.parquet",
-        "memory:///table/metadata/leaf%201%25.parquet"
-    )]
-    #[case::colon_in_relative_segment(
-        "metadata/snap-1:2.parquet",
-        "memory:///table/metadata/snap-1:2.parquet"
-    )]
-    #[case::absolute("s3://bucket/leaf.parquet", "s3://bucket/leaf.parquet")]
-    #[case::absolute_encoded("s3://bucket/a b.parquet", "s3://bucket/a%20b.parquet")]
+    #[case::relative("metadata/leaf 1.parquet", "memory:///table/metadata/leaf%201.parquet")]
+    #[case::absolute("s3://bucket/leaf 1.parquet", "s3://bucket/leaf%201.parquet")]
     fn leaf_ref_resolves_location_against_table_root(
         #[case] location: &str,
         #[case] expected: &str,
@@ -1549,8 +1544,12 @@ mod tests {
         assert_eq!(leaves, expected);
     }
 
-    // Unknown content types and statuses are rejected by the root entry checks, not here.
     #[rstest]
+    #[case::unparseable_location(
+        &[LOCATION],
+        Scalar::from("s3://bucket:port/leaf.parquet"),
+        "Failed to parse absolute AMT location \"s3://bucket:port/leaf.parquet\""
+    )]
     #[case::unresolvable_location(
         &[LOCATION],
         Scalar::from("s3://bucket/a/../leaf.parquet"),
@@ -1570,6 +1569,25 @@ mod tests {
         let entry = data_manifest_entry("leaf.parquet", 1, TrackingStatus::Existing);
         let batch = struct_batch(&engine, &[with_field(&entry.into(), path, value)]);
         assert_result_error_with_message(collect_leaf_refs(&engine, [batch]), message);
+    }
+
+    #[rstest]
+    fn collect_leaf_refs_ignores_malformed_non_leaf_entry(
+        #[values(
+            data_manifest_entry("leaf.parquet", 1, TrackingStatus::Deleted),
+            added_data_entry("a.parquet", 1, 1, 0, 0)
+        )]
+        entry: ContentTreeNodeEntry,
+        #[values(
+            (&[LOCATION][..], Scalar::from("s3://bucket/a/../leaf.parquet")),
+            (&[FILE_SIZE_IN_BYTES][..], Scalar::Long(-1))
+        )]
+        malformed: (&[&str], Scalar),
+    ) {
+        let engine = SyncEngine::new();
+        let (path, value) = malformed;
+        let batch = struct_batch(&engine, &[with_field(&entry.into(), path, value)]);
+        assert!(collect_leaf_refs(&engine, [batch]).unwrap().is_empty());
     }
 
     // === Manifest read schemas ===
@@ -2469,8 +2487,16 @@ mod tests {
     #[rstest]
     #[case::content_type(&[CONTENT_TYPE], "Invalid AMT content type value: 5")]
     #[case::tracking_status(&[TRACKING, TRACKING_STATUS], "Invalid AMT tracking status value: 5")]
-    fn unknown_enum_value_errors(#[case] path: &[&str], #[case] message: &str) {
-        let entry: StructData = added_data_entry("f.parquet", 1, 1, 0, 0).into();
+    fn unknown_enum_value_errors(
+        #[case] path: &[&str],
+        #[case] message: &str,
+        #[values(
+            added_data_entry("f.parquet", 1, 1, 0, 0),
+            data_manifest_entry("leaf.parquet", 1, TrackingStatus::Existing)
+        )]
+        entry: ContentTreeNodeEntry,
+    ) {
+        let entry: StructData = entry.into();
         let result = convert_struct(with_field(&entry, path, Scalar::Integer(5)));
         assert_result_error_with_message(result, message);
     }
