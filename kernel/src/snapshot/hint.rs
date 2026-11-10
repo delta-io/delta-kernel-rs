@@ -11,7 +11,7 @@ use crate::last_checkpoint_hint::LastCheckpointHint;
 use crate::log_path::LogPath;
 use crate::log_segment::{LogSegment, validate_catalog_version_bounds};
 use crate::log_segment_files::{CheckpointHandling, LogSegmentFiles};
-use crate::path::{DELTA_LOG_DIR_WITH_SLASH, LogPathFileType, ParsedLogPath};
+use crate::path::{DELTA_LOG_DIR_WITH_SLASH, ParsedLogPath};
 use crate::snapshot::{IncrementalReplay, SnapshotRef};
 use crate::table_configuration::TableConfiguration;
 use crate::utils::{require, try_parse_uri};
@@ -109,9 +109,9 @@ impl SnapshotHint {
     ///
     /// Returns an error if `table_root` is invalid,
     /// [`SnapshotHintError::LogPathOutsideRoot`] if any path is outside `table_root`'s `_delta_log`
-    /// root, or
-    /// [`SnapshotHintError::LogCompaction`] if any path is a compacted commit. Returns an error
-    /// when the supplied paths cannot be grouped into a valid log-segment file set.
+    /// root. Returns an error when the supplied paths cannot be grouped into a valid log-segment
+    /// file set. Compacted paths are ignored, as in storage listing; callers must also supply the
+    /// individual commits required for replay.
     #[internal_api]
     #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
     #[allow(clippy::too_many_arguments)]
@@ -128,12 +128,6 @@ impl SnapshotHint {
     ) -> KernelResult<Self> {
         let log_root = try_parse_uri(table_root)?.join(DELTA_LOG_DIR_WITH_SLASH)?;
         let mut parsed_paths: Vec<ParsedLogPath> = log_paths.into_iter().map(Into::into).collect();
-        require!(
-            !parsed_paths
-                .iter()
-                .any(|path| matches!(path.file_type, LogPathFileType::CompactedCommit { .. })),
-            SnapshotHintError::LogCompaction.into()
-        );
         validate_snapshot_hint_paths(parsed_paths.iter(), &log_root)?;
         parsed_paths
             .sort_unstable_by(|a, b| (a.version, &a.filename).cmp(&(b.version, &b.filename)));
@@ -415,6 +409,7 @@ mod tests {
     use crate::cancellation::CancellationTokenRef;
     use crate::engine::sync::SyncEngine;
     use crate::metrics::{MeteredDeltaEngine, MetricEvent, SnapshotLoadType};
+    use crate::path::LogPathFileType;
     use crate::schema::schema_ref;
     use crate::snapshot::builder::tests::catalog_managed_tests::{
         create_log_path as create_catalog_log_path, setup_catalog_managed_test,
