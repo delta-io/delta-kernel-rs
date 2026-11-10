@@ -453,8 +453,8 @@ struct EntryTransform {
     /// Keeps the rows of a batch whose [`SELECTED_COLUMN`] is true.
     selection_filter: Arc<dyn PredicateEvaluator>,
     /// The kind's [`ManifestKind::helpers`] followed by the [`ADD_HELPER_SCHEMA`] columns.
-    helper_schema: SchemaRef,
-    /// Evaluates a selected entry batch with the [`Self::helper_schema`] columns.
+    helpers: SchemaRef,
+    /// Evaluates a selected entry batch with the [`Self::helpers`] columns.
     evaluator: Arc<dyn ExpressionEvaluator>,
 }
 
@@ -474,8 +474,8 @@ impl EntryTransform {
             select,
             selected_schema.as_ref().clone().into(),
         )?;
-        let helper_schema = schema_with(&kind.helpers, [ADD_HELPER_SCHEMA.as_ref()]);
-        let augmented_schema = schema_with(&selected_schema, [helper_schema.as_ref()]);
+        let helpers = schema_with(&kind.helpers, &ADD_HELPER_SCHEMA);
+        let augmented_schema = schema_with(&selected_schema, &helpers);
         let selection_filter = handler.new_predicate_evaluator(
             augmented_schema.clone(),
             Arc::new(Predicate::from_expr(Expression::column([SELECTED_COLUMN]))),
@@ -490,7 +490,7 @@ impl EntryTransform {
             marked_schema,
             selector,
             selection_filter,
-            helper_schema,
+            helpers,
             evaluator,
         })
     }
@@ -543,7 +543,7 @@ impl EntryTransform {
             ArrayType::new(DataType::STRING, true),
             visitor.encoded_paths,
         )?);
-        let augmented = with_selected.append_columns(self.helper_schema.clone(), columns)?;
+        let augmented = with_selected.append_columns(self.helpers.clone(), columns)?;
         let selected_entries = filter_by_predicate(self.selection_filter.as_ref(), augmented)?;
         self.evaluator.evaluate(selected_entries.as_ref())
     }
@@ -660,14 +660,10 @@ impl LeafReadContext {
 
 // === Helpers ===
 
-/// `schema` followed by the fields of each of `extra`.
-fn schema_with<'a>(
-    schema: &'a StructType,
-    extra: impl IntoIterator<Item = &'a StructType>,
-) -> SchemaRef {
-    let extra_fields = extra.into_iter().flat_map(StructType::fields);
+/// `schema` followed by the fields of `extra`.
+fn schema_with(schema: &StructType, extra: &StructType) -> SchemaRef {
     Arc::new(StructType::new_unchecked(
-        schema.fields().chain(extra_fields).cloned(),
+        schema.fields().chain(extra.fields()).cloned(),
     ))
 }
 
@@ -1329,7 +1325,7 @@ mod tests {
         let row_index = StructField::not_null(LEAF_ROW_INDEX_COLUMN, DataType::LONG);
         schema_with(
             &ContentTreeNodeEntry::to_schema(),
-            [&StructType::new_unchecked([row_index])],
+            &StructType::new_unchecked([row_index]),
         )
     }
 
