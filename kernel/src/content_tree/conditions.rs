@@ -30,6 +30,11 @@ pub(crate) struct AssertCondition {
 /// and read as strings. NULL values are `None`.
 pub(crate) type ConditionErrorFn = fn(&[Option<&str>]) -> KernelError;
 
+/// The diagnostic value at `index`, or `NULL` when it is null or absent.
+pub(crate) fn diagnostic<'a>(values: &[Option<&'a str>], index: usize) -> &'a str {
+    values.get(index).copied().flatten().unwrap_or("NULL")
+}
+
 /// A condition and the error it reports.
 #[derive(Debug, Clone)]
 pub(crate) struct Check {

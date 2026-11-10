@@ -21,6 +21,7 @@ use url::Url;
 use crate::actions::{ADD_NAME, ADD_SCHEMA, CheckpointAction, LOG_ADD_SCHEMA};
 use crate::amt_path_util::amt_manifest_filemeta;
 use crate::cancellation::CancellationTokenRef;
+use crate::content_tree::conditions::{AssertCondition, Check, ConditionChecker, diagnostic};
 use crate::content_tree::dv_conversion::{add_deletion_vector_expression, check_deletion_vector};
 use crate::content_tree::mumbling::MumblingBitmap;
 use crate::content_tree::{
@@ -283,6 +284,8 @@ struct ManifestKind {
     base_row_id: Expression,
     /// Columns the caller of [`EntryTransform::convert`] supplies for `base_row_id`.
     helpers: SchemaRef,
+    /// What every entry must satisfy, checked by [`EntryTransform::annotate`].
+    checks: Vec<Check>,
 }
 
 impl ManifestKind {
@@ -293,6 +296,7 @@ impl ManifestKind {
             read_schema: Arc::new(ContentTreeNodeEntry::to_schema()),
             base_row_id: Expression::column([TRACKING, FIRST_ROW_ID]),
             helpers: Arc::new(StructType::new_unchecked([])),
+            checks: vec![],
         }
     }
 
@@ -317,6 +321,7 @@ impl ManifestKind {
             )),
             base_row_id: Expression::column([FIRST_ROW_ID_HELPER]),
             helpers: FIRST_ROW_ID_HELPER_SCHEMA.clone(),
+            checks: leaf_entry_checks(),
         }
     }
 }
@@ -397,6 +402,8 @@ struct EntryTransform {
     read_schema: SchemaRef,
     /// Appends [`SELECTED_COLUMN`] to a batch with the [`ParentColumns`].
     annotator: Arc<dyn ExpressionEvaluator>,
+    /// Checks the kind's [`ManifestKind::checks`] on annotated batches.
+    checker: ConditionChecker,
     /// Keeps the rows of a batch whose [`SELECTED_COLUMN`] is true.
     selection_filter: Arc<dyn PredicateEvaluator>,
     /// The kind's [`ManifestKind::helpers`].
@@ -417,6 +424,7 @@ impl EntryTransform {
             )
             .build()?;
         let annotator = patch_evaluator(engine, &marked_schema, &annotate)?;
+        let checker = ConditionChecker::try_new(handler.as_ref(), annotate.0.clone(), kind.checks)?;
         let augmented_schema = schema_with(&annotate.0, &kind.helpers);
         let selection_filter = handler.new_predicate_evaluator(
             augmented_schema.clone(),
@@ -430,6 +438,7 @@ impl EntryTransform {
         Ok(Self {
             read_schema: kind.read_schema,
             annotator,
+            checker,
             selection_filter,
             helpers: kind.helpers,
             evaluator,
@@ -453,13 +462,18 @@ impl EntryTransform {
     /// Appends the [`ParentColumns`] (via `marker`, the manifest's [`Self::marker`]) and
     /// [`SELECTED_COLUMN`] to an entry batch read with [`Self::read_schema`], producing the input
     /// of [`Self::convert`].
+    ///
+    /// # Errors
+    /// Returns the error of the first entry that fails one of the kind's [`ManifestKind::checks`].
     fn annotate(
         &self,
         marker: &dyn ExpressionEvaluator,
         entries: &dyn EngineData,
     ) -> KernelResult<Box<dyn EngineData>> {
         let marked = marker.evaluate(entries)?;
-        self.annotator.evaluate(marked.as_ref())
+        let annotated = self.annotator.evaluate(marked.as_ref())?;
+        self.checker.check(annotated.as_ref())?;
+        Ok(annotated)
     }
 
     /// Translates a [`Self::annotate`]d entry batch into an `Add`-action batch holding only the
@@ -551,19 +565,16 @@ impl LeafReadContext {
     /// checks are skipped.
     ///
     /// # Errors
-    /// Returns an error if an entry is malformed for a leaf (see [`LeafEntryVisitor`]), or any
-    /// error from [`EntryTransform::convert`].
+    /// Returns an error if an entry fails the [`leaf_entry_checks`], if its `firstRowId` cannot be
+    /// assigned (see [`LeafEntryVisitor`]), or any error from [`EntryTransform::convert`].
     fn convert_leaf_entries_to_add_actions(
         &mut self,
         transform: &EntryTransform,
         entries: &dyn EngineData,
     ) -> KernelResult<Box<dyn EngineData>> {
         let annotated = transform.annotate(self.marker.as_ref(), entries)?;
-        let (first_row_ids, next_first_row_id) = validate_and_assign_first_row_ids(
-            annotated.as_ref(),
-            self.next_first_row_id,
-            self.entry_count,
-        )?;
+        let (first_row_ids, next_first_row_id) =
+            assign_first_row_ids(annotated.as_ref(), self.next_first_row_id, self.entry_count)?;
         let adds = transform.convert(annotated.as_ref(), vec![first_row_ids])?;
         // Only update `self` once the whole batch succeeds, so a failed batch leaves
         // `next_first_row_id` and `entry_count` unchanged.
@@ -808,17 +819,96 @@ fn live_status_predicate() -> Predicate {
     Predicate::or_from(TrackingStatus::LIVE.map(|live| Predicate::eq(status(), lit(live))))
 }
 
-/// Validates each leaf entry and resolves its `firstRowId`, starting from `seed`. Returns the
-/// per-row values and the next unassigned row ID. `first_position` is the number of the leaf's
+/// What every leaf entry must satisfy: it is a `Data` entry, and a live entry that is not `Added`
+/// has the `sequenceNumber` it would otherwise inherit and, unless removed, a `firstRowId`.
+fn leaf_entry_checks() -> Vec<Check> {
+    let column = |path: &[&str]| Expression::column(path.iter().copied());
+    // Only `Added` entries inherit tracking fields, so the others must carry their own.
+    let inherits_or_not_live = || {
+        let added = Predicate::eq(
+            column(&[TRACKING, TRACKING_STATUS]),
+            lit(TrackingStatus::Added),
+        );
+        Predicate::or(added, Predicate::not(live_status_predicate()))
+    };
+    vec![
+        Check {
+            condition: AssertCondition {
+                id: "LeafNonDataEntry",
+                predicate: Predicate::eq(column(&[CONTENT_TYPE]), lit(DataContentType::Data)),
+                diagnostic_cols: vec![ColumnName::new([LOCATION]), ColumnName::new([CONTENT_TYPE])],
+            },
+            error: |values| match enum_from_diagnostic(values, 1, DataContentType::try_from_repr) {
+                Ok(content_type) => KernelError::generic(format!(
+                    "AMT leaf manifest entry '{}' has content type {content_type:?}; leaf \
+                         manifests may only contain Data entries",
+                    diagnostic(values, 0)
+                )),
+                Err(e) => e,
+            },
+        },
+        Check {
+            condition: AssertCondition {
+                id: "LeafLiveNonAddedMissingSequenceNumber",
+                predicate: Predicate::or(
+                    inherits_or_not_live(),
+                    Predicate::is_not_null(column(&[TRACKING, SEQUENCE_NUMBER])),
+                ),
+                diagnostic_cols: vec![],
+            },
+            error: |_| {
+                KernelError::missing_data(format!(
+                    "AMT content-tree live non-Added leaf entry has a null '{SEQUENCE_NUMBER}'"
+                ))
+            },
+        },
+        // A missing `firstRowId` only matters for the `Add` the entry becomes, which a removed
+        // entry never does.
+        Check {
+            condition: AssertCondition {
+                id: "LeafLiveNonAddedMissingFirstRowId",
+                predicate: Predicate::or_from([
+                    inherits_or_not_live(),
+                    Predicate::from_expr(column(&[REMOVED_COLUMN])),
+                    Predicate::is_not_null(column(&[TRACKING, FIRST_ROW_ID])),
+                ]),
+                diagnostic_cols: vec![],
+            },
+            error: |_| {
+                KernelError::missing_data(format!(
+                    "AMT content-tree live non-Added leaf entry has a null '{FIRST_ROW_ID}'"
+                ))
+            },
+        },
+    ]
+}
+
+/// Parses the INTEGER diagnostic at `index` back into an enum with `try_from_repr`, which errors
+/// on an unknown value.
+fn enum_from_diagnostic<T>(
+    values: &[Option<&str>],
+    index: usize,
+    try_from_repr: fn(i32) -> KernelResult<T>,
+) -> KernelResult<T> {
+    let value = diagnostic(values, index);
+    let repr = value.parse().map_err(|_| {
+        KernelError::internal_error(format!("Expected an integer diagnostic, got '{value}'"))
+    })?;
+    try_from_repr(repr)
+}
+
+/// Resolves each leaf entry's `firstRowId`, starting from `seed`. Returns the per-row values and
+/// the next unassigned row ID. `first_position` is the number of the leaf's
 /// entries in earlier batches, the `_row_index` the batch's first entry must have.
 ///
 /// An entry with a `firstRowId` keeps it. An `Added` entry without one gets the next unassigned
 /// ID, which then advances by the entry's `recordCount`. Removed entries (see [`REMOVED_COLUMN`])
-/// are assigned IDs the same way, and may have a null `firstRowId` whatever their status.
+/// are assigned IDs the same way. Other entries without one keep a null `firstRowId`, which
+/// [`leaf_entry_checks`] allows only for entries that never become an `Add`.
 ///
 /// # Errors
 /// See [`LeafEntryVisitor`].
-fn validate_and_assign_first_row_ids(
+fn assign_first_row_ids(
     entries: &dyn EngineData,
     seed: i64,
     first_position: usize,
@@ -1067,12 +1157,11 @@ impl RowVisitor for ColumnFileCounter {
     }
 }
 
-/// Visitor behind [`validate_and_assign_first_row_ids`].
+/// Visitor behind [`assign_first_row_ids`].
 ///
-/// Errors if a leaf entry is not `Data`, has an unknown status, is live and non-`Added` with a null
-/// `sequenceNumber`, or needs a `firstRowId` but has a negative `recordCount`, or if assignment
-/// overflows `i64`. An entry the manifest deletion vector does not remove also errors if it is live
-/// and non-`Added` with a null `firstRowId`.
+/// Errors if an entry's `_row_index` is not its position in the leaf, if its status is unknown,
+/// if an entry needing a `firstRowId` has a negative `recordCount`, or if assignment overflows
+/// `i64`.
 struct LeafEntryVisitor {
     /// Next unassigned `firstRowId`.
     next_first_row_id: i64,
@@ -1100,20 +1189,14 @@ impl RowVisitor for LeafEntryVisitor {
                     ColumnName::new([RECORD_COUNT]),
                     ColumnName::new([TRACKING, FIRST_ROW_ID]),
                     ColumnName::new([TRACKING, TRACKING_STATUS]),
-                    ColumnName::new([TRACKING, SEQUENCE_NUMBER]),
-                    ColumnName::new([CONTENT_TYPE]),
                     ColumnName::new([LOCATION]),
-                    ColumnName::new([REMOVED_COLUMN]),
                     ColumnName::new([LEAF_ROW_INDEX_COLUMN]),
                 ],
                 vec![
                     DataType::LONG,
                     DataType::LONG,
                     DataType::INTEGER,
-                    DataType::LONG,
-                    DataType::INTEGER,
                     DataType::STRING,
-                    DataType::BOOLEAN,
                     DataType::LONG,
                 ],
             )
@@ -1128,38 +1211,16 @@ impl RowVisitor for LeafEntryVisitor {
             // Removal and the deletion vector's end check both assume an entry's `_row_index` is
             // its position in the leaf, so a reader that numbers rows differently fails
             // here instead of removing the wrong entries.
-            let row_index: i64 = getters[7].get(row, LEAF_ROW_INDEX_COLUMN)?;
+            let row_index: i64 = getters[4].get(row, LEAF_ROW_INDEX_COLUMN)?;
             let position = self.first_position + row;
             if usize::try_from(row_index).ok() != Some(position) {
-                let location: &str = getters[5].get(row, LOCATION)?;
+                let location: &str = getters[3].get(row, LOCATION)?;
                 return Err(KernelError::internal_error(format!(
                     "AMT leaf manifest entry '{location}' has {LEAF_ROW_INDEX_COLUMN} {row_index}, \
                      but it is entry {position} of its leaf"
                 )));
             }
-            let removed: bool = getters[6].get(row, REMOVED_COLUMN)?;
-            // A leaf manifest holds only data file entries.
-            let content_type = DataContentType::try_from_repr(getters[4].get(row, CONTENT_TYPE)?)?;
-            if content_type != DataContentType::Data {
-                let location: &str = getters[5].get(row, LOCATION)?;
-                return Err(KernelError::generic(format!(
-                    "AMT leaf manifest entry '{location}' has content type {content_type:?}; \
-                     leaf manifests may only contain Data entries"
-                )));
-            }
             let status = TrackingStatus::try_from_repr(getters[2].get(row, TRACKING_STATUS)?)?;
-            // Only `Added` entries may inherit `sequenceNumber`. Dropped entries never become an
-            // `Add`, so they are not checked.
-            let sequence_number: Option<i64> = getters[3].get_opt(row, SEQUENCE_NUMBER)?;
-            if status.is_live() && status != TrackingStatus::Added && sequence_number.is_none() {
-                return Err(KernelError::missing_data(format!(
-                    "AMT content-tree live non-Added leaf entry has a null '{SEQUENCE_NUMBER}'"
-                )));
-            }
-            // Unlike the `sequenceNumber` check above, which validates the leaf entry itself, a
-            // missing `firstRowId` only matters for the `baseRowId` of the `Add` the entry becomes.
-            // A removed entry never becomes one, so it may lack a `firstRowId`.
-            let needs_first_row_id = status.is_live() && !removed;
             let assigned = match getters[1].get_opt(row, FIRST_ROW_ID)? {
                 // An already-materialized `firstRowId` is kept and does not consume row IDs.
                 Some(existing) => Scalar::Long(existing),
@@ -1182,12 +1243,6 @@ impl RowVisitor for LeafEntryVisitor {
                         })?;
                     Scalar::Long(assigned)
                 }
-                None if needs_first_row_id => {
-                    return Err(KernelError::missing_data(format!(
-                        "AMT content-tree live non-Added leaf entry has a null '{FIRST_ROW_ID}'"
-                    )));
-                }
-                // Entries that are not live, or are removed, never become an `Add`.
                 None => Scalar::Null(DataType::LONG),
             };
             self.first_row_ids.push(assigned);
@@ -2909,6 +2964,25 @@ mod tests {
         let result =
             ctx.convert_leaf_entries_to_add_actions(leaf_batch(&engine, &[entry], 0).as_ref());
         assert_result_error_with_message(result, &format!("content type {content_type:?}"));
+    }
+
+    #[test]
+    fn leaf_unknown_content_type_errors() {
+        let engine = SyncEngine::new();
+        let entry: StructData = leaf_entry("f.parquet", 10, 5, None, None, None).into();
+        let entry = with_field(&entry, &[CONTENT_TYPE], Scalar::Integer(9));
+        let row_index = ArrayData::try_new(ArrayType::new(DataType::LONG, false), [0i64]).unwrap();
+        let batch = struct_batch(&engine, &[entry])
+            .append_columns(
+                schema_ref! { not_null LEAF_ROW_INDEX_COLUMN: LONG },
+                vec![row_index],
+            )
+            .unwrap();
+        let mut ctx = leaf_ctx(&engine, None);
+        assert_result_error_with_message(
+            ctx.convert_leaf_entries_to_add_actions(batch.as_ref()),
+            "Invalid AMT content type value: 9",
+        );
     }
 
     #[rstest]
