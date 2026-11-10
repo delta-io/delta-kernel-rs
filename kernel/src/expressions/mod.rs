@@ -1464,8 +1464,8 @@ mod tests {
     use serde::de::DeserializeOwned;
 
     use super::{
-        DataType, Expression as Expr, MapToStructOptions, Predicate as Pred, col, column_pred,
-        expr, lit,
+        DataType, Expression as Expr, MapToStructOptions, Predicate as Pred, UnaryExpressionOp,
+        col, column_pred, expr, lit,
     };
 
     /// Helper function to verify roundtrip serialization/deserialization
@@ -1494,6 +1494,14 @@ mod tests {
             (
                 Expr::cast(col!("x"), DataType::DATE),
                 "CAST(Column(x) AS date)",
+            ),
+            (
+                Expr::unary(UnaryExpressionOp::ToJson, col!("x")),
+                "TO_JSON(Column(x))",
+            ),
+            (
+                Expr::unary(UnaryExpressionOp::ToJsonFullPrecision, col!("x")),
+                "TO_JSON_FULL_PRECISION(Column(x))",
             ),
             (
                 Expr::case_when([(col!("x").is_null(), lit(0))], col!("x")),

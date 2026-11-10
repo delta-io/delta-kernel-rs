@@ -2587,6 +2587,20 @@ mod tests {
         }
     }
 
+    #[rstest]
+    #[case::non_string_output(Some(&DataType::INTEGER), "operator requires STRING output")]
+    #[case::non_struct_input(Some(&DataType::STRING), "TO_JSON can only be applied to struct")]
+    fn test_to_json_rejects_invalid_types(
+        #[case] result_type: Option<&DataType>,
+        #[case] expected_error: &str,
+        #[values(UnaryExpressionOp::ToJson, UnaryExpressionOp::ToJsonFullPrecision)]
+        op: UnaryExpressionOp,
+    ) {
+        let expr = Expr::unary(op, col!("a"));
+        let result = evaluate_expression(&expr, &create_test_batch(), result_type);
+        assert_result_error_with_message(result, expected_error);
+    }
+
     /// Evaluates the JSON-encoding `op` over a one-column batch wrapping `value` and returns the
     /// encoded row.
     fn to_json_string(op: UnaryExpressionOp, value: StructArray) -> String {
