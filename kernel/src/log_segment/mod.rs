@@ -1272,16 +1272,18 @@ impl LogSegment {
         Ok(actions)
     }
 
+    /// Scan files for `paths`, each tagged with file-constant `version` set to `version(path)`.
     #[cfg(feature = "declarative-plans")]
     fn version_tagged_scan_files<'a>(
         paths: impl IntoIterator<Item = &'a ParsedLogPath>,
+        version: impl Fn(&ParsedLogPath) -> KernelResult<i64>,
     ) -> KernelResult<Vec<ScanFile>> {
         paths
             .into_iter()
             .map(|path| {
                 Ok(ScanFile {
                     meta: path.location.clone(),
-                    file_constants: vec![Scalar::Long(path.version_as_i64()?)],
+                    file_constants: vec![Scalar::Long(version(path)?)],
                 })
             })
             .collect()
@@ -1290,7 +1292,10 @@ impl LogSegment {
     /// Returns commit-cover files tagged with file-constant `version`.
     #[cfg(feature = "declarative-plans")]
     pub(crate) fn commit_cover_version_tagged_scan_files(&self) -> KernelResult<Vec<ScanFile>> {
-        Self::version_tagged_scan_files(self.find_commit_cover_paths(None))
+        Self::version_tagged_scan_files(
+            self.find_commit_cover_paths(None),
+            ParsedLogPath::version_as_i64,
+        )
     }
 
     /// Returns the checkpoint parts tagged with file-constant `version`, paired with the single
@@ -1315,7 +1320,10 @@ impl LogSegment {
         } else {
             FileType::Parquet
         };
-        Ok(Some((file_type, Self::version_tagged_scan_files(parts)?)))
+        Ok(Some((
+            file_type,
+            Self::version_tagged_scan_files(parts, ParsedLogPath::version_as_i64)?,
+        )))
     }
 
     /// Returns sidecars from the applicable checkpoint hint, tagged with checkpoint version.

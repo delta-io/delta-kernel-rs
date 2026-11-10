@@ -215,7 +215,10 @@ impl LogSegment {
         let schema = pm_plan_schema(&extra_actions)?;
 
         let commits = PlanBuilder::scan_json(
-            Self::version_tagged_scan_files(commit_paths)?,
+            // A log compaction holds the P&M in effect at its last version, so it ranks there.
+            Self::version_tagged_scan_files(commit_paths, |path| {
+                version_as_i64(path.last_version())
+            })?,
             &["version"],
             schema.clone(),
         )?;
