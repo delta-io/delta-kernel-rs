@@ -1082,10 +1082,11 @@ Feature flags:
 
 ## Testing under Miri
 
-CI runs this crate's tests under Miri (the `miri` job in `build.yml`) to catch undefined
-behavior in the `unsafe` FFI boundary: raw-pointer reads/writes, `unsafe impl Send/Sync`,
-`Handle` conversions (`as_ref` / `clone_as_arc` / `into_inner`), and `free_*`. Miri is a MIR
-interpreter, so its runtime grows with interpreted work even when the same code is fast natively.
+CI runs this crate's tests under Miri (the test workers gated by `miri_results` in `build.yml`)
+to catch undefined behavior in the `unsafe` FFI boundary: raw-pointer reads/writes,
+`unsafe impl Send/Sync`, `Handle` conversions (`as_ref` / `clone_as_arc` / `into_inner`), and
+`free_*`. Miri is a MIR interpreter, so its runtime grows with interpreted work even when the
+same code is fast natively.
 
 The consequence: a test is expensive under Miri in proportion to how much *code it executes*,
 not how much it asserts. Tests that construct heavyweight but **safe** machinery -- a
