@@ -5,6 +5,7 @@ use std::iter;
 use super::action_projector::ActionProjector;
 use super::checkpoint_sidecar::read_sidecar_actions;
 use super::reader::{ReadContext, read_add_actions_from_amt};
+use crate::actions::visitors::{SetTransactionMap, SetTransactionVisitor};
 use crate::actions::{
     ADD_NAME, CheckpointAction, DOMAIN_METADATA_NAME, LOG_ADD_SCHEMA, LOG_DOMAIN_METADATA_SCHEMA,
     LOG_METADATA_SCHEMA, LOG_PROTOCOL_SCHEMA, LOG_TXN_SCHEMA, METADATA_NAME, PROTOCOL_NAME,
@@ -12,10 +13,11 @@ use crate::actions::{
 };
 use crate::expressions::Scalar;
 use crate::log_replay::ActionsBatch;
+use crate::log_segment::{DomainMetadataMap, scan_domain_metadata_actions};
 use crate::path::LogRoot;
 use crate::schema::SchemaRef;
 use crate::utils::require;
-use crate::{Engine, KernelError, KernelResult, KernelResultIterator};
+use crate::{Engine, KernelError, KernelResult, KernelResultIterator, RowVisitor as _};
 
 /// The action kinds a read schema may ask a checkpoint action for.
 const CHECKPOINT_ACTION_KINDS: &[&str] = &[
@@ -94,6 +96,34 @@ pub(crate) fn read_checkpoint_action(
         streams.push(stream);
     }
     Ok(Box::new(streams.into_iter().flatten()))
+}
+
+/// Returns the set transactions held by `checkpoint`, inline or in its sidecars, keyed by app id.
+pub(crate) fn read_checkpoint_action_transactions(
+    engine: &dyn Engine,
+    checkpoint: &CheckpointAction,
+    log_root: &LogRoot,
+) -> KernelResult<SetTransactionMap> {
+    let mut visitor = SetTransactionVisitor::new(None);
+    for batch in read_checkpoint_action(engine, checkpoint, log_root, LOG_TXN_SCHEMA.clone())? {
+        visitor.visit_rows_of(batch?.actions.as_ref())?;
+    }
+    Ok(visitor.set_transactions)
+}
+
+/// Returns the domain metadata held by `checkpoint`, inline or in its sidecars, keyed by domain.
+pub(crate) fn read_checkpoint_action_domain_metadata(
+    engine: &dyn Engine,
+    checkpoint: &CheckpointAction,
+    log_root: &LogRoot,
+) -> KernelResult<DomainMetadataMap> {
+    let actions = read_checkpoint_action(
+        engine,
+        checkpoint,
+        log_root,
+        LOG_DOMAIN_METADATA_SCHEMA.clone(),
+    )?;
+    scan_domain_metadata_actions(actions, None)
 }
 
 /// The `add` actions of `checkpoint`'s content tree, projected onto `read_schema`.
