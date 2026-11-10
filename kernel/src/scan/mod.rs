@@ -380,10 +380,10 @@ impl PartitionValuesOptions {
     /// `timestamp_timezone` when no compatible `add.partitionValues_parsed` exists.
     /// The provided timezone must match the timezone used to write those offset-less values.
     ///
-    /// `timestamp_timezone` must be an IANA timezone identifier recognized by Kernel or a
-    /// normalized fixed offset in `+HH:MM` or `-HH:MM` form. An explicit offset in a partition
-    /// value takes precedence. This option applies to partition pruning in full and incremental
-    /// scans and to returned parsed partition values in full scans. It does not affect
+    /// `timestamp_timezone` must be an IANA timezone identifier recognized by Kernel, a normalized
+    /// fixed offset in `+HH:MM[:SS]` or `-HH:MM[:SS]` form, or `Z` for UTC. An explicit offset in a
+    /// partition value takes precedence. This option applies to partition pruning in full and
+    /// incremental scans and to returned parsed partition values in full scans. It does not affect
     /// `TIMESTAMP_NTZ`.
     ///
     /// For example, if a `TIMESTAMP` partition column `ts` has
@@ -1547,13 +1547,13 @@ impl Scan {
     ///
     /// ```no_run
     /// # use std::sync::Arc;
-    /// # use delta_kernel::{Engine, KernelResult};
+    /// # use delta_kernel::Engine;
     /// # use delta_kernel::scan::{AfterSequentialScanMetadata, ParallelScanMetadata};
     /// # use delta_kernel::Snapshot;
     /// # use url::Url;
     /// # use test_utils::delta_kernel_default_engine::DefaultEngineBuilder;
     /// # use delta_kernel::object_store::local::LocalFileSystem;
-    /// # fn main() -> KernelResult<()> {
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// let engine = Arc::new(DefaultEngineBuilder::new(Arc::new(LocalFileSystem::new())).build());
     /// let table_root = Url::parse("file:///path/to/table")?;
     ///
@@ -1768,7 +1768,7 @@ impl Scan {
             // Iterator<Result<Iterator<Result<Box<dyn EngineData>>>>> to Iterator<Result<Result<Box<dyn EngineData>>>>
             .flatten_ok()
             // Iterator<Result<Result<Box<dyn EngineData>>>> to Iterator<Result<Box<dyn EngineData>>>
-            .map(|x| x?);
+            .map(Result::flatten);
         Ok(result)
     }
 }

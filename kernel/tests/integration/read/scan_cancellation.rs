@@ -2,19 +2,20 @@
 
 use std::sync::Arc;
 
+use delta_kernel::engine::DelegatingEngine;
 use delta_kernel::object_store::ObjectStoreExt as _;
 use delta_kernel::object_store::memory::InMemory;
 use delta_kernel::object_store::path::Path;
 use delta_kernel::scan::StatsOptions;
 use delta_kernel::{
-    CancellationToken as _, CancellationTokenRef, Engine, FileMeta, FileSlice, JsonHandler,
-    KernelError, KernelResult, KernelResultIterator, ParquetHandler, Snapshot, StorageHandler,
+    CancellationToken as _, CancellationTokenRef, Engine, FileMeta, FileSlice, KernelError,
+    KernelResult, KernelResultIterator, Snapshot, StorageHandler,
 };
 use rstest::rstest;
 use test_utils::delta_kernel_default_engine::DefaultEngineBuilder;
 use test_utils::{
-    TestAction, TestCancellationToken, TokenCapturingEngine, actions_to_string, add_commit,
-    generate_simple_batch, load_test_data, record_batch_to_bytes,
+    TestAction, TestCancellationToken, actions_to_string, add_commit, generate_simple_batch,
+    load_test_data, record_batch_to_bytes, token_capturing_engine,
 };
 
 const PARQUET_FILE1: &str = "part-00000-a72b1fb3-f2df-41fe-a8f0-e65b746382dd-c000.snappy.parquet";
@@ -53,7 +54,7 @@ async fn json_only_table() -> KernelResult<(Arc<InMemory>, &'static str)> {
 #[tokio::test]
 async fn precancelled_scan_yields_cancelled(
     #[case] stats: Option<StatsOptions>,
-) -> KernelResult<()> {
+) -> delta_kernel::Result<()> {
     let (storage, table_root) = json_only_table().await?;
     let engine = DefaultEngineBuilder::new(storage).build();
     let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
@@ -71,7 +72,7 @@ async fn precancelled_scan_yields_cancelled(
 }
 
 #[tokio::test]
-async fn precancelled_snapshot_reader_yields_cancelled() -> KernelResult<()> {
+async fn precancelled_snapshot_reader_yields_cancelled() -> delta_kernel::Result<()> {
     let (storage, table_root) = json_only_table().await?;
     let engine = DefaultEngineBuilder::new(storage).build();
     let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
@@ -112,7 +113,7 @@ fn assert_cancelled<
 // Control: the same scan with no cancellation token (the default) completes normally, proving
 // the cancellation path is opt-in and does not otherwise change behavior.
 #[tokio::test]
-async fn uncancelled_json_scan_completes() -> KernelResult<()> {
+async fn uncancelled_json_scan_completes() -> delta_kernel::Result<()> {
     let (storage, table_root) = json_only_table().await?;
     let engine = DefaultEngineBuilder::new(storage).build();
     let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
@@ -135,7 +136,7 @@ async fn uncancelled_json_scan_completes() -> KernelResult<()> {
 
 // End-to-end coverage that cancellation is checked between scan iterator pulls.
 #[tokio::test(flavor = "multi_thread")]
-async fn mid_stream_cancellation_yields_cancelled() -> KernelResult<()> {
+async fn mid_stream_cancellation_yields_cancelled() -> delta_kernel::Result<()> {
     let (storage, table_root) = json_only_table().await?;
     let engine = DefaultEngineBuilder::new(storage).build();
     let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
@@ -169,7 +170,7 @@ async fn mid_stream_cancellation_yields_cancelled() -> KernelResult<()> {
 async fn precancelled_scan_over_checkpoint_yields_cancelled(
     #[case] test_name: &str,
     #[case] packed: bool,
-) -> KernelResult<()> {
+) -> delta_kernel::Result<()> {
     // `_tempdir` holds the unpacked fixture (packed case) for the test's lifetime.
     let (table_path, _tempdir) = if packed {
         let dir = load_test_data("./tests/data", test_name)?;
@@ -181,7 +182,10 @@ async fn precancelled_scan_over_checkpoint_yields_cancelled(
             None,
         )
     };
-    let url = url::Url::from_directory_path(std::fs::canonicalize(table_path)?).unwrap();
+    let url = url::Url::from_directory_path(
+        std::fs::canonicalize(table_path).map_err(KernelError::from)?,
+    )
+    .unwrap();
     let engine = test_utils::create_default_engine(&url)?;
 
     let snapshot = Snapshot::builder_for(url).build(engine.as_ref())?;
@@ -220,9 +224,10 @@ fn assert_token_recovered_by_identity(
 // Pins the pass-through-identity guarantee on the JSON read path: the engine receives the very
 // `Arc` the caller supplied, not a wrapper, so it can downcast back to its own token type.
 #[tokio::test]
-async fn engine_receives_the_callers_token_by_identity_json() -> KernelResult<()> {
+async fn engine_receives_the_callers_token_by_identity_json() -> delta_kernel::Result<()> {
     let (storage, table_root) = json_only_table().await?;
-    let engine = TokenCapturingEngine::new(Arc::new(DefaultEngineBuilder::new(storage).build()));
+    let (engine, captured_tokens) =
+        token_capturing_engine(Arc::new(DefaultEngineBuilder::new(storage).build()));
     let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
 
     let token = Arc::new(TestCancellationToken::default());
@@ -230,22 +235,25 @@ async fn engine_receives_the_callers_token_by_identity_json() -> KernelResult<()
         .scan_builder()
         .with_cancellation_token(token.clone() as CancellationTokenRef)
         .build()?;
-    scan.scan_metadata(&engine)?.for_each(drop);
+    scan.scan_metadata(&engine)?
+        .try_for_each(|batch| batch.map(drop))?;
 
-    assert_token_recovered_by_identity(engine.json_token(), token);
+    assert_token_recovered_by_identity(captured_tokens.json_token(), token);
     Ok(())
 }
 
 // Same guarantee on the Parquet read path, which the JSON-only fixture cannot reach. A live token
 // lets the read execute so the Parquet handler can verify its identity.
 #[tokio::test]
-async fn engine_receives_the_callers_token_by_identity_parquet() -> KernelResult<()> {
+async fn engine_receives_the_callers_token_by_identity_parquet() -> delta_kernel::Result<()> {
     let table_name = "with_checkpoint_no_last_checkpoint";
-    let url =
-        url::Url::from_directory_path(std::fs::canonicalize(format!("./tests/data/{table_name}"))?)
-            .unwrap();
+    let url = url::Url::from_directory_path(
+        std::fs::canonicalize(format!("./tests/data/{table_name}")).map_err(KernelError::from)?,
+    )
+    .unwrap();
 
-    let engine = TokenCapturingEngine::new(test_utils::create_default_engine(&url)?);
+    let (engine, captured_tokens) =
+        token_capturing_engine(test_utils::create_default_engine(&url)?);
     let snapshot = Snapshot::builder_for(url).build(&engine)?;
 
     let token = Arc::new(TestCancellationToken::default());
@@ -253,16 +261,17 @@ async fn engine_receives_the_callers_token_by_identity_parquet() -> KernelResult
         .scan_builder()
         .with_cancellation_token(token.clone() as CancellationTokenRef)
         .build()?;
-    scan.scan_metadata(&engine)?.for_each(drop);
+    scan.scan_metadata(&engine)?
+        .try_for_each(|batch| batch.map(drop))?;
 
-    assert_token_recovered_by_identity(engine.parquet_token(), token);
+    assert_token_recovered_by_identity(captured_tokens.parquet_token(), token);
     Ok(())
 }
 
 // `parallel_scan_metadata` does not support cancellation; setting a token makes it error rather
 // than silently run to completion.
 #[tokio::test]
-async fn parallel_scan_metadata_errors_when_token_set() -> KernelResult<()> {
+async fn parallel_scan_metadata_errors_when_token_set() -> delta_kernel::Result<()> {
     let (storage, table_root) = json_only_table().await?;
     let engine: Arc<dyn delta_kernel::Engine> =
         Arc::new(DefaultEngineBuilder::new(storage).build());
@@ -295,7 +304,10 @@ async fn precancelled_snapshot_build_yields_cancelled() -> KernelResult<()> {
         .build(&engine);
 
     assert!(
-        matches!(result, Err(KernelError::Cancelled)),
+        matches!(
+            result,
+            Err(delta_kernel::Error::Kernel(KernelError::Cancelled))
+        ),
         "a cancelled snapshot build must surface KernelError::Cancelled"
     );
     Ok(())
@@ -304,7 +316,7 @@ async fn precancelled_snapshot_build_yields_cancelled() -> KernelResult<()> {
 // An uncancelled token leaves snapshot building unchanged, so the feature is opt-in and the token's
 // mere presence costs nothing.
 #[tokio::test]
-async fn snapshot_build_with_uncancelled_token_succeeds() -> KernelResult<()> {
+async fn snapshot_build_with_uncancelled_token_succeeds() -> delta_kernel::Result<()> {
     let (storage, table_root) = json_only_table().await?;
     let engine = DefaultEngineBuilder::new(storage).build();
 
@@ -375,27 +387,6 @@ impl StorageHandler for CancelOnListHandler {
     }
 }
 
-/// Installs a [`CancelOnListHandler`] over the real engine's storage, delegating other handlers.
-struct CancelOnListEngine {
-    inner: Arc<dyn Engine>,
-    storage: Arc<CancelOnListHandler>,
-}
-
-impl Engine for CancelOnListEngine {
-    fn evaluation_handler(&self) -> Arc<dyn delta_kernel::EvaluationHandler> {
-        self.inner.evaluation_handler()
-    }
-    fn storage_handler(&self) -> Arc<dyn StorageHandler> {
-        self.storage.clone()
-    }
-    fn json_handler(&self) -> Arc<dyn JsonHandler> {
-        self.inner.json_handler()
-    }
-    fn parquet_handler(&self) -> Arc<dyn ParquetHandler> {
-        self.inner.parquet_handler()
-    }
-}
-
 // Cancellation reaches the log listing during a real `build()`, not only the pre-listing
 // `_last_checkpoint` read: the token is live when `try_read` runs (so that read succeeds) and flips
 // only once listing begins, so the `Err(Cancelled)` `build()` surfaces must come from the listing.
@@ -404,19 +395,23 @@ impl Engine for CancelOnListEngine {
 async fn snapshot_build_cancelled_during_listing() -> KernelResult<()> {
     let (storage, table_root) = json_only_table().await?;
     let token = Arc::new(TestCancellationToken::default());
-    let engine = CancelOnListEngine {
-        inner: Arc::new(DefaultEngineBuilder::new(storage.clone()).build()),
-        storage: Arc::new(CancelOnListHandler {
-            inner: DefaultEngineBuilder::new(storage).build().storage_handler(),
-            token: token.clone(),
-        }),
-    };
+    let inner = Arc::new(DefaultEngineBuilder::new(storage).build());
+    let cancel_on_list_handler = Arc::new(CancelOnListHandler {
+        inner: inner.storage_handler(),
+        token: token.clone(),
+    });
+    let engine = DelegatingEngine::new(inner)
+        .with_storage_handler(cancel_on_list_handler)
+        .without_plan_executor();
 
     let result = Snapshot::builder_for(table_root)
         .with_cancellation_token(token.clone() as CancellationTokenRef)
         .build(&engine);
     assert!(
-        matches!(result, Err(KernelError::Cancelled)),
+        matches!(
+            result,
+            Err(delta_kernel::Error::Kernel(KernelError::Cancelled))
+        ),
         "cancellation during listing must surface from build()"
     );
     Ok(())
@@ -426,7 +421,7 @@ async fn snapshot_build_cancelled_during_listing() -> KernelResult<()> {
 // already-cancelled token stops it the same way it stops a from-scratch build -- rather than
 // returning a snapshot advanced from a partial listing.
 #[tokio::test]
-async fn precancelled_incremental_snapshot_build_yields_cancelled() -> KernelResult<()> {
+async fn precancelled_incremental_snapshot_build_yields_cancelled() -> delta_kernel::Result<()> {
     let (storage, table_root) = json_only_table().await?;
     let engine = DefaultEngineBuilder::new(storage).build();
 
@@ -438,7 +433,10 @@ async fn precancelled_incremental_snapshot_build_yields_cancelled() -> KernelRes
         .build(&engine);
 
     assert!(
-        matches!(result, Err(KernelError::Cancelled)),
+        matches!(
+            result,
+            Err(delta_kernel::Error::Kernel(KernelError::Cancelled))
+        ),
         "a cancelled incremental snapshot build must surface KernelError::Cancelled"
     );
     Ok(())

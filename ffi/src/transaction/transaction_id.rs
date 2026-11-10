@@ -71,8 +71,8 @@ fn get_app_id_version_impl(
 mod tests {
     use std::sync::Arc;
 
+    use delta_kernel::Snapshot;
     use delta_kernel::schema::schema_ref;
-    use delta_kernel::{KernelResult, Snapshot};
     use rstest::rstest;
     use test_utils::setup_test_tables;
 
@@ -99,7 +99,7 @@ mod tests {
     async fn test_write_txn_actions(
         #[case] builder_ids: usize,
         #[case] duplicate_app_id: bool,
-    ) -> KernelResult<()> {
+    ) -> delta_kernel::Result<()> {
         // create a simple table: one int column named 'number'
         let schema = schema_ref! { nullable "number": INTEGER };
 

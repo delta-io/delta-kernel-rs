@@ -919,8 +919,8 @@ fn ordering_needs_transform(requested_ordering: &[ReorderIndex]) -> bool {
     // Check for all elements if we need a transform. This is true if any elements are not in order
     // (i.e. element[i].index < element[i+1].index), or any element needs a transform
     requested_ordering
-        .windows(2)
-        .any(|ri| (ri[0].index >= ri[1].index) || ri[1].needs_transform())
+        .array_windows()
+        .any(|[a, b]| a.index >= b.index || b.needs_transform())
 }
 
 /// Check if an ordering requires row index computation.
@@ -1244,6 +1244,27 @@ fn reorder_map(
 /// ancestors. The parquet reader stopped doing this automatically as of arrow-53.3, for example.
 pub fn fix_nested_null_masks(batch: StructArray) -> StructArray {
     compute_nested_null_masks(batch, None)
+}
+
+/// Propagates parent null masks through a record batch's nested struct columns while preserving
+/// its schema and row count.
+#[cfg(all(feature = "declarative-plans", any(test, feature = "test-utils")))]
+pub(crate) fn fix_record_batch_nested_null_masks(batch: RecordBatch) -> KernelResult<RecordBatch> {
+    if !batch
+        .columns()
+        .iter()
+        .any(|column| matches!(column.data_type(), ArrowDataType::Struct(_)))
+    {
+        return Ok(batch);
+    }
+    let schema = batch.schema();
+    let row_count = batch.num_rows();
+    let columns = fix_nested_null_masks(batch.into()).columns().to_vec();
+    Ok(RecordBatch::try_new_with_options(
+        schema,
+        columns,
+        &RecordBatchOptions::new().with_row_count(Some(row_count)),
+    )?)
 }
 
 /// Splits a StructArray into its parts, unions in the parent null mask, and uses the result to

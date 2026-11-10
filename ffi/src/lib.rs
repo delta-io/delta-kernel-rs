@@ -1334,9 +1334,10 @@ pub unsafe extern "C" fn checkpoint_snapshot(
 
 /// Publish unpublished catalog commits on a catalog-managed snapshot.
 ///
-/// No-op (still returns a caller-owned snapshot handle at the same version) when there is
-/// nothing to publish. Errors when unpublished commits exist but the table is not
-/// catalog-managed or the committer is not a catalog committer.
+/// The returned snapshot uses published paths for commits known to be published, even when no
+/// commits need copying. Filesystem-managed snapshots with nothing to publish are unchanged.
+/// Errors when unpublished commits exist but the table is not catalog-managed or the committer
+/// is not a catalog committer. See [`Snapshot::publish`] for the publication contract.
 ///
 /// Caller owns the returned handle ([`free_snapshot`]). The input snapshot is borrowed; the
 /// committer is consumed (do not free). The returned snapshot carries the published watermark
@@ -1976,9 +1977,9 @@ mod tests {
     use super::*;
     use crate::error::FFIKernelError;
     use crate::ffi_test_utils::{
-        TEST_ERROR_ALLOCATORS, allocate_str, assert_extern_result_error_contains,
-        assert_extern_result_error_with_message, build_snapshot, ok_or_panic, recover_string,
-        setup_snapshot,
+        TEST_ERROR_ALLOCATORS, allocate_str, assert_extern_result_delta_error,
+        assert_extern_result_error_contains, assert_extern_result_error_with_message,
+        build_snapshot, ok_or_panic, recover_string, setup_snapshot,
     };
 
     unsafe extern "C" fn allocate_null_err(
@@ -3788,7 +3789,7 @@ mod tests {
     fn collect_protocol_state(snap: &handle::Handle<SharedSnapshot>) -> ProtocolVisitState {
         let proto = unsafe { snapshot_get_protocol(snap.shallow_copy()) };
         let mut state = ProtocolVisitState::new();
-        let ctx = NonNull::new(&mut state as *mut ProtocolVisitState as *mut c_void);
+        let ctx = Some(NonNull::from_mut(&mut state).cast());
         unsafe {
             visit_protocol(
                 proto.shallow_copy(),
@@ -3838,6 +3839,46 @@ mod tests {
 
         unsafe { free_engine(engine) }
         Ok(())
+    }
+
+    #[rstest]
+    #[case::latest(None)]
+    #[case::at_version(Some(0))]
+    #[tokio::test]
+    async fn test_builder_on_empty_table_root_reports_missing_table_only_at_latest(
+        #[case] version: Option<Version>,
+    ) {
+        let path = "memory:///";
+        let engine = engine_to_handle(
+            Arc::new(DefaultEngineBuilder::new(Arc::new(InMemory::new())).build()),
+            TEST_ERROR_ALLOCATORS,
+        );
+
+        let result = unsafe {
+            let builder = ok_or_panic(get_snapshot_builder(
+                kernel_string_slice!(path),
+                engine.shallow_copy(),
+            ));
+            let builder = match version {
+                Some(version) => snapshot_builder_with_version(builder, version),
+                None => builder,
+            };
+            snapshot_builder_build(builder)
+        };
+        match version {
+            None => assert_extern_result_delta_error(
+                result,
+                "DELTA_PATH_DOES_NOT_EXIST",
+                "memory:/// doesn't exist, or is not a Delta table.",
+            ),
+            Some(_) => assert_extern_result_error_with_message(
+                result,
+                FFIKernelError::EmptyLogError,
+                Some("No table version found."),
+            ),
+        }
+
+        unsafe { free_engine(engine) }
     }
 
     #[tokio::test]

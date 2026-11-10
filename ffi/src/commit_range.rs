@@ -749,7 +749,7 @@ mod tests {
     /// Drain a commit-actions iterator, returning the versions yielded in order.
     unsafe fn drain_versions(iter: Handle<SharedCommitActionsIterator>) -> Vec<u64> {
         let mut versions = Vec::<u64>::new();
-        let ctx = Some(unsafe { NonNull::new_unchecked(&mut versions) }.cast());
+        let ctx = Some(NonNull::from_mut(&mut versions).cast());
         while unsafe {
             ok_or_panic(commit_range_commits_next(
                 iter.shallow_copy(),
@@ -1166,7 +1166,7 @@ mod tests {
                 ctx.engine.shallow_copy(),
             ))
         };
-        let rows_ctx = Some(unsafe { NonNull::new_unchecked(&mut ctx.total_rows) }.cast());
+        let rows_ctx = Some(NonNull::from_mut(&mut ctx.total_rows).cast());
         while unsafe { ok_or_panic(read_result_next(iter.shallow_copy(), rows_ctx, count_rows)) } {}
         unsafe { free_read_result_iter(iter) }
         unsafe { free_commit_action(action) }
@@ -1191,7 +1191,7 @@ mod tests {
             engine: unsafe { engine.shallow_copy() },
             total_rows: 0,
         };
-        let ctx_ptr = Some(unsafe { NonNull::new_unchecked(&mut ctx) }.cast());
+        let ctx_ptr = Some(NonNull::from_mut(&mut ctx).cast());
         while unsafe {
             ok_or_panic(commit_range_commits_next(
                 iter.shallow_copy(),

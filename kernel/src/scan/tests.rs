@@ -15,10 +15,10 @@ use crate::arrow::datatypes::{DataType as ArrowDataType, Field, Fields, Schema a
 use crate::arrow::record_batch::RecordBatch;
 use crate::arrow::util::display::array_value_to_string;
 use crate::committer::FileSystemCommitter;
+use crate::engine::DelegatingEngine;
 use crate::engine::arrow_data::ArrowEngineData;
 use crate::engine::parquet_row_group_skipping::ParquetRowGroupSkipping;
 use crate::engine::sync::SyncEngine;
-use crate::engine::test_delegating::DelegatingEngine;
 use crate::expressions::{
     Expression as Expr, Predicate as Pred, Scalar, col, column_name, column_pred, expr, lit,
 };

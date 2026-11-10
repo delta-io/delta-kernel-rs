@@ -72,6 +72,59 @@ impl From<kernel::CommitFailureReason> for CommitFailureReason {
     }
 }
 
+/// The result of a successful [`delta_kernel::Snapshot::checkpoint`] call.
+///
+/// cbindgen:prefix-with-name=true
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(C)]
+pub enum CheckpointWriteOutcome {
+    /// The checkpoint was written and the API returned its updated snapshot.
+    Written {
+        /// Size and action counts from the successful write, including all-zero measurements.
+        stats: CheckpointWriteStats,
+    },
+    /// The API returned that a checkpoint already exists at this version.
+    AlreadyExists,
+}
+
+impl From<kernel::CheckpointWriteOutcome> for CheckpointWriteOutcome {
+    fn from(outcome: kernel::CheckpointWriteOutcome) -> Self {
+        match outcome {
+            kernel::CheckpointWriteOutcome::Written { stats } => Self::Written {
+                stats: stats.into(),
+            },
+            kernel::CheckpointWriteOutcome::AlreadyExists => Self::AlreadyExists,
+        }
+    }
+}
+
+/// The checkpoint format and sidecar-writing path selected during the call.
+///
+/// cbindgen:prefix-with-name=true
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(C)]
+pub enum CheckpointWriteMode {
+    /// The call returned before selecting a checkpoint write mode.
+    NotAttempted,
+    /// V1 checkpoint without sidecars.
+    V1,
+    /// V2 checkpoint with file actions in the main checkpoint file.
+    V2WithoutSidecars,
+    /// V2 sidecar-writing path, which can produce zero sidecars if there are no file actions.
+    V2WithSidecars,
+}
+
+impl From<kernel::CheckpointWriteMode> for CheckpointWriteMode {
+    fn from(mode: kernel::CheckpointWriteMode) -> Self {
+        match mode {
+            kernel::CheckpointWriteMode::NotAttempted => Self::NotAttempted,
+            kernel::CheckpointWriteMode::V1 => Self::V1,
+            kernel::CheckpointWriteMode::V2WithoutSidecars => Self::V2WithoutSidecars,
+            kernel::CheckpointWriteMode::V2WithSidecars => Self::V2WithSidecars,
+        }
+    }
+}
+
 /// Whether a table is path-based or catalog-managed.
 ///
 /// cbindgen:prefix-with-name=true
@@ -259,6 +312,56 @@ pub struct TransactionCommitFailure {
     pub reason: CommitFailureReason,
 }
 
+/// A [`delta_kernel::Snapshot::checkpoint`] call returned successfully.
+#[repr(C)]
+pub struct CheckpointWriteSuccess {
+    /// Whether the call wrote a checkpoint or found one already present.
+    pub outcome: CheckpointWriteOutcome,
+    /// Selected checkpoint write mode.
+    pub mode: CheckpointWriteMode,
+    /// API entry through checkpoint data completion, or an earlier return, in nanoseconds.
+    /// Excludes `_last_checkpoint` publication and returned snapshot construction.
+    pub duration_ns: u64,
+}
+
+/// A [`delta_kernel::Snapshot::checkpoint`] call returned an error, including after data writes.
+#[repr(C)]
+pub struct CheckpointWriteFailure {
+    /// Selected write mode, preserved when the call fails.
+    pub mode: CheckpointWriteMode,
+    /// API entry through checkpoint data completion, or an earlier error, in nanoseconds.
+    /// Excludes `_last_checkpoint` publication and returned snapshot construction.
+    pub duration_ns: u64,
+}
+
+/// Size and action counts from a successful checkpoint write.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[repr(C)]
+pub struct CheckpointWriteStats {
+    /// Main checkpoint and all sidecar bytes, excluding `_last_checkpoint`.
+    pub bytes_written: u64,
+    /// Active Add-file actions written after reconciliation.
+    pub num_add_files: u64,
+    /// Retained Remove-file actions written, excluding expired tombstones.
+    pub num_remove_files: u64,
+    /// All emitted actions, including metadata and V2 sidecar references.
+    pub num_actions: u64,
+    /// Actual sidecar files written; zero means none were produced.
+    pub num_sidecars: u64,
+}
+
+impl From<kernel::CheckpointWriteStats> for CheckpointWriteStats {
+    fn from(stats: kernel::CheckpointWriteStats) -> Self {
+        Self {
+            bytes_written: stats.bytes_written,
+            num_add_files: stats.num_add_files,
+            num_remove_files: stats.num_remove_files,
+            num_actions: stats.num_actions,
+            num_sidecars: stats.num_sidecars,
+        }
+    }
+}
+
 /// A domain metadata load completed.
 #[repr(C)]
 pub struct DomainMetadataLoadSuccess {
@@ -365,6 +468,8 @@ pub enum MetricEvent {
     StorageListCompleted(StorageListCompleted),
     StorageReadCompleted(StorageReadCompleted),
     StorageCopyCompleted(StorageCopyCompleted),
+    CheckpointWriteSuccess(CheckpointWriteSuccess),
+    CheckpointWriteFailure(CheckpointWriteFailure),
 }
 
 /// Borrow the caller-supplied correlation id as a [`KernelStringSlice`], or an empty slice when
@@ -620,6 +725,21 @@ impl MetricEvent {
                     duration_ns: ns(*duration),
                 })
             }
+            K::CheckpointWriteSuccess(kernel::CheckpointWriteSuccess {
+                outcome,
+                mode,
+                duration,
+            }) => Self::CheckpointWriteSuccess(CheckpointWriteSuccess {
+                outcome: (*outcome).into(),
+                mode: (*mode).into(),
+                duration_ns: ns(*duration),
+            }),
+            K::CheckpointWriteFailure(kernel::CheckpointWriteFailure { mode, duration }) => {
+                Self::CheckpointWriteFailure(CheckpointWriteFailure {
+                    mode: (*mode).into(),
+                    duration_ns: ns(*duration),
+                })
+            }
         }
     }
 }
@@ -641,6 +761,105 @@ mod tests {
 
     use super::*;
     use crate::TryFromStringSlice;
+
+    #[rstest]
+    #[case::v1(kernel::CheckpointWriteMode::V1, CheckpointWriteMode::V1)]
+    #[case::v2_without_sidecars(
+        kernel::CheckpointWriteMode::V2WithoutSidecars,
+        CheckpointWriteMode::V2WithoutSidecars
+    )]
+    #[case::v2_with_sidecars(
+        kernel::CheckpointWriteMode::V2WithSidecars,
+        CheckpointWriteMode::V2WithSidecars
+    )]
+    fn from_kernel_checkpoint_written_preserves_stats(
+        #[case] mode: kernel::CheckpointWriteMode,
+        #[case] expected_mode: CheckpointWriteMode,
+        #[values(false, true)] zero_stats: bool,
+    ) {
+        let (bytes, adds, removes, actions, sidecars) = if zero_stats {
+            (0, 0, 0, 0, 0)
+        } else {
+            let sidecars = u64::from(mode == kernel::CheckpointWriteMode::V2WithSidecars) * 2;
+            (101, 3, 5, 11 + sidecars, sidecars)
+        };
+        let event = kernel::MetricEvent::CheckpointWriteSuccess(kernel::CheckpointWriteSuccess {
+            outcome: kernel::CheckpointWriteOutcome::Written {
+                stats: kernel::CheckpointWriteStats {
+                    bytes_written: bytes,
+                    num_add_files: adds,
+                    num_remove_files: removes,
+                    num_actions: actions,
+                    num_sidecars: sidecars,
+                },
+            },
+            mode,
+            duration: Duration::from_nanos(123),
+        });
+
+        with_ffi_event(&event, |ffi| {
+            let MetricEvent::CheckpointWriteSuccess(e) = ffi else {
+                panic!("expected CheckpointWriteSuccess");
+            };
+            assert_eq!(e.mode, expected_mode);
+            assert_eq!(e.duration_ns, 123);
+            assert_eq!(
+                e.outcome,
+                CheckpointWriteOutcome::Written {
+                    stats: CheckpointWriteStats {
+                        bytes_written: bytes,
+                        num_add_files: adds,
+                        num_remove_files: removes,
+                        num_actions: actions,
+                        num_sidecars: sidecars,
+                    },
+                }
+            );
+        });
+    }
+
+    #[rstest]
+    #[case::not_attempted(
+        kernel::CheckpointWriteMode::NotAttempted,
+        CheckpointWriteMode::NotAttempted
+    )]
+    #[case::with_sidecars(
+        kernel::CheckpointWriteMode::V2WithSidecars,
+        CheckpointWriteMode::V2WithSidecars
+    )]
+    fn from_kernel_checkpoint_nonwritten_preserves_mode_and_duration(
+        #[case] mode: kernel::CheckpointWriteMode,
+        #[case] expected_mode: CheckpointWriteMode,
+        #[values(false, true)] failed: bool,
+        #[values(0u64, 456)] duration_ns: u64,
+    ) {
+        let duration = Duration::from_nanos(duration_ns);
+        let event = if failed {
+            kernel::MetricEvent::CheckpointWriteFailure(kernel::CheckpointWriteFailure {
+                mode,
+                duration,
+            })
+        } else {
+            kernel::MetricEvent::CheckpointWriteSuccess(kernel::CheckpointWriteSuccess {
+                outcome: kernel::CheckpointWriteOutcome::AlreadyExists,
+                mode,
+                duration,
+            })
+        };
+
+        with_ffi_event(&event, |ffi| {
+            let (mode, duration) = match ffi {
+                MetricEvent::CheckpointWriteFailure(e) if failed => (e.mode, e.duration_ns),
+                MetricEvent::CheckpointWriteSuccess(e) if !failed => {
+                    assert_eq!(e.outcome, CheckpointWriteOutcome::AlreadyExists);
+                    (e.mode, e.duration_ns)
+                }
+                _ => panic!("expected checkpoint success or failure matching the kernel event"),
+            };
+            assert_eq!(mode, expected_mode);
+            assert_eq!(duration, duration_ns);
+        });
+    }
 
     #[test]
     fn from_kernel_transaction_commit_success_carries_operation_and_id() {

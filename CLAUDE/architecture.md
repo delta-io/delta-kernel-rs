@@ -24,8 +24,9 @@ deserializes the full batch into in-memory structs.
 
 Kernel APIs return `KernelResult<T, E = KernelError>`, preserving `KernelError` by default while
 allowing helpers to specify another error type. `Result<T>` always uses the top-level `Error` enum.
-Converting a kernel error to that envelope requires `Error::Kernel` or `.map_err(Error::Kernel)`.
-There is no implicit `From<KernelError> for Error` conversion.
+APIs that can report a catalog-defined Delta condition return `Result`. The code that identifies
+the condition constructs the `DeltaError`, which reaches the public boundary unchanged; other
+kernel failures propagate as `Error::Kernel`.
 
 Fallible kernel streams implement the `KernelResultIterator<T>` marker trait, including engine
 handlers and declarative-plan results, which erase it as `Box<dyn KernelResultIterator<T>>`.
