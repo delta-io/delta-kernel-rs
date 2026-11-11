@@ -36,7 +36,7 @@ use crate::{Engine, Version, create_row};
 use crate::{EngineData, FileMeta, KernelError, KernelResult, RowVisitor as _};
 
 const KERNEL_VERSION: &str = env!("CARGO_PKG_VERSION");
-const SCHEMA_RECURSION_LIMIT: usize = 1000;
+const SCHEMA_RECURSION_LIMIT: usize = 300;
 const UNKNOWN_OPERATION: &str = "UNKNOWN";
 pub(crate) const ROW_TRACKING_PRESERVED_TAG: &str = "delta.rowTracking.preserved";
 
@@ -2227,8 +2227,9 @@ mod tests {
 
     #[rstest]
     #[case::formerly_rejected(42, false)]
-    #[case::supported(331, false)]
-    #[case::exceeded(332, true)]
+    #[case::supported(98, false)]
+    #[case::exceeded(99, true)]
+    #[case::well_above_limit(332, true)]
     fn parse_schema_nesting_boundary(#[case] depth: usize, #[case] exceeds_limit: bool) {
         let metadata = Metadata {
             schema_string: Arc::new(serde_json::to_string(&nested_schema(depth)).unwrap()),
@@ -2241,7 +2242,7 @@ mod tests {
                 result.as_ref(),
                 concat!(
                     "Schema error: Table schema is too deeply nested: decoding ",
-                    "metaData.schemaString reached the JSON recursion limit of 1000"
+                    "metaData.schemaString reached the JSON recursion limit of 300"
                 ),
             );
             let error = match result.unwrap_err() {

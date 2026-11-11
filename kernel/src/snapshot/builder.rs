@@ -674,9 +674,9 @@ pub(super) mod tests {
 
     #[rstest::rstest]
     #[case::formerly_rejected(42, "struct")]
-    #[case::struct_boundary(331, "struct")]
-    #[case::array_boundary(996, "array")]
-    #[case::map_boundary(996, "map")]
+    #[case::struct_boundary(98, "struct")]
+    #[case::array_boundary(296, "array")]
+    #[case::map_boundary(296, "map")]
     #[test_log::test(tokio::test)]
     async fn snapshot_deep_schema_survives_updates_and_hint_reconstruction(
         #[case] depth: usize,

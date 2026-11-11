@@ -105,8 +105,8 @@ async fn setup_multi_version_table<E: TaskExecutor>(
 
 #[rstest]
 #[case::formerly_rejected(42, false)]
-#[case::supported(331, false)]
-#[case::exceeded(332, true)]
+#[case::supported(98, false)]
+#[case::exceeded(99, true)]
 #[tokio::test]
 async fn snapshot_schema_nesting_boundary(
     #[case] depth: usize,
@@ -143,7 +143,7 @@ async fn snapshot_schema_nesting_boundary(
         result.as_ref(),
         concat!(
             "Schema error: Table schema is too deeply nested: decoding ",
-            "metaData.schemaString reached the JSON recursion limit of 1000"
+            "metaData.schemaString reached the JSON recursion limit of 300"
         ),
     );
     let delta_kernel::Error::Kernel(error) = result.unwrap_err() else {
