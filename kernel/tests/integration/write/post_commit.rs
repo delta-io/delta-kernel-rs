@@ -11,7 +11,7 @@ use delta_kernel::expressions::Scalar;
 use delta_kernel::schema::schema_ref;
 use delta_kernel::transaction::CommitResult;
 use delta_kernel::transaction::create_table::create_table as create_table_txn;
-use delta_kernel::{KernelError, KernelResult, Snapshot};
+use delta_kernel::{KernelError, Snapshot};
 use tempfile::tempdir;
 use test_utils::{
     begin_transaction_with, create_default_engine, setup_test_tables, write_batch_to_table,
@@ -21,7 +21,7 @@ use url::Url;
 use crate::common::write_utils::get_simple_int_schema;
 
 #[tokio::test]
-async fn test_post_commit_snapshot_create_then_insert() -> KernelResult<()> {
+async fn test_post_commit_snapshot_create_then_insert() -> delta_kernel::Result<()> {
     let _ = tracing_subscriber::fmt::try_init();
 
     let temp_dir = tempdir().unwrap();

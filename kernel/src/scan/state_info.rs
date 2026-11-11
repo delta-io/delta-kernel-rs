@@ -716,7 +716,7 @@ pub(crate) mod tests {
     use rstest::rstest;
 
     use super::*;
-    use crate::KernelResult;
+    use crate::Result;
     use crate::actions::{MAX_VALUES, MIN_VALUES};
     use crate::expressions::{Predicate as Pred, col, column_name, expr, lit};
     #[cfg(feature = "geo-type-in-dev")]
@@ -887,7 +887,7 @@ pub(crate) mod tests {
     pub(crate) fn get_simple_state_info(
         schema: SchemaRef,
         partition_columns: Vec<String>,
-    ) -> KernelResult<StateInfo> {
+    ) -> Result<StateInfo> {
         get_state_info(schema, partition_columns, None, &[], HashMap::new(), vec![])
     }
 
@@ -900,7 +900,7 @@ pub(crate) mod tests {
         features: &[TableFeature],
         metadata_configuration: HashMap<String, String>,
         metadata_cols: Vec<(&str, MetadataColumnSpec)>,
-    ) -> KernelResult<StateInfo> {
+    ) -> Result<StateInfo> {
         get_state_info_with_stats(
             schema,
             partition_columns,
@@ -920,7 +920,7 @@ pub(crate) mod tests {
         metadata_configuration: HashMap<String, String>,
         metadata_cols: Vec<(&str, MetadataColumnSpec)>,
         stats: StatsOptions,
-    ) -> KernelResult<StateInfo> {
+    ) -> Result<StateInfo> {
         get_state_info_with_options(
             schema,
             partition_columns,
@@ -943,7 +943,7 @@ pub(crate) mod tests {
         metadata_cols: Vec<(&str, MetadataColumnSpec)>,
         stats: StatsOptions,
         partition_values: PartitionValuesOptions,
-    ) -> KernelResult<StateInfo> {
+    ) -> Result<StateInfo> {
         let builder = MockTableConfigurationBuilder::new()
             .with_schema(schema.clone())
             .with_partition_columns(partition_columns)
@@ -967,7 +967,7 @@ pub(crate) mod tests {
             );
         }
 
-        StateInfo::try_new(
+        Ok(StateInfo::try_new(
             schema.clone(),
             table_configuration.logical_schema(),
             &table_configuration,
@@ -975,7 +975,7 @@ pub(crate) mod tests {
             &stats,
             &partition_values,
             (),
-        )
+        )?)
     }
 
     pub(crate) fn assert_transform_spec(

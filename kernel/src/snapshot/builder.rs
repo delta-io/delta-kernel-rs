@@ -631,7 +631,6 @@ pub(super) mod tests {
     use url::Url;
 
     use super::*;
-    use crate::DeltaErrorCondition;
     use crate::engine::sync::SyncEngine;
     use crate::metrics::{LogSegmentLoadType, MetricEvent};
     use crate::object_store::memory::InMemory;
@@ -640,6 +639,7 @@ pub(super) mod tests {
     use crate::schema::{ArrayType, DataType, MapType, StructField, StructType};
     use crate::unit_test_utils::{CapturingReporter, install_thread_local_metrics_reporter};
     use crate::utils::FoldWithOption as _;
+    use crate::{DeltaErrorCondition, Result};
 
     pub(in crate::snapshot) fn setup_test() -> (Arc<SyncEngine>, Arc<DynObjectStore>, String) {
         let table_root = String::from("memory:///");
@@ -652,7 +652,7 @@ pub(super) mod tests {
     pub(in crate::snapshot) fn scan_paths(
         snapshot: SnapshotRef,
         engine: &dyn Engine,
-    ) -> KernelResult<Vec<String>> {
+    ) -> Result<Vec<String>> {
         let scan = snapshot.scan_builder().build()?;
         let mut paths = Vec::new();
         for batch in scan.scan_metadata(engine)? {

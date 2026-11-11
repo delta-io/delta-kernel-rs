@@ -6,6 +6,7 @@
 
 use std::sync::Arc;
 
+use delta_kernel::KernelError;
 use delta_kernel::arrow::array::{Int32Array, StringArray};
 use delta_kernel::arrow::record_batch::RecordBatch;
 use delta_kernel::committer::FileSystemCommitter;
@@ -17,7 +18,6 @@ use delta_kernel::table_features::{
 };
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
-use delta_kernel::{KernelError, KernelResult};
 use rstest::rstest;
 use test_utils::{
     get_materialized_row_tracking_column_names, get_row_tracking_add_actions, insert_data,
@@ -277,7 +277,7 @@ async fn test_create_table_with_multiple_files_and_row_tracking() -> delta_kerne
 /// DomainMetadata, which should appear exactly once in the protocol. Both domain metadata
 /// entries (delta.rowTracking and delta.clustering) should be present in the commit.
 #[test]
-fn test_create_table_with_row_tracking_and_clustering() -> KernelResult<()> {
+fn test_create_table_with_row_tracking_and_clustering() -> delta_kernel::Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
     let committed = create_table(&table_path, super::simple_schema()?, "Test/1.0", true)

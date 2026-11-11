@@ -24,7 +24,7 @@ use crate::plans::Operation as PlanOperation;
 use crate::plans::ir::nodes::Operator;
 use crate::scan::{PartitionValuesOptions, Scan, StatsOptions, StructStats};
 use crate::unit_test_utils::load_test_table;
-use crate::{Engine, KernelResult, PredicateRef, Result, Snapshot, Version};
+use crate::{Engine, Error, KernelResult, PredicateRef, Result, Snapshot, Version};
 
 // Normalizes metadata for comparison: the imperative path splits fields between the data batch
 // and fileConstantValues, while the declarative path returns them in an add struct.
@@ -725,7 +725,7 @@ fn declarative_json_only_disables_metadata_pruning(
             .with_partition_values(partitions.clone())
             .with_predicate(predicate)
             .build()?;
-        declarative_metadata(&scan, &engine)
+        Ok::<_, Error>(declarative_metadata(&scan, &engine)?)
     };
     let baseline = metadata(StatsOptions::json_only(), None)?;
     assert_eq!(metadata_row_count(&baseline), 4);

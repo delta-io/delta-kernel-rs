@@ -20,8 +20,8 @@
 //!
 //! ```no_run
 //! # use std::sync::Arc;
-//! # use delta_kernel::{Engine, KernelResult, SnapshotRef};
-//! # fn read(snapshot: SnapshotRef, engine: Arc<dyn Engine>) -> KernelResult<()> {
+//! # use delta_kernel::{Engine, Result, SnapshotRef};
+//! # fn read(snapshot: SnapshotRef, engine: Arc<dyn Engine>) -> Result<()> {
 //! let scan = snapshot.scan_builder().build()?;
 //! for batch in scan.execute(engine)? {
 //!     let batch = batch?;
@@ -82,8 +82,8 @@ use crate::table_features::{ColumnMappingMode, Operation};
 use crate::transforms::{ExpressionTransform, SchemaTransform, transform_output_type};
 use crate::utils::{FoldWithOption as _, IteratorExt, require};
 use crate::{
-    Engine, EngineData, FileMeta, KernelError, KernelResult, KernelResultIterator, SnapshotRef,
-    Version,
+    Engine, EngineData, Error, FileMeta, KernelError, KernelResult, KernelResultIterator, Result,
+    SnapshotRef, Version,
 };
 
 pub(crate) mod data_skipping;
@@ -656,7 +656,7 @@ impl ScanBuilder {
     /// [`Scan`] type itself can be used to fetch the files and associated metadata required to
     /// perform actual data reads.
     #[tracing::instrument(name = "scan_builder.build", skip_all, fields(enable_call_frame), err)]
-    pub fn build(self) -> KernelResult<Scan> {
+    pub fn build(self) -> Result<Scan> {
         // Predicates may reference columns outside self.logical_read_schema, so resolve against the
         // full table schema
         let table_schema = self.snapshot.schema();
@@ -665,10 +665,10 @@ impl ScanBuilder {
         // counts downstream and panics in the arrow layer. Users must populate the
         // schema with ALTER TABLE ADD COLUMN before scanning.
         if table_schema.num_fields() == 0 {
-            return Err(KernelError::generic(
+            return Err(Error::Kernel(KernelError::generic(
                 "Cannot scan Delta table with empty schema; use ALTER TABLE ADD COLUMN \
                  to add at least one column before scanning",
-            ));
+            )));
         }
 
         // if no schema is provided, use snapshot's entire schema (e.g. SELECT *)
@@ -1834,7 +1834,7 @@ impl Scan {
             // Iterator<Result<Iterator<Result<Box<dyn EngineData>>>>> to Iterator<Result<Result<Box<dyn EngineData>>>>
             .flatten_ok()
             // Iterator<Result<Result<Box<dyn EngineData>>>> to Iterator<Result<Box<dyn EngineData>>>
-            .map(Result::flatten);
+            .map(KernelResult::flatten);
         Ok(result)
     }
 }

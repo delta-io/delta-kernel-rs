@@ -227,9 +227,9 @@ mod tests {
     use crate::unit_test_utils::{
         MockProtocolBuilder, MockTableConfigurationBuilder, create_log_path,
     };
-    use crate::{Engine as _, KernelResult};
+    use crate::{Engine as _, KernelError, KernelResult, Result};
 
-    fn mock_snapshot(log_segment: LogSegment) -> KernelResult<Arc<Snapshot>> {
+    fn mock_snapshot(log_segment: LogSegment) -> Result<Arc<Snapshot>> {
         let table_configuration = MockTableConfigurationBuilder::new()
             .with_schema(partitioned_schema())
             .with_partition_columns(["p"])
@@ -448,7 +448,7 @@ mod tests {
         #[case] shape: CheckpointShape,
         #[case] file_type: FileType,
         #[case] checkpoint_arm_tags: Vec<&'static str>,
-    ) -> KernelResult<()> {
+    ) -> Result<()> {
         let segment = log_segment(
             log_root(),
             &["file:///_delta_log/00000000000000000001.json"],
@@ -477,7 +477,7 @@ mod tests {
         #[values(None, Some(struct_stats_schema()))] parsed_stats: Option<SchemaRef>,
         #[values(CheckpointKind::Inline, CheckpointKind::Manifest)] kind: CheckpointKind,
         #[values(false, true)] include_tombstones: bool,
-    ) -> KernelResult<()> {
+    ) -> Result<()> {
         let stats = StatsOptions::all_struct();
         let partition_values = PartitionValuesOptions::with_struct();
         let segment = log_segment(log_root(), &[], Some(checkpoint_path(FileType::Parquet)));
@@ -542,7 +542,7 @@ mod tests {
         #[case] stats: StatsOptions,
         #[case] preserve_json: bool,
         #[values(CheckpointKind::Inline, CheckpointKind::Manifest)] kind: CheckpointKind,
-    ) -> KernelResult<()> {
+    ) -> Result<()> {
         let segment = log_segment(log_root(), &[], Some(checkpoint_path(FileType::Parquet)));
         let config = MockTableConfigurationBuilder::new()
             .with_schema(partitioned_schema())
@@ -588,7 +588,7 @@ mod tests {
     }
 
     #[test]
-    fn metadata_plan_commits_only() -> KernelResult<()> {
+    fn metadata_plan_commits_only() -> Result<()> {
         let segment = log_segment(
             log_root(),
             &["file:///_delta_log/00000000000000000001.json"],
@@ -623,7 +623,7 @@ mod tests {
         #[case] shape: CheckpointShape,
         #[case] file_type: FileType,
         #[case] checkpoint_arm_tags: Vec<&'static str>,
-    ) -> KernelResult<()> {
+    ) -> Result<()> {
         let segment = log_segment(log_root(), &[], Some(checkpoint_path(file_type)));
         let scan = mock_snapshot(segment)?.scan_builder().build()?;
         let plan = scan
@@ -634,7 +634,7 @@ mod tests {
     }
 
     #[test]
-    fn metadata_plan_empty_is_none() -> KernelResult<()> {
+    fn metadata_plan_empty_is_none() -> Result<()> {
         let segment = log_segment(log_root(), &[], None);
         let scan = mock_snapshot(segment)?.scan_builder().build()?;
         assert!(
@@ -645,7 +645,7 @@ mod tests {
     }
 
     #[test]
-    fn metadata_plan_static_skip_all_is_none() -> KernelResult<()> {
+    fn metadata_plan_static_skip_all_is_none() -> Result<()> {
         let segment = log_segment(log_root(), &[], None);
         let scan = mock_snapshot(segment)?
             .scan_builder()
@@ -674,7 +674,7 @@ mod tests {
         #[case] remove_offset: Option<i32>,
         #[case] expected_paths: &[&str],
         #[values("commits", "crc", "checkpoint")] base: &str,
-    ) -> KernelResult<()> {
+    ) -> Result<()> {
         let store = Arc::new(InMemory::new());
         let dv = |offset: Option<i32>| {
             offset.map(|offset| {
@@ -748,7 +748,7 @@ mod tests {
             .with_table_root("memory:///")
             .with_version(1)
             .try_build()?;
-        let all_files = serde_json::from_value(json!(adds))?;
+        let all_files = serde_json::from_value(json!(adds)).map_err(KernelError::from)?;
         let crc = (base == "crc").then(|| {
             Arc::new(Crc {
                 version: 0,
@@ -810,7 +810,7 @@ mod tests {
         #[case] native_type: DataType,
         #[case] expected: &str,
         #[case] expected_native: &str,
-    ) -> KernelResult<()> {
+    ) -> Result<()> {
         let features = [TableFeature::TimestampWithoutTimezone];
         let config = MockTableConfigurationBuilder::new()
             .with_schema(schema_ref! { nullable "x": (logical_type) })
@@ -844,7 +844,8 @@ mod tests {
         futures::executor::block_on(store.put(
             &Path::from("_delta_log/00000000000000000000.checkpoint.parquet"),
             record_batch_to_bytes(&batch).into(),
-        ))?;
+        ))
+        .map_err(KernelError::from)?;
         let segment = log_segment(log_root(), &[], Some(checkpoint_path(FileType::Parquet)));
         let scan = Arc::new(Snapshot::new(segment, config)?)
             .scan_builder()
@@ -857,7 +858,8 @@ mod tests {
         for batch in batches {
             let json = batch.column_by_name(STATS).unwrap().as_string::<i32>();
             assert_eq!(
-                serde_json::from_str::<serde_json::Value>(json.value(0))?,
+                serde_json::from_str::<serde_json::Value>(json.value(0))
+                    .map_err(KernelError::from)?,
                 stats(expected.into())
             );
             assert_eq!(
@@ -869,9 +871,7 @@ mod tests {
     }
 
     #[rstest::rstest]
-    fn metadata_plan_native_stats_need_no_projection(
-        #[values(1, 100)] width: usize,
-    ) -> KernelResult<()> {
+    fn metadata_plan_native_stats_need_no_projection(#[values(1, 100)] width: usize) -> Result<()> {
         let config = MockTableConfigurationBuilder::new()
             .with_schema(StructType::new_unchecked((0..width).map(|index| {
                 StructField::nullable(format!("c{index}"), DataType::LONG)
@@ -900,7 +900,7 @@ mod tests {
         #[case] stats: StatsOptions,
         #[case] lower_bound: i64,
         #[case] expected_rows: usize,
-    ) -> KernelResult<()> {
+    ) -> Result<()> {
         let stats_json =
             r#"{"numRecords":1,"minValues":{"x":10},"maxValues":{"x":10},"nullCount":{"x":0}}"#;
         let file_schema = schema_ref! {
@@ -920,9 +920,10 @@ mod tests {
         futures::executor::block_on(store.put(
             &Path::from("_delta_log/00000000000000000000.checkpoint.parquet"),
             record_batch_to_bytes(&batch).into(),
-        ))?;
+        ))
+        .map_err(KernelError::from)?;
         let segment = log_segment(
-            Url::parse("memory:///_delta_log/")?,
+            Url::parse("memory:///_delta_log/").map_err(KernelError::from)?,
             &[],
             Some("memory:///_delta_log/00000000000000000000.checkpoint.parquet"),
         );
@@ -970,7 +971,7 @@ mod tests {
         #[case] stats: StatsOptions,
         #[case] lower_bound: i64,
         #[case] expected_rows: usize,
-    ) -> KernelResult<()> {
+    ) -> Result<()> {
         let store = Arc::new(InMemory::new());
         // A single-row parquet checkpoint carrying an `add` with a JSON `stats` string but no
         // `stats_parsed` column.
