@@ -38,7 +38,7 @@ fn batch(schema: &SchemaRef, columns: Vec<ArrayRef>) -> KernelResult<ArrowEngine
 async fn overwrite_removes_all_old_files_and_preserves_table_metadata(
     #[values(false, true)] overwrite_schema: bool,
     #[values(false, true)] empty_input: bool,
-) -> KernelResult<()> {
+) -> KernelResult<(), Box<dyn std::error::Error>> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
     let original = schema_ref! { nullable "id": INTEGER, nullable "legacy": STRING };
     let snapshot = create_table(&table_path, original.clone(), "test", true)
@@ -282,7 +282,7 @@ async fn overwrite_rejects_caller_removals() -> KernelResult<()> {
 #[tokio::test]
 async fn overwrite_conflicts_instead_of_committing_stale_removals(
     #[values(false, true)] concurrent_schema_change: bool,
-) -> KernelResult<()> {
+) -> KernelResult<(), Box<dyn std::error::Error>> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
     let schema = schema_ref! { nullable "id": INTEGER };
     let source = create_table(&table_path, schema.clone(), "test", true)
