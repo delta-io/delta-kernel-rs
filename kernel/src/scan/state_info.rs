@@ -395,12 +395,15 @@ impl StateInfo {
         stats.validate()?;
         let partition_columns = table_configuration.logical_partition_columns();
         let column_mapping_mode = table_configuration.column_mapping_mode();
-        // Only the unchanged table schema can reuse the validated physical schema.
-        let cached_physical_schema = (C::IS_IDENTITY
-            && Arc::ptr_eq(&logical_read_schema, &table_configuration.logical_schema())
-            && logical_read_schema.metadata_columns().next().is_none())
-        .then(|| table_configuration.physical_data_schema_without_partition_columns());
-        let mut read_fields = Vec::with_capacity(if cached_physical_schema.is_some() {
+        // Pointer identity proves this is the validated table schema, so its physical schema
+        // can be reused without converting fields again.
+        let reuse_physical_schema = classifier.classifies_no_fields()
+            && Arc::ptr_eq(
+                &logical_read_schema,
+                table_configuration.logical_schema_ref(),
+            )
+            && logical_read_schema.metadata_columns().next().is_none();
+        let mut read_fields = Vec::with_capacity(if reuse_physical_schema {
             0
         } else {
             logical_read_schema.num_fields()
@@ -410,7 +413,7 @@ impl StateInfo {
 
         let metadata_info = validate_metadata_columns(&logical_read_schema, table_configuration)?;
 
-        // Loop over all selected fields and build both the physical schema and transform spec
+        // Even when the physical schema is reused, partition columns still need transform specs.
         for (index, logical_field) in logical_read_schema.fields().enumerate() {
             if let Some(spec) =
                 classifier.classify_field(logical_field, index, &last_physical_field)
@@ -492,15 +495,14 @@ impl StateInfo {
                         // note that RowIndex and FilePath are handled in the parquet reader so we
                         // just add them as if they're normal physical
                         // columns
-                        let (physical_name, physical_field) = if cached_physical_schema.is_some() {
-                            (
-                                logical_field.physical_name(column_mapping_mode).to_owned(),
-                                None,
-                            )
+                        let physical_name = if reuse_physical_schema {
+                            logical_field.physical_name(column_mapping_mode).to_owned()
                         } else {
                             let field = logical_field.make_physical(column_mapping_mode)?;
                             trace!("\n\n{logical_field:#?}\nAfter mapping: {field:#?}\n\n");
-                            (field.name.clone(), Some(field))
+                            let name = field.name.clone();
+                            read_fields.push(field);
+                            name
                         };
 
                         if !logical_field.is_metadata_column()
@@ -513,17 +515,15 @@ impl StateInfo {
                             )));
                         }
                         last_physical_field = Some(physical_name);
-                        if let Some(field) = physical_field {
-                            read_fields.push(field);
-                        }
                     }
                 }
             }
         }
 
-        let physical_schema = match cached_physical_schema {
-            Some(schema) => schema,
-            None => Arc::new(StructType::try_new(read_fields)?),
+        let physical_schema = if reuse_physical_schema {
+            table_configuration.physical_data_schema_without_partition_columns()
+        } else {
+            Arc::new(StructType::try_new(read_fields)?)
         };
 
         // Logical column names referenced by the predicate. Fed into the stats schema
