@@ -649,6 +649,38 @@ mod tests {
         assert!(hint.log_segment_files.ascending_compaction_files.is_empty());
     }
 
+    #[test]
+    fn snapshot_hint_compacted_paths_do_not_fill_commit_gaps() -> Result<()> {
+        const TABLE_ROOT: &str = "memory:///target/";
+        let log_paths = [
+            "memory:///target/_delta_log/00000000000000000000.json",
+            "memory:///target/_delta_log/00000000000000000000.00000000000000000002.compacted.json",
+            "memory:///target/_delta_log/00000000000000000002.json",
+        ]
+        .into_iter()
+        .map(|path| LogPath::try_new(create_log_path_with_size(path, 1).location))
+        .collect::<KernelResult<Vec<_>>>()?;
+        let hint = SnapshotHint::try_new(
+            TABLE_ROOT,
+            2,
+            PublicationWatermark::InferFromLogPaths,
+            log_paths,
+            Protocol::try_new_legacy(1, 2)?,
+            Metadata::default().with_schema(schema_ref! { nullable "id": INTEGER })?,
+            None,
+            None,
+            SnapshotHintFreshness::Unverified,
+        )?;
+        let (engine, _store, _table_root) = setup_test();
+        assert_log_segment_hint_error(
+            SnapshotBuilder::new_for(TABLE_ROOT)
+                .with_snapshot_hint(hint)
+                .build(engine.as_ref()),
+            "Table version 1 is missing",
+        );
+        Ok(())
+    }
+
     #[rstest::rstest]
     #[case::invalid_local_root("file:///invalid%00table/", "Invalid table location")]
     #[case::non_hierarchical_root(
