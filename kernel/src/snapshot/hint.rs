@@ -11,7 +11,7 @@ use crate::last_checkpoint_hint::LastCheckpointHint;
 use crate::log_path::LogPath;
 use crate::log_segment::{LogSegment, validate_catalog_version_bounds};
 use crate::log_segment_files::{CheckpointHandling, LogSegmentFiles};
-use crate::path::{DELTA_LOG_DIR_WITH_SLASH, LogPathFileType, ParsedLogPath};
+use crate::path::{DELTA_LOG_DIR_WITH_SLASH, ParsedLogPath};
 use crate::snapshot::{IncrementalReplay, SnapshotRef};
 use crate::table_configuration::TableConfiguration;
 use crate::utils::{require, try_parse_uri};
@@ -110,9 +110,9 @@ impl SnapshotHint {
     ///
     /// Returns an error if `table_root` is invalid,
     /// [`SnapshotHintError::LogPathOutsideRoot`] if any path is outside `table_root`'s `_delta_log`
-    /// root, or
-    /// [`SnapshotHintError::LogCompaction`] if any path is a compacted commit. Returns an error
-    /// when the supplied paths cannot be grouped into a valid log-segment file set.
+    /// root. Returns an error when the supplied paths cannot be grouped into a valid log-segment
+    /// file set. Compacted paths are ignored, as in storage listing; callers must also supply the
+    /// individual commits required for replay.
     #[internal_api]
     #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
     #[allow(clippy::too_many_arguments)]
@@ -129,12 +129,6 @@ impl SnapshotHint {
     ) -> KernelResult<Self> {
         let log_root = try_parse_uri(table_root)?.join(DELTA_LOG_DIR_WITH_SLASH)?;
         let mut parsed_paths: Vec<ParsedLogPath> = log_paths.into_iter().map(Into::into).collect();
-        require!(
-            !parsed_paths
-                .iter()
-                .any(|path| matches!(path.file_type, LogPathFileType::CompactedCommit { .. })),
-            SnapshotHintError::LogCompaction.into()
-        );
         validate_snapshot_hint_paths(parsed_paths.iter(), &log_root)?;
         parsed_paths
             .sort_unstable_by(|a, b| (a.version, &a.filename).cmp(&(b.version, &b.filename)));
@@ -418,6 +412,7 @@ mod tests {
     use crate::cancellation::CancellationTokenRef;
     use crate::engine::sync::SyncEngine;
     use crate::metrics::{MeteredDeltaEngine, MetricEvent, SnapshotLoadType};
+    use crate::path::LogPathFileType;
     use crate::schema::schema_ref;
     use crate::snapshot::builder::tests::catalog_managed_tests::{
         create_log_path as create_catalog_log_path, setup_catalog_managed_test,
@@ -626,10 +621,11 @@ mod tests {
     ) {
         let log_paths = [
             "memory:///target/_delta_log/00000000000000000001.json",
+            "memory:///target/_delta_log/00000000000000000000.00000000000000000001.compacted.json",
             "memory:///target/_delta_log/00000000000000000000.json",
         ]
         .into_iter()
-        .map(|path| LogPath::try_new(create_log_path(path).location))
+        .map(|path| LogPath::try_new(create_log_path_with_size(path, 1).location))
         .collect::<KernelResult<Vec<_>>>()
         .unwrap();
         let hint = SnapshotHint::try_new(
@@ -653,6 +649,39 @@ mod tests {
                 .collect_vec(),
             vec![0, 1]
         );
+        assert!(hint.log_segment_files.ascending_compaction_files.is_empty());
+    }
+
+    #[test]
+    fn snapshot_hint_compacted_paths_do_not_fill_commit_gaps() -> Result<()> {
+        const TABLE_ROOT: &str = "memory:///target/";
+        let log_paths = [
+            "memory:///target/_delta_log/00000000000000000000.json",
+            "memory:///target/_delta_log/00000000000000000000.00000000000000000002.compacted.json",
+            "memory:///target/_delta_log/00000000000000000002.json",
+        ]
+        .into_iter()
+        .map(|path| LogPath::try_new(create_log_path_with_size(path, 1).location))
+        .collect::<KernelResult<Vec<_>>>()?;
+        let hint = SnapshotHint::try_new(
+            TABLE_ROOT,
+            2,
+            PublicationWatermark::InferFromLogPaths,
+            log_paths,
+            Protocol::try_new_legacy(1, 2)?,
+            Metadata::default().with_schema(schema_ref! { nullable "id": INTEGER })?,
+            None,
+            None,
+            SnapshotHintFreshness::Unverified,
+        )?;
+        let (engine, _store, _table_root) = setup_test();
+        assert_log_segment_hint_error(
+            SnapshotBuilder::new_for(TABLE_ROOT)
+                .with_snapshot_hint(hint)
+                .build(engine.as_ref()),
+            "Table version 1 is missing",
+        );
+        Ok(())
     }
 
     #[rstest::rstest]
@@ -691,6 +720,7 @@ mod tests {
         None
     )]
     #[case::crc("00000000000000000008.crc", None)]
+    #[case::compacted("00000000000000000007.00000000000000000008.compacted.json", None)]
     fn snapshot_hint_validates_paths_discarded_by_checkpoint_selection(
         #[case] filename: &str,
         #[case] expected_published_version: Option<Version>,

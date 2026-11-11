@@ -8,7 +8,7 @@ use std::sync::OnceLock;
 use std::time::Instant;
 
 use delta_kernel_derive::internal_api;
-use tracing::{debug, error, info, instrument, warn};
+use tracing::{error, info, instrument, trace, warn};
 use url::Url;
 
 use crate::action_reconciliation::calculate_transaction_expiration_timestamp;
@@ -36,10 +36,12 @@ use crate::log_segment::LastManifestCommitResolution;
 use crate::log_segment::{
     DomainMetadataMap, LogSegment, PmResolution, scan_domain_metadata_actions,
 };
-use crate::metrics::events::{DOMAIN_METADATA_LOADED_SPAN, SET_TRANSACTION_LOADED_SPAN};
+use crate::metrics::events::{
+    CHECKSUM_WRITE_SPAN, DOMAIN_METADATA_LOADED_SPAN, SET_TRANSACTION_LOADED_SPAN,
+};
 use crate::metrics::{
-    CheckpointWriteMode, CheckpointWriteOutcome, SnapshotLoadMetricContext,
-    emit_protocol_metadata_load, emit_protocol_metadata_load_failure,
+    CheckpointWriteMode, CheckpointWriteOutcome, ChecksumWriteOutcome, ChecksumWriteResolutionMode,
+    SnapshotLoadMetricContext, emit_protocol_metadata_load, emit_protocol_metadata_load_failure,
 };
 use crate::path::ParsedLogPath;
 use crate::row_tracking::{ROW_TRACKING_DOMAIN_NAME, parse_row_tracking_high_water_mark};
@@ -61,6 +63,8 @@ mod adaptive_metadata_tests;
 mod builder;
 #[cfg(test)]
 mod cancellation_tests;
+#[cfg(test)]
+mod crc_write_tests;
 mod hint;
 mod incremental;
 mod reader;
@@ -148,7 +152,7 @@ impl Eq for Snapshot {}
 
 impl Drop for Snapshot {
     fn drop(&mut self) {
-        debug!("Dropping snapshot");
+        trace!("Dropping snapshot");
     }
 }
 
@@ -1448,18 +1452,22 @@ impl Snapshot {
     /// its log segment. On [`ChecksumWriteResult::AlreadyExists`], the original snapshot is
     /// returned unchanged.
     ///
+    /// Reports one [`crate::metrics::MetricEvent::ChecksumWriteSuccess`] or
+    /// [`crate::metrics::MetricEvent::ChecksumWriteFailure`] event when the call returns.
+    ///
     /// # Errors
     ///
     /// - If Kernel does not support reading or writing the table.
     /// - [`KernelError::ChecksumWriteUnsupported`] if no CRC can be resolved for this version, if
     ///   the resolved CRC's `file_stats_state` is `Indeterminate` (a non-incremental operation like
-    ///   ANALYZE STATS, or a file action with a missing size; recoverable with a full state
+    ///   Manual Update, or a counted file action with a missing size; recoverable with a full state
     ///   reconstruction in the future), or if `delta.enableInCommitTimestamps` is `true` but
     ///   `inCommitTimestampOpt` is absent.
     /// - The underlying read error if in-commit timestamps are enabled but the timestamp cannot be
     ///   read from the commit file.
     /// - I/O errors from the engine's storage handler if the write fails.
-    #[instrument(parent = &self.span, name = "snap.write_checksum", skip_all, err)]
+    #[instrument(parent = &self.span, name = CHECKSUM_WRITE_SPAN, skip_all, err,
+        fields(report, outcome, resolution_mode, bytes_written))]
     pub fn write_checksum(
         self: &SnapshotRef,
         engine: &dyn Engine,
@@ -1476,17 +1484,19 @@ impl Snapshot {
                 "CRC file already exists on disk at version {}",
                 self.version()
             );
+            tracing::Span::current()
+                .record("outcome", ChecksumWriteOutcome::AlreadyExists.as_ref());
             return Ok((ChecksumWriteResult::AlreadyExists, Arc::clone(self)));
         }
 
         self.table_configuration().ensure_read_write_supported()?;
 
-        let crc = self.resolve_crc_for_write(engine)?;
+        let crc = self.resolve_crc_for_write(engine, &tracing::Span::current())?;
 
         let crc_path = ParsedLogPath::new_crc(self.table_root(), self.version())?;
 
         match try_write_crc_file(engine, &crc_path.location, &crc) {
-            Ok(()) => {
+            Ok(bytes_written) => {
                 info!("Wrote CRC file at {}", crc_path.location);
                 let new_log_segment = self.log_segment.try_new_with_crc_file(crc_path)?;
                 let new_snapshot = Arc::new(Snapshot::new_with_crc(
@@ -1496,6 +1506,7 @@ impl Snapshot {
                     self.built_as_latest,
                     self.skipped_new_checkpoints,
                 )?);
+                tracing::Span::current().record("bytes_written", bytes_written);
                 Ok((ChecksumWriteResult::Written, new_snapshot))
             }
             Err(KernelError::FileAlreadyExists(_)) => {
@@ -1503,6 +1514,8 @@ impl Snapshot {
                     "Another writer beat us to writing CRC file at {}",
                     crc_path.location
                 );
+                tracing::Span::current()
+                    .record("outcome", ChecksumWriteOutcome::AlreadyExists.as_ref());
                 Ok((ChecksumWriteResult::AlreadyExists, Arc::clone(self)))
             }
             Err(e) => Err(e),
@@ -1523,13 +1536,21 @@ impl Snapshot {
     /// writable CRC (missing protocol or metadata, or a non-incremental tail that dooms file
     /// stats).
     ///
-    /// The `root` span field records which root resolved the CRC.
+    /// The `root` span field records the selected root. `write_span` records its resolution mode.
     #[instrument(parent = &self.span, name = "snap.resolve_crc_for_write", skip_all, err, fields(root))]
-    fn resolve_crc_for_write(&self, engine: &dyn Engine) -> KernelResult<Arc<Crc>> {
+    fn resolve_crc_for_write(
+        &self,
+        engine: &dyn Engine,
+        write_span: &tracing::Span,
+    ) -> KernelResult<Arc<Crc>> {
         let span = tracing::Span::current();
+        let record_root = |root: &str, mode: ChecksumWriteResolutionMode| {
+            span.record("root", root);
+            write_span.record("resolution_mode", mode.as_ref());
+        };
         // Case 1: an in-memory CRC at this version is ready to write as-is.
         if let Some(crc) = self.crc_at_version() {
-            span.record("root", "in_memory");
+            record_root("in_memory", ChecksumWriteResolutionMode::Cached);
             return Ok(crc.clone());
         }
 
@@ -1543,14 +1564,14 @@ impl Snapshot {
         // Case 2: a stale base CRC, older than this version. Advance the retained base over the
         // tail commits (a held base is always at or above the checkpoint, so a tail exists).
         if let Some(base) = self.base_crc() {
-            span.record("root", "stale_crc");
+            record_root("stale_crc", ChecksumWriteResolutionMode::Incremental);
             let crc = log_segment.build_crc_from_base(engine, base)?;
             return Ok(Arc::new(crc));
         }
 
         // Case 3: no CRC, but a checkpoint to root at.
         if let Some(checkpoint_version) = log_segment.checkpoint_version {
-            span.record("root", "checkpoint");
+            record_root("checkpoint", ChecksumWriteResolutionMode::Full);
             if checkpoint_version == end {
                 // A checkpoint carries no ICT or lastManifestCommit (it has no commitInfo). Since
                 // there's no tail delta to carry them either, read them from the commit at the
@@ -1581,7 +1602,10 @@ impl Snapshot {
             )?;
             require!(
                 delta.is_incremental_safe,
-                unresolved_crc("commits after the checkpoint are not incremental-safe")
+                unresolved_crc(&match &delta.unsupported_operation {
+                    Some(operation) => format!("unsupported operation {operation:?}"),
+                    None => "commits after the checkpoint are not incremental-safe".to_string(),
+                })
             );
             let base = log_segment
                 .build_crc_from_checkpoint(engine)?
@@ -1591,7 +1615,7 @@ impl Snapshot {
         }
 
         // Case 4: neither CRC nor checkpoint, so reverse-replay the full commit history.
-        span.record("root", "version_zero");
+        record_root("version_zero", ChecksumWriteResolutionMode::Full);
         let crc = log_segment
             .build_crc_from_version_zero(engine)?
             .ok_or_else(|| unresolved_crc("commit history is missing protocol or metadata"))?;

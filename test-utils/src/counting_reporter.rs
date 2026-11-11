@@ -426,6 +426,8 @@ impl MetricsReporter for CountingReporter {
             | MetricEvent::CrcReadFailure
             | MetricEvent::CheckpointWriteSuccess(_)
             | MetricEvent::CheckpointWriteFailure(_)
+            | MetricEvent::ChecksumWriteSuccess(_)
+            | MetricEvent::ChecksumWriteFailure(_)
             | MetricEvent::ScanMetadataCompleted(_) => {}
         }
     }
