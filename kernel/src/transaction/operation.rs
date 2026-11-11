@@ -16,6 +16,15 @@ use crate::crc::{FileStatsPolicy, is_incremental_safe_operation};
 pub enum UpdateTableOperation {
     /// A batch write.
     Write,
+    /// A whole-table INSERT OVERWRITE, optionally with schema overwrite.
+    ///
+    /// Kernel removes every active logical file during commit, including when no files are
+    /// added. Callers stage only incoming files. Explicit removals, deletion-vector updates,
+    /// blind append, and `dataChange = false` are rejected. Partial overwrites use caller-managed
+    /// file changes with [`Write`](Self::Write) instead.
+    ///
+    /// Recorded as `WRITE` with `operationParameters.mode = Overwrite` in commit history.
+    Overwrite,
     /// A streaming write.
     StreamingUpdate,
     /// A standalone schema-changing operation.
@@ -61,6 +70,7 @@ impl UpdateTableOperation {
     pub fn as_str(&self) -> &str {
         match self {
             Self::Write => "WRITE",
+            Self::Overwrite => "WRITE",
             Self::StreamingUpdate => "STREAMING UPDATE",
             Self::AlterTable => "ALTER TABLE",
             Self::Delete => "DELETE",
@@ -165,6 +175,7 @@ mod tests {
     fn update_table_operations_have_stable_names() {
         let cases = [
             ("WRITE", UpdateTableOperation::Write, true),
+            ("WRITE", UpdateTableOperation::Overwrite, true),
             (
                 "STREAMING UPDATE",
                 UpdateTableOperation::StreamingUpdate,
