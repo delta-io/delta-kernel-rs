@@ -4,7 +4,7 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use tracing::{Level, debug, enabled, warn};
+use tracing::{Level, debug, enabled, trace, warn};
 use url::Url;
 
 use crate::actions::NULL_COUNT;
@@ -284,10 +284,10 @@ fn build_data_skipping_schemas(
         }
         // Requested columns bypass the indexed set and seed the stats schema; predicate refs join
         // the schema so kernel can still prune.
-        (StructStats::Columns { .. }, _) if requested_physical_stats_columns.is_some() => {
-            let mut filter = requested_physical_stats_columns
-                .unwrap_or_default()
-                .to_vec();
+        (StructStats::Columns { .. }, _)
+            if let Some(requested) = requested_physical_stats_columns =>
+        {
+            let mut filter = requested.to_vec();
             union_extra_into_filter(&mut filter, &predicate_refs_physical);
             build_stats_schema(requested_physical_stats_columns, Some(&filter))?
         }
@@ -484,7 +484,7 @@ impl StateInfo {
                         // just add them as if they're normal physical
                         // columns
                         let physical_field = logical_field.make_physical(column_mapping_mode)?;
-                        debug!("\n\n{logical_field:#?}\nAfter mapping: {physical_field:#?}\n\n");
+                        trace!("\n\n{logical_field:#?}\nAfter mapping: {physical_field:#?}\n\n");
                         let physical_name = physical_field.name.clone();
 
                         if !logical_field.is_metadata_column()

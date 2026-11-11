@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 pub(crate) use evaluate_expression::extract_column;
 use evaluate_expression::{evaluate_expression, evaluate_predicate};
-use tracing::debug;
+use tracing::trace;
 
 use super::arrow_conversion::{TryFromKernel as _, TryIntoArrow as _};
 use crate::arrow::array::{self, ArrayBuilder, ArrayRef, RecordBatch, StructArray};
@@ -346,7 +346,7 @@ pub struct DefaultExpressionEvaluator {
 
 impl ExpressionEvaluator for DefaultExpressionEvaluator {
     fn evaluate(&self, batch: &dyn EngineData) -> KernelResult<Box<dyn EngineData>> {
-        debug!("Arrow evaluator evaluating: {:#?}", self.expression);
+        trace!("Arrow evaluator evaluating: {:#?}", self.expression);
         let batch = extract_record_batch(batch)?;
         // TODO(#3263): Validate nested fields.
         validate_data_schema_top_level(&self.input_schema, batch.schema().as_ref())?;
@@ -386,7 +386,7 @@ pub struct DefaultPredicateEvaluator {
 
 impl PredicateEvaluator for DefaultPredicateEvaluator {
     fn evaluate(&self, batch: &dyn EngineData) -> KernelResult<Box<dyn EngineData>> {
-        debug!("Arrow evaluator evaluating: {:#?}", self.predicate);
+        trace!("Arrow evaluator evaluating: {:#?}", self.predicate);
         let batch = extract_record_batch(batch)?;
         // TODO(#3263): Validate nested fields.
         validate_data_schema_top_level(&self.input_schema, batch.schema().as_ref())?;

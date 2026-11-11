@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet};
 
 use chrono::{DateTime, Days};
 use delta_kernel_derive::internal_api;
-use tracing::debug;
+use tracing::trace;
 
 use crate::actions::{MAX_VALUES, MIN_VALUES, NULL_COUNT};
 use crate::engine::arrow_utils::RowIndexBuilder;
@@ -76,7 +76,7 @@ impl<T> ParquetRowGroupSkipping for ArrowReaderBuilder<T> {
                 RowGroupFilter::apply(row_group, predicate).then_some(ordinal)
             })
             .collect();
-        debug!("with_row_group_filter({predicate:#?}) = {ordinals:?})");
+        trace!("with_row_group_filter({predicate:#?}) = {ordinals:?})");
         if let Some(row_indexes) = row_indexes {
             row_indexes.select_row_groups(&ordinals);
         }
@@ -99,7 +99,7 @@ impl<T> ParquetRowGroupSkipping for ArrowReaderBuilder<T> {
                     .then_some(ordinal)
             })
             .collect();
-        debug!("with_checkpoint_row_group_filter({predicate:#?}) = {ordinals:?})");
+        trace!("with_checkpoint_row_group_filter({predicate:#?}) = {ordinals:?})");
         if let Some(row_indexes) = row_indexes {
             row_indexes.select_row_groups(&ordinals);
         }

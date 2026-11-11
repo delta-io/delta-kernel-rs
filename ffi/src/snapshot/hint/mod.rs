@@ -170,8 +170,9 @@ unsafe fn snapshot_builder_with_snapshot_hint_impl(
 /// supplied log location must be beneath the builder's table log root, including paths discarded by
 /// checkpoint selection. Kernel preserves the locations; the connector must canonicalize them into
 /// the same URL form as the table root. Build performs the remaining structural and
-/// table-configuration validation. `Latest` makes `is_built_as_latest()` true, and kernel trusts
-/// that caller claim. `Unverified` makes it false.
+/// table-configuration validation. `Latest` makes `is_built_as_latest()` true unless a supplied
+/// catalog bound is newer than the hint version. Kernel otherwise trusts that caller claim.
+/// `Unverified` makes it false.
 /// The caller must ensure the protocol and metadata came from the supplied files and all staged
 /// commits were catalog-ratified. Staged paths in a hint do not by themselves require
 /// [`snapshot_builder_with_max_catalog_version`]. Without an explicit target, a catalog-managed
@@ -183,8 +184,8 @@ unsafe fn snapshot_builder_with_snapshot_hint_impl(
 ///
 /// Returns `UnsupportedError` when the builder was created by
 /// [`get_snapshot_builder_from`](crate::get_snapshot_builder_from). Returns
-/// `InvalidSnapshotHint` when a supplied field cannot be decoded, a log path is outside the table
-/// log root, or a log path names an unsupported log compaction file.
+/// `InvalidSnapshotHint` when a supplied field cannot be decoded or a log path is outside the
+/// table log root. Compacted paths are ignored; the individual commits must also be supplied.
 /// Structural log-segment and table-configuration errors are returned when the builder is built.
 /// A failed call drops the builder.
 ///

@@ -225,7 +225,8 @@ impl<Mode> SnapshotBuilder<Mode> {
     /// Without a snapshot hint, omitting this uses the supplied
     /// [`max_catalog_version`](Self::with_max_catalog_version), or discovers the latest version
     /// using the filesystem and any supplied [`log tail`](Self::with_log_tail) if no bound is set.
-    /// With a hint, omitting this uses the hint version and its supplied freshness.
+    /// With a hint, omitting this uses the hint version and its supplied freshness, subject to
+    /// the catalog-bound rule in [`Snapshot::is_built_as_latest`].
     ///
     /// An explicit target does not require a catalog bound solely because that version is
     /// catalog-managed. An explicit target must not exceed a supplied catalog bound.
@@ -463,6 +464,7 @@ impl<Mode> SnapshotBuilder<Mode> {
                     log_tail,
                     engine,
                     effective_version,
+                    max_catalog_version,
                     metric_context,
                     incremental_replay,
                     checkpoint_handling,

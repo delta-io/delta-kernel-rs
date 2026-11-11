@@ -18,11 +18,11 @@ use crate::actions::{
     SIDECAR_NAME, Sidecar, get_all_actions_schema, get_commit_schema,
 };
 use crate::arrow::array::{StringArray, StructArray};
+use crate::engine::DelegatingEngine;
 use crate::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt as _};
 use crate::engine::arrow_expression::evaluate_expression::extract_column_ref;
 use crate::engine::sync::SyncEngine;
 use crate::engine::sync::json::SyncJsonHandler;
-use crate::engine::test_delegating::DelegatingEngine;
 use crate::expressions::{col, column_name};
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::last_checkpoint_hint::{AmtCheckpoint, CheckpointType};
@@ -5360,8 +5360,228 @@ async fn test_try_new_with_crc_file_sets_crc_and_preserves_other_fields() {
 }
 
 // ============================================================================
-// get_unpublished_catalog_commits tests
+// Commit publication tests
 // ============================================================================
+
+/// With published commits 0 and 1 and staged commits 1 and 2, publishing through 2 replaces both
+/// staged paths. Commit 1's path must change even though commit 1 was already published.
+/// Commits newer than `published_through` must keep their staged paths.
+#[rstest]
+#[case::one_commit_already_published(&[0, 1], &[1, 2], Some(2), true)]
+#[case::commit_2_stays_staged(&[0], &[1, 2], Some(1), true)]
+#[case::none_published(&[], &[0, 1], None, false)]
+#[case::version_zero(&[], &[0], Some(0), true)]
+#[case::all_staged(&[], &[0, 1], Some(1), true)]
+#[case::all_paths_already_published(&[0, 1, 2], &[], Some(2), false)]
+#[case::published_commits_with_staged_paths(&[0, 1, 2], &[1, 2], Some(2), true)]
+#[tokio::test]
+async fn test_new_as_published_replaces_staged_commit_paths(
+    #[case] published_commit_versions: &[Version],
+    #[case] staged_commit_versions: &[Version],
+    #[case] published_through: Option<Version>,
+    #[case] expect_updated: bool,
+) {
+    // GIVEN: a commit version may have both a published file and a catalog-supplied staged file.
+    let mut original = create_segment_for(LogSegmentConfig {
+        published_commit_versions,
+        staged_commit_versions,
+        ..Default::default()
+    })
+    .await;
+    for file in &mut original.listed.ascending_commit_files {
+        file.location.size = 123 + file.version;
+        file.location.last_modified = 456 + file.version as i64;
+    }
+    if let Some(latest) = &mut original.listed.latest_commit_file {
+        latest.location.size = 789;
+        latest.location.last_modified = 1011;
+    }
+    let source = original.clone();
+
+    // WHEN: replace staged paths through published_through.
+    let updated = original.new_as_published(published_through).unwrap();
+
+    // THEN: replace staged paths only through published_through and preserve file metadata.
+    assert_eq!(updated.is_some(), expect_updated);
+    let published = updated.as_ref().unwrap_or(&original);
+
+    let assert_reference = |before: &ParsedLogPath, after: &ParsedLogPath| {
+        if before.file_type == StagedCommit
+            && published_through.is_some_and(|version| before.version <= version)
+        {
+            let filename = format!("{:020}.json", before.version);
+            assert_eq!(
+                after.location.location,
+                original.log_root.join(&filename).unwrap()
+            );
+            assert_eq!(after.filename, filename);
+            assert_eq!(after.extension, "json");
+            assert_eq!(after.file_type, Commit);
+            assert_eq!(after.version, before.version);
+            assert_eq!(after.location.size, before.location.size);
+            assert_eq!(after.location.last_modified, before.location.last_modified);
+        } else {
+            assert_eq!(after, before);
+        }
+    };
+    assert_eq!(
+        published.listed.ascending_commit_files.len(),
+        original.listed.ascending_commit_files.len()
+    );
+    for (before, after) in original
+        .listed
+        .ascending_commit_files
+        .iter()
+        .zip(&published.listed.ascending_commit_files)
+    {
+        assert_reference(before, after);
+    }
+    assert_reference(
+        original.listed.latest_commit_file.as_ref().unwrap(),
+        published.listed.latest_commit_file.as_ref().unwrap(),
+    );
+    assert_eq!(published.listed.max_published_version, published_through);
+    assert_eq!(published.end_version, original.end_version);
+    assert_eq!(published.log_root, original.log_root);
+    assert_eq!(original, source);
+    assert!(
+        published
+            .new_as_published(published_through)
+            .unwrap()
+            .is_none()
+    );
+}
+
+/// A checkpoint at version 2 supplies all log actions, so `ascending_commit_files` is empty.
+/// `latest_commit_file` can still name staged commit 2 for in-commit timestamp reads.
+/// Replace that path only when version 2 is known to be published.
+#[rstest]
+#[case::none_published(None, StagedCommit, false)]
+#[case::published_before_checkpoint(Some(1), StagedCommit, true)]
+#[case::checkpoint_commit_published(Some(2), Commit, true)]
+#[tokio::test]
+async fn test_new_as_published_with_checkpoint_at_snapshot_version(
+    #[case] published_through: Option<Version>,
+    #[case] expected_type: LogPathFileType,
+    #[case] expected_updated: bool,
+    #[values(false, true)] retain_latest: bool,
+) {
+    // GIVEN: a checkpoint at the snapshot version, with or without latest_commit_file.
+    let mut original = create_segment_for(LogSegmentConfig {
+        checkpoint_version: Some(2),
+        staged_commit_versions: &[2],
+        ..Default::default()
+    })
+    .await;
+    original.listed.latest_crc_file = Some(create_log_path(
+        "memory:///_delta_log/00000000000000000002.crc",
+    ));
+    original.last_checkpoint_metadata = Some(LastCheckpointHint {
+        version: 2,
+        ..Default::default()
+    });
+    if !retain_latest {
+        original.listed.latest_commit_file = None;
+    }
+
+    // WHEN: update the published commit paths without adding commits to ascending_commit_files.
+    let updated = original.new_as_published(published_through).unwrap();
+
+    // THEN: update latest_commit_file only if its version has been published; keep the checkpoint.
+    assert_eq!(updated.is_some(), expected_updated);
+    let published = updated.as_ref().unwrap_or(&original);
+
+    assert!(published.listed.ascending_commit_files.is_empty());
+    assert_eq!(published.checkpoint_version, original.checkpoint_version);
+    assert_eq!(
+        published.listed.checkpoint_parts,
+        original.listed.checkpoint_parts
+    );
+    assert_eq!(
+        published.listed.latest_crc_file,
+        original.listed.latest_crc_file
+    );
+    assert_eq!(
+        published.last_checkpoint_metadata,
+        original.last_checkpoint_metadata
+    );
+    assert_eq!(
+        published.listed.ascending_compaction_files,
+        original.listed.ascending_compaction_files
+    );
+    assert_eq!(published.listed.max_published_version, published_through);
+    assert_eq!(
+        published
+            .listed
+            .latest_commit_file
+            .as_ref()
+            .map(|file| file.file_type.clone()),
+        retain_latest.then_some(expected_type)
+    );
+}
+
+#[rstest]
+#[case::after_snapshot_version(Some(3))]
+#[case::before_published_version(Some(0))]
+#[case::missing_published_version(None)]
+#[tokio::test]
+async fn test_new_as_published_rejects_invalid_published_version(
+    #[case] published_through: Option<Version>,
+) {
+    // GIVEN: commits 0 and 1 are published; staged commit 2 is not.
+    let original = create_segment_for(LogSegmentConfig {
+        published_commit_versions: &[0, 1],
+        staged_commit_versions: &[2],
+        ..Default::default()
+    })
+    .await;
+
+    // WHEN: publication would exceed version 2 or forget that version 1 is already published.
+    let result = original.new_as_published(published_through);
+
+    // THEN: reject the invalid published version.
+    assert!(matches!(result, Err(KernelError::InvalidLogSegment(_))));
+}
+
+#[tokio::test]
+async fn test_new_as_published_preserves_checkpoints_and_log_compactions() {
+    // GIVEN: a checkpoint at 0, a log compaction for 1-2, and staged paths for published commits
+    // 2-3.
+    let original = create_segment_for(LogSegmentConfig {
+        published_commit_versions: &[0, 1, 2, 3],
+        staged_commit_versions: &[2, 3],
+        checkpoint_version: Some(0),
+        ..Default::default()
+    })
+    .await;
+    // Snapshot listing excludes compactions, so construct the retained reference directly.
+    let mut listed = original.listed;
+    listed.ascending_compaction_files.push(create_log_path(
+        "memory:///_delta_log/00000000000000000001.00000000000000000002.compacted.json",
+    ));
+    let original = LogSegment::try_new(
+        listed,
+        original.log_root,
+        Some(original.end_version),
+        original.last_checkpoint_metadata,
+    )
+    .unwrap();
+    assert!(!original.listed.ascending_compaction_files.is_empty());
+    assert!(!original.listed.checkpoint_parts.is_empty());
+
+    // WHEN: replace staged paths through version 3.
+    let published = original.new_as_published(Some(3)).unwrap().unwrap();
+
+    // THEN: the checkpoint and log compaction files are unchanged.
+    assert_eq!(
+        published.listed.ascending_compaction_files,
+        original.listed.ascending_compaction_files
+    );
+    assert_eq!(
+        published.listed.checkpoint_parts,
+        original.listed.checkpoint_parts
+    );
+}
 
 #[tokio::test]
 async fn test_get_unpublished_catalog_commits() {

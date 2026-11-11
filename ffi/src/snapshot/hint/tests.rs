@@ -3,18 +3,17 @@ use std::error::Error as _;
 use std::ptr::NonNull;
 use std::sync::Arc;
 
+use delta_kernel::FileMeta;
 use delta_kernel::actions::Metadata;
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use delta_kernel::actions::{Add, LastManifestCommit};
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use delta_kernel::crc::Crc;
+use delta_kernel::engine::PanicEngine;
 use delta_kernel::last_checkpoint_hint::{LastCheckpointHint, LastCheckpointV2};
 use delta_kernel::log_segment::LogSegment;
-use delta_kernel::path::ParsedLogPath;
+use delta_kernel::path::{LogPathFileType, ParsedLogPath};
 use delta_kernel::snapshot::{IncrementalReplay, PublicationWatermark, Snapshot};
-use delta_kernel::{
-    Engine, EvaluationHandler, FileMeta, JsonHandler, ParquetHandler, StorageHandler,
-};
 use test_utils::table_builder::{LogState, TestTableBuilder};
 use test_utils::{TestCatalogCommitter, compacted_log_path_for_versions, create_log_path};
 
@@ -140,7 +139,7 @@ fn empty_crc() -> FfiCrc {
 }
 
 fn test_engine() -> Handle<SharedExternEngine> {
-    engine_to_handle(Arc::new(NoIoEngine), TEST_ERROR_ALLOCATORS)
+    engine_to_handle(Arc::new(PanicEngine), TEST_ERROR_ALLOCATORS)
 }
 
 #[rstest::rstest]
@@ -204,26 +203,6 @@ fn log_segment_stats_borrows_handles_and_propagates_errors_without_io(
     unsafe {
         free_snapshot(snapshot);
         free_engine(engine);
-    }
-}
-
-struct NoIoEngine;
-
-impl Engine for NoIoEngine {
-    fn evaluation_handler(&self) -> Arc<dyn EvaluationHandler> {
-        panic!("snapshot hints must not require evaluation")
-    }
-
-    fn storage_handler(&self) -> Arc<dyn StorageHandler> {
-        panic!("snapshot hints must not require storage")
-    }
-
-    fn json_handler(&self) -> Arc<dyn JsonHandler> {
-        panic!("snapshot hints must not require JSON I/O")
-    }
-
-    fn parquet_handler(&self) -> Arc<dyn ParquetHandler> {
-        panic!("snapshot hints must not require Parquet I/O")
     }
 }
 
@@ -524,8 +503,8 @@ fn assert_exported_paths_and_round_trip(snapshot: Handle<SharedSnapshot>) {
     assert!(
         state
             .files
-            .windows(2)
-            .all(|pair| pair[0].location.as_str() < pair[1].location.as_str())
+            .array_windows()
+            .all(|[a, b]| a.location.as_str() < b.location.as_str())
     );
     assert_eq!(
         state.files,
@@ -922,10 +901,15 @@ fn visited_hint_preserves_partial_crc_maps_and_indeterminate_file_stats() {
 }
 
 #[rstest::rstest]
-fn visited_hint_preserves_ratified_staged_paths_for_explicit_version(
-    #[values(false, true)] publish: bool,
+#[case::unpublished(0, false)]
+#[case::new_publication(0, true)]
+#[case::already_published(1, true)]
+fn visited_hint_preserves_commit_paths_and_watermark_for_explicit_version(
+    #[case] source_watermark: Version,
+    #[case] publish: bool,
     #[values(None, Some(1), Some(2))] max_catalog_version: Option<Version>,
 ) {
+    // GIVEN: a hint with published commit 0 and staged commit 1, which may already be published.
     let engine = test_engine();
     let reader_features = [slice("catalogManaged")];
     let writer_features = [slice("catalogManaged"), slice("inCommitTimestamp")];
@@ -963,8 +947,8 @@ fn visited_hint_preserves_ratified_staged_paths_for_explicit_version(
                 "memory:///hinted-table/_delta_log/_staged_commits/",
                 "00000000000000000001.3a0d65cd-4056-49b8-937b-95f9e3ee90e5.json",
             )),
-            2,
-            1,
+            17,
+            13,
         ),
     ];
     let crc = FfiCrc {
@@ -978,14 +962,17 @@ fn visited_hint_preserves_ratified_staged_paths_for_explicit_version(
     hint.protocol = protocol();
     hint.metadata = metadata();
     hint.crc = &crc;
+    hint.publication_watermark = FfiPublicationWatermark::PublishedThrough(source_watermark);
+    let source_hint_paths = unsafe { hint.log_paths.log_paths() }.unwrap();
     let builder = unsafe { snapshot_builder_with_max_catalog_version(test_builder(&engine), 1) };
     let builder = unsafe { ok_or_panic(snapshot_builder_with_snapshot_hint(builder, &hint)) };
     let source = unsafe { ok_or_panic(snapshot_builder_build(builder)) };
     let source_ref = unsafe { source.clone_as_arc() };
     assert_eq!(
         source_ref.log_segment().listed.max_published_version,
-        Some(0)
+        Some(source_watermark)
     );
+    let source_segment = source_ref.log_segment().clone();
     let kernel_engine = unsafe { engine.as_ref() }.engine();
     let published = if publish {
         source_ref
@@ -994,14 +981,50 @@ fn visited_hint_preserves_ratified_staged_paths_for_explicit_version(
     } else {
         source_ref.clone()
     };
-    let published_version = u64::from(publish);
+    let published_version = if publish { 1 } else { source_watermark };
     assert_eq!(
         published.log_segment().listed.max_published_version,
         Some(published_version)
     );
+    let published_files = &published.log_segment().listed.ascending_commit_files;
+    assert_eq!(published_files.len(), 2);
+    for (file, expected_location, (size, last_modified)) in itertools::izip!(
+        published_files,
+        [
+            "memory:///hinted-table/_delta_log/00000000000000000000.json",
+            if publish {
+                "memory:///hinted-table/_delta_log/00000000000000000001.json"
+            } else {
+                source_segment.listed.ascending_commit_files[1]
+                    .location
+                    .location
+                    .as_str()
+            },
+        ],
+        [(1, 1), (13, 17)],
+    ) {
+        assert_eq!(file.location.location.as_str(), expected_location);
+        let expected_type = if publish || file.version == 0 {
+            LogPathFileType::Commit
+        } else {
+            LogPathFileType::StagedCommit
+        };
+        assert_eq!(file.file_type, expected_type);
+        assert_eq!(file.location.size, size);
+        assert_eq!(file.location.last_modified, last_modified);
+    }
     assert_eq!(
-        published.log_segment().listed.ascending_commit_files,
-        source_ref.log_segment().listed.ascending_commit_files
+        published.log_segment().listed.latest_commit_file.as_ref(),
+        published_files.last()
+    );
+    assert_eq!(source_ref.log_segment(), &source_segment);
+    assert_eq!(
+        unsafe { hint.log_paths.log_paths() }.unwrap(),
+        source_hint_paths
+    );
+    assert_eq!(
+        PublicationWatermark::from(hint.publication_watermark),
+        PublicationWatermark::PublishedThrough(source_watermark)
     );
     let published: Handle<SharedSnapshot> = published.into();
     let expected_segment = unsafe { published.as_ref() }.log_segment().listed.clone();
@@ -1017,6 +1040,7 @@ fn visited_hint_preserves_ratified_staged_paths_for_explicit_version(
         watermark: None,
         visits: 0,
     };
+    // WHEN: export the returned snapshot through the FFI visitor.
     assert!(unsafe {
         ok_or_panic(snapshot_to_snapshot_hint(
             published.shallow_copy(),
@@ -1025,6 +1049,8 @@ fn visited_hint_preserves_ratified_staged_paths_for_explicit_version(
             install_visited_hint,
         ))
     });
+
+    // THEN: the exported hint rebuilds a snapshot with the same commit paths and metadata.
     assert_eq!(state.visits, 1);
     unsafe {
         free_snapshot(source);
@@ -1460,8 +1486,10 @@ fn aggregate_with_rejects_null_nonempty_log_path_array() {
     }
 }
 
-#[test]
-fn aggregate_with_rejects_log_compaction_paths() {
+#[rstest::rstest]
+#[case::complete(true)]
+#[case::missing_commit(false)]
+fn aggregate_with_log_compaction_requires_individual_commits(#[case] complete: bool) {
     let engine = test_engine();
     let builder = test_builder(&engine);
     let log_path = FfiLogPath::new(
@@ -1472,19 +1500,54 @@ fn aggregate_with_rejects_log_compaction_paths() {
         1,
         1,
     );
-    let hint = test_snapshot_hint(
-        std::slice::from_ref(&log_path),
-        1,
-        FfiSnapshotHintFreshness::Unverified,
+    let paths = [
+        log_path,
+        FfiLogPath::new(
+            slice("memory:///hinted-table/_delta_log/00000000000000000000.json"),
+            0,
+            0,
+        ),
+        FfiLogPath::new(
+            slice("memory:///hinted-table/_delta_log/00000000000000000001.json"),
+            1234,
+            0,
+        ),
+    ];
+    let supplied_paths = if complete { &paths[..] } else { &paths[..1] };
+    let hint = test_snapshot_hint(supplied_paths, 1, FfiSnapshotHintFreshness::Unverified);
+    let builder = unsafe { ok_or_panic(snapshot_builder_with_snapshot_hint(builder, &hint)) };
+    if !complete {
+        assert_extern_result_error_contains(
+            unsafe { snapshot_builder_build(builder) },
+            FFIKernelError::InvalidSnapshotHint,
+            "log segment",
+        );
+        unsafe { free_engine(engine) };
+        return;
+    }
+    let snapshot = unsafe { ok_or_panic(snapshot_builder_build(builder)) };
+    let source = unsafe { snapshot.as_ref() };
+    assert_eq!(source.version(), 1);
+    assert_eq!(source.log_segment().listed.ascending_commit_files.len(), 2);
+    assert!(
+        source
+            .log_segment()
+            .listed
+            .ascending_compaction_files
+            .is_empty()
     );
-    let result = unsafe { snapshot_builder_with_snapshot_hint(builder, &hint) };
-    assert_extern_result_error_contains(
-        result,
-        FFIKernelError::InvalidSnapshotHint,
-        "log compaction",
+    assert_eq!(
+        unsafe {
+            ok_or_panic(crate::snapshot_timestamp(
+                snapshot.shallow_copy(),
+                engine.shallow_copy(),
+            ))
+        },
+        1234
     );
 
     unsafe {
+        free_snapshot(snapshot);
         free_engine(engine);
     }
 }

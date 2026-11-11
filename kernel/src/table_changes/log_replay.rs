@@ -119,7 +119,7 @@ where
             scanner.into_scan_batches(engine.clone(), filter.clone())
         }) //Iterator-Result-Iterator-Result
         .flatten_ok() // Iterator-Result-Result
-        .map(|x| x?); // Iterator-Result
+        .map(Result::flatten); // Iterator-Result
     Ok(result)
 }
 
@@ -266,8 +266,7 @@ impl LogReplayScanner {
                 let writer_features_str = table_configuration
                     .protocol()
                     .writer_features()
-                    .map(format_features)
-                    .unwrap_or_else(|| "[]".to_string());
+                    .map_or_else(|| "[]".to_string(), format_features);
 
                 info!(
                     version = commit_file.version,

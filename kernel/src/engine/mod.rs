@@ -86,8 +86,11 @@ pub mod plans;
 ))]
 pub mod sync;
 
-#[cfg(test)]
-pub(crate) mod test_delegating;
+#[cfg(any(test, feature = "test-utils"))]
+mod test_delegating;
+
+#[cfg(any(test, feature = "test-utils"))]
+pub use test_delegating::{DelegatingEngine, PanicEngine};
 
 #[cfg(feature = "default-engine-base")]
 pub mod arrow_data;

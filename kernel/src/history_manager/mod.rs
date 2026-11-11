@@ -910,9 +910,8 @@ mod tests {
 
     use super::*;
     use crate::actions::{CommitInfo, Metadata, Protocol};
-    use crate::engine::CancellableEngine;
     use crate::engine::sync::SyncEngine;
-    use crate::engine::test_delegating::DelegatingEngine;
+    use crate::engine::{CancellableEngine, DelegatingEngine};
     use crate::object_store::memory::InMemory;
     use crate::schema::{SchemaRef, schema_ref};
     use crate::snapshot::{Snapshot, SnapshotBuilder};

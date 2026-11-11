@@ -9,7 +9,7 @@ use delta_kernel::table_changes::TableChanges;
 use delta_kernel::table_changes::scan::TableChangesScan;
 use delta_kernel::{EngineData, KernelError, KernelResult, KernelResultIterator, Version};
 use delta_kernel_ffi_macros::handle_descriptor;
-use tracing::debug;
+use tracing::{debug, trace};
 use url::Url;
 
 use super::handle::Handle;
@@ -248,7 +248,7 @@ pub struct SharedScanTableChangesIterator;
 
 impl Drop for ScanTableChangesIterator {
     fn drop(&mut self) {
-        debug!("dropping ScanTableChangesIterator");
+        trace!("dropping ScanTableChangesIterator");
     }
 }
 

@@ -30,6 +30,7 @@ use test_utils::{
 };
 use url::Url;
 
+mod checkpoint;
 mod commit;
 mod parallel_scan;
 mod scan;

@@ -6,8 +6,8 @@ use bytes::Bytes;
 use url::Url;
 
 use super::TestCancellationToken;
+use crate::engine::DelegatingEngine;
 use crate::engine::sync::SyncEngine;
-use crate::engine::test_delegating::DelegatingEngine;
 use crate::{
     CancellationTokenRef, Engine, EngineData, FileDataReadResultIterator, FileMeta, FileSize,
     FileSlice, FilteredEngineData, JsonHandler, KernelError, KernelResult, KernelResultIterator,
