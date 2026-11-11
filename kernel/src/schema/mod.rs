@@ -2543,18 +2543,19 @@ impl<'de> serde::Deserialize<'de> for DataType {
         if let Value::Object(map) = &value
             && let Some(Value::String(type_str)) = map.get("type")
         {
+            // Value-to-type conversion recurses outside the JSON decoder's stack-growth adapter.
             return match type_str.as_str() {
-                "array" => ArrayType::deserialize(value)
+                "array" => ArrayType::deserialize(serde_stacker::Deserializer::new(value))
                     .map(DataType::from)
                     .map_err(|e| Error::custom(e.to_string())),
-                "struct" => StructType::deserialize(value)
+                "struct" => StructType::deserialize(serde_stacker::Deserializer::new(value))
                     .map(DataType::from)
                     .map_err(|e| Error::custom(e.to_string())),
-                "map" => MapType::deserialize(value)
+                "map" => MapType::deserialize(serde_stacker::Deserializer::new(value))
                     .map(DataType::from)
                     .map_err(|e| Error::custom(e.to_string())),
                 #[cfg(feature = "udt-in-dev")]
-                "udt" => UserDefinedType::deserialize(value)
+                "udt" => UserDefinedType::deserialize(serde_stacker::Deserializer::new(value))
                     .map(DataType::UserDefined)
                     .map_err(Error::custom),
                 _ => Err(unsupported_delta_type_error(type_str)),
