@@ -408,7 +408,11 @@ impl StateInfo {
         } else {
             logical_read_schema.num_fields()
         });
-        let mut transform_spec = Vec::with_capacity(logical_read_schema.num_fields());
+        let mut transform_spec = Vec::with_capacity(if reuse_physical_schema {
+            partition_columns.len()
+        } else {
+            logical_read_schema.num_fields()
+        });
         let mut last_physical_field: Option<String> = None;
 
         let metadata_info = validate_metadata_columns(&logical_read_schema, table_configuration)?;
