@@ -433,6 +433,7 @@ impl<Mode> SnapshotBuilder<Mode> {
                 debug!(
                     ?effective_version,
                     ?incremental_replay,
+                    ?table_root,
                     "Loading snapshot from storage"
                 );
                 let table_url = try_parse_uri(&table_root)
