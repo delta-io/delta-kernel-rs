@@ -34,7 +34,8 @@ impl RootManifestFile {
     /// Builds the self-contained `checkpoint` action committing this root manifest at
     /// `commit_version`. A reader restores from it without replaying earlier commits, so it carries
     /// the table's protocol and metadata plus every active domain metadata and set transaction
-    /// (this transaction's `dm_changes` and `set_transactions` merged in, newest wins).
+    /// (this transaction's `dm_changes` and `set_transactions` merged in, newest wins). Expired set
+    /// transactions are dropped from the inline entries but carried forward in a reused sidecar.
     pub(super) fn compute_checkpoint_action(
         &self,
         engine: &dyn Engine,
@@ -67,18 +68,20 @@ impl RootManifestFile {
         changes.domain_metadata.extend(keyed(dm_changes));
 
         let log_root = LogRoot::new(snapshot.table_root().clone())?;
-        let (mut transactions, txn_sidecars) = fold_entries(
+        let (mut transactions, txn_sidecars) = apply_changes_to_checkpoint_entries(
             engine,
             snapshot,
             existing,
             &log_root,
             changes.set_transactions,
         )?;
-        // Txns in kept sidecars are not pruned.
+        // Only inline txns are expired: pruning a kept sidecar would mean reading and rewriting it.
+        // Its expired txns are pruned once a change moves the sidecar inline.
+        // TODO(#2866): prune kept sidecars once kernel can rewrite them.
         let expiration_timestamp =
             calculate_transaction_expiration_timestamp(table_config.table_properties())?;
         transactions.retain(|_, txn| !txn.is_expired(expiration_timestamp));
-        let (domain_metadata, domain_metadata_sidecars) = fold_entries(
+        let (domain_metadata, domain_metadata_sidecars) = apply_changes_to_checkpoint_entries(
             engine,
             snapshot,
             existing,
@@ -197,7 +200,7 @@ impl CheckpointEntry for DomainMetadata {
 /// Builds one kind of checkpoint-action state by applying `changes` to the `existing` checkpoint
 /// action's inline entries, keeping its sidecars unless a change touches an entry stored in one.
 /// Without an existing action, `changes` apply to the snapshot's state.
-fn fold_entries<T: CheckpointEntry>(
+fn apply_changes_to_checkpoint_entries<T: CheckpointEntry>(
     engine: &dyn Engine,
     snapshot: &Snapshot,
     existing: Option<&CheckpointAction>,
@@ -883,7 +886,7 @@ mod tests {
         true,
         true
     )]
-    fn compute_checkpoint_action_folds_domain_log_commits_after_the_action(
+    fn compute_checkpoint_action_applies_domain_log_commits_over_sidecars(
         #[case] log_domains: Vec<DomainMetadata>,
         #[case] dm_changes: Vec<DomainMetadata>,
         #[case] expected_inline: Vec<DomainMetadata>,
