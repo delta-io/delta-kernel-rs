@@ -1,4 +1,4 @@
-//! Single-part checkpoint reconstruction using shared metadata planning and action replay.
+//! Checkpoint reconstruction using shared metadata planning and action replay.
 
 use super::CheckpointWriter;
 use crate::action_reconciliation::RetentionCalculator as _;
@@ -29,6 +29,46 @@ impl CheckpointWriter {
             ))?
             .project_patch(|patch| patch.drop(VERSION))?
             .build()
+    }
+
+    /// Builds separate content and non-content reconstruction plans for a V2 checkpoint.
+    /// Returns `(content, non_content)` for sidecar and manifest writes, respectively.
+    ///
+    /// The non-content plan reads the checkpoint root without resolving sidecars. Sidecar
+    /// references, checkpointMetadata, and publication are supplied by the write orchestration.
+    pub fn declarative_v2_checkpoint_data_plans(
+        &self,
+        engine: &dyn Engine,
+    ) -> KernelResult<(Plan, Plan)> {
+        if !self.schema_context.is_v2 {
+            return Err(KernelError::unsupported(
+                "V2 checkpoint plans require the v2Checkpoint feature",
+            ));
+        }
+        let content = self
+            .metadata_planner(ActionSet::live_adds_with_tombstones())?
+            .with_checkpoint_shape(self.snapshot.checkpoint_info(engine)?)
+            .replay()?
+            .filter(file_retention_predicate(
+                self.deleted_file_retention_timestamp()?,
+            ))?
+            .project_patch(|patch| patch.drop(VERSION))?
+            .build()?;
+        let non_content = MetadataPlanner::new(
+            self.snapshot.log_segment(),
+            ActionSet {
+                live_adds: false,
+                include_tombstones: false,
+                ..ActionSet::ALL
+            },
+        )
+        .replay()?
+        .filter(non_content_retention_predicate(
+            self.get_transaction_expiration_timestamp()?,
+        ))?
+        .project_patch(|patch| patch.drop(VERSION))?
+        .build()?;
+        Ok((content, non_content))
     }
 
     /// Configures metadata replay using this writer's output representations and schemas.

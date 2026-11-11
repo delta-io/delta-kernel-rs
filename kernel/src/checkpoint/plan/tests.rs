@@ -16,7 +16,7 @@ use crate::action_reconciliation::plan::action_set::ActionSet;
 use crate::arrow::array::StringArray;
 use crate::arrow::compute::{filter_record_batch, is_not_null, or};
 use crate::arrow::record_batch::RecordBatch;
-use crate::checkpoint::CheckpointSpec;
+use crate::checkpoint::{CheckpointSpec, V2CheckpointConfig};
 use crate::engine::arrow_conversion::TryFromArrow as _;
 use crate::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt as _};
 use crate::engine::arrow_utils::parse_json_impl;
@@ -58,6 +58,20 @@ fn checkpoint_plans(
     writer: &CheckpointWriter,
     engine: &dyn Engine,
 ) -> KernelResult<Vec<(Plan, ActionSet)>> {
+    if writer.schema_context.is_v2 {
+        let (content, non_content) = writer.declarative_v2_checkpoint_data_plans(engine)?;
+        return Ok(vec![
+            (content, ActionSet::live_adds_with_tombstones()),
+            (
+                non_content,
+                ActionSet {
+                    live_adds: false,
+                    include_tombstones: false,
+                    ..ActionSet::ALL
+                },
+            ),
+        ]);
+    }
     Ok(vec![(
         writer.declarative_checkpoint_data_plan(engine)?,
         ActionSet::ALL,
@@ -85,9 +99,15 @@ fn assert_checkpoint_plan(
 #[case("partition_cm/name")]
 #[case("app-txn-no-checkpoint")]
 #[case("app-txn-checkpoint")]
+#[case("v2-checkpoints-parquet-with-sidecars")]
+#[case("v2-checkpoints-json-with-sidecars")]
+#[case("v2-checkpoints-parquet-without-sidecars")]
+#[case("v2-checkpoints-json-without-sidecars")]
 #[case("v1-single-part-struct-stats-only")]
 #[case("v1-multi-part-struct-stats-only")]
 #[case("v1-multi-part-partitioned-struct-stats-only")]
+#[case("v2-json-sidecars-struct-stats-only")]
+#[case("v2-parquet-sidecars-struct-stats-only")]
 fn checkpoint_plan_matches_existing_checkpoint_data(
     #[case] table: &str,
     #[values(false, true)] with_tail: bool,
@@ -194,17 +214,24 @@ fn add(path: &str, dv_offset: Option<i32>) -> Value {
 }
 
 #[rstest]
-#[case::v1(32, false)]
-#[case::no_indexed_columns(0, false)]
-#[case::clustering_not_indexed(0, true)]
+#[case::v1(false, false, 32, false)]
+#[case::v2_inline(true, false, 32, false)]
+#[case::v2_sidecars(true, true, 32, false)]
+#[case::no_indexed_columns(false, false, 0, false)]
+#[case::clustering_not_indexed(false, false, 0, true)]
 #[tokio::test]
 async fn checkpoint_plan_reconciles_all_groups_and_retains_after_replay(
+    #[case] v2: bool,
+    #[case] sidecars: bool,
     #[case] indexed_columns: i32,
     #[case] clustered: bool,
     #[values(false, true)] structured_stats: bool,
     #[values(None, Some(100i64))] txn_cutoff: Option<i64>,
 ) -> KernelResult<(), Box<dyn std::error::Error>> {
-    let features = FeatureSet::new().deletion_vectors().domain_metadata();
+    let mut features = FeatureSet::new().deletion_vectors().domain_metadata();
+    if v2 {
+        features = features.v2_checkpoint();
+    }
     let builder = TestTableBuilder::new()
         .with_features(features)
         .with_table_config(
@@ -232,7 +259,15 @@ async fn checkpoint_plan_reconciles_all_groups_and_retains_after_replay(
         "maxValues":{"long_col":7},"nullCount":{"long_col":0}})
         .to_string()
     );
-    let spec = CheckpointSpec::V1;
+    let spec = if sidecars {
+        CheckpointSpec::V2(V2CheckpointConfig::WithSidecar {
+            file_actions_per_sidecar_hint: Some(1),
+        })
+    } else if v2 {
+        CheckpointSpec::V2(V2CheckpointConfig::NoSidecar)
+    } else {
+        CheckpointSpec::V1
+    };
 
     metadata["id"] = json!("new");
     protocol["protocol"]["writerFeatures"]
@@ -294,7 +329,7 @@ async fn checkpoint_plan_reconciles_all_groups_and_retains_after_replay(
     let writer = snapshot.create_checkpoint_writer(&engine)?;
     let expected = existing_checkpoint_data(&writer, &engine, 100, txn_cutoff)?;
     // Fixed-cutoff checks exercise the shared retention expressions on fully replayed actions.
-    // The fixture comparisons above exercise the public factory with real cutoffs.
+    // The fixture comparisons above exercise the public V1 and V2 factories with real cutoffs.
     let plan = writer
         .metadata_planner(ActionSet::ALL)?
         .with_checkpoint_shape(writer.snapshot.checkpoint_info(&engine)?)
@@ -306,6 +341,9 @@ async fn checkpoint_plan_reconciles_all_groups_and_retains_after_replay(
         .project_patch(|patch| patch.drop(VERSION))?
         .build()?;
     let actual = assert_checkpoint_plan(&engine, plan, ActionSet::ALL, &expected)?;
+    if v2 {
+        return Ok(());
+    }
     let result = json_rows(&actual, true)?;
 
     // The relation is directly writable using the existing ParquetHandler. Reload the resulting
@@ -521,6 +559,10 @@ async fn checkpoint_uses_declared_metadata_representations(
 }
 
 #[rstest]
+#[case("v2-checkpoints-json-with-sidecars")]
+#[case("v2-checkpoints-parquet-with-sidecars")]
+#[case("v2-checkpoints-json-without-sidecars")]
+#[case("v2-checkpoints-parquet-without-sidecars")]
 #[case("app-txn-checkpoint")]
 fn checkpoint_source_reads_requested_actions(
     #[case] table: &str,
