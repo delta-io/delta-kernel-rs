@@ -59,6 +59,42 @@ addition to workspace checks. Root workspace commands exclude `datafusion-execut
 
 ## Action safety
 
+Use exact release tags for external actions and commit the generated native GitHub Actions
+lockfile, `.github/workflows/actions.lock`. The runner uses its immutable commits, including
+nested composite dependencies. Every workflow must be onboarded. Reference local actions with
+`$/` so their dependencies are covered too. For `taiki-e/install-action`, use an explicit `tool`
+input instead of tool-specific action tags.
+
+All uses of the same action repository must resolve to one commit, including subactions,
+third-party nested dependencies, and the `action-versions` job's own actions. Different refs
+resolving to the same commit are allowed. When a nested dependency conflicts, select compatible
+parent action releases and align direct uses; do not exclude the nested dependency, even when
+its step is conditional.
+
+Install the pinned native CLI and update the lockfile after changing action references:
+
+```bash
+gh extension install github/gh-actions-lock --pin v0.3.0
+python3 -m pip install --no-deps PyYAML==6.0.3
+GH_ACTIONS_LOCK_REPO_ROOT="$PWD" gh actions-lock --migrate-local-actions --no-interactive
+GH_ACTIONS_LOCK_REPO_ROOT="$PWD" gh actions-lock --verify \
+  --json=valid,findings,workflows,dependencies > /tmp/action-dependencies.json
+python3 .github/scripts/check_action_versions.py /tmp/action-dependencies.json
+python3 -m unittest discover --start-directory .github/scripts --pattern 'test_*.py'
+```
+
+Review the generated lockfile diff along with the workflow changes. Do not edit it manually or
+automatically accept moved refs. `gh actions-lock --verify-local` provides an offline coverage
+check; CI uses `--verify` to check provenance too. The single-version checker validates the native
+report and traverses the lockfile's `uses` graph because the CLI's JSON inventory omits nested
+dependencies. There is no second SHA manifest.
+
+Repository administrators must require the `action-versions` status check for merges and enable
+GitHub's **Require lockfile** Actions policy to prevent untracked workflows from running.
+The native lockfile feature is in public preview. It does not lock container images or the
+internals of external reusable workflows; assess coverage before introducing either dependency
+type. See [GitHub's lockfile documentation](https://gh.io/actions-lockfile).
+
 When writing any github action, consider safety including mitigating common attack
 vectors such as expression injection and pull request target attacks.
 
