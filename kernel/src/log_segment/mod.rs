@@ -1090,7 +1090,7 @@ impl LogSegment {
         );
         // Writers stop producing checkpoint files once adaptiveMetadata is enabled, so a file at or
         // after the action's version is a standalone checkpoint.
-        if let Some(checkpoint_file_version) = self.checkpoint_version.filter(|v| *v >= version) {
+        if let Some(checkpoint_file_version) = self.checkpoint_version().filter(|v| *v >= version) {
             return Err(KernelError::unsupported(format!(
                 "reading the adaptiveMetadata standalone checkpoint at version \
                  {checkpoint_file_version} is not yet supported"

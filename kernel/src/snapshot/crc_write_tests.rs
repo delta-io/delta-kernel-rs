@@ -178,8 +178,9 @@ fn crc_write_resolution_or_validation_error_retains_mode_and_duration(
             unsupported_operation: None,
         };
         let version = snapshot.version();
+        let crc_origin = snapshot.crc.crc_origin;
         Arc::get_mut(&mut snapshot).unwrap().crc =
-            SnapshotCrc::try_new(Some(Arc::new(crc)), version, None)?;
+            SnapshotCrc::try_new(Some(Arc::new(crc)), version, None, crc_origin)?;
     } else {
         // Corrupt the required commit after loading the snapshot so resolution itself fails.
         let path = ParsedLogPath::new_commit(snapshot.table_root(), snapshot.version())?;

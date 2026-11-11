@@ -1755,7 +1755,7 @@ mod tests {
         #[case] corrupt: bool,
         #[case] replay: IncrementalReplay,
         #[case] source: crate::snapshot::CrcSource,
-    ) -> KernelResult<()> {
+    ) -> crate::Result<()> {
         let ctx = setup_incremental_snapshot_test()?;
         setup_test_table_with_commits(ctx.url.as_str(), &ctx.store, 4).await?;
         if let Some(version) = disk_version {
@@ -1766,7 +1766,8 @@ mod tests {
             };
             ctx.store
                 .put(&delta_path_for_version(version, "crc"), content.into())
-                .await?;
+                .await
+                .map_err(KernelError::from)?;
         }
         let snapshot = Snapshot::builder_for(ctx.url.as_str())
             .with_incremental_crc_replay(replay)
@@ -1790,7 +1791,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn crc_provenance_new_disk_baseline_or_fallback(
         #[case] corrupt: bool,
-    ) -> KernelResult<()> {
+    ) -> crate::Result<()> {
         use crate::snapshot::{CrcProvenance, CrcSource};
         let ctx = setup_incremental_snapshot_test()?;
         setup_test_table_with_commits(ctx.url.as_str(), &ctx.store, 5).await?;
@@ -1799,7 +1800,8 @@ mod tests {
                 &delta_path_for_version(1, "crc"),
                 make_test_crc_json(200, 2).to_string().into(),
             )
-            .await?;
+            .await
+            .map_err(KernelError::from)?;
         let snapshot = Snapshot::builder_for(ctx.url.as_str())
             .at_version(2)
             .with_incremental_crc_replay(IncrementalReplay::Unlimited)
@@ -1811,7 +1813,8 @@ mod tests {
         };
         ctx.store
             .put(&delta_path_for_version(3, "crc"), content.into())
-            .await?;
+            .await
+            .map_err(KernelError::from)?;
         let updated = Snapshot::builder_from(snapshot)
             .with_incremental_crc_replay(IncrementalReplay::Unlimited)
             .build(ctx.engine.as_ref())?;

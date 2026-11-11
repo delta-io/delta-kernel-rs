@@ -2096,7 +2096,10 @@ mod tests {
                 ..Default::default()
             })
         });
-        Arc::new(Snapshot::new_with_crc(segment, configuration, crc, true, true).unwrap())
+        Arc::new(
+            Snapshot::new_with_crc(segment, configuration, crc, CrcOrigin::Unknown, true, true)
+                .unwrap(),
+        )
     }
 
     fn engine_with_published_commits() -> SyncEngine {
@@ -2153,6 +2156,7 @@ mod tests {
         // THEN: request publication only for unpublished commits; keep version, metadata, and CRC.
         assert_eq!(*committer.calls.borrow(), expected_calls);
         assert_eq!(published.version(), source.version());
+        assert_eq!(published.crc_provenance(), source.crc_provenance());
         assert_eq!(
             published.table_configuration(),
             source.table_configuration()
@@ -2165,8 +2169,8 @@ mod tests {
         let actual = published.log_segment();
         assert_eq!(actual.listed.max_published_version, Some(2));
         assert_eq!(
-            actual.checkpoint_version,
-            original_segment.checkpoint_version
+            actual.checkpoint_version(),
+            original_segment.checkpoint_version()
         );
         assert_eq!(
             actual.listed.checkpoint_parts,
@@ -2221,15 +2225,19 @@ mod tests {
         let engine = engine_with_published_commits();
         let segment = source
             .log_segment()
-            .try_new_with_checkpoint(create_log_path(
-                "memory:///publication/_delta_log/00000000000000000002.checkpoint.parquet",
-            ))
+            .try_new_with_checkpoint(
+                create_log_path(
+                    "memory:///publication/_delta_log/00000000000000000002.checkpoint.parquet",
+                ),
+                CheckpointType::V2,
+            )
             .unwrap();
         let source = Arc::new(
             Snapshot::new_with_crc(
                 segment,
                 source.table_configuration().clone(),
                 None,
+                CrcOrigin::Unknown,
                 false,
                 false,
             )

@@ -5606,7 +5606,10 @@ async fn test_new_as_published_with_checkpoint_at_snapshot_version(
     let published = updated.as_ref().unwrap_or(&original);
 
     assert!(published.listed.ascending_commit_files.is_empty());
-    assert_eq!(published.checkpoint_version, original.checkpoint_version);
+    assert_eq!(
+        published.checkpoint_version(),
+        original.checkpoint_version()
+    );
     assert_eq!(
         published.listed.checkpoint_parts,
         original.listed.checkpoint_parts

@@ -1468,9 +1468,11 @@ mod tests {
             .with_snapshot_hint(hint)
             .build(engine.as_ref())
             .unwrap_err();
-        assert!(matches!(error, KernelError::SnapshotHint(error)
+        assert!(
+            matches!(error, crate::Error::Kernel(KernelError::SnapshotHint(error))
             if matches!(*error, SnapshotHintError::CrcBeforeCheckpoint { crc, checkpoint: selected }
-                if crc == crc_version && selected == checkpoint)));
+                if crc == crc_version && selected == checkpoint))
+        );
         Ok(())
     }
 

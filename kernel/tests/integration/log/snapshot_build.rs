@@ -383,7 +383,7 @@ async fn built_as_latest_is_inherited_by_derived_snapshots(
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn checkpoint_drops_stale_crc_origin(
     #[values(TableKind::FileSystem, TableKind::CatalogManaged)] kind: TableKind,
-) -> KernelResult<()> {
+) -> delta_kernel::Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
     setup_multi_version_table(&engine, &table_path, kind).await?;
     let base =

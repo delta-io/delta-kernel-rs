@@ -14,10 +14,7 @@ use delta_kernel::last_checkpoint_hint::{LastCheckpointHint, LastCheckpointV2};
 use delta_kernel::log_segment::LogSegment;
 use delta_kernel::path::{LogPathFileType, ParsedLogPath};
 use delta_kernel::snapshot::{CrcSource, IncrementalReplay, PublicationWatermark, Snapshot};
-use delta_kernel::{
-    Engine, EvaluationHandler, FileMeta, FileSlice, JsonHandler, KernelResult, KernelResultIterator,
-    ParquetHandler, StorageHandler,
-};
+use delta_kernel::{FileMeta, FileSlice, KernelResult, KernelResultIterator, StorageHandler};
 use test_utils::table_builder::{LogState, TestTableBuilder};
 use test_utils::{TestCatalogCommitter, compacted_log_path_for_versions, create_log_path};
 use url::Url;
