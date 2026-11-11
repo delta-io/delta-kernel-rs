@@ -61,8 +61,43 @@ explains how that abstraction works.
 
 ## Cancellation
 
-A connector can attach a cancellation token to a scan so long-running reads stop when their caller
-goes away. Kernel carries that token to cancellation-aware storage, JSON, and Parquet operations.
+A connector can attach a cancellation token to a snapshot builder, metadata reader, or scan so
+long-running reads stop when their caller goes away. Kernel carries that token to cancellation-aware
+storage, JSON, and Parquet operations.
+
+### Attaching a token
+
+Attach the token separately to each operation whose storage reads you want to cancel. A metadata
+reader does not inherit the token used to build its `Snapshot`.
+
+```rust,no_run
+# extern crate delta_kernel;
+# use delta_kernel::{CancellationTokenRef, Engine, Snapshot};
+# fn read_metadata(
+#     engine: &dyn Engine,
+#     table_root: &str,
+#     token: CancellationTokenRef,
+# ) -> delta_kernel::Result<()> {
+let snapshot = Snapshot::builder_for(table_root)
+    .with_cancellation_token(token.clone())
+    .build(engine)?;
+
+let reader = snapshot.reader().with_cancellation_token(token.clone());
+let version = reader.get_app_id_version("my-app", engine)?;
+
+let scan = snapshot
+    .scan_builder()
+    .with_cancellation_token(token)
+    .build()?;
+# let _ = (version, scan);
+# Ok(())
+# }
+```
+
+`SnapshotReader` getters remain synchronous and may block. The token applies to handler-backed
+I/O, so a getter may return metadata already held by the `Snapshot` without checking cancellation.
+For more about cancelling scans, see
+[Advanced reads with `scan_metadata()`](../reading/scan_metadata.md#cancelling-a-scan).
 
 See the [Engine operation cancellation contract] for exact behavior and
 [Implementing the Engine trait](../connector/implementing_engine.md#support-cancellation) for the
