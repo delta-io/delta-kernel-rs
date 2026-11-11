@@ -401,7 +401,11 @@ impl<Mode> SnapshotBuilder<Mode> {
         };
 
         let snapshot = if let Some(snapshot_hint) = snapshot_hint {
-            debug!("Restoring snapshot from hint without storage reads");
+            debug!(
+                ?version,
+                ?table_root,
+                "Attempting hint restore without storage reads"
+            );
             snapshot_hint.build(
                 table_root,
                 version,

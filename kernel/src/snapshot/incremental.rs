@@ -327,8 +327,8 @@ impl Snapshot {
             source = ?resolution.source,
             base_crc_version = ?base_crc.as_ref().map(|crc| crc.version),
             crc_at_target = crc_at_version.is_some(),
-            metadata_changed = resolution.metadata.is_some(),
-            protocol_changed = resolution.protocol.is_some(),
+            metadata_resolved = resolution.metadata.is_some(),
+            protocol_resolved = resolution.protocol.is_some(),
             "Resolved incremental snapshot metadata"
         );
 
