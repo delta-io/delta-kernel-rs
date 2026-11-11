@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use futures::TryStreamExt;
 use serde_json::{Value, from_slice, json};
 use tempfile::tempdir;
 #[cfg(feature = "adaptive-metadata-in-dev")]
@@ -13,25 +14,26 @@ use crate::action_reconciliation::{
     ActionReconciliationIterator, ActionReconciliationIteratorState, DEFAULT_RETENTION_SECS,
     deleted_file_retention_timestamp_with_time,
 };
-use crate::actions::{Add, Metadata, Protocol, Remove};
+use crate::actions::deletion_vector::{DeletionVectorDescriptor, DeletionVectorStorageType};
+use crate::actions::{Add, Metadata, Protocol, Remove, TIGHT_BOUNDS};
 use crate::arrow::array::{
     Array, AsArray, Int64Array, MapArray, RecordBatch, StructArray, create_array,
 };
-use crate::arrow::datatypes::{DataType, Field, Schema};
+use crate::arrow::datatypes::{DataType, Field, Int64Type, Schema};
 use crate::checkpoint::{
-    CHECKPOINT_ACTIONS_SCHEMA_V2, CheckpointWriter, LastCheckpointHintStats,
-    create_last_checkpoint_data,
+    CHECKPOINT_ACTIONS_SCHEMA_V2, CheckpointSpec, CheckpointWriter, LastCheckpointHintStats,
+    V2CheckpointConfig, create_last_checkpoint_data,
 };
-#[cfg(feature = "adaptive-metadata-in-dev")]
-use crate::checkpoint::{CheckpointSpec, V2CheckpointConfig};
 use crate::committer::FileSystemCommitter;
 use crate::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt};
 use crate::engine::sync::SyncEngine;
 use crate::log_replay::HasSelectionVector;
-use crate::object_store::ObjectStoreExt as _;
 use crate::object_store::memory::InMemory;
 use crate::object_store::path::Path;
+use crate::object_store::{ObjectStore as _, ObjectStoreExt as _};
+use crate::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use crate::schema::{DataType as KernelDataType, StructField, schema_ref};
+use crate::snapshot::CheckpointWriteResult;
 use crate::table_features::TableFeature;
 use crate::transaction::UpdateTableOperation;
 use crate::transaction::create_table::create_table;
@@ -40,7 +42,7 @@ use crate::unit_test_utils::Action;
 use crate::unit_test_utils::{
     adaptive_metadata_table_configuration, test_schema_flat_with_column_mapping,
 };
-use crate::{FileMeta, KernelError, KernelResult, LogPath, Result, Snapshot};
+use crate::{Engine as _, FileMeta, KernelError, KernelResult, LogPath, Result, Snapshot};
 
 #[rstest::rstest]
 #[case::default_retention(
@@ -1169,6 +1171,295 @@ fn verify_checkpoint_schema_with_partitions(
         );
     } else {
         panic!("add field should be a struct");
+    }
+    Ok(())
+}
+
+#[rstest::rstest]
+#[case::no_dv_support(false, None)]
+#[case::no_dv_support_disabled(false, Some(false))]
+#[case::dv_enabled(true, Some(true))]
+#[case::dv_disabled(true, Some(false))]
+#[case::dv_enablement_unset(true, None)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_checkpoint_tight_bounds_depends_on_dv_protocol_support(
+    #[case] dv_supported: bool,
+    #[case] dv_enabled: Option<bool>,
+    #[values(
+        CheckpointSpec::V1,
+        CheckpointSpec::V2(V2CheckpointConfig::NoSidecar),
+        CheckpointSpec::V2(V2CheckpointConfig::WithSidecar {
+            file_actions_per_sidecar_hint: Some(1),
+        })
+    )]
+    spec: CheckpointSpec,
+    #[values(false, true)] write_json: bool,
+) -> Result<()> {
+    let (store, _) = new_in_memory_store();
+    let engine = SyncEngine::new_with_store(store.clone());
+    let mut features = Vec::new();
+    if dv_supported {
+        features.push(TableFeature::DeletionVectors);
+    }
+    if matches!(spec, CheckpointSpec::V2(_)) {
+        features.push(TableFeature::V2Checkpoint);
+    }
+    let protocol = Protocol::try_new_modern(features.clone(), features)?;
+    let metadata = |enable_dvs: Option<bool>| {
+        let mut config = HashMap::from([
+            (
+                "delta.checkpoint.writeStatsAsJson".into(),
+                write_json.to_string(),
+            ),
+            ("delta.checkpoint.writeStatsAsStruct".into(), "true".into()),
+        ]);
+        if let Some(enabled) = enable_dvs {
+            config.insert("delta.enableDeletionVectors".into(), enabled.to_string());
+        }
+        Metadata::try_new(
+            None,
+            None,
+            schema_ref! { nullable "id": LONG, nullable "name": STRING },
+            vec![],
+            0,
+            config,
+        )
+    };
+    let mut actions = vec![
+        Action::Protocol(protocol),
+        Action::Metadata(metadata(dv_supported.then_some(true))?),
+    ];
+    for bounds in [Some(true), None, Some(false)] {
+        let mut stats = json!({
+            "numRecords": 100,
+            "minValues": {"id": 1, "name": "alice"},
+            "maxValues": {"id": 100, "name": "zoe"},
+            "nullCount": {"id": 0, "name": 5},
+        });
+        if let Some(bounds) = bounds {
+            stats[TIGHT_BOUNDS] = bounds.into();
+        }
+        let deletion_vector = if dv_supported && bounds == Some(false) {
+            Some(DeletionVectorDescriptor::try_new(
+                DeletionVectorStorageType::Inline,
+                "^Bg9^0rr910000000000iXQKl0rr91000f55c8Xg0@@D72lkbi5=-{L",
+                None,
+                44,
+                6,
+            )?)
+        } else {
+            None
+        };
+        actions.push(Action::Add(Add {
+            path: format!("bounds-{bounds:?}.parquet"),
+            data_change: true,
+            stats: Some(stats.to_string()),
+            deletion_vector,
+            ..Default::default()
+        }));
+    }
+    write_commit_to_store(&store, actions, 0).await?;
+
+    for version in 0..=1 {
+        if version == 1 {
+            // The second checkpoint reads file statistics from the first checkpoint after
+            // DV creation is disabled or its enablement property is removed.
+            write_commit_to_store(
+                &store,
+                vec![Action::Metadata(metadata(dv_enabled)?)],
+                version,
+            )
+            .await?;
+        }
+        let snapshot = Snapshot::builder_for("memory:///").build(&engine)?;
+        assert_eq!(snapshot.version(), version);
+        let (result, _) = snapshot.checkpoint(&engine, Some(&spec))?;
+        assert_eq!(result, CheckpointWriteResult::Written);
+
+        let prefix = Path::from("_delta_log");
+        let objects = store
+            .list(Some(&prefix))
+            .try_collect::<Vec<_>>()
+            .await
+            .map_err(KernelError::from)?;
+        let mut observed = HashMap::new();
+        for object in objects {
+            let path = object.location.as_ref();
+            if !path.ends_with(".parquet") || !path.contains(&format!("{version:020}.checkpoint")) {
+                continue;
+            }
+            let bytes = store
+                .get(&object.location)
+                .await
+                .map_err(KernelError::from)?
+                .bytes()
+                .await
+                .map_err(KernelError::from)?;
+            let reader = ParquetRecordBatchReaderBuilder::try_new(bytes)
+                .map_err(KernelError::from)?
+                .build()
+                .map_err(KernelError::from)?;
+            for batch in reader {
+                let batch = batch.map_err(KernelError::from)?;
+                let add = batch.column_by_name("add").unwrap().as_struct();
+                let stats = add.column_by_name("stats_parsed").unwrap().as_struct();
+                let bounds = stats.column_by_name(TIGHT_BOUNDS);
+                assert_eq!(bounds.is_some(), dv_supported);
+                if let Some(bounds) = bounds {
+                    assert_eq!(bounds.data_type(), &DataType::Boolean);
+                    assert!(stats.fields().find(TIGHT_BOUNDS).unwrap().1.is_nullable());
+                }
+                let paths = add.column_by_name("path").unwrap().as_string::<i32>();
+                let num_records = stats
+                    .column_by_name("numRecords")
+                    .unwrap()
+                    .as_primitive::<Int64Type>();
+                for row in 0..batch.num_rows() {
+                    if add.is_null(row) {
+                        continue;
+                    }
+                    assert!(stats.is_valid(row));
+                    assert!(num_records.is_valid(row));
+                    assert_eq!(num_records.value(row), 100);
+                    let bounds = bounds.and_then(|bounds| {
+                        bounds.is_valid(row).then(|| bounds.as_boolean().value(row))
+                    });
+                    observed.insert(paths.value(row).to_string(), bounds);
+                }
+            }
+        }
+        let mut expected = HashMap::from([
+            (
+                "bounds-Some(true).parquet".into(),
+                dv_supported.then_some(true),
+            ),
+            ("bounds-None.parquet".into(), None),
+        ]);
+        expected.insert(
+            "bounds-Some(false).parquet".into(),
+            dv_supported.then_some(false),
+        );
+        assert_eq!(observed, expected);
+    }
+    Ok(())
+}
+
+#[rstest::rstest]
+#[case::wide_file_still_active(false, true)]
+#[case::wide_file_removed(true, true)]
+#[case::json_only(false, false)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_checkpoint_without_dv_support_omits_tight_bounds_and_preserves_json(
+    #[case] remove_wide_file: bool,
+    #[case] write_struct: bool,
+    #[values(false, true)] write_json: bool,
+    #[values(false, true)] from_checkpoint: bool,
+) -> Result<()> {
+    let (store, _) = new_in_memory_store();
+    let engine = SyncEngine::new_with_store(store.clone());
+    write_commit_to_store(
+        &store,
+        vec![
+            create_basic_protocol_action(),
+            create_metadata_with_stats_config(false, true),
+            Action::Add(Add {
+                path: "wide.parquet".into(),
+                data_change: true,
+                stats: Some(
+                    json!({
+                        "numRecords": 100,
+                        "minValues": {"id": 0},
+                        "maxValues": {"id": 200},
+                        "nullCount": {"id": 50},
+                        "tightBounds": false,
+                    })
+                    .to_string(),
+                ),
+                ..Default::default()
+            }),
+        ],
+        0,
+    )
+    .await?;
+    if from_checkpoint {
+        // Construct a checkpoint with the full stats schema to cover structured-only input
+        // written by a producer that includes tightBounds without DV protocol support.
+        let snapshot = Snapshot::builder_for("memory:///").build(&engine)?;
+        let writer = snapshot.create_checkpoint_writer(&engine)?;
+        let context = &writer.schema_context;
+        let (schema, expr) = super::build_checkpoint_transform(
+            &context.stats_config,
+            &writer.read_schema,
+            &context.stats_schema,
+            context.partition_schema.as_ref(),
+        )?;
+        let evaluator = engine.evaluation_handler().new_expression_evaluator(
+            writer.read_schema.clone(),
+            expr,
+            schema.into(),
+        )?;
+        let batches = writer
+            .snapshot
+            .log_segment()
+            .read_actions(&engine, writer.read_schema.clone())?
+            .map(move |batch| evaluator.evaluate(batch?.actions.as_ref()));
+        let size = engine
+            .parquet_handler()
+            .write_parquet_file(writer.checkpoint_path()?, Box::new(batches))?;
+        writer.finalize(
+            &engine,
+            &LastCheckpointHintStats {
+                num_actions: 3,
+                size_in_bytes: i64::try_from(size).unwrap(),
+                num_of_add_files: 1,
+            },
+        )?;
+    }
+    let mut actions = vec![create_metadata_with_stats_config(write_json, write_struct)];
+    if remove_wide_file {
+        actions.push(create_remove_action("wide.parquet"));
+    }
+    write_commit_to_store(&store, actions, 1).await?;
+    let snapshot = Snapshot::builder_for("memory:///").build(&engine)?;
+    assert_eq!(
+        snapshot.checkpoint(&engine, None)?.0,
+        CheckpointWriteResult::Written
+    );
+    assert_eq!(read_last_checkpoint_file(&store).await?["version"], 1);
+    if write_struct || write_json {
+        let path = Path::from("_delta_log/00000000000000000001.checkpoint.parquet");
+        let bytes = store
+            .get(&path)
+            .await
+            .map_err(KernelError::from)?
+            .bytes()
+            .await
+            .map_err(KernelError::from)?;
+        let reader = ParquetRecordBatchReaderBuilder::try_new(bytes)
+            .map_err(KernelError::from)?
+            .build()
+            .map_err(KernelError::from)?;
+        let mut found_add = false;
+        for batch in reader {
+            let batch = batch.map_err(KernelError::from)?;
+            let add = batch.column_by_name("add").unwrap().as_struct();
+            if write_struct {
+                let stats = add.column_by_name("stats_parsed").unwrap().as_struct();
+                assert!(stats.column_by_name(TIGHT_BOUNDS).is_none());
+            }
+            for row in 0..batch.num_rows() {
+                if add.is_valid(row) {
+                    found_add = true;
+                    if write_json {
+                        let stats = add.column_by_name("stats").unwrap().as_string::<i32>();
+                        let stats: Value =
+                            serde_json::from_str(stats.value(row)).map_err(KernelError::from)?;
+                        assert_eq!(stats[TIGHT_BOUNDS], false);
+                    }
+                }
+            }
+        }
+        assert_eq!(found_add, !remove_wide_file);
     }
     Ok(())
 }

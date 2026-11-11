@@ -121,9 +121,9 @@ use crate::action_reconciliation::{
     ActionReconciliationIterator, ActionReconciliationIteratorState, RetentionCalculator,
 };
 use crate::actions::{
-    ADD_FIELD, CHECKPOINT_METADATA_FIELD, CHECKPOINT_METADATA_NAME, CheckpointMetadata,
+    ADD_FIELD, ADD_NAME, CHECKPOINT_METADATA_FIELD, CHECKPOINT_METADATA_NAME, CheckpointMetadata,
     DOMAIN_METADATA_FIELD, METADATA_FIELD, PROTOCOL_FIELD, REMOVE_FIELD, SET_TRANSACTION_FIELD,
-    SIDECAR_FIELD,
+    SIDECAR_FIELD, STATS_PARSED, TIGHT_BOUNDS,
 };
 use crate::engine_data::FilteredEngineData;
 use crate::expressions::Scalar;
@@ -132,6 +132,7 @@ use crate::log_replay::HasSelectionVector;
 use crate::path::{self, ParsedLogPath};
 use crate::schema::{SchemaRef, StructField, lazy_schema_ref};
 use crate::snapshot::SnapshotRef;
+use crate::struct_patch::ProjectionStructPatchBuilder;
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::TableFeature;
 use crate::table_properties::TableProperties;
@@ -492,7 +493,7 @@ impl CheckpointWriter {
         } else {
             (context.stats_schema.clone(), Vec::new())
         };
-        let (output_schema, transform_expr) = build_checkpoint_transform(
+        let (transform_output_schema, transform_expr) = build_checkpoint_transform(
             &context.stats_config,
             &self.read_schema,
             &stats_schema,
@@ -504,8 +505,31 @@ impl CheckpointWriter {
         let evaluator = engine.evaluation_handler().new_expression_evaluator(
             self.read_schema.clone(),
             transform_expr,
-            output_schema.clone().into(),
+            transform_output_schema.clone().into(),
         )?;
+        // Without DV protocol support, writers are expected to supply tight statistics and an
+        // absent tightBounds means true. An upstream writer supplying genuinely wide
+        // statistics violates that assumption; omitting its explicit false can cause
+        // incorrect results for consumers relying on exact statistics. Checkpointing
+        // neither validates nor recomputes those statistics.
+        let (output_schema, projection) = if context.stats_config.write_stats_as_struct
+            && !self
+                .snapshot
+                .table_configuration()
+                .is_feature_supported(&TableFeature::DeletionVectors)
+        {
+            let (schema, expr) = ProjectionStructPatchBuilder::new(&transform_output_schema)
+                .drop_at([ADD_NAME, STATS_PARSED], TIGHT_BOUNDS)
+                .build()?;
+            let projection = engine.evaluation_handler().new_expression_evaluator(
+                transform_output_schema,
+                expr,
+                schema.clone().into(),
+            )?;
+            (schema, Some(projection))
+        } else {
+            (transform_output_schema, None)
+        };
 
         // Apply stats transform to each reconciled batch
         let checkpoint_data = buffered.into_iter().map(Ok).chain(checkpoint_data);
@@ -513,6 +537,11 @@ impl CheckpointWriter {
             let batch = batch_result?;
             let (data, sv) = batch.filtered_data.into_parts();
             let transformed = evaluator.evaluate(data.as_ref())?;
+            let transformed = if let Some(projection) = &projection {
+                projection.evaluate(transformed.as_ref())?
+            } else {
+                transformed
+            };
             Ok(ActionReconciliationBatch {
                 filtered_data: FilteredEngineData::try_new(transformed, sv)?,
                 actions_count: batch.actions_count,
