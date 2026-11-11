@@ -52,6 +52,8 @@ rand = "0.9"
 roaring = "0.11.2"
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = { version = "1", features = ["unbounded_depth"] }
+serde_stacker = "0.1"
+stacker = "0.1"
 strum = { version = "0.28", features = ["derive"] }
 thiserror = "2"
 prost = { version = "0.13", optional = true }

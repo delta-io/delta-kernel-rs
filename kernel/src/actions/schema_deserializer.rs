@@ -18,19 +18,22 @@ pub(super) fn parse(json: &str, recursion_limit: usize) -> KernelResult<StructTy
         remaining: recursion_limit,
         exceeded: &exceeded,
     };
-    StructType::deserialize(budget.wrap(&mut deserializer))
-        .and_then(|schema| deserializer.end().map(|()| schema))
-        .map_err(|error| {
-            if exceeded.get() {
-                KernelError::schema(format!(
-                    "Table schema is too deeply nested: decoding metaData.schemaString \
-                     reached the JSON recursion limit of {recursion_limit}"
-                ))
-                .with_backtrace()
-            } else {
-                schema_json_error(error)
-            }
-        })
+    // The depth budget bounds JSON nesting, not stack use across recursive Serde calls.
+    StructType::deserialize(serde_stacker::Deserializer::new(
+        budget.wrap(&mut deserializer),
+    ))
+    .and_then(|schema| deserializer.end().map(|()| schema))
+    .map_err(|error| {
+        if exceeded.get() {
+            KernelError::schema(format!(
+                "Table schema is too deeply nested: decoding metaData.schemaString \
+                 reached the JSON recursion limit of {recursion_limit}"
+            ))
+            .with_backtrace()
+        } else {
+            schema_json_error(error)
+        }
+    })
 }
 
 // Copying keeps sibling values at the same depth without restoring a shared counter on exit.
@@ -247,9 +250,8 @@ mod tests {
 
     #[rstest]
     #[case::formerly_rejected(160, true)]
-    #[case::boundary(296, true)]
-    #[case::exceeded(297, false)]
-    #[case::well_above_limit(997, false)]
+    #[case::boundary(996, true)]
+    #[case::exceeded(997, false)]
     fn parse_schema_collection_recursion_limit(
         #[values(false, true)] map: bool,
         #[case] depth: usize,
@@ -274,7 +276,7 @@ mod tests {
             assert_eq!(
                 result.unwrap_err().without_backtrace().to_string(),
                 "Schema error: Table schema is too deeply nested: decoding \
-                 metaData.schemaString reached the JSON recursion limit of 300"
+                 metaData.schemaString reached the JSON recursion limit of 1000"
             );
         }
     }
@@ -310,8 +312,7 @@ mod tests {
     fn schema_json_recursion_preserves_serde_handling(
         #[case] prefix: &str,
         #[case] suffix: &str,
-        #[values(0, 1, 123, 124, 125, 127, 128, 129, 253, SCHEMA_RECURSION_LIMIT - 5)]
-        nesting: usize,
+        #[values(0, 1, 123, 124, 125, 127, 128, 129, 253, 300)] nesting: usize,
     ) {
         let json = format!(
             "{prefix}{}0{}{suffix}",
