@@ -127,7 +127,8 @@ fn lower_project(project: &KernelProject, input: &Arc<DFLogicalPlan>) -> DFResul
 /// anti join.
 ///
 /// Join keys with different types follow DataFusion's equality coercion. This can differ from
-/// `SyncPlanExecutor`, which compares type-specific Arrow row encodings without coercion.
+/// `SyncPlanExecutor`, which only widens numeric keys losslessly and rejects other type
+/// differences.
 ///
 /// # Errors
 /// Returns an error if the key counts differ, a key cannot be lowered, or DataFusion rejects the

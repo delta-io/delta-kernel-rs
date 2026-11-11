@@ -24,7 +24,9 @@ use crate::arrow::array::{
     Array, ArrayRef, BooleanArray, Int64Array, ListArray, RecordBatch, StringArray,
 };
 use crate::arrow::compute::filter_record_batch;
-use crate::arrow::datatypes::Schema as ArrowSchema;
+use crate::arrow::datatypes::{
+    Field as ArrowField, Schema as ArrowSchema, SchemaRef as ArrowSchemaRef,
+};
 use crate::arrow::row::{OwnedRow, RowConverter, SortField};
 use crate::engine::arrow_conversion::{TryFromArrow as _, TryIntoArrow as _};
 use crate::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt};
@@ -41,7 +43,7 @@ use crate::plans::ir::nodes::{
 };
 use crate::plans::ir::plan::{Plan, PlanNode};
 use crate::plans::{IoOperation, Operation, PlanExecutor, PlanResult, ScopedPlanExecutor};
-use crate::schema::{ArrayType, DataType, SchemaRef, StructType};
+use crate::schema::{ArrayType, DataType, PrimitiveType, SchemaRef, StructField, StructType};
 use crate::{
     EvaluationHandler as _, FileMeta, FilteredEngineData, KernelError, KernelResult,
     KernelResultIterator, StorageHandler as _,
@@ -597,25 +599,136 @@ fn eval_filter(predicate: PredicateRef, input: &[RecordBatch]) -> KernelResult<V
         .collect()
 }
 
+/// Keeps the probe rows whose keys match a build row's keys, or the rows with no match when
+/// inverted. NULL keys match each other, and each probe/build key pair is first cast to a common
+/// type, so INT 1 matches LONG 1 (see [`common_key_type`]).
 fn eval_semi_join(
     join: SemiJoin,
     probe: &[RecordBatch],
     build: &[RecordBatch],
 ) -> KernelResult<Vec<RecordBatch>> {
+    if join.probe_keys.len() != join.build_keys.len() {
+        return Err(KernelError::generic(format!(
+            "SemiJoin has {} probe keys but {} build keys",
+            join.probe_keys.len(),
+            join.build_keys.len()
+        )));
+    }
+    // An input without batches has no key types, but also no rows to compare.
+    let key_schema = match (probe.first(), build.first()) {
+        (Some(probe), Some(build)) => Some(common_key_schema(&join, probe, build)?),
+        _ => None,
+    };
     let mut build_keys = HashSet::new();
     for batch in build {
-        build_keys.extend(encode_keys_as_rows(batch, &join.build_keys)?);
+        let keys = extract_keys(batch, &join.build_keys, key_schema.as_ref())?;
+        build_keys.extend(encode_arrays_as_rows(&keys, batch.num_rows())?);
     }
 
     probe
         .iter()
         .map(|batch| {
-            let keep = encode_keys_as_rows(batch, &join.probe_keys)?
+            let keys = extract_keys(batch, &join.probe_keys, key_schema.as_ref())?;
+            let keep = encode_arrays_as_rows(&keys, batch.num_rows())?
                 .into_iter()
                 .map(|key| join.inverted != build_keys.contains(&key));
             Ok(filter_record_batch(batch, &BooleanArray::from_iter(keep))?)
         })
         .collect()
+}
+
+/// Returns the schema that both inputs' keys are cast to: the common type of each probe/build key
+/// pair, read from one batch of each input.
+fn common_key_schema(
+    join: &SemiJoin,
+    probe: &RecordBatch,
+    build: &RecordBatch,
+) -> KernelResult<ArrowSchemaRef> {
+    let fields: Vec<_> = join
+        .probe_keys
+        .iter()
+        .zip(&join.build_keys)
+        .map(|(probe_key, build_key)| {
+            let probe_type =
+                DataType::try_from_arrow(extract_column(probe, probe_key)?.data_type())?;
+            let build_type =
+                DataType::try_from_arrow(extract_column(build, build_key)?.data_type())?;
+            let common = common_key_type(&probe_type, &build_type).ok_or_else(|| {
+                KernelError::generic(format!(
+                    "SemiJoin keys have no common type: probe key `{probe_key}` is {probe_type}, \
+                     build key `{build_key}` is {build_type}"
+                ))
+            })?;
+            Ok::<_, KernelError>(ArrowField::new(
+                probe_key.to_string(),
+                (&common).try_into_arrow()?,
+                true,
+            ))
+        })
+        .try_collect()?;
+    Ok(Arc::new(ArrowSchema::new(fields)))
+}
+
+/// Returns the type that a probe key of type `probe` and a build key of type `build` are both cast
+/// to before comparison, or `None` if they have no common type.
+///
+/// As SQL equality does, a numeric key whose type widens losslessly to the other's (see
+/// [`PrimitiveType::can_widen_to`]) is widened, and decimals are rescaled to a scale that holds
+/// both. Struct keys need the same field names in the same order; nullability is ignored. Other
+/// differences, such as STRING and BINARY, have no common type: comparing their Arrow row
+/// encodings uncast could match unrelated values.
+fn common_key_type(probe: &DataType, build: &DataType) -> Option<DataType> {
+    match (probe, build) {
+        (
+            DataType::Primitive(PrimitiveType::Decimal(p)),
+            DataType::Primitive(PrimitiveType::Decimal(b)),
+        ) => {
+            let scale = p.scale().max(b.scale());
+            let integer_digits = (p.precision() - p.scale()).max(b.precision() - b.scale());
+            DataType::decimal(integer_digits + scale, scale).ok()
+        }
+        // Kernel reads either timestamp type as the other, but comparing them needs a time zone.
+        (
+            DataType::Primitive(PrimitiveType::Timestamp | PrimitiveType::TimestampNtz),
+            DataType::Primitive(PrimitiveType::Timestamp | PrimitiveType::TimestampNtz),
+        ) => (probe == build).then(|| probe.clone()),
+        (DataType::Primitive(p), DataType::Primitive(b)) if b.can_widen_to(p) => {
+            Some(probe.clone())
+        }
+        (DataType::Primitive(p), DataType::Primitive(b)) if p.can_widen_to(b) => {
+            Some(build.clone())
+        }
+        (DataType::Struct(p), DataType::Struct(b)) if p.num_fields() == b.num_fields() => {
+            let fields = p.fields().zip(b.fields()).map(|(p, b)| {
+                let data_type = common_key_type(p.data_type(), b.data_type())?;
+                let nullable = p.is_nullable() || b.is_nullable();
+                (p.name() == b.name()).then(|| StructField::new(p.name(), data_type, nullable))
+            });
+            let fields: Option<Vec<_>> = fields.collect();
+            StructType::try_new(fields?).ok().map(DataType::from)
+        }
+        (DataType::Array(p), DataType::Array(b)) => {
+            let element = common_key_type(p.element_type(), b.element_type())?;
+            Some(ArrayType::new(element, p.contains_null() || b.contains_null()).into())
+        }
+        _ => (probe == build).then(|| probe.clone()),
+    }
+}
+
+/// Extracts the `keys` columns of `batch`, cast to `key_schema` if given.
+fn extract_keys(
+    batch: &RecordBatch,
+    keys: &[ColumnName],
+    key_schema: Option<&ArrowSchemaRef>,
+) -> KernelResult<Vec<ArrayRef>> {
+    let arrays = keys
+        .iter()
+        .map(|key| extract_column(batch, key))
+        .try_collect()?;
+    match key_schema {
+        Some(schema) => coerce_columns_to_schema(arrays, schema),
+        None => Ok(arrays),
+    }
 }
 
 /// Builds output columns in `schema` order: each column named in `file_constant_columns` is
@@ -649,14 +762,15 @@ pub(super) fn encode_keys_as_rows(
     batch: &RecordBatch,
     columns: &[ColumnName],
 ) -> KernelResult<Vec<OwnedRow>> {
-    if columns.is_empty() {
+    encode_arrays_as_rows(&extract_keys(batch, columns, None)?, batch.num_rows())
+}
+
+/// Encodes `arrays`, each `num_rows` long, as one key per row; see [`encode_keys_as_rows`].
+fn encode_arrays_as_rows(arrays: &[ArrayRef], num_rows: usize) -> KernelResult<Vec<OwnedRow>> {
+    if arrays.is_empty() {
         let key = RowConverter::new(vec![])?.parser().parse(&[]).owned();
-        return Ok(vec![key; batch.num_rows()]);
+        return Ok(vec![key; num_rows]);
     }
-    let arrays: Vec<_> = columns
-        .iter()
-        .map(|name| extract_column(batch, name))
-        .try_collect()?;
     // Constructing RowConverter requires a `SortField`. We initialize default, unsorted field for
     // each column.
     let sort_fields = arrays
@@ -664,7 +778,7 @@ pub(super) fn encode_keys_as_rows(
         .map(|array| SortField::new(array.data_type().clone()))
         .collect();
     let converter = RowConverter::new(sort_fields)?;
-    let rows = converter.convert_columns(&arrays)?;
+    let rows = converter.convert_columns(arrays)?;
     Ok(rows.iter().map(|row| row.owned()).collect())
 }
 
@@ -713,7 +827,7 @@ fn values_to_record_batch(values: Values) -> KernelResult<RecordBatch> {
 #[cfg(test)]
 mod tests {
     use rstest::rstest;
-    use test_utils::assert_batches_sorted_eq;
+    use test_utils::{assert_batches_sorted_eq, assert_result_error_with_message};
     use url::Url;
 
     use super::*;
@@ -1256,6 +1370,145 @@ mod tests {
         assert_eq!(keys.len(), 3);
         assert!(keys.iter().all(|key| key == &keys[0]));
         Ok(())
+    }
+
+    #[rstest]
+    #[case::integer_widens_to_long(
+        (DataType::INTEGER, vec![1i32.into(), 2i32.into(), Scalar::Null(DataType::INTEGER)]),
+        (DataType::LONG, vec![1i64.into(), Scalar::Null(DataType::LONG)]),
+        vec![0, 2]
+    )]
+    #[case::build_key_widens_to_probe_type(
+        (DataType::LONG, vec![1i64.into(), 2i64.into()]),
+        (DataType::INTEGER, vec![2i32.into()]),
+        vec![1]
+    )]
+    #[case::float_widens_to_double(
+        (DataType::FLOAT, vec![0.5f32.into(), 1.5f32.into()]),
+        (DataType::DOUBLE, vec![1.5f64.into()]),
+        vec![1]
+    )]
+    #[case::decimals_rescale(
+        (DataType::decimal(5, 1).unwrap(), vec![decimal(10, 5, 1), decimal(25, 5, 1)]),
+        (DataType::decimal(6, 2).unwrap(), vec![decimal(100, 6, 2)]),
+        vec![0]
+    )]
+    #[case::struct_fields_widen(
+        struct_keys("a", DataType::INTEGER, false, [1i32.into(), 2i32.into()]),
+        struct_keys("a", DataType::LONG, true, [2i64.into()]),
+        vec![1]
+    )]
+    fn semi_join_compares_keys_widened_to_a_common_type(
+        #[case] probe: (DataType, Vec<Scalar>),
+        #[case] build: (DataType, Vec<Scalar>),
+        #[case] semi_join_ids: Vec<i64>,
+        #[values(false, true)] inverted: bool,
+    ) -> KernelResult<()> {
+        let probe_ids = 0..probe.1.len() as i64;
+        let expected: Vec<_> = probe_ids
+            .filter(|id| semi_join_ids.contains(id) != inverted)
+            .collect();
+        assert_eq!(semi_join_kept_ids(probe, build, inverted)?, expected);
+        Ok(())
+    }
+
+    /// Each pair has equal Arrow row encodings, so comparing the keys uncast would match them.
+    #[rstest]
+    #[case::string_and_binary(
+        (DataType::STRING, vec!["a".into()]),
+        (DataType::BINARY, vec![Scalar::Binary(b"a".to_vec())])
+    )]
+    #[case::integer_and_date(
+        (DataType::INTEGER, vec![5i32.into()]),
+        (DataType::DATE, vec![Scalar::Date(5)])
+    )]
+    #[case::struct_field_names(
+        struct_keys("a", DataType::LONG, true, [7i64.into()]),
+        struct_keys("b", DataType::LONG, true, [7i64.into()])
+    )]
+    #[case::timestamp_and_timestamp_ntz(
+        (DataType::TIMESTAMP, vec![Scalar::Timestamp(0)]),
+        (DataType::TIMESTAMP_NTZ, vec![Scalar::TimestampNtz(0)])
+    )]
+    fn semi_join_rejects_keys_without_a_common_type(
+        #[case] probe: (DataType, Vec<Scalar>),
+        #[case] build: (DataType, Vec<Scalar>),
+    ) {
+        assert_result_error_with_message(
+            semi_join_kept_ids(probe, build, false),
+            "SemiJoin keys have no common type",
+        );
+    }
+
+    #[test]
+    fn semi_join_rejects_mismatched_key_counts() -> KernelResult<()> {
+        let batches = [RecordBatch::try_from_iter([(
+            "k",
+            Arc::new(Int64Array::from(vec![1])) as ArrayRef,
+        )])?];
+        let join = SemiJoin {
+            inverted: false,
+            probe_keys: vec![column_name!("k")],
+            build_keys: vec![],
+        };
+        assert_result_error_with_message(
+            eval_semi_join(join, &batches, &batches),
+            "SemiJoin has 1 probe keys but 0 build keys",
+        );
+        Ok(())
+    }
+
+    /// Runs a semi or anti join of probe rows `(id, k)`, with `id` counting from 0, against build
+    /// rows `(k)`, and returns the `id`s of the probe rows it keeps.
+    fn semi_join_kept_ids(
+        (probe_type, probe_keys): (DataType, Vec<Scalar>),
+        (build_type, build_keys): (DataType, Vec<Scalar>),
+        inverted: bool,
+    ) -> KernelResult<Vec<i64>> {
+        let probe_rows = probe_keys
+            .into_iter()
+            .zip(0i64..)
+            .map(|(key, id)| vec![id.into(), key])
+            .collect();
+        let probe = PlanBuilder::values(
+            schema_ref! { not_null "id": LONG, nullable "k": (probe_type) },
+            probe_rows,
+        )?;
+        let build_rows = build_keys.into_iter().map(|key| vec![key]).collect();
+        let build = PlanBuilder::values(schema_ref! { nullable "k": (build_type) }, build_rows)?;
+        let keys = || [column_name!("k")];
+        let join = if inverted {
+            probe.anti_join(build, keys(), keys())?
+        } else {
+            probe.semi_join(build, keys(), keys())?
+        };
+        let batches = SyncPlanExecutor::default().eval_plan(join.build()?, None)?;
+        Ok(batches
+            .iter()
+            .flat_map(|batch| {
+                let ids = batch.column(0).as_any().downcast_ref::<Int64Array>();
+                ids.unwrap().values().to_vec()
+            })
+            .collect())
+    }
+
+    /// Returns the type `struct<name>`, with the field of `data_type`, and one key per value.
+    fn struct_keys(
+        name: &str,
+        data_type: DataType,
+        nullable: bool,
+        values: impl IntoIterator<Item = Scalar>,
+    ) -> (DataType, Vec<Scalar>) {
+        let fields = vec![StructField::new(name, data_type, nullable)];
+        let keys = values
+            .into_iter()
+            .map(|value| Scalar::Struct(StructData::try_new(fields.clone(), vec![value]).unwrap()))
+            .collect();
+        (StructType::try_new(fields).unwrap().into(), keys)
+    }
+
+    fn decimal(bits: i128, precision: u8, scale: u8) -> Scalar {
+        Scalar::decimal(bits, precision, scale).unwrap()
     }
 
     fn null_dv() -> Scalar {
