@@ -414,7 +414,7 @@ pub extern "C" fn visit_expression_literal_interval_day_time(
     state: &mut KernelExpressionVisitorState,
     value: i64,
 ) -> usize {
-    wrap_expression(state, lit(Scalar::IntervalDayTime(value)))
+    wrap_expression(state, lit(Scalar::IntervalDayTime(value.into())))
 }
 
 /// visit a binary literal expression
@@ -568,7 +568,7 @@ impl NullTypeTag {
                 PrimitiveType::Timestamp => (Self::Timestamp, 0, 0),
                 PrimitiveType::TimestampNtz => (Self::TimestampNtz, 0, 0),
                 PrimitiveType::IntervalYearMonth(_) => (Self::IntervalYearMonth, 0, 0),
-                PrimitiveType::IntervalDayTime => (Self::IntervalDayTime, 0, 0),
+                PrimitiveType::IntervalDayTime(_) => (Self::IntervalDayTime, 0, 0),
                 PrimitiveType::Decimal(dt) => (Self::Decimal, dt.precision(), dt.scale()),
                 // Void has no dedicated FFI tag. The current predicate-construction path is
                 // not expected to produce a void-typed literal null; if one ever reaches this
@@ -911,7 +911,9 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
     use delta_kernel::expressions::{MapToStructOptions, Scalar, col, lit};
-    use delta_kernel::schema::{ArrayType, DataType, IntervalYearToMonthType, MapType, schema};
+    use delta_kernel::schema::{
+        ArrayType, DataType, IntervalDayToSecondType, IntervalYearToMonthType, MapType, schema,
+    };
     use rstest::rstest;
 
     use super::*;
@@ -980,6 +982,8 @@ mod tests {
     #[case(DataType::TIMESTAMP_NTZ, NullTypeTag::TimestampNtz, 0, 0)]
     #[case(DataType::INTERVAL_YEAR_MONTH, NullTypeTag::IntervalYearMonth, 0, 0)]
     #[case(DataType::INTERVAL_DAY_TIME, NullTypeTag::IntervalDayTime, 0, 0)]
+    #[case(DataType::INTERVAL_DAY, NullTypeTag::IntervalDayTime, 0, 0)]
+    #[case(DataType::INTERVAL_HOUR_MINUTE, NullTypeTag::IntervalDayTime, 0, 0)]
     fn from_data_type_primitive(
         #[case] dt: DataType,
         #[case] expected_tag: NullTypeTag,
@@ -1056,6 +1060,14 @@ mod tests {
         assert_eq!(
             NullTypeTag::IntervalYearMonth.to_data_type(0, 0).unwrap(),
             DataType::INTERVAL_YEAR_MONTH
+        );
+    }
+
+    #[test]
+    fn interval_day_time_null_tag_reconstructs_full_range() {
+        assert_eq!(
+            NullTypeTag::IntervalDayTime.to_data_type(0, 0).unwrap(),
+            DataType::INTERVAL_DAY_TIME
         );
     }
 
@@ -1186,21 +1198,22 @@ mod tests {
 
     #[rstest]
     #[case(Scalar::interval_year_month(17, IntervalYearToMonthType::IntervalYearToMonth).unwrap())]
-    #[case(Scalar::IntervalDayTime(1_234_567))]
+    #[case(Scalar::interval_day_time(1_234_567, IntervalDayToSecondType::IntervalDayToSecond).unwrap())]
+    #[case(Scalar::interval_day_time(1, IntervalDayToSecondType::IntervalDayToSecond).unwrap())]
     #[case(Scalar::interval_year_month(-13, IntervalYearToMonthType::IntervalYearToMonth).unwrap())]
     #[case(Scalar::interval_year_month(i32::MIN, IntervalYearToMonthType::IntervalYearToMonth).unwrap())]
     #[case(Scalar::interval_year_month(i32::MAX, IntervalYearToMonthType::IntervalYearToMonth).unwrap())]
-    #[case(Scalar::IntervalDayTime(-86_400_000_000))]
-    #[case(Scalar::IntervalDayTime(i64::MIN))]
-    #[case(Scalar::IntervalDayTime(i64::MAX))]
+    #[case(Scalar::interval_day_time(-86_400_000_000, IntervalDayToSecondType::IntervalDayToSecond).unwrap())]
+    #[case(Scalar::interval_day_time(i64::MIN, IntervalDayToSecondType::IntervalDayToSecond).unwrap())]
+    #[case(Scalar::interval_day_time(i64::MAX, IntervalDayToSecondType::IntervalDayToSecond).unwrap())]
     fn interval_literal_visitors_build_interval_scalars(#[case] expected: Scalar) {
         let mut state = KernelExpressionVisitorState::default();
         let id = match expected {
             Scalar::IntervalYearMonth(ref value) => {
                 visit_expression_literal_interval_year_month(&mut state, value.months())
             }
-            Scalar::IntervalDayTime(value) => {
-                visit_expression_literal_interval_day_time(&mut state, value)
+            Scalar::IntervalDayTime(ref value) => {
+                visit_expression_literal_interval_day_time(&mut state, value.micros())
             }
             _ => unreachable!(),
         };
