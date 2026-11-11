@@ -96,7 +96,8 @@ optional = true
 [features]
 # no default features
 default = []
-# internal-api will make everything marked #[internal_api] public.
+# Makes every `#[internal_api]` item public, such as `SnapshotBuilder::with_snapshot_hint`. These
+# APIs are unstable.
 internal-api = []
 # prettyprint enables Arrow pretty-print helpers (test/example oriented).
 prettyprint = ["arrow_59?/prettyprint", "arrow_60?/prettyprint"]
@@ -105,19 +106,23 @@ test-utils = ["prettyprint", "dep:futures"]
 # integration-test turns on a particularly heavy test for hdfs-object-store
 integration-test = ["hdfs-native-object-store/integration-test"]
 
-# The default versions for arrow/parquet/object_store
+# Arrow version selection, including the matching parquet and object_store versions. Kernel
+# supports the two newest Arrow major versions, and `arrow` selects the newest. Kernel's core APIs
+# do not depend on Arrow; the default engine requires one version.
 arrow = ["arrow-60"] # latest arrow version
 need-arrow = [] # need-arrow is a marker that the feature needs arrow dep
 
 arrow-59 = ["dep:arrow_59", "dep:parquet_59", "dep:object_store_13"]
 arrow-60 = ["dep:arrow_60", "dep:parquet_60", "dep:object_store_14"]
+# Arrow interop features, both enabled by `default-engine-base`.
 arrow-conversion = ["need-arrow"]
 arrow-expression = ["need-arrow", "dep:chrono-tz"]
 
 # Schema diffing functionality (experimental)
 schema-diff = []
 
-# Declarative plan IR (experimental).
+# Experimental declarative-plan IR (`kernel/src/plans/`) and the prost wire format that mirrors it
+# (`kernel/proto/`). Enables `internal-api`, but not Arrow.
 declarative-plans = ["internal-api", "dep:prost", "dep:prost-build"]
 
 # Sources a prebuilt `protoc` for the codegen `declarative-plans` runs, so the build needs no
@@ -125,16 +130,26 @@ declarative-plans = ["internal-api", "dep:prost", "dep:prost-build"]
 # a build that pins a hermetic toolchain cannot use a downloaded binary.
 vendored-protoc = ["dep:protoc-bin-vendored"]
 
-# Experimental, temporary feature flag guarding the in-progress CHECK constraints support (see
-# `check-constraints-in-dev` in AGENTS.md). TODO(#2896): remove once full support ships.
+# Experimental, temporary feature flag guarding the in-progress CHECK constraints support.
+# TODO(#2896): remove once full support ships.
+# Without it, kernel blocks writes to tables that support the `checkConstraints` writer feature,
+# including legacy writer version 3 and above. With it, kernel exposes each constraint's raw SQL
+# through `check_constraints()` on `Snapshot` and `Transaction`, and on a constrained table
+# `write_state` and every commit require `Transaction::ack_check_constraints`. Kernel does not
+# evaluate constraint SQL; enforcement is the connector's responsibility. Also gates the internal
+# SQL tokenizer and parser. CREATE TABLE rejects `delta.constraints.*` properties in every build.
 check-constraints-in-dev = []
 # Enables checkpointProtection support.
 checkpoint-protection = []
 # Experimental, temporary, test-only feature flag guarding the in-progress adaptiveMetadata
 # (Iceberg V4 adaptive metadata tree) work. TODO(#2866): remove once full support ships.
+# Without it, kernel blocks reads and writes of tables that list `adaptiveMetadata-preview`, and
+# writes of tables that list `icebergNativeV4-preview`.
 adaptive-metadata-in-dev = []
 # Experimental, temporary, test-only feature flag guarding the in-progress geospatial
 # (geometry/geography) type work. TODO(#2949): remove once full geo support ships.
+# Without it, kernel rejects any table that lists `geospatial`. With it, scans and CDF work, but
+# writes are still blocked.
 geo-type-in-dev = []
 # Enables experimental user-defined schema types.
 udt-in-dev = []

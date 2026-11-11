@@ -77,6 +77,9 @@ impl ReportGeneratorLayer {
     /// Apply `record` to the visitor stashed on `span`, then drain its pending warnings. Warnings
     /// must be emitted *after* the `extensions_mut` lock is released; calling `warn!()` while
     /// holding it would re-enter the layer and deadlock.
+    ///
+    /// `on_new_span` holds no extension lock during `attrs.record()`, so it may call `warn!()`
+    /// directly. `on_event`'s visitor does no warning-eligible work, so it may run under the lock.
     fn drain_into_visitor<S>(
         span: Option<tracing_subscriber::registry::SpanRef<'_, S>>,
         record: impl FnOnce(&mut EventVisitor),

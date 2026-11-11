@@ -111,8 +111,7 @@ set), `data_skipping.rs` (rewrite predicates against min/max/nullCount stats and
 - `scan.execute(engine)`: kernel handles everything end-to-end, returns `EngineData`
 - `scan.scan_metadata(engine)`: returns file list + transforms; connector reads files and
   calls `transform_to_logical` / `DvInfo::get_selection_vector`
-- `scan.parallel_scan_metadata(engine)`: two-phase distributed log replay (requires the
-  `internal-api` feature)
+- `scan.parallel_scan_metadata(engine)`: two-phase distributed log replay
 
 **Incremental read:** `Snapshot::incremental_scan_builder(base_version)` streams the file-action
 diff over `(base_version, target_version]`: live Adds as a `FilteredEngineData` iterator
