@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use delta_kernel_derive::internal_api;
-use tracing::{info, instrument};
+use tracing::{debug, info, instrument};
 
 use crate::cancellation::CancellationTokenRef;
 use crate::engine::CancellableEngine;
@@ -401,6 +401,7 @@ impl<Mode> SnapshotBuilder<Mode> {
         };
 
         let snapshot = if let Some(snapshot_hint) = snapshot_hint {
+            debug!("Restoring snapshot from hint without storage reads");
             snapshot_hint.build(
                 table_root,
                 version,
@@ -429,6 +430,11 @@ impl<Mode> SnapshotBuilder<Mode> {
             let built_as_latest = version.is_none() || version == max_catalog_version;
 
             if let Some(table_root) = table_root {
+                debug!(
+                    ?effective_version,
+                    ?incremental_replay,
+                    "Loading snapshot from storage"
+                );
                 let table_url = try_parse_uri(&table_root)
                     .map_err(|error| classify_table_root_error(&table_root, error))?;
                 let log_segment = LogSegment::for_snapshot(
@@ -459,6 +465,13 @@ impl<Mode> SnapshotBuilder<Mode> {
                     )
                     .into());
                 };
+                debug!(
+                    from_version = existing_snapshot.version(),
+                    ?effective_version,
+                    ?incremental_replay,
+                    ?checkpoint_handling,
+                    "Updating existing snapshot"
+                );
                 Snapshot::try_new_from(
                     existing_snapshot,
                     log_tail,
