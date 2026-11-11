@@ -43,6 +43,8 @@ Assuming you're running in the directory of this example:
 
 To select specific columns you need a `--` after the column list specification.
 
-- Read `letter` and `data` columns from the `multi_partitioned` dat table:
+Build the pinned DAT corpus with `cargo build -p acceptance` from the repository root.
 
-`cargo run -- --columns letter,data -- ../../../acceptance/tests/dat/out/reader_tests/generated/multi_partitioned/delta/`
+- Read `id` and `value` columns from the `reads_oss_partitioned` DAT table:
+
+`cargo run -- --columns id,value -- ../../../acceptance/workloads/reads_oss_partitioned/delta/`

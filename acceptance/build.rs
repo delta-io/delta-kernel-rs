@@ -1,8 +1,7 @@
-//! Build script for DAT and acceptance workload specs
+//! Build script for acceptance workload specs and table fixtures.
 
 use std::env;
-use std::fs::File;
-use std::io::{BufReader, BufWriter, Read, Write};
+use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -12,18 +11,14 @@ use tar::Archive;
 use ureq::tls::{RootCerts, TlsConfig, TlsProvider};
 use ureq::{Agent, Proxy};
 
-const DAT_EXISTS_FILE_CHECK: &str = "tests/dat/.done";
-const DAT_OUTPUT_FOLDER: &str = "tests/dat";
-const DAT_VERSION: &str = "0.0.3";
 const ACCEPTANCE_WORKLOADS_RELEASE: &str = "0.0.7-preview";
 const ACCEPTANCE_WORKLOADS_VERSION: &str = "0.0.7";
 const ACCEPTANCE_WORKLOADS_ARCHIVE_ENV: &str = "DELTA_ACCEPTANCE_WORKLOADS_ARCHIVE";
 const DOWNLOAD_ATTEMPTS: usize = 3;
 
-// SHA-256 of the release assets. Each download is otherwise trusted purely on TLS; verifying these
-// digests before extraction stops a tampered or MITM'd tarball from being unpacked to disk. Update
+// SHA-256 of the release asset. Each download is otherwise trusted purely on TLS; verifying this
+// digest before extraction stops a tampered or MITM'd tarball from being unpacked to disk. Update
 // alongside the version constants above.
-const DAT_CHECKSUM: &str = "19c045bc6f4e8531d1985d0f7bb156d788e65078b435d613c8e4a9c753b4a982";
 const WORKLOAD_CHECKSUM: &str = "6d86cada9aa6070cc23a77e3704af095a2ed838c3c198f3a5c39c7d9868f6eeb";
 
 /// Workloads to skip on Windows due to invalid filename characters.
@@ -36,27 +31,7 @@ const WINDOWS_SKIP_WORKLOADS: &[&str] = &[
 ];
 
 fn main() {
-    if !Path::new(DAT_EXISTS_FILE_CHECK).exists() {
-        let tarball_url = format!(
-            "https://github.com/delta-incubator/dat/releases/download/v{DAT_VERSION}/deltalake-dat-v{DAT_VERSION}.tar.gz"
-        );
-        let tarball_data = download_tarball(&tarball_url, DAT_CHECKSUM);
-        extract_dat_tarball(&tarball_data);
-        let mut done_file = BufWriter::new(
-            File::create(DAT_EXISTS_FILE_CHECK).expect("Failed to create legacy DAT marker"),
-        );
-        write!(done_file, "done").expect("Failed to write legacy DAT marker");
-    }
     extract_acceptance_workloads();
-}
-
-fn extract_dat_tarball(tarball_data: &[u8]) {
-    let tarball = GzDecoder::new(BufReader::new(tarball_data));
-    let mut archive = Archive::new(tarball);
-    std::fs::create_dir_all(DAT_OUTPUT_FOLDER).expect("Failed to create legacy DAT directory");
-    archive
-        .unpack(DAT_OUTPUT_FOLDER)
-        .expect("Failed to unpack legacy DAT archive");
 }
 
 fn download_tarball(url: &str, expected_checksum: &str) -> Vec<u8> {
