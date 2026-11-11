@@ -2,8 +2,7 @@ use std::sync::{Arc, LazyLock};
 
 use crate::actions::deletion_vector::{DeletionVectorDescriptor, DeletionVectorStorageType};
 use crate::amt_path_util::{
-    location_checks, parse_absolute_amt_location, raw_amt_location_from_uri,
-    validate_table_relative,
+    location_check, parse_absolute_amt_location, raw_amt_location_from_uri, validate_table_relative,
 };
 use crate::content_tree::conditions::{Check, diagnostic};
 use crate::content_tree::{
@@ -137,11 +136,6 @@ pub(crate) fn deletion_vector_checks() -> Vec<Check> {
             value(name).le(lit(high)),
         ))
     };
-    let [not_table_relative, dot_segment] = location_checks(
-        field(LOCATION),
-        absent_or,
-        ["DeletionVectorNotTableRelative", "DeletionVectorDotSegment"],
-    );
     vec![
         Check::new(
             "EncryptedDeletionVector",
@@ -176,8 +170,7 @@ pub(crate) fn deletion_vector_checks() -> Vec<Check> {
             vec![field(LOCATION), field(DV_INFO_CARDINALITY)],
             |values| invalid_deletion_vector(values, "cardinality", "is negative"),
         ),
-        not_table_relative,
-        dot_segment,
+        location_check(field(LOCATION), absent_or, "InvalidDeletionVectorLocation"),
     ]
 }
 
