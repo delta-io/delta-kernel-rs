@@ -6,7 +6,7 @@
 use url::Url;
 
 use crate::content_tree::LOCATION;
-use crate::content_tree::conditions::{Check, ConditionErrorFn};
+use crate::content_tree::conditions::Check;
 use crate::expressions::{ColumnName, Expression, Predicate, UnaryExpressionOp, lit};
 use crate::path_encoding::uri_encode_path;
 use crate::uri_reference::{scheme_len, uri_decode_location, uri_encode_location};
@@ -150,41 +150,27 @@ fn encode_and_join(path: &str, table_root: &Url) -> KernelResult<Url> {
     })
 }
 
-/// The checks that an AMT location `column` is absolute or table-relative (see
-/// [`validate_table_relative`]) and has no `.` or `..` segment (see [`reject_dot_segments`]):
-/// the condition forms of those rules, reporting their errors. `guard` wraps each predicate, e.g.
-/// to pass rows without a location. `ids` name the two checks.
-pub(crate) fn location_checks(
+/// The check, named `id`, that an AMT location `column` is absolute or table-relative (see
+/// [`validate_table_relative`]) and has no `.` or `..` segment (see [`reject_dot_segments`]): the
+/// condition form of those rules, reporting the error of the first one a location breaks. `guard`
+/// wraps the predicate, e.g. to pass rows without a location.
+pub(crate) fn location_check(
     column: ColumnName,
-    guard: impl Fn(Predicate) -> Predicate,
-    ids: [&'static str; 2],
-) -> [Check; 2] {
-    let location = || Expression::column(column.clone());
-    let absolute_or_table_relative = Predicate::or(
-        Predicate::has_uri_scheme(location()),
-        Predicate::and(
-            location().ne(lit("")),
-            Predicate::not(Predicate::starts_with(location(), lit("/"))),
-        ),
-    );
-    let table_relative_error: ConditionErrorFn =
-        |values| location_rule_error(values, validate_table_relative);
-    let dot_segment_error: ConditionErrorFn =
-        |values| location_rule_error(values, reject_dot_segments);
-    [
-        Check::new(
-            ids[0],
-            guard(absolute_or_table_relative),
-            vec![column.clone()],
-            table_relative_error,
-        ),
-        Check::new(
-            ids[1],
-            guard(Predicate::not(Predicate::has_dot_segment(location()))),
-            vec![column],
-            dot_segment_error,
-        ),
-    ]
+    guard: impl FnOnce(Predicate) -> Predicate,
+    id: &'static str,
+) -> Check {
+    let valid = Predicate::is_valid_file_location(Expression::column(column.clone()));
+    Check::new(id, guard(valid), vec![column], |values| {
+        location_rule_error(values, check_location_rules)
+    })
+}
+
+/// The rules a [`location_check`] states: an absolute location passes the table-relative rule.
+fn check_location_rules(location: &str) -> KernelResult<()> {
+    if scheme_len(location).is_none() {
+        validate_table_relative(location)?;
+    }
+    reject_dot_segments(location)
 }
 
 /// The error of `rule`, the Rust form of a failed location condition, for the location in the
@@ -385,8 +371,8 @@ mod tests {
         );
     }
 
-    /// The condition forms of [`validate_table_relative`] and [`reject_dot_segments`] in
-    /// [`location_checks`] accept the same locations as the rules, and report their errors.
+    /// The condition form of [`validate_table_relative`] and [`reject_dot_segments`] in
+    /// [`location_check`] accepts the same locations as the rules, and reports their errors.
     #[rstest]
     fn test_location_checks_agree_with_rules(
         #[values(
@@ -406,17 +392,13 @@ mod tests {
         let engine = SyncEngine::new();
         let handler = engine.evaluation_handler();
         let schema = schema_ref! { not_null "location": STRING };
-        let checks = location_checks(column_name!("location"), |p| p, ["Relative", "Dots"]);
+        let check = location_check(column_name!("location"), |p| p, "Location");
         let checker =
-            ConditionChecker::try_new(handler.as_ref(), schema.clone(), checks.into()).unwrap();
+            ConditionChecker::try_new(handler.as_ref(), schema.clone(), vec![check]).unwrap();
         let batch = handler
             .create_many(schema, vec![vec![Scalar::from(location)]])
             .unwrap();
-        let rule = match scheme_len(location) {
-            Some(_) => Ok(()),
-            None => validate_table_relative(location),
-        }
-        .and_then(|()| reject_dot_segments(location));
+        let rule = check_location_rules(location);
         let condition = checker.check(batch.as_ref());
         assert_eq!(
             condition.map_err(|e| e.to_string()),
