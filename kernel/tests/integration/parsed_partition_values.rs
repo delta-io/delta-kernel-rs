@@ -12,12 +12,12 @@ use delta_kernel::arrow::compute::filter_record_batch;
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
-use delta_kernel::expressions::{ColumnName, Predicate, Scalar, expr};
+use delta_kernel::expressions::{ColumnName, Expression, Predicate, Scalar, expr};
 use delta_kernel::object_store::DynObjectStore;
 use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::parquet::arrow::ArrowWriter;
-use delta_kernel::scan::PartitionValuesOptions;
 use delta_kernel::scan::state::ScanFile;
+use delta_kernel::scan::{ParsedColumnSource, PartitionValuesOptions, ScanMetadata};
 use delta_kernel::schema::{DataType, StructField, schema_ref};
 use delta_kernel::table_features::{ColumnMappingMode, get_any_level_column_physical_name};
 use delta_kernel::transaction::create_table::create_table;
@@ -26,7 +26,8 @@ use delta_kernel::{Engine, Snapshot, SnapshotRef};
 use rstest::rstest;
 use test_utils::delta_kernel_default_engine::DefaultEngineBuilder;
 use test_utils::table_builder::{
-    FeatureSet, LogState, TableConfig, TestTableBuilder, partitioned, unpartitioned, version_latest,
+    DataLayoutConfig, FeatureSet, LogState, TableConfig, TestTableBuilder, partitioned,
+    unpartitioned, version_latest,
 };
 use test_utils::{
     CountingReporter, add_commit, assert_result_error_with_message,
@@ -146,6 +147,146 @@ fn scan_metadata_emits_partition_values_parsed_across_column_mapping(
     }
 
     assert_eq!(file_count, 1, "Should have processed exactly one file");
+}
+
+/// Returns `(source, has_partitionValues_parsed_column)` for every batch that has selected rows.
+fn batch_partition_values_sources<E: std::fmt::Debug>(
+    batches: impl IntoIterator<Item = Result<ScanMetadata, E>>,
+) -> Vec<(Option<ParsedColumnSource>, bool)> {
+    let mut sources = Vec::new();
+    for metadata in batches {
+        let metadata = metadata.unwrap();
+        let source = metadata.partition_values_source();
+        let (data, selection) = metadata.scan_files.into_parts();
+        let batch: RecordBatch = ArrowEngineData::try_from_engine_data(data).unwrap().into();
+        let batch = filter_record_batch(&batch, &BooleanArray::from(selection)).unwrap();
+        if batch.num_rows() > 0 {
+            let has_column = batch.column_by_name("partitionValues_parsed").is_some();
+            sources.push((source, has_column));
+        }
+    }
+    sources
+}
+
+/// Asserts the batches report exactly the expected sources, each paired with a present column
+/// (or an absent one for `None`).
+fn assert_batch_sources(
+    actual: Vec<(Option<ParsedColumnSource>, bool)>,
+    expected: &[Option<ParsedColumnSource>],
+) {
+    for source in expected {
+        assert!(
+            actual.iter().any(|(s, _)| s == source),
+            "no batch reported {source:?}; got {actual:?}"
+        );
+    }
+    for (source, has_column) in &actual {
+        assert!(
+            expected.contains(source),
+            "unexpected source {source:?}; expected one of {expected:?}"
+        );
+        assert_eq!(
+            *has_column,
+            source.is_some(),
+            "column presence vs {source:?}"
+        );
+    }
+}
+
+#[rstest]
+#[case::json_only(1, None, false, &[Some(ParsedColumnSource::Derived)])]
+#[case::checkpoint_with_native(
+    1, Some(1), true, &[Some(ParsedColumnSource::Checkpoint)]
+)]
+#[case::checkpoint_without_native(1, Some(1), false, &[Some(ParsedColumnSource::Derived)])]
+#[case::checkpoint_then_commit(
+    2,
+    Some(1),
+    true,
+    &[Some(ParsedColumnSource::Checkpoint), Some(ParsedColumnSource::Derived)]
+)]
+fn scan_metadata_reports_partition_values_source(
+    #[case] latest_version: u64,
+    #[case] checkpoint_at: Option<u64>,
+    #[case] write_stats_as_struct: bool,
+    #[case] expected: &[Option<ParsedColumnSource>],
+) {
+    let (engine, snapshot, _table) = test_context!(
+        LogState::with_latest_version(latest_version).maybe_with_checkpoint_at(checkpoint_at),
+        FeatureSet::empty(),
+        partitioned(),
+        TableConfig::new().write_stats_as_struct(write_stats_as_struct),
+        version_latest(),
+    );
+    let scan = snapshot
+        .scan_builder()
+        .with_partition_values(PartitionValuesOptions::with_struct())
+        .build()
+        .unwrap();
+
+    assert_batch_sources(
+        batch_partition_values_sources(scan.scan_metadata(&engine).unwrap()),
+        expected,
+    );
+}
+
+#[rstest]
+#[case::predicate_only(partitioned(), false, true, Some(ParsedColumnSource::Checkpoint))]
+#[case::no_struct_no_predicate(partitioned(), false, false, None)]
+#[case::unpartitioned_with_struct(unpartitioned(), true, false, None)]
+fn scan_metadata_partition_values_source_follows_emitted_column(
+    #[case] data_layout: DataLayoutConfig,
+    #[case] with_struct: bool,
+    #[case] with_partition_predicate: bool,
+    #[case] expected: Option<ParsedColumnSource>,
+) {
+    let (engine, snapshot, _table) = test_context!(
+        LogState::with_latest_version(1).with_checkpoint_at([1]),
+        FeatureSet::empty(),
+        data_layout,
+        TableConfig::new().write_stats_as_struct(true),
+        version_latest(),
+    );
+    let mut builder = snapshot.scan_builder();
+    if with_struct {
+        builder = builder.with_partition_values(PartitionValuesOptions::with_struct());
+    }
+    if with_partition_predicate {
+        builder = builder.with_predicate(Arc::new(Predicate::is_not_null(Expression::column([
+            "part_int",
+        ]))));
+    }
+    let scan = builder.build().unwrap();
+
+    assert_batch_sources(
+        batch_partition_values_sources(scan.scan_metadata(&engine).unwrap()),
+        &[expected],
+    );
+}
+
+/// Parallel scan metadata derives `partitionValues_parsed` from the string map even when the
+/// checkpoint has a native column.
+#[test]
+fn parallel_scan_metadata_reports_derived_partition_values_source() {
+    let (engine, snapshot, _table) = test_context!(
+        LogState::with_latest_version(2).with_checkpoint_at([1]),
+        FeatureSet::empty(),
+        partitioned(),
+        TableConfig::new().write_stats_as_struct(true),
+        version_latest(),
+    );
+    let scan = snapshot
+        .scan_builder()
+        .with_partition_values(PartitionValuesOptions::with_struct())
+        .build()
+        .unwrap();
+
+    let sequential = scan.parallel_scan_metadata(Arc::new(engine)).unwrap();
+
+    assert_batch_sources(
+        batch_partition_values_sources(sequential),
+        &[Some(ParsedColumnSource::Derived)],
+    );
 }
 
 // === Foreign-writer literal empty-string partition values ===
@@ -493,11 +634,13 @@ async fn offset_less_timestamp_partition_read_with_json_and_checkpoint(
         .unwrap();
     let expected_ts = timestamp_micros(expected_ts);
     let mut paths = Vec::new();
+    let mut sources = Vec::new();
     for metadata in scan.scan_metadata(engine.as_ref()).unwrap() {
         let metadata = metadata.unwrap();
         if tz.is_some() {
             assert!(metadata.scan_file_transforms.iter().all(Option::is_none));
         }
+        let source = metadata.partition_values_source();
         let (data, selection) = metadata.scan_files.into_parts();
         let batch: RecordBatch = ArrowEngineData::try_from_engine_data(data).unwrap().into();
         let batch = filter_record_batch(&batch, &BooleanArray::from(selection)).unwrap();
@@ -527,10 +670,28 @@ async fn offset_less_timestamp_partition_read_with_json_and_checkpoint(
             );
             assert_eq!(integers.value(row), 7);
             paths.push(path.to_string());
+            sources.push((path.to_string(), source));
         }
     }
     paths.sort();
     assert_eq!(paths, ["file1.parquet", "file2.parquet"]);
+
+    let checkpoint_source = if write_parsed_partition {
+        ParsedColumnSource::Checkpoint
+    } else {
+        ParsedColumnSource::Derived
+    };
+    sources.sort_by(|a, b| a.0.cmp(&b.0));
+    assert_eq!(
+        sources,
+        [
+            ("file1.parquet".to_string(), Some(checkpoint_source)),
+            (
+                "file2.parquet".to_string(),
+                Some(ParsedColumnSource::Derived)
+            ),
+        ]
+    );
 }
 
 #[rstest]
