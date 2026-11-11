@@ -280,6 +280,8 @@ unpartitioned writes.
 | `free_write_state` / `free_write_context_builder` | Release unused owned handles |
 | `update_table_txn_get_unpartitioned_write_context` | Get a `SharedWriteContext` covering all rows in the transaction |
 | `update_table_txn_get_partitioned_write_context` | Get a `SharedWriteContext` for one partition (requires a `PartitionValueMap`) |
+| `partition_value_map_insert_null` | Insert a typed null by type tag; decimal nulls use the dedicated function below |
+| `partition_value_map_insert_decimal_null` | Insert a decimal null with its precision and scale |
 | `get_write_dir` | Return the recommended write subdirectory for a partitioned `SharedWriteContext` |
 | `get_write_path` | Return the table root URL from a `SharedWriteContext` (engines append their own subdirectory and filename) |
 | `get_write_schema` | Return the logical (user-facing) write schema from a `SharedWriteContext` |
@@ -291,6 +293,7 @@ unpartitioned writes.
 |----------|---------|
 | `get_domain_metadata` | Look up the configuration string for a specific domain on a snapshot |
 | `visit_domain_metadata` | Iterate all domain metadata entries on a snapshot |
+| `visit_clustering_columns` | Visit supported clustering columns through primitive and decimal callbacks |
 
 **Table creation**
 
@@ -399,6 +402,8 @@ Most engines need only one of the two surfaces.
 | `visit_expression` / `visit_predicate` | Walk a Kernel expression or predicate with an `EngineExpressionVisitor` (Walk surface) |
 | `visit_expression_ref` / `visit_predicate_ref` | Walk a pre-interned expression or predicate reference (Walk surface) |
 | `visit_expression_column` / `visit_expression_struct` / `visit_expression_plus` / `visit_expression_literal_*` / ... | Builder functions the engine calls from inside `visit_engine_expression` to construct Kernel expression nodes; see `delta_kernel_ffi.h` for the full list |
+| `visit_expression_literal_null` | Build a typed null by type tag; decimal nulls use the dedicated function below |
+| `visit_expression_literal_decimal_null` | Build a decimal null with its precision and scale |
 | `visit_predicate_eq` / `visit_predicate_and` / `visit_predicate_or` / ... | Builder functions the engine calls from inside `visit_engine_predicate` to construct Kernel predicate nodes |
 | `visit_expression_unknown` / `visit_predicate_unknown` | Builder helpers that bridge an opaque engine operator through Kernel unchanged |
 | `visit_kernel_opaque_expression_op_name` / `visit_kernel_opaque_predicate_op_name` | Inspect the name of an opaque op carried through by the above |

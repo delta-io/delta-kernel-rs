@@ -11,6 +11,7 @@ use std::collections::HashMap;
 
 use delta_kernel::KernelResult;
 use delta_kernel::expressions::Scalar;
+use delta_kernel::schema::DataType;
 use delta_kernel_ffi_macros::handle_descriptor;
 
 use crate::error::{ExternResult, IntoExternResult};
@@ -343,11 +344,11 @@ pub unsafe extern "C" fn partition_value_map_insert_decimal(
 
 /// Insert a typed `null` partition value under `name`. The `type_tag` identifies the column's
 /// data type using the same `NullTypeTag` encoding as `visit_expression_literal_null` in
-/// [`kernel_visitor`](crate::expressions::kernel_visitor). For the decimal tag, `precision` and
-/// `scale` specify the decimal parameters; for all other types, pass 0 for both.
+/// [`kernel_visitor`](crate::expressions::kernel_visitor). Use
+/// `partition_value_map_insert_decimal_null` for decimal nulls.
 ///
-/// Returns an error if the tag is unrecognized, is the non-primitive sentinel (255), or carries an
-/// invalid decimal precision/scale. A null partition value is only legal for a nullable partition
+/// Returns an error if the tag is unrecognized, is the non-primitive sentinel (255), or is
+/// reserved for decimal nulls. A null partition value is only legal for a nullable partition
 /// column; the kernel rejects it otherwise when the write context is built.
 ///
 /// # Safety
@@ -358,6 +359,27 @@ pub unsafe extern "C" fn partition_value_map_insert_null(
     mut map: Handle<ExclusivePartitionValueMap>,
     name: KernelStringSlice,
     type_tag: u8,
+    engine: Handle<SharedExternEngine>,
+) -> ExternResult<bool> {
+    let map = unsafe { map.as_mut() };
+    let engine = unsafe { engine.as_ref() };
+    let name = unsafe { TryFromStringSlice::try_from_slice(&name) };
+    let scalar = NullTypeTag::try_from(type_tag)
+        .and_then(NullTypeTag::to_data_type)
+        .map(Scalar::Null);
+    let result = partition_value_map_insert_impl(map, name, scalar);
+    unsafe { result.into_extern_result(&engine) }
+}
+
+/// Insert a decimal null partition value with its precision and scale.
+///
+/// # Safety
+///
+/// Caller must pass valid handles and a valid `name` slice.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn partition_value_map_insert_decimal_null(
+    mut map: Handle<ExclusivePartitionValueMap>,
+    name: KernelStringSlice,
     precision: u8,
     scale: u8,
     engine: Handle<SharedExternEngine>,
@@ -365,9 +387,7 @@ pub unsafe extern "C" fn partition_value_map_insert_null(
     let map = unsafe { map.as_mut() };
     let engine = unsafe { engine.as_ref() };
     let name = unsafe { TryFromStringSlice::try_from_slice(&name) };
-    let scalar = NullTypeTag::try_from(type_tag)
-        .and_then(|tag| tag.to_data_type(precision, scale))
-        .map(Scalar::Null);
+    let scalar = DataType::decimal(precision, scale).map(Scalar::Null);
     let result = partition_value_map_insert_impl(map, name, scalar);
     unsafe { result.into_extern_result(&engine) }
 }
@@ -434,7 +454,7 @@ mod tests {
             inner: HashMap::new(),
         };
         let scalar = NullTypeTag::try_from(NullTypeTag::Integer as u8)
-            .and_then(|tag| tag.to_data_type(0, 0))
+            .and_then(NullTypeTag::to_data_type)
             .map(Scalar::Null);
         partition_value_map_insert_impl(&mut map, Ok("p"), scalar).unwrap();
         assert_eq!(
@@ -603,13 +623,11 @@ mod tests {
             let engine = get_default_engine("memory:///partition_value_null_test/");
             let map = partition_value_map_new();
 
-            // Decimal null carries precision/scale through to the data type.
             let n = "dec_null";
             ok_or_panic(unsafe {
-                partition_value_map_insert_null(
+                partition_value_map_insert_decimal_null(
                     map.shallow_copy(),
                     kernel_string_slice!(n),
-                    NullTypeTag::Decimal as u8,
                     10,
                     2,
                     engine.shallow_copy(),
@@ -620,6 +638,20 @@ mod tests {
             assert_eq!(
                 unsafe { map.as_ref() }.inner.get("dec_null"),
                 Some(&expected)
+            );
+
+            let n = "year_month_null";
+            ok_or_panic(unsafe {
+                partition_value_map_insert_null(
+                    map.shallow_copy(),
+                    kernel_string_slice!(n),
+                    NullTypeTag::IntervalYearMonth as u8,
+                    engine.shallow_copy(),
+                )
+            });
+            assert_eq!(
+                unsafe { map.as_ref() }.inner.get(n),
+                Some(&Scalar::Null(DataType::INTERVAL_YEAR_MONTH))
             );
 
             // The non-primitive sentinel and unrecognized tags are rejected.
@@ -633,8 +665,6 @@ mod tests {
                     map.shallow_copy(),
                     kernel_string_slice!(n),
                     NullTypeTag::NonPrimitive as u8,
-                    0,
-                    0,
                     engine.shallow_copy(),
                 )
             });
@@ -643,9 +673,16 @@ mod tests {
                 partition_value_map_insert_null(
                     map.shallow_copy(),
                     kernel_string_slice!(n),
+                    12, // reserved for decimal nulls
+                    engine.shallow_copy(),
+                )
+            });
+            assert_eq!(err, FFIKernelError::SchemaError);
+            let err = expect_err(unsafe {
+                partition_value_map_insert_null(
+                    map.shallow_copy(),
+                    kernel_string_slice!(n),
                     200, // unrecognized tag
-                    0,
-                    0,
                     engine.shallow_copy(),
                 )
             });

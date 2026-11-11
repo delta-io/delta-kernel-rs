@@ -334,10 +334,12 @@ mod tests {
 
     #[test]
     fn test_validate_clustering_columns_unsupported_primitive_types() {
-        // Boolean and Binary are primitives but not supported for clustering
+        // Boolean, Binary, and interval primitives are not supported for clustering.
         let schema = schema! {
             not_null "bool_col": BOOLEAN,
             not_null "binary_col": BINARY,
+            not_null "year_month_col": INTERVAL_YEAR_MONTH,
+            not_null "day_time_col": INTERVAL_DAY_TIME,
         };
 
         for field in schema.fields() {

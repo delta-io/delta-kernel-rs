@@ -77,10 +77,25 @@ uintptr_t convert_engine_to_kernel_literal(
     }
     case Null: {
       struct NullTypeInfo* nt = &lit->value.null_type;
-      ExternResultusize result = visit_expression_literal_null(
-          state, nt->type_tag, nt->precision, nt->scale, &error_allocators);
+      ExternResultusize result;
+      switch (nt->kind) {
+        case NullTypeTagOnly:
+          result = visit_expression_literal_null(
+              state, nt->value.type_tag, &error_allocators);
+          break;
+        case NullTypeDecimal:
+          result = visit_expression_literal_decimal_null(
+              state,
+              nt->value.decimal.precision,
+              nt->value.decimal.scale,
+              &error_allocators);
+          break;
+        default:
+          fprintf(stderr, "Error: Unknown typed null variant\n");
+          abort();
+      }
       if (result.tag == Errusize) {
-        print_error("visit_expression_literal_null failed", (Error*)result.err);
+        print_error("typed null construction failed", (Error*)result.err);
         free_error((Error*)result.err);
         abort();
       }
