@@ -1200,12 +1200,12 @@ mod tests {
         use rstest::rstest;
 
         use super::super::PmCandidate;
-        #[cfg(feature = "adaptive-metadata-in-dev")]
-        use crate::actions::LastManifestCommit;
         use crate::actions::{Metadata, Protocol};
         use crate::metrics::ProtocolMetadataSource;
         #[cfg(feature = "adaptive-metadata-in-dev")]
-        use crate::unit_test_utils::adaptive_metadata_fixtures::minimal_checkpoint_action;
+        use crate::unit_test_utils::adaptive_metadata_fixtures::{
+            minimal_checkpoint_action, pointer,
+        };
 
         // A Protocol and Metadata that `writer_version` tells apart, found at the given versions.
         #[cfg_attr(
@@ -1314,7 +1314,7 @@ mod tests {
                     version,
                     minimal_checkpoint_action("root.parquet", content_root as u64).unwrap(),
                 )),
-                last_manifest_commit: Some(LastManifestCommit::new(version, content_root).unwrap()),
+                last_manifest_commit: Some(pointer(version, content_root)),
                 ..Default::default()
             };
             let merged = amt(self_version, 0).merge(amt(other_version, 1));
@@ -1323,7 +1323,7 @@ mod tests {
             assert_eq!(action.content_root_version(), expected_content_root);
             assert_eq!(
                 merged.last_manifest_commit,
-                Some(LastManifestCommit::new(expected_version, expected_content_root).unwrap())
+                Some(pointer(expected_version, expected_content_root))
             );
         }
 
@@ -1331,7 +1331,7 @@ mod tests {
         #[rstest]
         fn test_merge_folds_pointed_pm_in_either_order(#[values(false, true)] action_first: bool) {
             let with_pointer = PmCandidate {
-                last_manifest_commit: Some(LastManifestCommit::new(2, 2).unwrap()),
+                last_manifest_commit: Some(pointer(2, 2)),
                 ..Default::default()
             };
             let with_action = PmCandidate {

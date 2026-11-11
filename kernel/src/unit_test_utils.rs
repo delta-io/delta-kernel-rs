@@ -496,6 +496,12 @@ pub(crate) mod adaptive_metadata_fixtures {
         ))
     }
 
+    /// The `lastManifestCommit` naming the manifest commit at `version` whose content root is at
+    /// `content_root_version`.
+    pub(crate) fn pointer(version: i64, content_root_version: i64) -> LastManifestCommit {
+        LastManifestCommit::new(version, content_root_version).unwrap()
+    }
+
     /// Writes `rows` (each a value of `schema`'s single action field) as the checkpoint sidecar
     /// `name` of the table at `table_root`.
     pub(crate) fn write_sidecar(
