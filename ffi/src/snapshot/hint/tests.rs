@@ -1486,8 +1486,10 @@ fn aggregate_with_rejects_null_nonempty_log_path_array() {
     }
 }
 
-#[test]
-fn aggregate_with_rejects_log_compaction_paths() {
+#[rstest::rstest]
+#[case::complete(true)]
+#[case::missing_commit(false)]
+fn aggregate_with_log_compaction_requires_individual_commits(#[case] complete: bool) {
     let engine = test_engine();
     let builder = test_builder(&engine);
     let log_path = FfiLogPath::new(
@@ -1498,19 +1500,54 @@ fn aggregate_with_rejects_log_compaction_paths() {
         1,
         1,
     );
-    let hint = test_snapshot_hint(
-        std::slice::from_ref(&log_path),
-        1,
-        FfiSnapshotHintFreshness::Unverified,
+    let paths = [
+        log_path,
+        FfiLogPath::new(
+            slice("memory:///hinted-table/_delta_log/00000000000000000000.json"),
+            0,
+            0,
+        ),
+        FfiLogPath::new(
+            slice("memory:///hinted-table/_delta_log/00000000000000000001.json"),
+            1234,
+            0,
+        ),
+    ];
+    let supplied_paths = if complete { &paths[..] } else { &paths[..1] };
+    let hint = test_snapshot_hint(supplied_paths, 1, FfiSnapshotHintFreshness::Unverified);
+    let builder = unsafe { ok_or_panic(snapshot_builder_with_snapshot_hint(builder, &hint)) };
+    if !complete {
+        assert_extern_result_error_contains(
+            unsafe { snapshot_builder_build(builder) },
+            FFIKernelError::InvalidSnapshotHint,
+            "log segment",
+        );
+        unsafe { free_engine(engine) };
+        return;
+    }
+    let snapshot = unsafe { ok_or_panic(snapshot_builder_build(builder)) };
+    let source = unsafe { snapshot.as_ref() };
+    assert_eq!(source.version(), 1);
+    assert_eq!(source.log_segment().listed.ascending_commit_files.len(), 2);
+    assert!(
+        source
+            .log_segment()
+            .listed
+            .ascending_compaction_files
+            .is_empty()
     );
-    let result = unsafe { snapshot_builder_with_snapshot_hint(builder, &hint) };
-    assert_extern_result_error_contains(
-        result,
-        FFIKernelError::InvalidSnapshotHint,
-        "log compaction",
+    assert_eq!(
+        unsafe {
+            ok_or_panic(crate::snapshot_timestamp(
+                snapshot.shallow_copy(),
+                engine.shallow_copy(),
+            ))
+        },
+        1234
     );
 
     unsafe {
+        free_snapshot(snapshot);
         free_engine(engine);
     }
 }
