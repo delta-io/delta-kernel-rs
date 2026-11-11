@@ -8,8 +8,9 @@ use super::*;
 use crate::KernelResult;
 use crate::arrow::array::{
     Array, ArrayRef, AsArray, BinaryViewArray, BooleanArray, GenericStringArray, Int32Array,
-    Int32Builder, ListArray, ListViewArray, MapArray, MapBuilder, MapFieldNames, StringArray,
-    StringBuilder, StringViewArray, StructArray, TimestampNanosecondArray, create_array,
+    Int32Builder, Int64Array, ListArray, ListViewArray, MapArray, MapBuilder, MapFieldNames,
+    StringArray, StringBuilder, StringViewArray, StructArray, TimestampNanosecondArray,
+    create_array,
 };
 use crate::arrow::buffer::{BooleanBuffer, NullBuffer, OffsetBuffer, ScalarBuffer};
 use crate::arrow::compute::kernels::cmp::{gt_eq, lt};
@@ -32,8 +33,8 @@ use crate::kernel_predicates::{
 #[cfg(feature = "geo-type-in-dev")]
 use crate::schema::EdgeInterpolationAlgorithm;
 use crate::schema::{
-    ArrayType, DataType as KernelDataType, IntervalYearToMonthType, MapType, StructField,
-    StructType, schema, schema_ref,
+    ArrayType, DataType as KernelDataType, IntervalDayToSecondType, IntervalYearToMonthType,
+    MapType, StructField, StructType, schema, schema_ref,
 };
 use crate::unit_test_utils::assert_result_error_with_message;
 #[cfg(feature = "geo-type-in-dev")]
@@ -1809,11 +1810,24 @@ fn test_void_scalar_to_array() {
     Scalar::interval_year_month(30, IntervalYearToMonthType::IntervalMonth).unwrap(),
     DataType::Int32
 )]
-#[case::day_time(Scalar::IntervalDayTime(5), DataType::Int64)]
+#[case::day_time(Scalar::interval_day_time(5, IntervalDayToSecondType::IntervalDayToSecond).unwrap(), DataType::Int64)]
+#[case::day(Scalar::interval_day_time(86_400_000_000, IntervalDayToSecondType::IntervalDay).unwrap(), DataType::Int64)]
+#[case::hour(Scalar::interval_day_time(3_600_000_000, IntervalDayToSecondType::IntervalHour).unwrap(), DataType::Int64)]
+#[case::minute(Scalar::interval_day_time(60_000_000, IntervalDayToSecondType::IntervalMinute).unwrap(), DataType::Int64)]
 fn test_interval_scalar_to_array(#[case] scalar: Scalar, #[case] arrow_type: DataType) {
     let array = scalar.to_array(2).unwrap();
     assert_eq!(array.len(), 2);
     assert_eq!(*array.data_type(), arrow_type);
+    if let Scalar::IntervalDayTime(data) = &scalar {
+        assert_eq!(
+            array
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(0),
+            data.micros()
+        );
+    }
 
     let nulls = Scalar::Null(scalar.data_type()).to_array(2).unwrap();
     assert_eq!(*nulls.data_type(), arrow_type);
