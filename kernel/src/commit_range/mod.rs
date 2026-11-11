@@ -325,7 +325,7 @@ impl CommitActionsIterator {
         )
         .map_err(|e| match e {
             Error::Kernel(e) => Error::Kernel(with_version_context(version, e)),
-            Error::Delta(error) => Error::Delta(error),
+            Error::Delta(error) => Error::Delta(error.with_context(format!("commit v={version}"))),
         })?;
 
         match self.commit_ordering {
@@ -442,7 +442,7 @@ mod tests {
     use crate::object_store::memory::InMemory;
     use crate::unit_test_utils::TestCancellationToken;
     use crate::utils::FoldWithOption as _;
-    use crate::{Error, Snapshot};
+    use crate::{DeltaError, DeltaErrorCondition, Error, Snapshot};
 
     /// Open a `CommitRange` over `table-with-dv-small` with a matching anchor snapshot.
     /// `start_version` drives both the range's start version and the snapshot's version.
@@ -460,6 +460,74 @@ mod tests {
             .build(engine.as_ref())
             .unwrap();
         (range, engine, anchor_snapshot)
+    }
+
+    #[test]
+    fn delta_commit_error_preserves_catalog_metadata_and_version_context() {
+        let error = DeltaError::invalid_version(
+            -1,
+            Some(Box::new(KernelError::generic("negative version"))),
+        )
+        .with_context("commit v=7".to_owned());
+        assert_eq!(error.condition(), DeltaErrorCondition::DeltaVersionInvalid);
+        assert_eq!(error.parameters()[0].value(), "-1");
+        let context = std::error::Error::source(&error).unwrap();
+        assert_eq!(context.to_string(), "commit v=7");
+        assert!(matches!(
+            context.source().unwrap().downcast_ref::<KernelError>(),
+            Some(KernelError::Generic(message)) if message == "negative version"
+        ));
+    }
+
+    #[rstest::rstest]
+    #[tokio::test]
+    async fn commit_iterator_preserves_delta_error_and_version_context(
+        #[values(CommitOrdering::AscendingOrder, CommitOrdering::DescendingOrder)]
+        ordering: CommitOrdering,
+    ) {
+        let valid_commit = format!("{VALID_PROTOCOL_LINE}\n{VALID_METADATA_LINE}");
+        let mut metadata: serde_json::Value = serde_json::from_str(VALID_METADATA_LINE).unwrap();
+        metadata["metaData"]["schemaString"] = serde_json::json!(
+            r#"{"type":"struct","fields":[{"name":"p","type":"integer","nullable":true,"metadata":{}}]}"#
+        );
+        metadata["metaData"]["partitionColumns"] = serde_json::json!(["p", "p"]);
+        let invalid_commit = format!("{VALID_PROTOCOL_LINE}\n{metadata}");
+        let (engine, table_root) =
+            engine_with_commits(&[(0, &valid_commit), (1, &invalid_commit), (2, &valid_commit)])
+                .await;
+        let range = CommitRange::builder_for(table_root, 0)
+            .with_end_version(2)
+            .with_ordering(ordering)
+            .build(engine.as_ref())
+            .unwrap();
+        let mut commits = range
+            .commits(engine, None, &[DeltaAction::Metadata])
+            .unwrap();
+        let first_version = if ordering == CommitOrdering::AscendingOrder {
+            0
+        } else {
+            2
+        };
+        assert_eq!(commits.next().unwrap().unwrap().version(), first_version);
+        let Err(Error::Delta(error)) = commits.next().unwrap() else {
+            panic!("duplicate partition columns must produce a Delta error");
+        };
+        assert_eq!(
+            error.condition(),
+            DeltaErrorCondition::DeltaDuplicateColumnsFoundPartitionColumns
+        );
+        assert_eq!(error.parameters()[0].value(), "p");
+        let context = std::error::Error::source(&error).unwrap();
+        assert_eq!(context.to_string(), "commit v=1");
+        let source = context
+            .source()
+            .unwrap()
+            .downcast_ref::<KernelError>()
+            .unwrap();
+        assert!(matches!(
+            source.without_backtrace(),
+            KernelError::Generic(message) if message == "Duplicate partition column: 'p'"
+        ));
     }
 
     #[test]

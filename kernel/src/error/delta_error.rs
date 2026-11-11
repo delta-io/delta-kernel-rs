@@ -201,6 +201,15 @@ impl DeltaError {
         )
     }
 
+    /// Adds diagnostic context ahead of the original source without changing catalog metadata.
+    pub(crate) fn with_context(mut self, context: String) -> Self {
+        self.source = Some(Box::new(DiagnosticContext {
+            context,
+            source: self.source.take(),
+        }));
+        self
+    }
+
     /// Creates an error with an optional diagnostic cause and captures its backtrace.
     ///
     /// `parameters` must contain exactly [`DeltaErrorCondition::parameter_names`], in that order.
@@ -230,6 +239,14 @@ impl DeltaError {
             backtrace: Backtrace::capture(),
         }
     }
+}
+
+/// Operation context retained in the diagnostic source chain, outside the catalog message.
+#[derive(Debug, thiserror::Error)]
+#[error("{context}")]
+struct DiagnosticContext {
+    context: String,
+    source: Option<Box<dyn StdError + Send + Sync + 'static>>,
 }
 
 /// Renders the catalog message, inserting parameter values verbatim.
