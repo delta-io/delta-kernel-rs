@@ -19,7 +19,7 @@ impl MetadataReplayBase {
     pub(in crate::scan) fn try_new(
         snapshot: &Snapshot,
         engine: &dyn Engine,
-        planner: &MetadataPlanner<'_>,
+        planner: &MetadataPlanner,
     ) -> KernelResult<Self> {
         let checkpoint_version = snapshot.log_segment().checkpoint_version;
         // Keep replay eligibility independent of SnapshotCrc's validation.
@@ -105,7 +105,7 @@ mod tests {
         let crc = Some(crc);
         let snapshot = Arc::new(Snapshot::new_with_crc(segment, config, crc, false, false)?);
         let scan = snapshot.scan_builder().build()?;
-        let planner = MetadataPlanner::try_new(&scan)?;
+        let planner = MetadataPlanner::try_from_scan(&scan)?;
         let base = MetadataReplayBase::try_new(&scan.snapshot, &engine, &planner)?;
         assert_eq!(base.version(), Some(version));
         let is_crc = matches!(base, MetadataReplayBase::Crc { .. });
