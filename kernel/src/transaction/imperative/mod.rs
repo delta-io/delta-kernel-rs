@@ -40,7 +40,7 @@ use crate::scan::log_replay::{
     FILE_CONSTANT_VALUES_NAME, PARTITION_VALUES_NAME, PARTITION_VALUES_PARSED_NAME, SIZE_NAME,
     STATS_PARSED_NAME, TAGS_NAME,
 };
-use crate::scan::scan_row_schema;
+use crate::scan::{StatsOptions, scan_row_schema};
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::schema::ToSchema;
 use crate::schema::{ArrayType, SchemaRef, StructField, StructType, schema_ref};
@@ -76,6 +76,11 @@ impl<STATE> Transaction<STATE, Imperative> {
     ///
     /// `ALTER TABLE` returns a validation error if any data-file batches or manifest writes are
     /// staged. Empty or fully unselected data-file batches are also rejected.
+    ///
+    /// Whole-table `Overwrite` enumerates the source snapshot's active logical files through the
+    /// engine and generates all removals here. It rejects caller-staged removals and DV updates.
+    /// An empty incoming dataset still removes all existing data. A conflict requires rebuilding
+    /// against a fresh snapshot, rather than applying the removal plan to a later version.
     #[instrument(
         parent = &self.span,
         name = TRANSACTION_COMMIT_SPAN,
@@ -100,11 +105,12 @@ impl<STATE> Transaction<STATE, Imperative> {
         ),
         err
     )]
-    pub fn commit(self, engine: &dyn Engine) -> KernelResult<CommitResult<STATE>> {
+    pub fn commit(mut self, engine: &dyn Engine) -> KernelResult<CommitResult<STATE>> {
         let commit_start = Instant::now();
 
         // === Pre-commit validation ===
         self.validate_operation_compatibility()?;
+        self.prepare_overwrite_removals(engine)?;
         self.validate_commit()?;
         self.validate_file_actions()?;
 
@@ -203,6 +209,34 @@ impl<STATE> Transaction<STATE, Imperative> {
 // Imperative action processing
 // =============================================================================
 impl<STATE> Transaction<STATE, Imperative> {
+    fn prepare_overwrite_removals(&mut self, engine: &dyn Engine) -> KernelResult<()> {
+        if !self.is_full_overwrite() {
+            return Ok(());
+        }
+        require!(
+            self.staged_data_changes.remove_files_metadata.is_empty()
+                && self.staged_data_changes.dv_matched_files.is_empty(),
+            KernelError::invalid_transaction_state(
+                "Overwrite generates all removals internally and cannot include explicit removals \
+                 or DV updates"
+            )
+        );
+        let snapshot = self
+            .read_snapshot_opt
+            .clone()
+            .ok_or_else(|| KernelError::internal_error("Overwrite requires a source snapshot"))?;
+        let scan = snapshot
+            .scan_builder()
+            .without_row_transforms()
+            .with_stats(StatsOptions::none())
+            .build()?;
+        self.staged_data_changes.remove_files_metadata = scan
+            .scan_metadata(engine)?
+            .map(|batch| batch.map(|metadata| metadata.scan_files))
+            .collect::<KernelResult<_>>()?;
+        Ok(())
+    }
+
     /// Submits actions and returns the committer's response with its elapsed time.
     fn perform_commit(
         &self,
@@ -218,7 +252,7 @@ impl<STATE> Transaction<STATE, Imperative> {
     /// Translates a commit response, retaining the transaction on recoverable failures.
     /// File statistics are computed only when the committer reports success.
     fn translate_commit_result(
-        self,
+        mut self,
         commit_response: KernelResult<CommitResponse>,
         post_commit_inputs: PostCommitInputs,
         prepare_duration: Duration,
@@ -269,6 +303,10 @@ impl<STATE> Transaction<STATE, Imperative> {
             Err(e @ KernelError::IOError(_)) => {
                 tracing::Span::current()
                     .record("failure_reason", CommitFailureReason::RetryableIo.as_ref());
+                // Rebuild Kernel-owned removals on retry, keeping caller staging separate.
+                if self.is_full_overwrite() {
+                    self.staged_data_changes.remove_files_metadata.clear();
+                }
                 Ok(CommitResult::Retryable(self.into_retryable(e)))
             }
             Err(e) => Err(e),

@@ -2057,6 +2057,108 @@ mod tests {
         }
     }
 
+    #[rstest]
+    #[tokio::test]
+    async fn update_builder_with_complete_schema(
+        #[values(false, true)] overwrite: bool,
+    ) -> KernelResult<()> {
+        let (table_url, _store, engine) =
+            setup_domain_metadata_table("test_update_complete_schema", false).await?;
+        let snapshot =
+            unsafe { build_snapshot(ffi_str(table_url.as_str()), engine.shallow_copy()) };
+        let operation = if overwrite {
+            KernelUpdateTableOperation::Overwrite
+        } else {
+            KernelUpdateTableOperation::Write
+        };
+        let builder = ok_or_panic(unsafe {
+            new_update_table_txn_builder(
+                snapshot.shallow_copy(),
+                operation,
+                ffi_str("test"),
+                true,
+                engine.shallow_copy(),
+            )
+        });
+        let fields = if overwrite {
+            vec![StructField::nullable("id", DataType::STRING)]
+        } else {
+            vec![
+                StructField::nullable("id", DataType::INTEGER),
+                StructField::nullable("note", DataType::STRING),
+            ]
+        };
+        let schema = EngineSchema {
+            schema: &fields as *const Vec<StructField> as *mut c_void,
+            visitor: visit_test_schema,
+        };
+        let builder = ok_or_panic(unsafe {
+            update_table_txn_builder_with_schema(builder, &schema, overwrite, engine.shallow_copy())
+        });
+        let txn =
+            ok_or_panic(unsafe { update_table_txn_builder_build(builder, engine.shallow_copy()) });
+        let context = unsafe { txn.as_ref() }
+            .write_state()?
+            .write_context_builder()
+            .build()?;
+        assert_eq!(
+            context.physical_data_schema().as_ref(),
+            &StructType::try_new(fields)?
+        );
+        unsafe {
+            free_update_table_txn(txn);
+            free_snapshot(snapshot);
+            free_engine(engine);
+        }
+        Ok(())
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn update_builder_schema_errors_consume_builder(
+        #[values(false, true)] null: bool,
+    ) -> KernelResult<()> {
+        let (table_url, _store, engine) =
+            setup_domain_metadata_table("test_update_invalid_schema", false).await?;
+        let snapshot =
+            unsafe { build_snapshot(ffi_str(table_url.as_str()), engine.shallow_copy()) };
+        let builder = ok_or_panic(unsafe {
+            new_update_table_txn_builder(
+                snapshot.shallow_copy(),
+                KernelUpdateTableOperation::Overwrite,
+                ffi_str("test"),
+                true,
+                engine.shallow_copy(),
+            )
+        });
+        let invalid = EngineSchema {
+            schema: std::ptr::null_mut(),
+            visitor: visit_invalid_schema_not_struct,
+        };
+        let schema = if null { std::ptr::null() } else { &invalid };
+        let result = unsafe {
+            update_table_txn_builder_with_schema(builder, schema, true, engine.shallow_copy())
+        };
+        if null {
+            assert_extern_result_error_contains(
+                result,
+                FFIKernelError::GenericError,
+                "schema must not be null",
+            );
+        } else {
+            assert_extern_result_error_contains(
+                result,
+                FFIKernelError::SchemaError,
+                "Final returned id was not a struct",
+            );
+        }
+        unsafe {
+            free_snapshot(snapshot);
+            free_engine(engine);
+        }
+        Ok(())
+    }
+
     extern "C" fn visit_invalid_schema_not_struct(
         _schema_ptr: *mut c_void,
         state: &mut KernelSchemaVisitorState,
@@ -3341,6 +3443,7 @@ mod tests {
     #[case(KernelUpdateTableOperation::Merge, "MERGE")]
     #[case(KernelUpdateTableOperation::Optimize, "OPTIMIZE")]
     #[case(KernelUpdateTableOperation::Reorg, "REORG")]
+    #[case(KernelUpdateTableOperation::Overwrite, "WRITE")]
     #[tokio::test]
     async fn update_table_operation_variants_commit_expected_history_name(
         #[case] operation: KernelUpdateTableOperation,
