@@ -644,7 +644,7 @@ mod tests {
     use crate::unit_test_utils::{
         CapturingReporter, install_thread_local_metrics_reporter, string_array_to_engine_data,
     };
-    use crate::{Engine, Error, KernelResult, Result};
+    use crate::{DeltaErrorCondition, Engine, Error, KernelResult, Result};
 
     #[cfg(feature = "declarative-plans")]
     #[rstest]
@@ -1340,10 +1340,20 @@ mod tests {
             .build(ctx.engine.as_ref());
 
         // ===== THEN =====
-        let error = updated.expect_err("the missing commit must not be hidden by the checkpoint");
+        let Error::Delta(error) = updated.unwrap_err() else {
+            panic!("expected Delta error")
+        };
+        assert_eq!(
+            error.condition(),
+            DeltaErrorCondition::DeltaVersionsNotContiguous
+        );
+        let source = std::error::Error::source(&error)
+            .unwrap()
+            .downcast_ref::<KernelError>()
+            .unwrap();
         assert!(matches!(
-            error,
-            Error::Kernel(KernelError::MissingVersion(3))
+            source.without_backtrace(),
+            KernelError::MissingVersion(3)
         ));
 
         Ok(())

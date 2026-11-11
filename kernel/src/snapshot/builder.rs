@@ -2443,6 +2443,8 @@ pub(super) mod tests {
         #[case::gap(vec![1, 3], vec![1, 3], 3)]
         #[case::duplicates(vec![1], vec![1, 1], 1)]
         #[case::unsorted(vec![1, 2], vec![2, 1], 2)]
+        #[case::gap_then_duplicate(vec![1, 3], vec![1, 3, 3], 3)]
+        #[case::gap_then_reversed(vec![1, 2, 3], vec![1, 3, 2], 3)]
         #[case::overflow(vec![], vec![Version::MAX, 0], 0)]
         #[test_log::test(tokio::test)]
         async fn test_non_contiguous_log_tail_errors(
@@ -2468,12 +2470,27 @@ pub(super) mod tests {
                 .with_max_catalog_version(mcv)
                 .build(engine.as_ref());
 
-            assert!(matches!(
-                result,
-                Err(Error::Kernel(
-                    KernelError::LogTailVersionsNotContiguous { .. }
-                ))
-            ));
+            let error = result.unwrap_err();
+            if log_tail_versions.windows(2).all(|pair| pair[0] < pair[1]) {
+                let Error::Delta(error) = error else {
+                    panic!("expected Delta error")
+                };
+                assert_eq!(
+                    error.condition(),
+                    DeltaErrorCondition::DeltaVersionsNotContiguous
+                );
+                assert_eq!(error.parameters()[0].value(), "1,3");
+                assert!(matches!(
+                    std::error::Error::source(&error)
+                        .and_then(|source| source.downcast_ref::<KernelError>()),
+                    Some(KernelError::LogTailVersionsNotContiguous { .. })
+                ));
+            } else {
+                assert!(matches!(
+                    error,
+                    Error::Kernel(KernelError::LogTailVersionsNotContiguous { .. })
+                ));
+            }
 
             Ok(())
         }

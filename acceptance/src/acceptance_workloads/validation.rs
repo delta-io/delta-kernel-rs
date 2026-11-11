@@ -355,6 +355,12 @@ fn delta_error_matches(expected_code: &str, actual: &DeltaError) -> bool {
         // TODO: Report DELTA_TRUNCATED_TRANSACTION_LOG for missing history immediately after a
         // checkpoint, then remove this alias.
         ("DELTA_TRUNCATED_TRANSACTION_LOG", DeltaErrorCondition::DeltaLogFileNotFound) => true,
+        // TODO(#3421): Reconcile the workload's .GENERIC suffix with the unsuffixed catalog
+        // condition so this compatibility alias can be removed.
+        (
+            "DELTA_VERSIONS_NOT_CONTIGUOUS.GENERIC",
+            DeltaErrorCondition::DeltaVersionsNotContiguous,
+        ) => true,
         (code, _) => code == actual.name(),
     }
 }
