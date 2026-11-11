@@ -1861,3 +1861,26 @@ fn test_struct_evaluation_output_already_conforms(#[case] expression: Expr) {
 
     assert!(Arc::ptr_eq(&evaluated, &conformed));
 }
+
+#[test]
+fn test_struct_patch_reuses_a_passed_through_field_that_already_conforms() {
+    let field_id = |id: i64| [(ColumnMetadataKey::ParquetFieldId.as_ref(), id)];
+    let a = StructField::nullable("a", KernelDataType::INTEGER).with_metadata(field_id(1));
+    let output_type = KernelDataType::from(StructType::new_unchecked([
+        a.clone(),
+        StructField::nullable("b", KernelDataType::INTEGER),
+    ]));
+    let input_field: Field = (&a).try_into_arrow().unwrap();
+    let batch = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![input_field])),
+        vec![Arc::new(Int32Array::from(vec![1])) as ArrayRef],
+    )
+    .unwrap();
+    let patch = ExpressionStructPatchBuilder::new().insert_after("a", lit(7));
+    let expression = Expr::struct_patch(patch).unwrap();
+
+    let evaluated = evaluate_expression(&expression, &batch, Some(&output_type)).unwrap();
+
+    let output_field = &evaluated.as_struct().fields()[0];
+    assert!(Arc::ptr_eq(output_field, &batch.schema_ref().fields()[0]));
+}

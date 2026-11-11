@@ -24,15 +24,15 @@ use crate::arrow::compute::{
     and_kleene, can_cast_types, cast, filter_record_batch, is_not_null, is_null, not, or_kleene,
 };
 use crate::arrow::datatypes::{
-    DataType as ArrowDataType, Field as ArrowField, Fields as ArrowFields, IntervalUnit,
-    Schema as ArrowSchema, TimeUnit,
+    DataType as ArrowDataType, Field as ArrowField, FieldRef as ArrowFieldRef,
+    Fields as ArrowFields, IntervalUnit, Schema as ArrowSchema, TimeUnit,
 };
 use crate::arrow::error::ArrowError;
 use crate::arrow::json::StructMode;
 use crate::arrow::json::writer::{EncoderOptions, make_encoder};
 use crate::delta_kernel_derive::internal_api;
 use crate::engine::arrow_conversion::{
-    LIST_ARRAY_ROOT, TryFromKernel, TryIntoArrow, arrow_field_for,
+    LIST_ARRAY_ROOT, TryFromKernel, TryIntoArrow, arrow_field_for, is_arrow_field_for,
 };
 use crate::engine::arrow_expression::opaque::{
     ArrowOpaqueExpressionOpAdaptor, ArrowOpaquePredicateOpAdaptor,
@@ -214,6 +214,10 @@ fn evaluate_struct_patch_expression(
         None => batch,
     };
 
+    // The input field of each output column passed through unchanged, which may already be its
+    // output field.
+    let mut input_fields: Vec<Option<&ArrowFieldRef>> = vec![None; output_cols.len()];
+
     // Process each input field in order
     for input_field in source_data.schema_fields() {
         let field_name: &str = input_field.name();
@@ -221,6 +225,7 @@ fn evaluate_struct_patch_expression(
         let field_patch = patch.field_patches.get(field_name);
         if field_patch.is_none_or(|patch| patch.keep_input) {
             output_cols.push(extract_column(source_data, &[field_name])?);
+            input_fields.push(Some(input_field));
             let _ = next_output_type()?; // consume and discard the output schema field
         }
 
@@ -228,6 +233,7 @@ fn evaluate_struct_patch_expression(
         if let Some(field_patch) = field_patch {
             for expr in &field_patch.insertions {
                 output_cols.push(evaluate_expression(expr, batch, Some(next_output_type()?))?);
+                input_fields.push(None);
             }
             used_field_patches += 1;
         }
@@ -256,12 +262,21 @@ fn evaluate_struct_patch_expression(
     }
 
     // Build the final struct, preserving null bitmap for nested patches
-    let output_fields: Vec<ArrowField> = output_cols
+    input_fields.resize(output_cols.len(), None);
+    let output_fields: Vec<ArrowFieldRef> = output_cols
         .iter()
         .zip(output_schema.fields())
-        .map(|(output_col, output_field)| {
-            arrow_field_for(output_field, output_col.data_type().clone())
-        })
+        .zip(input_fields)
+        .map(
+            |((output_col, output_field), input_field)| match input_field {
+                Some(input_field)
+                    if is_arrow_field_for(input_field, output_field, output_col.data_type()) =>
+                {
+                    Ok(input_field.clone())
+                }
+                _ => arrow_field_for(output_field, output_col.data_type().clone()).map(Arc::new),
+            },
+        )
         .try_collect()?;
 
     // For nested patches, get the source struct's null bitmap to preserve null rows

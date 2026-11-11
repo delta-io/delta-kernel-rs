@@ -72,6 +72,19 @@ pub(crate) fn arrow_field_for(
     Ok(ArrowField::new(field.name(), data_type, field.is_nullable()).with_metadata(metadata))
 }
 
+/// Whether `arrow_field` already is the field [`arrow_field_for`] gives `field` for a column of
+/// `data_type`: same name, nullability, type, and metadata.
+pub(crate) fn is_arrow_field_for(
+    arrow_field: &ArrowField,
+    field: &StructField,
+    data_type: &ArrowDataType,
+) -> bool {
+    arrow_field.name() == field.name()
+        && arrow_field.is_nullable() == field.is_nullable()
+        && arrow_field.data_type() == data_type
+        && has_arrow_metadata_of(arrow_field, field)
+}
+
 /// Whether `arrow_field` has exactly the metadata [`arrow_field_for`] gives `field`. Compares
 /// without building that metadata.
 pub(crate) fn has_arrow_metadata_of(arrow_field: &ArrowField, field: &StructField) -> bool {

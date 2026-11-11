@@ -5,8 +5,8 @@ use std::sync::{Arc, LazyLock};
 use itertools::Itertools;
 
 use super::super::arrow_conversion::{
-    LIST_ARRAY_ROOT, MAP_KEY_DEFAULT, MAP_VALUE_DEFAULT, arrow_field_for, has_arrow_metadata_of,
-    has_field_id_metadata, lookup_nested_field_id, parquet_field_id_metadata,
+    LIST_ARRAY_ROOT, MAP_KEY_DEFAULT, MAP_VALUE_DEFAULT, arrow_field_for, has_field_id_metadata,
+    is_arrow_field_for, lookup_nested_field_id, parquet_field_id_metadata,
 };
 use super::make_arrow_error;
 use crate::KernelResult;
@@ -66,7 +66,9 @@ fn transform_struct(
             Some(target_field),
             &target_field.name,
         )?;
-        if transformed.is_none() && has_target_header(input_field, input_column, target_field) {
+        if transformed.is_none()
+            && is_arrow_field_for(input_field, target_field, input_column.data_type())
+        {
             fields.push(input_field.clone());
             columns.push(input_column.clone());
             continue;
@@ -105,15 +107,6 @@ fn transform_struct(
         struct_array.nulls().cloned(),
         struct_array.len(),
     )?))
-}
-
-/// Whether `field`, which holds `column`, already has the name, nullability, metadata, and type
-/// [`arrow_field_for`] gives `target`.
-fn has_target_header(field: &ArrowField, column: &ArrayRef, target: &StructField) -> bool {
-    field.name() == &target.name
-        && field.is_nullable() == target.nullable
-        && field.data_type() == column.data_type()
-        && has_arrow_metadata_of(field, target)
 }
 
 // Transform a struct array. The data is in `array`, and the target fields are in `kernel_fields`.
