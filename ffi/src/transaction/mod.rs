@@ -1128,8 +1128,6 @@ mod tests {
                     partition_values.shallow_copy(),
                     kernel_string_slice!(part_name),
                     crate::expressions::kernel_visitor::NullTypeTag::Integer as u8,
-                    0,
-                    0,
                     engine.shallow_copy(),
                 )
             });
