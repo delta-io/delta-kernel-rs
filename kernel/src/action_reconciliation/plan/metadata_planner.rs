@@ -1,14 +1,13 @@
 use std::sync::Arc;
 
-use super::action_set::{file_action_predicate, with_file_action_key};
+use super::action_set::{ActionSet, ActionSource};
 use super::{VERSION, sources};
 use crate::action_reconciliation::file_metadata::{
     PARTITION_VALUES_FIELD as PARTITION_VALUES,
     PARTITION_VALUES_PARSED_FIELD as PARTITION_VALUES_PARSED, STATS_FIELD as STATS,
 };
 use crate::actions::{
-    ADD_FIELD, ADD_NAME, ADD_SCHEMA, Add, LOG_ADD_SCHEMA, REMOVE_FIELD, REMOVE_NAME, STATS_PARSED,
-    get_all_actions_schema,
+    ADD_FIELD, ADD_NAME, ADD_SCHEMA, Add, REMOVE_NAME, STATS_PARSED, get_all_actions_schema,
 };
 use crate::checkpoint::CheckpointShape;
 use crate::checkpoint::collation_stats::source_collation_stats;
@@ -16,10 +15,9 @@ use crate::expressions::{
     Expression as Expr, Predicate, UnaryExpressionOp, col, column_name, expr,
 };
 use crate::log_segment::LogSegment;
-use crate::scan::{PartitionValuesOptions, StatsOptions};
+use crate::scan::{PartitionValuesOptions, StatsOptions, map_to_struct_options};
 use crate::schema::{
     CheckpointFieldKind, DataType, SchemaRef, SchemaStructPatchBuilder, StructField, StructType,
-    schema_ref,
 };
 use crate::struct_patch::ProjectionStructPatchBuilder;
 use crate::utils::FoldWithOption as _;
@@ -30,13 +28,17 @@ const IS_ADD: &str = "is_add";
 /// This planner centralizes schema and projection decisions shared by commits and checkpoints.
 /// For each source, it constructs a plan that:
 ///
-/// 1. Determines the read schema. A file may contain structured stats, JSON stats, or both; the
-///    planner selects the representation to read.
+/// 1. Derives action reads and identity keys from the replay intent and source. A file may contain
+///    structured stats, JSON stats, or both; the planner selects the representation to read.
 /// 2. Projects metadata before filtering, parsing JSON stats or deserializing partition values from
 ///    `map<string, string>` when needed for filtering or requested output.
 /// 3. Applies data skipping unless the user requests JSON stats without structured output.
 /// 4. Projects metadata after filtering into the stats and partition shape requested by the user.
-pub(crate) struct MetadataPlanner {
+#[derive(Clone)]
+pub(crate) struct MetadataPlanner<'a> {
+    pub(crate) segment: &'a LogSegment,
+    pub(crate) actions: ActionSet,
+    pub(crate) checkpoint_shape: Option<CheckpointShape>,
     pub(crate) stats: StatsOptions,
     pub(crate) partitions: PartitionValuesOptions,
     pub(crate) stats_schema: Option<SchemaRef>,
@@ -55,18 +57,79 @@ enum StatsKind {
     Both,
 }
 
-impl MetadataPlanner {
-    /// Build normalized CRC adds with their file identity key.
-    pub(crate) fn crc_arm_with_action_key(&self, files: Vec<Add>) -> KernelResult<PlanBuilder> {
-        self.build_metadata_scan(&LOG_ADD_SCHEMA, false, |schema| {
-            sources::crc_arm(files, schema)
-        })?
-        .project_patch(|patch| with_file_action_key(patch, false))
+impl<'a> MetadataPlanner<'a> {
+    /// Binds the source context for one metadata plan. Callers supply resolved metadata schemas.
+    pub(crate) fn new(segment: &'a LogSegment, actions: ActionSet) -> Self {
+        Self {
+            segment,
+            actions,
+            checkpoint_shape: None,
+            stats: StatsOptions::none(),
+            partitions: PartitionValuesOptions::default(),
+            stats_schema: None,
+            output_stats_schema: None,
+            parsed_partition_schema: None,
+            read_collations: false,
+            stats_filter: None,
+        }
     }
 
-    /// Build normalized checkpoint adds. Returns an empty relation when no checkpoint exists.
+    pub(crate) fn with_checkpoint_shape(
+        mut self,
+        checkpoint_shape: impl Into<Option<CheckpointShape>>,
+    ) -> Self {
+        self.checkpoint_shape = checkpoint_shape.into();
+        self
+    }
+
+    pub(crate) fn with_stats(mut self, stats: StatsOptions) -> Self {
+        self.stats = stats;
+        self
+    }
+
+    /// Sets the resolved schemas used to read statistics and project structured output.
+    pub(crate) fn with_stats_schemas(
+        mut self,
+        read: Option<SchemaRef>,
+        output: Option<SchemaRef>,
+    ) -> Self {
+        self.stats_schema = read;
+        self.output_stats_schema = output;
+        self
+    }
+
+    pub(crate) fn with_partition_values(
+        mut self,
+        options: PartitionValuesOptions,
+        parsed_schema: Option<SchemaRef>,
+    ) -> Self {
+        self.partitions = options;
+        self.parsed_partition_schema = parsed_schema;
+        self
+    }
+
+    pub(crate) fn with_read_collations(mut self, read_collations: bool) -> Self {
+        self.read_collations = read_collations;
+        self
+    }
+
+    pub(crate) fn with_stats_filter(mut self, predicate: Option<Predicate>) -> Self {
+        self.stats_filter = predicate;
+        self
+    }
+
+    /// Builds normalized live adds from a CRC with the supplied version and action key.
+    /// Requires [`ActionSet::live_adds`].
+    pub(crate) fn crc_adds(&self, version: Version, files: Vec<Add>) -> KernelResult<PlanBuilder> {
+        self.build_metadata_plan(ActionSource::Crc, None, |schema| {
+            sources::crc_arm(files, version, self.actions, schema)
+        })
+    }
+
+    /// Builds checkpoint actions for the replay intent, reading tombstones only when requested.
+    /// Returns an empty relation when no checkpoint exists.
     ///
-    /// ## SQL equivalent:
+    /// ## SQL equivalent (live adds with tombstones):
     ///
     /// SELECT STRUCT(
     ///          add.* EXCEPT (
@@ -75,57 +138,52 @@ impl MetadataPlanner {
     ///          add.stats_parsed AS stats_parsed,
     ///          add.partitionValues_parsed AS partitionValues_parsed
     ///        ) AS add,
-    ///        file_key(add) AS action_key
+    ///        remove,
+    ///        version,
+    ///        action_key(add, remove) AS action_key
     /// FROM checkpoint_actions
-    /// WHERE add.path IS NOT NULL
+    /// WHERE add.path IS NOT NULL OR remove.path IS NOT NULL
     ///
     /// When the checkpoint lacks native parsed metadata, `FROM_JSON(add.stats, physical_stats)`
     /// and `MAP_TO_STRUCT(add.partitionValues, physical_partitions)` replace the corresponding
     /// fields above. Parsed fields are omitted when unrequested or their schema is absent.
     /// JSON stats are retained or synthesized only when requested.
-    pub(crate) fn checkpoint_arm_with_action_key(
-        &self,
-        log_segment: &LogSegment,
-        shape: &CheckpointShape,
-    ) -> KernelResult<PlanBuilder> {
-        let available_file_schema = shape
-            .leaf_checkpoint_schema
-            .as_deref()
-            .unwrap_or(get_all_actions_schema());
-        self.build_metadata_scan(available_file_schema, false, |schema| {
-            sources::checkpoint_arm(log_segment, shape, schema)?
-                .filter(file_action_predicate(false))
-        })?
-        .project_patch(|patch| with_file_action_key(patch, false).drop(VERSION))
+    /// Without tombstones, remove fields are omitted from the read, filter, and key.
+    pub(crate) fn checkpoint_actions(&self) -> KernelResult<PlanBuilder> {
+        let checkpoint_shape = self.checkpoint_shape.as_ref();
+        self.build_metadata_plan(ActionSource::Checkpoint, checkpoint_shape, |schema| {
+            sources::checkpoint_actions(self.segment, checkpoint_shape, self.actions, schema)
+        })
     }
 
-    /// Build the normalized commit JSON arm.
+    /// Builds commit actions and identity keys needed to reconstruct the requested state.
     /// When `base_version` is set, only commits newer than that base are read.
+    /// Reconstructing live adds always reads commit removes, even when tombstones are not
+    /// requested.
     ///
-    /// ## SQL equivalent:
+    /// ## SQL equivalent (live adds with tombstones):
     ///
     /// SELECT STRUCT(
     ///          add.* EXCEPT (stats_parsed, partitionValues_parsed),
     ///          FROM_JSON(add.stats, physical_stats) AS stats_parsed,
     ///          MAP_TO_STRUCT(add.partitionValues, physical_partitions) AS partitionValues_parsed
     ///        ) AS add,
+    ///        remove,
     ///        version,
-    ///        file_key(COALESCE(add, remove)) AS action_key
+    ///        action_key(add, remove) AS action_key
     /// FROM json_commits
     /// WHERE add.path IS NOT NULL OR remove.path IS NOT NULL
     ///
     /// Parsed fields are omitted when unrequested or their schema is absent.
     /// JSON stats are retained or synthesized only when requested.
-    pub(crate) fn commit_arm_with_action_key(
+    /// Unrequested tombstones retain their rows and keys for replay without the remove payload.
+    pub(crate) fn commit_actions(
         &self,
-        log_segment: &LogSegment,
         base_version: Option<Version>,
     ) -> KernelResult<PlanBuilder> {
-        self.build_metadata_scan(get_all_actions_schema(), true, |schema| {
-            sources::commit_arm(log_segment, base_version, schema)?
-                .filter(file_action_predicate(true))
-        })?
-        .project_patch(|patch| with_file_action_key(patch, true).drop(REMOVE_NAME))
+        self.build_metadata_plan(ActionSource::Commit, None, |schema| {
+            sources::commit_arm(self.segment, base_version, schema)
+        })
     }
 
     /// Whether [`CheckpointShape`](crate::checkpoint::CheckpointShape) should inspect the
@@ -135,17 +193,31 @@ impl MetadataPlanner {
         self.stats_schema.is_some() || self.parsed_partition_schema.is_some()
     }
 
-    /// Plans a metadata source using its physical schema. `source` must honor the supplied read
-    /// schema; `read_removes` keeps remove actions for replay.
-    fn build_metadata_scan(
+    /// Reads and filters selected actions, attaches their identity key, then prepares metadata.
+    /// Representation is determined from the source shape and the requested options.
+    fn build_metadata_plan(
         &self,
-        available_file_schema: &StructType,
-        read_removes: bool,
-        source: impl FnOnce(SchemaRef) -> KernelResult<PlanBuilder>,
+        source: ActionSource,
+        checkpoint_shape: Option<&CheckpointShape>,
+        read_source: impl FnOnce(SchemaRef) -> KernelResult<PlanBuilder>,
     ) -> KernelResult<PlanBuilder> {
         let (read_schema, current_stats_kind, has_struct_partitions) =
-            self.read_schema(available_file_schema, read_removes)?;
-        let plan = source(read_schema)?;
+            self.read_schema(source, checkpoint_shape)?;
+        let (key_field, key_expr) = self.actions.key(source)?;
+        let plan = read_source(read_schema)?
+            .filter(self.actions.predicate_from_source(source))?
+            .project_patch(|patch| {
+                let patch = patch.append(key_field, key_expr);
+                if self.actions.reads_removes(source) && !self.actions.include_tombstones {
+                    // The key still cancels older adds without carrying the remove payload.
+                    patch.drop(REMOVE_NAME)
+                } else {
+                    patch
+                }
+            })?;
+        if !self.actions.live_adds {
+            return Ok(plan);
+        }
         let (plan, current_stats_kind) =
             self.prepare_metadata(plan, current_stats_kind, has_struct_partitions)?;
         let plan = plan.try_fold_with(self.stats_filter.as_ref(), |plan, predicate| {
@@ -154,7 +226,7 @@ impl MetadataPlanner {
         self.project_output(plan, current_stats_kind)
     }
 
-    /// Selects one stats representation from the physical schema.
+    /// Prunes reads to selected actions and the required metadata representations.
     ///
     /// # Returns
     ///
@@ -162,9 +234,24 @@ impl MetadataPlanner {
     /// representation, and whether the schema includes native `add.partitionValues_parsed`.
     fn read_schema(
         &self,
-        file_schema: &StructType,
-        read_removes: bool,
+        source: ActionSource,
+        checkpoint_shape: Option<&CheckpointShape>,
     ) -> KernelResult<(SchemaRef, StatsKind, bool)> {
+        let selected = self.actions.schema(source)?;
+        let action_patch =
+            SchemaStructPatchBuilder::new().append(StructField::nullable(VERSION, DataType::LONG));
+        // Only file actions require resolving the checkpoint shape and statistics.
+        // If there are no file actions, exit early.
+        if !self.actions.live_adds {
+            return Ok((
+                Arc::new(action_patch.build(&selected)?),
+                StatsKind::None,
+                false,
+            ));
+        }
+        let file_schema = checkpoint_shape
+            .and_then(|checkpoint_shape| checkpoint_shape.leaf_checkpoint_schema.as_deref())
+            .unwrap_or(get_all_actions_schema());
         let add_field = file_schema.field(ADD_NAME).unwrap_or(&ADD_FIELD);
         let file_add_schema = match add_field.data_type() {
             DataType::Struct(add) => add,
@@ -208,7 +295,9 @@ impl MetadataPlanner {
                 (patch, StatsKind::Struct)
             }
             // Json stats are used either by the dataskipping filter or are requested by the user
-            _ if self.stats_schema.is_some() => (patch, StatsKind::Json),
+            _ if self.stats.synthesize_json || self.stats_schema.is_some() => {
+                (patch, StatsKind::Json)
+            }
             // Neither the user nor the data skipping filter needs stats. Drop them.
             _ => (patch.drop(STATS), StatsKind::None),
         };
@@ -233,12 +322,13 @@ impl MetadataPlanner {
             _ => (patch, false),
         };
 
-        let read_schema = schema_ref! {
-            nullable ADD_NAME: (add_patch.build(&ADD_SCHEMA)?),
-            ..(read_removes.then_some(&REMOVE_FIELD)),
-            nullable VERSION: LONG,
-        };
-        Ok((read_schema, stats_kind, has_struct_partitions))
+        let read_schema = action_patch
+            .replace(
+                ADD_NAME,
+                StructField::nullable(ADD_NAME, add_patch.build(&ADD_SCHEMA)?),
+            )
+            .build(&selected)?;
+        Ok((Arc::new(read_schema), stats_kind, has_struct_partitions))
     }
 
     /// Adds structured metadata needed by the stats filter or requested output when the source
@@ -278,8 +368,10 @@ impl MetadataPlanner {
                 })
                 .fold_with(partition_schema_to_parse, |patch, schema| {
                     let field = StructField::nullable(PARTITION_VALUES_PARSED, schema.clone());
-                    let expr =
-                        Expr::map_to_struct(col!(ADD_NAME, PARTITION_VALUES), Default::default());
+                    let expr = Expr::map_to_struct(
+                        col!(ADD_NAME, PARTITION_VALUES),
+                        map_to_struct_options(self.partitions.timestamp_timezone.as_deref()),
+                    );
                     patch.insert_after_at([ADD_NAME], PARTITION_VALUES, field, expr)
                 })
                 .fold_with(parse_for_filter.then_some(()), |patch, _| {
@@ -292,17 +384,14 @@ impl MetadataPlanner {
 
     /// Projects the requested stats and partition representations after pruning. Stats may contain
     /// JSON only, parsed only, both, or neither; parsed partitions are independent and omitted for
-    /// unpartitioned tables. Removes filter-only fields and `is_add`, retaining `remove` and
-    /// `version` for replay.
+    /// unpartitioned tables. Removes filter-only fields and `is_add`, retaining the requested
+    /// actions and `version` for replay.
     fn project_output(&self, plan: PlanBuilder, stats: StatsKind) -> KernelResult<PlanBuilder> {
         let output_stats_schema = self.output_stats_schema.as_ref();
 
+        let input_schema = plan.schema().clone();
+        let read_stats = get_parsed_stats_field(stats, &input_schema)?;
         plan.project_patch(|mut patch| {
-            let read_stats = patch
-                .input_schema()
-                .field_at(&column_name!(ADD_NAME, STATS_PARSED))
-                .ok()
-                .map(StructField::data_type);
             let mut patch = match stats {
                 StatsKind::None => patch,
                 StatsKind::Json => patch.fold_with(output_stats_schema, |patch, schema| {
@@ -321,9 +410,7 @@ impl MetadataPlanner {
                     // TODO(#3535): Remove support for outputting both structured and JSON stats.
                     match (read_stats, output_stats_schema) {
                         (_, None) => patch.drop_at([ADD_NAME], STATS_PARSED),
-                        (Some(DataType::Struct(read)), Some(output))
-                            if read.as_ref() != output.as_ref() =>
-                        {
+                        (Some(read), Some(output)) if read != output.as_ref() => {
                             let mut parent = vec![ADD_NAME.into(), STATS_PARSED.into()];
                             Self::project_filter_only_stats(patch, read, output, &mut parent)
                         }
@@ -371,5 +458,23 @@ impl MetadataPlanner {
             }
         }
         patch
+    }
+}
+
+fn get_parsed_stats_field(
+    stats: StatsKind,
+    schema: &StructType,
+) -> KernelResult<Option<&StructType>> {
+    match stats {
+        StatsKind::Struct | StatsKind::Both => match schema
+            .field_at(&column_name!(ADD_NAME, STATS_PARSED))?
+            .data_type()
+        {
+            DataType::Struct(read) => Ok(Some(read.as_ref())),
+            _ => Err(KernelError::schema(
+                "Parsed statistics must have a struct type",
+            )),
+        },
+        StatsKind::None | StatsKind::Json => Ok(None),
     }
 }

@@ -18,7 +18,7 @@ use crate::action_reconciliation::file_metadata::PARTITION_VALUES_PARSED_FIELD a
 use crate::action_reconciliation::file_metadata::STATS_FIELD as STATS;
 pub(super) use crate::action_reconciliation::plan::MetadataPlanner;
 use crate::action_reconciliation::plan::VERSION;
-use crate::action_reconciliation::plan::action_set::ACTION_KEY;
+use crate::action_reconciliation::plan::action_set::{ACTION_KEY, ActionSet};
 #[cfg(test)]
 use crate::actions::ADD_SCHEMA;
 use crate::actions::{ADD_NAME, STATS_PARSED};
@@ -45,24 +45,8 @@ pub(super) use metadata_replay_base::MetadataReplayBase;
 #[cfg(test)]
 const IS_ADD: &str = "is_add";
 
-impl MetadataPlanner {
-    pub(super) fn try_from_scan(scan: &Scan) -> KernelResult<Self> {
-        let stats_schema = if scan.stats.synthesize_json {
-            let config = scan.snapshot.table_configuration();
-            let columns = config
-                .physical_data_schema_without_partition_columns()
-                .leaves(None);
-            // JSON synthesis must retain stats outside the scan's requested and indexed columns.
-            let builder = config
-                .stats_schema_builder()
-                .with_required_physical_columns(Some(columns.as_ref().0))
-                .with_variant_min_max(scan.stats.variant_min_max);
-            #[cfg(feature = "geo-type-in-dev")]
-            let builder = builder.with_geometry_min_max(scan.stats.geometry_min_max);
-            Some(builder.build()?)
-        } else {
-            scan.state_info.physical_stats_read_schema().cloned()
-        };
+impl<'a> MetadataPlanner<'a> {
+    pub(super) fn try_from_scan(scan: &'a Scan) -> KernelResult<Self> {
         let enable_metadata_filter =
             !scan.stats.synthesize_json || scan.state_info.physical_stats_output_schema().is_some();
         let stats_filter = enable_metadata_filter
@@ -77,11 +61,15 @@ impl MetadataPlanner {
         Ok(Self {
             stats: scan.stats.clone(),
             partitions: scan.partition_values_options.clone(),
-            stats_schema,
+            stats_schema: scan
+                .stats
+                .json_synthesis_schema(scan.snapshot.table_configuration())?
+                .or_else(|| scan.state_info.physical_stats_read_schema().cloned()),
             output_stats_schema: scan.state_info.physical_stats_output_schema().cloned(),
             parsed_partition_schema: parsed_partition_schema.cloned(),
             read_collations: scan.needs_collation_stats_schema(),
             stats_filter,
+            ..Self::new(scan.snapshot.log_segment(), ActionSet::live_adds())
         })
     }
 }
@@ -99,20 +87,19 @@ impl Scan {
     pub(super) fn build_metadata_scan_plan_with(
         &self,
         base: MetadataReplayBase,
-        planner: &MetadataPlanner,
+        planner: &MetadataPlanner<'_>,
     ) -> KernelResult<Option<Plan>> {
         let state = &self.state_info;
         if state.physical_predicate == PhysicalPredicate::StaticSkipAll {
             return Ok(None);
         }
 
-        let log_segment = self.snapshot.log_segment();
-        let commit_actions = planner.commit_arm_with_action_key(log_segment, base.version())?;
+        let commit_actions = planner.commit_actions(base.version())?;
 
         let deduped_commit = commit_actions.aggregate_by([column_name!(ACTION_KEY)], |a| {
             // Each group with a non-null ACTION_KEY contains the adds and removes for a given
             // file; winning adds pass through unchanged while winning removes produce NULL. Non-
-            // file actions have NULL ACTION_KEY and map to their own NULL group.
+            // file actions have a NULL file-identity lane and group by their own identity lanes.
             a.max_non_null_by(
                 column_name!(ADD_NAME),
                 column_name!(ACTION_KEY),
@@ -121,10 +108,11 @@ impl Scan {
         })?;
 
         let base_adds = match base {
-            MetadataReplayBase::Crc { files, .. } => planner.crc_arm_with_action_key(files),
-            MetadataReplayBase::Checkpoint { shape, .. } => {
-                planner.checkpoint_arm_with_action_key(log_segment, &shape)
-            }
+            MetadataReplayBase::Crc { version, files } => planner.crc_adds(version, files),
+            MetadataReplayBase::Checkpoint { shape, .. } => planner
+                .clone()
+                .with_checkpoint_shape(shape)
+                .checkpoint_actions(),
         }?;
 
         let base_live_adds = base_adds
@@ -133,7 +121,7 @@ impl Scan {
                 [column_name!(ACTION_KEY)],
                 [column_name!(ACTION_KEY)],
             )?
-            .project_patch(|patch| patch.drop(ACTION_KEY))?;
+            .project_patch(|patch| patch.drop(ACTION_KEY).drop(VERSION))?;
 
         let commit_live_adds = deduped_commit
             .filter(Predicate::from_expr(expr!(is_not_null(col("add")))))?
@@ -146,7 +134,7 @@ impl Scan {
     fn build_metadata_scan_plan(
         &self,
         shape: &CheckpointShape,
-        planner: &MetadataPlanner,
+        planner: &MetadataPlanner<'_>,
     ) -> KernelResult<Option<Plan>> {
         let base = MetadataReplayBase::Checkpoint {
             version: self.snapshot.log_segment().checkpoint_version,
@@ -914,7 +902,8 @@ mod tests {
         let planner = MetadataPlanner::try_from_scan(&scan)?;
         let file_shape = shape(CheckpointType::Leaf, planner.stats_schema.clone());
         let plan = planner
-            .checkpoint_arm_with_action_key(scan.snapshot.log_segment(), &file_shape)?
+            .with_checkpoint_shape(file_shape)
+            .checkpoint_actions()?
             .build()?;
         assert_eq!(tags(&plan), ["values"]);
         Ok(())
@@ -966,7 +955,8 @@ mod tests {
             leaf_checkpoint_schema: Some(file_schema),
         };
         let plan = MetadataPlanner::try_from_scan(&scan)?
-            .checkpoint_arm_with_action_key(scan.snapshot.log_segment(), &file_shape)?
+            .with_checkpoint_shape(file_shape.clone())
+            .checkpoint_actions()?
             .build()?;
         assert_eq!(
             add_struct(leaf_read_schema(&plan, &file_shape)),
