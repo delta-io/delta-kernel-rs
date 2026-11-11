@@ -23,7 +23,7 @@ use crate::engine::arrow_expression::opaque::{
     ArrowOpaqueExpression as _, ArrowOpaqueExpressionOp, ArrowOpaquePredicate as _,
     ArrowOpaquePredicateOp,
 };
-use crate::engine::arrow_utils::apply_schema::apply_schema;
+use crate::engine::arrow_utils::apply_schema::{apply_schema, apply_schema_to};
 use crate::expressions::*;
 use crate::kernel_predicates::{
     DirectDataSkippingPredicateEvaluator, DirectPredicateEvaluator,
@@ -32,8 +32,8 @@ use crate::kernel_predicates::{
 #[cfg(feature = "geo-type-in-dev")]
 use crate::schema::EdgeInterpolationAlgorithm;
 use crate::schema::{
-    ArrayType, DataType as KernelDataType, IntervalYearToMonthType, MapType, StructField,
-    StructType, schema, schema_ref,
+    ArrayType, ColumnMetadataKey, DataType as KernelDataType, IntervalYearToMonthType, MapType,
+    StructField, StructType, schema, schema_ref,
 };
 use crate::unit_test_utils::assert_result_error_with_message;
 #[cfg(feature = "geo-type-in-dev")]
@@ -1831,4 +1831,33 @@ fn test_geo_append_null_unsupported(#[case] dt: KernelDataType) {
         matches!(err, KernelError::Unsupported(_)),
         "expected Unsupported, got: {err:?}"
     );
+}
+
+/// Struct evaluation builds the fields applying the output type gives, so applying it reuses the
+/// evaluated array instead of rebuilding it.
+#[rstest]
+#[case::struct_expression(Expr::struct_from([col!("a"), Expr::struct_from([lit(7)])]))]
+#[case::struct_patch(
+    Expr::struct_patch(
+        ExpressionStructPatchBuilder::new().insert_after("a", Expr::struct_from([lit(7)]))
+    )
+    .unwrap()
+)]
+fn test_struct_evaluation_output_already_conforms(#[case] expression: Expr) {
+    let field_id = |id: i64| [(ColumnMetadataKey::ParquetFieldId.as_ref(), id)];
+    let batch =
+        RecordBatch::try_from_iter([("a", Arc::new(Int32Array::from(vec![1])) as ArrayRef)])
+            .unwrap();
+    let inner = StructType::new_unchecked([
+        StructField::not_null("x", KernelDataType::INTEGER).with_metadata(field_id(3))
+    ]);
+    let output_type = KernelDataType::from(StructType::new_unchecked([
+        StructField::nullable("a", KernelDataType::INTEGER).with_metadata(field_id(1)),
+        StructField::nullable("b", inner).with_metadata(field_id(2)),
+    ]));
+
+    let evaluated = evaluate_expression(&expression, &batch, Some(&output_type)).unwrap();
+    let conformed = apply_schema_to(&evaluated, &output_type).unwrap();
+
+    assert!(Arc::ptr_eq(&evaluated, &conformed));
 }

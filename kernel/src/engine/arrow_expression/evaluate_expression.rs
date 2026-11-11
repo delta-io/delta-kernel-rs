@@ -31,7 +31,9 @@ use crate::arrow::error::ArrowError;
 use crate::arrow::json::StructMode;
 use crate::arrow::json::writer::{EncoderOptions, make_encoder};
 use crate::delta_kernel_derive::internal_api;
-use crate::engine::arrow_conversion::{LIST_ARRAY_ROOT, TryFromKernel, TryIntoArrow};
+use crate::engine::arrow_conversion::{
+    LIST_ARRAY_ROOT, TryFromKernel, TryIntoArrow, arrow_field_for,
+};
 use crate::engine::arrow_expression::opaque::{
     ArrowOpaqueExpressionOpAdaptor, ArrowOpaquePredicateOpAdaptor,
 };
@@ -143,14 +145,9 @@ fn evaluate_struct_expression(
         .iter()
         .zip(output_schema.fields())
         .map(|(output_col, output_field)| {
-            ArrowField::new(
-                output_field.name(),
-                output_col.data_type().clone(),
-                output_field.nullable, /* Use schema's nullability; Arrow will validate any
-                                        * mismatch */
-            )
+            arrow_field_for(output_field, output_col.data_type().clone())
         })
-        .collect();
+        .try_collect()?;
     let null_buffer = if let Some(predicate_expr) = nullability_predicate {
         let predicate_array = evaluate_expression(predicate_expr, batch, Some(&DataType::BOOLEAN))?;
         let bool_array = predicate_array
@@ -263,13 +260,9 @@ fn evaluate_struct_patch_expression(
         .iter()
         .zip(output_schema.fields())
         .map(|(output_col, output_field)| {
-            ArrowField::new(
-                output_field.name(),
-                output_col.data_type().clone(),
-                output_col.is_nullable(),
-            )
+            arrow_field_for(output_field, output_col.data_type().clone())
         })
-        .collect();
+        .try_collect()?;
 
     // For nested patches, get the source struct's null bitmap to preserve null rows
     let source_null_buffer = source_array.as_ref().and_then(|arr| {
