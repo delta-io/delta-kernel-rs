@@ -4,11 +4,12 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use delta_kernel::arrow::array::{
-    Array, ArrayRef, BinaryArray, Int32Array, Int32Builder, LargeListArray, LargeListBuilder,
-    StringArray, StringBuilder, StructArray, TimestampMicrosecondArray, new_null_array,
+    Array, ArrayRef, BinaryArray, Int32Array, Int32Builder, ListArray, ListBuilder, StringArray,
+    StringBuilder, StructArray, TimestampMicrosecondArray, new_null_array,
 };
 use delta_kernel::arrow::buffer::{NullBuffer, OffsetBuffer};
-use delta_kernel::arrow::datatypes::{DataType as ArrowDataType, Field};
+use delta_kernel::arrow::compute::cast;
+use delta_kernel::arrow::datatypes::{DataType as ArrowDataType, Field, FieldRef};
 use delta_kernel::arrow::record_batch::RecordBatch;
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_conversion::{TryFromKernel, TryIntoArrow as _};
@@ -624,12 +625,19 @@ async fn test_not_null_data_column_rejects_null_in_batch(
     Ok(())
 }
 
-/// Writes `LargeList` columns (a list of strings, a list of structs, and a list inside a struct)
-/// through the logical-to-physical transform and reads them back. The batch is sliced so every
-/// list's first offset is non-zero.
+/// Writes columns of each Arrow list type (a list of strings, a list of structs, and a list inside
+/// a struct) through the logical-to-physical transform and reads them back. The batch is sliced so
+/// every list's first offset is non-zero.
 #[rstest]
 #[tokio::test]
-async fn test_write_large_list_columns(
+async fn test_write_columns_of_each_arrow_list_type(
+    #[values(
+        ArrowDataType::List,
+        ArrowDataType::LargeList,
+        ArrowDataType::ListView,
+        ArrowDataType::LargeListView
+    )]
+    list_type: fn(FieldRef) -> ArrowDataType,
     #[values("none", "id", "name")] column_mapping_mode: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let schema = schema_ref! {
@@ -645,14 +653,20 @@ async fn test_write_large_list_columns(
         &[("delta.columnMapping.mode", column_mapping_mode)],
     )?;
 
-    let mut tags = LargeListBuilder::new(StringBuilder::new());
+    let as_list_type = |list: ArrayRef| -> ArrayRef {
+        let ArrowDataType::List(element) = list.data_type() else {
+            panic!("expected a List, got {}", list.data_type());
+        };
+        cast(&list, &list_type(element.clone())).unwrap()
+    };
+    let mut tags = ListBuilder::new(StringBuilder::new());
     tags.extend([
         Some(vec![Some("dropped")]),
         Some(vec![Some("a"), None]),
         None,
         Some(vec![]),
     ]);
-    let tags = tags.finish();
+    let tags = as_list_type(Arc::new(tags.finish()));
     let labels: ArrayRef = Arc::new(StringArray::from(vec![
         Some("dropped"),
         Some("x"),
@@ -663,27 +677,27 @@ async fn test_write_large_list_columns(
         Arc::new(Field::new("label", ArrowDataType::Utf8, true)),
         labels,
     )]);
-    let items = LargeListArray::new(
+    let items = as_list_type(Arc::new(ListArray::new(
         Arc::new(Field::new_list_field(item_values.data_type().clone(), true)),
         OffsetBuffer::from_lengths([1, 2, 0, 1]),
         Arc::new(item_values),
         Some(NullBuffer::from(vec![true, true, false, true])),
-    );
-    let mut ids = LargeListBuilder::new(Int32Builder::new());
+    )));
+    let mut ids = ListBuilder::new(Int32Builder::new());
     ids.extend([
         Some(vec![Some(0)]),
         Some(vec![Some(1), Some(2)]),
         None,
         Some(vec![]),
     ]);
-    let ids = ids.finish();
+    let ids = as_list_type(Arc::new(ids.finish()));
     let meta = StructArray::from(vec![(
         Arc::new(Field::new("ids", ids.data_type().clone(), true)),
-        Arc::new(ids) as ArrayRef,
+        ids,
     )]);
     let data = RecordBatch::try_from_iter([
-        ("tags", Arc::new(tags) as ArrayRef),
-        ("items", Arc::new(items) as ArrayRef),
+        ("tags", tags),
+        ("items", items),
         ("meta", Arc::new(meta) as ArrayRef),
     ])?
     .slice(1, 3);

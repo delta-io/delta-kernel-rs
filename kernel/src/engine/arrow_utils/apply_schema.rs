@@ -144,56 +144,60 @@ pub(crate) fn apply_schema_to_struct(
     transform_struct(sa, kernel_fields.fields())
 }
 
-// Rebuild a `List`, `LargeList`, `ListView`, or `LargeListView` array under the contract of
-// [`apply_schema_to_inner`] (see that fn's doc for an example). The rebuilt array keeps the
-// input's Arrow list type and reuses its offsets, sizes, and null buffer.
+// Apply the kernel element schema while preserving the input's Arrow list representation.
+// Kernel's `ArrayType` specifies element type and nullability. The input Arrow type determines
+// the list layout and offset width. Rebuild that type to reuse its offsets, sizes, and null buffer.
+// See `apply_schema_to_inner` for the recursive field transformation.
 fn apply_schema_to_list(
     array: &ArrayRef,
     target_inner_type: &ArrayType,
     ancestor: Option<&StructField>,
     relative_path: &str,
 ) -> KernelResult<ArrayRef> {
-    let rebuilt: ArrayRef = match array.data_type() {
-        ArrowDataType::LargeList(_) => Arc::new(apply_schema_to_generic_list::<i64>(
-            array,
+    let rebuilt: ArrayRef = if let Some(list) = array.as_list_opt::<i32>() {
+        Arc::new(apply_schema_to_generic_list(
+            list,
             target_inner_type,
             ancestor,
             relative_path,
-        )?),
-        ArrowDataType::ListView(_) => Arc::new(apply_schema_to_generic_list_view::<i32>(
-            array,
+        )?)
+    } else if let Some(list) = array.as_list_opt::<i64>() {
+        Arc::new(apply_schema_to_generic_list(
+            list,
             target_inner_type,
             ancestor,
             relative_path,
-        )?),
-        ArrowDataType::LargeListView(_) => Arc::new(apply_schema_to_generic_list_view::<i64>(
-            array,
+        )?)
+    } else if let Some(list_view) = array.as_list_view_opt::<i32>() {
+        Arc::new(apply_schema_to_generic_list_view(
+            list_view,
             target_inner_type,
             ancestor,
             relative_path,
-        )?),
-        _ => Arc::new(apply_schema_to_generic_list::<i32>(
-            array,
+        )?)
+    } else if let Some(list_view) = array.as_list_view_opt::<i64>() {
+        Arc::new(apply_schema_to_generic_list_view(
+            list_view,
             target_inner_type,
             ancestor,
             relative_path,
-        )?),
+        )?)
+    } else {
+        return Err(make_arrow_error(format!(
+            "Expected a variable-length list type, got {}",
+            array.data_type()
+        )));
     };
     Ok(rebuilt)
 }
 
 fn apply_schema_to_generic_list<O: OffsetSizeTrait>(
-    array: &dyn Array,
+    list: &GenericListArray<O>,
     target_inner_type: &ArrayType,
     ancestor: Option<&StructField>,
     relative_path: &str,
 ) -> KernelResult<GenericListArray<O>> {
-    let Some(la) = array.as_list_opt::<O>() else {
-        return Err(make_arrow_error(
-            "Arrow claimed to be a list but isn't a ListArray",
-        ));
-    };
-    let (element_field, offsets, values, nulls) = la.clone().into_parts();
+    let (element_field, offsets, values, nulls) = list.clone().into_parts();
     let (element_field, values) = apply_schema_to_list_element(
         &element_field,
         &values,
@@ -210,17 +214,12 @@ fn apply_schema_to_generic_list<O: OffsetSizeTrait>(
 }
 
 fn apply_schema_to_generic_list_view<O: OffsetSizeTrait>(
-    array: &dyn Array,
+    list_view: &GenericListViewArray<O>,
     target_inner_type: &ArrayType,
     ancestor: Option<&StructField>,
     relative_path: &str,
 ) -> KernelResult<GenericListViewArray<O>> {
-    let Some(lv) = array.as_list_view_opt::<O>() else {
-        return Err(make_arrow_error(
-            "Arrow claimed to be a list view but isn't a ListViewArray",
-        ));
-    };
-    let (element_field, offsets, sizes, values, nulls) = lv.clone().into_parts();
+    let (element_field, offsets, sizes, values, nulls) = list_view.clone().into_parts();
     let (element_field, values) = apply_schema_to_list_element(
         &element_field,
         &values,
@@ -530,18 +529,19 @@ mod apply_schema_validation_tests {
 
     use super::*;
     use crate::arrow::array::{
-        ArrayRef, BinaryArray, Int32Array, ListArray, RecordBatch, StructArray,
+        ArrayRef, BinaryArray, FixedSizeListArray, Int32Array, RecordBatch, StructArray,
         TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
         TimestampSecondArray, make_array,
     };
-    use crate::arrow::buffer::{BooleanBuffer, NullBuffer, OffsetBuffer};
+    use crate::arrow::buffer::{BooleanBuffer, NullBuffer};
     use crate::arrow::datatypes::{
         DataType as ArrowDataType, Field as ArrowField, Fields, Schema as ArrowSchema, TimeUnit,
         TimestampMicrosecondType,
     };
     #[cfg(feature = "udt-in-dev")]
     use crate::engine::arrow_conversion::TryIntoArrow as _;
-    use crate::engine::arrow_utils::{ReorderIndex, reorder_struct_array};
+    use crate::engine::arrow_utils::{ReorderIndex, list_type_with_element, reorder_struct_array};
+    use crate::engine::test_utils::{ListFlavor, struct_list_fixture_as};
     use crate::parquet::arrow::PARQUET_FIELD_ID_META_KEY;
     use crate::schema::{
         ColumnMetadataKey, DataType, MetadataValue, StructField, StructType, schema,
@@ -637,36 +637,24 @@ mod apply_schema_validation_tests {
         assert_eq!(result.data_type(), variant.data_type());
     }
 
-    /// A list column keeps its Arrow list type and data, and takes the kernel's element
-    /// nullability and nested field id.
+    /// A list column keeps its Arrow list type, reuses its offsets and sizes, and takes the
+    /// kernel's element nullability and nested field id. The view fixtures lay rows out back to
+    /// front.
     #[rstest]
     fn test_apply_schema_keeps_arrow_list_type(
         #[values(
-            ArrowDataType::List,
-            ArrowDataType::LargeList,
-            ArrowDataType::ListView,
-            ArrowDataType::LargeListView
+            ListFlavor::List,
+            ListFlavor::LargeList,
+            ListFlavor::ListView,
+            ListFlavor::LargeListView
         )]
-        list_type: fn(FieldRef) -> ArrowDataType,
+        flavor: ListFlavor,
     ) {
-        let element = |nullable: bool, metadata: HashMap<String, String>| {
-            Arc::new(
-                ArrowField::new("custom_item", ArrowDataType::Int32, nullable)
-                    .with_metadata(metadata),
-            )
-        };
-        let list = ListArray::new(
-            element(false, HashMap::new()),
-            OffsetBuffer::from_lengths([1, 2, 0, 1]),
-            Arc::new(Int32Array::from(vec![1, 2, 3, 4])),
-            Some(NullBuffer::from(vec![true, true, false, true])),
-        );
-        // Sliced so the first offset is non-zero.
-        let input = cast(&list, &list_type(element(false, HashMap::new())))
-            .unwrap()
-            .slice(1, 3);
+        // Sliced so the first `List` offset is non-zero.
+        let input = struct_list_fixture_as(&[&[1, 2], &[3], &[], &[4, 5]], flavor).slice(1, 3);
+        let element_type = DataType::from(schema! { not_null "n": INTEGER });
         let schema = schema! {
-            (StructField::nullable("a", ArrayType::new(DataType::INTEGER, true)).with_metadata([(
+            (StructField::nullable("a", ArrayType::new(element_type, true)).with_metadata([(
                 ColumnMetadataKey::ColumnMappingNestedIds.as_ref().to_string(),
                 MetadataValue::Other(test_utils::nested_ids_json(&[("a.element", 7)])),
             )])),
@@ -678,8 +666,13 @@ mod apply_schema_validation_tests {
 
         let batch = apply_schema(&data, &DataType::from(schema)).unwrap();
 
-        let field_id = HashMap::from([(PARQUET_FIELD_ID_META_KEY.to_string(), "7".to_string())]);
-        let expected_type = list_type(element(true, field_id));
+        let element_struct =
+            ArrowDataType::Struct(vec![ArrowField::new("n", ArrowDataType::Int32, false)].into());
+        let expected_element = ArrowField::new("item", element_struct, true).with_metadata(
+            HashMap::from([(PARQUET_FIELD_ID_META_KEY.to_string(), "7".to_string())]),
+        );
+        let expected_type =
+            list_type_with_element(input.data_type(), Arc::new(expected_element)).unwrap();
         let expected = make_array(
             input
                 .to_data()
@@ -688,7 +681,24 @@ mod apply_schema_validation_tests {
                 .build()
                 .unwrap(),
         );
-        assert_eq!(batch.column(0).as_ref(), expected.as_ref());
+        let output = batch.column(0);
+        assert_eq!(output.as_ref(), expected.as_ref());
+        assert_eq!(output.to_data().buffers(), input.to_data().buffers());
+    }
+
+    #[test]
+    fn test_apply_schema_rejects_fixed_size_list() {
+        let input: ArrayRef = Arc::new(FixedSizeListArray::new(
+            Arc::new(ArrowField::new_list_field(ArrowDataType::Int32, true)),
+            2,
+            Arc::new(Int32Array::from(vec![1, 2, 3, 4])),
+            None,
+        ));
+
+        assert_result_error_with_message(
+            apply_schema_to(&input, &ArrayType::new(DataType::INTEGER, true).into()),
+            "Expected a variable-length list type, got FixedSizeList",
+        );
     }
 
     // Model the nanosecond timestamp leaves Arrow decodes from INT96 checkpoint stats.
