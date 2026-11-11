@@ -12,7 +12,7 @@ use delta_kernel::snapshot::SnapshotRef;
 use delta_kernel::{Expression, ExpressionRef, KernelError, KernelResult, KernelResultIterator};
 use delta_kernel_ffi_macros::handle_descriptor;
 use derive_more::From;
-use tracing::debug;
+use tracing::{debug, trace};
 use url::Url;
 
 use super::handle::Handle;
@@ -554,7 +554,7 @@ pub struct SharedScanMetadataIterator;
 
 impl Drop for ScanMetadataIterator {
     fn drop(&mut self) {
-        debug!("dropping ScanMetadataIterator");
+        trace!("dropping ScanMetadataIterator");
     }
 }
 

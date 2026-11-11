@@ -25,6 +25,8 @@ pre-release-replacements = [
   # Keep the separate DataFusion workspace's lockfile in sync with cargo-release version bumps.
   { file = "../datafusion-executor/Cargo.lock", search = "(name = \"delta_kernel\"\\r?\\nversion = \")[a-z0-9\\.+-]+\"", replace = "${1}{{version}}\"", exactly = 1 },
   { file = "../datafusion-executor/Cargo.lock", search = "(name = \"delta_kernel_derive\"\\r?\\nversion = \")[a-z0-9\\.+-]+\"", replace = "${1}{{version}}\"", exactly = 1 },
+  { file = "../docs/user-guide/src/getting_started/installation.md", search = "delta_kernel = \"[a-z0-9\\.-]+\"", replace = "delta_kernel = \"{{version}}\"" },
+  { file = "../docs/user-guide/src/getting_started/installation.md", search = "delta_kernel = \\{ version = \"[a-z0-9\\.-]+\"", replace = "delta_kernel = { version = \"{{version}}\"" },
 ]
 pre-release-hook = [
   "../release.sh",
@@ -51,7 +53,9 @@ percent-encoding = "2"
 rand = "0.9"
 roaring = "0.11.2"
 serde = { version = "1", features = ["derive", "rc"] }
-serde_json = "1"
+serde_json = { version = "1", features = ["unbounded_depth"] }
+serde_stacker = "0.1"
+stacker = "0.1"
 strum = { version = "0.28", features = ["derive"] }
 thiserror = "2"
 prost = { version = "0.13", optional = true }

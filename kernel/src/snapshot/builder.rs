@@ -620,6 +620,7 @@ pub(super) mod tests {
     use crate::object_store::memory::InMemory;
     use crate::object_store::path::Path;
     use crate::object_store::{DynObjectStore, ObjectStoreExt as _};
+    use crate::schema::{ArrayType, DataType, MapType, StructField, StructType};
     use crate::unit_test_utils::{CapturingReporter, install_thread_local_metrics_reporter};
     use crate::utils::FoldWithOption as _;
 
@@ -683,6 +684,64 @@ pub(super) mod tests {
             .build(engine)?;
         assert_eq!(snapshot.version(), 0);
 
+        Ok(())
+    }
+
+    #[rstest::rstest]
+    #[case::formerly_rejected(42, "struct")]
+    #[case::struct_boundary(331, "struct")]
+    #[case::array_boundary(996, "array")]
+    #[case::map_boundary(996, "map")]
+    #[test_log::test(tokio::test)]
+    async fn snapshot_deep_schema_survives_updates_and_hint_reconstruction(
+        #[case] depth: usize,
+        #[case] container: &str,
+    ) -> KernelResult<(), Box<dyn std::error::Error>> {
+        let (engine, store, table_root) = setup_test();
+        let data_type = (0..depth).fold(DataType::INTEGER, |nested, level| match container {
+            "struct" => {
+                StructType::try_new([StructField::nullable(format!("level_{level}"), nested)])
+                    .unwrap()
+                    .into()
+            }
+            "array" => ArrayType::new(nested, true).into(),
+            "map" => MapType::new(DataType::STRING, nested, true).into(),
+            _ => panic!("unknown schema container"),
+        });
+        let schema = StructType::try_new([StructField::nullable("nested", data_type)])?;
+        let mut metadata = json!({"metaData": {
+            "id": "nested-schema",
+            "format": {"provider": "parquet", "options": {}},
+            "schemaString": serde_json::to_string(&schema)?,
+            "partitionColumns": [],
+            "configuration": {}
+        }});
+        let protocol = json!({"protocol": {"minReaderVersion": 1, "minWriterVersion": 2}});
+        add_commit(
+            &table_root,
+            store.as_ref(),
+            0,
+            format!("{protocol}\n{metadata}"),
+        )
+        .await?;
+        let initial = Snapshot::builder_for(&table_root).build(engine.as_ref())?;
+        assert_eq!(initial.schema().as_ref(), &schema);
+        let scan = initial.clone().scan_builder().build()?;
+        assert_eq!(scan.logical_schema().as_ref(), &schema);
+
+        metadata["metaData"]["name"] = json!("updated-metadata");
+        add_commit(&table_root, store.as_ref(), 1, metadata.to_string()).await?;
+        let updated = Snapshot::builder_from(initial).build(engine.as_ref())?;
+        assert_eq!(updated.version(), 1);
+        assert_eq!(
+            updated.table_configuration.metadata().name(),
+            Some("updated-metadata")
+        );
+        assert_eq!(updated.schema().as_ref(), &schema);
+        let rebuilt = Snapshot::builder_for(&table_root)
+            .with_snapshot_hint(updated.to_snapshot_hint()?)
+            .build(engine.as_ref())?;
+        assert_eq!(rebuilt.schema().as_ref(), &schema);
         Ok(())
     }
 

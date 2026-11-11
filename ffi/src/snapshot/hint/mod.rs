@@ -184,8 +184,8 @@ unsafe fn snapshot_builder_with_snapshot_hint_impl(
 ///
 /// Returns `UnsupportedError` when the builder was created by
 /// [`get_snapshot_builder_from`](crate::get_snapshot_builder_from). Returns
-/// `InvalidSnapshotHint` when a supplied field cannot be decoded, a log path is outside the table
-/// log root, or a log path names an unsupported log compaction file.
+/// `InvalidSnapshotHint` when a supplied field cannot be decoded or a log path is outside the
+/// table log root. Compacted paths are ignored; the individual commits must also be supplied.
 /// Structural log-segment and table-configuration errors are returned when the builder is built.
 /// A failed call drops the builder.
 ///

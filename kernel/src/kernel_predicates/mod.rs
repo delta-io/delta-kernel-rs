@@ -5,7 +5,7 @@
 //! references with stats column references, which log replay will instruct the engine to evaluate.
 use std::cmp::Ordering;
 
-use tracing::{debug, warn};
+use tracing::{trace, warn};
 
 use crate::expressions::{
     BinaryExpression, BinaryExpressionOp, BinaryPredicate, BinaryPredicateOp, CaseWhenExpression,
@@ -251,7 +251,7 @@ pub trait KernelPredicateEvaluator {
                 | Expr::MapToStruct(_)
                 | Expr::Cast(_)
                 | Expr::Unknown(_) => {
-                    debug!("Unsupported operand: IS [NOT] NULL: {expr:?}");
+                    trace!("Unsupported operand: IS [NOT] NULL: {expr:?}");
                     None
                 }
             },
@@ -350,7 +350,7 @@ pub trait KernelPredicateEvaluator {
                 _ => None,
             },
             _ => {
-                debug!("Unsupported binary operand(s): {left:?} {op:?} {right:?}");
+                trace!("Unsupported binary operand(s): {left:?} {op:?} {right:?}");
                 None
             }
         }
@@ -609,7 +609,7 @@ impl KernelPredicateEvaluatorDefaults {
             LessThan => Self::partial_cmp_scalars(Ordering::Less, left, right, inverted),
             GreaterThan => Self::partial_cmp_scalars(Ordering::Greater, left, right, inverted),
             Distinct | In => {
-                debug!("Unsupported binary operator: {left:?} {op:?} {right:?}");
+                trace!("Unsupported binary operator: {left:?} {op:?} {right:?}");
                 None
             }
         }

@@ -7,7 +7,7 @@ use std::sync::{Arc, LazyLock};
 
 use delta_kernel_derive::internal_api;
 use itertools::Itertools;
-use tracing::{debug, info, warn};
+use tracing::{debug, info, trace, warn};
 use url::Url;
 
 #[cfg(feature = "adaptive-metadata-in-dev")]
@@ -1236,19 +1236,19 @@ impl LogSegment {
                 // Resolve version number ties in favor of the later file (it covers a wider range)
                 Some(prev) if prev.version == next.version => {
                     let removed = selected_files.pop();
-                    debug!("Selecting {next:?} rather than {removed:?}, it covers a wider range");
+                    trace!("Selecting {next:?} rather than {removed:?}, it covers a wider range");
                 }
                 // Skip later files whose start overlaps with the previous end
                 Some(&ParsedLogPath {
                     file_type: LogPathFileType::CompactedCommit { hi },
                     ..
                 }) if next.version <= hi => {
-                    debug!("Skipping log file {next:?}, it's already covered.");
+                    trace!("Skipping log file {next:?}, it's already covered.");
                     continue;
                 }
                 _ => {} // just fall through
             }
-            debug!("Provisionally selecting {next:?}");
+            trace!("Provisionally selecting {next:?}");
             last_pushed = Some(next);
             selected_files.push(next);
         }

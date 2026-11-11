@@ -1,4 +1,38 @@
-//! Functionality to create and execute scans (reads) over data stored in a delta table
+//! Build and execute reads over a Delta table snapshot.
+//!
+//! Start with [`Snapshot::scan_builder`](crate::Snapshot::scan_builder) to create a
+//! [`ScanBuilder`]. Configure the projected
+//! columns with [`ScanBuilder::with_schema`] and optional data skipping with
+//! [`ScanBuilder::with_predicate`], then call [`ScanBuilder::build`] to obtain a [`Scan`].
+//! The scan reads the table version captured by the snapshot.
+//!
+//! Choose an execution path based on who will read the data files:
+//!
+//! - [`Scan::execute`] reads files through the supplied [`Engine`], applies the per-file transforms
+//!   and deletion vectors, and returns batches of logical table data.
+//! - [`Scan::scan_metadata`] returns [`ScanMetadata`] for connectors that schedule their own reads.
+//!   Use [`ScanMetadata::visit_scan_files`] to consume file metadata. The connector handles file
+//!   reads, physical-to-logical transforms, and deletion vectors as described in [`state`].
+//!
+//! # Example
+//!
+//! Read every column using an existing snapshot and engine:
+//!
+//! ```no_run
+//! # use std::sync::Arc;
+//! # use delta_kernel::{Engine, KernelResult, SnapshotRef};
+//! # fn read(snapshot: SnapshotRef, engine: Arc<dyn Engine>) -> KernelResult<()> {
+//! let scan = snapshot.scan_builder().build()?;
+//! for batch in scan.execute(engine)? {
+//!     let batch = batch?;
+//!     println!("Read {} rows", batch.len());
+//! }
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! The [scan guide](https://docs.delta.io/kernel/rust/reading/building_a_scan.html) develops the
+//! connector workflow with projection, predicates, and execution examples.
 
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
@@ -311,6 +345,27 @@ impl StatsOptions {
         self
     }
 
+    /// JSON synthesis must preserve native stats outside the requested structured output.
+    #[cfg(feature = "declarative-plans")]
+    pub(crate) fn json_synthesis_schema(
+        &self,
+        config: &TableConfiguration,
+    ) -> KernelResult<Option<SchemaRef>> {
+        if !self.synthesize_json {
+            return Ok(None);
+        }
+        let columns = config
+            .physical_data_schema_without_partition_columns()
+            .leaves(None);
+        let builder = config
+            .stats_schema_builder()
+            .with_required_physical_columns(Some(columns.as_ref().0))
+            .with_variant_min_max(self.variant_min_max);
+        #[cfg(feature = "geo-type-in-dev")]
+        let builder = builder.with_geometry_min_max(self.geometry_min_max);
+        builder.build().map(Some)
+    }
+
     /// Checks that the options form a supported combination.
     ///
     /// # Errors
@@ -414,6 +469,10 @@ impl PartitionValuesOptions {
 }
 
 /// Builder to scan a snapshot of a table.
+///
+/// See the [scan guide] for the projection, predicate, and execution workflow.
+///
+/// [scan guide]: https://docs.delta.io/kernel/rust/reading/building_a_scan.html
 pub struct ScanBuilder {
     snapshot: SnapshotRef,
     logical_read_schema: Option<SchemaRef>,
@@ -909,6 +968,10 @@ impl HasSelectionVector for ScanMetadata {
 
 /// The result of building a scan over a table. This can be used to get the actual data from
 /// scanning the table.
+///
+/// See the [scan guide] for choosing between the execution APIs.
+///
+/// [scan guide]: https://docs.delta.io/kernel/rust/reading/building_a_scan.html
 pub struct Scan {
     snapshot: SnapshotRef,
     state_info: Arc<StateInfo>,
@@ -921,7 +984,7 @@ pub struct Scan {
 }
 
 /// Builds the consumer-visible stats schemas without predicate-only fields.
-fn build_stats_output_schemas(
+pub(crate) fn build_stats_output_schemas(
     table_configuration: &TableConfiguration,
     stats: &StatsOptions,
 ) -> KernelResult<Option<StatsOutputSchemas>> {
@@ -1404,7 +1467,7 @@ impl Scan {
             return Ok(None);
         }
 
-        let planner = scan_plan::MetadataPlanner::try_new(self)?;
+        let planner = scan_plan::MetadataPlanner::try_from_scan(self)?;
         let base = scan_plan::MetadataReplayBase::try_new(&self.snapshot, engine, &planner)?;
         self.build_metadata_scan_plan_with(base, &planner)
     }

@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet};
 
 use chrono::{DateTime, Days};
 use delta_kernel_derive::internal_api;
-use tracing::debug;
+use tracing::trace;
 
 use crate::actions::{MAX_VALUES, MIN_VALUES, NULL_COUNT};
 use crate::engine::arrow_utils::RowIndexBuilder;
@@ -76,7 +76,7 @@ impl<T> ParquetRowGroupSkipping for ArrowReaderBuilder<T> {
                 RowGroupFilter::apply(row_group, predicate).then_some(ordinal)
             })
             .collect();
-        debug!("with_row_group_filter({predicate:#?}) = {ordinals:?})");
+        trace!("with_row_group_filter({predicate:#?}) = {ordinals:?})");
         if let Some(row_indexes) = row_indexes {
             row_indexes.select_row_groups(&ordinals);
         }
@@ -99,7 +99,7 @@ impl<T> ParquetRowGroupSkipping for ArrowReaderBuilder<T> {
                     .then_some(ordinal)
             })
             .collect();
-        debug!("with_checkpoint_row_group_filter({predicate:#?}) = {ordinals:?})");
+        trace!("with_checkpoint_row_group_filter({predicate:#?}) = {ordinals:?})");
         if let Some(row_indexes) = row_indexes {
             row_indexes.select_row_groups(&ordinals);
         }
@@ -209,7 +209,7 @@ fn extract_min_scalar(data_type: &DataType, column: &ColumnChunkMetaData) -> Opt
         )?),
         (TimestampNtz, Statistics::Int32(s)) => timestamp_from_date(s.min_opt())?,
         (TimestampNtz, _) => return None, // TODO: Int96 timestamps
-        (IntervalYearMonth(_) | IntervalDayTime, _) => return None,
+        (IntervalYearMonth(_) | IntervalDayTime(_), _) => return None,
         (Decimal(d), Statistics::Int32(i)) => DecimalData::try_new(*i.min_opt()?, *d).ok()?.into(),
         (Decimal(d), Statistics::Int64(i)) => DecimalData::try_new(*i.min_opt()?, *d).ok()?.into(),
         (Decimal(d), Statistics::FixedLenByteArray(b)) => {
@@ -265,7 +265,7 @@ fn extract_max_scalar(data_type: &DataType, column: &ColumnChunkMetaData) -> Opt
         )?),
         (TimestampNtz, Statistics::Int32(s)) => timestamp_from_date(s.max_opt())?,
         (TimestampNtz, _) => return None, // TODO: Int96 timestamps
-        (IntervalYearMonth(_) | IntervalDayTime, _) => return None,
+        (IntervalYearMonth(_) | IntervalDayTime(_), _) => return None,
         (Decimal(d), Statistics::Int32(i)) => DecimalData::try_new(*i.max_opt()?, *d).ok()?.into(),
         (Decimal(d), Statistics::Int64(i)) => DecimalData::try_new(*i.max_opt()?, *d).ok()?.into(),
         (Decimal(d), Statistics::FixedLenByteArray(b)) => {
