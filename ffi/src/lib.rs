@@ -25,7 +25,7 @@ use delta_kernel::schema::Schema;
 use delta_kernel::snapshot::{CheckpointWriteResult, LogSegmentStats, Snapshot, SnapshotRef};
 use delta_kernel::{Engine, EngineData, FileStats, KernelResult, Version};
 use delta_kernel_ffi_macros::handle_descriptor;
-use tracing::debug;
+use tracing::trace;
 use url::Url;
 #[cfg(feature = "default-engine-base")]
 use {
@@ -714,7 +714,7 @@ pub use private::{KernelBoolSlice, KernelRowIndexArray};
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn free_bool_slice(slice: KernelBoolSlice) {
     let vec = unsafe { slice.into_vec() };
-    debug!("Dropping bool slice. It is {vec:#?}");
+    trace!("Dropping bool slice. It is {vec:#?}");
 }
 
 /// # Safety
@@ -778,7 +778,7 @@ struct ExternEngineVtable {
 #[cfg(feature = "default-engine-base")]
 impl Drop for ExternEngineVtable {
     fn drop(&mut self) {
-        debug!("dropping engine interface");
+        trace!("dropping engine interface");
     }
 }
 
@@ -1209,7 +1209,7 @@ pub(crate) fn build_engine_from_store(
 /// Caller is responsible for passing a valid handle.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn free_engine(engine: Handle<SharedExternEngine>) {
-    debug!("engine released engine");
+    trace!("engine released engine");
     unsafe { engine.drop_handle() }
 }
 
@@ -1297,7 +1297,7 @@ pub struct SharedProtocol;
 /// Caller is responsible for passing a valid handle.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn free_snapshot(snapshot: Handle<SharedSnapshot>) {
-    debug!("engine released snapshot");
+    trace!("engine released snapshot");
     unsafe { snapshot.drop_handle() }
 }
 
@@ -1334,9 +1334,10 @@ pub unsafe extern "C" fn checkpoint_snapshot(
 
 /// Publish unpublished catalog commits on a catalog-managed snapshot.
 ///
-/// No-op (still returns a caller-owned snapshot handle at the same version) when there is
-/// nothing to publish. Errors when unpublished commits exist but the table is not
-/// catalog-managed or the committer is not a catalog committer.
+/// The returned snapshot uses published paths for commits known to be published, even when no
+/// commits need copying. Filesystem-managed snapshots with nothing to publish are unchanged.
+/// Errors when unpublished commits exist but the table is not catalog-managed or the committer
+/// is not a catalog committer. See [`Snapshot::publish`] for the publication contract.
 ///
 /// Caller owns the returned handle ([`free_snapshot`]). The input snapshot is borrowed; the
 /// committer is consumed (do not free). The returned snapshot carries the published watermark
@@ -1976,9 +1977,9 @@ mod tests {
     use super::*;
     use crate::error::FFIKernelError;
     use crate::ffi_test_utils::{
-        TEST_ERROR_ALLOCATORS, allocate_str, assert_extern_result_error_contains,
-        assert_extern_result_error_with_message, build_snapshot, ok_or_panic, recover_string,
-        setup_snapshot,
+        TEST_ERROR_ALLOCATORS, allocate_str, assert_extern_result_delta_error,
+        assert_extern_result_error_contains, assert_extern_result_error_with_message,
+        build_snapshot, ok_or_panic, recover_string, setup_snapshot,
     };
 
     unsafe extern "C" fn allocate_null_err(
@@ -3432,27 +3433,11 @@ mod tests {
     }
 
     #[rstest]
-    #[case::catalog_managed_without_max_catalog_version(
-        true,
-        None,
-        concat!(
-            "Max catalog version error: Max catalog version is required when loading a ",
-            "catalog-managed table. Use with_max_catalog_version()."
-        )
-    )]
-    #[case::non_catalog_managed_with_max_catalog_version(
-        false,
-        Some(0),
-        concat!(
-            "Max catalog version error: Max catalog version 0 must not be set for a ",
-            "non-catalog-managed table"
-        )
-    )]
     #[tokio::test]
-    async fn test_snapshot_catalog_managed_mode_mismatch_returns_typed_error(
-        #[case] catalog_managed: bool,
-        #[case] max_catalog_version: Option<Version>,
-        #[case] expected_message: &str,
+    async fn test_snapshot_catalog_bound_validation_for_latest_and_explicit_versions(
+        #[values(false, true)] catalog_managed: bool,
+        #[values(None, Some(0), Some(1))] requested_version: Option<Version>,
+        #[values(None, Some(0))] max_catalog_version: Option<Version>,
     ) -> KernelResult<()> {
         let storage = Arc::new(InMemory::new());
         let table_root = "memory:///test_table/";
@@ -3462,6 +3447,7 @@ mod tests {
             actions_to_string(vec![TestAction::Metadata])
         };
         add_commit(table_root, storage.as_ref(), 0, actions).await?;
+        add_commit(table_root, storage.as_ref(), 1, "{}".into()).await?;
         let engine = engine_to_handle(
             Arc::new(DefaultEngineBuilder::new(storage).build()),
             TEST_ERROR_ALLOCATORS,
@@ -3472,6 +3458,11 @@ mod tests {
                 kernel_string_slice!(table_root),
                 engine.shallow_copy(),
             ));
+            let builder = if let Some(version) = requested_version {
+                snapshot_builder_with_version(builder, version)
+            } else {
+                builder
+            };
             let builder = if let Some(max_catalog_version) = max_catalog_version {
                 snapshot_builder_with_max_catalog_version(builder, max_catalog_version)
             } else {
@@ -3479,11 +3470,30 @@ mod tests {
             };
             snapshot_builder_build(builder)
         };
-        assert_extern_result_error_with_message(
-            result,
-            FFIKernelError::MaxCatalogVersionError,
-            Some(expected_message),
-        );
+        let expected_error = if requested_version == Some(1) && max_catalog_version == Some(0) {
+            Some("Max catalog version error: Requested version 1 exceeds max catalog version 0")
+        } else if catalog_managed && requested_version.is_none() && max_catalog_version.is_none() {
+            Some(concat!(
+                "Max catalog version error: Max catalog version is required when loading the ",
+                "latest catalog-managed snapshot. Use with_max_catalog_version()."
+            ))
+        } else {
+            None
+        };
+        if let Some(message) = expected_error {
+            assert_extern_result_error_with_message(
+                result,
+                FFIKernelError::MaxCatalogVersionError,
+                Some(message),
+            );
+        } else {
+            let snapshot = ok_or_panic(result);
+            assert_eq!(
+                unsafe { version(snapshot.shallow_copy()) },
+                requested_version.or(max_catalog_version).unwrap_or(1)
+            );
+            unsafe { free_snapshot(snapshot) };
+        }
 
         unsafe { free_engine(engine) }
         Ok(())
@@ -3779,7 +3789,7 @@ mod tests {
     fn collect_protocol_state(snap: &handle::Handle<SharedSnapshot>) -> ProtocolVisitState {
         let proto = unsafe { snapshot_get_protocol(snap.shallow_copy()) };
         let mut state = ProtocolVisitState::new();
-        let ctx = NonNull::new(&mut state as *mut ProtocolVisitState as *mut c_void);
+        let ctx = Some(NonNull::from_mut(&mut state).cast());
         unsafe {
             visit_protocol(
                 proto.shallow_copy(),
@@ -3829,6 +3839,46 @@ mod tests {
 
         unsafe { free_engine(engine) }
         Ok(())
+    }
+
+    #[rstest]
+    #[case::latest(None)]
+    #[case::at_version(Some(0))]
+    #[tokio::test]
+    async fn test_builder_on_empty_table_root_reports_missing_table_only_at_latest(
+        #[case] version: Option<Version>,
+    ) {
+        let path = "memory:///";
+        let engine = engine_to_handle(
+            Arc::new(DefaultEngineBuilder::new(Arc::new(InMemory::new())).build()),
+            TEST_ERROR_ALLOCATORS,
+        );
+
+        let result = unsafe {
+            let builder = ok_or_panic(get_snapshot_builder(
+                kernel_string_slice!(path),
+                engine.shallow_copy(),
+            ));
+            let builder = match version {
+                Some(version) => snapshot_builder_with_version(builder, version),
+                None => builder,
+            };
+            snapshot_builder_build(builder)
+        };
+        match version {
+            None => assert_extern_result_delta_error(
+                result,
+                "DELTA_PATH_DOES_NOT_EXIST",
+                "memory:/// doesn't exist, or is not a Delta table.",
+            ),
+            Some(_) => assert_extern_result_error_with_message(
+                result,
+                FFIKernelError::EmptyLogError,
+                Some("No table version found."),
+            ),
+        }
+
+        unsafe { free_engine(engine) }
     }
 
     #[tokio::test]

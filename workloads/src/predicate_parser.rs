@@ -519,7 +519,7 @@ fn between_to_pred(
 #[cfg(test)]
 mod tests {
     use delta_kernel::expressions::Scalar::*;
-    use delta_kernel::expressions::col;
+    use delta_kernel::expressions::{col, expr};
     use delta_kernel::schema::{Schema, StructField, schema};
     use rstest::rstest;
 
@@ -587,17 +587,17 @@ mod tests {
 
     // -- Comparisons --
     #[rstest]
-    #[case("id < 5", KPred::lt(col!("id"), Long(5)))]
-    #[case("id = 999", KPred::eq(col!("id"), Long(999)))]
-    #[case("id > 250", KPred::gt(col!("id"), Long(250)))]
-    #[case("id <= 2", KPred::le(col!("id"), Long(2)))]
-    #[case("id >= 100", KPred::ge(col!("id"), Long(100)))]
-    #[case("a <> 1", KPred::ne(col!("a"), Long(1)))]
-    #[case("a != 1", KPred::ne(col!("a"), Long(1)))]
+    #[case("id < 5", KPred::from_expr(expr!(col("id") < 5_i64)))]
+    #[case("id = 999", KPred::from_expr(expr!(col("id") == 999_i64)))]
+    #[case("id > 250", KPred::from_expr(expr!(col("id") > 250_i64)))]
+    #[case("id <= 2", KPred::from_expr(expr!(col("id") <= 2_i64)))]
+    #[case("id >= 100", KPred::from_expr(expr!(col("id") >= 100_i64)))]
+    #[case("a <> 1", KPred::from_expr(expr!(col("a") != 1_i64)))]
+    #[case("a != 1", KPred::from_expr(expr!(col("a") != 1_i64)))]
     // Literal on the left
-    #[case("1 < a", KPred::lt(Long(1), col!("a")))]
-    #[case("1 = a", KPred::eq(Long(1), col!("a")))]
-    #[case("1 != a", KPred::ne(Long(1), col!("a")))]
+    #[case("1 < a", KPred::from_expr(expr!(1_i64 < col("a"))))]
+    #[case("1 = a", KPred::from_expr(expr!(1_i64 == col("a"))))]
+    #[case("1 != a", KPred::from_expr(expr!(1_i64 != col("a"))))]
     fn comparison(#[case] sql: &str, #[case] expected: KPred) {
         let schema = test_schema();
         assert_eq!(parse_predicate(sql, &schema).unwrap(), expected);
@@ -605,66 +605,69 @@ mod tests {
 
     // -- Literal types --
     #[rstest]
-    #[case("name = 'bob'", KPred::eq(col!("name"), String("bob".to_string())))]
-    #[case("name = ''", KPred::eq(col!("name"), String("".to_string())))]
-    #[case("binary_col = ''", KPred::eq(col!("binary_col"), Binary(Vec::new())))]
-    #[case("c3 < 1.5", KPred::lt(col!("c3"), Double(1.5)))]
-    #[case("val < -2.5", KPred::lt(col!("val"), Double(-2.5)))]
-    #[case("c4 > 5.0", KPred::gt(col!("c4"), Double(5.0)))]
-    #[case("flag = true", KPred::eq(col!("flag"), Boolean(true)))]
-    #[case("cc9 = false", KPred::eq(col!("cc9"), Boolean(false)))]
-    #[case("a = NULL", KPred::eq(col!("a"), Null(DataType::LONG)))]
-    #[case("id > -100", KPred::gt(col!("id"), Long(-100)))]
-    #[case("val > 1.0E300", KPred::gt(col!("val"), Double(1.0E300)))]
-    #[case("a > 2147483647", KPred::gt(col!("a"), Long(2147483647)))]
-    #[case("long_val < 50000000000", KPred::lt(col!("long_val"), Long(50000000000)))]
+    #[case("name = 'bob'", KPred::from_expr(expr!(col("name") == "bob")))]
+    #[case("name = ''", KPred::from_expr(expr!(col("name") == "")))]
+    #[case(
+        "binary_col = ''",
+        KPred::from_expr(expr!(col("binary_col") == lit(Binary(Vec::new()))))
+    )]
+    #[case("c3 < 1.5", KPred::from_expr(expr!(col("c3") < 1.5_f64)))]
+    #[case("val < -2.5", KPred::from_expr(expr!(col("val") < -2.5_f64)))]
+    #[case("c4 > 5.0", KPred::from_expr(expr!(col("c4") > 5.0_f64)))]
+    #[case("flag = true", KPred::from_expr(expr!(col("flag") == true)))]
+    #[case("cc9 = false", KPred::from_expr(expr!(col("cc9") == false)))]
+    #[case("a = NULL", KPred::from_expr(expr!(col("a") == null(LONG))))]
+    #[case("id > -100", KPred::from_expr(expr!(col("id") > -100_i64)))]
+    #[case("val > 1.0E300", KPred::from_expr(expr!(col("val") > 1.0E300_f64)))]
+    #[case("a > 2147483647", KPred::from_expr(expr!(col("a") > 2147483647_i64)))]
+    #[case("long_val < 50000000000", KPred::from_expr(expr!(col("long_val") < 50000000000_i64)))]
     #[case(
         "byte_col = CAST(127 AS BYTE)",
-        KPred::eq(col!("byte_col"), Byte(127))
+        KPred::from_expr(expr!(col("byte_col") == 127_i8))
     )]
     #[case(
         "byte_col = CAST((127) AS BYTE)",
-        KPred::eq(col!("byte_col"), Byte(127))
+        KPred::from_expr(expr!(col("byte_col") == 127_i8))
     )]
     #[case(
         "byte_col = CAST(127 AS TINYINT)",
-        KPred::eq(col!("byte_col"), Byte(127))
+        KPred::from_expr(expr!(col("byte_col") == 127_i8))
     )]
     #[case(
         "short_col = CAST(-32768 AS SHORT)",
-        KPred::eq(col!("short_col"), Short(-32768))
+        KPred::from_expr(expr!(col("short_col") == -32768_i16))
     )]
     #[case(
         "short_col = CAST(-(12) AS SHORT)",
-        KPred::eq(col!("short_col"), Short(-12))
+        KPred::from_expr(expr!(col("short_col") == -12_i16))
     )]
     #[case(
         "short_col = CAST(12 AS SHORT)",
-        KPred::eq(col!("short_col"), Short(12))
+        KPred::from_expr(expr!(col("short_col") == 12_i16))
     )]
     #[case(
         "short_col = CAST(12 AS SMALLINT)",
-        KPred::eq(col!("short_col"), Short(12))
+        KPred::from_expr(expr!(col("short_col") == 12_i16))
     )]
     #[case(
         "float_col > CAST(0.0 AS FLOAT)",
-        KPred::gt(col!("float_col"), Float(0.0))
+        KPred::from_expr(expr!(col("float_col") > 0.0_f32))
     )]
     #[case(
         "int_col = CAST(2147483647 AS INT)",
-        KPred::eq(col!("int_col"), Integer(2147483647))
+        KPred::from_expr(expr!(col("int_col") == 2147483647_i32))
     )]
     #[case(
         "int_col = CAST(-2147483648 AS INTEGER)",
-        KPred::eq(col!("int_col"), Integer(-2147483648))
+        KPred::from_expr(expr!(col("int_col") == -2147483648_i32))
     )]
     #[case(
         "long_col = CAST(9223372036854775807 AS BIGINT)",
-        KPred::eq(col!("long_col"), Long(9223372036854775807))
+        KPred::from_expr(expr!(col("long_col") == 9223372036854775807_i64))
     )]
     #[case(
         "long_col = CAST(-9223372036854775808 AS LONG)",
-        KPred::eq(col!("long_col"), Long(-9223372036854775808))
+        KPred::from_expr(expr!(col("long_col") == -9223372036854775808_i64))
     )]
     fn literal_types(#[case] sql: &str, #[case] expected: KPred) {
         let schema = test_schema();
@@ -672,15 +675,42 @@ mod tests {
     }
 
     #[rstest]
-    #[case("price > 100", KPred::gt(col!("price"), Scalar::decimal(10000, 10, 2).unwrap()))]
-    #[case("price > 1.5", KPred::gt(col!("price"), Scalar::decimal(150, 10, 2).unwrap()))]
-    #[case("price > 1e2", KPred::gt(col!("price"), Scalar::decimal(10000, 10, 2).unwrap()))]
-    #[case("price > 1E-1", KPred::gt(col!("price"), Scalar::decimal(10, 10, 2).unwrap()))]
-    #[case("price > 0.05", KPred::gt(col!("price"), Scalar::decimal(5, 10, 2).unwrap()))]
-    #[case("price = 0e2147483647", KPred::eq(col!("price"), Scalar::decimal(0, 10, 2).unwrap()))]
-    #[case("price = 0e-5", KPred::eq(col!("price"), Scalar::decimal(0, 10, 2).unwrap()))]
-    #[case("price > 1.500", KPred::gt(col!("price"), Scalar::decimal(150, 10, 2).unwrap()))]
-    #[case("price = -100", KPred::eq(col!("price"), Scalar::decimal(-10000, 10, 2).unwrap()))]
+    #[case(
+        "price > 100",
+        KPred::from_expr(expr!(col("price") > lit(Scalar::decimal(10000, 10, 2).unwrap())))
+    )]
+    #[case(
+        "price > 1.5",
+        KPred::from_expr(expr!(col("price") > lit(Scalar::decimal(150, 10, 2).unwrap())))
+    )]
+    #[case(
+        "price > 1e2",
+        KPred::from_expr(expr!(col("price") > lit(Scalar::decimal(10000, 10, 2).unwrap())))
+    )]
+    #[case(
+        "price > 1E-1",
+        KPred::from_expr(expr!(col("price") > lit(Scalar::decimal(10, 10, 2).unwrap())))
+    )]
+    #[case(
+        "price > 0.05",
+        KPred::from_expr(expr!(col("price") > lit(Scalar::decimal(5, 10, 2).unwrap())))
+    )]
+    #[case(
+        "price = 0e2147483647",
+        KPred::from_expr(expr!(col("price") == lit(Scalar::decimal(0, 10, 2).unwrap())))
+    )]
+    #[case(
+        "price = 0e-5",
+        KPred::from_expr(expr!(col("price") == lit(Scalar::decimal(0, 10, 2).unwrap())))
+    )]
+    #[case(
+        "price > 1.500",
+        KPred::from_expr(expr!(col("price") > lit(Scalar::decimal(150, 10, 2).unwrap())))
+    )]
+    #[case(
+        "price = -100",
+        KPred::from_expr(expr!(col("price") == lit(Scalar::decimal(-10000, 10, 2).unwrap())))
+    )]
     fn decimal_literals_are_rescaled(#[case] sql: &str, #[case] expected: KPred) {
         let decimal = PrimitiveType::decimal(10, 2).unwrap();
         let schema = Schema::try_new([StructField::nullable("price", decimal)]).unwrap();
@@ -692,7 +722,9 @@ mod tests {
     fn zero_scale_decimal_literal_is_unchanged() {
         let decimal = PrimitiveType::decimal(5, 0).unwrap();
         let schema = Schema::try_new([StructField::nullable("price", decimal)]).unwrap();
-        let expected = KPred::eq(col!("price"), Scalar::decimal(12, 5, 0).unwrap());
+        let expected = KPred::from_expr(expr!(
+            col("price") == lit(Scalar::decimal(12, 5, 0).unwrap())
+        ));
 
         assert_eq!(parse_predicate("price = 12", &schema).unwrap(), expected);
     }
@@ -706,7 +738,7 @@ mod tests {
 
         assert_eq!(
             parse_predicate(sql, &schema).unwrap(),
-            KPred::eq(col!("price"), expected)
+            KPred::from_expr(expr!(col("price") == lit(expected)))
         );
     }
 
@@ -714,7 +746,9 @@ mod tests {
     fn exponent_trailing_zeros_are_normalized() {
         let decimal = PrimitiveType::decimal(3, 2).unwrap();
         let schema = Schema::try_new([StructField::nullable("price", decimal)]).unwrap();
-        let expected = KPred::eq(col!("price"), Scalar::decimal(100, 3, 2).unwrap());
+        let expected = KPred::from_expr(expr!(
+            col("price") == lit(Scalar::decimal(100, 3, 2).unwrap())
+        ));
 
         assert_eq!(
             parse_predicate("price = 1000e-3", &schema).unwrap(),
@@ -757,11 +791,11 @@ mod tests {
 
     // -- Compound identifiers (nested columns) --
     #[rstest]
-    #[case("data.value > 150", KPred::gt(col!("data.value"), Long(150)))]
-    #[case("null_v_struct.v > 1", KPred::gt(col!("null_v_struct.v"), Long(1)))]
+    #[case("data.value > 150", KPred::from_expr(expr!(col("data.value") > 150_i64)))]
+    #[case("null_v_struct.v > 1", KPred::from_expr(expr!(col("null_v_struct.v") > 1_i64)))]
     #[case(
         "struct_col.inner_int = 2",
-        KPred::eq(col!("struct_col.inner_int"), Integer(2))
+        KPred::from_expr(expr!(col("struct_col.inner_int") == 2_i32))
     )]
     fn nested_columns(#[case] sql: &str, #[case] expected: KPred) {
         let schema = test_schema();
@@ -779,9 +813,9 @@ mod tests {
 
     // -- IS NULL / IS NOT NULL --
     #[rstest]
-    #[case("a IS NULL", KPred::is_null(col!("a")))]
-    #[case("a IS NOT NULL", KPred::is_not_null(col!("a")))]
-    #[case("null_v_struct.v IS NULL", KPred::is_null(col!("null_v_struct.v")))]
+    #[case("a IS NULL", KPred::from_expr(expr!(is_null(col("a")))))]
+    #[case("a IS NOT NULL", KPred::from_expr(expr!(is_not_null(col("a")))))]
+    #[case("null_v_struct.v IS NULL", KPred::from_expr(expr!(is_null(col("null_v_struct.v")))))]
     fn is_null(#[case] sql: &str, #[case] expected: KPred) {
         let schema = test_schema();
         assert_eq!(parse_predicate(sql, &schema).unwrap(), expected);
@@ -789,14 +823,11 @@ mod tests {
 
     // -- NOT --
     #[rstest]
-    #[case("NOT a = 1", KPred::not(KPred::eq(col!("a"), Long(1))))]
-    #[case("NOT a = NULL", KPred::not(KPred::eq(col!("a"), Null(DataType::LONG))))]
+    #[case("NOT a = 1", KPred::from_expr(expr!(not(col("a") == 1_i64))))]
+    #[case("NOT a = NULL", KPred::from_expr(expr!(not(col("a") == null(LONG)))))]
     #[case(
         "NOT(a < 1 OR b > 20)",
-        KPred::not(KPred::or(
-            KPred::lt(col!("a"), Long(1)),
-            KPred::gt(col!("b"), Long(20)),
-        ))
+        KPred::from_expr(expr!(not(or(col("a") < 1_i64, col("b") > 20_i64))))
     )]
     fn not_predicate(#[case] sql: &str, #[case] expected: KPred) {
         let schema = test_schema();
@@ -807,50 +838,26 @@ mod tests {
     #[rstest]
     #[case(
         "id < 500 AND value > 10",
-        KPred::and(
-            KPred::lt(col!("id"), Long(500)),
-            KPred::gt(col!("value"), Long(10)),
-        )
+        KPred::from_expr(expr!(and(col("id") < 500_i64, col("value") > 10_i64)))
     )]
     #[case(
         "id = 1 OR id = 2",
-        KPred::or(
-            KPred::eq(col!("id"), Long(1)),
-            KPred::eq(col!("id"), Long(2)),
-        )
+        KPred::from_expr(expr!(or(col("id") == 1_i64, col("id") == 2_i64)))
     )]
     #[case(
         "a = 0 AND b = 0 AND c = 0",
-        KPred::and(
-            KPred::and(
-                KPred::eq(col!("a"), Long(0)),
-                KPred::eq(col!("b"), Long(0)),
-            ),
-            KPred::eq(col!("c"), Long(0)),
-        )
+        KPred::from_expr(expr!(and(and(col("a") == 0_i64, col("b") == 0_i64), col("c") == 0_i64)))
     )]
     #[case(
         "(a < 3 AND b < 3) OR (a > 7 AND b > 7)",
-        KPred::or(
-            KPred::and(
-                KPred::lt(col!("a"), Long(3)),
-                KPred::lt(col!("b"), Long(3)),
-            ),
-            KPred::and(
-                KPred::gt(col!("a"), Long(7)),
-                KPred::gt(col!("b"), Long(7)),
-            ),
-        )
+        KPred::from_expr(expr!(or(
+            and(col("a") < 3_i64, col("b") < 3_i64),
+            and(col("a") > 7_i64, col("b") > 7_i64),
+        )))
     )]
     #[case(
         "(a = 5 OR a = 7) AND b < 5",
-        KPred::and(
-            KPred::or(
-                KPred::eq(col!("a"), Long(5)),
-                KPred::eq(col!("a"), Long(7)),
-            ),
-            KPred::lt(col!("b"), Long(5)),
-        )
+        KPred::from_expr(expr!(and(or(col("a") == 5_i64, col("a") == 7_i64), col("b") < 5_i64)))
     )]
     fn and_or(#[case] sql: &str, #[case] expected: KPred) {
         let schema = test_schema();
@@ -859,12 +866,12 @@ mod tests {
 
     // -- Null-safe equals (<=>)  ->  NOT DISTINCT --
     #[rstest]
-    #[case("a <=> 1", KPred::not(KPred::distinct(col!("a"), Long(1))))]
-    #[case("a <=> NULL", KPred::not(KPred::distinct(col!("a"), Null(DataType::LONG))))]
-    #[case("1 <=> a", KPred::not(KPred::distinct(Long(1), col!("a"))))]
+    #[case("a <=> 1", KPred::from_expr(expr!(not(distinct(col("a"), 1_i64)))))]
+    #[case("a <=> NULL", KPred::from_expr(expr!(not(distinct(col("a"), null(LONG))))))]
+    #[case("1 <=> a", KPred::from_expr(expr!(not(distinct(1_i64, col("a"))))))]
     #[case(
         "NOT a <=> 1",
-        KPred::not(KPred::not(KPred::distinct(col!("a"), Long(1))))
+        KPred::from_expr(expr!(not(not(distinct(col("a"), 1_i64)))))
     )]
     fn null_safe_equals(#[case] sql: &str, #[case] expected: KPred) {
         let schema = test_schema();
@@ -912,24 +919,15 @@ mod tests {
     #[rstest]
     #[case(
         "id BETWEEN 10 AND 20",
-        KPred::and(
-            KPred::ge(col!("id"), Long(10)),
-            KPred::le(col!("id"), Long(20)),
-        )
+        KPred::from_expr(expr!(and(col("id") >= 10_i64, col("id") <= 20_i64)))
     )]
     #[case(
         "id BETWEEN -10 AND -1",
-        KPred::and(
-            KPred::ge(col!("id"), Long(-10)),
-            KPred::le(col!("id"), Long(-1)),
-        )
+        KPred::from_expr(expr!(and(col("id") >= -10_i64, col("id") <= -1_i64)))
     )]
     #[case(
         "id NOT BETWEEN 10 AND 20",
-        KPred::not(KPred::and(
-            KPred::ge(col!("id"), Long(10)),
-            KPred::le(col!("id"), Long(20)),
-        ))
+        KPred::from_expr(expr!(not(and(col("id") >= 10_i64, col("id") <= 20_i64))))
     )]
     fn between(#[case] sql: &str, #[case] expected: KPred) {
         let schema = test_schema();
@@ -940,34 +938,22 @@ mod tests {
     #[rstest]
     #[case(
         "id >= 0 AND id < 1000 AND version_tag = 'v0'",
-        KPred::and(
-            KPred::and(
-                KPred::ge(col!("id"), Long(0)),
-                KPred::lt(col!("id"), Long(1000)),
-            ),
-            KPred::eq(col!("version_tag"), String("v0".to_string())),
-        )
+        KPred::from_expr(expr!(and(
+            and(col("id") >= 0_i64, col("id") < 1000_i64),
+            col("version_tag") == "v0",
+        )))
     )]
     #[case(
         "int_col IS NOT NULL AND str_col IS NOT NULL",
-        KPred::and(
-            KPred::is_not_null(col!("int_col")),
-            KPred::is_not_null(col!("str_col")),
-        )
+        KPred::from_expr(expr!(and(is_not_null(col("int_col")), is_not_null(col("str_col")))))
     )]
     #[case(
         "NOT (a >= 5 AND NOT (b < 5))",
-        KPred::not(KPred::and(
-            KPred::ge(col!("a"), Long(5)),
-            KPred::not(KPred::lt(col!("b"), Long(5))),
-        ))
+        KPred::from_expr(expr!(not(and(col("a") >= 5_i64, not(col("b") < 5_i64)))))
     )]
     #[case(
         "partCol = 3 and id > 25",
-        KPred::and(
-            KPred::eq(col!("partCol"), Long(3)),
-            KPred::gt(col!("id"), Long(25)),
-        )
+        KPred::from_expr(expr!(and(col("partCol") == 3_i64, col("id") > 25_i64)))
     )]
     fn complex(#[case] sql: &str, #[case] expected: KPred) {
         let schema = test_schema();
@@ -1079,7 +1065,7 @@ mod tests {
                 ),
                 Long(10)
             ),
-            KPred::gt(col!("b"), Long(20))
+            KPred::from_expr(expr!(col("b") > 20_i64))
         )
     )]
     #[case(
@@ -1100,7 +1086,7 @@ mod tests {
     fn parse_date_typed_literal() {
         let schema = test_schema();
         let pred = parse_predicate("date_col = DATE'2024-01-15'", &schema).unwrap();
-        let expected = KPred::eq(col!("date_col"), Date(19737));
+        let expected = KPred::from_expr(expr!(col("date_col") == lit(Date(19737))));
         assert_eq!(pred, expected);
     }
 
@@ -1108,7 +1094,7 @@ mod tests {
     fn parse_timestamp_typed_literal() {
         let schema = test_schema();
         let pred = parse_predicate("ts_col = TIMESTAMP'2024-01-15 12:30:00'", &schema).unwrap();
-        let expected = KPred::eq(col!("ts_col"), Timestamp(1705321800000000));
+        let expected = KPred::from_expr(expr!(col("ts_col") == lit(Timestamp(1705321800000000))));
         assert_eq!(pred, expected);
     }
 
@@ -1117,7 +1103,9 @@ mod tests {
         let schema = test_schema();
         let pred =
             parse_predicate("ts_ntz_col = TIMESTAMP_NTZ'2024-01-15 12:30:00'", &schema).unwrap();
-        let expected = KPred::eq(col!("ts_ntz_col"), TimestampNtz(1705321800000000));
+        let expected = KPred::from_expr(expr!(
+            col("ts_ntz_col") == lit(TimestampNtz(1705321800000000))
+        ));
         assert_eq!(pred, expected);
     }
 
@@ -1133,10 +1121,10 @@ mod tests {
 
     // Typed scalar inference from schema
     #[rstest]
-    #[case("int_col > 100", KPred::gt(col!("int_col"), Integer(100)))]
-    #[case("short_col < 50", KPred::lt(col!("short_col"), Short(50)))]
-    #[case("byte_col <= 127", KPred::le(col!("byte_col"), Byte(127)))]
-    #[case("float_col < 1.5", KPred::lt(col!("float_col"), Float(1.5)))]
+    #[case("int_col > 100", KPred::from_expr(expr!(col("int_col") > 100_i32)))]
+    #[case("short_col < 50", KPred::from_expr(expr!(col("short_col") < 50_i16)))]
+    #[case("byte_col <= 127", KPred::from_expr(expr!(col("byte_col") <= 127_i8)))]
+    #[case("float_col < 1.5", KPred::from_expr(expr!(col("float_col") < 1.5_f32)))]
     fn typed_scalar_inference(#[case] sql: &str, #[case] expected: KPred) {
         let schema = test_schema();
         assert_eq!(parse_predicate(sql, &schema).unwrap(), expected);
@@ -1146,11 +1134,11 @@ mod tests {
     #[rstest]
     #[case(
         "struct_col.inner_int > 25",
-        KPred::gt(col!("struct_col.inner_int"), Integer(25))
+        KPred::from_expr(expr!(col("struct_col.inner_int") > 25_i32))
     )]
     #[case(
         "struct_col.inner_str = 'alice'",
-        KPred::eq(col!("struct_col.inner_str"), String("alice".to_string()))
+        KPred::from_expr(expr!(col("struct_col.inner_str") == "alice"))
     )]
     fn nested_struct_columns(#[case] sql: &str, #[case] expected: KPred) {
         let schema = test_schema();

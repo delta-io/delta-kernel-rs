@@ -9,7 +9,7 @@ use delta_kernel::table_changes::TableChanges;
 use delta_kernel::table_changes::scan::TableChangesScan;
 use delta_kernel::{EngineData, KernelError, KernelResult, KernelResultIterator, Version};
 use delta_kernel_ffi_macros::handle_descriptor;
-use tracing::debug;
+use tracing::{debug, trace};
 use url::Url;
 
 use super::handle::Handle;
@@ -75,7 +75,7 @@ fn table_changes_impl(
     extern_engine: &dyn ExternEngine,
     start_version: Version,
     end_version: Option<Version>,
-) -> KernelResult<Handle<ExclusiveTableChanges>> {
+) -> delta_kernel::Result<Handle<ExclusiveTableChanges>> {
     let table_changes = TableChanges::try_new(
         url?,
         extern_engine.engine().as_ref(),
@@ -248,7 +248,7 @@ pub struct SharedScanTableChangesIterator;
 
 impl Drop for ScanTableChangesIterator {
     fn drop(&mut self) {
-        debug!("dropping ScanTableChangesIterator");
+        trace!("dropping ScanTableChangesIterator");
     }
 }
 

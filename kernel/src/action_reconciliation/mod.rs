@@ -22,6 +22,9 @@ use std::time::Duration;
 use crate::table_properties::TableProperties;
 use crate::{KernelError, KernelResult};
 
+#[cfg(feature = "declarative-plans")]
+pub(crate) mod checkpoint_shape;
+pub(crate) mod file_metadata;
 pub(crate) mod log_replay;
 
 pub use log_replay::{ActionReconciliationIterator, ActionReconciliationIteratorState};
@@ -308,3 +311,6 @@ mod tests {
         Ok(())
     }
 }
+
+#[cfg(feature = "declarative-plans")]
+pub(crate) mod plan;

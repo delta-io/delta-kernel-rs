@@ -19,7 +19,7 @@ impl MetadataReplayBase {
     pub(in crate::scan) fn try_new(
         snapshot: &Snapshot,
         engine: &dyn Engine,
-        planner: &MetadataPlanner<'_>,
+        planner: &MetadataPlanner,
     ) -> KernelResult<Self> {
         let checkpoint_version = snapshot.log_segment().checkpoint_version;
         // Keep replay eligibility independent of SnapshotCrc's validation.
@@ -66,9 +66,10 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
+    use crate::Result;
     use crate::crc::Crc;
+    use crate::engine::DelegatingEngine;
     use crate::engine::arrow_data::EngineDataArrowExt as _;
-    use crate::engine::test_delegating::DelegatingEngine;
     use crate::plans::Operation as PlanOperation;
     use crate::plans::ir::nodes::Operator;
     use crate::scan::scan_plan::tests::log_segment;
@@ -82,7 +83,7 @@ mod tests {
         #[case] version: Version,
         #[case] checkpoint_version: Option<Version>,
         #[case] has_all_files: bool,
-    ) -> KernelResult<()> {
+    ) -> Result<()> {
         let (engine, latest, _tempdir) =
             load_test_table("v1-multi-part-partitioned-struct-stats-only")?;
         let snapshot = Snapshot::builder_for(latest.table_root().clone())
@@ -104,7 +105,7 @@ mod tests {
         let crc = Some(crc);
         let snapshot = Arc::new(Snapshot::new_with_crc(segment, config, crc, false, false)?);
         let scan = snapshot.scan_builder().build()?;
-        let planner = MetadataPlanner::try_new(&scan)?;
+        let planner = MetadataPlanner::try_from_scan(&scan)?;
         let base = MetadataReplayBase::try_new(&scan.snapshot, &engine, &planner)?;
         assert_eq!(base.version(), Some(version));
         let is_crc = matches!(base, MetadataReplayBase::Crc { .. });
@@ -121,7 +122,7 @@ mod tests {
         #[case] target_version: Version,
         #[case] empty_crc: bool,
         #[case] expected_rows: usize,
-    ) -> KernelResult<()> {
+    ) -> Result<()> {
         let (engine, latest, _tempdir) =
             load_test_table("v1-multi-part-partitioned-struct-stats-only")?;
         let target = Snapshot::builder_for(latest.table_root().clone())

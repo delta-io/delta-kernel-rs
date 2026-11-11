@@ -300,8 +300,8 @@ async fn test_commit_info_data_change(
 /// Every commit on an adaptiveMetadata table records `dataChange`, and `lastManifestCommit` is
 /// absent before the first manifest commit, set by it, replaced by the next manifest commit, then
 /// carried forward by later log commits. The carry-forward is read from the CRC when one exists at
-/// the read version, otherwise from the read version's commit file; a checksum written after the
-/// carry-forward (rebuilt by log replay) matches.
+/// the read version, otherwise from the newest commit during P&M replay; a checksum written after
+/// the carry-forward (rebuilt by log replay) matches.
 #[rstest]
 #[tokio::test(flavor = "multi_thread")]
 async fn test_commit_info_records_data_change_and_last_manifest_commit(
@@ -457,5 +457,43 @@ async fn test_app_id_versions_read_across_a_root_manifest_commit()
         snapshot.reader().get_app_id_version("app-3", &engine)?,
         None
     );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_domain_metadata_read_across_a_root_manifest_commit()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (engine, _temp_dir, table_url, snapshot) =
+        setup_adaptive_metadata_table("root_manifest_file_domain_metadata").await?;
+
+    // The manifest commit's checkpoint action holds `domain.a` and `domain.b`; the commit after it
+    // updates `domain.a` and removes `domain.b`.
+    let snapshot = commit_around_root_manifest(
+        &engine,
+        &table_url,
+        snapshot,
+        |builder| builder.with_domain_metadata("domain.a", "a1"),
+        |builder| builder.with_domain_metadata("domain.b", "b1"),
+        |builder| {
+            builder
+                .with_domain_metadata("domain.a", "a2")
+                .with_domain_metadata_removed("domain.b")
+        },
+    )?;
+
+    for (domain, expected) in [
+        ("domain.a", Some("a2")),
+        ("domain.b", None),
+        ("domain.c", None),
+    ] {
+        assert_eq!(
+            snapshot
+                .reader()
+                .get_domain_metadata(domain, &engine)?
+                .as_deref(),
+            expected,
+            "domain {domain}"
+        );
+    }
     Ok(())
 }

@@ -285,6 +285,11 @@ impl From<&Agg> for proto_plan::Agg {
                 value: Some(value.into()),
             }),
             Agg::CountStar => proto_agg::Func::CountStar(proto_plan::CountStarAgg {}),
+            Agg::FirstNonNull(value) => {
+                proto_agg::Func::FirstNonNull(proto_plan::FirstNonNullAgg {
+                    value: Some(value.into()),
+                })
+            }
             Agg::MinNonNullBy(operands) => {
                 proto_agg::Func::MinNonNullBy(proto_plan::MinNonNullByAgg {
                     value: Some((&operands.value).into()),
@@ -1085,7 +1090,7 @@ mod tests {
         ExpressionStructPatchBuilder, JunctionPredicateOp, MapData, MapToStructOptions,
         OpaqueExpressionOp, OpaquePredicateOp, Predicate, Scalar, ScalarExpressionEvaluator,
         StructData, UnaryExpressionOp, UnaryPredicateOp, VariadicExpressionOp, col, column_name,
-        lit,
+        expr, lit,
     };
     use crate::kernel_predicates::{
         DirectDataSkippingPredicateEvaluator, DirectPredicateEvaluator,
@@ -1339,7 +1344,7 @@ mod tests {
                 },
                 PlanNode {
                     op: Operator::Filter(Filter {
-                        predicate: Arc::new(Predicate::gt(col!("id"), lit(5i32))),
+                        predicate: Arc::new(Predicate::from_expr(expr!(col("id") > 5i32))),
                     }),
                     inputs: vec![0],
                 },
@@ -1681,6 +1686,7 @@ mod tests {
     #[case(Agg::sum(column_name!("a")), "sum")]
     #[case(Agg::count(column_name!("a")), "count")]
     #[case(Agg::count_star(), "count_star")]
+    #[case(Agg::first_non_null(column_name!("a")), "first_non_null")]
     #[case(Agg::min_non_null_by(column_name!("a"), column_name!("s"), column_name!("k")), "min_non_null_by")]
     #[case(Agg::max_non_null_by(column_name!("a"), column_name!("s"), column_name!("k")), "max_non_null_by")]
     fn from_agg(#[case] agg: Agg, #[case] expected: &str) {
@@ -1692,6 +1698,10 @@ mod tests {
             Func::Sum(_) => "sum",
             Func::Count(_) => "count",
             Func::CountStar(_) => "count_star",
+            Func::FirstNonNull(agg) => {
+                assert_eq!(agg.value.unwrap().path, ["a"]);
+                "first_non_null"
+            }
             Func::MinNonNullBy(_) => "min_non_null_by",
             Func::MaxNonNullBy(_) => "max_non_null_by",
         };
@@ -1735,7 +1745,7 @@ mod tests {
     )]
     #[case(Expression::unary(UnaryExpressionOp::ToJson, lit(1)), "unary")]
     #[case(Expression::binary(BinaryExpressionOp::Plus, lit(1), lit(2)), "binary")]
-    #[case(Expression::coalesce([lit(1), lit(2)]), "variadic")]
+    #[case(expr!(coalesce(1, 2)), "variadic")]
     #[case(Expression::opaque(TestOpaqueExprOp, [lit(1)]), "opaque")]
     #[case(Expression::parse_json(lit("{}"), sample_schema()), "parse_json")]
     #[case(
@@ -1773,10 +1783,10 @@ mod tests {
 
     #[rstest]
     #[case(Predicate::TRUE, "boolean_expression")]
-    #[case(Predicate::not(Predicate::TRUE), "not")]
-    #[case(Predicate::is_null(lit(1)), "unary")]
-    #[case(Predicate::gt(lit(1), lit(2)), "binary")]
-    #[case(Predicate::and(Predicate::TRUE, Predicate::FALSE), "junction")]
+    #[case(Predicate::from_expr(expr!(not(true))), "not")]
+    #[case(Predicate::from_expr(expr!(is_null(1))), "unary")]
+    #[case(Predicate::from_expr(expr!(1 > 2)), "binary")]
+    #[case(Predicate::from_expr(expr!(and(true, false))), "junction")]
     #[case(Predicate::opaque(TestOpaquePredOp, [lit(1)]), "opaque")]
     #[case(Predicate::Unknown("x".to_string()), "unknown")]
     fn from_predicate(#[case] pred: Predicate, #[case] expected: &str) {
@@ -1844,7 +1854,7 @@ mod tests {
     #[test]
     fn from_variadic_expression() {
         let proto_expr::expression::Kind::Variadic(variadic) =
-            expr_kind_of(Expression::coalesce([lit(1), lit(2), lit(3)]))
+            expr_kind_of(expr!(coalesce(1, 2, 3)))
         else {
             panic!("expected a variadic expression");
         };
@@ -1906,7 +1916,8 @@ mod tests {
 
     #[test]
     fn from_unary_predicate() {
-        let proto_expr::predicate::Kind::Unary(unary) = pred_kind_of(Predicate::is_null(lit(1)))
+        let proto_expr::predicate::Kind::Unary(unary) =
+            pred_kind_of(Predicate::from_expr(expr!(is_null(1))))
         else {
             panic!("expected a unary predicate");
         };
@@ -1917,7 +1928,7 @@ mod tests {
     #[test]
     fn from_binary_predicate() {
         let proto_expr::predicate::Kind::Binary(binary) =
-            pred_kind_of(Predicate::gt(lit(1), lit(2)))
+            pred_kind_of(Predicate::from_expr(expr!(1 > 2)))
         else {
             panic!("expected a binary predicate");
         };
@@ -1929,7 +1940,7 @@ mod tests {
     #[test]
     fn from_junction_predicate() {
         let proto_expr::predicate::Kind::Junction(junction) =
-            pred_kind_of(Predicate::and(Predicate::TRUE, Predicate::FALSE))
+            pred_kind_of(Predicate::from_expr(expr!(and(true, false))))
         else {
             panic!("expected a junction predicate");
         };

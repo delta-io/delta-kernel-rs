@@ -9,7 +9,7 @@ use delta_kernel::expressions::{
     ArrayData, BinaryExpressionOp, BinaryPredicateOp, Expression as Expr,
     ExpressionStructPatchBuilder, MapData, MapToStructOptions, OpaqueExpressionOp,
     OpaquePredicateOp, Predicate as Pred, Scalar, ScalarExpressionEvaluator, StructData, col,
-    column_name, column_pred, lit, null_lit,
+    column_name, column_pred, expr, lit, null_lit,
 };
 use delta_kernel::kernel_predicates::{
     DirectDataSkippingPredicateEvaluator, DirectPredicateEvaluator,
@@ -166,7 +166,7 @@ pub unsafe extern "C" fn get_testing_kernel_expression() -> Handle<SharedExpress
             col!("pv"),
             MapToStructOptions::default().with_timestamp_timezone("America/Los_Angeles"),
         ),
-        Expr::coalesce([col!("col"), lit(0_i32)]),
+        expr!(coalesce(col("col"), 0_i32)),
         Expr::array([lit(1_i32), lit(2_i32)]),
         Expr::case_when(
             [
@@ -224,8 +224,8 @@ pub unsafe extern "C" fn get_testing_kernel_predicate() -> Handle<SharedPredicat
             lit(10),
             Scalar::Array(array_data),
         )),
-        Pred::or_from(vec![Pred::eq(lit(5), lit(10)), Pred::ne(lit(20), lit(10))]),
-        Pred::is_not_null(col!("col")),
+        Pred::from_expr(expr!(or(5 == 10, 20 != 10))),
+        Pred::from_expr(expr!(is_not_null(col("col")))),
         Pred::opaque(OpaqueTestOp("bar".to_string()), vec![lit(42), lit(1.111)]),
         Pred::unknown("intrigue"),
         Pred::from_expr(Expr::case_when(
@@ -311,17 +311,17 @@ pub unsafe extern "C" fn get_simple_testing_kernel_predicate() -> Handle<SharedP
         column_pred!("pred_col"),
         Pred::TRUE,
         Pred::FALSE,
-        Pred::eq(lit(10), lit(10)),
-        Pred::ne(lit(5), lit(10)),
-        Pred::lt(lit(5), lit(10)),
-        Pred::le(lit(10), lit(10)),
-        Pred::gt(lit(20), lit(10)),
-        Pred::ge(lit(10), lit(10)),
-        Pred::distinct(lit(1), lit(2)),
-        Pred::is_null(col!("nullable_col")),
-        Pred::is_not_null(col!("nonnull_col")),
-        Pred::not(Pred::FALSE),
-        Pred::or_from(vec![Pred::eq(lit(1), lit(1)), Pred::eq(lit(2), lit(2))]),
+        Pred::from_expr(expr!(10 == 10)),
+        Pred::from_expr(expr!(5 != 10)),
+        Pred::from_expr(expr!(5 < 10)),
+        Pred::from_expr(expr!(10 <= 10)),
+        Pred::from_expr(expr!(20 > 10)),
+        Pred::from_expr(expr!(10 >= 10)),
+        Pred::from_expr(expr!(distinct(1, 2))),
+        Pred::from_expr(expr!(is_null(col("nullable_col")))),
+        Pred::from_expr(expr!(is_not_null(col("nonnull_col")))),
+        Pred::from_expr(expr!(not(false))),
+        Pred::from_expr(expr!(or(1 == 1, 2 == 2))),
     ];
     Arc::new(Pred::and_from(sub_preds)).into()
 }

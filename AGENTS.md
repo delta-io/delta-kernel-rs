@@ -195,9 +195,9 @@ transactions. `data_change` is never inferred from staged files, including for e
 staged-file checks. `UpdateTableOperation::AlterTable` records schema-changing DDL without
 introducing a separate transaction type.
 
-Incremental CRC replay trusts operation names in `INCREMENTAL_SAFE_OPS`
-(`kernel/src/crc/file_stats.rs`). Adding an operation requires both correct net Add/Remove file
-accounting and rejecting its exact name for `UpdateTableOperation::Custom`. Represent update-table
+Incremental CRC replay accepts known operation names with operation-specific exclusions in
+`FileStatsPolicy` (`kernel/src/crc/file_stats.rs`). Accepted operation names must also be rejected for
+`UpdateTableOperation::Custom`. Represent update-table
 operations with typed variants so name reservation is automatic, and mirror them in the FFI.
 
 Writers configure transaction intent before `build()`, then call
@@ -297,6 +297,12 @@ This list is non-exhaustive: when in doubt, browse the source files directly
 - `engine::arrow_conversion::TryIntoArrow`:
   `(&kernel_data_type).try_into_arrow()` for `DataType`,
   `(&kernel_struct_type).try_into_arrow()` for `StructType` -> Arrow `Schema`.
+
+**Handler access and overrides (from `delta_kernel::engine`, with `test-utils`)**
+
+- `PanicEngine`: assert that an operation requests no required engine handler.
+- `DelegatingEngine`: override selected handlers while delegating the rest to an inner engine.
+  See the types' rustdoc for override and executor selection behavior.
 
 **Engine + table setup (from `test_utils`)**
 
@@ -438,8 +444,11 @@ Keep this list updated when new protocol features are added to kernel.
     prefer `DataType::from(ArrayType::new(...))` over
     `DataType::Array(Box::new(ArrayType::new(...)))`.
 - Kernel APIs use `KernelResult<T, E = KernelError>`, which defaults to `KernelError` and permits
-  an explicit error type. `Result<T>` is reserved for the top-level `Error` envelope. Wrap kernel
-  errors explicitly with `Error::Kernel` when returning it.
+  an explicit error type. `Result<T>` is reserved for the top-level `Error` envelope. Return it
+  from functions that can produce `Error::Delta` and from every function that propagates their
+  errors. `?` converts a `KernelError` into `Error::Kernel`; never convert an `Error` back into a
+  `KernelError`. `?` applies one conversion, so a function returning `Result` converts foreign
+  errors through `KernelError` first (`.map_err(KernelError::from)?`).
 - Prefer the `KernelResultIterator<T>` marker trait over spelling
   `Iterator<Item = KernelResult<T>> + Send`, including in public APIs. Use
   `impl KernelResultIterator<T>` for unboxed streams and `Box<dyn KernelResultIterator<T>>`

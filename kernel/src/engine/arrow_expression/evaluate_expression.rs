@@ -168,7 +168,13 @@ fn evaluate_struct_expression(
     } else {
         None
     };
-    let data = StructArray::try_new(output_fields.into(), output_cols, null_buffer)?;
+    // Empty structs have no child arrays from which Arrow can infer the batch length.
+    let data = StructArray::try_new_with_length(
+        output_fields.into(),
+        output_cols,
+        null_buffer,
+        batch.num_rows(),
+    )?;
     Ok(Arc::new(data))
 }
 
@@ -1214,8 +1220,8 @@ mod tests {
     use super::*;
     use crate::arrow::array::{
         ArrayData as ArrowArrayData, ArrayRef, BinaryArray, BooleanArray, Date32Array,
-        Float64Array, Int32Array, Int64Array, LargeStringArray, ListArray, MapBuilder, StringArray,
-        StringBuilder, StructArray, TimestampMicrosecondArray,
+        Float32Array, Float64Array, Int32Array, Int64Array, LargeStringArray, ListArray,
+        MapBuilder, StringArray, StringBuilder, StructArray, TimestampMicrosecondArray,
     };
     use crate::arrow::buffer::{OffsetBuffer, ScalarBuffer};
     use crate::arrow::datatypes::{
@@ -1225,7 +1231,7 @@ mod tests {
     use crate::expressions::{
         ArrayData, BinaryExpressionOp, BinaryPredicateOp, Expression as Expr,
         ExpressionStructPatchBuilder, JunctionPredicateOp, MapData, MapToStructOptions,
-        Predicate as Pred, StructData, col, column_expr_ref, column_pred, lit, null_lit,
+        Predicate as Pred, StructData, col, column_expr_ref, column_pred, expr, lit, null_lit,
     };
     use crate::schema::{
         ArrayType, DataType, MapType, StructField, StructType, schema, schema_ref,
@@ -1860,7 +1866,7 @@ mod tests {
         // Create coalesce expression with column that has no nulls, followed by
         // a reference to a non-existent column. If short-circuit works, the
         // non-existent column is never evaluated and no error occurs.
-        let expr = Expression::coalesce([col!("a"), col!("nonexistent")]);
+        let expr = expr!(coalesce(col("a"), col("nonexistent")));
 
         // Should return column "a" directly (short-circuit skips evaluating "nonexistent")
         let result = evaluate_expression(&expr, &batch, Some(&DataType::INTEGER)).unwrap();
@@ -1885,7 +1891,7 @@ mod tests {
 
         // Create coalesce expression: a has nulls, b has none, c doesn't exist.
         // Short-circuit should stop after evaluating b.
-        let expr = Expression::coalesce([col!("a"), col!("b"), col!("nonexistent")]);
+        let expr = expr!(coalesce(col("a"), col("b"), col("nonexistent")));
 
         // Should coalesce a and b, never evaluate "nonexistent"
         let result = evaluate_expression(&expr, &batch, Some(&DataType::INTEGER)).unwrap();
@@ -1904,7 +1910,7 @@ mod tests {
         let a_values = Int32Array::from(vec![1, 2, 3]); // No nulls - would short-circuit
         let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(a_values)]).unwrap();
 
-        let expr = Expression::coalesce([col!("a")]);
+        let expr = expr!(coalesce(col("a")));
 
         // Request STRING type but array is INT32 - should fail even with short-circuit
         let result = evaluate_expression(&expr, &batch, Some(&DataType::STRING));
@@ -1987,6 +1993,141 @@ mod tests {
         assert_result_error_with_message(result, "Incorrect datatype");
     }
 
+    #[rstest]
+    #[case::float_double(lit(6_f32), lit(2_f64), DataType::DOUBLE)]
+    #[case::double_float(lit(6_f64), lit(2_f32), DataType::DOUBLE)]
+    #[case::integer_long(lit(6_i32), lit(2_i64), DataType::LONG)]
+    #[case::long_integer(lit(6_i64), lit(2_i32), DataType::LONG)]
+    fn test_arithmetic_rejects_mixed_numeric_types(
+        #[case] left: Expr,
+        #[case] right: Expr,
+        #[case] common_type: DataType,
+        #[values(
+            BinaryExpressionOp::Plus,
+            BinaryExpressionOp::Minus,
+            BinaryExpressionOp::Multiply,
+            BinaryExpressionOp::Divide
+        )]
+        op: BinaryExpressionOp,
+        #[values(false, true)] declare_result_type: bool,
+    ) {
+        let batch = create_test_batch();
+        let expr = Expr::binary(op, left, right);
+        // A requested result type validates the output; it does not cast either operand.
+        let result_type = declare_result_type.then_some(&common_type);
+        assert_result_error_with_message(
+            evaluate_expression(&expr, &batch, result_type),
+            "Invalid arithmetic operation",
+        );
+    }
+
+    fn numeric_type_batch() -> RecordBatch {
+        RecordBatch::try_from_iter([
+            (
+                "f32",
+                Arc::new(Float32Array::from(vec![
+                    Some(6.0),
+                    None,
+                    Some(2.0),
+                    Some(-2.0),
+                ])) as ArrayRef,
+            ),
+            (
+                "f64",
+                Arc::new(Float64Array::from(vec![
+                    Some(6.0),
+                    None,
+                    Some(2.0),
+                    Some(-2.0),
+                ])),
+            ),
+            (
+                "i32",
+                Arc::new(Int32Array::from(vec![Some(6), None, Some(2), Some(-2)])),
+            ),
+            (
+                "i64",
+                Arc::new(Int64Array::from(vec![Some(6), None, Some(2), Some(-2)])),
+            ),
+        ])
+        .unwrap()
+    }
+
+    #[rstest]
+    #[case::float(col!("f32"), lit(2_f32), DataType::FLOAT)]
+    #[case::double(col!("f64"), lit(2_f64), DataType::DOUBLE)]
+    #[case::integer(col!("i32"), lit(2_i32), DataType::INTEGER)]
+    #[case::long(col!("i64"), lit(2_i64), DataType::LONG)]
+    #[case::float_to_double(Expr::cast(col!("f32"), DataType::DOUBLE), lit(2_f64), DataType::DOUBLE)]
+    #[case::integer_to_long(Expr::cast(col!("i32"), DataType::LONG), lit(2_i64), DataType::LONG)]
+    fn test_numeric_arithmetic_same_types_and_explicit_casts(
+        #[case] left: Expr,
+        #[case] right: Expr,
+        #[case] result_type: DataType,
+    ) {
+        let batch = numeric_type_batch();
+        let arrow_type = (&result_type).try_into_arrow().unwrap();
+        for (op, first, third, last) in [
+            (BinaryExpressionOp::Plus, 8.0, 4.0, 0.0),
+            (BinaryExpressionOp::Minus, 4.0, 0.0, -4.0),
+            (BinaryExpressionOp::Multiply, 12.0, 4.0, -4.0),
+            (BinaryExpressionOp::Divide, 3.0, 1.0, -1.0),
+        ] {
+            let expr = Expr::binary(op, left.clone(), right.clone());
+            let result = evaluate_expression(&expr, &batch, Some(&result_type)).unwrap();
+            let expected = Float64Array::from(vec![Some(first), None, Some(third), Some(last)]);
+            let expected = cast(&expected, &arrow_type).unwrap();
+            assert_eq!(result.as_ref(), expected.as_ref(), "{expr}");
+        }
+    }
+
+    #[rstest]
+    #[case::float_double(lit(6_f32), lit(2_f64))]
+    #[case::double_float(lit(6_f64), lit(2_f32))]
+    #[case::integer_long(lit(6_i32), lit(2_i64))]
+    #[case::long_integer(lit(6_i64), lit(2_i32))]
+    fn test_comparison_rejects_mixed_numeric_types(
+        #[case] left: Expr,
+        #[case] right: Expr,
+        #[values(
+            BinaryPredicateOp::Equal,
+            BinaryPredicateOp::LessThan,
+            BinaryPredicateOp::GreaterThan
+        )]
+        op: BinaryPredicateOp,
+    ) {
+        let batch = create_test_batch();
+        let pred = Pred::binary(op, left, right);
+        assert_result_error_with_message(
+            evaluate_predicate(&pred, &batch, false),
+            "Invalid comparison operation",
+        );
+    }
+
+    #[rstest]
+    #[case::float(col!("f32"), lit(2_f32))]
+    #[case::double(col!("f64"), lit(2_f64))]
+    #[case::integer(col!("i32"), lit(2_i32))]
+    #[case::long(col!("i64"), lit(2_i64))]
+    #[case::float_to_double(Expr::cast(col!("f32"), DataType::DOUBLE), lit(2_f64))]
+    #[case::integer_to_long(Expr::cast(col!("i32"), DataType::LONG), lit(2_i64))]
+    fn test_numeric_comparison_same_types_and_explicit_casts(
+        #[case] left: Expr,
+        #[case] right: Expr,
+    ) {
+        let batch = numeric_type_batch();
+        for (op, first, third, last) in [
+            (BinaryPredicateOp::Equal, false, true, false),
+            (BinaryPredicateOp::LessThan, false, false, true),
+            (BinaryPredicateOp::GreaterThan, true, false, false),
+        ] {
+            let pred = Pred::binary(op, left.clone(), right.clone());
+            let result = evaluate_predicate(&pred, &batch, false).unwrap();
+            let expected = BooleanArray::from(vec![Some(first), None, Some(third), Some(last)]);
+            assert_eq!(result, expected, "{pred}");
+        }
+    }
+
     fn divide(left: Expr, right: Expr) -> Expr {
         Expr::binary(BinaryExpressionOp::Divide, left, right)
     }
@@ -2015,7 +2156,7 @@ mod tests {
         )
         .unwrap();
 
-        let pred = Pred::distinct(col!("l"), col!("r"));
+        let pred = Pred::from_expr(expr!(distinct(col("l"), col("r"))));
         let result = evaluate_predicate(&pred, &batch, false).unwrap();
         assert_eq!(result.null_count(), 0);
         assert_eq!(result.value(0), expected);
@@ -2148,7 +2289,7 @@ mod tests {
         )
         .unwrap();
 
-        let pred = Pred::is_null(col!("n"));
+        let pred = Pred::from_expr(expr!(is_null(col("n"))));
         let result = evaluate_predicate(&pred, &batch, inverted).unwrap();
         assert_eq!(result.null_count(), 0);
         assert_eq!(result.values().iter().collect::<Vec<_>>(), expected);
@@ -3378,60 +3519,140 @@ mod tests {
     }
 
     #[rstest]
-    // Fast path: no nulls in predicate array — values bitmap used directly.
+    // A guard without NULLs lets the struct reuse the guard's values bitmap.
     #[case::fast_path(
+        expr!(guarded_struct(col("is_valid"), col("a"))),
         vec![Some(1), Some(2), Some(3)],
         vec![Some(true), Some(false), Some(true)],
         vec![true, false, true],
+        vec![Some(1), Some(2), Some(3)],
     )]
-    // Slow path: predicate has nulls — Kleene AND; both false and null → null struct.
+    // A guard with NULLs combines values and validity so NULL guards yield NULL structs.
     #[case::slow_path(
+        expr!(guarded_struct(col("is_valid"), col("a"))),
         vec![Some(1), Some(2), Some(3), Some(4)],
         vec![Some(true), Some(false), None, Some(true)],
         vec![true, false, false, true],
+        vec![Some(1), Some(2), Some(3), Some(4)],
     )]
-    fn test_struct_with_nullability_predicate(
+    #[case::unguarded_null_fields(
+        expr!(make_struct(col("a"))),
+        vec![None, None, None],
+        vec![Some(true), Some(false), None],
+        vec![true, true, true],
+        vec![None, None, None],
+    )]
+    #[case::predicate_guard(
+        expr!(guarded_struct(col("is_valid") == true, col("a"))),
+        vec![Some(1), Some(2), Some(3)],
+        vec![Some(true), Some(false), None],
+        vec![true, false, false],
+        vec![Some(1), Some(2), Some(3)],
+    )]
+    #[case::coalesce_guard(
+        expr!(guarded_struct(coalesce(col("is_valid"), false), col("a"))),
+        vec![Some(1), Some(2), Some(3)],
+        vec![Some(true), Some(false), None],
+        vec![true, false, false],
+        vec![Some(1), Some(2), Some(3)],
+    )]
+    #[case::coalesce_structs(
+        expr!(coalesce(guarded_struct(col("is_valid"), col("a")), make_struct(99))),
+        vec![Some(1), Some(2), Some(3), None],
+        vec![Some(true), Some(false), None, Some(true)],
+        vec![true, true, true, true],
+        vec![Some(1), Some(99), Some(99), None],
+    )]
+    fn struct_macro_preserves_row_validity_and_values(
+        #[case] expr: Expr,
         #[case] a_vals: Vec<Option<i32>>,
         #[case] pred_vals: Vec<Option<bool>>,
         #[case] expected_valid: Vec<bool>,
+        #[case] expected_values: Vec<Option<i32>>,
     ) {
         let batch = create_batch_with_bool_col(a_vals, pred_vals);
         let schema = DataType::from(schema! { nullable "a": INTEGER });
-        let expr = Expr::struct_with_nullability_from(
-            [column_expr_ref!("a")],
-            column_expr_ref!("is_valid"),
-        );
         let result = evaluate_expression(&expr, &batch, Some(&schema)).unwrap();
-        let struct_result = result.as_any().downcast_ref::<StructArray>().unwrap();
-        for (i, valid) in expected_valid.iter().enumerate() {
-            assert_eq!(struct_result.is_valid(i), *valid, "row {i}");
-        }
+        let expected = StructArray::new(
+            vec![Arc::new(ArrowField::new("a", ArrowDataType::Int32, true))].into(),
+            vec![Arc::new(Int32Array::from(expected_values))],
+            Some(NullBuffer::from(expected_valid)),
+        );
+        assert_eq!(result.as_ref(), &expected);
     }
 
-    #[test]
-    fn test_struct_with_nullability_predicate_nested_schema() {
-        // Nested struct as schema: outer struct has one field that is itself a struct.
+    #[rstest]
+    #[case::unguarded(expr!(make_struct()), vec![true, true, true])]
+    #[case::guarded(expr!(guarded_struct(col("is_valid"))), vec![true, false, false])]
+    #[case::coalesced(
+        expr!(coalesce(guarded_struct(col("is_valid")), make_struct())),
+        vec![true, true, true],
+    )]
+    fn empty_struct_macro_preserves_row_count_and_validity(
+        #[case] expr: Expr,
+        #[case] expected_valid: Vec<bool>,
+        #[values(0, 3)] num_rows: usize,
+    ) {
         let batch = create_batch_with_bool_col(
             vec![Some(1), Some(2), Some(3)],
-            vec![Some(true), Some(false), Some(true)],
+            vec![Some(true), Some(false), None],
+        )
+        .slice(0, num_rows);
+        let schema = DataType::from(schema! {});
+        let result = evaluate_expression(&expr, &batch, Some(&schema)).unwrap();
+        let expected = StructArray::new_empty_fields(
+            num_rows,
+            Some(NullBuffer::from(expected_valid).slice(0, num_rows)),
+        );
+        assert_eq!(result.as_ref(), &expected);
+    }
+
+    #[rstest]
+    #[case::guarded_outer(
+        expr!(guarded_struct(col("a") > 0, make_struct(col("a")))),
+        vec![true, false, true, false],
+        vec![true, true, true, true],
+    )]
+    #[case::guarded_inner(
+        expr!(make_struct(guarded_struct(col("is_valid"), col("a")))),
+        vec![true, true, true, true],
+        vec![false, true, true, false],
+    )]
+    #[case::both_guarded(
+        expr!(guarded_struct(col("a") > 0, guarded_struct(col("is_valid"), col("a")))),
+        vec![true, false, true, false],
+        vec![false, true, true, false],
+    )]
+    fn nested_struct_macro_preserves_independent_guards(
+        #[case] expr: Expr,
+        #[case] outer_valid: Vec<bool>,
+        #[case] inner_valid: Vec<bool>,
+    ) {
+        let values = vec![Some(1), Some(-1), Some(2), None];
+        let batch = create_batch_with_bool_col(
+            values.clone(),
+            vec![Some(false), Some(true), Some(true), None],
         );
         let schema = DataType::from(schema! {
             nullable "nested": { nullable "a": INTEGER },
         });
-        let inner_expr = Expr::struct_from([column_expr_ref!("a")]);
-        let expr = Expr::struct_with_nullability_from([inner_expr], column_expr_ref!("is_valid"));
         let result = evaluate_expression(&expr, &batch, Some(&schema)).unwrap();
-        let struct_result = result.as_any().downcast_ref::<StructArray>().unwrap();
-        assert!(struct_result.is_valid(0));
-        assert!(struct_result.is_null(1));
-        assert!(struct_result.is_valid(2));
-        // The "nested" column should itself be a StructArray with 3 rows
-        let nested = struct_result
-            .column(0)
-            .as_any()
-            .downcast_ref::<StructArray>()
-            .unwrap();
-        assert_eq!(nested.len(), 3);
+        let inner = StructArray::new(
+            vec![Arc::new(ArrowField::new("a", ArrowDataType::Int32, true))].into(),
+            vec![Arc::new(Int32Array::from(values))],
+            Some(NullBuffer::from(inner_valid)),
+        );
+        let expected = StructArray::new(
+            vec![Arc::new(ArrowField::new(
+                "nested",
+                inner.data_type().clone(),
+                true,
+            ))]
+            .into(),
+            vec![Arc::new(inner)],
+            Some(NullBuffer::from(outer_valid)),
+        );
+        assert_eq!(result.as_ref(), &expected);
     }
 
     #[test]
@@ -3683,7 +3904,7 @@ mod tests {
         vec![col!("a") + col!("b"),
              col!("b") - col!("a"),
              col!("a") * col!("b"),
-             Expr::coalesce([col!("a"), col!("b")])],
+             expr!(coalesce(col("a"), col("b")))],
         vec![vec![11, 9, 10, 1], vec![22, 18, 40, 2], vec![33, 27, 90, 3]])]
     #[case::empty_batch_n1(int_a_batch(vec![], false), vec![col!("a")], vec![])]
     #[case::empty_batch_n2(int_a_batch(vec![], false),

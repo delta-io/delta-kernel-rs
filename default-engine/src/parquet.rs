@@ -612,7 +612,7 @@ mod tests {
     };
     use delta_kernel::engine::arrow_conversion::TryIntoKernel as _;
     use delta_kernel::engine::arrow_data::ArrowEngineData;
-    use delta_kernel::expressions::{Predicate, Scalar, col, lit};
+    use delta_kernel::expressions::{Predicate, Scalar, expr};
     use delta_kernel::object_store::local::LocalFileSystem;
     use delta_kernel::object_store::memory::InMemory;
     use delta_kernel::object_store::{
@@ -635,7 +635,10 @@ mod tests {
         test_parquet_handler_write_always_overwrites,
         test_parquet_handler_write_omits_arrow_schema,
     };
+    use test_utils::record_batch_to_bytes;
     use url::Url;
+    use wiremock::matchers::{method, path, query_param};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use super::*;
     use crate::DEFAULT_BATCH_SIZE;
@@ -895,6 +898,64 @@ mod tests {
         assert_eq!(data[0].num_rows(), 10);
     }
 
+    #[tokio::test]
+    async fn test_read_presigned_parquet_preserves_query_and_batches() {
+        let physical_schema = Arc::new(long_schema("value"));
+        let expected = RecordBatch::try_new(
+            Arc::new(physical_schema.as_ref().try_into_arrow().unwrap()),
+            vec![Arc::new(Int64Array::from(vec![
+                Some(1),
+                None,
+                Some(3),
+                Some(4),
+                Some(5),
+            ]))],
+        )
+        .unwrap();
+        let bytes = record_batch_to_bytes(&expected);
+        let file_size = bytes.len() as u64;
+
+        // HTTP and HTTPS select the same presigned-URL branch; HTTP avoids local TLS setup.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/data.parquet"))
+            .and(query_param("X-Amz-Signature", "test-signature"))
+            .and(query_param("X-Amz-Security-Token", "test/token+value="))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(bytes))
+            .expect(2)
+            .mount(&server)
+            .await;
+        let mut url = Url::parse(&format!("{}/data.parquet", server.uri())).unwrap();
+        url.query_pairs_mut()
+            .append_pair("X-Amz-Signature", "test-signature")
+            .append_pair("X-Amz-Security-Token", "test/token+value=");
+        let files = [FileMeta::new(url, 0, file_size)];
+
+        let handler = DefaultParquetHandler::new(
+            Arc::new(InMemory::new()),
+            Arc::new(TokioBackgroundExecutor::new()),
+        )
+        .with_batch_size(NonZero::new(2).unwrap());
+        let data: Vec<RecordBatch> = handler
+            .read_parquet_files(&files, physical_schema.clone(), None)
+            .unwrap()
+            .map(into_record_batch)
+            .try_collect()
+            .unwrap();
+
+        assert_eq!(
+            data,
+            vec![
+                expected.slice(0, 2),
+                expected.slice(2, 2),
+                expected.slice(4, 1)
+            ]
+        );
+        let footer = handler.read_parquet_footer(&files[0]).unwrap();
+        assert_eq!(footer.schema, physical_schema);
+        server.verify().await;
+    }
+
     #[rstest::rstest]
     #[case::millis(
         TimeUnit::Millisecond,
@@ -985,10 +1046,9 @@ mod tests {
         );
 
         let predicate = lower_bound_us.map(|bound| {
-            Arc::new(Predicate::gt(
-                col!("ts_ntz"),
-                lit(Scalar::TimestampNtz(bound)),
-            ))
+            Arc::new(Predicate::from_expr(expr!(
+                col("ts_ntz") > lit(Scalar::TimestampNtz(bound))
+            )))
         });
         let data: Vec<RecordBatch> = handler
             .read_parquet_files(
