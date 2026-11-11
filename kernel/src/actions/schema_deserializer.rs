@@ -241,12 +241,49 @@ fn schema_json_error(error: serde_json::Error) -> KernelError {
 
 #[cfg(test)]
 mod tests {
-    use rstest::rstest;
+    use std::cell::Cell;
 
-    use super::parse;
+    use rstest::rstest;
+    use serde::Deserialize;
+
+    use super::{Budget, parse};
     use crate::KernelError;
     use crate::actions::SCHEMA_RECURSION_LIMIT;
     use crate::schema::{ArrayType, DataType, MapType, StructField, StructType};
+
+    #[derive(Debug, Deserialize, PartialEq)]
+    struct NestedArrays(Vec<Vec<u8>>);
+
+    #[rstest]
+    #[case::null_has_no_containers("null", 1, true)]
+    #[case::wrappers_do_not_consume_depth("[[1],[2]]", 3, true)]
+    #[case::wrappers_do_not_bypass_limit("[[1],[2]]", 2, false)]
+    fn optional_newtype_preserves_container_budget(
+        #[case] json: &str,
+        #[case] limit: usize,
+        #[case] succeeds: bool,
+    ) {
+        let expected = serde_json::from_str::<Option<NestedArrays>>(json).unwrap();
+        let exceeded = Cell::new(false);
+        let budget = Budget {
+            remaining: limit,
+            exceeded: &exceeded,
+        };
+        let mut deserializer = serde_json::Deserializer::from_str(json);
+        let result = Option::<NestedArrays>::deserialize(budget.wrap(&mut deserializer));
+        if succeeds {
+            assert_eq!(result.unwrap(), expected);
+            assert!(!exceeded.get());
+        } else {
+            assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("recursion limit exceeded")
+            );
+            assert!(exceeded.get());
+        }
+    }
 
     #[rstest]
     #[case::formerly_rejected(160, true)]
