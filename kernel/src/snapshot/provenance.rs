@@ -80,19 +80,18 @@ mod tests {
     use crate::Snapshot;
 
     #[rstest::rstest]
+    #[case::classic(FeatureSet::empty(), false)]
+    #[case::v2_inline(FeatureSet::new().v2_checkpoint(), false)]
+    #[case::v2_sidecars(FeatureSet::new().v2_checkpoint(), true)]
     fn checkpoint_provenance_is_unchanged_by_scan_and_hint_round_trip(
-        #[values(false, true)] v2: bool,
-        #[values(false, true)] sidecars: bool,
+        #[case] features: FeatureSet,
+        #[case] sidecars: bool,
     ) {
+        // Given a snapshot loaded from a classic or V2 checkpoint.
         let mut log = LogState::with_latest_version(2).with_checkpoint_at([1]);
         if sidecars {
             log = log.with_sidecars_if_enabled(Some(1));
         }
-        let features = if v2 {
-            FeatureSet::new().v2_checkpoint()
-        } else {
-            FeatureSet::empty()
-        };
         let table = TestTableBuilder::new()
             .with_features(features)
             .with_log_state(log)
@@ -105,15 +104,21 @@ mod tests {
             .unwrap();
         let expected = snapshot.checkpoint_type();
         assert!(expected.is_some());
+
+        // When a scan reads the checkpoint contents.
         let scan = snapshot.clone().scan_builder().build().unwrap();
         for batch in scan.scan_metadata(&engine).unwrap() {
             batch.unwrap();
         }
+        // Then the snapshot keeps its build-time observation.
         assert_eq!(snapshot.checkpoint_type(), expected);
+
+        // When the snapshot is rebuilt from its hint.
         let hinted = Snapshot::builder_for(table.table_root())
             .with_snapshot_hint(snapshot.to_snapshot_hint().unwrap())
             .build(&engine)
             .unwrap();
+        // Then the retained checkpoint type survives the round trip.
         assert_eq!(hinted.checkpoint_type(), expected);
     }
 }

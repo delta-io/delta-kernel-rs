@@ -1451,6 +1451,7 @@ mod tests {
     #[test_log::test(tokio::test)]
     async fn snapshot_hint_rejects_crc_before_checkpoint_with_typed_error()
     -> KernelResult<(), Box<dyn std::error::Error>> {
+        // Given a hinted checksum older than the selected checkpoint.
         let (engine, table_root, _, mut hint) =
             snapshot_and_hint(SnapshotHintFreshness::Unverified).await?;
         let checkpoint = hint.version;
@@ -1464,10 +1465,12 @@ mod tests {
             None,
             CrcProvenance::new(crate::snapshot::CrcSource::Stale, Some(crc_version)),
         ));
+        // When the hinted snapshot is built.
         let error = SnapshotBuilder::new_for(table_root)
             .with_snapshot_hint(hint)
             .build(engine.as_ref())
             .unwrap_err();
+        // Then the typed error identifies both conflicting versions.
         assert!(
             matches!(error, crate::Error::Kernel(KernelError::SnapshotHint(error))
             if matches!(*error, SnapshotHintError::CrcBeforeCheckpoint { crc, checkpoint: selected }

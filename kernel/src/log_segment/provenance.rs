@@ -135,7 +135,12 @@ mod tests {
         #[case] filename: &str,
         #[case] expected: Option<CheckpointType>,
     ) {
-        assert_eq!(segment(filename).checkpoint_type(), expected);
+        // Given a commit or checkpoint path with no additional type claim.
+        let segment = segment(filename);
+        // When the selected checkpoint type is observed.
+        let checkpoint_type = segment.checkpoint_type();
+        // Then only unambiguous filename evidence establishes the format.
+        assert_eq!(checkpoint_type, expected);
     }
 
     #[rstest::rstest]
@@ -147,6 +152,7 @@ mod tests {
         #[case] new_type: CheckpointType,
         #[case] expected: CheckpointType,
     ) {
+        // Given a resolved source checkpoint and a derived segment's own type claim.
         let filename = "00000000000000000000.checkpoint.parquet";
         let source = segment(filename)
             .with_checkpoint_type(Some(CheckpointType::V2))
@@ -160,7 +166,9 @@ mod tests {
             )
             .unwrap();
         }
+        // When the derived segment inherits observations for the same checkpoint.
         derived.inherit_checkpoint_provenance(&source);
+        // Then only an unresolved claim for the same checkpoint inherits the source's type.
         assert_eq!(derived.checkpoint_type(), Some(expected));
         assert_eq!(source.checkpoint_type(), Some(CheckpointType::V2));
     }
@@ -181,8 +189,13 @@ mod tests {
         #[case] filename: &str,
         #[case] checkpoint_type: CheckpointType,
     ) {
+        // Given a path whose checkpoint presence or filename contradicts the supplied type.
+        let segment = segment(filename);
+        // When the claim is attached to the selected checkpoint.
+        let result = segment.with_checkpoint_type(Some(checkpoint_type));
+        // Then validation reports a typed checkpoint-provenance conflict.
         assert!(matches!(
-            segment(filename).with_checkpoint_type(Some(checkpoint_type)),
+            result,
             Err(KernelError::SnapshotHint(error)) if matches!(*error, SnapshotHintError::CheckpointProvenanceConflict)
         ));
     }

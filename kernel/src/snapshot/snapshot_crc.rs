@@ -215,14 +215,16 @@ mod tests {
         #[case] source: CrcSource,
         #[case] base_version: Option<Version>,
     ) {
+        // Given a retained checksum and an incompatible provenance claim.
         let mut holder =
             SnapshotCrc::try_new(crc_version.map(crc_at), 5, None, CrcOrigin::Unknown).unwrap();
+
+        // When the claim is applied to the retained checksum.
         let error = holder
-            .set_provenance(CrcProvenance {
-                source,
-                base_version,
-            })
+            .set_provenance(CrcProvenance::new(source, base_version))
             .unwrap_err();
+
+        // Then validation reports a typed provenance conflict.
         assert!(matches!(error, KernelError::SnapshotHint(error)
             if matches!(*error, SnapshotHintError::CrcProvenanceConflict)));
     }

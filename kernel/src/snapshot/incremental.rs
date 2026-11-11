@@ -637,7 +637,7 @@ mod tests {
     use crate::object_store::memory::InMemory;
     use crate::parquet::arrow::ArrowWriter;
     use crate::path::LogPathFileType;
-    use crate::snapshot::{CheckpointWriteResult, commit};
+    use crate::snapshot::{CheckpointWriteResult, CrcProvenance, CrcSource, commit};
     use crate::unit_test_utils::{
         CapturingReporter, install_thread_local_metrics_reporter, string_array_to_engine_data,
     };
@@ -1718,44 +1718,25 @@ mod tests {
     // ============================================================================
 
     #[rstest]
-    #[case::missing(
-        None,
-        false,
-        IncrementalReplay::Unlimited,
-        crate::snapshot::CrcSource::Missing
-    )]
-    #[case::unusable(
-        Some(3),
-        true,
-        IncrementalReplay::Unlimited,
-        crate::snapshot::CrcSource::Unusable
-    )]
-    #[case::at_version(
-        Some(3),
-        false,
-        IncrementalReplay::Disabled,
-        crate::snapshot::CrcSource::AtVersion
-    )]
-    #[case::stale(
+    #[case::missing(None, false, IncrementalReplay::Unlimited, CrcSource::Missing)]
+    #[case::unusable(Some(3), true, IncrementalReplay::Unlimited, CrcSource::Unusable)]
+    #[case::at_version(Some(3), false, IncrementalReplay::Disabled, CrcSource::AtVersion)]
+    #[case::stale(Some(1), false, IncrementalReplay::Disabled, CrcSource::Stale)]
+    #[case::over_budget(Some(1), false, IncrementalReplay::UpToCommits(1), CrcSource::Stale)]
+    #[case::reconstructed(
         Some(1),
         false,
-        IncrementalReplay::Disabled,
-        crate::snapshot::CrcSource::Stale
+        IncrementalReplay::Unlimited,
+        CrcSource::Reconstructed { num_commits: 2 }
     )]
-    #[case::over_budget(
-        Some(1),
-        false,
-        IncrementalReplay::UpToCommits(1),
-        crate::snapshot::CrcSource::Stale
-    )]
-    #[case::reconstructed(Some(1), false, IncrementalReplay::Unlimited, crate::snapshot::CrcSource::Reconstructed { num_commits: 2 })]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn crc_provenance_survives_hint_round_trip(
         #[case] disk_version: Option<u64>,
         #[case] corrupt: bool,
         #[case] replay: IncrementalReplay,
-        #[case] source: crate::snapshot::CrcSource,
+        #[case] source: CrcSource,
     ) -> crate::Result<()> {
+        // Given a table with a missing, unusable, current, or stale checksum.
         let ctx = setup_incremental_snapshot_test()?;
         setup_test_table_with_commits(ctx.url.as_str(), &ctx.store, 4).await?;
         if let Some(version) = disk_version {
@@ -1769,64 +1750,18 @@ mod tests {
                 .await
                 .map_err(KernelError::from)?;
         }
+        // When the snapshot resolves the checksum under the requested replay budget.
         let snapshot = Snapshot::builder_for(ctx.url.as_str())
             .with_incremental_crc_replay(replay)
             .build(ctx.engine.as_ref())?;
-        let expected = crate::snapshot::CrcProvenance {
-            source,
-            base_version: disk_version.filter(|_| !corrupt),
-        };
+        // Then both the snapshot and its hint round trip preserve the original observation.
+        let expected = CrcProvenance::new(source, disk_version.filter(|_| !corrupt));
         assert_eq!(snapshot.crc_provenance(), expected);
         let rebuilt = Snapshot::builder_for(ctx.url.as_str())
             .with_snapshot_hint(snapshot.to_snapshot_hint()?)
             .build(ctx.engine.as_ref())?;
         assert_eq!(rebuilt.crc_provenance(), expected);
         assert_eq!(rebuilt.base_crc(), snapshot.base_crc());
-        Ok(())
-    }
-
-    #[rstest]
-    #[case::usable_newer(false)]
-    #[case::failed_newer_falls_back(true)]
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn crc_provenance_new_disk_baseline_or_fallback(
-        #[case] corrupt: bool,
-    ) -> crate::Result<()> {
-        use crate::snapshot::{CrcProvenance, CrcSource};
-        let ctx = setup_incremental_snapshot_test()?;
-        setup_test_table_with_commits(ctx.url.as_str(), &ctx.store, 5).await?;
-        ctx.store
-            .put(
-                &delta_path_for_version(1, "crc"),
-                make_test_crc_json(200, 2).to_string().into(),
-            )
-            .await
-            .map_err(KernelError::from)?;
-        let snapshot = Snapshot::builder_for(ctx.url.as_str())
-            .at_version(2)
-            .with_incremental_crc_replay(IncrementalReplay::Unlimited)
-            .build(ctx.engine.as_ref())?;
-        let content = if corrupt {
-            "invalid".to_owned()
-        } else {
-            make_test_crc_json(300, 3).to_string()
-        };
-        ctx.store
-            .put(&delta_path_for_version(3, "crc"), content.into())
-            .await
-            .map_err(KernelError::from)?;
-        let updated = Snapshot::builder_from(snapshot)
-            .with_incremental_crc_replay(IncrementalReplay::Unlimited)
-            .build(ctx.engine.as_ref())?;
-        assert_eq!(
-            updated.crc_provenance(),
-            CrcProvenance {
-                source: CrcSource::Reconstructed {
-                    num_commits: if corrupt { 3 } else { 1 }
-                },
-                base_version: Some(if corrupt { 1 } else { 3 }),
-            }
-        );
         Ok(())
     }
 
@@ -1928,17 +1863,22 @@ mod tests {
     }
 
     #[rstest]
-    #[case::disabled(IncrementalReplay::Disabled, None)]
-    #[case::unlimited(IncrementalReplay::Unlimited, Some(5))]
-    #[case::budget_exact(IncrementalReplay::UpToCommits(2), Some(5))]
-    #[case::budget_more_than_enough(IncrementalReplay::UpToCommits(5), Some(5))]
-    #[case::budget_too_small(IncrementalReplay::UpToCommits(1), None)]
+    #[case::disabled(IncrementalReplay::Disabled, None, None, 1)]
+    #[case::unlimited(IncrementalReplay::Unlimited, Some(5), None, 1)]
+    #[case::budget_exact(IncrementalReplay::UpToCommits(2), Some(5), None, 1)]
+    #[case::budget_more_than_enough(IncrementalReplay::UpToCommits(5), Some(5), None, 1)]
+    #[case::budget_too_small(IncrementalReplay::UpToCommits(1), None, None, 1)]
+    #[case::newer_disk_crc(IncrementalReplay::Unlimited, Some(5), Some(false), 4)]
+    #[case::corrupt_newer_disk_crc(IncrementalReplay::Unlimited, Some(5), Some(true), 1)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_incremental_update_advances_in_memory_crc_within_budget(
         #[case] mode: IncrementalReplay,
         #[case] expected_crc_v: Option<u64>,
+        #[case] new_disk_crc: Option<bool>,
+        #[case] expected_base_version: Version,
         #[values(false, true)] skip_new_checkpoints: bool,
     ) -> Result<()> {
+        // Given an in-memory checksum reconstructed from disk version 1 through version 3.
         let ctx = setup_incremental_snapshot_test()?;
         setup_test_table_with_commits(ctx.url.as_str(), &ctx.store, 6).await?;
         ctx.store
@@ -1956,10 +1896,22 @@ mod tests {
         assert_eq!(snapshot_a.crc_at_version().map(|c| c.version), Some(3));
         assert_eq!(
             snapshot_a.crc_provenance().source,
-            crate::snapshot::CrcSource::Reconstructed { num_commits: 2 }
+            CrcSource::Reconstructed { num_commits: 2 }
         );
 
-        // Advance with each CRC budget under both checkpoint-listing policies.
+        if let Some(corrupt) = new_disk_crc {
+            let content = if corrupt {
+                "invalid".to_owned()
+            } else {
+                make_test_crc_json(500, 5).to_string()
+            };
+            ctx.store
+                .put(&delta_path_for_version(4, "crc"), content.into())
+                .await
+                .map_err(KernelError::from)?;
+        }
+
+        // When the snapshot advances under each replay budget and checkpoint-listing policy.
         let builder = Snapshot::builder_from(snapshot_a).with_incremental_crc_replay(mode);
         let builder = if skip_new_checkpoints {
             builder.skip_new_checkpoints()
@@ -1968,17 +1920,21 @@ mod tests {
         };
         let updated = builder.build(ctx.engine.as_ref())?;
 
-        // Checkpoint retention must not change whether the configured CRC budget can advance.
+        // Then a usable newer disk checksum replaces the baseline; otherwise its origin survives.
         assert_eq!(updated.version(), 5);
         assert_eq!(updated.crc_at_version().map(|c| c.version), expected_crc_v);
-        assert_eq!(updated.crc_provenance().base_version, Some(1));
         assert_eq!(
-            updated.crc_provenance().source,
-            if expected_crc_v.is_some() {
-                crate::snapshot::CrcSource::Reconstructed { num_commits: 4 }
-            } else {
-                crate::snapshot::CrcSource::Stale
-            }
+            updated.crc_provenance(),
+            CrcProvenance::new(
+                if expected_crc_v.is_some() {
+                    CrcSource::Reconstructed {
+                        num_commits: updated.version() - expected_base_version,
+                    }
+                } else {
+                    CrcSource::Stale
+                },
+                Some(expected_base_version),
+            )
         );
         assert_eq!(
             updated
@@ -1987,7 +1943,7 @@ mod tests {
                 .latest_crc_file
                 .as_ref()
                 .map(|f| f.version),
-            Some(1)
+            Some(if new_disk_crc.is_some() { 4 } else { 1 })
         );
 
         Ok(())

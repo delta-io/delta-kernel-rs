@@ -384,6 +384,7 @@ async fn built_as_latest_is_inherited_by_derived_snapshots(
 async fn checkpoint_drops_stale_crc_origin(
     #[values(TableKind::FileSystem, TableKind::CatalogManaged)] kind: TableKind,
 ) -> delta_kernel::Result<()> {
+    // Given a snapshot that retains an older checksum without replaying it.
     let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
     setup_multi_version_table(&engine, &table_path, kind).await?;
     let base =
@@ -395,7 +396,9 @@ async fn checkpoint_drops_stale_crc_origin(
         CrcProvenance::new(CrcSource::Stale, Some(0))
     );
 
+    // When a checkpoint supersedes that stale checksum.
     let (result, checkpointed) = base.checkpoint(engine.as_ref(), None)?;
+    // Then the derived snapshot no longer claims the discarded checksum's origin.
     assert_eq!(result, CheckpointWriteResult::Written);
     assert_eq!(
         checkpointed.crc_provenance(),

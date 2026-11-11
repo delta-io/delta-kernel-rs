@@ -509,6 +509,7 @@ extern "C" fn copy_hint_paths(context: NullableCvoid, hint: *const FfiSnapshotHi
 }
 
 fn assert_exported_paths_and_round_trip(snapshot: Handle<SharedSnapshot>) {
+    // Given a snapshot with retained paths, checksum state, and provenance.
     let source = unsafe { snapshot.as_ref() };
     let table_root = source.table_root().as_str().to_owned();
     let expected_segment = source.log_segment().clone();
@@ -537,6 +538,7 @@ fn assert_exported_paths_and_round_trip(snapshot: Handle<SharedSnapshot>) {
         crc_version: None,
         visits: 0,
     };
+    // When the retained state is exported without storage I/O.
     assert!(unsafe {
         ok_or_panic(snapshot_to_snapshot_hint(
             snapshot.shallow_copy(),
@@ -545,6 +547,7 @@ fn assert_exported_paths_and_round_trip(snapshot: Handle<SharedSnapshot>) {
             copy_hint_paths,
         ))
     });
+    // Then the visitor receives the sorted, deduplicated paths and retained checksum.
     assert_eq!(state.visits, 1);
     assert!(
         state
@@ -561,6 +564,7 @@ fn assert_exported_paths_and_round_trip(snapshot: Handle<SharedSnapshot>) {
         expected_base_crc.as_ref().map(|crc| crc.version)
     );
 
+    // When the exported hint is installed and the source snapshot is released.
     let builder = unsafe {
         ok_or_panic(get_snapshot_builder(
             KernelStringSlice::new_unsafe(&table_root),
@@ -570,6 +574,7 @@ fn assert_exported_paths_and_round_trip(snapshot: Handle<SharedSnapshot>) {
     let builder = ok_or_panic(install_through_visitor(&snapshot, builder, &engine));
     unsafe { free_snapshot(snapshot) };
     let rebuilt = unsafe { ok_or_panic(snapshot_builder_build(builder)) };
+    // Then rebuilding preserves the complete retained state.
     let rebuilt_ref = unsafe { rebuilt.as_ref() };
     assert_eq!(rebuilt_ref.log_segment(), &expected_segment);
     assert_eq!(rebuilt_ref.crc_at_version(), expected_crc.as_ref());
@@ -726,6 +731,7 @@ fn hint_provenance_failures_are_invalid_snapshot_hints(
     #[case] base_version: Option<u64>,
     #[case] expected_message: &str,
 ) {
+    // Given a hint whose provenance conflicts with its checkpoint or checksum.
     let engine = test_engine();
     let paths = [FfiLogPath::new(
         slice(
@@ -742,11 +748,7 @@ fn hint_provenance_failures_are_invalid_snapshot_hints(
             source,
             base_version: base_version.into(),
         },
-        crc: if crc_version.is_some() {
-            &crc
-        } else {
-            std::ptr::null()
-        },
+        crc: crc_version.map_or(std::ptr::null(), |_| &crc),
         ..test_snapshot_hint(&paths, 1, FfiSnapshotHintFreshness::Latest)
     };
     let builder = unsafe {
@@ -755,7 +757,9 @@ fn hint_provenance_failures_are_invalid_snapshot_hints(
             &hint,
         ))
     };
+    // When the hinted snapshot is built.
     let result = unsafe { snapshot_builder_build(builder) };
+    // Then the FFI reports a typed snapshot-hint error.
     assert_extern_result_error_contains(
         result,
         FFIKernelError::InvalidSnapshotHint,
@@ -787,24 +791,16 @@ fn hint_preserves_provenance_without_io(
     #[case] crc_version: Option<u64>,
     #[case] checkpoint_type: Option<CheckpointType>,
 ) {
+    // Given retained checksum and checkpoint observations supplied by a connector.
     let engine = test_engine();
-    let mut paths = vec![
-        FfiLogPath::new(
-            slice("memory:///hinted-table/_delta_log/00000000000000000000.json"),
-            0,
-            1,
-        ),
-        FfiLogPath::new(
-            slice("memory:///hinted-table/_delta_log/00000000000000000001.json"),
-            0,
-            1,
-        ),
-        FfiLogPath::new(
-            slice("memory:///hinted-table/_delta_log/00000000000000000002.json"),
-            0,
-            1,
-        ),
-    ];
+    let mut paths = Vec::from(
+        [
+            "memory:///hinted-table/_delta_log/00000000000000000000.json",
+            "memory:///hinted-table/_delta_log/00000000000000000001.json",
+            "memory:///hinted-table/_delta_log/00000000000000000002.json",
+        ]
+        .map(|path| FfiLogPath::new(slice(path), 0, 1)),
+    );
     if checkpoint_type.is_some() {
         paths.push(FfiLogPath::new(
             slice("memory:///hinted-table/_delta_log/00000000000000000000.checkpoint.parquet"),
@@ -820,13 +816,10 @@ fn hint_preserves_provenance_without_io(
             source,
             base_version: base_version.into(),
         },
-        crc: if crc_version.is_some() {
-            &crc
-        } else {
-            std::ptr::null()
-        },
+        crc: crc_version.map_or(std::ptr::null(), |_| &crc),
         ..test_snapshot_hint(&paths, 2, FfiSnapshotHintFreshness::Latest)
     };
+    // When the snapshot is built using an engine that rejects I/O.
     let builder = unsafe {
         ok_or_panic(snapshot_builder_with_snapshot_hint(
             test_builder(&engine),
@@ -834,6 +827,7 @@ fn hint_preserves_provenance_without_io(
         ))
     };
     let snapshot = unsafe { ok_or_panic(snapshot_builder_build(builder)) };
+    // Then the public FFI accessors expose the supplied provenance.
     let mut observed = std::mem::MaybeUninit::uninit();
     unsafe { snapshot_crc_provenance(snapshot.shallow_copy(), observed.as_mut_ptr()) };
     assert_eq!(unsafe { observed.assume_init() }, hint.crc_provenance);
@@ -841,47 +835,18 @@ fn hint_preserves_provenance_without_io(
         Option::<CheckpointType>::from(unsafe {
             snapshot_checkpoint_type(snapshot.shallow_copy())
         }),
-        Option::<&CheckpointType>::from(&hint.checkpoint_type).copied()
-    );
-    let mut state = VisitedHint {
-        builder: Some(test_builder(&engine)),
-        result: None,
-        watermark: None,
-        visits: 0,
-    };
-    assert!(unsafe {
-        ok_or_panic(snapshot_to_snapshot_hint(
-            snapshot.shallow_copy(),
-            engine.shallow_copy(),
-            Some(NonNull::from(&mut state).cast()),
-            install_visited_hint,
-        ))
-    });
-    assert_eq!(state.visits, 1);
-    unsafe { free_snapshot(snapshot) };
-    let rebuilt =
-        unsafe { ok_or_panic(snapshot_builder_build(ok_or_panic(state.result.unwrap()))) };
-    let rebuilt_ref = unsafe { rebuilt.as_ref() };
-    assert_eq!(
-        rebuilt_ref.crc_provenance(),
-        hint.crc_provenance.to_kernel()
+        checkpoint_type
     );
     assert_eq!(
-        rebuilt_ref.checkpoint_type(),
-        Option::<&CheckpointType>::from(&hint.checkpoint_type).copied()
-    );
-    assert_eq!(
-        rebuilt_ref
+        unsafe { snapshot.as_ref() }
             .to_snapshot_hint()
             .unwrap()
             .base_crc()
             .map(|crc| crc.version),
         crc_version
     );
-    unsafe {
-        free_snapshot(rebuilt);
-        free_engine(engine);
-    }
+    assert_exported_paths_and_round_trip(snapshot);
+    unsafe { free_engine(engine) };
 }
 
 extern "C" fn install_visited_hint(context: NullableCvoid, hint: *const FfiSnapshotHint) {

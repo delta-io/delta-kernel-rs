@@ -1614,6 +1614,7 @@ async fn pick_latest_base_crc_preserves_cancellation_with_in_memory_base(
 #[case::corrupt_newer_disk_crc(Some(true))]
 #[tokio::test]
 async fn pick_latest_base_crc_preserves_in_memory_identity(#[case] disk_crc: Option<bool>) {
+    // Given an in-memory baseline with a missing, same-version, or corrupt disk checksum.
     let mut test = CrcReadTest::new()
         .commit(0, create_table_actions())
         .commit(1, [commit_info(DEFAULT_OPERATION, None)]);
@@ -1636,10 +1637,12 @@ async fn pick_latest_base_crc_preserves_in_memory_identity(#[case] disk_crc: Opt
         None,
     )
     .unwrap();
+    // When the in-memory checksum wins baseline selection.
     let selected = segment
         .pick_latest_base_crc(&built.engine, Some(&base))
         .unwrap()
         .unwrap();
+    // Then the original Arc is retained, preserving its disk provenance.
     assert!(Arc::ptr_eq(&base, &selected));
 }
 

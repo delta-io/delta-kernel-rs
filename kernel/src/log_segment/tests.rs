@@ -1578,18 +1578,38 @@ async fn test_create_checkpoint_stream_returns_checkpoint_batches_if_checkpoint_
     Ok(())
 }
 
+#[rstest]
+#[case::classic(false, false)]
+#[case::v2_inline(true, false)]
+#[case::v2_with_sidecar_column(true, true)]
 #[tokio::test]
-async fn test_create_checkpoint_stream_reads_parquet_checkpoint_batch_without_sidecars()
--> KernelResult<()> {
+async fn test_create_checkpoint_stream_preserves_checkpoint_type(
+    #[case] v2: bool,
+    #[case] sidecar_column: bool,
+    #[values(CheckpointType::Unresolved, CheckpointType::V1, CheckpointType::V2)]
+    claimed_type: CheckpointType,
+) -> KernelResult<()> {
+    // Given a classic-named checkpoint and a retained type claim.
     let (store, log_root) = new_in_memory_store();
     let engine = SyncEngine::new_with_store(store.clone());
 
-    add_checkpoint_to_store(
-        &store,
-        add_batch_simple(get_commit_schema().clone()),
-        "00000000000000000001.checkpoint.parquet",
-    )
-    .await?;
+    let batch: Box<dyn EngineData> = if v2 {
+        let mut fields = vec![ADD_NAME, CHECKPOINT_METADATA_NAME];
+        if sidecar_column {
+            fields.push(SIDECAR_NAME);
+        }
+        let json = StringArray::from(vec![
+            r#"{"checkpointMetadata":{"version":1}}"#,
+            r#"{"add":{"path":"data.parquet","partitionValues":{},"size":1,"modificationTime":0,"dataChange":false}}"#,
+        ]);
+        SyncJsonHandler::new(None).parse_json(
+            string_array_to_engine_data(json),
+            get_all_actions_schema().project(&fields)?,
+        )?
+    } else {
+        add_batch_simple(get_commit_schema().clone())
+    };
+    add_checkpoint_to_store(&store, batch, "00000000000000000001.checkpoint.parquet").await?;
 
     let checkpoint_one_file = log_root
         .join("00000000000000000001.checkpoint.parquet")?
@@ -1613,7 +1633,11 @@ async fn test_create_checkpoint_stream_reads_parquet_checkpoint_batch_without_si
         log_root,
         None,
         None,
-    )?;
+    )?
+    .with_checkpoint_type(Some(claimed_type))?;
+    let before = log_segment.clone();
+
+    // When the checkpoint stream is consumed.
     let checkpoint_result = log_segment.create_checkpoint_stream(
         &engine,
         v2_checkpoint_read_schema.clone(),
@@ -1623,71 +1647,23 @@ async fn test_create_checkpoint_stream_reads_parquet_checkpoint_batch_without_si
     )?;
     let mut iter = checkpoint_result.actions;
 
-    // Assert that the first batch returned is from reading checkpoint file 1
+    // Then the stream returns checkpoint actions without changing the retained type.
     let ActionsBatch {
         actions: first_batch,
         is_log_batch,
     } = iter.next().unwrap()?;
     assert!(!is_log_batch);
-    assert_batch_matches(first_batch, add_batch_simple(v2_checkpoint_read_schema));
+    if v2 {
+        let mut adds = AddVisitor::default();
+        adds.visit_rows_of(first_batch.as_ref())?;
+        assert_eq!(adds.adds.len(), 1);
+    } else {
+        assert_batch_matches(first_batch, add_batch_simple(v2_checkpoint_read_schema));
+    }
     assert!(iter.next().is_none());
+    assert_eq!(log_segment.checkpoint_type(), Some(claimed_type));
+    assert_eq!(log_segment, before);
 
-    Ok(())
-}
-
-#[rstest]
-#[tokio::test]
-async fn classic_v2_checkpoint_type_is_unchanged_by_reads(
-    #[values(false, true)] sidecar_column: bool,
-    #[values(CheckpointType::Unresolved, CheckpointType::V1, CheckpointType::V2)]
-    claimed_type: CheckpointType,
-) -> KernelResult<()> {
-    let (store, log_root) = new_in_memory_store();
-    let engine = SyncEngine::new_with_store(store.clone());
-    let mut fields = vec![ADD_NAME, CHECKPOINT_METADATA_NAME];
-    if sidecar_column {
-        fields.push(SIDECAR_NAME);
-    }
-    let schema = get_all_actions_schema().project(&fields)?;
-    let json = StringArray::from(vec![
-        r#"{"checkpointMetadata":{"version":1}}"#,
-        r#"{"add":{"path":"data.parquet","partitionValues":{},"size":1,"modificationTime":0,"dataChange":false}}"#,
-    ]);
-    let batch = SyncJsonHandler::new(None).parse_json(string_array_to_engine_data(json), schema)?;
-    let filename = "00000000000000000001.checkpoint.parquet";
-    add_checkpoint_to_store(&store, batch, filename).await?;
-    let size = get_file_size(&store, &format!("_delta_log/{filename}")).await;
-    let segment = LogSegment::try_new(
-        LogSegmentFiles {
-            checkpoint_parts: vec![create_log_path_with_size(
-                log_root.join(filename)?.as_str(),
-                size,
-            )],
-            latest_commit_file: Some(create_log_path(
-                log_root.join("00000000000000000001.json")?.as_str(),
-            )),
-            ..Default::default()
-        },
-        log_root,
-        None,
-        None,
-    )?;
-    let segment = segment.with_checkpoint_type(Some(claimed_type))?;
-    let before = segment.clone();
-    let batches = segment.create_checkpoint_stream(
-        &engine,
-        get_all_actions_schema().project(&[ADD_NAME, SIDECAR_NAME])?,
-        None,
-        None,
-        None,
-    )?;
-    let mut adds = AddVisitor::default();
-    for batch in batches.actions {
-        adds.visit_rows_of(batch?.actions.as_ref())?;
-    }
-    assert_eq!(adds.adds.len(), 1);
-    assert_eq!(segment.checkpoint_type(), Some(claimed_type));
-    assert_eq!(segment, before);
     Ok(())
 }
 
