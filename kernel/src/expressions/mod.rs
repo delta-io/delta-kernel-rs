@@ -99,18 +99,22 @@ pub enum UnaryPredicateOp {
     ///
     /// [RFC 3986 section 3.1]: https://datatracker.ietf.org/doc/html/rfc3986#section-3.1
     HasUriScheme,
-    /// `true` when any `/`-separated segment of a STRING is exactly `.` or `..`, equivalent to
-    /// `regexp_like(expr, '(^|/)\.\.?(/|$)')`. The input is compared as a plain string: it is not
-    /// parsed as a URI or percent-decoded, so apply it to raw (unencoded) paths. A NULL input
-    /// yields NULL, and so does its `NOT`. Other input types are an error.
+    /// `true` when a STRING is absolute (has a URI scheme, see [`Self::HasUriScheme`]) or is a
+    /// non-empty relative path not beginning with `/`, and has no `/`-separated segment that is
+    /// exactly `.` or `..`. The string is checked as written, without URI parsing or
+    /// percent-decoding, so `%2E%2E` is not a dot segment. A NULL input yields NULL, and so does
+    /// its `NOT`. Other input types are an error.
     ///
     /// ```text
-    /// HAS_DOT_SEGMENT('a/../b')          -- true
-    /// HAS_DOT_SEGMENT('s3://b/x/./y')    -- true
-    /// HAS_DOT_SEGMENT('a/.hidden/b..c')  -- false
-    /// HAS_DOT_SEGMENT('a/%2E%2E/b')      -- false
+    /// IS_VALID_FILE_LOCATION('a/b.parquet')       -- true
+    /// IS_VALID_FILE_LOCATION('s3://b/a.parquet')  -- true
+    /// IS_VALID_FILE_LOCATION('a/.hidden/b..c')    -- true
+    /// IS_VALID_FILE_LOCATION('')                  -- false
+    /// IS_VALID_FILE_LOCATION('/a/b.parquet')      -- false
+    /// IS_VALID_FILE_LOCATION('a/../b')            -- false
+    /// IS_VALID_FILE_LOCATION('s3://b/x/./y')      -- false
     /// ```
-    HasDotSegment,
+    IsValidFileLocation,
 }
 
 /// A binary predicate operator.
@@ -1181,9 +1185,10 @@ impl Predicate {
         Self::unary(UnaryPredicateOp::HasUriScheme, expr)
     }
 
-    /// Create a new predicate `HAS_DOT_SEGMENT(expr)`; see [`UnaryPredicateOp::HasDotSegment`].
-    pub fn has_dot_segment(expr: impl Into<Expression>) -> Self {
-        Self::unary(UnaryPredicateOp::HasDotSegment, expr)
+    /// Create a new predicate `IS_VALID_FILE_LOCATION(expr)`; see
+    /// [`UnaryPredicateOp::IsValidFileLocation`].
+    pub fn is_valid_file_location(expr: impl Into<Expression>) -> Self {
+        Self::unary(UnaryPredicateOp::IsValidFileLocation, expr)
     }
 
     /// Create a new predicate `self == other`
@@ -1463,7 +1468,9 @@ impl Display for Predicate {
             Unary(UnaryPredicate { op, expr }) => match op {
                 UnaryPredicateOp::IsNull => write!(f, "{expr} IS NULL"),
                 UnaryPredicateOp::HasUriScheme => write!(f, "HAS_URI_SCHEME({expr})"),
-                UnaryPredicateOp::HasDotSegment => write!(f, "HAS_DOT_SEGMENT({expr})"),
+                UnaryPredicateOp::IsValidFileLocation => {
+                    write!(f, "IS_VALID_FILE_LOCATION({expr})")
+                }
             },
             Junction(JunctionPredicate { op, preds }) => {
                 let op = match op {
@@ -1671,8 +1678,8 @@ mod tests {
                 "NOT(HAS_URI_SCHEME(Column(x)))",
             ),
             (
-                Pred::has_dot_segment(col!("x")),
-                "HAS_DOT_SEGMENT(Column(x))",
+                Pred::is_valid_file_location(col!("x")),
+                "IS_VALID_FILE_LOCATION(Column(x))",
             ),
         ];
 
@@ -2009,7 +2016,7 @@ mod tests {
                 Predicate::from_expr(expr!(is_null(col("nullable_col")))),
                 Predicate::from_expr(expr!(is_not_null(col("nullable_col")))),
                 Predicate::has_uri_scheme(col!("location")),
-                Predicate::has_dot_segment(col!("location")),
+                Predicate::is_valid_file_location(col!("location")),
             ];
 
             for pred in &cases {

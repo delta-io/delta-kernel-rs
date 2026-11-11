@@ -24,9 +24,9 @@ use crate::scalar::to_df_scalar;
 ///
 /// # Errors
 /// Returns [`KernelError::unsupported`] for engine-defined (`Opaque`) or `Unknown` predicates, for
-/// `HasUriScheme`, and for an `IN` whose right side is neither a literal array nor an array-typed
-/// column. Also propagates errors from child expressions, such as an unresolved column or an
-/// interval literal (which has no Arrow equivalent).
+/// `HasUriScheme` and `IsValidFileLocation`, and for an `IN` whose right side is neither a literal
+/// array nor an array-typed column. Also propagates errors from child expressions, such as an
+/// unresolved column or an interval literal (which has no Arrow equivalent).
 pub fn to_df_predicate_expr(
     pred: &KernelPredicate,
     input_schema: &StructType,
@@ -59,11 +59,10 @@ fn unary_to_df_predicate_expr(
     let expr = to_df_expr(&unary.expr, input_schema, None)?;
     match unary.op {
         KernelUnaryPredicateOp::IsNull => Ok(DFExpr::IsNull(Box::new(expr))),
-        op @ (KernelUnaryPredicateOp::HasUriScheme | KernelUnaryPredicateOp::HasDotSegment) => {
-            Err(KernelError::unsupported(format!(
-                "converting the {op:?} predicate is not yet supported"
-            )))
-        }
+        op @ (KernelUnaryPredicateOp::HasUriScheme
+        | KernelUnaryPredicateOp::IsValidFileLocation) => Err(KernelError::unsupported(format!(
+            "converting the {op:?} predicate is not yet supported"
+        ))),
     }
 }
 
@@ -385,7 +384,7 @@ mod tests {
         KernelPred::binary(KernelBinaryPredicateOp::In, lit(1i64), col!("b"))
     )]
     #[case::has_uri_scheme(KernelPred::has_uri_scheme(col!("a")))]
-    #[case::has_dot_segment(KernelPred::has_dot_segment(col!("a")))]
+    #[case::is_valid_file_location(KernelPred::is_valid_file_location(col!("a")))]
     fn unsupported_predicate_is_an_error(#[case] pred: KernelPred) {
         to_df_predicate_expr(&pred, &test_schema()).unwrap_err();
     }

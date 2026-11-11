@@ -175,11 +175,11 @@ pub struct EngineExpressionVisitor {
     /// The sub-expression will be in a _one_ item list identified by `child_list_id`.
     /// See [`UnaryPredicateOp::HasUriScheme`] for the semantics the implementation must follow.
     pub visit_has_uri_scheme: VisitUnaryFn,
-    /// Visits a `has_dot_segment` predicate belonging to the list identified by
+    /// Visits an `is_valid_file_location` predicate belonging to the list identified by
     /// `sibling_list_id`. The sub-expression will be in a _one_ item list identified by
-    /// `child_list_id`. See [`UnaryPredicateOp::HasDotSegment`] for the semantics the
+    /// `child_list_id`. See [`UnaryPredicateOp::IsValidFileLocation`] for the semantics the
     /// implementation must follow.
-    pub visit_has_dot_segment: VisitUnaryFn,
+    pub visit_is_valid_file_location: VisitUnaryFn,
     /// Visits the `ToJson` unary operator belonging to the list identified by `sibling_list_id`.
     /// The sub-expression will be in a _one_ item list identified by `child_list_id`.
     /// See [`UnaryExpressionOp::ToJson`] for the encoding the implementation must produce; in
@@ -801,7 +801,7 @@ fn visit_predicate_impl(
             let visit_fn = match op {
                 UnaryPredicateOp::IsNull => visitor.visit_is_null,
                 UnaryPredicateOp::HasUriScheme => visitor.visit_has_uri_scheme,
-                UnaryPredicateOp::HasDotSegment => visitor.visit_has_dot_segment,
+                UnaryPredicateOp::IsValidFileLocation => visitor.visit_is_valid_file_location,
             };
             visit_fn(visitor.data, sibling_list_id, child_list_id);
         }
@@ -1022,7 +1022,7 @@ mod tests {
             visit_not: ignore_child_list,
             visit_is_null: ignore_child_list,
             visit_has_uri_scheme: ignore_child_list,
-            visit_has_dot_segment: ignore_child_list,
+            visit_is_valid_file_location: ignore_child_list,
             visit_to_json: ignore_child_list,
             visit_uri_encode_location: ignore_child_list,
             visit_cardinality: ignore_child_list,

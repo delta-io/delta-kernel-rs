@@ -570,7 +570,9 @@ impl From<UnaryPredicateOp> for proto_expr::UnaryPredicateOp {
         match op {
             UnaryPredicateOp::IsNull => proto_expr::UnaryPredicateOp::IsNull,
             UnaryPredicateOp::HasUriScheme => proto_expr::UnaryPredicateOp::HasUriScheme,
-            UnaryPredicateOp::HasDotSegment => proto_expr::UnaryPredicateOp::HasDotSegment,
+            UnaryPredicateOp::IsValidFileLocation => {
+                proto_expr::UnaryPredicateOp::IsValidFileLocation
+            }
         }
     }
 }
@@ -2047,8 +2049,8 @@ mod tests {
         proto_expr::UnaryPredicateOp::HasUriScheme
     )]
     #[case(
-        UnaryPredicateOp::HasDotSegment,
-        proto_expr::UnaryPredicateOp::HasDotSegment
+        UnaryPredicateOp::IsValidFileLocation,
+        proto_expr::UnaryPredicateOp::IsValidFileLocation
     )]
     fn from_unary_predicate_op(
         #[case] op: UnaryPredicateOp,

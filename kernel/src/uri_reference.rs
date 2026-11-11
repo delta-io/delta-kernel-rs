@@ -1,6 +1,6 @@
-//! RFC 3986 URI-reference syntax: whether a reference is absolute (has a scheme) or relative,
-//! whether it has `.` or `..` segments, and percent-encoding or decoding its path while keeping any
-//! `scheme:[//authority]` prefix.
+//! RFC 3986 URI-reference syntax: whether a reference is absolute (has a scheme) or relative, and
+//! percent-encoding or decoding its path while keeping any `scheme:[//authority]` prefix; plus the
+//! file location rule built on it.
 
 use std::borrow::Cow;
 
@@ -29,6 +29,15 @@ pub(crate) fn scheme_len(location: &str) -> Option<usize> {
 pub(crate) fn has_dot_segment(path: &str) -> bool {
     path.split('/')
         .any(|segment| segment == "." || segment == "..")
+}
+
+/// Returns whether `location` is valid as the location of a table's file: absolute (it has a URI
+/// scheme) or a non-empty path that does not begin with `/`, and in either case without a `.` or
+/// `..` segment.
+pub(crate) fn is_valid_file_location(location: &str) -> bool {
+    let absolute_or_table_relative =
+        scheme_len(location).is_some() || !(location.is_empty() || location.starts_with('/'));
+    absolute_or_table_relative && !has_dot_segment(location)
 }
 
 /// Percent-encodes the path of a raw URI reference with [`uri_encode_path`], keeping the
@@ -115,6 +124,21 @@ mod tests {
     #[case::plain("a/b.parquet", false)]
     fn test_has_dot_segment(#[case] path: &str, #[case] expected: bool) {
         assert_eq!(has_dot_segment(path), expected);
+    }
+
+    #[rstest]
+    #[case::relative("a/b.parquet", true)]
+    #[case::absolute("s3://b/a.parquet", true)]
+    #[case::dotted_name("a/.hidden/b..c", true)]
+    #[case::escaped_dots("a/%2E%2E/b", true)]
+    #[case::empty("", false)]
+    #[case::leading_slash("/a/b.parquet", false)]
+    #[case::relative_dot_dot("a/../b", false)]
+    #[case::relative_dot("./a", false)]
+    #[case::absolute_dot_dot("s3://b/x/../y", false)]
+    #[case::leading_slash_and_dot_dot("/../a", false)]
+    fn test_is_valid_file_location(#[case] location: &str, #[case] expected: bool) {
+        assert_eq!(is_valid_file_location(location), expected);
     }
 
     #[rstest]

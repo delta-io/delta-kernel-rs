@@ -713,7 +713,7 @@ fn test_eval_binary_commutes_literal_and_cast_column(
 #[rstest::rstest]
 fn test_uri_predicates_are_never_evaluated_for_skipping(
     #[values(lit("s3://b/a"), col!("location"))] expr: Expr,
-    #[values(Pred::has_uri_scheme, Pred::has_dot_segment)] make_pred: fn(Expr) -> Pred,
+    #[values(Pred::has_uri_scheme, Pred::is_valid_file_location)] make_pred: fn(Expr) -> Pred,
     #[values(false, true)] inverted: bool,
 ) {
     let filter = DefaultKernelPredicateEvaluator::from(Scalar::from("s3://b/a"));

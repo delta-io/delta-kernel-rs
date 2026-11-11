@@ -50,7 +50,7 @@ use crate::expressions::{
     UnaryPredicate, UnaryPredicateOp, VariadicExpression, VariadicExpressionOp,
 };
 use crate::schema::{DataType, PrimitiveType, StructField, StructType};
-use crate::uri_reference::{has_dot_segment, scheme_len, uri_encode_location};
+use crate::uri_reference::{is_valid_file_location, scheme_len, uri_encode_location};
 use crate::utils::require;
 
 #[internal_api]
@@ -766,9 +766,10 @@ pub fn evaluate_predicate(
                         map_string_rows(&arr, "HasUriScheme", |r| scheme_len(r).is_some())?;
                     Ok(maybe_inverted(Cow::Owned(BooleanArray::from(has_scheme)))?)
                 }
-                (UnaryPredicateOp::HasDotSegment, _) => {
-                    let has_dot = map_string_rows(&arr, "HasDotSegment", has_dot_segment)?;
-                    Ok(maybe_inverted(Cow::Owned(BooleanArray::from(has_dot)))?)
+                (UnaryPredicateOp::IsValidFileLocation, _) => {
+                    let valid =
+                        map_string_rows(&arr, "IsValidFileLocation", is_valid_file_location)?;
+                    Ok(maybe_inverted(Cow::Owned(BooleanArray::from(valid)))?)
                 }
             }
         }
@@ -999,7 +1000,6 @@ fn cardinalities(input: &ArrayRef) -> KernelResult<ArrayRef> {
     }
 }
 
-/// Evaluates [`UnaryPredicateOp::HasUriScheme`] over any string representation.
 /// Applies `f` to every non-NULL row of a string array of any representation, keeping NULLs.
 /// Other array types are an error naming `op`.
 fn map_string_rows<'a, T>(
@@ -2544,10 +2544,11 @@ mod tests {
         (None, None),
     ];
 
-    /// Each path paired with whether it has a `.` or `..` segment.
-    const HAS_DOT_SEGMENT_CASES: &[(Option<&str>, Option<bool>)] = &[
-        (Some("a/../b"), Some(true)),
-        (Some("a/.hidden"), Some(false)),
+    /// Each location paired with whether it is a valid file location.
+    const IS_VALID_FILE_LOCATION_CASES: &[(Option<&str>, Option<bool>)] = &[
+        (Some("a/.hidden"), Some(true)),
+        (Some("a/../b"), Some(false)),
+        (Some("/a"), Some(false)),
         (Some(""), Some(false)),
         (None, None),
     ];
@@ -2555,8 +2556,8 @@ mod tests {
     type MakePredicate = fn(Expr) -> Pred;
 
     #[rstest]
-    #[case::has_uri_scheme(|e| Pred::has_uri_scheme(e), HAS_URI_SCHEME_CASES)]
-    #[case::has_dot_segment(|e| Pred::has_dot_segment(e), HAS_DOT_SEGMENT_CASES)]
+    #[case::has_uri_scheme(Pred::has_uri_scheme, HAS_URI_SCHEME_CASES)]
+    #[case::is_valid_file_location(Pred::is_valid_file_location, IS_VALID_FILE_LOCATION_CASES)]
     fn test_uri_predicates(
         #[case] make_pred: MakePredicate,
         #[case] cases: &[(Option<&'static str>, Option<bool>)],
@@ -2580,8 +2581,7 @@ mod tests {
 
     #[rstest]
     fn test_uri_predicates_reject_non_string_input(
-        #[values(|e| Pred::has_uri_scheme(e), |e| Pred::has_dot_segment(e))]
-        make_pred: MakePredicate,
+        #[values(Pred::has_uri_scheme, Pred::is_valid_file_location)] make_pred: MakePredicate,
     ) {
         let batch =
             RecordBatch::try_from_iter([("n", Arc::new(Int32Array::from(vec![1])) as ArrayRef)])

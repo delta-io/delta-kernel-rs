@@ -256,7 +256,7 @@ pub trait KernelPredicateEvaluator {
                 }
             },
             // Not evaluated for skipping; returning `None` never prunes, so it is always safe.
-            UnaryPredicateOp::HasUriScheme | UnaryPredicateOp::HasDotSegment => None,
+            UnaryPredicateOp::HasUriScheme | UnaryPredicateOp::IsValidFileLocation => None,
         }
     }
 

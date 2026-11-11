@@ -169,7 +169,7 @@ And
       Column(col)
   HasUriScheme
     Column(location)
-  HasDotSegment
+  IsValidFileLocation
     Column(location)
   OpaquePredicate(bar)
     Integer(42)

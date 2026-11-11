@@ -284,8 +284,8 @@ void print_tree_helper(ExpressionItem ref, int depth) {
         case HasUriScheme:
           printf("HasUriScheme\n");
           break;
-        case HasDotSegment:
-          printf("HasDotSegment\n");
+        case IsValidFileLocation:
+          printf("IsValidFileLocation\n");
           break;
         case UriEncodeLocation:
           printf("UriEncodeLocation\n");
