@@ -101,117 +101,63 @@ cargo +nightly fmt \
 
 ### Crate Names for `-p` Flag
 
-| Crate                                | Directory                             | Description                                                              |
-|--------------------------------------|---------------------------------------|--------------------------------------------------------------------------|
-| `delta_kernel`                       | `kernel/`                             | Core library                                                             |
-| `delta_kernel_default_engine`        | `default-engine/`                     | Default Arrow/Tokio `Engine` implementation                              |
-| `delta_kernel_default_engine_test_utils` | `default-engine/test-utils/`      | Default-engine test utilities                                            |
-| `delta_kernel_ffi`                   | `ffi/`                                | C/C++ FFI bindings                                                       |
-| `delta_kernel_ffi_macros`            | `ffi-proc-macros/`                    | FFI proc macros                                                          |
-| `delta_kernel_derive`                | `derive-macros/`                      | Proc macros                                                              |
-| `acceptance`                         | `acceptance/`                         | Acceptance tests (DAT)                                                   |
-| `test_utils`                         | `test-utils/`                         | Shared test utilities                                                    |
-| `delta_kernel_workloads`             | `workloads/`                          | Shared workload spec types + SQL predicate parser                        |
-| `delta_kernel_benchmarks`            | `benchmarks/`                         | Workload benchmarks                                                      |
-| `feature_tests`                      | `feature-tests/`                      | Feature flag tests                                                       |
-| `mem-test`                           | `mem-test/`                           | Memory-usage test executable                                             |
-| `delta-kernel-unity-catalog`         | `delta-kernel-unity-catalog/`         | Unity Catalog integration (UCCommitter, snapshot + create-table helpers) |
-| `unity-catalog-delta-client-api`     | `unity-catalog-delta-client-api/`     | Transport-agnostic UC client traits + wire models                        |
-| `unity-catalog-delta-rest-client`    | `unity-catalog-delta-rest-client/`    | REST/HTTP client for the Unity Catalog Delta Tables API                  |
-| `xtask`                              | `xtask/`                              | Dev tasks (regenerates checked-in code from pinned inputs)               |
+| Crate | Directory | Description |
+|---|---|---|
+| `delta_kernel` | `kernel/` | Core library |
+| `delta_kernel_default_engine` | `default-engine/` | Default Arrow/Tokio `Engine` implementation |
+| `delta_kernel_default_engine_test_utils` | `default-engine/test-utils/` | Default-engine test utilities |
+| `delta_kernel_ffi` | `ffi/` | C/C++ FFI bindings |
+| `delta_kernel_ffi_macros` | `ffi-proc-macros/` | FFI proc macros |
+| `delta_kernel_derive` | `derive-macros/` | Proc macros |
+| `acceptance` | `acceptance/` | Acceptance tests (DAT) |
+| `test_utils` | `test-utils/` | Shared test utilities |
+| `delta_kernel_workloads` | `workloads/` | Shared workload spec types + SQL predicate parser |
+| `delta_kernel_benchmarks` | `benchmarks/` | Workload benchmarks |
+| `feature_tests` | `feature-tests/` | Feature flag tests |
+| `mem-test` | `mem-test/` | Memory-usage test executable |
+| `delta-kernel-unity-catalog` | `delta-kernel-unity-catalog/` | Unity Catalog integration (UCCommitter, snapshot + create-table helpers) |
+| `unity-catalog-delta-client-api` | `unity-catalog-delta-client-api/` | Transport-agnostic UC client traits + wire models |
+| `unity-catalog-delta-rest-client` | `unity-catalog-delta-rest-client/` | REST/HTTP client for the Unity Catalog Delta Tables API |
+| `xtask` | `xtask/` | Dev tasks (regenerates checked-in code from pinned inputs) |
 
 Packages under `kernel/examples/` are also workspace members. Use the package name from the
 example's `Cargo.toml` with `-p`.
 
 ### Feature Flags
 
-Some noteworthy ones (see `[features]` in `kernel/Cargo.toml` for the full list):
+`[features]` in `kernel/Cargo.toml` is the authoritative feature list. Each feature's comment says
+what it enables and, where relevant, what kernel blocks without it. Read those comments before
+using, adding, or removing a feature. Cautions agents commonly need:
 
-- TLS backend selection (`rustls` / `native-tls`) lives on the `delta_kernel_default_engine`
-  crate, not on kernel itself.
-- `arrow`, `arrow-XX`, `arrow-YY`: Arrow version selection (kernel tracks the latest two
-  major Arrow releases; `arrow` defaults to latest). Kernel's core APIs are Arrow-independent;
-  the Arrow dependencies are optional, while the default engine requires one version.
-- `arrow-conversion`, `arrow-expression`: Arrow interop (auto-enabled by `default-engine-base`)
-- `prettyprint`: enables Arrow pretty-print helpers (primarily test/example oriented)
-- `schema-diff`: experimental schema diffing
-- `check-constraints-in-dev`: CHECK constraints support (experimental, in development). Gates
-  `KernelSupport::Supported` for the `checkConstraints` writer feature (without it, writes to
-  tables that support the feature, including legacy writer version 3 and above, are blocked). With
-  it, kernel discovers constraints and exposes their raw SQL through `check_constraints()` on
-  `Snapshot` and `Transaction`, and on a constrained table `write_state` and every commit require
-  `Transaction::ack_check_constraints`. Kernel does not evaluate constraint SQL, so enforcement is
-  the connector's responsibility. CREATE TABLE rejects `delta.constraints.*` properties in every
-  build. Also gates the internal SQL tokenizer and parser.
-- `checkpoint-protection`: support for the `checkpointProtection` writer feature.
-- `adaptive-metadata-in-dev`: adaptiveMetadata (Iceberg V4 adaptive metadata tree) support
-  (experimental, in development). Gates `KernelSupport::Supported` for the
-  `adaptiveMetadata-preview` reader+writer feature. Without it, reads and writes to tables listing
-  the feature are blocked.
-- `geo-type-in-dev`: geospatial type support (geometry and geography columns) (experimental,
-  in development). Gates `KernelSupport` for the `geospatial` reader+writer feature: with the
-  cargo feature off, any table listing it is rejected; with it on, scans and CDF are supported
-  but writes are still blocked.
-- `internal-api`: unstable APIs like `parallel_scan_metadata`. Items are marked with the
-  `#[internal_api]` proc macro attribute.
-- `declarative-plans`: experimental declarative-plan IR (`kernel/src/plans/`) and the prost
-  proto wire format mirroring it (`kernel/proto/`). Auto-enables `internal-api`, but not Arrow.
-- `vendored-protoc`: supplies `protoc` for `declarative-plans`; without it, set `PROTOC` to a
-  system or hermetic protobuf compiler.
-- `test-utils`, `integration-test`: development only (`test-utils` enables `prettyprint`)
+- TLS backend features (`rustls`, `native-tls`) live on `delta_kernel_default_engine`, not on
+  `delta_kernel`.
+- `internal-api` makes `#[internal_api]` items public. Treat those items as unstable.
+- `*-in-dev` features gate experimental, in-progress support.
+- `--all-features` builds against the newest supported Arrow version.
 
 ## Architecture at a Glance
 
-**Snapshot** is the primary entry point for existing-table operations: an immutable view of a
-table at a specific version. From it you build a `Scan` (reads) or `Transaction` (writes).
+`Snapshot` is the entry point for an existing table: an immutable view at one version. Reads go
+`Snapshot` -> `ScanBuilder` -> `Scan`, then `execute()`, `scan_metadata()`, or
+`parallel_scan_metadata()`. Writes go `Snapshot` -> `UpdateTableTransactionBuilder` ->
+`Transaction` -> `commit()`, which delegates the atomic commit to a `Committer`; new tables use
+`CreateTableTransactionBuilder`. The `Engine` trait supplies `StorageHandler`, `JsonHandler`,
+`ParquetHandler`, and `EvaluationHandler`, plus an optional `PlanExecutor` under
+`declarative-plans`. `DefaultEngine` lives in `default-engine/src/`. Metrics use tracing layers,
+not an engine handler.
 
-**Snapshot metadata:** `snapshot.reader()` creates a `SnapshotReader` for metadata getters that may
-read storage. Its optional token scopes synchronous, blocking reads without changing the shared
-snapshot or the connector's engine. In-memory getters remain on `Snapshot`.
+Read `CLAUDE/architecture.md` before changing snapshot loading, log replay, scans, transactions,
+committers, engine handlers, `EngineData`, or catalog-managed tables. It explains the builder
+types, execution modes, write steps, and data flow.
 
-**Read path:** `Snapshot` -> `ScanBuilder` -> `Scan` -> data. Execution paths:
-`execute()` (simple), `scan_metadata()` (advanced/distributed),
-`parallel_scan_metadata()` (two-phase distributed log replay).
+Rules that span modules:
 
-
-**Write path:** `Snapshot` -> `UpdateTableTransactionBuilder` -> `Transaction` -> `commit()`.
-`UpdateTableTransactionBuilder<MODE>` aliases `TransactionBuilder<UpdateTable, MODE>`; the
-create-table builder aliases `TransactionBuilder<CreateTable, MODE>`. The mode defaults to
-`Imperative`. Both entry points return imperative builders; with `declarative-plans`,
-`with_execution_mode::<MODE>()` selects the mode returned by `build()`. Common setters have one
-generic implementation.
-`transaction::imperative` contains EngineData staging, staged-data validation, action encoding,
-and committer response handling. The feature-gated `transaction::declarative` contains relation
-staging and a commit entry point that currently returns an unsupported error. Transaction
-configuration, mode-independent validation, CRC construction, and post-commit snapshot logic
-remain shared.
-The sealed `TransactionType` trait selects opaque type-specific state; specialized implementations
-provide constructors, custom setters, and build validation.
-`Snapshot::update_table(operation, engine_info, data_change)` requires all three values at
-construction; create-table constructors require the path, schema, engine info, and `data_change`
-and fix the operation to `CREATE TABLE`. These inputs cannot be changed on builders or built
-transactions. `data_change` is never inferred from staged files, including for empty commits.
-`build()` rejects ALTER with `true` and blind append with `false`; `commit()` retains operation and
-staged-file checks. `UpdateTableOperation::AlterTable` records schema-changing DDL without
-introducing a separate transaction type.
-
-Incremental CRC replay accepts known operation names with operation-specific exclusions in
-`FileStatsPolicy` (`kernel/src/crc/file_stats.rs`). Accepted operation names must also be rejected for
-`UpdateTableOperation::Custom`. Represent update-table
-operations with typed variants so name reservation is automatic, and mirror them in the FFI.
-
-Writers configure transaction intent before `build()`, then call
-`Transaction::write_state`, then bind partition values through the returned `WriteState` to get a
-`BoundWriteContext`. Distributed writers can encode and transport the state before binding it.
-Kernel assembles commit actions, enforces protocol compliance, and delegates the atomic commit to a
-`Committer`.
-
-**Engine trait:** exposes `StorageHandler`, `JsonHandler`, `ParquetHandler`, and
-`EvaluationHandler`, plus an optional `PlanExecutor` under `declarative-plans`. Metrics use tracing
-layers rather than an engine handler. `DefaultEngine` lives in `default-engine/src/`.
-
-**EngineData:** opaque columnar data interface. NEVER access `EngineData` columns
-directly: ALWAYS use the visitor pattern (`visit_rows` with typed `GetData` accessors).
+- Snapshot metadata getters that may read storage belong on `SnapshotReader`
+  (`snapshot.reader()`). In-memory getters stay on `Snapshot`.
+- Operation names that incremental CRC replay accepts (`FileStatsPolicy` in
+  `kernel/src/crc/file_stats.rs`) must be rejected for `UpdateTableOperation::Custom`. Add new
+  operations as typed `UpdateTableOperation` variants, so name reservation is automatic, and mirror
+  each new variant in the FFI.
 
 ## Testing
 
@@ -225,43 +171,29 @@ directly: ALWAYS use the visitor pattern (`visit_rows` with typed `GetData` acce
 - **Integration tests** exercise only public APIs end-to-end. See `kernel/tests/README.md`
   for a catalog of available test tables (schema, protocol, features, and which tests use
   them). Consult it before creating new test data to avoid duplication.
-- **Consider `TestTableBuilder` (`test_utils::table_builder`) to build the table under test.**
-  Unlike `create_table`, which builds a single create transaction with a given set of features and
-  data layout, the builder *builds up* a multi-version table: data files written across many
-  commits, plus checkpoints, CRC files, a stale/missing `_last_checkpoint` hint, or post-cleanup
-  logs. So when a test needs a populated table history in a specific state, the builder is often a
-  good fit, composing `LogState`, `FeatureSet`, `DataLayoutConfig`, and `TableConfig` through the
-  real kernel write path so the table is protocol-correct by construction. Load a snapshot at any
-  `VersionTarget` with the `build_snapshot!` macro. For coverage across many table states, the
-  `default_sweep` cross-product template
-  (`LogState x FeatureSet x (DataLayoutConfig, TableConfig) x VersionTarget`: data layout and table
-  config are bundled into one axis to avoid a cartesian explosion), or a per-axis template with
-  your own `#[values]`, can help; see `kernel/tests/integration/cross_product/mod.rs`. Drop to
-  lower-level setup like `test_table_setup` (or hand-rolled `add_commit` / `LocalMockTable`) only
-  when necessary: e.g. for states the builder cannot express, such as corrupt or malformed logs.
+- **Consider `TestTableBuilder` (`test_utils::table_builder`)** when a test needs a multi-version
+  table in a specific state: data across many commits, checkpoints, CRC files, a stale or missing
+  `_last_checkpoint` hint, or post-cleanup logs. Read `CLAUDE/testing.md` for when to choose it
+  over `create_table`, the `build_snapshot!` macro, and the `default_sweep` template.
 - Consider how the feature interacts with Delta table features (see Protocol TLDR below).
-- Consider write paths: normal commits, checkpointing, CRC files, log compaction files.
+- Consider write paths: normal commits, checkpointing, and CRC files.
 - When adding cloud-storage functionality to an engine, such as writing JSON files, make sure to
   test it against S3, Azure, and GCS.
 - Consider read paths: loading a snapshot from scratch at latest version, at a specific
   version (time travel), and updating from an existing snapshot.
-- Consider table state: only versioned JSON commits, after a checkpoint, after a version
-  checksum (`.crc`) file, after log compaction, etc.
+- Consider table state: only versioned JSON commits, after a checkpoint, and after a version
+  checksum (`.crc`) file.
 - Prefer descriptive test names over doc comments. Encode the scenario and expected
   behavior in the test name. Only add a test doc comment when the intent is too
   verbose or complex to express succinctly in the name.
-- Use `rstest` to parameterize tests that share the same logic but differ in setup
-  or inputs. Prefer `#[case]` over duplicating test functions. When parameters are
-  independent and form a cartesian product, prefer `#[values]` over enumerating
-  every combination with `#[case]`.
-- Actively look for rstest consolidation opportunities: when writing multiple tests
-  that share the same setup/flow and differ only in configuration and expected
-  outcome, write one parameterized rstest instead of separate functions. Also check
-  whether a new test duplicates the flow of an existing nearby test and should be
-  merged into it as a new `#[case]`. A common pattern is toggling a feature (e.g.
-  column mapping on/off) and asserting success vs. error.
-- Reuse helpers from `test_utils` and the integration-test fixtures instead of writing
-  custom ones when possible. See **Common test helpers** below for a curated starter list.
+- Use `rstest` when tests share logic and differ only in setup, inputs, or expected outcome.
+  Prefer `#[case]` over duplicate test functions. When parameters are independent and form a
+  cartesian product, prefer `#[values]` over enumerating every combination with `#[case]`. Before
+  adding a test, check whether a nearby test already has the same flow and should gain a new
+  `#[case]` instead. A common pattern is toggling a feature, such as column mapping, and asserting
+  success or error.
+- Reuse helpers from `test_utils` and the integration-test fixtures instead of writing custom ones.
+  Before writing a helper, check the curated list in `CLAUDE/testing.md`.
 - **Committing in tests:** Use `txn.commit(engine)?.unwrap_committed()` to assert a
   successful commit and get the `CommittedTransaction`. When you only need the resulting
   snapshot, use `txn.commit(engine)?.unwrap_post_commit_snapshot()` to get the
@@ -282,79 +214,6 @@ directly: ALWAYS use the visitor pattern (`visit_rows` with typed `GetData` acce
   `InMemory::new()` with `"memory:///"`. ALWAYS use the same `table_root` URL string for both
   `add_commit` (writing log files) and `Snapshot::builder_for` (reading the table). ALWAYS include
   a trailing slash in directory URLs to ensure correct path joining.
-
-### Common Test Helpers
-
-Before writing a custom helper, check this curated list and the locations below.
-This list is non-exhaustive: when in doubt, browse the source files directly
-(`test-utils/src/lib.rs`, `kernel/tests/integration/common/`,
-`kernel/tests/integration/<topic>/mod.rs`).
-
-**Arrow construction (from `delta_kernel::arrow`)**
-
-- `arrow::array::new_null_array(&arrow_type, n)`: Arrow array of `n` nulls of any Arrow
-  type. Prefer this over per-type `Int32Array::from(vec![None as Option<i32>])` builders.
-- `engine::arrow_conversion::TryIntoArrow`:
-  `(&kernel_data_type).try_into_arrow()` for `DataType`,
-  `(&kernel_struct_type).try_into_arrow()` for `StructType` -> Arrow `Schema`.
-
-**Handler access and overrides (from `delta_kernel::engine`, with `test-utils`)**
-
-- `PanicEngine`: assert that an operation requests no required engine handler.
-- `DelegatingEngine`: override selected handlers while delegating the rest to an inner engine.
-  See the types' rustdoc for override and executor selection behavior.
-
-**Engine + table setup (from `test_utils`)**
-
-- `test_table_setup()` / `test_table_setup_mt()`: engine + temp table path. Use the `_mt`
-  variant under `#[tokio::test(flavor = "multi_thread")]`. Required whenever a test calls
-  `snapshot.checkpoint()`: it issues nested `block_on` calls that deadlock on a single-threaded
-  runtime / `TokioBackgroundExecutor`.
-- `engine_store_setup(table_name, local_directory)`: returns
-  `(store, engine, table_location)` when a test needs direct object-store access.
-- `setup_test_tables(...)`: multiple pre-built tables for read/scan tests.
-
-**Table creation in tests**
-
-- `test_utils::table_builder::TestTableBuilder` (and the `test_table(...)` shorthand): worth
-  considering for a table in a specific state: composes `LogState`, `FeatureSet`,
-  `DataLayoutConfig`, and `TableConfig` through the real write path. Pair with the
-  `build_snapshot!` macro and, for broad coverage, the `default_sweep` template. See the Testing
-  section above.
-- Prefer the kernel `create_table` builder
-  (`delta_kernel::transaction::create_table::create_table`) when you need a single bespoke
-  table rather than the builder's composed states. It exercises the same path connectors use
-  and auto-derives the protocol from the schema and feature flags.
-- `test_utils::create_table` (a JSON helper that hand-rolls protocol + metadata) is older
-  but still needed when the kernel builder cannot enable a particular feature combination.
-
-**Schema fixtures**
-
-- `test_utils`: `nested_schema`, `schema_with_type`, `nested_schema_with_type`,
-  `multi_schema_with_type`, `top_level_ntz_schema` / `nested_ntz_schema` /
-  `multiple_ntz_schema`, `top_level_variant_schema` / `nested_variant_schema` /
-  `multiple_variant_schema`.
-- `kernel/tests/integration/create_table/mod.rs`: `simple_schema`, `partition_test_schema`.
-
-**Commit + read helpers (from `test_utils`)**
-
-- `add_commit`, `add_staged_commit`: write a JSON commit at a given version.
-- `read_actions_from_commit`: read raw JSON actions from a specific local-file commit. Use
-  this instead of hand-rolled `serde_json` parsing.
-- `test_read`: full-scan read of a table; use for round-trip assertions.
-- `into_record_batch`: convert `Box<dyn EngineData>` to Arrow `RecordBatch`.
-
-**Assertion helpers (from `test_utils`)**
-
-- `assert_schema_has_field(schema, &["a".into(), "b".into()])`: assert a (possibly nested)
-  field path.
-- `assert_result_error_with_message(result, "needle")`: assert an error contains a
-  substring.
-
-**If a name here doesn't match what's in code:** the list may have drifted from a rename.
-Run `rg '^pub (fn|async fn)' test-utils/src/lib.rs` to discover the current public surface,
-and update this section in your PR. The same pattern works for
-`kernel/tests/integration/common/write_utils.rs`.
 
 ## Protocol TLDR
 
@@ -381,8 +240,9 @@ is the source of truth. Key concepts:
 
 - Writer: `allowColumnDefaults`, `appendOnly`, `changeDataFeed`, `checkConstraints`,
   `checkpointProtection`, `clustering`, `collations`, `collations-preview`, `domainMetadata`,
-  `generatedColumns`, `icebergCompatV1`, `icebergCompatV2`, `icebergCompatV3`, `identityColumns`,
-  `inCommitTimestamp`, `invariants`, `materializePartitionColumns`, `rowTracking`
+  `generatedColumns`, `icebergCompatV1`, `icebergCompatV2`, `icebergCompatV3`,
+  `icebergNativeV4-preview`, `identityColumns`, `inCommitTimestamp`, `invariants`,
+  `materializePartitionColumns`, `rowTracking`
 - Reader + writer: `adaptiveMetadata-preview`, `catalogManaged`, `catalogOwned-preview`,
   `columnMapping`, `deletionVectors`, `fileType`, `fileType-preview`, `geospatial`,
   `timestampNtz`, `typeWidening`, `typeWidening-preview`, `v2Checkpoint`, `vacuumProtocolCheck`,
@@ -392,28 +252,28 @@ Keep this list updated when new protocol features are added to kernel.
 
 ## Common Gotchas
 
-- **EngineData is opaque:** NEVER downcast to `ArrowEngineData` or any concrete type
-  in production code (ok in tests). NEVER assume one batch per file: ALWAYS iterate.
+- **EngineData is opaque:** NEVER access its columns directly: ALWAYS use the visitor pattern
+  (`visit_rows` with typed `GetData` accessors). NEVER downcast to `ArrowEngineData` or any
+  concrete type in production code (ok in tests). NEVER assume one batch per file: ALWAYS iterate.
 - **Column mapping:** Physical column names can differ from logical names. ALWAYS use
   the schema from `Snapshot::schema()` for user data columns. Metadata/system schema
   column names (defined by the protocol) are not subject to column mapping.
 - **Transforms:** Generic recursive schema and expression transform traits and helpers
   are in `kernel/src/transforms/`.
-- **Tracing layer callbacks must not emit tracing events directly:** Calling `warn!()` or
-  any tracing macro inside a `tracing_subscriber::Layer` callback (`on_event`, `on_record`,
-  `on_close`) while holding a span's `extensions_mut()` write lock will re-enter the layer
-  and deadlock on the same lock. In `on_new_span`, no extension lock is held during
-  `attrs.record()`, so direct `warn!()` is safe there. In `on_record`, store warnings in a
-  `pending_warnings: Vec<String>` field on the visitor, take them out after the extensions
-  block closes, and emit via `warn!()` only then. (`on_event`'s visitor does no
-  warning-eligible work, so it may run under the lock directly.) See
-  `kernel/src/metrics/reporter.rs` for the canonical pattern.
+- **Tracing layer callbacks must not emit tracing events, such as `warn!()`, while holding a span's
+  `extensions_mut()` lock:** the event re-enters the layer and deadlocks on the same lock. Collect
+  warnings and emit them after the lock is released. `drain_into_visitor` in
+  `kernel/src/metrics/reporter.rs` shows the pattern, and its doc comment explains which callbacks
+  may warn directly.
 - **Keep tests with process-global state safe under concurrency:** `cargo test` runs tests as
   parallel threads in one test binary, while nextest normally runs each test in a separate
   process. Tests for global tracing subscribers and callbacks must not share capture buffers with
   thread-local dispatch tests or assume no other thread can emit an event.
 - **Generated code:** files starting with ``//! Generated by `cargo xtask ...` `` are never edited by
   hand. Change the generator in `xtask/` or its inputs and rerun the command.
+- **Tests that call `snapshot.checkpoint()` need a multi-threaded runtime:** use
+  `test_table_setup_mt()` under `#[tokio::test(flavor = "multi_thread")]`. Checkpointing issues
+  nested `block_on` calls that deadlock on a single-threaded runtime or `TokioBackgroundExecutor`.
 
 ## Code Style
 
@@ -557,13 +417,22 @@ and data flow. Keep it concise.
 
 ## Deep Context
 
-Read these when relevant to the task at hand:
+Read the file that matches your task.
 
-- `CLAUDE/architecture.md`: kernel architecture: snapshot loading, read/write paths,
-  engine trait system, EngineData, key modules, catalog-managed tables
-- `docs/user-guide/CLAUDE.md`: writing standards for the mdBook user guide
-- Always cross-check protocol behavior against the
-  [Delta protocol spec](https://raw.githubusercontent.com/delta-io/delta/master/PROTOCOL.md)
+| File | Read when |
+|---|---|
+| `CLAUDE/architecture.md` | Before changing snapshot loading, log replay, scans, transactions, committers, engine handlers, `EngineData`, or catalog-managed tables |
+| `CLAUDE/testing.md` | Before writing a test helper, building a test table, or choosing test setup |
+| `kernel/tests/README.md` | Before choosing an existing test table or adding test data |
+| `kernel/Cargo.toml` `[features]` | Before using, adding, or removing a feature flag |
+| `kernel/src/metrics/README.md` | Before changing metric events or reporters |
+| `ffi/AGENTS.md` | Before any change under `ffi/` |
+| `datafusion-executor/CLAUDE.md` | Before any change in the `datafusion-executor` workspace |
+| `.github/CLAUDE.md` | Before any change under `.github/` |
+| `docs/user-guide/CLAUDE.md` | Before any user-guide edit |
+
+Always cross-check protocol behavior against the
+[Delta protocol spec](https://raw.githubusercontent.com/delta-io/delta/master/PROTOCOL.md).
 
 **Keeping docs current:** Update the authoritative documentation for a changed fact, along with
 affected examples and cross-references. Use [Documentation Ownership](#documentation-ownership)
