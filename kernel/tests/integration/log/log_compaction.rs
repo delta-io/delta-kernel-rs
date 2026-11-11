@@ -20,6 +20,7 @@ fn url_to_object_store_path(url: &Url) -> Result<Path, Box<dyn std::error::Error
 }
 
 #[tokio::test]
+#[ignore = "log compaction disabled (#2337)"]
 async fn action_reconciliation_round_trip() -> Result<(), Box<dyn std::error::Error>> {
     let _ = tracing_subscriber::fmt::try_init();
 
@@ -86,6 +87,16 @@ async fn action_reconciliation_round_trip() -> Result<(), Box<dyn std::error::Er
     let mut batch_count = 0;
     let mut compacted_data_batches = Vec::new();
 
+    // Log compaction should produce reconciled actions from the version range:
+    // - Protocol + metadata from table creation
+    // - Add action for file1 (first/newest add for this file path)
+    // - Add action for file2 (first/newest add for this file path)
+    // - Remove action for file1 (first/newest remove for this file path, non-expired tombstone)
+    // - CommitInfo actions should be excluded from compaction
+    //
+    // Note: Actions are processed in reverse chronological order (newest to oldest).
+    // The reconciliation keeps the first (newest) occurrence of each action type
+    // for each unique file path, so both add and remove actions for file1 are kept.
     for batch_result in compaction_data.by_ref() {
         let batch = batch_result?;
         compacted_data_batches.push(batch);
@@ -180,7 +191,8 @@ async fn action_reconciliation_round_trip() -> Result<(), Box<dyn std::error::Er
 
 /// Test log compaction behavior with expired tombstones.
 #[tokio::test]
-async fn expired_tombstone_retention() -> Result<(), Box<dyn std::error::Error>> {
+#[ignore = "log compaction disabled (#2337)"]
+async fn expired_tombstone_exclusion() -> Result<(), Box<dyn std::error::Error>> {
     let _ = tracing_subscriber::fmt::try_init();
 
     let schema = schema_ref! { nullable "id": INTEGER };
@@ -349,8 +361,8 @@ async fn expired_tombstone_retention() -> Result<(), Box<dyn std::error::Error>>
         "Compacted file should NOT contain commitInfo actions (they should be excluded)"
     );
     assert!(
-        has_remove_expired_file,
-        "Compaction must retain expired removals to suppress earlier adds"
+        !has_remove_expired_file,
+        "Compacted file should NOT contain remove action for expired file"
     );
     assert!(
         has_remove_recent_file,
@@ -383,3 +395,5 @@ async fn expired_tombstone_retention() -> Result<(), Box<dyn std::error::Error>>
     );
     Ok(())
 }
+
+// TODO: Add e2e test that log compaction contains domain metadtaas (and not tombstoned ones)

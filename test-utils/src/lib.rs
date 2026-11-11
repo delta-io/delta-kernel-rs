@@ -3,6 +3,7 @@
 pub mod column_mapping_fixtures;
 pub mod counting_reporter;
 pub mod engine_contract;
+pub mod log_compaction;
 pub mod table_builder;
 
 /// Helper macro to extract a typed column from a RecordBatch or StructArray.

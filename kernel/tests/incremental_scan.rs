@@ -32,6 +32,7 @@ use rstest::rstest;
 use test_utils::delta_kernel_default_engine::executor::tokio::TokioBackgroundExecutor;
 use test_utils::delta_kernel_default_engine::json::DefaultJsonHandler;
 use test_utils::delta_kernel_default_engine::{DefaultEngine, DefaultEngineBuilder};
+use test_utils::log_compaction::write_compaction_fixture;
 use test_utils::{
     TestAction, actions_to_string, actions_to_string_catalog_managed,
     actions_to_string_partitioned, add_commit, add_staged_commit, assert_result_error_with_message,
@@ -551,12 +552,7 @@ async fn compaction_file_in_range_is_ignored() -> Result<(), Box<dyn std::error:
     )
     .await?;
 
-    let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
-    let mut writer = snapshot.log_compaction_writer(1, 3)?;
-    let data = writer.compaction_data(engine.as_ref())?;
-    engine
-        .json_handler()
-        .write_json_file(writer.compaction_path(), Box::new(data), false)?;
+    write_compaction_fixture(table_root, storage.as_ref(), 1, 3).await?;
 
     let target = Snapshot::builder_for(table_url)
         .at_version(3)

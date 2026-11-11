@@ -83,6 +83,8 @@ use delta_kernel_default_engine::executor::tokio::{
 };
 use delta_kernel_default_engine::{DefaultEngine, DefaultEngineBuilder};
 
+use crate::log_compaction::write_compaction_fixture;
+
 // ===========================================================================
 // Sweep constants
 // ===========================================================================
@@ -1413,13 +1415,7 @@ impl TestTableBuilder {
         }
 
         for &(start, end) in &self.log_state.compactions {
-            let mut writer = snapshot.clone().log_compaction_writer(start, end)?;
-            let data = writer.compaction_data(engine.as_ref())?;
-            engine.json_handler().write_json_file(
-                writer.compaction_path(),
-                Box::new(data),
-                false,
-            )?;
+            write_compaction_fixture(table_root, store.as_ref(), start, end).await?;
         }
 
         match hint_state {

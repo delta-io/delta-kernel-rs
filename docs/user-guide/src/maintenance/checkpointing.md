@@ -172,18 +172,15 @@ post-commit pattern that includes writing a CRC file before checkpointing.
 
 ## Log compaction
 
-**Log compaction** aggregates multiple commit JSON files into a single compacted file,
-reducing the number of files Kernel must read during log replay. The API follows a similar
-pattern to the `CheckpointWriter` API: create a `LogCompactionWriter` from a `Snapshot`,
-retrieve the compaction path and data, then write the data to storage.
+Log compaction aggregates an inclusive range of commit JSON files into a compacted file,
+reducing the number of files Kernel reads during snapshot reconstruction. Kernel automatically
+selects available compactions that fit the target version and checkpoint boundaries. Empty
+compactions are skipped in favor of the original commits.
 
-Use an inclusive range with `start_version < end_version <= snapshot.version()`.
-Write every selected row from `compaction_data()` atomically to `compaction_path()` through
-your engine's JSON handler. Keep the original commits: time travel and change-data consumers
-still need them. Kernel chooses usable compactions automatically during snapshot reads.
-
-Compaction requires a published snapshot and a table that Kernel supports reading and writing.
-Tables with adaptiveMetadata enabled do not support compaction writes.
+Keep the original commits: commit-level APIs such as Change Data Feed and timestamp lookup
+still need them. Compaction writing remains disabled. `Snapshot::log_compaction_writer()`
+returns an error, and `should_compact()` returns `false`.
+See [issue #2337](https://github.com/delta-io/delta-kernel-rs/issues/2337) for tracking.
 
 ## What's next
 

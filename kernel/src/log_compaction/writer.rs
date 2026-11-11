@@ -1,88 +1,101 @@
+// TODO(#2337): remove dead_code allows when log compaction is re-enabled
+#![allow(dead_code, unused_imports)]
+
 use itertools::Itertools;
 use url::Url;
 
 use super::COMPACTION_ACTIONS_SCHEMA;
-use crate::action_reconciliation::ActionReconciliationIterator;
 use crate::action_reconciliation::log_replay::ActionReconciliationProcessor;
+use crate::action_reconciliation::{ActionReconciliationIterator, RetentionCalculator};
 use crate::log_replay::HasSelectionVector;
 use crate::log_segment::LogSegment;
 use crate::path::ParsedLogPath;
-use crate::table_features::TableFeature;
+use crate::table_properties::TableProperties;
 use crate::{Engine, KernelError, KernelResult, SnapshotRef, Version};
 
 /// Determine if log compaction should be performed based on the commit version and
 /// compaction interval.
 ///
-/// Returns `false` for a zero interval or the initial commit. Otherwise returns whether
-/// `commit_version` completes an interval of `compaction_interval` commits.
-pub fn should_compact(commit_version: Version, compaction_interval: Version) -> bool {
-    compaction_interval > 0
-        && commit_version > 0
-        && commit_version % compaction_interval == compaction_interval - 1
+/// Always returns `false` because log compaction is currently disabled.
+pub fn should_compact(_commit_version: Version, _compaction_interval: Version) -> bool {
+    // TODO(#2337): re-enable log compaction once testing is sufficient
+    //
+    // // Commits start at 0, so we add one to the commit version to check if we've hit the interval
+    // compaction_interval > 0
+    //     && commit_version > 0
+    //     && (commit_version + 1).is_multiple_of(compaction_interval)
+    false
 }
 
 /// Writer for log compaction files
 ///
 /// This writer provides an API for creating log compaction files that aggregate actions
 /// from multiple commit files.
+///
+/// Log compaction is currently disabled (#2337)
 #[derive(Debug)]
 pub struct LogCompactionWriter {
     /// Reference to the snapshot of the table being compacted
     snapshot: SnapshotRef,
+    // TODO(#2337): remove allow(dead_code) when log compaction is re-enabled
+    #[allow(dead_code)]
     start_version: Version,
+    #[allow(dead_code)]
     end_version: Version,
     /// Cached compaction file path
     compaction_path: Url,
 }
 
+impl RetentionCalculator for LogCompactionWriter {
+    fn table_properties(&self) -> &TableProperties {
+        self.snapshot.table_properties()
+    }
+}
+
 impl LogCompactionWriter {
+    // TODO(#2337): re-enable log compaction once testing is sufficient
     pub(crate) fn try_new(
-        snapshot: SnapshotRef,
-        start_version: Version,
-        end_version: Version,
+        _snapshot: SnapshotRef,
+        _start_version: Version,
+        _end_version: Version,
     ) -> KernelResult<Self> {
-        if start_version >= end_version {
-            return Err(KernelError::generic(format!(
-                "Invalid version range: end_version {end_version} must be greater than \
-                 start_version {start_version}"
-            )));
-        }
-        snapshot
-            .table_configuration()
-            .ensure_read_write_supported()?;
-        if snapshot
-            .table_configuration()
-            .is_feature_enabled(&TableFeature::AdaptiveMetadataPreview)
-        {
-            return Err(KernelError::unsupported(
-                "Log compaction is not supported for tables with adaptiveMetadata enabled",
-            ));
-        }
-        snapshot.log_segment().validate_published()?;
-        let compaction_path =
-            ParsedLogPath::new_log_compaction(snapshot.table_root(), start_version, end_version)?;
-        Ok(Self {
-            snapshot,
-            start_version,
-            end_version,
-            compaction_path: compaction_path.location,
-        })
+        Err(KernelError::unsupported(
+            "Log compaction is not currently supported",
+        ))
+        // if start_version >= end_version {
+        //     return Err(KernelError::generic(format!(
+        //         "Invalid version range: end_version {end_version} must be greater than \
+        //          start_version {start_version}"
+        //     )));
+        // }
+        //
+        // // We disallow log compaction if the Snapshot is not published. If we didn't, this
+        // // could create gaps in the version history, thereby breaking old readers.
+        // snapshot.log_segment().validate_published()?;
+        //
+        // // Compute the compaction path once during construction
+        // let compaction_path = ParsedLogPath::new_log_compaction(
+        //     snapshot.table_root(),
+        //     start_version,
+        //     end_version,
+        // )?;
+        //
+        // Ok(Self {
+        //     snapshot,
+        //     start_version,
+        //     end_version,
+        //     compaction_path: compaction_path.location,
+        // })
     }
 
-    /// Return the output URL for the inclusive version range supplied at construction.
+    /// Get the path where the compaction file will be written
     pub fn compaction_path(&self) -> &Url {
         &self.compaction_path
     }
 
     /// Get an iterator over the compaction data to be written
     ///
-    /// Uses `engine` to read and reconcile the inclusive version range. Removals and transaction
-    /// markers are retained so they can suppress state from before the range. The caller must
-    /// consume every batch and write the selected rows atomically to [`Self::compaction_path`].
-    ///
-    /// # Errors
-    /// Returns an error if the range exceeds the snapshot or required commits are unavailable.
-    /// Read and reconciliation failures may also be returned by the iterator.
+    /// Performs action reconciliation for the version range specified in the constructor
     pub fn compaction_data(
         &mut self,
         engine: &dyn Engine,
@@ -109,8 +122,13 @@ impl LogCompactionWriter {
         let actions_iter =
             compaction_log_segment.read_actions(engine, COMPACTION_ACTIONS_SCHEMA.clone())?;
 
-        // A partial range must preserve removals and transaction winners that mask older state.
-        let mut processor = ActionReconciliationProcessor::for_compaction(
+        let min_file_retention_timestamp_millis = self.deleted_file_retention_timestamp()?;
+
+        // Create action reconciliation processor for compaction
+        // This reuses the same reconciliation logic as checkpoints
+        let mut processor = ActionReconciliationProcessor::new(
+            min_file_retention_timestamp_millis,
+            self.get_transaction_expiration_timestamp()?,
             self.snapshot.table_configuration().dv_normalization_root(),
         );
 

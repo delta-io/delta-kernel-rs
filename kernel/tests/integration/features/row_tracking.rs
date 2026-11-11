@@ -9,18 +9,18 @@ use delta_kernel::arrow::datatypes::{
 use delta_kernel::arrow::record_batch::RecordBatch;
 use delta_kernel::engine::arrow_conversion::TryIntoArrow;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
-use delta_kernel::engine::to_json_bytes;
 use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::{DynObjectStore, ObjectStoreExt};
 use delta_kernel::schema::{MetadataColumnSpec, SchemaRef, StructField, schema_ref};
 use delta_kernel::transaction::CommitResult;
-use delta_kernel::{Engine, KernelError, KernelResult, Snapshot};
+use delta_kernel::{KernelError, KernelResult, Snapshot};
 use itertools::Itertools;
 use rstest::rstest;
 use serde_json::{Deserializer, Value};
 use tempfile::{TempDir, tempdir};
 use test_utils::delta_kernel_default_engine::DefaultEngine;
 use test_utils::delta_kernel_default_engine::executor::tokio::TokioBackgroundExecutor;
+use test_utils::log_compaction::write_compaction_fixture;
 use test_utils::table_builder::{FeatureSet, LogState, TestTableBuilder};
 use test_utils::{
     add_commit, assert_result_error_with_message, begin_transaction_with, collect_row_ids,
@@ -1364,12 +1364,7 @@ async fn test_read_row_tracking_metadata_stable_across_deletion_vector_update(
     txn.commit(engine.as_ref())?.unwrap_committed();
 
     if compact {
-        let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
-        let mut writer = snapshot.log_compaction_writer(1, 2)?;
-        let data = writer.compaction_data(engine.as_ref())?;
-        engine
-            .json_handler()
-            .write_json_file(writer.compaction_path(), Box::new(data), false)?;
+        write_compaction_fixture(table_url.as_str(), store.as_ref(), 1, 2).await?;
     }
 
     let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
@@ -1682,22 +1677,7 @@ async fn test_read_row_ids_after_log_compaction() -> delta_kernel::Result<()> {
             .is_committed()
     );
 
-    // Create a log compaction file spanning all commits so far (versions 0..=2).
-    let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
-    let mut writer = snapshot.log_compaction_writer(0, 2)?;
-    let compaction_path = writer.compaction_path().clone();
-    let batches = writer
-        .compaction_data(engine.as_ref())?
-        .collect::<KernelResult<Vec<_>>>()?;
-
-    let json_bytes = to_json_bytes(batches.into_iter().map(Ok))?;
-    store
-        .put(
-            &Path::from_url_path(compaction_path.path()).map_err(KernelError::from)?,
-            json_bytes.into(),
-        )
-        .await
-        .map_err(|e| KernelError::generic(e.to_string()))?;
+    write_compaction_fixture(table_url.as_str(), store.as_ref(), 0, 2).await?;
 
     // Load a fresh snapshot -- it should read Protocol and Metadata and file list from the
     // compaction file.

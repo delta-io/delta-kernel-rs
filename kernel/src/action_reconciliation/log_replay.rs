@@ -13,8 +13,8 @@
 //! 2. **Txn Actions**: Keeps exactly one `txn` action for each unique app ID, always selecting the
 //!    latest one encountered.
 //! 3. **File Actions**: Resolves file actions to produce the latest state of the table, keeping the
-//!    most recent action for each file. Checkpoints omit expired tombstones; compactions retain
-//!    tombstones so older actions outside the compacted range remain suppressed.
+//!    most recent valid add actions and unexpired remove actions (tombstones) that are newer than
+//!    `minimum_file_retention_timestamp`.
 //!
 //! ## Architecture
 //!
@@ -58,7 +58,6 @@ pub(crate) struct ActionReconciliationProcessor {
     seen_domains: HashSet<String>,
     /// Minimum timestamp for file retention, used for filtering expired tombstones.
     minimum_file_retention_timestamp: i64,
-    retain_tombstones: bool,
     /// Transaction expiration timestamp for filtering old transactions
     txn_expiration_timestamp: Option<i64>,
     /// Table root for normalizing paths. `Some` iff adaptiveMetadata is enabled.
@@ -231,7 +230,6 @@ impl ActionReconciliationProcessor {
             self.txn_expiration_timestamp,
             self.dv_normalization_root.clone(),
         );
-        visitor.retain_tombstones = self.retain_tombstones;
         visitor.visit_rows_of(actions.as_ref())?;
 
         // Update protocol and metadata seen flags
@@ -248,14 +246,6 @@ impl ActionReconciliationProcessor {
         })
     }
 
-    /// Reconcile a commit range without expiring records that suppress earlier state.
-    pub(crate) fn for_compaction(dv_normalization_root: Option<Url>) -> Self {
-        Self {
-            retain_tombstones: true,
-            ..Self::new(0, None, dv_normalization_root)
-        }
-    }
-
     pub(crate) fn new(
         minimum_file_retention_timestamp: i64,
         txn_expiration_timestamp: Option<i64>,
@@ -268,7 +258,6 @@ impl ActionReconciliationProcessor {
             seen_txns: Default::default(),
             seen_domains: Default::default(),
             minimum_file_retention_timestamp,
-            retain_tombstones: false,
             txn_expiration_timestamp,
             dv_normalization_root,
         }
@@ -281,19 +270,23 @@ impl ActionReconciliationProcessor {
 /// replay) and applies deduplication logic for both file and non-file actions to
 /// produce the actions.
 ///
-/// # File Action Filtering Rules
-/// Keeps the newest action for each unique (path, dvId) pair. Checkpoints omit remove actions
-/// whose deletion timestamp is at or before the retention cutoff, treating a missing timestamp
-/// as zero. Compactions retain all tombstones to suppress older adds outside the compacted range.
+/// # File Action Filtering Rules:
+///   Kept Actions:
+/// - The first (newest) add action for each unique (path, dvId) pair
+/// - The first (newest) remove action for each unique (path, dvId) pair, but only if its
+///   deletionTimestamp > minimumFileRetentionTimestamp Omitted Actions:
+/// - Any file action (add/remove) with the same (path, dvId) as a previously processed action
+/// - All remove actions with deletionTimestamp ≤ minimumFileRetentionTimestamp
+/// - All remove actions with missing deletionTimestamp (defaults to 0)
+///
+/// The resulting filtered file actions represents files present in the table (add actions) and
+/// unexpired tombstones required for vacuum operations (remove actions).
 ///
 /// # Non-File Action Filtering:
 /// - Keeps only the first protocol action (newest version)
 /// - Keeps only the first metadata action (most recent table metadata)
 /// - Keeps only the first txn action for each unique app ID
 /// - Keeps only the first domainMetadata action for each unique domain name
-///
-/// Checkpoints omit expired transactions and removed domains. Compactions retain them to suppress
-/// older state outside the compacted range.
 ///
 /// # Excluded Actions
 /// - CommitInfo, CDC, and CheckpointMetadata actions should not appear in the action batches
@@ -312,7 +305,8 @@ impl ActionReconciliationProcessor {
 ///
 /// The resulting filtered set of actions are the reconciled actions.
 pub(crate) struct ActionReconciliationVisitor<'seen> {
-    // Deduplicates file actions by keeping the newest action for each key.
+    // Deduplicates file actions (applies logic to filter Adds with corresponding Removes,
+    // and keep unexpired Removes). This deduplicator builds a set of seen file actions.
     // This set has O(M) memory usage where M = number of file actions with unique (path, dvId)
     // pairs
     deduplicator: FileActionDeduplicator<'seen>,
@@ -328,7 +322,6 @@ pub(crate) struct ActionReconciliationVisitor<'seen> {
     remove_actions_count: i64,
     // i64 for comparison with remove.deletionTimestamp
     minimum_file_retention_timestamp: i64,
-    retain_tombstones: bool,
     // Flag to track if we've seen a protocol action so we can keep only the first protocol action
     seen_protocol: bool,
     // Flag to track if we've seen a metadata action so we can keep only the first metadata action
@@ -419,7 +412,6 @@ impl ActionReconciliationVisitor<'_> {
             add_actions_count: 0,
             remove_actions_count: 0,
             minimum_file_retention_timestamp,
-            retain_tombstones: false,
             seen_protocol,
             seen_metadata,
             seen_txns,
@@ -484,9 +476,7 @@ impl ActionReconciliationVisitor<'_> {
         } else if is_add {
             self.add_actions_count += 1;
             true
-        } else if !self.retain_tombstones
-            && self.is_expired_tombstone(i, getters[Self::REMOVE_DELETION_TIMESTAMP.index])?
-        {
+        } else if self.is_expired_tombstone(i, getters[Self::REMOVE_DELETION_TIMESTAMP.index])? {
             false
         } else {
             self.remove_actions_count += 1;
@@ -604,11 +594,11 @@ impl ActionReconciliationVisitor<'_> {
             return Ok(Some(false)); // duplicate - older version of a domain we've already seen
         }
 
-        // Partial compactions must suppress domain state from before their range.
+        // Exclude tombstones (removed=true) from the checkpoint per protocol spec.
         let removed: bool = getters[Self::DOMAIN_METADATA_REMOVED.index]
             .get_opt(i, Self::DOMAIN_METADATA_REMOVED.name)?
             .unwrap_or(false);
-        if removed && !self.retain_tombstones {
+        if removed {
             return Ok(Some(false));
         }
 

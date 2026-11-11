@@ -24,6 +24,7 @@ use rstest::rstest;
 use serde_json::json;
 use test_utils::delta_kernel_default_engine::DefaultEngineBuilder;
 use test_utils::delta_kernel_default_engine::executor::tokio::TokioMultiThreadExecutor;
+use test_utils::log_compaction::write_compaction_fixture;
 use test_utils::table_builder::{FeatureSet, LogState, TestTableBuilder, all_features_cm_name};
 use test_utils::{
     add_commit, assert_result_error_with_message, begin_transaction, into_record_batch,
@@ -110,7 +111,7 @@ async fn partial_compaction_preserves_suppression(
     );
     assert!(read_scan(&baseline.clone().scan_builder().build()?, engine.clone())?.is_empty());
 
-    let path = write_compaction(&baseline, engine.as_ref(), 3, 4)?;
+    let path = write_compaction_fixture(table.table_root(), table.store().as_ref(), 3, 4).await?;
     engine.json.reads.lock().unwrap().clear();
     let compacted = Snapshot::builder_for(table.table_root()).build(engine.as_ref())?;
     match action {
@@ -171,7 +172,7 @@ async fn compaction_reads_match_commits(
             .build(engine.as_ref())?;
         baselines.push((snapshot.clone(), scan_results(snapshot, engine.clone())?));
     }
-    let (latest, expected) = baselines.last().unwrap();
+    let (_, expected) = baselines.last().unwrap();
     let all_files = expected[0].files.len();
     assert!(!expected[1].files.is_empty());
     assert!(expected[1].files.len() < all_files);
@@ -179,10 +180,12 @@ async fn compaction_reads_match_commits(
         assert!(!expected[2].files.is_empty());
         assert!(expected[2].files.len() < all_files);
     }
-    let latest = latest.clone();
     let mut paths = vec![];
     for &(start, end) in &ranges {
-        paths.push(write_compaction(&latest, engine.as_ref(), start, end)?);
+        paths.push(
+            write_compaction_fixture(table.table_root(), table.store().as_ref(), start, end)
+                .await?,
+        );
     }
     for (baseline, expected) in &baselines {
         engine.json.reads.lock().unwrap().clear();
@@ -247,7 +250,7 @@ async fn unusable_compaction_does_not_return_partial_state(
         .build()?;
     let engine = recording_engine(table.store().clone(), 1);
     let baseline = Snapshot::builder_for(table.table_root()).build(engine.as_ref())?;
-    let path = write_compaction(&baseline, engine.as_ref(), 0, 2)?;
+    let path = write_compaction_fixture(table.table_root(), table.store().as_ref(), 0, 2).await?;
     table
         .store()
         .put(
@@ -266,36 +269,25 @@ async fn unusable_compaction_does_not_return_partial_state(
 
 #[rstest]
 #[tokio::test(flavor = "multi_thread")]
-async fn compaction_requires_readable_source_commits(
-    #[values(false, true)] malformed: bool,
+async fn snapshot_requires_original_commit_versions(
     #[values(false, true)] existing_compaction: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let table = TestTableBuilder::new()
         .with_log_state(LogState::with_latest_version(3))
         .build()?;
     let engine = recording_engine(table.store().clone(), 1);
-    let snapshot = Snapshot::builder_for(table.table_root()).build(engine.as_ref())?;
     if existing_compaction {
-        write_compaction(&snapshot, engine.as_ref(), 1, 3)?;
+        write_compaction_fixture(table.table_root(), table.store().as_ref(), 1, 3).await?;
     }
-    let path = Path::from("_delta_log/00000000000000000002.json");
-    if malformed {
-        table.store().put(&path, "{".into()).await?;
-    } else {
-        table.store().delete(&path).await?;
-    }
-    let mut writer = snapshot.log_compaction_writer(1, 3)?;
-    let result = writer
-        .compaction_data(engine.as_ref())
-        .and_then(|data| data.collect::<KernelResult<Vec<_>>>());
-    assert!(result.is_err());
-    if !malformed {
-        assert!(
-            Snapshot::builder_for(table.table_root())
-                .build(engine.as_ref())
-                .is_err()
-        );
-    }
+    table
+        .store()
+        .delete(&Path::from("_delta_log/00000000000000000002.json"))
+        .await?;
+    assert!(
+        Snapshot::builder_for(table.table_root())
+            .build(engine.as_ref())
+            .is_err()
+    );
     Ok(())
 }
 
@@ -316,9 +308,11 @@ async fn checkpoint_hint_behavior_with_compaction(
     let engine = recording_engine(table.store().clone(), 1);
     let baseline = Snapshot::builder_for(table.table_root()).build(engine.as_ref())?;
     let expected = scan_results(baseline.clone(), engine.clone())?;
-    let compaction = compact
-        .then(|| write_compaction(&baseline, engine.as_ref(), 4, 5))
-        .transpose()?;
+    let compaction = if compact {
+        Some(write_compaction_fixture(table.table_root(), table.store().as_ref(), 4, 5).await?)
+    } else {
+        None
+    };
     let hint = Path::from("_delta_log/_last_checkpoint");
     if let Some(version) = hint_version {
         table
@@ -358,7 +352,7 @@ async fn compaction_cannot_advance_latest_version() -> Result<(), Box<dyn std::e
     let engine = recording_engine(table.store().clone(), 1);
     let baseline = Snapshot::builder_for(table.table_root()).build(engine.as_ref())?;
     let expected = scan_results(baseline.clone(), engine.clone())?;
-    let path = write_compaction(&baseline, engine.as_ref(), 1, 3)?;
+    let path = write_compaction_fixture(table.table_root(), table.store().as_ref(), 1, 3).await?;
     let source = Path::from_url_path(path.path())?;
     let future = Path::from("_delta_log/00000000000000000001.00000000000000000004.compacted.json");
     let contents = table.store().get(&source).await?.bytes().await?;
@@ -415,7 +409,7 @@ async fn compaction_without_adds_preserves_state(
     if action == "removal" {
         assert!(expected_rows[0].files.is_empty());
     }
-    let path = write_compaction(&snapshot, engine.as_ref(), 2, 4)?;
+    let path = write_compaction_fixture(table.table_root(), table.store().as_ref(), 2, 4).await?;
     engine.json.reads.lock().unwrap().clear();
     let fresh = Snapshot::builder_for(table.table_root()).build(engine.as_ref())?;
     assert_eq!(fresh.version(), 4);
@@ -457,7 +451,8 @@ async fn compaction_preserves_nested_variant_data() -> Result<(), Box<dyn std::e
     let table_root = Url::from_directory_path(directory.path().join("unshredded-variant"))
         .unwrap()
         .to_string();
-    let engine = recording_engine(Arc::new(LocalFileSystem::new()), 1);
+    let store: Arc<DynObjectStore> = Arc::new(LocalFileSystem::new());
+    let engine = recording_engine(store.clone(), 1);
     // Version 1 precedes the fixture's checkpoint, so the scan must replay the compaction.
     let baseline = Snapshot::builder_for(&table_root)
         .at_version(1)
@@ -471,7 +466,7 @@ async fn compaction_preserves_nested_variant_data() -> Result<(), Box<dyn std::e
     assert!(!expected[0].files.is_empty());
     assert!(!expected[1].files.is_empty());
     assert!(expected[1].files.len() < expected[0].files.len());
-    let path = write_compaction(&baseline, engine.as_ref(), 0, 1)?;
+    let path = write_compaction_fixture(&table_root, store.as_ref(), 0, 1).await?;
     engine.json.reads.lock().unwrap().clear();
     let fresh = Snapshot::builder_for(&table_root)
         .at_version(1)
@@ -482,6 +477,57 @@ async fn compaction_preserves_nested_variant_data() -> Result<(), Box<dyn std::e
         expected
     );
     assert!(engine.json.reads.lock().unwrap().contains(&path));
+    Ok(())
+}
+
+#[rstest]
+#[tokio::test(flavor = "multi_thread")]
+async fn existing_compaction_fixture_matches_original_commits(
+    #[values(5, 15)] version: u64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let directory = load_test_data("./tests/data", "compacted-log-files-table")?;
+    let table_root = Url::from_directory_path(directory.path().join("compacted-log-files-table"))
+        .unwrap()
+        .to_string();
+    let store: Arc<DynObjectStore> = Arc::new(LocalFileSystem::new());
+    let engine = recording_engine(store.clone(), 1);
+    let compacted = Snapshot::builder_for(&table_root)
+        .at_version(version)
+        .build(engine.as_ref())?;
+    let actual = scan_results_with_predicates(compacted.clone(), engine.clone(), vec![None])?;
+    assert!(!actual[0].files.is_empty());
+    let paths = engine.json.reads.lock().unwrap().clone();
+    assert!(paths.iter().any(|p| p.path().ends_with(".compacted.json")));
+
+    let log_root = Url::parse(&table_root)?.join("_delta_log/")?;
+    let prefix = Path::from_url_path(log_root.path())?;
+    for file in store.list(Some(&prefix)).try_collect::<Vec<_>>().await? {
+        if file.location.as_ref().ends_with(".compacted.json") {
+            store.delete(&file.location).await?;
+        }
+    }
+    engine.json.reads.lock().unwrap().clear();
+    let original = Snapshot::builder_for(&table_root)
+        .at_version(version)
+        .build(engine.as_ref())?;
+    assert_eq!(original.schema(), compacted.schema());
+    assert_eq!(
+        original.table_configuration().protocol(),
+        compacted.table_configuration().protocol()
+    );
+    assert_eq!(
+        scan_results_with_predicates(original, engine.clone(), vec![None])?,
+        actual
+    );
+    assert!(
+        !engine
+            .json
+            .reads
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|p| p.path().ends_with(".compacted.json"))
+    );
     Ok(())
 }
 
@@ -496,7 +542,7 @@ async fn commit_consumers_preserve_history_with_compaction()
     let engine = recording_engine(table.store().clone(), 1);
     let baseline = Snapshot::builder_for(table.table_root()).build(engine.as_ref())?;
     let timestamp = baseline.reader().get_timestamp(engine.as_ref())?;
-    let path = write_compaction(&baseline, engine.as_ref(), 1, 3)?;
+    let path = write_compaction_fixture(table.table_root(), table.store().as_ref(), 1, 3).await?;
     engine.json.reads.lock().unwrap().clear();
     let range = CommitRange::builder_for(table.table_root(), 1)
         .with_end_version(3)
@@ -566,7 +612,7 @@ async fn compaction_preserves_schema_changes(
             .unwrap_post_commit_snapshot();
     }
     let expected = scan_results(latest.clone(), engine.clone())?;
-    let path = write_compaction(&latest, engine.as_ref(), 2, 3)?;
+    let path = write_compaction_fixture(table.table_root(), table.store().as_ref(), 2, 3).await?;
     engine.json.reads.lock().unwrap().clear();
     let fresh = Snapshot::builder_for(table.table_root()).build(engine.as_ref())?;
     let incremental = Snapshot::builder_from(old).build(engine.as_ref())?;
@@ -620,7 +666,7 @@ async fn compaction_preserves_protocol_upgrades(
         .build(engine.as_ref())?;
     let expected = latest.table_configuration().protocol();
     assert_ne!(expected, old.table_configuration().protocol());
-    let path = write_compaction(&latest, engine.as_ref(), 2, 3)?;
+    let path = write_compaction_fixture(table.table_root(), table.store().as_ref(), 2, 3).await?;
     engine.json.reads.lock().unwrap().clear();
     let fresh = Snapshot::builder_for(table.table_root())
         .with_incremental_crc_replay(IncrementalReplay::Unlimited)
@@ -692,6 +738,47 @@ async fn parallel_metadata_uses_compaction(
     Ok(())
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn compaction_preserves_unsupported_reader_feature_error()
+-> Result<(), Box<dyn std::error::Error>> {
+    let table = TestTableBuilder::new()
+        .with_log_state(LogState::with_latest_version(1))
+        .with_schema(schema_ref! { nullable "id": INTEGER })
+        .build()?;
+    let engine = recording_engine(table.store().clone(), 1);
+    add_commit(
+        table.table_root(),
+        table.store().as_ref(),
+        2,
+        json!({"protocol": {"minReaderVersion": 3, "minWriterVersion": 7,
+            "readerFeatures": ["unknownReaderFeature"],
+            "writerFeatures": ["unknownReaderFeature"]}})
+        .to_string(),
+    )
+    .await?;
+    add_commit(
+        table.table_root(),
+        table.store().as_ref(),
+        3,
+        json!({"commitInfo": {"timestamp": 1}}).to_string(),
+    )
+    .await?;
+    let expected = Snapshot::builder_for(table.table_root())
+        .build(engine.as_ref())
+        .unwrap_err()
+        .to_string();
+    assert!(expected.contains("unknownReaderFeature"), "{expected}");
+    let path = write_compaction_fixture(table.table_root(), table.store().as_ref(), 2, 3).await?;
+    engine.json.reads.lock().unwrap().clear();
+    let actual = Snapshot::builder_for(table.table_root())
+        .build(engine.as_ref())
+        .unwrap_err()
+        .to_string();
+    assert_eq!(actual, expected);
+    assert!(engine.json.reads.lock().unwrap().contains(&path));
+    Ok(())
+}
+
 #[derive(Debug, PartialEq, Eq)]
 struct ScanResult {
     files: Vec<String>,
@@ -755,21 +842,6 @@ fn scan_results_with_predicates(
         results.push(ScanResult { files, rows });
     }
     Ok(results)
-}
-
-fn write_compaction(
-    snapshot: &Arc<Snapshot>,
-    engine: &dyn Engine,
-    start: u64,
-    end: u64,
-) -> Result<Url, Box<dyn std::error::Error>> {
-    let mut writer = snapshot.clone().log_compaction_writer(start, end)?;
-    let data = writer.compaction_data(engine)?;
-    let path = writer.compaction_path().clone();
-    engine
-        .json_handler()
-        .write_json_file(&path, Box::new(data), false)?;
-    Ok(path)
 }
 
 fn recording_engine(store: Arc<DynObjectStore>, batch_size: usize) -> Arc<RecordingEngine> {

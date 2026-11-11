@@ -689,14 +689,7 @@ async fn test_no_checkpoint_on_unpublished_snapshot() -> Result<()> {
         .build(&engine)?;
 
     assert!(matches!(
-        snapshot
-            .clone()
-            .create_checkpoint_writer(&engine)
-            .unwrap_err(),
-        crate::KernelError::UnpublishedVersion(1)
-    ));
-    assert!(matches!(
-        snapshot.log_compaction_writer(0, 1).unwrap_err(),
+        snapshot.create_checkpoint_writer(&engine).unwrap_err(),
         crate::KernelError::UnpublishedVersion(1)
     ));
     Ok(())
@@ -731,11 +724,7 @@ async fn test_no_standalone_checkpoint_on_adaptive_metadata_table(
     let message =
         "Standalone checkpoints are not yet supported for tables with adaptiveMetadata enabled";
     assert_result_error_with_message(snapshot.checkpoint(&engine, spec.as_ref()), message);
-    assert_result_error_with_message(snapshot.clone().create_checkpoint_writer(&engine), message);
-    assert_result_error_with_message(
-        snapshot.log_compaction_writer(0, 1),
-        "Log compaction is not supported for tables with adaptiveMetadata enabled",
-    );
+    assert_result_error_with_message(snapshot.create_checkpoint_writer(&engine), message);
     Ok(())
 }
 
