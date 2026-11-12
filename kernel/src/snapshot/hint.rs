@@ -176,7 +176,8 @@ impl SnapshotHint {
         self.provenance
     }
 
-    /// Returns the retained checksum, including a stale baseline when provenance is attached.
+    /// Returns the checksum kept by the hint, which may be older than the hint's version
+    /// ([`hint.version()`](Self::version)).
     #[internal_api]
     #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
     pub(crate) fn base_crc(&self) -> Option<&Crc> {
