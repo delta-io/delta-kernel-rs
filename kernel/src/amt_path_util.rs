@@ -3,13 +3,22 @@
 //!
 //! [relative paths specification]: https://iceberg.apache.org/spec/#paths-in-metadata
 
+use std::sync::{Arc, LazyLock};
+
 use url::Url;
 
-use crate::expressions::{Expression, UnaryExpressionOp};
+use crate::content_tree::LOCATION;
+use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
+use crate::expressions::{ColumnName, Expression, Predicate, UnaryExpressionOp, null_lit};
 use crate::path_encoding::uri_encode_path;
-use crate::uri_reference::{scheme_len, uri_decode_location, uri_encode_location};
+use crate::schema::{ColumnNamesAndTypes, DataType, SchemaRef, StructField, StructType};
+use crate::uri_reference::{
+    has_uri_safe_prefix, scheme_len, uri_decode_location, uri_encode_location,
+};
 use crate::utils::{require, to_file_size};
-use crate::{FileMeta, KernelError, KernelResult};
+use crate::{
+    EngineData, EvaluationHandler, ExpressionEvaluator, FileMeta, KernelError, KernelResult,
+};
 
 /// Resolve an AMT `path` (as stored in the log or a manifest) into an absolute [`Url`].
 ///
@@ -36,6 +45,11 @@ pub(crate) fn resolve_amt_location(path: &str, table_root: &Url) -> KernelResult
 /// stays relative. For a location [`resolve_amt_location`] accepts, joining the result onto the
 /// table root gives the same [`Url`], except for a `file:` or `http(s):` location without `//`,
 /// which `Url::join` resolves against the root.
+// TODO: settle with the Iceberg V4 RFC how a tree location is spelled as an `add.path`. Log replay
+// matches add and remove paths as raw strings, and other writers may spell the same file
+// differently: non-ASCII left raw (TODO(#2423)), or `//` collapsed. The engine computes this value,
+// so its output must match kernel's byte for byte. A `file:`/`http(s):` location without `//`, or a
+// relative one with `:` in its first segment, has no portable `add.path` form.
 pub(crate) fn encode_amt_location_expression(location: Expression) -> Expression {
     Expression::unary(UnaryExpressionOp::UriEncodeFileLocation, location)
 }
@@ -47,6 +61,8 @@ pub(crate) fn parse_absolute_amt_location(path: &str) -> KernelResult<Option<Url
         return Ok(None);
     }
     reject_dot_segments(path)?;
+    // TODO: require `has_uri_safe_prefix` here too, so leaf manifest and checkpoint content-root
+    // locations reject a prefix `Url` would misread, as data file and deletion vector locations do.
     let url = Url::parse(&uri_encode_location(path)).map_err(|e| {
         KernelError::generic(format!(
             "Failed to parse absolute AMT location {path:?}: {e}"
@@ -157,13 +173,170 @@ fn encode_and_join(path: &str, table_root: &Url) -> KernelResult<Url> {
     })
 }
 
-/// Rejects an AMT location that is neither absolute nor table-relative (see
-/// [`validate_table_relative`]) or that has a `.` or `..` segment (see [`reject_dot_segments`]).
-pub(crate) fn validate_amt_location(location: &str) -> KernelResult<()> {
-    if scheme_len(location).is_none() {
-        validate_table_relative(location)?;
+/// Which location a [`LocationCheck`] checks, naming it in errors and fixing the order its rules
+/// are checked in.
+#[derive(Clone, Copy)]
+pub(crate) enum LocationKind {
+    /// An entry's data file location, checked for dot segments first.
+    DataFile,
+    /// A deletion vector location, checked as table-relative first.
+    DeletionVector,
+}
+
+impl LocationKind {
+    /// Rejects `location` unless it is absolute or table-relative (see
+    /// [`validate_table_relative`]) and has no `.` or `..` segment (see [`reject_dot_segments`]),
+    /// naming this kind of location in the error.
+    pub(crate) fn validate(self, location: &str) -> KernelResult<()> {
+        let table_relative = || match scheme_len(location) {
+            Some(_) => Ok(()),
+            None => validate_table_relative(location),
+        };
+        let (what, result) = match self {
+            Self::DataFile => (
+                "data file location",
+                reject_dot_segments(location).and_then(|()| table_relative()),
+            ),
+            Self::DeletionVector => (
+                "deletion vector location",
+                table_relative().and_then(|()| reject_dot_segments(location)),
+            ),
+        };
+        result.map_err(|e| match e {
+            KernelError::Generic(message) => {
+                KernelError::generic(format!("Invalid AMT {what}: {message}"))
+            }
+            e => e,
+        })
     }
-    reject_dot_segments(location)
+}
+
+/// Builds the error for an absolute location whose `scheme:[//authority]` prefix is not valid URI
+/// syntax.
+type UnsafePrefixError = fn(&str) -> KernelError;
+
+/// A location column a [`LocationCheck`] checks.
+pub(crate) struct CheckedLocation {
+    pub(crate) column: ColumnName,
+    /// The rows where the column holds a location.
+    pub(crate) present: Predicate,
+    pub(crate) kind: LocationKind,
+    /// The error for an absolute location whose `scheme:[//authority]` prefix is not valid URI
+    /// syntax.
+    pub(crate) unsafe_prefix_error: UnsafePrefixError,
+}
+
+/// The most location columns one [`LocationCheck`] checks.
+const MAX_CHECKED_LOCATIONS: usize = 2;
+
+/// Checks the locations in some columns of entry batches: each must pass its
+/// [`LocationKind::validate`], and an absolute one must parse and have a `scheme:[//authority]`
+/// prefix, which [`encode_amt_location_expression`] keeps as written, that is already valid URI
+/// syntax. `Url` would otherwise re-encode or strip characters there, or end the authority early
+/// at a `?` or `#`. An expression selects the present locations and Rust checks them.
+pub(crate) struct LocationCheck {
+    /// Yields, per checked column, whether each row holds a location and, if so, the location.
+    locations: Arc<dyn ExpressionEvaluator>,
+    /// Per checked column, its kind and [`CheckedLocation::unsafe_prefix_error`].
+    kinds: Vec<(LocationKind, UnsafePrefixError)>,
+}
+
+impl LocationCheck {
+    /// Builds the check of `locations` for entry batches with `input_schema`. Within a row, the
+    /// locations are checked in the given order.
+    pub(crate) fn try_new(
+        handler: &dyn EvaluationHandler,
+        input_schema: SchemaRef,
+        locations: Vec<CheckedLocation>,
+    ) -> KernelResult<Self> {
+        require!(
+            locations.len() <= MAX_CHECKED_LOCATIONS,
+            KernelError::internal_error(format!(
+                "Cannot check {} locations, more than the {MAX_CHECKED_LOCATIONS} supported",
+                locations.len()
+            ))
+        );
+        let checked = locations.iter().flat_map(|checked| {
+            let location = Expression::case_when(
+                [(
+                    checked.present.clone(),
+                    Expression::column(checked.column.clone()),
+                )],
+                null_lit(DataType::STRING),
+            );
+            [Expression::from(checked.present.clone()), location]
+        });
+        let padding = (locations.len()..MAX_CHECKED_LOCATIONS).flat_map(|_| {
+            [
+                Expression::from(Predicate::FALSE),
+                null_lit(DataType::STRING),
+            ]
+        });
+        let projection = handler.new_expression_evaluator(
+            input_schema,
+            Arc::new(Expression::struct_from(checked.chain(padding))),
+            CHECKED_LOCATIONS_SCHEMA.clone().into(),
+        )?;
+        let kinds = locations
+            .iter()
+            .map(|checked| (checked.kind, checked.unsafe_prefix_error))
+            .collect();
+        Ok(Self {
+            locations: projection,
+            kinds,
+        })
+    }
+
+    /// Errors for the first row of `entries` with a checked location that fails.
+    pub(crate) fn check(&self, entries: &dyn EngineData) -> KernelResult<()> {
+        let locations = self.locations.evaluate(entries)?;
+        LocationVisitor { kinds: &self.kinds }.visit_rows_of(locations.as_ref())
+    }
+}
+
+/// Schema of the [`LocationCheck`] projection: per checked column, whether the row holds a
+/// location, then the location.
+static CHECKED_LOCATIONS_SCHEMA: LazyLock<StructType> = LazyLock::new(|| {
+    StructType::new_unchecked((0..MAX_CHECKED_LOCATIONS).flat_map(|i| {
+        [
+            StructField::not_null(format!("p{i}"), DataType::BOOLEAN),
+            StructField::nullable(format!("l{i}"), DataType::STRING),
+        ]
+    }))
+});
+
+/// Visitor behind [`LocationCheck::check`].
+struct LocationVisitor<'k> {
+    kinds: &'k [(LocationKind, UnsafePrefixError)],
+}
+
+impl RowVisitor for LocationVisitor<'_> {
+    fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
+        static NAMES_AND_TYPES: LazyLock<ColumnNamesAndTypes> = LazyLock::new(|| {
+            CHECKED_LOCATIONS_SCHEMA
+                .fields()
+                .map(|field| (ColumnName::new([field.name()]), field.data_type().clone()))
+                .unzip::<_, _, Vec<_>, Vec<_>>()
+                .into()
+        });
+        NAMES_AND_TYPES.as_ref()
+    }
+
+    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> KernelResult<()> {
+        for row in 0..row_count {
+            for (pair, (kind, unsafe_prefix_error)) in getters.chunks(2).zip(self.kinds) {
+                if !pair[0].get(row, "present")? {
+                    continue;
+                }
+                let location: &str = pair[1].get(row, LOCATION)?;
+                kind.validate(location)?;
+                if parse_absolute_amt_location(location)?.is_some() {
+                    require!(has_uri_safe_prefix(location), unsafe_prefix_error(location));
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Rejects a `path` containing a `.` or `..` segment: the Iceberg V4 path spec does not support

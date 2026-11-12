@@ -19,11 +19,14 @@ use bytes::Bytes;
 use url::Url;
 
 use crate::actions::{ADD_NAME, ADD_SCHEMA, CheckpointAction, LOG_ADD_SCHEMA};
-use crate::amt_path_util::{amt_manifest_filemeta, encode_amt_location_expression};
+use crate::amt_path_util::{
+    CheckedLocation, LocationCheck, LocationKind, amt_manifest_filemeta,
+    encode_amt_location_expression,
+};
 use crate::cancellation::CancellationTokenRef;
 use crate::content_tree::conditions::{Check, ConditionChecker, diagnostic, diagnostic_i32};
 use crate::content_tree::dv_conversion::{
-    DeletionVectorLocationCheck, add_deletion_vector_expression, deletion_vector_checks,
+    add_deletion_vector_expression, checked_deletion_vector_location, deletion_vector_checks,
 };
 use crate::content_tree::mumbling::MumblingBitmap;
 use crate::content_tree::{
@@ -432,8 +435,8 @@ struct EntryTransform {
     selection_filter: Arc<dyn PredicateEvaluator>,
     /// Checks the kind's [`ManifestKind::selected_checks`] on the kept rows.
     selected_checker: ConditionChecker,
-    /// Checks the deletion vector locations of the kept rows.
-    dv_locations: DeletionVectorLocationCheck,
+    /// Checks the data file and deletion vector locations of the kept rows.
+    locations: LocationCheck,
     /// The kind's [`ManifestKind::helpers`].
     helpers: SchemaRef,
     /// Evaluates a selected entry batch with the [`Self::helpers`] columns.
@@ -463,8 +466,14 @@ impl EntryTransform {
             augmented_schema.clone(),
             kind.selected_checks,
         )?;
-        let dv_locations =
-            DeletionVectorLocationCheck::try_new(handler.as_ref(), augmented_schema.clone())?;
+        let locations = LocationCheck::try_new(
+            handler.as_ref(),
+            augmented_schema.clone(),
+            vec![
+                checked_data_file_location(),
+                checked_deletion_vector_location(),
+            ],
+        )?;
         let evaluator = handler.new_expression_evaluator(
             augmented_schema,
             Arc::new(build_entry_to_add_expression(ctx, &kind.base_row_id)?),
@@ -476,7 +485,7 @@ impl EntryTransform {
             checker,
             selection_filter,
             selected_checker,
-            dv_locations,
+            locations,
             helpers: kind.helpers,
             evaluator,
         })
@@ -537,7 +546,7 @@ impl EntryTransform {
         let augmented = annotated.append_columns(self.helpers.clone(), helper_columns)?;
         let selected_entries = filter_by_predicate(self.selection_filter.as_ref(), augmented)?;
         self.selected_checker.check(selected_entries.as_ref())?;
-        self.dv_locations.check(selected_entries.as_ref())?;
+        self.locations.check(selected_entries.as_ref())?;
         self.evaluator.evaluate(selected_entries.as_ref())
     }
 }
@@ -909,7 +918,8 @@ fn unsupported_entry_checks() -> Vec<Check> {
 /// What every selected (live `Data`) entry must satisfy for its `Add` to carry it faithfully: it
 /// has no partition spec, passes the [`deletion_vector_checks`], and has no unrecognized
 /// modification, whose values a plain `Add` would drop. The [`UnsupportedEntryVisitor`] checks its
-/// file format and column files.
+/// file format and column files, and a [`LocationCheck`] its location (see
+/// [`checked_data_file_location`]), so a relative `Add.path` resolves under the table root.
 fn selected_entry_checks() -> Vec<Check> {
     let spec_id = || col!(PARTITION_SPEC_ID);
     vec![Check::new(
@@ -971,6 +981,22 @@ fn unknown_enum_error<T>(
             diagnostic(values, 0)
         )),
         Err(e) => e,
+    }
+}
+
+/// The data file location a [`LocationCheck`] checks: `Add.path` keeps its `scheme:[//authority]`
+/// prefix as written.
+fn checked_data_file_location() -> CheckedLocation {
+    CheckedLocation {
+        column: column_name!(LOCATION),
+        present: Predicate::TRUE,
+        kind: LocationKind::DataFile,
+        unsafe_prefix_error: |location| {
+            KernelError::generic(format!(
+                "AMT location {location:?} has a URI scheme or authority with characters a URI \
+                 does not allow there"
+            ))
+        },
     }
 }
 
@@ -2317,6 +2343,7 @@ mod tests {
         |e: &mut ContentTreeNodeEntry| e.column_files = Some(vec![test_column_file()])
     )]
     #[case::partition_spec(|e: &mut ContentTreeNodeEntry| e.spec_id = Some(3))]
+    #[case::invalid_location(|e: &mut ContentTreeNodeEntry| e.location = "/../removed.parquet".into())]
     #[case::modified_snapshot_id(
         |e: &mut ContentTreeNodeEntry| e.tracking.modified_snapshot_id = Some(3)
     )]
@@ -2488,6 +2515,40 @@ mod tests {
         assert_result_error_with_message(
             read_tree(&engine, &checkpoint),
             "references leaf manifest 'memory:///table/metadata/leaf.parquet' more than once",
+        );
+    }
+
+    #[rstest]
+    #[case::parent_segment("../a.parquet", "contains a '.' or '..' segment")]
+    #[case::current_segment("data/./a.parquet", "contains a '.' or '..' segment")]
+    #[case::absolute_parent_segment("s3://bucket/t/../a.parquet", "contains a '.' or '..' segment")]
+    #[case::leading_slash_and_dot_segment("/../a.parquet", "contains a '.' or '..' segment")]
+    #[case::empty("", "must not be empty")]
+    #[case::leading_slash("/a.parquet", "must not begin with a leading '/'")]
+    #[case::network_path("//host/a.parquet", "must not begin with a leading '/'")]
+    #[case::unsafe_prefix("s3://bu#ck/a.parquet", "characters a URI does not allow")]
+    fn read_add_actions_from_amt_rejects_invalid_live_location(
+        #[case] location: &str,
+        #[case] message: &str,
+        #[values(false, true)] in_leaf: bool,
+    ) {
+        let engine = memory_engine();
+        let root_entry = if in_leaf {
+            let entry = leaf_entry(location, 1, 10, None, None, None);
+            write_leaf(&engine, "metadata/leaf.parquet", &[entry], 5, 100)
+        } else {
+            added_data_entry(location, 1, 1, 0, 0)
+        };
+        let checkpoint = write_root(&engine, &[root_entry]);
+        assert_generic(read_tree(&engine, &checkpoint), message);
+    }
+
+    /// Asserts `result` is a `Generic` error whose message contains `message`.
+    fn assert_generic<T>(result: KernelResult<T>, message: &str) {
+        let err = result.err().unwrap();
+        assert!(
+            matches!(&err, KernelError::Generic(m) if m.contains(message)),
+            "{err}"
         );
     }
 
@@ -2696,7 +2757,7 @@ mod tests {
     }
 
     /// A dropped entry is not validated: an unsupported file format, partition spec, deletion
-    /// vector, or null tracking values on it must not fail the read.
+    /// vector, location, or null tracking values on it must not fail the read.
     #[rstest]
     fn dropped_entry_with_unsupported_fields_is_not_rejected(
         #[values(
@@ -2707,7 +2768,7 @@ mod tests {
         content_type: DataContentType,
         #[values(TrackingStatus::Deleted, TrackingStatus::Replaced)] status: TrackingStatus,
     ) {
-        let mut entry = added_data_entry("dropped.parquet", 1, 1, 0, 0);
+        let mut entry = added_data_entry("/../dropped.parquet", 1, 1, 0, 0);
         entry.content_type = content_type;
         entry.tracking.status = status;
         entry.spec_id = Some(7);
@@ -3298,13 +3359,9 @@ mod tests {
             .then(|| ManifestDv::try_new(&mumbling_bitmap(&[0])).unwrap())
             .flatten();
         let mut ctx = leaf_ctx(&engine, manifest_dv);
-        let err = ctx
-            .convert_leaf_entries_to_add_actions(batch.as_ref())
-            .err()
-            .unwrap();
-        assert!(
-            matches!(&err, KernelError::Generic(m) if m.contains(message)),
-            "{err}"
+        assert_generic(
+            ctx.convert_leaf_entries_to_add_actions(batch.as_ref()),
+            message,
         );
     }
 

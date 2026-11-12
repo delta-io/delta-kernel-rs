@@ -1,9 +1,9 @@
-use std::sync::{Arc, LazyLock};
+use std::sync::LazyLock;
 
 use crate::actions::deletion_vector::{DeletionVectorDescriptor, DeletionVectorStorageType};
 use crate::amt_path_util::{
-    encode_amt_location_expression, parse_absolute_amt_location, raw_amt_location_from_uri,
-    validate_amt_location, validate_table_relative,
+    CheckedLocation, LocationKind, encode_amt_location_expression, raw_amt_location_from_uri,
+    validate_table_relative,
 };
 use crate::content_tree::conditions::{Check, diagnostic};
 use crate::content_tree::{
@@ -13,11 +13,9 @@ use crate::content_tree::{
 use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
 use crate::expressions::{ArrayData, Expression, Predicate, Scalar, lit, null_lit};
 use crate::schema::{
-    ArrayType, ColumnName, ColumnNamesAndTypes, DataType, SchemaRef, StructField, StructType,
-    ToSchema as _, column_name, lazy_schema_ref,
+    ArrayType, ColumnName, DataType, SchemaRef, ToSchema as _, column_name, lazy_schema_ref,
 };
-use crate::uri_reference::has_uri_safe_prefix;
-use crate::{EngineData, EvaluationHandler, ExpressionEvaluator, KernelError, KernelResult};
+use crate::{EngineData, KernelError, KernelResult};
 
 /// Extracts deletion vector content from a DeletionVectorDescriptor.
 ///
@@ -77,9 +75,10 @@ pub(crate) fn extract_deletion_vector_content(
 /// entry's `deletionVector` column: the inverse of [`extract_deletion_vector_content`].
 ///
 /// The descriptor is null where the entry has no deletion vector, and is otherwise built from an
-/// entry that passed the [`deletion_vector_checks`] and a [`DeletionVectorLocationCheck`]. A
-/// relative location becomes a `PersistedUnencodedRelative` (`'r'`) descriptor; an absolute one
-/// becomes `PersistedAbsolute` (`'p'`) with its path percent-encoded.
+/// entry that passed the [`deletion_vector_checks`] and a
+/// [`LocationCheck`](crate::amt_path_util::LocationCheck). A relative location becomes a
+/// `PersistedUnencodedRelative` (`'r'`) descriptor; an absolute one becomes `PersistedAbsolute`
+/// (`'p'`) with its path percent-encoded.
 pub(crate) fn add_deletion_vector_expression() -> Expression {
     let dv_field = |field: &str| Expression::column([DV_INFO, field]);
     let is_absolute = || Predicate::has_uri_scheme(dv_field(LOCATION));
@@ -122,7 +121,8 @@ pub(crate) fn add_deletion_vector_expression() -> Expression {
 /// build its descriptor: no encryption, an offset and Delta size that fit the descriptor's
 /// non-negative i32 fields, and a non-negative cardinality. An entry without one passes.
 ///
-/// Its location must also pass a [`DeletionVectorLocationCheck`].
+/// Its location must also pass a [`LocationCheck`](crate::amt_path_util::LocationCheck) (see
+/// [`checked_deletion_vector_location`]).
 pub(crate) fn deletion_vector_checks() -> Vec<Check> {
     let field = |name: &str| ColumnName::new([DV_INFO, name]);
     let value = |name: &str| Expression::column([DV_INFO, name]);
@@ -170,87 +170,19 @@ pub(crate) fn deletion_vector_checks() -> Vec<Check> {
     ]
 }
 
-/// Checks the deletion vector locations of entry batches: each must be absolute or table-relative
-/// with no `.` or `..` segment (see [`validate_amt_location`]), and an absolute one must parse and
-/// have a `scheme:[//authority]` prefix, which the descriptor keeps as written, that is already
-/// valid URI syntax. `Url` would otherwise re-encode or strip characters there, or end the
-/// authority early at a `?` or `#`. An expression selects the present locations and Rust checks
-/// them.
-pub(crate) struct DeletionVectorLocationCheck {
-    /// Yields, per entry, whether it has a deletion vector and, if so, its location.
-    locations: Arc<dyn ExpressionEvaluator>,
-}
-
-impl DeletionVectorLocationCheck {
-    /// Builds the check for entry batches with `input_schema`.
-    pub(crate) fn try_new(
-        handler: &dyn EvaluationHandler,
-        input_schema: SchemaRef,
-    ) -> KernelResult<Self> {
-        let location = Expression::case_when(
-            [(dv_present(), Expression::column([DV_INFO, LOCATION]))],
-            null_lit(DataType::STRING),
-        );
-        let locations = handler.new_expression_evaluator(
-            input_schema,
-            Arc::new(Expression::struct_from([
-                Expression::from(dv_present()),
-                location,
-            ])),
-            DV_LOCATION_SCHEMA.clone().into(),
-        )?;
-        Ok(Self { locations })
-    }
-
-    /// Errors for the first entry of `entries` whose deletion vector location fails.
-    pub(crate) fn check(&self, entries: &dyn EngineData) -> KernelResult<()> {
-        let locations = self.locations.evaluate(entries)?;
-        DeletionVectorLocationVisitor.visit_rows_of(locations.as_ref())
-    }
-}
-
-/// Name of the [`DeletionVectorLocationCheck`] projection's deletion-vector-present column.
-const DV_PRESENT: &str = "present";
-
-/// Schema of the [`DeletionVectorLocationCheck`] projection.
-static DV_LOCATION_SCHEMA: LazyLock<StructType> = LazyLock::new(|| {
-    StructType::new_unchecked([
-        StructField::not_null(DV_PRESENT, DataType::BOOLEAN),
-        StructField::nullable(LOCATION, DataType::STRING),
-    ])
-});
-
-/// Visitor behind [`DeletionVectorLocationCheck::check`].
-struct DeletionVectorLocationVisitor;
-
-impl RowVisitor for DeletionVectorLocationVisitor {
-    fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
-        static NAMES_AND_TYPES: LazyLock<ColumnNamesAndTypes> = LazyLock::new(|| {
-            (
-                vec![column_name!(DV_PRESENT), column_name!(LOCATION)],
-                vec![DataType::BOOLEAN, DataType::STRING],
-            )
-                .into()
-        });
-        NAMES_AND_TYPES.as_ref()
-    }
-
-    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> KernelResult<()> {
-        for row in 0..row_count {
-            if getters[0].get(row, DV_PRESENT)? {
-                let location: &str = getters[1].get(row, LOCATION)?;
-                validate_amt_location(location)?;
-                if parse_absolute_amt_location(location)?.is_some()
-                    && !has_uri_safe_prefix(location)
-                {
-                    return Err(KernelError::DeletionVector(format!(
-                        "Deletion vector '{location}' has a URI scheme or authority with \
-                         characters a URI does not allow there"
-                    )));
-                }
-            }
-        }
-        Ok(())
+/// The deletion vector location a [`LocationCheck`](crate::amt_path_util::LocationCheck) checks,
+/// present only where the entry has a deletion vector.
+pub(crate) fn checked_deletion_vector_location() -> CheckedLocation {
+    CheckedLocation {
+        column: ColumnName::new([DV_INFO, LOCATION]),
+        present: dv_present(),
+        kind: LocationKind::DeletionVector,
+        unsafe_prefix_error: |location| {
+            KernelError::DeletionVector(format!(
+                "Deletion vector '{location}' has a URI scheme or authority with characters a URI \
+                 does not allow there"
+            ))
+        },
     }
 }
 
@@ -450,6 +382,7 @@ mod tests {
     use super::*;
     use crate::Engine;
     use crate::actions::deletion_vector::{DeletionVectorDescriptor, DeletionVectorStorageType};
+    use crate::amt_path_util::LocationCheck;
     use crate::arrow::array::{AsArray as _, RecordBatch, StructArray};
     use crate::content_tree::conditions::ConditionChecker;
     use crate::content_tree::test_utils::test_dv_info;
@@ -918,8 +851,12 @@ mod tests {
             deletion_vector_checks(),
         )?
         .check(&entries)?;
-        DeletionVectorLocationCheck::try_new(handler.as_ref(), entry_schema.clone())?
-            .check(&entries)?;
+        LocationCheck::try_new(
+            handler.as_ref(),
+            entry_schema.clone(),
+            vec![checked_deletion_vector_location()],
+        )?
+        .check(&entries)?;
         // Wrapped in a `dv` field, since a top-level struct cannot be null.
         let output_type = schema! { nullable "dv": (DeletionVectorDescriptor::to_schema()) };
         let output = handler
