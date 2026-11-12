@@ -298,17 +298,13 @@ fn leaf_stats_field(
     // checked before the range check below so an out-of-range geo field ID still errors. A
     // projected read only narrows the stats a scan reads, and stats are optional there, so it skips
     // the leaf rather than failing the scan. Reachable only with the `geo-type-in-dev` feature.
-    // TODO: emit proper stats for geospatial columns.
+    // TODO(#3926): emit proper stats for geospatial columns.
     #[cfg(feature = "geo-type-in-dev")]
     if matches!(
         field.data_type(),
         DataType::Primitive(PrimitiveType::Geometry(_) | PrimitiveType::Geography(_))
     ) {
         if categories.is_some() {
-            warn!(
-                "Skipping stats for geospatial field '{}': not yet supported",
-                field.name()
-            );
             return Ok(None);
         }
         return Err(KernelError::unsupported(format!(
