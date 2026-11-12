@@ -38,12 +38,14 @@ use crate::engine::arrow_utils::{
 use crate::expressions::{ArrayData, ColumnName, PredicateRef, Scalar};
 use crate::object_store::DynObjectStore;
 use crate::plans::ir::nodes::{
-    DynamicScan, FILE_META_SCHEMA, FileType, Operator, Project, RelationId, RelationRef, ScanFile,
-    ScanJson, ScanParquet, SemiJoin, Values, WriteJson,
+    Aggregate, DynamicScan, FILE_META_SCHEMA, FileType, Operator, PrefixSum, Project, RelationId,
+    RelationRef, ScanFile, ScanJson, ScanParquet, SemiJoin, Values, WriteJson,
 };
 use crate::plans::ir::plan::{Plan, PlanNode};
 use crate::plans::{IoOperation, Operation, PlanExecutor, PlanResult, ScopedPlanExecutor};
-use crate::schema::{ArrayType, DataType, PrimitiveType, SchemaRef, StructField, StructType};
+use crate::schema::{
+    ArrayType, DataType, MapType, PrimitiveType, SchemaRef, StructField, StructType,
+};
 use crate::{
     EvaluationHandler as _, FileMeta, FilteredEngineData, KernelError, KernelResult,
     KernelResultIterator, StorageHandler as _,
@@ -216,8 +218,10 @@ impl SyncPlanExecutor {
         relation_store: Option<&RelationStore>,
     ) -> KernelResult<Vec<RecordBatch>> {
         let mut outputs: Vec<Vec<RecordBatch>> = Vec::with_capacity(plan.nodes.len());
+        let mut schemas: Vec<SchemaRef> = Vec::with_capacity(plan.nodes.len());
         for node in plan.nodes {
-            let output = self.eval_node(node, &outputs, relation_store)?;
+            schemas.push(output_schema(&node, &schemas)?);
+            let output = self.eval_node(node, &outputs, &schemas, relation_store)?;
             // Every consumer, including the caller of the final node, sees nested children with
             // their ancestors' null masks applied. Project can introduce new nullable structs.
             outputs.push(
@@ -233,11 +237,13 @@ impl SyncPlanExecutor {
     }
 
     /// Evaluates a single plan node. `node.inputs` are indices into `outputs`, the
-    /// already-materialized results of every prior node, in the node's declared input order.
+    /// already-materialized results of every prior node, in the node's declared input order, and
+    /// into `schemas`, those nodes' output schemas.
     fn eval_node(
         &self,
         node: PlanNode,
         results: &[Vec<RecordBatch>],
+        schemas: &[SchemaRef],
         relation_store: Option<&RelationStore>,
     ) -> KernelResult<Vec<RecordBatch>> {
         let PlanNode { op, inputs } = node;
@@ -269,9 +275,11 @@ impl SyncPlanExecutor {
             Operator::WriteJson(write) => {
                 self.eval_write_json(&write, inputs.iter().flat_map(|&i| results[i].iter()))
             }
-            Operator::SemiJoin(join) => {
-                eval_semi_join(join, &results[inputs[0]], &results[inputs[1]])
-            }
+            Operator::SemiJoin(join) => eval_semi_join(
+                join,
+                (&results[inputs[0]], &schemas[inputs[0]]),
+                (&results[inputs[1]], &schemas[inputs[1]]),
+            ),
         }
     }
 
@@ -599,13 +607,36 @@ fn eval_filter(predicate: PredicateRef, input: &[RecordBatch]) -> KernelResult<V
         .collect()
 }
 
+/// Returns the output schema of `node`, given the output schemas of the nodes before it.
+fn output_schema(node: &PlanNode, schemas: &[SchemaRef]) -> KernelResult<SchemaRef> {
+    Ok(match &node.op {
+        Operator::ScanParquet(ScanParquet { schema, .. })
+        | Operator::ScanJson(ScanJson { schema, .. })
+        | Operator::Values(Values { schema, .. })
+        | Operator::Project(Project { schema, .. })
+        | Operator::DynamicScan(DynamicScan { schema, .. })
+        | Operator::Aggregate(Aggregate { schema, .. })
+        | Operator::PrefixSum(PrefixSum { schema, .. }) => Arc::clone(schema),
+        Operator::RelationSource(relation) => Arc::clone(relation.schema()),
+        Operator::WriteJson(_) => Arc::clone(&FILE_META_SCHEMA),
+        // These emit rows of their first input unchanged.
+        Operator::Filter(_) | Operator::SemiJoin(_) | Operator::UnionAll(_) => {
+            let input = node.inputs.first().and_then(|&input| schemas.get(input));
+            Arc::clone(input.ok_or_else(|| KernelError::generic("plan node has no input"))?)
+        }
+    })
+}
+
 /// Keeps the probe rows whose keys match a build row's keys, or the rows with no match when
 /// inverted. NULL keys match each other, and each probe/build key pair is first cast to a common
 /// type, so INT 1 matches LONG 1 (see [`common_key_type`]).
+///
+/// Key types come from the input schemas rather than the batches, so a pair without a common
+/// type is an error even when an input has no rows.
 fn eval_semi_join(
     join: SemiJoin,
-    probe: &[RecordBatch],
-    build: &[RecordBatch],
+    (probe, probe_schema): (&[RecordBatch], &StructType),
+    (build, build_schema): (&[RecordBatch], &StructType),
 ) -> KernelResult<Vec<RecordBatch>> {
     if join.probe_keys.len() != join.build_keys.len() {
         return Err(KernelError::generic(format!(
@@ -614,21 +645,17 @@ fn eval_semi_join(
             join.build_keys.len()
         )));
     }
-    // An input without batches has no key types, but also no rows to compare.
-    let key_schema = match (probe.first(), build.first()) {
-        (Some(probe), Some(build)) => Some(common_key_schema(&join, probe, build)?),
-        _ => None,
-    };
+    let key_schema = common_key_schema(&join, probe_schema, build_schema)?;
     let mut build_keys = HashSet::new();
     for batch in build {
-        let keys = extract_keys(batch, &join.build_keys, key_schema.as_ref())?;
+        let keys = extract_keys(batch, &join.build_keys, Some(&key_schema))?;
         build_keys.extend(encode_arrays_as_rows(&keys, batch.num_rows())?);
     }
 
     probe
         .iter()
         .map(|batch| {
-            let keys = extract_keys(batch, &join.probe_keys, key_schema.as_ref())?;
+            let keys = extract_keys(batch, &join.probe_keys, Some(&key_schema))?;
             let keep = encode_arrays_as_rows(&keys, batch.num_rows())?
                 .into_iter()
                 .map(|key| join.inverted != build_keys.contains(&key));
@@ -638,22 +665,20 @@ fn eval_semi_join(
 }
 
 /// Returns the schema that both inputs' keys are cast to: the common type of each probe/build key
-/// pair, read from one batch of each input.
+/// pair.
 fn common_key_schema(
     join: &SemiJoin,
-    probe: &RecordBatch,
-    build: &RecordBatch,
+    probe_schema: &StructType,
+    build_schema: &StructType,
 ) -> KernelResult<ArrowSchemaRef> {
     let fields: Vec<_> = join
         .probe_keys
         .iter()
         .zip(&join.build_keys)
         .map(|(probe_key, build_key)| {
-            let probe_type =
-                DataType::try_from_arrow(extract_column(probe, probe_key)?.data_type())?;
-            let build_type =
-                DataType::try_from_arrow(extract_column(build, build_key)?.data_type())?;
-            let common = common_key_type(&probe_type, &build_type).ok_or_else(|| {
+            let probe_type = probe_schema.field_at(probe_key)?.data_type();
+            let build_type = build_schema.field_at(build_key)?.data_type();
+            let common = common_key_type(probe_type, build_type).ok_or_else(|| {
                 KernelError::generic(format!(
                     "SemiJoin keys have no common type: probe key `{probe_key}` is {probe_type}, \
                      build key `{build_key}` is {build_type}"
@@ -674,9 +699,10 @@ fn common_key_schema(
 ///
 /// As SQL equality does, a numeric key whose type widens losslessly to the other's (see
 /// [`PrimitiveType::can_widen_to`]) is widened, and decimals are rescaled to a scale that holds
-/// both. Struct keys need the same field names in the same order; nullability is ignored. Other
-/// differences, such as STRING and BINARY, have no common type: comparing their Arrow row
-/// encodings uncast could match unrelated values.
+/// both, unless that needs a precision above 38. Struct, array, and map keys widen their fields,
+/// elements, and map keys and values the same way, ignoring nullability; struct fields must have
+/// the same names in the same order. Other differences, such as STRING and BINARY, have no common
+/// type: comparing their Arrow row encodings uncast could match unrelated values.
 fn common_key_type(probe: &DataType, build: &DataType) -> Option<DataType> {
     match (probe, build) {
         (
@@ -710,6 +736,12 @@ fn common_key_type(probe: &DataType, build: &DataType) -> Option<DataType> {
         (DataType::Array(p), DataType::Array(b)) => {
             let element = common_key_type(p.element_type(), b.element_type())?;
             Some(ArrayType::new(element, p.contains_null() || b.contains_null()).into())
+        }
+        (DataType::Map(p), DataType::Map(b)) => {
+            let key = common_key_type(p.key_type(), b.key_type())?;
+            let value = common_key_type(p.value_type(), b.value_type())?;
+            let value_contains_null = p.value_contains_null() || b.value_contains_null();
+            Some(MapType::new(key, value, value_contains_null).into())
         }
         _ => (probe == build).then(|| probe.clone()),
     }
@@ -836,7 +868,9 @@ mod tests {
     use crate::arrow::buffer::{BooleanBuffer, NullBuffer};
     use crate::arrow::datatypes::{DataType as ArrowDataType, Field};
     use crate::engine::sync::get_bytes;
-    use crate::expressions::{Expression, Predicate, StructData, col, column_name, expr, lit};
+    use crate::expressions::{
+        Expression, MapData, Predicate, StructData, col, column_name, expr, lit,
+    };
     use crate::object_store::memory::InMemory;
     use crate::plans::PlanBuilder;
     use crate::plans::ir::nodes::Agg;
@@ -1388,14 +1422,51 @@ mod tests {
         (DataType::DOUBLE, vec![1.5f64.into()]),
         vec![1]
     )]
+    #[case::doubles_compare_in_total_order(
+        (DataType::DOUBLE, vec![(-0.0f64).into(), f64::NAN.into(), 0.0f64.into()]),
+        (DataType::DOUBLE, vec![0.0f64.into(), f64::NAN.into()]),
+        vec![1, 2]
+    )]
     #[case::decimals_rescale(
         (DataType::decimal(5, 1).unwrap(), vec![decimal(10, 5, 1), decimal(25, 5, 1)]),
         (DataType::decimal(6, 2).unwrap(), vec![decimal(100, 6, 2)]),
         vec![0]
     )]
+    #[case::decimals_keep_the_most_integer_digits(
+        (DataType::decimal(4, 0).unwrap(), vec![decimal(123, 4, 0), decimal(5, 4, 0)]),
+        (DataType::decimal(5, 2).unwrap(), vec![decimal(12300, 5, 2)]),
+        vec![0]
+    )]
+    #[case::decimal_precision_reaches_38(
+        (DataType::decimal(36, 0).unwrap(), vec![decimal(1, 36, 0), decimal(2, 36, 0)]),
+        (DataType::decimal(38, 2).unwrap(), vec![decimal(100, 38, 2)]),
+        vec![0]
+    )]
     #[case::struct_fields_widen(
         struct_keys("a", DataType::INTEGER, false, [1i32.into(), 2i32.into()]),
         struct_keys("a", DataType::LONG, true, [2i64.into()]),
+        vec![1]
+    )]
+    #[case::array_elements_widen(
+        array_keys(DataType::INTEGER, vec![vec![1i32.into(), 2i32.into()], vec![3i32.into()]]),
+        array_keys(DataType::LONG, vec![vec![3i64.into()]]),
+        vec![1]
+    )]
+    #[case::nullable_struct_elements_widen(
+        struct_array_keys(
+            DataType::INTEGER,
+            vec![vec![Some(1i32.into()), None], vec![Some(2i32.into())]]
+        ),
+        struct_array_keys(DataType::LONG, vec![vec![Some(1i64.into()), None]]),
+        vec![0]
+    )]
+    #[case::map_values_widen(
+        map_keys(
+            DataType::INTEGER,
+            false,
+            vec![vec![("a", 1i32.into())], vec![("a", 2i32.into())]]
+        ),
+        map_keys(DataType::LONG, true, vec![vec![("a", 2i64.into())]]),
         vec![1]
     )]
     fn semi_join_compares_keys_widened_to_a_common_type(
@@ -1412,7 +1483,8 @@ mod tests {
         Ok(())
     }
 
-    /// Each pair has equal Arrow row encodings, so comparing the keys uncast would match them.
+    /// Except for the decimals, whose common type needs a precision above 38, each pair has equal
+    /// Arrow row encodings, so comparing the keys uncast would match them.
     #[rstest]
     #[case::string_and_binary(
         (DataType::STRING, vec!["a".into()]),
@@ -1430,12 +1502,91 @@ mod tests {
         (DataType::TIMESTAMP, vec![Scalar::Timestamp(0)]),
         (DataType::TIMESTAMP_NTZ, vec![Scalar::TimestampNtz(0)])
     )]
+    #[case::decimal_precision_above_38(
+        (DataType::decimal(38, 0).unwrap(), vec![decimal(1, 38, 0)]),
+        (DataType::decimal(38, 2).unwrap(), vec![decimal(100, 38, 2)])
+    )]
     fn semi_join_rejects_keys_without_a_common_type(
         #[case] probe: (DataType, Vec<Scalar>),
         #[case] build: (DataType, Vec<Scalar>),
+        #[values(false, true)] inverted: bool,
     ) {
         assert_result_error_with_message(
-            semi_join_kept_ids(probe, build, false),
+            semi_join_kept_ids(probe, build, inverted),
+            "SemiJoin keys have no common type",
+        );
+    }
+
+    /// Keys pair by position, and the build input has its key columns in the other order.
+    #[rstest]
+    fn semi_join_widens_each_key_pair_of_a_multi_key_join(
+        #[values(false, true)] inverted: bool,
+    ) -> KernelResult<()> {
+        let probe = PlanBuilder::values(
+            schema_ref! { not_null "id": LONG, nullable "a": INTEGER, nullable "b": STRING },
+            vec![
+                vec![0i64.into(), 1i32.into(), "x".into()],
+                vec![1i64.into(), 1i32.into(), "y".into()],
+                vec![2i64.into(), 2i32.into(), "x".into()],
+            ],
+        )?;
+        let build = PlanBuilder::values(
+            schema_ref! { nullable "b": STRING, nullable "a": LONG },
+            vec![vec!["x".into(), 1i64.into()], vec!["y".into(), 2i64.into()]],
+        )?;
+        let keys = [column_name!("a"), column_name!("b")];
+        let expected = if inverted { vec![1, 2] } else { vec![0] };
+        assert_eq!(kept_ids(join_on(probe, build, &keys, inverted)?)?, expected);
+        Ok(())
+    }
+
+    /// Each input is the union of two batches.
+    #[rstest]
+    fn semi_join_widens_keys_across_batches(
+        #[values(false, true)] inverted: bool,
+    ) -> KernelResult<()> {
+        let probe_batch = |rows: [(i64, i32); 2]| {
+            let rows = rows.map(|(id, key)| vec![id.into(), key.into()]).to_vec();
+            PlanBuilder::values(
+                schema_ref! { not_null "id": LONG, nullable "k": INTEGER },
+                rows,
+            )
+        };
+        let build_batch = |key: i64| {
+            PlanBuilder::values(schema_ref! { nullable "k": LONG }, vec![vec![key.into()]])
+        };
+        let probe = PlanBuilder::union_all([
+            probe_batch([(0, 1), (1, 2)])?,
+            probe_batch([(2, 3), (3, 4)])?,
+        ])?;
+        let build = PlanBuilder::union_all([build_batch(1)?, build_batch(3)?])?;
+        let expected = if inverted { vec![1, 3] } else { vec![0, 2] };
+        assert_eq!(
+            kept_ids(join_on(probe, build, &[column_name!("k")], inverted)?)?,
+            expected
+        );
+        Ok(())
+    }
+
+    #[rstest]
+    fn semi_join_widens_keys_when_the_build_input_has_no_batches(
+        #[values(false, true)] inverted: bool,
+    ) -> KernelResult<()> {
+        let plan = join_with_unscanned_build(
+            (DataType::INTEGER, vec![1i32.into()]),
+            DataType::LONG,
+            inverted,
+        );
+        let expected = if inverted { vec![0] } else { vec![] };
+        assert_eq!(kept_ids(plan)?, expected);
+        Ok(())
+    }
+
+    #[test]
+    fn semi_join_rejects_keys_without_a_common_type_when_the_build_input_has_no_batches() {
+        let probe = (DataType::STRING, vec!["a".into()]);
+        assert_result_error_with_message(
+            kept_ids(join_with_unscanned_build(probe, DataType::BINARY, true)),
             "SemiJoin keys have no common type",
         );
     }
@@ -1446,43 +1597,85 @@ mod tests {
             "k",
             Arc::new(Int64Array::from(vec![1])) as ArrayRef,
         )])?];
+        let schema = schema! { nullable "k": LONG };
         let join = SemiJoin {
             inverted: false,
             probe_keys: vec![column_name!("k")],
             build_keys: vec![],
         };
         assert_result_error_with_message(
-            eval_semi_join(join, &batches, &batches),
+            eval_semi_join(join, (&batches, &schema), (&batches, &schema)),
             "SemiJoin has 1 probe keys but 0 build keys",
         );
         Ok(())
     }
 
-    /// Runs a semi or anti join of probe rows `(id, k)`, with `id` counting from 0, against build
-    /// rows `(k)`, and returns the `id`s of the probe rows it keeps.
+    /// Runs a semi or anti join of probe rows `(id, k)` against build rows `(k)`, and returns the
+    /// `id`s of the probe rows it keeps.
     fn semi_join_kept_ids(
         (probe_type, probe_keys): (DataType, Vec<Scalar>),
         (build_type, build_keys): (DataType, Vec<Scalar>),
         inverted: bool,
     ) -> KernelResult<Vec<i64>> {
-        let probe_rows = probe_keys
-            .into_iter()
-            .zip(0i64..)
-            .map(|(key, id)| vec![id.into(), key])
-            .collect();
         let probe = PlanBuilder::values(
             schema_ref! { not_null "id": LONG, nullable "k": (probe_type) },
-            probe_rows,
+            id_rows(probe_keys),
         )?;
         let build_rows = build_keys.into_iter().map(|key| vec![key]).collect();
         let build = PlanBuilder::values(schema_ref! { nullable "k": (build_type) }, build_rows)?;
-        let keys = || [column_name!("k")];
+        kept_ids(join_on(probe, build, &[column_name!("k")], inverted)?)
+    }
+
+    /// Joins probe rows `(id, k)` with a build input that scans no files, so it has no batches.
+    fn join_with_unscanned_build(
+        (probe_type, probe_keys): (DataType, Vec<Scalar>),
+        build_type: DataType,
+        inverted: bool,
+    ) -> Plan {
+        let probe = Values::new(
+            schema_ref! { not_null "id": LONG, nullable "k": (probe_type) },
+            id_rows(probe_keys),
+        );
+        let build = ScanJson {
+            files: vec![],
+            file_constant_columns: vec![],
+            schema: schema_ref! { nullable "k": (build_type) },
+        };
+        let join = SemiJoin {
+            inverted,
+            probe_keys: vec![column_name!("k")],
+            build_keys: vec![column_name!("k")],
+        };
+        Plan {
+            schema: Arc::clone(&probe.schema),
+            nodes: vec![
+                PlanNode::new(probe, vec![]),
+                PlanNode::new(build, vec![]),
+                PlanNode::new(join, vec![0, 1]),
+            ],
+        }
+    }
+
+    /// Returns a semi join, or an anti join when `inverted`, of `probe` with `build` on `keys`,
+    /// which name columns of both inputs.
+    fn join_on(
+        probe: PlanBuilder,
+        build: PlanBuilder,
+        keys: &[ColumnName],
+        inverted: bool,
+    ) -> KernelResult<Plan> {
+        let keys = || keys.iter().cloned();
         let join = if inverted {
             probe.anti_join(build, keys(), keys())?
         } else {
             probe.semi_join(build, keys(), keys())?
         };
-        let batches = SyncPlanExecutor::default().eval_plan(join.build()?, None)?;
+        join.build()
+    }
+
+    /// Runs `plan` and returns its first column, the `id`s of the probe rows a join keeps.
+    fn kept_ids(plan: Plan) -> KernelResult<Vec<i64>> {
+        let batches = SyncPlanExecutor::default().eval_plan(plan, None)?;
         Ok(batches
             .iter()
             .flat_map(|batch| {
@@ -1492,6 +1685,14 @@ mod tests {
             .collect())
     }
 
+    /// Returns rows `(id, key)` for `keys`, with `id` counting from 0.
+    fn id_rows(keys: Vec<Scalar>) -> Vec<Vec<Scalar>> {
+        (0i64..)
+            .zip(keys)
+            .map(|(id, key)| vec![id.into(), key])
+            .collect()
+    }
+
     /// Returns the type `struct<name>`, with the field of `data_type`, and one key per value.
     fn struct_keys(
         name: &str,
@@ -1499,12 +1700,60 @@ mod tests {
         nullable: bool,
         values: impl IntoIterator<Item = Scalar>,
     ) -> (DataType, Vec<Scalar>) {
-        let fields = vec![StructField::new(name, data_type, nullable)];
+        let struct_type =
+            StructType::try_new([StructField::new(name, data_type, nullable)]).unwrap();
         let keys = values
             .into_iter()
-            .map(|value| Scalar::Struct(StructData::try_new(fields.clone(), vec![value]).unwrap()))
+            .map(|value| struct_value(&struct_type, value))
             .collect();
-        (StructType::try_new(fields).unwrap().into(), keys)
+        (struct_type.into(), keys)
+    }
+
+    /// Returns the type `array<element_type>`, whose elements may be NULL, and one key per list.
+    fn array_keys(element_type: DataType, lists: Vec<Vec<Scalar>>) -> (DataType, Vec<Scalar>) {
+        let array_type = ArrayType::new(element_type, true);
+        let keys = lists
+            .into_iter()
+            .map(|list| Scalar::Array(ArrayData::try_new(array_type.clone(), list).unwrap()))
+            .collect();
+        (array_type.into(), keys)
+    }
+
+    /// Returns the type `array<struct<a>>`, with `a` of `data_type`, and one key per list, in which
+    /// `None` is a NULL struct.
+    fn struct_array_keys(
+        data_type: DataType,
+        lists: Vec<Vec<Option<Scalar>>>,
+    ) -> (DataType, Vec<Scalar>) {
+        let struct_type = StructType::try_new([StructField::nullable("a", data_type)]).unwrap();
+        let element = |value: Option<Scalar>| match value {
+            Some(value) => struct_value(&struct_type, value),
+            None => Scalar::Null(struct_type.clone().into()),
+        };
+        let lists = lists
+            .into_iter()
+            .map(|list| list.into_iter().map(element).collect())
+            .collect();
+        array_keys(struct_type.into(), lists)
+    }
+
+    /// Returns the type `map<string, value_type>` and one key per list of entries.
+    fn map_keys(
+        value_type: DataType,
+        value_contains_null: bool,
+        maps: Vec<Vec<(&str, Scalar)>>,
+    ) -> (DataType, Vec<Scalar>) {
+        let map_type = MapType::new(DataType::STRING, value_type, value_contains_null);
+        let keys = maps
+            .into_iter()
+            .map(|entries| Scalar::Map(MapData::try_new(map_type.clone(), entries).unwrap()))
+            .collect();
+        (map_type.into(), keys)
+    }
+
+    fn struct_value(struct_type: &StructType, value: Scalar) -> Scalar {
+        let fields = struct_type.fields().cloned().collect();
+        Scalar::Struct(StructData::try_new(fields, vec![value]).unwrap())
     }
 
     fn decimal(bits: i128, precision: u8, scale: u8) -> Scalar {
