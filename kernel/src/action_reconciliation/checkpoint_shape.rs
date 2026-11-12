@@ -11,6 +11,7 @@
 #![allow(dead_code)]
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use url::Url;
 
@@ -20,6 +21,11 @@ use crate::checkpoint::CHECKPOINT_ACTIONS_SCHEMA_V2;
 use crate::engine_data::RowVisitor;
 use crate::expressions::col;
 use crate::log_segment::LogSegment;
+use crate::metrics::{
+    CheckpointInspectionCompleted, CheckpointInspectionMode, CheckpointReadContext,
+    CheckpointReadFormat, CheckpointReadOutcome, CheckpointSidecarReadCompleted,
+    CheckpointSidecarReadMode, CheckpointSidecarReadOutcome,
+};
 use crate::plans::ir::nodes::FileType;
 use crate::plans::{Operation, PlanBuilder, PlanExecutor};
 use crate::schema::{SchemaRef, StructType};
@@ -60,8 +66,9 @@ impl CheckpointShape {
     pub(crate) fn try_new(
         exec: &dyn PlanExecutor,
         snapshot: &Snapshot,
+        context: &CheckpointReadContext,
     ) -> KernelResult<CheckpointShape> {
-        Self::try_new_impl(exec, snapshot, false)
+        Self::try_new_impl(exec, snapshot, false, context)
     }
 
     /// Resolves `snapshot`'s checkpoint topology and retains the checkpoint leaf schema.
@@ -77,27 +84,32 @@ impl CheckpointShape {
     pub(crate) fn try_new_with_leaf_schema(
         exec: &dyn PlanExecutor,
         snapshot: &Snapshot,
+        context: &CheckpointReadContext,
     ) -> KernelResult<CheckpointShape> {
-        Self::try_new_impl(exec, snapshot, true)
+        Self::try_new_impl(exec, snapshot, true, context)
     }
 
     fn try_new_impl(
         exec: &dyn PlanExecutor,
         snapshot: &Snapshot,
         needs_leaf_schema: bool,
+        context: &CheckpointReadContext,
     ) -> KernelResult<CheckpointShape> {
         let segment = snapshot.log_segment();
 
-        let (root_checkpoint, file_type) = match segment.listed.checkpoint_parts.first() {
-            Some(checkpoint) if checkpoint.is_json() => (&checkpoint.location, FileType::Json),
-            Some(checkpoint) => (&checkpoint.location, FileType::Parquet),
-            None => {
-                return Ok(CheckpointShape {
-                    checkpoint_type: CheckpointType::None,
-                    leaf_checkpoint_schema: None,
-                });
-            }
-        };
+        let (root_checkpoint, file_type, checkpoint_version) =
+            match segment.listed.checkpoint_parts.first() {
+                Some(checkpoint) if checkpoint.is_json() => {
+                    (&checkpoint.location, FileType::Json, checkpoint.version)
+                }
+                Some(checkpoint) => (&checkpoint.location, FileType::Parquet, checkpoint.version),
+                None => {
+                    return Ok(CheckpointShape {
+                        checkpoint_type: CheckpointType::None,
+                        leaf_checkpoint_schema: None,
+                    });
+                }
+            };
 
         // Classify from a V2 checkpoint's `_last_checkpoint` hint when possible, else inspect the
         // file.
@@ -107,6 +119,8 @@ impl CheckpointShape {
             root_checkpoint,
             file_type,
             needs_leaf_schema,
+            checkpoint_version,
+            context,
         )? {
             return Ok(shape);
         }
@@ -124,12 +138,21 @@ impl CheckpointShape {
                 }
                 // The `sidecar` column may still be all-null (not a manifest), so scan it to
                 // confirm whether a sidecar is actually present.
-                match collect_single_sidecar(exec, root_checkpoint, file_type, &segment.log_root)? {
+                match collect_single_sidecar(
+                    exec,
+                    root_checkpoint,
+                    file_type,
+                    &segment.log_root,
+                    checkpoint_version,
+                    context,
+                )? {
                     Some(sidecar) => Self::try_new_manifest(
                         exec,
                         sidecar,
                         needs_leaf_schema,
                         segment.checkpoint_hint_sidecar_file_schema(),
+                        checkpoint_version,
+                        context,
                     ),
                     None => Ok(Self::new_leaf(needs_leaf_schema.then_some(cp_schema))),
                 }
@@ -137,12 +160,21 @@ impl CheckpointShape {
             // A JSON checkpoint has no footer schema to inspect, so try to collect a sidecar to
             // decide if it is a manifest or a leaf.
             FileType::Json => {
-                match collect_single_sidecar(exec, root_checkpoint, file_type, &segment.log_root)? {
+                match collect_single_sidecar(
+                    exec,
+                    root_checkpoint,
+                    file_type,
+                    &segment.log_root,
+                    checkpoint_version,
+                    context,
+                )? {
                     Some(sidecar) => Self::try_new_manifest(
                         exec,
                         sidecar,
                         needs_leaf_schema,
                         segment.checkpoint_hint_sidecar_file_schema(),
+                        checkpoint_version,
+                        context,
                     ),
                     None => Ok(Self::new_leaf(
                         needs_leaf_schema.then(|| CHECKPOINT_ACTIONS_SCHEMA_V2.clone()),
@@ -169,6 +201,8 @@ impl CheckpointShape {
         root_checkpoint: &FileMeta,
         file_type: FileType,
         needs_leaf_schema: bool,
+        checkpoint_version: u64,
+        context: &CheckpointReadContext,
     ) -> KernelResult<Option<CheckpointShape>> {
         match segment.checkpoint_hint_sidecars().map(Vec::as_slice) {
             Some([sidecar, ..]) => {
@@ -178,6 +212,8 @@ impl CheckpointShape {
                     sidecar_meta,
                     needs_leaf_schema,
                     segment.checkpoint_hint_sidecar_file_schema(),
+                    checkpoint_version,
+                    context,
                 )?;
                 Ok(Some(result))
             }
@@ -212,11 +248,31 @@ impl CheckpointShape {
         sidecar: FileMeta,
         needs_leaf_schema: bool,
         hint_sidecar_schema: Option<StructType>,
+        checkpoint_version: u64,
+        context: &CheckpointReadContext,
     ) -> KernelResult<CheckpointShape> {
         let leaf_checkpoint_schema = match (needs_leaf_schema, hint_sidecar_schema) {
             (false, _) => None,
             (true, Some(schema)) => Some(Arc::new(schema)),
-            (true, None) => Some(read_parquet_footer_schema(exec, sidecar)?),
+            (true, None) => {
+                let start = Instant::now();
+                let result = read_parquet_footer_schema(exec, sidecar);
+                CheckpointSidecarReadCompleted {
+                    operation_id: context.operation_id,
+                    correlation_id: context.correlation_id.clone(),
+                    mode: CheckpointSidecarReadMode::Footer,
+                    outcome: if result.is_ok() {
+                        CheckpointSidecarReadOutcome::Success
+                    } else {
+                        CheckpointSidecarReadOutcome::Error
+                    },
+                    checkpoint_version,
+                    num_files_requested: 1,
+                    duration: start.elapsed(),
+                }
+                .emit();
+                Some(result?)
+            }
         };
         Ok(CheckpointShape {
             checkpoint_type: CheckpointType::Manifest,
@@ -284,28 +340,53 @@ fn collect_single_sidecar(
     file: &FileMeta,
     file_format: FileType,
     log_root: &Url,
+    checkpoint_version: u64,
+    context: &CheckpointReadContext,
 ) -> KernelResult<Option<FileMeta>> {
-    let read_schema = LogSegment::sidecar_read_schema();
-    // No file-constant columns: the sidecar column is read directly from each file.
-    let plan = match file_format {
-        FileType::Parquet => PlanBuilder::scan_parquet([file.clone()], &[], read_schema),
-        FileType::Json => PlanBuilder::scan_json([file.clone()], &[], read_schema),
-    }?
-    .filter(col!(SIDECAR_NAME, "path").is_not_null())?
-    .build()?;
-    let data = exec.execute_op(Operation::QueryPlan(plan))?.into_data()?;
-
+    let started = Instant::now();
     let mut visitor = SidecarVisitor::default();
-    for batch in data {
-        visitor.visit_rows_of(batch?.as_ref())?;
-        if !visitor.sidecars.is_empty() {
-            break;
+    let result: KernelResult<Option<FileMeta>> = (|| {
+        let read_schema = LogSegment::sidecar_read_schema();
+        // No file-constant columns: the sidecar column is read directly from each file.
+        let plan = match file_format {
+            FileType::Parquet => PlanBuilder::scan_parquet([file.clone()], &[], read_schema),
+            FileType::Json => PlanBuilder::scan_json([file.clone()], &[], read_schema),
+        }?
+        .filter(col!(SIDECAR_NAME, "path").is_not_null())?
+        .build()?;
+        let data = exec.execute_op(Operation::QueryPlan(plan))?.into_data()?;
+
+        for batch in data {
+            visitor.visit_rows_of(batch?.as_ref())?;
+            if !visitor.sidecars.is_empty() {
+                break;
+            }
         }
+        match visitor.sidecars.first() {
+            Some(sidecar) => Ok(Some(sidecar.to_filemeta(log_root)?)),
+            None => Ok(None),
+        }
+    })();
+    CheckpointInspectionCompleted {
+        operation_id: context.operation_id,
+        correlation_id: context.correlation_id.clone(),
+        mode: CheckpointInspectionMode::SidecarProbe,
+        format: match file_format {
+            FileType::Json => CheckpointReadFormat::Json,
+            FileType::Parquet => CheckpointReadFormat::Parquet,
+        },
+        outcome: if result.is_ok() {
+            CheckpointReadOutcome::Success
+        } else {
+            CheckpointReadOutcome::Error
+        },
+        checkpoint_version,
+        checkpoint_size_bytes: file.size,
+        num_sidecars_observed: visitor.sidecars.len() as u64,
+        duration: started.elapsed(),
     }
-    match visitor.sidecars.first() {
-        Some(sidecar) => Ok(Some(sidecar.to_filemeta(log_root)?)),
-        None => Ok(None),
-    }
+    .emit();
+    result
 }
 
 #[cfg(test)]
@@ -315,7 +396,6 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
-    use crate::KernelResult;
     use crate::actions::{
         ADD_NAME, CheckpointMetadata, MAX_VALUES, MIN_VALUES, NUM_RECORDS, SIDECAR_FILE_SCHEMA_TAG,
         STATS_PARSED, Sidecar,
@@ -324,12 +404,114 @@ mod tests {
     use crate::engine::sync::plan::SyncPlanExecutor;
     use crate::last_checkpoint_hint::{HintAction, LastCheckpointHint, LastCheckpointV2};
     use crate::log_segment_files::LogSegmentFiles;
+    use crate::metrics::MetricEvent;
     use crate::plans::ir::nodes::Operator;
     use crate::plans::{IoOperation, PlanResult};
+    use crate::scan::test_utils::sidecar_batch_with_given_paths;
     use crate::schema::{schema, schema_ref};
     use crate::unit_test_utils::{
-        copy_test_table, create_log_path, create_log_path_with_size, load_test_table,
+        CapturingReporter, copy_test_table, create_log_path, create_log_path_with_size,
+        install_thread_local_metrics_reporter, load_test_table,
     };
+    use crate::{EngineData, KernelError, KernelResult};
+
+    struct ProbeExecutor {
+        input: &'static str,
+        pulled: Arc<AtomicUsize>,
+    }
+
+    impl PlanExecutor for ProbeExecutor {
+        fn execute_op(&self, op: Operation) -> KernelResult<PlanResult> {
+            assert!(matches!(op, Operation::QueryPlan(_)));
+            if self.input == "call_error" {
+                return Err(KernelError::Cancelled);
+            }
+            let data: Vec<KernelResult<Box<dyn EngineData>>> = match self.input {
+                "empty" => vec![],
+                "iterator_error" => vec![Err(KernelError::Cancelled)],
+                _ => vec![
+                    Ok(sidecar_batch_with_given_paths(
+                        vec!["a.parquet", "b.parquet"],
+                        LogSegment::sidecar_read_schema(),
+                    )),
+                    // A probe must not request this batch after finding a reference.
+                    Err(KernelError::Cancelled),
+                ],
+            };
+            let pulled = self.pulled.clone();
+            Ok(PlanResult::Data(Box::new(data.into_iter().inspect(
+                move |_| {
+                    pulled.fetch_add(1, Ordering::Relaxed);
+                },
+            ))))
+        }
+    }
+
+    #[rstest]
+    #[case::first_batch("sidecars", false, 2, 1)]
+    #[case::empty("empty", false, 0, 0)]
+    #[case::iterator_error("iterator_error", true, 0, 1)]
+    #[case::call_error("call_error", true, 0, 0)]
+    fn sidecar_probe_reports_outcome_without_draining(
+        #[case] input: &'static str,
+        #[case] fails: bool,
+        #[case] observed: u64,
+        #[case] expected_pulls: usize,
+        #[values(FileType::Json, FileType::Parquet)] format: FileType,
+    ) {
+        let reporter = Arc::new(CapturingReporter::default());
+        let _guard = install_thread_local_metrics_reporter(reporter.clone());
+        let pulled = Arc::new(AtomicUsize::new(0));
+        let exec = ProbeExecutor {
+            input,
+            pulled: pulled.clone(),
+        };
+        let root = Url::parse("memory:///table/_delta_log/").unwrap();
+        let file = FileMeta::new(root.join("checkpoint").unwrap(), 0, 123);
+        let result = collect_single_sidecar(
+            &exec,
+            &file,
+            format,
+            &root,
+            7,
+            &CheckpointReadContext::default(),
+        );
+        if fails {
+            assert!(matches!(result, Err(KernelError::Cancelled)));
+        } else {
+            assert_eq!(result.unwrap().is_some(), observed > 0);
+        }
+        assert_eq!(pulled.load(Ordering::Relaxed), expected_pulls);
+        let events: Vec<_> = reporter
+            .events()
+            .into_iter()
+            .filter_map(|event| match event {
+                MetricEvent::CheckpointInspectionCompleted(event) => Some(event),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(events.len(), 1);
+        let event = &events[0];
+        assert_eq!(event.mode, CheckpointInspectionMode::SidecarProbe);
+        assert_eq!(
+            event.format,
+            match format {
+                FileType::Json => CheckpointReadFormat::Json,
+                FileType::Parquet => CheckpointReadFormat::Parquet,
+            }
+        );
+        assert_eq!(
+            event.outcome,
+            if fails {
+                CheckpointReadOutcome::Error
+            } else {
+                CheckpointReadOutcome::Success
+            }
+        );
+        assert_eq!(event.checkpoint_version, 7);
+        assert_eq!(event.checkpoint_size_bytes, 123);
+        assert_eq!(event.num_sidecars_observed, observed);
+    }
 
     /// Counts I/O operations and verifies that sidecar discovery queries filter out null paths.
     struct CountingExecutor {
@@ -421,9 +603,17 @@ mod tests {
         let stats_schema = expect_parsed.map(|_| probe_stats_schema());
 
         let shape = if stats_schema.is_some() {
-            CheckpointShape::try_new_with_leaf_schema(&exec, snapshot.as_ref())
+            CheckpointShape::try_new_with_leaf_schema(
+                &exec,
+                snapshot.as_ref(),
+                &crate::metrics::CheckpointReadContext::default(),
+            )
         } else {
-            CheckpointShape::try_new(&exec, snapshot.as_ref())
+            CheckpointShape::try_new(
+                &exec,
+                snapshot.as_ref(),
+                &crate::metrics::CheckpointReadContext::default(),
+            )
         }
         .unwrap();
         let parsed_stats_schema = stats_schema
@@ -495,6 +685,7 @@ mod tests {
         let shape = CheckpointShape::try_new_with_leaf_schema(
             &SyncPlanExecutor::default(),
             snapshot.as_ref(),
+            &crate::metrics::CheckpointReadContext::default(),
         )
         .unwrap();
 
@@ -521,6 +712,7 @@ mod tests {
         let shape = CheckpointShape::try_new_with_leaf_schema(
             &SyncPlanExecutor::default(),
             snapshot.as_ref(),
+            &crate::metrics::CheckpointReadContext::default(),
         )
         .unwrap();
 
@@ -544,9 +736,17 @@ mod tests {
         let exec = CountingExecutor::new();
 
         let shape = if needs_leaf_schema {
-            CheckpointShape::try_new_with_leaf_schema(&exec, snapshot.as_ref())
+            CheckpointShape::try_new_with_leaf_schema(
+                &exec,
+                snapshot.as_ref(),
+                &crate::metrics::CheckpointReadContext::default(),
+            )
         } else {
-            CheckpointShape::try_new(&exec, snapshot.as_ref())
+            CheckpointShape::try_new(
+                &exec,
+                snapshot.as_ref(),
+                &crate::metrics::CheckpointReadContext::default(),
+            )
         }
         .unwrap();
 
@@ -594,7 +794,12 @@ mod tests {
             .unwrap();
 
         let exec = CountingExecutor::new();
-        let shape = CheckpointShape::try_new_with_leaf_schema(&exec, snapshot.as_ref()).unwrap();
+        let shape = CheckpointShape::try_new_with_leaf_schema(
+            &exec,
+            snapshot.as_ref(),
+            &crate::metrics::CheckpointReadContext::default(),
+        )
+        .unwrap();
 
         assert_eq!(shape.checkpoint_type, CheckpointType::Manifest);
         assert!(
@@ -657,6 +862,8 @@ mod tests {
         #[case] expect_parsed: Option<bool>,
         #[case] expected_footer_reads: usize,
     ) {
+        let reporter = Arc::new(CapturingReporter::default());
+        let _guard = install_thread_local_metrics_reporter(reporter.clone());
         let segment = segment_with_empty_sidecars_hint(extension);
         let root = &segment.listed.checkpoint_parts[0].location;
         let file_type = match extension {
@@ -672,11 +879,19 @@ mod tests {
             root,
             file_type,
             needs_leaf_schema,
+            segment.checkpoint_version.unwrap(),
+            &CheckpointReadContext::default(),
         )
         .unwrap()
         .expect("an empty-sidecars hint must classify without falling through");
 
         assert_eq!(shape.checkpoint_type, CheckpointType::Leaf);
+        assert!(
+            !reporter
+                .events()
+                .iter()
+                .any(|event| matches!(event, MetricEvent::CheckpointInspectionCompleted(_)))
+        );
         if file_type == FileType::Json && needs_leaf_schema {
             assert_eq!(
                 shape.leaf_checkpoint_schema.as_ref(),
@@ -782,10 +997,17 @@ mod tests {
         let stats_schema = probe_stats_schema();
         let exec = CountingExecutor::new();
 
-        let shape =
-            CheckpointShape::from_v2_checkpoint_hint(&exec, &segment, root, file_type, true)
-                .unwrap()
-                .expect("a sidecar-listing hint must classify as a manifest");
+        let shape = CheckpointShape::from_v2_checkpoint_hint(
+            &exec,
+            &segment,
+            root,
+            file_type,
+            true,
+            segment.checkpoint_version.unwrap(),
+            &CheckpointReadContext::default(),
+        )
+        .unwrap()
+        .expect("a sidecar-listing hint must classify as a manifest");
 
         assert_eq!(shape.checkpoint_type, CheckpointType::Manifest);
         let parsed_stats_schema = shape.compatible_stats_parsed_schema(&stats_schema);
@@ -822,14 +1044,70 @@ mod tests {
         let hint_schema = segment
             .checkpoint_hint_sidecar_file_schema()
             .expect("table's hint carries the sidecar schema");
-        let footer_shape =
-            CheckpointShape::try_new_manifest(&exec, sidecar.clone(), true, None).unwrap();
-        let hinted =
-            CheckpointShape::try_new_manifest(&exec, sidecar, true, Some(hint_schema)).unwrap();
+        let footer_shape = CheckpointShape::try_new_manifest(
+            &exec,
+            sidecar.clone(),
+            true,
+            None,
+            0,
+            &CheckpointReadContext::default(),
+        )
+        .unwrap();
+        let hinted = CheckpointShape::try_new_manifest(
+            &exec,
+            sidecar,
+            true,
+            Some(hint_schema),
+            0,
+            &CheckpointReadContext::default(),
+        )
+        .unwrap();
 
         assert_eq!(
             hinted.leaf_checkpoint_schema, footer_shape.leaf_checkpoint_schema,
             "hint schema must match the footer schema"
         );
+    }
+    struct FailingFooterExecutor;
+
+    impl PlanExecutor for FailingFooterExecutor {
+        fn execute_op(&self, op: Operation) -> KernelResult<PlanResult> {
+            assert!(matches!(op, Operation::IoOperation(_)));
+            Err(KernelError::Cancelled)
+        }
+    }
+
+    #[test]
+    fn sidecar_footer_failure_retains_context_and_original_error() {
+        let reporter = Arc::new(CapturingReporter::default());
+        let _guard = install_thread_local_metrics_reporter(reporter.clone());
+        let context = CheckpointReadContext {
+            correlation_id: Some("scan-reader".into()),
+            ..Default::default()
+        };
+        let sidecar = FileMeta::new(
+            Url::parse("memory:///_delta_log/_sidecars/a.parquet").unwrap(),
+            0,
+            123,
+        );
+        let result = CheckpointShape::try_new_manifest(
+            &FailingFooterExecutor,
+            sidecar,
+            true,
+            None,
+            7,
+            &context,
+        );
+        assert!(matches!(result, Err(KernelError::Cancelled)));
+        let events = reporter.events();
+        let [MetricEvent::CheckpointSidecarReadCompleted(event)] = events.as_slice() else {
+            panic!("expected one sidecar footer report");
+        };
+        assert_eq!(event.mode, CheckpointSidecarReadMode::Footer);
+        assert_eq!(event.outcome, CheckpointSidecarReadOutcome::Error);
+        assert_eq!(event.checkpoint_version, 7);
+        assert_eq!(event.num_files_requested, 1);
+        assert_eq!(event.operation_id, None);
+        assert_eq!(event.correlation_id, context.correlation_id);
     }
 }

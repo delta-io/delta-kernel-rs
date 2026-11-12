@@ -25,6 +25,10 @@ use tracing::span::Attributes;
 use tracing::warn;
 use uuid::Uuid;
 
+use super::{
+    CheckpointDiscoveryCompleted, CheckpointHintReadCompleted, CheckpointInspectionCompleted,
+    CheckpointSidecarReadCompleted,
+};
 use crate::log_segment::LogSegment;
 
 // ====================================================================
@@ -116,6 +120,10 @@ pub enum MetricEvent {
     StorageListCompleted(StorageListCompleted),
     StorageReadCompleted(StorageReadCompleted),
     StorageCopyCompleted(StorageCopyCompleted),
+    CheckpointDiscoveryCompleted(CheckpointDiscoveryCompleted),
+    CheckpointInspectionCompleted(CheckpointInspectionCompleted),
+    CheckpointHintReadCompleted(CheckpointHintReadCompleted),
+    CheckpointSidecarReadCompleted(CheckpointSidecarReadCompleted),
 }
 
 impl MetricEvent {
@@ -124,6 +132,7 @@ impl MetricEvent {
         match self {
             // Lifecycle events receive elapsed time from the tracing layer.
             Self::SnapshotBuildSuccess(e) => e.set_duration(d),
+            Self::SnapshotBuildFailure(e) => e.duration = d,
             Self::TransactionCommitSuccess(e) => e.set_duration(d),
             Self::DomainMetadataLoadSuccess(e) => e.set_duration(d),
             Self::SetTransactionLoadSuccess(e) => e.set_duration(d),
@@ -133,20 +142,23 @@ impl MetricEvent {
             Self::ChecksumWriteSuccess(e) => e.duration = d,
             Self::ChecksumWriteFailure(e) => e.duration = d,
 
-            // Emit-based success events set their duration as a creation attribute, so the
+            // Emit-based events set their duration as a creation attribute, so the
             // span-close hook must not overwrite it.
             Self::LogSegmentLoadSuccess(_)
+            | Self::LogSegmentLoadFailure(_)
             | Self::ProtocolMetadataLoadSuccess(_)
+            | Self::ProtocolMetadataLoadFailure(_)
             | Self::ScanMetadataCompleted(_)
             | Self::StorageListCompleted(_)
             | Self::StorageReadCompleted(_)
-            | Self::StorageCopyCompleted(_) => {}
+            | Self::StorageCopyCompleted(_)
+            | Self::CheckpointDiscoveryCompleted(_)
+            | Self::CheckpointInspectionCompleted(_)
+            | Self::CheckpointHintReadCompleted(_)
+            | Self::CheckpointSidecarReadCompleted(_) => {}
 
             // These failure events carry no duration.
-            Self::LogSegmentLoadFailure(_)
-            | Self::ProtocolMetadataLoadFailure(_)
-            | Self::SnapshotBuildFailure(_)
-            | Self::TransactionCommitFailure(_)
+            Self::TransactionCommitFailure(_)
             | Self::DomainMetadataLoadFailure
             | Self::SetTransactionLoadFailure
             | Self::CrcReadFailure => {}
@@ -166,6 +178,12 @@ impl MetricEvent {
             Self::CheckpointWriteSuccess(e) => e.record_u64(name, value),
             Self::ChecksumWriteSuccess(e) => e.record_u64(name, value),
 
+            Self::CheckpointDiscoveryCompleted(_) => Err(CheckpointDiscoveryCompleted::SPAN_NAME),
+            Self::CheckpointInspectionCompleted(_) => Err(CheckpointInspectionCompleted::SPAN_NAME),
+            Self::CheckpointHintReadCompleted(_) => Err(CheckpointHintReadCompleted::SPAN_NAME),
+            Self::CheckpointSidecarReadCompleted(_) => {
+                Err(CheckpointSidecarReadCompleted::SPAN_NAME)
+            }
             Self::LogSegmentLoadSuccess(_) => Err(LogSegmentLoadSuccess::SPAN_NAME),
             Self::ProtocolMetadataLoadSuccess(_) => Err(ProtocolMetadataLoadSuccess::SPAN_NAME),
             Self::SetTransactionLoadSuccess(_) => Err(SetTransactionLoadSuccess::SPAN_NAME),
@@ -197,6 +215,12 @@ impl MetricEvent {
             Self::SetTransactionLoadSuccess(e) => e.record_bool(name, value),
 
             // No bool fields set during span lifetime — a runtime record() on these is a bug.
+            Self::CheckpointDiscoveryCompleted(_) => Err(CheckpointDiscoveryCompleted::SPAN_NAME),
+            Self::CheckpointInspectionCompleted(_) => Err(CheckpointInspectionCompleted::SPAN_NAME),
+            Self::CheckpointHintReadCompleted(_) => Err(CheckpointHintReadCompleted::SPAN_NAME),
+            Self::CheckpointSidecarReadCompleted(_) => {
+                Err(CheckpointSidecarReadCompleted::SPAN_NAME)
+            }
             Self::LogSegmentLoadSuccess(_) => Err(LogSegmentLoadSuccess::SPAN_NAME),
             Self::ProtocolMetadataLoadSuccess(_) => Err(ProtocolMetadataLoadSuccess::SPAN_NAME),
             Self::SnapshotBuildSuccess(_) => Err(SnapshotBuildSuccess::SPAN_NAME),
@@ -257,6 +281,7 @@ impl MetricEvent {
                 table_type: e.table_type,
                 correlation_id: e.correlation_id,
                 load_type: e.load_type,
+                duration: e.duration,
             }),
             Self::ProtocolMetadataLoadSuccess(e) => {
                 Self::ProtocolMetadataLoadFailure(ProtocolMetadataLoadFailure {
@@ -264,6 +289,7 @@ impl MetricEvent {
                     table_type: e.table_type,
                     correlation_id: e.correlation_id,
                     load_type: e.load_type,
+                    duration: e.duration,
                 })
             }
             Self::SnapshotBuildSuccess(e) => Self::SnapshotBuildFailure(SnapshotBuildFailure {
@@ -271,6 +297,7 @@ impl MetricEvent {
                 table_type: e.table_type,
                 correlation_id: e.correlation_id,
                 load_type: e.load_type,
+                duration: e.duration,
             }),
             Self::TransactionCommitSuccess(e) => {
                 Self::TransactionCommitFailure(TransactionCommitFailure {
@@ -310,7 +337,11 @@ impl MetricEvent {
             | Self::ScanMetadataCompleted(_)
             | Self::StorageListCompleted(_)
             | Self::StorageReadCompleted(_)
-            | Self::StorageCopyCompleted(_)) => e,
+            | Self::StorageCopyCompleted(_)
+            | Self::CheckpointDiscoveryCompleted(_)
+            | Self::CheckpointInspectionCompleted(_)
+            | Self::CheckpointHintReadCompleted(_)
+            | Self::CheckpointSidecarReadCompleted(_)) => e,
         }
     }
 }
@@ -342,6 +373,10 @@ impl fmt::Display for MetricEvent {
             Self::StorageListCompleted(e) => e.fmt(f),
             Self::StorageReadCompleted(e) => e.fmt(f),
             Self::StorageCopyCompleted(e) => e.fmt(f),
+            Self::CheckpointDiscoveryCompleted(e) => e.fmt(f),
+            Self::CheckpointInspectionCompleted(e) => e.fmt(f),
+            Self::CheckpointHintReadCompleted(e) => e.fmt(f),
+            Self::CheckpointSidecarReadCompleted(e) => e.fmt(f),
         }
     }
 }
@@ -701,14 +736,17 @@ pub struct LogSegmentLoadFailure {
     pub correlation_id: Option<Arc<str>>,
     pub table_type: TableType,
     pub load_type: LogSegmentLoadType,
+    /// Elapsed wall-clock time before the operation failed.
+    pub duration: Duration,
 }
 
 impl fmt::Display for LogSegmentLoadFailure {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "LogSegmentLoadFailure(id={}, table_type={}, correlation_id={:?}, load_type={})",
-            self.operation_id, self.table_type, self.correlation_id, self.load_type
+            "LogSegmentLoadFailure(id={}, table_type={}, correlation_id={:?}, \
+             load_type={}, duration={:?})",
+            self.operation_id, self.table_type, self.correlation_id, self.load_type, self.duration
         )
     }
 }
@@ -846,6 +884,8 @@ pub struct ProtocolMetadataLoadFailure {
     pub correlation_id: Option<Arc<str>>,
     pub table_type: TableType,
     pub load_type: LogSegmentLoadType,
+    /// Elapsed wall-clock time before the operation failed.
+    pub duration: Duration,
 }
 
 impl fmt::Display for ProtocolMetadataLoadFailure {
@@ -853,8 +893,8 @@ impl fmt::Display for ProtocolMetadataLoadFailure {
         write!(
             f,
             "ProtocolMetadataLoadFailure(id={}, table_type={}, correlation_id={:?}, \
-             load_type={})",
-            self.operation_id, self.table_type, self.correlation_id, self.load_type
+             load_type={}, duration={:?})",
+            self.operation_id, self.table_type, self.correlation_id, self.load_type, self.duration
         )
     }
 }
@@ -942,14 +982,17 @@ pub struct SnapshotBuildFailure {
     pub correlation_id: Option<Arc<str>>,
     pub table_type: TableType,
     pub load_type: SnapshotLoadType,
+    /// Elapsed wall-clock time before the operation failed.
+    pub duration: Duration,
 }
 
 impl fmt::Display for SnapshotBuildFailure {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "SnapshotBuildFailure(id={}, table_type={}, correlation_id={:?}, load_type={})",
-            self.operation_id, self.table_type, self.correlation_id, self.load_type
+            "SnapshotBuildFailure(id={}, table_type={}, correlation_id={:?}, \
+             load_type={}, duration={:?})",
+            self.operation_id, self.table_type, self.correlation_id, self.load_type, self.duration
         )
     }
 }
@@ -2134,7 +2177,7 @@ pub(crate) fn emit_log_segment_load(
 }
 
 /// Emit a [`MetricEvent::LogSegmentLoadFailure`]. Call once per log-segment load, on failure.
-pub(crate) fn emit_log_segment_load_failure(ctx: &SnapshotLoadMetricContext) {
+pub(crate) fn emit_log_segment_load_failure(ctx: &SnapshotLoadMetricContext, duration: Duration) {
     let span = tracing::span!(
         tracing::Level::INFO,
         LogSegmentLoadSuccess::SPAN_NAME,
@@ -2143,6 +2186,7 @@ pub(crate) fn emit_log_segment_load_failure(ctx: &SnapshotLoadMetricContext) {
         is_catalog_managed = ctx.is_catalog_managed,
         correlation_id = ctx.correlation_id.as_deref().unwrap_or(""),
         load_type = ctx.load_type.as_ref(),
+        duration_ns = duration.as_nanos() as u64,
     );
     let _enter = span.enter();
     tracing::info!(error = tracing::field::debug("log segment load failed"));
@@ -2170,7 +2214,10 @@ pub(crate) fn emit_protocol_metadata_load(
 
 /// Emit a [`MetricEvent::ProtocolMetadataLoadFailure`]. Call once per snapshot load on the P&M
 /// resolution path, on failure.
-pub(crate) fn emit_protocol_metadata_load_failure(ctx: &SnapshotLoadMetricContext) {
+pub(crate) fn emit_protocol_metadata_load_failure(
+    ctx: &SnapshotLoadMetricContext,
+    duration: Duration,
+) {
     let span = tracing::span!(
         tracing::Level::INFO,
         ProtocolMetadataLoadSuccess::SPAN_NAME,
@@ -2179,6 +2226,7 @@ pub(crate) fn emit_protocol_metadata_load_failure(ctx: &SnapshotLoadMetricContex
         is_catalog_managed = ctx.is_catalog_managed,
         correlation_id = ctx.correlation_id.as_deref().unwrap_or(""),
         load_type = ctx.load_type.as_ref(),
+        duration_ns = duration.as_nanos() as u64,
     );
     let _enter = span.enter();
     tracing::info!(error = tracing::field::debug("protocol/metadata load failed"));
@@ -2459,7 +2507,7 @@ mod tests {
             correlation_id: Some("snap-req-3".into()),
             load_type: SnapshotLoadType::Incremental,
             version: 0,
-            duration: Duration::default(),
+            duration: Duration::from_nanos(37),
         };
         let MetricEvent::SnapshotBuildFailure(failure) =
             MetricEvent::SnapshotBuildSuccess(snapshot).into_failure()
@@ -2468,6 +2516,7 @@ mod tests {
         };
         assert_eq!(failure.correlation_id.as_deref(), Some("snap-req-3"));
         assert_eq!(failure.load_type, SnapshotLoadType::Incremental);
+        assert_eq!(failure.duration, Duration::from_nanos(37));
     }
 
     #[rstest]

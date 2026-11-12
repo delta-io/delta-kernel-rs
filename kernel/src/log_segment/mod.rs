@@ -4,6 +4,7 @@
 use std::fmt::Display;
 use std::num::NonZero;
 use std::sync::{Arc, LazyLock};
+use std::time::Instant;
 
 use delta_kernel_derive::internal_api;
 use itertools::Itertools;
@@ -33,7 +34,10 @@ use crate::log_replay::ActionsBatch;
 #[internal_api]
 use crate::log_segment_files::LogSegmentFiles;
 use crate::metrics::{
-    SnapshotLoadMetricContext, emit_log_segment_load, emit_log_segment_load_failure,
+    CheckpointInspectionCompleted, CheckpointInspectionMode, CheckpointReadContext,
+    CheckpointReadFormat, CheckpointReadOutcome, CheckpointSidecarReadCompleted,
+    CheckpointSidecarReadMode, CheckpointSidecarReadOutcome, SnapshotLoadMetricContext,
+    emit_log_segment_load, emit_log_segment_load_failure,
 };
 use crate::path::LogPathFileType::*;
 #[cfg(feature = "adaptive-metadata-in-dev")]
@@ -555,18 +559,21 @@ impl LogSegment {
     ) -> KernelResult<Self> {
         let time_travel_version = time_travel_version.into();
         let start = std::time::Instant::now();
+        let context = CheckpointReadContext::from(&metric_context);
         let build = || {
-            let checkpoint_hint = LastCheckpointHint::try_read(storage, &log_root)?;
-            Self::for_snapshot_impl(
+            let checkpoint_hint =
+                LastCheckpointHint::try_read_with_context(storage, &log_root, &context)?;
+            Self::for_snapshot_with_context(
                 storage,
                 log_root,
                 log_tail,
                 checkpoint_hint,
                 time_travel_version,
+                &context,
             )
         };
-        let log_segment =
-            build().inspect_err(|_| emit_log_segment_load_failure(&metric_context))?;
+        let log_segment = build()
+            .inspect_err(|_| emit_log_segment_load_failure(&metric_context, start.elapsed()))?;
 
         emit_log_segment_load(&metric_context, &log_segment, start.elapsed());
         Ok(log_segment)
@@ -584,12 +591,31 @@ impl LogSegment {
     }
 
     // factored out for testing
+    #[cfg(test)]
     pub(crate) fn for_snapshot_impl(
         storage: &dyn StorageHandler,
         log_root: Url,
         log_tail: Vec<ParsedLogPath>,
         checkpoint_hint: Option<LastCheckpointHint>,
         time_travel_version: Option<Version>,
+    ) -> KernelResult<Self> {
+        Self::for_snapshot_with_context(
+            storage,
+            log_root,
+            log_tail,
+            checkpoint_hint,
+            time_travel_version,
+            &CheckpointReadContext::default(),
+        )
+    }
+
+    fn for_snapshot_with_context(
+        storage: &dyn StorageHandler,
+        log_root: Url,
+        log_tail: Vec<ParsedLogPath>,
+        checkpoint_hint: Option<LastCheckpointHint>,
+        time_travel_version: Option<Version>,
+        context: &CheckpointReadContext,
     ) -> KernelResult<Self> {
         // The end_version is the time_travel_version, if present
         // TODO: When max catalog version is implemented, we would use that as end_version if
@@ -621,13 +647,22 @@ impl LogSegment {
                 &log_root,
                 log_tail,
                 end_version,
+                context,
             )?,
             // Case 3
             (None, Some(end)) => LogSegmentFiles::list_with_backward_checkpoint_scan(
-                storage, &log_root, log_tail, end,
+                storage, &log_root, log_tail, end, context,
             )?,
             // Case 4
-            (None, None) => LogSegmentFiles::list(storage, &log_root, log_tail, None, None)?,
+            (None, None) => LogSegmentFiles::list_with_context(
+                storage,
+                &log_root,
+                log_tail,
+                None,
+                None,
+                crate::log_segment_files::CheckpointHandling::Adopt,
+                context,
+            )?,
         };
 
         LogSegment::try_new(listed_files, log_root, time_travel_version, checkpoint_hint)
@@ -994,6 +1029,28 @@ impl LogSegment {
         stats_schema: Option<&StructType>,
         partition_schema: Option<&StructType>,
     ) -> KernelResult<ActionsWithCheckpointInfo<Box<dyn KernelResultIterator<ActionsBatch>>>> {
+        self.read_actions_with_checkpoint_context(
+            engine,
+            commit_read_schema,
+            checkpoint_read_schema,
+            meta_predicate,
+            stats_schema,
+            partition_schema,
+            &CheckpointReadContext::default(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn read_actions_with_checkpoint_context(
+        &self,
+        engine: &dyn Engine,
+        commit_read_schema: SchemaRef,
+        checkpoint_read_schema: SchemaRef,
+        meta_predicate: Option<PredicateRef>,
+        stats_schema: Option<&StructType>,
+        partition_schema: Option<&StructType>,
+        context: &CheckpointReadContext,
+    ) -> KernelResult<ActionsWithCheckpointInfo<Box<dyn KernelResultIterator<ActionsBatch>>>> {
         // Combine the action-presence predicate with the caller's skipping predicate so readers
         // can omit checkpoint data that cannot contain a relevant action.
         let projection_predicate = checkpoint_action_projection_predicate(&checkpoint_read_schema);
@@ -1010,6 +1067,7 @@ impl LogSegment {
             checkpoint_predicate,
             stats_schema,
             partition_schema,
+            context,
         )?;
 
         Ok(ActionsWithCheckpointInfo {
@@ -1358,6 +1416,7 @@ impl LogSegment {
     fn get_file_actions_schema_and_sidecars(
         &self,
         engine: &dyn Engine,
+        context: &CheckpointReadContext,
     ) -> KernelResult<(Option<SchemaRef>, Vec<FileMeta>)> {
         // Hint schema from `_last_checkpoint` avoids footer reads when available.
         let hint_schema = self.checkpoint_hint_schema();
@@ -1378,7 +1437,7 @@ impl LogSegment {
             UuidCheckpoint if checkpoint.extension.as_str() == "json" => {
                 // JSON checkpoint is always V2. No checkpoint schema is available since JSON
                 // checkpoints don't have a parquet footer to read.
-                self.read_sidecar_schema_and_files(engine, checkpoint, None)
+                self.read_sidecar_schema_and_files(engine, checkpoint, None, context)
             }
             ClassicCheckpoint | UuidCheckpoint if checkpoint.extension.as_str() == "parquet" => {
                 // Parquet checkpoint (classic-named or UUID-named): either can be V1 or V2.
@@ -1386,7 +1445,12 @@ impl LogSegment {
                 let checkpoint_schema =
                     Self::read_checkpoint_schema(engine, checkpoint, hint_schema.as_ref())?;
                 if checkpoint_schema.field(SIDECAR_NAME).is_some() {
-                    self.read_sidecar_schema_and_files(engine, checkpoint, Some(&checkpoint_schema))
+                    self.read_sidecar_schema_and_files(
+                        engine,
+                        checkpoint,
+                        Some(&checkpoint_schema),
+                        context,
+                    )
                 } else {
                     Ok((Some(checkpoint_schema), vec![]))
                 }
@@ -1421,10 +1485,29 @@ impl LogSegment {
         engine: &dyn Engine,
         checkpoint: &ParsedLogPath<FileMeta>,
         checkpoint_schema: Option<&SchemaRef>,
+        context: &CheckpointReadContext,
     ) -> KernelResult<(Option<SchemaRef>, Vec<FileMeta>)> {
-        let sidecar_files = self.extract_sidecar_refs(engine, checkpoint)?;
+        let sidecar_files = self.extract_sidecar_refs(engine, checkpoint, context)?;
         let file_actions_schema = match sidecar_files.first() {
-            Some(first) => Some(Self::read_footer_schema(engine, first)?),
+            Some(first) => {
+                let start = Instant::now();
+                let result = Self::read_footer_schema(engine, first);
+                CheckpointSidecarReadCompleted {
+                    operation_id: context.operation_id,
+                    correlation_id: context.correlation_id.clone(),
+                    mode: CheckpointSidecarReadMode::Footer,
+                    outcome: if result.is_ok() {
+                        CheckpointSidecarReadOutcome::Success
+                    } else {
+                        CheckpointSidecarReadOutcome::Error
+                    },
+                    checkpoint_version: checkpoint.version,
+                    num_files_requested: 1,
+                    duration: start.elapsed(),
+                }
+                .emit();
+                Some(result?)
+            }
             None => checkpoint_schema.cloned(),
         };
         Ok((file_actions_schema, sidecar_files))
@@ -1445,12 +1528,13 @@ impl LogSegment {
         meta_predicate: Option<PredicateRef>,
         stats_schema: Option<&StructType>,
         partition_schema: Option<&StructType>,
+        context: &CheckpointReadContext,
     ) -> KernelResult<ActionsWithCheckpointInfo<impl KernelResultIterator<ActionsBatch> + use<>>>
     {
         let need_file_actions = schema_contains_file_actions(&action_schema);
 
         let (file_actions_schema, sidecar_files) = if need_file_actions {
-            self.get_file_actions_schema_and_sidecars(engine)?
+            self.get_file_actions_schema_and_sidecars(engine, context)?
         } else {
             (None, vec![])
         };
@@ -1546,11 +1630,21 @@ impl LogSegment {
         // Both checkpoint and sidecar parquet files share the same `add.stats_parsed.*` column
         // layout, so we reuse the same predicate for row group skipping.
         let sidecar_batches = if !sidecar_files.is_empty() {
-            engine.parquet_handler().read_parquet_files(
-                &sidecar_files,
-                read_schema.clone(),
-                meta_predicate,
-            )?
+            CheckpointSidecarReadCompleted {
+                operation_id: context.operation_id,
+                correlation_id: context.correlation_id.clone(),
+                mode: CheckpointSidecarReadMode::Data,
+                checkpoint_version: self.checkpoint_version.unwrap_or_default(),
+                num_files_requested: sidecar_files.len() as u64,
+                ..Default::default()
+            }
+            .meter_data_read(|| {
+                engine.parquet_handler().read_parquet_files(
+                    &sidecar_files,
+                    read_schema.clone(),
+                    meta_predicate,
+                )
+            })?
         } else {
             Box::new(std::iter::empty())
         };
@@ -1586,35 +1680,54 @@ impl LogSegment {
         &self,
         engine: &dyn Engine,
         checkpoint: &ParsedLogPath,
+        context: &CheckpointReadContext,
     ) -> KernelResult<Vec<FileMeta>> {
-        // Read checkpoint with just the sidecar column
-        let batches = match checkpoint.extension.as_str() {
-            "json" => engine.json_handler().read_json_files(
-                std::slice::from_ref(&checkpoint.location),
-                Self::sidecar_read_schema(),
-                None,
-            )?,
-            "parquet" => engine.parquet_handler().read_parquet_files(
-                std::slice::from_ref(&checkpoint.location),
-                Self::sidecar_read_schema(),
-                None,
-            )?,
+        let format = match checkpoint.extension.as_str() {
+            "json" => CheckpointReadFormat::Json,
+            "parquet" => CheckpointReadFormat::Parquet,
             _ => return Ok(vec![]),
         };
-
-        // Extract sidecar file references
+        let started = Instant::now();
         let mut visitor = SidecarVisitor::default();
-        for batch_result in batches {
-            let batch = batch_result?;
-            visitor.visit_rows_of(batch.as_ref())?;
+        let result: KernelResult<Vec<FileMeta>> = (|| {
+            let batches = match format {
+                CheckpointReadFormat::Json => engine.json_handler().read_json_files(
+                    std::slice::from_ref(&checkpoint.location),
+                    Self::sidecar_read_schema(),
+                    None,
+                )?,
+                _ => engine.parquet_handler().read_parquet_files(
+                    std::slice::from_ref(&checkpoint.location),
+                    Self::sidecar_read_schema(),
+                    None,
+                )?,
+            };
+            for batch_result in batches {
+                visitor.visit_rows_of(batch_result?.as_ref())?;
+            }
+            visitor
+                .sidecars
+                .iter()
+                .map(|sidecar| sidecar.to_filemeta(&self.log_root))
+                .try_collect()
+        })();
+        CheckpointInspectionCompleted {
+            operation_id: context.operation_id,
+            correlation_id: context.correlation_id.clone(),
+            mode: CheckpointInspectionMode::SidecarEnumeration,
+            format,
+            outcome: if result.is_ok() {
+                CheckpointReadOutcome::Success
+            } else {
+                CheckpointReadOutcome::Error
+            },
+            checkpoint_version: checkpoint.version,
+            checkpoint_size_bytes: checkpoint.location.size,
+            num_sidecars_observed: visitor.sidecars.len() as u64,
+            duration: started.elapsed(),
         }
-
-        // Convert to FileMeta
-        visitor
-            .sidecars
-            .iter()
-            .map(|sidecar| sidecar.to_filemeta(&self.log_root))
-            .try_collect()
+        .emit();
+        result
     }
 
     /// Creates a pruned LogSegment of only the commits and compactions in

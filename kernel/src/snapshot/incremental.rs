@@ -197,9 +197,11 @@ impl Snapshot {
             log_tail,
             requested_version,
             checkpoint_handling,
+            metric_context,
         )
-        .inspect_err(|_| emit_log_segment_load_failure(metric_context))?
-        {
+        .inspect_err(|_| {
+            emit_log_segment_load_failure(metric_context, segment_load_start.elapsed())
+        })? {
             NewSegment::Unchanged => {
                 // The builder reaches this branch without an effective target: neither an
                 // explicit version nor a catalog bound can contradict the latest claim.
@@ -269,10 +271,14 @@ impl Snapshot {
         let pm_start = std::time::Instant::now();
         let base_crc = combined_log_segment
             .pick_latest_base_crc(engine, existing_snapshot.base_crc())
-            .inspect_err(|_| emit_protocol_metadata_load_failure(metric_context))?;
+            .inspect_err(|_| {
+                emit_protocol_metadata_load_failure(metric_context, pm_start.elapsed())
+            })?;
         let crc_at_version = combined_log_segment
             .try_build_crc_within_budget(engine, base_crc.as_ref(), incremental_replay)
-            .inspect_err(|_| emit_protocol_metadata_load_failure(metric_context))?;
+            .inspect_err(|_| {
+                emit_protocol_metadata_load_failure(metric_context, pm_start.elapsed())
+            })?;
 
         let existing_table_config = existing_snapshot.table_configuration();
         let resolution = match &crc_at_version {
@@ -299,7 +305,9 @@ impl Snapshot {
                 combined_log_segment
                     .segment_after_version(existing_snapshot_version)
                     .read_protocol_metadata_opt(engine, newer_base)
-                    .inspect_err(|_| emit_protocol_metadata_load_failure(metric_context))?
+                    .inspect_err(|_| {
+                        emit_protocol_metadata_load_failure(metric_context, pm_start.elapsed())
+                    })?
             }
         };
         emit_protocol_metadata_load(metric_context, resolution.source, pm_start.elapsed());
@@ -348,6 +356,7 @@ impl Snapshot {
         log_tail: Vec<ParsedLogPath>,
         requested_version: Option<Version>,
         checkpoint_handling: CheckpointHandling,
+        metric_context: &SnapshotLoadMetricContext,
     ) -> KernelResult<NewSegment> {
         let log_root = existing_log_segment.log_root.clone();
         let storage = engine.storage_handler();
@@ -369,13 +378,14 @@ impl Snapshot {
             // No version can follow Version::MAX.
             return Ok(NewSegment::Unchanged);
         };
-        let new_listed_files = LogSegmentFiles::list_with_checkpoint_handling(
+        let new_listed_files = LogSegmentFiles::list_with_context(
             storage.as_ref(),
             &log_root,
             log_tail,
             Some(listing_start),
             requested_version,
             checkpoint_handling,
+            &crate::metrics::CheckpointReadContext::from(metric_context),
         )?;
 
         // NB: we need to check both checkpoints and commits since we filter commits at and below

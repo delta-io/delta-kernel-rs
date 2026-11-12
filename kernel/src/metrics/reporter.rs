@@ -15,6 +15,10 @@ use super::events::{
     ProtocolMetadataLoadSuccess, STORAGE_SPAN, ScanMetadataCompleted, SetTransactionLoadSuccess,
     SnapshotBuildSuccess, TransactionCommitSuccess, storage_metric_from_attrs,
 };
+use super::{
+    CheckpointDiscoveryCompleted, CheckpointHintReadCompleted, CheckpointInspectionCompleted,
+    CheckpointSidecarReadCompleted,
+};
 
 // ====================================================================
 // MetricsReporter trait + LoggingMetricsReporter
@@ -144,6 +148,26 @@ where
             ScanMetadataCompleted::SPAN_NAME => Some(MetricEvent::ScanMetadataCompleted(
                 ScanMetadataCompleted::from_attrs(attrs),
             )),
+            CheckpointDiscoveryCompleted::SPAN_NAME => {
+                Some(MetricEvent::CheckpointDiscoveryCompleted(
+                    CheckpointDiscoveryCompleted::from_attrs(attrs),
+                ))
+            }
+            CheckpointInspectionCompleted::SPAN_NAME => {
+                Some(MetricEvent::CheckpointInspectionCompleted(
+                    CheckpointInspectionCompleted::from_attrs(attrs),
+                ))
+            }
+            CheckpointHintReadCompleted::SPAN_NAME => {
+                Some(MetricEvent::CheckpointHintReadCompleted(
+                    CheckpointHintReadCompleted::from_attrs(attrs),
+                ))
+            }
+            CheckpointSidecarReadCompleted::SPAN_NAME => {
+                Some(MetricEvent::CheckpointSidecarReadCompleted(
+                    CheckpointSidecarReadCompleted::from_attrs(attrs),
+                ))
+            }
             STORAGE_SPAN => storage_metric_from_attrs(attrs),
             _ => None,
         };
@@ -322,7 +346,10 @@ mod tests {
     use tracing_subscriber::registry;
     use uuid::Uuid;
 
-    use crate::metrics::events::SNAPSHOT_COMPLETED_SPAN;
+    use crate::metrics::events::{
+        SNAPSHOT_COMPLETED_SPAN, SnapshotLoadMetricContext, emit_log_segment_load_failure,
+        emit_protocol_metadata_load_failure,
+    };
     use crate::metrics::{
         CheckpointWriteMode, CheckpointWriteOutcome, CheckpointWriteStats, MetricEvent,
         WithMetricsReporterLayer as _,
@@ -491,23 +518,50 @@ mod tests {
         );
     }
 
-    #[instrument(name = SNAPSHOT_COMPLETED_SPAN, fields(report, operation_id = %Uuid::new_v4()), err)]
-    fn failing_build() -> Result<(), Error> {
+    #[instrument(
+        name = SNAPSHOT_COMPLETED_SPAN,
+        skip_all,
+        fields(report, operation_id = %Uuid::new_v4()),
+        err
+    )]
+    fn failing_build(delay: Duration) -> Result<(), Error> {
+        std::thread::sleep(delay);
         Err(Error::other("boom"))
     }
 
     #[test]
-    fn instrument_err_event_still_flips_to_failure() {
+    fn instrument_err_event_reports_elapsed_failure_duration() {
         let reporter = Arc::new(CapturingReporter::default());
         let _guard = install_thread_local_metrics_reporter(reporter.clone());
-        let _ = failing_build();
-        assert!(
-            reporter
-                .events()
-                .iter()
-                .any(|e| matches!(e, MetricEvent::SnapshotBuildFailure(_))),
-            "#[instrument(err)] must flip the success event to its failure form via on_event"
-        );
+        let delay = Duration::from_millis(1);
+        let _ = failing_build(delay);
+        let events = reporter.events();
+        let [MetricEvent::SnapshotBuildFailure(event)] = events.as_slice() else {
+            panic!("expected a snapshot build failure; got: {events:?}");
+        };
+        assert!(event.duration >= delay);
+    }
+
+    #[rstest::rstest]
+    fn failure_emitters_preserve_operation_duration(#[values(0u64, 73)] duration_ns: u64) {
+        let reporter = Arc::new(CapturingReporter::default());
+        let _guard = install_thread_local_metrics_reporter(reporter.clone());
+        let context = SnapshotLoadMetricContext::for_test();
+        let duration = Duration::from_nanos(duration_ns);
+
+        emit_log_segment_load_failure(&context, duration);
+        emit_protocol_metadata_load_failure(&context, duration);
+
+        let events = reporter.events();
+        let [
+            MetricEvent::LogSegmentLoadFailure(segment),
+            MetricEvent::ProtocolMetadataLoadFailure(pm),
+        ] = events.as_slice()
+        else {
+            panic!("expected log-segment and protocol/metadata failures; got: {events:?}");
+        };
+        assert_eq!(segment.duration, duration);
+        assert_eq!(pm.duration, duration);
     }
 
     #[instrument(name = SNAPSHOT_COMPLETED_SPAN, fields(report, operation_id = %Uuid::new_v4()), ret)]

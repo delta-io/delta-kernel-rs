@@ -7,9 +7,9 @@
 //! [`FrameReporterLayer`] separately reports dynamic enter/exit notifications for tracing spans
 //! that opt in with [`ENABLE_CALL_FRAME_FIELD`]. It does not create or modify [`MetricEvent`]s.
 //!
-//! Each operation (Snapshot, Transaction, Scan) is assigned a unique operation ID ([`MetricId`])
-//! when it starts, and all subsequent events for that operation reference this ID.
-//! This allows reporters to correlate events and track operation lifecycles.
+//! Lifecycle reports carry an operation ID ([`MetricId`]) for correlating an operation's events.
+//! Lower-level checkpoint reports reuse existing operation and caller-supplied correlation context
+//! when available. Standalone reports leave that context absent instead of creating operation IDs.
 //!
 //! # Example: Implementing a Custom MetricsReporter
 //!
@@ -75,6 +75,7 @@
 //!
 //! [`Engine`]: crate::Engine
 
+mod checkpoint_read;
 pub(crate) mod events;
 mod frame_reporter;
 mod metered_engine;
@@ -87,6 +88,13 @@ mod streaming_metrics_iterator;
 
 use std::sync::Arc;
 
+pub(crate) use checkpoint_read::CheckpointReadContext;
+pub use checkpoint_read::{
+    CheckpointDiscoveryCompleted, CheckpointDiscoveryMode, CheckpointHintReadCompleted,
+    CheckpointHintReadOutcome, CheckpointInspectionCompleted, CheckpointInspectionMode,
+    CheckpointReadFormat, CheckpointReadOutcome, CheckpointSidecarReadCompleted,
+    CheckpointSidecarReadMode, CheckpointSidecarReadOutcome,
+};
 pub use events::{
     CheckpointWriteFailure, CheckpointWriteMode, CheckpointWriteOutcome, CheckpointWriteStats,
     CheckpointWriteSuccess, ChecksumWriteFailure, ChecksumWriteOutcome,

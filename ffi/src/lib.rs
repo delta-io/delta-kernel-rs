@@ -88,8 +88,9 @@ pub use snapshot::hint as snapshot_hint;
 pub use snapshot::{
     ExclusiveSnapshotBuilder, FfiIncrementalReplay, FfiSnapshotBuilder, free_snapshot_builder,
     get_snapshot_builder, get_snapshot_builder_from, snapshot_builder_build,
-    snapshot_builder_with_incremental_crc_replay, snapshot_builder_with_log_tail,
-    snapshot_builder_with_max_catalog_version, snapshot_builder_with_version,
+    snapshot_builder_with_correlation_id, snapshot_builder_with_incremental_crc_replay,
+    snapshot_builder_with_log_tail, snapshot_builder_with_max_catalog_version,
+    snapshot_builder_with_version,
 };
 
 #[cfg(test)]

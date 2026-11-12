@@ -525,7 +525,11 @@ pub(crate) fn timestamp_to_version(
 /// let timestamp = 1672531200000; // Milliseconds since epoch for 2023-01-01
 /// let commit = latest_version_as_of(&snapshot, &engine, timestamp, HistoryCommitType::Recreatable)?;
 /// ```
-#[tracing::instrument(skip(snapshot, engine), ret, fields(latest_version = snapshot.version(), table_root = %snapshot.table_root()))]
+#[tracing::instrument(
+    skip(snapshot, engine),
+    ret,
+    fields(enable_call_frame, latest_version = snapshot.version(), table_root = %snapshot.table_root())
+)]
 pub fn latest_version_as_of(
     snapshot: &Snapshot,
     engine: &dyn Engine,
@@ -566,7 +570,11 @@ pub fn latest_version_as_of(
 /// let timestamp = 1672531200000; // Milliseconds since epoch for 2023-01-01
 /// let commit = first_version_after(&snapshot, &engine, timestamp, HistoryCommitType::Recreatable)?;
 /// ```
-#[tracing::instrument(skip(snapshot, engine), ret, fields(latest_version = snapshot.version(), table_root = %snapshot.table_root()))]
+#[tracing::instrument(
+    skip(snapshot, engine),
+    ret,
+    fields(enable_call_frame, latest_version = snapshot.version(), table_root = %snapshot.table_root())
+)]
 pub fn first_version_after(
     snapshot: &Snapshot,
     engine: &dyn Engine,
@@ -874,7 +882,7 @@ pub enum HistoryCommitType {
 /// - [`DeltaError::Generic`] when the listing yields no commits and
 ///   `earliest_ratified_commit_version` is `Some(0)`, flagging a broken catalog-managed invariant
 ///   (ratified commit 0 with no published filesystem commit).
-#[tracing::instrument(skip(engine), err, ret)]
+#[tracing::instrument(skip(engine), err, ret, fields(enable_call_frame))]
 pub fn get_earliest_commit(
     engine: &dyn Engine,
     log_root: &Url,

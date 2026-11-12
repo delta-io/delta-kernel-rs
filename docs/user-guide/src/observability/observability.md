@@ -121,8 +121,8 @@ When a snapshot loads, you'll see output like:
 
 ## Metric events
 
-Every callback receives a `MetricEvent` enum value. Events fall into three
-categories: snapshot lifecycle, scan metadata, and storage/file I/O.
+Every callback receives a `MetricEvent` enum value. Events fall into four
+categories: snapshot lifecycle, checkpoint reads, scan metadata, and storage/file I/O.
 
 ### Snapshot lifecycle events
 
@@ -133,11 +133,23 @@ events from the same snapshot load together.
 | Event | Fields | What it measures |
 |-------|--------|------------------|
 | `LogSegmentLoadSuccess` | `operation_id`, `duration`, `num_commit_files`, `num_checkpoint_files`, `num_compaction_files`, `has_latest_crc_file` | Time to list and organize log files into a log segment. |
-| `LogSegmentLoadFailure` | `operation_id` | Log segment load failed. |
+| `LogSegmentLoadFailure` | `operation_id`, `duration` | Time spent before log segment loading failed. |
 | `ProtocolMetadataLoadSuccess` | `operation_id`, `duration` | Time to read protocol and metadata actions from the log. |
-| `ProtocolMetadataLoadFailure` | `operation_id` | Protocol/metadata load failed. |
+| `ProtocolMetadataLoadFailure` | `operation_id`, `duration` | Time spent before protocol/metadata loading failed. |
 | `SnapshotBuildSuccess` | `operation_id`, `version`, `duration` | End-to-end snapshot creation, including the table version that was loaded. |
-| `SnapshotBuildFailure` | `operation_id` | Snapshot creation failed. Use this to track error rates. |
+| `SnapshotBuildFailure` | `operation_id`, `duration` | Time spent before snapshot creation failed. |
+
+### Checkpoint read events
+
+To diagnose checkpoint discovery, use
+[`CheckpointDiscoveryCompleted`](https://docs.rs/delta_kernel/latest/delta_kernel/metrics/struct.CheckpointDiscoveryCompleted.html).
+It reports a forward listing or backward search, including listing attempts, entries examined,
+and the selected checkpoint version when one is found. A successful search can find no checkpoint.
+
+To diagnose checkpoint reads that inspect sidecar references, use
+[`CheckpointInspectionCompleted`](https://docs.rs/delta_kernel/latest/delta_kernel/metrics/struct.CheckpointInspectionCompleted.html).
+A probe can stop before reading all references, so its observed count isn't a total sidecar count.
+These reports include failed work and add no I/O. They are standalone reports without operation IDs.
 
 ### Scan metadata events
 
