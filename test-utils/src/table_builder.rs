@@ -83,7 +83,7 @@ use delta_kernel_default_engine::executor::tokio::{
 };
 use delta_kernel_default_engine::{DefaultEngine, DefaultEngineBuilder};
 
-use crate::log_compaction::write_compaction_fixture;
+use crate::log_compaction::write_compaction_from_commits;
 
 // ===========================================================================
 // Sweep constants
@@ -246,9 +246,10 @@ impl LogState {
         self
     }
 
-    /// Add inclusive compaction ranges, written before log cleanup.
+    /// Add inclusive compaction ranges.
     ///
     /// Returns the updated log state. Ranges may overlap, but must be distinct.
+    /// The builder writes compactions before cleanup because they require the original commits.
     ///
     /// # Panics
     /// Panics unless each range satisfies `start < end <= latest_version`, or on duplicates.
@@ -381,7 +382,7 @@ pub fn compaction_at_end() -> LogState {
     commits_only().with_compaction_ranges([(0, DEFAULT_SWEEP_LATEST_VERSION)])
 }
 
-/// Interior compactions with uncovered commits on either side.
+/// Compactions over `[2, 4]` and `[6, 8]`, with individual commits before, between, and after them.
 pub fn interior_compactions() -> LogState {
     commits_only().with_compaction_ranges([(2, 4), (6, 8)])
 }
@@ -1415,7 +1416,7 @@ impl TestTableBuilder {
         }
 
         for &(start, end) in &self.log_state.compactions {
-            write_compaction_fixture(table_root, store.as_ref(), start, end).await?;
+            write_compaction_from_commits(table_root, store.as_ref(), start, end).await?;
         }
 
         match hint_state {

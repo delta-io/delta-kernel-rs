@@ -323,7 +323,7 @@ impl ListingAccumulator {
             CompactedCommit { hi } if self.end_version.is_none_or(|end| hi <= end) => {
                 self.output.ascending_compaction_files.push(file);
             }
-            CompactedCommit { .. } => (),
+            CompactedCommit { .. } => (), // Failed the bounds check above
             ClassicCheckpoint | UuidCheckpoint | MultiPartCheckpoint { .. } => {
                 self.pending_checkpoint_parts.push(file)
             }

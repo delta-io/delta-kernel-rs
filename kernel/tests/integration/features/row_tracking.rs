@@ -20,7 +20,7 @@ use serde_json::{Deserializer, Value};
 use tempfile::{TempDir, tempdir};
 use test_utils::delta_kernel_default_engine::DefaultEngine;
 use test_utils::delta_kernel_default_engine::executor::tokio::TokioBackgroundExecutor;
-use test_utils::log_compaction::write_compaction_fixture;
+use test_utils::log_compaction::write_compaction_from_commits;
 use test_utils::table_builder::{FeatureSet, LogState, TestTableBuilder};
 use test_utils::{
     add_commit, assert_result_error_with_message, begin_transaction_with, collect_row_ids,
@@ -1364,7 +1364,7 @@ async fn test_read_row_tracking_metadata_stable_across_deletion_vector_update(
     txn.commit(engine.as_ref())?.unwrap_committed();
 
     if compact {
-        write_compaction_fixture(table_url.as_str(), store.as_ref(), 1, 2).await?;
+        write_compaction_from_commits(table_url.as_str(), store.as_ref(), 1, 2).await?;
     }
 
     let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
@@ -1677,7 +1677,7 @@ async fn test_read_row_ids_after_log_compaction() -> delta_kernel::Result<()> {
             .is_committed()
     );
 
-    write_compaction_fixture(table_url.as_str(), store.as_ref(), 0, 2).await?;
+    write_compaction_from_commits(table_url.as_str(), store.as_ref(), 0, 2).await?;
 
     // Load a fresh snapshot -- it should read Protocol and Metadata and file list from the
     // compaction file.

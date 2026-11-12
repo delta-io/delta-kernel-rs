@@ -1,4 +1,6 @@
 //! Reconciled JSON fixtures for testing compaction readers without enabling compaction writes.
+//!
+//! Reconciliation preserves JSON fields independently of kernel's writer and replay code.
 
 use std::collections::{BTreeMap, HashSet};
 
@@ -10,17 +12,18 @@ use url::Url;
 
 use crate::resolve_table_path;
 
-/// Materialize a compaction fixture from the inclusive original-commit range `start..=end`.
+/// Writes a log compaction from the original commits in `start..=end` and returns its URL.
 ///
-/// `table_root` is a directory URL backed by `store`. Returns the fixture's URL. Winning file,
-/// domain, and transaction actions are retained without expiration. This helper preserves JSON
-/// fields independently of kernel's writer and reconciliation code. It is for conventional log
-/// fixtures, not adaptiveMetadata histories requiring path normalization.
+/// `table_root` must be a directory URL backed by `store`, and `start < end`.
+/// Keeps the latest action per key without expiring removals, deleted domains, or transaction
+/// markers, so they still suppress state preceding the range. Omits `commitInfo` and `cdc`.
+///
+/// Use for conventional Delta logs; this helper does not normalize adaptiveMetadata paths.
 ///
 /// # Errors
 /// Returns an error for an invalid range, unavailable or malformed commits, duplicate action keys
 /// within a commit, unsupported action shapes, or storage failures.
-pub async fn write_compaction_fixture(
+pub async fn write_compaction_from_commits(
     table_root: impl AsRef<str>,
     store: &DynObjectStore,
     start: u64,
@@ -151,7 +154,7 @@ mod tests {
                 .join("\n"),
         )
         .await?;
-        let path = write_compaction_fixture("memory:///", &store, 0, 1).await?;
+        let path = write_compaction_from_commits("memory:///", &store, 0, 1).await?;
         let bytes = store
             .get(&Path::from_url_path(path.path())?)
             .await?
@@ -180,7 +183,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            write_compaction_fixture("memory:///", &store, 0, 1)
+            write_compaction_from_commits("memory:///", &store, 0, 1)
                 .await
                 .is_err()
         );
