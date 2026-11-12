@@ -565,8 +565,8 @@ impl LogSegment {
                 time_travel_version,
             )
         };
-        let log_segment =
-            build().inspect_err(|_| emit_log_segment_load_failure(&metric_context))?;
+        let log_segment = build()
+            .inspect_err(|_| emit_log_segment_load_failure(&metric_context, start.elapsed()))?;
 
         emit_log_segment_load(&metric_context, &log_segment, start.elapsed());
         Ok(log_segment)

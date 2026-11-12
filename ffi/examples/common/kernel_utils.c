@@ -428,6 +428,7 @@ void print_metric(MetricEvent event) {
     PM_SLICE(lslf, correlation_id);
     print_table_type(lslf.table_type);
     print_log_segment_load_type(lslf.load_type);
+    PM_U64(lslf, duration_ns);
     PM_END;
     return;
 
@@ -449,6 +450,7 @@ void print_metric(MetricEvent event) {
     PM_SLICE(pmlf, correlation_id);
     print_table_type(pmlf.table_type);
     print_log_segment_load_type(pmlf.load_type);
+    PM_U64(pmlf, duration_ns);
     PM_END;
     return;
 
@@ -471,6 +473,7 @@ void print_metric(MetricEvent event) {
     PM_SLICE(slf, correlation_id);
     print_table_type(slf.table_type);
     print_load_type(slf.load_type);
+    PM_U64(slf, duration_ns);
     PM_END;
     return;
 
