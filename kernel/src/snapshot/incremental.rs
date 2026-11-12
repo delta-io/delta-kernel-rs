@@ -197,6 +197,7 @@ impl Snapshot {
             log_tail,
             requested_version,
             checkpoint_handling,
+            metric_context,
         )
         .inspect_err(|_| {
             emit_log_segment_load_failure(metric_context, segment_load_start.elapsed())
@@ -355,6 +356,7 @@ impl Snapshot {
         log_tail: Vec<ParsedLogPath>,
         requested_version: Option<Version>,
         checkpoint_handling: CheckpointHandling,
+        metric_context: &SnapshotLoadMetricContext,
     ) -> KernelResult<NewSegment> {
         let log_root = existing_log_segment.log_root.clone();
         let storage = engine.storage_handler();
@@ -376,13 +378,14 @@ impl Snapshot {
             // No version can follow Version::MAX.
             return Ok(NewSegment::Unchanged);
         };
-        let new_listed_files = LogSegmentFiles::list_with_checkpoint_handling(
+        let new_listed_files = LogSegmentFiles::list_with_context(
             storage.as_ref(),
             &log_root,
             log_tail,
             Some(listing_start),
             requested_version,
             checkpoint_handling,
+            &crate::metrics::CheckpointReadContext::from(metric_context),
         )?;
 
         // NB: we need to check both checkpoints and commits since we filter commits at and below

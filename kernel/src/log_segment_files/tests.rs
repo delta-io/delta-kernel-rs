@@ -690,9 +690,14 @@ async fn backward_scan_single_checkpoint_cases(
 
     let reporter = Arc::new(CapturingReporter::default());
     let _guard = install_thread_local_metrics_reporter(reporter.clone());
-    let result =
-        LogSegmentFiles::list_with_backward_checkpoint_scan(&counter, &log_root, vec![], 1005)
-            .unwrap();
+    let result = LogSegmentFiles::list_with_backward_checkpoint_scan(
+        &counter,
+        &log_root,
+        vec![],
+        1005,
+        &crate::metrics::CheckpointReadContext::default(),
+    )
+    .unwrap();
 
     assert_eq!(counter.call_count(), expected_listings);
     let events = discovery_events(&reporter);
@@ -835,6 +840,7 @@ async fn backward_scan_multipart_checkpoint_cases(
         &log_root,
         vec![],
         end_version,
+        &crate::metrics::CheckpointReadContext::default(),
     )
     .unwrap();
 
@@ -887,6 +893,7 @@ async fn backward_scan_with_log_tail_derives_lower_bound_from_checkpoint() {
         &log_root,
         log_tail,
         10,
+        &crate::metrics::CheckpointReadContext::default(),
     )
     .unwrap();
 
@@ -937,6 +944,7 @@ async fn backward_scan_with_log_tail_starting_before_checkpoint() {
         &log_root,
         log_tail,
         8,
+        &crate::metrics::CheckpointReadContext::default(),
     )
     .unwrap();
 
@@ -979,6 +987,7 @@ async fn backward_scan_log_tail_defines_latest_version() {
         &log_root,
         log_tail,
         5,
+        &crate::metrics::CheckpointReadContext::default(),
     )
     .unwrap();
 
@@ -1065,8 +1074,14 @@ async fn test_zero_byte_compaction_skipped_commits_used(#[case] use_backward_sca
     let (storage, log_root) = create_storage_with_empty_files(log_files).await;
 
     let result = if use_backward_scan {
-        LogSegmentFiles::list_with_backward_checkpoint_scan(storage.as_ref(), &log_root, vec![], 4)
-            .unwrap()
+        LogSegmentFiles::list_with_backward_checkpoint_scan(
+            storage.as_ref(),
+            &log_root,
+            vec![],
+            4,
+            &crate::metrics::CheckpointReadContext::default(),
+        )
+        .unwrap()
     } else {
         LogSegmentFiles::list(storage.as_ref(), &log_root, vec![], Some(0), Some(4)).unwrap()
     };
@@ -1105,8 +1120,14 @@ async fn test_zero_byte_checkpoint_skipped_older_used(#[case] use_backward_scan:
     let (storage, log_root) = create_storage_with_empty_files(log_files).await;
 
     let result = if use_backward_scan {
-        LogSegmentFiles::list_with_backward_checkpoint_scan(storage.as_ref(), &log_root, vec![], 10)
-            .unwrap()
+        LogSegmentFiles::list_with_backward_checkpoint_scan(
+            storage.as_ref(),
+            &log_root,
+            vec![],
+            10,
+            &crate::metrics::CheckpointReadContext::default(),
+        )
+        .unwrap()
     } else {
         LogSegmentFiles::list(storage.as_ref(), &log_root, vec![], Some(0), Some(10)).unwrap()
     };
@@ -1157,9 +1178,14 @@ async fn test_zero_byte_checkpoint_backward_scan_crosses_windows() {
     let (storage, log_root) = create_storage_with_empty_files(log_files).await;
     let counter = CountingStorageHandler::new(storage);
 
-    let result =
-        LogSegmentFiles::list_with_backward_checkpoint_scan(&counter, &log_root, vec![], 1005)
-            .unwrap();
+    let result = LogSegmentFiles::list_with_backward_checkpoint_scan(
+        &counter,
+        &log_root,
+        vec![],
+        1005,
+        &crate::metrics::CheckpointReadContext::default(),
+    )
+    .unwrap();
 
     // Needed 2 windows because the 0-byte checkpoint at v1005 was skipped
     assert_eq!(counter.call_count(), 2);
@@ -1651,6 +1677,7 @@ async fn last_checkpoint_hint_applies_iff_it_names_the_selected_checkpoint(
         &log_root,
         vec![],
         None,
+        &crate::metrics::CheckpointReadContext::default(),
     )
     .unwrap();
 
@@ -1977,7 +2004,13 @@ fn discovery_failure_preserves_error_and_partial_progress(
     let reporter = Arc::new(CapturingReporter::default());
     let _guard = install_thread_local_metrics_reporter(reporter.clone());
     let result = if backward {
-        LogSegmentFiles::list_with_backward_checkpoint_scan(&storage, &root, vec![], 5)
+        LogSegmentFiles::list_with_backward_checkpoint_scan(
+            &storage,
+            &root,
+            vec![],
+            5,
+            &crate::metrics::CheckpointReadContext::default(),
+        )
     } else {
         LogSegmentFiles::list(&storage, &root, vec![], None, Some(5))
     };

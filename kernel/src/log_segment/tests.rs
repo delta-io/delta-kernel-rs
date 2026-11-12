@@ -1481,6 +1481,7 @@ async fn test_create_checkpoint_stream_returns_checkpoint_batches_as_is_if_schem
         None, // meta_predicate
         None, // stats_schema
         None, // partition_schema
+        &crate::metrics::CheckpointReadContext::default(),
     )?;
     let mut iter = checkpoint_result.actions;
 
@@ -1554,6 +1555,7 @@ async fn test_create_checkpoint_stream_returns_checkpoint_batches_if_checkpoint_
         None, // meta_predicate
         None, // stats_schema
         None, // partition_schema
+        &crate::metrics::CheckpointReadContext::default(),
     )?;
     let mut iter = checkpoint_result.actions;
 
@@ -1619,6 +1621,7 @@ async fn test_create_checkpoint_stream_reads_parquet_checkpoint_batch_without_si
         None, // meta_predicate
         None, // stats_schema
         None, // partition_schema
+        &crate::metrics::CheckpointReadContext::default(),
     )?;
     let mut iter = checkpoint_result.actions;
 
@@ -1881,6 +1884,7 @@ async fn test_create_checkpoint_stream_reads_json_checkpoint_batch_without_sidec
         None, // meta_predicate
         None, // stats_schema
         None, // partition_schema
+        &crate::metrics::CheckpointReadContext::default(),
     )?;
     let mut iter = checkpoint_result.actions;
 
@@ -1973,6 +1977,7 @@ async fn test_create_checkpoint_stream_reads_checkpoint_file_and_returns_sidecar
         None, // meta_predicate
         None, // stats_schema
         None, // partition_schema
+        &crate::metrics::CheckpointReadContext::default(),
     )?;
     let mut iter = checkpoint_result.actions;
 
@@ -3741,7 +3746,10 @@ async fn test_get_file_actions_schema_v1_parquet_with_hint(
 
     // Verify that get_file_actions_schema_and_sidecars returns appropriate schema based on hint
     // version
-    let (schema, sidecars) = log_segment.get_file_actions_schema_and_sidecars(&engine)?;
+    let (schema, sidecars) = log_segment.get_file_actions_schema_and_sidecars(
+        &engine,
+        &crate::metrics::CheckpointReadContext::default(),
+    )?;
     let schema = schema.expect("V1 checkpoint should yield a file actions schema");
     if expect_hint_schema_used {
         assert_eq!(schema, hint_schema, "should use hint when versions match");
@@ -3806,7 +3814,10 @@ async fn test_get_file_actions_schema_v2_identity_filter(
         }),
     )?;
 
-    let (schema, sidecars) = log_segment.get_file_actions_schema_and_sidecars(&engine)?;
+    let (schema, sidecars) = log_segment.get_file_actions_schema_and_sidecars(
+        &engine,
+        &crate::metrics::CheckpointReadContext::default(),
+    )?;
     let schema = schema.expect("leaf V2 checkpoint should yield a file actions schema");
     if identity_matches {
         assert_eq!(
@@ -3887,7 +3898,10 @@ async fn test_get_file_actions_schema_multi_part_v1(#[case] use_hint: bool) -> K
         }),
     )?;
 
-    let (schema, sidecars) = log_segment.get_file_actions_schema_and_sidecars(&engine)?;
+    let (schema, sidecars) = log_segment.get_file_actions_schema_and_sidecars(
+        &engine,
+        &crate::metrics::CheckpointReadContext::default(),
+    )?;
     let schema = schema.expect("Multi-part V1 should return file actions schema");
 
     // Verify stats_parsed is detectable in the returned schema.
@@ -4172,6 +4186,7 @@ async fn test_checkpoint_stream_resolves_stats_projection(
         None, // meta_predicate
         Some(&stats_schema),
         None, // partition_schema
+        &crate::metrics::CheckpointReadContext::default(),
     )?;
 
     assert_eq!(
@@ -4883,6 +4898,7 @@ async fn test_checkpoint_stream_sets_has_partition_values_parsed() -> KernelResu
         None, // meta_predicate
         None, // stats_schema
         Some(&partition_schema),
+        &crate::metrics::CheckpointReadContext::default(),
     )?;
 
     // Verify that checkpoint_info reports partitionValues_parsed as available
@@ -4947,6 +4963,7 @@ async fn test_checkpoint_stream_no_partition_values_parsed_when_incompatible() -
         None,
         None,
         Some(&partition_schema),
+        &crate::metrics::CheckpointReadContext::default(),
     )?;
 
     // Verify it's false
@@ -6262,7 +6279,11 @@ fn sidecar_enumeration_reports_outcome(
         token.cancel();
     }
     let engine = CancellableEngine::new(engine.as_ref(), token);
-    let result = segment.extract_sidecar_refs(&engine, checkpoint);
+    let result = segment.extract_sidecar_refs(
+        &engine,
+        checkpoint,
+        &crate::metrics::CheckpointReadContext::default(),
+    );
     let observed = if cancelled {
         assert!(matches!(result, Err(KernelError::Cancelled)));
         0
@@ -6348,7 +6369,11 @@ fn sidecar_enumeration_failure_reports_partial_progress_without_draining() -> Re
     ));
     let reporter = Arc::new(CapturingReporter::default());
     let _guard = install_thread_local_metrics_reporter(reporter.clone());
-    let result = segment.extract_sidecar_refs(&engine, checkpoint);
+    let result = segment.extract_sidecar_refs(
+        &engine,
+        checkpoint,
+        &crate::metrics::CheckpointReadContext::default(),
+    );
     assert!(matches!(result, Err(KernelError::Cancelled)));
     assert_eq!(pulled.load(Ordering::Relaxed), 2);
     let events: Vec<_> = reporter
@@ -6363,5 +6388,280 @@ fn sidecar_enumeration_failure_reports_partial_progress_without_draining() -> Re
     assert_eq!(events[0].mode, CheckpointInspectionMode::SidecarEnumeration);
     assert_eq!(events[0].outcome, CheckpointReadOutcome::Error);
     assert_eq!(events[0].num_sidecars_observed, 2);
+    Ok(())
+}
+
+#[rstest]
+#[case::corrupt_latest("{", None, true)]
+#[case::corrupt_time_travel("{", Some(0), true)]
+#[case::corrupt_terminal("{", None, false)]
+#[case::future_hint(r#"{"version":5,"size":1}"#, Some(0), true)]
+#[tokio::test]
+async fn hint_fallback_retains_operation_context_and_enclosing_outcome(
+    #[case] hint: &'static str,
+    #[case] version: Option<u64>,
+    #[case] has_log: bool,
+) {
+    let files = if has_log {
+        vec![delta_path_for_version(0, "json")]
+    } else {
+        vec![]
+    };
+    let (storage, root) = build_log_with_paths_and_checkpoint(&files, None).await;
+    storage
+        .put(
+            &root.join("_last_checkpoint").unwrap(),
+            bytes::Bytes::from_static(hint.as_bytes()),
+            true,
+        )
+        .unwrap();
+    let context = SnapshotLoadMetricContext {
+        operation_id: crate::metrics::MetricId::new(),
+        correlation_id: Some("snapshot-reader".into()),
+        ..SnapshotLoadMetricContext::for_test()
+    };
+    let reporter = Arc::new(CapturingReporter::default());
+    let _guard = install_thread_local_metrics_reporter(reporter.clone());
+    let result = LogSegment::for_snapshot(storage.as_ref(), root, vec![], version, context.clone());
+    assert_eq!(result.is_ok(), has_log);
+    let events = reporter.events();
+    let hint_reports: Vec<_> = events
+        .iter()
+        .filter_map(|event| match event {
+            MetricEvent::CheckpointHintReadCompleted(event) => Some(event),
+            _ => None,
+        })
+        .collect();
+    let [hint_report] = hint_reports.as_slice() else {
+        panic!("expected one hint report");
+    };
+    assert_eq!(
+        hint_report.outcome,
+        if hint == "{" {
+            crate::metrics::CheckpointHintReadOutcome::Invalid
+        } else {
+            crate::metrics::CheckpointHintReadOutcome::Parsed
+        }
+    );
+    assert_eq!(hint_report.operation_id, Some(context.operation_id));
+    assert_eq!(hint_report.correlation_id, context.correlation_id);
+    let discovery: Vec<_> = events
+        .iter()
+        .filter_map(|event| match event {
+            MetricEvent::CheckpointDiscoveryCompleted(event) => Some(event),
+            _ => None,
+        })
+        .collect();
+    let [discovery] = discovery.as_slice() else {
+        panic!("expected one discovery report");
+    };
+    assert_eq!(discovery.operation_id, Some(context.operation_id));
+    assert_eq!(discovery.correlation_id, context.correlation_id);
+    assert_eq!(
+        discovery.mode,
+        if version.is_some() {
+            crate::metrics::CheckpointDiscoveryMode::Backward
+        } else {
+            crate::metrics::CheckpointDiscoveryMode::Forward
+        }
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, MetricEvent::LogSegmentLoadFailure(_)))
+            .count(),
+        usize::from(!has_log)
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, MetricEvent::LogSegmentLoadSuccess(_)))
+            .count(),
+        usize::from(has_log)
+    );
+}
+
+struct SidecarReadFailureHandler {
+    inner: Arc<dyn ParquetHandler>,
+    failure: &'static str,
+    pulls: Arc<AtomicUsize>,
+}
+
+impl ParquetHandler for SidecarReadFailureHandler {
+    fn read_parquet_files(
+        &self,
+        files: &[FileMeta],
+        schema: SchemaRef,
+        predicate: Option<PredicateRef>,
+    ) -> KernelResult<FileDataReadResultIterator> {
+        if files
+            .iter()
+            .any(|file| file.location.path().contains("/_sidecars/"))
+        {
+            match self.failure {
+                "data_call" => return Err(KernelError::Cancelled),
+                "data_iterator" => {
+                    let pulls = self.pulls.clone();
+                    return Ok(Box::new(std::iter::from_fn(move || {
+                        pulls.fetch_add(1, Ordering::Relaxed);
+                        Some(Err(KernelError::Cancelled))
+                    })));
+                }
+                _ => {}
+            }
+        }
+        self.inner.read_parquet_files(files, schema, predicate)
+    }
+
+    fn read_parquet_footer(&self, file: &FileMeta) -> KernelResult<ParquetFooter> {
+        if self.failure == "footer" && file.location.path().contains("/_sidecars/") {
+            return Err(KernelError::Cancelled);
+        }
+        self.inner.read_parquet_footer(file)
+    }
+
+    fn write_parquet_file(
+        &self,
+        _location: Url,
+        _data: Box<dyn KernelResultIterator<Box<dyn EngineData>>>,
+    ) -> KernelResult<FileSize> {
+        panic!("sidecar reads must not write files");
+    }
+}
+
+#[rstest]
+#[case::footer("footer")]
+#[case::data_call("data_call")]
+#[case::data_iterator("data_iterator")]
+#[case::success("success")]
+#[case::early_drop("drop")]
+fn sidecar_content_reads_report_actual_outcome_once(#[case] failure: &'static str) -> Result<()> {
+    let (engine, snapshot, _tempdir) = load_test_table("v2-checkpoints-json-with-sidecars")?;
+    let pulls = Arc::new(AtomicUsize::new(0));
+    let handler = SidecarReadFailureHandler {
+        inner: engine.parquet_handler(),
+        failure,
+        pulls: pulls.clone(),
+    };
+    let engine = DelegatingEngine::new(engine).with_parquet_handler(Arc::new(handler));
+    let reporter = Arc::new(CapturingReporter::default());
+    let _guard = install_thread_local_metrics_reporter(reporter.clone());
+    let context = CheckpointReadContext {
+        correlation_id: Some("scan-reader".into()),
+        ..Default::default()
+    };
+    let result = snapshot.log_segment().create_checkpoint_stream(
+        &engine,
+        CHECKPOINT_READ_SCHEMA.clone(),
+        None,
+        None,
+        None,
+        &context,
+    );
+    match failure {
+        "footer" | "data_call" => assert!(matches!(result, Err(KernelError::Cancelled))),
+        "drop" => drop(result?),
+        _ => {
+            let result: KernelResult<Vec<_>> = result?.actions.collect();
+            assert_eq!(result.is_ok(), failure == "success");
+            if failure == "data_iterator" {
+                assert!(matches!(result, Err(KernelError::Cancelled)));
+            }
+        }
+    }
+    assert_eq!(
+        pulls.load(Ordering::Relaxed),
+        usize::from(failure == "data_iterator")
+    );
+    let reads: Vec<_> = reporter
+        .events()
+        .into_iter()
+        .filter_map(|event| match event {
+            MetricEvent::CheckpointSidecarReadCompleted(event) => Some(event),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(reads.len(), if failure == "footer" { 1 } else { 2 });
+    assert_eq!(reads[0].mode, CheckpointSidecarReadMode::Footer);
+    assert_eq!(
+        reads[0].outcome,
+        if failure == "footer" {
+            CheckpointSidecarReadOutcome::Error
+        } else {
+            CheckpointSidecarReadOutcome::Success
+        }
+    );
+    for event in &reads {
+        assert_eq!(event.operation_id, None);
+        assert_eq!(event.correlation_id, context.correlation_id);
+        assert_eq!(
+            Some(event.checkpoint_version),
+            snapshot.log_segment().checkpoint_version
+        );
+    }
+    if let Some(data) = reads.get(1) {
+        assert_eq!(data.mode, CheckpointSidecarReadMode::Data);
+        assert!(data.num_files_requested > 0);
+        assert_eq!(
+            data.outcome,
+            match failure {
+                "success" => CheckpointSidecarReadOutcome::Success,
+                "drop" => CheckpointSidecarReadOutcome::Incomplete,
+                _ => CheckpointSidecarReadOutcome::Error,
+            }
+        );
+    }
+    Ok(())
+}
+
+#[cfg(feature = "declarative-plans")]
+#[rstest]
+fn checkpoint_inspection_retains_scan_correlation(
+    #[values(false, true)] declarative: bool,
+) -> Result<()> {
+    let (engine, snapshot, _tempdir) = load_test_table("v2-checkpoints-json-with-sidecars")?;
+    let mut segment = snapshot.log_segment().clone();
+    segment.last_checkpoint_metadata = None;
+    let snapshot = Arc::new(crate::Snapshot::new(
+        segment,
+        snapshot.table_configuration().clone(),
+    )?);
+    let scan = snapshot
+        .scan_builder()
+        .with_correlation_id("scan-request")
+        .build()?;
+    let reporter = Arc::new(CapturingReporter::default());
+    let _guard = install_thread_local_metrics_reporter(reporter.clone());
+    if declarative {
+        assert!(
+            scan.declarative_metadata_scan_plan(engine.as_ref())?
+                .is_some()
+        );
+    } else {
+        for metadata in scan.scan_metadata(engine.as_ref())? {
+            metadata?;
+        }
+    }
+    let reports: Vec<_> = reporter
+        .events()
+        .into_iter()
+        .filter_map(|event| match event {
+            MetricEvent::CheckpointInspectionCompleted(event) => Some(event),
+            _ => None,
+        })
+        .collect();
+    let [report] = reports.as_slice() else {
+        panic!("expected one checkpoint inspection");
+    };
+    assert_eq!(report.operation_id, None);
+    assert_eq!(report.correlation_id.as_deref(), Some("scan-request"));
+    assert_eq!(
+        report.mode,
+        if declarative {
+            CheckpointInspectionMode::SidecarProbe
+        } else {
+            CheckpointInspectionMode::SidecarEnumeration
+        }
+    );
     Ok(())
 }

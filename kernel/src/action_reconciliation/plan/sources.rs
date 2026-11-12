@@ -282,7 +282,13 @@ mod tests {
         let snapshot = snapshot.checkpoint(&engine, Some(&spec))?.1;
         let checkpoint_shape = actions
             .live_adds
-            .then(|| CheckpointShape::try_new(engine.require_plan_executor()?.as_ref(), &snapshot))
+            .then(|| {
+                CheckpointShape::try_new(
+                    engine.require_plan_executor()?.as_ref(),
+                    &snapshot,
+                    &crate::metrics::CheckpointReadContext::default(),
+                )
+            })
             .transpose()?;
         let mut segment = snapshot.log_segment().clone();
         // V2 hints identify UUID-named manifests; Kernel's writer uses classic naming.

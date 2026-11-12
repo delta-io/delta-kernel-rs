@@ -22,8 +22,9 @@ use crate::engine_data::RowVisitor;
 use crate::expressions::col;
 use crate::log_segment::LogSegment;
 use crate::metrics::{
-    CheckpointInspectionCompleted, CheckpointInspectionMode, CheckpointReadFormat,
-    CheckpointReadOutcome,
+    CheckpointInspectionCompleted, CheckpointInspectionMode, CheckpointReadContext,
+    CheckpointReadFormat, CheckpointReadOutcome, CheckpointSidecarReadCompleted,
+    CheckpointSidecarReadMode, CheckpointSidecarReadOutcome,
 };
 use crate::plans::ir::nodes::FileType;
 use crate::plans::{Operation, PlanBuilder, PlanExecutor};
@@ -65,8 +66,9 @@ impl CheckpointShape {
     pub(crate) fn try_new(
         exec: &dyn PlanExecutor,
         snapshot: &Snapshot,
+        context: &CheckpointReadContext,
     ) -> KernelResult<CheckpointShape> {
-        Self::try_new_impl(exec, snapshot, false)
+        Self::try_new_impl(exec, snapshot, false, context)
     }
 
     /// Resolves `snapshot`'s checkpoint topology and retains the checkpoint leaf schema.
@@ -82,14 +84,16 @@ impl CheckpointShape {
     pub(crate) fn try_new_with_leaf_schema(
         exec: &dyn PlanExecutor,
         snapshot: &Snapshot,
+        context: &CheckpointReadContext,
     ) -> KernelResult<CheckpointShape> {
-        Self::try_new_impl(exec, snapshot, true)
+        Self::try_new_impl(exec, snapshot, true, context)
     }
 
     fn try_new_impl(
         exec: &dyn PlanExecutor,
         snapshot: &Snapshot,
         needs_leaf_schema: bool,
+        context: &CheckpointReadContext,
     ) -> KernelResult<CheckpointShape> {
         let segment = snapshot.log_segment();
 
@@ -115,6 +119,8 @@ impl CheckpointShape {
             root_checkpoint,
             file_type,
             needs_leaf_schema,
+            checkpoint_version,
+            context,
         )? {
             return Ok(shape);
         }
@@ -138,12 +144,15 @@ impl CheckpointShape {
                     file_type,
                     &segment.log_root,
                     checkpoint_version,
+                    context,
                 )? {
                     Some(sidecar) => Self::try_new_manifest(
                         exec,
                         sidecar,
                         needs_leaf_schema,
                         segment.checkpoint_hint_sidecar_file_schema(),
+                        checkpoint_version,
+                        context,
                     ),
                     None => Ok(Self::new_leaf(needs_leaf_schema.then_some(cp_schema))),
                 }
@@ -157,12 +166,15 @@ impl CheckpointShape {
                     file_type,
                     &segment.log_root,
                     checkpoint_version,
+                    context,
                 )? {
                     Some(sidecar) => Self::try_new_manifest(
                         exec,
                         sidecar,
                         needs_leaf_schema,
                         segment.checkpoint_hint_sidecar_file_schema(),
+                        checkpoint_version,
+                        context,
                     ),
                     None => Ok(Self::new_leaf(
                         needs_leaf_schema.then(|| CHECKPOINT_ACTIONS_SCHEMA_V2.clone()),
@@ -189,6 +201,8 @@ impl CheckpointShape {
         root_checkpoint: &FileMeta,
         file_type: FileType,
         needs_leaf_schema: bool,
+        checkpoint_version: u64,
+        context: &CheckpointReadContext,
     ) -> KernelResult<Option<CheckpointShape>> {
         match segment.checkpoint_hint_sidecars().map(Vec::as_slice) {
             Some([sidecar, ..]) => {
@@ -198,6 +212,8 @@ impl CheckpointShape {
                     sidecar_meta,
                     needs_leaf_schema,
                     segment.checkpoint_hint_sidecar_file_schema(),
+                    checkpoint_version,
+                    context,
                 )?;
                 Ok(Some(result))
             }
@@ -232,11 +248,31 @@ impl CheckpointShape {
         sidecar: FileMeta,
         needs_leaf_schema: bool,
         hint_sidecar_schema: Option<StructType>,
+        checkpoint_version: u64,
+        context: &CheckpointReadContext,
     ) -> KernelResult<CheckpointShape> {
         let leaf_checkpoint_schema = match (needs_leaf_schema, hint_sidecar_schema) {
             (false, _) => None,
             (true, Some(schema)) => Some(Arc::new(schema)),
-            (true, None) => Some(read_parquet_footer_schema(exec, sidecar)?),
+            (true, None) => {
+                let start = Instant::now();
+                let result = read_parquet_footer_schema(exec, sidecar);
+                CheckpointSidecarReadCompleted {
+                    operation_id: context.operation_id,
+                    correlation_id: context.correlation_id.clone(),
+                    mode: CheckpointSidecarReadMode::Footer,
+                    outcome: if result.is_ok() {
+                        CheckpointSidecarReadOutcome::Success
+                    } else {
+                        CheckpointSidecarReadOutcome::Error
+                    },
+                    checkpoint_version,
+                    num_files_requested: 1,
+                    duration: start.elapsed(),
+                }
+                .emit();
+                Some(result?)
+            }
         };
         Ok(CheckpointShape {
             checkpoint_type: CheckpointType::Manifest,
@@ -305,6 +341,7 @@ fn collect_single_sidecar(
     file_format: FileType,
     log_root: &Url,
     checkpoint_version: u64,
+    context: &CheckpointReadContext,
 ) -> KernelResult<Option<FileMeta>> {
     let started = Instant::now();
     let mut visitor = SidecarVisitor::default();
@@ -331,6 +368,8 @@ fn collect_single_sidecar(
         }
     })();
     CheckpointInspectionCompleted {
+        operation_id: context.operation_id,
+        correlation_id: context.correlation_id.clone(),
         mode: CheckpointInspectionMode::SidecarProbe,
         format: match file_format {
             FileType::Json => CheckpointReadFormat::Json,
@@ -429,7 +468,14 @@ mod tests {
         };
         let root = Url::parse("memory:///table/_delta_log/").unwrap();
         let file = FileMeta::new(root.join("checkpoint").unwrap(), 0, 123);
-        let result = collect_single_sidecar(&exec, &file, format, &root, 7);
+        let result = collect_single_sidecar(
+            &exec,
+            &file,
+            format,
+            &root,
+            7,
+            &CheckpointReadContext::default(),
+        );
         if fails {
             assert!(matches!(result, Err(KernelError::Cancelled)));
         } else {
@@ -557,9 +603,17 @@ mod tests {
         let stats_schema = expect_parsed.map(|_| probe_stats_schema());
 
         let shape = if stats_schema.is_some() {
-            CheckpointShape::try_new_with_leaf_schema(&exec, snapshot.as_ref())
+            CheckpointShape::try_new_with_leaf_schema(
+                &exec,
+                snapshot.as_ref(),
+                &crate::metrics::CheckpointReadContext::default(),
+            )
         } else {
-            CheckpointShape::try_new(&exec, snapshot.as_ref())
+            CheckpointShape::try_new(
+                &exec,
+                snapshot.as_ref(),
+                &crate::metrics::CheckpointReadContext::default(),
+            )
         }
         .unwrap();
         let parsed_stats_schema = stats_schema
@@ -631,6 +685,7 @@ mod tests {
         let shape = CheckpointShape::try_new_with_leaf_schema(
             &SyncPlanExecutor::default(),
             snapshot.as_ref(),
+            &crate::metrics::CheckpointReadContext::default(),
         )
         .unwrap();
 
@@ -657,6 +712,7 @@ mod tests {
         let shape = CheckpointShape::try_new_with_leaf_schema(
             &SyncPlanExecutor::default(),
             snapshot.as_ref(),
+            &crate::metrics::CheckpointReadContext::default(),
         )
         .unwrap();
 
@@ -680,9 +736,17 @@ mod tests {
         let exec = CountingExecutor::new();
 
         let shape = if needs_leaf_schema {
-            CheckpointShape::try_new_with_leaf_schema(&exec, snapshot.as_ref())
+            CheckpointShape::try_new_with_leaf_schema(
+                &exec,
+                snapshot.as_ref(),
+                &crate::metrics::CheckpointReadContext::default(),
+            )
         } else {
-            CheckpointShape::try_new(&exec, snapshot.as_ref())
+            CheckpointShape::try_new(
+                &exec,
+                snapshot.as_ref(),
+                &crate::metrics::CheckpointReadContext::default(),
+            )
         }
         .unwrap();
 
@@ -730,7 +794,12 @@ mod tests {
             .unwrap();
 
         let exec = CountingExecutor::new();
-        let shape = CheckpointShape::try_new_with_leaf_schema(&exec, snapshot.as_ref()).unwrap();
+        let shape = CheckpointShape::try_new_with_leaf_schema(
+            &exec,
+            snapshot.as_ref(),
+            &crate::metrics::CheckpointReadContext::default(),
+        )
+        .unwrap();
 
         assert_eq!(shape.checkpoint_type, CheckpointType::Manifest);
         assert!(
@@ -810,6 +879,8 @@ mod tests {
             root,
             file_type,
             needs_leaf_schema,
+            segment.checkpoint_version.unwrap(),
+            &CheckpointReadContext::default(),
         )
         .unwrap()
         .expect("an empty-sidecars hint must classify without falling through");
@@ -926,10 +997,17 @@ mod tests {
         let stats_schema = probe_stats_schema();
         let exec = CountingExecutor::new();
 
-        let shape =
-            CheckpointShape::from_v2_checkpoint_hint(&exec, &segment, root, file_type, true)
-                .unwrap()
-                .expect("a sidecar-listing hint must classify as a manifest");
+        let shape = CheckpointShape::from_v2_checkpoint_hint(
+            &exec,
+            &segment,
+            root,
+            file_type,
+            true,
+            segment.checkpoint_version.unwrap(),
+            &CheckpointReadContext::default(),
+        )
+        .unwrap()
+        .expect("a sidecar-listing hint must classify as a manifest");
 
         assert_eq!(shape.checkpoint_type, CheckpointType::Manifest);
         let parsed_stats_schema = shape.compatible_stats_parsed_schema(&stats_schema);
@@ -966,14 +1044,70 @@ mod tests {
         let hint_schema = segment
             .checkpoint_hint_sidecar_file_schema()
             .expect("table's hint carries the sidecar schema");
-        let footer_shape =
-            CheckpointShape::try_new_manifest(&exec, sidecar.clone(), true, None).unwrap();
-        let hinted =
-            CheckpointShape::try_new_manifest(&exec, sidecar, true, Some(hint_schema)).unwrap();
+        let footer_shape = CheckpointShape::try_new_manifest(
+            &exec,
+            sidecar.clone(),
+            true,
+            None,
+            0,
+            &CheckpointReadContext::default(),
+        )
+        .unwrap();
+        let hinted = CheckpointShape::try_new_manifest(
+            &exec,
+            sidecar,
+            true,
+            Some(hint_schema),
+            0,
+            &CheckpointReadContext::default(),
+        )
+        .unwrap();
 
         assert_eq!(
             hinted.leaf_checkpoint_schema, footer_shape.leaf_checkpoint_schema,
             "hint schema must match the footer schema"
         );
+    }
+    struct FailingFooterExecutor;
+
+    impl PlanExecutor for FailingFooterExecutor {
+        fn execute_op(&self, op: Operation) -> KernelResult<PlanResult> {
+            assert!(matches!(op, Operation::IoOperation(_)));
+            Err(KernelError::Cancelled)
+        }
+    }
+
+    #[test]
+    fn sidecar_footer_failure_retains_context_and_original_error() {
+        let reporter = Arc::new(CapturingReporter::default());
+        let _guard = install_thread_local_metrics_reporter(reporter.clone());
+        let context = CheckpointReadContext {
+            correlation_id: Some("scan-reader".into()),
+            ..Default::default()
+        };
+        let sidecar = FileMeta::new(
+            Url::parse("memory:///_delta_log/_sidecars/a.parquet").unwrap(),
+            0,
+            123,
+        );
+        let result = CheckpointShape::try_new_manifest(
+            &FailingFooterExecutor,
+            sidecar,
+            true,
+            None,
+            7,
+            &context,
+        );
+        assert!(matches!(result, Err(KernelError::Cancelled)));
+        let events = reporter.events();
+        let [MetricEvent::CheckpointSidecarReadCompleted(event)] = events.as_slice() else {
+            panic!("expected one sidecar footer report");
+        };
+        assert_eq!(event.mode, CheckpointSidecarReadMode::Footer);
+        assert_eq!(event.outcome, CheckpointSidecarReadOutcome::Error);
+        assert_eq!(event.checkpoint_version, 7);
+        assert_eq!(event.num_files_requested, 1);
+        assert_eq!(event.operation_id, None);
+        assert_eq!(event.correlation_id, context.correlation_id);
     }
 }

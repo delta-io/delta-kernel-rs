@@ -21,7 +21,8 @@ use url::Url;
 
 use crate::last_checkpoint_hint::LastCheckpointHint;
 use crate::metrics::{
-    CheckpointDiscoveryCompleted, CheckpointDiscoveryMode, CheckpointReadOutcome,
+    CheckpointDiscoveryCompleted, CheckpointDiscoveryMode, CheckpointReadContext,
+    CheckpointReadOutcome,
 };
 use crate::path::LogPathFileType::*;
 use crate::path::{
@@ -635,7 +636,7 @@ impl LogSegmentFiles {
     // - SortedCommitFiles: Vec<ParsedLogPath>, is_ascending: bool, end_version: Version
     // - CheckpointParts: Vec<ParsedLogPath>, checkpoint_version: Version (guarantee all same
     //   version)
-    #[instrument(name = "log.list", skip_all, fields(enable_call_frame, start = ?start_version, end = ?end_version), err)]
+    #[cfg(test)]
     pub(crate) fn list(
         storage: &dyn StorageHandler,
         log_root: &Url,
@@ -653,6 +654,7 @@ impl LogSegmentFiles {
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn list_with_checkpoint_handling(
         storage: &dyn StorageHandler,
         log_root: &Url,
@@ -660,6 +662,28 @@ impl LogSegmentFiles {
         start_version: Option<Version>,
         end_version: Option<Version>,
         checkpoint_handling: CheckpointHandling,
+    ) -> KernelResult<Self> {
+        Self::list_with_context(
+            storage,
+            log_root,
+            log_tail,
+            start_version,
+            end_version,
+            checkpoint_handling,
+            &CheckpointReadContext::default(),
+        )
+    }
+
+    #[instrument(name = "log.list", skip_all, fields(enable_call_frame, start = ?start_version, end = ?end_version), err)]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn list_with_context(
+        storage: &dyn StorageHandler,
+        log_root: &Url,
+        log_tail: Vec<ParsedLogPath>,
+        start_version: Option<Version>,
+        end_version: Option<Version>,
+        checkpoint_handling: CheckpointHandling,
+        context: &CheckpointReadContext,
     ) -> KernelResult<Self> {
         let start = start_version.unwrap_or(0);
         let end = end_version.unwrap_or(Version::MAX);
@@ -675,6 +699,8 @@ impl LogSegmentFiles {
         }
         let started = Instant::now();
         let mut report = CheckpointDiscoveryCompleted {
+            operation_id: context.operation_id,
+            correlation_id: context.correlation_id.clone(),
             mode: CheckpointDiscoveryMode::Forward,
             start_version: start,
             end_version,
@@ -719,13 +745,16 @@ impl LogSegmentFiles {
         log_root: &Url,
         log_tail: Vec<ParsedLogPath>,
         end_version: Option<Version>,
+        context: &CheckpointReadContext,
     ) -> KernelResult<Self> {
-        let listed_files = Self::list(
+        let listed_files = Self::list_with_context(
             storage,
             log_root,
             log_tail,
             Some(checkpoint_metadata.version),
             end_version,
+            CheckpointHandling::Adopt,
+            context,
         )?;
 
         let Some(latest_checkpoint) = listed_files.checkpoint_parts.last() else {
@@ -808,9 +837,12 @@ impl LogSegmentFiles {
         log_root: &Url,
         log_tail: Vec<ParsedLogPath>,
         end_version: Version,
+        context: &CheckpointReadContext,
     ) -> KernelResult<Self> {
         let started = Instant::now();
         let mut report = CheckpointDiscoveryCompleted {
+            operation_id: context.operation_id,
+            correlation_id: context.correlation_id.clone(),
             mode: CheckpointDiscoveryMode::Backward,
             start_version: end_version,
             end_version: Some(end_version),

@@ -3,6 +3,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Instant;
 
 use delta_kernel_derive::internal_api;
 use serde::{Deserialize, Serialize};
@@ -13,6 +14,9 @@ use url::Url;
 use crate::actions::CheckpointAction;
 use crate::actions::{
     CheckpointMetadata, DomainMetadata, Metadata, Protocol, SetTransaction, Sidecar,
+};
+use crate::metrics::{
+    CheckpointHintReadCompleted, CheckpointHintReadOutcome, CheckpointReadContext,
 };
 use crate::path::{CheckpointInstance, ParsedLogPath};
 use crate::schema::SchemaRef;
@@ -93,8 +97,8 @@ pub(crate) struct LastCheckpointHint {
 
 /// The checkpoint format recorded in a `_last_checkpoint` hint's `checkpointType` field.
 /// An unrecognized wire value deserializes to [`CheckpointType::Unknown`]
-/// rather than failing the parse, signaling `LastCheckpointHint::try_read` to drop the hint so
-/// the reader falls back to log replay.
+/// rather than failing the parse, signaling `LastCheckpointHint::try_read_with_context` to drop the
+/// hint so the reader falls back to log replay.
 #[cfg(feature = "adaptive-metadata-in-dev")]
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
 #[internal_api]
@@ -430,57 +434,76 @@ impl LastCheckpointHint {
         Ok(log_root.join(LAST_CHECKPOINT_FILE_NAME)?)
     }
 
-    /// Try reading the `_last_checkpoint` file.
-    ///
-    /// Note that we typically want to ignore a missing/invalid `_last_checkpoint` file without
-    /// failing the read. Thus, the semantics of this function are to return `None` if the file is
-    /// not found or is invalid JSON. Unexpected/unrecoverable errors are returned as `Err` case and
-    /// are assumed to cause failure.
-    // TODO(#1047): weird that we propagate FileNotFound as part of the iterator instead of top-
-    // level result coming from storage.read_files
+    /// Try reading the hint without an enclosing operation's metric context.
+    #[cfg(test)]
+    pub(crate) fn try_read(
+        storage: &dyn StorageHandler,
+        log_root: &Url,
+    ) -> KernelResult<Option<LastCheckpointHint>> {
+        Self::try_read_with_context(storage, log_root, &CheckpointReadContext::default())
+    }
+
+    /// Read the hint, ignoring missing or invalid data so log discovery can proceed.
+    /// Unexpected storage errors propagate to the caller.
     #[instrument(
         name = "last_checkpoint.read",
         skip_all,
         fields(enable_call_frame),
         err
     )]
-    pub(crate) fn try_read(
+    pub(crate) fn try_read_with_context(
         storage: &dyn StorageHandler,
         log_root: &Url,
+        context: &CheckpointReadContext,
     ) -> KernelResult<Option<LastCheckpointHint>> {
-        let file_path = Self::path(log_root)?;
-        match storage.read_files(vec![(file_path, None)])?.next() {
-            Some(Ok(data)) => {
-                let result = Self::from_bytes_with_oversized_fields_dropped(&data)
-                    .inspect_err(|e| warn!("invalid _last_checkpoint JSON: {e}"))
-                    .ok()
-                    // Kernel cannot tell which checkpoint a hint describes if its `checkpointType`
-                    // is unrecognized or its AMT fields are inconsistent. Such a hint is dropped so
-                    // the reader falls back to log replay.
-                    .filter(|_hint| {
-                        #[cfg(feature = "adaptive-metadata-in-dev")]
-                        if let Some(problem) = _hint.amt_fields_problem() {
-                            warn!(
-                                version = _hint.version,
-                                "_last_checkpoint {problem}; dropping"
-                            );
-                            return false;
+        let start = Instant::now();
+        let mut report = CheckpointHintReadCompleted {
+            operation_id: context.operation_id,
+            correlation_id: context.correlation_id.clone(),
+            ..Default::default()
+        };
+        let result = (|| {
+            let file_path = Self::path(log_root)?;
+            match storage.read_files(vec![(file_path, None)])?.next() {
+                Some(Ok(data)) => {
+                    let hint = match Self::from_bytes_with_oversized_fields_dropped(&data) {
+                        Ok(hint) => hint,
+                        Err(error) => {
+                            warn!("invalid _last_checkpoint JSON: {error}");
+                            report.outcome = CheckpointHintReadOutcome::Invalid;
+                            return Ok(None);
                         }
-                        true
-                    });
-                info!(hint = result.as_ref().map(|h| h.summary()));
-                Ok(result)
+                    };
+                    #[cfg(feature = "adaptive-metadata-in-dev")]
+                    if let Some(problem) = hint.amt_fields_problem() {
+                        warn!(
+                            version = hint.version,
+                            "_last_checkpoint {problem}; dropping"
+                        );
+                        report.outcome = CheckpointHintReadOutcome::Invalid;
+                        return Ok(None);
+                    }
+                    info!(hint = hint.summary());
+                    report.outcome = CheckpointHintReadOutcome::Parsed;
+                    report.checkpoint_version = Some(hint.version);
+                    Ok(Some(hint))
+                }
+                Some(Err(KernelError::FileNotFound(_))) => {
+                    info!("_last_checkpoint file not found");
+                    report.outcome = CheckpointHintReadOutcome::Missing;
+                    Ok(None)
+                }
+                Some(Err(err)) => Err(err),
+                None => {
+                    warn!("empty _last_checkpoint file");
+                    report.outcome = CheckpointHintReadOutcome::Empty;
+                    Ok(None)
+                }
             }
-            Some(Err(KernelError::FileNotFound(_))) => {
-                info!("_last_checkpoint file not found");
-                Ok(None)
-            }
-            Some(Err(err)) => Err(err),
-            None => {
-                warn!("empty _last_checkpoint file");
-                Ok(None)
-            }
-        }
+        })();
+        report.duration = start.elapsed();
+        report.emit();
+        result
     }
 
     /// Succinct summary string for logging purposes.
@@ -813,8 +836,24 @@ mod tests {
                 true,
             )
             .unwrap();
+        let reporter = Arc::new(crate::unit_test_utils::CapturingReporter::default());
+        let _guard =
+            crate::unit_test_utils::install_thread_local_metrics_reporter(reporter.clone());
         let hint = LastCheckpointHint::try_read(storage.as_ref(), &log_root).unwrap();
         assert_eq!(hint.is_some(), retained, "{json}");
+        let events = reporter.events();
+        let [crate::metrics::MetricEvent::CheckpointHintReadCompleted(event)] = events.as_slice()
+        else {
+            panic!("expected one hint report");
+        };
+        assert_eq!(
+            event.outcome,
+            if retained {
+                CheckpointHintReadOutcome::Parsed
+            } else {
+                CheckpointHintReadOutcome::Invalid
+            }
+        );
     }
 
     /// `AdaptiveMetadataTree` serializes to its wire string, but `Unknown` refuses to serialize --
@@ -1484,11 +1523,12 @@ mod tests {
         Ok(())
     }
 
-    /// A storage handler whose every method panics, so a test can prove an operation never touched
-    /// storage.
-    struct NoIoStorageHandler;
+    /// Returns one configured hint read and rejects unexpected storage calls.
+    struct HintReadStorageHandler {
+        input: &'static str,
+    }
 
-    impl StorageHandler for NoIoStorageHandler {
+    impl StorageHandler for HintReadStorageHandler {
         fn list_from(&self, _path: &Url) -> KernelResult<Box<dyn KernelResultIterator<FileMeta>>> {
             panic!("list_from should not be called");
         }
@@ -1496,7 +1536,20 @@ mod tests {
             &self,
             _files: Vec<crate::FileSlice>,
         ) -> KernelResult<Box<dyn KernelResultIterator<bytes::Bytes>>> {
-            panic!("read_files should not be called");
+            match self.input {
+                "untouched" => panic!("read_files should not be called"),
+                "call_error" => Err(KernelError::Cancelled),
+                "call_missing" => Err(KernelError::FileNotFound("hint".into())),
+                "empty" => Ok(Box::new(std::iter::empty())),
+                input => {
+                    let result = match input {
+                        "missing" => Err(KernelError::FileNotFound("hint".into())),
+                        "iterator_error" => Err(KernelError::Cancelled),
+                        data => Ok(bytes::Bytes::from_static(data.as_bytes())),
+                    };
+                    Ok(Box::new(std::iter::once(result)))
+                }
+            }
         }
         fn put(&self, _path: &Url, _data: bytes::Bytes, _overwrite: bool) -> KernelResult<()> {
             panic!("put should not be called");
@@ -1520,12 +1573,54 @@ mod tests {
     fn try_read_propagates_cancellation() {
         let log_root = Url::parse("memory:///_delta_log/").unwrap();
         let engine = DelegatingEngine::new(Arc::new(SyncEngine::new()))
-            .with_storage_handler(Arc::new(NoIoStorageHandler));
+            .with_storage_handler(Arc::new(HintReadStorageHandler { input: "untouched" }));
         let engine = CancellableEngine::new(
             &engine,
             Arc::new(crate::unit_test_utils::TestCancellationToken::cancelled()),
         );
         let result = LastCheckpointHint::try_read(engine.storage_handler().as_ref(), &log_root);
         assert!(matches!(result, Err(KernelError::Cancelled)));
+    }
+    #[rstest]
+    #[case::parsed(r#"{"version":0,"size":1}"#, CheckpointHintReadOutcome::Parsed, false)]
+    #[case::missing("missing", CheckpointHintReadOutcome::Missing, false)]
+    #[case::empty("empty", CheckpointHintReadOutcome::Empty, false)]
+    #[case::invalid("{", CheckpointHintReadOutcome::Invalid, false)]
+    #[case::empty_bytes("", CheckpointHintReadOutcome::Invalid, false)]
+    #[case::call_error("call_error", CheckpointHintReadOutcome::Error, true)]
+    #[case::call_missing("call_missing", CheckpointHintReadOutcome::Error, true)]
+    #[case::iterator_error("iterator_error", CheckpointHintReadOutcome::Error, true)]
+    fn hint_read_reports_fallback_or_error(
+        #[case] input: &'static str,
+        #[case] expected: CheckpointHintReadOutcome,
+        #[case] fails: bool,
+        #[values(false, true)] has_context: bool,
+    ) {
+        let reporter = Arc::new(crate::unit_test_utils::CapturingReporter::default());
+        let _guard =
+            crate::unit_test_utils::install_thread_local_metrics_reporter(reporter.clone());
+        let context = CheckpointReadContext {
+            operation_id: has_context.then(crate::metrics::MetricId::new),
+            correlation_id: has_context.then(|| Arc::<str>::from("hint-reader")),
+        };
+        let result = LastCheckpointHint::try_read_with_context(
+            &HintReadStorageHandler { input },
+            &Url::parse("memory:///_delta_log/").unwrap(),
+            &context,
+        );
+        assert_eq!(result.is_err(), fails);
+        let version = (expected == CheckpointHintReadOutcome::Parsed).then_some(0);
+        if !fails {
+            assert_eq!(result.unwrap().map(|hint| hint.version), version);
+        }
+        let events = reporter.events();
+        let [crate::metrics::MetricEvent::CheckpointHintReadCompleted(event)] = events.as_slice()
+        else {
+            panic!("expected one hint read report");
+        };
+        assert_eq!(event.outcome, expected);
+        assert_eq!(event.checkpoint_version, version);
+        assert_eq!(event.operation_id, context.operation_id);
+        assert_eq!(event.correlation_id, context.correlation_id);
     }
 }

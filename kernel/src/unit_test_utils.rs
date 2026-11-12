@@ -120,7 +120,9 @@ pub(crate) fn is_io_event(event: &MetricEvent) -> bool {
         | MetricEvent::ChecksumWriteFailure(_)
         | MetricEvent::ScanMetadataCompleted(_)
         | MetricEvent::CheckpointDiscoveryCompleted(_)
-        | MetricEvent::CheckpointInspectionCompleted(_) => false,
+        | MetricEvent::CheckpointInspectionCompleted(_)
+        | MetricEvent::CheckpointHintReadCompleted(_)
+        | MetricEvent::CheckpointSidecarReadCompleted(_) => false,
     }
 }
 
