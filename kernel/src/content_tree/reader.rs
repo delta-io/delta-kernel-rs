@@ -27,16 +27,18 @@ use crate::content_tree::dv_conversion::{add_deletion_vector_expression, check_d
 use crate::content_tree::mumbling::MumblingBitmap;
 use crate::content_tree::stats::{parsed_stats_expression, projected_stats_schema};
 use crate::content_tree::{
-    AMT_FORMAT_VERSION, COLUMN_FILES, CONTENT_TYPE, ContentTreeNodeEntry, DV_INFO_COLUMNS,
-    DataContentType, DataFileFormat, FILE_FORMAT, FILE_SIZE_IN_BYTES, FIRST_ROW_ID, FORMAT_VERSION,
-    LOCATION, MANIFEST_DV, MANIFEST_INFO, MODIFIED_SNAPSHOT_ID, PARTITION_SPEC_ID, RECORD_COUNT,
-    SEQUENCE_NUMBER, TAGS, TRACKING, TRACKING_COLUMNS, TRACKING_STATUS, TrackingInfo,
-    TrackingStatus, struct_expr_from_schema,
+    AMT_FORMAT_VERSION, COLUMN_FILES, CONTENT_TYPE, ColumnFile, ContentTreeNodeEntry,
+    DV_INFO_COLUMNS, DataContentType, DataFileFormat, FILE_FORMAT, FILE_SIZE_IN_BYTES,
+    FIRST_ROW_ID, FORMAT_VERSION, LOCATION, MANIFEST_DV, MANIFEST_INFO, MODIFIED_SNAPSHOT_ID,
+    PARTITION_SPEC_ID, RECORD_COUNT, SEQUENCE_NUMBER, TAGS, TRACKING, TRACKING_COLUMNS,
+    TRACKING_STATUS, TrackingInfo, TrackingStatus, struct_expr_from_schema,
 };
-use crate::engine_data::{EngineData, GetData, RowVisitor, TypedGetData as _, filter_by_predicate};
+use crate::engine_data::{
+    EngineData, GetData, RowVisitor, StructList, TypedGetData as _, filter_by_predicate,
+};
 use crate::expressions::{
     ArrayData, ColumnName, Expression, ExpressionRef, MapData, Predicate, PredicateRef, Scalar,
-    UnaryExpressionOp, expr, lit, null_lit,
+    expr, lit, null_lit,
 };
 use crate::scan::data_skipping::DataSkippingFilter;
 use crate::scan::log_replay::{
@@ -480,9 +482,6 @@ const PARENT_SEQUENCE_NUMBER_COLUMN: &str = "_parentSequenceNumber";
 /// Column holding whether an entry becomes an `Add` (see [`selected_predicate`]).
 const SELECTED_COLUMN: &str = "_selected";
 
-/// Column holding whether an entry has column files (see [`has_column_files_predicate`]).
-const HAS_COLUMN_FILES_COLUMN: &str = "_hasColumnFiles";
-
 /// What a leaf's entries take from the root `DataManifest` entry referencing the leaf, appended to
 /// each entry batch as the [`REMOVED_COLUMN`] and [`PARENT_SEQUENCE_NUMBER_COLUMN`] columns. A root
 /// manifest has no parent.
@@ -541,8 +540,7 @@ struct EntryTransform {
     read_schema: SchemaRef,
     /// [`Self::read_schema`] followed by the [`ParentColumns`].
     marked_schema: SchemaRef,
-    /// Appends [`SELECTED_COLUMN`] and [`HAS_COLUMN_FILES_COLUMN`] to a batch with the
-    /// [`ParentColumns`].
+    /// Appends [`SELECTED_COLUMN`] to a batch with the [`ParentColumns`].
     annotator: Arc<dyn ExpressionEvaluator>,
     /// Keeps the rows of a batch whose [`SELECTED_COLUMN`] is true.
     selection_filter: Arc<dyn PredicateEvaluator>,
@@ -561,10 +559,6 @@ impl EntryTransform {
             .append(
                 StructField::nullable(SELECTED_COLUMN, DataType::BOOLEAN),
                 Expression::from(selected_predicate()),
-            )
-            .append(
-                StructField::not_null(HAS_COLUMN_FILES_COLUMN, DataType::BOOLEAN),
-                Expression::from(has_column_files_predicate()),
             )
             .build()?;
         let annotator = handler.new_expression_evaluator(
@@ -608,9 +602,9 @@ impl EntryTransform {
         )
     }
 
-    /// Appends the [`ParentColumns`] (via `marker`, the manifest's [`Self::marker`]),
-    /// [`SELECTED_COLUMN`], and [`HAS_COLUMN_FILES_COLUMN`] to an entry batch read with
-    /// [`Self::read_schema`], producing the input of [`Self::convert`].
+    /// Appends the [`ParentColumns`] (via `marker`, the manifest's [`Self::marker`]) and
+    /// [`SELECTED_COLUMN`] to an entry batch read with [`Self::read_schema`], producing the input
+    /// of [`Self::convert`].
     fn annotate(
         &self,
         marker: &dyn ExpressionEvaluator,
@@ -953,16 +947,6 @@ fn selected_predicate() -> Predicate {
     ])
 }
 
-/// The entries whose `columnFiles` list is non-empty. A null or empty list carries no column
-/// updates, so the result is never null.
-fn has_column_files_predicate() -> Predicate {
-    let count = Expression::unary(
-        UnaryExpressionOp::Cardinality,
-        Expression::column([COLUMN_FILES]),
-    );
-    Expression::coalesce([count, lit(0)]).gt(lit(0))
-}
-
 /// Validates each leaf entry and resolves its `firstRowId`, starting from `seed`. Returns the
 /// per-row values and the next unassigned row ID. `first_position` is the number of the leaf's
 /// entries in earlier batches, the `_row_index` the batch's first entry must have.
@@ -1088,7 +1072,7 @@ impl RowVisitor for AddSelectionVisitor {
                 ColumnName::new([FILE_FORMAT]),
                 ColumnName::new([PARTITION_SPEC_ID]),
                 ColumnName::new([TRACKING, MODIFIED_SNAPSHOT_ID]),
-                ColumnName::new([HAS_COLUMN_FILES_COLUMN]),
+                ColumnName::new([COLUMN_FILES]),
                 ColumnName::new([SELECTED_COLUMN]),
             ];
             let types: [DataType; ADD_SELECTION_DV_START] = [
@@ -1098,7 +1082,7 @@ impl RowVisitor for AddSelectionVisitor {
                 DataType::STRING,
                 DataType::INTEGER,
                 DataType::LONG,
-                DataType::BOOLEAN,
+                ArrayType::new(ColumnFile::to_schema(), false).into(),
                 DataType::BOOLEAN,
             ];
             let (dv_names, dv_types) = DV_INFO_COLUMNS.as_ref();
@@ -1122,7 +1106,7 @@ impl RowVisitor for AddSelectionVisitor {
             }
             if content_type == DataContentType::DataManifest
                 && status.is_live()
-                && getters[6].get(row, HAS_COLUMN_FILES_COLUMN)?
+                && has_column_files(getters[6].get_struct_list(row, COLUMN_FILES)?)?
             {
                 return Err(KernelError::unsupported(format!(
                     "AMT read path does not yet support column files on a leaf manifest; \
@@ -1246,7 +1230,7 @@ fn check_selected_entry<'a>(
              unrecognized modification (entry '{location}' has non-null '{field}')"
         ))
     };
-    if getters[6].get(row, HAS_COLUMN_FILES_COLUMN)? {
+    if has_column_files(getters[6].get_struct_list(row, COLUMN_FILES)?)? {
         return Err(unsupported_modification(COLUMN_FILES));
     }
     // A modification is the only reason to set `modifiedSnapshotId`, and a deletion vector is the
@@ -1257,6 +1241,35 @@ fn check_selected_entry<'a>(
         return Err(unsupported_modification(MODIFIED_SNAPSHOT_ID));
     }
     Ok(())
+}
+
+/// Whether `column_files` holds at least one column file: an empty list carries no column updates.
+fn has_column_files(column_files: Option<StructList<'_>>) -> KernelResult<bool> {
+    let Some(column_files) = column_files else {
+        return Ok(false);
+    };
+    let mut counter = ColumnFileCounter::default();
+    column_files.visit_with(&mut counter)?;
+    Ok(counter.count > 0)
+}
+
+/// Counts the elements of a [`ColumnFile`] list; see [`has_column_files`].
+#[derive(Default)]
+struct ColumnFileCounter {
+    count: usize,
+}
+
+impl RowVisitor for ColumnFileCounter {
+    fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
+        static NAMES_AND_TYPES: LazyLock<ColumnNamesAndTypes> =
+            LazyLock::new(|| (vec![ColumnName::new([LOCATION])], vec![DataType::STRING]).into());
+        NAMES_AND_TYPES.as_ref()
+    }
+
+    fn visit<'a>(&mut self, row_count: usize, _: &[&'a dyn GetData<'a>]) -> KernelResult<()> {
+        self.count += row_count;
+        Ok(())
+    }
 }
 
 /// Visitor behind [`validate_and_assign_first_row_ids`].
@@ -1419,8 +1432,8 @@ mod tests {
         x_stats, x_upper_bound_stats,
     };
     use crate::content_tree::{
-        ColumnFile, DeletionVectorInfo, LOWER_BOUND, ManifestInfo, NAN_VALUE_COUNT,
-        NULL_VALUE_COUNT, UPPER_BOUND, VALUE_COUNT,
+        DeletionVectorInfo, LOWER_BOUND, ManifestInfo, NAN_VALUE_COUNT, NULL_VALUE_COUNT,
+        UPPER_BOUND, VALUE_COUNT,
     };
     use crate::engine::DelegatingEngine;
     use crate::engine::arrow_conversion::TryFromArrow as _;
