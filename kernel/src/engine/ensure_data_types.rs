@@ -288,8 +288,6 @@ fn check_cast_compat(
         (Int32, Int64 | Float64) => Ok(DataTypeCompat::NeedsCast(target_type)),
         (Float32, Float64) => Ok(DataTypeCompat::NeedsCast(target_type)),
         (_, Decimal128(p, s)) if can_upcast_to_decimal(source_type, *p, *s) => {
-            // Decimal bounds returned by `decimal_stat_as` in
-            // `engine/parquet_row_group_skipping.rs` must agree with this upcast.
             Ok(DataTypeCompat::NeedsCast(target_type))
         }
         (Date32, Timestamp(_, None)) => Ok(DataTypeCompat::NeedsCast(target_type)),
@@ -315,6 +313,17 @@ fn can_upcast_to_decimal(
     target_precision: u8,
     target_scale: i8,
 ) -> bool {
+    decimal_upcast_factor(source_type, target_precision, target_scale).is_some()
+}
+
+/// Multiplier that widens unscaled values of `source_type` to a decimal of `target_precision` and
+/// `target_scale` without loss of information, or `None` when `check_cast_compat` rejects that
+/// cast. Row group skipping applies it to footer bounds so pruning agrees with the reader.
+pub(crate) fn decimal_upcast_factor(
+    source_type: &ArrowDataType,
+    target_precision: u8,
+    target_scale: i8,
+) -> Option<i128> {
     use ArrowDataType::*;
 
     let (source_precision, source_scale) = match source_type {
@@ -324,12 +333,14 @@ fn can_upcast_to_decimal(
         Int16 => (5u8, 0i8),
         Int32 => (10u8, 0i8),
         Int64 => (20u8, 0i8),
-        _ => return false,
+        _ => return None,
     };
 
-    target_precision >= source_precision
-        && target_scale >= source_scale
-        && target_precision - source_precision >= (target_scale - source_scale) as u8
+    let scale_increase = u8::try_from(target_scale.checked_sub(source_scale)?).ok()?;
+    if target_precision < source_precision || target_precision - source_precision < scale_increase {
+        return None;
+    }
+    10i128.checked_pow(scale_increase.into())
 }
 
 impl PartialEq<String> for MetadataValue {

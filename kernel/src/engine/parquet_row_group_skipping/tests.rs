@@ -10,11 +10,12 @@ use super::*;
 use crate::arrow::array::{
     ArrayRef, AsArray, Decimal128Array, Int64Array, RecordBatch, StringArray, StructArray,
 };
-use crate::arrow::compute::cast;
+use crate::arrow::compute::{CastOptions, cast, cast_with_options};
 use crate::arrow::datatypes::{
-    DataType as ArrowDataType, Field, Fields, Schema as ArrowSchema, TimeUnit as ArrowTimeUnit,
-    TimestampMicrosecondType,
+    DataType as ArrowDataType, Decimal128Type, Field, Fields, Schema as ArrowSchema,
+    TimeUnit as ArrowTimeUnit, TimestampMicrosecondType,
 };
+use crate::engine::ensure_data_types::{ValidationMode, ensure_data_types};
 use crate::engine::reader_options;
 use crate::expressions::{
     Expression, OpaquePredicateOp, ScalarExpressionEvaluator, col, column_name, column_pred, expr,
@@ -671,7 +672,7 @@ fn decimal_row_group_skipping_rescales_footer_scale(
             .column_type(),
         physical_type
     );
-    let bound = lit(Scalar::decimal(bound, 12, 4).unwrap());
+    let bound = lit(Scalar::decimal(bound, 22, 4).unwrap());
     assert_partition_filters_keep(bytes, &col_path, comparison, bound, expected_rows);
 }
 
@@ -898,31 +899,41 @@ fn timestamp_footer_stats_respect_annotations(
 #[case::logical_decimal(
     Some(LogicalType::decimal(2, 9)),
     ConvertedType::DECIMAL,
+    1_050,
     Some(105_000)
 )]
-#[case::legacy_decimal(None, ConvertedType::DECIMAL, Some(105_000))]
-#[case::unannotated(None, ConvertedType::NONE, Some(10_500_000))]
+#[case::legacy_decimal(None, ConvertedType::DECIMAL, 1_050, Some(105_000))]
+#[case::unannotated(None, ConvertedType::NONE, 1_050, Some(10_500_000))]
 #[case::logical_signed_integer(
     Some(LogicalType::integer(8, true)),
     ConvertedType::INT_8,
-    Some(10_500_000)
+    105,
+    Some(1_050_000)
 )]
-#[case::legacy_signed_integer(None, ConvertedType::INT_16, Some(10_500_000))]
+#[case::negative_logical_signed_integer(
+    Some(LogicalType::integer(8, true)),
+    ConvertedType::INT_8,
+    -105,
+    Some(-1_050_000)
+)]
+#[case::legacy_signed_integer(None, ConvertedType::INT_16, 1_050, Some(10_500_000))]
 #[case::logical_unsigned_integer(
     Some(LogicalType::integer(32, false)),
     ConvertedType::UINT_32,
+    1_050,
     None
 )]
-#[case::legacy_unsigned_integer(None, ConvertedType::UINT_32, None)]
-#[case::logical_date(Some(LogicalType::Date), ConvertedType::DATE, None)]
-#[case::legacy_date(None, ConvertedType::DATE, None)]
+#[case::legacy_unsigned_integer(None, ConvertedType::UINT_32, 1_050, None)]
+#[case::logical_date(Some(LogicalType::Date), ConvertedType::DATE, 1_050, None)]
+#[case::legacy_date(None, ConvertedType::DATE, 1_050, None)]
 fn decimal_footer_stats_respect_annotations(
     #[case] logical_type: Option<LogicalType>,
     #[case] converted_type: ConvertedType,
+    #[case] value: i32,
     #[case] expected: Option<i128>,
 ) {
     let decimal = (converted_type == ConvertedType::DECIMAL).then_some((9, 2));
-    let stats = Statistics::int32(Some(1_050), Some(1_050), None, Some(0), false);
+    let stats = Statistics::int32(Some(value), Some(value), None, Some(0), false);
     let column = annotated_chunk(
         PhysicalType::INT32,
         logical_type,
@@ -930,8 +941,8 @@ fn decimal_footer_stats_respect_annotations(
         decimal,
         stats,
     );
-    let data_type = DataType::decimal(12, 4).unwrap();
-    let expected = expected.map(|bits| Scalar::decimal(bits, 12, 4).unwrap());
+    let data_type = DataType::decimal(14, 4).unwrap();
+    let expected = expected.map(|bits| Scalar::decimal(bits, 14, 4).unwrap());
     assert_eq!(extract_min_scalar(&data_type, &column), expected.clone());
     assert_eq!(extract_max_scalar(&data_type, &column), expected);
 }
@@ -940,18 +951,33 @@ fn decimal_footer_stats_respect_annotations(
 #[case::decimal(
     Some(LogicalType::decimal(2, 20)),
     ConvertedType::DECIMAL,
+    16,
     false,
     Some(105_000)
 )]
-#[case::deprecated_bounds(Some(LogicalType::decimal(2, 20)), ConvertedType::DECIMAL, true, None)]
-#[case::unannotated(None, ConvertedType::NONE, false, None)]
+#[case::deprecated_bounds(
+    Some(LogicalType::decimal(2, 20)),
+    ConvertedType::DECIMAL,
+    16,
+    true,
+    None
+)]
+#[case::truncated_bounds(
+    Some(LogicalType::decimal(2, 20)),
+    ConvertedType::DECIMAL,
+    8,
+    false,
+    None
+)]
+#[case::unannotated(None, ConvertedType::NONE, 16, false, None)]
 fn decimal_fixed_len_byte_array_footer_stats_respect_annotations(
     #[case] logical_type: Option<LogicalType>,
     #[case] converted_type: ConvertedType,
+    #[case] width: usize,
     #[case] deprecated: bool,
     #[case] expected: Option<i128>,
 ) {
-    let bytes = FixedLenByteArray::from(1_050i128.to_be_bytes().to_vec());
+    let bytes = FixedLenByteArray::from(1_050i128.to_be_bytes()[16 - width..].to_vec());
     let stats = Statistics::fixed_len_byte_array(
         Some(bytes.clone()),
         Some(bytes),
@@ -975,27 +1001,77 @@ fn decimal_fixed_len_byte_array_footer_stats_respect_annotations(
 
 #[rstest]
 #[case::zero(0, Some(0))]
-#[case::exceeds_precision(1, None)]
-#[case::rescale_overflow(2, None)]
-#[case::negative_rescale_overflow(i32::MIN, None)]
+#[case::fits(1, Some(10i128.pow(37)))]
+#[case::exceeds_precision(10, None)]
+#[case::rescale_overflow(i128::MAX, None)]
+#[case::negative_rescale_overflow(i128::MIN, None)]
 fn decimal_footer_stats_reject_values_that_do_not_fit_target(
-    #[case] value: i32,
+    #[case] value: i128,
     #[case] expected: Option<i128>,
 ) {
-    let stats = Statistics::int32(Some(value), Some(value), None, Some(0), false);
-    let column = annotated_chunk(PhysicalType::INT32, None, ConvertedType::NONE, None, stats);
-    let data_type = DataType::decimal(38, 38).unwrap();
-    let expected = expected.map(|bits| Scalar::decimal(bits, 38, 38).unwrap());
+    let bytes = FixedLenByteArray::from(value.to_be_bytes().to_vec());
+    let stats =
+        Statistics::fixed_len_byte_array(Some(bytes.clone()), Some(bytes), None, Some(0), false);
+    let column = annotated_chunk(
+        PhysicalType::FIXED_LEN_BYTE_ARRAY,
+        Some(LogicalType::decimal(0, 1)),
+        ConvertedType::DECIMAL,
+        Some((1, 0)),
+        stats,
+    );
+    let data_type = DataType::decimal(38, 37).unwrap();
+    let expected = expected.map(|bits| Scalar::decimal(bits, 38, 37).unwrap());
     assert_eq!(extract_min_scalar(&data_type, &column), expected.clone());
     assert_eq!(extract_max_scalar(&data_type, &column), expected);
 }
 
+#[rstest]
+fn decimal_footer_stats_match_reader_cast(
+    #[values(
+        ArrowDataType::Int8,
+        ArrowDataType::Int16,
+        ArrowDataType::Int32,
+        ArrowDataType::Int64,
+        ArrowDataType::Decimal128(9, 2),
+        ArrowDataType::Decimal128(18, 2),
+        ArrowDataType::Decimal128(20, 2)
+    )]
+    source_type: ArrowDataType,
+    #[values(4, 5, 10, 12, 14, 20, 22, 38)] precision: u8,
+    #[values(0, 1, 2, 4)] scale: u8,
+) {
+    let source = cast(&Int64Array::from(vec![-105, 105]), &source_type).unwrap();
+    let builder = parquet_reader(write_row_groups(&["d"], [source.clone()]));
+    let column = builder.metadata().row_group(0).column(0);
+    let target = DataType::decimal(precision, scale).unwrap();
+    let expected = match ensure_data_types(&target, &source_type, ValidationMode::TypesOnly) {
+        Ok(_) => {
+            let opts = CastOptions {
+                safe: false,
+                ..Default::default()
+            };
+            let widened = cast_with_options(
+                &source,
+                &ArrowDataType::Decimal128(precision, scale as i8),
+                &opts,
+            )
+            .unwrap();
+            let widened = widened.as_primitive::<Decimal128Type>();
+            let bound = |i| Some(Scalar::decimal(widened.value(i), precision, scale).unwrap());
+            (bound(0), bound(1))
+        }
+        Err(_) => (None, None),
+    };
+    assert_eq!(extract_min_scalar(&target, column), expected.0);
+    assert_eq!(extract_max_scalar(&target, column), expected.1);
+}
+
 #[test]
 fn test_decimal_bits_from_bytes_sign_extends_negative_stats() {
-    // Parquet stores decimal statistics as minimal-width big-endian two's-complement byte
-    // arrays, so a negative value occupies fewer than 16 bytes. Decoding must sign-extend the
-    // high bytes; zero-padding turns a negative stat into a large positive one, which makes
-    // row-group skipping prune groups that actually contain matching rows.
+    // FIXED_LEN_BYTE_ARRAY decimal statistics are `type_length`-wide big-endian two's-complement
+    // byte arrays, so a negative value usually occupies fewer than 16 bytes. Decoding must
+    // sign-extend the high bytes; zero-padding turns a negative stat into a large positive one,
+    // which makes row-group skipping prune groups that actually contain matching rows.
 
     // -1 unscaled, one byte: 0xFF.
     assert_eq!(decimal_bits_from_bytes(&[0xFF]), Some(-1));
@@ -1003,7 +1079,7 @@ fn test_decimal_bits_from_bytes_sign_extends_negative_stats() {
     // -256 unscaled, two bytes: 0xFF00.
     assert_eq!(decimal_bits_from_bytes(&[0xFF, 0x00]), Some(-256));
 
-    // Positive minimal-width values must stay correct.
+    // Positive values must stay correct.
     assert_eq!(decimal_bits_from_bytes(&[0x01]), Some(1));
 
     // Empty slice: no most-significant byte, treated as non-negative, decodes to 0.

@@ -1,20 +1,26 @@
 //! An implementation of parquet row group skipping using data skipping predicates over footer
 //! stats.
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use chrono::{DateTime, Days};
 use delta_kernel_derive::internal_api;
 use tracing::trace;
 
 use crate::actions::{MAX_VALUES, MIN_VALUES, NULL_COUNT};
+use crate::arrow::datatypes::DataType as ArrowDataType;
 use crate::engine::arrow_utils::RowIndexBuilder;
+use crate::engine::ensure_data_types::decimal_upcast_factor;
 use crate::expressions::{ColumnName, DecimalData, Predicate, Scalar};
 use crate::kernel_predicates::parquet_stats_skipping::ParquetStatsProvider;
 use crate::parquet::arrow::arrow_reader::ArrowReaderBuilder;
-use crate::parquet::basic::{ConvertedType, LogicalType, TimeUnit, Type as PhysicalType};
+use crate::parquet::arrow::parquet_to_arrow_schema;
+use crate::parquet::basic::{ConvertedType, LogicalType, TimeUnit};
 use crate::parquet::file::metadata::{ColumnChunkMetaData, RowGroupMetaData};
 use crate::parquet::file::statistics::Statistics;
-use crate::parquet::schema::types::{ColumnDescPtr, ColumnDescriptor};
+use crate::parquet::schema::types::{
+    ColumnDescPtr, ColumnDescriptor, SchemaDescriptor, Type as ParquetType,
+};
 use crate::schema::{DataType, DecimalType, PrimitiveType};
 
 #[cfg(test)]
@@ -213,7 +219,8 @@ fn extract_min_scalar(data_type: &DataType, column: &ColumnChunkMetaData) -> Opt
         (TimestampNtz, _) => return None, // TODO: Int96 timestamps
         (IntervalYearMonth(_) | IntervalDayTime(_), _) => return None,
         (Decimal(d), stats) => {
-            decimal_stat_as(decimal_min_bits(stats)?, column.column_descr(), *d)?
+            let column = column.column_descr();
+            decimal_stat_as(decimal_min_bits(stats, column)?, column, *d)?
         }
         // Void columns have no Parquet representation, so no stats exist
         (Void, _) => return None,
@@ -267,7 +274,8 @@ fn extract_max_scalar(data_type: &DataType, column: &ColumnChunkMetaData) -> Opt
         (TimestampNtz, _) => return None, // TODO: Int96 timestamps
         (IntervalYearMonth(_) | IntervalDayTime(_), _) => return None,
         (Decimal(d), stats) => {
-            decimal_stat_as(decimal_max_bits(stats)?, column.column_descr(), *d)?
+            let column = column.column_descr();
+            decimal_stat_as(decimal_max_bits(stats, column)?, column, *d)?
         }
         // Void columns have no Parquet representation, so no stats exist
         (Void, _) => return None,
@@ -287,70 +295,68 @@ fn extract_nullcount(stats: Option<&Statistics>) -> Option<i64> {
 /// Unscaled minimum of a decimal column chunk from its INT32, INT64 or FIXED_LEN_BYTE_ARRAY stats.
 ///
 /// Legacy `min`/`max` footer fields are rejected for FIXED_LEN_BYTE_ARRAY: writers filled them
-/// using byte-wise comparison, which is not numeric order for multi-byte two's complement.
-fn decimal_min_bits(stats: &Statistics) -> Option<i128> {
+/// using byte-wise comparison, which is not numeric order for multi-byte two's complement. So are
+/// bounds narrower than the column's `type_length`, whose sign extension would change the value.
+fn decimal_min_bits(stats: &Statistics, column: &ColumnDescriptor) -> Option<i128> {
     Some(match stats {
         Statistics::Int32(s) => (*s.min_opt()?).into(),
         Statistics::Int64(s) => (*s.min_opt()?).into(),
         Statistics::FixedLenByteArray(s) if !stats.is_min_max_deprecated() => {
-            decimal_bits_from_bytes(s.min_bytes_opt()?)?
+            fixed_len_decimal_bits(s.min_bytes_opt()?, column)?
         }
         _ => return None,
     })
 }
 
 /// Unscaled maximum of a decimal column chunk; see [`decimal_min_bits`].
-fn decimal_max_bits(stats: &Statistics) -> Option<i128> {
+fn decimal_max_bits(stats: &Statistics, column: &ColumnDescriptor) -> Option<i128> {
     Some(match stats {
         Statistics::Int32(s) => (*s.max_opt()?).into(),
         Statistics::Int64(s) => (*s.max_opt()?).into(),
         Statistics::FixedLenByteArray(s) if !stats.is_min_max_deprecated() => {
-            decimal_bits_from_bytes(s.max_bytes_opt()?)?
+            fixed_len_decimal_bits(s.max_bytes_opt()?, column)?
         }
         _ => return None,
     })
 }
 
-/// Widens an unscaled footer bound from the column's Parquet scale to `target`, using the same
-/// value-preserving multiply as the reader cast admitted by `can_upcast_to_decimal` in
-/// `engine/ensure_data_types.rs`. Returns `None` for a column that is not readable as a decimal, a
-/// narrower target scale, an overflow, or a value exceeding `target`'s precision, so that bound
-/// cannot justify skipping a row group.
+fn fixed_len_decimal_bits(bytes: &[u8], column: &ColumnDescriptor) -> Option<i128> {
+    if bytes.len() != usize::try_from(column.type_length()).ok()? {
+        return None;
+    }
+    decimal_bits_from_bytes(bytes)
+}
+
+/// Widens an unscaled footer bound to `target` with the multiplier the reader cast applies, so a
+/// bound exists exactly when `ensure_data_types` admits decoding the column as `target`. Returns
+/// `None` when the reader would reject that cast or the value exceeds `target`'s precision, so
+/// the bound cannot justify skipping a row group.
 fn decimal_stat_as(bits: i128, column: &ColumnDescriptor, target: DecimalType) -> Option<Scalar> {
-    let scale_increase = target.scale().checked_sub(parquet_decimal_scale(column)?)?;
-    let factor = 10i128.checked_pow(scale_increase.into())?;
+    let source = reader_arrow_type(column)?;
+    let target_scale = i8::try_from(target.scale()).ok()?;
+    let factor = decimal_upcast_factor(&source, target.precision(), target_scale)?;
     let bits = bits.checked_mul(factor)?;
     DecimalData::try_new(bits, target).ok().map(Scalar::Decimal)
 }
 
-/// Scale of the values parquet-rs decodes for this column when it is read as a decimal, derived
-/// from the same annotations the reader uses: DECIMAL annotations carry their own scale, signed
-/// and unannotated INT32/INT64 are integers the reader casts by value (scale 0), and any other
-/// column is not readable as a decimal.
-fn parquet_decimal_scale(column: &ColumnDescriptor) -> Option<u8> {
-    let scale = match column.logical_type_ref() {
-        Some(LogicalType::Decimal(decimal)) => decimal.scale,
-        Some(LogicalType::Integer(int)) if int.is_signed => 0,
-        Some(_) => return None,
-        None => {
-            use ConvertedType::*;
-            match (column.converted_type(), column.physical_type()) {
-                (DECIMAL, _) => column.type_scale(),
-                (NONE, PhysicalType::INT32 | PhysicalType::INT64) => 0,
-                (INT_8 | INT_16 | INT_32 | INT_64, _) => 0,
-                _ => return None,
-            }
-        }
-    };
-    u8::try_from(scale).ok()
+/// Arrow type parquet-rs decodes this column to, derived from the same Parquet annotations the
+/// reader uses under [`crate::engine::reader_options`].
+fn reader_arrow_type(column: &ColumnDescriptor) -> Option<ArrowDataType> {
+    let root = ParquetType::group_type_builder("schema")
+        .with_fields(vec![column.self_type_ptr()])
+        .build()
+        .ok()?;
+    let schema = parquet_to_arrow_schema(&SchemaDescriptor::new(Arc::new(root)), None).ok()?;
+    Some(schema.field(0).data_type().clone())
 }
 
 fn decimal_bits_from_bytes(bytes: &[u8]) -> Option<i128> {
-    // Statistics are a minimal-width big-endian two's-complement integer. Sign-extend to
-    // 16 bytes on the stack (no heap alloc) and copy in as little-endian: fill with 0xFF
-    // when the sign bit of the most-significant (first, big-endian) byte is set, else 0x00.
-    // Zero-padding a negative value would decode it as a large positive i128 and wrongly
-    // prune row groups. `(b >> 7) * 0xFF` sets the fill without a data-dependent branch.
+    // Bounds are a big-endian two's-complement integer of at most 16 bytes; FIXED_LEN_BYTE_ARRAY
+    // bounds are `type_length` wide, which callers check. Sign-extend to 16 bytes on the stack
+    // (no heap alloc) and copy in as little-endian: fill with 0xFF when the sign bit of the
+    // most-significant (first, big-endian) byte is set, else 0x00. Zero-padding a negative value
+    // would decode it as a large positive i128 and wrongly prune row groups. `(b >> 7) * 0xFF`
+    // sets the fill without a data-dependent branch.
     if bytes.len() > 16 {
         return None;
     }
