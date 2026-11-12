@@ -4,6 +4,7 @@ use delta_kernel::engine_data::FilteredEngineData;
 
 use super::committed::commit_result_to_committed_handle;
 use super::*;
+use crate::delta_types::{FfiStringArray, FfiStringMap};
 
 /// A handle for an update-table transaction (`Transaction<UpdateTable>`).
 ///
@@ -352,6 +353,50 @@ pub unsafe extern "C" fn update_table_txn_builder_set_nullable(
     let engine = unsafe { engine.as_ref() };
     let result = unsafe { column.try_to_column_name() }
         .map(|column| Box::new(builder.set_nullable(column)).into());
+    unsafe { result.into_extern_result(&engine) }
+}
+
+/// Replaces requested table-property additions with a borrowed string map.
+///
+/// Copies keys and values before returning a replacement builder. Returns decoding errors here;
+/// property and final-state validation runs at build.
+///
+/// # Safety
+///
+/// All handles and nested string slices must be valid for this call. Borrows `properties` and
+/// `engine`, and unconditionally consumes `builder`, including on errors.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn update_table_txn_builder_with_table_properties_added(
+    builder: Handle<ExclusiveUpdateTableTransactionBuilder>,
+    properties: &FfiStringMap,
+    engine: Handle<SharedExternEngine>,
+) -> ExternResult<Handle<ExclusiveUpdateTableTransactionBuilder>> {
+    let builder = unsafe { *builder.into_inner() };
+    let engine = unsafe { engine.as_ref() };
+    let result = unsafe { properties.try_to_hash_map() }
+        .map(|properties| Box::new(builder.with_table_properties_added(properties)).into());
+    unsafe { result.into_extern_result(&engine) }
+}
+
+/// Replaces requested table-property removals with a borrowed string array.
+///
+/// Copies keys before returning a replacement builder, or a decoding error. Build rejects Delta
+/// property removals and overlap with additions. An absent ordinary key is a successful no-op.
+///
+/// # Safety
+///
+/// All handles and nested string slices must be valid for this call. Borrows `keys` and `engine`
+/// and unconditionally consumes `builder`, including on errors.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn update_table_txn_builder_with_table_properties_removed(
+    builder: Handle<ExclusiveUpdateTableTransactionBuilder>,
+    keys: &FfiStringArray,
+    engine: Handle<SharedExternEngine>,
+) -> ExternResult<Handle<ExclusiveUpdateTableTransactionBuilder>> {
+    let builder = unsafe { *builder.into_inner() };
+    let engine = unsafe { engine.as_ref() };
+    let result = unsafe { keys.try_to_strings() }
+        .map(|keys| Box::new(builder.with_table_properties_removed(keys)).into());
     unsafe { result.into_extern_result(&engine) }
 }
 
