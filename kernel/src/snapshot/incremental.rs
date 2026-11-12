@@ -297,6 +297,8 @@ impl Snapshot {
                 let newer_base = base_crc
                     .as_ref()
                     .filter(|c| c.version > existing_snapshot_version);
+                // TODO(#3421): Classify missing replay-file failures as Delta errors using the
+                // incremental replay context, preserving the original error sources.
                 combined_log_segment
                     .segment_after_version(existing_snapshot_version)
                     .read_protocol_metadata_opt(engine, newer_base)
