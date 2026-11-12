@@ -220,7 +220,11 @@ fn extract_min_scalar(data_type: &DataType, column: &ColumnChunkMetaData) -> Opt
         (IntervalYearMonth(_) | IntervalDayTime(_), _) => return None,
         (Decimal(d), stats) => {
             let column = column.column_descr();
-            decimal_stat_as(decimal_min_bits(stats, column)?, column, *d)?
+            decimal_stat_as(
+                decimal_unscaled(stats, column, DecimalBound::Min)?,
+                column,
+                *d,
+            )?
         }
         // Void columns have no Parquet representation, so no stats exist
         (Void, _) => return None,
@@ -275,7 +279,11 @@ fn extract_max_scalar(data_type: &DataType, column: &ColumnChunkMetaData) -> Opt
         (IntervalYearMonth(_) | IntervalDayTime(_), _) => return None,
         (Decimal(d), stats) => {
             let column = column.column_descr();
-            decimal_stat_as(decimal_max_bits(stats, column)?, column, *d)?
+            decimal_stat_as(
+                decimal_unscaled(stats, column, DecimalBound::Max)?,
+                column,
+                *d,
+            )?
         }
         // Void columns have no Parquet representation, so no stats exist
         (Void, _) => return None,
@@ -292,29 +300,33 @@ fn extract_nullcount(stats: Option<&Statistics>) -> Option<i64> {
     Some(stats?.null_count_opt()? as i64)
 }
 
-/// Unscaled minimum of a decimal column chunk from its INT32, INT64 or FIXED_LEN_BYTE_ARRAY stats.
-///
-/// Legacy `min`/`max` footer fields are rejected for FIXED_LEN_BYTE_ARRAY: writers filled them
-/// using byte-wise comparison, which is not numeric order for multi-byte two's complement. So are
-/// bounds narrower than the column's `type_length`, whose sign extension would change the value.
-fn decimal_min_bits(stats: &Statistics, column: &ColumnDescriptor) -> Option<i128> {
-    Some(match stats {
-        Statistics::Int32(s) => (*s.min_opt()?).into(),
-        Statistics::Int64(s) => (*s.min_opt()?).into(),
-        Statistics::FixedLenByteArray(s) if !stats.is_min_max_deprecated() => {
-            fixed_len_decimal_bits(s.min_bytes_opt()?, column)?
-        }
-        _ => return None,
-    })
+enum DecimalBound {
+    Min,
+    Max,
 }
 
-/// Unscaled maximum of a decimal column chunk; see [`decimal_min_bits`].
-fn decimal_max_bits(stats: &Statistics, column: &ColumnDescriptor) -> Option<i128> {
-    Some(match stats {
-        Statistics::Int32(s) => (*s.max_opt()?).into(),
-        Statistics::Int64(s) => (*s.max_opt()?).into(),
-        Statistics::FixedLenByteArray(s) if !stats.is_min_max_deprecated() => {
-            fixed_len_decimal_bits(s.max_bytes_opt()?, column)?
+/// Unscaled bound of a decimal column chunk from its INT32, INT64 or FIXED_LEN_BYTE_ARRAY stats.
+///
+/// Legacy `min`/`max` footer fields are rejected for FIXED_LEN_BYTE_ARRAY: writers filled them
+/// using byte-wise comparison, which is not numeric order for multi-byte two's complement.
+/// Bounds must match the column's `type_length` so a truncated value cannot be sign-extended
+/// to a different number.
+fn decimal_unscaled(
+    stats: &Statistics,
+    column: &ColumnDescriptor,
+    bound: DecimalBound,
+) -> Option<i128> {
+    Some(match (stats, bound) {
+        (Statistics::Int32(s), DecimalBound::Min) => (*s.min_opt()?).into(),
+        (Statistics::Int32(s), DecimalBound::Max) => (*s.max_opt()?).into(),
+        (Statistics::Int64(s), DecimalBound::Min) => (*s.min_opt()?).into(),
+        (Statistics::Int64(s), DecimalBound::Max) => (*s.max_opt()?).into(),
+        (Statistics::FixedLenByteArray(s), bound) if !stats.is_min_max_deprecated() => {
+            let bytes = match bound {
+                DecimalBound::Min => s.min_bytes_opt()?,
+                DecimalBound::Max => s.max_bytes_opt()?,
+            };
+            fixed_len_decimal_bits(bytes, column)?
         }
         _ => return None,
     })
