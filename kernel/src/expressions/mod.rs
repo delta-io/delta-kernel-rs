@@ -18,7 +18,7 @@ pub use self::column_names::{
 pub use self::macros::expr;
 pub(crate) use self::scalars::MONTHS_PER_YEAR;
 pub use self::scalars::{
-    ArrayData, DecimalData, IntervalYearMonthData, MapData, Scalar, StructData,
+    ArrayData, DecimalData, IntervalDayTimeData, IntervalYearMonthData, MapData, Scalar, StructData,
 };
 use crate::kernel_predicates::{
     DirectDataSkippingPredicateEvaluator, DirectPredicateEvaluator,
@@ -366,6 +366,26 @@ pub struct VariadicExpression {
     pub exprs: Vec<Expression>,
 }
 
+/// A searched SQL `CASE WHEN` expression.
+///
+/// Conditions are checked in order. The first TRUE condition selects its result expression;
+/// FALSE and NULL conditions fall through to the next branch. Only the selected result is
+/// evaluated for each row. If no condition is TRUE, `else_expr` is evaluated.
+/// An empty branch list evaluates to `else_expr`.
+/// Every THEN result and `else_expr` must have the same logical data type, including typed NULLs.
+/// For example, integer results require an integer ELSE or a NULL typed as [`DataType::INTEGER`].
+/// No implicit casts or numeric widening are applied. The Arrow evaluator requires evaluated
+/// results to have identical Arrow types, including string representations and nested fields.
+/// Runtime type validation checks evaluated results; unused branches are not evaluated to check
+/// their types.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CaseWhenExpression {
+    /// Ordered condition/result pairs.
+    pub branches: Vec<(Predicate, Expression)>,
+    /// The fallback expression when no condition is TRUE.
+    pub else_expr: Box<Expression>,
+}
+
 /// An expression that parses a JSON string column into a struct column of `output_schema`, the
 /// inverse of [`UnaryExpressionOp::ToJson`] except for the sub-millisecond timestamp precision
 /// that operator discards.
@@ -537,6 +557,8 @@ pub enum Expression {
     Binary(BinaryExpression),
     /// An expression that takes a variable number of expressions as input.
     Variadic(VariadicExpression),
+    /// A conditional expression with ordered WHEN branches and a required ELSE.
+    CaseWhen(CaseWhenExpression),
     /// An expression that the engine defines and implements. Kernel interacts with the expression
     /// only through methods provided by the [`OpaqueExpressionOp`] trait.
     #[serde(serialize_with = "fail_serialize_opaque_expression")]
@@ -675,6 +697,18 @@ impl VariadicExpression {
     }
 }
 
+impl CaseWhenExpression {
+    pub(crate) fn new(
+        branches: impl IntoIterator<Item = (Predicate, Expression)>,
+        else_expr: Expression,
+    ) -> Self {
+        Self {
+            branches: branches.into_iter().collect(),
+            else_expr: Box::new(else_expr),
+        }
+    }
+}
+
 impl ParseJsonExpression {
     pub(crate) fn new(json_expr: impl Into<Expression>, output_schema: SchemaRef) -> Self {
         Self {
@@ -698,9 +732,9 @@ pub struct MapToStructOptions {
 impl MapToStructOptions {
     /// Interpret offset-less `TIMESTAMP` values in `timestamp_timezone`.
     ///
-    /// Accepts an IANA timezone identifier or a fixed offset in `+HH:MM` or `-HH:MM` form. Named
-    /// zones preserve their clock-transition rules; fixed offsets apply when the reader
-    /// configuration itself is fixed. Use [`MapToStructOptions::default`] for UTC.
+    /// Accepts an IANA timezone identifier, a fixed offset in `+HH:MM[:SS]` or `-HH:MM[:SS]` form,
+    /// or `Z` for UTC. Named zones preserve their clock-transition rules; fixed offsets apply when
+    /// the reader configuration itself is fixed. Use [`MapToStructOptions::default`] for UTC.
     pub fn with_timestamp_timezone(mut self, timestamp_timezone: impl Into<String>) -> Self {
         self.timestamp_timezone = Some(timestamp_timezone.into());
         self
@@ -708,7 +742,7 @@ impl MapToStructOptions {
 
     /// Returns the configured IANA timezone or fixed offset, or `None` when UTC applies.
     ///
-    /// Fixed offsets use `+HH:MM` or `-HH:MM` form.
+    /// Fixed offsets use `+HH:MM[:SS]` or `-HH:MM[:SS]` form, or `Z` for UTC.
     pub fn timestamp_timezone(&self) -> Option<&str> {
         self.timestamp_timezone.as_deref()
     }
@@ -969,6 +1003,22 @@ impl Expression {
     /// Creates a new Array constructor expression. See [`VariadicExpressionOp::Array`].
     pub fn array(exprs: impl IntoIterator<Item = impl Into<Expression>>) -> Self {
         Self::variadic(VariadicExpressionOp::Array, exprs)
+    }
+
+    /// Creates a searched CASE expression from ordered condition/result `branches` and an
+    /// `else_expr` fallback. Empty `branches` return `else_expr` directly.
+    /// All branch results and `else_expr` must have the same logical type, including typed NULLs;
+    /// no implicit type coercion is performed.
+    /// See [`CaseWhenExpression`] for evaluation semantics.
+    pub fn case_when(
+        branches: impl IntoIterator<Item = (Predicate, Expression)>,
+        else_expr: Expression,
+    ) -> Self {
+        let branches = branches.into_iter().collect::<Vec<_>>();
+        match branches.is_empty() {
+            true => else_expr,
+            false => Self::CaseWhen(CaseWhenExpression::new(branches, else_expr)),
+        }
     }
 
     /// Creates a new opaque expression
@@ -1277,6 +1327,16 @@ impl Display for Expression {
             Variadic(VariadicExpression { op, exprs }) => {
                 write!(f, "{op}({})", format_child_list(exprs))
             }
+            CaseWhen(CaseWhenExpression {
+                branches,
+                else_expr,
+            }) => {
+                write!(f, "CASE")?;
+                for (condition, result) in branches {
+                    write!(f, " WHEN {condition} THEN {result}")?;
+                }
+                write!(f, " ELSE {else_expr} END")
+            }
             Opaque(OpaqueExpression { op, exprs }) => {
                 write!(f, "{op:?}({})", format_child_list(exprs))
             }
@@ -1398,7 +1458,8 @@ mod tests {
     use serde::de::DeserializeOwned;
 
     use super::{
-        DataType, Expression as Expr, MapToStructOptions, Predicate as Pred, col, column_pred, lit,
+        DataType, Expression as Expr, MapToStructOptions, Predicate as Pred, col, column_pred,
+        expr, lit,
     };
 
     /// Helper function to verify roundtrip serialization/deserialization
@@ -1427,6 +1488,20 @@ mod tests {
             (
                 Expr::cast(col!("x"), DataType::DATE),
                 "CAST(Column(x) AS date)",
+            ),
+            (
+                Expr::case_when([(col!("x").is_null(), lit(0))], col!("x")),
+                "CASE WHEN Column(x) IS NULL THEN 0 ELSE Column(x) END",
+            ),
+            (
+                Expr::case_when(
+                    [
+                        (col!("x").is_null(), lit(0)),
+                        (col!("x").gt(lit(100)), lit(100)),
+                    ],
+                    col!("x"),
+                ),
+                "CASE WHEN Column(x) IS NULL THEN 0 WHEN Column(x) > 100 THEN 100 ELSE Column(x) END",
             ),
         ];
 
@@ -1475,25 +1550,24 @@ mod tests {
     fn test_predicate_format() {
         let cases = [
             (column_pred!("x"), "Column(x)"),
-            (col!("x").eq(lit(2)), "Column(x) = 2"),
+            (Pred::from_expr(expr!(col("x") == 2)), "Column(x) = 2"),
             ((col!("x") - lit(4)).lt(lit(10)), "Column(x) - 4 < 10"),
             (
-                Pred::and(col!("x").ge(lit(2)), col!("x").le(lit(10))),
+                Pred::from_expr(expr!(and(col("x") >= 2, col("x") <= 10))),
                 "AND(NOT(Column(x) < 2), NOT(Column(x) > 10))",
             ),
             (
-                Pred::and_from([
-                    col!("x").ge(lit(2)),
-                    col!("x").le(lit(10)),
-                    col!("x").le(lit(100)),
-                ]),
+                Pred::from_expr(expr!(and(col("x") >= 2, col("x") <= 10, col("x") <= 100))),
                 "AND(NOT(Column(x) < 2), NOT(Column(x) > 10), NOT(Column(x) > 100))",
             ),
             (
-                Pred::or(col!("x").gt(lit(2)), col!("x").lt(lit(10))),
+                Pred::from_expr(expr!(or(col("x") > 2, col("x") < 10))),
                 "OR(Column(x) > 2, Column(x) < 10)",
             ),
-            (col!("x").eq(lit("foo")), "Column(x) = 'foo'"),
+            (
+                Pred::from_expr(expr!(col("x") == "foo")),
+                "Column(x) = 'foo'",
+            ),
         ];
 
         for (pred, expected) in cases {
@@ -1512,7 +1586,7 @@ mod tests {
         use crate::expressions::{
             BinaryExpressionOp, BinaryPredicateOp, ColumnName, Expression,
             ExpressionStructPatchBuilder, MapToStructOptions, Predicate, Scalar, UnaryExpressionOp,
-            col, column_name, lit, null_lit,
+            col, column_name, expr, lit, null_lit,
         };
         use crate::schema::{ArrayType, DataType, DecimalType, MapType, StructField};
         use crate::unit_test_utils::assert_result_error_with_message;
@@ -1646,7 +1720,7 @@ mod tests {
 
         #[test]
         fn test_variadic_expression_roundtrip() {
-            let expr = Expression::coalesce([col!("a"), col!("b"), lit("default")]);
+            let expr = expr!(coalesce(col("a"), col("b"), "default"));
             assert_roundtrip(&expr);
         }
 
@@ -1669,6 +1743,27 @@ mod tests {
             lit(42i64),
         ]))]
         fn test_array_expression_roundtrip(#[case] expr: Expression) {
+            assert_roundtrip(&expr);
+        }
+
+        #[rstest::rstest]
+        fn test_case_when_expression_roundtrip(
+            #[values(0, 1, 2)] num_branches: i32,
+            #[values(Expression::literal(0), null_lit(DataType::INTEGER))] else_expr: Expression,
+        ) {
+            let branches = (0..num_branches).map(|i| {
+                (
+                    col!("a").gt(Expression::literal(i)),
+                    Expression::case_when(
+                        [(col!("flag").is_null(), Expression::literal(i))],
+                        col!("value"),
+                    ),
+                )
+            });
+            let expr = Expression::case_when(branches, else_expr.clone());
+            if num_branches == 0 {
+                assert_eq!(expr, else_expr);
+            }
             assert_roundtrip(&expr);
         }
 
@@ -1729,7 +1824,7 @@ mod tests {
 
         #[test]
         fn test_expression_wrapping_predicate_roundtrip() {
-            let pred = Predicate::eq(col!("x"), lit(10));
+            let pred = Predicate::from_expr(expr!(col("x") == 10));
             let expr = Expression::from_pred(pred);
             assert_roundtrip(&expr);
         }
@@ -1790,14 +1885,14 @@ mod tests {
                 Predicate::TRUE,
                 Predicate::FALSE,
                 // NOT
-                Predicate::not(Predicate::from_expr(col!("x"))),
+                Predicate::from_expr(expr!(not(col("x")))),
                 // Nested NOT
-                Predicate::not(Predicate::not(Predicate::gt(col!("x"), lit(5)))),
+                Predicate::from_expr(expr!(not(not(col("x") > 5)))),
                 // Unknown
                 Predicate::unknown("some_unknown_predicate()"),
                 // Unary predicates
-                Predicate::is_null(col!("nullable_col")),
-                Predicate::is_not_null(col!("nullable_col")),
+                Predicate::from_expr(expr!(is_null(col("nullable_col")))),
+                Predicate::from_expr(expr!(is_not_null(col("nullable_col")))),
             ];
 
             for pred in &cases {
@@ -1813,13 +1908,13 @@ mod tests {
         #[test]
         fn test_predicate_comparisons_roundtrip() {
             let cases: Vec<Predicate> = vec![
-                Predicate::eq(col!("x"), lit(42)),
-                Predicate::ne(col!("status"), lit("active")),
-                Predicate::lt(col!("age"), lit(18)),
-                Predicate::le(col!("price"), lit(100)),
-                Predicate::gt(col!("score"), lit(90)),
-                Predicate::ge(col!("quantity"), lit(1)),
-                Predicate::distinct(col!("a"), col!("b")),
+                Predicate::from_expr(expr!(col("x") == 42)),
+                Predicate::from_expr(expr!(col("status") != "active")),
+                Predicate::from_expr(expr!(col("age") < 18)),
+                Predicate::from_expr(expr!(col("price") <= 100)),
+                Predicate::from_expr(expr!(col("score") > 90)),
+                Predicate::from_expr(expr!(col("quantity") >= 1)),
+                Predicate::from_expr(expr!(distinct(col("a"), col("b")))),
             ];
 
             for pred in &cases {
@@ -1846,35 +1941,29 @@ mod tests {
         fn test_predicate_junctions_roundtrip() {
             let cases: Vec<Predicate> = vec![
                 // Simple AND
-                Predicate::and(
-                    Predicate::gt(col!("x"), lit(0)),
-                    Predicate::lt(col!("x"), lit(100)),
-                ),
+                Predicate::from_expr(expr!(and(col("x") > 0, col("x") < 100))),
                 // Simple OR
-                Predicate::or(
-                    Predicate::eq(col!("status"), lit("active")),
-                    Predicate::eq(col!("status"), lit("pending")),
-                ),
+                Predicate::from_expr(expr!(or(
+                    col("status") == "active",
+                    col("status") == "pending"
+                ))),
                 // Multiple AND
-                Predicate::and_from([
-                    Predicate::gt(col!("x"), lit(0)),
-                    Predicate::lt(col!("x"), lit(100)),
-                    Predicate::is_not_null(col!("x")),
-                ]),
+                Predicate::from_expr(expr!(and(
+                    col("x") > 0,
+                    col("x") < 100,
+                    is_not_null(col("x"))
+                ))),
                 // Multiple OR
-                Predicate::or_from([
-                    Predicate::eq(col!("type"), lit("A")),
-                    Predicate::eq(col!("type"), lit("B")),
-                    Predicate::eq(col!("type"), lit("C")),
-                ]),
+                Predicate::from_expr(expr!(or(
+                    col("type") == "A",
+                    col("type") == "B",
+                    col("type") == "C"
+                ))),
                 // Nested: (a > 0 AND b < 100) OR (c = 'special')
-                Predicate::or(
-                    Predicate::and(
-                        Predicate::gt(col!("a"), lit(0)),
-                        Predicate::lt(col!("b"), lit(100)),
-                    ),
-                    Predicate::eq(col!("c"), lit("special")),
-                ),
+                Predicate::from_expr(expr!(or(
+                    and(col("a") > 0, col("b") < 100),
+                    col("c") == "special"
+                ))),
             ];
 
             for pred in &cases {
@@ -1895,7 +1984,7 @@ mod tests {
 
             // Expression wrapping a predicate that references expressions
             let inner_pred = Predicate::and(
-                Predicate::eq(col!("x"), lit(1)),
+                Predicate::from_expr(expr!(col("x") == 1)),
                 Predicate::gt(
                     Expression::binary(BinaryExpressionOp::Plus, col!("y"), col!("z")),
                     lit(10),

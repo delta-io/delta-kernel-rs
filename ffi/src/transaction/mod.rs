@@ -2,6 +2,7 @@
 mod committed;
 mod create_table;
 mod deletion_vector;
+mod deletion_vector_writer;
 mod partition_value;
 mod transaction_id;
 mod update_table;
@@ -19,6 +20,11 @@ pub use deletion_vector::{
     ExclusiveDvDescriptor, ExclusiveDvDescriptorMap, KernelDvStorageType, dv_descriptor_map_insert,
     dv_descriptor_map_new, dv_descriptor_new, free_dv_descriptor, free_dv_descriptor_map,
     update_table_txn_update_deletion_vectors,
+};
+pub use deletion_vector_writer::{
+    DvFlushFn, DvWriteFn, ExclusiveDeletionVector, ExclusiveDvWriter, FfiDvWriteResult,
+    FfiDvWriterOutput, deletion_vector_add_indexes, dv_writer_finalize, dv_writer_write,
+    free_deletion_vector, free_dv_writer, new_deletion_vector, new_dv_writer,
 };
 use delta_kernel::EngineData;
 use delta_kernel::committer::{Committer, FileSystemCommitter};
@@ -133,14 +139,14 @@ mod tests {
     };
     use delta_kernel::table_features::TableFeature;
     use delta_kernel::transaction::create_table::create_table;
-    use delta_kernel::{KernelResult, Snapshot};
+    use delta_kernel::{KernelError, KernelResult, Snapshot};
     use delta_kernel_ffi::delta_types::{
         FfiColumnNameArray, FfiNullableStringMap, FfiNullableStringMapEntry, FfiStringArray,
     };
     use delta_kernel_ffi::engine_data::{ArrowFFIData, get_engine_data};
     use delta_kernel_ffi::error::FFIKernelError;
     use delta_kernel_ffi::ffi_test_utils::{
-        allocate_bytes, allocate_err, allocate_str, assert_extern_result_error_contains,
+        TEST_ERROR_ALLOCATORS, allocate_bytes, allocate_str, assert_extern_result_error_contains,
         assert_extern_result_error_with_message, build_snapshot, build_update_table_txn,
         engine_handle_for_store, ok_or_panic, recover_bytes, recover_error, recover_string,
     };
@@ -511,7 +517,7 @@ mod tests {
             )?;
 
             let file_info_engine_data = ok_or_panic(unsafe {
-                get_engine_data(file_info.array, &file_info.schema, allocate_err)
+                get_engine_data(file_info.array, &file_info.schema, &TEST_ERROR_ALLOCATORS)
             });
 
             unsafe { update_table_txn_add_files(txn.shallow_copy(), file_info_engine_data) };
@@ -819,7 +825,7 @@ mod tests {
                 unsafe {
                     visit_partition_values(
                         context.shallow_copy(),
-                        std::ptr::NonNull::new((&mut collected as *mut Vec<_>).cast()),
+                        Some(std::ptr::NonNull::from_mut(&mut collected).cast()),
                         collect_partition_value,
                     );
                 }
@@ -865,7 +871,7 @@ mod tests {
         miri,
         ignore = "local-filesystem commit calls `linkat`, unsupported under Miri"
     )]
-    async fn test_partitioned_append() -> KernelResult<()> {
+    async fn test_partitioned_append() -> delta_kernel::Result<()> {
         // Partition column `part` is listed last in the schema; the physical write schema must
         // exclude it (CM=none, partition columns are not materialized).
         let schema = schema_ref! {
@@ -923,7 +929,7 @@ mod tests {
             let write_dir_str = recover_string(
                 unsafe { get_write_dir(write_context.shallow_copy(), allocate_str) }.unwrap(),
             );
-            let write_dir_url = Url::parse(&write_dir_str)?;
+            let write_dir_url = Url::parse(&write_dir_str).map_err(KernelError::from)?;
             assert!(
                 write_dir_url.path().ends_with("part=100/"),
                 "unexpected write dir: {write_dir_str}"
@@ -931,9 +937,7 @@ mod tests {
 
             // The serialized partition values surface the physical name and value.
             let mut collected: Vec<(String, String, bool)> = Vec::new();
-            let ctx = std::ptr::NonNull::new(
-                &mut collected as *mut Vec<(String, String, bool)> as *mut std::ffi::c_void,
-            );
+            let ctx = Some(std::ptr::NonNull::from_mut(&mut collected).cast());
             unsafe {
                 visit_partition_values(write_context.shallow_copy(), ctx, collect_partition_value)
             };
@@ -955,22 +959,25 @@ mod tests {
             ])
             .unwrap();
             let dir_path = write_dir_url.to_file_path().unwrap();
-            std::fs::create_dir_all(&dir_path)?;
+            std::fs::create_dir_all(&dir_path).map_err(KernelError::from)?;
             let file_name = "my_file.parquet";
             let file_fs_path = dir_path.join(file_name);
-            let parquet_file = std::fs::File::create(&file_fs_path)?;
+            let parquet_file = std::fs::File::create(&file_fs_path).map_err(KernelError::from)?;
             let mut writer = ArrowWriter::try_new(
                 parquet_file,
                 batch.schema(),
                 Some(WriterProperties::builder().build()),
-            )?;
-            writer.write(&batch)?;
-            let parquet_meta = writer.close()?;
+            )
+            .map_err(KernelError::from)?;
+            writer.write(&batch).map_err(KernelError::from)?;
+            let parquet_meta = writer.close().map_err(KernelError::from)?;
             let num_rows = parquet_meta.file_metadata().num_rows();
-            let size = std::fs::metadata(&file_fs_path)?.len();
+            let size = std::fs::metadata(&file_fs_path)
+                .map_err(KernelError::from)?
+                .len();
 
             // Resolve the relative add.path from the absolute file URL.
-            let file_url = write_dir_url.join(file_name)?;
+            let file_url = write_dir_url.join(file_name).map_err(KernelError::from)?;
             let file_url_str = file_url.as_str();
             let add_path = recover_string(
                 ok_or_panic(unsafe {
@@ -991,10 +998,11 @@ mod tests {
             );
             let metadata_schema = unsafe { txn.shallow_copy().as_ref().add_files_schema() }
                 .as_ref()
-                .try_into_arrow()?;
+                .try_into_arrow()
+                .map_err(KernelError::from)?;
             let file_info = create_arrow_ffi_from_json(metadata_schema, &metadata_json)?;
             let file_info_engine_data = ok_or_panic(unsafe {
-                get_engine_data(file_info.array, &file_info.schema, allocate_err)
+                get_engine_data(file_info.array, &file_info.schema, &TEST_ERROR_ALLOCATORS)
             });
             unsafe { update_table_txn_add_files(txn.shallow_copy(), file_info_engine_data) };
 
@@ -1008,10 +1016,13 @@ mod tests {
                 .unwrap();
             let commit1 = store
                 .get(&Path::from_url_path(commit1_url.path()).unwrap())
-                .await?;
-            let parsed_commits: Vec<_> = Deserializer::from_slice(&commit1.bytes().await?)
-                .into_iter::<serde_json::Value>()
-                .try_collect()?;
+                .await
+                .map_err(KernelError::from)?;
+            let parsed_commits: Vec<_> =
+                Deserializer::from_slice(&commit1.bytes().await.map_err(KernelError::from)?)
+                    .into_iter::<serde_json::Value>()
+                    .try_collect()
+                    .map_err(KernelError::from)?;
             let add = &parsed_commits[1]["add"];
             assert_eq!(add["path"], json!("part=100/my_file.parquet"));
             assert_eq!(add["partitionValues"], json!({ "part": "100" }));
@@ -1131,9 +1142,7 @@ mod tests {
             });
 
             let mut collected: Vec<(String, String, bool)> = Vec::new();
-            let ctx = std::ptr::NonNull::new(
-                &mut collected as *mut Vec<(String, String, bool)> as *mut std::ffi::c_void,
-            );
+            let ctx = Some(std::ptr::NonNull::from_mut(&mut collected).cast());
             unsafe {
                 visit_partition_values(write_context.shallow_copy(), ctx, collect_partition_value)
             };
@@ -1196,9 +1205,7 @@ mod tests {
             });
 
             let mut collected: Vec<(String, String, bool)> = Vec::new();
-            let ctx = std::ptr::NonNull::new(
-                &mut collected as *mut Vec<(String, String, bool)> as *mut std::ffi::c_void,
-            );
+            let ctx = Some(std::ptr::NonNull::from_mut(&mut collected).cast());
             unsafe {
                 visit_partition_values(write_context.shallow_copy(), ctx, collect_partition_value)
             };
@@ -1538,7 +1545,7 @@ mod tests {
             .try_into_arrow()?;
         let file_info = create_file_metadata("file.parquet", 1, 2, metadata_schema)?;
         let file_info_engine_data = ok_or_panic(unsafe {
-            get_engine_data(file_info.array, &file_info.schema, allocate_err)
+            get_engine_data(file_info.array, &file_info.schema, &TEST_ERROR_ALLOCATORS)
         });
         unsafe { update_table_txn_add_files(txn.shallow_copy(), file_info_engine_data) };
 
@@ -1572,7 +1579,7 @@ mod tests {
             .try_into_arrow()?;
         let file_info = create_file_metadata("file.parquet", 1, 2, metadata_schema)?;
         let file_info_engine_data = ok_or_panic(unsafe {
-            get_engine_data(file_info.array, &file_info.schema, allocate_err)
+            get_engine_data(file_info.array, &file_info.schema, &TEST_ERROR_ALLOCATORS)
         });
         unsafe { update_table_txn_add_files(txn.shallow_copy(), file_info_engine_data) };
 
@@ -1777,7 +1784,7 @@ mod tests {
                     kernel_string_slice!(catalog),
                     kernel_string_slice!(schema),
                     kernel_string_slice!(table_name),
-                    allocate_err,
+                    &TEST_ERROR_ALLOCATORS,
                 ))
             };
 
@@ -1828,7 +1835,7 @@ mod tests {
             .await?;
 
             let file_info_engine_data = ok_or_panic(unsafe {
-                get_engine_data(file_info.array, &file_info.schema, allocate_err)
+                get_engine_data(file_info.array, &file_info.schema, &TEST_ERROR_ALLOCATORS)
             });
 
             unsafe { update_table_txn_add_files(txn.shallow_copy(), file_info_engine_data) };
@@ -1853,7 +1860,7 @@ mod tests {
                     kernel_string_slice!(catalog),
                     kernel_string_slice!(schema),
                     kernel_string_slice!(table_name),
-                    allocate_err,
+                    &TEST_ERROR_ALLOCATORS,
                 ))
             };
             let published_snapshot = ok_or_panic(unsafe {
@@ -1895,7 +1902,7 @@ mod tests {
                     kernel_string_slice!(catalog),
                     kernel_string_slice!(schema),
                     kernel_string_slice!(table_name),
-                    allocate_err,
+                    &TEST_ERROR_ALLOCATORS,
                 ))
             };
             let republished_snapshot = ok_or_panic(unsafe {
@@ -2016,21 +2023,21 @@ mod tests {
                             kernel_string_slice!(name),
                             nullable,
                             std::ptr::null(),
-                            allocate_err,
+                            &TEST_ERROR_ALLOCATORS,
                         ),
                         DataType::STRING => visit_field_string(
                             state,
                             kernel_string_slice!(name),
                             nullable,
                             std::ptr::null(),
-                            allocate_err,
+                            &TEST_ERROR_ALLOCATORS,
                         ),
                         DataType::LONG => visit_field_long(
                             state,
                             kernel_string_slice!(name),
                             nullable,
                             std::ptr::null(),
-                            allocate_err,
+                            &TEST_ERROR_ALLOCATORS,
                         ),
                         _ => panic!("Unsupported test field type: {:?}", field.data_type),
                     })
@@ -2046,7 +2053,7 @@ mod tests {
                 field_ids.len(),
                 false,
                 std::ptr::null(),
-                allocate_err,
+                &TEST_ERROR_ALLOCATORS,
             ))
         }
     }
@@ -2062,7 +2069,7 @@ mod tests {
                 kernel_string_slice!(field),
                 true,
                 std::ptr::null(),
-                allocate_err,
+                &TEST_ERROR_ALLOCATORS,
             ))
         }
     }
@@ -2123,7 +2130,7 @@ mod tests {
     async fn create_table_transaction_ids(
         #[case] builder_ids: usize,
         #[case] duplicate_app_id: bool,
-    ) -> KernelResult<()> {
+    ) -> delta_kernel::Result<()> {
         let (store, test_engine, table_url) =
             test_utils::engine_store_setup("test_create_transaction_ids", None);
         let (_table_path, engine, mut builder) = create_table_txn_builder(
@@ -2344,7 +2351,7 @@ mod tests {
                 kernel_string_slice!(crs),
                 true,
                 std::ptr::null(),
-                allocate_err,
+                &TEST_ERROR_ALLOCATORS,
             ))
         };
         let field_ids = [field_id];
@@ -2357,7 +2364,7 @@ mod tests {
                 field_ids.len(),
                 false,
                 std::ptr::null(),
-                allocate_err,
+                &TEST_ERROR_ALLOCATORS,
             ))
         }
     }
@@ -3142,7 +3149,7 @@ mod tests {
             .try_into_arrow()?;
         let file_info = create_file_metadata("file.parquet", 1, 2, metadata_schema)?;
         let metadata = ok_or_panic(unsafe {
-            get_engine_data(file_info.array, &file_info.schema, allocate_err)
+            get_engine_data(file_info.array, &file_info.schema, &TEST_ERROR_ALLOCATORS)
         });
         unsafe { update_table_txn_add_files(txn.shallow_copy(), metadata) };
 
@@ -3624,7 +3631,7 @@ mod tests {
     #[tokio::test]
     async fn test_create_table_with_clustering_column_paths(
         #[case] column_mapping: bool,
-    ) -> KernelResult<()> {
+    ) -> delta_kernel::Result<()> {
         let (store, test_engine, table_url) =
             test_utils::engine_store_setup("clustering_paths", None);
         let engine = engine_handle_for_store(Arc::clone(&store));
@@ -3724,7 +3731,7 @@ mod tests {
     )]
     #[case::traverse_primitive(
         vec![vec!["id", "child"]],
-        "intermediate field 'id' is not a struct type"
+        "intermediate field 'id' is not a struct or `file` type"
     )]
     #[case::struct_as_leaf(vec![vec!["parent"]], "has unsupported type")]
     #[case::duplicate_nested_path(
@@ -4376,7 +4383,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_update_table_txn_builder_applies_nested_schema_changes() -> KernelResult<()> {
+    async fn test_update_table_txn_builder_applies_nested_schema_changes()
+    -> delta_kernel::Result<()> {
         let (store, kernel_engine, table_url) =
             test_utils::engine_store_setup("test_nested_schema_changes", None);
         let nested =
@@ -4563,7 +4571,7 @@ mod tests {
             get_engine_data(
                 file_info.array,
                 &file_info.schema,
-                crate::ffi_test_utils::allocate_err,
+                &crate::ffi_test_utils::TEST_ERROR_ALLOCATORS,
             )
         });
         unsafe { update_table_txn_add_files(txn.shallow_copy(), file_info_engine_data) };
@@ -4576,7 +4584,7 @@ mod tests {
     fn assert_no_active_files(
         kernel_engine: &Arc<dyn delta_kernel::Engine>,
         table_path: &str,
-    ) -> KernelResult<()> {
+    ) -> delta_kernel::Result<()> {
         let snapshot =
             delta_kernel::snapshot::Snapshot::builder_for(delta_kernel::try_parse_uri(table_path)?)
                 .build(kernel_engine.as_ref())?;
@@ -4607,7 +4615,7 @@ mod tests {
     async fn setup_remove_files_test(
         store: &Arc<DynObjectStore>,
         table_url: &Url,
-    ) -> KernelResult<(
+    ) -> delta_kernel::Result<(
         Box<dyn delta_kernel::EngineData>,
         Vec<bool>,
         Handle<ExclusiveUpdateTableTransaction>,
@@ -4647,7 +4655,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_remove_files_with_null_sv_commits_and_removes_all() -> KernelResult<()> {
+    async fn test_remove_files_with_null_sv_commits_and_removes_all() -> delta_kernel::Result<()> {
         let (store, _test_engine, table_url) =
             test_utils::engine_store_setup("test_remove_files", None);
         let (data, sv, txn, engine, kernel_engine, table_path) =
@@ -4698,7 +4706,7 @@ mod tests {
 
     /// End-to-end FFI round trip for connector-authored deletion vector updates.
     #[tokio::test]
-    async fn test_dv_update_round_trip_via_ffi() -> KernelResult<()> {
+    async fn test_dv_update_round_trip_via_ffi() -> delta_kernel::Result<()> {
         use delta_kernel::actions::deletion_vector_writer::{
             KernelDeletionVector, StreamingDeletionVectorWriter,
         };
@@ -4730,17 +4738,19 @@ mod tests {
         let batch = RecordBatch::try_from_iter(vec![(
             "id",
             Arc::new(Int32Array::from(vec![10, 20, 30, 40])) as ArrayRef,
-        )])?;
+        )])
+        .map_err(KernelError::from)?;
         let parquet_bytes = record_batch_to_bytes(&batch);
         let parquet_len = parquet_bytes.len();
         let data_file_path = "data_file.parquet".to_string();
-        let data_url = table_url.join(&data_file_path)?;
+        let data_url = table_url.join(&data_file_path).map_err(KernelError::from)?;
         store
             .put(
-                &ObjectStorePath::from_url_path(data_url.path())?,
+                &ObjectStorePath::from_url_path(data_url.path()).map_err(KernelError::from)?,
                 parquet_bytes.into(),
             )
-            .await?;
+            .await
+            .map_err(KernelError::from)?;
 
         // Add the file via a kernel transaction so the table has something to scan.
         // Build the kernel engine over the seeded store: `create_default_engine` resolves a fresh
@@ -4769,13 +4779,16 @@ mod tests {
         let mut dv_writer = StreamingDeletionVectorWriter::new(&mut dv_bytes);
         let dv_write_result = dv_writer.write_deletion_vector(dv)?;
         dv_writer.finalize()?;
-        let dv_url = table_url.join("connector_dv.bin")?;
+        let dv_url = table_url
+            .join("connector_dv.bin")
+            .map_err(KernelError::from)?;
         store
             .put(
-                &ObjectStorePath::from_url_path(dv_url.path())?,
+                &ObjectStorePath::from_url_path(dv_url.path()).map_err(KernelError::from)?,
                 dv_bytes.into(),
             )
-            .await?;
+            .await
+            .map_err(KernelError::from)?;
 
         // === FFI surface under test ===
         let table_path_str = table_url.as_str();
@@ -4863,7 +4876,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_remove_files_with_non_empty_sv_exercises_from_raw_parts() -> KernelResult<()> {
+    async fn test_remove_files_with_non_empty_sv_exercises_from_raw_parts()
+    -> delta_kernel::Result<()> {
         // Exercises the from_raw_parts code path in the remove_files FFI wrapper by passing
         // a non-null selection vector pointer with non-zero length. The null-SV test always
         // passes a null pointer because scan_metadata for a single-file table returns an

@@ -17,31 +17,87 @@ void print_diag(char* fmt, ...)
 #endif
 }
 
-// Print out an error message, plus the code and kernel message of an error
+// Print diagnostics from either allocation callback.
 void print_error(const char* msg, Error* err)
 {
   printf("[ERROR] %s\n", msg);
-  printf("  Kernel Code: %i\n", err->etype.etype);
-  printf("  Kernel Msg: %s\n", err->msg);
+  if (!err) {
+    printf("  Error allocation failed\n");
+    return;
+  }
+  if (err->is_delta) {
+    printf("  Delta Condition: %s\n", err->condition);
+    if (err->sql_state) printf("  SQLSTATE: %s\n", err->sql_state);
+    for (size_t i = 0; i < err->parameter_count; ++i)
+      printf("  %s: %s\n", err->parameters[i].key, err->parameters[i].value);
+  } else {
+    printf("  Kernel Code: %i\n", err->code);
+  }
+  printf("  Message: %s\n", err->msg);
 }
 
-// free an error
 void free_error(Error* error)
 {
+  if (!error) return;
+  for (size_t i = 0; i < error->parameter_count; ++i) {
+    free(error->parameters[i].key);
+    free(error->parameters[i].value);
+  }
+  free(error->parameters);
+  free(error->condition);
+  free(error->sql_state);
   free(error->msg);
   free(error);
 }
 
-// kernel will call this to allocate our errors. This can be used to create an "engine native" type
-// error
-EngineError* allocate_error(FFIKernelError etype, const KernelStringSlice msg)
+static void* allocate_kernel_error(void* context, const KernelErrorInfo* info)
 {
-  Error* error = malloc(sizeof(Error));
-  error->etype.etype = etype;
-  char* charmsg = allocate_string(msg);
-  error->msg = charmsg;
-  return (EngineError*)error;
+  (void)context;
+  Error* error = calloc(1, sizeof(Error));
+  if (!error) return NULL;
+  error->code = info->code;
+  error->msg = allocate_string(info->message);
+  if (!error->msg) {
+    free_error(error);
+    return NULL;
+  }
+  return error;
 }
+
+static void* allocate_delta_error(void* context, const DeltaErrorInfo* info)
+{
+  (void)context;
+  Error* error = calloc(1, sizeof(Error));
+  if (!error) return NULL;
+  error->is_delta = true;
+  error->condition = allocate_string(info->condition);
+  error->msg = allocate_string(info->message);
+  if (!error->condition || !error->msg) goto fail;
+  if (info->sql_state.tag == SomeKernelStringSlice) {
+    error->sql_state = allocate_string(info->sql_state.some);
+    if (!error->sql_state) goto fail;
+  }
+  if (info->parameters.len) {
+    error->parameters = calloc(info->parameters.len, sizeof(ErrorParameter));
+    if (!error->parameters) goto fail;
+    error->parameter_count = info->parameters.len;
+    for (size_t i = 0; i < error->parameter_count; ++i) {
+      error->parameters[i].key = allocate_string(info->parameters.ptr[i].key);
+      error->parameters[i].value = allocate_string(info->parameters.ptr[i].value);
+      if (!error->parameters[i].key || !error->parameters[i].value) goto fail;
+    }
+  }
+  return error;
+fail:
+  free_error(error);
+  return NULL;
+}
+
+const ErrorAllocators error_allocators = {
+  .context = NULL,
+  .allocate_kernel_error = allocate_kernel_error,
+  .allocate_delta_error = allocate_delta_error,
+};
 
 #ifdef WIN32 // windows doesn't have strndup
 char *strndup(const char *s, size_t n) {
@@ -492,6 +548,31 @@ void print_metric(MetricEvent event) {
 
   case MetricEventCrcReadFailure:
     PM_START(CrcReadFailure);
+    PM_END;
+    return;
+
+  case MetricEventCheckpointWriteSuccess:
+    PM_START(CheckpointWriteSuccess);
+    CheckpointWriteSuccess cps = event.checkpoint_write_success;
+    printf("  outcome: %d,\n", cps.outcome.tag);
+    PM_U64(cps, mode);
+    PM_U64(cps, duration_ns);
+    if (cps.outcome.tag == CheckpointWriteOutcomeWritten) {
+      CheckpointWriteStats stats = cps.outcome.written.stats;
+      PM_U64(stats, bytes_written);
+      PM_U64(stats, num_add_files);
+      PM_U64(stats, num_remove_files);
+      PM_U64(stats, num_actions);
+      PM_U64(stats, num_sidecars);
+    }
+    PM_END;
+    return;
+
+  case MetricEventCheckpointWriteFailure:
+    PM_START(CheckpointWriteFailure);
+    CheckpointWriteFailure cpf = event.checkpoint_write_failure;
+    PM_U64(cpf, mode);
+    PM_U64(cpf, duration_ns);
     PM_END;
     return;
 

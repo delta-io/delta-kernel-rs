@@ -284,6 +284,9 @@ fn lower_aggregate_function(agg: &KernelAgg, input_schema: &DFSchema) -> DFResul
         KernelAgg::Count(value) => Ok(count(column_to_df_expr(value, input_schema)?)),
         // DataFusion produces 1 for every input row, so counting it implements COUNT(*).
         KernelAgg::CountStar => Ok(count(df_lit(1))),
+        KernelAgg::FirstNonNull(_) => Err(DataFusionError::NotImplemented(
+            "FIRST_NON_NULL aggregate".into(),
+        )),
         KernelAgg::MinNonNullBy(operands) => lower_non_null_by(
             &operands.value,
             &operands.null_sentinel,
@@ -384,11 +387,9 @@ mod tests {
     use datafusion::{assert_batches_eq, assert_batches_sorted_eq};
     use delta_kernel::PlanBuilder;
     use delta_kernel::expressions::{
-        ArrayData as KernelArrayData, BinaryPredicateOp as KernelBinaryPredicateOp,
-        Expression as KernelExpr, ExpressionRef, ExpressionStructPatchBuilder,
-        JunctionPredicateOp as KernelJunctionPredicateOp, MapData as KernelMapData,
-        Predicate as KernelPredicate, StructData as KernelStructData, col, column_name,
-        lit as kernel_lit, null_lit,
+        ArrayData as KernelArrayData, Expression as KernelExpr, ExpressionRef,
+        ExpressionStructPatchBuilder, MapData as KernelMapData, Predicate as KernelPredicate,
+        StructData as KernelStructData, col, column_name, expr, lit as kernel_lit, null_lit,
     };
     use delta_kernel::schema::{
         ArrayType, DataType, MapType, SchemaRef, StructField, StructType, schema,
@@ -651,7 +652,7 @@ mod tests {
     fn filter_wraps_its_input_and_inherits_schema() {
         let input = input_with_schema(test_schema());
         let filter = KernelFilter {
-            predicate: KernelPredicate::is_null(col!("a")).into(),
+            predicate: KernelPredicate::from_expr(expr!(is_null(col("a")))).into(),
         };
         let lowered = lower_operator(
             &KernelOperator::Filter(filter),
@@ -738,53 +739,29 @@ mod tests {
     ];
 
     #[rstest]
-    #[case::is_null(KernelPredicate::is_null(col!("a")), NULL_ROW)]
+    #[case::is_null(KernelPredicate::from_expr(expr!(is_null(col("a")))), NULL_ROW)]
     #[case::equal(
-        KernelPredicate::binary(KernelBinaryPredicateOp::Equal, col!("a"), kernel_lit(5i64)),
+        KernelPredicate::from_expr(expr!(col("a") == 5i64)),
         Y_ROW
     )]
     #[case::less_than(
-        KernelPredicate::binary(
-            KernelBinaryPredicateOp::LessThan,
-            col!("a"),
-            kernel_lit(5i64),
-        ),
+        KernelPredicate::from_expr(expr!(col("a") < 5i64)),
         X_ROW
     )]
     #[case::greater_than(
-        KernelPredicate::binary(
-            KernelBinaryPredicateOp::GreaterThan,
-            col!("a"),
-            kernel_lit(5i64),
-        ),
+        KernelPredicate::from_expr(expr!(col("a") > 5i64)),
         Z_ROW
     )]
     #[case::distinct(
-        KernelPredicate::binary(
-            KernelBinaryPredicateOp::Distinct,
-            col!("a"),
-            kernel_lit(5i64),
-        ),
+        KernelPredicate::from_expr(expr!(distinct(col("a"), 5i64))),
         NULL_X_AND_Z_ROWS
     )]
     #[case::and(
-        KernelPredicate::junction(
-            KernelJunctionPredicateOp::And,
-            [
-                KernelPredicate::gt(col!("a"), kernel_lit(1i64)),
-                KernelPredicate::lt(col!("a"), kernel_lit(9i64)),
-            ],
-        ),
+        KernelPredicate::from_expr(expr!(and(col("a") > 1i64, col("a") < 9i64))),
         Y_ROW
     )]
     #[case::or(
-        KernelPredicate::junction(
-            KernelJunctionPredicateOp::Or,
-            [
-                KernelPredicate::lt(col!("a"), kernel_lit(5i64)),
-                KernelPredicate::gt(col!("a"), kernel_lit(5i64)),
-            ],
-        ),
+        KernelPredicate::from_expr(expr!(or(col("a") < 5i64, col("a") > 5i64))),
         X_AND_Z_ROWS
     )]
     #[case::where_null(KernelPredicate::NULL, NO_ROWS)]
@@ -808,7 +785,7 @@ mod tests {
         let input = input_with_schema(test_schema());
         let inputs = vec![input; actual];
         let op = KernelOperator::Filter(KernelFilter {
-            predicate: KernelPredicate::is_null(col!("a")).into(),
+            predicate: KernelPredicate::from_expr(expr!(is_null(col("a")))).into(),
         });
         let err = lower_operator(&op, &inputs).unwrap_err();
         assert!(
@@ -917,13 +894,13 @@ mod tests {
     fn struct_patch_project() -> (SchemaRef, ExpressionRef) {
         let input = project_input_schema();
         ProjectionStructPatchBuilder::new(&input)
-            .replace_expr("b", KernelExpr::coalesce([col!("b"), kernel_lit(99i64)]))
+            .replace_expr("b", expr!(coalesce(col("b"), 99i64)))
             .drop("flag")
             .drop("small")
             .drop("nested")
             .append(
                 StructField::nullable("sum", DataType::LONG),
-                col!("a") + KernelExpr::coalesce([col!("b"), kernel_lit(99i64)]),
+                col!("a") + expr!(coalesce(col("b"), 99i64)),
             )
             .build()
             .unwrap()
@@ -1011,7 +988,7 @@ mod tests {
             lower_project_expr(KernelExpr::struct_from([col!("a")]), output, &parent).unwrap(),
         );
         let filter = KernelFilter {
-            predicate: KernelPredicate::is_null(col!("projected")).into(),
+            predicate: KernelPredicate::from_expr(expr!(is_null(col("projected")))).into(),
         };
         let filtered = lower_operator(
             &KernelOperator::Filter(filter),
@@ -1205,7 +1182,7 @@ mod tests {
         struct_project([
             (
                 StructField::nullable("coalesced", DataType::LONG),
-                KernelExpr::coalesce([col!("b"), col!("a"), kernel_lit(99i64)]),
+                expr!(coalesce(col("b"), col("a"), 99i64)),
             ),
             (
                 StructField::nullable(
@@ -1229,22 +1206,19 @@ mod tests {
         struct_project([
             (
                 StructField::nullable("is_null", DataType::BOOLEAN),
-                KernelExpr::from_pred(col!("b").is_null()),
+                expr!(is_null(col("b"))),
             ),
             (
                 StructField::nullable("greater", DataType::BOOLEAN),
-                KernelExpr::from_pred(col!("a").gt(kernel_lit(15i64))),
+                expr!(col("a") > 15i64),
             ),
             (
                 StructField::nullable("conjunction", DataType::BOOLEAN),
-                KernelExpr::from_pred(KernelPredicate::and(
-                    col!("a").is_not_null(),
-                    col!("b").lt(kernel_lit(3i64)),
-                )),
+                expr!(and(is_not_null(col("a")), col("b") < 3i64)),
             ),
             (
                 StructField::nullable("distinct", DataType::BOOLEAN),
-                KernelExpr::from_pred(col!("a").distinct(col!("b"))),
+                expr!(distinct(col("a"), col("b"))),
             ),
         ]),
         &[
@@ -1268,7 +1242,7 @@ mod tests {
             ),
             KernelExpr::struct_with_nullability_from(
                 [col!("nested.value"), kernel_lit("seen")],
-                KernelExpr::from_pred(col!("nested").is_not_null()),
+                expr!(is_not_null(col("nested"))),
             ),
         )]),
         &[

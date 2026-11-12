@@ -14,8 +14,8 @@ use super::{COMMIT_READ_SCHEMA, PhysicalPredicate, ScanMetadata, map_to_struct_o
 use crate::actions::deletion_vector::DeletionVectorDescriptor;
 use crate::engine_data::{EngineData, GetData, RowVisitor, TypedGetData as _};
 use crate::expressions::{
-    ColumnName, Expression, ExpressionRef, Predicate, PredicateRef, UnaryExpressionOp, col,
-    column_expr_ref, column_name, null_lit,
+    ColumnName, Expression, ExpressionRef, PredicateRef, UnaryExpressionOp, col, column_expr_ref,
+    column_name, expr, null_lit,
 };
 use crate::log_replay::deduplicator::{CheckpointDeduplicator, Deduplicator, FileActionInfo};
 use crate::log_replay::{
@@ -323,7 +323,7 @@ impl ScanLogReplayProcessor {
                 column_expr_ref!("partitionValues_parsed"),
                 // The transform flattens `add.*` to top-level columns, so `path` is non-null
                 // exactly for Add rows.
-                Arc::new(Predicate::is_not_null(col!("path")).into()),
+                Arc::new(expr!(is_not_null(col("path")))),
                 output_schema.clone(),
                 &state_info.eligible_physical_stats_columns,
                 Some(metrics.clone()),
@@ -1312,7 +1312,7 @@ mod tests {
     use crate::engine::sync::SyncEngine;
     use crate::expressions::{
         BinaryExpressionOp, Expression, OpaquePredicateOp, Predicate, Scalar,
-        ScalarExpressionEvaluator, UnaryExpressionOp, col, column_name, lit, null_lit,
+        ScalarExpressionEvaluator, UnaryExpressionOp, col, column_name, expr, lit, null_lit,
     };
     use crate::kernel_predicates::{
         DirectDataSkippingPredicateEvaluator, DirectPredicateEvaluator,
@@ -1723,10 +1723,10 @@ mod tests {
                 .expect("Should have row_commit_version_col patch");
             assert_eq!(
                 row_commit_version_patch.insertions,
-                [Arc::new(Expr::coalesce([
-                    col!("row_commit_version_col"),
-                    lit(5i64),
-                ]))]
+                [Arc::new(expr!(coalesce(
+                    col("row_commit_version_col"),
+                    5i64
+                )))]
             );
         }
         Ok(())
@@ -1793,7 +1793,7 @@ mod tests {
             nullable "id": INTEGER,
             nullable "name": STRING,
         };
-        let predicate = Arc::new(Predicate::gt(col!("id"), lit(0i32)));
+        let predicate = Arc::new(Predicate::from_expr(expr!(col("id") > 0i32)));
         let state_info = Arc::new(
             get_state_info_with_stats(
                 schema,
@@ -1842,7 +1842,7 @@ mod tests {
             nullable "id": INTEGER,
             nullable "value": STRING,
         };
-        let predicate = Arc::new(crate::expressions::Predicate::eq(col!("id"), lit(10i32)));
+        let predicate = Arc::new(Predicate::from_expr(expr!(col("id") == 10i32)));
         let state_info = Arc::new(
             get_state_info(
                 schema.clone(),
@@ -1890,7 +1890,9 @@ mod tests {
             nullable "value": INTEGER,
         };
         // Keep timestamps after 2024-01-15 16:00 UTC.
-        let predicate = Arc::new(col!("ts").gt(lit(Scalar::Timestamp(1_705_334_400_000_000))));
+        let predicate = Arc::new(Predicate::from_expr(expr!(
+            col("ts") > lit(Scalar::Timestamp(1_705_334_400_000_000))
+        )));
         let mut state_info = get_state_info(
             schema,
             vec!["ts".to_string()],
@@ -2374,22 +2376,22 @@ mod tests {
     #[case::stats_only(
         schema_ref! { nullable "value": INTEGER },
         vec![],
-        Arc::new(col!("value").gt(lit(5i32))),
+        Arc::new(Predicate::from_expr(expr!(col("value") > 5i32))),
         false, // use batch without partition column
     )]
     #[case::partition_predicate(
         schema_ref! { nullable "value": INTEGER, nullable "date": DATE },
         vec!["date".to_string()],
-        Arc::new(col!("date").eq(lit(Scalar::Date(17_510)))),
+        Arc::new(Predicate::from_expr(expr!(col("date") == lit(Scalar::Date(17_510))))),
         true, // use batch with partition column
     )]
     #[case::mixed_stats_and_partition(
         schema_ref! { nullable "value": INTEGER, nullable "date": DATE },
         vec!["date".to_string()],
-        Arc::new(Predicate::and(
-            col!("value").gt(lit(5i32)),
-            col!("date").eq(lit(Scalar::Date(17_510))),
-        )),
+        Arc::new(Predicate::from_expr(expr!(and(
+            col("value") > 5i32,
+            col("date") == lit(Scalar::Date(17_510)),
+        )))),
         true, // use batch with partition column
     )]
     fn data_skipping_does_not_prune_remove_actions(
@@ -2464,6 +2466,13 @@ mod tests {
             }
             Expression::Binary(b) => count_to_json(&b.left) + count_to_json(&b.right),
             Expression::Variadic(v) => v.exprs.iter().map(|e| count_to_json(e)).sum(),
+            Expression::CaseWhen(c) => {
+                c.branches
+                    .iter()
+                    .map(|(_, result)| count_to_json(result))
+                    .sum::<usize>()
+                    + count_to_json(&c.else_expr)
+            }
             Expression::Struct(fields, nullability) => {
                 fields.iter().map(|e| count_to_json(e)).sum::<usize>()
                     + nullability.as_ref().map_or(0, |e| count_to_json(e))

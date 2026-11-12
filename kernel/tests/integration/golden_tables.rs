@@ -18,7 +18,7 @@ use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::parquet::arrow::async_reader::{
     ParquetObjectReader, ParquetRecordBatchStreamBuilder,
 };
-use delta_kernel::{KernelResult, Snapshot};
+use delta_kernel::{KernelError, KernelResult, Snapshot};
 use futures::StreamExt;
 use futures::stream::TryStreamExt;
 use itertools::Itertools;
@@ -36,17 +36,17 @@ async fn read_expected(path: &Path) -> KernelResult<RecordBatch> {
     let mut batches = vec![];
     let mut schema = None;
     for meta in files.into_iter() {
-        if let Some(ext) = meta.location.extension() {
-            if ext == "parquet" {
-                let reader = ParquetObjectReader::new(store.clone(), meta.location);
-                let builder = ParquetRecordBatchStreamBuilder::new(reader).await?;
-                if schema.is_none() {
-                    schema = Some(builder.schema().clone());
-                }
-                let mut stream = builder.build()?;
-                while let Some(batch) = stream.next().await {
-                    batches.push(batch?);
-                }
+        if let Some(ext) = meta.location.extension()
+            && ext == "parquet"
+        {
+            let reader = ParquetObjectReader::new(store.clone(), meta.location);
+            let builder = ParquetRecordBatchStreamBuilder::new(reader).await?;
+            if schema.is_none() {
+                schema = Some(builder.schema().clone());
+            }
+            let mut stream = builder.build()?;
+            while let Some(batch) = stream.next().await {
+                batches.push(batch?);
             }
         }
     }
@@ -166,7 +166,7 @@ async fn latest_snapshot_test(
     engine: DefaultEngine<TokioBackgroundExecutor>,
     url: Url,
     expected_path: Option<PathBuf>,
-) -> KernelResult<()> {
+) -> delta_kernel::Result<()> {
     let snapshot = Snapshot::builder_for(url).build(&engine)?;
     let scan = snapshot.scan_builder().build()?;
     let scan_res = scan.execute(Arc::new(engine))?;
@@ -176,8 +176,10 @@ async fn latest_snapshot_test(
 
     let expected = read_expected(&expected_path.expect("expect an expected dir")).await?;
 
-    let schema = Arc::new(Schema::try_from_kernel(scan.logical_schema().as_ref())?);
-    let result = concat_batches(&schema, &batches)?;
+    let schema = Arc::new(
+        Schema::try_from_kernel(scan.logical_schema().as_ref()).map_err(KernelError::from)?,
+    );
+    let result = concat_batches(&schema, &batches).map_err(KernelError::from)?;
     let result = sort_record_batch(result)?;
     let expected = sort_record_batch(expected)?;
     assert!(
@@ -237,7 +239,7 @@ macro_rules! golden_test {
     ($test_name:literal, $test_fn:expr) => {
         paste! {
             #[tokio::test]
-            async fn [<golden_ $test_name:snake>]() -> KernelResult<()> {
+            async fn [<golden_ $test_name:snake>]() -> delta_kernel::Result<()> {
                 // we don't use _test_dir but we don't want it to go out of scope before the test
                 // is done since it will cleanup the directory when it runs drop
                 let (engine, table, expected, _test_dir) = setup_golden_table($test_name);

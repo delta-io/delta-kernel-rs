@@ -563,15 +563,14 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
-    use crate::engine::CancellableEngine;
     use crate::engine::sync::SyncEngine;
-    use crate::engine::test_delegating::DelegatingEngine;
+    use crate::engine::{CancellableEngine, DelegatingEngine};
     #[cfg(feature = "adaptive-metadata-in-dev")]
     use crate::object_store::memory::InMemory;
     use crate::schema::schema;
     use crate::table_features::TableFeature;
     use crate::unit_test_utils::create_log_path;
-    use crate::{Engine, KernelResultIterator};
+    use crate::{Engine, KernelResultIterator, Result};
 
     /// A real `_last_checkpoint` for a V2 checkpoint carries a `v2Checkpoint` object; we parse its
     /// `path` and file metadata. An empty `sidecarFiles` (a leaf checkpoint) parses to `Some([])`,
@@ -1329,7 +1328,7 @@ mod tests {
         created_time: 1739313200623,
         config: &[("delta.checkpointPolicy", "v2")],
     })]
-    fn v2_last_checkpoint_hint_contents(#[case] expected: ExpectedHint) -> KernelResult<()> {
+    fn v2_last_checkpoint_hint_contents(#[case] expected: ExpectedHint) -> Result<()> {
         use crate::unit_test_utils::load_test_table;
 
         let ExpectedHint {

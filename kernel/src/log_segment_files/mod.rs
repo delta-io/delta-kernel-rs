@@ -15,7 +15,7 @@ use std::collections::HashMap;
 
 use delta_kernel_derive::internal_api;
 use itertools::Itertools;
-use tracing::{debug, info, instrument, warn};
+use tracing::{debug, info, instrument, trace, warn};
 use url::Url;
 
 use crate::last_checkpoint_hint::LastCheckpointHint;
@@ -155,11 +155,10 @@ fn group_checkpoint_parts(
                 // a multi-part checkpoint
                 if let Some(part_files) = checkpoints.get_mut(&CheckpointInstance::MultiPart {
                     num_parts: *num_parts,
-                }) {
-                    if *part_num as usize == 1 + part_files.len() {
-                        // Safe to append because all previous parts exist
-                        part_files.push(part_file);
-                    }
+                }) && *part_num as usize == 1 + part_files.len()
+                {
+                    // Safe to append because all previous parts exist
+                    part_files.push(part_file);
                 }
             }
             Commit | StagedCommit | CompactedCommit { .. } | Crc | Unknown => {}
@@ -329,7 +328,7 @@ impl ListingAccumulator {
             // }
             // CompactedCommit { .. } => (), // Failed the bounds check above
             CompactedCommit { .. } => {
-                debug!(
+                trace!(
                     "Skipping unsupported log compaction file: {:?}",
                     file.location
                 );
@@ -775,6 +774,7 @@ impl LogSegmentFiles {
         // upper is the exclusive upper bound of the next window; adding 1 includes end_version
         // in the first window. The inclusive range passed to list_delta_log_from_storage is
         // [lower, upper - 1].
+        // TODO(#3835): Handle the exclusive upper bound when end_version is Version::MAX.
         let mut upper = end_version + 1;
         while upper > 0 {
             let lower = upper.saturating_sub(BACKWARD_SCAN_WINDOW_SIZE);

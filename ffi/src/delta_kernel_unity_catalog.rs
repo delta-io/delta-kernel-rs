@@ -12,13 +12,13 @@ use delta_kernel_ffi::handle::Handle;
 use delta_kernel_ffi::{KernelStringSlice, OptionalValue, TryFromStringSlice, kernel_string_slice};
 use delta_kernel_ffi_macros::handle_descriptor;
 use delta_kernel_unity_catalog::UCCommitter;
-use tracing::debug;
+use tracing::trace;
 use unity_catalog_delta_client_api::{
     Result as ApiResult, TableIdentifier, UpdateTableClient,
     UpdateTableRequest as ClientUpdateTableRequest,
 };
 
-use crate::error::{AllocateErrorFn, ExternResult, IntoExternResult as _};
+use crate::error::{ErrorAllocators, ExternResult, IntoExternResult as _};
 use crate::transaction::MutableCommitter;
 use crate::{ExclusiveRustString, NullableCvoid};
 
@@ -158,7 +158,7 @@ pub unsafe extern "C" fn get_uc_commit_client(
 /// Caller is responsible for passing a valid handle.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn free_uc_commit_client(commit_client: Handle<SharedFfiUCCommitClient>) {
-    debug!("released uc commit client");
+    trace!("released uc commit client");
     unsafe { commit_client.drop_handle() }
 }
 
@@ -212,9 +212,13 @@ impl<C: UpdateTableClient + 'static> Committer for FfiUCCommitter<C> {
 ///
 /// # Safety
 ///
+/// `error_allocators` must point to an initialized [`ErrorAllocators`] for this call. Its context
+/// and callbacks must remain valid for every use and support concurrent calls if shared across
+/// threads.
+///
 ///  Caller is responsible for passing a valid pointer to a SharedFfiUCCommitClient, obtained via
 ///  calling [`get_uc_commit_client`], valid KernelStringSlices for `table_id`, `catalog`,
-///  `schema`, and `table_name`, and a valid error function pointer.
+///  `schema`, and `table_name`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn get_uc_committer(
     commit_client: Handle<SharedFfiUCCommitClient>,
@@ -222,10 +226,10 @@ pub unsafe extern "C" fn get_uc_committer(
     catalog: KernelStringSlice,
     schema: KernelStringSlice,
     table_name: KernelStringSlice,
-    error_fn: AllocateErrorFn,
+    error_allocators: *const ErrorAllocators,
 ) -> ExternResult<Handle<MutableCommitter>> {
     let result = get_uc_committer_impl(commit_client, table_id, catalog, schema, table_name);
-    unsafe { result.into_extern_result(&error_fn) }
+    unsafe { result.into_extern_result(&*error_allocators) }
 }
 
 fn get_uc_committer_impl(
@@ -261,7 +265,7 @@ fn get_uc_committer_impl(
 /// Caller is responsible for passing a valid handle obtained via `get_uc_committer`
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn free_uc_committer(commit_client: Handle<MutableCommitter>) {
-    debug!("released uc committer");
+    trace!("released uc committer");
     unsafe { commit_client.drop_handle() }
 }
 
@@ -277,7 +281,7 @@ pub(crate) mod tests {
     };
 
     use super::*;
-    use crate::ffi_test_utils::{allocate_err, ok_or_panic};
+    use crate::ffi_test_utils::{TEST_ERROR_ALLOCATORS, ok_or_panic};
     use crate::{OptionalValue, allocate_kernel_string, kernel_string_slice};
 
     pub(crate) struct TestContext {
@@ -331,7 +335,7 @@ pub(crate) mod tests {
             let error_str = unsafe {
                 ok_or_panic(allocate_kernel_string(
                     kernel_string_slice!(error_msg),
-                    allocate_err,
+                    &TEST_ERROR_ALLOCATORS,
                 ))
             };
             OptionalValue::Some(error_str)
@@ -447,7 +451,7 @@ pub(crate) mod tests {
                 kernel_string_slice!(catalog),
                 kernel_string_slice!(schema),
                 kernel_string_slice!(table_name),
-                allocate_err,
+                &TEST_ERROR_ALLOCATORS,
             ))
         };
 

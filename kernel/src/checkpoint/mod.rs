@@ -84,7 +84,7 @@
 //! // Finalize the checkpoint by passing the stats
 //! writer.finalize(engine, &last_checkpoint_stats)?;
 //!
-//! # Ok::<_, KernelError>(())
+//! # Ok::<_, delta_kernel::Error>(())
 //! ```
 //!
 //! ## Warning
@@ -108,6 +108,12 @@ use itertools::Itertools;
 use tracing::info;
 use url::Url;
 
+#[cfg(feature = "declarative-plans")]
+#[allow(unused_imports)]
+pub(crate) use crate::action_reconciliation::checkpoint_shape::{CheckpointShape, CheckpointType};
+use crate::action_reconciliation::file_metadata::{
+    StatsTransformConfig, build_checkpoint_read_schema, build_checkpoint_transform,
+};
 use crate::action_reconciliation::log_replay::{
     ActionReconciliationBatch, ActionReconciliationProcessor,
 };
@@ -134,21 +140,12 @@ use crate::{
     version_as_i64,
 };
 
-#[cfg(feature = "declarative-plans")]
-mod checkpoint_shape;
-mod checkpoint_transform;
 pub(crate) mod collation_stats;
 mod sidecar;
 
-#[cfg(feature = "declarative-plans")]
-#[allow(unused_imports)]
-pub(crate) use checkpoint_shape::{CheckpointShape, CheckpointType};
-use checkpoint_transform::{
-    StatsTransformConfig, build_checkpoint_read_schema, build_checkpoint_transform,
-};
 use sidecar::{SidecarSplitter, SingleSidecarDataIterator, create_sidecar_action_batch};
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 /// Information about a freshly-written checkpoint. Pass it to
 /// [`CheckpointWriter::finalize`] to produce the `_last_checkpoint` hint file.
@@ -172,12 +169,12 @@ mod tests;
 pub struct LastCheckpointHintStats {
     /// The total number of actions stored in the checkpoint (including actions created
     /// outside the reconciliation iterator, e.g. sidecar actions).
-    num_actions: i64,
+    pub(crate) num_actions: i64,
     /// The total size in bytes of the checkpoint. For V2 checkpoint with sidecars,
     /// this is the sum of the main checkpoint file size and all sidecar file sizes.
-    size_in_bytes: i64,
+    pub(crate) size_in_bytes: i64,
     /// The number of Add-file actions in the checkpoint.
-    num_of_add_files: i64,
+    pub(crate) num_of_add_files: i64,
 }
 
 impl LastCheckpointHintStats {
@@ -236,6 +233,10 @@ pub(crate) struct WrittenCheckpointInfo {
     pub(crate) file_meta: FileMeta,
     /// Stats for the `_last_checkpoint` hint.
     pub(crate) last_checkpoint_stats: LastCheckpointHintStats,
+    /// Retained Remove actions selected by reconciliation.
+    pub(crate) num_remove_files: u64,
+    /// Actual sidecar files written, excluding the main checkpoint file.
+    pub(crate) num_sidecars: u64,
 }
 
 /// Schemas and configs needed for building the checkpoint read/output schemas.
@@ -335,7 +336,7 @@ static CHECKPOINT_ACTIONS_SCHEMA_V1: LazyLock<SchemaRef> =
 
 /// Schema for V2 checkpoints (includes checkpointMetadata action). JSON checkpoints do not embed
 /// a schema, so readers assume this schema for them.
-static CHECKPOINT_ACTIONS_SCHEMA_V2: LazyLock<SchemaRef> = lazy_schema_ref! {
+pub(crate) static CHECKPOINT_ACTIONS_SCHEMA_V2: LazyLock<SchemaRef> = lazy_schema_ref! {
     ..(base_checkpoint_action_fields()),
     (&CHECKPOINT_METADATA_FIELD),
 };
@@ -516,6 +517,7 @@ impl CheckpointWriter {
                 filtered_data: FilteredEngineData::try_new(transformed, sv)?,
                 actions_count: batch.actions_count,
                 add_actions_count: batch.add_actions_count,
+                remove_actions_count: batch.remove_actions_count,
             })
         });
 
@@ -557,15 +559,15 @@ impl CheckpointWriter {
         // Skip writing `_last_checkpoint` if the existing hint already points to a newer
         // checkpoint, to avoid regressing the hint.
         let checkpoint_version = self.snapshot.version();
-        if let Some(hint_version) = self.snapshot.log_segment().last_checkpoint_version() {
-            if hint_version > checkpoint_version {
-                info!(
-                    hint_version,
-                    checkpoint_version,
-                    "Skipping _last_checkpoint write: existing hint is newer than checkpoint"
-                );
-                return Ok(());
-            }
+        if let Some(hint_version) = self.snapshot.log_segment().last_checkpoint_version()
+            && hint_version > checkpoint_version
+        {
+            info!(
+                hint_version,
+                checkpoint_version,
+                "Skipping _last_checkpoint write: existing hint is newer than checkpoint"
+            );
+            return Ok(());
         }
 
         let data = create_last_checkpoint_data(
@@ -745,6 +747,7 @@ impl CheckpointWriter {
             filtered_data,
             actions_count: 1,
             add_actions_count: 0,
+            remove_actions_count: 0,
         })
     }
 
@@ -894,6 +897,7 @@ fn build_written_checkpoint_info(
         .ok_or_else(|| {
             KernelError::internal_error("checkpoint total size_in_bytes overflowed u64")
         })?;
+    let num_remove_files = state.remove_actions_count() as u64;
     let state = Arc::into_inner(state).ok_or_else(|| {
         KernelError::internal_error("ActionReconciliationIteratorState Arc has other references")
     })?;
@@ -905,5 +909,7 @@ fn build_written_checkpoint_info(
     Ok(WrittenCheckpointInfo {
         file_meta,
         last_checkpoint_stats,
+        num_remove_files,
+        num_sidecars: sidecar_count,
     })
 }

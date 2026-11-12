@@ -200,6 +200,15 @@ storage call may serve multiple higher-level operations.
 > `emit_parquet_read_completed` once per read call so connectors that install
 > the metrics layer still see those events from your handler.
 
+### Checksum write events
+
+To track checksum write latency and errors, use
+[ChecksumWriteSuccess](https://docs.rs/delta_kernel/latest/delta_kernel/metrics/struct.ChecksumWriteSuccess.html)
+and [ChecksumWriteFailure](https://docs.rs/delta_kernel/latest/delta_kernel/metrics/struct.ChecksumWriteFailure.html).
+A checksum that already exists produces a success event. See
+[Snapshot::write_checksum](https://docs.rs/delta_kernel/latest/delta_kernel/struct.Snapshot.html#method.write_checksum)
+for the call's behavior.
+
 ## Correlating events with MetricId
 
 Several events include an `operation_id` field of type `MetricId`. This is a

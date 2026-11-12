@@ -443,7 +443,7 @@ mod tests {
         visit_predicate_gt,
     };
     use crate::ffi_test_utils::{
-        allocate_err, assert_extern_result_error_with_message, ok_or_panic, recover_error,
+        TEST_ERROR_ALLOCATORS, assert_extern_result_error_with_message, ok_or_panic, recover_error,
     };
     #[cfg(feature = "default-engine-base")]
     use crate::scan::free_scan_metadata_arrow_result;
@@ -472,7 +472,7 @@ mod tests {
                 .unwrap();
         }
         let engine = DefaultEngineBuilder::new(storage.clone()).build();
-        let engine = engine_to_handle(Arc::new(engine), allocate_err);
+        let engine = engine_to_handle(Arc::new(engine), TEST_ERROR_ALLOCATORS);
         let table_root = kernel_string_slice!(table_root);
         let builder =
             unsafe { ok_or_panic(get_snapshot_builder(table_root, engine.shallow_copy())) };
@@ -526,7 +526,7 @@ mod tests {
         summary: &Handle<SharedIncrementalScanSummary>,
     ) -> Vec<(String, Option<String>)> {
         let keys = RefCell::new(Vec::new());
-        let ctx = std::ptr::NonNull::new(&keys as *const _ as *mut std::ffi::c_void);
+        let ctx = Some(std::ptr::NonNull::from_ref(&keys).cast());
         unsafe {
             incremental_scan_summary_visit_live_adds(summary.shallow_copy(), ctx, collect_key)
         };
@@ -537,7 +537,7 @@ mod tests {
         summary: &Handle<SharedIncrementalScanSummary>,
     ) -> Vec<(String, Option<String>)> {
         let keys = RefCell::new(Vec::new());
-        let ctx = std::ptr::NonNull::new(&keys as *const _ as *mut std::ffi::c_void);
+        let ctx = Some(std::ptr::NonNull::from_ref(&keys).cast());
         unsafe { incremental_scan_summary_visit_removes(summary.shallow_copy(), ctx, collect_key) };
         keys.into_inner()
     }
@@ -846,7 +846,7 @@ mod tests {
                 state,
                 parts.as_ptr(),
                 parts.len(),
-                allocate_err,
+                &TEST_ERROR_ALLOCATORS,
             ))
         };
         let lit = visit_expression_literal_int(state, 25);
@@ -943,7 +943,7 @@ mod tests {
                 state,
                 parts.as_ptr(),
                 parts.len(),
-                allocate_err,
+                &TEST_ERROR_ALLOCATORS,
             ))
         };
         let lit = visit_expression_literal_int(state, 25);
@@ -1069,7 +1069,7 @@ mod tests {
                     .with_task_executor(executor)
                     .build(),
             ),
-            allocate_err,
+            TEST_ERROR_ALLOCATORS,
         );
 
         // Checkpoint at v2 so the log segment for a later snapshot starts at the checkpoint and

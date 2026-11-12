@@ -30,7 +30,7 @@ pub enum Error {
 
     /// A failure represented by a kernel implementation error.
     #[error(transparent)]
-    Kernel(KernelError),
+    Kernel(#[from] KernelError),
 }
 
 /// Details of a failed conversion from a scalar into a Rust value.
@@ -104,9 +104,9 @@ pub(crate) fn add_scalar_path_context(
 }
 
 /// A result whose error is the top-level [`Error`].
-// Note: `delta_kernel::Result` is currently unused as part of the error migration tracked in:
-// https://github.com/delta-io/delta-kernel-rs/issues/3421.
-// First usages will come when the first `KernelError` is migrated to a `DeltaError`.
+///
+/// APIs that can fail with a [`DeltaError`] return this type. Other kernel APIs return
+/// [`KernelResult`]; `?` converts their errors into [`Error::Kernel`].
 pub type Result<T> = std::result::Result<T, Error>;
 
 /// A result whose error defaults to [`KernelError`].
@@ -154,16 +154,6 @@ pub enum SnapshotHintError {
         max_catalog_version: Version,
         /// The version described by the snapshot hint.
         hint: Version,
-    },
-    /// A hint marked latest conflicts with a later catalog-ratified version.
-    #[error(
-        "Invalid snapshot hint: version {hint} is marked latest but max catalog version is {max_catalog_version}"
-    )]
-    LatestVersionConflict {
-        /// The version described by the snapshot hint.
-        hint: Version,
-        /// The latest version ratified by the catalog.
-        max_catalog_version: Version,
     },
     /// The supplied log files contain log compaction files, which snapshot hints do not support.
     #[error("Invalid snapshot hint: log compaction files are not supported")]

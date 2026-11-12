@@ -10,7 +10,7 @@ use delta_kernel::table_features::{ColumnMappingMode, TableFeature};
 use delta_kernel::transaction::create_table::create_table;
 use rstest::rstest;
 use serde_json::json;
-use test_utils::test_table_setup;
+use test_utils::{assert_result_error_with_message, test_table_setup};
 
 /// V3 create-table negative paths: enabling V3 alongside an incompatible property must fail at
 /// `.build(...)` with a clear error.
@@ -122,48 +122,21 @@ fn v3_create_table_rejects_interval_column(
     Ok(())
 }
 
-/// Listing IcebergCompatV3 in writerFeatures (i.e. "supported") without setting
-/// `delta.enableIcebergCompatV3=true` must not activate V3: column mapping stays off and
-/// no nested-id metadata is set on the Map field.
+/// TODO(#3769): Stricter than the spec, which only requires column mapping to be supported when
+/// IcebergCompatV3 is supported. CREATE runs the write path checks, which require the
+/// requirements of every listed writer feature to hold.
 #[test]
-fn v3_supported_but_not_enabled_skips_cm_and_nested_ids() -> KernelResult<()> {
+fn v3_supported_but_not_enabled_requires_column_mapping() -> KernelResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
     let schema = schema_ref! {
         nullable "data": { INTEGER => nullable [nullable INTEGER] },
     };
 
-    let _ = create_table(&table_path, schema, "Test/1.0", true)
-        .with_table_properties([("delta.feature.icebergCompatV3", "supported")])
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
-        .commit(engine.as_ref())?;
-    let snapshot = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
-
-    // 1. V3 is in writerFeatures (supported).
-    let writer_features = snapshot
-        .table_configuration()
-        .protocol()
-        .writer_features()
-        .expect("writerFeatures present");
-    assert!(
-        writer_features.contains(&TableFeature::IcebergCompatV3),
-        "expected icebergCompatV3 in writerFeatures, got: {writer_features:?}",
-    );
-
-    // 2. CM is not enabled (no auto-enable from V3 being merely supported).
-    assert_eq!(
-        snapshot.table_configuration().column_mapping_mode(),
-        ColumnMappingMode::None,
-    );
-
-    // 3. No nested-id metadata set on the Map field.
-    let loaded_schema = snapshot.schema();
-    let data_field = loaded_schema.field("data").expect("data field present");
-    assert!(
-        !data_field
-            .metadata
-            .contains_key(ColumnMetadataKey::ColumnMappingNestedIds.as_ref()),
-        "unexpected delta.columnMapping.nested.ids on data: {:?}",
-        data_field.metadata,
+    assert_result_error_with_message(
+        create_table(&table_path, schema, "Test/1.0", true)
+            .with_table_properties([("delta.feature.icebergCompatV3", "supported")])
+            .build(engine.as_ref(), Box::new(FileSystemCommitter::new())),
+        "Feature 'icebergCompatV3' requires 'columnMapping' to be enabled",
     );
     Ok(())
 }
@@ -173,7 +146,7 @@ fn v3_supported_but_not_enabled_skips_cm_and_nested_ids() -> KernelResult<()> {
 /// and — critically — assigns `delta.columnMapping.nested.ids` to a Map column (regression guard
 /// for the nested-id gate that previously keyed only on V3).
 #[test]
-fn v2_create_table_enables_column_mapping_and_nested_ids() -> KernelResult<()> {
+fn v2_create_table_enables_column_mapping_and_nested_ids() -> delta_kernel::Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
     let schema = schema_ref! {
         nullable "id": LONG,

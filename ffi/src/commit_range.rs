@@ -676,7 +676,7 @@ mod tests {
     use crate::engine_funcs::{free_read_result_iter, read_result_next};
     use crate::error::FFIKernelError;
     use crate::ffi_test_utils::{
-        allocate_err, assert_extern_result_error_with_message, assert_timestamp_is_recent,
+        TEST_ERROR_ALLOCATORS, assert_extern_result_error_with_message, assert_timestamp_is_recent,
         build_snapshot, error_only_engine_handle, ok_or_panic,
     };
     use crate::log_path::LogPathArray;
@@ -712,7 +712,10 @@ mod tests {
             .unwrap();
         }
         let engine = DefaultEngineBuilder::new(storage.clone()).build();
-        (engine_to_handle(Arc::new(engine), allocate_err), table_root)
+        (
+            engine_to_handle(Arc::new(engine), TEST_ERROR_ALLOCATORS),
+            table_root,
+        )
     }
 
     /// Build a `[start_version, end_version]` commit range handle via the FFI builder API.
@@ -746,7 +749,7 @@ mod tests {
     /// Drain a commit-actions iterator, returning the versions yielded in order.
     unsafe fn drain_versions(iter: Handle<SharedCommitActionsIterator>) -> Vec<u64> {
         let mut versions = Vec::<u64>::new();
-        let ctx = Some(unsafe { NonNull::new_unchecked(&mut versions) }.cast());
+        let ctx = Some(NonNull::from_mut(&mut versions).cast());
         while unsafe {
             ok_or_panic(commit_range_commits_next(
                 iter.shallow_copy(),
@@ -982,7 +985,7 @@ mod tests {
         }
         let engine = engine_to_handle(
             Arc::new(DefaultEngineBuilder::new(storage).build()),
-            allocate_err,
+            TEST_ERROR_ALLOCATORS,
         );
 
         let builder = unsafe {
@@ -1163,7 +1166,7 @@ mod tests {
                 ctx.engine.shallow_copy(),
             ))
         };
-        let rows_ctx = Some(unsafe { NonNull::new_unchecked(&mut ctx.total_rows) }.cast());
+        let rows_ctx = Some(NonNull::from_mut(&mut ctx.total_rows).cast());
         while unsafe { ok_or_panic(read_result_next(iter.shallow_copy(), rows_ctx, count_rows)) } {}
         unsafe { free_read_result_iter(iter) }
         unsafe { free_commit_action(action) }
@@ -1188,7 +1191,7 @@ mod tests {
             engine: unsafe { engine.shallow_copy() },
             total_rows: 0,
         };
-        let ctx_ptr = Some(unsafe { NonNull::new_unchecked(&mut ctx) }.cast());
+        let ctx_ptr = Some(NonNull::from_mut(&mut ctx).cast());
         while unsafe {
             ok_or_panic(commit_range_commits_next(
                 iter.shallow_copy(),

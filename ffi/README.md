@@ -170,6 +170,10 @@ The examples include comprehensive testing capabilities:
 
 ### Running Tests
 
+The read-table and read-table-changes tests use tables from the modern DAT corpus. Run
+`cargo build -p acceptance` from the repository root to download the pinned corpus into
+`acceptance/workloads/` before running these tests.
+
 After building an example, you can run the associated tests:
 
 ```sh
@@ -199,3 +203,20 @@ By default the VSCode C/C++ Extension does not use any defines flags. You can op
         "DEFINE_SYNC_ENGINE"
     ]
 ```
+
+## Error allocation
+
+Register both error callbacks by passing a pointer to `ErrorAllocators` to engine constructors.
+Builders and engines copy the table, so the table itself need only live through registration.
+Callback code and connector context must remain valid for every call, including concurrent calls
+when the engine is shared. Standalone FFI functions borrow an allocator table directly.
+
+Kernel errors provide `KernelErrorInfo` (numeric code and message). Delta errors provide
+`DeltaErrorInfo` (condition, optional SQLSTATE, named parameters, and message). Callbacks must copy
+any information they retain after returning. Each callback returns a connector-owned error object
+as `void*`, or NULL if allocation fails. `ExternResult::Err` returns that pointer unchanged; the
+connector frees it. Callbacks must not unwind across FFI. See `examples/common/kernel_utils.c` for
+both callbacks and their shared registration table.
+
+This changes constructor and standalone function signatures and removes the `EngineError` layout
+requirement. Rebuild bindings against the generated headers and supply both callbacks.

@@ -21,7 +21,8 @@ use crate::scan::log_replay::STATS_NAME;
 pub use crate::scan::log_replay::{CLUSTERING_PROVIDER_NAME, TAGS_NAME};
 use crate::schema::void_utils::validate_schema_for_write;
 use crate::schema::{
-    ColumnDefault, MapType, SchemaRef, SchemaStructPatchBuilder, StructField, lazy_schema_ref,
+    ColumnDefault, GeneratedColumn, MapType, SchemaRef, SchemaStructPatchBuilder, StructField,
+    lazy_schema_ref,
 };
 use crate::snapshot::{Snapshot, SnapshotRef};
 use crate::table_configuration::TableConfiguration;
@@ -332,6 +333,9 @@ pub struct Transaction<STATE = UpdateTable, MODE: ExecutionMode = Imperative> {
     // constraints.
     #[cfg(feature = "check-constraints-in-dev")]
     check_constraints_acknowledged: bool,
+    // Whether the connector acknowledged responsibility for enforcing this table's generated
+    // columns.
+    generated_columns_acknowledged: bool,
     // Whether the connector acknowledged responsibility for preserving Row IDs and Row Commit
     // Versions.
     row_tracking_preservation_acknowledged: bool,
@@ -411,6 +415,41 @@ impl<STATE, MODE: ExecutionMode> Transaction<STATE, MODE> {
     #[cfg(feature = "check-constraints-in-dev")]
     pub fn ack_check_constraints(&mut self) {
         self.check_constraints_acknowledged = true;
+    }
+
+    /// The effective [`GeneratedColumn`]s of this transaction, in schema order. Empty when the
+    /// table has none, or when its protocol doesn't support the `generatedColumns` writer feature.
+    ///
+    /// Each generated column's value is defined by a SQL expression over the row's other columns.
+    /// See [`Self::ack_generated_columns`] for what a connector must do before writing to a table
+    /// with generated columns.
+    ///
+    /// # Errors
+    ///
+    /// Returns a schema error if a generated column's `delta.generationExpression` metadata is not
+    /// a string.
+    pub fn generated_columns(&self) -> KernelResult<Vec<GeneratedColumn>> {
+        self.effective_table_config.generated_columns()
+    }
+
+    /// Acknowledges that the connector enforces this table's generated columns.
+    ///
+    /// Only the connector sees the rows it writes, so the connector evaluates generation
+    /// expressions. It must:
+    /// - Discover the generated columns of this transaction via [`Self::generated_columns`] and
+    ///   parse each one's [`raw_sql`](GeneratedColumn::raw_sql) itself. The SQL refers to logical
+    ///   column names.
+    /// - Compute each generated column from its expression when the write omits the column.
+    /// - Make every written row, including its partition values, satisfy `(<value> <=> <generation
+    ///   expression>) IS TRUE` for each generated column. `<=>` is null-safe equality, so a `NULL`
+    ///   value matches a `NULL` expression result. This includes files written for an earlier
+    ///   commit attempt, such as one that conflicted, and validated against an older table version.
+    ///
+    /// The acknowledgement covers whatever this transaction commits. Without it,
+    /// [`write_state`](Transaction::write_state) and [`commit`](Self::commit) fail whenever this
+    /// transaction has effective generated columns.
+    pub fn ack_generated_columns(&mut self) {
+        self.generated_columns_acknowledged = true;
     }
 
     /// Replaces operation metrics recorded in `commitInfo`.
@@ -621,12 +660,14 @@ impl<STATE, MODE: ExecutionMode> Transaction<STATE, MODE> {
     /// configuration.
     ///
     /// Returns an error if the table has an empty or unsupported schema, or if the table declares
-    /// column defaults or CHECK constraints that the connector has not acknowledged.
+    /// column defaults, CHECK constraints, or generated columns that the connector has not
+    /// acknowledged.
     pub fn write_state(&self) -> KernelResult<Arc<WriteState>> {
         self.ensure_schema_non_empty_for_write_state()?;
         self.ensure_column_defaults_acknowledged()?;
         #[cfg(feature = "check-constraints-in-dev")]
         self.ensure_check_constraints_acknowledged()?;
+        self.ensure_generated_columns_acknowledged()?;
         self.validate_for_data_write()?;
         // The effective table configuration can change while building a transaction, so this
         // state must be derived on demand rather than cached on the transaction. TODO(#3149):
@@ -702,6 +743,7 @@ impl<STATE, MODE: ExecutionMode> Transaction<STATE, MODE> {
             column_defaults_acknowledged: false,
             #[cfg(feature = "check-constraints-in-dev")]
             check_constraints_acknowledged: false,
+            generated_columns_acknowledged: false,
             row_tracking_preservation_acknowledged: false,
             is_blind_append: false,
             #[cfg(feature = "adaptive-metadata-in-dev")]
@@ -725,6 +767,7 @@ impl<STATE, MODE: ExecutionMode> Transaction<STATE, MODE> {
             (true, true) => CommitType::CatalogManagedCreate,
             (true, false) => CommitType::PathBasedCreate,
             (false, true) => CommitType::CatalogManagedWrite,
+            // TODO(#3852): Publish retained catalog commits before executing a path-based write.
             (false, false) => CommitType::PathBasedWrite,
         }
     }
@@ -1001,6 +1044,20 @@ impl<STATE, MODE: ExecutionMode> Transaction<STATE, MODE> {
         Ok(())
     }
 
+    /// Fails `write_state` and `commit` when this transaction has effective generated columns that
+    /// the connector hasn't acknowledged.
+    fn ensure_generated_columns_acknowledged(&self) -> KernelResult<()> {
+        require!(
+            self.generated_columns_acknowledged
+                || self.effective_table_config.generated_columns()?.is_empty(),
+            KernelError::invalid_transaction_state(
+                "Writing to a table with generated columns requires calling \
+                 Transaction::ack_generated_columns() first",
+            )
+        );
+        Ok(())
+    }
+
     fn ensure_row_tracking_preservation_acknowledged(&self) -> KernelResult<()> {
         if !self
             .effective_table_config
@@ -1143,6 +1200,7 @@ impl<STATE, MODE: ExecutionMode> Transaction<STATE, MODE> {
 
         #[cfg(feature = "check-constraints-in-dev")]
         self.ensure_check_constraints_acknowledged()?;
+        self.ensure_generated_columns_acknowledged()?;
 
         // TODO(zach): we currently do this in two passes - can we do it in one and still keep refs
         // in the HashSet?
@@ -1370,6 +1428,8 @@ impl<STATE, MODE: ExecutionMode> Transaction<STATE, MODE> {
             #[cfg(feature = "adaptive-metadata-in-dev")]
             last_manifest_commit: commit_info.last_manifest_commit,
             is_incremental_safe,
+            unsupported_operation: (!is_incremental_safe)
+                .then(|| self.operation.as_str().to_string()),
         })
     }
 
@@ -1584,13 +1644,13 @@ mod tests {
     use crate::unit_test_utils::{
         adaptive_metadata_table_configuration, test_schema_flat_with_column_mapping,
     };
-    use crate::{EvaluationHandler, Expression, KernelResultIterator, Snapshot};
+    use crate::{EvaluationHandler, Expression, KernelResultIterator, Result, Snapshot};
 
     #[rstest]
     fn transaction_constructor_initializes_all_defaults(
         #[values(false, true)] expected_data_change: bool,
         #[values("", "test-engine")] expected_engine_info: &str,
-    ) -> KernelResult<()> {
+    ) -> Result<()> {
         let (_engine, snapshot, _tempdir) = load_test_table("table-without-dv-small")?;
         let _guard = tracing::subscriber::set_default(tracing_subscriber::registry());
         let expected_span = tracing::info_span!("transaction_constructor_defaults");
@@ -1641,6 +1701,7 @@ mod tests {
             column_defaults_acknowledged,
             #[cfg(feature = "check-constraints-in-dev")]
             check_constraints_acknowledged,
+            generated_columns_acknowledged,
             row_tracking_preservation_acknowledged,
             is_blind_append,
             #[cfg(feature = "adaptive-metadata-in-dev")]
@@ -1675,6 +1736,7 @@ mod tests {
         assert!(!column_defaults_acknowledged);
         #[cfg(feature = "check-constraints-in-dev")]
         assert!(!check_constraints_acknowledged);
+        assert!(!generated_columns_acknowledged);
         assert!(!row_tracking_preservation_acknowledged);
         assert!(!is_blind_append);
         assert!(dv_matched_files.is_empty());
@@ -1686,7 +1748,7 @@ mod tests {
     }
 
     #[test]
-    fn transaction_constructor_generates_unique_operation_ids() -> KernelResult<()> {
+    fn transaction_constructor_generates_unique_operation_ids() -> Result<()> {
         let (_engine, snapshot, _tempdir) = load_test_table("table-without-dv-small")?;
         let first = Transaction::<UpdateTable>::new(
             TransactionBuilderState::default(),
@@ -1710,7 +1772,7 @@ mod tests {
     }
 
     #[test]
-    fn transaction_constructor_preserves_shared_intent() -> KernelResult<()> {
+    fn transaction_constructor_preserves_shared_intent() -> Result<()> {
         let (_engine, snapshot, _tempdir) = load_test_table("table-without-dv-small")?;
         let expected_parameters = HashMap::from([("mode".into(), Some("Create".into()))]);
         let expected_metrics = HashMap::from([("numFiles".into(), Some("3".into()))]);
@@ -1863,7 +1925,7 @@ mod tests {
         (engine, snapshot)
     }
 
-    fn setup_dv_supported_but_disabled_table() -> KernelResult<(Arc<dyn Engine>, Arc<Snapshot>)> {
+    fn setup_dv_supported_but_disabled_table() -> Result<(Arc<dyn Engine>, Arc<Snapshot>)> {
         let storage = Arc::new(InMemory::new());
         let table_root = url::Url::parse("memory:///").unwrap();
         let engine = Arc::new(SyncEngine::new_with_store(storage.clone()));
@@ -1894,7 +1956,8 @@ mod tests {
 
         let commit_path = Path::from("_delta_log/00000000000000000000.json");
         let rt = tokio::runtime::Runtime::new().unwrap();
-        rt.block_on(storage.put(&commit_path, actions.into()))?;
+        rt.block_on(storage.put(&commit_path, actions.into()))
+            .map_err(KernelError::from)?;
         let engine: Arc<dyn Engine> = engine;
         let snapshot = Snapshot::builder_for(table_root).build(engine.as_ref())?;
         Ok((engine, snapshot))
@@ -2036,7 +2099,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_changes_are_applied_once_and_persisted_on_commit() -> KernelResult<()> {
+    fn schema_changes_are_applied_once_and_persisted_on_commit() -> Result<()> {
         let (engine, txn, _tempdir) = create_existing_table_txn_with(true, |builder| {
             builder.add_column(StructField::nullable("first_column", DataType::INTEGER))
         })?;
@@ -2091,7 +2154,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_add_struct_then_nested_field_is_persisted_on_commit() -> KernelResult<()> {
+    fn schema_add_struct_then_nested_field_is_persisted_on_commit() -> Result<()> {
         let (engine, txn, _tempdir) = create_existing_table_txn_with(true, |builder| {
             builder
                 .add_column(StructField::nullable(
@@ -2119,7 +2182,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_changes_can_precede_staged_data_in_the_same_commit() -> KernelResult<()> {
+    fn schema_changes_can_precede_staged_data_in_the_same_commit() -> Result<()> {
         let (engine, mut txn, _tempdir) = create_existing_table_txn_with(true, |builder| {
             builder.add_column(StructField::nullable("fresh_column", DataType::INTEGER))
         })?;
@@ -2325,7 +2388,7 @@ mod tests {
     fn snapshot_and_partitioned_write_context(
         table_path: &str,
         partition_values: HashMap<String, Scalar>,
-    ) -> KernelResult<(Arc<Snapshot>, BoundWriteContext)> {
+    ) -> Result<(Arc<Snapshot>, BoundWriteContext)> {
         let engine = SyncEngine::new();
         let path = std::fs::canonicalize(PathBuf::from(table_path)).unwrap();
         let url = url::Url::from_directory_path(path).unwrap();
@@ -2370,7 +2433,7 @@ mod tests {
     fn test_partition_columns_materialized_in_logical_to_physical(
         #[case] table_path: &str,
         #[case] materialized: bool,
-    ) -> KernelResult<()> {
+    ) -> Result<()> {
         let (snapshot, wc) = snapshot_and_partitioned_write_context(
             table_path,
             HashMap::from([("letter".to_string(), Scalar::String("a".into()))]),
@@ -2394,7 +2457,8 @@ mod tests {
                 Arc::new(Int64Array::from(vec![42])) as ArrayRef,
                 Arc::new(Float64Array::from(vec![1.5])),
             ],
-        )?;
+        )
+        .map_err(KernelError::from)?;
         let rb = eval_logical_to_physical(&wc, batch)?;
 
         let rb_schema = rb.schema();
@@ -2500,7 +2564,7 @@ mod tests {
 
     /// Physical schema should include partition columns when materializePartitionColumns is on.
     #[test]
-    fn test_physical_schema_includes_partition_columns_when_materialized() -> KernelResult<()> {
+    fn test_physical_schema_includes_partition_columns_when_materialized() -> Result<()> {
         let (_snapshot, write_context) = snapshot_and_partitioned_write_context(
             "./tests/data/partitioned_with_materialize_feature/",
             HashMap::from([("letter".to_string(), Scalar::String("a".into()))]),
@@ -2543,7 +2607,7 @@ mod tests {
         #[case] partition_values: Option<HashMap<String, Scalar>>,
         #[case] expected_msg: &str,
         #[case] unexpected_msg: Option<&str>,
-    ) -> KernelResult<()> {
+    ) -> Result<()> {
         let engine = SyncEngine::new();
         let path = std::fs::canonicalize(PathBuf::from(table_path)).unwrap();
         let url = url::Url::from_directory_path(path).unwrap();
@@ -2596,7 +2660,7 @@ mod tests {
     }
 
     #[test]
-    fn test_update_deletion_vectors_requires_enablement_property() -> KernelResult<()> {
+    fn test_update_deletion_vectors_requires_enablement_property() -> Result<()> {
         let (engine, snapshot) = setup_dv_supported_but_disabled_table()?;
         let mut txn = create_dv_transaction(snapshot, engine.as_ref())?;
 
@@ -2794,15 +2858,14 @@ mod tests {
     }
 
     /// Build a transaction on a writable copy of the `table-without-dv-small` fixture.
-    fn create_existing_table_txn() -> KernelResult<(Arc<dyn Engine>, Transaction, tempfile::TempDir)>
-    {
+    fn create_existing_table_txn() -> Result<(Arc<dyn Engine>, Transaction, tempfile::TempDir)> {
         create_existing_table_txn_with(true, |builder| builder)
     }
 
     fn create_existing_table_txn_with(
         data_change: bool,
         configure: impl FnOnce(UpdateTableTransactionBuilder) -> UpdateTableTransactionBuilder,
-    ) -> KernelResult<(Arc<dyn Engine>, Transaction, tempfile::TempDir)> {
+    ) -> Result<(Arc<dyn Engine>, Transaction, tempfile::TempDir)> {
         let (url, tempdir) = copy_test_table("table-without-dv-small")?;
         let engine: Arc<dyn Engine> = Arc::new(SyncEngine::new());
         let snapshot = Snapshot::builder_for(url).build(engine.as_ref())?;
@@ -2817,7 +2880,7 @@ mod tests {
 
     #[cfg(feature = "adaptive-metadata-in-dev")]
     #[test]
-    fn test_commit_rejects_file_actions_on_iceberg_native_v4_table() -> KernelResult<()> {
+    fn test_commit_rejects_file_actions_on_iceberg_native_v4_table() -> Result<()> {
         let (engine, mut txn, _tempdir) = create_existing_table_txn()?;
         txn.replace_effective_table_config(adaptive_metadata_table_configuration(
             test_schema_flat_with_column_mapping(),
@@ -2829,6 +2892,31 @@ mod tests {
             err.to_string().contains("icebergNativeV4"),
             "unexpected error: {err}"
         );
+        Ok(())
+    }
+
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[test]
+    fn test_ctas_rejected_on_iceberg_native_v4_table() -> KernelResult<()> {
+        let tempdir = tempfile::tempdir()?;
+        let table_path = tempdir.path().join("table");
+        std::fs::create_dir(&table_path)?;
+        let engine = SyncEngine::new();
+        let mut txn = create_table(
+            table_path.to_string_lossy(),
+            schema_ref! { nullable "id": INTEGER },
+            "test-engine",
+            true,
+        )
+        .with_table_properties([("delta.enableIcebergNativeV4", "true")])
+        .build(&engine, Box::new(FileSystemCommitter::new()))?;
+        add_dummy_file(&mut txn);
+
+        assert_result_error_with_message(
+            txn.commit(&engine),
+            "commits to icebergNativeV4-preview tables cannot include file actions",
+        );
+        assert!(!table_path.join("_delta_log").exists());
         Ok(())
     }
 
@@ -2867,10 +2955,10 @@ mod tests {
         #[case] is_create_table: bool,
         #[case] operation: CommitOperation,
         #[case] expected: &str,
-    ) -> KernelResult<()> {
+    ) -> Result<()> {
         // Public builders reject these states. Mutate private intent to test the runtime guard.
         let result = if is_create_table {
-            let tempdir = tempfile::tempdir()?;
+            let tempdir = tempfile::tempdir().map_err(KernelError::from)?;
             let engine = SyncEngine::new();
             let mut txn = create_table(
                 tempdir.path().to_string_lossy(),
@@ -2894,7 +2982,7 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_blind_append_success() -> KernelResult<()> {
+    fn test_validate_blind_append_success() -> Result<()> {
         let (_engine, mut txn, _tempdir) =
             create_existing_table_txn_with(true, UpdateTableTransactionBuilder::with_blind_append)?;
         add_dummy_file(&mut txn);
@@ -2903,7 +2991,7 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_blind_append_requires_adds() -> KernelResult<()> {
+    fn test_validate_blind_append_requires_adds() -> Result<()> {
         let (_engine, txn, _tempdir) =
             create_existing_table_txn_with(true, UpdateTableTransactionBuilder::with_blind_append)?;
         let result = txn.validate_blind_append_semantics();
@@ -2915,7 +3003,7 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_blind_append_requires_data_change() -> KernelResult<()> {
+    fn test_validate_blind_append_requires_data_change() -> Result<()> {
         let (_engine, mut txn, _tempdir) =
             create_existing_table_txn_with(true, UpdateTableTransactionBuilder::with_blind_append)?;
         // Exercise defensive commit validation of an invalid internal state.
@@ -2930,7 +3018,7 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_blind_append_rejects_removes() -> KernelResult<()> {
+    fn test_validate_blind_append_rejects_removes() -> Result<()> {
         let (_engine, mut txn, _tempdir) =
             create_existing_table_txn_with(true, UpdateTableTransactionBuilder::with_blind_append)?;
         add_dummy_file(&mut txn);
@@ -2947,7 +3035,7 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_blind_append_rejects_dv_updates() -> KernelResult<()> {
+    fn test_validate_blind_append_rejects_dv_updates() -> Result<()> {
         let (_engine, mut txn, _tempdir) =
             create_existing_table_txn_with(true, UpdateTableTransactionBuilder::with_blind_append)?;
         add_dummy_file(&mut txn);
@@ -2998,7 +3086,7 @@ mod tests {
     }
 
     #[test]
-    fn test_blind_append_commit_rejects_no_adds() -> KernelResult<()> {
+    fn test_blind_append_commit_rejects_no_adds() -> Result<()> {
         let (_engine, txn, _tempdir) =
             create_existing_table_txn_with(true, UpdateTableTransactionBuilder::with_blind_append)?;
         // No files added — commit should fail with blind append validation
@@ -3014,7 +3102,7 @@ mod tests {
     }
 
     #[test]
-    fn test_blind_append_commit_success() -> KernelResult<()> {
+    fn test_blind_append_commit_success() -> Result<()> {
         let (engine, mut txn, _tempdir) =
             create_existing_table_txn_with(true, UpdateTableTransactionBuilder::with_blind_append)?;
         add_dummy_file(&mut txn);
@@ -3038,7 +3126,7 @@ mod tests {
     // the full deletion vector write workflow including the DvMatchVisitor logic.
 
     #[test]
-    fn test_commit_io_error_returns_retryable_transaction() -> KernelResult<()> {
+    fn test_commit_io_error_returns_retryable_transaction() -> Result<()> {
         let (engine, snapshot, _tempdir) = load_test_table("table-without-dv-small")?;
         let mut txn = snapshot
             .update_table(UpdateTableOperation::Write, "test-engine", true)
@@ -3060,7 +3148,7 @@ mod tests {
     }
 
     #[test]
-    fn test_existing_table_txn_debug() -> KernelResult<()> {
+    fn test_existing_table_txn_debug() -> Result<()> {
         let (_engine, txn, _tempdir) = create_existing_table_txn()?;
         let debug_str = format!("{txn:?}");
         // Existing-table transactions should include the snapshot version number
@@ -3411,7 +3499,7 @@ mod tests {
     }
 
     #[test]
-    fn test_commit_metadata_receives_ict_not_wall_time() -> KernelResult<()> {
+    fn test_commit_metadata_receives_ict_not_wall_time() -> Result<()> {
         // Set up a table with ICT enabled and a very high previous ICT so that the
         // monotonicity rule (max(wall_time, prev_ict + 1)) produces a value strictly
         // greater than the current wall time. This lets us verify the computed ICT is
@@ -3502,7 +3590,7 @@ mod tests {
     }
 
     #[test]
-    fn test_commit_io_error_emits_retryable_io_failure_metric() -> KernelResult<()> {
+    fn test_commit_io_error_emits_retryable_io_failure_metric() -> Result<()> {
         let (engine, snapshot, _tempdir) = load_test_table("table-without-dv-small")?;
         let reporter = Arc::new(CapturingReporter::default());
         let _guard = install_thread_local_metrics_reporter(reporter.clone());
@@ -3519,7 +3607,7 @@ mod tests {
     }
 
     #[test]
-    fn test_commit_terminal_error_emits_error_failure_metric() -> KernelResult<()> {
+    fn test_commit_terminal_error_emits_error_failure_metric() -> Result<()> {
         let (engine, snapshot, _tempdir) = load_test_table("table-without-dv-small")?;
         let reporter = Arc::new(CapturingReporter::default());
         let _guard = install_thread_local_metrics_reporter(reporter.clone());

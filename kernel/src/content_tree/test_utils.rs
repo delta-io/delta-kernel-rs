@@ -55,6 +55,7 @@ pub(crate) fn added_data_entry(
         record_count: num_records,
         file_size_in_bytes: size,
         content_stats: None,
+        tight_stats: None,
         manifest_info: None,
         key_metadata: None,
         split_offsets: None,
@@ -148,10 +149,15 @@ mod tests {
     use crate::object_store::memory::InMemory;
     use crate::schema::{ColumnMetadataKey, DataType, MetadataValue, StructField, StructType};
 
+    /// Covers `tight_stats` as `Some(true)`, `Some(false)`, and `None`.
     fn manifest_entries() -> Vec<ContentTreeNodeEntry> {
+        let mut tight = added_data_entry("a.parquet", 100, 10, 0, 5);
+        tight.tight_stats = Some(true);
+        let mut loose = added_data_entry("b.parquet", 200, 20, 10, 5);
+        loose.tight_stats = Some(false);
         vec![
-            added_data_entry("a.parquet", 100, 10, 0, 5),
-            added_data_entry("b.parquet", 200, 20, 10, 5),
+            tight,
+            loose,
             data_manifest_entry("leaf.parquet", 300, TrackingStatus::Existing),
         ]
     }

@@ -27,8 +27,8 @@ use crate::engine_data::FilteredEngineData;
 use crate::error::KernelError;
 use crate::expressions::UnaryExpressionOp::ToJson;
 use crate::expressions::{
-    ArrayData, ColumnName, ExpressionStructPatch, ExpressionStructPatchBuilder, col, column_name,
-    lit, null_lit,
+    ArrayData, ColumnName, ExpressionStructPatch, ExpressionStructPatchBuilder, Predicate, col,
+    column_name, lit, null_lit,
 };
 use crate::log_replay::HasSelectionVector;
 use crate::metrics::CommitFailureReason;
@@ -49,7 +49,7 @@ use crate::table_features::TableFeature;
 use crate::utils::require;
 use crate::{
     DataType, Engine, EngineData, Expression, ExpressionEvaluator, KernelResult,
-    KernelResultIterator, Predicate, RowVisitor, Version, create_row, version_as_i64,
+    KernelResultIterator, RowVisitor, Version, create_row, version_as_i64,
 };
 
 mod update_table;
@@ -365,9 +365,12 @@ impl<STATE> Transaction<STATE, Imperative> {
         metadata: Option<&Metadata>,
         set_transactions: Vec<SetTransaction>,
     ) -> KernelResult<CommitBatches<'a>> {
-        let set_transaction_actions = set_transactions
-            .into_iter()
-            .map(|txn| create_row(engine, LOG_TXN_SCHEMA.clone(), txn));
+        let set_transaction_actions = (!set_transactions.is_empty()).then(|| {
+            let rows = set_transactions.into_iter().map(|txn| vec![txn.into()]);
+            engine
+                .evaluation_handler()
+                .create_many(LOG_TXN_SCHEMA.clone(), Vec::from_iter(rows))
+        });
         let commit_info_action = self.generate_commit_info(engine, kernel_commit_info);
         let protocol_action = protocol
             .map(|protocol| create_row(engine, LOG_PROTOCOL_SCHEMA.clone(), protocol.clone()))
@@ -381,11 +384,12 @@ impl<STATE> Transaction<STATE, Imperative> {
 
         let dm_changes =
             self.generate_domain_metadata_actions(engine, row_tracking_domain_metadata)?;
-        let domain_metadata_actions: Vec<_> = dm_changes
-            .iter()
-            .cloned()
-            .map(|dm| create_row(engine, LOG_DOMAIN_METADATA_SCHEMA.clone(), dm))
-            .collect();
+        let domain_metadata_actions = (!dm_changes.is_empty()).then(|| {
+            let rows = dm_changes.iter().map(|dm| vec![dm.clone().into()]);
+            engine
+                .evaluation_handler()
+                .create_many(LOG_DOMAIN_METADATA_SCHEMA.clone(), Vec::from_iter(rows))
+        });
 
         let dv_update_actions = self.generate_dv_update_actions(engine)?;
 
@@ -451,27 +455,27 @@ impl<STATE> Transaction<STATE, Imperative> {
             // one pass.
             stats_verifier::verify_num_records_present(add_files)?;
         }
-        if let Some(ref clustering_cols) = self.physical_clustering_columns {
-            if !clustering_cols.is_empty() {
-                let physical_schema = self.effective_table_config.physical_schema();
-                let columns_with_types: Vec<(ColumnName, DataType)> = clustering_cols
-                    .iter()
-                    .map(|col| {
-                        let data_type = physical_schema
-                            .fields_of_path(col)?
-                            .last()
-                            .map(|field| field.data_type().clone())
-                            .ok_or_else(|| {
-                                KernelError::internal_error(format!(
-                                    "Required column '{col}' not found in table schema"
-                                ))
-                            })?;
-                        Ok((col.clone(), data_type))
-                    })
-                    .collect::<KernelResult<_>>()?;
-                let verifier = StatsColumnVerifier::new(columns_with_types);
-                verifier.verify(add_files)?;
-            }
+        if let Some(ref clustering_cols) = self.physical_clustering_columns
+            && !clustering_cols.is_empty()
+        {
+            let physical_schema = self.effective_table_config.physical_schema();
+            let columns_with_types: Vec<(ColumnName, DataType)> = clustering_cols
+                .iter()
+                .map(|col| {
+                    let data_type = physical_schema
+                        .fields_of_path(col)?
+                        .last()
+                        .map(|field| field.data_type().clone())
+                        .ok_or_else(|| {
+                            KernelError::internal_error(format!(
+                                "Required column '{col}' not found in table schema"
+                            ))
+                        })?;
+                    Ok((col.clone(), data_type))
+                })
+                .collect::<KernelResult<_>>()?;
+            let verifier = StatsColumnVerifier::new(columns_with_types);
+            verifier.verify(add_files)?;
         }
         Ok(())
     }
@@ -726,10 +730,10 @@ where
             add_files_batch.has_field(&column_name!(TAGS_NAME)),
             add_files_batch.has_field(&column_name!(CLUSTERING_PROVIDER_NAME)),
         );
-        if let Some((cached_columns, evaluator)) = &last_evaluator {
-            if *cached_columns == optional_columns {
-                return evaluator.evaluate(add_files_batch.deref());
-            }
+        if let Some((cached_columns, evaluator)) = &last_evaluator
+            && *cached_columns == optional_columns
+        {
+            return evaluator.evaluate(add_files_batch.deref());
         }
         let input_schema = add_files_schema_with(optional_columns.0, optional_columns.1);
         let input_schema = if row_tracking {
@@ -779,17 +783,17 @@ fn build_remove_struct_patch(
     // Note: The Delta protocol requires `partitionValues`, `size`, and `tags` when
     // `extendedFileMetadata` is true. We require only `partitionValues` and `size` to match Spark.
     // Under adaptiveMetadata both are guaranteed present
-    let extended_file_metadata = Predicate::and_from([
+    let extended_file_metadata = Expression::from_pred(Predicate::and(
         col!(SIZE_NAME).is_not_null(),
         col!(FILE_CONSTANT_VALUES_NAME, PARTITION_VALUES_NAME).is_not_null(),
-    ]);
+    ));
     let mut patch = ExpressionStructPatchBuilder::new()
         // deletionTimestamp
         .insert_after("path", deletion_timestamp)
         // dataChange
         .insert_after("path", lit(data_change))
         // extended_file_metadata
-        .insert_after("path", Expression::from(extended_file_metadata))
+        .insert_after("path", extended_file_metadata)
         .insert_after(
             "path",
             col!(FILE_CONSTANT_VALUES_NAME, PARTITION_VALUES_NAME),
@@ -853,11 +857,11 @@ mod tests {
     use crate::arrow::datatypes::{DataType as ArrowDataType, Schema as ArrowSchema};
     use crate::arrow::record_batch::RecordBatch;
     use crate::committer::FileSystemCommitter;
+    use crate::engine::DelegatingEngine;
     use crate::engine::arrow_conversion::TryIntoArrow;
     use crate::engine::arrow_data::ArrowEngineData;
     use crate::engine::arrow_expression::ArrowEvaluationHandler;
     use crate::engine::sync::SyncEngine;
-    use crate::engine::test_delegating::DelegatingEngine;
     use crate::expressions::{ExpressionRef, MapData, PredicateRef, Scalar, StructData};
     use crate::scan::log_replay::PATH_NAME;
     use crate::schema::{MapType, column_name, schema};
@@ -866,7 +870,7 @@ mod tests {
     use crate::transaction::create_table::create_table;
     use crate::transaction::operation::UpdateTableOperation;
     use crate::unit_test_utils::{copy_test_table, create_valid_add_file_batch, test_schema_flat};
-    use crate::{EvaluationHandler, ExpressionEvaluator, PredicateEvaluator, Snapshot};
+    use crate::{EvaluationHandler, ExpressionEvaluator, PredicateEvaluator, Result, Snapshot};
 
     impl Transaction {
         /// Set clustering columns for testing purposes without needing a table
@@ -1054,10 +1058,10 @@ mod tests {
         } else {
             lit(commit_timestamp)
         };
-        let expected_extended_file_metadata = Expression::from_pred(Predicate::and_from([
+        let expected_extended_file_metadata = Expression::from_pred(Predicate::and(
             col!(SIZE_NAME).is_not_null(),
             col!(FILE_CONSTANT_VALUES_NAME, PARTITION_VALUES_NAME).is_not_null(),
-        ]));
+        ));
         assert_eq!(deletion_timestamp.as_ref(), &expected_deletion_timestamp);
         assert_eq!(
             extended_file_metadata.as_ref(),
@@ -1068,7 +1072,7 @@ mod tests {
 
     fn existing_table_txn(
         data_change: bool,
-    ) -> KernelResult<(SyncEngine, Transaction, tempfile::TempDir)> {
+    ) -> Result<(SyncEngine, Transaction, tempfile::TempDir)> {
         let (url, tempdir) = copy_test_table("table-without-dv-small")?;
         let engine = SyncEngine::new();
         let snapshot = Snapshot::builder_for(url).build(&engine)?;
@@ -1239,7 +1243,7 @@ mod tests {
         #[case] data_change: bool,
         #[case] selection_vector: &[bool],
         #[case] expected_error: bool,
-    ) -> KernelResult<()> {
+    ) -> Result<()> {
         let (_engine, mut txn, _tempdir) = existing_table_txn(data_change)?;
         set_append_only(&mut txn, append_only)?;
         for index in 0..2 {

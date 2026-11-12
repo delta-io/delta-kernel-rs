@@ -786,14 +786,14 @@ fn get_earliest_recreatable_commit(
                 let earliest_version =
                     *earliest_commit_version.get_or_insert(parsed_log_path.version);
 
-                if let Some(checkpoint_version) = last_complete_checkpoint {
-                    if checkpoint_version >= earliest_version {
-                        // Given the contiguity assumption of delta_log commits,
-                        // when a full checkpoint has contiguous commits starting before or at
-                        // checkpoint_version that table can be
-                        // recreated at checkpoint_version.
-                        return Ok(checkpoint_version);
-                    }
+                if let Some(checkpoint_version) = last_complete_checkpoint
+                    && checkpoint_version >= earliest_version
+                {
+                    // Given the contiguity assumption of delta_log commits,
+                    // when a full checkpoint has contiguous commits starting before or at
+                    // checkpoint_version that table can be
+                    // recreated at checkpoint_version.
+                    return Ok(checkpoint_version);
                 }
             }
             LogPathFileType::ClassicCheckpoint | LogPathFileType::UuidCheckpoint => {
@@ -910,9 +910,8 @@ mod tests {
 
     use super::*;
     use crate::actions::{CommitInfo, Metadata, Protocol};
-    use crate::engine::CancellableEngine;
     use crate::engine::sync::SyncEngine;
-    use crate::engine::test_delegating::DelegatingEngine;
+    use crate::engine::{CancellableEngine, DelegatingEngine};
     use crate::object_store::memory::InMemory;
     use crate::schema::{SchemaRef, schema_ref};
     use crate::snapshot::{Snapshot, SnapshotBuilder};

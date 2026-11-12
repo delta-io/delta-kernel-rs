@@ -23,7 +23,9 @@ use delta_kernel::arrow::datatypes::{
 use delta_kernel::column_trie::ColumnTrie;
 use delta_kernel::engine::arrow_utils::fix_nested_null_masks;
 use delta_kernel::expressions::ColumnName;
-use delta_kernel::schema::{DataType as KernelDataType, StructType};
+use delta_kernel::schema::{
+    DataType as KernelDataType, StructType, is_null_count_only_file_sub_field,
+};
 use delta_kernel::{KernelError, KernelResult};
 
 /// Maximum prefix length for string statistics (Delta protocol requirement).
@@ -403,8 +405,11 @@ fn compute_column_stats(
                 return Ok(ColumnStats::default());
             }
 
-            let null_count: Option<ArrayRef> =
-                Some(Arc::new(Int64Array::from(vec![column.null_count() as i64])));
+            // Logical nulls: a dictionary key can be valid but point at a null value, which
+            // `null_count` does not count.
+            let null_count: Option<ArrayRef> = Some(Arc::new(Int64Array::from(vec![
+                column.logical_null_count() as i64,
+            ])));
 
             let complex_type = matches!(
                 column.data_type(),
@@ -504,12 +509,11 @@ pub fn collect_stats(
     stats_columns: &[ColumnName],
     physical_schema: &StructType,
 ) -> KernelResult<StructArray> {
-    let null_count_only_columns = interval_column_names(physical_schema, stats_columns);
-    reduce_stats(&collect_stats_raw(
-        batch,
-        stats_columns,
-        &null_count_only_columns,
-    )?)
+    let null_count_only_columns = null_count_only_column_names(physical_schema, stats_columns);
+    reduce_stats(
+        &collect_stats_raw(batch, stats_columns, &null_count_only_columns)?,
+        TruncateStats::Yes,
+    )
 }
 
 #[cfg(test)]
@@ -517,7 +521,10 @@ pub(crate) fn collect_stats_for_test(
     batch: &RecordBatch,
     stats_columns: &[ColumnName],
 ) -> KernelResult<StructArray> {
-    reduce_stats(&collect_stats_raw(batch, stats_columns, &[])?)
+    reduce_stats(
+        &collect_stats_raw(batch, stats_columns, &[])?,
+        TruncateStats::Yes,
+    )
 }
 
 /// Collect one batch's raw (untruncated) statistics as a single-row struct. [`reduce_stats`] turns
@@ -583,13 +590,11 @@ fn collect_stats_raw(
 /// A connector that writes one file as multiple row groups feeds each row group's [`RecordBatch`]
 /// to [`FileStatsAccumulator::merge`] as the row group closes, then calls
 /// [`FileStatsAccumulator::finish`] once the file is complete to get the file-level statistics for
-/// the Add action. Only one single-row statistics struct per row group is retained, never the row
-/// groups themselves.
+/// the Add action. The accumulator retains one raw statistics row, combining each batch's
+/// statistics into it.
 ///
-/// Per-row-group statistics are accumulated raw and reduced once by
-/// [`FileStatsAccumulator::finish`], which truncates string bounds as part of that reduction. Raw
-/// bounds compose across row groups where truncated ones would not, so the file-level statistics
-/// are byte-identical to collecting statistics over the whole file at once.
+/// Raw statistics are reduced incrementally. [`FileStatsAccumulator::finish`] truncates string
+/// bounds once.
 ///
 /// Every batch must have the same Arrow schema, since the statistics shape derives from it:
 /// [`FileStatsAccumulator::merge`] rejects a batch whose Arrow schema differs from that of the
@@ -647,8 +652,8 @@ pub struct FileStatsAccumulator {
 /// Makes the terminal state representable, so a failed merge cannot be forgotten.
 #[derive(Debug)]
 enum AccumulatorState {
-    /// One raw statistics row per row group merged so far.
-    Open(Vec<StructArray>),
+    /// One raw aggregate, or `None` if no batch has been merged.
+    Open(Option<StructArray>),
     /// A merge failed, so the row groups merged so far can never be published.
     Failed,
 }
@@ -662,10 +667,10 @@ impl FileStatsAccumulator {
     /// only) from integer columns.
     pub fn new(stats_columns: &[ColumnName], physical_schema: &StructType) -> Self {
         Self {
-            null_count_only_columns: interval_column_names(physical_schema, stats_columns),
+            null_count_only_columns: null_count_only_column_names(physical_schema, stats_columns),
             stats_columns: stats_columns.to_vec(),
             batch_schema: None,
-            state: AccumulatorState::Open(Vec::new()),
+            state: AccumulatorState::Open(None),
         }
     }
 
@@ -673,7 +678,7 @@ impl FileStatsAccumulator {
     ///
     /// Returns an error if the accumulator already failed a merge, or if this one fails: `batch`
     /// has a different Arrow schema than the first batch merged, it produces a different statistics
-    /// shape, or statistics collection fails.
+    /// shape, or statistics collection or aggregation fails.
     pub fn merge(&mut self, batch: &RecordBatch) -> KernelResult<()> {
         // Catch every error path in one place, so no failure can leave publishable state behind.
         self.try_merge(batch)
@@ -681,7 +686,7 @@ impl FileStatsAccumulator {
     }
 
     fn try_merge(&mut self, batch: &RecordBatch) -> KernelResult<()> {
-        let AccumulatorState::Open(row_groups) = &mut self.state else {
+        let AccumulatorState::Open(total) = &mut self.state else {
             return Err(KernelError::stats_validation(FAILED));
         };
         // Comparing derived stats shapes instead would collapse every nullCount-only leaf to the
@@ -697,19 +702,10 @@ impl FileStatsAccumulator {
         }
         let batch_stats =
             collect_stats_raw(batch, &self.stats_columns, &self.null_count_only_columns)?;
-        // Schema equality can ignore a struct column's nested field names, which statistics
-        // collection filters on, so equal schemas can still derive different stats shapes.
-        if let Some(first) = row_groups.first() {
-            if first.data_type() != batch_stats.data_type() {
-                return Err(KernelError::schema(format!(
-                    "all row groups must produce the same statistics shape; batch schemas compare \
-                     equal but their nested field names differ: {} vs {}",
-                    first.data_type(),
-                    batch_stats.data_type(),
-                )));
-            }
-        }
-        row_groups.push(batch_stats);
+        *total = match total.as_ref() {
+            None => Some(batch_stats),
+            Some(previous) => Some(merge_raw_stats(previous, &batch_stats)?),
+        };
         Ok(())
     }
 
@@ -722,39 +718,93 @@ impl FileStatsAccumulator {
     /// `numRecords` is rejected by tables that require it (IcebergCompat tables, and any file
     /// carrying a deletion vector).
     ///
-    /// Returns `Err` if a merge failed, or if the accumulated statistics cannot be reduced into a
-    /// single row.
+    /// Returns `Err` if a merge failed or the final statistics cannot be constructed.
     pub fn finish(self) -> KernelResult<Option<StructArray>> {
-        let AccumulatorState::Open(row_groups) = self.state else {
+        let AccumulatorState::Open(total) = self.state else {
             return Err(KernelError::stats_validation(FAILED));
         };
-        if row_groups.is_empty() {
-            return Ok(None);
-        }
-        let rows: Vec<&dyn Array> = row_groups.iter().map(|s| s as &dyn Array).collect();
-        let combined = concat(&rows)
-            .map_err(|e| KernelError::generic(format!("concat per-row-group stats: {e}")))?;
-        let combined = combined
-            .as_struct_opt()
-            .ok_or_else(|| KernelError::internal_error("concatenated stats are not a struct"))?;
-        reduce_stats(combined).map(Some)
+        total
+            .map(|stats| reduce_stats(&stats, TruncateStats::Yes))
+            .transpose()
     }
 }
 
-/// Reduce a raw statistics struct of one row per row group into the single publishable row for the
-/// file: `numRecords` and `nullCount` summed, `minValues`/`maxValues` aggregated element-wise and
-/// truncated per Delta's string rules, `tightBounds` AND-ed.
+/// Combine two raw statistics rows, rejecting different shapes and preserving untruncated bounds.
+///
+/// Concatenate `left` and `right` into two rows, then reduce to one: sum record and null counts,
+/// take each column's minimum and maximum, and AND `tightBounds`.
+///
+/// For a column `n`, batches `[5, null, 1]` and `[9, 2]` produce the following statistics:
+///
+/// | Statistic | Left | Right | Merged |
+/// | --- | --- | --- | --- |
+/// | `numRecords` | 3 | 2 | 5 |
+/// | `nullCount.n` | 1 | 0 | 1 |
+/// | `minValues.n` | 1 | 2 | 1 |
+/// | `maxValues.n` | 5 | 9 | 9 |
+/// | `tightBounds` | true | true | true |
+///
+/// Keep string bounds raw during merges and truncate them only in `finish()`.
+///
+/// For example, let `m = "\u{10FFFF}".repeat(65)`. The max-string truncator returns a null upper
+/// bound for `m` because it's too long. Consider three batches:
+///
+/// 1. `[m]` retains `m` as its maximum.
+/// 2. Merging `["apple"]` still has maximum `m`, but truncating it would produce a null bound.
+/// 3. Merging `["banana"]` would then ignore that null and select `"banana"` as the maximum.
+///
+/// Since `m > "banana"`, this would underestimate the file's maximum and could incorrectly skip
+/// matching rows. Retaining `m` until `finish()` instead leaves the final maximum absent, which
+/// safely prevents data skipping from relying on an invalid upper bound.
+fn merge_raw_stats(left: &StructArray, right: &StructArray) -> KernelResult<StructArray> {
+    // Equal batch schemas can hide different nested field names in the underlying arrays.
+    if left.data_type() != right.data_type() {
+        return Err(KernelError::schema(format!(
+            "all row groups must produce the same statistics shape; batch schemas compare \
+             equal but their nested field names differ: {} vs {}",
+            left.data_type(),
+            right.data_type(),
+        )));
+    }
+    let rows: [&dyn Array; 2] = [left, right];
+    let combined =
+        concat(&rows).map_err(|e| KernelError::generic(format!("concat raw stats: {e}")))?;
+    let combined = combined
+        .as_struct_opt()
+        .ok_or_else(|| KernelError::internal_error("concatenated stats are not a struct"))?;
+    reduce_stats(combined, TruncateStats::No)
+}
+
+/// Whether to truncate string bounds when reducing statistics.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TruncateStats {
+    Yes,
+    No,
+}
+
+/// Reduce raw statistics rows into one: sum `numRecords` and `nullCount`, combine min/max bounds,
+/// and AND `tightBounds`. When `truncate_stats` is [`TruncateStats::Yes`], truncate string bounds
+/// in the final file statistics.
 ///
 /// Returns `Err` if `stats` is not shaped like the output of `collect_stats_raw`.
-fn reduce_stats(stats: &StructArray) -> KernelResult<StructArray> {
+fn reduce_stats(stats: &StructArray, truncate_stats: TruncateStats) -> KernelResult<StructArray> {
+    let reduce_minmax = |col: &ArrayRef, agg| -> KernelResult<ArrayRef> {
+        let bound = match compute_leaf_agg(col, agg)? {
+            Some(bound) if truncate_stats == TruncateStats::Yes => {
+                truncate_stats_bound(&bound, agg)?
+            }
+            bound => bound,
+        };
+        Ok(bound.unwrap_or_else(|| new_null_array(col.data_type(), 1)))
+    };
     let fields = stats.fields().clone();
     let mut cols: Vec<ArrayRef> = Vec::with_capacity(stats.num_columns());
     for (field, col) in fields.iter().zip(stats.columns()) {
         cols.push(match field.name().as_str() {
             NUM_RECORDS => reduce_count_leaf(col)?,
             NULL_COUNT => reduce_stats_children(col, &reduce_count_leaf)?,
-            MIN_VALUES => reduce_stats_children(col, &|c| reduce_minmax_leaf(c, Agg::Min))?,
-            MAX_VALUES => reduce_stats_children(col, &|c| reduce_minmax_leaf(c, Agg::Max))?,
+            MIN_VALUES => reduce_stats_children(col, &|c| reduce_minmax(c, Agg::Min))?,
+            MAX_VALUES => reduce_stats_children(col, &|c| reduce_minmax(c, Agg::Max))?,
             TIGHT_BOUNDS => reduce_bool_and_leaf(col)?,
             // Keep in sync with the sections `collect_stats_raw` produces. User columns live inside
             // the sub-structs, so an unrecognized top-level name is a kernel bug, not bad input.
@@ -825,19 +875,6 @@ fn reduce_bool_and_leaf(array: &ArrayRef) -> KernelResult<ArrayRef> {
     Ok(Arc::new(BooleanArray::from(vec![all])))
 }
 
-/// Reduce a min (or max) leaf to the one bound published for the file, null if none is
-/// representable.
-///
-/// Reusing `compute_leaf_agg` gives the bound the same ordering a single-pass collection uses (NaN,
-/// decimal precision/scale, timestamp timezone, string byte order).
-fn reduce_minmax_leaf(array: &ArrayRef, agg: Agg) -> KernelResult<ArrayRef> {
-    let bound = match compute_leaf_agg(array, agg)? {
-        Some(bound) => truncate_stats_bound(&bound, agg)?,
-        None => None,
-    };
-    Ok(bound.unwrap_or_else(|| new_null_array(array.data_type(), 1)))
-}
-
 /// Truncate a single-row min/max bound per Delta's string rules, passing non-string bounds through.
 ///
 /// `None` when a max string has no representable truncated upper bound: no upper bound may be
@@ -873,15 +910,21 @@ fn is_interval_type(data_type: &KernelDataType) -> bool {
     primitive_type.is_interval()
 }
 
-fn interval_column_names(schema: &StructType, stats_columns: &[ColumnName]) -> Vec<ColumnName> {
+/// Returns the `stats_columns` that get only `nullCount`: intervals, and the `file` sub-fields
+/// without min/max statistics (`checksum` and `inline`).
+fn null_count_only_column_names(
+    schema: &StructType,
+    stats_columns: &[ColumnName],
+) -> Vec<ColumnName> {
     stats_columns
         .iter()
         .filter(|col| {
-            schema
-                .fields_of_path(col)
-                .ok()
-                .and_then(|fields| fields.last().map(|field| field.data_type()))
-                .is_some_and(is_interval_type)
+            schema.fields_of_path(col).is_ok_and(|path| {
+                is_null_count_only_file_sub_field(&path)
+                    || path
+                        .last()
+                        .is_some_and(|leaf| is_interval_type(leaf.data_type()))
+            })
         })
         .cloned()
         .collect()
@@ -890,18 +933,19 @@ fn interval_column_names(schema: &StructType, stats_columns: &[ColumnName]) -> V
 #[cfg(test)]
 mod tests {
     use delta_kernel::arrow::array::{
-        Array, AsArray, BinaryArray, Decimal128Array, Float64Array, Int32Array, Int64Array,
-        ListArray, MapArray, NullArray, RecordBatchOptions, StringArray,
+        Array, AsArray, BinaryArray, Decimal128Array, DictionaryArray, Float64Array, Int32Array,
+        Int64Array, ListArray, MapArray, NullArray, RecordBatchOptions, StringArray,
     };
     use delta_kernel::arrow::buffer::{NullBuffer, OffsetBuffer};
     use delta_kernel::arrow::compute::concat_batches;
     use delta_kernel::arrow::datatypes::{Fields, Int32Type, Int64Type, Schema};
+    use delta_kernel::arrow::util::pretty::pretty_format_batches;
     use delta_kernel::engine::arrow_conversion::TryFromArrow as _;
     use delta_kernel::engine::arrow_expression::evaluate_expression::to_json;
     use delta_kernel::expressions::column_name;
     use delta_kernel::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-    use delta_kernel::schema::schema;
-    use test_utils::assert_result_error_with_message;
+    use delta_kernel::schema::{StructField, schema};
+    use test_utils::{assert_batches_sorted_eq, assert_result_error_with_message};
 
     use super::*;
 
@@ -974,6 +1018,42 @@ mod tests {
             .downcast_ref::<Int64Array>()
             .unwrap();
         assert_eq!(value_null_count.value(0), 1);
+    }
+
+    /// A dictionary key that is valid but points at a null value is a null, at top level and
+    /// in a struct, so `nullCount` counts it.
+    #[test]
+    fn test_collect_stats_null_counts_dictionary_null_values() {
+        // Rows: "a", a valid key for a null value, a null key.
+        let dict = || {
+            Arc::new(DictionaryArray::<Int32Type>::new(
+                Int32Array::from(vec![Some(0), Some(1), None]),
+                Arc::new(StringArray::from(vec![Some("a"), None])),
+            )) as ArrayRef
+        };
+        let dict_type = DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8));
+        let child = Field::new("uri", dict_type.clone(), true);
+        // The struct is null in the first row, so its `uri` is null there too.
+        let s = StructArray::new(
+            Fields::from(vec![child.clone()]),
+            vec![dict()],
+            Some(NullBuffer::from(vec![false, true, true])),
+        );
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("d", dict_type, true),
+            Field::new("s", s.data_type().clone(), true),
+        ]));
+        let batch = RecordBatch::try_new(schema, vec![dict(), Arc::new(s)]).unwrap();
+
+        let stats = collect_stats(&batch, &[column_name!("d"), column_name!("s.uri")]).unwrap();
+
+        assert_eq!(flat_stat::<Int64Type>(&stats, NULL_COUNT, "d"), 2);
+        let s_null_counts = child_struct(&stats, NULL_COUNT)
+            .column_by_name("s")
+            .unwrap()
+            .as_struct();
+        let uri = s_null_counts.column_by_name("uri").unwrap();
+        assert_eq!(uri.as_primitive::<Int64Type>().value(0), 3);
     }
 
     #[test]
@@ -1895,33 +1975,87 @@ mod tests {
         assert!(acc.finish().unwrap().is_none());
     }
 
-    #[test]
-    fn test_file_stats_accumulator_single_batch_matches_collect_stats() {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Int64, false),
-            Field::new("value", DataType::Utf8, true),
-        ]));
-        let batch = RecordBatch::try_new(
-            schema.clone(),
+    #[rstest::rstest]
+    #[case::nan(vec![1.0, 2.0, f64::NAN, 0.5])]
+    #[case::signed_zero(vec![0.0, -0.0, 0.0, -0.0])]
+    #[case::signed_zero_reversed(vec![-0.0, 0.0, -0.0, 0.0])]
+    fn test_file_stats_accumulator_matches_collect_stats(
+        #[case] values: Vec<f64>,
+        #[values(None, Some("UTC"), Some("America/Los_Angeles"))] timezone: Option<&str>,
+        #[values(1, 2, 4)] batch_size: usize,
+    ) {
+        let timestamps = PrimitiveArray::<TimestampMicrosecondType>::from(vec![
+            Some(5),
+            None,
+            Some(-3),
+            Some(10),
+        ])
+        .with_timezone_opt(timezone);
+        let whole = batch_of(
             vec![
-                Arc::new(Int64Array::from(vec![1, 2, 3])),
-                Arc::new(StringArray::from(vec![Some("a"), None, Some("c")])),
+                Field::new("id", DataType::Int64, false),
+                Field::new("value", DataType::Utf8, true),
+                Field::new("f", DataType::Float64, true),
+                Field::new("t", timestamps.data_type().clone(), true),
             ],
-        )
-        .unwrap();
-        let cols = vec![column_name!("id"), column_name!("value")];
-        let physical_schema = StructType::try_from_arrow(schema.as_ref()).unwrap();
-
-        let single = collect_stats(&batch, &cols).unwrap();
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2, 3, 4])),
+                Arc::new(StringArray::from(vec![
+                    Some("a"),
+                    None,
+                    Some("c"),
+                    Some("d"),
+                ])),
+                Arc::new(Float64Array::from(values)),
+                Arc::new(timestamps),
+            ],
+        );
+        let timestamp_type = if timezone.is_some() {
+            KernelDataType::TIMESTAMP
+        } else {
+            KernelDataType::TIMESTAMP_NTZ
+        };
+        let physical_schema = schema! {
+            not_null "id": LONG,
+            nullable "value": STRING,
+            nullable "f": DOUBLE,
+            nullable "t": (timestamp_type),
+        };
+        let cols = vec![
+            column_name!("id"),
+            column_name!("value"),
+            column_name!("f"),
+            column_name!("t"),
+        ];
+        let single = collect_stats(&whole, &cols).unwrap();
 
         let mut acc = FileStatsAccumulator::new(&cols, &physical_schema);
-        acc.merge(&batch).unwrap();
+        for offset in (0..whole.num_rows()).step_by(batch_size) {
+            acc.merge(&whole.slice(offset, batch_size.min(whole.num_rows() - offset)))
+                .unwrap();
+        }
         let merged = acc.finish().unwrap().unwrap();
 
-        assert_eq!(
-            to_json(&merged).unwrap().as_string::<i32>().value(0),
-            to_json(&single).unwrap().as_string::<i32>().value(0),
-        );
+        assert_eq!(merged.data_type(), single.data_type());
+        for section in [MIN_VALUES, MAX_VALUES] {
+            assert_eq!(
+                flat_stat::<Float64Type>(&merged, section, "f").to_bits(),
+                flat_stat::<Float64Type>(&single, section, "f").to_bits(),
+                "{section} must preserve NaN and signed-zero ordering",
+            );
+            assert_eq!(
+                child_struct(&merged, section)
+                    .column_by_name("t")
+                    .unwrap()
+                    .data_type(),
+                whole.column_by_name("t").unwrap().data_type(),
+            );
+        }
+        let expected = pretty_format_batches(&[RecordBatch::from(single)])
+            .unwrap()
+            .to_string();
+        let expected_lines: Vec<&str> = expected.trim().lines().collect();
+        assert_batches_sorted_eq!(expected_lines, &[RecordBatch::from(merged)]);
     }
 
     /// Extracts a named child column from a StructArray, downcasting it to StructArray.
@@ -2326,27 +2460,6 @@ mod tests {
         assert_eq!(flat_stat::<Decimal128Type>(&merged, MAX_VALUES, "d"), 900);
     }
 
-    // NaN wins max and loses min, matching `compute_leaf_agg`.
-    #[test]
-    fn test_file_stats_accumulator_float_nan_ordering() {
-        let schema = Arc::new(Schema::new(vec![Field::new("f", DataType::Float64, true)]));
-        let physical_schema = StructType::try_from_arrow(schema.as_ref()).unwrap();
-        let mk = |vals: Vec<f64>| {
-            RecordBatch::try_new(
-                schema.clone(),
-                vec![Arc::new(Float64Array::from(vals)) as ArrayRef],
-            )
-            .unwrap()
-        };
-        let mut acc = FileStatsAccumulator::new(&[column_name!("f")], &physical_schema);
-        acc.merge(&mk(vec![1.0, 2.0])).unwrap();
-        acc.merge(&mk(vec![f64::NAN, 0.5])).unwrap();
-        let merged = acc.finish().unwrap().unwrap();
-
-        assert_eq!(flat_stat::<Float64Type>(&merged, MIN_VALUES, "f"), 0.5);
-        assert!(flat_stat::<Float64Type>(&merged, MAX_VALUES, "f").is_nan());
-    }
-
     #[rstest::rstest]
     #[case::ascii(
         "a".repeat(50),
@@ -2409,7 +2522,9 @@ mod tests {
 
     // Splits past the fixture's row count exercise merging empty row groups.
     #[rstest::rstest]
-    fn test_file_stats_accumulator_matches_spark(#[values(1, 2, 3, 4, 6)] n_row_groups: usize) {
+    fn test_file_stats_accumulator_matches_spark(
+        #[values(1, 2, 3, 4, 6, 32, 128)] n_row_groups: usize,
+    ) {
         let (whole, spark_stats) = load_spark_all_types_fixture();
         let schema = whole.schema();
         let stats_columns = extract_leaf_columns(schema.fields(), &[]);
@@ -2442,6 +2557,7 @@ mod tests {
     #[case::one_row_group(vec![vec![1i64, 2, 3]], Some(3), Some((1, 3)))]
     #[case::two_row_groups(vec![vec![1i64], vec![2i64]], Some(2), Some((1, 2)))]
     #[case::only_zero_row_group(vec![vec![]], Some(0), None)]
+    #[case::zero_row_group_first(vec![vec![], vec![1i64, 2]], Some(2), Some((1, 2)))]
     #[case::zero_row_group_between(vec![vec![1i64], vec![], vec![2i64]], Some(2), Some((1, 2)))]
     fn test_file_stats_accumulator_finish_counts_and_bounds(
         #[case] row_groups: Vec<Vec<i64>>,
@@ -2491,8 +2607,13 @@ mod tests {
 
     // Every Arrow string type takes its own arm in `compute_leaf_agg`.
     #[rstest::rstest]
+    #[case::ascii("z".repeat(40))]
+    #[case::unicode("\u{6f22}".repeat(40))]
+    #[case::unrepresentable_max("\u{10FFFF}".repeat(65))]
     fn test_file_stats_accumulator_string_types_match_single_shot(
+        #[case] long_max: String,
         #[values(DataType::Utf8, DataType::LargeUtf8, DataType::Utf8View)] string_type: DataType,
+        #[values(1, 2, 32)] repetitions: usize,
     ) {
         let schema = Arc::new(Schema::new(vec![Field::new(
             "t",
@@ -2509,23 +2630,70 @@ mod tests {
             };
             RecordBatch::try_new(schema.clone(), vec![array]).unwrap()
         };
-        // Long enough to be truncated, so the merge must compose raw values, not truncated ones.
-        let long_max = "z".repeat(40);
-        let rg1 = vec![Some("apple"), None];
-        let rg2 = vec![Some(long_max.as_str()), Some("banana")];
+        let rg1 = vec![Some(long_max.as_str()), None];
+        let rg2 = vec![Some("apple"), Some("banana")];
+        let first = mk(rg1.clone());
+        let second = mk(rg2.clone());
+        let empty = RecordBatch::new_empty(schema.clone());
 
         let mut acc = FileStatsAccumulator::new(&[column_name!("t")], &physical_schema);
-        acc.merge(&mk(rg1.clone())).unwrap();
-        acc.merge(&mk(rg2.clone())).unwrap();
+        for _ in 0..repetitions {
+            for batch in [&first, &empty, &second] {
+                acc.merge(batch).unwrap();
+                let AccumulatorState::Open(Some(total)) = &acc.state else {
+                    panic!("successful merge must retain statistics");
+                };
+                assert_eq!(total.len(), 1);
+            }
+        }
         let merged = acc.finish().unwrap().unwrap();
 
-        let whole = mk([rg1, rg2].concat());
+        let whole = mk([rg1, rg2].concat().repeat(repetitions));
         let single = collect_stats(&whole, &[column_name!("t")]).unwrap();
 
         assert_eq!(
             to_json(&merged).unwrap().as_string::<i32>().value(0),
             to_json(&single).unwrap().as_string::<i32>().value(0),
         );
+    }
+
+    #[rstest::rstest]
+    fn test_file_stats_accumulator_count_overflow_is_terminal(
+        #[values(NUM_RECORDS, NULL_COUNT)] section: &str,
+    ) {
+        let batch = batch_of(
+            vec![Field::new("n", DataType::Int64, true)],
+            vec![new_null_array(&DataType::Int64, 1)],
+        );
+        let physical_schema = StructType::try_from_arrow(batch.schema().as_ref()).unwrap();
+        let mut acc = FileStatsAccumulator::new(&[column_name!("n")], &physical_schema);
+        acc.merge(&batch).unwrap();
+
+        // Seed a large count without allocating an impossible number of rows.
+        let AccumulatorState::Open(Some(total)) = &mut acc.state else {
+            panic!("first merge must produce statistics");
+        };
+        let index = total
+            .fields()
+            .iter()
+            .position(|f| f.name() == section)
+            .unwrap();
+        let maximum: ArrayRef = Arc::new(Int64Array::from(vec![i64::MAX]));
+        let mut columns = total.columns().to_vec();
+        columns[index] = if section == NUM_RECORDS {
+            maximum
+        } else {
+            Arc::new(StructArray::new(
+                columns[index].as_struct().fields().clone(),
+                vec![maximum],
+                None,
+            ))
+        };
+        *total = StructArray::new(total.fields().clone(), columns, None);
+
+        assert_result_error_with_message(acc.merge(&batch), "summing stats count leaf");
+        assert_result_error_with_message(acc.merge(&batch), FAILED);
+        assert_result_error_with_message(acc.finish(), FAILED);
     }
 
     // A malformed stats tree is a kernel bug, not bad caller input, so the guards report
@@ -2556,7 +2724,10 @@ mod tests {
             None,
         )
         .unwrap();
-        assert_internal_error(reduce_stats(&stats), "unknown stats section");
+        assert_internal_error(
+            reduce_stats(&stats, TruncateStats::Yes),
+            "unknown stats section",
+        );
     }
 
     #[test]
@@ -2700,8 +2871,10 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_file_stats_accumulator_rejects_differing_stats_shape() {
+    #[rstest::rstest]
+    fn test_file_stats_accumulator_rejects_differing_stats_shape(
+        #[values(1, 2, 4)] matching_merges: usize,
+    ) {
         let declared = nested_batch(["x", "y"], [1, 2]);
         // `with_match_field_names(false)` is the only way to get a schema-equal batch whose nested
         // field names differ.
@@ -2718,7 +2891,9 @@ mod tests {
             &[column_name!("s", "x"), column_name!("s", "y")],
             &physical_schema,
         );
-        acc.merge(&declared).expect("first merge must succeed");
+        for _ in 0..matching_merges {
+            acc.merge(&declared).expect("matching merge must succeed");
+        }
         let err = acc
             .merge(&renamed)
             .expect_err("a batch deriving a different stats shape must be rejected");
@@ -2799,6 +2974,54 @@ mod tests {
             // The sibling column still gets bounds, so the exclusion is targeted.
             assert!(child_struct(&merged, section).column_by_name("n").is_some());
         }
+    }
+
+    /// The null-count-only columns are intervals and the `file` sub-fields `checksum` and
+    /// `inline`, at top level or nested in a struct, but no other `file` sub-field.
+    #[test]
+    fn test_null_count_only_column_names() {
+        let schema = StructType::try_new([
+            StructField::nullable("span", KernelDataType::INTERVAL_DAY_TIME),
+            StructField::nullable("f", KernelDataType::file_type()),
+            StructField::nullable(
+                "s",
+                StructType::try_new([StructField::nullable("f", KernelDataType::file_type())])
+                    .unwrap(),
+            ),
+            StructField::nullable(
+                "checksum",
+                StructType::try_new([StructField::nullable("checksum", KernelDataType::STRING)])
+                    .unwrap(),
+            ),
+        ])
+        .unwrap();
+        let columns: Vec<_> = [
+            "span",
+            "f.uri",
+            "f.offset",
+            "f.size",
+            "f.content_type",
+            "f.checksum",
+            "f.inline",
+            "s.f.size",
+            "s.f.checksum",
+            "s.f.inline",
+            "checksum.checksum",
+        ]
+        .into_iter()
+        .map(ColumnName::from_naive_str_split)
+        .collect();
+        let expected: Vec<_> = [
+            "span",
+            "f.checksum",
+            "f.inline",
+            "s.f.checksum",
+            "s.f.inline",
+        ]
+        .into_iter()
+        .map(ColumnName::from_naive_str_split)
+        .collect();
+        assert_eq!(null_count_only_column_names(&schema, &columns), expected);
     }
 
     #[test]

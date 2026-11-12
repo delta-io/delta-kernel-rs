@@ -24,7 +24,7 @@
 //! ```no_run
 //! use std::sync::Arc;
 //! use delta_kernel::commit_range::{CommitRange, DeltaAction};
-//! use delta_kernel::{Engine, KernelError, Snapshot};
+//! use delta_kernel::{Engine, Snapshot};
 //! use delta_kernel::object_store::local::LocalFileSystem;
 //! use test_utils::delta_kernel_default_engine::DefaultEngineBuilder;
 //!
@@ -46,7 +46,7 @@
 //!         let _batch = batch?;
 //!     }
 //! }
-//! # Ok::<(), KernelError>(())
+//! # Ok::<(), delta_kernel::Error>(())
 //! ```
 
 mod actions;

@@ -21,13 +21,14 @@ use delta_kernel::checkpoint::{CheckpointSpec, V2CheckpointConfig};
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
 use delta_kernel::expressions::{
-    Expression as Expr, Predicate as Pred, PredicateRef, Scalar, col, column_name, lit,
+    Expression as Expr, Predicate as Pred, PredicateRef, Scalar, col, column_name, expr, lit,
 };
 use delta_kernel::metrics::{MetricEvent, ScanType};
 use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::scan::{AfterSequentialScanMetadata, ParallelScanMetadata, Scan, StatsOptions};
 use delta_kernel::schema::{
-    DataType, IntervalYearToMonthType, SchemaRef, StructField, StructType, schema, schema_ref,
+    DataType, IntervalDayToSecondType, IntervalYearToMonthType, SchemaRef, StructField, StructType,
+    schema, schema_ref,
 };
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
@@ -208,7 +209,7 @@ async fn all_in_cap_prunes(
     #[values(false, true)] use_parallel: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (_tmp_dir, table_path, engine) = build_capped_table_with_checkpoint().await?;
-    let pred = Arc::new(Pred::gt(col!("c0"), lit(60i64)));
+    let pred = Arc::new(Pred::from_expr(expr!(col("c0") > 60i64)));
     assert_eq!(surviving_files(&table_path, engine, pred, use_parallel)?, 1);
     Ok(())
 }
@@ -219,7 +220,7 @@ async fn all_in_cap_keeps_all(
     #[values(false, true)] use_parallel: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (_tmp_dir, table_path, engine) = build_capped_table_with_checkpoint().await?;
-    let pred = Arc::new(Pred::gt(col!("c0"), lit(0i64)));
+    let pred = Arc::new(Pred::from_expr(expr!(col("c0") > 0i64)));
     assert_eq!(surviving_files(&table_path, engine, pred, use_parallel)?, 3);
     Ok(())
 }
@@ -230,7 +231,7 @@ async fn all_past_cap_keeps_all(
     #[values(false, true)] use_parallel: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (_tmp_dir, table_path, engine) = build_capped_table_with_checkpoint().await?;
-    let pred = Arc::new(Pred::gt(col!("c4"), lit(1_000_000i64)));
+    let pred = Arc::new(Pred::from_expr(expr!(col("c4") > 1_000_000i64)));
     assert_eq!(surviving_files(&table_path, engine, pred, use_parallel)?, 3);
     Ok(())
 }
@@ -243,10 +244,10 @@ async fn mixed_and_in_cap_prunes(
     let (_tmp_dir, table_path, engine) = build_capped_table_with_checkpoint().await?;
     // c0 > 60 prunes files A and B; c4 > 50 is past-cap and folds to NULL.
     // AND(false, NULL) = false keeps the prune; AND(true, NULL) = NULL keeps file C.
-    let pred = Arc::new(Pred::and(
-        Pred::gt(col!("c0"), lit(60i64)),
-        Pred::gt(col!("c4"), lit(50i64)),
-    ));
+    let pred = Arc::new(Pred::from_expr(expr!(and(
+        col("c0") > 60i64,
+        col("c4") > 50i64
+    ))));
     assert_eq!(surviving_files(&table_path, engine, pred, use_parallel)?, 1);
     Ok(())
 }
@@ -259,10 +260,10 @@ async fn mixed_or_keeps_all(
     let (_tmp_dir, table_path, engine) = build_capped_table_with_checkpoint().await?;
     // c0 > 1000 would prune all 3 by max; c4 > 50 is past-cap and folds to NULL.
     // OR(false, NULL) = NULL keeps every file.
-    let pred = Arc::new(Pred::or(
-        Pred::gt(col!("c0"), lit(1000i64)),
-        Pred::gt(col!("c4"), lit(50i64)),
-    ));
+    let pred = Arc::new(Pred::from_expr(expr!(or(
+        col("c0") > 1000i64,
+        col("c4") > 50i64
+    ))));
     assert_eq!(surviving_files(&table_path, engine, pred, use_parallel)?, 3);
     Ok(())
 }
@@ -275,10 +276,10 @@ async fn boundary_c1_prunes_all(
     let (_tmp_dir, table_path, engine) = build_capped_table_with_checkpoint().await?;
     // c1 max across files is 209 < 250 so the in-cap arm rules out everything.
     // c2 > 50 is past-cap and folds to NULL; AND(false, NULL) = false everywhere.
-    let pred = Arc::new(Pred::and(
-        Pred::gt(col!("c1"), lit(250i64)),
-        Pred::gt(col!("c2"), lit(50i64)),
-    ));
+    let pred = Arc::new(Pred::from_expr(expr!(and(
+        col("c1") > 250i64,
+        col("c2") > 50i64
+    ))));
     assert_eq!(surviving_files(&table_path, engine, pred, use_parallel)?, 0);
     Ok(())
 }
@@ -455,7 +456,7 @@ async fn past_cap_stats_column_enables_pruning(
     bypass_stats: StatsOptions,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (_tmp_dir, table_path, engine) = build_table_with_past_cap_stats(checkpoint).await?;
-    let predicate = || Arc::new(Pred::gt(col!("c2"), lit(60i64)));
+    let predicate = || Arc::new(Pred::from_expr(expr!(col("c2") > 60i64)));
 
     let default_survivors = surviving_paths_with_stats(
         &table_path,
@@ -520,7 +521,7 @@ async fn extra_indexed_file_missing_the_stat_is_never_pruned(
     let survivors = surviving_paths_with_stats(
         &table_path,
         engine,
-        Arc::new(Pred::gt(col!("c2"), lit(60i64))),
+        Arc::new(Pred::from_expr(expr!(col("c2") > 60i64))),
         StatsOptions::all_struct_with_extra_indexed(vec![column_name!("c2")]),
         use_parallel,
     )?;
@@ -701,13 +702,10 @@ async fn extended_year_timestamp_stats_dont_collapse_skipping(
     // Predicate: EventTime < 2024-06-01T00:00:00Z AND UserId > 0.
     // 2024-06-01T00:00:00 UTC = 1_717_200_000 seconds since epoch = 1_717_200_000_000_000 us.
     let june_first_2024_us: i64 = 1_717_200_000_000_000;
-    let predicate = Arc::new(Pred::and(
-        Pred::lt(
-            col!("EventTime"),
-            lit(Scalar::Timestamp(june_first_2024_us)),
-        ),
-        Pred::gt(col!("UserId"), lit(0i64)),
-    ));
+    let predicate = Arc::new(Pred::from_expr(expr!(and(
+        col("EventTime") < lit(Scalar::Timestamp(june_first_2024_us)),
+        col("UserId") > 0i64
+    ))));
 
     // Expected survivors:
     //   file_A: EventTime min Jan 15 < Jun 1, UserId max 100 > 0, kept.
@@ -841,13 +839,10 @@ async fn extended_year_timestamp_round_trip_via_checkpoint_and_remove(
     .await?;
 
     let june_first_2024_us: i64 = 1_717_200_000_000_000;
-    let predicate = Arc::new(Pred::and(
-        Pred::lt(
-            col!("EventTime"),
-            lit(Scalar::Timestamp(june_first_2024_us)),
-        ),
-        Pred::gt(col!("UserId"), lit(0i64)),
-    ));
+    let predicate = Arc::new(Pred::from_expr(expr!(and(
+        col("EventTime") < lit(Scalar::Timestamp(june_first_2024_us)),
+        col("UserId") > 0i64
+    ))));
 
     assert_eq!(
         surviving_files(&table_path, engine, predicate, use_parallel)?,
@@ -920,22 +915,19 @@ async fn millisecond_truncated_timestamp_stats_dont_overprune(
 /// remain compatible with the old addFiles.
 #[rstest]
 #[case::partition(
-    Arc::new(Pred::eq(col!("part"), lit(1i64))),
+    Arc::new(Pred::from_expr(expr!(col("part") == 1i64))),
     &["new-1.parquet"],
     1,
     101
 )]
 #[case::stats(
-    Arc::new(Pred::eq(col!("value"), lit(20i64))),
+    Arc::new(Pred::from_expr(expr!(col("value") == 20i64))),
     &["new-2.parquet"],
     1,
     102
 )]
 #[case::partition_and_stats(
-    Arc::new(Pred::and(
-        Pred::eq(col!("part"), lit(3i64)),
-        Pred::eq(col!("value"), lit(30i64)),
-    )),
+    Arc::new(Pred::from_expr(expr!(and(col("part") == 3i64, col("value") == 30i64)))),
     &["new-3.parquet"],
     1,
     103
@@ -1253,20 +1245,18 @@ async fn partition_pruning_honors_rfc3339_offset_partition_values(
     let fourteen_thirty_utc_us: i64 = 1_718_461_800_000_000; // 2024-06-15T14:30:00Z
 
     // ts == 09:30Z must keep only file_A (its +05:00 value normalized to 09:30 UTC).
-    let predicate = Arc::new(Pred::eq(
-        col!("ts"),
-        lit(Scalar::Timestamp(nine_thirty_utc_us)),
-    ));
+    let predicate = Arc::new(Pred::from_expr(expr!(
+        col("ts") == lit(Scalar::Timestamp(nine_thirty_utc_us))
+    )));
     assert_eq!(
         surviving_files(&table_path, engine.clone(), predicate, use_parallel)?,
         1
     );
 
     // ts == 14:30Z must keep only file_B.
-    let predicate = Arc::new(Pred::eq(
-        col!("ts"),
-        lit(Scalar::Timestamp(fourteen_thirty_utc_us)),
-    ));
+    let predicate = Arc::new(Pred::from_expr(expr!(
+        col("ts") == lit(Scalar::Timestamp(fourteen_thirty_utc_us))
+    )));
     assert_eq!(
         surviving_files(&table_path, engine, predicate, use_parallel)?,
         1
@@ -1295,9 +1285,63 @@ async fn partition_pruning_honors_rfc3339_offset_partition_values(
 )]
 #[case::day_time(
     DataType::INTERVAL_DAY_TIME,
-    Scalar::IntervalDayTime(3_600_000_000),
-    Scalar::IntervalDayTime(3_600_000_000),
-    Scalar::IntervalDayTime(7_200_000_000)
+    Scalar::interval_day_time(3_600_000_000, IntervalDayToSecondType::IntervalDayToSecond).unwrap(),
+    Scalar::interval_day_time(3_600_000_000, IntervalDayToSecondType::IntervalDayToSecond).unwrap(),
+    Scalar::interval_day_time(7_200_000_000, IntervalDayToSecondType::IntervalDayToSecond).unwrap()
+)]
+#[case::day(
+    DataType::INTERVAL_DAY,
+    Scalar::interval_day_time(86_400_000_000, IntervalDayToSecondType::IntervalDay).unwrap(),
+    Scalar::interval_day_time(86_400_000_000, IntervalDayToSecondType::IntervalDay).unwrap(),
+    Scalar::interval_day_time(172_800_000_000, IntervalDayToSecondType::IntervalDay).unwrap()
+)]
+#[case::hour(
+    DataType::INTERVAL_HOUR,
+    Scalar::interval_day_time(93_600_000_000, IntervalDayToSecondType::IntervalHour).unwrap(),
+    Scalar::interval_day_time(93_600_000_000, IntervalDayToSecondType::IntervalHour).unwrap(),
+    Scalar::interval_day_time(97_200_000_000, IntervalDayToSecondType::IntervalHour).unwrap()
+)]
+#[case::minute(
+    DataType::INTERVAL_MINUTE,
+    Scalar::interval_day_time(93_780_000_000, IntervalDayToSecondType::IntervalMinute).unwrap(),
+    Scalar::interval_day_time(93_780_000_000, IntervalDayToSecondType::IntervalMinute).unwrap(),
+    Scalar::interval_day_time(93_840_000_000, IntervalDayToSecondType::IntervalMinute).unwrap()
+)]
+#[case::second(
+    DataType::INTERVAL_SECOND,
+    Scalar::interval_day_time(93_784_500_000, IntervalDayToSecondType::IntervalSecond).unwrap(),
+    Scalar::interval_day_time(93_784_500_000, IntervalDayToSecondType::IntervalSecond).unwrap(),
+    Scalar::interval_day_time(93_784_500_001, IntervalDayToSecondType::IntervalSecond).unwrap()
+)]
+#[case::day_hour(
+    DataType::INTERVAL_DAY_HOUR,
+    Scalar::interval_day_time(93_600_000_000, IntervalDayToSecondType::IntervalDayToHour).unwrap(),
+    Scalar::interval_day_time(93_600_000_000, IntervalDayToSecondType::IntervalDayToHour).unwrap(),
+    Scalar::interval_day_time(97_200_000_000, IntervalDayToSecondType::IntervalDayToHour).unwrap()
+)]
+#[case::day_minute(
+    DataType::INTERVAL_DAY_MINUTE,
+    Scalar::interval_day_time(93_780_000_000, IntervalDayToSecondType::IntervalDayToMinute).unwrap(),
+    Scalar::interval_day_time(93_780_000_000, IntervalDayToSecondType::IntervalDayToMinute).unwrap(),
+    Scalar::interval_day_time(93_840_000_000, IntervalDayToSecondType::IntervalDayToMinute).unwrap()
+)]
+#[case::hour_minute(
+    DataType::INTERVAL_HOUR_MINUTE,
+    Scalar::interval_day_time(93_780_000_000, IntervalDayToSecondType::IntervalHourToMinute).unwrap(),
+    Scalar::interval_day_time(93_780_000_000, IntervalDayToSecondType::IntervalHourToMinute).unwrap(),
+    Scalar::interval_day_time(93_840_000_000, IntervalDayToSecondType::IntervalHourToMinute).unwrap()
+)]
+#[case::hour_second(
+    DataType::INTERVAL_HOUR_SECOND,
+    Scalar::interval_day_time(93_784_500_000, IntervalDayToSecondType::IntervalHourToSecond).unwrap(),
+    Scalar::interval_day_time(93_784_500_000, IntervalDayToSecondType::IntervalHourToSecond).unwrap(),
+    Scalar::interval_day_time(93_784_500_001, IntervalDayToSecondType::IntervalHourToSecond).unwrap()
+)]
+#[case::minute_second(
+    DataType::INTERVAL_MINUTE_SECOND,
+    Scalar::interval_day_time(93_784_500_000, IntervalDayToSecondType::IntervalMinuteToSecond).unwrap(),
+    Scalar::interval_day_time(93_784_500_000, IntervalDayToSecondType::IntervalMinuteToSecond).unwrap(),
+    Scalar::interval_day_time(93_784_500_001, IntervalDayToSecondType::IntervalMinuteToSecond).unwrap()
 )]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn interval_partition_values_do_not_prune_files(
@@ -1337,7 +1381,9 @@ async fn interval_partition_values_do_not_prune_files(
     )
     .await?;
 
-    let predicate = Arc::new(Pred::eq(col!("period"), lit(predicate_value)));
+    let predicate = Arc::new(Pred::from_expr(expr!(
+        col("period") == lit(predicate_value)
+    )));
     assert_eq!(
         surviving_files(&table_path, engine, predicate, use_parallel)?,
         2
@@ -1392,8 +1438,8 @@ fn value_stats_json(num_records: i64, null_count: i64, bounds: Option<(i64, i64)
 // `eval_sql_where` and `!=` the NOT-wrapped arm. The not-all-null guard is operator-agnostic, and
 // the unit test `test_all_null_pruning_all_comparison_ops` covers all six operators at the rewrite
 // level, so the source/parallel matrix here does not repeat every operator.
-#[case::eq(Pred::eq(col!("value"), lit(5i64)))]
-#[case::ne(Pred::ne(col!("value"), lit(5i64)))]
+#[case::eq(Pred::from_expr(expr!(col("value") == 5i64)))]
+#[case::ne(Pred::from_expr(expr!(col("value") != 5i64)))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn all_null_files_pruned_regardless_of_source(
     #[case] predicate: Pred,

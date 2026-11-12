@@ -3,14 +3,14 @@ use std::collections::HashSet;
 use std::sync::{Arc, LazyLock};
 use std::time::Instant;
 
-use tracing::{debug, error};
+use tracing::{debug, error, trace};
 
 use crate::actions::visitors::SelectionVectorVisitor;
 use crate::actions::{MAX_VALUES, MIN_VALUES, NULL_COUNT, NUM_RECORDS};
 use crate::expressions::{
     BinaryPredicateOp, ColumnName, Expression as Expr, ExpressionRef, JunctionPredicateOp,
     MapToStructOptions, OpaquePredicateOpRef, Predicate as Pred, PredicateRef, Scalar, col,
-    column_name, column_pred, lit,
+    column_name, expr, lit,
 };
 use crate::kernel_predicates::{
     DataSkippingPredicateEvaluator, KernelPredicateEvaluator, KernelPredicateEvaluatorDefaults,
@@ -148,7 +148,7 @@ impl DataSkippingFilter {
         metrics: Option<Arc<ScanMetrics>>,
     ) -> Option<Self> {
         static FILTER_PRED: LazyLock<PredicateRef> =
-            LazyLock::new(|| Arc::new(col!("output").distinct(lit(false))));
+            LazyLock::new(|| Arc::new(Pred::from_expr(expr!(distinct(col("output"), false)))));
         static FILTER_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
             nullable "output": BOOLEAN,
         };
@@ -279,7 +279,7 @@ impl DataSkippingFilter {
             col!("add.partitionValues"),
             map_to_struct_options,
         ));
-        let is_add_expr = Arc::new(Pred::is_not_null(col!("add.path")).into());
+        let is_add_expr = Arc::new(expr!(is_not_null(col("add.path"))));
         Self::new(
             engine,
             Some(physical_predicate),
@@ -409,7 +409,7 @@ impl DataSkippingFilter {
         visitor.visit_rows_of(selection_vector.as_ref())?;
 
         if visitor.num_filtered > 0 {
-            debug!(
+            trace!(
                 "data skipping filtered {}/{batch_len} rows from batch",
                 visitor.num_filtered
             );
@@ -632,7 +632,7 @@ impl<'a> DataSkippingPredicateCreator<'a> {
     /// (op-computed verdicts bypass kernel's null-stats folding). The `is_add` column ensures
     /// non-Add rows always pass the filter.
     fn guard_for_removes(&self, pred: Pred) -> Pred {
-        Pred::or(Pred::not(column_pred!("is_add")), pred)
+        Pred::or(Pred::from_expr(expr!(not(col("is_add")))), pred)
     }
 }
 

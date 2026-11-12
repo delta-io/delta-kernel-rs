@@ -160,7 +160,10 @@ operations. `Snapshot::publish()`:
 3. Builds a `PublishMetadata` containing the list of `CatalogCommit` entries to publish.
 4. Delegates to `committer.publish(engine, publish_metadata)`, which copies each staged
    commit from `_staged_commits/` to `_delta_log/<version>.json`.
-5. Returns a **new snapshot** where all commits are marked as published.
+5. Returns a snapshot that uses published paths for commits known to be published.
+
+Use the returned snapshot for reads after staged commit files are removed. The
+input snapshot keeps its original paths.
 
 Publishing matters because:
 

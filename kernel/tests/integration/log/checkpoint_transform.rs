@@ -15,12 +15,12 @@ use delta_kernel::arrow::compute::{concat_batches, sort_to_indices, take};
 use delta_kernel::arrow::datatypes::{
     DataType as ArrowDataType, Field, Int64Type, Schema as ArrowSchema, TimestampMicrosecondType,
 };
-use delta_kernel::expressions::{Scalar, col, lit};
+use delta_kernel::expressions::{Predicate, Scalar, expr};
 use delta_kernel::object_store::ObjectStoreExt as _;
 use delta_kernel::object_store::memory::InMemory;
 use delta_kernel::object_store::path::Path;
 use delta_kernel::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-use delta_kernel::{KernelResult, Snapshot};
+use delta_kernel::{KernelError, KernelResult, Snapshot};
 use serde_json::json;
 use test_utils::delta_kernel_default_engine::DefaultEngineBuilder;
 use test_utils::delta_kernel_default_engine::executor::tokio::TokioMultiThreadExecutor;
@@ -97,7 +97,7 @@ async fn test_checkpoint_stats_config_with_real_data(
     #[values(true, false)] struct1: bool,
     #[values(true, false)] json2: bool,
     #[values(true, false)] struct2: bool,
-) -> KernelResult<()> {
+) -> delta_kernel::Result<()> {
     let (store, table_root) = new_in_memory_store();
     let executor = Arc::new(TokioMultiThreadExecutor::new(
         tokio::runtime::Handle::current(),
@@ -164,15 +164,15 @@ async fn test_checkpoint_stats_config_with_real_data(
     let batches = read_scan(&scan, engine.clone())?;
 
     let schema = batches[0].schema();
-    let merged = concat_batches(&schema, &batches)?;
+    let merged = concat_batches(&schema, &batches).map_err(KernelError::from)?;
     let id_col = merged.column_by_name("id").unwrap();
-    let sort_indices = sort_to_indices(id_col, None, None)?;
+    let sort_indices = sort_to_indices(id_col, None, None).map_err(KernelError::from)?;
     let sorted_columns: Vec<ArrayRef> = merged
         .columns()
         .iter()
         .map(|col| take(col.as_ref(), &sort_indices, None).unwrap())
         .collect();
-    let sorted = RecordBatch::try_new(schema, sorted_columns)?;
+    let sorted = RecordBatch::try_new(schema, sorted_columns).map_err(KernelError::from)?;
 
     assert_eq!(sorted.num_rows(), 6, "All 6 rows should be readable");
 
@@ -220,7 +220,7 @@ async fn test_checkpoint_partitioned_with_real_data(
     #[values(true, false)] struct1: bool,
     #[values(true, false)] json2: bool,
     #[values(true, false)] struct2: bool,
-) -> KernelResult<()> {
+) -> delta_kernel::Result<()> {
     let (store, table_root) = new_in_memory_store();
     let executor = Arc::new(TokioMultiThreadExecutor::new(
         tokio::runtime::Handle::current(),
@@ -256,7 +256,8 @@ async fn test_checkpoint_partitioned_with_real_data(
             Arc::new(Int64Array::from(vec![1, 2])) as ArrayRef,
             Arc::new(StringArray::from(vec!["Alice", "Bob"])),
         ],
-    )?;
+    )
+    .map_err(KernelError::from)?;
     write_batch_to_table(
         &snapshot,
         engine.as_ref(),
@@ -286,7 +287,8 @@ async fn test_checkpoint_partitioned_with_real_data(
             Arc::new(Int64Array::from(vec![3, 4])) as ArrayRef,
             Arc::new(StringArray::from(vec!["Charlie", "Diana"])),
         ],
-    )?;
+    )
+    .map_err(KernelError::from)?;
     write_batch_to_table(
         &snapshot,
         engine.as_ref(),
@@ -322,11 +324,20 @@ async fn test_checkpoint_partitioned_with_real_data(
     // Verify partitionValues_parsed content directly in the checkpoint
     if struct2 {
         let checkpoint_path = Path::from("_delta_log/00000000000000000003.checkpoint.parquet");
-        let checkpoint_bytes = store.get(&checkpoint_path).await?.bytes().await?;
-        let reader = ParquetRecordBatchReaderBuilder::try_new(checkpoint_bytes)?.build()?;
+        let checkpoint_bytes = store
+            .get(&checkpoint_path)
+            .await
+            .map_err(KernelError::from)?
+            .bytes()
+            .await
+            .map_err(KernelError::from)?;
+        let reader = ParquetRecordBatchReaderBuilder::try_new(checkpoint_bytes)
+            .map_err(KernelError::from)?
+            .build()
+            .map_err(KernelError::from)?;
         let ckpt_batches: Vec<RecordBatch> = reader.map(|b| b.unwrap()).collect();
         let ckpt_schema = ckpt_batches[0].schema();
-        let ckpt_merged = concat_batches(&ckpt_schema, &ckpt_batches)?;
+        let ckpt_merged = concat_batches(&ckpt_schema, &ckpt_batches).map_err(KernelError::from)?;
 
         let add_col = ckpt_merged
             .column_by_name("add")
@@ -382,15 +393,15 @@ async fn test_checkpoint_partitioned_with_real_data(
 
     // Merge all batches and sort by id to get deterministic ordering
     let schema = batches[0].schema();
-    let merged = concat_batches(&schema, &batches)?;
+    let merged = concat_batches(&schema, &batches).map_err(KernelError::from)?;
     let id_col = merged.column_by_name("id").unwrap();
-    let sort_indices = sort_to_indices(id_col, None, None)?;
+    let sort_indices = sort_to_indices(id_col, None, None).map_err(KernelError::from)?;
     let sorted_columns: Vec<ArrayRef> = merged
         .columns()
         .iter()
         .map(|col| take(col.as_ref(), &sort_indices, None).unwrap())
         .collect();
-    let sorted = RecordBatch::try_new(schema, sorted_columns)?;
+    let sorted = RecordBatch::try_new(schema, sorted_columns).map_err(KernelError::from)?;
 
     assert_eq!(sorted.num_rows(), 4, "All 4 rows should be readable");
 
@@ -420,7 +431,7 @@ const COLUMN_MAPPING_SCHEMA: &str = r#"{"type":"struct","fields":[{"name":"id","
 /// is enabled. The checkpoint should contain `col-category-phys` (physical) not `category`
 /// (logical) as the field name inside `partitionValues_parsed`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_checkpoint_partition_values_parsed_with_column_mapping() -> KernelResult<()> {
+async fn test_checkpoint_partition_values_parsed_with_column_mapping() -> delta_kernel::Result<()> {
     let (store, table_root) = new_in_memory_store();
     let executor = Arc::new(TokioMultiThreadExecutor::new(
         tokio::runtime::Handle::current(),
@@ -468,7 +479,8 @@ async fn test_checkpoint_partition_values_parsed_with_column_mapping() -> Kernel
             Arc::new(Int64Array::from(vec![1, 2])) as ArrayRef,
             Arc::new(StringArray::from(vec!["Alice", "Bob"])),
         ],
-    )?;
+    )
+    .map_err(KernelError::from)?;
     write_batch_to_table(
         &snapshot,
         engine.as_ref(),
@@ -483,11 +495,20 @@ async fn test_checkpoint_partition_values_parsed_with_column_mapping() -> Kernel
 
     // Read checkpoint and verify partitionValues_parsed uses physical name
     let checkpoint_path = Path::from("_delta_log/00000000000000000001.checkpoint.parquet");
-    let checkpoint_bytes = store.get(&checkpoint_path).await?.bytes().await?;
-    let reader = ParquetRecordBatchReaderBuilder::try_new(checkpoint_bytes)?.build()?;
+    let checkpoint_bytes = store
+        .get(&checkpoint_path)
+        .await
+        .map_err(KernelError::from)?
+        .bytes()
+        .await
+        .map_err(KernelError::from)?;
+    let reader = ParquetRecordBatchReaderBuilder::try_new(checkpoint_bytes)
+        .map_err(KernelError::from)?
+        .build()
+        .map_err(KernelError::from)?;
     let ckpt_batches: Vec<RecordBatch> = reader.map(|b| b.unwrap()).collect();
     let ckpt_schema = ckpt_batches[0].schema();
-    let ckpt_merged = concat_batches(&ckpt_schema, &ckpt_batches)?;
+    let ckpt_merged = concat_batches(&ckpt_schema, &ckpt_batches).map_err(KernelError::from)?;
 
     let add_col = ckpt_merged
         .column_by_name("add")
@@ -539,8 +560,8 @@ const WIDE_SCHEMA: &str = r#"{"type":"struct","fields":[{"name":"id","type":"lon
 /// pre-evolution columns, scanning with a predicate on a newly added column should
 /// not panic. The missing stats column should be treated as unknown (no data skipping).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_scan_schema_evolved_table_with_checkpoint_predicate_on_new_column() -> KernelResult<()>
-{
+async fn test_scan_schema_evolved_table_with_checkpoint_predicate_on_new_column()
+-> delta_kernel::Result<()> {
     let (store, table_root) = new_in_memory_store();
     let executor = Arc::new(TokioMultiThreadExecutor::new(
         tokio::runtime::Handle::current(),
@@ -600,7 +621,7 @@ async fn test_scan_schema_evolved_table_with_checkpoint_predicate_on_new_column(
 
     // Scan with predicate on `id` (present in checkpoint stats_parsed) should work
     let snapshot = Snapshot::builder_for(table_root.clone()).build(engine.as_ref())?;
-    let predicate = Arc::new(col!("id").gt(lit(2i64)));
+    let predicate = Arc::new(Predicate::from_expr(expr!(col("id") > 2i64)));
     let scan = snapshot.scan_builder().with_predicate(predicate).build()?;
     let batches = read_scan(&scan, engine.clone())?;
     let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
@@ -609,7 +630,7 @@ async fn test_scan_schema_evolved_table_with_checkpoint_predicate_on_new_column(
     // Scan with predicate on `age` (missing from checkpoint stats_parsed) should NOT panic.
     // The kernel should handle the missing stats column gracefully.
     let snapshot = Snapshot::builder_for(table_root).build(engine.as_ref())?;
-    let predicate = Arc::new(col!("age").gt(lit(30i64)));
+    let predicate = Arc::new(Predicate::from_expr(expr!(col("age") > 30i64)));
     let scan = snapshot.scan_builder().with_predicate(predicate).build()?;
     let batches = read_scan(&scan, engine.clone())?;
     let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();

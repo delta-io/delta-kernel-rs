@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use super::struct_expr_from_schema;
-use crate::expressions::{Expression, null_lit};
+use crate::expressions::{Expression, expr, null_lit};
 use crate::schema::{DataType, SchemaRef, StructField, StructType};
 use crate::{Engine, EngineData, ExpressionEvaluator, KernelError, KernelResult};
 
@@ -13,12 +13,10 @@ use crate::{Engine, EngineData, ExpressionEvaluator, KernelError, KernelResult};
 ///
 /// For example, projecting `add` batches onto a read schema of `{add, remove}` keeps each row's
 /// `add` and makes its `remove` null.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(super) struct ActionProjector {
     evaluator: Arc<dyn ExpressionEvaluator>,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl ActionProjector {
     /// Builds a projector from `source`, the schema of the batches to project, onto `read_schema`.
     /// Fields of `read_schema.<action>` that `source.<action>` has are copied; every other nullable
@@ -58,10 +56,8 @@ impl ActionProjector {
                 }
             })
             .collect::<KernelResult<Vec<_>>>()?;
-        let action_expr = Expression::struct_with_nullability_from(
-            fields,
-            Expression::from_pred(Expression::column([action]).is_not_null()),
-        );
+        let action_expr =
+            Expression::struct_with_nullability_from(fields, expr!(is_not_null(path(action))));
         let expr = struct_expr_from_schema(&read_schema, |name| {
             (name == action).then(|| action_expr.clone())
         })?;

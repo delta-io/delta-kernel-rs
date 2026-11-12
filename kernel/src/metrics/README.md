@@ -23,6 +23,12 @@ Success and failure are two variants of one event. Emit the success span, then f
 (`#[instrument(err)]` does this on `Err`; an emit helper calls `tracing::info!(error = ...)`). The
 layer sees `error` and flips the event via `MetricEvent::into_failure`.
 
+`CheckpointWriteSuccess` reports `Written` with statistics or `AlreadyExists` without statistics.
+`CheckpointWriteFailure` retains the selected mode and duration without write statistics. Both durations
+stop after checkpoint data writes and verification, before hint publication. Recording `duration_ns`
+preserves that boundary when the reporting span closes after the final API result is known. Calls
+that return before data completion use span-close timing.
+
 ## Adding an event
 
 1. Define the struct + `SPAN_NAME` in `events.rs`; add a `MetricEvent` variant and its

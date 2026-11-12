@@ -424,10 +424,10 @@ mod tests {
                     //    completed
                     // 3. the next key is the last key in the queue, in which case there is nothing
                     //    left to do (no need to wake anyone)
-                    if let Some(next_key) = state.ordered_keys.front().cloned() {
-                        if let Some(waker) = state.wakers.remove(&next_key) {
-                            waker.wake(); // NOTE: Not async, returns instantly.
-                        }
+                    if let Some(next_key) = state.ordered_keys.front().cloned()
+                        && let Some(waker) = state.wakers.remove(&next_key)
+                    {
+                        waker.wake(); // NOTE: Not async, returns instantly.
                     }
                     Poll::Ready(())
                 } else {

@@ -30,6 +30,10 @@ const ROARING_BITMAP_PORTABLE_MAGIC: u32 = 1681511377;
 /// This format is reserved for future use and not currently supported.
 const ROARING_BITMAP_NATIVE_MAGIC: u32 = 1681511376;
 
+/// Magic bytes an Iceberg Puffin file starts with ("PFA1").
+/// See: https://iceberg.apache.org/puffin-spec/#file-structure
+const PUFFIN_MAGIC: [u8; 4] = [0x50, 0x46, 0x41, 0x31];
+
 const INLINE_DELETION_VECTOR_MAGIC_SIZE: usize = 4;
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy, Serialize, Deserialize)]
@@ -572,26 +576,11 @@ impl DeletionVectorDescriptor {
                     )))??;
                 let dv_data_len = dv_data.len();
 
-                let mut cursor = Cursor::new(dv_data);
-                let mut version_buf = [0; 1];
-                cursor.read(&mut version_buf).map_err(|err| {
-                    KernelError::DeletionVector(format!(
-                        "Failed to read version from {path}: {err}"
-                    ))
-                })?;
-                let version = u8::from_be_bytes(version_buf);
-                require!(
-                    version == 1,
-                    KernelError::DeletionVector(format!("Invalid version {version} for {path}"))
-                );
+                self.validate_framing(&dv_data, &path)?;
 
-                // Deletion vector file format:
-                // +---------------+-----------------+
-                // |  num bytes    |  value          |
-                // +===============+=================+
-                // | 1 byte        |  version        |
-                // +---------------+-----------------+
-                // | offset-1      |  other dvs...   |
+                let mut cursor = Cursor::new(dv_data);
+
+                // DV blob layout, starting at this_dv_start (the descriptor's offset):
                 // +---------------+-----------------+ <- this_dv_start
                 // | 4 bytes       |  dv_size        |
                 // +---------------+-----------------+
@@ -683,6 +672,42 @@ impl DeletionVectorDescriptor {
         parent: &Url,
     ) -> KernelResult<Vec<u64>> {
         Ok(self.read(storage, parent)?.into_iter().collect())
+    }
+
+    /// Validates the deletion vector file's framing: a Delta DV file or, as a reader-side leniency
+    /// for Iceberg interop, a Puffin file.
+    ///
+    /// A Delta DV file opens with a 1-byte version header, then one or more blobs; the descriptor's
+    /// `offset` points at the first blob:
+    ///
+    /// ```text
+    /// +---------------+-----------------+
+    /// |  num bytes    |  value          |
+    /// +===============+=================+
+    /// | 1 byte        |  version        |
+    /// +---------------+-----------------+
+    /// | offset-1      |  other dvs...   |
+    /// +---------------+-----------------+ <- offset (first blob)
+    /// ```
+    fn validate_framing(&self, dv_data: &[u8], path: &Url) -> KernelResult<()> {
+        if dv_data.starts_with(&PUFFIN_MAGIC) {
+            require!(
+                self.offset
+                    .is_some_and(|offset| offset >= PUFFIN_MAGIC.len() as i32),
+                KernelError::DeletionVector(format!(
+                    "Puffin deletion vector requires an explicit offset >= {} for {path}",
+                    PUFFIN_MAGIC.len()
+                ))
+            );
+            Ok(())
+        } else {
+            let version = dv_data.first().copied().unwrap_or_default();
+            require!(
+                version == 1,
+                KernelError::DeletionVector(format!("Invalid version {version} for {path}"))
+            );
+            Ok(())
+        }
     }
 }
 
@@ -779,13 +804,8 @@ pub fn split_vector(
 ) -> Option<Vec<bool>> {
     match vector {
         Some(vector) if split_index < vector.len() => Some(vector.split_off(split_index)),
-        Some(vector) if extend.is_some() => {
-            vector.extend(std::iter::repeat_n(
-                // safety: we just checked `is_some` above
-                #[allow(clippy::unwrap_used)]
-                extend.unwrap(),
-                split_index - vector.len(),
-            ));
+        Some(vector) if let Some(extend) = extend => {
+            vector.extend(std::iter::repeat_n(extend, split_index - vector.len()));
             None
         }
         _ => None,
@@ -1255,6 +1275,68 @@ mod tests {
         let expected: Vec<u64> = vec![0, 9];
         let found = tree_map.iter().collect::<Vec<_>>();
         assert_eq!(found, expected)
+    }
+
+    // Absolute-path descriptor for the checked-in Iceberg Puffin fixture, with the given offset.
+    // `size_in_bytes` is the magic + bitmap size (Iceberg's 44-byte blob minus the 8-byte
+    // length-prefix + CRC framing). `parent` is unused for an absolute-path descriptor.
+    fn puffin_fixture_dv(offset: Option<i32>) -> (DeletionVectorDescriptor, Url) {
+        let path = std::fs::canonicalize(
+            "./tests/data/deletion-vector-puffin/deletion-vector-61d16c75.puffin",
+        )
+        .unwrap();
+        let parent = Url::from_directory_path(path.parent().unwrap()).unwrap();
+        let dv = DeletionVectorDescriptor {
+            storage_type: DeletionVectorStorageType::PersistedAbsolute,
+            path_or_inline_dv: Url::from_file_path(&path).unwrap().to_string(),
+            offset,
+            size_in_bytes: 36,
+            cardinality: 2,
+        };
+        (dv, parent)
+    }
+
+    // A DV blob is byte-identical in a Delta DV file and an Iceberg Puffin file; only the framing
+    // around it differs (a 1-byte `0x01` version header vs. the 4-byte `PFA1` magic plus a footer).
+    // Reads the blob out of a real Iceberg Puffin file (produced by iceberg-rust's PuffinWriter)
+    // and confirms it yields the same bitmap as the Delta fixture.
+    #[test]
+    fn test_deletion_vector_read_puffin_framed() {
+        // The blob starts just after the 4-byte `PFA1` magic.
+        let (dv, parent) = puffin_fixture_dv(Some(4));
+        let tree_map = dv
+            .read(SyncEngine::new().storage_handler(), &parent)
+            .unwrap();
+        assert_eq!(tree_map.iter().collect::<Vec<_>>(), vec![0, 9]);
+    }
+
+    // A Puffin-framed DV needs an explicit offset past the `PFA1` magic; without one the reader
+    // cannot fall back to the Delta version-header default, so it errors rather than misreading.
+    #[test]
+    fn test_deletion_vector_read_puffin_requires_offset() {
+        let (dv, parent) = puffin_fixture_dv(None);
+        assert_result_error_with_message(
+            dv.read(SyncEngine::new().storage_handler(), &parent),
+            "requires an explicit offset",
+        );
+    }
+
+    // A file whose header is neither the Delta version (`0x01`) nor the Puffin magic is still
+    // rejected rather than read at an arbitrary offset.
+    #[test]
+    fn test_deletion_vector_read_rejects_unknown_framing() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path()
+                .join("deletion_vector_61d16c75-6994-46b7-a15b-8b538852e50e.bin"),
+            [0x02u8; 48],
+        )
+        .unwrap();
+        let parent = Url::from_directory_path(dir.path()).unwrap();
+        assert_result_error_with_message(
+            dv_example().read(SyncEngine::new().storage_handler(), &parent),
+            "Invalid version 2",
+        );
     }
 
     #[rstest::rstest]

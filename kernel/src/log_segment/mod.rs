@@ -7,7 +7,7 @@ use std::sync::{Arc, LazyLock};
 
 use delta_kernel_derive::internal_api;
 use itertools::Itertools;
-use tracing::{debug, info, warn};
+use tracing::{debug, info, trace, warn};
 use url::Url;
 
 #[cfg(feature = "adaptive-metadata-in-dev")]
@@ -25,6 +25,8 @@ use crate::checkpoint::collation_stats::{
     build_collation_stats_read_transform, source_collation_stats,
 };
 use crate::committer::CatalogCommit;
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use crate::content_tree::read_checkpoint_action;
 use crate::expressions::ColumnName;
 use crate::last_checkpoint_hint::{HintAction, LastCheckpointHint};
 use crate::log_replay::ActionsBatch;
@@ -34,7 +36,9 @@ use crate::metrics::{
     SnapshotLoadMetricContext, emit_log_segment_load, emit_log_segment_load_failure,
 };
 use crate::path::LogPathFileType::*;
-use crate::path::{LogPathFileType, ParsedLogPath};
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use crate::path::LogRoot;
+use crate::path::{LogPathFileType, ParsedLogPath, published_commit_file_name};
 #[cfg(feature = "declarative-plans")]
 use crate::plans::ir::nodes::{FileType, ScanFile};
 use crate::schema::compare::SchemaComparison;
@@ -52,7 +56,7 @@ mod crc_replay;
 mod domain_metadata_replay;
 mod protocol_metadata_replay;
 
-pub(crate) use domain_metadata_replay::DomainMetadataMap;
+pub(crate) use domain_metadata_replay::{DomainMetadataMap, scan_domain_metadata_actions};
 #[cfg(feature = "adaptive-metadata-in-dev")]
 pub(crate) use protocol_metadata_replay::LastManifestCommitResolution;
 pub(crate) use protocol_metadata_replay::PmResolution;
@@ -62,7 +66,7 @@ mod crc_tests;
 #[cfg(all(test, feature = "adaptive-metadata-in-dev"))]
 mod protocol_metadata_replay_amt_tests;
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 /// Statistics for the commit files selected to replay a snapshot's log segment.
 ///
@@ -93,7 +97,7 @@ pub(crate) struct CheckpointReadInfo {
     #[serde(default)]
     #[allow(unused)]
     pub has_partition_values_parsed: bool,
-    /// The schema used to read checkpoint files, potentially including stats_parsed.
+    /// The schema of normalized checkpoint batches, potentially including stats_parsed.
     #[allow(unused)]
     pub checkpoint_read_schema: SchemaRef,
 }
@@ -166,12 +170,12 @@ pub(crate) fn validate_catalog_managed_log_tail(
             path.file_type, path.location.location
         )));
     }
-    for pair in log_tail.windows(2) {
+    for [a, b] in log_tail.array_windows() {
         require!(
-            pair[0].version.checked_add(1) == Some(pair[1].version),
+            a.version.checked_add(1) == Some(b.version),
             KernelError::LogTailVersionsNotContiguous {
-                first_version: pair[0].version,
-                second_version: pair[1].version,
+                first_version: a.version,
+                second_version: b.version,
             }
         );
     }
@@ -181,21 +185,7 @@ pub(crate) fn validate_catalog_managed_log_tail(
     let has_staged_commits = log_tail
         .iter()
         .any(|path| path.file_type == LogPathFileType::StagedCommit);
-    validate_catalog_managed_versions(
-        requested_version,
-        max_catalog_version,
-        has_staged_commits,
-        log_tail.last().map(|path| path.version),
-    )
-}
-
-/// Validate catalog version bounds against the staged commits available to the caller.
-pub(crate) fn validate_catalog_managed_versions(
-    requested_version: Option<Version>,
-    max_catalog_version: Option<Version>,
-    has_staged_commits: bool,
-    latest_commit_version: Option<Version>,
-) -> KernelResult<()> {
+    // Newly supplied staged commits require a bound even when the tail ends in a downgrade.
     require!(
         !has_staged_commits || max_catalog_version.is_some(),
         KernelError::MaxCatalogVersion(
@@ -205,6 +195,19 @@ pub(crate) fn validate_catalog_managed_versions(
         )
     );
 
+    validate_catalog_version_bounds(
+        requested_version,
+        max_catalog_version,
+        log_tail.last().map(|path| path.version),
+    )
+}
+
+/// Validate requested and terminal commit versions against a supplied catalog bound.
+pub(crate) fn validate_catalog_version_bounds(
+    requested_version: Option<Version>,
+    max_catalog_version: Option<Version>,
+    latest_commit_version: Option<Version>,
+) -> KernelResult<()> {
     if let (Some(requested_version), Some(max_catalog_version)) =
         (requested_version, max_catalog_version)
     {
@@ -224,8 +227,8 @@ pub(crate) fn validate_catalog_managed_versions(
             require!(
                 latest_commit_version >= requested_version,
                 KernelError::MaxCatalogVersion(format!(
-                    "Log tail version {} is less than requested version {requested_version} for \
-                     max catalog version {max_catalog_version}",
+                    "Latest commit version {} is less than requested version {requested_version} \
+                     for max catalog version {max_catalog_version}",
                     latest_commit_version
                 ))
             );
@@ -233,7 +236,7 @@ pub(crate) fn validate_catalog_managed_versions(
             require!(
                 latest_commit_version == max_catalog_version,
                 KernelError::MaxCatalogVersion(format!(
-                    "Log tail version {} does not match max catalog version \
+                    "Latest commit version {} does not match max catalog version \
                      {max_catalog_version}",
                     latest_commit_version
                 ))
@@ -654,12 +657,12 @@ impl LogSegment {
         log_tail: Vec<ParsedLogPath>,
     ) -> KernelResult<Self> {
         let end_version = end_version.into();
-        if let Some(end_version) = end_version {
-            if start_version > end_version {
-                return Err(KernelError::generic(
-                    "Failed to build LogSegment: start_version cannot be greater than end_version",
-                ));
-            }
+        if let Some(end_version) = end_version
+            && start_version > end_version
+        {
+            return Err(KernelError::generic(
+                "Failed to build LogSegment: start_version cannot be greater than end_version",
+            ));
         }
 
         // TODO: compactions?
@@ -864,12 +867,81 @@ impl LogSegment {
         Ok(new_log_segment)
     }
 
-    pub(crate) fn new_as_published(&self) -> KernelResult<Self> {
-        // In the future, we can additionally convert the staged commit files to published commit
-        // files. That would reqire faking their FileMeta locations.
+    /// Replaces retained staged commit references through `max_published_version` with published
+    /// paths.
+    ///
+    /// The caller establishes which commits have been published; this method performs no storage
+    /// reads. Replaced commit references retain the staged file's size and modification time.
+    /// `max_published_version` cannot exceed `self.end_version` or be less than
+    /// `self.listed.max_published_version`.
+    ///
+    /// `None` means no published version is known. Callers may pass it when no commits need copying
+    /// and no published version was recorded, including when a checkpoint covers the replay
+    /// commits. It is a no-op if the recorded maximum is also `None`; otherwise it is an error.
+    ///
+    /// Returns `Ok(None)` without cloning if neither the commit paths nor the recorded maximum
+    /// change.
+    pub(crate) fn new_as_published(
+        &self,
+        max_published_version: Option<Version>,
+    ) -> KernelResult<Option<Self>> {
+        require!(
+            max_published_version <= Some(self.end_version),
+            KernelError::invalid_log_segment(format!(
+                "publication watermark {max_published_version:?} exceeds log segment end version {}",
+                self.end_version
+            ))
+        );
+        require!(
+            max_published_version >= self.listed.max_published_version,
+            KernelError::invalid_log_segment(format!(
+                "publication watermark {max_published_version:?} regresses existing watermark {:?}",
+                self.listed.max_published_version
+            ))
+        );
+
+        let needs_published_path = |file: &ParsedLogPath| {
+            file.file_type == StagedCommit
+                && max_published_version.is_some_and(|version| file.version <= version)
+        };
+        if max_published_version == self.listed.max_published_version
+            && !self
+                .listed
+                .ascending_commit_files
+                .iter()
+                .chain(self.listed.latest_commit_file.iter())
+                .any(needs_published_path)
+        {
+            return Ok(None);
+        }
+
+        let replace_staged = |file: &mut ParsedLogPath| -> KernelResult<()> {
+            if needs_published_path(file) {
+                let location = self
+                    .log_root
+                    .join(&published_commit_file_name(file.version))?;
+                let metadata = FileMeta {
+                    location: location.clone(),
+                    last_modified: file.location.last_modified,
+                    size: file.location.size,
+                };
+                *file = ParsedLogPath::new(metadata)
+                    .ok_or_else(|| KernelError::invalid_log_path(location))?;
+            }
+            Ok(())
+        };
+
         let mut new_log_segment = self.clone();
-        new_log_segment.listed.max_published_version = Some(self.end_version);
-        Ok(new_log_segment)
+        new_log_segment.listed.max_published_version = max_published_version;
+        for file in &mut new_log_segment.listed.ascending_commit_files {
+            replace_staged(file)?;
+        }
+        // Loading a snapshot with a checkpoint at the same version leaves ascending_commit_files
+        // empty. latest_commit_file is still needed to read the in-commit timestamp.
+        if let Some(file) = &mut new_log_segment.listed.latest_commit_file {
+            replace_staged(file)?;
+        }
+        Ok(Some(new_log_segment))
     }
 
     pub(crate) fn get_unpublished_catalog_commits(&self) -> KernelResult<Vec<CatalogCommit>> {
@@ -921,8 +993,7 @@ impl LogSegment {
         meta_predicate: Option<PredicateRef>,
         stats_schema: Option<&StructType>,
         partition_schema: Option<&StructType>,
-    ) -> KernelResult<ActionsWithCheckpointInfo<impl KernelResultIterator<ActionsBatch> + use<>>>
-    {
+    ) -> KernelResult<ActionsWithCheckpointInfo<Box<dyn KernelResultIterator<ActionsBatch>>>> {
         // Combine the action-presence predicate with the caller's skipping predicate so readers
         // can omit checkpoint data that cannot contain a relevant action.
         let projection_predicate = checkpoint_action_projection_predicate(&checkpoint_read_schema);
@@ -942,8 +1013,85 @@ impl LogSegment {
         )?;
 
         Ok(ActionsWithCheckpointInfo {
-            actions: commit_stream.chain(checkpoint_result.actions),
+            actions: Box::new(commit_stream.chain(checkpoint_result.actions)),
             checkpoint_info: checkpoint_result.checkpoint_info,
+        })
+    }
+
+    /// Same as [`Self::read_actions_with_projected_checkpoint_actions`], but reads the AMT
+    /// `checkpoint` action as the segment's checkpoint: the commits after its version are followed
+    /// by the actions it carries, and the commits and checkpoint files at or below that version are
+    /// not read.
+    ///
+    /// `table_root` resolves the action's manifest locations.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn read_actions_with_checkpoint_action(
+        &self,
+        engine: &dyn Engine,
+        checkpoint: &CheckpointAction,
+        table_root: &Url,
+        commit_read_schema: SchemaRef,
+        checkpoint_read_schema: SchemaRef,
+        stats_schema: Option<&StructType>,
+    ) -> KernelResult<ActionsWithCheckpointInfo<Box<dyn KernelResultIterator<ActionsBatch>>>> {
+        let version = Version::try_from(checkpoint.version())
+            .ok()
+            .filter(|v| *v <= self.end_version)
+            .ok_or_else(|| {
+                KernelError::invalid_checkpoint(format!(
+                    "checkpoint action version {} is outside the log segment's versions 0..={}",
+                    checkpoint.version(),
+                    self.end_version
+                ))
+            })?;
+        // A manifest commit's checkpoint action covers its version with the tree alone; an older
+        // root needs the inline file actions only a standalone checkpoint carries.
+        require!(
+            checkpoint.content_root_version() == checkpoint.version(),
+            KernelError::unsupported(format!(
+                "reading a checkpoint action whose content root version {} is older than its \
+                 version {version} is not yet supported",
+                checkpoint.content_root_version()
+            ))
+        );
+        // Writers stop producing checkpoint files once adaptiveMetadata is enabled, so a file at or
+        // after the action's version is a standalone checkpoint.
+        if let Some(checkpoint_file_version) = self.checkpoint_version.filter(|v| *v >= version) {
+            return Err(KernelError::unsupported(format!(
+                "reading the adaptiveMetadata standalone checkpoint at version \
+                 {checkpoint_file_version} is not yet supported"
+            )));
+        }
+
+        let commits = Self::read_commit_files(
+            engine,
+            &self.find_commit_cover_after(Some(version)),
+            commit_read_schema,
+        )?;
+        let stats_fallback =
+            needs_json_stats_fallback(&checkpoint_read_schema, stats_schema, false)
+                .then(|| StructField::nullable("stats", DataType::STRING));
+        let checkpoint_read_schema = augment_checkpoint_read_schema(
+            &checkpoint_read_schema,
+            stats_fallback.into_iter().collect(),
+            false,
+        )?;
+        let checkpoint_actions = read_checkpoint_action(
+            engine,
+            checkpoint,
+            &LogRoot::new(table_root.clone())?,
+            checkpoint_read_schema.clone(),
+        )?;
+        Ok(ActionsWithCheckpointInfo {
+            actions: Box::new(commits.chain(checkpoint_actions)),
+            // TODO(#2866): the content tree reader produces neither `stats_parsed` nor
+            // `partitionValues_parsed`, so replay parses the JSON stats.
+            checkpoint_info: CheckpointReadInfo {
+                has_stats_parsed: false,
+                has_partition_values_parsed: false,
+                checkpoint_read_schema,
+            },
         })
     }
 
@@ -1043,15 +1191,42 @@ impl LogSegment {
     }
 
     fn find_commit_cover_paths(&self, after: Option<Version>) -> Vec<&ParsedLogPath> {
+        self.find_commit_cover_paths_in_range(after, self.end_version, &[])
+    }
+
+    /// The commit cover over versions in `(oldest_exclusive, newest_inclusive]`, in descending
+    /// order. Each of `required_commits` is read as its own commit file, never through a log
+    /// compaction. A compaction that crosses either end of the range is read as its individual
+    /// commits within the range.
+    fn find_commit_cover_paths_in_range(
+        &self,
+        oldest_exclusive: Option<Version>,
+        newest_inclusive: Version,
+        required_commits: &[Version],
+    ) -> Vec<&ParsedLogPath> {
+        let commits = self
+            .listed
+            .ascending_commit_files
+            .iter()
+            .filter(|commit| commit.version <= newest_inclusive);
+        let compactions = self
+            .listed
+            .ascending_compaction_files
+            .iter()
+            .filter(|compaction| {
+                matches!(
+                    compaction.file_type,
+                    LogPathFileType::CompactedCommit { hi } if hi <= newest_inclusive
+                        && !required_commits.iter().any(|v| (compaction.version..=hi).contains(v))
+                )
+            });
         // Create an iterator sorted in ascending order by (initial version, end version), e.g.
         // [00.json, 00.09.compacted.json, 00.99.compacted.json, 01.json, 02.json, ..., 10.json,
         //  10.19.compacted.json, 11.json, ...]
-        let all_files = itertools::Itertools::merge_by(
-            self.listed.ascending_commit_files.iter(),
-            self.listed.ascending_compaction_files.iter(),
-            |path_a, path_b| path_a.version <= path_b.version,
-        )
-        .filter(|path| after.is_none_or(|after| path.version > after));
+        let all_files = itertools::Itertools::merge_by(commits, compactions, |path_a, path_b| {
+            path_a.version <= path_b.version
+        })
+        .filter(|path| oldest_exclusive.is_none_or(|oldest| path.version > oldest));
 
         let mut last_pushed: Option<&ParsedLogPath> = None;
 
@@ -1061,19 +1236,19 @@ impl LogSegment {
                 // Resolve version number ties in favor of the later file (it covers a wider range)
                 Some(prev) if prev.version == next.version => {
                     let removed = selected_files.pop();
-                    debug!("Selecting {next:?} rather than {removed:?}, it covers a wider range");
+                    trace!("Selecting {next:?} rather than {removed:?}, it covers a wider range");
                 }
                 // Skip later files whose start overlaps with the previous end
                 Some(&ParsedLogPath {
                     file_type: LogPathFileType::CompactedCommit { hi },
                     ..
                 }) if next.version <= hi => {
-                    debug!("Skipping log file {next:?}, it's already covered.");
+                    trace!("Skipping log file {next:?}, it's already covered.");
                     continue;
                 }
                 _ => {} // just fall through
             }
-            debug!("Provisionally selecting {next:?}");
+            trace!("Provisionally selecting {next:?}");
             last_pushed = Some(next);
             selected_files.push(next);
         }
@@ -1799,16 +1974,15 @@ fn validate_compaction_files(compactions: &[ParsedLogPath]) -> KernelResult<()> 
                 f.version, hi
             )));
         }
-        if let Some(next) = compactions.get(i + 1) {
-            // next's type is validated on its own iteration; skip sort check if it isn't a
-            // CompactedCommit since the type error will be caught then.
-            if let LogPathFileType::CompactedCommit { hi: next_hi } = next.file_type {
-                if !(f.version < next.version || (f.version == next.version && hi <= next_hi)) {
-                    return Err(KernelError::invalid_log_segment(format!(
-                        "ascending_compaction_files is not sorted: {f:?} -> {next:?}"
-                    )));
-                }
-            }
+        // next's type is validated on its own iteration; skip sort check if it isn't a
+        // CompactedCommit since the type error will be caught then.
+        if let Some(next) = compactions.get(i + 1)
+            && let LogPathFileType::CompactedCommit { hi: next_hi } = next.file_type
+            && !(f.version < next.version || (f.version == next.version && hi <= next_hi))
+        {
+            return Err(KernelError::invalid_log_segment(format!(
+                "ascending_compaction_files is not sorted: {f:?} -> {next:?}"
+            )));
         }
     }
     Ok(())
@@ -1905,13 +2079,12 @@ pub(crate) fn validate_commit_file_types(commits: &[ParsedLogPath]) -> KernelRes
 
 /// Validates that commit versions are in strictly increasing order.
 pub(crate) fn validate_commit_files_sorted(commits: &[ParsedLogPath]) -> KernelResult<()> {
-    if let Some(pair) = commits
-        .windows(2)
-        .find(|pair| pair[0].version >= pair[1].version)
+    if let Some([a, b]) = commits
+        .array_windows()
+        .find(|[a, b]| a.version >= b.version)
     {
         return Err(KernelError::invalid_log_segment(format!(
-            "ascending_commit_files is not sorted: {:?} -> {:?}",
-            pair[0], pair[1]
+            "ascending_commit_files is not sorted: {a:?} -> {b:?}"
         )));
     }
     Ok(())
@@ -1942,14 +2115,13 @@ pub(crate) fn validate_start_version_available(
 
 /// Validates that each commit version immediately follows the previous version.
 pub(crate) fn validate_commit_files_contiguous(commits: &[ParsedLogPath]) -> KernelResult<()> {
-    for pair in commits.windows(2) {
-        let Some(expected_version) = pair[0].version.checked_add(1) else {
+    for [prev, next] in commits.array_windows() {
+        let Some(expected_version) = prev.version.checked_add(1) else {
             return Err(KernelError::invalid_log_segment(format!(
-                "Expected contiguous commit files, but the version after {:?} overflows",
-                pair[0]
+                "Expected contiguous commit files, but the version after {prev:?} overflows"
             )));
         };
-        if expected_version != pair[1].version {
+        if expected_version != next.version {
             return Err(KernelError::MissingVersion(expected_version));
         }
     }

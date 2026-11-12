@@ -288,7 +288,7 @@ The REST authentication callback similarly fills a caller-provided record:
 pub type CAuthHeaderCallback = extern "C" fn(
     context: NullableCvoid,
     out: *mut CAuthHeaders,
-    allocate_error: AllocateErrorFn,
+    error_allocators: *const ErrorAllocators,
 );
 ```
 
@@ -443,41 +443,36 @@ an opaque pointer when the API needs one.
 
 ### Error handling
 
-Rust helpers use `KernelResult<T>` and pass it to `IntoExternResult` to produce the C ABI's
-`ExternResult<T>`. Preserve `KernelError` variants through this conversion. `delta_kernel::Result<T>`
-uses the separate top-level `Error` envelope.
+Rust helpers return `KernelResult<T>` or `delta_kernel::Result<T>` and pass the result to
+`IntoExternResult` to produce the C ABI's `ExternResult<T>`. The top-level error variant selects the
+connector's allocation callback; a Delta error with a Kernel source still uses the Delta callback.
 
 There are two error directions, with opposite message owners:
 
 | Direction | Result envelope | Message construction | Final owner |
 | :---- | :---- | :---- | :---- |
-| Kernel to engine | `ExternResult<T>::Err(*mut EngineError)` | Kernel calls the engine's `AllocateErrorFn` with a temporary `KernelStringSlice`. | The engine owns and frees the returned `EngineError`. |
+| Kernel to engine | `ExternResult<T>::Err(*mut c_void)` | Kernel calls the registered Kernel or Delta allocator with temporary error information. | The engine owns and frees the returned error object. |
 | Engine to Kernel | `EngineExecResult<T>::Failure(EngineExecError)` | The engine calls `allocate_kernel_string` to copy its message into an `ExclusiveRustString` handle. | Kernel consumes and frees the string handle. |
 
-#### Kernel errors returned to the engine
+#### Kernel and Delta errors returned to the engine
 
-`AllocateErrorFn` is the one underlying ABI:
+`ErrorAllocators` carries a connector context and both allocation callbacks. `KernelErrorInfo`
+contains a numeric code and message; `DeltaErrorInfo` contains the catalog condition, optional
+SQLSTATE, named parameters, and message. Callbacks copy any information they need after returning
+and return their own error object as `void*`, or NULL if allocation fails. Kernel returns that
+pointer unchanged in `ExternResult::Err` and never reads or frees it.
+
+Engine constructors accept `*const ErrorAllocators` and copy the table into builders and engines.
+The table pointer must be valid for the constructor call; callback code and context must remain
+valid for every use and support concurrent calls when shared. Standalone exports borrow a table
+for the call. Use the stored allocator when an engine or builder is already available:
 
 ```rust
-pub type AllocateErrorFn = extern "C" fn(
-    error_type: FFIKernelError,
-    message: KernelStringSlice,
-) -> *mut EngineError;
+unsafe { result.into_extern_result(&*error_allocators) }; // Borrowed table for this call.
+unsafe { result.into_extern_result(&engine.as_ref()) }; // The engine stores the table.
 ```
 
-Kernel may reach it in two ways:
-
-```rust
-result.into_extern_result(&allocate_error); // No engine handle exists yet.
-result.into_extern_result(&engine.as_ref()); // The engine stores the callback.
-```
-
-Use the allocator stored on the engine, builder, or another live owner when one is already
-available. Accept an explicit `AllocateErrorFn` only when the API has no such owner, for example
-while constructing an engine or inside a standalone visitor API. Do not require both. In either
-form, Kernel owns the source message only until `AllocateErrorFn` returns. The callback must copy
-the message into engine-owned memory and return an `EngineError` pointer. Kernel immediately places
-that pointer in ExternResult::Err and never frees it.
+Do not require both an engine and a separate allocator table for the same operation.
 
 #### Engine errors returned to Kernel
 
@@ -493,7 +488,7 @@ pub struct EngineExecError {
 
 The engine creates message by calling allocate_kernel_string. Kernel takes ownership when it
 receives EngineExecResult::Failure, consumes the handle exactly once, and frees it. The
-`AllocateErrorFn` argument to allocate_kernel_string is only for reporting a failure in that
+`ErrorAllocators` argument to allocate_kernel_string is only for reporting a failure in that
 downcall, such as invalid UTF-8; it does not own the returned string. `AllocateStringFn` is a
 separate general-purpose conversion callback for temporary Kernel strings. It is not the error
 allocator and should not be introduced as a third error-message ownership model.
@@ -522,10 +517,10 @@ pub struct CMetadataEntries {
 pub unsafe extern "C" fn set_metadata(
     builder: *mut FfiBuilder,
     entries: CMetadataEntries,
-    allocate_error: AllocateErrorFn,
+    error_allocators: *const ErrorAllocators,
 ) -> ExternResult<bool> {
     let result = unsafe { set_metadata_impl(builder, entries) };
-    unsafe { result.into_extern_result(&allocate_error) }
+    unsafe { result.into_extern_result(&*error_allocators) }
 }
 
 unsafe fn set_metadata_impl(

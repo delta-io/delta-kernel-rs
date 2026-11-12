@@ -11,8 +11,9 @@ use std::sync::Arc;
 use delta_kernel::arrow::array::{Int32Array, MapArray, RecordBatch, StringArray, StructArray};
 use delta_kernel::arrow::datatypes::Schema as ArrowSchema;
 use delta_kernel::committer::FileSystemCommitter;
+use delta_kernel::engine::DelegatingEngine;
 use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
-use delta_kernel::expressions::{Predicate as Pred, PredicateRef, Scalar, col, lit};
+use delta_kernel::expressions::{Predicate as Pred, PredicateRef, Scalar, expr};
 use delta_kernel::incremental_scan::{
     IncrementalListing, IncrementalListingAgainstBase, IncrementalScanStream,
     IncrementalScanSummary,
@@ -26,9 +27,7 @@ use delta_kernel::scan::state::ScanFile;
 use delta_kernel::schema::{StructType, schema_ref};
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
-use delta_kernel::{
-    Engine, EvaluationHandler, JsonHandler, ParquetHandler, Snapshot, SnapshotRef, StorageHandler,
-};
+use delta_kernel::{Engine, Snapshot, SnapshotRef};
 use rstest::rstest;
 use test_utils::delta_kernel_default_engine::executor::tokio::TokioBackgroundExecutor;
 use test_utils::delta_kernel_default_engine::json::DefaultJsonHandler;
@@ -788,49 +787,24 @@ async fn mixed_intra_batch_selection_vector() -> Result<(), Box<dyn std::error::
 }
 
 // === Batch-splitting invariance ===
-//
-// Engine wrapper that overrides only the JSON handler so we can force `read_json_files`
-// to chunk a single commit file across many `ActionsBatch` yields. Used by the
-// `single_commit_split_across_batches_dedups_correctly` test to verify the kernel does
-// not carry per-batch dedup state. A naive consumer that assumes "one yield = one commit"
-// would mis-cancel a same-commit `add(P, dv=new) + remove(P, dv=old)` pair when the two
-// rows land in different batches. Our dedup is keyed on `(path, dv_unique_id)` against a
-// global `seen_file_keys`, so output must be identical regardless of how the JSON reader
-// chunks rows.
-struct CustomBatchSizeEngine {
-    inner: Arc<DefaultEngine<TokioBackgroundExecutor>>,
-    json: Arc<DefaultJsonHandler<TokioBackgroundExecutor>>,
-}
 
-impl CustomBatchSizeEngine {
-    fn new(storage: Arc<InMemory>, batch_size: usize) -> Self {
-        let task_executor = Arc::new(TokioBackgroundExecutor::new());
-        let json = Arc::new(
-            DefaultJsonHandler::new(storage.clone(), task_executor.clone())
-                .with_batch_size(NonZero::new(batch_size).expect("batch_size is non-zero")),
-        );
-        let inner = Arc::new(
-            DefaultEngineBuilder::new(storage)
-                .with_task_executor(task_executor)
-                .build(),
-        );
-        Self { inner, json }
-    }
-}
-
-impl Engine for CustomBatchSizeEngine {
-    fn evaluation_handler(&self) -> Arc<dyn EvaluationHandler> {
-        self.inner.evaluation_handler()
-    }
-    fn storage_handler(&self) -> Arc<dyn StorageHandler> {
-        self.inner.storage_handler()
-    }
-    fn json_handler(&self) -> Arc<dyn JsonHandler> {
-        self.json.clone()
-    }
-    fn parquet_handler(&self) -> Arc<dyn ParquetHandler> {
-        self.inner.parquet_handler()
-    }
+/// Overrides the JSON batch size so tests can split a single commit across multiple `ActionsBatch`
+/// yields and check that deduplication is independent of batch boundaries. The JSON handler shares
+/// storage and the task executor with the base engine.
+fn custom_batch_size_engine(storage: Arc<InMemory>, batch_size: usize) -> DelegatingEngine {
+    let task_executor = Arc::new(TokioBackgroundExecutor::new());
+    let batch_sized_json_handler = Arc::new(
+        DefaultJsonHandler::new(storage.clone(), task_executor.clone())
+            .with_batch_size(NonZero::new(batch_size).expect("batch_size is non-zero")),
+    );
+    let inner = Arc::new(
+        DefaultEngineBuilder::new(storage)
+            .with_task_executor(task_executor)
+            .build(),
+    );
+    DelegatingEngine::new(inner)
+        .with_json_handler(batch_sized_json_handler)
+        .without_plan_executor()
 }
 
 // Regression test for batch-splitting invariance. A single commit contains a mix that
@@ -885,7 +859,7 @@ async fn single_commit_split_across_batches_dedups_correctly(
     .join("\n");
     add_commit(table_root, storage.as_ref(), 1, v1_actions).await?;
 
-    let engine = CustomBatchSizeEngine::new(storage, batch_size);
+    let engine = custom_batch_size_engine(storage, batch_size);
     let target = Snapshot::builder_for(table_url)
         .at_version(1)
         .build(&engine)?;
@@ -1345,90 +1319,90 @@ async fn incremental_scan_preserves_raw_partition_values_without_parsed_partitio
 // Under UTC, the offset-less value is interpreted as 2024-01-15T12:30:45.123456Z (UTC).
 // The file is expected not to be pruned.
 #[case::utc_before(
-    col!("p_ts").lt(lit(Scalar::Timestamp(
+    Pred::from_expr(expr!(col("p_ts") < lit(Scalar::Timestamp(
         1_705_334_400_000_000 /* 2024-01-15T16:00:00Z (UTC) */
-    ))),
+    )))),
     None /* timezone: default UTC */,
     1 /* expected surviving file count */
 )]
 // Under UTC, the offset-less value is interpreted as 2024-01-15T12:30:45.123456Z (UTC).
 // The file is expected to be pruned.
 #[case::utc_after(
-    col!("p_ts").gt(lit(Scalar::Timestamp(
+    Pred::from_expr(expr!(col("p_ts") > lit(Scalar::Timestamp(
         1_705_334_400_000_000 /* 2024-01-15T16:00:00Z (UTC) */
-    ))),
+    )))),
     None /* timezone: default UTC */,
     0 /* expected surviving file count */
 )]
 // Under America/Los_Angeles, the offset-less value is interpreted as
 // 2024-01-15T20:30:45.123456Z (UTC). The file is expected to be pruned.
 #[case::los_angeles_before(
-    col!("p_ts").lt(lit(Scalar::Timestamp(
+    Pred::from_expr(expr!(col("p_ts") < lit(Scalar::Timestamp(
         1_705_334_400_000_000 /* 2024-01-15T16:00:00Z (UTC) */
-    ))),
+    )))),
     Some("America/Los_Angeles") /* timezone */,
     0 /* expected surviving file count */
 )]
 // Under America/Los_Angeles, the offset-less value is interpreted as
 // 2024-01-15T20:30:45.123456Z (UTC). The file is expected not to be pruned.
 #[case::los_angeles_after(
-    col!("p_ts").gt(lit(Scalar::Timestamp(
+    Pred::from_expr(expr!(col("p_ts") > lit(Scalar::Timestamp(
         1_705_334_400_000_000 /* 2024-01-15T16:00:00Z (UTC) */
-    ))),
+    )))),
     Some("America/Los_Angeles") /* timezone */,
     1 /* expected surviving file count */
 )]
 // Under UTC, the offset-less value is interpreted as 2024-01-15T12:30:45.123456Z (UTC).
 // The file is expected not to be pruned.
 #[case::utc_equal(
-    col!("p_ts").eq(lit(Scalar::Timestamp(
+    Pred::from_expr(expr!(col("p_ts") == lit(Scalar::Timestamp(
         1_705_321_845_123_456 /* 2024-01-15T12:30:45.123456Z (UTC) */
-    ))),
+    )))),
     None /* timezone: default UTC */,
     1 /* expected surviving file count */
 )]
 // Under UTC, the offset-less value is interpreted as 2024-01-15T12:30:45.123456Z (UTC).
 // The file is expected not to be pruned.
 #[case::utc_less_than_or_equal(
-    col!("p_ts").le(lit(Scalar::Timestamp(
+    Pred::from_expr(expr!(col("p_ts") <= lit(Scalar::Timestamp(
         1_705_321_845_123_456 /* 2024-01-15T12:30:45.123456Z (UTC) */
-    ))),
+    )))),
     None /* timezone: default UTC */,
     1 /* expected surviving file count */
 )]
 // Under UTC, the offset-less value is interpreted as 2024-01-15T12:30:45.123456Z (UTC).
 // The file is expected not to be pruned.
 #[case::utc_greater_than_or_equal(
-    col!("p_ts").ge(lit(Scalar::Timestamp(
+    Pred::from_expr(expr!(col("p_ts") >= lit(Scalar::Timestamp(
         1_705_321_845_123_456 /* 2024-01-15T12:30:45.123456Z (UTC) */
-    ))),
+    )))),
     None /* timezone: default UTC */,
     1 /* expected surviving file count */
 )]
 // Under America/Los_Angeles, the offset-less value is interpreted as
 // 2024-01-15T20:30:45.123456Z (UTC). The file is expected not to be pruned.
 #[case::los_angeles_equal(
-    col!("p_ts").eq(lit(Scalar::Timestamp(
+    Pred::from_expr(expr!(col("p_ts") == lit(Scalar::Timestamp(
         1_705_350_645_123_456 /* 2024-01-15T20:30:45.123456Z (UTC) */
-    ))),
+    )))),
     Some("America/Los_Angeles") /* timezone */,
     1 /* expected surviving file count */
 )]
 // Under America/Los_Angeles, the offset-less value is interpreted as
 // 2024-01-15T20:30:45.123456Z (UTC). The file is expected not to be pruned.
 #[case::los_angeles_less_than_or_equal(
-    col!("p_ts").le(lit(Scalar::Timestamp(
+    Pred::from_expr(expr!(col("p_ts") <= lit(Scalar::Timestamp(
         1_705_350_645_123_456 /* 2024-01-15T20:30:45.123456Z (UTC) */
-    ))),
+    )))),
     Some("America/Los_Angeles") /* timezone */,
     1 /* expected surviving file count */
 )]
 // Under America/Los_Angeles, the offset-less value is interpreted as
 // 2024-01-15T20:30:45.123456Z (UTC). The file is expected not to be pruned.
 #[case::los_angeles_greater_than_or_equal(
-    col!("p_ts").ge(lit(Scalar::Timestamp(
+    Pred::from_expr(expr!(col("p_ts") >= lit(Scalar::Timestamp(
         1_705_350_645_123_456 /* 2024-01-15T20:30:45.123456Z (UTC) */
-    ))),
+    )))),
     Some("America/Los_Angeles") /* timezone */,
     1 /* expected surviving file count */
 )]
@@ -1457,13 +1431,13 @@ async fn incremental_scan_partition_predicate_uses_timezone(
 #[rstest]
 #[case::timestamp_partition(
     Partitioning::Timestamp,
-    col!("p_ts").gt(lit(Scalar::Timestamp(
+    Pred::from_expr(expr!(col("p_ts") > lit(Scalar::Timestamp(
         1_705_334_400_000_000 /* 2024-01-15T16:00:00Z (UTC) */
-    ))),
+    )))),
 )]
 #[case::int_partition(
     Partitioning::Integer,
-    col!("p_int").gt(lit(0)),
+    Pred::from_expr(expr!(col("p_int") > 0)),
 )]
 #[tokio::test]
 async fn incremental_scan_reports_invalid_timezone_when_expression_used(
@@ -1492,11 +1466,11 @@ async fn incremental_scan_reports_invalid_timezone_when_expression_used(
 )]
 #[case::unpartitioned(
     Partitioning::Unpartitioned,
-    Some(col!("p_ts").gt(lit(Scalar::Timestamp(0)))),
+    Some(Pred::from_expr(expr!(col("p_ts") > lit(Scalar::Timestamp(0))))),
 )]
 #[case::data_column_predicate(
     Partitioning::Timestamp,
-    Some(col!("value").gt(lit(0))),
+    Some(Pred::from_expr(expr!(col("value") > 0))),
 )]
 #[tokio::test]
 async fn incremental_scan_ignores_invalid_timezone_without_partition_predicate(
@@ -1519,15 +1493,15 @@ async fn incremental_scan_ignores_invalid_timezone_without_partition_predicate(
 
 #[rstest]
 #[case::less_than(
-    col!("ts").lt(lit(Scalar::Timestamp(
+    Pred::from_expr(expr!(col("ts") < lit(Scalar::Timestamp(
         1_705_350_645_123_456 /* 2024-01-15T20:30:45.123456Z (UTC) */
-    ))),
+    )))),
     &["base_before.parquet", "incremental_before.parquet"],
 )]
 #[case::less_than_or_equal(
-    col!("ts").le(lit(Scalar::Timestamp(
+    Pred::from_expr(expr!(col("ts") <= lit(Scalar::Timestamp(
         1_705_350_645_123_456 /* 2024-01-15T20:30:45.123456Z (UTC) */
-    ))),
+    )))),
     &[
         "base_before.parquet",
         "base_equal.parquet",
@@ -1536,15 +1510,15 @@ async fn incremental_scan_ignores_invalid_timezone_without_partition_predicate(
     ],
 )]
 #[case::equal(
-    col!("ts").eq(lit(Scalar::Timestamp(
+    Pred::from_expr(expr!(col("ts") == lit(Scalar::Timestamp(
         1_705_350_645_123_456 /* 2024-01-15T20:30:45.123456Z (UTC) */
-    ))),
+    )))),
     &["base_equal.parquet", "incremental_equal.parquet"],
 )]
 #[case::greater_than_or_equal(
-    col!("ts").ge(lit(Scalar::Timestamp(
+    Pred::from_expr(expr!(col("ts") >= lit(Scalar::Timestamp(
         1_705_350_645_123_456 /* 2024-01-15T20:30:45.123456Z (UTC) */
-    ))),
+    )))),
     &[
         "base_equal.parquet",
         "base_after.parquet",
@@ -1553,9 +1527,9 @@ async fn incremental_scan_ignores_invalid_timezone_without_partition_predicate(
     ],
 )]
 #[case::greater_than(
-    col!("ts").gt(lit(Scalar::Timestamp(
+    Pred::from_expr(expr!(col("ts") > lit(Scalar::Timestamp(
         1_705_350_645_123_456 /* 2024-01-15T20:30:45.123456Z (UTC) */
-    ))),
+    )))),
     &["base_after.parquet", "incremental_after.parquet"],
 )]
 #[tokio::test]
@@ -1739,7 +1713,7 @@ fn add_with_dv_and_id_stats(
 // vector agrees with `live_adds` (no summary/stream drift).
 #[rstest]
 #[case::pushdown(
-    Some(Arc::new(col!("id").gt(lit(25i32))) as PredicateRef),
+    Some(Arc::new(Pred::from_expr(expr!(col("id") > 25i32))) as PredicateRef),
     vec!["high.parquet"],
 )]
 #[case::no_predicate(None, vec!["low.parquet", "mid.parquet", "high.parquet"])]
@@ -1815,7 +1789,7 @@ async fn added_file_without_stats_is_always_kept() -> Result<(), Box<dyn std::er
         .at_version(1)
         .build(engine.as_ref())?;
 
-    let predicate: PredicateRef = Arc::new(col!("id").gt(lit(25i32)));
+    let predicate: PredicateRef = Arc::new(Pred::from_expr(expr!(col("id") > 25i32)));
     let listing = unwrap_listing(
         target
             .incremental_scan_builder(0)
@@ -1867,7 +1841,7 @@ async fn removes_are_never_filtered_by_predicate() -> Result<(), Box<dyn std::er
         .at_version(2)
         .build(engine.as_ref())?;
 
-    let predicate: PredicateRef = Arc::new(col!("id").gt(lit(25i32)));
+    let predicate: PredicateRef = Arc::new(Pred::from_expr(expr!(col("id") > 25i32)));
     let listing = unwrap_listing(
         target
             .incremental_scan_builder(0)
@@ -1894,8 +1868,8 @@ async fn removes_are_never_filtered_by_predicate() -> Result<(), Box<dyn std::er
 // stream, but Removes are still reported. A tautology (`id > 25 OR TRUE`) is useless for
 // skipping and behaves like no predicate.
 #[rstest]
-#[case::static_skip_all(Pred::and(col!("id").gt(lit(25i32)), Pred::FALSE), 0)]
-#[case::tautology(Pred::or(col!("id").gt(lit(25i32)), Pred::TRUE), 2)]
+#[case::static_skip_all(Pred::from_expr(expr!(and(col("id") > 25i32, false))), 0)]
+#[case::tautology(Pred::from_expr(expr!(or(col("id") > 25i32, true))), 2)]
 #[tokio::test]
 async fn static_skip_all_and_tautology(
     #[case] predicate: Pred,
@@ -1972,7 +1946,7 @@ async fn against_base_classification_composes_with_predicate()
     // Both files are in the consumer's base. Only the predicate-surviving one should classify
     // as a duplicate; the dropped file was pruned before base intersection.
     let base_keys = [key("matches.parquet"), key("dropped.parquet")];
-    let predicate: PredicateRef = Arc::new(col!("id").gt(lit(25i32)));
+    let predicate: PredicateRef = Arc::new(Pred::from_expr(expr!(col("id") > 25i32)));
     let stream = target
         .incremental_scan_builder(0)
         .with_predicate(predicate)
@@ -2029,7 +2003,7 @@ async fn pruned_newest_add_suppresses_older_matching_duplicate()
         .at_version(2)
         .build(engine.as_ref())?;
 
-    let predicate: PredicateRef = Arc::new(col!("id").gt(lit(25i32)));
+    let predicate: PredicateRef = Arc::new(Pred::from_expr(expr!(col("id") > 25i32)));
     let listing = unwrap_listing(
         target
             .incremental_scan_builder(0)
@@ -2072,7 +2046,7 @@ async fn unknown_column_predicate_fails_at_build() -> Result<(), Box<dyn std::er
         .at_version(1)
         .build(engine.as_ref())?;
 
-    let predicate: PredicateRef = Arc::new(col!("nonexistent").gt(lit(1i32)));
+    let predicate: PredicateRef = Arc::new(Pred::from_expr(expr!(col("nonexistent") > 1i32)));
     let result = target
         .incremental_scan_builder(0)
         .with_predicate(predicate)
@@ -2113,7 +2087,7 @@ async fn partition_column_predicate_prunes_added_files() -> Result<(), Box<dyn s
         .at_version(1)
         .build(engine.as_ref())?;
 
-    let predicate: PredicateRef = Arc::new(col!("val").eq(lit("x")));
+    let predicate: PredicateRef = Arc::new(Pred::from_expr(expr!(col("val") == "x")));
     let listing = unwrap_listing(
         target
             .incremental_scan_builder(0)
@@ -2160,10 +2134,10 @@ async fn mixed_data_and_partition_predicate_prunes_on_both()
         .at_version(1)
         .build(engine.as_ref())?;
 
-    let predicate: PredicateRef = Arc::new(Pred::and(
-        col!("id").gt(lit(25i32)),
-        col!("val").eq(lit("x")),
-    ));
+    let predicate: PredicateRef = Arc::new(Pred::from_expr(expr!(and(
+        col("id") > 25i32,
+        col("val") == "x"
+    ))));
     let listing = unwrap_listing(
         target
             .incremental_scan_builder(0)
@@ -2209,7 +2183,7 @@ async fn pushdown_resolves_column_mapping_physical_names() -> Result<(), Box<dyn
         .at_version(1)
         .build(engine.as_ref())?;
 
-    let predicate: PredicateRef = Arc::new(col!("id").gt(lit(25i32)));
+    let predicate: PredicateRef = Arc::new(Pred::from_expr(expr!(col("id") > 25i32)));
     let listing = unwrap_listing(
         target
             .incremental_scan_builder(0)
@@ -2252,7 +2226,7 @@ async fn pushdown_prunes_dv_bearing_adds_keyed_by_dv() -> Result<(), Box<dyn std
         .at_version(1)
         .build(engine.as_ref())?;
 
-    let predicate: PredicateRef = Arc::new(col!("id").gt(lit(25i32)));
+    let predicate: PredicateRef = Arc::new(Pred::from_expr(expr!(col("id") > 25i32)));
     let listing = unwrap_listing(
         target
             .incremental_scan_builder(0)
@@ -2404,7 +2378,7 @@ async fn predicate_pushdown_reconciled_with_base_matches_full_scan_across_checkp
     }
     let target_version = snapshot.version();
 
-    let predicate: PredicateRef = Arc::new(col!("id").gt(lit(20i32)));
+    let predicate: PredicateRef = Arc::new(Pred::from_expr(expr!(col("id") > 20i32)));
 
     // Base full scan (reads the checkpoint's `stats_parsed`) and target full scan, both loaded
     // fresh off disk so they replay through the checkpoint.

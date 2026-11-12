@@ -76,7 +76,7 @@ async fn setup_multi_version_table<E: TaskExecutor>(
     engine: &Arc<DefaultEngine<E>>,
     table_path: &str,
     kind: TableKind,
-) -> KernelResult<()> {
+) -> delta_kernel::Result<()> {
     let schema = schema_ref! { nullable "id": INTEGER };
     let builder = create_table(table_path, schema, "test_engine", true);
     let builder = match kind {
@@ -103,9 +103,16 @@ async fn setup_multi_version_table<E: TaskExecutor>(
     Ok(())
 }
 
+#[rstest]
+#[case::formerly_rejected(42, false)]
+#[case::supported(331, false)]
+#[case::exceeded(332, true)]
 #[tokio::test]
-async fn deeply_nested_schema_snapshot_load_returns_schema_error() -> KernelResult<()> {
-    let deeply_nested_schema = (0..42).fold(
+async fn snapshot_schema_nesting_boundary(
+    #[case] depth: usize,
+    #[case] exceeds_limit: bool,
+) -> KernelResult<()> {
+    let deeply_nested_schema = (0..depth).fold(
         schema! { nullable "leaf": INTEGER },
         |nested, depth| schema! { nullable (format!("level_{depth}")): (nested) },
     );
@@ -128,15 +135,21 @@ async fn deeply_nested_schema_snapshot_load_returns_schema_error() -> KernelResu
     add_commit(table_url.as_str(), store.as_ref(), 0, commit).await?;
 
     let result = Snapshot::builder_for(table_url).build(&engine);
+    if !exceeds_limit {
+        assert_eq!(result.unwrap().schema().as_ref(), &deeply_nested_schema);
+        return Ok(());
+    }
     assert_result_error_with_message(
         result.as_ref(),
         concat!(
             "Schema error: Table schema is too deeply nested: decoding ",
-            "metaData.schemaString exceeded serde_json's ",
-            "recursion limit: recursion limit exceeded"
+            "metaData.schemaString reached the JSON recursion limit of 1000"
         ),
     );
-    let error = match result.unwrap_err() {
+    let delta_kernel::Error::Kernel(error) = result.unwrap_err() else {
+        panic!("expected a kernel error");
+    };
+    let error = match error {
         KernelError::Backtraced { source, .. } => *source,
         error => error,
     };
@@ -172,7 +185,7 @@ async fn deeply_nested_schema_snapshot_load_returns_schema_error() -> KernelResu
 #[case::unsupported_writer_only(SnapshotLoadProtocolCase {
     min_reader_version: 3,
     reader_features: &["deletionVectors"],
-    writer_features: &["deletionVectors", "generatedColumns"],
+    writer_features: &["deletionVectors", "identityColumns"],
     expected_error: None,
 })]
 #[case::future_reader_version(SnapshotLoadProtocolCase {
@@ -195,7 +208,7 @@ async fn snapshot_load_validates_reader_protocol(
     #[case] case: SnapshotLoadProtocolCase,
     #[values(false, true)] incremental: bool,
     #[values(false, true)] time_travel: bool,
-) -> KernelResult<()> {
+) -> delta_kernel::Result<()> {
     let (store, engine, table_url) = engine_store_setup("snapshot_feature_validation", None);
     create_table(
         table_url.as_str(),
@@ -259,7 +272,7 @@ async fn row_tracking_configuration_rejects_only_enabled_and_suspended(
     #[case] suspended: Option<bool>,
     #[case] expect_error: bool,
     #[values(false, true)] incremental: bool,
-) -> KernelResult<()> {
+) -> delta_kernel::Result<()> {
     let configuration: HashMap<_, _> = [
         ("delta.enableRowTracking", enabled),
         ("delta.rowTrackingSuspended", suspended),
@@ -308,7 +321,7 @@ async fn row_tracking_configuration_rejects_only_enabled_and_suspended(
 async fn built_as_latest_is_inherited_by_derived_snapshots(
     #[values(true, false)] base_snap_time_travel_to_latest: bool,
     #[values(TableKind::FileSystem, TableKind::CatalogManaged)] kind: TableKind,
-) -> KernelResult<()> {
+) -> delta_kernel::Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
     setup_multi_version_table(&engine, &table_path, kind).await?;
 
@@ -353,7 +366,7 @@ async fn built_as_latest_is_inherited_by_derived_snapshots(
 async fn built_as_latest_on_fresh_and_incremental_build(
     #[values(None, Some(1), Some(3))] time_travel_version: Option<Version>,
     #[values(TableKind::FileSystem, TableKind::CatalogManaged)] kind: TableKind,
-) -> KernelResult<()> {
+) -> delta_kernel::Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
     setup_multi_version_table(&engine, &table_path, kind).await?;
 
