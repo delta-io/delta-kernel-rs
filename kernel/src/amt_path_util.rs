@@ -104,6 +104,8 @@ pub(crate) fn amt_location_to_add_path(location: &str) -> KernelResult<Cow<'_, s
             ("", location)
         }
     };
+    // TODO(#2423): non-ASCII characters are percent-encoded here but left raw by Delta-Spark, so
+    // Add/Remove reconciliation can see two spellings of the same file.
     Ok(match uri_encode_path(raw_path) {
         Cow::Borrowed(_) => Cow::Borrowed(location),
         Cow::Owned(encoded) => Cow::Owned(format!("{prefix}{encoded}")),

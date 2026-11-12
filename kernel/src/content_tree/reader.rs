@@ -293,12 +293,13 @@ static FIRST_ROW_ID_HELPER_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
 /// RFC 2396 form `Add.path` uses, or null when encoding leaves it unchanged.
 const ENCODED_PATH_HELPER: &str = "_encodedPath";
 
-/// Schema of the appended [`ENCODED_PATH_HELPER`] column.
-static ENCODED_PATH_HELPER_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
-    Arc::new(StructType::new_unchecked([StructField::nullable(
-        ENCODED_PATH_HELPER,
-        DataType::STRING,
-    )]))
+/// Helper columns [`EntryConverter::convert`] appends to every entry batch: the
+/// [`ADD_DV_HELPER_SCHEMA`] columns followed by [`ENCODED_PATH_HELPER`].
+static ADD_HELPER_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
+    schema_with_helpers(
+        &ADD_DV_HELPER_SCHEMA,
+        &StructType::new_unchecked([StructField::nullable(ENCODED_PATH_HELPER, DataType::STRING)]),
+    )
 });
 
 /// Leaf converter input schema: the entry schema plus [`FIRST_ROW_ID_HELPER`].
@@ -312,8 +313,7 @@ static LEAF_INPUT_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
 /// Converts content-tree entry batches into `Add`-action batches. The entry->`Add` evaluator is
 /// built once, so one converter can be reused across every batch of a manifest.
 struct EntryConverter {
-    /// Evaluates a batch plus the [`ADD_DV_HELPER_SCHEMA`] columns `Add.deletionVector` is built
-    /// from (see [`add_deletion_vector_expression`]).
+    /// Evaluates a batch plus the [`ADD_HELPER_SCHEMA`] columns.
     evaluator: Arc<dyn ExpressionEvaluator>,
 }
 
@@ -357,16 +357,12 @@ impl EntryConverter {
             encoded_paths: Vec::new(),
         };
         visitor.visit_rows_of(entries)?;
-        let with_dvs = entries.append_columns(
-            ADD_DV_HELPER_SCHEMA.clone(),
-            visitor.deletion_vectors.into_columns()?,
-        )?;
-        let augmented = append_helper_column(
-            with_dvs.as_ref(),
-            &ENCODED_PATH_HELPER_SCHEMA,
-            DataType::STRING,
+        let mut helper_columns = visitor.deletion_vectors.into_columns()?;
+        helper_columns.push(ArrayData::try_new(
+            ArrayType::new(DataType::STRING, true),
             visitor.encoded_paths,
-        )?;
+        )?);
+        let augmented = entries.append_columns(ADD_HELPER_SCHEMA.clone(), helper_columns)?;
         let actions = self.evaluator.evaluate(augmented.as_ref())?;
         FilteredEngineData::try_new(actions, visitor.selection)
     }
@@ -705,8 +701,7 @@ impl RowVisitor for FilePathVisitor {
 ///
 /// `input_schema` is the schema of the batches passed to [`EntryConverter::convert`] -- the entry
 /// schema for a root batch, or an augmented schema when a caller appends helper columns. The
-/// transform evaluates against it plus the [`ADD_DV_HELPER_SCHEMA`] and [`ENCODED_PATH_HELPER`]
-/// columns `convert` appends.
+/// transform evaluates against it plus the [`ADD_HELPER_SCHEMA`] columns `convert` appends.
 fn make_entry_converter(
     engine: &dyn Engine,
     ctx: &ReadContext,
@@ -715,15 +710,8 @@ fn make_entry_converter(
 ) -> KernelResult<EntryConverter> {
     let output_type = DataType::from(LOG_ADD_SCHEMA.as_ref().clone());
     let expr = build_entry_to_add_expression(ctx, sources)?;
-    let evaluated_schema = StructType::new_unchecked(
-        input_schema
-            .fields()
-            .chain(ADD_DV_HELPER_SCHEMA.fields())
-            .chain(ENCODED_PATH_HELPER_SCHEMA.fields())
-            .cloned(),
-    );
     let evaluator = engine.evaluation_handler().new_expression_evaluator(
-        Arc::new(evaluated_schema),
+        schema_with_helpers(&input_schema, &ADD_HELPER_SCHEMA),
         Arc::new(expr),
         output_type,
     )?;
