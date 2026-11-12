@@ -101,7 +101,7 @@ StructExpression
     Integer(42)
     Double(1.111000)
   Unknown(mystery)
-  UriEncodePath
+  UriEncodeFileLocation
     Column(location)
   MapToStruct
     Column(pv)

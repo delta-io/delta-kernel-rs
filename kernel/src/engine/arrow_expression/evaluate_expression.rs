@@ -1,6 +1,7 @@
 //! Expression handling based on arrow-rs compute kernels.
 use std::borrow::Cow;
 use std::collections::HashMap;
+use std::fmt::Display;
 use std::sync::Arc;
 
 use chrono::Utc;
@@ -11,8 +12,8 @@ use super::timestamp_timezone::TimestampTimezone;
 use crate::arrow::array::types::*;
 use crate::arrow::array::{
     self as arrow_array, Array, ArrayBuilder, ArrayData, ArrayRef, AsArray, BooleanArray, Datum,
-    ListArray, MapArray, MutableArrayData, NullBufferBuilder, RecordBatch, StringArray,
-    StringArrayType, StructArray, make_array, new_null_array,
+    LargeStringArray, ListArray, MapArray, MutableArrayData, NullBufferBuilder, RecordBatch,
+    StringArray, StringArrayType, StructArray, make_array, new_null_array,
 };
 use crate::arrow::buffer::{NullBuffer, OffsetBuffer};
 use crate::arrow::compute::kernels::cast_utils::{Parser, string_to_datetime};
@@ -46,7 +47,6 @@ use crate::expressions::{
 };
 use crate::schema::{DataType, PrimitiveType, StructField, StructType};
 use crate::uri_reference::{scheme_len, uri_encode_location};
-use crate::utils::require;
 
 #[internal_api]
 pub(crate) trait ProvidesColumnByName {
@@ -320,7 +320,7 @@ pub fn evaluate_expression(
         ))),
         (Unary(UnaryExpression { op, expr }), result_type) => {
             let output_type = match op {
-                ToJson | UriEncodePath => DataType::STRING,
+                ToJson | UriEncodeFileLocation => DataType::STRING,
             };
             if let Some(expected) = result_type
                 && *expected != output_type
@@ -332,7 +332,7 @@ pub fn evaluate_expression(
             let input = evaluate_expression(expr, batch, None)?;
             match op {
                 ToJson => Ok(to_json(&input)?),
-                UriEncodePath => uri_encode_locations(&input),
+                UriEncodeFileLocation => map_strings(&input, op, uri_encode_location),
             }
         }
         (Binary(BinaryExpression { op, left, right }), _) => {
@@ -886,22 +886,17 @@ pub fn evaluate_predicate(
     }
 }
 
-/// Evaluates [`UnaryExpressionOp::UriEncodePath`] over any string representation.
-fn uri_encode_locations(input: &ArrayRef) -> KernelResult<ArrayRef> {
-    let encoded = map_string_rows(input, "UriEncodePath", uri_encode_location)?;
-    // Encoding can triple a value's size, and arrow panics rather than errors on offset overflow.
-    let total_len: usize = encoded
-        .iter()
-        .flatten()
-        .map(|location| location.len())
-        .sum();
-    require!(
-        i32::try_from(total_len).is_ok(),
-        KernelError::invalid_expression(format!(
-            "UriEncodePath output of {total_len} bytes does not fit in one string array"
-        ))
-    );
-    Ok(Arc::new(StringArray::from_iter(encoded)))
+/// [`map_string_rows`] collected into a Utf8 array, whatever the input representation.
+fn map_strings<'a, T: AsRef<str>>(
+    input: &'a ArrayRef,
+    op: impl Display,
+    f: impl FnMut(&'a str) -> T,
+) -> KernelResult<ArrayRef> {
+    let mapped = map_string_rows(input, op, f)?;
+    // Large offsets keep the build from overflowing; the cast to Utf8 then returns an error where
+    // building a Utf8 array directly would panic.
+    let mapped = LargeStringArray::from_iter(mapped);
+    Ok(cast(&mapped, &ArrowDataType::Utf8)?)
 }
 
 /// Evaluates [`UnaryPredicateOp::HasUriScheme`] over any string representation.
@@ -914,7 +909,7 @@ fn has_uri_scheme(input: &ArrayRef) -> KernelResult<BooleanArray> {
 /// Other array types are an error naming `op`.
 fn map_string_rows<'a, T>(
     input: &'a ArrayRef,
-    op: &str,
+    op: impl Display,
     f: impl FnMut(&'a str) -> T,
 ) -> KernelResult<Vec<Option<T>>> {
     fn map_rows<'a, T>(
@@ -2236,7 +2231,7 @@ mod tests {
             None,
         ];
         let batch = RecordBatch::try_from_iter([("l", make_array(locations))]).unwrap();
-        let expr = Expr::unary(UnaryExpressionOp::UriEncodePath, col!("l"));
+        let expr = Expr::unary(UnaryExpressionOp::UriEncodeFileLocation, col!("l"));
         let result = evaluate_expression(&expr, &batch, result_type).unwrap();
         let expected = StringArray::from(vec![
             Some("data/a%20b.parquet"),
@@ -2252,7 +2247,7 @@ mod tests {
         let batch =
             RecordBatch::try_from_iter([("n", Arc::new(Int32Array::from(vec![1])) as ArrayRef)])
                 .unwrap();
-        let expr = Expr::unary(UnaryExpressionOp::UriEncodePath, col!("n"));
+        let expr = Expr::unary(UnaryExpressionOp::UriEncodeFileLocation, col!("n"));
         let err = evaluate_expression(&expr, &batch, None).unwrap_err();
         assert!(
             matches!(err, KernelError::InvalidExpressionEvaluation(_)),
@@ -2262,7 +2257,7 @@ mod tests {
 
     #[rstest]
     fn test_unary_expression_rejects_non_string_output(
-        #[values(UnaryExpressionOp::ToJson, UnaryExpressionOp::UriEncodePath)]
+        #[values(UnaryExpressionOp::ToJson, UnaryExpressionOp::UriEncodeFileLocation)]
         op: UnaryExpressionOp,
     ) {
         let batch =
