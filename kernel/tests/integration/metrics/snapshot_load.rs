@@ -356,7 +356,7 @@ async fn snapshot_at_checkpoint_tip_emits_expected_metrics() -> delta_kernel::Re
 
 /// When early commits are covered by a compacted log file, the snapshot reports both
 /// the individual commit count and the compaction count. The JSON handler reads the
-/// compaction file and the tail commit in a single call (the minimal cover).
+/// tail commit before selecting the compaction file for older replay.
 
 #[tokio::test]
 async fn snapshot_with_log_compaction_emits_expected_metrics() -> delta_kernel::Result<()> {
@@ -382,7 +382,10 @@ async fn snapshot_with_log_compaction_emits_expected_metrics() -> delta_kernel::
     assert_eq!(reporter.checkpoint_files.get(), 0);
     assert_eq!(reporter.compaction_files.get(), 1);
 
-    // find_commit_cover selects [3.json, 0.2.compacted.json] -- 2 JSON files, one read call
+    // AMT discovery reads 3.json before selecting 0.2.compacted.json for older replay.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    assert_eq!(reporter.json_read_calls.get(), 2);
+    #[cfg(not(feature = "adaptive-metadata-in-dev"))]
     assert_eq!(reporter.json_read_calls.get(), 1);
     assert_eq!(reporter.json_files_read.get(), 2);
     assert_eq!(reporter.parquet_read_calls.get(), 0);

@@ -35,6 +35,7 @@ pub(super) fn visit(
         .checkpoint_parts
         .iter()
         .chain(&files.ascending_commit_files)
+        .chain(&files.ascending_compaction_files)
         .chain(files.latest_commit_file.iter())
         .chain(files.latest_crc_file.iter())
         .collect();

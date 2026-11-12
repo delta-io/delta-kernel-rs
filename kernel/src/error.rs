@@ -155,7 +155,7 @@ pub enum SnapshotHintError {
         /// The version described by the snapshot hint.
         hint: Version,
     },
-    /// The supplied log files contain log compaction files, which snapshot hints do not support.
+    /// The supplied log files contain unsupported log compaction files.
     #[error("Invalid snapshot hint: log compaction files are not supported")]
     LogCompaction,
     /// A supplied log file is not beneath the table's `_delta_log` root.

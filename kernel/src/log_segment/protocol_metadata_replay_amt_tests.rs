@@ -6,9 +6,10 @@ use std::sync::Arc;
 use std::sync::Mutex;
 
 use rstest::rstest;
-#[cfg(feature = "declarative-plans")]
-use test_utils::compacted_log_path_for_versions;
-use test_utils::{add_commit, assert_result_error_with_message, delta_path_for_version};
+use test_utils::{
+    add_commit, assert_result_error_with_message, compacted_log_path_for_versions,
+    delta_path_for_version,
+};
 
 use super::LastManifestCommitResolution;
 #[cfg(feature = "declarative-plans")]
@@ -27,10 +28,9 @@ use crate::engine::DelegatingEngine;
 use crate::engine::sync::SyncEngine;
 #[cfg(feature = "declarative-plans")]
 use crate::expressions::Scalar;
+use crate::last_checkpoint_hint::{AmtCheckpoint, CheckpointType, LastCheckpointHint};
 use crate::object_store::ObjectStoreExt as _;
 use crate::object_store::memory::InMemory;
-#[cfg(feature = "declarative-plans")]
-use crate::path::ParsedLogPath;
 #[cfg(feature = "declarative-plans")]
 use crate::plans::ir::nodes::Operator;
 #[cfg(feature = "declarative-plans")]
@@ -40,6 +40,7 @@ use crate::table_features::TableFeature;
 use crate::transaction::UpdateTableOperation;
 use crate::unit_test_utils::adaptive_metadata_fixtures::{
     checkpoint_line, commit_info_line, last_manifest_commit_info, protocol_and_metadata_lines,
+    txn_line,
 };
 use crate::unit_test_utils::{
     adaptive_metadata_table_configuration, parse_json_batch, test_schema_flat_with_column_mapping,
@@ -143,6 +144,203 @@ fn non_plan_engine(store: Arc<InMemory>) -> impl Engine {
     #[cfg(feature = "declarative-plans")]
     let engine = DelegatingEngine::new(Arc::new(engine)).without_plan_executor();
     engine
+}
+
+#[rstest]
+#[tokio::test]
+async fn compaction_preserves_manifest_discovery_with_amt_hint(
+    #[values(false, true)] use_plan: bool,
+) {
+    let pointer = commit_info(Some((4, 3)));
+    let txn = serde_json::json!({ "txn": { "appId": "app", "version": 1 } }).to_string();
+    let (store, table_root) = commit_table(&[
+        protocol_and_metadata_lines(one_column_schema(), &[]),
+        commit_info(None),
+        commit_info(None),
+        commit_info(None),
+        carrying_pointer((4, 3), checkpoint_action(3, &[], one_column_schema())),
+        format!("{pointer}\n{txn}"),
+    ])
+    .await;
+    let hint = LastCheckpointHint {
+        version: 3,
+        size: 1,
+        checkpoint_type: Some(CheckpointType::AdaptiveMetadataTree),
+        amt_checkpoint: Some(AmtCheckpoint {
+            manifest_commit_version: 4,
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    store
+        .put(
+            &crate::object_store::path::Path::from("_delta_log/_last_checkpoint"),
+            hint.to_json_bytes().into(),
+        )
+        .await
+        .unwrap();
+    store
+        .put(&compacted_log_path_for_versions(4, 5, "json"), txn.into())
+        .await
+        .unwrap();
+
+    let engine: Arc<dyn Engine> = if use_plan {
+        Arc::new(SyncEngine::new_with_store(store))
+    } else {
+        Arc::new(non_plan_engine(store))
+    };
+    let snapshot = Snapshot::builder_for(table_root)
+        .build(engine.as_ref())
+        .unwrap();
+    assert_eq!(snapshot.version(), 5);
+    assert_eq!(snapshot.schema(), one_column_schema());
+    assert_eq!(
+        snapshot
+            .latest_checkpoint_action(engine.as_ref())
+            .unwrap()
+            .unwrap()
+            .version(),
+        3
+    );
+}
+
+#[rstest]
+#[tokio::test]
+async fn newest_commit_discovery_captures_later_actions_and_propagates_errors(
+    #[values(false, true)] corrupt_tail: bool,
+) {
+    let padding = (0..1024)
+        .map(|i| txn_line(&format!("padding{i}"), 0))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let newest = format!(
+        "{}\n{padding}\n{}\n{}",
+        protocol_and_metadata_lines(one_column_schema(), &[]),
+        commit_info(Some((2, 2))),
+        checkpoint_action(2, &[], one_column_schema()),
+    );
+    let newest = if corrupt_tail {
+        // The first batch supplies P&M; discovery must still observe the later error.
+        format!("{newest}\n{{")
+    } else {
+        newest
+    };
+    let bootstrap = protocol_and_metadata_lines(one_column_schema(), &[]);
+    let (store, table_root) = commit_table(&[bootstrap.clone(), commit_info(None), newest]).await;
+    store
+        .put(
+            &compacted_log_path_for_versions(0, 1, "json"),
+            bootstrap.into(),
+        )
+        .await
+        .unwrap();
+    let engine = non_plan_engine(store);
+    let segment = latest_log_segment(&table_root, &engine);
+    let newest = &segment
+        .listed
+        .ascending_commit_files
+        .last()
+        .unwrap()
+        .location;
+    let mut batches = Vec::new();
+    let reader = engine
+        .json_handler()
+        .read_json_files(
+            std::slice::from_ref(newest),
+            crate::actions::get_all_actions_schema().clone(),
+            None,
+        )
+        .unwrap();
+    for batch in reader {
+        let failed = batch.is_err();
+        batches.push(batch);
+        if failed {
+            break;
+        }
+    }
+    assert!(batches.len() > 1);
+    let first_batch = batches[0].as_ref().unwrap().as_ref();
+    assert!(
+        LastManifestCommit::try_new_from_data(first_batch)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        CheckpointAction::try_new_from_data(first_batch)
+            .unwrap()
+            .is_none()
+    );
+    let resolution = segment.read_protocol_metadata_opt(&engine, None);
+    if corrupt_tail {
+        assert!(batches.last().unwrap().is_err());
+        assert!(resolution.is_err());
+    } else {
+        assert!(batches.iter().all(Result::is_ok));
+        let resolution = resolution.unwrap();
+        assert_eq!(
+            resolution.last_manifest_commit,
+            LastManifestCommitResolution::Resolved(Some(LastManifestCommit::new(2, 2).unwrap()))
+        );
+        assert_eq!(resolution.captured_checkpoint_action.unwrap().version(), 2);
+    }
+}
+
+#[rstest]
+#[tokio::test]
+async fn compaction_preserves_metadata_newer_than_delayed_amt_checkpoint(
+    #[values(1, 2)] compaction_start: u64,
+    #[values(false, true)] tail_commit: bool,
+    #[values(false, true)] stale_crc: bool,
+    #[values(false, true)] use_plan: bool,
+) {
+    let mut metadata: serde_json::Value =
+        serde_json::from_str(&metadata_commit(one_column_schema())).unwrap();
+    metadata["metaData"]["configuration"]["delta.dataSkippingStatsColumns"] =
+        serde_json::json!("id");
+    let metadata = metadata.to_string();
+    let mut commits = vec![
+        checkpoint_commit(0, &[], one_column_schema()),
+        commit_info(Some((0, 0))),
+        commit_info(Some((0, 0))),
+        carrying_pointer((0, 0), metadata.clone()),
+        carrying_pointer((4, 2), checkpoint_action(2, &[], one_column_schema())),
+    ];
+    if tail_commit {
+        commits.push(commit_info(Some((4, 2))));
+    }
+    let (store, table_root) = commit_table(&commits).await;
+    if stale_crc {
+        put_crc_with_pointer(&store, 0, LastManifestCommit::new(0, 0).unwrap()).await;
+    }
+    let engine: Arc<dyn Engine> = if use_plan {
+        Arc::new(SyncEngine::new_with_store(store.clone()))
+    } else {
+        Arc::new(non_plan_engine(store.clone()))
+    };
+    let baseline = Snapshot::builder_for(table_root.clone())
+        .build(engine.as_ref())
+        .unwrap();
+    store
+        .put(
+            &compacted_log_path_for_versions(compaction_start, 3, "json"),
+            metadata.into(),
+        )
+        .await
+        .unwrap();
+
+    let snapshot = Snapshot::builder_for(table_root)
+        .build(engine.as_ref())
+        .unwrap();
+    let property = |snapshot: &Snapshot| {
+        snapshot
+            .table_configuration()
+            .metadata()
+            .configuration()
+            .get("delta.dataSkippingStatsColumns")
+            .cloned()
+    };
+    assert_eq!(property(&baseline).as_deref(), Some("id"));
+    assert_eq!(property(&snapshot), property(&baseline));
 }
 
 #[tokio::test]
@@ -566,16 +764,8 @@ async fn plan_replay_bounded_by_crc_or_checkpoint_runs_one_plan(
     let engine = recording_plan_engine(store, plans.clone());
     let storage = engine.storage_handler();
     let log_root = table_root.join("_delta_log/").unwrap();
-    let mut log_segment =
+    let log_segment =
         LogSegment::for_snapshot_impl(storage.as_ref(), log_root, vec![], None, None).unwrap();
-    if compacted {
-        let location = table_root.join(compaction.as_ref()).unwrap();
-        let compaction = ParsedLogPath::new(FileMeta::new(location, 0, 100)).unwrap();
-        log_segment
-            .listed
-            .ascending_compaction_files
-            .push(compaction);
-    }
     let crc = log_segment.read_latest_crc(&engine).unwrap();
 
     let resolution = log_segment
@@ -707,15 +897,14 @@ async fn plan_replay_skips_commits_below_pointed_content_root() {
     assert_replay_resolution(&commits, Some(1), |store| SyncEngine::new_with_store(store)).await;
 }
 
-// The pointed manifest commit is newer than the segment's checkpoint, but its content root is not.
-// The non-plan replay reads the whole segment and captures the pointed action, but no pointer. A
-// plan replay bounded by a checkpoint file reads the pointer but no checkpoint action.
+// A checkpoint file supplies the baseline P&M, so both execution paths read the newest pointer
+// without reconciling a lagging checkpoint action's historical P&M.
 #[tokio::test]
 async fn replay_resolves_pointed_action_above_segment_checkpoint() {
     check_pointed_action_above_segment_checkpoint(
         non_plan_engine,
-        Some(1),
-        LastManifestCommitResolution::Unresolved,
+        None,
+        LastManifestCommitResolution::Resolved(Some(LastManifestCommit::new(2, 1).unwrap())),
     )
     .await;
     #[cfg(feature = "declarative-plans")]
@@ -808,7 +997,7 @@ impl PlanExecutor for RecordingPlanExecutor {
 async fn standalone_checkpoint_above_pointed_commit_fails_to_read_its_action() {
     check_standalone_checkpoint_above_pointed_commit(
         non_plan_engine,
-        LastManifestCommitResolution::Unresolved,
+        LastManifestCommitResolution::Resolved(Some(LastManifestCommit::new(0, 0).unwrap())),
     )
     .await;
     #[cfg(feature = "declarative-plans")]
@@ -1127,9 +1316,8 @@ async fn post_commit_snapshot_resolves_latest_checkpoint_action(
     assert_eq!(action.version, expected_version);
 }
 
-// The plan replay takes `lastManifestCommit` from the newest commit only: a manifest commit records
-// itself, a later log commit carries it forward, and a newest commit without one is not back-filled
-// from an older commit (a miss stays `Unresolved`). The non-plan replay reads no `commitInfo`.
+// Replay takes `lastManifestCommit` from the newest commit only. A miss stays unresolved rather
+// than inheriting an older commit's pointer.
 #[cfg(feature = "declarative-plans")]
 #[rstest]
 #[case::manifest_commit_records_itself(vec![], Some((0, 0)))]
@@ -1146,12 +1334,7 @@ async fn replay_resolves_last_manifest_commit_from_newest_commit(
         }
         None => LastManifestCommitResolution::Unresolved,
     };
-    assert_replay_last_manifest_commit(
-        &later_commits,
-        &LastManifestCommitResolution::Unresolved,
-        non_plan_engine,
-    )
-    .await;
+    assert_replay_last_manifest_commit(&later_commits, &expected, non_plan_engine).await;
     assert_replay_last_manifest_commit(&later_commits, &expected, |store| {
         SyncEngine::new_with_store(store)
     })
@@ -1196,8 +1379,7 @@ async fn plan_replay_rejects_pointer_after_newest_commit(
 }
 
 // The plan path reads the newest commit and the pointed manifest commit as their own files, not
-// through a log compaction covering them. Compaction listing is disabled, so the compaction is
-// added by hand.
+// through a log compaction covering them.
 #[cfg(feature = "declarative-plans")]
 #[rstest]
 #[case::covers_newest_and_manifest_commit(
@@ -1234,14 +1416,8 @@ async fn plan_replay_reads_commits_a_compaction_covers(
     let engine = SyncEngine::new_with_store(store);
     let storage = engine.storage_handler();
     let log_root = table_root.join("_delta_log/").unwrap();
-    let mut log_segment =
+    let log_segment =
         LogSegment::for_snapshot_impl(storage.as_ref(), log_root, vec![], None, None).unwrap();
-    let compaction_location = table_root.join(compaction.as_ref()).unwrap();
-    let compaction = ParsedLogPath::new(FileMeta::new(compaction_location, 0, 100)).unwrap();
-    log_segment
-        .listed
-        .ascending_compaction_files
-        .push(compaction);
 
     let resolution = log_segment
         .read_protocol_metadata_opt(&engine, None)

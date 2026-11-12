@@ -1,6 +1,6 @@
 //! # Log Compaction
 //!
-//! **NOTE:** Compaction reads are supported. Compaction writes remain disabled pending
+//! **NOTE:** Compaction reads are supported. Compaction writes are disabled pending
 //! further validation. See issue #2337 for tracking.
 //!
 //! This module provides an API for writing log compaction files that aggregate
