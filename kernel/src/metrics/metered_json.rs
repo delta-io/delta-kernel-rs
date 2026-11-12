@@ -274,7 +274,7 @@ mod tests {
         #[values(false, true)] cancellation: bool,
         #[values(false, true)] other_thread: bool,
     ) {
-        let capture = JsonReadCapture::new();
+        let capture = JsonReadCapture::default();
         let handler = MeteredJsonHandler::new(Arc::new(StubJsonHandler {
             read_error,
             batch_error,

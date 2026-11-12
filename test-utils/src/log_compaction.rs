@@ -105,7 +105,7 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
-    use crate::add_commit;
+    use crate::{add_commit, assert_result_error_with_message};
 
     #[tokio::test]
     async fn fixture_preserves_winners_and_distinct_dv_offsets() -> KernelResult<()> {
@@ -173,6 +173,14 @@ mod tests {
     #[rstest]
     #[case::duplicate("{\"add\":{\"path\":\"a\"}}\n{\"remove\":{\"path\":\"a\"}}")]
     #[case::unsupported("{\"checkpoint\":{}}")]
+    #[case::malformed("{")]
+    #[case::non_object("[]")]
+    #[case::empty_object("{}")]
+    #[case::multiple_actions("{\"protocol\":{},\"metaData\":{}}")]
+    #[case::missing_path("{\"add\":{}}")]
+    #[case::invalid_dv("{\"add\":{\"path\":\"a\",\"deletionVector\":{\"storageType\":\"bad\"}}}")]
+    #[case::missing_app_id("{\"txn\":{}}")]
+    #[case::missing_domain("{\"domainMetadata\":{}}")]
     #[tokio::test]
     async fn fixture_rejects_ambiguous_or_unsupported_actions(#[case] actions: &str) {
         let store = InMemory::new();
@@ -186,6 +194,16 @@ mod tests {
             write_compaction_from_commits("memory:///", &store, 0, 1)
                 .await
                 .is_err()
+        );
+    }
+    #[rstest]
+    #[case::equal(1, 1)]
+    #[case::reversed(2, 1)]
+    #[tokio::test]
+    async fn fixture_rejects_invalid_version_ranges(#[case] start: u64, #[case] end: u64) {
+        assert_result_error_with_message(
+            write_compaction_from_commits("memory:///", &InMemory::new(), start, end).await,
+            "invalid compaction fixture range",
         );
     }
 }
