@@ -476,6 +476,23 @@ async fn test_published_snapshot_reads_after_staged_files_are_deleted(
         std::fs::remove_dir_all(&staged_dir)?;
     }
 
+    // THEN: every retained commit reference carries its published file's storage metadata.
+    let listed = &published.log_segment().listed;
+    let storage = engine.storage_handler();
+    for file in listed
+        .ascending_commit_files
+        .iter()
+        .chain(listed.latest_commit_file.iter())
+    {
+        assert_eq!(file.file_type, LogPathFileType::Commit);
+        assert_eq!(
+            file.location,
+            storage.head(&file.location.location)?,
+            "commit {}",
+            file.version
+        );
+    }
+
     let latest = published
         .log_segment()
         .listed
@@ -484,9 +501,7 @@ async fn test_published_snapshot_reads_after_staged_files_are_deleted(
         .unwrap();
     let ict = 1749830881799;
 
-    // THEN: read the in-commit timestamp, scan 200 rows, and create a checkpoint without staged
-    // files. With no CRC at version 2, get_timestamp() must read commitInfo from the published
-    // commit file.
+    // With no CRC at version 2, get_timestamp() must read commitInfo from the published file.
     assert_ne!(latest.location.last_modified, ict);
     assert!(published.crc_at_version().is_none());
     assert_eq!(published.reader().get_timestamp(engine.as_ref())?, ict);

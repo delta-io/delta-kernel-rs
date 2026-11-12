@@ -160,7 +160,8 @@ operations. `Snapshot::publish()`:
 3. Builds a `PublishMetadata` containing the list of `CatalogCommit` entries to publish.
 4. Delegates to `committer.publish(engine, publish_metadata)`, which copies each staged
    commit from `_staged_commits/` to `_delta_log/<version>.json`.
-5. Returns a snapshot that uses published paths for commits known to be published.
+5. Replaces staged references for commits known to be published, reading the published files'
+   metadata from storage, and returns the updated snapshot.
 
 Use the returned snapshot for reads after staged commit files are removed. The
 input snapshot keeps its original paths.
