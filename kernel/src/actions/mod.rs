@@ -23,8 +23,7 @@ use crate::expressions::{ArrayData, StructData};
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::schema::{ArrayType, DataType, schema};
 use crate::schema::{
-    SchemaRef, StructField, StructType, ToSchema as _, is_unsupported_delta_type_error,
-    lazy_schema_ref, schema_ref,
+    SchemaRef, StructField, StructType, ToSchema as _, lazy_schema_ref, schema_ref,
 };
 use crate::table_features::{
     FeatureType, LEGACY_READER_FEATURES, MIN_VALID_RW_VERSION, TABLE_FEATURES_MIN_READER_VERSION,
@@ -37,13 +36,15 @@ use crate::{Engine, Version, create_row};
 use crate::{EngineData, FileMeta, KernelError, KernelResult, RowVisitor as _};
 
 const KERNEL_VERSION: &str = env!("CARGO_PKG_VERSION");
-const SERDE_JSON_RECURSION_LIMIT_ERROR_PREFIX: &str = "recursion limit exceeded";
+const SCHEMA_RECURSION_LIMIT: usize = 1000;
 const UNKNOWN_OPERATION: &str = "UNKNOWN";
 pub(crate) const ROW_TRACKING_PRESERVED_TAG: &str = "delta.rowTracking.preserved";
 
 pub mod deletion_vector;
 pub mod deletion_vector_writer;
 pub mod set_transaction;
+
+mod schema_deserializer;
 
 // see comment in ../lib.rs for the path module for why we include this way
 #[cfg(feature = "internal-api")]
@@ -483,6 +484,10 @@ impl Metadata {
 
     /// Parses the table schema from its JSON representation.
     ///
+    /// Decoding fails when nesting reaches `SCHEMA_RECURSION_LIMIT`, counting JSON objects and
+    /// arrays, including field metadata. Each nested struct adds three containers. Unknown
+    /// fields skipped by the deserializer do not count toward the limit.
+    ///
     /// # Errors
     ///
     /// Returns [`KernelError::Schema`] when the schema exceeds the supported decoding depth or
@@ -490,26 +495,7 @@ impl Metadata {
     /// JSON decoding failures.
     #[internal_api]
     pub(crate) fn parse_schema(&self) -> KernelResult<StructType> {
-        // TODO(#1896): Increase the supported nesting depth or use non-recursive schema decoding.
-        serde_json::from_str(&self.schema_string).map_err(|error| {
-            // serde_json keeps ErrorCode::RecursionLimitExceeded private, so we use string
-            // matching.
-            if error.is_syntax()
-                && error
-                    .to_string()
-                    .starts_with(SERDE_JSON_RECURSION_LIMIT_ERROR_PREFIX)
-            {
-                KernelError::schema(format!(
-                    "Table schema is too deeply nested: decoding metaData.schemaString exceeded \
-                     serde_json's recursion limit: {error}"
-                ))
-                .with_backtrace()
-            } else if is_unsupported_delta_type_error(&error) {
-                KernelError::schema(error.to_string()).with_backtrace()
-            } else {
-                error.into()
-            }
-        })
+        schema_deserializer::parse(&self.schema_string, SCHEMA_RECURSION_LIMIT)
     }
 
     #[internal_api]
@@ -2219,8 +2205,9 @@ mod tests {
     }
 
     #[rstest]
-    #[case::supported(41, false)]
-    #[case::exceeded(42, true)]
+    #[case::formerly_rejected(42, false)]
+    #[case::supported(331, false)]
+    #[case::exceeded(332, true)]
     fn parse_schema_nesting_boundary(#[case] depth: usize, #[case] exceeds_limit: bool) {
         let metadata = Metadata {
             schema_string: Arc::new(serde_json::to_string(&nested_schema(depth)).unwrap()),
@@ -2233,8 +2220,7 @@ mod tests {
                 result.as_ref(),
                 concat!(
                     "Schema error: Table schema is too deeply nested: decoding ",
-                    "metaData.schemaString exceeded serde_json's ",
-                    "recursion limit: recursion limit exceeded"
+                    "metaData.schemaString reached the JSON recursion limit of 1000"
                 ),
             );
             let error = match result.unwrap_err() {

@@ -1,0 +1,9 @@
+[profile.default.junit]
+path = "junit.xml"
+
+[profile.default-miri]
+# Report long interpreted tests without terminating them or changing Miri coverage.
+slow-timeout = { period = "30s" }
+
+[profile.default-miri.junit]
+path = "junit.xml"
