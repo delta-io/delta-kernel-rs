@@ -102,6 +102,11 @@ jobs:
           python3 -m unittest discover
           --start-directory .github/omnigent/tests
           --pattern 'test_*.py'
+      - name: Test review audit tooling
+        run: >-
+          python3 -m unittest discover
+          --start-directory .github/omnigent/review-audit
+          --pattern 'test_*.py'
 
   format:
     runs-on: ubuntu-latest
