@@ -145,7 +145,7 @@ impl LogSegment {
     #[cfg(feature = "adaptive-metadata-in-dev")]
     fn read_newest_commit_info(&self, candidate: &PmCandidate) -> KernelResult<bool> {
         Ok(self.newest_commit_after_checkpoint().is_some()
-            && !candidate.is_final_at(self.end_version)?)
+            && !candidate.is_final_at(version_as_i64(self.end_version)?))
     }
 
     /// Replays the log segment for the latest Protocol and Metadata, each with its version, in one
