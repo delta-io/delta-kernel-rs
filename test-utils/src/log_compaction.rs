@@ -10,7 +10,7 @@ use delta_kernel::{KernelError, KernelResult};
 use serde_json::{Value, json};
 use url::Url;
 
-use crate::resolve_table_path;
+use crate::{resolve_table_path, try_parse_uri};
 
 /// Writes a log compaction from the original commits in `start..=end` and returns its URL.
 ///
@@ -32,11 +32,11 @@ pub async fn write_compaction_from_commits(
     if start >= end {
         return Err(KernelError::generic("invalid compaction fixture range"));
     }
-    let table_root = table_root.as_ref();
+    let table_root = try_parse_uri(table_root)?;
     let mut winners = BTreeMap::new();
     for version in start..=end {
         let path = resolve_table_path(
-            table_root,
+            table_root.as_str(),
             &Path::from(format!("_delta_log/{version:020}.json")),
         )?;
         let bytes = store.get(&path).await?.bytes().await?;
@@ -60,9 +60,9 @@ pub async fn write_compaction_from_commits(
         .collect::<Vec<_>>()
         .join("\n");
     let relative_path = format!("_delta_log/{start:020}.{end:020}.compacted.json");
-    let path = resolve_table_path(table_root, &Path::from(relative_path.as_str()))?;
+    let path = resolve_table_path(table_root.as_str(), &Path::from(relative_path.as_str()))?;
     store.put(&path, content.into()).await?;
-    Ok(Url::parse(table_root)?.join(&relative_path)?)
+    Ok(table_root.join(&relative_path)?)
 }
 
 fn action_key(action: &Value) -> KernelResult<Option<(String, String)>> {
@@ -101,11 +101,50 @@ fn action_key(action: &Value) -> KernelResult<Option<(String, String)>> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    use delta_kernel::object_store::local::LocalFileSystem;
     use delta_kernel::object_store::memory::InMemory;
     use rstest::rstest;
 
     use super::*;
     use crate::{add_commit, assert_result_error_with_message};
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fixture_returns_canonical_url_for_symlinked_table_root() {
+        let directory = tempfile::tempdir().unwrap();
+        let actual = directory.path().join("actual");
+        let alias = directory.path().join("alias");
+        std::fs::create_dir(&actual).unwrap();
+        std::os::unix::fs::symlink(&actual, &alias).unwrap();
+        let root = Url::from_directory_path(alias).unwrap();
+        let store = LocalFileSystem::new();
+        add_commit(root.as_str(), &store, 0, r#"{"protocol":{}}"#.into())
+            .await
+            .unwrap();
+        add_commit(root.as_str(), &store, 1, r#"{"metaData":{}}"#.into())
+            .await
+            .unwrap();
+
+        let path = write_compaction_from_commits(root.as_str(), &store, 0, 1)
+            .await
+            .unwrap();
+        let canonical_root = Url::from_directory_path(actual.canonicalize().unwrap()).unwrap();
+        assert_eq!(
+            path,
+            canonical_root
+                .join("_delta_log/00000000000000000000.00000000000000000001.compacted.json")
+                .unwrap()
+        );
+        assert!(
+            store
+                .head(&Path::from_url_path(path.path()).unwrap())
+                .await
+                .unwrap()
+                .size
+                > 0
+        );
+    }
 
     #[tokio::test]
     async fn fixture_preserves_winners_and_distinct_dv_offsets() -> KernelResult<()> {
