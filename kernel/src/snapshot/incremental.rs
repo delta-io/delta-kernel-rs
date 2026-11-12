@@ -268,7 +268,7 @@ impl Snapshot {
         // matching the fresh path.
         let pm_start = std::time::Instant::now();
         let base_crc = combined_log_segment
-            .pick_latest_base_crc(engine, existing_snapshot.base_crc())
+            .pick_latest_base_crc(engine, existing_snapshot.retained_crc())
             .inspect_err(|_| emit_protocol_metadata_load_failure(metric_context))?;
         let crc_at_version = combined_log_segment
             .try_build_crc_within_budget(engine, base_crc.as_ref(), incremental_replay)
@@ -312,16 +312,18 @@ impl Snapshot {
         )?;
 
         tracing::Span::current().record("version", table_configuration.version());
-        let origin = super::snapshot_crc::SnapshotCrc::resolved_origin(
+        let crc_provenance = super::snapshot_crc::SnapshotCrc::resolved_provenance(
             base_crc.as_ref(),
             Some(&existing_snapshot.crc),
+            crc_at_version.as_ref().map(|(crc, _)| crc),
+            new_end_version,
             combined_log_segment.listed.latest_crc_file.is_some(),
         );
         let crc = Self::validate_configuration_and_crc(
             combined_log_segment,
             &table_configuration,
             crc_at_version.map(|(crc, _)| crc).or(base_crc),
-            origin,
+            crc_provenance,
         )?;
         let log_segment = current_segment
             .take()
@@ -1717,54 +1719,6 @@ mod tests {
     // Tests: stale-CRC resolution on the incremental path
     // ============================================================================
 
-    #[rstest]
-    #[case::missing(None, false, IncrementalReplay::Unlimited, CrcSource::Missing)]
-    #[case::unusable(Some(3), true, IncrementalReplay::Unlimited, CrcSource::Unusable)]
-    #[case::at_version(Some(3), false, IncrementalReplay::Disabled, CrcSource::AtVersion)]
-    #[case::stale(Some(1), false, IncrementalReplay::Disabled, CrcSource::Stale)]
-    #[case::over_budget(Some(1), false, IncrementalReplay::UpToCommits(1), CrcSource::Stale)]
-    #[case::reconstructed(
-        Some(1),
-        false,
-        IncrementalReplay::Unlimited,
-        CrcSource::Reconstructed { num_commits: 2 }
-    )]
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn crc_provenance_survives_hint_round_trip(
-        #[case] disk_version: Option<u64>,
-        #[case] corrupt: bool,
-        #[case] replay: IncrementalReplay,
-        #[case] source: CrcSource,
-    ) -> crate::Result<()> {
-        // Given a table with a missing, unusable, current, or stale checksum.
-        let ctx = setup_incremental_snapshot_test()?;
-        setup_test_table_with_commits(ctx.url.as_str(), &ctx.store, 4).await?;
-        if let Some(version) = disk_version {
-            let content = if corrupt {
-                "invalid".to_owned()
-            } else {
-                make_test_crc_json(200, 2).to_string()
-            };
-            ctx.store
-                .put(&delta_path_for_version(version, "crc"), content.into())
-                .await
-                .map_err(KernelError::from)?;
-        }
-        // When the snapshot resolves the checksum under the requested replay budget.
-        let snapshot = Snapshot::builder_for(ctx.url.as_str())
-            .with_incremental_crc_replay(replay)
-            .build(ctx.engine.as_ref())?;
-        // Then both the snapshot and its hint round trip preserve the original observation.
-        let expected = CrcProvenance::new(source, disk_version.filter(|_| !corrupt));
-        assert_eq!(snapshot.crc_provenance(), expected);
-        let rebuilt = Snapshot::builder_for(ctx.url.as_str())
-            .with_snapshot_hint(snapshot.to_snapshot_hint()?)
-            .build(ctx.engine.as_ref())?;
-        assert_eq!(rebuilt.crc_provenance(), expected);
-        assert_eq!(rebuilt.base_crc(), snapshot.base_crc());
-        Ok(())
-    }
-
     // `resolve_crc_file` when the new listing discovers a checkpoint *at or below* the existing
     // snapshot version must correctly decide which CRC file the combined segment carries on disk.
     // Each case below sets up commits 0-3, writes an existing CRC, builds snapshot_v3, writes
@@ -1877,6 +1831,7 @@ mod tests {
         #[case] new_disk_crc: Option<bool>,
         #[case] expected_base_version: Version,
         #[values(false, true)] skip_new_checkpoints: bool,
+        #[values(false, true)] known_provenance: bool,
     ) -> Result<()> {
         // Given an in-memory checksum reconstructed from disk version 1 through version 3.
         let ctx = setup_incremental_snapshot_test()?;
@@ -1898,6 +1853,18 @@ mod tests {
             snapshot_a.crc_provenance().source,
             CrcSource::Reconstructed { num_commits: 2 }
         );
+        let snapshot_a = if known_provenance {
+            snapshot_a
+        } else {
+            Arc::new(Snapshot::new_with_crc(
+                snapshot_a.log_segment().clone(),
+                snapshot_a.table_configuration().clone(),
+                snapshot_a.retained_crc().cloned(),
+                CrcProvenance::default(),
+                false, /* built_as_latest */
+                false, /* skipped_new_checkpoints */
+            )?)
+        };
 
         if let Some(corrupt) = new_disk_crc {
             let content = if corrupt {
@@ -1920,21 +1887,26 @@ mod tests {
         };
         let updated = builder.build(ctx.engine.as_ref())?;
 
-        // Then a usable newer disk checksum replaces the baseline; otherwise its origin survives.
+        // Then a usable newer disk checksum establishes provenance; otherwise the retained
+        // baseline's provenance, including Unknown, survives.
         assert_eq!(updated.version(), 5);
         assert_eq!(updated.crc_at_version().map(|c| c.version), expected_crc_v);
         assert_eq!(
             updated.crc_provenance(),
-            CrcProvenance::new(
-                if expected_crc_v.is_some() {
-                    CrcSource::Reconstructed {
-                        num_commits: updated.version() - expected_base_version,
-                    }
-                } else {
-                    CrcSource::Stale
-                },
-                Some(expected_base_version),
-            )
+            if known_provenance || new_disk_crc == Some(false) {
+                CrcProvenance::new(
+                    if expected_crc_v.is_some() {
+                        CrcSource::Reconstructed {
+                            num_commits: updated.version() - expected_base_version,
+                        }
+                    } else {
+                        CrcSource::Stale
+                    },
+                    Some(expected_base_version),
+                )
+            } else {
+                CrcProvenance::default()
+            }
         );
         assert_eq!(
             updated

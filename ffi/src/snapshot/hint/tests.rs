@@ -348,24 +348,59 @@ fn metadata_visit_preserves_original_schema_json_and_does_not_consume_snapshot()
 }
 
 #[rstest::rstest]
-#[case::latest(FfiSnapshotHintFreshness::Latest, true)]
-#[case::unverified(FfiSnapshotHintFreshness::Unverified, false)]
+#[case::at_version(CrcSource::AtVersion, Some(2), Some(2), None)]
+#[case::reconstructed(CrcSource::Reconstructed { num_commits: 2 }, Some(0), Some(2), None)]
+#[case::stale(CrcSource::Stale, Some(0), Some(1), None)]
+#[case::missing(CrcSource::Missing, None, None, None)]
+#[case::unusable(CrcSource::Unusable, None, None, None)]
+#[case::unknown(CrcSource::Unknown, None, Some(2), None)]
+#[case::unknown_stale(CrcSource::Unknown, None, Some(1), None)]
+#[case::unknown_absent(CrcSource::Unknown, None, None, None)]
+#[case::unresolved(
+    CrcSource::AtVersion,
+    Some(2),
+    Some(2),
+    Some(CheckpointType::Unresolved)
+)]
+#[case::v1(CrcSource::AtVersion, Some(2), Some(2), Some(CheckpointType::V1))]
+#[case::v2(CrcSource::AtVersion, Some(2), Some(2), Some(CheckpointType::V2))]
 fn exported_hint_copy_outlives_snapshot_and_preserves_state(
-    #[case] freshness: FfiSnapshotHintFreshness,
-    #[case] expected_latest: bool,
-    #[values(false, true)] with_crc: bool,
+    #[case] source: CrcSource,
+    #[case] base_version: Option<u64>,
+    #[case] crc_version: Option<u64>,
+    #[case] checkpoint_type: Option<CheckpointType>,
+    #[values(FfiSnapshotHintFreshness::Latest, FfiSnapshotHintFreshness::Unverified)]
+    freshness: FfiSnapshotHintFreshness,
 ) {
+    // Given retained checksum and checkpoint observations supplied by a connector.
     let engine = test_engine();
-    let log_path = FfiLogPath::new(
-        slice("memory:///hinted-table/_delta_log/00000000000000000000.json"),
-        123,
-        456,
+    let mut paths = Vec::from(
+        [
+            "memory:///hinted-table/_delta_log/00000000000000000000.json",
+            "memory:///hinted-table/_delta_log/00000000000000000001.json",
+            "memory:///hinted-table/_delta_log/00000000000000000002.json",
+        ]
+        .map(|path| FfiLogPath::new(slice(path), 0, 1)),
     );
-    let crc = empty_crc();
-    let mut hint = test_snapshot_hint(std::slice::from_ref(&log_path), 0, freshness);
-    if with_crc {
-        hint.crc = &crc;
+    if checkpoint_type.is_some() {
+        paths.push(FfiLogPath::new(
+            slice("memory:///hinted-table/_delta_log/00000000000000000000.checkpoint.parquet"),
+            0,
+            1,
+        ));
     }
+    let mut crc = empty_crc();
+    crc.version = crc_version.unwrap_or(0);
+    let hint = FfiSnapshotHint {
+        checkpoint_type: checkpoint_type.into(),
+        crc_provenance: FfiCrcProvenance {
+            source,
+            base_version: base_version.into(),
+        },
+        crc: crc_version.map_or(std::ptr::null(), |_| &crc),
+        ..test_snapshot_hint(&paths, 2, freshness)
+    };
+    // When the snapshot is built using an engine that rejects I/O.
     let builder = unsafe {
         ok_or_panic(snapshot_builder_with_snapshot_hint(
             test_builder(&engine),
@@ -373,24 +408,30 @@ fn exported_hint_copy_outlives_snapshot_and_preserves_state(
         ))
     };
     let snapshot = unsafe { ok_or_panic(snapshot_builder_build(builder)) };
-    let expected_segment = unsafe { snapshot.as_ref() }.log_segment().clone();
-    let expected_crc = unsafe { snapshot.as_ref() }.crc_at_version().cloned();
-    let builder = ok_or_panic(install_through_visitor(
-        &snapshot,
-        test_builder(&engine),
-        &engine,
-    ));
-    unsafe { free_snapshot(snapshot) };
-    let rebuilt = unsafe { ok_or_panic(snapshot_builder_build(builder)) };
-    let rebuilt_ref = unsafe { rebuilt.as_ref() };
-    assert_eq!(rebuilt_ref.version(), 0);
-    assert_eq!(rebuilt_ref.is_built_as_latest(), expected_latest);
-    assert_eq!(rebuilt_ref.log_segment(), &expected_segment);
-    assert_eq!(rebuilt_ref.crc_at_version(), expected_crc.as_ref());
-    unsafe {
-        free_snapshot(rebuilt);
-        free_engine(engine);
-    }
+    // Then the public FFI accessors expose the supplied freshness and provenance.
+    assert_eq!(
+        unsafe { snapshot.as_ref() }.is_built_as_latest(),
+        matches!(freshness, FfiSnapshotHintFreshness::Latest),
+    );
+    let mut observed = std::mem::MaybeUninit::uninit();
+    unsafe { snapshot_crc_provenance(snapshot.shallow_copy(), observed.as_mut_ptr()) };
+    assert_eq!(unsafe { observed.assume_init() }, hint.crc_provenance);
+    assert_eq!(
+        Option::<CheckpointType>::from(unsafe {
+            snapshot_checkpoint_type(snapshot.shallow_copy())
+        }),
+        checkpoint_type
+    );
+    assert_eq!(
+        unsafe { snapshot.as_ref() }
+            .to_snapshot_hint()
+            .unwrap()
+            .retained_crc()
+            .map(|crc| crc.version),
+        crc_version
+    );
+    assert_exported_paths_and_round_trip(snapshot);
+    unsafe { free_engine(engine) };
 }
 
 #[test]
@@ -514,7 +555,7 @@ fn assert_exported_paths_and_round_trip(snapshot: Handle<SharedSnapshot>) {
     let table_root = source.table_root().as_str().to_owned();
     let expected_segment = source.log_segment().clone();
     let expected_crc = source.crc_at_version().cloned();
-    let expected_base_crc = source.to_snapshot_hint().unwrap().base_crc().cloned();
+    let expected_retained_crc = source.to_snapshot_hint().unwrap().retained_crc().cloned();
     let expected_provenance = source.crc_provenance();
     let expected_checkpoint_type = source.checkpoint_type();
     let expected_latest = source.is_built_as_latest();
@@ -561,7 +602,7 @@ fn assert_exported_paths_and_round_trip(snapshot: Handle<SharedSnapshot>) {
     );
     assert_eq!(
         state.crc_version,
-        expected_base_crc.as_ref().map(|crc| crc.version)
+        expected_retained_crc.as_ref().map(|crc| crc.version)
     );
 
     // When the exported hint is installed and the source snapshot is released.
@@ -579,8 +620,8 @@ fn assert_exported_paths_and_round_trip(snapshot: Handle<SharedSnapshot>) {
     assert_eq!(rebuilt_ref.log_segment(), &expected_segment);
     assert_eq!(rebuilt_ref.crc_at_version(), expected_crc.as_ref());
     assert_eq!(
-        rebuilt_ref.to_snapshot_hint().unwrap().base_crc(),
-        expected_base_crc.as_ref()
+        rebuilt_ref.to_snapshot_hint().unwrap().retained_crc(),
+        expected_retained_crc.as_ref()
     );
     assert_eq!(rebuilt_ref.crc_provenance(), expected_provenance);
     assert_eq!(rebuilt_ref.checkpoint_type(), expected_checkpoint_type);
@@ -765,87 +806,6 @@ fn hint_provenance_failures_are_invalid_snapshot_hints(
         FFIKernelError::InvalidSnapshotHint,
         expected_message,
     );
-    unsafe { free_engine(engine) };
-}
-
-#[rstest::rstest]
-#[case::at_version(CrcSource::AtVersion, Some(2), Some(2), None)]
-#[case::reconstructed(CrcSource::Reconstructed { num_commits: 2 }, Some(0), Some(2), None)]
-#[case::stale(CrcSource::Stale, Some(0), Some(1), None)]
-#[case::missing(CrcSource::Missing, None, None, None)]
-#[case::unusable(CrcSource::Unusable, None, None, None)]
-#[case::unknown(CrcSource::Unknown, None, Some(2), None)]
-#[case::unknown_stale(CrcSource::Unknown, None, Some(1), None)]
-#[case::unknown_absent(CrcSource::Unknown, None, None, None)]
-#[case::unresolved(
-    CrcSource::AtVersion,
-    Some(2),
-    Some(2),
-    Some(CheckpointType::Unresolved)
-)]
-#[case::v1(CrcSource::AtVersion, Some(2), Some(2), Some(CheckpointType::V1))]
-#[case::v2(CrcSource::AtVersion, Some(2), Some(2), Some(CheckpointType::V2))]
-fn hint_preserves_provenance_without_io(
-    #[case] source: CrcSource,
-    #[case] base_version: Option<u64>,
-    #[case] crc_version: Option<u64>,
-    #[case] checkpoint_type: Option<CheckpointType>,
-) {
-    // Given retained checksum and checkpoint observations supplied by a connector.
-    let engine = test_engine();
-    let mut paths = Vec::from(
-        [
-            "memory:///hinted-table/_delta_log/00000000000000000000.json",
-            "memory:///hinted-table/_delta_log/00000000000000000001.json",
-            "memory:///hinted-table/_delta_log/00000000000000000002.json",
-        ]
-        .map(|path| FfiLogPath::new(slice(path), 0, 1)),
-    );
-    if checkpoint_type.is_some() {
-        paths.push(FfiLogPath::new(
-            slice("memory:///hinted-table/_delta_log/00000000000000000000.checkpoint.parquet"),
-            0,
-            1,
-        ));
-    }
-    let mut crc = empty_crc();
-    crc.version = crc_version.unwrap_or(0);
-    let hint = FfiSnapshotHint {
-        checkpoint_type: checkpoint_type.into(),
-        crc_provenance: FfiCrcProvenance {
-            source,
-            base_version: base_version.into(),
-        },
-        crc: crc_version.map_or(std::ptr::null(), |_| &crc),
-        ..test_snapshot_hint(&paths, 2, FfiSnapshotHintFreshness::Latest)
-    };
-    // When the snapshot is built using an engine that rejects I/O.
-    let builder = unsafe {
-        ok_or_panic(snapshot_builder_with_snapshot_hint(
-            test_builder(&engine),
-            &hint,
-        ))
-    };
-    let snapshot = unsafe { ok_or_panic(snapshot_builder_build(builder)) };
-    // Then the public FFI accessors expose the supplied provenance.
-    let mut observed = std::mem::MaybeUninit::uninit();
-    unsafe { snapshot_crc_provenance(snapshot.shallow_copy(), observed.as_mut_ptr()) };
-    assert_eq!(unsafe { observed.assume_init() }, hint.crc_provenance);
-    assert_eq!(
-        Option::<CheckpointType>::from(unsafe {
-            snapshot_checkpoint_type(snapshot.shallow_copy())
-        }),
-        checkpoint_type
-    );
-    assert_eq!(
-        unsafe { snapshot.as_ref() }
-            .to_snapshot_hint()
-            .unwrap()
-            .base_crc()
-            .map(|crc| crc.version),
-        crc_version
-    );
-    assert_exported_paths_and_round_trip(snapshot);
     unsafe { free_engine(engine) };
 }
 

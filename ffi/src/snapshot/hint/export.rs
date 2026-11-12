@@ -18,7 +18,7 @@ pub(super) fn visit(
     context: NullableCvoid,
     visitor: SnapshotHintVisitor,
 ) -> KernelResult<()> {
-    let retained_crc = hint.base_crc();
+    let retained_crc = hint.retained_crc();
     #[cfg(feature = "adaptive-metadata-in-dev")]
     if retained_crc.is_some_and(|crc| {
         crc.last_manifest_commit().is_some()

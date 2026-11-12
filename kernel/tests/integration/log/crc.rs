@@ -1022,7 +1022,7 @@ async fn test_write_checksum_resolves_correct_crc_from_each_root(
     Ok(())
 }
 
-/// A `Disabled`-mode load over a stale on-disk CRC retains it as a base: `base_crc()` is
+/// A `Disabled`-mode load over a stale on-disk CRC retains it as a base: `retained_crc()` is
 /// `Some(stale)` while `crc_at_version()` is `None`. Asserting only `crc_at_version().is_none()`
 /// would pass even if retention regressed to a full discard, so this drives the retained base
 /// through the observable write path.

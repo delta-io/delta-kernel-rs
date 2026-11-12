@@ -25,7 +25,7 @@ use crate::engine::sync::SyncEngine;
 use crate::object_store::ObjectStoreExt as _;
 use crate::object_store::memory::InMemory;
 use crate::path::ParsedLogPath;
-use crate::snapshot::{IncrementalReplay, SnapshotBuilder, SnapshotRef};
+use crate::snapshot::{CrcProvenance, CrcSource, IncrementalReplay, SnapshotBuilder, SnapshotRef};
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::table_configuration::TableConfiguration;
 #[cfg(feature = "adaptive-metadata-in-dev")]
@@ -1528,37 +1528,65 @@ async fn test_full_replay_across_two_commits_propagates_all_state() {
 // Tests: incremental-replay budget gate
 // ============================================================================
 
-// Commits 0-3 (target v3) with a CRC at `crc_version`, so distance = 3 - crc_version.
+// Commits 0-3 (target v3) with an optional CRC at `crc_version`.
 #[rstest]
-// CRC already at the target (distance 0): used regardless of mode, even Disabled.
-#[case::at_target_disabled(3, IncrementalReplay::Disabled, Some(3))]
-// Stale CRC (distance >= 1): advancement depends on the budget.
-#[case::disabled_stale(1, IncrementalReplay::Disabled, None)]
-#[case::up_to_zero(1, IncrementalReplay::UpToCommits(0), None)]
-#[case::interior(2, IncrementalReplay::UpToCommits(5), Some(3))] // distance 1 < 5
-#[case::at_budget(1, IncrementalReplay::UpToCommits(2), Some(3))] // distance 2 == 2
-#[case::over_budget(1, IncrementalReplay::UpToCommits(1), None)] // distance 2 > 1
-#[case::unlimited(0, IncrementalReplay::Unlimited, Some(3))] // distance 3
+#[case::at_target_disabled(Some(3), false, IncrementalReplay::Disabled, CrcSource::AtVersion)]
+#[case::disabled_stale(Some(1), false, IncrementalReplay::Disabled, CrcSource::Stale)]
+#[case::up_to_zero(Some(1), false, IncrementalReplay::UpToCommits(0), CrcSource::Stale)]
+#[case::interior(Some(2), false, IncrementalReplay::UpToCommits(5), CrcSource::Reconstructed { num_commits: 1 })]
+#[case::at_budget(Some(1), false, IncrementalReplay::UpToCommits(2), CrcSource::Reconstructed { num_commits: 2 })]
+#[case::over_budget(Some(1), false, IncrementalReplay::UpToCommits(1), CrcSource::Stale)]
+#[case::unlimited(Some(0), false, IncrementalReplay::Unlimited, CrcSource::Reconstructed { num_commits: 3 })]
+#[case::unlimited_stale(Some(1), false, IncrementalReplay::Unlimited, CrcSource::Reconstructed { num_commits: 2 })]
+#[case::missing(None, false, IncrementalReplay::Unlimited, CrcSource::Missing)]
+#[case::unusable(Some(3), true, IncrementalReplay::Unlimited, CrcSource::Unusable)]
 #[tokio::test]
 async fn test_stale_crc_advanced_only_within_replay_budget(
-    #[case] crc_version: u64,
+    #[case] crc_version: Option<Version>,
+    #[case] corrupt: bool,
     #[case] mode: IncrementalReplay,
-    #[case] expected_crc_version: Option<u64>,
+    #[case] expected_source: CrcSource,
 ) {
-    let built = CrcReadTest::new()
+    // Given a checksum candidate and the commits needed to reach the target version.
+    let mut test = CrcReadTest::new()
         .v2_checkpoint(0, protocol_a(), metadata_a())
         .commit(1, [commit_info(DEFAULT_OPERATION, None)])
         .commit(2, [commit_info(DEFAULT_OPERATION, None)])
-        .commit(3, [commit_info(DEFAULT_OPERATION, None)])
-        .crc(crc_version, protocol_a(), metadata_a(), None)
-        .build()
-        .await;
+        .commit(3, [commit_info(DEFAULT_OPERATION, None)]);
+    if let Some(version) = crc_version {
+        test = if corrupt {
+            test.corrupt_crc(version)
+        } else {
+            test.crc(version, protocol_a(), metadata_a(), None)
+        };
+    }
+    let built = test.build().await;
+
+    // When the snapshot resolves the checksum under the requested replay budget.
     let snapshot = built.snapshot_latest_with_replay(mode);
+
+    // Then the checksum version and disk observation agree with the replay result.
+    let expected_crc_version = matches!(
+        expected_source,
+        CrcSource::AtVersion | CrcSource::Reconstructed { .. }
+    )
+    .then_some(3);
     assert_eq!(snapshot.version(), 3);
     assert_eq!(
         snapshot.crc_at_version().map(|c| c.version),
         expected_crc_version
     );
+    let expected = CrcProvenance::new(expected_source, crc_version.filter(|_| !corrupt));
+    assert_eq!(snapshot.crc_provenance(), expected);
+
+    // When the snapshot is rebuilt from its hint.
+    let rebuilt = Snapshot::builder_for(built.url.clone())
+        .with_snapshot_hint(snapshot.to_snapshot_hint().unwrap())
+        .build(&built.engine)
+        .unwrap();
+    // Then both checksum and provenance survive.
+    assert_eq!(rebuilt.crc_provenance(), expected);
+    assert_eq!(rebuilt.retained_crc(), snapshot.retained_crc());
 }
 
 // Without adaptiveMetadata, CRC replay ignores `commitInfo.lastManifestCommit`, so a value of any
@@ -1579,50 +1607,28 @@ async fn test_stale_crc_advances_past_foreign_last_manifest_commit() {
 }
 
 #[rstest]
+#[case::no_disk_crc(None, false, 0)]
+#[case::same_version_disk_crc(Some(0), false, 0)]
+#[case::newer_disk_crc(Some(1), false, 1)]
+#[case::corrupt_newer_disk_crc(Some(1), true, 0)]
 #[tokio::test]
-async fn pick_latest_base_crc_preserves_cancellation_with_in_memory_base(
-    #[values(false, true)] corrupt: bool,
+async fn pick_latest_base_crc_preserves_cancellation_and_in_memory_identity(
+    #[case] disk_version: Option<Version>,
+    #[case] corrupt: bool,
+    #[case] expected_version: Version,
     #[values(false, true)] cancelled: bool,
 ) {
-    let test = CrcReadTest::new()
-        .commit(0, create_table_actions())
-        .crc(0, protocol_a(), metadata_a(), None)
-        .commit(1, [commit_info(DEFAULT_OPERATION, None)]);
-    let test = if corrupt {
-        test.corrupt_crc(1)
-    } else {
-        test.crc(1, protocol_a(), metadata_a(), None)
-    };
-    let built = test.build().await;
-    let base = Arc::new(built.read_crc_at(0).unwrap());
-    let token = Arc::new(TestCancellationToken::default());
-    if cancelled {
-        token.cancel();
-    }
-    let engine = CancellableEngine::new(&built.engine, token);
-    let result = built.pick_latest_base_crc(&engine, Some(&base));
-    if cancelled {
-        assert!(matches!(result, Err(KernelError::Cancelled)), "{result:?}");
-    } else {
-        assert_eq!(result.unwrap(), Some(if corrupt { 0 } else { 1 }));
-    }
-}
-
-#[rstest]
-#[case::no_disk_crc(None)]
-#[case::same_version_disk_crc(Some(false))]
-#[case::corrupt_newer_disk_crc(Some(true))]
-#[tokio::test]
-async fn pick_latest_base_crc_preserves_in_memory_identity(#[case] disk_crc: Option<bool>) {
-    // Given an in-memory baseline with a missing, same-version, or corrupt disk checksum.
+    // Given an in-memory baseline and an optional checksum candidate on disk.
     let mut test = CrcReadTest::new()
         .commit(0, create_table_actions())
         .commit(1, [commit_info(DEFAULT_OPERATION, None)]);
-    test = match disk_crc {
-        None => test,
-        Some(false) => test.crc(0, protocol_a(), metadata_a(), None),
-        Some(true) => test.corrupt_crc(1),
-    };
+    if let Some(version) = disk_version {
+        test = if corrupt {
+            test.corrupt_crc(version)
+        } else {
+            test.crc(version, protocol_a(), metadata_a(), None)
+        };
+    }
     let built = test.build().await;
     let base = Arc::new(Crc {
         version: 0,
@@ -1637,13 +1643,25 @@ async fn pick_latest_base_crc_preserves_in_memory_identity(#[case] disk_crc: Opt
         None,
     )
     .unwrap();
-    // When the in-memory checksum wins baseline selection.
-    let selected = segment
-        .pick_latest_base_crc(&built.engine, Some(&base))
-        .unwrap()
-        .unwrap();
-    // Then the original Arc is retained, preserving its disk provenance.
-    assert!(Arc::ptr_eq(&base, &selected));
+    let token = Arc::new(TestCancellationToken::default());
+    if cancelled {
+        token.cancel();
+    }
+    let engine = CancellableEngine::new(&built.engine, token);
+
+    // When the baseline is selected, reading a newer disk candidate may be cancelled.
+    let result = segment.pick_latest_base_crc(&engine, Some(&base));
+
+    // Then cancellation propagates; otherwise a winning in-memory baseline keeps its identity.
+    if cancelled && disk_version == Some(1) {
+        assert!(matches!(result, Err(KernelError::Cancelled)), "{result:?}");
+    } else {
+        let selected = result.unwrap().unwrap();
+        assert_eq!(selected.version, expected_version);
+        if expected_version == base.version {
+            assert!(Arc::ptr_eq(&base, &selected));
+        }
+    }
 }
 
 // A base exactly at the checkpoint version is kept (its tail is (ckpt, end]); a base below it is
