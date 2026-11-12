@@ -1423,11 +1423,10 @@ impl Scan {
     ///
     /// Planning reuses completed metadata from
     /// [`crate::snapshot::SnapshotReader::get_checkpoint_info`] when available. Otherwise, it
-    /// probes checkpoint topology and reads a leaf schema only if needed, without populating
-    /// the snapshot's checkpoint-info cache. Without a complete sidecar list, the plan
-    /// discovers sidecars during execution. A CRC at least as new as the checkpoint
-    /// with `allFiles`, or a statically empty scan, skips checkpoint discovery. Returns `None` when
-    /// no Delta metadata matches this scan.
+    /// resolves the complete checkpoint layout and leaf schema through the engine, without waiting
+    /// for or populating the snapshot's checkpoint-info cache. Manifest plans use the resolved
+    /// sidecar list. A CRC at least as new as the checkpoint with `allFiles`, or a statically empty
+    /// scan, skips checkpoint discovery. Returns `None` when no Delta metadata matches this scan.
     ///
     /// This method returns the metadata plan without executing it. A connector that consumes the
     /// resulting live `add` rows may run the plan through the generic
@@ -1473,7 +1472,7 @@ impl Scan {
 
         let planner = scan_plan::MetadataPlanner::try_from_scan(self)?;
         let base = scan_plan::MetadataReplayBase::try_new(&self.snapshot, engine)?;
-        self.build_metadata_scan_plan_with(base, &planner)
+        self.build_metadata_scan_plan_with(base, planner)
     }
 
     #[cfg(feature = "declarative-plans")]

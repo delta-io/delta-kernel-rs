@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use super::action_set::{ActionSet, ActionSource};
+use super::action_set::{ACTION_KEY, ActionSet, ActionSource};
 use super::{VERSION, sources};
 use crate::action_reconciliation::file_metadata::{
     PARTITION_VALUES_FIELD as PARTITION_VALUES,
@@ -12,7 +12,7 @@ use crate::actions::{
 use crate::checkpoint::CheckpointShape;
 use crate::checkpoint::collation_stats::source_collation_stats;
 use crate::expressions::{
-    Expression as Expr, Predicate, UnaryExpressionOp, col, column_name, expr,
+    ColumnName, Expression as Expr, Predicate, UnaryExpressionOp, col, column_name, expr,
 };
 use crate::log_segment::LogSegment;
 use crate::scan::{PartitionValuesOptions, StatsOptions, map_to_struct_options};
@@ -113,9 +113,19 @@ impl<'a> MetadataPlanner<'a> {
         self
     }
 
+    /// Enables scan pruning before replay; only use when a conservative superset is acceptable.
     pub(crate) fn with_stats_filter(mut self, predicate: Option<Predicate>) -> Self {
         self.stats_filter = predicate;
         self
+    }
+
+    /// Reconstructs requested actions with the configured stats and partition representations.
+    /// Uses the caller's resolved schemas and options; sources supply `version`.
+    /// Checkpoint file actions require a resolved shape. Winning domain deletions are retained.
+    pub(crate) fn replay(&self) -> KernelResult<PlanBuilder> {
+        let commits = self.commit_actions(self.segment.checkpoint_version)?;
+        let checkpoint = self.checkpoint_actions()?;
+        self.replay_actions(commits, checkpoint)
     }
 
     /// Builds normalized live adds from a CRC with the supplied version and action key.
@@ -373,6 +383,57 @@ impl<'a> MetadataPlanner<'a> {
                 })
         })?;
         Ok((plan, stats))
+    }
+
+    /// Reconciles version-tagged commits with an already-reconciled checkpoint or CRC base.
+    /// Inputs must carry the action key and the same schema, normalized by metadata planning.
+    /// Commit versions must be strictly newer than the base. Retention is left to the consumer.
+    /// Non-content actions aggregate together. Content actions aggregate the tail and anti-join the
+    /// base; when only JSON commits exist, the builder eliminates the empty base and anti-join.
+    pub(crate) fn replay_actions(
+        &self,
+        commits: PlanBuilder,
+        checkpoint: PlanBuilder,
+    ) -> KernelResult<PlanBuilder> {
+        if !self.actions.contains_content_actions() {
+            return self
+                .latest_by_key(PlanBuilder::union_all([checkpoint, commits])?)?
+                .project_patch(|patch| patch.drop(ACTION_KEY));
+        }
+        // Winning deletions cancel base keys even if retention will later expire them.
+        let winners = self.latest_by_key(commits)?;
+        let base = checkpoint
+            .anti_join(
+                winners.clone(),
+                [column_name!(ACTION_KEY)],
+                [column_name!(ACTION_KEY)],
+            )?
+            .project_patch(|patch| patch.drop(ACTION_KEY))?;
+        let tail = if self.actions.include_tombstones {
+            winners
+        } else {
+            winners.filter(self.actions.output_predicate())?
+        };
+        let tail = tail.project_patch(|patch| patch.drop(ACTION_KEY))?;
+        PlanBuilder::union_all([tail, base])
+    }
+
+    /// Selects winning action payloads per identity, keeping deletion keys even without tombstones.
+    fn latest_by_key(&self, input: PlanBuilder) -> KernelResult<PlanBuilder> {
+        input.aggregate_by([column_name!(ACTION_KEY)], |mut aggs| {
+            for name in self.actions.output_action_names().chain([VERSION]) {
+                // Each file-identity group contains the adds and removes for a given file; winning
+                // adds pass through unchanged while winning removes produce NULL adds. Non-file
+                // actions have a NULL file-identity lane and group by their own identity lanes.
+                // Select every payload from the winning row, including its NULL add for a remove.
+                aggs = aggs.max_non_null_by(
+                    ColumnName::new([name]),
+                    column_name!(ACTION_KEY),
+                    column_name!(VERSION),
+                );
+            }
+            aggs
+        })
     }
 
     /// Projects the requested stats and partition representations after pruning. Stats may contain

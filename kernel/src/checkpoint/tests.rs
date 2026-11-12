@@ -13,7 +13,7 @@ use crate::action_reconciliation::{
     ActionReconciliationIterator, ActionReconciliationIteratorState, DEFAULT_RETENTION_SECS,
     deleted_file_retention_timestamp_with_time,
 };
-use crate::actions::{Add, Metadata, Protocol, Remove};
+use crate::actions::{Add, Metadata, Protocol};
 use crate::arrow::array::{
     Array, AsArray, Int64Array, MapArray, RecordBatch, StructArray, create_array,
 };
@@ -40,6 +40,7 @@ use crate::unit_test_utils::Action;
 use crate::unit_test_utils::{
     adaptive_metadata_table_configuration, test_schema_flat_with_column_mapping,
 };
+pub(super) use crate::unit_test_utils::{create_add_action, create_remove_action};
 use crate::{FileMeta, KernelError, KernelResult, LogPath, Result, Snapshot};
 
 #[rstest::rstest]
@@ -281,28 +282,6 @@ fn create_metadata_action_with_config(configuration: HashMap<String, String>) ->
 /// Create a Metadata action with no configuration.
 pub(super) fn create_metadata_action() -> Action {
     create_metadata_action_with_config(HashMap::new())
-}
-
-/// Create a simple Add action with the specified path (no stats)
-pub(super) fn create_add_action(path: &str) -> Action {
-    Action::Add(Add {
-        path: path.into(),
-        data_change: true,
-        ..Default::default()
-    })
-}
-
-/// Create a Remove action with the specified path
-///
-/// The remove action has deletion_timestamp set to i64::MAX to ensure the
-/// remove action is not considered expired during testing.
-pub(super) fn create_remove_action(path: &str) -> Action {
-    Action::Remove(Remove {
-        path: path.into(),
-        data_change: true,
-        deletion_timestamp: Some(i64::MAX), // Ensure the remove action is not expired
-        ..Default::default()
-    })
 }
 
 fn try_finalize_checkpoint(
