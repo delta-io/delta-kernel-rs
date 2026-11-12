@@ -466,12 +466,12 @@ fn visit_expression_literal_decimal_impl(
 
 /// Type tag for null literal construction via FFI. Identifies the data type of a typed null.
 ///
-/// Most primitive types use fixed discriminants 0-14. Tag 12 is reserved for decimal nulls,
-/// which require precision and scale and use a dedicated constructor. Tag 13 retains the
-/// full-range year-month interval mapping. Non-primitive types (struct, array, map, variant),
-/// `void`, geospatial types, and decimal types use the
-/// [`NonPrimitive`](Self::NonPrimitive) sentinel because they cannot be reconstructed from a type
-/// tag alone.
+/// Fixed type tags use the established discriminants 0-11 and 13-14. Tag 12 is reserved for
+/// decimal nulls and is rejected by the tag-only constructor; decimal nulls use the dedicated
+/// constructor with precision and scale. Tag 13 maps to the existing full-range year-month
+/// interval type. Non-primitive types (struct, array, map, variant), `void`, geospatial types, and
+/// decimal types use the [`NonPrimitive`](Self::NonPrimitive) sentinel because they cannot be
+/// reconstructed from a type tag alone.
 ///
 /// NOTE: These values are part of the FFI contract. Changing existing discriminants is a breaking
 /// change.
@@ -568,7 +568,7 @@ impl NullTypeTag {
                 PrimitiveType::Timestamp => Self::Timestamp,
                 PrimitiveType::TimestampNtz => Self::TimestampNtz,
                 PrimitiveType::IntervalYearMonth(_) => Self::IntervalYearMonth,
-                PrimitiveType::IntervalDayTime => Self::IntervalDayTime,
+                PrimitiveType::IntervalDayTime(_) => Self::IntervalDayTime,
                 PrimitiveType::Decimal(_) => Self::NonPrimitive,
                 // Void has no dedicated FFI tag. The current predicate-construction path is
                 // not expected to produce a void-typed literal null; if one ever reaches this
@@ -576,9 +576,9 @@ impl NullTypeTag {
                 // case, so this arm is a defensive fallback rather than part of the normal
                 // void-column path.
                 PrimitiveType::Void => Self::NonPrimitive,
-                // A geometry/geography's coordinate reference system string doesn't fit the
-                // (tag, u8, u8) payload, so map to the NonPrimitive sentinel. See #2949 for
-                // real geo FFI support.
+                // A geometry/geography's coordinate reference system string does not fit the null
+                // type tag, so map to the NonPrimitive sentinel. See #2949 for real geo FFI
+                // support.
                 #[cfg(feature = "geo-type-in-dev")]
                 PrimitiveType::Geometry(_) | PrimitiveType::Geography(_) => Self::NonPrimitive,
             },
