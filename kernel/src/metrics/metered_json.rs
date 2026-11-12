@@ -2,8 +2,16 @@
 //! kernel's standard `JsonReadCompleted` span, carrying `(num_files, bytes_read)` exactly
 //! once when the returned iterator is exhausted or dropped. `parse_json` and
 //! `write_json_file` pass through.
+//!
+//! DEBUG events named `json_read_finished` identify each requested path and distinguish successful
+//! exhaustion (`success`), read errors (`failure`), and early iterator drops (`dropped`).
+//! Outcomes describe the entire handler request. A failure is reported for every requested path;
+//! it does not identify which file failed or how far reading progressed.
 
 use std::sync::Arc;
+
+use tracing::{Dispatch, Level};
+use url::Url;
 
 use crate::metrics::PrecountedMetricsIterator;
 use crate::metrics::events::emit_json_read_completed;
@@ -42,15 +50,25 @@ impl std::fmt::Debug for MeteredJsonHandler {
 impl MeteredJsonHandler {
     /// Wraps `inner` so it emits a `JsonReadCompleted` span carrying `num_files` and the summed
     /// `bytes_read` of `files` when the iterator is exhausted or dropped.
-    fn meter(files: &[FileMeta], inner: FileDataReadResultIterator) -> FileDataReadResultIterator {
+    fn meter(
+        files: &[FileMeta],
+        result: KernelResult<FileDataReadResultIterator>,
+    ) -> KernelResult<FileDataReadResultIterator> {
+        let mut trace = JsonReadTrace::new(files);
+        let inner = result.inspect_err(|_| {
+            if let Some(trace) = &mut trace {
+                trace.finish("failure");
+            }
+        })?;
         let num_files = files.len() as u64;
         let bytes_read = files.iter().map(|f| f.size).sum();
-        Box::new(PrecountedMetricsIterator::new(
-            inner,
-            num_files,
-            bytes_read,
-            emit_json_read_completed,
-        ))
+        let inner =
+            PrecountedMetricsIterator::new(inner, num_files, bytes_read, emit_json_read_completed);
+        if let Some(trace) = trace {
+            Ok(Box::new(TracedJsonRead { inner, trace }))
+        } else {
+            Ok(Box::new(inner))
+        }
     }
 }
 
@@ -69,10 +87,10 @@ impl JsonHandler for MeteredJsonHandler {
         physical_schema: SchemaRef,
         predicate: Option<PredicateRef>,
     ) -> KernelResult<FileDataReadResultIterator> {
-        let inner = self
+        let result = self
             .inner
-            .read_json_files(files, physical_schema, predicate)?;
-        Ok(Self::meter(files, inner))
+            .read_json_files(files, physical_schema, predicate);
+        Self::meter(files, result)
     }
 
     fn read_json_files_with_cancellation(
@@ -82,13 +100,13 @@ impl JsonHandler for MeteredJsonHandler {
         predicate: Option<PredicateRef>,
         cancellation_token: Option<CancellationTokenRef>,
     ) -> KernelResult<FileDataReadResultIterator> {
-        let inner = self.inner.read_json_files_with_cancellation(
+        let result = self.inner.read_json_files_with_cancellation(
             files,
             physical_schema,
             predicate,
             cancellation_token,
-        )?;
-        Ok(Self::meter(files, inner))
+        );
+        Self::meter(files, result)
     }
 
     fn write_json_file(
@@ -101,10 +119,63 @@ impl JsonHandler for MeteredJsonHandler {
     }
 }
 
+struct JsonReadTrace {
+    paths: Vec<Url>,
+    dispatch: Dispatch,
+}
+
+impl JsonReadTrace {
+    fn new(files: &[FileMeta]) -> Option<Self> {
+        if files.is_empty() || !tracing::level_enabled!(Level::DEBUG) {
+            return None;
+        }
+        Some(Self {
+            paths: files.iter().map(|file| file.location.clone()).collect(),
+            dispatch: tracing::dispatcher::get_default(Clone::clone),
+        })
+    }
+
+    fn finish(&mut self, outcome: &'static str) {
+        // Keep the initiating subscriber when a different thread consumes or drops the iterator.
+        tracing::dispatcher::with_default(&self.dispatch, || {
+            for path in self.paths.drain(..) {
+                tracing::debug!(name: "json_read_finished", path = path.as_str(), outcome);
+            }
+        });
+    }
+}
+
+impl Drop for JsonReadTrace {
+    fn drop(&mut self) {
+        self.finish("dropped");
+    }
+}
+
+struct TracedJsonRead<I> {
+    inner: I,
+    trace: JsonReadTrace,
+}
+
+impl<I: Iterator<Item = KernelResult<Box<dyn EngineData>>>> Iterator for TracedJsonRead<I> {
+    type Item = I::Item;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let item = self.inner.next();
+        match &item {
+            None => self.trace.finish("success"),
+            Some(Err(_)) => self.trace.finish("failure"),
+            Some(Ok(_)) => {}
+        }
+        item
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
 
+    use rstest::rstest;
+    use test_utils::JsonReadCapture;
     use url::Url;
 
     use super::*;
@@ -121,6 +192,8 @@ mod tests {
         /// metered wrapper forwards to it (rather than the plain read).
         cancellation_read_called: std::sync::atomic::AtomicBool,
         write_size: Option<FileSize>,
+        read_error: bool,
+        batch_error: bool,
     }
 
     fn empty_batch() -> Box<dyn EngineData> {
@@ -144,6 +217,14 @@ mod tests {
             _physical_schema: SchemaRef,
             _predicate: Option<PredicateRef>,
         ) -> KernelResult<FileDataReadResultIterator> {
+            if self.read_error {
+                return Err(crate::KernelError::generic("read failed"));
+            }
+            if self.batch_error {
+                return Ok(Box::new(std::iter::once(Err(crate::KernelError::generic(
+                    "batch failed",
+                )))));
+            }
             Ok(Box::new(std::iter::empty()))
         }
 
@@ -156,7 +237,7 @@ mod tests {
         ) -> KernelResult<FileDataReadResultIterator> {
             self.cancellation_read_called
                 .store(true, std::sync::atomic::Ordering::SeqCst);
-            Ok(Box::new(std::iter::empty()))
+            self.read_json_files(_files, _physical_schema, _predicate)
         }
 
         fn write_json_file(
@@ -187,6 +268,71 @@ mod tests {
 
     fn delta_schema() -> SchemaRef {
         schema_ref! { nullable "x": INTEGER }
+    }
+
+    #[rstest]
+    #[case::success(false, false, false)]
+    #[case::construction_error(true, false, false)]
+    #[case::batch_error(false, true, false)]
+    #[case::dropped(false, false, true)]
+    fn json_read_trace_reports_one_terminal_outcome(
+        #[case] read_error: bool,
+        #[case] batch_error: bool,
+        #[case] drop_early: bool,
+        #[values(false, true)] cancellation: bool,
+        #[values(false, true)] other_thread: bool,
+    ) {
+        let capture = JsonReadCapture::default();
+        let handler = MeteredJsonHandler::new(Arc::new(StubJsonHandler {
+            read_error,
+            batch_error,
+            ..Default::default()
+        }));
+        let files = vec![fake_file("0.json", 100), fake_file("1.json", 50)];
+        let result = if cancellation {
+            handler.read_json_files_with_cancellation(&files, delta_schema(), None, None)
+        } else {
+            handler.read_json_files(&files, delta_schema(), None)
+        };
+        if read_error {
+            assert!(result.is_err());
+        } else {
+            let iterator = result.unwrap();
+            let consume = move || {
+                if drop_early {
+                    drop(iterator);
+                } else {
+                    let batches = iterator.collect::<Vec<_>>();
+                    assert_eq!(batches.iter().any(Result::is_err), batch_error);
+                }
+            };
+            if other_thread {
+                std::thread::spawn(consume).join().unwrap();
+            } else {
+                consume();
+            }
+        }
+        let paths = files
+            .iter()
+            .map(|file| file.location.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(capture.requested_paths(), paths);
+        assert_eq!(
+            capture.successful_paths().len(),
+            if !read_error && !batch_error && !drop_early {
+                2
+            } else {
+                0
+            }
+        );
+        assert_eq!(
+            capture.failed_paths().len(),
+            if read_error || batch_error { 2 } else { 0 }
+        );
+        assert_eq!(
+            capture.dropped_paths().len(),
+            if drop_early { 2 } else { 0 }
+        );
     }
 
     #[test]

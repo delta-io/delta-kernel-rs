@@ -111,8 +111,8 @@ impl SnapshotHint {
     /// Returns an error if `table_root` is invalid,
     /// [`SnapshotHintError::LogPathOutsideRoot`] if any path is outside `table_root`'s `_delta_log`
     /// root. Returns an error when the supplied paths cannot be grouped into a valid log-segment
-    /// file set. Compacted paths are ignored, as in storage listing; callers must also supply the
-    /// individual commits required for replay.
+    /// file set. Compacted paths are retained; callers must also supply the individual commits
+    /// required for replay.
     #[internal_api]
     #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
     #[allow(clippy::too_many_arguments)]
@@ -227,10 +227,6 @@ impl SnapshotHint {
 
     pub(crate) fn from_snapshot(snapshot: &Snapshot) -> KernelResult<Self> {
         let segment = snapshot.log_segment();
-        require!(
-            segment.listed.ascending_compaction_files.is_empty(),
-            SnapshotHintError::LogCompaction.into()
-        );
         Ok(Self {
             version: snapshot.version(),
             log_segment_files: segment.listed.clone(),
@@ -312,11 +308,6 @@ impl SnapshotHint {
             max_catalog_version,
             latest_commit_version,
         )?;
-
-        require!(
-            log_segment_files.ascending_compaction_files.is_empty(),
-            SnapshotHintError::LogCompaction.into()
-        );
 
         // Construction validates every path against one root, and grouping preserves locations.
         // One retained path suffices to reject a hint attached to a different table's builder.
@@ -546,7 +537,7 @@ mod tests {
     }
 
     #[test_log::test(tokio::test)]
-    async fn snapshot_to_hint_rejects_log_compaction()
+    async fn snapshot_to_hint_preserves_log_compaction()
     -> KernelResult<(), Box<dyn std::error::Error>> {
         let (_engine, table_root, snapshot, mut hint) =
             snapshot_and_hint(SnapshotHintFreshness::Unverified).await?;
@@ -568,11 +559,11 @@ mod tests {
             false,
             false,
         )?;
-        assert!(matches!(
-            snapshot.to_snapshot_hint(),
-            Err(KernelError::SnapshotHint(source))
-                if matches!(*source, SnapshotHintError::LogCompaction)
-        ));
+        let exported = snapshot.to_snapshot_hint()?;
+        assert_eq!(
+            exported.log_segment_files.ascending_compaction_files,
+            snapshot.log_segment().listed.ascending_compaction_files,
+        );
         Ok(())
     }
 
@@ -649,7 +640,7 @@ mod tests {
                 .collect_vec(),
             vec![0, 1]
         );
-        assert!(hint.log_segment_files.ascending_compaction_files.is_empty());
+        assert_eq!(hint.log_segment_files.ascending_compaction_files.len(), 1);
     }
 
     #[test]
@@ -1277,12 +1268,10 @@ mod tests {
             .push(create_log_path(
                 "memory:///_delta_log/00000000000000000000.00000000000000000001.compacted.json",
             ));
-        assert_hint_error(
-            SnapshotBuilder::new_for(&table_root),
-            compacted,
-            engine.as_ref(),
-            "log compaction files are not supported",
-        );
+        let rebuilt = SnapshotBuilder::new_for(&table_root)
+            .with_snapshot_hint(compacted)
+            .build(engine.as_ref())?;
+        assert_eq!(rebuilt.version(), hint.version);
 
         let mut incompatible = hint;
         incompatible.metadata = incompatible

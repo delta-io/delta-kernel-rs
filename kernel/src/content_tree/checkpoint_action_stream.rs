@@ -201,7 +201,7 @@ mod tests {
         create_adaptive_metadata_table, write_sidecar,
     };
     use crate::unit_test_utils::{
-        Action, TestCancellationToken, assert_result_error_with_message, create_log_path_with_size,
+        Action, TestCancellationToken, assert_result_error_with_message,
         test_schema_flat_with_column_mapping,
     };
     use crate::{CancellationTokenRef, Version};
@@ -359,15 +359,7 @@ mod tests {
         .unwrap();
         let path = Path::from(format!("_delta_log/{name}"));
         store.put(&path, compacted.clone().into()).await.unwrap();
-        let mut log_segment = latest_log_segment(&table_root(), &engine);
-        // Listing skips compacted deltas while log compaction is disabled (#2337).
-        log_segment
-            .listed
-            .ascending_compaction_files
-            .push(create_log_path_with_size(
-                log_root().log_root().join(&name).unwrap().as_str(),
-                compacted.len() as u64,
-            ));
+        let log_segment = latest_log_segment(&table_root(), &engine);
 
         let batches = read_paths(
             &engine,

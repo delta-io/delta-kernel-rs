@@ -292,7 +292,7 @@ pub struct Transaction<STATE = UpdateTable, MODE: ExecutionMode = Imperative> {
     // config, this is cloned from the read snapshot; when the config changes (e.g. schema
     // evolution), it is constructed separately with the new schema/protocol.
     effective_table_config: TableConfiguration,
-    // Whether to emit a Protocol action. True for CREATE TABLE, false otherwise.
+    // Whether to emit a Protocol action for this transaction.
     should_emit_protocol: bool,
     // Whether to emit a Metadata action. True for CREATE TABLE and transactions with staged
     // schema changes, false otherwise.
@@ -377,6 +377,24 @@ impl<STATE, MODE: ExecutionMode> std::fmt::Debug for Transaction<STATE, MODE> {
             "Transaction {{ read_snapshot version: {}, engine_info: {:?} }}",
             version_info, self.engine_info
         ))
+    }
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+impl<MODE: ExecutionMode> Transaction<UpdateTable, MODE> {
+    /// Stages `protocol` for this test transaction to emit when committed.
+    ///
+    /// Revalidates the effective table configuration, returning an error if it is invalid.
+    /// This fixture helper does not validate protocol transition rules.
+    pub fn update_table_protocol_for_test(&mut self, protocol: Protocol) -> KernelResult<()> {
+        self.effective_table_config = TableConfiguration::try_new_from(
+            &self.effective_table_config,
+            None,
+            Some(protocol),
+            self.effective_table_config.version(),
+        )?;
+        self.should_emit_protocol = true;
+        Ok(())
     }
 }
 

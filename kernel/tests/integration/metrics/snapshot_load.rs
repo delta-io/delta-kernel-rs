@@ -13,11 +13,8 @@ use delta_kernel::arrow::array::Int32Array;
 use delta_kernel::committer::FileSystemCommitter;
 #[cfg(feature = "internal-api")]
 use delta_kernel::crc::Crc;
-use delta_kernel::engine::to_json_bytes;
 use delta_kernel::metrics::SnapshotLoadType;
-use delta_kernel::object_store::ObjectStoreExt as _;
 use delta_kernel::object_store::local::LocalFileSystem;
-use delta_kernel::object_store::path::Path;
 use delta_kernel::snapshot::IncrementalReplay;
 #[cfg(feature = "internal-api")]
 use delta_kernel::snapshot::{PublicationWatermark, SnapshotHint, SnapshotHintFreshness};
@@ -357,38 +354,20 @@ async fn snapshot_at_checkpoint_tip_emits_expected_metrics() -> delta_kernel::Re
 // Scenario 4: log compaction covering early commits + one tail commit
 // ============================================================================
 
-// TODO: migrate to TestTableBuilder when compaction LogState variants land (#2284)
-
 /// When early commits are covered by a compacted log file, the snapshot reports both
 /// the individual commit count and the compaction count. The JSON handler reads the
-/// compaction file and the tail commit in a single call (the minimal cover).
-// TODO(#2337): re-enable when log compaction is re-enabled
-#[ignore = "log compaction is temporarily disabled (#2337)"]
+/// tail commit before selecting the compaction file for older replay.
+
 #[tokio::test]
 async fn snapshot_with_log_compaction_emits_expected_metrics() -> delta_kernel::Result<()> {
     let table = TestTableBuilder::new()
-        .with_log_state(LogState::with_latest_version(2))
+        .with_log_state(LogState::with_latest_version(2).with_compaction_ranges([(0, 2)]))
         .with_schema(simple_schema())
         .with_data(1, 1)
         .build()?;
     let store = table.store().clone();
     let table_url = Url::parse(table.table_root()).unwrap();
     let setup_engine = Arc::new(DefaultEngineBuilder::new(store.clone()).build());
-
-    // Write a compacted log file covering versions 0-2 using the public API
-    let snap2 = Snapshot::builder_for(table.table_root()).build(setup_engine.as_ref())?;
-    let mut writer = snap2.log_compaction_writer(0, 2)?;
-    let compaction_url = writer.compaction_path().clone();
-    let batches: Vec<_> = writer
-        .compaction_data(setup_engine.as_ref())?
-        .collect::<KernelResult<Vec<_>>>()?;
-    let json_bytes = to_json_bytes(batches.into_iter().map(Ok))?;
-    let compaction_path = Path::from_url_path(compaction_url.path())
-        .map_err(|e| delta_kernel::KernelError::generic(e.to_string()))?;
-    store
-        .put(&compaction_path, json_bytes.into())
-        .await
-        .map_err(|e| delta_kernel::KernelError::generic(e.to_string()))?;
 
     // commit 3: tail commit after the compaction
     insert_rows(&table_url, &setup_engine, 3, 1).await?;
@@ -403,7 +382,10 @@ async fn snapshot_with_log_compaction_emits_expected_metrics() -> delta_kernel::
     assert_eq!(reporter.checkpoint_files.get(), 0);
     assert_eq!(reporter.compaction_files.get(), 1);
 
-    // find_commit_cover selects [3.json, 0.2.compacted.json] -- 2 JSON files, one read call
+    // AMT discovery reads 3.json before selecting 0.2.compacted.json for older replay.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    assert_eq!(reporter.json_read_calls.get(), 2);
+    #[cfg(not(feature = "adaptive-metadata-in-dev"))]
     assert_eq!(reporter.json_read_calls.get(), 1);
     assert_eq!(reporter.json_files_read.get(), 2);
     assert_eq!(reporter.parquet_read_calls.get(), 0);

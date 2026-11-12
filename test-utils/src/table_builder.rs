@@ -83,6 +83,8 @@ use delta_kernel_default_engine::executor::tokio::{
 };
 use delta_kernel_default_engine::{DefaultEngine, DefaultEngineBuilder};
 
+use crate::log_compaction::write_compaction_from_commits;
+
 // ===========================================================================
 // Sweep constants
 // ===========================================================================
@@ -192,6 +194,7 @@ pub struct LogState {
     latest_version: u64,
     /// Sorted ascending, distinct, all `<= latest_version`.
     checkpoints_at: Vec<u64>,
+    compactions: Vec<(u64, u64)>,
     /// Format applied to every checkpoint in `checkpoints_at`.
     checkpoint_format: CheckpointFormat,
     /// Sorted ascending, distinct, all `<= latest_version`. A `.crc` file is
@@ -210,6 +213,7 @@ impl LogState {
         Self {
             latest_version: n,
             checkpoints_at: Vec::new(),
+            compactions: Vec::new(),
             checkpoint_format: CheckpointFormat::Default,
             crcs_at: Vec::new(),
             cleanup_before: None,
@@ -239,6 +243,29 @@ impl LogState {
             self.checkpoints_at.push(v);
         }
         self.checkpoints_at.sort_unstable();
+        self
+    }
+
+    /// Add inclusive compaction ranges.
+    ///
+    /// Returns the updated log state. Ranges may overlap, but must be distinct.
+    /// The builder writes compactions before cleanup because they require the original commits.
+    ///
+    /// # Panics
+    /// Panics unless each range satisfies `start < end <= latest_version`, or on duplicates.
+    pub fn with_compaction_ranges(mut self, ranges: impl IntoIterator<Item = (u64, u64)>) -> Self {
+        for (start, end) in ranges {
+            assert!(
+                start < end && end <= self.latest_version,
+                "invalid compaction range"
+            );
+            assert!(
+                !self.compactions.contains(&(start, end)),
+                "duplicate compaction range"
+            );
+            self.compactions.push((start, end));
+        }
+        self.compactions.sort_unstable();
         self
     }
 
@@ -348,6 +375,22 @@ impl LogState {
 
 pub fn commits_only() -> LogState {
     LogState::with_latest_version(DEFAULT_SWEEP_LATEST_VERSION)
+}
+
+/// A compaction covering all commits.
+pub fn compaction_at_end() -> LogState {
+    commits_only().with_compaction_ranges([(0, DEFAULT_SWEEP_LATEST_VERSION)])
+}
+
+/// Compactions over `[2, 4]` and `[6, 8]`, with individual commits before, between, and after them.
+pub fn interior_compactions() -> LogState {
+    commits_only().with_compaction_ranges([(2, 4), (6, 8)])
+}
+
+/// A compaction after a checkpoint and CRC base, with cleaned-up earlier commits.
+pub fn compaction_after_checkpoint() -> LogState {
+    checkpoint_mid_crc_at_mid_post_cleanup()
+        .with_compaction_ranges([(DEFAULT_SWEEP_MID_VERSION + 1, DEFAULT_SWEEP_LATEST_VERSION)])
 }
 
 pub fn checkpoint_at_end() -> LogState {
@@ -482,6 +525,9 @@ impl fmt::Display for LogState {
         write!(f, "v={}", self.latest_version)?;
         for v in &self.checkpoints_at {
             write!(f, "+checkpoint_at({v})")?;
+        }
+        for (start, end) in &self.compactions {
+            write!(f, "+compaction({start}..={end})")?;
         }
         for v in &self.crcs_at {
             write!(f, "+crc_at({v})")?;
@@ -1367,6 +1413,10 @@ impl TestTableBuilder {
                     stale_hint_bytes = Some(read_hint_bytes(&store, &resolved_hint_path).await?);
                 }
             }
+        }
+
+        for &(start, end) in &self.log_state.compactions {
+            write_compaction_from_commits(table_root, store.as_ref(), start, end).await?;
         }
 
         match hint_state {

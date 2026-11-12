@@ -417,7 +417,7 @@ extern "C" fn count_hint_visits(context: NullableCvoid, _hint: *const FfiSnapsho
 }
 
 #[test]
-fn snapshot_hint_export_rejects_compaction_without_calling_visitor() {
+fn snapshot_hint_export_round_trips_compaction_paths() {
     let engine = test_engine();
     let paths = [
         FfiLogPath::new(
@@ -462,26 +462,8 @@ fn snapshot_hint_export_rejects_compaction_without_calling_visitor() {
     let snapshot: Handle<SharedSnapshot> = Arc::new(snapshot).into();
     unsafe { free_snapshot(source) };
 
-    let mut visits = 0usize;
-    let result = unsafe {
-        snapshot_to_snapshot_hint(
-            snapshot.shallow_copy(),
-            engine.shallow_copy(),
-            Some(NonNull::from(&mut visits).cast()),
-            count_hint_visits,
-        )
-    };
-    assert_extern_result_error_contains(
-        result,
-        FFIKernelError::InvalidSnapshotHint,
-        "log compaction",
-    );
-    assert_eq!(visits, 0);
-    assert_eq!(unsafe { snapshot.as_ref() }.version(), 1);
-    unsafe {
-        free_snapshot(snapshot);
-        free_engine(engine);
-    }
+    assert_exported_paths_and_round_trip(snapshot);
+    unsafe { free_engine(engine) };
 }
 
 struct CopiedHintPaths {
@@ -513,6 +495,7 @@ fn assert_exported_paths_and_round_trip(snapshot: Handle<SharedSnapshot>) {
         .checkpoint_parts
         .iter()
         .chain(&files.ascending_commit_files)
+        .chain(&files.ascending_compaction_files)
         .chain(files.latest_commit_file.iter())
         .chain(files.latest_crc_file.iter())
         .map(|path| {
@@ -1573,12 +1556,9 @@ fn aggregate_with_log_compaction_requires_individual_commits(#[case] complete: b
     let source = unsafe { snapshot.as_ref() };
     assert_eq!(source.version(), 1);
     assert_eq!(source.log_segment().listed.ascending_commit_files.len(), 2);
-    assert!(
-        source
-            .log_segment()
-            .listed
-            .ascending_compaction_files
-            .is_empty()
+    assert_eq!(
+        source.log_segment().listed.ascending_compaction_files.len(),
+        1
     );
     assert_eq!(
         unsafe {
