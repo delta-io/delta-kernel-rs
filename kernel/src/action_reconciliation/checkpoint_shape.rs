@@ -39,7 +39,13 @@ pub(crate) enum CheckpointType {
 /// How much checkpoint information the caller needs; this does not change snapshot cache state.
 #[derive(Clone, Copy, PartialEq)]
 enum DiscoveryMode {
-    Scan { needs_leaf_schema: bool },
+    /// Resolve scan inputs, stopping after the first sidecar batch.
+    Scan {
+        /// - `false`: resolve only the layout, without requesting the leaf schema.
+        /// - `true`: also resolve the leaf schema for statistics or structured partition values.
+        needs_leaf_schema: bool,
+    },
+    /// Resolve all sidecars, the leaf schema, and a portable hint for the checkpoint getter.
     Complete,
 }
 

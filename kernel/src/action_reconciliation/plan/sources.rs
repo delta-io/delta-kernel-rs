@@ -55,7 +55,8 @@ pub(crate) fn checkpoint_actions(
                     });
                     PlanBuilder::scan_parquet(sidecars, &[VERSION], schema.clone())
                 }
-                // Without a complete list, load the sidecars referenced by the manifest.
+                // Discover sidecars from the manifest at execution when no complete list is
+                // available.
                 None => {
                     sidecar_actions(file_type, parts.clone(), schema.clone(), &segment.log_root)
                 }
