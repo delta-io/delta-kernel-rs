@@ -168,7 +168,7 @@ fn uri_with_encoded_path(prefix: &str, raw_path: &str) -> Result<Url, ParseError
 ///
 /// An AMT path is raw: kernel percent-encodes it before parsing, so `%` and `\` are data and only
 /// a literal `.` or `..` segment navigates. A `file` value's `uri` is already percent-encoded, so
-/// `file_uri::validate_relative_uri` also checks decoded and `\`-separated segments.
+/// `file_uri::check_uri` also rejects `%2e` forms, `\`, and encoded separators.
 pub(crate) fn reject_dot_segments(path: &str) -> KernelResult<()> {
     require!(
         !path

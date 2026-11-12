@@ -21,13 +21,17 @@ const FILES_DIR: &str = "_files";
 /// the relative-path rule of Delta's Iceberg V4 metadata, itself following Iceberg V4's
 /// [relative paths specification]:
 ///
-/// - A `uri` with a URI scheme ([RFC 3986 section 3.1]) is absolute and is parsed as a [`Url`],
-///   which normalizes any `.` or `..` segments.
+/// - A `uri` with a URI scheme ([RFC 3986 section 3.1]) is absolute and is parsed as a [`Url`].
 /// - A `uri` without a scheme is relative and is joined onto `table_root` with a single `/`.
 ///   Against `s3://bucket/table/`, `_files/a.png` resolves to `s3://bucket/table/_files/a.png`.
 ///
 /// The `uri` is an RFC 3986 URI-reference and is not percent-encoded again: `_files/a%20b.png`
 /// names the object `_files/a b.png`.
+///
+/// Kernel supports ordinary relative paths and absolute URLs. It rejects the forms that URL
+/// parsing or an object store could interpret as a different path than the one written, so that
+/// such a `uri` fails here instead of silently resolving to another location. Other unusual URI
+/// forms, and storage-specific aliases of a location, are left to the connector.
 ///
 /// Only the location is computed: kernel does not check that bytes exist there, and whether they
 /// are accessible is up to the connector.
@@ -35,43 +39,35 @@ const FILES_DIR: &str = "_files";
 /// # Errors
 ///
 /// Returns an error if:
-/// - the `uri` contains a space or an ASCII control character, which a URI cannot contain and which
-///   URL parsing would otherwise drop or trim;
-/// - a relative `uri` has an empty path, or its path starts with `/` or `\`, which the
-///   relative-path rule does not allow;
-/// - a relative `uri` has a `.` or `..` path segment once its path is percent-decoded and split on
-///   `/` and `\`, as `_files/../a.png`, `_files/%2e%2e/a.png` and `_files/..%2fa.png` do. The
-///   relative-path rule does not support such navigation, and URL parsing or the object store would
-///   otherwise resolve it, possibly to a location outside the table root;
-/// - the resolved location fails to parse as a [`Url`].
+/// - the `uri` contains a space or an ASCII control character, which URL parsing drops or trims;
+/// - its path contains `\`, `%2F` or `%5C`, which URL parsing or an object store can treat as a
+///   path separator;
+/// - its path has a `.` or `..` segment, including `%2e` forms, which URL parsing or an object
+///   store would navigate;
+/// - an absolute `uri` fails to parse as a [`Url`];
+/// - a relative `uri` has an empty path or starts with `/`, which the relative-path rule does not
+///   allow, or `table_root` has a query or fragment, which would absorb the joined path.
 ///
 /// [relative paths specification]: https://iceberg.apache.org/spec/#paths-in-metadata
 /// [RFC 3986 section 3.1]: https://datatracker.ietf.org/doc/html/rfc3986#section-3.1
 pub fn resolve_file_uri(table_root: &Url, uri: &str) -> KernelResult<Url> {
-    validate_uri_chars(uri)
-        .map_err(|reason| KernelError::generic(format!("Invalid file uri {uri:?}: {reason}")))?;
-    if scheme_len(uri).is_some() {
-        return Url::parse(uri).map_err(|e| {
-            KernelError::generic(format!("Failed to parse absolute file uri {uri:?}: {e}"))
-        });
+    let unsupported =
+        |reason: &str| KernelError::generic(format!("Unsupported file uri {uri:?}: {reason}"));
+    match check_uri(uri).map_err(unsupported)? {
+        CheckedUri::Absolute(url) => Ok(url),
+        CheckedUri::Relative => {
+            // The `uri` is appended to the root's text, so a query or fragment there would absorb
+            // it.
+            require!(
+                table_root.query().is_none() && table_root.fragment().is_none(),
+                unsupported(&format!(
+                    "the table root {table_root} has a query or fragment"
+                ))
+            );
+            let base = with_trailing_slash(table_root);
+            Url::parse(&format!("{base}{uri}")).map_err(|e| unsupported(&e.to_string()))
+        }
     }
-    validate_relative_uri(uri).map_err(|reason| {
-        KernelError::generic(format!("Invalid relative file uri {uri:?}: {reason}"))
-    })?;
-    // The `uri` is appended to the root's text, so a query or fragment there would absorb it.
-    require!(
-        table_root.query().is_none() && table_root.fragment().is_none(),
-        KernelError::generic(format!(
-            "Cannot resolve relative file uri {uri:?} against table root {table_root}, which has \
-             a query or fragment"
-        ))
-    );
-    let base = with_trailing_slash(table_root);
-    Url::parse(&format!("{base}{uri}")).map_err(|e| {
-        KernelError::generic(format!(
-            "Failed to resolve relative file uri {uri:?} against table root {base}: {e}"
-        ))
-    })
 }
 
 /// A unique location for a new file that a `file` value references, created by
@@ -138,12 +134,13 @@ pub(crate) fn new_referenced_file_path(
 /// Returns the `uri` prefix, ending in `/`, under which a writer writes the files of new `file`
 /// references: `_files/` when `write_location` is `None`, a relative `write_location` with a
 /// trailing `/`, or the text of an absolute `write_location` parsed as a [`Url`] with a trailing
-/// `/`, which normalizes plain `.` and `..` segments.
+/// `/`.
 ///
 /// Per the `file` type protocol, a valid value is either a table-root-relative path under `_files`
 /// (`_files` itself, or `_files/<prefix>`) or an absolute URI outside the table root. A writer must
-/// not write files at any other value, so this returns an error for one. Whether an absolute URI is
-/// outside the table root is decided lexically; see [`is_within`].
+/// not write files at any other value, so this returns an error for one, and for a value that
+/// [`resolve_file_uri`] does not support. Whether an absolute URI is outside the table root is
+/// decided lexically; see [`is_within`].
 fn write_location_uri_prefix(
     table_root: &Url,
     write_location: Option<&str>,
@@ -156,150 +153,104 @@ fn write_location_uri_prefix(
             "Invalid {FILE_TYPE_WRITE_LOCATION} {value:?}: {reason}"
         ))
     };
-    validate_uri_chars(value).map_err(invalid)?;
     require!(
         !value.contains(['?', '#']),
         invalid("a write location cannot have a query or fragment")
     );
     let dir = value.strip_suffix('/').unwrap_or(value);
-    if scheme_len(value).is_some() {
-        // Parsing normalizes plain `.` and `..` segments, so the parsed location is what is
-        // checked, and its text is the prefix of the `uri`s written there.
-        let url = Url::parse(&format!("{dir}/")).map_err(|e| invalid(&e.to_string()))?;
-        require!(
-            !url.cannot_be_a_base(),
-            invalid("an absolute write location must be a hierarchical URI")
-        );
-        // A decoded `.` or `..` segment would navigate once a store or `to_file_path` decodes it,
-        // which could lead back inside the table root, so it is rejected before the comparison.
-        require!(
-            !decoded_segments(url.path())
-                .iter()
-                .any(|s| is_dot_segment(s)),
-            invalid("an absolute write location must not contain a '.' or '..' segment")
-        );
-        // Object stores cannot address an empty path segment, as in `s3://other//files`.
-        let segments = decoded_segments(url.path());
-        let interior = segments
-            .get(1..segments.len().saturating_sub(1))
-            .unwrap_or_default();
-        require!(
-            !interior.iter().any(String::is_empty),
-            invalid("an absolute write location cannot have an empty path segment")
-        );
-        require!(
-            !is_within(&url, table_root),
-            invalid("an absolute write location must be outside the table root")
-        );
-        Ok(url.into())
-    } else {
-        validate_relative_uri(value).map_err(invalid)?;
-        require!(
-            dir == FILES_DIR || dir.starts_with(&format!("{FILES_DIR}/")),
-            invalid("a relative write location must be under `_files`")
-        );
-        require!(
-            !dir.split('/').any(str::is_empty),
-            invalid("a relative write location cannot have an empty path segment")
-        );
-        Ok(format!("{dir}/"))
+    match check_uri(value).map_err(invalid)? {
+        CheckedUri::Absolute(_) => {
+            let url = Url::parse(&format!("{dir}/")).map_err(|e| invalid(&e.to_string()))?;
+            require!(
+                !url.cannot_be_a_base(),
+                invalid("an absolute write location must be a hierarchical URI")
+            );
+            require!(
+                !is_within(&url, table_root),
+                invalid("an absolute write location must be outside the table root")
+            );
+            Ok(url.into())
+        }
+        CheckedUri::Relative => {
+            require!(
+                dir == FILES_DIR || dir.starts_with(&format!("{FILES_DIR}/")),
+                invalid("a relative write location must be under `_files`")
+            );
+            require!(
+                !dir.split('/').any(str::is_empty),
+                invalid("a relative write location cannot have an empty path segment")
+            );
+            Ok(format!("{dir}/"))
+        }
     }
 }
 
-/// Checks that a writer may write `uri`: it is a `uri` that [`resolve_file_uri`] resolves, for any
-/// table root. The `file` type protocol requires a writer to write each `uri` as an absolute URI or
-/// as a relative reference resolved per its URI resolution rules.
+/// Checks that a writer may write `uri`: it is a `uri` that [`resolve_file_uri`] supports, for any
+/// table root without a query or fragment. The `file` type protocol requires a writer to write
+/// each `uri` as an absolute URI or as a relative reference resolved per its URI resolution rules.
 pub(crate) fn validate_file_uri(uri: &str) -> Result<(), &'static str> {
-    validate_uri_chars(uri)?;
-    if scheme_len(uri).is_some() {
-        Url::parse(uri).map_err(|_| "an absolute uri must parse as a URL")?;
-    } else {
-        validate_relative_uri(uri)?;
+    check_uri(uri).map(|_| ())
+}
+
+/// A `uri` that [`check_uri`] accepts.
+enum CheckedUri {
+    Absolute(Url),
+    Relative,
+}
+
+/// Checks `uri` against the forms [`resolve_file_uri`] supports, and parses it if it is absolute.
+/// See [`resolve_file_uri`] for the rules. Its path is the part before any `?` or `#`.
+///
+/// AMT paths are checked differently (see `amt_path_util::reject_dot_segments`): they are raw
+/// paths that kernel percent-encodes before parsing, so only a literal `.` or `..` segment
+/// navigates there.
+fn check_uri(uri: &str) -> Result<CheckedUri, &'static str> {
+    if uri.chars().any(|c| c == ' ' || c.is_ascii_control()) {
+        return Err("contains a space or an ASCII control character");
     }
-    Ok(())
+    let path = uri.split(['?', '#']).next().unwrap_or_default();
+    let lowercase = path.to_ascii_lowercase();
+    if path.contains('\\') || lowercase.contains("%2f") || lowercase.contains("%5c") {
+        return Err("its path contains '\\', '%2F' or '%5C', which can separate path segments");
+    }
+    if lowercase
+        .split('/')
+        .any(|segment| matches!(segment.replace("%2e", ".").as_str(), "." | ".."))
+    {
+        return Err("its path has a '.' or '..' segment");
+    }
+    if scheme_len(uri).is_some() {
+        return Url::parse(uri)
+            .map(CheckedUri::Absolute)
+            .map_err(|_| "an absolute uri must parse as a URL");
+    }
+    if path.is_empty() {
+        return Err("a relative uri must have a non-empty path");
+    }
+    if path.starts_with('/') {
+        return Err("a relative uri must not start with '/'");
+    }
+    Ok(CheckedUri::Relative)
 }
 
 /// Returns whether `url` is `table_root` or under it.
 ///
-/// The paths are percent-decoded before they are split on `/` and `\`, as object stores and
-/// `Url::to_file_path` decode them, and are then compared segment by segment. So an encoded
-/// spelling of the table root (`%74able` for `table`, or `table%2F_files` for `table/_files`)
-/// counts as inside it, but a sibling that only shares a name prefix (`table2`) does not.
-///
 /// The scheme and authority (`scheme://[userinfo@]host[:port]`) are compared as text, ignoring
-/// case. The check is lexical: it doesn't unify scheme aliases such as `s3` and `s3a`, a default
-/// port written out, or userinfo, so a location spelled with one of those counts as outside. Paths
-/// are compared case-sensitively and symlinks are not followed, so on a case-insensitive
-/// filesystem `file:///tmp/TABLE/x` also counts as outside `file:///tmp/table/`.
+/// case, and the paths segment by segment after percent-decoding each segment, so `%74able` for
+/// `table` counts as the table root, but a sibling that only shares a name prefix (`table2`) does
+/// not. The check is otherwise lexical: it doesn't unify scheme aliases such as `s3` and `s3a`, a
+/// default port written out, or userinfo, compares paths case-sensitively, and doesn't follow
+/// symlinks. A location spelled in one of those ways counts as outside.
 fn is_within(url: &Url, table_root: &Url) -> bool {
     let authority = |url: &Url| url[..Position::BeforePath].to_ascii_lowercase();
     let segments = |url: &Url| -> Vec<String> {
-        let mut segments = decoded_segments(url.path());
-        segments.retain(|segment| !segment.is_empty());
-        segments
+        url.path()
+            .split('/')
+            .filter(|segment| !segment.is_empty())
+            .map(|segment| percent_decode_str(segment).decode_utf8_lossy().into_owned())
+            .collect()
     };
     authority(url) == authority(table_root) && segments(url).starts_with(&segments(table_root))
-}
-
-/// Fails if `uri` contains a space or an ASCII control character, or a `%` that is not followed by
-/// two hex digits. A URI cannot contain either ([RFC 3986 section 2]). URL parsing removes tabs
-/// and newlines and trims leading and trailing spaces and controls, so the parsed location could
-/// differ from what was checked, and it keeps a malformed escape such as `%GG` as text.
-///
-/// [RFC 3986 section 2]: https://datatracker.ietf.org/doc/html/rfc3986#section-2
-fn validate_uri_chars(uri: &str) -> Result<(), &'static str> {
-    if uri.chars().any(|c| c == ' ' || c.is_ascii_control()) {
-        return Err("contains a space or an ASCII control character");
-    }
-    let bytes = uri.as_bytes();
-    let malformed_escape = bytes.iter().enumerate().any(|(i, &byte)| {
-        byte == b'%'
-            && !bytes
-                .get(i + 1..i + 3)
-                .is_some_and(|hex| hex.iter().all(u8::is_ascii_hexdigit))
-    });
-    if malformed_escape {
-        return Err("contains a '%' that is not followed by two hex digits");
-    }
-    Ok(())
-}
-
-/// Fails if the relative reference `uri` breaks the relative-path rule: its path (before any `?`
-/// or `#`) is empty, starts with `/` or `\`, or has a `.` or `..` segment.
-///
-/// The `uri` is already percent-encoded, and URL parsing and object stores decode it, so segments
-/// are checked after percent-decoding the path: `%2e` is a `.`, and `%2f` and `%5c` separate
-/// segments. Segments are split on `/` and also on `\`, which URL parsing treats as `/` for some
-/// schemes. AMT paths are checked differently (see `amt_path_util::reject_dot_segments`) because
-/// they are raw paths that kernel percent-encodes before parsing, so only a literal `.` or `..`
-/// segment navigates.
-fn validate_relative_uri(uri: &str) -> Result<(), &'static str> {
-    let path = uri.split(['?', '#']).next().unwrap_or_default();
-    if path.is_empty() {
-        return Err("a relative uri must have a non-empty path");
-    }
-    if path.starts_with(['/', '\\']) {
-        return Err("a relative uri must not start with '/' or '\\'");
-    }
-    if decoded_segments(path).iter().any(|s| is_dot_segment(s)) {
-        return Err("a relative uri must not contain a '.' or '..' segment");
-    }
-    Ok(())
-}
-
-/// Returns the segments of a URL `path` once it is percent-decoded and split on `/` and `\`, as
-/// object stores and `Url::to_file_path` see them: `%2e` is a `.`, and `%2f` and `%5c` separate
-/// segments. Empty segments are kept.
-fn decoded_segments(path: &str) -> Vec<String> {
-    percent_decode_str(path)
-        .decode_utf8_lossy()
-        .split(['/', '\\'])
-        .map(str::to_owned)
-        .collect()
-}
-
-fn is_dot_segment(segment: &str) -> bool {
-    segment == "." || segment == ".."
 }
 
 #[cfg(test)]
@@ -344,23 +295,16 @@ mod tests {
         "2024:01/a.png",
         "s3://bucket/table/2024:01/a.png"
     )]
-    // An encoded `/` is accepted when it adds no `.` or `..` segment. Object stores decode it, so
-    // this names `_files/a/b.png`, still under the table root.
-    #[case::encoded_slash(
-        "s3://bucket/table/",
-        "_files/a%2Fb.png",
-        "s3://bucket/table/_files/a%2Fb.png"
-    )]
     #[case::query(
         "s3://bucket/table/",
         "_files/a.png?v=1",
         "s3://bucket/table/_files/a.png?v=1"
     )]
-    // A `.` or `..` after `?` or `#` is not a path segment.
+    // Only the path is checked, so dots and encoded separators after `?` or `#` are allowed.
     #[case::dots_in_query(
         "s3://bucket/table/",
-        "_files/a.png?p=../x",
-        "s3://bucket/table/_files/a.png?p=../x"
+        "_files/a.png?p=../x%2F",
+        "s3://bucket/table/_files/a.png?p=../x%2F"
     )]
     #[case::dots_in_fragment(
         "s3://bucket/table/",
@@ -383,64 +327,68 @@ mod tests {
         "https://example.com/a.png",
         "https://example.com/a.png"
     )]
-    // The relative-path rule applies only to relative `uri`s; parsing normalizes an absolute one.
-    #[case::absolute_with_dot_segment(
-        "s3://bucket/table/",
-        "s3://bucket/x/../a.png",
-        "s3://bucket/a.png"
+    // An absolute `uri` doesn't use the table root, so a root with a query is fine.
+    #[case::absolute_with_query_root(
+        "s3://bucket/table/?token=x",
+        "s3://other/a.png",
+        "s3://other/a.png"
     )]
     fn test_resolve_file_uri(#[case] root: &str, #[case] uri: &str, #[case] expected: &str) {
         let root = Url::parse(root).unwrap();
         assert_eq!(resolve_file_uri(&root, uri).unwrap().as_str(), expected);
     }
 
+    const CONTROL: &str = "space or an ASCII control character";
+    const SEPARATOR: &str = "'%2F' or '%5C'";
+    const DOT: &str = "'.' or '..' segment";
+
     #[rstest]
-    #[case::dot(".", "'.' or '..' segment")]
-    #[case::dot_dot("..", "'.' or '..' segment")]
-    #[case::leading_dot("./a.png", "'.' or '..' segment")]
-    #[case::parent("../other/a.png", "'.' or '..' segment")]
-    #[case::inner_parent("_files/../../a.png", "'.' or '..' segment")]
-    #[case::inner_dot("_files/./a.png", "'.' or '..' segment")]
-    #[case::trailing_parent("_files/..", "'.' or '..' segment")]
-    #[case::encoded_parent("_files/%2e%2e/a.png", "'.' or '..' segment")]
-    #[case::encoded_parent_upper("_files/%2E%2E/a.png", "'.' or '..' segment")]
-    #[case::mixed_encoded_parent("_files/.%2e/a.png", "'.' or '..' segment")]
-    #[case::encoded_dot("_files/%2e/a.png", "'.' or '..' segment")]
-    #[case::backslash_parent("_files\\..\\a.png", "'.' or '..' segment")]
-    // Object stores decode `%2f` and `%5c`, which then separate a `..` segment.
-    #[case::encoded_slash_parent("_files/%2e%2e%2f%2e%2e%2fsecret", "'.' or '..' segment")]
-    #[case::encoded_slash_upper_parent("_files/..%2F..%2Fsecret", "'.' or '..' segment")]
-    #[case::encoded_backslash_parent("_files/.%2e%5csecret", "'.' or '..' segment")]
-    #[case::encoded_slash_after_parent(".%2e%2Fsecret", "'.' or '..' segment")]
-    #[case::parent_before_query("../a.png?x=1", "'.' or '..' segment")]
+    // URL parsing drops tabs and newlines and trims spaces.
+    #[case::tab_in_parent("_files/.\t./a.png", CONTROL)]
+    #[case::newline_in_parent(".\n./a.png", CONTROL)]
+    #[case::carriage_return("_files/.\r./a.png", CONTROL)]
+    #[case::trailing_space("..  ", CONTROL)]
+    #[case::inner_space("_files/a b.png", CONTROL)]
+    #[case::nul("_files/a\0.png", CONTROL)]
+    #[case::absolute_with_tab("s3://bucket/x/.\t./a.png", CONTROL)]
+    // URL parsing or an object store can treat these as separators.
+    #[case::backslash("_files\\a.png", SEPARATOR)]
+    #[case::leading_backslash("\\a.png", SEPARATOR)]
+    #[case::encoded_slash("_files/a%2Fb.png", SEPARATOR)]
+    #[case::encoded_slash_lower("_files/a%2fb.png", SEPARATOR)]
+    #[case::encoded_backslash("_files/a%5Cb.png", SEPARATOR)]
+    #[case::encoded_slash_parent("_files/%2e%2e%2fsecret", SEPARATOR)]
+    #[case::absolute_encoded_slash("s3://bucket/a%2Fb.png", SEPARATOR)]
+    // Dot navigation, literal or `%2e`-encoded.
+    #[case::dot(".", DOT)]
+    #[case::dot_dot("..", DOT)]
+    #[case::leading_dot("./a.png", DOT)]
+    #[case::parent("../other/a.png", DOT)]
+    #[case::inner_parent("_files/../../a.png", DOT)]
+    #[case::inner_dot("_files/./a.png", DOT)]
+    #[case::trailing_parent("_files/..", DOT)]
+    #[case::encoded_parent("_files/%2e%2e/a.png", DOT)]
+    #[case::encoded_parent_upper("_files/%2E%2E/a.png", DOT)]
+    #[case::mixed_encoded_parent("_files/.%2e/a.png", DOT)]
+    #[case::encoded_dot("_files/%2e/a.png", DOT)]
+    #[case::parent_before_query("../a.png?x=1", DOT)]
+    #[case::absolute_parent("s3://bucket/x/../a.png", DOT)]
+    #[case::absolute_encoded_parent("s3://bucket/x/%2e%2e/a.png", DOT)]
+    // The relative-path rule.
     #[case::leading_slash("/a.png", "must not start with '/'")]
     #[case::leading_double_slash("//host/a.png", "must not start with '/'")]
-    #[case::leading_backslash("\\a.png", "must not start with '/'")]
     #[case::empty("", "non-empty path")]
     #[case::only_query("?x", "non-empty path")]
     #[case::only_fragment("#x", "non-empty path")]
-    // URL parsing drops tabs and newlines and trims spaces, which would turn these into `..`.
-    #[case::tab_in_parent("_files/.\t./a.png", "space or an ASCII control character")]
-    #[case::newline_in_parent(".\n./a.png", "space or an ASCII control character")]
-    #[case::carriage_return("_files/.\r./a.png", "space or an ASCII control character")]
-    #[case::tab_in_encoded_parent("%2\te%2\te/a.png", "space or an ASCII control character")]
-    #[case::trailing_space("..  ", "space or an ASCII control character")]
-    #[case::inner_space("_files/a b.png", "space or an ASCII control character")]
-    #[case::nul("_files/a\0.png", "space or an ASCII control character")]
-    #[case::malformed_escape("_files/a%GG.png", "'%' that is not followed by two hex digits")]
-    #[case::truncated_escape("_files/a%2", "'%' that is not followed by two hex digits")]
-    #[case::absolute_malformed_escape(
-        "s3://bucket/a%GG.png",
-        "'%' that is not followed by two hex digits"
-    )]
-    #[case::absolute_with_tab("s3://bucket/x/.\t./a.png", "space or an ASCII control character")]
+    #[case::unparseable_absolute("http://[bad/a.png", "must parse as a URL")]
     fn test_resolve_file_uri_rejects(#[case] uri: &str, #[case] reason: &str) {
         let err = resolve_file_uri(&root(), uri).unwrap_err().to_string();
+        assert!(err.contains("Unsupported file uri"), "{err}");
         assert!(err.contains(reason), "{err}");
     }
 
     /// A relative `uri` cannot be joined onto a table root with a query or fragment, which would
-    /// absorb it; an absolute `uri` doesn't use the root.
+    /// absorb it.
     #[rstest]
     #[case::query("s3://bucket/table/?token=x")]
     #[case::fragment("s3://bucket/table/#f")]
@@ -454,20 +402,27 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("query or fragment"), "{err}");
-        assert_eq!(
-            resolve_file_uri(&root, "s3://other/a.png")
-                .unwrap()
-                .as_str(),
-            "s3://other/a.png"
-        );
     }
 
-    #[test]
-    fn test_resolve_file_uri_rejects_unparseable_absolute_uri() {
-        let err = resolve_file_uri(&root(), "http://[bad/a.png")
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("Failed to parse absolute file uri"), "{err}");
+    /// Writes accept exactly the `uri`s that resolution accepts.
+    #[rstest]
+    #[case("_files/a.png")]
+    #[case("s3://other/a.png")]
+    #[case("_files/a.png?p=../x")]
+    #[case("")]
+    #[case("/a.png")]
+    #[case("\\a.png")]
+    #[case("_files/../a.png")]
+    #[case("_files/a%2Fb.png")]
+    #[case("_files/.\t./a.png")]
+    #[case("s3://bucket/x/../a.png")]
+    #[case("http://[bad/a.png")]
+    fn test_validate_file_uri_matches_resolve_file_uri(#[case] uri: &str) {
+        assert_eq!(
+            validate_file_uri(uri).is_ok(),
+            resolve_file_uri(&root(), uri).is_ok(),
+            "{uri:?}"
+        );
     }
 
     #[rstest]
@@ -487,8 +442,6 @@ mod tests {
     #[case::absolute_scheme_alias(Some("s3a://bucket/table/p1"), "s3a://bucket/table/p1/")]
     #[case::absolute_userinfo(Some("s3://user@bucket/table/p1"), "s3://user@bucket/table/p1/")]
     #[case::absolute_port(Some("s3://bucket:443/table/p1"), "s3://bucket:443/table/p1/")]
-    // The prefix is the parsed location, which normalizes plain `.` and `..` segments.
-    #[case::absolute_normalized(Some("s3://other/x/%2e/../files"), "s3://other/files/")]
     fn test_write_location_uri_prefix(#[case] value: Option<&str>, #[case] expected: &str) {
         assert_eq!(write_location_uri_prefix(&root(), value).unwrap(), expected);
     }
@@ -499,10 +452,11 @@ mod tests {
     #[case::relative_files_wrong_case("_FILES/p1", "must be under `_files`")]
     #[case::relative_empty("", "non-empty path")]
     #[case::relative_leading_slash("/_files/p1", "must not start with '/'")]
-    #[case::relative_parent("_files/../p1", "'.' or '..' segment")]
+    #[case::relative_parent("_files/../p1", DOT)]
+    #[case::relative_encoded_slash("_files%2Fp1", SEPARATOR)]
     #[case::relative_empty_segment("_files//p1", "empty path segment")]
     #[case::relative_trailing_double_slash("_files//", "empty path segment")]
-    #[case::relative_space("_files/a b", "space or an ASCII control character")]
+    #[case::relative_space("_files/a b", CONTROL)]
     #[case::relative_query("_files/p1?x", "query or fragment")]
     #[case::absolute_table_root("s3://bucket/table", "outside the table root")]
     #[case::absolute_table_root_with_slash("s3://bucket/table/", "outside the table root")]
@@ -510,21 +464,11 @@ mod tests {
     // An encoded spelling of the table root, or a differently-cased scheme, is still the root.
     #[case::absolute_encoded_table_root("s3://bucket/%74able/p1", "outside the table root")]
     #[case::absolute_upper_case_scheme("S3://bucket/table/p1", "outside the table root")]
-    // An encoded `/` that joins the table root with its subdirectory is still inside the root.
-    #[case::absolute_encoded_slash_upper("s3://bucket/table%2F_files/p1", "outside the table root")]
-    #[case::absolute_encoded_slash_lower("s3://bucket/table%2f_files/p1", "outside the table root")]
-    #[case::absolute_encoded_backslash("s3://bucket/table%5C_files/p1", "outside the table root")]
-    // A `..` that appears only after decoding could lead back inside the table root.
-    #[case::absolute_encoded_parent("s3://bucket/x%2F..%2Ftable/p1", "'.' or '..' segment")]
-    #[case::absolute_encoded_backslash_parent(
-        "s3://bucket/x%5C..%5Ctable/p1",
-        "'.' or '..' segment"
-    )]
-    // Parsing collapses a plain `..`, so this is the table root's `p1`.
-    #[case::absolute_parent_into_table_root("s3://bucket/x/../table/p1", "outside the table root")]
+    // Encoded separators and dot navigation could lead back inside the table root.
+    #[case::absolute_encoded_slash("s3://bucket/table%2F_files/p1", SEPARATOR)]
+    #[case::absolute_encoded_backslash("s3://bucket/table%5C_files/p1", SEPARATOR)]
+    #[case::absolute_parent("s3://bucket/x/../table/p1", DOT)]
     #[case::absolute_fragment("s3://other/files#x", "query or fragment")]
-    #[case::absolute_empty_segment("s3://other//files", "empty path segment")]
-    #[case::absolute_malformed_escape("s3://other/a%GG", "two hex digits")]
     #[case::absolute_not_hierarchical("mailto:files@example.com", "hierarchical URI")]
     fn test_write_location_uri_prefix_rejects(#[case] value: &str, #[case] reason: &str) {
         let err = write_location_uri_prefix(&root(), Some(value))
@@ -532,47 +476,6 @@ mod tests {
             .to_string();
         assert!(err.contains("delta.fileType.writeLocation"), "{err}");
         assert!(err.contains(reason), "{err}");
-    }
-
-    /// On a local table, `Url::to_file_path` decodes an absolute write location, so an encoded `/`
-    /// can name the table root, and an encoded `..` can lead back into it.
-    #[rstest]
-    #[case::encoded_slash("file:///tmp%2Ftable/x", "outside the table root")]
-    #[case::encoded_parent("file:///tmp/outside/..%2Ftable/references", "'.' or '..' segment")]
-    fn test_write_location_uri_prefix_rejects_encoded_local_table_root(
-        #[case] value: &str,
-        #[case] reason: &str,
-    ) {
-        let root = Url::parse("file:///tmp/table/").unwrap();
-        let err = write_location_uri_prefix(&root, Some(value))
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains(reason), "{err}");
-    }
-
-    /// Writes accept exactly the `uri`s that resolution accepts.
-    #[rstest]
-    #[case("_files/a.png")]
-    #[case("_files/a%2Fb.png")]
-    #[case("s3://other/a.png")]
-    #[case("s3://bucket/x/../a.png")]
-    #[case("")]
-    #[case("?x")]
-    #[case("/a.png")]
-    #[case("\\a.png")]
-    #[case("_files/../a.png")]
-    #[case("_files/..%2fa.png")]
-    #[case("_files/.\t./a.png")]
-    #[case("_files/a b.png")]
-    #[case("http://[bad/a.png")]
-    #[case("_files/a%GG.png")]
-    #[case("s3://bucket/a%GG.png")]
-    fn test_validate_file_uri_matches_resolve_file_uri(#[case] uri: &str) {
-        assert_eq!(
-            validate_file_uri(uri).is_ok(),
-            resolve_file_uri(&root(), uri).is_ok(),
-            "{uri:?}"
-        );
     }
 
     #[rstest]
