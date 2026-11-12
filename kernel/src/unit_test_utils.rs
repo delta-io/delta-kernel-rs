@@ -168,6 +168,28 @@ use crate::schema::{
 #[cfg(feature = "geo-type-in-dev")]
 use crate::schema::{EdgeInterpolationAlgorithm, GeographyType, GeometryType, PrimitiveType};
 
+/// Create a simple Add action with the specified path (no stats)
+pub(crate) fn create_add_action(path: &str) -> Action {
+    Action::Add(Add {
+        path: path.into(),
+        data_change: true,
+        ..Default::default()
+    })
+}
+
+/// Create a Remove action with the specified path
+///
+/// The remove action has deletion_timestamp set to i64::MAX to ensure the
+/// remove action is not considered expired during testing.
+pub(crate) fn create_remove_action(path: &str) -> Action {
+    Action::Remove(Remove {
+        path: path.into(),
+        data_change: true,
+        deletion_timestamp: Some(i64::MAX), // Ensure the remove action is not expired
+        ..Default::default()
+    })
+}
+
 /// A mock table that writes commits to a local temporary delta log. This can be used to
 /// construct a delta log used for testing.
 pub(crate) struct LocalMockTable {
