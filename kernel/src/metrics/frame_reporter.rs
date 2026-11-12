@@ -93,6 +93,9 @@ mod tests {
     use super::*;
     use crate::Snapshot;
     use crate::engine::sync::SyncEngine;
+    use crate::history_manager::{
+        HistoryCommitType, first_version_after, get_earliest_commit, latest_version_as_of,
+    };
     use crate::metrics::events::SNAPSHOT_COMPLETED_SPAN;
     use crate::unit_test_utils::{copy_test_table, load_test_table};
 
@@ -343,6 +346,55 @@ mod tests {
                 "log_seg.load_p_m",
             ],
         );
+    }
+
+    #[rstest::rstest]
+    fn history_lookups_report_balanced_frames(#[values(false, true)] fail: bool) {
+        let (engine, snapshot, _tempdir) = load_test_table("table-without-dv-small").unwrap();
+        let events = capture(|| {
+            assert_eq!(
+                latest_version_as_of(
+                    &snapshot,
+                    engine.as_ref(),
+                    if fail { i64::MIN } else { i64::MAX },
+                    HistoryCommitType::Published,
+                )
+                .is_err(),
+                fail,
+            );
+            assert_eq!(
+                first_version_after(
+                    &snapshot,
+                    engine.as_ref(),
+                    if fail { i64::MAX } else { 0 },
+                    HistoryCommitType::Published,
+                )
+                .is_err(),
+                fail,
+            );
+            let log_root = snapshot
+                .table_root()
+                .join(if fail { "missing_log/" } else { "_delta_log/" })
+                .unwrap();
+            assert_eq!(
+                get_earliest_commit(
+                    engine.as_ref(),
+                    &log_root,
+                    None,
+                    HistoryCommitType::Published
+                )
+                .is_err(),
+                fail,
+            );
+        });
+        let callstacks = entered_callstacks(&events);
+        for name in [
+            "latest_version_as_of",
+            "first_version_after",
+            "get_earliest_commit",
+        ] {
+            assert_contains_callstack(&callstacks, &[name]);
+        }
     }
 
     #[test]
