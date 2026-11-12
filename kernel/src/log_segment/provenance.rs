@@ -3,7 +3,7 @@ use crate::actions::CHECKPOINT_METADATA_NAME;
 use crate::error::SnapshotHintError;
 use crate::last_checkpoint_hint::LastCheckpointHint;
 use crate::path::{LogPathFileType, ParsedLogPath};
-use crate::snapshot::CheckpointType;
+use crate::snapshot::SelectedCheckpointType;
 use crate::{KernelResult, Version};
 
 impl LogSegment {
@@ -13,12 +13,12 @@ impl LogSegment {
         self.checkpoint.map(|checkpoint| checkpoint.version)
     }
 
-    pub(crate) fn checkpoint_type(&self) -> Option<CheckpointType> {
+    pub(crate) fn checkpoint_type(&self) -> Option<SelectedCheckpointType> {
         self.checkpoint.map(|checkpoint| checkpoint.checkpoint_type)
     }
 
     pub(crate) fn inherit_checkpoint_provenance(&mut self, previous: &Self) {
-        if self.checkpoint_type() == Some(CheckpointType::Unresolved)
+        if self.checkpoint_type() == Some(SelectedCheckpointType::Unresolved)
             && self
                 .listed
                 .checkpoint_parts
@@ -36,14 +36,14 @@ impl LogSegment {
 
     pub(crate) fn with_checkpoint_type(
         mut self,
-        checkpoint_type: Option<CheckpointType>,
+        checkpoint_type: Option<SelectedCheckpointType>,
     ) -> KernelResult<Self> {
         if let Some(checkpoint_type) = checkpoint_type {
             let Some(checkpoint) = self.checkpoint.as_mut() else {
                 return Err(SnapshotHintError::CheckpointProvenanceConflict.into());
             };
-            if checkpoint_type != CheckpointType::Unresolved {
-                if checkpoint.checkpoint_type != CheckpointType::Unresolved
+            if checkpoint_type != SelectedCheckpointType::Unresolved {
+                if checkpoint.checkpoint_type != SelectedCheckpointType::Unresolved
                     && checkpoint.checkpoint_type != checkpoint_type
                 {
                     return Err(SnapshotHintError::CheckpointProvenanceConflict.into());
@@ -58,17 +58,17 @@ impl LogSegment {
 impl SelectedCheckpoint {
     pub(super) fn from_path(path: &ParsedLogPath, hint: Option<&LastCheckpointHint>) -> Self {
         let checkpoint_type = match &path.file_type {
-            LogPathFileType::MultiPartCheckpoint { .. } => CheckpointType::V1,
-            LogPathFileType::UuidCheckpoint => CheckpointType::V2,
+            LogPathFileType::MultiPartCheckpoint { .. } => SelectedCheckpointType::V1,
+            LogPathFileType::UuidCheckpoint => SelectedCheckpointType::V2,
             _ => {
                 let hint = hint.filter(|hint| hint.applies_to(std::slice::from_ref(path)));
                 if hint
                     .and_then(|hint| hint.checkpoint_schema.as_ref())
                     .is_some_and(|schema| !schema.contains(CHECKPOINT_METADATA_NAME))
                 {
-                    CheckpointType::V1
+                    SelectedCheckpointType::V1
                 } else {
-                    CheckpointType::Unresolved
+                    SelectedCheckpointType::Unresolved
                 }
             }
         };
@@ -121,19 +121,19 @@ mod tests {
     #[case("00000000000000000000.json", None)]
     #[case(
         "00000000000000000000.checkpoint.parquet",
-        Some(CheckpointType::Unresolved)
+        Some(SelectedCheckpointType::Unresolved)
     )]
     #[case(
         "00000000000000000000.checkpoint.0000000001.0000000002.parquet",
-        Some(CheckpointType::V1)
+        Some(SelectedCheckpointType::V1)
     )]
     #[case(
         "00000000000000000000.checkpoint.550e8400-e29b-41d4-a716-446655440000.parquet",
-        Some(CheckpointType::V2)
+        Some(SelectedCheckpointType::V2)
     )]
     fn checkpoint_filename_evidence(
         #[case] filename: &str,
-        #[case] expected: Option<CheckpointType>,
+        #[case] expected: Option<SelectedCheckpointType>,
     ) {
         // Given a commit or checkpoint path with no additional type claim.
         let segment = segment(filename);
@@ -144,18 +144,22 @@ mod tests {
     }
 
     #[rstest::rstest]
-    #[case::same_unresolved(false, CheckpointType::Unresolved, CheckpointType::V2)]
-    #[case::same_resolved(false, CheckpointType::V1, CheckpointType::V1)]
-    #[case::different_checkpoint(true, CheckpointType::Unresolved, CheckpointType::Unresolved)]
+    #[case::same_unresolved(false, SelectedCheckpointType::Unresolved, SelectedCheckpointType::V2)]
+    #[case::same_resolved(false, SelectedCheckpointType::V1, SelectedCheckpointType::V1)]
+    #[case::different_checkpoint(
+        true,
+        SelectedCheckpointType::Unresolved,
+        SelectedCheckpointType::Unresolved
+    )]
     fn derived_segment_retains_checkpoint_provenance_without_mutating_source(
         #[case] different_checkpoint: bool,
-        #[case] new_type: CheckpointType,
-        #[case] expected: CheckpointType,
+        #[case] new_type: SelectedCheckpointType,
+        #[case] expected: SelectedCheckpointType,
     ) {
         // Given a resolved source checkpoint and a derived segment's own type claim.
         let filename = "00000000000000000000.checkpoint.parquet";
         let source = segment(filename)
-            .with_checkpoint_type(Some(CheckpointType::V2))
+            .with_checkpoint_type(Some(SelectedCheckpointType::V2))
             .unwrap();
         let mut derived = segment(filename)
             .with_checkpoint_type(Some(new_type))
@@ -170,24 +174,24 @@ mod tests {
         derived.inherit_checkpoint_provenance(&source);
         // Then only an unresolved claim for the same checkpoint inherits the source's type.
         assert_eq!(derived.checkpoint_type(), Some(expected));
-        assert_eq!(source.checkpoint_type(), Some(CheckpointType::V2));
+        assert_eq!(source.checkpoint_type(), Some(SelectedCheckpointType::V2));
     }
 
     #[rstest::rstest]
-    #[case("00000000000000000000.json", CheckpointType::Unresolved)]
-    #[case("00000000000000000000.json", CheckpointType::V1)]
-    #[case("00000000000000000000.json", CheckpointType::V2)]
+    #[case("00000000000000000000.json", SelectedCheckpointType::Unresolved)]
+    #[case("00000000000000000000.json", SelectedCheckpointType::V1)]
+    #[case("00000000000000000000.json", SelectedCheckpointType::V2)]
     #[case(
         "00000000000000000000.checkpoint.0000000001.0000000002.parquet",
-        CheckpointType::V2
+        SelectedCheckpointType::V2
     )]
     #[case(
         "00000000000000000000.checkpoint.550e8400-e29b-41d4-a716-446655440000.parquet",
-        CheckpointType::V1
+        SelectedCheckpointType::V1
     )]
     fn checkpoint_type_rejects_inconsistent_claims(
         #[case] filename: &str,
-        #[case] checkpoint_type: CheckpointType,
+        #[case] checkpoint_type: SelectedCheckpointType,
     ) {
         // Given a path whose checkpoint presence or filename contradicts the supplied type.
         let segment = segment(filename);

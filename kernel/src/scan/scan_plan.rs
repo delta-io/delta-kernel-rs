@@ -270,7 +270,7 @@ mod tests {
             checkpoint: checkpoint_parts.first().map(|path| {
                 crate::log_segment::SelectedCheckpoint {
                     version: path.version,
-                    checkpoint_type: crate::snapshot::CheckpointType::Unresolved,
+                    checkpoint_type: crate::snapshot::SelectedCheckpointType::Unresolved,
                 }
             }),
             log_root,

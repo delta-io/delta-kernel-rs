@@ -765,7 +765,7 @@ pub struct FfiSnapshotHint {
     pub last_checkpoint: *const FfiLastCheckpoint,
     pub crc: *const FfiCrc,
     pub publication_watermark: FfiPublicationWatermark,
-    pub checkpoint_type: OptionalValue<FfiCheckpointType>,
+    pub checkpoint_type: OptionalValue<FfiSelectedCheckpointType>,
     pub crc_provenance: OptionalValue<FfiCrcProvenance>,
 }
 

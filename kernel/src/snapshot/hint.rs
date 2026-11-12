@@ -12,7 +12,7 @@ use crate::log_path::LogPath;
 use crate::log_segment::{LogSegment, validate_catalog_version_bounds};
 use crate::log_segment_files::{CheckpointHandling, LogSegmentFiles};
 use crate::path::{DELTA_LOG_DIR_WITH_SLASH, ParsedLogPath};
-use crate::snapshot::{CheckpointType, CrcProvenance, IncrementalReplay, SnapshotRef};
+use crate::snapshot::{CrcProvenance, IncrementalReplay, SelectedCheckpointType, SnapshotRef};
 use crate::table_configuration::TableConfiguration;
 use crate::utils::{require, try_parse_uri};
 use crate::{KernelError, KernelResult, Snapshot, Version};
@@ -89,7 +89,7 @@ pub(crate) struct SnapshotHint {
     crc: Option<Arc<Crc>>,
     /// Whether `version` was established as latest when the hint was captured.
     freshness: SnapshotHintFreshness,
-    provenance: Option<(Option<CheckpointType>, CrcProvenance)>,
+    provenance: Option<(Option<SelectedCheckpointType>, CrcProvenance)>,
 }
 
 impl SnapshotHint {
@@ -133,7 +133,7 @@ impl SnapshotHint {
         last_checkpoint_hint: Option<LastCheckpointHint>,
         crc: Option<Arc<Crc>>,
         freshness: SnapshotHintFreshness,
-        provenance: Option<(Option<CheckpointType>, CrcProvenance)>,
+        provenance: Option<(Option<SelectedCheckpointType>, CrcProvenance)>,
     ) -> KernelResult<Self> {
         let log_root = try_parse_uri(table_root)?.join(DELTA_LOG_DIR_WITH_SLASH)?;
         let mut parsed_paths: Vec<ParsedLogPath> = log_paths.into_iter().map(Into::into).collect();
@@ -172,7 +172,7 @@ impl SnapshotHint {
     /// Returns retained observations, if supplied or captured from a snapshot.
     #[internal_api]
     #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
-    pub(crate) fn provenance(&self) -> Option<(Option<CheckpointType>, CrcProvenance)> {
+    pub(crate) fn provenance(&self) -> Option<(Option<SelectedCheckpointType>, CrcProvenance)> {
         self.provenance
     }
 

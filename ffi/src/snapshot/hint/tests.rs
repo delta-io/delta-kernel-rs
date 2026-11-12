@@ -14,7 +14,8 @@ use delta_kernel::last_checkpoint_hint::{LastCheckpointHint, LastCheckpointV2};
 use delta_kernel::log_segment::LogSegment;
 use delta_kernel::path::{LogPathFileType, ParsedLogPath};
 use delta_kernel::snapshot::{
-    CheckpointType, CrcProvenance, CrcSource, IncrementalReplay, PublicationWatermark, Snapshot,
+    CrcProvenance, CrcSource, IncrementalReplay, PublicationWatermark, SelectedCheckpointType,
+    Snapshot,
 };
 use delta_kernel::{FileMeta, FileSlice, KernelResult, KernelResultIterator, StorageHandler};
 use test_utils::table_builder::{LogState, TestTableBuilder};
@@ -362,15 +363,25 @@ fn metadata_visit_preserves_original_schema_json_and_does_not_consume_snapshot()
     Some(CrcSource::AtVersion),
     Some(2),
     Some(2),
-    Some(CheckpointType::Unresolved)
+    Some(SelectedCheckpointType::Unresolved)
 )]
-#[case::v1(Some(CrcSource::AtVersion), Some(2), Some(2), Some(CheckpointType::V1))]
-#[case::v2(Some(CrcSource::AtVersion), Some(2), Some(2), Some(CheckpointType::V2))]
+#[case::v1(
+    Some(CrcSource::AtVersion),
+    Some(2),
+    Some(2),
+    Some(SelectedCheckpointType::V1)
+)]
+#[case::v2(
+    Some(CrcSource::AtVersion),
+    Some(2),
+    Some(2),
+    Some(SelectedCheckpointType::V2)
+)]
 fn exported_hint_copy_outlives_snapshot_and_preserves_state(
     #[case] source: Option<CrcSource>,
     #[case] base_version: Option<u64>,
     #[case] crc_version: Option<u64>,
-    #[case] checkpoint_type: Option<CheckpointType>,
+    #[case] checkpoint_type: Option<SelectedCheckpointType>,
     #[values(FfiSnapshotHintFreshness::Latest, FfiSnapshotHintFreshness::Unverified)]
     freshness: FfiSnapshotHintFreshness,
 ) {
@@ -420,7 +431,7 @@ fn exported_hint_copy_outlives_snapshot_and_preserves_state(
         expected_provenance.into()
     );
     assert_eq!(
-        Option::<FfiCheckpointType>::from(unsafe {
+        Option::<FfiSelectedCheckpointType>::from(unsafe {
             snapshot_checkpoint_type(snapshot.shallow_copy())
         })
         .map(Into::into),
@@ -740,7 +751,7 @@ struct VisitedHint {
 )]
 #[case::checkpoint_claim(
     Some(1),
-    Some(CheckpointType::V1),
+    Some(SelectedCheckpointType::V1),
     CrcSource::AtVersion,
     Some(1),
     "checkpoint provenance conflicts"
@@ -771,7 +782,7 @@ struct VisitedHint {
 )]
 fn hint_provenance_failures_are_invalid_snapshot_hints(
     #[case] crc_version: Option<u64>,
-    #[case] checkpoint_type: Option<CheckpointType>,
+    #[case] checkpoint_type: Option<SelectedCheckpointType>,
     #[case] source: CrcSource,
     #[case] base_version: Option<u64>,
     #[case] expected_message: &str,

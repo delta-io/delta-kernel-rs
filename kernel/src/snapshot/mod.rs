@@ -78,7 +78,7 @@ pub use builder::{IncrementalReplay, IncrementalSnapshotBuilder, SnapshotBuilder
 #[allow(unused_imports)]
 #[internal_api]
 pub(crate) use hint::{PublicationWatermark, SnapshotHint, SnapshotHintFreshness};
-pub use provenance::{CheckpointType, CrcProvenance, CrcSource};
+pub use provenance::{CrcProvenance, CrcSource, SelectedCheckpointType};
 pub use reader::SnapshotReader;
 use snapshot_crc::SnapshotCrc;
 
@@ -650,10 +650,10 @@ impl Snapshot {
 
     /// Returns the selected checkpoint specification, when known, without performing engine I/O.
     ///
-    /// Returns `None` if no checkpoint was selected and `Some(CheckpointType::Unresolved)` if
-    /// the type was not established during construction. This observation remains fixed for the
-    /// snapshot's lifetime. The table's configured checkpoint policy does not determine it.
-    pub fn checkpoint_type(&self) -> Option<CheckpointType> {
+    /// Returns `None` if no checkpoint was selected and `Some(SelectedCheckpointType::Unresolved)`
+    /// if the type was not established during construction. This observation remains fixed for
+    /// the snapshot's lifetime. The table's configured checkpoint policy does not determine it.
+    pub fn checkpoint_type(&self) -> Option<SelectedCheckpointType> {
         self.log_segment.checkpoint_type()
     }
 
@@ -1825,9 +1825,9 @@ impl Snapshot {
             KernelError::internal_error("Checkpoint path could not be parsed as a log path")
         })?;
         let checkpoint_type = if v2_supported {
-            CheckpointType::V2
+            SelectedCheckpointType::V2
         } else {
-            CheckpointType::V1
+            SelectedCheckpointType::V1
         };
         let new_log_segment = self
             .log_segment
@@ -2248,7 +2248,7 @@ mod tests {
                 create_log_path(
                     "memory:///publication/_delta_log/00000000000000000002.checkpoint.parquet",
                 ),
-                CheckpointType::V2,
+                SelectedCheckpointType::V2,
             )
             .unwrap();
         let source = Arc::new(

@@ -10,7 +10,7 @@ use crate::delta_types::{
 use crate::error::{ExternResult, IntoExternResult};
 use crate::handle::Handle;
 use crate::log_path::LogPathArray;
-use crate::snapshot::provenance::{FfiCheckpointType, FfiCrcProvenance};
+use crate::snapshot::provenance::{FfiCrcProvenance, FfiSelectedCheckpointType};
 use crate::{NullableCvoid, OptionalValue, SharedExternEngine, SharedSnapshot};
 
 mod export;
@@ -97,7 +97,7 @@ pub struct FfiSnapshotHint {
     pub publication_watermark: FfiPublicationWatermark,
     /// Selected checkpoint specification. `Unresolved` means a checkpoint is selected but its
     /// type has not been retained. Absent supplies no type claim; paths establish presence.
-    pub checkpoint_type: OptionalValue<FfiCheckpointType>,
+    pub checkpoint_type: OptionalValue<FfiSelectedCheckpointType>,
     /// Optional retained checksum observation. Absent supplies no claim and becomes `Unknown`.
     /// Export always includes the observation, even when `crc` is null.
     /// `Missing` and `Unusable` require a null `crc` and no base version. `AtVersion`,
@@ -170,7 +170,7 @@ unsafe fn snapshot_builder_with_snapshot_hint_impl(
         crc,
         freshness,
         Some((
-            Option::<&FfiCheckpointType>::from(&value.checkpoint_type)
+            Option::<&FfiSelectedCheckpointType>::from(&value.checkpoint_type)
                 .copied()
                 .map(Into::into),
             Option::<&FfiCrcProvenance>::from(&value.crc_provenance)

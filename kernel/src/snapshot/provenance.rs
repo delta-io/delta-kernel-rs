@@ -2,12 +2,13 @@
 
 use crate::Version;
 
-/// The specification followed by a checkpoint, independently of the table's checkpoint policy.
+/// The specification observed for a snapshot's selected checkpoint.
 ///
 /// A classic checkpoint filename alone does not distinguish V1 from V2.
+/// Selection does not require reading the checkpoint; a CRC can supply protocol and metadata.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[non_exhaustive]
-pub enum CheckpointType {
+pub enum SelectedCheckpointType {
     /// A checkpoint was selected, but its type was not established during snapshot construction.
     #[default]
     Unresolved,

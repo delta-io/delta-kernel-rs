@@ -1,15 +1,15 @@
 //! Snapshot provenance observations, available without engine I/O.
 
-use delta_kernel::snapshot::{CheckpointType, CrcProvenance, CrcSource};
+use delta_kernel::snapshot::{CrcProvenance, CrcSource, SelectedCheckpointType};
 
 use crate::{Handle, OptionalValue, SharedSnapshot};
 
-/// The selected checkpoint's specification. See [`CheckpointType`].
+/// The selected checkpoint's specification. See [`SelectedCheckpointType`].
 ///
 /// cbindgen:prefix-with-name=true
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[repr(C)]
-pub enum FfiCheckpointType {
+pub enum FfiSelectedCheckpointType {
     /// A checkpoint was selected, but its specification was not established.
     Unresolved,
     /// The checkpoint follows the V1 specification.
@@ -18,22 +18,22 @@ pub enum FfiCheckpointType {
     V2,
 }
 
-impl From<CheckpointType> for FfiCheckpointType {
-    fn from(value: CheckpointType) -> Self {
+impl From<SelectedCheckpointType> for FfiSelectedCheckpointType {
+    fn from(value: SelectedCheckpointType) -> Self {
         match value {
-            CheckpointType::V1 => Self::V1,
-            CheckpointType::V2 => Self::V2,
+            SelectedCheckpointType::V1 => Self::V1,
+            SelectedCheckpointType::V2 => Self::V2,
             _ => Self::Unresolved,
         }
     }
 }
 
-impl From<FfiCheckpointType> for CheckpointType {
-    fn from(value: FfiCheckpointType) -> Self {
+impl From<FfiSelectedCheckpointType> for SelectedCheckpointType {
+    fn from(value: FfiSelectedCheckpointType) -> Self {
         match value {
-            FfiCheckpointType::Unresolved => Self::Unresolved,
-            FfiCheckpointType::V1 => Self::V1,
-            FfiCheckpointType::V2 => Self::V2,
+            FfiSelectedCheckpointType::Unresolved => Self::Unresolved,
+            FfiSelectedCheckpointType::V1 => Self::V1,
+            FfiSelectedCheckpointType::V2 => Self::V2,
         }
     }
 }
@@ -125,7 +125,7 @@ impl FfiCrcProvenance {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn snapshot_checkpoint_type(
     snapshot: Handle<SharedSnapshot>,
-) -> OptionalValue<FfiCheckpointType> {
+) -> OptionalValue<FfiSelectedCheckpointType> {
     unsafe { snapshot.as_ref() }
         .checkpoint_type()
         .map(Into::into)

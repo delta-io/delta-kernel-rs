@@ -46,7 +46,7 @@ use crate::scan::{
 use crate::schema::{
     DataType, SchemaRef, SchemaStructPatchBuilder, StructField, StructType, schema, schema_ref,
 };
-use crate::snapshot::CheckpointType;
+use crate::snapshot::SelectedCheckpointType;
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::unit_test_utils::adaptive_metadata_fixtures::{
     adaptive_metadata_protocol_and_metadata, minimal_checkpoint_action, setup_table,
@@ -358,7 +358,7 @@ fn log_segment_stats_counts_only_replay_commits(
         end_version: sizes.len().saturating_sub(1) as u64,
         checkpoint: checkpoint_only.then_some(SelectedCheckpoint {
             version: 0,
-            checkpoint_type: CheckpointType::Unresolved,
+            checkpoint_type: SelectedCheckpointType::Unresolved,
         }),
         log_root: Url::parse("memory:///_delta_log/").unwrap(),
         last_checkpoint_metadata: None,
@@ -1586,8 +1586,12 @@ async fn test_create_checkpoint_stream_returns_checkpoint_batches_if_checkpoint_
 async fn test_create_checkpoint_stream_preserves_checkpoint_type(
     #[case] v2: bool,
     #[case] sidecar_column: bool,
-    #[values(CheckpointType::Unresolved, CheckpointType::V1, CheckpointType::V2)]
-    claimed_type: CheckpointType,
+    #[values(
+        SelectedCheckpointType::Unresolved,
+        SelectedCheckpointType::V1,
+        SelectedCheckpointType::V2
+    )]
+    claimed_type: SelectedCheckpointType,
 ) -> KernelResult<()> {
     // Given a classic-named checkpoint and a retained type claim.
     let (store, log_root) = new_in_memory_store();
@@ -5276,7 +5280,8 @@ async fn test_try_new_with_checkpoint_rejects_invalid_path(
         ..Default::default()
     })
     .await;
-    let result = log_segment.try_new_with_checkpoint(create_log_path(path), CheckpointType::V1);
+    let result =
+        log_segment.try_new_with_checkpoint(create_log_path(path), SelectedCheckpointType::V1);
     assert_result_error_with_message(result, expected_error);
 }
 
@@ -5313,9 +5318,9 @@ async fn test_try_new_with_checkpoint(
     assert!(log_segment.listed.ascending_compaction_files.is_empty());
 
     let checkpoint_type = if ckpt_suffix == "checkpoint.parquet" {
-        CheckpointType::V1
+        SelectedCheckpointType::V1
     } else {
-        CheckpointType::V2
+        SelectedCheckpointType::V2
     };
     let result = log_segment
         .try_new_with_checkpoint(create_log_path(&ckpt_url), checkpoint_type)
