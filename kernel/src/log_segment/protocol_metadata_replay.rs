@@ -8,7 +8,7 @@ use std::sync::{Arc, LazyLock};
 use tracing::{info, instrument};
 use url::Url;
 
-use super::LogSegment;
+use super::{LogSegment, checkpoint_action_projection_predicate};
 #[cfg(all(feature = "adaptive-metadata-in-dev", feature = "declarative-plans"))]
 use super::{
     last_manifest_commit_inconsistency, missing_pointed_checkpoint_action,
@@ -332,16 +332,13 @@ impl LogSegment {
             commit_schema.fields().cloned().chain([file_column]),
         )?);
         let checkpoint_version = self.checkpoint_version.map(|v| v as i64);
-        let batches = self
-            .read_actions_with_projected_checkpoint_actions(
-                engine,
-                commit_schema,
-                checkpoint_schema,
-                None,
-                None,
-                None,
-            )?
+        let commits = Self::read_commit_files(engine, &self.find_commit_cover(), commit_schema)?;
+        // Let readers skip checkpoint data without a Protocol or Metadata.
+        let checkpoint_predicate = checkpoint_action_projection_predicate(&checkpoint_schema);
+        let checkpoint = self
+            .create_checkpoint_stream(engine, checkpoint_schema, checkpoint_predicate, None, None)?
             .actions;
+        let batches = commits.chain(checkpoint);
         Ok(batches.map(move |batch| {
             let batch = batch?;
             // A commit's version is parsed from its `_file`; a checkpoint batch uses the constant.
