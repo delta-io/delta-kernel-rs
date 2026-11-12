@@ -868,10 +868,10 @@ impl LogSegment {
     }
 
     /// Replaces retained staged commit references through `max_published_version` with published
-    /// paths.
+    /// paths and their storage metadata.
     ///
-    /// The caller establishes which commits have been published; this method performs no storage
-    /// reads. Replaced commit references retain the staged file's size and modification time.
+    /// The caller establishes which commits have been published. This method reads each replacement
+    /// file's metadata with HEAD because publication can change its modification time.
     /// `max_published_version` cannot exceed `self.end_version` or be less than
     /// `self.listed.max_published_version`.
     ///
@@ -879,10 +879,11 @@ impl LogSegment {
     /// and no published version was recorded, including when a checkpoint covers the replay
     /// commits. It is a no-op if the recorded maximum is also `None`; otherwise it is an error.
     ///
-    /// Returns `Ok(None)` without cloning if neither the commit paths nor the recorded maximum
-    /// change.
+    /// Returns `Ok(None)` without cloning or accessing the engine if neither the commit paths nor
+    /// the recorded maximum change. Metadata read failures leave the original segment unchanged.
     pub(crate) fn new_as_published(
         &self,
+        engine: &dyn Engine,
         max_published_version: Option<Version>,
     ) -> KernelResult<Option<Self>> {
         require!(
@@ -920,11 +921,9 @@ impl LogSegment {
                 let location = self
                     .log_root
                     .join(&published_commit_file_name(file.version))?;
-                let metadata = FileMeta {
-                    location: location.clone(),
-                    last_modified: file.location.last_modified,
-                    size: file.location.size,
-                };
+                // We expect publication to need one file, so prefer HEAD for the common case.
+                // Use publication counts and timings (#3929) to evaluate HEAD versus LIST.
+                let metadata = engine.storage_handler().head(&location)?;
                 *file = ParsedLogPath::new(metadata)
                     .ok_or_else(|| KernelError::invalid_log_path(location))?;
             }
@@ -936,10 +935,21 @@ impl LogSegment {
         for file in &mut new_log_segment.listed.ascending_commit_files {
             replace_staged(file)?;
         }
-        // Loading a snapshot with a checkpoint at the same version leaves ascending_commit_files
-        // empty. latest_commit_file is still needed to read the in-commit timestamp.
-        if let Some(file) = &mut new_log_segment.listed.latest_commit_file {
-            replace_staged(file)?;
+        if let Some(file) = &mut new_log_segment.listed.latest_commit_file
+            && needs_published_path(file)
+        {
+            // Reuse the replay commit's metadata to avoid a second HEAD. A checkpoint can leave
+            // only latest_commit_file, which timestamp reads still need.
+            if let Some(commit) = new_log_segment
+                .listed
+                .ascending_commit_files
+                .last()
+                .filter(|commit| commit.version == file.version)
+            {
+                file.clone_from(commit);
+            } else {
+                replace_staged(file)?;
+            }
         }
         Ok(Some(new_log_segment))
     }
