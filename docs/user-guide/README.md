@@ -16,6 +16,8 @@ after reviewing the full range.
 This book is built with [`mdbook`]. Install the latest version with `cargo install mdbook` or whatever
 their latest docs say. If running into issues with the `mermaid` preprocessor (e.g. "Unable to run the preprocessor `mermaid`"), run `cargo install mdbook-mermaid`.
 
+Testing the Rust examples with `make test` also requires Python 3.
+
 ## building
 The book is built in CI and deployed to [docs.delta.io/kernel/rust](https://docs.delta.io/kernel/rust/). When working on
 the book locally you can preview changes with mdbook local server:
