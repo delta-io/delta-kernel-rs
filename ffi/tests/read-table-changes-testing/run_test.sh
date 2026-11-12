@@ -11,8 +11,8 @@ OUT_FILE=$(mktemp)
 trap 'rm -f "$OUT_FILE"' EXIT
 
 # table_root lines contain machine-specific absolute paths. Replace everything up to and
-# including ".../acceptance/tests/dat/" with "<DAT>" so expected files are portable.
+# including ".../acceptance/workloads/" with "<DAT>" so expected files are portable.
 ./read_table_changes "$@" "$TABLE_PATH" \
-    | sed -E 's|file://.*/acceptance/tests/dat/|file://<DAT>/|g' \
+    | sed -E 's|file://.*/acceptance/workloads/|file://<DAT>/|g' \
     | tee "$OUT_FILE"
 diff "$OUT_FILE" "$EXPECTED"

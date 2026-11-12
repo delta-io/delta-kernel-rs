@@ -8,6 +8,7 @@ use std::ops::Deref;
 use std::str::FromStr;
 use std::sync::{Arc, LazyLock};
 
+use IntervalDayToSecondType::*;
 use delta_kernel_derive::internal_api;
 use derive_more::From;
 use indexmap::IndexMap;
@@ -655,17 +656,14 @@ impl StructField {
     /// annotation may still be present (it is ignored, and the logical name is returned).
     #[internal_api]
     pub(crate) fn physical_name(&self, column_mapping_mode: ColumnMappingMode) -> &str {
-        match column_mapping_mode {
-            ColumnMappingMode::None => &self.name,
-            ColumnMappingMode::Id | ColumnMappingMode::Name => {
-                match self
-                    .metadata
-                    .get(ColumnMetadataKey::ColumnMappingPhysicalName.as_ref())
-                {
-                    Some(MetadataValue::String(physical_name)) => physical_name,
-                    _ => &self.name,
-                }
-            }
+        if let ColumnMappingMode::Id | ColumnMappingMode::Name = column_mapping_mode
+            && let Some(MetadataValue::String(physical_name)) = self
+                .metadata
+                .get(ColumnMetadataKey::ColumnMappingPhysicalName.as_ref())
+        {
+            physical_name
+        } else {
+            &self.name
         }
     }
 
@@ -1060,7 +1058,7 @@ impl StructType {
     /// Retrieves the nested field named by the given column path.
     ///
     /// Returns an error if the path is empty, a field is not found, or an intermediate field is not
-    /// a struct type.
+    /// a struct or `file` type.
     pub fn field_at<'a>(&'a self, col: &ColumnName) -> KernelResult<&'a StructField> {
         let mut field = None;
         self.visit_fields_of_path(col, |f| field = Some(f))?;
@@ -1076,7 +1074,7 @@ impl StructType {
     /// Visits all fields along the given column path.
     ///
     /// Returns an error if the path is empty, a field is not found, or an intermediate field is not
-    /// a struct type.
+    /// a struct or `file` type.
     #[internal_api]
     pub(crate) fn visit_fields_of_path<'a>(
         &'a self,
@@ -1090,10 +1088,10 @@ impl StructType {
     /// [`StructField`]s along the path. The last element is the leaf field.
     ///
     /// Each element of the path must resolve to a field in the current struct. All intermediate
-    /// (non-leaf) fields must be struct types.
+    /// (non-leaf) fields must be struct or `file` types.
     ///
     /// Returns an error if the path is empty, a field is not found, or an intermediate
-    /// field is not a struct type.
+    /// field is not a struct or `file` type.
     #[internal_api]
     pub(crate) fn fields_of_path<'a>(
         &'a self,
@@ -1107,7 +1105,7 @@ impl StructType {
     /// Visits all fields along the given column path, using a caller-provided field name resolver.
     ///
     /// Returns an error if the path is empty, a field is not found, or an intermediate field is not
-    /// a struct type.
+    /// a struct or `file` type.
     pub(crate) fn visit_fields_of_path_by<'a, F>(
         &'a self,
         col: &ColumnName,
@@ -1130,10 +1128,12 @@ impl StructType {
             })?;
             visit_field(field);
             if i < path.len() - 1 {
-                let DataType::Struct(inner) = field.data_type() else {
+                // A `file` column's sub-fields are addressable like a struct's, for example in
+                // statistics, predicates, and clustering columns.
+                let (DataType::Struct(inner) | DataType::File(inner)) = field.data_type() else {
                     return Err(KernelError::generic(format!(
                         "Cannot resolve column '{col}': intermediate field '{field_name}' \
-                         is not a struct type"
+                         is not a struct or `file` type"
                     )));
                 };
                 current_struct = inner;
@@ -1662,7 +1662,7 @@ pub(crate) fn normalize_column_names_to_schema_casing(
                 {
                     Some(f) => {
                         normalized.push(f.name().to_string());
-                        if let DataType::Struct(inner) = f.data_type() {
+                        if let DataType::Struct(inner) | DataType::File(inner) = f.data_type() {
                             current_schema = inner;
                         }
                     }
@@ -2001,10 +2001,9 @@ pub enum PrimitiveType {
     #[serde(rename = "timestamp_ntz")]
     TimestampNtz,
     Void,
-    /// Day-time interval: a signed count of microseconds (ANSI `INTERVAL DAY TO SECOND` and
-    /// its narrowed `DAY` / `HOUR` / `MINUTE` / `SECOND` spellings).
-    #[serde(rename = "interval day to second")]
-    IntervalDayTime,
+    /// Day-time interval: a signed count of microseconds with an ANSI qualifier.
+    #[serde(serialize_with = "serialize_interval_day_time", untagged)]
+    IntervalDayTime(IntervalDayToSecondType),
     #[from]
     #[serde(serialize_with = "serialize_decimal", untagged)]
     Decimal(DecimalType),
@@ -2034,11 +2033,16 @@ impl PrimitiveType {
         Self::IntervalYearMonth(ty)
     }
 
+    /// Constructs a day-time interval primitive with the given ANSI qualifier.
+    pub fn interval_day_time(ty: IntervalDayToSecondType) -> Self {
+        Self::IntervalDayTime(ty)
+    }
+
     /// Returns whether this is one of the ANSI interval primitive types.
     #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
     #[internal_api]
     pub(crate) fn is_interval(&self) -> bool {
-        matches!(self, Self::IntervalYearMonth(_) | Self::IntervalDayTime)
+        matches!(self, Self::IntervalYearMonth(_) | Self::IntervalDayTime(_))
     }
 
     /// Returns `true` if this primitive type can be widened to the `target` type.
@@ -2152,6 +2156,70 @@ impl Display for IntervalYearToMonthType {
     }
 }
 
+/// The supported ANSI qualifiers for Delta's day-time interval family.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum IntervalDayToSecondType {
+    #[serde(rename = "interval day")]
+    IntervalDay,
+    #[serde(rename = "interval hour")]
+    IntervalHour,
+    #[serde(rename = "interval minute")]
+    IntervalMinute,
+    #[serde(rename = "interval second")]
+    IntervalSecond,
+    #[serde(rename = "interval day to hour")]
+    IntervalDayToHour,
+    #[serde(rename = "interval day to minute")]
+    IntervalDayToMinute,
+    #[serde(rename = "interval day to second")]
+    IntervalDayToSecond,
+    #[serde(rename = "interval hour to minute")]
+    IntervalHourToMinute,
+    #[serde(rename = "interval hour to second")]
+    IntervalHourToSecond,
+    #[serde(rename = "interval minute to second")]
+    IntervalMinuteToSecond,
+}
+
+impl IntervalDayToSecondType {
+    pub(crate) fn unit_micros(&self) -> i64 {
+        match self {
+            IntervalDay => 86_400_000_000,
+            IntervalHour | IntervalDayToHour => 3_600_000_000,
+            IntervalMinute | IntervalDayToMinute | IntervalHourToMinute => 60_000_000,
+            IntervalSecond
+            | IntervalDayToSecond
+            | IntervalHourToSecond
+            | IntervalMinuteToSecond => 1,
+        }
+    }
+}
+
+impl Display for IntervalDayToSecondType {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        let name = match self {
+            Self::IntervalDay => "interval day",
+            Self::IntervalHour => "interval hour",
+            Self::IntervalMinute => "interval minute",
+            Self::IntervalSecond => "interval second",
+            Self::IntervalDayToHour => "interval day to hour",
+            Self::IntervalDayToMinute => "interval day to minute",
+            Self::IntervalDayToSecond => "interval day to second",
+            Self::IntervalHourToMinute => "interval hour to minute",
+            Self::IntervalHourToSecond => "interval hour to second",
+            Self::IntervalMinuteToSecond => "interval minute to second",
+        };
+        f.write_str(name)
+    }
+}
+
+fn serialize_interval_day_time<S: serde::Serializer>(
+    dtype: &IntervalDayToSecondType,
+    serializer: S,
+) -> KernelResult<S::Ok, S::Error> {
+    serializer.serialize_str(&dtype.to_string())
+}
+
 fn serialize_interval_year_month<S: serde::Serializer>(
     dtype: &IntervalYearToMonthType,
     serializer: S,
@@ -2195,7 +2263,7 @@ pub(crate) struct IntervalFieldRange {
 }
 
 impl IntervalFieldRange {
-    fn primitive_type(self) -> Option<PrimitiveType> {
+    pub(crate) fn primitive_type(self) -> Option<PrimitiveType> {
         match (self.start, self.end) {
             (IntervalField::Year, IntervalField::Year) => Some(PrimitiveType::IntervalYearMonth(
                 IntervalYearToMonthType::IntervalYear,
@@ -2206,13 +2274,36 @@ impl IntervalFieldRange {
             (IntervalField::Year, IntervalField::Month) => Some(PrimitiveType::IntervalYearMonth(
                 IntervalYearToMonthType::IntervalYearToMonth,
             )),
-            (
-                IntervalField::Day
-                | IntervalField::Hour
-                | IntervalField::Minute
-                | IntervalField::Second,
-                _,
-            ) => Some(PrimitiveType::IntervalDayTime),
+            (IntervalField::Day, IntervalField::Day) => Some(PrimitiveType::IntervalDayTime(
+                IntervalDayToSecondType::IntervalDay,
+            )),
+            (IntervalField::Hour, IntervalField::Hour) => Some(PrimitiveType::IntervalDayTime(
+                IntervalDayToSecondType::IntervalHour,
+            )),
+            (IntervalField::Minute, IntervalField::Minute) => Some(PrimitiveType::IntervalDayTime(
+                IntervalDayToSecondType::IntervalMinute,
+            )),
+            (IntervalField::Second, IntervalField::Second) => Some(PrimitiveType::IntervalDayTime(
+                IntervalDayToSecondType::IntervalSecond,
+            )),
+            (IntervalField::Day, IntervalField::Hour) => Some(PrimitiveType::IntervalDayTime(
+                IntervalDayToSecondType::IntervalDayToHour,
+            )),
+            (IntervalField::Day, IntervalField::Minute) => Some(PrimitiveType::IntervalDayTime(
+                IntervalDayToSecondType::IntervalDayToMinute,
+            )),
+            (IntervalField::Day, IntervalField::Second) => Some(PrimitiveType::IntervalDayTime(
+                IntervalDayToSecondType::IntervalDayToSecond,
+            )),
+            (IntervalField::Hour, IntervalField::Minute) => Some(PrimitiveType::IntervalDayTime(
+                IntervalDayToSecondType::IntervalHourToMinute,
+            )),
+            (IntervalField::Hour, IntervalField::Second) => Some(PrimitiveType::IntervalDayTime(
+                IntervalDayToSecondType::IntervalHourToSecond,
+            )),
+            (IntervalField::Minute, IntervalField::Second) => Some(PrimitiveType::IntervalDayTime(
+                IntervalDayToSecondType::IntervalMinuteToSecond,
+            )),
             _ => None,
         }
     }
@@ -2245,8 +2336,8 @@ fn normalize_interval_type(s: &str) -> Option<PrimitiveType> {
 }
 
 // Custom Deserialize to provide clear error messages for unsupported types.
-// The derived impl would produce: "unknown variant `interval second`, expected one of ..."
-// This impl produces: "Unsupported Delta table type: 'interval second'"
+// The derived impl would produce: "unknown variant `unknown type`, expected one of ..."
+// This impl produces: "Unsupported Delta table type: 'unknown type'"
 impl<'de> serde::Deserialize<'de> for PrimitiveType {
     fn deserialize<D>(deserializer: D) -> KernelResult<Self, D::Error>
     where
@@ -2350,7 +2441,7 @@ impl Display for PrimitiveType {
             PrimitiveType::Timestamp => write!(f, "timestamp"),
             PrimitiveType::TimestampNtz => write!(f, "timestamp_ntz"),
             PrimitiveType::IntervalYearMonth(dtype) => write!(f, "{dtype}"),
-            PrimitiveType::IntervalDayTime => write!(f, "interval day to second"),
+            PrimitiveType::IntervalDayTime(dtype) => write!(f, "{dtype}"),
             PrimitiveType::Decimal(dtype) => {
                 write!(f, "decimal({},{})", dtype.precision(), dtype.scale())
             }
@@ -2452,18 +2543,19 @@ impl<'de> serde::Deserialize<'de> for DataType {
         if let Value::Object(map) = &value
             && let Some(Value::String(type_str)) = map.get("type")
         {
+            // Value-to-type conversion recurses outside the JSON decoder's stack-growth adapter.
             return match type_str.as_str() {
-                "array" => ArrayType::deserialize(value)
+                "array" => ArrayType::deserialize(serde_stacker::Deserializer::new(value))
                     .map(DataType::from)
                     .map_err(|e| Error::custom(e.to_string())),
-                "struct" => StructType::deserialize(value)
+                "struct" => StructType::deserialize(serde_stacker::Deserializer::new(value))
                     .map(DataType::from)
                     .map_err(|e| Error::custom(e.to_string())),
-                "map" => MapType::deserialize(value)
+                "map" => MapType::deserialize(serde_stacker::Deserializer::new(value))
                     .map(DataType::from)
                     .map_err(|e| Error::custom(e.to_string())),
                 #[cfg(feature = "udt-in-dev")]
-                "udt" => UserDefinedType::deserialize(value)
+                "udt" => UserDefinedType::deserialize(serde_stacker::Deserializer::new(value))
                     .map(DataType::UserDefined)
                     .map_err(Error::custom),
                 _ => Err(unsupported_delta_type_error(type_str)),
@@ -2491,6 +2583,27 @@ pub(crate) static FILE_FIELDS: LazyLock<StructType> = LazyLock::new(|| {
     ])
 });
 
+/// The `file` sub-fields that get `minValues` and `maxValues` statistics. All six sub-fields get
+/// `nullCount`; only these four also get `minValues` and `maxValues`.
+const FILE_MIN_MAX_FIELDS: [&str; 4] = ["uri", "offset", "size", "content_type"];
+
+/// Whether the `file` sub-field `name` gets `minValues` and `maxValues` statistics.
+pub(crate) fn file_sub_field_has_min_max(name: &str) -> bool {
+    FILE_MIN_MAX_FIELDS.contains(&name)
+}
+
+/// Whether `path`, the fields from the root to a column (as from [`StructType::fields_of_path`]),
+/// ends at a `file` sub-field that gets only `nullCount`: `checksum` or `inline`.
+#[internal_api]
+pub(crate) fn is_null_count_only_file_sub_field(path: &[&StructField]) -> bool {
+    matches!(
+        path,
+        [.., parent, leaf]
+            if matches!(parent.data_type(), DataType::File(_))
+                && !file_sub_field_has_min_max(leaf.name())
+    )
+}
+
 impl DataType {
     pub const STRING: Self = DataType::Primitive(PrimitiveType::String);
     pub const LONG: Self = DataType::Primitive(PrimitiveType::Long);
@@ -2517,7 +2630,46 @@ impl DataType {
     pub const INTERVAL_YEAR_MONTH: Self = DataType::Primitive(PrimitiveType::IntervalYearMonth(
         IntervalYearToMonthType::IntervalYearToMonth,
     ));
-    pub const INTERVAL_DAY_TIME: Self = DataType::Primitive(PrimitiveType::IntervalDayTime);
+    /// ANSI `INTERVAL DAY`, stored as microseconds aligned to whole days.
+    pub const INTERVAL_DAY: Self = DataType::Primitive(PrimitiveType::IntervalDayTime(
+        IntervalDayToSecondType::IntervalDay,
+    ));
+    /// ANSI `INTERVAL HOUR`, stored as microseconds aligned to whole hours.
+    pub const INTERVAL_HOUR: Self = DataType::Primitive(PrimitiveType::IntervalDayTime(
+        IntervalDayToSecondType::IntervalHour,
+    ));
+    /// ANSI `INTERVAL MINUTE`, stored as microseconds aligned to whole minutes.
+    pub const INTERVAL_MINUTE: Self = DataType::Primitive(PrimitiveType::IntervalDayTime(
+        IntervalDayToSecondType::IntervalMinute,
+    ));
+    /// ANSI `INTERVAL SECOND`, stored as signed microseconds.
+    pub const INTERVAL_SECOND: Self = DataType::Primitive(PrimitiveType::IntervalDayTime(
+        IntervalDayToSecondType::IntervalSecond,
+    ));
+    /// ANSI `INTERVAL DAY TO HOUR`, stored as microseconds aligned to whole hours.
+    pub const INTERVAL_DAY_HOUR: Self = DataType::Primitive(PrimitiveType::IntervalDayTime(
+        IntervalDayToSecondType::IntervalDayToHour,
+    ));
+    /// ANSI `INTERVAL DAY TO MINUTE`, stored as microseconds aligned to whole minutes.
+    pub const INTERVAL_DAY_MINUTE: Self = DataType::Primitive(PrimitiveType::IntervalDayTime(
+        IntervalDayToSecondType::IntervalDayToMinute,
+    ));
+    /// ANSI `INTERVAL HOUR TO MINUTE`, stored as microseconds aligned to whole minutes.
+    pub const INTERVAL_HOUR_MINUTE: Self = DataType::Primitive(PrimitiveType::IntervalDayTime(
+        IntervalDayToSecondType::IntervalHourToMinute,
+    ));
+    /// ANSI `INTERVAL HOUR TO SECOND`, stored as signed microseconds.
+    pub const INTERVAL_HOUR_SECOND: Self = DataType::Primitive(PrimitiveType::IntervalDayTime(
+        IntervalDayToSecondType::IntervalHourToSecond,
+    ));
+    /// ANSI `INTERVAL MINUTE TO SECOND`, stored as signed microseconds.
+    pub const INTERVAL_MINUTE_SECOND: Self = DataType::Primitive(PrimitiveType::IntervalDayTime(
+        IntervalDayToSecondType::IntervalMinuteToSecond,
+    ));
+    /// ANSI `INTERVAL DAY TO SECOND`, stored as signed microseconds.
+    pub const INTERVAL_DAY_TIME: Self = DataType::Primitive(PrimitiveType::IntervalDayTime(
+        IntervalDayToSecondType::IntervalDayToSecond,
+    ));
 
     /// Resolves a path to a mutable nested struct.
     ///
@@ -2594,6 +2746,11 @@ impl DataType {
     /// Constructs a year-month interval data type with the given ANSI qualifier.
     pub fn interval_year_month(ty: IntervalYearToMonthType) -> Self {
         PrimitiveType::interval_year_month(ty).into()
+    }
+
+    /// Constructs a day-time interval data type with the given ANSI qualifier.
+    pub fn interval_day_time(ty: IntervalDayToSecondType) -> Self {
+        PrimitiveType::interval_day_time(ty).into()
     }
 
     /// Create a new struct type with the given fields.
@@ -3259,7 +3416,7 @@ mod tests {
 
     #[rstest]
     #[case("money")]
-    #[case("interval fortnight")]
+    #[case("unknown type")]
     // invalid orderings across year-month and day-time
     #[case("interval month to day")]
     #[case("interval year to second")]
@@ -3289,12 +3446,14 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_invalid_interval_field_range_has_no_primitive_type() {
-        let range = IntervalFieldRange {
-            start: IntervalField::Month,
-            end: IntervalField::Year,
-        };
+    #[rstest]
+    #[case(IntervalField::Month, IntervalField::Year)]
+    #[case(IntervalField::Second, IntervalField::Day)]
+    fn test_invalid_interval_field_range_has_no_primitive_type(
+        #[case] start: IntervalField,
+        #[case] end: IntervalField,
+    ) {
+        let range = IntervalFieldRange { start, end };
         assert_eq!(range.primitive_type(), None);
     }
 
@@ -3314,16 +3473,16 @@ mod tests {
     #[case("interval year", DataType::INTERVAL_YEAR)]
     #[case("interval month", DataType::INTERVAL_MONTH)]
     #[case("interval year to month", DataType::INTERVAL_YEAR_MONTH)]
-    #[case("interval day", DataType::INTERVAL_DAY_TIME)]
-    #[case("interval hour", DataType::INTERVAL_DAY_TIME)]
-    #[case("interval minute", DataType::INTERVAL_DAY_TIME)]
-    #[case("interval second", DataType::INTERVAL_DAY_TIME)]
-    #[case("interval day to hour", DataType::INTERVAL_DAY_TIME)]
-    #[case("interval day to minute", DataType::INTERVAL_DAY_TIME)]
+    #[case("interval day", DataType::INTERVAL_DAY)]
+    #[case("interval hour", DataType::INTERVAL_HOUR)]
+    #[case("interval minute", DataType::INTERVAL_MINUTE)]
+    #[case("interval second", DataType::INTERVAL_SECOND)]
+    #[case("interval day to hour", DataType::INTERVAL_DAY_HOUR)]
+    #[case("interval day to minute", DataType::INTERVAL_DAY_MINUTE)]
     #[case("interval day to second", DataType::INTERVAL_DAY_TIME)]
-    #[case("interval hour to minute", DataType::INTERVAL_DAY_TIME)]
-    #[case("interval hour to second", DataType::INTERVAL_DAY_TIME)]
-    #[case("interval minute to second", DataType::INTERVAL_DAY_TIME)]
+    #[case("interval hour to minute", DataType::INTERVAL_HOUR_MINUTE)]
+    #[case("interval hour to second", DataType::INTERVAL_HOUR_SECOND)]
+    #[case("interval minute to second", DataType::INTERVAL_MINUTE_SECOND)]
     fn test_primitive_type_deserialization_still_works(
         #[case] type_str: &str,
         #[case] expected_type: DataType,
@@ -3414,7 +3573,16 @@ mod tests {
     #[case("\"interval year\"", DataType::INTERVAL_YEAR)]
     #[case("\"interval month\"", DataType::INTERVAL_MONTH)]
     #[case("\"interval year to month\"", DataType::INTERVAL_YEAR_MONTH)]
+    #[case("\"interval day\"", DataType::INTERVAL_DAY)]
+    #[case("\"interval hour\"", DataType::INTERVAL_HOUR)]
+    #[case("\"interval minute\"", DataType::INTERVAL_MINUTE)]
+    #[case("\"interval second\"", DataType::INTERVAL_SECOND)]
+    #[case("\"interval day to hour\"", DataType::INTERVAL_DAY_HOUR)]
+    #[case("\"interval day to minute\"", DataType::INTERVAL_DAY_MINUTE)]
     #[case("\"interval day to second\"", DataType::INTERVAL_DAY_TIME)]
+    #[case("\"interval hour to minute\"", DataType::INTERVAL_HOUR_MINUTE)]
+    #[case("\"interval hour to second\"", DataType::INTERVAL_HOUR_SECOND)]
+    #[case("\"interval minute to second\"", DataType::INTERVAL_MINUTE_SECOND)]
     #[case("\"variant\"", DataType::unshredded_variant())]
     fn test_data_type_deserialization(#[case] type_json: &str, #[case] expected: DataType) {
         let data_type: DataType = serde_json::from_str(type_json).unwrap();
@@ -3434,7 +3602,46 @@ mod tests {
         PrimitiveType::interval_year_month(IntervalYearToMonthType::IntervalYearToMonth),
         "interval year to month"
     )]
-    #[case(PrimitiveType::IntervalDayTime, "interval day to second")]
+    #[case(
+        PrimitiveType::interval_day_time(IntervalDayToSecondType::IntervalDay),
+        "interval day"
+    )]
+    #[case(
+        PrimitiveType::interval_day_time(IntervalDayToSecondType::IntervalHour),
+        "interval hour"
+    )]
+    #[case(
+        PrimitiveType::interval_day_time(IntervalDayToSecondType::IntervalMinute),
+        "interval minute"
+    )]
+    #[case(
+        PrimitiveType::interval_day_time(IntervalDayToSecondType::IntervalSecond),
+        "interval second"
+    )]
+    #[case(
+        PrimitiveType::interval_day_time(IntervalDayToSecondType::IntervalDayToHour),
+        "interval day to hour"
+    )]
+    #[case(
+        PrimitiveType::interval_day_time(IntervalDayToSecondType::IntervalDayToMinute),
+        "interval day to minute"
+    )]
+    #[case(
+        PrimitiveType::interval_day_time(IntervalDayToSecondType::IntervalDayToSecond),
+        "interval day to second"
+    )]
+    #[case(
+        PrimitiveType::interval_day_time(IntervalDayToSecondType::IntervalHourToMinute),
+        "interval hour to minute"
+    )]
+    #[case(
+        PrimitiveType::interval_day_time(IntervalDayToSecondType::IntervalHourToSecond),
+        "interval hour to second"
+    )]
+    #[case(
+        PrimitiveType::interval_day_time(IntervalDayToSecondType::IntervalMinuteToSecond),
+        "interval minute to second"
+    )]
     fn test_interval_type_name_round_trips(#[case] ptype: PrimitiveType, #[case] name: &str) {
         assert_eq!(ptype.to_string(), name);
         assert_eq!(
@@ -3466,6 +3673,25 @@ mod tests {
         assert!(json.contains(r#""type":"interval year""#));
         assert!(json.contains(r#""elementType":"interval month""#));
         assert!(json.contains(r#""valueType":"interval year to month""#));
+        assert_eq!(serde_json::from_str::<StructType>(&json).unwrap(), schema);
+    }
+
+    #[test]
+    fn test_nested_interval_day_time_schema_round_trips_exact_qualifiers() {
+        let schema = StructType::try_new([
+            StructField::nullable("day", DataType::INTERVAL_DAY),
+            StructField::nullable("hour_array", ArrayType::new(DataType::INTERVAL_HOUR, true)),
+            StructField::nullable(
+                "minute_second_map",
+                MapType::new(DataType::STRING, DataType::INTERVAL_MINUTE_SECOND, true),
+            ),
+        ])
+        .unwrap();
+
+        let json = serde_json::to_string(&schema).unwrap();
+        assert!(json.contains(r#""type":"interval day""#));
+        assert!(json.contains(r#""elementType":"interval hour""#));
+        assert!(json.contains(r#""valueType":"interval minute to second""#));
         assert_eq!(serde_json::from_str::<StructType>(&json).unwrap(), schema);
     }
 
@@ -5044,7 +5270,7 @@ mod tests {
     #[case::empty_path(vec![], "Column path cannot be empty")]
     #[case::not_found_top(vec!["x"], "not found in schema")]
     #[case::not_found_nested(vec!["a", "x"], "not found in schema")]
-    #[case::intermediate_not_struct(vec!["a", "b", "c", "d"], "not a struct type")]
+    #[case::intermediate_not_struct(vec!["a", "b", "c", "d"], "is not a struct or `file` type")]
     #[test]
     fn test_walk_column_fields_error(#[case] col_path: Vec<&str>, #[case] expected_error: &str) {
         let schema = walk_test_schema();
@@ -5088,6 +5314,60 @@ mod tests {
         assert_eq!(
             normalize_column_names_to_schema_casing(&schema, &cols)[0].path(),
             ["nonexistent"]
+        );
+    }
+
+    /// `field_at` resolves each `file` sub-field, at top level and nested in a struct, and rejects
+    /// a path that continues past one.
+    #[rstest]
+    fn test_field_at_file_sub_fields(
+        #[values("uri", "offset", "size", "content_type", "checksum", "inline")] name: &str,
+        #[values("f", "s.f")] file_path: &str,
+    ) {
+        let schema = StructType::new_unchecked([
+            StructField::nullable("f", DataType::file_type()),
+            StructField::nullable(
+                "s",
+                StructType::new_unchecked([StructField::nullable("f", DataType::file_type())]),
+            ),
+        ]);
+        let col = ColumnName::from_naive_str_split(format!("{file_path}.{name}"));
+        let field = schema.field_at(&col).unwrap();
+        assert_eq!(Some(field), FILE_FIELDS.field(name));
+
+        let past = col.join(&ColumnName::new(["x"]));
+        assert_result_error_with_message(
+            schema.field_at(&past),
+            &format!("intermediate field '{name}' is not a struct or `file` type"),
+        );
+    }
+
+    /// Every `file` sub-field gets min/max statistics except `checksum` and `inline`.
+    #[test]
+    fn test_file_min_max_fields() {
+        let without: Vec<_> = FILE_FIELDS
+            .fields()
+            .map(|f| f.name().as_str())
+            .filter(|name| !file_sub_field_has_min_max(name))
+            .collect();
+        assert_eq!(without, ["checksum", "inline"]);
+        for name in FILE_MIN_MAX_FIELDS {
+            assert!(FILE_FIELDS.field(name).is_some(), "{name}");
+        }
+    }
+
+    /// Normalization descends into a `file` column's sub-fields, not into a same-named top-level
+    /// field.
+    #[test]
+    fn test_normalize_column_names_to_schema_casing_through_file() {
+        let schema = StructType::new_unchecked([
+            StructField::nullable("C", DataType::file_type()),
+            StructField::nullable("SIZE", DataType::LONG),
+        ]);
+        let cols = vec![column_name!("c.SIZE")];
+        assert_eq!(
+            normalize_column_names_to_schema_casing(&schema, &cols)[0].path(),
+            ["C", "size"]
         );
     }
 }

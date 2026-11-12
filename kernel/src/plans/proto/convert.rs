@@ -25,8 +25,8 @@ use crate::plans::ir::nodes::{
 use crate::plans::ir::plan::{Plan, PlanNode};
 use crate::plans::{IoOperation, Operation};
 use crate::schema::{
-    ArrayType, DataType, DecimalType, IntervalYearToMonthType, MapType, MetadataValue,
-    PrimitiveType, StructField, StructType,
+    ArrayType, DataType, DecimalType, IntervalDayToSecondType, IntervalYearToMonthType, MapType,
+    MetadataValue, PrimitiveType, StructField, StructType,
 };
 #[cfg(feature = "geo-type-in-dev")]
 use crate::schema::{EdgeInterpolationAlgorithm, GeographyType, GeometryType};
@@ -285,6 +285,11 @@ impl From<&Agg> for proto_plan::Agg {
                 value: Some(value.into()),
             }),
             Agg::CountStar => proto_agg::Func::CountStar(proto_plan::CountStarAgg {}),
+            Agg::FirstNonNull(value) => {
+                proto_agg::Func::FirstNonNull(proto_plan::FirstNonNullAgg {
+                    value: Some(value.into()),
+                })
+            }
             Agg::MinNonNullBy(operands) => {
                 proto_agg::Func::MinNonNullBy(proto_plan::MinNonNullByAgg {
                     value: Some((&operands.value).into()),
@@ -606,7 +611,7 @@ impl From<&Scalar> for proto_expr::Scalar {
             Scalar::Timestamp(v) => Value::Timestamp(*v),
             Scalar::TimestampNtz(v) => Value::TimestampNtz(*v),
             Scalar::IntervalYearMonth(v) => Value::IntervalYearMonth(v.months()),
-            Scalar::IntervalDayTime(v) => Value::IntervalDayTime(*v),
+            Scalar::IntervalDayTime(v) => Value::IntervalDayTime(v.micros()),
             Scalar::Date(v) => Value::Date(*v),
             Scalar::Binary(v) => Value::Binary(v.clone()),
             Scalar::Decimal(decimal) => Value::Decimal(decimal.into()),
@@ -729,7 +734,7 @@ impl From<&PrimitiveType> for proto_schema::PrimitiveType {
                 // The proto tag carries no qualifier; decoding reconstructs the full-range type.
                 PrimitiveTypeKind::Simple(Simple::IntervalYearMonth as i32)
             }
-            PrimitiveType::IntervalDayTime => {
+            PrimitiveType::IntervalDayTime(_) => {
                 PrimitiveTypeKind::Simple(Simple::IntervalDayTime as i32)
             }
         };
@@ -936,7 +941,9 @@ impl TryFrom<proto_schema::PrimitiveType> for PrimitiveType {
                     Simple::IntervalYearMonth => PrimitiveType::interval_year_month(
                         IntervalYearToMonthType::IntervalYearToMonth,
                     ),
-                    Simple::IntervalDayTime => PrimitiveType::IntervalDayTime,
+                    Simple::IntervalDayTime => PrimitiveType::interval_day_time(
+                        IntervalDayToSecondType::IntervalDayToSecond,
+                    ),
                     Simple::Unspecified => {
                         return Err(KernelError::schema("SimplePrimitiveType is unspecified"));
                     }
@@ -1102,8 +1109,9 @@ mod tests {
     };
     use crate::plans::{IoOperation, Operation};
     use crate::schema::{
-        ArrayType, DataType, DecimalType, IntervalYearToMonthType, MapType, MetadataValue,
-        PrimitiveType, SchemaRef, StructField, StructType, ToSchema as _, schema, schema_ref,
+        ArrayType, DataType, DecimalType, IntervalDayToSecondType, IntervalYearToMonthType,
+        MapType, MetadataValue, PrimitiveType, SchemaRef, StructField, StructType, ToSchema as _,
+        schema, schema_ref,
     };
     #[cfg(feature = "geo-type-in-dev")]
     use crate::schema::{EdgeInterpolationAlgorithm, GeographyType, GeometryType};
@@ -1681,6 +1689,7 @@ mod tests {
     #[case(Agg::sum(column_name!("a")), "sum")]
     #[case(Agg::count(column_name!("a")), "count")]
     #[case(Agg::count_star(), "count_star")]
+    #[case(Agg::first_non_null(column_name!("a")), "first_non_null")]
     #[case(Agg::min_non_null_by(column_name!("a"), column_name!("s"), column_name!("k")), "min_non_null_by")]
     #[case(Agg::max_non_null_by(column_name!("a"), column_name!("s"), column_name!("k")), "max_non_null_by")]
     fn from_agg(#[case] agg: Agg, #[case] expected: &str) {
@@ -1692,6 +1701,10 @@ mod tests {
             Func::Sum(_) => "sum",
             Func::Count(_) => "count",
             Func::CountStar(_) => "count_star",
+            Func::FirstNonNull(agg) => {
+                assert_eq!(agg.value.unwrap().path, ["a"]);
+                "first_non_null"
+            }
             Func::MinNonNullBy(_) => "min_non_null_by",
             Func::MaxNonNullBy(_) => "max_non_null_by",
         };
@@ -2154,12 +2167,20 @@ mod tests {
         proto_expr::scalar::Value::IntervalYearMonth(i32::MIN)
     )]
     #[case(
-        Scalar::IntervalDayTime(-5),
+        Scalar::interval_day_time(-5, IntervalDayToSecondType::IntervalDayToSecond).unwrap(),
         proto_expr::scalar::Value::IntervalDayTime(-5)
     )]
     #[case(
-        Scalar::IntervalDayTime(i64::MAX),
+        Scalar::interval_day_time(i64::MAX, IntervalDayToSecondType::IntervalDayToSecond).unwrap(),
         proto_expr::scalar::Value::IntervalDayTime(i64::MAX)
+    )]
+    #[case(
+        Scalar::interval_day_time(86_400_000_000, IntervalDayToSecondType::IntervalDay).unwrap(),
+        proto_expr::scalar::Value::IntervalDayTime(86_400_000_000)
+    )]
+    #[case(
+        Scalar::interval_day_time(93_600_000_000, IntervalDayToSecondType::IntervalDayToHour).unwrap(),
+        proto_expr::scalar::Value::IntervalDayTime(93_600_000_000)
     )]
     fn from_interval_scalar_preserves_payload(
         #[case] scalar: Scalar,
@@ -2180,6 +2201,28 @@ mod tests {
 
         let decoded = DataType::try_from(data_type).unwrap();
         assert_eq!(decoded, DataType::INTERVAL_YEAR_MONTH);
+    }
+
+    #[rstest]
+    #[case(IntervalDayToSecondType::IntervalDay)]
+    #[case(IntervalDayToSecondType::IntervalHour)]
+    #[case(IntervalDayToSecondType::IntervalMinute)]
+    #[case(IntervalDayToSecondType::IntervalSecond)]
+    #[case(IntervalDayToSecondType::IntervalDayToHour)]
+    #[case(IntervalDayToSecondType::IntervalDayToMinute)]
+    #[case(IntervalDayToSecondType::IntervalDayToSecond)]
+    #[case(IntervalDayToSecondType::IntervalHourToMinute)]
+    #[case(IntervalDayToSecondType::IntervalHourToSecond)]
+    #[case(IntervalDayToSecondType::IntervalMinuteToSecond)]
+    fn from_interval_day_time_null_encodes_generic_type(#[case] dtype: IntervalDayToSecondType) {
+        let scalar = Scalar::Null(DataType::interval_day_time(dtype));
+        let proto_expr::scalar::Value::Null(data_type) = scalar_value_of(scalar) else {
+            panic!("expected a null scalar");
+        };
+        assert_eq!(
+            DataType::try_from(data_type).unwrap(),
+            DataType::INTERVAL_DAY_TIME
+        );
     }
 
     #[test]
@@ -2363,7 +2406,15 @@ mod tests {
         proto_schema::SimplePrimitiveType::IntervalYearMonth
     )]
     #[case(
-        PrimitiveType::IntervalDayTime,
+        PrimitiveType::interval_day_time(IntervalDayToSecondType::IntervalDayToSecond),
+        proto_schema::SimplePrimitiveType::IntervalDayTime
+    )]
+    #[case(
+        PrimitiveType::interval_day_time(IntervalDayToSecondType::IntervalDay),
+        proto_schema::SimplePrimitiveType::IntervalDayTime
+    )]
+    #[case(
+        PrimitiveType::interval_day_time(IntervalDayToSecondType::IntervalMinuteToSecond),
         proto_schema::SimplePrimitiveType::IntervalDayTime
     )]
     fn from_primitive_type(
@@ -2497,7 +2548,7 @@ mod tests {
             PrimitiveType::TimestampNtz,
             PrimitiveType::Void,
             PrimitiveType::interval_year_month(IntervalYearToMonthType::IntervalYearToMonth),
-            PrimitiveType::IntervalDayTime
+            PrimitiveType::interval_day_time(IntervalDayToSecondType::IntervalDayToSecond)
         )]
         primitive: PrimitiveType,
     ) {

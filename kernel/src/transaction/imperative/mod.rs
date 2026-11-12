@@ -365,9 +365,12 @@ impl<STATE> Transaction<STATE, Imperative> {
         metadata: Option<&Metadata>,
         set_transactions: Vec<SetTransaction>,
     ) -> KernelResult<CommitBatches<'a>> {
-        let set_transaction_actions = set_transactions
-            .into_iter()
-            .map(|txn| create_row(engine, LOG_TXN_SCHEMA.clone(), txn));
+        let set_transaction_actions = (!set_transactions.is_empty()).then(|| {
+            let rows = set_transactions.into_iter().map(|txn| vec![txn.into()]);
+            engine
+                .evaluation_handler()
+                .create_many(LOG_TXN_SCHEMA.clone(), Vec::from_iter(rows))
+        });
         let commit_info_action = self.generate_commit_info(engine, kernel_commit_info);
         let protocol_action = protocol
             .map(|protocol| create_row(engine, LOG_PROTOCOL_SCHEMA.clone(), protocol.clone()))
@@ -381,11 +384,12 @@ impl<STATE> Transaction<STATE, Imperative> {
 
         let dm_changes =
             self.generate_domain_metadata_actions(engine, row_tracking_domain_metadata)?;
-        let domain_metadata_actions: Vec<_> = dm_changes
-            .iter()
-            .cloned()
-            .map(|dm| create_row(engine, LOG_DOMAIN_METADATA_SCHEMA.clone(), dm))
-            .collect();
+        let domain_metadata_actions = (!dm_changes.is_empty()).then(|| {
+            let rows = dm_changes.iter().map(|dm| vec![dm.clone().into()]);
+            engine
+                .evaluation_handler()
+                .create_many(LOG_DOMAIN_METADATA_SCHEMA.clone(), Vec::from_iter(rows))
+        });
 
         let dv_update_actions = self.generate_dv_update_actions(engine)?;
 
@@ -853,11 +857,11 @@ mod tests {
     use crate::arrow::datatypes::{DataType as ArrowDataType, Schema as ArrowSchema};
     use crate::arrow::record_batch::RecordBatch;
     use crate::committer::FileSystemCommitter;
+    use crate::engine::DelegatingEngine;
     use crate::engine::arrow_conversion::TryIntoArrow;
     use crate::engine::arrow_data::ArrowEngineData;
     use crate::engine::arrow_expression::ArrowEvaluationHandler;
     use crate::engine::sync::SyncEngine;
-    use crate::engine::test_delegating::DelegatingEngine;
     use crate::expressions::{ExpressionRef, MapData, PredicateRef, Scalar, StructData};
     use crate::scan::log_replay::PATH_NAME;
     use crate::schema::{MapType, column_name, schema};

@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use tracing::debug;
+use tracing::trace;
 use url::Url;
 
 use crate::engine::arrow_utils;
@@ -71,7 +71,7 @@ impl JsonHandler for PlanBasedJsonHandler {
                  handler is configured",
             ));
         };
-        debug!(%path, "PlanBasedJsonHandler delegating write_json_file to fallback handler");
+        trace!(%path, "PlanBasedJsonHandler delegating write_json_file to fallback handler");
         fallback.write_json_file(path, data, overwrite)
     }
 }

@@ -68,8 +68,8 @@ mod tests {
     use super::*;
     use crate::Result;
     use crate::crc::Crc;
+    use crate::engine::DelegatingEngine;
     use crate::engine::arrow_data::EngineDataArrowExt as _;
-    use crate::engine::test_delegating::DelegatingEngine;
     use crate::plans::Operation as PlanOperation;
     use crate::plans::ir::nodes::Operator;
     use crate::scan::scan_plan::tests::log_segment;
@@ -105,7 +105,7 @@ mod tests {
         let crc = Some(crc);
         let snapshot = Arc::new(Snapshot::new_with_crc(segment, config, crc, false, false)?);
         let scan = snapshot.scan_builder().build()?;
-        let planner = MetadataPlanner::try_new(&scan)?;
+        let planner = MetadataPlanner::try_from_scan(&scan)?;
         let base = MetadataReplayBase::try_new(&scan.snapshot, &engine, &planner)?;
         assert_eq!(base.version(), Some(version));
         let is_crc = matches!(base, MetadataReplayBase::Crc { .. });

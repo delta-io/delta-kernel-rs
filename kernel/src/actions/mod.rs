@@ -23,8 +23,7 @@ use crate::expressions::{ArrayData, StructData};
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::schema::{ArrayType, DataType, schema};
 use crate::schema::{
-    SchemaRef, StructField, StructType, ToSchema as _, is_unsupported_delta_type_error,
-    lazy_schema_ref, schema_ref,
+    SchemaRef, StructField, StructType, ToSchema as _, lazy_schema_ref, schema_ref,
 };
 use crate::table_features::{
     FeatureType, LEGACY_READER_FEATURES, MIN_VALID_RW_VERSION, TABLE_FEATURES_MIN_READER_VERSION,
@@ -37,13 +36,15 @@ use crate::{Engine, Version, create_row};
 use crate::{EngineData, FileMeta, KernelError, KernelResult, RowVisitor as _};
 
 const KERNEL_VERSION: &str = env!("CARGO_PKG_VERSION");
-const SERDE_JSON_RECURSION_LIMIT_ERROR_PREFIX: &str = "recursion limit exceeded";
+const SCHEMA_RECURSION_LIMIT: usize = 1000;
 const UNKNOWN_OPERATION: &str = "UNKNOWN";
 pub(crate) const ROW_TRACKING_PRESERVED_TAG: &str = "delta.rowTracking.preserved";
 
 pub mod deletion_vector;
 pub mod deletion_vector_writer;
 pub mod set_transaction;
+
+mod schema_deserializer;
 
 // see comment in ../lib.rs for the path module for why we include this way
 #[cfg(feature = "internal-api")]
@@ -483,6 +484,10 @@ impl Metadata {
 
     /// Parses the table schema from its JSON representation.
     ///
+    /// Decoding fails when nesting reaches `SCHEMA_RECURSION_LIMIT`, counting JSON objects and
+    /// arrays, including field metadata. Each nested struct adds three containers. Unknown
+    /// fields skipped by the deserializer do not count toward the limit.
+    ///
     /// # Errors
     ///
     /// Returns [`KernelError::Schema`] when the schema exceeds the supported decoding depth or
@@ -490,26 +495,7 @@ impl Metadata {
     /// JSON decoding failures.
     #[internal_api]
     pub(crate) fn parse_schema(&self) -> KernelResult<StructType> {
-        // TODO(#1896): Increase the supported nesting depth or use non-recursive schema decoding.
-        serde_json::from_str(&self.schema_string).map_err(|error| {
-            // serde_json keeps ErrorCode::RecursionLimitExceeded private, so we use string
-            // matching.
-            if error.is_syntax()
-                && error
-                    .to_string()
-                    .starts_with(SERDE_JSON_RECURSION_LIMIT_ERROR_PREFIX)
-            {
-                KernelError::schema(format!(
-                    "Table schema is too deeply nested: decoding metaData.schemaString exceeded \
-                     serde_json's recursion limit: {error}"
-                ))
-                .with_backtrace()
-            } else if is_unsupported_delta_type_error(&error) {
-                KernelError::schema(error.to_string()).with_backtrace()
-            } else {
-                error.into()
-            }
-        })
+        schema_deserializer::parse(&self.schema_string, SCHEMA_RECURSION_LIMIT)
     }
 
     #[internal_api]
@@ -1500,6 +1486,13 @@ impl LastManifestCommit {
         );
         Ok(())
     }
+
+    /// Parses the first `commitInfo.lastManifestCommit` in `data`, if any.
+    pub(crate) fn try_new_from_data(data: &dyn EngineData) -> KernelResult<Option<Self>> {
+        let mut visitor = visitors::LastManifestCommitVisitor::default();
+        visitor.visit_rows_of(data)?;
+        Ok(visitor.last_manifest_commit)
+    }
 }
 
 /// The checkpoint action embeds metadata tree state in a Delta log entry.
@@ -2108,18 +2101,17 @@ mod tests {
     };
     use crate::arrow::datatypes::{DataType as ArrowDataType, Field, Schema};
     use crate::arrow::json::ReaderBuilder;
+    use crate::create_row;
     use crate::engine::arrow_data::EngineDataArrowExt as _;
     use crate::engine::arrow_expression::ArrowEvaluationHandler;
     #[cfg(feature = "adaptive-metadata-in-dev")]
     use crate::engine::to_json_bytes;
+    use crate::engine::{DelegatingEngine, PanicEngine};
     #[cfg(feature = "adaptive-metadata-in-dev")]
     use crate::engine_data::FilteredEngineData;
     use crate::expressions::{Scalar, StructData};
     use crate::schema::{DataType, MapType, StructField, schema, schema_ref};
     use crate::unit_test_utils::assert_result_error_with_message;
-    use crate::{
-        Engine, EvaluationHandler, JsonHandler, ParquetHandler, StorageHandler, create_row,
-    };
 
     #[rstest]
     #[case::add(ADD_NAME, Some("path"))]
@@ -2137,31 +2129,11 @@ mod tests {
         assert_eq!(action_presence_leaf(action_name), expected_leaf);
     }
 
-    // duplicated
-    struct ExprEngine(Arc<dyn EvaluationHandler>);
-
-    impl ExprEngine {
-        fn new() -> Self {
-            ExprEngine(Arc::new(ArrowEvaluationHandler))
-        }
-    }
-
-    impl Engine for ExprEngine {
-        fn evaluation_handler(&self) -> Arc<dyn EvaluationHandler> {
-            self.0.clone()
-        }
-
-        fn json_handler(&self) -> Arc<dyn JsonHandler> {
-            unimplemented!()
-        }
-
-        fn parquet_handler(&self) -> Arc<dyn ParquetHandler> {
-            unimplemented!()
-        }
-
-        fn storage_handler(&self) -> Arc<dyn StorageHandler> {
-            unimplemented!()
-        }
+    /// Allows Arrow expression evaluation and rejects other required handler access.
+    fn expr_engine() -> DelegatingEngine {
+        DelegatingEngine::new(Arc::new(PanicEngine))
+            .with_evaluation_handler(Arc::new(ArrowEvaluationHandler))
+            .without_plan_executor()
     }
 
     #[rstest]
@@ -2233,8 +2205,9 @@ mod tests {
     }
 
     #[rstest]
-    #[case::supported(41, false)]
-    #[case::exceeded(42, true)]
+    #[case::formerly_rejected(42, false)]
+    #[case::supported(331, false)]
+    #[case::exceeded(332, true)]
     fn parse_schema_nesting_boundary(#[case] depth: usize, #[case] exceeds_limit: bool) {
         let metadata = Metadata {
             schema_string: Arc::new(serde_json::to_string(&nested_schema(depth)).unwrap()),
@@ -2247,8 +2220,7 @@ mod tests {
                 result.as_ref(),
                 concat!(
                     "Schema error: Table schema is too deeply nested: decoding ",
-                    "metaData.schemaString exceeded serde_json's ",
-                    "recursion limit: recursion limit exceeded"
+                    "metaData.schemaString reached the JSON recursion limit of 1000"
                 ),
             );
             let error = match result.unwrap_err() {
@@ -2920,7 +2892,7 @@ mod tests {
 
     #[test]
     fn test_metadata_with_log_schema() {
-        let engine = ExprEngine::new();
+        let engine = expr_engine();
         let schema = schema_ref! { not_null "id": INTEGER };
 
         let metadata = Metadata::try_new(
@@ -2968,7 +2940,7 @@ mod tests {
 
     #[test]
     fn test_protocol_creates_log_row() {
-        let engine = ExprEngine::new();
+        let engine = expr_engine();
         let protocol = Protocol::try_new_modern(
             [TableFeature::DeletionVectors, TableFeature::ColumnMapping],
             [TableFeature::DeletionVectors, TableFeature::ColumnMapping],
@@ -3349,7 +3321,7 @@ mod tests {
     #[cfg(feature = "adaptive-metadata-in-dev")]
     #[test]
     fn test_checkpoint_action_scalar_round_trip() -> KernelResult<()> {
-        let engine = ExprEngine::new();
+        let engine = expr_engine();
         let action = sample_checkpoint_action();
         let scalar = action.clone().try_into_scalar()?;
         let data = create_row(&engine, LOG_CHECKPOINT_SCHEMA.clone(), scalar)?;
@@ -3384,7 +3356,7 @@ mod tests {
         // pin the exact bytes. This is the only guard on the wire format: element order, camelCase
         // field names, the sidecar `type` discriminator, and the JSON writer's null omission (the
         // null union siblings collapse each element to a single-key tagged object).
-        let engine = ExprEngine::new();
+        let engine = expr_engine();
         let scalar = sample_checkpoint_action().try_into_scalar()?;
         let data = create_row(&engine, LOG_CHECKPOINT_SCHEMA.clone(), scalar)?;
         let filtered = FilteredEngineData::with_all_rows_selected(data);
@@ -3470,7 +3442,7 @@ mod tests {
             txn_sidecars: vec![sidecar("t1.parquet"), sidecar("t2.parquet")],
             domain_metadata_sidecars: vec![],
         };
-        let engine = ExprEngine::new();
+        let engine = expr_engine();
         let scalar = action.clone().try_into_scalar()?;
         let data = create_row(&engine, LOG_CHECKPOINT_SCHEMA.clone(), scalar)?;
         let back = CheckpointAction::try_new_from_data(data.as_ref())?
@@ -3493,7 +3465,7 @@ mod tests {
             ),
             ..sample_checkpoint_action()
         };
-        let engine = ExprEngine::new();
+        let engine = expr_engine();
         let scalar = action.clone().try_into_scalar()?;
         let data = create_row(&engine, LOG_CHECKPOINT_SCHEMA.clone(), scalar)?;
         let back = CheckpointAction::try_new_from_data(data.as_ref())?

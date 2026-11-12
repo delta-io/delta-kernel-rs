@@ -15,10 +15,10 @@ use crate::arrow::json::WriterBuilder;
 use crate::arrow::json::writer::JsonArray;
 use crate::arrow::record_batch::RecordBatch;
 use crate::arrow::util::pretty::pretty_format_batches;
+use crate::engine::DelegatingEngine;
 use crate::engine::arrow_conversion::TryIntoArrow as _;
 use crate::engine::arrow_data::EngineDataArrowExt as _;
 use crate::engine::sync::SyncEngine;
-use crate::engine::test_delegating::DelegatingEngine;
 use crate::expressions::{Predicate as Pred, column_name, expr};
 use crate::plans::Operation as PlanOperation;
 use crate::plans::ir::nodes::Operator;
@@ -1286,7 +1286,7 @@ fn test_declarative_metadata_scan_plan_no_executor_returns_unsupported() -> Resu
         .declarative_metadata_scan_plan(&no_plan_engine)
         .unwrap_err();
 
-    assert!(matches!(err, crate::KernelError::Unsupported(_)));
+    assert!(matches!(err, KernelError::Unsupported(_)));
 
     let scan = snapshot
         .scan_builder()

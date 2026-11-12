@@ -4,7 +4,7 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use tracing::{Level, debug, enabled, warn};
+use tracing::{Level, debug, enabled, trace, warn};
 use url::Url;
 
 use crate::actions::NULL_COUNT;
@@ -284,10 +284,10 @@ fn build_data_skipping_schemas(
         }
         // Requested columns bypass the indexed set and seed the stats schema; predicate refs join
         // the schema so kernel can still prune.
-        (StructStats::Columns { .. }, _) if requested_physical_stats_columns.is_some() => {
-            let mut filter = requested_physical_stats_columns
-                .unwrap_or_default()
-                .to_vec();
+        (StructStats::Columns { .. }, _)
+            if let Some(requested) = requested_physical_stats_columns =>
+        {
+            let mut filter = requested.to_vec();
             union_extra_into_filter(&mut filter, &predicate_refs_physical);
             build_stats_schema(requested_physical_stats_columns, Some(&filter))?
         }
@@ -395,13 +395,29 @@ impl StateInfo {
         stats.validate()?;
         let partition_columns = table_configuration.logical_partition_columns();
         let column_mapping_mode = table_configuration.column_mapping_mode();
-        let mut read_fields = Vec::with_capacity(logical_read_schema.num_fields());
-        let mut transform_spec = Vec::with_capacity(logical_read_schema.num_fields());
+        // Pointer identity proves this is the validated table schema, so its physical schema
+        // can be reused without converting fields again.
+        let reuse_physical_schema = classifier.classifies_no_fields()
+            && Arc::ptr_eq(
+                &logical_read_schema,
+                table_configuration.logical_schema_ref(),
+            )
+            && logical_read_schema.metadata_columns().next().is_none();
+        let mut read_fields = Vec::with_capacity(if reuse_physical_schema {
+            0
+        } else {
+            logical_read_schema.num_fields()
+        });
+        let mut transform_spec = Vec::with_capacity(if reuse_physical_schema {
+            partition_columns.len()
+        } else {
+            logical_read_schema.num_fields()
+        });
         let mut last_physical_field: Option<String> = None;
 
         let metadata_info = validate_metadata_columns(&logical_read_schema, table_configuration)?;
 
-        // Loop over all selected fields and build both the physical schema and transform spec
+        // Even when the physical schema is reused, partition columns still need transform specs.
         for (index, logical_field) in logical_read_schema.fields().enumerate() {
             if let Some(spec) =
                 classifier.classify_field(logical_field, index, &last_physical_field)
@@ -483,9 +499,15 @@ impl StateInfo {
                         // note that RowIndex and FilePath are handled in the parquet reader so we
                         // just add them as if they're normal physical
                         // columns
-                        let physical_field = logical_field.make_physical(column_mapping_mode)?;
-                        debug!("\n\n{logical_field:#?}\nAfter mapping: {physical_field:#?}\n\n");
-                        let physical_name = physical_field.name.clone();
+                        let physical_name = if reuse_physical_schema {
+                            logical_field.physical_name(column_mapping_mode).to_owned()
+                        } else {
+                            let field = logical_field.make_physical(column_mapping_mode)?;
+                            trace!("\n\n{logical_field:#?}\nAfter mapping: {field:#?}\n\n");
+                            let name = field.name.clone();
+                            read_fields.push(field);
+                            name
+                        };
 
                         if !logical_field.is_metadata_column()
                             && metadata_info.metadata_field_names.contains(&physical_name)
@@ -497,13 +519,16 @@ impl StateInfo {
                             )));
                         }
                         last_physical_field = Some(physical_name);
-                        read_fields.push(physical_field);
                     }
                 }
             }
         }
 
-        let physical_schema = Arc::new(StructType::try_new(read_fields)?);
+        let physical_schema = if reuse_physical_schema {
+            table_configuration.physical_data_schema_without_partition_columns()
+        } else {
+            Arc::new(StructType::try_new(read_fields)?)
+        };
 
         // Logical column names referenced by the predicate. Fed into the stats schema
         // build below and into the dropped-refs observability log.
@@ -689,6 +714,7 @@ pub(crate) mod tests {
     use crate::expressions::{Predicate as Pred, column_name, expr};
     #[cfg(feature = "geo-type-in-dev")]
     use crate::scan::build_stats_output_schemas;
+    use crate::scan::field_classifiers::CdfTransformFieldClassifier;
     #[cfg(feature = "geo-type-in-dev")]
     use crate::schema::GeometryType;
     use crate::schema::{ColumnMetadataKey, MetadataValue, schema, schema_ref};
@@ -696,6 +722,88 @@ pub(crate) mod tests {
     use crate::unit_test_utils::{
         MockProtocolBuilder, MockTableConfigurationBuilder, assert_result_error_with_message,
     };
+
+    #[rstest]
+    fn default_scan_reuses_physical_schema(
+        #[values("none", "name", "id")] mapping: &str,
+        #[values(false, true)] partitioned: bool,
+    ) {
+        let schema = Arc::new(StructType::new_unchecked([
+            cm_field("part", 1, "physical_part", DataType::STRING),
+            cm_field(
+                "nested",
+                2,
+                "physical_nested",
+                StructType::new_unchecked([cm_field("value", 3, "physical_value", DataType::LONG)]),
+            ),
+        ]));
+        let features = if mapping == "none" {
+            vec![]
+        } else {
+            vec![TableFeature::ColumnMapping]
+        };
+        let config = MockTableConfigurationBuilder::new()
+            .with_schema(schema)
+            .with_protocol(MockProtocolBuilder::new().with_features(&features).build())
+            .with_properties(get_string_map(&[("delta.columnMapping.mode", mapping)]))
+            .with_partition_columns(partitioned.then_some("part"))
+            .build();
+        let logical = config.logical_schema();
+        let make_state = |read_schema| {
+            StateInfo::try_new(
+                read_schema,
+                logical.clone(),
+                &config,
+                None,
+                &StatsOptions::default(),
+                &PartitionValuesOptions::default(),
+                (),
+            )
+            .unwrap()
+        };
+        let cached = config.physical_data_schema_without_partition_columns();
+        let state = make_state(logical.clone());
+        assert!(Arc::ptr_eq(&state.physical_schema, &cached));
+
+        let independent = make_state(Arc::new(logical.as_ref().clone()));
+        assert!(!Arc::ptr_eq(&independent.physical_schema, &cached));
+        assert_eq!(state.physical_schema, independent.physical_schema);
+        assert_eq!(state.transform_spec, independent.transform_spec);
+
+        let projected = Arc::new(StructType::new_unchecked([logical
+            .field("nested")
+            .unwrap()
+            .clone()]));
+        let projected = make_state(projected);
+        assert!(!Arc::ptr_eq(&projected.physical_schema, &cached));
+        assert_eq!(projected.physical_schema.num_fields(), 1);
+        assert_eq!(
+            projected.physical_schema.fields().next(),
+            cached.fields().last()
+        );
+
+        let with_metadata = make_state(Arc::new(
+            logical
+                .add_metadata_column("file_path", MetadataColumnSpec::FilePath)
+                .unwrap(),
+        ));
+        assert!(!Arc::ptr_eq(&with_metadata.physical_schema, &cached));
+        assert!(with_metadata.physical_schema.field("file_path").is_some());
+
+        let classified = StateInfo::try_new(
+            logical.clone(),
+            logical,
+            &config,
+            None,
+            &StatsOptions::default(),
+            &PartitionValuesOptions::default(),
+            CdfTransformFieldClassifier,
+        )
+        .unwrap();
+        assert!(!Arc::ptr_eq(&classified.physical_schema, &cached));
+        assert_eq!(state.physical_schema, classified.physical_schema);
+        assert_eq!(state.transform_spec, classified.transform_spec);
+    }
 
     #[test]
     fn stats_schemas_can_both_be_absent() {

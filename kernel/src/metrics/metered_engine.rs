@@ -92,8 +92,8 @@ mod tests {
     use url::Url;
 
     use super::*;
+    use crate::engine::DelegatingEngine;
     use crate::engine::sync::SyncEngine;
-    use crate::engine::test_delegating::DelegatingEngine;
     use crate::metrics::MetricEvent;
     use crate::unit_test_utils::{CapturingReporter, install_thread_local_metrics_reporter};
     use crate::{FileMeta, FileSlice, KernelResult, KernelResultIterator};
