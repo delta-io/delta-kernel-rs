@@ -81,7 +81,9 @@ impl SnapshotCrc {
         };
         require!(
             valid_provenance,
-            KernelError::internal_error("Checksum provenance conflicts with retained checksum")
+            KernelError::internal_error(
+                "Checksum source or baseline version conflicts with retained checksum"
+            )
         );
         Ok(())
     }

@@ -754,31 +754,37 @@ struct VisitedHint {
     Some(SelectedCheckpointType::V1),
     CrcSource::AtVersion,
     Some(1),
-    "checkpoint provenance conflicts"
+    "supplied checkpoint type conflicts"
 )]
-#[case::crc_claim(Some(1), None, CrcSource::Reconstructed { num_commits: 2 }, Some(0), "checksum provenance conflicts")]
+#[case::crc_claim(Some(1), None, CrcSource::Reconstructed { num_commits: 2 }, Some(0), "checksum source or baseline version conflicts")]
 #[case::at_version_without_crc(
     None,
     None,
     CrcSource::AtVersion,
     Some(1),
-    "checksum provenance conflicts"
+    "checksum source or baseline version conflicts"
 )]
-#[case::reconstructed_without_crc(None, None, CrcSource::Reconstructed { num_commits: 1 }, Some(0), "checksum provenance conflicts")]
-#[case::stale_without_crc(None, None, CrcSource::Stale, Some(0), "checksum provenance conflicts")]
+#[case::reconstructed_without_crc(None, None, CrcSource::Reconstructed { num_commits: 1 }, Some(0), "checksum source or baseline version conflicts")]
+#[case::stale_without_crc(
+    None,
+    None,
+    CrcSource::Stale,
+    Some(0),
+    "checksum source or baseline version conflicts"
+)]
 #[case::missing_with_crc(
     Some(1),
     None,
     CrcSource::Missing,
     None,
-    "checksum provenance conflicts"
+    "checksum source or baseline version conflicts"
 )]
 #[case::unusable_with_crc(
     Some(1),
     None,
     CrcSource::Unusable,
     None,
-    "checksum provenance conflicts"
+    "checksum source or baseline version conflicts"
 )]
 fn hint_provenance_failures_are_invalid_snapshot_hints(
     #[case] crc_version: Option<u64>,

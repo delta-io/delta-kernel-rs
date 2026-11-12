@@ -214,10 +214,14 @@ pub enum SnapshotHintError {
         checkpoint: Version,
     },
     /// The claimed checkpoint type conflicts with the selected checkpoint.
-    #[error("Invalid snapshot hint: checkpoint provenance conflicts with selected checkpoint")]
+    #[error(
+        "Invalid snapshot hint: supplied checkpoint type conflicts with the selected checkpoint"
+    )]
     CheckpointProvenanceConflict,
-    /// The claimed checksum origin conflicts with the retained checksum.
-    #[error("Invalid snapshot hint: checksum provenance conflicts with retained checksum")]
+    /// The supplied checksum source or baseline version conflicts with the retained checksum.
+    #[error(
+        "Invalid snapshot hint: checksum source or baseline version conflicts with retained checksum"
+    )]
     CrcProvenanceConflict,
 }
 
