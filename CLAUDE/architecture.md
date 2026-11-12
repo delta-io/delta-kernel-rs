@@ -12,6 +12,7 @@ design decisions. This map provides entry points and broader design context.
 | Task | Start here | Related implementation |
 |------|------------|------------------------|
 | Load or refresh a snapshot | `kernel/src/snapshot/` | `log_segment/`, `log_reader/`, `crc/` |
+| Inspect retained checkpoint and checksum provenance | `kernel/src/snapshot/provenance.rs` | `snapshot/hint.rs`, `log_segment/provenance.rs` |
 | Build or execute a read | `kernel/src/scan/` | `log_replay/`, `actions/deletion_vector.rs` |
 | Read changes between versions | `kernel/src/incremental_scan/`, `kernel/src/table_changes/` | `log_replay/` |
 | Create or modify a table | `kernel/src/transaction/` | `committer/`, `partition/` |

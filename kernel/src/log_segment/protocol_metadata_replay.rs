@@ -115,7 +115,7 @@ impl LogSegment {
         // A listed checkpoint file truncates the log listing and holds the P&M as of where the
         // replay starts. Without one, the P&M may be only in the checkpoint action that the newest
         // commit's `lastManifestCommit` points at.
-        let candidate = match self.checkpoint_version {
+        let candidate = match self.checkpoint_version() {
             Some(_) => self.replay_for_pm(engine)?,
             None => self.replay_for_pm_with_unbounded_segment(engine)?,
         };
@@ -325,7 +325,7 @@ impl LogSegment {
         let commit_schema = Arc::new(StructType::try_new(
             commit_schema.fields().cloned().chain([file_column]),
         )?);
-        let checkpoint_version = self.checkpoint_version.map(|v| v as i64);
+        let checkpoint_version = self.checkpoint_version().map(|v| v as i64);
         let batches = self
             .read_actions_with_projected_checkpoint_actions(
                 engine,

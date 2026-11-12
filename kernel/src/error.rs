@@ -182,7 +182,7 @@ pub enum SnapshotHintError {
     /// The hint has neither a complete checkpoint nor commit version zero.
     #[error("Invalid snapshot hint: snapshot history does not start at version 0")]
     MissingHistoryAnchor,
-    /// The supplied CRC describes a different table version.
+    /// The supplied CRC is newer than the hint, or is older without attached provenance.
     #[error("Invalid snapshot hint: CRC version {crc} does not match snapshot hint version {hint}")]
     CrcVersion {
         /// The version described by the CRC.
@@ -205,6 +205,24 @@ pub enum SnapshotHintError {
         #[source]
         source: Option<Box<KernelError>>,
     },
+    /// The supplied CRC predates the selected checkpoint and cannot seed its replay history.
+    #[error("Invalid snapshot hint: CRC version {crc} is below checkpoint version {checkpoint}")]
+    CrcBeforeCheckpoint {
+        /// The version described by the CRC.
+        crc: Version,
+        /// The selected checkpoint version.
+        checkpoint: Version,
+    },
+    /// The claimed checkpoint type conflicts with the selected checkpoint.
+    #[error(
+        "Invalid snapshot hint: supplied checkpoint type conflicts with the selected checkpoint"
+    )]
+    CheckpointProvenanceConflict,
+    /// The supplied checksum source or baseline version conflicts with the retained checksum.
+    #[error(
+        "Invalid snapshot hint: checksum source or baseline version conflicts with retained checksum"
+    )]
+    CrcProvenanceConflict,
 }
 
 impl From<SnapshotHintError> for KernelError {

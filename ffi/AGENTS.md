@@ -765,6 +765,8 @@ pub struct FfiSnapshotHint {
     pub last_checkpoint: *const FfiLastCheckpoint,
     pub crc: *const FfiCrc,
     pub publication_watermark: FfiPublicationWatermark,
+    pub checkpoint_type: OptionalValue<FfiSelectedCheckpointType>,
+    pub crc_provenance: OptionalValue<FfiCrcProvenance>,
 }
 
 pub unsafe extern "C" fn snapshot_builder_with_snapshot_hint(
@@ -791,6 +793,7 @@ FFI-specific ownership, conversion, and engine support code can use its own modu
   with their backing storage and conversions colocated
 - `src/snapshot/builder.rs` -- snapshot builders and their configuration
 - `src/snapshot/hint/` -- typed snapshot-hint input and callback export
+- `src/snapshot/provenance.rs` -- retained checkpoint and checksum provenance getters
 - `src/handle.rs` -- opaque handle system for passing Rust objects across FFI
 - `src/column_default.rs` -- column-default (`allowColumnDefaults`) reads and the write-path ack
 - `src/scan.rs` -- scan FFI interface
@@ -817,9 +820,10 @@ Snapshot builder API (`ffi/src/snapshot/builder.rs` and `ffi/src/snapshot/hint/m
 - `snapshot_builder_with_max_catalog_version(builder, version)` -- optional: set max catalog version (for catalog-managed tables)
 - `snapshot_builder_with_snapshot_hint(builder, hint)` -- optional: validate and copy a complete
   typed snapshot hint into the builder. Log paths may name published or staged commits, checkpoint
-  files, or CRC files; log compaction paths are rejected. Kernel validates every supplied path beneath
-  the builder's `_delta_log` root before grouping and checkpoint selection, preserving supplied
-  locations. The connector must canonicalize paths into the same URL form as the table root.
+  files, or CRC files; log compaction paths are ignored, so individual commits must also be supplied.
+  Kernel validates every supplied path beneath the builder's `_delta_log` root before grouping and
+  checkpoint selection, preserving supplied locations. The connector must canonicalize paths into
+  the same URL form as the table root.
   A failed call consumes and drops the builder
 - `snapshot_builder_build(builder)` -- consume the builder and produce a `SharedSnapshot`
 - `free_snapshot_builder(builder)` -- discard without building (e.g. on error paths)
@@ -836,8 +840,14 @@ engine I/O through one callback with a complete borrowed `FfiSnapshotHint`. Both
 borrowed. The callback runs once on success and is not invoked on error. All nested pointers expire
 when the callback returns; copy retained values during the callback. No hint handle is returned.
 Supply the copied values through `snapshot_builder_with_snapshot_hint` when rebuilding a snapshot.
-The hint preserves build-time freshness, not current freshness, and includes only a matching
-checkpoint hint and an at-version CRC. Compaction files are unsupported.
+The hint preserves build-time freshness, a matching checkpoint hint, retained CRC state (including
+stale baselines), and checkpoint and CRC provenance. `crc` is null only when no checksum is retained.
+The checkpoint type is `None` when no checkpoint was selected, or `Unresolved`/`V1`/`V2` for a
+selected checkpoint. Snapshot observations stay fixed after construction; reads do not refine them.
+Input hints may omit a type claim and let the paths establish presence. Checksum provenance may
+also be omitted, which becomes `Unknown`; exports always include it, preserving `Missing`/`Unusable`
+with a null CRC. Claims of a usable checksum require a non-null CRC. Export rejects retained
+compaction files.
 
 Export includes an explicit publication watermark,
 preserving absence even when published commits are not represented by the retained paths.

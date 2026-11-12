@@ -36,6 +36,7 @@ use crate::plans::ir::nodes::Operator;
 #[cfg(feature = "declarative-plans")]
 use crate::plans::{Operation, PlanExecutor, PlanResult};
 use crate::schema::SchemaRef;
+use crate::snapshot::CrcProvenance;
 use crate::table_features::TableFeature;
 use crate::transaction::UpdateTableOperation;
 use crate::unit_test_utils::adaptive_metadata_fixtures::{
@@ -742,7 +743,7 @@ async fn check_pointed_action_above_segment_checkpoint<E: Engine>(
 
     let engine = make_engine(store);
     let log_segment = latest_log_segment(&table_root, &engine);
-    assert_eq!(log_segment.checkpoint_version, Some(1));
+    assert_eq!(log_segment.checkpoint_version(), Some(1));
     let resolution = log_segment
         .read_protocol_metadata_opt(&engine, None)
         .unwrap();
@@ -833,7 +834,7 @@ async fn check_standalone_checkpoint_above_pointed_commit<E: Engine>(
 
     let engine = make_engine(store);
     let log_segment = latest_log_segment(&table_root, &engine);
-    assert_eq!(log_segment.checkpoint_version, Some(1));
+    assert_eq!(log_segment.checkpoint_version(), Some(1));
     let resolution = log_segment
         .read_protocol_metadata_opt(&engine, None)
         .unwrap();
@@ -880,7 +881,7 @@ async fn check_segment_ending_on_checkpoint<E: Engine>(
 
     let engine = make_engine(store);
     let log_segment = latest_log_segment(&table_root, &engine);
-    assert_eq!(log_segment.checkpoint_version, Some(0));
+    assert_eq!(log_segment.checkpoint_version(), Some(0));
     let resolution = log_segment
         .read_protocol_metadata_opt(&engine, None)
         .unwrap();
@@ -1333,6 +1334,7 @@ async fn snapshot_with_crc_at_version_serves_last_manifest_commit_from_crc(
         loaded.log_segment().clone(),
         loaded.table_configuration().clone(),
         Some(Arc::new(crc)),
+        CrcProvenance::default(),
         false, /* built_as_latest */
         false, /* skipped_new_checkpoints */
     )
@@ -1367,7 +1369,7 @@ async fn snapshot_on_checkpoint_reads_last_manifest_commit_from_commit_file(
     }
 
     let snapshot = Snapshot::builder_for(table_root).build(&engine).unwrap();
-    assert_eq!(snapshot.log_segment().checkpoint_version, Some(0));
+    assert_eq!(snapshot.log_segment().checkpoint_version(), Some(0));
     let result = snapshot.last_manifest_commit(&engine);
     if delete_commit_file {
         // TODO(#3683): when the checkpoint is a standalone checkpoint, read lastManifestCommit

@@ -119,7 +119,7 @@ impl Scan {
         planner: &MetadataPlanner<'_>,
     ) -> KernelResult<Option<Plan>> {
         let base = MetadataReplayBase::Checkpoint {
-            version: self.snapshot.log_segment().checkpoint_version,
+            version: self.snapshot.log_segment().checkpoint_version(),
             shape: shape.clone(),
         };
         self.build_metadata_scan_plan_with(base, planner.clone())
@@ -222,7 +222,7 @@ mod tests {
     use crate::scan::data_skipping::stats_schema::expected_stats_schema;
     use crate::scan::{PartitionValuesOptions, StatsOptions};
     use crate::schema::StructType;
-    use crate::snapshot::Snapshot;
+    use crate::snapshot::{CrcProvenance, Snapshot};
     use crate::table_features::TableFeature;
     use crate::unit_test_utils::{
         MockProtocolBuilder, MockTableConfigurationBuilder, create_log_path,
@@ -267,7 +267,12 @@ mod tests {
             .unwrap_or_default();
         LogSegment {
             end_version,
-            checkpoint_version,
+            checkpoint: checkpoint_parts.first().map(|path| {
+                crate::log_segment::SelectedCheckpoint {
+                    version: path.version,
+                    checkpoint_type: crate::snapshot::SelectedCheckpointType::Unresolved,
+                }
+            }),
             log_root,
             listed: LogSegmentFiles {
                 ascending_commit_files,
@@ -761,9 +766,16 @@ mod tests {
                 ..Default::default()
             })
         });
-        let scan = Arc::new(Snapshot::new_with_crc(segment, config, crc, false, false)?)
-            .scan_builder()
-            .build()?;
+        let scan = Arc::new(Snapshot::new_with_crc(
+            segment,
+            config,
+            crc,
+            CrcProvenance::default(),
+            false,
+            false,
+        )?)
+        .scan_builder()
+        .build()?;
         let plan = scan
             .declarative_metadata_scan_plan(&engine)?
             .expect("non-empty");

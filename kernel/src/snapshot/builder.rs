@@ -1767,7 +1767,7 @@ pub(super) mod tests {
                         DowngradeRefresh::EarlierCheckpoint | DowngradeRefresh::TerminalCheckpoint
                     ) {
                         assert_eq!(
-                            updated.log_segment().checkpoint_version,
+                            updated.log_segment().checkpoint_version(),
                             Some(
                                 downgrade_version
                                     - u64::from(refresh == DowngradeRefresh::EarlierCheckpoint)
