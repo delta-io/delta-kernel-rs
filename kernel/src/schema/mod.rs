@@ -858,7 +858,7 @@ impl Display for StructField {
 #[derive(Debug, PartialEq, Eq)]
 pub struct StructType {
     type_name: String,
-    /// The fields stored in this struct
+    /// Fields are Arc-wrapped so schema subsets can share them.
     // We use indexmap to preserve the order of fields as they are defined in the schema
     // while also allowing for fast lookup by name. The alternative is to do a linear search
     // for each field by name would be potentially quite expensive for large schemas.
@@ -874,6 +874,7 @@ pub struct StructTypeBuilder {
 }
 
 impl Clone for StructType {
+    // Preserve deep-copy behavior; only share_selected_fields shares fields between schemas.
     fn clone(&self) -> Self {
         Self {
             type_name: self.type_name.clone(),
@@ -924,14 +925,17 @@ impl StructTypeBuilder {
 }
 
 impl StructType {
-    /// Builds a subset sharing immutable fields from this already-valid schema.
-    pub(crate) fn share_selected_fields(&self, mut keep: impl FnMut(usize) -> bool) -> Self {
+    /// Returns a subset whose retained fields share storage with this already-valid schema.
+    ///
+    /// Calls `keep` once per field in schema order, preserves that order, and rebuilds metadata
+    /// column indexes without revalidating fields. Mutable access must use copy-on-write to avoid
+    /// changing fields in the source schema.
+    pub(crate) fn share_selected_fields(&self, mut keep: impl FnMut(&StructField) -> bool) -> Self {
         let fields: IndexMap<_, _> = self
             .fields
             .iter()
-            .enumerate()
-            .filter(|(index, _)| keep(*index))
-            .map(|(_, (name, field))| (name.clone(), field.clone()))
+            .filter(|(_, field)| keep(field))
+            .map(|(name, field)| (name.clone(), field.clone()))
             .collect();
         let metadata_columns = fields
             .values()
@@ -1296,20 +1300,16 @@ impl StructType {
 
     /// Gets a reference to the metadata column with the given spec.
     pub fn metadata_column(&self, spec: &MetadataColumnSpec) -> Option<&StructField> {
-        self.metadata_columns.get(spec).and_then(|index| {
-            self.fields
-                .get_index(*index)
-                .map(|(_, field)| field.as_ref())
-        })
+        self.metadata_columns
+            .get(spec)
+            .and_then(|index| self.field_at_index(*index))
     }
 
     /// Gets an iterator over all the metadata columns in this struct type.
     pub fn metadata_columns(&self) -> impl Iterator<Item = &StructField> {
-        self.metadata_columns.values().filter_map(|index| {
-            self.fields
-                .get_index(*index)
-                .map(|(_, field)| field.as_ref())
-        })
+        self.metadata_columns
+            .values()
+            .filter_map(|index| self.field_at_index(*index))
     }
 
     /// Extracts the name and type of all leaf columns, in schema order. Caller should pass Some
@@ -3162,7 +3162,7 @@ mod tests {
     };
 
     #[test]
-    fn partition_subset_shares_fields_and_isolates_mutation() {
+    fn subset_shares_fields_and_preserves_serialization() {
         let schema = StructType::try_new([
             StructField::nullable("partition", DataType::STRING),
             StructField::not_null(
@@ -3173,7 +3173,7 @@ mod tests {
             ),
         ])
         .unwrap();
-        let mut subset = schema.share_selected_fields(|index| index == 1);
+        let subset = schema.share_selected_fields(|field| field.name() == "data");
         assert!(Arc::ptr_eq(&schema.fields["data"], &subset.fields["data"]));
         let expected = StructType::try_new([schema.field("data").unwrap().clone()]).unwrap();
         assert_eq!(subset, expected);
@@ -3181,11 +3181,13 @@ mod tests {
             serde_json::to_value(&subset).unwrap(),
             serde_json::to_value(&expected).unwrap()
         );
-        Arc::make_mut(subset.fields.get_mut("data").unwrap()).nullable = true;
-        assert!(!schema.field("data").unwrap().nullable);
-        assert!(subset.field("data").unwrap().nullable);
-        assert!(!Arc::ptr_eq(&schema.fields["data"], &subset.fields["data"]));
-        let shared = schema.share_selected_fields(|index| index == 1);
+    }
+
+    #[test]
+    fn subset_owned_fields_do_not_mutate_source() {
+        let schema = schema! { nullable "data": LONG };
+        let shared = schema.share_selected_fields(|_| true);
+        assert!(Arc::ptr_eq(&schema.fields["data"], &shared.fields["data"]));
         let mut owned = shared.into_fields().next().unwrap();
         owned
             .metadata
@@ -3194,14 +3196,31 @@ mod tests {
     }
 
     #[test]
-    fn partition_subset_reindexes_metadata_columns() {
+    fn clone_deep_copies_nested_fields() {
+        let schema = schema! {
+            nullable "data": {
+                nullable "nested": LONG,
+            },
+        };
+        let cloned = schema.clone();
+        assert_eq!(schema, cloned);
+        assert!(!Arc::ptr_eq(&schema.fields["data"], &cloned.fields["data"]));
+        let path = ["data".into(), "nested".into()];
+        assert!(!std::ptr::eq(
+            schema.field_at_path(&path),
+            cloned.field_at_path(&path)
+        ));
+    }
+
+    #[test]
+    fn subset_reindexes_metadata_columns() {
         let schema = StructType::try_new([
             StructField::nullable("partition", DataType::STRING),
             StructField::create_metadata_column("row_index", MetadataColumnSpec::RowIndex),
             StructField::nullable("value", DataType::LONG),
         ])
         .unwrap();
-        let subset = schema.share_selected_fields(|index| index != 0);
+        let subset = schema.share_selected_fields(|field| field.name() != "partition");
         assert_eq!(
             subset
                 .fields()
