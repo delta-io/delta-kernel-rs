@@ -689,11 +689,11 @@ impl Snapshot {
         self.crc.at_version()
     }
 
-    /// The held CRC regardless of version, for reuse that does not require an at-version CRC
-    /// (e.g. checksum writes). Prefer [`Self::crc_at_version`] for authoritative queries.
+    /// The CRC kept in memory regardless of version, for reuse that does not require an at-version
+    /// CRC (e.g. checksum writes). Prefer [`Self::crc_at_version`] for authoritative queries.
     /// Replaying `allFiles` from this CRC requires applying commits newer than its version.
     pub(crate) fn base_crc(&self) -> Option<&Arc<Crc>> {
-        self.crc.base()
+        self.crc.retained()
     }
 
     /// The stale CRC a tail-only replay can start from: [`Self::base_crc`], unless an AMT

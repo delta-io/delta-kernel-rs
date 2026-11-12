@@ -24,7 +24,7 @@ pub(crate) enum CrcOrigin {
 /// read from disk (or computed) at most once; keeping it lets later queries and CRC writes reuse
 /// the already-parsed state instead of re-reading it. A `Some(crc)` is one of:
 /// - at the snapshot version: authoritative, servable at zero I/O via [`Self::at_version`];
-/// - stale (older): kept only as a base for [`Self::base`], never served as authoritative.
+/// - stale (older): available through [`Self::retained`] for reuse, never served as authoritative.
 ///
 /// [`Snapshot`]: super::Snapshot
 #[derive(Debug, Clone)]
@@ -37,7 +37,7 @@ pub(super) struct SnapshotCrc {
 impl SnapshotCrc {
     /// Wrap the CRC a snapshot at `snapshot_version` resolved. A `Some(crc)` must sit in
     /// `[checkpoint_version, snapshot_version]`. `crc_origin` records the caller's observation of
-    /// the original disk checksum, independently of the retained CRC's version.
+    /// the original disk checksum, independently of the in-memory CRC's version.
     pub(super) fn try_new(
         crc: Option<Arc<Crc>>,
         snapshot_version: Version,
@@ -72,7 +72,7 @@ impl SnapshotCrc {
             (CrcSource::Unknown, None) => CrcOrigin::Unknown,
             (CrcSource::Missing, None) => CrcOrigin::Missing,
             (CrcSource::Unusable, None) => CrcOrigin::Unusable,
-            (_, Some(version)) if self.base().is_some_and(|crc| version <= crc.version) => {
+            (_, Some(version)) if self.retained().is_some_and(|crc| version <= crc.version) => {
                 CrcOrigin::Disk(version)
             }
             _ => return Err(SnapshotHintError::CrcProvenanceConflict.into()),
@@ -85,18 +85,18 @@ impl SnapshotCrc {
     }
 
     pub(super) fn provenance(&self) -> CrcProvenance {
-        let (source, base_version) = match (self.crc_origin, self.base()) {
-            (CrcOrigin::Disk(version), Some(crc)) => {
-                let source = if crc.version < self.snapshot_version {
+        let (source, base_version) = match (self.crc_origin, self.retained()) {
+            (CrcOrigin::Disk(disk_base_version), Some(retained_crc)) => {
+                let source = if retained_crc.version < self.snapshot_version {
                     CrcSource::Stale
-                } else if version == self.snapshot_version {
+                } else if disk_base_version == self.snapshot_version {
                     CrcSource::AtVersion
                 } else {
                     CrcSource::Reconstructed {
-                        num_commits: self.snapshot_version - version,
+                        num_commits: self.snapshot_version - disk_base_version,
                     }
                 };
-                (source, Some(version))
+                (source, Some(disk_base_version))
             }
             (CrcOrigin::Missing, None) => (CrcSource::Missing, None),
             (CrcOrigin::Unusable, None) => (CrcSource::Unusable, None),
@@ -117,7 +117,7 @@ impl SnapshotCrc {
     ) -> CrcOrigin {
         match base {
             Some(base) => previous
-                .filter(|old| old.base().is_some_and(|crc| Arc::ptr_eq(crc, base)))
+                .filter(|old| old.retained().is_some_and(|crc| Arc::ptr_eq(crc, base)))
                 .map_or(CrcOrigin::Disk(base.version), |old| old.crc_origin),
             None if candidate_present => CrcOrigin::Unusable,
             None => CrcOrigin::Missing,
@@ -132,9 +132,9 @@ impl SnapshotCrc {
             .filter(|crc| crc.version == self.snapshot_version)
     }
 
-    /// The held CRC, at-version or stale, for callers that reuse it regardless of version
-    /// (e.g. checksum writes).
-    pub(super) fn base(&self) -> Option<&Arc<Crc>> {
+    /// Returns the CRC kept in memory, whether at the snapshot version or stale.
+    /// It may have been read from disk or advanced by replaying commits.
+    pub(super) fn retained(&self) -> Option<&Arc<Crc>> {
         self.crc.as_ref()
     }
 }
@@ -177,28 +177,28 @@ mod tests {
     #[test]
     fn new_accepts_crc_at_checkpoint() {
         let holder = SnapshotCrc::try_new(Some(crc_at(3)), 5, Some(3), CrcOrigin::Unknown).unwrap();
-        assert_eq!(holder.base().map(|c| c.version), Some(3));
+        assert_eq!(holder.retained().map(|c| c.version), Some(3));
     }
 
     #[test]
     fn at_version_serves_crc_matching_snapshot_version() {
         let holder = SnapshotCrc::try_new(Some(crc_at(5)), 5, None, CrcOrigin::Unknown).unwrap();
         assert_eq!(holder.at_version().map(|c| c.version), Some(5));
-        assert_eq!(holder.base().map(|c| c.version), Some(5));
+        assert_eq!(holder.retained().map(|c| c.version), Some(5));
     }
 
     #[test]
-    fn stale_crc_is_base_but_not_at_version() {
+    fn stale_crc_is_retained_but_not_at_version() {
         let holder = SnapshotCrc::try_new(Some(crc_at(3)), 5, None, CrcOrigin::Unknown).unwrap();
         assert!(holder.at_version().is_none());
-        assert_eq!(holder.base().map(|c| c.version), Some(3));
+        assert_eq!(holder.retained().map(|c| c.version), Some(3));
     }
 
     #[test]
     fn none_holder_serves_nothing() {
         let holder = SnapshotCrc::try_new(None, 5, None, CrcOrigin::Unknown).unwrap();
         assert!(holder.at_version().is_none());
-        assert!(holder.base().is_none());
+        assert!(holder.retained().is_none());
     }
 
     #[rstest::rstest]
