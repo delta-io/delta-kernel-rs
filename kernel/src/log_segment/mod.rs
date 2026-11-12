@@ -626,15 +626,16 @@ impl LogSegment {
                 .checkpoint_parts
                 .first()
                 .map(|file| file.version);
-            if let Some(checkpoint) = checkpoint_version
-                && checkpoint.checked_add(1) == Some(*missing)
+            if checkpoint_version.and_then(|version| version.checked_add(1)) == Some(*missing)
                 && first.version > *missing
             {
-                Error::Delta(DeltaError::log_file_not_found(
-                    time_travel_version.unwrap_or(last.version),
-                    checkpoint,
-                    &log_root,
-                    Some(error),
+                // Segment validation precedes metadata loading, so retention policies are unknown.
+                Error::Delta(DeltaError::truncated_transaction_log(
+                    format!("{log_root}{missing:020}.json"),
+                    last.version,
+                    None,
+                    None,
+                    Some(Box::new(error)),
                 ))
             } else if *missing < last.version {
                 Error::Delta(DeltaError::versions_not_contiguous(

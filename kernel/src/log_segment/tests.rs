@@ -6326,6 +6326,7 @@ fn snapshot_with_amt_last_checkpoint_hint_skips_earlier_commits() -> Result<()> 
 #[rstest]
 #[case::latest(None)]
 #[case::pinned(Some(7))]
+#[case::beyond_observed_history(Some(8))]
 #[tokio::test]
 async fn snapshot_checkpoint_gap_preserves_replay_context(#[case] target: Option<Version>) {
     let (storage, log_root) = build_log_with_paths_and_checkpoint(
@@ -6343,7 +6344,7 @@ async fn snapshot_checkpoint_gap_preserves_replay_context(#[case] target: Option
     let Error::Delta(error) = error else {
         panic!("expected Delta error")
     };
-    assert_eq!(error.name(), "DELTA_LOG_FILE_NOT_FOUND");
+    assert_eq!(error.name(), "DELTA_TRUNCATED_TRANSACTION_LOG");
     assert_eq!(error.sql_state(), Some("42K03"));
     let parameters: Vec<_> = error
         .parameters()
@@ -6353,9 +6354,18 @@ async fn snapshot_checkpoint_gap_preserves_replay_context(#[case] target: Option
     assert_eq!(
         parameters,
         [
+            (
+                "path",
+                log_root.join("00000000000000000005.json").unwrap().as_str()
+            ),
             ("version", "7"),
-            ("checkpointVersion", "4"),
-            ("logPath", log_root.as_str())
+            ("logRetentionKey", "delta.logRetentionDuration"),
+            ("logRetention", "unknown"),
+            (
+                "checkpointRetentionKey",
+                "delta.checkpointRetentionDuration"
+            ),
+            ("checkpointRetention", "unknown"),
         ]
     );
     assert!(matches!(

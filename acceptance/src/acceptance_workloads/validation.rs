@@ -352,9 +352,6 @@ fn delta_error_matches(expected_code: &str, actual: &DeltaError) -> bool {
             "DELTA_TABLE_NOT_FOUND" | "DELTA_MISSING_TRANSACTION_LOG",
             DeltaErrorCondition::DeltaPathDoesNotExist,
         ) => true,
-        // TODO: Report DELTA_TRUNCATED_TRANSACTION_LOG for missing history immediately after a
-        // checkpoint, then remove this alias.
-        ("DELTA_TRUNCATED_TRANSACTION_LOG", DeltaErrorCondition::DeltaLogFileNotFound) => true,
         // TODO(#3421): Reconcile the workload's .GENERIC suffix with the unsuffixed catalog
         // condition so this compatibility alias can be removed.
         (
@@ -671,10 +668,17 @@ mod tests {
     }
 
     #[test]
-    fn truncated_log_accepts_the_missing_replay_condition() {
+    fn truncated_log_requires_its_own_condition() {
         let error = DeltaError::for_test(
-            DeltaErrorCondition::DeltaLogFileNotFound,
-            &["7", "4", "memory:///_delta_log/"],
+            DeltaErrorCondition::DeltaTruncatedTransactionLog,
+            &[
+                "memory:///_delta_log/00000000000000000005.json",
+                "7",
+                "delta.logRetentionDuration",
+                "unknown",
+                "delta.checkpointRetentionDuration",
+                "unknown",
+            ],
             None,
         )
         .unwrap();
@@ -682,8 +686,14 @@ mod tests {
             "DELTA_TRUNCATED_TRANSACTION_LOG",
             &error
         ));
-        assert!(delta_error_matches("DELTA_LOG_FILE_NOT_FOUND", &error));
+        assert!(!delta_error_matches("DELTA_LOG_FILE_NOT_FOUND", &error));
         assert!(!delta_error_matches("DELTA_PATH_DOES_NOT_EXIST", &error));
+
+        let missing_file = DeltaError::log_file_not_found(7, 4, "memory:///_delta_log/", None);
+        assert!(!delta_error_matches(
+            "DELTA_TRUNCATED_TRANSACTION_LOG",
+            &missing_file
+        ));
     }
 
     #[test]

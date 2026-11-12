@@ -5,10 +5,11 @@ use std::error::Error as StdError;
 use std::fmt;
 
 use super::{BoxedError, DeltaErrorCondition};
-#[cfg(any(test, feature = "test-utils"))]
-use crate::KernelResult;
+use crate::Version;
 use crate::schema::StructType;
-use crate::{KernelError, Version};
+use crate::table_properties::LOG_RETENTION_DURATION;
+#[cfg(any(test, feature = "test-utils"))]
+use crate::{KernelError, KernelResult};
 
 /// A catalog-defined Delta failure that terminates the current operation.
 ///
@@ -156,8 +157,8 @@ impl DeltaError {
         )
     }
 
-    /// Reports missing replay files for `version` after `checkpoint_version` in `log_path`.
-    /// The original listing or read failure remains available as the diagnostic source.
+    /// Reports a missing file encountered while replaying `version` after `checkpoint_version`.
+    /// `log_path` identifies the log directory. The original read failure remains as the source.
     pub fn log_file_not_found(
         version: Version,
         checkpoint_version: Version,
@@ -170,6 +171,37 @@ impl DeltaError {
                 DeltaErrorParameter::new("version", version),
                 DeltaErrorParameter::new("checkpointVersion", checkpoint_version),
                 DeltaErrorParameter::new("logPath", log_path),
+            ],
+            source,
+        )
+    }
+
+    /// Reports missing history at `path` needed to reconstruct the last observed commit `version`.
+    ///
+    /// `path` identifies the first missing commit. Retention values describe the table's configured
+    /// policies when known. Pass `None` when metadata is unavailable to report `unknown`.
+    pub fn truncated_transaction_log(
+        path: impl ToString,
+        version: Version,
+        log_retention: Option<&str>,
+        checkpoint_retention: Option<&str>,
+        source: Option<BoxedError>,
+    ) -> Self {
+        Self::new(
+            DeltaErrorCondition::DeltaTruncatedTransactionLog,
+            vec![
+                DeltaErrorParameter::new("path", path),
+                DeltaErrorParameter::new("version", version),
+                DeltaErrorParameter::new("logRetentionKey", LOG_RETENTION_DURATION),
+                DeltaErrorParameter::new("logRetention", log_retention.unwrap_or("unknown")),
+                DeltaErrorParameter::new(
+                    "checkpointRetentionKey",
+                    "delta.checkpointRetentionDuration",
+                ),
+                DeltaErrorParameter::new(
+                    "checkpointRetention",
+                    checkpoint_retention.unwrap_or("unknown"),
+                ),
             ],
             source,
         )
@@ -396,6 +428,9 @@ mod tests {
     #[case::missing_path(|source| DeltaError::path_does_not_exist("table", source))]
     #[case::version_gap(|source| DeltaError::versions_not_contiguous([0, 2], 0, 2, 2, source))]
     #[case::missing_log(|source| DeltaError::log_file_not_found(2, 0, "table/_delta_log", source))]
+    #[case::truncated_log(|source| DeltaError::truncated_transaction_log(
+        "table/_delta_log/00000000000000000001.json", 2, None, None, source
+    ))]
     #[case::invalid_version(|source| DeltaError::invalid_version(-1, source))]
     #[case::duplicate_partition(|source| DeltaError::duplicate_partition_column("p", source))]
     #[case::missing_partition(|source| DeltaError::partition_column_not_found(
@@ -438,6 +473,32 @@ mod tests {
             "none" => assert!(error.source().is_none()),
             _ => unreachable!(),
         }
+    }
+
+    #[rstest]
+    fn truncated_log_reports_known_or_unknown_retention(
+        #[values(None, Some("interval 30 days"))] log_retention: Option<&str>,
+        #[values(None, Some("interval 2 days"))] checkpoint_retention: Option<&str>,
+    ) {
+        let error = DeltaError::truncated_transaction_log(
+            "table/_delta_log/00000000000000000005.json",
+            7,
+            log_retention,
+            checkpoint_retention,
+            None,
+        );
+        let log_retention = log_retention.unwrap_or("unknown");
+        let checkpoint_retention = checkpoint_retention.unwrap_or("unknown");
+        assert_eq!(
+            error.message(),
+            format!(
+                "table/_delta_log/00000000000000000005.json: Unable to reconstruct state at \
+                 version 7 as the transaction log has been truncated due to manual deletion or \
+                 the log retention policy (delta.logRetentionDuration={log_retention}) and \
+                 checkpoint retention policy \
+                 (delta.checkpointRetentionDuration={checkpoint_retention})"
+            )
+        );
     }
 
     #[rstest]

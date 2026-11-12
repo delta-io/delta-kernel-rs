@@ -26,6 +26,8 @@ pub enum DeltaErrorCondition {
     DeltaPartitionColumnNotFound,
     /// `DELTA_PATH_DOES_NOT_EXIST` (SQLSTATE `42K03`).
     DeltaPathDoesNotExist,
+    /// `DELTA_TRUNCATED_TRANSACTION_LOG` (SQLSTATE `42K03`).
+    DeltaTruncatedTransactionLog,
     /// `DELTA_VERSIONS_NOT_CONTIGUOUS` (SQLSTATE `KD00C`).
     DeltaVersionsNotContiguous,
     /// `DELTA_VERSION_INVALID` (SQLSTATE `42815`).
@@ -76,6 +78,12 @@ impl DeltaErrorCondition {
                 sql_state: Some("42K03"),
                 parameter_names: &["path"],
                 message_template: "<path> doesn't exist, or is not a Delta table.",
+            },
+            Self::DeltaTruncatedTransactionLog => ConditionMetadata {
+                name: "DELTA_TRUNCATED_TRANSACTION_LOG",
+                sql_state: Some("42K03"),
+                parameter_names: &["path", "version", "logRetentionKey", "logRetention", "checkpointRetentionKey", "checkpointRetention"],
+                message_template: "<path>: Unable to reconstruct state at version <version> as the transaction log has been truncated due to manual deletion or the log retention policy (<logRetentionKey>=<logRetention>) and checkpoint retention policy (<checkpointRetentionKey>=<checkpointRetention>)",
             },
             Self::DeltaVersionsNotContiguous => ConditionMetadata {
                 name: "DELTA_VERSIONS_NOT_CONTIGUOUS",
