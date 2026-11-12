@@ -119,7 +119,7 @@ impl Scan {
         planner: &MetadataPlanner<'_>,
     ) -> KernelResult<Option<Plan>> {
         let base = MetadataReplayBase::Checkpoint {
-            version: self.snapshot.log_segment().checkpoint_version,
+            version: self.snapshot.log_segment().checkpoint_version(),
             shape: shape.into().cloned().map(Arc::new),
         };
         self.build_metadata_scan_plan_with(base, planner.clone())
@@ -267,7 +267,10 @@ mod tests {
             .unwrap_or_default();
         LogSegment {
             end_version,
-            checkpoint_version,
+            checkpoint: checkpoint_version.map(|version| crate::log_segment::SelectedCheckpoint {
+                version,
+                checkpoint_type: crate::snapshot::SelectedCheckpointType::Unresolved,
+            }),
             log_root,
             listed: LogSegmentFiles {
                 ascending_commit_files,

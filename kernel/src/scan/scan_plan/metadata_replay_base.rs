@@ -18,7 +18,7 @@ pub(in crate::scan) enum MetadataReplayBase {
 impl MetadataReplayBase {
     /// Select the newest eligible metadata base and resolve checkpoint shape only when needed.
     pub(in crate::scan) fn try_new(snapshot: &Snapshot, engine: &dyn Engine) -> KernelResult<Self> {
-        let checkpoint_version = snapshot.log_segment().checkpoint_version;
+        let checkpoint_version = snapshot.log_segment().checkpoint_version();
         // Keep replay eligibility independent of SnapshotCrc's validation.
         if let Some((version, files)) = snapshot
             .base_crc()
@@ -80,7 +80,7 @@ mod tests {
             .at_version(version)
             .build(engine.as_ref())?;
         assert_eq!(
-            snapshot.log_segment().checkpoint_version,
+            snapshot.log_segment().checkpoint_version(),
             checkpoint_version
         );
         let mut crc = snapshot.crc_at_version().expect("fixture CRC").clone();
@@ -141,9 +141,11 @@ mod tests {
         let config = target.table_configuration().clone();
         let snapshot = Arc::new(Snapshot::new_with_crc(segment, config, crc, false, false)?);
         let scan = snapshot.scan_builder().build()?;
-        let plan = scan.declarative_metadata_scan_plan(
+        let result = scan.declarative_metadata_scan_plan_with_info(
             &DelegatingEngine::new(engine.clone()).without_plan_executor(),
         )?;
+        assert_eq!(result.log_replay_skipped_via_crc, target_version == version);
+        let plan = result.plan;
         if expected_rows == 0 {
             assert!(plan.is_none());
             return Ok(());

@@ -12,7 +12,7 @@ use crate::log_path::LogPath;
 use crate::log_segment::{LogSegment, validate_catalog_version_bounds};
 use crate::log_segment_files::{CheckpointHandling, LogSegmentFiles};
 use crate::path::{DELTA_LOG_DIR_WITH_SLASH, ParsedLogPath};
-use crate::snapshot::{IncrementalReplay, SnapshotRef};
+use crate::snapshot::{IncrementalReplay, SelectedCheckpointType, SnapshotRef};
 use crate::table_configuration::TableConfiguration;
 use crate::utils::{require, try_parse_uri};
 use crate::{KernelError, KernelResult, Result, Snapshot, Version};
@@ -88,6 +88,7 @@ pub(crate) struct SnapshotHint {
     crc: Option<Arc<Crc>>,
     /// Whether `version` was established as latest when the hint was captured.
     freshness: SnapshotHintFreshness,
+    checkpoint_type: Option<SelectedCheckpointType>,
 }
 
 impl SnapshotHint {
@@ -157,7 +158,27 @@ impl SnapshotHint {
             last_checkpoint_hint,
             crc,
             freshness,
+            checkpoint_type: None,
         })
+    }
+
+    /// Supplies a retained type claim for the selected checkpoint. Snapshot construction validates
+    /// the claim.
+    #[internal_api]
+    #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
+    pub(crate) fn with_checkpoint_type(
+        mut self,
+        checkpoint_type: Option<SelectedCheckpointType>,
+    ) -> Self {
+        self.checkpoint_type = checkpoint_type;
+        self
+    }
+
+    /// Returns the supplied or captured checkpoint type, if present.
+    #[internal_api]
+    #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
+    pub(crate) fn checkpoint_type(&self) -> Option<SelectedCheckpointType> {
+        self.checkpoint_type
     }
 
     /// Returns the version described by this hint.
@@ -245,6 +266,7 @@ impl SnapshotHint {
             metadata: snapshot.table_configuration().metadata().clone(),
             last_checkpoint_hint: last_checkpoint_hint.cloned(),
             crc: snapshot.crc_at_version().cloned(),
+            checkpoint_type: snapshot.checkpoint_type(),
             freshness: if snapshot.is_built_as_latest() {
                 SnapshotHintFreshness::Latest
             } else {
@@ -309,6 +331,7 @@ impl SnapshotHint {
             last_checkpoint_hint,
             crc,
             freshness,
+            checkpoint_type,
         } = *self;
         let built_as_latest = freshness == SnapshotHintFreshness::Latest
             && max_catalog_version.is_none_or(|max| max <= version);
@@ -354,7 +377,7 @@ impl SnapshotHint {
             KernelError::from(SnapshotHintError::MaxPublishedVersion { hint: version }).into()
         );
         require!(
-            log_segment.checkpoint_version.is_some()
+            log_segment.checkpoint_version().is_some()
                 || log_segment
                     .listed
                     .ascending_commit_files
@@ -384,7 +407,7 @@ impl SnapshotHint {
         }
 
         Snapshot::new_with_crc(
-            log_segment,
+            log_segment.with_checkpoint_type(checkpoint_type)?,
             table_configuration,
             crc,
             built_as_latest,
@@ -872,7 +895,7 @@ mod tests {
         } else {
             let snapshot = result?;
             let segment = snapshot.log_segment();
-            assert_eq!(segment.checkpoint_version, Some(10));
+            assert_eq!(segment.checkpoint_version(), Some(10));
             assert!(segment.listed.ascending_commit_files.is_empty());
             assert!(segment.listed.latest_commit_file.is_none());
             assert!(segment.listed.latest_crc_file.is_none());
@@ -1270,8 +1293,8 @@ mod tests {
             .with_snapshot_hint(hint)
             .build(engine.as_ref())?;
         assert_eq!(
-            hinted_snapshot.log_segment().checkpoint_version,
-            storage_snapshot.log_segment().checkpoint_version
+            hinted_snapshot.log_segment().checkpoint_version(),
+            storage_snapshot.log_segment().checkpoint_version()
         );
         assert_eq!(
             hinted_snapshot.log_segment().listed.checkpoint_parts,

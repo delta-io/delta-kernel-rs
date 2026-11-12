@@ -10,7 +10,8 @@ use crate::delta_types::{
 use crate::error::{ExternResult, IntoExternResult};
 use crate::handle::Handle;
 use crate::log_path::LogPathArray;
-use crate::{NullableCvoid, SharedExternEngine, SharedSnapshot};
+use crate::snapshot::checkpoint_type::FfiSelectedCheckpointType;
+use crate::{NullableCvoid, OptionalValue, SharedExternEngine, SharedSnapshot};
 
 mod export;
 
@@ -92,6 +93,9 @@ pub struct FfiSnapshotHint {
     ///
     /// Export always uses an explicit variant, never `InferFromLogPaths`.
     pub publication_watermark: FfiPublicationWatermark,
+    /// Optional selected-checkpoint type claim, validated against the supplied paths at build.
+    /// Absent leaves the type to be inferred from paths and matching `_last_checkpoint` state.
+    pub checkpoint_type: OptionalValue<FfiSelectedCheckpointType>,
 }
 
 fn invalid_with_source(message: impl Into<String>, source: KernelError) -> KernelError {
@@ -158,7 +162,12 @@ unsafe fn snapshot_builder_with_snapshot_hint_impl(
         last_checkpoint_hint,
         crc,
         freshness,
-    )?;
+    )?
+    .with_checkpoint_type(
+        Option::<&FfiSelectedCheckpointType>::from(&value.checkpoint_type)
+            .copied()
+            .map(Into::into),
+    );
     builder.snapshot_hint = Some(Box::new(snapshot_hint));
     Ok(())
 }

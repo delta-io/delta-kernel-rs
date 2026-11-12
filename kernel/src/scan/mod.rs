@@ -702,7 +702,7 @@ impl ScanBuilder {
         if self.snapshot.skipped_new_checkpoints() && commits_since_checkpoint > 0 {
             warn!(
                 snapshot_version = self.snapshot.version(),
-                checkpoint_version = ?self.snapshot.log_segment().checkpoint_version,
+                checkpoint_version = ?self.snapshot.log_segment().checkpoint_version(),
                 commits_since_checkpoint,
                 "Full scan may replay extra transaction-log commits because the snapshot was \
                  built with skip_new_checkpoints()"
@@ -964,6 +964,18 @@ impl HasSelectionVector for ScanMetadata {
     fn has_selected_rows(&self) -> bool {
         self.scan_files.selection_vector().contains(&true)
     }
+}
+
+/// A declarative metadata plan and the file-list source selected during planning.
+#[cfg(feature = "declarative-plans")]
+#[derive(Debug, Clone)]
+pub struct MetadataScanPlan {
+    /// The plan to execute, or `None` when the result is statically empty.
+    pub plan: Option<Plan>,
+    /// Whether the complete live file list comes from a CRC at the snapshot version, avoiding
+    /// checkpoint and commit replay. False when a stale CRC seeds replay of newer commits or
+    /// when the predicate statically skips the scan. Describes planning, not completed execution.
+    pub log_replay_skipped_via_crc: bool,
 }
 
 /// The result of building a scan over a table. This can be used to get the actual data from
@@ -1301,7 +1313,7 @@ impl Scan {
         // only has deltas after the checkpoint, so we cannot update from prior versions.
         // TODO: we may be able to apply heuristics or other logic to try and fetch missing deltas
         // from the log.
-        if matches!(log_segment.checkpoint_version, Some(v) if v > existing_version) {
+        if matches!(log_segment.checkpoint_version(), Some(v) if v > existing_version) {
             return Ok(Box::new(self.scan_metadata_with_engine(engine)?));
         }
         // Likewise for an AMT checkpoint action: commits at or below its version may no longer be
@@ -1440,16 +1452,28 @@ impl Scan {
     /// with `TIMESTAMP` partition columns, if planning requires a
     /// [`PlanExecutor`](crate::plans::PlanExecutor) that the engine does not provide, or if log
     /// discovery, checkpoint inspection, or plan construction fails.
+    pub fn declarative_metadata_scan_plan(
+        &self,
+        engine: &dyn Engine,
+    ) -> KernelResult<Option<Plan>> {
+        Ok(self.declarative_metadata_scan_plan_with_info(engine)?.plan)
+    }
+
+    /// Builds the metadata plan and reports whether a current-version CRC supplies its file list.
+    ///
+    /// Has the same execution requirements and errors as [`Self::declarative_metadata_scan_plan`].
+    /// The returned observation belongs to this planning call and requires no additional I/O.
+    #[cfg(feature = "declarative-plans")]
     #[tracing::instrument(
         name = "scan.declarative_metadata_scan_plan",
         skip_all,
         fields(enable_call_frame),
         err
     )]
-    pub fn declarative_metadata_scan_plan(
+    pub fn declarative_metadata_scan_plan_with_info(
         &self,
         engine: &dyn Engine,
-    ) -> KernelResult<Option<Plan>> {
+    ) -> KernelResult<MetadataScanPlan> {
         // TODO(#3609): Support connector-supplied timezone in declarative metadata scans.
         require!(
             !table_requires_timestamp_timezone_support(
@@ -1467,12 +1491,23 @@ impl Scan {
 
         // A statically-unsatisfiable predicate (e.g. `x > 10 AND FALSE`) skips the whole table.
         if self.state_info.physical_predicate == PhysicalPredicate::StaticSkipAll {
-            return Ok(None);
+            return Ok(MetadataScanPlan {
+                plan: None,
+                log_replay_skipped_via_crc: false,
+            });
         }
 
         let planner = scan_plan::MetadataPlanner::try_from_scan(self)?;
         let base = scan_plan::MetadataReplayBase::try_new(&self.snapshot, engine)?;
-        self.build_metadata_scan_plan_with(base, planner)
+        let log_replay_skipped_via_crc = matches!(
+            &base,
+            scan_plan::MetadataReplayBase::Crc { version, .. } if *version == self.snapshot.version()
+        );
+        let plan = self.build_metadata_scan_plan_with(base, planner)?;
+        Ok(MetadataScanPlan {
+            plan,
+            log_replay_skipped_via_crc,
+        })
     }
 
     #[cfg(feature = "declarative-plans")]

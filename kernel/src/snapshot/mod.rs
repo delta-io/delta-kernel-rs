@@ -68,12 +68,15 @@ mod adaptive_metadata_tests;
 mod builder;
 #[cfg(test)]
 mod cancellation_tests;
+mod checkpoint_type;
 #[cfg(test)]
 mod crc_write_tests;
 mod hint;
 mod incremental;
 mod reader;
 mod snapshot_crc;
+
+pub use checkpoint_type::SelectedCheckpointType;
 #[cfg(test)]
 mod tracing_tests;
 #[doc(hidden)]
@@ -283,7 +286,7 @@ impl Snapshot {
         Ok(SnapshotCrc::try_new(
             crc,
             table_configuration.version(),
-            log_segment.checkpoint_version,
+            log_segment.checkpoint_version(),
         )?)
     }
 
@@ -679,6 +682,16 @@ impl Snapshot {
     /// Returns an error if the total commit file size exceeds [`u64::MAX`].
     pub fn log_segment_stats(&self) -> KernelResult<LogSegmentStats> {
         self.log_segment.stats()
+    }
+
+    /// Returns the selected checkpoint's type without engine I/O.
+    ///
+    /// Returns `None` when no checkpoint was selected, or
+    /// `Some(SelectedCheckpointType::Unresolved)` when its type is unknown. This describes the
+    /// selected checkpoint, independently of the table's configured checkpoint policy, and
+    /// remains fixed for this snapshot's lifetime.
+    pub fn checkpoint_type(&self) -> Option<SelectedCheckpointType> {
+        self.log_segment.checkpoint_type()
     }
 
     /// Captures retained snapshot state as an owned hint without engine I/O.
@@ -1654,7 +1667,7 @@ impl Snapshot {
         }
 
         // Case 3: no CRC, but a checkpoint to root at.
-        if let Some(checkpoint_version) = log_segment.checkpoint_version {
+        if let Some(checkpoint_version) = log_segment.checkpoint_version() {
             record_root("checkpoint", ChecksumWriteResolutionMode::Full);
             if checkpoint_version == end {
                 // A checkpoint carries no ICT or lastManifestCommit (it has no commitInfo). Since
@@ -1762,7 +1775,7 @@ impl Snapshot {
     ) -> Result<(CheckpointWriteResult, SnapshotRef)> {
         let start = Instant::now();
         let span = tracing::Span::current();
-        if self.log_segment.checkpoint_version == Some(self.log_segment.end_version) {
+        if self.log_segment.checkpoint_version() == Some(self.log_segment.end_version) {
             info!(
                 "Checkpoint already exists for snapshot version {}",
                 self.version()
@@ -1859,9 +1872,14 @@ impl Snapshot {
         let checkpoint_log_path = ParsedLogPath::new(info.file_meta).ok_or_else(|| {
             KernelError::internal_error("Checkpoint path could not be parsed as a log path")
         })?;
+        let checkpoint_type = if v2_supported {
+            SelectedCheckpointType::V2
+        } else {
+            SelectedCheckpointType::V1
+        };
         let new_log_segment = self
             .log_segment
-            .try_new_with_checkpoint(checkpoint_log_path)?;
+            .try_new_with_checkpoint(checkpoint_log_path, checkpoint_type)?;
         // Carry only an at-version CRC forward: the checkpoint drops the commits below it, so a
         // stale base could no longer be advanced over them.
         let new_snapshot = Arc::new(Snapshot::new_with_crc(
@@ -2202,8 +2220,8 @@ mod tests {
         let actual = published.log_segment();
         assert_eq!(actual.listed.max_published_version, Some(2));
         assert_eq!(
-            actual.checkpoint_version,
-            original_segment.checkpoint_version
+            actual.checkpoint_version(),
+            original_segment.checkpoint_version()
         );
         assert_eq!(
             actual.listed.checkpoint_parts,
@@ -2258,9 +2276,12 @@ mod tests {
         let engine = engine_with_published_commits();
         let segment = source
             .log_segment()
-            .try_new_with_checkpoint(create_log_path(
-                "memory:///publication/_delta_log/00000000000000000002.checkpoint.parquet",
-            ))
+            .try_new_with_checkpoint(
+                create_log_path(
+                    "memory:///publication/_delta_log/00000000000000000002.checkpoint.parquet",
+                ),
+                SelectedCheckpointType::V2,
+            )
             .unwrap();
         let source = Arc::new(
             Snapshot::new_with_crc(
