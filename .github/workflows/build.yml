@@ -293,6 +293,14 @@ jobs:
           key: ${{ matrix.config }}
           save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
       - uses: taiki-e/install-action@98ec31d284eb962f41c14065e9391a955aa810cf # nextest
+        with:
+          tool: cargo-nextest@0.9.132
+      - name: Record test runner
+        continue-on-error: true
+        shell: bash
+        run: |
+          mkdir -p target/ci-telemetry
+          bash .github/scripts/runner-info.sh | tee target/ci-telemetry/runner-info.txt
       - name: all-features tests
         if: matrix.config == 'all-features'
         shell: bash
@@ -313,6 +321,18 @@ jobs:
         run: |
           cargo nextest run --locked -p delta_kernel -p acceptance --no-default-features --features internal-api,prettyprint,test-utils,integration-test,arrow,arrow-conversion,arrow-expression,schema-diff,check-constraints-in-dev,adaptive-metadata-in-dev,default-engine-base -E 'not test(read_table_version_hdfs) and not test(invalid_handle_code)'
           cargo test --locked -p delta_kernel -p acceptance --no-default-features --features internal-api,prettyprint,test-utils,integration-test,arrow,arrow-conversion,arrow-expression,schema-diff,check-constraints-in-dev,adaptive-metadata-in-dev,default-engine-base --doc
+      - name: Check test timing report
+        shell: bash
+        run: test -s target/nextest/default/junit.xml
+      - name: Upload test timings and runner information
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: tests-${{ matrix.os }}-${{ matrix.config }}-${{ github.run_attempt }}
+          path: |
+            target/nextest/default/junit.xml
+            target/ci-telemetry/
+          retention-days: 14
 
   # Fails red on trybuild drift, but kept out of required checks so it never blocks a merge.
   invalid-handle-code:
@@ -456,24 +476,51 @@ jobs:
           cmake ..
           make
           make test
-  miri:
-    name: "Miri (shard ${{ matrix.partition }}/3)"
+  # Separate worker IDs expose cancellations directly instead of aggregating matrix results.
+  # https://github.com/orgs/community/discussions/211624
+  # Each worker must appear in the result job's dependencies and success check; the partition
+  # total must match the worker set.
+  miri_1:
+    name: "Miri (shard 1/5)"
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        partition: [1, 2, 3]
-    steps:
+    env:
+      # Track nightly so Miri fixes and new checks reach CI without manual compiler updates.
+      # Compiler updates (usually daily) change rust-cache's key, so older artifacts do not match.
+      # Only a successful shard-1 job on main can save a new entry. Once it saves with the new
+      # compiler, later PR and merge-queue runs with matching cache inputs can reuse that entry.
+      # Until then, including days with no successful shard-1 job, PRs and queue runs stay cold.
+      MIRI_TOOLCHAIN: &miri-toolchain nightly
+      MIRI_PARTITION: "1"
+    steps: &miri-steps
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      # rust-cache hashes compiler versions; select Miri before restoring its artifacts.
       - name: Install Miri
         run: |
-          rustup toolchain install nightly --component miri
-          rustup override set nightly
+          rustup toolchain install "$MIRI_TOOLCHAIN" --component miri
+          rustup override set "$MIRI_TOOLCHAIN"
+          # The sysroot hash includes rust-src mtimes, so fresh installs invalidate a cached sysroot.
           cargo miri setup
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      # Keep the cache upgrade scoped to Miri to measure dependency reuse independently.
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           cache-bin: false
-          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+          # Preserve the shared cache identity across the separate worker job IDs.
+          shared-key: miri
+          # All shards restore this key; only shard 1 saves to avoid duplicate compression.
+          # A failed shard-1 job leaves a cold key until a later successful shard-1 job on main.
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && env.MIRI_PARTITION == '1' }}
+      # rust-cache runs cargo metadata internally without --locked.
+      - name: Check cache setup preserved Cargo.lock
+        run: git diff --exit-code -- Cargo.lock
       - uses: taiki-e/install-action@98ec31d284eb962f41c14065e9391a955aa810cf # nextest
+        with:
+          tool: cargo-nextest@0.9.132
+      - name: Record Miri runner
+        continue-on-error: true
+        shell: bash
+        run: |
+          mkdir -p target/ci-telemetry
+          bash .github/scripts/runner-info.sh | tee target/ci-telemetry/runner-info.txt
       - name: Test with Miri
         env:
           # rust-cache sets CARGO_INCREMENTAL=0; re-enable it so nextest's separate Miri
@@ -483,8 +530,84 @@ jobs:
         # basic blocks instead of the default 10k, reducing GC pauses. It only changes GC
         # frequency, so it does not weaken undefined-behavior or data-race detection.
         run: |
+          # The best-effort runner probe above cannot be a precondition for this test step.
+          mkdir -p target/ci-telemetry
+          printf 'CARGO_INCREMENTAL=%s\n' "$CARGO_INCREMENTAL" \
+            | tee target/ci-telemetry/miri-settings.txt
           pushd ffi
-          MIRIFLAGS="-Zmiri-disable-isolation -Zmiri-provenance-gc=1000000" cargo miri nextest run --locked --features default-engine-rustls,delta-kernel-unity-catalog,declarative-plans,vendored-protoc,geo-type-in-dev --partition slice:${{ matrix.partition }}/3
+          MIRIFLAGS="-Zmiri-disable-isolation -Zmiri-provenance-gc=1000000" cargo miri nextest run --locked --features default-engine-rustls,delta-kernel-unity-catalog,declarative-plans,vendored-protoc,geo-type-in-dev --partition "slice:$MIRI_PARTITION/5"
+      - name: Check Miri timing report
+        run: test -s target/nextest/default-miri/junit.xml
+      - name: Upload Miri timings and runner information
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: miri-${{ env.MIRI_PARTITION }}-${{ github.run_attempt }}
+          path: |
+            target/nextest/default-miri/junit.xml
+            target/ci-telemetry/
+          retention-days: 14
+
+  miri_2:
+    name: "Miri (shard 2/5)"
+    runs-on: ubuntu-latest
+    env:
+      MIRI_TOOLCHAIN: *miri-toolchain
+      MIRI_PARTITION: "2"
+    steps: *miri-steps
+
+  miri_3:
+    name: "Miri (shard 3/5)"
+    runs-on: ubuntu-latest
+    env:
+      MIRI_TOOLCHAIN: *miri-toolchain
+      MIRI_PARTITION: "3"
+    steps: *miri-steps
+
+  miri_4:
+    name: "Miri (shard 4/5)"
+    runs-on: ubuntu-latest
+    env:
+      MIRI_TOOLCHAIN: *miri-toolchain
+      MIRI_PARTITION: "4"
+    steps: *miri-steps
+
+  miri_5:
+    name: "Miri (shard 5/5)"
+    runs-on: ubuntu-latest
+    env:
+      MIRI_TOOLCHAIN: *miri-toolchain
+      MIRI_PARTITION: "5"
+    steps: *miri-steps
+
+  miri_results:
+    name: ${{ matrix.check }}
+    needs: [miri_1, miri_2, miri_3, miri_4, miri_5]
+    if: always()
+    runs-on: ubuntu-latest
+    permissions: {}
+    strategy:
+      fail-fast: false
+      matrix:
+        # The /3 names are compatibility checks for branch protection; they run no tests.
+        # Each waits for every Miri worker and fails unless all succeed.
+        # Once branch protection requires Miri, remove the /3 checks and their extra runner jobs.
+        # Track the migration in https://github.com/delta-io/delta-kernel-rs/issues/3881.
+        check: ["Miri", "Miri (shard 1/3)", "Miri (shard 2/3)", "Miri (shard 3/3)"]
+    steps:
+      - name: Require every Miri worker to succeed
+        env:
+          MIRI_1_RESULT: ${{ needs.miri_1.result }}
+          MIRI_2_RESULT: ${{ needs.miri_2.result }}
+          MIRI_3_RESULT: ${{ needs.miri_3.result }}
+          MIRI_4_RESULT: ${{ needs.miri_4.result }}
+          MIRI_5_RESULT: ${{ needs.miri_5.result }}
+        run: |
+          printf 'Miri worker results: %s %s %s %s %s\n' \
+            "$MIRI_1_RESULT" "$MIRI_2_RESULT" "$MIRI_3_RESULT" "$MIRI_4_RESULT" "$MIRI_5_RESULT"
+          [[ "$MIRI_1_RESULT" == success && "$MIRI_2_RESULT" == success && \
+             "$MIRI_3_RESULT" == success && "$MIRI_4_RESULT" == success && \
+             "$MIRI_5_RESULT" == success ]]
 
   coverage:
     runs-on: ubuntu-latest

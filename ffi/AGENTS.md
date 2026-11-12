@@ -1082,11 +1082,11 @@ Feature flags:
 
 ## Testing under Miri
 
-CI runs this crate's tests under Miri (the `miri` job in `build.yml`) to catch undefined
-behavior in the `unsafe` FFI boundary: raw-pointer reads/writes, `unsafe impl Send/Sync`,
-`Handle` conversions (`as_ref` / `clone_as_arc` / `into_inner`), and `free_*`. Miri is a MIR
-interpreter, so it runs 10x-100x slower than native and is billed by the interpreted
-instruction, not wall-clock work.
+CI runs this crate's tests under Miri (the test workers gated by `miri_results` in `build.yml`)
+to catch undefined behavior in the `unsafe` FFI boundary: raw-pointer reads/writes,
+`unsafe impl Send/Sync`, `Handle` conversions (`as_ref` / `clone_as_arc` / `into_inner`), and
+`free_*`. Miri is a MIR interpreter, so its runtime grows with interpreted work even when the
+same code is fast natively.
 
 The consequence: a test is expensive under Miri in proportion to how much *code it executes*,
 not how much it asserts. Tests that construct heavyweight but **safe** machinery -- a
@@ -1112,6 +1112,12 @@ Guidance for adding or triaging FFI tests:
 - When you skip under reason 2, **prove the coverage is preserved**: the kept tests' set of
   `unsafe` FFI functions must be a superset of the skipped test's. Name the covering test in the
   `ignore` reason or a nearby comment so a future reader can re-check it.
+- For parameter matrices, keep full native coverage and share assertions with named Miri cases.
+  Miri interprets each selected case's setup and assertions; this does not move setup outside the
+  interpreter. Selecting fewer cases reduces input coverage, so compare ownership branches,
+  callbacks, optional values, error cleanup, and release order as well as the set of `unsafe`
+  functions. Matching function names alone does not establish equivalent coverage. Revisit the
+  selection when any of those paths change, and check the expanded test list for redundant setup.
 - Miri's leak check also flags handles a test itself forgot to free. Triage before assuming a bug
   in the code under test: a missing `free_*` in the test is a test fix, while an unjoined
   background thread at teardown can be an artifact of how the test ends.
