@@ -1,5 +1,6 @@
 //! Builder for transactions against an existing table.
 
+use std::collections::HashMap;
 use std::marker::PhantomData;
 
 use delta_kernel_derive::internal_api;
@@ -15,6 +16,7 @@ use crate::table_features::{
     IcebergCompatValidationContext, Operation, TableFeature, V2_VALIDATOR, V3_VALIDATOR,
     validate_iceberg_compat_if_needed,
 };
+use crate::table_properties::{is_delta_property_key, validate_and_normalize_property_for_update};
 use crate::transaction::domain_metadata::validate_unique_domains;
 use crate::transaction::schema_evolution::{SchemaOperation, evolve_table_config};
 use crate::transaction::{
@@ -33,22 +35,25 @@ use crate::{Engine, KernelError, KernelResult};
 ///
 /// # Schema changes
 ///
-/// Use **ALTER TABLE** for a standalone schema change without changing table data, such as adding
-/// a nullable column without writing data files. Select [`UpdateTableOperation::AlterTable`].
+/// Use **ALTER TABLE** for a standalone metadata change without changing table data, such as
+/// adding a nullable column or setting table properties without writing data files. Select
+/// [`UpdateTableOperation::AlterTable`].
 ///
 /// Use **schema evolution during a write** to change the schema while writing or rewriting data
 /// files in the same transaction. Select the data operation, such as
-/// [`UpdateTableOperation::Write`], and configure the schema changes on the same builder.
+/// [`UpdateTableOperation::Write`], and configure the schema changes on the same builder. The same
+/// builder also accepts table-property updates alongside a write.
 ///
-/// In both workflows, configure schema operations before `build()`, which validates and applies
-/// them. For schema evolution, stage data-file changes on the returned [`Transaction`], using the
-/// evolved schema provided by [`Transaction::write_state`].
+/// In both workflows, configure schema operations and property updates before `build()`, which
+/// validates and applies them. For schema evolution, stage data-file changes on the returned
+/// [`Transaction`], using the evolved schema provided by [`Transaction::write_state`].
 ///
 /// Set `data_change` when constructing the builder: `true` for logical data changes, or `false`
-/// for metadata-only changes and data-preserving rewrites. `ALTER TABLE` requires `false`, while
-/// blind append requires `true`. [`build`](UpdateTableTransactionBuilder::build) rejects
-/// incompatible intent; commit validates the staged file actions and rejects any staged
-/// data-file batches or manifest writes for `ALTER TABLE`.
+/// for metadata-only changes and data-preserving rewrites. `ALTER TABLE` requires `false` and at
+/// least one schema or property change, while blind append requires `true`.
+/// [`build`](UpdateTableTransactionBuilder::build) rejects incompatible intent; commit validates
+/// the staged file actions and rejects any staged data-file batches or manifest writes for
+/// `ALTER TABLE`.
 ///
 /// cbindgen:ignore
 pub type UpdateTableTransactionBuilder<MODE = Imperative> = TransactionBuilder<UpdateTable, MODE>;
@@ -59,8 +64,19 @@ pub struct UpdateTableBuilderState {
     snapshot: SnapshotRef,
     operation: UpdateTableOperation,
     schema_changes: Option<Vec<SchemaOperation>>,
+    properties_added: HashMap<String, String>,
     domain_metadata_removals: Vec<String>,
     is_blind_append: bool,
+}
+
+impl UpdateTableBuilderState {
+    fn has_property_changes(&self) -> bool {
+        !self.properties_added.is_empty()
+    }
+
+    fn has_metadata_changes(&self) -> bool {
+        self.schema_changes.is_some() || self.has_property_changes()
+    }
 }
 
 impl<MODE: ExecutionMode> std::fmt::Debug for TransactionBuilder<UpdateTable, MODE> {
@@ -71,6 +87,10 @@ impl<MODE: ExecutionMode> std::fmt::Debug for TransactionBuilder<UpdateTable, MO
             .field(
                 "schema_change_count",
                 &self.local_state.schema_changes.as_ref().map_or(0, Vec::len),
+            )
+            .field(
+                "properties_added_count",
+                &self.local_state.properties_added.len(),
             )
             .finish()
     }
@@ -89,6 +109,7 @@ impl TransactionBuilder<UpdateTable> {
                 snapshot,
                 operation,
                 schema_changes: None,
+                properties_added: HashMap::new(),
                 domain_metadata_removals: Vec::new(),
                 is_blind_append: false,
             },
@@ -102,9 +123,43 @@ impl<MODE: ExecutionMode> TransactionBuilder<UpdateTable, MODE> {
     ///
     /// Blind appends add new files without depending on existing table state. Commit validation
     /// requires staged Add metadata and rejects staged Remove metadata or deletion-vector batches.
-    /// Blind append is also invalid for `ALTER TABLE`, schema changes, or `dataChange = false`.
+    /// Blind append is also invalid for `ALTER TABLE`, schema changes, property changes, or
+    /// `dataChange = false`.
     pub fn with_blind_append(mut self) -> Self {
         self.local_state.is_blind_append = true;
+        self
+    }
+
+    /// Adds or updates table properties in the metadata configuration.
+    ///
+    /// Values merge into the existing configuration; unrelated properties are preserved. Repeated
+    /// calls merge, and a later value for the same key wins. For `delta.*` keys, matching is
+    /// case-insensitive: a later spelling replaces an earlier one before build-time
+    /// canonicalization. Non-`delta.*` application properties are accepted with their original key
+    /// casing. Recognized config-only `delta.*` keys are rewritten to their canonical form and
+    /// value-validated during [`build`](Self::build).
+    ///
+    /// Feature-enabling `delta.*` properties (for example `delta.enableDeletionVectors`),
+    /// `delta.feature.*` signals, CHECK constraints, and unknown `delta.*` keys are rejected.
+    /// Property changes are applied during [`build`](Self::build). Entries that already match the
+    /// current configuration are skipped, so a Metadata action is emitted only when at least one
+    /// added value actually changes.
+    pub fn with_table_properties_added<I, K, V>(mut self, properties: I) -> Self
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: Into<String>,
+        V: Into<String>,
+    {
+        for (key, value) in properties {
+            let key = key.into();
+            let value = value.into();
+            if is_delta_property_key(&key) {
+                self.local_state
+                    .properties_added
+                    .retain(|existing, _| !existing.eq_ignore_ascii_case(&key));
+            }
+            self.local_state.properties_added.insert(key, value);
+        }
         self
     }
 
@@ -209,8 +264,8 @@ impl<MODE: ExecutionMode> TransactionBuilder<UpdateTable, MODE> {
     /// # Errors
     ///
     /// Returns an error for:
-    /// - Invalid operation intent, including incompatible blind-append or schema intent.
-    /// - Unsupported table writes, schema evolution, or CDF validation failures.
+    /// - Invalid operation intent, including incompatible blind-append, schema, or property intent.
+    /// - Unsupported table writes, schema evolution, property updates, or CDF validation failures.
     /// - Conflicting application ids or domain metadata, or reserved or unsupported domains.
     /// - Connector commit information that does not contain exactly one row.
     ///
@@ -234,9 +289,9 @@ impl<MODE: ExecutionMode> TransactionBuilder<UpdateTable, MODE> {
             .validate()
             .map_err(KernelError::invalid_transaction_state)?;
         if operation == &UpdateTableOperation::AlterTable {
-            if self.local_state.schema_changes.is_none() {
+            if !self.local_state.has_metadata_changes() {
                 return Err(KernelError::invalid_transaction_state(
-                    "ALTER TABLE requires at least one schema change",
+                    "ALTER TABLE requires at least one table change",
                 ));
             }
             if self.local_state.is_blind_append {
@@ -258,6 +313,11 @@ impl<MODE: ExecutionMode> TransactionBuilder<UpdateTable, MODE> {
         if self.local_state.is_blind_append && self.local_state.schema_changes.is_some() {
             return Err(KernelError::invalid_transaction_state(
                 "blind append cannot include schema changes",
+            ));
+        }
+        if self.local_state.is_blind_append && self.local_state.has_property_changes() {
+            return Err(KernelError::invalid_transaction_state(
+                "blind append cannot include property changes",
             ));
         }
 
@@ -300,6 +360,7 @@ fn try_new_update_table<MODE: ExecutionMode>(
         snapshot: read_snapshot,
         operation,
         schema_changes,
+        properties_added,
         domain_metadata_removals,
         is_blind_append,
     } = local_state;
@@ -344,10 +405,34 @@ fn try_new_update_table<MODE: ExecutionMode>(
         IcebergCompatValidationContext::Write,
     )?;
 
-    let should_emit_metadata = schema_changes.is_some();
+    let has_schema_changes = schema_changes.is_some();
     let effective_table_config = match schema_changes {
         Some(changes) => apply_schema_changes(effective_table_config, changes)?,
         None => effective_table_config,
+    };
+    // Drop adds that already match the current configuration so identical re-sets do not rewrite
+    // Metadata (matches Java Metadata.filterOutUnchangedProperties).
+    let properties_added = if properties_added.is_empty() {
+        properties_added
+    } else {
+        let validated = validate_and_canonicalize_properties_added(properties_added)?;
+        effective_table_config
+            .metadata()
+            .filter_out_unchanged_properties(validated)
+    };
+    let has_property_changes = !properties_added.is_empty();
+    let should_emit_metadata = has_schema_changes || has_property_changes;
+    // validate() treats any requested property add as a table change. After dropping identical
+    // values, an ALTER TABLE may have nothing left to apply.
+    if operation == UpdateTableOperation::AlterTable && !should_emit_metadata {
+        return Err(KernelError::invalid_transaction_state(
+            "ALTER TABLE requires at least one table change",
+        ));
+    }
+    let effective_table_config = if has_property_changes {
+        apply_table_properties_added(effective_table_config, properties_added)?
+    } else {
+        effective_table_config
     };
 
     Ok(Transaction {
@@ -392,6 +477,32 @@ fn apply_schema_changes(
         ));
     }
     evolve_table_config(&table_config, changes)
+}
+
+/// Merges already-validated, changed `properties_added` into `table_config`'s metadata.
+///
+/// Callers must validate/canonicalize and drop unchanged entries first.
+fn apply_table_properties_added(
+    table_config: TableConfiguration,
+    properties_added: HashMap<String, String>,
+) -> KernelResult<TableConfiguration> {
+    let metadata = properties_added
+        .into_iter()
+        .fold(table_config.metadata().clone(), |metadata, (key, value)| {
+            metadata.with_configuration_entry(key, value)
+        });
+    TableConfiguration::try_new_with_schema(&table_config, metadata, table_config.logical_schema())
+}
+
+fn validate_and_canonicalize_properties_added(
+    properties_added: HashMap<String, String>,
+) -> KernelResult<HashMap<String, String>> {
+    let mut validated = HashMap::with_capacity(properties_added.len());
+    for (key, value) in properties_added {
+        let (canonical_key, value) = validate_and_normalize_property_for_update(key, value)?;
+        validated.insert(canonical_key, value);
+    }
+    Ok(validated)
 }
 
 #[cfg(test)]
@@ -657,7 +768,7 @@ mod tests {
     }
 
     #[test]
-    fn alter_table_requires_schema_changes() -> Result<()> {
+    fn alter_table_requires_table_changes() -> Result<()> {
         let (engine, snapshot, _tempdir) = load_test_table("table-without-dv-small")?;
         let error = snapshot
             .update_table(UpdateTableOperation::AlterTable, "test-engine", false)
@@ -667,8 +778,184 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("requires at least one schema change")
+                .contains("requires at least one table change")
         );
+        Ok(())
+    }
+
+    #[test]
+    fn alter_table_accepts_property_only_changes() -> Result<()> {
+        let (engine, snapshot, _tempdir) = load_test_table("table-without-dv-small")?;
+        let transaction = snapshot
+            .update_table(UpdateTableOperation::AlterTable, "test-engine", false)
+            .with_table_properties_added([("app.owner", "kernel")])
+            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
+
+        assert!(transaction.should_emit_metadata);
+        assert_eq!(
+            transaction
+                .effective_table_config
+                .metadata()
+                .configuration()
+                .get("app.owner")
+                .map(String::as_str),
+            Some("kernel")
+        );
+        Ok(())
+    }
+
+    #[rstest]
+    #[case::user_property("app.owner", "kernel", "app.owner")]
+    #[case::canonical_delta("delta.checkpointInterval", "42", "delta.checkpointInterval")]
+    #[case::case_insensitive_delta(
+        "DELTA.enableExpiredLogCleanup",
+        "false",
+        "delta.enableExpiredLogCleanup"
+    )]
+    #[case::compression_codec(
+        "delta.parquet.compression.codec",
+        "zstd",
+        "delta.parquet.compression.codec"
+    )]
+    fn with_table_properties_added_accepts_allowed_keys(
+        #[case] key: &str,
+        #[case] value: &str,
+        #[case] expected_key: &str,
+    ) -> Result<()> {
+        let (engine, snapshot, _tempdir) = load_test_table("table-without-dv-small")?;
+        let transaction = snapshot
+            .update_table(UpdateTableOperation::Write, "test-engine", true)
+            .with_table_properties_added([(key, value)])
+            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
+
+        let after = transaction
+            .effective_table_config
+            .metadata()
+            .configuration();
+        assert!(transaction.should_emit_metadata);
+        assert_eq!(after.get(expected_key).map(String::as_str), Some(value));
+        Ok(())
+    }
+
+    #[test]
+    fn with_table_properties_added_skips_identical_values() -> Result<()> {
+        let engine = Arc::new(SyncEngine::new_with_store(Arc::new(InMemory::new())));
+        let snapshot = create_table("memory:///", test_schema_flat(), "test-engine", true)
+            .with_table_properties([("app.owner", "kernel"), ("app.team", "delta")])
+            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+            .commit(engine.as_ref())?
+            .unwrap_post_commit_snapshot();
+
+        let unchanged = snapshot
+            .clone()
+            .update_table(UpdateTableOperation::Write, "test-engine", true)
+            .with_table_properties_added([("app.owner", "kernel")])
+            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
+        assert!(!unchanged.should_emit_metadata);
+
+        let alter_unchanged = snapshot
+            .clone()
+            .update_table(UpdateTableOperation::AlterTable, "test-engine", false)
+            .with_table_properties_added([("app.owner", "kernel")])
+            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()));
+        assert!(matches!(
+            &alter_unchanged,
+            Err(KernelError::InvalidTransactionState(message))
+            if message == "ALTER TABLE requires at least one table change"
+        ));
+
+        let mixed = snapshot
+            .update_table(UpdateTableOperation::Write, "test-engine", true)
+            .with_table_properties_added([("app.owner", "kernel"), ("app.region", "eu")])
+            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
+        let after = mixed.effective_table_config.metadata().configuration();
+        assert!(mixed.should_emit_metadata);
+        assert_eq!(after.get("app.owner").map(String::as_str), Some("kernel"));
+        assert_eq!(after.get("app.team").map(String::as_str), Some("delta"));
+        assert_eq!(after.get("app.region").map(String::as_str), Some("eu"));
+        Ok(())
+    }
+
+    #[test]
+    fn with_table_properties_added_case_variants_later_wins() -> Result<()> {
+        let (engine, snapshot, _tempdir) = load_test_table("table-without-dv-small")?;
+        let transaction = snapshot
+            .update_table(UpdateTableOperation::Write, "test-engine", true)
+            .with_table_properties_added([
+                ("DELTA.checkpointInterval", "1"),
+                ("delta.checkpointInterval", "42"),
+            ])
+            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
+
+        let after = transaction
+            .effective_table_config
+            .metadata()
+            .configuration();
+        assert_eq!(
+            after.get("delta.checkpointInterval").map(String::as_str),
+            Some("42")
+        );
+        Ok(())
+    }
+
+    #[rstest]
+    #[case::unknown_delta("delta.unknownProperty", "true", "Unknown configuration key")]
+    #[case::feature_enablement(
+        "delta.enableChangeDataFeed",
+        "true",
+        "Cannot modify the table property"
+    )]
+    #[case::append_only("delta.appendOnly", "true", "Cannot modify the table property")]
+    #[case::checkpoint_policy("delta.checkpointPolicy", "v2", "Cannot modify the table property")]
+    #[case::check_constraint(
+        "delta.constraints.positive_id",
+        "id > 0",
+        "Cannot modify the table property"
+    )]
+    #[case::malformed_interval(
+        "delta.checkpointInterval",
+        "not-a-number",
+        "Invalid value 'not-a-number' for table property"
+    )]
+    #[case::malformed_bool(
+        "delta.enableExpiredLogCleanup",
+        "yes",
+        "Invalid value 'yes' for table property"
+    )]
+    fn with_table_properties_added_rejects_unsupported_or_invalid_keys(
+        #[case] key: &str,
+        #[case] value: &str,
+        #[case] expected: &str,
+    ) -> Result<()> {
+        let (engine, snapshot, _tempdir) = load_test_table("table-without-dv-small")?;
+        let error = snapshot
+            .update_table(UpdateTableOperation::AlterTable, "test-engine", false)
+            .with_table_properties_added([(key, value)])
+            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))
+            .unwrap_err();
+
+        assert!(
+            error.to_string().contains(expected),
+            "error={error}, expected={expected}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn blind_append_rejects_property_changes() -> Result<()> {
+        let (engine, snapshot, _tempdir) = load_test_table("table-without-dv-small")?;
+        let error = snapshot
+            .update_table(UpdateTableOperation::Write, "test-engine", true)
+            .with_blind_append()
+            .with_table_properties_added([("app.owner", "kernel")])
+            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))
+            .unwrap_err();
+
+        assert!(matches!(
+            &error,
+            KernelError::InvalidTransactionState(message)
+            if message == "blind append cannot include property changes"
+        ));
         Ok(())
     }
 
@@ -774,7 +1061,7 @@ mod tests {
             let error = result.unwrap_err();
             assert!(
                 matches!(&error, KernelError::InvalidTransactionState(message)
-                if message == "ALTER TABLE requires at least one schema change")
+                if message == "ALTER TABLE requires at least one table change")
             );
         } else {
             let transaction = result.expect("non-ALTER transactions do not require schema changes");

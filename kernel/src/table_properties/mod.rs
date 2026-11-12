@@ -20,7 +20,9 @@ use crate::expressions::ColumnName;
 use crate::table_features::ColumnMappingMode;
 use crate::{KernelError, Version};
 
+mod config;
 mod deserialize;
+pub(crate) use config::{is_delta_property_key, validate_and_normalize_property_for_update};
 pub use deserialize::ParseIntervalError;
 
 /// Prefix for delta table properties (e.g., `delta.enableChangeDataFeed`, `delta.appendOnly`).
