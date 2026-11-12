@@ -1469,7 +1469,7 @@ impl Scan {
 
         let planner = scan_plan::MetadataPlanner::try_from_scan(self)?;
         let base = scan_plan::MetadataReplayBase::try_new(&self.snapshot, engine, &planner)?;
-        self.build_metadata_scan_plan_with(base, &planner)
+        self.build_metadata_scan_plan_with(base, planner)
     }
 
     #[cfg(feature = "declarative-plans")]
