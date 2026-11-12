@@ -579,6 +579,41 @@ void print_metric(MetricEvent event) {
     PM_END;
     return;
 
+  case MetricEventCheckpointDiscoveryCompleted:
+    PM_START(CheckpointDiscoveryCompleted);
+    CheckpointDiscoveryCompleted cdc = event.checkpoint_discovery_completed;
+    PM_U64(cdc, mode);
+    PM_U64(cdc, outcome);
+    PM_U64(cdc, start_version);
+    if (cdc.end_version.tag == Someu64) {
+      printf("  end_version: %" PRIu64 ",\n", cdc.end_version.some);
+    } else {
+      printf("  end_version: null,\n");
+    }
+    PM_U64(cdc, num_list_calls);
+    PM_U64(cdc, num_files_examined);
+    if (cdc.checkpoint_version.tag == Someu64) {
+      printf("  checkpoint_version: %" PRIu64 ",\n", cdc.checkpoint_version.some);
+    } else {
+      printf("  checkpoint_version: null,\n");
+    }
+    PM_U64(cdc, duration_ns);
+    PM_END;
+    return;
+
+  case MetricEventCheckpointInspectionCompleted:
+    PM_START(CheckpointInspectionCompleted);
+    CheckpointInspectionCompleted cic = event.checkpoint_inspection_completed;
+    PM_U64(cic, mode);
+    PM_U64(cic, format);
+    PM_U64(cic, outcome);
+    PM_U64(cic, checkpoint_version);
+    PM_U64(cic, checkpoint_size_bytes);
+    PM_U64(cic, num_sidecars_observed);
+    PM_U64(cic, duration_ns);
+    PM_END;
+    return;
+
   case MetricEventJsonReadCompleted:
     PM_START(MetricEventJsonReadCompleted);
     JsonReadCompleted jrc = event.json_read_completed;

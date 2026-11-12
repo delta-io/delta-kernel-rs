@@ -15,6 +15,7 @@ use super::events::{
     ProtocolMetadataLoadSuccess, STORAGE_SPAN, ScanMetadataCompleted, SetTransactionLoadSuccess,
     SnapshotBuildSuccess, TransactionCommitSuccess, storage_metric_from_attrs,
 };
+use super::{CheckpointDiscoveryCompleted, CheckpointInspectionCompleted};
 
 // ====================================================================
 // MetricsReporter trait + LoggingMetricsReporter
@@ -144,6 +145,16 @@ where
             ScanMetadataCompleted::SPAN_NAME => Some(MetricEvent::ScanMetadataCompleted(
                 ScanMetadataCompleted::from_attrs(attrs),
             )),
+            CheckpointDiscoveryCompleted::SPAN_NAME => {
+                Some(MetricEvent::CheckpointDiscoveryCompleted(
+                    CheckpointDiscoveryCompleted::from_attrs(attrs),
+                ))
+            }
+            CheckpointInspectionCompleted::SPAN_NAME => {
+                Some(MetricEvent::CheckpointInspectionCompleted(
+                    CheckpointInspectionCompleted::from_attrs(attrs),
+                ))
+            }
             STORAGE_SPAN => storage_metric_from_attrs(attrs),
             _ => None,
         };

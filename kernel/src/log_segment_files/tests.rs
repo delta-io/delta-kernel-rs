@@ -7,11 +7,14 @@ use url::Url;
 use super::*;
 use crate::engine::sync::SyncEngine;
 use crate::engine::{CancellableEngine, DelegatingEngine};
+use crate::metrics::MetricEvent;
 use crate::object_store::ObjectStoreExt as _;
 use crate::object_store::memory::InMemory;
 use crate::object_store::path::Path as ObjectPath;
 use crate::path::tests::multipart_checkpoint_name;
-use crate::unit_test_utils::TestCancellationToken;
+use crate::unit_test_utils::{
+    CapturingReporter, TestCancellationToken, install_thread_local_metrics_reporter,
+};
 use crate::{Engine as _, FileMeta, KernelResultIterator, StorageHandler};
 
 // size markers used to identify commit sources in tests
@@ -685,11 +688,27 @@ async fn backward_scan_single_checkpoint_cases(
     let (storage, log_root) = create_storage(log_files).await;
     let counter = CountingStorageHandler::new(storage);
 
+    let reporter = Arc::new(CapturingReporter::default());
+    let _guard = install_thread_local_metrics_reporter(reporter.clone());
     let result =
         LogSegmentFiles::list_with_backward_checkpoint_scan(&counter, &log_root, vec![], 1005)
             .unwrap();
 
     assert_eq!(counter.call_count(), expected_listings);
+    let events = discovery_events(&reporter);
+    assert_eq!(events.len(), 1);
+    let event = &events[0];
+    let lowest = if expected_listings == 1 { 6 } else { 0 };
+    assert_eq!(event.mode, CheckpointDiscoveryMode::Backward);
+    assert_eq!(event.outcome, CheckpointReadOutcome::Success);
+    assert_eq!(event.start_version, lowest);
+    assert_eq!(event.end_version, Some(1005));
+    assert_eq!(event.checkpoint_version, expected_checkpoint);
+    assert_eq!(event.num_list_calls, u64::from(expected_listings));
+    assert_eq!(
+        event.num_files_examined,
+        1006 - lowest + u64::from(expected_checkpoint.is_some())
+    );
 
     assert_eq!(
         result.checkpoint_parts.len(),
@@ -1772,6 +1791,7 @@ fn find_complete_checkpoint_version_same_version_cases(
 /// A storage handler whose listing yields `count` synthetic commit paths and records how many were
 /// pulled, so a test can tell where a cancelled listing actually stopped.
 struct FiniteListingHandler {
+    fail_after: Option<usize>,
     log_root: Url,
     count: usize,
     items_pulled: Arc<AtomicU32>,
@@ -1779,10 +1799,17 @@ struct FiniteListingHandler {
 
 impl StorageHandler for FiniteListingHandler {
     fn list_from(&self, _path: &Url) -> KernelResult<Box<dyn KernelResultIterator<FileMeta>>> {
+        if self.fail_after == Some(0) {
+            return Err(KernelError::Cancelled);
+        }
+        let fail_after = self.fail_after;
         let log_root = self.log_root.clone();
         let pulled = self.items_pulled.clone();
         let iter = (0..self.count as u64).map(move |version| {
             pulled.fetch_add(1, Ordering::Relaxed);
+            if fail_after == Some(version as usize) {
+                return Err(KernelError::Cancelled);
+            }
             Ok(FileMeta::new(
                 log_root.join(&format!("{version:020}.json"))?,
                 version as i64,
@@ -1822,6 +1849,7 @@ fn finite_listing_handler(count: usize) -> (Url, Arc<AtomicU32>, FiniteListingHa
     let log_root = Url::parse("memory:///_delta_log/").unwrap();
     let pulled = Arc::new(AtomicU32::new(0));
     let storage = FiniteListingHandler {
+        fail_after: None,
         log_root: log_root.clone(),
         count,
         items_pulled: pulled.clone(),
@@ -1882,4 +1910,97 @@ fn listing_without_token_is_unchanged() {
         .map(KernelResult::unwrap)
         .collect();
     assert_eq!(listed.len(), 5);
+}
+
+fn discovery_events(reporter: &CapturingReporter) -> Vec<CheckpointDiscoveryCompleted> {
+    reporter
+        .events()
+        .into_iter()
+        .filter_map(|event| match event {
+            MetricEvent::CheckpointDiscoveryCompleted(event) => Some(event),
+            _ => None,
+        })
+        .collect()
+}
+
+#[rstest]
+#[case::unbounded(None)]
+#[case::bounded(Some(2))]
+#[tokio::test]
+async fn forward_discovery_reports_bounds_and_selected_checkpoint(#[case] end: Option<u64>) {
+    let (storage, root) = create_storage(vec![
+        (
+            0,
+            LogPathFileType::ClassicCheckpoint,
+            CommitSource::Filesystem,
+        ),
+        (1, LogPathFileType::Commit, CommitSource::Filesystem),
+        (2, LogPathFileType::Commit, CommitSource::Filesystem),
+        (
+            3,
+            LogPathFileType::ClassicCheckpoint,
+            CommitSource::Filesystem,
+        ),
+    ])
+    .await;
+    let counter = CountingStorageHandler::new(storage);
+    let reporter = Arc::new(CapturingReporter::default());
+    let _guard = install_thread_local_metrics_reporter(reporter.clone());
+    let listed = LogSegmentFiles::list(&counter, &root, vec![], None, end).unwrap();
+    assert_eq!(counter.call_count(), 1);
+    let events = discovery_events(&reporter);
+    assert_eq!(events.len(), 1);
+    let event = &events[0];
+    assert_eq!(event.mode, CheckpointDiscoveryMode::Forward);
+    assert_eq!(event.outcome, CheckpointReadOutcome::Success);
+    assert_eq!(event.start_version, 0);
+    assert_eq!(event.end_version, end);
+    assert_eq!(event.num_list_calls, 1);
+    assert_eq!(event.num_files_examined, if end.is_some() { 3 } else { 4 });
+    assert_eq!(
+        event.checkpoint_version,
+        Some(if end.is_some() { 0 } else { 3 })
+    );
+    assert_eq!(
+        listed.checkpoint_parts[0].version,
+        event.checkpoint_version.unwrap()
+    );
+}
+
+#[rstest]
+fn discovery_failure_preserves_error_and_partial_progress(
+    #[values(false, true)] backward: bool,
+    #[values(0, 2)] fail_after: usize,
+) {
+    let (root, pulled, mut storage) = finite_listing_handler(10);
+    storage.fail_after = Some(fail_after);
+    let reporter = Arc::new(CapturingReporter::default());
+    let _guard = install_thread_local_metrics_reporter(reporter.clone());
+    let result = if backward {
+        LogSegmentFiles::list_with_backward_checkpoint_scan(&storage, &root, vec![], 5)
+    } else {
+        LogSegmentFiles::list(&storage, &root, vec![], None, Some(5))
+    };
+    assert!(matches!(result, Err(KernelError::Cancelled)));
+    assert_eq!(
+        pulled.load(Ordering::Relaxed) as usize,
+        if fail_after == 0 { 0 } else { fail_after + 1 }
+    );
+    let events = discovery_events(&reporter);
+    assert_eq!(events.len(), 1);
+    let event = &events[0];
+    assert_eq!(
+        event.mode,
+        if backward {
+            CheckpointDiscoveryMode::Backward
+        } else {
+            CheckpointDiscoveryMode::Forward
+        }
+    );
+    assert_eq!(event.outcome, CheckpointReadOutcome::Error);
+    assert_eq!(event.start_version, 0);
+    assert_eq!(event.end_version, Some(5));
+    assert_eq!(event.num_list_calls, 1);
+    assert_eq!(event.num_files_examined, fail_after as u64);
+    assert_eq!(event.checkpoint_version, None);
 }

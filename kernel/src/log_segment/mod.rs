@@ -4,6 +4,7 @@
 use std::fmt::Display;
 use std::num::NonZero;
 use std::sync::{Arc, LazyLock};
+use std::time::Instant;
 
 use delta_kernel_derive::internal_api;
 use itertools::Itertools;
@@ -33,7 +34,9 @@ use crate::log_replay::ActionsBatch;
 #[internal_api]
 use crate::log_segment_files::LogSegmentFiles;
 use crate::metrics::{
-    SnapshotLoadMetricContext, emit_log_segment_load, emit_log_segment_load_failure,
+    CheckpointInspectionCompleted, CheckpointInspectionMode, CheckpointReadFormat,
+    CheckpointReadOutcome, SnapshotLoadMetricContext, emit_log_segment_load,
+    emit_log_segment_load_failure,
 };
 use crate::path::LogPathFileType::*;
 #[cfg(feature = "adaptive-metadata-in-dev")]
@@ -1587,34 +1590,50 @@ impl LogSegment {
         engine: &dyn Engine,
         checkpoint: &ParsedLogPath,
     ) -> KernelResult<Vec<FileMeta>> {
-        // Read checkpoint with just the sidecar column
-        let batches = match checkpoint.extension.as_str() {
-            "json" => engine.json_handler().read_json_files(
-                std::slice::from_ref(&checkpoint.location),
-                Self::sidecar_read_schema(),
-                None,
-            )?,
-            "parquet" => engine.parquet_handler().read_parquet_files(
-                std::slice::from_ref(&checkpoint.location),
-                Self::sidecar_read_schema(),
-                None,
-            )?,
+        let format = match checkpoint.extension.as_str() {
+            "json" => CheckpointReadFormat::Json,
+            "parquet" => CheckpointReadFormat::Parquet,
             _ => return Ok(vec![]),
         };
-
-        // Extract sidecar file references
+        let started = Instant::now();
         let mut visitor = SidecarVisitor::default();
-        for batch_result in batches {
-            let batch = batch_result?;
-            visitor.visit_rows_of(batch.as_ref())?;
+        let result: KernelResult<Vec<FileMeta>> = (|| {
+            let batches = match format {
+                CheckpointReadFormat::Json => engine.json_handler().read_json_files(
+                    std::slice::from_ref(&checkpoint.location),
+                    Self::sidecar_read_schema(),
+                    None,
+                )?,
+                _ => engine.parquet_handler().read_parquet_files(
+                    std::slice::from_ref(&checkpoint.location),
+                    Self::sidecar_read_schema(),
+                    None,
+                )?,
+            };
+            for batch_result in batches {
+                visitor.visit_rows_of(batch_result?.as_ref())?;
+            }
+            visitor
+                .sidecars
+                .iter()
+                .map(|sidecar| sidecar.to_filemeta(&self.log_root))
+                .try_collect()
+        })();
+        CheckpointInspectionCompleted {
+            mode: CheckpointInspectionMode::SidecarEnumeration,
+            format,
+            outcome: if result.is_ok() {
+                CheckpointReadOutcome::Success
+            } else {
+                CheckpointReadOutcome::Error
+            },
+            checkpoint_version: checkpoint.version,
+            checkpoint_size_bytes: checkpoint.location.size,
+            num_sidecars_observed: visitor.sidecars.len() as u64,
+            duration: started.elapsed(),
         }
-
-        // Convert to FileMeta
-        visitor
-            .sidecars
-            .iter()
-            .map(|sidecar| sidecar.to_filemeta(&self.log_root))
-            .try_collect()
+        .emit();
+        result
     }
 
     /// Creates a pruned LogSegment of only the commits and compactions in

@@ -1,4 +1,5 @@
 use std::iter;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock};
 
 use itertools::Itertools;
@@ -18,11 +19,11 @@ use crate::actions::{
     SIDECAR_NAME, Sidecar, get_all_actions_schema, get_commit_schema,
 };
 use crate::arrow::array::{StringArray, StructArray};
-use crate::engine::DelegatingEngine;
 use crate::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt as _};
 use crate::engine::arrow_expression::evaluate_expression::extract_column_ref;
 use crate::engine::sync::SyncEngine;
 use crate::engine::sync::json::SyncJsonHandler;
+use crate::engine::{CancellableEngine, DelegatingEngine};
 use crate::expressions::{col, column_name};
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::last_checkpoint_hint::{AmtCheckpoint, CheckpointType};
@@ -30,6 +31,7 @@ use crate::last_checkpoint_hint::{HintAction, LastCheckpointHint, LastCheckpoint
 use crate::log_replay::ActionsBatch;
 use crate::log_segment::LogSegment;
 use crate::log_segment_files::LogSegmentFiles;
+use crate::metrics::MetricEvent;
 use crate::object_store::ObjectStoreExt as _;
 use crate::object_store::memory::InMemory;
 use crate::object_store::path::Path;
@@ -52,8 +54,9 @@ use crate::unit_test_utils::adaptive_metadata_fixtures::{
     write_manifest_commit, write_manifest_commit_keeping_pm,
 };
 use crate::unit_test_utils::{
-    Action, assert_batch_matches, assert_result_error_with_message, create_log_path,
-    create_log_path_with_size, load_test_table, string_array_to_engine_data,
+    Action, CapturingReporter, TestCancellationToken, assert_batch_matches,
+    assert_result_error_with_message, create_log_path, create_log_path_with_size,
+    install_thread_local_metrics_reporter, load_test_table, string_array_to_engine_data,
 };
 #[cfg(feature = "geo-type-in-dev")]
 use crate::unit_test_utils::{geography_type, geometry_type};
@@ -5117,6 +5120,7 @@ fn assert_log_segment_extended(orig: LogSegment, new: LogSegment) {
     // Check: What should be the same
     fn normalize(log_segment: LogSegment) -> LogSegment {
         use crate::log_segment_files::LogSegmentFiles;
+        use crate::metrics::MetricEvent;
         LogSegment {
             end_version: 0,
             listed: LogSegmentFiles {
@@ -6238,5 +6242,127 @@ fn snapshot_with_amt_last_checkpoint_hint_skips_earlier_commits() -> Result<()> 
         .latest_checkpoint_action(&engine)?
         .expect("checkpoint present");
     assert_eq!(checkpoint.path(), "metadata/root-v2.parquet");
+    Ok(())
+}
+
+#[rstest]
+#[case::json("v2-checkpoints-json-with-sidecars", CheckpointReadFormat::Json)]
+#[case::parquet("v2-checkpoints-parquet-with-sidecars", CheckpointReadFormat::Parquet)]
+fn sidecar_enumeration_reports_outcome(
+    #[case] table: &str,
+    #[case] format: CheckpointReadFormat,
+    #[values(false, true)] cancelled: bool,
+) -> KernelResult<()> {
+    let (engine, snapshot, _tempdir) = load_test_table(table)?;
+    let segment = snapshot.log_segment();
+    let checkpoint = &segment.listed.checkpoint_parts[0];
+    let reporter = Arc::new(CapturingReporter::default());
+    let _guard = install_thread_local_metrics_reporter(reporter.clone());
+    let token = Arc::new(TestCancellationToken::default());
+    if cancelled {
+        token.cancel();
+    }
+    let engine = CancellableEngine::new(engine.as_ref(), token);
+    let result = segment.extract_sidecar_refs(&engine, checkpoint);
+    let observed = if cancelled {
+        assert!(matches!(result, Err(KernelError::Cancelled)));
+        0
+    } else {
+        let sidecars = result?;
+        assert!(!sidecars.is_empty());
+        sidecars.len() as u64
+    };
+    let events: Vec<_> = reporter
+        .events()
+        .into_iter()
+        .filter_map(|event| match event {
+            MetricEvent::CheckpointInspectionCompleted(event) => Some(event),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(events.len(), 1);
+    let event = &events[0];
+    assert_eq!(event.mode, CheckpointInspectionMode::SidecarEnumeration);
+    assert_eq!(event.format, format);
+    assert_eq!(
+        event.outcome,
+        if cancelled {
+            CheckpointReadOutcome::Error
+        } else {
+            CheckpointReadOutcome::Success
+        }
+    );
+    assert_eq!(event.checkpoint_version, checkpoint.version);
+    assert_eq!(event.checkpoint_size_bytes, checkpoint.location.size);
+    assert_eq!(event.num_sidecars_observed, observed);
+    Ok(())
+}
+
+struct PartialSidecarParquetHandler {
+    pulled: Arc<AtomicUsize>,
+}
+
+impl ParquetHandler for PartialSidecarParquetHandler {
+    fn read_parquet_files(
+        &self,
+        _files: &[FileMeta],
+        schema: SchemaRef,
+        _predicate: Option<PredicateRef>,
+    ) -> KernelResult<FileDataReadResultIterator> {
+        let batches: Vec<KernelResult<Box<dyn EngineData>>> = vec![
+            Ok(sidecar_batch_with_given_paths(
+                vec!["a.parquet", "b.parquet"],
+                schema,
+            )),
+            Err(KernelError::Cancelled),
+            Err(KernelError::generic("must not drain after failure")),
+        ];
+        let pulled = self.pulled.clone();
+        Ok(Box::new(batches.into_iter().inspect(move |_| {
+            pulled.fetch_add(1, Ordering::Relaxed);
+        })))
+    }
+
+    fn write_parquet_file(
+        &self,
+        _location: Url,
+        _data: Box<dyn KernelResultIterator<Box<dyn EngineData>>>,
+    ) -> KernelResult<FileSize> {
+        panic!("inspection must not write files");
+    }
+
+    fn read_parquet_footer(&self, _file: &FileMeta) -> KernelResult<ParquetFooter> {
+        panic!("enumeration must not add a footer read");
+    }
+}
+
+#[test]
+fn sidecar_enumeration_failure_reports_partial_progress_without_draining() -> KernelResult<()> {
+    let (engine, snapshot, _tempdir) = load_test_table("v2-checkpoints-parquet-with-sidecars")?;
+    let segment = snapshot.log_segment();
+    let checkpoint = &segment.listed.checkpoint_parts[0];
+    let pulled = Arc::new(AtomicUsize::new(0));
+    let engine = DelegatingEngine::new(engine).with_parquet_handler(Arc::new(
+        PartialSidecarParquetHandler {
+            pulled: pulled.clone(),
+        },
+    ));
+    let reporter = Arc::new(CapturingReporter::default());
+    let _guard = install_thread_local_metrics_reporter(reporter.clone());
+    let result = segment.extract_sidecar_refs(&engine, checkpoint);
+    assert!(matches!(result, Err(KernelError::Cancelled)));
+    assert_eq!(pulled.load(Ordering::Relaxed), 2);
+    let events: Vec<_> = reporter
+        .events()
+        .into_iter()
+        .filter_map(|event| match event {
+            MetricEvent::CheckpointInspectionCompleted(event) => Some(event),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].mode, CheckpointInspectionMode::SidecarEnumeration);
+    assert_eq!(events[0].outcome, CheckpointReadOutcome::Error);
+    assert_eq!(events[0].num_sidecars_observed, 2);
     Ok(())
 }

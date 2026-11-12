@@ -75,6 +75,7 @@
 //!
 //! [`Engine`]: crate::Engine
 
+mod checkpoint_read;
 pub(crate) mod events;
 mod frame_reporter;
 mod metered_engine;
@@ -87,6 +88,10 @@ mod streaming_metrics_iterator;
 
 use std::sync::Arc;
 
+pub use checkpoint_read::{
+    CheckpointDiscoveryCompleted, CheckpointDiscoveryMode, CheckpointInspectionCompleted,
+    CheckpointInspectionMode, CheckpointReadFormat, CheckpointReadOutcome,
+};
 pub use events::{
     CheckpointWriteFailure, CheckpointWriteMode, CheckpointWriteOutcome, CheckpointWriteStats,
     CheckpointWriteSuccess, ChecksumWriteFailure, ChecksumWriteOutcome,
