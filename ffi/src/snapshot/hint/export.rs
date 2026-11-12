@@ -65,8 +65,8 @@ pub(super) fn visit(
         last_checkpoint: optional_pointer(checkpoint_view.as_ref()),
         crc: optional_pointer(crc_view.as_ref()),
         publication_watermark: hint.publication_watermark().into(),
-        checkpoint_type: checkpoint_type.into(),
-        crc_provenance: crc_provenance.into(),
+        checkpoint_type: checkpoint_type.map(Into::into).into(),
+        crc_provenance: Some(crc_provenance.into()).into(),
     };
     visitor(context, &value);
     Ok(())

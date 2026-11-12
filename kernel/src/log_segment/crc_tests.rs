@@ -1543,7 +1543,7 @@ async fn test_full_replay_across_two_commits_propagates_all_state() {
 #[tokio::test]
 async fn test_stale_crc_advanced_only_within_replay_budget(
     #[case] crc_version: Option<Version>,
-    #[case] corrupt: bool,
+    #[case] corrupt_crc: bool,
     #[case] mode: IncrementalReplay,
     #[case] expected_source: CrcSource,
 ) {
@@ -1554,7 +1554,7 @@ async fn test_stale_crc_advanced_only_within_replay_budget(
         .commit(2, [commit_info(DEFAULT_OPERATION, None)])
         .commit(3, [commit_info(DEFAULT_OPERATION, None)]);
     if let Some(version) = crc_version {
-        test = if corrupt {
+        test = if corrupt_crc {
             test.corrupt_crc(version)
         } else {
             test.crc(version, protocol_a(), metadata_a(), None)
@@ -1576,7 +1576,7 @@ async fn test_stale_crc_advanced_only_within_replay_budget(
         snapshot.crc_at_version().map(|c| c.version),
         expected_crc_version
     );
-    let expected = CrcProvenance::new(expected_source, crc_version.filter(|_| !corrupt));
+    let expected = CrcProvenance::new(expected_source, crc_version.filter(|_| !corrupt_crc));
     assert_eq!(snapshot.crc_provenance(), expected);
 
     // When the snapshot is rebuilt from its hint.
@@ -1614,7 +1614,7 @@ async fn test_stale_crc_advances_past_foreign_last_manifest_commit() {
 #[tokio::test]
 async fn pick_latest_base_crc_preserves_cancellation_and_in_memory_identity(
     #[case] disk_version: Option<Version>,
-    #[case] corrupt: bool,
+    #[case] corrupt_crc: bool,
     #[case] expected_version: Version,
     #[values(false, true)] cancelled: bool,
 ) {
@@ -1623,7 +1623,7 @@ async fn pick_latest_base_crc_preserves_cancellation_and_in_memory_identity(
         .commit(0, create_table_actions())
         .commit(1, [commit_info(DEFAULT_OPERATION, None)]);
     if let Some(version) = disk_version {
-        test = if corrupt {
+        test = if corrupt_crc {
             test.corrupt_crc(version)
         } else {
             test.crc(version, protocol_a(), metadata_a(), None)

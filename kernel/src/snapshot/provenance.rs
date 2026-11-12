@@ -5,11 +5,8 @@ use crate::Version;
 /// The specification followed by a checkpoint, independently of the table's checkpoint policy.
 ///
 /// A classic checkpoint filename alone does not distinguish V1 from V2.
-///
-/// cbindgen:prefix-with-name=true
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[non_exhaustive]
-#[repr(C)]
 pub enum CheckpointType {
     /// A checkpoint was selected, but its type was not established during snapshot construction.
     #[default]
@@ -21,11 +18,8 @@ pub enum CheckpointType {
 }
 
 /// How the retained checksum relates to an observed checksum file and the snapshot version.
-///
-/// cbindgen:prefix-with-name=true
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[non_exhaustive]
-#[repr(C)]
 pub enum CrcSource {
     /// A usable on-disk checksum file was resolved at the snapshot version.
     AtVersion,
@@ -37,12 +31,18 @@ pub enum CrcSource {
     },
     /// A usable checksum is retained behind the snapshot version.
     Stale,
-    /// Normal loading found no applicable checksum file.
+    /// Loading found no checksum candidate in its listed version range and retained no in-memory
+    /// CRC. Fresh loads consider the selected checkpoint version (or zero without a checkpoint)
+    /// through the snapshot version, inclusive. Incremental loads may list only after the previous
+    /// checkpoint, or after the previous snapshot when new checkpoints are ignored. Files below
+    /// the selected checkpoint are not candidates. This does not describe unlisted versions.
     Missing,
     /// An observed checksum candidate was unusable and no usable baseline was resolved.
     /// This includes read failures as well as invalid checksum contents.
     Unusable,
-    /// The checksum's disk provenance was not established.
+    /// No observation of an on-disk checksum is available. This occurs when a connector supplies
+    /// a hint without provenance, or a derived snapshot discards its known CRC at a checkpoint.
+    /// It does not indicate that loading searched for a checksum and failed to find or read it.
     #[default]
     Unknown,
 }

@@ -1,8 +1,6 @@
 //! Construction and export of snapshot hints.
 
-use delta_kernel::snapshot::{
-    CheckpointType, SnapshotHint, SnapshotHintError, SnapshotHintFreshness,
-};
+use delta_kernel::snapshot::{SnapshotHint, SnapshotHintError, SnapshotHintFreshness};
 use delta_kernel::{KernelError, KernelResult, Version};
 
 use super::builder::{ExclusiveSnapshotBuilder, FfiSnapshotBuilder, FfiSnapshotBuilderSource};
@@ -12,7 +10,7 @@ use crate::delta_types::{
 use crate::error::{ExternResult, IntoExternResult};
 use crate::handle::Handle;
 use crate::log_path::LogPathArray;
-use crate::snapshot::provenance::FfiCrcProvenance;
+use crate::snapshot::provenance::{FfiCheckpointType, FfiCrcProvenance};
 use crate::{NullableCvoid, OptionalValue, SharedExternEngine, SharedSnapshot};
 
 mod export;
@@ -90,7 +88,8 @@ pub struct FfiSnapshotHint {
     /// Optional `_last_checkpoint` state. Null means absent.
     pub last_checkpoint: *const FfiLastCheckpoint,
     /// Optional retained CRC state at or before `version`. Null means absent.
-    /// A stale CRC remains a baseline for later reconstruction.
+    /// It may have been advanced in memory without a corresponding CRC file. Later replay can
+    /// reuse it when it is at or after the selected checkpoint; newer checkpoints can discard it.
     pub crc: *const FfiCrc,
     /// Whether to infer publication from paths or preserve an explicit observation.
     ///
@@ -98,11 +97,12 @@ pub struct FfiSnapshotHint {
     pub publication_watermark: FfiPublicationWatermark,
     /// Selected checkpoint specification. `Unresolved` means a checkpoint is selected but its
     /// type has not been retained. Absent supplies no type claim; paths establish presence.
-    pub checkpoint_type: OptionalValue<CheckpointType>,
-    /// Retained checksum observation. Use `Unknown` with no base version when it is not known.
+    pub checkpoint_type: OptionalValue<FfiCheckpointType>,
+    /// Optional retained checksum observation. Absent supplies no claim and becomes `Unknown`.
+    /// Export always includes the observation, even when `crc` is null.
     /// `Missing` and `Unusable` require a null `crc` and no base version. `AtVersion`,
     /// `Reconstructed`, and `Stale` require a non-null `crc` and a compatible base version.
-    pub crc_provenance: FfiCrcProvenance,
+    pub crc_provenance: OptionalValue<FfiCrcProvenance>,
 }
 
 fn invalid_with_source(message: impl Into<String>, source: KernelError) -> KernelError {
@@ -170,8 +170,12 @@ unsafe fn snapshot_builder_with_snapshot_hint_impl(
         crc,
         freshness,
         Some((
-            Option::<&CheckpointType>::from(&value.checkpoint_type).copied(),
-            value.crc_provenance.to_kernel(),
+            Option::<&FfiCheckpointType>::from(&value.checkpoint_type)
+                .copied()
+                .map(Into::into),
+            Option::<&FfiCrcProvenance>::from(&value.crc_provenance)
+                .map(FfiCrcProvenance::to_kernel)
+                .unwrap_or_default(),
         )),
     )?;
     builder.snapshot_hint = Some(Box::new(snapshot_hint));

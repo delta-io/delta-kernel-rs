@@ -13,7 +13,9 @@ use delta_kernel::engine::{DelegatingEngine, PanicEngine};
 use delta_kernel::last_checkpoint_hint::{LastCheckpointHint, LastCheckpointV2};
 use delta_kernel::log_segment::LogSegment;
 use delta_kernel::path::{LogPathFileType, ParsedLogPath};
-use delta_kernel::snapshot::{CrcSource, IncrementalReplay, PublicationWatermark, Snapshot};
+use delta_kernel::snapshot::{
+    CheckpointType, CrcProvenance, CrcSource, IncrementalReplay, PublicationWatermark, Snapshot,
+};
 use delta_kernel::{FileMeta, FileSlice, KernelResult, KernelResultIterator, StorageHandler};
 use test_utils::table_builder::{LogState, TestTableBuilder};
 use test_utils::{TestCatalogCommitter, compacted_log_path_for_versions, create_log_path};
@@ -271,10 +273,7 @@ fn test_snapshot_hint(
         crc: std::ptr::null(),
         publication_watermark: FfiPublicationWatermark::InferFromLogPaths,
         checkpoint_type: OptionalValue::None,
-        crc_provenance: FfiCrcProvenance {
-            source: CrcSource::Unknown,
-            base_version: OptionalValue::None,
-        },
+        crc_provenance: OptionalValue::None,
     }
 }
 
@@ -348,24 +347,27 @@ fn metadata_visit_preserves_original_schema_json_and_does_not_consume_snapshot()
 }
 
 #[rstest::rstest]
-#[case::at_version(CrcSource::AtVersion, Some(2), Some(2), None)]
-#[case::reconstructed(CrcSource::Reconstructed { num_commits: 2 }, Some(0), Some(2), None)]
-#[case::stale(CrcSource::Stale, Some(0), Some(1), None)]
-#[case::missing(CrcSource::Missing, None, None, None)]
-#[case::unusable(CrcSource::Unusable, None, None, None)]
-#[case::unknown(CrcSource::Unknown, None, Some(2), None)]
-#[case::unknown_stale(CrcSource::Unknown, None, Some(1), None)]
-#[case::unknown_absent(CrcSource::Unknown, None, None, None)]
+#[case::at_version(Some(CrcSource::AtVersion), Some(2), Some(2), None)]
+#[case::reconstructed(Some(CrcSource::Reconstructed { num_commits: 2 }), Some(0), Some(2), None)]
+#[case::stale(Some(CrcSource::Stale), Some(0), Some(1), None)]
+#[case::missing(Some(CrcSource::Missing), None, None, None)]
+#[case::unusable(Some(CrcSource::Unusable), None, None, None)]
+#[case::unknown(Some(CrcSource::Unknown), None, Some(2), None)]
+#[case::unknown_stale(Some(CrcSource::Unknown), None, Some(1), None)]
+#[case::unknown_absent(Some(CrcSource::Unknown), None, None, None)]
+#[case::omitted(None, None, Some(2), None)]
+#[case::omitted_stale(None, None, Some(1), None)]
+#[case::omitted_absent(None, None, None, None)]
 #[case::unresolved(
-    CrcSource::AtVersion,
+    Some(CrcSource::AtVersion),
     Some(2),
     Some(2),
     Some(CheckpointType::Unresolved)
 )]
-#[case::v1(CrcSource::AtVersion, Some(2), Some(2), Some(CheckpointType::V1))]
-#[case::v2(CrcSource::AtVersion, Some(2), Some(2), Some(CheckpointType::V2))]
+#[case::v1(Some(CrcSource::AtVersion), Some(2), Some(2), Some(CheckpointType::V1))]
+#[case::v2(Some(CrcSource::AtVersion), Some(2), Some(2), Some(CheckpointType::V2))]
 fn exported_hint_copy_outlives_snapshot_and_preserves_state(
-    #[case] source: CrcSource,
+    #[case] source: Option<CrcSource>,
     #[case] base_version: Option<u64>,
     #[case] crc_version: Option<u64>,
     #[case] checkpoint_type: Option<CheckpointType>,
@@ -391,12 +393,10 @@ fn exported_hint_copy_outlives_snapshot_and_preserves_state(
     }
     let mut crc = empty_crc();
     crc.version = crc_version.unwrap_or(0);
+    let expected_provenance = CrcProvenance::new(source.unwrap_or_default(), base_version);
     let hint = FfiSnapshotHint {
-        checkpoint_type: checkpoint_type.into(),
-        crc_provenance: FfiCrcProvenance {
-            source,
-            base_version: base_version.into(),
-        },
+        checkpoint_type: checkpoint_type.map(Into::into).into(),
+        crc_provenance: source.map(|_| expected_provenance.into()).into(),
         crc: crc_version.map_or(std::ptr::null(), |_| &crc),
         ..test_snapshot_hint(&paths, 2, freshness)
     };
@@ -415,11 +415,15 @@ fn exported_hint_copy_outlives_snapshot_and_preserves_state(
     );
     let mut observed = std::mem::MaybeUninit::uninit();
     unsafe { snapshot_crc_provenance(snapshot.shallow_copy(), observed.as_mut_ptr()) };
-    assert_eq!(unsafe { observed.assume_init() }, hint.crc_provenance);
     assert_eq!(
-        Option::<CheckpointType>::from(unsafe {
+        unsafe { observed.assume_init() },
+        expected_provenance.into()
+    );
+    assert_eq!(
+        Option::<FfiCheckpointType>::from(unsafe {
             snapshot_checkpoint_type(snapshot.shallow_copy())
-        }),
+        })
+        .map(Into::into),
         checkpoint_type
     );
     assert_eq!(
@@ -784,11 +788,8 @@ fn hint_provenance_failures_are_invalid_snapshot_hints(
     let mut crc = empty_crc();
     crc.version = crc_version.unwrap_or(0);
     let hint = FfiSnapshotHint {
-        checkpoint_type: checkpoint_type.into(),
-        crc_provenance: FfiCrcProvenance {
-            source,
-            base_version: base_version.into(),
-        },
+        checkpoint_type: checkpoint_type.map(Into::into).into(),
+        crc_provenance: Some(CrcProvenance::new(source, base_version).into()).into(),
         crc: crc_version.map_or(std::ptr::null(), |_| &crc),
         ..test_snapshot_hint(&paths, 1, FfiSnapshotHintFreshness::Latest)
     };
