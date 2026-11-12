@@ -108,8 +108,6 @@ use itertools::Itertools;
 use tracing::info;
 use url::Url;
 
-#[cfg(feature = "declarative-plans")]
-pub(crate) use crate::action_reconciliation::checkpoint_shape::CheckpointType;
 use crate::action_reconciliation::file_metadata::{
     StatsTransformConfig, build_checkpoint_read_schema, build_checkpoint_transform,
 };

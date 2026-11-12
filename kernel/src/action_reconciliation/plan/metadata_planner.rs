@@ -186,13 +186,6 @@ impl<'a> MetadataPlanner<'a> {
         })
     }
 
-    /// Whether [`CheckpointShape`](crate::checkpoint::CheckpointShape) should inspect the
-    /// leaf-level checkpoint schema to choose the statistics representation and identify
-    /// compatible structured partition values.
-    pub(crate) fn requires_checkpoint_add_schema(&self) -> bool {
-        self.stats_schema.is_some() || self.parsed_partition_schema.is_some()
-    }
-
     /// Reads and filters selected actions, attaches their identity key, then prepares metadata.
     /// Representation is determined from the source shape and the requested options.
     fn build_metadata_plan(
@@ -250,7 +243,7 @@ impl<'a> MetadataPlanner<'a> {
             ));
         }
         let file_schema = checkpoint_shape
-            .and_then(|checkpoint_shape| checkpoint_shape.leaf_checkpoint_schema.as_deref())
+            .map(|checkpoint_shape| checkpoint_shape.leaf_checkpoint_schema.as_ref())
             .unwrap_or(get_all_actions_schema());
         let add_field = file_schema.field(ADD_NAME).unwrap_or(&ADD_FIELD);
         let file_add_schema = match add_field.data_type() {

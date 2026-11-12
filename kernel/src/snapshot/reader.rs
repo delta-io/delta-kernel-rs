@@ -72,10 +72,10 @@ impl<'a> SnapshotReader<'a> {
     /// plan executor. Successful results are shared with subsequent readers and scan planning;
     /// failures are retried on the next call. Construction and hint export do not trigger this
     /// read. Scan planning can reuse a completed result but does not initialize this cache; a
-    /// preceding scan may have already probed the same files. Reloads and updates that replace
-    /// the log segment resolve independently. Concurrent getters wait for in-progress
-    /// initialization. Neither that wait nor executor reads observe this reader's cancellation
-    /// token; reads use the executor's own cancellation behavior.
+    /// preceding scan may have already resolved the same metadata independently. Reloads and
+    /// updates that replace the log segment resolve independently. Concurrent getters wait for
+    /// in-progress initialization. Neither that wait nor executor reads observe this reader's
+    /// cancellation token; reads use the executor's own cancellation behavior.
     /// During initialization, the plan executor must not call this getter recursively on the same
     /// snapshot: the recursive call would wait for the initialization already in progress.
     /// Adaptive-metadata tables are unsupported.

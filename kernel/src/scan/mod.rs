@@ -1472,7 +1472,7 @@ impl Scan {
         }
 
         let planner = scan_plan::MetadataPlanner::try_from_scan(self)?;
-        let base = scan_plan::MetadataReplayBase::try_new(&self.snapshot, engine, &planner)?;
+        let base = scan_plan::MetadataReplayBase::try_new(&self.snapshot, engine)?;
         self.build_metadata_scan_plan_with(base, &planner)
     }
 

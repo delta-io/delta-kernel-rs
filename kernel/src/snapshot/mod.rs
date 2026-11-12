@@ -796,9 +796,9 @@ impl Snapshot {
                 .checkpoint_info
                 .get()
                 .and_then(Option::as_ref)
-                .and_then(|info| info.sidecars.as_ref())
+                .map(|info| info.sidecars.as_ref())
                 .map_or(0, |sidecars| {
-                    sidecars.len() * size_of::<crate::FileMeta>()
+                    std::mem::size_of_val(sidecars)
                         + sidecars
                             .iter()
                             .map(|file| file.location.as_str().len())

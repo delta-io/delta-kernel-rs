@@ -1,7 +1,7 @@
 //! FFI checkpoint layout and metadata resolved through the engine's declarative executor.
 
+use delta_kernel::KernelResult;
 use delta_kernel::checkpoint::{CheckpointKind, CheckpointShape};
-use delta_kernel::{KernelError, KernelResult};
 
 use crate::delta_types::{CheckpointBacking, FfiLastCheckpoint};
 use crate::error::{ExternResult, IntoExternResult};
@@ -95,18 +95,14 @@ fn visit(
         visitor(context, std::ptr::null());
         return Ok(());
     };
-    let missing = || KernelError::internal_error("Resolved checkpoint omitted its layout metadata");
-    let schema = serde_json::to_string(info.leaf_schema().ok_or_else(missing)?)?;
-    let checkpoint = CheckpointBacking::try_new(info.last_checkpoint().ok_or_else(missing)?)?;
+    let schema = serde_json::to_string(info.leaf_schema())?;
+    let checkpoint = CheckpointBacking::try_new(info.last_checkpoint())?;
     let value = FfiCheckpointShape {
         leaf_schema: kernel_string_slice!(schema),
-        leaf_file_count: info.leaf_file_count().ok_or_else(missing)?,
-        size_in_bytes: info
-            .size_in_bytes()
-            .and_then(|bytes| u64::try_from(bytes).ok())
-            .ok_or_else(missing)?,
+        leaf_file_count: info.leaf_file_count(),
+        size_in_bytes: info.size_in_bytes(),
         last_checkpoint: checkpoint.as_ffi(),
-        kind: info.kind().ok_or_else(missing)?.into(),
+        kind: info.kind().into(),
     };
     visitor(context, &value);
     Ok(())

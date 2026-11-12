@@ -272,7 +272,7 @@ fn declarative_metadata_matches_imperative_scan(
 #[case::single_json_sidecar("v2-json-sidecars-struct-stats-only")]
 #[case::single_parquet_sidecar("v2-parquet-sidecars-struct-stats-only")]
 #[case::classic_named_manifest("v2-classic-checkpoint-parquet")]
-fn declarative_metadata_reuses_complete_lists_or_discovers_sidecars_dynamically(
+fn declarative_metadata_resolves_complete_sidecar_lists(
     #[case] table: &str,
     #[values(false, true)] remove_hint: bool,
     #[values(false, true)] getter_first: bool,
@@ -283,7 +283,6 @@ fn declarative_metadata_reuses_complete_lists_or_discovers_sidecars_dynamically(
     if remove_hint {
         segment.last_checkpoint_metadata = None;
     }
-    let has_sidecar_hint = segment.checkpoint_hint_sidecars().is_some();
     // Exercise checkpoint planning independently of any eligible CRC in the fixture.
     let snapshot = Arc::new(Snapshot::new(
         segment,
@@ -299,12 +298,11 @@ fn declarative_metadata_reuses_complete_lists_or_discovers_sidecars_dynamically(
         .declarative_metadata_scan_plan(engine.as_ref())?
         .expect("metadata plan");
 
-    // Then: only unhinted, unresolved manifests need dynamic discovery; planning fills no cache.
-    assert_eq!(
+    // Then: every manifest uses static files, while planning leaves the getter cache untouched.
+    assert!(
         plan.nodes
             .iter()
-            .any(|node| matches!(&node.op, Operator::DynamicScan(_))),
-        !has_sidecar_hint && !getter_first
+            .all(|node| !matches!(&node.op, Operator::DynamicScan(_)))
     );
     assert_eq!(snapshot.cached_checkpoint_info().is_some(), getter_first);
     let actual_metadata = declarative_metadata(&scan, engine.as_ref())?;
@@ -320,7 +318,7 @@ fn declarative_metadata_reuses_complete_lists_or_discovers_sidecars_dynamically(
         .reader()
         .get_checkpoint_info(engine.as_ref())?
         .unwrap();
-    let expected = resolved.sidecars.as_ref().unwrap();
+    let expected = resolved.sidecars.as_ref();
     let plan = scan
         .declarative_metadata_scan_plan(engine.as_ref())?
         .unwrap();
@@ -334,7 +332,7 @@ fn declarative_metadata_reuses_complete_lists_or_discovers_sidecars_dynamically(
             _ => vec![],
         })
         .collect();
-    assert_eq!(actual.as_slice(), expected.as_ref());
+    assert_eq!(actual.as_slice(), expected);
     Ok(())
 }
 

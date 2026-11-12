@@ -1,18 +1,14 @@
 //! Physical action reads using the caller's requested schema.
 
-use std::sync::LazyLock;
-
-use url::Url;
-
 use super::VERSION;
 use super::action_set::{ActionSet, ActionSource};
 use crate::action_reconciliation::file_metadata::STATS_FIELD as STATS;
-use crate::actions::{ADD_NAME, Add, LOG_ADD_SCHEMA, SIDECAR_FIELD, SIDECAR_NAME};
-use crate::checkpoint::{CheckpointShape, CheckpointType};
-use crate::expressions::{Expression as Expr, col, column_name, lit};
+use crate::actions::{ADD_NAME, Add, LOG_ADD_SCHEMA};
+use crate::checkpoint::{CheckpointKind, CheckpointShape};
+use crate::expressions::{column_name, lit};
 use crate::log_segment::LogSegment;
-use crate::plans::ir::nodes::{DynamicScan, FileType, ScanFile};
-use crate::schema::{DataType, SchemaRef, StructField, lazy_schema_ref};
+use crate::plans::ir::nodes::{FileType, ScanFile};
+use crate::schema::{DataType, SchemaRef, StructField};
 use crate::{KernelError, KernelResult, PlanBuilder, Version};
 
 /// Reads selected checkpoint actions. Non-content metadata reads use the root without sidecar
@@ -32,44 +28,34 @@ pub(crate) fn checkpoint_actions(
         FileType::Json => PlanBuilder::scan_json,
         FileType::Parquet => PlanBuilder::scan_parquet,
     };
-    match (
-        actions.contains_content_actions(),
-        checkpoint_shape.map(|checkpoint_shape| &checkpoint_shape.checkpoint_type),
-    ) {
-        (false, _) if !actions.contains_non_content_actions() => {
+    if !actions.contains_content_actions() {
+        return if actions.contains_non_content_actions() {
+            scan(parts, &[VERSION], schema)
+        } else {
             PlanBuilder::values(schema, vec![])
-        }
-        (false, _) | (true, Some(CheckpointType::Leaf)) => scan(parts, &[VERSION], schema),
-        (true, None) => Err(KernelError::schema("File reads require a checkpoint shape")),
-        (true, Some(CheckpointType::None)) => PlanBuilder::values(schema, vec![]),
-        (true, Some(CheckpointType::Manifest)) => {
-            let sidecar_files = match checkpoint_shape.and_then(|shape| shape.sidecars.as_ref()) {
-                Some(sidecars) => {
-                    let constants = parts
-                        .first()
-                        .map(|part| part.file_constants.clone())
-                        .unwrap_or_default();
-                    let sidecars = sidecars.iter().map(|file| ScanFile {
-                        meta: file.clone(),
-                        file_constants: constants.clone(),
-                    });
-                    PlanBuilder::scan_parquet(sidecars, &[VERSION], schema.clone())
-                }
-                // Discover sidecars from the manifest at execution when no complete list is
-                // available.
-                None => {
-                    sidecar_actions(file_type, parts.clone(), schema.clone(), &segment.log_root)
-                }
-            }?;
-            if !actions.contains_non_content_actions() {
-                return Ok(sidecar_files);
-            }
-            PlanBuilder::union_all([
-                sidecar_files.filter(actions.content_predicate(ActionSource::Checkpoint))?,
-                scan(parts, &[VERSION], schema)?.filter(actions.non_content_predicate())?,
-            ])
-        }
+        };
     }
+    let shape = checkpoint_shape
+        .ok_or_else(|| KernelError::schema("File reads require a checkpoint shape"))?;
+    if shape.kind() == CheckpointKind::Inline {
+        return scan(parts, &[VERSION], schema);
+    }
+    let constants = parts
+        .first()
+        .map(|part| part.file_constants.clone())
+        .unwrap_or_default();
+    let sidecars = shape.sidecars.iter().map(|file| ScanFile {
+        meta: file.clone(),
+        file_constants: constants.clone(),
+    });
+    let sidecar_files = PlanBuilder::scan_parquet(sidecars, &[VERSION], schema.clone())?;
+    if !actions.contains_non_content_actions() {
+        return Ok(sidecar_files);
+    }
+    PlanBuilder::union_all([
+        sidecar_files.filter(actions.content_predicate(ActionSource::Checkpoint))?,
+        scan(parts, &[VERSION], schema)?.filter(actions.non_content_predicate())?,
+    ])
 }
 
 /// Builds live-add rows from CRC files with the supplied `version`.
@@ -112,62 +98,6 @@ pub(crate) fn commit_arm(
         None => log_segment.commit_cover_version_tagged_scan_files()?,
     };
     PlanBuilder::scan_json(commit_files, &[VERSION], schema)
-}
-
-/// Read actions from V2 checkpoint sidecars.
-fn sidecar_actions(
-    file_type: FileType,
-    root_parts: Vec<ScanFile>,
-    action_schema: SchemaRef,
-    log_root: &Url,
-) -> KernelResult<PlanBuilder> {
-    const FILE_PATH: &str = "path";
-    const FILE_SIZE: &str = "size";
-    const FILE_MOD: &str = "filemod";
-    const SIDECAR_SIZE: &str = "sizeInBytes";
-    const SIDECAR_FILE_MOD: &str = "modificationTime";
-
-    static SIDECAR_FILE_META_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
-        not_null FILE_PATH: STRING,
-        not_null FILE_SIZE: LONG,
-        not_null FILE_MOD: LONG,
-        nullable VERSION: LONG,
-    };
-
-    static SIDECAR_READ_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
-        (&SIDECAR_FIELD),
-        nullable VERSION: LONG,
-    };
-
-    let scan = match file_type {
-        FileType::Json => PlanBuilder::scan_json,
-        FileType::Parquet => PlanBuilder::scan_parquet,
-    };
-    let sidecar_files = scan(root_parts, &[VERSION], SIDECAR_READ_SCHEMA.clone())?
-        .filter(col!(SIDECAR_NAME, FILE_PATH).is_not_null())?
-        .project(
-            Expr::struct_from([
-                col!(SIDECAR_NAME, FILE_PATH),
-                col!(SIDECAR_NAME, SIDECAR_SIZE),
-                col!(SIDECAR_NAME, SIDECAR_FILE_MOD),
-                col!(VERSION),
-            ]),
-            SIDECAR_FILE_META_SCHEMA.clone(),
-        )?;
-
-    let dynamic_scan = DynamicScan::try_new(
-        &SIDECAR_FILE_META_SCHEMA,
-        action_schema,
-        FileType::Parquet,
-        log_root.join("_sidecars/")?,
-        [VERSION],
-        column_name!(FILE_PATH),
-        column_name!(FILE_SIZE),
-        column_name!(FILE_MOD),
-        None,
-    )?;
-
-    sidecar_files.dynamic_scan(dynamic_scan)
 }
 
 #[cfg(test)]
@@ -344,8 +274,9 @@ mod tests {
         }
         let checkpoint_shape = actions
             .contains_content_actions()
-            .then(|| CheckpointShape::for_scan(&snapshot, &engine, false))
-            .transpose()?;
+            .then(|| CheckpointShape::for_scan(&snapshot, &engine))
+            .transpose()?
+            .flatten();
 
         // When: selected checkpoint actions are planned from the same resolved shape.
         let plan = MetadataPlanner::new(snapshot.log_segment(), actions)
@@ -354,15 +285,11 @@ mod tests {
             .checkpoint_actions()?
             .project_patch(|patch| patch.drop(ACTION_KEY))?
             .build()?;
-        // Then: only manifests without a complete list need dynamic sidecar discovery.
-        assert_eq!(
+        // Then: file-action reads always use a complete static sidecar list.
+        assert!(
             plan.nodes
                 .iter()
-                .any(|node| matches!(node.op, Operator::DynamicScan(_))),
-            matches!(spec, CheckpointSpec::V2(_))
-                && actions.contains_content_actions()
-                && !use_sidecar_hint
-                && !getter_first,
+                .all(|node| !matches!(node.op, Operator::DynamicScan(_)))
         );
         assert_eq!(
             plan.schema

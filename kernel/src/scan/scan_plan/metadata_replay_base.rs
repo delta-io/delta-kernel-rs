@@ -1,6 +1,5 @@
 use std::sync::Arc;
 
-use super::MetadataPlanner;
 use crate::actions::Add;
 use crate::checkpoint::CheckpointShape;
 use crate::{Engine, KernelResult, Snapshot, Version};
@@ -12,17 +11,13 @@ pub(in crate::scan) enum MetadataReplayBase {
     /// Checkpoint replay base, or an empty base when no checkpoint exists.
     Checkpoint {
         version: Option<Version>,
-        shape: Arc<CheckpointShape>,
+        shape: Option<Arc<CheckpointShape>>,
     },
 }
 
 impl MetadataReplayBase {
     /// Select the newest eligible metadata base and resolve checkpoint shape only when needed.
-    pub(in crate::scan) fn try_new(
-        snapshot: &Snapshot,
-        engine: &dyn Engine,
-        planner: &MetadataPlanner<'_>,
-    ) -> KernelResult<Self> {
+    pub(in crate::scan) fn try_new(snapshot: &Snapshot, engine: &dyn Engine) -> KernelResult<Self> {
         let checkpoint_version = snapshot.log_segment().checkpoint_version;
         // Keep replay eligibility independent of SnapshotCrc's validation.
         if let Some((version, files)) = snapshot
@@ -38,10 +33,7 @@ impl MetadataReplayBase {
             });
         }
 
-        // Resolve the checkpoint shape once. The planner owns the decision to retain the file-
-        // action schema; checkpoint discovery owns how that schema is obtained.
-        let shape =
-            CheckpointShape::for_scan(snapshot, engine, planner.requires_checkpoint_add_schema())?;
+        let shape = CheckpointShape::for_scan(snapshot, engine)?;
         Ok(Self::Checkpoint {
             version: checkpoint_version,
             shape,
@@ -103,8 +95,7 @@ mod tests {
         let crc = Some(crc);
         let snapshot = Arc::new(Snapshot::new_with_crc(segment, config, crc, false, false)?);
         let scan = snapshot.scan_builder().build()?;
-        let planner = MetadataPlanner::try_from_scan(&scan)?;
-        let base = MetadataReplayBase::try_new(&scan.snapshot, &engine, &planner)?;
+        let base = MetadataReplayBase::try_new(&scan.snapshot, &engine)?;
         assert_eq!(base.version(), Some(version));
         let is_crc = matches!(base, MetadataReplayBase::Crc { .. });
         assert_eq!(is_crc, has_all_files);

@@ -236,7 +236,7 @@ impl SnapshotHint {
         let last_checkpoint_hint = snapshot
             .cached_checkpoint_info()
             .and_then(Option::as_deref)
-            .and_then(|info| info.last_checkpoint())
+            .map(|info| info.last_checkpoint())
             .or(last_checkpoint_hint);
         Ok(Self {
             version: snapshot.version(),
@@ -591,7 +591,10 @@ mod tests {
         let mut exported = snapshot.to_snapshot_hint()?;
 
         // Then: export retains the resolved metadata, which remains readable without an executor.
-        assert_eq!(exported.last_checkpoint_hint(), resolved.last_checkpoint());
+        assert_eq!(
+            exported.last_checkpoint_hint(),
+            Some(resolved.last_checkpoint())
+        );
         let no_executor = DelegatingEngine::new(engine.clone()).without_plan_executor();
         let cached = snapshot
             .reader()
@@ -618,7 +621,7 @@ mod tests {
         assert_eq!(recovered.leaf_schema(), resolved.leaf_schema());
         assert_eq!(recovered.leaf_file_count(), resolved.leaf_file_count());
         assert_eq!(
-            serde_json::to_value(recovered.last_checkpoint().unwrap()).unwrap(),
+            serde_json::to_value(recovered.last_checkpoint()).unwrap(),
             portable
         );
         Ok(())
