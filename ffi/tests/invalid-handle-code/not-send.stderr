@@ -6,13 +6,15 @@ error[E0277]: `*mut u32` cannot be sent between threads safely
   |
   = help: within `NotSend`, the trait `Send` is not implemented for `*mut u32`
 note: required because it appears within the type `NotSend`
- --> tests/invalid-handle-code/not-send.rs:3:12
+ --> tests/invalid-handle-code/not-send.rs:3:20
   |
 3 | pub struct NotSend(*mut u32);
-  |            ^^^^^^^
+  |                    ^^^^^^^^ required by this field
 note: required by a bound in `delta_kernel_ffi::handle::HandleDescriptor::Target`
  --> src/handle.rs
   |
+  | pub trait HandleDescriptor {
+  |     /// The true type of the handle's underlying object
   |     type Target: ?Sized + Send;
   |                           ^^^^ required by this bound in `HandleDescriptor::Target`
 
@@ -24,12 +26,14 @@ error[E0277]: `*mut u32` cannot be sent between threads safely
   |
   = help: within `NotSend`, the trait `Send` is not implemented for `*mut u32`
 note: required because it appears within the type `NotSend`
- --> tests/invalid-handle-code/not-send.rs:3:12
+ --> tests/invalid-handle-code/not-send.rs:3:20
   |
 3 | pub struct NotSend(*mut u32);
-  |            ^^^^^^^
+  |                    ^^^^^^^^ required by this field
 note: required by a bound in `delta_kernel_ffi::handle::HandleDescriptor::Target`
  --> src/handle.rs
   |
+  | pub trait HandleDescriptor {
+  |     /// The true type of the handle's underlying object
   |     type Target: ?Sized + Send;
   |                           ^^^^ required by this bound in `HandleDescriptor::Target`
