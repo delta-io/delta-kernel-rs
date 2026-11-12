@@ -38,7 +38,8 @@ impl JsonReadCapture {
         self.paths_with_outcome("success")
     }
 
-    /// Returns requested paths from reads that failed before or during iteration.
+    /// Returns all requested paths from reads that failed before or during iteration.
+    /// A failing request does not identify which file failed or how far reading progressed.
     pub fn failed_paths(&self) -> Vec<Url> {
         self.paths_with_outcome("failure")
     }

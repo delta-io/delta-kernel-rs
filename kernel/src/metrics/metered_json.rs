@@ -5,6 +5,8 @@
 //!
 //! DEBUG events named `json_read_finished` identify each requested path and distinguish successful
 //! exhaustion (`success`), read errors (`failure`), and early iterator drops (`dropped`).
+//! Outcomes describe the entire handler request. A failure is reported for every requested path;
+//! it does not identify which file failed or how far reading progressed.
 
 use std::sync::Arc;
 
@@ -53,12 +55,20 @@ impl MeteredJsonHandler {
         result: KernelResult<FileDataReadResultIterator>,
     ) -> KernelResult<FileDataReadResultIterator> {
         let mut trace = JsonReadTrace::new(files);
-        let inner = result.inspect_err(|_| trace.finish("failure"))?;
+        let inner = result.inspect_err(|_| {
+            if let Some(trace) = &mut trace {
+                trace.finish("failure");
+            }
+        })?;
         let num_files = files.len() as u64;
         let bytes_read = files.iter().map(|f| f.size).sum();
         let inner =
             PrecountedMetricsIterator::new(inner, num_files, bytes_read, emit_json_read_completed);
-        Ok(Box::new(TracedJsonRead { inner, trace }))
+        if let Some(trace) = trace {
+            Ok(Box::new(TracedJsonRead { inner, trace }))
+        } else {
+            Ok(Box::new(inner))
+        }
     }
 }
 
@@ -115,16 +125,14 @@ struct JsonReadTrace {
 }
 
 impl JsonReadTrace {
-    fn new(files: &[FileMeta]) -> Self {
-        let paths = if tracing::level_enabled!(Level::DEBUG) {
-            files.iter().map(|file| file.location.clone()).collect()
-        } else {
-            Vec::new()
-        };
-        Self {
-            paths,
-            dispatch: tracing::dispatcher::get_default(Clone::clone),
+    fn new(files: &[FileMeta]) -> Option<Self> {
+        if files.is_empty() || !tracing::level_enabled!(Level::DEBUG) {
+            return None;
         }
+        Some(Self {
+            paths: files.iter().map(|file| file.location.clone()).collect(),
+            dispatch: tracing::dispatcher::get_default(Clone::clone),
+        })
     }
 
     fn finish(&mut self, outcome: &'static str) {

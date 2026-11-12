@@ -383,12 +383,24 @@ async fn compaction_cannot_advance_latest_version() -> Result<(), Box<dyn std::e
     reads.clear();
     let snapshot = Snapshot::builder_for(table.table_root()).build(engine.as_ref())?;
     assert_eq!(snapshot.version(), 3);
-    assert_eq!(scan_results(snapshot, engine.clone())?, expected);
+    assert_eq!(scan_results(snapshot.clone(), engine.clone())?, expected);
     assert!(
         !reads
             .requested_paths()
             .iter()
             .any(|p| p.path().ends_with(".compacted.json"))
+    );
+    let committed = begin_transaction(snapshot, engine.as_ref())?
+        .commit(engine.as_ref())?
+        .unwrap_committed();
+    assert_eq!(committed.commit_version(), 4);
+    assert_eq!(
+        committed.post_commit_stats().commits_since_log_compaction,
+        4
+    );
+    assert_eq!(
+        scan_results(committed.post_commit_snapshot().unwrap().clone(), engine)?,
+        expected
     );
     Ok(())
 }

@@ -424,6 +424,10 @@ impl LogSegment {
             &listed_files.checkpoint_parts,
             end_version,
         )?;
+        // Future compactions cannot bound replay or post-commit statistics.
+        listed_files.ascending_compaction_files.retain(|file| {
+            matches!(file.file_type, LogPathFileType::CompactedCommit { hi } if hi <= effective_version)
+        });
         validate_latest_commit_file(&listed_files, effective_version)?;
         validate_crc(
             listed_files.latest_crc_file.as_ref(),
