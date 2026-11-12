@@ -3007,7 +3007,14 @@ impl<'a> SchemaTransform<'a> for MakePhysical<'a> {
 
     fn transform_struct(&mut self, stype: &'a StructType) -> KernelResult<Cow<'a, StructType>> {
         self.sibling_names_stack.push(HashMap::new());
-        let result = self.recurse_into_struct(stype);
+        let result = if self.mode == MakePhysicalMode::Rewrite {
+            self.recurse_into_struct(stype)
+        } else {
+            stype
+                .fields()
+                .try_for_each(|field| self.transform_struct_field(field).map(|_| ()))
+                .map(|()| Cow::Borrowed(stype))
+        };
         self.sibling_names_stack.pop();
         result
     }
@@ -3957,15 +3964,26 @@ mod tests {
     fn test_make_physical_dup_physical_name(
         #[case] schema: StructType,
         #[case] expected_error_substring: Option<String>,
+        #[values(MakePhysicalMode::ValidateRead, MakePhysicalMode::ValidateStrict)]
+        validation_mode: MakePhysicalMode,
     ) {
         // The same dedup rules should apply under both CM modes.
         for mode in [ColumnMappingMode::Name, ColumnMappingMode::Id] {
             let result = schema.make_physical(mode);
-            let validation = MakePhysical::validate_read_column_mapping(mode, &schema);
+            let mut walker = MakePhysical {
+                mode: validation_mode,
+                ..MakePhysical::new(mode)
+            };
+            let validation = walker.transform_struct(&schema);
             assert_eq!(
                 result.as_ref().map(|_| ()).map_err(ToString::to_string),
-                validation.map_err(|error| error.to_string()),
+                validation.as_ref().map(|_| ()).map_err(ToString::to_string),
             );
+            assert!(walker.sibling_names_stack.is_empty());
+            assert!(walker.logical_path.is_empty());
+            if let Ok(validated) = validation {
+                assert!(matches!(validated, Cow::Borrowed(_)));
+            }
             match &expected_error_substring {
                 None => {
                     result.expect("The input schema should be valid");
