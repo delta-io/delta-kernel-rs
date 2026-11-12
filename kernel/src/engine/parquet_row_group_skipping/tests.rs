@@ -999,6 +999,22 @@ fn decimal_fixed_len_byte_array_footer_stats_respect_annotations(
     assert_eq!(extract_max_scalar(&data_type, &column), expected);
 }
 
+#[test]
+fn byte_array_decimal_footer_stats_yield_no_bound() {
+    let bytes = ByteArray::from(1_050i128.to_be_bytes().to_vec());
+    let stats = Statistics::byte_array(Some(bytes.clone()), Some(bytes), None, Some(0), false);
+    let column = annotated_chunk(
+        PhysicalType::BYTE_ARRAY,
+        Some(LogicalType::decimal(2, 20)),
+        ConvertedType::DECIMAL,
+        Some((20, 2)),
+        stats,
+    );
+    let data_type = DataType::decimal(22, 4).unwrap();
+    assert_eq!(extract_min_scalar(&data_type, &column), None);
+    assert_eq!(extract_max_scalar(&data_type, &column), None);
+}
+
 #[rstest]
 #[case::zero(0, Some(0))]
 #[case::fits(1, Some(10i128.pow(37)))]
@@ -1034,7 +1050,8 @@ fn decimal_footer_stats_match_reader_cast(
         ArrowDataType::Int64,
         ArrowDataType::Decimal128(9, 2),
         ArrowDataType::Decimal128(18, 2),
-        ArrowDataType::Decimal128(20, 2)
+        ArrowDataType::Decimal128(20, 2),
+        ArrowDataType::Decimal256(40, 2)
     )]
     source_type: ArrowDataType,
     #[values(4, 5, 10, 12, 14, 20, 22, 38)] precision: u8,

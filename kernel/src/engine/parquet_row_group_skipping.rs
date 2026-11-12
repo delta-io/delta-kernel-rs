@@ -327,10 +327,10 @@ fn fixed_len_decimal_bits(bytes: &[u8], column: &ColumnDescriptor) -> Option<i12
     decimal_bits_from_bytes(bytes)
 }
 
-/// Widens an unscaled footer bound to `target` with the multiplier the reader cast applies, so a
-/// bound exists exactly when `ensure_data_types` admits decoding the column as `target`. Returns
-/// `None` when the reader would reject that cast or the value exceeds `target`'s precision, so
-/// the bound cannot justify skipping a row group.
+/// Widens an unscaled footer bound to `target` with the multiplier the reader cast applies. A
+/// bound exists only when `ensure_data_types` admits decoding the column as `target` and the
+/// widened value fits `target`'s precision; otherwise `None`, so the bound cannot justify
+/// skipping a row group.
 fn decimal_stat_as(bits: i128, column: &ColumnDescriptor, target: DecimalType) -> Option<Scalar> {
     let source = reader_arrow_type(column)?;
     let target_scale = i8::try_from(target.scale()).ok()?;

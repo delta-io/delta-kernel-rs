@@ -1727,6 +1727,17 @@ fn type_widening_decimal() -> Result<(), Box<dyn std::error::Error>> {
         "+--------------+",
     ]
 )]
+#[case::short_decimal(
+    "short_decimal",
+    Scalar::decimal(20, 6, 1).unwrap(),
+    vec![
+        "+---------------+",
+        "| short_decimal |",
+        "+---------------+",
+        "| 2.0           |",
+        "+---------------+",
+    ]
+)]
 #[case::int_decimal(
     "int_decimal",
     Scalar::decimal(30, 11, 1).unwrap(),
