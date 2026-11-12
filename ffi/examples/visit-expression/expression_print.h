@@ -281,8 +281,8 @@ void print_tree_helper(ExpressionItem ref, int depth) {
         case HasUriScheme:
           printf("HasUriScheme\n");
           break;
-        case UriEncodePath:
-          printf("UriEncodePath\n");
+        case UriEncodeLocation:
+          printf("UriEncodeLocation\n");
           break;
       }
 

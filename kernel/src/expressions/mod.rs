@@ -173,11 +173,11 @@ pub enum UnaryExpressionOp {
     /// STRING, a NULL input yields NULL, and other input types are an error.
     ///
     /// ```text
-    /// URI_ENCODE_PATH('data/a b.parquet')         -- 'data/a%20b.parquet'
-    /// URI_ENCODE_PATH('s3://bucket/a#1.parquet')  -- 's3://bucket/a%231.parquet'
-    /// URI_ENCODE_PATH('data/a%20b.parquet')       -- 'data/a%2520b.parquet'
+    /// URI_ENCODE_LOCATION('data/a b.parquet')         -- 'data/a%20b.parquet'
+    /// URI_ENCODE_LOCATION('s3://bucket/a#1.parquet')  -- 's3://bucket/a%231.parquet'
+    /// URI_ENCODE_LOCATION('data/a%20b.parquet')       -- 'data/a%2520b.parquet'
     /// ```
-    UriEncodePath,
+    UriEncodeLocation,
 }
 
 /// A binary arithmetic operator over two numeric operands.
@@ -1273,7 +1273,7 @@ impl Display for UnaryExpressionOp {
         use UnaryExpressionOp::*;
         match self {
             ToJson => write!(f, "TO_JSON"),
-            UriEncodePath => write!(f, "URI_ENCODE_PATH"),
+            UriEncodeLocation => write!(f, "URI_ENCODE_LOCATION"),
         }
     }
 }
@@ -1528,8 +1528,8 @@ mod tests {
                 "CAST(Column(x) AS date)",
             ),
             (
-                Expr::unary(UnaryExpressionOp::UriEncodePath, col!("x")),
-                "URI_ENCODE_PATH(Column(x))",
+                Expr::unary(UnaryExpressionOp::UriEncodeLocation, col!("x")),
+                "URI_ENCODE_LOCATION(Column(x))",
             ),
             (
                 Expr::case_when([(col!("x").is_null(), lit(0))], col!("x")),
@@ -1745,7 +1745,7 @@ mod tests {
 
         #[rstest::rstest]
         fn test_unary_expression_roundtrip(
-            #[values(UnaryExpressionOp::ToJson, UnaryExpressionOp::UriEncodePath)]
+            #[values(UnaryExpressionOp::ToJson, UnaryExpressionOp::UriEncodeLocation)]
             op: UnaryExpressionOp,
         ) {
             assert_roundtrip(&Expression::unary(op, col!("data")));

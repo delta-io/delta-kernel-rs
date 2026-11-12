@@ -21,7 +21,7 @@ use delta_kernel::engine::parse_json;
 use delta_kernel::expressions::{
     BinaryExpression, BinaryExpressionOp, Expression as KernelExpression, ExpressionRef,
     ExpressionStructPatch, MapToStructExpression, MapToStructOptions, ParseJsonExpression,
-    VariadicExpression, VariadicExpressionOp,
+    UnaryExpressionOp, VariadicExpression, VariadicExpressionOp,
 };
 use delta_kernel::schema::{
     DataType as KernelDataType, PrimitiveType, SchemaRef as KernelSchemaRef, StructField,
@@ -72,10 +72,13 @@ pub fn to_df_expr(
         }
         KernelExpression::ParseJson(parse) => parse_json_to_df_expr(parse, input_schema),
 
-        KernelExpression::Unary(u) => Err(KernelError::unsupported(format!(
-            "converting the {} expression is not yet supported",
-            u.op
-        ))),
+        KernelExpression::Unary(u) => match u.op {
+            op @ (UnaryExpressionOp::ToJson | UnaryExpressionOp::UriEncodeLocation) => {
+                Err(KernelError::unsupported(format!(
+                    "converting the {op} expression is not yet supported"
+                )))
+            }
+        },
 
         KernelExpression::CaseWhen(_) => Err(KernelError::unsupported(
             "converting a CaseWhen expression is not yet supported",
@@ -853,7 +856,7 @@ mod tests {
 
     #[rstest]
     fn unary_expression_is_unsupported(
-        #[values(UnaryExpressionOp::ToJson, UnaryExpressionOp::UriEncodePath)]
+        #[values(UnaryExpressionOp::ToJson, UnaryExpressionOp::UriEncodeLocation)]
         op: UnaryExpressionOp,
     ) {
         let kernel = KernelExpr::unary(op, col!("b"));
