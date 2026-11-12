@@ -2086,6 +2086,8 @@ mod tests {
                 ..Default::default()
             }),
         )
+        .unwrap()
+        .with_checkpoint_type(Some(SelectedCheckpointType::V1))
         .unwrap();
         let configuration = MockTableConfigurationBuilder::new()
             .with_table_root(&table_root)
@@ -2176,6 +2178,7 @@ mod tests {
         assert_eq!(*committer.calls.borrow(), expected_calls);
         assert_eq!(published.version(), source.version());
         assert_eq!(published.crc_provenance(), source.crc_provenance());
+        assert_eq!(published.checkpoint_type(), source.checkpoint_type());
         assert_eq!(
             published.table_configuration(),
             source.table_configuration()
@@ -2275,6 +2278,7 @@ mod tests {
             .unwrap();
 
         // THEN: replace latest_commit_file only if version 2 is known to be published.
+        assert_eq!(result.checkpoint_type(), Some(SelectedCheckpointType::V2));
         assert!(
             result
                 .log_segment()
@@ -3426,63 +3430,35 @@ mod tests {
         assert_eq!(snap.version(), 2);
     }
 
-    #[test]
-    fn test_new_post_commit_simple() {
-        // GIVEN
-        let path = std::fs::canonicalize(PathBuf::from("./tests/data/basic_partitioned/")).unwrap();
-        let url = url::Url::from_directory_path(path).unwrap();
-        let engine = SyncEngine::new();
-        let base_snapshot = Snapshot::builder_for(url.clone()).build(&engine).unwrap();
-        let next_version = base_snapshot.version() + 1;
-
-        // WHEN
-        let fake_new_commit = ParsedLogPath::create_parsed_published_commit(&url, next_version);
-        let post_commit_snapshot = base_snapshot
-            .new_post_commit(
-                fake_new_commit,
-                CrcDelta::default(),
-                #[cfg(feature = "adaptive-metadata-in-dev")]
-                None,
-            )
-            .unwrap();
-
-        // THEN
-        assert_eq!(post_commit_snapshot.version(), next_version);
-        assert_eq!(post_commit_snapshot.log_segment().end_version, next_version);
-    }
-
-    // A post-commit snapshot built from a parent holding a stale base (not an at-version CRC)
-    // keeps that base rather than dropping it: the single-commit delta can't advance it, but
-    // retaining it lets a later write reuse the parsed CRC.
-    #[test]
-    fn test_new_post_commit_from_stale_base_keeps_base() {
-        let path =
-            std::fs::canonicalize(PathBuf::from("./tests/data/table-with-dv-small/")).unwrap();
-        let url = url::Url::from_directory_path(path).unwrap();
-        let engine = SyncEngine::new();
-
-        // Rebuild the v1 snapshot so it holds a stale CRC@0 (base only, not at-version).
-        let built = Snapshot::builder_for(url.clone())
-            .at_version(1)
-            .build(&engine)
-            .unwrap();
-        let stale_crc = Arc::new(Crc {
-            version: 0,
-            ..Default::default()
-        });
+    #[rstest]
+    #[case::at_version(Some(2), CrcSource::AtVersion, Some(2), CrcSource::Reconstructed { num_commits: 1 })]
+    #[case::reconstructed(Some(2), CrcSource::Reconstructed { num_commits: 2 }, Some(0), CrcSource::Reconstructed { num_commits: 3 })]
+    #[case::stale(Some(0), CrcSource::Stale, Some(0), CrcSource::Stale)]
+    #[case::unknown_stale(Some(0), CrcSource::Unknown, None, CrcSource::Unknown)]
+    #[case::missing(None, CrcSource::Missing, None, CrcSource::Missing)]
+    #[case::unusable(None, CrcSource::Unusable, None, CrcSource::Unusable)]
+    #[case::unknown(None, CrcSource::Unknown, None, CrcSource::Unknown)]
+    fn test_new_post_commit_preserves_provenance(
+        #[case] crc_version: Option<Version>,
+        #[case] source: CrcSource,
+        #[case] base_version: Option<Version>,
+        #[case] expected_source: CrcSource,
+    ) {
+        // Given a snapshot with a known checkpoint type and optional retained checksum.
+        let built = snapshot_with_staged_commits(Some(2), crc_version, false);
         let parent = Snapshot::new_with_crc(
             built.log_segment().clone(),
             built.table_configuration().clone(),
-            Some(stale_crc),
-            CrcProvenance::default(),
+            built.retained_crc().cloned(),
+            CrcProvenance::new(source, base_version),
             false, /* built_as_latest */
             false, /* skipped_new_checkpoints */
         )
         .unwrap();
-        assert!(parent.crc_at_version().is_none());
-        assert_eq!(parent.retained_crc().map(|c| c.version), Some(0));
+        assert_eq!(parent.checkpoint_type(), Some(SelectedCheckpointType::V1));
 
-        let commit = ParsedLogPath::create_parsed_published_commit(&url, 2);
+        // When a committed action advances the snapshot without storage I/O.
+        let commit = ParsedLogPath::create_parsed_published_commit(parent.table_root(), 3);
         let post = parent
             .new_post_commit(
                 commit,
@@ -3492,13 +3468,25 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(post.version(), 2);
-        assert!(post.crc_at_version().is_none());
+        // Then at-version CRCs advance, stale or absent state is retained, and the type survives.
+        assert_eq!(post.version(), 3);
+        assert_eq!(post.log_segment().end_version, 3);
+        assert_eq!(post.checkpoint_type(), parent.checkpoint_type());
         assert_eq!(
-            post.retained_crc().map(|c| c.version),
-            Some(0),
-            "the stale base must be carried forward, not dropped"
+            post.crc_provenance(),
+            CrcProvenance::new(expected_source, base_version)
         );
+        assert_eq!(
+            post.retained_crc().map(|crc| crc.version),
+            crc_version.map(|version| {
+                if version == parent.version() {
+                    3
+                } else {
+                    version
+                }
+            })
+        );
+        assert_eq!(parent.retained_crc().map(|crc| crc.version), crc_version);
     }
 
     #[test]

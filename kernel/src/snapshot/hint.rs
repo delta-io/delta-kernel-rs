@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use delta_kernel_derive::internal_api;
 
+use super::snapshot_crc::SnapshotCrc;
 use crate::actions::{Metadata, Protocol};
 use crate::crc::Crc;
 use crate::error::SnapshotHintError;
@@ -111,7 +112,8 @@ impl SnapshotHint {
     /// `provenance` supplies retained checkpoint and checksum observations. When present, `crc`
     /// may be stale; `None` preserves legacy hint behavior and requires any CRC to be at-version.
     /// Structural consistency is validated when the hint is built; Kernel does not read storage
-    /// to verify these claims.
+    /// to verify these claims. Checksum provenance is checked against `crc` and `version`, not
+    /// CRC entries in `log_paths`, which may omit the original disk baseline.
     ///
     /// # Errors
     ///
@@ -234,7 +236,7 @@ impl SnapshotHint {
         self.last_checkpoint_hint.as_ref()
     }
 
-    /// Returns the retained CRC state, if present.
+    /// Returns the checksum at [`Self::version`], if present.
     ///
     /// Returns `None` for a stale checksum; [`Self::retained_crc`] includes the retained stale
     /// baseline. Connector-provided inputs are checked when the snapshot is built.
@@ -410,6 +412,11 @@ impl SnapshotHint {
             );
         }
 
+        let crc_provenance = provenance
+            .map(|(_, provenance)| provenance)
+            .unwrap_or_default();
+        SnapshotCrc::validate_provenance(crc.as_deref(), version, crc_provenance)
+            .map_err(|_| SnapshotHintError::CrcProvenanceConflict)?;
         let snapshot = Snapshot::new_with_crc(
             match provenance {
                 Some((checkpoint_type, _)) => log_segment.with_checkpoint_type(checkpoint_type)?,
@@ -417,9 +424,7 @@ impl SnapshotHint {
             },
             table_configuration,
             crc,
-            provenance
-                .map(|(_, provenance)| provenance)
-                .unwrap_or_default(),
+            crc_provenance,
             built_as_latest,
             false, /* skipped_new_checkpoints */
         )?;

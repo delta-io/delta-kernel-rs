@@ -102,6 +102,7 @@ pub struct FfiSnapshotHint {
     /// Export always includes the observation, even when `crc` is null.
     /// `Missing` and `Unusable` require a null `crc` and no base version. `AtVersion`,
     /// `Reconstructed`, and `Stale` require a non-null `crc` and a compatible base version.
+    /// Validated against `crc` and `version`, not against CRC entries in `log_paths`.
     pub crc_provenance: OptionalValue<FfiCrcProvenance>,
 }
 

@@ -84,9 +84,10 @@ mod tests {
     use super::*;
     use crate::log_segment_files::LogSegmentFiles;
     use crate::path::ParsedLogPath;
+    use crate::schema::{SchemaRef, schema_ref};
     use crate::{FileMeta, KernelError};
 
-    fn segment(filename: &str) -> LogSegment {
+    fn segment(filename: &str, hint: Option<LastCheckpointHint>) -> LogSegment {
         let root = url::Url::parse("memory:///_delta_log/").unwrap();
         let file = ParsedLogPath::new(FileMeta {
             location: root.join(filename).unwrap(),
@@ -114,32 +115,53 @@ mod tests {
                 ..Default::default()
             }
         };
-        LogSegment::try_new(files, root, Some(0), None).unwrap()
+        LogSegment::try_new(files, root, Some(0), hint).unwrap()
     }
 
     #[rstest::rstest]
-    #[case("00000000000000000000.json", None)]
+    #[case("00000000000000000000.json", None, None)]
     #[case(
         "00000000000000000000.checkpoint.parquet",
+        None,
         Some(SelectedCheckpointType::Unresolved)
     )]
     #[case(
         "00000000000000000000.checkpoint.0000000001.0000000002.parquet",
+        None,
         Some(SelectedCheckpointType::V1)
     )]
     #[case(
         "00000000000000000000.checkpoint.550e8400-e29b-41d4-a716-446655440000.parquet",
+        None,
         Some(SelectedCheckpointType::V2)
+    )]
+    #[case::v1_schema(
+        "00000000000000000000.checkpoint.parquet",
+        Some(schema_ref! { nullable "add": STRING }),
+        Some(SelectedCheckpointType::V1)
+    )]
+    #[case::schema_with_checkpoint_metadata(
+        "00000000000000000000.checkpoint.parquet",
+        Some(schema_ref! { nullable "checkpointMetadata": STRING }),
+        Some(SelectedCheckpointType::Unresolved)
     )]
     fn checkpoint_filename_evidence(
         #[case] filename: &str,
+        #[case] checkpoint_schema: Option<SchemaRef>,
         #[case] expected: Option<SelectedCheckpointType>,
     ) {
-        // Given a commit or checkpoint path with no additional type claim.
-        let segment = segment(filename);
+        // Given a log path and optional matching _last_checkpoint schema evidence.
+        let segment = segment(
+            filename,
+            checkpoint_schema.map(|schema| LastCheckpointHint {
+                version: 0,
+                checkpoint_schema: Some(schema),
+                ..Default::default()
+            }),
+        );
         // When the selected checkpoint type is observed.
         let checkpoint_type = segment.checkpoint_type();
-        // Then only unambiguous filename evidence establishes the format.
+        // Then only unambiguous filename or matching schema evidence establishes the format.
         assert_eq!(checkpoint_type, expected);
     }
 
@@ -158,10 +180,10 @@ mod tests {
     ) {
         // Given a resolved source checkpoint and a derived segment's own type claim.
         let filename = "00000000000000000000.checkpoint.parquet";
-        let source = segment(filename)
+        let source = segment(filename, None)
             .with_checkpoint_type(Some(SelectedCheckpointType::V2))
             .unwrap();
-        let mut derived = segment(filename)
+        let mut derived = segment(filename, None)
             .with_checkpoint_type(Some(new_type))
             .unwrap();
         if different_checkpoint {
@@ -194,7 +216,7 @@ mod tests {
         #[case] checkpoint_type: SelectedCheckpointType,
     ) {
         // Given a path whose checkpoint presence or filename contradicts the supplied type.
-        let segment = segment(filename);
+        let segment = segment(filename, None);
         // When the claim is attached to the selected checkpoint.
         let result = segment.with_checkpoint_type(Some(checkpoint_type));
         // Then validation reports a typed checkpoint-provenance conflict.

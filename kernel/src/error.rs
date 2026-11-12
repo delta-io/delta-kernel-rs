@@ -182,7 +182,7 @@ pub enum SnapshotHintError {
     /// The hint has neither a complete checkpoint nor commit version zero.
     #[error("Invalid snapshot hint: snapshot history does not start at version 0")]
     MissingHistoryAnchor,
-    /// The supplied CRC describes a different table version.
+    /// The supplied CRC is newer than the hint, or is older without attached provenance.
     #[error("Invalid snapshot hint: CRC version {crc} does not match snapshot hint version {hint}")]
     CrcVersion {
         /// The version described by the CRC.

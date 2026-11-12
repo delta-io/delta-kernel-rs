@@ -6,7 +6,6 @@ use std::sync::Arc;
 
 use super::{CrcProvenance, CrcSource};
 use crate::crc::Crc;
-use crate::error::SnapshotHintError;
 use crate::utils::require;
 use crate::{KernelError, KernelResult, Version};
 
@@ -50,7 +49,21 @@ impl SnapshotCrc {
                 ))
             );
         }
-        let valid_provenance = match (provenance.source, provenance.base_version, crc.as_ref()) {
+        Self::validate_provenance(crc.as_deref(), snapshot_version, provenance)?;
+        Ok(Self {
+            crc,
+            snapshot_version,
+            provenance,
+        })
+    }
+
+    /// Checks the checksum's provenance independently of its log-segment bounds.
+    pub(super) fn validate_provenance(
+        crc: Option<&Crc>,
+        snapshot_version: Version,
+        provenance: CrcProvenance,
+    ) -> KernelResult<()> {
+        let valid_provenance = match (provenance.source, provenance.base_version, crc) {
             (CrcSource::Unknown, None, _) => true,
             (CrcSource::Missing | CrcSource::Unusable, None, None) => true,
             (CrcSource::AtVersion, Some(base_version), Some(crc)) => {
@@ -68,13 +81,9 @@ impl SnapshotCrc {
         };
         require!(
             valid_provenance,
-            SnapshotHintError::CrcProvenanceConflict.into()
+            KernelError::internal_error("Checksum provenance conflicts with retained checksum")
         );
-        Ok(Self {
-            crc,
-            snapshot_version,
-            provenance,
-        })
+        Ok(())
     }
 
     pub(super) fn provenance(&self) -> CrcProvenance {
@@ -245,8 +254,10 @@ mod tests {
         let error = SnapshotCrc::try_new(crc, 5, None, CrcProvenance::new(source, base_version))
             .unwrap_err();
 
-        // Then validation reports a typed provenance conflict.
-        assert!(matches!(error, KernelError::SnapshotHint(error)
-            if matches!(*error, SnapshotHintError::CrcProvenanceConflict)));
+        // Then an invalid internal derivation is reported as an internal error.
+        assert!(matches!(
+            error.without_backtrace(),
+            KernelError::InternalError(_)
+        ));
     }
 }
