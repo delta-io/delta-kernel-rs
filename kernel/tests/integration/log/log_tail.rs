@@ -388,7 +388,7 @@ async fn incremental_snapshot_skip_new_checkpoints_with_log_tail(
     assert_eq!(new_snapshot.version(), 4);
     assert_eq!(reporter.list_calls.get(), 1);
     assert_eq!(
-        new_snapshot.log_segment().checkpoint_version,
+        new_snapshot.log_segment().checkpoint_version(),
         with_checkpoint.then_some(1)
     );
     assert_eq!(

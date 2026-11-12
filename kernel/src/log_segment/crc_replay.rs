@@ -125,7 +125,7 @@ impl LogSegment {
             .transpose()?
             .flatten();
         Ok(disk_crc.or_else(|| in_memory_base.cloned()).filter(|crc| {
-            self.checkpoint_version
+            self.checkpoint_version()
                 .is_none_or(|ckpt| crc.version >= ckpt)
         }))
     }
@@ -176,7 +176,7 @@ impl LogSegment {
         &self,
         engine: &dyn Engine,
     ) -> KernelResult<Option<Crc>> {
-        let Some(version) = self.checkpoint_version else {
+        let Some(version) = self.checkpoint_version() else {
             return Ok(None);
         };
         // The checkpoint covers the full table, so `into_complete_crc` produces a Complete CRC.
@@ -206,7 +206,7 @@ impl LogSegment {
         engine: &dyn Engine,
     ) -> KernelResult<Option<Crc>> {
         require!(
-            self.checkpoint_version.is_none(),
+            self.checkpoint_version().is_none(),
             KernelError::internal_error(
                 "build_crc_from_version_zero called with a checkpoint present"
             )

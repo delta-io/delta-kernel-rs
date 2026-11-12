@@ -589,7 +589,7 @@ async fn collation_domain_hints_survive_append_alter_checkpoint_and_crc(
     );
     let checkpointed = Snapshot::builder_for(&path).build(engine.as_ref())?;
     assert_eq!(
-        checkpointed.log_segment().checkpoint_version,
+        checkpointed.log_segment().checkpoint_version(),
         Some(altered.version())
     );
     assert!(checkpointed.log_segment().listed.latest_crc_file.is_none());
@@ -809,7 +809,7 @@ async fn checkpoint_repeatedly_preserves_multiple_identifiers_and_sparse_bounds(
         );
         snapshot = Snapshot::builder_for(&path).build(engine.as_ref())?;
         assert_eq!(
-            snapshot.log_segment().checkpoint_version,
+            snapshot.log_segment().checkpoint_version(),
             Some(snapshot.version())
         );
         let actual = read_add_infos(&snapshot, engine.as_ref())?;

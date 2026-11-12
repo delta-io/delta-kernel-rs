@@ -42,7 +42,7 @@ async fn test_checkpoint_and_checksum_return_updated_snapshots(
     // Precondition: no checkpoint, no CRC
     let seg = snapshot.log_segment();
     assert!(seg.listed.checkpoint_parts.is_empty());
-    assert!(seg.checkpoint_version.is_none());
+    assert!(seg.checkpoint_version().is_none());
     assert!(seg.listed.latest_crc_file.is_none());
 
     // ===== WHEN: we checkpoint =====
@@ -51,7 +51,7 @@ async fn test_checkpoint_and_checksum_return_updated_snapshots(
 
     // ===== THEN =====
     // Checkpoint version and parts are set
-    assert_eq!(seg.checkpoint_version, Some(snapshot.version()));
+    assert_eq!(seg.checkpoint_version(), Some(snapshot.version()));
     assert_eq!(seg.listed.checkpoint_parts.len(), 1);
     assert_eq!(seg.listed.checkpoint_parts[0].version, snapshot.version());
 
@@ -74,7 +74,7 @@ async fn test_checkpoint_and_checksum_return_updated_snapshots(
     assert_eq!(crc_file.version, snapshot.version());
 
     // The checkpoint is still present after the CRC write
-    assert_eq!(seg.checkpoint_version, Some(snapshot.version()));
+    assert_eq!(seg.checkpoint_version(), Some(snapshot.version()));
 
     Ok(())
 }
@@ -108,7 +108,7 @@ async fn test_checkpoint_already_exists(#[case] v2_checkpoint: bool) -> delta_ke
     // A fresh snapshot loaded from storage also returns AlreadyExists
     let fresh = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
     assert_eq!(
-        fresh.log_segment().checkpoint_version,
+        fresh.log_segment().checkpoint_version(),
         Some(snapshot.version())
     );
     let (result, _) = fresh.checkpoint(engine.as_ref(), None)?;

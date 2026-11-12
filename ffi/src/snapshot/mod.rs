@@ -1,6 +1,7 @@
 //! FFI interfaces for snapshot construction and retained state.
 
 mod builder;
+pub mod checkpoint_type;
 pub mod hint;
 
 pub use builder::{

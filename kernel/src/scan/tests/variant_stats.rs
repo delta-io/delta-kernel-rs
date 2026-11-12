@@ -51,7 +51,7 @@ async fn scan_metadata_variant_stats_from_commit_json_and_checkpoint_stats_parse
     let (engine, table_root) = setup_variant_stats_table().await;
 
     let snapshot = Snapshot::builder_for(&table_root).build(&engine).unwrap();
-    assert_eq!(snapshot.log_segment().checkpoint_version, Some(1));
+    assert_eq!(snapshot.log_segment().checkpoint_version(), Some(1));
     let scan = snapshot
         .scan_builder()
         .with_stats(StatsOptions::all_struct().with_variant_min_max_stats(true))
