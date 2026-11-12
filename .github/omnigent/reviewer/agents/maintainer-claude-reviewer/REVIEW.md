@@ -215,6 +215,8 @@ When reviewing code changes:
 3. **API surface audit** -- List all new/modified public items. Are they all necessary? Well-named? Documented?
 
 4. **Implementation review** -- Go file by file, function by function. Apply all technical priorities above.
+   When returned or cached state is redirected to a different object, verify that its associated fields
+   remain valid under the new object's contract.
 
 5. **Test review** -- Are the tests sufficient? Do they cover the scenarios listed in CLAUDE.md (checkpoint, CRC, log compaction, time travel, empty table, etc.)?
 
