@@ -1,9 +1,10 @@
 //! Completion reports for checkpoint discovery and inspection.
 //!
 //! These are standalone operation reports, like handler metrics. They describe work that was
-//! requested by the read path; enabling them does not trigger checkpoint I/O. A successful discovery
-//! can find no checkpoint, and a successful inspection can find no sidecar references. These reports
-//! do not carry operation or correlation IDs; consumers need external context for attribution.
+//! requested by the read path; enabling them does not trigger checkpoint I/O. A successful
+//! discovery can find no checkpoint, and a successful inspection can find no sidecar references.
+//! These reports do not carry operation or correlation IDs; consumers need external context for
+//! attribution.
 
 use std::fmt;
 use std::time::Duration;

@@ -19,9 +19,10 @@ span-based events reuse small per-field helpers like `MetricId::from_attrs`, eac
 
 ## Failure events
 
-Success and failure are two variants of one event. Emit the success span, then fire `error` on it
-(`#[instrument(err)]` does this on `Err`; an emit helper calls `tracing::info!(error = ...)`). The
-layer sees `error` and flips the event via `MetricEvent::into_failure`.
+Operations with separate success and failure variants emit the success span, then fire `error`
+on it (`#[instrument(err)]` does this on `Err`; an emit helper calls
+`tracing::info!(error = ...)`). The layer sees `error` and flips the event via
+`MetricEvent::into_failure`.
 
 Snapshot-build failures receive elapsed time when the lifecycle span closes. Log-segment and
 protocol/metadata failures preserve the operation duration passed to their emit helper; timing the
@@ -32,6 +33,10 @@ helper span itself would omit the failed work.
 stop after checkpoint data writes and verification, before hint publication. Recording `duration_ns`
 preserves that boundary when the reporting span closes after the final API result is known. Calls
 that return before data completion use span-close timing.
+
+Checkpoint discovery and inspection use completion reports with an explicit outcome. A
+successful operation may find no checkpoint or sidecars. Their emit helpers supply the duration,
+including failed work, without a success-to-failure conversion.
 
 ## Adding an event
 

@@ -350,8 +350,8 @@ mod tests {
 
     #[rstest::rstest]
     fn history_lookups_report_balanced_frames(#[values(false, true)] fail: bool) {
-        let (engine, snapshot, _tempdir) = load_test_table("table-without-dv-small").unwrap();
         let events = capture(|| {
+            let (engine, snapshot, _tempdir) = load_test_table("table-without-dv-small").unwrap();
             assert_eq!(
                 latest_version_as_of(
                     &snapshot,

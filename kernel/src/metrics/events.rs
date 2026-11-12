@@ -25,9 +25,8 @@ use tracing::span::Attributes;
 use tracing::warn;
 use uuid::Uuid;
 
-use crate::log_segment::LogSegment;
-
 use super::{CheckpointDiscoveryCompleted, CheckpointInspectionCompleted};
+use crate::log_segment::LogSegment;
 
 // ====================================================================
 // MetricId

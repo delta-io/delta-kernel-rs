@@ -682,8 +682,12 @@ impl LogSegmentFiles {
             ..Default::default()
         };
         let result = (|| {
-            let fs_iter = list_delta_log_from_storage(storage, log_root, start, end)?
-                .inspect_ok(|_| report.num_files_examined += 1);
+            let fs_iter =
+                list_delta_log_from_storage(storage, log_root, start, end)?.inspect(|entry| {
+                    if entry.is_ok() {
+                        report.num_files_examined += 1;
+                    }
+                });
             Self::build_log_segment_files(
                 fs_iter,
                 log_tail,
@@ -824,7 +828,11 @@ impl LogSegmentFiles {
                 report.num_list_calls += 1;
                 let window_files: Vec<_> =
                     list_delta_log_from_storage(storage, log_root, lower, upper - 1)?
-                        .inspect_ok(|_| report.num_files_examined += 1)
+                        .inspect(|entry| {
+                            if entry.is_ok() {
+                                report.num_files_examined += 1;
+                            }
+                        })
                         .try_collect()?;
                 let found = find_complete_checkpoint_version(&window_files);
                 windows.push(window_files);
