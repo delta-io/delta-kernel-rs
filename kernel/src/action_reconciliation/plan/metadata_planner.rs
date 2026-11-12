@@ -123,7 +123,7 @@ impl<'a> MetadataPlanner<'a> {
     /// Uses the caller's resolved schemas and options; sources supply `version`.
     /// Checkpoint file actions require a resolved shape. Winning domain deletions are retained.
     pub(crate) fn replay(&self) -> KernelResult<PlanBuilder> {
-        let commits = self.commit_actions(self.segment.checkpoint_version)?;
+        let commits = self.commit_actions(self.segment.checkpoint_version())?;
         let checkpoint = self.checkpoint_actions()?;
         self.replay_actions(commits, checkpoint)
     }
