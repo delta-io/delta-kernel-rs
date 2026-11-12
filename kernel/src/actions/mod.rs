@@ -20,11 +20,11 @@ use crate::amt_path_util::amt_manifest_filemeta;
 use crate::expressions::Scalar;
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::expressions::{ArrayData, StructData};
+use crate::schema::decoding::{SchemaDiagnostic, decode_schema};
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::schema::{ArrayType, DataType, schema};
 use crate::schema::{
-    SchemaRef, StructField, StructType, ToSchema as _, is_unsupported_delta_type_error,
-    lazy_schema_ref, schema_ref,
+    SchemaRef, StructField, StructType, ToSchema as _, lazy_schema_ref, schema_ref,
 };
 use crate::table_features::{
     FeatureType, LEGACY_READER_FEATURES, MIN_VALID_RW_VERSION, TABLE_FEATURES_MIN_READER_VERSION,
@@ -491,7 +491,16 @@ impl Metadata {
     #[internal_api]
     pub(crate) fn parse_schema(&self) -> KernelResult<StructType> {
         // TODO(#1896): Increase the supported nesting depth or use non-recursive schema decoding.
-        serde_json::from_str(&self.schema_string).map_err(|error| {
+        decode_schema(&self.schema_string).map_err(|(error, diagnostic)| {
+            match diagnostic {
+                Some(SchemaDiagnostic::UnsupportedType(_name)) => {
+                    return KernelError::schema(error.to_string()).with_backtrace();
+                }
+                Some(SchemaDiagnostic::DuplicateField(_name)) => {
+                    return error.into();
+                }
+                None => {}
+            }
             // serde_json keeps ErrorCode::RecursionLimitExceeded private, so we use string
             // matching.
             if error.is_syntax()
@@ -504,8 +513,6 @@ impl Metadata {
                      serde_json's recursion limit: {error}"
                 ))
                 .with_backtrace()
-            } else if is_unsupported_delta_type_error(&error) {
-                KernelError::schema(error.to_string()).with_backtrace()
             } else {
                 error.into()
             }
@@ -2230,6 +2237,24 @@ mod tests {
             },
         };
         assert_eq!(schema, expected);
+    }
+
+    #[test]
+    fn persisted_duplicate_fields_preserve_later_field_decode_failure_precedence() {
+        let schema_string = r#"{"type":"struct","fields":[
+            {"name":"id","type":"long","nullable":true,"metadata":{}},
+            {"name":"ID","type":"long","nullable":"invalid","metadata":{}}
+        ]}"#;
+        let metadata = Metadata {
+            schema_string: schema_string.to_owned().into(),
+            ..Default::default()
+        };
+        assert!(matches!(
+            metadata.parse_schema().unwrap_err().without_backtrace(),
+            KernelError::MalformedJson(_)
+        ));
+        let ordinary = serde_json::from_str::<StructType>(schema_string).unwrap_err();
+        assert!(ordinary.to_string().contains("expected a boolean"));
     }
 
     #[rstest]
