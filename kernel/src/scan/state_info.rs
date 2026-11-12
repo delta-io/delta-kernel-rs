@@ -123,7 +123,8 @@ pub(crate) struct StateInfo {
     /// This combines the table's indexed columns with caller-requested columns and gates which
     /// predicate references may use stats. It can be broader than
     /// [`Self::requested_physical_stats_columns`], which preserves the caller's selection for
-    /// `stats_parsed` output.
+    /// `stats_parsed` output. Empty when neither a physical predicate nor struct statistics
+    /// require it.
     pub(crate) eligible_physical_stats_columns: HashSet<ColumnName>,
     /// Caller-requested physical stats columns used for data skipping and `stats_parsed` output.
     /// `Columns` resolves names strictly; `All` resolves them best-effort.
@@ -557,10 +558,16 @@ impl StateInfo {
         let requested_physical_stats_columns_ref = (!requested_physical_stats_columns.is_empty())
             .then_some(requested_physical_stats_columns.as_slice());
 
-        // Stats-eligible column set. Partition columns are excluded; they flow through
-        // `partitionValues_parsed` instead.
+        // Build stats eligibility only for predicates or requested struct statistics. Partition
+        // columns are excluded; they flow through `partitionValues_parsed` instead.
         let eligible_physical_stats_columns =
-            table_configuration.physical_stats_columns_set(requested_physical_stats_columns_ref);
+            if matches!(physical_predicate, PhysicalPredicate::Some(_, _))
+                || !matches!(stats.struct_stats, StructStats::None)
+            {
+                table_configuration.physical_stats_columns_set(requested_physical_stats_columns_ref)
+            } else {
+                HashSet::new()
+            };
         // Observability: predicate refs outside `eligible_physical_stats_columns` fold to NULL
         // by the gate. Surface the dropped set so an engine operator can see what got folded.
         // The filter walk is bounded by predicate width but still does a physical-name
@@ -711,7 +718,7 @@ pub(crate) mod tests {
     use super::*;
     use crate::KernelResult;
     use crate::actions::{MAX_VALUES, MIN_VALUES};
-    use crate::expressions::{Predicate as Pred, column_name, expr};
+    use crate::expressions::{Predicate as Pred, col, column_name, expr, lit};
     #[cfg(feature = "geo-type-in-dev")]
     use crate::scan::build_stats_output_schemas;
     use crate::scan::field_classifiers::CdfTransformFieldClassifier;
@@ -1914,6 +1921,8 @@ pub(crate) mod tests {
 
     // === eligible_physical_stats_columns trims the predicate-derived stats schema ===
 
+    // Eligibility-set assertions supply a predicate to request construction of the set.
+
     /// Flat schema with `n` long columns named `c0..c{n-1}`.
     fn flat_long_schema(n: usize) -> SchemaRef {
         Arc::new(StructType::new_unchecked(
@@ -1986,7 +1995,7 @@ pub(crate) mod tests {
         let state_info = get_state_info(
             schema,
             vec![],
-            None, // no predicate; just check the cached set
+            Some(Arc::new(col!("c0").gt(lit(1i64)))),
             &[],
             num_indexed_cols_config(2),
             vec![],
@@ -1994,6 +2003,17 @@ pub(crate) mod tests {
         .unwrap();
         let cols = HashSet::from_iter([column_name!("c0"), column_name!("c1")]);
         assert_eq!(state_info.eligible_physical_stats_columns, cols);
+
+        let no_predicate = get_state_info(
+            flat_long_schema(5),
+            vec![],
+            None,
+            &[],
+            num_indexed_cols_config(2),
+            vec![],
+        )
+        .unwrap();
+        assert!(no_predicate.eligible_physical_stats_columns.is_empty());
     }
 
     /// Predicate on a past-cap column: stats schema goes to `None` (no skipping), but
@@ -2093,7 +2113,7 @@ pub(crate) mod tests {
         let state_info = get_state_info(
             schema,
             vec![],
-            None,
+            Some(Arc::new(col!("c0").gt(lit(1i64)))),
             &[],
             stats_columns_config(listed),
             vec![],
@@ -2174,7 +2194,7 @@ pub(crate) mod tests {
         let state_info = get_state_info(
             schema,
             vec![],
-            None,
+            Some(Arc::new(col!("a").gt(lit(1i64)))),
             &[],
             stats_columns_config(&["s"]),
             vec![],
@@ -2198,7 +2218,7 @@ pub(crate) mod tests {
         let state_info = get_state_info(
             schema,
             vec![],
-            None,
+            Some(Arc::new(col!("c0").gt(lit(1i64)))),
             &[],
             both_configs(listed, num_indexed),
             vec![],
