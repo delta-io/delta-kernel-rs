@@ -181,11 +181,11 @@ pub enum UnaryExpressionOp {
     /// STRING, a NULL input yields NULL, and other input types are an error.
     ///
     /// ```text
-    /// URI_ENCODE_PATH('data/a b.parquet')         -- 'data/a%20b.parquet'
-    /// URI_ENCODE_PATH('s3://bucket/a#1.parquet')  -- 's3://bucket/a%231.parquet'
-    /// URI_ENCODE_PATH('data/a%20b.parquet')       -- 'data/a%2520b.parquet'
+    /// URI_ENCODE_FILE_LOCATION('data/a b.parquet')         -- 'data/a%20b.parquet'
+    /// URI_ENCODE_FILE_LOCATION('s3://bucket/a#1.parquet')  -- 's3://bucket/a%231.parquet'
+    /// URI_ENCODE_FILE_LOCATION('data/a%20b.parquet')       -- 'data/a%2520b.parquet'
     /// ```
-    UriEncodePath,
+    UriEncodeFileLocation,
 }
 
 impl UnaryExpressionOp {
@@ -1291,7 +1291,7 @@ impl Display for UnaryExpressionOp {
         use UnaryExpressionOp::*;
         match self {
             ToJson { .. } => write!(f, "TO_JSON"),
-            UriEncodePath => write!(f, "URI_ENCODE_PATH"),
+            UriEncodeFileLocation => write!(f, "URI_ENCODE_FILE_LOCATION"),
         }
     }
 }
@@ -1566,8 +1566,8 @@ mod tests {
                 "TO_JSON(Column(x), full_precision_timestamps)",
             ),
             (
-                Expr::unary(UnaryExpressionOp::UriEncodePath, col!("x")),
-                "URI_ENCODE_PATH(Column(x))",
+                Expr::unary(UnaryExpressionOp::UriEncodeFileLocation, col!("x")),
+                "URI_ENCODE_FILE_LOCATION(Column(x))",
             ),
             (
                 Expr::case_when([(col!("x").is_null(), lit(0))], col!("x")),
@@ -1783,7 +1783,7 @@ mod tests {
             #[values(
                 UnaryExpressionOp::TO_JSON,
                 UnaryExpressionOp::ToJson { full_precision_timestamps: true },
-                UnaryExpressionOp::UriEncodePath
+                UnaryExpressionOp::UriEncodeFileLocation
             )]
             op: UnaryExpressionOp,
         ) {
