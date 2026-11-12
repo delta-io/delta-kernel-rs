@@ -471,6 +471,9 @@ pub enum LastCheckpointReadOutcome {
     /// The hint was parsed and retained.
     Success,
     /// Storage reported that the hint file was absent.
+    ///
+    /// When the file iterator reports the missing hint, Kernel lists the log to find checkpoints
+    /// and commits. If the storage call itself returns the error, it propagates instead.
     NotFound,
     /// The hint was empty, malformed, or discarded by hint validation.
     Invalid,

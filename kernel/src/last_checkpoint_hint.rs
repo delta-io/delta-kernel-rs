@@ -432,12 +432,15 @@ impl LastCheckpointHint {
         Ok(log_root.join(LAST_CHECKPOINT_FILE_NAME)?)
     }
 
-    /// Try reading the `_last_checkpoint` file.
+    /// Reads and validates the `_last_checkpoint` hint.
     ///
-    /// Note that we typically want to ignore a missing/invalid `_last_checkpoint` file without
-    /// failing the read. Thus, the semantics of this function are to return `None` if the file is
-    /// not found or is invalid JSON. Unexpected/unrecoverable errors are returned as `Err` case and
-    /// are assumed to cause failure.
+    /// Returns `Ok(None)` for an empty or invalid hint, or a file-not-found error from the read
+    /// iterator. A file-not-found error returned directly by [`StorageHandler::read_files`]
+    /// propagates instead. Both forms of absence report [`LastCheckpointReadOutcome::NotFound`].
+    /// Other errors, including cancellation, propagate.
+    ///
+    /// Emits one [`LastCheckpointReadCompleted`](crate::metrics::LastCheckpointReadCompleted)
+    /// event per call when metrics reporting is enabled.
     // TODO(#1047): weird that we propagate FileNotFound as part of the iterator instead of top-
     // level result coming from storage.read_files
     #[instrument(

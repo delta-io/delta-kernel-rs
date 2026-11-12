@@ -204,9 +204,10 @@ storage call may serve multiple higher-level operations.
 
 Use [LastCheckpointReadCompleted](https://docs.rs/delta_kernel/latest/delta_kernel/metrics/struct.LastCheckpointReadCompleted.html)
 to count `_last_checkpoint` read attempts and record their duration by outcome. A missing or invalid
-hint normally leads to log listing, so these outcomes do not imply a failed snapshot build. Keep
-hint availability separate from your snapshot error rate. The event has no `operation_id`; see its
-rustdoc for outcome and timing semantics.
+hint normally leads to log listing. A file-not-found error returned directly by storage propagates
+instead of falling back, but still reports `NotFound`. Use snapshot events to measure snapshot
+failures separately from hint availability. The event has no `operation_id`; see its rustdoc for
+outcome and timing semantics.
 
 ### Checksum write events
 
