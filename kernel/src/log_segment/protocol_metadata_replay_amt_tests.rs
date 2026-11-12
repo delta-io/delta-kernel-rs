@@ -950,6 +950,76 @@ async fn assert_incremental_update_action<E: Engine>(
     );
 }
 
+// An incremental update replays only the new commits, so a new manifest commit whose checkpoint
+// action lags behind the base snapshot must not roll back the base's newer Metadata.
+#[tokio::test]
+async fn incremental_update_ignores_checkpoint_action_older_than_base() {
+    assert_incremental_update_keeps_base_metadata(non_plan_engine).await;
+    #[cfg(feature = "declarative-plans")]
+    assert_incremental_update_keeps_base_metadata(|store| SyncEngine::new_with_store(store)).await;
+}
+
+async fn assert_incremental_update_keeps_base_metadata<E: Engine>(
+    make_engine: impl FnOnce(Arc<InMemory>) -> E,
+) {
+    let (store, table_root) = commit_table(&standalone_pm_then_metadata_change()).await;
+    let engine = make_engine(store.clone());
+    let base = Snapshot::builder_for(table_root.clone())
+        .build(&engine)
+        .unwrap();
+    assert_eq!(base.schema().num_fields(), 2);
+
+    // The first manifest commit, whose action checkpoints v0.
+    let lagging_manifest_commit =
+        carrying_pointer((2, 0), checkpoint_action(0, &[], one_column_schema()));
+    add_commit(
+        table_root.as_str(),
+        store.as_ref(),
+        2,
+        lagging_manifest_commit,
+    )
+    .await
+    .unwrap();
+
+    let updated = Snapshot::builder_from(base).build(&engine).unwrap();
+    let fresh = Snapshot::builder_for(table_root).build(&engine).unwrap();
+    for snapshot in [updated, fresh] {
+        assert_eq!(snapshot.version(), 2);
+        assert_eq!(snapshot.schema().num_fields(), 2);
+    }
+}
+
+// A caller holding P&M as of v1 must not get back the older P&M of a CRC at v0.
+#[tokio::test]
+async fn read_protocol_metadata_newer_than_ignores_crc_older_than_existing_version() {
+    assert_older_crc_ignored(non_plan_engine).await;
+    #[cfg(feature = "declarative-plans")]
+    assert_older_crc_ignored(|store| SyncEngine::new_with_store(store)).await;
+}
+
+async fn assert_older_crc_ignored<E: Engine>(make_engine: impl FnOnce(Arc<InMemory>) -> E) {
+    let [v0, v1] = standalone_pm_then_metadata_change();
+    let (store, table_root) = commit_table(&[v0, v1, commit_info(None)]).await;
+    let engine = make_engine(store);
+    let crc = Arc::new(one_column_crc(0, None));
+
+    let resolution = latest_log_segment(&table_root, &engine)
+        .segment_after_version(1)
+        .read_protocol_metadata_newer_than(&engine, Some(&crc), 1)
+        .unwrap();
+    assert!(resolution.protocol.is_none());
+    assert!(resolution.metadata.is_none());
+}
+
+// v0 holds standalone P&M with one column, and v1 changes Metadata to two columns. Neither is a
+// manifest commit.
+fn standalone_pm_then_metadata_change() -> [String; 2] {
+    [
+        protocol_and_metadata_lines(one_column_schema(), &[]),
+        metadata_commit(test_schema_flat_with_column_mapping()),
+    ]
+}
+
 // A CRC at the target version carrying `lastManifestCommit` makes `latest_checkpoint_action` read
 // only the commit it points at, failing when that commit does not carry the expected action. Each
 // case has checkpoint commits at v0 and v2, the given v1, and a CRC at v2 holding the pointer. A
@@ -1396,17 +1466,7 @@ async fn put_pm_checkpoint(store: &Arc<InMemory>, version: u64) {
 
 // Writes a CRC at `version` carrying `pointer` as its `lastManifestCommit`.
 async fn put_crc_with_pointer(store: &InMemory, version: u64, pointer: LastManifestCommit) {
-    let config = adaptive_metadata_table_configuration(one_column_schema(), &[]);
-    let crc = Crc {
-        version,
-        protocol: config.protocol().clone(),
-        metadata: config.metadata().clone(),
-        file_stats_state: FileStatsState::Complete(FileStats::try_new(0, 0, None).unwrap()),
-        // AMT config enables ICT, so the CRC must carry an inCommitTimestampOpt.
-        in_commit_timestamp_opt: Some(1000),
-        last_manifest_commit_opt: Some(pointer),
-        ..Default::default()
-    };
+    let crc = one_column_crc(version, Some(pointer));
     store
         .put(
             &delta_path_for_version(version, "crc"),
@@ -1414,4 +1474,20 @@ async fn put_crc_with_pointer(store: &InMemory, version: u64, pointer: LastManif
         )
         .await
         .unwrap();
+}
+
+// A CRC at `version` for a one-column adaptiveMetadata table, carrying `pointer` as its
+// `lastManifestCommit`.
+fn one_column_crc(version: u64, pointer: Option<LastManifestCommit>) -> Crc {
+    let config = adaptive_metadata_table_configuration(one_column_schema(), &[]);
+    Crc {
+        version,
+        protocol: config.protocol().clone(),
+        metadata: config.metadata().clone(),
+        file_stats_state: FileStatsState::Complete(FileStats::try_new(0, 0, None).unwrap()),
+        // AMT config enables ICT, so the CRC must carry an inCommitTimestampOpt.
+        in_commit_timestamp_opt: Some(1000),
+        last_manifest_commit_opt: pointer,
+        ..Default::default()
+    }
 }
