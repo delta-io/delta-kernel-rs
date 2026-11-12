@@ -1814,20 +1814,23 @@ impl Snapshot {
     /// like checkpointing.
     ///
     /// The returned snapshot uses published paths for commits known to be published, even when
-    /// no new commits need copying. The returned snapshot keeps the staged files' sizes and
-    /// modification times.
+    /// no new commits need copying. Each replaced reference carries the published file's size and
+    /// modification time, read from storage with one
+    /// [`StorageHandler::head`](crate::StorageHandler::head) call per replaced commit.
     ///
     /// The input snapshot keeps its original paths. Use the returned snapshot for reads after
     /// staged commit files are removed.
     ///
     /// # Parameters
     ///
-    /// - `engine`: The engine to use for publishing commits
+    /// - `engine`: The engine to use for publishing commits and reading published file metadata
     ///
     /// # Errors
     ///
-    /// Returns an error if the publish operation fails, or if there are catalog commits that need
-    /// publishing but the table or committer don't support publishing.
+    /// Returns an error if the publish operation fails, if reading a published file's metadata
+    /// fails, or if there are catalog commits that need publishing but the table or committer
+    /// don't support publishing. After an error, the input snapshot is unchanged and publishing can
+    /// be retried from it.
     ///
     /// # See Also
     ///
@@ -1877,7 +1880,20 @@ impl Snapshot {
             Some(self.version())
         };
 
-        let Some(log_segment) = self.log_segment().new_as_published(max_published_version)? else {
+        // Each published file is a separate object from its staged commit, with its own
+        // modification time, so read its metadata back for the returned references.
+        let log_segment = self.log_segment();
+        let published_files = log_segment
+            .staged_commit_versions_through(max_published_version)
+            .into_iter()
+            .map(|version| {
+                let location = log_segment.published_commit_location(version)?;
+                Ok((version, engine.storage_handler().head(&location)?))
+            })
+            .collect::<KernelResult<HashMap<_, _>>>()?;
+        let Some(log_segment) =
+            log_segment.new_as_published(max_published_version, &published_files)?
+        else {
             return Ok(Arc::clone(self));
         };
 
@@ -1915,6 +1931,7 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::Arc;
 
+    use bytes::Bytes;
     use rstest::rstest;
     use serde_json::json;
     use test_utils::table_builder::{
@@ -1949,7 +1966,7 @@ mod tests {
         create_log_path, string_array_to_engine_data,
     };
     use crate::utils::FoldWithOption as _;
-    use crate::{FilteredEngineData, Result};
+    use crate::{FileMeta, FilteredEngineData, Result};
 
     /// Records versions passed to `publish` and can fail the first call.
     #[derive(Default)]
@@ -2051,6 +2068,43 @@ mod tests {
         Arc::new(Snapshot::new_with_crc(segment, configuration, crc, true, true).unwrap())
     }
 
+    /// Returns an engine whose storage holds published commit files 1 and 2 for
+    /// [`snapshot_with_staged_commits`]. Their sizes and modification times differ from the staged
+    /// commit references.
+    fn engine_with_published_commits() -> SyncEngine {
+        let engine = SyncEngine::new_with_store(Arc::new(InMemory::new()));
+        for version in [1, 2] {
+            let location = Url::parse(&format!(
+                "memory:///publication/_delta_log/{version:020}.json"
+            ))
+            .unwrap();
+            let data = Bytes::from(vec![b' '; 10 + version as usize]);
+            engine
+                .storage_handler()
+                .put(&location, data, false)
+                .unwrap();
+        }
+        engine
+    }
+
+    /// Asserts that every published commit reference in `snapshot` carries its file's storage
+    /// metadata.
+    fn assert_published_references_match_storage(snapshot: &Snapshot, engine: &dyn Engine) {
+        let listed = &snapshot.log_segment().listed;
+        for file in listed
+            .ascending_commit_files
+            .iter()
+            .chain(listed.latest_commit_file.iter())
+            .filter(|file| file.file_type == LogPathFileType::Commit)
+        {
+            let stored = engine
+                .storage_handler()
+                .head(&file.location.location)
+                .unwrap();
+            assert_eq!(file.location, stored, "commit {}", file.version);
+        }
+    }
+
     #[rstest]
     #[case::both_commits_need_publishing(None, vec![vec![1, 2]])]
     #[case::commit_2_needs_publishing(Some(1), vec![vec![2]])]
@@ -2065,12 +2119,15 @@ mod tests {
         let source = snapshot_with_staged_commits(max_published_version, crc_version, observed_crc);
         let original_segment = source.log_segment().clone();
         let committer = RecordingPublishCommitter::default();
+        let engine = engine_with_published_commits();
 
         // WHEN: publish the remaining commits and return a snapshot with published paths.
-        let published = source.publish(&PanicEngine, &committer).unwrap();
+        let published = source.publish(&engine, &committer).unwrap();
 
         // THEN: request publication only for unpublished commits; keep version, metadata, and CRC.
+        // Published references carry the published files' metadata, not the staged files'.
         assert_eq!(*committer.calls.borrow(), expected_calls);
+        assert_published_references_match_storage(&published, &engine);
         assert_eq!(published.version(), source.version());
         assert_eq!(
             published.table_configuration(),
@@ -2120,7 +2177,8 @@ mod tests {
         assert_eq!(published.crc_at_version().is_some(), crc_version == Some(2));
         assert_eq!(source.log_segment(), &original_segment);
 
-        // Publishing the returned snapshot again must neither copy files nor create a new snapshot.
+        // Publishing the returned snapshot again must not copy files, read storage, or create a
+        // new snapshot.
         let repeated = published.publish(&PanicEngine, &committer).unwrap();
         assert!(Arc::ptr_eq(&published, &repeated));
         assert_eq!(*committer.calls.borrow(), expected_calls);
@@ -2153,11 +2211,16 @@ mod tests {
             .unwrap(),
         );
         let original_segment = source.log_segment().clone();
+        // Only a replaced reference reads storage.
+        let published_engine = engine_with_published_commits();
+        let engine: &dyn Engine = if published_through == Some(2) {
+            &published_engine
+        } else {
+            &PanicEngine
+        };
 
         // WHEN: publish with nothing left in ascending_commit_files to copy.
-        let result = source
-            .publish(&PanicEngine, &FileSystemCommitter::new())
-            .unwrap();
+        let result = source.publish(engine, &FileSystemCommitter::new()).unwrap();
 
         // THEN: replace latest_commit_file only if version 2 is known to be published.
         assert!(
@@ -2179,6 +2242,7 @@ mod tests {
             .unwrap();
         if published_through == Some(2) {
             assert_eq!(latest.file_type, LogPathFileType::Commit);
+            assert_published_references_match_storage(&result, engine);
             result.log_segment().validate_published().unwrap();
         } else {
             assert_eq!(latest.file_type, LogPathFileType::StagedCommit);
@@ -2197,19 +2261,21 @@ mod tests {
             fail_once: Cell::new(true),
             ..Default::default()
         };
+        let engine = engine_with_published_commits();
 
         // WHEN: publication fails.
-        let result = source.publish(&PanicEngine, &committer);
+        let result = source.publish(&engine, &committer);
 
         // THEN: report the failure and leave the input snapshot unchanged.
         assert_result_error_with_message(result, "injected publication failure");
         assert_eq!(source.log_segment(), &original_segment);
 
         // WHEN: retry publication from the same input snapshot.
-        let result = source.publish(&PanicEngine, &committer).unwrap();
+        let result = source.publish(&engine, &committer).unwrap();
 
         // THEN: retry commit 2 and return published paths for both commits.
         assert_eq!(*committer.calls.borrow(), vec![vec![2], vec![2]]);
+        assert_published_references_match_storage(&result, &engine);
         assert_eq!(result.log_segment().listed.max_published_version, Some(2));
         assert!(
             result
@@ -2219,6 +2285,23 @@ mod tests {
                 .iter()
                 .all(|file| file.file_type == LogPathFileType::Commit)
         );
+        assert_eq!(source.log_segment(), &original_segment);
+    }
+
+    #[test]
+    fn test_publish_fails_when_published_file_metadata_is_unavailable() {
+        // GIVEN: commit 2 needs publishing, but storage has no published file for it.
+        let source = snapshot_with_staged_commits(Some(1), None, false);
+        let original_segment = source.log_segment().clone();
+        let committer = RecordingPublishCommitter::default();
+        let engine = SyncEngine::new_with_store(Arc::new(InMemory::new()));
+
+        // WHEN: the committer reports success, but reading the published file's metadata fails.
+        let result = source.publish(&engine, &committer);
+
+        // THEN: report the failure instead of returning references without storage metadata.
+        assert!(matches!(result, Err(KernelError::FileNotFound(_))));
+        assert_eq!(*committer.calls.borrow(), vec![vec![2]]);
         assert_eq!(source.log_segment(), &original_segment);
     }
 
@@ -2293,9 +2376,16 @@ mod tests {
             .with_table_root("memory:///publication/")
             .with_version(2)
             .build();
+        let published_files = HashMap::from([1, 2].map(|version| {
+            let location = snapshot
+                .log_segment
+                .published_commit_location(version)
+                .unwrap();
+            (version, FileMeta::new(location, 0, 0))
+        }));
         snapshot.log_segment = snapshot
             .log_segment
-            .new_as_published(Some(2))
+            .new_as_published(Some(2), &published_files)
             .unwrap()
             .unwrap();
 

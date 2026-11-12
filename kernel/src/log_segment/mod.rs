@@ -1,5 +1,6 @@
 //! Represents a segment of a delta log. [`LogSegment`] wraps a set of checkpoint and commit
 //! files.
+use std::collections::HashMap;
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use std::fmt::Display;
 use std::num::NonZero;
@@ -870,8 +871,10 @@ impl LogSegment {
     /// Replaces retained staged commit references through `max_published_version` with published
     /// paths.
     ///
-    /// The caller establishes which commits have been published; this method performs no storage
-    /// reads. Replaced commit references retain the staged file's size and modification time.
+    /// The caller establishes which commits have been published and supplies the storage metadata
+    /// of each published file in `published_files`, keyed by version; this method performs no
+    /// storage reads. `published_files` must contain every version returned by
+    /// [`Self::staged_commit_versions_through`] for the same `max_published_version`.
     /// `max_published_version` cannot exceed `self.end_version` or be less than
     /// `self.listed.max_published_version`.
     ///
@@ -884,6 +887,7 @@ impl LogSegment {
     pub(crate) fn new_as_published(
         &self,
         max_published_version: Option<Version>,
+        published_files: &HashMap<Version, FileMeta>,
     ) -> KernelResult<Option<Self>> {
         require!(
             max_published_version <= Some(self.end_version),
@@ -900,30 +904,27 @@ impl LogSegment {
             ))
         );
 
-        let needs_published_path = |file: &ParsedLogPath| {
-            file.file_type == StagedCommit
-                && max_published_version.is_some_and(|version| file.version <= version)
-        };
         if max_published_version == self.listed.max_published_version
             && !self
-                .listed
-                .ascending_commit_files
-                .iter()
-                .chain(self.listed.latest_commit_file.iter())
-                .any(needs_published_path)
+                .retained_commit_files()
+                .any(|file| is_staged_through(file, max_published_version))
         {
             return Ok(None);
         }
 
         let replace_staged = |file: &mut ParsedLogPath| -> KernelResult<()> {
-            if needs_published_path(file) {
-                let location = self
-                    .log_root
-                    .join(&published_commit_file_name(file.version))?;
+            if is_staged_through(file, max_published_version) {
+                let location = self.published_commit_location(file.version)?;
+                let published = published_files.get(&file.version).ok_or_else(|| {
+                    KernelError::internal_error(format!(
+                        "missing storage metadata for published commit {}",
+                        file.version
+                    ))
+                })?;
                 let metadata = FileMeta {
                     location: location.clone(),
-                    last_modified: file.location.last_modified,
-                    size: file.location.size,
+                    last_modified: published.last_modified,
+                    size: published.size,
                 };
                 *file = ParsedLogPath::new(metadata)
                     .ok_or_else(|| KernelError::invalid_log_path(location))?;
@@ -942,6 +943,33 @@ impl LogSegment {
             replace_staged(file)?;
         }
         Ok(Some(new_log_segment))
+    }
+
+    /// Returns the versions of retained staged commit references at or below
+    /// `max_published_version`, in ascending order. These are the references that
+    /// [`Self::new_as_published`] replaces.
+    pub(crate) fn staged_commit_versions_through(
+        &self,
+        max_published_version: Option<Version>,
+    ) -> Vec<Version> {
+        // `latest_commit_file` has the highest version, so duplicates are adjacent.
+        self.retained_commit_files()
+            .filter(|file| is_staged_through(file, max_published_version))
+            .map(|file| file.version)
+            .dedup()
+            .collect()
+    }
+
+    /// Returns the location of the published commit file for `version`.
+    pub(crate) fn published_commit_location(&self, version: Version) -> KernelResult<Url> {
+        Ok(self.log_root.join(&published_commit_file_name(version))?)
+    }
+
+    fn retained_commit_files(&self) -> impl Iterator<Item = &ParsedLogPath> {
+        self.listed
+            .ascending_commit_files
+            .iter()
+            .chain(self.listed.latest_commit_file.iter())
     }
 
     pub(crate) fn get_unpublished_catalog_commits(&self) -> KernelResult<Vec<CatalogCommit>> {
@@ -2240,4 +2268,9 @@ fn validate_crc(
         ))
     );
     Ok(())
+}
+
+fn is_staged_through(file: &ParsedLogPath, max_published_version: Option<Version>) -> bool {
+    file.file_type == StagedCommit
+        && max_published_version.is_some_and(|version| file.version <= version)
 }

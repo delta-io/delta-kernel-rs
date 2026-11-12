@@ -5363,6 +5363,25 @@ async fn test_try_new_with_crc_file_sets_crc_and_preserves_other_fields() {
 // Commit publication tests
 // ============================================================================
 
+/// Storage metadata for the published files that replace `segment`'s staged commit references
+/// through `max_published_version`, distinct from any staged file's metadata.
+fn published_files_for(
+    segment: &LogSegment,
+    max_published_version: Option<Version>,
+) -> HashMap<Version, FileMeta> {
+    segment
+        .staged_commit_versions_through(max_published_version)
+        .into_iter()
+        .map(|version| {
+            let location = segment.published_commit_location(version).unwrap();
+            (
+                version,
+                FileMeta::new(location, 2000 + version as i64, 900 + version),
+            )
+        })
+        .collect()
+}
+
 /// With published commits 0 and 1 and staged commits 1 and 2, publishing through 2 replaces both
 /// staged paths. Commit 1's path must change even though commit 1 was already published.
 /// Commits newer than `published_through` must keep their staged paths.
@@ -5397,11 +5416,15 @@ async fn test_new_as_published_replaces_staged_commit_paths(
         latest.location.last_modified = 1011;
     }
     let source = original.clone();
+    let published_files = published_files_for(&original, published_through);
 
     // WHEN: replace staged paths through published_through.
-    let updated = original.new_as_published(published_through).unwrap();
+    let updated = original
+        .new_as_published(published_through, &published_files)
+        .unwrap();
 
-    // THEN: replace staged paths only through published_through and preserve file metadata.
+    // THEN: replace staged paths only through published_through, with the published files'
+    // metadata.
     assert_eq!(updated.is_some(), expect_updated);
     let published = updated.as_ref().unwrap_or(&original);
 
@@ -5418,8 +5441,9 @@ async fn test_new_as_published_replaces_staged_commit_paths(
             assert_eq!(after.extension, "json");
             assert_eq!(after.file_type, Commit);
             assert_eq!(after.version, before.version);
-            assert_eq!(after.location.size, before.location.size);
-            assert_eq!(after.location.last_modified, before.location.last_modified);
+            let published = &published_files[&before.version];
+            assert_eq!(after.location.size, published.size);
+            assert_eq!(after.location.last_modified, published.last_modified);
         } else {
             assert_eq!(after, before);
         }
@@ -5446,10 +5470,29 @@ async fn test_new_as_published_replaces_staged_commit_paths(
     assert_eq!(original, source);
     assert!(
         published
-            .new_as_published(published_through)
+            .new_as_published(published_through, &HashMap::new())
             .unwrap()
             .is_none()
     );
+}
+
+#[tokio::test]
+async fn test_new_as_published_requires_metadata_for_each_replaced_commit() {
+    // GIVEN: staged commits 1 and 2, with published file metadata only for commit 1.
+    let original = create_segment_for(LogSegmentConfig {
+        published_commit_versions: &[0],
+        staged_commit_versions: &[1, 2],
+        ..Default::default()
+    })
+    .await;
+    let mut published_files = published_files_for(&original, Some(2));
+    assert!(published_files.remove(&2).is_some());
+
+    // WHEN: replace staged paths through version 2.
+    let result = original.new_as_published(Some(2), &published_files);
+
+    // THEN: reject the replacement instead of keeping the staged file's metadata.
+    assert_result_error_with_message(result, "missing storage metadata for published commit 2");
 }
 
 /// A checkpoint at version 2 supplies all log actions, so `ascending_commit_files` is empty.
@@ -5485,7 +5528,10 @@ async fn test_new_as_published_with_checkpoint_at_snapshot_version(
     }
 
     // WHEN: update the published commit paths without adding commits to ascending_commit_files.
-    let updated = original.new_as_published(published_through).unwrap();
+    let published_files = published_files_for(&original, published_through);
+    let updated = original
+        .new_as_published(published_through, &published_files)
+        .unwrap();
 
     // THEN: update latest_commit_file only if its version has been published; keep the checkpoint.
     assert_eq!(updated.is_some(), expected_updated);
@@ -5537,7 +5583,7 @@ async fn test_new_as_published_rejects_invalid_published_version(
     .await;
 
     // WHEN: publication would exceed version 2 or forget that version 1 is already published.
-    let result = original.new_as_published(published_through);
+    let result = original.new_as_published(published_through, &HashMap::new());
 
     // THEN: reject the invalid published version.
     assert!(matches!(result, Err(KernelError::InvalidLogSegment(_))));
@@ -5570,7 +5616,10 @@ async fn test_new_as_published_preserves_checkpoints_and_log_compactions() {
     assert!(!original.listed.checkpoint_parts.is_empty());
 
     // WHEN: replace staged paths through version 3.
-    let published = original.new_as_published(Some(3)).unwrap().unwrap();
+    let published = original
+        .new_as_published(Some(3), &published_files_for(&original, Some(3)))
+        .unwrap()
+        .unwrap();
 
     // THEN: the checkpoint and log compaction files are unchanged.
     assert_eq!(

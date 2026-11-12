@@ -476,6 +476,19 @@ async fn test_published_snapshot_reads_after_staged_files_are_deleted(
         std::fs::remove_dir_all(&staged_dir)?;
     }
 
+    // THEN: each published reference carries its file's storage metadata, not the metadata the
+    // catalog recorded for the staged file.
+    let listed = &published.log_segment().listed;
+    for file in listed
+        .ascending_commit_files
+        .iter()
+        .chain(listed.latest_commit_file.iter())
+    {
+        assert_eq!(file.file_type, LogPathFileType::Commit);
+        let stored = engine.storage_handler().head(&file.location.location)?;
+        assert_eq!(file.location, stored, "commit {}", file.version);
+    }
+
     let latest = published
         .log_segment()
         .listed

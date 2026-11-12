@@ -3,19 +3,21 @@ use std::error::Error as _;
 use std::ptr::NonNull;
 use std::sync::Arc;
 
-use delta_kernel::FileMeta;
+use bytes::Bytes;
 use delta_kernel::actions::Metadata;
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use delta_kernel::actions::{Add, LastManifestCommit};
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use delta_kernel::crc::Crc;
-use delta_kernel::engine::PanicEngine;
+use delta_kernel::engine::{DelegatingEngine, PanicEngine};
 use delta_kernel::last_checkpoint_hint::{LastCheckpointHint, LastCheckpointV2};
 use delta_kernel::log_segment::LogSegment;
 use delta_kernel::path::{LogPathFileType, ParsedLogPath};
 use delta_kernel::snapshot::{IncrementalReplay, PublicationWatermark, Snapshot};
+use delta_kernel::{FileMeta, FileSlice, KernelResult, KernelResultIterator, StorageHandler};
 use test_utils::table_builder::{LogState, TestTableBuilder};
 use test_utils::{TestCatalogCommitter, compacted_log_path_for_versions, create_log_path};
+use url::Url;
 
 use super::*;
 use crate::delta_types::*;
@@ -35,6 +37,36 @@ use crate::{
 
 fn slice(value: &'static str) -> KernelStringSlice {
     unsafe { KernelStringSlice::new_unsafe(value) }
+}
+
+/// Answers HEAD for one file with fixed metadata and panics on every other storage call.
+struct HeadOnlyStorage(FileMeta);
+
+impl StorageHandler for HeadOnlyStorage {
+    fn list_from(&self, _: &Url) -> KernelResult<Box<dyn KernelResultIterator<FileMeta>>> {
+        panic!("unexpected list_from")
+    }
+
+    fn read_files(&self, _: Vec<FileSlice>) -> KernelResult<Box<dyn KernelResultIterator<Bytes>>> {
+        panic!("unexpected read_files")
+    }
+
+    fn copy_atomic(&self, _: &Url, _: &Url) -> KernelResult<()> {
+        panic!("unexpected copy_atomic")
+    }
+
+    fn put(&self, _: &Url, _: Bytes, _: bool) -> KernelResult<()> {
+        panic!("unexpected put")
+    }
+
+    fn head(&self, path: &Url) -> KernelResult<FileMeta> {
+        assert_eq!(path, &self.0.location);
+        Ok(self.0.clone())
+    }
+
+    fn delete(&self, _: &Url) -> KernelResult<()> {
+        panic!("unexpected delete")
+    }
 }
 
 fn invalid_utf8() -> KernelStringSlice {
@@ -973,10 +1005,17 @@ fn visited_hint_preserves_commit_paths_and_watermark_for_explicit_version(
         Some(source_watermark)
     );
     let source_segment = source_ref.log_segment().clone();
-    let kernel_engine = unsafe { engine.as_ref() }.engine();
+    // The published commit is a separate object, with metadata that differs from the staged one.
+    let published_commit = FileMeta::new(
+        Url::parse("memory:///hinted-table/_delta_log/00000000000000000001.json").unwrap(),
+        23,
+        19,
+    );
+    let publish_engine = DelegatingEngine::new(Arc::new(PanicEngine))
+        .with_storage_handler(Arc::new(HeadOnlyStorage(published_commit)));
     let published = if publish {
         source_ref
-            .publish(kernel_engine.as_ref(), &TestCatalogCommitter)
+            .publish(&publish_engine, &TestCatalogCommitter)
             .unwrap()
     } else {
         source_ref.clone()
@@ -1001,7 +1040,7 @@ fn visited_hint_preserves_commit_paths_and_watermark_for_explicit_version(
                     .as_str()
             },
         ],
-        [(1, 1), (13, 17)],
+        [(1, 1), if publish { (19, 23) } else { (13, 17) }],
     ) {
         assert_eq!(file.location.location.as_str(), expected_location);
         let expected_type = if publish || file.version == 0 {
