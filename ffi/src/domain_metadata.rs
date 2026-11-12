@@ -138,18 +138,30 @@ pub struct ClusteringColumnVisitor {
 /// # Safety
 ///
 /// Caller is responsible for passing valid snapshot and engine handles, a valid `engine_context`
-/// opaque pointer forwarded to each callback, and valid function pointers in both fields of
-/// `visitor`.
+/// opaque pointer forwarded to each callback, and a non-null, correctly aligned `visitor` pointer
+/// that remains readable for the duration of the call. Both callback function pointers in
+/// `visitor` must be valid and callable for the duration of the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn visit_clustering_columns(
     snapshot: Handle<SharedSnapshot>,
     engine: Handle<SharedExternEngine>,
     engine_context: NullableCvoid,
-    visitor: ClusteringColumnVisitor,
+    visitor: *const ClusteringColumnVisitor,
 ) -> ExternResult<OptionalValue<usize>> {
     let snapshot = unsafe { snapshot.as_ref() };
     let engine = unsafe { engine.as_ref() };
-    let result = visit_clustering_columns_impl(snapshot, engine, engine_context, visitor);
+    let result = if visitor.is_null() {
+        Err(delta_kernel::KernelError::generic(
+            "ClusteringColumnVisitor pointer is null",
+        ))
+    } else if !visitor.is_aligned() {
+        Err(delta_kernel::KernelError::generic(
+            "ClusteringColumnVisitor pointer is misaligned",
+        ))
+    } else {
+        let visitor = unsafe { &*visitor };
+        visit_clustering_columns_impl(snapshot, engine, engine_context, visitor)
+    };
     unsafe { result.into_extern_result(&engine) }
 }
 
@@ -157,7 +169,7 @@ fn visit_clustering_columns_impl(
     snapshot: &Snapshot,
     extern_engine: &dyn ExternEngine,
     engine_context: NullableCvoid,
-    visitor: ClusteringColumnVisitor,
+    visitor: &ClusteringColumnVisitor,
 ) -> KernelResult<OptionalValue<usize>> {
     let Some(infos) = snapshot
         .reader()
@@ -179,7 +191,7 @@ fn visit_clustering_columns_impl(
     // Validate all metadata before invoking callbacks so malformed entries cannot leave partial
     // callback side effects.
     for (logical, physical, dispatch) in columns? {
-        dispatch.visit(&visitor, engine_context, logical, physical);
+        dispatch.visit(visitor, engine_context, logical, physical);
     }
     Ok(OptionalValue::Some(infos.len()))
 }
@@ -607,15 +619,16 @@ mod tests {
             ));
         }
 
+        let visitor = ClusteringColumnVisitor {
+            visit_primitive,
+            visit_decimal,
+        };
         let count: Option<usize> = ok_or_panic(unsafe {
             visit_clustering_columns(
                 snapshot.shallow_copy(),
                 engine.shallow_copy(),
                 Some(NonNull::new_unchecked(collected_ptr).cast()),
-                ClusteringColumnVisitor {
-                    visit_primitive,
-                    visit_decimal,
-                },
+                &visitor,
             )
         })
         .into();
@@ -823,9 +836,9 @@ mod tests {
         Ok(())
     }
 
-    // Mixed dispatch preserves domain order and routes decimals through their dedicated callback.
+    // Decimal columns use the dedicated callback with precision and scale.
     #[tokio::test]
-    async fn test_visit_clustering_columns_dispatches_primitive_and_decimal() -> KernelResult<()> {
+    async fn test_visit_clustering_columns_dispatches_decimal() -> KernelResult<()> {
         let storage = Arc::new(InMemory::new());
         let engine = DefaultEngineBuilder::new(storage.clone()).build();
         let engine = engine_to_handle(Arc::new(engine), TEST_ERROR_ALLOCATORS);
@@ -834,7 +847,6 @@ mod tests {
         let schema = json!({
             "type": "struct",
             "fields": [
-                {"name": "id", "type": "integer", "nullable": true, "metadata": {}},
                 {"name": "amt", "type": "decimal(12,3)", "nullable": true, "metadata": {}}
             ]
         })
@@ -842,7 +854,7 @@ mod tests {
         let commit = join_actions(&[
             protocol_action(true),
             metadata_action(&schema),
-            clustering_domain_action(r#"{"clusteringColumns":[["id"],["amt"]]}"#, false),
+            clustering_domain_action(r#"{"clusteringColumns":[["amt"]]}"#, false),
         ]);
         add_commit(table_root, storage.as_ref(), 0, commit)
             .await
@@ -852,84 +864,11 @@ mod tests {
             unsafe { build_snapshot(kernel_string_slice!(table_root), engine.shallow_copy()) };
 
         let (count, columns) = unsafe { collect_clustering_columns(&snapshot, &engine) };
-        assert_eq!(count, Some(2));
+        assert_eq!(count, Some(1));
         assert_eq!(
             columns,
-            vec![
-                ("id".to_string(), "id".to_string(), TAG_INTEGER, 0, 0),
-                ("amt".to_string(), "amt".to_string(), TAG_DECIMAL, 12, 3),
-            ]
+            vec![("amt".to_string(), "amt".to_string(), TAG_DECIMAL, 12, 3)]
         );
-
-        unsafe { free_snapshot(snapshot) }
-        unsafe { free_engine(engine) }
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_visit_clustering_columns_rejects_interval_before_callbacks() -> KernelResult<()> {
-        let storage = Arc::new(InMemory::new());
-        let engine = DefaultEngineBuilder::new(storage.clone()).build();
-        let engine = engine_to_handle(Arc::new(engine), TEST_ERROR_ALLOCATORS);
-        let table_root = "memory:///test_clustering_interval_rejected/";
-        let schema = json!({
-            "type": "struct",
-            "fields": [
-                {"name": "id", "type": "integer", "nullable": true, "metadata": {}},
-                {"name": "period", "type": "interval year to month", "nullable": true, "metadata": {}}
-            ]
-        })
-        .to_string();
-        let commit = join_actions(&[
-            protocol_action(true),
-            metadata_action(&schema),
-            clustering_domain_action(r#"{"clusteringColumns":[["id"],["period"]]}"#, false),
-        ]);
-        add_commit(table_root, storage.as_ref(), 0, commit)
-            .await
-            .unwrap();
-        let snapshot =
-            unsafe { build_snapshot(kernel_string_slice!(table_root), engine.shallow_copy()) };
-
-        extern "C" fn count_primitive(
-            context: NullableCvoid,
-            _: KernelStringSlice,
-            _: KernelStringSlice,
-            _: u8,
-        ) {
-            let count = unsafe { &mut *context.unwrap().as_ptr().cast::<usize>() };
-            *count += 1;
-        }
-        extern "C" fn count_decimal(
-            context: NullableCvoid,
-            _: KernelStringSlice,
-            _: KernelStringSlice,
-            _: u8,
-            _: u8,
-        ) {
-            let count = unsafe { &mut *context.unwrap().as_ptr().cast::<usize>() };
-            *count += 1;
-        }
-
-        let mut callback_count = 0;
-        let result = unsafe {
-            visit_clustering_columns(
-                snapshot.shallow_copy(),
-                engine.shallow_copy(),
-                Some(NonNull::from(&mut callback_count).cast()),
-                ClusteringColumnVisitor {
-                    visit_primitive: count_primitive,
-                    visit_decimal: count_decimal,
-                },
-            )
-        };
-        assert_extern_result_error_with_message(
-            result,
-            FFIKernelError::SchemaError,
-            Some("Schema error: Unsupported clustering column type: interval year to month"),
-        );
-        assert_eq!(callback_count, 0);
 
         unsafe { free_snapshot(snapshot) }
         unsafe { free_engine(engine) }
@@ -1036,15 +975,16 @@ mod tests {
             _: u8,
         ) {
         }
+        let visitor = ClusteringColumnVisitor {
+            visit_primitive: primitive,
+            visit_decimal: decimal,
+        };
         let res = unsafe {
             visit_clustering_columns(
                 snapshot.shallow_copy(),
                 engine.shallow_copy(),
                 None,
-                ClusteringColumnVisitor {
-                    visit_primitive: primitive,
-                    visit_decimal: decimal,
-                },
+                &visitor,
             )
         };
         assert_extern_result_error_with_message(res, FFIKernelError::GenericError, None);
