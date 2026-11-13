@@ -1270,6 +1270,7 @@ pub(crate) fn fix_record_batch_nested_null_masks(batch: RecordBatch) -> KernelRe
 /// Splits a StructArray into its parts, unions in the parent null mask, and uses the result to
 /// recursively update the children as well before putting everything back together.
 fn compute_nested_null_masks(sa: StructArray, parent_nulls: Option<&NullBuffer>) -> StructArray {
+    let num_rows = sa.len();
     let (fields, columns, nulls) = sa.into_parts();
     let nulls = NullBuffer::union(parent_nulls, nulls.as_ref());
     let columns = columns
@@ -1306,8 +1307,8 @@ fn compute_nested_null_masks(sa: StructArray, parent_nulls: Option<&NullBuffer>)
     // for a `RecordBatch` with n rows and k leaf columns.
     //
     // SAFETY: We are simply reassembling the input `StructArray` we previously broke apart, with
-    // updated null buffers. See above for details about null buffer safety.
-    unsafe { StructArray::new_unchecked(fields, columns, nulls) }
+    // updated null buffers and the original row count. See above for null buffer safety.
+    unsafe { StructArray::new_unchecked_with_length(fields, columns, nulls, num_rows) }
 }
 
 /// Parse a column of JSON strings into a typed `RecordBatch` matching `schema`. N input
@@ -4077,6 +4078,20 @@ mod tests {
         let expect_reorder = vec![];
         assert_eq!(mask_indices, expect_mask);
         assert_eq!(reorder_indices, expect_reorder);
+    }
+
+    #[rstest]
+    fn test_fixup_parquet_read_preserves_empty_projection_row_count(
+        #[values(0, 1, 3)] num_rows: usize,
+        #[values(false, true)] apply_schema: bool,
+    ) -> KernelResult<()> {
+        let batch = RecordBatch::from(StructArray::new_empty_fields(num_rows, None));
+        let schema = apply_schema.then(|| schema_ref! {});
+        let data = fixup_parquet_read(batch, &[], None, None, schema.as_ref())?;
+
+        assert_eq!(data.record_batch().num_rows(), num_rows);
+        assert_eq!(data.record_batch().num_columns(), 0);
+        Ok(())
     }
 
     #[test]

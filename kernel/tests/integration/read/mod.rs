@@ -545,9 +545,10 @@ fn column_ordering() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-#[test]
-fn column_ordering_and_projection() -> Result<(), Box<dyn std::error::Error>> {
-    let expected = vec![
+#[rstest::rstest]
+#[case::data_columns(
+    &["a_float", "number"],
+    vec![
         "+---------+--------+",
         "| a_float | number |",
         "+---------+--------+",
@@ -558,10 +559,30 @@ fn column_ordering_and_projection() -> Result<(), Box<dyn std::error::Error>> {
         "| 2.2     | 2      |",
         "| 3.3     | 3      |",
         "+---------+--------+",
-    ];
+    ]
+)]
+#[case::partition_column_only(
+    &["letter"],
+    vec![
+        "+--------+",
+        "| letter |",
+        "+--------+",
+        "|        |",
+        "| a      |",
+        "| a      |",
+        "| b      |",
+        "| c      |",
+        "| e      |",
+        "+--------+",
+    ]
+)]
+fn column_ordering_and_projection(
+    #[case] columns: &[&str],
+    #[case] expected: Vec<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
     read_table_data_str(
         "./tests/data/basic_partitioned",
-        Some(&["a_float", "number"]),
+        Some(columns),
         None,
         expected,
     )?;
