@@ -75,6 +75,7 @@
 //! }
 //! ```
 
+mod checkpoint;
 pub mod validation;
 pub mod workload;
 
@@ -86,7 +87,7 @@ use url::Url;
 /// Result of loading a workload specification.
 #[derive(Debug)]
 pub enum LoadedTestCase {
-    /// A read or snapshot workload supported by this harness.
+    /// A workload supported by this harness.
     Supported(Box<TestCase>),
     /// A workload operation that this harness does not execute.
     Unsupported(String),
@@ -111,7 +112,7 @@ impl TestCase {
     ///
     /// Given a path like `.../workloads/<test_case>/specs/<workload>.json`,
     /// reads the JSON once and resolves the test case root directory. Unsupported workload
-    /// operations are returned without attempting to deserialize them as read or snapshot specs.
+    /// operations are returned without attempting to deserialize them as supported specs.
     ///
     /// # Errors
     ///
@@ -186,7 +187,7 @@ impl TestCase {
 fn is_supported_spec_type(spec_type: &str) -> bool {
     matches!(
         spec_type,
-        "read" | "snapshot" | "snapshotConstruction" | "snapshot_construction"
+        "read" | "snapshot" | "snapshotConstruction" | "snapshot_construction" | "checkpoint"
     )
 }
 
@@ -208,7 +209,7 @@ mod tests {
 
     #[test]
     fn loader_does_not_treat_other_operations_as_supported() {
-        for spec_type in ["cdf", "checkpoint", "crc", "write", "unknown"] {
+        for spec_type in ["cdf", "crc", "write", "unknown"] {
             assert!(!is_supported_spec_type(spec_type));
         }
     }
