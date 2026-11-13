@@ -1,14 +1,16 @@
 //! File system committer for non-catalog-managed tables.
 
 use tracing::{info, instrument};
+use url::Url;
 
 use super::Committer;
 use super::commit_types::{CommitMetadata, CommitResponse};
 use super::publish_types::PublishMetadata;
+use crate::commit_range::CommitRange;
 #[cfg(feature = "declarative-plans")]
 use crate::committer::write_commit_json_declarative;
 #[cfg(feature = "declarative-plans")]
-use crate::plans::{RelationRef, ScopedPlanExecutor};
+use crate::plans::{PlanExecutor, RelationRef, ScopedPlanExecutor};
 use crate::{
     Engine, FileMeta, FilteredEngineData, KernelError, KernelResult, KernelResultIterator,
 };
@@ -27,9 +29,29 @@ impl FileSystemCommitter {
         Self {}
     }
 
+    fn load_winning_commits(
+        &self,
+        engine: &dyn Engine,
+        table_root: &Url,
+        conflict_version: crate::Version,
+    ) -> KernelResult<CommitRange> {
+        CommitRange::builder_for(table_root, conflict_version).build(engine)
+    }
+
+    #[cfg(feature = "declarative-plans")]
+    fn load_winning_commits_declarative(
+        &self,
+        executor: &dyn PlanExecutor,
+        table_root: &Url,
+        conflict_version: crate::Version,
+    ) -> KernelResult<CommitRange> {
+        CommitRange::builder_for(table_root, conflict_version).build_declarative(executor)
+    }
+
     fn commit_response(
         result: KernelResult<FileMeta>,
         version: crate::Version,
+        load_history: impl FnOnce() -> KernelResult<CommitRange>,
     ) -> KernelResult<CommitResponse> {
         match result {
             Ok(file_meta) => {
@@ -44,7 +66,10 @@ impl FileSystemCommitter {
                     conflicting_version = version,
                     "Filesystem commit conflict: target version already exists"
                 );
-                Ok(CommitResponse::Conflict { version })
+                Ok(CommitResponse::Conflict {
+                    version,
+                    commits: load_history(),
+                })
             }
             Err(e) => Err(e),
         }
@@ -77,7 +102,9 @@ impl Committer for FileSystemCommitter {
                     written_size,
                 )
             });
-        Self::commit_response(result, version)
+        Self::commit_response(result, version, || {
+            self.load_winning_commits(engine, commit_metadata.table_root(), version)
+        })
     }
 
     #[cfg(feature = "declarative-plans")]
@@ -96,7 +123,9 @@ impl Committer for FileSystemCommitter {
         let version = commit_metadata.version();
         let path = commit_metadata.published_commit_path()?;
         let result = write_commit_json_declarative(executor, actions, path);
-        Self::commit_response(result, version)
+        Self::commit_response(result, version, || {
+            self.load_winning_commits_declarative(executor, commit_metadata.table_root(), version)
+        })
     }
 
     fn is_catalog_committer(&self) -> bool {
@@ -121,7 +150,6 @@ mod tests {
     use std::sync::Arc;
 
     use rstest::rstest;
-    use url::Url;
 
     use super::*;
     use crate::actions::{LOG_METADATA_SCHEMA, Metadata, Protocol};
@@ -282,7 +310,7 @@ mod tests {
                         .ends_with("00000000000000000001.json")
                 );
             }
-            CommitResponse::Conflict { .. } => panic!("Expected Committed, got Conflict"),
+            response => panic!("Expected Committed, got {response:?}"),
         }
     }
 
@@ -350,6 +378,79 @@ mod tests {
             second_metadata,
         )
         .unwrap();
-        assert!(matches!(second, CommitResponse::Conflict { version: 1 }));
+        let CommitResponse::Conflict { version, commits } = second else {
+            panic!("Expected a confirmed conflict with bundled history");
+        };
+        assert_eq!(version, 1);
+        let winners = commits.unwrap();
+        assert_eq!(winners.start_version(), 1);
+        assert_eq!(winners.end_version(), 1);
+        assert_eq!(winners.commit_files().unwrap().count(), 1);
+    }
+
+    #[cfg(feature = "declarative-plans")]
+    #[rstest]
+    #[case::complete(vec![10, 11, 12, 13], None)]
+    #[case::missing_first(vec![12, 13], Some(11))]
+    #[case::missing_middle(vec![11, 13], Some(12))]
+    #[case::missing_terminal(vec![11, 12], Some(13))]
+    #[tokio::test]
+    async fn winning_history_requires_complete_commits_even_with_a_checkpoint(
+        #[case] versions: Vec<u64>,
+        #[case] missing_version: Option<u64>,
+        #[values(CommitStyle::Imperative, CommitStyle::Declarative)] style: CommitStyle,
+    ) {
+        let storage = Arc::new(InMemory::new());
+        let engine = SyncEngine::new_with_store(storage.clone());
+        for version in versions {
+            // Discovery must not parse the file contents.
+            storage
+                .put(
+                    &Path::from(format!("table/_delta_log/{version:020}.json")),
+                    "not JSON".into(),
+                )
+                .await
+                .unwrap();
+        }
+        storage
+            .put(
+                &Path::from("table/_delta_log/00000000000000000013.checkpoint.parquet"),
+                "checkpoint".into(),
+            )
+            .await
+            .unwrap();
+        let root = Url::parse("memory:///table/").unwrap();
+        let committer = FileSystemCommitter::new();
+        let executor = SyncPlanExecutor::new(Some(storage));
+        let result = match style {
+            CommitStyle::Imperative => committer.load_winning_commits(&engine, &root, 11),
+            CommitStyle::Declarative => {
+                committer.load_winning_commits_declarative(&executor, &root, 11)
+            }
+        };
+        match missing_version {
+            None => {
+                let winners = result.unwrap();
+                assert_eq!(winners.start_version(), 11);
+                assert_eq!(winners.end_version(), 13);
+                let versions: Vec<_> = winners
+                    .commit_files()
+                    .unwrap()
+                    .map(|file| file.unwrap().version)
+                    .collect();
+                assert_eq!(versions, vec![11, 12, 13]);
+            }
+            Some(11) => assert!(matches!(
+                result,
+                Err(KernelError::StartVersionNotFound {
+                    requested: 11,
+                    earliest: 12
+                })
+            )),
+            Some(version) => assert!(matches!(
+                result,
+                Err(KernelError::MissingVersion(missing)) if missing == version
+            )),
+        }
     }
 }

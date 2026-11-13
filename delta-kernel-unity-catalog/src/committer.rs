@@ -1,21 +1,23 @@
+use std::future::Future;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 
+use delta_kernel::commit_range::CommitRange;
 #[cfg(feature = "declarative-plans")]
 use delta_kernel::committer::write_commit_json_declarative;
 use delta_kernel::committer::{
     CommitMetadata, CommitResponse, CommitType, Committer, PublishMetadata,
 };
 #[cfg(feature = "declarative-plans")]
-use delta_kernel::plans::{RelationRef, ScopedPlanExecutor};
+use delta_kernel::plans::{PlanExecutor, RelationRef, ScopedPlanExecutor};
 use delta_kernel::{
     Engine, FileMeta, FilteredEngineData, KernelError as DeltaError, KernelResult,
     KernelResultIterator,
 };
 use tracing::{debug, info};
 use unity_catalog_delta_client_api::{
-    Commit, DeltaTableRequirement, DeltaTableUpdate, TableIdentifier, UpdateTableClient,
-    UpdateTableRequest,
+    Commit, DeltaTableRequirement, DeltaTableUpdate, Error as ClientError, TableIdentifier,
+    UpdateTableClient, UpdateTableRequest,
 };
 
 use crate::constants::{
@@ -66,6 +68,58 @@ impl<C: UpdateTableClient> UCCommitter<C> {
             table_id: table_id.into(),
             table,
         }
+    }
+
+    fn load_winning_commits(
+        &self,
+        engine: &dyn Engine,
+        table_root: &url::Url,
+        conflict_version: delta_kernel::Version,
+    ) -> KernelResult<CommitRange> {
+        require!(
+            conflict_version != 0,
+            DeltaError::unsupported("A create-table conflict cannot be rebased onto another table")
+        );
+        let (log_tail, latest_version) = self.read_commit_history(table_root)?;
+        CommitRange::builder_for(table_root, conflict_version)
+            .with_log_tail(log_tail, latest_version)
+            .build(engine)
+    }
+
+    #[cfg(feature = "declarative-plans")]
+    fn load_winning_commits_declarative(
+        &self,
+        executor: &dyn PlanExecutor,
+        table_root: &url::Url,
+        conflict_version: delta_kernel::Version,
+    ) -> KernelResult<CommitRange> {
+        require!(
+            conflict_version != 0,
+            DeltaError::unsupported("A create-table conflict cannot be rebased onto another table")
+        );
+        let (log_tail, latest_version) = self.read_commit_history(table_root)?;
+        CommitRange::builder_for(table_root, conflict_version)
+            .with_log_tail(log_tail, latest_version)
+            .build_declarative(executor)
+    }
+
+    fn read_commit_history(
+        &self,
+        table_root: &url::Url,
+    ) -> KernelResult<(Vec<delta_kernel::LogPath>, delta_kernel::Version)> {
+        let state = block_on_catalog(
+            self.update_table_client
+                .get_commits(&self.table, &self.table_id),
+        )?
+        .map_err(|e| DeltaError::generic(format!("UC commit-history read failed: {e}")))?;
+        require!(
+            state.table_uuid == self.table_id,
+            DeltaError::generic("Catalog commit-history response identifies a different table")
+        );
+        let latest_version = u64::try_from(state.latest_version)
+            .map_err(|_| DeltaError::generic("Catalog returned a negative ratified version"))?;
+        let log_tail = crate::log_tail_from_commits(&state.commits, table_root.clone())?;
+        Ok((log_tail, latest_version))
     }
 
     /// Returns true if the commit metadata has the `catalogManaged` feature in both reader and
@@ -162,7 +216,12 @@ impl<C: UpdateTableClient> UCCommitter<C> {
             }
             Err(DeltaError::FileAlreadyExists(_)) => {
                 info!("version 0 commit conflict: commit file already exists");
-                Ok(CommitResponse::Conflict { version: 0 })
+                Ok(CommitResponse::Conflict {
+                    version: 0,
+                    commits: Err(DeltaError::unsupported(
+                        "A create-table conflict cannot be rebased onto another table",
+                    )),
+                })
             }
             Err(e) => Err(e),
         }
@@ -174,6 +233,7 @@ impl<C: UpdateTableClient> UCCommitter<C> {
         &self,
         commit_metadata: CommitMetadata,
         write: impl FnOnce(&url::Url) -> KernelResult<FileMeta>,
+        load_history: impl FnOnce() -> KernelResult<CommitRange>,
     ) -> KernelResult<CommitResponse>
     where
         C: 'static,
@@ -209,40 +269,27 @@ impl<C: UpdateTableClient> UCCommitter<C> {
             updates,
         )
         .map_err(|e| DeltaError::generic(format!("invalid UC update_table request: {e}")))?;
-        let target = self.table.clone();
-
-        let handle = tokio::runtime::Handle::try_current().map_err(|_| {
-            DeltaError::generic("UCCommitter may only be used within a tokio runtime")
-        })?;
-        // `block_in_place` panics if the current runtime isn't multi-threaded. We can't check for
-        // that up front: `runtime_flavor()` can't tell a real single-threaded runtime (where this
-        // panics) apart from the FFI case (single-threaded on top of multi-threaded, where it's
-        // fine). So we let it run and catch the panic.
-        let result = catch_unwind(AssertUnwindSafe(|| {
-            tokio::task::block_in_place(|| {
-                handle.block_on(async move {
-                    self.update_table_client
-                        .update_table(&target, update_req)
-                        .await
-                })
-            })
-        }))
-        .map_err(|panic| {
-            let msg = panic
-                .downcast_ref::<&str>()
-                .map(|s| s.to_string())
-                .or_else(|| panic.downcast_ref::<String>().cloned())
-                .unwrap_or_else(|| "unknown panic".to_string());
-            DeltaError::generic(format!(
-                "UCCommitter commit panicked (requires a multi-threaded tokio runtime): {msg}"
-            ))
-        })?;
+        let result = block_on_catalog(
+            self.update_table_client
+                .update_table(&self.table, update_req),
+        )?;
         match result {
             Ok(_) => Ok(CommitResponse::Committed {
                 file_meta: committed,
             }),
-            // TODO(#2970): classify version conflicts as CommitResponse::Conflict so the
-            // transaction layer can rebase/retry, instead of collapsing every error to Generic.
+            Err(ClientError::CommitVersionAlreadyExists { version })
+                if u64::try_from(version).ok() == Some(commit_metadata.version()) =>
+            {
+                Ok(CommitResponse::Conflict {
+                    version: commit_metadata.version(),
+                    commits: load_history(),
+                })
+            }
+            Err(
+                e @ (ClientError::Retryable(_) | ClientError::MaxUnpublishedCommitsExceeded(_)),
+            ) => Ok(CommitResponse::Retryable {
+                error: DeltaError::generic(format!("UC update_table error: {e}")),
+            }),
             Err(e) => Err(DeltaError::Generic(format!("UC update_table error: {e}"))),
         }
     }
@@ -274,12 +321,18 @@ impl<C: UpdateTableClient + 'static> Committer for UCCommitter<C> {
                 ))
             });
         }
-        self.commit_version_non_zero(commit_metadata, |path| {
-            engine
-                .json_handler()
-                .write_json_file(path, Box::new(actions), false)?;
-            engine.storage_handler().head(path)
-        })
+        let table_root = commit_metadata.table_root().clone();
+        let version = commit_metadata.version();
+        self.commit_version_non_zero(
+            commit_metadata,
+            |path| {
+                engine
+                    .json_handler()
+                    .write_json_file(path, Box::new(actions), false)?;
+                engine.storage_handler().head(path)
+            },
+            || self.load_winning_commits(engine, &table_root, version),
+        )
     }
 
     #[cfg(feature = "declarative-plans")]
@@ -294,9 +347,13 @@ impl<C: UpdateTableClient + 'static> Committer for UCCommitter<C> {
                 write_commit_json_declarative(executor, actions, path.clone())
             });
         }
-        self.commit_version_non_zero(commit_metadata, |path| {
-            write_commit_json_declarative(executor, actions, path.clone())
-        })
+        let table_root = commit_metadata.table_root().clone();
+        let version = commit_metadata.version();
+        self.commit_version_non_zero(
+            commit_metadata,
+            |path| write_commit_json_declarative(executor, actions, path.clone()),
+            || self.load_winning_commits_declarative(executor, &table_root, version),
+        )
     }
 
     fn is_catalog_committer(&self) -> bool {
@@ -320,6 +377,28 @@ impl<C: UpdateTableClient + 'static> Committer for UCCommitter<C> {
 
         Ok(())
     }
+}
+
+fn block_on_catalog<T>(
+    future: impl Future<Output = unity_catalog_delta_client_api::Result<T>>,
+) -> KernelResult<unity_catalog_delta_client_api::Result<T>> {
+    let handle = tokio::runtime::Handle::try_current()
+        .map_err(|_| DeltaError::generic("UCCommitter may only be used within a tokio runtime"))?;
+    // The FFI runtime can appear single-threaded even when block_in_place is supported, so
+    // runtime_flavor cannot reliably replace catching this runtime precondition failure.
+    catch_unwind(AssertUnwindSafe(|| {
+        tokio::task::block_in_place(|| handle.block_on(future))
+    }))
+    .map_err(|panic| {
+        let msg = panic
+            .downcast_ref::<&str>()
+            .map(|s| s.to_string())
+            .or_else(|| panic.downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "unknown panic".to_string());
+        DeltaError::generic(format!(
+            "UCCommitter catalog request panicked (requires a multi-threaded tokio runtime): {msg}"
+        ))
+    })
 }
 
 /// Convert a `u64` to the `i64` the UC wire types use, erroring if it does not fit.
@@ -356,6 +435,7 @@ mod tests {
     use delta_kernel::{EngineData, FilteredEngineData, Version};
     use delta_kernel_default_engine::DefaultEngine;
     use rstest::rstest;
+    use unity_catalog_delta_client_api::InMemoryUpdateTableClient;
     use unity_catalog_delta_client_api::error::Result;
 
     use super::*;
@@ -363,6 +443,7 @@ mod tests {
     #[derive(Default)]
     struct MockUpdateTableClient {
         requests: Mutex<Vec<UpdateTableRequest>>,
+        error: Mutex<Option<ClientError>>,
     }
 
     impl UpdateTableClient for MockUpdateTableClient {
@@ -372,7 +453,7 @@ mod tests {
             request: UpdateTableRequest,
         ) -> Result<()> {
             self.requests.lock().unwrap().push(request);
-            Ok(())
+            self.error.lock().unwrap().take().map_or(Ok(()), Err)
         }
     }
 
@@ -468,6 +549,194 @@ mod tests {
     }
 
     #[rstest]
+    #[case::connection(|| ClientError::Retryable("Connection refused".into()), true, false)]
+    #[case::unpublished_limit(|| ClientError::MaxUnpublishedCommitsExceeded(20), true, false)]
+    #[case::authentication(|| ClientError::AuthenticationFailed, false, false)]
+    #[case::uncertain(|| ClientError::Generic("Response lost".into()), false, false)]
+    #[case::conflict_history_unavailable(|| ClientError::CommitVersionAlreadyExists { version: 1 }, false, true)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn catalog_failures_are_retryable_only_for_confirmed_temporary_rejections(
+        #[case] error: fn() -> ClientError,
+        #[case] retryable: bool,
+        #[case] conflicted: bool,
+    ) {
+        for style in [
+            CommitStyle::Imperative,
+            #[cfg(feature = "declarative-plans")]
+            CommitStyle::Declarative,
+        ] {
+            let tmp_dir = tempfile::tempdir().unwrap();
+            let table_root = url::Url::from_directory_path(tmp_dir.path()).unwrap();
+            fs::create_dir_all(tmp_dir.path().join("_delta_log/_staged_commits")).unwrap();
+            let client = Arc::new(MockUpdateTableClient {
+                error: Mutex::new(Some(error())),
+                ..Default::default()
+            });
+            let committer = UCCommitter::new(
+                client.clone(),
+                "test-table-id",
+                TableIdentifier::new("test_catalog", "test_schema", "test_table"),
+            );
+            let engine = DefaultEngine::builder(Arc::new(LocalFileSystem::new())).build();
+            let result = commit_with_style(
+                &committer,
+                &engine,
+                style,
+                catalog_managed_commit_metadata(table_root.clone(), 1),
+            );
+            if conflicted {
+                assert!(matches!(
+                    result,
+                    Ok(CommitResponse::Conflict {
+                        version: 1,
+                        commits: Err(_)
+                    })
+                ));
+                assert_eq!(client.requests.lock().unwrap().len(), 1);
+            } else if retryable {
+                assert!(matches!(result, Ok(CommitResponse::Retryable { .. })));
+                let retried = commit_with_style(
+                    &committer,
+                    &engine,
+                    style,
+                    catalog_managed_commit_metadata(table_root, 1),
+                )
+                .unwrap();
+                assert!(matches!(retried, CommitResponse::Committed { .. }));
+                assert_eq!(client.requests.lock().unwrap().len(), 2);
+            } else {
+                assert!(result.is_err());
+                assert_eq!(client.requests.lock().unwrap().len(), 1);
+            }
+        }
+    }
+
+    #[rstest]
+    #[case::imperative(CommitStyle::Imperative)]
+    #[cfg_attr(
+        feature = "declarative-plans",
+        case::declarative(CommitStyle::Declarative)
+    )]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn duplicate_catalog_version_returns_conflict_and_loads_only_ratified_winners(
+        #[case] style: CommitStyle,
+        #[values(0, 2, 3)] published_until: u64,
+    ) {
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let table_root = url::Url::from_directory_path(tmp_dir.path()).unwrap();
+        fs::create_dir_all(tmp_dir.path().join("_delta_log/_staged_commits")).unwrap();
+        let client = Arc::new(InMemoryUpdateTableClient::new());
+        client.create_table("test-table-id").unwrap();
+        let committer = UCCommitter::new(
+            client,
+            "test-table-id",
+            TableIdentifier::new("test_catalog", "test_schema", "test_table"),
+        );
+        let engine = DefaultEngine::builder(Arc::new(LocalFileSystem::new())).build();
+        for version in 1..=3 {
+            let result = commit_with_style(
+                &committer,
+                &engine,
+                style,
+                catalog_managed_commit_metadata(table_root.clone(), version),
+            )
+            .unwrap();
+            assert!(matches!(result, CommitResponse::Committed { .. }));
+        }
+        let result = commit_with_style(
+            &committer,
+            &engine,
+            style,
+            catalog_managed_commit_metadata(table_root.clone(), 1),
+        )
+        .unwrap();
+        let CommitResponse::Conflict { version, commits } = result else {
+            panic!("Expected a confirmed conflict with bundled catalog history");
+        };
+        assert_eq!(version, 1);
+        let bundled = commits.unwrap();
+        assert_eq!(bundled.start_version(), 1);
+        assert_eq!(bundled.end_version(), 3);
+        assert_eq!(bundled.commit_files().unwrap().count(), 3);
+        // The losing proposal also exists on disk, but only the catalog identifies winners.
+        let staged_count = fs::read_dir(tmp_dir.path().join("_delta_log/_staged_commits"))
+            .unwrap()
+            .count();
+        assert_eq!(staged_count, 4);
+        let state = committer
+            .update_table_client
+            .get_commits(&committer.table, &committer.table_id)
+            .await
+            .unwrap();
+        if published_until > 0 {
+            let commits = state
+                .commits
+                .iter()
+                .filter(|commit| commit.version <= published_until as i64)
+                .map(|commit| {
+                    let src = table_root
+                        .join(&format!("_delta_log/_staged_commits/{}", commit.file_name))
+                        .unwrap();
+                    let dest = table_root
+                        .join(&format!("_delta_log/{:020}.json", commit.version))
+                        .unwrap();
+                    CatalogCommit::new_unchecked(commit.version as u64, src, dest)
+                })
+                .collect();
+            committer
+                .publish(
+                    &engine,
+                    PublishMetadata::try_new(published_until, commits).unwrap(),
+                )
+                .unwrap();
+            committer.update_table_client.insert_table(
+                "test-table-id",
+                unity_catalog_delta_client_api::TableData {
+                    max_ratified_version: state.latest_version,
+                    catalog_commits: state
+                        .commits
+                        .into_iter()
+                        .filter(|commit| commit.version > published_until as i64)
+                        .collect(),
+                },
+            );
+        }
+        // Versions newer than the catalog read are outside the pinned history.
+        fs::write(
+            tmp_dir.path().join("_delta_log/00000000000000000004.json"),
+            "not ratified",
+        )
+        .unwrap();
+        let winners = committer
+            .load_winning_commits(&engine, &table_root, 1)
+            .unwrap();
+        assert_eq!(winners.start_version(), 1);
+        assert_eq!(winners.end_version(), 3);
+        let paths = winners
+            .commit_files()
+            .unwrap()
+            .collect::<KernelResult<Vec<_>>>()
+            .unwrap();
+        assert_eq!(paths.len(), 3);
+        assert_eq!(
+            paths
+                .iter()
+                .filter(|p| p.location.location.path().contains("/_staged_commits/"))
+                .count(),
+            3 - published_until as usize
+        );
+        #[cfg(feature = "declarative-plans")]
+        {
+            let executor = SyncPlanExecutor::default();
+            let winners = committer
+                .load_winning_commits_declarative(&executor, &table_root, 1)
+                .unwrap();
+            assert_eq!(winners.end_version(), 3);
+            assert_eq!(winners.commit_files().unwrap().count(), 3);
+        }
+    }
+
+    #[rstest]
     #[case::imperative(CommitStyle::Imperative)]
     #[cfg_attr(
         feature = "declarative-plans",
@@ -502,9 +771,7 @@ mod tests {
                     "{\"test\":\"value\"}\n"
                 );
             }
-            CommitResponse::Conflict { .. } => {
-                panic!("expected Committed for version 0, got Conflict")
-            }
+            response => panic!("expected Committed for version 0, got {response:?}"),
         }
         assert!(
             committer
@@ -587,7 +854,13 @@ mod tests {
         let commit_metadata = catalog_managed_commit_metadata(table_root, 0);
         let result = commit_with_style(&committer, &engine, style, commit_metadata).unwrap();
         assert!(
-            matches!(result, CommitResponse::Conflict { version: 0 }),
+            matches!(
+                result,
+                CommitResponse::Conflict {
+                    version: 0,
+                    commits: Err(_)
+                }
+            ),
             "expected Conflict for version 0 when file exists, got: {result:?}"
         );
     }

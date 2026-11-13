@@ -7,17 +7,16 @@
 //! (`load_table`, credentials, `/config`). Concrete HTTP implementations live
 //! in `unity-catalog-delta-rest-client`.
 //!
-//! Only `update_table` (the commit RPC) is behind a trait. Read and
-//! credential-vending flows are connector-driven: connectors call concrete
-//! REST methods (or bring their own HTTP plumbing) and hand the responses to
-//! `delta-kernel-unity-catalog` helpers.
+//! The commit client also exposes optional ratified-history reads for conflict recovery. Snapshot
+//! loading and credential vending remain connector-driven through concrete REST methods or
+//! connector-provided transports.
 
 pub mod clients;
 pub mod credentials;
 pub mod error;
 pub mod models;
 
-pub use clients::UpdateTableClient;
+pub use clients::{CommitState, UpdateTableClient};
 #[cfg(any(test, feature = "test-utils"))]
 pub use clients::{InMemoryUpdateTableClient, TableData};
 pub use credentials::{CredentialsResponse, Operation, StorageCredential};

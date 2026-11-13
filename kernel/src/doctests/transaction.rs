@@ -153,13 +153,15 @@ pub struct BuilderDefaultMode;
 #[cfg(not(feature = "declarative-plans"))]
 pub struct ModeSelectionRequiresDeclarativePlans;
 
-/// Declarative transactions stage relation handles and expose a separate commit entry point.
+/// Declarative transactions collect relation handles and prepare them before a commit attempt.
 ///
 /// ```no_run
 /// use delta_kernel::committer::FileSystemCommitter;
 /// use delta_kernel::plans::{RelationRef, ScopedPlanExecutor};
 /// use delta_kernel::snapshot::SnapshotRef;
-/// use delta_kernel::transaction::{CommitResult, Declarative, UpdateTable, UpdateTableOperation};
+/// use delta_kernel::transaction::{
+///     Declarative, PreparedTransactionCommitResult, UpdateTable, UpdateTableOperation,
+/// };
 /// use delta_kernel::{KernelResult, Engine};
 ///
 /// fn commit(
@@ -168,7 +170,7 @@ pub struct ModeSelectionRequiresDeclarativePlans;
 ///     executor: &dyn ScopedPlanExecutor,
 ///     adds: RelationRef,
 ///     removes: RelationRef,
-/// ) -> KernelResult<CommitResult<UpdateTable, Declarative>> {
+/// ) -> KernelResult<PreparedTransactionCommitResult<UpdateTable>> {
 ///     let mut txn = snapshot
 ///         .update_table(UpdateTableOperation::Write, "connector/1.0", true)
 ///         .with_execution_mode::<Declarative>()
@@ -176,7 +178,7 @@ pub struct ModeSelectionRequiresDeclarativePlans;
 ///         .build(engine, Box::new(FileSystemCommitter::new()))?;
 ///     txn.add_files_ref(adds);
 ///     txn.remove_files_ref(removes);
-///     txn.commit_declarative(executor)
+///     txn.prepare(engine, executor)?.commit(engine, executor)
 /// }
 /// ```
 #[cfg(feature = "declarative-plans")]
@@ -189,7 +191,7 @@ pub struct DeclarativeCommit;
 /// use delta_kernel::plans::{RelationRef, ScopedPlanExecutor};
 /// use delta_kernel::schema::SchemaRef;
 /// use delta_kernel::transaction::create_table::create_table;
-/// use delta_kernel::transaction::{CommitResult, CreateTable, Declarative};
+/// use delta_kernel::transaction::{CreateTable, Declarative, PreparedTransactionCommitResult};
 /// use delta_kernel::{Engine, KernelResult};
 ///
 /// fn create(
@@ -197,13 +199,13 @@ pub struct DeclarativeCommit;
 ///     executor: &dyn ScopedPlanExecutor,
 ///     schema: SchemaRef,
 ///     adds: RelationRef,
-/// ) -> KernelResult<CommitResult<CreateTable, Declarative>> {
+/// ) -> KernelResult<PreparedTransactionCommitResult<CreateTable>> {
 ///     let mut txn = create_table("/path/to/new-table", schema, "connector/1.0", true)
 ///         .with_execution_mode::<Declarative>()
 ///         .with_table_properties([("app.version", "1")])
 ///         .build(engine, Box::new(FileSystemCommitter::new()))?;
 ///     txn.add_files_ref(adds);
-///     txn.commit_declarative(executor)
+///     txn.prepare(engine, executor)?.commit(engine, executor)
 /// }
 /// ```
 #[cfg(feature = "declarative-plans")]
@@ -351,15 +353,40 @@ pub struct ImperativeCannotRemoveFilesRef;
 #[cfg(feature = "declarative-plans")]
 pub struct ImperativeCannotUpdateDeletionVectorsRef;
 
-/// Imperative transactions cannot invoke the declarative commit path.
+/// Imperative transactions cannot invoke the declarative preparation path.
 ///
 /// ```compile_fail,E0599
 /// use delta_kernel::plans::ScopedPlanExecutor;
 /// use delta_kernel::transaction::Transaction;
 ///
-/// fn commit(txn: Transaction, executor: &dyn ScopedPlanExecutor) {
-///     txn.commit_declarative(executor);
+/// fn prepare(
+///     txn: Transaction,
+///     engine: &dyn delta_kernel::Engine,
+///     executor: &dyn ScopedPlanExecutor,
+/// ) {
+///     txn.prepare(engine, executor);
 /// }
 /// ```
 #[cfg(feature = "declarative-plans")]
-pub struct ImperativeTxnWithDeclarativeCommit;
+pub struct ImperativeTxnWithDeclarativePrepare;
+
+/// Preparation consumes the transaction so further file inputs cannot be collected on it.
+///
+/// ```compile_fail,E0382
+/// use delta_kernel::plans::{RelationRef, ScopedPlanExecutor};
+/// use delta_kernel::transaction::{Declarative, Transaction};
+/// use delta_kernel::{Engine, KernelResult};
+///
+/// fn add_after_prepare(
+///     mut txn: Transaction<delta_kernel::transaction::UpdateTable, Declarative>,
+///     engine: &dyn Engine,
+///     executor: &dyn ScopedPlanExecutor,
+///     adds: RelationRef,
+/// ) -> KernelResult<()> {
+///     let prepared = txn.prepare(engine, executor)?;
+///     txn.add_files_ref(adds);
+///     Ok(())
+/// }
+/// ```
+#[cfg(feature = "declarative-plans")]
+pub struct PreparedTransactionConsumesInputs;

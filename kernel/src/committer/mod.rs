@@ -56,11 +56,6 @@ use crate::{Engine, FilteredEngineData, KernelResult, KernelResultIterator};
 ///
 /// [`commit`]: Committer::commit
 /// [`EngineData`]: crate::EngineData
-//
-// Note: While we could omit the Send bound, we keep it here for simplicity - so usage can be
-// Arc<dyn Committer> (instead of Arc<dyn Committer + Send>). If there is a strong case for a !Send
-// Committer then we can remove this bound and possibly just do an alias like CommitterRef =
-// Arc<dyn Committer + Send>.
 pub trait Committer: Send {
     /// Commits actions to the table at the version specified in [`CommitMetadata`].
     ///
@@ -68,6 +63,9 @@ pub trait Committer: Send {
     /// 1. Persisted directly to object storage as published deltas (for filesystem-based tables),
     ///    or
     /// 2. Persisted as per the managing catalog's semantics (for catalog-managed tables)
+    ///
+    /// After a confirmed version conflict, return winning history in [`CommitResponse::Conflict`].
+    /// A history-load failure belongs inside that response, preserving the established conflict.
     fn commit(
         &self,
         engine: &dyn Engine,
@@ -80,7 +78,8 @@ pub trait Committer: Send {
     /// `actions` provides an *ordered* collection of RelationRefs that should be committed.
     /// Each relation must have the same schema and remain valid within the provided `executor`
     /// until this method returns.
-    /// Implementations must also provide the same atomicity and conflict behavior as `commit`.
+    /// Implementations must also provide the same atomicity and bundled-history conflict behavior
+    /// as `commit`.
     #[cfg(feature = "declarative-plans")]
     fn commit_declarative(
         &self,
