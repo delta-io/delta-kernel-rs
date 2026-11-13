@@ -45,7 +45,8 @@ use crate::metrics::events::{
 };
 use crate::metrics::{
     CheckpointWriteMode, CheckpointWriteOutcome, ChecksumWriteOutcome, ChecksumWriteResolutionMode,
-    SnapshotLoadMetricContext, emit_protocol_metadata_load, emit_protocol_metadata_load_failure,
+    MetricId, SnapshotLoadMetricContext, emit_protocol_metadata_load,
+    emit_protocol_metadata_load_failure,
 };
 use crate::path::ParsedLogPath;
 use crate::row_tracking::{ROW_TRACKING_DOMAIN_NAME, parse_row_tracking_high_water_mark};
@@ -1751,8 +1752,13 @@ impl Snapshot {
         parent = &self.span,
         name = "snap.checkpoint",
         skip_all,
-        fields(report, outcome, mode, duration_ns, bytes_written, num_add_files, num_remove_files,
-            num_actions, num_sidecars),
+        fields(report, operation_id = %MetricId::new(), version, outcome, mode, duration_ns,
+            bytes_written, num_add_files, num_remove_files, num_actions, num_sidecars,
+            input_setup_duration_ns, input_read_duration_ns, reconciliation_duration_ns,
+            stats_transform_duration_ns, selection_duration_ns, sidecar_split_duration_ns,
+            num_input_batches, num_log_rows, num_checkpoint_rows, num_add_files_seen,
+            num_remove_files_seen, num_duplicate_file_actions, num_expired_tombstones,
+            num_reconciled_actions, peak_hash_set_size),
         err
     )]
     pub fn checkpoint(
@@ -1762,6 +1768,7 @@ impl Snapshot {
     ) -> Result<(CheckpointWriteResult, SnapshotRef)> {
         let start = Instant::now();
         let span = tracing::Span::current();
+        span.record("version", self.version());
         if self.log_segment.checkpoint_version == Some(self.log_segment.end_version) {
             info!(
                 "Checkpoint already exists for snapshot version {}",
@@ -1817,6 +1824,8 @@ impl Snapshot {
         };
         span.record("mode", mode.as_ref());
 
+        let metrics = crate::checkpoint::metrics::CheckpointMetrics::new(&span);
+        let _metrics_report = metrics.report_on_drop(span.clone());
         let writer = Arc::clone(self).create_checkpoint_writer(engine)?;
 
         let write_result = match spec {
@@ -1825,9 +1834,9 @@ impl Snapshot {
             })) => {
                 let hint =
                     file_actions_per_sidecar_hint.unwrap_or(DEFAULT_FILE_ACTIONS_PER_SIDECAR_HINT);
-                writer.write_v2_checkpoint_with_sidecars(engine, hint)
+                writer.write_v2_checkpoint_with_sidecars(engine, hint, metrics.clone())
             }
-            _ => writer.write_checkpoint_without_sidecars(engine),
+            _ => writer.write_checkpoint_without_sidecars(engine, metrics.clone()),
         };
 
         let info = match write_result {

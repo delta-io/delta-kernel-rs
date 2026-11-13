@@ -43,13 +43,15 @@ fn generate_checkpoint_parts(
     engine: &dyn Engine,
     file_actions_per_sidecar_hint: usize,
 ) -> KernelResult<CheckpointParts> {
-    let (data_iter, output_schema) = writer.checkpoint_data_with_schema(engine)?;
+    let (data_iter, output_schema) =
+        writer.checkpoint_data_with_schema(engine, Default::default())?;
     let iter_state = data_iter.state();
 
     let splitter = SidecarSplitter::new_mut_shared(
         data_iter,
         engine.evaluation_handler().as_ref(),
         output_schema,
+        Default::default(),
     )?;
 
     let sidecars_base = writer.snapshot.log_segment().log_root.join("_sidecars/")?;
@@ -556,7 +558,7 @@ async fn test_generate_sidecars_stats_and_partition_values() -> Result<()> {
     let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
     let writer = snapshot.create_checkpoint_writer(&engine)?;
 
-    let (data_iter, schema) = writer.checkpoint_data_with_schema(&engine)?;
+    let (data_iter, schema) = writer.checkpoint_data_with_schema(&engine, Default::default())?;
     let mut all_batches = Vec::new();
     for batch_result in data_iter {
         let batch = batch_result?;
@@ -649,12 +651,14 @@ async fn test_splitter_no_file_actions() -> Result<()> {
     let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
     let writer = snapshot.create_checkpoint_writer(&engine)?;
 
-    let (data_iter, output_schema) = writer.checkpoint_data_with_schema(&engine)?;
+    let (data_iter, output_schema) =
+        writer.checkpoint_data_with_schema(&engine, Default::default())?;
 
     let splitter = SidecarSplitter::new_mut_shared(
         data_iter,
         engine.evaluation_handler().as_ref(),
         output_schema,
+        Default::default(),
     )?;
 
     let iter = SingleSidecarDataIterator::new(splitter.clone(), usize::MAX)?;
@@ -711,7 +715,12 @@ fn dummy_struct() -> DataType {
 )]
 fn test_splitter_rejects_invalid_schema(#[case] schema: StructType, #[case] expected_msg: &str) {
     let iter = ActionReconciliationIterator::new(Box::new(std::iter::empty()));
-    let result = SidecarSplitter::new(iter, &ArrowEvaluationHandler, Arc::new(schema));
+    let result = SidecarSplitter::new(
+        iter,
+        &ArrowEvaluationHandler,
+        Arc::new(schema),
+        Default::default(),
+    );
     assert!(result.is_err(), "should reject invalid schema");
     let err = result.err().unwrap();
     assert!(
@@ -727,7 +736,9 @@ fn test_single_sidecar_data_iterator_rejects_zero_max_file_actions_hint() {
         nullable "remove": (dummy_struct()),
     };
     let iter = ActionReconciliationIterator::new(Box::new(std::iter::empty()));
-    let splitter = SidecarSplitter::new_mut_shared(iter, &ArrowEvaluationHandler, schema).unwrap();
+    let splitter =
+        SidecarSplitter::new_mut_shared(iter, &ArrowEvaluationHandler, schema, Default::default())
+            .unwrap();
     let result = SingleSidecarDataIterator::new(splitter, 0);
     assert!(result.is_err());
     let err = result.err().unwrap();

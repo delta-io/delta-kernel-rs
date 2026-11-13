@@ -4,6 +4,7 @@ use itertools::Itertools;
 
 use crate::action_reconciliation::ActionReconciliationIterator;
 use crate::actions::{ADD_NAME, REMOVE_NAME, SIDECAR_NAME};
+use crate::checkpoint::metrics::{CheckpointMetrics, CheckpointPhase};
 use crate::engine_data::filter_by_predicate;
 use crate::expressions::{
     Expression, ExpressionStructPatchBuilder, Predicate, Scalar, StructData, col, expr, null_lit,
@@ -150,6 +151,7 @@ pub(super) struct SidecarSplitter {
     non_file_action_batches: Vec<Box<dyn EngineData>>,
     /// Set to `true` when the inner `checkpoint_data_iter` is exhausted.
     exhausted: bool,
+    metrics: CheckpointMetrics,
 }
 
 impl SidecarSplitter {
@@ -157,6 +159,7 @@ impl SidecarSplitter {
         checkpoint_data_iterator: ActionReconciliationIterator,
         eval_handler: &dyn EvaluationHandler,
         checkpoint_data_schema: SchemaRef,
+        metrics: CheckpointMetrics,
     ) -> KernelResult<Self> {
         // Derive sidecar output schema from the checkpoint data schema (add + remove only).
         let add_field = checkpoint_data_schema.field(ADD_NAME).ok_or_else(|| {
@@ -235,6 +238,7 @@ impl SidecarSplitter {
             },
             non_file_action_batches: Vec::new(),
             exhausted: false,
+            metrics,
         })
     }
 
@@ -245,11 +249,13 @@ impl SidecarSplitter {
         checkpoint_data_iterator: ActionReconciliationIterator,
         eval_handler: &dyn EvaluationHandler,
         checkpoint_data_schema: SchemaRef,
+        metrics: CheckpointMetrics,
     ) -> KernelResult<Arc<Mutex<Self>>> {
         Self::new(
             checkpoint_data_iterator,
             eval_handler,
             checkpoint_data_schema,
+            metrics,
         )
         .map(|s| Arc::new(Mutex::new(s)))
     }
@@ -272,10 +278,14 @@ impl SidecarSplitter {
                 self.exhausted = true;
                 None
             })?;
-            let batch = match result.and_then(|f| f.apply_selection_vector()) {
+            let batch = match result.and_then(|f| {
+                let _timer = self.metrics.start(CheckpointPhase::Selection);
+                f.apply_selection_vector()
+            }) {
                 Ok(b) => b,
                 Err(e) => return Some(Err(e)),
             };
+            let _timer = self.metrics.start(CheckpointPhase::SidecarSplit);
             let non_file_actions_batch = match self.non_file_actions_picker.pick(batch.as_ref()) {
                 Ok(b) => b,
                 Err(e) => return Some(Err(e)),

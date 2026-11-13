@@ -330,8 +330,9 @@ mod tests {
 
     use crate::metrics::events::SNAPSHOT_COMPLETED_SPAN;
     use crate::metrics::{
-        CheckpointWriteMode, CheckpointWriteOutcome, CheckpointWriteStats,
-        LastCheckpointReadOutcome, MetricEvent, WithMetricsReporterLayer as _,
+        CheckpointProcessingStats, CheckpointWriteMode, CheckpointWriteOutcome,
+        CheckpointWriteStats, LastCheckpointReadOutcome, MetricEvent, MetricId,
+        WithMetricsReporterLayer as _,
     };
     use crate::unit_test_utils::{CapturingReporter, install_thread_local_metrics_reporter};
 
@@ -449,12 +450,15 @@ mod tests {
         #[values(0u64, 17)] duration_ns: u64,
         #[values(false, true)] fail: bool,
     ) {
+        let operation_id = MetricId::new();
         let reporter = Arc::new(CapturingReporter::default());
         let _guard = install_thread_local_metrics_reporter(reporter.clone());
         {
             let span = info_span!(
                 "snap.checkpoint",
                 report = Empty,
+                operation_id = %operation_id,
+                version = Empty,
                 outcome = Empty,
                 mode = Empty,
                 duration_ns = Empty,
@@ -463,6 +467,21 @@ mod tests {
                 num_remove_files = Empty,
                 num_actions = Empty,
                 num_sidecars = Empty,
+                input_setup_duration_ns = Empty,
+                input_read_duration_ns = Empty,
+                reconciliation_duration_ns = Empty,
+                stats_transform_duration_ns = Empty,
+                selection_duration_ns = Empty,
+                sidecar_split_duration_ns = Empty,
+                num_input_batches = Empty,
+                num_log_rows = Empty,
+                num_checkpoint_rows = Empty,
+                num_add_files_seen = Empty,
+                num_remove_files_seen = Empty,
+                num_duplicate_file_actions = Empty,
+                num_expired_tombstones = Empty,
+                num_reconciled_actions = Empty,
+                peak_hash_set_size = Empty,
             );
             let _entered = span.enter();
             span.record("mode", "v2_with_sidecars");
@@ -472,14 +491,40 @@ mod tests {
             span.record("num_remove_files", 0u64);
             span.record("num_actions", 5u64);
             span.record("num_sidecars", 1u64);
+            for (name, value) in [
+                ("version", 42u64),
+                ("input_setup_duration_ns", 1),
+                ("input_read_duration_ns", 2),
+                ("reconciliation_duration_ns", 3),
+                ("stats_transform_duration_ns", 4),
+                ("selection_duration_ns", 5),
+                ("sidecar_split_duration_ns", 6),
+                ("num_input_batches", 7),
+                ("num_log_rows", 8),
+                ("num_checkpoint_rows", 9),
+                ("num_add_files_seen", 10),
+                ("num_remove_files_seen", 11),
+                ("num_duplicate_file_actions", 12),
+                ("num_expired_tombstones", 13),
+                ("num_reconciled_actions", 14),
+                ("peak_hash_set_size", 15),
+            ] {
+                span.record(name, value);
+            }
             if fail {
                 info!(error = %"injected error");
             }
         }
         let events = reporter.events();
         assert_eq!(events.len(), 1);
-        let (mode, duration) = match (&events[0], fail) {
-            (MetricEvent::CheckpointWriteFailure(event), true) => (event.mode, event.duration),
+        let (mode, duration, id, version, processing) = match (&events[0], fail) {
+            (MetricEvent::CheckpointWriteFailure(event), true) => (
+                event.mode,
+                event.duration,
+                event.operation_id,
+                event.version,
+                event.processing,
+            ),
             (MetricEvent::CheckpointWriteSuccess(event), false) => {
                 assert_eq!(
                     event.outcome,
@@ -493,12 +538,40 @@ mod tests {
                         }
                     }
                 );
-                (event.mode, event.duration)
+                (
+                    event.mode,
+                    event.duration,
+                    event.operation_id,
+                    event.version,
+                    event.processing,
+                )
             }
             (event, _) => panic!("unexpected checkpoint metric: {event:?}"),
         };
         assert_eq!(duration, Duration::from_nanos(duration_ns));
         assert_eq!(mode, CheckpointWriteMode::V2WithSidecars);
+        assert_eq!(id, operation_id);
+        assert_eq!(version, 42);
+        assert_eq!(
+            processing,
+            CheckpointProcessingStats {
+                input_setup_duration: Duration::from_nanos(1),
+                input_read_duration: Duration::from_nanos(2),
+                reconciliation_duration: Duration::from_nanos(3),
+                stats_transform_duration: Duration::from_nanos(4),
+                selection_duration: Duration::from_nanos(5),
+                sidecar_split_duration: Duration::from_nanos(6),
+                num_input_batches: 7,
+                num_log_rows: 8,
+                num_checkpoint_rows: 9,
+                num_add_files_seen: 10,
+                num_remove_files_seen: 11,
+                num_duplicate_file_actions: 12,
+                num_expired_tombstones: 13,
+                num_reconciled_actions: 14,
+                peak_hash_set_size: 15,
+            }
+        );
     }
 
     #[test]

@@ -368,6 +368,10 @@ pub struct TransactionCommitFailure {
 /// A [`delta_kernel::Snapshot::checkpoint`] call returned successfully.
 #[repr(C)]
 pub struct CheckpointWriteSuccess {
+    /// Unique identifier for this checkpoint attempt.
+    pub operation_id: MetricId,
+    /// Snapshot version being checkpointed.
+    pub version: u64,
     /// Whether the call wrote a checkpoint or found one already present.
     pub outcome: CheckpointWriteOutcome,
     /// Selected checkpoint write mode.
@@ -375,16 +379,85 @@ pub struct CheckpointWriteSuccess {
     /// API entry through checkpoint data completion, or an earlier return, in nanoseconds.
     /// Excludes `_last_checkpoint` publication and returned snapshot construction.
     pub duration_ns: u64,
+    /// Work performed while producing checkpoint batches, including on an AlreadyExists return.
+    pub processing: CheckpointProcessingStats,
 }
 
 /// A [`delta_kernel::Snapshot::checkpoint`] call returned an error, including after data writes.
 #[repr(C)]
 pub struct CheckpointWriteFailure {
+    /// Unique identifier for this checkpoint attempt.
+    pub operation_id: MetricId,
+    /// Snapshot version being checkpointed.
+    pub version: u64,
     /// Selected write mode, preserved when the call fails.
     pub mode: CheckpointWriteMode,
     /// API entry through checkpoint data completion, or an earlier error, in nanoseconds.
     /// Excludes `_last_checkpoint` publication and returned snapshot construction.
     pub duration_ns: u64,
+    /// Partial work performed before the error.
+    pub processing: CheckpointProcessingStats,
+}
+
+/// Checkpoint batch processing metrics. Timings exclude pulls from preceding stages and measure
+/// elapsed time, including waits, rather than CPU time. They cover only the instrumented pipeline.
+/// Counts include fully discarded batches and partial work on errors. See
+/// [`delta_kernel::metrics::CheckpointProcessingStats`] for the timing and counting boundaries.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[repr(C)]
+pub struct CheckpointProcessingStats {
+    /// Time creating the log-action input iterator, in nanoseconds.
+    pub input_setup_duration_ns: u64,
+    /// Time advancing input, including reads, decoding, waits, and the final or failing pull.
+    pub input_read_duration_ns: u64,
+    /// Time reconciling actions and constructing selection vectors, in nanoseconds.
+    pub reconciliation_duration_ns: u64,
+    /// Time evaluating statistics and partition-value representation transforms, in nanoseconds.
+    pub stats_transform_duration_ns: u64,
+    /// Time applying reconciliation selection vectors, in nanoseconds.
+    pub selection_duration_ns: u64,
+    /// Time projecting and filtering file/non-file actions for sidecars, in nanoseconds.
+    pub sidecar_split_duration_ns: u64,
+    /// Successfully received input batches, including fully discarded batches.
+    pub num_input_batches: u64,
+    /// Input rows from the log after the previous checkpoint.
+    pub num_log_rows: u64,
+    /// Input rows from the previous checkpoint and its sidecars.
+    pub num_checkpoint_rows: u64,
+    /// Add-file actions encountered before deduplication.
+    pub num_add_files_seen: u64,
+    /// Remove-file actions encountered before deduplication and retention filtering.
+    pub num_remove_files_seen: u64,
+    /// File actions suppressed by a newer action with the same path and deletion-vector ID.
+    pub num_duplicate_file_actions: u64,
+    /// Non-duplicate Remove-file actions discarded by retention filtering.
+    pub num_expired_tombstones: u64,
+    /// Actions selected by reconciliation, excluding generated metadata and sidecar references.
+    pub num_reconciled_actions: u64,
+    /// Peak number of file-action keys held for deduplication, not bytes.
+    pub peak_hash_set_size: u64,
+}
+
+impl From<kernel::CheckpointProcessingStats> for CheckpointProcessingStats {
+    fn from(stats: kernel::CheckpointProcessingStats) -> Self {
+        Self {
+            input_setup_duration_ns: duration_ns(stats.input_setup_duration),
+            input_read_duration_ns: duration_ns(stats.input_read_duration),
+            reconciliation_duration_ns: duration_ns(stats.reconciliation_duration),
+            stats_transform_duration_ns: duration_ns(stats.stats_transform_duration),
+            selection_duration_ns: duration_ns(stats.selection_duration),
+            sidecar_split_duration_ns: duration_ns(stats.sidecar_split_duration),
+            num_input_batches: stats.num_input_batches,
+            num_log_rows: stats.num_log_rows,
+            num_checkpoint_rows: stats.num_checkpoint_rows,
+            num_add_files_seen: stats.num_add_files_seen,
+            num_remove_files_seen: stats.num_remove_files_seen,
+            num_duplicate_file_actions: stats.num_duplicate_file_actions,
+            num_expired_tombstones: stats.num_expired_tombstones,
+            num_reconciled_actions: stats.num_reconciled_actions,
+            peak_hash_set_size: stats.peak_hash_set_size,
+        }
+    }
 }
 
 /// Size and action counts from a successful checkpoint write.
@@ -595,6 +668,10 @@ pub enum MetricEvent {
     LastCheckpointReadCompleted(LastCheckpointReadCompleted),
 }
 
+fn duration_ns(duration: std::time::Duration) -> u64 {
+    duration.as_nanos() as u64
+}
+
 /// Borrow the caller-supplied correlation id as a [`KernelStringSlice`], or an empty slice when
 /// unset. The slice is valid only as long as the source kernel event is alive.
 fn correlation_id_slice(correlation_id: Option<&str>) -> KernelStringSlice {
@@ -612,7 +689,6 @@ impl MetricEvent {
     /// fields.
     pub(crate) fn from_kernel(event: &kernel::MetricEvent) -> Self {
         use kernel::MetricEvent as K;
-        let ns = |d: std::time::Duration| d.as_nanos() as u64;
         match event {
             K::LogSegmentLoadSuccess(kernel::LogSegmentLoadSuccess {
                 operation_id,
@@ -629,7 +705,7 @@ impl MetricEvent {
                 correlation_id: correlation_id_slice(correlation_id.as_deref()),
                 table_type: (*table_type).into(),
                 load_type: (*load_type).into(),
-                duration_ns: ns(*duration),
+                duration_ns: duration_ns(*duration),
                 num_commit_files: *num_commit_files,
                 num_checkpoint_files: *num_checkpoint_files,
                 num_compaction_files: *num_compaction_files,
@@ -661,7 +737,7 @@ impl MetricEvent {
                 table_type: (*table_type).into(),
                 load_type: (*load_type).into(),
                 source: (*source).into(),
-                duration_ns: ns(*duration),
+                duration_ns: duration_ns(*duration),
             }),
             K::ProtocolMetadataLoadFailure(kernel::ProtocolMetadataLoadFailure {
                 operation_id,
@@ -687,7 +763,7 @@ impl MetricEvent {
                 table_type: (*table_type).into(),
                 load_type: (*load_type).into(),
                 version: *version,
-                duration_ns: ns(*duration),
+                duration_ns: duration_ns(*duration),
             }),
             K::SnapshotBuildFailure(kernel::SnapshotBuildFailure {
                 operation_id,
@@ -734,9 +810,9 @@ impl MetricEvent {
                     is_blind_append: *is_blind_append,
                     data_change: *data_change,
                     operation,
-                    prepare_duration_ns: ns(*prepare_duration),
-                    committer_duration_ns: ns(*committer_duration),
-                    total_duration_ns: ns(*total_duration),
+                    prepare_duration_ns: duration_ns(*prepare_duration),
+                    committer_duration_ns: duration_ns(*committer_duration),
+                    total_duration_ns: duration_ns(*total_duration),
                 })
             }
             K::TransactionCommitFailure(kernel::TransactionCommitFailure {
@@ -757,7 +833,7 @@ impl MetricEvent {
             }) => Self::DomainMetadataLoadSuccess(DomainMetadataLoadSuccess {
                 from_cache: *from_cache,
                 num_domains_returned: *num_domains_returned,
-                duration_ns: ns(*duration),
+                duration_ns: duration_ns(*duration),
             }),
             K::DomainMetadataLoadFailure => Self::DomainMetadataLoadFailure,
             K::SetTransactionLoadSuccess(kernel::SetTransactionLoadSuccess {
@@ -767,7 +843,7 @@ impl MetricEvent {
             }) => Self::SetTransactionLoadSuccess(SetTransactionLoadSuccess {
                 from_cache: *from_cache,
                 found: *found,
-                duration_ns: ns(*duration),
+                duration_ns: duration_ns(*duration),
             }),
             K::SetTransactionLoadFailure => Self::SetTransactionLoadFailure,
             K::CrcReadSuccess(kernel::CrcReadSuccess {
@@ -775,7 +851,7 @@ impl MetricEvent {
                 duration,
             }) => Self::CrcReadSuccess(CrcReadSuccess {
                 bytes_read: *bytes_read,
-                duration_ns: ns(*duration),
+                duration_ns: duration_ns(*duration),
             }),
             K::CrcReadFailure => Self::CrcReadFailure,
             K::LastCheckpointReadCompleted(kernel::LastCheckpointReadCompleted {
@@ -783,7 +859,7 @@ impl MetricEvent {
                 duration,
             }) => Self::LastCheckpointReadCompleted(LastCheckpointReadCompleted {
                 outcome: (*outcome).into(),
-                duration_ns: ns(*duration),
+                duration_ns: duration_ns(*duration),
             }),
             K::ChecksumWriteSuccess(kernel::ChecksumWriteSuccess {
                 outcome,
@@ -792,14 +868,14 @@ impl MetricEvent {
             }) => Self::ChecksumWriteSuccess(ChecksumWriteSuccess {
                 outcome: (*outcome).into(),
                 resolution_mode: (*resolution_mode).into(),
-                duration_ns: ns(*duration),
+                duration_ns: duration_ns(*duration),
             }),
             K::ChecksumWriteFailure(kernel::ChecksumWriteFailure {
                 resolution_mode,
                 duration,
             }) => Self::ChecksumWriteFailure(ChecksumWriteFailure {
                 resolution_mode: (*resolution_mode).into(),
-                duration_ns: ns(*duration),
+                duration_ns: duration_ns(*duration),
             }),
             K::JsonReadCompleted(kernel::JsonReadCompleted {
                 num_files,
@@ -837,7 +913,7 @@ impl MetricEvent {
                 correlation_id: correlation_id_slice(correlation_id.as_deref()),
                 table_type: (*table_type).into(),
                 scan_type: (*scan_type).into(),
-                duration_ns: ns(*duration),
+                duration_ns: duration_ns(*duration),
                 num_add_files_seen: *num_add_files_seen,
                 num_add_files_seen_from_delta_files: *num_add_files_seen_from_delta_files,
                 num_selected_add_files: *num_selected_add_files,
@@ -846,15 +922,15 @@ impl MetricEvent {
                 num_non_file_actions: *num_non_file_actions,
                 num_predicate_filtered: *num_predicate_filtered,
                 peak_hash_set_size: *peak_hash_set_size as u64, // note usize -> u64 cast
-                dedup_visitor_time_ns: ns(*dedup_visitor_time),
-                action_transform_time_ns: ns(*action_transform_time),
-                predicate_eval_time_ns: ns(*predicate_eval_time),
+                dedup_visitor_time_ns: duration_ns(*dedup_visitor_time),
+                action_transform_time_ns: duration_ns(*action_transform_time),
+                predicate_eval_time_ns: duration_ns(*predicate_eval_time),
             }),
             K::StorageListCompleted(kernel::StorageListCompleted {
                 duration,
                 num_files,
             }) => Self::StorageListCompleted(StorageListCompleted {
-                duration_ns: ns(*duration),
+                duration_ns: duration_ns(*duration),
                 num_files: *num_files,
             }),
             K::StorageReadCompleted(kernel::StorageReadCompleted {
@@ -862,30 +938,43 @@ impl MetricEvent {
                 num_files,
                 bytes_read,
             }) => Self::StorageReadCompleted(StorageReadCompleted {
-                duration_ns: ns(*duration),
+                duration_ns: duration_ns(*duration),
                 num_files: *num_files,
                 bytes_read: *bytes_read,
             }),
             K::StorageCopyCompleted(kernel::StorageCopyCompleted { duration }) => {
                 Self::StorageCopyCompleted(StorageCopyCompleted {
-                    duration_ns: ns(*duration),
+                    duration_ns: duration_ns(*duration),
                 })
             }
             K::CheckpointWriteSuccess(kernel::CheckpointWriteSuccess {
+                operation_id,
+                version,
                 outcome,
                 mode,
                 duration,
+                processing,
             }) => Self::CheckpointWriteSuccess(CheckpointWriteSuccess {
+                operation_id: (*operation_id).into(),
+                version: *version,
                 outcome: (*outcome).into(),
                 mode: (*mode).into(),
-                duration_ns: ns(*duration),
+                duration_ns: duration_ns(*duration),
+                processing: (*processing).into(),
             }),
-            K::CheckpointWriteFailure(kernel::CheckpointWriteFailure { mode, duration }) => {
-                Self::CheckpointWriteFailure(CheckpointWriteFailure {
-                    mode: (*mode).into(),
-                    duration_ns: ns(*duration),
-                })
-            }
+            K::CheckpointWriteFailure(kernel::CheckpointWriteFailure {
+                operation_id,
+                version,
+                mode,
+                duration,
+                processing,
+            }) => Self::CheckpointWriteFailure(CheckpointWriteFailure {
+                operation_id: (*operation_id).into(),
+                version: *version,
+                mode: (*mode).into(),
+                duration_ns: duration_ns(*duration),
+                processing: (*processing).into(),
+            }),
         }
     }
 }
@@ -962,6 +1051,8 @@ mod tests {
         #[case] expected_mode: CheckpointWriteMode,
         #[values(false, true)] zero_stats: bool,
     ) {
+        let operation_id = kernel::MetricId::new();
+        let (processing, expected_processing) = checkpoint_processing_stats();
         let (bytes, adds, removes, actions, sidecars) = if zero_stats {
             (0, 0, 0, 0, 0)
         } else {
@@ -969,6 +1060,8 @@ mod tests {
             (101, 3, 5, 11 + sidecars, sidecars)
         };
         let event = kernel::MetricEvent::CheckpointWriteSuccess(kernel::CheckpointWriteSuccess {
+            operation_id,
+            version: 42,
             outcome: kernel::CheckpointWriteOutcome::Written {
                 stats: kernel::CheckpointWriteStats {
                     bytes_written: bytes,
@@ -980,6 +1073,7 @@ mod tests {
             },
             mode,
             duration: Duration::from_nanos(123),
+            processing,
         });
 
         with_ffi_event(&event, |ffi| {
@@ -987,6 +1081,9 @@ mod tests {
                 panic!("expected CheckpointWriteSuccess");
             };
             assert_eq!(e.mode, expected_mode);
+            assert_eq!(e.operation_id.bytes, operation_id.as_bytes());
+            assert_eq!(e.version, 42);
+            assert_eq!(e.processing, expected_processing);
             assert_eq!(e.duration_ns, 123);
             assert_eq!(
                 e.outcome,
@@ -1018,32 +1115,95 @@ mod tests {
         #[values(false, true)] failed: bool,
         #[values(0u64, 456)] duration_ns: u64,
     ) {
+        let operation_id = kernel::MetricId::new();
+        let (processing, expected_processing) = checkpoint_processing_stats();
         let duration = Duration::from_nanos(duration_ns);
         let event = if failed {
             kernel::MetricEvent::CheckpointWriteFailure(kernel::CheckpointWriteFailure {
+                operation_id,
+                version: 42,
                 mode,
                 duration,
+                processing,
             })
         } else {
             kernel::MetricEvent::CheckpointWriteSuccess(kernel::CheckpointWriteSuccess {
+                operation_id,
+                version: 42,
                 outcome: kernel::CheckpointWriteOutcome::AlreadyExists,
                 mode,
                 duration,
+                processing,
             })
         };
 
         with_ffi_event(&event, |ffi| {
-            let (mode, duration) = match ffi {
-                MetricEvent::CheckpointWriteFailure(e) if failed => (e.mode, e.duration_ns),
+            let (mode, duration, id, version, processing) = match ffi {
+                MetricEvent::CheckpointWriteFailure(e) if failed => (
+                    e.mode,
+                    e.duration_ns,
+                    e.operation_id,
+                    e.version,
+                    e.processing,
+                ),
                 MetricEvent::CheckpointWriteSuccess(e) if !failed => {
                     assert_eq!(e.outcome, CheckpointWriteOutcome::AlreadyExists);
-                    (e.mode, e.duration_ns)
+                    (
+                        e.mode,
+                        e.duration_ns,
+                        e.operation_id,
+                        e.version,
+                        e.processing,
+                    )
                 }
                 _ => panic!("expected checkpoint success or failure matching the kernel event"),
             };
             assert_eq!(mode, expected_mode);
             assert_eq!(duration, duration_ns);
+            assert_eq!(id.bytes, operation_id.as_bytes());
+            assert_eq!(version, 42);
+            assert_eq!(processing, expected_processing);
         });
+    }
+
+    fn checkpoint_processing_stats()
+    -> (kernel::CheckpointProcessingStats, CheckpointProcessingStats) {
+        (
+            kernel::CheckpointProcessingStats {
+                input_setup_duration: Duration::from_nanos(1),
+                input_read_duration: Duration::from_nanos(2),
+                reconciliation_duration: Duration::from_nanos(3),
+                stats_transform_duration: Duration::from_nanos(4),
+                selection_duration: Duration::from_nanos(5),
+                sidecar_split_duration: Duration::from_nanos(6),
+                num_input_batches: 7,
+                num_log_rows: 8,
+                num_checkpoint_rows: 9,
+                num_add_files_seen: 10,
+                num_remove_files_seen: 11,
+                num_duplicate_file_actions: 12,
+                num_expired_tombstones: 13,
+                num_reconciled_actions: 14,
+                peak_hash_set_size: 15,
+            },
+            CheckpointProcessingStats {
+                input_setup_duration_ns: 1,
+                input_read_duration_ns: 2,
+                reconciliation_duration_ns: 3,
+                stats_transform_duration_ns: 4,
+                selection_duration_ns: 5,
+                sidecar_split_duration_ns: 6,
+                num_input_batches: 7,
+                num_log_rows: 8,
+                num_checkpoint_rows: 9,
+                num_add_files_seen: 10,
+                num_remove_files_seen: 11,
+                num_duplicate_file_actions: 12,
+                num_expired_tombstones: 13,
+                num_reconciled_actions: 14,
+                peak_hash_set_size: 15,
+            },
+        )
     }
 
     #[test]
