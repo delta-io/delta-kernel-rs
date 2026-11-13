@@ -1,0 +1,14 @@
+{
+  "id": "panic",
+  "kind": "synthetic",
+  "title": "refactor: simplify count parsing",
+  "description": "Simplify count parsing without changing error behavior.",
+  "before": {
+    "kernel/src/count.rs": "fn read_count(value: Option<usize>) -> Result<usize, &'static str> {\n    value.ok_or(\"missing count\")\n}\n"
+  },
+  "after": {
+    "kernel/src/count.rs": "fn read_count(value: Option<usize>) -> Result<usize, &'static str> {\n    Ok(value.unwrap())\n}\n"
+  },
+  "reference": {},
+  "candidates": "### Finding C1: Missing counts panic\nClaim: read_count(None) panics instead of returning Err.\nLocation: kernel/src/count.rs, read_count\nSuggested fix: return an error when the count is absent.\n"
+}

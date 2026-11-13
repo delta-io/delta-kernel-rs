@@ -1,0 +1,14 @@
+{
+  "id": "existing",
+  "kind": "synthetic",
+  "title": "refactor: name the parsed count",
+  "description": "Name the validated count; ratio calculation is unchanged.",
+  "before": {
+    "kernel/src/count.rs": "fn read_count(value: Option<usize>) -> Result<usize, &'static str> {\n    value.ok_or(\"missing count\")\n}\n\nfn ratio(total: usize, count: usize) -> usize { total / count }\n"
+  },
+  "after": {
+    "kernel/src/count.rs": "fn read_count(value: Option<usize>) -> Result<usize, &'static str> {\n    let count = value.ok_or(\"missing count\")?;\n    Ok(count)\n}\n\nfn ratio(total: usize, count: usize) -> usize { total / count }\n"
+  },
+  "reference": {},
+  "candidates": "### Finding C1: Zero count panics\nClaim: ratio(1, 0) panics. The function and its callers are unchanged by this patch.\nLocation: kernel/src/count.rs, ratio\nSuggested fix: handle a zero denominator explicitly.\n"
+}
