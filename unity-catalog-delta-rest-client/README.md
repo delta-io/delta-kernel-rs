@@ -7,9 +7,9 @@ A Rust client for the Unity Catalog Delta APIs.
 
 It provides two REST structs:
 
-- `UCDeltaTableClient`: concrete HTTP methods for the connector-driven endpoints:
-  `load_table`, credential vending, `/config`, table and staging-table creation, and
-  metrics reporting.
+- `UCDeltaTableClient`: implements `LoadTableClient` and `GetCredentialsClient` from
+  `unity-catalog-delta-client-api`. Its inherent methods also expose these operations with
+  REST-specific errors, plus `/config`, table and staging-table creation, and metrics reporting.
 - `UCUpdateTableRestClient`: an implementation of the `UpdateTableClient` trait (from
   `unity-catalog-delta-client-api`) against the `update_table` commit endpoint.
 

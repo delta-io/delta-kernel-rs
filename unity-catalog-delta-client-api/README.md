@@ -11,14 +11,16 @@ than on a concrete client.
 
 It provides:
 
+- `LoadTableClient` and `GetCredentialsClient`: traits for loading table metadata and unpublished
+  commits, and vending temporary storage credentials.
 - `UpdateTableClient`: the trait for committing a new version to a UC-managed table, which
   `delta-kernel-unity-catalog`'s `UCCommitter` dispatches through.
 - Serde wire models for the UC Delta Tables endpoints: `load_table`, credential vending, `/config`,
   table and staging-table creation, `update_table`, and metrics reporting.
 
-Only `update_table` (the commit RPC) sits behind a trait. Read and credential-vending flows are
-connector-driven: connectors call concrete client methods, or bring their own HTTP plumbing, then
-hand the responses to `delta-kernel-unity-catalog` helpers.
+Read and credential-vending flows are connector-driven: connectors call the client traits, then
+hand the responses to `delta-kernel-unity-catalog` helpers and their engine's storage configuration.
+The crate documentation includes an example of a connector using both read traits.
 
 [`unity-catalog-delta-rest-client`]: https://github.com/delta-io/delta-kernel-rs/tree/main/unity-catalog-delta-rest-client
 [`delta-kernel-unity-catalog`]: https://github.com/delta-io/delta-kernel-rs/tree/main/delta-kernel-unity-catalog

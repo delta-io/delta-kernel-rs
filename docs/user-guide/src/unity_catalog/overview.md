@@ -39,6 +39,10 @@ responsibility.
 This crate defines the **API contract** for communicating with Unity Catalog. It
 contains no HTTP code or network dependencies. The key types are:
 
+- **`LoadTableClient`** and **`GetCredentialsClient`** traits: load table state
+  and obtain storage credentials. Your connector can use these traits with
+  any catalog transport, then pass the responses to Kernel's snapshot helpers
+  and your engine's storage configuration.
 - **`UpdateTableClient`** trait: commits a new version to a UC-managed table.
   Your implementation calls the UC commits API to ratify a staged commit.
 - **`LoadTableResponse`** / **`TableMetadata`** / **`Commit`**: the response
@@ -59,9 +63,9 @@ gRPC, or in-memory) without changing the code that depends on these traits.
 
 This crate provides the concrete REST-over-HTTP implementations:
 
-- **`UCClient`**: calls the UC Delta-Tables APIs. `load_table` returns a table's
-  metadata plus its inline log tail in one call, `get_table_credentials` vends
-  temporary cloud credentials scoped to the table's storage, and
+- **`UCDeltaTableClient`**: implements `LoadTableClient` and `GetCredentialsClient`
+  over HTTP. `load_table` returns a table's metadata plus its inline log tail,
+  `get_table_credentials` vends temporary cloud credentials, and
   `create_staging_table` / `create_table` reserve and register a new
   catalog-managed table.
 - **`UCUpdateTableRestClient`**: implements `UpdateTableClient` over HTTP. It
@@ -117,8 +121,8 @@ UC crates fill those roles:
 
 | Generic concept | UC implementation |
 |-----------------|-------------------|
-| Load table metadata + log tail | `UCClient::load_table()` |
-| Obtain storage credentials | `UCClient::get_table_credentials()` |
+| Load table metadata + log tail | `LoadTableClient::load_table()` |
+| Obtain storage credentials | `GetCredentialsClient::get_table_credentials()` |
 | Build Snapshot with catalog commits | `snapshot_builder_from_load_table()`, then `build()` |
 | Commit through catalog | `UCCommitter` implements `Committer`: stages a commit, submits it via `UpdateTableClient::update_table()` for UC to ratify, then publishes |
 | Publish staged commits | `UCCommitter::publish()` copies staged files to `_delta_log/` |
@@ -132,8 +136,8 @@ connector reads or writes a UC-managed table.
  ┌───────────────────────────────────────────────────────────┐
  │  Your Connector                                           │
  │                                                           │
- │  1. UCClient::load_table("cat", "schema", "table")        │
- │  2. UCClient::get_table_credentials(.., ReadWrite)        │
+ │  1. client.load_table(&target)                             │
+ │  2. client.get_table_credentials(&target, ReadWrite)       │
  │  3. snapshot_builder_from_load_table(&resp)?.build(..)    │
  │  4. snapshot.update_table(                                │
  │       UpdateTableOperation::Write, engine_info, true)     │
@@ -147,7 +151,8 @@ connector reads or writes a UC-managed table.
  │  delta-rest-     │  │                                     │
  │  client          │  │  snapshot_builder_from_load_table() │
  │                  │  │    load_table resp -> builder       │
- │  UCClient        │  │                                     │
+ │  UCDeltaTable    │  │                                     │
+ │    Client       │  │                                     │
  │    load_table    │  │  UCCommitter                        │
  │    get_table_    │  │    implements Committer trait       │
  │      credentials │  │    stages a commit, submits via     │
@@ -163,8 +168,8 @@ connector reads or writes a UC-managed table.
  │  delta-client-   │  │                                     │
  │  api             │  │  Snapshot, Scan, Transaction        │
  │                  │  │  Committer trait                    │
- │  UpdateTable     │  │  LogPath, SnapshotBuilder           │
- │    Client (trait)│  │                                     │
+ │  Read and write  │  │  LogPath, SnapshotBuilder           │
+ │    client traits│  │                                     │
  │  wire models     │  │  Knows nothing about UC.            │
  └──────────────────┘  └─────────────────────────────────────┘
 ```

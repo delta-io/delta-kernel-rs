@@ -3,8 +3,8 @@ use reqwest::StatusCode;
 use tracing::instrument;
 use unity_catalog_delta_client_api::{
     CatalogConfig, CommitReport, CreateStagingTableRequest, CreateStagingTableResponse,
-    CreateTableRequest, CredentialsResponse, LoadTableResponse, MetricsReport, Operation,
-    ReportMetricsRequest,
+    CreateTableRequest, CredentialsResponse, GetCredentialsClient, LoadTableClient,
+    LoadTableResponse, MetricsReport, Operation, ReportMetricsRequest, TableIdentifier,
 };
 use url::Url;
 
@@ -34,9 +34,13 @@ fn table_path(catalog: &str, schema: &str, table: &str) -> String {
 
 /// Connector-facing HTTP client for the Unity Catalog Delta-Tables API.
 ///
-/// A connector calls this directly for the read and setup path: loading a table, vending storage
-/// credentials, the config handshake, table and staging-table creation, and metrics reporting.
-/// Cheap to clone.
+/// Implements [`LoadTableClient`] and [`GetCredentialsClient`] for connector-driven reads and
+/// storage access. Inherent methods also expose these operations with REST-specific errors,
+/// plus the config handshake, table and staging-table creation, and metrics reporting. Cheap to
+/// clone.
+///
+/// Call the traits through generic bounds or use trait-qualified syntax on a concrete client,
+/// such as `LoadTableClient::load_table(&client, &target)`.
 ///
 /// Committing a new version is a separate path: it goes through the `UpdateTableClient` trait
 /// (implemented by `UCUpdateTableRestClient`), which the kernel committer drives.
@@ -45,6 +49,35 @@ pub struct UCDeltaTableClient {
     http_client: reqwest::Client,
     config: ClientConfig,
     base_url: Url,
+}
+
+impl LoadTableClient for UCDeltaTableClient {
+    async fn load_table(
+        &self,
+        target: &TableIdentifier,
+    ) -> unity_catalog_delta_client_api::Result<LoadTableResponse> {
+        UCDeltaTableClient::load_table(self, &target.catalog, &target.schema, &target.table)
+            .await
+            .map_err(Into::into)
+    }
+}
+
+impl GetCredentialsClient for UCDeltaTableClient {
+    async fn get_table_credentials(
+        &self,
+        target: &TableIdentifier,
+        operation: Operation,
+    ) -> unity_catalog_delta_client_api::Result<CredentialsResponse> {
+        UCDeltaTableClient::get_table_credentials(
+            self,
+            &target.catalog,
+            &target.schema,
+            &target.table,
+            operation,
+        )
+        .await
+        .map_err(Into::into)
+    }
 }
 
 impl UCDeltaTableClient {
