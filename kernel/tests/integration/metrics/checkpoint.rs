@@ -7,7 +7,9 @@ use std::time::{Duration, Instant};
 use delta_kernel::checkpoint::{CheckpointSpec, V2CheckpointConfig};
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::expressions::PredicateRef;
-use delta_kernel::metrics::{CheckpointWriteMode, CheckpointWriteOutcome, MetricEvent};
+use delta_kernel::metrics::{
+    CheckpointProcessingStats, CheckpointWriteMode, CheckpointWriteOutcome, MetricEvent,
+};
 use delta_kernel::object_store::ObjectStoreExt;
 use delta_kernel::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use delta_kernel::schema::SchemaRef;
@@ -52,6 +54,7 @@ async fn checkpoint_reports_reconciled_counts_and_stored_bytes(
     #[case] spec: Option<CheckpointSpec>,
     #[case] mode: CheckpointWriteMode,
     #[case] num_sidecars: u64,
+    #[values(false, true)] previous_checkpoint: bool,
 ) -> delta_kernel::Result<()> {
     let features = if v2 {
         FeatureSet::new().v2_checkpoint()
@@ -60,7 +63,10 @@ async fn checkpoint_reports_reconciled_counts_and_stored_bytes(
     };
     let table = TestTableBuilder::new()
         .with_features(features)
-        .with_log_state(LogState::with_latest_version(2))
+        .with_log_state(
+            LogState::with_latest_version(2)
+                .maybe_with_checkpoint_at(previous_checkpoint.then_some(1)),
+        )
         .with_data(1, 1)
         .build()?;
     let reporter = Arc::new(CapturingReporter::default());
@@ -90,6 +96,19 @@ async fn checkpoint_reports_reconciled_counts_and_stored_bytes(
         panic!("expected CheckpointWriteSuccess");
     };
     assert_eq!(event.mode, mode);
+    let operation_id = event.operation_id;
+    assert_ne!(operation_id.as_bytes(), [0; 16]);
+    assert_eq!(event.version, snapshot.version());
+    let processing = &event.processing;
+    assert_eq!(processing.num_checkpoint_rows > 0, previous_checkpoint);
+    assert!(processing.num_log_rows > 0);
+    // Include input rows discarded by reconciliation.
+    assert!(processing.num_log_rows + processing.num_checkpoint_rows > 4);
+    assert!(processing.input_duration > Duration::ZERO);
+    assert!(processing.reconciliation_duration > Duration::ZERO);
+    assert!(processing.stats_transform_duration > Duration::ZERO);
+    assert!(processing.output_preparation_duration > Duration::ZERO);
+    assert_processing_within_duration(processing, event.duration);
     let CheckpointWriteOutcome::Written { stats } = event.outcome else {
         panic!("expected Written");
     };
@@ -108,7 +127,9 @@ async fn checkpoint_reports_reconciled_counts_and_stored_bytes(
         .iter()
         .filter(|file| {
             let path = file.location.as_ref();
-            path.starts_with("_delta_log/") && path.ends_with(".parquet")
+            path.starts_with("_delta_log/")
+                && path.ends_with(".parquet")
+                && !path.ends_with("00000000000000000001.checkpoint.parquet")
         })
         .collect();
     assert_eq!(checkpoint_files.len() as u64, 1 + num_sidecars);
@@ -143,6 +164,9 @@ async fn checkpoint_reports_reconciled_counts_and_stored_bytes(
     };
     assert_eq!(event.outcome, CheckpointWriteOutcome::AlreadyExists);
     assert_eq!(event.mode, CheckpointWriteMode::NotAttempted);
+    assert_ne!(event.operation_id, operation_id);
+    assert_eq!(event.version, snapshot.version());
+    assert_eq!(event.processing, CheckpointProcessingStats::default());
     Ok(())
 }
 
@@ -213,6 +237,9 @@ async fn invalid_checkpoint_spec_reports_error_without_selecting_mode(
         panic!("expected CheckpointWriteFailure");
     };
     assert_eq!(event.mode, CheckpointWriteMode::NotAttempted);
+    assert_ne!(event.operation_id.as_bytes(), [0; 16]);
+    assert_eq!(event.version, snapshot.version());
+    assert_eq!(event.processing, CheckpointProcessingStats::default());
     Ok(())
 }
 
@@ -242,12 +269,12 @@ async fn checkpoint_duration_includes_data_writes_and_excludes_hint_writes(
 
     let events = checkpoint_events(&reporter);
     assert_eq!(events.len(), 1);
-    let (mode, duration) = if fail_hint {
+    let (mode, duration, processing) = if fail_hint {
         assert!(result.is_err());
         let MetricEvent::CheckpointWriteFailure(event) = &events[0] else {
             panic!("expected CheckpointWriteFailure");
         };
-        (event.mode, event.duration)
+        (event.mode, event.duration, &event.processing)
     } else {
         assert_eq!(result?.0, CheckpointWriteResult::Written);
         let MetricEvent::CheckpointWriteSuccess(event) = &events[0] else {
@@ -257,12 +284,85 @@ async fn checkpoint_duration_includes_data_writes_and_excludes_hint_writes(
             panic!("expected Written");
         };
         assert_eq!(stats.num_add_files, 1);
-        (event.mode, event.duration)
+        (event.mode, event.duration, &event.processing)
     };
     assert_eq!(mode, CheckpointWriteMode::V1);
+    assert_eq!(processing.num_log_rows, 5);
+    assert_eq!(processing.num_checkpoint_rows, 0);
+    assert_processing_within_duration(processing, duration);
     assert!(duration >= checkpoint_delay);
     let hint_duration = engine.json.hint_duration.lock().unwrap().unwrap();
     assert!(total_duration.saturating_sub(duration) >= hint_duration);
+    Ok(())
+}
+
+#[rstest]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn checkpoint_input_timing_includes_setup_sidecar_peek_and_failing_pulls(
+    #[values(false, true)] sidecars: bool,
+    #[values(None, Some(0), Some(1))] fail_after: Option<usize>,
+) -> delta_kernel::Result<()> {
+    let table = TestTableBuilder::new()
+        .with_features(FeatureSet::new().v2_checkpoint())
+        .with_log_state(LogState::with_latest_version(1))
+        .build()?;
+    let inner = checkpoint_engine(&table);
+    let reporter = Arc::new(CapturingReporter::default());
+    let _guard = install_thread_local_metrics_reporter(reporter.clone());
+    let snapshot = Snapshot::builder_for(table.table_root()).build(inner.as_ref())?;
+    let mut engine =
+        ControlledCheckpointEngine::new(inner, Duration::ZERO, None, Duration::ZERO, false);
+    let delay = Duration::from_millis(20);
+    let json = Arc::get_mut(&mut engine.json).unwrap();
+    json.input_delay = delay;
+    json.input_error_after = fail_after;
+    let spec = CheckpointSpec::V2(if sidecars {
+        V2CheckpointConfig::WithSidecar {
+            file_actions_per_sidecar_hint: Some(1),
+        }
+    } else {
+        V2CheckpointConfig::NoSidecar
+    });
+
+    let result = snapshot.checkpoint(&engine, Some(&spec));
+
+    let events = checkpoint_events(&reporter);
+    assert_eq!(events.len(), 1);
+    let (processing, duration, operation_id) = match &events[0] {
+        MetricEvent::CheckpointWriteSuccess(event) if fail_after.is_none() => {
+            assert_eq!(result?.0, CheckpointWriteResult::Written);
+            assert_eq!(event.processing.num_log_rows, 5);
+            (&event.processing, event.duration, event.operation_id)
+        }
+        MetricEvent::CheckpointWriteFailure(event) if fail_after.is_some() => {
+            assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("injected input failure")
+            );
+            let consumed = fail_after.unwrap() as u64;
+            assert_eq!(event.processing.num_log_rows, consumed);
+            (&event.processing, event.duration, event.operation_id)
+        }
+        event => panic!("unexpected checkpoint event: {event:?}"),
+    };
+    assert_eq!(processing.num_checkpoint_rows, 0);
+    // One delay for setup, one per row, and one for the final or failing pull.
+    assert!(processing.input_duration >= delay * (processing.num_log_rows as u32 + 2));
+    assert_processing_within_duration(processing, duration);
+
+    // Reuse the snapshot for a fresh attempt to detect state leaking across calls.
+    let (result, _) = snapshot.checkpoint(engine.inner.as_ref(), Some(&spec))?;
+    assert_eq!(result, CheckpointWriteResult::Written);
+    let events = checkpoint_events(&reporter);
+    assert_eq!(events.len(), 2);
+    let MetricEvent::CheckpointWriteSuccess(event) = &events[1] else {
+        panic!("expected successful retry");
+    };
+    assert_ne!(event.operation_id, operation_id);
+    assert_eq!(event.processing.num_log_rows, 5);
+    assert_eq!(event.processing.num_checkpoint_rows, 0);
     Ok(())
 }
 
@@ -376,13 +476,24 @@ fn checkpoint_events(reporter: &CapturingReporter) -> Vec<MetricEvent> {
         .collect()
 }
 
+fn assert_processing_within_duration(processing: &CheckpointProcessingStats, duration: Duration) {
+    let stages = processing.input_duration
+        + processing.reconciliation_duration
+        + processing.stats_transform_duration
+        + processing.output_preparation_duration;
+    assert!(
+        stages <= duration,
+        "pipeline timers overlap: {processing:?}, total={duration:?}"
+    );
+}
+
 #[derive(Debug, Clone, Copy)]
 enum InjectedWriteError {
     Generic,
     AlreadyExists,
 }
 
-/// Controls checkpoint data and hint writes while delegating reads to the default engine.
+/// Injects input delays/errors and controls writes while delegating data processing to the engine.
 struct ControlledCheckpointEngine {
     inner: Arc<dyn Engine>,
     json: Arc<ControlledJsonHandler>,
@@ -403,6 +514,8 @@ impl ControlledCheckpointEngine {
                 hint_delay,
                 fail_hint,
                 hint_duration: Mutex::new(None),
+                input_delay: Duration::ZERO,
+                input_error_after: None,
             }),
             parquet: Arc::new(ControlledParquetHandler {
                 inner: inner.parquet_handler(),
@@ -437,6 +550,8 @@ struct ControlledJsonHandler {
     hint_delay: Duration,
     fail_hint: bool,
     hint_duration: Mutex<Option<Duration>>,
+    input_delay: Duration,
+    input_error_after: Option<usize>,
 }
 
 impl JsonHandler for ControlledJsonHandler {
@@ -454,8 +569,23 @@ impl JsonHandler for ControlledJsonHandler {
         physical_schema: SchemaRef,
         predicate: Option<PredicateRef>,
     ) -> KernelResult<FileDataReadResultIterator> {
-        self.inner
-            .read_json_files(files, physical_schema, predicate)
+        std::thread::sleep(self.input_delay);
+        let mut input = self
+            .inner
+            .read_json_files(files, physical_schema, predicate)?;
+        let delay = self.input_delay;
+        let fail_after = self.input_error_after;
+        let mut num_pulls = 0;
+        Ok(Box::new(std::iter::from_fn(move || {
+            std::thread::sleep(delay);
+            let fail = fail_after == Some(num_pulls);
+            num_pulls += 1;
+            if fail {
+                Some(Err(KernelError::generic("injected input failure")))
+            } else {
+                input.next()
+            }
+        })))
     }
 
     fn write_json_file(

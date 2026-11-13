@@ -138,10 +138,12 @@ use crate::{
 };
 
 pub(crate) mod collation_stats;
+pub(crate) mod metrics;
 #[cfg(feature = "declarative-plans")]
 mod shape;
 mod sidecar;
 
+use metrics::{CheckpointMetrics, CheckpointPhase};
 #[cfg(feature = "declarative-plans")]
 pub use shape::{CheckpointKind, CheckpointShape};
 use sidecar::{SidecarSplitter, SingleSidecarDataIterator, create_sidecar_action_batch};
@@ -456,7 +458,7 @@ impl CheckpointWriter {
         &self,
         engine: &dyn Engine,
     ) -> KernelResult<ActionReconciliationIterator> {
-        self.checkpoint_data_with_schema(engine)
+        self.checkpoint_data_with_schema(engine, CheckpointMetrics::default())
             .map(|(data, _)| data)
     }
 
@@ -464,12 +466,25 @@ impl CheckpointWriter {
     fn checkpoint_data_with_schema(
         &self,
         engine: &dyn Engine,
+        metrics: CheckpointMetrics,
     ) -> KernelResult<(ActionReconciliationIterator, SchemaRef)> {
-        // Read actions from log segment
-        let actions = self
-            .snapshot
-            .log_segment()
-            .read_actions(engine, self.read_schema.clone())?;
+        let mut actions = {
+            let _timer = metrics.start(CheckpointPhase::Input);
+            self.snapshot
+                .log_segment()
+                .read_actions(engine, self.read_schema.clone())?
+        };
+        let input_metrics = metrics.clone();
+        let actions = std::iter::from_fn(move || {
+            let batch = {
+                let _timer = input_metrics.start(CheckpointPhase::Input);
+                actions.next()
+            };
+            if let Some(Ok(batch)) = &batch {
+                input_metrics.record_input(batch);
+            }
+            batch
+        });
 
         // Process actions through reconciliation
         let mut processor = ActionReconciliationProcessor::new(
@@ -477,8 +492,13 @@ impl CheckpointWriter {
             self.get_transaction_expiration_timestamp()?,
             self.snapshot.table_configuration().dv_normalization_root(),
         );
+        let reconciliation_metrics = metrics.clone();
         let mut checkpoint_data = actions
-            .map(move |batch| processor.process_actions_batch(batch?))
+            .map(move |batch| {
+                let batch = batch?;
+                let _timer = reconciliation_metrics.start(CheckpointPhase::Reconciliation);
+                processor.process_actions_batch(batch)
+            })
             .filter_ok(HasSelectionVector::has_selected_rows);
 
         let context = &self.schema_context;
@@ -512,6 +532,7 @@ impl CheckpointWriter {
         let checkpoint_data = buffered.into_iter().map(Ok).chain(checkpoint_data);
         let transformed = checkpoint_data.map(move |batch_result| {
             let batch = batch_result?;
+            let _timer = metrics.start(CheckpointPhase::StatsTransform);
             let (data, sv) = batch.filtered_data.into_parts();
             let transformed = evaluator.evaluate(data.as_ref())?;
             Ok(ActionReconciliationBatch {
@@ -596,14 +617,17 @@ impl CheckpointWriter {
         &self,
         engine: &dyn Engine,
         file_actions_per_sidecar_hint: usize,
+        metrics: CheckpointMetrics,
     ) -> KernelResult<WrittenCheckpointInfo> {
-        let (data_iter, output_schema) = self.checkpoint_data_with_schema(engine)?;
+        let (data_iter, output_schema) =
+            self.checkpoint_data_with_schema(engine, metrics.clone())?;
         let iter_state = data_iter.state();
 
         let splitter = SidecarSplitter::new_mut_shared(
             data_iter,
             engine.evaluation_handler().as_ref(),
             output_schema.clone(),
+            metrics,
         )?;
 
         // Write sidecar files
@@ -675,11 +699,17 @@ impl CheckpointWriter {
     pub(crate) fn write_checkpoint_without_sidecars(
         &self,
         engine: &dyn Engine,
+        metrics: CheckpointMetrics,
     ) -> KernelResult<WrittenCheckpointInfo> {
         let checkpoint_path = self.checkpoint_path()?;
-        let data_iter = self.checkpoint_data(engine)?;
+        let (data_iter, _) = self.checkpoint_data_with_schema(engine, metrics.clone())?;
         let state = data_iter.state();
-        let lazy_data = data_iter.map(|r| r.and_then(|f| f.apply_selection_vector()));
+        let lazy_data = data_iter.map(move |r| {
+            r.and_then(|f| {
+                let _timer = metrics.start(CheckpointPhase::OutputPreparation);
+                f.apply_selection_vector()
+            })
+        });
         let main_size = engine
             .parquet_handler()
             .write_parquet_file(checkpoint_path.clone(), Box::new(lazy_data))?;
