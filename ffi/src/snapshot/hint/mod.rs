@@ -164,12 +164,10 @@ unsafe fn snapshot_builder_with_snapshot_hint_impl(
         last_checkpoint_hint,
         crc,
         freshness,
-    )?
-    .with_checkpoint_type(
         Option::<&FfiSelectedCheckpointType>::from(&value.checkpoint_type)
             .copied()
             .map(Into::into),
-    );
+    )?;
     builder.snapshot_hint = Some(Box::new(snapshot_hint));
     Ok(())
 }

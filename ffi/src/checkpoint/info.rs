@@ -355,6 +355,7 @@ mod tests {
             last_checkpoint,
             None,
             SnapshotHintFreshness::Unverified,
+            None,
         )
         .unwrap();
         let snapshot = Snapshot::builder_for("memory:///checkpoint-info/")

@@ -109,6 +109,10 @@ impl SnapshotHint {
     /// `publication_watermark` selects path-based inference or an explicit observation that may
     /// no longer be represented by a retained path.
     ///
+    /// `checkpoint_type` retains a known type for the selected checkpoint. Pass `None` if no
+    /// checkpoint was selected or its type has not been resolved. Snapshot construction validates
+    /// a supplied type against the selected checkpoint.
+    ///
     /// # Errors
     ///
     /// Returns an error if `table_root` is invalid,
@@ -129,6 +133,7 @@ impl SnapshotHint {
         last_checkpoint_hint: Option<LastCheckpointHint>,
         crc: Option<Arc<Crc>>,
         freshness: SnapshotHintFreshness,
+        checkpoint_type: Option<SelectedCheckpointType>,
     ) -> KernelResult<Self> {
         let log_root = try_parse_uri(table_root)?.join(DELTA_LOG_DIR_WITH_SLASH)?;
         let mut parsed_paths: Vec<ParsedLogPath> = log_paths.into_iter().map(Into::into).collect();
@@ -160,20 +165,8 @@ impl SnapshotHint {
             last_checkpoint_hint,
             crc,
             freshness,
-            checkpoint_type: None,
+            checkpoint_type,
         })
-    }
-
-    /// Supplies a retained type claim for the selected checkpoint. Snapshot construction validates
-    /// the claim.
-    #[internal_api]
-    #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
-    pub(crate) fn with_checkpoint_type(
-        mut self,
-        checkpoint_type: Option<SelectedCheckpointType>,
-    ) -> Self {
-        self.checkpoint_type = checkpoint_type;
-        self
     }
 
     /// Returns the supplied or captured checkpoint type, if present.
@@ -727,6 +720,7 @@ mod tests {
             None,
             None,
             SnapshotHintFreshness::Unverified,
+            None,
         )
         .unwrap();
 
@@ -763,6 +757,7 @@ mod tests {
             None,
             None,
             SnapshotHintFreshness::Unverified,
+            None,
         )
         .unwrap();
 
@@ -798,6 +793,7 @@ mod tests {
             None,
             None,
             SnapshotHintFreshness::Unverified,
+            None,
         )?;
         let (engine, _store, _table_root) = setup_test();
         assert_log_segment_hint_error(
@@ -829,6 +825,7 @@ mod tests {
             None,
             None,
             SnapshotHintFreshness::Unverified,
+            None,
         );
         assert_result_error_with_message(result, expected_error);
     }
@@ -882,6 +879,7 @@ mod tests {
             None,
             None,
             SnapshotHintFreshness::Unverified,
+            None,
         )
         .map_err(Error::from)
         .and_then(|hint| {
@@ -950,6 +948,7 @@ mod tests {
             None,
             None,
             SnapshotHintFreshness::Unverified,
+            None,
         )
         .unwrap();
         let first_retained_path = hint
@@ -996,6 +995,7 @@ mod tests {
             None,
             None,
             SnapshotHintFreshness::Unverified,
+            None,
         )
         .unwrap();
         let (engine, _store, _table_root) = setup_test();
