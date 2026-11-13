@@ -189,6 +189,10 @@ pub enum Spec {
     Read(ReadSpec),
     #[serde(alias = "snapshot_construction", alias = "snapshot")]
     SnapshotConstruction(Box<SnapshotConstructionSpec>),
+    /// Write a checkpoint at the specified table version.
+    Checkpoint {
+        version: u64,
+    },
 }
 
 /// Specification for a read workload.
@@ -239,6 +243,7 @@ impl Spec {
             Spec::SnapshotConstruction(snapshot_construction_spec) => {
                 snapshot_construction_spec.as_str()
             }
+            Spec::Checkpoint { .. } => "checkpoint",
         }
     }
 
@@ -492,6 +497,7 @@ mod tests {
         Some(-1)
     )]
     #[case(r#"{"type": "read", "version": -1}"#, "read", Some(-1))]
+    #[case(r#"{"type": "checkpoint", "version": 2}"#, "checkpoint", Some(2))]
     fn test_deserialize_spec(
         #[case] json: &str,
         #[case] expected_type: &str,
@@ -510,6 +516,7 @@ mod tests {
                     _ => None,
                 }
             }
+            Spec::Checkpoint { version } => Some(i64::try_from(*version).unwrap()),
         };
 
         assert_eq!(version, expected_version);
