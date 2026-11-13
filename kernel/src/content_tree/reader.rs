@@ -21,10 +21,7 @@ use bytes::Bytes;
 use url::Url;
 
 use crate::actions::{ADD_NAME, ADD_SCHEMA, CheckpointAction, STATS_PARSED};
-use crate::amt_path_util::{
-    amt_location_to_add_path, amt_manifest_filemeta, parse_resolved_amt_location,
-    resolve_amt_location_expression,
-};
+use crate::amt_path_util::{amt_location_to_add_path, amt_manifest_filemeta};
 use crate::cancellation::CancellationTokenRef;
 use crate::content_tree::dv_conversion::{add_deletion_vector_expression, check_deletion_vector};
 use crate::content_tree::mumbling::MumblingBitmap;
@@ -212,13 +209,11 @@ static LEAF_REF_COLUMNS: LazyLock<ColumnNamesAndTypes> = LazyLock::new(|| {
     let (tracking_names, tracking_types) = TRACKING_COLUMNS.as_ref();
     let names = [
         ColumnName::new([LOCATION]),
-        ColumnName::new([RESOLVED_LOCATION_COLUMN]),
         ColumnName::new([FILE_SIZE_IN_BYTES]),
         ColumnName::new([MANIFEST_INFO, MANIFEST_DV]),
         ColumnName::new([MANIFEST_INFO, FORMAT_VERSION]),
     ];
     let types = [
-        DataType::STRING,
         DataType::STRING,
         DataType::LONG,
         DataType::BINARY,
@@ -231,8 +226,12 @@ static LEAF_REF_COLUMNS: LazyLock<ColumnNamesAndTypes> = LazyLock::new(|| {
 
 impl LeafRef {
     /// Parses one root `DataManifest` row from `getters`, which must follow [`LEAF_REF_COLUMNS`]
-    /// order.
-    fn try_from_getters<'a>(row: usize, getters: &[&'a dyn GetData<'a>]) -> KernelResult<Self> {
+    /// order. The raw `location` resolves against `table_root` when relative.
+    fn try_from_getters<'a>(
+        row: usize,
+        getters: &[&'a dyn GetData<'a>],
+        table_root: &Url,
+    ) -> KernelResult<Self> {
         let expected = LEAF_REF_COLUMNS.as_ref().0.len();
         if getters.len() != expected {
             return Err(KernelError::internal_error(format!(
@@ -242,11 +241,9 @@ impl LeafRef {
         }
         let (fields, tracking) = getters.split_at(tracking_start(getters));
         let location: &str = fields[0].get(row, LOCATION)?;
-        let resolved =
-            parse_resolved_amt_location(location, fields[1].get(row, RESOLVED_LOCATION_COLUMN)?)?;
-        let size: i64 = fields[2].get(row, FILE_SIZE_IN_BYTES)?;
-        let file_meta = amt_manifest_filemeta(resolved, location, size, "AMT leaf manifest")?;
-        let manifest_dv: Option<&[u8]> = fields[3].get_opt(row, MANIFEST_DV)?;
+        let size: i64 = fields[1].get(row, FILE_SIZE_IN_BYTES)?;
+        let file_meta = amt_manifest_filemeta(location, size, table_root, "AMT leaf manifest")?;
+        let manifest_dv: Option<&[u8]> = fields[2].get_opt(row, MANIFEST_DV)?;
         let manifest_dv = manifest_dv
             .map(ManifestDv::try_new)
             .transpose()
@@ -261,7 +258,7 @@ impl LeafRef {
             file_meta,
             parent_info: TrackingInfo::try_from_getters(row, tracking)?,
             manifest_dv,
-            format_version: fields[4].get(row, FORMAT_VERSION)?,
+            format_version: fields[3].get(row, FORMAT_VERSION)?,
         })
     }
 
@@ -285,12 +282,12 @@ impl LeafRef {
 struct LeafRefProjection {
     /// Keeps the leaf references of a batch.
     filter: Arc<dyn PredicateEvaluator>,
-    /// Appends [`RESOLVED_LOCATION_COLUMN`] to the kept entries.
-    resolver: Arc<dyn ExpressionEvaluator>,
+    /// The table root relative leaf locations resolve against.
+    table_root: Url,
 }
 
 impl LeafRefProjection {
-    /// Builds the evaluators for root entry batches read with `read_schema`, resolving relative
+    /// Builds the filter for root entry batches read with `read_schema`, resolving relative
     /// locations against `table_root`.
     fn try_new(
         engine: &dyn Engine,
@@ -302,23 +299,20 @@ impl LeafRefProjection {
             read_schema.clone(),
             Arc::new(live_entries_predicate(DataContentType::DataManifest)),
         )?;
-        let resolved = resolve_amt_location_expression(Expression::column([LOCATION]), table_root);
-        let resolve = ProjectionStructPatchBuilder::new(read_schema)
-            .append(
-                StructField::nullable(RESOLVED_LOCATION_COLUMN, DataType::STRING),
-                resolved,
-            )
-            .build()?;
-        let resolver = patch_evaluator(engine, read_schema, &resolve)?;
-        Ok(Self { filter, resolver })
+        Ok(Self {
+            filter,
+            table_root: table_root.clone(),
+        })
     }
 
     /// The [`LeafRef`]s of `entries`, in row order.
     fn leaf_refs(&self, entries: Box<dyn EngineData>) -> KernelResult<Vec<LeafRef>> {
         let live_data_manifests = filter_by_predicate(self.filter.as_ref(), entries)?;
-        let resolved = self.resolver.evaluate(live_data_manifests.as_ref())?;
-        let mut visitor = LeafRefVisitor::default();
-        visitor.visit_rows_of(resolved.as_ref())?;
+        let mut visitor = LeafRefVisitor {
+            table_root: &self.table_root,
+            leaves: Vec::new(),
+        };
+        visitor.visit_rows_of(live_data_manifests.as_ref())?;
         Ok(visitor.leaves)
     }
 }
@@ -426,10 +420,6 @@ const PARENT_SEQUENCE_NUMBER_COLUMN: &str = "_parentSequenceNumber";
 
 /// Column holding whether an entry becomes an `Add` (see [`selected_predicate`]).
 const SELECTED_COLUMN: &str = "_selected";
-
-/// Column holding a root entry's `location` resolved against the table root (see
-/// [`resolve_amt_location_expression`]).
-const RESOLVED_LOCATION_COLUMN: &str = "_resolvedLocation";
 
 /// What a leaf's entries take from the root `DataManifest` entry referencing the leaf, appended to
 /// each entry batch as the [`REMOVED_COLUMN`] and [`PARENT_SEQUENCE_NUMBER_COLUMN`] columns. A root
@@ -1091,19 +1081,21 @@ impl RowVisitor for AddSelectionVisitor {
 }
 
 /// Collects a [`LeafRef`] for every row of a [`LeafRefProjection`] batch, in row order.
-#[derive(Default)]
-struct LeafRefVisitor {
+struct LeafRefVisitor<'u> {
+    /// The table root relative leaf locations resolve against.
+    table_root: &'u Url,
     leaves: Vec<LeafRef>,
 }
 
-impl RowVisitor for LeafRefVisitor {
+impl RowVisitor for LeafRefVisitor<'_> {
     fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
         LEAF_REF_COLUMNS.as_ref()
     }
 
     fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> KernelResult<()> {
         for row in 0..row_count {
-            self.leaves.push(LeafRef::try_from_getters(row, getters)?);
+            let leaf = LeafRef::try_from_getters(row, getters, self.table_root)?;
+            self.leaves.push(leaf);
         }
         Ok(())
     }
@@ -1559,7 +1551,7 @@ mod tests {
         engine: &dyn Engine,
         batches: impl IntoIterator<Item = Box<dyn EngineData>>,
     ) -> KernelResult<Vec<LeafRef>> {
-        let schema = ManifestKind::root().read_schema;
+        let schema = ManifestKind::root(None).read_schema;
         let projection = LeafRefProjection::try_new(engine, &schema, &table_root())?;
         let mut leaves = Vec::new();
         for batch in batches {
@@ -1617,7 +1609,7 @@ mod tests {
     #[test]
     fn leaf_ref_rejects_wrong_getter_count() {
         assert_result_error_with_message(
-            LeafRef::try_from_getters(0, &[]),
+            LeafRef::try_from_getters(0, &[], &table_root()),
             "AMT leaf reference getters, got 0",
         );
     }
