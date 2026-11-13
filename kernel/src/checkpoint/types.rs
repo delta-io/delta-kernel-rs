@@ -7,7 +7,6 @@
 /// Classic-named checkpoints remain unresolved unless matching `_last_checkpoint` schema evidence,
 /// a retained hint claim, or the checkpoint writer establishes their type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-#[non_exhaustive]
 pub enum SelectedCheckpointType {
     /// A checkpoint was selected, but its type was not established during snapshot construction.
     #[default]
