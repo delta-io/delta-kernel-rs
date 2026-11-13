@@ -12,8 +12,8 @@ use super::timestamp_timezone::TimestampTimezone;
 use crate::arrow::array::types::*;
 use crate::arrow::array::{
     self as arrow_array, Array, ArrayBuilder, ArrayData, ArrayRef, AsArray, BooleanArray, Datum,
-    LargeStringArray, ListArray, MapArray, MutableArrayData, NullBufferBuilder, RecordBatch,
-    StringArray, StringArrayType, StructArray, make_array, new_null_array,
+    LargeStringBuilder, ListArray, MapArray, MutableArrayData, NullBufferBuilder, RecordBatch,
+    StringArray, StringArrayType, StringViewBuilder, StructArray, make_array, new_null_array,
 };
 use crate::arrow::buffer::{NullBuffer, OffsetBuffer};
 use crate::arrow::compute::kernels::cast_utils::{Parser, string_to_datetime};
@@ -332,7 +332,7 @@ pub fn evaluate_expression(
             let input = evaluate_expression(expr, batch, None)?;
             match op {
                 ToJson => Ok(to_json(&input)?),
-                UriEncodeFileLocation => map_strings(&input, op, uri_encode_location),
+                UriEncodeFileLocation => map_changed_strings(&input, op, uri_encode_location),
             }
         }
         (Binary(BinaryExpression { op, left, right }), _) => {
@@ -886,17 +886,63 @@ pub fn evaluate_predicate(
     }
 }
 
-/// [`map_string_rows`] collected into a Utf8 array, whatever the input representation.
-fn map_strings<'a, T: AsRef<str>>(
-    input: &'a ArrayRef,
+/// Applies `f` to every non-NULL row of a string array, keeping NULLs and the input's string
+/// representation. Returns `input` itself when `f` borrows every row unchanged. Other array types
+/// are an error naming `op`.
+fn map_changed_strings(
+    input: &ArrayRef,
     op: impl Display,
-    f: impl FnMut(&'a str) -> T,
+    f: impl for<'r> Fn(&'r str) -> Cow<'r, str>,
 ) -> KernelResult<ArrayRef> {
-    let mapped = map_string_rows(input, op, f)?;
-    // Large offsets keep the build from overflowing; the cast to Utf8 then returns an error where
-    // building a Utf8 array directly would panic.
-    let mapped = LargeStringArray::from_iter(mapped);
-    Ok(cast(&mapped, &ArrowDataType::Utf8)?)
+    let mapped = match input.data_type() {
+        ArrowDataType::Utf8 => {
+            let rows = input.as_string::<i32>();
+            let builder = LargeStringBuilder::with_capacity(rows.len(), rows.values().len());
+            // Large offsets keep the build from overflowing; the cast back to Utf8 then returns an
+            // error where building a Utf8 array directly would panic.
+            replay_changed_rows(rows, builder, f)
+                .map(|mapped| cast(&mapped, &ArrowDataType::Utf8))
+                .transpose()?
+        }
+        ArrowDataType::LargeUtf8 => {
+            let rows = input.as_string::<i64>();
+            let builder = LargeStringBuilder::with_capacity(rows.len(), rows.values().len());
+            replay_changed_rows(rows, builder, f)
+        }
+        ArrowDataType::Utf8View => {
+            let rows = input.as_string_view();
+            replay_changed_rows(rows, StringViewBuilder::with_capacity(rows.len()), f)
+        }
+        other => {
+            return Err(KernelError::invalid_expression(format!(
+                "{op} requires a string input, got {other}"
+            )));
+        }
+    };
+    Ok(mapped.unwrap_or_else(|| input.clone()))
+}
+
+/// `rows` with `f` applied, built with `builder`, or `None` when `f` borrows every row unchanged.
+/// Finding the first changed row costs one call of `f` per earlier row and allocates nothing; the
+/// rows before it are then copied as they are.
+fn replay_changed_rows<'a, B>(
+    rows: impl StringArrayType<'a>,
+    mut builder: B,
+    f: impl Fn(&'a str) -> Cow<'a, str>,
+) -> Option<ArrayRef>
+where
+    B: ArrayBuilder + Extend<Option<Cow<'a, str>>>,
+{
+    let first_changed = rows
+        .iter()
+        .position(|row| row.is_some_and(|row| matches!(f(row), Cow::Owned(_))))?;
+    builder.extend(
+        rows.iter()
+            .take(first_changed)
+            .map(|row| row.map(Cow::Borrowed)),
+    );
+    builder.extend(rows.iter().skip(first_changed).map(|row| row.map(&f)));
+    Some(builder.finish())
 }
 
 /// Evaluates [`UnaryPredicateOp::HasUriScheme`] over any string representation.
@@ -2214,32 +2260,64 @@ mod tests {
         assert_eq!(result.values().iter().collect::<Vec<_>>(), expected);
     }
 
+    /// Builds a string array of each representation kernel reads as STRING.
+    type MakeStringArray = fn(Vec<Option<&'static str>>) -> ArrayRef;
+    const STRING_ARRAYS: [MakeStringArray; 3] = [
+        |l| Arc::new(StringArray::from(l)),
+        |l| Arc::new(LargeStringArray::from(l)),
+        |l| Arc::new(StringViewArray::from(l)),
+    ];
+
+    /// The output keeps the input's representation. The first row needing encoding comes after
+    /// unchanged and NULL rows, which are copied as they are.
     #[rstest]
     fn test_uri_encode_path(
-        #[values(
-            |l| Arc::new(StringArray::from(l)) as ArrayRef,
-            |l| Arc::new(LargeStringArray::from(l)) as ArrayRef,
-            |l| Arc::new(StringViewArray::from(l)) as ArrayRef
-        )]
-        make_array: fn(Vec<Option<&'static str>>) -> ArrayRef,
+        #[values(0, 1, 2)] representation: usize,
         #[values(None, Some(&DataType::STRING))] result_type: Option<&'static DataType>,
     ) {
         let locations = vec![
+            Some("data/a.parquet"),
+            None,
             Some("data/a b.parquet"),
             Some("s3://bucket/a#1.parquet"),
-            Some("data/a.parquet"),
+            Some("s3://bucket/b.parquet"),
             None,
         ];
-        let batch = RecordBatch::try_from_iter([("l", make_array(locations))]).unwrap();
+        let input = STRING_ARRAYS[representation](locations);
+        let batch = RecordBatch::try_from_iter([("l", input.clone())]).unwrap();
         let expr = Expr::unary(UnaryExpressionOp::UriEncodeFileLocation, col!("l"));
         let result = evaluate_expression(&expr, &batch, result_type).unwrap();
+        assert_eq!(result.data_type(), input.data_type());
         let expected = StringArray::from(vec![
-            Some("data/a%20b.parquet"),
-            Some("s3://bucket/a%231.parquet"),
             Some("data/a.parquet"),
             None,
+            Some("data/a%20b.parquet"),
+            Some("s3://bucket/a%231.parquet"),
+            Some("s3://bucket/b.parquet"),
+            None,
         ]);
+        let result = cast(&result, &ArrowDataType::Utf8).unwrap();
         assert_eq!(result.as_string::<i32>(), &expected);
+    }
+
+    /// An input with nothing to encode is returned as is. A slice is checked only within its
+    /// bounds, so a row before it that needs encoding does not matter.
+    #[rstest]
+    fn test_uri_encode_path_returns_unchanged_input(
+        #[values(0, 1, 2)] representation: usize,
+        #[values(false, true)] sliced: bool,
+    ) {
+        let unchanged = [Some("data/a.parquet"), None, Some("s3://bucket/a.parquet")];
+        let make_array = STRING_ARRAYS[representation];
+        let input = if sliced {
+            make_array([Some("a b.parquet")].into_iter().chain(unchanged).collect()).slice(1, 3)
+        } else {
+            make_array(unchanged.to_vec())
+        };
+        let batch = RecordBatch::try_from_iter([("l", input.clone())]).unwrap();
+        let expr = Expr::unary(UnaryExpressionOp::UriEncodeFileLocation, col!("l"));
+        let result = evaluate_expression(&expr, &batch, None).unwrap();
+        assert!(Arc::ptr_eq(&result, &input));
     }
 
     #[test]
