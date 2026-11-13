@@ -20,6 +20,9 @@ impl LogSegment {
     }
 
     /// Refines an unresolved type using the protocol already loaded for this snapshot.
+    ///
+    /// Using the snapshot protocol assumes a feature-drop flow has selected a V1 checkpoint
+    /// before removing v2Checkpoint support, even when the selected checkpoint is older.
     pub(crate) fn resolve_checkpoint_type(&mut self, protocol: &Protocol) {
         let (Some(checkpoint), Some(path)) =
             (&mut self.checkpoint, self.listed.checkpoint_parts.first())
@@ -87,6 +90,8 @@ fn infer_checkpoint_type(
     hint: Option<&LastCheckpointHint>,
     protocol: Option<&Protocol>,
 ) -> Option<SelectedCheckpointType> {
+    // The hint's v2Checkpoint field identifies a UUID-named checkpoint; its presence alone
+    // does not establish the specification of a selected classic-named checkpoint.
     match &path.file_type {
         LogPathFileType::MultiPartCheckpoint { .. } => Some(SelectedCheckpointType::V1),
         LogPathFileType::UuidCheckpoint => Some(SelectedCheckpointType::V2),
@@ -164,13 +169,19 @@ mod tests {
     )]
     #[case::v1_schema(
         "00000000000000000000.checkpoint.parquet",
-        Some(schema_ref! { nullable "add": STRING }),
+        Some((0, schema_ref! { nullable "add": STRING })),
         None,
         Some(SelectedCheckpointType::V1)
     )]
     #[case::schema_with_checkpoint_metadata(
         "00000000000000000000.checkpoint.parquet",
-        Some(schema_ref! { nullable "checkpointMetadata": STRING }),
+        Some((0, schema_ref! { nullable "checkpointMetadata": STRING })),
+        None,
+        None
+    )]
+    #[case::different_hint_version(
+        "00000000000000000000.checkpoint.parquet",
+        Some((5, schema_ref! { nullable "add": STRING })),
         None,
         None
     )]
@@ -188,15 +199,15 @@ mod tests {
     )]
     fn checkpoint_type_from_constructor_evidence(
         #[case] filename: &str,
-        #[case] checkpoint_schema: Option<SchemaRef>,
+        #[case] checkpoint_schema: Option<(Version, SchemaRef)>,
         #[case] retained_type: Option<SelectedCheckpointType>,
         #[case] expected: Option<SelectedCheckpointType>,
     ) {
         // Given a log path, optional matching schema evidence, and a retained type.
         let segment = segment(
             filename,
-            checkpoint_schema.map(|schema| LastCheckpointHint {
-                version: 0,
+            checkpoint_schema.map(|(version, schema)| LastCheckpointHint {
+                version,
                 checkpoint_schema: Some(schema),
                 ..Default::default()
             }),
@@ -248,27 +259,42 @@ mod tests {
     }
 
     #[rstest::rstest]
-    #[case("00000000000000000000.json", SelectedCheckpointType::V1)]
-    #[case("00000000000000000000.json", SelectedCheckpointType::V2)]
+    #[case("00000000000000000000.json", SelectedCheckpointType::V1, None)]
+    #[case("00000000000000000000.json", SelectedCheckpointType::V2, None)]
     #[case(
         "00000000000000000000.checkpoint.0000000001.0000000002.parquet",
-        SelectedCheckpointType::V2
+        SelectedCheckpointType::V2,
+        None
     )]
     #[case(
         "00000000000000000000.checkpoint.550e8400-e29b-41d4-a716-446655440000.parquet",
-        SelectedCheckpointType::V1
+        SelectedCheckpointType::V1,
+        None
+    )]
+    #[case::v2_claim_against_v1_schema(
+        "00000000000000000000.checkpoint.parquet",
+        SelectedCheckpointType::V2,
+        Some(schema_ref! { nullable "add": STRING })
     )]
     fn checkpoint_type_rejects_inconsistent_claims(
         #[case] filename: &str,
         #[case] checkpoint_type: SelectedCheckpointType,
+        #[case] checkpoint_schema: Option<SchemaRef>,
     ) {
-        // Given a path whose checkpoint presence or filename contradicts the supplied type.
-        // When the segment is constructed with that type claim.
-        let result = segment(filename, None, Some(checkpoint_type));
-        // Then validation reports a conflicting checkpoint type.
+        // Given: a path whose checkpoint presence, filename, or schema contradicts the claim.
+        let hint = checkpoint_schema.map(|schema| LastCheckpointHint {
+            version: 0,
+            checkpoint_schema: Some(schema),
+            ..Default::default()
+        });
+        // When: the segment is constructed with that type claim.
+        let result = segment(filename, hint, Some(checkpoint_type));
+        // Then: validation reports a conflicting checkpoint type.
+        let error = result.unwrap_err();
         assert!(matches!(
-            result,
-            Err(KernelError::SnapshotHint(error)) if matches!(*error, SnapshotHintError::CheckpointTypeConflict)
+            error.without_backtrace(),
+            KernelError::SnapshotHint(source)
+                if matches!(source.as_ref(), SnapshotHintError::CheckpointTypeConflict)
         ));
     }
 }

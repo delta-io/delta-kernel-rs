@@ -783,9 +783,9 @@ The setter consumes the builder on both success and error, returning its replace
 Prefer mirroring the `kernel/src/` module hierarchy in `ffi/src/` for corresponding APIs.
 Snapshot hints live under `src/snapshot/hint/`, matching `kernel/src/snapshot/hint.rs`.
 Snapshot builders live in `src/snapshot/builder.rs`; selected-checkpoint types live in
-`src/checkpoint/types.rs`, mirroring `kernel/src/checkpoint/types.rs`. Their snapshot getter lives in
-`src/snapshot/mod.rs`. Checkpoint-info types and discovery live in `src/checkpoint/info.rs`, gated
-at the module boundary by `declarative-plans`. Other snapshot accessors live in `src/lib.rs`.
+`src/checkpoint/types.rs`, mirroring `kernel/src/checkpoint/types.rs`. Checkpoint-info types,
+discovery, and the selected-checkpoint type getter live in `src/checkpoint/info.rs`, gated at the
+module boundary by `declarative-plans`. Other snapshot accessors live in `src/lib.rs`.
 FFI-specific ownership, conversion, and engine support code can use its own modules.
 
 ## Key Files

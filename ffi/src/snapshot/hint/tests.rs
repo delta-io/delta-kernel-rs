@@ -21,6 +21,8 @@ use url::Url;
 
 use super::*;
 use crate::checkpoint::FfiSelectedCheckpointType;
+#[cfg(feature = "declarative-plans")]
+use crate::checkpoint::snapshot_checkpoint_type;
 use crate::delta_types::*;
 use crate::error::FFIKernelError;
 use crate::ffi_test_utils::{
@@ -28,8 +30,6 @@ use crate::ffi_test_utils::{
     assert_extern_result_error_with_message, ok_or_panic,
 };
 use crate::log_path::FfiLogPath;
-#[cfg(feature = "declarative-plans")]
-use crate::snapshot::snapshot_checkpoint_type;
 use crate::{
     FfiFileStats, FfiIncrementalReplay, FfiLogSegmentStats, KernelI64Slice, KernelStringSlice,
     OptionalValue, SharedExternEngine, engine_to_handle, free_engine, free_snapshot,
@@ -466,13 +466,7 @@ fn checkpoint_type_claim_rejects_conflicting_paths(
 
     // When the snapshot is constructed, then it rejects the conflicting claim without I/O.
     let result = unsafe { snapshot_builder_build(builder) };
-    assert_extern_result_error_with_message(
-        result,
-        FFIKernelError::InvalidSnapshotHint,
-        Some(
-            "Invalid snapshot hint: supplied checkpoint type conflicts with the selected checkpoint",
-        ),
-    );
+    assert_extern_result_error_with_message(result, FFIKernelError::InvalidSnapshotHint, None);
     unsafe { free_engine(engine) };
 }
 

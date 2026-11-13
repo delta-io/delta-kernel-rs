@@ -1874,7 +1874,10 @@ impl Snapshot {
         })?;
         let checkpoint_type = match mode {
             CheckpointWriteMode::NotAttempted => {
-                unreachable!("a successful checkpoint write selected a mode")
+                return Err(KernelError::internal_error(
+                    "a successful checkpoint write must select a checkpoint mode",
+                )
+                .into());
             }
             CheckpointWriteMode::V1 => SelectedCheckpointType::V1,
             CheckpointWriteMode::V2WithoutSidecars | CheckpointWriteMode::V2WithSidecars => {

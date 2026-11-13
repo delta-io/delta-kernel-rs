@@ -96,7 +96,8 @@ pub struct FfiSnapshotHint {
     /// Optional selected-checkpoint type claim, validated against the supplied paths at build.
     /// Absent leaves the type to be inferred from available evidence or resolved during discovery.
     /// C callers must explicitly set the tag to `NoneFfiSelectedCheckpointType` when absent;
-    /// zero-initializing this field is invalid.
+    /// zero-initializing this field creates an invalid enum payload and causes undefined behavior
+    /// when read.
     pub checkpoint_type: OptionalValue<FfiSelectedCheckpointType>,
 }
 

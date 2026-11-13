@@ -243,7 +243,7 @@ impl<'a> MetadataPlanner<'a> {
         let selected = self.actions.schema(source)?;
         let action_patch =
             SchemaStructPatchBuilder::new().append(StructField::nullable(VERSION, DataType::LONG));
-        // Only file actions require resolving the checkpoint shape and statistics.
+        // Only file actions require resolving checkpoint information and statistics.
         // If there are no file actions, exit early.
         if !self.actions.live_adds {
             return Ok((

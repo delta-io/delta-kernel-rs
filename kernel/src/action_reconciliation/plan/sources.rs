@@ -35,16 +35,16 @@ pub(crate) fn checkpoint_actions(
             PlanBuilder::values(schema, vec![])
         };
     }
-    let shape = checkpoint_info
-        .ok_or_else(|| KernelError::schema("File reads require a checkpoint shape"))?;
-    if shape.kind() == CheckpointKind::Inline {
+    let info = checkpoint_info
+        .ok_or_else(|| KernelError::schema("File reads require checkpoint information"))?;
+    if info.kind() == CheckpointKind::Inline {
         return scan(parts, &[VERSION], schema);
     }
     let constants = parts
         .first()
         .map(|part| part.file_constants.clone())
         .unwrap_or_default();
-    let sidecars = shape.sidecars.iter().map(|file| ScanFile {
+    let sidecars = info.sidecars.iter().map(|file| ScanFile {
         meta: file.clone(),
         file_constants: constants.clone(),
     });
@@ -274,7 +274,8 @@ mod tests {
             .transpose()?
             .flatten();
 
-        // When: selected checkpoint actions are planned from the same resolved shape.
+        // When: selected checkpoint actions are planned from the same resolved checkpoint
+        // information.
         let plan = MetadataPlanner::new(snapshot.log_segment(), actions)
             .with_stats(StatsOptions::json_only())
             .with_checkpoint_info(checkpoint_info)
