@@ -2492,7 +2492,7 @@ mod test {
         let result = config(&[]);
         assert_result_error_with_message(
             result,
-            "Unsupported: Table contains TIMESTAMP_NANOS or TIMESTAMP_NANOS_NTZ columns but does not have the required 'timestampNanos' and 'timestampNtz' features in reader and writer features",
+            "Unsupported: Table contains TIMESTAMP_LTZ(9) or TIMESTAMP_NTZ(9) columns but does not have the required 'timestampNanos' and 'timestampNtz' features in reader and writer features",
         );
 
         let result = config(&[

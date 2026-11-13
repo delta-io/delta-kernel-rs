@@ -965,7 +965,7 @@ impl TryFrom<proto_schema::PrimitiveType> for PrimitiveType {
                     #[cfg(not(feature = "nanosecond-timestamps"))]
                     Simple::TimestampNanos | Simple::TimestampNanosNtz => {
                         return Err(KernelError::schema(
-                            "timestamp_nanos types require the 'nanosecond-timestamps' feature",
+                            "timestamp_ltz(9) and timestamp_ntz(9) types require the 'nanosecond-timestamps' feature",
                         ));
                     }
                     Simple::Unspecified => {

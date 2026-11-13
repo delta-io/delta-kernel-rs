@@ -2012,10 +2012,10 @@ pub enum PrimitiveType {
     #[serde(rename = "timestamp_ntz")]
     TimestampNtz,
     #[cfg(feature = "nanosecond-timestamps")]
-    #[serde(rename = "timestamp_nanos")]
+    #[serde(rename = "timestamp_ltz(9)")]
     TimestampNanos,
     #[cfg(feature = "nanosecond-timestamps")]
-    #[serde(rename = "timestamp_nanos_ntz")]
+    #[serde(rename = "timestamp_ntz(9)")]
     TimestampNanosNtz,
     Void,
     /// Day-time interval: a signed count of microseconds with an ANSI qualifier.
@@ -2386,9 +2386,9 @@ impl<'de> serde::Deserialize<'de> for PrimitiveType {
             "timestamp" => Ok(PrimitiveType::Timestamp),
             "timestamp_ntz" => Ok(PrimitiveType::TimestampNtz),
             #[cfg(feature = "nanosecond-timestamps")]
-            "timestamp_nanos" => Ok(PrimitiveType::TimestampNanos),
+            "timestamp_ltz(9)" => Ok(PrimitiveType::TimestampNanos),
             #[cfg(feature = "nanosecond-timestamps")]
-            "timestamp_nanos_ntz" => Ok(PrimitiveType::TimestampNanosNtz),
+            "timestamp_ntz(9)" => Ok(PrimitiveType::TimestampNanosNtz),
             "void" => Ok(PrimitiveType::Void),
             // Accept canonical and narrowed interval spellings
             s if s.starts_with("interval ") => {
@@ -2472,9 +2472,9 @@ impl Display for PrimitiveType {
             PrimitiveType::Timestamp => write!(f, "timestamp"),
             PrimitiveType::TimestampNtz => write!(f, "timestamp_ntz"),
             #[cfg(feature = "nanosecond-timestamps")]
-            PrimitiveType::TimestampNanos => write!(f, "timestamp_nanos"),
+            PrimitiveType::TimestampNanos => write!(f, "timestamp_ltz(9)"),
             #[cfg(feature = "nanosecond-timestamps")]
-            PrimitiveType::TimestampNanosNtz => write!(f, "timestamp_nanos_ntz"),
+            PrimitiveType::TimestampNanosNtz => write!(f, "timestamp_ntz(9)"),
             PrimitiveType::IntervalYearMonth(dtype) => write!(f, "{dtype}"),
             PrimitiveType::IntervalDayTime(dtype) => write!(f, "{dtype}"),
             PrimitiveType::Decimal(dtype) => {
@@ -3516,6 +3516,18 @@ mod tests {
     #[case("interval minute to minute")]
     // too many fields
     #[case("interval year to month to year")]
+    // only nanosecond precision is supported for parameterized timestamps
+    #[case("timestamp_ltz(6)")]
+    #[case("timestamp_ntz(6)")]
+    #[case("timestamp_ltz(7)")]
+    #[case("timestamp_ntz(7)")]
+    #[case("timestamp_ltz( 9 )")]
+    #[case("timestamp_ltz")]
+    #[case("timestamp(9)")]
+    #[case("timestamp_nanos")]
+    #[case("timestamp_nanos_ntz")]
+    #[cfg_attr(not(feature = "nanosecond-timestamps"), case("timestamp_ltz(9)"))]
+    #[cfg_attr(not(feature = "nanosecond-timestamps"), case("timestamp_ntz(9)"))]
     fn test_unsupported_type_error_message(#[case] unsupported_type: &str) {
         let data = format!(
             r#"{{
@@ -3732,6 +3744,25 @@ mod tests {
         "interval minute to second"
     )]
     fn test_interval_type_name_round_trips(#[case] ptype: PrimitiveType, #[case] name: &str) {
+        assert_eq!(ptype.to_string(), name);
+        assert_eq!(
+            serde_json::to_string(&ptype).unwrap(),
+            format!("\"{name}\"")
+        );
+        assert_eq!(
+            serde_json::from_str::<PrimitiveType>(&format!("\"{name}\"")).unwrap(),
+            ptype
+        );
+    }
+
+    #[cfg(feature = "nanosecond-timestamps")]
+    #[rstest]
+    #[case(PrimitiveType::TimestampNanos, "timestamp_ltz(9)")]
+    #[case(PrimitiveType::TimestampNanosNtz, "timestamp_ntz(9)")]
+    fn test_timestamp_nanos_type_name_round_trips(
+        #[case] ptype: PrimitiveType,
+        #[case] name: &str,
+    ) {
         assert_eq!(ptype.to_string(), name);
         assert_eq!(
             serde_json::to_string(&ptype).unwrap(),

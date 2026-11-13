@@ -7,7 +7,7 @@ use crate::transforms::{SchemaTransform, transform_output_type};
 use crate::utils::require;
 use crate::{KernelError, KernelResult};
 
-/// Validates that if a table schema contains TIMESTAMP_NANOS or TIMESTAMP_NANOS_NTZ columns,
+/// Validates that if a table schema contains TIMESTAMP_LTZ(9) or TIMESTAMP_NTZ(9) columns,
 /// the table must have the TimestampNanos and TimestampNtz features in both reader and writer
 /// features.
 pub(crate) fn validate_timestamp_nanos_feature_support(
@@ -20,7 +20,7 @@ pub(crate) fn validate_timestamp_nanos_feature_support(
         require!(
             !schema_contains_timestamp_nanos(&tc.logical_schema()),
             KernelError::unsupported(
-                "Table contains TIMESTAMP_NANOS or TIMESTAMP_NANOS_NTZ columns but does not have the required 'timestampNanos' and 'timestampNtz' features in reader and writer features"
+                "Table contains TIMESTAMP_LTZ(9) or TIMESTAMP_NTZ(9) columns but does not have the required 'timestampNanos' and 'timestampNtz' features in reader and writer features"
             )
         );
     }
@@ -112,7 +112,7 @@ mod tests {
                 &map_key_schema_with,
                 &map_value_schema_with,
             ],
-            "Table contains TIMESTAMP_NANOS or TIMESTAMP_NANOS_NTZ columns but does not have the required 'timestampNanos' and 'timestampNtz' features in reader and writer features",
+            "Table contains TIMESTAMP_LTZ(9) or TIMESTAMP_NTZ(9) columns but does not have the required 'timestampNanos' and 'timestampNtz' features in reader and writer features",
         );
     }
 }

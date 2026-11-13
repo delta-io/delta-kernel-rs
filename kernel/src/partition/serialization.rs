@@ -205,7 +205,7 @@ fn nanos_to_datetime(nanos: i64, label: &str) -> KernelResult<DateTime<Utc>> {
 #[cfg(feature = "nanosecond-timestamps")]
 /// Formats a timestamp (nanoseconds since epoch) as ISO 8601: "YYYY-MM-DDTHH:MM:SS.fffffffffZ".
 fn format_timestamp_nanos(nanos: i64) -> KernelResult<String> {
-    nanos_to_datetime(nanos, "timestamp_nanos")
+    nanos_to_datetime(nanos, "timestamp_ltz(9)")
         .map(|dt| dt.format("%Y-%m-%dT%H:%M:%S%.9fZ").to_string())
 }
 
@@ -213,7 +213,7 @@ fn format_timestamp_nanos(nanos: i64) -> KernelResult<String> {
 /// Formats a nanosecond timestamp without timezone as "YYYY-MM-DD HH:MM:SS.fffffffff".
 /// Space separator, no Z suffix (there is no timezone).
 fn format_timestamp_nanos_ntz(nanos: i64) -> KernelResult<String> {
-    nanos_to_datetime(nanos, "timestamp_nanos_ntz")
+    nanos_to_datetime(nanos, "timestamp_ntz(9)")
         .map(|dt| dt.naive_utc().format("%Y-%m-%d %H:%M:%S%.9f").to_string())
 }
 

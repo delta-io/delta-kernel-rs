@@ -62,13 +62,13 @@ def write_log(log_dir: Path, file_name: str, file_size: int) -> None:
                 },
                 {
                     "name": "ts",
-                    "type": "timestamp_nanos",
+                    "type": "timestamp_ltz(9)",
                     "nullable": True,
                     "metadata": {},
                 },
                 {
                     "name": "ts_ntz",
-                    "type": "timestamp_nanos_ntz",
+                    "type": "timestamp_ntz(9)",
                     "nullable": True,
                     "metadata": {},
                 },

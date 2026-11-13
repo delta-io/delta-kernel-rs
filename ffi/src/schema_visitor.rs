@@ -563,7 +563,7 @@ pub unsafe extern "C" fn visit_field_interval_day_time(
     unsafe { result.into_extern_result(&*error_allocators) }
 }
 
-/// Visit a timestamp_nanos field. Similar to timestamp but nanosecond resolution.
+/// Visit a `timestamp_ltz(9)` field. Similar to timestamp but nanosecond resolution.
 ///
 /// Returns an error if kernel was not built with the `nanosecond-timestamps` feature.
 ///
@@ -617,7 +617,7 @@ fn visit_field_timestamp_nanos_impl(
     ))
 }
 
-/// Visit a timestamp_nanos_ntz field. Similar to timestamp_ntz but nanosecond resolution.
+/// Visit a `timestamp_ntz(9)` field. Similar to timestamp_ntz but nanosecond resolution.
 ///
 /// Returns an error if kernel was not built with the `nanosecond-timestamps` feature.
 ///

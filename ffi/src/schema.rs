@@ -695,8 +695,8 @@ mod tests {
     visit_simple_type!(visit_date, "date");
     visit_simple_type!(visit_timestamp, "timestamp");
     visit_simple_type!(visit_timestamp_ntz, "timestamp_ntz");
-    visit_simple_type!(visit_timestamp_nanos, "timestamp_nanos");
-    visit_simple_type!(visit_timestamp_nanos_ntz, "timestamp_nanos_ntz");
+    visit_simple_type!(visit_timestamp_nanos, "timestamp_ltz(9)");
+    visit_simple_type!(visit_timestamp_nanos_ntz, "timestamp_ntz(9)");
     visit_simple_type!(visit_interval_year_month, "interval year to month");
     visit_simple_type!(visit_interval_day_time, "interval day to second");
     visit_simple_type!(visit_void, "void");

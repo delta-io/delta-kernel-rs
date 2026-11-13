@@ -346,10 +346,26 @@ DEFINE_VISIT_SIMPLE_TYPE(binary)
 DEFINE_VISIT_SIMPLE_TYPE(date)
 DEFINE_VISIT_SIMPLE_TYPE(timestamp)
 DEFINE_VISIT_SIMPLE_TYPE(timestamp_ntz)
-DEFINE_VISIT_SIMPLE_TYPE(timestamp_nanos)
-DEFINE_VISIT_SIMPLE_TYPE(timestamp_nanos_ntz)
 DEFINE_VISIT_SIMPLE_TYPE(void)
 DEFINE_VISIT_SIMPLE_TYPE(variant)
+
+void visit_timestamp_nanos(void* data,
+                           uintptr_t sibling_list_id,
+                           struct KernelStringSlice name,
+                           bool is_nullable,
+                           const CMetadataMap * metadata)
+{
+  visit_simple_type(data, sibling_list_id, name, is_nullable, metadata, "timestamp_ltz(9)");
+}
+
+void visit_timestamp_nanos_ntz(void* data,
+                               uintptr_t sibling_list_id,
+                               struct KernelStringSlice name,
+                               bool is_nullable,
+                               const CMetadataMap * metadata)
+{
+  visit_simple_type(data, sibling_list_id, name, is_nullable, metadata, "timestamp_ntz(9)");
+}
 
 void visit_interval_year_month(void* data,
                                uintptr_t sibling_list_id,

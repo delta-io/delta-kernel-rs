@@ -592,9 +592,9 @@ pub(crate) enum NullTypeTag {
     IntervalDayTime = 14,
     // Deliberately not feature gated, so timestamp_nanos number allocations are there even
     // if the feature is disabled.
-    /// EXPERIMENTAL. Null of type `timestamp_nanos` (nanoseconds since epoch, UTC-adjusted).
+    /// EXPERIMENTAL. Null of type `timestamp_ltz(9)` (nanoseconds since epoch, UTC-adjusted).
     TimestampNanos = 15,
-    /// EXPERIMENTAL. Null of type `timestamp_nanos_ntz` (nanoseconds since epoch, no timezone).
+    /// EXPERIMENTAL. Null of type `timestamp_ntz(9)` (nanoseconds since epoch, no timezone).
     TimestampNanosNtz = 16,
     /// Sentinel for non-primitive null types (struct, array, map, variant) and void. Emitted by
     /// the kernel-to-engine visitor when the null's type cannot be reconstructed from a compact
