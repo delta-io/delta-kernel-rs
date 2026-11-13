@@ -1490,6 +1490,14 @@ impl Scan {
             self.checkpoint_read_options();
         #[cfg(feature = "adaptive-metadata-in-dev")]
         if let Some(checkpoint) = self.snapshot.latest_checkpoint_action(engine)? {
+            // The scan's stats schema follows the snapshot's schema, which a later commit may have
+            // changed since the checkpoint's `content_stats` were written.
+            let stats_parsed = checkpoint.metadata().schema_string()
+                == self
+                    .snapshot
+                    .table_configuration()
+                    .metadata()
+                    .schema_string();
             return self
                 .snapshot
                 .log_segment()
@@ -1500,6 +1508,7 @@ impl Scan {
                     COMMIT_READ_SCHEMA.clone(),
                     checkpoint_schema,
                     physical_stats_read_schema,
+                    stats_parsed,
                 );
         }
         // Checkpoints already represent reconciled state, so scans project only Add actions. This

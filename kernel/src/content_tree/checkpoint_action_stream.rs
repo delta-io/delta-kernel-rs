@@ -4,9 +4,9 @@ use std::iter;
 
 use super::action_projector::ActionProjector;
 use super::checkpoint_sidecar::read_sidecar_actions;
-use super::reader::{ReadContext, read_add_actions_from_amt};
+use super::reader::{ReadContext, StatsRead, read_add_actions_from_amt};
 use crate::actions::{
-    ADD_NAME, CheckpointAction, DOMAIN_METADATA_NAME, LOG_ADD_SCHEMA, LOG_DOMAIN_METADATA_SCHEMA,
+    ADD_NAME, CheckpointAction, DOMAIN_METADATA_NAME, LOG_DOMAIN_METADATA_SCHEMA,
     LOG_METADATA_SCHEMA, LOG_PROTOCOL_SCHEMA, LOG_TXN_SCHEMA, METADATA_NAME, PROTOCOL_NAME,
     REMOVE_NAME, SET_TRANSACTION_NAME, Sidecar,
 };
@@ -35,8 +35,9 @@ const CHECKPOINT_ACTION_KINDS: &[&str] = &[
 /// itself, and `txn` and `domainMetadata` rows from the action and its sidecars of that kind. A
 /// checkpoint holds reconciled state, so `remove` rows are never produced.
 ///
-/// `stats_schema` is the physical Delta stats schema the caller reads (see
-/// [`ReadContext::stats_schema`]), or `None` to read no stats.
+/// `stats_schema` is the physical Delta stats schema to read from the content tree's
+/// `content_stats` as `add.stats_parsed` (see [`StatsRead::try_new`] for its requirements), or
+/// `None` to read no stats.
 pub(crate) fn read_checkpoint_action(
     engine: &dyn Engine,
     checkpoint: &CheckpointAction,
@@ -131,10 +132,11 @@ fn read_tree_adds(
         // TODO(#2866): inherit each file's commit timestamp instead of a non-zero constant.
         modification_time: 1,
         data_change: false,
-        stats_schema: stats_schema.cloned(),
+        stats: stats_schema
+            .map(|schema| StatsRead::try_new(checkpoint, schema.clone()))
+            .transpose()?,
     };
-    let projector =
-        ActionProjector::try_new(engine, ADD_NAME, LOG_ADD_SCHEMA.clone(), read_schema)?;
+    let projector = ActionProjector::try_new(engine, ADD_NAME, ctx.add_schema(), read_schema)?;
     // The engine's handlers carry any cancellation token bound to this read.
     let adds = read_add_actions_from_amt(engine, checkpoint, &ctx, None)?;
     Ok(Box::new(adds.map(move |batch| {
@@ -284,6 +286,7 @@ mod tests {
                 commit_schema,
                 checkpoint_schema,
                 None,
+                false,
             )?
             .actions
             .map(|batch| {

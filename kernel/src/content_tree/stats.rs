@@ -690,19 +690,8 @@ impl<'a> StatsLeafVisitor<'a> for StatsSchemaCollector {
 // == AMT content_stats -> parsed Delta stats ==
 
 /// Replaces [`CONTENT_STATS_FIELD_NAME`] in `input_schema` with a nullable [`STATS_PARSED`] column
-/// of type `delta_stats_schema`. Other columns pass through. Returns `(output_schema, expression)`.
-///
-/// ```text
-/// numRecords:  long               <- recordCount
-/// nullCount:   {<table nesting>}  <- content_stats.<leaf>.null_value_count
-/// minValues:   {<table nesting>}  <- content_stats.<leaf>.lower_bound
-/// maxValues:   {<table nesting>}  <- content_stats.<leaf>.upper_bound
-/// tightBounds: boolean            <- false
-/// ```
-///
-/// `content_stats` must have been read with [`projected_stats_schema`] for the same `table_schema`
-/// and `delta_stats_schema`. A leaf without a `content_stats` entry (array/map columns,
-/// out-of-range field IDs) yields null.
+/// of type `delta_stats_schema` (see [`parsed_stats_expression`]). Other columns pass through.
+/// Returns `(output_schema, expression)`.
 pub(crate) fn build_parsed_stats_expression(
     table_schema: &StructType,
     delta_stats_schema: &StructType,
@@ -726,14 +715,37 @@ pub(crate) fn build_parsed_stats_expression(
         )));
     }
 
-    let scopes = CategoryScopes::from_delta_stats_schema(delta_stats_schema)?;
-    let root = StatsLeafWalker::walk(table_schema, Some(scopes), &ParsedStatsExprBuilder)?;
-    let stats_expr = assemble_parsed_stats_expr(root, delta_stats_schema, &scopes)?;
-
+    let stats_expr = parsed_stats_expression(table_schema, delta_stats_schema)?;
     let output_field = StructField::nullable(STATS_PARSED, delta_stats_schema.clone());
     ProjectionStructPatchBuilder::new(input_schema)
         .replace(CONTENT_STATS_FIELD_NAME, output_field, Arc::new(stats_expr))
         .build()
+}
+
+/// Builds the expression evaluating an AMT entry row to its Delta stats, a struct of type
+/// `delta_stats_schema`:
+///
+/// ```text
+/// numRecords:  long               <- recordCount
+/// nullCount:   {<table nesting>}  <- content_stats.<leaf>.null_value_count
+/// minValues:   {<table nesting>}  <- content_stats.<leaf>.lower_bound
+/// maxValues:   {<table nesting>}  <- content_stats.<leaf>.upper_bound
+/// tightBounds: boolean            <- false
+/// ```
+///
+/// `content_stats` must have been read with [`projected_stats_schema`] for the same `table_schema`
+/// and `delta_stats_schema`. A leaf without a `content_stats` entry (array/map columns,
+/// out-of-range field IDs) yields null, so the expression reads no `content_stats` when none of
+/// the requested stats are recorded there.
+///
+/// Every column of `delta_stats_schema` must be a column of `table_schema`, in table order.
+pub(crate) fn parsed_stats_expression(
+    table_schema: &StructType,
+    delta_stats_schema: &StructType,
+) -> KernelResult<Expression> {
+    let scopes = CategoryScopes::from_delta_stats_schema(delta_stats_schema)?;
+    let root = StatsLeafWalker::walk(table_schema, Some(scopes), &ParsedStatsExprBuilder)?;
+    assemble_parsed_stats_expr(root, delta_stats_schema, &scopes)
 }
 
 /// A built child expression and the name of the output field it fills.
