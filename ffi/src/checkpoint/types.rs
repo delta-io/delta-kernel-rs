@@ -19,9 +19,9 @@ pub enum FfiSelectedCheckpointType {
 impl From<SelectedCheckpointType> for FfiSelectedCheckpointType {
     fn from(value: SelectedCheckpointType) -> Self {
         match value {
+            SelectedCheckpointType::Unresolved => Self::Unresolved,
             SelectedCheckpointType::V1 => Self::V1,
             SelectedCheckpointType::V2 => Self::V2,
-            _ => Self::Unresolved,
         }
     }
 }
