@@ -47,6 +47,7 @@ pub(crate) struct CollationStatsReadTransform {
 pub(crate) fn build_collation_stats_read_transform(
     requested: &StructType,
     source: Option<&StructField>,
+    stats_json_op: UnaryExpressionOp,
 ) -> KernelResult<Option<CollationStatsReadTransform>> {
     if !requested.contains_col(["add", "stats"]) {
         return Ok(None);
@@ -75,7 +76,7 @@ pub(crate) fn build_collation_stats_read_transform(
     );
     let json = Expression::coalesce([
         col!("add.stats"),
-        Expression::unary(UnaryExpressionOp::ToJson, col!("add.stats_parsed")),
+        Expression::unary(stats_json_op, col!("add.stats_parsed")),
     ]);
     let mut patch = ProjectionStructPatchBuilder::new(&read_schema).replace_expr_at(
         ["add"],
@@ -227,12 +228,13 @@ mod tests {
     use super::*;
     use crate::action_reconciliation::file_metadata::build_checkpoint_read_schema;
     use crate::action_reconciliation::log_replay::ActionReconciliationProcessor;
-    use crate::actions::{Metadata, Protocol};
+    use crate::actions::{LOG_ADD_SCHEMA, MIN_VALUES, Metadata, Protocol};
     use crate::arrow::array::StringArray;
     use crate::checkpoint::{CHECKPOINT_ACTIONS_SCHEMA_V1, CheckpointWriter};
     use crate::engine::arrow_utils::to_json_bytes;
     use crate::engine::sync::SyncEngine;
     use crate::engine_data::FilteredEngineData;
+    use crate::log_segment::CheckpointReadOptions;
     use crate::object_store::DynObjectStore;
     use crate::object_store::memory::InMemory;
     use crate::scan::StatsOptions;
@@ -558,16 +560,129 @@ mod tests {
             StructField::nullable(COLLATION_STATS, schema! { nullable "custom.ci.1": STRING });
         let requested = schema! { nullable "add": { nullable "stats": STRING } };
         assert!(
-            build_collation_stats_read_transform(&requested, None)
+            build_collation_stats_read_transform(&requested, None, UnaryExpressionOp::TO_JSON)
                 .unwrap()
                 .is_none()
         );
         let requested = schema! { nullable "add": { nullable "path": STRING } };
         assert!(
-            build_collation_stats_read_transform(&requested, Some(&source))
-                .unwrap()
-                .is_none()
+            build_collation_stats_read_transform(
+                &requested,
+                Some(&source),
+                UnaryExpressionOp::TO_JSON
+            )
+            .unwrap()
+            .is_none()
         );
+    }
+
+    #[rstest]
+    #[case::millisecond(UnaryExpressionOp::TO_JSON, "2026-07-02T15:55:55.298Z")]
+    #[case::full_precision(
+        UnaryExpressionOp::ToJson { full_precision_timestamps: true },
+        "2026-07-02T15:55:55.298677Z"
+    )]
+    fn read_transform_rebuilds_json_with_stats_json_op(
+        #[case] stats_json_op: UnaryExpressionOp,
+        #[case] expected_bound: &str,
+    ) -> Result<()> {
+        let source =
+            StructField::nullable(COLLATION_STATS, schema! { nullable "custom.ci.1": STRING });
+        let requested = schema! {
+            nullable "add": {
+                nullable "stats": STRING,
+                nullable "stats_parsed": { nullable MIN_VALUES: { nullable "ts": TIMESTAMP } },
+            },
+        };
+        let transform =
+            build_collation_stats_read_transform(&requested, Some(&source), stats_json_op)?
+                .unwrap();
+
+        let engine = SyncEngine::new();
+        let parsed_stats = json!({ MIN_VALUES: { "ts": "2026-07-02T15:55:55.298677Z" } });
+        let input = parse_actions(
+            &engine,
+            transform.read_schema.clone(),
+            &[json!({ "add": { "stats": null, "stats_parsed": parsed_stats } })],
+        )?;
+        let output = engine
+            .evaluation_handler()
+            .new_expression_evaluator(
+                transform.read_schema,
+                transform.expression,
+                transform.output_schema.as_ref().clone().into(),
+            )?
+            .evaluate(input.as_ref())?;
+        let rows = json_rows([Ok(FilteredEngineData::with_all_rows_selected(output))].into_iter())?;
+        let stats: Value = serde_json::from_str(rows[0]["add"]["stats"].as_str().unwrap())
+            .map_err(KernelError::from)?;
+        assert_eq!(stats[MIN_VALUES]["ts"], expected_bound, "{stats}");
+        Ok(())
+    }
+
+    #[rstest]
+    #[case::millisecond(UnaryExpressionOp::TO_JSON, "2026-07-02T15:55:55.298Z")]
+    #[case::full_precision(
+        UnaryExpressionOp::ToJson { full_precision_timestamps: true },
+        "2026-07-02T15:55:55.298677Z"
+    )]
+    #[tokio::test]
+    async fn checkpoint_read_rebuilds_collation_json_with_stats_json_op(
+        #[case] stats_json_op: UnaryExpressionOp,
+        #[case] expected_bound: &str,
+    ) -> Result<()> {
+        let store: Arc<DynObjectStore> = Arc::new(InMemory::new());
+        let engine = SyncEngine::new_with_store(store.clone());
+        let table_schema = schema_ref! { nullable "ts": TIMESTAMP, (collated_field("other")) };
+        let metadata = Metadata::try_new(None, None, table_schema, vec![], 0, HashMap::new())?;
+        let protocol = Protocol::try_new_modern(Vec::<&str>::new(), ["collations"])?;
+        let mut actions = vec![
+            json!({ "protocol": protocol }),
+            json!({ "metaData": metadata }),
+        ];
+        commit(store.as_ref(), 0, &actions).await;
+        let mut add = add_action("a.parquet", json!({}));
+        add["add"]["stats_parsed"] = json!({
+            MIN_VALUES: { "ts": "2026-07-02T15:55:55.298677Z" },
+            COLLATION_STATS: { "ICU.en_US.72": { "minValues": { "other": "B" } } },
+        });
+        actions.push(add);
+        let ts_stats = schema! { nullable MIN_VALUES: { nullable "ts": TIMESTAMP } };
+        let source = SchemaStructPatchBuilder::new()
+            .append(StructField::nullable(
+                COLLATION_STATS,
+                schema! {
+                    nullable "ICU.en_US.72": { nullable "minValues": { nullable "other": STRING } },
+                },
+            ))
+            .build(&ts_stats)?;
+        write_checkpoint_rows(&engine, source, &actions, false)?;
+        let snapshot = Snapshot::builder_for("memory:///").build(&engine)?;
+
+        let options = CheckpointReadOptions {
+            stats_schema: Some(&ts_stats),
+            stats_json_op,
+            ..Default::default()
+        };
+        let batches = snapshot
+            .log_segment()
+            .read_actions_with_projected_checkpoint_actions(
+                &engine,
+                LOG_ADD_SCHEMA.clone(),
+                LOG_ADD_SCHEMA.clone(),
+                options,
+            )?
+            .actions
+            .map(|batch| Ok(FilteredEngineData::with_all_rows_selected(batch?.actions)));
+        let adds = json_rows(batches)?
+            .into_iter()
+            .filter(|row| !row["add"].is_null())
+            .collect_vec();
+        assert_eq!(adds.len(), 1);
+        let stats: Value = serde_json::from_str(adds[0]["add"]["stats"].as_str().unwrap())
+            .map_err(KernelError::from)?;
+        assert_eq!(stats[MIN_VALUES]["ts"], expected_bound, "{stats}");
+        Ok(())
     }
 
     #[rstest]
