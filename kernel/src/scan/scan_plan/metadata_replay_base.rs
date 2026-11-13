@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use crate::actions::Add;
-use crate::checkpoint::CheckpointShape;
+use crate::checkpoint::CheckpointInfo;
 use crate::{Engine, KernelResult, Snapshot, Version};
 
 /// Reconciled table state from which metadata replay starts.
@@ -11,14 +11,15 @@ pub(in crate::scan) enum MetadataReplayBase {
     /// Checkpoint replay base, or an empty base when no checkpoint exists.
     Checkpoint {
         version: Option<Version>,
-        shape: Option<Arc<CheckpointShape>>,
+        info: Option<Arc<CheckpointInfo>>,
     },
 }
 
 impl MetadataReplayBase {
-    /// Select the newest eligible metadata base and resolve checkpoint shape only when needed.
+    /// Select the newest eligible metadata base and resolve checkpoint information only when
+    /// needed.
     pub(in crate::scan) fn try_new(snapshot: &Snapshot, engine: &dyn Engine) -> KernelResult<Self> {
-        let checkpoint_version = snapshot.log_segment().checkpoint_version;
+        let checkpoint_version = snapshot.log_segment().checkpoint_version();
         // Keep replay eligibility independent of SnapshotCrc's validation.
         if let Some((version, files)) = snapshot
             .base_crc()
@@ -33,10 +34,10 @@ impl MetadataReplayBase {
             });
         }
 
-        let shape = snapshot.checkpoint_info(engine)?;
+        let info = snapshot.checkpoint_info(engine)?;
         Ok(Self::Checkpoint {
             version: checkpoint_version,
-            shape,
+            info,
         })
     }
 
@@ -80,7 +81,7 @@ mod tests {
             .at_version(version)
             .build(engine.as_ref())?;
         assert_eq!(
-            snapshot.log_segment().checkpoint_version,
+            snapshot.log_segment().checkpoint_version(),
             checkpoint_version
         );
         let mut crc = snapshot.crc_at_version().expect("fixture CRC").clone();

@@ -99,14 +99,14 @@ async fn replay_selects_latest_action_without_retention(
         .await;
     // When: shared replay reads the requested actions using complete checkpoint discovery.
     let snapshot = build_snapshot!(VersionTarget::Latest, &table_root, &engine);
-    let checkpoint_shape = actions
+    let checkpoint_info = actions
         .live_adds
         .then(|| snapshot.checkpoint_info(&engine))
         .transpose()?
         .flatten();
     let state = MetadataPlanner::new(snapshot.log_segment(), actions)
         .with_stats(StatsOptions::json_only())
-        .with_checkpoint_shape(checkpoint_shape)
+        .with_checkpoint_info(checkpoint_info)
         .replay()?;
     // Then: each requested payload and version comes from its latest action.
     let names = actions.output_action_names().collect::<Vec<_>>();

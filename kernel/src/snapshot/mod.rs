@@ -21,10 +21,10 @@ use crate::actions::visitors::SetTransactionMap;
 use crate::actions::{CheckpointAction, LastManifestCommit};
 use crate::actions::{DomainMetadata, INTERNAL_DOMAIN_PREFIX, LOG_DOMAIN_METADATA_SCHEMA};
 #[cfg(feature = "declarative-plans")]
-use crate::checkpoint::CheckpointShape;
+use crate::checkpoint::CheckpointInfo;
 use crate::checkpoint::{
-    CheckpointSpec, CheckpointWriter, DEFAULT_FILE_ACTIONS_PER_SIDECAR_HINT, V2CheckpointConfig,
-    ensure_standalone_checkpoint_supported,
+    CheckpointSpec, CheckpointWriter, DEFAULT_FILE_ACTIONS_PER_SIDECAR_HINT,
+    SelectedCheckpointType, V2CheckpointConfig, ensure_standalone_checkpoint_supported,
 };
 use crate::clustering::{CLUSTERING_DOMAIN_NAME, ClusteringColumnInfo, parse_clustering_columns};
 use crate::committer::{Committer, PublishMetadata};
@@ -74,6 +74,7 @@ mod hint;
 mod incremental;
 mod reader;
 mod snapshot_crc;
+
 #[cfg(test)]
 mod tracing_tests;
 #[doc(hidden)]
@@ -133,7 +134,7 @@ pub struct Snapshot {
     skipped_new_checkpoints: bool,
     /// Complete state for the frozen segment. Shared with scan plans; failed reads are not cached.
     #[cfg(feature = "declarative-plans")]
-    checkpoint_info: OnceLock<Option<Arc<CheckpointShape>>>,
+    checkpoint_info: OnceLock<Option<Arc<CheckpointInfo>>>,
     #[cfg(feature = "declarative-plans")]
     checkpoint_info_init: Mutex<()>,
     /// This snapshot's latest AMT `checkpoint` action (see
@@ -283,7 +284,7 @@ impl Snapshot {
         Ok(SnapshotCrc::try_new(
             crc,
             table_configuration.version(),
-            log_segment.checkpoint_version,
+            log_segment.checkpoint_version(),
         )?)
     }
 
@@ -294,7 +295,7 @@ impl Snapshot {
     /// at the snapshot version takes precedence, since it records the value authoritatively,
     /// including its absence.
     fn new_with_validated_crc(
-        log_segment: LogSegment,
+        mut log_segment: LogSegment,
         table_configuration: TableConfiguration,
         crc: SnapshotCrc,
         built_as_latest: bool,
@@ -305,6 +306,7 @@ impl Snapshot {
         #[cfg(feature = "adaptive-metadata-in-dev")]
         last_manifest_commit: LastManifestCommitResolution,
     ) -> Self {
+        log_segment.resolve_checkpoint_type(table_configuration.protocol());
         let span = tracing::info_span!(
             parent: tracing::Span::none(),
             "snap",
@@ -341,7 +343,7 @@ impl Snapshot {
 
     /// Returns only completed metadata, without waiting for or starting checkpoint discovery.
     #[cfg(feature = "declarative-plans")]
-    pub(crate) fn cached_checkpoint_info(&self) -> Option<&Option<Arc<CheckpointShape>>> {
+    pub(crate) fn cached_checkpoint_info(&self) -> Option<&Option<Arc<CheckpointInfo>>> {
         self.checkpoint_info.get()
     }
 
@@ -350,7 +352,7 @@ impl Snapshot {
     pub(crate) fn checkpoint_info(
         &self,
         engine: &dyn Engine,
-    ) -> KernelResult<Option<Arc<CheckpointShape>>> {
+    ) -> KernelResult<Option<Arc<CheckpointInfo>>> {
         if let Some(resolved) = self.checkpoint_info.get() {
             return Ok(resolved.clone());
         }
@@ -368,7 +370,7 @@ impl Snapshot {
             None
         } else {
             let executor = engine.require_plan_executor()?;
-            CheckpointShape::resolve(executor.as_ref(), self.log_segment())?.map(Arc::new)
+            CheckpointInfo::resolve(executor.as_ref(), self.log_segment())?.map(Arc::new)
         };
         // All initializers hold the mutex; publish only after every fallible operation succeeds.
         let _ = self.checkpoint_info.set(resolved.clone());
@@ -536,7 +538,7 @@ impl Snapshot {
             None => log_segment
                 .read_protocol_metadata_opt(engine, base_crc.as_ref())
                 .map_err(|error| {
-                    match (error.without_backtrace(), log_segment.checkpoint_version) {
+                    match (error.without_backtrace(), log_segment.checkpoint_version()) {
                         (KernelError::FileNotFound(_), Some(checkpoint)) => {
                             Error::Delta(DeltaError::log_file_not_found(
                                 log_segment.end_version,
@@ -681,10 +683,21 @@ impl Snapshot {
         self.log_segment.stats()
     }
 
+    /// Returns a known checkpoint type without starting or waiting for discovery.
+    pub(crate) fn known_checkpoint_type(&self) -> Option<SelectedCheckpointType> {
+        #[cfg(feature = "declarative-plans")]
+        if let Some(info) = self.cached_checkpoint_info() {
+            return info.as_ref().map(|info| info.checkpoint_type());
+        }
+        self.log_segment.checkpoint_type()
+    }
+
     /// Captures retained snapshot state as an owned hint without engine I/O.
     ///
     /// The hint preserves whether this snapshot was built as latest, not whether it is still
     /// latest. Missing checkpoint hints and CRCs at this snapshot's version remain absent.
+    /// The hint includes the selected checkpoint type when already known; export does not
+    /// trigger checkpoint discovery.
     /// Rebuild it with [`SnapshotBuilder::with_snapshot_hint`] for the same table root.
     ///
     /// # Errors
@@ -1654,7 +1667,7 @@ impl Snapshot {
         }
 
         // Case 3: no CRC, but a checkpoint to root at.
-        if let Some(checkpoint_version) = log_segment.checkpoint_version {
+        if let Some(checkpoint_version) = log_segment.checkpoint_version() {
             record_root("checkpoint", ChecksumWriteResolutionMode::Full);
             if checkpoint_version == end {
                 // A checkpoint carries no ICT or lastManifestCommit (it has no commitInfo). Since
@@ -1762,7 +1775,7 @@ impl Snapshot {
     ) -> Result<(CheckpointWriteResult, SnapshotRef)> {
         let start = Instant::now();
         let span = tracing::Span::current();
-        if self.log_segment.checkpoint_version == Some(self.log_segment.end_version) {
+        if self.log_segment.checkpoint_version() == Some(self.log_segment.end_version) {
             info!(
                 "Checkpoint already exists for snapshot version {}",
                 self.version()
@@ -1859,9 +1872,21 @@ impl Snapshot {
         let checkpoint_log_path = ParsedLogPath::new(info.file_meta).ok_or_else(|| {
             KernelError::internal_error("Checkpoint path could not be parsed as a log path")
         })?;
+        let checkpoint_type = match mode {
+            CheckpointWriteMode::NotAttempted => {
+                return Err(KernelError::internal_error(
+                    "a successful checkpoint write must select a checkpoint mode",
+                )
+                .into());
+            }
+            CheckpointWriteMode::V1 => SelectedCheckpointType::V1,
+            CheckpointWriteMode::V2WithoutSidecars | CheckpointWriteMode::V2WithSidecars => {
+                SelectedCheckpointType::V2
+            }
+        };
         let new_log_segment = self
             .log_segment
-            .try_new_with_checkpoint(checkpoint_log_path)?;
+            .try_new_with_checkpoint(checkpoint_log_path, checkpoint_type)?;
         // Carry only an at-version CRC forward: the checkpoint drops the commits below it, so a
         // stale base could no longer be advanced over them.
         let new_snapshot = Arc::new(Snapshot::new_with_crc(
@@ -2110,6 +2135,7 @@ mod tests {
                 size: 17,
                 ..Default::default()
             }),
+            None,
         )
         .unwrap();
         let configuration = MockTableConfigurationBuilder::new()
@@ -2202,8 +2228,8 @@ mod tests {
         let actual = published.log_segment();
         assert_eq!(actual.listed.max_published_version, Some(2));
         assert_eq!(
-            actual.checkpoint_version,
-            original_segment.checkpoint_version
+            actual.checkpoint_version(),
+            original_segment.checkpoint_version()
         );
         assert_eq!(
             actual.listed.checkpoint_parts,
@@ -2258,9 +2284,12 @@ mod tests {
         let engine = engine_with_published_commits();
         let segment = source
             .log_segment()
-            .try_new_with_checkpoint(create_log_path(
-                "memory:///publication/_delta_log/00000000000000000002.checkpoint.parquet",
-            ))
+            .try_new_with_checkpoint(
+                create_log_path(
+                    "memory:///publication/_delta_log/00000000000000000002.checkpoint.parquet",
+                ),
+                SelectedCheckpointType::V2,
+            )
             .unwrap();
         let source = Arc::new(
             Snapshot::new_with_crc(
@@ -2582,6 +2611,7 @@ mod tests {
             listed_files,
             url.join("_delta_log/").map_err(KernelError::from)?,
             Some(0),
+            None,
             None,
         )?;
 

@@ -5,6 +5,7 @@ use std::sync::Arc;
 use delta_kernel_derive::internal_api;
 
 use crate::actions::{Metadata, Protocol};
+use crate::checkpoint::SelectedCheckpointType;
 use crate::crc::Crc;
 use crate::error::SnapshotHintError;
 use crate::last_checkpoint_hint::LastCheckpointHint;
@@ -88,6 +89,8 @@ pub(crate) struct SnapshotHint {
     crc: Option<Arc<Crc>>,
     /// Whether `version` was established as latest when the hint was captured.
     freshness: SnapshotHintFreshness,
+    /// The selected checkpoint type retained when this hint was captured.
+    checkpoint_type: Option<SelectedCheckpointType>,
 }
 
 impl SnapshotHint {
@@ -105,6 +108,10 @@ impl SnapshotHint {
     ///
     /// `publication_watermark` selects path-based inference or an explicit observation that may
     /// no longer be represented by a retained path.
+    ///
+    /// `checkpoint_type` retains a known type for the selected checkpoint. Pass `None` if no
+    /// checkpoint was selected or its type has not been resolved. Snapshot construction validates
+    /// a supplied type against the selected checkpoint.
     ///
     /// # Errors
     ///
@@ -126,6 +133,7 @@ impl SnapshotHint {
         last_checkpoint_hint: Option<LastCheckpointHint>,
         crc: Option<Arc<Crc>>,
         freshness: SnapshotHintFreshness,
+        checkpoint_type: Option<SelectedCheckpointType>,
     ) -> KernelResult<Self> {
         let log_root = try_parse_uri(table_root)?.join(DELTA_LOG_DIR_WITH_SLASH)?;
         let mut parsed_paths: Vec<ParsedLogPath> = log_paths.into_iter().map(Into::into).collect();
@@ -157,7 +165,15 @@ impl SnapshotHint {
             last_checkpoint_hint,
             crc,
             freshness,
+            checkpoint_type,
         })
+    }
+
+    /// Returns the supplied or captured checkpoint type, if present.
+    #[internal_api]
+    #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
+    pub(crate) fn checkpoint_type(&self) -> Option<SelectedCheckpointType> {
+        self.checkpoint_type
     }
 
     /// Returns the version described by this hint.
@@ -245,6 +261,7 @@ impl SnapshotHint {
             metadata: snapshot.table_configuration().metadata().clone(),
             last_checkpoint_hint: last_checkpoint_hint.cloned(),
             crc: snapshot.crc_at_version().cloned(),
+            checkpoint_type: snapshot.known_checkpoint_type(),
             freshness: if snapshot.is_built_as_latest() {
                 SnapshotHintFreshness::Latest
             } else {
@@ -309,6 +326,7 @@ impl SnapshotHint {
             last_checkpoint_hint,
             crc,
             freshness,
+            checkpoint_type,
         } = *self;
         let built_as_latest = freshness == SnapshotHintFreshness::Latest
             && max_catalog_version.is_none_or(|max| max <= version);
@@ -339,11 +357,15 @@ impl SnapshotHint {
             log_root,
             Some(version),
             last_checkpoint_hint,
+            checkpoint_type,
         )
-        .map_err(|source| SnapshotHintError::LogSegment {
-            source: Box::new(source),
-        })
-        .map_err(KernelError::from)?;
+        .map_err(|source| match source.without_backtrace() {
+            KernelError::SnapshotHint(_) => source,
+            _ => SnapshotHintError::LogSegment {
+                source: Box::new(source),
+            }
+            .into(),
+        })?;
         // Regular construction derives this field from storage listing. A hint supplies it, so
         // only the hint path needs to validate it explicitly.
         require!(
@@ -354,7 +376,7 @@ impl SnapshotHint {
             KernelError::from(SnapshotHintError::MaxPublishedVersion { hint: version }).into()
         );
         require!(
-            log_segment.checkpoint_version.is_some()
+            log_segment.checkpoint_version().is_some()
                 || log_segment
                     .listed
                     .ascending_commit_files
@@ -546,6 +568,7 @@ mod tests {
                 snapshot.log_segment().log_root.clone(),
                 Some(snapshot.version()),
                 hint.last_checkpoint_hint,
+                None,
             )?,
             snapshot.table_configuration().clone(),
             snapshot.crc_at_version().cloned(),
@@ -656,6 +679,7 @@ mod tests {
                 snapshot.log_segment().log_root.clone(),
                 Some(snapshot.version()),
                 None,
+                None,
             )?,
             snapshot.table_configuration().clone(),
             None,
@@ -696,6 +720,7 @@ mod tests {
             None,
             None,
             SnapshotHintFreshness::Unverified,
+            None,
         )
         .unwrap();
 
@@ -732,6 +757,7 @@ mod tests {
             None,
             None,
             SnapshotHintFreshness::Unverified,
+            None,
         )
         .unwrap();
 
@@ -767,6 +793,7 @@ mod tests {
             None,
             None,
             SnapshotHintFreshness::Unverified,
+            None,
         )?;
         let (engine, _store, _table_root) = setup_test();
         assert_log_segment_hint_error(
@@ -798,6 +825,7 @@ mod tests {
             None,
             None,
             SnapshotHintFreshness::Unverified,
+            None,
         );
         assert_result_error_with_message(result, expected_error);
     }
@@ -851,6 +879,7 @@ mod tests {
             None,
             None,
             SnapshotHintFreshness::Unverified,
+            None,
         )
         .map_err(Error::from)
         .and_then(|hint| {
@@ -872,7 +901,7 @@ mod tests {
         } else {
             let snapshot = result?;
             let segment = snapshot.log_segment();
-            assert_eq!(segment.checkpoint_version, Some(10));
+            assert_eq!(segment.checkpoint_version(), Some(10));
             assert!(segment.listed.ascending_commit_files.is_empty());
             assert!(segment.listed.latest_commit_file.is_none());
             assert!(segment.listed.latest_crc_file.is_none());
@@ -919,6 +948,7 @@ mod tests {
             None,
             None,
             SnapshotHintFreshness::Unverified,
+            None,
         )
         .unwrap();
         let first_retained_path = hint
@@ -965,6 +995,7 @@ mod tests {
             None,
             None,
             SnapshotHintFreshness::Unverified,
+            None,
         )
         .unwrap();
         let (engine, _store, _table_root) = setup_test();
@@ -1270,8 +1301,8 @@ mod tests {
             .with_snapshot_hint(hint)
             .build(engine.as_ref())?;
         assert_eq!(
-            hinted_snapshot.log_segment().checkpoint_version,
-            storage_snapshot.log_segment().checkpoint_version
+            hinted_snapshot.log_segment().checkpoint_version(),
+            storage_snapshot.log_segment().checkpoint_version()
         );
         assert_eq!(
             hinted_snapshot.log_segment().listed.checkpoint_parts,

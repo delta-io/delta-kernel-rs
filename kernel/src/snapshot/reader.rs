@@ -9,7 +9,7 @@ use delta_kernel_derive::internal_api;
 use super::Snapshot;
 use crate::actions::DomainMetadata;
 #[cfg(feature = "declarative-plans")]
-use crate::checkpoint::CheckpointShape;
+use crate::checkpoint::{CheckpointInfo, SelectedCheckpointType};
 use crate::clustering::ClusteringColumnInfo;
 use crate::engine::CancellableEngine;
 use crate::expressions::ColumnName;
@@ -59,14 +59,33 @@ pub struct SnapshotReader<'a> {
 mod tests;
 
 impl<'a> SnapshotReader<'a> {
+    /// Returns the selected checkpoint's V1 or V2 specification, or `None` if none was selected.
+    ///
+    /// Returns without I/O when the type is already known from checkpoint naming, loaded protocol,
+    /// matching hint evidence, the writer, or completed discovery. Otherwise, resolves it through
+    /// [`Self::get_checkpoint_info`], sharing that getter's I/O, caching, and cancellation
+    /// behavior. Adaptive-metadata tables are unsupported.
+    #[cfg(feature = "declarative-plans")]
+    pub fn get_checkpoint_type(
+        &self,
+        engine: &dyn Engine,
+    ) -> KernelResult<Option<SelectedCheckpointType>> {
+        self.ensure_checkpoint_info_supported()?;
+        if let Some(checkpoint_type) = self.snapshot.known_checkpoint_type() {
+            return Ok(Some(checkpoint_type));
+        }
+        self.get_checkpoint_info(engine)
+            .map(|info| info.map(|info| info.checkpoint_type()))
+    }
+
     /// Returns metadata for the selected checkpoint, or `None` when no checkpoint was selected.
     ///
-    /// The returned info has a resolved kind, leaf schema, leaf count, exact byte total, and
-    /// portable hint. In that hint, the action count is -1 when unknown; the root schema and
-    /// bounded action lists may be absent. The derived hint has no checksum. Only UUID-named
-    /// checkpoints carry `v2Checkpoint`, even when a classic-named checkpoint references
-    /// sidecars. The portable hint contains no resolved layout and does not establish complete
-    /// metadata when deserialized.
+    /// The returned info has a resolved V1/V2 type, kind, leaf schema, leaf count, exact byte
+    /// total, and portable hint. In that hint, the action count is -1 when unknown; the root
+    /// schema and bounded action lists may be absent. The derived hint has no checksum. Only
+    /// UUID-named checkpoints carry `v2Checkpoint`, even when a classic-named checkpoint
+    /// references sidecars. The portable hint contains no resolved layout and does not
+    /// establish complete metadata when deserialized.
     ///
     /// The first getter or scan that needs checkpoint metadata resolves the complete leaf schema
     /// and sidecar list through the engine's plan executor. Successful results are shared by all
@@ -82,16 +101,9 @@ impl<'a> SnapshotReader<'a> {
     pub fn get_checkpoint_info(
         &self,
         engine: &dyn Engine,
-    ) -> KernelResult<Option<Arc<CheckpointShape>>> {
-        self.read(engine, |snapshot, engine| {
-            #[cfg(feature = "adaptive-metadata-in-dev")]
-            if snapshot.has_adaptive_metadata() {
-                return Err(crate::KernelError::unsupported(
-                    "Checkpoint info does not support adaptive metadata",
-                ));
-            }
-            snapshot.checkpoint_info(engine)
-        })
+    ) -> KernelResult<Option<Arc<CheckpointInfo>>> {
+        self.ensure_checkpoint_info_supported()?;
+        self.read(engine, |snapshot, engine| snapshot.checkpoint_info(engine))
     }
 
     /// Sets the cancellation token for this reader's handler-backed reads.
@@ -264,6 +276,17 @@ impl<'a> SnapshotReader<'a> {
             snapshot,
             cancellation_token: None,
         }
+    }
+
+    #[cfg(feature = "declarative-plans")]
+    fn ensure_checkpoint_info_supported(&self) -> KernelResult<()> {
+        #[cfg(feature = "adaptive-metadata-in-dev")]
+        if self.snapshot.has_adaptive_metadata() {
+            return Err(crate::KernelError::unsupported(
+                "Checkpoint info does not support adaptive metadata",
+            ));
+        }
+        Ok(())
     }
 
     /// Binds this reader's token for one getter while leaving the shared snapshot unchanged.

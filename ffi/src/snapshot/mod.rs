@@ -1,4 +1,4 @@
-//! FFI interfaces for snapshot construction and retained state.
+//! FFI interfaces for snapshot construction and metadata access.
 
 mod builder;
 pub mod hint;

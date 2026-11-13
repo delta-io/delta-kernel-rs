@@ -11,8 +11,9 @@ use crate::actions::{
     CHECKPOINT_METADATA_FIELD, CHECKPOINT_METADATA_NAME, CHECKPOINT_NUM_ADD_FILES_TAG,
     CheckpointMetadata, SIDECAR_FIELD, SIDECAR_FILE_SCHEMA_TAG, SIDECAR_NAME, Sidecar,
 };
-use crate::checkpoint::{CHECKPOINT_ACTIONS_SCHEMA_V2, CheckpointShape};
+use crate::checkpoint::{CHECKPOINT_ACTIONS_SCHEMA_V2, CheckpointInfo, SelectedCheckpointType};
 use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
+use crate::error::SnapshotHintError;
 use crate::expressions::{ColumnName, Predicate, col};
 use crate::last_checkpoint_hint::{HintAction, LastCheckpointHint, LastCheckpointV2};
 use crate::log_segment::LogSegment;
@@ -24,10 +25,10 @@ use crate::schema::{
 };
 use crate::{FileMeta, KernelError, KernelResult};
 
-impl CheckpointShape {
+impl CheckpointInfo {
     /// Resolves the selected checkpoint's complete layout, leaf schema, and portable hint.
     #[tracing::instrument(
-        name = "checkpoint_shape.resolve",
+        name = "checkpoint_info.resolve",
         skip_all,
         fields(enable_call_frame),
         err
@@ -80,6 +81,15 @@ impl CheckpointShape {
                 "Checkpoint metadata version mismatch",
             ));
         }
+        // A hint can omit checkpointMetadata, so its absence does not disprove a retained V2 type.
+        let checkpoint_type = match (segment.checkpoint_type(), metadata.is_some()) {
+            (Some(SelectedCheckpointType::V1), true) => {
+                return Err(SnapshotHintError::CheckpointTypeConflict.into());
+            }
+            (_, true) => SelectedCheckpointType::V2,
+            (Some(retained), false) => retained,
+            (None, false) => SelectedCheckpointType::V1,
+        };
         let files = sidecars
             .iter()
             .map(|sidecar| sidecar.to_filemeta(&segment.log_root))
@@ -125,6 +135,7 @@ impl CheckpointShape {
             size_in_bytes,
         )?);
         Ok(Some(Self {
+            checkpoint_type,
             leaf_checkpoint_schema,
             sidecars: files,
             size_in_bytes,
@@ -198,7 +209,7 @@ fn derived_last_checkpoint(
 }
 
 #[tracing::instrument(
-    name = "checkpoint_shape.read_parquet_footer_schema",
+    name = "checkpoint_info.read_parquet_footer_schema",
     skip_all,
     fields(enable_call_frame),
     err
@@ -208,7 +219,7 @@ fn read_parquet_footer_schema(exec: &dyn PlanExecutor, file: FileMeta) -> Kernel
 }
 
 #[tracing::instrument(
-    name = "checkpoint_shape.collect_checkpoint_metadata",
+    name = "checkpoint_info.collect_checkpoint_metadata",
     skip_all,
     fields(enable_call_frame),
     err
@@ -410,28 +421,32 @@ mod tests {
     }
 
     #[rstest]
-    #[case::no_checkpoint("app-txn-no-checkpoint", None, false, 0)]
+    #[case::no_checkpoint("app-txn-no-checkpoint", None, None, false, 0)]
     #[case::leaf_parquet(
         "with_checkpoint_no_last_checkpoint",
         Some(CheckpointKind::Inline),
+        Some(SelectedCheckpointType::V1),
         false,
         0
     )]
     #[case::manifest_parquet(
         "v2-checkpoints-parquet-with-sidecars",
         Some(CheckpointKind::Manifest),
+        Some(SelectedCheckpointType::V2),
         false,
         1
     )]
     #[case::manifest_json(
         "v2-checkpoints-json-with-sidecars",
         Some(CheckpointKind::Manifest),
+        Some(SelectedCheckpointType::V2),
         false,
         1
     )]
     #[case::leaf_json_inline(
         "v2-checkpoints-json-without-sidecars",
         Some(CheckpointKind::Inline),
+        Some(SelectedCheckpointType::V2),
         false,
         1
     )]
@@ -439,42 +454,49 @@ mod tests {
     #[case::leaf_parquet_inline(
         "v2-checkpoints-parquet-without-sidecars",
         Some(CheckpointKind::Inline),
+        Some(SelectedCheckpointType::V2),
         false,
         1
     )]
     #[case::leaf_multipart(
         "v1-multi-part-struct-stats-only",
         Some(CheckpointKind::Inline),
+        Some(SelectedCheckpointType::V1),
         true,
         0
     )]
     #[case::json_stats_classic(
         "v2-classic-checkpoint-parquet",
         Some(CheckpointKind::Manifest),
+        Some(SelectedCheckpointType::V2),
         false,
         1
     )]
     #[case::struct_stats_leaf(
         "v2-classic-parquet-struct-stats-only",
         Some(CheckpointKind::Inline),
+        Some(SelectedCheckpointType::V1),
         true,
         0
     )]
     #[case::struct_stats_json_manifest(
         "v2-json-sidecars-struct-stats-only",
         Some(CheckpointKind::Manifest),
+        Some(SelectedCheckpointType::V2),
         true,
         1
     )]
     #[case::struct_stats_parquet_manifest(
         "v2-parquet-sidecars-struct-stats-only",
         Some(CheckpointKind::Manifest),
+        Some(SelectedCheckpointType::V2),
         true,
         1
     )]
     fn resolve_checkpoint_and_stats(
         #[case] table: &str,
         #[case] expected_checkpoint: Option<CheckpointKind>,
+        #[case] expected_type: Option<SelectedCheckpointType>,
         #[case] expect_parsed: bool,
         #[case] unhinted_query_scans: usize,
         #[values(false, true)] omit_hint: bool,
@@ -484,19 +506,29 @@ mod tests {
         let mut segment = snapshot.log_segment().clone();
         if omit_hint {
             segment.last_checkpoint_metadata = None;
+            if let Some(checkpoint) = &mut segment.checkpoint
+                && segment.listed.checkpoint_parts[0].file_type
+                    == LogPathFileType::ClassicCheckpoint
+            {
+                checkpoint.checkpoint_type = None;
+            }
         }
         let exec = CountingExecutor::new();
 
         // When: the shared resolver discovers the complete checkpoint.
-        let resolved = CheckpointShape::resolve(&exec, &segment).unwrap();
+        let resolved = CheckpointInfo::resolve(&exec, &segment).unwrap();
 
         // Then: absence stays explicit; selected checkpoints always include their leaf schema.
         assert_eq!(
-            resolved.as_ref().map(CheckpointShape::kind),
+            resolved.as_ref().map(CheckpointInfo::kind),
             expected_checkpoint
         );
-        if let Some(shape) = resolved {
-            let schema = shape.leaf_schema();
+        assert_eq!(
+            resolved.as_ref().map(CheckpointInfo::checkpoint_type),
+            expected_type
+        );
+        if let Some(checkpoint_info) = resolved {
+            let schema = checkpoint_info.leaf_schema();
             assert!(schema.contains("add"), "{table}: retained add action");
             assert!(schema.contains("remove"), "{table}: retained remove action");
             assert_eq!(
@@ -528,28 +560,52 @@ mod tests {
         schema_ref! { nullable "part": INTEGER }
     }
 
-    #[test]
-    fn classic_named_manifest_keeps_layout_without_v2_hint() {
+    #[rstest]
+    fn classic_named_manifest_retains_layout_and_validates_type(
+        #[values(
+            None,
+            Some(SelectedCheckpointType::V1),
+            Some(SelectedCheckpointType::V2)
+        )]
+        retained_type: Option<SelectedCheckpointType>,
+    ) {
         // Given: a classic-named Parquet checkpoint referencing one sidecar.
         let (engine, snapshot, _tempdir) =
             load_test_table("v2-classic-checkpoint-parquet").unwrap();
-        let root = &snapshot.log_segment().listed.checkpoint_parts[0];
+        let mut segment = snapshot.log_segment().clone();
+        let root = &segment.listed.checkpoint_parts[0];
         assert_eq!(root.file_type, LogPathFileType::ClassicCheckpoint);
+        segment.checkpoint.as_mut().unwrap().checkpoint_type = retained_type;
+        let snapshot = Snapshot::new(segment, snapshot.table_configuration().clone()).unwrap();
 
         // When: the public getter resolves the selected checkpoint.
-        let info = resolve_checkpoint_info(&snapshot, engine.as_ref());
+        let result = snapshot.reader().get_checkpoint_info(engine.as_ref());
+
+        // Then: a conflicting V1 claim fails without publishing checkpoint information.
+        if retained_type == Some(SelectedCheckpointType::V1) {
+            let error = result.unwrap_err();
+            assert!(matches!(
+                error.without_backtrace(),
+                KernelError::SnapshotHint(source)
+                    if matches!(source.as_ref(), SnapshotHintError::CheckpointTypeConflict)
+            ));
+            assert!(snapshot.cached_checkpoint_info().is_none());
+            return;
+        }
+        let info = result.unwrap().unwrap();
 
         // Then: its manifest layout is explicit even though the portable hint has no V2 entry.
+        assert_eq!(info.checkpoint_type(), SelectedCheckpointType::V2);
         assert_eq!(info.kind(), CheckpointKind::Manifest);
         assert_eq!(info.leaf_file_count(), 1);
         assert_eq!(info.size_in_bytes(), 18_768 + 9_363);
         assert_eq!(info.last_checkpoint().version(), 1);
         assert!(info.last_checkpoint().v2_checkpoint().is_none());
         assert!(info.last_checkpoint().parts().is_none());
-        let shape = snapshot.checkpoint_info(engine.as_ref()).unwrap().unwrap();
+        let checkpoint_info = snapshot.checkpoint_info(engine.as_ref()).unwrap().unwrap();
         let sidecar_schema = read_parquet_footer_schema(
             &SyncPlanExecutor::default(),
-            shape.sidecars.as_ref()[0].clone(),
+            checkpoint_info.sidecars.as_ref()[0].clone(),
         )
         .unwrap();
         assert_eq!(info.leaf_schema(), &sidecar_schema);
@@ -568,13 +624,14 @@ mod tests {
         };
 
         // When: the checkpoint schema is resolved.
-        let shape = CheckpointShape::resolve(&SyncPlanExecutor::default(), snapshot.log_segment())
-            .unwrap()
-            .unwrap();
+        let checkpoint_info =
+            CheckpointInfo::resolve(&SyncPlanExecutor::default(), snapshot.log_segment())
+                .unwrap()
+                .unwrap();
 
         // Then: incompatible parsed statistics are unavailable.
         assert!(!LogSegment::schema_has_compatible_stats_parsed(
-            shape.leaf_checkpoint_schema.as_ref(),
+            checkpoint_info.leaf_checkpoint_schema.as_ref(),
             &incompatible,
         ));
     }
@@ -594,14 +651,15 @@ mod tests {
         let (_engine, snapshot, _tempdir) =
             load_test_table("v1-multi-part-partitioned-struct-stats-only").unwrap();
         // When: its parsed partition schema is resolved.
-        let shape = CheckpointShape::resolve(&SyncPlanExecutor::default(), snapshot.log_segment())
-            .unwrap()
-            .unwrap();
+        let checkpoint_info =
+            CheckpointInfo::resolve(&SyncPlanExecutor::default(), snapshot.log_segment())
+                .unwrap()
+                .unwrap();
 
         // Then: missing columns are allowed, but incompatible column types are rejected.
         assert_eq!(
             LogSegment::schema_has_compatible_partition_values_parsed(
-                shape.leaf_checkpoint_schema.as_ref(),
+                checkpoint_info.leaf_checkpoint_schema.as_ref(),
                 &partition_schema,
             ),
             expected_compatible
@@ -631,13 +689,17 @@ mod tests {
         let exec = CountingExecutor::new();
 
         // When: checkpoint metadata is resolved from the hint.
-        let shape = CheckpointShape::resolve(&exec, &segment).unwrap().unwrap();
+        let checkpoint_info = CheckpointInfo::resolve(&exec, &segment).unwrap().unwrap();
 
         // Then: only the missing sidecar schema requires I/O.
-        assert_eq!(shape.kind(), CheckpointKind::Manifest);
+        assert_eq!(checkpoint_info.kind(), CheckpointKind::Manifest);
+        assert_eq!(
+            checkpoint_info.checkpoint_type(),
+            SelectedCheckpointType::V2
+        );
         assert_eq!(exec.query_scans.load(Ordering::Relaxed), 0);
         assert_eq!(exec.footer_reads.load(Ordering::Relaxed), 1);
-        assert!(!shape.sidecars.is_empty());
+        assert!(!checkpoint_info.sidecars.is_empty());
     }
 
     #[rstest]
@@ -704,7 +766,11 @@ mod tests {
         let batches = exec.batches_read.load(Ordering::Relaxed);
         assert!(batches > 1);
 
-        // When: the getter and another scan request the same checkpoint metadata.
+        // When: the getters and another scan request the same checkpoint metadata.
+        assert_eq!(
+            snapshot.reader().get_checkpoint_type(&counted).unwrap(),
+            Some(SelectedCheckpointType::V2)
+        );
         let info = resolve_checkpoint_info(&snapshot, &counted);
         scan.declarative_metadata_scan_plan(&counted).unwrap();
 
@@ -750,6 +816,7 @@ mod tests {
                 }),
                 ..Default::default()
             }),
+            None,
         )
         .unwrap()
     }
@@ -777,14 +844,14 @@ mod tests {
         let exec = CountingExecutor::new();
 
         // When: full metadata is resolved.
-        let shape = CheckpointShape::resolve(&exec, &segment).unwrap().unwrap();
+        let checkpoint_info = CheckpointInfo::resolve(&exec, &segment).unwrap().unwrap();
 
         // Then: the checkpoint is a leaf and neither its root nor a footer is read.
-        assert_eq!(shape.kind(), CheckpointKind::Inline);
-        assert_eq!(shape.leaf_schema(), &expected_schema);
-        assert_eq!(shape.leaf_file_count(), 1);
+        assert_eq!(checkpoint_info.kind(), CheckpointKind::Inline);
+        assert_eq!(checkpoint_info.leaf_schema(), &expected_schema);
+        assert_eq!(checkpoint_info.leaf_file_count(), 1);
         assert_eq!(
-            shape
+            checkpoint_info
                 .last_checkpoint()
                 .v2_checkpoint()
                 .unwrap()
@@ -898,6 +965,7 @@ mod tests {
                 }),
                 ..Default::default()
             }),
+            None,
         )
         .unwrap()
     }
@@ -915,12 +983,15 @@ mod tests {
         let exec = CountingExecutor::new();
 
         // When: metadata is resolved using that hint.
-        let shape = CheckpointShape::resolve(&exec, &segment).unwrap().unwrap();
+        let checkpoint_info = CheckpointInfo::resolve(&exec, &segment).unwrap().unwrap();
 
         // Then: stats compatibility follows the hinted schema without any I/O.
-        assert_eq!(shape.kind(), CheckpointKind::Manifest);
+        assert_eq!(checkpoint_info.kind(), CheckpointKind::Manifest);
         assert_eq!(
-            LogSegment::schema_has_compatible_stats_parsed(shape.leaf_schema(), &stats_schema,),
+            LogSegment::schema_has_compatible_stats_parsed(
+                checkpoint_info.leaf_schema(),
+                &stats_schema,
+            ),
             compatible
         );
         assert_eq!(
@@ -992,7 +1063,7 @@ mod tests {
                 .insert(CHECKPOINT_NUM_ADD_FILES_TAG.to_owned(), tag.to_owned());
         }
         // When: selected-checkpoint metadata is derived.
-        let resolved = CheckpointShape::resolve(&CountingExecutor::new(), &segment)
+        let resolved = CheckpointInfo::resolve(&CountingExecutor::new(), &segment)
             .unwrap()
             .unwrap();
         let derived = resolved.last_checkpoint();
@@ -1135,16 +1206,28 @@ mod tests {
         assert_eq!(exec.io_counts(), calls);
     }
 
-    #[test]
-    fn failed_resolution_can_retry_and_new_snapshots_resolve_independently() {
-        // Given: a snapshot whose first getter has no executor available.
+    #[rstest]
+    fn failed_resolution_can_retry_and_new_snapshots_resolve_independently(
+        #[values(false, true)] type_getter: bool,
+    ) {
+        // Given: an unresolved classic-named checkpoint and a getter without an executor.
         let (engine, snapshot, _tempdir) =
-            load_test_table("v2-checkpoints-parquet-with-sidecars").unwrap();
+            load_test_table("v2-classic-checkpoint-parquet").unwrap();
         let missing = DelegatingEngine::new(engine.clone()).without_plan_executor();
-        assert!(snapshot.reader().get_checkpoint_info(&missing).is_err());
+        let read = |snapshot: &Snapshot, engine: &dyn Engine| {
+            if type_getter {
+                snapshot.reader().get_checkpoint_type(engine).map(|_| ())
+            } else {
+                snapshot.reader().get_checkpoint_info(engine).map(|_| ())
+            }
+        };
+        assert!(snapshot.known_checkpoint_type().is_none());
+        assert!(read(&snapshot, &missing).is_err());
+        assert!(snapshot.cached_checkpoint_info().is_none());
 
-        // When: a working executor retries the getter.
-        let first = resolve_checkpoint_info(&snapshot, engine.as_ref());
+        // When: a working executor retries the same getter.
+        read(&snapshot, engine.as_ref()).unwrap();
+        let first = resolve_checkpoint_info(&snapshot, &missing);
 
         // Then: readers and scans can reuse the cache even without an executor.
         let cached = resolve_checkpoint_info(&snapshot, &missing);
@@ -1164,7 +1247,7 @@ mod tests {
         .unwrap();
 
         // Then: neither its getter nor its scan inherits the original cache.
-        assert!(new_snapshot.reader().get_checkpoint_info(&missing).is_err());
+        assert!(read(&new_snapshot, &missing).is_err());
         let scan = Arc::new(new_snapshot).scan_builder().build().unwrap();
         let error = scan.declarative_metadata_scan_plan(&missing).unwrap_err();
         assert!(
@@ -1281,7 +1364,7 @@ mod tests {
         let exec = CountingExecutor::new();
 
         // When: discovery reads the malformed metadata.
-        let error = CheckpointShape::resolve(&exec, &segment).unwrap_err();
+        let error = CheckpointInfo::resolve(&exec, &segment).unwrap_err();
 
         // Then: resolution reports the specific metadata error.
         assert!(error.to_string().contains(expected_error), "{error}");
@@ -1359,7 +1442,11 @@ mod tests {
         );
         assert!(matches!(snapshot.cached_checkpoint_info(), Some(None)));
 
-        // Then: the getter shares the cached absence without requiring an executor.
+        // Then: the getters share the cached absence without requiring an executor.
+        assert_eq!(
+            snapshot.reader().get_checkpoint_type(&engine).unwrap(),
+            None
+        );
         assert!(
             snapshot
                 .reader()
@@ -1440,7 +1527,7 @@ mod tests {
 
         // When: the getter drains the root and derives its summary from checkpoint actions.
         let info = resolve_checkpoint_info(&snapshot, &counted);
-        let shape = snapshot.cached_checkpoint_info().unwrap().as_ref().unwrap();
+        let checkpoint_info = snapshot.cached_checkpoint_info().unwrap().as_ref().unwrap();
 
         // Then: valid tags supply counts and schema; malformed tags fall back to the footer.
         assert_eq!(
@@ -1460,7 +1547,7 @@ mod tests {
         if malformed_tags {
             let footer = read_parquet_footer_schema(
                 &SyncPlanExecutor::default(),
-                shape.sidecars.as_ref()[0].clone(),
+                checkpoint_info.sidecars.as_ref()[0].clone(),
             )
             .unwrap();
             assert_eq!(info.leaf_schema(), &footer);
@@ -1484,7 +1571,7 @@ mod tests {
         );
         assert_eq!(info.leaf_file_count(), expected_sidecars);
         assert_eq!(info.kind(), CheckpointKind::Manifest);
-        assert_eq!(shape.sidecars.as_ref().len(), expected_sidecars);
+        assert_eq!(checkpoint_info.sidecars.as_ref().len(), expected_sidecars);
         assert!(expected_sidecars > 30);
         assert!(
             info.last_checkpoint()
@@ -1534,7 +1621,7 @@ mod tests {
             .collect();
         assert_eq!(
             planned_files,
-            shape.sidecars.as_ref().iter().collect::<Vec<_>>()
+            checkpoint_info.sidecars.as_ref().iter().collect::<Vec<_>>()
         );
         assert!(
             plan.nodes
@@ -1607,7 +1694,7 @@ mod tests {
         assert_eq!(exec.query_scans.load(Ordering::Relaxed), 2);
     }
 
-    fn resolve_checkpoint_info(snapshot: &Snapshot, engine: &dyn Engine) -> Arc<CheckpointShape> {
+    fn resolve_checkpoint_info(snapshot: &Snapshot, engine: &dyn Engine) -> Arc<CheckpointInfo> {
         snapshot
             .reader()
             .get_checkpoint_info(engine)

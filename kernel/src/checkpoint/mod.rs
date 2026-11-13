@@ -1,5 +1,7 @@
-//! This module implements the API for **customized** Delta checkpoint writes, where the
+//! Checkpoint format types and APIs for **customized** Delta checkpoint writes, where the
 //! caller drives the write themselves. The entry point is [`Snapshot::create_checkpoint_writer`].
+//! [`SelectedCheckpointType`] describes the specification of a snapshot's selected checkpoint,
+//! independently of the checkpoint write policy.
 //!
 //! If you want an all-in-one API that handles writing the checkpoint, use
 //! [`Snapshot::checkpoint`] instead.
@@ -139,12 +141,16 @@ use crate::{
 
 pub(crate) mod collation_stats;
 #[cfg(feature = "declarative-plans")]
-mod shape;
+mod info;
 mod sidecar;
+mod types;
 
 #[cfg(feature = "declarative-plans")]
-pub use shape::{CheckpointKind, CheckpointShape};
+pub use info::{CheckpointInfo, CheckpointKind};
 use sidecar::{SidecarSplitter, SingleSidecarDataIterator, create_sidecar_action_batch};
+#[delta_kernel_derive::internal_api]
+pub(crate) use types::SelectedCheckpoint;
+pub use types::SelectedCheckpointType;
 #[cfg(test)]
 pub(crate) mod tests;
 

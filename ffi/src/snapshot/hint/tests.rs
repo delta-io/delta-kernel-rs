@@ -20,6 +20,9 @@ use test_utils::{TestCatalogCommitter, compacted_log_path_for_versions, create_l
 use url::Url;
 
 use super::*;
+use crate::checkpoint::FfiSelectedCheckpointType;
+#[cfg(feature = "declarative-plans")]
+use crate::checkpoint::snapshot_checkpoint_type;
 use crate::delta_types::*;
 use crate::error::FFIKernelError;
 use crate::ffi_test_utils::{
@@ -269,6 +272,7 @@ fn test_snapshot_hint(
         last_checkpoint: std::ptr::null(),
         crc: std::ptr::null(),
         publication_watermark: FfiPublicationWatermark::InferFromLogPaths,
+        checkpoint_type: OptionalValue::None,
     }
 }
 
@@ -348,15 +352,29 @@ fn exported_hint_copy_outlives_snapshot_and_preserves_state(
     #[case] freshness: FfiSnapshotHintFreshness,
     #[case] expected_latest: bool,
     #[values(false, true)] with_crc: bool,
+    #[values(
+        (false, None),
+        (true, None),
+        (true, Some(FfiSelectedCheckpointType::V1)),
+        (true, Some(FfiSelectedCheckpointType::V2))
+    )]
+    checkpoint: (bool, Option<FfiSelectedCheckpointType>),
 ) {
+    // Given a typed hint with an optional CRC and selected-checkpoint type.
+    let (with_checkpoint, checkpoint_type) = checkpoint;
+    #[cfg(feature = "declarative-plans")]
+    let expected_checkpoint_type =
+        with_checkpoint.then(|| checkpoint_type.unwrap_or(FfiSelectedCheckpointType::V1));
     let engine = test_engine();
-    let log_path = FfiLogPath::new(
-        slice("memory:///hinted-table/_delta_log/00000000000000000000.json"),
-        123,
-        456,
-    );
+    let location = if with_checkpoint {
+        "memory:///hinted-table/_delta_log/00000000000000000000.checkpoint.parquet"
+    } else {
+        "memory:///hinted-table/_delta_log/00000000000000000000.json"
+    };
+    let log_path = FfiLogPath::new(slice(location), 123, 456);
     let crc = empty_crc();
     let mut hint = test_snapshot_hint(std::slice::from_ref(&log_path), 0, freshness);
+    hint.checkpoint_type = checkpoint_type.into();
     if with_crc {
         hint.crc = &crc;
     }
@@ -367,6 +385,18 @@ fn exported_hint_copy_outlives_snapshot_and_preserves_state(
         ))
     };
     let snapshot = unsafe { ok_or_panic(snapshot_builder_build(builder)) };
+    #[cfg(feature = "declarative-plans")]
+    assert_eq!(
+        Option::<&FfiSelectedCheckpointType>::from(&unsafe {
+            ok_or_panic(snapshot_checkpoint_type(
+                snapshot.shallow_copy(),
+                engine.shallow_copy(),
+            ))
+        })
+        .copied(),
+        expected_checkpoint_type,
+    );
+    // When the exported hint is copied and its source snapshot is freed.
     let expected_segment = unsafe { snapshot.as_ref() }.log_segment().clone();
     let expected_crc = unsafe { snapshot.as_ref() }.crc_at_version().cloned();
     let builder = ok_or_panic(install_through_visitor(
@@ -377,6 +407,18 @@ fn exported_hint_copy_outlives_snapshot_and_preserves_state(
     unsafe { free_snapshot(snapshot) };
     let rebuilt = unsafe { ok_or_panic(snapshot_builder_build(builder)) };
     let rebuilt_ref = unsafe { rebuilt.as_ref() };
+    // Then the owned copy preserves the checkpoint type, CRC, and freshness without I/O.
+    #[cfg(feature = "declarative-plans")]
+    assert_eq!(
+        Option::<&FfiSelectedCheckpointType>::from(&unsafe {
+            ok_or_panic(snapshot_checkpoint_type(
+                rebuilt.shallow_copy(),
+                engine.shallow_copy(),
+            ))
+        })
+        .copied(),
+        expected_checkpoint_type,
+    );
     assert_eq!(rebuilt_ref.version(), 0);
     assert_eq!(rebuilt_ref.is_built_as_latest(), expected_latest);
     assert_eq!(rebuilt_ref.log_segment(), &expected_segment);
@@ -385,6 +427,47 @@ fn exported_hint_copy_outlives_snapshot_and_preserves_state(
         free_snapshot(rebuilt);
         free_engine(engine);
     }
+}
+
+#[rstest::rstest]
+#[case::no_checkpoint(
+    &["memory:///hinted-table/_delta_log/00000000000000000000.json"],
+    FfiSelectedCheckpointType::V1
+)]
+#[case::multipart_paths_claimed_v2(
+    &[
+        "memory:///hinted-table/_delta_log/00000000000000000000.checkpoint.0000000001.0000000002.parquet",
+        "memory:///hinted-table/_delta_log/00000000000000000000.checkpoint.0000000002.0000000002.parquet",
+    ],
+    FfiSelectedCheckpointType::V2
+)]
+#[case::uuid_path_claimed_v1(
+    &["memory:///hinted-table/_delta_log/00000000000000000000.checkpoint.550e8400-e29b-41d4-a716-446655440000.parquet"],
+    FfiSelectedCheckpointType::V1
+)]
+fn checkpoint_type_claim_rejects_conflicting_paths(
+    #[case] locations: &[&'static str],
+    #[case] claimed_type: FfiSelectedCheckpointType,
+) {
+    // Given paths incompatible with the supplied checkpoint type claim.
+    let engine = test_engine();
+    let paths: Vec<_> = locations
+        .iter()
+        .map(|location| FfiLogPath::new(slice(location), 0, 1))
+        .collect();
+    let mut hint = test_snapshot_hint(&paths, 0, FfiSnapshotHintFreshness::Unverified);
+    hint.checkpoint_type = OptionalValue::Some(claimed_type);
+    let builder = unsafe {
+        ok_or_panic(snapshot_builder_with_snapshot_hint(
+            test_builder(&engine),
+            &hint,
+        ))
+    };
+
+    // When the snapshot is constructed, then it rejects the conflicting claim without I/O.
+    let result = unsafe { snapshot_builder_build(builder) };
+    assert_extern_result_error_with_message(result, FFIKernelError::InvalidSnapshotHint, None);
+    unsafe { free_engine(engine) };
 }
 
 #[test]
@@ -453,6 +536,7 @@ fn snapshot_hint_export_rejects_compaction_without_calling_visitor() {
             files,
             source_ref.log_segment().log_root.clone(),
             Some(1),
+            None,
             None,
         )
         .unwrap(),
@@ -637,7 +721,7 @@ fn exported_storage_snapshot_preserves_paths_and_omits_stale_crc(
         .build(&table.engine())
         .unwrap();
     let segment = snapshot.log_segment();
-    assert_eq!(segment.checkpoint_version, Some(checkpoint_version));
+    assert_eq!(segment.checkpoint_version(), Some(checkpoint_version));
     assert_eq!(
         segment
             .listed
@@ -1179,6 +1263,7 @@ fn typed_export_rejects_adaptive_crc_without_visiting_or_consuming_snapshot(
         None,
         Some(Arc::new(expected_crc.clone())),
         SnapshotHintFreshness::Unverified,
+        None,
     )
     .unwrap();
     let kernel_engine = unsafe { engine.as_ref() }.engine();
@@ -1517,6 +1602,7 @@ fn aggregate_with_rejects_null_nonempty_log_path_array() {
         last_checkpoint: std::ptr::null(),
         crc: std::ptr::null(),
         publication_watermark: FfiPublicationWatermark::InferFromLogPaths,
+        checkpoint_type: OptionalValue::None,
     };
     let result = unsafe { snapshot_builder_with_snapshot_hint(builder, &hint) };
     assert_extern_result_error_contains(
@@ -2003,7 +2089,7 @@ fn assert_typed_checkpoint_build(
         0
     );
     let segment = snapshot_ref.log_segment();
-    assert_eq!(segment.checkpoint_version, Some(0));
+    assert_eq!(segment.checkpoint_version(), Some(0));
     assert_eq!(
         segment
             .listed

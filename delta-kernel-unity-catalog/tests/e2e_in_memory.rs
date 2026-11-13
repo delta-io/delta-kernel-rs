@@ -303,7 +303,7 @@ async fn test_snapshot_from_catalog_response_with_published_commits(
     let snapshot = Snapshot::builder_for(table_uri)
         .with_max_catalog_version(3)
         .build(engine.as_ref())?;
-    assert_eq!(snapshot.log_segment().checkpoint_version, Some(3));
+    assert_eq!(snapshot.log_segment().checkpoint_version(), Some(3));
     Ok(())
 }
 
@@ -415,7 +415,7 @@ async fn test_checkpoint_after_publish() -> Result<(), TestError> {
     let snapshot = Snapshot::builder_for(table_uri)
         .with_max_catalog_version(3)
         .build(&engine)?;
-    assert_eq!(snapshot.log_segment().checkpoint_version, Some(3));
+    assert_eq!(snapshot.log_segment().checkpoint_version(), Some(3));
 
     Ok(())
 }
@@ -513,7 +513,7 @@ async fn test_published_snapshot_reads_after_staged_files_are_deleted(
         .sum();
     assert_eq!(rows, 200);
     let (_, checkpointed) = published.checkpoint(engine.as_ref(), None)?;
-    assert_eq!(checkpointed.log_segment().checkpoint_version, Some(2));
+    assert_eq!(checkpointed.log_segment().checkpoint_version(), Some(2));
     assert_eq!(checkpointed.reader().get_timestamp(engine.as_ref())?, ict);
     Ok(())
 }
@@ -537,7 +537,7 @@ async fn test_published_snapshot_reads_timestamp_at_checkpoint_version() -> Resu
     let source = build_snapshot(&update_table_client, &engine, &table_uri)?;
     let source_segment = source.log_segment();
     assert!(source_segment.listed.ascending_commit_files.is_empty());
-    assert_eq!(source_segment.checkpoint_version, Some(2));
+    assert_eq!(source_segment.checkpoint_version(), Some(2));
     assert_eq!(source_segment.listed.max_published_version, Some(2));
     assert_eq!(
         source_segment

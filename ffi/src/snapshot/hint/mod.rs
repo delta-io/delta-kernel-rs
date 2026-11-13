@@ -4,13 +4,14 @@ use delta_kernel::snapshot::{SnapshotHint, SnapshotHintError, SnapshotHintFreshn
 use delta_kernel::{KernelError, KernelResult, Version};
 
 use super::builder::{ExclusiveSnapshotBuilder, FfiSnapshotBuilder, FfiSnapshotBuilderSource};
+use crate::checkpoint::FfiSelectedCheckpointType;
 use crate::delta_types::{
     FfiCrc, FfiLastCheckpoint, FfiMetadata, FfiProtocol, FfiPublicationWatermark,
 };
 use crate::error::{ExternResult, IntoExternResult};
 use crate::handle::Handle;
 use crate::log_path::LogPathArray;
-use crate::{NullableCvoid, SharedExternEngine, SharedSnapshot};
+use crate::{NullableCvoid, OptionalValue, SharedExternEngine, SharedSnapshot};
 
 mod export;
 
@@ -92,6 +93,12 @@ pub struct FfiSnapshotHint {
     ///
     /// Export always uses an explicit variant, never `InferFromLogPaths`.
     pub publication_watermark: FfiPublicationWatermark,
+    /// Optional selected-checkpoint type claim, validated against the supplied paths at build.
+    /// Absent leaves the type to be inferred from available evidence or resolved during discovery.
+    /// C callers must explicitly set the tag to `NoneFfiSelectedCheckpointType` when absent;
+    /// zero-initializing this field creates an invalid enum payload and causes undefined behavior
+    /// when read.
+    pub checkpoint_type: OptionalValue<FfiSelectedCheckpointType>,
 }
 
 fn invalid_with_source(message: impl Into<String>, source: KernelError) -> KernelError {
@@ -158,6 +165,9 @@ unsafe fn snapshot_builder_with_snapshot_hint_impl(
         last_checkpoint_hint,
         crc,
         freshness,
+        Option::<&FfiSelectedCheckpointType>::from(&value.checkpoint_type)
+            .copied()
+            .map(Into::into),
     )?;
     builder.snapshot_hint = Some(Box::new(snapshot_hint));
     Ok(())

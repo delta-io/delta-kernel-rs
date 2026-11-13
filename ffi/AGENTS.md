@@ -765,6 +765,7 @@ pub struct FfiSnapshotHint {
     pub last_checkpoint: *const FfiLastCheckpoint,
     pub crc: *const FfiCrc,
     pub publication_watermark: FfiPublicationWatermark,
+    pub checkpoint_type: OptionalValue<FfiSelectedCheckpointType>,
 }
 
 pub unsafe extern "C" fn snapshot_builder_with_snapshot_hint(
@@ -781,7 +782,10 @@ The setter consumes the builder on both success and error, returning its replace
 
 Prefer mirroring the `kernel/src/` module hierarchy in `ffi/src/` for corresponding APIs.
 Snapshot hints live under `src/snapshot/hint/`, matching `kernel/src/snapshot/hint.rs`.
-Snapshot builders live in `src/snapshot/builder.rs`; snapshot accessors live in `src/lib.rs`.
+Snapshot builders live in `src/snapshot/builder.rs`; selected-checkpoint types live in
+`src/checkpoint/types.rs`, mirroring `kernel/src/checkpoint/types.rs`. Checkpoint-info types,
+discovery, and the selected-checkpoint type getter live in `src/checkpoint/info.rs`, gated at the
+module boundary by `declarative-plans`. Other snapshot accessors live in `src/lib.rs`.
 FFI-specific ownership, conversion, and engine support code can use its own modules.
 
 ## Key Files
@@ -837,7 +841,7 @@ borrowed. The callback runs once on success and is not invoked on error. All nes
 when the callback returns; copy retained values during the callback. No hint handle is returned.
 Supply the copied values through `snapshot_builder_with_snapshot_hint` when rebuilding a snapshot.
 The hint preserves build-time freshness, not current freshness, and includes only a matching
-checkpoint hint and an at-version CRC. Compaction files are unsupported.
+checkpoint hint, selected checkpoint type, and an at-version CRC. Compaction files are unsupported.
 
 Export includes an explicit publication watermark,
 preserving absence even when published commits are not represented by the retained paths.
@@ -856,6 +860,12 @@ checkpoint files, optional latest commit/CRC metadata, checkpoint version, and t
 watermark. It preserves staged paths independently of that watermark. The snapshot is borrowed;
 copy all retained values before the callback returns. It does not implement snapshot equivalence
 or establish freshness.
+
+`snapshot_checkpoint_type(snapshot, engine)` returns the selected checkpoint's V1/V2 specification,
+or absent when no checkpoint was selected. Known types return without I/O; ambiguous types resolve
+through the same snapshot cache as `snapshot_checkpoint_info` and declarative scan planning. The
+checkpoint-info summary also includes this resolved type. Typed hints preserve already-known types
+without triggering discovery and validate supplied claims against their paths.
 
 Snapshot accessors (`ffi/src/lib.rs`) include no-I/O reads such as `version` and
 `snapshot_file_stats`, which returns `OptionalValue<FfiFileStats>` (scalar

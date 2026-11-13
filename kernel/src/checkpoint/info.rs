@@ -2,6 +2,7 @@
 
 use std::sync::Arc;
 
+use super::SelectedCheckpointType;
 use crate::FileMeta;
 use crate::last_checkpoint_hint::LastCheckpointHint;
 use crate::schema::SchemaRef;
@@ -18,18 +19,24 @@ pub enum CheckpointKind {
 /// Complete layout and portable metadata for the checkpoint selected by a snapshot.
 ///
 /// Scan planning and [`crate::snapshot::SnapshotReader::get_checkpoint_info`] share discovery of
-/// the complete sidecar list, leaf schema, and portable hint. This type is not serialized;
-/// [`LastCheckpointHint`] describes the portable fields. Layout discovery does not validate every
-/// required checkpoint action.
+/// the checkpoint type, complete sidecar list, leaf schema, and portable hint. This type is not
+/// serialized; [`LastCheckpointHint`] describes the portable fields. Layout discovery does not
+/// validate every required checkpoint action.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CheckpointShape {
+pub struct CheckpointInfo {
+    pub(crate) checkpoint_type: SelectedCheckpointType,
     pub(crate) leaf_checkpoint_schema: SchemaRef,
     pub(crate) sidecars: Arc<[FileMeta]>,
     pub(crate) size_in_bytes: u64,
     pub(crate) last_checkpoint: Box<LastCheckpointHint>,
 }
 
-impl CheckpointShape {
+impl CheckpointInfo {
+    /// Returns whether the selected checkpoint follows the V1 or V2 specification.
+    pub fn checkpoint_type(&self) -> SelectedCheckpointType {
+        self.checkpoint_type
+    }
+
     /// Returns where the checkpoint stores its file actions.
     pub fn kind(&self) -> CheckpointKind {
         if self.sidecars.is_empty() {

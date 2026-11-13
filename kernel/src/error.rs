@@ -199,6 +199,11 @@ pub enum SnapshotHintError {
     /// The supplied CRC metadata differs from the hint metadata.
     #[error("Invalid snapshot hint: CRC metadata does not match snapshot hint metadata")]
     CrcMetadata,
+    /// The supplied checkpoint type conflicts with the selected checkpoint.
+    #[error(
+        "Invalid snapshot hint: supplied checkpoint type conflicts with the selected checkpoint"
+    )]
+    CheckpointTypeConflict,
     /// A connector reported invalid snapshot-hint state, optionally with an underlying error.
     #[error("Invalid snapshot hint: {message}")]
     Connector {

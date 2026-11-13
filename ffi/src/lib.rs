@@ -50,7 +50,6 @@ extern crate self as delta_kernel_ffi;
 
 mod alloc_stats;
 
-#[cfg(feature = "declarative-plans")]
 pub mod checkpoint;
 pub mod column_default;
 pub mod commit_range;

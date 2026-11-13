@@ -382,8 +382,8 @@ mod tests {
             &callstacks,
             &[
                 "scan.declarative_metadata_scan_plan",
-                "checkpoint_shape.resolve",
-                "checkpoint_shape.read_parquet_footer_schema",
+                "checkpoint_info.resolve",
+                "checkpoint_info.read_parquet_footer_schema",
             ],
         );
         assert_contains_callstack(

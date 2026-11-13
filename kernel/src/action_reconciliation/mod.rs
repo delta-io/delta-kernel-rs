@@ -23,7 +23,7 @@ use crate::table_properties::TableProperties;
 use crate::{KernelError, KernelResult};
 
 #[cfg(feature = "declarative-plans")]
-pub(crate) mod checkpoint_shape;
+pub(crate) mod checkpoint_info;
 pub(crate) mod file_metadata;
 pub(crate) mod log_replay;
 

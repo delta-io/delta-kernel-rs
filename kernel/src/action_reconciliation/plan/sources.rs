@@ -4,7 +4,7 @@ use super::VERSION;
 use super::action_set::{ActionSet, ActionSource};
 use crate::action_reconciliation::file_metadata::STATS_FIELD as STATS;
 use crate::actions::{ADD_NAME, Add, LOG_ADD_SCHEMA};
-use crate::checkpoint::{CheckpointKind, CheckpointShape};
+use crate::checkpoint::{CheckpointInfo, CheckpointKind};
 use crate::expressions::{column_name, lit};
 use crate::log_segment::LogSegment;
 use crate::plans::ir::nodes::{FileType, ScanFile};
@@ -16,7 +16,7 @@ use crate::{KernelError, KernelResult, PlanBuilder, Version};
 /// Supplies `version`; absent checkpoints and empty selections return an empty relation.
 pub(crate) fn checkpoint_actions(
     segment: &LogSegment,
-    checkpoint_shape: Option<&CheckpointShape>,
+    checkpoint_info: Option<&CheckpointInfo>,
     actions: ActionSet,
     schema: SchemaRef,
 ) -> KernelResult<PlanBuilder> {
@@ -35,16 +35,16 @@ pub(crate) fn checkpoint_actions(
             PlanBuilder::values(schema, vec![])
         };
     }
-    let shape = checkpoint_shape
-        .ok_or_else(|| KernelError::schema("File reads require a checkpoint shape"))?;
-    if shape.kind() == CheckpointKind::Inline {
+    let info = checkpoint_info
+        .ok_or_else(|| KernelError::schema("File reads require checkpoint information"))?;
+    if info.kind() == CheckpointKind::Inline {
         return scan(parts, &[VERSION], schema);
     }
     let constants = parts
         .first()
         .map(|part| part.file_constants.clone())
         .unwrap_or_default();
-    let sidecars = shape.sidecars.iter().map(|file| ScanFile {
+    let sidecars = info.sidecars.iter().map(|file| ScanFile {
         meta: file.clone(),
         file_constants: constants.clone(),
     });
@@ -268,16 +268,17 @@ mod tests {
             use_sidecar_hint
         );
         let snapshot = Snapshot::new(segment, snapshot.table_configuration().clone())?;
-        let checkpoint_shape = actions
+        let checkpoint_info = actions
             .contains_content_actions()
             .then(|| snapshot.checkpoint_info(&engine))
             .transpose()?
             .flatten();
 
-        // When: selected checkpoint actions are planned from the same resolved shape.
+        // When: selected checkpoint actions are planned from the same resolved checkpoint
+        // information.
         let plan = MetadataPlanner::new(snapshot.log_segment(), actions)
             .with_stats(StatsOptions::json_only())
-            .with_checkpoint_shape(checkpoint_shape)
+            .with_checkpoint_info(checkpoint_info)
             .checkpoint_actions()?
             .project_patch(|patch| patch.drop(ACTION_KEY))?
             .build()?;
