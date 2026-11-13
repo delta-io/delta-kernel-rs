@@ -22,10 +22,13 @@ for inline publication; repeat-review deletions that no longer map stay in the r
 The hidden revision marker is added after output validation only when the code diff was not
 truncated. Text comparison ignores it, but duplicate suppression also checks the reviewed revision. Missing history expands review coverage rather than suppressing findings.
 
-Use `/review full inline` (or any other output mode), or select `full_review` on workflow dispatch,
-for a redesign requested during review. Public Rust API/impl changes, dependency and wire-format
-changes, file moves/deletions, and substantial churn also force a full review. These conservative
-heuristics cannot recognize every architectural change. Small fixes remain incremental.
+Use `/review inline` for automatic scope selection: eligible small updates are reviewed
+incrementally, with a full review when the baseline is missing or a fallback applies. Use
+`/review inline full` (or another output mode followed by `full`), or select `full_review` on
+workflow dispatch, for a redesign requested during review. Public Rust API/impl changes,
+dependency and wire-format changes, file moves/deletions, and substantial churn also force a full
+review. These conservative heuristics cannot recognize every architectural change. Small fixes
+remain incremental.
 
 Every child receives a bounded complete PR diff specifically for title/description verification,
 even when code review is incremental or the head is unchanged. Identical clean prose is published
