@@ -275,9 +275,8 @@ fn declarative_metadata_matches_imperative_scan(
 fn declarative_metadata_resolves_complete_sidecar_lists(
     #[case] table: &str,
     #[values(false, true)] remove_hint: bool,
-    #[values(false, true)] getter_first: bool,
 ) -> Result<()> {
-    // Given: a manifest with optional writer hints and optional completed getter state.
+    // Given: an unresolved manifest with or without writer hints.
     let (engine, snapshot, _tempdir) = crate::unit_test_utils::load_test_table(table)?;
     let mut segment = snapshot.log_segment().clone();
     if remove_hint {
@@ -288,39 +287,27 @@ fn declarative_metadata_resolves_complete_sidecar_lists(
         segment,
         snapshot.table_configuration().clone(),
     )?);
-    if getter_first {
-        snapshot.reader().get_checkpoint_info(engine.as_ref())?;
-    }
-    let scan = snapshot.clone().scan_builder().build()?;
+    let scan = snapshot
+        .clone()
+        .scan_builder()
+        .with_stats(StatsOptions::none())
+        .build()?;
 
-    // When: the scan plans before any remaining metadata resolution.
+    // When: scan planning resolves the checkpoint.
     let plan = scan
         .declarative_metadata_scan_plan(engine.as_ref())?
         .expect("metadata plan");
 
-    // Then: every manifest uses static files, while planning leaves the getter cache untouched.
+    // Then: static files match the cached complete sidecar list.
     assert!(
         plan.nodes
             .iter()
             .all(|node| !matches!(&node.op, Operator::DynamicScan(_)))
     );
-    assert_eq!(snapshot.cached_checkpoint_info().is_some(), getter_first);
-    let actual_metadata = declarative_metadata(&scan, engine.as_ref())?;
-
-    // When: the getter resolves a complete layout and the scan plans again.
-    snapshot.reader().get_checkpoint_info(engine.as_ref())?;
-    let expected_metadata = declarative_metadata(&scan, engine.as_ref())?;
-
-    // Then: scan results are unchanged and its static files match the complete sidecar list.
-    assert_metadata_eq(&actual_metadata, &expected_metadata, table)?;
-
     let resolved = snapshot
-        .reader()
-        .get_checkpoint_info(engine.as_ref())?
-        .unwrap();
-    let expected = resolved.sidecars.as_ref();
-    let plan = scan
-        .declarative_metadata_scan_plan(engine.as_ref())?
+        .cached_checkpoint_info()
+        .expect("scan populated checkpoint cache")
+        .as_ref()
         .unwrap();
     let actual: Vec<_> = plan
         .nodes
@@ -332,7 +319,16 @@ fn declarative_metadata_resolves_complete_sidecar_lists(
             _ => vec![],
         })
         .collect();
-    assert_eq!(actual.as_slice(), expected);
+    assert_eq!(actual.as_slice(), resolved.sidecars.as_ref());
+
+    // Then: executing the plan agrees with independent imperative replay.
+    let actual_metadata = declarative_metadata(&scan, engine.as_ref())?;
+    let expected_metadata = imperative_metadata(snapshot.scan_builder().build()?, engine.as_ref())?;
+    assert_metadata_eq(
+        &actual_metadata,
+        &without_columns(&expected_metadata, &[STATS])?,
+        table,
+    )?;
     Ok(())
 }
 
@@ -1339,5 +1335,6 @@ fn test_declarative_metadata_scan_plan_no_executor_returns_unsupported() -> Resu
         scan.declarative_metadata_scan_plan(&no_plan_engine)?
             .is_none()
     );
+    assert!(scan.snapshot.cached_checkpoint_info().is_none());
     Ok(())
 }

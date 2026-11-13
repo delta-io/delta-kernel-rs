@@ -68,16 +68,15 @@ impl<'a> SnapshotReader<'a> {
     /// sidecars. The portable hint contains no resolved layout and does not establish complete
     /// metadata when deserialized.
     ///
-    /// The first call resolves the complete leaf schema and sidecar list through the engine's
-    /// plan executor. Successful results are shared with subsequent readers and scan planning;
-    /// failures are retried on the next call. Construction and hint export do not trigger this
-    /// read. Scan planning can reuse a completed result but does not initialize this cache; a
-    /// preceding scan may have already resolved the same metadata independently. Reloads and
-    /// updates that replace the log segment resolve independently. Concurrent getters wait for
-    /// in-progress initialization. Neither that wait nor executor reads observe this reader's
-    /// cancellation token; reads use the executor's own cancellation behavior.
-    /// During initialization, the plan executor must not call this getter recursively on the same
-    /// snapshot: the recursive call would wait for the initialization already in progress.
+    /// The first getter or scan that needs checkpoint metadata resolves the complete leaf schema
+    /// and sidecar list through the engine's plan executor. Successful results are shared by all
+    /// readers and scan planning; failures are retried on the next call. Construction and hint
+    /// export do not trigger this read. Reloads and updates that replace the log segment resolve
+    /// independently. Concurrent callers wait for in-progress initialization. Neither that wait
+    /// nor executor reads observe this reader's cancellation token; reads use the executor's own
+    /// cancellation behavior. During initialization, the plan executor must not request checkpoint
+    /// metadata recursively on the same snapshot, including through scan planning: the recursive
+    /// call would wait for the initialization already in progress.
     /// Adaptive-metadata tables are unsupported.
     #[cfg(feature = "declarative-plans")]
     pub fn get_checkpoint_info(

@@ -1,8 +1,7 @@
 //! Resolves a checkpoint's layout and leaf schema for scan planning and metadata access.
 //!
-//! Scan planning and metadata access share complete discovery of the sidecar list, leaf schema,
-//! and portable hint. Scans can reuse a completed snapshot cache without waiting for
-//! initialization.
+//! Scan planning and metadata access share snapshot-cached discovery of the complete sidecar list,
+//! leaf schema, and portable hint.
 
 use std::borrow::Cow;
 use std::sync::{Arc, LazyLock};
@@ -23,26 +22,9 @@ use crate::plans::{Operation, PlanBuilder, PlanExecutor};
 use crate::schema::{
     ColumnNamesAndTypes, DataType, SchemaRef, StructType, ToSchema as _, schema_ref,
 };
-use crate::snapshot::Snapshot;
-use crate::{Engine, FileMeta, KernelError, KernelResult};
+use crate::{FileMeta, KernelError, KernelResult};
 
 impl CheckpointShape {
-    /// Reuses completed snapshot metadata, otherwise resolves the checkpoint independently.
-    /// Does not wait for or initialize the snapshot's checkpoint metadata cache.
-    pub(crate) fn for_scan(
-        snapshot: &Snapshot,
-        engine: &dyn Engine,
-    ) -> KernelResult<Option<Arc<Self>>> {
-        if let Some(cached) = snapshot.cached_checkpoint_info() {
-            return Ok(cached.clone());
-        }
-        if snapshot.log_segment().listed.checkpoint_parts.is_empty() {
-            return Ok(None);
-        }
-        let exec = engine.require_plan_executor()?;
-        Self::resolve(exec.as_ref(), snapshot.log_segment()).map(|shape| shape.map(Arc::new))
-    }
-
     /// Resolves the selected checkpoint's complete layout, leaf schema, and portable hint.
     #[tracing::instrument(
         name = "checkpoint_shape.resolve",
@@ -661,7 +643,7 @@ mod tests {
     #[rstest]
     #[case::json("v2-checkpoints-json-with-sidecars", 0)]
     #[case::parquet("v2-checkpoints-parquet-with-sidecars", 1)]
-    fn scan_resolves_complete_metadata_without_initializing_cache(
+    fn scan_caches_complete_metadata_for_getters_and_later_scans(
         #[case] table: &str,
         #[case] root_footer_reads: usize,
         #[values(false, true)] include_stats: bool,
@@ -717,22 +699,19 @@ mod tests {
                 .iter()
                 .all(|node| !matches!(node.op, Operator::DynamicScan(_)))
         );
-        assert!(snapshot.cached_checkpoint_info().is_none());
+        let cached = snapshot.cached_checkpoint_info().unwrap().as_ref().unwrap();
         assert_eq!(exec.io_counts(), (1, root_footer_reads + 1));
         let batches = exec.batches_read.load(Ordering::Relaxed);
         assert!(batches > 1);
 
-        // When: the getter resolves independently, then another getter and scan reuse its cache.
+        // When: the getter and another scan request the same checkpoint metadata.
         let info = resolve_checkpoint_info(&snapshot, &counted);
-        assert_eq!(exec.io_counts(), (2, 2 * (root_footer_reads + 1)));
-        assert_eq!(exec.batches_read.load(Ordering::Relaxed), 2 * batches);
-        let calls = exec.io_counts();
-        let cached = resolve_checkpoint_info(&snapshot, &counted);
         scan.declarative_metadata_scan_plan(&counted).unwrap();
 
         // Then: the cached result is shared and no further discovery is performed.
-        assert!(Arc::ptr_eq(&info, &cached));
-        assert_eq!(exec.io_counts(), calls);
+        assert!(Arc::ptr_eq(&info, cached));
+        assert_eq!(exec.io_counts(), (1, root_footer_reads + 1));
+        assert_eq!(exec.batches_read.load(Ordering::Relaxed), batches);
     }
 
     /// Builds a `LogSegment` whose applicable hint carries `v2Checkpoint.sidecarFiles == Some([])`
@@ -1032,8 +1011,10 @@ mod tests {
         );
     }
 
-    #[test]
-    fn concurrent_checkpoint_getter_waits_for_complete_result() {
+    #[rstest]
+    fn concurrent_checkpoint_access_waits_for_complete_result(
+        #[values(false, true)] waiting_scan: bool,
+    ) {
         // Given: a getter paused inside its footer read while holding initialization.
         let (engine, snapshot, _tempdir) =
             load_test_table("v2-checkpoints-parquet-with-sidecars").unwrap();
@@ -1046,21 +1027,29 @@ mod tests {
         });
         let counted = DelegatingEngine::new(engine.clone()).with_plan_executor(exec.clone());
         let without_executor = DelegatingEngine::new(engine).without_plan_executor();
+        let scan = snapshot.clone().scan_builder().build().unwrap();
 
         std::thread::scope(|scope| {
             let first = scope.spawn(|| snapshot.reader().get_checkpoint_info(&counted));
             entered_rx.recv_timeout(timeout).unwrap();
 
-            // When: a second getter enters without an executor while the result is incomplete.
+            // When: a scan or another getter enters without an executor during initialization.
             let (started_tx, started_rx) = mpsc::channel();
             let (done_tx, done_rx) = mpsc::channel();
             let snapshot = snapshot.as_ref();
             let waiting_engine = &without_executor;
             scope.spawn(move || {
                 started_tx.send(()).unwrap();
-                done_tx
-                    .send(snapshot.reader().get_checkpoint_info(waiting_engine))
-                    .unwrap();
+                let result = (|| {
+                    if waiting_scan {
+                        assert!(
+                            scan.declarative_metadata_scan_plan(waiting_engine)?
+                                .is_some()
+                        );
+                    }
+                    snapshot.reader().get_checkpoint_info(waiting_engine)
+                })();
+                done_tx.send(result).unwrap();
             });
             started_rx.recv_timeout(timeout).unwrap();
             let before_release = done_rx.recv_timeout(Duration::from_millis(100));
@@ -1081,74 +1070,46 @@ mod tests {
     #[rstest]
     #[case::manifest("v2-checkpoints-parquet-with-sidecars")]
     #[case::multipart("v1-multi-part-struct-stats-only")]
-    fn snapshot_readers_share_complete_metadata(
-        #[case] table: &str,
-        #[values(false, true)] scan_first: bool,
-    ) {
-        // Given: an unresolved snapshot, optionally preceded by scan planning.
+    fn snapshot_caches_complete_checkpoint_metadata(#[case] table: &str) {
+        // Given: an unresolved checkpoint with manifest or multipart layout.
         let (engine, snapshot, _tempdir) = load_test_table(table).unwrap();
         let exec = Arc::new(CountingExecutor::new());
         let counted = DelegatingEngine::new(engine).with_plan_executor(exec.clone());
         let cold_heap = snapshot.estimated_owned_heap_size_bytes();
-        if scan_first {
-            snapshot
-                .clone()
-                .scan_builder()
-                .build()
-                .unwrap()
-                .declarative_metadata_scan_plan(&counted)
-                .unwrap();
-        }
-        assert!(snapshot.cached_checkpoint_info().is_none());
-        let scan_calls = exec.io_counts();
 
-        // When: concurrent readers request complete metadata from the same snapshot.
-        let infos = std::thread::scope(|scope| {
-            let readers: Vec<_> = (0..8)
-                .map(|_| scope.spawn(|| resolve_checkpoint_info(&snapshot, &counted)))
-                .collect();
-            readers
-                .into_iter()
-                .map(|reader| reader.join().unwrap())
-                .collect::<Vec<_>>()
-        });
+        // When: a getter initializes metadata, followed by another reader.
+        let info = resolve_checkpoint_info(&snapshot, &counted);
+        let cached = resolve_checkpoint_info(&snapshot, &counted);
 
-        // Then: all readers share one result and pay for only one full resolution.
-        for info in &infos {
-            assert!(Arc::ptr_eq(info, &infos[0]));
-        }
-        let info = &infos[0];
+        // Then: readers share one complete result, whose allocations count toward snapshot size.
+        assert!(Arc::ptr_eq(&info, &cached));
         let calls = exec.io_counts();
         assert_eq!(
-            (calls.0 - scan_calls.0, calls.1 - scan_calls.1),
+            calls,
             if table.starts_with("v2") {
                 (0, 1)
             } else {
                 (0, 0)
             }
         );
-        let shape = CheckpointShape::for_scan(&snapshot, &counted)
-            .unwrap()
-            .unwrap();
-        assert!(Arc::ptr_eq(info, &shape));
         assert!(
             snapshot.estimated_owned_heap_size_bytes()
-                >= cold_heap + std::mem::size_of_val(shape.sidecars.as_ref())
+                >= cold_heap + std::mem::size_of_val(info.sidecars.as_ref())
         );
 
         let roots = &snapshot.log_segment().listed.checkpoint_parts;
         let expected_bytes = roots
             .iter()
             .map(|root| root.location.size)
-            .chain(shape.sidecars.as_ref().iter().map(|file| file.size))
+            .chain(info.sidecars.iter().map(|file| file.size))
             .sum::<u64>();
         assert_eq!(info.size_in_bytes(), expected_bytes);
         assert_eq!(
             info.leaf_file_count(),
-            if shape.sidecars.as_ref().is_empty() {
+            if info.sidecars.is_empty() {
                 roots.len()
             } else {
-                shape.sidecars.as_ref().len()
+                info.sidecars.len()
             }
         );
         assert_eq!(info.last_checkpoint().version(), roots[0].version);
@@ -1162,7 +1123,6 @@ mod tests {
             matches!(roots[0].file_type, LogPathFileType::UuidCheckpoint)
         );
         assert_eq!(info.last_checkpoint().checksum(), None);
-        assert_eq!(info.leaf_schema(), shape.leaf_schema());
 
         // When / Then: another scan reuses those facts without additional I/O.
         snapshot
@@ -1355,14 +1315,16 @@ mod tests {
             .size_in_bytes = sidecar_bytes;
         let (engine, original, _tempdir) =
             load_test_table("v2-checkpoints-json-with-sidecars").unwrap();
-        let snapshot = Snapshot::new(segment, original.table_configuration().clone()).unwrap();
+        let snapshot =
+            Arc::new(Snapshot::new(segment, original.table_configuration().clone()).unwrap());
         let exec = Arc::new(CountingExecutor::new());
         let engine = DelegatingEngine::new(engine).with_plan_executor(exec.clone());
+        let scan = snapshot.clone().scan_builder().build().unwrap();
 
         for _ in 0..2 {
-            // When: scan discovery or a getter attempts resolution, including after a failure.
+            // When: scan planning or a getter attempts resolution, including after a failure.
             let error = if scan_first {
-                CheckpointShape::for_scan(&snapshot, &engine).unwrap_err()
+                scan.declarative_metadata_scan_plan(&engine).unwrap_err()
             } else {
                 snapshot.reader().get_checkpoint_info(&engine).unwrap_err()
             };
@@ -1387,20 +1349,24 @@ mod tests {
         // Given: a snapshot with no checkpoint and no executor.
         let (engine, snapshot, _tempdir) = load_test_table("app-txn-no-checkpoint").unwrap();
         let engine = DelegatingEngine::new(engine).without_plan_executor();
-        // When / Then: scan discovery returns absence without an executor or cache publication.
+        let scan = snapshot.clone().scan_builder().build().unwrap();
+
+        // When: scan planning resolves checkpoint absence without an executor.
         assert!(
-            CheckpointShape::for_scan(&snapshot, &engine)
+            scan.declarative_metadata_scan_plan(&engine)
+                .unwrap()
+                .is_some()
+        );
+        assert!(matches!(snapshot.cached_checkpoint_info(), Some(None)));
+
+        // Then: the getter shares the cached absence without requiring an executor.
+        assert!(
+            snapshot
+                .reader()
+                .get_checkpoint_info(&engine)
                 .unwrap()
                 .is_none()
         );
-        assert!(snapshot.cached_checkpoint_info().is_none());
-
-        // When: its checkpoint metadata is requested.
-        let info = snapshot.reader().get_checkpoint_info(&engine).unwrap();
-
-        // Then: absence is returned without requiring an executor.
-        assert!(info.is_none());
-        assert!(matches!(snapshot.cached_checkpoint_info(), Some(None)));
     }
 
     #[rstest]

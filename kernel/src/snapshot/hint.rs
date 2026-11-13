@@ -583,10 +583,16 @@ mod tests {
         );
         assert!(snapshot.cached_checkpoint_info().is_none());
 
-        // When: the getter resolves the checkpoint and its hint is exported.
+        // When: scan planning resolves the checkpoint and its hint is exported.
+        snapshot
+            .clone()
+            .scan_builder()
+            .build()?
+            .declarative_metadata_scan_plan(engine.as_ref())?;
         let resolved = snapshot
-            .reader()
-            .get_checkpoint_info(engine.as_ref())?
+            .cached_checkpoint_info()
+            .expect("scan populated checkpoint cache")
+            .as_ref()
             .unwrap();
         let mut exported = snapshot.to_snapshot_hint()?;
 
@@ -600,7 +606,7 @@ mod tests {
             .reader()
             .get_checkpoint_info(&no_executor)?
             .unwrap();
-        assert!(Arc::ptr_eq(&resolved, &cached));
+        assert!(Arc::ptr_eq(resolved, &cached));
         let portable = serde_json::to_value(exported.last_checkpoint_hint().unwrap()).unwrap();
         let parsed: LastCheckpointHint = serde_json::from_value(portable.clone()).unwrap();
         assert_eq!(serde_json::to_value(&parsed).unwrap(), portable);

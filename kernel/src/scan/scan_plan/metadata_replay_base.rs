@@ -33,7 +33,7 @@ impl MetadataReplayBase {
             });
         }
 
-        let shape = CheckpointShape::for_scan(snapshot, engine)?;
+        let shape = snapshot.checkpoint_info(engine)?;
         Ok(Self::Checkpoint {
             version: checkpoint_version,
             shape,
@@ -99,6 +99,10 @@ mod tests {
         assert_eq!(base.version(), Some(version));
         let is_crc = matches!(base, MetadataReplayBase::Crc { .. });
         assert_eq!(is_crc, has_all_files);
+        assert_eq!(
+            scan.snapshot.cached_checkpoint_info().is_some(),
+            !has_all_files
+        );
         Ok(())
     }
 

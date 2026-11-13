@@ -9,7 +9,7 @@ use super::action_set::ActionSet;
 use super::*;
 use crate::actions::{DomainMetadata, SetTransaction, get_all_actions_schema};
 use crate::arrow::compute::{concat_batches, filter_record_batch, is_not_null};
-use crate::checkpoint::{CheckpointShape, CheckpointSpec, V2CheckpointConfig};
+use crate::checkpoint::{CheckpointSpec, V2CheckpointConfig};
 use crate::engine::arrow_conversion::TryIntoArrow;
 use crate::engine::sync::SyncEngine;
 use crate::scan::StatsOptions;
@@ -101,7 +101,7 @@ async fn replay_selects_latest_action_without_retention(
     let snapshot = build_snapshot!(VersionTarget::Latest, &table_root, &engine);
     let checkpoint_shape = actions
         .live_adds
-        .then(|| CheckpointShape::for_scan(&snapshot, &engine))
+        .then(|| snapshot.checkpoint_info(&engine))
         .transpose()?
         .flatten();
     let state = MetadataPlanner::new(snapshot.log_segment(), actions)

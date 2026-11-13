@@ -215,7 +215,7 @@ fn declarative_scan_without_checkpoint_action_does_not_require_checkpoint_info_s
         "Checkpoint info does not support adaptive metadata",
     );
 
-    // When: declarative scan planning uses its independent checkpoint probe.
+    // When: declarative scan planning resolves checkpoint state internally.
     let plan = scan.declarative_metadata_scan_plan(&engine).unwrap();
 
     // Then: planning succeeds while the complete-metadata getter remains unsupported.

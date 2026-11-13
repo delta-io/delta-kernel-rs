@@ -155,7 +155,6 @@ mod tests {
             }), false),
         )]
         checkpoint: (CheckpointSpec, bool),
-        #[values(false, true)] getter_first: bool,
     ) -> KernelResult<()> {
         // Given: a checkpoint containing file actions, tombstones, and non-file actions.
         let (spec, use_sidecar_hint) = checkpoint;
@@ -269,12 +268,9 @@ mod tests {
             use_sidecar_hint
         );
         let snapshot = Snapshot::new(segment, snapshot.table_configuration().clone())?;
-        if getter_first {
-            snapshot.reader().get_checkpoint_info(&engine)?;
-        }
         let checkpoint_shape = actions
             .contains_content_actions()
-            .then(|| CheckpointShape::for_scan(&snapshot, &engine))
+            .then(|| snapshot.checkpoint_info(&engine))
             .transpose()?
             .flatten();
 

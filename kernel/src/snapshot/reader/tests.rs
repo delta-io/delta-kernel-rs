@@ -14,39 +14,6 @@ use crate::unit_test_utils::{
 };
 use crate::{CancellationTokenRef, KernelError, Snapshot};
 
-#[cfg(feature = "declarative-plans")]
-#[test]
-fn scan_does_not_wait_for_checkpoint_info_initialization() {
-    // Given: the complete-metadata initialization lock is held by another operation.
-    let (engine, snapshot, _tempdir) =
-        crate::unit_test_utils::load_test_table("v2-checkpoints-parquet-with-sidecars").unwrap();
-    let guard = snapshot.checkpoint_info_init.lock().unwrap();
-    let scan = snapshot.clone().scan_builder().build().unwrap();
-    let (sender, receiver) = std::sync::mpsc::channel();
-
-    // When: scan planning runs while initialization remains locked.
-    let result = std::thread::scope(|scope| {
-        scope.spawn(|| {
-            sender
-                .send(scan.declarative_metadata_scan_plan(engine.as_ref()))
-                .unwrap();
-        });
-        let result = receiver.recv_timeout(std::time::Duration::from_secs(10));
-        // Release initialization even if the scan incorrectly waited for it.
-        drop(guard);
-        result
-    });
-
-    // Then: it completes without waiting for or publishing full checkpoint metadata.
-    assert!(
-        result
-            .expect("scan waited for full checkpoint resolution")
-            .unwrap()
-            .is_some()
-    );
-    assert!(snapshot.cached_checkpoint_info().is_none());
-}
-
 /// Independent readers neither inherit a completed build token nor alter another reader's scope.
 #[test]
 fn reader_scopes_are_independent_and_release_their_tokens() {

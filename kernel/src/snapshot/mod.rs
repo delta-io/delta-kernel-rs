@@ -353,11 +353,12 @@ impl Snapshot {
         if let Some(resolved) = self.checkpoint_info.get() {
             return Ok(resolved.clone());
         }
-        // The mutex only serializes initialization; OnceLock publishes a complete value. A panic
-        // in engine code cannot leave partial state, so a later call can retry after poisoning.
+        // Fallible OnceLock initialization is unstable on our MSRV. Serialize discovery so
+        // concurrent callers share one result while errors leave initialization retryable.
         let _guard = self
             .checkpoint_info_init
             .lock()
+            // A panicking initializer cannot publish partial state, so retry after poisoning.
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(resolved) = self.checkpoint_info.get() {
             return Ok(resolved.clone());
