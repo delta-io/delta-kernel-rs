@@ -82,7 +82,7 @@ use crate::{Engine, KernelError, KernelResult, KernelResultIterator, Version};
 /// The pointer order matches the [`CommitOrdering`] requested at build time (ascending by
 /// default; reversed if [`CommitOrdering::DescendingOrder`]). Reading the underlying actions is
 /// lazy via [`CommitRange::commits`].
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct CommitRange {
     table_root: Url,
     commit_files: Vec<ParsedLogPath>,

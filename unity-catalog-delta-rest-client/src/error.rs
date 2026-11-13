@@ -49,6 +49,9 @@ impl From<Error> for unity_catalog_delta_client_api::Error {
     fn from(e: Error) -> Self {
         match e {
             Error::Api(api_err) => api_err,
+            Error::Http(error) if error.is_connect() => {
+                unity_catalog_delta_client_api::Error::Retryable(error.to_string())
+            }
             e => unity_catalog_delta_client_api::Error::Generic(e.to_string()),
         }
     }

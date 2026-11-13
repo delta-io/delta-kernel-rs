@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::sync::RwLock;
 
-use super::UpdateTableClient;
+use super::{CommitState, UpdateTableClient};
 use crate::error::{Error, Result};
 use crate::models::{
     Commit, LoadTableResponse, TableIdentifier, TableMetadata, UpdateTableRequest,
@@ -43,6 +43,11 @@ impl TableData {
             Error::UnsupportedOperation("add-commit update is required".to_string())
         })?;
 
+        if commit.version >= 0 && commit.version <= self.max_ratified_version {
+            return Err(Error::CommitVersionAlreadyExists {
+                version: commit.version,
+            });
+        }
         let expected_version = self.max_ratified_version + 1;
         if commit.version != expected_version {
             return Err(Error::UnsupportedOperation(format!(
@@ -151,6 +156,22 @@ impl Default for InMemoryUpdateTableClient {
 }
 
 impl UpdateTableClient for InMemoryUpdateTableClient {
+    async fn get_commits(
+        &self,
+        _target: &TableIdentifier,
+        table_uuid: &str,
+    ) -> Result<CommitState> {
+        let tables = self.tables.read().unwrap();
+        let table = tables
+            .get(table_uuid)
+            .ok_or_else(|| Error::TableNotFound(table_uuid.to_string()))?;
+        Ok(CommitState {
+            table_uuid: table_uuid.to_string(),
+            latest_version: table.max_ratified_version,
+            commits: table.catalog_commits.clone(),
+        })
+    }
+
     async fn update_table(
         &self,
         _target: &TableIdentifier,
@@ -267,6 +288,28 @@ mod tests {
                 .await,
             Err(Error::TableNotFound(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn duplicate_version_is_a_confirmed_conflict_and_preserves_catalog_history() {
+        let client = InMemoryUpdateTableClient::new();
+        client.create_table(TABLE_ID).unwrap();
+        client
+            .update_table(&target(), commit_request(1, None))
+            .await
+            .unwrap();
+        let result = client
+            .update_table(&target(), commit_request(1, None))
+            .await;
+        assert!(matches!(
+            result,
+            Err(Error::CommitVersionAlreadyExists { version: 1 })
+        ));
+        let state = client.get_commits(&target(), TABLE_ID).await.unwrap();
+        assert_eq!(state.table_uuid, TABLE_ID);
+        assert_eq!(state.latest_version, 1);
+        assert_eq!(state.commits.len(), 1);
+        assert_eq!(state.commits[0].version, 1);
     }
 
     #[tokio::test]

@@ -5,10 +5,11 @@ use std::collections::HashMap;
 use url::Url;
 
 use crate::actions::{DomainMetadata, Metadata, Protocol};
+use crate::commit_range::CommitRange;
 use crate::path::LogRoot;
 #[cfg(any(test, feature = "test-utils"))]
 use crate::schema::schema_ref;
-use crate::{KernelResult, Version};
+use crate::{KernelError, KernelResult, Version};
 
 /// The type of commit operation being performed. This communicates to the committer whether this
 /// is a table creation or a write to an existing table, and whether the table is catalog-managed.
@@ -345,19 +346,42 @@ impl CommitMetadata {
     }
 }
 
-/// `CommitResponse` is the result of committing a transaction via a catalog. The committer uses
-/// this type to indicate whether or not the commit was successful or conflicted. The kernel then
-/// transforms the associated [`Transaction`] into the appropriate state.
+/// Outcome of an atomic commit attempt through a catalog or filesystem.
 ///
-/// If the commit was successful, the committer returns `CommitResponse::Committed` with the commit
-/// version set. If the commit conflicted (e.g. another writer committed to the same version), the
-/// Committer returns `CommitResponse::Conflict` with the version that was attempted.
+/// A confirmed temporary rejection returns [`Self::Retryable`], allowing the same version to be
+/// attempted without rebasing after the failure is addressed. Errors with an uncertain write
+/// outcome must remain errors; they cannot be classified as Retryable based on a timeout alone.
+/// Kernel transforms the associated [`Transaction`] into the appropriate state.
 ///
 /// [`Transaction`]: crate::transaction::Transaction
 #[derive(Debug)]
 pub enum CommitResponse {
-    Committed { file_meta: crate::FileMeta },
-    Conflict { version: Version },
+    /// The commit succeeded.
+    Committed {
+        /// Location and metadata of the accepted commit file.
+        file_meta: crate::FileMeta,
+    },
+    /// Another commit occupies the proposed version.
+    Conflict {
+        /// The rejected version.
+        version: Version,
+        /// Complete winning history, or its load error without losing the confirmed conflict.
+        ///
+        /// The range contains ascending, contiguous individual commits from `version` through a
+        /// finite observed latest version. Missing commits produce a load error even if covered
+        /// by a checkpoint. Catalog committers merge published files with ratified catalog
+        /// commits. A failed load is preserved for inspection; restart the transaction to
+        /// obtain fresh history.
+        commits: KernelResult<CommitRange>,
+    },
+    /// A temporary failure prevented acceptance of this commit attempt.
+    ///
+    /// The committer must establish that this attempt did not commit. No rebase is required to
+    /// retry the same version, though the caller may need to wait or publish outstanding commits.
+    Retryable {
+        /// The failure that must be addressed before another attempt.
+        error: KernelError,
+    },
 }
 
 #[cfg(test)]

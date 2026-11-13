@@ -15,6 +15,8 @@ design decisions. This map provides entry points and broader design context.
 | Build or execute a read | `kernel/src/scan/` | `log_replay/`, `actions/deletion_vector.rs` |
 | Read changes between versions | `kernel/src/incremental_scan/`, `kernel/src/table_changes/` | `log_replay/` |
 | Create or modify a table | `kernel/src/transaction/` | `committer/`, `partition/` |
+| Prepare or submit declarative transactions | `kernel/src/transaction/prepared/` | `transaction/declarative.rs`, `ffi/src/transaction/prepared.rs` |
+| Discover winning commits after a conflict | `kernel/src/committer/` | `commit_range/`, `transaction/conflict.rs`, `delta-kernel-unity-catalog/` |
 | Write checkpoints or CRCs | `kernel/src/checkpoint/`, `kernel/src/crc/` | `actions/` |
 | Implement engine capabilities | `kernel/src/lib.rs`, `kernel/src/engine/` | `default-engine/src/` |
 | Change schemas or expressions | `kernel/src/schema/`, `kernel/src/expressions/` | `transforms/` |

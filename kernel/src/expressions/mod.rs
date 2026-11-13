@@ -125,6 +125,12 @@ pub enum BinaryPredicateOp {
 /// A unary expression operator.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum UnaryExpressionOp {
+    /// Number of entries in a map as LONG. A NULL map produces NULL; an empty map produces zero.
+    MapSize,
+    /// Map keys as an array with the map's key type and no null elements.
+    /// A NULL map produces NULL; an empty map produces an empty array. Keys retain their order
+    /// and duplicates, independently of whether the associated values are null.
+    MapKeys,
     /// SQL `to_json(expr)`: encode a struct as a JSON object string, one string per row. The input
     /// must be a struct and the output is STRING. A NULL input row produces a NULL string rather
     /// than `"null"`. This is the inverse of [`ParseJsonExpression`] for every type except
@@ -1237,6 +1243,8 @@ impl Display for UnaryExpressionOp {
         use UnaryExpressionOp::*;
         match self {
             ToJson => write!(f, "TO_JSON"),
+            MapSize => write!(f, "MAP_SIZE"),
+            MapKeys => write!(f, "MAP_KEYS"),
         }
     }
 }

@@ -24,3 +24,10 @@ automatically.
 (cd datafusion-executor && cargo build)
 (cd datafusion-executor && cargo test)
 ```
+
+## Transaction plan support
+
+Expression lowering returns Unsupported for `ToJson`, `MapSize`, and `MapKeys`. Declarative
+transaction plans that use these expressions require an executor that implements them;
+`SyncPlanExecutor` supports the preparation and commit path. Keep expression lowering exhaustive
+when adding kernel operators.

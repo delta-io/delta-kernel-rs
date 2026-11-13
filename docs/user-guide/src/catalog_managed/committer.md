@@ -32,14 +32,16 @@ pub trait Committer: Send {
 }
 ```
 
-The trait has three methods. Two (`commit()` and `publish()`) carry the real
-logic; the third (`is_catalog_committer()`) is a one-line method that returns a
-constant:
+This excerpt shows the required methods. `commit()` and `publish()` perform I/O;
+`is_catalog_committer()` identifies the committer type:
 
 1. **`commit()`** atomically commits the given actions at the version specified in
    `CommitMetadata`. Returns `CommitResponse::Committed` on success or
-   `CommitResponse::Conflict { version }` if another writer already committed this
-   version.
+   `CommitResponse::Conflict { version, commits }` if another writer already committed this
+   version. Bundle complete winning history in `commits`; if discovery fails, put the load error
+   in that field so the response still reports a confirmed conflict.
+   Return `CommitResponse::Retryable { error }` for a temporary failure known to have
+   prevented acceptance of the commit.
 
 2. **`is_catalog_committer()`** returns `true` for catalog committers. Kernel checks
    this flag on both commit and publish paths and enforces the pairing in both
@@ -50,6 +52,14 @@ constant:
    `_delta_log/` directory as published delta files. Some catalogs publish
    server-side, in which case `publish()` only notifies the catalog; others use
    PUT-if-absent copies from the client.
+
+After a confirmed version conflict, the committer loads and bundles the history needed for conflict
+checking. Catalog committers combine published files with catalog-ratified commits and report a
+history-load error if any required version is missing. Kernel saves the bundled history or its
+error on the conflict result. `get_winning_commits()` returns only that saved range or error and
+performs no I/O. If discovery failed, load a fresh Snapshot and rebuild your transaction. Success,
+temporary rejection, and unknown outcomes skip discovery. The trait also provides an optional
+declarative commit method; see its rustdoc for the complete API.
 
 ## CommitMetadata
 
@@ -99,11 +109,14 @@ the full list.
 pub enum CommitResponse {
     Committed { file_meta: FileMeta },
     Conflict { version: Version },
+    Retryable { error: KernelError },
 }
 ```
 
 Return `Committed` with the `FileMeta` of the staged commit file on success. Return
 `Conflict` with the attempted version if another writer already committed that version.
+Return `Retryable` only when the attempt is known not to have committed and the failure can be
+addressed before retrying the same version. Uncertain outcomes must remain errors.
 
 ## Implementing a catalog committer
 
@@ -165,11 +178,20 @@ shape:
 }
 ```
 
-Map your catalog's "another writer won this version" error to `CommitResponse::Conflict { version:
-commit_metadata.version() }` rather than propagating it as an `Err`. Return other errors as
-`Err(...)`. Kernel classifies only `KernelError::IOError` as retryable (surfaced as
-`CommitResult::Retryable`); return `IOError` for transient storage failures and other variants for
-everything else. Do not disguise non-I/O errors as `IOError` to opt into retry semantics.
+Map your catalog's "another writer won this version" error to `CommitResponse::Conflict` and
+include the rejected version and a winning-history discovery result. Return the confirmed conflict
+even if loading history fails. Kernel saves the bundled history or discovery error; result getters
+perform no I/O. A failed discovery requires a fresh Snapshot and rebuilt transaction. Return
+`CommitResponse::Retryable { error }` for confirmed temporary failures, such as a connection failure
+before sending the request or a catalog rejection requiring outstanding commits to be published.
+The pending transaction can then retry the same version without rebasing. Retryable outcomes do
+not trigger winning-history discovery or an automatic retry loop.
+
+Return other errors as `Err(...)`. Prepared declarative transactions preserve these as `Unknown`
+outcomes and block resubmission until the submitted outcome is resolved. A timeout after sending
+the request is insufficient evidence that the commit failed. Imperative transactions also retain
+their existing `KernelError::IOError` to `CommitResult::Retryable` mapping; do not disguise other
+errors as `IOError` to opt into retry semantics.
 
 ### Step 3: Mark as catalog committer
 

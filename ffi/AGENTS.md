@@ -784,6 +784,13 @@ Snapshot hints live under `src/snapshot/hint/`, matching `kernel/src/snapshot/hi
 Snapshot builders live in `src/snapshot/builder.rs`; snapshot accessors live in `src/lib.rs`.
 FFI-specific ownership, conversion, and engine support code can use its own modules.
 
+## Expression callback compatibility
+
+`EngineExpressionVisitor` is a fixed-layout callback table. Its `visit_map_size` callback receives
+one map child and produces LONG, preserving null and returning zero for an empty map. Bindings must
+initialize the full table from matching generated headers; adding a callback changes its ABI.
+With `declarative-plans`, FFI also exposes the prepared transaction lifecycle; see Write Flow.
+
 ## Key Files
 
 - `src/lib.rs` -- main FFI entry points and type definitions
@@ -924,7 +931,8 @@ reuses `ScanMetadataArrowResult` with null `transforms`.
 
 Rust builders are aliases for `TransactionBuilder<CreateTable>` and
 `TransactionBuilder<UpdateTable>`, both using the default `Imperative` execution mode. Rust callers
-can select another mode on the builder; the FFI descriptors expose imperative transactions.
+can select another mode on the builder. Imperative FFI descriptors retain their existing API;
+`declarative-plans` also exposes explicit declarative build/prepare and owning outcome handles.
 Keep their concrete opaque FFI descriptors and explicit
 `create_table_txn_builder_*` / `update_table_txn_builder_*` exports. Shared Rust setters do not imply
 a universal C handle; custom setters are exposed only for their applicable builder descriptor.
@@ -943,6 +951,28 @@ get_default_engine() -> get_snapshot_builder() -> snapshot_builder_build()
                                                                                   v
                                                                   free_committed_transaction
 ```
+
+Declarative lifecycle (`declarative-plans`): configure the existing create/update builder, then call
+`*_txn_builder_build_declarative(builder, optional_committer, engine)`. Collect engine-held inputs
+with `declarative_*_txn_add_files` / `declarative_update_table_txn_remove_files`, then consume the
+transaction with `declarative_*_txn_prepare(txn, scope, engine)`. Commit the returned
+`ExclusivePreparedTransaction` with `prepared_transaction_commit` and inspect its typed outcome.
+`prepared_transaction_commit_result_take_pending` transfers pending work exactly once, leaving the
+result's saved history or discovery error available.
+`prepared_transaction_commit_result_get_winning_commits` returns an independent SharedCommitRange
+or the saved error without I/O. Its engine argument supplies error allocation only. If initial
+discovery failed, restart from a fresh Snapshot and rebuild the transaction. Success, Retryable,
+and Unknown do not perform history discovery. Rebase returns Unsupported without consuming pending
+work. Free results, pending transactions, views, and range handles as documented.
+
+Prepared/result handles retain a SharedScopedPlanExecutor; scope cleanup waits for all such owners.
+`get_scoped_plan_executor` registers execution, retention, and final cleanup callbacks. Relations
+carry an ID and schema; `new_relation_ref` does not retain rows. The host must reject foreign or
+expired identifiers. `get_declarative_committer` registers commit/publication services.
+Commit callbacks receive one borrowed descriptor slice and metadata; callback outputs transfer
+ownership. A conflict bundles a winning-range handle or its load error. There is no history-recovery
+callback; releasing pending work releases its committer independently of the saved result.
+Error messages and schema outputs use owned byte buffers with named cleanup.
 
 Update operations, engine info, and `data_change` are required at construction and cannot be changed.
 `new_update_table_txn_builder` accepts a typed operation;

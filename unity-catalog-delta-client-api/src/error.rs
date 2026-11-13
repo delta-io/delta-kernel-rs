@@ -11,9 +11,26 @@ pub enum Error {
     #[error("Table not found: {0}")]
     TableNotFound(String),
 
+    /// A different commit has already been ratified at the submitted version.
+    ///
+    /// Implementations must only return this after confirming a version conflict. An ETag
+    /// mismatch or an uncertain request outcome alone is insufficient.
+    #[error("Commit version {version} already exists")]
+    CommitVersionAlreadyExists {
+        /// The rejected commit version.
+        version: i64,
+    },
+
     /// The number of unpublished commits has exceeded the maximum allowed.
     #[error("Max unpublished commits exceeded (max: {0})")]
     MaxUnpublishedCommitsExceeded(u16),
+
+    /// A temporary failure known to have prevented acceptance of the update.
+    ///
+    /// The caller may retry after addressing the failure. Timeouts after sending the update do
+    /// not establish that it failed and must not be classified using this variant.
+    #[error("Retryable request failure: {0}")]
+    Retryable(String),
 
     /// The requested operation is not supported.
     #[error("Operation not supported: {0}")]

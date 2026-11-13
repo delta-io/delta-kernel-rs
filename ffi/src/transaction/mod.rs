@@ -1,9 +1,17 @@
 //! This module holds functionality for managing transactions.
 mod committed;
+#[cfg(feature = "declarative-plans")]
+mod committer;
+#[cfg(feature = "declarative-plans")]
+pub use committer::*;
 mod create_table;
 mod deletion_vector;
 mod deletion_vector_writer;
 mod partition_value;
+#[cfg(feature = "declarative-plans")]
+mod prepared;
+#[cfg(feature = "declarative-plans")]
+pub use prepared::*;
 mod transaction_id;
 mod update_table;
 mod write_context;

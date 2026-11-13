@@ -316,6 +316,41 @@ pub fn evaluate_expression(
         (Predicate(_), Some(data_type)) => Err(KernelError::generic(format!(
             "Predicate evaluation produces boolean output, but caller expects {data_type:?}"
         ))),
+        (Unary(UnaryExpression { op: MapSize, expr }), result_type) => {
+            if result_type.is_some_and(|t| t != &DataType::LONG) {
+                return Err(KernelError::invalid_expression(
+                    "MapSize requires LONG output",
+                ));
+            }
+            let input = evaluate_expression(expr, batch, None)?;
+            let map = input
+                .as_any()
+                .downcast_ref::<MapArray>()
+                .ok_or_else(|| KernelError::invalid_expression("MapSize requires a map input"))?;
+            let sizes = arrow_array::Int64Array::from_iter(
+                (0..map.len())
+                    .map(|row| map.is_valid(row).then(|| i64::from(map.value_length(row)))),
+            );
+            Ok(Arc::new(sizes))
+        }
+        (Unary(UnaryExpression { op: MapKeys, expr }), result_type) => {
+            let input = evaluate_expression(expr, batch, None)?;
+            let map = input
+                .as_any()
+                .downcast_ref::<MapArray>()
+                .ok_or_else(|| KernelError::invalid_expression("MapKeys requires a map input"))?;
+            let keys = ListArray::try_new(
+                Arc::new(ArrowField::new(
+                    LIST_ARRAY_ROOT,
+                    map.keys().data_type().clone(),
+                    false,
+                )),
+                map.offsets().clone(),
+                map.keys().clone(),
+                map.nulls().cloned(),
+            )?;
+            validate_array_type(Arc::new(keys), result_type)
+        }
         (Unary(UnaryExpression { op: ToJson, expr }), result_type) => match result_type {
             None | Some(&DataType::STRING) => {
                 let input = evaluate_expression(expr, batch, None)?;
@@ -2431,6 +2466,70 @@ mod tests {
         let result = evaluate_expression(&expr, &batch, Some(&output_type)).unwrap();
         let result = result.as_any().downcast_ref::<StructArray>().unwrap();
         assert_eq!(result.is_null(0), expect_null_struct);
+    }
+
+    #[test]
+    fn map_size_preserves_null_and_distinguishes_empty_maps() {
+        let mut builder = crate::arrow::array::MapBuilder::new(
+            None,
+            crate::arrow::array::StringBuilder::new(),
+            crate::arrow::array::StringBuilder::new(),
+        );
+        builder.append(false).unwrap();
+        builder.append(true).unwrap();
+        builder.keys().append_value("key");
+        builder.values().append_value("value");
+        builder.append(true).unwrap();
+        let batch =
+            RecordBatch::try_from_iter([("m", Arc::new(builder.finish()) as ArrayRef)]).unwrap();
+        let expr = Expr::unary(UnaryExpressionOp::MapSize, col!("m"));
+        let result = evaluate_expression(&expr, &batch, Some(&DataType::LONG)).unwrap();
+        assert_eq!(
+            result.as_any().downcast_ref::<Int64Array>().unwrap(),
+            &Int64Array::from(vec![None, Some(0), Some(1)])
+        );
+        assert!(evaluate_expression(&expr, &batch, Some(&DataType::STRING)).is_err());
+        let expr = Expr::unary(UnaryExpressionOp::MapSize, lit("not a map"));
+        assert!(evaluate_expression(&expr, &batch, None).is_err());
+    }
+
+    #[test]
+    fn map_keys_preserves_null_maps_duplicate_keys_and_sliced_offsets() {
+        let mut builder = MapBuilder::new(None, StringBuilder::new(), StringBuilder::new());
+        builder.keys().append_value("skip");
+        builder.values().append_value("skip");
+        builder.append(true).unwrap();
+        builder.append(false).unwrap();
+        builder.append(true).unwrap();
+        builder.keys().append_value("key");
+        builder.values().append_null();
+        builder.keys().append_value("key");
+        builder.values().append_value("value");
+        builder.append(true).unwrap();
+        builder.keys().append_value("other");
+        builder.values().append_value("value");
+        builder.append(true).unwrap();
+        let map = builder.finish().slice(1, 4);
+        let batch = RecordBatch::try_from_iter([("m", Arc::new(map) as ArrayRef)]).unwrap();
+        let expr = Expr::unary(UnaryExpressionOp::MapKeys, col!("m"));
+        let output_type = DataType::from(crate::schema::ArrayType::new(DataType::STRING, false));
+        let result = evaluate_expression(&expr, &batch, Some(&output_type)).unwrap();
+        let keys = result.as_list::<i32>();
+        assert_eq!(keys.len(), 4);
+        assert!(keys.is_null(0));
+        assert!(!keys.is_null(1));
+        assert_eq!(keys.value_length(1), 0);
+        assert_eq!(
+            keys.value(2).as_string::<i32>(),
+            &StringArray::from(vec!["key", "key"])
+        );
+        assert_eq!(
+            keys.value(3).as_string::<i32>(),
+            &StringArray::from(vec!["other"])
+        );
+        assert!(evaluate_expression(&expr, &batch, Some(&DataType::LONG)).is_err());
+        let expr = Expr::unary(UnaryExpressionOp::MapKeys, lit("not a map"));
+        assert!(evaluate_expression(&expr, &batch, None).is_err());
     }
 
     /// Delta truncates timestamp stats down to milliseconds, so `ToJson` must emit exactly three

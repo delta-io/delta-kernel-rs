@@ -6,8 +6,8 @@ use delta_kernel::commit_range::CommitRange;
 use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::path::LogPathFileType;
 use delta_kernel::schema::schema_ref;
-use delta_kernel::transaction::UpdateTableOperation;
 use delta_kernel::transaction::create_table::create_table;
+use delta_kernel::transaction::{CommitResult, UpdateTableOperation};
 use delta_kernel::{Engine, KernelError, Snapshot};
 use delta_kernel_default_engine::DefaultEngine;
 use delta_kernel_default_engine::executor::tokio::TokioMultiThreadExecutor;
@@ -367,7 +367,7 @@ async fn test_catalog_response_rejects_duplicate_commit_versions(
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn test_insert_without_publish_hits_limit() -> Result<(), TestError> {
+async fn test_insert_without_publish_returns_retryable_at_limit() -> Result<(), TestError> {
     let TestSetup {
         update_table_client,
         engine,
@@ -383,17 +383,23 @@ async fn test_insert_without_publish_hits_limit() -> Result<(), TestError> {
     }
     assert_eq!(snapshot.version(), max);
 
-    // Next insert should fail with MaxUnpublishedCommitsExceeded
     let committer = Box::new(uc_committer(&update_table_client));
-    let err = snapshot
+    let result = snapshot
         .clone()
         .update_table(UpdateTableOperation::Write, "test-engine", true)
         .build(&engine, committer)?
-        .commit(&engine)
-        .unwrap_err();
+        .commit(&engine)?;
+    let CommitResult::Retryable(pending) = result else {
+        panic!("Expected a retryable unpublished-commit limit rejection");
+    };
     assert!(
-        matches!(err, delta_kernel::KernelError::Generic(msg) if msg.contains("Max unpublished commits"))
+        pending
+            .error
+            .to_string()
+            .contains("Max unpublished commits")
     );
+    let state = update_table_client.load_table_response(TABLE_ID, "memory:///")?;
+    assert_eq!(state.latest_table_version, Some(max as i64));
     Ok(())
 }
 

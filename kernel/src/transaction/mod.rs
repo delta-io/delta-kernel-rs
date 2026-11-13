@@ -55,8 +55,14 @@ pub use builder::{TransactionBuilder, TransactionType};
 use commit_info::collect_operation_metadata;
 mod bound_write_context;
 mod commit_info;
+mod conflict;
+pub use conflict::WinningCommitHistory;
 #[cfg(feature = "declarative-plans")]
 mod declarative;
+#[cfg(feature = "declarative-plans")]
+mod prepared;
+#[cfg(feature = "declarative-plans")]
+pub use prepared::{PreparedTransaction, PreparedTransactionCommitResult, SubmittedAttempt};
 mod domain_metadata;
 mod exec_mode;
 mod imperative;
@@ -1433,10 +1439,20 @@ impl<STATE, MODE: ExecutionMode> Transaction<STATE, MODE> {
         })
     }
 
-    fn into_conflicted(self, conflict_version: Version) -> ConflictedTransaction<STATE, MODE> {
+    fn into_conflicted(
+        self,
+        conflict_version: Version,
+        commits: KernelResult<crate::commit_range::CommitRange>,
+    ) -> ConflictedTransaction<STATE, MODE> {
+        let winning_history = WinningCommitHistory::new(
+            self.effective_table_config.table_root(),
+            conflict_version,
+            commits,
+        );
         ConflictedTransaction {
             transaction: self,
             conflict_version,
+            winning_history,
         }
     }
 
@@ -1471,8 +1487,8 @@ pub struct PostCommitStats {
 /// - [`CommitResult::Conflicted`]: the transaction conflicted with an existing version. This
 ///   transcation must be rebased before retrying. (currently no rebase APIs exist, caller must
 ///   create new txn)
-/// - [`CommitResult::Retryable`]: an IO (retryable) error occurred during the commit. This
-///   transaction can be retried without rebasing.
+/// - [`CommitResult::Retryable`]: a temporary rejection or IO error occurred during the commit.
+///   This transaction can be retried without rebasing.
 #[derive(Debug)]
 #[must_use]
 pub enum CommitResult<STATE = UpdateTable, MODE: ExecutionMode = Imperative> {
@@ -1485,7 +1501,7 @@ pub enum CommitResult<STATE = UpdateTable, MODE: ExecutionMode = Imperative> {
     // TODO(zach): in order to make the returning of a transaction useful, we need to add APIs to
     // update the transaction to a new version etc.
     Conflicted(ConflictedTransaction<STATE, MODE>),
-    /// An IO (retryable) error occurred during the commit.
+    /// A temporary rejection or IO error occurred during the commit.
     Retryable(RetryableTransaction<STATE, MODE>),
 }
 
@@ -1567,12 +1583,26 @@ pub struct ConflictedTransaction<STATE = UpdateTable, MODE: ExecutionMode = Impe
     #[allow(dead_code)]
     transaction: Transaction<STATE, MODE>,
     conflict_version: Version,
+    winning_history: WinningCommitHistory,
 }
 
 impl<STATE, MODE: ExecutionMode> ConflictedTransaction<STATE, MODE> {
     /// The version attempted commit that yielded a conflict
     pub fn conflict_version(&self) -> Version {
         self.conflict_version
+    }
+
+    /// Returns saved winning history without performing I/O.
+    ///
+    /// If discovery failed, returns the saved error. Restart from a fresh Snapshot and rebuild
+    /// the transaction; repeated calls do not retry discovery.
+    pub fn get_winning_commits(&self) -> KernelResult<&Arc<crate::commit_range::CommitRange>> {
+        self.winning_history.get()
+    }
+
+    /// Returns the last history-discovery error without performing I/O.
+    pub fn winning_commits_error(&self) -> Option<&KernelError> {
+        self.winning_history.load_error()
     }
 }
 
@@ -1827,8 +1857,9 @@ mod tests {
         Ok(())
     }
 
-    /// A mock committer that always returns an IOError, used to test the retryable error path.
-    struct IoErrorCommitter;
+    struct IoErrorCommitter {
+        confirmed_rejection: bool,
+    }
 
     impl Committer for IoErrorCommitter {
         fn commit(
@@ -1837,9 +1868,12 @@ mod tests {
             _actions: Box<dyn KernelResultIterator<FilteredEngineData> + '_>,
             _commit_metadata: CommitMetadata,
         ) -> KernelResult<CommitResponse> {
-            Err(KernelError::IOError(std::io::Error::other(
-                "simulated IO error",
-            )))
+            let error = KernelError::IOError(std::io::Error::other("simulated IO error"));
+            if self.confirmed_rejection {
+                Ok(CommitResponse::Retryable { error })
+            } else {
+                Err(error)
+            }
         }
         fn is_catalog_committer(&self) -> bool {
             false
@@ -1889,7 +1923,10 @@ mod tests {
             _commit_metadata: CommitMetadata,
         ) -> KernelResult<CommitResponse> {
             // This won't be reached in tests — the validation error fires before commit.
-            Ok(CommitResponse::Conflict { version: 0 })
+            Ok(CommitResponse::Conflict {
+                version: 0,
+                commits: Err(KernelError::unsupported("Mock has no winning history")),
+            })
         }
         fn is_catalog_committer(&self) -> bool {
             true
@@ -3125,12 +3162,21 @@ mod tests {
     // kernel/tests/features/dv.rs and kernel/tests/write/remove_dv.rs, which exercise
     // the full deletion vector write workflow including the DvMatchVisitor logic.
 
-    #[test]
-    fn test_commit_io_error_returns_retryable_transaction() -> Result<()> {
+    #[rstest]
+    #[case::io_error(false)]
+    #[case::confirmed_rejection(true)]
+    fn test_commit_error_returns_retryable_transaction(
+        #[case] confirmed_rejection: bool,
+    ) -> Result<()> {
         let (engine, snapshot, _tempdir) = load_test_table("table-without-dv-small")?;
         let mut txn = snapshot
             .update_table(UpdateTableOperation::Write, "test-engine", true)
-            .build(engine.as_ref(), Box::new(IoErrorCommitter))?;
+            .build(
+                engine.as_ref(),
+                Box::new(IoErrorCommitter {
+                    confirmed_rejection,
+                }),
+            )?;
         add_dummy_file(&mut txn);
         let result = txn.commit(engine.as_ref())?;
         assert!(
@@ -3484,6 +3530,7 @@ mod tests {
             *self.captured.lock().unwrap() = Some(commit_metadata.in_commit_timestamp());
             Ok(CommitResponse::Conflict {
                 version: commit_metadata.version(),
+                commits: Err(KernelError::unsupported("Mock has no winning history")),
             })
         }
         fn is_catalog_committer(&self) -> bool {
@@ -3596,7 +3643,12 @@ mod tests {
         let _guard = install_thread_local_metrics_reporter(reporter.clone());
         let mut txn = snapshot
             .update_table(UpdateTableOperation::Write, "test-engine", true)
-            .build(engine.as_ref(), Box::new(IoErrorCommitter))?;
+            .build(
+                engine.as_ref(),
+                Box::new(IoErrorCommitter {
+                    confirmed_rejection: false,
+                }),
+            )?;
         add_dummy_file(&mut txn);
         let result = txn.commit(engine.as_ref())?;
         assert!(matches!(result, CommitResult::Retryable(_)));

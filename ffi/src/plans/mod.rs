@@ -13,6 +13,7 @@ use crate::{ErrorAllocators, NullableCvoid, OptionalValue, SharedExternEngine, e
 pub mod executor;
 pub mod iter;
 pub mod result;
+pub mod scoped;
 
 /// Build a [`PlanExecutor`] backed by an engine-provided C callback.
 ///
