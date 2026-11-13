@@ -1333,8 +1333,7 @@ impl Snapshot {
 
     #[cfg(feature = "adaptive-metadata-in-dev")]
     fn has_adaptive_metadata(&self) -> bool {
-        self.table_configuration()
-            .is_feature_enabled(&TableFeature::AdaptiveMetadataPreview)
+        self.table_configuration().is_adaptive_metadata_enabled()
     }
 
     /// Reads the In-Commit Timestamp and `lastManifestCommit` from this version's commit file,
@@ -1664,10 +1663,7 @@ impl Snapshot {
                     .build_crc_from_checkpoint(engine)?
                     .ok_or_else(|| unresolved_crc("checkpoint is missing protocol or metadata"))?;
                 #[cfg(feature = "adaptive-metadata-in-dev")]
-                if self
-                    .table_configuration()
-                    .is_feature_enabled(&TableFeature::AdaptiveMetadataPreview)
-                {
+                if self.table_configuration().is_adaptive_metadata_enabled() {
                     let (in_commit_timestamp, last_manifest_commit) =
                         self.read_ict_and_last_manifest_commit(engine)?;
                     crc.in_commit_timestamp_opt = Some(in_commit_timestamp);

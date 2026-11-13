@@ -20,12 +20,12 @@ use tracing_subscriber::util::SubscriberInitExt as _;
 use url::Url;
 
 use crate::actions::{
-    Add, Cdc, CommitInfo, DomainMetadata, Metadata, Protocol, Remove, SetTransaction,
-    get_all_actions_schema,
+    Add, Cdc, CommitInfo, DomainMetadata, Metadata, NUM_RECORDS, Protocol, Remove, SetTransaction,
+    TIGHT_STATS, get_all_actions_schema,
 };
 use crate::arrow::array::{
-    ArrayRef, Int64Array, MapArray, RecordBatch, StringArray, StructArray, new_empty_array,
-    new_null_array,
+    ArrayRef, BooleanArray, Int64Array, MapArray, RecordBatch, StringArray, StructArray,
+    new_empty_array, new_null_array,
 };
 use crate::arrow::buffer::{OffsetBuffer, ScalarBuffer};
 use crate::arrow::compute::concat_batches;
@@ -287,6 +287,26 @@ pub(crate) fn create_valid_add_file_batch(all_nullable: bool) -> RecordBatch {
         })
         .collect();
     RecordBatch::try_new(Arc::new(arrow_schema), columns).expect("valid add-file batch")
+}
+
+/// Builds a `stats` struct column of `num_rows` rows with `numRecords = 1`, plus a `tightStats`
+/// column holding `tight_stats` when it is `Some`.
+pub(crate) fn tight_stats_struct(
+    num_rows: usize,
+    tight_stats: Option<&[Option<bool>]>,
+) -> StructArray {
+    let num_records: ArrayRef = Arc::new(Int64Array::from(vec![1; num_rows]));
+    let mut fields = vec![(
+        Arc::new(Field::new(NUM_RECORDS, DataType::Int64, true)),
+        num_records,
+    )];
+    if let Some(values) = tight_stats {
+        fields.push((
+            Arc::new(Field::new(TIGHT_STATS, DataType::Boolean, true)),
+            Arc::new(BooleanArray::from(values.to_vec())),
+        ));
+    }
+    StructArray::from(fields)
 }
 
 /// Builds one valid add-file row with a fully nullable schema.

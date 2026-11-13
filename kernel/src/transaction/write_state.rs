@@ -58,6 +58,10 @@ pub struct WriteState {
     pub(super) iceberg_compat_v3_enabled: bool,
     pub(super) column_mapping_mode: ColumnMappingMode,
     pub(super) stats_columns: Vec<ColumnName>,
+    /// Whether new files' statistics should carry `tightStats`. See
+    /// [`BoundWriteContext::should_write_tight_stats`].
+    #[serde(default)]
+    pub(super) write_tight_stats: bool,
     /// Logical partition column names in metadata-defined order.
     pub(super) logical_partition_columns: Vec<String>,
     pub(super) materialize_partition_columns: bool,
@@ -397,6 +401,7 @@ impl WriteState {
             iceberg_compat_v3_enabled: table_config
                 .is_feature_enabled(&TableFeature::IcebergCompatV3),
             column_mapping_mode: table_config.column_mapping_mode(),
+            write_tight_stats: table_config.is_adaptive_metadata_enabled(),
             stats_columns,
             logical_partition_columns: table_config.logical_partition_columns().to_vec(),
             materialize_partition_columns: table_config.should_materialize_partition_columns(),
@@ -453,10 +458,12 @@ mod tests {
     use super::*;
     use crate::committer::FileSystemCommitter;
     use crate::engine::sync::SyncEngine;
+    use crate::expressions::column_name;
     use crate::object_store::memory::InMemory;
     use crate::schema::{MetadataValue, schema_ref};
     use crate::transaction::create_table::create_table;
     use crate::transaction::data_layout::DataLayout;
+    use crate::unit_test_utils::{MockProtocolBuilder, MockTableConfigurationBuilder};
     use crate::{Engine, Result};
 
     fn partitioned_write_state(
@@ -973,5 +980,29 @@ mod tests {
 
         let error = WriteState::decode(&serde_json::to_vec(&encoded).unwrap()).unwrap_err();
         assert!(error.to_string().contains("unknown field `unknown_field`"));
+    }
+
+    /// adaptiveMetadata tables always write `tightStats`, including with timestamp stats, since
+    /// their stats JSON keeps full-precision timestamp bounds.
+    #[rstest]
+    fn write_tight_stats_follows_adaptive_metadata(#[values(false, true)] adaptive_metadata: bool) {
+        let config = MockTableConfigurationBuilder::new()
+            .with_schema(StructType::new_unchecked([
+                StructField::nullable("id", DataType::LONG),
+                StructField::nullable("ts", DataType::TIMESTAMP),
+            ]))
+            .with_protocol(
+                MockProtocolBuilder::new()
+                    .with_features(
+                        adaptive_metadata.then_some(TableFeature::AdaptiveMetadataPreview),
+                    )
+                    .build(),
+            )
+            .build();
+
+        let state = WriteState::new(&config, vec![column_name!("id"), column_name!("ts")]);
+        assert_eq!(state.write_tight_stats, adaptive_metadata);
+        let decoded = WriteState::decode(&state.encode().unwrap()).unwrap();
+        assert_eq!(decoded.write_tight_stats, adaptive_metadata);
     }
 }
