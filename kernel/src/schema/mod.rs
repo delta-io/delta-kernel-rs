@@ -3997,20 +3997,34 @@ mod tests {
         collation_utils::validate_collation_annotations(&shared_physical).unwrap();
     }
 
-    #[test]
-    fn test_make_physical_tolerates_stale_annotations_when_column_mapping_disabled() {
+    #[rstest]
+    fn test_make_physical_tolerates_stale_annotations_when_column_mapping_disabled(
+        #[values(false, true)] clean_parent: bool,
+    ) {
         // A table can carry `delta.columnMapping.*` annotations after mapping was enabled and then
         // disabled. They are inert while mapping is off, so `make_physical` (the read path)
         // tolerates them: the field keeps its logical name and the CM keys are dropped from the
         // physical metadata, leaving a schema indistinguishable from a table that never had them.
         let data = example_schema_metadata();
-        let field: StructField = serde_json::from_str(data).unwrap();
+        let mut field: StructField = serde_json::from_str(data).unwrap();
+        if clean_parent {
+            for key in [
+                ColumnMetadataKey::ColumnMappingId,
+                ColumnMetadataKey::ColumnMappingPhysicalName,
+                ColumnMetadataKey::ParquetFieldId,
+            ] {
+                field.metadata.remove(key.as_ref());
+            }
+        }
         let schema = schema! { (field.clone()) };
         MakePhysical::validate_read_column_mapping(ColumnMappingMode::None, &schema).unwrap();
         assert!(
             MakePhysical::validate_schema_column_mapping(ColumnMappingMode::None, &schema).is_err()
         );
         let physical = field.make_physical(ColumnMappingMode::None).unwrap();
+        if clean_parent {
+            assert_eq!(physical.metadata, field.metadata);
+        }
 
         assert_eq!(physical.name, "e");
         assert!(
