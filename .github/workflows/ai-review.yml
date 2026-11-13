@@ -52,6 +52,11 @@ on:
         description: Force a full review after a redesign or substantial rework.
         type: boolean
         default: false
+      expected_scope:
+        description: Test fixture assertion for selected review scope.
+        type: choice
+        default: full
+        options: [full, incremental]
       output_mode:
         description: Where to put the review.
         required: false
@@ -1011,6 +1016,7 @@ jobs:
               trusted_bot_logins=trusted_bot_logins,
               force_full=os.environ.get("FORCE_FULL_REVIEW") == "true",
           )
+          print(f"Review scope: {review_scope}")
           pathlib.Path("/tmp/review_diff.txt").write_text(review_diff)
           pathlib.Path("/tmp/review_scope.json").write_text(json.dumps({"incremental": incremental}))
           diff_bytes = review_diff.encode("utf-8")
@@ -1134,6 +1140,22 @@ jobs:
           PYEOF
 
       # This GitHub-generated archive is untrusted reference data. Nothing from it may be executed.
+      - name: Assert fixture review scope
+        if: steps.context.outcome == 'success'
+        env:
+          EXPECTED_SCOPE: ${{ inputs.expected_scope }}
+        run: |
+          python3 - <<'PYEOF'
+          import json
+          import os
+          from pathlib import Path
+          expected = os.environ["EXPECTED_SCOPE"]
+          actual = "incremental" if json.loads(Path("/tmp/review_scope.json").read_text())["incremental"] else "full"
+          if actual != expected:
+              raise SystemExit(f"Expected {expected} review, got {actual}")
+          print(f"Confirmed {actual} review")
+          PYEOF
+
       - name: Materialize PR source reference
         if: >-
           steps.creds.outputs.available == 'true' &&
