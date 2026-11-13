@@ -18,6 +18,7 @@ use crate::actions::{
     SIDECAR_FILE_SCHEMA_TAG, SIDECAR_NAME, Sidecar, get_all_actions_schema, get_commit_schema,
 };
 use crate::arrow::array::{StringArray, StructArray};
+use crate::checkpoint::SelectedCheckpointType;
 use crate::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt as _};
 use crate::engine::arrow_expression::evaluate_expression::extract_column_ref;
 use crate::engine::sync::SyncEngine;
@@ -46,7 +47,6 @@ use crate::scan::{
 use crate::schema::{
     DataType, SchemaRef, SchemaStructPatchBuilder, StructField, StructType, schema, schema_ref,
 };
-use crate::snapshot::SelectedCheckpointType;
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::unit_test_utils::adaptive_metadata_fixtures::{
     adaptive_metadata_protocol_and_metadata, minimal_checkpoint_action, setup_table,

@@ -167,7 +167,7 @@ pub(crate) struct SelectedCheckpoint {
     /// The selected checkpoint's version.
     pub version: Version,
     /// The retained type observation. Reads do not refine this value.
-    pub checkpoint_type: crate::snapshot::SelectedCheckpointType,
+    pub checkpoint_type: crate::checkpoint::SelectedCheckpointType,
 }
 
 /// Validate the invariants shared by catalog-managed snapshot and commit-range log tails.
@@ -817,7 +817,7 @@ impl LogSegment {
     pub(crate) fn try_new_with_checkpoint(
         &self,
         checkpoint: ParsedLogPath,
-        checkpoint_type: crate::snapshot::SelectedCheckpointType,
+        checkpoint_type: crate::checkpoint::SelectedCheckpointType,
     ) -> KernelResult<Self> {
         require!(
             matches!(

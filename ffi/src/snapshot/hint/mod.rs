@@ -4,13 +4,13 @@ use delta_kernel::snapshot::{SnapshotHint, SnapshotHintError, SnapshotHintFreshn
 use delta_kernel::{KernelError, KernelResult, Version};
 
 use super::builder::{ExclusiveSnapshotBuilder, FfiSnapshotBuilder, FfiSnapshotBuilderSource};
+use crate::checkpoint::FfiSelectedCheckpointType;
 use crate::delta_types::{
     FfiCrc, FfiLastCheckpoint, FfiMetadata, FfiProtocol, FfiPublicationWatermark,
 };
 use crate::error::{ExternResult, IntoExternResult};
 use crate::handle::Handle;
 use crate::log_path::LogPathArray;
-use crate::snapshot::checkpoint_type::FfiSelectedCheckpointType;
 use crate::{NullableCvoid, OptionalValue, SharedExternEngine, SharedSnapshot};
 
 mod export;

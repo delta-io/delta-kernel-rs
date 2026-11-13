@@ -269,7 +269,7 @@ mod tests {
             end_version,
             checkpoint: checkpoint_version.map(|version| crate::log_segment::SelectedCheckpoint {
                 version,
-                checkpoint_type: crate::snapshot::SelectedCheckpointType::Unresolved,
+                checkpoint_type: crate::checkpoint::SelectedCheckpointType::Unresolved,
             }),
             log_root,
             listed: LogSegmentFiles {

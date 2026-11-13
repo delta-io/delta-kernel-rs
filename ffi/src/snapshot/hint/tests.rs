@@ -22,6 +22,7 @@ use test_utils::{TestCatalogCommitter, compacted_log_path_for_versions, create_l
 use url::Url;
 
 use super::*;
+use crate::checkpoint::FfiSelectedCheckpointType;
 use crate::delta_types::*;
 use crate::error::FFIKernelError;
 use crate::ffi_test_utils::{
@@ -33,7 +34,7 @@ use crate::log_path::FfiLogPath;
 use crate::scan::{
     free_scan, scan_builder, scan_builder_build, scan_declarative_metadata_plan_with_info,
 };
-use crate::snapshot::checkpoint_type::{FfiSelectedCheckpointType, snapshot_checkpoint_type};
+use crate::snapshot::snapshot_checkpoint_type;
 use crate::{
     FfiFileStats, FfiIncrementalReplay, FfiLogSegmentStats, KernelI64Slice, KernelStringSlice,
     OptionalValue, SharedExternEngine, engine_to_handle, free_engine, free_snapshot,
