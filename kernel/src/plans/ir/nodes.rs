@@ -26,7 +26,8 @@ use crate::{FileMeta, KernelError, KernelResult};
 /// documenting that operator's semantics, invariants, and output shape.
 ///
 /// An operator that reshapes its rows (a source, projection, aggregation, or file scan) carries a
-/// caller-declared `schema` field holding its output schema. File writes emit [`FILE_META_SCHEMA`].
+/// caller-declared `schema` field holding its output schema. File writes emit [`FILE_META_SCHEMA`]
+/// or [`FILES_META_SCHEMA`].
 /// The remaining operators inherit an input's schema; each payload's docs name which input.
 #[derive(Debug, Clone, Display, From)]
 #[strum(serialize_all = "snake_case")]
@@ -53,14 +54,22 @@ pub enum Operator {
     // === N-ary operators (variable inputs) ===================================
     UnionAll(UnionAll),
     WriteJson(WriteJson),
+    WriteParquet(WriteParquet),
+    WriteParquetFiles(WriteParquetFiles),
 }
 
-/// Output schema of [`WriteJson`]: the file's fully qualified `location`,
+/// Output schema of [`WriteJson`] and [`WriteParquet`]: the file's fully qualified `location`,
 /// `size` in bytes, and `last_modified` in milliseconds since the Unix epoch.
 pub static FILE_META_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
     not_null "location": STRING,
     not_null "size": LONG,
     not_null "last_modified": LONG,
+};
+
+/// Per-file output of [`WriteParquetFiles`], including the name relative to its base URL.
+pub static FILES_META_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
+    not_null "file_name": STRING,
+    ..(FILE_META_SCHEMA.fields()),
 };
 
 /// Writes all rows from its inputs to one newline-delimited JSON file at `file_path`.
@@ -116,6 +125,74 @@ pub struct WriteJson {
     /// unspecified. For example, Delta uses this to write the `commitInfo` action before other
     /// actions in a commit.
     pub ordered: bool,
+}
+
+/// Writes all input rows to one Parquet file and returns one row of [`FILE_META_SCHEMA`].
+///
+/// `write_schema` selects and orders top-level input fields and supplies their file metadata,
+/// including Parquet field IDs. Selected fields must exist in every input with the same data
+/// types (including nested fields) and nullability. Other input fields are omitted. The engine
+/// chooses compression and row-group sizing.
+///
+/// The atomic-create, overwrite, input ordering, nonempty input, and duplicate-destination
+/// contracts of [`WriteJson`] also apply. Executors must reject invalid inputs before creating
+/// or replacing the destination.
+#[derive(Debug, Clone)]
+pub struct WriteParquet {
+    /// Physical schema of the fields to write, including file metadata.
+    pub write_schema: SchemaRef,
+    /// Fully qualified URL of the destination file.
+    pub file_path: Url,
+    /// Whether an existing destination may be replaced.
+    pub overwrite: bool,
+    /// Whether all rows from each input must precede rows from the next input.
+    pub ordered: bool,
+}
+
+/// Writes input rows to engine-sized Parquet files and returns [`FILES_META_SCHEMA`] per file.
+///
+/// Field selection and metadata follow [`WriteParquet`]. Empty input produces no files or rows.
+/// Each file is atomically created without overwriting. Engines choose file boundaries and replace
+/// the template's single `{uuid}` with a fresh UUID per file. Shared consumers of this node must
+/// observe the same files; they must not execute the write independently.
+///
+/// Invalid input must be rejected before publishing any file. Storage failures may leave completed
+/// files, but must not publish a partially serialized file. Input row order is unspecified.
+#[derive(Debug, Clone)]
+pub struct WriteParquetFiles {
+    /// Physical schema selecting and ordering fields, including file metadata.
+    pub write_schema: SchemaRef,
+    /// Hierarchical directory URL ending in `/`, without a query or fragment.
+    pub base_url: Url,
+    /// File name containing one `{uuid}`; other characters must be ASCII letters, digits, `-`,
+    /// `_`, or `.`, for example `part-{uuid}.parquet`.
+    pub file_name_template: String,
+}
+
+impl WriteParquetFiles {
+    pub(crate) fn validate_destination(&self) -> KernelResult<()> {
+        if self.base_url.cannot_be_a_base()
+            || !self.base_url.path().ends_with('/')
+            || self.base_url.query().is_some()
+            || self.base_url.fragment().is_some()
+        {
+            return Err(KernelError::generic(
+                "WriteParquetFiles base URL must be hierarchical, end in `/`, and have no query or fragment",
+            ));
+        }
+        if self.file_name_template.matches("{uuid}").count() != 1
+            || !self
+                .file_name_template
+                .replace("{uuid}", "")
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+        {
+            return Err(KernelError::generic(
+                "WriteParquetFiles requires one {uuid} and only letters, digits, `-`, `_`, or `.`",
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// An engine-assigned identifier for a relation retained by a
