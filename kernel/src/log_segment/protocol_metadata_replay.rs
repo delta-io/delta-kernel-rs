@@ -47,6 +47,8 @@ use crate::schema::{
     ColumnName, ColumnNamesAndTypes, DataType, MetadataColumnSpec, StructField, StructType,
     column_name, schema_ref,
 };
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use crate::table_features::TableFeature;
 use crate::{
     Engine, EngineData, KernelError, KernelResult, KernelResultIterator, Version, version_as_i64,
 };
@@ -140,12 +142,14 @@ impl LogSegment {
     }
 
     /// Whether replaying this segment for `candidate` read its newest commit's `commitInfo`. Replay
-    /// stops inside that commit only once the commit has both P&M, possibly before its
-    /// `commitInfo`.
+    /// always reads that commit first, and stops inside it only once the commit has both P&M. With
+    /// In-Commit Timestamps, `commitInfo` is the commit's first action, so replay read it even
+    /// then.
     #[cfg(feature = "adaptive-metadata-in-dev")]
     fn read_newest_commit_info(&self, candidate: &PmCandidate) -> KernelResult<bool> {
         Ok(self.newest_commit_after_checkpoint().is_some()
-            && !candidate.is_final_at(version_as_i64(self.end_version)?))
+            && (candidate.enables_in_commit_timestamps()
+                || !candidate.is_final_at(version_as_i64(self.end_version)?)))
     }
 
     /// Replays the log segment for the latest Protocol and Metadata, each with its version, in one
@@ -759,6 +763,19 @@ impl PmCandidate {
                 newest_commit_read,
             ),
         }
+    }
+
+    /// Whether the Protocol and Metadata found enable In-Commit Timestamps.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    fn enables_in_commit_timestamps(&self) -> bool {
+        let (Some((_, protocol)), Some((_, metadata))) = (&self.protocol, &self.metadata) else {
+            return false;
+        };
+        protocol.has_table_feature(&TableFeature::InCommitTimestamp)
+            && metadata
+                .parse_table_properties()
+                .enable_in_commit_timestamps
+                == Some(true)
     }
 
     /// Whether both Protocol and Metadata are found at or above `version`.

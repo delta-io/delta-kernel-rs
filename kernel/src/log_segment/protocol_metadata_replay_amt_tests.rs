@@ -1546,6 +1546,30 @@ async fn segment_with_compaction(
     log_segment
 }
 
+// Replay stops inside a newest commit that has both P&M, so it read that commit's `commitInfo` only
+// if In-Commit Timestamps put it first; only then is a missing pointer `Resolved(None)`. Without
+// them, the `commitInfo` after the P&M may be unread.
+#[rstest]
+#[case::in_commit_timestamps(pointerless_pm_commit(), LastManifestCommitResolution::Resolved(None))]
+#[case::no_in_commit_timestamps(
+    [protocol_commit(1, 2), metadata_commit(one_column_schema()), commit_info(None)].join("\n"),
+    LastManifestCommitResolution::Unresolved
+)]
+#[tokio::test]
+async fn replay_resolves_missing_pointer_in_newest_commit_with_pm(
+    #[case] newest_commit: String,
+    #[case] expected: LastManifestCommitResolution,
+) {
+    let log = ReplayLog::after_manifest_commit(vec![newest_commit]);
+    let expected = ReplayExpectation::default().last_manifest_commit(expected);
+    assert_replay(&log, None, &expected, non_plan_engine).await;
+    #[cfg(feature = "declarative-plans")]
+    assert_replay(&log, None, &expected, |store| {
+        SyncEngine::new_with_store(store)
+    })
+    .await;
+}
+
 // A replayed snapshot serves `lastManifestCommit` from build-time state: it still resolves after
 // the newest commit file is deleted, including a missing pointer. The newest commit has no P&M, so
 // replay reads all of it.
