@@ -15,7 +15,7 @@ use visitors::{MetadataVisitor, ProtocolVisitor};
 
 use self::deletion_vector::DeletionVectorDescriptor;
 #[cfg(feature = "adaptive-metadata-in-dev")]
-use crate::amt_path_util::{amt_manifest_filemeta, resolve_amt_location};
+use crate::amt_path_util::amt_manifest_filemeta;
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::expressions::Scalar;
 #[cfg(feature = "adaptive-metadata-in-dev")]
@@ -1918,9 +1918,9 @@ impl CheckpointAction {
     pub(crate) fn root_filemeta(&self, table_root: &Url) -> KernelResult<FileMeta> {
         let content_root = &self.content_root;
         amt_manifest_filemeta(
-            resolve_amt_location(&content_root.path, table_root)?,
             &content_root.path,
             content_root.size_in_bytes,
+            table_root,
             "checkpoint contentRoot",
         )
     }

@@ -5,7 +5,6 @@
 
 use url::Url;
 
-use crate::expressions::{Expression, Predicate, UnaryExpressionOp, lit};
 use crate::path_encoding::uri_encode_path;
 use crate::uri_reference::{scheme_len, uri_decode_location, uri_encode_location};
 use crate::utils::{require, to_file_size};
@@ -31,36 +30,6 @@ pub(crate) fn resolve_amt_location(path: &str, table_root: &Url) -> KernelResult
     }
 }
 
-/// Evaluates a STRING `location` to the URI string [`resolve_amt_location`] parses. Pass each
-/// value, with its `location`, to [`parse_resolved_amt_location`], which rejects dot segments and
-/// parses it into the same [`Url`].
-pub(crate) fn resolve_amt_location_expression(
-    location: Expression,
-    table_root: &Url,
-) -> Expression {
-    // `UriEncodeFileLocation` keeps an absolute location's `scheme:[//authority]`, so only a
-    // relative one needs the table root in front.
-    let prefix = Expression::case_when(
-        [(Predicate::has_uri_scheme(location.clone()), lit(""))],
-        lit(table_root_prefix(table_root)),
-    );
-    Expression::string_concat([
-        prefix,
-        Expression::unary(UnaryExpressionOp::UriEncodeFileLocation, location),
-    ])
-}
-
-/// Parses `resolved`, the [`resolve_amt_location_expression`] value for the AMT `path`, into the
-/// [`Url`] [`resolve_amt_location`] returns for `path`, failing the same way.
-pub(crate) fn parse_resolved_amt_location(path: &str, resolved: &str) -> KernelResult<Url> {
-    reject_dot_segments(path)?;
-    if scheme_len(path).is_some() {
-        parse_absolute(path, resolved)
-    } else {
-        parse_relative(path, resolved)
-    }
-}
-
 /// Parses an absolute AMT `path` into a [`Url`] with its path component percent-encoded, as
 /// [`resolve_amt_location`] does, or returns `None` if `path` is relative (has no URI scheme).
 pub(crate) fn parse_absolute_amt_location(path: &str) -> KernelResult<Option<Url>> {
@@ -68,7 +37,12 @@ pub(crate) fn parse_absolute_amt_location(path: &str) -> KernelResult<Option<Url
         return Ok(None);
     }
     reject_dot_segments(path)?;
-    parse_absolute(path, &uri_encode_location(path)).map(Some)
+    let url = Url::parse(&uri_encode_location(path)).map_err(|e| {
+        KernelError::generic(format!(
+            "Failed to parse absolute AMT location {path:?}: {e}"
+        ))
+    })?;
+    Ok(Some(url))
 }
 
 /// Converts an absolute, percent-encoded `uri` (such as a Delta `p` deletion vector path) into the
@@ -88,20 +62,21 @@ pub(crate) fn raw_amt_location_from_uri(uri: &str) -> KernelResult<String> {
     Ok(raw.into_owned())
 }
 
-/// Builds the [`FileMeta`] of an AMT manifest file referenced by `path`, resolved to `location`,
-/// with `size_in_bytes`. AMT references carry no modification time, so `last_modified` is
-/// `i64::MAX`.
+/// Builds the [`FileMeta`] of an AMT manifest file referenced by `path` (absolute, or relative to
+/// `table_root`) with `size_in_bytes`. AMT references carry no modification time, so
+/// `last_modified` is `i64::MAX`.
 ///
 /// # Errors
-/// Returns an error if `size_in_bytes` is negative (the error names `context` and `path`).
+/// Returns an error if `path` cannot be resolved (see [`resolve_amt_location`]), or if
+/// `size_in_bytes` is negative (the error names `context` and `path`).
 pub(crate) fn amt_manifest_filemeta(
-    location: Url,
     path: &str,
     size_in_bytes: i64,
+    table_root: &Url,
     context: &str,
 ) -> KernelResult<FileMeta> {
     Ok(FileMeta {
-        location,
+        location: resolve_amt_location(path, table_root)?,
         last_modified: i64::MAX,
         size: to_file_size(size_in_bytes, format_args!("{context} '{path}'"))?,
     })
@@ -161,35 +136,15 @@ pub(crate) fn validate_table_relative(path: &str) -> KernelResult<()> {
 /// Returns an error if the resolved location fails to parse as a [`Url`].
 fn encode_and_join(path: &str, table_root: &Url) -> KernelResult<Url> {
     reject_dot_segments(path)?;
-    let base = table_root_prefix(table_root);
-    parse_relative(path, &format!("{base}{}", uri_encode_path(path)))
-}
-
-/// Parses `resolved`, the URI string of the absolute AMT `path`.
-fn parse_absolute(path: &str, resolved: &str) -> KernelResult<Url> {
-    Url::parse(resolved).map_err(|e| {
-        KernelError::generic(format!(
-            "Failed to parse absolute AMT location {path:?}: {e}"
-        ))
-    })
-}
-
-/// Parses `resolved`, the URI string of the relative AMT `path` joined onto a table root.
-fn parse_relative(path: &str, resolved: &str) -> KernelResult<Url> {
-    Url::parse(resolved).map_err(|e| {
-        KernelError::generic(format!(
-            "Failed to resolve relative AMT location {path:?} as {resolved:?}: {e}"
-        ))
-    })
-}
-
-/// `table_root` with a trailing `/`, the prefix a relative AMT path is appended to.
-fn table_root_prefix(table_root: &Url) -> String {
     let mut base = table_root.as_str().to_string();
     if !base.ends_with('/') {
         base.push('/');
     }
-    base
+    Url::parse(&format!("{base}{}", uri_encode_path(path))).map_err(|e| {
+        KernelError::generic(format!(
+            "Failed to resolve relative AMT location {path:?} against table root {base}: {e}"
+        ))
+    })
 }
 
 /// Rejects a `path` containing a `.` or `..` segment: the Iceberg V4 path spec does not support
@@ -212,31 +167,6 @@ mod tests {
     use test_utils::assert_result_error_with_message;
 
     use super::*;
-    use crate::Engine as _;
-    use crate::arrow::array::AsArray as _;
-    use crate::engine::arrow_data::EngineDataArrowExt as _;
-    use crate::engine::sync::SyncEngine;
-    use crate::expressions::{Scalar, col};
-    use crate::schema::{DataType, schema_ref};
-
-    type Resolver = fn(&str, &Url) -> KernelResult<Url>;
-
-    /// [`resolve_amt_location`] through [`resolve_amt_location_expression`] and
-    /// [`parse_resolved_amt_location`].
-    fn resolve_with_expression(path: &str, table_root: &Url) -> KernelResult<Url> {
-        let handler = SyncEngine::new().evaluation_handler();
-        let schema = schema_ref! { not_null "location": STRING };
-        let batch = handler.create_many(schema.clone(), vec![vec![Scalar::from(path)]])?;
-        let resolved = handler
-            .new_expression_evaluator(
-                schema,
-                resolve_amt_location_expression(col!("location"), table_root).into(),
-                DataType::STRING,
-            )?
-            .evaluate(batch.as_ref())?
-            .try_into_record_batch()?;
-        parse_resolved_amt_location(path, resolved.column(0).as_string::<i32>().value(0))
-    }
 
     #[rstest]
     #[case::relative_path(
@@ -342,10 +272,9 @@ mod tests {
         #[case] table_root: &str,
         #[case] path: &str,
         #[case] expected_location: &str,
-        #[values(resolve_amt_location, resolve_with_expression)] resolve: Resolver,
     ) {
         let table_root = Url::parse(table_root).unwrap();
-        let location = resolve(path, &table_root).unwrap();
+        let location = resolve_amt_location(path, &table_root).unwrap();
         assert_eq!(location.as_str(), expected_location);
     }
 
@@ -387,13 +316,10 @@ mod tests {
     #[case::relative_trailing_dot("a/.")]
     #[case::bare_dot_dot("..")]
     #[case::absolute_dot_dot("s3://bucket/x/../y.parquet")]
-    fn test_resolve_amt_location_rejects_dot_segments(
-        #[case] path: &str,
-        #[values(resolve_amt_location, resolve_with_expression)] resolve: Resolver,
-    ) {
+    fn test_resolve_amt_location_rejects_dot_segments(#[case] path: &str) {
         let table_root = Url::parse("memory:///table/").unwrap();
         assert_result_error_with_message(
-            resolve(path, &table_root),
+            resolve_amt_location(path, &table_root),
             "contains a '.' or '..' segment",
         );
     }
@@ -401,13 +327,10 @@ mod tests {
     #[rstest]
     #[case::invalid_port("s3://bucket:port/a.parquet")]
     #[case::space_in_authority("s3://my bucket/a.parquet")]
-    fn test_resolve_amt_location_rejects_unparseable_absolute(
-        #[case] path: &str,
-        #[values(resolve_amt_location, resolve_with_expression)] resolve: Resolver,
-    ) {
+    fn test_resolve_amt_location_rejects_unparseable_absolute(#[case] path: &str) {
         let table_root = Url::parse("memory:///table/").unwrap();
         assert_result_error_with_message(
-            resolve(path, &table_root),
+            resolve_amt_location(path, &table_root),
             "Failed to parse absolute AMT location",
         );
     }
