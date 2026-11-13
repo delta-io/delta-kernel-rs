@@ -16,6 +16,7 @@ use delta_kernel_workloads::predicate_parser::parse_predicate;
 use itertools::Itertools;
 use url::Url;
 
+use super::checkpoint::execute_checkpoint_workload;
 use super::validation::{validate_read_result, validate_snapshot};
 
 /// Result of executing a read workload.
@@ -211,6 +212,9 @@ pub fn execute_and_validate_workload(
                 .ok_or("SnapshotSpec must have expected or error field")?;
             let result = execute_snapshot_workload(engine, table_root, snapshot_spec.as_ref());
             validate_snapshot(result, snapshot_spec.time_travel.as_ref(), expected)?;
+        }
+        Spec::Checkpoint { version } => {
+            execute_checkpoint_workload(engine, table_root, *version, expected_dir)?;
         }
     }
     Ok(())
