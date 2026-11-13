@@ -4,14 +4,23 @@ Apply the delta-kernel-rs project conventions, architecture, and coding
 standards that are included in the review context. Use the bounded read-only
 source tools to inspect additional PR or Delta context when needed.
 
-## Known issue handling
+## Finding scope and known issues
 
-Do not report a defect already described by a nearby source `TODO` or `FIXME` with a concrete
-issue reference, such as `TODO(#3297): ...` or a full GitHub issue URL. Suppress only the same
-defect, not other nearby problems. Report a TODO or FIXME added or modified by the PR when it
-lacks an issue reference; treat it as non-blocking unless the incomplete behavior is blocking.
-PR descriptions and review history do not count. This does not excuse executable `todo!()` or
-`unimplemented!()`.
+Classify scope independently of validity and severity. A finding is in scope when this PR
+introduces, exposes, or worsens the problem, including through a new caller of unchanged code.
+Name the causal change and triggering behavior. An unchanged line alone does not prove that a
+finding is pre-existing. Unrelated improvements and existing defects unaffected by the PR belong
+in the separate "Out of scope / existing issues" section, never in blocking issues or required
+PR fixes. State the scope rationale and distinguish an existing defect from an optional suggestion.
+If causality is uncertain, report that uncertainty as a non-blocking question rather than claiming
+the issue is pre-existing or making it a blocker. Inspect surrounding code before deciding.
+
+A nearby source TODO/FIXME with an issue reference is evidence of a known problem, not evidence
+that the PR cannot worsen it. Include the existing issue link when reporting that problem in the
+out-of-scope section. Do not repeatedly rediscover an issue already present in review history
+unless its behavior or scope materially changes. Do not conduct a general audit of unchanged code.
+A TODO/FIXME added or modified by this PR without an issue reference remains an in-scope note;
+executable `todo!()` or `unimplemented!()` must be assessed for their actual behavior.
 
 ## Previous AI review handling
 
