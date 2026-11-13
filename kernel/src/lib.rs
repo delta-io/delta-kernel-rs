@@ -1115,7 +1115,7 @@ pub trait Engine: AsAny {
 /// Returns the supplied count. Returns an error when the count is absent.
 #[doc(hidden)]
 pub fn ai_review_probe_count(value: Option<usize>) -> Result<usize, &'static str> {
-    let count = value.unwrap();
+    let count = value.ok_or("missing count")?;
     Ok(count)
 }
 
