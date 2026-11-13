@@ -4119,21 +4119,22 @@ fn create_checkpoint_schema_without_stats_parsed() -> StructType {
 }
 
 #[rstest]
-#[case::missing_with_json(false, true, false, true)]
-#[case::partial_with_json(true, true, true, false)]
-#[case::partial_without_json(true, false, true, false)]
+#[case::missing_with_json(None, true, false, true)]
+#[case::partial_with_json(Some("other"), true, false, true)]
+#[case::partial_without_json(Some("other"), false, true, false)]
+#[case::complete_with_json(Some("id"), true, true, false)]
 #[tokio::test]
 async fn test_checkpoint_stream_resolves_stats_projection(
-    #[case] include_parsed_stats: bool,
+    #[case] parsed_column: Option<&str>,
     #[case] include_json_stats: bool,
     #[case] expect_parsed_stats: bool,
     #[case] expect_json_stats: bool,
 ) -> KernelResult<()> {
     let (store, log_root) = new_in_memory_store();
     let engine = SyncEngine::new_with_store(store.clone());
-    let checkpoint_schema = if include_parsed_stats {
+    let checkpoint_schema = if let Some(column) = parsed_column {
         create_checkpoint_file_schema_with_stats_parsed(
-            vec![StructField::nullable("other", DataType::LONG)],
+            vec![StructField::nullable(column, DataType::LONG)],
             include_json_stats,
         )?
     } else {

@@ -1846,7 +1846,8 @@ impl LogSegment {
     /// Both the checkpoint's `stats_parsed` schema and the `stats_schema` for data skipping
     /// use physical column names (not logical names), so direct name comparison is correct.
     ///
-    /// Returns `false` if stats_parsed doesn't exist or has incompatible types.
+    /// Returns `false` if stats_parsed doesn't exist or has incompatible types. When JSON stats
+    /// are available, prefer them if the native schema omits requested fields.
     pub(crate) fn schema_has_compatible_stats_parsed(
         checkpoint_schema: &StructType,
         stats_schema: &StructType,
@@ -1865,6 +1866,18 @@ impl LogSegment {
             );
             return false;
         };
+
+        // JSON can retain statistics beyond the checkpoint's current indexed-column cap.
+        if checkpoint_schema.contains_col(["add", "stats"])
+            && stats_schema
+                .leaves(None)
+                .as_ref()
+                .0
+                .iter()
+                .any(|column| stats_struct.field_at(column).is_err())
+        {
+            return false;
+        }
 
         if !Self::structs_have_compatible_types(
             stats_struct,

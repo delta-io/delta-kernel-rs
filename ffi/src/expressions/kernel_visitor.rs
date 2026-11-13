@@ -922,17 +922,23 @@ mod tests {
     #[rstest]
     #[case::default(None)]
     #[case::configured(Some("America/Los_Angeles"))]
-    fn map_to_struct_preserves_options(#[case] timestamp_timezone: Option<&str>) {
+    fn map_to_struct_preserves_options(
+        #[case] timestamp_timezone: Option<&str>,
+        #[values(false, true)] null_on_invalid: bool,
+    ) {
         let mut state = KernelExpressionVisitorState::default();
         let child = wrap_expression(&mut state, col!("partitionValues"));
-        let options = timestamp_timezone.map_or_else(MapToStructOptions::default, |timezone| {
-            MapToStructOptions::default().with_timestamp_timezone(timezone)
-        });
+        let options = timestamp_timezone
+            .map_or_else(MapToStructOptions::default, |timezone| {
+                MapToStructOptions::default().with_timestamp_timezone(timezone)
+            })
+            .with_null_on_invalid(null_on_invalid);
         let ffi_timezone = timestamp_timezone
             .map(|timezone| crate::kernel_string_slice!(timezone))
             .into();
         let ffi_options = FfiMapToStructOptions {
             timestamp_timezone: ffi_timezone,
+            null_on_invalid,
         };
 
         let expression_id =
@@ -955,6 +961,7 @@ mod tests {
                 ptr: invalid_utf8.as_ptr().cast(),
                 len: invalid_utf8.len(),
             }),
+            null_on_invalid: false,
         };
 
         let expression_id =

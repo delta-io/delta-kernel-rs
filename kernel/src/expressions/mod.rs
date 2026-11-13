@@ -732,6 +732,8 @@ impl ParseJsonExpression {
 pub struct MapToStructOptions {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     timestamp_timezone: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    null_on_invalid: bool,
 }
 
 impl MapToStructOptions {
@@ -750,6 +752,17 @@ impl MapToStructOptions {
     /// Fixed offsets use `+HH:MM[:SS]` or `-HH:MM[:SS]` form, or `Z` for UTC.
     pub fn timestamp_timezone(&self) -> Option<&str> {
         self.timestamp_timezone.as_deref()
+    }
+
+    /// Return null for unparseable values; invalid schemas and timezones still fail.
+    pub fn with_null_on_invalid(mut self, null_on_invalid: bool) -> Self {
+        self.null_on_invalid = null_on_invalid;
+        self
+    }
+
+    /// Whether unparseable values become null instead of failing evaluation.
+    pub fn null_on_invalid(&self) -> bool {
+        self.null_on_invalid
     }
 
     /// Returns whether no parsing options are configured.
@@ -817,7 +830,9 @@ impl MapToStructOptions {
 ///
 /// Non-empty geometry and geography values are unsupported. Struct, array, map, and variant target
 /// fields are not primitive partition types and are rejected. Any other unparseable non-empty value
-/// returns [`KernelError::ParseError`] and fails evaluation; it does not silently become null.
+/// returns [`KernelError::ParseError`] and fails evaluation, unless
+/// [`MapToStructOptions::with_null_on_invalid`] enables nulls for invalid values. This option does
+/// not suppress invalid schemas, unsupported types, or invalid timezone configuration.
 ///
 /// # Implementing this expression
 ///
@@ -1363,16 +1378,16 @@ impl Display for Expression {
                     p.output_schema.fields().len()
                 )
             }
-            MapToStruct(m) => match m.options.timestamp_timezone() {
-                Some(timezone) => {
-                    write!(
-                        f,
-                        "MAP_TO_STRUCT({}, timestamp_timezone={timezone:?})",
-                        m.map_expr
-                    )
+            MapToStruct(m) => {
+                write!(f, "MAP_TO_STRUCT({}", m.map_expr)?;
+                if let Some(timezone) = m.options.timestamp_timezone() {
+                    write!(f, ", timestamp_timezone={timezone:?}")?;
                 }
-                None => write!(f, "MAP_TO_STRUCT({})", m.map_expr),
-            },
+                if m.options.null_on_invalid() {
+                    write!(f, ", null_on_invalid=true")?;
+                }
+                write!(f, ")")
+            }
             Cast(c) => write!(f, "CAST({} AS {})", c.expr, c.target),
         }
     }
@@ -1858,6 +1873,10 @@ mod tests {
                 Expression::map_to_struct(
                     col!("pv"),
                     MapToStructOptions::default().with_timestamp_timezone("America/Los_Angeles"),
+                ),
+                Expression::map_to_struct(
+                    col!("pv"),
+                    MapToStructOptions::default().with_null_on_invalid(true),
                 ),
             ];
 

@@ -105,7 +105,7 @@ mod tests {
     use std::sync::Arc;
 
     use ::test_utils::assert_batches_sorted_eq;
-    use ::test_utils::table_builder::{FeatureSet, LogState, TestTableBuilder};
+    use ::test_utils::table_builder::{FeatureSet, LogState, TableConfig, TestTableBuilder};
     use rstest::rstest;
 
     use super::*;
@@ -166,6 +166,7 @@ mod tests {
             .with_log_state(LogState::with_latest_version(1))
             .with_data(2, 10)
             .with_features(features)
+            .with_table_config(TableConfig::new().write_stats_as_struct(false))
             .build()
             .unwrap();
         let engine = SyncEngine::new_with_store(table.store().clone());

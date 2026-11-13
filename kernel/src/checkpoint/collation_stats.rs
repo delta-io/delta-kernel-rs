@@ -579,10 +579,8 @@ mod tests {
             } else {
                 writer.declarative_checkpoint_data_plan(&engine)?
             };
-            assert_eq!(
-                source_collation_stats(&plan.schema).unwrap(),
-                expected.field(COLLATION_STATS).unwrap(),
-            );
+            // Declarative output keeps dynamic collation keys in JSON, without sampling.
+            assert!(source_collation_stats(&plan.schema).is_none());
             let data = engine
                 .require_plan_executor()?
                 .execute_op(crate::plans::Operation::QueryPlan(plan))?
@@ -596,8 +594,14 @@ mod tests {
             assert_eq!(adds.len(), 1);
             let add = &adds[0]["add"];
             assert_eq!(add["path"], path);
-            assert_json_contains(&add["stats_parsed"][COLLATION_STATS], &active_bounds);
+            assert!(add["stats_parsed"].get(COLLATION_STATS).is_none());
+            assert_eq!(add["stats_parsed"]["numRecords"], 2);
             assert_eq!(add.get("stats").is_some(), write_json);
+            if write_json {
+                let stats: Value = serde_json::from_str(add["stats"].as_str().unwrap())
+                    .map_err(KernelError::from)?;
+                assert_json_contains(&stats[COLLATION_STATS], &active_bounds);
+            }
         }
         Ok(())
     }

@@ -168,6 +168,8 @@ message MapToStructOptions {
   // the host or table metadata. A timezone or offset in a value takes precedence; absence means
   // UTC.
   optional string timestamp_timezone = 1;
+  // Invalid values become null. Invalid schemas, unsupported types, and timezones still fail.
+  bool null_on_invalid = 2;
 }
 
 message MapToStructExpression {

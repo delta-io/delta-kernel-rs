@@ -1351,7 +1351,8 @@ mod tests {
     fn map_to_struct_with_unsupported_target_is_an_error(
         #[values(
             MapToStructOptions::default(),
-            MapToStructOptions::default().with_timestamp_timezone("America/Los_Angeles")
+            MapToStructOptions::default().with_timestamp_timezone("America/Los_Angeles"),
+            MapToStructOptions::default().with_null_on_invalid(true)
         )]
         options: MapToStructOptions,
         #[case] output_type: Option<DataType>,
@@ -1373,6 +1374,7 @@ mod tests {
     fn map_to_struct_executes_with_options(
         #[case] options: MapToStructOptions,
         #[case] expected_timestamp: i64,
+        #[values(false, true)] null_on_invalid: bool,
     ) {
         let mut maps = MapBuilder::new(None, StringBuilder::new(), StringBuilder::new());
         maps.keys().append_value("id");
@@ -1380,6 +1382,13 @@ mod tests {
         maps.keys().append_value("ts");
         maps.values().append_value("2024-06-15 09:30:00");
         maps.append(true).unwrap();
+        if null_on_invalid {
+            maps.keys().append_value("id");
+            maps.values().append_value("not a number");
+            maps.keys().append_value("ts");
+            maps.values().append_value("not a timestamp");
+            maps.append(true).unwrap();
+        }
         maps.append(false).unwrap();
         let map = Arc::new(maps.finish()) as ArrayRef;
         let arrow_schema =
@@ -1390,7 +1399,7 @@ mod tests {
             nullable "ts": TIMESTAMP,
         };
         let logical = to_df_expr(
-            &KernelExpr::map_to_struct(col!("pv"), options),
+            &KernelExpr::map_to_struct(col!("pv"), options.with_null_on_invalid(null_on_invalid)),
             &pv_map_schema(),
             Some(&DataType::from(target)),
         )
@@ -1403,7 +1412,11 @@ mod tests {
             &PhysicalPlanningContext::default(),
         )
         .unwrap();
-        let result = physical.evaluate(&batch).unwrap().into_array(2).unwrap();
+        let result = physical
+            .evaluate(&batch)
+            .unwrap()
+            .into_array(batch.num_rows())
+            .unwrap();
         let result = result.as_struct();
         let ids = result
             .column(0)
@@ -1417,7 +1430,12 @@ mod tests {
             .unwrap();
         assert_eq!(ids.value(0), 7);
         assert_eq!(timestamps.value(0), expected_timestamp);
-        assert!(result.is_null(1));
+        if null_on_invalid {
+            assert!(result.is_valid(1));
+            assert!(ids.is_null(1));
+            assert!(timestamps.is_null(1));
+        }
+        assert!(result.is_null(batch.num_rows() - 1));
     }
 
     #[test]
@@ -1436,8 +1454,10 @@ mod tests {
         assert!(udf("America/Los_Angeles") != udf("America/New_York"));
     }
 
-    #[test]
-    fn configured_map_to_struct_reports_invalid_timezone() {
+    #[rstest]
+    fn configured_map_to_struct_reports_invalid_timezone(
+        #[values(false, true)] null_on_invalid: bool,
+    ) {
         let mut maps = MapBuilder::new(None, StringBuilder::new(), StringBuilder::new());
         maps.keys().append_value("ts");
         maps.values().append_value("2024-06-15 09:30:00");
@@ -1449,7 +1469,9 @@ mod tests {
         let logical = to_df_expr(
             &KernelExpr::map_to_struct(
                 col!("pv"),
-                MapToStructOptions::default().with_timestamp_timezone("Not/AZone"),
+                MapToStructOptions::default()
+                    .with_timestamp_timezone("Not/AZone")
+                    .with_null_on_invalid(null_on_invalid),
             ),
             &pv_map_schema(),
             Some(&DataType::from(schema! { nullable "ts": TIMESTAMP })),

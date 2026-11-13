@@ -407,7 +407,12 @@ pub fn evaluate_expression(
         (MapToStruct(m), Some(DataType::Struct(output_schema))) => {
             let map_arr = evaluate_expression(&m.map_expr, batch, None)?;
             let timestamp_timezone = TimestampTimezone::try_from_options(&m.options)?;
-            let result = evaluate_map_to_struct(&map_arr, output_schema, timestamp_timezone)?;
+            let result = evaluate_map_to_struct(
+                &map_arr,
+                output_schema,
+                timestamp_timezone,
+                m.options.null_on_invalid(),
+            )?;
             Ok(Arc::new(result) as ArrayRef)
         }
         (MapToStruct(_), dt) => Err(KernelError::Generic(format!(
@@ -1166,12 +1171,13 @@ fn parse_partition_scalar(
 /// `timestamp_timezone` controls `TIMESTAMP` values without an embedded offset or named timezone.
 ///
 /// - Missing keys produce null values
-/// - Parse errors are propagated (indicating a broken table)
+/// - Parse errors propagate unless `null_on_invalid` is enabled
 /// - Duplicate keys are invalid input and their result is undefined
 fn evaluate_map_to_struct(
     map_arr: &ArrayRef,
     output_schema: &StructType,
     timestamp_timezone: TimestampTimezone,
+    null_on_invalid: bool,
 ) -> KernelResult<StructArray> {
     let map_array = map_arr
         .as_any()
@@ -1252,9 +1258,13 @@ fn evaluate_map_to_struct(
             // and where the value is non-null.
             if entry_idx >= entry_start && map_values.is_valid(entry_idx as usize) {
                 let raw = map_values.value(entry_idx as usize);
-                match parse_partition_scalar(target_types[i], raw, timestamp_timezone)? {
-                    Some(scalar) => scalar.append_to(builder, 1)?,
-                    None => Scalar::append_null(builder, field.data_type(), 1)?,
+                match parse_partition_scalar(target_types[i], raw, timestamp_timezone) {
+                    Ok(Some(scalar)) => scalar.append_to(builder, 1)?,
+                    Ok(None) => Scalar::append_null(builder, field.data_type(), 1)?,
+                    Err(KernelError::ParseError(..)) if null_on_invalid => {
+                        Scalar::append_null(builder, field.data_type(), 1)?;
+                    }
+                    Err(error) => return Err(error),
                 }
             } else {
                 Scalar::append_null(builder, field.data_type(), 1)?;
@@ -3113,12 +3123,21 @@ mod tests {
         assert_eq!(regions.value(0), "us");
     }
 
-    #[test]
-    fn test_map_to_struct_parse_error() {
+    #[rstest]
+    fn test_map_to_struct_parse_error(
+        #[values(false, true)] null_on_invalid: bool,
+        #[values("not_a_number", "2147483648")] invalid: &str,
+    ) {
         let mut builder = MapBuilder::new(None, StringBuilder::new(), StringBuilder::new());
         builder.keys().append_value("count");
-        builder.values().append_value("not_a_number");
+        builder.values().append_value(invalid);
+        builder.keys().append_value("valid");
+        builder.values().append_value("7");
         builder.append(true).unwrap();
+        builder.keys().append_value("count");
+        builder.values().append_value("42");
+        builder.append(true).unwrap();
+        builder.append(false).unwrap();
 
         let map_array = builder.finish();
         let schema = ArrowSchema::new(vec![ArrowField::new(
@@ -3128,11 +3147,37 @@ mod tests {
         )]);
         let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(map_array)]).unwrap();
 
-        let output_schema = schema! { nullable "count": INTEGER };
+        let output_schema = schema! { nullable "count": INTEGER, nullable "valid": INTEGER };
         let result_type = DataType::from(output_schema);
-        let expr = Expr::map_to_struct(col!("pv"), MapToStructOptions::default());
+        let expr = Expr::map_to_struct(
+            col!("pv"),
+            MapToStructOptions::default().with_null_on_invalid(null_on_invalid),
+        );
         let result = evaluate_expression(&expr, &batch, Some(&result_type));
-        assert!(result.is_err());
+        if null_on_invalid {
+            let result = result.unwrap();
+            let result = result.as_struct();
+            assert_eq!(
+                result
+                    .column(0)
+                    .as_primitive::<Int32Type>()
+                    .iter()
+                    .collect::<Vec<_>>(),
+                [None, Some(42), None]
+            );
+            assert_eq!(
+                result
+                    .column(1)
+                    .as_primitive::<Int32Type>()
+                    .iter()
+                    .collect::<Vec<_>>(),
+                [Some(7), None, None]
+            );
+            assert!(result.is_valid(0));
+            assert!(result.is_null(2));
+        } else {
+            assert!(matches!(result, Err(KernelError::ParseError(..))));
+        }
     }
 
     #[test]

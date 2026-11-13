@@ -270,9 +270,9 @@ impl TableProperties {
     }
 
     /// Returns whether to write file statistics as parsed structs in checkpoints.
-    /// Default: `false` per the Delta protocol.
+    /// Default: `true`, matching Delta Spark.
     pub fn should_write_stats_as_struct(&self) -> bool {
-        self.checkpoint_write_stats_as_struct.unwrap_or(false)
+        self.checkpoint_write_stats_as_struct.unwrap_or(true)
     }
 
     /// Returns whether to emit a random alphanumeric prefix in file paths regardless of column

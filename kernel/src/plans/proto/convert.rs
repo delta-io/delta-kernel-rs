@@ -493,6 +493,7 @@ impl From<&MapToStructOptions> for proto_expr::MapToStructOptions {
     fn from(options: &MapToStructOptions) -> Self {
         Self {
             timestamp_timezone: options.timestamp_timezone().map(ToOwned::to_owned),
+            null_on_invalid: options.null_on_invalid(),
         }
     }
 }
@@ -1990,8 +1991,8 @@ mod tests {
         assert!(parse_json.output_schema.is_some());
     }
 
-    #[test]
-    fn from_map_to_struct_expression() {
+    #[rstest]
+    fn from_map_to_struct_expression(#[values(false, true)] null_on_invalid: bool) {
         let proto_expr::expression::Kind::MapToStruct(map_to_struct) = expr_kind_of(
             Expression::map_to_struct(col!("m"), MapToStructOptions::default()),
         ) else {
@@ -2003,7 +2004,9 @@ mod tests {
         let proto_expr::expression::Kind::MapToStruct(map_to_struct) =
             expr_kind_of(Expression::map_to_struct(
                 col!("m"),
-                MapToStructOptions::default().with_timestamp_timezone("America/Los_Angeles"),
+                MapToStructOptions::default()
+                    .with_timestamp_timezone("America/Los_Angeles")
+                    .with_null_on_invalid(null_on_invalid),
             ))
         else {
             panic!("expected a map_to_struct expression");
@@ -2014,6 +2017,10 @@ mod tests {
                 .as_ref()
                 .and_then(|options| options.timestamp_timezone.as_deref()),
             Some("America/Los_Angeles")
+        );
+        assert_eq!(
+            map_to_struct.options.unwrap().null_on_invalid,
+            null_on_invalid
         );
     }
 
