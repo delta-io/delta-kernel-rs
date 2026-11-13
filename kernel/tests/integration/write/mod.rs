@@ -23,5 +23,6 @@ mod remove_dv;
 mod root_manifest_file;
 mod row_tracking;
 mod stats;
+mod table_description;
 mod txn;
 mod types;

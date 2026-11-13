@@ -518,6 +518,29 @@ fn create_table_txn_builder_with_table_property_impl(
     Ok(Box::new(builder).into())
 }
 
+/// Sets the description of the new table, stored in the `description` field of its metadata.
+///
+/// Repeated calls replace the previous description.
+///
+/// # Safety
+///
+/// All handles and `description` must be valid. This call borrows `engine` and `description`
+/// and unconditionally consumes `builder`, including on error.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn create_table_txn_builder_with_description(
+    builder: Handle<ExclusiveCreateTableTransactionBuilder>,
+    description: KernelStringSlice,
+    engine: Handle<SharedExternEngine>,
+) -> ExternResult<Handle<ExclusiveCreateTableTransactionBuilder>> {
+    let builder = unsafe { *builder.into_inner() };
+    let engine = unsafe { engine.as_ref() };
+    let description: KernelResult<String> =
+        unsafe { TryFromStringSlice::try_from_slice(&description) };
+    let result =
+        description.map(|description| Box::new(builder.with_description(description)).into());
+    unsafe { result.into_extern_result(&engine) }
+}
+
 /// Build a create-table transaction using the default [`FileSystemCommitter`]. Returns a
 /// create-table transaction handle that can be used with [`create_table_txn_add_files`] and
 /// [`create_table_txn_commit`] to optionally stage initial data before committing.
