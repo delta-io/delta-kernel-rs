@@ -68,6 +68,25 @@ For delta-kernel-rs changes, check coverage of these scenarios where relevant:
 - **Concurrent writes** — conflict detection and resolution
 - **Large tables** — tables with many files/partitions (at least acknowledged)
 
+For changed replay, hint, or path-conversion logic, check whether the fixtures distinguish these
+failure modes. Credit existing direct or indirect coverage; request only cases relevant to the diff:
+- **Independent replay keys**: use at least two transaction app IDs or domains, update only one,
+  and verify both identities and their winning payloads/versions. One key cannot detect a global
+  winner replacing per-key reconciliation. Check both non-file selections and mixed file/non-file
+  selections when the change affects their separate replay strategies.
+- **Checkpoint-resident tombstones**: removing a file only after checkpointing tests the commit
+  tail, not replay of an existing checkpoint remove. Check a remove before checkpointing followed
+  by an unrelated commit; assert that tombstone-inclusive output retains it exactly once and
+  live-add output excludes the removed identity. Distinguish this from retention filtering.
+- **Interior log gaps**: an empty commit list only tests missing input. Supply commits on both
+  sides of a missing version, plus a compacted path spanning the gap, and verify the hint still
+  fails when its contract requires individual commits. Include a complete-history success case.
+- **Path identity across representations**: URL equivalence alone does not prove that an AMT or
+  checkpoint Add reconciles with a later JSON Remove. Build the later path independently of the
+  conversion under test; copying a converted scan path into the Remove can hide the same bug in
+  both operands. Use relevant reserved characters, literal percent sequences, or Unicode and
+  verify live-file identities after replay, subject to the supported encoding contract.
+
 ### Step 5: Assess test quality
 
 Beyond just existence, evaluate test quality:
@@ -81,6 +100,9 @@ Beyond just existence, evaluate test quality:
   - Timestamp comparisons that assume ordering
   - `sleep` calls of various forms
   - Racing threads/async code without specific barriers to sequence relative progress
+  - Concurrent cache tests whose workers may all observe an already initialized value. Force the
+    relevant overlap with synchronization inside initialization, then verify waiting and reuse of
+    the completed result without duplicate I/O. Sleeps alone do not establish that overlap.
   - Tests that pass "most of the time" but fail under load
 
 ### Step 6: Assess test design (avoid over-fitting)
