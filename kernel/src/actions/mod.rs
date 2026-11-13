@@ -546,6 +546,15 @@ impl Metadata {
         self
     }
 
+    /// Returns a new Metadata with the description replaced, preserving all other fields.
+    #[internal_api]
+    pub(crate) fn with_description(self, description: impl Into<String>) -> Self {
+        Self {
+            description: Some(description.into()),
+            ..self
+        }
+    }
+
     #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new_unchecked(
