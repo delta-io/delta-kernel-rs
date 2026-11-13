@@ -9,6 +9,8 @@ use rstest::rstest;
 use super::*;
 use crate::arrow::array::{ArrayRef, AsArray, Int64Array, RecordBatch, StringArray, StructArray};
 use crate::arrow::compute::cast;
+#[cfg(feature = "nanosecond-timestamps")]
+use crate::arrow::datatypes::TimestampNanosecondType;
 use crate::arrow::datatypes::{
     DataType as ArrowDataType, Field, Fields, Schema as ArrowSchema, TimeUnit as ArrowTimeUnit,
     TimestampMicrosecondType,
@@ -741,6 +743,186 @@ fn timestamp_footer_stats_respect_annotations(
     assert_eq!(extract_max_scalar(&data_type, &column), expected);
 }
 
+#[cfg(feature = "nanosecond-timestamps")]
+#[rstest]
+#[case::greater_positive(Predicate::gt, 1_500_000_000, 2)]
+#[case::less_positive(Predicate::lt, 1_500_000_000, 5)]
+#[case::greater_negative(Predicate::gt, -1_500_000_000, 5)]
+#[case::less_negative(Predicate::lt, -1_500_000_000, 2)]
+#[case::equal_positive(Predicate::eq, 1_500_000_000, 2)]
+#[case::equal_negative(Predicate::eq, -1_500_000_000, 2)]
+fn timestamp_nanos_row_group_skipping_rescales_footer_units(
+    #[case] comparison: fn(Expression, Expression) -> Predicate,
+    #[case] bound: i64,
+    #[case] expected_rows: usize,
+    #[values(
+        ArrowTimeUnit::Millisecond,
+        ArrowTimeUnit::Microsecond,
+        ArrowTimeUnit::Nanosecond
+    )]
+    unit: ArrowTimeUnit,
+    #[values(None, Some("UTC"))] timezone: Option<&str>,
+) {
+    let values = [-1_999_000, -1_001_000, 0, 1_001_000, 1_999_000]
+        .map(|micros| micros_to_unit(micros, unit));
+    let col_path = ["add", "partitionValues_parsed", "ts"];
+    let bytes = write_timestamp_parquet(
+        unit,
+        timezone,
+        &col_path,
+        &[&values[..2], &values[2..3], &values[3..]],
+    );
+    let (_, scalar) = timestamp_nanos_kind(timezone);
+    let bound = lit(scalar(bound));
+    let count_rows = |builder: ParquetRecordBatchReaderBuilder<Bytes>| -> usize {
+        builder
+            .build()
+            .unwrap()
+            .map(|batch| batch.unwrap().num_rows())
+            .sum()
+    };
+    let builder = || parquet_reader(bytes.clone());
+
+    let predicate = comparison(Expression::column(col_path), bound.clone());
+    assert_eq!(
+        count_rows(builder().with_row_group_filter(&predicate, None)),
+        expected_rows
+    );
+
+    let predicate = comparison(col!("ts"), bound);
+    let partition_columns = HashSet::from(["ts".into()]);
+    assert_eq!(
+        count_rows(builder().with_checkpoint_row_group_filter(
+            &predicate,
+            &partition_columns,
+            None
+        )),
+        expected_rows
+    );
+}
+
+#[cfg(feature = "nanosecond-timestamps")]
+#[rstest]
+#[case::millis(
+    ArrowTimeUnit::Millisecond,
+    1_580_544_550_123,
+    1_580_544_550_123_000_000
+)]
+#[case::negative_millis(ArrowTimeUnit::Millisecond, -1, -1_000_000)]
+#[case::micros(
+    ArrowTimeUnit::Microsecond,
+    1_580_544_550_123_456,
+    1_580_544_550_123_456_000
+)]
+#[case::negative_micros(ArrowTimeUnit::Microsecond, -1, -1_000)]
+#[case::nanos_max(ArrowTimeUnit::Nanosecond, i64::MAX, i64::MAX)]
+#[case::nanos_min(ArrowTimeUnit::Nanosecond, i64::MIN, i64::MIN)]
+fn timestamp_nanos_footer_stats_match_arrow_nanosecond_cast(
+    #[case] unit: ArrowTimeUnit,
+    #[case] raw: i64,
+    #[case] expected: i64,
+    #[values(None, Some("UTC"))] timezone: Option<&str>,
+) {
+    let bytes = write_timestamp_parquet(unit, timezone, &["ts"], &[&[raw]]);
+    let builder = parquet_reader(bytes);
+    let predicate = column_pred!("ts");
+    let filter = RowGroupFilter::new(builder.metadata().row_group(0), &predicate);
+    let (data_type, scalar) = timestamp_nanos_kind(timezone);
+    assert_eq!(
+        filter.get_min_stat(&column_name!("ts"), &data_type),
+        Some(scalar(expected))
+    );
+    assert_eq!(
+        filter.get_max_stat(&column_name!("ts"), &data_type),
+        Some(scalar(expected))
+    );
+
+    let batch = builder.build().unwrap().next().unwrap().unwrap();
+    let nanos_type = ArrowDataType::Timestamp(ArrowTimeUnit::Nanosecond, timezone.map(Into::into));
+    let nanos = cast(batch.column(0), &nanos_type).unwrap();
+    assert_eq!(
+        nanos.as_primitive::<TimestampNanosecondType>().value(0),
+        expected
+    );
+}
+
+#[cfg(feature = "nanosecond-timestamps")]
+#[rstest]
+#[case::millis_max_overflow(ArrowTimeUnit::Millisecond, &[-1, i64::MAX / 1_000_000 + 1], Some(-1_000_000), None)]
+#[case::millis_min_underflow(ArrowTimeUnit::Millisecond, &[i64::MIN / 1_000_000 - 1, 1], None, Some(1_000_000))]
+#[case::micros_max_overflow(ArrowTimeUnit::Microsecond, &[-1, i64::MAX / 1_000 + 1], Some(-1_000), None)]
+#[case::micros_min_underflow(ArrowTimeUnit::Microsecond, &[i64::MIN / 1_000 - 1, 1], None, Some(1_000))]
+fn timestamp_nanos_footer_stat_overflow_keeps_row_group(
+    #[case] unit: ArrowTimeUnit,
+    #[case] raw: &[i64],
+    #[case] expected_min: Option<i64>,
+    #[case] expected_max: Option<i64>,
+    #[values(None, Some("UTC"))] timezone: Option<&str>,
+) {
+    let bytes = write_timestamp_parquet(unit, timezone, &["ts"], &[raw]);
+    let builder = parquet_reader(bytes);
+    let row_group = builder.metadata().row_group(0);
+    let predicate = column_pred!("ts");
+    let filter = RowGroupFilter::new(row_group, &predicate);
+    let (data_type, scalar) = timestamp_nanos_kind(timezone);
+    assert_eq!(
+        filter.get_min_stat(&column_name!("ts"), &data_type),
+        expected_min.map(scalar)
+    );
+    assert_eq!(
+        filter.get_max_stat(&column_name!("ts"), &data_type),
+        expected_max.map(scalar)
+    );
+    assert!(RowGroupFilter::apply(
+        row_group,
+        &Predicate::from_expr(expr!(col("ts") < lit(scalar(0))))
+    ));
+    assert!(RowGroupFilter::apply(
+        row_group,
+        &Predicate::from_expr(expr!(col("ts") > lit(scalar(0))))
+    ));
+}
+
+#[cfg(feature = "nanosecond-timestamps")]
+#[rstest]
+#[case::nanos(
+    Some(LogicalType::timestamp(true, TimeUnit::NANOS)),
+    ConvertedType::NONE,
+    Some(1_000)
+)]
+#[case::micros(
+    Some(LogicalType::timestamp(true, TimeUnit::MICROS)),
+    ConvertedType::NONE,
+    Some(1_000_000)
+)]
+#[case::legacy_millis(None, ConvertedType::TIMESTAMP_MILLIS, Some(1_000_000_000))]
+#[case::legacy_micros(None, ConvertedType::TIMESTAMP_MICROS, Some(1_000_000))]
+#[case::unannotated(None, ConvertedType::NONE, None)]
+#[case::legacy_time(None, ConvertedType::TIME_MICROS, None)]
+#[case::logical_signed_integer(Some(LogicalType::integer(64, true)), ConvertedType::INT_64, None)]
+fn timestamp_nanos_footer_stats_respect_annotations(
+    #[case] logical_type: Option<LogicalType>,
+    #[case] converted_type: ConvertedType,
+    #[case] expected: Option<i64>,
+    #[values(None, Some("UTC"))] timezone: Option<&str>,
+) {
+    let column = Type::primitive_type_builder("ts", PhysicalType::INT64)
+        .with_logical_type(logical_type)
+        .with_converted_type(converted_type)
+        .build()
+        .unwrap();
+    let column = ColumnDescriptor::new(Arc::new(column), 0, 0, ColumnPath::from("ts"));
+    let stats = Statistics::int64(Some(1_000), Some(1_000), None, Some(0), false);
+    let column = ColumnChunkMetaData::builder(Arc::new(column))
+        .set_statistics(stats)
+        .build()
+        .unwrap();
+    let (data_type, scalar) = timestamp_nanos_kind(timezone);
+    let expected = expected.map(scalar);
+    assert_eq!(extract_min_scalar(&data_type, &column), expected.clone());
+    assert_eq!(extract_max_scalar(&data_type, &column), expected);
+}
+
 #[rstest]
 fn timestamp_checkpoint_stats_rescale_before_widening(
     #[values(
@@ -772,6 +954,45 @@ fn timestamp_checkpoint_stats_rescale_before_widening(
         (
             filter.get_max_stat(&column_name!("ts"), &data_type),
             1_001_999,
+        )
+    };
+    assert_eq!(actual, Some(scalar(expected)));
+}
+
+// Checkpoint max stats are widened by 999_999ns to account for millisecond truncation in
+// JSON-serialized stats, after rescaling from the footer unit.
+#[cfg(feature = "nanosecond-timestamps")]
+#[rstest]
+fn timestamp_nanos_checkpoint_stats_rescale_before_widening(
+    #[values(
+        ArrowTimeUnit::Millisecond,
+        ArrowTimeUnit::Microsecond,
+        ArrowTimeUnit::Nanosecond
+    )]
+    unit: ArrowTimeUnit,
+    #[values(None, Some("UTC"))] timezone: Option<&str>,
+    #[values(MIN_VALUES, MAX_VALUES)] stat: &str,
+) {
+    let bytes = write_timestamp_parquet(
+        unit,
+        timezone,
+        &["add", "stats_parsed", stat, "ts"],
+        &[&[micros_to_unit(1_001_000, unit)]],
+    );
+    let builder = parquet_reader(bytes);
+    let predicate = column_pred!("ts");
+    let filter =
+        CheckpointRowGroupFilter::new(builder.metadata().row_group(0), &predicate, &NO_PARTITIONS);
+    let (data_type, scalar) = timestamp_nanos_kind(timezone);
+    let (actual, expected) = if stat == MIN_VALUES {
+        (
+            filter.get_min_stat(&column_name!("ts"), &data_type),
+            1_001_000_000,
+        )
+    } else {
+        (
+            filter.get_max_stat(&column_name!("ts"), &data_type),
+            1_001_999_999,
         )
     };
     assert_eq!(actual, Some(scalar(expected)));
@@ -843,6 +1064,14 @@ fn timestamp_kind(timezone: Option<&str>) -> (DataType, fn(i64) -> Scalar) {
     match timezone {
         Some(_) => (DataType::TIMESTAMP, Scalar::Timestamp),
         None => (DataType::TIMESTAMP_NTZ, Scalar::TimestampNtz),
+    }
+}
+
+#[cfg(feature = "nanosecond-timestamps")]
+fn timestamp_nanos_kind(timezone: Option<&str>) -> (DataType, fn(i64) -> Scalar) {
+    match timezone {
+        Some(_) => (DataType::TIMESTAMP_NANOS, Scalar::TimestampNanos),
+        None => (DataType::TIMESTAMP_NANOS_NTZ, Scalar::TimestampNanosNtz),
     }
 }
 
@@ -1355,18 +1584,6 @@ fn checkpoint_filter_timestamp_max_widened() {
     assert_eq!(
         filter.get_max_stat(&column_name!("x"), &DataType::TIMESTAMP_NTZ),
         Some(Scalar::TimestampNtz(1199))
-    );
-
-    // Nanosecond timestamps are widened by 999_999ns: 200 + 999_999 = 1_000_199.
-    #[cfg(feature = "nanosecond-timestamps")]
-    assert_eq!(
-        filter.get_max_stat(&column_name!("x"), &DataType::TIMESTAMP_NANOS),
-        Some(Scalar::TimestampNanos(1_000_199))
-    );
-    #[cfg(feature = "nanosecond-timestamps")]
-    assert_eq!(
-        filter.get_max_stat(&column_name!("x"), &DataType::TIMESTAMP_NANOS_NTZ),
-        Some(Scalar::TimestampNanosNtz(1_000_199))
     );
 
     // Non-timestamp types are not widened.
