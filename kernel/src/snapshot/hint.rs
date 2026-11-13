@@ -364,11 +364,15 @@ impl SnapshotHint {
             log_root,
             Some(version),
             last_checkpoint_hint,
+            checkpoint_type,
         )
-        .map_err(|source| SnapshotHintError::LogSegment {
-            source: Box::new(source),
-        })
-        .map_err(KernelError::from)?;
+        .map_err(|source| match source.without_backtrace() {
+            KernelError::SnapshotHint(_) => source,
+            _ => SnapshotHintError::LogSegment {
+                source: Box::new(source),
+            }
+            .into(),
+        })?;
         // Regular construction derives this field from storage listing. A hint supplies it, so
         // only the hint path needs to validate it explicitly.
         require!(
@@ -409,7 +413,7 @@ impl SnapshotHint {
         }
 
         Snapshot::new_with_crc(
-            log_segment.with_checkpoint_type(checkpoint_type)?,
+            log_segment,
             table_configuration,
             crc,
             built_as_latest,
@@ -571,6 +575,7 @@ mod tests {
                 snapshot.log_segment().log_root.clone(),
                 Some(snapshot.version()),
                 hint.last_checkpoint_hint,
+                None,
             )?,
             snapshot.table_configuration().clone(),
             snapshot.crc_at_version().cloned(),
@@ -680,6 +685,7 @@ mod tests {
                 hint.log_segment_files,
                 snapshot.log_segment().log_root.clone(),
                 Some(snapshot.version()),
+                None,
                 None,
             )?,
             snapshot.table_configuration().clone(),

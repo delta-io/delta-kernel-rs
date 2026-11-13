@@ -1326,6 +1326,7 @@ impl Scan {
             log_segment.log_root.clone(),
             Some(log_segment.end_version),
             None, // No checkpoint in this incremental segment
+            None,
         )?;
 
         // For incremental reads, new_log_segment has no checkpoint but we use the

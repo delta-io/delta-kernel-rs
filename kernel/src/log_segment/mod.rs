@@ -28,6 +28,7 @@ use crate::checkpoint::{SelectedCheckpoint, SelectedCheckpointType};
 use crate::committer::CatalogCommit;
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::content_tree::read_checkpoint_action;
+use crate::error::SnapshotHintError;
 use crate::expressions::ColumnName;
 use crate::last_checkpoint_hint::{HintAction, LastCheckpointHint};
 use crate::log_replay::ActionsBatch;
@@ -395,19 +396,22 @@ impl LogSegment {
         })
     }
 
-    /// Validates the supplied files and constructs their replay segment.
+    /// Constructs a segment with a retained checkpoint type, rejecting conflicts with its paths
+    /// and matching checkpoint schema. The supplied type can resolve ambiguous classic paths.
     #[internal_api]
     pub(crate) fn try_new(
         mut listed_files: LogSegmentFiles,
         log_root: Url,
         end_version: Option<Version>,
         last_checkpoint_metadata: Option<LastCheckpointHint>,
+        checkpoint_type: Option<SelectedCheckpointType>,
     ) -> KernelResult<Self> {
         Self::try_new_impl(
             &mut listed_files,
             log_root,
             end_version,
             last_checkpoint_metadata,
+            checkpoint_type,
         )
     }
 
@@ -597,7 +601,13 @@ impl LogSegment {
             (None, None) => LogSegmentFiles::list(storage, &log_root, log_tail, None, None)?,
         };
 
-        Self::try_new_for_snapshot(listed_files, log_root, time_travel_version, checkpoint_hint)
+        Self::try_new_for_snapshot(
+            listed_files,
+            log_root,
+            time_travel_version,
+            checkpoint_hint,
+            None,
+        )
     }
 
     /// Validates a snapshot's replay files with its selected checkpoint and target version.
@@ -607,6 +617,7 @@ impl LogSegment {
         log_root: Url,
         time_travel_version: Option<Version>,
         checkpoint_hint: Option<LastCheckpointHint>,
+        checkpoint_type: Option<SelectedCheckpointType>,
     ) -> Result<Self> {
         // TODO(#3421): Move Delta error classification into the shared constructor when the
         // remaining public APIs and their log-segment callers migrate to `Result`.
@@ -615,6 +626,7 @@ impl LogSegment {
             log_root.clone(),
             time_travel_version,
             checkpoint_hint,
+            checkpoint_type,
         )
         .map_err(|error| {
             let KernelError::MissingVersion(missing) = error.without_backtrace() else {
@@ -703,7 +715,7 @@ impl LogSegment {
             start_version,
             listed_files.ascending_commit_files().first(),
         )?;
-        LogSegment::try_new(listed_files, log_root, end_version, None)
+        LogSegment::try_new(listed_files, log_root, end_version, None, None)
     }
 
     #[allow(unused)]
@@ -754,7 +766,7 @@ impl LogSegment {
         }
         commits.drain(..start_idx);
 
-        LogSegment::try_new(listed_commits, log_root, Some(end_version), None)
+        LogSegment::try_new(listed_commits, log_root, Some(end_version), None, None)
     }
 
     /// Creates a new LogSegment with the given commit file added to the end.
@@ -830,15 +842,10 @@ impl LogSegment {
             ))
         );
 
-        let observed_type = SelectedCheckpoint::from_path(&checkpoint, None).checkpoint_type;
-        debug_assert!(
-            observed_type == SelectedCheckpointType::Unresolved || observed_type == checkpoint_type
-        );
+        let selected_checkpoint =
+            SelectedCheckpoint::try_new(&checkpoint, None, Some(checkpoint_type))?;
         let mut new_log_segment = self.clone();
-        new_log_segment.checkpoint = Some(SelectedCheckpoint {
-            version: checkpoint.version,
-            checkpoint_type,
-        });
+        new_log_segment.checkpoint = Some(selected_checkpoint);
         let checkpoint_version = checkpoint.version;
         new_log_segment.listed.checkpoint_parts = vec![checkpoint];
         // A snapshot at version N only contains commits and compactions at versions <= N,
@@ -1943,6 +1950,7 @@ impl LogSegment {
         log_root: Url,
         end_version: Option<Version>,
         last_checkpoint_metadata: Option<LastCheckpointHint>,
+        checkpoint_type: Option<SelectedCheckpointType>,
     ) -> KernelResult<Self> {
         validate_log_path_fields(listed_files)?;
         validate_compaction_files(&listed_files.ascending_compaction_files)?;
@@ -1976,12 +1984,18 @@ impl LogSegment {
             effective_version,
         )?;
 
+        let checkpoint = match (listed_files.checkpoint_parts.first(), checkpoint_type) {
+            (Some(path), retained_type) => Some(SelectedCheckpoint::try_new(
+                path,
+                last_checkpoint_metadata.as_ref(),
+                retained_type,
+            )?),
+            (None, None) => None,
+            (None, Some(_)) => return Err(SnapshotHintError::CheckpointTypeConflict.into()),
+        };
         let log_segment = LogSegment {
             end_version: effective_version,
-            checkpoint: listed_files
-                .checkpoint_parts
-                .first()
-                .map(|path| SelectedCheckpoint::from_path(path, last_checkpoint_metadata.as_ref())),
+            checkpoint,
             log_root,
             last_checkpoint_metadata,
             listed: std::mem::take(listed_files),

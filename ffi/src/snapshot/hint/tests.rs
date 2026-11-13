@@ -534,6 +534,7 @@ fn snapshot_hint_export_rejects_compaction_without_calling_visitor() {
             source_ref.log_segment().log_root.clone(),
             Some(1),
             None,
+            None,
         )
         .unwrap(),
         source_ref.table_configuration().clone(),

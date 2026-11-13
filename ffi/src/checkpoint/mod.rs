@@ -2,12 +2,11 @@
 
 mod types;
 
-pub use types::FfiSelectedCheckpointType;
-
 #[cfg(feature = "declarative-plans")]
 use delta_kernel::KernelResult;
 #[cfg(feature = "declarative-plans")]
 use delta_kernel::checkpoint::{CheckpointKind, CheckpointShape};
+pub use types::FfiSelectedCheckpointType;
 
 #[cfg(feature = "declarative-plans")]
 use crate::delta_types::{CheckpointBacking, FfiLastCheckpoint};

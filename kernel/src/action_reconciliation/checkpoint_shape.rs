@@ -750,6 +750,7 @@ mod tests {
                 }),
                 ..Default::default()
             }),
+            None,
         )
         .unwrap()
     }
@@ -898,6 +899,7 @@ mod tests {
                 }),
                 ..Default::default()
             }),
+            None,
         )
         .unwrap()
     }

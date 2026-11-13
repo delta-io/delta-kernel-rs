@@ -2131,6 +2131,7 @@ mod tests {
                 size: 17,
                 ..Default::default()
             }),
+            None,
         )
         .unwrap();
         let configuration = MockTableConfigurationBuilder::new()
@@ -2606,6 +2607,7 @@ mod tests {
             listed_files,
             url.join("_delta_log/").map_err(KernelError::from)?,
             Some(0),
+            None,
             None,
         )?;
 

@@ -217,7 +217,7 @@ mod tests {
         let expected_published = files.max_published_version;
         let root = source.log_segment().log_root.clone();
         let snapshot = Snapshot::new(
-            LogSegment::try_new(files, root.clone(), Some(3), None).unwrap(),
+            LogSegment::try_new(files, root.clone(), Some(3), None, None).unwrap(),
             source.table_configuration().clone(),
         )
         .unwrap();
