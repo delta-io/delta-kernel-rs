@@ -113,14 +113,14 @@ impl Scan {
     }
 
     #[cfg(test)]
-    fn build_metadata_scan_plan(
+    fn build_metadata_scan_plan<'a>(
         &self,
-        shape: &CheckpointShape,
+        shape: impl Into<Option<&'a CheckpointShape>>,
         planner: &MetadataPlanner<'_>,
     ) -> KernelResult<Option<Plan>> {
         let base = MetadataReplayBase::Checkpoint {
             version: self.snapshot.log_segment().checkpoint_version,
-            shape: shape.clone(),
+            shape: shape.into().cloned().map(Arc::new),
         };
         self.build_metadata_scan_plan_with(base, planner.clone())
     }
@@ -206,7 +206,7 @@ mod tests {
     use super::*;
     use crate::actions::LOG_ADD_SCHEMA;
     use crate::arrow::array::{AsArray as _, StringArray, StructArray};
-    use crate::checkpoint::CheckpointType;
+    use crate::checkpoint::CheckpointKind;
     use crate::checkpoint::collation_stats::source_collation_stats;
     use crate::crc::Crc;
     use crate::engine::arrow_data::EngineDataArrowExt as _;
@@ -290,18 +290,24 @@ mod tests {
         }
     }
 
-    fn shape(checkpoint_type: CheckpointType, parsed_stats: Option<SchemaRef>) -> CheckpointShape {
-        let leaf_checkpoint_schema = parsed_stats
-            .as_ref()
-            .map(|stats| parquet_read_schema(Some(stats), None).unwrap());
+    fn shape(kind: CheckpointKind, parsed_stats: Option<SchemaRef>) -> CheckpointShape {
         CheckpointShape {
-            checkpoint_type,
-            leaf_checkpoint_schema,
+            leaf_checkpoint_schema: parquet_read_schema(parsed_stats.as_ref(), None).unwrap(),
+            sidecars: if kind == CheckpointKind::Manifest {
+                Arc::from([crate::FileMeta {
+                    location: log_root().join("_sidecars/leaf.parquet").unwrap(),
+                    size: 0,
+                    last_modified: 0,
+                }])
+            } else {
+                Arc::from([])
+            },
+            size_in_bytes: 0,
+            last_checkpoint: Box::new(crate::last_checkpoint_hint::LastCheckpointHint {
+                size_in_bytes: Some(0),
+                ..Default::default()
+            }),
         }
-    }
-
-    fn no_checkpoint() -> CheckpointShape {
-        shape(CheckpointType::None, None)
     }
 
     fn tags(plan: &Plan) -> Vec<String> {
@@ -309,17 +315,11 @@ mod tests {
     }
 
     // Inspect the leaf read schema to verify collation bounds survive checkpoint projection.
-    fn leaf_read_schema<'plan>(plan: &'plan Plan, shape: &CheckpointShape) -> &'plan SchemaRef {
+    fn leaf_read_schema(plan: &Plan) -> &SchemaRef {
         plan.nodes
             .iter()
             .find_map(|node| match &node.op {
-                Operator::ScanParquet(scan) if shape.checkpoint_type == CheckpointType::Leaf => {
-                    Some(&scan.schema)
-                }
-                Operator::DynamicScan(scan) => {
-                    assert!(scan.dv_column.is_none(), "sidecar scan sets no dv column");
-                    Some(&scan.schema)
-                }
+                Operator::ScanParquet(scan) => Some(&scan.schema),
                 _ => None,
             })
             .expect("checkpoint leaf scan")
@@ -430,17 +430,16 @@ mod tests {
     ];
 
     #[rstest::rstest]
-    #[case::leaf_parquet(shape(CheckpointType::Leaf, None), FileType::Parquet,
+    #[case::leaf_parquet(shape(CheckpointKind::Inline, None), FileType::Parquet,
         vec!["scan_parquet", "filter", "project", "semi_join", "project"])]
-    #[case::leaf_json(shape(CheckpointType::Leaf, None), FileType::Json,
+    #[case::leaf_json(shape(CheckpointKind::Inline, None), FileType::Json,
         vec!["scan_json", "filter", "project", "semi_join", "project"])]
-    #[case::manifest(shape(CheckpointType::Manifest, None), FileType::Parquet,
-        vec!["scan_parquet", "filter", "project", "dynamic_scan", "filter", "project",
-            "semi_join", "project"])]
+    #[case::manifest(shape(CheckpointKind::Manifest, None), FileType::Parquet,
+        vec!["scan_parquet", "filter", "project", "semi_join", "project"])]
     #[case::checkpoint_without_add(
         CheckpointShape {
-            checkpoint_type: CheckpointType::Leaf,
-            leaf_checkpoint_schema: Some(schema_ref! {}),
+            leaf_checkpoint_schema: schema_ref! {},
+            ..shape(CheckpointKind::Inline, None)
         },
         FileType::Parquet,
         vec!["scan_parquet", "filter", "project", "semi_join", "project"]
@@ -476,7 +475,7 @@ mod tests {
         #[case] parsed_partitions: Option<SchemaRef>,
         #[case] expect_native_partitions: bool,
         #[values(None, Some(struct_stats_schema()))] parsed_stats: Option<SchemaRef>,
-        #[values(CheckpointType::Leaf, CheckpointType::Manifest)] checkpoint_type: CheckpointType,
+        #[values(CheckpointKind::Inline, CheckpointKind::Manifest)] kind: CheckpointKind,
         #[values(false, true)] include_tombstones: bool,
     ) -> KernelResult<()> {
         let stats = StatsOptions::all_struct();
@@ -489,11 +488,11 @@ mod tests {
             .with_partition_values(partition_values)
             .build()?;
         let shape = CheckpointShape {
-            checkpoint_type,
-            leaf_checkpoint_schema: Some(parquet_read_schema(
+            leaf_checkpoint_schema: parquet_read_schema(
                 parsed_stats.as_ref(),
                 parsed_partitions.as_ref(),
-            )?),
+            )?,
+            ..shape(kind, None)
         };
         let mut planner = MetadataPlanner::try_from_scan(&scan)?;
         planner.actions.include_tombstones = include_tombstones;
@@ -501,7 +500,7 @@ mod tests {
             .build_metadata_scan_plan(&shape, &planner)?
             .expect("non-empty");
 
-        let checkpoint_schema = leaf_read_schema(&plan, &shape);
+        let checkpoint_schema = leaf_read_schema(&plan);
         assert_eq!(checkpoint_schema.contains(REMOVE_NAME), include_tombstones);
         assert_eq!(
             add_struct(checkpoint_schema).field(STATS_PARSED).is_some(),
@@ -542,7 +541,7 @@ mod tests {
     fn metadata_plan_reads_full_collation_source_only_for_json(
         #[case] stats: StatsOptions,
         #[case] preserve_json: bool,
-        #[values(CheckpointType::Leaf, CheckpointType::Manifest)] checkpoint_type: CheckpointType,
+        #[values(CheckpointKind::Inline, CheckpointKind::Manifest)] kind: CheckpointKind,
     ) -> KernelResult<()> {
         let segment = log_segment(log_root(), &[], Some(checkpoint_path(FileType::Parquet)));
         let config = MockTableConfigurationBuilder::new()
@@ -570,13 +569,13 @@ mod tests {
             .drop_at([ADD_NAME], STATS)
             .build(&checkpoint_schema)?;
         let shape = CheckpointShape {
-            checkpoint_type,
-            leaf_checkpoint_schema: Some(Arc::new(leaf_checkpoint_schema)),
+            leaf_checkpoint_schema: Arc::new(leaf_checkpoint_schema),
+            ..shape(kind, None)
         };
         let plan = scan
             .build_metadata_scan_plan(&shape, &MetadataPlanner::try_from_scan(&scan)?)?
             .unwrap();
-        let read_schema = leaf_read_schema(&plan, &shape);
+        let read_schema = leaf_read_schema(&plan);
         assert_eq!(source_collation_stats(read_schema).is_some(), preserve_json);
         assert_eq!(
             plan.nodes.iter().any(|node| match &node.op {
@@ -597,7 +596,7 @@ mod tests {
         );
         let scan = mock_snapshot(segment)?.scan_builder().build()?;
         let plan = scan
-            .build_metadata_scan_plan(&no_checkpoint(), &MetadataPlanner::try_from_scan(&scan)?)?
+            .build_metadata_scan_plan(None, &MetadataPlanner::try_from_scan(&scan)?)?
             .expect("non-empty");
         let mut expected = COMMIT_ARM_TAGS.to_vec();
         expected.push("project"); // drop version
@@ -606,17 +605,16 @@ mod tests {
     }
 
     #[rstest::rstest]
-    #[case::leaf_parquet(shape(CheckpointType::Leaf, None), FileType::Parquet,
+    #[case::leaf_parquet(shape(CheckpointKind::Inline, None), FileType::Parquet,
         vec!["scan_parquet", "filter", "project", "project", "project"])]
-    #[case::leaf_json(shape(CheckpointType::Leaf, None), FileType::Json,
+    #[case::leaf_json(shape(CheckpointKind::Inline, None), FileType::Json,
         vec!["scan_json", "filter", "project", "project", "project"])]
-    #[case::manifest(shape(CheckpointType::Manifest, None), FileType::Parquet,
-        vec!["scan_parquet", "filter", "project", "dynamic_scan", "filter", "project",
-            "project", "project"])]
+    #[case::manifest(shape(CheckpointKind::Manifest, None), FileType::Parquet,
+        vec!["scan_parquet", "filter", "project", "project", "project"])]
     #[case::checkpoint_without_add(
         CheckpointShape {
-            checkpoint_type: CheckpointType::Leaf,
-            leaf_checkpoint_schema: Some(schema_ref! {}),
+            leaf_checkpoint_schema: schema_ref! {},
+            ..shape(CheckpointKind::Inline, None)
         },
         FileType::Parquet,
         vec!["scan_parquet", "filter", "project", "project", "project"]
@@ -640,11 +638,8 @@ mod tests {
         let segment = log_segment(log_root(), &[], None);
         let scan = mock_snapshot(segment)?.scan_builder().build()?;
         assert!(
-            scan.build_metadata_scan_plan(
-                &no_checkpoint(),
-                &MetadataPlanner::try_from_scan(&scan)?
-            )?
-            .is_none()
+            scan.build_metadata_scan_plan(None, &MetadataPlanner::try_from_scan(&scan)?)?
+                .is_none()
         );
         Ok(())
     }
@@ -662,7 +657,7 @@ mod tests {
         );
         assert!(
             scan.build_metadata_scan_plan(
-                &shape(CheckpointType::Leaf, None),
+                &shape(CheckpointKind::Inline, None),
                 &MetadataPlanner::try_from_scan(&scan)?,
             )?
             .is_none()
@@ -888,9 +883,9 @@ mod tests {
             .with_stats(StatsOptions::all_struct())
             .build()?;
         let planner = MetadataPlanner::try_from_scan(&scan)?;
-        let file_shape = shape(CheckpointType::Leaf, planner.stats_schema.clone());
+        let file_shape = shape(CheckpointKind::Inline, planner.stats_schema.clone());
         let plan = planner
-            .with_checkpoint_shape(file_shape)
+            .with_checkpoint_shape(Arc::new(file_shape))
             .checkpoint_actions()?
             .build()?;
         assert_eq!(tags(&plan), ["values"]);
@@ -939,17 +934,14 @@ mod tests {
             ))))
             .build()?;
         let file_shape = CheckpointShape {
-            checkpoint_type: CheckpointType::Leaf,
-            leaf_checkpoint_schema: Some(file_schema),
+            leaf_checkpoint_schema: file_schema,
+            ..shape(CheckpointKind::Inline, None)
         };
         let plan = MetadataPlanner::try_from_scan(&scan)?
-            .with_checkpoint_shape(file_shape.clone())
+            .with_checkpoint_shape(Arc::new(file_shape.clone()))
             .checkpoint_actions()?
             .build()?;
-        assert_eq!(
-            add_struct(leaf_read_schema(&plan, &file_shape)),
-            &*ADD_SCHEMA
-        );
+        assert_eq!(add_struct(leaf_read_schema(&plan)), &*ADD_SCHEMA);
         let batches = declarative_metadata(&scan, &SyncEngine::new_with_store(store))?;
         assert_eq!(metadata_row_count(&batches), expected_rows);
         for batch in batches {
@@ -998,7 +990,7 @@ mod tests {
             .build()?;
         let plan = scan
             .build_metadata_scan_plan(
-                &shape(CheckpointType::Leaf, None),
+                &shape(CheckpointKind::Inline, None),
                 &MetadataPlanner::try_from_scan(&scan)?,
             )?
             .expect("non-empty");

@@ -555,6 +555,10 @@ impl Snapshot {
             crc: existing.crc.clone(),
             built_as_latest,
             skipped_new_checkpoints,
+            #[cfg(feature = "declarative-plans")]
+            checkpoint_info: existing.checkpoint_info.clone(),
+            #[cfg(feature = "declarative-plans")]
+            checkpoint_info_init: Default::default(),
             #[cfg(feature = "adaptive-metadata-in-dev")]
             checkpoint_action: existing.checkpoint_action.clone(),
             #[cfg(feature = "adaptive-metadata-in-dev")]
@@ -635,6 +639,44 @@ mod tests {
         CapturingReporter, install_thread_local_metrics_reporter, string_array_to_engine_data,
     };
     use crate::{Engine, Error, KernelResult, Result};
+
+    #[cfg(feature = "declarative-plans")]
+    #[rstest]
+    fn checkpoint_cache_survives_build_metadata_changes(
+        #[values(false, true)] initialized: bool,
+    ) -> Result<()> {
+        // Given: a latest snapshot with either a completed or an empty checkpoint cache.
+        let (engine, snapshot, _tempdir) =
+            crate::unit_test_utils::load_test_table("v1-multi-part-struct-stats-only")?;
+        let before = if initialized {
+            snapshot.reader().get_checkpoint_info(engine.as_ref())?
+        } else {
+            None
+        };
+        assert_eq!(before.is_some(), initialized);
+        let no_executor =
+            crate::engine::DelegatingEngine::new(engine.clone()).without_plan_executor();
+
+        // When: a refresh changes only build policy, then its getter runs without an executor.
+        let refreshed = Snapshot::builder_from(snapshot.clone())
+            .skip_new_checkpoints()
+            .build(engine.as_ref())?;
+        let cached = refreshed.reader().get_checkpoint_info(&no_executor);
+
+        // Then: the copied view retains completed metadata while keeping empty caches independent.
+        assert!(!Arc::ptr_eq(&snapshot, &refreshed));
+        assert!(!snapshot.skipped_new_checkpoints());
+        assert!(refreshed.skipped_new_checkpoints());
+        if let Some(before) = before {
+            assert!(Arc::ptr_eq(&before, &cached?.unwrap()));
+        } else {
+            assert!(cached.is_err());
+            // When / Then: initializing the copy leaves the original unresolved.
+            refreshed.reader().get_checkpoint_info(engine.as_ref())?;
+            assert!(snapshot.cached_checkpoint_info().is_none());
+        }
+        Ok(())
+    }
 
     // ============================================================================
     // Helpers

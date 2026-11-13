@@ -80,7 +80,7 @@ pub(crate) struct SnapshotHint {
     protocol: Protocol,
     /// The table metadata at `version`.
     metadata: Metadata,
-    /// The optional `_last_checkpoint` contents associated with the log segment.
+    /// Optional portable metadata for the selected checkpoint, supplied or resolved.
     last_checkpoint_hint: Option<LastCheckpointHint>,
     /// The optional CRC state resolved at `version`.
     ///
@@ -231,12 +231,19 @@ impl SnapshotHint {
             segment.listed.ascending_compaction_files.is_empty(),
             SnapshotHintError::LogCompaction.into()
         );
+        let last_checkpoint_hint = segment.checkpoint_hint();
+        #[cfg(feature = "declarative-plans")]
+        let last_checkpoint_hint = snapshot
+            .cached_checkpoint_info()
+            .and_then(Option::as_deref)
+            .map(|info| info.last_checkpoint())
+            .or(last_checkpoint_hint);
         Ok(Self {
             version: snapshot.version(),
             log_segment_files: segment.listed.clone(),
             protocol: snapshot.table_configuration().protocol().clone(),
             metadata: snapshot.table_configuration().metadata().clone(),
-            last_checkpoint_hint: segment.checkpoint_hint().cloned(),
+            last_checkpoint_hint: last_checkpoint_hint.cloned(),
             crc: snapshot.crc_at_version().cloned(),
             freshness: if snapshot.is_built_as_latest() {
                 SnapshotHintFreshness::Latest
@@ -410,6 +417,8 @@ mod tests {
 
     use super::*;
     use crate::cancellation::CancellationTokenRef;
+    #[cfg(feature = "declarative-plans")]
+    use crate::engine::DelegatingEngine;
     use crate::engine::sync::SyncEngine;
     use crate::metrics::{MeteredDeltaEngine, MetricEvent, SnapshotLoadType};
     use crate::path::LogPathFileType;
@@ -422,6 +431,8 @@ mod tests {
     };
     use crate::snapshot::{FromTableRoot, SnapshotBuilder};
     use crate::table_features::TableFeature;
+    #[cfg(feature = "declarative-plans")]
+    use crate::unit_test_utils::load_test_table;
     use crate::unit_test_utils::{
         TestCancellationToken, create_log_path, create_log_path_with_size, is_io_event,
     };
@@ -542,6 +553,83 @@ mod tests {
             .with_snapshot_hint(exported)
             .build(engine.as_ref())?;
         assert_eq!(rebuilt.version(), snapshot.version());
+        Ok(())
+    }
+
+    #[cfg(feature = "declarative-plans")]
+    #[rstest::rstest]
+    #[case::classic_manifest("v2-classic-checkpoint-parquet")]
+    #[case::uuid_manifest("v2-checkpoints-json-with-sidecars")]
+    #[case::inline("v2-checkpoints-parquet-without-sidecars")]
+    #[case::multipart("v1-multi-part-struct-stats-only")]
+    fn resolved_checkpoint_hint_exports_and_rebuilds(
+        #[case] table: &str,
+        #[values(false, true)] omit_hint: bool,
+    ) -> crate::Result<()> {
+        // Given: an unresolved snapshot with or without a writer hint.
+        let (engine, original, _tempdir) = load_test_table(table)?;
+        let mut segment = original.log_segment().clone();
+        if omit_hint {
+            segment.last_checkpoint_metadata = None;
+        }
+        let snapshot = Arc::new(Snapshot::new(
+            segment,
+            original.table_configuration().clone(),
+        )?);
+        let exported = snapshot.to_snapshot_hint()?;
+        assert_eq!(
+            exported.last_checkpoint_hint(),
+            snapshot.log_segment().checkpoint_hint()
+        );
+        assert!(snapshot.cached_checkpoint_info().is_none());
+
+        // When: scan planning resolves the checkpoint and its hint is exported.
+        snapshot
+            .clone()
+            .scan_builder()
+            .build()?
+            .declarative_metadata_scan_plan(engine.as_ref())?;
+        let resolved = snapshot
+            .cached_checkpoint_info()
+            .expect("scan populated checkpoint cache")
+            .as_ref()
+            .unwrap();
+        let mut exported = snapshot.to_snapshot_hint()?;
+
+        // Then: export retains the resolved metadata, which remains readable without an executor.
+        assert_eq!(
+            exported.last_checkpoint_hint(),
+            Some(resolved.last_checkpoint())
+        );
+        let no_executor = DelegatingEngine::new(engine.clone()).without_plan_executor();
+        let cached = snapshot
+            .reader()
+            .get_checkpoint_info(&no_executor)?
+            .unwrap();
+        assert!(Arc::ptr_eq(resolved, &cached));
+        let portable = serde_json::to_value(exported.last_checkpoint_hint().unwrap()).unwrap();
+        let parsed: LastCheckpointHint = serde_json::from_value(portable.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&parsed).unwrap(), portable);
+
+        // When: a new snapshot is built using only the portable hint.
+        exported.last_checkpoint_hint = Some(parsed);
+        let rebuilt = Snapshot::builder_for(snapshot.table_root().clone())
+            .with_snapshot_hint(exported)
+            .build(&no_executor)?;
+
+        // Then: construction leaves resolution lazy and a getter recovers the complete layout.
+        assert!(rebuilt.cached_checkpoint_info().is_none());
+        let recovered = rebuilt
+            .reader()
+            .get_checkpoint_info(engine.as_ref())?
+            .unwrap();
+        assert_eq!(recovered.kind(), resolved.kind());
+        assert_eq!(recovered.leaf_schema(), resolved.leaf_schema());
+        assert_eq!(recovered.leaf_file_count(), resolved.leaf_file_count());
+        assert_eq!(
+            serde_json::to_value(recovered.last_checkpoint()).unwrap(),
+            portable
+        );
         Ok(())
     }
 

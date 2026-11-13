@@ -9,7 +9,7 @@ use super::action_set::ActionSet;
 use super::*;
 use crate::actions::{DomainMetadata, SetTransaction, get_all_actions_schema};
 use crate::arrow::compute::{concat_batches, filter_record_batch, is_not_null};
-use crate::checkpoint::{CheckpointShape, CheckpointSpec, V2CheckpointConfig};
+use crate::checkpoint::{CheckpointSpec, V2CheckpointConfig};
 use crate::engine::arrow_conversion::TryIntoArrow;
 use crate::engine::sync::SyncEngine;
 use crate::scan::StatsOptions;
@@ -20,7 +20,7 @@ use crate::unit_test_utils::{
     Action, LocalMockTable, MockProtocolBuilder, MockTableConfigurationBuilder, create_add_action,
     create_remove_action,
 };
-use crate::{Engine, KernelResult, Snapshot};
+use crate::{KernelResult, Snapshot};
 
 #[rstest]
 #[case::live_adds(ActionSet::live_adds())]
@@ -44,6 +44,7 @@ async fn replay_selects_latest_action_without_retention(
     )]
     checkpoint: Option<CheckpointSpec>,
 ) -> KernelResult<()> {
+    // Given: checkpoint and commit actions with independent identities and optional tombstones.
     let engine = SyncEngine::new();
     let mut table = LocalMockTable::new();
     let table_root = Url::from_directory_path(table.table_root()).unwrap();
@@ -96,15 +97,18 @@ async fn replay_selects_latest_action_without_retention(
             Action::DomainMetadata(domain_deletion),
         ])
         .await;
+    // When: shared replay reads the requested actions using complete checkpoint discovery.
     let snapshot = build_snapshot!(VersionTarget::Latest, &table_root, &engine);
     let checkpoint_shape = actions
         .live_adds
-        .then(|| CheckpointShape::try_new(engine.require_plan_executor()?.as_ref(), &snapshot))
-        .transpose()?;
+        .then(|| snapshot.checkpoint_info(&engine))
+        .transpose()?
+        .flatten();
     let state = MetadataPlanner::new(snapshot.log_segment(), actions)
         .with_stats(StatsOptions::json_only())
         .with_checkpoint_shape(checkpoint_shape)
         .replay()?;
+    // Then: each requested payload and version comes from its latest action.
     let names = actions.output_action_names().collect::<Vec<_>>();
     let schema = schema_ref! {
         ..(get_all_actions_schema().project_as_struct(&names)?),

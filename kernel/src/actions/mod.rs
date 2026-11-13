@@ -73,6 +73,11 @@ pub(crate) const CHECKPOINT_METADATA_NAME: &str = "checkpointMetadata";
 /// Optional `checkpointMetadata.tags` key whose value is the JSON-encoded `StructType` of the
 /// checkpoint's sidecar files
 pub(crate) const SIDECAR_FILE_SCHEMA_TAG: &str = "sidecarFileSchema";
+/// Optional add-action count from the [checkpoint metadata tags][spec] in the Delta protocol.
+///
+/// [spec]: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#checkpoint-metadata-tags
+#[cfg(feature = "declarative-plans")]
+pub(crate) const CHECKPOINT_NUM_ADD_FILES_TAG: &str = "numOfAddFiles";
 #[internal_api]
 pub(crate) const DOMAIN_METADATA_NAME: &str = "domainMetadata";
 #[cfg(feature = "adaptive-metadata-in-dev")]
