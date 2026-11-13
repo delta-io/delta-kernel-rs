@@ -183,7 +183,7 @@ mod tests {
     };
     use crate::arrow::array::{Array as _, AsArray as _, RecordBatch};
     use crate::arrow::datatypes::Int64Type;
-    use crate::content_tree::test_utils::{added_data_entry, write_manifest};
+    use crate::content_tree::test_utils::{action_paths, added_data_entry, write_manifest};
     use crate::content_tree::{ContentTreeNodeEntry, TrackingStatus};
     use crate::engine::CancellableEngine;
     use crate::engine::arrow_data::EngineDataArrowExt as _;
@@ -249,20 +249,6 @@ mod tests {
     ) -> CheckpointAction {
         let root = write_manifest(engine, table_root().join(ROOT_PATH).unwrap(), entries);
         checkpoint_action_with_root(ROOT_PATH, root.size as i64, version).unwrap()
-    }
-
-    /// The non-null `<action>.path` leaf values of `batch`, as replay reads them, or none if it
-    /// lacks the action column.
-    fn action_paths(batch: &RecordBatch, action: &str) -> Vec<String> {
-        let Some(column) = batch.column_by_name(action) else {
-            return vec![];
-        };
-        let paths = column
-            .as_struct()
-            .column_by_name("path")
-            .unwrap()
-            .as_string::<i32>();
-        paths.iter().flatten().map(str::to_string).collect()
     }
 
     /// A read batch's `(is_log_batch, add paths, remove paths)`.

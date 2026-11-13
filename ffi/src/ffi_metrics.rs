@@ -460,6 +460,51 @@ pub struct ChecksumWriteFailure {
     pub duration_ns: u64,
 }
 
+/// Result of reading and validating a `_last_checkpoint` hint.
+///
+/// See [`kernel::LastCheckpointReadOutcome`] for return and fallback semantics.
+///
+/// cbindgen:prefix-with-name=true
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(C)]
+pub enum LastCheckpointReadOutcome {
+    /// The hint was parsed and retained.
+    Success,
+    /// Storage reported that the hint file was absent.
+    ///
+    /// When the file iterator reports the missing hint, Kernel lists the log to find checkpoints
+    /// and commits. If the storage call itself returns the error, it propagates instead.
+    NotFound,
+    /// The hint was empty, malformed, or discarded by hint validation.
+    Invalid,
+    /// The attempt returned another error, including cancellation.
+    Error,
+    /// The outcome was not recorded or its metric label was unrecognized.
+    Unknown,
+}
+
+impl From<kernel::LastCheckpointReadOutcome> for LastCheckpointReadOutcome {
+    fn from(outcome: kernel::LastCheckpointReadOutcome) -> Self {
+        match outcome {
+            kernel::LastCheckpointReadOutcome::Success => Self::Success,
+            kernel::LastCheckpointReadOutcome::NotFound => Self::NotFound,
+            kernel::LastCheckpointReadOutcome::Invalid => Self::Invalid,
+            kernel::LastCheckpointReadOutcome::Error => Self::Error,
+            kernel::LastCheckpointReadOutcome::Unknown => Self::Unknown,
+        }
+    }
+}
+
+/// A `_last_checkpoint` read attempt completed.
+#[repr(C)]
+pub struct LastCheckpointReadCompleted {
+    /// Result of reading and validating the hint.
+    pub outcome: LastCheckpointReadOutcome,
+    /// Wall-clock time from entry through return, including parsing and validation, in
+    /// nanoseconds.
+    pub duration_ns: u64,
+}
+
 /// A `JsonHandler::read_json_files` call completed.
 #[repr(C)]
 pub struct JsonReadCompleted {
@@ -547,6 +592,7 @@ pub enum MetricEvent {
     CheckpointWriteFailure(CheckpointWriteFailure),
     ChecksumWriteSuccess(ChecksumWriteSuccess),
     ChecksumWriteFailure(ChecksumWriteFailure),
+    LastCheckpointReadCompleted(LastCheckpointReadCompleted),
 }
 
 /// Borrow the caller-supplied correlation id as a [`KernelStringSlice`], or an empty slice when
@@ -732,6 +778,13 @@ impl MetricEvent {
                 duration_ns: ns(*duration),
             }),
             K::CrcReadFailure => Self::CrcReadFailure,
+            K::LastCheckpointReadCompleted(kernel::LastCheckpointReadCompleted {
+                outcome,
+                duration,
+            }) => Self::LastCheckpointReadCompleted(LastCheckpointReadCompleted {
+                outcome: (*outcome).into(),
+                duration_ns: ns(*duration),
+            }),
             K::ChecksumWriteSuccess(kernel::ChecksumWriteSuccess {
                 outcome,
                 resolution_mode,
@@ -854,6 +907,45 @@ mod tests {
 
     use super::*;
     use crate::TryFromStringSlice;
+
+    #[rstest]
+    #[case(
+        kernel::LastCheckpointReadOutcome::Success,
+        LastCheckpointReadOutcome::Success
+    )]
+    #[case(
+        kernel::LastCheckpointReadOutcome::NotFound,
+        LastCheckpointReadOutcome::NotFound
+    )]
+    #[case(
+        kernel::LastCheckpointReadOutcome::Invalid,
+        LastCheckpointReadOutcome::Invalid
+    )]
+    #[case(
+        kernel::LastCheckpointReadOutcome::Error,
+        LastCheckpointReadOutcome::Error
+    )]
+    #[case(
+        kernel::LastCheckpointReadOutcome::Unknown,
+        LastCheckpointReadOutcome::Unknown
+    )]
+    fn last_checkpoint_read_conversion_preserves_outcome_and_duration(
+        #[case] outcome: kernel::LastCheckpointReadOutcome,
+        #[case] expected: LastCheckpointReadOutcome,
+    ) {
+        let event =
+            kernel::MetricEvent::LastCheckpointReadCompleted(kernel::LastCheckpointReadCompleted {
+                outcome,
+                duration: Duration::from_nanos(17),
+            });
+        with_ffi_event(&event, |event| {
+            let MetricEvent::LastCheckpointReadCompleted(event) = event else {
+                panic!("expected LastCheckpointReadCompleted");
+            };
+            assert_eq!(event.outcome, expected);
+            assert_eq!(event.duration_ns, 17);
+        });
+    }
 
     #[rstest]
     #[case::v1(kernel::CheckpointWriteMode::V1, CheckpointWriteMode::V1)]

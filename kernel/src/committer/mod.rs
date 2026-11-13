@@ -117,6 +117,9 @@ pub trait Committer: Send {
     /// - This method must ensure that all catalog commits are published to the Delta log up to and
     ///   including the snapshot version specified in [`PublishMetadata`]
     /// - Commits must be published in order: version V-1 must be published before version V
+    /// - Publishing the same commits again must be safe, including after a successful call.
+    /// - On success, published files must be visible to the supplied engine's
+    ///   [`StorageHandler::head`](crate::StorageHandler::head).
     ///
     /// # Catalog-specific semantics
     ///
