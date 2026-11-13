@@ -11,7 +11,7 @@ use delta_kernel::object_store::gcp::GoogleCloudStorageBuilder;
 use delta_kernel::object_store::{DynObjectStore, ObjectStoreScheme};
 use delta_kernel::scan::Scan;
 use delta_kernel::schema::MetadataColumnSpec;
-use delta_kernel::{KernelResult, SnapshotRef};
+use delta_kernel::{KernelResult, Result, SnapshotRef};
 use delta_kernel_default_engine::executor::tokio::TokioBackgroundExecutor;
 use delta_kernel_default_engine::storage::store_from_url_opts;
 use delta_kernel_default_engine::{DefaultEngine, DefaultEngineBuilder};
@@ -180,7 +180,7 @@ pub fn get_engine(
 
 /// Construct a scan at the latest snapshot. This is over the specified table and using the passed
 /// engine. Parameters of the scan are controlled by the specified `ScanArgs`
-pub fn get_scan(snapshot: SnapshotRef, args: &ScanArgs) -> KernelResult<Option<Scan>> {
+pub fn get_scan(snapshot: SnapshotRef, args: &ScanArgs) -> Result<Option<Scan>> {
     if args.schema_only {
         println!("{:#?}", snapshot.schema());
         return Ok(None);

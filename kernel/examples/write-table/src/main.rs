@@ -203,7 +203,7 @@ async fn create_table(
     table_url: &Url,
     schema: &SchemaRef,
     engine: &dyn Engine,
-) -> KernelResult<()> {
+) -> delta_kernel::Result<()> {
     // Use the create_table API to create the table
     let table_path = table_url.as_str();
     let _result = create_delta_table(

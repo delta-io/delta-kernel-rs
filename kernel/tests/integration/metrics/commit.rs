@@ -5,6 +5,7 @@
 
 use std::sync::{Arc, Mutex};
 
+use delta_kernel::Snapshot;
 use delta_kernel::arrow::array::Int32Array;
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::metrics::{MetricEvent, MetricsReporter, TableType, TransactionCommitSuccess};
@@ -12,7 +13,6 @@ use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::schema::{DataType, StructField, schema_ref};
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::{CommitResult, UpdateTableOperation};
-use delta_kernel::{KernelResult, Snapshot};
 use rstest::rstest;
 use test_utils::delta_kernel_default_engine::DefaultEngineBuilder;
 use test_utils::{
@@ -50,7 +50,7 @@ impl LastCommitSuccess {
     }
 }
 
-fn setup_empty_table() -> KernelResult<(tempfile::TempDir, Url)> {
+fn setup_empty_table() -> delta_kernel::Result<(tempfile::TempDir, Url)> {
     let (temp_dir, table_path, setup_engine) = test_table_setup_mt()?;
     let table_url = delta_kernel::try_parse_uri(&table_path)?;
     create_table(&table_path, simple_schema(), "Test/1.0", true)
@@ -179,7 +179,7 @@ async fn commit_reports_added_file_count_not_batch_count() -> delta_kernel::Resu
 
 /// Sets the correlation id on the create-table builder and checks it reaches the commit metric.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn commit_success_carries_correlation_id() -> KernelResult<()> {
+async fn commit_success_carries_correlation_id() -> delta_kernel::Result<()> {
     let (_temp_dir, table_path, setup_engine) = test_table_setup_mt()?;
     let reporter = Arc::new(LastCommitSuccess::default());
     let _guard = install_thread_local_metrics_reporter(reporter.clone());
@@ -207,7 +207,7 @@ async fn commit_success_carries_correlation_id() -> KernelResult<()> {
 async fn create_table_builder_carries_correlation_id(
     #[case] correlation_id: Option<&str>,
     #[case] expected: Option<&str>,
-) -> KernelResult<()> {
+) -> delta_kernel::Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
     let reporter = Arc::new(LastCommitSuccess::default());
     let _guard = install_thread_local_metrics_reporter(reporter.clone());

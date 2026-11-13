@@ -125,6 +125,59 @@ impl From<kernel::CheckpointWriteMode> for CheckpointWriteMode {
     }
 }
 
+/// Outcome of a successful [`delta_kernel::Snapshot::write_checksum`] call.
+///
+/// cbindgen:prefix-with-name=true
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(C)]
+pub enum ChecksumWriteOutcome {
+    /// The CRC was written and the returned snapshot was constructed successfully.
+    Written {
+        /// Exact serialized UTF-8 byte count written by this call.
+        bytes_written: u64,
+    },
+    /// The CRC already existed, including a concurrent writer winning the storage race.
+    AlreadyExists,
+}
+
+impl From<kernel::ChecksumWriteOutcome> for ChecksumWriteOutcome {
+    fn from(outcome: kernel::ChecksumWriteOutcome) -> Self {
+        match outcome {
+            kernel::ChecksumWriteOutcome::Written { bytes_written } => {
+                Self::Written { bytes_written }
+            }
+            kernel::ChecksumWriteOutcome::AlreadyExists => Self::AlreadyExists,
+        }
+    }
+}
+
+/// CRC construction path selected during a [`delta_kernel::Snapshot::write_checksum`] call.
+///
+/// cbindgen:prefix-with-name=true
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(C)]
+pub enum ChecksumWriteResolutionMode {
+    /// Attempted construction from a checkpoint or version zero, replaying commits as needed.
+    Full,
+    /// Attempted to advance an older CRC by replaying newer commits.
+    Incremental,
+    /// Selected the in-memory CRC already at the snapshot version.
+    Cached,
+    /// Returned before selecting a CRC construction path.
+    NotAttempted,
+}
+
+impl From<kernel::ChecksumWriteResolutionMode> for ChecksumWriteResolutionMode {
+    fn from(mode: kernel::ChecksumWriteResolutionMode) -> Self {
+        match mode {
+            kernel::ChecksumWriteResolutionMode::Full => Self::Full,
+            kernel::ChecksumWriteResolutionMode::Incremental => Self::Incremental,
+            kernel::ChecksumWriteResolutionMode::Cached => Self::Cached,
+            kernel::ChecksumWriteResolutionMode::NotAttempted => Self::NotAttempted,
+        }
+    }
+}
+
 /// Whether a table is path-based or catalog-managed.
 ///
 /// cbindgen:prefix-with-name=true
@@ -385,6 +438,73 @@ pub struct CrcReadSuccess {
     pub duration_ns: u64,
 }
 
+/// A [`delta_kernel::Snapshot::write_checksum`] call succeeded.
+#[repr(C)]
+pub struct ChecksumWriteSuccess {
+    /// Whether this call wrote a new CRC or the CRC already existed.
+    pub outcome: ChecksumWriteOutcome,
+    /// CRC construction path selected during this call.
+    pub resolution_mode: ChecksumWriteResolutionMode,
+    /// Wall-clock time from API entry to return.
+    pub duration_ns: u64,
+}
+
+/// A [`delta_kernel::Snapshot::write_checksum`] call failed.
+///
+/// Storage may already contain the CRC if constructing the returned snapshot failed.
+#[repr(C)]
+pub struct ChecksumWriteFailure {
+    /// CRC construction path selected before the error.
+    pub resolution_mode: ChecksumWriteResolutionMode,
+    /// Wall-clock time from API entry to return.
+    pub duration_ns: u64,
+}
+
+/// Result of reading and validating a `_last_checkpoint` hint.
+///
+/// See [`kernel::LastCheckpointReadOutcome`] for return and fallback semantics.
+///
+/// cbindgen:prefix-with-name=true
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(C)]
+pub enum LastCheckpointReadOutcome {
+    /// The hint was parsed and retained.
+    Success,
+    /// Storage reported that the hint file was absent.
+    ///
+    /// When the file iterator reports the missing hint, Kernel lists the log to find checkpoints
+    /// and commits. If the storage call itself returns the error, it propagates instead.
+    NotFound,
+    /// The hint was empty, malformed, or discarded by hint validation.
+    Invalid,
+    /// The attempt returned another error, including cancellation.
+    Error,
+    /// The outcome was not recorded or its metric label was unrecognized.
+    Unknown,
+}
+
+impl From<kernel::LastCheckpointReadOutcome> for LastCheckpointReadOutcome {
+    fn from(outcome: kernel::LastCheckpointReadOutcome) -> Self {
+        match outcome {
+            kernel::LastCheckpointReadOutcome::Success => Self::Success,
+            kernel::LastCheckpointReadOutcome::NotFound => Self::NotFound,
+            kernel::LastCheckpointReadOutcome::Invalid => Self::Invalid,
+            kernel::LastCheckpointReadOutcome::Error => Self::Error,
+            kernel::LastCheckpointReadOutcome::Unknown => Self::Unknown,
+        }
+    }
+}
+
+/// A `_last_checkpoint` read attempt completed.
+#[repr(C)]
+pub struct LastCheckpointReadCompleted {
+    /// Result of reading and validating the hint.
+    pub outcome: LastCheckpointReadOutcome,
+    /// Wall-clock time from entry through return, including parsing and validation, in
+    /// nanoseconds.
+    pub duration_ns: u64,
+}
+
 /// A `JsonHandler::read_json_files` call completed.
 #[repr(C)]
 pub struct JsonReadCompleted {
@@ -470,6 +590,9 @@ pub enum MetricEvent {
     StorageCopyCompleted(StorageCopyCompleted),
     CheckpointWriteSuccess(CheckpointWriteSuccess),
     CheckpointWriteFailure(CheckpointWriteFailure),
+    ChecksumWriteSuccess(ChecksumWriteSuccess),
+    ChecksumWriteFailure(ChecksumWriteFailure),
+    LastCheckpointReadCompleted(LastCheckpointReadCompleted),
 }
 
 /// Borrow the caller-supplied correlation id as a [`KernelStringSlice`], or an empty slice when
@@ -655,6 +778,29 @@ impl MetricEvent {
                 duration_ns: ns(*duration),
             }),
             K::CrcReadFailure => Self::CrcReadFailure,
+            K::LastCheckpointReadCompleted(kernel::LastCheckpointReadCompleted {
+                outcome,
+                duration,
+            }) => Self::LastCheckpointReadCompleted(LastCheckpointReadCompleted {
+                outcome: (*outcome).into(),
+                duration_ns: ns(*duration),
+            }),
+            K::ChecksumWriteSuccess(kernel::ChecksumWriteSuccess {
+                outcome,
+                resolution_mode,
+                duration,
+            }) => Self::ChecksumWriteSuccess(ChecksumWriteSuccess {
+                outcome: (*outcome).into(),
+                resolution_mode: (*resolution_mode).into(),
+                duration_ns: ns(*duration),
+            }),
+            K::ChecksumWriteFailure(kernel::ChecksumWriteFailure {
+                resolution_mode,
+                duration,
+            }) => Self::ChecksumWriteFailure(ChecksumWriteFailure {
+                resolution_mode: (*resolution_mode).into(),
+                duration_ns: ns(*duration),
+            }),
             K::JsonReadCompleted(kernel::JsonReadCompleted {
                 num_files,
                 bytes_read,
@@ -761,6 +907,45 @@ mod tests {
 
     use super::*;
     use crate::TryFromStringSlice;
+
+    #[rstest]
+    #[case(
+        kernel::LastCheckpointReadOutcome::Success,
+        LastCheckpointReadOutcome::Success
+    )]
+    #[case(
+        kernel::LastCheckpointReadOutcome::NotFound,
+        LastCheckpointReadOutcome::NotFound
+    )]
+    #[case(
+        kernel::LastCheckpointReadOutcome::Invalid,
+        LastCheckpointReadOutcome::Invalid
+    )]
+    #[case(
+        kernel::LastCheckpointReadOutcome::Error,
+        LastCheckpointReadOutcome::Error
+    )]
+    #[case(
+        kernel::LastCheckpointReadOutcome::Unknown,
+        LastCheckpointReadOutcome::Unknown
+    )]
+    fn last_checkpoint_read_conversion_preserves_outcome_and_duration(
+        #[case] outcome: kernel::LastCheckpointReadOutcome,
+        #[case] expected: LastCheckpointReadOutcome,
+    ) {
+        let event =
+            kernel::MetricEvent::LastCheckpointReadCompleted(kernel::LastCheckpointReadCompleted {
+                outcome,
+                duration: Duration::from_nanos(17),
+            });
+        with_ffi_event(&event, |event| {
+            let MetricEvent::LastCheckpointReadCompleted(event) = event else {
+                panic!("expected LastCheckpointReadCompleted");
+            };
+            assert_eq!(event.outcome, expected);
+            assert_eq!(event.duration_ns, 17);
+        });
+    }
 
     #[rstest]
     #[case::v1(kernel::CheckpointWriteMode::V1, CheckpointWriteMode::V1)]
@@ -955,6 +1140,102 @@ mod tests {
             let cid: &str =
                 unsafe { TryFromStringSlice::try_from_slice(&e.correlation_id).unwrap() };
             assert_eq!(cid, "req-fail");
+        });
+    }
+
+    #[rstest]
+    #[case::written(
+        kernel::ChecksumWriteOutcome::Written { bytes_written: u64::MAX },
+        ChecksumWriteOutcome::Written { bytes_written: u64::MAX }
+    )]
+    #[case::written_zero(
+        kernel::ChecksumWriteOutcome::Written { bytes_written: 0 },
+        ChecksumWriteOutcome::Written { bytes_written: 0 }
+    )]
+    #[case::already_exists(
+        kernel::ChecksumWriteOutcome::AlreadyExists,
+        ChecksumWriteOutcome::AlreadyExists
+    )]
+    fn from_kernel_checksum_write_success_preserves_payload_mode_and_duration(
+        #[case] outcome: kernel::ChecksumWriteOutcome,
+        #[case] expected_outcome: ChecksumWriteOutcome,
+        #[values(
+            (kernel::ChecksumWriteResolutionMode::Full, ChecksumWriteResolutionMode::Full),
+            (
+                kernel::ChecksumWriteResolutionMode::Incremental,
+                ChecksumWriteResolutionMode::Incremental
+            ),
+            (kernel::ChecksumWriteResolutionMode::Cached, ChecksumWriteResolutionMode::Cached),
+            (
+                kernel::ChecksumWriteResolutionMode::NotAttempted,
+                ChecksumWriteResolutionMode::NotAttempted
+            )
+        )]
+        modes: (
+            kernel::ChecksumWriteResolutionMode,
+            ChecksumWriteResolutionMode,
+        ),
+        #[values(
+            (Duration::ZERO, 0),
+            (Duration::from_nanos(123_456_789), 123_456_789),
+            (Duration::from_nanos(u64::MAX), u64::MAX)
+        )]
+        durations: (Duration, u64),
+    ) {
+        let (mode, expected_mode) = modes;
+        let (duration, expected_duration_ns) = durations;
+        let event = kernel::MetricEvent::ChecksumWriteSuccess(kernel::ChecksumWriteSuccess {
+            outcome,
+            resolution_mode: mode,
+            duration,
+        });
+        with_ffi_event(&event, |ffi| {
+            let MetricEvent::ChecksumWriteSuccess(event) = ffi else {
+                panic!("expected ChecksumWriteSuccess");
+            };
+            assert_eq!(event.outcome, expected_outcome);
+            assert_eq!(event.resolution_mode, expected_mode);
+            assert_eq!(event.duration_ns, expected_duration_ns);
+        });
+    }
+
+    #[rstest]
+    fn from_kernel_checksum_write_failure_preserves_mode_and_duration(
+        #[values(
+            (kernel::ChecksumWriteResolutionMode::Full, ChecksumWriteResolutionMode::Full),
+            (
+                kernel::ChecksumWriteResolutionMode::Incremental,
+                ChecksumWriteResolutionMode::Incremental
+            ),
+            (kernel::ChecksumWriteResolutionMode::Cached, ChecksumWriteResolutionMode::Cached),
+            (
+                kernel::ChecksumWriteResolutionMode::NotAttempted,
+                ChecksumWriteResolutionMode::NotAttempted
+            )
+        )]
+        modes: (
+            kernel::ChecksumWriteResolutionMode,
+            ChecksumWriteResolutionMode,
+        ),
+        #[values(
+            (Duration::ZERO, 0),
+            (Duration::from_nanos(123_456_789), 123_456_789),
+            (Duration::from_nanos(u64::MAX), u64::MAX)
+        )]
+        durations: (Duration, u64),
+    ) {
+        let (mode, expected_mode) = modes;
+        let (duration, expected_duration_ns) = durations;
+        let event = kernel::MetricEvent::ChecksumWriteFailure(kernel::ChecksumWriteFailure {
+            resolution_mode: mode,
+            duration,
+        });
+        with_ffi_event(&event, |ffi| {
+            let MetricEvent::ChecksumWriteFailure(event) = ffi else {
+                panic!("expected ChecksumWriteFailure");
+            };
+            assert_eq!(event.resolution_mode, expected_mode);
+            assert_eq!(event.duration_ns, expected_duration_ns);
         });
     }
 

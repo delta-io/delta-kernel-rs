@@ -7,13 +7,6 @@ Delta protocol so connectors can read and write Delta tables without understandi
 internals. Kernel never does I/O directly: it defines _what_ to do via its APIs
 (`Snapshot`, `Scan`, `Transaction`) and delegates _how_ to the `Engine` trait.
 
-Current capabilities include table reads with predicates, data skipping, deletion vectors,
-change data feed, incremental scans (`incremental_scan_builder`) and commit ranges, checkpoints
-(V1 & V2), version checksums, blind appends, file removals, writes to tables with generated
-columns (the connector computes and verifies the values after `Transaction::ack_generated_columns`),
-table creation (including clustered tables), limited schema alteration, and catalog-managed tables.
-Log compaction remains disabled (#2337).
-
 ## Documentation Ownership
 
 Choose where to document something by the reader's task and the scope of the explanation:
@@ -99,119 +92,8 @@ cargo +nightly fmt \
   && cargo test --workspace --all-features --doc
 ```
 
-### Crate Names for `-p` Flag
-
-| Crate                                | Directory                             | Description                                                              |
-|--------------------------------------|---------------------------------------|--------------------------------------------------------------------------|
-| `delta_kernel`                       | `kernel/`                             | Core library                                                             |
-| `delta_kernel_default_engine`        | `default-engine/`                     | Default Arrow/Tokio `Engine` implementation                              |
-| `delta_kernel_default_engine_test_utils` | `default-engine/test-utils/`      | Default-engine test utilities                                            |
-| `delta_kernel_ffi`                   | `ffi/`                                | C/C++ FFI bindings                                                       |
-| `delta_kernel_ffi_macros`            | `ffi-proc-macros/`                    | FFI proc macros                                                          |
-| `delta_kernel_derive`                | `derive-macros/`                      | Proc macros                                                              |
-| `acceptance`                         | `acceptance/`                         | Acceptance tests (DAT)                                                   |
-| `test_utils`                         | `test-utils/`                         | Shared test utilities                                                    |
-| `delta_kernel_workloads`             | `workloads/`                          | Shared workload spec types + SQL predicate parser                        |
-| `delta_kernel_benchmarks`            | `benchmarks/`                         | Workload benchmarks                                                      |
-| `feature_tests`                      | `feature-tests/`                      | Feature flag tests                                                       |
-| `mem-test`                           | `mem-test/`                           | Memory-usage test executable                                             |
-| `delta-kernel-unity-catalog`         | `delta-kernel-unity-catalog/`         | Unity Catalog integration (UCCommitter, snapshot + create-table helpers) |
-| `unity-catalog-delta-client-api`     | `unity-catalog-delta-client-api/`     | Transport-agnostic UC client traits + wire models                        |
-| `unity-catalog-delta-rest-client`    | `unity-catalog-delta-rest-client/`    | REST/HTTP client for the Unity Catalog Delta Tables API                  |
-| `xtask`                              | `xtask/`                              | Dev tasks (regenerates checked-in code from pinned inputs)               |
-
-Packages under `kernel/examples/` are also workspace members. Use the package name from the
-example's `Cargo.toml` with `-p`.
-
-### Feature Flags
-
-Some noteworthy ones (see `[features]` in `kernel/Cargo.toml` for the full list):
-
-- TLS backend selection (`rustls` / `native-tls`) lives on the `delta_kernel_default_engine`
-  crate, not on kernel itself.
-- `arrow`, `arrow-XX`, `arrow-YY`: Arrow version selection (kernel tracks the latest two
-  major Arrow releases; `arrow` defaults to latest). Kernel's core APIs are Arrow-independent;
-  the Arrow dependencies are optional, while the default engine requires one version.
-- `arrow-conversion`, `arrow-expression`: Arrow interop (auto-enabled by `default-engine-base`)
-- `prettyprint`: enables Arrow pretty-print helpers (primarily test/example oriented)
-- `schema-diff`: experimental schema diffing
-- `check-constraints-in-dev`: CHECK constraints support (experimental, in development). Gates
-  `KernelSupport::Supported` for the `checkConstraints` writer feature (without it, writes to
-  tables that support the feature, including legacy writer version 3 and above, are blocked). With
-  it, kernel discovers constraints and exposes their raw SQL through `check_constraints()` on
-  `Snapshot` and `Transaction`, and on a constrained table `write_state` and every commit require
-  `Transaction::ack_check_constraints`. Kernel does not evaluate constraint SQL, so enforcement is
-  the connector's responsibility. CREATE TABLE rejects `delta.constraints.*` properties in every
-  build. Also gates the internal SQL tokenizer and parser.
-- `checkpoint-protection`: support for the `checkpointProtection` writer feature.
-- `adaptive-metadata-in-dev`: adaptiveMetadata (Iceberg V4 adaptive metadata tree) support
-  (experimental, in development). Gates `KernelSupport::Supported` for the
-  `adaptiveMetadata-preview` reader+writer feature. Without it, reads and writes to tables listing
-  the feature are blocked.
-- `geo-type-in-dev`: geospatial type support (geometry and geography columns) (experimental,
-  in development). Gates `KernelSupport` for the `geospatial` reader+writer feature: with the
-  cargo feature off, any table listing it is rejected; with it on, scans and CDF are supported
-  but writes are still blocked.
-- `internal-api`: unstable APIs like `parallel_scan_metadata`. Items are marked with the
-  `#[internal_api]` proc macro attribute.
-- `declarative-plans`: experimental declarative-plan IR (`kernel/src/plans/`) and the prost
-  proto wire format mirroring it (`kernel/proto/`). Auto-enables `internal-api`, but not Arrow.
-- `vendored-protoc`: supplies `protoc` for `declarative-plans`; without it, set `PROTOC` to a
-  system or hermetic protobuf compiler.
-- `test-utils`, `integration-test`: development only (`test-utils` enables `prettyprint`)
-
-## Architecture at a Glance
-
-**Snapshot** is the primary entry point for existing-table operations: an immutable view of a
-table at a specific version. From it you build a `Scan` (reads) or `Transaction` (writes).
-
-**Snapshot metadata:** `snapshot.reader()` creates a `SnapshotReader` for metadata getters that may
-read storage. Its optional token scopes synchronous, blocking reads without changing the shared
-snapshot or the connector's engine. In-memory getters remain on `Snapshot`.
-
-**Read path:** `Snapshot` -> `ScanBuilder` -> `Scan` -> data. Execution paths:
-`execute()` (simple), `scan_metadata()` (advanced/distributed),
-`parallel_scan_metadata()` (two-phase distributed log replay).
-
-
-**Write path:** `Snapshot` -> `UpdateTableTransactionBuilder` -> `Transaction` -> `commit()`.
-`UpdateTableTransactionBuilder<MODE>` aliases `TransactionBuilder<UpdateTable, MODE>`; the
-create-table builder aliases `TransactionBuilder<CreateTable, MODE>`. The mode defaults to
-`Imperative`. Both entry points return imperative builders; with `declarative-plans`,
-`with_execution_mode::<MODE>()` selects the mode returned by `build()`. Common setters have one
-generic implementation.
-`transaction::imperative` contains EngineData staging, staged-data validation, action encoding,
-and committer response handling. The feature-gated `transaction::declarative` contains relation
-staging and a commit entry point that currently returns an unsupported error. Transaction
-configuration, mode-independent validation, CRC construction, and post-commit snapshot logic
-remain shared.
-The sealed `TransactionType` trait selects opaque type-specific state; specialized implementations
-provide constructors, custom setters, and build validation.
-`Snapshot::update_table(operation, engine_info, data_change)` requires all three values at
-construction; create-table constructors require the path, schema, engine info, and `data_change`
-and fix the operation to `CREATE TABLE`. These inputs cannot be changed on builders or built
-transactions. `data_change` is never inferred from staged files, including for empty commits.
-`build()` rejects ALTER with `true` and blind append with `false`; `commit()` retains operation and
-staged-file checks. `UpdateTableOperation::AlterTable` records schema-changing DDL without
-introducing a separate transaction type.
-
-Incremental CRC replay trusts operation names in `INCREMENTAL_SAFE_OPS`
-(`kernel/src/crc/file_stats.rs`). Adding an operation requires both correct net Add/Remove file
-accounting and rejecting its exact name for `UpdateTableOperation::Custom`. Represent update-table
-operations with typed variants so name reservation is automatic, and mirror them in the FFI.
-
-Writers configure transaction intent before `build()`, then call
-`Transaction::write_state`, then bind partition values through the returned `WriteState` to get a
-`BoundWriteContext`. Distributed writers can encode and transport the state before binding it.
-Kernel assembles commit actions, enforces protocol compliance, and delegates the atomic commit to a
-`Committer`.
-
-**Engine trait:** exposes `StorageHandler`, `JsonHandler`, `ParquetHandler`, and
-`EvaluationHandler`, plus an optional `PlanExecutor` under `declarative-plans`. Metrics use tracing
-layers rather than an engine handler. `DefaultEngine` lives in `default-engine/src/`.
-
-**EngineData:** opaque columnar data interface. NEVER access `EngineData` columns
-directly: ALWAYS use the visitor pattern (`visit_rows` with typed `GetData` accessors).
+Use `cargo metadata --no-deps` to discover current workspace package names. Read each crate's
+`Cargo.toml` for its feature flags; the manifests are the source of truth.
 
 ## Testing
 
@@ -239,7 +121,8 @@ directly: ALWAYS use the visitor pattern (`visit_rows` with typed `GetData` acce
   your own `#[values]`, can help; see `kernel/tests/integration/cross_product/mod.rs`. Drop to
   lower-level setup like `test_table_setup` (or hand-rolled `add_commit` / `LocalMockTable`) only
   when necessary: e.g. for states the builder cannot express, such as corrupt or malformed logs.
-- Consider how the feature interacts with Delta table features (see Protocol TLDR below).
+- Consider how the feature interacts with Delta table features. Cross-check behavior against the
+  Delta protocol spec.
 - Consider write paths: normal commits, checkpointing, CRC files, log compaction files.
 - When adding cloud-storage functionality to an engine, such as writing JSON files, make sure to
   test it against S3, Azure, and GCS.
@@ -356,40 +239,6 @@ Run `rg '^pub (fn|async fn)' test-utils/src/lib.rs` to discover the current publ
 and update this section in your PR. The same pattern works for
 `kernel/tests/integration/common/write_utils.rs`.
 
-## Protocol TLDR
-
-The [Delta protocol spec](https://raw.githubusercontent.com/delta-io/delta/master/PROTOCOL.md)
-is the source of truth. Key concepts:
-
-- **Actions**: records in commits and checkpoints: Metadata, Add File, Remove File, Add CDC
-  File, Protocol, CommitInfo, SetTransaction, Domain Metadata, Sidecar, Checkpoint Metadata,
-  and the feature-gated adaptive metadata `checkpoint` action
-- **Log structure**: JSON commit files, checkpoints (V1 parquet, V2 multi-part), log
-  compaction files, version checksum (CRC) files, `_last_checkpoint`
-- **Protocol versioning**: `(readerVersion, writerVersion)` pair. Reader version 3 requires
-  `readerFeatures`; writer version 7 requires `writerFeatures`. Follow each feature's rules for
-  activation, dependencies, and any permitted removal.
-- **Data skipping**: per-file column statistics (min, max, null count, row count) with
-  tight/wide bounds
-- **Schemas**: JSON serialization format for StructType/StructField/DataType
-- **Stats and partition values**: per-file statistics are stored as a JSON-encoded string in
-  the Add action's `stats` field. `partitionValues` is a JSON map from column names to serialized
-  string or null values. The stats structure mirrors the table schema. See the protocol spec
-  sections on "Per-file Statistics" and "Partition Value Serialization" for the exact formats.
-
-**Table features**:
-
-- Writer: `allowColumnDefaults`, `appendOnly`, `changeDataFeed`, `checkConstraints`,
-  `checkpointProtection`, `clustering`, `collations`, `collations-preview`, `domainMetadata`,
-  `generatedColumns`, `icebergCompatV1`, `icebergCompatV2`, `icebergCompatV3`, `identityColumns`,
-  `inCommitTimestamp`, `invariants`, `materializePartitionColumns`, `rowTracking`
-- Reader + writer: `adaptiveMetadata-preview`, `catalogManaged`, `catalogOwned-preview`,
-  `columnMapping`, `deletionVectors`, `fileType`, `fileType-preview`, `geospatial`,
-  `timestampNtz`, `typeWidening`, `typeWidening-preview`, `v2Checkpoint`, `vacuumProtocolCheck`,
-  `variantShredding`, `variantShredding-preview`, `variantType`, `variantType-preview`
-
-Keep this list updated when new protocol features are added to kernel.
-
 ## Common Gotchas
 
 - **EngineData is opaque:** NEVER downcast to `ArrowEngineData` or any concrete type
@@ -449,6 +298,10 @@ Keep this list updated when new protocol features are added to kernel.
   errors. `?` converts a `KernelError` into `Error::Kernel`; never convert an `Error` back into a
   `KernelError`. `?` applies one conversion, so a function returning `Result` converts foreign
   errors through `KernelError` first (`.map_err(KernelError::from)?`).
+- When matching a `KernelError` to classify a failure, match on `error.without_backtrace()` so
+  `Backtraced` wrappers do not change the classification. This borrows the underlying error.
+  Preserve the original `error`, including its backtrace wrappers, when propagating it or attaching
+  it as a source to another error.
 - Prefer the `KernelResultIterator<T>` marker trait over spelling
   `Iterator<Item = KernelResult<T>> + Send`, including in public APIs. Use
   `impl KernelResultIterator<T>` for unboxed streams and `Box<dyn KernelResultIterator<T>>`
@@ -559,9 +412,11 @@ and data flow. Keep it concise.
 
 Read these when relevant to the task at hand:
 
-- `CLAUDE/architecture.md`: kernel architecture: snapshot loading, read/write paths,
-  engine trait system, EngineData, key modules, catalog-managed tables
+- `CLAUDE/architecture.md`: task-oriented source navigation for kernel internals
 - `docs/user-guide/CLAUDE.md`: writing standards for the mdBook user guide
+- [Delta Kernel user guide](https://docs.delta.io/kernel/rust/): introductions and connector workflows
+- [delta_kernel rustdoc](https://docs.rs/delta_kernel/latest/delta_kernel/): API explanations,
+  contracts, and executable examples
 - Always cross-check protocol behavior against the
   [Delta protocol spec](https://raw.githubusercontent.com/delta-io/delta/master/PROTOCOL.md)
 

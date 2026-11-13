@@ -21,7 +21,7 @@ use crate::transaction::{
     ExecutionMode, Imperative, Transaction, UpdateTable, UpdateTableOperation,
 };
 use crate::utils::{current_time_ms, require};
-use crate::{Engine, KernelError, KernelResult};
+use crate::{Engine, Error, KernelError, KernelResult, Result};
 
 /// Configures DML and schema-changing DDL transactions against an existing table.
 ///
@@ -221,7 +221,7 @@ impl<MODE: ExecutionMode> TransactionBuilder<UpdateTable, MODE> {
         self,
         engine: &dyn Engine,
         committer: Box<dyn Committer>,
-    ) -> KernelResult<Transaction<UpdateTable, MODE>> {
+    ) -> Result<Transaction<UpdateTable, MODE>> {
         self.validate()?;
         let transaction = try_new_update_table(self, committer, engine)?;
         transaction.validate_domain_metadata_operations()?;
@@ -290,7 +290,7 @@ fn try_new_update_table<MODE: ExecutionMode>(
     builder: UpdateTableTransactionBuilder<MODE>,
     committer: Box<dyn Committer>,
     engine: &dyn Engine,
-) -> KernelResult<Transaction<UpdateTable, MODE>> {
+) -> Result<Transaction<UpdateTable, MODE>> {
     let TransactionBuilder {
         common_state,
         local_state,
@@ -370,26 +370,27 @@ fn try_new_update_table<MODE: ExecutionMode>(
 fn apply_schema_changes(
     table_config: TableConfiguration,
     changes: Vec<SchemaOperation>,
-) -> KernelResult<TableConfiguration> {
+) -> Result<TableConfiguration> {
     let unsupported_iceberg_compat = [TableFeature::IcebergCompatV2, TableFeature::IcebergCompatV3]
         .into_iter()
         .find(|feature| table_config.is_feature_enabled(feature));
     if let Some(feature) = unsupported_iceberg_compat {
-        return Err(KernelError::unsupported(format!(
+        return Err(Error::Kernel(KernelError::unsupported(format!(
             "Schema changes are not yet supported on tables with {feature} enabled"
-        )));
+        ))));
     }
     if table_config.is_feature_enabled(&TableFeature::AllowColumnDefaults) {
-        return Err(KernelError::unsupported(
+        return Err(Error::Kernel(KernelError::unsupported(
             "Schema changes are not yet supported on tables with allowColumnDefaults enabled",
-        ));
+        )));
     }
     if table_config.is_feature_supported(&TableFeature::GeneratedColumns)
         && table_config.has_generation_expressions()
     {
         return Err(KernelError::unsupported(
             "Schema changes are not yet supported on tables with generated columns",
-        ));
+        )
+        .into());
     }
     evolve_table_config(&table_config, changes)
 }
@@ -420,7 +421,7 @@ mod tests {
     use crate::transaction::create_table::create_table;
     use crate::transaction::{SchemaOperation, UpdateTableOperation};
     use crate::unit_test_utils::{copy_test_table, load_test_table, test_schema_flat};
-    use crate::{Engine, KernelError, Result, SnapshotRef};
+    use crate::{Engine, Error, KernelError, Result, SnapshotRef};
 
     #[rstest]
     #[case::write(UpdateTableOperation::Write)]
@@ -635,20 +636,22 @@ mod tests {
 
     #[rstest]
     fn custom_operation_rejects_reserved_known_name(
-        #[values("ALTER TABLE", "REORG")] operation: &str,
+        #[values("ALTER TABLE", "REORG", "LIQUID TAGGING", "Deletion Vector Tombstones")]
+        operation: &str,
+        #[values(false, true)] data_change: bool,
     ) -> Result<()> {
         let (engine, snapshot, _tempdir) = load_test_table("table-without-dv-small")?;
         let error = snapshot
             .update_table(
                 UpdateTableOperation::Custom(operation.to_string()),
                 "test-engine",
-                false,
+                data_change,
             )
             .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))
             .unwrap_err();
 
         assert!(
-            matches!(&error, KernelError::InvalidTransactionState(message)
+            matches!(&error, Error::Kernel(KernelError::InvalidTransactionState(message))
             if message == &format!("custom operation name '{operation}' is reserved"))
         );
         Ok(())
@@ -771,7 +774,7 @@ mod tests {
         if operation == UpdateTableOperation::AlterTable {
             let error = result.unwrap_err();
             assert!(
-                matches!(&error, KernelError::InvalidTransactionState(message)
+                matches!(&error, Error::Kernel(KernelError::InvalidTransactionState(message))
                 if message == "ALTER TABLE requires at least one schema change")
             );
         } else {
@@ -820,7 +823,9 @@ mod tests {
             let error = result.unwrap_err();
             let expected =
                 format!("Schema changes are not yet supported on tables with {feature} enabled");
-            assert!(matches!(&error, KernelError::Unsupported(message) if message == &expected));
+            assert!(
+                matches!(&error, Error::Kernel(KernelError::Unsupported(message)) if message == &expected)
+            );
         } else {
             let transaction = result.expect("supported schema changes must build successfully");
             assert_eq!(transaction.operation, operation.into());
@@ -964,7 +969,10 @@ mod tests {
         let error = builder
             .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))
             .unwrap_err();
-        assert!(matches!(&error, KernelError::InvalidTransactionState(_)));
+        assert!(matches!(
+            &error,
+            Error::Kernel(KernelError::InvalidTransactionState(_))
+        ));
         assert!(error.to_string().contains(expected), "{error}");
         Ok(())
     }
@@ -1023,7 +1031,7 @@ mod tests {
         assert!(!transaction.data_change);
         let error = transaction.commit(engine.as_ref()).unwrap_err();
         assert!(
-            matches!(&error, KernelError::InvalidTransactionState(message)
+            matches!(&error, Error::Kernel(KernelError::InvalidTransactionState(message))
             if message == "ALTER TABLE cannot include data-file actions")
         );
         Ok(())
@@ -1044,7 +1052,7 @@ mod tests {
         if data_change {
             let error = result.unwrap_err();
             assert!(
-                matches!(&error, KernelError::InvalidTransactionState(message)
+                matches!(&error, Error::Kernel(KernelError::InvalidTransactionState(message))
                 if message == "ALTER TABLE requires data_change to be false")
             );
         } else {
@@ -1067,7 +1075,7 @@ mod tests {
         transaction.data_change = true;
         let error = transaction.commit(engine.as_ref()).unwrap_err();
         assert!(
-            matches!(&error, KernelError::InvalidTransactionState(message)
+            matches!(&error, Error::Kernel(KernelError::InvalidTransactionState(message))
             if message == "ALTER TABLE requires data_change to be false")
         );
         Ok(())
@@ -1141,7 +1149,10 @@ mod tests {
         let error = builder
             .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))
             .unwrap_err();
-        assert!(matches!(&error, KernelError::InvalidTransactionState(_)));
+        assert!(matches!(
+            &error,
+            Error::Kernel(KernelError::InvalidTransactionState(_))
+        ));
         assert!(error.to_string().contains(expected), "{error}");
         Ok(())
     }

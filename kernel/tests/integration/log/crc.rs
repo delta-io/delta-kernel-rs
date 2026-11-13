@@ -3,6 +3,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 #[cfg(feature = "internal-api")]
 use delta_kernel::LogPath;
@@ -13,6 +14,7 @@ use delta_kernel::crc::{Crc, DomainMetadataState, SetTransactionState};
 use delta_kernel::engine::arrow_conversion::TryFromKernel;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::engine::{DelegatingEngine, PanicEngine};
+use delta_kernel::metrics::{ChecksumWriteResolutionMode, MetricEvent};
 use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::path::ParsedLogPath;
 use delta_kernel::schema::{SchemaRef, schema_ref};
@@ -30,8 +32,9 @@ use rstest::rstest;
 use test_utils::delta_kernel_default_engine::executor::TaskExecutor;
 use test_utils::delta_kernel_default_engine::{DefaultEngine, DefaultEngineBuilder};
 use test_utils::{
-    add_commit, begin_transaction_with, copy_directory, insert_data, insert_data_with,
-    test_table_setup, test_table_setup_mt,
+    CapturingReporter, add_commit, assert_result_error_with_message, begin_transaction_with,
+    copy_directory, insert_data, insert_data_with, install_thread_local_metrics_reporter,
+    read_actions_from_commit, read_scan, test_table_setup, test_table_setup_mt,
 };
 use url::Url;
 
@@ -436,7 +439,7 @@ async fn test_crc_returns_none_when_no_crc() -> delta_kernel::Result<()> {
 fn create_table_and_commit(
     table_path: &str,
     engine: &dyn delta_kernel::Engine,
-) -> KernelResult<delta_kernel::transaction::CommittedTransaction> {
+) -> delta_kernel::Result<delta_kernel::transaction::CommittedTransaction> {
     let schema = schema_ref! { nullable "id": INTEGER };
     let txn = create_table(table_path, schema, "test_engine", true)
         .with_data_layout(DataLayout::clustered(["id"]))
@@ -447,7 +450,7 @@ fn create_table_and_commit(
 }
 
 #[tokio::test]
-async fn test_create_table_produces_post_commit_crc() -> KernelResult<()> {
+async fn test_create_table_produces_post_commit_crc() -> delta_kernel::Result<()> {
     // ===== GIVEN / WHEN: Create the table =====
     let (_temp_dir, table_path, engine) = test_table_setup()?;
     let committed = create_table_and_commit(&table_path, engine.as_ref())?;
@@ -536,7 +539,7 @@ fn write_and_verify_crc(
 }
 
 #[tokio::test]
-async fn test_post_commit_crc_tracks_file_stats_across_inserts() -> KernelResult<()> {
+async fn test_post_commit_crc_tracks_file_stats_across_inserts() -> delta_kernel::Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
     // ===== GIVEN: Create the table =====
@@ -599,7 +602,7 @@ async fn test_post_commit_crc_tracks_file_stats_across_inserts() -> KernelResult
 }
 
 #[tokio::test]
-async fn test_post_commit_crc_tracks_domain_metadata_changes() -> KernelResult<()> {
+async fn test_post_commit_crc_tracks_domain_metadata_changes() -> delta_kernel::Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
     // ===== WHEN: CREATE TABLE with zip -> zap0 =====
@@ -651,11 +654,9 @@ async fn test_post_commit_crc_tracks_domain_metadata_changes() -> KernelResult<(
     Ok(())
 }
 
-#[rstest]
 #[tokio::test]
-async fn test_post_commit_crc_metadata_only_custom_op_makes_file_stats_indeterminate(
-    #[values("ANALYZE STATS", "VACUUM END", "SET TBLPROPERTIES")] operation: &str,
-) -> delta_kernel::Result<()> {
+async fn test_post_commit_crc_metadata_only_custom_op_makes_file_stats_indeterminate()
+-> delta_kernel::Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
     // ===== GIVEN: Create table (v0) and insert data (v1) =====
@@ -672,7 +673,7 @@ async fn test_post_commit_crc_metadata_only_custom_op_makes_file_stats_indetermi
     let committed = begin_transaction_with(
         snapshot_v1.clone(),
         engine.as_ref(),
-        UpdateTableOperation::Custom(operation.to_string()),
+        UpdateTableOperation::Custom("ANALYZE STATS".to_string()),
         "test-engine",
         true,
         |builder| builder,
@@ -687,7 +688,9 @@ async fn test_post_commit_crc_metadata_only_custom_op_makes_file_stats_indetermi
     assert!(crc_v2.file_stats_state().is_indeterminate());
     assert!(matches!(
         snapshot_v2.write_checksum(engine.as_ref()),
-        Err(KernelError::ChecksumWriteUnsupported(_))
+        Err(delta_kernel::Error::Kernel(
+            KernelError::ChecksumWriteUnsupported(_)
+        ))
     ));
 
     let fresh = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
@@ -802,16 +805,23 @@ async fn test_write_checksum_preserves_stats_across_metadata_only_commits(
                 .await?
                 .unwrap_post_commit_snapshot()
         } else {
-            snap.update_table(
-                UpdateTableOperation::Custom(operation.to_string()),
-                "test_engine",
-                false,
-            )
-            .with_domain_metadata("metadata_only", format!("v{version}"))
-            .with_transaction_id("metadata_only", version)
-            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
-            .commit(engine.as_ref())?
-            .unwrap_post_commit_snapshot()
+            // Hand-write commits to vary the operation name while keeping them metadata-only.
+            let actions = [
+                serde_json::json!({"commitInfo": {"operation": operation}}),
+                serde_json::json!({"domainMetadata": {
+                    "domain": "metadata_only",
+                    "configuration": format!("v{version}"),
+                    "removed": false,
+                }}),
+                serde_json::json!({"txn": {"appId": "metadata_only", "version": version}}),
+            ];
+            let commit = actions
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("\n");
+            add_commit(&table_path, &LocalFileSystem::new(), version, commit).await?;
+            Snapshot::builder_for(&table_path).build(engine.as_ref())?
         };
     }
 
@@ -1235,23 +1245,175 @@ async fn test_write_checksum_from_checkpoint_ict_enabled_but_commit_unreadable_p
         .join(format!("_delta_log/{checkpoint_version:020}.json"));
     std::fs::write(&commit, b"}}} not valid commit json").unwrap();
 
+    let reporter = Arc::new(CapturingReporter::default());
+    let _guard = install_thread_local_metrics_reporter(reporter.clone());
     let fresh = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
     assert!(fresh.crc_at_version().is_none());
+    let initial_event_count = reporter.events().len();
+    let start = Instant::now();
     // The failure is the propagated ICT read error, not a laundered `ChecksumWriteUnsupported`.
     assert!(matches!(
         fresh.write_checksum(engine.as_ref()),
-        Err(e) if !matches!(e, delta_kernel::KernelError::ChecksumWriteUnsupported(_))
+        Err(e) if !matches!(e, delta_kernel::Error::Kernel(delta_kernel::KernelError::ChecksumWriteUnsupported(_)))
     ));
+    let elapsed = start.elapsed();
+
+    let events: Vec<_> = reporter
+        .events()
+        .into_iter()
+        .skip(initial_event_count)
+        .filter(|event| {
+            matches!(
+                event,
+                MetricEvent::ChecksumWriteSuccess(_) | MetricEvent::ChecksumWriteFailure(_)
+            )
+        })
+        .collect();
+    let [MetricEvent::ChecksumWriteFailure(event)] = events.as_slice() else {
+        panic!("expected one ChecksumWriteFailure event");
+    };
+    assert_eq!(event.resolution_mode, ChecksumWriteResolutionMode::Full);
+    assert!(event.duration > Duration::ZERO);
+    assert!(event.duration <= elapsed);
 
     Ok(())
 }
 
 #[rstest]
-#[case::checkpoint(true)]
-#[case::stale_crc(false)]
+#[case::full_history(WriteRoot::VersionZero)]
+#[case::stale_crc(WriteRoot::StaleCrcIncrementalBuild)]
+#[case::checkpoint(WriteRoot::CheckpointWithTail)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_write_checksum_ignores_excluded_file_actions_and_counts_subsequent_writes(
+    #[case] root: WriteRoot,
+    #[values(
+        "COMPUTE STATS",
+        "ROW TRACKING BACKFILL",
+        "ROW TRACKING UNBACKFILL",
+        "DROP FEATURE",
+        "LIQUID BACKFILL",
+        "LIQUID TAGGING",
+        "REPLACE PARTITIONED BY WITH CLUSTER BY",
+        "Deletion Vector Tombstones"
+    )]
+    operation: &str,
+) -> delta_kernel::Result<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
+    let snap = create_table_and_commit(&table_path, engine.as_ref())?
+        .post_commit_snapshot()
+        .unwrap()
+        .clone();
+    let snap = insert_data(
+        snap,
+        &engine,
+        vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+    )
+    .await?
+    .unwrap_post_commit_snapshot();
+    let expected = snap.get_file_stats_if_present().unwrap();
+    match root {
+        WriteRoot::StaleCrcIncrementalBuild => {
+            snap.write_checksum(engine.as_ref())?;
+        }
+        WriteRoot::CheckpointWithTail => {
+            snap.checkpoint(engine.as_ref(), None)?;
+        }
+        WriteRoot::VersionZero => {}
+        _ => unreachable!(),
+    }
+
+    // Metadata re-adds and auxiliary tombstones leave the active files unchanged.
+    let table_url = snap.table_root().clone();
+    let mut existing = read_actions_from_commit(&table_url, 1, "add")?;
+    assert_eq!(existing.len(), 1);
+    existing[0]["dataChange"] = serde_json::json!(false);
+    existing[0]["tags"] = serde_json::json!({"test.tag": "updated"});
+    let file_action = match operation {
+        "Deletion Vector Tombstones" => serde_json::json!({"remove": {
+            "path": "auxiliary-dv.bin",
+            "dataChange": false,
+        }}),
+        _ => serde_json::json!({"add": existing[0]}),
+    };
+    let actions = [
+        file_action,
+        serde_json::json!({"commitInfo": {"operation": operation}}),
+    ];
+    let commit = actions
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("\n");
+    add_commit(table_url.as_str(), &LocalFileSystem::new(), 2, commit).await?;
+
+    let replay = if root == WriteRoot::StaleCrcIncrementalBuild {
+        IncrementalReplay::Unlimited
+    } else {
+        IncrementalReplay::Disabled
+    };
+    let snap = Snapshot::builder_for(&table_path)
+        .with_incremental_crc_replay(replay)
+        .build(engine.as_ref())?;
+    assert_eq!(snap.version(), 2);
+    assert_eq!(
+        snap.write_checksum(engine.as_ref())?.0,
+        ChecksumWriteResult::Written
+    );
+    let snap = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
+    assert_eq!(snap.get_file_stats_if_present(), Some(expected));
+
+    insert_data(
+        snap,
+        &engine,
+        vec![Arc::new(Int32Array::from(vec![4, 5, 6]))],
+    )
+    .await?
+    .unwrap_committed();
+    let snap = Snapshot::builder_for(&table_path)
+        .with_incremental_crc_replay(IncrementalReplay::Unlimited)
+        .build(engine.as_ref())?;
+    assert_eq!(snap.version(), 3);
+    let sizes = parquet_file_sizes_on_disk(&table_path);
+    assert_eq!(sizes.len(), 2);
+    let stats = snap.get_file_stats_if_present().unwrap();
+    assert_eq!(stats.num_files(), 2);
+    assert_eq!(stats.table_size_bytes(), sizes.iter().sum::<i64>());
+    assert_histogram_totals(&stats, 2, sizes.iter().sum());
+    assert_eq!(
+        snap.write_checksum(engine.as_ref())?.0,
+        ChecksumWriteResult::Written
+    );
+
+    let scan = snap.scan_builder().build()?;
+    let batches = read_scan(&scan, engine.clone())?;
+    #[rustfmt::skip]
+    test_utils::assert_batches_sorted_eq!(
+        vec![
+            "+----+",
+            "| id |",
+            "+----+",
+            "| 1  |",
+            "| 2  |",
+            "| 3  |",
+            "| 4  |",
+            "| 5  |",
+            "| 6  |",
+            "+----+",
+        ],
+        &batches
+    );
+    Ok(())
+}
+
+#[rstest]
+#[case::checkpoint(true, IncrementalReplay::Disabled)]
+#[case::stale_crc(false, IncrementalReplay::Disabled)]
+#[case::advanced_crc(false, IncrementalReplay::Unlimited)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_write_checksum_rejects_file_actions_with_unsafe_operation(
     #[case] with_checkpoint: bool,
+    #[case] replay: IncrementalReplay,
+    #[values("ANALYZE STATS", "Manual Update", "UNKNOWN", "SET TBLPROPERTIES")] operation: &str,
 ) -> delta_kernel::Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
     let snap = create_table_and_commit(&table_path, engine.as_ref())?
@@ -1276,7 +1438,7 @@ async fn test_write_checksum_rejects_file_actions_with_unsafe_operation(
         &engine,
         vec![Arc::new(Int32Array::from(vec![4, 5, 6]))],
         Box::new(FileSystemCommitter::new()),
-        "ANALYZE STATS",
+        operation,
         true,
         false,
     )
@@ -1284,24 +1446,28 @@ async fn test_write_checksum_rejects_file_actions_with_unsafe_operation(
     .unwrap_committed();
 
     let fresh = Snapshot::builder_for(&table_path)
-        .with_incremental_crc_replay(IncrementalReplay::Unlimited)
+        .with_incremental_crc_replay(replay)
         .build(engine.as_ref())?;
     assert_eq!(fresh.version(), 2);
-    assert_eq!(fresh.crc_at_version().is_some(), !with_checkpoint);
+    assert_eq!(
+        fresh.crc_at_version().is_some(),
+        !with_checkpoint && replay == IncrementalReplay::Unlimited
+    );
     assert_eq!(fresh.get_file_stats_if_present(), None);
     if let Some(crc) = fresh.crc_at_version() {
         assert!(crc.file_stats_state().is_indeterminate());
     }
-    assert!(matches!(
+    assert_result_error_with_message(
         fresh.write_checksum(engine.as_ref()),
-        Err(delta_kernel::KernelError::ChecksumWriteUnsupported(_))
-    ));
+        &format!("unsupported operation {operation:?}"),
+    );
 
     Ok(())
 }
 
 #[tokio::test]
-async fn test_in_memory_crc_chains_across_multiple_commits_then_writes() -> KernelResult<()> {
+async fn test_in_memory_crc_chains_across_multiple_commits_then_writes() -> delta_kernel::Result<()>
+{
     let (_temp_dir, table_path, engine) = test_table_setup()?;
     let committed = create_table_and_commit(&table_path, engine.as_ref())?;
     let mut snapshot = committed.post_commit_snapshot().unwrap().clone();
@@ -1447,7 +1613,7 @@ async fn test_incremental_snapshot_old_crc_no_new_crc() -> delta_kernel::Result<
 #[tokio::test]
 async fn test_write_checksum_with_no_dms_writes_empty_list(
     #[case] dm_supported: bool,
-) -> KernelResult<()> {
+) -> delta_kernel::Result<()> {
     use std::collections::HashMap;
 
     let (_temp_dir, table_path, engine) = test_table_setup()?;
@@ -2205,7 +2371,7 @@ const LARGE_FILE_ROW_COUNT: i32 = (FIRST_BIN_BOUNDARY * 2 / APPROX_BYTES_PER_ROW
 /// - v2: insert large file (>= 8KB, bin 1+) -> files span two bins
 /// - v3: remove all files, delete parquet from disk -> histogram returns to all zeros
 #[tokio::test]
-async fn test_file_histogram_tracks_adds_and_removes_across_bins() -> KernelResult<()> {
+async fn test_file_histogram_tracks_adds_and_removes_across_bins() -> delta_kernel::Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
     let schema = schema_ref! {
         nullable "id": INTEGER,
@@ -2495,7 +2661,7 @@ async fn commit_with_dm_and_txn<E: TaskExecutor>(
     snapshot: SnapshotRef,
     engine: &Arc<DefaultEngine<E>>,
     v: i64,
-) -> KernelResult<SnapshotRef> {
+) -> delta_kernel::Result<SnapshotRef> {
     commit_data(snapshot, engine, v, |builder| {
         builder
             .with_domain_metadata("domain", format!("value_{v}"))
@@ -2511,8 +2677,9 @@ async fn commit_data<E: TaskExecutor>(
     engine: &Arc<DefaultEngine<E>>,
     v: i64,
     customize: impl FnOnce(UpdateTableTransactionBuilder) -> UpdateTableTransactionBuilder,
-) -> KernelResult<SnapshotRef> {
-    let arrow_schema = TryFromKernel::try_from_kernel(snapshot.schema().as_ref())?;
+) -> delta_kernel::Result<SnapshotRef> {
+    let arrow_schema = TryFromKernel::try_from_kernel(snapshot.schema().as_ref())
+        .map_err(delta_kernel::KernelError::from)?;
     let batch = RecordBatch::try_new(
         Arc::new(arrow_schema),
         vec![Arc::new(Int32Array::from(vec![v as i32]))],
@@ -2707,8 +2874,8 @@ async fn test_stale_crc_fresh_build_advance_matrix(
 }
 
 #[tokio::test]
-async fn test_stale_crc_fresh_build_fails_load_when_advance_commit_is_corrupt() -> KernelResult<()>
-{
+async fn test_stale_crc_fresh_build_fails_load_when_advance_commit_is_corrupt()
+-> delta_kernel::Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
     let snap = create_table_and_commit(&table_path, engine.as_ref())?
@@ -2794,7 +2961,7 @@ fn no_parquet_reads_engine(inner: Arc<dyn Engine>) -> DelegatingEngine {
 async fn setup_stale_crc_dm_table<E: TaskExecutor>(
     engine: &Arc<DefaultEngine<E>>,
     table_path: &str,
-) -> KernelResult<()> {
+) -> delta_kernel::Result<()> {
     let schema = schema_ref! { nullable "id": INTEGER };
     let mut snap = create_table(table_path, schema, "test_engine", true)
         .with_table_properties([("delta.feature.domainMetadata", "supported")])
@@ -2959,7 +3126,7 @@ async fn test_dm_query_stale_partial_crc_falls_through_to_full_scan() -> delta_k
 async fn setup_stale_crc_txn_table<E: TaskExecutor>(
     engine: &Arc<DefaultEngine<E>>,
     table_path: &str,
-) -> KernelResult<()> {
+) -> delta_kernel::Result<()> {
     let schema = schema_ref! { nullable "id": INTEGER };
     let mut snap = create_table(table_path, schema, "test_engine", true)
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?

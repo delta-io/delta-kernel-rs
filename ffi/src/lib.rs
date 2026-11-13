@@ -25,7 +25,7 @@ use delta_kernel::schema::Schema;
 use delta_kernel::snapshot::{CheckpointWriteResult, LogSegmentStats, Snapshot, SnapshotRef};
 use delta_kernel::{Engine, EngineData, FileStats, KernelResult, Version};
 use delta_kernel_ffi_macros::handle_descriptor;
-use tracing::debug;
+use tracing::trace;
 use url::Url;
 #[cfg(feature = "default-engine-base")]
 use {
@@ -50,6 +50,8 @@ extern crate self as delta_kernel_ffi;
 
 mod alloc_stats;
 
+#[cfg(feature = "declarative-plans")]
+pub mod checkpoint;
 pub mod column_default;
 pub mod commit_range;
 pub mod delta_types;
@@ -714,7 +716,7 @@ pub use private::{KernelBoolSlice, KernelRowIndexArray};
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn free_bool_slice(slice: KernelBoolSlice) {
     let vec = unsafe { slice.into_vec() };
-    debug!("Dropping bool slice. It is {vec:#?}");
+    trace!("Dropping bool slice. It is {vec:#?}");
 }
 
 /// # Safety
@@ -778,7 +780,7 @@ struct ExternEngineVtable {
 #[cfg(feature = "default-engine-base")]
 impl Drop for ExternEngineVtable {
     fn drop(&mut self) {
-        debug!("dropping engine interface");
+        trace!("dropping engine interface");
     }
 }
 
@@ -1209,7 +1211,7 @@ pub(crate) fn build_engine_from_store(
 /// Caller is responsible for passing a valid handle.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn free_engine(engine: Handle<SharedExternEngine>) {
-    debug!("engine released engine");
+    trace!("engine released engine");
     unsafe { engine.drop_handle() }
 }
 
@@ -1297,7 +1299,7 @@ pub struct SharedProtocol;
 /// Caller is responsible for passing a valid handle.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn free_snapshot(snapshot: Handle<SharedSnapshot>) {
-    debug!("engine released snapshot");
+    trace!("engine released snapshot");
     unsafe { snapshot.drop_handle() }
 }
 

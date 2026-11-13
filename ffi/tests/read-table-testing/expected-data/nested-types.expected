@@ -1,115 +1,58 @@
-Reading table at ../../../../acceptance/tests/dat/out/reader_tests/generated/nested_types/delta/
-version: 0
+Reading table at ../../../../acceptance/workloads/types_nested_types/delta/
+version: 1
 
 Schema:
-├─ pk: integer
-├─ struct: struct
-│  ├─ float64: double
-│  └─ bool: boolean
-├─ array: array (can contain null: true)
-│  └─ array_element: short
-└─ map: map (can contain null: true)
+├─ id: integer
+├─ info: struct
+│  ├─ name: string
+│  └─ age: integer
+├─ tags: array (can contain null: true)
+│  └─ array_element: string
+└─ props: map (can contain null: true)
    ├─ map_key: string
    └─ map_value: integer
 
-pk:  [
-  0,
+id:  [
   1,
-  2,
-  3,
-  4
+  2
 ]
-struct:  -- is_valid: all not null
--- child 0 type: double
+info:  -- is_valid: all not null
+-- child 0 type: string
   [
-    0,
-    1,
-    2,
-    3,
-    4
+    "alice",
+    "bob"
   ]
--- child 1 type: bool
+-- child 1 type: int32
   [
-    true,
-    false,
-    true,
-    false,
-    true
+    30,
+    25
   ]
-array:  [
+tags:  [
   [
-    0
+    "a",
+    "b"
   ],
   [
-    0,
-    1
-  ],
-  [
-    0,
-    1,
-    2
-  ],
-  [
-    0,
-    1,
-    2,
-    3
-  ],
-  [
-    0,
-    1,
-    2,
-    3,
-    4
+    "c"
   ]
 ]
-map:  [
-  keys:
-  []
-  values:
-  [],
+props:  [
   keys:
   [
-    "0"
+    "x",
+    "y"
   ]
   values:
   [
-    0
-  ],
-  keys:
-  [
-    "0",
-    "1"
-  ]
-  values:
-  [
-    0,
-    1
-  ],
-  keys:
-  [
-    "0",
-    "1",
-    "2"
-  ]
-  values:
-  [
-    0,
     1,
     2
   ],
   keys:
   [
-    "0",
-    "1",
-    "2",
-    "3"
+    "z"
   ]
   values:
   [
-    0,
-    1,
-    2,
     3
   ]
 ]

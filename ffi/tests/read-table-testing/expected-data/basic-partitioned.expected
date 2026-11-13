@@ -1,32 +1,29 @@
-Reading table at ../../../../acceptance/tests/dat/out/reader_tests/generated/basic_partitioned/delta/
+Reading table at ../../../../acceptance/workloads/reads_oss_partitioned/delta/
 version: 1
 
 Schema:
-├─ letter: string
-├─ number: long
-└─ a_float: double
+├─ id: integer
+├─ part: string
+└─ value: integer
 
-letter:  [
+id:  [
+  1,
+  3,
+  2,
+  4,
+  5
+]
+part:  [
   "a",
-  "e",
-  "f",
   "a",
+  "b",
   "b",
   "c"
 ]
-number:  [
-  4,
-  5,
-  6,
-  1,
-  2,
-  3
-]
-a_float:  [
-  4.4,
-  5.5,
-  6.6,
-  1.1,
-  2.2,
-  3.3
+value:  [
+  10,
+  30,
+  20,
+  40,
+  50
 ]

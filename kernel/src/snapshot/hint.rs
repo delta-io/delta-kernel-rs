@@ -11,11 +11,11 @@ use crate::last_checkpoint_hint::LastCheckpointHint;
 use crate::log_path::LogPath;
 use crate::log_segment::{LogSegment, validate_catalog_version_bounds};
 use crate::log_segment_files::{CheckpointHandling, LogSegmentFiles};
-use crate::path::{DELTA_LOG_DIR_WITH_SLASH, LogPathFileType, ParsedLogPath};
+use crate::path::{DELTA_LOG_DIR_WITH_SLASH, ParsedLogPath};
 use crate::snapshot::{IncrementalReplay, SnapshotRef};
 use crate::table_configuration::TableConfiguration;
 use crate::utils::{require, try_parse_uri};
-use crate::{KernelError, KernelResult, Snapshot, Version};
+use crate::{KernelError, KernelResult, Result, Snapshot, Version};
 
 /// The freshness claim for the version carried by a [`SnapshotHint`].
 ///
@@ -80,7 +80,7 @@ pub(crate) struct SnapshotHint {
     protocol: Protocol,
     /// The table metadata at `version`.
     metadata: Metadata,
-    /// The optional `_last_checkpoint` contents associated with the log segment.
+    /// Optional portable metadata for the selected checkpoint, supplied or resolved.
     last_checkpoint_hint: Option<LastCheckpointHint>,
     /// The optional CRC state resolved at `version`.
     ///
@@ -110,9 +110,9 @@ impl SnapshotHint {
     ///
     /// Returns an error if `table_root` is invalid,
     /// [`SnapshotHintError::LogPathOutsideRoot`] if any path is outside `table_root`'s `_delta_log`
-    /// root, or
-    /// [`SnapshotHintError::LogCompaction`] if any path is a compacted commit. Returns an error
-    /// when the supplied paths cannot be grouped into a valid log-segment file set.
+    /// root. Returns an error when the supplied paths cannot be grouped into a valid log-segment
+    /// file set. Compacted paths are ignored, as in storage listing; callers must also supply the
+    /// individual commits required for replay.
     #[internal_api]
     #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
     #[allow(clippy::too_many_arguments)]
@@ -129,12 +129,6 @@ impl SnapshotHint {
     ) -> KernelResult<Self> {
         let log_root = try_parse_uri(table_root)?.join(DELTA_LOG_DIR_WITH_SLASH)?;
         let mut parsed_paths: Vec<ParsedLogPath> = log_paths.into_iter().map(Into::into).collect();
-        require!(
-            !parsed_paths
-                .iter()
-                .any(|path| matches!(path.file_type, LogPathFileType::CompactedCommit { .. })),
-            SnapshotHintError::LogCompaction.into()
-        );
         validate_snapshot_hint_paths(parsed_paths.iter(), &log_root)?;
         parsed_paths
             .sort_unstable_by(|a, b| (a.version, &a.filename).cmp(&(b.version, &b.filename)));
@@ -237,12 +231,19 @@ impl SnapshotHint {
             segment.listed.ascending_compaction_files.is_empty(),
             SnapshotHintError::LogCompaction.into()
         );
+        let last_checkpoint_hint = segment.checkpoint_hint();
+        #[cfg(feature = "declarative-plans")]
+        let last_checkpoint_hint = snapshot
+            .cached_checkpoint_info()
+            .and_then(Option::as_deref)
+            .map(|info| info.last_checkpoint())
+            .or(last_checkpoint_hint);
         Ok(Self {
             version: snapshot.version(),
             log_segment_files: segment.listed.clone(),
             protocol: snapshot.table_configuration().protocol().clone(),
             metadata: snapshot.table_configuration().metadata().clone(),
-            last_checkpoint_hint: segment.checkpoint_hint().cloned(),
+            last_checkpoint_hint: last_checkpoint_hint.cloned(),
             crc: snapshot.crc_at_version().cloned(),
             freshness: if snapshot.is_built_as_latest() {
                 SnapshotHintFreshness::Latest
@@ -262,28 +263,31 @@ impl SnapshotHint {
         log_tail: Vec<LogPath>,
         max_catalog_version: Option<Version>,
         incremental_replay: IncrementalReplay,
-    ) -> KernelResult<SnapshotRef> {
-        require!(log_tail.is_empty(), SnapshotHintError::LogTail.into());
+    ) -> Result<SnapshotRef> {
+        require!(
+            log_tail.is_empty(),
+            KernelError::from(SnapshotHintError::LogTail).into()
+        );
         require!(
             incremental_replay.is_disabled(),
-            SnapshotHintError::IncrementalReplay.into()
+            KernelError::from(SnapshotHintError::IncrementalReplay).into()
         );
         if let Some(version) = requested_version {
             require!(
                 version == self.version,
-                SnapshotHintError::VersionMismatch {
+                KernelError::from(SnapshotHintError::VersionMismatch {
                     requested: version,
                     hint: self.version,
-                }
+                })
                 .into()
             );
         } else if let Some(max_catalog_version) = max_catalog_version {
             require!(
                 max_catalog_version == self.version,
-                SnapshotHintError::MaxCatalogVersionMismatch {
+                KernelError::from(SnapshotHintError::MaxCatalogVersionMismatch {
                     max_catalog_version,
                     hint: self.version,
-                }
+                })
                 .into()
             );
         }
@@ -294,7 +298,9 @@ impl SnapshotHint {
             )
         })?;
         let table_url = try_parse_uri(table_root)?;
-        let log_root = table_url.join(DELTA_LOG_DIR_WITH_SLASH)?;
+        let log_root = table_url
+            .join(DELTA_LOG_DIR_WITH_SLASH)
+            .map_err(KernelError::from)?;
         let SnapshotHint {
             version,
             log_segment_files,
@@ -321,7 +327,7 @@ impl SnapshotHint {
 
         require!(
             log_segment_files.ascending_compaction_files.is_empty(),
-            SnapshotHintError::LogCompaction.into()
+            KernelError::from(SnapshotHintError::LogCompaction).into()
         );
 
         // Construction validates every path against one root, and grouping preserves locations.
@@ -336,7 +342,8 @@ impl SnapshotHint {
         )
         .map_err(|source| SnapshotHintError::LogSegment {
             source: Box::new(source),
-        })?;
+        })
+        .map_err(KernelError::from)?;
         // Regular construction derives this field from storage listing. A hint supplies it, so
         // only the hint path needs to validate it explicitly.
         require!(
@@ -344,7 +351,7 @@ impl SnapshotHint {
                 .listed
                 .max_published_version
                 .is_none_or(|published_version| published_version <= version),
-            SnapshotHintError::MaxPublishedVersion { hint: version }.into()
+            KernelError::from(SnapshotHintError::MaxPublishedVersion { hint: version }).into()
         );
         require!(
             log_segment.checkpoint_version.is_some()
@@ -353,26 +360,26 @@ impl SnapshotHint {
                     .ascending_commit_files
                     .first()
                     .is_some_and(|path| path.version == 0),
-            SnapshotHintError::MissingHistoryAnchor.into()
+            KernelError::from(SnapshotHintError::MissingHistoryAnchor).into()
         );
         let table_configuration =
             TableConfiguration::try_new(metadata, protocol, table_url, version)?;
         if let Some(crc) = crc.as_ref() {
             require!(
                 crc.version == version,
-                SnapshotHintError::CrcVersion {
+                KernelError::from(SnapshotHintError::CrcVersion {
                     crc: crc.version,
                     hint: version,
-                }
+                })
                 .into()
             );
             require!(
                 crc.protocol == *table_configuration.protocol(),
-                SnapshotHintError::CrcProtocol.into()
+                KernelError::from(SnapshotHintError::CrcProtocol).into()
             );
             require!(
                 crc.metadata == *table_configuration.metadata(),
-                SnapshotHintError::CrcMetadata.into()
+                KernelError::from(SnapshotHintError::CrcMetadata).into()
             );
         }
 
@@ -416,8 +423,11 @@ mod tests {
 
     use super::*;
     use crate::cancellation::CancellationTokenRef;
+    #[cfg(feature = "declarative-plans")]
+    use crate::engine::DelegatingEngine;
     use crate::engine::sync::SyncEngine;
     use crate::metrics::{MeteredDeltaEngine, MetricEvent, SnapshotLoadType};
+    use crate::path::LogPathFileType;
     use crate::schema::schema_ref;
     use crate::snapshot::builder::tests::catalog_managed_tests::{
         create_log_path as create_catalog_log_path, setup_catalog_managed_test,
@@ -427,6 +437,8 @@ mod tests {
     };
     use crate::snapshot::{FromTableRoot, SnapshotBuilder};
     use crate::table_features::TableFeature;
+    #[cfg(feature = "declarative-plans")]
+    use crate::unit_test_utils::load_test_table;
     use crate::unit_test_utils::{
         TestCancellationToken, create_log_path, create_log_path_with_size, is_io_event,
     };
@@ -550,6 +562,83 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(feature = "declarative-plans")]
+    #[rstest::rstest]
+    #[case::classic_manifest("v2-classic-checkpoint-parquet")]
+    #[case::uuid_manifest("v2-checkpoints-json-with-sidecars")]
+    #[case::inline("v2-checkpoints-parquet-without-sidecars")]
+    #[case::multipart("v1-multi-part-struct-stats-only")]
+    fn resolved_checkpoint_hint_exports_and_rebuilds(
+        #[case] table: &str,
+        #[values(false, true)] omit_hint: bool,
+    ) -> crate::Result<()> {
+        // Given: an unresolved snapshot with or without a writer hint.
+        let (engine, original, _tempdir) = load_test_table(table)?;
+        let mut segment = original.log_segment().clone();
+        if omit_hint {
+            segment.last_checkpoint_metadata = None;
+        }
+        let snapshot = Arc::new(Snapshot::new(
+            segment,
+            original.table_configuration().clone(),
+        )?);
+        let exported = snapshot.to_snapshot_hint()?;
+        assert_eq!(
+            exported.last_checkpoint_hint(),
+            snapshot.log_segment().checkpoint_hint()
+        );
+        assert!(snapshot.cached_checkpoint_info().is_none());
+
+        // When: scan planning resolves the checkpoint and its hint is exported.
+        snapshot
+            .clone()
+            .scan_builder()
+            .build()?
+            .declarative_metadata_scan_plan(engine.as_ref())?;
+        let resolved = snapshot
+            .cached_checkpoint_info()
+            .expect("scan populated checkpoint cache")
+            .as_ref()
+            .unwrap();
+        let mut exported = snapshot.to_snapshot_hint()?;
+
+        // Then: export retains the resolved metadata, which remains readable without an executor.
+        assert_eq!(
+            exported.last_checkpoint_hint(),
+            Some(resolved.last_checkpoint())
+        );
+        let no_executor = DelegatingEngine::new(engine.clone()).without_plan_executor();
+        let cached = snapshot
+            .reader()
+            .get_checkpoint_info(&no_executor)?
+            .unwrap();
+        assert!(Arc::ptr_eq(resolved, &cached));
+        let portable = serde_json::to_value(exported.last_checkpoint_hint().unwrap()).unwrap();
+        let parsed: LastCheckpointHint = serde_json::from_value(portable.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&parsed).unwrap(), portable);
+
+        // When: a new snapshot is built using only the portable hint.
+        exported.last_checkpoint_hint = Some(parsed);
+        let rebuilt = Snapshot::builder_for(snapshot.table_root().clone())
+            .with_snapshot_hint(exported)
+            .build(&no_executor)?;
+
+        // Then: construction leaves resolution lazy and a getter recovers the complete layout.
+        assert!(rebuilt.cached_checkpoint_info().is_none());
+        let recovered = rebuilt
+            .reader()
+            .get_checkpoint_info(engine.as_ref())?
+            .unwrap();
+        assert_eq!(recovered.kind(), resolved.kind());
+        assert_eq!(recovered.leaf_schema(), resolved.leaf_schema());
+        assert_eq!(recovered.leaf_file_count(), resolved.leaf_file_count());
+        assert_eq!(
+            serde_json::to_value(recovered.last_checkpoint()).unwrap(),
+            portable
+        );
+        Ok(())
+    }
+
     #[test_log::test(tokio::test)]
     async fn snapshot_to_hint_rejects_log_compaction()
     -> KernelResult<(), Box<dyn std::error::Error>> {
@@ -626,10 +715,11 @@ mod tests {
     ) {
         let log_paths = [
             "memory:///target/_delta_log/00000000000000000001.json",
+            "memory:///target/_delta_log/00000000000000000000.00000000000000000001.compacted.json",
             "memory:///target/_delta_log/00000000000000000000.json",
         ]
         .into_iter()
-        .map(|path| LogPath::try_new(create_log_path(path).location))
+        .map(|path| LogPath::try_new(create_log_path_with_size(path, 1).location))
         .collect::<KernelResult<Vec<_>>>()
         .unwrap();
         let hint = SnapshotHint::try_new(
@@ -653,6 +743,39 @@ mod tests {
                 .collect_vec(),
             vec![0, 1]
         );
+        assert!(hint.log_segment_files.ascending_compaction_files.is_empty());
+    }
+
+    #[test]
+    fn snapshot_hint_compacted_paths_do_not_fill_commit_gaps() -> Result<()> {
+        const TABLE_ROOT: &str = "memory:///target/";
+        let log_paths = [
+            "memory:///target/_delta_log/00000000000000000000.json",
+            "memory:///target/_delta_log/00000000000000000000.00000000000000000002.compacted.json",
+            "memory:///target/_delta_log/00000000000000000002.json",
+        ]
+        .into_iter()
+        .map(|path| LogPath::try_new(create_log_path_with_size(path, 1).location))
+        .collect::<KernelResult<Vec<_>>>()?;
+        let hint = SnapshotHint::try_new(
+            TABLE_ROOT,
+            2,
+            PublicationWatermark::InferFromLogPaths,
+            log_paths,
+            Protocol::try_new_legacy(1, 2)?,
+            Metadata::default().with_schema(schema_ref! { nullable "id": INTEGER })?,
+            None,
+            None,
+            SnapshotHintFreshness::Unverified,
+        )?;
+        let (engine, _store, _table_root) = setup_test();
+        assert_log_segment_hint_error(
+            SnapshotBuilder::new_for(TABLE_ROOT)
+                .with_snapshot_hint(hint)
+                .build(engine.as_ref()),
+            "Table version 1 is missing",
+        );
+        Ok(())
     }
 
     #[rstest::rstest]
@@ -691,6 +814,7 @@ mod tests {
         None
     )]
     #[case::crc("00000000000000000008.crc", None)]
+    #[case::compacted("00000000000000000007.00000000000000000008.compacted.json", None)]
     fn snapshot_hint_validates_paths_discarded_by_checkpoint_selection(
         #[case] filename: &str,
         #[case] expected_published_version: Option<Version>,

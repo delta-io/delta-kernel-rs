@@ -106,8 +106,11 @@ pub enum MetricEvent {
     SetTransactionLoadFailure,
     CrcReadSuccess(CrcReadSuccess),
     CrcReadFailure,
+    LastCheckpointReadCompleted(LastCheckpointReadCompleted),
     CheckpointWriteSuccess(CheckpointWriteSuccess),
     CheckpointWriteFailure(CheckpointWriteFailure),
+    ChecksumWriteSuccess(ChecksumWriteSuccess),
+    ChecksumWriteFailure(ChecksumWriteFailure),
     JsonReadCompleted(JsonReadCompleted),
     ParquetReadCompleted(ParquetReadCompleted),
     ScanMetadataCompleted(ScanMetadataCompleted),
@@ -126,8 +129,11 @@ impl MetricEvent {
             Self::DomainMetadataLoadSuccess(e) => e.set_duration(d),
             Self::SetTransactionLoadSuccess(e) => e.set_duration(d),
             Self::CrcReadSuccess(e) => e.set_duration(d),
+            Self::LastCheckpointReadCompleted(e) => e.duration = d,
             Self::CheckpointWriteSuccess(e) => e.duration = d,
             Self::CheckpointWriteFailure(e) => e.duration = d,
+            Self::ChecksumWriteSuccess(e) => e.duration = d,
+            Self::ChecksumWriteFailure(e) => e.duration = d,
 
             // Emit-based success events set their duration as a creation attribute, so the
             // span-close hook must not overwrite it.
@@ -160,10 +166,12 @@ impl MetricEvent {
             Self::DomainMetadataLoadSuccess(e) => e.record_u64(name, value),
             Self::CrcReadSuccess(e) => e.record_u64(name, value),
             Self::CheckpointWriteSuccess(e) => e.record_u64(name, value),
+            Self::ChecksumWriteSuccess(e) => e.record_u64(name, value),
 
             Self::LogSegmentLoadSuccess(_) => Err(LogSegmentLoadSuccess::SPAN_NAME),
             Self::ProtocolMetadataLoadSuccess(_) => Err(ProtocolMetadataLoadSuccess::SPAN_NAME),
             Self::SetTransactionLoadSuccess(_) => Err(SetTransactionLoadSuccess::SPAN_NAME),
+            Self::LastCheckpointReadCompleted(_) => Err(LastCheckpointReadCompleted::SPAN_NAME),
             Self::ScanMetadataCompleted(_) => Err(ScanMetadataCompleted::SPAN_NAME),
             Self::JsonReadCompleted(_) => Err(JsonReadCompleted::SPAN_NAME),
             Self::ParquetReadCompleted(_) => Err(ParquetReadCompleted::SPAN_NAME),
@@ -180,6 +188,7 @@ impl MetricEvent {
             Self::SetTransactionLoadFailure => Err(SetTransactionLoadSuccess::SPAN_NAME),
             Self::CrcReadFailure => Err(CrcReadSuccess::SPAN_NAME),
             Self::CheckpointWriteFailure(_) => Err(CheckpointWriteSuccess::SPAN_NAME),
+            Self::ChecksumWriteFailure(_) => Err(ChecksumWriteSuccess::SPAN_NAME),
         }
     }
 
@@ -195,7 +204,9 @@ impl MetricEvent {
             Self::ProtocolMetadataLoadSuccess(_) => Err(ProtocolMetadataLoadSuccess::SPAN_NAME),
             Self::SnapshotBuildSuccess(_) => Err(SnapshotBuildSuccess::SPAN_NAME),
             Self::CrcReadSuccess(_) => Err(CrcReadSuccess::SPAN_NAME),
+            Self::LastCheckpointReadCompleted(_) => Err(LastCheckpointReadCompleted::SPAN_NAME),
             Self::CheckpointWriteSuccess(_) => Err(CheckpointWriteSuccess::SPAN_NAME),
+            Self::ChecksumWriteSuccess(_) => Err(ChecksumWriteSuccess::SPAN_NAME),
             Self::ScanMetadataCompleted(_) => Err(ScanMetadataCompleted::SPAN_NAME),
             Self::JsonReadCompleted(_) => Err(JsonReadCompleted::SPAN_NAME),
             Self::ParquetReadCompleted(_) => Err(ParquetReadCompleted::SPAN_NAME),
@@ -212,10 +223,14 @@ impl MetricEvent {
             Self::SetTransactionLoadFailure => Err(SetTransactionLoadSuccess::SPAN_NAME),
             Self::CrcReadFailure => Err(CrcReadSuccess::SPAN_NAME),
             Self::CheckpointWriteFailure(_) => Err(CheckpointWriteSuccess::SPAN_NAME),
+            Self::ChecksumWriteFailure(_) => Err(ChecksumWriteSuccess::SPAN_NAME),
         }
     }
 
     pub(crate) fn record_str(&mut self, name: &str, value: &str) -> Result<(), &'static str> {
+        if let Self::LastCheckpointReadCompleted(e) = self {
+            return e.record_str(name, value);
+        }
         if name == "failure_reason" {
             if let Self::TransactionCommitSuccess(e) = self {
                 let operation_id = e.operation_id;
@@ -236,6 +251,7 @@ impl MetricEvent {
         match self {
             Self::TransactionCommitSuccess(e) => e.record_str(name, value),
             Self::CheckpointWriteSuccess(e) => e.record_str(name, value),
+            Self::ChecksumWriteSuccess(e) => e.record_str(name, value),
             _ => Ok(()),
         }
     }
@@ -274,12 +290,22 @@ impl MetricEvent {
             Self::DomainMetadataLoadSuccess(_) => Self::DomainMetadataLoadFailure,
             Self::SetTransactionLoadSuccess(_) => Self::SetTransactionLoadFailure,
             Self::CrcReadSuccess(_) => Self::CrcReadFailure,
+            Self::LastCheckpointReadCompleted(mut e) => {
+                if e.outcome == LastCheckpointReadOutcome::Unknown {
+                    e.outcome = LastCheckpointReadOutcome::Error;
+                }
+                Self::LastCheckpointReadCompleted(e)
+            }
             Self::CheckpointWriteSuccess(e) => {
                 Self::CheckpointWriteFailure(CheckpointWriteFailure {
                     mode: e.mode,
                     duration: e.duration,
                 })
             }
+            Self::ChecksumWriteSuccess(e) => Self::ChecksumWriteFailure(ChecksumWriteFailure {
+                resolution_mode: e.resolution_mode,
+                duration: e.duration,
+            }),
             // Events with no failure form pass through unchanged.
             // Note: here we list explicitly so adding a lifecycle event without a failure mapping
             //       fails to compile.
@@ -291,6 +317,7 @@ impl MetricEvent {
             | Self::SetTransactionLoadFailure
             | Self::CrcReadFailure
             | Self::CheckpointWriteFailure(_)
+            | Self::ChecksumWriteFailure(_)
             | Self::JsonReadCompleted(_)
             | Self::ParquetReadCompleted(_)
             | Self::ScanMetadataCompleted(_)
@@ -318,8 +345,11 @@ impl fmt::Display for MetricEvent {
             Self::SetTransactionLoadFailure => f.write_str("SetTransactionLoadFailure"),
             Self::CrcReadSuccess(e) => e.fmt(f),
             Self::CrcReadFailure => f.write_str("CrcReadFailure"),
+            Self::LastCheckpointReadCompleted(e) => e.fmt(f),
             Self::CheckpointWriteSuccess(e) => e.fmt(f),
             Self::CheckpointWriteFailure(e) => e.fmt(f),
+            Self::ChecksumWriteSuccess(e) => e.fmt(f),
+            Self::ChecksumWriteFailure(e) => e.fmt(f),
             Self::JsonReadCompleted(e) => e.fmt(f),
             Self::ParquetReadCompleted(e) => e.fmt(f),
             Self::ScanMetadataCompleted(e) => e.fmt(f),
@@ -1300,6 +1330,213 @@ impl fmt::Display for CrcReadSuccess {
 }
 
 // ====================================================================
+// LastCheckpointRead
+// ====================================================================
+
+pub(crate) const LAST_CHECKPOINT_READ_SPAN: &str = "last_checkpoint.read";
+
+/// Result of an attempt to read and validate a `_last_checkpoint` hint.
+///
+/// This describes the hint read, not whether the enclosing snapshot operation succeeded.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Default, EnumString, StrumDisplay, AsRefStr, IntoStaticStr,
+)]
+#[strum(serialize_all = "snake_case")]
+pub enum LastCheckpointReadOutcome {
+    /// The hint was parsed and retained. It may still name a checkpoint the caller cannot use.
+    Success,
+    /// Storage reported that the hint file was absent.
+    ///
+    /// An iterator-level file-not-found returns no hint; a top-level storage error propagates.
+    NotFound,
+    /// The hint was empty, malformed, or discarded by hint validation.
+    Invalid,
+    /// The attempt returned another error, including cancellation.
+    Error,
+    /// The outcome was not recorded or its metric label was unrecognized.
+    #[default]
+    Unknown,
+}
+
+/// A `_last_checkpoint` read attempt completed, including attempts returning no hint or an error.
+///
+/// Reporters can count attempts and record latency using [`Self::outcome`] as a label. Missing
+/// and invalid hints normally allow the caller to fall back to listing the log.
+#[derive(Debug, Clone)]
+pub struct LastCheckpointReadCompleted {
+    /// Result of reading and validating the hint.
+    pub outcome: LastCheckpointReadOutcome,
+    /// Wall-clock time from entry through return, including storage access, parsing, and
+    /// validation.
+    pub duration: Duration,
+}
+
+impl LastCheckpointReadCompleted {
+    pub(crate) const SPAN_NAME: &'static str = LAST_CHECKPOINT_READ_SPAN;
+
+    pub(crate) fn from_attrs(_attrs: &Attributes<'_>) -> Self {
+        Self {
+            outcome: LastCheckpointReadOutcome::Unknown,
+            duration: Duration::ZERO,
+        }
+    }
+
+    fn record_str(&mut self, name: &str, value: &str) -> Result<(), &'static str> {
+        if name != "outcome" {
+            return Err(Self::SPAN_NAME);
+        }
+        match value.parse() {
+            Ok(outcome) => {
+                self.outcome = outcome;
+                Ok(())
+            }
+            Err(_) => {
+                self.outcome = LastCheckpointReadOutcome::Unknown;
+                Err(Self::SPAN_NAME)
+            }
+        }
+    }
+}
+
+impl fmt::Display for LastCheckpointReadCompleted {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self { outcome, duration } = self;
+        write!(
+            f,
+            "LastCheckpointReadCompleted(outcome={outcome}, duration={duration:?})"
+        )
+    }
+}
+
+// ====================================================================
+// ChecksumWrite
+// ====================================================================
+
+pub(crate) const CHECKSUM_WRITE_SPAN: &str = "snap.write_checksum";
+
+/// Outcome of a successful [`crate::Snapshot::write_checksum`] call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, AsRefStr, StrumDisplay)]
+#[strum(serialize_all = "snake_case")]
+pub enum ChecksumWriteOutcome {
+    /// The CRC was written and the updated snapshot was constructed successfully.
+    Written {
+        /// Exact serialized UTF-8 byte count written by this call.
+        bytes_written: u64,
+    },
+    /// The CRC already existed, including a concurrent writer winning the storage race.
+    AlreadyExists,
+}
+
+/// CRC construction path selected during [`crate::Snapshot::write_checksum`].
+///
+/// Reusing a CRC already at the snapshot version is [`Self::Cached`], regardless of how it was
+/// constructed. The selected mode is retained on failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, AsRefStr, StrumDisplay, EnumString)]
+#[strum(serialize_all = "snake_case")]
+pub enum ChecksumWriteResolutionMode {
+    /// Attempted construction from a checkpoint or version zero, replaying commits as needed.
+    Full,
+    /// Attempted to advance an older CRC by replaying newer commits.
+    Incremental,
+    /// Selected the in-memory CRC already at the snapshot version.
+    Cached,
+    /// Returned before selecting a CRC construction path.
+    NotAttempted,
+}
+
+/// A [`crate::Snapshot::write_checksum`] call succeeded, writing a CRC or finding one already
+/// present.
+#[derive(Debug, Clone)]
+pub struct ChecksumWriteSuccess {
+    /// Final result returned by the API.
+    pub outcome: ChecksumWriteOutcome,
+    /// CRC construction path selected during this call.
+    pub resolution_mode: ChecksumWriteResolutionMode,
+    /// Wall-clock time from API entry to return.
+    pub duration: Duration,
+}
+
+impl ChecksumWriteSuccess {
+    pub(crate) const SPAN_NAME: &'static str = CHECKSUM_WRITE_SPAN;
+
+    pub(crate) fn from_attrs(_attrs: &Attributes<'_>) -> Self {
+        Self {
+            outcome: ChecksumWriteOutcome::Written { bytes_written: 0 },
+            resolution_mode: ChecksumWriteResolutionMode::NotAttempted,
+            duration: Duration::default(),
+        }
+    }
+
+    fn record_u64(&mut self, name: &str, value: u64) -> Result<(), &'static str> {
+        match name {
+            "bytes_written" => {
+                self.outcome = ChecksumWriteOutcome::Written {
+                    bytes_written: value,
+                }
+            }
+            _ => return Err(Self::SPAN_NAME),
+        }
+        Ok(())
+    }
+
+    fn record_str(&mut self, name: &str, value: &str) -> Result<(), &'static str> {
+        match name {
+            "outcome" if value == ChecksumWriteOutcome::AlreadyExists.as_ref() => {
+                self.outcome = ChecksumWriteOutcome::AlreadyExists;
+            }
+            "resolution_mode" => {
+                self.resolution_mode = value.parse().map_err(|_| Self::SPAN_NAME)?;
+            }
+            _ => return Err(Self::SPAN_NAME),
+        }
+        Ok(())
+    }
+}
+
+impl fmt::Display for ChecksumWriteSuccess {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self {
+            outcome,
+            resolution_mode,
+            duration,
+        } = self;
+        write!(
+            f,
+            "ChecksumWriteSuccess(outcome={outcome}, resolution_mode={resolution_mode}, \
+             duration={duration:?}"
+        )?;
+        if let ChecksumWriteOutcome::Written { bytes_written } = outcome {
+            write!(f, ", bytes_written={bytes_written}")?;
+        }
+        f.write_str(")")
+    }
+}
+
+/// A [`crate::Snapshot::write_checksum`] call failed.
+///
+/// The CRC may have been written before construction of the returned snapshot failed.
+#[derive(Debug, Clone)]
+pub struct ChecksumWriteFailure {
+    /// CRC construction path selected before the error.
+    pub resolution_mode: ChecksumWriteResolutionMode,
+    /// Wall-clock time from API entry to return.
+    pub duration: Duration,
+}
+
+impl fmt::Display for ChecksumWriteFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self {
+            resolution_mode,
+            duration,
+        } = self;
+        write!(
+            f,
+            "ChecksumWriteFailure(resolution_mode={resolution_mode}, duration={duration:?})"
+        )
+    }
+}
+
+// ====================================================================
 // JsonReadCompleted
 // ====================================================================
 
@@ -2085,6 +2322,42 @@ mod tests {
         assert_eq!(failure.reason, expected);
     }
 
+    #[rstest]
+    #[case("success", LastCheckpointReadOutcome::Success)]
+    #[case("not_found", LastCheckpointReadOutcome::NotFound)]
+    #[case("invalid", LastCheckpointReadOutcome::Invalid)]
+    #[case("error", LastCheckpointReadOutcome::Error)]
+    #[case("unknown", LastCheckpointReadOutcome::Unknown)]
+    fn last_checkpoint_outcome_has_stable_label(
+        #[case] label: &str,
+        #[case] outcome: LastCheckpointReadOutcome,
+    ) {
+        let static_label: &'static str = outcome.into();
+        assert_eq!(static_label, label);
+        assert_eq!(label.parse::<LastCheckpointReadOutcome>().unwrap(), outcome);
+        let mut event = MetricEvent::LastCheckpointReadCompleted(LastCheckpointReadCompleted {
+            outcome,
+            duration: Duration::ZERO,
+        });
+        event.set_duration_if_applicable(Duration::from_nanos(17));
+        assert_eq!(
+            event.to_string(),
+            format!("LastCheckpointReadCompleted(outcome={label}, duration=17ns)")
+        );
+        assert_eq!(
+            event.record_u64("outcome", 1),
+            Err(LastCheckpointReadCompleted::SPAN_NAME)
+        );
+        assert_eq!(
+            event.record_bool("outcome", false),
+            Err(LastCheckpointReadCompleted::SPAN_NAME)
+        );
+        assert_eq!(
+            event.record_str("failure_reason", "error"),
+            Err(LastCheckpointReadCompleted::SPAN_NAME)
+        );
+    }
+
     #[test]
     fn record_str_operation_sets_field_without_flipping() {
         let mut event = MetricEvent::TransactionCommitSuccess(commit_success(MetricId::new()));
@@ -2324,5 +2597,54 @@ mod tests {
         };
         assert_eq!(failure.correlation_id.as_deref(), Some("snap-req-3"));
         assert_eq!(failure.load_type, SnapshotLoadType::Incremental);
+    }
+
+    #[rstest]
+    #[case(ChecksumWriteOutcome::Written { bytes_written: 0 }, "written")]
+    #[case(ChecksumWriteOutcome::Written { bytes_written: 100 }, "written")]
+    #[case(ChecksumWriteOutcome::AlreadyExists, "already_exists")]
+    fn crc_write_outcome_has_stable_label(
+        #[case] outcome: ChecksumWriteOutcome,
+        #[case] label: &str,
+    ) {
+        assert_eq!(outcome.as_ref(), label);
+        assert_eq!(outcome.to_string(), label);
+    }
+
+    #[rstest]
+    #[case(ChecksumWriteResolutionMode::Full, "full")]
+    #[case(ChecksumWriteResolutionMode::Incremental, "incremental")]
+    #[case(ChecksumWriteResolutionMode::Cached, "cached")]
+    #[case(ChecksumWriteResolutionMode::NotAttempted, "not_attempted")]
+    fn crc_write_resolution_mode_has_stable_label(
+        #[case] mode: ChecksumWriteResolutionMode,
+        #[case] label: &str,
+    ) {
+        assert_eq!(mode.as_ref(), label);
+        assert_eq!(mode.to_string(), label);
+        assert_eq!(label.parse::<ChecksumWriteResolutionMode>().unwrap(), mode);
+    }
+
+    #[rstest]
+    fn crc_write_failure_preserves_mode_and_duration_but_discards_written_payload(
+        #[values(
+            ChecksumWriteResolutionMode::Full,
+            ChecksumWriteResolutionMode::Incremental,
+            ChecksumWriteResolutionMode::Cached,
+            ChecksumWriteResolutionMode::NotAttempted
+        )]
+        mode: ChecksumWriteResolutionMode,
+    ) {
+        let duration = Duration::from_millis(42);
+        let event = MetricEvent::ChecksumWriteSuccess(ChecksumWriteSuccess {
+            outcome: ChecksumWriteOutcome::Written { bytes_written: 100 },
+            resolution_mode: mode,
+            duration,
+        });
+        let MetricEvent::ChecksumWriteFailure(event) = event.into_failure() else {
+            panic!("expected ChecksumWriteFailure");
+        };
+        assert_eq!(event.resolution_mode, mode);
+        assert_eq!(event.duration, duration);
     }
 }

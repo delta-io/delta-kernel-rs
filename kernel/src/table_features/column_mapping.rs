@@ -7,7 +7,7 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
-use strum::EnumString;
+use strum::{Display, EnumString};
 use tracing::debug;
 use uuid::Uuid;
 
@@ -22,7 +22,7 @@ use crate::transforms::{SchemaTransform, transform_output_type};
 use crate::{KernelError, KernelResult};
 
 /// Modes of column mapping a table can be in
-#[derive(Debug, EnumString, Serialize, Deserialize, Copy, Clone, PartialEq, Eq)]
+#[derive(Debug, Display, EnumString, Serialize, Deserialize, Copy, Clone, PartialEq, Eq)]
 #[strum(serialize_all = "camelCase")]
 #[serde(rename_all = "camelCase")]
 pub enum ColumnMappingMode {

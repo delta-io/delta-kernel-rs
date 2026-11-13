@@ -29,7 +29,7 @@ use delta_kernel::table_changes::TableChanges;
 use delta_kernel::transaction::UpdateTableOperation;
 use delta_kernel::transaction::create_table::{CreateTableTransaction, create_table};
 use delta_kernel::transaction::data_layout::DataLayout;
-use delta_kernel::{Engine, KernelResult, ReferencedFilePath, resolve_file_uri};
+use delta_kernel::{Engine, ReferencedFilePath, resolve_file_uri};
 use rstest::rstest;
 use test_utils::delta_kernel_default_engine::DefaultEngine;
 use test_utils::delta_kernel_default_engine::executor::tokio::TokioMultiThreadExecutor;
@@ -159,7 +159,7 @@ type WrittenTable = (
     tempfile::TempDir,
     String,
     Arc<DefaultEngine<TokioMultiThreadExecutor>>,
-    KernelResult<SnapshotRef>,
+    delta_kernel::Result<SnapshotRef>,
 );
 
 /// Creates a table with columns `id` and `c` in `cm_mode` and writes one batch holding `column`.
@@ -596,7 +596,7 @@ fn create_clustered_table(
     engine: &dyn Engine,
     cm_mode: &str,
     column: ColumnName,
-) -> KernelResult<CreateTableTransaction> {
+) -> delta_kernel::Result<CreateTableTransaction> {
     create_table(table_path, clustering_test_schema(), "Test/1.0", true)
         .with_table_properties([
             ("delta.columnMapping.mode", cm_mode),
@@ -905,15 +905,16 @@ fn new_referenced_file_path(
     snapshot: &SnapshotRef,
     engine: &dyn Engine,
     extension: Option<&str>,
-) -> KernelResult<ReferencedFilePath> {
+) -> Result<ReferencedFilePath, Box<dyn std::error::Error>> {
     let txn = snapshot
         .clone()
         .update_table(UpdateTableOperation::Write, "test", true)
         .build(engine, Box::new(FileSystemCommitter::new()))?;
-    txn.write_state()?
+    Ok(txn
+        .write_state()?
         .write_context_builder()
         .build()?
-        .new_referenced_file_path(extension)
+        .new_referenced_file_path(extension)?)
 }
 
 /// A connector writes the bytes of a new reference at the location from

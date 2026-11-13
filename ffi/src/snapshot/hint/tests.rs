@@ -1,21 +1,23 @@
 use std::collections::BTreeMap;
 use std::error::Error as _;
 use std::ptr::NonNull;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
-use delta_kernel::FileMeta;
+use bytes::Bytes;
 use delta_kernel::actions::Metadata;
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use delta_kernel::actions::{Add, LastManifestCommit};
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use delta_kernel::crc::Crc;
-use delta_kernel::engine::PanicEngine;
+use delta_kernel::engine::{DelegatingEngine, PanicEngine};
 use delta_kernel::last_checkpoint_hint::{LastCheckpointHint, LastCheckpointV2};
 use delta_kernel::log_segment::LogSegment;
 use delta_kernel::path::{LogPathFileType, ParsedLogPath};
 use delta_kernel::snapshot::{IncrementalReplay, PublicationWatermark, Snapshot};
+use delta_kernel::{FileMeta, FileSlice, KernelResult, KernelResultIterator, StorageHandler};
 use test_utils::table_builder::{LogState, TestTableBuilder};
 use test_utils::{TestCatalogCommitter, compacted_log_path_for_versions, create_log_path};
+use url::Url;
 
 use super::*;
 use crate::delta_types::*;
@@ -140,6 +142,41 @@ fn empty_crc() -> FfiCrc {
 
 fn test_engine() -> Handle<SharedExternEngine> {
     engine_to_handle(Arc::new(PanicEngine), TEST_ERROR_ALLOCATORS)
+}
+
+struct SingleHeadStorage(Mutex<Option<FileMeta>>);
+
+impl StorageHandler for SingleHeadStorage {
+    fn head(&self, path: &Url) -> KernelResult<FileMeta> {
+        let metadata = self
+            .0
+            .lock()
+            .unwrap()
+            .take()
+            .expect("unexpected second HEAD");
+        assert_eq!(path, &metadata.location);
+        Ok(metadata)
+    }
+
+    fn list_from(&self, _: &Url) -> KernelResult<Box<dyn KernelResultIterator<FileMeta>>> {
+        panic!("unexpected list_from")
+    }
+
+    fn read_files(&self, _: Vec<FileSlice>) -> KernelResult<Box<dyn KernelResultIterator<Bytes>>> {
+        panic!("unexpected read_files")
+    }
+
+    fn copy_atomic(&self, _: &Url, _: &Url) -> KernelResult<()> {
+        panic!("unexpected copy_atomic")
+    }
+
+    fn put(&self, _: &Url, _: Bytes, _: bool) -> KernelResult<()> {
+        panic!("unexpected put")
+    }
+
+    fn delete(&self, _: &Url) -> KernelResult<()> {
+        panic!("unexpected delete")
+    }
 }
 
 #[rstest::rstest]
@@ -973,10 +1010,17 @@ fn visited_hint_preserves_commit_paths_and_watermark_for_explicit_version(
         Some(source_watermark)
     );
     let source_segment = source_ref.log_segment().clone();
-    let kernel_engine = unsafe { engine.as_ref() }.engine();
     let published = if publish {
+        let published_meta = FileMeta::new(
+            Url::parse("memory:///hinted-table/_delta_log/00000000000000000001.json").unwrap(),
+            23,
+            19,
+        );
+        let publish_engine = DelegatingEngine::new(Arc::new(PanicEngine)).with_storage_handler(
+            Arc::new(SingleHeadStorage(Mutex::new(Some(published_meta)))),
+        );
         source_ref
-            .publish(kernel_engine.as_ref(), &TestCatalogCommitter)
+            .publish(&publish_engine, &TestCatalogCommitter)
             .unwrap()
     } else {
         source_ref.clone()
@@ -1001,7 +1045,7 @@ fn visited_hint_preserves_commit_paths_and_watermark_for_explicit_version(
                     .as_str()
             },
         ],
-        [(1, 1), (13, 17)],
+        [(1, 1), if publish { (19, 23) } else { (13, 17) }],
     ) {
         assert_eq!(file.location.location.as_str(), expected_location);
         let expected_type = if publish || file.version == 0 {
@@ -1486,8 +1530,10 @@ fn aggregate_with_rejects_null_nonempty_log_path_array() {
     }
 }
 
-#[test]
-fn aggregate_with_rejects_log_compaction_paths() {
+#[rstest::rstest]
+#[case::complete(true)]
+#[case::missing_commit(false)]
+fn aggregate_with_log_compaction_requires_individual_commits(#[case] complete: bool) {
     let engine = test_engine();
     let builder = test_builder(&engine);
     let log_path = FfiLogPath::new(
@@ -1498,19 +1544,54 @@ fn aggregate_with_rejects_log_compaction_paths() {
         1,
         1,
     );
-    let hint = test_snapshot_hint(
-        std::slice::from_ref(&log_path),
-        1,
-        FfiSnapshotHintFreshness::Unverified,
+    let paths = [
+        log_path,
+        FfiLogPath::new(
+            slice("memory:///hinted-table/_delta_log/00000000000000000000.json"),
+            0,
+            0,
+        ),
+        FfiLogPath::new(
+            slice("memory:///hinted-table/_delta_log/00000000000000000001.json"),
+            1234,
+            0,
+        ),
+    ];
+    let supplied_paths = if complete { &paths[..] } else { &paths[..1] };
+    let hint = test_snapshot_hint(supplied_paths, 1, FfiSnapshotHintFreshness::Unverified);
+    let builder = unsafe { ok_or_panic(snapshot_builder_with_snapshot_hint(builder, &hint)) };
+    if !complete {
+        assert_extern_result_error_contains(
+            unsafe { snapshot_builder_build(builder) },
+            FFIKernelError::InvalidSnapshotHint,
+            "log segment",
+        );
+        unsafe { free_engine(engine) };
+        return;
+    }
+    let snapshot = unsafe { ok_or_panic(snapshot_builder_build(builder)) };
+    let source = unsafe { snapshot.as_ref() };
+    assert_eq!(source.version(), 1);
+    assert_eq!(source.log_segment().listed.ascending_commit_files.len(), 2);
+    assert!(
+        source
+            .log_segment()
+            .listed
+            .ascending_compaction_files
+            .is_empty()
     );
-    let result = unsafe { snapshot_builder_with_snapshot_hint(builder, &hint) };
-    assert_extern_result_error_contains(
-        result,
-        FFIKernelError::InvalidSnapshotHint,
-        "log compaction",
+    assert_eq!(
+        unsafe {
+            ok_or_panic(crate::snapshot_timestamp(
+                snapshot.shallow_copy(),
+                engine.shallow_copy(),
+            ))
+        },
+        1234
     );
 
     unsafe {
+        free_snapshot(snapshot);
         free_engine(engine);
     }
 }

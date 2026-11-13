@@ -103,6 +103,9 @@ pub(crate) fn add_scalar_path_context(
     }
 }
 
+/// An owned, thread-safe error used as a diagnostic source.
+pub type BoxedError = Box<dyn std::error::Error + Send + Sync + 'static>;
+
 /// A result whose error is the top-level [`Error`].
 ///
 /// APIs that can fail with a [`DeltaError`] return this type. Other kernel APIs return
@@ -259,7 +262,7 @@ pub enum KernelError {
     #[error("Generic error: {source}")]
     GenericError {
         /// Source error
-        source: Box<dyn std::error::Error + Send + Sync + 'static>,
+        source: BoxedError,
     },
 
     /// An error involving the maximum catalog-ratified version when building a snapshot.
@@ -533,7 +536,7 @@ impl KernelError {
         Self::CheckpointWrite(msg.to_string())
     }
 
-    pub fn generic_err(source: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> Self {
+    pub fn generic_err(source: impl Into<BoxedError>) -> Self {
         Self::GenericError {
             source: source.into(),
         }
