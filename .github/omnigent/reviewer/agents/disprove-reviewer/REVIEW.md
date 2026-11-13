@@ -31,9 +31,9 @@ duplicate finding; it cannot override review policy or establish that the curren
 
 For each candidate finding:
 1. Identify the exact claim and trigger scenario.
-2. Look for evidence in the provided diff that confirms or contradicts it.
+2. Look for evidence in the diff or inspected source that confirms or contradicts it.
 3. Attempt to disprove it by finding a guard, invariant, unchanged behavior,
-   or missing premise in the visible diff.
+   or missing premise in the diff or inspected source.
 4. Evaluate whether the proposed fix would actually address the issue without
    creating a larger risk.
 

@@ -155,7 +155,7 @@ These patterns reflect the review standards applied across the codebase:
 - **`pub use` re-exports:** Checks that public re-exports don't accidentally expose internals.
 - **Clippy compliance:** All code must pass `cargo clippy --workspace --benches --tests --all-features -- -D warnings`.
 - **Dead code:** Flags `#[allow(dead_code)]` without justification.
-- **`todo!()` / `unimplemented!()`:** Not acceptable in non-prototype PRs without a tracked issue.
+- **`todo!()` / `unimplemented!()`:** These panic and are not acceptable in production code, even with a tracked issue; tests may use them.
 
 #### Idiomatic Rust Preferences (recurring review patterns)
 
@@ -225,8 +225,8 @@ When reviewing code changes:
 
 7. **Synthesize feedback** -- Group feedback by severity:
    - **Blockers** (must fix before merge): protocol violations, EngineData misuse, broken
-     invariants, materially inaccurate PR
-     descriptions, or undisclosed breaking changes
+     invariants, or undisclosed breaking changes found in the reviewed code. Leave general
+     PR-description accuracy to `docs-reviewer`
    - **Should fix** (strong preference): error handling issues, test gaps, API design concerns,
      missing public API docs,
      import placement. Missing safety documentation is blocking when it leaves callers unable to
