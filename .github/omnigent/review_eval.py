@@ -117,48 +117,22 @@ def validate_trace(path: Path) -> None:
     """
     events = [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
     calls, results = set(), set()
-    launched = {}
     for event in events:
         phase = event.get("type", "").lower().removeprefix("phase_")
         data = event.get("data")
         request = event.get("request_data") or {}
-        if (
-            phase == "tool_call"
-            and isinstance(data, dict)
-            and data.get("name") == "sys_session_send"
-        ):
-            agent = data.get("arguments", {}).get("agent")
-            if isinstance(agent, str):
+        if phase == "tool_call" and isinstance(data, dict):
+            tool = event.get("target") or data.get("name")
+            # A preceding context policy can replace data with transformed tool arguments.
+            arguments = data.get("arguments", data)
+            agent = arguments.get("agent") if isinstance(arguments, dict) else None
+            if tool == "sys_session_send" and isinstance(agent, str):
                 calls.add(agent)
         if phase == "tool_result" and request.get("name") == "sys_session_send":
+            # Deferred child results use args; launch acknowledgements use arguments.
             agent = request.get("args", {}).get("agent")
             if isinstance(agent, str) and data:
                 results.add(agent)
-        if phase != "tool_result" or not isinstance(data, dict):
-            continue
-        output = data.get("result")
-        if not isinstance(output, str):
-            continue
-        # Omnigent 0.8.2 omits request metadata from policy events. Correlate its launch
-        # receipts with completed inbox messages instead of counting dispatch acknowledgements.
-        if event.get("target") == "sys_session_send":
-            try:
-                receipt = json.loads(output)
-            except ValueError:
-                continue
-            if isinstance(receipt, dict) and receipt.get("agent") in calls:
-                task = receipt.get("task_id")
-                if isinstance(task, str):
-                    launched[task] = receipt["agent"]
-        if event.get("target") == "sys_read_inbox":
-            for match in re.finditer(
-                r"(?:^|\n)\[System: sub-agent task ([0-9a-f]{32}) completed \u2014 "
-                r"([a-z][a-z-]+):[^\n]*? returned:\s*\S",
-                output,
-            ):
-                task, agent = match.groups()
-                if launched.get(task) == agent:
-                    results.add(agent)
     maintainers = {"maintainer-claude-reviewer", "maintainer-codex-reviewer"}
     primary = {
         "delta-protocol-reviewer",

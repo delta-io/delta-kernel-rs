@@ -212,27 +212,22 @@ class ReviewEvalTest(unittest.TestCase):
             path.write_text("**Verdict**: CONFIRMED")
             verify_artifacts(Path(directory), "fake-eval-sentinel")
 
-    def test_trace_correlates_omnigent_082_inbox_results_with_launch_receipts(self):
+    def test_trace_handles_transformed_dispatch_arguments_from_omnigent_082(self):
         events = []
-        for index, agent in enumerate(
-            ("maintainer-codex-reviewer", "docs-reviewer", "disprove-reviewer")
-        ):
-            task = f"{index:032x}"
+        agents = ("maintainer-codex-reviewer", "docs-reviewer", "disprove-reviewer")
+        for agent in agents:
             events.extend(
                 [
                     {
                         "type": "tool_call",
                         "target": "sys_session_send",
-                        "data": {"name": "sys_session_send", "arguments": {"agent": agent}},
+                        "data": {"agent": agent, "args": {"input": "canonical context"}},
                     },
                     {
                         "type": "tool_result",
                         "target": "sys_session_send",
-                        "data": {
-                            "result": json.dumps(
-                                {"task_id": task, "agent": agent, "status": "launching"}
-                            )
-                        },
+                        "request_data": {"name": "sys_session_send", "arguments": {"agent": agent}},
+                        "data": {"result": json.dumps({"agent": agent, "status": "launching"})},
                     },
                 ]
             )
@@ -241,16 +236,13 @@ class ReviewEvalTest(unittest.TestCase):
             path.write_text("\n".join(json.dumps(e) for e in events))
             with self.assertRaisesRegex(ValueError, "quorum"):
                 validate_trace(path)
-            for index, agent in enumerate(
-                ("maintainer-codex-reviewer", "docs-reviewer", "disprove-reviewer")
-            ):
+            for agent in agents:
                 events.append(
                     {
                         "type": "tool_result",
-                        "target": "sys_read_inbox",
-                        "data": {
-                            "result": f"[System: sub-agent task {index:032x} completed \u2014 {agent}:review returned: evidence]"
-                        },
+                        "target": "sys_session_send",
+                        "request_data": {"name": "sys_session_send", "args": {"agent": agent}},
+                        "data": {"result": "completed review evidence"},
                     }
                 )
             path.write_text("\n".join(json.dumps(e) for e in events))
