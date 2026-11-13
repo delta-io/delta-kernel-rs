@@ -94,9 +94,9 @@ pub struct FfiSnapshotHint {
     /// Export always uses an explicit variant, never `InferFromLogPaths`.
     pub publication_watermark: FfiPublicationWatermark,
     /// Optional selected-checkpoint type claim, validated against the supplied paths at build.
-    /// Absent leaves the type to be inferred from paths and matching `_last_checkpoint` state.
-    /// C callers must explicitly set the tag to `NoneFfiSelectedCheckpointType` when absent:
-    /// zero-initializing this field produces `Some(Unresolved)`, which requires a checkpoint.
+    /// Absent leaves the type to be inferred from available evidence or resolved during discovery.
+    /// C callers must explicitly set the tag to `NoneFfiSelectedCheckpointType` when absent;
+    /// zero-initializing this field is invalid.
     pub checkpoint_type: OptionalValue<FfiSelectedCheckpointType>,
 }
 

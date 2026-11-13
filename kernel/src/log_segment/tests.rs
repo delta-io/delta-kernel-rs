@@ -358,7 +358,7 @@ fn log_segment_stats_counts_only_replay_commits(
         end_version: sizes.len().saturating_sub(1) as u64,
         checkpoint: checkpoint_only.then_some(SelectedCheckpoint {
             version: 0,
-            checkpoint_type: SelectedCheckpointType::Unresolved,
+            checkpoint_type: None,
         }),
         log_root: Url::parse("memory:///_delta_log/").unwrap(),
         last_checkpoint_metadata: None,
@@ -1589,11 +1589,11 @@ async fn test_create_checkpoint_stream_preserves_checkpoint_type(
     #[case] v2: bool,
     #[case] sidecar_column: bool,
     #[values(
-        SelectedCheckpointType::Unresolved,
-        SelectedCheckpointType::V1,
-        SelectedCheckpointType::V2
+        None,
+        Some(SelectedCheckpointType::V1),
+        Some(SelectedCheckpointType::V2)
     )]
-    claimed_type: SelectedCheckpointType,
+    claimed_type: Option<SelectedCheckpointType>,
 ) -> KernelResult<()> {
     // Given a classic-named checkpoint and a retained type claim.
     let (store, log_root) = new_in_memory_store();
@@ -1639,7 +1639,7 @@ async fn test_create_checkpoint_stream_preserves_checkpoint_type(
         log_root,
         None,
         None,
-        Some(claimed_type),
+        claimed_type,
     )?;
     let before = log_segment.clone();
 
@@ -1667,7 +1667,7 @@ async fn test_create_checkpoint_stream_preserves_checkpoint_type(
         assert_batch_matches(first_batch, add_batch_simple(v2_checkpoint_read_schema));
     }
     assert!(iter.next().is_none());
-    assert_eq!(log_segment.checkpoint_type(), Some(claimed_type));
+    assert_eq!(log_segment.checkpoint_type(), claimed_type);
     assert_eq!(log_segment, before);
 
     Ok(())

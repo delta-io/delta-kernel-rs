@@ -269,7 +269,7 @@ mod tests {
             end_version,
             checkpoint: checkpoint_version.map(|version| crate::checkpoint::SelectedCheckpoint {
                 version,
-                checkpoint_type: crate::checkpoint::SelectedCheckpointType::Unresolved,
+                checkpoint_type: None,
             }),
             log_root,
             listed: LogSegmentFiles {
@@ -295,6 +295,7 @@ mod tests {
 
     fn shape(kind: CheckpointKind, parsed_stats: Option<SchemaRef>) -> CheckpointShape {
         CheckpointShape {
+            checkpoint_type: crate::checkpoint::SelectedCheckpointType::V2,
             leaf_checkpoint_schema: parquet_read_schema(parsed_stats.as_ref(), None).unwrap(),
             sidecars: if kind == CheckpointKind::Manifest {
                 Arc::from([crate::FileMeta {

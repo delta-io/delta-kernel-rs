@@ -148,7 +148,7 @@ pub(crate) struct ActionsWithCheckpointInfo<A: KernelResultIterator<ActionsBatch
 #[internal_api]
 pub(crate) struct LogSegment {
     pub end_version: Version,
-    /// The selected checkpoint, including its construction-time type observation.
+    /// The selected checkpoint, including its retained type observation.
     pub checkpoint: Option<SelectedCheckpoint>,
     pub log_root: Url,
     /// The set of log files found during listing.

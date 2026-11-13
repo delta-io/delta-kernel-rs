@@ -295,7 +295,7 @@ impl Snapshot {
     /// at the snapshot version takes precedence, since it records the value authoritatively,
     /// including its absence.
     fn new_with_validated_crc(
-        log_segment: LogSegment,
+        mut log_segment: LogSegment,
         table_configuration: TableConfiguration,
         crc: SnapshotCrc,
         built_as_latest: bool,
@@ -306,6 +306,7 @@ impl Snapshot {
         #[cfg(feature = "adaptive-metadata-in-dev")]
         last_manifest_commit: LastManifestCommitResolution,
     ) -> Self {
+        log_segment.resolve_checkpoint_type(table_configuration.protocol());
         let span = tracing::info_span!(
             parent: tracing::Span::none(),
             "snap",
@@ -682,13 +683,12 @@ impl Snapshot {
         self.log_segment.stats()
     }
 
-    /// Returns the selected checkpoint's type without engine I/O.
-    ///
-    /// Returns `None` when no checkpoint was selected, or
-    /// `Some(SelectedCheckpointType::Unresolved)` when its type is unknown. This describes the
-    /// selected checkpoint, independently of the table's configured checkpoint policy, and
-    /// remains fixed for this snapshot's lifetime.
-    pub fn checkpoint_type(&self) -> Option<SelectedCheckpointType> {
+    /// Returns a known checkpoint type without starting or waiting for discovery.
+    pub(crate) fn known_checkpoint_type(&self) -> Option<SelectedCheckpointType> {
+        #[cfg(feature = "declarative-plans")]
+        if let Some(info) = self.cached_checkpoint_info() {
+            return info.as_ref().map(|info| info.checkpoint_type());
+        }
         self.log_segment.checkpoint_type()
     }
 
@@ -696,7 +696,8 @@ impl Snapshot {
     ///
     /// The hint preserves whether this snapshot was built as latest, not whether it is still
     /// latest. Missing checkpoint hints and CRCs at this snapshot's version remain absent.
-    /// The selected checkpoint type is retained without refining an unresolved observation.
+    /// The hint includes the selected checkpoint type when already known; export does not
+    /// trigger checkpoint discovery.
     /// Rebuild it with [`SnapshotBuilder::with_snapshot_hint`] for the same table root.
     ///
     /// # Errors

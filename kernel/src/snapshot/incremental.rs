@@ -185,7 +185,6 @@ impl Snapshot {
             tracing::Span::current().record("version", existing_snapshot_version);
         }
 
-        let existing_log_segment = &existing_snapshot.log_segment;
         let skipped_new_checkpoints = checkpoint_handling == CheckpointHandling::Ignore;
 
         // Assemble the new segment as one fallible unit so a load failure emits exactly once, via
@@ -193,8 +192,7 @@ impl Snapshot {
         let segment_load_start = std::time::Instant::now();
         let (combined_log_segment, new_end_version) = match Self::build_new_segment(
             engine,
-            existing_log_segment,
-            existing_snapshot_version,
+            &existing_snapshot,
             log_tail,
             requested_version,
             checkpoint_handling,
@@ -346,12 +344,13 @@ impl Snapshot {
     /// propagated `Err` is a genuine listing/assembly failure.
     fn build_new_segment(
         engine: &dyn Engine,
-        existing_log_segment: &LogSegment,
-        existing_snapshot_version: Version,
+        existing_snapshot: &Snapshot,
         log_tail: Vec<ParsedLogPath>,
         requested_version: Option<Version>,
         checkpoint_handling: CheckpointHandling,
     ) -> Result<NewSegment> {
+        let existing_log_segment = existing_snapshot.log_segment();
+        let existing_snapshot_version = existing_snapshot.version();
         let log_root = existing_log_segment.log_root.clone();
         let storage = engine.storage_handler();
 
@@ -491,7 +490,10 @@ impl Snapshot {
         // below the existing snapshot version, trim existing commits and compaction files
         // already covered by it; otherwise keep all existing files.
         let new_checkpoint_version = new_log_segment.checkpoint_version();
-        let checkpoint_type = new_log_segment.checkpoint_type_for_update(existing_log_segment);
+        let checkpoint_type = new_log_segment.checkpoint_type_for_update(
+            existing_log_segment,
+            existing_snapshot.known_checkpoint_type(),
+        );
         let mut ascending_commit_files = Self::files_after_checkpoint(
             &existing_log_segment.listed.ascending_commit_files,
             new_checkpoint_version,

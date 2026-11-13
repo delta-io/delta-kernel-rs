@@ -24,6 +24,8 @@ use crate::{
 #[repr(C)]
 #[cfg(feature = "declarative-plans")]
 pub struct FfiCheckpointShape {
+    /// Whether the selected checkpoint follows the V1 or V2 specification.
+    pub checkpoint_type: FfiSelectedCheckpointType,
     /// Schema JSON for the files containing Add and Remove actions. For manifest checkpoints this
     /// is the sidecar schema; JSON leaves use the canonical action read schema.
     pub leaf_schema: KernelStringSlice,
@@ -113,6 +115,7 @@ fn visit(
     let schema = serde_json::to_string(info.leaf_schema())?;
     let checkpoint = CheckpointBacking::try_new(info.last_checkpoint())?;
     let value = FfiCheckpointShape {
+        checkpoint_type: info.checkpoint_type().into(),
         leaf_schema: kernel_string_slice!(schema),
         leaf_file_count: info.leaf_file_count(),
         size_in_bytes: info.size_in_bytes(),
@@ -145,7 +148,14 @@ mod tests {
     #[derive(Default)]
     struct Captured {
         visits: usize,
-        info: Option<(String, usize, u64, LastCheckpointHint, FfiCheckpointKind)>,
+        info: Option<(
+            String,
+            usize,
+            u64,
+            LastCheckpointHint,
+            FfiCheckpointKind,
+            FfiSelectedCheckpointType,
+        )>,
     }
 
     extern "C" fn capture(context: NullableCvoid, info: *const FfiCheckpointShape) {
@@ -158,6 +168,7 @@ mod tests {
                 info.size_in_bytes,
                 unsafe { info.last_checkpoint.try_to_kernel() }.unwrap(),
                 info.kind,
+                info.checkpoint_type,
             )
         });
     }
@@ -207,7 +218,8 @@ mod tests {
 
         // Then: copied schema and nested hint values remain usable after both handles are freed.
         if checkpoint && !invalid_size {
-            let (copied_schema, count, bytes, hint, kind) = captured.info.unwrap();
+            let (copied_schema, count, bytes, hint, kind, checkpoint_type) = captured.info.unwrap();
+            assert_eq!(checkpoint_type, FfiSelectedCheckpointType::V2);
             assert_eq!(
                 kind,
                 if manifest {

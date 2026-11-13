@@ -268,7 +268,7 @@ impl SnapshotHint {
             metadata: snapshot.table_configuration().metadata().clone(),
             last_checkpoint_hint: last_checkpoint_hint.cloned(),
             crc: snapshot.crc_at_version().cloned(),
-            checkpoint_type: snapshot.checkpoint_type(),
+            checkpoint_type: snapshot.known_checkpoint_type(),
             freshness: if snapshot.is_built_as_latest() {
                 SnapshotHintFreshness::Latest
             } else {

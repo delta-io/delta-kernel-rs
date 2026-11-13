@@ -11,7 +11,7 @@ use crate::actions::{
     CHECKPOINT_METADATA_FIELD, CHECKPOINT_METADATA_NAME, CHECKPOINT_NUM_ADD_FILES_TAG,
     CheckpointMetadata, SIDECAR_FIELD, SIDECAR_FILE_SCHEMA_TAG, SIDECAR_NAME, Sidecar,
 };
-use crate::checkpoint::{CHECKPOINT_ACTIONS_SCHEMA_V2, CheckpointShape};
+use crate::checkpoint::{CHECKPOINT_ACTIONS_SCHEMA_V2, CheckpointShape, SelectedCheckpointType};
 use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
 use crate::expressions::{ColumnName, Predicate, col};
 use crate::last_checkpoint_hint::{HintAction, LastCheckpointHint, LastCheckpointV2};
@@ -124,7 +124,16 @@ impl CheckpointShape {
             root_schema.as_ref(),
             size_in_bytes,
         )?);
+        // Only ambiguous classic names need discovery to establish their type.
+        let checkpoint_type = segment.checkpoint_type().unwrap_or_else(|| {
+            if metadata.is_some() {
+                SelectedCheckpointType::V2
+            } else {
+                SelectedCheckpointType::V1
+            }
+        });
         Ok(Some(Self {
+            checkpoint_type,
             leaf_checkpoint_schema,
             sidecars: files,
             size_in_bytes,
@@ -410,28 +419,32 @@ mod tests {
     }
 
     #[rstest]
-    #[case::no_checkpoint("app-txn-no-checkpoint", None, false, 0)]
+    #[case::no_checkpoint("app-txn-no-checkpoint", None, None, false, 0)]
     #[case::leaf_parquet(
         "with_checkpoint_no_last_checkpoint",
         Some(CheckpointKind::Inline),
+        Some(SelectedCheckpointType::V1),
         false,
         0
     )]
     #[case::manifest_parquet(
         "v2-checkpoints-parquet-with-sidecars",
         Some(CheckpointKind::Manifest),
+        Some(SelectedCheckpointType::V2),
         false,
         1
     )]
     #[case::manifest_json(
         "v2-checkpoints-json-with-sidecars",
         Some(CheckpointKind::Manifest),
+        Some(SelectedCheckpointType::V2),
         false,
         1
     )]
     #[case::leaf_json_inline(
         "v2-checkpoints-json-without-sidecars",
         Some(CheckpointKind::Inline),
+        Some(SelectedCheckpointType::V2),
         false,
         1
     )]
@@ -439,42 +452,49 @@ mod tests {
     #[case::leaf_parquet_inline(
         "v2-checkpoints-parquet-without-sidecars",
         Some(CheckpointKind::Inline),
+        Some(SelectedCheckpointType::V2),
         false,
         1
     )]
     #[case::leaf_multipart(
         "v1-multi-part-struct-stats-only",
         Some(CheckpointKind::Inline),
+        Some(SelectedCheckpointType::V1),
         true,
         0
     )]
     #[case::json_stats_classic(
         "v2-classic-checkpoint-parquet",
         Some(CheckpointKind::Manifest),
+        Some(SelectedCheckpointType::V2),
         false,
         1
     )]
     #[case::struct_stats_leaf(
         "v2-classic-parquet-struct-stats-only",
         Some(CheckpointKind::Inline),
+        Some(SelectedCheckpointType::V1),
         true,
         0
     )]
     #[case::struct_stats_json_manifest(
         "v2-json-sidecars-struct-stats-only",
         Some(CheckpointKind::Manifest),
+        Some(SelectedCheckpointType::V2),
         true,
         1
     )]
     #[case::struct_stats_parquet_manifest(
         "v2-parquet-sidecars-struct-stats-only",
         Some(CheckpointKind::Manifest),
+        Some(SelectedCheckpointType::V2),
         true,
         1
     )]
     fn resolve_checkpoint_and_stats(
         #[case] table: &str,
         #[case] expected_checkpoint: Option<CheckpointKind>,
+        #[case] expected_type: Option<SelectedCheckpointType>,
         #[case] expect_parsed: bool,
         #[case] unhinted_query_scans: usize,
         #[values(false, true)] omit_hint: bool,
@@ -484,6 +504,12 @@ mod tests {
         let mut segment = snapshot.log_segment().clone();
         if omit_hint {
             segment.last_checkpoint_metadata = None;
+            if let Some(checkpoint) = &mut segment.checkpoint
+                && segment.listed.checkpoint_parts[0].file_type
+                    == LogPathFileType::ClassicCheckpoint
+            {
+                checkpoint.checkpoint_type = None;
+            }
         }
         let exec = CountingExecutor::new();
 
@@ -494,6 +520,10 @@ mod tests {
         assert_eq!(
             resolved.as_ref().map(CheckpointShape::kind),
             expected_checkpoint
+        );
+        assert_eq!(
+            resolved.as_ref().map(CheckpointShape::checkpoint_type),
+            expected_type
         );
         if let Some(shape) = resolved {
             let schema = shape.leaf_schema();
@@ -635,6 +665,7 @@ mod tests {
 
         // Then: only the missing sidecar schema requires I/O.
         assert_eq!(shape.kind(), CheckpointKind::Manifest);
+        assert_eq!(shape.checkpoint_type(), SelectedCheckpointType::V2);
         assert_eq!(exec.query_scans.load(Ordering::Relaxed), 0);
         assert_eq!(exec.footer_reads.load(Ordering::Relaxed), 1);
         assert!(!shape.sidecars.is_empty());
@@ -704,7 +735,11 @@ mod tests {
         let batches = exec.batches_read.load(Ordering::Relaxed);
         assert!(batches > 1);
 
-        // When: the getter and another scan request the same checkpoint metadata.
+        // When: the getters and another scan request the same checkpoint metadata.
+        assert_eq!(
+            snapshot.reader().get_checkpoint_type(&counted).unwrap(),
+            Some(SelectedCheckpointType::V2)
+        );
         let info = resolve_checkpoint_info(&snapshot, &counted);
         scan.declarative_metadata_scan_plan(&counted).unwrap();
 
@@ -1361,7 +1396,11 @@ mod tests {
         );
         assert!(matches!(snapshot.cached_checkpoint_info(), Some(None)));
 
-        // Then: the getter shares the cached absence without requiring an executor.
+        // Then: the getters share the cached absence without requiring an executor.
+        assert_eq!(
+            snapshot.reader().get_checkpoint_type(&engine).unwrap(),
+            None
+        );
         assert!(
             snapshot
                 .reader()

@@ -1,7 +1,11 @@
-//! FFI interfaces for snapshot construction and retained state.
+//! FFI interfaces for snapshot construction and metadata access.
 
+#[cfg(feature = "declarative-plans")]
 use crate::checkpoint::FfiSelectedCheckpointType;
-use crate::{Handle, OptionalValue, SharedSnapshot};
+#[cfg(feature = "declarative-plans")]
+use crate::error::{ExternResult, IntoExternResult};
+#[cfg(feature = "declarative-plans")]
+use crate::{Handle, OptionalValue, SharedExternEngine, SharedSnapshot};
 
 mod builder;
 pub mod hint;
@@ -13,18 +17,27 @@ pub use builder::{
     snapshot_builder_with_max_catalog_version, snapshot_builder_with_version,
 };
 
-/// Returns the selected checkpoint specification without engine I/O.
-/// Returns absent if no checkpoint was selected, or `Unresolved` if its type was not retained
-/// during construction. The observation remains fixed for the snapshot's lifetime.
+/// Returns the selected checkpoint's V1 or V2 specification, or absent if none was selected.
+///
+/// Returns without I/O when the type is known. Otherwise, resolves checkpoint information through
+/// the engine's declarative executor and shares the result with checkpoint-info getters and scan
+/// planning. Failed discovery can be retried.
 ///
 /// # Safety
-/// `snapshot` must be valid and remain owned by the caller throughout the call.
+/// The snapshot and engine handles are borrowed and must remain valid for this call.
+/// During discovery, the executor must not request checkpoint information recursively on the
+/// same snapshot: that call would wait for initialization already in progress.
 #[unsafe(no_mangle)]
+#[cfg(feature = "declarative-plans")]
 pub unsafe extern "C" fn snapshot_checkpoint_type(
     snapshot: Handle<SharedSnapshot>,
-) -> OptionalValue<FfiSelectedCheckpointType> {
-    unsafe { snapshot.as_ref() }
-        .checkpoint_type()
-        .map(Into::into)
-        .into()
+    engine: Handle<SharedExternEngine>,
+) -> ExternResult<OptionalValue<FfiSelectedCheckpointType>> {
+    let snapshot = unsafe { snapshot.as_ref() };
+    let engine = unsafe { engine.as_ref() };
+    let result = snapshot
+        .reader()
+        .get_checkpoint_type(engine.engine().as_ref())
+        .map(|checkpoint_type| checkpoint_type.map(Into::into).into());
+    unsafe { result.into_extern_result(&engine) }
 }

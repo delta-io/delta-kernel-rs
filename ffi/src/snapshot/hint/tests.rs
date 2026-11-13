@@ -28,6 +28,7 @@ use crate::ffi_test_utils::{
     assert_extern_result_error_with_message, ok_or_panic,
 };
 use crate::log_path::FfiLogPath;
+#[cfg(feature = "declarative-plans")]
 use crate::snapshot::snapshot_checkpoint_type;
 use crate::{
     FfiFileStats, FfiIncrementalReplay, FfiLogSegmentStats, KernelI64Slice, KernelStringSlice,
@@ -352,16 +353,20 @@ fn exported_hint_copy_outlives_snapshot_and_preserves_state(
     #[case] expected_latest: bool,
     #[values(false, true)] with_crc: bool,
     #[values(
-        None,
-        Some(FfiSelectedCheckpointType::Unresolved),
-        Some(FfiSelectedCheckpointType::V1),
-        Some(FfiSelectedCheckpointType::V2)
+        (false, None),
+        (true, None),
+        (true, Some(FfiSelectedCheckpointType::V1)),
+        (true, Some(FfiSelectedCheckpointType::V2))
     )]
-    checkpoint_type: Option<FfiSelectedCheckpointType>,
+    checkpoint: (bool, Option<FfiSelectedCheckpointType>),
 ) {
     // Given a typed hint with an optional CRC and selected-checkpoint type.
+    let (with_checkpoint, checkpoint_type) = checkpoint;
+    #[cfg(feature = "declarative-plans")]
+    let expected_checkpoint_type =
+        with_checkpoint.then(|| checkpoint_type.unwrap_or(FfiSelectedCheckpointType::V1));
     let engine = test_engine();
-    let location = if checkpoint_type.is_some() {
+    let location = if with_checkpoint {
         "memory:///hinted-table/_delta_log/00000000000000000000.checkpoint.parquet"
     } else {
         "memory:///hinted-table/_delta_log/00000000000000000000.json"
@@ -380,12 +385,16 @@ fn exported_hint_copy_outlives_snapshot_and_preserves_state(
         ))
     };
     let snapshot = unsafe { ok_or_panic(snapshot_builder_build(builder)) };
+    #[cfg(feature = "declarative-plans")]
     assert_eq!(
         Option::<&FfiSelectedCheckpointType>::from(&unsafe {
-            snapshot_checkpoint_type(snapshot.shallow_copy())
+            ok_or_panic(snapshot_checkpoint_type(
+                snapshot.shallow_copy(),
+                engine.shallow_copy(),
+            ))
         })
         .copied(),
-        checkpoint_type,
+        expected_checkpoint_type,
     );
     // When the exported hint is copied and its source snapshot is freed.
     let expected_segment = unsafe { snapshot.as_ref() }.log_segment().clone();
@@ -399,12 +408,16 @@ fn exported_hint_copy_outlives_snapshot_and_preserves_state(
     let rebuilt = unsafe { ok_or_panic(snapshot_builder_build(builder)) };
     let rebuilt_ref = unsafe { rebuilt.as_ref() };
     // Then the owned copy preserves the checkpoint type, CRC, and freshness without I/O.
+    #[cfg(feature = "declarative-plans")]
     assert_eq!(
         Option::<&FfiSelectedCheckpointType>::from(&unsafe {
-            snapshot_checkpoint_type(rebuilt.shallow_copy())
+            ok_or_panic(snapshot_checkpoint_type(
+                rebuilt.shallow_copy(),
+                engine.shallow_copy(),
+            ))
         })
         .copied(),
-        checkpoint_type,
+        expected_checkpoint_type,
     );
     assert_eq!(rebuilt_ref.version(), 0);
     assert_eq!(rebuilt_ref.is_built_as_latest(), expected_latest);
@@ -420,10 +433,6 @@ fn exported_hint_copy_outlives_snapshot_and_preserves_state(
 #[case::no_checkpoint(
     &["memory:///hinted-table/_delta_log/00000000000000000000.json"],
     FfiSelectedCheckpointType::V1
-)]
-#[case::no_checkpoint_claimed_unresolved(
-    &["memory:///hinted-table/_delta_log/00000000000000000000.json"],
-    FfiSelectedCheckpointType::Unresolved
 )]
 #[case::multipart_paths_claimed_v2(
     &[
