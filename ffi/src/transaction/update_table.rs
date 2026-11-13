@@ -1,5 +1,6 @@
 //! Existing-table transaction FFI lifecycle.
 
+use delta_kernel::KernelError;
 use delta_kernel::engine_data::FilteredEngineData;
 
 use super::committed::commit_result_to_committed_handle;
@@ -19,6 +20,36 @@ pub struct ExclusiveUpdateTableTransaction;
 /// final returned handle.
 #[handle_descriptor(target=UpdateTableTransactionBuilder, mutable=true, sized=true)]
 pub struct ExclusiveUpdateTableTransactionBuilder;
+
+/// Sets the complete target schema before building an update-table transaction.
+///
+/// `overwrite = false` uses ordinary schema-evolution validation. `overwrite = true` requires
+/// the whole-table Overwrite operation and makes Kernel generate all removals during commit.
+/// Schema and operation compatibility are validated when building the transaction.
+///
+/// # Safety
+///
+/// Both handles must be valid. This call consumes `builder` on success and error and borrows
+/// `engine` for this call. A non-null `schema` must point to an aligned, initialized descriptor
+/// whose callback and referenced data remain valid for this call. Kernel copies the schema.
+/// Null returns an error. The caller must build or free the returned builder on success.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn update_table_txn_builder_with_schema(
+    builder: Handle<ExclusiveUpdateTableTransactionBuilder>,
+    schema: *const EngineSchema,
+    overwrite: bool,
+    engine: Handle<SharedExternEngine>,
+) -> ExternResult<Handle<ExclusiveUpdateTableTransactionBuilder>> {
+    let builder = unsafe { *builder.into_inner() };
+    let engine = unsafe { engine.as_ref() };
+    let result: KernelResult<Handle<ExclusiveUpdateTableTransactionBuilder>> = (|| {
+        let schema = unsafe { schema.as_ref() }
+            .ok_or_else(|| KernelError::generic("schema must not be null"))?;
+        let schema = Arc::new(decode_engine_schema(schema)?);
+        Ok(Box::new(builder.with_schema(schema, overwrite)).into())
+    })();
+    unsafe { result.into_extern_result(&engine) }
+}
 
 /// Creates a builder from a snapshot, known `operation`, connector `engine_info`, and
 /// `data_change`.
@@ -464,6 +495,8 @@ pub enum KernelUpdateTableOperation {
     Merge = 5,
     Optimize = 6,
     Reorg = 7,
+    /// Whole-table overwrite with Kernel-generated removals.
+    Overwrite = 8,
 }
 
 impl From<KernelUpdateTableOperation> for UpdateTableOperation {
@@ -477,6 +510,7 @@ impl From<KernelUpdateTableOperation> for UpdateTableOperation {
             KernelUpdateTableOperation::Merge => Self::Merge,
             KernelUpdateTableOperation::Optimize => Self::Optimize,
             KernelUpdateTableOperation::Reorg => Self::Reorg,
+            KernelUpdateTableOperation::Overwrite => Self::Overwrite,
         }
     }
 }

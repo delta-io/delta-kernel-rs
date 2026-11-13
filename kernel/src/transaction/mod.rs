@@ -70,6 +70,7 @@ mod manifest_commit_state;
 #[cfg(feature = "adaptive-metadata-in-dev")]
 mod root_manifest_file;
 pub(crate) mod schema_evolution;
+mod schema_overwrite;
 #[internal_api]
 #[cfg_attr(not(feature = "internal-api"), allow(unused_imports))]
 pub(crate) use schema_evolution::SchemaOperation;
@@ -1082,10 +1083,27 @@ impl<STATE, MODE: ExecutionMode> Transaction<STATE, MODE> {
         self.read_snapshot_opt.is_none()
     }
 
+    fn is_full_overwrite(&self) -> bool {
+        self.operation == CommitOperation::UpdateTable(UpdateTableOperation::Overwrite)
+    }
+
     fn validate_operation_compatibility(&self) -> KernelResult<()> {
         self.operation
             .validate()
             .map_err(KernelError::invalid_transaction_state)?;
+        if self.is_full_overwrite() {
+            require!(
+                self.data_change && !self.is_blind_append,
+                KernelError::invalid_transaction_state(
+                    "Overwrite requires data_change = true and cannot be a blind append"
+                )
+            );
+            #[cfg(feature = "adaptive-metadata-in-dev")]
+            require!(
+                self.manifest_write.is_none(),
+                KernelError::unsupported("Overwrite with manifest writes is not supported")
+            );
+        }
         match (self.is_create_table(), &self.operation) {
             (true, CommitOperation::CreateTable) => Ok(()),
             (false, CommitOperation::UpdateTable(UpdateTableOperation::AlterTable))
@@ -1269,6 +1287,11 @@ impl<STATE, MODE: ExecutionMode> Transaction<STATE, MODE> {
         );
         if let Some(operation_parameters) = self.operation_parameters.clone() {
             kernel_commit_info.set_operation_parameters(operation_parameters);
+        }
+        if self.is_full_overwrite() {
+            let mut parameters = self.operation_parameters.clone().unwrap_or_default();
+            parameters.insert("mode".into(), Some("Overwrite".into()));
+            kernel_commit_info.set_operation_parameters(parameters);
         }
         if let Some(operation_metrics) = self.operation_metrics.clone() {
             kernel_commit_info.set_operation_metrics(operation_metrics);

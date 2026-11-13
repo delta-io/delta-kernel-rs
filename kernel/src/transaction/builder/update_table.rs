@@ -8,7 +8,7 @@ use super::TransactionBuilder;
 use super::state::TransactionBuilderState;
 use crate::committer::Committer;
 use crate::expressions::ColumnName;
-use crate::schema::StructField;
+use crate::schema::{SchemaRef, StructField};
 use crate::snapshot::SnapshotRef;
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::{
@@ -17,6 +17,7 @@ use crate::table_features::{
 };
 use crate::transaction::domain_metadata::validate_unique_domains;
 use crate::transaction::schema_evolution::{SchemaOperation, evolve_table_config};
+use crate::transaction::schema_overwrite::apply_target_schema;
 use crate::transaction::{
     ExecutionMode, Imperative, Transaction, UpdateTable, UpdateTableOperation,
 };
@@ -44,6 +45,11 @@ use crate::{Engine, KernelError, KernelResult};
 /// them. For schema evolution, stage data-file changes on the returned [`Transaction`], using the
 /// evolved schema provided by [`Transaction::write_state`].
 ///
+/// For **whole-table overwrite**, select [`UpdateTableOperation::Overwrite`]. Kernel generates
+/// all removals during commit, so stage only incoming files. To replace the schema as well, use
+/// [`with_schema(schema, true)`](Self::with_schema). Building validates the target definition but
+/// does not enumerate existing data files. Empty incoming data still truncates the table.
+///
 /// Set `data_change` when constructing the builder: `true` for logical data changes, or `false`
 /// for metadata-only changes and data-preserving rewrites. `ALTER TABLE` requires `false`, while
 /// blind append requires `true`. [`build`](UpdateTableTransactionBuilder::build) rejects
@@ -59,6 +65,7 @@ pub struct UpdateTableBuilderState {
     snapshot: SnapshotRef,
     operation: UpdateTableOperation,
     schema_changes: Option<Vec<SchemaOperation>>,
+    target_schema: Option<(SchemaRef, bool)>,
     domain_metadata_removals: Vec<String>,
     is_blind_append: bool,
 }
@@ -89,6 +96,7 @@ impl TransactionBuilder<UpdateTable> {
                 snapshot,
                 operation,
                 schema_changes: None,
+                target_schema: None,
                 domain_metadata_removals: Vec::new(),
                 is_blind_append: false,
             },
@@ -98,6 +106,45 @@ impl TransactionBuilder<UpdateTable> {
 }
 
 impl<MODE: ExecutionMode> TransactionBuilder<UpdateTable, MODE> {
+    /// Sets the complete target schema, choosing evolution or whole-table schema overwrite.
+    ///
+    /// With `overwrite = false`, only the builder's supported evolution operations are allowed:
+    /// nullable field additions and relaxing field nullability. Existing fields retain their
+    /// names, order, types, and metadata. Added fields follow the existing fields in each struct.
+    ///
+    /// With `overwrite = true`, requires [`UpdateTableOperation::Overwrite`]. Existing-data
+    /// compatibility checks are replaced by target-definition validation. Kernel removes all
+    /// existing logical files during commit. Partitioning, table identity, properties, protocol,
+    /// and domain metadata are retained. The target must remain valid under that retained state.
+    ///
+    /// Repeated calls replace the previous target. Cannot be combined with incremental schema
+    /// setters. Validation occurs during [`build`](Self::build), before obtaining write state.
+    /// Schema overwrite rejects column mapping, clustering, row tracking, CDF, CHECK constraints,
+    /// generated columns, column defaults, and IcebergCompatV2/V3. The table's existing protocol
+    /// must support all target types.
+    ///
+    /// ```no_run
+    /// # use delta_kernel::{Engine, KernelResult, SnapshotRef};
+    /// # use delta_kernel::committer::FileSystemCommitter;
+    /// # use delta_kernel::schema::SchemaRef;
+    /// # use delta_kernel::transaction::UpdateTableOperation;
+    /// # fn replace_schema(snapshot: SnapshotRef, schema: SchemaRef, engine: &dyn Engine)
+    /// #     -> KernelResult<()> {
+    /// let txn = snapshot
+    ///     .update_table(UpdateTableOperation::Overwrite, "connector/1.0", true)
+    ///     .with_schema(schema, true)
+    ///     .build(engine, Box::new(FileSystemCommitter::new()))?;
+    /// let write_state = txn.write_state()?;
+    /// // Use this state to prepare incoming files before staging and committing them.
+    /// # let _ = write_state;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn with_schema(mut self, schema: SchemaRef, overwrite: bool) -> Self {
+        self.local_state.target_schema = Some((schema, overwrite));
+        self
+    }
+
     /// Marks the transaction as a blind append assertion.
     ///
     /// Blind appends add new files without depending on existing table state. Commit validation
@@ -233,8 +280,32 @@ impl<MODE: ExecutionMode> TransactionBuilder<UpdateTable, MODE> {
         operation
             .validate()
             .map_err(KernelError::invalid_transaction_state)?;
+        if self.local_state.target_schema.is_some() && self.local_state.schema_changes.is_some() {
+            return Err(KernelError::invalid_transaction_state(
+                "with_schema cannot be combined with incremental schema changes",
+            ));
+        }
+        if self
+            .local_state
+            .target_schema
+            .as_ref()
+            .is_some_and(|(_, overwrite)| *overwrite)
+            && operation != &UpdateTableOperation::Overwrite
+        {
+            return Err(KernelError::invalid_transaction_state(
+                "schema overwrite requires the whole-table Overwrite operation",
+            ));
+        }
+        if operation == &UpdateTableOperation::Overwrite
+            && (!self.common_state.data_change || self.local_state.is_blind_append)
+        {
+            return Err(KernelError::invalid_transaction_state(
+                "Overwrite requires data_change = true and cannot be a blind append",
+            ));
+        }
         if operation == &UpdateTableOperation::AlterTable {
-            if self.local_state.schema_changes.is_none() {
+            if self.local_state.schema_changes.is_none() && self.local_state.target_schema.is_none()
+            {
                 return Err(KernelError::invalid_transaction_state(
                     "ALTER TABLE requires at least one schema change",
                 ));
@@ -255,7 +326,10 @@ impl<MODE: ExecutionMode> TransactionBuilder<UpdateTable, MODE> {
                 "blind append requires data_change to be true",
             ));
         }
-        if self.local_state.is_blind_append && self.local_state.schema_changes.is_some() {
+        if self.local_state.is_blind_append
+            && (self.local_state.schema_changes.is_some()
+                || self.local_state.target_schema.is_some())
+        {
             return Err(KernelError::invalid_transaction_state(
                 "blind append cannot include schema changes",
             ));
@@ -300,6 +374,7 @@ fn try_new_update_table<MODE: ExecutionMode>(
         snapshot: read_snapshot,
         operation,
         schema_changes,
+        target_schema,
         domain_metadata_removals,
         is_blind_append,
     } = local_state;
@@ -344,11 +419,30 @@ fn try_new_update_table<MODE: ExecutionMode>(
         IcebergCompatValidationContext::Write,
     )?;
 
-    let should_emit_metadata = schema_changes.is_some();
+    let should_emit_metadata = schema_changes.is_some() || target_schema.is_some();
     let effective_table_config = match schema_changes {
         Some(changes) => apply_schema_changes(effective_table_config, changes)?,
         None => effective_table_config,
     };
+    let effective_table_config = match target_schema {
+        Some((schema, overwrite)) => {
+            validate_schema_change_supported(&effective_table_config)?;
+            apply_target_schema(&effective_table_config, schema, overwrite)?
+        }
+        None => effective_table_config,
+    };
+    if operation == UpdateTableOperation::Overwrite {
+        for feature in [
+            TableFeature::RowTracking,
+            TableFeature::AdaptiveMetadataPreview,
+        ] {
+            if effective_table_config.is_feature_supported(&feature) {
+                return Err(KernelError::unsupported(format!(
+                    "Whole-table overwrite is not supported on tables with {feature}"
+                )));
+            }
+        }
+    }
 
     Ok(Transaction {
         read_snapshot_opt: Some(read_snapshot),
@@ -371,6 +465,11 @@ fn apply_schema_changes(
     table_config: TableConfiguration,
     changes: Vec<SchemaOperation>,
 ) -> KernelResult<TableConfiguration> {
+    validate_schema_change_supported(&table_config)?;
+    evolve_table_config(&table_config, changes)
+}
+
+fn validate_schema_change_supported(table_config: &TableConfiguration) -> KernelResult<()> {
     let unsupported_iceberg_compat = [TableFeature::IcebergCompatV2, TableFeature::IcebergCompatV3]
         .into_iter()
         .find(|feature| table_config.is_feature_enabled(feature));
@@ -391,7 +490,7 @@ fn apply_schema_changes(
             "Schema changes are not yet supported on tables with generated columns",
         ));
     }
-    evolve_table_config(&table_config, changes)
+    Ok(())
 }
 
 #[cfg(test)]
