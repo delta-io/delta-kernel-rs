@@ -177,6 +177,9 @@ pub enum UnaryExpressionOp {
     /// URI_ENCODE_FILE_LOCATION('s3://bucket/a#1.parquet')  -- 's3://bucket/a%231.parquet'
     /// URI_ENCODE_FILE_LOCATION('data/a%20b.parquet')       -- 'data/a%2520b.parquet'
     /// ```
+    // TODO(#2423): non-ASCII is percent-encoded here, but Delta-Spark leaves it raw in `add.path`.
+    // This op must follow kernel's `add.path` encoding once it matches Delta-Spark's (see
+    // `HADOOP_URI_PATH_ENCODE_SET`).
     UriEncodeFileLocation,
 }
 
