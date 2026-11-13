@@ -425,6 +425,7 @@ impl Snapshot {
                 schema.clone(),
                 schema,
                 None,
+                false,
             )?;
             return Ok(result.actions);
         }

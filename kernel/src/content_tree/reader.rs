@@ -5,9 +5,10 @@
 //! entries become `Add` actions, its live `DataManifest` entries are expanded into the `Add`
 //! actions of the leaf manifests they reference (minus the leaf entries removed by the root entry's
 //! manifest deletion vector), and every other root entry is dropped. A leaf manifest may contain
-//! only `Data` entries and errors otherwise. Statistics, partition values, and tags are not yet
-//! carried across (see the per-field TODOs); the only entry data that flows into the action is the
-//! file location, size, row-tracking numbers, and deletion vector.
+//! only `Data` entries and errors otherwise. JSON statistics, partition values, and tags are not
+//! yet carried across (see the per-field TODOs); the entry data that flows into the action is the
+//! file location, size, row-tracking numbers, deletion vector, and, when the caller requests them,
+//! the Delta stats as `Add.stats_parsed` (see [`StatsRead`]).
 //! `modificationTime` and `dataChange` have no AMT source and are supplied by the caller via
 //! [`ReadContext`].
 
@@ -19,13 +20,14 @@ use std::{iter, slice};
 use bytes::Bytes;
 use url::Url;
 
-use crate::actions::{ADD_NAME, ADD_SCHEMA, CheckpointAction, LOG_ADD_SCHEMA};
+use crate::actions::{ADD_NAME, ADD_SCHEMA, CheckpointAction, STATS_PARSED};
 use crate::amt_path_util::{amt_location_to_add_path, amt_manifest_filemeta};
 use crate::cancellation::CancellationTokenRef;
 use crate::content_tree::dv_conversion::{
     ADD_DV_HELPER_SCHEMA, AddDeletionVectorColumns, add_deletion_vector_expression,
 };
 use crate::content_tree::mumbling::MumblingBitmap;
+use crate::content_tree::stats::{parsed_stats_expression, projected_stats_schema};
 use crate::content_tree::{
     AMT_FORMAT_VERSION, COLUMN_FILES, CONTENT_TYPE, ColumnFile, ContentTreeNodeEntry,
     DV_INFO_COLUMNS, DataContentType, DataFileFormat, FILE_FORMAT, FILE_SIZE_IN_BYTES,
@@ -45,9 +47,10 @@ use crate::schema::{
     ArrayType, ColumnNamesAndTypes, DataType, MapType, MetadataColumnSpec, SchemaRef, StructField,
     StructType, ToSchema as _,
 };
+use crate::table_features::column_mapping_mode;
 use crate::{
     Engine, ExpressionEvaluator, FileDataReadResultIterator, FileMeta, KernelError, KernelResult,
-    KernelResultIterator,
+    KernelResultIterator, Result,
 };
 
 /// Reads the `Add` actions for every live data file in an AMT checkpoint's content tree.
@@ -63,8 +66,8 @@ use crate::{
 ///   [`KernelError::Cancelled`].
 ///
 /// # Returns
-/// An iterator of `Add`-action batches (schema [`LOG_ADD_SCHEMA`]) whose selection vectors keep
-/// only live data files.
+/// An iterator of `Add`-action batches (schema [`ReadContext::add_schema`]) whose selection vectors
+/// keep only live data files.
 ///
 /// # Errors
 /// Returns an error if a manifest cannot be read or holds a malformed or unsupported entry. Leaf
@@ -75,10 +78,10 @@ pub(crate) fn read_add_actions_from_amt(
     checkpoint: &CheckpointAction,
     ctx: &ReadContext,
     cancellation_token: Option<&CancellationTokenRef>,
-) -> KernelResult<Box<dyn KernelResultIterator<FilteredEngineData>>> {
+) -> Result<Box<dyn KernelResultIterator<FilteredEngineData>>> {
     let table_root = &ctx.table_root;
     let root = checkpoint.root_filemeta(table_root)?;
-    let schemas = ManifestReadSchema::new();
+    let schemas = ManifestReadSchema::new(ctx.content_stats());
     let converter = make_root_entry_converter(engine, ctx)?;
     let mut root_actions = Vec::new();
     let mut leaves = LeafRefVisitor::new(table_root);
@@ -107,7 +110,8 @@ pub(crate) fn read_add_actions_from_amt(
 /// The context carries the table root that relative entry locations resolve against. The AMT entry
 /// also lacks the data file's modification time and a `dataChange` flag, so without this context
 /// the reader would have to invent both. Supplying them here keeps the function signature
-/// stable once a real source (e.g. the commit timestamp) is threaded through.
+/// stable once a real source (e.g. the commit timestamp) is threaded through. Which Delta stats the
+/// caller reads is likewise a property of the read, not of the entry.
 pub(crate) struct ReadContext {
     /// The table root URL relative manifest locations resolve against.
     pub(crate) table_root: Url,
@@ -115,6 +119,68 @@ pub(crate) struct ReadContext {
     pub(crate) modification_time: i64,
     /// Emitted as `Add.dataChange`.
     pub(crate) data_change: bool,
+    /// The Delta stats to emit as `Add.stats_parsed`, or `None` to emit no `stats_parsed`. Must
+    /// be built for the checkpoint being read.
+    pub(crate) stats: Option<StatsRead>,
+}
+
+impl ReadContext {
+    /// The schema of the `Add`-action batches the read produces:
+    /// [`crate::actions::LOG_ADD_SCHEMA`], with a trailing `add.stats_parsed` when [`Self::stats`]
+    /// is set.
+    pub(crate) fn add_schema(&self) -> SchemaRef {
+        Arc::new(StructType::new_unchecked([StructField::nullable(
+            ADD_NAME,
+            self.action_schema(),
+        )]))
+    }
+
+    /// The `add` struct of [`Self::add_schema`].
+    fn action_schema(&self) -> StructType {
+        let stats_parsed = self
+            .stats
+            .as_ref()
+            .map(|stats| StructField::nullable(STATS_PARSED, stats.schema.clone()));
+        StructType::new_unchecked(ADD_SCHEMA.fields().cloned().chain(stats_parsed))
+    }
+
+    /// The `content_stats` to read from the manifests, or `None` to read none.
+    fn content_stats(&self) -> Option<StructType> {
+        self.stats.as_ref()?.content_stats.clone()
+    }
+}
+
+/// The Delta stats a read emits as `Add.stats_parsed`, converted from each entry's `content_stats`
+/// and `recordCount`.
+pub(crate) struct StatsRead {
+    /// The physical Delta stats schema: the type of `Add.stats_parsed`.
+    schema: StructType,
+    /// The `content_stats` backing [`Self::schema`] (see [`projected_stats_schema`]), or `None`
+    /// when none of its stats are recorded in `content_stats`.
+    content_stats: Option<StructType>,
+    /// Evaluates an entry row to its `Add.stats_parsed`.
+    expression: Expression,
+}
+
+impl StatsRead {
+    /// Plans reading the physical Delta stats `schema` from `checkpoint`'s content tree.
+    ///
+    /// `content_stats` is keyed by Parquet field ID, which the Delta stats schema does not carry,
+    /// so the IDs come from the checkpoint's own metadata: the schema the manifests were written
+    /// with. Every column of `schema` must therefore be a column of the checkpoint's physical
+    /// schema, in the same order and with the same type.
+    pub(crate) fn try_new(checkpoint: &CheckpointAction, schema: StructType) -> Result<Self> {
+        let metadata = checkpoint.metadata();
+        let mode = column_mapping_mode(checkpoint.protocol(), &metadata.parse_table_properties());
+        let physical_schema = metadata.parse_schema()?.make_physical(mode)?;
+        let content_stats = projected_stats_schema(&physical_schema, &schema)?;
+        let expression = parsed_stats_expression(&physical_schema, &schema)?;
+        Ok(Self {
+            schema,
+            content_stats: (content_stats.num_fields() > 0).then_some(content_stats),
+            expression,
+        })
+    }
 }
 
 /// A leaf manifest referenced by a live root `DataManifest` entry: where to read it, and the
@@ -227,7 +293,7 @@ const LEAF_ROW_INDEX_COLUMN: &str = "_row_index";
 
 /// The schemas AMT root and leaf manifests are read with.
 struct ManifestReadSchema {
-    /// Root manifest read schema: [`ContentTreeNodeEntry::to_schema`].
+    /// Root manifest read schema: [`ContentTreeNodeEntry::to_schema_with_content_stats`].
     root: SchemaRef,
     /// Leaf manifest read schema: [`Self::root`] plus the [`LEAF_FILE_PATH_COLUMN`] and
     /// [`LEAF_ROW_INDEX_COLUMN`] metadata columns. Root entries need neither: they are never
@@ -236,9 +302,11 @@ struct ManifestReadSchema {
 }
 
 impl ManifestReadSchema {
-    /// Builds the manifest read schemas.
-    fn new() -> Self {
-        let entry_schema = Arc::new(ContentTreeNodeEntry::to_schema());
+    /// Builds the manifest read schemas, reading `content_stats` when given.
+    fn new(content_stats: Option<StructType>) -> Self {
+        let entry_schema = Arc::new(ContentTreeNodeEntry::to_schema_with_content_stats(
+            content_stats,
+        ));
         let metadata = [
             StructField::create_metadata_column(
                 LEAF_FILE_PATH_COLUMN,
@@ -302,14 +370,6 @@ static ADD_HELPER_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
     )
 });
 
-/// Leaf converter input schema: the entry schema plus [`FIRST_ROW_ID_HELPER`].
-static LEAF_INPUT_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
-    schema_with_helpers(
-        &ContentTreeNodeEntry::to_schema(),
-        &FIRST_ROW_ID_HELPER_SCHEMA,
-    )
-});
-
 /// Converts content-tree entry batches into `Add`-action batches. The entry->`Add` evaluator is
 /// built once, so one converter can be reused across every batch of a manifest.
 struct EntryConverter {
@@ -335,8 +395,8 @@ impl EntryConverter {
     ///
     /// # Returns
     /// A [`FilteredEngineData`] over an `Add`-action batch (one row per input entry, schema
-    /// [`crate::actions::LOG_ADD_SCHEMA`]), whose selection vector keeps only the entries that read
-    /// as live data files.
+    /// [`ReadContext::add_schema`]), whose selection vector keeps only the entries that read as
+    /// live data files.
     ///
     /// # Errors
     /// Returns an error if an entry carries an unknown content-type or tracking-status value, if a
@@ -384,7 +444,9 @@ fn make_root_entry_converter(
         engine,
         ctx,
         &AddFieldSources::root(),
-        Arc::new(ContentTreeNodeEntry::to_schema()),
+        Arc::new(ContentTreeNodeEntry::to_schema_with_content_stats(
+            ctx.content_stats(),
+        )),
     )
 }
 
@@ -436,9 +498,13 @@ impl LeafReadContext {
                 lit(parent_sequence_number),
             )),
         };
+        let input_schema = schema_with_helpers(
+            &ContentTreeNodeEntry::to_schema_with_content_stats(ctx.content_stats()),
+            &FIRST_ROW_ID_HELPER_SCHEMA,
+        );
         Ok(Self {
             next_first_row_id: require(parent.first_row_id, FIRST_ROW_ID)?,
-            converter: make_entry_converter(engine, ctx, &sources, LEAF_INPUT_SCHEMA.clone())?,
+            converter: make_entry_converter(engine, ctx, &sources, input_schema)?,
             manifest_dv,
             next_position: 0,
         })
@@ -708,7 +774,7 @@ fn make_entry_converter(
     sources: &AddFieldSources,
     input_schema: SchemaRef,
 ) -> KernelResult<EntryConverter> {
-    let output_type = DataType::from(LOG_ADD_SCHEMA.as_ref().clone());
+    let output_type = DataType::from(ctx.add_schema().as_ref().clone());
     let expr = build_entry_to_add_expression(ctx, sources)?;
     let evaluator = engine.evaluation_handler().new_expression_evaluator(
         schema_with_helpers(&input_schema, &ADD_HELPER_SCHEMA),
@@ -738,7 +804,7 @@ fn validate_and_assign_first_row_ids(
 }
 
 /// Builds the transform mapping a [`ContentTreeNodeEntry`] row to a `{ add: Add }` struct matching
-/// [`crate::actions::LOG_ADD_SCHEMA`].
+/// [`ReadContext::add_schema`].
 ///
 /// `ctx` supplies the fields the AMT entry cannot; `sources` supplies the row-tracking fields
 /// whose derivation differs between root and leaf entries.
@@ -757,9 +823,8 @@ fn build_entry_to_add_expression(
 
     // `struct_expr_from_schema` fills every unmatched (nullable) field with a typed null, so
     // `stats`, `tags`, and `clusteringProvider` fall through to null.
-    // TODO(#2866): carry statistics (including `numRecords` from `recordCount`) and tags across
-    // from the entry.
-    let add = struct_expr_from_schema(&ADD_SCHEMA, |name| {
+    // TODO(#2866): carry tags across from the entry.
+    let add = struct_expr_from_schema(&ctx.action_schema(), |name| {
         Some(match name {
             n if n == PATH_NAME => Expression::coalesce([
                 Expression::column([ENCODED_PATH_HELPER]),
@@ -775,12 +840,13 @@ fn build_entry_to_add_expression(
             n if n == DELETION_VECTOR_NAME => add_deletion_vector_expression(),
             n if n == BASE_ROW_ID_NAME => sources.base_row_id.clone(),
             n if n == DEFAULT_ROW_COMMIT_VERSION_NAME => sources.default_row_commit_version.clone(),
+            n if n == STATS_PARSED => ctx.stats.as_ref()?.expression.clone(),
             _ => return None,
         })
     })?;
 
-    // LOG_ADD_SCHEMA is a single `add` field wrapping the action struct.
-    struct_expr_from_schema(&LOG_ADD_SCHEMA, |name| match name {
+    // The schema is a single `add` field wrapping the action struct.
+    struct_expr_from_schema(&ctx.add_schema(), |name| match name {
         ADD_NAME => Some(add.clone()),
         _ => None,
     })
@@ -1194,13 +1260,17 @@ mod tests {
         KernelDeletionVector, StreamingDeletionVectorWriter,
     };
     use crate::actions::visitors::AddVisitor;
+    use crate::actions::{
+        LOG_ADD_SCHEMA, MAX_VALUES, MIN_VALUES, NULL_COUNT, NUM_RECORDS, TIGHT_BOUNDS,
+    };
     use crate::arrow::array::{AsArray as _, RecordBatch};
     use crate::arrow::compute::concat_batches;
     use crate::arrow::datatypes::Int64Type;
     use crate::content_tree::dv_conversion::extract_deletion_vector_content;
     use crate::content_tree::test_utils::{
         action_paths, added_data_entry, data_manifest_entry, entry_batch, mumbling_bitmap,
-        struct_batch, test_dv_info, with_field, write_manifest,
+        struct_batch, test_dv_info, with_field, write_manifest, write_manifest_with_stats,
+        x_full_stats, x_full_stats_value, x_upper_bound_stats,
     };
     use crate::content_tree::{DeletionVectorInfo, ManifestInfo};
     use crate::engine::DelegatingEngine;
@@ -1213,7 +1283,7 @@ mod tests {
     use crate::schema::StructType;
     use crate::unit_test_utils::adaptive_metadata_fixtures::checkpoint_action_with_root;
     use crate::unit_test_utils::{TestCancellationToken, assert_result_error_with_message};
-    use crate::{FileSize, ParquetFooter, ParquetHandler, PredicateRef};
+    use crate::{Error, FileSize, ParquetFooter, ParquetHandler, PredicateRef};
 
     /// The [`ReadContext`] the tests read against; [`expected_add_row`] reads its values back.
     /// Non-default values so a hard-coded `modificationTime` / `dataChange` would fail.
@@ -1222,6 +1292,7 @@ mod tests {
             table_root: table_root(),
             modification_time: 1234,
             data_change: false,
+            stats: None,
         }
     }
 
@@ -1437,15 +1508,18 @@ mod tests {
 
     // === Manifest read schemas ===
 
-    #[test]
-    fn manifest_read_schema_adds_leaf_metadata_columns() {
-        let entry_schema = Arc::new(ContentTreeNodeEntry::to_schema());
-        let schemas = ManifestReadSchema::new();
+    #[rstest]
+    fn manifest_read_schema_adds_content_stats_and_leaf_metadata_columns(
+        #[values(false, true)] with_stats: bool,
+    ) {
+        let content_stats = with_stats.then(x_upper_bound_stats);
+        let schemas = ManifestReadSchema::new(content_stats.clone());
 
-        assert_eq!(schemas.root, entry_schema);
+        let root = ContentTreeNodeEntry::to_schema_with_content_stats(content_stats);
+        assert_eq!(*schemas.root, root);
         let leaf: Vec<_> = schemas.leaf.fields().collect();
         let (entries, metadata) = leaf.split_at(leaf.len() - 2);
-        assert_eq!(entries, entry_schema.fields().collect::<Vec<_>>());
+        assert_eq!(entries, root.fields().collect::<Vec<_>>());
         let specs: Vec<_> = metadata
             .iter()
             .map(|f| f.get_metadata_column_spec())
@@ -1468,7 +1542,7 @@ mod tests {
             added_data_entry("b.parquet", 1, 1, 1, 0),
         ];
         let file = write_manifest(&engine, location.clone(), &entries);
-        let schemas = ManifestReadSchema::new();
+        let schemas = ManifestReadSchema::new(None);
 
         let batches: Vec<RecordBatch> = engine
             .parquet_handler()
@@ -1598,13 +1672,12 @@ mod tests {
     }
 
     /// Reads `checkpoint`'s content tree, returning each batch's selected `Add` rows.
-    fn read_tree(
-        engine: &dyn Engine,
-        checkpoint: &CheckpointAction,
-    ) -> KernelResult<Vec<RecordBatch>> {
-        read_add_actions_from_amt(engine, checkpoint, &read_ctx(), None)?
-            .map(|batch| filtered_to_batch(batch?).try_into_record_batch())
-            .collect()
+    fn read_tree(engine: &dyn Engine, checkpoint: &CheckpointAction) -> Result<Vec<RecordBatch>> {
+        Ok(
+            read_add_actions_from_amt(engine, checkpoint, &read_ctx(), None)?
+                .map(|batch| filtered_to_batch(batch?).try_into_record_batch())
+                .collect::<KernelResult<_>>()?,
+        )
     }
 
     /// The expected `Add` batch for `rows` of `(path, size, baseRowId, defaultRowCommitVersion)`.
@@ -1642,6 +1715,103 @@ mod tests {
             &[("a.parquet", 100, 0, 5), ("b.parquet", 200, 10, 5)],
         );
         assert_eq!(actual, vec![expected]);
+    }
+
+    /// Requested Delta stats are read from the root and leaf manifests' `content_stats`, keyed by
+    /// the field IDs of the checkpoint's own schema, and emitted as `Add.stats_parsed`.
+    #[rstest]
+    fn read_add_actions_from_amt_emits_requested_stats_parsed(
+        #[values(false, true)] with_stats: bool,
+    ) {
+        let engine = memory_engine();
+        // The manifests record `x_full_stats_value` for a LONG leaf with field ID 1, which the
+        // checkpoint's schema (see `checkpoint_action_with_root`) maps to its `id` column,
+        // physically `phys_id`.
+        let write = |path: &str, entries: &[ContentTreeNodeEntry]| {
+            let location = table_root().join(path).unwrap();
+            let stats = entries.iter().map(|_| x_full_stats_value()).collect();
+            write_manifest_with_stats(&engine, location, entries, &x_full_stats(), stats)
+        };
+        let leaf_path = "metadata/leaf.parquet";
+        let leaf_file = write(
+            leaf_path,
+            &[leaf_entry("a.parquet", 100, 10, None, None, None)],
+        );
+        let mut leaf = data_manifest_entry(leaf_path, leaf_file.size as i64, TrackingStatus::Added);
+        leaf.tracking = parent_tracking(Some(1), Some(5), Some(5), Some(1000));
+        let root = write(
+            ROOT_PATH,
+            &[added_data_entry("root.parquet", 50, 1, 600, 4), leaf],
+        );
+        let checkpoint = checkpoint_action_with_root(ROOT_PATH, root.size as i64, 1).unwrap();
+        let phys_id = StructType::new_unchecked([StructField::nullable("phys_id", DataType::LONG)]);
+        let stats_schema = StructType::new_unchecked([
+            StructField::nullable(NUM_RECORDS, DataType::LONG),
+            StructField::nullable(NULL_COUNT, phys_id.clone()),
+            StructField::nullable(MIN_VALUES, phys_id.clone()),
+            StructField::nullable(MAX_VALUES, phys_id),
+            StructField::nullable(TIGHT_BOUNDS, DataType::BOOLEAN),
+        ]);
+        let ctx = ReadContext {
+            stats: with_stats
+                .then(|| StatsRead::try_new(&checkpoint, stats_schema.clone()).unwrap()),
+            ..read_ctx()
+        };
+
+        let actual: Vec<_> = read_add_actions_from_amt(&engine, &checkpoint, &ctx, None)
+            .unwrap()
+            .map(|batch| {
+                filtered_to_batch(batch.unwrap())
+                    .try_into_record_batch()
+                    .unwrap()
+            })
+            .collect();
+
+        // `id` ranges over `[1, 9]` with no nulls in every file.
+        let expected_adds = |(path, size, base_row_id, version, num_records)| {
+            let row = expected_add_row(path, size, base_row_id, version);
+            let row = match (row.as_slice(), with_stats) {
+                ([Scalar::Struct(add)], true) => {
+                    let phys_id = |value: i64| {
+                        let field = StructField::nullable("phys_id", DataType::LONG);
+                        Scalar::Struct(
+                            StructData::try_new(vec![field], vec![value.into()]).unwrap(),
+                        )
+                    };
+                    let values = vec![
+                        Scalar::Long(num_records),
+                        phys_id(0),
+                        phys_id(1),
+                        phys_id(9),
+                        Scalar::Boolean(false),
+                    ];
+                    let stats =
+                        StructData::try_new(stats_schema.fields().cloned().collect(), values);
+                    let field = StructField::nullable(STATS_PARSED, stats_schema.clone());
+                    let add = StructData::try_new(
+                        add.fields().iter().cloned().chain([field]).collect(),
+                        add.values()
+                            .iter()
+                            .cloned()
+                            .chain([stats.unwrap().into()])
+                            .collect(),
+                    );
+                    vec![Scalar::Struct(add.unwrap())]
+                }
+                _ => row,
+            };
+            engine
+                .evaluation_handler()
+                .create_many(ctx.add_schema(), vec![row])
+                .unwrap()
+                .try_into_record_batch()
+                .unwrap()
+        };
+        let expected = vec![
+            expected_adds(("root.parquet", 50, 600, 4, 1)),
+            expected_adds(("a.parquet", 100, 1000, 5, 10)),
+        ];
+        assert_eq!(actual, expected);
     }
 
     /// A live entry's deletion vector reaches its `Add` as a descriptor for the writer's DV file:
@@ -2105,10 +2275,10 @@ mod tests {
         let results: Vec<_> = read_add_actions_from_amt(&engine, &checkpoint, &read_ctx(), None)
             .unwrap()
             .collect();
-        let first_error = results.iter().position(Result::is_err).unwrap();
+        let first_error = results.iter().position(KernelResult::is_err).unwrap();
         let after = &results[first_error + 1..];
         assert!(!after.is_empty());
-        assert!(after.iter().all(Result::is_err));
+        assert!(after.iter().all(KernelResult::is_err));
     }
 
     #[test]
@@ -2196,7 +2366,10 @@ mod tests {
         };
 
         let cancelled = Arc::new(TestCancellationToken::cancelled());
-        assert!(matches!(read(cancelled), Err(KernelError::Cancelled)));
+        assert!(matches!(
+            read(cancelled),
+            Err(Error::Kernel(KernelError::Cancelled))
+        ));
 
         let token = Arc::new(TestCancellationToken::default());
         let mut batches = read(token.clone()).unwrap();

@@ -1051,7 +1051,10 @@ impl LogSegment {
     /// by the actions it carries, and the commits and checkpoint files at or below that version are
     /// not read.
     ///
-    /// `table_root` resolves the action's manifest locations.
+    /// `table_root` resolves the action's manifest locations. When `stats_parsed` is set, the
+    /// checkpoint's adds carry `stats_schema` as `add.stats_parsed`, read from the content tree's
+    /// `content_stats`. Those are keyed by the checkpoint's schema, so the caller sets it only when
+    /// `stats_schema` is derived from that same schema; otherwise the tree's adds carry no stats.
     #[cfg(feature = "adaptive-metadata-in-dev")]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn read_actions_with_checkpoint_action(
@@ -1062,6 +1065,7 @@ impl LogSegment {
         commit_read_schema: SchemaRef,
         checkpoint_read_schema: SchemaRef,
         stats_schema: Option<&StructType>,
+        stats_parsed: bool,
     ) -> KernelResult<ActionsWithCheckpointInfo<Box<dyn KernelResultIterator<ActionsBatch>>>> {
         let version = Version::try_from(checkpoint.version())
             .ok()
@@ -1097,26 +1101,31 @@ impl LogSegment {
             &self.find_commit_cover_after(Some(version)),
             commit_read_schema,
         )?;
-        let stats_fallback =
-            needs_json_stats_fallback(&checkpoint_read_schema, stats_schema, false)
-                .then(|| StructField::nullable("stats", DataType::STRING));
-        let checkpoint_read_schema = augment_checkpoint_read_schema(
-            &checkpoint_read_schema,
-            stats_fallback.into_iter().collect(),
-            false,
-        )?;
+        let stats_parsed_schema = stats_schema.filter(|_| stats_parsed);
+        let has_stats_parsed = stats_parsed_schema.is_some();
+        let mut add_fields = Vec::new();
+        if needs_json_stats_fallback(&checkpoint_read_schema, stats_schema, has_stats_parsed) {
+            add_fields.push(StructField::nullable("stats", DataType::STRING));
+        }
+        if let Some(schema) = stats_parsed_schema {
+            add_fields.push(StructField::nullable("stats_parsed", schema.clone()));
+        }
+        let checkpoint_read_schema =
+            augment_checkpoint_read_schema(&checkpoint_read_schema, add_fields, false)?;
+        // TODO(#3421): propagate `Result` once replay's callers can return Delta errors.
         let checkpoint_actions = read_checkpoint_action(
             engine,
             checkpoint,
             &LogRoot::new(table_root.clone())?,
             checkpoint_read_schema.clone(),
-        )?;
+            stats_parsed_schema,
+        )
+        .map_err(KernelError::generic_err)?;
         Ok(ActionsWithCheckpointInfo {
             actions: Box::new(commits.chain(checkpoint_actions)),
-            // TODO(#2866): the content tree reader produces neither `stats_parsed` nor
-            // `partitionValues_parsed`, so replay parses the JSON stats.
+            // TODO(#3320): the content tree reader does not produce `partitionValues_parsed`.
             checkpoint_info: CheckpointReadInfo {
-                has_stats_parsed: false,
+                has_stats_parsed,
                 has_partition_values_parsed: false,
                 checkpoint_read_schema,
             },
