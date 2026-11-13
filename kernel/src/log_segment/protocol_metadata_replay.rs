@@ -128,21 +128,18 @@ impl LogSegment {
     /// Replays the log segment for the latest Protocol and Metadata, each with its version, in one
     /// pass over the segment.
     fn replay_for_pm(&self, engine: &dyn Engine) -> KernelResult<PmCandidate> {
-        #[cfg(feature = "declarative-plans")]
-        if let Some(executor) = engine.plan_executor() {
-            // P&M need no checkpoint action here: a commit that changes them also writes them as
-            // top-level actions.
-            let candidate = self.replay_for_pm_via_plan(
-                executor.as_ref(),
-                #[cfg(feature = "adaptive-metadata-in-dev")]
-                PmReplaySegment::WholeSegment,
-            )?;
-            // Only a sanity check: a pointer past its own commit means a malformed log.
-            #[cfg(feature = "adaptive-metadata-in-dev")]
-            candidate.ensure_pointer_at_or_before(self.end_version)?;
-            return Ok(candidate);
-        }
-        resolve_pm_batches(self.read_pm_batches(engine)?)
+        // P&M need no checkpoint action here: a commit that changes them also writes them as
+        // top-level actions.
+        let candidate = PmReader::for_engine(engine).replay(
+            engine,
+            self,
+            #[cfg(all(feature = "adaptive-metadata-in-dev", feature = "declarative-plans"))]
+            PmReplaySegment::WholeSegment,
+        )?;
+        // Only a sanity check: a pointer past its own commit means a malformed log.
+        #[cfg(all(feature = "adaptive-metadata-in-dev", feature = "declarative-plans"))]
+        candidate.ensure_pointer_at_or_before(self.end_version)?;
+        Ok(candidate)
     }
 
     /// [`Self::replay_for_pm`] for a segment that no CRC or checkpoint file bounds, whose P&M may
@@ -152,13 +149,12 @@ impl LogSegment {
         engine: &dyn Engine,
     ) -> KernelResult<PmCandidate> {
         #[cfg(all(feature = "adaptive-metadata-in-dev", feature = "declarative-plans"))]
-        if let (Some(plan_executor), Some(_)) = (
-            engine.plan_executor(),
+        if let (reader @ PmReader::Plan(_), Some(_)) = (
+            PmReader::for_engine(engine),
             self.newest_commit_after_checkpoint(),
         ) {
-            let executor = plan_executor.as_ref();
-            let newest_pm_candidate = self
-                .replay_for_pm_via_plan(executor, PmReplaySegment::NewestCommit)?
+            let newest_pm_candidate = reader
+                .replay(engine, self, PmReplaySegment::NewestCommit)?
                 .validated_pointer(self.end_version)?;
             if newest_pm_candidate.is_final_at(self.end_version)? {
                 return Ok(newest_pm_candidate);
@@ -170,7 +166,7 @@ impl LogSegment {
                 // resolution.
                 return Ok(newest_pm_candidate);
             };
-            let resolved = newest_pm_candidate.merge(self.replay_for_pm_via_plan(executor, older)?);
+            let resolved = newest_pm_candidate.merge(reader.replay(engine, self, older)?);
             // The pointed action must exist when replay lacks Protocol or Metadata without it, and
             // must match the pointer whenever it was read. The Protocol and Metadata checks keep
             // this consistent with imperative reads, which error when the pointed commit carries no
@@ -274,14 +270,14 @@ impl LogSegment {
             .build()
     }
 
-    /// Runs one declarative P&M plan and resolves the newest Protocol and Metadata it reads.
-    /// `segment` is as for [`Self::build_pm_plan`].
+    /// Runs the declarative P&M plan for `segment` (as for [`Self::build_pm_plan`]) and tags each
+    /// output batch with the versions its actions were found at.
     #[cfg(feature = "declarative-plans")]
-    fn replay_for_pm_via_plan(
+    fn execute_pm_plan(
         &self,
         executor: &dyn PlanExecutor,
         #[cfg(feature = "adaptive-metadata-in-dev")] segment: PmReplaySegment,
-    ) -> KernelResult<PmCandidate> {
+    ) -> KernelResult<impl KernelResultIterator<VersionedBatch> + use<>> {
         let plan = self.build_pm_plan(
             #[cfg(feature = "adaptive-metadata-in-dev")]
             segment,
@@ -316,7 +312,7 @@ impl LogSegment {
                     actions,
                 })
             });
-        resolve_pm_batches(batches)
+        Ok(batches)
     }
 
     /// Reads the P&M commit cover and checkpoint, tagging each batch with its version.
@@ -389,6 +385,71 @@ impl LogSegment {
             .ascending_commit_files
             .last()
             .filter(|commit| commit.version == self.end_version)
+    }
+}
+
+/// How P&M replay reads the log.
+enum PmReader {
+    /// Through the engine's declarative plan executor.
+    #[cfg(feature = "declarative-plans")]
+    Plan(Arc<dyn PlanExecutor>),
+    /// By reading the log files.
+    Files,
+}
+
+impl PmReader {
+    /// The reader `engine` supports: its plan executor when it has one.
+    #[cfg_attr(not(feature = "declarative-plans"), allow(unused_variables))]
+    fn for_engine(engine: &dyn Engine) -> Self {
+        #[cfg(feature = "declarative-plans")]
+        if let Some(executor) = engine.plan_executor() {
+            return Self::Plan(executor);
+        }
+        Self::Files
+    }
+
+    /// Replays `segment` of `log_segment` for its newest Protocol and Metadata.
+    fn replay(
+        &self,
+        engine: &dyn Engine,
+        log_segment: &LogSegment,
+        #[cfg(all(feature = "adaptive-metadata-in-dev", feature = "declarative-plans"))]
+        segment: PmReplaySegment,
+    ) -> KernelResult<PmCandidate> {
+        resolve_pm_batches(self.batches(
+            engine,
+            log_segment,
+            #[cfg(all(feature = "adaptive-metadata-in-dev", feature = "declarative-plans"))]
+            segment,
+        )?)
+    }
+
+    /// The batches replaying `segment` of `log_segment` folds, newest first.
+    fn batches(
+        &self,
+        engine: &dyn Engine,
+        log_segment: &LogSegment,
+        #[cfg(all(feature = "adaptive-metadata-in-dev", feature = "declarative-plans"))]
+        segment: PmReplaySegment,
+    ) -> KernelResult<Box<dyn KernelResultIterator<VersionedBatch>>> {
+        Ok(match self {
+            #[cfg(feature = "declarative-plans")]
+            Self::Plan(executor) => Box::new(log_segment.execute_pm_plan(
+                executor.as_ref(),
+                #[cfg(feature = "adaptive-metadata-in-dev")]
+                segment,
+            )?),
+            Self::Files => {
+                // File reads only cover the whole segment.
+                #[cfg(all(feature = "adaptive-metadata-in-dev", feature = "declarative-plans"))]
+                if segment != PmReplaySegment::WholeSegment {
+                    return Err(KernelError::internal_error(format!(
+                        "P&M file reads cannot replay {segment:?}"
+                    )));
+                }
+                Box::new(log_segment.read_pm_batches(engine)?)
+            }
+        })
     }
 }
 
