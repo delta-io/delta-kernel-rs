@@ -108,6 +108,35 @@ impl CrcDelta {
 
 /// Commit delta application for [`Crc`]. See the [module-level docs](self) for details.
 impl Crc {
+    /// Applies a delta to a copy without cloning fields that the advance replaces or discards.
+    ///
+    /// The source CRC remains unchanged, including its exact-version fields such as `all_files`.
+    pub(crate) fn apply_to_clone(&self, mut delta: CrcDelta, new_version: Version) -> Self {
+        Self {
+            version: self.version,
+            metadata: delta
+                .metadata
+                .take()
+                .unwrap_or_else(|| self.metadata.clone()),
+            protocol: delta
+                .protocol
+                .take()
+                .unwrap_or_else(|| self.protocol.clone()),
+            file_stats_state: self.file_stats_state.clone(),
+            set_transaction_state: self.set_transaction_state.clone(),
+            domain_metadata_state: self.domain_metadata_state.clone(),
+            in_commit_timestamp_opt: None,
+            all_files: None,
+            txn_id: None,
+            num_deleted_records_opt: None,
+            num_deletion_vectors_opt: None,
+            deleted_record_counts_histogram_opt: None,
+            #[cfg(feature = "adaptive-metadata-in-dev")]
+            last_manifest_commit_opt: None,
+        }
+        .apply(delta, new_version)
+    }
+
     /// Apply a commit delta and advance to `new_version`.
     ///
     /// - Protocol / metadata: replaced when present in the delta, kept otherwise.
@@ -395,6 +424,53 @@ mod tests {
         assert_eq!(crc.num_deleted_records_opt, None);
         assert_eq!(crc.num_deletion_vectors_opt, None);
         assert_eq!(crc.deleted_record_counts_histogram_opt, None);
+    }
+
+    #[rstest]
+    fn test_apply_to_clone_preserves_source_and_matches_owned_apply(
+        #[values(false, true)] complete: bool,
+        #[values(false, true)] replace_pm: bool,
+    ) {
+        let base = Crc {
+            metadata: Metadata::default().with_configuration_entry("base", "kept"),
+            domain_metadata_state: if complete {
+                DomainMetadataState::Complete(seed_dm_map())
+            } else {
+                DomainMetadataState::Partial(seed_dm_map())
+            },
+            set_transaction_state: if complete {
+                SetTransactionState::Complete(seed_txn_map())
+            } else {
+                SetTransactionState::Partial(seed_txn_map())
+            },
+            in_commit_timestamp_opt: Some(1000),
+            txn_id: Some("base-txn".into()),
+            all_files: Some(vec![Add::default()]),
+            num_deleted_records_opt: Some(0),
+            num_deletion_vectors_opt: Some(0),
+            deleted_record_counts_histogram_opt: Some(
+                DeletedRecordCountsHistogram::try_new(vec![1, 0, 0, 0, 0, 0, 0, 0, 0, 0]).unwrap(),
+            ),
+            #[cfg(feature = "adaptive-metadata-in-dev")]
+            last_manifest_commit_opt: Some(LastManifestCommit::new(0, 0).unwrap()),
+            ..base_crc()
+        };
+        let delta = CrcDelta {
+            metadata: replace_pm
+                .then(|| Metadata::default().with_configuration_entry("replacement", "new")),
+            protocol: replace_pm.then(test_protocol),
+            domain_metadata: HashMap::from([dm_entry("keep", "new"), dm_remove_entry("drop", "x")]),
+            set_transactions: HashMap::from([txn_entry("existing", 2, Some(2000))]),
+            in_commit_timestamp: Some(2000),
+            ..add_files_delta(1, 100)
+        };
+        let original = base.clone();
+        let expected = base.clone().apply(delta.clone(), 1);
+
+        let advanced = base.apply_to_clone(delta, 1);
+
+        assert_eq!(advanced, expected);
+        assert_eq!(base, original);
     }
 
     /// Applies multiple commit deltas sequentially.

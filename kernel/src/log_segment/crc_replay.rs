@@ -156,7 +156,7 @@ impl LogSegment {
             })
             .transpose()?;
         let delta = self.build_crc_delta_from_base(engine, base_crc.version, seed_histogram)?;
-        Ok(base_crc.clone().apply(delta, self.end_version))
+        Ok(base_crc.apply_to_clone(delta, self.end_version))
     }
 
     /// Build a Complete base [`Crc`] at `checkpoint_version` from this segment's checkpoint files.

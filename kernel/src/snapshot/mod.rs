@@ -624,9 +624,7 @@ impl Snapshot {
         // `crc_delta` covers what the transaction committed, so it advances an at-version CRC;
         // a stale base is carried forward unadvanced.
         let new_crc = match self.crc_at_version() {
-            Some(base) => Some(Arc::new(
-                base.as_ref().clone().apply(crc_delta, new_version),
-            )),
+            Some(base) => Some(Arc::new(base.apply_to_clone(crc_delta, new_version))),
             None => self.base_crc().cloned(),
         };
 
