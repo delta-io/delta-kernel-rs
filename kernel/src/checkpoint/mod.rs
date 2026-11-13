@@ -1,7 +1,7 @@
 //! Checkpoint format types and APIs for **customized** Delta checkpoint writes, where the
 //! caller drives the write themselves. The entry point is [`Snapshot::create_checkpoint_writer`].
-//! [`SelectedCheckpointType`] describes the checkpoint selected by
-//! [`Snapshot::checkpoint_type`](crate::Snapshot::checkpoint_type).
+//! [`SelectedCheckpointType`] describes the specification of a snapshot's selected checkpoint,
+//! independently of the checkpoint write policy.
 //!
 //! If you want an all-in-one API that handles writing the checkpoint, use
 //! [`Snapshot::checkpoint`] instead.

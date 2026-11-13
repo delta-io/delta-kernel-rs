@@ -860,9 +860,11 @@ watermark. It preserves staged paths independently of that watermark. The snapsh
 copy all retained values before the callback returns. It does not implement snapshot equivalence
 or establish freshness.
 
-`snapshot_checkpoint_type` returns the retained selected-checkpoint type without I/O. Absent means
-no selected checkpoint; `Unresolved` means the type is unknown. Typed hints preserve this claim and
-validate it against their paths.
+`snapshot_checkpoint_type(snapshot, engine)` returns the selected checkpoint's V1/V2 specification,
+or absent when no checkpoint was selected. Known types return without I/O; ambiguous types resolve
+through the same snapshot cache as `snapshot_checkpoint_info` and declarative scan planning. The
+checkpoint-info summary also includes this resolved type. Typed hints preserve already-known types
+without triggering discovery and validate supplied claims against their paths.
 
 Snapshot accessors (`ffi/src/lib.rs`) include no-I/O reads such as `version` and
 `snapshot_file_stats`, which returns `OptionalValue<FfiFileStats>` (scalar

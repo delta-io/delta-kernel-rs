@@ -1,9 +1,10 @@
 use super::LogSegment;
-use crate::actions::CHECKPOINT_METADATA_NAME;
+use crate::actions::{CHECKPOINT_METADATA_NAME, Protocol};
 use crate::checkpoint::{SelectedCheckpoint, SelectedCheckpointType};
 use crate::error::SnapshotHintError;
 use crate::last_checkpoint_hint::LastCheckpointHint;
 use crate::path::{LogPathFileType, ParsedLogPath};
+use crate::table_features::TableFeature;
 use crate::{KernelResult, Version};
 
 impl LogSegment {
@@ -14,7 +15,21 @@ impl LogSegment {
     }
 
     pub(crate) fn checkpoint_type(&self) -> Option<SelectedCheckpointType> {
-        self.checkpoint.map(|checkpoint| checkpoint.checkpoint_type)
+        self.checkpoint
+            .and_then(|checkpoint| checkpoint.checkpoint_type)
+    }
+
+    /// Refines an unresolved type using the protocol already loaded for this snapshot.
+    pub(crate) fn resolve_checkpoint_type(&mut self, protocol: &Protocol) {
+        let (Some(checkpoint), Some(path)) =
+            (&mut self.checkpoint, self.listed.checkpoint_parts.first())
+        else {
+            return;
+        };
+        if checkpoint.checkpoint_type.is_none() {
+            checkpoint.checkpoint_type =
+                infer_checkpoint_type(path, self.last_checkpoint_metadata.as_ref(), Some(protocol));
+        }
     }
 
     /// Returns the type for a combined segment, preserving a prior observation only when no new
@@ -22,24 +37,27 @@ impl LogSegment {
     pub(crate) fn checkpoint_type_for_update(
         &self,
         previous: &Self,
+        previous_type: Option<SelectedCheckpointType>,
     ) -> Option<SelectedCheckpointType> {
-        match self.checkpoint_type() {
-            None => previous.checkpoint_type(),
-            Some(SelectedCheckpointType::Unresolved)
-                if self
+        match self.checkpoint {
+            None => previous_type,
+            Some(SelectedCheckpoint {
+                checkpoint_type: None,
+                ..
+            }) if self
+                .listed
+                .checkpoint_parts
+                .iter()
+                .map(|part| &part.location.location)
+                .eq(previous
                     .listed
                     .checkpoint_parts
                     .iter()
-                    .map(|part| &part.location.location)
-                    .eq(previous
-                        .listed
-                        .checkpoint_parts
-                        .iter()
-                        .map(|part| &part.location.location)) =>
+                    .map(|part| &part.location.location)) =>
             {
-                previous.checkpoint_type()
+                previous_type
             }
-            checkpoint_type => checkpoint_type,
+            Some(checkpoint) => checkpoint.checkpoint_type,
         }
     }
 }
@@ -50,11 +68,11 @@ impl SelectedCheckpoint {
         hint: Option<&LastCheckpointHint>,
         retained_type: Option<SelectedCheckpointType>,
     ) -> KernelResult<Self> {
-        let inferred = infer_checkpoint_type(path, hint);
+        let inferred = infer_checkpoint_type(path, hint, None);
         let checkpoint_type = match (inferred, retained_type) {
-            (inferred, None | Some(SelectedCheckpointType::Unresolved)) => inferred,
-            (SelectedCheckpointType::Unresolved, Some(retained)) => retained,
-            (inferred, Some(retained)) if inferred == retained => inferred,
+            (inferred, None) => inferred,
+            (None, retained) => retained,
+            (Some(inferred), Some(retained)) if inferred == retained => Some(inferred),
             _ => return Err(SnapshotHintError::CheckpointTypeConflict.into()),
         };
         Ok(Self {
@@ -67,21 +85,22 @@ impl SelectedCheckpoint {
 fn infer_checkpoint_type(
     path: &ParsedLogPath,
     hint: Option<&LastCheckpointHint>,
-) -> SelectedCheckpointType {
+    protocol: Option<&Protocol>,
+) -> Option<SelectedCheckpointType> {
     match &path.file_type {
-        LogPathFileType::MultiPartCheckpoint { .. } => SelectedCheckpointType::V1,
-        LogPathFileType::UuidCheckpoint => SelectedCheckpointType::V2,
-        _ => {
-            let hint = hint.filter(|hint| hint.applies_to(std::slice::from_ref(path)));
-            if hint
+        LogPathFileType::MultiPartCheckpoint { .. } => Some(SelectedCheckpointType::V1),
+        LogPathFileType::UuidCheckpoint => Some(SelectedCheckpointType::V2),
+        // Classic-named V2 checkpoints require both protocol support and checkpointMetadata.
+        _ if protocol
+            .is_some_and(|protocol| !protocol.has_table_feature(&TableFeature::V2Checkpoint))
+            || hint
+                .filter(|hint| hint.applies_to(std::slice::from_ref(path)))
                 .and_then(|hint| hint.checkpoint_schema.as_ref())
-                .is_some_and(|schema| !schema.contains(CHECKPOINT_METADATA_NAME))
-            {
-                SelectedCheckpointType::V1
-            } else {
-                SelectedCheckpointType::Unresolved
-            }
+                .is_some_and(|schema| !schema.contains(CHECKPOINT_METADATA_NAME)) =>
+        {
+            Some(SelectedCheckpointType::V1)
         }
+        _ => None,
     }
 }
 
@@ -130,12 +149,7 @@ mod tests {
 
     #[rstest::rstest]
     #[case("00000000000000000000.json", None, None, None)]
-    #[case(
-        "00000000000000000000.checkpoint.parquet",
-        None,
-        None,
-        Some(SelectedCheckpointType::Unresolved)
-    )]
+    #[case("00000000000000000000.checkpoint.parquet", None, None, None)]
     #[case(
         "00000000000000000000.checkpoint.0000000001.0000000002.parquet",
         None,
@@ -158,7 +172,7 @@ mod tests {
         "00000000000000000000.checkpoint.parquet",
         Some(schema_ref! { nullable "checkpointMetadata": STRING }),
         None,
-        Some(SelectedCheckpointType::Unresolved)
+        None
     )]
     #[case::retained_v1(
         "00000000000000000000.checkpoint.parquet",
@@ -170,18 +184,6 @@ mod tests {
         "00000000000000000000.checkpoint.parquet",
         None,
         Some(SelectedCheckpointType::V2),
-        Some(SelectedCheckpointType::V2)
-    )]
-    #[case::unresolved_preserves_v1(
-        "00000000000000000000.checkpoint.0000000001.0000000002.parquet",
-        None,
-        Some(SelectedCheckpointType::Unresolved),
-        Some(SelectedCheckpointType::V1)
-    )]
-    #[case::unresolved_preserves_v2(
-        "00000000000000000000.checkpoint.550e8400-e29b-41d4-a716-446655440000.parquet",
-        None,
-        Some(SelectedCheckpointType::Unresolved),
         Some(SelectedCheckpointType::V2)
     )]
     fn checkpoint_type_from_constructor_evidence(
@@ -208,22 +210,22 @@ mod tests {
     }
 
     #[rstest::rstest]
-    #[case::same_unresolved(false, SelectedCheckpointType::Unresolved, SelectedCheckpointType::V2)]
-    #[case::same_resolved(false, SelectedCheckpointType::V1, SelectedCheckpointType::V1)]
-    #[case::different_checkpoint(
-        true,
-        SelectedCheckpointType::Unresolved,
-        SelectedCheckpointType::Unresolved
+    #[case::same_unknown(false, None, Some(SelectedCheckpointType::V2))]
+    #[case::same_resolved(
+        false,
+        Some(SelectedCheckpointType::V1),
+        Some(SelectedCheckpointType::V1)
     )]
+    #[case::different_checkpoint(true, None, None)]
     fn derived_segment_retains_checkpoint_type_without_mutating_source(
         #[case] different_checkpoint: bool,
-        #[case] new_type: SelectedCheckpointType,
-        #[case] expected: SelectedCheckpointType,
+        #[case] new_type: Option<SelectedCheckpointType>,
+        #[case] expected: Option<SelectedCheckpointType>,
     ) {
         // Given a resolved source checkpoint and a derived segment's own type claim.
         let filename = "00000000000000000000.checkpoint.parquet";
         let source = segment(filename, None, Some(SelectedCheckpointType::V2)).unwrap();
-        let mut derived = segment(filename, None, Some(new_type)).unwrap();
+        let mut derived = segment(filename, None, new_type).unwrap();
         if different_checkpoint {
             derived.listed.checkpoint_parts[0].location.location = url::Url::parse(
                 "memory:///other/_delta_log/00000000000000000000.checkpoint.parquet",
@@ -231,7 +233,7 @@ mod tests {
             .unwrap();
         }
         // When a combined segment is constructed with the observation selected for the update.
-        let checkpoint_type = derived.checkpoint_type_for_update(&source);
+        let checkpoint_type = derived.checkpoint_type_for_update(&source, source.checkpoint_type());
         let combined = LogSegment::try_new(
             derived.listed,
             derived.log_root,
@@ -241,12 +243,11 @@ mod tests {
         )
         .unwrap();
         // Then only an unresolved claim for the same checkpoint inherits the source's type.
-        assert_eq!(combined.checkpoint_type(), Some(expected));
+        assert_eq!(combined.checkpoint_type(), expected);
         assert_eq!(source.checkpoint_type(), Some(SelectedCheckpointType::V2));
     }
 
     #[rstest::rstest]
-    #[case("00000000000000000000.json", SelectedCheckpointType::Unresolved)]
     #[case("00000000000000000000.json", SelectedCheckpointType::V1)]
     #[case("00000000000000000000.json", SelectedCheckpointType::V2)]
     #[case(

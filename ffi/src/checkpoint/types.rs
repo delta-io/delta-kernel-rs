@@ -8,18 +8,15 @@ use delta_kernel::checkpoint::SelectedCheckpointType;
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[repr(C)]
 pub enum FfiSelectedCheckpointType {
-    /// A checkpoint was selected, but its specification was not established.
-    Unresolved,
     /// The checkpoint follows the V1 specification.
-    V1,
+    V1 = 1,
     /// The checkpoint follows the V2 specification, with or without sidecars.
-    V2,
+    V2 = 2,
 }
 
 impl From<SelectedCheckpointType> for FfiSelectedCheckpointType {
     fn from(value: SelectedCheckpointType) -> Self {
         match value {
-            SelectedCheckpointType::Unresolved => Self::Unresolved,
             SelectedCheckpointType::V1 => Self::V1,
             SelectedCheckpointType::V2 => Self::V2,
         }
@@ -29,7 +26,6 @@ impl From<SelectedCheckpointType> for FfiSelectedCheckpointType {
 impl From<FfiSelectedCheckpointType> for SelectedCheckpointType {
     fn from(value: FfiSelectedCheckpointType) -> Self {
         match value {
-            FfiSelectedCheckpointType::Unresolved => Self::Unresolved,
             FfiSelectedCheckpointType::V1 => Self::V1,
             FfiSelectedCheckpointType::V2 => Self::V2,
         }
