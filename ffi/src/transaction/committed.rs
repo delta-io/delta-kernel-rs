@@ -1,10 +1,11 @@
 use std::sync::Arc;
 
+use delta_kernel::Result;
 use delta_kernel::transaction::CommitResult;
 
 use super::ExclusiveCommittedTransaction;
 use crate::handle::Handle;
-use crate::{KernelResult, OptionalValue, SharedSnapshot};
+use crate::{OptionalValue, SharedSnapshot};
 
 /// Converts a [`CommitResult`] to an owned FFI handle, or returns an error when the commit was not
 /// successful.
@@ -13,17 +14,19 @@ use crate::{KernelResult, OptionalValue, SharedSnapshot};
 /// [`free_committed_transaction`].
 // TODO(#3504): Preserve retryable and conflicted transaction state across the FFI boundary.
 pub(super) fn commit_result_to_committed_handle<STATE>(
-    result: KernelResult<CommitResult<STATE>>,
-) -> KernelResult<Handle<ExclusiveCommittedTransaction>> {
+    result: Result<CommitResult<STATE>>,
+) -> Result<Handle<ExclusiveCommittedTransaction>> {
     match result? {
         CommitResult::Committed(committed) => Ok(Box::new(committed).into()),
         CommitResult::Retryable(_) => Err(delta_kernel::KernelError::unsupported(
             "commit failed: retryable transaction not supported in FFI (yet)",
-        )),
+        )
+        .into()),
         CommitResult::Conflicted(conflicted) => Err(delta_kernel::KernelError::Generic(format!(
             "commit conflict at version {}",
             conflicted.conflict_version()
-        ))),
+        ))
+        .into()),
     }
 }
 

@@ -137,7 +137,7 @@ mod tests {
     use crate::path::LogRoot;
     use crate::schema::schema_ref;
     use crate::transaction::UpdateTableOperation;
-    use crate::{EngineData, create_row};
+    use crate::{EngineData, Error, KernelError, create_row};
 
     #[derive(Clone, Copy)]
     enum CommitStyle {
@@ -207,7 +207,7 @@ mod tests {
             .unwrap_err();
         assert!(matches!(
             err,
-            crate::KernelError::Generic(e) if e.contains("This table is catalog-managed and requires a catalog committer.")
+            Error::Kernel(KernelError::Generic(e)) if e.contains("This table is catalog-managed and requires a catalog committer.")
         ));
     }
 

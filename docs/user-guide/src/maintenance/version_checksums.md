@@ -41,7 +41,7 @@ writers must not overwrite existing checksum files.
 
 ## ChecksumWriteResult
 
-The return type is `KernelResult<(ChecksumWriteResult, SnapshotRef)>`:
+The return type is `delta_kernel::Result<(ChecksumWriteResult, SnapshotRef)>`:
 
 | Variant | Meaning |
 |---------|---------|

@@ -155,7 +155,7 @@ mod tests {
             }), false),
         )]
         checkpoint: (CheckpointSpec, bool),
-    ) -> KernelResult<()> {
+    ) -> crate::Result<()> {
         // Given: a checkpoint containing file actions, tombstones, and non-file actions.
         let (spec, use_sidecar_hint) = checkpoint;
         let mut features = FeatureSet::new().domain_metadata();
@@ -295,7 +295,9 @@ mod tests {
             names.iter().copied().chain([VERSION]).collect::<Vec<_>>(),
         );
         let actual = execute_plan(&engine, plan)?;
-        let expected = pretty_format_batches(&expected)?.to_string();
+        let expected = pretty_format_batches(&expected)
+            .map_err(KernelError::from)?
+            .to_string();
         let mut expected = expected.trim().lines().collect::<Vec<_>>();
         ::test_utils::sort_lines!(expected);
         assert_batches_sorted_eq!(expected, &actual);

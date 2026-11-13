@@ -15,7 +15,7 @@ use crate::path::{DELTA_LOG_DIR_WITH_SLASH, ParsedLogPath};
 use crate::snapshot::{IncrementalReplay, SnapshotRef};
 use crate::table_configuration::TableConfiguration;
 use crate::utils::{require, try_parse_uri};
-use crate::{KernelError, KernelResult, Snapshot, Version};
+use crate::{KernelError, KernelResult, Result, Snapshot, Version};
 
 /// The freshness claim for the version carried by a [`SnapshotHint`].
 ///
@@ -263,28 +263,31 @@ impl SnapshotHint {
         log_tail: Vec<LogPath>,
         max_catalog_version: Option<Version>,
         incremental_replay: IncrementalReplay,
-    ) -> KernelResult<SnapshotRef> {
-        require!(log_tail.is_empty(), SnapshotHintError::LogTail.into());
+    ) -> Result<SnapshotRef> {
+        require!(
+            log_tail.is_empty(),
+            KernelError::from(SnapshotHintError::LogTail).into()
+        );
         require!(
             incremental_replay.is_disabled(),
-            SnapshotHintError::IncrementalReplay.into()
+            KernelError::from(SnapshotHintError::IncrementalReplay).into()
         );
         if let Some(version) = requested_version {
             require!(
                 version == self.version,
-                SnapshotHintError::VersionMismatch {
+                KernelError::from(SnapshotHintError::VersionMismatch {
                     requested: version,
                     hint: self.version,
-                }
+                })
                 .into()
             );
         } else if let Some(max_catalog_version) = max_catalog_version {
             require!(
                 max_catalog_version == self.version,
-                SnapshotHintError::MaxCatalogVersionMismatch {
+                KernelError::from(SnapshotHintError::MaxCatalogVersionMismatch {
                     max_catalog_version,
                     hint: self.version,
-                }
+                })
                 .into()
             );
         }
@@ -295,7 +298,9 @@ impl SnapshotHint {
             )
         })?;
         let table_url = try_parse_uri(table_root)?;
-        let log_root = table_url.join(DELTA_LOG_DIR_WITH_SLASH)?;
+        let log_root = table_url
+            .join(DELTA_LOG_DIR_WITH_SLASH)
+            .map_err(KernelError::from)?;
         let SnapshotHint {
             version,
             log_segment_files,
@@ -322,7 +327,7 @@ impl SnapshotHint {
 
         require!(
             log_segment_files.ascending_compaction_files.is_empty(),
-            SnapshotHintError::LogCompaction.into()
+            KernelError::from(SnapshotHintError::LogCompaction).into()
         );
 
         // Construction validates every path against one root, and grouping preserves locations.
@@ -337,7 +342,8 @@ impl SnapshotHint {
         )
         .map_err(|source| SnapshotHintError::LogSegment {
             source: Box::new(source),
-        })?;
+        })
+        .map_err(KernelError::from)?;
         // Regular construction derives this field from storage listing. A hint supplies it, so
         // only the hint path needs to validate it explicitly.
         require!(
@@ -345,7 +351,7 @@ impl SnapshotHint {
                 .listed
                 .max_published_version
                 .is_none_or(|published_version| published_version <= version),
-            SnapshotHintError::MaxPublishedVersion { hint: version }.into()
+            KernelError::from(SnapshotHintError::MaxPublishedVersion { hint: version }).into()
         );
         require!(
             log_segment.checkpoint_version.is_some()
@@ -354,26 +360,26 @@ impl SnapshotHint {
                     .ascending_commit_files
                     .first()
                     .is_some_and(|path| path.version == 0),
-            SnapshotHintError::MissingHistoryAnchor.into()
+            KernelError::from(SnapshotHintError::MissingHistoryAnchor).into()
         );
         let table_configuration =
             TableConfiguration::try_new(metadata, protocol, table_url, version)?;
         if let Some(crc) = crc.as_ref() {
             require!(
                 crc.version == version,
-                SnapshotHintError::CrcVersion {
+                KernelError::from(SnapshotHintError::CrcVersion {
                     crc: crc.version,
                     hint: version,
-                }
+                })
                 .into()
             );
             require!(
                 crc.protocol == *table_configuration.protocol(),
-                SnapshotHintError::CrcProtocol.into()
+                KernelError::from(SnapshotHintError::CrcProtocol).into()
             );
             require!(
                 crc.metadata == *table_configuration.metadata(),
-                SnapshotHintError::CrcMetadata.into()
+                KernelError::from(SnapshotHintError::CrcMetadata).into()
             );
         }
 

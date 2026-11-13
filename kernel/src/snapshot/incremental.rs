@@ -16,7 +16,7 @@ use crate::metrics::{
 };
 use crate::path::ParsedLogPath;
 use crate::table_configuration::TableConfiguration;
-use crate::{Engine, KernelError, KernelResult, Version};
+use crate::{Engine, KernelError, Result, Version};
 
 /// The assembled outcome of the listing phase of an incremental update. Listing/assembly
 /// failures surface as `Err` from [`Snapshot::build_new_segment`], not a variant here.
@@ -116,7 +116,7 @@ impl Snapshot {
         incremental_replay: IncrementalReplay,
         checkpoint_handling: CheckpointHandling,
         built_as_latest: bool,
-    ) -> KernelResult<Arc<Self>> {
+    ) -> Result<Arc<Self>> {
         let requested_version = target_version.into();
         let mut current_segment = None;
         let result = Self::try_new_from_impl(
@@ -157,7 +157,7 @@ impl Snapshot {
         checkpoint_handling: CheckpointHandling,
         built_as_latest: bool,
         current_segment: &mut Option<LogSegment>,
-    ) -> KernelResult<Arc<Self>> {
+    ) -> Result<Arc<Self>> {
         let existing_snapshot_version = existing_snapshot.version();
         if let Some(requested_version) = requested_version {
             tracing::Span::current().record("version", requested_version);
@@ -178,7 +178,8 @@ impl Snapshot {
                 return Err(KernelError::Generic(format!(
                     "Requested snapshot version {requested_version} is older than snapshot \
                     hint version {existing_snapshot_version}"
-                )));
+                ))
+                .into());
             }
         } else {
             tracing::Span::current().record("version", existing_snapshot_version);
@@ -296,6 +297,8 @@ impl Snapshot {
                 let newer_base = base_crc
                     .as_ref()
                     .filter(|c| c.version > existing_snapshot_version);
+                // TODO(#3421): Classify missing replay-file failures as Delta errors using the
+                // incremental replay context, preserving the original error sources.
                 combined_log_segment
                     .segment_after_version(existing_snapshot_version)
                     .read_protocol_metadata_opt(engine, newer_base)
@@ -348,7 +351,7 @@ impl Snapshot {
         log_tail: Vec<ParsedLogPath>,
         requested_version: Option<Version>,
         checkpoint_handling: CheckpointHandling,
-    ) -> KernelResult<NewSegment> {
+    ) -> Result<NewSegment> {
         let log_root = existing_log_segment.log_root.clone();
         let storage = engine.storage_handler();
 
@@ -388,7 +391,7 @@ impl Snapshot {
                 // Case C.1: caller requested a specific version (necessarily >
                 // existing_snapshot_version since cases A and B were handled above), but
                 // no such commit exists in the log.
-                Some(_) => Err(KernelError::MissingVersion(existing_snapshot_version + 1)),
+                Some(_) => Err(KernelError::MissingVersion(existing_snapshot_version + 1).into()),
                 // Case C.2: no new commits and no explicit target; latest is existing.
                 // TODO(#3845): Define publication refresh when cached versions are not listed.
                 None => Ok(NewSegment::Unchanged),
@@ -406,15 +409,20 @@ impl Snapshot {
         // hint. If the new segment has a checkpoint, we will return it as is. Otherwise, we
         // will preserve last_checkpoint_metadata when merging the new log segment with the
         // old one.
-        let mut new_log_segment =
-            LogSegment::try_new(new_listed_files, log_root.clone(), requested_version, None)?;
+        let mut new_log_segment = LogSegment::try_new_for_snapshot(
+            new_listed_files,
+            log_root.clone(),
+            requested_version,
+            None,
+        )?;
 
         let new_end_version = new_log_segment.end_version;
         if new_end_version < existing_snapshot_version {
             return Err(KernelError::invalid_log_segment(format!(
                 "Unexpected state: the newest version in the log {new_end_version} is \
                  older than the existing snapshot version {existing_snapshot_version}"
-            )));
+            ))
+            .into());
         }
         if let Some(new_checkpoint_version) = new_log_segment.checkpoint_version
             && new_checkpoint_version > existing_snapshot_version
@@ -511,7 +519,7 @@ impl Snapshot {
                 existing_log_segment.last_checkpoint_metadata.clone(),
             )
         };
-        let combined_log_segment = LogSegment::try_new(
+        let combined_log_segment = LogSegment::try_new_for_snapshot(
             LogSegmentFiles {
                 ascending_commit_files,
                 ascending_compaction_files,
@@ -638,7 +646,7 @@ mod tests {
     use crate::unit_test_utils::{
         CapturingReporter, install_thread_local_metrics_reporter, string_array_to_engine_data,
     };
-    use crate::{Engine, Error, KernelResult, Result};
+    use crate::{DeltaErrorCondition, Engine, Error, KernelResult, Result};
 
     #[cfg(feature = "declarative-plans")]
     #[rstest]
@@ -986,7 +994,7 @@ mod tests {
         );
         assert!(matches!(
             older_version,
-            Err(KernelError::Generic(msg)) if msg.contains("older than snapshot hint version")
+            Err(Error::Kernel(KernelError::Generic(msg))) if msg.contains("older than snapshot hint version")
         ));
 
         Ok(())
@@ -1334,10 +1342,20 @@ mod tests {
             .build(ctx.engine.as_ref());
 
         // ===== THEN =====
-        let error = updated.expect_err("the missing commit must not be hidden by the checkpoint");
+        let Error::Delta(error) = updated.unwrap_err() else {
+            panic!("expected Delta error")
+        };
+        assert_eq!(
+            error.condition(),
+            DeltaErrorCondition::DeltaVersionsNotContiguous
+        );
+        let source = std::error::Error::source(&error)
+            .unwrap()
+            .downcast_ref::<KernelError>()
+            .unwrap();
         assert!(matches!(
-            error,
-            Error::Kernel(KernelError::MissingVersion(3))
+            source.without_backtrace(),
+            KernelError::MissingVersion(3)
         ));
 
         Ok(())

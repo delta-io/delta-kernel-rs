@@ -37,7 +37,7 @@ use crate::schema::derive_macro_utils::ToDataType;
 use crate::schema::{DataType, Schema, schema_has_invariants};
 use crate::table_properties::TableProperties;
 use crate::utils::require;
-use crate::{KernelError, KernelResult};
+use crate::{DeltaError, KernelError, KernelResult, Result};
 
 mod column_mapping;
 #[cfg(feature = "geo-type-in-dev")]
@@ -297,7 +297,7 @@ pub(crate) enum FeatureRequirement {
     /// Feature must NOT be enabled (may be supported but property must not activate it)
     NotEnabled(TableFeature),
     /// Custom validation logic run against the protocol and table properties.
-    Custom(fn(&Protocol, &TableProperties) -> KernelResult<()>),
+    Custom(fn(&Protocol, &TableProperties) -> Result<()>),
 }
 
 /// Minimum protocol versions for legacy (pre-feature-list) inference.
@@ -569,7 +569,10 @@ static ICEBERG_NATIVE_V4_PREVIEW_INFO: FeatureInfo = FeatureInfo {
         FeatureRequirement::NotEnabled(TableFeature::CheckConstraints),
         FeatureRequirement::NotEnabled(TableFeature::GeneratedColumns),
         FeatureRequirement::NotEnabled(TableFeature::IdentityColumns),
-        FeatureRequirement::Custom(check_iceberg_native_v4_allowed_writer_features),
+        FeatureRequirement::Custom(|protocol, properties| {
+            check_iceberg_native_v4_allowed_writer_features(protocol, properties)
+                .map_err(Into::into)
+        }),
     ],
     #[cfg(feature = "adaptive-metadata-in-dev")]
     kernel_support: KernelSupport::Supported,
@@ -810,11 +813,24 @@ static ADAPTIVE_METADATA_PREVIEW_INFO: FeatureInfo = FeatureInfo {
     feature_requirements: &[
         FeatureRequirement::Enabled(TableFeature::ColumnMapping),
         FeatureRequirement::Custom(|_protocol, properties| {
+            if let Some(mode) = properties
+                .column_mapping_mode
+                .filter(|mode| *mode != ColumnMappingMode::Id)
+            {
+                return Err(DeltaError::adaptive_metadata_mapping_mode(
+                    mode,
+                    Some(Box::new(KernelError::invalid_protocol(
+                        "Feature 'adaptiveMetadata-preview' requires column mapping in 'id' mode",
+                    ))),
+                )
+                .into());
+            }
             require!(
                 properties.column_mapping_mode == Some(ColumnMappingMode::Id),
                 KernelError::invalid_protocol(
                     "Feature 'adaptiveMetadata-preview' requires column mapping in 'id' mode"
                 )
+                .into()
             );
             Ok(())
         }),

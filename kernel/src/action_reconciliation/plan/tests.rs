@@ -20,7 +20,7 @@ use crate::unit_test_utils::{
     Action, LocalMockTable, MockProtocolBuilder, MockTableConfigurationBuilder, create_add_action,
     create_remove_action,
 };
-use crate::{KernelResult, Snapshot};
+use crate::{KernelError, Result, Snapshot};
 
 #[rstest]
 #[case::live_adds(ActionSet::live_adds())]
@@ -43,7 +43,7 @@ async fn replay_selects_latest_action_without_retention(
         }))
     )]
     checkpoint: Option<CheckpointSpec>,
-) -> KernelResult<()> {
+) -> Result<()> {
     // Given: checkpoint and commit actions with independent identities and optional tombstones.
     let engine = SyncEngine::new();
     let mut table = LocalMockTable::new();
@@ -118,10 +118,17 @@ async fn replay_selects_latest_action_without_retention(
     let file_version =
         (remove_version.unwrap_or(1) as i64).max(if checkpoint.is_some() { 3 } else { 0 });
     let actual = concat_batches(
-        &Arc::new(schema.as_ref().try_into_arrow()?),
+        &Arc::new(
+            schema
+                .as_ref()
+                .try_into_arrow()
+                .map_err(KernelError::from)?,
+        ),
         &execute_plan(&engine, state.build()?)?,
-    )?
-    .normalize(".", Some(1))?;
+    )
+    .map_err(KernelError::from)?
+    .normalize(".", Some(1))
+    .map_err(KernelError::from)?;
     #[rustfmt::skip]
     let expected = [
         ("add", &["add.path", "add.dataChange"][..], format!(r#"+--------------+----------------+---------+
@@ -174,11 +181,13 @@ async fn replay_selects_latest_action_without_retention(
             .iter()
             .chain([&VERSION])
             .map(|field| actual.schema().index_of(field))
-            .collect::<Result<Vec<_>, _>>()?;
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(KernelError::from)?;
         let batch = filter_record_batch(
-            &actual.project(&columns)?,
-            &is_not_null(actual.column_by_name(fields[0]).unwrap())?,
-        )?;
+            &actual.project(&columns).map_err(KernelError::from)?,
+            &is_not_null(actual.column_by_name(fields[0]).unwrap()).map_err(KernelError::from)?,
+        )
+        .map_err(KernelError::from)?;
         checked_rows += batch.num_rows();
         if (name == "add" && remove_version.is_some())
             || (name == "remove" && remove_version.is_none())
