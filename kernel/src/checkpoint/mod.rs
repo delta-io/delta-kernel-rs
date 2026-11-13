@@ -141,12 +141,12 @@ use crate::{
 
 pub(crate) mod collation_stats;
 #[cfg(feature = "declarative-plans")]
-mod shape;
+mod info;
 mod sidecar;
 mod types;
 
 #[cfg(feature = "declarative-plans")]
-pub use shape::{CheckpointKind, CheckpointShape};
+pub use info::{CheckpointInfo, CheckpointKind};
 use sidecar::{SidecarSplitter, SingleSidecarDataIterator, create_sidecar_action_batch};
 #[delta_kernel_derive::internal_api]
 pub(crate) use types::SelectedCheckpoint;

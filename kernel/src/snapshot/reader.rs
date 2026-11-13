@@ -9,7 +9,7 @@ use delta_kernel_derive::internal_api;
 use super::Snapshot;
 use crate::actions::DomainMetadata;
 #[cfg(feature = "declarative-plans")]
-use crate::checkpoint::{CheckpointShape, SelectedCheckpointType};
+use crate::checkpoint::{CheckpointInfo, SelectedCheckpointType};
 use crate::clustering::ClusteringColumnInfo;
 use crate::engine::CancellableEngine;
 use crate::expressions::ColumnName;
@@ -101,7 +101,7 @@ impl<'a> SnapshotReader<'a> {
     pub fn get_checkpoint_info(
         &self,
         engine: &dyn Engine,
-    ) -> KernelResult<Option<Arc<CheckpointShape>>> {
+    ) -> KernelResult<Option<Arc<CheckpointInfo>>> {
         self.ensure_checkpoint_info_supported()?;
         self.read(engine, |snapshot, engine| snapshot.checkpoint_info(engine))
     }

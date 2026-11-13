@@ -11,7 +11,7 @@ use crate::actions::{
     CHECKPOINT_METADATA_FIELD, CHECKPOINT_METADATA_NAME, CHECKPOINT_NUM_ADD_FILES_TAG,
     CheckpointMetadata, SIDECAR_FIELD, SIDECAR_FILE_SCHEMA_TAG, SIDECAR_NAME, Sidecar,
 };
-use crate::checkpoint::{CHECKPOINT_ACTIONS_SCHEMA_V2, CheckpointShape, SelectedCheckpointType};
+use crate::checkpoint::{CHECKPOINT_ACTIONS_SCHEMA_V2, CheckpointInfo, SelectedCheckpointType};
 use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
 use crate::expressions::{ColumnName, Predicate, col};
 use crate::last_checkpoint_hint::{HintAction, LastCheckpointHint, LastCheckpointV2};
@@ -24,7 +24,7 @@ use crate::schema::{
 };
 use crate::{FileMeta, KernelError, KernelResult};
 
-impl CheckpointShape {
+impl CheckpointInfo {
     /// Resolves the selected checkpoint's complete layout, leaf schema, and portable hint.
     #[tracing::instrument(
         name = "checkpoint_shape.resolve",
@@ -514,15 +514,15 @@ mod tests {
         let exec = CountingExecutor::new();
 
         // When: the shared resolver discovers the complete checkpoint.
-        let resolved = CheckpointShape::resolve(&exec, &segment).unwrap();
+        let resolved = CheckpointInfo::resolve(&exec, &segment).unwrap();
 
         // Then: absence stays explicit; selected checkpoints always include their leaf schema.
         assert_eq!(
-            resolved.as_ref().map(CheckpointShape::kind),
+            resolved.as_ref().map(CheckpointInfo::kind),
             expected_checkpoint
         );
         assert_eq!(
-            resolved.as_ref().map(CheckpointShape::checkpoint_type),
+            resolved.as_ref().map(CheckpointInfo::checkpoint_type),
             expected_type
         );
         if let Some(shape) = resolved {
@@ -598,7 +598,7 @@ mod tests {
         };
 
         // When: the checkpoint schema is resolved.
-        let shape = CheckpointShape::resolve(&SyncPlanExecutor::default(), snapshot.log_segment())
+        let shape = CheckpointInfo::resolve(&SyncPlanExecutor::default(), snapshot.log_segment())
             .unwrap()
             .unwrap();
 
@@ -624,7 +624,7 @@ mod tests {
         let (_engine, snapshot, _tempdir) =
             load_test_table("v1-multi-part-partitioned-struct-stats-only").unwrap();
         // When: its parsed partition schema is resolved.
-        let shape = CheckpointShape::resolve(&SyncPlanExecutor::default(), snapshot.log_segment())
+        let shape = CheckpointInfo::resolve(&SyncPlanExecutor::default(), snapshot.log_segment())
             .unwrap()
             .unwrap();
 
@@ -661,7 +661,7 @@ mod tests {
         let exec = CountingExecutor::new();
 
         // When: checkpoint metadata is resolved from the hint.
-        let shape = CheckpointShape::resolve(&exec, &segment).unwrap().unwrap();
+        let shape = CheckpointInfo::resolve(&exec, &segment).unwrap().unwrap();
 
         // Then: only the missing sidecar schema requires I/O.
         assert_eq!(shape.kind(), CheckpointKind::Manifest);
@@ -813,7 +813,7 @@ mod tests {
         let exec = CountingExecutor::new();
 
         // When: full metadata is resolved.
-        let shape = CheckpointShape::resolve(&exec, &segment).unwrap().unwrap();
+        let shape = CheckpointInfo::resolve(&exec, &segment).unwrap().unwrap();
 
         // Then: the checkpoint is a leaf and neither its root nor a footer is read.
         assert_eq!(shape.kind(), CheckpointKind::Inline);
@@ -952,7 +952,7 @@ mod tests {
         let exec = CountingExecutor::new();
 
         // When: metadata is resolved using that hint.
-        let shape = CheckpointShape::resolve(&exec, &segment).unwrap().unwrap();
+        let shape = CheckpointInfo::resolve(&exec, &segment).unwrap().unwrap();
 
         // Then: stats compatibility follows the hinted schema without any I/O.
         assert_eq!(shape.kind(), CheckpointKind::Manifest);
@@ -1029,7 +1029,7 @@ mod tests {
                 .insert(CHECKPOINT_NUM_ADD_FILES_TAG.to_owned(), tag.to_owned());
         }
         // When: selected-checkpoint metadata is derived.
-        let resolved = CheckpointShape::resolve(&CountingExecutor::new(), &segment)
+        let resolved = CheckpointInfo::resolve(&CountingExecutor::new(), &segment)
             .unwrap()
             .unwrap();
         let derived = resolved.last_checkpoint();
@@ -1318,7 +1318,7 @@ mod tests {
         let exec = CountingExecutor::new();
 
         // When: discovery reads the malformed metadata.
-        let error = CheckpointShape::resolve(&exec, &segment).unwrap_err();
+        let error = CheckpointInfo::resolve(&exec, &segment).unwrap_err();
 
         // Then: resolution reports the specific metadata error.
         assert!(error.to_string().contains(expected_error), "{error}");
@@ -1648,7 +1648,7 @@ mod tests {
         assert_eq!(exec.query_scans.load(Ordering::Relaxed), 2);
     }
 
-    fn resolve_checkpoint_info(snapshot: &Snapshot, engine: &dyn Engine) -> Arc<CheckpointShape> {
+    fn resolve_checkpoint_info(snapshot: &Snapshot, engine: &dyn Engine) -> Arc<CheckpointInfo> {
         snapshot
             .reader()
             .get_checkpoint_info(engine)

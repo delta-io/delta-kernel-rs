@@ -23,7 +23,7 @@ pub enum CheckpointKind {
 /// serialized; [`LastCheckpointHint`] describes the portable fields. Layout discovery does not
 /// validate every required checkpoint action.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CheckpointShape {
+pub struct CheckpointInfo {
     pub(crate) checkpoint_type: SelectedCheckpointType,
     pub(crate) leaf_checkpoint_schema: SchemaRef,
     pub(crate) sidecars: Arc<[FileMeta]>,
@@ -31,7 +31,7 @@ pub struct CheckpointShape {
     pub(crate) last_checkpoint: Box<LastCheckpointHint>,
 }
 
-impl CheckpointShape {
+impl CheckpointInfo {
     /// Returns whether the selected checkpoint follows the V1 or V2 specification.
     pub fn checkpoint_type(&self) -> SelectedCheckpointType {
         self.checkpoint_type

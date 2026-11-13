@@ -9,7 +9,7 @@ use crate::action_reconciliation::file_metadata::{
 use crate::actions::{
     ADD_FIELD, ADD_NAME, ADD_SCHEMA, Add, REMOVE_NAME, STATS_PARSED, get_all_actions_schema,
 };
-use crate::checkpoint::CheckpointShape;
+use crate::checkpoint::CheckpointInfo;
 use crate::checkpoint::collation_stats::source_collation_stats;
 use crate::expressions::{
     ColumnName, Expression as Expr, Predicate, UnaryExpressionOp, col, column_name, expr,
@@ -38,7 +38,7 @@ const IS_ADD: &str = "is_add";
 pub(crate) struct MetadataPlanner<'a> {
     pub(crate) segment: &'a LogSegment,
     pub(crate) actions: ActionSet,
-    pub(crate) checkpoint_shape: Option<Arc<CheckpointShape>>,
+    pub(crate) checkpoint_info: Option<Arc<CheckpointInfo>>,
     pub(crate) stats: StatsOptions,
     pub(crate) partitions: PartitionValuesOptions,
     pub(crate) stats_schema: Option<SchemaRef>,
@@ -63,7 +63,7 @@ impl<'a> MetadataPlanner<'a> {
         Self {
             segment,
             actions,
-            checkpoint_shape: None,
+            checkpoint_info: None,
             stats: StatsOptions::none(),
             partitions: PartitionValuesOptions::default(),
             stats_schema: None,
@@ -74,11 +74,11 @@ impl<'a> MetadataPlanner<'a> {
         }
     }
 
-    pub(crate) fn with_checkpoint_shape(
+    pub(crate) fn with_checkpoint_info(
         mut self,
-        checkpoint_shape: impl Into<Option<Arc<CheckpointShape>>>,
+        checkpoint_info: impl Into<Option<Arc<CheckpointInfo>>>,
     ) -> Self {
-        self.checkpoint_shape = checkpoint_shape.into();
+        self.checkpoint_info = checkpoint_info.into();
         self
     }
 
@@ -160,9 +160,9 @@ impl<'a> MetadataPlanner<'a> {
     /// JSON stats are retained or synthesized only when requested.
     /// Without tombstones, remove fields are omitted from the read, filter, and key.
     pub(crate) fn checkpoint_actions(&self) -> KernelResult<PlanBuilder> {
-        let checkpoint_shape = self.checkpoint_shape.as_deref();
-        self.build_metadata_plan(ActionSource::Checkpoint, checkpoint_shape, |schema| {
-            sources::checkpoint_actions(self.segment, checkpoint_shape, self.actions, schema)
+        let checkpoint_info = self.checkpoint_info.as_deref();
+        self.build_metadata_plan(ActionSource::Checkpoint, checkpoint_info, |schema| {
+            sources::checkpoint_actions(self.segment, checkpoint_info, self.actions, schema)
         })
     }
 
@@ -201,11 +201,11 @@ impl<'a> MetadataPlanner<'a> {
     fn build_metadata_plan(
         &self,
         source: ActionSource,
-        checkpoint_shape: Option<&CheckpointShape>,
+        checkpoint_info: Option<&CheckpointInfo>,
         read_source: impl FnOnce(SchemaRef) -> KernelResult<PlanBuilder>,
     ) -> KernelResult<PlanBuilder> {
         let (read_schema, current_stats_kind, has_struct_partitions) =
-            self.read_schema(source, checkpoint_shape)?;
+            self.read_schema(source, checkpoint_info)?;
         let (key_field, key_expr) = self.actions.key(source)?;
         let plan = read_source(read_schema)?
             .filter(self.actions.predicate_from_source(source))?
@@ -238,7 +238,7 @@ impl<'a> MetadataPlanner<'a> {
     fn read_schema(
         &self,
         source: ActionSource,
-        checkpoint_shape: Option<&CheckpointShape>,
+        checkpoint_info: Option<&CheckpointInfo>,
     ) -> KernelResult<(SchemaRef, StatsKind, bool)> {
         let selected = self.actions.schema(source)?;
         let action_patch =
@@ -252,8 +252,8 @@ impl<'a> MetadataPlanner<'a> {
                 false,
             ));
         }
-        let file_schema = checkpoint_shape
-            .map(|checkpoint_shape| checkpoint_shape.leaf_checkpoint_schema.as_ref())
+        let file_schema = checkpoint_info
+            .map(|checkpoint_info| checkpoint_info.leaf_checkpoint_schema.as_ref())
             .unwrap_or(get_all_actions_schema());
         let add_field = file_schema.field(ADD_NAME).unwrap_or(&ADD_FIELD);
         let file_add_schema = match add_field.data_type() {

@@ -21,7 +21,7 @@ use crate::actions::visitors::SetTransactionMap;
 use crate::actions::{CheckpointAction, LastManifestCommit};
 use crate::actions::{DomainMetadata, INTERNAL_DOMAIN_PREFIX, LOG_DOMAIN_METADATA_SCHEMA};
 #[cfg(feature = "declarative-plans")]
-use crate::checkpoint::CheckpointShape;
+use crate::checkpoint::CheckpointInfo;
 use crate::checkpoint::{
     CheckpointSpec, CheckpointWriter, DEFAULT_FILE_ACTIONS_PER_SIDECAR_HINT,
     SelectedCheckpointType, V2CheckpointConfig, ensure_standalone_checkpoint_supported,
@@ -134,7 +134,7 @@ pub struct Snapshot {
     skipped_new_checkpoints: bool,
     /// Complete state for the frozen segment. Shared with scan plans; failed reads are not cached.
     #[cfg(feature = "declarative-plans")]
-    checkpoint_info: OnceLock<Option<Arc<CheckpointShape>>>,
+    checkpoint_info: OnceLock<Option<Arc<CheckpointInfo>>>,
     #[cfg(feature = "declarative-plans")]
     checkpoint_info_init: Mutex<()>,
     /// This snapshot's latest AMT `checkpoint` action (see
@@ -343,7 +343,7 @@ impl Snapshot {
 
     /// Returns only completed metadata, without waiting for or starting checkpoint discovery.
     #[cfg(feature = "declarative-plans")]
-    pub(crate) fn cached_checkpoint_info(&self) -> Option<&Option<Arc<CheckpointShape>>> {
+    pub(crate) fn cached_checkpoint_info(&self) -> Option<&Option<Arc<CheckpointInfo>>> {
         self.checkpoint_info.get()
     }
 
@@ -352,7 +352,7 @@ impl Snapshot {
     pub(crate) fn checkpoint_info(
         &self,
         engine: &dyn Engine,
-    ) -> KernelResult<Option<Arc<CheckpointShape>>> {
+    ) -> KernelResult<Option<Arc<CheckpointInfo>>> {
         if let Some(resolved) = self.checkpoint_info.get() {
             return Ok(resolved.clone());
         }
@@ -370,7 +370,7 @@ impl Snapshot {
             None
         } else {
             let executor = engine.require_plan_executor()?;
-            CheckpointShape::resolve(executor.as_ref(), self.log_segment())?.map(Arc::new)
+            CheckpointInfo::resolve(executor.as_ref(), self.log_segment())?.map(Arc::new)
         };
         // All initializers hold the mutex; publish only after every fallible operation succeeds.
         let _ = self.checkpoint_info.set(resolved.clone());
