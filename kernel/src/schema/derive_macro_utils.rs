@@ -199,6 +199,7 @@ pub(crate) struct StructDataFields {
 }
 
 impl StructDataFields {
+    #[internal_api]
     pub(crate) fn try_new(data: StructData, expected: StructType) -> KernelResult<Self> {
         let (actual_fields, values) = data.into_parts();
         require!(
@@ -233,6 +234,7 @@ impl StructDataFields {
         Ok(Self { expected, fields })
     }
 
+    #[internal_api]
     pub(crate) fn take_field<T: TryFrom<Scalar, Error = KernelError>>(
         &mut self,
         field_name: &str,
@@ -271,6 +273,7 @@ impl StructDataFields {
     }
 
     /// Verifies that every named field was consumed.
+    #[internal_api]
     pub(crate) fn finish(self) -> KernelResult<()> {
         if self.fields.is_empty() {
             return Ok(());

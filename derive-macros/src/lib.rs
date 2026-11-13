@@ -579,6 +579,63 @@ fn try_from_struct_data_impl(input: &DeriveInput) -> Result<TokenStream, Error> 
     })
 }
 
+/// Derives cached row metadata and conversion from a declarative plan result.
+///
+/// Requires `delta_kernel/declarative-plans`, `ToSchema`, and `TryFromStructData`.
+/// Both singleton and vector conversions require this derive. Singleton conversion requires
+/// exactly one total row; both conversions propagate stream errors.
+///
+/// Supports concrete structs with named fields. Generic parameters are unsupported because
+/// local statics are shared across monomorphizations.
+#[proc_macro_derive(TryFromPlanResult)]
+pub fn try_from_plan_result_derive(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
+    let input = parse_macro_input!(input as DeriveInput);
+    try_from_plan_result_impl(&input)
+        .unwrap_or_else(Error::into_compile_error)
+        .into()
+}
+
+fn try_from_plan_result_impl(input: &DeriveInput) -> Result<TokenStream, Error> {
+    let struct_name = &input.ident;
+    partition_fields(&input.data, "TryFromPlanResult", struct_name.span())?;
+    if !input.generics.params.is_empty() {
+        return Err(Error::new_spanned(
+            &input.generics,
+            "TryFromPlanResult does not support generic parameters",
+        ));
+    }
+    Ok(quote! {
+        #[automatically_derived]
+        impl delta_kernel::plans::PlanResultRow for #struct_name {
+            fn schema_and_columns() -> (
+                &'static delta_kernel::schema::SchemaRef,
+                &'static delta_kernel::schema::ColumnNamesAndTypes,
+            ) {
+                static METADATA: ::std::sync::LazyLock<(
+                    delta_kernel::schema::SchemaRef,
+                    delta_kernel::schema::ColumnNamesAndTypes,
+                )> = ::std::sync::LazyLock::new(|| {
+                    let schema = ::std::sync::Arc::new(
+                        <#struct_name as delta_kernel::schema::ToSchema>::to_schema(),
+                    );
+                    let columns = schema.leaves(None);
+                    (schema, columns)
+                });
+                (&METADATA.0, &METADATA.1)
+            }
+        }
+
+        #[automatically_derived]
+        impl ::core::convert::TryFrom<delta_kernel::plans::PlanResult> for #struct_name {
+            type Error = delta_kernel::KernelError;
+
+            fn try_from(value: delta_kernel::plans::PlanResult) -> delta_kernel::KernelResult<Self> {
+                value.into_single()
+            }
+        }
+    })
+}
+
 /// Expose a `macro_rules!` declaration as a public macro at its declaration site.
 ///
 /// The macro's crate-root implementation is exported under a doc-hidden generated name.
@@ -991,6 +1048,63 @@ mod tests {
         assert!(
             !tokens.contains("skipped"),
             "skipped field must be absent: {tokens}"
+        );
+    }
+
+    #[rstest]
+    #[case::enum_type("enum Row { Value { id: i64 } }")]
+    #[case::union_type("union Row { id: i64 }")]
+    #[case::tuple_struct("struct Row(i64);")]
+    #[case::unit_struct("struct Row;")]
+    fn try_from_plan_result_rejects_unsupported_shape(#[case] input: &str) {
+        let input = syn::parse_str::<DeriveInput>(input).unwrap();
+        let error = try_from_plan_result_impl(&input).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "TryFromPlanResult can only be derived for structs with named fields"
+        );
+    }
+
+    #[rstest]
+    #[case::type_parameter("struct Row<T> { id: T }")]
+    #[case::lifetime("struct Row<'a> { id: &'a str }")]
+    #[case::const_parameter("struct Row<const N: usize> { ids: [i64; N] }")]
+    fn try_from_plan_result_rejects_generic_parameters(#[case] input: &str) {
+        let input = syn::parse_str::<DeriveInput>(input).unwrap();
+        assert_eq!(
+            try_from_plan_result_impl(&input).unwrap_err().to_string(),
+            "TryFromPlanResult does not support generic parameters"
+        );
+    }
+
+    #[test]
+    fn try_from_plan_result_caches_metadata_for_concrete_row() {
+        let output = try_from_plan_result_impl(&parse_quote!(
+            struct Row {
+                id: i64,
+            }
+        ))
+        .unwrap();
+        let file = syn::parse2::<syn::File>(output).unwrap();
+        assert_eq!(file.items.len(), 2);
+        let syn::Item::Impl(metadata_impl) = &file.items[0] else {
+            panic!("metadata impl")
+        };
+        let syn::ImplItem::Fn(method) = &metadata_impl.items[0] else {
+            panic!("metadata method")
+        };
+        let syn::Stmt::Item(syn::Item::Static(metadata)) = &method.block.stmts[0] else {
+            panic!("metadata must be cached in a single local static")
+        };
+        let tokens = quote!(#metadata).to_string();
+        assert!(tokens.contains("LazyLock"), "{tokens}");
+        assert!(
+            tokens.contains("< Row as delta_kernel :: schema :: ToSchema >"),
+            "{tokens}"
+        );
+        assert!(
+            !tokens.contains("Self"),
+            "local statics cannot use Self: {tokens}"
         );
     }
 
