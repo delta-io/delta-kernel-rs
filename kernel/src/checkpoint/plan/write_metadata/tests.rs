@@ -757,6 +757,7 @@ fn checkpoint_schema_respects_length_limit(
         },
         &FileMeta::new(writer.checkpoint_path()?, 19, 17),
         schema.clone(),
+        crate::last_checkpoint_hint::LastCheckpointV2::default(),
     )?;
     let hint: LastCheckpointHint = serde_json::from_slice(&bytes)?;
     assert_eq!(hint.checkpoint_schema, included.then_some(schema));
