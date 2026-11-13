@@ -769,7 +769,6 @@ impl<STATE, MODE: ExecutionMode> Transaction<STATE, MODE> {
             (true, true) => CommitType::CatalogManagedCreate,
             (true, false) => CommitType::PathBasedCreate,
             (false, true) => CommitType::CatalogManagedWrite,
-            // TODO(#3852): Publish retained catalog commits before executing a path-based write.
             (false, false) => CommitType::PathBasedWrite,
         }
     }

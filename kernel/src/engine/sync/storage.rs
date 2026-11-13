@@ -5,7 +5,7 @@ use derive_more::Constructor;
 use futures::StreamExt as _;
 use url::Url;
 
-use super::{put_bytes, resolve_scope};
+use super::{get_bytes, put_bytes, resolve_scope};
 use crate::object_store::path::Path;
 use crate::object_store::{DynObjectStore, ObjectStoreExt as _};
 use crate::{FileMeta, FileSlice, KernelError, KernelResult, KernelResultIterator, StorageHandler};
@@ -87,8 +87,14 @@ impl StorageHandler for SyncStorageHandler {
         put_bytes(self.store.as_ref(), path, data, overwrite)
     }
 
-    fn copy_atomic(&self, _src: &Url, _dest: &Url) -> KernelResult<()> {
-        unimplemented!("SyncStorageHandler does not implement copy");
+    fn copy_atomic(&self, src: &Url, dest: &Url) -> KernelResult<()> {
+        // Create-only put makes the destination appear atomically without overwriting it.
+        put_bytes(
+            self.store.as_ref(),
+            dest,
+            get_bytes(self.store.as_ref(), src)?,
+            false,
+        )
     }
 
     fn head(&self, url: &Url) -> KernelResult<FileMeta> {
@@ -115,10 +121,12 @@ impl StorageHandler for SyncStorageHandler {
 mod tests {
     use std::fs::File;
     use std::io::Write;
+    use std::sync::Arc;
     use std::time::Duration;
 
-    use bytes::{BufMut, BytesMut};
+    use bytes::{BufMut, Bytes, BytesMut};
     use itertools::Itertools;
+    use rstest::rstest;
     use url::Url;
 
     use super::SyncStorageHandler;
@@ -126,6 +134,57 @@ mod tests {
     use crate::object_store::memory::InMemory;
     use crate::utils::current_time_duration;
     use crate::{KernelError, StorageHandler};
+
+    #[rstest]
+    fn atomic_copy_preserves_existing_destination(#[values(false, true)] in_memory: bool) {
+        // GIVEN a destination copied from the original source, in memory or on disk.
+        let dir = tempfile::tempdir().unwrap();
+        let (storage, root) = if in_memory {
+            (
+                SyncStorageHandler::new(Some(Arc::new(InMemory::new()))),
+                Url::parse("memory:///").unwrap(),
+            )
+        } else {
+            (
+                SyncStorageHandler::new(None),
+                Url::from_directory_path(dir.path()).unwrap(),
+            )
+        };
+        let src = root.join("staged/source.json").unwrap();
+        let dest = root.join("published.json").unwrap();
+        storage
+            .put(&src, Bytes::from_static(b"original"), false)
+            .unwrap();
+        storage.copy_atomic(&src, &dest).unwrap();
+        storage
+            .put(&src, Bytes::from_static(b"replacement"), true)
+            .unwrap();
+
+        // WHEN replacement bytes are copied to the existing destination.
+        let result = storage.copy_atomic(&src, &dest);
+
+        // THEN the copy fails without changing either file.
+        assert!(matches!(result, Err(KernelError::FileAlreadyExists(_))));
+        let read = |path| {
+            storage
+                .read_files(vec![(path, None)])
+                .unwrap()
+                .next()
+                .unwrap()
+                .unwrap()
+        };
+        assert_eq!(read(src), Bytes::from_static(b"replacement"));
+        assert_eq!(read(dest), Bytes::from_static(b"original"));
+
+        // WHEN the source does not exist.
+        let result = storage.copy_atomic(
+            &root.join("missing.json").unwrap(),
+            &root.join("new.json").unwrap(),
+        );
+
+        // THEN the missing source is reported.
+        assert!(matches!(result, Err(KernelError::FileNotFound(_))));
+    }
 
     /// generate json filenames that follow the spec (numbered padded to 20 chars)
     fn get_json_filename(index: usize) -> String {
