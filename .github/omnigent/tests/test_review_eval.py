@@ -212,6 +212,50 @@ class ReviewEvalTest(unittest.TestCase):
             path.write_text("**Verdict**: CONFIRMED")
             verify_artifacts(Path(directory), "fake-eval-sentinel")
 
+    def test_trace_correlates_omnigent_082_inbox_results_with_launch_receipts(self):
+        events = []
+        for index, agent in enumerate(
+            ("maintainer-codex-reviewer", "docs-reviewer", "disprove-reviewer")
+        ):
+            task = f"{index:032x}"
+            events.extend(
+                [
+                    {
+                        "type": "tool_call",
+                        "target": "sys_session_send",
+                        "data": {"name": "sys_session_send", "arguments": {"agent": agent}},
+                    },
+                    {
+                        "type": "tool_result",
+                        "target": "sys_session_send",
+                        "data": {
+                            "result": json.dumps(
+                                {"task_id": task, "agent": agent, "status": "launching"}
+                            )
+                        },
+                    },
+                ]
+            )
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "events.jsonl"
+            path.write_text("\n".join(json.dumps(e) for e in events))
+            with self.assertRaisesRegex(ValueError, "quorum"):
+                validate_trace(path)
+            for index, agent in enumerate(
+                ("maintainer-codex-reviewer", "docs-reviewer", "disprove-reviewer")
+            ):
+                events.append(
+                    {
+                        "type": "tool_result",
+                        "target": "sys_read_inbox",
+                        "data": {
+                            "result": f"[System: sub-agent task {index:032x} completed \u2014 {agent}:review returned: evidence]"
+                        },
+                    }
+                )
+            path.write_text("\n".join(json.dumps(e) for e in events))
+            validate_trace(path)
+
     def test_timeout_is_a_failed_run_not_a_clean_review(self):
         with tempfile.TemporaryDirectory() as directory:
             result = self.run_fake(Path(directory), "import time; time.sleep(2)", timeout=1)
