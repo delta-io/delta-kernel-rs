@@ -917,6 +917,7 @@ jobs:
               trusted_bot_logins=trusted_bot_logins,
               force_full=os.environ.get("FORCE_FULL_REVIEW") == "true",
           )
+          print(f"Review scope: {review_scope}")
           pathlib.Path("/tmp/review_diff.txt").write_text(review_diff)
           pathlib.Path("/tmp/review_scope.json").write_text(json.dumps({"incremental": incremental}))
           diff_bytes = review_diff.encode("utf-8")
