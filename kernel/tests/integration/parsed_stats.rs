@@ -275,3 +275,164 @@ fn json_stats_truncate_timestamps_to_milliseconds() {
     }
     assert!(checked > 0, "no timestamp stats were checked");
 }
+
+#[cfg(feature = "adaptive-metadata-in-dev")]
+mod adaptive_metadata {
+    use std::sync::Arc;
+
+    use delta_kernel::actions::TIGHT_STATS;
+    use delta_kernel::arrow::array::TimestampMicrosecondArray;
+    use delta_kernel::object_store::memory::InMemory;
+    use delta_kernel::schema::schema_ref;
+    use test_utils::{
+        add_commit, create_table_with_column_mapping_mode, engine_store_setup, insert_data,
+        read_actions_from_commit,
+    };
+    use url::Url;
+
+    use super::*;
+
+    /// Only adaptiveMetadata tables define `tightStats`, so only their `stats_parsed` carries it.
+    #[rstest]
+    #[case::adaptive_metadata(
+        vec!["adaptiveMetadata-preview"],
+        "id",
+        Some(vec![Some(true), Some(false), None]),
+    )]
+    #[case::without_adaptive_metadata(vec![], "none", None)]
+    #[tokio::test]
+    async fn scan_metadata_parses_tight_stats_only_on_adaptive_metadata_tables(
+        #[case] features: Vec<&str>,
+        #[case] column_mapping_mode: &str,
+        #[case] expected: Option<Vec<Option<bool>>>,
+    ) {
+        let store = Arc::new(InMemory::new());
+        let engine = DefaultEngineBuilder::new(store.clone()).build();
+        let table_root = Url::parse("memory:///").unwrap();
+        create_table_with_column_mapping_mode(
+            store.clone(),
+            table_root.clone(),
+            schema_ref! { nullable "id": LONG },
+            &[],
+            true,
+            features.clone(),
+            features,
+            column_mapping_mode,
+        )
+        .await
+        .unwrap();
+        let add = |path: &str, stats: &str| {
+            serde_json::json!({"add": {
+                "path": path,
+                "partitionValues": {},
+                "size": 1,
+                "modificationTime": 1,
+                "dataChange": true,
+                "stats": stats,
+            }})
+            .to_string()
+        };
+        // adaptiveMetadata snapshots read the newest commit's In-Commit Timestamp.
+        let commit_info =
+            serde_json::json!({"commitInfo": {"timestamp": 1, "inCommitTimestamp": 1}}).to_string();
+        let commit = [
+            commit_info,
+            add(
+                "a.parquet",
+                r#"{"numRecords":1,"tightBounds":true,"tightStats":true}"#,
+            ),
+            add(
+                "b.parquet",
+                r#"{"numRecords":1,"tightBounds":false,"tightStats":false}"#,
+            ),
+            add("c.parquet", r#"{"numRecords":1}"#),
+        ]
+        .join("\n");
+        add_commit(table_root.as_str(), store.as_ref(), 1, commit)
+            .await
+            .unwrap();
+
+        let scan = Snapshot::builder_for(table_root.as_str())
+            .build(&engine)
+            .unwrap()
+            .scan_builder()
+            .with_stats(StatsOptions::all_struct())
+            .build()
+            .unwrap();
+        let mut actual: Option<Vec<(String, Option<bool>)>> = None;
+        let mut num_files = 0;
+        for scan_metadata in scan.scan_metadata(&engine).unwrap() {
+            let (data, selection_vector) = scan_metadata.unwrap().scan_files.into_parts();
+            let batch: RecordBatch = ArrowEngineData::try_from_engine_data(data).unwrap().into();
+            let batch = filter_record_batch(&batch, &BooleanArray::from(selection_vector)).unwrap();
+            num_files += batch.num_rows();
+            let paths = get_column!(batch, "path", StringArray);
+            let stats_parsed = get_column!(batch, STATS_PARSED, StructArray);
+            let Some(tight_stats) = stats_parsed.column_by_name(TIGHT_STATS) else {
+                continue;
+            };
+            let tight_stats = tight_stats.as_any().downcast_ref::<BooleanArray>().unwrap();
+            actual.get_or_insert_with(Vec::new).extend(
+                paths
+                    .iter()
+                    .zip(tight_stats)
+                    .map(|(path, tight)| (path.unwrap().to_string(), tight)),
+            );
+        }
+
+        let actual = actual.map(|mut rows| {
+            rows.sort();
+            rows.into_iter().map(|(_, tight)| tight).collect::<Vec<_>>()
+        });
+        assert_eq!(num_files, 3);
+        assert_eq!(actual, expected);
+    }
+
+    /// adaptiveMetadata `add.stats` keep every microsecond digit of timestamp bounds, while other
+    /// tables truncate them down to milliseconds.
+    #[rstest]
+    #[case::adaptive_metadata(vec!["adaptiveMetadata-preview"], "id", "2026-07-02T15:55:55.298677Z")]
+    #[case::without_adaptive_metadata(vec![], "none", "2026-07-02T15:55:55.298Z")]
+    #[tokio::test]
+    async fn committed_timestamp_stats_precision_follows_adaptive_metadata(
+        #[case] features: Vec<&str>,
+        #[case] column_mapping_mode: &str,
+        #[case] expected_bound: &str,
+    ) {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let temp_dir_url = Url::from_directory_path(temp_dir.path()).unwrap();
+        let (store, engine, table_location) = engine_store_setup("ts_table", Some(&temp_dir_url));
+        let engine = Arc::new(engine);
+        let table_url = create_table_with_column_mapping_mode(
+            store,
+            table_location,
+            schema_ref! { nullable "ts": TIMESTAMP },
+            &[],
+            true,
+            features.clone(),
+            features,
+            column_mapping_mode,
+        )
+        .await
+        .unwrap();
+        let snapshot = Snapshot::builder_for(table_url.clone())
+            .build(engine.as_ref())
+            .unwrap();
+        let ts = TimestampMicrosecondArray::from(vec![1_783_007_755_298_677]).with_timezone("UTC");
+        insert_data(snapshot, &engine, vec![Arc::new(ts)])
+            .await
+            .unwrap()
+            .unwrap_committed();
+
+        let adds = read_actions_from_commit(&table_url, 1, "add").unwrap();
+        let [add] = adds.as_slice() else {
+            panic!("expected one add, got {adds:?}");
+        };
+        let stats: serde_json::Value =
+            serde_json::from_str(add["stats"].as_str().unwrap()).unwrap();
+        for bound in [MIN_VALUES, MAX_VALUES] {
+            let values: Vec<_> = stats[bound].as_object().unwrap().values().collect();
+            assert_eq!(values, [expected_bound], "{bound} in {stats}");
+        }
+    }
+}

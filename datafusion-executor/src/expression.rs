@@ -73,9 +73,10 @@ pub fn to_df_expr(
         KernelExpression::ParseJson(parse) => parse_json_to_df_expr(parse, input_schema),
 
         KernelExpression::Unary(u) => match u.op {
-            UnaryExpressionOp::ToJson => Err(KernelError::unsupported(
-                "converting the ToJson expression is not yet supported",
-            )),
+            UnaryExpressionOp::ToJson { .. } => Err(KernelError::unsupported(format!(
+                "converting the {:?} expression is not yet supported",
+                u.op
+            ))),
         },
 
         KernelExpression::CaseWhen(_) => Err(KernelError::unsupported(

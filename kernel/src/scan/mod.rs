@@ -60,7 +60,9 @@ use crate::kernel_predicates::{
     DefaultKernelPredicateEvaluator, EmptyColumnResolver, KernelPredicateEvaluator as _,
 };
 use crate::log_replay::{ActionsBatch, HasSelectionVector};
-use crate::log_segment::{ActionsWithCheckpointInfo, CheckpointReadInfo, LogSegment};
+use crate::log_segment::{
+    ActionsWithCheckpointInfo, CheckpointReadInfo, CheckpointReadOptions, LogSegment,
+};
 use crate::log_segment_files::LogSegmentFiles;
 use crate::metrics::events::emit_scan_metadata_completed;
 use crate::metrics::{MetricId, ScanType};
@@ -74,8 +76,8 @@ use crate::scan::log_replay::{
 use crate::scan::metrics::ScanMetrics;
 use crate::scan::state_info::StateInfo;
 use crate::schema::{
-    ArrayType, DataType, MapType, PrimitiveType, Schema, SchemaRef, StructField, StructType,
-    ToSchema as _, lazy_schema_ref, schema_ref,
+    ArrayType, DataType, MapType, PrimitiveType, Schema, SchemaRef, StructField, ToSchema as _,
+    lazy_schema_ref, schema_ref,
 };
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::{ColumnMappingMode, Operation};
@@ -1024,7 +1026,7 @@ impl Scan {
         !self.stats.synthesize_json && matches!(self.stats.struct_stats, StructStats::None)
     }
 
-    fn checkpoint_read_options(&self) -> (SchemaRef, Option<PredicateRef>, Option<&StructType>) {
+    fn checkpoint_read_options(&self) -> (SchemaRef, CheckpointReadOptions<'_>) {
         let skip_stats = self.skip_stats();
         // The read schema is the typed shape this scan can consume, not evidence that the
         // checkpoint contains `stats_parsed`. Checkpoint discovery validates availability and
@@ -1051,11 +1053,13 @@ impl Scan {
                 .physical_stats_read_schema()
                 .map(AsRef::as_ref)
         };
-        (
-            checkpoint_schema,
+        let options = CheckpointReadOptions {
             meta_predicate,
-            physical_stats_read_schema,
-        )
+            stats_schema: physical_stats_read_schema,
+            partition_schema: None,
+            stats_json_op: self.snapshot.table_configuration().stats_json_op(),
+        };
+        (checkpoint_schema, options)
     }
 
     /// Build the read-options bundle passed to [`ScanLogReplayProcessor`].
@@ -1330,15 +1334,12 @@ impl Scan {
 
         // For incremental reads, new_log_segment has no checkpoint but we use the
         // checkpoint schema returned by the function for consistency.
-        let (checkpoint_schema, meta_predicate, physical_stats_read_schema) =
-            self.checkpoint_read_options();
+        let (checkpoint_schema, checkpoint_options) = self.checkpoint_read_options();
         let result = new_log_segment.read_actions_with_projected_checkpoint_actions(
             engine,
             COMMIT_READ_SCHEMA.clone(),
             checkpoint_schema,
-            meta_predicate,
-            physical_stats_read_schema,
-            None,
+            checkpoint_options,
         )?;
         // Only the cached suffix needs a kernel-side check. The engine owns cancellation for the
         // newly read action prefix.
@@ -1486,8 +1487,7 @@ impl Scan {
         &self,
         engine: &dyn Engine,
     ) -> KernelResult<ActionsWithCheckpointInfo<Box<dyn KernelResultIterator<ActionsBatch>>>> {
-        let (checkpoint_schema, meta_predicate, physical_stats_read_schema) =
-            self.checkpoint_read_options();
+        let (checkpoint_schema, checkpoint_options) = self.checkpoint_read_options();
         #[cfg(feature = "adaptive-metadata-in-dev")]
         if let Some(checkpoint) = self.snapshot.latest_checkpoint_action(engine)? {
             // The scan's stats schema follows the snapshot's schema, which a later commit may have
@@ -1507,7 +1507,7 @@ impl Scan {
                     self.snapshot.table_root(),
                     COMMIT_READ_SCHEMA.clone(),
                     checkpoint_schema,
-                    physical_stats_read_schema,
+                    checkpoint_options.stats_schema,
                     stats_parsed,
                 );
         }
@@ -1519,12 +1519,10 @@ impl Scan {
                 engine,
                 COMMIT_READ_SCHEMA.clone(),
                 checkpoint_schema,
-                meta_predicate,
-                physical_stats_read_schema,
-                self.state_info
-                    .physical_partition_schema
-                    .as_ref()
-                    .map(|s| s.as_ref()),
+                CheckpointReadOptions {
+                    partition_schema: self.state_info.physical_partition_schema.as_deref(),
+                    ..checkpoint_options
+                },
             )
     }
 

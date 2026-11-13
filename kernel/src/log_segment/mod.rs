@@ -27,7 +27,7 @@ use crate::checkpoint::collation_stats::{
 use crate::committer::CatalogCommit;
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::content_tree::read_checkpoint_action;
-use crate::expressions::ColumnName;
+use crate::expressions::{ColumnName, UnaryExpressionOp};
 use crate::last_checkpoint_hint::{HintAction, LastCheckpointHint};
 use crate::log_replay::ActionsBatch;
 #[internal_api]
@@ -111,6 +111,38 @@ impl CheckpointReadInfo {
             has_stats_parsed: false,
             has_partition_values_parsed: false,
             checkpoint_read_schema: LOG_ADD_SCHEMA.clone(),
+        }
+    }
+}
+
+/// Options for reading the checkpoint part of a log segment.
+#[derive(Debug, Clone)]
+#[internal_api]
+pub(crate) struct CheckpointReadOptions<'a> {
+    /// Conservative predicate readers may use to skip checkpoint data. It is not the query's final
+    /// data filter, and readers may ignore it.
+    pub meta_predicate: Option<PredicateRef>,
+    /// Stats schema the caller can consume. When the checkpoint has compatible `stats_parsed`,
+    /// batches carry it so callers need not parse JSON stats.
+    pub stats_schema: Option<&'a StructType>,
+    /// Partition schema the caller can consume. When the checkpoint has compatible
+    /// `partitionValues_parsed`, batches carry it so callers need not parse partition strings.
+    pub partition_schema: Option<&'a StructType>,
+    /// Operator that encodes the table's file stats as JSON when a checkpoint's `add.stats` must
+    /// be rebuilt from its parsed stats. Callers that read `add.stats` pass the table
+    /// configuration's `stats_json_op`.
+    pub stats_json_op: UnaryExpressionOp,
+}
+
+impl Default for CheckpointReadOptions<'_> {
+    fn default() -> Self {
+        Self {
+            meta_predicate: None,
+            stats_schema: None,
+            partition_schema: None,
+            // Only adaptiveMetadata tables need full precision, and readers that don't project
+            // `add.stats` never encode stats.
+            stats_json_op: UnaryExpressionOp::TO_JSON,
         }
     }
 }
@@ -1006,27 +1038,24 @@ impl LogSegment {
     ///
     /// Also returns `CheckpointReadInfo` with stats_parsed compatibility and the checkpoint schema.
     ///
-    /// `meta_predicate` is an optional conservative predicate for checkpoint reads, not the query's
-    /// final data filter. When every projected action has a reliable presence witness, their
-    /// `IS NOT NULL` predicates are combined (OR), then combined (AND) with `meta_predicate`.
-    /// Otherwise projection-based pruning is disabled. Readers may ignore the resulting predicate,
-    /// and downstream log replay must tolerate rows that do not satisfy it.
+    /// `options` configures the checkpoint read. When every projected action has a reliable
+    /// presence witness, their `IS NOT NULL` predicates are combined (OR), then combined (AND) with
+    /// `options.meta_predicate`. Otherwise projection-based pruning is disabled. Readers may ignore
+    /// the resulting predicate, and downstream log replay must tolerate rows that do not satisfy
+    /// it.
     #[internal_api]
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn read_actions_with_projected_checkpoint_actions(
         &self,
         engine: &dyn Engine,
         commit_read_schema: SchemaRef,
         checkpoint_read_schema: SchemaRef,
-        meta_predicate: Option<PredicateRef>,
-        stats_schema: Option<&StructType>,
-        partition_schema: Option<&StructType>,
+        options: CheckpointReadOptions<'_>,
     ) -> KernelResult<ActionsWithCheckpointInfo<Box<dyn KernelResultIterator<ActionsBatch>>>> {
         // Combine the action-presence predicate with the caller's skipping predicate so readers
         // can omit checkpoint data that cannot contain a relevant action.
         let projection_predicate = checkpoint_action_projection_predicate(&checkpoint_read_schema);
-        let checkpoint_predicate =
-            combine_checkpoint_predicates(projection_predicate, meta_predicate);
+        let meta_predicate =
+            combine_checkpoint_predicates(projection_predicate, options.meta_predicate);
 
         // `replay` expects commit files to be sorted in descending order, so the return value here
         // is correct
@@ -1035,9 +1064,10 @@ impl LogSegment {
         let checkpoint_result = self.create_checkpoint_stream(
             engine,
             checkpoint_read_schema,
-            checkpoint_predicate,
-            stats_schema,
-            partition_schema,
+            CheckpointReadOptions {
+                meta_predicate,
+                ..options
+            },
         )?;
 
         Ok(ActionsWithCheckpointInfo {
@@ -1134,7 +1164,8 @@ impl LogSegment {
 
     /// Same as [`Self::read_actions_with_projected_checkpoint_actions`], but uses the same schema
     /// for reading checkpoints and commits. IS NOT NULL predicates are automatically derived from
-    /// the schema, so callers do not need to supply them.
+    /// the schema, so callers do not need to supply them. Checkpoint `add.stats` rebuilt from
+    /// parsed stats uses [`UnaryExpressionOp::ToJson`].
     #[internal_api]
     pub(crate) fn read_actions(
         &self,
@@ -1145,9 +1176,7 @@ impl LogSegment {
             engine,
             action_schema.clone(),
             action_schema,
-            None,
-            None,
-            None,
+            CheckpointReadOptions::default(),
         )?;
         Ok(result.actions)
     }
@@ -1453,11 +1482,15 @@ impl LogSegment {
         &self,
         engine: &dyn Engine,
         action_schema: SchemaRef,
-        meta_predicate: Option<PredicateRef>,
-        stats_schema: Option<&StructType>,
-        partition_schema: Option<&StructType>,
+        options: CheckpointReadOptions<'_>,
     ) -> KernelResult<ActionsWithCheckpointInfo<impl KernelResultIterator<ActionsBatch> + use<>>>
     {
+        let CheckpointReadOptions {
+            meta_predicate,
+            stats_schema,
+            partition_schema,
+            stats_json_op,
+        } = options;
         let need_file_actions = schema_contains_file_actions(&action_schema);
 
         let (file_actions_schema, sidecar_files) = if need_file_actions {
@@ -1505,6 +1538,7 @@ impl LogSegment {
                 .as_deref()
                 .and_then(source_collation_stats)
                 .filter(|_| action_schema.contains_col(["add", "stats"])),
+            stats_json_op,
         )?;
         let read_schema = read_transform
             .as_ref()
