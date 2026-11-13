@@ -188,6 +188,7 @@ fn write_location_uri_prefix(
 /// Checks that a writer may write `uri`: it is a `uri` that [`resolve_file_uri`] supports, for any
 /// table root without a query or fragment. The `file` type protocol requires a writer to write
 /// each `uri` as an absolute URI or as a relative reference resolved per its URI resolution rules.
+#[cfg(feature = "default-engine-base")]
 pub(crate) fn validate_file_uri(uri: &str) -> Result<(), &'static str> {
     check_uri(uri).map(|_| ())
 }
@@ -405,6 +406,7 @@ mod tests {
     }
 
     /// Writes accept exactly the `uri`s that resolution accepts.
+    #[cfg(feature = "default-engine-base")]
     #[rstest]
     #[case("_files/a.png")]
     #[case("s3://other/a.png")]

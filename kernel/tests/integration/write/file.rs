@@ -1075,9 +1075,10 @@ async fn test_new_referenced_file_path_rejects_invalid_write_location(
         DataType::file_type(),
     )])?);
     let (_tmp_dir, table_path, engine) = test_table_setup_mt()?;
-    create_table_and_load_snapshot(&table_path, schema, engine.as_ref(), &[])?;
-    let table_url = Url::from_directory_path(&table_path).unwrap();
-    let value = value.replace("TABLE_ROOT/", table_url.as_str());
+    let snapshot = create_table_and_load_snapshot(&table_path, schema, engine.as_ref(), &[])?;
+    // The snapshot's table root, which may differ from the raw temp path, as on Windows (8.3
+    // short names) and macOS (`/var` links to `/private/var`).
+    let value = value.replace("TABLE_ROOT/", snapshot.table_root().as_str());
     let snapshot = set_write_location(&table_path, engine.as_ref(), &value).await?;
 
     let err = new_referenced_file_path(&snapshot, engine.as_ref(), None)
