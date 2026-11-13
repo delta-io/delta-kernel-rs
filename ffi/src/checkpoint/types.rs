@@ -1,8 +1,6 @@
-//! The type of the selected checkpoint, available without engine I/O.
+//! C-compatible checkpoint format types.
 
-use delta_kernel::snapshot::SelectedCheckpointType;
-
-use crate::{Handle, OptionalValue, SharedSnapshot};
+use delta_kernel::checkpoint::SelectedCheckpointType;
 
 /// The selected checkpoint's specification. See [`SelectedCheckpointType`].
 ///
@@ -36,20 +34,4 @@ impl From<FfiSelectedCheckpointType> for SelectedCheckpointType {
             FfiSelectedCheckpointType::V2 => Self::V2,
         }
     }
-}
-
-/// Returns the selected checkpoint specification, when known, without engine I/O.
-/// Returns absent if no checkpoint was selected, or `Unresolved` if its type was not retained
-/// during construction. The observation remains fixed for the snapshot's lifetime.
-///
-/// # Safety
-/// `snapshot` must be valid and remain owned by the caller throughout the call.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn snapshot_checkpoint_type(
-    snapshot: Handle<SharedSnapshot>,
-) -> OptionalValue<FfiSelectedCheckpointType> {
-    unsafe { snapshot.as_ref() }
-        .checkpoint_type()
-        .map(Into::into)
-        .into()
 }

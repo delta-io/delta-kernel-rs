@@ -1,11 +1,21 @@
-//! FFI checkpoint layout and metadata resolved through the engine's declarative executor.
+//! FFI checkpoint types and metadata resolved through the engine's declarative executor.
 
+mod types;
+
+pub use types::FfiSelectedCheckpointType;
+
+#[cfg(feature = "declarative-plans")]
 use delta_kernel::KernelResult;
+#[cfg(feature = "declarative-plans")]
 use delta_kernel::checkpoint::{CheckpointKind, CheckpointShape};
 
+#[cfg(feature = "declarative-plans")]
 use crate::delta_types::{CheckpointBacking, FfiLastCheckpoint};
+#[cfg(feature = "declarative-plans")]
 use crate::error::{ExternResult, IntoExternResult};
+#[cfg(feature = "declarative-plans")]
 use crate::handle::Handle;
+#[cfg(feature = "declarative-plans")]
 use crate::{
     KernelStringSlice, NullableCvoid, SharedExternEngine, SharedSnapshot, kernel_string_slice,
 };
@@ -13,6 +23,7 @@ use crate::{
 /// Complete borrowed checkpoint summary passed to [`CheckpointShapeVisitor`].
 /// All nested storage expires when that visitor returns.
 #[repr(C)]
+#[cfg(feature = "declarative-plans")]
 pub struct FfiCheckpointShape {
     /// Schema JSON for the files containing Add and Remove actions. For manifest checkpoints this
     /// is the sidecar schema; JSON leaves use the canonical action read schema.
@@ -33,6 +44,7 @@ pub struct FfiCheckpointShape {
 /// cbindgen:prefix-with-name=true
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(C)]
+#[cfg(feature = "declarative-plans")]
 pub enum FfiCheckpointKind {
     /// File actions are stored in the checkpoint parts themselves.
     Inline = 0,
@@ -42,9 +54,11 @@ pub enum FfiCheckpointKind {
 
 /// Receives one summary, or null if the snapshot has no selected checkpoint.
 /// Copy every retained value before returning.
+#[cfg(feature = "declarative-plans")]
 pub type CheckpointShapeVisitor =
     extern "C" fn(context: NullableCvoid, checkpoint: *const FfiCheckpointShape);
 
+#[cfg(feature = "declarative-plans")]
 impl From<CheckpointKind> for FfiCheckpointKind {
     fn from(kind: CheckpointKind) -> Self {
         match kind {
@@ -70,6 +84,7 @@ impl From<CheckpointKind> for FfiCheckpointKind {
 /// During initialization, the plan executor must not call this function recursively on the same
 /// snapshot: the recursive call would wait for the initialization already in progress.
 #[unsafe(no_mangle)]
+#[cfg(feature = "declarative-plans")]
 pub unsafe extern "C" fn snapshot_checkpoint_info(
     snapshot: Handle<SharedSnapshot>,
     engine: Handle<SharedExternEngine>,
@@ -86,6 +101,7 @@ pub unsafe extern "C" fn snapshot_checkpoint_info(
     unsafe { result.into_extern_result(&engine) }
 }
 
+#[cfg(feature = "declarative-plans")]
 fn visit(
     info: Option<&CheckpointShape>,
     context: NullableCvoid,
@@ -108,7 +124,7 @@ fn visit(
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "declarative-plans"))]
 mod tests {
     use std::ptr::NonNull;
     use std::sync::Arc;

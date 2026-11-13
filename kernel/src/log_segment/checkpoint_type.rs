@@ -1,9 +1,9 @@
 use super::{LogSegment, SelectedCheckpoint};
 use crate::actions::CHECKPOINT_METADATA_NAME;
+use crate::checkpoint::SelectedCheckpointType;
 use crate::error::SnapshotHintError;
 use crate::last_checkpoint_hint::LastCheckpointHint;
 use crate::path::{LogPathFileType, ParsedLogPath};
-use crate::snapshot::SelectedCheckpointType;
 use crate::{KernelResult, Version};
 
 impl LogSegment {

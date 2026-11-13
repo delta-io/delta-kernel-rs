@@ -1,4 +1,4 @@
-//! The type of the checkpoint selected by a snapshot.
+//! Checkpoint format types.
 
 /// The specification observed for a snapshot's selected checkpoint.
 ///

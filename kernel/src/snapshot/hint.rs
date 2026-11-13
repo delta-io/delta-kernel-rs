@@ -5,6 +5,7 @@ use std::sync::Arc;
 use delta_kernel_derive::internal_api;
 
 use crate::actions::{Metadata, Protocol};
+use crate::checkpoint::SelectedCheckpointType;
 use crate::crc::Crc;
 use crate::error::SnapshotHintError;
 use crate::last_checkpoint_hint::LastCheckpointHint;
@@ -12,7 +13,7 @@ use crate::log_path::LogPath;
 use crate::log_segment::{LogSegment, validate_catalog_version_bounds};
 use crate::log_segment_files::{CheckpointHandling, LogSegmentFiles};
 use crate::path::{DELTA_LOG_DIR_WITH_SLASH, ParsedLogPath};
-use crate::snapshot::{IncrementalReplay, SelectedCheckpointType, SnapshotRef};
+use crate::snapshot::{IncrementalReplay, SnapshotRef};
 use crate::table_configuration::TableConfiguration;
 use crate::utils::{require, try_parse_uri};
 use crate::{KernelError, KernelResult, Result, Snapshot, Version};
