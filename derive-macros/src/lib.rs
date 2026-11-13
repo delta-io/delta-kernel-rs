@@ -618,14 +618,8 @@ fn try_from_plan_result_impl(input: &DeriveInput) -> Result<TokenStream, Error> 
                     let schema = ::std::sync::Arc::new(
                         <#struct_name as delta_kernel::schema::ToSchema>::to_schema(),
                     );
-                    let (names, types): (::std::vec::Vec<_>, ::std::vec::Vec<_>) = schema
-                        .fields()
-                        .map(|field| (
-                            delta_kernel::expressions::ColumnName::new([field.name()]),
-                            field.data_type().clone(),
-                        ))
-                        .unzip();
-                    (schema, (names, types).into())
+                    let columns = schema.leaves(None);
+                    (schema, columns)
                 });
                 (&METADATA.0, &METADATA.1)
             }

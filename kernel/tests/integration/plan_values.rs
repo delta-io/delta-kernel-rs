@@ -69,6 +69,17 @@ fn plan<T: delta_kernel::schema::ToSchema + Into<StructData>>(rows: Vec<T>) -> K
     PlanBuilder::values(schema, rows)?.build()
 }
 
+fn convert_rows<T>(result: PlanResult, singleton: bool) -> KernelResult<Vec<T>>
+where
+    T: PlanResultRow + TryFrom<PlanResult, Error = KernelError>,
+{
+    if singleton {
+        T::try_from(result).map(|row| vec![row])
+    } else {
+        result.try_into()
+    }
+}
+
 #[test]
 fn executor_results_convert_directly_to_singleton_and_vector() -> KernelResult<()> {
     let executor = SyncPlanExecutor::default();
@@ -137,11 +148,7 @@ fn late_stream_errors_win_over_cardinality(
         Ok(row_batch(vec![Some(1); count])),
         Err(KernelError::generic("late")),
     ]);
-    let error = if singleton {
-        TestRow::try_from(result).map(|_| ()).unwrap_err()
-    } else {
-        Vec::<TestRow>::try_from(result).map(|_| ()).unwrap_err()
-    };
+    let error = convert_rows::<TestRow>(result, singleton).unwrap_err();
     assert!(
         matches!(error.without_backtrace(), KernelError::Generic(message) if message == "late")
     );
@@ -155,11 +162,7 @@ fn non_data_variants_are_rejected(
     #[case] result: fn() -> PlanResult,
     #[values(false, true)] singleton: bool,
 ) {
-    let error = if singleton {
-        TestRow::try_from(result()).map(|_| ()).unwrap_err()
-    } else {
-        Vec::<TestRow>::try_from(result()).map(|_| ()).unwrap_err()
-    };
+    let error = convert_rows::<TestRow>(result(), singleton).unwrap_err();
     assert!(matches!(
         error.without_backtrace(),
         KernelError::PlanResultTypeMismatch {
