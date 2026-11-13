@@ -316,12 +316,21 @@ pub fn evaluate_expression(
         (Predicate(_), Some(data_type)) => Err(KernelError::generic(format!(
             "Predicate evaluation produces boolean output, but caller expects {data_type:?}"
         ))),
-        (Unary(UnaryExpression { op, expr }), result_type) => match result_type {
+        (
+            Unary(UnaryExpression {
+                op: op @ ToJson {
+                    full_precision_timestamps,
+                },
+                expr,
+            }),
+            result_type,
+        ) => match result_type {
             None | Some(&DataType::STRING) => {
                 let input = evaluate_expression(expr, batch, None)?;
-                let formats = match op {
-                    ToJson => STATS_TIMESTAMP_MILLIS_FORMATS,
-                    ToJsonFullPrecision => STATS_TIMESTAMP_MICROS_FORMATS,
+                let formats = if *full_precision_timestamps {
+                    STATS_TIMESTAMP_MICROS_FORMATS
+                } else {
+                    STATS_TIMESTAMP_MILLIS_FORMATS
                 };
                 Ok(to_json_with_timestamp_formats(&input, formats)?)
             }
@@ -884,7 +893,7 @@ struct TimestampFormats {
     tz: &'static str,
 }
 
-/// The timestamp encoding [`UnaryExpressionOp::ToJson`] requires.
+/// The timestamp encoding [`UnaryExpressionOp::ToJson`] requires by default.
 ///
 /// `%.3f` truncates rather than rounds, and floors below the epoch. Reader subtracts .000999
 /// from the query value before comparing it to the max stat so it doesn't skip the wrong files.
@@ -899,14 +908,15 @@ const STATS_TIMESTAMP_MILLIS_FORMATS: TimestampFormats = TimestampFormats {
     tz: "%Y-%m-%dT%H:%M:%S%.3fZ",
 };
 
-/// The timestamp encoding [`UnaryExpressionOp::ToJsonFullPrecision`] requires: the same as
+/// The timestamp encoding [`UnaryExpressionOp::ToJson`] requires with `full_precision_timestamps`:
+/// the same as
 /// [`STATS_TIMESTAMP_MILLIS_FORMATS`], but with every microsecond digit.
 const STATS_TIMESTAMP_MICROS_FORMATS: TimestampFormats = TimestampFormats {
     ntz: "%Y-%m-%dT%H:%M:%S%.6f",
     tz: "%Y-%m-%dT%H:%M:%S%.6fZ",
 };
 
-/// Converts a StructArray to JSON-encoded strings, as [`UnaryExpressionOp::ToJson`] does.
+/// Converts a StructArray to JSON-encoded strings, as [`UnaryExpressionOp::TO_JSON`] does.
 #[internal_api]
 pub(crate) fn to_json(input: &dyn Datum) -> KernelResult<ArrayRef, ArrowError> {
     to_json_with_timestamp_formats(input, STATS_TIMESTAMP_MILLIS_FORMATS)
@@ -2462,7 +2472,7 @@ mod tests {
 
     /// Delta truncates timestamp stats down to milliseconds, so `ToJson` must emit exactly three
     /// fractional digits, floored: a max stat above the true value lets readers prune a file that
-    /// still holds a matching row. `ToJsonFullPrecision` keeps all six microsecond digits.
+    /// still holds a matching row. `full_precision_timestamps` keeps all six microsecond digits.
     /// `Timestamp` carries a `Z` suffix, `TimestampNtz` none.
     #[rstest]
     // Sub-millisecond digits are dropped, not rounded (.298677 -> .298).
@@ -2490,8 +2500,7 @@ mod tests {
         #[case] expected_millis: &str,
         #[case] expected_micros: &str,
         #[values(None, Some("UTC"))] timezone: Option<&str>,
-        #[values(UnaryExpressionOp::ToJson, UnaryExpressionOp::ToJsonFullPrecision)]
-        op: UnaryExpressionOp,
+        #[values(false, true)] full_precision_timestamps: bool,
     ) {
         let array = TimestampMicrosecondArray::from(vec![micros]);
         let array: ArrayRef = match timezone {
@@ -2501,14 +2510,15 @@ mod tests {
         let field = ArrowField::new("ts", array.data_type().clone(), true);
         let value = StructArray::from(vec![(Arc::new(field), array)]);
 
-        let expected = match op {
-            UnaryExpressionOp::ToJson => expected_millis,
-            UnaryExpressionOp::ToJsonFullPrecision => expected_micros,
+        let expected = if full_precision_timestamps {
+            expected_micros
+        } else {
+            expected_millis
         };
         // A UTC-annotated array renders the protocol's `Z` suffix; NTZ has no offset at all.
         let suffix = if timezone.is_some() { "Z" } else { "" };
         assert_eq!(
-            to_json_string(op, value),
+            to_json_string(full_precision_timestamps, value),
             format!(r#"{{"ts":"{expected}{suffix}"}}"#)
         );
     }
@@ -2538,20 +2548,20 @@ mod tests {
             (outer, format!(r#"{{"minValues":{{"ts":"{expected}"}}}}"#)),
         ] {
             assert_eq!(
-                to_json_string(UnaryExpressionOp::ToJson, value),
+                to_json_string(false, value),
                 expected,
                 "timezone {timezone}"
             );
         }
     }
 
-    /// `ParseJson` recovers what `ToJsonFullPrecision` wrote exactly, and recovers `ToJson` output
-    /// only down to the millisecond.
+    /// `ParseJson` recovers what `ToJson` wrote with `full_precision_timestamps` exactly, and
+    /// recovers its default output only down to the millisecond.
     #[rstest]
-    #[case::full_precision(UnaryExpressionOp::ToJsonFullPrecision, 1_783_007_755_298_677)]
-    #[case::millis(UnaryExpressionOp::ToJson, 1_783_007_755_298_000)]
+    #[case::full_precision(true, 1_783_007_755_298_677)]
+    #[case::millis(false, 1_783_007_755_298_000)]
     fn test_parse_json_round_trips_timestamp_json(
-        #[case] op: UnaryExpressionOp,
+        #[case] full_precision_timestamps: bool,
         #[case] expected_micros: i64,
     ) {
         let micros = 1_783_007_755_298_677;
@@ -2575,6 +2585,9 @@ mod tests {
             nullable "ts": TIMESTAMP,
             nullable "ntz": TIMESTAMP_NTZ,
         };
+        let op = UnaryExpressionOp::ToJson {
+            full_precision_timestamps,
+        };
         let expr = Expr::parse_json(Expr::unary(op, col!("s")), output_schema);
         let result = evaluate_expression(&expr, &batch, None).unwrap();
         let result = result.as_struct();
@@ -2593,19 +2606,23 @@ mod tests {
     fn test_to_json_rejects_invalid_types(
         #[case] result_type: Option<&DataType>,
         #[case] expected_error: &str,
-        #[values(UnaryExpressionOp::ToJson, UnaryExpressionOp::ToJsonFullPrecision)]
-        op: UnaryExpressionOp,
+        #[values(false, true)] full_precision_timestamps: bool,
     ) {
+        let op = UnaryExpressionOp::ToJson {
+            full_precision_timestamps,
+        };
         let expr = Expr::unary(op, col!("a"));
         let result = evaluate_expression(&expr, &create_test_batch(), result_type);
         assert_result_error_with_message(result, expected_error);
     }
 
-    /// Evaluates the JSON-encoding `op` over a one-column batch wrapping `value` and returns the
-    /// encoded row.
-    fn to_json_string(op: UnaryExpressionOp, value: StructArray) -> String {
+    /// Evaluates `ToJson` over a one-column batch wrapping `value` and returns the encoded row.
+    fn to_json_string(full_precision_timestamps: bool, value: StructArray) -> String {
         let schema = ArrowSchema::new(vec![ArrowField::new("s", value.data_type().clone(), true)]);
         let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(value)]).unwrap();
+        let op = UnaryExpressionOp::ToJson {
+            full_precision_timestamps,
+        };
         let expr = Expr::unary(op, col!("s"));
         let result = evaluate_expression(&expr, &batch, Some(&DataType::STRING)).unwrap();
         let result = result.as_any().downcast_ref::<StringArray>().unwrap();
@@ -2653,7 +2670,7 @@ mod tests {
         )]);
         let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(value)]).unwrap();
 
-        let expr = Expr::unary(UnaryExpressionOp::ToJson, col!("s"));
+        let expr = Expr::unary(UnaryExpressionOp::TO_JSON, col!("s"));
         let result = evaluate_expression(&expr, &batch, Some(&DataType::STRING)).unwrap();
         let result = result.as_any().downcast_ref::<StringArray>().unwrap();
         assert_eq!(result.value(0), r#"{"b":"abcd","l":[1,2],"n":{"z":7}}"#);

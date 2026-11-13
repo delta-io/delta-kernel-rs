@@ -128,7 +128,8 @@ pub enum UnaryExpressionOp {
     /// SQL `to_json(expr)`: encode a struct as a JSON object string, one string per row. The input
     /// must be a struct and the output is STRING. A NULL input row produces a NULL string rather
     /// than `"null"`. This is the inverse of [`ParseJsonExpression`] for every type except
-    /// timestamps, whose sub-millisecond precision this operator discards (see below).
+    /// timestamps, whose sub-millisecond precision this operator discards unless
+    /// `full_precision_timestamps` is set (see below).
     ///
     /// Nested structs and arrays encode as JSON objects and arrays. Binary encodes as lowercase
     /// hex rather than base64, two digits per byte in the order the bytes appear, so
@@ -145,13 +146,22 @@ pub enum UnaryExpressionOp {
     /// `{"ts":"2026-07-02T15:55:55.298Z"}`. Emitting more digits, or rounding up, makes readers
     /// prune files that hold matching rows.
     ///
+    /// When `full_precision_timestamps` is set, timestamps instead encode with exactly six
+    /// fractional digits, so the same value becomes `{"ts":"2026-07-02T15:55:55.298677Z"}` and the
+    /// operator is the exact inverse of [`ParseJsonExpression`].
+    ///
     /// [Per-file Statistics]: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#per-file-statistics
-    ToJson,
-    /// Like [`ToJson`](Self::ToJson), but timestamps keep their full microsecond precision: they
-    /// encode with exactly six fractional digits, so `{ ts: 2026-07-02T15:55:55.298677Z }` becomes
-    /// `{"ts":"2026-07-02T15:55:55.298677Z"}`. This is the exact inverse of
-    /// [`ParseJsonExpression`].
-    ToJsonFullPrecision,
+    ToJson {
+        /// Encode timestamps with all six microsecond digits instead of three.
+        full_precision_timestamps: bool,
+    },
+}
+
+impl UnaryExpressionOp {
+    /// [`ToJson`](Self::ToJson) with timestamps truncated to milliseconds.
+    pub const TO_JSON: Self = Self::ToJson {
+        full_precision_timestamps: false,
+    };
 }
 
 /// A binary arithmetic operator over two numeric operands.
@@ -392,8 +402,8 @@ pub struct CaseWhenExpression {
 }
 
 /// An expression that parses a JSON string column into a struct column of `output_schema`, the
-/// inverse of [`UnaryExpressionOp::ToJsonFullPrecision`], and of [`UnaryExpressionOp::ToJson`]
-/// except for the sub-millisecond timestamp precision that operator discards.
+/// inverse of [`UnaryExpressionOp::ToJson`] except for the sub-millisecond timestamp precision
+/// that operator discards unless `full_precision_timestamps` is set.
 ///
 /// Unparseable input must degrade to NULL rather than fail the query, because kernel parses
 /// `add.stats` with this operator and data skipping reads null stats as "include the file". The
@@ -1042,7 +1052,7 @@ impl Expression {
     /// Creates a new ParseJson expression that parses a JSON string column into a struct.
     /// This is the inverse of [`UnaryExpressionOp::ToJson`] - it converts a JSON-encoded string
     /// into a struct. Sub-millisecond timestamp precision does not survive the round trip, since
-    /// `ToJson` truncates it; use [`UnaryExpressionOp::ToJsonFullPrecision`] to keep it.
+    /// `ToJson` truncates it unless `full_precision_timestamps` is set.
     pub fn parse_json(json_expr: impl Into<Expression>, output_schema: SchemaRef) -> Self {
         Self::ParseJson(ParseJsonExpression::new(json_expr, output_schema))
     }
@@ -1241,8 +1251,7 @@ impl Display for UnaryExpressionOp {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         use UnaryExpressionOp::*;
         match self {
-            ToJson => write!(f, "TO_JSON"),
-            ToJsonFullPrecision => write!(f, "TO_JSON_FULL_PRECISION"),
+            ToJson { .. } => write!(f, "TO_JSON"),
         }
     }
 }
@@ -1328,6 +1337,13 @@ impl Display for Expression {
                 }
                 write!(f, ")")
             }
+            Unary(UnaryExpression {
+                op:
+                    op @ UnaryExpressionOp::ToJson {
+                        full_precision_timestamps: true,
+                    },
+                expr,
+            }) => write!(f, "{op}({expr}, full_precision_timestamps)"),
             Unary(UnaryExpression { op, expr }) => write!(f, "{op}({expr})"),
             Binary(BinaryExpression { op, left, right }) => write!(f, "{left} {op} {right}"),
             Variadic(VariadicExpression { op, exprs }) => {
@@ -1496,12 +1512,17 @@ mod tests {
                 "CAST(Column(x) AS date)",
             ),
             (
-                Expr::unary(UnaryExpressionOp::ToJson, col!("x")),
+                Expr::unary(UnaryExpressionOp::TO_JSON, col!("x")),
                 "TO_JSON(Column(x))",
             ),
             (
-                Expr::unary(UnaryExpressionOp::ToJsonFullPrecision, col!("x")),
-                "TO_JSON_FULL_PRECISION(Column(x))",
+                Expr::unary(
+                    UnaryExpressionOp::ToJson {
+                        full_precision_timestamps: true,
+                    },
+                    col!("x"),
+                ),
+                "TO_JSON(Column(x), full_precision_timestamps)",
             ),
             (
                 Expr::case_when([(col!("x").is_null(), lit(0))], col!("x")),
@@ -1712,10 +1733,10 @@ mod tests {
         // ==================== Expression Operations Tests ====================
 
         #[rstest::rstest]
-        fn test_unary_expression_roundtrip(
-            #[values(UnaryExpressionOp::ToJson, UnaryExpressionOp::ToJsonFullPrecision)]
-            op: UnaryExpressionOp,
-        ) {
+        fn test_unary_expression_roundtrip(#[values(false, true)] full_precision_timestamps: bool) {
+            let op = UnaryExpressionOp::ToJson {
+                full_precision_timestamps,
+            };
             let expr = Expression::unary(op, col!("data"));
             assert_roundtrip(&expr);
         }
