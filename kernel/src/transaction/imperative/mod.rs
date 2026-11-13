@@ -25,10 +25,9 @@ use crate::committer::{CommitMetadata, CommitResponse};
 use crate::crc::FileStatsDelta;
 use crate::engine_data::FilteredEngineData;
 use crate::error::KernelError;
-use crate::expressions::UnaryExpressionOp::ToJson;
 use crate::expressions::{
-    ArrayData, ColumnName, ExpressionStructPatch, ExpressionStructPatchBuilder, Predicate, col,
-    column_name, lit, null_lit,
+    ArrayData, ColumnName, ExpressionStructPatch, ExpressionStructPatchBuilder, Predicate,
+    UnaryExpressionOp, col, column_name, lit, null_lit,
 };
 use crate::log_replay::HasSelectionVector;
 use crate::metrics::CommitFailureReason;
@@ -703,7 +702,7 @@ fn build_add_action_projection(
         .replace(
             "stats",
             StructField::nullable("stats", DataType::STRING),
-            Expression::unary(ToJson, col!("stats")),
+            Expression::unary(UnaryExpressionOp::TO_JSON, col!("stats")),
         )
         .build()?;
     let patch = Expression::struct_from([patch]);
@@ -803,7 +802,7 @@ fn build_remove_struct_patch(
         // Replace stats with COALESCE(stats, TO_JSON(stats_parsed)) and drop stats_parsed.
         let coalesce_stats = Expression::coalesce([
             col!("stats"),
-            Expression::unary(ToJson, col!(STATS_PARSED_NAME)),
+            Expression::unary(UnaryExpressionOp::TO_JSON, col!(STATS_PARSED_NAME)),
         ]);
         patch = patch
             .replace("stats", coalesce_stats)
