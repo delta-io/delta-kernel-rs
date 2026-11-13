@@ -21,6 +21,7 @@ use crate::actions::{
     LOG_ADD_SCHEMA, SIDECAR_FILE_SCHEMA_TAG, SIDECAR_NAME, Sidecar, action_presence_leaf,
     schema_contains_file_actions,
 };
+use crate::checkpoint::SelectedCheckpoint;
 use crate::checkpoint::collation_stats::{
     build_collation_stats_read_transform, source_collation_stats,
 };
@@ -158,16 +159,6 @@ pub(crate) struct LogSegment {
     /// [`Self::checkpoint_hint_sidecars`] accessors built on it). Read this field directly only
     /// when the raw hint is wanted as-is -- e.g. re-threading it into a derived segment.
     pub(crate) last_checkpoint_metadata: Option<LastCheckpointHint>,
-}
-
-/// The selected checkpoint and the type established when its segment was constructed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[internal_api]
-pub(crate) struct SelectedCheckpoint {
-    /// The selected checkpoint's version.
-    pub version: Version,
-    /// The retained type observation. Reads do not refine this value.
-    pub checkpoint_type: crate::checkpoint::SelectedCheckpointType,
 }
 
 /// Validate the invariants shared by catalog-managed snapshot and commit-range log tails.

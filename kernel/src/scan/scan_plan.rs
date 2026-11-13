@@ -267,7 +267,7 @@ mod tests {
             .unwrap_or_default();
         LogSegment {
             end_version,
-            checkpoint: checkpoint_version.map(|version| crate::log_segment::SelectedCheckpoint {
+            checkpoint: checkpoint_version.map(|version| crate::checkpoint::SelectedCheckpoint {
                 version,
                 checkpoint_type: crate::checkpoint::SelectedCheckpointType::Unresolved,
             }),

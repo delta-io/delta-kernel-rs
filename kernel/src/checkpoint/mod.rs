@@ -148,6 +148,8 @@ mod types;
 #[cfg(feature = "declarative-plans")]
 pub use shape::{CheckpointKind, CheckpointShape};
 use sidecar::{SidecarSplitter, SingleSidecarDataIterator, create_sidecar_action_batch};
+#[delta_kernel_derive::internal_api]
+pub(crate) use types::SelectedCheckpoint;
 pub use types::SelectedCheckpointType;
 #[cfg(test)]
 pub(crate) mod tests;

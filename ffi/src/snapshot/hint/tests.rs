@@ -416,20 +416,33 @@ fn exported_hint_copy_outlives_snapshot_and_preserves_state(
 }
 
 #[rstest::rstest]
-#[case::no_checkpoint("memory:///hinted-table/_delta_log/00000000000000000000.json")]
-#[case::v2_checkpoint(
-    "memory:///hinted-table/_delta_log/00000000000000000000.checkpoint.550e8400-e29b-41d4-a716-446655440000.parquet"
+#[case::no_checkpoint(
+    &["memory:///hinted-table/_delta_log/00000000000000000000.json"],
+    FfiSelectedCheckpointType::V1
 )]
-fn checkpoint_type_claim_rejects_conflicting_paths(#[case] location: &'static str) {
-    // Given paths incompatible with a V1 checkpoint claim.
+#[case::v1_checkpoint(
+    &[
+        "memory:///hinted-table/_delta_log/00000000000000000000.checkpoint.0000000001.0000000002.parquet",
+        "memory:///hinted-table/_delta_log/00000000000000000000.checkpoint.0000000002.0000000002.parquet",
+    ],
+    FfiSelectedCheckpointType::V2
+)]
+#[case::v2_checkpoint(
+    &["memory:///hinted-table/_delta_log/00000000000000000000.checkpoint.550e8400-e29b-41d4-a716-446655440000.parquet"],
+    FfiSelectedCheckpointType::V1
+)]
+fn checkpoint_type_claim_rejects_conflicting_paths(
+    #[case] locations: &[&'static str],
+    #[case] claimed_type: FfiSelectedCheckpointType,
+) {
+    // Given paths incompatible with the supplied checkpoint type claim.
     let engine = test_engine();
-    let path = FfiLogPath::new(slice(location), 0, 1);
-    let mut hint = test_snapshot_hint(
-        std::slice::from_ref(&path),
-        0,
-        FfiSnapshotHintFreshness::Unverified,
-    );
-    hint.checkpoint_type = OptionalValue::Some(FfiSelectedCheckpointType::V1);
+    let paths: Vec<_> = locations
+        .iter()
+        .map(|location| FfiLogPath::new(slice(location), 0, 1))
+        .collect();
+    let mut hint = test_snapshot_hint(&paths, 0, FfiSnapshotHintFreshness::Unverified);
+    hint.checkpoint_type = OptionalValue::Some(claimed_type);
     let builder = unsafe {
         ok_or_panic(snapshot_builder_with_snapshot_hint(
             test_builder(&engine),
