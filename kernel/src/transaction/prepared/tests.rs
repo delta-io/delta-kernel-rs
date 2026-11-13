@@ -21,7 +21,7 @@ use crate::unit_test_utils::{
     add_files_with_partition_values, create_valid_add_file_batch, nullable_add_file,
     set_field_as_null,
 };
-use crate::{FilteredEngineData, KernelResultIterator};
+use crate::{FilteredEngineData, KernelResultIterator, Result};
 
 struct ObservedCommitter {
     history_reads: Arc<AtomicUsize>,
@@ -216,7 +216,7 @@ fn table_with_partitioning(
 #[case::partitioned_id_mapping(Some("id"))]
 fn prepare_append_commit_produces_the_exact_post_commit_snapshot(
     #[case] column_mapping_mode: Option<&str>,
-) -> KernelResult<()> {
+) -> Result<()> {
     let (store, engine, snapshot) = table_with_partitioning(column_mapping_mode)?;
     let executor = SyncPlanExecutor::new(Some(store)).get_scoped();
     let mut txn = snapshot
@@ -315,7 +315,7 @@ fn prepare_append_commit_produces_the_exact_post_commit_snapshot(
 }
 
 #[test]
-fn declarative_create_preserves_typed_actions_and_application_transaction() -> KernelResult<()> {
+fn declarative_create_preserves_typed_actions_and_application_transaction() -> Result<()> {
     let store = Arc::new(InMemory::new());
     let engine = SyncEngine::new_with_store(store.clone());
     let executor = SyncPlanExecutor::new(Some(store)).get_scoped();
@@ -367,7 +367,7 @@ fn declarative_create_preserves_typed_actions_and_application_transaction() -> K
 fn conflict_getters_preserve_saved_history_or_error_without_refetching(
     #[case] history_failures: usize,
     #[values(false, true)] discard_pending: bool,
-) -> KernelResult<()> {
+) -> Result<()> {
     let (store, engine, snapshot) = table()?;
     let history_executor = SyncPlanExecutor::new(Some(store));
     let executor = history_executor.get_scoped();
@@ -469,8 +469,8 @@ fn conflict_getters_preserve_saved_history_or_error_without_refetching(
 }
 
 #[test]
-fn retryable_rejection_preserves_actions_and_retries_the_same_version_without_history()
--> KernelResult<()> {
+fn retryable_rejection_preserves_actions_and_retries_the_same_version_without_history() -> Result<()>
+{
     let (store, engine, snapshot) = table()?;
     let executor = SyncPlanExecutor::new(Some(store)).get_scoped();
     let reads = Arc::new(AtomicUsize::new(0));
@@ -527,8 +527,8 @@ fn retryable_rejection_preserves_actions_and_retries_the_same_version_without_hi
 }
 
 #[test]
-fn uncertain_success_preserves_exact_attempt_without_discovery_or_blind_resubmission()
--> KernelResult<()> {
+fn uncertain_success_preserves_exact_attempt_without_discovery_or_blind_resubmission() -> Result<()>
+{
     let (store, engine, snapshot) = table()?;
     let executor = SyncPlanExecutor::new(Some(store)).get_scoped();
     let reads = Arc::new(AtomicUsize::new(0));
@@ -599,7 +599,7 @@ fn partition_key_validation_fails_before_writing(
     #[case] invalid: &str,
     #[values("none", "name", "id")] column_mapping_mode: &str,
     #[values(false, true)] skip_dedup_validation: bool,
-) -> KernelResult<()> {
+) -> Result<()> {
     let (store, engine, snapshot) = table_with_partitioning(Some(column_mapping_mode))?;
     let executor = SyncPlanExecutor::new(Some(store)).get_scoped();
     let keys: Vec<_> = snapshot
@@ -667,7 +667,7 @@ fn partition_key_validation_fails_before_writing(
 #[case::empty_path("empty")]
 #[case::null_size("null_size")]
 #[case::wrong_partition_keys("partition")]
-fn file_action_validation_fails_before_submitting(#[case] invalid: &str) -> KernelResult<()> {
+fn file_action_validation_fails_before_submitting(#[case] invalid: &str) -> Result<()> {
     let (store, engine, snapshot) = table()?;
     let executor = SyncPlanExecutor::new(Some(store)).get_scoped();
     let calls = Arc::new(AtomicUsize::new(0));
@@ -718,7 +718,7 @@ fn file_action_validation_fails_before_submitting(#[case] invalid: &str) -> Kern
 #[rstest]
 fn imperative_conflict_saves_history_or_error_without_refetching(
     #[values(0, 1)] failures: usize,
-) -> KernelResult<()> {
+) -> Result<()> {
     let (_store, engine, snapshot) = table()?;
     let reads = Arc::new(AtomicUsize::new(0));
     let txn = snapshot
@@ -771,7 +771,7 @@ fn imperative_conflict_saves_history_or_error_without_refetching(
 #[case::invalid_reported_version(Some(2))]
 fn post_commit_snapshot_stays_at_committed_version_or_propagates_construction_error(
     #[case] reported_version: Option<Version>,
-) -> KernelResult<()> {
+) -> Result<()> {
     let (store, engine, snapshot) = table()?;
     let executor = SyncPlanExecutor::new(Some(store)).get_scoped();
     let committer = ObservedCommitter {
