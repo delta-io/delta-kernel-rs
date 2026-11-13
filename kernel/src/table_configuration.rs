@@ -17,7 +17,7 @@ use tracing::warn;
 use url::Url;
 
 use crate::actions::{Metadata, NULL_COUNT, Protocol};
-use crate::expressions::ColumnName;
+use crate::expressions::{ColumnName, UnaryExpressionOp};
 use crate::scan::data_skipping::stats_schema::{
     StatsConfig, StripFieldMetadataTransform, expected_stats_schema, is_skipping_eligible_datatype,
     stats_column_names,
@@ -1037,6 +1037,15 @@ impl TableConfiguration {
     pub(crate) fn dv_normalization_root(&self) -> Option<Url> {
         self.is_feature_enabled(&TableFeature::AdaptiveMetadataPreview)
             .then(|| self.table_root.clone())
+    }
+
+    /// The operator that encodes this table's file statistics as JSON.
+    pub(crate) fn stats_json_op(&self) -> UnaryExpressionOp {
+        // The adaptiveMetadata RFC requires untruncated timestamp bounds in file stats.
+        UnaryExpressionOp::ToJson {
+            full_precision_timestamps: self
+                .is_feature_enabled(&TableFeature::AdaptiveMetadataPreview),
+        }
     }
 
     /// The [`Version`] which this [`TableConfiguration`] belongs to.

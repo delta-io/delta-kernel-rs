@@ -126,6 +126,7 @@ use crate::engine_data::FilteredEngineData;
 use crate::expressions::Scalar;
 use crate::last_checkpoint_hint::LastCheckpointHint;
 use crate::log_replay::HasSelectionVector;
+use crate::log_segment::CheckpointReadOptions;
 use crate::path::{self, ParsedLogPath};
 use crate::schema::{SchemaRef, StructField, lazy_schema_ref};
 use crate::snapshot::SnapshotRef;
@@ -465,11 +466,20 @@ impl CheckpointWriter {
         &self,
         engine: &dyn Engine,
     ) -> KernelResult<(ActionReconciliationIterator, SchemaRef)> {
-        // Read actions from log segment
+        let options = CheckpointReadOptions {
+            stats_json_op: self.snapshot.table_configuration().stats_json_op(),
+            ..Default::default()
+        };
         let actions = self
             .snapshot
             .log_segment()
-            .read_actions(engine, self.read_schema.clone())?;
+            .read_actions_with_projected_checkpoint_actions(
+                engine,
+                self.read_schema.clone(),
+                self.read_schema.clone(),
+                options,
+            )?
+            .actions;
 
         // Process actions through reconciliation
         let mut processor = ActionReconciliationProcessor::new(
@@ -758,7 +768,7 @@ impl CheckpointWriter {
         engine: &dyn Engine,
     ) -> KernelResult<CheckpointSchemaContext> {
         let tc = snapshot.table_configuration();
-        let config = StatsTransformConfig::from_table_properties(snapshot.table_properties());
+        let config = StatsTransformConfig::from_table_configuration(tc);
 
         // Select schema based on V2 checkpoint support
         let is_v2 = tc.is_feature_supported(&TableFeature::V2Checkpoint);

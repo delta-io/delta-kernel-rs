@@ -28,7 +28,7 @@ use crate::expressions::{col, column_name};
 use crate::last_checkpoint_hint::{AmtCheckpoint, CheckpointType};
 use crate::last_checkpoint_hint::{HintAction, LastCheckpointHint, LastCheckpointV2};
 use crate::log_replay::ActionsBatch;
-use crate::log_segment::LogSegment;
+use crate::log_segment::{CheckpointReadOptions, LogSegment};
 use crate::log_segment_files::LogSegmentFiles;
 use crate::object_store::ObjectStoreExt as _;
 use crate::object_store::memory::InMemory;
@@ -235,9 +235,7 @@ fn collect_projected_adds(
             engine,
             COMMIT_READ_SCHEMA.clone(),
             CHECKPOINT_READ_SCHEMA.clone(),
-            None,
-            None,
-            None,
+            CheckpointReadOptions::default(),
         )?
         .actions;
     collect_materialized_adds(actions)
@@ -1475,9 +1473,7 @@ async fn test_create_checkpoint_stream_returns_checkpoint_batches_as_is_if_schem
     let checkpoint_result = log_segment.create_checkpoint_stream(
         &engine,
         v2_checkpoint_read_schema.clone(),
-        None, // meta_predicate
-        None, // stats_schema
-        None, // partition_schema
+        CheckpointReadOptions::default(),
     )?;
     let mut iter = checkpoint_result.actions;
 
@@ -1548,9 +1544,7 @@ async fn test_create_checkpoint_stream_returns_checkpoint_batches_if_checkpoint_
     let checkpoint_result = log_segment.create_checkpoint_stream(
         &engine,
         v2_checkpoint_read_schema.clone(),
-        None, // meta_predicate
-        None, // stats_schema
-        None, // partition_schema
+        CheckpointReadOptions::default(),
     )?;
     let mut iter = checkpoint_result.actions;
 
@@ -1613,9 +1607,7 @@ async fn test_create_checkpoint_stream_reads_parquet_checkpoint_batch_without_si
     let checkpoint_result = log_segment.create_checkpoint_stream(
         &engine,
         v2_checkpoint_read_schema.clone(),
-        None, // meta_predicate
-        None, // stats_schema
-        None, // partition_schema
+        CheckpointReadOptions::default(),
     )?;
     let mut iter = checkpoint_result.actions;
 
@@ -1875,9 +1867,7 @@ async fn test_create_checkpoint_stream_reads_json_checkpoint_batch_without_sidec
     let checkpoint_result = log_segment.create_checkpoint_stream(
         &engine,
         v2_checkpoint_read_schema,
-        None, // meta_predicate
-        None, // stats_schema
-        None, // partition_schema
+        CheckpointReadOptions::default(),
     )?;
     let mut iter = checkpoint_result.actions;
 
@@ -1967,9 +1957,7 @@ async fn test_create_checkpoint_stream_reads_checkpoint_file_and_returns_sidecar
     let checkpoint_result = log_segment.create_checkpoint_stream(
         &engine,
         v2_checkpoint_read_schema.clone(),
-        None, // meta_predicate
-        None, // stats_schema
-        None, // partition_schema
+        CheckpointReadOptions::default(),
     )?;
     let mut iter = checkpoint_result.actions;
 
@@ -4166,9 +4154,10 @@ async fn test_checkpoint_stream_resolves_stats_projection(
     let checkpoint_result = log_segment.create_checkpoint_stream(
         &engine,
         CHECKPOINT_READ_SCHEMA_NO_JSON_STATS.clone(),
-        None, // meta_predicate
-        Some(&stats_schema),
-        None, // partition_schema
+        CheckpointReadOptions {
+            stats_schema: Some(&stats_schema),
+            ..Default::default()
+        },
     )?;
 
     assert_eq!(
@@ -4877,9 +4866,10 @@ async fn test_checkpoint_stream_sets_has_partition_values_parsed() -> KernelResu
     let checkpoint_result = log_segment.create_checkpoint_stream(
         &engine,
         read_schema,
-        None, // meta_predicate
-        None, // stats_schema
-        Some(&partition_schema),
+        CheckpointReadOptions {
+            partition_schema: Some(&partition_schema),
+            ..Default::default()
+        },
     )?;
 
     // Verify that checkpoint_info reports partitionValues_parsed as available
@@ -4941,9 +4931,10 @@ async fn test_checkpoint_stream_no_partition_values_parsed_when_incompatible() -
     let checkpoint_result = log_segment.create_checkpoint_stream(
         &engine,
         read_schema.clone(),
-        None,
-        None,
-        Some(&partition_schema),
+        CheckpointReadOptions {
+            partition_schema: Some(&partition_schema),
+            ..Default::default()
+        },
     )?;
 
     // Verify it's false

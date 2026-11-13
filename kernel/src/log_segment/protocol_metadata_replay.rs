@@ -8,7 +8,7 @@ use std::sync::{Arc, LazyLock};
 use tracing::{info, instrument};
 use url::Url;
 
-use super::LogSegment;
+use super::{CheckpointReadOptions, LogSegment};
 #[cfg(all(feature = "adaptive-metadata-in-dev", feature = "declarative-plans"))]
 use super::{last_manifest_commit_inconsistency, require_pointed_checkpoint_action};
 #[cfg(all(feature = "adaptive-metadata-in-dev", feature = "declarative-plans"))]
@@ -331,9 +331,7 @@ impl LogSegment {
                 engine,
                 commit_schema,
                 checkpoint_schema,
-                None,
-                None,
-                None,
+                CheckpointReadOptions::default(),
             )?
             .actions;
         Ok(batches.map(move |batch| {
