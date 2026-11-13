@@ -7,11 +7,13 @@ use crate::log_segment::{
     validate_commit_files_contiguous, validate_commit_files_sorted,
     validate_start_version_available,
 };
-use crate::log_segment_files::LogSegmentFiles;
+use crate::log_segment_files::{
+    LogSegmentFiles, find_complete_checkpoint_version, parse_delta_log_listing,
+};
 use crate::path::ParsedLogPath;
 use crate::snapshot::SnapshotRef;
 use crate::utils::require;
-use crate::{Engine, KernelError, KernelResult, LogPath, Version};
+use crate::{Engine, FileMeta, KernelError, KernelResult, KernelResultIterator, LogPath, Version};
 
 /// Builder for a [`CommitRange`].
 ///
@@ -23,6 +25,9 @@ use crate::{Engine, KernelError, KernelResult, LogPath, Version};
 /// a path-based builder disabled validation with `with_commit_range_validation`. Disabling
 /// validation is only for ascending raw commit-file iteration with `CommitRange::commit_files`;
 /// [`CommitRange::commits`] is unavailable on such ranges.
+///
+/// Use [`Self::build`] with an engine, or `build_declarative` with a plan executor when the
+/// `declarative-plans` feature is enabled.
 pub struct CommitRangeBuilder {
     table_root: String,
     start_version: Version,
@@ -95,8 +100,8 @@ impl CommitRangeBuilder {
 
     /// Enable or disable build-time commit range validation. Defaults to `true`.
     ///
-    /// When `true`, [`Self::build`] requires the requested start version to be present and the
-    /// listed commits to be contiguous. When `false`, [`Self::build`] materializes whatever
+    /// When `true`, building requires the requested start version to be present and the
+    /// listed commits to be contiguous. When `false`, building materializes whatever
     /// commits are listed in the range without validating the start version, contiguity, or
     /// end version. Disabling validation is only supported for path-based builders
     /// ([`CommitRange::builder_for`]) with ascending ordering.
@@ -127,12 +132,57 @@ impl CommitRangeBuilder {
     ///
     /// Returns [`KernelError::MissingVersion`] if a snapshot-derived range requires a commit beyond
     /// what is available from the snapshot's log segment and the supplied catalog tail, or if the
-    /// listed commits are non-contiguous. Returns [`KernelError::StartVersionNotFound`] (carrying
+    /// listed commits are non-contiguous. An unbounded, validated path-based range also returns
+    /// this error if a later complete checkpoint implies missing trailing commit JSON files.
+    /// Returns [`KernelError::StartVersionNotFound`] (carrying
     /// the earliest still-available version) if the requested start is unavailable but later
     /// versions exist, [`KernelError::EmptyLog`] if nothing is available in the requested range at
     /// all, and [`KernelError::CommitRange`] if the resolved version range is invalid
     /// (start > end).
     pub fn build(self, engine: &dyn Engine) -> KernelResult<CommitRange> {
+        self.build_with_file_listing_fn(|listing_start_url| {
+            engine.storage_handler().list_from(listing_start_url)
+        })
+    }
+
+    /// Builds a commit range using the executor for filesystem listing.
+    ///
+    /// Catalog tails, version bounds, and validation match [`Self::build`].
+    /// A snapshot-based builder reuses its log segment without invoking the executor. Path-based
+    /// builders request file metadata only; neither path reads commit JSON.
+    ///
+    /// ```no_run
+    /// use delta_kernel::commit_range::CommitRange;
+    /// use delta_kernel::plans::PlanExecutor;
+    /// # fn example(executor: &dyn PlanExecutor) -> delta_kernel::KernelResult<CommitRange> {
+    /// CommitRange::builder_for("file:///data/table/", 11)
+    ///     .with_end_version(13)
+    ///     .build_declarative(executor)
+    /// # }
+    /// ```
+    #[cfg(feature = "declarative-plans")]
+    pub fn build_declarative(
+        self,
+        executor: &dyn crate::plans::PlanExecutor,
+    ) -> KernelResult<CommitRange> {
+        self.build_with_file_listing_fn(|listing_start_url| {
+            executor
+                .execute_op(crate::plans::Operation::IoOperation(
+                    crate::plans::IoOperation::file_listing(listing_start_url.clone()),
+                ))?
+                .into_file_meta()
+        })
+    }
+
+    /// Builds a commit range, using `file_listing_fn` when no snapshot was supplied.
+    ///
+    /// The callback receives the `_delta_log/` listing offset for `start_version` and returns file
+    /// metadata. Snapshot-based builders reuse their log segment without invoking the callback.
+    /// Neither path reads commit JSON.
+    fn build_with_file_listing_fn(
+        self,
+        file_listing_fn: impl FnOnce(&Url) -> KernelResult<Box<dyn KernelResultIterator<FileMeta>>>,
+    ) -> KernelResult<CommitRange> {
         self.validate_supported_modes()?;
 
         let table_root = Self::parse_table_root(&self.table_root)?;
@@ -157,13 +207,35 @@ impl CommitRangeBuilder {
                 start_version,
                 configured_end_version,
             )?,
-            None => Self::list_commit_files(
-                engine,
-                &log_root,
-                log_tail,
-                start_version,
-                configured_end_version,
-            )?,
+            None => {
+                let listing_start_url = log_root.join(&format!("{start_version:020}"))?;
+                let listing = parse_delta_log_listing(
+                    file_listing_fn(&listing_start_url)?,
+                    &log_root,
+                    configured_end_version.unwrap_or(Version::MAX),
+                );
+                let (commit_files, latest_complete_checkpoint_version) =
+                    Self::collect_commit_files(
+                        listing,
+                        log_tail,
+                        start_version,
+                        configured_end_version,
+                    )?;
+                let latest_commit_version =
+                    commit_files.last().ok_or(KernelError::EmptyLog)?.version;
+                // If a listing contains only 11.json, 12.json, and a complete checkpoint at 13, the
+                // table reached version 13 even though 13.json is missing. An unbounded validated
+                // range must report MissingVersion(13). Calling with_commit_range_validation(false)
+                // permits a range ending at 12.
+                let latest_version = if commit_range_validation {
+                    latest_commit_version
+                        .max(latest_complete_checkpoint_version.unwrap_or(latest_commit_version))
+                } else {
+                    latest_commit_version
+                };
+                let end_version = configured_end_version.unwrap_or(latest_version);
+                (commit_files, end_version)
+            }
         };
 
         validate_commit_file_types(&commit_files)?;
@@ -232,24 +304,34 @@ impl CommitRangeBuilder {
         Ok((commit_files, end_version))
     }
 
-    fn list_commit_files(
-        engine: &dyn Engine,
-        log_root: &Url,
+    /// Collects commit files from `file_listing` and the supplied log tail.
+    ///
+    /// Also returns the latest complete checkpoint version found in the listing. This lets callers
+    /// detect missing commit JSON files when a checkpoint is newer than the last listed commit.
+    fn collect_commit_files(
+        file_listing: impl KernelResultIterator<ParsedLogPath>,
         log_tail: Vec<ParsedLogPath>,
         start_version: Version,
         configured_end_version: Option<Version>,
-    ) -> KernelResult<(Vec<ParsedLogPath>, Version)> {
-        let commit_files = LogSegmentFiles::list_commits(
-            engine.storage_handler().as_ref(),
-            log_root,
+    ) -> KernelResult<(Vec<ParsedLogPath>, Option<Version>)> {
+        let mut checkpoint_parts = Vec::new();
+        let file_listing = file_listing.inspect(|file| {
+            if let Ok(file) = file
+                && file.is_checkpoint()
+            {
+                checkpoint_parts.push(file.clone());
+            }
+        });
+        let commit_files = LogSegmentFiles::from_commit_listing(
+            file_listing,
             log_tail,
-            Some(start_version),
-            configured_end_version,
+            start_version,
+            configured_end_version.unwrap_or(Version::MAX),
         )?
         .ascending_commit_files;
-        let last_version = commit_files.last().ok_or(KernelError::EmptyLog)?.version;
-        let end_version = configured_end_version.unwrap_or(last_version);
-        Ok((commit_files, end_version))
+        let latest_complete_checkpoint_version =
+            find_complete_checkpoint_version(&checkpoint_parts);
+        Ok((commit_files, latest_complete_checkpoint_version))
     }
 
     fn validate_complete_range(
@@ -330,7 +412,11 @@ mod tests {
     use crate::commit_range::DeltaAction;
     use crate::engine::DelegatingEngine;
     use crate::engine::sync::SyncEngine;
+    #[cfg(feature = "declarative-plans")]
+    use crate::engine::sync::plan::SyncPlanExecutor;
     use crate::path::LogPathFileType;
+    #[cfg(feature = "declarative-plans")]
+    use crate::plans::{Operation, PlanExecutor, PlanResult};
     use crate::utils::FoldWithOption as _;
     use crate::{Engine, FileMeta, KernelResultIterator, LogPath, Snapshot, StorageHandler};
 
@@ -394,6 +480,140 @@ mod tests {
         assert_eq!(range.start_version(), 0);
         assert_eq!(range.end_version(), 1);
         assert_eq!(range.table_root().as_str(), table_root.as_str());
+    }
+
+    #[cfg(feature = "declarative-plans")]
+    #[rstest::rstest]
+    #[case::latest(0, None, false)]
+    #[case::nonzero_start(1, None, false)]
+    #[case::bounded(0, Some(0), false)]
+    #[case::catalog_tail(0, None, true)]
+    #[case::bounded_catalog_tail(0, Some(0), true)]
+    fn test_declarative_listing_matches_imperative(
+        #[case] start: Version,
+        #[case] end: Option<Version>,
+        #[case] catalog_tail: bool,
+        #[values(CommitOrdering::AscendingOrder, CommitOrdering::DescendingOrder)]
+        ordering: CommitOrdering,
+    ) {
+        let root = dv_small_table_root();
+        let builder = || {
+            let builder = CommitRange::builder_for(root.as_str(), start)
+                .with_ordering(ordering)
+                .fold_with(end, CommitRangeBuilder::with_end_version);
+            if catalog_tail {
+                builder.with_log_tail(vec![staged_commit(&root, 1)], 1)
+            } else {
+                builder
+            }
+        };
+        let expected = builder().build(&SyncEngine::new()).unwrap();
+        let actual = builder()
+            .build_declarative(&SyncPlanExecutor::new(None))
+            .unwrap();
+        assert_eq!(actual.start_version(), expected.start_version());
+        assert_eq!(actual.end_version(), expected.end_version());
+        assert_eq!(actual.commit_files, expected.commit_files);
+    }
+
+    #[cfg(feature = "declarative-plans")]
+    struct FailingExecutor;
+
+    #[cfg(feature = "declarative-plans")]
+    impl PlanExecutor for FailingExecutor {
+        fn execute_op(&self, _: Operation) -> KernelResult<PlanResult> {
+            Err(KernelError::generic("listing failed"))
+        }
+    }
+
+    #[cfg(feature = "declarative-plans")]
+    #[rstest::rstest]
+    fn test_declarative_snapshot_range_skips_listing(#[values(false, true)] from_snapshot: bool) {
+        let root = dv_small_table_root();
+        let builder = if from_snapshot {
+            let snapshot = Snapshot::builder_for(root.as_str())
+                .build(&SyncEngine::new())
+                .unwrap();
+            CommitRange::builder_from(snapshot, 0)
+        } else {
+            CommitRange::builder_for(root.as_str(), 0)
+        };
+        let result = builder.build_declarative(&FailingExecutor);
+        if from_snapshot {
+            assert_eq!(result.unwrap().end_version(), 1);
+        } else {
+            assert_result_error_with_message(result, "listing failed");
+        }
+    }
+
+    #[cfg_attr(feature = "declarative-plans", rstest::rstest(declarative => [false, true]))]
+    #[cfg_attr(not(feature = "declarative-plans"), rstest::rstest(declarative => [false]))]
+    #[case::complete(&[11, 12, 13], "checkpoint.parquet", "checkpoint", None, true, Ok(13))]
+    #[case::missing_middle(&[11, 13], "checkpoint.parquet", "checkpoint", None, true, Err(12))]
+    #[case::missing_terminal(&[11, 12], "checkpoint.parquet", "checkpoint", None, true, Err(13))]
+    #[case::validation_disabled(&[11, 12], "checkpoint.parquet", "checkpoint", None, false, Ok(12))]
+    #[case::explicit_end_before_checkpoint(
+        &[11, 12, 13], "checkpoint.parquet", "checkpoint", Some(12), true, Ok(12)
+    )]
+    #[case::incomplete_checkpoint(
+        &[11, 12], "checkpoint.0000000001.0000000002.parquet", "checkpoint", None, true, Ok(12)
+    )]
+    #[case::empty_checkpoint(&[11, 12], "checkpoint.parquet", "", None, true, Ok(12))]
+    fn test_checkpoint_does_not_replace_missing_commit_json(
+        #[case] commit_versions: &[Version],
+        #[case] checkpoint_suffix: &str,
+        #[case] checkpoint_contents: &str,
+        #[case] end_version: Option<Version>,
+        #[case] validate_range: bool,
+        #[case] expected: KernelResult<Version, Version>,
+        declarative: bool,
+    ) {
+        let directory = tempfile::tempdir().unwrap();
+        let log = directory.path().join("_delta_log");
+        std::fs::create_dir(&log).unwrap();
+        for version in commit_versions {
+            std::fs::write(log.join(format!("{version:020}.json")), "not JSON").unwrap();
+        }
+        std::fs::write(
+            log.join(format!("{:020}.{checkpoint_suffix}", 13)),
+            checkpoint_contents,
+        )
+        .unwrap();
+        let root = Url::from_directory_path(directory.path()).unwrap();
+        let builder = CommitRange::builder_for(root.as_str(), 11)
+            .fold_with(end_version, CommitRangeBuilder::with_end_version)
+            .with_commit_range_validation(validate_range);
+        #[cfg(feature = "declarative-plans")]
+        let result = if declarative {
+            builder.build_declarative(&SyncPlanExecutor::new(None))
+        } else {
+            builder.build(&SyncEngine::new())
+        };
+        #[cfg(not(feature = "declarative-plans"))]
+        let result = {
+            assert!(!declarative);
+            builder.build(&SyncEngine::new())
+        };
+        match expected {
+            Err(missing_version) => {
+                assert!(
+                    matches!(result, Err(KernelError::MissingVersion(v)) if v == missing_version)
+                );
+            }
+            Ok(end_version) => {
+                let range = result.unwrap();
+                assert_eq!(range.start_version(), 11);
+                assert_eq!(range.end_version(), end_version);
+                let actual_versions: Vec<_> =
+                    range.commit_files.iter().map(|file| file.version).collect();
+                let expected_versions: Vec<_> = commit_versions
+                    .iter()
+                    .copied()
+                    .filter(|version| *version <= end_version)
+                    .collect();
+                assert_eq!(actual_versions, expected_versions);
+            }
+        }
     }
 
     #[test]
