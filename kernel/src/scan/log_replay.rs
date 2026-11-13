@@ -953,7 +953,7 @@ fn get_add_transform_expr(
         // serializing stats_parsed so ScanFile.stats is populated either way.
         Arc::new(Expression::coalesce([
             col!("add.stats"),
-            Expression::unary(UnaryExpressionOp::ToJson, col!("add.stats_parsed")),
+            Expression::unary(UnaryExpressionOp::TO_JSON, col!("add.stats_parsed")),
         ]))
     } else if has_stats_parsed {
         // The compatible checkpoint projection can omit add.stats when JSON output is disabled.
@@ -2459,7 +2459,7 @@ mod tests {
     fn count_to_json(expr: &Expression) -> usize {
         match expr {
             Expression::Unary(u) => {
-                let here = (u.op == UnaryExpressionOp::ToJson) as usize;
+                let here = matches!(u.op, UnaryExpressionOp::ToJson { .. }) as usize;
                 here + count_to_json(&u.expr)
             }
             Expression::Binary(b) => count_to_json(&b.left) + count_to_json(&b.right),

@@ -457,7 +457,7 @@ impl<'a> MetadataPlanner<'a> {
                     if stats == StatsKind::Struct && self.stats.synthesize_json {
                         let field = StructField::nullable(STATS, DataType::STRING);
                         let expr =
-                            Expr::unary(UnaryExpressionOp::ToJson, col!(ADD_NAME, STATS_PARSED));
+                            Expr::unary(UnaryExpressionOp::TO_JSON, col!(ADD_NAME, STATS_PARSED));
                         // Match ADD_SCHEMA's field order without moving native structured stats.
                         patch = patch.insert_after_at([ADD_NAME], "dataChange", field, expr)
                     }

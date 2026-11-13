@@ -245,7 +245,7 @@ static STATS_JSON_EXPR: LazyLock<ExpressionRef> = LazyLock::new(|| {
     Arc::new(Expression::coalesce([
         col!(ADD_NAME, STATS_FIELD),
         Expression::unary(
-            UnaryExpressionOp::ToJson,
+            UnaryExpressionOp::TO_JSON,
             col!(ADD_NAME, STATS_PARSED_FIELD),
         ),
     ]))
