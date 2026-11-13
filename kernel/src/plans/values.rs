@@ -1,7 +1,7 @@
 //! Materializes executor batches using statically cached visitor metadata.
 
 use crate::engine_data::{EngineData, GetData, RowVisitor};
-use crate::expressions::{ArrayData, MapData, Scalar};
+use crate::expressions::{ArrayData, MapData, Scalar, StructData};
 use crate::plans::PlanResultRow;
 use crate::plans::ir::nodes::Values;
 use crate::schema::{ColumnName, ColumnNamesAndTypes, DataType, SchemaRef, StructField};
@@ -37,20 +37,25 @@ impl RowVisitor for ValuesVisitor {
     }
 
     fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> KernelResult<()> {
-        if getters.len() != self.schema.fields().len() {
+        if getters.len() != self.columns.as_ref().0.len() {
             return Err(KernelError::missing_column(
                 "Incorrect number of result column getters",
             ));
         }
         self.rows.reserve(row_count);
         for row in 0..row_count {
-            self.rows.push(
-                self.schema
-                    .fields()
-                    .zip(getters)
-                    .map(|(field, getter)| read_scalar(*getter, row, field))
-                    .collect::<KernelResult<Vec<_>>>()?,
-            );
+            let mut getters = getters.iter().copied();
+            let values = self
+                .schema
+                .fields()
+                .map(|field| read_field(&mut getters, row, field))
+                .collect::<KernelResult<Vec<_>>>()?;
+            if getters.next().is_some() {
+                return Err(KernelError::missing_column(
+                    "Unused result column getters after reconstructing row",
+                ));
+            }
+            self.rows.push(values);
         }
         Ok(())
     }
@@ -76,6 +81,24 @@ fn ensure_supported(field: &StructField) -> KernelResult<()> {
                 && map.value_type() == &DataType::STRING
                 && !map.value_contains_null()
         }
+        DataType::Struct(fields) => {
+            if field.is_nullable() {
+                return Err(KernelError::unsupported(format!(
+                    "Nullable plan result struct field {} is unsupported",
+                    field.name()
+                )));
+            }
+            if fields.num_fields() == 0 {
+                return Err(KernelError::unsupported(format!(
+                    "Empty plan result struct field {} is unsupported",
+                    field.name()
+                )));
+            }
+            for child in fields.fields() {
+                ensure_supported(child)?;
+            }
+            true
+        }
         _ => false,
     };
     if supported {
@@ -86,6 +109,32 @@ fn ensure_supported(field: &StructField) -> KernelResult<()> {
             field.name(),
             field.data_type()
         )))
+    }
+}
+
+fn read_field<'a>(
+    getters: &mut impl Iterator<Item = &'a dyn GetData<'a>>,
+    row: usize,
+    field: &StructField,
+) -> KernelResult<Scalar> {
+    if let DataType::Struct(fields) = field.data_type() {
+        let values = fields
+            .fields()
+            .map(|child| read_field(getters, row, child))
+            .collect::<KernelResult<Vec<_>>>()?;
+        // Schema-order recursion and typed leaf reads preserve the constructor's invariants.
+        Ok(Scalar::Struct(StructData::from_values_unchecked(
+            fields.as_ref().clone(),
+            values,
+        )))
+    } else {
+        let getter = getters.next().ok_or_else(|| {
+            KernelError::missing_column(format!(
+                "Missing result column getter for field {}",
+                field.name()
+            ))
+        })?;
+        read_scalar(getter, row, field)
     }
 }
 

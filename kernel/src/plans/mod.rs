@@ -187,8 +187,12 @@ impl PlanResult {
     /// Supports numeric primitives, booleans, strings, binary, dates, and string containers
     /// with non-null elements or values. String list sources must contain no null elements:
     /// the existing typed list getter does not expose element validity. Map null values and
-    /// duplicate keys return an error. Nested types, decimals, and timestamps are unsupported,
-    /// including for empty streams. Other result variants retain the [`Self::into_data`] error.
+    /// duplicate keys return an error. Required, nonempty structs are supported recursively.
+    /// Nullable or empty struct fields, arrays or maps containing structs, decimals, and timestamps
+    /// are unsupported, including for empty streams. Source batches must keep required parent
+    /// structs non-null: leaf getters do not expose parent validity. A required struct whose
+    /// children are all nullable remains present when they are all null. Other result variants
+    /// retain the [`Self::into_data`] error.
     pub fn into_values<T: PlanResultRow>(self) -> KernelResult<Values> {
         values::from_batches::<T>(self.into_data()?)
     }

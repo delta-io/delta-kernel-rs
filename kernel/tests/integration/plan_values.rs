@@ -1,5 +1,7 @@
 //! Typed plan result conversion through the existing row visitor interface.
 
+mod nested;
+
 use std::collections::HashMap;
 use std::sync::Arc;
 
