@@ -14,7 +14,17 @@ SHAs in the input provenance, export their relevant source snapshots into `befor
 include the exact protocol reference used. Do not include later fixes, review answers, or labels in
 the source snapshot. Record omissions; a bounded snapshot must not imply whole-repository coverage.
 
-## Run
+## Dispatch through GitHub Actions
+
+Select this revision in the AI PR Review workflow, set `evaluation_mode` to `gate` or `pipeline`,
+and choose `evaluation_case`. Supply a PR number for the existing authorized dispatch interface.
+The workflow uses the repository's configured model/runtime credentials, runs one frozen case,
+and uploads the evidence even when the replay fails. Upload is withheld if evidence contains the
+runtime credential or credential-like diagnostic text. Evaluation mode skips PR review and publication.
+It remains an operator-triggered pilot. Use separate dispatches for each case; concurrent runs for
+one PR cancel one another under the existing workflow concurrency rule.
+
+## Run locally
 
 Use a supported, authenticated Omnigent runtime. The runner does not read credential files or
 configure authentication. Install PyYAML 6.0.3 and use Python 3.12. Create a nonsecret JSON file mapping

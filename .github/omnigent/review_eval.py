@@ -287,6 +287,22 @@ def run_case(
     return record
 
 
+def verify_artifacts(directory: Path, secret: str) -> None:
+    """Withhold an artifact bundle containing the runtime key or credential-like output."""
+    patterns = (
+        r"(?i)authorization\s*[:=]\s*(?:bearer\s+)?\S+",
+        r"(?i)(?:(?:x-)?api[-_ ]?key|access[-_ ]?token)\s*[:=]\s*\S+",
+        r"(?i)(?:token|key|sig|signature)=[^&\s]+",
+    )
+    if not directory.is_dir() or not any(directory.iterdir()):
+        raise ValueError("No replay evidence is available for upload")
+    for path in directory.rglob("*"):
+        if path.is_file():
+            text = path.read_text(errors="replace")
+            if (secret and secret in text) or any(re.search(pattern, text) for pattern in patterns):
+                raise ValueError("Replay evidence contains credential-like output; upload withheld")
+
+
 def score(
     labels: dict[str, Any], adjudication: dict[str, Any], run: dict[str, Any]
 ) -> dict[str, Any]:

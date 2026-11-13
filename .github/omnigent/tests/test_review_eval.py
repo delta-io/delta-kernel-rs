@@ -164,6 +164,54 @@ class ReviewEvalTest(unittest.TestCase):
             path.write_text("\n".join(json.dumps(event) for event in events))
             validate_trace(path)
 
+    def test_dispatch_evaluation_isolated_from_pr_publication(self):
+        import ast
+        import re
+        import yaml
+
+        workflow = yaml.safe_load((ROOT.parent / "workflows/ai-review.yml").read_text())
+        steps = workflow["jobs"]["review"]["steps"]
+        named = {step["name"]: step for step in steps if "name" in step}
+        self.assertLess(
+            steps.index(named["Run behavioral replay pilot"]),
+            steps.index(named["Materialize reviewer model config"]),
+        )
+        for name in (
+            "Materialize reviewer model config",
+            "Collect PR context and build review prompt",
+            "Materialize PR source reference",
+            "Run AI review",
+        ):
+            self.assertIn("inputs.evaluation_mode != 'gate'", named[name]["if"])
+            self.assertIn("inputs.evaluation_mode != 'pipeline'", named[name]["if"])
+        script = named["Run behavioral replay pilot"]["run"]
+        self.assertIn('command=["omnigent"]', script)
+        self.assertIn('result["status"] == "complete"', script)
+        for source in re.findall(r"python3[^\n]*<<'PYEOF'\n(.*?)\nPYEOF", script, re.S):
+            ast.parse(source)
+        self.assertIn("always()", named["Upload behavioral replay evidence"]["if"])
+        self.assertIn(
+            "steps.evaluation_artifacts.outcome == 'success'",
+            named["Upload behavioral replay evidence"]["if"],
+        )
+
+    def test_artifact_upload_withholds_credentials_without_rewriting_evidence(self):
+        from review_eval import verify_artifacts
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "stdout.txt"
+            for text in (
+                "fake-eval-sentinel",
+                "Authorization: Bearer fake-value",
+                "token=fake-value",
+            ):
+                path.write_text(text)
+                with self.assertRaisesRegex(ValueError, "withheld"):
+                    verify_artifacts(Path(directory), "fake-eval-sentinel")
+                self.assertEqual(path.read_text(), text)
+            path.write_text("**Verdict**: CONFIRMED")
+            verify_artifacts(Path(directory), "fake-eval-sentinel")
+
     def test_timeout_is_a_failed_run_not_a_clean_review(self):
         with tempfile.TemporaryDirectory() as directory:
             result = self.run_fake(Path(directory), "import time; time.sleep(2)", timeout=1)
