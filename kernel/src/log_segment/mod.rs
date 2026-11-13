@@ -21,10 +21,10 @@ use crate::actions::{
     LOG_ADD_SCHEMA, SIDECAR_FILE_SCHEMA_TAG, SIDECAR_NAME, Sidecar, action_presence_leaf,
     schema_contains_file_actions,
 };
-use crate::checkpoint::SelectedCheckpoint;
 use crate::checkpoint::collation_stats::{
     build_collation_stats_read_transform, source_collation_stats,
 };
+use crate::checkpoint::{SelectedCheckpoint, SelectedCheckpointType};
 use crate::committer::CatalogCommit;
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::content_tree::read_checkpoint_action;
@@ -808,7 +808,7 @@ impl LogSegment {
     pub(crate) fn try_new_with_checkpoint(
         &self,
         checkpoint: ParsedLogPath,
-        checkpoint_type: crate::checkpoint::SelectedCheckpointType,
+        checkpoint_type: SelectedCheckpointType,
     ) -> KernelResult<Self> {
         require!(
             matches!(
@@ -830,6 +830,10 @@ impl LogSegment {
             ))
         );
 
+        let observed_type = SelectedCheckpoint::from_path(&checkpoint, None).checkpoint_type;
+        debug_assert!(
+            observed_type == SelectedCheckpointType::Unresolved || observed_type == checkpoint_type
+        );
         let mut new_log_segment = self.clone();
         new_log_segment.checkpoint = Some(SelectedCheckpoint {
             version: checkpoint.version,

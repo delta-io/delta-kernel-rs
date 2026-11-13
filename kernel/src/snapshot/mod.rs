@@ -696,6 +696,7 @@ impl Snapshot {
     ///
     /// The hint preserves whether this snapshot was built as latest, not whether it is still
     /// latest. Missing checkpoint hints and CRCs at this snapshot's version remain absent.
+    /// The selected checkpoint type is retained without refining an unresolved observation.
     /// Rebuild it with [`SnapshotBuilder::with_snapshot_hint`] for the same table root.
     ///
     /// # Errors
@@ -1870,10 +1871,14 @@ impl Snapshot {
         let checkpoint_log_path = ParsedLogPath::new(info.file_meta).ok_or_else(|| {
             KernelError::internal_error("Checkpoint path could not be parsed as a log path")
         })?;
-        let checkpoint_type = if v2_supported {
-            SelectedCheckpointType::V2
-        } else {
-            SelectedCheckpointType::V1
+        let checkpoint_type = match mode {
+            CheckpointWriteMode::NotAttempted => {
+                unreachable!("a successful checkpoint write selected a mode")
+            }
+            CheckpointWriteMode::V1 => SelectedCheckpointType::V1,
+            CheckpointWriteMode::V2WithoutSidecars | CheckpointWriteMode::V2WithSidecars => {
+                SelectedCheckpointType::V2
+            }
         };
         let new_log_segment = self
             .log_segment

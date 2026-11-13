@@ -17,6 +17,7 @@ impl LogSegment {
         self.checkpoint.map(|checkpoint| checkpoint.checkpoint_type)
     }
 
+    /// Retains a prior type only when this segment has unresolved evidence for identical paths.
     pub(crate) fn inherit_checkpoint_type(&mut self, previous: &Self) {
         if self.checkpoint_type() == Some(SelectedCheckpointType::Unresolved)
             && self
@@ -34,6 +35,8 @@ impl LogSegment {
         }
     }
 
+    /// Validates a hint claim against selection and refines only unresolved filename evidence.
+    /// An unresolved claim still requires a selected checkpoint and never erases a known type.
     pub(crate) fn with_checkpoint_type(
         mut self,
         checkpoint_type: Option<SelectedCheckpointType>,

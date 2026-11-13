@@ -13,7 +13,7 @@ pub use builder::{
     snapshot_builder_with_max_catalog_version, snapshot_builder_with_version,
 };
 
-/// Returns the selected checkpoint specification, when known, without engine I/O.
+/// Returns the selected checkpoint specification without engine I/O.
 /// Returns absent if no checkpoint was selected, or `Unresolved` if its type was not retained
 /// during construction. The observation remains fixed for the snapshot's lifetime.
 ///

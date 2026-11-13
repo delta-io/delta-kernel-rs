@@ -353,6 +353,7 @@ fn exported_hint_copy_outlives_snapshot_and_preserves_state(
     #[values(false, true)] with_crc: bool,
     #[values(
         None,
+        Some(FfiSelectedCheckpointType::Unresolved),
         Some(FfiSelectedCheckpointType::V1),
         Some(FfiSelectedCheckpointType::V2)
     )]
@@ -420,14 +421,18 @@ fn exported_hint_copy_outlives_snapshot_and_preserves_state(
     &["memory:///hinted-table/_delta_log/00000000000000000000.json"],
     FfiSelectedCheckpointType::V1
 )]
-#[case::v1_checkpoint(
+#[case::no_checkpoint_claimed_unresolved(
+    &["memory:///hinted-table/_delta_log/00000000000000000000.json"],
+    FfiSelectedCheckpointType::Unresolved
+)]
+#[case::multipart_paths_claimed_v2(
     &[
         "memory:///hinted-table/_delta_log/00000000000000000000.checkpoint.0000000001.0000000002.parquet",
         "memory:///hinted-table/_delta_log/00000000000000000000.checkpoint.0000000002.0000000002.parquet",
     ],
     FfiSelectedCheckpointType::V2
 )]
-#[case::v2_checkpoint(
+#[case::uuid_path_claimed_v1(
     &["memory:///hinted-table/_delta_log/00000000000000000000.checkpoint.550e8400-e29b-41d4-a716-446655440000.parquet"],
     FfiSelectedCheckpointType::V1
 )]

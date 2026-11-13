@@ -89,6 +89,7 @@ pub(crate) struct SnapshotHint {
     crc: Option<Arc<Crc>>,
     /// Whether `version` was established as latest when the hint was captured.
     freshness: SnapshotHintFreshness,
+    /// The selected checkpoint type retained when this hint was captured.
     checkpoint_type: Option<SelectedCheckpointType>,
 }
 
