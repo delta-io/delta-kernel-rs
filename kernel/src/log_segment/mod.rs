@@ -115,6 +115,21 @@ impl CheckpointReadInfo {
     }
 }
 
+/// Options for reading the checkpoint part of a log segment.
+#[derive(Debug, Clone, Default)]
+#[internal_api]
+pub(crate) struct CheckpointReadOptions<'a> {
+    /// Conservative predicate readers may use to skip checkpoint data. It is not the query's final
+    /// data filter, and readers may ignore it.
+    pub meta_predicate: Option<PredicateRef>,
+    /// Stats schema the caller can consume. When the checkpoint has compatible `stats_parsed`,
+    /// batches carry it so callers need not parse JSON stats.
+    pub stats_schema: Option<&'a StructType>,
+    /// Partition schema the caller can consume. When the checkpoint has compatible
+    /// `partitionValues_parsed`, batches carry it so callers need not parse partition strings.
+    pub partition_schema: Option<&'a StructType>,
+}
+
 /// Result of reading actions from a log segment, containing both the actions iterator
 /// and checkpoint metadata.
 ///
@@ -1006,27 +1021,24 @@ impl LogSegment {
     ///
     /// Also returns `CheckpointReadInfo` with stats_parsed compatibility and the checkpoint schema.
     ///
-    /// `meta_predicate` is an optional conservative predicate for checkpoint reads, not the query's
-    /// final data filter. When every projected action has a reliable presence witness, their
-    /// `IS NOT NULL` predicates are combined (OR), then combined (AND) with `meta_predicate`.
-    /// Otherwise projection-based pruning is disabled. Readers may ignore the resulting predicate,
-    /// and downstream log replay must tolerate rows that do not satisfy it.
+    /// `options` configures the checkpoint read. When every projected action has a reliable
+    /// presence witness, their `IS NOT NULL` predicates are combined (OR), then combined (AND) with
+    /// `options.meta_predicate`. Otherwise projection-based pruning is disabled. Readers may ignore
+    /// the resulting predicate, and downstream log replay must tolerate rows that do not satisfy
+    /// it.
     #[internal_api]
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn read_actions_with_projected_checkpoint_actions(
         &self,
         engine: &dyn Engine,
         commit_read_schema: SchemaRef,
         checkpoint_read_schema: SchemaRef,
-        meta_predicate: Option<PredicateRef>,
-        stats_schema: Option<&StructType>,
-        partition_schema: Option<&StructType>,
+        options: CheckpointReadOptions<'_>,
     ) -> KernelResult<ActionsWithCheckpointInfo<Box<dyn KernelResultIterator<ActionsBatch>>>> {
         // Combine the action-presence predicate with the caller's skipping predicate so readers
         // can omit checkpoint data that cannot contain a relevant action.
         let projection_predicate = checkpoint_action_projection_predicate(&checkpoint_read_schema);
-        let checkpoint_predicate =
-            combine_checkpoint_predicates(projection_predicate, meta_predicate);
+        let meta_predicate =
+            combine_checkpoint_predicates(projection_predicate, options.meta_predicate);
 
         // `replay` expects commit files to be sorted in descending order, so the return value here
         // is correct
@@ -1035,9 +1047,10 @@ impl LogSegment {
         let checkpoint_result = self.create_checkpoint_stream(
             engine,
             checkpoint_read_schema,
-            checkpoint_predicate,
-            stats_schema,
-            partition_schema,
+            CheckpointReadOptions {
+                meta_predicate,
+                ..options
+            },
         )?;
 
         Ok(ActionsWithCheckpointInfo {
@@ -1145,9 +1158,7 @@ impl LogSegment {
             engine,
             action_schema.clone(),
             action_schema,
-            None,
-            None,
-            None,
+            CheckpointReadOptions::default(),
         )?;
         Ok(result.actions)
     }
@@ -1453,11 +1464,14 @@ impl LogSegment {
         &self,
         engine: &dyn Engine,
         action_schema: SchemaRef,
-        meta_predicate: Option<PredicateRef>,
-        stats_schema: Option<&StructType>,
-        partition_schema: Option<&StructType>,
+        options: CheckpointReadOptions<'_>,
     ) -> KernelResult<ActionsWithCheckpointInfo<impl KernelResultIterator<ActionsBatch> + use<>>>
     {
+        let CheckpointReadOptions {
+            meta_predicate,
+            stats_schema,
+            partition_schema,
+        } = options;
         let need_file_actions = schema_contains_file_actions(&action_schema);
 
         let (file_actions_schema, sidecar_files) = if need_file_actions {

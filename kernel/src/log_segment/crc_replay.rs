@@ -15,7 +15,7 @@ use std::sync::{Arc, LazyLock};
 
 use tracing::{instrument, warn};
 
-use super::LogSegment;
+use super::{CheckpointReadOptions, LogSegment};
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::actions::visitors::visit_last_manifest_commit_at;
 use crate::actions::visitors::{
@@ -184,7 +184,11 @@ impl LogSegment {
         let mut acc = CrcReplayAccumulator::new(Some(FileSizeHistogram::create_default()));
         // Read only the checkpoint parquet plus any V2 sidecars via `create_checkpoint_stream`.
         let batches = self
-            .create_checkpoint_stream(engine, CHECKPOINT_CRC_SCHEMA.clone(), None, None, None)?
+            .create_checkpoint_stream(
+                engine,
+                CHECKPOINT_CRC_SCHEMA.clone(),
+                CheckpointReadOptions::default(),
+            )?
             .actions;
         for batch in batches {
             let batch = batch?;

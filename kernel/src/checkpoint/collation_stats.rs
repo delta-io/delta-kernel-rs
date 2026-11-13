@@ -75,7 +75,7 @@ pub(crate) fn build_collation_stats_read_transform(
     );
     let json = Expression::coalesce([
         col!("add.stats"),
-        Expression::unary(UnaryExpressionOp::ToJson, col!("add.stats_parsed")),
+        Expression::unary(UnaryExpressionOp::TO_JSON, col!("add.stats_parsed")),
     ]);
     let mut patch = ProjectionStructPatchBuilder::new(&read_schema).replace_expr_at(
         ["add"],
