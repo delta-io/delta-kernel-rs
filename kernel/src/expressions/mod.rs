@@ -148,7 +148,8 @@ pub enum UnaryExpressionOp {
     ///
     /// When `full_precision_timestamps` is set, timestamps instead encode with exactly six
     /// fractional digits, so the same value becomes `{"ts":"2026-07-02T15:55:55.298677Z"}` and the
-    /// operator is the exact inverse of [`ParseJsonExpression`].
+    /// operator is the exact inverse of [`ParseJsonExpression`]. Kernel writes adaptiveMetadata
+    /// `add.stats` with this flag set.
     ///
     /// [Per-file Statistics]: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#per-file-statistics
     ToJson {
