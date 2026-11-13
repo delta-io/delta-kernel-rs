@@ -72,11 +72,11 @@
 //! }
 //!
 //! # fn singleton(executor: &dyn PlanExecutor, plan: Plan) -> KernelResult<()> {
-//! let row: Row = executor.execute(plan)?.try_into()?;
+//! let row: Row = executor.execute_plan(plan)?.try_into()?;
 //! # Ok(())
 //! # }
 //! # fn multiple(executor: &dyn PlanExecutor, plan: Plan) -> KernelResult<()> {
-//! let rows: Vec<Row> = executor.execute(plan)?.try_into()?;
+//! let rows: Vec<Row> = executor.execute_plan(plan)?.try_into()?;
 //! # Ok(())
 //! # }
 //! ```
@@ -123,7 +123,7 @@ pub trait PlanExecutor: AsAny {
     fn execute_op(&self, op: Operation) -> KernelResult<PlanResult>;
 
     /// Executes a query plan through [`Self::execute_op`].
-    fn execute(&self, plan: Plan) -> KernelResult<PlanResult> {
+    fn execute_plan(&self, plan: Plan) -> KernelResult<PlanResult> {
         self.execute_op(Operation::QueryPlan(plan))
     }
 

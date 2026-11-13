@@ -21,7 +21,7 @@ use rstest::rstest;
 #[derive(
     Clone, Debug, PartialEq, ToSchema, IntoStructData, TryFromStructData, TryFromPlanResult,
 )]
-struct Row {
+struct TestRow {
     id: i32,
     label: Option<String>,
 }
@@ -43,9 +43,9 @@ macro_rules! unsupported_row {
     };
 }
 unsupported_row!(IntegerList, Vec<i32>);
-unsupported_row!(NestedStruct, Option<Row>);
+unsupported_row!(NestedStruct, Option<TestRow>);
 unsupported_row!(NestedList, Vec<Vec<String>>);
-unsupported_row!(NestedMap, HashMap<String, Row>);
+unsupported_row!(NestedMap, HashMap<String, TestRow>);
 unsupported_row!(NullableList, Vec<Option<String>>);
 unsupported_row!(NullableMap, HashMap<String, Option<String>>);
 
@@ -72,23 +72,23 @@ fn plan<T: delta_kernel::schema::ToSchema + Into<StructData>>(rows: Vec<T>) -> K
 #[test]
 fn executor_results_convert_directly_to_singleton_and_vector() -> KernelResult<()> {
     let executor = SyncPlanExecutor::default();
-    let expected = Row {
+    let expected = TestRow {
         id: 4,
         label: Some("four".to_owned()),
     };
-    let row: Row = executor
-        .execute(plan(vec![expected.clone()])?)?
+    let row: TestRow = executor
+        .execute_plan(plan(vec![expected.clone()])?)?
         .try_into()?;
     assert_eq!(row, expected);
-    let expected = vec![expected, Row { id: 5, label: None }];
-    let rows: Vec<Row> = executor.execute(plan(expected.clone())?)?.try_into()?;
+    let expected = vec![expected, TestRow { id: 5, label: None }];
+    let rows: Vec<TestRow> = executor.execute_plan(plan(expected.clone())?)?.try_into()?;
     assert_eq!(rows, expected);
     Ok(())
 }
 
 #[test]
 fn batches_preserve_order_and_empty_batches_do_not_add_rows() -> KernelResult<()> {
-    let rows: Vec<Row> = data(vec![
+    let rows: Vec<TestRow> = data(vec![
         Ok(row_batch(vec![])),
         Ok(row_batch(vec![Some(7)])),
         Ok(row_batch(vec![])),
@@ -97,16 +97,19 @@ fn batches_preserve_order_and_empty_batches_do_not_add_rows() -> KernelResult<()
     .try_into()?;
     assert_eq!(
         rows,
-        vec![Row { id: 7, label: None }, Row { id: 8, label: None }]
+        vec![
+            TestRow { id: 7, label: None },
+            TestRow { id: 8, label: None }
+        ]
     );
-    let singleton: Row = data(vec![
+    let singleton: TestRow = data(vec![
         Ok(row_batch(vec![])),
         Ok(row_batch(vec![Some(9)])),
         Ok(row_batch(vec![])),
     ])
     .try_into()?;
-    assert_eq!(singleton, Row { id: 9, label: None });
-    let empty: Vec<Row> = data(vec![]).try_into()?;
+    assert_eq!(singleton, TestRow { id: 9, label: None });
+    let empty: Vec<TestRow> = data(vec![]).try_into()?;
     assert!(empty.is_empty());
     Ok(())
 }
@@ -118,7 +121,7 @@ fn batches_preserve_order_and_empty_batches_do_not_add_rows() -> KernelResult<()
 #[case::separate_batches(vec![vec![Some(1)], vec![Some(2)]])]
 fn singleton_requires_one_total_row(#[case] batches: Vec<Vec<Option<i32>>>) {
     let result = data(batches.into_iter().map(|ids| Ok(row_batch(ids))).collect());
-    let error = Row::try_from(result).unwrap_err();
+    let error = TestRow::try_from(result).unwrap_err();
     assert!(matches!(
         error.without_backtrace(),
         KernelError::ScalarConversion(_)
@@ -135,9 +138,9 @@ fn late_stream_errors_win_over_cardinality(
         Err(KernelError::generic("late")),
     ]);
     let error = if singleton {
-        Row::try_from(result).map(|_| ()).unwrap_err()
+        TestRow::try_from(result).map(|_| ()).unwrap_err()
     } else {
-        Vec::<Row>::try_from(result).map(|_| ()).unwrap_err()
+        Vec::<TestRow>::try_from(result).map(|_| ()).unwrap_err()
     };
     assert!(
         matches!(error.without_backtrace(), KernelError::Generic(message) if message == "late")
@@ -153,9 +156,9 @@ fn non_data_variants_are_rejected(
     #[values(false, true)] singleton: bool,
 ) {
     let error = if singleton {
-        Row::try_from(result()).map(|_| ()).unwrap_err()
+        TestRow::try_from(result()).map(|_| ()).unwrap_err()
     } else {
-        Vec::<Row>::try_from(result()).map(|_| ()).unwrap_err()
+        Vec::<TestRow>::try_from(result()).map(|_| ()).unwrap_err()
     };
     assert!(matches!(
         error.without_backtrace(),
@@ -176,8 +179,9 @@ fn materialization_matches_field_names_and_uses_cached_schema() -> KernelResult<
         ("ignored", Arc::new(Int32Array::from(vec![99])) as ArrayRef),
         ("id", Arc::new(Int32Array::from(vec![2])) as ArrayRef),
     ])?;
-    let values = data(vec![Ok(row_batch(vec![Some(1)])), Ok(reordered)]).into_values::<Row>()?;
-    assert!(Arc::ptr_eq(&values.schema, Row::schema_and_columns().0));
+    let values =
+        data(vec![Ok(row_batch(vec![Some(1)])), Ok(reordered)]).into_values::<TestRow>()?;
+    assert!(Arc::ptr_eq(&values.schema, TestRow::schema_and_columns().0));
     assert_eq!(
         values.rows,
         vec![
@@ -193,7 +197,7 @@ fn materialization_matches_field_names_and_uses_cached_schema() -> KernelResult<
 #[case::wrong_type(vec![("id", Arc::new(StringArray::from(vec!["one"])) as ArrayRef), ("label", Arc::new(StringArray::from(vec![None::<&str>])) as ArrayRef)])]
 #[case::required_null(vec![("id", Arc::new(Int32Array::from(vec![None::<i32>])) as ArrayRef), ("label", Arc::new(StringArray::from(vec![None::<&str>])) as ArrayRef)])]
 fn invalid_fields_are_rejected(#[case] columns: Vec<(&str, ArrayRef)>) -> KernelResult<()> {
-    let result: KernelResult<Vec<Row>> =
+    let result: KernelResult<Vec<TestRow>> =
         data(vec![Ok(RecordBatch::try_from_iter(columns)?)]).try_into();
     assert!(result.is_err());
     Ok(())
@@ -216,7 +220,7 @@ fn string_containers_preserve_missing_empty_and_populated_values() -> KernelResu
         },
     ];
     let rows: Vec<Containers> = SyncPlanExecutor::default()
-        .execute(plan(expected.clone())?)?
+        .execute_plan(plan(expected.clone())?)?
         .try_into()?;
     assert_eq!(rows, expected);
     Ok(())
@@ -274,9 +278,9 @@ fn unsupported_schemas_fail_without_rows(
 
 #[test]
 fn row_metadata_is_static_and_reused_after_conversion() -> KernelResult<()> {
-    let (schema, columns) = Row::schema_and_columns();
-    let _: Row = data(vec![Ok(row_batch(vec![Some(1)]))]).try_into()?;
-    let (again_schema, again_columns) = Row::schema_and_columns();
+    let (schema, columns) = TestRow::schema_and_columns();
+    let _: TestRow = data(vec![Ok(row_batch(vec![Some(1)]))]).try_into()?;
+    let (again_schema, again_columns) = TestRow::schema_and_columns();
     assert!(std::ptr::eq(schema, again_schema));
     assert!(Arc::ptr_eq(schema, again_schema));
     assert!(std::ptr::eq(columns, again_columns));
