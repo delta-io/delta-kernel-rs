@@ -5,9 +5,6 @@
 
 use url::Url;
 
-use crate::content_tree::LOCATION;
-use crate::content_tree::conditions::Check;
-use crate::expressions::{ColumnName, Expression, Predicate, UnaryExpressionOp, lit};
 use crate::path_encoding::uri_encode_path;
 use crate::uri_reference::{scheme_len, uri_decode_location, uri_encode_location};
 use crate::utils::{require, to_file_size};
@@ -150,40 +147,13 @@ fn encode_and_join(path: &str, table_root: &Url) -> KernelResult<Url> {
     })
 }
 
-/// The check, named `id`, that an AMT location `column` is absolute or table-relative (see
-/// [`validate_table_relative`]) and has no `.` or `..` segment (see [`reject_dot_segments`]): the
-/// condition form of those rules, reporting the error of the first one a location breaks. `guard`
-/// wraps the predicate, e.g. to pass rows without a location.
-pub(crate) fn location_check(
-    column: ColumnName,
-    guard: impl FnOnce(Predicate) -> Predicate,
-    id: &'static str,
-) -> Check {
-    let valid = Predicate::is_valid_file_location(Expression::column(column.clone()));
-    Check::new(id, guard(valid), vec![column], |values| {
-        location_rule_error(values, check_location_rules)
-    })
-}
-
-/// The rules a [`location_check`] states: an absolute location passes the table-relative rule.
-fn check_location_rules(location: &str) -> KernelResult<()> {
+/// Rejects an AMT location that is neither absolute nor table-relative (see
+/// [`validate_table_relative`]) or that has a `.` or `..` segment (see [`reject_dot_segments`]).
+pub(crate) fn validate_amt_location(location: &str) -> KernelResult<()> {
     if scheme_len(location).is_none() {
         validate_table_relative(location)?;
     }
     reject_dot_segments(location)
-}
-
-/// The error of `rule`, the Rust form of a failed location condition, for the location in the
-/// first of `values`.
-fn location_rule_error(values: &[Option<&str>], rule: fn(&str) -> KernelResult<()>) -> KernelError {
-    let Some(location) = values.first().copied().flatten() else {
-        return KernelError::missing_data(format!("Data missing for field {LOCATION}"));
-    };
-    rule(location).err().unwrap_or_else(|| {
-        KernelError::internal_error(format!(
-            "AMT location {location:?} failed a condition its rule accepts"
-        ))
-    })
 }
 
 /// Rejects a `path` containing a `.` or `..` segment: the Iceberg V4 path spec does not support
@@ -206,14 +176,6 @@ mod tests {
     use test_utils::assert_result_error_with_message;
 
     use super::*;
-    use crate::Engine as _;
-    use crate::arrow::array::AsArray as _;
-    use crate::content_tree::conditions::ConditionChecker;
-    use crate::engine::arrow_data::EngineDataArrowExt as _;
-    use crate::engine::sync::SyncEngine;
-    use crate::expressions::{Scalar, col, column_name};
-    use crate::schema::{DataType, schema_ref};
-
 
     #[rstest]
     #[case::relative_path(
@@ -368,41 +330,6 @@ mod tests {
         assert_result_error_with_message(
             resolve_amt_location(path, &table_root),
             "contains a '.' or '..' segment",
-        );
-    }
-
-    /// The condition form of [`validate_table_relative`] and [`reject_dot_segments`] in
-    /// [`location_check`] accepts the same locations as the rules, and reports their errors.
-    #[rstest]
-    fn test_location_checks_agree_with_rules(
-        #[values(
-            "a/b.bin",
-            "a:b/c.bin",
-            "s3://bucket/a.bin",
-            "C:/a.bin",
-            "",
-            "/a.bin",
-            "a/../b.bin",
-            "./a.bin",
-            "s3://bucket/./a.bin",
-            "a/..b.bin"
-        )]
-        location: &str,
-    ) {
-        let engine = SyncEngine::new();
-        let handler = engine.evaluation_handler();
-        let schema = schema_ref! { not_null "location": STRING };
-        let check = location_check(column_name!("location"), |p| p, "Location");
-        let checker =
-            ConditionChecker::try_new(handler.as_ref(), schema.clone(), vec![check]).unwrap();
-        let batch = handler
-            .create_many(schema, vec![vec![Scalar::from(location)]])
-            .unwrap();
-        let rule = check_location_rules(location);
-        let condition = checker.check(batch.as_ref());
-        assert_eq!(
-            condition.map_err(|e| e.to_string()),
-            rule.map_err(|e| e.to_string())
         );
     }
 

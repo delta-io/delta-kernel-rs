@@ -23,15 +23,15 @@ use crate::amt_path_util::amt_manifest_filemeta;
 use crate::cancellation::CancellationTokenRef;
 use crate::content_tree::conditions::{Check, ConditionChecker, diagnostic, diagnostic_i32};
 use crate::content_tree::dv_conversion::{
-    AbsoluteLocationCheck, add_deletion_vector_expression, deletion_vector_checks,
+    DeletionVectorLocationCheck, add_deletion_vector_expression, deletion_vector_checks,
 };
 use crate::content_tree::mumbling::MumblingBitmap;
 use crate::content_tree::{
     AMT_FORMAT_VERSION, COLUMN_FILES, CONTENT_TYPE, ColumnFile, ContentTreeNodeEntry, DV_INFO,
-    DV_INFO_COLUMNS, DataContentType, DataFileFormat, FILE_FORMAT, FILE_SIZE_IN_BYTES,
-    FIRST_ROW_ID, FORMAT_VERSION, LOCATION, MANIFEST_DV, MANIFEST_INFO, MODIFIED_SNAPSHOT_ID,
-    PARTITION_SPEC_ID, RECORD_COUNT, SEQUENCE_NUMBER, TRACKING, TRACKING_COLUMNS, TRACKING_STATUS,
-    TrackingInfo, TrackingStatus, struct_expr_from_schema,
+    DataContentType, DataFileFormat, FILE_FORMAT, FILE_SIZE_IN_BYTES, FIRST_ROW_ID, FORMAT_VERSION,
+    LOCATION, MANIFEST_DV, MANIFEST_INFO, MODIFIED_SNAPSHOT_ID, PARTITION_SPEC_ID, RECORD_COUNT,
+    SEQUENCE_NUMBER, TRACKING, TRACKING_COLUMNS, TRACKING_STATUS, TrackingInfo, TrackingStatus,
+    struct_expr_from_schema,
 };
 use crate::engine_data::{
     EngineData, GetData, RowVisitor, StructList, TypedGetData as _, filter_by_predicate,
@@ -426,8 +426,8 @@ struct EntryTransform {
     selection_filter: Arc<dyn PredicateEvaluator>,
     /// Checks the kind's [`ManifestKind::selected_checks`] on the kept rows.
     selected_checker: ConditionChecker,
-    /// Checks the absolute deletion vector locations of the kept rows.
-    absolute_locations: AbsoluteLocationCheck,
+    /// Checks the deletion vector locations of the kept rows.
+    dv_locations: DeletionVectorLocationCheck,
     /// The kind's [`ManifestKind::helpers`].
     helpers: SchemaRef,
     /// Evaluates a selected entry batch with the [`Self::helpers`] columns.
@@ -457,8 +457,8 @@ impl EntryTransform {
             augmented_schema.clone(),
             kind.selected_checks,
         )?;
-        let absolute_locations =
-            AbsoluteLocationCheck::try_new(handler.as_ref(), augmented_schema.clone())?;
+        let dv_locations =
+            DeletionVectorLocationCheck::try_new(handler.as_ref(), augmented_schema.clone())?;
         let evaluator = handler.new_expression_evaluator(
             augmented_schema,
             Arc::new(build_entry_to_add_expression(ctx, &kind.base_row_id)?),
@@ -470,7 +470,7 @@ impl EntryTransform {
             checker,
             selection_filter,
             selected_checker,
-            absolute_locations,
+            dv_locations,
             helpers: kind.helpers,
             evaluator,
         })
@@ -531,7 +531,7 @@ impl EntryTransform {
         let augmented = annotated.append_columns(self.helpers.clone(), helper_columns)?;
         let selected_entries = filter_by_predicate(self.selection_filter.as_ref(), augmented)?;
         self.selected_checker.check(selected_entries.as_ref())?;
-        self.absolute_locations.check(selected_entries.as_ref())?;
+        self.dv_locations.check(selected_entries.as_ref())?;
         self.evaluator.evaluate(selected_entries.as_ref())
     }
 }
