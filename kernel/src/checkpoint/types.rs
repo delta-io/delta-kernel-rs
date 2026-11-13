@@ -1,5 +1,19 @@
 //! Checkpoint format types.
 
+use delta_kernel_derive::internal_api;
+
+use crate::Version;
+
+/// The selected checkpoint and the type established when its segment was constructed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[internal_api]
+pub(crate) struct SelectedCheckpoint {
+    /// The selected checkpoint's version.
+    pub version: Version,
+    /// The retained type observation. Reads do not refine this value.
+    pub checkpoint_type: SelectedCheckpointType,
+}
+
 /// The specification observed for a snapshot's selected checkpoint.
 ///
 /// A classic checkpoint filename alone does not distinguish V1 from V2.

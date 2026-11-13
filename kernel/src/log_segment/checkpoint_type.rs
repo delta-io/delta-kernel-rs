@@ -1,6 +1,6 @@
-use super::{LogSegment, SelectedCheckpoint};
+use super::LogSegment;
 use crate::actions::CHECKPOINT_METADATA_NAME;
-use crate::checkpoint::SelectedCheckpointType;
+use crate::checkpoint::{SelectedCheckpoint, SelectedCheckpointType};
 use crate::error::SnapshotHintError;
 use crate::last_checkpoint_hint::LastCheckpointHint;
 use crate::path::{LogPathFileType, ParsedLogPath};
