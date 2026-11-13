@@ -14,13 +14,49 @@
 use std::collections::HashMap;
 
 use crate::table_changes::scan_file::{TableChangesFileAction, TableChangesScanFile};
-use crate::{KernelError, KernelResult};
+use crate::KernelResult;
 
-/// One flattened side of a per-commit [`TableChangesFileAction`], tagged with which side it is so a
-/// path's boundaries can be ordered. `is_add` sorts a remove before an add at the same commit.
-struct Side {
-    is_add: bool,
-    file: TableChangesScanFile,
+// Variant order ensures removes sort before adds within the same commit.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum ActionKind {
+    Remove,
+    Add,
+}
+
+// Track both endpoint of an initial add or final remove.
+// Only endpoint files that can contribute to the output are retained.
+struct Boundaries {
+    first: (i64, ActionKind),
+    last: (i64, ActionKind),
+    first_remove: Option<TableChangesScanFile>,
+    last_add: Option<TableChangesScanFile>,
+}
+
+impl Boundaries {
+    fn new(kind: ActionKind, file: TableChangesScanFile) -> Self {
+        let key = (file.commit_version, kind);
+        let (first_remove, last_add) = match kind {
+            ActionKind::Remove => (Some(file), None),
+            ActionKind::Add => (None, Some(file)),
+        };
+        Self {
+            first: key,
+            last: key,
+            first_remove,
+            last_add,
+        }
+    }
+
+    fn include(&mut self, kind: ActionKind, file: TableChangesScanFile) {
+        let key = (file.commit_version, kind);
+        if key < self.first {
+            self.first = key;
+            self.first_remove = (kind == ActionKind::Remove).then_some(file);
+        } else if key >= self.last {
+            self.last = key;
+            self.last_add = (kind == ActionKind::Add).then_some(file);
+        }
+    }
 }
 
 /// Collapses per-commit [`TableChangesFileAction`]s to their net effect per path across the whole
@@ -31,7 +67,7 @@ struct Side {
 /// (`{add: Some, remove: Some}`) contributes both -- keyed by file path. A file path is globally
 /// unique within a table's commit range (it carries the full partition prefix and a unique write
 /// UUID), so keying on the path alone never merges actions from different files or partitions. Per
-/// path, the global earliest and latest sides are ordered by `(commit_version, add-side)` (a
+/// path, the global earliest and latest sides are ordered by `(commit_version, action_kind)` (a
 /// remove-side precedes an add-side within a commit), and:
 /// - earliest is a remove-side and latest is an add-side with differing deletion vectors -> a net
 ///   update: one output [`TableChangesFileAction`] carrying both boundary sides -- the pre-image
@@ -49,59 +85,47 @@ struct Side {
 ///
 /// Each path yields at most one output action. The result is sorted by path (unique per output) for
 /// a deterministic listing, since the intermediate path map has no defined iteration order.
+/// Input errors are propagated before a listing is returned.
 pub(super) fn collapse_net_changes(
-    actions: Vec<TableChangesFileAction>,
+    actions: impl IntoIterator<Item = KernelResult<TableChangesFileAction>>,
 ) -> KernelResult<Vec<TableChangesFileAction>> {
-    let mut by_path: HashMap<String, Vec<Side>> = HashMap::new();
+    let mut by_path: HashMap<String, Boundaries> = HashMap::new();
     for action in actions {
+        let action = action?;
         if let Some(add) = action.add {
-            by_path.entry(add.path.clone()).or_default().push(Side {
-                is_add: true,
-                file: add,
-            });
+            if let Some(boundaries) = by_path.get_mut(&add.path) {
+                boundaries.include(ActionKind::Add, add);
+            } else {
+                by_path.insert(add.path.clone(), Boundaries::new(ActionKind::Add, add));
+            }
         }
         if let Some(remove) = action.remove {
-            by_path.entry(remove.path.clone()).or_default().push(Side {
-                is_add: false,
-                file: remove,
-            });
+            if let Some(boundaries) = by_path.get_mut(&remove.path) {
+                boundaries.include(ActionKind::Remove, remove);
+            } else {
+                by_path.insert(remove.path.clone(), Boundaries::new(ActionKind::Remove, remove));
+            }
         }
     }
 
-    let mut out: Vec<(String, TableChangesFileAction)> = Vec::with_capacity(by_path.len());
-    for (path, sides) in by_path {
-        let key = |s: &&Side| (s.file.commit_version, s.is_add);
-        let (Some(earliest), Some(latest)) =
-            (sides.iter().min_by_key(key), sides.iter().max_by_key(key))
-        else {
-            return Err(KernelError::internal_error(format!(
-                "net-changes collapse produced an empty side slot for path {path}"
-            )));
+    let mut out = Vec::new();
+    for (path, boundaries) in by_path {
+        let action = TableChangesFileAction {
+            add: boundaries.last_add,
+            remove: boundaries.first_remove,
         };
-        // Only a leading remove and/or a trailing add mark a net change; clone the boundary
-        // file(s) that survive.
-        let first_remove = (!earliest.is_add).then(|| earliest.file.clone());
-        let last_add = latest.is_add.then(|| latest.file.clone());
-        let action = match (first_remove, last_add) {
-            (Some(remove), None) => TableChangesFileAction {
-                add: None,
-                remove: Some(remove),
-            },
-            (None, Some(add)) => TableChangesFileAction {
-                add: Some(add),
-                remove: None,
-            },
-            (Some(remove), Some(add)) if remove.deletion_vector != add.deletion_vector => {
-                TableChangesFileAction {
-                    add: Some(add),
-                    remove: Some(remove),
-                }
+
+        if action.add.is_none() && action.remove.is_none() {
+            continue;
+        }
+        if let (Some(remove), Some(add)) = (&action.remove, &action.add) {
+            if remove.deletion_vector == add.deletion_vector {
+                continue;
             }
-            (Some(_), Some(_)) | (None, None) => continue,
-        };
+        }
+
         out.push((path, action));
     }
-
     out.sort_unstable_by(|(a, _), (b, _)| a.cmp(b));
     Ok(out.into_iter().map(|(_, action)| action).collect())
 }
@@ -110,11 +134,15 @@ pub(super) fn collapse_net_changes(
 mod tests {
     use std::collections::HashMap;
 
+    use rand::rngs::StdRng;
+    use rand::seq::SliceRandom;
+    use rand::{Rng, SeedableRng};
     use rstest::rstest;
 
     use crate::actions::deletion_vector::{DeletionVectorDescriptor, DeletionVectorStorageType};
     use crate::table_changes::net_changes::collapse_net_changes;
     use crate::table_changes::scan_file::{TableChangesFileAction, TableChangesScanFile};
+    use crate::{KernelError, KernelResult};
 
     /// Builds a deletion-vector descriptor identified by `id`. Two descriptors with different ids
     /// compare unequal, which is how the collapse tells a real net update from a same-DV carry-over
@@ -230,7 +258,7 @@ mod tests {
             insert("reinsert.parquet", 3, None),
         ];
 
-        let out = collapse_net_changes(actions).unwrap();
+        let out = collapse_net_changes(actions.into_iter().map(Ok)).unwrap();
 
         // Only the three net-effect paths survive; the two no-net-change paths are dropped. Sorted
         // by path, each path yields a single grouped action.
@@ -295,7 +323,7 @@ mod tests {
         #[case] actions: Vec<TableChangesFileAction>,
         #[case] expected: Vec<(String, SideSummary, SideSummary)>,
     ) {
-        let out = collapse_net_changes(actions).unwrap();
+        let out = collapse_net_changes(actions.into_iter().map(Ok)).unwrap();
         assert_eq!(out.iter().map(summarize).collect::<Vec<_>>(), expected);
     }
 
@@ -328,7 +356,7 @@ mod tests {
             },
         ];
 
-        let out = collapse_net_changes(actions).unwrap();
+        let out = collapse_net_changes(actions.into_iter().map(Ok)).unwrap();
 
         assert_eq!(out.len(), 1, "expected one grouped net update: {out:?}");
         let remove = out[0].remove.as_ref().expect("remove side");
@@ -337,5 +365,119 @@ mod tests {
         assert_eq!(remove.default_row_commit_version, Some(1));
         assert_eq!(add.base_row_id, Some(200));
         assert_eq!(add.default_row_commit_version, Some(2));
+    }
+    // Use orginal implementation as a reference
+    struct Side {
+        is_add: bool,
+        file: TableChangesScanFile,
+    }
+
+    fn reference_collapse(
+        actions: Vec<TableChangesFileAction>,
+    ) -> KernelResult<Vec<TableChangesFileAction>> {
+        let mut by_path: HashMap<String, Vec<Side>> = HashMap::new();
+        for action in actions {
+            if let Some(add) = action.add {
+                by_path.entry(add.path.clone()).or_default().push(Side {
+                    is_add: true,
+                    file: add,
+                });
+            }
+            if let Some(remove) = action.remove {
+                by_path.entry(remove.path.clone()).or_default().push(Side {
+                    is_add: false,
+                    file: remove,
+                });
+            }
+        }
+
+        let mut out: Vec<(String, TableChangesFileAction)> = Vec::with_capacity(by_path.len());
+        for (path, sides) in by_path {
+            let key = |s: &&Side| (s.file.commit_version, s.is_add);
+            let (Some(earliest), Some(latest)) =
+                (sides.iter().min_by_key(key), sides.iter().max_by_key(key))
+            else {
+                return Err(KernelError::internal_error(format!(
+                    "net-changes collapse produced an empty side slot for path {path}"
+                )));
+            };
+            // Only a leading remove and/or a trailing add mark a net change; clone the boundary
+            // file(s) that survive.
+            let first_remove = (!earliest.is_add).then(|| earliest.file.clone());
+            let last_add = latest.is_add.then(|| latest.file.clone());
+            let action = match (first_remove, last_add) {
+                (Some(remove), None) => TableChangesFileAction {
+                    add: None,
+                    remove: Some(remove),
+                },
+                (None, Some(add)) => TableChangesFileAction {
+                    add: Some(add),
+                    remove: None,
+                },
+                (Some(remove), Some(add)) if remove.deletion_vector != add.deletion_vector => {
+                    TableChangesFileAction {
+                        add: Some(add),
+                        remove: Some(remove),
+                    }
+                }
+                (Some(_), Some(_)) | (None, None) => continue,
+            };
+            out.push((path, action));
+        }
+
+        out.sort_unstable_by(|(a, _), (b, _)| a.cmp(b));
+        Ok(out.into_iter().map(|(_, action)| action).collect())
+    }
+
+    /// Uses seeded, shuffled actions to compare against the collect-and-select reference algorithm.
+    /// Distinct metadata detects selection of the wrong boundary when version and action kind tie.
+    #[test]
+    fn net_changes_matches_reference_for_shuffled_actions_and_equal_version_ties() {
+        let mut rng = StdRng::seed_from_u64(3232);
+        for len in [0, 1, 2, 10, 100, 1000] {
+            for _ in 0..20 {
+                let mut actions = Vec::new();
+                for i in 0..len {
+                    let path = format!("{}.parquet", rng.random_range(0..8));
+                    let version = rng.random_range(0..10);
+                    let dv = match rng.random_range(0..3) {
+                        0 => None,
+                        1 => Some(test_dv("a")),
+                        _ => Some(test_dv("b")),
+                    };
+                    let mut action = match rng.random_range(0..4) {
+                        0 => insert(&path, version, dv),
+                        1 => delete(&path, version, dv),
+                        2 => paired_dv_update(&path, version, dv, Some(test_dv("c"))),
+                        _ => TableChangesFileAction {
+                            add: None,
+                            remove: None,
+                        },
+                    };
+                    for file in [&mut action.add, &mut action.remove].into_iter().flatten() {
+                        file.commit_timestamp = i;
+                        file.partition_values.insert("p".into(), i.to_string());
+                        file.base_row_id = Some(i);
+                    }
+                    actions.push(action);
+                }
+                actions.shuffle(&mut rng);
+                let expected = reference_collapse(actions.clone()).unwrap();
+                let actual = collapse_net_changes(actions.into_iter().map(Ok)).unwrap();
+                assert_eq!(actual, expected);
+            }
+        }
+    }
+
+    /// Even when preceding actions cancel out, a later input error must fail the whole listing.
+    #[test]
+    fn net_changes_returns_late_input_error_instead_of_partial_listing() {
+        let actions = [
+            Ok(insert("a.parquet", 1, None)),
+            Ok(delete("a.parquet", 2, None)),
+            Err(crate::KernelError::generic("late input failure")),
+        ];
+        let error = collapse_net_changes(actions).unwrap_err();
+        assert!(error.to_string().contains("late input failure"));
     }
 }
