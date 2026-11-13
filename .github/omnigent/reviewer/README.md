@@ -36,4 +36,5 @@ once per new revision to record review progress; repeats at the same revision ar
 Reviews keep existing defects and unrelated suggestions in an "Out of scope / existing issues"
 section. These findings retain their evidence and attribution but do not count as required PR
 fixes and are not posted inline. Scope follows causality: a PR can expose a bug in unchanged code.
-Repeated findings use the same history suppression as in-scope findings.
+The reviewer suppresses repeats using the supplied history. Exact inline-comment deduplication
+applies only to findings eligible for inline publication.

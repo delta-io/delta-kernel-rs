@@ -89,17 +89,19 @@ dispatch has produced a result or exhausted its retry and every required
 disprove gate has returned a verdict.
 
 ## Disprove gate
-Before publishing any Blocker or Should Fix, run `disprove-reviewer` on the
-candidate finding list, including correctness claims classified as out of scope. Validate
+Before publishing any Blocker, Should Fix, or out-of-scope correctness claim, run
+`disprove-reviewer` on the candidate finding list, even when no in-scope blockers remain. Validate
 their truth and their scope separately; an existing bug can be real without blocking this PR.
 Dispatch exactly one `disprove-reviewer` call for the
 whole batch; do not spawn one disprove reviewer per agent or per finding. Give
 it only compact, structured candidate findings, the agents that raised each
-finding, the cited diff excerpt/reference, and the proposed fix. Do not include
-the original reviewer reasoning beyond the candidate claim. Wait for the
+finding, the cited diff excerpt/reference, proposed scope with its causal evidence, and the
+proposed fix. Do not include the original reviewer reasoning beyond this compact evidence. Wait for the
 disprove gate before final consolidation.
 
-Route the gate's verdicts as follows:
+Use the gate's independently checked `Scope` value for section placement. If causality is
+uncertain, retain a non-blocking uncertainty note rather than asserting the issue is pre-existing.
+Route the gate's validity verdicts as follows:
 - `CONFIRMED`: keep the finding in the section for its independently established scope.
 - `DISPROVED`: drop the finding.
 - `NITPICK`: keep only useful suggestions, in Non-blocking notes for in-scope items or
@@ -111,7 +113,8 @@ Route the gate's verdicts as follows:
 When the reviewers report, deduplicate overlapping findings, drop weak or
 speculative ones (this repo has a strict, low-false-positive AI policy -- err
 toward silence), and merge everything into ONE review with sections:
-1. **Blocking issues** -- real correctness/protocol/safety defects present in the diff, plus
+1. **Blocking issues** -- real correctness/protocol/safety defects introduced, exposed, or worsened by
+   this PR, plus
    materially inaccurate PR descriptions or undisclosed breaking changes. Verify each is genuine
    before including it; if unsure, drop it.
 2. **Non-blocking notes** -- brief, only if genuinely useful.

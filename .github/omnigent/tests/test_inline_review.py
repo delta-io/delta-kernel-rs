@@ -91,10 +91,11 @@ class InlineReviewTest(unittest.TestCase):
                         (scope_id, "Existing defect unaffected by this PR."),
                     )
                 ]
-                payload, _, _ = self.inline_review.build_review_payload(
+                payload, unmapped, _ = self.inline_review.build_review_payload(
                     review=review, findings=findings, diff=DIFF, head_sha="a" * 40,
                     run_url="https://github.com/example/repo/actions/runs/1",
                 )
+                self.assertEqual(unmapped, ["entry 2" if scope_id == "OutOfScope1" else scope_id])
                 self.assertEqual(len(payload["comments"]), 1)
                 self.assertIn("Blocker1", payload["comments"][0]["body"])
                 self.assertNotIn("### Blocker1", payload["body"])
@@ -103,6 +104,22 @@ class InlineReviewTest(unittest.TestCase):
                 self.assertIn("Existing defect unaffected by this PR.", payload["body"])
                 self.assertIn("issues/123", payload["body"])
                 self.assertIn("## Summary", payload["body"])
+
+    def test_return_to_in_scope_section_allows_inline_notes(self) -> None:
+        review = (
+            "## Out of scope / existing issues\n### OutOfScope1\nExisting issue.\n"
+            "## Non-blocking notes\n### Nit1\nUseful correction.\n## Summary\nOne of each."
+        )
+        payload, unmapped, _ = self.inline_review.build_review_payload(
+            review=review,
+            findings=[{"id": "Nit1", "path": "kernel/src/example.rs", "line": 9,
+                       "side": "RIGHT", "body": "Useful correction."}],
+            diff=DIFF, head_sha="a" * 40,
+            run_url="https://github.com/example/repo/actions/runs/1",
+        )
+        self.assertEqual(unmapped, [])
+        self.assertEqual(len(payload["comments"]), 1)
+        self.assertIn("OutOfScope1", payload["body"])
 
     def test_scope_heading_inside_code_fence_does_not_change_finding_scope(self) -> None:
         review = (
