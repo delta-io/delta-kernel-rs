@@ -384,9 +384,12 @@ impl LogSegment {
                     KernelError::internal_error("checkpoint batch without a version")
                 })?,
             };
-            // Commit batches carry the checkpoint action and `commitInfo`.
+            // Only commit files carry the checkpoint action and `commitInfo`; log compactions carry
+            // neither.
             #[cfg(feature = "adaptive-metadata-in-dev")]
-            let commit_version = log_path.map(|path| path.version as i64);
+            let commit_version = log_path
+                .filter(|path| path.is_commit())
+                .map(|path| path.version as i64);
             Ok(VersionedBatch {
                 protocol_version: Some(rank_version),
                 metadata_version: Some(rank_version),
@@ -778,6 +781,8 @@ impl PmCandidate {
             return false;
         }
         // A checkpoint action's P&M can be older than its commit, so check version, not presence.
+        // A compaction ranks at its last version; stopping there is safe, since every file left to
+        // read is older than its first.
         let version = batch.protocol_version.max(batch.metadata_version);
         is_final(&self.protocol, version) && is_final(&self.metadata, version)
     }
