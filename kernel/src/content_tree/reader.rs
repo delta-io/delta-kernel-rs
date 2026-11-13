@@ -20,7 +20,7 @@ use std::{iter, slice};
 use bytes::Bytes;
 use url::Url;
 
-use crate::actions::{ADD_NAME, ADD_SCHEMA, CheckpointAction, LOG_ADD_SCHEMA, STATS_PARSED};
+use crate::actions::{ADD_NAME, ADD_SCHEMA, CheckpointAction, STATS_PARSED};
 use crate::amt_path_util::{amt_location_to_add_path, amt_manifest_filemeta};
 use crate::cancellation::CancellationTokenRef;
 use crate::content_tree::dv_conversion::{
@@ -125,16 +125,14 @@ pub(crate) struct ReadContext {
 }
 
 impl ReadContext {
-    /// The schema of the `Add`-action batches the read produces: [`LOG_ADD_SCHEMA`], with a
-    /// trailing `add.stats_parsed` when [`Self::stats`] is set.
+    /// The schema of the `Add`-action batches the read produces:
+    /// [`crate::actions::LOG_ADD_SCHEMA`], with a trailing `add.stats_parsed` when [`Self::stats`]
+    /// is set.
     pub(crate) fn add_schema(&self) -> SchemaRef {
-        match self.stats {
-            None => LOG_ADD_SCHEMA.clone(),
-            Some(_) => Arc::new(StructType::new_unchecked([StructField::nullable(
-                ADD_NAME,
-                self.action_schema(),
-            )])),
-        }
+        Arc::new(StructType::new_unchecked([StructField::nullable(
+            ADD_NAME,
+            self.action_schema(),
+        )]))
     }
 
     /// The `add` struct of [`Self::add_schema`].
@@ -1262,7 +1260,9 @@ mod tests {
         KernelDeletionVector, StreamingDeletionVectorWriter,
     };
     use crate::actions::visitors::AddVisitor;
-    use crate::actions::{MAX_VALUES, MIN_VALUES, NULL_COUNT, NUM_RECORDS, TIGHT_BOUNDS};
+    use crate::actions::{
+        LOG_ADD_SCHEMA, MAX_VALUES, MIN_VALUES, NULL_COUNT, NUM_RECORDS, TIGHT_BOUNDS,
+    };
     use crate::arrow::array::{AsArray as _, RecordBatch};
     use crate::arrow::compute::concat_batches;
     use crate::arrow::datatypes::Int64Type;
