@@ -118,7 +118,7 @@ review, use this complete response layout, with both the human-readable review
 and the machine-readable block inside the outer review markers:
 
 {review_start}
-<human-readable review, including ### <ID> findings and Summary>
+<human-readable review grouped under the section headings below, with ### <ID> findings>
 {start}
 {example}
 {end}
@@ -126,6 +126,10 @@ and the machine-readable block inside the outer review markers:
 
 Do not close the outer review before the machine-readable block. For a completed
 review, the outer review end marker must be the final line of your response.
+
+Use `## Blocking issues`, `## Non-blocking notes`, and
+`## Out of scope / existing issues` for the nonempty finding groups, followed by `## Summary`.
+Keep out-of-scope findings under their own section even when in-scope findings move inline.
 
 Include entries for up to {MAX_INLINE_FINDINGS} Blocker/Nit findings, prioritizing
 blockers and then the most useful in-scope notes. OutOfScope findings stay in the

@@ -15,15 +15,15 @@ these ratings or learn from them. The footer is excluded from exact finding dedu
 For repeatable gate-only and full-pipeline behavioral checks, use the
 [review replay pilot](../evaluations/README.md). It keeps frozen inputs separate from adjudicated
 labels and saves raw evidence without publishing to GitHub.
-Repeat reviews use changes since the newest trusted, workflow-stamped review when its base is
+Repeat reviews use changes since the newest trusted, workflow-stamped GitHub review with matching commit metadata when its base is
 unchanged and its head is an ancestor of the current head. A changed base, rewritten history,
 unavailable comparison, or update spanning more than 20 files or 200 changed lines triggers a full review. Older
 reviews without revision metadata also trigger a full review. The reviewer still checks the
 current PR description and affected surrounding code. The complete PR diff remains the source
 for inline publication; repeat-review deletions that no longer map stay in the review body.
 
-The hidden revision marker is added by the workflow after output validation and is ignored by
-text deduplication. Missing history expands review coverage rather than suppressing findings.
+The hidden revision marker is added after output validation only when the code diff was not
+truncated. Text comparison ignores it, but duplicate suppression also checks the reviewed revision. Missing history expands review coverage rather than suppressing findings.
 
 Use `/review full inline` (or any other output mode), or select `full_review` on workflow dispatch,
 for a redesign requested during review. Public Rust API/impl changes, dependency and wire-format
@@ -38,3 +38,10 @@ section. These findings retain their evidence and attribution but do not count a
 fixes and are not posted inline. Scope follows causality: a PR can expose a bug in unchanged code.
 The reviewer suppresses repeats using the supplied history. Exact inline-comment deduplication
 applies only to findings eligible for inline publication.
+
+Issue comments, truncated reviews, and rejected inline publications cannot establish a baseline.
+A merge commit or incomplete comparison commit list also forces a full review. If inline publication
+fails, the collapsed fallback retains the complete findings and omits the revision marker.
+The declaration checks are conservative syntax heuristics, including multiline parameter/field and
+return-type edits; use the full-review override for redesigns they cannot recognize. The complete
+PR diff supplied for description checks is capped at 30,000 characters with a truncation notice.

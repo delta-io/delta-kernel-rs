@@ -1018,9 +1018,11 @@ jobs:
           )
           print(f"Review scope: {review_scope}")
           pathlib.Path("/tmp/review_diff.txt").write_text(review_diff)
-          pathlib.Path("/tmp/review_scope.json").write_text(json.dumps({"incremental": incremental}))
           diff_bytes = review_diff.encode("utf-8")
           truncated = len(diff_bytes) > max_diff_bytes
+          pathlib.Path("/tmp/review_scope.json").write_text(
+              json.dumps({"incremental": incremental, "truncated": truncated})
+          )
           diff = diff_bytes[:max_diff_bytes].decode("utf-8", errors="replace")
           truncation_note = (
               "\n\n[Diff truncated at 80000 bytes by the workflow. Use the "
@@ -1315,7 +1317,7 @@ jobs:
           sys.path.insert(0, ".github/omnigent")
           from inline_review import extract_inline_findings
           from review_publish import extract_marked_review
-          from review_incremental import publication_findings, revision_marker
+          from review_incremental import publication_findings, stamp_complete_review
 
           raw = pathlib.Path("/tmp/review_raw_output.txt").read_text(errors="replace")
           marker = os.environ.get("REVIEW_MARKER", "")
@@ -1390,7 +1392,10 @@ jobs:
               )
 
           meta = json.loads(pathlib.Path("/tmp/pr_meta.json").read_text())
-          body += "\n\n" + revision_marker(meta["base"]["sha"], meta["head"]["sha"])
+          scope = json.loads(pathlib.Path("/tmp/review_scope.json").read_text())
+          body = stamp_complete_review(
+              body, meta["base"]["sha"], meta["head"]["sha"], truncated=scope["truncated"]
+          )
           pathlib.Path("/tmp/review_output.txt").write_text(body + "\n")
           PYEOF
 
@@ -1497,7 +1502,17 @@ jobs:
           if ! gh api --method POST "repos/${REPO}/pulls/${PR_NUMBER}/reviews" \
             --input /tmp/inline-review.json --silent; then
             echo "::warning::GitHub rejected the inline review; posting the collapsed review without inline comments."
-            jq -r '.body' /tmp/inline-review.json > /tmp/comment.md
+            python3 - <<'PYEOF'
+          import os
+          import pathlib
+          import sys
+          sys.path.insert(0, ".github/omnigent")
+          from review_incremental import fallback_review_body
+          body = fallback_review_body(
+              pathlib.Path("/tmp/review_output.txt").read_text(), os.environ["RUN_URL"]
+          )
+          pathlib.Path("/tmp/comment.md").write_text(body)
+          PYEOF
             gh pr comment "$PR_NUMBER" --repo "$REPO" --body-file /tmp/comment.md
             exit 0
           fi

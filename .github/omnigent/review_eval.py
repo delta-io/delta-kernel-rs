@@ -121,15 +121,15 @@ def validate_trace(path: Path) -> None:
         phase = event.get("type", "").lower().removeprefix("phase_")
         data = event.get("data")
         request = event.get("request_data") or {}
-        if (
-            phase == "tool_call"
-            and isinstance(data, dict)
-            and data.get("name") == "sys_session_send"
-        ):
-            agent = data.get("arguments", {}).get("agent")
-            if isinstance(agent, str):
+        if phase == "tool_call" and isinstance(data, dict):
+            tool = event.get("target") or data.get("name")
+            # A preceding context policy can replace data with transformed tool arguments.
+            arguments = data.get("arguments", data)
+            agent = arguments.get("agent") if isinstance(arguments, dict) else None
+            if tool == "sys_session_send" and isinstance(agent, str):
                 calls.add(agent)
         if phase == "tool_result" and request.get("name") == "sys_session_send":
+            # Deferred child results use args; launch acknowledgements use arguments.
             agent = request.get("args", {}).get("agent")
             if isinstance(agent, str) and data:
                 results.add(agent)

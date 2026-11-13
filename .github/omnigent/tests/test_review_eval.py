@@ -212,6 +212,42 @@ class ReviewEvalTest(unittest.TestCase):
             path.write_text("**Verdict**: CONFIRMED")
             verify_artifacts(Path(directory), "fake-eval-sentinel")
 
+    def test_trace_handles_transformed_dispatch_arguments_from_omnigent_082(self):
+        events = []
+        agents = ("maintainer-codex-reviewer", "docs-reviewer", "disprove-reviewer")
+        for agent in agents:
+            events.extend(
+                [
+                    {
+                        "type": "tool_call",
+                        "target": "sys_session_send",
+                        "data": {"agent": agent, "args": {"input": "canonical context"}},
+                    },
+                    {
+                        "type": "tool_result",
+                        "target": "sys_session_send",
+                        "request_data": {"name": "sys_session_send", "arguments": {"agent": agent}},
+                        "data": {"result": json.dumps({"agent": agent, "status": "launching"})},
+                    },
+                ]
+            )
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "events.jsonl"
+            path.write_text("\n".join(json.dumps(e) for e in events))
+            with self.assertRaisesRegex(ValueError, "quorum"):
+                validate_trace(path)
+            for agent in agents:
+                events.append(
+                    {
+                        "type": "tool_result",
+                        "target": "sys_session_send",
+                        "request_data": {"name": "sys_session_send", "args": {"agent": agent}},
+                        "data": {"result": "completed review evidence"},
+                    }
+                )
+            path.write_text("\n".join(json.dumps(e) for e in events))
+            validate_trace(path)
+
     def test_timeout_is_a_failed_run_not_a_clean_review(self):
         with tempfile.TemporaryDirectory() as directory:
             result = self.run_fake(Path(directory), "import time; time.sleep(2)", timeout=1)
