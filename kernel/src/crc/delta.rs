@@ -108,7 +108,7 @@ impl CrcDelta {
 
 /// Commit delta application for [`Crc`]. See the [module-level docs](self) for details.
 impl Crc {
-    /// Applies a delta to a copy without cloning fields that the advance replaces or discards.
+    /// Applies a delta to a copy without cloning replaced P&M or discarded exact-version state.
     ///
     /// The source CRC remains unchanged, including its exact-version fields such as `all_files`.
     pub(crate) fn apply_to_clone(&self, mut delta: CrcDelta, new_version: Version) -> Self {
