@@ -51,9 +51,7 @@ use crate::schema::{
 };
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::table_features::TableFeature;
-use crate::{
-    Engine, EngineData, KernelError, KernelResult, KernelResultIterator, Version, version_as_i64,
-};
+use crate::{Engine, EngineData, KernelError, KernelResult, KernelResultIterator, version_as_i64};
 
 impl LogSegment {
     /// Read the latest Protocol and Metadata from this log segment, using CRC when available.
