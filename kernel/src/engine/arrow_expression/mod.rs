@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 pub(crate) use evaluate_expression::extract_column;
 use evaluate_expression::{evaluate_expression, evaluate_predicate};
-use tracing::debug;
+use tracing::trace;
 
 use super::arrow_conversion::{TryFromKernel as _, TryIntoArrow as _};
 use crate::arrow::array::{self, ArrayBuilder, ArrayRef, RecordBatch, StructArray};
@@ -104,7 +104,7 @@ impl Scalar {
                 append_val_n_as!(array::TimestampMicrosecondBuilder, *val)
             }
             IntervalYearMonth(val) => append_val_n_as!(array::Int32Builder, val.months()),
-            IntervalDayTime(val) => append_val_n_as!(array::Int64Builder, *val),
+            IntervalDayTime(val) => append_val_n_as!(array::Int64Builder, val.micros()),
             Date(val) => append_val_n_as!(array::Date32Builder, *val),
             Binary(val) => append_val_as!(array::BinaryBuilder, val),
             // precision and scale were already set at builder construction time
@@ -227,7 +227,9 @@ impl Scalar {
             DataType::Primitive(PrimitiveType::IntervalYearMonth(_)) => {
                 append_nulls_as!(array::Int32Builder)
             }
-            DataType::INTERVAL_DAY_TIME => append_nulls_as!(array::Int64Builder),
+            DataType::Primitive(PrimitiveType::IntervalDayTime(_)) => {
+                append_nulls_as!(array::Int64Builder)
+            }
             #[cfg(feature = "geo-type-in-dev")]
             DataType::Primitive(PrimitiveType::Geometry(_) | PrimitiveType::Geography(_)) => {
                 return Err(KernelError::unsupported(
@@ -346,7 +348,7 @@ pub struct DefaultExpressionEvaluator {
 
 impl ExpressionEvaluator for DefaultExpressionEvaluator {
     fn evaluate(&self, batch: &dyn EngineData) -> KernelResult<Box<dyn EngineData>> {
-        debug!("Arrow evaluator evaluating: {:#?}", self.expression);
+        trace!("Arrow evaluator evaluating: {:#?}", self.expression);
         let batch = extract_record_batch(batch)?;
         // TODO(#3263): Validate nested fields.
         validate_data_schema_top_level(&self.input_schema, batch.schema().as_ref())?;
@@ -386,7 +388,7 @@ pub struct DefaultPredicateEvaluator {
 
 impl PredicateEvaluator for DefaultPredicateEvaluator {
     fn evaluate(&self, batch: &dyn EngineData) -> KernelResult<Box<dyn EngineData>> {
-        debug!("Arrow evaluator evaluating: {:#?}", self.predicate);
+        trace!("Arrow evaluator evaluating: {:#?}", self.predicate);
         let batch = extract_record_batch(batch)?;
         // TODO(#3263): Validate nested fields.
         validate_data_schema_top_level(&self.input_schema, batch.schema().as_ref())?;
@@ -520,7 +522,7 @@ fn primitive_types_compatible(expected: &PrimitiveType, data_type: &ArrowDataTyp
         ) => true,
         (PrimitiveType::Void, ArrowDataType::Null) => true,
         (PrimitiveType::IntervalYearMonth(_), ArrowDataType::Int32 | ArrowDataType::UInt32) => true,
-        (PrimitiveType::IntervalDayTime, ArrowDataType::Int64 | ArrowDataType::UInt64) => true,
+        (PrimitiveType::IntervalDayTime(_), ArrowDataType::Int64 | ArrowDataType::UInt64) => true,
         _ => false,
     }
 }

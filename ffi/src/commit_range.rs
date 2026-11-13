@@ -394,7 +394,7 @@ pub unsafe extern "C" fn free_commit_action(commit_action: Handle<SharedCommitAc
     unsafe { commit_action.drop_handle() }
 }
 
-type CommitActionIter = Box<dyn KernelResultIterator<CommitAction>>;
+type CommitActionIter = Box<dyn Iterator<Item = delta_kernel::Result<CommitAction>> + Send>;
 
 /// Iterator handle returned by [`commit_range_commits`]. Holds the boxed kernel iterator behind a
 /// mutex (so it is safe to share across threads) plus an engine reference for error allocation.
@@ -480,7 +480,7 @@ fn commit_range_commits_impl(
     engine: Arc<dyn ExternEngine>,
     start_snapshot: Option<SnapshotRef>,
     actions: Vec<KernelDeltaAction>,
-) -> KernelResult<Handle<SharedCommitActionsIterator>> {
+) -> delta_kernel::Result<Handle<SharedCommitActionsIterator>> {
     let inner = commit_range.commits(engine.engine(), start_snapshot, &actions)?;
     let boxed: CommitActionIter = Box::new(inner);
     let iter = FfiCommitActionsIterator {
@@ -520,7 +520,7 @@ fn commit_range_commits_next_impl(
         engine_context: NullableCvoid,
         commit_action: Handle<SharedCommitAction>,
     ),
-) -> KernelResult<bool> {
+) -> delta_kernel::Result<bool> {
     let mut iter = data.lock_iter()?;
     match iter.next().transpose()? {
         Some(commit_action) => {
@@ -749,7 +749,7 @@ mod tests {
     /// Drain a commit-actions iterator, returning the versions yielded in order.
     unsafe fn drain_versions(iter: Handle<SharedCommitActionsIterator>) -> Vec<u64> {
         let mut versions = Vec::<u64>::new();
-        let ctx = Some(unsafe { NonNull::new_unchecked(&mut versions) }.cast());
+        let ctx = Some(NonNull::from_mut(&mut versions).cast());
         while unsafe {
             ok_or_panic(commit_range_commits_next(
                 iter.shallow_copy(),
@@ -1166,7 +1166,7 @@ mod tests {
                 ctx.engine.shallow_copy(),
             ))
         };
-        let rows_ctx = Some(unsafe { NonNull::new_unchecked(&mut ctx.total_rows) }.cast());
+        let rows_ctx = Some(NonNull::from_mut(&mut ctx.total_rows).cast());
         while unsafe { ok_or_panic(read_result_next(iter.shallow_copy(), rows_ctx, count_rows)) } {}
         unsafe { free_read_result_iter(iter) }
         unsafe { free_commit_action(action) }
@@ -1191,7 +1191,7 @@ mod tests {
             engine: unsafe { engine.shallow_copy() },
             total_rows: 0,
         };
-        let ctx_ptr = Some(unsafe { NonNull::new_unchecked(&mut ctx) }.cast());
+        let ctx_ptr = Some(NonNull::from_mut(&mut ctx).cast());
         while unsafe {
             ok_or_panic(commit_range_commits_next(
                 iter.shallow_copy(),

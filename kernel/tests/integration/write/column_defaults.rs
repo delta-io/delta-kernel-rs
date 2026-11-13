@@ -108,7 +108,7 @@ fn assert_top_level_default(
     engine: &dyn Engine,
     column: &str,
     expected: Scalar,
-) -> KernelResult<()> {
+) -> delta_kernel::Result<()> {
     let txn = snapshot
         .clone()
         .update_table(UpdateTableOperation::Write, "test-engine", true)
@@ -664,7 +664,7 @@ async fn test_file_column_default_validation_at_snapshot_load(
     #[case] label: &str,
     #[case] default_sql: &str,
     #[case] expected_error: Option<&str>,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> std::result::Result<(), Box<dyn std::error::Error>> {
     let file_type = DataType::file_type();
     let base = schema! { nullable "f": (file_type) };
     let schema = schema_with_column_defaults(&base, HashMap::from([("f", default_sql)]))?;

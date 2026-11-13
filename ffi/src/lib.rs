@@ -25,7 +25,7 @@ use delta_kernel::schema::Schema;
 use delta_kernel::snapshot::{CheckpointWriteResult, LogSegmentStats, Snapshot, SnapshotRef};
 use delta_kernel::{Engine, EngineData, FileStats, KernelResult, Version};
 use delta_kernel_ffi_macros::handle_descriptor;
-use tracing::debug;
+use tracing::trace;
 use url::Url;
 #[cfg(feature = "default-engine-base")]
 use {
@@ -50,6 +50,8 @@ extern crate self as delta_kernel_ffi;
 
 mod alloc_stats;
 
+#[cfg(feature = "declarative-plans")]
+pub mod checkpoint;
 pub mod column_default;
 pub mod commit_range;
 pub mod delta_types;
@@ -714,7 +716,7 @@ pub use private::{KernelBoolSlice, KernelRowIndexArray};
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn free_bool_slice(slice: KernelBoolSlice) {
     let vec = unsafe { slice.into_vec() };
-    debug!("Dropping bool slice. It is {vec:#?}");
+    trace!("Dropping bool slice. It is {vec:#?}");
 }
 
 /// # Safety
@@ -778,7 +780,7 @@ struct ExternEngineVtable {
 #[cfg(feature = "default-engine-base")]
 impl Drop for ExternEngineVtable {
     fn drop(&mut self) {
-        debug!("dropping engine interface");
+        trace!("dropping engine interface");
     }
 }
 
@@ -1209,7 +1211,7 @@ pub(crate) fn build_engine_from_store(
 /// Caller is responsible for passing a valid handle.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn free_engine(engine: Handle<SharedExternEngine>) {
-    debug!("engine released engine");
+    trace!("engine released engine");
     unsafe { engine.drop_handle() }
 }
 
@@ -1297,7 +1299,7 @@ pub struct SharedProtocol;
 /// Caller is responsible for passing a valid handle.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn free_snapshot(snapshot: Handle<SharedSnapshot>) {
-    debug!("engine released snapshot");
+    trace!("engine released snapshot");
     unsafe { snapshot.drop_handle() }
 }
 
@@ -1334,9 +1336,10 @@ pub unsafe extern "C" fn checkpoint_snapshot(
 
 /// Publish unpublished catalog commits on a catalog-managed snapshot.
 ///
-/// No-op (still returns a caller-owned snapshot handle at the same version) when there is
-/// nothing to publish. Errors when unpublished commits exist but the table is not
-/// catalog-managed or the committer is not a catalog committer.
+/// The returned snapshot uses published paths for commits known to be published, even when no
+/// commits need copying. Filesystem-managed snapshots with nothing to publish are unchanged.
+/// Errors when unpublished commits exist but the table is not catalog-managed or the committer
+/// is not a catalog committer. See [`Snapshot::publish`] for the publication contract.
 ///
 /// Caller owns the returned handle ([`free_snapshot`]). The input snapshot is borrowed; the
 /// committer is consumed (do not free). The returned snapshot carries the published watermark
@@ -3788,7 +3791,7 @@ mod tests {
     fn collect_protocol_state(snap: &handle::Handle<SharedSnapshot>) -> ProtocolVisitState {
         let proto = unsafe { snapshot_get_protocol(snap.shallow_copy()) };
         let mut state = ProtocolVisitState::new();
-        let ctx = NonNull::new(&mut state as *mut ProtocolVisitState as *mut c_void);
+        let ctx = Some(NonNull::from_mut(&mut state).cast());
         unsafe {
             visit_protocol(
                 proto.shallow_copy(),

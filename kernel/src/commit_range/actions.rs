@@ -11,7 +11,7 @@ use crate::path::ParsedLogPath;
 use crate::schema::{SchemaRef, lazy_schema_ref};
 use crate::table_configuration::{InCommitTimestampEnablement, TableConfiguration};
 use crate::table_features::{Operation, ensure_table_can_be_read};
-use crate::{Engine, FileDataReadResultIterator, KernelError, KernelResult, Version};
+use crate::{Engine, FileDataReadResultIterator, KernelError, KernelResult, Result, Version};
 
 /// A Delta log action kind.
 ///
@@ -70,7 +70,7 @@ impl CommitAction {
         read_schema: SchemaRef,
         seed_protocol: Option<Protocol>,
         seed_metadata: Option<Metadata>,
-    ) -> KernelResult<Self> {
+    ) -> Result<Self> {
         let timestamp = log_path.location.last_modified;
         let mut this = Self {
             table_root,
@@ -204,10 +204,10 @@ impl CommitAction {
 
     /// Validate that the kernel can read this commit, given the prebuilt effective `table_config`
     /// (present iff both protocol and metadata are known at this commit).
-    fn protocol_validation(&self, table_config: &Option<TableConfiguration>) -> KernelResult<()> {
+    fn protocol_validation(&self, table_config: &Option<TableConfiguration>) -> Result<()> {
         match (table_config, &self.protocol) {
             (Some(table_config), _) => table_config.ensure_operation_supported(Operation::Scan),
-            (None, Some(protocol)) => ensure_table_can_be_read(protocol),
+            (None, Some(protocol)) => Ok(ensure_table_can_be_read(protocol)?),
             (None, None) => Ok(()),
         }
     }

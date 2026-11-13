@@ -192,13 +192,31 @@ storage call may serve multiple higher-level operations.
 | `JsonReadCompleted` | `num_files`, `bytes_read` | One `JsonHandler::read_json_files` call completed. `bytes_read` is the sum of on-disk file sizes. |
 | `ParquetReadCompleted` | `num_files`, `bytes_read` | One `ParquetHandler::read_parquet_files` call completed. `bytes_read` is the sum of on-disk file sizes. |
 | `CrcReadSuccess` | `duration`, `bytes_read` | One CRC file read and parsed successfully. `bytes_read` is the raw byte count from storage. |
-| `CrcReadFailure` | none | A CRC file read or parse failed. The caller falls back to log replay. |
+| `CrcReadFailure` | none | A CRC file read or parse failed. Non-cancellation failures allow log replay. |
 
 > [!NOTE]
 > If you implement a custom `JsonHandler` or `ParquetHandler`, call
 > `delta_kernel::metrics::emit_json_read_completed` or
 > `emit_parquet_read_completed` once per read call so connectors that install
 > the metrics layer still see those events from your handler.
+
+### Checkpoint hint reads
+
+Use [LastCheckpointReadCompleted](https://docs.rs/delta_kernel/latest/delta_kernel/metrics/struct.LastCheckpointReadCompleted.html)
+to count `_last_checkpoint` read attempts and record their duration by outcome. A missing or invalid
+hint normally leads to log listing. A file-not-found error returned directly by storage propagates
+instead of falling back, but still reports `NotFound`. Use snapshot events to measure snapshot
+failures separately from hint availability. The event has no `operation_id`; see its rustdoc for
+outcome and timing semantics.
+
+### Checksum write events
+
+To track checksum write latency and errors, use
+[ChecksumWriteSuccess](https://docs.rs/delta_kernel/latest/delta_kernel/metrics/struct.ChecksumWriteSuccess.html)
+and [ChecksumWriteFailure](https://docs.rs/delta_kernel/latest/delta_kernel/metrics/struct.ChecksumWriteFailure.html).
+A checksum that already exists produces a success event. See
+[Snapshot::write_checksum](https://docs.rs/delta_kernel/latest/delta_kernel/struct.Snapshot.html#method.write_checksum)
+for the call's behavior.
 
 ## Correlating events with MetricId
 

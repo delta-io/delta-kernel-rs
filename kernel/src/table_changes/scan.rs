@@ -17,7 +17,8 @@ use crate::scan::{PartitionValuesOptions, PhysicalPredicate, StatsOptions};
 use crate::schema::{MetadataColumnSpec, SchemaRef};
 use crate::utils::FoldWithOption as _;
 use crate::{
-    Engine, EngineData, FileMeta, KernelError, KernelResult, KernelResultIterator, PredicateRef,
+    Engine, EngineData, Error, FileMeta, KernelError, KernelResult, KernelResultIterator,
+    PredicateRef, Result,
 };
 
 /// The result of building a [`TableChanges`] scan over a table. This can be used to get the change
@@ -163,7 +164,7 @@ impl TableChangesScan {
     fn scan_metadata(
         &self,
         engine: Arc<dyn Engine>,
-    ) -> KernelResult<impl KernelResultIterator<TableChangesScanMetadata> + use<>> {
+    ) -> Result<impl Iterator<Item = Result<TableChangesScanMetadata>> + Send + use<>> {
         let commits = self
             .table_changes
             .log_segment
@@ -220,7 +221,7 @@ impl TableChangesScan {
     pub fn execute(
         &self,
         engine: Arc<dyn Engine>,
-    ) -> KernelResult<impl KernelResultIterator<Box<dyn EngineData>> + use<>> {
+    ) -> Result<impl Iterator<Item = Result<Box<dyn EngineData>>> + Send + use<>> {
         let scan_metadata = self.scan_metadata(engine.clone())?;
         let scan_files = scan_metadata_to_scan_file(scan_metadata);
 
@@ -234,9 +235,10 @@ impl TableChangesScan {
         let result = scan_files
             .map(move |scan_file| {
                 resolve_scan_file_dv(dv_engine_ref.as_ref(), &table_root, scan_file?)
+                    .map_err(Error::from)
             }) // Iterator-Result-Iterator
             .flatten_ok() // Iterator-Result
-            .map(move |resolved_scan_file| -> KernelResult<_> {
+            .map(move |resolved_scan_file| -> Result<_> {
                 read_scan_file(
                     engine.as_ref(),
                     resolved_scan_file?,
@@ -244,9 +246,10 @@ impl TableChangesScan {
                     state_info.as_ref(),
                     physical_predicate.clone(),
                 )
+                .map_err(Error::from)
             }) // Iterator-Result-Iterator-Result
             .flatten_ok() // Iterator-Result-Result
-            .map(|x| x?); // Iterator-Result
+            .map(|x| x?.map_err(Error::from)); // Iterator-Result
 
         Ok(result)
     }

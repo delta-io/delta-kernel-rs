@@ -30,7 +30,9 @@ use crate::engine::arrow_conversion::{TryFromArrow as _, TryIntoArrow as _};
 use crate::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt};
 use crate::engine::arrow_expression::evaluate_expression::extract_column_ref;
 use crate::engine::arrow_expression::{ArrowEvaluationHandler, extract_column};
-use crate::engine::arrow_utils::{coerce_columns_to_schema, to_json_bytes};
+use crate::engine::arrow_utils::{
+    coerce_columns_to_schema, fix_record_batch_nested_null_masks, to_json_bytes,
+};
 use crate::expressions::{ArrayData, ColumnName, PredicateRef, Scalar};
 use crate::object_store::DynObjectStore;
 use crate::plans::ir::nodes::{
@@ -214,7 +216,14 @@ impl SyncPlanExecutor {
         let mut outputs: Vec<Vec<RecordBatch>> = Vec::with_capacity(plan.nodes.len());
         for node in plan.nodes {
             let output = self.eval_node(node, &outputs, relation_store)?;
-            outputs.push(output);
+            // Every consumer, including the caller of the final node, sees nested children with
+            // their ancestors' null masks applied. Project can introduce new nullable structs.
+            outputs.push(
+                output
+                    .into_iter()
+                    .map(fix_record_batch_nested_null_masks)
+                    .try_collect()?,
+            );
         }
         outputs
             .pop()
@@ -422,10 +431,8 @@ fn retain_relation(
     batches: Vec<RecordBatch>,
 ) -> KernelResult<RelationRef> {
     validate_relation_batches(&schema, &batches)?;
-    // `try_update` is unavailable at the crate's MSRV.
-    #[allow(deprecated)]
     let counter = NEXT_RELATION_ID
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
         .map_err(|_| KernelError::internal_error("relation id space exhausted"))?;
     let id = format!("{name}-{counter}");
     relation_store
@@ -713,10 +720,12 @@ mod tests {
     use crate::actions::deletion_vector::DeletionVectorDescriptor;
     use crate::arrow::array::StructArray;
     use crate::arrow::buffer::{BooleanBuffer, NullBuffer};
+    use crate::arrow::datatypes::{DataType as ArrowDataType, Field};
     use crate::engine::sync::get_bytes;
-    use crate::expressions::{Predicate, StructData, column_name, expr};
+    use crate::expressions::{Expression, Predicate, StructData, col, column_name, expr, lit};
     use crate::object_store::memory::InMemory;
     use crate::plans::PlanBuilder;
+    use crate::plans::ir::nodes::Agg;
     use crate::schema::{ToSchema as _, schema, schema_ref};
 
     fn write_plan(
@@ -940,6 +949,151 @@ mod tests {
                 .to_string()
                 .contains("requires an executor that can store relations")
         );
+        Ok(())
+    }
+
+    #[test]
+    fn aggregate_respects_nested_parent_nulls_from_relation() -> KernelResult<()> {
+        let schema = schema_ref! { nullable "nested": { nullable "value": LONG } };
+        let nested = StructArray::new(
+            vec![Arc::new(Field::new("value", ArrowDataType::Int64, true))].into(),
+            vec![Arc::new(Int64Array::from(vec![99, 7]))],
+            Some(NullBuffer::from(vec![false, true])),
+        );
+        let batch = RecordBatch::try_new(
+            Arc::new(schema.as_ref().try_into_arrow()?),
+            vec![Arc::new(nested)],
+        )?;
+        let scoped = SyncPlanExecutor::default().get_scoped();
+        let source = scoped.create_ref("nested", schema, batch)?;
+
+        let path = column_name!("nested.value");
+        let aggregate = PlanBuilder::relation_source(source)
+            .aggregate_ungrouped(|aggs| {
+                aggs.aggregate_as(Agg::count(path.clone()), "count")
+                    .aggregate_as(Agg::first_non_null(path.clone()), "first")
+                    .aggregate_as(Agg::min(path.clone()), "min")
+                    .aggregate_as(Agg::sum(path.clone()), "sum")
+                    .aggregate_as(
+                        Agg::min_non_null_by(path.clone(), path.clone(), path),
+                        "selected",
+                    )
+            })?
+            .build()?;
+        let batches = scoped
+            .executor
+            .eval_plan(aggregate, Some(&scoped.relation_store))?;
+        let values: Vec<_> = batches[0]
+            .columns()
+            .iter()
+            .map(|column| {
+                column
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .iter()
+                    .next()
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(values, [Some(1), Some(7), Some(7), Some(7), Some(7)]);
+        Ok(())
+    }
+
+    #[test]
+    fn aggregate_respects_nested_parent_nulls_from_project() -> KernelResult<()> {
+        let nested = Expression::struct_with_nullability_from(
+            [col!("value")],
+            Expression::from(Predicate::eq(col!("value"), lit(7i64))),
+        );
+        let plan = PlanBuilder::values(
+            schema_ref! { not_null "value": LONG },
+            vec![vec![99i64.into()], vec![7i64.into()]],
+        )?
+        .project(
+            Expression::struct_from([nested]),
+            schema_ref! { nullable "nested": { nullable "value": LONG } },
+        )?
+        .aggregate_ungrouped(|aggs| {
+            aggs.aggregate_as(Agg::count(column_name!("nested.value")), "count")
+                .aggregate_as(Agg::first_non_null(column_name!("nested.value")), "first")
+        })?
+        .build()?;
+        let batches = SyncPlanExecutor::default().eval_plan(plan, None)?;
+        let count = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let first = batches[0]
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(count.iter().collect::<Vec<_>>(), [Some(1)]);
+        assert_eq!(first.iter().collect::<Vec<_>>(), [Some(7)]);
+        Ok(())
+    }
+
+    #[test]
+    fn filter_respects_nested_parent_nulls_from_relation() -> KernelResult<()> {
+        let schema = schema_ref! { nullable "nested": { nullable "value": LONG } };
+        let nested = StructArray::new(
+            vec![Arc::new(Field::new("value", ArrowDataType::Int64, true))].into(),
+            vec![Arc::new(Int64Array::from(vec![99, 7]))],
+            Some(NullBuffer::from(vec![false, true])),
+        );
+        let batch = RecordBatch::try_new(
+            Arc::new(schema.as_ref().try_into_arrow()?),
+            vec![Arc::new(nested)],
+        )?;
+        let scoped = SyncPlanExecutor::default().get_scoped();
+        let source = scoped.create_ref("nested", schema, batch)?;
+        let plan = PlanBuilder::relation_source(source)
+            .filter(Predicate::is_not_null(col!("nested.value")))?
+            .project(
+                Expression::struct_from([col!("nested.value")]),
+                schema_ref! { nullable "value": LONG },
+            )?
+            .build()?;
+        let output = scoped
+            .executor
+            .eval_plan(plan, Some(&scoped.relation_store))?;
+        let values = output[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(values.iter().collect::<Vec<_>>(), [Some(7)]);
+        Ok(())
+    }
+
+    #[test]
+    fn project_returns_logical_values_from_nullable_struct() -> KernelResult<()> {
+        let nested = Expression::struct_with_nullability_from(
+            [col!("value")],
+            Expression::from(Predicate::eq(col!("value"), lit(7i64))),
+        );
+        let plan = PlanBuilder::values(
+            schema_ref! { not_null "value": LONG },
+            vec![vec![99i64.into()], vec![7i64.into()]],
+        )?
+        .project(
+            Expression::struct_from([nested]),
+            schema_ref! { nullable "nested": { nullable "value": LONG } },
+        )?
+        .project(
+            Expression::struct_from([col!("nested.value")]),
+            schema_ref! { nullable "value": LONG },
+        )?
+        .build()?;
+        let output = SyncPlanExecutor::default().eval_plan(plan, None)?;
+        let values = output[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(values.iter().collect::<Vec<_>>(), [None, Some(7)]);
         Ok(())
     }
 

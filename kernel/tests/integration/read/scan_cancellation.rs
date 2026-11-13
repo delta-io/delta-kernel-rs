@@ -2,19 +2,20 @@
 
 use std::sync::Arc;
 
+use delta_kernel::engine::DelegatingEngine;
 use delta_kernel::object_store::ObjectStoreExt as _;
 use delta_kernel::object_store::memory::InMemory;
 use delta_kernel::object_store::path::Path;
 use delta_kernel::scan::StatsOptions;
 use delta_kernel::{
-    CancellationToken as _, CancellationTokenRef, Engine, FileMeta, FileSlice, JsonHandler,
-    KernelError, KernelResult, KernelResultIterator, ParquetHandler, Snapshot, StorageHandler,
+    CancellationToken as _, CancellationTokenRef, Engine, FileMeta, FileSlice, KernelError,
+    KernelResult, KernelResultIterator, Snapshot, StorageHandler,
 };
 use rstest::rstest;
 use test_utils::delta_kernel_default_engine::DefaultEngineBuilder;
 use test_utils::{
-    TestAction, TestCancellationToken, TokenCapturingEngine, actions_to_string, add_commit,
-    generate_simple_batch, load_test_data, record_batch_to_bytes,
+    TestAction, TestCancellationToken, actions_to_string, add_commit, generate_simple_batch,
+    load_test_data, record_batch_to_bytes, token_capturing_engine,
 };
 
 const PARQUET_FILE1: &str = "part-00000-a72b1fb3-f2df-41fe-a8f0-e65b746382dd-c000.snappy.parquet";
@@ -225,7 +226,8 @@ fn assert_token_recovered_by_identity(
 #[tokio::test]
 async fn engine_receives_the_callers_token_by_identity_json() -> delta_kernel::Result<()> {
     let (storage, table_root) = json_only_table().await?;
-    let engine = TokenCapturingEngine::new(Arc::new(DefaultEngineBuilder::new(storage).build()));
+    let (engine, captured_tokens) =
+        token_capturing_engine(Arc::new(DefaultEngineBuilder::new(storage).build()));
     let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
 
     let token = Arc::new(TestCancellationToken::default());
@@ -233,9 +235,10 @@ async fn engine_receives_the_callers_token_by_identity_json() -> delta_kernel::R
         .scan_builder()
         .with_cancellation_token(token.clone() as CancellationTokenRef)
         .build()?;
-    scan.scan_metadata(&engine)?.for_each(drop);
+    scan.scan_metadata(&engine)?
+        .try_for_each(|batch| batch.map(drop))?;
 
-    assert_token_recovered_by_identity(engine.json_token(), token);
+    assert_token_recovered_by_identity(captured_tokens.json_token(), token);
     Ok(())
 }
 
@@ -249,7 +252,8 @@ async fn engine_receives_the_callers_token_by_identity_parquet() -> delta_kernel
     )
     .unwrap();
 
-    let engine = TokenCapturingEngine::new(test_utils::create_default_engine(&url)?);
+    let (engine, captured_tokens) =
+        token_capturing_engine(test_utils::create_default_engine(&url)?);
     let snapshot = Snapshot::builder_for(url).build(&engine)?;
 
     let token = Arc::new(TestCancellationToken::default());
@@ -257,9 +261,10 @@ async fn engine_receives_the_callers_token_by_identity_parquet() -> delta_kernel
         .scan_builder()
         .with_cancellation_token(token.clone() as CancellationTokenRef)
         .build()?;
-    scan.scan_metadata(&engine)?.for_each(drop);
+    scan.scan_metadata(&engine)?
+        .try_for_each(|batch| batch.map(drop))?;
 
-    assert_token_recovered_by_identity(engine.parquet_token(), token);
+    assert_token_recovered_by_identity(captured_tokens.parquet_token(), token);
     Ok(())
 }
 
@@ -382,27 +387,6 @@ impl StorageHandler for CancelOnListHandler {
     }
 }
 
-/// Installs a [`CancelOnListHandler`] over the real engine's storage, delegating other handlers.
-struct CancelOnListEngine {
-    inner: Arc<dyn Engine>,
-    storage: Arc<CancelOnListHandler>,
-}
-
-impl Engine for CancelOnListEngine {
-    fn evaluation_handler(&self) -> Arc<dyn delta_kernel::EvaluationHandler> {
-        self.inner.evaluation_handler()
-    }
-    fn storage_handler(&self) -> Arc<dyn StorageHandler> {
-        self.storage.clone()
-    }
-    fn json_handler(&self) -> Arc<dyn JsonHandler> {
-        self.inner.json_handler()
-    }
-    fn parquet_handler(&self) -> Arc<dyn ParquetHandler> {
-        self.inner.parquet_handler()
-    }
-}
-
 // Cancellation reaches the log listing during a real `build()`, not only the pre-listing
 // `_last_checkpoint` read: the token is live when `try_read` runs (so that read succeeds) and flips
 // only once listing begins, so the `Err(Cancelled)` `build()` surfaces must come from the listing.
@@ -411,13 +395,14 @@ impl Engine for CancelOnListEngine {
 async fn snapshot_build_cancelled_during_listing() -> KernelResult<()> {
     let (storage, table_root) = json_only_table().await?;
     let token = Arc::new(TestCancellationToken::default());
-    let engine = CancelOnListEngine {
-        inner: Arc::new(DefaultEngineBuilder::new(storage.clone()).build()),
-        storage: Arc::new(CancelOnListHandler {
-            inner: DefaultEngineBuilder::new(storage).build().storage_handler(),
-            token: token.clone(),
-        }),
-    };
+    let inner = Arc::new(DefaultEngineBuilder::new(storage).build());
+    let cancel_on_list_handler = Arc::new(CancelOnListHandler {
+        inner: inner.storage_handler(),
+        token: token.clone(),
+    });
+    let engine = DelegatingEngine::new(inner)
+        .with_storage_handler(cancel_on_list_handler)
+        .without_plan_executor();
 
     let result = Snapshot::builder_for(table_root)
         .with_cancellation_token(token.clone() as CancellationTokenRef)

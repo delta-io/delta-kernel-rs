@@ -10,25 +10,18 @@ cargo new delta_read_example
 cd delta_read_example
 ```
 
-Add the Kernel and default-engine dependencies (see [Installation](./installation.md) for details):
+Add the default-engine dependency setup from
+[Installation](./installation.md#adding-the-dependency), then enable the features used by this
+tutorial:
 
 ```sh
-cargo add delta_kernel -F internal-api
-cargo add delta_kernel_default_engine -F rustls
-```
-
-Your `Cargo.toml` should look like:
-
-```toml
-[dependencies]
-delta_kernel = { version = "0.23", features = ["internal-api"] }
-delta_kernel_default_engine = { version = "0.23", features = ["rustls"] }
+cargo add delta_kernel -F internal-api,prettyprint
 ```
 
 > [!NOTE]
 > The `internal-api` feature exposes `try_parse_uri`, a convenience function used in this tutorial
-> and throughout the guide. This feature flag may be removed in a future release once the API
-> stabilizes.
+> and throughout the guide. It has no compatibility guarantees. The `prettyprint` feature enables
+> the Arrow formatting helper used to display the results.
 
 ## Write the code
 

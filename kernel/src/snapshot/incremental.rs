@@ -16,14 +16,14 @@ use crate::metrics::{
 };
 use crate::path::ParsedLogPath;
 use crate::table_configuration::TableConfiguration;
-use crate::{Engine, KernelError, KernelResult, Version};
+use crate::{Engine, KernelError, Result, Version};
 
 /// The assembled outcome of the listing phase of an incremental update. Listing/assembly
 /// failures surface as `Err` from [`Snapshot::build_new_segment`], not a variant here.
 ///
 /// See [`Snapshot::try_new_from`] for the case taxonomy these outcomes map onto.
 enum NewSegment {
-    /// No new segment to build; the caller returns the existing snapshot unchanged.
+    /// No new segment to build. The caller reuses the snapshot with updated build flags.
     Unchanged,
     /// A checkpoint ahead of the existing snapshot requires a full rebuild from it.
     Rebuild(LogSegment),
@@ -76,7 +76,8 @@ impl Snapshot {
     /// only commits in `(S1, S2]` are replayed for newer P+M on top of it. A base CRC newer than
     /// `S1`, when present, serves as the baseline instead.
     ///
-    /// - **A.** `T == S1`: return the existing snapshot unchanged.
+    /// - **A.** `T == S1`: reuse the existing snapshot, clearing its latest claim if the catalog
+    ///   bound is newer than `S1`.
     /// - **B.** `T < S1`: error. The incremental path only moves forward.
     /// - Otherwise (`T` unset or `T > S1`), list the log from `C1+1` (or from version 1 if there is
     ///   no existing checkpoint), and one of the following applies:
@@ -110,11 +111,12 @@ impl Snapshot {
         log_tail: Vec<ParsedLogPath>,
         engine: &dyn Engine,
         target_version: impl Into<Option<Version>>,
+        max_catalog_version: Option<Version>,
         metric_context: SnapshotLoadMetricContext,
         incremental_replay: IncrementalReplay,
         checkpoint_handling: CheckpointHandling,
         built_as_latest: bool,
-    ) -> KernelResult<Arc<Self>> {
+    ) -> Result<Arc<Self>> {
         let requested_version = target_version.into();
         let mut current_segment = None;
         let result = Self::try_new_from_impl(
@@ -122,6 +124,7 @@ impl Snapshot {
             log_tail,
             engine,
             requested_version,
+            max_catalog_version,
             &metric_context,
             incremental_replay,
             checkpoint_handling,
@@ -148,27 +151,35 @@ impl Snapshot {
         log_tail: Vec<ParsedLogPath>,
         engine: &dyn Engine,
         requested_version: Option<Version>,
+        max_catalog_version: Option<Version>,
         metric_context: &SnapshotLoadMetricContext,
         incremental_replay: IncrementalReplay,
         checkpoint_handling: CheckpointHandling,
         built_as_latest: bool,
         current_segment: &mut Option<LogSegment>,
-    ) -> KernelResult<Arc<Self>> {
+    ) -> Result<Arc<Self>> {
         let existing_snapshot_version = existing_snapshot.version();
         if let Some(requested_version) = requested_version {
             tracing::Span::current().record("version", requested_version);
             // Case A: re-requesting the same version.
             if requested_version == existing_snapshot_version {
-                // TODO(#3833): Reconcile cached freshness with the new request before reuse.
+                // TODO(#3833): Promote cached freshness for latest requests.
                 // TODO(#3845): Preserve publication evidence from the supplied tail before reuse.
-                return Ok(existing_snapshot.clone());
+                let built_as_latest = existing_snapshot.built_as_latest
+                    && max_catalog_version.is_none_or(|max| max <= existing_snapshot_version);
+                return Ok(Self::reuse_with_build_metadata(
+                    &existing_snapshot,
+                    built_as_latest,
+                    existing_snapshot.skipped_new_checkpoints,
+                ));
             }
             // Case B: incremental path only moves forward.
             if requested_version < existing_snapshot_version {
                 return Err(KernelError::Generic(format!(
                     "Requested snapshot version {requested_version} is older than snapshot \
                     hint version {existing_snapshot_version}"
-                )));
+                ))
+                .into());
             }
         } else {
             tracing::Span::current().record("version", existing_snapshot_version);
@@ -191,11 +202,14 @@ impl Snapshot {
         .inspect_err(|_| emit_log_segment_load_failure(metric_context))?
         {
             NewSegment::Unchanged => {
-                return Self::reuse_with_build_metadata(
+                // The builder reaches this branch without an effective target: neither an
+                // explicit version nor a catalog bound can contradict the latest claim.
+                let built_as_latest = existing_snapshot.built_as_latest || built_as_latest;
+                return Ok(Self::reuse_with_build_metadata(
                     &existing_snapshot,
                     built_as_latest,
                     skipped_new_checkpoints,
-                );
+                ));
             }
             NewSegment::Rebuild(new_log_segment) => {
                 emit_log_segment_load(
@@ -283,6 +297,8 @@ impl Snapshot {
                 let newer_base = base_crc
                     .as_ref()
                     .filter(|c| c.version > existing_snapshot_version);
+                // TODO(#3421): Classify missing replay-file failures as Delta errors using the
+                // incremental replay context, preserving the original error sources.
                 combined_log_segment
                     .segment_after_version(existing_snapshot_version)
                     .read_protocol_metadata_opt(engine, newer_base)
@@ -335,7 +351,7 @@ impl Snapshot {
         log_tail: Vec<ParsedLogPath>,
         requested_version: Option<Version>,
         checkpoint_handling: CheckpointHandling,
-    ) -> KernelResult<NewSegment> {
+    ) -> Result<NewSegment> {
         let log_root = existing_log_segment.log_root.clone();
         let storage = engine.storage_handler();
 
@@ -375,7 +391,7 @@ impl Snapshot {
                 // Case C.1: caller requested a specific version (necessarily >
                 // existing_snapshot_version since cases A and B were handled above), but
                 // no such commit exists in the log.
-                Some(_) => Err(KernelError::MissingVersion(existing_snapshot_version + 1)),
+                Some(_) => Err(KernelError::MissingVersion(existing_snapshot_version + 1).into()),
                 // Case C.2: no new commits and no explicit target; latest is existing.
                 // TODO(#3845): Define publication refresh when cached versions are not listed.
                 None => Ok(NewSegment::Unchanged),
@@ -393,15 +409,20 @@ impl Snapshot {
         // hint. If the new segment has a checkpoint, we will return it as is. Otherwise, we
         // will preserve last_checkpoint_metadata when merging the new log segment with the
         // old one.
-        let mut new_log_segment =
-            LogSegment::try_new(new_listed_files, log_root.clone(), requested_version, None)?;
+        let mut new_log_segment = LogSegment::try_new_for_snapshot(
+            new_listed_files,
+            log_root.clone(),
+            requested_version,
+            None,
+        )?;
 
         let new_end_version = new_log_segment.end_version;
         if new_end_version < existing_snapshot_version {
             return Err(KernelError::invalid_log_segment(format!(
                 "Unexpected state: the newest version in the log {new_end_version} is \
                  older than the existing snapshot version {existing_snapshot_version}"
-            )));
+            ))
+            .into());
         }
         if let Some(new_checkpoint_version) = new_log_segment.checkpoint_version
             && new_checkpoint_version > existing_snapshot_version
@@ -498,7 +519,7 @@ impl Snapshot {
                 existing_log_segment.last_checkpoint_metadata.clone(),
             )
         };
-        let combined_log_segment = LogSegment::try_new(
+        let combined_log_segment = LogSegment::try_new_for_snapshot(
             LogSegmentFiles {
                 ascending_commit_files,
                 ascending_compaction_files,
@@ -521,26 +542,36 @@ impl Snapshot {
         Ok(NewSegment::Combined(combined_log_segment))
     }
 
-    /// Reuse `existing`, promoting its `built_as_latest` flag to `true` if this build confirmed
-    /// latest (and updating the checkpoint-retention flag).
+    /// Reuses the snapshot when its build flags match, otherwise copies its retained state.
+    ///
+    /// The source is unchanged. Populated caches are preserved, and uninitialized cache cells
+    /// resolve independently.
     fn reuse_with_build_metadata(
         existing: &Arc<Snapshot>,
         built_as_latest: bool,
         skipped_new_checkpoints: bool,
-    ) -> KernelResult<Arc<Snapshot>> {
-        let built_as_latest = existing.built_as_latest || built_as_latest;
+    ) -> Arc<Snapshot> {
         if existing.built_as_latest == built_as_latest
             && existing.skipped_new_checkpoints == skipped_new_checkpoints
         {
-            return Ok(existing.clone());
+            return existing.clone();
         }
-        Ok(Arc::new(Snapshot::new_with_crc(
-            existing.log_segment.clone(),
-            existing.table_configuration.clone(),
-            existing.base_crc().cloned(),
+        Arc::new(Self {
+            span: existing.span.clone(),
+            log_segment: existing.log_segment.clone(),
+            table_configuration: existing.table_configuration.clone(),
+            crc: existing.crc.clone(),
             built_as_latest,
             skipped_new_checkpoints,
-        )?))
+            #[cfg(feature = "declarative-plans")]
+            checkpoint_info: existing.checkpoint_info.clone(),
+            #[cfg(feature = "declarative-plans")]
+            checkpoint_info_init: Default::default(),
+            #[cfg(feature = "adaptive-metadata-in-dev")]
+            checkpoint_action: existing.checkpoint_action.clone(),
+            #[cfg(feature = "adaptive-metadata-in-dev")]
+            last_manifest_commit: existing.last_manifest_commit.clone(),
+        })
     }
 
     /// Determine the on-disk CRC file the combined segment should carry.
@@ -615,7 +646,45 @@ mod tests {
     use crate::unit_test_utils::{
         CapturingReporter, install_thread_local_metrics_reporter, string_array_to_engine_data,
     };
-    use crate::{Engine, Error, KernelResult, Result};
+    use crate::{DeltaErrorCondition, Engine, Error, KernelResult, Result};
+
+    #[cfg(feature = "declarative-plans")]
+    #[rstest]
+    fn checkpoint_cache_survives_build_metadata_changes(
+        #[values(false, true)] initialized: bool,
+    ) -> Result<()> {
+        // Given: a latest snapshot with either a completed or an empty checkpoint cache.
+        let (engine, snapshot, _tempdir) =
+            crate::unit_test_utils::load_test_table("v1-multi-part-struct-stats-only")?;
+        let before = if initialized {
+            snapshot.reader().get_checkpoint_info(engine.as_ref())?
+        } else {
+            None
+        };
+        assert_eq!(before.is_some(), initialized);
+        let no_executor =
+            crate::engine::DelegatingEngine::new(engine.clone()).without_plan_executor();
+
+        // When: a refresh changes only build policy, then its getter runs without an executor.
+        let refreshed = Snapshot::builder_from(snapshot.clone())
+            .skip_new_checkpoints()
+            .build(engine.as_ref())?;
+        let cached = refreshed.reader().get_checkpoint_info(&no_executor);
+
+        // Then: the copied view retains completed metadata while keeping empty caches independent.
+        assert!(!Arc::ptr_eq(&snapshot, &refreshed));
+        assert!(!snapshot.skipped_new_checkpoints());
+        assert!(refreshed.skipped_new_checkpoints());
+        if let Some(before) = before {
+            assert!(Arc::ptr_eq(&before, &cached?.unwrap()));
+        } else {
+            assert!(cached.is_err());
+            // When / Then: initializing the copy leaves the original unresolved.
+            refreshed.reader().get_checkpoint_info(engine.as_ref())?;
+            assert!(snapshot.cached_checkpoint_info().is_none());
+        }
+        Ok(())
+    }
 
     // ============================================================================
     // Helpers
@@ -756,6 +825,7 @@ mod tests {
             vec![],
             &engine,
             None,
+            None,
             SnapshotLoadMetricContext::for_test(),
             IncrementalReplay::Disabled,
             CheckpointHandling::Adopt,
@@ -841,6 +911,7 @@ mod tests {
             log_tail,
             &engine,
             Some(2),
+            None,
             SnapshotLoadMetricContext::for_test(),
             IncrementalReplay::Disabled,
             CheckpointHandling::Adopt,
@@ -901,6 +972,7 @@ mod tests {
             vec![],
             &engine,
             Some(1),
+            None,
             SnapshotLoadMetricContext::for_test(),
             IncrementalReplay::Disabled,
             CheckpointHandling::Adopt,
@@ -914,6 +986,7 @@ mod tests {
             vec![],
             &engine,
             Some(0),
+            None,
             SnapshotLoadMetricContext::for_test(),
             IncrementalReplay::Disabled,
             CheckpointHandling::Adopt,
@@ -921,7 +994,7 @@ mod tests {
         );
         assert!(matches!(
             older_version,
-            Err(KernelError::Generic(msg)) if msg.contains("older than snapshot hint version")
+            Err(Error::Kernel(KernelError::Generic(msg))) if msg.contains("older than snapshot hint version")
         ));
 
         Ok(())
@@ -1269,10 +1342,20 @@ mod tests {
             .build(ctx.engine.as_ref());
 
         // ===== THEN =====
-        let error = updated.expect_err("the missing commit must not be hidden by the checkpoint");
+        let Error::Delta(error) = updated.unwrap_err() else {
+            panic!("expected Delta error")
+        };
+        assert_eq!(
+            error.condition(),
+            DeltaErrorCondition::DeltaVersionsNotContiguous
+        );
+        let source = std::error::Error::source(&error)
+            .unwrap()
+            .downcast_ref::<KernelError>()
+            .unwrap();
         assert!(matches!(
-            error,
-            Error::Kernel(KernelError::MissingVersion(3))
+            source.without_backtrace(),
+            KernelError::MissingVersion(3)
         ));
 
         Ok(())

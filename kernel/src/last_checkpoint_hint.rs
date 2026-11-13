@@ -1,5 +1,4 @@
-//! Utilities for reading the `_last_checkpoint` file. Maybe this file should instead go under
-//! log_segment module since it should only really be used there? as hint for listing?
+//! Utilities for reading and constructing portable `_last_checkpoint` metadata.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -14,6 +13,8 @@ use crate::actions::CheckpointAction;
 use crate::actions::{
     CheckpointMetadata, DomainMetadata, Metadata, Protocol, SetTransaction, Sidecar,
 };
+use crate::metrics::LastCheckpointReadOutcome;
+use crate::metrics::events::LAST_CHECKPOINT_READ_SPAN;
 use crate::path::{CheckpointInstance, ParsedLogPath};
 use crate::schema::SchemaRef;
 use crate::{FileMeta, KernelError, KernelResult, StorageHandler, Version};
@@ -30,6 +31,7 @@ const LAST_CHECKPOINT_FILE_NAME: &str = "_last_checkpoint";
 const LAST_CHECKPOINT_SIDECARS_THRESHOLD: usize = 30;
 const LAST_CHECKPOINT_NON_FILE_ACTIONS_THRESHOLD: usize = 30;
 
+/// Portable checkpoint metadata matching the fields of `_last_checkpoint`.
 // Note: Schema can not be derived because the checkpoint schema is only known at runtime.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[cfg_attr(test, derive(Default))]
@@ -220,7 +222,7 @@ impl LastCheckpointHint {
         self.version
     }
 
-    /// Returns the checkpoint action count.
+    /// Returns the checkpoint action count, or -1 when unknown.
     #[internal_api]
     #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
     pub(crate) fn size(&self) -> i64 {
@@ -430,18 +432,21 @@ impl LastCheckpointHint {
         Ok(log_root.join(LAST_CHECKPOINT_FILE_NAME)?)
     }
 
-    /// Try reading the `_last_checkpoint` file.
+    /// Reads and validates the `_last_checkpoint` hint.
     ///
-    /// Note that we typically want to ignore a missing/invalid `_last_checkpoint` file without
-    /// failing the read. Thus, the semantics of this function are to return `None` if the file is
-    /// not found or is invalid JSON. Unexpected/unrecoverable errors are returned as `Err` case and
-    /// are assumed to cause failure.
+    /// Returns `Ok(None)` for an empty or invalid hint, or a file-not-found error from the read
+    /// iterator. A file-not-found error returned directly by [`StorageHandler::read_files`]
+    /// propagates instead. Both forms of absence report [`LastCheckpointReadOutcome::NotFound`].
+    /// Other errors, including cancellation, propagate.
+    ///
+    /// Emits one [`LastCheckpointReadCompleted`](crate::metrics::LastCheckpointReadCompleted)
+    /// event per call when metrics reporting is enabled.
     // TODO(#1047): weird that we propagate FileNotFound as part of the iterator instead of top-
     // level result coming from storage.read_files
     #[instrument(
-        name = "last_checkpoint.read",
+        name = LAST_CHECKPOINT_READ_SPAN,
         skip_all,
-        fields(enable_call_frame),
+        fields(report, outcome, enable_call_frame),
         err
     )]
     pub(crate) fn try_read(
@@ -449,7 +454,14 @@ impl LastCheckpointHint {
         log_root: &Url,
     ) -> KernelResult<Option<LastCheckpointHint>> {
         let file_path = Self::path(log_root)?;
-        match storage.read_files(vec![(file_path, None)])?.next() {
+        let mut files = storage
+            .read_files(vec![(file_path, None)])
+            .inspect_err(|err| {
+                if matches!(err, KernelError::FileNotFound(_)) {
+                    record_read_outcome(LastCheckpointReadOutcome::NotFound);
+                }
+            })?;
+        match files.next() {
             Some(Ok(data)) => {
                 let result = Self::from_bytes_with_oversized_fields_dropped(&data)
                     .inspect_err(|e| warn!("invalid _last_checkpoint JSON: {e}"))
@@ -468,15 +480,22 @@ impl LastCheckpointHint {
                         }
                         true
                     });
+                record_read_outcome(if result.is_some() {
+                    LastCheckpointReadOutcome::Success
+                } else {
+                    LastCheckpointReadOutcome::Invalid
+                });
                 info!(hint = result.as_ref().map(|h| h.summary()));
                 Ok(result)
             }
             Some(Err(KernelError::FileNotFound(_))) => {
+                record_read_outcome(LastCheckpointReadOutcome::NotFound);
                 info!("_last_checkpoint file not found");
                 Ok(None)
             }
             Some(Err(err)) => Err(err),
             None => {
+                record_read_outcome(LastCheckpointReadOutcome::Invalid);
                 warn!("empty _last_checkpoint file");
                 Ok(None)
             }
@@ -556,22 +575,103 @@ impl LastCheckpointV2 {
     }
 }
 
+fn record_read_outcome(outcome: LastCheckpointReadOutcome) {
+    tracing::Span::current().record("outcome", outcome.as_ref());
+}
+
 #[cfg(test)]
 mod tests {
-    #[cfg(feature = "adaptive-metadata-in-dev")]
     use bytes::Bytes;
     use rstest::rstest;
 
     use super::*;
-    use crate::engine::CancellableEngine;
     use crate::engine::sync::SyncEngine;
-    use crate::engine::test_delegating::DelegatingEngine;
+    use crate::engine::{CancellableEngine, DelegatingEngine};
+    use crate::metrics::MetricEvent;
     #[cfg(feature = "adaptive-metadata-in-dev")]
     use crate::object_store::memory::InMemory;
     use crate::schema::schema;
     use crate::table_features::TableFeature;
-    use crate::unit_test_utils::create_log_path;
+    use crate::unit_test_utils::{
+        CapturingReporter, create_log_path, install_thread_local_metrics_reporter,
+    };
     use crate::{Engine, KernelResultIterator, Result};
+
+    fn assert_read_outcome(reporter: &CapturingReporter, expected: LastCheckpointReadOutcome) {
+        let reads: Vec<_> = reporter
+            .events()
+            .into_iter()
+            .filter_map(|event| match event {
+                MetricEvent::LastCheckpointReadCompleted(event) => Some(event.outcome),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(reads, [expected]);
+    }
+
+    #[derive(Clone, Copy)]
+    enum ReadBehavior {
+        Data(&'static [u8]),
+        TopLevelNotFound,
+        TopLevelError,
+        IteratorNotFound,
+        IteratorError,
+        EmptyIterator,
+    }
+
+    #[rstest]
+    #[case::valid(
+        ReadBehavior::Data(br#"{"version": 5, "size": 10}"#),
+        LastCheckpointReadOutcome::Success,
+        false
+    )]
+    #[case::empty_file(ReadBehavior::Data(b""), LastCheckpointReadOutcome::Invalid, false)]
+    #[case::malformed(
+        ReadBehavior::Data(b"invalid"),
+        LastCheckpointReadOutcome::Invalid,
+        false
+    )]
+    #[case::missing_fields(ReadBehavior::Data(b"{}"), LastCheckpointReadOutcome::Invalid, false)]
+    #[case::top_level_not_found(
+        ReadBehavior::TopLevelNotFound,
+        LastCheckpointReadOutcome::NotFound,
+        true
+    )]
+    #[case::top_level_error(ReadBehavior::TopLevelError, LastCheckpointReadOutcome::Error, true)]
+    #[case::iterator_not_found(
+        ReadBehavior::IteratorNotFound,
+        LastCheckpointReadOutcome::NotFound,
+        false
+    )]
+    #[case::iterator_error(ReadBehavior::IteratorError, LastCheckpointReadOutcome::Error, true)]
+    #[case::empty_iterator(ReadBehavior::EmptyIterator, LastCheckpointReadOutcome::Invalid, false)]
+    fn try_read_reports_one_outcome_and_preserves_result(
+        #[case] behavior: ReadBehavior,
+        #[case] expected: LastCheckpointReadOutcome,
+        #[case] returns_error: bool,
+    ) {
+        let reporter = Arc::new(CapturingReporter::default());
+        let _guard = install_thread_local_metrics_reporter(reporter.clone());
+        let log_root = Url::parse("memory:///_delta_log/").unwrap();
+        let result = LastCheckpointHint::try_read(&TestStorageHandler(Some(behavior)), &log_root);
+        assert_eq!(result.is_err(), returns_error);
+        if !returns_error {
+            assert_eq!(
+                result.unwrap().is_some(),
+                expected == LastCheckpointReadOutcome::Success
+            );
+        }
+        assert_read_outcome(&reporter, expected);
+    }
+
+    #[test]
+    fn invalid_log_root_reports_error_without_reading_storage() {
+        let reporter = Arc::new(CapturingReporter::default());
+        let _guard = install_thread_local_metrics_reporter(reporter.clone());
+        let log_root = Url::parse("data:text/plain,not-a-directory").unwrap();
+        assert!(LastCheckpointHint::try_read(&TestStorageHandler(None), &log_root).is_err());
+        assert_read_outcome(&reporter, LastCheckpointReadOutcome::Error);
+    }
 
     /// A real `_last_checkpoint` for a V2 checkpoint carries a `v2Checkpoint` object; we parse its
     /// `path` and file metadata. An empty `sidecarFiles` (a leaf checkpoint) parses to `Some([])`,
@@ -814,8 +914,18 @@ mod tests {
                 true,
             )
             .unwrap();
+        let reporter = Arc::new(CapturingReporter::default());
+        let _guard = install_thread_local_metrics_reporter(reporter.clone());
         let hint = LastCheckpointHint::try_read(storage.as_ref(), &log_root).unwrap();
         assert_eq!(hint.is_some(), retained, "{json}");
+        assert_read_outcome(
+            &reporter,
+            if retained {
+                LastCheckpointReadOutcome::Success
+            } else {
+                LastCheckpointReadOutcome::Invalid
+            },
+        );
     }
 
     /// `AdaptiveMetadataTree` serializes to its wire string, but `Unknown` refuses to serialize --
@@ -1485,19 +1595,34 @@ mod tests {
         Ok(())
     }
 
-    /// A storage handler whose every method panics, so a test can prove an operation never touched
-    /// storage.
-    struct NoIoStorageHandler;
+    /// Only the configured read behavior is allowed; all other storage calls panic.
+    struct TestStorageHandler(Option<ReadBehavior>);
 
-    impl StorageHandler for NoIoStorageHandler {
+    impl StorageHandler for TestStorageHandler {
         fn list_from(&self, _path: &Url) -> KernelResult<Box<dyn KernelResultIterator<FileMeta>>> {
             panic!("list_from should not be called");
         }
         fn read_files(
             &self,
             _files: Vec<crate::FileSlice>,
-        ) -> KernelResult<Box<dyn KernelResultIterator<bytes::Bytes>>> {
-            panic!("read_files should not be called");
+        ) -> KernelResult<Box<dyn KernelResultIterator<Bytes>>> {
+            let Some(behavior) = self.0 else {
+                panic!("read_files should not be called");
+            };
+            match behavior {
+                ReadBehavior::Data(data) => {
+                    Ok(Box::new(std::iter::once(Ok(Bytes::from_static(data)))))
+                }
+                ReadBehavior::TopLevelNotFound => Err(KernelError::file_not_found("hint")),
+                ReadBehavior::TopLevelError => Err(KernelError::generic("read failed")),
+                ReadBehavior::IteratorNotFound => Ok(Box::new(std::iter::once(Err(
+                    KernelError::file_not_found("hint"),
+                )))),
+                ReadBehavior::IteratorError => Ok(Box::new(std::iter::once(Err(
+                    KernelError::generic("read failed"),
+                )))),
+                ReadBehavior::EmptyIterator => Ok(Box::new(std::iter::empty())),
+            }
         }
         fn put(&self, _path: &Url, _data: bytes::Bytes, _overwrite: bool) -> KernelResult<()> {
             panic!("put should not be called");
@@ -1519,14 +1644,17 @@ mod tests {
     // touched.
     #[test]
     fn try_read_propagates_cancellation() {
+        let reporter = Arc::new(CapturingReporter::default());
+        let _guard = install_thread_local_metrics_reporter(reporter.clone());
         let log_root = Url::parse("memory:///_delta_log/").unwrap();
         let engine = DelegatingEngine::new(Arc::new(SyncEngine::new()))
-            .with_storage_handler(Arc::new(NoIoStorageHandler));
+            .with_storage_handler(Arc::new(TestStorageHandler(None)));
         let engine = CancellableEngine::new(
             &engine,
             Arc::new(crate::unit_test_utils::TestCancellationToken::cancelled()),
         );
         let result = LastCheckpointHint::try_read(engine.storage_handler().as_ref(), &log_root);
         assert!(matches!(result, Err(KernelError::Cancelled)));
+        assert_read_outcome(&reporter, LastCheckpointReadOutcome::Error);
     }
 }

@@ -217,6 +217,7 @@ use delta_kernel::arrow::util::pretty::pretty_format_batches;
 use delta_kernel::committer::{
     CommitMetadata, CommitResponse, Committer, FileSystemCommitter, PublishMetadata,
 };
+use delta_kernel::engine::DelegatingEngine;
 use delta_kernel::engine::arrow_conversion::{TryFromKernel, TryIntoArrow};
 use delta_kernel::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt};
 use delta_kernel::expressions::Scalar;
@@ -238,7 +239,7 @@ use delta_kernel::{
     CancellationToken, CancellationTokenRef, CancelledFuture, Engine, EngineData,
     FileDataReadResultIterator, FileMeta, FileSize, FilteredEngineData, JsonHandler, KernelError,
     KernelResult, KernelResultIterator, LogPath, ParquetFooter, ParquetHandler, PredicateRef,
-    Snapshot, try_parse_uri,
+    Result, Snapshot, try_parse_uri,
 };
 // Re-export `delta_kernel_default_engine` so kernel's integration tests can access it without
 // taking a direct dev-dep on the new crate (which would create a cycle via this crate).
@@ -1258,7 +1259,7 @@ pub async fn insert_data<E: TaskExecutor>(
     snapshot: Arc<Snapshot>,
     engine: &Arc<DefaultEngine<E>>,
     columns: Vec<ArrayRef>,
-) -> KernelResult<CommitResult> {
+) -> Result<CommitResult> {
     insert_data_with(
         snapshot,
         engine,
@@ -1282,8 +1283,9 @@ pub async fn insert_data_with<E: TaskExecutor>(
     operation: &str,
     data_change: bool,
     is_blind_append: bool,
-) -> KernelResult<CommitResult> {
-    let arrow_schema = TryFromKernel::try_from_kernel(snapshot.schema().as_ref())?;
+) -> Result<CommitResult> {
+    let arrow_schema = TryFromKernel::try_from_kernel(snapshot.schema().as_ref())
+        .map_err(delta_kernel::KernelError::from)?;
     let batch = RecordBatch::try_new(Arc::new(arrow_schema), columns)
         .map_err(|e| delta_kernel::KernelError::generic(e.to_string()))?;
     let operation = match operation {
@@ -1315,10 +1317,7 @@ pub async fn insert_data_with<E: TaskExecutor>(
 }
 
 /// Starts a `WRITE` transaction using the passed snapshot and a [`FileSystemCommitter`].
-pub fn begin_transaction(
-    snapshot: Arc<Snapshot>,
-    engine: &dyn Engine,
-) -> KernelResult<Transaction> {
+pub fn begin_transaction(snapshot: Arc<Snapshot>, engine: &dyn Engine) -> Result<Transaction> {
     begin_transaction_with(
         snapshot,
         engine,
@@ -1341,7 +1340,7 @@ pub fn begin_transaction_with(
     engine_info: impl Into<String>,
     data_change: bool,
     configure: impl FnOnce(UpdateTableTransactionBuilder) -> UpdateTableTransactionBuilder,
-) -> KernelResult<Transaction> {
+) -> Result<Transaction> {
     configure(snapshot.update_table(operation, engine_info, data_change))
         .build(engine, Box::new(FileSystemCommitter::new()))
 }
@@ -1408,14 +1407,14 @@ pub fn load_and_begin_transaction_with(
     configure: impl FnOnce(UpdateTableTransactionBuilder) -> UpdateTableTransactionBuilder,
 ) -> delta_kernel::Result<Transaction> {
     let snapshot = Snapshot::builder_for(table_url).build(engine)?;
-    Ok(begin_transaction_with(
+    begin_transaction_with(
         snapshot,
         engine,
         operation,
         engine_info,
         data_change,
         configure,
-    )?)
+    )
 }
 
 // Helper function to set json values in a serde_json Values
@@ -1780,7 +1779,7 @@ pub async fn write_batch_to_table(
     engine: &DefaultEngine<impl delta_kernel_default_engine::executor::TaskExecutor>,
     data: RecordBatch,
     partition_values: HashMap<String, Scalar>,
-) -> KernelResult<Arc<Snapshot>> {
+) -> Result<Arc<Snapshot>> {
     let mut txn = snapshot
         .clone()
         .update_table(UpdateTableOperation::Write, "DefaultEngine", true)
@@ -1868,60 +1867,51 @@ impl CancellationToken for TestCancellationToken {
     }
 }
 
-/// An [`Engine`] decorator that records the [`CancellationTokenRef`] kernel passes to the JSON and
-/// Parquet cancellation-aware reads, so a test can assert kernel threaded the caller's own token
-/// through by identity. Every other handler call, and the non-cancellation reads, delegate to the
-/// wrapped engine unchanged.
+/// Wraps `inner` to record cancellation tokens passed to JSON and Parquet reads.
 ///
-/// Only the first token observed on each path is retained: a scan drives the read path once with
-/// the caller's token, but a subsequent empty-sidecar read must not clobber it with `None`.
-pub struct TokenCapturingEngine {
-    inner: Arc<dyn Engine>,
-    json: Arc<CapturingJsonHandler>,
-    parquet: Arc<CapturingParquetHandler>,
+/// The returned engine delegates other handlers and non-cancellation reads to `inner` and reports
+/// no plan executor. The recording fixture shares the installed handlers, so tests can inspect
+/// the original token allocations after reading through the engine.
+pub fn token_capturing_engine(inner: Arc<dyn Engine>) -> (DelegatingEngine, CapturedReadTokens) {
+    let json_handler = Arc::new(CapturingJsonHandler {
+        inner: inner.json_handler(),
+        seen: Mutex::new(None),
+    });
+    let parquet_handler = Arc::new(CapturingParquetHandler {
+        inner: inner.parquet_handler(),
+        seen: Mutex::new(None),
+    });
+    let engine = DelegatingEngine::new(inner)
+        .with_json_handler(json_handler.clone())
+        .with_parquet_handler(parquet_handler.clone())
+        .without_plan_executor();
+    (
+        engine,
+        CapturedReadTokens {
+            json_handler,
+            parquet_handler,
+        },
+    )
 }
 
-impl TokenCapturingEngine {
-    /// Wrap `inner`, capturing tokens on both read paths.
-    pub fn new(inner: Arc<dyn Engine>) -> Self {
-        let json = Arc::new(CapturingJsonHandler {
-            inner: inner.json_handler(),
-            seen: Mutex::new(None),
-        });
-        let parquet = Arc::new(CapturingParquetHandler {
-            inner: inner.parquet_handler(),
-            seen: Mutex::new(None),
-        });
-        Self {
-            inner,
-            json,
-            parquet,
-        }
-    }
+/// Tokens recorded by the JSON and Parquet handlers installed by [`token_capturing_engine`].
+///
+/// Each handler retains the first non-`None` token by `Arc` identity. Later reads, including reads
+/// without a token, leave it intact.
+pub struct CapturedReadTokens {
+    json_handler: Arc<CapturingJsonHandler>,
+    parquet_handler: Arc<CapturingParquetHandler>,
+}
 
-    /// The token the JSON read path received, or `None` if it never ran or was handed no token.
+impl CapturedReadTokens {
+    /// Returns the first JSON read token, or `None` if no read supplied one.
     pub fn json_token(&self) -> Option<CancellationTokenRef> {
-        self.json.seen.lock().unwrap().clone()
+        self.json_handler.seen.lock().unwrap().clone()
     }
 
-    /// The token the Parquet read path received, or `None` if it never ran or was handed no token.
+    /// Returns the first Parquet read token, or `None` if no read supplied one.
     pub fn parquet_token(&self) -> Option<CancellationTokenRef> {
-        self.parquet.seen.lock().unwrap().clone()
-    }
-}
-
-impl Engine for TokenCapturingEngine {
-    fn evaluation_handler(&self) -> Arc<dyn delta_kernel::EvaluationHandler> {
-        self.inner.evaluation_handler()
-    }
-    fn storage_handler(&self) -> Arc<dyn delta_kernel::StorageHandler> {
-        self.inner.storage_handler()
-    }
-    fn json_handler(&self) -> Arc<dyn JsonHandler> {
-        self.json.clone()
-    }
-    fn parquet_handler(&self) -> Arc<dyn ParquetHandler> {
-        self.parquet.clone()
+        self.parquet_handler.seen.lock().unwrap().clone()
     }
 }
 
@@ -2257,7 +2247,7 @@ pub fn remove_all_and_get_remove_actions(
     snapshot: &Arc<Snapshot>,
     table_url: &Url,
     engine: &impl Engine,
-) -> KernelResult<Vec<serde_json::Value>> {
+) -> Result<Vec<serde_json::Value>> {
     let scan = snapshot.clone().scan_builder().build()?;
     let all_scan_metadata: Vec<_> = scan
         .scan_metadata(engine)?
@@ -2274,7 +2264,11 @@ pub fn remove_all_and_get_remove_actions(
         CommitResult::Committed(c) => c,
         _ => panic!("Transaction should be committed"),
     };
-    read_actions_from_commit(table_url, committed.commit_version(), "remove")
+    Ok(read_actions_from_commit(
+        table_url,
+        committed.commit_version(),
+        "remove",
+    )?)
 }
 
 /// Build a `serde_json::Value` mapping nested dot-paths to ids.
@@ -2302,4 +2296,52 @@ pub fn assert_partition_values(action: &serde_json::Value, key: &str, expected_v
         "partitionValues should contain key '{key}', got: {pv:?}"
     );
     assert_eq!(pv[key], expected_value);
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use delta_kernel::object_store::memory::InMemory;
+    use delta_kernel::schema::schema_ref;
+    use delta_kernel::{CancellationTokenRef, Engine, KernelResult};
+    use delta_kernel_default_engine::DefaultEngineBuilder;
+    use rstest::rstest;
+
+    use super::{TestCancellationToken, token_capturing_engine};
+
+    #[rstest]
+    #[case::json(false)]
+    #[case::parquet(true)]
+    fn token_recording_retains_first_supplied_token(#[case] parquet: bool) -> KernelResult<()> {
+        let inner = Arc::new(DefaultEngineBuilder::new(Arc::new(InMemory::new())).build());
+        let (engine, captured) = token_capturing_engine(inner);
+        let first: CancellationTokenRef = Arc::new(TestCancellationToken::default());
+        let second: CancellationTokenRef = Arc::new(TestCancellationToken::default());
+        let schema = schema_ref! { not_null "id": INTEGER };
+
+        // Empty requests exercise the installed recording handlers without reading storage.
+        for token in [None, Some(first.clone()), None, Some(second)] {
+            let mut batches = if parquet {
+                engine
+                    .parquet_handler()
+                    .read_parquet_files_with_cancellation(&[], schema.clone(), None, token)?
+            } else {
+                engine.json_handler().read_json_files_with_cancellation(
+                    &[],
+                    schema.clone(),
+                    None,
+                    token,
+                )?
+            };
+            assert!(batches.next().is_none());
+        }
+        let recorded = if parquet {
+            captured.parquet_token()
+        } else {
+            captured.json_token()
+        };
+        assert!(Arc::ptr_eq(&recorded.unwrap(), &first));
+        Ok(())
+    }
 }

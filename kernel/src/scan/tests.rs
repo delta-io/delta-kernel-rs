@@ -15,10 +15,10 @@ use crate::arrow::datatypes::{DataType as ArrowDataType, Field, Fields, Schema a
 use crate::arrow::record_batch::RecordBatch;
 use crate::arrow::util::display::array_value_to_string;
 use crate::committer::FileSystemCommitter;
+use crate::engine::DelegatingEngine;
 use crate::engine::arrow_data::ArrowEngineData;
 use crate::engine::parquet_row_group_skipping::ParquetRowGroupSkipping;
 use crate::engine::sync::SyncEngine;
-use crate::engine::test_delegating::DelegatingEngine;
 use crate::expressions::{
     Expression as Expr, Predicate as Pred, Scalar, col, column_name, column_pred, expr, lit,
 };
@@ -37,7 +37,8 @@ use crate::unit_test_utils::TestCancellationToken;
 use crate::unit_test_utils::recording_reads::{Read, RecordingReads};
 use crate::{
     CancellationTokenRef, Engine, EngineData, FileDataReadResultIterator, FileMeta, FileSize,
-    KernelResult, KernelResultIterator, ParquetFooter, ParquetHandler, PredicateRef, Snapshot,
+    KernelError, KernelResult, KernelResultIterator, ParquetFooter, ParquetHandler, PredicateRef,
+    Result, Snapshot,
 };
 
 #[cfg(feature = "adaptive-metadata-in-dev")]
@@ -1039,10 +1040,11 @@ fn test_missing_column_row_group_skipping() {
 }
 
 #[test_log::test]
-fn test_scan_with_checkpoint() -> KernelResult<()> {
+fn test_scan_with_checkpoint() -> Result<()> {
     let path = std::fs::canonicalize(PathBuf::from(
         "./tests/data/with_checkpoint_no_last_checkpoint/",
-    ))?;
+    ))
+    .map_err(KernelError::from)?;
 
     let url = url::Url::from_directory_path(path).unwrap();
     let engine = SyncEngine::new();
@@ -2908,7 +2910,7 @@ mod scan_metadata_completed_tests {
         let results: Vec<_> = scan
             .scan_metadata(engine.as_ref())
             .unwrap()
-            .collect::<Result<Vec<_>, _>>()
+            .collect::<std::result::Result<Vec<_>, _>>()
             .unwrap();
         (reporter, guard, results.len())
     }

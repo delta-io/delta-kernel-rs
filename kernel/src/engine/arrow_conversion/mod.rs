@@ -374,7 +374,7 @@ impl TryFromKernel<&DataType> for ArrowDataType {
                     }
                     PrimitiveType::Void => Ok(ArrowDataType::Null),
                     PrimitiveType::IntervalYearMonth(_) => Ok(ArrowDataType::Int32),
-                    PrimitiveType::IntervalDayTime => Ok(ArrowDataType::Int64),
+                    PrimitiveType::IntervalDayTime(_) => Ok(ArrowDataType::Int64),
                     #[cfg(feature = "geo-type-in-dev")]
                     PrimitiveType::Geometry(_) | PrimitiveType::Geography(_) => {
                         Err(ArrowError::SchemaError(format!(
@@ -654,15 +654,14 @@ impl TryFromArrow<&ArrowDataType> for DataType {
                 (*field).is_nullable(),
             )
             .into()),
-            ArrowDataType::Map(field, _) => {
-                if let ArrowDataType::Struct(struct_fields) = field.data_type() {
-                    let key_type = DataType::try_from_arrow(struct_fields[0].data_type())?;
-                    let value_type = DataType::try_from_arrow(struct_fields[1].data_type())?;
-                    let value_type_nullable = struct_fields[1].is_nullable();
-                    Ok(MapType::new(key_type, value_type, value_type_nullable).into())
-                } else {
-                    unreachable!("DataType::Map should contain a struct field child");
-                }
+            ArrowDataType::Map(field, _)
+                if let ArrowDataType::Struct(struct_fields) = field.data_type()
+                    && let [key, value] = struct_fields.as_ref() =>
+            {
+                let key_type = DataType::try_from_arrow(key.data_type())?;
+                let value_type = DataType::try_from_arrow(value.data_type())?;
+                let value_type_nullable = value.is_nullable();
+                Ok(MapType::new(key_type, value_type, value_type_nullable).into())
             }
             // Dictionary types are just an optimized in-memory representation of an array.
             // Schema-wise, they are the same as the value type.

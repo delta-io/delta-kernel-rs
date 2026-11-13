@@ -54,7 +54,7 @@ async fn append_row<E: TaskExecutor>(
     engine: &Arc<DefaultEngine<E>>,
     kind: TableKind,
     value: i32,
-) -> KernelResult<Arc<Snapshot>> {
+) -> delta_kernel::Result<Arc<Snapshot>> {
     let column: ArrayRef = Arc::new(Int32Array::from(vec![value]));
     Ok(insert_data_with(
         snapshot,
@@ -103,9 +103,16 @@ async fn setup_multi_version_table<E: TaskExecutor>(
     Ok(())
 }
 
+#[rstest]
+#[case::formerly_rejected(42, false)]
+#[case::supported(331, false)]
+#[case::exceeded(332, true)]
 #[tokio::test]
-async fn deeply_nested_schema_snapshot_load_returns_schema_error() -> KernelResult<()> {
-    let deeply_nested_schema = (0..42).fold(
+async fn snapshot_schema_nesting_boundary(
+    #[case] depth: usize,
+    #[case] exceeds_limit: bool,
+) -> KernelResult<()> {
+    let deeply_nested_schema = (0..depth).fold(
         schema! { nullable "leaf": INTEGER },
         |nested, depth| schema! { nullable (format!("level_{depth}")): (nested) },
     );
@@ -128,12 +135,15 @@ async fn deeply_nested_schema_snapshot_load_returns_schema_error() -> KernelResu
     add_commit(table_url.as_str(), store.as_ref(), 0, commit).await?;
 
     let result = Snapshot::builder_for(table_url).build(&engine);
+    if !exceeds_limit {
+        assert_eq!(result.unwrap().schema().as_ref(), &deeply_nested_schema);
+        return Ok(());
+    }
     assert_result_error_with_message(
         result.as_ref(),
         concat!(
             "Schema error: Table schema is too deeply nested: decoding ",
-            "metaData.schemaString exceeded serde_json's ",
-            "recursion limit: recursion limit exceeded"
+            "metaData.schemaString reached the JSON recursion limit of 1000"
         ),
     );
     let delta_kernel::Error::Kernel(error) = result.unwrap_err() else {

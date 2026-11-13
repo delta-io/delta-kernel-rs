@@ -225,7 +225,8 @@ impl<Mode> SnapshotBuilder<Mode> {
     /// Without a snapshot hint, omitting this uses the supplied
     /// [`max_catalog_version`](Self::with_max_catalog_version), or discovers the latest version
     /// using the filesystem and any supplied [`log tail`](Self::with_log_tail) if no bound is set.
-    /// With a hint, omitting this uses the hint version and its supplied freshness.
+    /// With a hint, omitting this uses the hint version and its supplied freshness, subject to
+    /// the catalog-bound rule in [`Snapshot::is_built_as_latest`].
     ///
     /// An explicit target does not require a catalog bound solely because that version is
     /// catalog-managed. An explicit target must not exceed a supplied catalog bound.
@@ -463,6 +464,7 @@ impl<Mode> SnapshotBuilder<Mode> {
                     log_tail,
                     engine,
                     effective_version,
+                    max_catalog_version,
                     metric_context,
                     incremental_replay,
                     checkpoint_handling,
@@ -488,8 +490,37 @@ impl<Mode> SnapshotBuilder<Mode> {
         version: Option<Version>,
         max_catalog_version: Option<Version>,
         log_tail: &[crate::path::ParsedLogPath],
-    ) -> KernelResult<()> {
-        validate_catalog_managed_log_tail(version, max_catalog_version, log_tail)
+    ) -> Result<()> {
+        // TODO(#3421): Move this Delta error classification into validate_catalog_managed_log_tail
+        // when CommitRangeBuilder::build and its callers migrate to `Result`.
+        validate_catalog_managed_log_tail(version, max_catalog_version, log_tail).map_err(|error| {
+            match error.without_backtrace() {
+                KernelError::LogTailVersionsNotContiguous {
+                    first_version,
+                    second_version,
+                } if first_version
+                    .checked_add(1)
+                    .is_some_and(|next| next < *second_version)
+                    && log_tail
+                        .windows(2)
+                        .all(|pair| pair[0].version < pair[1].version) =>
+                {
+                    match (log_tail.first(), log_tail.last()) {
+                        (Some(first), Some(last)) => {
+                            Error::Delta(DeltaError::versions_not_contiguous(
+                                log_tail.iter().map(|file| file.version),
+                                first.version,
+                                last.version,
+                                version.or(max_catalog_version).unwrap_or(last.version),
+                                Some(Box::new(error)),
+                            ))
+                        }
+                        _ => Error::Kernel(error),
+                    }
+                }
+                _ => Error::Kernel(error),
+            }
+        })
     }
 
     /// Require a catalog bound when a latest version request resolves to a catalog-managed
@@ -561,7 +592,7 @@ impl<Mode> SnapshotBuilder<Mode> {
 fn classify_table_root_error(table_root: &str, error: KernelError) -> Error {
     match error {
         KernelError::InvalidTableLocation(_) if is_absent_local_path(table_root) => {
-            DeltaError::path_does_not_exist(table_root, error).into()
+            DeltaError::path_does_not_exist(table_root, Some(Box::new(error))).into()
         }
         error => error.into(),
     }
@@ -576,13 +607,14 @@ fn classify_table_root_error(table_root: &str, error: KernelError) -> Error {
 fn classify_log_segment_error(
     table_root: &str,
     target_version: Option<Version>,
-    error: KernelError,
+    error: Error,
 ) -> Error {
     match error {
-        KernelError::EmptyLog if target_version.is_none() => {
-            DeltaError::path_does_not_exist(table_root, error).into()
+        Error::Kernel(KernelError::EmptyLog) if target_version.is_none() => {
+            DeltaError::path_does_not_exist(table_root, Some(Box::new(KernelError::EmptyLog)))
+                .into()
         }
-        error => error.into(),
+        error => error,
     }
 }
 
@@ -599,14 +631,15 @@ pub(super) mod tests {
     use url::Url;
 
     use super::*;
-    use crate::DeltaErrorCondition;
     use crate::engine::sync::SyncEngine;
     use crate::metrics::{LogSegmentLoadType, MetricEvent};
     use crate::object_store::memory::InMemory;
     use crate::object_store::path::Path;
     use crate::object_store::{DynObjectStore, ObjectStoreExt as _};
+    use crate::schema::{ArrayType, DataType, MapType, StructField, StructType};
     use crate::unit_test_utils::{CapturingReporter, install_thread_local_metrics_reporter};
     use crate::utils::FoldWithOption as _;
+    use crate::{DeltaErrorCondition, Result};
 
     pub(in crate::snapshot) fn setup_test() -> (Arc<SyncEngine>, Arc<DynObjectStore>, String) {
         let table_root = String::from("memory:///");
@@ -619,7 +652,7 @@ pub(super) mod tests {
     pub(in crate::snapshot) fn scan_paths(
         snapshot: SnapshotRef,
         engine: &dyn Engine,
-    ) -> KernelResult<Vec<String>> {
+    ) -> Result<Vec<String>> {
         let scan = snapshot.scan_builder().build()?;
         let mut paths = Vec::new();
         for batch in scan.scan_metadata(engine)? {
@@ -671,6 +704,64 @@ pub(super) mod tests {
         Ok(())
     }
 
+    #[rstest::rstest]
+    #[case::formerly_rejected(42, "struct")]
+    #[case::struct_boundary(331, "struct")]
+    #[case::array_boundary(996, "array")]
+    #[case::map_boundary(996, "map")]
+    #[test_log::test(tokio::test)]
+    async fn snapshot_deep_schema_survives_updates_and_hint_reconstruction(
+        #[case] depth: usize,
+        #[case] container: &str,
+    ) -> KernelResult<(), Box<dyn std::error::Error>> {
+        let (engine, store, table_root) = setup_test();
+        let data_type = (0..depth).fold(DataType::INTEGER, |nested, level| match container {
+            "struct" => {
+                StructType::try_new([StructField::nullable(format!("level_{level}"), nested)])
+                    .unwrap()
+                    .into()
+            }
+            "array" => ArrayType::new(nested, true).into(),
+            "map" => MapType::new(DataType::STRING, nested, true).into(),
+            _ => panic!("unknown schema container"),
+        });
+        let schema = StructType::try_new([StructField::nullable("nested", data_type)])?;
+        let mut metadata = json!({"metaData": {
+            "id": "nested-schema",
+            "format": {"provider": "parquet", "options": {}},
+            "schemaString": serde_json::to_string(&schema)?,
+            "partitionColumns": [],
+            "configuration": {}
+        }});
+        let protocol = json!({"protocol": {"minReaderVersion": 1, "minWriterVersion": 2}});
+        add_commit(
+            &table_root,
+            store.as_ref(),
+            0,
+            format!("{protocol}\n{metadata}"),
+        )
+        .await?;
+        let initial = Snapshot::builder_for(&table_root).build(engine.as_ref())?;
+        assert_eq!(initial.schema().as_ref(), &schema);
+        let scan = initial.clone().scan_builder().build()?;
+        assert_eq!(scan.logical_schema().as_ref(), &schema);
+
+        metadata["metaData"]["name"] = json!("updated-metadata");
+        add_commit(&table_root, store.as_ref(), 1, metadata.to_string()).await?;
+        let updated = Snapshot::builder_from(initial).build(engine.as_ref())?;
+        assert_eq!(updated.version(), 1);
+        assert_eq!(
+            updated.table_configuration.metadata().name(),
+            Some("updated-metadata")
+        );
+        assert_eq!(updated.schema().as_ref(), &schema);
+        let rebuilt = Snapshot::builder_for(&table_root)
+            .with_snapshot_hint(updated.to_snapshot_hint()?)
+            .build(engine.as_ref())?;
+        assert_eq!(rebuilt.schema().as_ref(), &schema);
+        Ok(())
+    }
+
     #[test_log::test(tokio::test)]
     async fn test_snapshot_with_unsupported_type() -> KernelResult<()> {
         let (engine, store, table_root) = setup_test();
@@ -712,16 +803,22 @@ pub(super) mod tests {
         let path = Path::from("_delta_log/00000000000000000000.json");
         store.put(&path, commit0_data.into()).await?;
 
-        // Try to build a snapshot and expect a clear error message
-        let result = SnapshotBuilder::new_for(table_root.clone()).build(engine);
-        assert!(result.is_err());
-
-        let err = result.unwrap_err();
-        let err_msg = err.to_string();
-        assert!(
-            err_msg.contains("Unsupported Delta table type: 'interval year to second'"),
-            "Expected clear error message about unsupported type, got: {err_msg}"
+        let Error::Delta(error) = SnapshotBuilder::new_for(table_root)
+            .build(engine)
+            .unwrap_err()
+        else {
+            panic!("expected Delta error");
+        };
+        assert_eq!(
+            error.condition(),
+            DeltaErrorCondition::DeltaParsingUnsupportedDataType
         );
+        assert_eq!(error.parameters()[0].value(), "interval year to second");
+        let source = std::error::Error::source(&error)
+            .unwrap()
+            .downcast_ref::<KernelError>()
+            .unwrap();
+        assert!(matches!(source.without_backtrace(), KernelError::Schema(_)));
 
         Ok(())
     }
@@ -2352,6 +2449,8 @@ pub(super) mod tests {
         #[case::gap(vec![1, 3], vec![1, 3], 3)]
         #[case::duplicates(vec![1], vec![1, 1], 1)]
         #[case::unsorted(vec![1, 2], vec![2, 1], 2)]
+        #[case::gap_then_duplicate(vec![1, 3], vec![1, 3, 3], 3)]
+        #[case::gap_then_reversed(vec![1, 2, 3], vec![1, 3, 2], 3)]
         #[case::overflow(vec![], vec![Version::MAX, 0], 0)]
         #[test_log::test(tokio::test)]
         async fn test_non_contiguous_log_tail_errors(
@@ -2377,12 +2476,27 @@ pub(super) mod tests {
                 .with_max_catalog_version(mcv)
                 .build(engine.as_ref());
 
-            assert!(matches!(
-                result,
-                Err(Error::Kernel(
-                    KernelError::LogTailVersionsNotContiguous { .. }
-                ))
-            ));
+            let error = result.unwrap_err();
+            if log_tail_versions.windows(2).all(|pair| pair[0] < pair[1]) {
+                let Error::Delta(error) = error else {
+                    panic!("expected Delta error")
+                };
+                assert_eq!(
+                    error.condition(),
+                    DeltaErrorCondition::DeltaVersionsNotContiguous
+                );
+                assert_eq!(error.parameters()[0].value(), "1,3");
+                assert!(matches!(
+                    std::error::Error::source(&error)
+                        .and_then(|source| source.downcast_ref::<KernelError>()),
+                    Some(KernelError::LogTailVersionsNotContiguous { .. })
+                ));
+            } else {
+                assert!(matches!(
+                    error,
+                    Error::Kernel(KernelError::LogTailVersionsNotContiguous { .. })
+                ));
+            }
 
             Ok(())
         }

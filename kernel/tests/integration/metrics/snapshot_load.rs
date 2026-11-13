@@ -626,7 +626,7 @@ fn get_domain_metadata_when_no_latest_crc_incurs_additional_log_replay() -> delt
 // user domain metadata and a SetTransaction.
 async fn setup_table_with_dms_and_set_txns(
     write_crc: bool,
-) -> KernelResult<(Url, tempfile::TempDir)> {
+) -> delta_kernel::Result<(Url, tempfile::TempDir)> {
     let (temp_dir, table_path, engine) = test_table_setup()?;
     let table_url = delta_kernel::try_parse_uri(&table_path)?;
     let committer = || Box::new(FileSystemCommitter::new());

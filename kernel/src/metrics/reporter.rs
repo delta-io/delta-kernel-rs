@@ -10,10 +10,11 @@ use tracing_subscriber::Layer;
 use tracing_subscriber::layer::Context;
 
 use super::events::{
-    CrcReadSuccess, DomainMetadataLoadSuccess, JsonReadCompleted, LogSegmentLoadSuccess,
-    MetricEvent, ParquetReadCompleted, ProtocolMetadataLoadSuccess, STORAGE_SPAN,
-    ScanMetadataCompleted, SetTransactionLoadSuccess, SnapshotBuildSuccess,
-    TransactionCommitSuccess, storage_metric_from_attrs,
+    CheckpointWriteSuccess, ChecksumWriteSuccess, CrcReadSuccess, DomainMetadataLoadSuccess,
+    JsonReadCompleted, LastCheckpointReadCompleted, LogSegmentLoadSuccess, MetricEvent,
+    ParquetReadCompleted, ProtocolMetadataLoadSuccess, STORAGE_SPAN, ScanMetadataCompleted,
+    SetTransactionLoadSuccess, SnapshotBuildSuccess, TransactionCommitSuccess,
+    storage_metric_from_attrs,
 };
 
 // ====================================================================
@@ -106,6 +107,9 @@ where
             return;
         };
         let event = match metadata.name() {
+            CheckpointWriteSuccess::SPAN_NAME => Some(MetricEvent::CheckpointWriteSuccess(
+                CheckpointWriteSuccess::from_attrs(attrs),
+            )),
             LogSegmentLoadSuccess::SPAN_NAME => Some(MetricEvent::LogSegmentLoadSuccess(
                 LogSegmentLoadSuccess::from_attrs(attrs),
             )),
@@ -129,6 +133,14 @@ where
             CrcReadSuccess::SPAN_NAME => Some(MetricEvent::CrcReadSuccess(
                 CrcReadSuccess::from_attrs(attrs),
             )),
+            LastCheckpointReadCompleted::SPAN_NAME => {
+                Some(MetricEvent::LastCheckpointReadCompleted(
+                    LastCheckpointReadCompleted::from_attrs(attrs),
+                ))
+            }
+            ChecksumWriteSuccess::SPAN_NAME => Some(MetricEvent::ChecksumWriteSuccess(
+                ChecksumWriteSuccess::from_attrs(attrs),
+            )),
             JsonReadCompleted::SPAN_NAME => Some(MetricEvent::JsonReadCompleted(
                 JsonReadCompleted::from_attrs(attrs),
             )),
@@ -149,8 +161,7 @@ where
     }
 
     // RUNTIME CHANNEL. on_event carries log lines, not metric writes; its only metric effect is the
-    // `#[instrument(err)]` failure signal, which FailureFlipVisitor turns into the event's failure
-    // counterpart.
+    // `#[instrument(err)]` failure signal, handled by FailureFlipVisitor.
     fn on_event(&self, event: &tracing::Event<'_>, ctx: Context<'_, S>) {
         let Some(span) = ctx.event_span(event) else {
             return;
@@ -193,7 +204,9 @@ where
             let Some(visitor) = extensions.get_mut::<EventVisitor>() else {
                 return;
             };
-            if let (Some(d), Some(event)) = (duration, visitor.event.as_mut()) {
+            if !visitor.duration_recorded
+                && let (Some(d), Some(event)) = (duration, visitor.event.as_mut())
+            {
                 event.set_duration_if_applicable(d);
             }
             visitor.event.take()
@@ -217,6 +230,8 @@ where
 struct EventVisitor {
     event: Option<MetricEvent>,
     pending_warnings: Vec<String>,
+    // Checkpoint data can finish before the reporting span closes. Preserve its recorded duration.
+    duration_recorded: bool,
 }
 
 impl EventVisitor {
@@ -224,6 +239,7 @@ impl EventVisitor {
         Self {
             event,
             pending_warnings: vec![],
+            duration_recorded: false,
         }
     }
 
@@ -240,8 +256,12 @@ impl Visit for EventVisitor {
         let Some(event) = self.event.as_mut() else {
             return;
         };
-        if let Err(span_name) = event.record_u64(field.name(), value) {
-            self.warn_invalid(field, span_name);
+        match event.record_u64(field.name(), value) {
+            Ok(()) if field.name() == "duration_ns" => {
+                self.duration_recorded = true;
+            }
+            Ok(()) => {}
+            Err(span_name) => self.warn_invalid(field, span_name),
         }
     }
 
@@ -276,8 +296,8 @@ impl Visit for EventVisitor {
 
 /// Event-path visitor for the synthetic event `#[instrument(err)]` emits on `Err` return.
 ///
-/// Flips the span's in-flight success event to its failure counterpart and ignores every other
-/// field, so arbitrary log-line fields never reach the metric allowlist.
+/// Marks the span's in-flight metric as failed and ignores every other field, so arbitrary
+/// log-line fields never reach the metric allowlist.
 struct FailureFlipVisitor<'a> {
     event: &'a mut Option<MetricEvent>,
 }
@@ -297,6 +317,7 @@ impl Visit for FailureFlipVisitor<'_> {
 mod tests {
     use std::io::Error;
     use std::sync::{Arc, Mutex};
+    use std::time::Duration;
 
     use test_utils::{LogWriter, ensure_metrics_compatible_global_subscriber};
     use tracing::field::Empty;
@@ -308,7 +329,10 @@ mod tests {
     use uuid::Uuid;
 
     use crate::metrics::events::SNAPSHOT_COMPLETED_SPAN;
-    use crate::metrics::{MetricEvent, WithMetricsReporterLayer as _};
+    use crate::metrics::{
+        CheckpointWriteMode, CheckpointWriteOutcome, CheckpointWriteStats,
+        LastCheckpointReadOutcome, MetricEvent, WithMetricsReporterLayer as _,
+    };
     use crate::unit_test_utils::{CapturingReporter, install_thread_local_metrics_reporter};
 
     /// Run `f` under a subscriber that layers the metrics layer over an fmt layer capturing to a
@@ -328,6 +352,59 @@ mod tests {
         with_default(subscriber, f);
         let bytes = logs.lock().unwrap().clone();
         String::from_utf8(bytes).unwrap()
+    }
+
+    #[rstest::rstest]
+    #[case::missing(None, LastCheckpointReadOutcome::Unknown)]
+    #[case::empty(Some(""), LastCheckpointReadOutcome::Unknown)]
+    #[case::invalid(Some("not_an_outcome"), LastCheckpointReadOutcome::Unknown)]
+    #[case::success(Some("success"), LastCheckpointReadOutcome::Success)]
+    #[case::not_found(Some("not_found"), LastCheckpointReadOutcome::NotFound)]
+    #[case::invalid_hint(Some("invalid"), LastCheckpointReadOutcome::Invalid)]
+    #[case::error(Some("error"), LastCheckpointReadOutcome::Error)]
+    #[case::unknown(Some("unknown"), LastCheckpointReadOutcome::Unknown)]
+    fn last_checkpoint_read_decodes_outcome_and_records_duration(
+        #[case] value: Option<&str>,
+        #[case] expected: LastCheckpointReadOutcome,
+        #[values(false, true)] error_event: bool,
+    ) {
+        let reporter = Arc::new(CapturingReporter::default());
+        let _guard = install_thread_local_metrics_reporter(reporter.clone());
+        {
+            let span = info_span!("last_checkpoint.read", report = Empty, outcome = Empty);
+            let _entered = span.enter();
+            if let Some(value) = value {
+                span.record("outcome", value);
+            }
+            info!(
+                outcome = "invalid",
+                "log fields must not overwrite metric fields"
+            );
+            if error_event {
+                info!(error = %"injected error");
+            }
+        }
+        let events = reporter.events();
+        let [MetricEvent::LastCheckpointReadCompleted(event)] = events.as_slice() else {
+            panic!("expected one last checkpoint metric: {events:?}");
+        };
+        let expected = if error_event && expected == LastCheckpointReadOutcome::Unknown {
+            LastCheckpointReadOutcome::Error
+        } else {
+            expected
+        };
+        assert_eq!(event.outcome, expected);
+        assert!(event.duration > Duration::ZERO);
+    }
+
+    #[test]
+    fn last_checkpoint_invalid_outcome_warns_after_releasing_extension_lock() {
+        let logs = capture_logs(|| {
+            let span = info_span!("last_checkpoint.read", report = Empty, outcome = Empty);
+            let _entered = span.enter();
+            span.record("outcome", "not_an_outcome");
+        });
+        assert!(logs.contains("Invalid field 'outcome' recorded on last_checkpoint.read span"));
     }
 
     #[test]
@@ -365,6 +442,79 @@ mod tests {
             logs.contains("Invalid field 'bogus' recorded on snap.build span"),
             "an unrecognized .record() field is a declared-field typo and must still warn; got: {logs}"
         );
+    }
+
+    #[rstest::rstest]
+    fn checkpoint_recorded_duration_survives_span_close_and_errors(
+        #[values(0u64, 17)] duration_ns: u64,
+        #[values(false, true)] fail: bool,
+    ) {
+        let reporter = Arc::new(CapturingReporter::default());
+        let _guard = install_thread_local_metrics_reporter(reporter.clone());
+        {
+            let span = info_span!(
+                "snap.checkpoint",
+                report = Empty,
+                outcome = Empty,
+                mode = Empty,
+                duration_ns = Empty,
+                bytes_written = Empty,
+                num_add_files = Empty,
+                num_remove_files = Empty,
+                num_actions = Empty,
+                num_sidecars = Empty,
+            );
+            let _entered = span.enter();
+            span.record("mode", "v2_with_sidecars");
+            span.record("duration_ns", duration_ns);
+            span.record("bytes_written", 50u64);
+            span.record("num_add_files", 1u64);
+            span.record("num_remove_files", 0u64);
+            span.record("num_actions", 5u64);
+            span.record("num_sidecars", 1u64);
+            if fail {
+                info!(error = %"injected error");
+            }
+        }
+        let events = reporter.events();
+        assert_eq!(events.len(), 1);
+        let (mode, duration) = match (&events[0], fail) {
+            (MetricEvent::CheckpointWriteFailure(event), true) => (event.mode, event.duration),
+            (MetricEvent::CheckpointWriteSuccess(event), false) => {
+                assert_eq!(
+                    event.outcome,
+                    CheckpointWriteOutcome::Written {
+                        stats: CheckpointWriteStats {
+                            bytes_written: 50,
+                            num_add_files: 1,
+                            num_remove_files: 0,
+                            num_actions: 5,
+                            num_sidecars: 1,
+                        }
+                    }
+                );
+                (event.mode, event.duration)
+            }
+            (event, _) => panic!("unexpected checkpoint metric: {event:?}"),
+        };
+        assert_eq!(duration, Duration::from_nanos(duration_ns));
+        assert_eq!(mode, CheckpointWriteMode::V2WithSidecars);
+    }
+
+    #[test]
+    fn checkpoint_invalid_enum_fields_warn_without_reentering_the_extension_lock() {
+        let logs = capture_logs(|| {
+            let span = info_span!(
+                "snap.checkpoint",
+                report = Empty,
+                outcome = Empty,
+                mode = Empty
+            );
+            span.record("outcome", "invalid");
+            span.record("mode", "invalid");
+        });
+        assert!(logs.contains("Invalid field 'outcome' recorded on snap.checkpoint span"));
+        assert!(logs.contains("Invalid field 'mode' recorded on snap.checkpoint span"));
     }
 
     // A log line whose field name collides with a real metric field must NOT overwrite the value a

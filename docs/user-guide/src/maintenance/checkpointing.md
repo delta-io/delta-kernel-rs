@@ -38,7 +38,7 @@ match result {
 ```
 
 `checkpoint()` takes a `&SnapshotRef` (i.e., `&Arc<Snapshot>`) and returns a
-`KernelResult<(CheckpointWriteResult, SnapshotRef)>`. The returned `SnapshotRef` reflects
+`delta_kernel::Result<(CheckpointWriteResult, SnapshotRef)>`. The returned `SnapshotRef` reflects
 the new checkpoint when `Written`, or the original snapshot when `AlreadyExists`.
 
 This method handles everything in one call: reads the log, reconciles actions, writes the

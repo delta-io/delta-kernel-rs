@@ -71,7 +71,7 @@ use crate::snapshot::SnapshotRef;
 use crate::table_features::Operation;
 use crate::transforms::{SchemaTransform, transform_output_type};
 use crate::utils::require;
-use crate::{Engine, KernelError, KernelResult, KernelResultIterator, Version};
+use crate::{Engine, Error, KernelError, KernelResult, KernelResultIterator, Result, Version};
 
 /// A range of Delta commits, holding resolved `[start_version, end_version]` bounds plus the
 /// materialized commit-file pointers in `commit_files`.
@@ -183,37 +183,37 @@ impl CommitRange {
         engine: Arc<dyn Engine>,
         start_snapshot: Option<SnapshotRef>,
         actions: &[DeltaAction],
-    ) -> KernelResult<impl KernelResultIterator<CommitAction> + use<>> {
+    ) -> Result<impl Iterator<Item = Result<CommitAction>> + Send + use<>> {
         require!(
             self.supports_commit_actions,
-            KernelError::CommitRange(
+            Error::Kernel(KernelError::CommitRange(
                 "Commit action iteration is not supported for this range".to_string()
-            )
+            ))
         );
         if actions.is_empty() {
-            return Err(KernelError::CommitRange(
+            return Err(Error::Kernel(KernelError::CommitRange(
                 "at least one DeltaAction must be requested".to_string(),
-            ));
+            )));
         }
 
         let (latest_protocol, latest_metadata) = match &start_snapshot {
             Some(snapshot) => {
                 if snapshot.table_root() != &self.table_root {
-                    return Err(KernelError::CommitRange(format!(
+                    return Err(Error::Kernel(KernelError::CommitRange(format!(
                         "snapshot table root ({}) does not match commit range table root ({})",
                         snapshot.table_root(),
                         self.table_root,
-                    )));
+                    ))));
                 }
                 let (anchor_version, anchor_name) = match self.commit_ordering {
                     CommitOrdering::AscendingOrder => (self.start_version, "start_version"),
                     CommitOrdering::DescendingOrder => (self.end_version, "end_version"),
                 };
                 if snapshot.version() != anchor_version {
-                    return Err(KernelError::CommitRange(format!(
+                    return Err(Error::Kernel(KernelError::CommitRange(format!(
                         "snapshot version {} does not match {anchor_name} ({anchor_version})",
                         snapshot.version(),
-                    )));
+                    ))));
                 }
                 let table_config = snapshot.table_configuration();
                 table_config.ensure_operation_supported(Operation::Scan)?;
@@ -313,7 +313,7 @@ impl CommitActionsIterator {
     /// Commits below the anchor are validated/timestamped best-effort against only their own
     /// actions. Another solution is to walk the commit in ascending then reversing in the
     /// [`CommitOrdering::DescendingOrder`] scenario.
-    fn try_advance(&mut self, log_path: ParsedLogPath) -> KernelResult<CommitAction> {
+    fn try_advance(&mut self, log_path: ParsedLogPath) -> Result<CommitAction> {
         let version = log_path.version;
         let commit_action = CommitAction::try_new(
             self.engine.as_ref(),
@@ -323,7 +323,10 @@ impl CommitActionsIterator {
             self.latest_protocol.clone(),
             self.latest_metadata.clone(),
         )
-        .map_err(|e| with_version_context(version, e))?;
+        .map_err(|e| match e {
+            Error::Kernel(e) => Error::Kernel(with_version_context(version, e)),
+            Error::Delta(error) => Error::Delta(error.with_context(format!("commit v={version}"))),
+        })?;
 
         match self.commit_ordering {
             CommitOrdering::AscendingOrder => {
@@ -354,7 +357,7 @@ fn with_version_context(version: Version, err: KernelError) -> KernelError {
 }
 
 impl Iterator for CommitActionsIterator {
-    type Item = KernelResult<CommitAction>;
+    type Item = Result<CommitAction>;
 
     fn next(&mut self) -> Option<Self::Item> {
         let log_path = self.log_path_iter.next()?;
@@ -429,7 +432,6 @@ mod tests {
     use test_utils::{add_commit, assert_result_error_with_message};
 
     use super::*;
-    use crate::Snapshot;
     use crate::actions::visitors::{AddVisitor, RemoveVisitor};
     use crate::actions::{Add, Remove};
     use crate::arrow::array::{Array, AsArray, MapArray, StringArray, StructArray};
@@ -440,6 +442,7 @@ mod tests {
     use crate::object_store::memory::InMemory;
     use crate::unit_test_utils::TestCancellationToken;
     use crate::utils::FoldWithOption as _;
+    use crate::{DeltaError, DeltaErrorCondition, Error, Snapshot};
 
     /// Open a `CommitRange` over `table-with-dv-small` with a matching anchor snapshot.
     /// `start_version` drives both the range's start version and the snapshot's version.
@@ -460,6 +463,74 @@ mod tests {
     }
 
     #[test]
+    fn delta_commit_error_preserves_catalog_metadata_and_version_context() {
+        let error = DeltaError::invalid_version(
+            -1,
+            Some(Box::new(KernelError::generic("negative version"))),
+        )
+        .with_context("commit v=7".to_owned());
+        assert_eq!(error.condition(), DeltaErrorCondition::DeltaVersionInvalid);
+        assert_eq!(error.parameters()[0].value(), "-1");
+        let context = std::error::Error::source(&error).unwrap();
+        assert_eq!(context.to_string(), "commit v=7");
+        assert!(matches!(
+            context.source().unwrap().downcast_ref::<KernelError>(),
+            Some(KernelError::Generic(message)) if message == "negative version"
+        ));
+    }
+
+    #[rstest::rstest]
+    #[tokio::test]
+    async fn commit_iterator_preserves_delta_error_and_version_context(
+        #[values(CommitOrdering::AscendingOrder, CommitOrdering::DescendingOrder)]
+        ordering: CommitOrdering,
+    ) {
+        let valid_commit = format!("{VALID_PROTOCOL_LINE}\n{VALID_METADATA_LINE}");
+        let mut metadata: serde_json::Value = serde_json::from_str(VALID_METADATA_LINE).unwrap();
+        metadata["metaData"]["schemaString"] = serde_json::json!(
+            r#"{"type":"struct","fields":[{"name":"p","type":"integer","nullable":true,"metadata":{}}]}"#
+        );
+        metadata["metaData"]["partitionColumns"] = serde_json::json!(["p", "p"]);
+        let invalid_commit = format!("{VALID_PROTOCOL_LINE}\n{metadata}");
+        let (engine, table_root) =
+            engine_with_commits(&[(0, &valid_commit), (1, &invalid_commit), (2, &valid_commit)])
+                .await;
+        let range = CommitRange::builder_for(table_root, 0)
+            .with_end_version(2)
+            .with_ordering(ordering)
+            .build(engine.as_ref())
+            .unwrap();
+        let mut commits = range
+            .commits(engine, None, &[DeltaAction::Metadata])
+            .unwrap();
+        let first_version = if ordering == CommitOrdering::AscendingOrder {
+            0
+        } else {
+            2
+        };
+        assert_eq!(commits.next().unwrap().unwrap().version(), first_version);
+        let Err(Error::Delta(error)) = commits.next().unwrap() else {
+            panic!("duplicate partition columns must produce a Delta error");
+        };
+        assert_eq!(
+            error.condition(),
+            DeltaErrorCondition::DeltaDuplicateColumnsFoundPartitionColumns
+        );
+        assert_eq!(error.parameters()[0].value(), "p");
+        let context = std::error::Error::source(&error).unwrap();
+        assert_eq!(context.to_string(), "commit v=1");
+        let source = context
+            .source()
+            .unwrap()
+            .downcast_ref::<KernelError>()
+            .unwrap();
+        assert!(matches!(
+            source.without_backtrace(),
+            KernelError::Generic(message) if message == "Duplicate partition column: 'p'"
+        ));
+    }
+
+    #[test]
     fn test_commits_yields_one_per_commit_in_range() {
         let (range, engine, anchor_snapshot) = open_test_range_at(0);
         let files = &range.commit_files;
@@ -473,7 +544,7 @@ mod tests {
         let collected = range
             .commits(engine, Some(anchor_snapshot), &actions)
             .unwrap()
-            .collect::<KernelResult<Vec<_>>>()
+            .collect::<Result<Vec<_>>>()
             .unwrap();
 
         assert_eq!(collected.len(), 2, "yield one CommitAction per commit");
@@ -500,7 +571,7 @@ mod tests {
         }
         let result = commits.next().unwrap();
         if cancelled {
-            assert!(matches!(result, Err(KernelError::Cancelled)));
+            assert!(matches!(result, Err(Error::Kernel(KernelError::Cancelled))));
         } else {
             assert_eq!(result.unwrap().version(), 0);
         }
@@ -805,7 +876,7 @@ mod tests {
         engine: Arc<dyn Engine>,
         start_snapshot: Option<SnapshotRef>,
         actions: &[DeltaAction],
-    ) -> KernelResult<()> {
+    ) -> Result<()> {
         for commit_res in range.commits(engine.clone(), start_snapshot, actions)? {
             let commit = commit_res?;
             for batch_res in commit.get_actions(engine.as_ref())? {
@@ -852,7 +923,10 @@ mod tests {
         let actions = [DeltaAction::Add, DeltaAction::Remove];
         let err = drain_commits(&range, engine, Some(anchor_snapshot), &actions)
             .expect_err("v=1 reader version must be rejected");
-        assert!(is_expected_err(&err), "unexpected error variant: {err:?}");
+        assert!(
+            matches!(&err, Error::Kernel(error) if is_expected_err(error)),
+            "unexpected error variant: {err:?}"
+        );
     }
 
     #[rstest::rstest]
@@ -944,7 +1018,7 @@ mod tests {
             .unwrap();
         assert!(matches!(
             err,
-            KernelError::CommitRange(message) if message.contains(expected_anchor_name)
+            Error::Kernel(KernelError::CommitRange(message)) if message.contains(expected_anchor_name)
         ));
     }
 
@@ -965,7 +1039,7 @@ mod tests {
             .unwrap();
         assert!(matches!(
             err,
-            KernelError::CommitRange(message) if message.contains("table root")
+            Error::Kernel(KernelError::CommitRange(message)) if message.contains("table root")
         ));
     }
 
@@ -978,7 +1052,7 @@ mod tests {
             .unwrap();
         assert!(matches!(
             err,
-            KernelError::CommitRange(message) if message.contains("DeltaAction")
+            Error::Kernel(KernelError::CommitRange(message)) if message.contains("DeltaAction")
         ));
     }
 
@@ -1113,7 +1187,7 @@ mod tests {
         if expects_unsupported {
             let err = result.expect_err("commit-driven validation must reject");
             assert!(
-                matches!(err, KernelError::Unsupported(_)),
+                matches!(err, Error::Kernel(KernelError::Unsupported(_))),
                 "expected KernelError::Unsupported, got: {err:?}",
             );
         } else {
@@ -1142,7 +1216,7 @@ mod tests {
         let v0_result = iter.next().expect("v=0 commit yield slot");
         match v0_result {
             Ok(_) => panic!("v=0 must reject during iter.next()"),
-            Err(KernelError::Unsupported(msg)) => {
+            Err(Error::Kernel(KernelError::Unsupported(msg))) => {
                 assert!(msg.contains("futureFeature"), "got: {msg}")
             }
             Err(other) => panic!("expected KernelError::Unsupported, got: {other:?}"),
@@ -1328,7 +1402,10 @@ mod tests {
         let commits = range.commits(engine, None, &[DeltaAction::Protocol]);
         match expected_commits_err {
             Some(msg) => {
-                assert!(matches!(commits, Err(KernelError::CommitRange(_))));
+                assert!(matches!(
+                    commits,
+                    Err(Error::Kernel(KernelError::CommitRange(_)))
+                ));
                 assert_result_error_with_message(commits, msg);
             }
             None => {
