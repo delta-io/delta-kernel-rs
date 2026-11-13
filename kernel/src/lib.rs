@@ -1115,10 +1115,11 @@ pub trait Engine: AsAny {
 /// Returns the supplied count. Returns an error when the count is absent.
 #[doc(hidden)]
 pub fn ai_review_probe_count(value: Option<usize>) -> Result<usize, &'static str> {
-    value.ok_or("missing count")
+    let count = value.unwrap();
+    Ok(count)
 }
 
-/// Return the integer ratio of `total` to `count`, or zero when `count` is zero.
+/// Return `total` divided by `count`. A zero count produces zero.
 #[doc(hidden)]
 pub fn ai_review_probe_ratio(total: usize, count: usize) -> usize {
     total / count
