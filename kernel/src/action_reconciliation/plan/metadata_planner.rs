@@ -46,6 +46,7 @@ pub(crate) struct MetadataPlanner<'a> {
     pub(crate) parsed_partition_schema: Option<SchemaRef>,
     pub(crate) read_collations: bool,
     pub(crate) stats_filter: Option<Predicate>,
+    pub(crate) stats_json_op: UnaryExpressionOp,
 }
 
 /// The statistics representation present in a metadata plan.
@@ -71,6 +72,7 @@ impl<'a> MetadataPlanner<'a> {
             parsed_partition_schema: None,
             read_collations: false,
             stats_filter: None,
+            stats_json_op: UnaryExpressionOp::TO_JSON,
         }
     }
 
@@ -116,6 +118,12 @@ impl<'a> MetadataPlanner<'a> {
     /// Enables scan pruning before replay; only use when a conservative superset is acceptable.
     pub(crate) fn with_stats_filter(mut self, predicate: Option<Predicate>) -> Self {
         self.stats_filter = predicate;
+        self
+    }
+
+    /// Sets the operator that synthesizes JSON stats from structured stats.
+    pub(crate) fn with_stats_json_op(mut self, stats_json_op: UnaryExpressionOp) -> Self {
+        self.stats_json_op = stats_json_op;
         self
     }
 
@@ -456,8 +464,7 @@ impl<'a> MetadataPlanner<'a> {
                 StatsKind::Struct | StatsKind::Both => {
                     if stats == StatsKind::Struct && self.stats.synthesize_json {
                         let field = StructField::nullable(STATS, DataType::STRING);
-                        let expr =
-                            Expr::unary(UnaryExpressionOp::TO_JSON, col!(ADD_NAME, STATS_PARSED));
+                        let expr = Expr::unary(self.stats_json_op, col!(ADD_NAME, STATS_PARSED));
                         // Match ADD_SCHEMA's field order without moving native structured stats.
                         patch = patch.insert_after_at([ADD_NAME], "dataChange", field, expr)
                     }
