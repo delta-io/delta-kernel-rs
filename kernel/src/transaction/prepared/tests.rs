@@ -239,7 +239,7 @@ fn prepare_append_commit_produces_the_exact_post_commit_snapshot(
     } else {
         create_valid_add_file_batch(false)
     };
-    let schema = Arc::new(StructType::try_from_arrow(batch.schema())?);
+    let schema = Arc::new(StructType::try_from_arrow(batch.schema()).map_err(KernelError::from)?);
     let input = executor.create_ref("adds", schema, batch)?;
     txn.add_files_ref(input);
     let prepared = txn.prepare(&engine, &executor)?;
@@ -292,7 +292,8 @@ fn prepare_append_commit_produces_the_exact_post_commit_snapshot(
                     .map(|row| selection.get(row).copied().unwrap_or(true))
                     .collect::<Vec<_>>(),
             ),
-        )?;
+        )
+        .map_err(KernelError::from)?;
         remove.remove_files_ref(executor.create_ref(
             "removes",
             crate::scan::scan_row_schema(),
@@ -633,7 +634,7 @@ fn partition_key_validation_fails_before_writing(
     } else {
         batch
     };
-    let schema = Arc::new(StructType::try_from_arrow(batch.schema())?);
+    let schema = Arc::new(StructType::try_from_arrow(batch.schema()).map_err(KernelError::from)?);
     let mut builder = snapshot
         .update_table(UpdateTableOperation::Write, "test", true)
         .with_execution_mode::<Declarative>();
@@ -695,7 +696,7 @@ fn file_action_validation_fails_before_submitting(#[case] invalid: &str) -> Resu
         ),
         _ => nullable_add_file("a"),
     };
-    let schema = StructType::try_from_arrow(batch.schema())?;
+    let schema = StructType::try_from_arrow(batch.schema()).map_err(KernelError::from)?;
     let input = executor.create_ref("input", Arc::new(schema), batch)?;
     txn.add_files_ref(input.clone());
     if invalid == "duplicate" {
