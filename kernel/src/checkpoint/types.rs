@@ -20,10 +20,9 @@ pub(crate) struct SelectedCheckpoint {
 /// Selection does not require reading the checkpoint; a CRC can supply protocol and metadata.
 /// Classic-named checkpoints remain unresolved unless matching `_last_checkpoint` schema evidence,
 /// a retained hint claim, or the checkpoint writer establishes their type.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SelectedCheckpointType {
     /// A checkpoint was selected, but its type was not established during snapshot construction.
-    #[default]
     Unresolved,
     /// The checkpoint follows the V1 specification.
     V1,
@@ -48,7 +47,7 @@ mod tests {
         #[case] sidecars: bool,
         #[case] written_type: SelectedCheckpointType,
     ) {
-        // Given a snapshot loaded from a classic or V2 checkpoint.
+        // Given a snapshot loaded from a classic-named V1 or V2 checkpoint.
         let mut log = LogState::with_latest_version(3).with_checkpoint_at([1]);
         if sidecars {
             log = log.with_sidecars_if_enabled(Some(1));
@@ -64,8 +63,8 @@ mod tests {
             .at_version(2)
             .build(&engine)
             .unwrap();
-        let expected = snapshot.checkpoint_type();
-        assert!(expected.is_some());
+        let expected = Some(SelectedCheckpointType::Unresolved);
+        assert_eq!(snapshot.checkpoint_type(), expected);
 
         // When a scan reads the checkpoint contents.
         let scan = snapshot.clone().scan_builder().build().unwrap();
@@ -103,5 +102,12 @@ mod tests {
         assert_eq!(updated.version(), 3);
         assert_eq!(updated.log_segment().checkpoint_version(), Some(2));
         assert_eq!(updated.checkpoint_type(), Some(written_type));
+
+        // When a newer checkpoint is selected during an incremental snapshot load.
+        updated.checkpoint(&engine, spec.as_ref()).unwrap();
+        let reloaded = Snapshot::builder_from(checkpointed).build(&engine).unwrap();
+        // Then it uses the new checkpoint's evidence rather than inheriting the old type.
+        assert_eq!(reloaded.log_segment().checkpoint_version(), Some(3));
+        assert_eq!(reloaded.checkpoint_type(), expected);
     }
 }
