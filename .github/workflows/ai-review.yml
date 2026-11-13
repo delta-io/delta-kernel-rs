@@ -73,15 +73,9 @@ permissions:
   contents: read
 
 concurrency:
-  # Keep comments isolated until the authorize job has parsed and approved a command.
-  group: >-
-    ai-review-${{
-      github.event_name == 'issue_comment' && github.run_id ||
-      github.event.pull_request.number ||
-      github.event.issue.number ||
-      inputs.pr
-    }}
-  cancel-in-progress: true
+  # Temporary fixture runs must not share a slot with a stalled infrastructure run.
+  group: ai-review-fixture-${{ github.run_id }}
+  cancel-in-progress: false
 
 env:
   CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1"
@@ -274,7 +268,7 @@ jobs:
       needs.authorize.outputs.skip != 'true' &&
       needs.authorize.outputs.allowed == 'true'
     concurrency:
-      group: ai-review-job-${{ needs.authorize.outputs.pr_number }}
+      group: ai-review-fixture-job-${{ github.run_id }}
       cancel-in-progress: true
     permissions:
       checks: write
