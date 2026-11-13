@@ -59,6 +59,7 @@ pub struct UpdateTableBuilderState {
     snapshot: SnapshotRef,
     operation: UpdateTableOperation,
     schema_changes: Option<Vec<SchemaOperation>>,
+    description: Option<String>,
     domain_metadata_removals: Vec<String>,
     is_blind_append: bool,
 }
@@ -89,6 +90,7 @@ impl TransactionBuilder<UpdateTable> {
                 snapshot,
                 operation,
                 schema_changes: None,
+                description: None,
                 domain_metadata_removals: Vec::new(),
                 is_blind_append: false,
             },
@@ -188,6 +190,15 @@ impl<MODE: ExecutionMode> TransactionBuilder<UpdateTable, MODE> {
         self.local_state
             .domain_metadata_removals
             .push(domain.into());
+        self
+    }
+
+    /// Sets a new description for the table.
+    ///
+    /// If the table already has this description, the transaction writes no metadata action for
+    /// it. Calling this method again replaces the previous description.
+    pub fn with_description(mut self, description: impl Into<String>) -> Self {
+        self.local_state.description = Some(description.into());
         self
     }
 
@@ -300,6 +311,7 @@ fn try_new_update_table<MODE: ExecutionMode>(
         snapshot: read_snapshot,
         operation,
         schema_changes,
+        description,
         domain_metadata_removals,
         is_blind_append,
     } = local_state;
@@ -344,9 +356,16 @@ fn try_new_update_table<MODE: ExecutionMode>(
         IcebergCompatValidationContext::Write,
     )?;
 
-    let should_emit_metadata = schema_changes.is_some();
+    let new_description = description.filter(|description| {
+        effective_table_config.metadata().description() != Some(description.as_str())
+    });
+    let should_emit_metadata = schema_changes.is_some() || new_description.is_some();
     let effective_table_config = match schema_changes {
         Some(changes) => apply_schema_changes(effective_table_config, changes)?,
+        None => effective_table_config,
+    };
+    let effective_table_config = match new_description {
+        Some(description) => apply_description(effective_table_config, description)?,
         None => effective_table_config,
     };
 
@@ -392,6 +411,18 @@ fn apply_schema_changes(
         ));
     }
     evolve_table_config(&table_config, changes)
+}
+
+fn apply_description(
+    table_config: TableConfiguration,
+    description: String,
+) -> KernelResult<TableConfiguration> {
+    let logical_schema = table_config.logical_schema();
+    let metadata = table_config
+        .metadata()
+        .clone()
+        .with_description(description);
+    TableConfiguration::try_new_with_schema(&table_config, metadata, logical_schema)
 }
 
 #[cfg(test)]

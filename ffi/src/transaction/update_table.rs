@@ -554,6 +554,30 @@ pub unsafe extern "C" fn update_table_txn_builder_with_domain_metadata_removed(
     unsafe { result.into_extern_result(&engine) }
 }
 
+/// Sets a new description for the table. If the table already has this description, the
+/// transaction writes no metadata action for it.
+///
+/// Repeated calls replace the previous description.
+///
+/// # Safety
+///
+/// All handles and `description` must be valid. This call borrows `engine` and `description`
+/// and unconditionally consumes `builder`, including on error.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn update_table_txn_builder_with_description(
+    builder: Handle<ExclusiveUpdateTableTransactionBuilder>,
+    description: KernelStringSlice,
+    engine: Handle<SharedExternEngine>,
+) -> ExternResult<Handle<ExclusiveUpdateTableTransactionBuilder>> {
+    let builder = unsafe { *builder.into_inner() };
+    let engine = unsafe { engine.as_ref() };
+    let description: KernelResult<String> =
+        unsafe { TryFromStringSlice::try_from_slice(&description) };
+    let result =
+        description.map(|description| Box::new(builder.with_description(description)).into());
+    unsafe { result.into_extern_result(&engine) }
+}
+
 /// Set an explicit row-tracking high-water mark for this transaction.
 ///
 /// Use this when row IDs must also be coordinated with another system. Kernel still assigns

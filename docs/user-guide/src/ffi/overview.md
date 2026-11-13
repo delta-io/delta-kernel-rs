@@ -236,6 +236,7 @@ feature is enabled; the rest are always available.
 | `update_table_txn_builder_with_commit_info` / `update_table_txn_with_commit_info` | Set connector commit information before writing or before commit |
 | `update_table_txn_builder_with_transaction_id` | Add an `(app_id, version)` pair for idempotent writes (see [Idempotent Writes](../writing/idempotent_writes.md)) |
 | `update_table_txn_builder_with_blind_append` | Assert blind-append semantics before `build()` |
+| `update_table_txn_builder_with_description` | Set a new table description. No metadata action is written if the table already has it |
 | `update_table_txn_builder_add_column` / `update_table_txn_builder_add_column_at` / `update_table_txn_builder_set_nullable` | Configure schema evolution before `build()` |
 | `update_table_txn_builder_with_domain_metadata` / `update_table_txn_builder_with_domain_metadata_removed` | Add or remove user domain metadata |
 | `update_table_txn_builder_build` / `update_table_txn_builder_build_with_committer` | Consume the builder and produce a transaction |
@@ -298,6 +299,7 @@ unpartitioned writes.
 |----------|---------|
 | `new_create_table_txn_builder` | Create a builder from a path, schema, engine info, and `data_change` |
 | `create_table_txn_builder_with_table_property` | Add a table property to the builder |
+| `create_table_txn_builder_with_description` | Set the table description |
 | `create_table_txn_builder_with_correlation_id` | Attach a correlation identifier to transaction metrics |
 | `create_table_txn_builder_with_operation_parameters` | Replace the operation parameters recorded in `commitInfo` |
 | `create_table_txn_builder_with_operation_metrics` / `create_table_txn_with_operation_metrics` | Set metrics before writing or replace them with write-time results |
