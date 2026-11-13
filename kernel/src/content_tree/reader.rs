@@ -21,10 +21,7 @@ use bytes::Bytes;
 use url::Url;
 
 use crate::actions::{ADD_NAME, ADD_SCHEMA, CheckpointAction, STATS_PARSED};
-use crate::amt_path_util::{
-    amt_location_to_add_path, amt_manifest_filemeta, parse_resolved_amt_location,
-    resolve_amt_location_expression,
-};
+use crate::amt_path_util::{amt_location_to_add_path, amt_manifest_filemeta};
 use crate::cancellation::CancellationTokenRef;
 use crate::content_tree::dv_conversion::{add_deletion_vector_expression, check_deletion_vector};
 use crate::content_tree::mumbling::MumblingBitmap;
@@ -314,13 +311,11 @@ static LEAF_REF_COLUMNS: LazyLock<ColumnNamesAndTypes> = LazyLock::new(|| {
     let (tracking_names, tracking_types) = TRACKING_COLUMNS.as_ref();
     let names = [
         ColumnName::new([LOCATION]),
-        ColumnName::new([RESOLVED_LOCATION_COLUMN]),
         ColumnName::new([FILE_SIZE_IN_BYTES]),
         ColumnName::new([MANIFEST_INFO, MANIFEST_DV]),
         ColumnName::new([MANIFEST_INFO, FORMAT_VERSION]),
     ];
     let types = [
-        DataType::STRING,
         DataType::STRING,
         DataType::LONG,
         DataType::BINARY,
@@ -333,8 +328,12 @@ static LEAF_REF_COLUMNS: LazyLock<ColumnNamesAndTypes> = LazyLock::new(|| {
 
 impl LeafRef {
     /// Parses one root `DataManifest` row from `getters`, which must follow [`LEAF_REF_COLUMNS`]
-    /// order.
-    fn try_from_getters<'a>(row: usize, getters: &[&'a dyn GetData<'a>]) -> KernelResult<Self> {
+    /// order. The raw `location` resolves against `table_root` when relative.
+    fn try_from_getters<'a>(
+        row: usize,
+        getters: &[&'a dyn GetData<'a>],
+        table_root: &Url,
+    ) -> KernelResult<Self> {
         let expected = LEAF_REF_COLUMNS.as_ref().0.len();
         if getters.len() != expected {
             return Err(KernelError::internal_error(format!(
@@ -344,11 +343,9 @@ impl LeafRef {
         }
         let (fields, tracking) = getters.split_at(tracking_start(getters));
         let location: &str = fields[0].get(row, LOCATION)?;
-        let resolved =
-            parse_resolved_amt_location(location, fields[1].get(row, RESOLVED_LOCATION_COLUMN)?)?;
-        let size: i64 = fields[2].get(row, FILE_SIZE_IN_BYTES)?;
-        let file_meta = amt_manifest_filemeta(resolved, location, size, "AMT leaf manifest")?;
-        let manifest_dv: Option<&[u8]> = fields[3].get_opt(row, MANIFEST_DV)?;
+        let size: i64 = fields[1].get(row, FILE_SIZE_IN_BYTES)?;
+        let file_meta = amt_manifest_filemeta(location, size, table_root, "AMT leaf manifest")?;
+        let manifest_dv: Option<&[u8]> = fields[2].get_opt(row, MANIFEST_DV)?;
         let manifest_dv = manifest_dv
             .map(ManifestDv::try_new)
             .transpose()
@@ -363,7 +360,7 @@ impl LeafRef {
             file_meta,
             parent_info: TrackingInfo::try_from_getters(row, tracking)?,
             manifest_dv,
-            format_version: fields[4].get(row, FORMAT_VERSION)?,
+            format_version: fields[3].get(row, FORMAT_VERSION)?,
             skipped: false,
         })
     }
@@ -388,15 +385,15 @@ impl LeafRef {
 struct LeafRefProjection {
     /// Keeps the leaf references of a batch.
     filter: Arc<dyn PredicateEvaluator>,
-    /// Appends [`RESOLVED_LOCATION_COLUMN`] to the kept entries.
-    resolver: Arc<dyn ExpressionEvaluator>,
-    /// Decides which kept entries' leaves are [skipped](LeafRef::skipped), or `None` to read
-    /// every leaf (see [`StatsRead::leaf_filter`]).
+    /// The table root relative leaf locations resolve against.
+    table_root: Url,
+    /// Decides which leaf references are [skipped](LeafRef::skipped), or `None` to read every
+    /// leaf (see [`StatsRead::leaf_filter`]).
     leaf_filter: Option<DataSkippingFilter>,
 }
 
 impl LeafRefProjection {
-    /// Builds the evaluators for root entry batches read with `read_schema`, resolving relative
+    /// Builds the filter for root entry batches read with `read_schema`, resolving relative
     /// locations against `table_root` and skipping the leaves `leaf_filter` rules out.
     fn try_new(
         engine: &dyn Engine,
@@ -409,17 +406,9 @@ impl LeafRefProjection {
             read_schema.clone(),
             Arc::new(live_entries_predicate(DataContentType::DataManifest)),
         )?;
-        let resolved = resolve_amt_location_expression(Expression::column([LOCATION]), table_root);
-        let resolve = ProjectionStructPatchBuilder::new(read_schema)
-            .append(
-                StructField::nullable(RESOLVED_LOCATION_COLUMN, DataType::STRING),
-                resolved,
-            )
-            .build()?;
-        let resolver = patch_evaluator(engine, read_schema, &resolve)?;
         Ok(Self {
             filter,
-            resolver,
+            table_root: table_root.clone(),
             leaf_filter,
         })
     }
@@ -427,9 +416,11 @@ impl LeafRefProjection {
     /// The [`LeafRef`]s of `entries`, in row order.
     fn leaf_refs(&self, entries: Box<dyn EngineData>) -> KernelResult<Vec<LeafRef>> {
         let live_data_manifests = filter_by_predicate(self.filter.as_ref(), entries)?;
-        let resolved = self.resolver.evaluate(live_data_manifests.as_ref())?;
-        let mut visitor = LeafRefVisitor::default();
-        visitor.visit_rows_of(resolved.as_ref())?;
+        let mut visitor = LeafRefVisitor {
+            table_root: &self.table_root,
+            leaves: Vec::new(),
+        };
+        visitor.visit_rows_of(live_data_manifests.as_ref())?;
         let mut leaves = visitor.leaves;
         if let Some(leaf_filter) = &self.leaf_filter {
             let keep = leaf_filter.apply(live_data_manifests.as_ref())?;
@@ -549,10 +540,6 @@ const PARENT_SEQUENCE_NUMBER_COLUMN: &str = "_parentSequenceNumber";
 
 /// Column holding whether an entry becomes an `Add` (see [`selected_predicate`]).
 const SELECTED_COLUMN: &str = "_selected";
-
-/// Column holding a root entry's `location` resolved against the table root (see
-/// [`resolve_amt_location_expression`]).
-const RESOLVED_LOCATION_COLUMN: &str = "_resolvedLocation";
 
 /// What a leaf's entries take from the root `DataManifest` entry referencing the leaf, appended to
 /// each entry batch as the [`REMOVED_COLUMN`] and [`PARENT_SEQUENCE_NUMBER_COLUMN`] columns. A root
@@ -1215,19 +1202,21 @@ impl RowVisitor for AddSelectionVisitor {
 }
 
 /// Collects a [`LeafRef`] for every row of a [`LeafRefProjection`] batch, in row order.
-#[derive(Default)]
-struct LeafRefVisitor {
+struct LeafRefVisitor<'u> {
+    /// The table root relative leaf locations resolve against.
+    table_root: &'u Url,
     leaves: Vec<LeafRef>,
 }
 
-impl RowVisitor for LeafRefVisitor {
+impl RowVisitor for LeafRefVisitor<'_> {
     fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
         LEAF_REF_COLUMNS.as_ref()
     }
 
     fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> KernelResult<()> {
         for row in 0..row_count {
-            self.leaves.push(LeafRef::try_from_getters(row, getters)?);
+            let leaf = LeafRef::try_from_getters(row, getters, self.table_root)?;
+            self.leaves.push(leaf);
         }
         Ok(())
     }
@@ -1747,7 +1736,7 @@ mod tests {
     #[test]
     fn leaf_ref_rejects_wrong_getter_count() {
         assert_result_error_with_message(
-            LeafRef::try_from_getters(0, &[]),
+            LeafRef::try_from_getters(0, &[], &table_root()),
             "AMT leaf reference getters, got 0",
         );
     }
@@ -3730,10 +3719,12 @@ mod tests {
 
     /// Writes a root of two `DataManifest` entries whose `phys_id` stats are `[1, 9]` and
     /// `[200, 300]`. The first references `low`, which the test never writes; the second
-    /// references a leaf holding `high.parquet` (10 rows, `firstRowId` 1000).
+    /// references a leaf holding `high.parquet` (10 rows, `firstRowId` 1000). With
+    /// `root_data_first`, the root starts with a `Data` entry for `root.parquet` (`firstRowId` 0).
     fn write_root_of_ranged_leaves(
         engine: &dyn Engine,
         low: ContentTreeNodeEntry,
+        root_data_first: bool,
     ) -> CheckpointAction {
         let high = write_leaf(
             engine,
@@ -3742,13 +3733,17 @@ mod tests {
             5,
             1000,
         );
-        let stats = vec![
+        let mut entries = vec![low, high];
+        let mut stats = vec![
             x_stats(&x_full_stats(), &[1, 9, 10, 0]),
             x_stats(&x_full_stats(), &[200, 300, 10, 0]),
         ];
+        if root_data_first {
+            entries.insert(0, added_data_entry("root.parquet", 100, 10, 0, 1));
+            stats.insert(0, x_stats(&x_full_stats(), &[500, 600, 10, 0]));
+        }
         let location = table_root().join(ROOT_PATH).unwrap();
-        let root =
-            write_manifest_with_stats(engine, location, &[low, high], &x_full_stats(), stats);
+        let root = write_manifest_with_stats(engine, location, &entries, &x_full_stats(), stats);
         checkpoint_action_with_root(ROOT_PATH, root.size as i64, 1).unwrap()
     }
 
@@ -3788,15 +3783,22 @@ mod tests {
     }
 
     /// A leaf whose root entry's stats rule out the predicate is never read: here it does not
-    /// exist, so reading it fails. The leaf that is read keeps its row IDs.
-    #[test]
-    fn read_add_actions_from_amt_never_reads_skipped_leaves() {
+    /// exist, so reading it fails. The leaf that is read keeps its row IDs. A root `Data` entry
+    /// ahead of the leaves must not shift which leaf is skipped.
+    #[rstest]
+    fn read_add_actions_from_amt_never_reads_skipped_leaves(
+        #[values(false, true)] root_data_first: bool,
+    ) {
         let engine = SyncEngine::in_memory();
-        let checkpoint = write_root_of_ranged_leaves(&engine, missing_leaf());
+        let checkpoint = write_root_of_ranged_leaves(&engine, missing_leaf(), root_data_first);
 
         let skipped =
             read_tree_skipping(&engine, &checkpoint, Pred::gt(col!("phys_id"), lit(100i64)));
-        assert_eq!(skipped.unwrap(), vec![("high.parquet".to_string(), 1000)]);
+        let mut expected = vec![("high.parquet".to_string(), 1000)];
+        if root_data_first {
+            expected.insert(0, ("root.parquet".to_string(), 0));
+        }
+        assert_eq!(skipped.unwrap(), expected);
 
         let read = read_tree_skipping(&engine, &checkpoint, Pred::lt(col!("phys_id"), lit(100i64)));
         assert!(
@@ -3810,7 +3812,7 @@ mod tests {
         let engine = SyncEngine::in_memory();
         let mut unreadable = missing_leaf();
         unreadable.manifest_info.as_mut().unwrap().format_version = 0;
-        let checkpoint = write_root_of_ranged_leaves(&engine, unreadable);
+        let checkpoint = write_root_of_ranged_leaves(&engine, unreadable, false);
 
         let skipped =
             read_tree_skipping(&engine, &checkpoint, Pred::gt(col!("phys_id"), lit(100i64)));
