@@ -13,7 +13,7 @@ use delta_kernel::plans::ir::nodes::Values;
 use delta_kernel::{KernelError, KernelResult, PlanExecutor, PlanResult};
 use rstest::rstest;
 
-use super::{Containers, TestRow as FlatRow, data, plan, row_batch};
+use super::{Containers, TestRow as FlatRow, convert_rows, data, plan, row_batch};
 
 #[derive(Clone, Debug, PartialEq, ToSchema, IntoStructData, TryFromStructData)]
 struct NestedType {
@@ -35,7 +35,9 @@ struct SimpleNestedRow {
     nested: FlatRow,
 }
 
-#[derive(Debug, PartialEq, ToSchema, IntoStructData, TryFromStructData, TryFromPlanResult)]
+#[derive(
+    Clone, Debug, PartialEq, ToSchema, IntoStructData, TryFromStructData, TryFromPlanResult,
+)]
 struct ContainerRow {
     nested: Containers,
 }
@@ -113,11 +115,7 @@ fn nested_structs_round_trip_through_executor(
         })
         .collect();
     let result = SyncPlanExecutor::default().execute_plan(plan(expected.clone())?)?;
-    let actual = if singleton {
-        vec![TestRow::try_from(result)?]
-    } else {
-        Vec::<TestRow>::try_from(result)?
-    };
+    let actual = convert_rows::<TestRow>(result, singleton)?;
     assert_eq!(actual, expected);
     let (_, columns) = TestRow::schema_and_columns();
     assert_eq!(
@@ -174,17 +172,9 @@ fn required_nested_struct_with_all_null_children_remains_present() -> KernelResu
         },
     };
     let actual: ContainerRow = SyncPlanExecutor::default()
-        .execute_plan(plan(vec![expected])?)?
+        .execute_plan(plan(vec![expected.clone()])?)?
         .try_into()?;
-    assert_eq!(
-        actual,
-        ContainerRow {
-            nested: Containers {
-                tags: None,
-                attrs: None
-            }
-        }
-    );
+    assert_eq!(actual, expected);
     Ok(())
 }
 
@@ -221,13 +211,7 @@ fn nested_rows_propagate_late_stream_errors(#[values(false, true)] singleton: bo
         Ok(nested_batch(vec![Some(1)])),
         Err(KernelError::generic("late nested error")),
     ]);
-    let error = if singleton {
-        SimpleNestedRow::try_from(result).map(|_| ()).unwrap_err()
-    } else {
-        Vec::<SimpleNestedRow>::try_from(result)
-            .map(|_| ())
-            .unwrap_err()
-    };
+    let error = convert_rows::<SimpleNestedRow>(result, singleton).unwrap_err();
     assert!(
         matches!(error.without_backtrace(), KernelError::Generic(message) if message == "late nested error")
     );

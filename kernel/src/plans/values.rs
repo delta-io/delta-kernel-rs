@@ -123,26 +123,17 @@ fn read_field<'a>(
             .map(|child| read_field(getters, row, child))
             .collect::<KernelResult<Vec<_>>>()?;
         // Schema-order recursion and typed leaf reads preserve the constructor's invariants.
-        Ok(Scalar::Struct(StructData::from_values_unchecked(
+        return Ok(Scalar::Struct(StructData::from_values_unchecked(
             fields.as_ref().clone(),
             values,
-        )))
-    } else {
-        let getter = getters.next().ok_or_else(|| {
-            KernelError::missing_column(format!(
-                "Missing result column getter for field {}",
-                field.name()
-            ))
-        })?;
-        read_scalar(getter, row, field)
+        )));
     }
-}
-
-fn read_scalar<'a>(
-    getter: &'a dyn GetData<'a>,
-    row: usize,
-    field: &StructField,
-) -> KernelResult<Scalar> {
+    let getter = getters.next().ok_or_else(|| {
+        KernelError::missing_column(format!(
+            "Missing result column getter for field {}",
+            field.name()
+        ))
+    })?;
     let name = field.name();
     let value = match field.data_type() {
         &DataType::BOOLEAN => getter.get_bool(row, name)?.map(Scalar::Boolean),
