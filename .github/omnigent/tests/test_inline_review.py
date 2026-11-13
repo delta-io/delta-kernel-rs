@@ -73,6 +73,55 @@ class InlineReviewTest(unittest.TestCase):
         self.inline_review = _load_module("inline_review")
         self.review_publish = _load_module("review_publish")
 
+    def test_out_of_scope_findings_stay_in_body_when_in_scope_findings_move_inline(self) -> None:
+        for scope_id in ("OutOfScope1", "Blocker2", "Nit2"):
+            with self.subTest(scope_id=scope_id):
+                review = (
+                    "## Blocking issues\n### Blocker1\nNew regression.\n"
+                    "## Out of scope / existing issues\n"
+                    f"### {scope_id}\nExisting defect unaffected by this PR.\n"
+                    "Tracked at https://github.com/delta-io/delta-kernel-rs/issues/123.\n"
+                    "## Summary\nOne in-scope bug; one existing issue."
+                )
+                findings = [
+                    {"id": finding_id, "path": "kernel/src/example.rs", "line": 9,
+                     "side": "RIGHT", "body": body}
+                    for finding_id, body in (
+                        ("Blocker1", "New regression."),
+                        (scope_id, "Existing defect unaffected by this PR."),
+                    )
+                ]
+                payload, _, _ = self.inline_review.build_review_payload(
+                    review=review, findings=findings, diff=DIFF, head_sha="a" * 40,
+                    run_url="https://github.com/example/repo/actions/runs/1",
+                )
+                self.assertEqual(len(payload["comments"]), 1)
+                self.assertIn("Blocker1", payload["comments"][0]["body"])
+                self.assertNotIn("### Blocker1", payload["body"])
+                self.assertIn("## Out of scope / existing issues", payload["body"])
+                self.assertIn(f"### {scope_id}", payload["body"])
+                self.assertIn("Existing defect unaffected by this PR.", payload["body"])
+                self.assertIn("issues/123", payload["body"])
+                self.assertIn("## Summary", payload["body"])
+
+    def test_scope_heading_inside_code_fence_does_not_change_finding_scope(self) -> None:
+        review = (
+            "## Non-blocking notes\n### Nit1\nAn in-scope documentation correction.\n"
+            "```markdown\n## Out of scope / existing issues\n```\n"
+            "### Nit2\nAnother in-scope correction.\n## Summary\nTwo notes."
+        )
+        payload, unmapped, _ = self.inline_review.build_review_payload(
+            review=review,
+            findings=[{"id": "Nit2", "path": "kernel/src/example.rs", "line": 9,
+                       "side": "RIGHT", "body": "Another in-scope correction."}],
+            diff=DIFF, head_sha="a" * 40,
+            run_url="https://github.com/example/repo/actions/runs/1",
+        )
+        self.assertEqual(unmapped, [])
+        self.assertEqual(len(payload["comments"]), 1)
+        self.assertIn("### Nit1", payload["body"])
+        self.assertNotIn("### Nit2", payload["body"])
+
     def test_extract_inline_findings_removes_machine_block(self) -> None:
         marker = "a" * 32
         review, findings = self.inline_review.extract_inline_findings(

@@ -1,0 +1,14 @@
+{
+  "case_id": "unavailable",
+  "status": "provisional; independent adjudication required",
+  "issues": [
+    {
+      "id": "C1",
+      "kind": "runtime",
+      "truth": "uncertain",
+      "scope": "uncertain",
+      "evidence": "The external decoder contract is unavailable. Neither a panic nor its absence can be established."
+    }
+  ],
+  "input_digest": "0b8662dd5b8810b5a387be2f73e6d4bc4aeda24ae18f60bb5fee3d89d1a6397c"
+}

@@ -38,6 +38,20 @@ on:
         description: PR number to review.
         required: true
         type: string
+      evaluation_mode:
+        description: Run a normal PR review or replay a frozen evaluation case.
+        type: choice
+        default: review
+        options: [review, gate, pipeline]
+      evaluation_case:
+        description: Frozen case to replay when evaluation_mode is gate or pipeline.
+        type: choice
+        default: panic
+        options: [panic, guarded, unavailable, existing]
+      full_review:
+        description: Force a full review after a redesign or substantial rework.
+        type: boolean
+        default: false
       output_mode:
         description: Where to put the review.
         required: false
@@ -103,12 +117,14 @@ jobs:
       output_mode: ${{ steps.trigger.outputs.output_mode }}
       pr_number: ${{ steps.trigger.outputs.pr_number }}
       skip: ${{ steps.trigger.outputs.skip }}
+      full_review: ${{ steps.trigger.outputs.full_review }}
     steps:
       - name: Resolve trigger
         id: trigger
         env:
           ACTOR: ${{ github.actor }}
           COMMENT_BODY: ${{ github.event.comment.body }}
+          DISPATCH_FULL: ${{ inputs.full_review }}
           DISPATCH_MODE: ${{ inputs.output_mode }}
           DISPATCH_PR: ${{ inputs.pr }}
           EVENT_NAME: ${{ github.event_name }}
@@ -118,6 +134,7 @@ jobs:
         run: |
           set -euo pipefail
 
+          full_review=false
           skip=false
           mode=artifact
           auth_subject="$ACTOR"
@@ -132,13 +149,14 @@ jobs:
               for word in $command; do
                 case "$word" in
                   /review) ;;
+                  full) full_review=true ;;
                   artifact|dark) mode=artifact ;;
                   summary) mode=summary ;;
                   collapsed) mode=collapsed ;;
                   inline) mode=inline ;;
                   comment) mode=comment ;;
                   *)
-                    echo "::error::Unknown /review option '$word'. Use artifact, summary, collapsed, inline, or comment."
+                    echo "::error::Unknown /review option '$word'. Use full, artifact, summary, collapsed, inline, or comment."
                     exit 1
                     ;;
                 esac
@@ -150,6 +168,7 @@ jobs:
               auth_subject="$PR_AUTHOR"
               ;;
             workflow_dispatch)
+              full_review="${DISPATCH_FULL:-false}"
               n="$DISPATCH_PR"
               mode="${DISPATCH_MODE:-artifact}"
               ;;
@@ -168,6 +187,7 @@ jobs:
             *) echo "::error::Invalid output mode '$mode'."; exit 1 ;;
           esac
 
+          echo "full_review=$full_review" >> "$GITHUB_OUTPUT"
           echo "skip=$skip" >> "$GITHUB_OUTPUT"
           echo "auth_subject=$auth_subject" >> "$GITHUB_OUTPUT"
           echo "pr_number=$n" >> "$GITHUB_OUTPUT"
@@ -732,8 +752,90 @@ jobs:
           pathlib.Path.home().joinpath('.omnigent', 'config.yaml').write_text(json.dumps(cfg, indent=2))
           "
 
+      - name: Run behavioral replay pilot
+        id: evaluation
+        if: >-
+          steps.creds.outputs.available == 'true' &&
+          (inputs.evaluation_mode == 'gate' || inputs.evaluation_mode == 'pipeline')
+        env:
+          EVALUATION_MODE: ${{ inputs.evaluation_mode }}
+          EVALUATION_CASE: ${{ inputs.evaluation_case }}
+          CLAUDE_MAINTAINER_MODEL: ${{ vars.CLAUDE_MAINTAINER_MODEL }}
+          CODEX_MAINTAINER_MODEL: ${{ vars.CODEX_MAINTAINER_MODEL }}
+          DISPROVE_MODEL: ${{ vars.DISPROVE_MODEL }}
+          MODEL: ${{ vars.MODEL }}
+          GATEWAY_BASE_URL: ${{ secrets.GATEWAY_BASE_URL }}
+          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+          PYTHONPATH: ${{ github.workspace }}/.github/omnigent
+        run: |
+          set -euo pipefail
+          umask 077
+          export ANTHROPIC_AUTH_TOKEN="$LLM_API_KEY"
+          export ANTHROPIC_BASE_URL="${GATEWAY_BASE_URL%/}/anthropic"
+          export ANTHROPIC_MODEL="$MODEL"
+          export ANTHROPIC_DEFAULT_MODEL="$MODEL"
+          export ANTHROPIC_DEFAULT_OPUS_MODEL="$MODEL"
+          export ANTHROPIC_DEFAULT_SONNET_MODEL="$MODEL"
+          export OPENAI_API_KEY="$LLM_API_KEY"
+          export OPENAI_BASE_URL="${GATEWAY_BASE_URL%/}"
+          python3 - <<'PYEOF'
+          import importlib.metadata
+          import json
+          import os
+          from pathlib import Path
+          from review_eval import run_case
+
+          case_name = os.environ["EVALUATION_CASE"]
+          if case_name not in {"panic", "guarded", "unavailable", "existing"}:
+              raise SystemExit("Unknown evaluation case")
+          mode = os.environ["EVALUATION_MODE"]
+          if mode not in {"gate", "pipeline"}:
+              raise SystemExit("Unknown evaluation mode")
+          root = Path(".github/omnigent")
+          models = {
+              "default": os.environ["MODEL"],
+              "maintainer-claude": os.environ["CLAUDE_MAINTAINER_MODEL"],
+              "maintainer-codex": os.environ["CODEX_MAINTAINER_MODEL"],
+              "disprove": os.environ["DISPROVE_MODEL"],
+          }
+          packages = json.loads((root / "package.json").read_text())["dependencies"]
+          runtime = json.dumps({"omnigent": importlib.metadata.version("omnigent"), **packages})
+          result = run_case(
+              json.loads((root / "evaluations" / f"{case_name}.input.json").read_text()),
+              mode=mode, output=Path("/tmp/review-evaluation"), command=["omnigent"],
+              models=models, runtime=runtime, timeout=1200,
+          )
+          print(json.dumps(result, indent=2))
+          raise SystemExit(0 if result["status"] == "complete" else 1)
+          PYEOF
+
+      - name: Validate behavioral replay artifacts
+        id: evaluation_artifacts
+        if: always() && steps.evaluation.outcome != 'skipped'
+        env:
+          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+          PYTHONPATH: ${{ github.workspace }}/.github/omnigent
+        run: |
+          python3 - <<'PYEOF'
+          import os
+          from pathlib import Path
+          from review_eval import verify_artifacts
+          verify_artifacts(Path("/tmp/review-evaluation"), os.environ["LLM_API_KEY"])
+          PYEOF
+
+      - name: Upload behavioral replay evidence
+        if: always() && steps.evaluation_artifacts.outcome == 'success'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: review-evaluation-${{ inputs.evaluation_mode }}-${{ inputs.evaluation_case }}-${{ github.run_id }}
+          path: /tmp/review-evaluation
+          retention-days: 7
+          if-no-files-found: error
+
       - name: Materialize reviewer model config
-        if: steps.creds.outputs.available == 'true'
+        if: >-
+          steps.creds.outputs.available == 'true' &&
+          inputs.evaluation_mode != 'gate' && inputs.evaluation_mode != 'pipeline'
         env:
           CLAUDE_MAINTAINER_MODEL: ${{ vars.CLAUDE_MAINTAINER_MODEL }}
           CODEX_MAINTAINER_MODEL: ${{ vars.CODEX_MAINTAINER_MODEL }}
@@ -766,9 +868,12 @@ jobs:
           PYEOF
 
       - name: Collect PR context and build review prompt
-        if: steps.creds.outputs.available == 'true'
+        if: >-
+          steps.creds.outputs.available == 'true' &&
+          inputs.evaluation_mode != 'gate' && inputs.evaluation_mode != 'pipeline'
         id: context
         env:
+          FORCE_FULL_REVIEW: ${{ needs.authorize.outputs.full_review }}
           GH_TOKEN: ${{ github.token }}
           OMNIGENT_BOT_LOGIN: ${{ vars.OMNIGENT_BOT_LOGIN }}
           OUTPUT_MODE: ${{ needs.authorize.outputs.output_mode }}
@@ -793,6 +898,7 @@ jobs:
                       author { __typename login }
                       body
                       submittedAt
+                      commit { oid }
                       comments(first: 50) {
                         nodes { fullDatabaseId path line originalLine body }
                       }
@@ -850,6 +956,7 @@ jobs:
 
           sys.path.insert(0, ".github/omnigent")
           from inline_review import inline_prompt_instructions
+          from review_incremental import select_review_diff
           from review_history import (
               DEFAULT_TRUSTED_BOT_LOGINS,
               attach_inline_comment_sides,
@@ -898,7 +1005,15 @@ jobs:
                   "\n\n[PR description truncated at 4096 characters by the workflow. "
                   "Do not report omissions based on unavailable text.]"
               )
-          diff_bytes = pathlib.Path("/tmp/pr_diff.txt").read_bytes()
+          full_diff = pathlib.Path("/tmp/pr_diff.txt").read_text(errors="replace")
+          review_diff, review_scope, incremental = select_review_diff(
+              metadata=meta, history=history_document, full_diff=full_diff,
+              trusted_bot_logins=trusted_bot_logins,
+              force_full=os.environ.get("FORCE_FULL_REVIEW") == "true",
+          )
+          pathlib.Path("/tmp/review_diff.txt").write_text(review_diff)
+          pathlib.Path("/tmp/review_scope.json").write_text(json.dumps({"incremental": incremental}))
+          diff_bytes = review_diff.encode("utf-8")
           truncated = len(diff_bytes) > max_diff_bytes
           diff = diff_bytes[:max_diff_bytes].decode("utf-8", errors="replace")
           truncation_note = (
@@ -925,10 +1040,15 @@ jobs:
               f"{meta['changed_files']} file(s)\n\n"
               "## PR Description\n"
               f"{body}\n\n"
-              "## PR Diff\n\n"
+              f"## Review scope\n{review_scope}\n\n"
+              "## Review Diff\n\n"
               "```diff\n"
               f"{diff}\n"
               f"```{truncation_note}\n"
+              "\n## Complete PR diff for title and description verification only\n"
+              f"```diff\n{full_diff[:30000]}\n```\n"
+              + ("[Complete PR diff truncated; do not infer omissions.]\n"
+                 if len(full_diff) > 30000 else "")
           )
           pathlib.Path("/tmp/reviewer_context.txt").write_text(reviewer_context)
 
@@ -999,7 +1119,10 @@ jobs:
           Failed agents: comma-separated checked-in agent names, or none
           Do not downgrade a finding to bypass a failed gate.
 
-          ## PR Diff
+          ## Review scope
+          {review_scope}
+
+          ## Review Diff
 
           ```diff
           {diff}
@@ -1012,7 +1135,9 @@ jobs:
 
       # This GitHub-generated archive is untrusted reference data. Nothing from it may be executed.
       - name: Materialize PR source reference
-        if: steps.creds.outputs.available == 'true'
+        if: >-
+          steps.creds.outputs.available == 'true' &&
+          inputs.evaluation_mode != 'gate' && inputs.evaluation_mode != 'pipeline'
         env:
           GH_TOKEN: ${{ github.token }}
           HEAD_REPO: ${{ steps.context.outputs.head_repo }}
@@ -1034,7 +1159,9 @@ jobs:
           rm -f /tmp/pr-source.tar.gz
 
       - name: Run AI review
-        if: steps.creds.outputs.available == 'true'
+        if: >-
+          steps.creds.outputs.available == 'true' &&
+          inputs.evaluation_mode != 'gate' && inputs.evaluation_mode != 'pipeline'
         id: run_review
         env:
           DELTA_SOURCE_ROOT: ${{ github.workspace }}/.delta-oss
@@ -1166,6 +1293,7 @@ jobs:
           sys.path.insert(0, ".github/omnigent")
           from inline_review import extract_inline_findings
           from review_publish import extract_marked_review
+          from review_incremental import publication_findings, revision_marker
 
           raw = pathlib.Path("/tmp/review_raw_output.txt").read_text(errors="replace")
           marker = os.environ.get("REVIEW_MARKER", "")
@@ -1233,10 +1361,14 @@ jobs:
               except ValueError as error:
                   print(f"::error::AI inline review metadata is invalid: {error}.")
                   sys.exit(1)
+              scope = json.loads(pathlib.Path("/tmp/review_scope.json").read_text())
+              findings = publication_findings(findings, scope["incremental"])
               pathlib.Path("/tmp/inline_findings.json").write_text(
                   json.dumps(findings)
               )
 
+          meta = json.loads(pathlib.Path("/tmp/pr_meta.json").read_text())
+          body += "\n\n" + revision_marker(meta["base"]["sha"], meta["head"]["sha"])
           pathlib.Path("/tmp/review_output.txt").write_text(body + "\n")
           PYEOF
 

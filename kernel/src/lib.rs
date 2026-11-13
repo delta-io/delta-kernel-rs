@@ -1110,6 +1110,20 @@ pub trait Engine: AsAny {
     }
 }
 
+/// Decode an optional count.
+///
+/// Returns the supplied count. Returns an error when the count is absent.
+#[doc(hidden)]
+pub fn ai_review_probe_count(value: Option<usize>) -> Result<usize, &'static str> {
+    value.ok_or("missing count")
+}
+
+/// Return the integer ratio of `total` to `count`, or zero when `count` is zero.
+#[doc(hidden)]
+pub fn ai_review_probe_ratio(total: usize, count: usize) -> usize {
+    total / count
+}
+
 // Rustdoc's documentation tests can do some things that regular unit tests can't. Here we are
 // using doctests to test macros. Specifically, we are testing for failed macro invocations due
 // to invalid input, not the macro output when the macro invocation is successful (which can/should

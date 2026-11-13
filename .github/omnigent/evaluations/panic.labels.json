@@ -1,0 +1,14 @@
+{
+  "case_id": "panic",
+  "status": "provisional; independent adjudication required",
+  "issues": [
+    {
+      "id": "C1",
+      "kind": "runtime",
+      "truth": "true",
+      "scope": "in",
+      "evidence": "The None input changes from Err to an unwrap panic; both snapshots are complete for this function."
+    }
+  ],
+  "input_digest": "db77f761bf5408d6233cc4e040ad7a9bef67d665cf76acccbd650e5ab721a480"
+}
