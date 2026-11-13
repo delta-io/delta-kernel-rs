@@ -81,6 +81,7 @@ fn workload_benchmarks(c: &mut Criterion) {
                 .expect("Failed to create snapshot construction runner");
                 run_benchmark(c, &runner, &reporter);
             }
+            Spec::Checkpoint { .. } => {}
         }
     }
 }
