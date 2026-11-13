@@ -1473,12 +1473,60 @@ async fn check_pointer_after_newest_commit<E: Engine>(
         .schema(test_schema_flat_with_column_mapping())
         .last_manifest_commit(resolved_pointer(1, 1))
 )]
+// A log compaction holds the P&M in effect at its last version, so replay ranks it there. A
+// checkpoint file bounds these replays, so they read the whole cover: the compaction of v1..=3
+// holds v3's Metadata and spans v2, where the newest commit's checkpoint action lags. Ranked at its
+// start version, the compaction would lose to the action's older nested Metadata. Padding puts the
+// Metadata in a later JSON read batch than the compaction's first.
+#[case::ranks_compaction_at_its_last_version(
+    ranked_compaction_log(txn_commit()),
+    ReplayExpectation::default().schema(test_schema_flat_with_column_mapping())
+)]
+#[case::ranks_multi_batch_compaction_at_its_last_version(
+    ranked_compaction_log(json_batch_padding()),
+    ReplayExpectation::default().schema(test_schema_flat_with_column_mapping())
+)]
 #[tokio::test]
 async fn replay_reads_the_files_a_compaction_hides(
     #[case] log: ReplayLog,
     #[case] expected: ReplayExpectation,
 ) {
     on_both_paths!(assert_replay(&log, None, &expected));
+}
+
+// A table whose newest commit carries a checkpoint action lagging at v2, a P&M checkpoint at v0,
+// and a compaction of v1..=3 holding `leading_lines` and then v3's newer Metadata.
+fn ranked_compaction_log(leading_lines: String) -> ReplayLog {
+    let newer_metadata = metadata_commit(test_schema_flat_with_column_mapping());
+    let compaction = [leading_lines, txn_commit(), newer_metadata.clone()].join("\n");
+    ReplayLog::new(vec![
+        protocol_and_metadata_lines(one_column_schema(), &[]),
+        txn_commit(),
+        txn_commit(),
+        newer_metadata,
+        carrying_pointer(
+            pointer(4, 2),
+            checkpoint_action(2, &[], one_column_schema()),
+        ),
+    ])
+    .with_checkpoint_at(0)
+    .with_compaction((1, 3), compaction)
+}
+
+// The newest commit's Metadata and the compaction's Protocol are final together, so non-plan replay
+// of the older commits stops after the compaction and never reads the unparseable v0. A plan reads
+// every file it lists, so this is non-plan only.
+#[tokio::test]
+async fn non_plan_replay_of_older_commits_stops_once_newest_commit_completes_pm() {
+    let log = ReplayLog::new(vec![
+        "not json".to_string(),
+        txn_commit(),
+        txn_commit(),
+        metadata_commit(one_column_schema()),
+    ])
+    .with_compaction((1, 2), protocol_commit(1, 2));
+    let expected = ReplayExpectation::default().schema(one_column_schema());
+    assert_replay(&log, None, &expected, non_plan_engine).await;
 }
 
 // Writes `contents` as a log compaction over versions `lo..=hi` and returns a segment that uses it.
