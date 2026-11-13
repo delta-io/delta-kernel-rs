@@ -3,14 +3,13 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use delta_kernel::Engine;
 use delta_kernel::arrow::array::{
     Array, ArrayRef, AsArray, BinaryArray, Int32Array, Int64Array, ListArray, MapArray,
     RecordBatch, StringArray, StructArray,
 };
 use delta_kernel::arrow::buffer::{NullBuffer, OffsetBuffer};
 use delta_kernel::arrow::datatypes::{
-    DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
+    DataType as ArrowDataType, Field as ArrowField, Int64Type, Schema as ArrowSchema,
 };
 use delta_kernel::checkpoint::{CheckpointSpec, V2CheckpointConfig};
 use delta_kernel::committer::FileSystemCommitter;
@@ -27,14 +26,16 @@ use delta_kernel::schema::{
 };
 use delta_kernel::snapshot::{Snapshot, SnapshotRef};
 use delta_kernel::table_changes::TableChanges;
+use delta_kernel::transaction::UpdateTableOperation;
 use delta_kernel::transaction::create_table::{CreateTableTransaction, create_table};
 use delta_kernel::transaction::data_layout::DataLayout;
+use delta_kernel::{Engine, ReferencedFilePath, resolve_file_uri};
 use rstest::rstest;
 use test_utils::delta_kernel_default_engine::DefaultEngine;
 use test_utils::delta_kernel_default_engine::executor::tokio::TokioMultiThreadExecutor;
 use test_utils::{
-    add_commit, create_table_and_load_snapshot, read_add_infos, read_scan, test_table_setup,
-    test_table_setup_mt, write_batch_to_table,
+    add_commit, create_table_and_load_snapshot, read_actions_from_commit, read_add_infos,
+    read_scan, test_table_setup, test_table_setup_mt, write_batch_to_table,
 };
 use url::Url;
 
@@ -311,6 +312,10 @@ async fn test_write_and_read_nested_file_column(
 #[case::offset_without_uri((None, Some(4), Some(10), Some(b"x".as_slice())), "`offset` is set without `uri`")]
 #[case::offset_without_size((Some("s3://b/a"), Some(4), None, None), "`offset` is set without `size`")]
 #[case::negative_size((Some("s3://b/a"), None, Some(-1), None), "`size` is negative")]
+#[case::uri_leading_slash((Some("/a.png"), None, None, None), "a relative uri must not start with '/'")]
+#[case::uri_parent((Some("_files/../a.png"), None, None, None), "its path has a '.' or '..' segment")]
+#[case::uri_encoded_slash((Some("_files/a%2Fb.png"), None, None, None), "'%2F' or '%5C'")]
+#[case::uri_unparseable_absolute((Some("http://[bad/a.png"), None, None, None), "an absolute uri must parse as a URL")]
 #[tokio::test(flavor = "multi_thread")]
 async fn test_write_rejects_invalid_file_value(
     #[case] value: Value<'static>,
@@ -892,5 +897,215 @@ async fn test_predicate_on_file_sub_field_uses_written_stats(
 
     let files = scan_file_count(&snapshot, engine.as_ref(), predicate.clone())?;
     assert_eq!(files, expected, "{predicate:?}");
+    Ok(())
+}
+
+/// Returns a new referenced-file path from a write context of `snapshot`.
+fn new_referenced_file_path(
+    snapshot: &SnapshotRef,
+    engine: &dyn Engine,
+    extension: Option<&str>,
+) -> Result<ReferencedFilePath, Box<dyn std::error::Error>> {
+    let txn = snapshot
+        .clone()
+        .update_table(UpdateTableOperation::Write, "test", true)
+        .build(engine, Box::new(FileSystemCommitter::new()))?;
+    Ok(txn
+        .write_state()?
+        .write_context_builder()
+        .build()?
+        .new_referenced_file_path(extension)?)
+}
+
+/// A connector writes the bytes of a new reference at the location from
+/// [`BoundWriteContext::new_referenced_file_path`] and stores its `uri`; a reader finds the bytes
+/// by resolving each `uri` with [`resolve_file_uri`]: a relative `uri` against the table root, an
+/// absolute one by parsing it.
+///
+/// [`BoundWriteContext::new_referenced_file_path`]:
+///     delta_kernel::transaction::BoundWriteContext::new_referenced_file_path
+#[tokio::test(flavor = "multi_thread")]
+async fn test_write_and_read_bytes_of_referenced_files() -> Result<(), Box<dyn std::error::Error>> {
+    let schema = Arc::new(StructType::try_new([StructField::nullable(
+        "c",
+        DataType::file_type(),
+    )])?);
+    let (_tmp_dir, table_path, engine) = test_table_setup_mt()?;
+    let snapshot =
+        create_table_and_load_snapshot(&table_path, schema.clone(), engine.as_ref(), &[])?;
+
+    // A new file under `_files`, referenced by a byte range.
+    let referenced = new_referenced_file_path(&snapshot, engine.as_ref(), Some("png"))?;
+    assert!(
+        referenced.uri().starts_with("_files/"),
+        "{}",
+        referenced.uri()
+    );
+    assert!(referenced.uri().ends_with(".png"), "{}", referenced.uri());
+    let path = referenced.location().to_file_path().unwrap();
+    std::fs::create_dir_all(path.parent().unwrap())?;
+    std::fs::write(&path, b"relative bytes")?;
+    // An existing file outside the table, referenced as a whole.
+    let external_dir = tempfile::tempdir()?;
+    let external_path = external_dir.path().join("b.png");
+    std::fs::write(&external_path, b"external bytes")?;
+    let external_uri = Url::from_file_path(&external_path).unwrap().to_string();
+
+    let files = file_array(&[
+        Some((Some(referenced.uri()), Some(9), Some(5), None)),
+        Some((Some(external_uri.as_str()), None, None, None)),
+    ]);
+    let arrow_schema: ArrowSchema = schema.as_ref().try_into_arrow()?;
+    let batch = RecordBatch::try_new(Arc::new(arrow_schema), vec![Arc::new(files)])?;
+    let snapshot = write_batch_to_table(&snapshot, engine.as_ref(), batch, HashMap::new()).await?;
+
+    let scan = snapshot.scan_builder().build()?;
+    let batches = read_scan(&scan, engine.clone())?;
+    let read = batches[0].column_by_name("c").unwrap().as_struct();
+    let uris = read.column_by_name("uri").unwrap().as_string::<i32>();
+    let offsets = read
+        .column_by_name("offset")
+        .unwrap()
+        .as_primitive::<Int64Type>();
+    let sizes = read
+        .column_by_name("size")
+        .unwrap()
+        .as_primitive::<Int64Type>();
+    let mut bytes = Vec::new();
+    for row in 0..read.len() {
+        let location = resolve_file_uri(scan.table_root(), uris.value(row))?;
+        let range = (!offsets.is_null(row)).then(|| {
+            let start = offsets.value(row) as u64;
+            start..start + sizes.value(row) as u64
+        });
+        let mut read = engine
+            .storage_handler()
+            .read_files(vec![(location, range)])?;
+        bytes.push(read.next().unwrap()?);
+    }
+    assert_eq!(bytes, [&b"bytes"[..], &b"external bytes"[..]]);
+    Ok(())
+}
+
+/// Commits a `metaData` action that sets `delta.fileType.writeLocation` to `value`, as the system
+/// that allocates the write location would; kernel does not let users set it.
+async fn set_write_location(
+    table_path: &str,
+    engine: &dyn Engine,
+    value: &str,
+) -> Result<SnapshotRef, Box<dyn std::error::Error>> {
+    let table_url = Url::from_directory_path(table_path).unwrap();
+    let mut metadata = read_actions_from_commit(&table_url, 0, "metaData")?
+        .pop()
+        .expect("the first commit has a metaData action");
+    metadata["configuration"]["delta.fileType.writeLocation"] = value.into();
+    let commit = [
+        r#"{"commitInfo":{"timestamp":1700000000000,"operation":"SET TBLPROPERTIES"}}"#.to_string(),
+        serde_json::json!({ "metaData": metadata }).to_string(),
+    ]
+    .join("\n");
+    let store: Arc<DynObjectStore> = Arc::new(LocalFileSystem::new());
+    add_commit(table_url.as_str(), store.as_ref(), 1, commit).await?;
+    Ok(Snapshot::builder_for(table_url).build(engine)?)
+}
+
+/// New referenced files go to the location set by `delta.fileType.writeLocation`: under its
+/// `_files` prefix with a relative `uri`, or outside the table root with an absolute `uri`.
+#[rstest]
+#[case::files_prefix(false)]
+#[case::outside_table_root(true)]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_new_referenced_file_path_uses_write_location(
+    #[case] absolute: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let schema = Arc::new(StructType::try_new([StructField::nullable(
+        "c",
+        DataType::file_type(),
+    )])?);
+    let (_tmp_dir, table_path, engine) = test_table_setup_mt()?;
+    create_table_and_load_snapshot(&table_path, schema, engine.as_ref(), &[])?;
+    let external_dir = tempfile::tempdir()?;
+    let value = if absolute {
+        Url::from_directory_path(external_dir.path())
+            .unwrap()
+            .to_string()
+    } else {
+        "_files/p1".to_string()
+    };
+    let snapshot = set_write_location(&table_path, engine.as_ref(), &value).await?;
+
+    let referenced = new_referenced_file_path(&snapshot, engine.as_ref(), None)?;
+    let expected_prefix = if absolute {
+        value.clone()
+    } else {
+        "_files/p1/".to_string()
+    };
+    assert!(
+        referenced.uri().starts_with(&expected_prefix),
+        "{}",
+        referenced.uri()
+    );
+    assert_eq!(
+        resolve_file_uri(snapshot.table_root(), referenced.uri())?,
+        *referenced.location()
+    );
+    if absolute {
+        assert!(referenced.location().as_str().starts_with(&value));
+    } else {
+        assert!(
+            referenced
+                .location()
+                .as_str()
+                .starts_with(&format!("{}_files/p1/", snapshot.table_root()))
+        );
+    }
+    Ok(())
+}
+
+/// A writer must not write files at an invalid `delta.fileType.writeLocation`.
+#[rstest]
+#[case::relative_outside_files("data/p1", "must be under `_files`")]
+#[case::absolute_inside_table_root("TABLE_ROOT/_files/p1", "outside the table root")]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_new_referenced_file_path_rejects_invalid_write_location(
+    #[case] value: &str,
+    #[case] reason: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let schema = Arc::new(StructType::try_new([StructField::nullable(
+        "c",
+        DataType::file_type(),
+    )])?);
+    let (_tmp_dir, table_path, engine) = test_table_setup_mt()?;
+    let snapshot = create_table_and_load_snapshot(&table_path, schema, engine.as_ref(), &[])?;
+    // The snapshot's table root, which may differ from the raw temp path, as on Windows (8.3
+    // short names) and macOS (`/var` links to `/private/var`).
+    let value = value.replace("TABLE_ROOT/", snapshot.table_root().as_str());
+    let snapshot = set_write_location(&table_path, engine.as_ref(), &value).await?;
+
+    let err = new_referenced_file_path(&snapshot, engine.as_ref(), None)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains(reason), "{err}");
+    Ok(())
+}
+
+/// Users cannot set the internal `delta.fileType.writeLocation` property through kernel.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_create_table_rejects_write_location_property()
+-> Result<(), Box<dyn std::error::Error>> {
+    let schema = Arc::new(StructType::try_new([StructField::nullable(
+        "c",
+        DataType::file_type(),
+    )])?);
+    let (_tmp_dir, table_path, engine) = test_table_setup_mt()?;
+    let err = create_table_and_load_snapshot(
+        &table_path,
+        schema,
+        engine.as_ref(),
+        &[("delta.fileType.writeLocation", "_files/p1")],
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(err.contains("delta.fileType.writeLocation"), "{err}");
     Ok(())
 }

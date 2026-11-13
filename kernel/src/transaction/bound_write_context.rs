@@ -8,6 +8,7 @@ use url::Url;
 use super::WriteState;
 use crate::actions::deletion_vector::DeletionVectorPath;
 use crate::expressions::{ColumnName, ExpressionRef};
+use crate::file_uri::{ReferencedFilePath, new_referenced_file_path};
 use crate::partition::hive::build_partition_path;
 use crate::path_encoding::uri_encode_path;
 use crate::schema::SchemaRef;
@@ -264,6 +265,39 @@ impl BoundWriteContext {
     pub fn new_deletion_vector_path(&self, random_prefix: String) -> DeletionVectorPath {
         DeletionVectorPath::new(self.write_state.table_root.clone(), random_prefix)
     }
+
+    /// Returns a new, unique location for a file that a `file` value will reference.
+    ///
+    /// The file is named with a new UUID, followed by `.<extension>` when `extension` is set, and
+    /// placed at the table's write location: `_files` under the table root, or the location set
+    /// by the internal `delta.fileType.writeLocation` table property. Write the bytes to
+    /// [`ReferencedFilePath::location`] and store [`ReferencedFilePath::uri`] in the value's
+    /// `uri`: relative to the table root under `_files`, absolute outside the table root.
+    ///
+    /// The `file` type protocol requires a writer to write each file for a new reference under a
+    /// unique name, never to overwrite an existing file, and to treat a file as immutable once a
+    /// committed `uri` references it. Each call returns a new name, so a connector that writes
+    /// each file once to the returned location, and never modifies it, meets these requirements.
+    /// Kernel does not write or track the file; keeping it is up to the connector or the system
+    /// that owns the write location.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `delta.fileType.writeLocation` is invalid: it must be a
+    /// table-root-relative path under `_files` (for example `_files/<prefix>`) or an absolute URI
+    /// outside the table root, and a writer must not write files at any other value. Also returns
+    /// an error if `extension` is empty or has a character other than an ASCII letter, digit, `-`,
+    /// `_` or `.`.
+    pub fn new_referenced_file_path(
+        &self,
+        extension: Option<&str>,
+    ) -> KernelResult<ReferencedFilePath> {
+        new_referenced_file_path(
+            &self.write_state.table_root,
+            self.write_state.file_type_write_location.as_deref(),
+            extension,
+        )
+    }
 }
 
 /// Generates a random alphanumeric prefix of the given length for data file directory paths.
@@ -312,6 +346,7 @@ mod tests {
             randomize_file_prefixes,
             random_prefix_length: NonZero::new(random_prefix_length)
                 .expect("test prefix length must be > 0"),
+            file_type_write_location: None,
         });
         BoundWriteContext {
             write_state,
