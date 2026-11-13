@@ -7,5 +7,6 @@ mod types;
 #[cfg(feature = "declarative-plans")]
 pub use info::{
     CheckpointInfoVisitor, FfiCheckpointInfo, FfiCheckpointKind, snapshot_checkpoint_info,
+    snapshot_checkpoint_type,
 };
 pub use types::FfiSelectedCheckpointType;

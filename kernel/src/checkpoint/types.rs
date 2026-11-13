@@ -106,9 +106,11 @@ mod tests {
         let cached = reader.get_checkpoint_info(&PanicEngine).unwrap().unwrap();
         assert!(Arc::ptr_eq(&info, &cached));
 
-        // When the snapshot is rebuilt from its hint or advanced with the same checkpoint.
+        // When the snapshot loaded from storage is rebuilt from its resolved hint or advanced.
+        let hint = snapshot.to_snapshot_hint().unwrap();
+        assert_eq!(hint.checkpoint_type(), expected);
         let hinted = Snapshot::builder_for(table.table_root())
-            .with_snapshot_hint(snapshot.to_snapshot_hint().unwrap())
+            .with_snapshot_hint(hint)
             .build(&PanicEngine)
             .unwrap();
         let updated = Snapshot::builder_from(snapshot.clone())
@@ -120,6 +122,11 @@ mod tests {
             expected
         );
         assert_eq!(updated.version(), 3);
+        assert_eq!(
+            updated.log_segment().checkpoint_version(),
+            snapshot.log_segment().checkpoint_version()
+        );
+        assert!(updated.cached_checkpoint_info().is_none());
         assert_eq!(
             updated.reader().get_checkpoint_type(&PanicEngine).unwrap(),
             expected

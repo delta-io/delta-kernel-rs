@@ -8,7 +8,8 @@ use crate::delta_types::{CheckpointBacking, FfiLastCheckpoint};
 use crate::error::{ExternResult, IntoExternResult};
 use crate::handle::Handle;
 use crate::{
-    KernelStringSlice, NullableCvoid, SharedExternEngine, SharedSnapshot, kernel_string_slice,
+    KernelStringSlice, NullableCvoid, OptionalValue, SharedExternEngine, SharedSnapshot,
+    kernel_string_slice,
 };
 
 /// Complete borrowed checkpoint summary passed to [`CheckpointInfoVisitor`].
@@ -55,6 +56,30 @@ impl From<CheckpointKind> for FfiCheckpointKind {
             CheckpointKind::Manifest => Self::Manifest,
         }
     }
+}
+
+/// Returns the selected checkpoint's V1 or V2 specification, or absent if none was selected.
+///
+/// Returns without I/O when the type is known. Otherwise, resolves checkpoint information through
+/// the engine's declarative executor and shares the result with checkpoint-info getters and scan
+/// planning. Failed discovery can be retried.
+///
+/// # Safety
+/// The snapshot and engine handles are borrowed and must remain valid for this call.
+/// During discovery, the executor must not request checkpoint information recursively on the
+/// same snapshot: that call would wait for initialization already in progress.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn snapshot_checkpoint_type(
+    snapshot: Handle<SharedSnapshot>,
+    engine: Handle<SharedExternEngine>,
+) -> ExternResult<OptionalValue<FfiSelectedCheckpointType>> {
+    let snapshot = unsafe { snapshot.as_ref() };
+    let engine = unsafe { engine.as_ref() };
+    let result = snapshot
+        .reader()
+        .get_checkpoint_type(engine.engine().as_ref())
+        .map(|checkpoint_type| checkpoint_type.map(Into::into).into());
+    unsafe { result.into_extern_result(&engine) }
 }
 
 /// Resolves the selected checkpoint and invokes `visitor` once with its complete summary.
@@ -160,12 +185,13 @@ mod tests {
     }
 
     #[rstest]
-    #[case::no_checkpoint(false, false, false)]
-    #[case::manifest(true, true, false)]
-    #[case::leaf(true, false, false)]
-    #[case::failed_resolution(true, true, true)]
+    #[case::no_checkpoint(None, false, false)]
+    #[case::v1(Some(FfiSelectedCheckpointType::V1), false, false)]
+    #[case::manifest(Some(FfiSelectedCheckpointType::V2), true, false)]
+    #[case::leaf(Some(FfiSelectedCheckpointType::V2), false, false)]
+    #[case::failed_resolution(Some(FfiSelectedCheckpointType::V2), true, true)]
     fn callback_copies_metadata_and_borrows_handles(
-        #[case] checkpoint: bool,
+        #[case] checkpoint: Option<FfiSelectedCheckpointType>,
         #[case] manifest: bool,
         #[case] invalid_size: bool,
     ) {
@@ -203,9 +229,9 @@ mod tests {
         }
 
         // Then: copied schema and nested hint values remain usable after both handles are freed.
-        if checkpoint && !invalid_size {
+        if checkpoint.is_some() && !invalid_size {
             let (copied_schema, count, bytes, hint, kind, checkpoint_type) = captured.info.unwrap();
-            assert_eq!(checkpoint_type, FfiSelectedCheckpointType::V2);
+            assert_eq!(Some(checkpoint_type), checkpoint);
             assert_eq!(
                 kind,
                 if manifest {
@@ -223,11 +249,15 @@ mod tests {
             }
             assert_eq!((count, bytes), (1, if manifest { 30 } else { 17 }));
             assert_eq!(hint.size(), 7);
-            let sidecars = hint.v2_checkpoint().unwrap().sidecar_files().unwrap();
-            if manifest {
-                assert_eq!(sidecars[0].path, "leaf.parquet");
+            if checkpoint_type == FfiSelectedCheckpointType::V1 {
+                assert!(hint.v2_checkpoint().is_none());
             } else {
-                assert!(sidecars.is_empty());
+                let sidecars = hint.v2_checkpoint().unwrap().sidecar_files().unwrap();
+                if manifest {
+                    assert_eq!(sidecars[0].path, "leaf.parquet");
+                } else {
+                    assert!(sidecars.is_empty());
+                }
             }
         } else {
             assert!(captured.info.is_none());
@@ -266,7 +296,8 @@ mod tests {
     #[test]
     fn callback_can_reenter_same_snapshot_with_null_context() {
         // Given: a callback that recursively exports from the same borrowed handles.
-        let (snapshot, engine) = checkpoint_handles(true, false, false);
+        let (snapshot, engine) =
+            checkpoint_handles(Some(FfiSelectedCheckpointType::V2), false, false);
         let mut state = ReentrantContext {
             snapshot,
             engine,
@@ -302,7 +333,7 @@ mod tests {
     }
 
     fn checkpoint_handles(
-        checkpoint: bool,
+        checkpoint: Option<FfiSelectedCheckpointType>,
         manifest: bool,
         invalid_size: bool,
     ) -> (Handle<SharedSnapshot>, Handle<SharedExternEngine>) {
@@ -310,22 +341,45 @@ mod tests {
             DelegatingEngine::new(Arc::new(PanicEngine)).with_plan_executor(Arc::new(NoIoExecutor)),
         );
         let schema = r#"{"type":"struct","fields":[]}"#;
-        let filename = "00000000000000000000.checkpoint.11111111-1111-1111-1111-111111111111.json";
-        let last_checkpoint = checkpoint.then(|| serde_json::from_value::<LastCheckpointHint>(
-            serde_json::json!({
-                "version": 0, "size": 7,
-                "v2Checkpoint": {
-                    "path": filename,
-                    "sidecarFiles": if manifest {
-                        vec![serde_json::json!({ "path": "leaf.parquet", "sizeInBytes": if invalid_size { -1 } else { 13 }, "modificationTime": 23 })]
-                    } else {
-                        vec![]
-                    },
-                    "nonFileActions": [{ "checkpointMetadata": { "version": 0, "tags": { "sidecarFileSchema": schema } } }]
-                }
-            })
-        ).unwrap());
-        let path = if checkpoint {
+        let filename = if checkpoint == Some(FfiSelectedCheckpointType::V1) {
+            "00000000000000000000.checkpoint.parquet"
+        } else {
+            "00000000000000000000.checkpoint.11111111-1111-1111-1111-111111111111.json"
+        };
+        let last_checkpoint = checkpoint.map(|checkpoint_type| {
+            let value = if checkpoint_type == FfiSelectedCheckpointType::V1 {
+                serde_json::json!({
+                    "version": 0, "size": 7,
+                    "checkpointSchema": {
+                        "type": "struct",
+                        "fields": [{
+                            "name": "add", "type": "string", "nullable": true, "metadata": {}
+                        }]
+                    }
+                })
+            } else {
+                serde_json::json!({
+                    "version": 0, "size": 7,
+                    "v2Checkpoint": {
+                        "path": filename,
+                        "sidecarFiles": if manifest {
+                            vec![serde_json::json!({
+                                "path": "leaf.parquet",
+                                "sizeInBytes": if invalid_size { -1 } else { 13 },
+                                "modificationTime": 23
+                            })]
+                        } else {
+                            vec![]
+                        },
+                        "nonFileActions": [{ "checkpointMetadata": {
+                            "version": 0, "tags": { "sidecarFileSchema": schema }
+                        } }]
+                    }
+                })
+            };
+            serde_json::from_value::<LastCheckpointHint>(value).unwrap()
+        });
+        let path = if checkpoint.is_some() {
             filename
         } else {
             "00000000000000000000.json"
