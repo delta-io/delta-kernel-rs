@@ -792,11 +792,8 @@ async fn plan_replay_bounded_by_crc_or_checkpoint_runs_one_plan(
         .unwrap();
     assert!(resolution.protocol.is_some() && resolution.metadata.is_some());
     assert!(resolution.captured_checkpoint_action.is_none());
-    let expected = if newest_has_commit_info {
-        resolved_pointer(0, 0)
-    } else {
-        LastManifestCommitResolution::Unresolved
-    };
+    let expected =
+        LastManifestCommitResolution::Resolved(newest_has_commit_info.then(|| pointer(0, 0)));
     assert_eq!(resolution.last_manifest_commit, expected);
     assert_eq!(plans.lock().unwrap().len(), 1);
 }
@@ -1343,7 +1340,8 @@ async fn post_commit_snapshot_resolves_latest_checkpoint_action(
 
 // Replay takes `lastManifestCommit` from the newest commit only: a manifest commit records itself,
 // a later log commit carries it forward, and a newest commit without one is not back-filled from an
-// older commit, so that miss stays `Unresolved`. The same holds when a CRC at v0 seeds the replay.
+// older commit. Replay always reads the newest commit, so it resolves that miss as
+// `Resolved(None)`. The same holds when a CRC at v0 seeds the replay.
 #[rstest]
 #[case::manifest_commit_records_itself(vec![], false, Some(pointer(0, 0)))]
 #[case::log_commit_carries_it_forward(vec![commit_info(Some(pointer(0, 0)))], false, Some(pointer(0, 0)))]
@@ -1356,14 +1354,11 @@ async fn replay_resolves_last_manifest_commit_from_newest_commit(
     #[case] crc_seeded: bool,
     #[case] expected: Option<LastManifestCommit>,
 ) {
-    let expected = match expected {
-        Some(pointer) => LastManifestCommitResolution::Resolved(Some(pointer)),
-        None => LastManifestCommitResolution::Unresolved,
-    };
     let crc = crc_seeded.then(|| Arc::new(Crc::default()));
     let crc = crc.as_ref();
     let log = ReplayLog::after_manifest_commit(later_commits);
-    let expected = ReplayExpectation::default().last_manifest_commit(expected);
+    let expected = ReplayExpectation::default()
+        .last_manifest_commit(LastManifestCommitResolution::Resolved(expected));
     assert_replay(&log, crc, &expected, non_plan_engine).await;
     #[cfg(feature = "declarative-plans")]
     assert_replay(&log, crc, &expected, |store| {
@@ -1417,7 +1412,7 @@ async fn check_pointer_after_newest_commit<E: Engine>(
     ReplayExpectation::default()
         .captured(None)
         .schema(one_column_schema())
-        .last_manifest_commit(LastManifestCommitResolution::Unresolved)
+        .last_manifest_commit(LastManifestCommitResolution::Resolved(None))
 )]
 #[case::newest_commit_has_no_commit_info(
     ReplayLog::after_manifest_commit(vec![pointerless_pm_commit(), commit_info(None), txn_commit()])
@@ -1425,7 +1420,7 @@ async fn check_pointer_after_newest_commit<E: Engine>(
     ReplayExpectation::default()
         .captured(None)
         .schema(one_column_schema())
-        .last_manifest_commit(LastManifestCommitResolution::Unresolved)
+        .last_manifest_commit(LastManifestCommitResolution::Resolved(None))
 )]
 #[case::follows_pointer(
     ReplayLog::after_manifest_commit(vec![
@@ -1552,34 +1547,36 @@ async fn segment_with_compaction(
 }
 
 // A replayed snapshot serves `lastManifestCommit` from build-time state: it still resolves after
-// the newest commit file is deleted.
+// the newest commit file is deleted, including a missing pointer. The newest commit has no P&M, so
+// replay reads all of it.
 #[rstest]
-#[case::carried_pointer(commit_info(Some(pointer(0, 0))), Some(pointer(0, 0)))]
+#[case::carried_pointer(vec![commit_info(Some(pointer(0, 0)))], Some(pointer(0, 0)))]
+#[case::no_pointer(vec![pointerless_pm_commit(), commit_info(None)], None)]
 #[tokio::test]
 async fn replayed_snapshot_serves_last_manifest_commit_without_reading_the_log(
-    #[case] newest_commit: String,
+    #[case] later_commits: Vec<String>,
     #[case] expected: Option<LastManifestCommit>,
 ) {
-    assert_snapshot_serves_last_manifest_commit(&newest_commit, expected.clone(), non_plan_engine)
+    assert_snapshot_serves_last_manifest_commit(&later_commits, expected.clone(), non_plan_engine)
         .await;
     #[cfg(feature = "declarative-plans")]
-    assert_snapshot_serves_last_manifest_commit(&newest_commit, expected, |store| {
+    assert_snapshot_serves_last_manifest_commit(&later_commits, expected, |store| {
         SyncEngine::new_with_store(store)
     })
     .await;
 }
 
 async fn assert_snapshot_serves_last_manifest_commit<E: Engine>(
-    newest_commit: &str,
+    later_commits: &[String],
     expected: Option<LastManifestCommit>,
     make_engine: impl FnOnce(Arc<InMemory>) -> E,
 ) {
-    let (store, table_root) = manifest_commit_table(&[newest_commit.to_string()]).await;
+    let (store, table_root) = manifest_commit_table(later_commits).await;
     let engine = make_engine(store.clone());
     let snapshot = Snapshot::builder_for(table_root).build(&engine).unwrap();
 
     store
-        .delete(&delta_path_for_version(1, "json"))
+        .delete(&delta_path_for_version(later_commits.len() as u64, "json"))
         .await
         .unwrap();
     assert_eq!(snapshot.last_manifest_commit(&engine).unwrap(), expected);
