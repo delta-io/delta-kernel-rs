@@ -6,7 +6,6 @@
 //! with schema hints and DBR's JSON checksum. A fresh checkpoint has no compacted-file
 //! chain; AMT and legacy multipart generation are outside this planner's scope.
 
-use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
 
 use serde::Serialize;
@@ -15,9 +14,7 @@ use serde::de::DeserializeOwned;
 mod json_checksum;
 
 use super::super::{CheckpointWriter, LastCheckpointHintStats};
-use crate::actions::{
-    CHECKPOINT_METADATA_FIELD, CheckpointMetadata, SIDECAR_FIELD, SIDECAR_FILE_SCHEMA_TAG, Sidecar,
-};
+use crate::actions::{CHECKPOINT_METADATA_FIELD, SIDECAR_FIELD, SIDECAR_FILE_SCHEMA_TAG, Sidecar};
 use crate::engine_data::TypedGetData as _;
 use crate::expressions::{
     ColumnName, Expression as Expr, Scalar, UnaryExpressionOp, col, column_name, lit, null_lit,
@@ -66,38 +63,16 @@ impl CheckpointWriter {
         sidecar_actions(sidecars)?.build()
     }
 
-    /// Computes the action, add-file, and byte totals used by the V2 checkpointMetadata action.
-    /// `content_counts` is the retained result of [`Self::declarative_checkpoint_counts_plan`]
-    /// over the sidecar input. `sidecars` follows [`Self::declarative_sidecar_actions_plan`]'s
-    /// write-result schema. Its bytes come from completed writes, not table data-file sizes.
-    /// These totals exclude the manifest's non-content rows, sidecar references, and metadata row.
-    pub fn declarative_v2_checkpoint_statistics_plan(
-        &self,
-        content_counts: RelationRef,
-        sidecars: RelationRef,
-    ) -> KernelResult<Plan> {
-        if !self.schema_context.is_v2 {
-            return Err(KernelError::unsupported(
-                "V2 statistics require a V2 checkpoint writer",
-            ));
-        }
-        checkpoint_totals(
-            PlanBuilder::relation_source(content_counts),
-            Some(sidecars),
-            None,
-        )?
-        .build()
-    }
-
     /// Builds the V2 manifest rows, including sidecar references and fresh checkpoint metadata.
-    /// `statistics` is the single row from [`Self::declarative_v2_checkpoint_statistics_plan`].
+    /// `content_counts` is the retained result of [`Self::declarative_checkpoint_counts_plan`].
+    /// The engine combines these counts with completed sidecar sizes and constructs the metadata.
     /// `content_schema` is the sidecar input schema; its bounded JSON goes in `sidecarFileSchema`.
     /// No files are written: retain these rows for the manifest write and hint computation.
     pub fn declarative_v2_checkpoint_manifest_plan(
         &self,
         non_content: RelationRef,
         sidecars: RelationRef,
-        statistics: &dyn EngineData,
+        content_counts: RelationRef,
         content_schema: &SchemaRef,
     ) -> KernelResult<Plan> {
         if !self.schema_context.is_v2 {
@@ -105,19 +80,31 @@ impl CheckpointWriter {
                 "A V2 manifest requires a V2 checkpoint writer",
             ));
         }
-        let stats = read_statistics(statistics)?;
-        let mut tags = HashMap::from([
-            ("sidecarNumActions".into(), stats.num_actions.to_string()),
-            ("sidecarSizeInBytes".into(), stats.size_in_bytes.to_string()),
-            ("numOfAddFiles".into(), stats.num_of_add_files.to_string()),
-        ]);
-        if let Some(schema) = checkpoint_schema_json(content_schema)? {
-            tags.insert(SIDECAR_FILE_SCHEMA_TAG.into(), schema);
-        }
-        let metadata = CheckpointMetadata {
-            version: self.version,
-            tags: Some(tags),
-        };
+        let tags = [
+            ("sidecarNumActions", NUM_ACTIONS),
+            ("sidecarSizeInBytes", NUM_BYTES),
+            ("numOfAddFiles", NUM_ADDS),
+        ]
+        .into_iter()
+        .map(|(tag, column)| {
+            (
+                lit(tag),
+                Expr::cast(Expr::column([column]), DataType::STRING),
+            )
+        })
+        .chain(
+            checkpoint_schema_json(content_schema)?
+                .map(|schema| (lit(SIDECAR_FILE_SCHEMA_TAG), lit(schema))),
+        );
+        let metadata = checkpoint_totals(
+            PlanBuilder::relation_source(content_counts),
+            Some(sidecars.clone()),
+            None,
+        )?
+        .project(
+            Expr::struct_from([Expr::struct_from([lit(self.version), Expr::map(tags)])]),
+            Arc::new(schema! { (&CHECKPOINT_METADATA_FIELD) }),
+        )?;
         let schema = Arc::new(StructType::try_new(
             non_content
                 .schema()
@@ -128,10 +115,7 @@ impl CheckpointWriter {
         let inputs = [
             PlanBuilder::relation_source(non_content),
             sidecar_actions(sidecars)?,
-            PlanBuilder::values(
-                Arc::new(schema! { (&CHECKPOINT_METADATA_FIELD) }),
-                vec![vec![metadata.into()]],
-            )?,
+            metadata,
         ]
         .into_iter()
         .map(|input| {

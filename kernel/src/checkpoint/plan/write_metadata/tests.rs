@@ -2,7 +2,7 @@ use ::test_utils::table_builder::{FeatureSet, LogState, TestTableBuilder};
 use rstest::rstest;
 
 use super::*;
-use crate::actions::{SET_TRANSACTION_FIELD, SetTransaction};
+use crate::actions::{CheckpointMetadata, SET_TRANSACTION_FIELD, SetTransaction};
 use crate::arrow::record_batch::RecordBatch;
 use crate::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt as _};
 use crate::engine::sync::SyncEngine;
@@ -73,7 +73,9 @@ async fn checkpoint_statistics_match_reconciliation_and_write_results(
         .unwrap();
     let engine = SyncEngine::new_with_store(table.store().clone());
     let executor = SyncPlanExecutor::new(Some(table.store().clone())).get_scoped();
-    let snapshot = Snapshot::builder_for(table.table_root()).build(&engine)?;
+    let snapshot = Snapshot::builder_for(table.table_root())
+        .build(&engine)
+        .unwrap();
     let writer = snapshot.create_checkpoint_writer(&engine)?;
     let legacy = writer.checkpoint_data(&engine)?;
     let legacy_state = legacy.state();
@@ -108,15 +110,6 @@ async fn checkpoint_statistics_match_reconciliation_and_write_results(
         let sidecar_count = descriptors.len() as i64;
         let sidecar_bytes = if files == 0 { 0i64 } else { 384i64 };
         let sidecars = file_results(&executor, "sidecars", descriptors)?;
-        assert_rows(
-            &executor,
-            writer.declarative_v2_checkpoint_statistics_plan(counts.clone(), sidecars.clone())?,
-            vec![vec![
-                (files as i64).into(),
-                (files as i64).into(),
-                sidecar_bytes.into(),
-            ]],
-        )?;
         let expected = if files == 0 {
             vec![]
         } else {
@@ -134,16 +127,12 @@ async fn checkpoint_statistics_match_reconciliation_and_write_results(
             CheckpointWriter::declarative_sidecar_actions_plan(sidecars.clone())?,
             expected,
         )?;
-        let totals = execute(
-            &executor,
-            writer.declarative_v2_checkpoint_statistics_plan(counts.clone(), sidecars.clone())?,
-        )?;
         let actions = executor.execute_and_retain(
             "manifest",
             writer.declarative_v2_checkpoint_manifest_plan(
                 actions,
                 sidecars.clone(),
-                &ArrowEngineData::new(totals[0].clone()),
+                counts.clone(),
                 content.schema(),
             )?,
         )?;

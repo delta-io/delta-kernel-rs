@@ -13,7 +13,7 @@ use crate::action_reconciliation::file_metadata::{
 use crate::action_reconciliation::log_replay::ActionReconciliationProcessor;
 use crate::action_reconciliation::plan::VERSION;
 use crate::action_reconciliation::plan::action_set::ActionSet;
-use crate::arrow::array::{Int64Array, StringArray};
+use crate::arrow::array::{Array as _, BooleanArray, Int64Array, StringArray, StructArray};
 use crate::arrow::compute::{filter_record_batch, is_not_null, or};
 use crate::arrow::record_batch::RecordBatch;
 use crate::checkpoint::{CheckpointSpec, V2CheckpointConfig};
@@ -167,7 +167,7 @@ fn checkpoint_plan_matches_existing_checkpoint_data(
     Ok(())
 }
 
-// A fixed-cutoff oracle using the existing imperative checkpoint replay and stats transform.
+// A fixed-cutoff oracle using imperative replay and stats conversion, with DBR txn retention.
 fn existing_checkpoint_data(
     writer: &CheckpointWriter,
     engine: &dyn Engine,
@@ -197,10 +197,33 @@ fn existing_checkpoint_data(
             .process_actions_batch(batch?)?
             .filtered_data
             .into_parts();
-        batches.push(selected_batch(FilteredEngineData::try_new(
+        let mut batch = selected_batch(FilteredEngineData::try_new(
             evaluator.evaluate(data.as_ref())?,
             selected,
-        )?)?);
+        )?)?;
+        if let Some(cutoff) = txn_cutoff {
+            // Legacy Kernel retains missing timestamps; DBR's checkpoint replay expires them.
+            let txns = batch
+                .column_by_name("txn")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<StructArray>()
+                .unwrap();
+            let timestamps = txns
+                .column_by_name("lastUpdated")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            let keep = BooleanArray::from_iter((0..batch.num_rows()).map(|row| {
+                Some(
+                    txns.is_null(row)
+                        || (timestamps.is_valid(row) && timestamps.value(row) > cutoff),
+                )
+            }));
+            batch = filter_record_batch(&batch, &keep)?;
+        }
+        batches.push(batch);
     }
     Ok(batches)
 }
@@ -333,8 +356,7 @@ async fn checkpoint_plan_reconciles_all_groups_and_retains_after_replay(
     // Fixed-cutoff checks exercise the shared retention expressions on fully replayed actions.
     // The fixture comparisons above exercise the public V1 and V2 factories with real cutoffs.
     let plan = writer
-        .metadata_planner(ActionSet::ALL)?
-        .with_checkpoint_shape(writer.snapshot.checkpoint_info(&engine)?)
+        .metadata_planner(&engine, ActionSet::ALL)?
         .replay()?
         .filter(Predicate::and(
             file_retention_predicate(100),
@@ -374,10 +396,14 @@ async fn checkpoint_plan_reconciles_all_groups_and_retains_after_replay(
             .sum::<usize>()
     );
     let actual = assert_checkpoint_plan(&engine, plan, ActionSet::ALL, &expected)?;
+    let result = json_rows(&actual, true)?;
+    assert_eq!(
+        result.iter().any(|row| row["txn"]["appId"] == "legacy"),
+        txn_cutoff.is_none(),
+    );
     if v2 {
         return Ok(());
     }
-    let result = json_rows(&actual, true)?;
 
     // The relation is directly writable using the existing ParquetHandler. Reload the resulting
     // checkpoint with the imperative reader and compare the reconstructed state again.
@@ -411,12 +437,18 @@ async fn checkpoint_plan_reconciles_all_groups_and_retains_after_replay(
 #[rstest]
 #[tokio::test]
 async fn checkpoint_uses_declared_metadata_representations(
+    #[values(false, true)] v2: bool,
     #[values(false, true)] compatible: bool,
     #[values(false, true)] write_json: bool,
     #[values(false, true)] write_struct: bool,
     #[values(false, true)] parsed_partitions: bool,
 ) -> KernelResult<(), Box<dyn std::error::Error>> {
     let table = TestTableBuilder::new()
+        .with_features(if v2 {
+            FeatureSet::new().v2_checkpoint()
+        } else {
+            FeatureSet::new()
+        })
         .with_schema(
             partitioned_schema()
                 .project(&["value", "part_long"])
@@ -549,7 +581,15 @@ async fn checkpoint_uses_declared_metadata_representations(
     }
     writer.schema_context.stats_config.write_stats_as_json = write_json;
     writer.schema_context.stats_config.write_stats_as_struct = write_struct;
-    let plan = writer.declarative_checkpoint_data_plan(&engine)?;
+    let (plan, actions) = if v2 {
+        let (content, _) = writer.declarative_v2_checkpoint_data_plans(&engine)?;
+        (content, ActionSet::live_adds_with_tombstones())
+    } else {
+        (
+            writer.declarative_checkpoint_data_plan(&engine)?,
+            ActionSet::ALL,
+        )
+    };
     let actual = execute(&engine, plan)?;
     if compatible {
         let expected = writer
@@ -558,7 +598,7 @@ async fn checkpoint_uses_declared_metadata_representations(
             .collect::<KernelResult<Vec<_>>>()?;
         assert_eq!(
             json_rows(&actual, true)?,
-            json_rows(&select_checkpoint_actions(&expected, ActionSet::ALL)?, true)?
+            json_rows(&select_checkpoint_actions(&expected, actions)?, true)?
         );
     }
     let actual_rows = json_rows(&actual, true)?;
@@ -585,7 +625,7 @@ async fn checkpoint_uses_declared_metadata_representations(
             .iter()
             .filter(|row| !row[kind].is_null())
             .count()),
-        [3, 1, 1]
+        [3, usize::from(!v2), usize::from(!v2)]
     );
 
     Ok(())
