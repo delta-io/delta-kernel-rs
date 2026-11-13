@@ -938,17 +938,15 @@ impl TableConfiguration {
 
     /// The physical schema ([`SchemaRef`]) of this table at this version.
     ///
-    /// When column mapping is disabled, this is identical to
-    /// [`logical_schema`](Self::logical_schema). Otherwise, field names are replaced with
-    /// physical column names derived from column mapping metadata.
+    /// When column mapping is disabled, this keeps logical names and removes stale mapping
+    /// annotations. Otherwise, field names are replaced with physical column names derived from
+    /// column mapping metadata.
     #[internal_api]
     pub(crate) fn physical_schema(&self) -> SchemaRef {
         self.physical_schema
             .get_or_init(|| {
-                Arc::new(
-                    self.logical_schema
-                        .make_validated_physical(self.column_mapping_mode),
-                )
+                self.logical_schema
+                    .make_validated_physical_shared(self.column_mapping_mode)
             })
             .clone()
     }
@@ -1417,6 +1415,7 @@ mod test {
     use crate::actions::{MIN_VALUES, Metadata, Protocol};
     use crate::scan::state_info::StateInfo;
     use crate::scan::{PartitionValuesOptions, StatsOptions};
+    use crate::schema::column_default::field_with_default;
     use crate::schema::{
         ColumnMetadataKey, ColumnName, DataType, MetadataValue, SchemaRef, StructField,
         column_name, schema, schema_ref,
@@ -1440,6 +1439,28 @@ mod test {
         test_schema_with_array_and_column_mapping, test_schema_with_map,
         test_schema_with_map_and_column_mapping,
     };
+
+    #[rstest]
+    #[case::flat(test_schema_flat())]
+    #[case::nested(test_schema_nested())]
+    #[case::array(test_schema_with_array())]
+    #[case::map(test_schema_with_map())]
+    #[case::defaults_and_custom_metadata(schema_ref! {
+        (field_with_default("value", DataType::LONG, "42").add_metadata([
+            ("custom", MetadataValue::String("kept".into())),
+        ])),
+    })]
+    fn unchanged_physical_schema_shares_logical_storage(#[case] schema: SchemaRef) {
+        let config = MockTableConfigurationBuilder::new()
+            .with_schema(schema.clone())
+            .build();
+        assert!(config.physical_schema.get().is_none());
+        assert_eq!(config.physical_schema(), schema);
+        assert!(Arc::ptr_eq(
+            &config.logical_schema(),
+            &config.physical_schema(),
+        ));
+    }
 
     #[rstest]
     fn collations_feature_without_annotations_requires_only_domain_metadata_for_writes(

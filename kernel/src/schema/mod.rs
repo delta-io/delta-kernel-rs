@@ -1346,10 +1346,25 @@ impl StructType {
     ///
     /// [`MakePhysical::validate_read_column_mapping`] must have succeeded for this schema and
     /// `mode`, and both must remain unchanged after validation.
+    #[allow(unused)]
     pub(crate) fn make_validated_physical(&self, mode: ColumnMappingMode) -> Self {
         MaterializePhysical(mode)
             .transform_struct(self)
             .into_owned()
+    }
+
+    /// Materializes physical mappings, sharing this schema when every field is unchanged.
+    ///
+    /// [`MakePhysical::validate_read_column_mapping`] must have succeeded for this schema and
+    /// `mode`, and both must remain unchanged after validation.
+    pub(crate) fn make_validated_physical_shared(
+        self: &Arc<Self>,
+        mode: ColumnMappingMode,
+    ) -> SchemaRef {
+        match MaterializePhysical(mode).transform_struct(self) {
+            Cow::Borrowed(_) => self.clone(),
+            Cow::Owned(schema) => Arc::new(schema),
+        }
     }
 
     /// Validates that there are no metadata columns in the given fields.
@@ -3130,11 +3145,18 @@ impl<'a> SchemaTransform<'a> for MaterializePhysical {
         if field.is_metadata_column() {
             return Cow::Borrowed(field);
         }
-        let data_type = self.transform(field.data_type()).into_owned();
+        let data_type = self.transform(field.data_type());
+        let physical_name = field.physical_name(self.0);
         let metadata = field.logical_to_physical_metadata(self.0);
+        if matches!(&data_type, Cow::Borrowed(_))
+            && physical_name == field.name().as_str()
+            && metadata == field.metadata
+        {
+            return Cow::Borrowed(field);
+        }
         Cow::Owned(StructField {
-            name: field.physical_name(self.0).to_owned(),
-            data_type,
+            name: physical_name.to_owned(),
+            data_type: data_type.into_owned(),
             nullable: field.nullable,
             metadata,
         })
@@ -3966,8 +3988,13 @@ mod tests {
             logical.get_config_value(&ColumnMetadataKey::Collations),
             Some(&annotation)
         );
-        collation_utils::validate_collation_annotations(&StructType::try_new([physical]).unwrap())
-            .unwrap();
+        let expected = StructType::try_new([physical]).unwrap();
+        let logical = Arc::new(StructType::try_new([logical]).unwrap());
+        MakePhysical::validate_read_column_mapping(mode, &logical).unwrap();
+        let shared_physical = logical.make_validated_physical_shared(mode);
+        assert_eq!(logical.make_validated_physical(mode), expected);
+        assert_eq!(shared_physical.as_ref(), &expected);
+        collation_utils::validate_collation_annotations(&shared_physical).unwrap();
     }
 
     #[test]
@@ -4018,6 +4045,11 @@ mod tests {
                 .metadata
                 .contains_key(ColumnMetadataKey::ColumnMappingPhysicalName.as_ref())
         );
+        let logical = Arc::new(StructType::try_new([field]).unwrap());
+        MakePhysical::validate_read_column_mapping(ColumnMappingMode::None, &logical).unwrap();
+        let shared_physical = logical.make_validated_physical_shared(ColumnMappingMode::None);
+        assert!(!Arc::ptr_eq(&logical, &shared_physical));
+        assert_eq!(shared_physical.fields().next().unwrap(), &physical);
     }
 
     #[test]
@@ -4246,6 +4278,13 @@ mod tests {
         )]);
         assert_result_error_with_message(
             field.make_physical(ColumnMappingMode::Name),
+            "must not have column mapping annotations",
+        );
+        assert_result_error_with_message(
+            MakePhysical::validate_read_column_mapping(
+                ColumnMappingMode::Name,
+                &StructType::try_new([field]).unwrap(),
+            ),
             "must not have column mapping annotations",
         );
     }
