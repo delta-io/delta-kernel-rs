@@ -31,7 +31,7 @@ enum CrcRoot {
     Checkpoint,
 }
 
-fn create_snapshot(engine: &dyn Engine) -> KernelResult<SnapshotRef> {
+fn create_snapshot(engine: &dyn Engine) -> Result<SnapshotRef> {
     let schema = Arc::new(StructType::try_new([StructField::nullable(
         "café",
         DataType::INTEGER,
@@ -130,7 +130,7 @@ fn crc_write_reports_utf8_bytes_and_completes_while_snapshot_is_alive(
 fn crc_write_already_exists_reports_no_bytes(
     #[case] use_original_snapshot: bool,
     #[case] expected_mode: ChecksumWriteResolutionMode,
-) -> KernelResult<()> {
+) -> Result<()> {
     let reporter = Arc::new(CapturingReporter::default());
     let _guard = install_thread_local_metrics_reporter(reporter.clone());
     let engine = SyncEngine::new_with_store(Arc::new(InMemory::new()));
@@ -206,7 +206,7 @@ fn crc_write_resolution_or_validation_error_retains_mode_and_duration(
 }
 
 #[test]
-fn crc_write_snapshot_update_error_reports_failure_after_successful_put() -> KernelResult<()> {
+fn crc_write_snapshot_update_error_reports_failure_after_successful_put() -> Result<()> {
     let reporter = Arc::new(CapturingReporter::default());
     let _guard = install_thread_local_metrics_reporter(reporter.clone());
     let engine = SyncEngine::new_with_store(Arc::new(InMemory::new()));

@@ -4,13 +4,11 @@ use std::fmt;
 use serde::Deserialize;
 use serde::de::{self, DeserializeSeed, MapAccess, SeqAccess, Visitor};
 
-use crate::schema::{StructType, is_unsupported_delta_type_error};
-use crate::{KernelError, KernelResult};
-
-const SERDE_JSON_RECURSION_LIMIT_ERROR_PREFIX: &str = "recursion limit exceeded";
+use crate::schema::StructType;
+use crate::{KernelError, KernelResult, Result};
 
 /// Decodes a schema with a finite budget for visited JSON containers.
-pub(super) fn parse(json: &str, recursion_limit: usize) -> KernelResult<StructType> {
+pub(super) fn parse(json: &str, recursion_limit: usize) -> Result<StructType> {
     let mut deserializer = serde_json::Deserializer::from_str(json);
     deserializer.disable_recursion_limit();
     let exceeded = Cell::new(false);
@@ -30,8 +28,9 @@ pub(super) fn parse(json: &str, recursion_limit: usize) -> KernelResult<StructTy
                  reached the JSON recursion limit of {recursion_limit}"
             ))
             .with_backtrace()
+            .into()
         } else {
-            schema_json_error(error)
+            super::schema_decode_error(error)
         }
     })
 }
@@ -219,26 +218,6 @@ impl<'de, A: MapAccess<'de>> MapAccess<'de> for Limited<'_, A> {
     }
 }
 
-fn schema_json_error(error: serde_json::Error) -> KernelError {
-    // serde_json keeps ErrorCode::RecursionLimitExceeded private, so we use string
-    // matching.
-    if error.is_syntax()
-        && error
-            .to_string()
-            .starts_with(SERDE_JSON_RECURSION_LIMIT_ERROR_PREFIX)
-    {
-        KernelError::schema(format!(
-            "Table schema is too deeply nested: decoding metaData.schemaString exceeded \
-             serde_json's recursion limit: {error}"
-        ))
-        .with_backtrace()
-    } else if is_unsupported_delta_type_error(&error) {
-        KernelError::schema(error.to_string()).with_backtrace()
-    } else {
-        error.into()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::cell::Cell;
@@ -247,9 +226,9 @@ mod tests {
     use serde::Deserialize;
 
     use super::{Budget, parse};
-    use crate::KernelError;
     use crate::actions::SCHEMA_RECURSION_LIMIT;
     use crate::schema::{ArrayType, DataType, MapType, StructField, StructType};
+    use crate::{Error, KernelError};
 
     #[derive(Debug, Deserialize, PartialEq)]
     struct NestedArrays(Vec<Vec<u8>>);
@@ -310,8 +289,11 @@ mod tests {
             assert_eq!(cloned, expected);
             assert_eq!(serde_json::to_string(&cloned).unwrap(), json);
         } else {
+            let Error::Kernel(error) = result.unwrap_err() else {
+                panic!("expected Kernel error");
+            };
             assert_eq!(
-                result.unwrap_err().without_backtrace().to_string(),
+                error.without_backtrace().to_string(),
                 "Schema error: Table schema is too deeply nested: decoding \
                  metaData.schemaString reached the JSON recursion limit of 1000"
             );
@@ -393,7 +375,9 @@ mod tests {
         if succeeds {
             assert_eq!(result.unwrap(), expected);
         } else {
-            let error = result.unwrap_err();
+            let Error::Kernel(error) = result.unwrap_err() else {
+                panic!("expected Kernel error");
+            };
             assert!(matches!(error.without_backtrace(), KernelError::Schema(_)));
             assert_eq!(
                 error.without_backtrace().to_string(),
@@ -420,7 +404,9 @@ mod tests {
     #[case::unclosed_ignored_array(r#"{"type":"struct","fields":[],"x":[[0]}"#)]
     #[case::ignored_array_trailing_comma(r#"{"type":"struct","fields":[],"x":[0,]}"#)]
     fn parse_schema_rejects_malformed_json(#[case] json: &str) {
-        let error = parse(json, SCHEMA_RECURSION_LIMIT).unwrap_err();
+        let Error::Kernel(error) = parse(json, SCHEMA_RECURSION_LIMIT).unwrap_err() else {
+            panic!("expected Kernel error");
+        };
         assert!(matches!(
             error.without_backtrace(),
             KernelError::MalformedJson(_)

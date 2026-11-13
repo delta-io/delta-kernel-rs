@@ -19,10 +19,10 @@ error[E0277]: `*mut u32` cannot be shared between threads safely
    |
    = help: within `NotSync`, the trait `Sync` is not implemented for `*mut u32`
 note: required because it appears within the type `NotSync`
-  --> tests/invalid-handle-code/shared-not-sync.rs:5:12
+  --> tests/invalid-handle-code/shared-not-sync.rs:5:20
    |
  5 | pub struct NotSync(*mut u32);
-   |            ^^^^^^^
+   |                    ^^^^^^^^ required by this field
    = note: required for `SharedNotSync` to implement `handle::private::SharedHandleOps<NotSync, delta_kernel_ffi::handle::True>`
    = note: required for `Handle<SharedNotSync>` to implement `From<Arc<NotSync>>`
    = note: required for `Arc<NotSync>` to implement `Into<Handle<SharedNotSync>>`

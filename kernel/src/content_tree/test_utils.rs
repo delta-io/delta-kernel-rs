@@ -6,6 +6,7 @@ use std::sync::Arc;
 use url::Url;
 
 use crate::actions::MAX_VALUES;
+use crate::arrow::array::{AsArray as _, RecordBatch};
 /// Encodes manifest deletion vector positions as a Mumbling bitmap.
 pub(crate) use crate::content_tree::mumbling::tests::encode_positions as mumbling_bitmap;
 use crate::content_tree::stats::{field_with_id, projected_stats_schema, stats_schema};
@@ -340,4 +341,18 @@ mod tests {
         let stats = batch.column_by_name(CONTENT_STATS_FIELD_NAME).unwrap();
         assert_eq!(stats.null_count(), batch.num_rows());
     }
+}
+
+/// The non-null `<action>.path` leaf values of `batch`, as replay reads them, or none if it lacks
+/// the action column.
+pub(crate) fn action_paths(batch: &RecordBatch, action: &str) -> Vec<String> {
+    let Some(column) = batch.column_by_name(action) else {
+        return vec![];
+    };
+    let paths = column
+        .as_struct()
+        .column_by_name("path")
+        .unwrap()
+        .as_string::<i32>();
+    paths.iter().flatten().map(str::to_string).collect()
 }

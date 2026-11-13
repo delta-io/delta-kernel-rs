@@ -15,7 +15,7 @@ use crate::log_replay::ActionsBatch;
 use crate::path::LogRoot;
 use crate::schema::{SchemaRef, StructType};
 use crate::utils::require;
-use crate::{Engine, KernelError, KernelResult, KernelResultIterator};
+use crate::{Engine, KernelError, KernelResult, KernelResultIterator, Result};
 
 /// The action kinds a read schema may ask a checkpoint action for.
 const CHECKPOINT_ACTION_KINDS: &[&str] = &[
@@ -43,7 +43,7 @@ pub(crate) fn read_checkpoint_action(
     log_root: &LogRoot,
     read_schema: SchemaRef,
     stats_schema: Option<&StructType>,
-) -> KernelResult<Box<dyn KernelResultIterator<ActionsBatch>>> {
+) -> Result<Box<dyn KernelResultIterator<ActionsBatch>>> {
     if let Some(other) = read_schema
         .fields()
         .map(|field| field.name().as_str())
@@ -52,7 +52,8 @@ pub(crate) fn read_checkpoint_action(
         return Err(KernelError::unsupported(format!(
             "reading `{other}` actions from an adaptiveMetadata checkpoint action is not yet \
              supported"
-        )));
+        ))
+        .into());
     }
     let mut streams = Vec::new();
     for field in read_schema.fields() {
@@ -113,7 +114,7 @@ fn read_tree_adds(
     log_root: &LogRoot,
     read_schema: SchemaRef,
     stats_schema: Option<&StructType>,
-) -> KernelResult<Box<dyn KernelResultIterator<ActionsBatch>>> {
+) -> Result<Box<dyn KernelResultIterator<ActionsBatch>>> {
     // TODO(#3320): the content tree does not yet carry partition values, so its adds would read
     // with empty `partitionValues`.
     let partition_columns = checkpoint.metadata().partition_columns();
@@ -123,6 +124,7 @@ fn read_tree_adds(
             "reading adds from a partitioned adaptiveMetadata checkpoint action is not yet \
              supported; partition columns: {partition_columns:?}"
         ))
+        .into()
     );
     let ctx = ReadContext {
         table_root: log_root.table_root().clone(),
@@ -195,7 +197,7 @@ mod tests {
     };
     use crate::arrow::array::{Array as _, AsArray as _, RecordBatch};
     use crate::arrow::datatypes::Int64Type;
-    use crate::content_tree::test_utils::{added_data_entry, write_manifest};
+    use crate::content_tree::test_utils::{action_paths, added_data_entry, write_manifest};
     use crate::content_tree::{ContentTreeNodeEntry, TrackingStatus};
     use crate::engine::CancellableEngine;
     use crate::engine::arrow_data::EngineDataArrowExt as _;
@@ -216,7 +218,7 @@ mod tests {
         Action, TestCancellationToken, assert_result_error_with_message, create_log_path_with_size,
         test_schema_flat_with_column_mapping,
     };
-    use crate::{CancellationTokenRef, Version};
+    use crate::{CancellationTokenRef, Error, Version};
 
     const TABLE_ROOT: &str = "memory:///";
     const ROOT_PATH: &str = "metadata/root.parquet";
@@ -261,20 +263,6 @@ mod tests {
     ) -> CheckpointAction {
         let root = write_manifest(engine, table_root().join(ROOT_PATH).unwrap(), entries);
         checkpoint_action_with_root(ROOT_PATH, root.size as i64, version).unwrap()
-    }
-
-    /// The non-null `<action>.path` leaf values of `batch`, as replay reads them, or none if it
-    /// lacks the action column.
-    fn action_paths(batch: &RecordBatch, action: &str) -> Vec<String> {
-        let Some(column) = batch.column_by_name(action) else {
-            return vec![];
-        };
-        let paths = column
-            .as_struct()
-            .column_by_name("path")
-            .unwrap()
-            .as_string::<i32>();
-        paths.iter().flatten().map(str::to_string).collect()
     }
 
     /// A read batch's `(is_log_batch, add paths, remove paths)`.
@@ -589,7 +577,7 @@ mod tests {
             CHECKPOINT_READ_SCHEMA.clone(),
             None,
         );
-        assert!(matches!(result, Err(KernelError::Cancelled)));
+        assert!(matches!(result, Err(Error::Kernel(KernelError::Cancelled))));
     }
 
     #[test]

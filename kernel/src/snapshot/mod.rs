@@ -3,7 +3,9 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-#[cfg(feature = "adaptive-metadata-in-dev")]
+#[cfg(feature = "declarative-plans")]
+use std::sync::Mutex;
+#[cfg(any(feature = "adaptive-metadata-in-dev", feature = "declarative-plans"))]
 use std::sync::OnceLock;
 use std::time::Instant;
 
@@ -18,6 +20,8 @@ use crate::actions::visitors::SetTransactionMap;
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::actions::{CheckpointAction, LastManifestCommit};
 use crate::actions::{DomainMetadata, INTERNAL_DOMAIN_PREFIX, LOG_DOMAIN_METADATA_SCHEMA};
+#[cfg(feature = "declarative-plans")]
+use crate::checkpoint::CheckpointShape;
 use crate::checkpoint::{
     CheckpointSpec, CheckpointWriter, DEFAULT_FILE_ACTIONS_PER_SIDECAR_HINT, V2CheckpointConfig,
     ensure_standalone_checkpoint_supported,
@@ -55,7 +59,8 @@ use crate::table_properties::TableProperties;
 use crate::transaction::{UpdateTableOperation, UpdateTableTransactionBuilder};
 use crate::utils::require;
 use crate::{
-    Engine, KernelError, KernelResult, KernelResultIterator, LogCompactionWriter, Version,
+    DeltaError, Engine, Error, KernelError, KernelResult, KernelResultIterator,
+    LogCompactionWriter, Result, Version,
 };
 
 #[cfg(all(test, feature = "adaptive-metadata-in-dev"))]
@@ -126,6 +131,11 @@ pub struct Snapshot {
     built_as_latest: bool,
     /// Whether the last applicable incremental build requested ignoring new checkpoints.
     skipped_new_checkpoints: bool,
+    /// Complete state for the frozen segment. Shared with scan plans; failed reads are not cached.
+    #[cfg(feature = "declarative-plans")]
+    checkpoint_info: OnceLock<Option<Arc<CheckpointShape>>>,
+    #[cfg(feature = "declarative-plans")]
+    checkpoint_info_init: Mutex<()>,
     /// This snapshot's latest AMT `checkpoint` action (see
     /// [`Snapshot::latest_checkpoint_action`]), filled at build time when P&M replay or the
     /// committing transaction captured it, else on the first successful lookup (a failed
@@ -226,7 +236,7 @@ impl Snapshot {
     pub(crate) fn new(
         log_segment: LogSegment,
         table_configuration: TableConfiguration,
-    ) -> KernelResult<Self> {
+    ) -> Result<Self> {
         Self::new_with_crc(
             log_segment,
             table_configuration,
@@ -247,7 +257,7 @@ impl Snapshot {
         crc: Option<Arc<Crc>>,
         built_as_latest: bool,
         skipped_new_checkpoints: bool,
-    ) -> KernelResult<Self> {
+    ) -> Result<Self> {
         let crc = Self::validate_configuration_and_crc(&log_segment, &table_configuration, crc)?;
         Ok(Self::new_with_validated_crc(
             log_segment,
@@ -268,13 +278,13 @@ impl Snapshot {
         log_segment: &LogSegment,
         table_configuration: &TableConfiguration,
         crc: Option<Arc<Crc>>,
-    ) -> KernelResult<SnapshotCrc> {
+    ) -> Result<SnapshotCrc> {
         table_configuration.ensure_operation_supported(Operation::SnapshotLoad)?;
-        SnapshotCrc::try_new(
+        Ok(SnapshotCrc::try_new(
             crc,
             table_configuration.version(),
             log_segment.checkpoint_version,
-        )
+        )?)
     }
 
     /// `captured_checkpoint_action` is the latest checkpoint action when the build already has it
@@ -315,6 +325,10 @@ impl Snapshot {
             crc,
             built_as_latest,
             skipped_new_checkpoints,
+            #[cfg(feature = "declarative-plans")]
+            checkpoint_info: OnceLock::new(),
+            #[cfg(feature = "declarative-plans")]
+            checkpoint_info_init: Mutex::new(()),
             #[cfg(feature = "adaptive-metadata-in-dev")]
             checkpoint_action: match captured_checkpoint_action {
                 Some(action) => OnceLock::from(Some(action)),
@@ -323,6 +337,42 @@ impl Snapshot {
             #[cfg(feature = "adaptive-metadata-in-dev")]
             last_manifest_commit,
         }
+    }
+
+    /// Returns only completed metadata, without waiting for or starting checkpoint discovery.
+    #[cfg(feature = "declarative-plans")]
+    pub(crate) fn cached_checkpoint_info(&self) -> Option<&Option<Arc<CheckpointShape>>> {
+        self.checkpoint_info.get()
+    }
+
+    /// Resolve checkpoint state once, without caching failures or holding an engine reference.
+    #[cfg(feature = "declarative-plans")]
+    pub(crate) fn checkpoint_info(
+        &self,
+        engine: &dyn Engine,
+    ) -> KernelResult<Option<Arc<CheckpointShape>>> {
+        if let Some(resolved) = self.checkpoint_info.get() {
+            return Ok(resolved.clone());
+        }
+        // Fallible OnceLock initialization is unstable on our MSRV. Serialize discovery so
+        // concurrent callers share one result while errors leave initialization retryable.
+        let _guard = self
+            .checkpoint_info_init
+            .lock()
+            // A panicking initializer cannot publish partial state, so retry after poisoning.
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(resolved) = self.checkpoint_info.get() {
+            return Ok(resolved.clone());
+        }
+        let resolved = if self.log_segment.listed.checkpoint_parts.is_empty() {
+            None
+        } else {
+            let executor = engine.require_plan_executor()?;
+            CheckpointShape::resolve(executor.as_ref(), self.log_segment())?.map(Arc::new)
+        };
+        // All initializers hold the mutex; publish only after every fallible operation succeeds.
+        let _ = self.checkpoint_info.set(resolved.clone());
+        Ok(resolved)
     }
 
     /// The latest AMT `checkpoint` action this snapshot covers, or `None` when the table has no
@@ -392,7 +442,7 @@ impl Snapshot {
         metric_context: SnapshotLoadMetricContext,
         incremental_replay: IncrementalReplay,
         built_as_latest: bool,
-    ) -> KernelResult<Self> {
+    ) -> Result<Self> {
         let PreparedSnapshot {
             table_configuration,
             crc,
@@ -430,7 +480,7 @@ impl Snapshot {
         metric_context: &SnapshotLoadMetricContext,
         incremental_replay: IncrementalReplay,
         built_as_latest: bool,
-    ) -> KernelResult<PreparedSnapshot> {
+    ) -> Result<PreparedSnapshot> {
         Self::resolve_table_configuration_and_crc(
             location,
             log_segment,
@@ -457,7 +507,7 @@ impl Snapshot {
         engine: &dyn Engine,
         metric_context: &SnapshotLoadMetricContext,
         incremental_replay: IncrementalReplay,
-    ) -> KernelResult<PreparedSnapshot> {
+    ) -> Result<PreparedSnapshot> {
         let pm_start = std::time::Instant::now();
 
         // Step 1: read the latest on-disk CRC and, if usable, advance it to the end version
@@ -484,13 +534,26 @@ impl Snapshot {
             Some((crc, crc_source)) => PmResolution::from_crc(crc, *crc_source),
             None => log_segment
                 .read_protocol_metadata_opt(engine, base_crc.as_ref())
+                .map_err(|error| {
+                    match (error.without_backtrace(), log_segment.checkpoint_version) {
+                        (KernelError::FileNotFound(_), Some(checkpoint)) => {
+                            Error::Delta(DeltaError::log_file_not_found(
+                                log_segment.end_version,
+                                checkpoint,
+                                &log_segment.log_root,
+                                Some(Box::new(error)),
+                            ))
+                        }
+                        _ => Error::Kernel(error),
+                    }
+                })
                 .inspect_err(|_| emit_protocol_metadata_load_failure(metric_context))?,
         };
 
         // Fresh snapshot creation requires both Protocol and Metadata to be present.
         let fail = |e| {
             emit_protocol_metadata_load_failure(metric_context);
-            Err(e)
+            Err(Error::Kernel(e))
         };
         let (metadata, protocol) = match (metadata, protocol) {
             (Some(metadata), Some(protocol)) => (metadata, protocol),
@@ -539,23 +602,23 @@ impl Snapshot {
         commit: ParsedLogPath,
         crc_delta: CrcDelta,
         #[cfg(feature = "adaptive-metadata-in-dev")] checkpoint_action: Option<CheckpointAction>,
-    ) -> KernelResult<Self> {
+    ) -> Result<Self> {
         require!(
             commit.is_commit(),
-            KernelError::internal_error(format!(
+            Error::Kernel(KernelError::internal_error(format!(
                 "Cannot create post-commit Snapshot. Log file is not a commit file. \
                 Path: {}, Type: {:?}.",
                 commit.location.location, commit.file_type
-            ))
+            )))
         );
         let read_version = self.version();
         let new_version = commit.version;
         require!(
             new_version == read_version.wrapping_add(1),
-            KernelError::internal_error(format!(
+            Error::Kernel(KernelError::internal_error(format!(
                 "Cannot create post-commit Snapshot. Log file version ({new_version}) does not \
                 equal Snapshot version ({read_version}) + 1."
-            ))
+            )))
         );
 
         let new_table_configuration = TableConfiguration::new_post_commit(
@@ -719,6 +782,7 @@ impl Snapshot {
     ///   filename / extension / Url string heap.
     /// - Vec buffer capacity (`capacity * size_of::<ParsedLogPath>()`) for the three Vec fields on
     ///   `LogSegmentFiles`.
+    /// - Cached checkpoint sidecar descriptors and their Url strings, after resolution.
     /// - The log root Url string.
     /// - The raw `schemaString` JSON on table metadata.
     ///
@@ -730,17 +794,32 @@ impl Snapshot {
     /// Other variables' contributions to heap size are relatively small, so they are not counted
     /// here.
     ///
-    /// Runs in O(n) over listed log files.
+    /// Runs in O(n) over listed log files and cached sidecars.
     ///
     /// TODO(#2757): Optimize the estimation accuracy.
     pub fn estimated_owned_heap_size_bytes(&self) -> usize {
-        self.log_segment.listed.estimated_heap_size_bytes()
+        let size = self.log_segment.listed.estimated_heap_size_bytes()
             + self.log_segment.log_root.as_str().len()
             + self
                 .table_configuration()
                 .metadata()
                 .schema_string()
-                .capacity()
+                .capacity();
+        #[cfg(feature = "declarative-plans")]
+        let size = size
+            + self
+                .checkpoint_info
+                .get()
+                .and_then(Option::as_ref)
+                .map(|info| info.sidecars.as_ref())
+                .map_or(0, |sidecars| {
+                    std::mem::size_of_val(sidecars)
+                        + sidecars
+                            .iter()
+                            .map(|file| file.location.as_str().len())
+                            .sum::<usize>()
+                });
+        size
     }
 
     /// Get the [`TableProperties`] for this [`Snapshot`].
@@ -1415,7 +1494,7 @@ impl Snapshot {
     pub fn create_checkpoint_writer(
         self: Arc<Self>,
         engine: &dyn Engine,
-    ) -> KernelResult<CheckpointWriter> {
+    ) -> Result<CheckpointWriter> {
         CheckpointWriter::try_new(self, engine)
     }
 
@@ -1475,7 +1554,7 @@ impl Snapshot {
     pub fn write_checksum(
         self: &SnapshotRef,
         engine: &dyn Engine,
-    ) -> KernelResult<(ChecksumWriteResult, SnapshotRef)> {
+    ) -> Result<(ChecksumWriteResult, SnapshotRef)> {
         let has_crc_on_disk = self
             .log_segment
             .listed
@@ -1522,7 +1601,7 @@ impl Snapshot {
                     .record("outcome", ChecksumWriteOutcome::AlreadyExists.as_ref());
                 Ok((ChecksumWriteResult::AlreadyExists, Arc::clone(self)))
             }
-            Err(e) => Err(e),
+            Err(e) => Err(Error::Kernel(e)),
         }
     }
 
@@ -1679,7 +1758,7 @@ impl Snapshot {
         self: &SnapshotRef,
         engine: &dyn Engine,
         spec: Option<&CheckpointSpec>,
-    ) -> KernelResult<(CheckpointWriteResult, SnapshotRef)> {
+    ) -> Result<(CheckpointWriteResult, SnapshotRef)> {
         let start = Instant::now();
         let span = tracing::Span::current();
         if self.log_segment.checkpoint_version == Some(self.log_segment.end_version) {
@@ -1705,25 +1784,25 @@ impl Snapshot {
         match spec {
             Some(CheckpointSpec::V2(cfg)) => {
                 if !v2_supported {
-                    return Err(KernelError::checkpoint_write(
+                    return Err(Error::Kernel(KernelError::checkpoint_write(
                         "CheckpointSpec::V2 requires the v2Checkpoint table feature to be supported",
-                    ));
+                    )));
                 }
                 if let V2CheckpointConfig::WithSidecar {
                     file_actions_per_sidecar_hint: Some(0),
                 } = cfg
                 {
-                    return Err(KernelError::checkpoint_write(
+                    return Err(Error::Kernel(KernelError::checkpoint_write(
                         "file_actions_per_sidecar_hint must be greater than 0",
-                    ));
+                    )));
                 }
             }
             Some(CheckpointSpec::V1) if v2_supported => {
                 // TODO: remove this once we support writing V1 checkpoints even if table supports
                 // v2Checkpoint See <https://github.com/delta-io/delta-kernel-rs/issues/2454>.
-                return Err(KernelError::unsupported(
+                return Err(Error::Kernel(KernelError::unsupported(
                     "Kernel does not support writing V1 checkpoints when the table supports v2Checkpoint",
-                ));
+                )));
             }
             _ => {}
         }
@@ -1763,7 +1842,7 @@ impl Snapshot {
                 span.record("outcome", CheckpointWriteOutcome::AlreadyExists.as_ref());
                 return Ok((CheckpointWriteResult::AlreadyExists, Arc::clone(self)));
             }
-            Err(e) => return Err(e),
+            Err(e) => return Err(Error::Kernel(e)),
         };
 
         // Freeze duration before hint publication. ReportGeneratorLayer waits for the final API
@@ -1814,8 +1893,8 @@ impl Snapshot {
     /// like checkpointing.
     ///
     /// The returned snapshot uses published paths for commits known to be published, even when
-    /// no new commits need copying. The returned snapshot keeps the staged files' sizes and
-    /// modification times.
+    /// no new commits need copying. Each replaced reference carries the published file's size and
+    /// modification time, read from storage.
     ///
     /// The input snapshot keeps its original paths. Use the returned snapshot for reads after
     /// staged commit files are removed.
@@ -1826,8 +1905,9 @@ impl Snapshot {
     ///
     /// # Errors
     ///
-    /// Returns an error if the publish operation fails, or if there are catalog commits that need
-    /// publishing but the table or committer don't support publishing.
+    /// Returns an error if publication or reading the published files' metadata fails, or if there
+    /// are catalog commits that need publishing but the table or committer don't support
+    /// publishing. Publication may have succeeded even if a metadata read fails.
     ///
     /// # See Also
     ///
@@ -1837,7 +1917,8 @@ impl Snapshot {
         self: &SnapshotRef,
         engine: &dyn Engine,
         committer: &dyn Committer,
-    ) -> KernelResult<SnapshotRef> {
+    ) -> Result<SnapshotRef> {
+        // TODO(#3929): Emit metrics for commits submitted, metadata lookups, duration, and outcome.
         let unpublished_catalog_commits = self.log_segment().get_unpublished_catalog_commits()?;
 
         let max_published_version = if unpublished_catalog_commits.is_empty() {
@@ -1850,24 +1931,24 @@ impl Snapshot {
                 unpublished_catalog_commits
                     .array_windows()
                     .all(|[a, b]| a.version() + 1 == b.version()),
-                KernelError::generic(format!(
+                Error::Kernel(KernelError::generic(format!(
                     "Expected ordered and contiguous unpublished catalog commits. \
                  Got: {unpublished_catalog_commits:?}"
-                ))
+                )))
             );
 
             require!(
                 self.table_configuration().is_catalog_managed(),
-                KernelError::generic(
+                Error::Kernel(KernelError::generic(
                     "There are catalog commits that need publishing, but the table is not catalog-managed.",
-                )
+                ))
             );
 
             require!(
                 committer.is_catalog_committer(),
-                KernelError::generic(
+                Error::Kernel(KernelError::generic(
                     "There are catalog commits that need publishing, but the committer is not a catalog committer.",
-                )
+                ))
             );
 
             let publish_metadata =
@@ -1877,7 +1958,10 @@ impl Snapshot {
             Some(self.version())
         };
 
-        let Some(log_segment) = self.log_segment().new_as_published(max_published_version)? else {
+        let Some(log_segment) = self
+            .log_segment()
+            .new_as_published(engine, max_published_version)?
+        else {
             return Ok(Arc::clone(self));
         };
 
@@ -1915,6 +1999,7 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::Arc;
 
+    use bytes::Bytes;
     use rstest::rstest;
     use serde_json::json;
     use test_utils::table_builder::{
@@ -1949,9 +2034,9 @@ mod tests {
         create_log_path, string_array_to_engine_data,
     };
     use crate::utils::FoldWithOption as _;
-    use crate::{FilteredEngineData, Result};
+    use crate::{FilteredEngineData, KernelError, Result};
 
-    /// Records versions passed to `publish` and can fail the first call.
+    /// Records publication requests and optionally fails once. Tests supply destination files.
     #[derive(Default)]
     struct RecordingPublishCommitter {
         calls: RefCell<Vec<Vec<Version>>>,
@@ -1988,8 +2073,7 @@ mod tests {
         }
     }
 
-    /// Builds a version 2 snapshot with checkpoint 0 and ratified staged commits 1 and 2.
-    /// No files are created, so any attempt to read the commits must fail.
+    /// Builds a version 2 snapshot with checkpoint 0 and staged commits 1 and 2, without I/O.
     fn snapshot_with_staged_commits(
         max_published_version: Option<Version>,
         crc_version: Option<Version>,
@@ -2051,6 +2135,37 @@ mod tests {
         Arc::new(Snapshot::new_with_crc(segment, configuration, crc, true, true).unwrap())
     }
 
+    fn engine_with_published_commits() -> SyncEngine {
+        let engine = SyncEngine::new_with_store(Arc::new(InMemory::new()));
+        let storage = engine.storage_handler();
+        for version in [1, 2] {
+            let location = Url::parse(&format!(
+                "memory:///publication/_delta_log/{version:020}.json"
+            ))
+            .unwrap();
+            storage
+                .put(&location, Bytes::from(vec![b' '; version]), false)
+                .unwrap();
+        }
+        engine
+    }
+
+    fn assert_published_references_match_storage(snapshot: &Snapshot, engine: &dyn Engine) {
+        let listed = &snapshot.log_segment().listed;
+        let storage = engine.storage_handler();
+        for file in listed
+            .ascending_commit_files
+            .iter()
+            .chain(listed.latest_commit_file.iter())
+        {
+            assert_eq!(file.file_type, LogPathFileType::Commit);
+            assert_eq!(
+                file.location,
+                storage.head(&file.location.location).unwrap()
+            );
+        }
+    }
+
     #[rstest]
     #[case::both_commits_need_publishing(None, vec![vec![1, 2]])]
     #[case::commit_2_needs_publishing(Some(1), vec![vec![2]])]
@@ -2061,13 +2176,15 @@ mod tests {
         #[values(None, Some(0), Some(2))] crc_version: Option<Version>,
         #[values(false, true)] observed_crc: bool,
     ) {
-        // GIVEN: staged paths for commits 1 and 2, with neither, one, or both already published.
+        // GIVEN: staged paths for commits 1 and 2, with publication recorded for neither,
+        // one, or both commits.
         let source = snapshot_with_staged_commits(max_published_version, crc_version, observed_crc);
+        let engine = engine_with_published_commits();
         let original_segment = source.log_segment().clone();
         let committer = RecordingPublishCommitter::default();
 
         // WHEN: publish the remaining commits and return a snapshot with published paths.
-        let published = source.publish(&PanicEngine, &committer).unwrap();
+        let published = source.publish(&engine, &committer).unwrap();
 
         // THEN: request publication only for unpublished commits; keep version, metadata, and CRC.
         assert_eq!(*committer.calls.borrow(), expected_calls);
@@ -2104,14 +2221,15 @@ mod tests {
                 .listed
                 .ascending_commit_files
                 .iter()
-                .map(|file| (file.version, file.file_type.clone()))
+                .map(|file| file.version)
                 .collect::<Vec<_>>(),
-            vec![(1, LogPathFileType::Commit), (2, LogPathFileType::Commit)]
+            vec![1, 2]
         );
         assert_eq!(
             actual.listed.latest_commit_file.as_ref(),
             actual.listed.ascending_commit_files.last()
         );
+        assert_published_references_match_storage(&published, &engine);
         match (published.base_crc(), source.base_crc()) {
             (Some(actual), Some(expected)) => assert!(Arc::ptr_eq(actual, expected)),
             (None, None) => {}
@@ -2136,6 +2254,7 @@ mod tests {
     ) {
         // GIVEN: checkpoint 2 and a staged latest_commit_file, with no at-version CRC.
         let source = snapshot_with_staged_commits(published_through, None, false);
+        let engine = engine_with_published_commits();
         let segment = source
             .log_segment()
             .try_new_with_checkpoint(create_log_path(
@@ -2155,8 +2274,13 @@ mod tests {
         let original_segment = source.log_segment().clone();
 
         // WHEN: publish with nothing left in ascending_commit_files to copy.
+        let publish_engine: &dyn Engine = if published_through == Some(2) {
+            &engine
+        } else {
+            &PanicEngine
+        };
         let result = source
-            .publish(&PanicEngine, &FileSystemCommitter::new())
+            .publish(publish_engine, &FileSystemCommitter::new())
             .unwrap();
 
         // THEN: replace latest_commit_file only if version 2 is known to be published.
@@ -2178,7 +2302,7 @@ mod tests {
             .as_ref()
             .unwrap();
         if published_through == Some(2) {
-            assert_eq!(latest.file_type, LogPathFileType::Commit);
+            assert_published_references_match_storage(&result, &engine);
             result.log_segment().validate_published().unwrap();
         } else {
             assert_eq!(latest.file_type, LogPathFileType::StagedCommit);
@@ -2192,6 +2316,7 @@ mod tests {
     fn test_publish_retry_after_committer_failure() {
         // GIVEN: commit 1 is published, and the committer fails its first attempt to publish 2.
         let source = snapshot_with_staged_commits(Some(1), Some(0), true);
+        let engine = engine_with_published_commits();
         let original_segment = source.log_segment().clone();
         let committer = RecordingPublishCommitter {
             fail_once: Cell::new(true),
@@ -2206,20 +2331,57 @@ mod tests {
         assert_eq!(source.log_segment(), &original_segment);
 
         // WHEN: retry publication from the same input snapshot.
-        let result = source.publish(&PanicEngine, &committer).unwrap();
+        let result = source.publish(&engine, &committer).unwrap();
 
         // THEN: retry commit 2 and return published paths for both commits.
         assert_eq!(*committer.calls.borrow(), vec![vec![2], vec![2]]);
         assert_eq!(result.log_segment().listed.max_published_version, Some(2));
-        assert!(
-            result
-                .log_segment()
-                .listed
-                .ascending_commit_files
-                .iter()
-                .all(|file| file.file_type == LogPathFileType::Commit)
-        );
+        assert_published_references_match_storage(&result, &engine);
         assert_eq!(source.log_segment(), &original_segment);
+    }
+
+    #[rstest]
+    #[case::after_committer_success(Some(1), 1)]
+    #[case::already_published(Some(2), 0)]
+    fn test_publish_retry_after_missing_published_file(
+        #[case] max_published_version: Option<Version>,
+        #[case] calls_per_attempt: usize,
+    ) {
+        // GIVEN: commit 1 exists, but commit 2 is missing from storage.
+        let source = snapshot_with_staged_commits(max_published_version, None, false);
+        let engine = engine_with_published_commits();
+        let original_segment = source.log_segment().clone();
+        let destination = original_segment
+            .log_root
+            .join("00000000000000000002.json")
+            .unwrap();
+        let storage = engine.storage_handler();
+        storage.delete(&destination).unwrap();
+        let committer = RecordingPublishCommitter::default();
+
+        // WHEN: resolve the published references while commit 2 is missing.
+        let result = source.publish(&engine, &committer);
+
+        // THEN: report the missing file and leave the original segment unchanged.
+        assert!(matches!(
+            result,
+            Err(Error::Kernel(KernelError::FileNotFound(_)))
+        ));
+        assert_eq!(*committer.calls.borrow(), vec![vec![2]; calls_per_attempt]);
+        assert_eq!(source.log_segment(), &original_segment);
+
+        // WHEN: restore commit 2 and retry from the same snapshot.
+        storage
+            .put(&destination, Bytes::from_static(b"published"), false)
+            .unwrap();
+        let published = source.publish(&engine, &committer).unwrap();
+
+        // THEN: return destination metadata, repeating publication if it was needed.
+        assert_published_references_match_storage(&published, &engine);
+        assert_eq!(
+            *committer.calls.borrow(),
+            vec![vec![2]; 2 * calls_per_attempt]
+        );
     }
 
     #[rstest]
@@ -2288,6 +2450,7 @@ mod tests {
     fn test_publish_returns_original_filesystem_snapshot() {
         // GIVEN: a filesystem-managed snapshot containing only published commit paths.
         let mut source = snapshot_with_staged_commits(Some(2), None, false);
+        let engine = engine_with_published_commits();
         let snapshot = Arc::get_mut(&mut source).unwrap();
         snapshot.table_configuration = MockTableConfigurationBuilder::new()
             .with_table_root("memory:///publication/")
@@ -2295,7 +2458,7 @@ mod tests {
             .build();
         snapshot.log_segment = snapshot
             .log_segment
-            .new_as_published(Some(2))
+            .new_as_published(&engine, Some(2))
             .unwrap()
             .unwrap();
 
@@ -2395,12 +2558,14 @@ mod tests {
     fn create_snapshot_with_commit_file_absent_from_log_segment(
         url: &Url,
         table_cfg: TableConfiguration,
-    ) -> KernelResult<Snapshot> {
+    ) -> Result<Snapshot> {
         // Create a log segment with only checkpoint and no commit file (simulating scenario
         // where a checkpoint exists but the commit file has been cleaned up)
         let checkpoint_parts = vec![
             ParsedLogPath::new(crate::FileMeta {
-                location: url.join("_delta_log/00000000000000000000.checkpoint.parquet")?,
+                location: url
+                    .join("_delta_log/00000000000000000000.checkpoint.parquet")
+                    .map_err(KernelError::from)?,
                 last_modified: 0,
                 size: 100,
             })
@@ -2412,8 +2577,12 @@ mod tests {
             ..Default::default()
         };
 
-        let log_segment =
-            LogSegment::try_new(listed_files, url.join("_delta_log/")?, Some(0), None)?;
+        let log_segment = LogSegment::try_new(
+            listed_files,
+            url.join("_delta_log/").map_err(KernelError::from)?,
+            Some(0),
+            None,
+        )?;
 
         Snapshot::new_with_crc(
             log_segment,

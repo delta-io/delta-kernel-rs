@@ -76,7 +76,7 @@ use delta_kernel::snapshot::ChecksumWriteResult;
 use delta_kernel::table_features::TableFeature;
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
-use delta_kernel::{Engine, KernelResult, Snapshot};
+use delta_kernel::{Engine, KernelResult, Result, Snapshot};
 use delta_kernel_default_engine::executor::TaskExecutor;
 use delta_kernel_default_engine::executor::tokio::{
     TokioBackgroundExecutor, TokioMultiThreadExecutor,
@@ -108,10 +108,11 @@ pub const DEFAULT_SWEEP_MID_VERSION: u64 = 5;
 /// A multi-threaded runtime is required so kernel operations that call
 /// `block_in_place` (e.g. `Snapshot::checkpoint`) do not deadlock, which is why
 /// the sync wrappers in this module all route through this helper.
-fn block_on_sync<F, Fut, T>(make_fut: F) -> KernelResult<T>
+fn block_on_sync<F, Fut, T, E>(make_fut: F) -> std::result::Result<T, E>
 where
     F: FnOnce() -> Fut + Send,
-    Fut: std::future::Future<Output = KernelResult<T>>,
+    Fut: std::future::Future<Output = std::result::Result<T, E>>,
+    E: From<delta_kernel::KernelError> + Send,
     T: Send,
 {
     std::thread::scope(|s| {
@@ -1264,12 +1265,12 @@ impl TestTableBuilder {
     /// # Panics
     /// Panics if [`LastCheckpointHintState::Stale`] is paired with fewer than two
     /// checkpoints.
-    pub fn build(self) -> KernelResult<TestTable> {
+    pub fn build(self) -> Result<TestTable> {
         validate_log_state(&self.log_state);
         block_on_sync(|| self.build_async())
     }
 
-    async fn build_async(self) -> KernelResult<TestTable> {
+    async fn build_async(self) -> Result<TestTable> {
         let store: Arc<DynObjectStore> = Arc::new(InMemory::new());
         let table_root = "memory:///";
         let executor = Arc::new(TokioMultiThreadExecutor::new(
@@ -1373,7 +1374,7 @@ impl TestTableBuilder {
             LastCheckpointHintState::Present => {}
             LastCheckpointHintState::Missing => match store.delete(&resolved_hint_path).await {
                 Ok(()) | Err(ObjectStoreError::NotFound { .. }) => {}
-                Err(e) => return Err(delta_kernel::KernelError::from(e)),
+                Err(e) => return Err(delta_kernel::KernelError::from(e).into()),
             },
             LastCheckpointHintState::Stale => {
                 // Restore the hint bytes captured after the lowest checkpoint write.
@@ -1427,7 +1428,7 @@ impl TestTableBuilder {
 /// Write a CRC file via kernel's checksum writer. Builder invariant: the snapshot
 /// comes from a post-commit handoff on a fresh in-memory table, so the CRC for
 /// that version cannot already exist on disk.
-fn write_crc(snapshot: &Arc<Snapshot>, engine: &dyn Engine) -> KernelResult<()> {
+fn write_crc(snapshot: &Arc<Snapshot>, engine: &dyn Engine) -> Result<()> {
     let (result, _) = snapshot.write_checksum(engine)?;
     assert_eq!(
         result,
@@ -1451,7 +1452,7 @@ async fn write_data_commit<E: TaskExecutor>(
     rows_per_file: usize,
     partition_columns: &[String],
     version: u64,
-) -> KernelResult<delta_kernel::transaction::CommitResult> {
+) -> Result<delta_kernel::transaction::CommitResult> {
     let logical_schema = snapshot.schema().clone();
     let arrow_schema: ArrowSchema = TryFromKernel::try_from_kernel(logical_schema.as_ref())
         .map_err(|e| delta_kernel::KernelError::generic(e.to_string()))?;
@@ -2036,7 +2037,7 @@ mod tests {
     }
 
     #[test]
-    fn test_data_skipping_table_properties_in_metadata() -> KernelResult<()> {
+    fn test_data_skipping_table_properties_in_metadata() -> delta_kernel::Result<()> {
         let table = TestTableBuilder::new()
             .with_table_config(
                 TableConfig::new()
@@ -2074,7 +2075,7 @@ mod tests {
 
     /// Verifies every common table config builds successfully.
     #[rstest_reuse::apply(table_configs)]
-    fn test_all_table_configs_build(table_config: TableConfig) -> KernelResult<()> {
+    fn test_all_table_configs_build(table_config: TableConfig) -> delta_kernel::Result<()> {
         TestTableBuilder::new()
             .with_table_config(table_config)
             .build()?;
@@ -2087,7 +2088,9 @@ mod tests {
     #[rstest::rstest]
     #[case::default_hint(None)]
     #[case::explicit_hint(Some(1))]
-    fn test_v2_sidecars_emit_sidecar_files(#[case] hint: Option<usize>) -> KernelResult<()> {
+    fn test_v2_sidecars_emit_sidecar_files(
+        #[case] hint: Option<usize>,
+    ) -> delta_kernel::Result<()> {
         let log_state = LogState::with_latest_version(2)
             .with_checkpoint_at([1])
             .with_sidecars_if_enabled(hint);
@@ -2107,7 +2110,7 @@ mod tests {
     /// `with_sidecars_if_enabled` without the `v2Checkpoint` feature is a no-op:
     /// the table builds (no error) and no sidecar directory is produced.
     #[test]
-    fn test_v2_sidecars_silently_ignored_without_v2_feature() -> KernelResult<()> {
+    fn test_v2_sidecars_silently_ignored_without_v2_feature() -> delta_kernel::Result<()> {
         let log_state = LogState::with_latest_version(2)
             .with_checkpoint_at([1])
             .with_sidecars_if_enabled(None);
@@ -2465,7 +2468,7 @@ mod tests {
     fn test_builder_writes_crc_with_correct_content(
         #[case] features: FeatureSet,
         #[case] expect_ict: bool,
-    ) -> KernelResult<()> {
+    ) -> delta_kernel::Result<()> {
         let log_state = LogState::with_latest_version(2)
             .with_checkpoint_at([2])
             .with_crc_at([2]);
