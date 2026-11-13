@@ -366,7 +366,9 @@ impl LogSegment {
     }
 
     /// The commit cover, plus the newest commit when a log compaction covers it: compactions drop
-    /// commitInfo, which carries the newest `lastManifestCommit`.
+    /// commitInfo, which carries the newest `lastManifestCommit`. Only that commitInfo is needed
+    /// from the newest commit; the compaction is still generally cheaper to read than the commits
+    /// it replaces.
     #[cfg(all(feature = "adaptive-metadata-in-dev", feature = "declarative-plans"))]
     fn pm_commit_cover_paths(&self) -> Vec<&ParsedLogPath> {
         let mut paths = self.find_commit_cover_paths(None);
@@ -470,7 +472,8 @@ impl PmReplaySegment {
     }
 
     /// The version of the commit in `log_segment` whose checkpoint action the plan keeps. Any other
-    /// commit's action is older than the one replay takes. Log compactions carry none.
+    /// commit's action is older than the one replay takes. Log compactions carry no checkpoint
+    /// action.
     fn checkpoint_action_version(self, log_segment: &LogSegment) -> Option<Version> {
         match self {
             // A CRC or checkpoint file bounds this replay, so it needs no checkpoint action.
@@ -635,7 +638,8 @@ impl PmCandidate {
 
     /// Folds `other`, parsed from a batch replay reached later, into this result. Each field keeps
     /// its higher-versioned value, so the order batches merge in only matters on a version tie,
-    /// where `other` wins.
+    /// where `other` wins. Once the pointer and the checkpoint action it names are both known, the
+    /// action's nested P&M are also candidates.
     fn merge(self, other: PmCandidate) -> Self {
         #[cfg(feature = "adaptive-metadata-in-dev")]
         let brings_amt = other.checkpoint.is_some() || other.last_manifest_commit.is_some();
@@ -845,9 +849,10 @@ fn pm_plan_schema(extra_actions: &[PmPlanExtraAction]) -> KernelResult<SchemaRef
     Ok(Arc::new(StructType::try_new(actions.chain([version]))?))
 }
 
-/// The Protocol and Metadata in `batch`, tagged with its versions, plus any AMT checkpoint action,
-/// tagged with its commit's version, whose nested P&M rank at its `checkpointMetadata.version`, and
-/// the newest commit's `lastManifestCommit`.
+/// The Protocol and Metadata in `batch`, tagged with their versions. Under AMT, also any checkpoint
+/// action, tagged with the version of the commit it was read from, and the newest commit's
+/// `lastManifestCommit`. The action's nested P&M are candidates at its
+/// `checkpointMetadata.version`.
 fn pm_candidate(batch: &VersionedBatch) -> KernelResult<PmCandidate> {
     let actions = batch.actions.as_ref();
     let protocol = batch
@@ -1295,13 +1300,14 @@ mod tests {
         // read from; `content_root` tells the two sides of a tie apart.
         #[cfg(feature = "adaptive-metadata-in-dev")]
         #[rstest]
-        #[case::self_newer(2, 1, 2)]
-        #[case::other_newer(1, 2, 2)]
-        #[case::tie_goes_to_other(1, 1, 1)]
+        #[case::self_newer(2, 1, 2, 0)]
+        #[case::other_newer(1, 2, 2, 1)]
+        #[case::tie_goes_to_other(1, 1, 1, 1)]
         fn test_merge_keeps_newer_amt_fields(
             #[case] self_version: i64,
             #[case] other_version: i64,
             #[case] expected_version: i64,
+            #[case] expected_content_root: i64,
         ) {
             let amt = |version: i64, content_root: i64| PmCandidate {
                 checkpoint: Some((
@@ -1312,7 +1318,6 @@ mod tests {
                 ..Default::default()
             };
             let merged = amt(self_version, 0).merge(amt(other_version, 1));
-            let expected_content_root = if other_version >= self_version { 1 } else { 0 };
             let (checkpoint_version, action) = merged.checkpoint.unwrap();
             assert_eq!(checkpoint_version, expected_version);
             assert_eq!(action.content_root_version(), expected_content_root);
