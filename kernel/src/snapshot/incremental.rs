@@ -421,6 +421,7 @@ impl Snapshot {
             log_root.clone(),
             requested_version,
             None,
+            None,
         )?;
 
         let new_end_version = new_log_segment.end_version;
@@ -497,6 +498,7 @@ impl Snapshot {
         // below the existing snapshot version, trim existing commits and compaction files
         // already covered by it; otherwise keep all existing files.
         let new_checkpoint_version = new_log_segment.checkpoint_version();
+        let checkpoint_type = new_log_segment.checkpoint_type_for_update(existing_log_segment);
         let mut ascending_commit_files = Self::files_after_checkpoint(
             &existing_log_segment.listed.ascending_commit_files,
             new_checkpoint_version,
@@ -526,7 +528,7 @@ impl Snapshot {
                 existing_log_segment.last_checkpoint_metadata.clone(),
             )
         };
-        let mut combined_log_segment = LogSegment::try_new_for_snapshot(
+        let combined_log_segment = LogSegment::try_new_for_snapshot(
             LogSegmentFiles {
                 ascending_commit_files,
                 ascending_compaction_files,
@@ -544,9 +546,9 @@ impl Snapshot {
             log_root,
             requested_version,
             new_checkpoint_hint,
+            checkpoint_type,
         )?;
 
-        combined_log_segment.inherit_checkpoint_type(existing_log_segment);
         Ok(NewSegment::Combined(combined_log_segment))
     }
 
