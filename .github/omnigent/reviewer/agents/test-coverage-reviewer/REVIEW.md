@@ -56,7 +56,8 @@ For each new/changed logic path identified in Step 1, determine:
 
 For delta-kernel-rs changes, check coverage of these scenarios where relevant:
 - **Normal commits** — basic read/write with commit JSON files
-- **Checkpoints** — V1 Parquet, V2 multi-part, checkpoint at version 0
+- **Checkpoints** — V1 classic/multipart, V2 classic/UUID-named with inline actions or sidecars,
+  checkpoint at version 0
 - **CRC files** — `.crc` sidecar validation
 - **Log compaction** — compacted commit files
 - **Time travel** — reading at specific versions
