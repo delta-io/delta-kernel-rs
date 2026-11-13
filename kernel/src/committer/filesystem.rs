@@ -390,14 +390,14 @@ mod tests {
 
     #[cfg(feature = "declarative-plans")]
     #[rstest]
-    #[case::complete(vec![10, 11, 12, 13], None)]
-    #[case::missing_first(vec![12, 13], Some(11))]
-    #[case::missing_middle(vec![11, 13], Some(12))]
-    #[case::missing_terminal(vec![11, 12], Some(13))]
+    #[case::complete(vec![10, 11, 12, 13], Ok(13))]
+    #[case::missing_first(vec![12, 13], Err(11))]
+    #[case::missing_middle(vec![11, 13], Err(12))]
+    #[case::unbounded_ends_at_last_commit(vec![11, 12], Ok(12))]
     #[tokio::test]
-    async fn winning_history_requires_complete_commits_even_with_a_checkpoint(
+    async fn winning_history_validates_listed_commit_range_with_a_checkpoint(
         #[case] versions: Vec<u64>,
-        #[case] missing_version: Option<u64>,
+        #[case] expected: KernelResult<u64, u64>,
         #[values(CommitStyle::Imperative, CommitStyle::Declarative)] style: CommitStyle,
     ) {
         let storage = Arc::new(InMemory::new());
@@ -428,26 +428,26 @@ mod tests {
                 committer.load_winning_commits_declarative(&executor, &root, 11)
             }
         };
-        match missing_version {
-            None => {
+        match expected {
+            Ok(end_version) => {
                 let winners = result.unwrap();
                 assert_eq!(winners.start_version(), 11);
-                assert_eq!(winners.end_version(), 13);
+                assert_eq!(winners.end_version(), end_version);
                 let versions: Vec<_> = winners
                     .commit_files()
                     .unwrap()
                     .map(|file| file.unwrap().version)
                     .collect();
-                assert_eq!(versions, vec![11, 12, 13]);
+                assert_eq!(versions, (11..=end_version).collect::<Vec<_>>());
             }
-            Some(11) => assert!(matches!(
+            Err(11) => assert!(matches!(
                 result,
                 Err(KernelError::StartVersionNotFound {
                     requested: 11,
                     earliest: 12
                 })
             )),
-            Some(version) => assert!(matches!(
+            Err(version) => assert!(matches!(
                 result,
                 Err(KernelError::MissingVersion(missing)) if missing == version
             )),
