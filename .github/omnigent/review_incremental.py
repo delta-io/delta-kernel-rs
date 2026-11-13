@@ -148,6 +148,7 @@ def select_review_diff(
 
 def stamp_complete_review(review: str, base: str, head: str, *, truncated: bool) -> str:
     """Stamp only reviews whose code diff was complete enough to serve as a baseline."""
+    review = REVISION_MARKER.sub("", review).strip()
     return review if truncated else review + "\n\n" + revision_marker(base, head)
 
 
