@@ -132,7 +132,9 @@ pub(crate) fn convert_append_metadata_to_root_entry_batch(
         snapshot_id,
         // TODO(#3319): AMT `location` (Iceberg field id 100) is expected to be the
         // percent-decoded data-file path, but `path` is the raw RFC-2396-encoded `AddFile.path`.
-        // A decode step is needed once kernel has an expression-level percent-decode op.
+        // A decode step is needed once kernel has an expression-level percent-decode op; the
+        // reader percent-encodes `location` into `Add.path`, so until then a tree this builds
+        // reads back double-encoded.
         location: Expression::column([PATH_NAME]),
         file_size_in_bytes: Expression::column([SIZE_NAME]),
         sequence_number: Expression::column([DEFAULT_ROW_COMMIT_VERSION_NAME]),

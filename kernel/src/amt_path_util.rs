@@ -34,7 +34,8 @@ pub(crate) fn resolve_amt_location(path: &str, table_root: &Url) -> KernelResult
 /// Evaluates a STRING AMT `location` to its URI-reference form, as `Add.path` and a `'p'`
 /// deletion vector path carry it: the path component is percent-encoded and a relative location
 /// stays relative. For a location [`resolve_amt_location`] accepts, joining the result onto the
-/// table root gives the same [`Url`].
+/// table root gives the same [`Url`], except for a `file:` or `http(s):` location without `//`,
+/// which `Url::join` resolves against the root.
 pub(crate) fn encode_amt_location_expression(location: Expression) -> Expression {
     Expression::unary(UnaryExpressionOp::UriEncodeFileLocation, location)
 }
@@ -326,7 +327,7 @@ mod tests {
         #[values(resolve_amt_location, resolve_with_encoded_location)] resolve: Resolver,
     ) {
         let table_root = Url::parse(table_root).unwrap();
-        let location = resolve_amt_location(path, &table_root).unwrap();
+        let location = resolve(path, &table_root).unwrap();
         assert_eq!(location.as_str(), expected_location);
     }
 
