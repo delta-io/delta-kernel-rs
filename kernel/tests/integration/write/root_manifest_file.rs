@@ -394,6 +394,8 @@ type Configure = fn(UpdateTableTransactionBuilder) -> UpdateTableTransactionBuil
 
 /// Commits transactions configured by `before`, `manifest`, then `after`, the `manifest` one as a
 /// manifest commit of a root manifest that is never read, and returns a freshly loaded snapshot.
+/// With `remanifest_after`, an empty manifest commit follows, so its checkpoint action has to fold
+/// in the `after` commit.
 fn commit_around_root_manifest(
     engine: &dyn Engine,
     table_url: &Url,
@@ -401,6 +403,7 @@ fn commit_around_root_manifest(
     before: Configure,
     manifest: Configure,
     after: Configure,
+    remanifest_after: bool,
 ) -> Result<SnapshotRef, Box<dyn std::error::Error>> {
     let commit = |snapshot, configure, root_manifest: Option<FileMeta>| {
         let mut txn = begin_transaction_with(
@@ -416,20 +419,32 @@ fn commit_around_root_manifest(
         }
         Ok::<_, Box<dyn std::error::Error>>(txn.commit(engine)?.unwrap_post_commit_snapshot())
     };
-    let root_manifest = FileMeta {
-        location: table_url.join("metadata/root-v2.parquet")?,
-        last_modified: 0,
-        size: 1024,
+    let root_manifest = |name| -> Result<FileMeta, Box<dyn std::error::Error>> {
+        Ok(FileMeta {
+            location: table_url.join(name)?,
+            last_modified: 0,
+            size: 1024,
+        })
     };
     let snapshot = commit(snapshot, before, None)?;
-    let snapshot = commit(snapshot, manifest, Some(root_manifest))?;
-    commit(snapshot, after, None)?;
+    let snapshot = commit(
+        snapshot,
+        manifest,
+        Some(root_manifest("metadata/root-v2.parquet")?),
+    )?;
+    let snapshot = commit(snapshot, after, None)?;
+    if remanifest_after {
+        let file = root_manifest("metadata/root-v4.parquet")?;
+        commit(snapshot, |builder| builder, Some(file))?;
+    }
     Ok(Snapshot::builder_for(table_url.clone()).build(engine)?)
 }
 
+#[rstest]
 #[tokio::test(flavor = "multi_thread")]
-async fn test_app_id_versions_read_across_a_root_manifest_commit()
--> Result<(), Box<dyn std::error::Error>> {
+async fn test_app_id_versions_read_across_a_root_manifest_commit(
+    #[values(false, true)] remanifest_after: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
     let (engine, _temp_dir, table_url, snapshot) =
         setup_adaptive_metadata_table("root_manifest_file_app_id_versions").await?;
 
@@ -443,6 +458,7 @@ async fn test_app_id_versions_read_across_a_root_manifest_commit()
         |builder| builder.with_transaction_id("app-1", 5),
         |builder| builder.with_transaction_id("app-2", 7),
         |builder| builder.with_transaction_id("app-1", 6),
+        remanifest_after,
     )?;
 
     assert_eq!(
@@ -460,9 +476,11 @@ async fn test_app_id_versions_read_across_a_root_manifest_commit()
     Ok(())
 }
 
+#[rstest]
 #[tokio::test(flavor = "multi_thread")]
-async fn test_domain_metadata_read_across_a_root_manifest_commit()
--> Result<(), Box<dyn std::error::Error>> {
+async fn test_domain_metadata_read_across_a_root_manifest_commit(
+    #[values(false, true)] remanifest_after: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
     let (engine, _temp_dir, table_url, snapshot) =
         setup_adaptive_metadata_table("root_manifest_file_domain_metadata").await?;
 
@@ -479,6 +497,7 @@ async fn test_domain_metadata_read_across_a_root_manifest_commit()
                 .with_domain_metadata("domain.a", "a2")
                 .with_domain_metadata_removed("domain.b")
         },
+        remanifest_after,
     )?;
 
     for (domain, expected) in [
