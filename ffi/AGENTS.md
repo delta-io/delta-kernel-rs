@@ -862,9 +862,7 @@ or establish freshness.
 
 `snapshot_checkpoint_type` returns the retained selected-checkpoint type without I/O. Absent means
 no selected checkpoint; `Unresolved` means the type is unknown. Typed hints preserve this claim and
-validate it against their paths. `scan_declarative_metadata_plan_with_info` writes the plan bytes
-and `log_replay_skipped_via_crc` to an output record. The flag is true only when a current CRC supplies
-the complete file list. The caller releases the returned bytes with `free_kernel_bytes`.
+validate it against their paths.
 
 Snapshot accessors (`ffi/src/lib.rs`) include no-I/O reads such as `version` and
 `snapshot_file_stats`, which returns `OptionalValue<FfiFileStats>` (scalar

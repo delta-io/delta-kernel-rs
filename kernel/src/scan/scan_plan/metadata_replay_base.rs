@@ -141,11 +141,9 @@ mod tests {
         let config = target.table_configuration().clone();
         let snapshot = Arc::new(Snapshot::new_with_crc(segment, config, crc, false, false)?);
         let scan = snapshot.scan_builder().build()?;
-        let result = scan.declarative_metadata_scan_plan_with_info(
+        let plan = scan.declarative_metadata_scan_plan(
             &DelegatingEngine::new(engine.clone()).without_plan_executor(),
         )?;
-        assert_eq!(result.log_replay_skipped_via_crc, target_version == version);
-        let plan = result.plan;
         if expected_rows == 0 {
             assert!(plan.is_none());
             return Ok(());

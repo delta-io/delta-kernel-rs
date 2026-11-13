@@ -1,7 +1,5 @@
 use std::collections::BTreeMap;
 use std::error::Error as _;
-#[cfg(feature = "declarative-plans")]
-use std::mem::MaybeUninit;
 use std::ptr::NonNull;
 use std::sync::{Arc, Mutex};
 
@@ -30,10 +28,6 @@ use crate::ffi_test_utils::{
     assert_extern_result_error_with_message, ok_or_panic,
 };
 use crate::log_path::FfiLogPath;
-#[cfg(feature = "declarative-plans")]
-use crate::scan::{
-    free_scan, scan_builder, scan_builder_build, scan_declarative_metadata_plan_with_info,
-};
 use crate::snapshot::snapshot_checkpoint_type;
 use crate::{
     FfiFileStats, FfiIncrementalReplay, FfiLogSegmentStats, KernelI64Slice, KernelStringSlice,
@@ -1964,29 +1958,6 @@ fn aggregate_with_builds_latest_snapshot_from_rich_crc(
     assert_eq!(rebuilt_ref.log_segment(), snapshot_ref.log_segment());
     assert_eq!(rebuilt_ref.crc_at_version(), snapshot_ref.crc_at_version());
     assert!(rebuilt_ref.is_built_as_latest());
-
-    #[cfg(feature = "declarative-plans")]
-    {
-        // When the rebuilt hint supplies a complete current CRC, planning avoids checkpoint I/O.
-        let builder = unsafe { scan_builder(rebuilt.shallow_copy()) };
-        let scan = unsafe { ok_or_panic(scan_builder_build(builder, engine.shallow_copy())) };
-        let mut result = MaybeUninit::uninit();
-        assert!(ok_or_panic(unsafe {
-            scan_declarative_metadata_plan_with_info(
-                scan.shallow_copy(),
-                engine.shallow_copy(),
-                result.as_mut_ptr(),
-            )
-        }));
-        let result = unsafe { result.assume_init() };
-        // Then the plan reports CRC reuse and transfers owned plan bytes to the caller.
-        assert!(result.log_replay_skipped_via_crc);
-        let OptionalValue::Some(bytes) = result.plan else {
-            panic!("nonempty CRC file list must produce a plan");
-        };
-        unsafe { crate::free_kernel_bytes(bytes) };
-        unsafe { free_scan(scan) };
-    }
 
     unsafe {
         free_snapshot(rebuilt);
