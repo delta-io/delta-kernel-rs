@@ -24,8 +24,8 @@ def resolve_review_base(
     comparison link; otherwise request the immediate parent PR through ``get_json``, which
     accepts a GitHub API endpoint. Ordinary PRs and stack roots without a pinned link use
     the GitHub base SHA. A merged parent's original head remains the boundary while it is
-    an ancestor of the child; a rebased child uses the GitHub base instead. Stack boundaries
-    are author supplied: ancestry checks do not establish that the selected scope is complete.
+    an ancestor of the child; a child inheriting its merge result uses the GitHub base instead.
+    Stack boundaries are author supplied: ancestry checks do not prove the scope is complete.
     Raise ValueError if a stack boundary is missing, stale, or not an ancestor of the head.
     API errors propagate to the caller rather than expanding the review to ancestor PRs.
     """
@@ -70,7 +70,16 @@ def resolve_review_base(
         or comparison.get("merge_base_commit", {}).get("sha") != review_base
     ):
         if parent_merged and comparison.get("status") in {"behind", "diverged"}:
-            return github_base
+            merge_sha = parent_metadata.get("merge_commit_sha")
+            if isinstance(merge_sha, str) and _SHA.fullmatch(merge_sha):
+                merged_comparison = get_json(
+                    f"repos/{repository}/compare/{merge_sha}...{head_sha}"
+                )
+                if (
+                    merged_comparison.get("status") in {"ahead", "identical"}
+                    and merged_comparison.get("merge_base_commit", {}).get("sha") == merge_sha
+                ):
+                    return github_base
         raise ValueError("stack parent is not an ancestor of the PR head; refresh the stack")
     return review_base
 

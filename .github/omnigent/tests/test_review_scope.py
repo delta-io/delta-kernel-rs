@@ -20,6 +20,7 @@ PR_URL = f"https://github.com/{REPOSITORY}/pull"
 GITHUB_BASE = "a" * 40
 PARENT = "b" * 40
 HEAD = "c" * 40
+MERGE = "e" * 40
 
 
 def _load_module():
@@ -115,14 +116,50 @@ class ReviewScopeTest(unittest.TestCase):
             with self.subTest(status=status):
                 self.get_json.reset_mock()
                 self.get_json.side_effect = [
-                    {"head": {"sha": PARENT}, "merged_at": "2026-10-21T00:00:00Z"},
+                    {
+                        "head": {"sha": PARENT},
+                        "merged_at": "2026-10-21T00:00:00Z",
+                        "merge_commit_sha": MERGE,
+                    },
                     {"status": status, "merge_base_commit": {"sha": merge_base}},
+                    {"status": "ahead", "merge_base_commit": {"sha": MERGE}},
                 ]
                 self.assertEqual(self.resolve(_stack_body(f"[parent]({PR_URL}/1)")), expected)
                 self.assertEqual(
                     self.get_json.call_args_list[1].args,
                     (f"repos/{REPOSITORY}/compare/{PARENT}...{HEAD}",),
                 )
+                expected_calls = 2 if expected == PARENT else 3
+                self.assertEqual(self.get_json.call_count, expected_calls)
+                if expected == GITHUB_BASE:
+                    self.assertEqual(
+                        self.get_json.call_args.args,
+                        (f"repos/{REPOSITORY}/compare/{MERGE}...{HEAD}",),
+                    )
+
+    def test_merged_parent_without_inherited_merge_result_stops_review(self) -> None:
+        for merge_sha, merge_comparison in (
+            (MERGE, {"status": "diverged", "merge_base_commit": {"sha": "d" * 40}}),
+            (MERGE, {"status": "behind", "merge_base_commit": {"sha": HEAD}}),
+            (MERGE, {"status": "ahead", "merge_base_commit": {"sha": "d" * 40}}),
+            (MERGE, {}),
+            (None, None),
+            ("not-a-sha", None),
+        ):
+            with self.subTest(merge_sha=merge_sha, comparison=merge_comparison):
+                self.get_json.reset_mock()
+                self.get_json.side_effect = [
+                    {
+                        "head": {"sha": PARENT},
+                        "merged_at": "2026-10-21T00:00:00Z",
+                        "merge_commit_sha": merge_sha,
+                    },
+                    {"status": "diverged", "merge_base_commit": {"sha": "d" * 40}},
+                    merge_comparison,
+                ]
+                with self.assertRaisesRegex(ValueError, "not an ancestor"):
+                    self.resolve(_stack_body(f"[parent]({PR_URL}/1)"))
+                self.assertEqual(self.get_json.call_count, 2 if merge_sha != MERGE else 3)
 
     def test_other_sections_and_descendant_comparisons_do_not_change_scope(self) -> None:
         body = _stack_body() + (
