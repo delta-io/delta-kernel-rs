@@ -6,7 +6,7 @@ use delta_kernel::arrow::datatypes::{Int32Type, Int64Type};
 use delta_kernel::arrow::record_batch::RecordBatch;
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
-use delta_kernel::schema::{schema_ref, MetadataColumnSpec};
+use delta_kernel::schema::{MetadataColumnSpec, schema_ref};
 use delta_kernel::transaction::create_table::create_table as kernel_create_table;
 use delta_kernel::transaction::{RowTrackingMetadataColumns, UpdateTableOperation};
 use delta_kernel::{Engine, KernelResult, Snapshot};
@@ -19,11 +19,12 @@ use crate::common::read_utils::read_row_tracking_scan;
 mod row_tracking_preservation {
     use std::collections::HashMap;
 
+    use delta_kernel::KernelError;
     use delta_kernel::actions::deletion_vector_writer::KernelDeletionVector;
     use delta_kernel::arrow::array::{Array, ArrayRef, MapBuilder, StringArray, StringBuilder};
     use delta_kernel::schema::{DataType, SchemaRef, StructField};
-    use test_utils::delta_kernel_default_engine::executor::tokio::TokioMultiThreadExecutor;
     use test_utils::delta_kernel_default_engine::DefaultEngine;
+    use test_utils::delta_kernel_default_engine::executor::tokio::TokioMultiThreadExecutor;
     use test_utils::{read_actions_from_commit, read_add_infos};
     use url::Url;
 
@@ -80,7 +81,7 @@ mod row_tracking_preservation {
     #[tokio::test]
     async fn insert_commit_info_preservation_tag_requires_row_tracking_enabled(
         #[case] test_case: CommitInfoTagTestCase,
-    ) -> KernelResult<()> {
+    ) -> delta_kernel::Result<()> {
         // === Create a table in the requested Row Tracking state ===
         let (_temp_dir, table_path, engine) = test_table_setup()?;
         let table_url = Url::from_directory_path(&table_path).unwrap();
@@ -349,7 +350,7 @@ mod row_tracking_preservation {
     #[tokio::test(flavor = "multi_thread")]
     async fn remove_files_requires_row_tracking_preservation_acknowledgment(
         #[case] test_case: RemoveTestCase,
-    ) -> KernelResult<()> {
+    ) -> delta_kernel::Result<()> {
         // === Create the table and insert data ===
         let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
         let schema = schema_ref! { nullable "number": INTEGER };
@@ -411,9 +412,10 @@ mod row_tracking_preservation {
     }
 
     #[tokio::test]
-    async fn deletion_vector_update_requires_preservation_acknowledgment() -> KernelResult<()> {
+    async fn deletion_vector_update_requires_preservation_acknowledgment()
+    -> delta_kernel::Result<()> {
         // === Create a Row Tracking table with deletion vectors and insert data ===
-        let tmp_dir = tempfile::tempdir()?;
+        let tmp_dir = tempfile::tempdir().map_err(KernelError::from)?;
         let (_schema, table_url, engine, store) = setup_number_table_with_features(
             &tmp_dir,
             "dv_update_without_preservation_acknowledgment",
@@ -471,7 +473,7 @@ mod row_tracking_preservation {
     #[tokio::test(flavor = "multi_thread")]
     async fn optimize_preserves_row_tracking_metadata_in_data_and_checkpoint(
         #[case] table_properties: &[(&str, &str)],
-    ) -> KernelResult<()> {
+    ) -> delta_kernel::Result<()> {
         // === Write two source files ===
         let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
         let schema = schema_ref! { nullable "number": INTEGER };
@@ -508,7 +510,8 @@ mod row_tracking_preservation {
             .first()
             .expect("source scan must return data")
             .schema();
-        let merged_batch = concat_batches(&source_schema, &source_batches)?;
+        let merged_batch =
+            concat_batches(&source_schema, &source_batches).map_err(KernelError::from)?;
         let expected_rows = vec![(10, 0, 1), (20, 1, 1), (30, 2, 2), (40, 3, 2), (50, 4, 2)];
         assert_eq!(
             collect_rows(
@@ -574,8 +577,8 @@ mod row_tracking_preservation {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn optimize_preserves_row_tracking_metadata_after_deletion_vector_update(
-    ) -> KernelResult<()> {
+    async fn optimize_preserves_row_tracking_metadata_after_deletion_vector_update()
+    -> KernelResult<()> {
         // === Write the source file ===
         let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
         let table_url = Url::from_directory_path(&table_path).unwrap();

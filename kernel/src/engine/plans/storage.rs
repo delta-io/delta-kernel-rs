@@ -8,9 +8,7 @@ use itertools::Itertools as _;
 use url::Url;
 
 use crate::plans::{IoOperation, Operation, PlanExecutor, PlanResult};
-use crate::{
-    FileMeta, FileSlice, KernelError, KernelResult, KernelResultIteratorStatic, StorageHandler,
-};
+use crate::{FileMeta, FileSlice, KernelError, KernelResult, KernelResultIterator, StorageHandler};
 
 /// A [`StorageHandler`] that delegates to a [`PlanExecutor`].
 #[derive(Constructor)]
@@ -25,12 +23,15 @@ impl PlanBasedStorageHandler {
 }
 
 impl StorageHandler for PlanBasedStorageHandler {
-    fn list_from(&self, path: &Url) -> KernelResult<KernelResultIteratorStatic<FileMeta>> {
+    fn list_from(&self, path: &Url) -> KernelResult<Box<dyn KernelResultIterator<FileMeta>>> {
         self.execute_io(IoOperation::file_listing(path.clone()))?
             .into_file_meta()
     }
 
-    fn read_files(&self, files: Vec<FileSlice>) -> KernelResult<KernelResultIteratorStatic<Bytes>> {
+    fn read_files(
+        &self,
+        files: Vec<FileSlice>,
+    ) -> KernelResult<Box<dyn KernelResultIterator<Bytes>>> {
         self.execute_io(IoOperation::read_bytes(files))?
             .into_bytes()
     }

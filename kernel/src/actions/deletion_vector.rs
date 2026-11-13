@@ -5,11 +5,11 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use bytes::Bytes;
-use crc::{Crc, CRC_32_ISO_HDLC};
+use crc::{CRC_32_ISO_HDLC, Crc};
 use delta_kernel::schema::derive_macro_utils::ToDataType;
-use delta_kernel_derive::{internal_api, IntoStructData, ToSchema};
+use delta_kernel_derive::{IntoStructData, ToSchema, internal_api};
 use roaring::RoaringTreemap;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use url::Url;
 
 #[cfg(feature = "adaptive-metadata-in-dev")]
@@ -30,22 +30,25 @@ const ROARING_BITMAP_PORTABLE_MAGIC: u32 = 1681511377;
 /// This format is reserved for future use and not currently supported.
 const ROARING_BITMAP_NATIVE_MAGIC: u32 = 1681511376;
 
+/// Magic bytes an Iceberg Puffin file starts with ("PFA1").
+/// See: https://iceberg.apache.org/puffin-spec/#file-structure
+const PUFFIN_MAGIC: [u8; 4] = [0x50, 0x46, 0x41, 0x31];
+
 const INLINE_DELETION_VECTOR_MAGIC_SIZE: usize = 4;
 
-#[derive(Debug, PartialEq, Eq, Clone, Copy)]
-#[cfg_attr(test, derive(serde::Serialize, serde::Deserialize))]
+#[derive(Debug, PartialEq, Eq, Clone, Copy, Serialize, Deserialize)]
 pub enum DeletionVectorStorageType {
-    #[cfg_attr(test, serde(rename = "u"))]
+    #[serde(rename = "u")]
     PersistedRelative,
-    #[cfg_attr(test, serde(rename = "i"))]
+    #[serde(rename = "i")]
     Inline,
-    #[cfg_attr(test, serde(rename = "p"))]
+    #[serde(rename = "p")]
     PersistedAbsolute,
     /// Unlike [`PersistedRelative`](Self::PersistedRelative) (`'u'`), `path_or_inline_dv` stores
     /// the raw path with no base85/UUID encoding; it is percent-encoded only when resolved against
     /// the table root.
     #[cfg(feature = "adaptive-metadata-in-dev")]
-    #[cfg_attr(test, serde(rename = "r"))]
+    #[serde(rename = "r")]
     PersistedUnencodedRelative,
 }
 
@@ -147,9 +150,12 @@ impl DeletionVectorPath {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, ToSchema, IntoStructData, Deserialize)]
-#[cfg_attr(test, derive(serde::Serialize))]
-#[serde(rename_all = "camelCase", try_from = "DeletionVectorRaw")]
+#[derive(Debug, Clone, PartialEq, Eq, ToSchema, IntoStructData, Deserialize, Serialize)]
+#[serde(
+    rename_all = "camelCase",
+    try_from = "DeletionVectorRaw",
+    into = "DeletionVectorRaw"
+)]
 pub struct DeletionVectorDescriptor {
     /// A single character to indicate how to access the DV. Legal options are: ['u', 'i', 'p'],
     /// plus 'r' when built with the `adaptive-metadata-in-dev` cargo feature.
@@ -175,7 +181,8 @@ pub struct DeletionVectorDescriptor {
     pub path_or_inline_dv: String,
 
     /// Start of the data for this DV in number of bytes from the beginning of the file it is
-    /// stored in. Always None (absent in JSON) when `storageType = 'i'`.
+    /// stored in. `None` when `storageType = 'i'`. The Delta log omits an absent offset; these
+    /// serde impls serialize it as `null`.
     pub offset: Option<i32>,
 
     /// Size of the serialized DV in bytes (raw data size, i.e. before base85 encoding, if inline).
@@ -185,7 +192,7 @@ pub struct DeletionVectorDescriptor {
     pub cardinality: i64,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct DeletionVectorRaw {
     storage_type: String,
@@ -206,6 +213,21 @@ impl TryFrom<DeletionVectorRaw> for DeletionVectorDescriptor {
             raw.size_in_bytes,
             raw.cardinality,
         )
+    }
+}
+
+/// Mirror of [`TryFrom<DeletionVectorRaw>`] for serialization: routing through the raw struct
+/// emits `storage_type` as its protocol string in every format, keeping serialize symmetric with
+/// deserialize rather than relying on the self-describing enum representation.
+impl From<DeletionVectorDescriptor> for DeletionVectorRaw {
+    fn from(descriptor: DeletionVectorDescriptor) -> Self {
+        Self {
+            storage_type: descriptor.storage_type.to_string(),
+            path_or_inline_dv: descriptor.path_or_inline_dv,
+            offset: descriptor.offset,
+            size_in_bytes: descriptor.size_in_bytes,
+            cardinality: descriptor.cardinality,
+        }
     }
 }
 
@@ -554,26 +576,11 @@ impl DeletionVectorDescriptor {
                     )))??;
                 let dv_data_len = dv_data.len();
 
-                let mut cursor = Cursor::new(dv_data);
-                let mut version_buf = [0; 1];
-                cursor.read(&mut version_buf).map_err(|err| {
-                    KernelError::DeletionVector(format!(
-                        "Failed to read version from {path}: {err}"
-                    ))
-                })?;
-                let version = u8::from_be_bytes(version_buf);
-                require!(
-                    version == 1,
-                    KernelError::DeletionVector(format!("Invalid version {version} for {path}"))
-                );
+                self.validate_framing(&dv_data, &path)?;
 
-                // Deletion vector file format:
-                // +---------------+-----------------+
-                // |  num bytes    |  value          |
-                // +===============+=================+
-                // | 1 byte        |  version        |
-                // +---------------+-----------------+
-                // | offset-1      |  other dvs...   |
+                let mut cursor = Cursor::new(dv_data);
+
+                // DV blob layout, starting at this_dv_start (the descriptor's offset):
                 // +---------------+-----------------+ <- this_dv_start
                 // | 4 bytes       |  dv_size        |
                 // +---------------+-----------------+
@@ -665,6 +672,42 @@ impl DeletionVectorDescriptor {
         parent: &Url,
     ) -> KernelResult<Vec<u64>> {
         Ok(self.read(storage, parent)?.into_iter().collect())
+    }
+
+    /// Validates the deletion vector file's framing: a Delta DV file or, as a reader-side leniency
+    /// for Iceberg interop, a Puffin file.
+    ///
+    /// A Delta DV file opens with a 1-byte version header, then one or more blobs; the descriptor's
+    /// `offset` points at the first blob:
+    ///
+    /// ```text
+    /// +---------------+-----------------+
+    /// |  num bytes    |  value          |
+    /// +===============+=================+
+    /// | 1 byte        |  version        |
+    /// +---------------+-----------------+
+    /// | offset-1      |  other dvs...   |
+    /// +---------------+-----------------+ <- offset (first blob)
+    /// ```
+    fn validate_framing(&self, dv_data: &[u8], path: &Url) -> KernelResult<()> {
+        if dv_data.starts_with(&PUFFIN_MAGIC) {
+            require!(
+                self.offset
+                    .is_some_and(|offset| offset >= PUFFIN_MAGIC.len() as i32),
+                KernelError::DeletionVector(format!(
+                    "Puffin deletion vector requires an explicit offset >= {} for {path}",
+                    PUFFIN_MAGIC.len()
+                ))
+            );
+            Ok(())
+        } else {
+            let version = dv_data.first().copied().unwrap_or_default();
+            require!(
+                version == 1,
+                KernelError::DeletionVector(format!("Invalid version {version} for {path}"))
+            );
+            Ok(())
+        }
     }
 }
 
@@ -761,13 +804,8 @@ pub fn split_vector(
 ) -> Option<Vec<bool>> {
     match vector {
         Some(vector) if split_index < vector.len() => Some(vector.split_off(split_index)),
-        Some(vector) if extend.is_some() => {
-            vector.extend(std::iter::repeat_n(
-                // safety: we just checked `is_some` above
-                #[allow(clippy::unwrap_used)]
-                extend.unwrap(),
-                split_index - vector.len(),
-            ));
+        Some(vector) if let Some(extend) = extend => {
+            vector.extend(std::iter::repeat_n(extend, split_index - vector.len()));
             None
         }
         _ => None,
@@ -813,9 +851,11 @@ mod tests {
     use roaring::RoaringTreemap;
 
     use super::{DeletionVectorDescriptor, *};
-    use crate::engine::sync::SyncEngine;
-    use crate::unit_test_utils::assert_result_error_with_message;
     use crate::Engine;
+    use crate::engine::CancellableEngine;
+    use crate::engine::sync::SyncEngine;
+    use crate::scan::state::DvInfo;
+    use crate::unit_test_utils::{TestCancellationToken, assert_result_error_with_message};
 
     fn dv_relative() -> DeletionVectorDescriptor {
         DeletionVectorDescriptor {
@@ -879,6 +919,100 @@ mod tests {
         }"#;
         let error = serde_json::from_str::<DeletionVectorDescriptor>(invalid).unwrap_err();
         assert!(error.to_string().contains("must not carry an offset"));
+    }
+
+    #[test]
+    fn storage_type_serializes_as_a_string_and_round_trips() {
+        // In JSON the renamed enum serializes to its protocol string ("u"/"i"/"p"/"r") both ways.
+        for (variant, json) in [
+            (DeletionVectorStorageType::PersistedRelative, "\"u\""),
+            (DeletionVectorStorageType::Inline, "\"i\""),
+            (DeletionVectorStorageType::PersistedAbsolute, "\"p\""),
+        ] {
+            assert_eq!(serde_json::to_string(&variant).unwrap(), json);
+            assert_eq!(
+                serde_json::from_str::<DeletionVectorStorageType>(json).unwrap(),
+                variant
+            );
+            // Keep the serde wire string in sync with Display/FromStr, which define the same
+            // "u"/"i"/"p"/"r" strings in a second place.
+            assert_eq!(
+                serde_json::to_string(&variant).unwrap(),
+                format!("\"{variant}\"")
+            );
+        }
+
+        #[cfg(feature = "adaptive-metadata-in-dev")]
+        {
+            let variant = DeletionVectorStorageType::PersistedUnencodedRelative;
+            assert_eq!(serde_json::to_string(&variant).unwrap(), "\"r\"");
+            assert_eq!(
+                serde_json::from_str::<DeletionVectorStorageType>("\"r\"").unwrap(),
+                variant
+            );
+            assert_eq!(
+                serde_json::to_string(&variant).unwrap(),
+                format!("\"{variant}\"")
+            );
+        }
+    }
+
+    // Round-trips the descriptor and the DvInfo that wraps it through both serde formats:
+    // JSON (self-describing) and bincode (positional, where an omitted field desyncs the stream).
+    #[rstest::rstest]
+    #[case::relative(dv_relative())]
+    #[case::absolute(dv_absolute())]
+    #[case::inline(dv_inline())]
+    fn descriptor_and_dv_info_serde_round_trips(#[case] descriptor: DeletionVectorDescriptor) {
+        // JSON: storageType is a string; a present offset is a number, an absent one is null.
+        let json = serde_json::to_string(&descriptor).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(
+            value["storageType"].is_string(),
+            "storageType must serialize as a string: {json}"
+        );
+        match descriptor.offset {
+            Some(offset) => assert_eq!(value["offset"].as_i64(), Some(i64::from(offset))),
+            None => assert_eq!(
+                value.get("offset"),
+                Some(&serde_json::Value::Null),
+                "{json}"
+            ),
+        }
+        assert_eq!(
+            serde_json::from_str::<DeletionVectorDescriptor>(&json).unwrap(),
+            descriptor
+        );
+
+        // bincode (positional) must round-trip the descriptor and the DvInfo wrapper.
+        let bytes = bincode::serialize(&descriptor).unwrap();
+        assert_eq!(
+            bincode::deserialize::<DeletionVectorDescriptor>(&bytes).unwrap(),
+            descriptor
+        );
+        let dv_info = DvInfo::from(descriptor);
+        let bytes = bincode::serialize(&dv_info).unwrap();
+        assert_eq!(bincode::deserialize::<DvInfo>(&bytes).unwrap(), dv_info);
+    }
+
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[test]
+    fn descriptor_serde_json_round_trips_unencoded_relative() {
+        let descriptor = DeletionVectorDescriptor::try_new(
+            DeletionVectorStorageType::PersistedUnencodedRelative,
+            "data/deletion_vector_x.bin",
+            Some(1),
+            4,
+            2,
+        )
+        .unwrap();
+        let json = serde_json::to_string(&descriptor).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value["storageType"].as_str(), Some("r"), "{json}");
+        assert_eq!(
+            serde_json::from_str::<DeletionVectorDescriptor>(&json).unwrap(),
+            descriptor
+        );
     }
 
     #[test]
@@ -1143,6 +1277,99 @@ mod tests {
         assert_eq!(found, expected)
     }
 
+    // Absolute-path descriptor for the checked-in Iceberg Puffin fixture, with the given offset.
+    // `size_in_bytes` is the magic + bitmap size (Iceberg's 44-byte blob minus the 8-byte
+    // length-prefix + CRC framing). `parent` is unused for an absolute-path descriptor.
+    fn puffin_fixture_dv(offset: Option<i32>) -> (DeletionVectorDescriptor, Url) {
+        let path = std::fs::canonicalize(
+            "./tests/data/deletion-vector-puffin/deletion-vector-61d16c75.puffin",
+        )
+        .unwrap();
+        let parent = Url::from_directory_path(path.parent().unwrap()).unwrap();
+        let dv = DeletionVectorDescriptor {
+            storage_type: DeletionVectorStorageType::PersistedAbsolute,
+            path_or_inline_dv: Url::from_file_path(&path).unwrap().to_string(),
+            offset,
+            size_in_bytes: 36,
+            cardinality: 2,
+        };
+        (dv, parent)
+    }
+
+    // A DV blob is byte-identical in a Delta DV file and an Iceberg Puffin file; only the framing
+    // around it differs (a 1-byte `0x01` version header vs. the 4-byte `PFA1` magic plus a footer).
+    // Reads the blob out of a real Iceberg Puffin file (produced by iceberg-rust's PuffinWriter)
+    // and confirms it yields the same bitmap as the Delta fixture.
+    #[test]
+    fn test_deletion_vector_read_puffin_framed() {
+        // The blob starts just after the 4-byte `PFA1` magic.
+        let (dv, parent) = puffin_fixture_dv(Some(4));
+        let tree_map = dv
+            .read(SyncEngine::new().storage_handler(), &parent)
+            .unwrap();
+        assert_eq!(tree_map.iter().collect::<Vec<_>>(), vec![0, 9]);
+    }
+
+    // A Puffin-framed DV needs an explicit offset past the `PFA1` magic; without one the reader
+    // cannot fall back to the Delta version-header default, so it errors rather than misreading.
+    #[test]
+    fn test_deletion_vector_read_puffin_requires_offset() {
+        let (dv, parent) = puffin_fixture_dv(None);
+        assert_result_error_with_message(
+            dv.read(SyncEngine::new().storage_handler(), &parent),
+            "requires an explicit offset",
+        );
+    }
+
+    // A file whose header is neither the Delta version (`0x01`) nor the Puffin magic is still
+    // rejected rather than read at an arbitrary offset.
+    #[test]
+    fn test_deletion_vector_read_rejects_unknown_framing() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path()
+                .join("deletion_vector_61d16c75-6994-46b7-a15b-8b538852e50e.bin"),
+            [0x02u8; 48],
+        )
+        .unwrap();
+        let parent = Url::from_directory_path(dir.path()).unwrap();
+        assert_result_error_with_message(
+            dv_example().read(SyncEngine::new().storage_handler(), &parent),
+            "Invalid version 2",
+        );
+    }
+
+    #[rstest::rstest]
+    fn engine_deletion_vector_reads_inherit_cancellation(#[values(false, true)] cancelled: bool) {
+        let path = std::fs::canonicalize("tests/data/table-with-dv-small").unwrap();
+        let parent = Url::from_directory_path(path).unwrap();
+        let token = Arc::new(TestCancellationToken::default());
+        if cancelled {
+            token.cancel();
+        }
+        let engine = CancellableEngine::new(&SyncEngine::new(), token);
+        let descriptor = dv_example();
+        let info = DvInfo {
+            deletion_vector: Some(descriptor.clone()),
+        };
+        let rows = info.get_row_indexes(&engine, &parent);
+        let selection = crate::scan::selection_vector(&engine, &descriptor, &parent);
+        if cancelled {
+            assert!(matches!(rows, Err(KernelError::Cancelled)));
+            assert!(matches!(selection, Err(KernelError::Cancelled)));
+        } else {
+            assert_eq!(rows.unwrap().unwrap(), [0, 9]);
+            assert_eq!(
+                selection
+                    .unwrap()
+                    .iter()
+                    .filter(|selected| !**selected)
+                    .count(),
+                2
+            );
+        }
+    }
+
     // Reads through a `StorageHandler` to show the percent-encoded URL finds the raw-named object.
     // Only a space is used: object_store's local filesystem stores `#`, `%` and non-ASCII bytes
     // percent-encoded on disk, so a raw-named file with them is unreachable through it.
@@ -1259,13 +1486,17 @@ mod tests {
         assert!("P".parse::<DeletionVectorStorageType>().is_err());
         assert!("".parse::<DeletionVectorStorageType>().is_err());
         assert!("invalid".parse::<DeletionVectorStorageType>().is_err());
-        assert!("PersistedRelative"
-            .parse::<DeletionVectorStorageType>()
-            .is_err());
+        assert!(
+            "PersistedRelative"
+                .parse::<DeletionVectorStorageType>()
+                .is_err()
+        );
         assert!("Inline".parse::<DeletionVectorStorageType>().is_err());
-        assert!("PersistedAbsolute"
-            .parse::<DeletionVectorStorageType>()
-            .is_err());
+        assert!(
+            "PersistedAbsolute"
+                .parse::<DeletionVectorStorageType>()
+                .is_err()
+        );
         #[cfg(not(feature = "adaptive-metadata-in-dev"))]
         assert!("r".parse::<DeletionVectorStorageType>().is_err());
     }
@@ -1439,6 +1670,13 @@ mod tests {
         None,
         "s3://mytable/",
         "ps3://other/a%20b/dv.bin"
+    )]
+    #[case::uuid_relative_absent_offset(
+        DeletionVectorStorageType::PersistedRelative,
+        "ab^-aqEH.-t@S}K{vb[*k^",
+        None,
+        "s3://mytable/",
+        "rab/deletion_vector_d2c639aa-8816-431a-aaf6-d3fe2512ff61.bin"
     )]
     #[case::inline(
         DeletionVectorStorageType::Inline,

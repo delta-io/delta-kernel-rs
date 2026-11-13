@@ -196,9 +196,10 @@ use std::num::NonZero;
 use std::sync::{Arc, Mutex};
 
 pub use counting_reporter::{
-    ensure_metrics_compatible_global_subscriber, install_thread_local_metrics_reporter,
     CapturingReporter, CountingReporter, RelaxedCounter, SnapshotCompletionStatus,
+    ensure_metrics_compatible_global_subscriber, install_thread_local_metrics_reporter,
 };
+use delta_kernel::actions::deletion_vector::DeletionVectorDescriptor;
 use delta_kernel::actions::{
     LOG_ADD_SCHEMA, MAX_VALUES, MIN_VALUES, NULL_COUNT, NUM_RECORDS, TIGHT_BOUNDS,
 };
@@ -206,7 +207,7 @@ use delta_kernel::arrow::array::{
     Array, ArrayRef, AsArray, BooleanArray, Float64Array, Int32Array, Int64Array, MapArray,
     MapBuilder, RecordBatch, StringArray, StringBuilder, StructArray,
 };
-use delta_kernel::arrow::buffer::OffsetBuffer;
+use delta_kernel::arrow::buffer::{NullBuffer, OffsetBuffer};
 use delta_kernel::arrow::compute::concat;
 use delta_kernel::arrow::datatypes::{
     DataType as ArrowDataType, Field, Int64Type, Schema as ArrowSchema,
@@ -216,7 +217,8 @@ use delta_kernel::arrow::util::pretty::pretty_format_batches;
 use delta_kernel::committer::{
     CommitMetadata, CommitResponse, Committer, FileSystemCommitter, PublishMetadata,
 };
-use delta_kernel::engine::arrow_conversion::TryFromKernel;
+use delta_kernel::engine::DelegatingEngine;
+use delta_kernel::engine::arrow_conversion::{TryFromKernel, TryIntoArrow};
 use delta_kernel::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt};
 use delta_kernel::expressions::Scalar;
 use delta_kernel::object_store::local::LocalFileSystem;
@@ -227,29 +229,29 @@ use delta_kernel::parquet::arrow::arrow_writer::ArrowWriter;
 use delta_kernel::parquet::file::properties::WriterProperties;
 use delta_kernel::scan::Scan;
 use delta_kernel::schema::{
-    schema_ref, ColumnMetadataKey, DataType, MetadataValue, SchemaRef, StructType,
+    ColumnMetadataKey, DataType, MetadataValue, SchemaRef, StructType, ToSchema, schema_ref,
 };
 use delta_kernel::table_features::{assign_column_mapping_metadata, find_max_column_id_in_schema};
 use delta_kernel::transaction::{
     CommitResult, Transaction, UpdateTableOperation, UpdateTableTransactionBuilder,
 };
 use delta_kernel::{
-    try_parse_uri, CancellationToken, CancellationTokenRef, CancelledFuture, Engine, EngineData,
+    CancellationToken, CancellationTokenRef, CancelledFuture, Engine, EngineData,
     FileDataReadResultIterator, FileMeta, FileSize, FilteredEngineData, JsonHandler, KernelError,
     KernelResult, KernelResultIterator, LogPath, ParquetFooter, ParquetHandler, PredicateRef,
-    Snapshot,
+    Snapshot, try_parse_uri,
 };
 // Re-export `delta_kernel_default_engine` so kernel's integration tests can access it without
 // taking a direct dev-dep on the new crate (which would create a cycle via this crate).
 pub use delta_kernel_default_engine;
+use delta_kernel_default_engine::executor::TaskExecutor;
 use delta_kernel_default_engine::executor::tokio::{
     TokioBackgroundExecutor, TokioMultiThreadExecutor,
 };
-use delta_kernel_default_engine::executor::TaskExecutor;
 use delta_kernel_default_engine::storage::store_from_url;
 use delta_kernel_default_engine::{DefaultEngine, DefaultEngineBuilder};
 use itertools::Itertools;
-use serde_json::{json, to_vec, Deserializer};
+use serde_json::{Deserializer, json, to_vec};
 use tracing::subscriber::DefaultGuard;
 use tracing_subscriber::layer::SubscriberExt;
 use url::Url;
@@ -642,6 +644,70 @@ pub fn replace_array_row(column: &ArrayRef, replacement: ArrayRef, row: usize) -
     ];
     let arrays: Vec<&dyn Array> = slices.iter().map(|array| array.as_ref()).collect();
     concat(&arrays).expect("replacement value must match the modified column type")
+}
+
+/// Builds nullable deletion-vector values (`addFile.deletionVector` or `removeFile.deletionVector`)
+/// for tests.
+///
+/// Each entry supplies `pathOrInlineDv`; `None` produces a null descriptor. Present descriptors
+/// have no offset and use placeholder size and cardinality values.
+///
+/// # Panics
+///
+/// Panics if the deletion-vector schema cannot be converted to Arrow.
+pub fn deletion_vector_array(
+    storage_type: &str,
+    paths_or_inline_dvs: &[Option<&str>],
+) -> StructArray {
+    let schema: ArrowSchema = (&DeletionVectorDescriptor::to_schema())
+        .try_into_arrow()
+        .expect("deletion-vector schema should convert to Arrow");
+    let row_count = paths_or_inline_dvs.len();
+
+    StructArray::new(
+        schema.fields().clone(),
+        vec![
+            Arc::new(StringArray::from(
+                paths_or_inline_dvs
+                    .iter()
+                    .map(|path| path.map(|_| storage_type))
+                    .collect::<Vec<_>>(),
+            )), // storageType
+            Arc::new(StringArray::from(paths_or_inline_dvs.to_vec())), // pathOrInlineDv
+            Arc::new(Int32Array::from(vec![None; row_count])),         // offset
+            Arc::new(Int32Array::from(
+                paths_or_inline_dvs
+                    .iter()
+                    .map(|path| path.map(|_| 1))
+                    .collect::<Vec<_>>(),
+            )), // sizeInBytes
+            Arc::new(Int64Array::from(
+                paths_or_inline_dvs
+                    .iter()
+                    .map(|path| path.map(|_| 1))
+                    .collect::<Vec<_>>(),
+            )), // cardinality
+        ],
+        Some(NullBuffer::from(
+            paths_or_inline_dvs
+                .iter()
+                .map(Option::is_some)
+                .collect::<Vec<_>>(),
+        )),
+    )
+}
+
+/// Returns a copy of `batch` with `field` replaced by `column`.
+///
+/// # Panics
+///
+/// Panics if `field` does not exist or `column` is incompatible with the batch schema.
+pub fn replace_column(batch: &RecordBatch, field: &str, column: ArrayRef) -> RecordBatch {
+    let schema = batch.schema();
+    let index = schema.index_of(field).expect("field in schema");
+    let mut columns = batch.columns().to_vec();
+    columns[index] = column;
+    RecordBatch::try_new(schema, columns).expect("replacement column must match the batch schema")
 }
 
 pub fn create_default_engine(
@@ -1160,7 +1226,7 @@ pub fn test_read(
     expected: &ArrowEngineData,
     url: &Url,
     engine: Arc<dyn Engine>,
-) -> KernelResult<()> {
+) -> delta_kernel::Result<()> {
     let snapshot = Snapshot::builder_for(url.clone()).build(engine.as_ref())?;
     let scan = snapshot.scan_builder().build()?;
     let batches = read_scan(&scan, engine)?;
@@ -1229,6 +1295,7 @@ pub async fn insert_data_with<E: TaskExecutor>(
         "UPDATE" => UpdateTableOperation::Update,
         "MERGE" => UpdateTableOperation::Merge,
         "OPTIMIZE" => UpdateTableOperation::Optimize,
+        "REORG" => UpdateTableOperation::Reorg,
         operation => UpdateTableOperation::Custom(operation.to_string()),
     };
     let mut builder = snapshot.update_table(operation, "test-utils", data_change);
@@ -1288,7 +1355,7 @@ impl Committer for TestCatalogCommitter {
     fn commit(
         &self,
         engine: &dyn Engine,
-        actions: KernelResultIterator<'_, FilteredEngineData>,
+        actions: Box<dyn KernelResultIterator<FilteredEngineData> + '_>,
         commit_metadata: CommitMetadata,
     ) -> KernelResult<CommitResponse> {
         let path = commit_metadata.published_commit_path()?;
@@ -1317,7 +1384,7 @@ impl Committer for TestCatalogCommitter {
 pub fn load_and_begin_transaction(
     table_url: impl AsRef<str>,
     engine: &dyn Engine,
-) -> KernelResult<Transaction> {
+) -> delta_kernel::Result<Transaction> {
     load_and_begin_transaction_with(
         table_url,
         engine,
@@ -1340,16 +1407,16 @@ pub fn load_and_begin_transaction_with(
     engine_info: impl Into<String>,
     data_change: bool,
     configure: impl FnOnce(UpdateTableTransactionBuilder) -> UpdateTableTransactionBuilder,
-) -> KernelResult<Transaction> {
+) -> delta_kernel::Result<Transaction> {
     let snapshot = Snapshot::builder_for(table_url).build(engine)?;
-    begin_transaction_with(
+    Ok(begin_transaction_with(
         snapshot,
         engine,
         operation,
         engine_info,
         data_change,
         configure,
-    )
+    )?)
 }
 
 // Helper function to set json values in a serde_json Values
@@ -1531,6 +1598,18 @@ pub fn nested_variant_schema() -> SchemaRef {
 
 pub fn multiple_variant_schema() -> SchemaRef {
     multi_schema_with_type(DataType::unshredded_variant())
+}
+
+pub fn top_level_file_schema() -> SchemaRef {
+    schema_with_type(DataType::file_type())
+}
+
+pub fn nested_file_schema() -> SchemaRef {
+    nested_schema_with_type(DataType::file_type())
+}
+
+pub fn multiple_file_schema() -> SchemaRef {
+    multi_schema_with_type(DataType::file_type())
 }
 
 /// Returns column mapping table properties for the given mode, or empty for `"none"`.
@@ -1820,60 +1899,51 @@ impl CancellationToken for TestCancellationToken {
     }
 }
 
-/// An [`Engine`] decorator that records the [`CancellationTokenRef`] kernel passes to the JSON and
-/// Parquet cancellation-aware reads, so a test can assert kernel threaded the caller's own token
-/// through by identity. Every other handler call, and the non-cancellation reads, delegate to the
-/// wrapped engine unchanged.
+/// Wraps `inner` to record cancellation tokens passed to JSON and Parquet reads.
 ///
-/// Only the first token observed on each path is retained: a scan drives the read path once with
-/// the caller's token, but a subsequent empty-sidecar read must not clobber it with `None`.
-pub struct TokenCapturingEngine {
-    inner: Arc<dyn Engine>,
-    json: Arc<CapturingJsonHandler>,
-    parquet: Arc<CapturingParquetHandler>,
+/// The returned engine delegates other handlers and non-cancellation reads to `inner` and reports
+/// no plan executor. The recording fixture shares the installed handlers, so tests can inspect
+/// the original token allocations after reading through the engine.
+pub fn token_capturing_engine(inner: Arc<dyn Engine>) -> (DelegatingEngine, CapturedReadTokens) {
+    let json_handler = Arc::new(CapturingJsonHandler {
+        inner: inner.json_handler(),
+        seen: Mutex::new(None),
+    });
+    let parquet_handler = Arc::new(CapturingParquetHandler {
+        inner: inner.parquet_handler(),
+        seen: Mutex::new(None),
+    });
+    let engine = DelegatingEngine::new(inner)
+        .with_json_handler(json_handler.clone())
+        .with_parquet_handler(parquet_handler.clone())
+        .without_plan_executor();
+    (
+        engine,
+        CapturedReadTokens {
+            json_handler,
+            parquet_handler,
+        },
+    )
 }
 
-impl TokenCapturingEngine {
-    /// Wrap `inner`, capturing tokens on both read paths.
-    pub fn new(inner: Arc<dyn Engine>) -> Self {
-        let json = Arc::new(CapturingJsonHandler {
-            inner: inner.json_handler(),
-            seen: Mutex::new(None),
-        });
-        let parquet = Arc::new(CapturingParquetHandler {
-            inner: inner.parquet_handler(),
-            seen: Mutex::new(None),
-        });
-        Self {
-            inner,
-            json,
-            parquet,
-        }
-    }
+/// Tokens recorded by the JSON and Parquet handlers installed by [`token_capturing_engine`].
+///
+/// Each handler retains the first non-`None` token by `Arc` identity. Later reads, including reads
+/// without a token, leave it intact.
+pub struct CapturedReadTokens {
+    json_handler: Arc<CapturingJsonHandler>,
+    parquet_handler: Arc<CapturingParquetHandler>,
+}
 
-    /// The token the JSON read path received, or `None` if it never ran or was handed no token.
+impl CapturedReadTokens {
+    /// Returns the first JSON read token, or `None` if no read supplied one.
     pub fn json_token(&self) -> Option<CancellationTokenRef> {
-        self.json.seen.lock().unwrap().clone()
+        self.json_handler.seen.lock().unwrap().clone()
     }
 
-    /// The token the Parquet read path received, or `None` if it never ran or was handed no token.
+    /// Returns the first Parquet read token, or `None` if no read supplied one.
     pub fn parquet_token(&self) -> Option<CancellationTokenRef> {
-        self.parquet.seen.lock().unwrap().clone()
-    }
-}
-
-impl Engine for TokenCapturingEngine {
-    fn evaluation_handler(&self) -> Arc<dyn delta_kernel::EvaluationHandler> {
-        self.inner.evaluation_handler()
-    }
-    fn storage_handler(&self) -> Arc<dyn delta_kernel::StorageHandler> {
-        self.inner.storage_handler()
-    }
-    fn json_handler(&self) -> Arc<dyn JsonHandler> {
-        self.json.clone()
-    }
-    fn parquet_handler(&self) -> Arc<dyn ParquetHandler> {
-        self.parquet.clone()
+        self.parquet_handler.seen.lock().unwrap().clone()
     }
 }
 
@@ -1931,7 +2001,7 @@ impl JsonHandler for CapturingJsonHandler {
     fn write_json_file(
         &self,
         path: &Url,
-        data: KernelResultIterator<'_, FilteredEngineData>,
+        data: Box<dyn KernelResultIterator<FilteredEngineData> + '_>,
         overwrite: bool,
     ) -> KernelResult<u64> {
         self.inner.write_json_file(path, data, overwrite)
@@ -2041,7 +2111,7 @@ pub fn create_table_and_load_snapshot(
     schema: SchemaRef,
     engine: &dyn Engine,
     properties: &[(&str, &str)],
-) -> KernelResult<Arc<Snapshot>> {
+) -> delta_kernel::Result<Arc<Snapshot>> {
     use delta_kernel::committer::FileSystemCommitter;
     use delta_kernel::transaction::create_table::create_table;
 
@@ -2117,6 +2187,7 @@ pub fn read_actions_from_commit(
 }
 
 /// Row tracking fields extracted from a single add action in a commit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AddActionRowTracking {
     /// The base row ID assigned to the first row in the file.
     pub base_row_id: Option<i64>,
@@ -2166,10 +2237,10 @@ pub fn get_materialized_row_tracking_column_names(
         row_id_column_name: config["delta.rowTracking.materializedRowIdColumnName"]
             .as_str()
             .map(str::to_owned),
-        row_commit_version_column_name: config
-            ["delta.rowTracking.materializedRowCommitVersionColumnName"]
-            .as_str()
-            .map(str::to_owned),
+        row_commit_version_column_name:
+            config["delta.rowTracking.materializedRowCommitVersionColumnName"]
+                .as_str()
+                .map(str::to_owned),
     })
 }
 
@@ -2192,11 +2263,11 @@ pub async fn read_metadata_configuration_from_store(
     let mut config = HashMap::new();
     for line in std::str::from_utf8(&bytes)?.lines() {
         let v: serde_json::Value = serde_json::from_str(line)?;
-        if let Some(c) = v.get("metaData").and_then(|m| m.get("configuration")) {
-            if c.is_object() {
-                let entries: HashMap<String, String> = serde_json::from_value(c.clone())?;
-                config.extend(entries);
-            }
+        if let Some(c) = v.get("metaData").and_then(|m| m.get("configuration"))
+            && c.is_object()
+        {
+            let entries: HashMap<String, String> = serde_json::from_value(c.clone())?;
+            config.extend(entries);
         }
     }
     Ok(config)
@@ -2253,4 +2324,52 @@ pub fn assert_partition_values(action: &serde_json::Value, key: &str, expected_v
         "partitionValues should contain key '{key}', got: {pv:?}"
     );
     assert_eq!(pv[key], expected_value);
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use delta_kernel::object_store::memory::InMemory;
+    use delta_kernel::schema::schema_ref;
+    use delta_kernel::{CancellationTokenRef, Engine, KernelResult};
+    use delta_kernel_default_engine::DefaultEngineBuilder;
+    use rstest::rstest;
+
+    use super::{TestCancellationToken, token_capturing_engine};
+
+    #[rstest]
+    #[case::json(false)]
+    #[case::parquet(true)]
+    fn token_recording_retains_first_supplied_token(#[case] parquet: bool) -> KernelResult<()> {
+        let inner = Arc::new(DefaultEngineBuilder::new(Arc::new(InMemory::new())).build());
+        let (engine, captured) = token_capturing_engine(inner);
+        let first: CancellationTokenRef = Arc::new(TestCancellationToken::default());
+        let second: CancellationTokenRef = Arc::new(TestCancellationToken::default());
+        let schema = schema_ref! { not_null "id": INTEGER };
+
+        // Empty requests exercise the installed recording handlers without reading storage.
+        for token in [None, Some(first.clone()), None, Some(second)] {
+            let mut batches = if parquet {
+                engine
+                    .parquet_handler()
+                    .read_parquet_files_with_cancellation(&[], schema.clone(), None, token)?
+            } else {
+                engine.json_handler().read_json_files_with_cancellation(
+                    &[],
+                    schema.clone(),
+                    None,
+                    token,
+                )?
+            };
+            assert!(batches.next().is_none());
+        }
+        let recorded = if parquet {
+            captured.parquet_token()
+        } else {
+            captured.json_token()
+        };
+        assert!(Arc::ptr_eq(&recorded.unwrap(), &first));
+        Ok(())
+    }
 }

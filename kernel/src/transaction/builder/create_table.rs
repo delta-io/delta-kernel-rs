@@ -7,6 +7,7 @@
 //! than constructing the builder directly.
 
 use std::collections::{HashMap, HashSet};
+use std::marker::PhantomData;
 use std::sync::Arc;
 
 use delta_kernel_derive::internal_api;
@@ -14,45 +15,48 @@ use itertools::Itertools;
 use url::Url;
 use uuid::Uuid;
 
-use super::state::TransactionBuilderState;
 use super::TransactionBuilder;
+use super::state::TransactionBuilderState;
 use crate::actions::{DomainMetadata, Metadata, Protocol};
 use crate::clustering::{create_clustering_domain_metadata, validate_clustering_columns};
 use crate::committer::Committer;
 use crate::expressions::ColumnName;
+use crate::schema::collation_utils::schema_has_collations;
+use crate::schema::file_utils::schema_contains_file_type;
 use crate::schema::validation::validate_schema;
 use crate::schema::variant_utils::schema_contains_variant_type;
 use crate::schema::{
-    normalize_column_names_to_schema_casing, schema_contains_non_null_fields, DataType, SchemaRef,
-    StructType,
+    DataType, SchemaRef, StructType, normalize_column_names_to_schema_casing,
+    schema_contains_non_null_fields,
 };
 use crate::table_configuration::TableConfiguration;
 #[cfg(feature = "nanosecond-timestamps")]
 use crate::table_features::schema_contains_timestamp_nanos;
 use crate::table_features::{
-    add_feature_to_lists, assign_column_mapping_metadata, auto_enable_property_driven_features,
+    ColumnMappingMode, IcebergCompatValidationContext, SET_TABLE_FEATURE_SUPPORTED_PREFIX,
+    SET_TABLE_FEATURE_SUPPORTED_VALUE, TableFeature, V2_VALIDATOR, add_feature_to_lists,
+    assign_column_mapping_metadata, auto_enable_property_driven_features,
     ensure_domain_metadata_dependency, find_max_column_id_in_schema,
     get_any_level_column_physical_name, get_column_mapping_mode_from_properties,
     schema_contains_timestamp_ntz, strip_stray_column_mapping_metadata,
-    validate_iceberg_compat_if_needed, ColumnMappingMode, IcebergCompatValidationContext,
-    TableFeature, SET_TABLE_FEATURE_SUPPORTED_PREFIX, SET_TABLE_FEATURE_SUPPORTED_VALUE,
-    V2_VALIDATOR,
+    validate_iceberg_compat_if_needed,
 };
 use crate::table_properties::{
-    strip_check_constraint_prefix, CheckpointPolicy, TableProperties, APPEND_ONLY,
-    CHECKPOINT_INTERVAL, CHECKPOINT_POLICY, CHECKPOINT_WRITE_STATS_AS_JSON,
+    APPEND_ONLY, CHECKPOINT_INTERVAL, CHECKPOINT_POLICY, CHECKPOINT_WRITE_STATS_AS_JSON,
     CHECKPOINT_WRITE_STATS_AS_STRUCT, COLUMN_MAPPING_MAX_COLUMN_ID, COLUMN_MAPPING_MODE,
-    DATA_SKIPPING_NUM_INDEXED_COLS, DATA_SKIPPING_STATS_COLUMNS, DELETED_FILE_RETENTION_DURATION,
-    DELTA_PROPERTY_PREFIX, ENABLE_CHANGE_DATA_FEED, ENABLE_DELETION_VECTORS,
-    ENABLE_EXPIRED_LOG_CLEANUP, ENABLE_ICEBERG_COMPAT_V1, ENABLE_ICEBERG_COMPAT_V2,
-    ENABLE_ICEBERG_COMPAT_V3, ENABLE_IN_COMMIT_TIMESTAMPS, ENABLE_ROW_TRACKING,
-    ENABLE_TYPE_WIDENING, LOG_RETENTION_DURATION, MATERIALIZED_ROW_COMMIT_VERSION_COLUMN_NAME,
-    MATERIALIZED_ROW_ID_COLUMN_NAME, PARQUET_FORMAT_VERSION, ROW_TRACKING_SUSPENDED,
-    SET_TRANSACTION_RETENTION_DURATION,
+    CheckpointPolicy, DATA_SKIPPING_NUM_INDEXED_COLS, DATA_SKIPPING_STATS_COLUMNS,
+    DELETED_FILE_RETENTION_DURATION, DELTA_PROPERTY_PREFIX, ENABLE_CHANGE_DATA_FEED,
+    ENABLE_DELETION_VECTORS, ENABLE_EXPIRED_LOG_CLEANUP, ENABLE_ICEBERG_COMPAT_V1,
+    ENABLE_ICEBERG_COMPAT_V2, ENABLE_ICEBERG_COMPAT_V3, ENABLE_ICEBERG_NATIVE_V4,
+    ENABLE_IN_COMMIT_TIMESTAMPS, ENABLE_ROW_TRACKING, ENABLE_TYPE_WIDENING, LOG_RETENTION_DURATION,
+    MATERIALIZED_ROW_COMMIT_VERSION_COLUMN_NAME, MATERIALIZED_ROW_ID_COLUMN_NAME,
+    PARQUET_COMPRESSION_CODEC, PARQUET_FORMAT_VERSION, ParquetCompressionCodec,
+    ROW_TRACKING_SUSPENDED, SET_TRANSACTION_RETENTION_DURATION, TableProperties,
+    strip_check_constraint_prefix,
 };
 use crate::transaction::create_table::CreateTableTransaction;
 use crate::transaction::data_layout::DataLayout;
-use crate::transaction::{CommitOperation, CreateTable, ExecutionMode, Transaction};
+use crate::transaction::{CommitOperation, CreateTable, ExecutionMode, Imperative, Transaction};
 use crate::utils::{current_time_ms, try_parse_uri};
 use crate::{Engine, KernelError, KernelResult, StorageHandler};
 
@@ -95,6 +99,7 @@ const ALLOWED_DELTA_FEATURES: &[TableFeature] = &[
     // create time is the explicit feature signal
     // `delta.feature.materializePartitionColumns=supported`.
     TableFeature::MaterializePartitionColumns,
+    TableFeature::Collations,
     // IcebergCompatV2 is a writer-only feature that gates Iceberg V2 conversion compatibility.
     // Dependent features (ColumnMapping) are auto-added during create table.
     TableFeature::IcebergCompatV2,
@@ -102,6 +107,8 @@ const ALLOWED_DELTA_FEATURES: &[TableFeature] = &[
     // Dependent features (ColumnMapping, RowTracking, DomainMetadata) are auto-added during
     // create table.
     TableFeature::IcebergCompatV3,
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    TableFeature::IcebergNativeV4Preview,
 ];
 
 /// The single allow-list of `delta.*` properties accepted during CREATE TABLE. Any `delta.*`
@@ -128,11 +135,17 @@ const ALLOWED_DELTA_PROPERTIES: &[&str] = &[
     SET_TRANSACTION_RETENTION_DURATION,
     // Parquet format version: controls the Parquet writer version for data files
     PARQUET_FORMAT_VERSION,
+    // Advisory compression setting for the connector's Parquet writer.
+    PARQUET_COMPRESSION_CODEC,
     // IcebergCompatV2 enablement: triggers auto-enablement of ColumnMapping.
     ENABLE_ICEBERG_COMPAT_V2,
     // IcebergCompatV3 enablement: triggers auto-enablement of ColumnMapping,
     // RowTracking, DomainMetadata.
     ENABLE_ICEBERG_COMPAT_V3,
+    // IcebergNativeV4 enablement: triggers auto-enablement of ColumnMapping (id), RowTracking,
+    // DeletionVectors, InCommitTimestamp, DomainMetadata, and adaptiveMetadata.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    ENABLE_ICEBERG_NATIVE_V4,
     // Log/checkpoint maintenance configs: stored verbatim, consumed by log cleanup / checkpoint
     // scheduling.
     LOG_RETENTION_DURATION,
@@ -381,12 +394,38 @@ fn maybe_enable_variant_type(schema: &SchemaRef, validated: &mut ValidatedTableP
     }
 }
 
+/// Conditionally adds the `fileType-preview` feature to the protocol when the schema contains File
+/// columns anywhere in the schema tree (top-level, nested structs, arrays, maps).
+///
+/// The stable `fileType` feature is deliberately not written: the protocol change is still only
+/// proposed, and a stable feature name is permanent once it is in a table's protocol.
+fn maybe_enable_file_type_preview(schema: &SchemaRef, validated: &mut ValidatedTableProperties) {
+    if schema_contains_file_type(schema) {
+        add_feature_to_lists(
+            TableFeature::FileTypePreview,
+            &mut validated.reader_features,
+            &mut validated.writer_features,
+        );
+    }
+}
+
 /// Conditionally adds the `timestampNtz` feature to the protocol when the schema contains
 /// TimestampNTZ columns anywhere in the schema tree (top-level, nested structs, arrays, maps).
 fn maybe_enable_timestamp_ntz(schema: &SchemaRef, validated: &mut ValidatedTableProperties) {
     if schema_contains_timestamp_ntz(schema) {
         add_feature_to_lists(
             TableFeature::TimestampWithoutTimezone,
+            &mut validated.reader_features,
+            &mut validated.writer_features,
+        );
+    }
+}
+
+/// Adds the stable collation feature for annotated schemas.
+fn maybe_enable_collations(schema: &SchemaRef, validated: &mut ValidatedTableProperties) {
+    if schema_has_collations(schema) {
+        add_feature_to_lists(
+            TableFeature::Collations,
             &mut validated.reader_features,
             &mut validated.writer_features,
         );
@@ -656,6 +695,72 @@ fn maybe_enable_iceberg_compat_v3_dependencies(
     Ok(())
 }
 
+/// Adds IcebergNativeV4 dependencies when `delta.enableIcebergNativeV4=true`.
+///
+/// - Sets required props (`columnMapping.mode=id`, row tracking, DVs, ICT). CM *feature* is added
+///   later in `maybe_apply_column_mapping_for_table_create` when mode is name/id.
+/// - Adds AMT, V4, and domainMetadata features here (V4 depends on AMT directly).
+#[cfg(feature = "adaptive-metadata-in-dev")]
+fn maybe_enable_iceberg_native_v4_dependencies(
+    validated: &mut ValidatedTableProperties,
+) -> KernelResult<()> {
+    // TODO(#3769): Replace per-feature dependency wiring with a general CREATE dependency resolver.
+    if !validated.is_property_true(ENABLE_ICEBERG_NATIVE_V4) {
+        return Ok(());
+    }
+
+    // Incompatible properties
+    if validated.is_property_true(ROW_TRACKING_SUSPENDED) {
+        return Err(KernelError::generic(format!(
+            "IcebergNativeV4 cannot be enabled while '{ROW_TRACKING_SUSPENDED}' is 'true'"
+        )));
+    }
+
+    for key in [
+        ENABLE_ICEBERG_COMPAT_V1,
+        ENABLE_ICEBERG_COMPAT_V2,
+        ENABLE_ICEBERG_COMPAT_V3,
+    ] {
+        if validated.is_property_true(key) {
+            return Err(KernelError::generic(format!(
+                "IcebergNativeV4 cannot be enabled together with '{key}'"
+            )));
+        }
+    }
+
+    // Required table properties
+    for (key, required) in [
+        (COLUMN_MAPPING_MODE, "id"),
+        (ENABLE_ROW_TRACKING, "true"),
+        (ENABLE_DELETION_VECTORS, "true"),
+        (ENABLE_IN_COMMIT_TIMESTAMPS, "true"),
+    ] {
+        let value = validated
+            .properties
+            .entry(key.to_string())
+            .or_insert_with(|| required.to_string());
+        if value.as_str() != required {
+            return Err(KernelError::generic(format!(
+                "IcebergNativeV4 requires '{key}' to be '{required}', got '{value}'"
+            )));
+        }
+    }
+
+    // Required table features
+    for feature in [
+        TableFeature::AdaptiveMetadataPreview,
+        TableFeature::IcebergNativeV4Preview,
+        TableFeature::DomainMetadata,
+    ] {
+        add_feature_to_lists(
+            feature,
+            &mut validated.reader_features,
+            &mut validated.writer_features,
+        );
+    }
+    Ok(())
+}
+
 /// Conditionally applies column mapping for table creation based on the mode in properties.
 ///
 /// If `delta.columnMapping.mode` is set to `name` or `id`, this function:
@@ -694,11 +799,12 @@ fn maybe_apply_column_mapping_for_table_create(
             // missing piece of that pair, and assign fresh metadata to bare fields (matches
             // delta-spark's `DeltaColumnMapping.assignColumnIdAndPhysicalName`). Seed
             // `max_id` from the schema's existing max so newly assigned IDs cannot collide
-            // with preserved ones. When IcebergCompatV2 or IcebergCompatV3 is enabled, also
+            // with preserved ones. When an Iceberg compat feature is enabled, also
             // allocate nested ids for `Array.element` and `Map.key`/`Map.value` and store them
             // under `delta.columnMapping.nested.ids` on the nearest ancestor `StructField`.
             let assign_nested_field_ids = validated.is_property_true(ENABLE_ICEBERG_COMPAT_V2)
-                || validated.is_property_true(ENABLE_ICEBERG_COMPAT_V3);
+                || validated.is_property_true(ENABLE_ICEBERG_COMPAT_V3)
+                || validated.is_property_true(ENABLE_ICEBERG_NATIVE_V4);
             let mut max_id = find_max_column_id_in_schema(schema).unwrap_or(0);
             let transformed_schema =
                 assign_column_mapping_metadata(schema, &mut max_id, assign_nested_field_ids)?;
@@ -720,7 +826,8 @@ fn maybe_apply_column_mapping_for_table_create(
 ///
 /// This function:
 /// 1. Validates feature signals (`delta.feature.*`) against `ALLOWED_DELTA_FEATURES`
-/// 2. Validates delta properties (`delta.*`) against `ALLOWED_DELTA_PROPERTIES`
+/// 2. Validates delta property keys (`delta.*`) against `ALLOWED_DELTA_PROPERTIES` and checks
+///    compression codec values with the shared codec parser (case-insensitive, without trimming)
 /// 3. Removes feature signals from properties (they shouldn't be stored in metadata)
 /// 4. Extracts reader/writer features from validated feature signals
 ///
@@ -783,7 +890,7 @@ fn validate_extract_table_features_and_properties(
     }
 
     // Validate remaining delta.* properties against the allow list
-    for key in properties.keys() {
+    for (key, value) in &properties {
         if strip_check_constraint_prefix(key).is_some() {
             return Err(KernelError::generic(format!(
                 "Setting CHECK constraint property '{key}' is not supported during CREATE TABLE"
@@ -795,6 +902,12 @@ fn validate_extract_table_features_and_properties(
             return Err(KernelError::generic(format!(
                 "Setting delta property '{key}' is not supported during CREATE TABLE"
             )));
+        }
+        if key == PARQUET_COMPRESSION_CODEC {
+            // Reject unsupported codecs at creation; snapshot parsing remains tolerant of them.
+            ParquetCompressionCodec::try_from(value.as_str()).map_err(|_| {
+                KernelError::generic(format!("Invalid value '{value}' for '{key}'"))
+            })?;
         }
     }
 
@@ -813,7 +926,7 @@ fn validate_extract_table_features_and_properties(
 /// Created via [`create_table()`](super::super::create_table::create_table).
 ///
 /// cbindgen:ignore
-pub type CreateTableTransactionBuilder = TransactionBuilder<CreateTable>;
+pub type CreateTableTransactionBuilder<MODE = Imperative> = TransactionBuilder<CreateTable, MODE>;
 
 /// Opaque state collected by create-table-specific builder setters.
 #[doc(hidden)]
@@ -844,9 +957,12 @@ impl TransactionBuilder<CreateTable> {
                 table_properties: HashMap::new(),
                 data_layout: DataLayout::None,
             },
+            _mode: PhantomData,
         }
     }
+}
 
+impl<MODE: ExecutionMode> TransactionBuilder<CreateTable, MODE> {
     /// Sets table properties for the new Delta table.
     ///
     /// Custom application properties (those not starting with `delta.`) are always allowed.
@@ -947,7 +1063,7 @@ impl TransactionBuilder<CreateTable> {
     /// This method performs validation:
     /// - Checks that the table path is valid
     /// - Verifies the table doesn't already exist
-    /// - Rejects schemas with `delta.invariants` metadata annotations (unsupported by kernel)
+    /// - Validates the schema and metadata annotations
     /// - Validates the data layout is valid
     /// - Validates table properties against the allow list
     ///
@@ -967,10 +1083,10 @@ impl TransactionBuilder<CreateTable> {
     /// Returns an error if:
     /// - The table path is invalid
     /// - A table already exists at the given path
-    /// - The schema has `delta.invariants` metadata on any column
-    /// - CDF is enabled and the schema contains a top-level column reserved for CDF
+    /// - Schema or metadata annotation validation fails
     /// - The data layout is invalid
     /// - Unsupported delta properties or feature flags are specified
+    /// - The value of `delta.parquet.compression.codec` is not a recognized codec
     /// - Connector commit information does not contain exactly one row
     /// - An application transaction identifier occurs more than once
     #[internal_api]
@@ -978,7 +1094,7 @@ impl TransactionBuilder<CreateTable> {
         self,
         engine: &dyn Engine,
         committer: Box<dyn Committer>,
-    ) -> KernelResult<CreateTableTransaction> {
+    ) -> KernelResult<CreateTableTransaction<MODE>> {
         self.common_state.validate()?;
 
         // Validate path
@@ -995,6 +1111,11 @@ impl TransactionBuilder<CreateTable> {
         // - Returns reader/writer features to add to protocol
         let mut validated =
             validate_extract_table_features_and_properties(self.local_state.table_properties)?;
+
+        // Run before the IcebergCompat steps so that compat conflicts report against V4.
+        // Run before column mapping so that the defaults apply.
+        #[cfg(feature = "adaptive-metadata-in-dev")]
+        maybe_enable_iceberg_native_v4_dependencies(&mut validated)?;
 
         // When IcebergCompatV2 is enabled, fill in / validate required dependencies before column
         // mapping is applied so the CM mode is in place. This must run before
@@ -1013,7 +1134,7 @@ impl TransactionBuilder<CreateTable> {
         let (mut effective_schema, column_mapping_mode) =
             maybe_apply_column_mapping_for_table_create(&self.local_state.schema, &mut validated)?;
 
-        // Validate schema (column names, duplicates, no `delta.invariants` metadata).
+        // Validate the schema and metadata annotations.
         // Empty schemas are intentionally allowed.
         validate_schema(
             &effective_schema,
@@ -1043,7 +1164,9 @@ impl TransactionBuilder<CreateTable> {
 
         // Schema-driven auto-enablement: detect types or annotations that require a feature
         maybe_enable_variant_type(&effective_schema, &mut validated);
+        maybe_enable_file_type_preview(&effective_schema, &mut validated);
         maybe_enable_timestamp_ntz(&effective_schema, &mut validated);
+        maybe_enable_collations(&effective_schema, &mut validated);
         maybe_enable_invariants(&effective_schema, &mut validated);
 
         // Auto-enable timestampNanos feature if schema contains TimestampNanos columns
@@ -1089,6 +1212,13 @@ impl TransactionBuilder<CreateTable> {
 
         // Build TableConfiguration directly for the new table
         let table_configuration = TableConfiguration::try_new(metadata, protocol, table_url, 0)?;
+        // TODO(#3695): Support creating tables with generated columns.
+        if table_configuration.has_generation_expressions() {
+            return Err(KernelError::unsupported(
+                "Setting `delta.generationExpression` column metadata is not supported during \
+                 CREATE TABLE",
+            ));
+        }
 
         // Create Transaction<CreateTable> with the effective table configuration
         let transaction = try_new_create_table(
@@ -1115,6 +1245,9 @@ fn try_new_create_table<MODE: ExecutionMode>(
         &V2_VALIDATOR,
         IcebergCompatValidationContext::Write,
     )?;
+
+    // Run the same checks as the write path so the created table is writable.
+    effective_table_config.ensure_write_supported()?;
 
     let span = tracing::info_span!(
         "txn",
@@ -1152,11 +1285,11 @@ mod tests {
     use crate::engine::arrow_conversion::TryIntoArrow;
     use crate::engine::arrow_data::ArrowEngineData;
     use crate::engine::sync::SyncEngine;
-    use crate::expressions::{column_name, ColumnName};
+    use crate::expressions::{ColumnName, column_name};
     use crate::metrics::MetricEvent;
     use crate::scan::data_skipping::stats_schema::StripFieldMetadataTransform;
     use crate::schema::{
-        schema, schema_ref, try_schema, ColumnMetadataKey, DataType, MetadataValue, StructField,
+        ColumnMetadataKey, DataType, MetadataValue, StructField, schema, schema_ref, try_schema,
     };
     use crate::table_features::FeatureType;
     use crate::table_properties::{
@@ -1165,8 +1298,8 @@ mod tests {
     };
     use crate::transforms::SchemaTransform;
     use crate::unit_test_utils::{
-        assert_result_error_with_message, build_complex_nested_kernel_schema,
-        install_thread_local_metrics_reporter, CapturingReporter,
+        CapturingReporter, assert_result_error_with_message, build_complex_nested_kernel_schema,
+        field_with_generation_expression, install_thread_local_metrics_reporter,
     };
 
     fn test_schema() -> SchemaRef {
@@ -1191,6 +1324,7 @@ mod tests {
     #[rstest]
     fn common_builder_state_preserves_data_change_through_empty_commit(
         #[values(false, true)] expected_data_change: bool,
+        #[values(false, true)] skip_dedup_validation: bool,
     ) -> KernelResult<()> {
         let tempdir = tempfile::tempdir()?;
         let table_path = tempdir.path().join("table");
@@ -1199,7 +1333,7 @@ mod tests {
         let reporter = Arc::new(CapturingReporter::default());
         let _guard = install_thread_local_metrics_reporter(reporter.clone());
 
-        let builder = CreateTableTransactionBuilder::new(
+        let mut builder = CreateTableTransactionBuilder::new(
             table_path.to_string_lossy(),
             test_schema(),
             "test-engine",
@@ -1208,8 +1342,12 @@ mod tests {
         .with_correlation_id("test-correlation")
         .with_operation_parameters([("mode", Some("Create"))])
         .with_transaction_id("app", 7);
+        if skip_dedup_validation {
+            builder = builder.without_dedup_validation();
+        }
         let transaction = builder.build(&engine, Box::new(FileSystemCommitter::new()))?;
 
+        assert_eq!(transaction.skip_dedup_validation, skip_dedup_validation);
         assert_eq!(transaction.engine_info, "test-engine");
         assert_eq!(
             transaction.correlation_id.as_deref(),
@@ -1406,6 +1544,30 @@ mod tests {
         let properties = HashMap::from([(key.to_string(), "amount > 0".to_string())]);
         let result = validate_extract_table_features_and_properties(properties);
         assert_result_error_with_message(result, "Setting CHECK constraint property");
+    }
+
+    #[test]
+    fn create_table_rejects_generation_expressions() -> KernelResult<()> {
+        let tempdir = tempfile::tempdir()?;
+        let table_path = tempdir.path().join("table");
+        std::fs::create_dir(&table_path)?;
+        let schema = schema_ref! {
+            nullable "event_time": TIMESTAMP,
+            (field_with_generation_expression("event_year", DataType::INTEGER, "YEAR(event_time)")),
+        };
+
+        let result = CreateTableTransactionBuilder::new(
+            table_path.to_string_lossy(),
+            schema,
+            "test-engine",
+            true,
+        )
+        .build(&SyncEngine::new(), Box::new(FileSystemCommitter::new()));
+
+        let is_unsupported = matches!(&result, Err(KernelError::Unsupported(_)));
+        assert!(is_unsupported);
+        assert_result_error_with_message(result, "delta.generationExpression");
+        Ok(())
     }
 
     #[test]
@@ -1645,10 +1807,12 @@ mod tests {
         );
 
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("not found in schema"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("not found in schema")
+        );
     }
 
     #[test]
@@ -1751,6 +1915,7 @@ mod tests {
         };
 
         maybe_enable_variant_type(&schema, &mut validated);
+        maybe_enable_file_type_preview(&schema, &mut validated);
         maybe_enable_timestamp_ntz(&schema, &mut validated);
 
         for feature in expected_features {
@@ -1862,6 +2027,7 @@ mod tests {
     #[case::append_only(TableFeature::AppendOnly, "appendOnly")]
     #[case::change_data_feed(TableFeature::ChangeDataFeed, "changeDataFeed")]
     #[case::type_widening(TableFeature::TypeWidening, "typeWidening")]
+    #[case::collations(TableFeature::Collations, "collations")]
     #[case::variant_type(TableFeature::VariantType, "variantType")]
     #[case::variant_shredding(TableFeature::VariantShredding, "variantShredding")]
     #[case::catalog_managed(TableFeature::CatalogManaged, "catalogManaged")]
@@ -1891,6 +2057,28 @@ mod tests {
         }
     }
 
+    #[rstest::rstest]
+    fn test_preview_feature_signals_rejected(
+        #[values(
+            "collations-preview",
+            "typeWidening-preview",
+            "variantType-preview",
+            "variantShredding-preview",
+            "catalogOwned-preview",
+            "adaptiveMetadata-preview"
+        )]
+        feature_name: &str,
+    ) {
+        let key = format!("delta.feature.{feature_name}");
+        let properties = HashMap::from([(key.clone(), "supported".to_string())]);
+        assert_result_error_with_message(
+            validate_extract_table_features_and_properties(properties),
+            &format!(
+                "Enabling feature '{feature_name}' via '{key}' is not supported during CREATE TABLE"
+            ),
+        );
+    }
+
     #[test]
     fn test_variant_shredding_feature_signal_adds_variant_type_dependency() {
         let properties = HashMap::from([(
@@ -1899,18 +2087,26 @@ mod tests {
         )]);
         let validated = validate_extract_table_features_and_properties(properties).unwrap();
 
-        assert!(validated
-            .reader_features
-            .contains(&TableFeature::VariantType));
-        assert!(validated
-            .reader_features
-            .contains(&TableFeature::VariantShredding));
-        assert!(validated
-            .writer_features
-            .contains(&TableFeature::VariantType));
-        assert!(validated
-            .writer_features
-            .contains(&TableFeature::VariantShredding));
+        assert!(
+            validated
+                .reader_features
+                .contains(&TableFeature::VariantType)
+        );
+        assert!(
+            validated
+                .reader_features
+                .contains(&TableFeature::VariantShredding)
+        );
+        assert!(
+            validated
+                .writer_features
+                .contains(&TableFeature::VariantType)
+        );
+        assert!(
+            validated
+                .writer_features
+                .contains(&TableFeature::VariantShredding)
+        );
     }
 
     fn multi_column_schema() -> SchemaRef {
@@ -2030,10 +2226,12 @@ mod tests {
         let columns = vec![column_name!("address.city")];
         let result = validate_partition_columns(&schema, &columns);
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("must be a top-level column"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("must be a top-level column")
+        );
     }
 
     #[rstest::rstest]
@@ -2060,10 +2258,12 @@ mod tests {
         let columns = vec![ColumnName::new([col_name])];
         let result = validate_partition_columns(&schema, &columns);
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("non-primitive type"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("non-primitive type")
+        );
     }
 
     #[rstest::rstest]
@@ -2138,9 +2338,11 @@ mod tests {
         maybe_auto_enable_property_driven_features(&mut validated);
         maybe_enable_ict_for_catalog_managed(&mut validated).unwrap();
 
-        assert!(validated
-            .writer_features
-            .contains(&TableFeature::InCommitTimestamp));
+        assert!(
+            validated
+                .writer_features
+                .contains(&TableFeature::InCommitTimestamp)
+        );
         assert_eq!(
             validated.properties.get(ENABLE_IN_COMMIT_TIMESTAMPS),
             Some(&"true".to_string()),
@@ -2341,9 +2543,11 @@ mod tests {
 
         let region = effective_schema.field("region").expect("missing region");
         let _ = expect_field_id_and_physical_name(region, 3);
-        assert!(!region
-            .metadata
-            .contains_key(ColumnMetadataKey::ColumnMappingNestedIds.as_ref()));
+        assert!(
+            !region
+                .metadata
+                .contains_key(ColumnMetadataKey::ColumnMappingNestedIds.as_ref())
+        );
 
         // maxColumnId tracks the largest assigned CM id, including nested ids.
         assert_eq!(
@@ -2645,6 +2849,154 @@ mod tests {
             err.to_string().contains(expected_substring),
             "expected error mentioning '{expected_substring}', got: {err}",
         );
+    }
+
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    fn build_create_table_txn(
+        schema: SchemaRef,
+        properties: &[(&str, &str)],
+    ) -> KernelResult<CreateTableTransaction> {
+        let tempdir = tempfile::tempdir()?;
+        let table_path = tempdir.path().join("table");
+        std::fs::create_dir(&table_path)?;
+        CreateTableTransactionBuilder::new(
+            table_path.to_string_lossy(),
+            schema,
+            "test-engine",
+            true,
+        )
+        .with_table_properties(properties.iter().copied())
+        .build(&SyncEngine::new(), Box::new(FileSystemCommitter::new()))
+    }
+
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[test]
+    fn test_create_table_iceberg_native_v4_assigns_nested_ids() {
+        let txn = build_create_table_txn(
+            build_iceberg_compat_test_schema(),
+            &[(ENABLE_ICEBERG_NATIVE_V4, "true")],
+        )
+        .unwrap();
+        let config = &txn.effective_table_config;
+        assert_eq!(config.column_mapping_mode(), ColumnMappingMode::Id);
+        assert_eq!(
+            config
+                .metadata()
+                .configuration()
+                .get(COLUMN_MAPPING_MAX_COLUMN_ID)
+                .map(String::as_str),
+            Some("9"),
+        );
+        let schema = config.logical_schema();
+        let top = schema.field("top").unwrap();
+        assert!(
+            top.metadata()
+                .contains_key(ColumnMetadataKey::ColumnMappingNestedIds.as_ref())
+        );
+    }
+
+    /// Builds `ValidatedTableProperties` directly because some of these properties are not in
+    /// the CREATE TABLE allow-list.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[rstest]
+    #[case::cm_mode_name(COLUMN_MAPPING_MODE, "name")]
+    #[case::row_tracking_suspended(ROW_TRACKING_SUSPENDED, "true")]
+    #[case::v1_concurrent(ENABLE_ICEBERG_COMPAT_V1, "true")]
+    fn test_iceberg_native_v4_dependencies_rejects_invalid_combinations(
+        #[case] key: &str,
+        #[case] value: &str,
+    ) {
+        let mut validated = ValidatedTableProperties {
+            properties: HashMap::from([
+                (ENABLE_ICEBERG_NATIVE_V4.to_string(), "true".to_string()),
+                (key.to_string(), value.to_string()),
+            ]),
+            reader_features: Vec::new(),
+            writer_features: Vec::new(),
+        };
+        let err = maybe_enable_iceberg_native_v4_dependencies(&mut validated)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("IcebergNativeV4") && err.contains(key),
+            "expected error mentioning 'IcebergNativeV4' and '{key}', got: {err}",
+        );
+    }
+
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[rstest]
+    #[case::checkpoint_policy_v2(
+        schema_ref! { nullable "id": INTEGER },
+        &[(ENABLE_ICEBERG_NATIVE_V4, "true"), (CHECKPOINT_POLICY, "v2")],
+        "'v2Checkpoint'"
+    )]
+    #[case::byte_column(
+        schema_ref! { nullable "b": BYTE },
+        &[(ENABLE_ICEBERG_NATIVE_V4, "true")],
+        "icebergNativeV4-preview does not support type at column: b (byte)"
+    )]
+    #[case::enabled_iceberg_compat_v2(
+        schema_ref! { nullable "id": INTEGER },
+        &[(ENABLE_ICEBERG_NATIVE_V4, "true"), (ENABLE_ICEBERG_COMPAT_V2, "true")],
+        "IcebergNativeV4 cannot be enabled together with 'delta.enableIcebergCompatV2'"
+    )]
+    // TODO(#3769): Stricter than the RFC, which places no requirements on a supported but not
+    // enabled icebergNativeV4. The write path checks every listed writer feature.
+    #[case::supported_but_not_enabled(
+        schema_ref! { nullable "id": INTEGER },
+        &[("delta.feature.icebergNativeV4-preview", "supported")],
+        "Feature 'icebergNativeV4-preview' requires 'adaptiveMetadata-preview' to be enabled"
+    )]
+    // TODO(#3769): Stricter than the RFC, which allows an inactive icebergCompatV2 alongside
+    // icebergNativeV4. The write path checks requirements for every listed writer feature.
+    #[case::supported_iceberg_compat_v2(
+        schema_ref! { nullable "id": INTEGER },
+        &[(ENABLE_ICEBERG_NATIVE_V4, "true"), ("delta.feature.icebergCompatV2", "supported")],
+        "Feature 'icebergCompatV2' requires 'deletionVectors' to not be enabled"
+    )]
+    fn test_create_table_iceberg_native_v4_rejects(
+        #[case] schema: SchemaRef,
+        #[case] properties: &[(&str, &str)],
+        #[case] expected_substring: &str,
+    ) {
+        assert_result_error_with_message(
+            build_create_table_txn(schema, properties),
+            expected_substring,
+        );
+    }
+
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[test]
+    fn test_create_table_iceberg_native_v4_accepts_non_null_column() {
+        let txn = build_create_table_txn(
+            schema_ref! { not_null "id": INTEGER },
+            &[(ENABLE_ICEBERG_NATIVE_V4, "true")],
+        )
+        .unwrap();
+        let config = &txn.effective_table_config;
+        assert!(config.is_feature_enabled(&TableFeature::IcebergNativeV4Preview));
+        assert!(config.is_feature_supported(&TableFeature::Invariants));
+        assert!(!config.is_feature_enabled(&TableFeature::Invariants));
+    }
+
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[rstest]
+    #[case::variant_type(TableFeature::VariantType)]
+    #[case::catalog_managed(TableFeature::CatalogManaged)]
+    #[case::iceberg_compat_v3(TableFeature::IcebergCompatV3)]
+    fn test_create_table_iceberg_native_v4_accepts_allowed_feature(#[case] feature: TableFeature) {
+        let feature_key = format!("delta.feature.{feature}");
+        let txn = build_create_table_txn(
+            schema_ref! { nullable "id": INTEGER },
+            &[
+                (ENABLE_ICEBERG_NATIVE_V4, "true"),
+                (feature_key.as_str(), "supported"),
+            ],
+        )
+        .unwrap();
+        let config = &txn.effective_table_config;
+        assert!(config.is_feature_enabled(&TableFeature::IcebergNativeV4Preview));
+        assert!(config.is_feature_supported(&feature));
     }
 
     /// Asserts the field has CM id == `expected_id` and a `col-` prefixed physical name; returns

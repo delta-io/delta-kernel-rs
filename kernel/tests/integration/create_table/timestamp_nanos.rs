@@ -10,11 +10,10 @@ use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::schema::{DataType, StructField, StructType};
 use delta_kernel::snapshot::Snapshot;
 use delta_kernel::table_features::{
-    ColumnMappingMode, TableFeature, TABLE_FEATURES_MIN_READER_VERSION,
-    TABLE_FEATURES_MIN_WRITER_VERSION,
+    ColumnMappingMode, TABLE_FEATURES_MIN_READER_VERSION, TABLE_FEATURES_MIN_WRITER_VERSION,
+    TableFeature,
 };
 use delta_kernel::transaction::create_table::create_table;
-use delta_kernel::KernelResult;
 use test_utils::{
     cm_properties, multiple_nanots_ntz_schema, multiple_nanots_schema, nested_nanots_ntz_schema,
     nested_nanots_schema, test_table_setup, top_level_nanots_ntz_schema, top_level_nanots_schema,
@@ -56,7 +55,7 @@ fn test_create_table_with_timestamp_nanos(
     )]
     schema: Arc<StructType>,
     #[values("none", "name", "id")] cm_mode: &str,
-) -> KernelResult<()> {
+) -> delta_kernel::Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
     let _ = create_table(&table_path, schema.clone(), "Test/1.0", true)
@@ -96,7 +95,7 @@ fn test_create_table_with_timestamp_nanos(
 
 /// A schema without TimestampNanos columns should not add the timestampNanos feature.
 #[test]
-fn test_create_table_no_timestamp_nanos_no_feature() -> KernelResult<()> {
+fn test_create_table_no_timestamp_nanos_no_feature() -> delta_kernel::Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
     let schema = Arc::new(StructType::try_new(vec![
@@ -124,7 +123,7 @@ fn test_create_table_no_timestamp_nanos_no_feature() -> KernelResult<()> {
 #[rstest::rstest]
 fn test_create_table_timestamp_nanos_and_variant(
     #[values(DataType::TIMESTAMP_NANOS, DataType::TIMESTAMP_NANOS_NTZ)] ts_type: DataType,
-) -> KernelResult<()> {
+) -> delta_kernel::Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
     let schema = Arc::new(StructType::new_unchecked(vec![
@@ -162,7 +161,7 @@ fn test_create_table_timestamp_nanos_and_variant(
 #[rstest::rstest]
 fn test_create_table_timestamp_nanos_with_timestamp_ntz_column_no_duplicate_features(
     #[values(DataType::TIMESTAMP_NANOS, DataType::TIMESTAMP_NANOS_NTZ)] nanos_type: DataType,
-) -> KernelResult<()> {
+) -> delta_kernel::Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
     let schema = Arc::new(StructType::try_new(vec![

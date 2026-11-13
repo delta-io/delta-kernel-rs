@@ -1,7 +1,11 @@
 //! Integration tests for table maintenance operations (checkpoint, checksum).
 
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
 use delta_kernel::checkpoint::{CheckpointSpec, V2CheckpointConfig};
 use delta_kernel::committer::FileSystemCommitter;
+use delta_kernel::metrics::{ChecksumWriteResolutionMode, MetricEvent};
 use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::schema::schema_ref;
 use delta_kernel::snapshot::{CheckpointWriteResult, ChecksumWriteResult};
@@ -9,7 +13,10 @@ use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::{KernelResult, Snapshot};
 use rstest::rstest;
 use serde_json::json;
-use test_utils::{add_commit, assert_result_error_with_message, test_table_setup_mt};
+use test_utils::{
+    CapturingReporter, add_commit, assert_result_error_with_message,
+    install_thread_local_metrics_reporter, test_table_setup_mt,
+};
 use url::Url;
 
 #[rstest]
@@ -76,7 +83,7 @@ async fn test_checkpoint_and_checksum_return_updated_snapshots(
 #[case::v1_checkpoint(false)]
 #[case::v2_checkpoint(true)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_checkpoint_already_exists(#[case] v2_checkpoint: bool) -> KernelResult<()> {
+async fn test_checkpoint_already_exists(#[case] v2_checkpoint: bool) -> delta_kernel::Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
     let schema = schema_ref! { nullable "id": INTEGER };
     let mut builder = create_table(&table_path, schema, "test_engine", true);
@@ -152,7 +159,7 @@ async fn checkpoint_crc_writes_reject_unsupported_table_features(
     #[case] reader_features: &[&str],
     #[case] writer_features: &[&str],
     #[case] checkpoint_spec: Option<CheckpointSpec>,
-) -> KernelResult<()> {
+) -> delta_kernel::Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
     let table_url = Url::from_directory_path(&table_path).unwrap();
     let store = LocalFileSystem::new();
@@ -190,14 +197,34 @@ async fn checkpoint_crc_writes_reject_unsupported_table_features(
     .join("\n");
     add_commit(table_url.as_str(), &store, 0, commit).await?;
 
+    let reporter = Arc::new(CapturingReporter::default());
+    let _guard = install_thread_local_metrics_reporter(reporter.clone());
     let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
     let checkpoint_result = snapshot
         .checkpoint(engine.as_ref(), checkpoint_spec.as_ref())
         .map(|_| ());
     assert_result_error_with_message(checkpoint_result, "futureFeature");
 
+    let initial_event_count = reporter.events().len();
+    let start = Instant::now();
     let checksum_result = snapshot.write_checksum(engine.as_ref()).map(|_| ());
+    let elapsed = start.elapsed();
     assert_result_error_with_message(checksum_result, "futureFeature");
+
+    let events: Vec<_> = reporter
+        .events()
+        .into_iter()
+        .skip(initial_event_count)
+        .collect();
+    let [MetricEvent::ChecksumWriteFailure(event)] = events.as_slice() else {
+        panic!("expected one ChecksumWriteFailure event");
+    };
+    assert_eq!(
+        event.resolution_mode,
+        ChecksumWriteResolutionMode::NotAttempted
+    );
+    assert!(event.duration > Duration::ZERO);
+    assert!(event.duration <= elapsed);
 
     Ok(())
 }

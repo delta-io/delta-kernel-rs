@@ -288,7 +288,7 @@ The REST authentication callback similarly fills a caller-provided record:
 pub type CAuthHeaderCallback = extern "C" fn(
     context: NullableCvoid,
     out: *mut CAuthHeaders,
-    allocate_error: AllocateErrorFn,
+    error_allocators: *const ErrorAllocators,
 );
 ```
 
@@ -443,41 +443,36 @@ an opaque pointer when the API needs one.
 
 ### Error handling
 
-Rust helpers use `KernelResult<T>` and pass it to `IntoExternResult` to produce the C ABI's
-`ExternResult<T>`. Preserve `KernelError` variants through this conversion. `delta_kernel::Result<T>`
-uses the separate top-level `Error` envelope.
+Rust helpers return `KernelResult<T>` or `delta_kernel::Result<T>` and pass the result to
+`IntoExternResult` to produce the C ABI's `ExternResult<T>`. The top-level error variant selects the
+connector's allocation callback; a Delta error with a Kernel source still uses the Delta callback.
 
 There are two error directions, with opposite message owners:
 
 | Direction | Result envelope | Message construction | Final owner |
 | :---- | :---- | :---- | :---- |
-| Kernel to engine | `ExternResult<T>::Err(*mut EngineError)` | Kernel calls the engine's `AllocateErrorFn` with a temporary `KernelStringSlice`. | The engine owns and frees the returned `EngineError`. |
+| Kernel to engine | `ExternResult<T>::Err(*mut c_void)` | Kernel calls the registered Kernel or Delta allocator with temporary error information. | The engine owns and frees the returned error object. |
 | Engine to Kernel | `EngineExecResult<T>::Failure(EngineExecError)` | The engine calls `allocate_kernel_string` to copy its message into an `ExclusiveRustString` handle. | Kernel consumes and frees the string handle. |
 
-#### Kernel errors returned to the engine
+#### Kernel and Delta errors returned to the engine
 
-`AllocateErrorFn` is the one underlying ABI:
+`ErrorAllocators` carries a connector context and both allocation callbacks. `KernelErrorInfo`
+contains a numeric code and message; `DeltaErrorInfo` contains the catalog condition, optional
+SQLSTATE, named parameters, and message. Callbacks copy any information they need after returning
+and return their own error object as `void*`, or NULL if allocation fails. Kernel returns that
+pointer unchanged in `ExternResult::Err` and never reads or frees it.
+
+Engine constructors accept `*const ErrorAllocators` and copy the table into builders and engines.
+The table pointer must be valid for the constructor call; callback code and context must remain
+valid for every use and support concurrent calls when shared. Standalone exports borrow a table
+for the call. Use the stored allocator when an engine or builder is already available:
 
 ```rust
-pub type AllocateErrorFn = extern "C" fn(
-    error_type: FFIKernelError,
-    message: KernelStringSlice,
-) -> *mut EngineError;
+unsafe { result.into_extern_result(&*error_allocators) }; // Borrowed table for this call.
+unsafe { result.into_extern_result(&engine.as_ref()) }; // The engine stores the table.
 ```
 
-Kernel may reach it in two ways:
-
-```rust
-result.into_extern_result(&allocate_error); // No engine handle exists yet.
-result.into_extern_result(&engine.as_ref()); // The engine stores the callback.
-```
-
-Use the allocator stored on the engine, builder, or another live owner when one is already
-available. Accept an explicit `AllocateErrorFn` only when the API has no such owner, for example
-while constructing an engine or inside a standalone visitor API. Do not require both. In either
-form, Kernel owns the source message only until `AllocateErrorFn` returns. The callback must copy
-the message into engine-owned memory and return an `EngineError` pointer. Kernel immediately places
-that pointer in ExternResult::Err and never frees it.
+Do not require both an engine and a separate allocator table for the same operation.
 
 #### Engine errors returned to Kernel
 
@@ -493,7 +488,7 @@ pub struct EngineExecError {
 
 The engine creates message by calling allocate_kernel_string. Kernel takes ownership when it
 receives EngineExecResult::Failure, consumes the handle exactly once, and frees it. The
-`AllocateErrorFn` argument to allocate_kernel_string is only for reporting a failure in that
+`ErrorAllocators` argument to allocate_kernel_string is only for reporting a failure in that
 downcall, such as invalid UTF-8; it does not own the returned string. `AllocateStringFn` is a
 separate general-purpose conversion callback for temporary Kernel strings. It is not the error
 allocator and should not be introduced as a third error-message ownership model.
@@ -522,10 +517,10 @@ pub struct CMetadataEntries {
 pub unsafe extern "C" fn set_metadata(
     builder: *mut FfiBuilder,
     entries: CMetadataEntries,
-    allocate_error: AllocateErrorFn,
+    error_allocators: *const ErrorAllocators,
 ) -> ExternResult<bool> {
     let result = unsafe { set_metadata_impl(builder, entries) };
-    unsafe { result.into_extern_result(&allocate_error) }
+    unsafe { result.into_extern_result(&*error_allocators) }
 }
 
 unsafe fn set_metadata_impl(
@@ -782,12 +777,20 @@ The host keeps `hint` and all reachable memory alive for the call. Rust validate
 full graph before changing the builder. One call avoids partial state and callback choreography.
 The setter consumes the builder on both success and error, returning its replacement on success.
 
+## Source layout
+
+Prefer mirroring the `kernel/src/` module hierarchy in `ffi/src/` for corresponding APIs.
+Snapshot hints live under `src/snapshot/hint/`, matching `kernel/src/snapshot/hint.rs`.
+Snapshot builders live in `src/snapshot/builder.rs`; snapshot accessors live in `src/lib.rs`.
+FFI-specific ownership, conversion, and engine support code can use its own modules.
+
 ## Key Files
 
 - `src/lib.rs` -- main FFI entry points and type definitions
 - `src/delta_types.rs` -- reusable borrowed C representations of Delta state and actions,
   with their backing storage and conversions colocated
-- `src/snapshot_hint/` -- typed snapshot-hint input and callback export
+- `src/snapshot/builder.rs` -- snapshot builders and their configuration
+- `src/snapshot/hint/` -- typed snapshot-hint input and callback export
 - `src/handle.rs` -- opaque handle system for passing Rust objects across FFI
 - `src/column_default.rs` -- column-default (`allowColumnDefaults`) reads and the write-path ack
 - `src/scan.rs` -- scan FFI interface
@@ -804,7 +807,7 @@ The setter consumes the builder on both success and error, returning its replace
 get_default_engine() -> get_snapshot_builder() -> snapshot_builder_build() -> scan() -> scan_metadata() -> read + transform
 ```
 
-Snapshot builder API (`ffi/src/lib.rs` and `ffi/src/snapshot_hint/mod.rs`):
+Snapshot builder API (`ffi/src/snapshot/builder.rs` and `ffi/src/snapshot/hint/mod.rs`):
 - `get_snapshot_builder(path, engine)` -- fresh snapshot from a table path
 - `get_snapshot_builder_from(old_snapshot, engine)` -- incremental update reusing an existing snapshot (avoids re-reading the log)
 - `snapshot_builder_with_version(builder, version)` -- optional: pin to a specific version
@@ -847,12 +850,24 @@ publication watermark.
 When built with `adaptive-metadata-in-dev`, typed export rejects CRCs containing experimental
 adaptive-metadata `lastManifestCommit` or Add `backReference` state.
 
-Snapshot accessors (`ffi/src/lib.rs`) read a built `SharedSnapshot` without I/O -- e.g. `version`,
-`snapshot_timestamp`, and `snapshot_file_stats`, which returns `OptionalValue<FfiFileStats>` (scalar
+`snapshot_log_segment(snapshot, context, visitor)` exposes the existing retained segment without
+I/O through one borrowed `FfiLogSegment` callback. It includes commit, compaction, and top-level
+checkpoint files, optional latest commit/CRC metadata, checkpoint version, and the known publication
+watermark. It preserves staged paths independently of that watermark. The snapshot is borrowed;
+copy all retained values before the callback returns. It does not implement snapshot equivalence
+or establish freshness.
+
+Snapshot accessors (`ffi/src/lib.rs`) include no-I/O reads such as `version` and
+`snapshot_file_stats`, which returns `OptionalValue<FfiFileStats>` (scalar
 `num_files` / `table_size_bytes` from the CRC; `None` when the snapshot has no CRC, or its CRC lacks
 complete file stats). `visit_file_size_histogram` exposes the optional variable-length histogram in
 the same file stats: it invokes one callback with borrowed `i64` slices for bin boundaries, file
 counts, and total bytes; callers must copy values they retain after the callback.
+
+`snapshot_timestamp` uses a synchronous `SnapshotReader` and may read commit JSON when the
+In-Commit Timestamp is unavailable from retained CRC state. Domain-metadata and transaction-version
+FFI reads also use an unscoped reader, preserving the engine's cancellation and timeout behavior.
+The C API signatures do not expose reader state or a cancellation token.
 
 Domain-metadata reads live in `ffi/src/domain_metadata.rs`: `get_domain_metadata` /
 `visit_domain_metadata` for user domains, and `visit_clustering_columns`, which reports one
@@ -908,7 +923,9 @@ reuses `ScanMetadataArrowResult` with null `transforms`.
 ## Write Flow
 
 Rust builders are aliases for `TransactionBuilder<CreateTable>` and
-`TransactionBuilder<UpdateTable>`. Keep their concrete opaque FFI descriptors and explicit
+`TransactionBuilder<UpdateTable>`, both using the default `Imperative` execution mode. Rust callers
+can select another mode on the builder; the FFI descriptors expose imperative transactions.
+Keep their concrete opaque FFI descriptors and explicit
 `create_table_txn_builder_*` / `update_table_txn_builder_*` exports. Shared Rust setters do not imply
 a universal C handle; custom setters are exposed only for their applicable builder descriptor.
 Rust-only builder aliases carry `cbindgen:ignore` so header generation uses the descriptors rather
@@ -936,6 +953,13 @@ constructors likewise require engine info and `data_change`, with the operation 
 `CREATE TABLE`.
 
 `update_table_txn_commit()` and `create_table_txn_commit()` return a `Handle<ExclusiveCommittedTransaction>` that the caller can read via `committed_transaction_version` and `committed_transaction_post_commit_snapshot`, then must release with `free_committed_transaction`. The post-commit snapshot, when present, is a separate `SharedSnapshot` handle that must be freed with `free_snapshot`.
+
+Transaction identifiers can be added before build with the `*_txn_builder_with_transaction_id`
+setters, or after build with `update_table_txn_with_transaction_id` /
+`create_table_txn_with_transaction_id`. The post-build setters consume the transaction on success
+or error and return its replacement on success. Duplicate application ids among builder ids are
+rejected at build. Duplicates involving ids added after build, including collisions with builder
+ids, are rejected at commit.
 
 Write context: `update_table_txn_get_unpartitioned_write_context` covers unpartitioned tables. For partitioned tables, build a `PartitionValueMap` (`partition_value_map_new` + the typed `partition_value_map_insert_*` functions, one entry per partition column keyed by logical name) and pass it to `update_table_txn_get_partitioned_write_context` (consumes the map). Then use `get_write_dir` for the partition's target directory (Hive-style prefix or random prefix), `visit_partition_values` to read the physical `partitionValues` to record in each Add action, and `resolve_file_path` to turn a written file's URL into its relative `add.path`. The `create_table_*` variants apply the same flow to a create-table transaction whose partition columns were declared with `create_table_txn_builder_with_partition_columns`.
 

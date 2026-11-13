@@ -2,14 +2,14 @@
 
 use std::sync::Arc;
 
-use tracing::debug;
+use tracing::trace;
 use url::Url;
 
 use crate::plans::{IoOperation, Operation, PlanBuilder, PlanExecutor};
 use crate::schema::SchemaRef;
 use crate::{
     EngineData, FileDataReadResultIterator, FileMeta, FileSize, KernelError, KernelResult,
-    KernelResultIteratorStatic, ParquetFooter, ParquetHandler, PredicateRef,
+    KernelResultIterator, ParquetFooter, ParquetHandler, PredicateRef,
 };
 
 /// A [`ParquetHandler`] that delegates to a [`PlanExecutor`].
@@ -53,7 +53,7 @@ impl ParquetHandler for PlanBasedParquetHandler {
     fn write_parquet_file(
         &self,
         location: Url,
-        data: KernelResultIteratorStatic<Box<dyn EngineData>>,
+        data: Box<dyn KernelResultIterator<Box<dyn EngineData>>>,
     ) -> KernelResult<FileSize> {
         let Some(fallback) = &self.fallback else {
             return Err(KernelError::unsupported(
@@ -61,7 +61,7 @@ impl ParquetHandler for PlanBasedParquetHandler {
                  handler is configured",
             ));
         };
-        debug!(%location, "PlanBasedParquetHandler delegating write_parquet_file to fallback handler");
+        trace!(%location, "PlanBasedParquetHandler delegating write_parquet_file to fallback handler");
         fallback.write_parquet_file(location, data)
     }
 
@@ -87,10 +87,10 @@ mod tests {
     use crate::arrow::array::{Array, Int64Array, RecordBatch};
     use crate::engine::arrow_conversion::TryIntoKernel as _;
     use crate::engine::arrow_data::ArrowEngineData;
-    use crate::engine::sync::plan::SyncPlanExecutor;
     use crate::engine::sync::SyncEngine;
+    use crate::engine::sync::plan::SyncPlanExecutor;
     use crate::parquet::arrow::arrow_writer::ArrowWriter;
-    use crate::schema::{schema_ref, SchemaRef};
+    use crate::schema::{SchemaRef, schema_ref};
     use crate::{Engine as _, EngineData, FileMeta, ParquetHandler as _};
 
     fn make_handler() -> PlanBasedParquetHandler {

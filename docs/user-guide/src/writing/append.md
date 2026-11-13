@@ -34,7 +34,7 @@ may differ.
 # use delta_kernel::transaction::{CommitResult, UpdateTableOperation};
 # use delta_kernel::{KernelResult, Snapshot};
 # #[tokio::main]
-# async fn main() -> KernelResult<()> {
+# async fn main() -> KernelResult<(), Box<dyn std::error::Error>> {
 # let url = delta_kernel::try_parse_uri("/tmp/table")?;
 # let engine = DefaultEngine::builder(store_from_url(&url)?).build();
 // 1. Get a snapshot
@@ -105,6 +105,14 @@ These inputs cannot be changed on the returned builder or transaction.
 If the table declares column defaults, resolve any defaults your input needs and acknowledge them
 before requesting write state. See [Column defaults](./column_defaults.md) for both Kernel-parsed
 and connector-evaluated defaults.
+
+If the table declares CHECK constraints, acknowledge that your connector enforces them before
+requesting write state. See [Check constraints](./check_constraints.md) for discovery and
+validation.
+
+If the table has generated columns, acknowledge that your connector enforces them before requesting
+write state. See [Generated columns](./generated_columns.md) for discovery, computing, and
+verification.
 
 Before writing data, obtain a `WriteState` from the transaction. Bind the state to create a
 `BoundWriteContext`, which bundles everything needed to correctly write Parquet files:

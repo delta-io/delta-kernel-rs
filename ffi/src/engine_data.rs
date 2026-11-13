@@ -1,23 +1,23 @@
 //! EngineData related ffi code
 use std::ffi::c_void;
 
+use delta_kernel::EngineData;
+#[cfg(feature = "default-engine-base")]
+use delta_kernel::KernelResult;
 #[cfg(feature = "default-engine-base")]
 use delta_kernel::arrow;
 #[cfg(feature = "default-engine-base")]
 use delta_kernel::arrow::array::{
-    ffi::{FFI_ArrowArray, FFI_ArrowSchema},
     ArrayData, RecordBatch, StructArray,
+    ffi::{FFI_ArrowArray, FFI_ArrowSchema},
 };
 #[cfg(feature = "default-engine-base")]
 use delta_kernel::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt as _};
-use delta_kernel::EngineData;
-#[cfg(feature = "default-engine-base")]
-use delta_kernel::KernelResult;
 
 use super::handle::Handle;
-#[cfg(feature = "default-engine-base")]
-use crate::error::AllocateErrorFn;
 use crate::ExclusiveEngineData;
+#[cfg(feature = "default-engine-base")]
+use crate::error::ErrorAllocators;
 #[cfg(feature = "default-engine-base")]
 use crate::{ExternResult, IntoExternResult, SharedExternEngine};
 
@@ -25,7 +25,7 @@ use crate::{ExternResult, IntoExternResult, SharedExternEngine};
 ///
 /// # Safety
 /// `data_handle` must be a valid pointer to a kernel allocated `ExclusiveEngineData`
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn engine_data_length(data: &mut Handle<ExclusiveEngineData>) -> usize {
     let data = unsafe { data.as_mut() };
     data.len()
@@ -42,9 +42,9 @@ pub unsafe extern "C" fn engine_data_length(data: &mut Handle<ExclusiveEngineDat
 // pointers, we will need to define an `ExternEngineData` trait that exposes such capability, along
 // with an ExternEngineDataVtable that implements it. See `ExternEngine` and `ExternEngineVtable`
 // for examples of how that works.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn get_raw_engine_data(mut data: Handle<ExclusiveEngineData>) -> *mut c_void {
-    let ptr = get_raw_engine_data_impl(&mut data) as *mut dyn EngineData;
+    let ptr = unsafe { get_raw_engine_data_impl(&mut data) } as *mut dyn EngineData;
     ptr as _
 }
 
@@ -102,14 +102,15 @@ impl ArrowFFIData {
 /// data_handle must be a valid ExclusiveEngineData as read by the
 /// [`delta_kernel_default_engine::DefaultEngine`] obtained from `get_default_engine`.
 #[cfg(feature = "default-engine-base")]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn get_raw_arrow_data(
     data: Handle<ExclusiveEngineData>,
     engine: Handle<SharedExternEngine>,
 ) -> ExternResult<*mut ArrowFFIData> {
     // TODO(frj): This consumes the handle. Is that what we really want?
     let data = unsafe { data.into_inner() };
-    get_raw_arrow_data_impl(data).into_extern_result(&engine.as_ref())
+    let result = get_raw_arrow_data_impl(data);
+    unsafe { result.into_extern_result(&engine.as_ref()) }
 }
 
 #[cfg(feature = "default-engine-base")]
@@ -136,7 +137,7 @@ fn get_raw_arrow_data_impl(data: Box<dyn EngineData>) -> KernelResult<*mut Arrow
 /// `result` must be either null, or a pointer returned by a kernel FFI function that produces
 /// `*mut ArrowFFIData`. Must be called at most once per non-null pointer.
 #[cfg(feature = "default-engine-base")]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn free_arrow_ffi_data(result: *mut ArrowFFIData) {
     if result.is_null() {
         return;
@@ -151,17 +152,24 @@ pub unsafe extern "C" fn free_arrow_ffi_data(result: *mut ArrowFFIData) {
 /// ownership of the schema stays the engine's.
 ///
 /// # Safety
+///
+/// `error_allocators` must point to an initialized [`ErrorAllocators`] for this call. Its context
+/// and callbacks must remain valid for every use and support concurrent calls if shared across
+/// threads.
 /// - `array` must be a valid FFI_ArrowArray
 /// - `schema` must be a valid pointer to a FFI_ArrowSchema
-/// - `allocate_error` must be a valid error allocation function
+/// - `error_allocators` must satisfy the callback table requirements above
 #[cfg(feature = "default-engine-base")]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn get_engine_data(
     array: FFI_ArrowArray,
     schema: &FFI_ArrowSchema,
-    allocate_error: AllocateErrorFn,
+    error_allocators: *const ErrorAllocators,
 ) -> ExternResult<Handle<ExclusiveEngineData>> {
-    get_engine_data_impl(array, schema).into_extern_result(&allocate_error)
+    unsafe {
+        let result = get_engine_data_impl(array, schema);
+        result.into_extern_result(&*error_allocators)
+    }
 }
 
 #[cfg(feature = "default-engine-base")]

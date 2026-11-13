@@ -4,8 +4,8 @@ use std::borrow::{Cow, ToOwned};
 use crate::schema::UserDefinedType;
 use crate::schema::{ArrayType, DataType, MapType, PrimitiveType, StructField, StructType};
 use crate::transforms::{
-    map_owned_children_or_else, map_owned_or_else, map_owned_pair_or_else, transform_output_type,
-    Carrier,
+    Carrier, map_owned_children_or_else, map_owned_or_else, map_owned_pair_or_else,
+    transform_output_type,
 };
 
 /// Generic framework for describing recursive bottom-up schema transforms.
@@ -136,10 +136,18 @@ pub trait SchemaTransform<'a> {
         Carrier::from_inner(Cow::Borrowed(udt))
     }
 
+    /// Called for each file value encountered. The provided implementation just
+    /// forwards to [`Self::recurse_into_struct`].
+    fn transform_file(&mut self, stype: &'a StructType) -> Self::Output<StructType> {
+        self.recurse_into_struct(stype)
+    }
+
     /// General entry point for a recursive traversal over any data type. Also invoked internally to
     /// dispatch on nested data types encountered during the traversal.
     fn transform(&mut self, data_type: &'a DataType) -> Self::Output<DataType> {
-        match data_type {
+        // Decoding accepts schemas whose traversal can exhaust the caller's stack.
+        // Match serde_stacker's defaults: keep 64 KiB in reserve and use 2 MiB stack segments.
+        stacker::maybe_grow(64 * 1024, 2 * 1024 * 1024, || match data_type {
             DataType::Primitive(ptype) => {
                 let child = self.transform_primitive(ptype);
                 map_owned_or_else(data_type, child, DataType::from)
@@ -165,7 +173,11 @@ pub trait SchemaTransform<'a> {
                 let child = self.transform_user_defined(udt);
                 map_owned_or_else(data_type, child, DataType::UserDefined)
             }
-        }
+            DataType::File(stype) => {
+                let child = self.transform_file(stype);
+                map_owned_or_else(data_type, child, |s| DataType::File(Box::new(s)))
+            }
+        })
     }
 
     /// Recursively transforms a struct field's data type (unary).
@@ -277,7 +289,7 @@ impl<'a> SchemaTransform<'a> for SchemaDepthChecker {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schema::{schema, DataType};
+    use crate::schema::{DataType, schema};
 
     #[test]
     fn test_depth_checker() {

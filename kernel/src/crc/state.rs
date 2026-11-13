@@ -9,8 +9,8 @@
 //! - [`DomainMetadataState`] tracks domain-metadata completeness (Complete / Partial).
 //! - [`SetTransactionState`] tracks set-transaction completeness (Complete / Partial).
 
-use std::collections::hash_map::Entry;
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 
 use delta_kernel_derive::internal_api;
 
@@ -22,7 +22,7 @@ use crate::{KernelError, KernelResult};
 ///
 /// # State transitions during `Crc::apply`
 ///
-/// | Current       | + safe op     | + unsafe op or missing remove.size |
+/// | Current       | + safe op     | + unsafe op or missing counted size |
 /// |---------------|---------------|------------------------------------|
 /// | Complete      | Complete      | Indeterminate                      |
 /// | Indeterminate | Indeterminate | Indeterminate                      |
@@ -35,9 +35,12 @@ pub enum FileStatsState {
     Complete(FileStats),
     /// File stats cannot be determined incrementally. Reasons include a non-incremental
     /// operation (like `ANALYZE STATS`) that re-adds files without corresponding removes,
-    /// or a remove action with a missing `size` field. A full add/remove reconciliation pass
-    /// can recover `Complete`.
-    Indeterminate,
+    /// or a counted remove action with a missing `size` field. A full add/remove reconciliation
+    /// pass can recover `Complete`.
+    Indeterminate {
+        /// Operation that prevented incremental statistics, when known.
+        unsupported_operation: Option<String>,
+    },
 }
 
 impl FileStatsState {
@@ -58,9 +61,10 @@ impl FileStatsState {
 
     /// Returns `true` if file stats cannot be determined incrementally and require a full
     /// add/remove reconciliation pass to recover.
-    #[cfg(any(test, feature = "test-utils"))]
+    // Downstream tests need `internal-api` to access the CRC module.
+    #[cfg(any(test, all(feature = "test-utils", feature = "internal-api")))]
     pub fn is_indeterminate(&self) -> bool {
-        self == &Self::Indeterminate
+        matches!(self, Self::Indeterminate { .. })
     }
 }
 
@@ -144,7 +148,7 @@ fn domain_metadata_map(
     Ok(result)
 }
 
-#[cfg(any(test, feature = "test-utils"))]
+#[cfg(any(test, all(feature = "test-utils", feature = "internal-api")))]
 #[allow(clippy::panic)]
 impl DomainMetadataState {
     /// Test-only: returns the map if `Complete`, panics otherwise.
@@ -230,7 +234,7 @@ fn transaction_map(
     Ok(result)
 }
 
-#[cfg(any(test, feature = "test-utils"))]
+#[cfg(any(test, all(feature = "test-utils", feature = "internal-api")))]
 #[allow(clippy::panic)]
 impl SetTransactionState {
     /// Test-only: returns the map if `Complete`, panics otherwise.
@@ -283,7 +287,13 @@ mod tests {
 
     #[test]
     fn indeterminate_returns_none_for_file_stats() {
-        assert!(FileStatsState::Indeterminate.file_stats().is_none());
+        assert!(
+            FileStatsState::Indeterminate {
+                unsupported_operation: None,
+            }
+            .file_stats()
+            .is_none()
+        );
     }
 
     #[test]
@@ -292,7 +302,9 @@ mod tests {
         assert!(complete.is_complete());
         assert!(!complete.is_indeterminate());
 
-        let indet = FileStatsState::Indeterminate;
+        let indet = FileStatsState::Indeterminate {
+            unsupported_operation: None,
+        };
         assert!(!indet.is_complete());
         assert!(indet.is_indeterminate());
     }

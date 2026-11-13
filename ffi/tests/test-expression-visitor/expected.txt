@@ -113,6 +113,17 @@ StructExpression
   ArrayConstructor
     Integer(1)
     Integer(2)
+  CaseWhen
+    Column(flag)
+    Integer(10)
+    Column(other_flag)
+    Integer(20)
+    Integer(30)
+  CaseWhen
+    Column(flag)
+    Integer(10)
+    Null(Integer)
+  Integer(40)
   Divide
     Integer(0)
     Integer(0)
@@ -155,6 +166,10 @@ And
     Integer(42)
     Double(1.111000)
   Unknown(intrigue)
+  CaseWhen
+    Column(flag)
+    Boolean(1)
+    Boolean(0)
   Equal
     Integer(0)
     Integer(0)

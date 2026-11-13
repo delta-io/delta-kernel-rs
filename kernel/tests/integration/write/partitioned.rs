@@ -4,12 +4,13 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use chrono::{NaiveDate, NaiveDateTime, TimeZone, Utc};
+use delta_kernel::Snapshot;
 use delta_kernel::actions::{MAX_VALUES, MIN_VALUES, NULL_COUNT};
 #[cfg(feature = "nanosecond-timestamps")]
 use delta_kernel::arrow::array::TimestampNanosecondArray;
 use delta_kernel::arrow::array::{
     Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float32Array,
-    Float64Array, Int16Array, Int32Array, Int64Array, Int8Array, RecordBatch, StringArray,
+    Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, RecordBatch, StringArray,
     TimestampMicrosecondArray,
 };
 use delta_kernel::arrow::datatypes::Schema as ArrowSchema;
@@ -17,12 +18,14 @@ use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::expressions::Scalar;
-use delta_kernel::schema::{schema, schema_ref, DataType, StructField, StructType};
+use delta_kernel::schema::{
+    DataType, IntervalDayToSecondType, IntervalYearToMonthType, StructField, StructType, schema,
+    schema_ref,
+};
 use delta_kernel::table_features::ColumnMappingMode;
+use delta_kernel::transaction::UpdateTableOperation;
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
-use delta_kernel::transaction::UpdateTableOperation;
-use delta_kernel::Snapshot;
 use rstest::rstest;
 use test_utils::{get_column, read_scan, test_table_setup_mt, write_batch_to_table};
 use url::Url;
@@ -132,18 +135,72 @@ async fn test_write_partitioned_normal_values_roundtrip(
     Ok(())
 }
 
-/// Writes an interval partition column, asserts the partitionValues entry is the Spark ANSI
-/// interval literal (CM=None), and verifies the value round-trips through a scan.
+/// Checks interval partition serialization and scanned values.
 #[rstest]
 #[case::year_month(
     DataType::INTERVAL_YEAR_MONTH,
-    Scalar::IntervalYearMonth(30),
+    Scalar::interval_year_month(30, IntervalYearToMonthType::IntervalYearToMonth).unwrap(),
     "INTERVAL '2-6' YEAR TO MONTH"
 )]
+#[case::year(
+    DataType::INTERVAL_YEAR,
+    Scalar::interval_year_month(24, IntervalYearToMonthType::IntervalYear).unwrap(),
+    "INTERVAL '2' YEAR"
+)]
+#[case::month(
+    DataType::INTERVAL_MONTH,
+    Scalar::interval_year_month(30, IntervalYearToMonthType::IntervalMonth).unwrap(),
+    "INTERVAL '30' MONTH"
+)]
 #[case::day_time(
-    DataType::INTERVAL_DAY_TIME,
-    Scalar::IntervalDayTime(131_445_000_000),
-    "INTERVAL '1 12:30:45' DAY TO SECOND"
+     DataType::INTERVAL_DAY_TIME,
+     Scalar::interval_day_time(131_445_000_000, IntervalDayToSecondType::IntervalDayToSecond).unwrap(),
+     "INTERVAL '1 12:30:45' DAY TO SECOND"
+ )]
+#[case::day(
+    DataType::INTERVAL_DAY,
+    Scalar::interval_day_time(86_400_000_000, IntervalDayToSecondType::IntervalDay).unwrap(),
+    "INTERVAL '1' DAY"
+)]
+#[case::hour(
+    DataType::INTERVAL_HOUR,
+    Scalar::interval_day_time(93_600_000_000, IntervalDayToSecondType::IntervalHour).unwrap(),
+    "INTERVAL '26' HOUR"
+)]
+#[case::minute(
+    DataType::INTERVAL_MINUTE,
+    Scalar::interval_day_time(93_780_000_000, IntervalDayToSecondType::IntervalMinute).unwrap(),
+    "INTERVAL '1563' MINUTE"
+)]
+#[case::second(
+    DataType::INTERVAL_SECOND,
+    Scalar::interval_day_time(93_784_500_000, IntervalDayToSecondType::IntervalSecond).unwrap(),
+    "INTERVAL '93784.5' SECOND"
+)]
+#[case::day_hour(
+    DataType::INTERVAL_DAY_HOUR,
+    Scalar::interval_day_time(93_600_000_000, IntervalDayToSecondType::IntervalDayToHour).unwrap(),
+    "INTERVAL '1 02' DAY TO HOUR"
+)]
+#[case::day_minute(
+    DataType::INTERVAL_DAY_MINUTE,
+    Scalar::interval_day_time(93_780_000_000, IntervalDayToSecondType::IntervalDayToMinute).unwrap(),
+    "INTERVAL '1 02:03' DAY TO MINUTE"
+)]
+#[case::hour_minute(
+    DataType::INTERVAL_HOUR_MINUTE,
+    Scalar::interval_day_time(93_780_000_000, IntervalDayToSecondType::IntervalHourToMinute).unwrap(),
+    "INTERVAL '26:03' HOUR TO MINUTE"
+)]
+#[case::hour_second(
+    DataType::INTERVAL_HOUR_SECOND,
+    Scalar::interval_day_time(93_784_500_000, IntervalDayToSecondType::IntervalHourToSecond).unwrap(),
+    "INTERVAL '26:03:04.5' HOUR TO SECOND"
+)]
+#[case::minute_second(
+    DataType::INTERVAL_MINUTE_SECOND,
+    Scalar::interval_day_time(93_784_500_000, IntervalDayToSecondType::IntervalMinuteToSecond).unwrap(),
+    "INTERVAL '1563:04.5' MINUTE TO SECOND"
 )]
 #[tokio::test(flavor = "multi_thread")]
 async fn test_write_partitioned_interval_roundtrip(
@@ -155,6 +212,22 @@ async fn test_write_partitioned_interval_roundtrip(
         ColumnMappingMode::Name,
         ColumnMappingMode::Id
     )]
+    cm_mode: ColumnMappingMode,
+) {
+    write_partitioned_interval_roundtrip(
+        interval,
+        partition_value,
+        expected_partition_value,
+        cm_mode,
+    )
+    .await
+    .unwrap();
+}
+
+async fn write_partitioned_interval_roundtrip(
+    interval: DataType,
+    partition_value: Scalar,
+    expected_partition_value: &str,
     cm_mode: ColumnMappingMode,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let schema = schema_ref! {
@@ -177,15 +250,17 @@ async fn test_write_partitioned_interval_roundtrip(
     )
     .await?;
 
-    // CM=None: the raw partitionValues entry is the Spark ANSI interval literal.
-    if cm_mode == ColumnMappingMode::None {
-        let (add, _rel) = read_single_add(&table_path, 1)?;
-        assert_eq!(
-            add["partitionValues"]["period"].as_str(),
-            Some(expected_partition_value),
-            "interval partition value should serialize to the ANSI literal"
-        );
-    }
+    let logical_schema = snapshot.schema();
+    let period_physical = logical_schema
+        .field("period")
+        .unwrap()
+        .physical_name(cm_mode);
+    let (add, _rel) = read_single_add(&table_path, 1)?;
+    assert_eq!(
+        add["partitionValues"][period_physical].as_str(),
+        Some(expected_partition_value),
+        "interval partition value should serialize to the ANSI literal"
+    );
 
     // The partition value round-trips: scan materializes `period` back as its physical integer.
     let sorted = read_sorted(&snapshot, engine as Arc<dyn delta_kernel::Engine>)?;
@@ -199,18 +274,132 @@ async fn test_write_partitioned_interval_roundtrip(
     Ok(())
 }
 
-/// Materialized interval partition columns are written into the Parquet file as physical integer
-/// values and still round-trip through scan output as logical partition columns.
+#[rstest]
+#[case::year_month(
+    DataType::INTERVAL_YEAR,
+    Scalar::interval_year_month(24, IntervalYearToMonthType::IntervalMonth).unwrap()
+)]
+#[case::day_time(
+    DataType::INTERVAL_DAY,
+    Scalar::interval_day_time(86_400_000_000, IntervalDayToSecondType::IntervalHour).unwrap()
+)]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_write_rejects_qualifier_mismatch(
+    #[case] interval: DataType,
+    #[case] partition_value: Scalar,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let schema = schema_ref! {
+        nullable "value": INTEGER,
+        nullable "period": (interval),
+    };
+    let (_tmp_dir, table_path, engine) = test_table_setup_mt()?;
+    let snapshot = create_interval_partitioned_table(
+        &table_path,
+        engine.as_ref(),
+        schema,
+        ColumnMappingMode::None,
+        false,
+    )?;
+    let data_schema = schema! { nullable "value": INTEGER };
+    let batch = RecordBatch::try_new(
+        Arc::new((&data_schema).try_into_arrow()?),
+        vec![Arc::new(Int32Array::from(vec![7]))],
+    )?;
+    let error = write_batch_to_table(
+        &snapshot,
+        engine.as_ref(),
+        batch,
+        HashMap::from([("period".to_string(), partition_value)]),
+    )
+    .await
+    .expect_err("mismatched partition qualifier should fail");
+    assert!(
+        error
+            .to_string()
+            .contains("partition column 'period' has type")
+    );
+
+    let latest = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
+    assert_eq!(latest.version(), snapshot.version());
+    Ok(())
+}
+
+/// Checks partitionValues spelling before validating materialized Parquet columns and scans.
 #[rstest]
 #[case::year_month(
     DataType::INTERVAL_YEAR_MONTH,
-    Scalar::IntervalYearMonth(30),
+    Scalar::interval_year_month(30, IntervalYearToMonthType::IntervalYearToMonth).unwrap(),
     "INTERVAL '2-6' YEAR TO MONTH"
 )]
+#[case::year(
+    DataType::INTERVAL_YEAR,
+    Scalar::interval_year_month(24, IntervalYearToMonthType::IntervalYear).unwrap(),
+    "INTERVAL '2' YEAR"
+)]
+#[case::month(
+    DataType::INTERVAL_MONTH,
+    Scalar::interval_year_month(30, IntervalYearToMonthType::IntervalMonth).unwrap(),
+    "INTERVAL '30' MONTH"
+)]
 #[case::day_time(
-    DataType::INTERVAL_DAY_TIME,
-    Scalar::IntervalDayTime(131_445_000_000),
-    "INTERVAL '1 12:30:45' DAY TO SECOND"
+     DataType::INTERVAL_DAY_TIME,
+     Scalar::interval_day_time(131_445_000_000, IntervalDayToSecondType::IntervalDayToSecond).unwrap(),
+     "INTERVAL '1 12:30:45' DAY TO SECOND"
+ )]
+#[case::day(
+    DataType::INTERVAL_DAY,
+    Scalar::interval_day_time(86_400_000_000, IntervalDayToSecondType::IntervalDay).unwrap(),
+    "INTERVAL '1' DAY"
+)]
+#[case::hour(
+    DataType::INTERVAL_HOUR,
+    Scalar::interval_day_time(93_600_000_000, IntervalDayToSecondType::IntervalHour).unwrap(),
+    "INTERVAL '26' HOUR"
+)]
+#[case::minute(
+    DataType::INTERVAL_MINUTE,
+    Scalar::interval_day_time(93_780_000_000, IntervalDayToSecondType::IntervalMinute).unwrap(),
+    "INTERVAL '1563' MINUTE"
+)]
+#[case::second(
+    DataType::INTERVAL_SECOND,
+    Scalar::interval_day_time(93_784_500_000, IntervalDayToSecondType::IntervalSecond).unwrap(),
+    "INTERVAL '93784.5' SECOND"
+)]
+#[case::day_hour(
+    DataType::INTERVAL_DAY_HOUR,
+    Scalar::interval_day_time(93_600_000_000, IntervalDayToSecondType::IntervalDayToHour).unwrap(),
+    "INTERVAL '1 02' DAY TO HOUR"
+)]
+#[case::day_hour_negative(
+    DataType::INTERVAL_DAY_HOUR,
+    Scalar::interval_day_time(-93_600_000_000, IntervalDayToSecondType::IntervalDayToHour).unwrap(),
+    "INTERVAL '-1 02' DAY TO HOUR"
+)]
+#[case::day_minute(
+    DataType::INTERVAL_DAY_MINUTE,
+    Scalar::interval_day_time(93_780_000_000, IntervalDayToSecondType::IntervalDayToMinute).unwrap(),
+    "INTERVAL '1 02:03' DAY TO MINUTE"
+)]
+#[case::day_minute_negative(
+    DataType::INTERVAL_DAY_MINUTE,
+    Scalar::interval_day_time(-93_780_000_000, IntervalDayToSecondType::IntervalDayToMinute).unwrap(),
+    "INTERVAL '-1 02:03' DAY TO MINUTE"
+)]
+#[case::hour_minute(
+    DataType::INTERVAL_HOUR_MINUTE,
+    Scalar::interval_day_time(93_780_000_000, IntervalDayToSecondType::IntervalHourToMinute).unwrap(),
+    "INTERVAL '26:03' HOUR TO MINUTE"
+)]
+#[case::hour_second(
+    DataType::INTERVAL_HOUR_SECOND,
+    Scalar::interval_day_time(93_784_500_000, IntervalDayToSecondType::IntervalHourToSecond).unwrap(),
+    "INTERVAL '26:03:04.5' HOUR TO SECOND"
+)]
+#[case::minute_second(
+    DataType::INTERVAL_MINUTE_SECOND,
+    Scalar::interval_day_time(93_784_500_000, IntervalDayToSecondType::IntervalMinuteToSecond).unwrap(),
+    "INTERVAL '1563:04.5' MINUTE TO SECOND"
 )]
 #[tokio::test(flavor = "multi_thread")]
 async fn test_materialized_partitioned_interval_roundtrip(
@@ -222,6 +411,22 @@ async fn test_materialized_partitioned_interval_roundtrip(
         ColumnMappingMode::Name,
         ColumnMappingMode::Id
     )]
+    cm_mode: ColumnMappingMode,
+) {
+    materialized_partitioned_interval_roundtrip(
+        interval,
+        partition_value,
+        expected_partition_value,
+        cm_mode,
+    )
+    .await
+    .unwrap();
+}
+
+async fn materialized_partitioned_interval_roundtrip(
+    interval: DataType,
+    partition_value: Scalar,
+    expected_partition_value: &str,
     cm_mode: ColumnMappingMode,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let schema = schema_ref! {
@@ -790,14 +995,14 @@ fn assert_interval_value(batch: &RecordBatch, column_name: &str, expected: &Scal
         Scalar::IntervalYearMonth(months) => {
             assert_eq!(
                 get_column!(batch, column_name, Int32Array).value(0),
-                *months,
+                months.months(),
                 "interval year-month column {column_name}"
             );
         }
         Scalar::IntervalDayTime(micros) => {
             assert_eq!(
                 get_column!(batch, column_name, Int64Array).value(0),
-                *micros,
+                micros.micros(),
                 "interval day-time column {column_name}"
             );
         }
@@ -1115,8 +1320,8 @@ fn read_single_add(
 /// `partitionValues`. Verifies that contract end-to-end through the kernel `create_table`
 /// builder.
 #[tokio::test(flavor = "multi_thread")]
-async fn test_materialized_partition_columns_excluded_from_stats(
-) -> Result<(), Box<dyn std::error::Error>> {
+async fn test_materialized_partition_columns_excluded_from_stats()
+-> Result<(), Box<dyn std::error::Error>> {
     let _ = tracing_subscriber::fmt::try_init();
 
     let partition_col = "partition";

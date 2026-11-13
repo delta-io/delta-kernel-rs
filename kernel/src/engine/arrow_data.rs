@@ -3,14 +3,14 @@ use std::sync::Arc;
 
 use derive_more::From;
 use itertools::Itertools;
-use tracing::debug;
+use tracing::trace;
 
 use crate::arrow::array::cast::AsArray;
 #[cfg(feature = "nanosecond-timestamps")]
 use crate::arrow::array::types::TimestampNanosecondType;
 use crate::arrow::array::types::{
-    Date32Type, Decimal128Type, Float32Type, Float64Type, GenericStringType, Int16Type, Int32Type,
-    Int64Type, Int8Type, TimestampMicrosecondType,
+    Date32Type, Decimal128Type, Float32Type, Float64Type, GenericStringType, Int8Type, Int16Type,
+    Int32Type, Int64Type, TimestampMicrosecondType,
 };
 use crate::arrow::array::{
     Array, ArrayRef, GenericByteArray, OffsetSizeTrait, RecordBatch, RunArray, StringViewArray,
@@ -227,7 +227,7 @@ impl EngineData for ArrowEngineData {
                 cur_parent = parent.parent();
             }
         }
-        debug!(
+        trace!(
             "Column map for selected columns {leaf_columns:?} has {} entries",
             column_map.len()
         );
@@ -294,6 +294,9 @@ impl EngineData for ArrowEngineData {
                 self.len()
             ))
         );
+        if !selection_vector.contains(&false) {
+            return Ok(self);
+        }
         selection_vector.resize(self.len(), true);
         let filtered = filter_record_batch(&self.data, &selection_vector.into())?;
         Ok(Box::new(Self::new(filtered)))
@@ -337,7 +340,7 @@ impl ArrowEngineData {
                     ColumnState::Parent => {
                         // Parent path - recurse if it's a struct
                         if let Some(struct_array) = column.as_struct_opt() {
-                            debug!(
+                            trace!(
                                 "Recurse into a struct array for {}",
                                 ColumnName::new(path.iter())
                             );
@@ -347,7 +350,7 @@ impl ArrowEngineData {
                     ColumnState::AwaitingGetter(data_type) => {
                         // Leaf column - extract and transition to HasGetter
                         let getter = if column.data_type() == &ArrowDataType::Null {
-                            debug!("Pushing a null array for {}", ColumnName::new(path.iter()));
+                            trace!("Pushing a null array for {}", ColumnName::new(path.iter()));
                             &() as &'a dyn GetData<'a>
                         } else {
                             Self::extract_leaf_column(path, data_type, column)?
@@ -362,7 +365,7 @@ impl ArrowEngineData {
                     }
                 }
             } else {
-                debug!("Skipping unmasked path {}", ColumnName::new(path.iter()));
+                trace!("Skipping unmasked path {}", ColumnName::new(path.iter()));
             }
             path.pop();
         }
@@ -421,14 +424,14 @@ impl ArrowEngineData {
         };
         let result: KernelResult<&'a dyn GetData<'a>, _> = match data_type {
             &DataType::BOOLEAN => {
-                debug!("Pushing boolean array for {}", ColumnName::new(path));
+                trace!("Pushing boolean array for {}", ColumnName::new(path));
                 col.as_boolean_opt()
                     .map(|a| a as _)
                     .or_else(|| Self::try_extract_with_ree(col))
                     .ok_or("bool")
             }
             &DataType::STRING => {
-                debug!("Pushing string array for {}", ColumnName::new(path));
+                trace!("Pushing string array for {}", ColumnName::new(path));
                 col.as_string_opt::<i32>()
                     .map(|a| a as _)
                     .or_else(|| col.as_string_opt::<i64>().map(|a| a as _))
@@ -437,7 +440,7 @@ impl ArrowEngineData {
                     .ok_or("string")
             }
             &DataType::BINARY => {
-                debug!("Pushing binary array for {}", ColumnName::new(path));
+                trace!("Pushing binary array for {}", ColumnName::new(path));
                 col.as_binary_opt::<i32>()
                     .map(|a| a as _)
                     .or_else(|| col.as_binary_opt::<i64>().map(|a| a as _))
@@ -446,70 +449,73 @@ impl ArrowEngineData {
                     .ok_or("binary")
             }
             &DataType::BYTE => {
-                debug!("Pushing int8 array for {}", ColumnName::new(path));
+                trace!("Pushing int8 array for {}", ColumnName::new(path));
                 col.as_primitive_opt::<Int8Type>()
                     .map(|a| a as _)
                     .ok_or("byte")
             }
             &DataType::SHORT => {
-                debug!("Pushing int16 array for {}", ColumnName::new(path));
+                trace!("Pushing int16 array for {}", ColumnName::new(path));
                 col.as_primitive_opt::<Int16Type>()
                     .map(|a| a as _)
                     .ok_or("short")
             }
             &DataType::INTEGER => {
-                debug!("Pushing int32 array for {}", ColumnName::new(path));
+                trace!("Pushing int32 array for {}", ColumnName::new(path));
                 col.as_primitive_opt::<Int32Type>()
                     .map(|a| a as _)
                     .or_else(|| Self::try_extract_with_ree(col))
                     .ok_or("int")
             }
             &DataType::LONG => {
-                debug!("Pushing int64 array for {}", ColumnName::new(path));
+                trace!("Pushing int64 array for {}", ColumnName::new(path));
                 col.as_primitive_opt::<Int64Type>()
                     .map(|a| a as _)
                     .or_else(|| Self::try_extract_with_ree(col))
                     .ok_or("long")
             }
             &DataType::FLOAT => {
-                debug!("Pushing float array for {}", ColumnName::new(path));
+                trace!("Pushing float array for {}", ColumnName::new(path));
                 col.as_primitive_opt::<Float32Type>()
                     .map(|a| a as _)
                     .ok_or("float")
             }
             &DataType::DOUBLE => {
-                debug!("Pushing double array for {}", ColumnName::new(path));
+                trace!("Pushing double array for {}", ColumnName::new(path));
                 col.as_primitive_opt::<Float64Type>()
                     .map(|a| a as _)
                     .ok_or("double")
             }
             &DataType::DATE => {
-                debug!("Pushing date array for {}", ColumnName::new(path));
+                trace!("Pushing date array for {}", ColumnName::new(path));
                 col.as_primitive_opt::<Date32Type>()
                     .map(|a| a as _)
                     .ok_or("date")
             }
             &DataType::TIMESTAMP | &DataType::TIMESTAMP_NTZ => {
-                debug!("Pushing timestamp array for {}", ColumnName::new(path));
+                trace!("Pushing timestamp array for {}", ColumnName::new(path));
                 col.as_primitive_opt::<TimestampMicrosecondType>()
                     .map(|a| a as _)
                     .ok_or("timestamp")
             }
             #[cfg(feature = "nanosecond-timestamps")]
             &DataType::TIMESTAMP_NANOS | &DataType::TIMESTAMP_NANOS_NTZ => {
-                debug!("Pushing timestamp array for {}", ColumnName::new(path));
+                trace!(
+                    "Pushing timestamp nanos array for {}",
+                    ColumnName::new(path)
+                );
                 col.as_primitive_opt::<TimestampNanosecondType>()
                     .map(|a| a as _)
                     .ok_or("timestamp_nanos")
             }
             DataType::Primitive(PrimitiveType::Decimal(_)) => {
-                debug!("Pushing decimal array for {}", ColumnName::new(path));
+                trace!("Pushing decimal array for {}", ColumnName::new(path));
                 col.as_primitive_opt::<Decimal128Type>()
                     .map(|a| a as _)
                     .ok_or("decimal")
             }
             DataType::Array(array) if matches!(array.element_type(), DataType::Struct(_)) => {
-                debug!("Pushing struct list for {}", ColumnName::new(path));
+                trace!("Pushing struct list for {}", ColumnName::new(path));
                 // A nested visitor sees one row per element and cannot observe a skipped one, so
                 // reject nullable elements up front, where the column can still be named.
                 require!(
@@ -522,11 +528,11 @@ impl ArrowEngineData {
                 col_as_list_like(is_struct_type).ok_or("array<struct>")
             }
             DataType::Array(_) => {
-                debug!("Pushing list for {}", ColumnName::new(path));
+                trace!("Pushing list for {}", ColumnName::new(path));
                 col_as_list_like(is_string_type).ok_or("array<string>")
             }
             DataType::Map(_) => {
-                debug!("Pushing map for {}", ColumnName::new(path));
+                trace!("Pushing map for {}", ColumnName::new(path));
                 col_as_map().ok_or("map<string, string>")
             }
             data_type => {
@@ -553,8 +559,8 @@ mod tests {
 
     use rstest::rstest;
 
-    use super::{extract_record_batch, ArrowEngineData};
-    use crate::actions::{get_commit_schema, Metadata, Protocol, LOG_PROTOCOL_SCHEMA};
+    use super::{ArrowEngineData, extract_record_batch};
+    use crate::actions::{LOG_PROTOCOL_SCHEMA, Metadata, Protocol, get_commit_schema};
     use crate::arrow::array::types::{Int32Type, Int64Type};
     use crate::arrow::array::{
         Array, ArrayRef, AsArray, BinaryArray, BooleanArray, Int32Array, Int64Array,
@@ -566,10 +572,10 @@ mod tests {
         DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
     };
     use crate::engine::sync::SyncEngine;
-    use crate::engine::test_utils::{struct_list_fixture_as, CollectNVisitor, ListFlavor};
+    use crate::engine::test_utils::{CollectNVisitor, ListFlavor, struct_list_fixture_as};
     use crate::engine_data::{GetData, ListItem, MapItem, RowVisitor, TypedGetData};
-    use crate::expressions::{column_name, ArrayData};
-    use crate::schema::{schema, schema_ref, ArrayType, ColumnName, ColumnNamesAndTypes, DataType};
+    use crate::expressions::{ArrayData, column_name};
+    use crate::schema::{ArrayType, ColumnName, ColumnNamesAndTypes, DataType, schema, schema_ref};
     use crate::table_features::TableFeature;
     use crate::unit_test_utils::{assert_result_error_with_message, string_array_to_engine_data};
     use crate::{Engine as _, EngineData as _, KernelResult};
@@ -2047,6 +2053,22 @@ mod tests {
         let column = batch.column(0).as_string::<i32>();
         let values: Vec<_> = column.iter().flatten().collect();
         assert_eq!(values, ["b", "c"]);
+        Ok(())
+    }
+
+    #[rstest]
+    #[case::empty(vec![])]
+    #[case::shorter_all_true(vec![true])]
+    #[case::all_true(vec![true, true, true])]
+    fn test_apply_selection_vector_selecting_all_rows_returns_data_unfiltered(
+        #[case] selection_vector: Vec<bool>,
+    ) -> KernelResult<()> {
+        let data = string_array_to_engine_data(StringArray::from(vec!["a", "b", "c"]));
+        let column = extract_record_batch(data.as_ref())?.column(0).clone();
+        let filtered = data.apply_selection_vector(selection_vector)?;
+        let batch = extract_record_batch(filtered.as_ref())?;
+        assert_eq!(batch.num_rows(), 3);
+        assert!(Arc::ptr_eq(batch.column(0), &column));
         Ok(())
     }
 

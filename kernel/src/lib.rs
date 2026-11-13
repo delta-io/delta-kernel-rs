@@ -7,6 +7,9 @@
 //! The [`delta_kernel_default_engine`](https://docs.rs/delta_kernel_default_engine) crate provides
 //! a ready-to-use implementation based on Arrow, `object_store`, and Tokio.
 //!
+//! The [Delta Kernel user guide](https://docs.delta.io/kernel/rust/) explains end-to-end connector
+//! workflows. This crate's rustdoc is the source of truth for exact API contracts.
+//!
 //! A full `rust` example for reading table data using the default engine can be found in the
 //! [read-table-single-threaded] example (and for a more complex multi-threaded reader see the
 //! [read-table-multi-threaded] example). An example for reading the table changes for a table
@@ -149,7 +152,7 @@ pub mod utils;
 pub(crate) mod utils;
 
 #[cfg(feature = "internal-api")]
-pub use utils::{try_parse_uri, CollectInto, FoldWithOption};
+pub use utils::{CollectInto, FoldWithOption, try_parse_uri};
 
 // for the below modules, we cannot introduce a macro to clean this up. rustfmt doesn't follow into
 // macros, and so will not format the files associated with these modules if we get too clever. see:
@@ -188,30 +191,40 @@ pub mod parallel;
 pub(crate) mod parallel;
 
 pub use action_reconciliation::{ActionReconciliationIterator, ActionReconciliationIteratorState};
-use cancellation::{check_cancelled, CancellableIterator};
+use cancellation::{CancellableIterator, check_cancelled};
 pub use cancellation::{CancellationToken, CancellationTokenRef, CancelledFuture};
 pub use delta_kernel_derive;
 pub use engine_data::{
     EngineData, FilteredEngineData, FilteredRowVisitor, GetData, RowIndexIterator, RowVisitor,
 };
 pub use error::{
-    Error, KernelError, KernelResult, KernelResultIterator, KernelResultIteratorStatic, Result,
-    ResultIterator, ResultIteratorStatic,
+    DeltaError, DeltaErrorCondition, DeltaErrorParameter, Error, KernelError, KernelResult,
+    KernelResultIterator, Result,
 };
 use expressions::Scalar;
 pub use expressions::{Expression, ExpressionRef, Predicate, PredicateRef};
-pub use log_compaction::{should_compact, LogCompactionWriter};
+pub use log_compaction::{LogCompactionWriter, should_compact};
 #[cfg(feature = "declarative-plans")]
 pub use plans::{IoOperation, Operation, PlanBuilder, PlanExecutor, PlanResult};
 use schema::StructField;
-pub use snapshot::{Snapshot, SnapshotRef};
+pub use snapshot::{Snapshot, SnapshotReader, SnapshotRef};
 
+// `test-utils` exposes the test engines without requiring Arrow or declarative plans.
 #[cfg(any(
     feature = "default-engine-base",
     feature = "arrow-conversion",
-    feature = "declarative-plans"
+    feature = "declarative-plans",
+    feature = "test-utils"
 ))]
 pub mod engine;
+
+#[cfg(not(any(
+    feature = "default-engine-base",
+    feature = "arrow-conversion",
+    feature = "declarative-plans",
+    feature = "test-utils"
+)))]
+pub(crate) mod engine;
 
 /// Delta table version is 8 byte unsigned int
 pub type Version = u64;
@@ -233,7 +246,7 @@ pub type FileSlice = (Url, Option<Range<FileIndex>>);
 pub type FileDataReadResult = (FileMeta, Box<dyn EngineData>);
 
 /// An iterator of data read from specified files
-pub type FileDataReadResultIterator = KernelResultIteratorStatic<Box<dyn EngineData>>;
+pub type FileDataReadResultIterator = Box<dyn KernelResultIterator<Box<dyn EngineData>>>;
 
 /// The metadata that describes an object.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -477,9 +490,13 @@ pub trait EvaluationHandler: AsAny {
     ///
     /// If the provided output type is a struct, its fields describe the columns of output produced
     /// by the evaluator. Otherwise, the output schema is a single column named "output" of the
-    /// specified `output_type`. In all cases, the output schema is only used for its names (all
-    /// field names will be updated to match) and nullability (non-nullable columns can be converted
-    /// to nullable). Any mismatch in types (including number of columns) will produce an error.
+    /// specified `output_type`. Output field names and nullability are updated to match
+    /// `output_type` (non-nullable columns can be made nullable). Incompatible types or a different
+    /// number of columns produce an error.
+    ///
+    /// The Arrow-based evaluator casts compatible leaf types to the requested output types. It
+    /// uses Arrow's safe casts: reducing timestamp precision truncates toward zero, and values
+    /// that cannot be converted (for example, timestamp scaling overflow) become null.
     ///
     /// # Parameters
     ///
@@ -569,7 +586,7 @@ pub trait StorageHandler: AsAny {
     ///   contains all files at or below that directory.
     /// - Otherwise, the parent is the directory containing `path`, and only files (at any depth
     ///   under that parent) whose full path sorts strictly greater than `path` are returned.
-    fn list_from(&self, path: &Url) -> KernelResult<KernelResultIteratorStatic<FileMeta>>;
+    fn list_from(&self, path: &Url) -> KernelResult<Box<dyn KernelResultIterator<FileMeta>>>;
 
     /// Cancellation-aware variant of [`list_from`].
     ///
@@ -583,14 +600,17 @@ pub trait StorageHandler: AsAny {
         &self,
         path: &Url,
         cancellation_token: Option<CancellationTokenRef>,
-    ) -> KernelResult<KernelResultIteratorStatic<FileMeta>> {
+    ) -> KernelResult<Box<dyn KernelResultIterator<FileMeta>>> {
         check_cancelled(cancellation_token.as_ref())?;
         let iter = self.list_from(path)?;
         Ok(Box::new(CancellableIterator::new(iter, cancellation_token)))
     }
 
     /// Read data specified by the start and end offset from the file.
-    fn read_files(&self, files: Vec<FileSlice>) -> KernelResult<KernelResultIteratorStatic<Bytes>>;
+    fn read_files(
+        &self,
+        files: Vec<FileSlice>,
+    ) -> KernelResult<Box<dyn KernelResultIterator<Bytes>>>;
 
     /// Cancellation-aware variant of [`read_files`].
     ///
@@ -604,7 +624,7 @@ pub trait StorageHandler: AsAny {
         &self,
         files: Vec<FileSlice>,
         cancellation_token: Option<CancellationTokenRef>,
-    ) -> KernelResult<KernelResultIteratorStatic<Bytes>> {
+    ) -> KernelResult<Box<dyn KernelResultIterator<Bytes>>> {
         check_cancelled(cancellation_token.as_ref())?;
         let iter = self.read_files(files)?;
         Ok(Box::new(CancellableIterator::new(iter, cancellation_token)))
@@ -737,7 +757,7 @@ pub trait JsonHandler: AsAny {
     fn write_json_file(
         &self,
         path: &Url,
-        data: KernelResultIterator<'_, FilteredEngineData>,
+        data: Box<dyn KernelResultIterator<FilteredEngineData> + '_>,
         overwrite: bool,
     ) -> KernelResult<FileSize>;
 }
@@ -991,7 +1011,7 @@ pub trait ParquetHandler: AsAny {
     fn write_parquet_file(
         &self,
         location: url::Url,
-        data: KernelResultIteratorStatic<Box<dyn EngineData>>,
+        data: Box<dyn KernelResultIterator<Box<dyn EngineData>>>,
     ) -> KernelResult<FileSize>;
 
     /// Read the footer metadata from a Parquet file without reading the data.
@@ -1052,6 +1072,10 @@ pub trait ParquetHandler: AsAny {
 /// on Delta tables.
 ///
 /// Connectors pass an implementation of this trait to Delta Kernel operations.
+/// See the [Engine implementation guide] for the cross-API workflow.
+///
+/// [Engine implementation guide]:
+/// https://docs.delta.io/kernel/rust/connector/implementing_engine.html
 pub trait Engine: AsAny {
     /// Get the connector provided [`EvaluationHandler`].
     fn evaluation_handler(&self) -> Arc<dyn EvaluationHandler>;
@@ -1112,11 +1136,12 @@ mod tests {
         let meta = FileMeta::new(Url::parse("file:///x").unwrap(), 0, size);
         match expected {
             Some(v) => assert_eq!(meta.size_as_i64().unwrap(), v),
-            None => assert!(meta
-                .size_as_i64()
-                .unwrap_err()
-                .to_string()
-                .contains("exceeds i64::MAX")),
+            None => assert!(
+                meta.size_as_i64()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("exceeds i64::MAX")
+            ),
         }
     }
 }

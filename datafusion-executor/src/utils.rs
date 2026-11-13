@@ -2,7 +2,7 @@
 
 use datafusion::common::{Column as DFColumn, DFSchema, DataFusionError, Result as DFResult};
 use datafusion::functions::core::expr_fn::get_field_path;
-use datafusion::logical_expr::{lit, Expr as DFExpr};
+use datafusion::logical_expr::{Expr as DFExpr, lit};
 use delta_kernel::expressions::ColumnName as KernelColumnName;
 use delta_kernel::schema::StructType;
 use delta_kernel::{KernelError, KernelResult};
@@ -14,7 +14,7 @@ pub(crate) trait ColumnResolver {
 
     /// Validates and returns the root DataFusion column.
     fn resolve_column(&self, name: &KernelColumnName)
-        -> std::result::Result<DFColumn, Self::Error>;
+    -> std::result::Result<DFColumn, Self::Error>;
 }
 
 /// Lowers a column reference to a nested field access, e.g. `a.b.c` becomes a single

@@ -198,13 +198,29 @@ let score = StructField::nullable("score", DataType::DOUBLE);
 
 Fields can carry arbitrary key-value metadata:
 
-```rust,ignore
-let field = StructField::nullable("price", DataType::decimal(18, 2)?)
+```rust
+# extern crate delta_kernel;
+# use delta_kernel::schema::{DataType, MetadataValue, StructField};
+# use delta_kernel::KernelResult;
+# fn main() -> KernelResult<()> {
+let mut field = StructField::nullable("price", DataType::decimal(18, 2)?)
     .with_metadata([("description", "Unit price in USD")]);
+
+field.metadata.insert("comment".into(), "Retail price".into());
+assert_eq!(
+    field.metadata.get("comment"),
+    Some(&MetadataValue::String("Retail price".into()))
+);
+let key = String::from("comment");
+assert!(field.metadata.get(key.as_str()).is_some());
+# Ok(())
+# }
 ```
 
-Metadata is stored as a `HashMap<String, MetadataValue>`. The `MetadataValue` enum
-supports strings, numbers (`i64`), booleans, and arbitrary JSON.
+Metadata is stored as a `HashMap<MetadataKey, MetadataValue>`. `MetadataKey` shares storage
+for common keys and preserves custom key names. To insert a key directly, convert it with
+`.into()`. To look up a key, use `&str`; for a `String` key, pass `key.as_str()`.
+The `MetadataValue` enum supports strings, numbers (`i64`), booleans, and arbitrary JSON.
 
 ## Reading a table's schema
 
@@ -215,8 +231,8 @@ Every `Snapshot` exposes the table's schema:
 # extern crate delta_kernel_default_engine;
 # use delta_kernel_default_engine::DefaultEngine;
 # use delta_kernel_default_engine::storage::store_from_url;
-# use delta_kernel::{KernelResult, Snapshot};
-# fn main() -> KernelResult<()> {
+# use delta_kernel::Snapshot;
+# fn main() -> delta_kernel::Result<()> {
 # let url = delta_kernel::try_parse_uri("/tmp/table")?;
 # let engine = DefaultEngine::builder(store_from_url(&url)?).build();
 let snapshot = Snapshot::builder_for(url).build(&engine)?;

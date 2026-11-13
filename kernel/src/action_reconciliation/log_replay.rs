@@ -38,9 +38,9 @@ use url::Url;
 use crate::engine_data::{FilteredEngineData, GetData, RowVisitor, TypedGetData as _};
 use crate::log_replay::deduplicator::{Deduplicator as _, FileActionInfo};
 use crate::log_replay::{ActionsBatch, FileActionDeduplicator, FileActionKey, HasSelectionVector};
-use crate::schema::{column_name, ColumnName, ColumnNamesAndTypes, DataType};
+use crate::schema::{ColumnName, ColumnNamesAndTypes, DataType, column_name};
 use crate::utils::require;
-use crate::{KernelError, KernelResult, KernelResultIteratorStatic};
+use crate::{KernelError, KernelResult, KernelResultIterator};
 
 /// Filters log segment actions for action reconciliation.
 pub(crate) struct ActionReconciliationProcessor {
@@ -81,6 +81,8 @@ pub(crate) struct ActionReconciliationBatch {
     pub(crate) actions_count: i64,
     /// The number of add actions in the batch.
     pub(crate) add_actions_count: i64,
+    /// The number of retained remove actions in the batch.
+    pub(crate) remove_actions_count: i64,
 }
 
 impl HasSelectionVector for ActionReconciliationBatch {
@@ -89,23 +91,31 @@ impl HasSelectionVector for ActionReconciliationBatch {
     }
 }
 
-/// Stats for ActionReconciliationIterator
+/// Counts of selected actions in batches consumed from an [`ActionReconciliationIterator`].
 #[derive(Debug, Default)]
 pub struct ActionReconciliationIteratorState {
     actions_count: AtomicI64,
     add_actions_count: AtomicI64,
+    remove_actions_count: AtomicI64,
     is_exhausted: AtomicBool,
 }
 
 impl ActionReconciliationIteratorState {
-    /// Get the total number of actions processed
+    /// Returns the number of selected actions in the consumed batches.
     pub fn actions_count(&self) -> i64 {
         self.actions_count.load(Ordering::Acquire)
     }
 
-    /// Get the total number of add actions processed
+    /// Returns the number of selected Add-file actions in the consumed batches.
     pub fn add_actions_count(&self) -> i64 {
         self.add_actions_count.load(Ordering::Acquire)
+    }
+
+    /// Returns the number of retained Remove-file actions in the consumed batches.
+    ///
+    /// Duplicate file actions and expired tombstones do not contribute to this count.
+    pub fn remove_actions_count(&self) -> i64 {
+        self.remove_actions_count.load(Ordering::Acquire)
     }
 
     /// True if the iterator has been exhausted (all batches processed)
@@ -119,6 +129,7 @@ impl ActionReconciliationIteratorState {
         Self {
             actions_count: AtomicI64::new(actions_count),
             add_actions_count: AtomicI64::new(add_actions_count),
+            remove_actions_count: AtomicI64::new(0),
             is_exhausted: AtomicBool::new(true),
         }
     }
@@ -129,13 +140,13 @@ impl ActionReconciliationIteratorState {
 /// This iterator yields a stream of [`FilteredEngineData`] items while, tracking action
 /// counts. Used by both checkpoint and log compaction workflows.
 pub struct ActionReconciliationIterator {
-    inner: KernelResultIteratorStatic<ActionReconciliationBatch>,
+    inner: Box<dyn KernelResultIterator<ActionReconciliationBatch>>,
     state: Arc<ActionReconciliationIteratorState>,
 }
 
 impl ActionReconciliationIterator {
     /// Create a new iterator with counters initialized to 0
-    pub(crate) fn new(inner: KernelResultIteratorStatic<ActionReconciliationBatch>) -> Self {
+    pub(crate) fn new(inner: Box<dyn KernelResultIterator<ActionReconciliationBatch>>) -> Self {
         Self {
             inner,
             state: Arc::new(ActionReconciliationIteratorState::default()),
@@ -163,6 +174,9 @@ impl ActionReconciliationIterator {
             self.state
                 .add_actions_count
                 .fetch_add(batch.add_actions_count, Ordering::Release);
+            self.state
+                .remove_actions_count
+                .fetch_add(batch.remove_actions_count, Ordering::Release);
             batch.filtered_data
         }))
     }
@@ -192,8 +206,7 @@ impl ActionReconciliationProcessor {
     ///
     /// This method delegates the filtering logic to the [`ActionReconciliationVisitor`], which
     /// implements the deduplication rules described in the module documentation. The method
-    /// tracks statistics about processed actions (total count, add actions count) and maintains
-    /// state for cross-batch deduplication.
+    /// counts selected actions and maintains state for cross-batch deduplication.
     pub(crate) fn process_actions_batch(
         &mut self,
         actions_batch: ActionsBatch,
@@ -229,6 +242,7 @@ impl ActionReconciliationProcessor {
             filtered_data,
             actions_count: visitor.actions_count,
             add_actions_count: visitor.add_actions_count,
+            remove_actions_count: visitor.remove_actions_count,
         })
     }
 
@@ -304,6 +318,8 @@ pub(crate) struct ActionReconciliationVisitor<'seen> {
     actions_count: i64,
     // i64 to match the `_last_checkpoint` file schema
     add_actions_count: i64,
+    // i64 to match the other action counters
+    remove_actions_count: i64,
     // i64 for comparison with remove.deletionTimestamp
     minimum_file_retention_timestamp: i64,
     // Flag to track if we've seen a protocol action so we can keep only the first protocol action
@@ -394,6 +410,7 @@ impl ActionReconciliationVisitor<'_> {
             selection_vector,
             actions_count: 0,
             add_actions_count: 0,
+            remove_actions_count: 0,
             minimum_file_retention_timestamp,
             seen_protocol,
             seen_metadata,
@@ -459,9 +476,11 @@ impl ActionReconciliationVisitor<'_> {
         } else if is_add {
             self.add_actions_count += 1;
             true
+        } else if self.is_expired_tombstone(i, getters[Self::REMOVE_DELETION_TIMESTAMP.index])? {
+            false
         } else {
-            // Expired remove actions are not valid
-            !self.is_expired_tombstone(i, getters[Self::REMOVE_DELETION_TIMESTAMP.index])?
+            self.remove_actions_count += 1;
+            true
         };
         Ok(Some(is_valid))
     }
@@ -536,14 +555,13 @@ impl ActionReconciliationVisitor<'_> {
 
         // Exclude the winner when retention has expired it. A txn without last_updated never
         // expires (kept for backward compatibility).
-        if let Some(retention_ts) = self.txn_expiration_timestamp {
-            if let Some(last_updated) =
+        if let Some(retention_ts) = self.txn_expiration_timestamp
+            && let Some(last_updated) =
                 getters[Self::TXN_LAST_UPDATED.index].get_opt(i, Self::TXN_LAST_UPDATED.name)?
-            {
-                let last_updated: i64 = last_updated;
-                if last_updated <= retention_ts {
-                    return Ok(Some(false));
-                }
+        {
+            let last_updated: i64 = last_updated;
+            if last_updated <= retention_ts {
+                return Ok(Some(false));
             }
         }
 
@@ -695,9 +713,9 @@ mod tests {
     use itertools::Itertools;
 
     use super::*;
+    use crate::KernelError;
     use crate::arrow::array::StringArray;
     use crate::unit_test_utils::{action_batch, parse_json_batch};
-    use crate::KernelError;
 
     /// Helper function to create test batches from JSON strings
     fn create_batch(json_strings: Vec<&str>) -> KernelResult<ActionsBatch> {
@@ -760,6 +778,7 @@ mod tests {
 
         assert_eq!(visitor.actions_count, 5);
         assert_eq!(visitor.add_actions_count, 1);
+        assert_eq!(visitor.remove_actions_count, 1);
         assert!(visitor.seen_protocol);
         assert!(visitor.seen_metadata);
         assert_eq!(visitor.seen_txns.len(), 1);
@@ -776,8 +795,8 @@ mod tests {
     /// - Remove actions with deletionTimestamp > minimumFileRetentionTimestamp (should be included)
     /// - Remove actions with missing deletionTimestamp (defaults to 0, should be excluded)
     #[test]
-    fn test_action_reconciliation_visitor_boundary_cases_for_tombstone_expiration(
-    ) -> KernelResult<()> {
+    fn test_action_reconciliation_visitor_boundary_cases_for_tombstone_expiration()
+    -> KernelResult<()> {
         let json_strings: StringArray = vec![
             r#"{"remove":{"path":"exactly_at_threshold","deletionTimestamp":100,"dataChange":true,"partitionValues":{}}}"#,
             r#"{"remove":{"path":"one_below_threshold","deletionTimestamp":99,"dataChange":true,"partitionValues":{}}}"#,
@@ -811,6 +830,67 @@ mod tests {
         assert_eq!(visitor.selection_vector, expected);
         assert_eq!(visitor.actions_count, 1);
         assert_eq!(visitor.add_actions_count, 0);
+        assert_eq!(visitor.remove_actions_count, 1);
+        Ok(())
+    }
+
+    #[rstest::rstest]
+    #[case::all_retained(98, 3)]
+    #[case::oldest_expired(99, 2)]
+    #[case::two_expired(100, 1)]
+    #[case::all_expired(101, 0)]
+    fn reconciliation_counts_retained_unique_file_actions_across_batches(
+        #[case] minimum_file_retention_timestamp: i64,
+        #[case] expected_remove_count: i64,
+    ) -> KernelResult<()> {
+        let input_batches = vec![
+            create_batch(vec![
+                r#"{"remove":{"path":"removed","deletionTimestamp":100,"dataChange":true}}"#,
+                r#"{"remove":{"path":"removed","deletionTimestamp":100,"dataChange":true}}"#,
+                r#"{"remove":{"path":"second","deletionTimestamp":101,"dataChange":true}}"#,
+                concat!(
+                    r#"{"add":{"path":"active","partitionValues":{},"size":1,"#,
+                    r#""modificationTime":1,"dataChange":true}}"#,
+                ),
+                r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}"#,
+            ])?,
+            create_batch(vec![
+                concat!(
+                    r#"{"add":{"path":"removed","partitionValues":{},"size":1,"#,
+                    r#""modificationTime":1,"dataChange":true}}"#,
+                ),
+                r#"{"remove":{"path":"active","deletionTimestamp":100,"dataChange":true}}"#,
+                r#"{"remove":{"path":"second","deletionTimestamp":101,"dataChange":true}}"#,
+                r#"{"remove":{"path":"third","deletionTimestamp":99,"dataChange":true}}"#,
+            ])?,
+        ];
+        let mut processor =
+            ActionReconciliationProcessor::new(minimum_file_retention_timestamp, None, None);
+        let iterator = ActionReconciliationIterator::new(Box::new(
+            input_batches
+                .into_iter()
+                .map(move |batch| processor.process_actions_batch(batch)),
+        ));
+        let state = iterator.state();
+        assert!(!state.is_exhausted());
+
+        let batches: Vec<_> = iterator.try_collect()?;
+
+        assert!(state.is_exhausted());
+        assert_eq!(state.add_actions_count(), 1);
+        assert_eq!(state.remove_actions_count(), expected_remove_count);
+        assert_eq!(state.actions_count(), expected_remove_count + 2);
+        let selected_rows: usize = batches
+            .iter()
+            .map(|batch| {
+                batch
+                    .selection_vector()
+                    .iter()
+                    .filter(|selected| **selected)
+                    .count()
+            })
+            .sum();
+        assert_eq!(selected_rows as i64, state.actions_count());
         Ok(())
     }
 
@@ -844,6 +924,7 @@ mod tests {
         assert_eq!(visitor.selection_vector, expected);
         assert_eq!(visitor.actions_count, 1);
         assert_eq!(visitor.add_actions_count, 1);
+        assert_eq!(visitor.remove_actions_count, 0);
         // The action should NOT be added to the seen_file_keys set as it's a reconciled batch
         // and actions in reconciled batches do not conflict with each other.
         // This is a key difference from log batches, where actions can conflict.
@@ -886,6 +967,7 @@ mod tests {
         assert_eq!(visitor.selection_vector, expected);
         assert_eq!(visitor.actions_count, 3);
         assert_eq!(visitor.add_actions_count, 1);
+        assert_eq!(visitor.remove_actions_count, 2);
 
         Ok(())
     }
@@ -1045,7 +1127,7 @@ mod tests {
 
         // Verify results
         assert_eq!(results.len(), 2); // The third batch should be filtered out since there are no
-                                      // selected actions
+        // selected actions
         assert_eq!(results[0].selection_vector(), &vec![true]);
         assert_eq!(results[1].selection_vector(), &vec![false, true]);
         assert_eq!(actions_count, 2);
@@ -1057,8 +1139,8 @@ mod tests {
     /// This test ensures that the processor correctly deduplicates and filters
     /// file actions (add, remove) with deletion vectors across multiple batches.
     #[test]
-    fn test_action_reconciliation_actions_iter_file_actions_with_deletion_vectors(
-    ) -> KernelResult<()> {
+    fn test_action_reconciliation_actions_iter_file_actions_with_deletion_vectors()
+    -> KernelResult<()> {
         // Batch 1: add actions with deletion vectors
         let batch1 = vec![
             // (file1, DV_ONE) New, should be included
@@ -1137,8 +1219,8 @@ mod tests {
     // the app_id must be dropped entirely: the expired newest suppresses the older duplicate, and
     // neither reaches the checkpoint. Guards against resurrecting the older txn (a stale winner).
     #[test]
-    fn test_action_reconciliation_expired_newest_txn_suppresses_older_txn_for_same_app(
-    ) -> KernelResult<()> {
+    fn test_action_reconciliation_expired_newest_txn_suppresses_older_txn_for_same_app()
+    -> KernelResult<()> {
         let json_strings: StringArray = vec![
             // Newest for "app" (visited first), expired.
             r#"{"txn":{"appId":"app","version":2,"lastUpdated":500}}"#,
@@ -1348,10 +1430,12 @@ mod tests {
         let getters = vec![&getter as &dyn GetData<'_>; 5]; // Wrong count (should be 15)!
         let result = visitor.visit(1, &getters);
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("Wrong number of visitor getters"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Wrong number of visitor getters")
+        );
 
         // Test 2: Basic type mismatch errors using parameterized approach
         let test_cases = [
@@ -1377,10 +1461,12 @@ mod tests {
                 getters.iter().map(|g| g as &dyn GetData<'_>).collect();
             let result = visitor.visit(1, &getter_refs);
             assert!(result.is_err(), "Expected error for {field_name}");
-            assert!(result
-                .unwrap_err()
-                .to_string()
-                .contains(expected_error_text));
+            assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains(expected_error_text)
+            );
         }
     }
 
@@ -1437,10 +1523,12 @@ mod tests {
         getters.extend(defaults2.iter().map(|g| g as &dyn GetData<'_>));
         let result = visitor.visit(1, &getters);
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("deletionTimestamp is not of type i64"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("deletionTimestamp is not of type i64")
+        );
     }
 
     #[test]

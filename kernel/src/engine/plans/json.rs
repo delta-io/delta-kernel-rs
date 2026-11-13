@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use tracing::debug;
+use tracing::trace;
 use url::Url;
 
 use crate::engine::arrow_utils;
@@ -62,7 +62,7 @@ impl JsonHandler for PlanBasedJsonHandler {
     fn write_json_file(
         &self,
         path: &Url,
-        data: KernelResultIterator<'_, FilteredEngineData>,
+        data: Box<dyn KernelResultIterator<FilteredEngineData> + '_>,
         overwrite: bool,
     ) -> KernelResult<FileSize> {
         let Some(fallback) = &self.fallback else {
@@ -71,7 +71,7 @@ impl JsonHandler for PlanBasedJsonHandler {
                  handler is configured",
             ));
         };
-        debug!(%path, "PlanBasedJsonHandler delegating write_json_file to fallback handler");
+        trace!(%path, "PlanBasedJsonHandler delegating write_json_file to fallback handler");
         fallback.write_json_file(path, data, overwrite)
     }
 }
@@ -84,17 +84,17 @@ mod tests {
     use std::sync::Arc;
 
     use rstest::rstest;
-    use tempfile::{tempdir, NamedTempFile};
+    use tempfile::{NamedTempFile, tempdir};
     use url::Url;
 
     use super::PlanBasedJsonHandler;
     use crate::arrow::array::{Array, Int32Array, RecordBatch, StringArray};
     use crate::engine::arrow_data::ArrowEngineData;
     use crate::engine::plans::parquet::PlanBasedParquetHandler;
-    use crate::engine::sync::plan::SyncPlanExecutor;
     use crate::engine::sync::SyncEngine;
+    use crate::engine::sync::plan::SyncPlanExecutor;
     use crate::engine_data::FilteredEngineData;
-    use crate::schema::{schema_ref, SchemaRef};
+    use crate::schema::{SchemaRef, schema_ref};
     use crate::{
         Engine as _, EngineData, FileDataReadResultIterator, FileMeta, JsonHandler as _,
         KernelResult, ParquetHandler as _,

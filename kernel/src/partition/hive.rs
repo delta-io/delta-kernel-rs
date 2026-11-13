@@ -123,7 +123,7 @@ pub(crate) fn build_partition_path(columns: &[(&str, Option<&str>)]) -> String {
 ///
 /// On Windows, additional characters are escaped. See the module-level encoding rules.
 fn needs_escaping(b: u8) -> bool {
-    if matches!(
+    let must_escape = matches!(
         b,
         0x00..=0x1F
             | b'"'
@@ -141,14 +141,11 @@ fn needs_escaping(b: u8) -> bool {
             | b'['
             | b']'
             | b'^'
-    ) {
-        return true;
-    }
+    );
+    // Keep Windows-only branches out of coverage on other platforms.
     #[cfg(target_os = "windows")]
-    if matches!(b, b' ' | b'<' | b'>' | b'|') {
-        return true;
-    }
-    false
+    let must_escape = must_escape || matches!(b, b' ' | b'<' | b'>' | b'|');
+    must_escape
 }
 
 #[cfg(test)]
@@ -169,12 +166,13 @@ mod tests {
         out.extend_from_slice(&bytes[..first]);
         let mut i = first;
         while i < bytes.len() {
-            if bytes[i] == b'%' && i + 2 < bytes.len() {
-                if let (Some(hi), Some(lo)) = (from_hex(bytes[i + 1]), from_hex(bytes[i + 2])) {
-                    out.push(hi << 4 | lo);
-                    i += 3;
-                    continue;
-                }
+            if bytes[i] == b'%'
+                && i + 2 < bytes.len()
+                && let (Some(hi), Some(lo)) = (from_hex(bytes[i + 1]), from_hex(bytes[i + 2]))
+            {
+                out.push(hi << 4 | lo);
+                i += 3;
+                continue;
             }
             out.push(bytes[i]);
             i += 1;

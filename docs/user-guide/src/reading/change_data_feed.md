@@ -17,9 +17,9 @@ disabled for any version in the range, `TableChanges::try_new` returns an error.
 
 ## Creating a TableChanges
 
-`TableChanges::try_new` takes a table URL, an `Engine` reference, a start version, and an
-optional end version. It validates that CDF is enabled and that the schema is compatible
-across the requested range.
+To read changes, pass a table URL or local directory path, an `Engine` reference, a start
+version, and an optional end version to
+[`TableChanges::try_new`](https://docs.rs/delta_kernel/latest/delta_kernel/table_changes/struct.TableChanges.html#method.try_new).
 
 ```rust,no_run
 # extern crate delta_kernel;
@@ -27,13 +27,12 @@ across the requested range.
 # use delta_kernel_default_engine::DefaultEngine;
 # use delta_kernel_default_engine::storage::store_from_url;
 # use delta_kernel::table_changes::TableChanges;
-# use delta_kernel::KernelResult;
-# fn example() -> KernelResult<()> {
+# fn example() -> delta_kernel::Result<()> {
 # let url = delta_kernel::try_parse_uri("/tmp/my-table")?;
 # let store = store_from_url(&url)?;
 # let engine = DefaultEngine::builder(store).build();
 // Read changes from version 0 through version 5 (inclusive)
-let table_changes = TableChanges::try_new(url, &engine, 0, Some(5))?;
+let table_changes = TableChanges::try_new("/tmp/my-table", &engine, 0, Some(5))?;
 # Ok(())
 # }
 ```
@@ -47,13 +46,12 @@ table at the time of the call.
 # use delta_kernel_default_engine::DefaultEngine;
 # use delta_kernel_default_engine::storage::store_from_url;
 # use delta_kernel::table_changes::TableChanges;
-# use delta_kernel::KernelResult;
-# fn example() -> KernelResult<()> {
+# fn example() -> delta_kernel::Result<()> {
 # let url = delta_kernel::try_parse_uri("/tmp/my-table")?;
 # let store = store_from_url(&url)?;
 # let engine = DefaultEngine::builder(store).build();
 // Read all changes from version 0 to the latest version
-let table_changes = TableChanges::try_new(url, &engine, 0, None)?;
+let table_changes = TableChanges::try_new("/tmp/my-table", &engine, 0, None)?;
 # Ok(())
 # }
 ```
@@ -64,7 +62,7 @@ let table_changes = TableChanges::try_new(url, &engine, 0, None)?;
 - The table schema at the start and end versions must be identical.
 - No unsupported reader features (other than deletion vectors) are enabled.
 
-If any check fails, it returns a `KernelError`.
+If any check fails, `try_new` returns an error.
 
 ## CDF metadata columns
 
@@ -94,12 +92,12 @@ project columns with `with_schema` and filter rows with `with_predicate`.
 # use delta_kernel_default_engine::storage::store_from_url;
 # use delta_kernel::expressions::{col, lit};
 # use delta_kernel::table_changes::TableChanges;
-# use delta_kernel::{KernelResult, Predicate};
-# fn example() -> KernelResult<()> {
+# use delta_kernel::Predicate;
+# fn example() -> delta_kernel::Result<()> {
 # let url = delta_kernel::try_parse_uri("/tmp/my-table")?;
 # let store = store_from_url(&url)?;
 # let engine = DefaultEngine::builder(store).build();
-# let table_changes = TableChanges::try_new(url, &engine, 0, Some(5))?;
+# let table_changes = TableChanges::try_new("/tmp/my-table", &engine, 0, Some(5))?;
 // 1. Project only the columns you need (including CDF metadata)
 let schema = table_changes
     .schema()
@@ -151,13 +149,12 @@ after building the scan), use `scan_builder` on an `Arc<TableChanges>` instead o
 # use delta_kernel_default_engine::DefaultEngine;
 # use delta_kernel_default_engine::storage::store_from_url;
 # use delta_kernel::table_changes::TableChanges;
-# use delta_kernel::KernelResult;
-# fn example() -> KernelResult<()> {
+# fn example() -> delta_kernel::Result<()> {
 # let url = delta_kernel::try_parse_uri("/tmp/my-table")?;
 # let store = store_from_url(&url)?;
 # let engine = DefaultEngine::builder(store).build();
 let table_changes = Arc::new(
-    TableChanges::try_new(url, &engine, 0, Some(5))?
+    TableChanges::try_new("/tmp/my-table", &engine, 0, Some(5))?
 );
 
 let scan = table_changes.clone().scan_builder().build()?;

@@ -10,14 +10,14 @@
 //! # use std::sync::Arc;
 //! # use test_utils::delta_kernel_default_engine::{DefaultEngine, DefaultEngineBuilder};
 //! # use delta_kernel::expressions::{col, lit};
-//! # use delta_kernel::{Predicate, Snapshot, SnapshotRef, KernelError, Engine};
+//! # use delta_kernel::{Predicate, Snapshot, SnapshotRef, Engine};
 //! # use delta_kernel::table_changes::TableChanges;
-//! # let path = "./tests/data/table-with-cdf";
-//! let url = delta_kernel::try_parse_uri(path)?;
+//! let path = "./tests/data/table-with-cdf";
+//! # let url = delta_kernel::try_parse_uri(path)?;
 //! # use test_utils::delta_kernel_default_engine::storage::store_from_url;
 //! # let engine = std::sync::Arc::new(DefaultEngineBuilder::new(store_from_url(&url)?).build());
 //! // Get the table changes (change data feed) between version 0 and 1
-//! let table_changes = TableChanges::try_new(url, engine.as_ref(), 0, Some(1))?;
+//! let table_changes = TableChanges::try_new(path, engine.as_ref(), 0, Some(1))?;
 //!
 //! // Optionally specify a schema and predicate to apply to the table changes scan
 //! let schema = table_changes
@@ -34,7 +34,7 @@
 //!
 //! // Execute the table changes scan to get a fallible iterator of `Box<dyn EngineData>`s
 //! let table_change_batches = table_changes_scan.execute(engine.clone())?;
-//! # Ok::<(), KernelError>(())
+//! # Ok::<(), delta_kernel::Error>(())
 //! ```
 use std::sync::{Arc, LazyLock};
 
@@ -47,15 +47,15 @@ use url::Url;
 use crate::log_segment::LogSegment;
 use crate::path::AsUrl;
 use crate::schema::compare::SchemaComparison as _;
-use crate::schema::{try_schema, DataType, Schema, StructField, StructType};
+use crate::schema::{DataType, Schema, StructField, StructType, try_schema};
 use crate::snapshot::{Snapshot, SnapshotRef};
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::{Operation, TableFeature};
 use crate::table_properties::{
     MATERIALIZED_ROW_COMMIT_VERSION_COLUMN_NAME, MATERIALIZED_ROW_ID_COLUMN_NAME,
 };
-use crate::utils::require;
-use crate::{Engine, KernelError, KernelResult, Version};
+use crate::utils::{require, try_parse_uri};
+use crate::{Engine, KernelError, KernelResult, KernelResultIterator, Result, Version};
 
 mod log_replay;
 mod net_changes;
@@ -212,13 +212,13 @@ static CDF_FIELDS: LazyLock<[StructField; 3]> = LazyLock::new(|| {
 ///  Get `TableChanges` for versions 0 to 1 (inclusive)
 ///  ```rust
 ///  # use test_utils::delta_kernel_default_engine::{storage::store_from_url, DefaultEngineBuilder};
-///  # use delta_kernel::{SnapshotRef, KernelError};
+///  # use delta_kernel::SnapshotRef;
 ///  # use delta_kernel::table_changes::TableChanges;
-///  # let path = "./tests/data/table-with-cdf";
-///  let url = delta_kernel::try_parse_uri(path)?;
+///  let path = "./tests/data/table-with-cdf";
+///  # let url = delta_kernel::try_parse_uri(path)?;
 ///  # let engine = DefaultEngineBuilder::new(store_from_url(&url)?).build();
-///  let table_changes = TableChanges::try_new(url, &engine, 0, Some(1))?;
-///  # Ok::<(), KernelError>(())
+///  let table_changes = TableChanges::try_new(path, &engine, 0, Some(1))?;
+///  # Ok::<(), delta_kernel::Error>(())
 ///  ````
 /// For more details, see the following sections of the protocol:
 /// - [Add CDC File](https://github.com/delta-io/delta/blob/master/PROTOCOL.md#add-cdc-file)
@@ -239,7 +239,7 @@ pub struct TableChanges {
 impl TableChanges {
     /// Creates a new [`TableChanges`] instance for the given version range. This function checks
     /// these properties:
-    /// - The change data feed table feature must be enabled in both the start or end versions.
+    /// - The change data feed table feature must be enabled in both the start and end versions.
     /// - Every enabled reader feature must be supported by the kernel.
     /// - The schemas at the start and end versions are the same.
     ///
@@ -247,17 +247,20 @@ impl TableChanges {
     /// range. It also does not check that the schema remains the same for the entire range.
     ///
     /// # Parameters
-    /// - `table_root`: url pointing at the table root (where `_delta_log` folder is located)
+    /// - `table_root`: URL or absolute or relative local directory path containing `_delta_log`.
+    ///   Local paths (including `file://` URLs) must name existing directories and are canonicalized.
+    ///   Relative paths are resolved against the current working directory.
     /// - `engine`: Implementation of [`Engine`] apis.
     /// - `start_version`: The start version of the change data feed
     /// - `end_version`: The end version (inclusive) of the change data feed. If this is none, this
     ///   defaults to the newest table version.
     pub fn try_new(
-        table_root: Url,
+        table_root: impl AsRef<str>,
         engine: &dyn Engine,
         start_version: Version,
         end_version: Option<Version>,
-    ) -> KernelResult<Self> {
+    ) -> Result<Self> {
+        let table_root = try_parse_uri(table_root)?;
         Self::try_new_internal(
             table_root,
             engine,
@@ -298,7 +301,7 @@ impl TableChanges {
         engine: &dyn Engine,
         start_version: Version,
         end_version: Option<Version>,
-    ) -> KernelResult<Self> {
+    ) -> Result<Self> {
         Self::try_new_internal(
             table_root,
             engine,
@@ -314,8 +317,8 @@ impl TableChanges {
         start_version: Version,
         end_version: Option<Version>,
         mode: CdfMode,
-    ) -> KernelResult<Self> {
-        let log_root = table_root.join("_delta_log/")?;
+    ) -> Result<Self> {
+        let log_root = table_root.join("_delta_log/").map_err(KernelError::from)?;
         let log_segment = LogSegment::for_table_changes(
             engine.storage_handler().as_ref(),
             log_root,
@@ -368,6 +371,7 @@ impl TableChanges {
                     end_snapshot.version(),
                     MATERIALIZED_ROW_ID_COLUMN_NAME
                 ))
+                .into()
             );
             require!(
                 properties
@@ -378,6 +382,7 @@ impl TableChanges {
                     end_snapshot.version(),
                     MATERIALIZED_ROW_COMMIT_VERSION_COLUMN_NAME
                 ))
+                .into()
             );
         }
 
@@ -386,7 +391,9 @@ impl TableChanges {
         let start_schema = start_snapshot.schema();
         let end_schema = end_snapshot.schema();
         if !mode.schemas_compatible(start_schema.as_ref(), end_schema.as_ref()) {
-            return Err(mode.boundary_schema_error(start_schema.as_ref(), end_schema.as_ref()));
+            return Err(mode
+                .boundary_schema_error(start_schema.as_ref(), end_schema.as_ref())
+                .into());
         }
 
         let schema = try_schema! {
@@ -518,7 +525,7 @@ impl TableChanges {
         self: Arc<Self>,
         engine: Arc<dyn Engine>,
         mode: TableChangesListingMode,
-    ) -> KernelResult<impl Iterator<Item = KernelResult<TableChangesFileAction>>> {
+    ) -> KernelResult<impl KernelResultIterator<TableChangesFileAction>> {
         if self.mode != CdfMode::RowTracking {
             return Err(KernelError::unsupported(
                 "scan_file_listing is only supported for row-tracking change feeds; construct \
@@ -553,29 +560,29 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
 
-    use itertools::{assert_equal, Itertools};
+    use itertools::{Itertools, assert_equal};
 
     use super::*;
     use crate::actions::deletion_vector::DeletionVectorDescriptor;
     use crate::actions::{Add, Metadata, Protocol, Remove};
     use crate::engine::sync::SyncEngine;
-    use crate::schema::{schema_ref, DataType, StructField, StructType};
-    use crate::table_changes::test_utils::{
-        row_tracking_properties, row_tracking_protocol, row_tracking_setup_actions,
-        test_deletion_vector, TEST_MATERIALIZED_ROW_COMMIT_VERSION_COLUMN_NAME,
-        TEST_MATERIALIZED_ROW_ID_COLUMN_NAME,
-    };
+    use crate::schema::{DataType, StructField, StructType, schema_ref};
     use crate::table_changes::CDF_FIELDS;
+    use crate::table_changes::test_utils::{
+        TEST_MATERIALIZED_ROW_COMMIT_VERSION_COLUMN_NAME, TEST_MATERIALIZED_ROW_ID_COLUMN_NAME,
+        row_tracking_properties, row_tracking_protocol, row_tracking_setup_actions,
+        test_deletion_vector,
+    };
     use crate::table_features::TableFeature;
     use crate::table_properties::{
         COLUMN_MAPPING_MODE, MATERIALIZED_ROW_COMMIT_VERSION_COLUMN_NAME,
         MATERIALIZED_ROW_ID_COLUMN_NAME,
     };
     use crate::unit_test_utils::{
-        assert_result_error_with_message, test_schema_flat_with_column_mapping, Action,
-        LocalMockTable,
+        Action, LocalMockTable, assert_result_error_with_message,
+        test_schema_flat_with_column_mapping,
     };
-    use crate::{Engine, KernelError};
+    use crate::{Engine, Error, KernelError};
 
     fn listing_test_schema() -> Arc<StructType> {
         schema_ref! {
@@ -614,7 +621,7 @@ mod tests {
             );
             assert!(matches!(
                 res,
-                Err(KernelError::ChangeDataFeedUnsupported(_))
+                Err(Error::Kernel(KernelError::ChangeDataFeedUnsupported(_)))
             ))
         }
     }
@@ -627,14 +634,30 @@ mod tests {
 
         // A field in the schema goes from being nullable to non-nullable
         let table_changes_res = TableChanges::try_new(url, engine.as_ref(), 3, Some(4));
-        assert!(matches!(table_changes_res, Err(KernelError::Generic(msg)) if msg == expected_msg));
+        assert!(matches!(
+            table_changes_res,
+            Err(Error::Kernel(KernelError::Generic(msg))) if msg == expected_msg
+        ));
     }
 
-    #[test]
-    fn table_changes_has_cdf_schema() {
-        let path = "./tests/data/table-with-cdf";
-        let engine = Box::new(SyncEngine::new());
-        let url = delta_kernel::try_parse_uri(path).unwrap();
+    #[rstest::rstest]
+    #[case::relative_path("./tests/data/table-with-cdf")]
+    #[case::absolute_path(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/table-with-cdf"))]
+    #[case::url(Url::from_directory_path(concat!(
+        env!("CARGO_MANIFEST_DIR"), "/tests/data/table-with-cdf"
+    )).unwrap())]
+    #[case::url_string(Url::from_directory_path(concat!(
+        env!("CARGO_MANIFEST_DIR"), "/tests/data/table-with-cdf"
+    )).unwrap().to_string())]
+    #[case::url_string_without_trailing_slash(
+        Url::from_directory_path(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/table-with-cdf"))
+            .unwrap()
+            .as_str()
+            .trim_end_matches('/')
+            .to_owned()
+    )]
+    fn table_changes_accepts_urls_and_paths(#[case] table_root: impl AsRef<str>) {
+        let engine = SyncEngine::new();
         let expected_schema = [
             StructField::nullable("part", DataType::INTEGER),
             StructField::nullable("id", DataType::INTEGER),
@@ -642,9 +665,32 @@ mod tests {
         .into_iter()
         .chain(CDF_FIELDS.clone());
 
-        let table_changes =
-            TableChanges::try_new(url.clone(), engine.as_ref(), 0, 0.into()).unwrap();
+        let table_changes = TableChanges::try_new(table_root, &engine, 0, Some(1)).unwrap();
+        let expected_root =
+            Url::from_directory_path(std::fs::canonicalize("./tests/data/table-with-cdf").unwrap())
+                .unwrap();
+        assert_eq!(table_changes.table_root(), &expected_root);
+        assert_eq!(table_changes.start_version(), 0);
+        assert_eq!(table_changes.end_version(), 1);
         assert_equal(expected_schema, table_changes.schema().fields().cloned());
+    }
+
+    #[rstest::rstest]
+    #[case::local_path(false)]
+    #[case::file_url(true)]
+    fn table_changes_rejects_nonexistent_local_path(#[case] as_file_url: bool) {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let path = temp_dir.path().join("missing");
+        let table_root = if as_file_url {
+            Url::from_directory_path(&path).unwrap().to_string()
+        } else {
+            path.to_str().unwrap().to_owned()
+        };
+        let result = TableChanges::try_new(table_root, &SyncEngine::new(), 0, Some(1));
+        assert!(matches!(
+            result,
+            Err(Error::Kernel(KernelError::InvalidTableLocation(_)))
+        ));
     }
 
     #[test]
@@ -707,7 +753,12 @@ mod tests {
         let url = delta_kernel::try_parse_uri(path).unwrap();
         let res = TableChanges::try_new_row_tracking_cdf_listing(url, engine.as_ref(), 0, Some(1));
         assert!(
-            matches!(&res, Err(KernelError::RowTrackingChangeFeedUnsupported(_))),
+            matches!(
+                &res,
+                Err(Error::Kernel(
+                    KernelError::RowTrackingChangeFeedUnsupported(_)
+                ))
+            ),
             "expected a row-tracking-disabled error, got {res:?}"
         );
     }
@@ -758,7 +809,9 @@ mod tests {
         assert!(
             matches!(
                 &res,
-                Err(KernelError::ChangeDataFeedIncompatibleSchema(_, _))
+                Err(Error::Kernel(
+                    KernelError::ChangeDataFeedIncompatibleSchema(_, _)
+                ))
             ),
             "expected an incompatible start schema to be rejected, got {res:?}"
         );

@@ -66,8 +66,8 @@ column. The flow is:
 # use delta_kernel_default_engine::storage::store_from_url;
 # use delta_kernel::schema::{DataType, StructField};
 # use delta_kernel::transaction::{CommitResult, UpdateTableOperation};
-# use delta_kernel::{KernelResult, Snapshot};
-# fn example() -> KernelResult<()> {
+# use delta_kernel::Snapshot;
+# fn example() -> delta_kernel::Result<()> {
 # let url = delta_kernel::try_parse_uri("/tmp/table")?;
 # let engine = DefaultEngine::builder(store_from_url(&url)?).build();
 // 1. Load a snapshot of the existing table.
@@ -95,6 +95,9 @@ Bob, and Carol read back `NULL` for `country`. New writes can populate the
 column by including it in the `RecordBatch` they pass to
 `engine.write_parquet()`.
 
+If the table declares CHECK constraints, acknowledge that your connector enforces them before you
+commit. See [Check constraints](./check_constraints.md) for the acknowledgement.
+
 ## Validation rules
 
 `add_column()` checks the new field at `build()` time. If any rule is violated,
@@ -110,8 +113,8 @@ column by including it in the `RecordBatch` they pass to
 
 > [!NOTE]
 > Kernel rejects schema changes at `build()` when `icebergCompatV2`, `icebergCompatV3`, or
-> `allowColumnDefaults` is enabled. This restriction applies to both workflows, regardless of the
-> transaction operation or `dataChange` value.
+> `allowColumnDefaults` is enabled, or when the table has generated columns. This restriction
+> applies to both workflows, regardless of the transaction operation or `dataChange` value.
 
 ## Chaining multiple operations
 

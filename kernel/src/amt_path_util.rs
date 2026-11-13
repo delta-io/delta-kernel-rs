@@ -3,11 +3,13 @@
 //!
 //! [relative paths specification]: https://iceberg.apache.org/spec/#paths-in-metadata
 
+use std::borrow::Cow;
+
 use url::{ParseError, Url};
 
-use crate::path_encoding::uri_encode_path;
-use crate::utils::require;
-use crate::{KernelError, KernelResult};
+use crate::path_encoding::{uri_decode_path, uri_encode_path};
+use crate::utils::{require, to_file_size};
+use crate::{FileMeta, KernelError, KernelResult};
 
 /// Resolve an AMT `path` (as stored in the log or a manifest) into an absolute [`Url`].
 ///
@@ -23,18 +25,91 @@ use crate::{KernelError, KernelResult};
 ///
 /// [relative paths specification]: https://iceberg.apache.org/spec/#paths-in-metadata
 pub(crate) fn resolve_amt_location(path: &str, table_root: &Url) -> KernelResult<Url> {
-    match scheme_len(path) {
-        Some(scheme_len) => {
-            reject_dot_segments(path)?;
-            let (prefix, raw_path) = split_authority(path, scheme_len);
-            uri_with_encoded_path(prefix, raw_path).map_err(|e| {
-                KernelError::generic(format!(
-                    "Failed to parse absolute AMT location {path:?}: {e}"
-                ))
-            })
-        }
+    match parse_absolute_amt_location(path)? {
+        Some(url) => Ok(url),
         None => encode_and_join(path, table_root),
     }
+}
+
+/// Parses an absolute AMT `path` into a [`Url`] with its path component percent-encoded, as
+/// [`resolve_amt_location`] does, or returns `None` if `path` is relative (has no URI scheme).
+pub(crate) fn parse_absolute_amt_location(path: &str) -> KernelResult<Option<Url>> {
+    let Some(scheme_len) = scheme_len(path) else {
+        return Ok(None);
+    };
+    reject_dot_segments(path)?;
+    let (prefix, raw_path) = split_authority(path, scheme_len);
+    let url = uri_with_encoded_path(prefix, raw_path).map_err(|e| {
+        KernelError::generic(format!(
+            "Failed to parse absolute AMT location {path:?}: {e}"
+        ))
+    })?;
+    Ok(Some(url))
+}
+
+/// Converts an absolute, percent-encoded `uri` (such as a Delta `p` deletion vector path) into the
+/// raw form AMT locations are stored in: the inverse of [`resolve_amt_location`] for an absolute
+/// path. The `scheme:[//authority]` prefix is kept verbatim and the path component is
+/// percent-decoded.
+pub(crate) fn raw_amt_location_from_uri(uri: &str) -> KernelResult<String> {
+    let invalid =
+        |reason: &str| KernelError::generic(format!("Invalid absolute URI {uri:?}: {reason}"));
+    let scheme_len = scheme_len(uri).ok_or_else(|| invalid("no URI scheme"))?;
+    let url = Url::parse(uri).map_err(|e| invalid(&e.to_string()))?;
+    require!(
+        url.query().is_none() && url.fragment().is_none(),
+        invalid("a query or fragment cannot be stored as an AMT location")
+    );
+    let (prefix, encoded_path) = split_authority(uri, scheme_len);
+    let path = uri_decode_path(encoded_path).ok_or_else(|| invalid("path is not valid UTF-8"))?;
+    Ok(format!("{prefix}{path}"))
+}
+
+/// Builds the [`FileMeta`] of an AMT manifest file referenced by `path` (absolute, or relative to
+/// `table_root`) with `size_in_bytes`. AMT references carry no modification time, so
+/// `last_modified` is `i64::MAX`.
+///
+/// # Errors
+/// Returns an error if `path` cannot be resolved (see [`resolve_amt_location`]), or if
+/// `size_in_bytes` is negative (the error names `context` and `path`).
+pub(crate) fn amt_manifest_filemeta(
+    path: &str,
+    size_in_bytes: i64,
+    table_root: &Url,
+    context: &str,
+) -> KernelResult<FileMeta> {
+    Ok(FileMeta {
+        location: resolve_amt_location(path, table_root)?,
+        last_modified: i64::MAX,
+        size: to_file_size(size_in_bytes, format_args!("{context} '{path}'"))?,
+    })
+}
+
+/// Converts a raw AMT data-file `location` into the RFC 2396 form `add.path` uses: the path
+/// component is percent-encoded as in [`resolve_amt_location`], while a scheme and authority are
+/// kept as-is, and a relative location stays relative. Returns [`Cow::Borrowed`] when nothing
+/// needs encoding.
+///
+/// # Errors
+///
+/// Returns an error if `location` contains a `.` or `..` segment, which [`resolve_amt_location`]
+/// rejects too, or if a relative `location` is empty or begins with `/` (see
+/// [`validate_table_relative`]), which would resolve outside the table root.
+pub(crate) fn amt_location_to_add_path(location: &str) -> KernelResult<Cow<'_, str>> {
+    reject_dot_segments(location)?;
+    let (prefix, raw_path) = match scheme_len(location) {
+        Some(scheme_len) => split_authority(location, scheme_len),
+        None => {
+            validate_table_relative(location)?;
+            ("", location)
+        }
+    };
+    // TODO(#2423): non-ASCII characters are percent-encoded here but left raw by Delta-Spark, so
+    // Add/Remove reconciliation can see two spellings of the same file.
+    Ok(match uri_encode_path(raw_path) {
+        Cow::Borrowed(_) => Cow::Borrowed(location),
+        Cow::Owned(encoded) => Cow::Owned(format!("{prefix}{encoded}")),
+    })
 }
 
 /// Resolve a strictly table-relative `path` into an absolute [`Url`] under `table_root`.
@@ -153,7 +228,7 @@ fn uri_with_encoded_path(prefix: &str, raw_path: &str) -> Result<Url, ParseError
 
 /// Rejects a `path` containing a `.` or `..` segment: the Iceberg V4 path spec does not support
 /// relative navigation, and URL parsing would otherwise silently collapse such segments.
-fn reject_dot_segments(path: &str) -> KernelResult<()> {
+pub(crate) fn reject_dot_segments(path: &str) -> KernelResult<()> {
     require!(
         !path
             .split('/')
@@ -171,6 +246,85 @@ mod tests {
     use test_utils::assert_result_error_with_message;
 
     use super::*;
+
+    /// `expected_url` is where a scan reads the file: `add.path` joined onto the table root.
+    #[rstest]
+    #[case::plain_relative(
+        "data/a.parquet",
+        "data/a.parquet",
+        false,
+        "memory:///table/data/a.parquet"
+    )]
+    #[case::spaced_relative(
+        "data/a b.parquet",
+        "data/a%20b.parquet",
+        true,
+        "memory:///table/data/a%20b.parquet"
+    )]
+    #[case::percent_relative(
+        "data/a%b.parquet",
+        "data/a%25b.parquet",
+        true,
+        "memory:///table/data/a%25b.parquet"
+    )]
+    #[case::non_ascii_relative(
+        "data/M\u{fc}nchen.parquet",
+        "data/M%C3%BCnchen.parquet",
+        true,
+        "memory:///table/data/M%C3%BCnchen.parquet"
+    )]
+    #[case::query_and_fragment_relative(
+        "data/a?b#c.parquet",
+        "data/a%3Fb%23c.parquet",
+        true,
+        "memory:///table/data/a%3Fb%23c.parquet"
+    )]
+    #[case::plain_absolute(
+        "s3://bucket/t/a.parquet",
+        "s3://bucket/t/a.parquet",
+        false,
+        "s3://bucket/t/a.parquet"
+    )]
+    #[case::spaced_absolute(
+        "s3://bucket/t/a b.parquet",
+        "s3://bucket/t/a%20b.parquet",
+        true,
+        "s3://bucket/t/a%20b.parquet"
+    )]
+    #[case::spaced_absolute_without_authority(
+        "file:/tmp/a b.parquet",
+        "file:/tmp/a%20b.parquet",
+        true,
+        "file:///tmp/a%20b.parquet"
+    )]
+    fn test_amt_location_to_add_path(
+        #[case] location: &str,
+        #[case] expected: &str,
+        #[case] encoded: bool,
+        #[case] expected_url: &str,
+    ) {
+        let path = amt_location_to_add_path(location).unwrap();
+        assert_eq!(path, expected);
+        assert_eq!(matches!(path, Cow::Owned(_)), encoded);
+        let table_root = Url::parse("memory:///table/").unwrap();
+        let url = table_root.join(&path).unwrap();
+        assert_eq!(url.as_str(), expected_url);
+        assert_eq!(url, resolve_amt_location(location, &table_root).unwrap());
+    }
+
+    #[rstest]
+    #[case::parent_segment("../a.parquet", "contains a '.' or '..' segment")]
+    #[case::current_segment("data/./a.parquet", "contains a '.' or '..' segment")]
+    #[case::absolute_parent_segment("s3://bucket/t/../a.parquet", "contains a '.' or '..' segment")]
+    #[case::empty("", "must not be empty")]
+    #[case::leading_slash("/a.parquet", "must not begin with a leading '/'")]
+    #[case::network_path("//host/a.parquet", "must not begin with a leading '/'")]
+    fn amt_location_to_add_path_rejects_invalid_locations(
+        #[case] location: &str,
+        #[case] message: &str,
+    ) {
+        assert_result_error_with_message(amt_location_to_add_path(location), message);
+    }
 
     #[rstest]
     #[case::relative_path(
@@ -280,6 +434,37 @@ mod tests {
         let table_root = Url::parse(table_root).unwrap();
         let location = resolve_amt_location(path, &table_root).unwrap();
         assert_eq!(location.as_str(), expected_location);
+    }
+
+    #[rstest]
+    #[case::encoded_space("s3://bucket/data/dv%20file.bin", "s3://bucket/data/dv file.bin")]
+    #[case::unencoded("s3://bucket/data/dv.bin", "s3://bucket/data/dv.bin")]
+    #[case::encoded_reserved_chars(
+        "s3://bucket/data/a%23b%3Fc%25d.bin",
+        "s3://bucket/data/a#b?c%d.bin"
+    )]
+    #[case::userinfo_authority_kept(
+        "abfss://c1@acct.dfs.core.windows.net/t/a%20b.bin",
+        "abfss://c1@acct.dfs.core.windows.net/t/a b.bin"
+    )]
+    fn test_raw_amt_location_from_uri_round_trips(#[case] uri: &str, #[case] expected_raw: &str) {
+        let raw = raw_amt_location_from_uri(uri).unwrap();
+        assert_eq!(raw, expected_raw);
+        let table_root = Url::parse("memory:///table/").unwrap();
+        assert_eq!(
+            resolve_amt_location(&raw, &table_root).unwrap().as_str(),
+            uri
+        );
+    }
+
+    #[rstest]
+    #[case::relative("data/dv.bin", "no URI scheme")]
+    #[case::not_a_url("s3://bucket:port/dv.bin", "Invalid absolute URI")]
+    #[case::query("s3://bucket/dv.bin?x=1", "query or fragment")]
+    #[case::fragment("s3://bucket/dv.bin#x", "query or fragment")]
+    #[case::invalid_utf8("s3://bucket/%FF.bin", "not valid UTF-8")]
+    fn test_raw_amt_location_from_uri_errors(#[case] uri: &str, #[case] message: &str) {
+        assert_result_error_with_message(raw_amt_location_from_uri(uri), message);
     }
 
     #[rstest]

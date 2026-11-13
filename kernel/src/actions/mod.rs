@@ -3,9 +3,9 @@
 
 use std::collections::HashMap;
 use std::fmt;
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock};
 
-use delta_kernel_derive::{internal_api, IntoStructData, ToSchema, TryFromStructData};
+use delta_kernel_derive::{IntoStructData, ToSchema, TryFromStructData, internal_api};
 use derive_more::Constructor;
 use serde::de::{MapAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
@@ -15,35 +15,36 @@ use visitors::{MetadataVisitor, ProtocolVisitor};
 
 use self::deletion_vector::DeletionVectorDescriptor;
 #[cfg(feature = "adaptive-metadata-in-dev")]
-use crate::amt_path_util::resolve_amt_location;
+use crate::amt_path_util::amt_manifest_filemeta;
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::expressions::Scalar;
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::expressions::{ArrayData, StructData};
-use crate::schema::{
-    is_unsupported_delta_type_error, lazy_schema_ref, schema_ref, SchemaRef, StructField,
-    StructType, ToSchema as _,
-};
 #[cfg(feature = "adaptive-metadata-in-dev")]
-use crate::schema::{schema, ArrayType, DataType};
+use crate::schema::{ArrayType, DataType, schema};
+use crate::schema::{
+    SchemaRef, StructField, StructType, ToSchema as _, lazy_schema_ref, schema_ref,
+};
 use crate::table_features::{
-    FeatureType, TableFeature, LEGACY_READER_FEATURES, MIN_VALID_RW_VERSION,
-    TABLE_FEATURES_MIN_READER_VERSION, TABLE_FEATURES_MIN_WRITER_VERSION,
+    FeatureType, LEGACY_READER_FEATURES, MIN_VALID_RW_VERSION, TABLE_FEATURES_MIN_READER_VERSION,
+    TABLE_FEATURES_MIN_WRITER_VERSION, TableFeature,
 };
 use crate::table_properties::TableProperties;
-use crate::utils::require;
+use crate::utils::{require, to_file_size};
 #[cfg(feature = "adaptive-metadata-in-dev")]
-use crate::{create_row, Engine, Version};
-use crate::{EngineData, FileMeta, FileSize, KernelError, KernelResult, RowVisitor as _};
+use crate::{Engine, Version, create_row};
+use crate::{EngineData, FileMeta, KernelError, KernelResult, RowVisitor as _};
 
 const KERNEL_VERSION: &str = env!("CARGO_PKG_VERSION");
-const SERDE_JSON_RECURSION_LIMIT_ERROR_PREFIX: &str = "recursion limit exceeded";
+const SCHEMA_RECURSION_LIMIT: usize = 1000;
 const UNKNOWN_OPERATION: &str = "UNKNOWN";
 pub(crate) const ROW_TRACKING_PRESERVED_TAG: &str = "delta.rowTracking.preserved";
 
 pub mod deletion_vector;
 pub mod deletion_vector_writer;
 pub mod set_transaction;
+
+mod schema_deserializer;
 
 // see comment in ../lib.rs for the path module for why we include this way
 #[cfg(feature = "internal-api")]
@@ -342,8 +343,8 @@ pub struct Metadata {
     description: Option<String>,
     /// Specification of the encoding for the files stored in the table
     format: Format,
-    /// Schema of the table
-    schema_string: String,
+    /// Schema JSON, shared to avoid copying large schemas when cloning metadata.
+    schema_string: Arc<String>,
     /// Column names by which the data should be partitioned
     partition_columns: Vec<String>,
     /// The time when this metadata action is created, in milliseconds since the Unix epoch
@@ -379,7 +380,7 @@ impl Metadata {
                 provider: format_provider,
                 options: format_options,
             },
-            schema_string,
+            schema_string: Arc::new(schema_string),
             partition_columns,
             created_time,
             configuration,
@@ -419,7 +420,7 @@ impl Metadata {
             // both for legacy reasons and to enable possible support for other formats in the
             // future (See delta-io/delta#87).
             format: Format::default(),
-            schema_string: serde_json::to_string(&schema)?,
+            schema_string: Arc::new(serde_json::to_string(&schema)?),
             partition_columns,
             created_time: Some(created_time),
             configuration,
@@ -483,6 +484,10 @@ impl Metadata {
 
     /// Parses the table schema from its JSON representation.
     ///
+    /// Decoding fails when nesting reaches `SCHEMA_RECURSION_LIMIT`, counting JSON objects and
+    /// arrays, including field metadata. Each nested struct adds three containers. Unknown
+    /// fields skipped by the deserializer do not count toward the limit.
+    ///
     /// # Errors
     ///
     /// Returns [`KernelError::Schema`] when the schema exceeds the supported decoding depth or
@@ -490,26 +495,7 @@ impl Metadata {
     /// JSON decoding failures.
     #[internal_api]
     pub(crate) fn parse_schema(&self) -> KernelResult<StructType> {
-        // TODO(#1896): Increase the supported nesting depth or use non-recursive schema decoding.
-        serde_json::from_str(&self.schema_string).map_err(|error| {
-            // serde_json keeps ErrorCode::RecursionLimitExceeded private, so we use string
-            // matching.
-            if error.is_syntax()
-                && error
-                    .to_string()
-                    .starts_with(SERDE_JSON_RECURSION_LIMIT_ERROR_PREFIX)
-            {
-                KernelError::schema(format!(
-                    "Table schema is too deeply nested: decoding metaData.schemaString exceeded \
-                     serde_json's recursion limit: {error}"
-                ))
-                .with_backtrace()
-            } else if is_unsupported_delta_type_error(&error) {
-                KernelError::schema(error.to_string()).with_backtrace()
-            } else {
-                error.into()
-            }
-        })
+        schema_deserializer::parse(&self.schema_string, SCHEMA_RECURSION_LIMIT)
     }
 
     #[internal_api]
@@ -530,15 +516,17 @@ impl Metadata {
     /// # Errors
     ///
     /// Returns an error if schema serialization fails.
+    #[internal_api]
     pub(crate) fn with_schema(self, schema: SchemaRef) -> KernelResult<Self> {
         Ok(Self {
-            schema_string: serde_json::to_string(&schema)?,
+            schema_string: Arc::new(serde_json::to_string(&schema)?),
             ..self
         })
     }
 
     /// Returns a new Metadata with a single configuration entry inserted (or replaced),
     /// preserving all other configuration entries and metadata fields.
+    #[internal_api]
     pub(crate) fn with_configuration_entry(
         mut self,
         key: impl Into<String>,
@@ -565,7 +553,7 @@ impl Metadata {
             name,
             description,
             format,
-            schema_string: schema_string.into(),
+            schema_string: Arc::new(schema_string.into()),
             partition_columns,
             created_time,
             configuration,
@@ -1498,6 +1486,13 @@ impl LastManifestCommit {
         );
         Ok(())
     }
+
+    /// Parses the first `commitInfo.lastManifestCommit` in `data`, if any.
+    pub(crate) fn try_new_from_data(data: &dyn EngineData) -> KernelResult<Option<Self>> {
+        let mut visitor = visitors::LastManifestCommitVisitor::default();
+        visitor.visit_rows_of(data)?;
+        Ok(visitor.last_manifest_commit)
+    }
 }
 
 /// The checkpoint action embeds metadata tree state in a Delta log entry.
@@ -1845,7 +1840,7 @@ impl CheckpointAction {
                     other => {
                         return Err(KernelError::generic(format!(
                             "checkpoint sidecar has unsupported type `{other}`"
-                        )))
+                        )));
                     }
                 },
             }
@@ -1915,11 +1910,12 @@ impl CheckpointAction {
     #[internal_api]
     pub(crate) fn root_filemeta(&self, table_root: &Url) -> KernelResult<FileMeta> {
         let content_root = &self.content_root;
-        Ok(FileMeta {
-            location: resolve_amt_location(&content_root.path, table_root)?,
-            last_modified: i64::MAX,
-            size: to_file_size(content_root.size_in_bytes, "checkpoint contentRoot")?,
-        })
+        amt_manifest_filemeta(
+            &content_root.path,
+            content_root.size_in_bytes,
+            table_root,
+            "checkpoint contentRoot",
+        )
     }
 
     /// The table protocol embedded in this checkpoint action (at [`Self::version`]).
@@ -1961,16 +1957,6 @@ pub(crate) struct Sidecar {
     /// A map containing any additional metadata about the logical file. Values can be null.
     #[allow_null_container_values]
     pub tags: Option<HashMap<String, String>>,
-}
-
-/// Convert an `i64` byte count from a log action into a [`FileSize`], erroring with `context` (a
-/// short action name, e.g. `"sidecar"`) and the offending value when it is negative.
-fn to_file_size(bytes: i64, context: &str) -> KernelResult<FileSize> {
-    bytes.try_into().map_err(|_| {
-        KernelError::generic(format!(
-            "Failed to convert {context} size {bytes} to FileSize"
-        ))
-    })
 }
 
 impl Sidecar {
@@ -2108,23 +2094,24 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    use crate::FileSize;
     use crate::arrow::array::{
         Array, Int32Array, ListBuilder, RecordBatch, StringBuilder, StructArray,
     };
     use crate::arrow::datatypes::{DataType as ArrowDataType, Field, Schema};
     use crate::arrow::json::ReaderBuilder;
+    use crate::create_row;
     use crate::engine::arrow_data::EngineDataArrowExt as _;
     use crate::engine::arrow_expression::ArrowEvaluationHandler;
     #[cfg(feature = "adaptive-metadata-in-dev")]
     use crate::engine::to_json_bytes;
+    use crate::engine::{DelegatingEngine, PanicEngine};
     #[cfg(feature = "adaptive-metadata-in-dev")]
     use crate::engine_data::FilteredEngineData;
     use crate::expressions::{Scalar, StructData};
-    use crate::schema::{schema, schema_ref, DataType, MapType, StructField};
+    use crate::schema::{DataType, MapType, StructField, schema, schema_ref};
     use crate::unit_test_utils::assert_result_error_with_message;
-    use crate::{
-        create_row, Engine, EvaluationHandler, JsonHandler, ParquetHandler, StorageHandler,
-    };
 
     #[rstest]
     #[case::add(ADD_NAME, Some("path"))]
@@ -2142,31 +2129,11 @@ mod tests {
         assert_eq!(action_presence_leaf(action_name), expected_leaf);
     }
 
-    // duplicated
-    struct ExprEngine(Arc<dyn EvaluationHandler>);
-
-    impl ExprEngine {
-        fn new() -> Self {
-            ExprEngine(Arc::new(ArrowEvaluationHandler))
-        }
-    }
-
-    impl Engine for ExprEngine {
-        fn evaluation_handler(&self) -> Arc<dyn EvaluationHandler> {
-            self.0.clone()
-        }
-
-        fn json_handler(&self) -> Arc<dyn JsonHandler> {
-            unimplemented!()
-        }
-
-        fn parquet_handler(&self) -> Arc<dyn ParquetHandler> {
-            unimplemented!()
-        }
-
-        fn storage_handler(&self) -> Arc<dyn StorageHandler> {
-            unimplemented!()
-        }
+    /// Allows Arrow expression evaluation and rejects other required handler access.
+    fn expr_engine() -> DelegatingEngine {
+        DelegatingEngine::new(Arc::new(PanicEngine))
+            .with_evaluation_handler(Arc::new(ArrowEvaluationHandler))
+            .without_plan_executor()
     }
 
     #[rstest]
@@ -2238,11 +2205,12 @@ mod tests {
     }
 
     #[rstest]
-    #[case::supported(41, false)]
-    #[case::exceeded(42, true)]
+    #[case::formerly_rejected(42, false)]
+    #[case::supported(331, false)]
+    #[case::exceeded(332, true)]
     fn parse_schema_nesting_boundary(#[case] depth: usize, #[case] exceeds_limit: bool) {
         let metadata = Metadata {
-            schema_string: serde_json::to_string(&nested_schema(depth)).unwrap(),
+            schema_string: Arc::new(serde_json::to_string(&nested_schema(depth)).unwrap()),
             ..Default::default()
         };
 
@@ -2252,8 +2220,7 @@ mod tests {
                 result.as_ref(),
                 concat!(
                     "Schema error: Table schema is too deeply nested: decoding ",
-                    "metaData.schemaString exceeded serde_json's ",
-                    "recursion limit: recursion limit exceeded"
+                    "metaData.schemaString reached the JSON recursion limit of 1000"
                 ),
             );
             let error = match result.unwrap_err() {
@@ -2307,7 +2274,7 @@ mod tests {
         #[case] expected_error: &str,
     ) {
         let metadata = Metadata {
-            schema_string: schema_string.to_string(),
+            schema_string: Arc::new(schema_string.to_string()),
             ..Default::default()
         };
         // Error conversion captures a backtrace only when enabled, so normalize both forms before
@@ -2613,9 +2580,13 @@ mod tests {
     #[case(1, -1)]
     fn reject_protocol_version_below_minimum(#[case] rv: i32, #[case] wv: i32) {
         let expected = if rv < 1 {
-            format!("Invalid protocol action in the delta log: min_reader_version must be >= 1, got {rv}")
+            format!(
+                "Invalid protocol action in the delta log: min_reader_version must be >= 1, got {rv}"
+            )
         } else {
-            format!("Invalid protocol action in the delta log: min_writer_version must be >= 1, got {wv}")
+            format!(
+                "Invalid protocol action in the delta log: min_writer_version must be >= 1, got {wv}"
+            )
         };
         assert_result_error_with_message(
             Protocol::try_new(rv, wv, TableFeature::NO_LIST, TableFeature::NO_LIST),
@@ -2653,10 +2624,7 @@ mod tests {
             ),
             (
                 vec![TableFeature::VariantType],
-                vec![
-                    TableFeature::VariantType,
-                    TableFeature::DeletionVectors,
-                ],
+                vec![TableFeature::VariantType, TableFeature::DeletionVectors],
                 "Writer features must be Writer-only or also listed in reader features",
             ),
             // WriterOnly feature present in reader features
@@ -2812,6 +2780,31 @@ mod tests {
     }
 
     #[test]
+    fn metadata_clone_preserves_schema_when_another_copy_changes() {
+        let original_schema = schema_ref! { not_null "id": INTEGER };
+        let metadata = Metadata::try_new(
+            None,
+            None,
+            original_schema.clone(),
+            vec![],
+            0,
+            HashMap::new(),
+        )
+        .unwrap();
+        let saved_json = serde_json::to_value(&metadata).unwrap();
+        let copy = metadata.clone();
+        assert!(Arc::ptr_eq(&metadata.schema_string, &copy.schema_string));
+        let changed = metadata
+            .with_schema(schema_ref! { nullable "name": STRING })
+            .unwrap();
+        assert_eq!(copy.parse_schema().unwrap(), *original_schema);
+        assert_ne!(changed.schema_string(), copy.schema_string());
+        assert_eq!(serde_json::to_value(&copy).unwrap(), saved_json);
+        let decoded: Metadata = serde_json::from_value(saved_json).unwrap();
+        assert_eq!(decoded, copy);
+    }
+
+    #[test]
     fn test_metadata_try_new() {
         let schema = schema_ref! { not_null "id": INTEGER };
         let config = HashMap::from([("key1".to_string(), "value1".to_string())]);
@@ -2829,7 +2822,7 @@ mod tests {
         assert!(!metadata.id.is_empty());
         assert_eq!(metadata.name, Some("test_table".to_string()));
         assert_eq!(
-            metadata.schema_string,
+            metadata.schema_string.as_str(),
             serde_json::to_string(&schema).unwrap()
         );
         assert_eq!(metadata.created_time, Some(1234567890));
@@ -2899,7 +2892,7 @@ mod tests {
 
     #[test]
     fn test_metadata_with_log_schema() {
-        let engine = ExprEngine::new();
+        let engine = expr_engine();
         let schema = schema_ref! { not_null "id": INTEGER };
 
         let metadata = Metadata::try_new(
@@ -2947,7 +2940,7 @@ mod tests {
 
     #[test]
     fn test_protocol_creates_log_row() {
-        let engine = ExprEngine::new();
+        let engine = expr_engine();
         let protocol = Protocol::try_new_modern(
             [TableFeature::DeletionVectors, TableFeature::ColumnMapping],
             [TableFeature::DeletionVectors, TableFeature::ColumnMapping],
@@ -3256,7 +3249,7 @@ mod tests {
         "metadata/root.parquet",
         -1,
         "memory:///table/metadata/root.parquet",
-        Err("Failed to convert checkpoint contentRoot size -1")
+        Err("Failed to convert checkpoint contentRoot 'metadata/root.parquet' size -1")
     )]
     fn test_checkpoint_action_root_filemeta(
         #[case] table_root: &str,
@@ -3328,7 +3321,7 @@ mod tests {
     #[cfg(feature = "adaptive-metadata-in-dev")]
     #[test]
     fn test_checkpoint_action_scalar_round_trip() -> KernelResult<()> {
-        let engine = ExprEngine::new();
+        let engine = expr_engine();
         let action = sample_checkpoint_action();
         let scalar = action.clone().try_into_scalar()?;
         let data = create_row(&engine, LOG_CHECKPOINT_SCHEMA.clone(), scalar)?;
@@ -3363,7 +3356,7 @@ mod tests {
         // pin the exact bytes. This is the only guard on the wire format: element order, camelCase
         // field names, the sidecar `type` discriminator, and the JSON writer's null omission (the
         // null union siblings collapse each element to a single-key tagged object).
-        let engine = ExprEngine::new();
+        let engine = expr_engine();
         let scalar = sample_checkpoint_action().try_into_scalar()?;
         let data = create_row(&engine, LOG_CHECKPOINT_SCHEMA.clone(), scalar)?;
         let filtered = FilteredEngineData::with_all_rows_selected(data);
@@ -3449,7 +3442,7 @@ mod tests {
             txn_sidecars: vec![sidecar("t1.parquet"), sidecar("t2.parquet")],
             domain_metadata_sidecars: vec![],
         };
-        let engine = ExprEngine::new();
+        let engine = expr_engine();
         let scalar = action.clone().try_into_scalar()?;
         let data = create_row(&engine, LOG_CHECKPOINT_SCHEMA.clone(), scalar)?;
         let back = CheckpointAction::try_new_from_data(data.as_ref())?
@@ -3472,7 +3465,7 @@ mod tests {
             ),
             ..sample_checkpoint_action()
         };
-        let engine = ExprEngine::new();
+        let engine = expr_engine();
         let scalar = action.clone().try_into_scalar()?;
         let data = create_row(&engine, LOG_CHECKPOINT_SCHEMA.clone(), scalar)?;
         let back = CheckpointAction::try_new_from_data(data.as_ref())?

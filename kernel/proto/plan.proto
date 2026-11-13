@@ -112,6 +112,9 @@ message CountAgg {
   delta.kernel.expressions.ColumnName value = 1;
 }
 message CountStarAgg {}
+message FirstNonNullAgg {
+  delta.kernel.expressions.ColumnName value = 1;
+}
 message MinNonNullByAgg {
   delta.kernel.expressions.ColumnName value = 1;
   delta.kernel.expressions.ColumnName null_sentinel = 2;
@@ -132,6 +135,7 @@ message Agg {
     SumAgg sum = 5;
     CountAgg count = 6;
     CountStarAgg count_star = 7;
+    FirstNonNullAgg first_non_null = 8;
   }
 }
 
@@ -145,6 +149,12 @@ message SemiJoinNode {
   bool inverted = 1;
   repeated delta.kernel.expressions.ColumnName probe_keys = 2;
   repeated delta.kernel.expressions.ColumnName build_keys = 3;
+}
+
+message PrefixSumNode {
+  delta.kernel.expressions.ColumnName input = 1;
+  string output = 2;
+  delta.kernel.schema.StructType schema = 3;
 }
 
 // ============================================================================
@@ -165,6 +175,7 @@ message Operator {
     DynamicScanNode dynamic_scan = 7;
     AggregateNode aggregate = 8;
     SemiJoinNode semi_join = 9;
+    PrefixSumNode prefix_sum = 12;
     // Sinks (write nodes)
     WriteJsonNode write_json = 11;
   }

@@ -1,5 +1,6 @@
 //! Various utility functions/macros used throughout the kernel
 use std::borrow::Cow;
+use std::fmt::Display;
 use std::marker::PhantomData;
 use std::ops::Deref;
 use std::path::PathBuf;
@@ -8,7 +9,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use delta_kernel_derive::internal_api;
 use url::Url;
 
-use crate::{KernelError, KernelResult};
+use crate::{FileSize, KernelError, KernelResult};
 
 /// Phantom type parameter `T`: The containing type mentions but does not own any instance of `T`.
 ///
@@ -103,6 +104,17 @@ pub(crate) fn try_parse_uri(uri: impl AsRef<str>) -> KernelResult<Url> {
     Ok(url)
 }
 
+/// Returns whether `uri` resolves, as in [`try_parse_uri`], to a local path that does not exist.
+///
+/// Returns `false` for non-local URLs and for paths whose existence cannot be determined, for
+/// example because of a permission error: such a failure does not prove that the path is absent.
+pub(crate) fn is_absent_local_path(uri: &str) -> bool {
+    matches!(
+        resolve_uri_type(uri),
+        Ok(UriType::LocalPath(path)) if matches!(path.try_exists(), Ok(false))
+    )
+}
+
 #[allow(unused)]
 #[derive(Debug)]
 enum UriType {
@@ -152,6 +164,16 @@ pub(crate) fn current_time_ms() -> KernelResult<i64> {
     let duration = current_time_duration()?;
     i64::try_from(duration.as_millis())
         .map_err(|_| KernelError::generic("Current timestamp exceeds i64 millisecond range"))
+}
+
+/// Convert an `i64` byte count into a [`FileSize`], erroring with `context` (a short description
+/// of the source, e.g. `"sidecar"`) and the offending value when it is negative.
+pub(crate) fn to_file_size(bytes: i64, context: impl Display) -> KernelResult<FileSize> {
+    bytes.try_into().map_err(|_| {
+        KernelError::generic(format!(
+            "Failed to convert {context} size {bytes} to FileSize"
+        ))
+    })
 }
 
 /// Extension trait for folding zero or one value from an [`Option`] into a base value.
@@ -300,8 +322,8 @@ mod tests {
     }
 
     mod on_complete_tests {
-        use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
         use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
         use super::*;
 

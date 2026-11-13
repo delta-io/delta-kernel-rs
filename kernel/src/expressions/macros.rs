@@ -11,13 +11,20 @@ use delta_kernel_derive::pub_macro;
 /// segments such as `path("a.b", "c")`, `coalesce`, `and`, `or`, `not`, `is_null`, `is_not_null`,
 /// and `distinct`. Every form returns an `Expression`, including comparisons and predicate calls.
 ///
+/// `make_struct(field, ...)` constructs a non-null struct, even when all its fields are NULL.
+/// `guarded_struct(guard, field, ...)` takes a BOOLEAN guard and constructs a struct that is NULL
+/// when the guard evaluates to FALSE or NULL. Both forms accept zero fields. Field names and types
+/// come from the evaluator's result type, in the same order as the field expressions.
+///
 /// Literals retain their Rust type: `1` is INTEGER and `1_i64` is LONG.
 /// `null` takes a [`DataType`](crate::schema::DataType) associated constant name, such as `LONG`.
 /// `col` takes one string literal and follows [`col!`](crate::expressions::col) path rules.
 /// `col("a.b")` addresses nested fields. `path("a.b")` addresses one field named `a.b`, and
 /// `path("a.b", "c")` addresses its nested field `c`. `path` also accepts computed segment names.
 /// Segments can mix types implementing `Into<String>`, such as `&str` and `String`.
-/// `lit` and `path` arguments accept Rust expressions and are evaluated once, in order.
+/// `lit` and `path` arguments accept Rust expressions. Arguments are evaluated once in source
+/// order while constructing the expression tree, including a struct guard before its fields.
+/// This does not specify row evaluation order.
 ///
 /// Expression construction delegates to the existing builders without resolving types or
 /// evaluating rows. Other Rust expressions must appear inside `lit` or `path` arguments.
@@ -71,6 +78,36 @@ use delta_kernel_derive::pub_macro;
 ///     kernel_expr!(path("a.b") == null(LONG)),
 ///     Expression::from_pred(Expression::column(["a.b"]).eq(null_lit(DataType::LONG))),
 /// );
+/// ```
+///
+/// Structs can nest and compose with COALESCE:
+///
+/// ```
+/// use delta_kernel::expressions::{col, expr, lit, Expression};
+///
+/// assert_eq!(
+///     expr!(coalesce(
+///         guarded_struct(is_not_null(col("id")), col("id"), make_struct("active")),
+///         make_struct(0_i64, make_struct("unknown")),
+///     )),
+///     Expression::coalesce([
+///         Expression::struct_with_nullability_from(
+///             [col!("id"), Expression::struct_from([lit("active")])],
+///             Expression::from_pred(col!("id").is_not_null()),
+///         ),
+///         Expression::struct_from([lit(0_i64), Expression::struct_from([lit("unknown")])]),
+///     ]),
+/// );
+/// ```
+///
+/// ```compile_fail
+/// use delta_kernel::expressions::expr;
+/// let _ = expr!(guarded_struct());
+/// ```
+///
+/// ```compile_fail
+/// use delta_kernel::expressions::expr;
+/// let _ = expr!(make_struct(unknown(col("id"))));
 /// ```
 ///
 /// ```compile_fail
@@ -203,8 +240,8 @@ mod tests {
     use rstest::rstest;
 
     use crate::expressions::{
-        col, expr, lit, null_lit, BinaryPredicateOp, Expression, Predicate, Scalar,
-        UnaryPredicateOp,
+        BinaryPredicateOp, Expression, Predicate, Scalar, UnaryPredicateOp, col, expr, lit,
+        null_lit,
     };
     use crate::schema::DataType;
 
@@ -356,6 +393,75 @@ mod tests {
     }
 
     #[rstest]
+    #[case::empty(expr!(make_struct()), Expression::struct_from(Vec::<Expression>::new()))]
+    #[case::raw_identifier(expr!(r#make_struct(1_i64)), Expression::struct_from([lit(1_i64)]))]
+    #[case::single(expr!(make_struct(1_i64)), Expression::struct_from([lit(1_i64)]))]
+    #[case::trailing_comma(expr!(make_struct(1_i64,)), Expression::struct_from([lit(1_i64)]))]
+    #[case::multiple(
+        expr!(make_struct(col("id"), "value", null(LONG),)),
+        Expression::struct_from([col!("id"), lit("value"), null_lit(DataType::LONG)]),
+    )]
+    #[case::nested(
+        expr!(make_struct(make_struct(), make_struct(col("id"), make_struct(1_i64)),)),
+        Expression::struct_from([
+            Expression::struct_from(Vec::<Expression>::new()),
+            Expression::struct_from([col!("id"), Expression::struct_from([lit(1_i64)])]),
+        ]),
+    )]
+    #[case::guarded_empty(
+        expr!(guarded_struct(col("keep"))),
+        Expression::struct_with_nullability_from(Vec::<Expression>::new(), col!("keep")),
+    )]
+    #[case::guarded_empty_trailing_comma(
+        expr!(guarded_struct(true,)),
+        Expression::struct_with_nullability_from(Vec::<Expression>::new(), lit(true)),
+    )]
+    #[case::guarded_single(
+        expr!(guarded_struct(col("keep"), col("id"))),
+        Expression::struct_with_nullability_from([col!("id")], col!("keep")),
+    )]
+    #[case::guarded_multiple(
+        expr!(guarded_struct(col("keep"), col("id"), "value",)),
+        Expression::struct_with_nullability_from([col!("id"), lit("value")], col!("keep")),
+    )]
+    #[case::predicate_guard(
+        expr!(guarded_struct(col("id") > 0_i64, col("id"))),
+        Expression::struct_with_nullability_from(
+            [col!("id")], Expression::from_pred(col!("id").gt(lit(0_i64))),
+        ),
+    )]
+    #[case::coalesce_guard(
+        expr!(guarded_struct(coalesce(col("keep"), false), col("id"))),
+        Expression::struct_with_nullability_from(
+            [col!("id")], Expression::coalesce([col!("keep"), lit(false)]),
+        ),
+    )]
+    #[case::nested_guards(
+        expr!(guarded_struct(col("outer"), guarded_struct(col("inner"), col("id")))),
+        Expression::struct_with_nullability_from(
+            [Expression::struct_with_nullability_from([col!("id")], col!("inner"))],
+            col!("outer"),
+        ),
+    )]
+    #[case::coalesce_structs(
+        expr!(coalesce(guarded_struct(col("keep"), col("id")), make_struct(0_i64))),
+        Expression::coalesce([
+            Expression::struct_with_nullability_from([col!("id")], col!("keep")),
+            Expression::struct_from([lit(0_i64)]),
+        ]),
+    )]
+    #[case::deferred_guard_type_validation(
+        expr!(guarded_struct(1_i64)),
+        Expression::struct_with_nullability_from(Vec::<Expression>::new(), lit(1_i64)),
+    )]
+    fn structs_preserve_fields_and_guards(
+        #[case] actual: Expression,
+        #[case] expected: Expression,
+    ) {
+        assert_eq!(actual, expected);
+    }
+
+    #[rstest]
     #[case::nested(expr!(col("a.b")), &["a", "b"])]
     #[case::literal_dot(expr!(path("a.b")), &["a.b"])]
     #[case::literal_space(expr!(path("column with spaces")), &["column with spaces"])]
@@ -481,6 +587,55 @@ mod tests {
         assert_eq!(actual, Expression::coalesce([lit(1_i64), lit(2_i64)]));
     }
 
+    #[rstest]
+    fn struct_arguments_are_evaluated_once_in_source_order(#[values(true, false)] keep: bool) {
+        let mut calls = 0_i64;
+        let mut next = || {
+            calls += 1;
+            calls
+        };
+        let actual = expr!(coalesce(
+            guarded_struct(
+                lit(next() == 1 && keep),
+                lit(next()),
+                make_struct(lit(next())),
+                guarded_struct(lit(next() == 4), lit(next())),
+            ),
+            make_struct(lit(next())),
+        ));
+        assert_eq!(calls, 6);
+        assert_eq!(
+            actual,
+            Expression::coalesce([
+                Expression::struct_with_nullability_from(
+                    [
+                        lit(2_i64),
+                        Expression::struct_from([lit(3_i64)]),
+                        Expression::struct_with_nullability_from([lit(5_i64)], lit(true)),
+                    ],
+                    lit(keep),
+                ),
+                Expression::struct_from([lit(6_i64)]),
+            ]),
+        );
+    }
+
+    #[test]
+    fn struct_syntax_preserves_rust_tokens_in_literal_and_path_arguments() {
+        macro_rules! rust_argument {
+            (struct($value:literal)) => {
+                $value
+            };
+        }
+        assert_eq!(
+            expr!(make_struct(
+                lit(rust_argument!(struct(7_i64))),
+                path(rust_argument!(struct("field"))),
+            )),
+            Expression::struct_from([lit(7_i64), col!("field")]),
+        );
+    }
+
     #[test]
     fn path_segments_accept_mixed_string_types_and_are_evaluated_once_in_order() {
         let mut calls = 0;
@@ -561,6 +716,13 @@ mod tests {
         );
         assert_eq!(forward!(-7), lit(-7));
         assert_eq!(forward!("active"), lit("active"));
+        assert_eq!(
+            forward!(guarded_struct(true, r#make_struct(1_i64))),
+            Expression::struct_with_nullability_from(
+                [Expression::struct_from([lit(1_i64)])],
+                lit(true)
+            ),
+        );
     }
 
     #[test]
@@ -590,12 +752,39 @@ mod tests {
     }
 
     mod macro_hygiene {
+        use crate::expressions::{Expression as KernelExpression, expr as kernel_expr, lit};
+
         // Simulate a caller defining types named Vec, Expression, and Predicate.
         // expr! must still use std::vec::Vec and Kernel's Expression and Predicate.
         // Bare type names in its expansion would resolve to these () aliases and fail to compile.
         type Vec = ();
         type Expression = ();
         type Predicate = ();
+
+        #[test]
+        fn struct_expansion_preserves_caller_bindings_and_resolves_kernel_types() {
+            let _caller_types: (Vec, Expression, Predicate) = ((), (), ());
+            let __kernel_struct_guard = 7_i64;
+            assert_eq!(
+                kernel_expr!(guarded_struct(
+                    true,
+                    lit(__kernel_struct_guard),
+                    guarded_struct(false),
+                    make_struct(),
+                )),
+                KernelExpression::struct_with_nullability_from(
+                    [
+                        lit(7_i64),
+                        KernelExpression::struct_with_nullability_from(
+                            std::vec::Vec::<KernelExpression>::new(),
+                            lit(false),
+                        ),
+                        KernelExpression::struct_from(std::vec::Vec::<KernelExpression>::new()),
+                    ],
+                    lit(true),
+                ),
+            );
+        }
 
         #[test]
         fn expressions_resolve_types_independently_of_caller_names() {

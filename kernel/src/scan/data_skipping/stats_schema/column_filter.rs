@@ -234,12 +234,14 @@ impl<'col> StatsColumnFilter<'col> {
         self.path.push(field.name.clone());
 
         match field.data_type() {
-            DataType::Struct(struct_type) => {
+            // A `file` column's sub-fields are leaves like a struct's: each counts against the
+            // column limit and gets its own statistics, so a `file` column takes up to six slots.
+            DataType::Struct(struct_type) | DataType::File(struct_type) => {
                 for child in struct_type.fields() {
                     self.collect_field(child, result);
                 }
             }
-            // All non-struct types are leaf columns for stats purposes: they count against
+            // All other non-struct types are leaf columns for stats purposes: they count against
             // the column limit and are included in nullCount. Array, Map, and (unless the caller
             // opts in) Variant are excluded from min/max by MinMaxStatsTransform.
             _ => {
@@ -256,7 +258,8 @@ impl<'col> StatsColumnFilter<'col> {
 
 /// Appends missing leaf paths under `data_type`, rooted at `path`, to `result`.
 ///
-/// Structs expand to descendant leaves so exact membership matches the leaf-based stats schema.
+/// Structs and `file` columns expand to descendant leaves so exact membership matches the
+/// leaf-based stats schema.
 fn collect_required_leaf_paths(
     path: &mut Vec<String>,
     data_type: &DataType,
@@ -264,7 +267,7 @@ fn collect_required_leaf_paths(
     seen: &mut HashSet<ColumnName>,
 ) {
     match data_type {
-        DataType::Struct(struct_type) => {
+        DataType::Struct(struct_type) | DataType::File(struct_type) => {
             for child in struct_type.fields() {
                 path.push(child.name.clone());
                 collect_required_leaf_paths(path, child.data_type(), result, seen);
@@ -284,7 +287,7 @@ fn collect_required_leaf_paths(
 mod tests {
     use super::*;
     use crate::expressions::column_name;
-    use crate::schema::{schema, StructType};
+    use crate::schema::{StructType, schema};
     use crate::table_properties::TableProperties;
 
     fn make_props_with_num_cols(n: u64) -> TableProperties {
@@ -462,6 +465,33 @@ mod tests {
         };
 
         let columns = collect_stats_columns(&props, Some(&required_cols), &schema);
+        assert_eq!(columns, expected);
+    }
+
+    /// A required `file` column expands to its six sub-fields, like a required struct, even past
+    /// the column limit.
+    #[test]
+    fn test_required_file_column_expands_to_sub_fields() {
+        let props = make_props_with_num_cols(1);
+        let required_cols = vec![column_name!("f")];
+        let schema = StructType::new_unchecked([
+            StructField::nullable("a", DataType::LONG),
+            StructField::nullable("f", DataType::file_type()),
+        ]);
+
+        let columns = collect_stats_columns(&props, Some(&required_cols), &schema);
+        let expected: Vec<_> = [
+            "a",
+            "f.uri",
+            "f.offset",
+            "f.size",
+            "f.content_type",
+            "f.checksum",
+            "f.inline",
+        ]
+        .into_iter()
+        .map(ColumnName::from_naive_str_split)
+        .collect();
         assert_eq!(columns, expected);
     }
 

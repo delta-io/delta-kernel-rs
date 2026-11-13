@@ -2,24 +2,24 @@
 //! engine's native expressions into kernel's [`Expression`] and [`Predicate`] types.
 use std::sync::Arc;
 
+use delta_kernel::KernelResult;
 #[cfg(feature = "default-engine-base")]
 use delta_kernel::engine::arrow_expression::opaque::ArrowOpaquePredicate;
 use delta_kernel::expressions::{
-    lit, null_lit, BinaryExpressionOp, BinaryPredicateOp, ColumnName, Expression,
-    JunctionPredicateOp, Predicate, Scalar, UnaryPredicateOp,
+    BinaryExpressionOp, BinaryPredicateOp, ColumnName, Expression, JunctionPredicateOp, Predicate,
+    Scalar, UnaryPredicateOp, lit, null_lit,
 };
 use delta_kernel::schema::{DataType, PrimitiveType};
-use delta_kernel::KernelResult;
 
 #[cfg(feature = "default-engine-base")]
-use crate::expressions::opaque_eval::{COpaqueEvalCallbacks, FfiOpaqueEvalCallbacks};
-#[cfg(feature = "default-engine-base")]
 use crate::expressions::FfiOpaquePredicateOp;
+#[cfg(feature = "default-engine-base")]
+use crate::expressions::opaque_eval::{COpaqueEvalCallbacks, FfiOpaqueEvalCallbacks};
 use crate::expressions::{FfiMapToStructOptions, SharedExpression, SharedPredicate};
 use crate::handle::Handle;
 use crate::scan::{EngineExpression, EnginePredicate};
 use crate::{
-    AllocateErrorFn, EngineIterator, ExternResult, IntoExternResult, KernelStringSlice,
+    EngineIterator, ErrorAllocators, ExternResult, IntoExternResult, KernelStringSlice,
     ReferenceSet, TryFromStringSlice,
 };
 
@@ -101,7 +101,7 @@ fn visit_predicate_unary(
 }
 
 // The EngineIterator is not thread safe, not reentrant, not owned by callee, not freed by callee.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn visit_predicate_and(
     state: &mut KernelExpressionVisitorState,
     children: &mut EngineIterator,
@@ -112,7 +112,7 @@ pub extern "C" fn visit_predicate_and(
     wrap_predicate(state, result)
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn visit_expression_plus(
     state: &mut KernelExpressionVisitorState,
     a: usize,
@@ -121,7 +121,7 @@ pub extern "C" fn visit_expression_plus(
     visit_expression_binary(state, BinaryExpressionOp::Plus, a, b)
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn visit_expression_minus(
     state: &mut KernelExpressionVisitorState,
     a: usize,
@@ -130,7 +130,7 @@ pub extern "C" fn visit_expression_minus(
     visit_expression_binary(state, BinaryExpressionOp::Minus, a, b)
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn visit_expression_multiply(
     state: &mut KernelExpressionVisitorState,
     a: usize,
@@ -139,7 +139,7 @@ pub extern "C" fn visit_expression_multiply(
     visit_expression_binary(state, BinaryExpressionOp::Multiply, a, b)
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn visit_expression_divide(
     state: &mut KernelExpressionVisitorState,
     a: usize,
@@ -148,7 +148,7 @@ pub extern "C" fn visit_expression_divide(
     visit_expression_binary(state, BinaryExpressionOp::Divide, a, b)
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn visit_predicate_lt(
     state: &mut KernelExpressionVisitorState,
     a: usize,
@@ -157,7 +157,7 @@ pub extern "C" fn visit_predicate_lt(
     visit_predicate_binary(state, BinaryPredicateOp::LessThan, a, b)
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn visit_predicate_le(
     state: &mut KernelExpressionVisitorState,
     a: usize,
@@ -167,7 +167,7 @@ pub extern "C" fn visit_predicate_le(
     visit_predicate_not(state, p)
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn visit_predicate_gt(
     state: &mut KernelExpressionVisitorState,
     a: usize,
@@ -176,7 +176,7 @@ pub extern "C" fn visit_predicate_gt(
     visit_predicate_binary(state, BinaryPredicateOp::GreaterThan, a, b)
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn visit_predicate_ge(
     state: &mut KernelExpressionVisitorState,
     a: usize,
@@ -186,7 +186,7 @@ pub extern "C" fn visit_predicate_ge(
     visit_predicate_not(state, p)
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn visit_predicate_eq(
     state: &mut KernelExpressionVisitorState,
     a: usize,
@@ -195,7 +195,7 @@ pub extern "C" fn visit_predicate_eq(
     visit_predicate_binary(state, BinaryPredicateOp::Equal, a, b)
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn visit_predicate_ne(
     state: &mut KernelExpressionVisitorState,
     a: usize,
@@ -205,7 +205,7 @@ pub extern "C" fn visit_predicate_ne(
     visit_predicate_not(state, p)
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn visit_predicate_unknown(
     state: &mut KernelExpressionVisitorState,
     name: KernelStringSlice,
@@ -214,7 +214,7 @@ pub extern "C" fn visit_predicate_unknown(
     name.map_or(0, |name| wrap_predicate(state, Predicate::Unknown(name)))
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn visit_expression_unknown(
     state: &mut KernelExpressionVisitorState,
     name: KernelStringSlice,
@@ -228,16 +228,21 @@ pub extern "C" fn visit_expression_unknown(
 /// Returns an error for zero parts, empty parts, or invalid UTF-8.
 ///
 /// # Safety
+///
+/// `error_allocators` must be non-null, aligned, and point to an initialized [`ErrorAllocators`]
+/// for this call. Its callbacks and context must satisfy [`ErrorAllocators`]'s requirements
+/// until this call returns.
 /// If `parts_len > 0`, `parts` must point to `parts_len` valid [`KernelStringSlice`] values.
 /// Every slice must remain valid for this call. The field parts are copied before returning.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn visit_expression_column(
     state: &mut KernelExpressionVisitorState,
     parts: *const KernelStringSlice,
     parts_len: usize,
-    allocate_error: AllocateErrorFn,
+    error_allocators: *const ErrorAllocators,
 ) -> ExternResult<usize> {
-    visit_expression_column_impl(state, parts, parts_len).into_extern_result(&allocate_error)
+    let result = unsafe { visit_expression_column_impl(state, parts, parts_len) };
+    unsafe { result.into_extern_result(&*error_allocators) }
 }
 /// # Safety
 /// `parts` must point to `parts_len` valid [`KernelStringSlice`], each valid for the
@@ -267,7 +272,7 @@ unsafe fn visit_expression_column_impl(
     Ok(wrap_expression(state, name))
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn visit_predicate_not(
     state: &mut KernelExpressionVisitorState,
     inner_pred: usize,
@@ -276,7 +281,7 @@ pub extern "C" fn visit_predicate_not(
         .map_or(0, |pred| wrap_predicate(state, Predicate::not(pred)))
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn visit_predicate_is_null(
     state: &mut KernelExpressionVisitorState,
     inner_expr: usize,
@@ -285,15 +290,20 @@ pub extern "C" fn visit_predicate_is_null(
 }
 
 /// # Safety
+///
+/// `error_allocators` must be non-null, aligned, and point to an initialized [`ErrorAllocators`]
+/// for this call. Its callbacks and context must satisfy [`ErrorAllocators`]'s requirements
+/// until this call returns.
 /// The string slice must be valid
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn visit_expression_literal_string(
     state: &mut KernelExpressionVisitorState,
     value: KernelStringSlice,
-    allocate_error: AllocateErrorFn,
+    error_allocators: *const ErrorAllocators,
 ) -> ExternResult<usize> {
     let value = unsafe { String::try_from_slice(&value) };
-    visit_expression_literal_string_impl(state, value).into_extern_result(&allocate_error)
+    let result = visit_expression_literal_string_impl(state, value);
+    unsafe { result.into_extern_result(&*error_allocators) }
 }
 fn visit_expression_literal_string_impl(
     state: &mut KernelExpressionVisitorState,
@@ -303,7 +313,7 @@ fn visit_expression_literal_string_impl(
 }
 
 // We need to get parse.expand working to be able to macro everything below, see issue #255
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn visit_expression_literal_int(
     state: &mut KernelExpressionVisitorState,
     value: i32,
@@ -311,7 +321,7 @@ pub extern "C" fn visit_expression_literal_int(
     wrap_expression(state, lit(value))
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn visit_expression_literal_long(
     state: &mut KernelExpressionVisitorState,
     value: i64,
@@ -319,7 +329,7 @@ pub extern "C" fn visit_expression_literal_long(
     wrap_expression(state, lit(value))
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn visit_expression_literal_short(
     state: &mut KernelExpressionVisitorState,
     value: i16,
@@ -327,7 +337,7 @@ pub extern "C" fn visit_expression_literal_short(
     wrap_expression(state, lit(value))
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn visit_expression_literal_byte(
     state: &mut KernelExpressionVisitorState,
     value: i8,
@@ -335,7 +345,7 @@ pub extern "C" fn visit_expression_literal_byte(
     wrap_expression(state, lit(value))
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn visit_expression_literal_float(
     state: &mut KernelExpressionVisitorState,
     value: f32,
@@ -343,7 +353,7 @@ pub extern "C" fn visit_expression_literal_float(
     wrap_expression(state, lit(value))
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn visit_expression_literal_double(
     state: &mut KernelExpressionVisitorState,
     value: f64,
@@ -351,7 +361,7 @@ pub extern "C" fn visit_expression_literal_double(
     wrap_expression(state, lit(value))
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn visit_expression_literal_bool(
     state: &mut KernelExpressionVisitorState,
     value: bool,
@@ -360,7 +370,7 @@ pub extern "C" fn visit_expression_literal_bool(
 }
 
 /// visit a date literal expression 'value' (i32 representing days since unix epoch)
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn visit_expression_literal_date(
     state: &mut KernelExpressionVisitorState,
     value: i32,
@@ -369,7 +379,7 @@ pub extern "C" fn visit_expression_literal_date(
 }
 
 /// visit a timestamp literal expression 'value' (i64 representing microseconds since unix epoch)
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn visit_expression_literal_timestamp(
     state: &mut KernelExpressionVisitorState,
     value: i64,
@@ -380,17 +390,20 @@ pub extern "C" fn visit_expression_literal_timestamp(
 /// Visit a timestamp literal expression 'value' (i64 representing nanoseconds since unix epoch)
 ///
 /// Returns an error if kernel was not built with the `nanosecond-timestamps` feature.
-#[no_mangle]
-pub extern "C" fn visit_expression_literal_timestamp_nanos(
+///
+/// # Safety
+///
+/// `error_allocators` must be non-null, aligned, and point to an initialized [`ErrorAllocators`]
+/// for this call. Its callbacks and context must satisfy [`ErrorAllocators`]'s requirements
+/// until this call returns.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn visit_expression_literal_timestamp_nanos(
     state: &mut KernelExpressionVisitorState,
     value: i64,
-    allocate_error: AllocateErrorFn,
+    error_allocators: *const ErrorAllocators,
 ) -> ExternResult<usize> {
-    // SAFETY: The allocate_error function pointer is provided by the engine and assumed valid.
-    unsafe {
-        visit_expression_literal_timestamp_nanos_impl(state, value)
-            .into_extern_result(&allocate_error)
-    }
+    let result = visit_expression_literal_timestamp_nanos_impl(state, value);
+    unsafe { result.into_extern_result(&*error_allocators) }
 }
 
 #[cfg(feature = "nanosecond-timestamps")]
@@ -418,17 +431,20 @@ fn visit_expression_literal_timestamp_nanos_impl(
 /// unix epoch, with no timezone)
 ///
 /// Returns an error if kernel was not built with the `nanosecond-timestamps` feature.
-#[no_mangle]
-pub extern "C" fn visit_expression_literal_timestamp_nanos_ntz(
+///
+/// # Safety
+///
+/// `error_allocators` must be non-null, aligned, and point to an initialized [`ErrorAllocators`]
+/// for this call. Its callbacks and context must satisfy [`ErrorAllocators`]'s requirements
+/// until this call returns.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn visit_expression_literal_timestamp_nanos_ntz(
     state: &mut KernelExpressionVisitorState,
     value: i64,
-    allocate_error: AllocateErrorFn,
+    error_allocators: *const ErrorAllocators,
 ) -> ExternResult<usize> {
-    // SAFETY: The allocate_error function pointer is provided by the engine and assumed valid.
-    unsafe {
-        visit_expression_literal_timestamp_nanos_ntz_impl(state, value)
-            .into_extern_result(&allocate_error)
-    }
+    let result = visit_expression_literal_timestamp_nanos_ntz_impl(state, value);
+    unsafe { result.into_extern_result(&*error_allocators) }
 }
 
 #[cfg(feature = "nanosecond-timestamps")]
@@ -454,7 +470,7 @@ fn visit_expression_literal_timestamp_nanos_ntz_impl(
 
 /// visit a timestamp_ntz literal expression 'value' (i64 representing microseconds since unix
 /// epoch)
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn visit_expression_literal_timestamp_ntz(
     state: &mut KernelExpressionVisitorState,
     value: i64,
@@ -462,55 +478,58 @@ pub extern "C" fn visit_expression_literal_timestamp_ntz(
     wrap_expression(state, lit(Scalar::TimestampNtz(value)))
 }
 
-/// Visit an interval year-month literal (signed month count).
-#[no_mangle]
+/// Registers a `YEAR TO MONTH` literal containing `value` total months in `state`.
+///
+/// Returns its expression ID. Every `i32` month count is valid.
+#[unsafe(no_mangle)]
 pub extern "C" fn visit_expression_literal_interval_year_month(
     state: &mut KernelExpressionVisitorState,
     value: i32,
 ) -> usize {
-    wrap_expression(state, lit(Scalar::IntervalYearMonth(value)))
+    wrap_expression(state, lit(Scalar::IntervalYearMonth(value.into())))
 }
 
 /// Visit an interval day-time literal (signed microsecond count).
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn visit_expression_literal_interval_day_time(
     state: &mut KernelExpressionVisitorState,
     value: i64,
 ) -> usize {
-    wrap_expression(state, lit(Scalar::IntervalDayTime(value)))
+    wrap_expression(state, lit(Scalar::IntervalDayTime(value.into())))
 }
 
 /// visit a binary literal expression
 ///
 /// # Safety
 /// The caller must ensure that `value` points to a valid array of at least `len` bytes.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn visit_expression_literal_binary(
     state: &mut KernelExpressionVisitorState,
     value: *const u8,
     len: usize,
 ) -> usize {
-    let bytes = std::slice::from_raw_parts(value, len);
+    let bytes = unsafe { std::slice::from_raw_parts(value, len) };
     wrap_expression(state, lit(bytes))
 }
 
 /// visit a decimal literal expression
 ///
 /// Returns an error if the precision/scale combination is invalid.
-#[no_mangle]
-pub extern "C" fn visit_expression_literal_decimal(
+/// # Safety
+///
+/// `error_allocators` must point to an initialized [`ErrorAllocators`] for this call. Its context
+/// and callbacks must remain valid for the call and support concurrency when shared.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn visit_expression_literal_decimal(
     state: &mut KernelExpressionVisitorState,
     value_hi: u64,
     value_lo: u64,
     precision: u8,
     scale: u8,
-    allocate_error: AllocateErrorFn,
+    error_allocators: *const ErrorAllocators,
 ) -> ExternResult<usize> {
-    // SAFETY: The allocate_error function pointer is provided by the engine and assumed valid.
-    unsafe {
-        visit_expression_literal_decimal_impl(state, value_hi, value_lo, precision, scale)
-            .into_extern_result(&allocate_error)
-    }
+    let result = visit_expression_literal_decimal_impl(state, value_hi, value_lo, precision, scale);
+    unsafe { result.into_extern_result(&*error_allocators) }
 }
 
 fn visit_expression_literal_decimal_impl(
@@ -641,8 +660,8 @@ impl NullTypeTag {
                 PrimitiveType::TimestampNanos => (Self::TimestampNanos, 0, 0),
                 #[cfg(feature = "nanosecond-timestamps")]
                 PrimitiveType::TimestampNanosNtz => (Self::TimestampNanosNtz, 0, 0),
-                PrimitiveType::IntervalYearMonth => (Self::IntervalYearMonth, 0, 0),
-                PrimitiveType::IntervalDayTime => (Self::IntervalDayTime, 0, 0),
+                PrimitiveType::IntervalYearMonth(_) => (Self::IntervalYearMonth, 0, 0),
+                PrimitiveType::IntervalDayTime(_) => (Self::IntervalDayTime, 0, 0),
                 PrimitiveType::Decimal(dt) => (Self::Decimal, dt.precision(), dt.scale()),
                 // Void has no dedicated FFI tag. The current predicate-construction path is
                 // not expected to produce a void-typed literal null; if one ever reaches this
@@ -717,19 +736,20 @@ impl NullTypeTag {
 ///
 /// Returns an error if the type tag is unrecognized, if the tag is `NonPrimitive` (255), or
 /// if the decimal precision/scale is invalid.
-#[no_mangle]
-pub extern "C" fn visit_expression_literal_null(
+/// # Safety
+///
+/// `error_allocators` must point to an initialized [`ErrorAllocators`] for this call. Its context
+/// and callbacks must remain valid for the call and support concurrency when shared.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn visit_expression_literal_null(
     state: &mut KernelExpressionVisitorState,
     type_tag: u8,
     precision: u8,
     scale: u8,
-    allocate_error: AllocateErrorFn,
+    error_allocators: *const ErrorAllocators,
 ) -> ExternResult<usize> {
-    // SAFETY: The allocate_error function pointer is provided by the engine and assumed valid.
-    unsafe {
-        visit_expression_literal_null_impl(state, type_tag, precision, scale)
-            .into_extern_result(&allocate_error)
-    }
+    let result = visit_expression_literal_null_impl(state, type_tag, precision, scale);
+    unsafe { result.into_extern_result(&*error_allocators) }
 }
 
 fn visit_expression_literal_null_impl(
@@ -743,7 +763,7 @@ fn visit_expression_literal_null_impl(
     Ok(wrap_expression(state, null_lit(data_type)))
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn visit_predicate_distinct(
     state: &mut KernelExpressionVisitorState,
     a: usize,
@@ -752,7 +772,7 @@ pub extern "C" fn visit_predicate_distinct(
     visit_predicate_binary(state, BinaryPredicateOp::Distinct, a, b)
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn visit_predicate_in(
     state: &mut KernelExpressionVisitorState,
     a: usize,
@@ -761,7 +781,7 @@ pub extern "C" fn visit_predicate_in(
     visit_predicate_binary(state, BinaryPredicateOp::In, a, b)
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn visit_predicate_or(
     state: &mut KernelExpressionVisitorState,
     children: &mut EngineIterator,
@@ -773,7 +793,7 @@ pub extern "C" fn visit_predicate_or(
     wrap_predicate(state, result)
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn visit_expression_struct(
     state: &mut KernelExpressionVisitorState,
     children: &mut EngineIterator,
@@ -795,7 +815,7 @@ pub extern "C" fn visit_expression_struct(
 ///
 /// `options` must reference a valid [`FfiMapToStructOptions`] for this call. A configured timezone
 /// slice must point to its declared number of initialized bytes.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn visit_expression_map_to_struct(
     state: &mut KernelExpressionVisitorState,
     child_expr: usize,
@@ -815,14 +835,19 @@ pub unsafe extern "C" fn visit_expression_map_to_struct(
 ///
 /// # Safety
 ///
+/// `error_allocators` must be non-null, aligned, and point to an initialized [`ErrorAllocators`]
+/// for this call. Its callbacks and context must satisfy [`ErrorAllocators`]'s requirements
+/// until this call returns.
+///
 /// Caller must ensure that `engine_expression` points to a valid
 /// `EngineExpression` with a valid visitor function and expression pointer.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn visit_engine_expression(
     engine_expression: &mut EngineExpression,
-    allocate_error: AllocateErrorFn,
+    error_allocators: *const ErrorAllocators,
 ) -> ExternResult<Handle<SharedExpression>> {
-    visit_engine_expression_impl(engine_expression).into_extern_result(&allocate_error)
+    let result = visit_engine_expression_impl(engine_expression);
+    unsafe { result.into_extern_result(&*error_allocators) }
 }
 
 fn visit_engine_expression_impl(
@@ -845,14 +870,19 @@ fn visit_engine_expression_impl(
 ///
 /// # Safety
 ///
+/// `error_allocators` must be non-null, aligned, and point to an initialized [`ErrorAllocators`]
+/// for this call. Its callbacks and context must satisfy [`ErrorAllocators`]'s requirements
+/// until this call returns.
+///
 /// Caller must ensure that `engine_predicate` points to a valid
 /// `EnginePredicate` with a valid visitor function and predicate pointer.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn visit_engine_predicate(
     engine_predicate: &mut EnginePredicate,
-    allocate_error: AllocateErrorFn,
+    error_allocators: *const ErrorAllocators,
 ) -> ExternResult<Handle<SharedPredicate>> {
-    visit_engine_predicate_impl(engine_predicate).into_extern_result(&allocate_error)
+    let result = visit_engine_predicate_impl(engine_predicate);
+    unsafe { result.into_extern_result(&*error_allocators) }
 }
 
 fn visit_engine_predicate_impl(
@@ -898,16 +928,21 @@ fn resolve_opaque_children<I: IntoIterator<Item = usize>>(
 /// Returns 0 if any child ID is invalid.
 ///
 /// # Safety
+///
+/// `error_allocators` must be non-null, aligned, and point to an initialized [`ErrorAllocators`]
+/// for this call. Its callbacks and context must satisfy [`ErrorAllocators`]'s requirements
+/// until this call returns.
 /// `name` must be valid UTF-8 for the duration of the call.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn visit_predicate_opaque(
     state: &mut KernelExpressionVisitorState,
     name: KernelStringSlice,
     children: &mut EngineIterator,
-    allocate_error: AllocateErrorFn,
+    error_allocators: *const ErrorAllocators,
 ) -> ExternResult<usize> {
     let name = unsafe { String::try_from_slice(&name) };
-    visit_predicate_opaque_impl(state, name, children).into_extern_result(&allocate_error)
+    let result = visit_predicate_opaque_impl(state, name, children);
+    unsafe { result.into_extern_result(&*error_allocators) }
 }
 
 fn visit_predicate_opaque_impl(
@@ -938,23 +973,27 @@ fn visit_predicate_opaque_impl(
 /// Returns 0 if any child ID is invalid.
 ///
 /// # Safety
+///
+/// `error_allocators` must be non-null, aligned, and point to an initialized [`ErrorAllocators`]
+/// for this call. Its callbacks and context must satisfy [`ErrorAllocators`]'s requirements
+/// until this call returns.
 /// `name` must be valid UTF-8 for the duration of the call; the function
 /// pointers in `callbacks` must remain valid for the lifetime of the built
 /// predicate.
 #[cfg(feature = "default-engine-base")]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn visit_predicate_opaque_with_eval(
     state: &mut KernelExpressionVisitorState,
     name: KernelStringSlice,
     children: &mut EngineIterator,
     callbacks: COpaqueEvalCallbacks,
-    allocate_error: AllocateErrorFn,
+    error_allocators: *const ErrorAllocators,
 ) -> ExternResult<usize> {
     let name = unsafe { String::try_from_slice(&name) };
     // Wrap immediately so free_state fires exactly once on every exit path.
     let callbacks = Arc::new(FfiOpaqueEvalCallbacks::new(callbacks));
-    visit_predicate_opaque_with_eval_impl(state, name, children, callbacks)
-        .into_extern_result(&allocate_error)
+    let result = visit_predicate_opaque_with_eval_impl(state, name, children, callbacks);
+    unsafe { result.into_extern_result(&*error_allocators) }
 }
 
 #[cfg(feature = "default-engine-base")]
@@ -976,8 +1015,10 @@ fn visit_predicate_opaque_with_eval_impl(
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-    use delta_kernel::expressions::{col, lit, MapToStructOptions, Scalar};
-    use delta_kernel::schema::{schema, ArrayType, DataType, MapType};
+    use delta_kernel::expressions::{MapToStructOptions, Scalar, col, lit};
+    use delta_kernel::schema::{
+        ArrayType, DataType, IntervalDayToSecondType, IntervalYearToMonthType, MapType, schema,
+    };
     use rstest::rstest;
 
     use super::*;
@@ -1046,6 +1087,8 @@ mod tests {
     #[case(DataType::TIMESTAMP_NTZ, NullTypeTag::TimestampNtz, 0, 0)]
     #[case(DataType::INTERVAL_YEAR_MONTH, NullTypeTag::IntervalYearMonth, 0, 0)]
     #[case(DataType::INTERVAL_DAY_TIME, NullTypeTag::IntervalDayTime, 0, 0)]
+    #[case(DataType::INTERVAL_DAY, NullTypeTag::IntervalDayTime, 0, 0)]
+    #[case(DataType::INTERVAL_HOUR_MINUTE, NullTypeTag::IntervalDayTime, 0, 0)]
     fn from_data_type_primitive(
         #[case] dt: DataType,
         #[case] expected_tag: NullTypeTag,
@@ -1115,6 +1158,22 @@ mod tests {
     #[case(NullTypeTag::IntervalDayTime, DataType::INTERVAL_DAY_TIME)]
     fn to_data_type_primitive(#[case] tag: NullTypeTag, #[case] expected: DataType) {
         assert_eq!(tag.to_data_type(0, 0).unwrap(), expected);
+    }
+
+    #[test]
+    fn interval_year_month_null_tag_reconstructs_full_range() {
+        assert_eq!(
+            NullTypeTag::IntervalYearMonth.to_data_type(0, 0).unwrap(),
+            DataType::INTERVAL_YEAR_MONTH
+        );
+    }
+
+    #[test]
+    fn interval_day_time_null_tag_reconstructs_full_range() {
+        assert_eq!(
+            NullTypeTag::IntervalDayTime.to_data_type(0, 0).unwrap(),
+            DataType::INTERVAL_DAY_TIME
+        );
     }
 
     #[test]
@@ -1245,22 +1304,23 @@ mod tests {
     }
 
     #[rstest]
-    #[case(Scalar::IntervalYearMonth(17))]
-    #[case(Scalar::IntervalDayTime(1_234_567))]
-    #[case(Scalar::IntervalYearMonth(-13))]
-    #[case(Scalar::IntervalYearMonth(i32::MIN))]
-    #[case(Scalar::IntervalYearMonth(i32::MAX))]
-    #[case(Scalar::IntervalDayTime(-86_400_000_000))]
-    #[case(Scalar::IntervalDayTime(i64::MIN))]
-    #[case(Scalar::IntervalDayTime(i64::MAX))]
+    #[case(Scalar::interval_year_month(17, IntervalYearToMonthType::IntervalYearToMonth).unwrap())]
+    #[case(Scalar::interval_day_time(1_234_567, IntervalDayToSecondType::IntervalDayToSecond).unwrap())]
+    #[case(Scalar::interval_day_time(1, IntervalDayToSecondType::IntervalDayToSecond).unwrap())]
+    #[case(Scalar::interval_year_month(-13, IntervalYearToMonthType::IntervalYearToMonth).unwrap())]
+    #[case(Scalar::interval_year_month(i32::MIN, IntervalYearToMonthType::IntervalYearToMonth).unwrap())]
+    #[case(Scalar::interval_year_month(i32::MAX, IntervalYearToMonthType::IntervalYearToMonth).unwrap())]
+    #[case(Scalar::interval_day_time(-86_400_000_000, IntervalDayToSecondType::IntervalDayToSecond).unwrap())]
+    #[case(Scalar::interval_day_time(i64::MIN, IntervalDayToSecondType::IntervalDayToSecond).unwrap())]
+    #[case(Scalar::interval_day_time(i64::MAX, IntervalDayToSecondType::IntervalDayToSecond).unwrap())]
     fn interval_literal_visitors_build_interval_scalars(#[case] expected: Scalar) {
         let mut state = KernelExpressionVisitorState::default();
         let id = match expected {
-            Scalar::IntervalYearMonth(value) => {
-                visit_expression_literal_interval_year_month(&mut state, value)
+            Scalar::IntervalYearMonth(ref value) => {
+                visit_expression_literal_interval_year_month(&mut state, value.months())
             }
-            Scalar::IntervalDayTime(value) => {
-                visit_expression_literal_interval_day_time(&mut state, value)
+            Scalar::IntervalDayTime(ref value) => {
+                visit_expression_literal_interval_day_time(&mut state, value.micros())
             }
             _ => unreachable!(),
         };
@@ -1311,7 +1371,12 @@ mod tests {
             })
             .collect();
         let result = unsafe {
-            visit_expression_column(&mut state, slices.as_ptr(), slices.len(), allocate_err)
+            visit_expression_column(
+                &mut state,
+                slices.as_ptr(),
+                slices.len(),
+                &TEST_ERROR_ALLOCATORS,
+            )
         };
         assert_extern_result_error_with_message(result, expected_error, expected_message);
     }
@@ -1398,13 +1463,13 @@ mod tests {
 
     // ============================================================================
     // Top-level `extern "C"` entry points. These drive the real FFI symbols (with
-    // an engine-supplied `allocate_error` and the handle alloc/dealloc dance) so
+    // an engine-supplied `error_allocators` and the handle alloc/dealloc dance) so
     // miri can validate the unsafe boundary, not just the `_impl` helpers above.
     // ============================================================================
 
     use crate::error::FFIKernelError;
     use crate::ffi_test_utils::{
-        allocate_err, assert_extern_result_error_with_message, ok_or_panic,
+        TEST_ERROR_ALLOCATORS, assert_extern_result_error_with_message, ok_or_panic,
     };
     use crate::kernel_string_slice;
 
@@ -1414,15 +1479,14 @@ mod tests {
         let (a, b) = make_two_literal_ids(&mut state);
         let (_keep, mut it) = make_iter(vec![a, b]);
         let name = "MY_OP";
-        let result = unsafe {
+        let id = ok_or_panic(unsafe {
             visit_predicate_opaque(
                 &mut state,
                 kernel_string_slice!(name),
                 &mut it,
-                allocate_err,
+                &TEST_ERROR_ALLOCATORS,
             )
-        };
-        let id = ok_or_panic(result);
+        });
         assert_ne!(id, 0);
         let pred = unwrap_kernel_predicate(&mut state, id).unwrap();
         assert_eq!(pred, Predicate::NULL);
@@ -1468,16 +1532,15 @@ mod tests {
         let (a, b) = make_two_literal_ids(&mut state);
         let (_keep, mut it) = make_iter(vec![a, b]);
         let name = "MY_EVAL_OP";
-        let result = unsafe {
+        let id = ok_or_panic(unsafe {
             visit_predicate_opaque_with_eval(
                 &mut state,
                 kernel_string_slice!(name),
                 &mut it,
                 callbacks(),
-                allocate_err,
+                &TEST_ERROR_ALLOCATORS,
             )
-        };
-        let id = ok_or_panic(result);
+        });
         assert_ne!(id, 0);
         assert_eq!(
             FREED.load(Ordering::SeqCst),
@@ -1499,7 +1562,7 @@ mod tests {
                 kernel_string_slice!(name),
                 &mut bad_it,
                 callbacks(),
-                allocate_err,
+                &TEST_ERROR_ALLOCATORS,
             )
         });
         assert_eq!(id, 0);
@@ -1524,16 +1587,16 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn opaque_predicate_prunes_files_end_to_end() {
         use std::ffi::c_void;
-        use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
 
-        use delta_kernel::arrow::array::ffi::{from_ffi, FFI_ArrowArray, FFI_ArrowSchema};
+        use delta_kernel::Snapshot;
+        use delta_kernel::arrow::array::ffi::{FFI_ArrowArray, FFI_ArrowSchema, from_ffi};
         use delta_kernel::arrow::array::{
             Array, ArrayRef, BooleanArray, Int64Array, RecordBatch, StructArray,
         };
         use delta_kernel::object_store::memory::InMemory;
         use delta_kernel::scan::state::ScanFile;
-        use delta_kernel::Snapshot;
         use delta_kernel_default_engine::DefaultEngineBuilder;
         use test_utils::add_commit;
 
@@ -1615,7 +1678,7 @@ mod tests {
                     eval_pred_stats: engine_in_range,
                     free_state: noop_free,
                 },
-                allocate_err,
+                &TEST_ERROR_ALLOCATORS,
             )
         });
         let predicate = Arc::new(unwrap_kernel_predicate(&mut state, id).unwrap());
@@ -1683,11 +1746,11 @@ mod tests {
         use std::ffi::c_void;
         use std::sync::Arc;
 
-        use delta_kernel::arrow::array::ffi::{from_ffi, FFI_ArrowArray, FFI_ArrowSchema};
+        use delta_kernel::Snapshot;
+        use delta_kernel::arrow::array::ffi::{FFI_ArrowArray, FFI_ArrowSchema, from_ffi};
         use delta_kernel::arrow::array::{Array, ArrayRef, BooleanArray, RecordBatch, StructArray};
         use delta_kernel::object_store::memory::InMemory;
         use delta_kernel::scan::state::ScanFile;
-        use delta_kernel::Snapshot;
         use delta_kernel_default_engine::DefaultEngineBuilder;
         use test_utils::add_commit;
 
@@ -1744,7 +1807,7 @@ mod tests {
                     eval_pred_stats: engine_skip_null_bounds,
                     free_state: noop_free,
                 },
-                allocate_err,
+                &TEST_ERROR_ALLOCATORS,
             )
         });
         let predicate = Arc::new(unwrap_kernel_predicate(&mut state, id).unwrap());

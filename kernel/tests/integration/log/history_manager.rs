@@ -5,7 +5,7 @@ use std::ops::RangeInclusive;
 use std::time::{Duration, SystemTime};
 
 use delta_kernel::committer::FileSystemCommitter;
-use delta_kernel::history_manager::{get_earliest_commit, latest_version_as_of, HistoryCommitType};
+use delta_kernel::history_manager::{HistoryCommitType, get_earliest_commit, latest_version_as_of};
 use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::{ObjectStore, ObjectStoreExt as _};
 use delta_kernel::transaction::create_table::create_table;
@@ -120,7 +120,7 @@ fn test_at_timestamp_resolves_to_intermediate_version() -> KernelResult<()> {
 /// querying one millisecond earlier resolves to its predecessor. Deterministic without setting
 /// commit timestamps explicitly, since ICT values are derived from the table rather than hardcoded.
 #[test]
-fn test_at_timestamp_targets_specific_commit_via_ict() -> KernelResult<()> {
+fn test_at_timestamp_targets_specific_commit_via_ict() -> delta_kernel::Result<()> {
     let table = TestTableBuilder::new()
         .with_features(FeatureSet::new().ict())
         .with_log_state(LogState::with_latest_version(4))

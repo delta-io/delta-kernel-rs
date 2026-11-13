@@ -230,7 +230,7 @@ mod tests {
 
     use crate::schema::compare::{Error, SchemaComparison, SchemaComparisonResult};
     use crate::schema::{
-        schema, ArrayType, CheckpointFieldKind, DataType, MapType, PrimitiveType, StructField,
+        ArrayType, CheckpointFieldKind, DataType, MapType, PrimitiveType, StructField, schema,
     };
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -7,7 +7,7 @@ use crate::delta_types::FfiNullableStringMap;
 use crate::delta_types::FfiNullableStringMapEntry;
 use crate::handle::Handle;
 use crate::scan::CMetadataMap;
-use crate::{kernel_string_slice, KernelStringSlice, SharedSchema};
+use crate::{KernelStringSlice, SharedSchema, kernel_string_slice};
 
 /// The `EngineSchemaVisitor` defines a visitor system to allow engines to build their own
 /// representation of a schema from a particular schema within kernel.
@@ -321,7 +321,7 @@ pub struct EngineSchemaVisitor {
 /// # Safety
 ///
 /// Caller is responsible for passing a valid schema handle and schema visitor.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn visit_schema(
     schema: Handle<SharedSchema>,
     visitor: &mut EngineSchemaVisitor,
@@ -449,6 +449,10 @@ fn visit_schema_impl(schema: &StructType, visitor: &mut EngineSchemaVisitor) -> 
                 );
             }
             DataType::Struct(st) => call!(visit_struct, visit_struct_fields(visitor, st)),
+            // A `file` is physically a struct of its fixed fields, so engines see it as that
+            // struct. A dedicated `visit_file` callback would change the C ABI, so it
+            // is deferred until the type is finalized.
+            DataType::File(st) => call!(visit_struct, visit_struct_fields(visitor, st)),
             DataType::Map(mt) => {
                 call!(
                     visit_map,
@@ -478,8 +482,13 @@ fn visit_schema_impl(schema: &StructType, visitor: &mut EngineSchemaVisitor) -> 
             &DataType::TIMESTAMP_NANOS => call!(visit_timestamp_nanos),
             #[cfg(feature = "nanosecond-timestamps")]
             &DataType::TIMESTAMP_NANOS_NTZ => call!(visit_timestamp_nanos_ntz),
-            &DataType::INTERVAL_YEAR_MONTH => call!(visit_interval_year_month),
-            &DataType::INTERVAL_DAY_TIME => call!(visit_interval_day_time),
+            DataType::Primitive(PrimitiveType::IntervalYearMonth(_)) => {
+                // The callback carries no qualifier, so narrowed types lose it here.
+                call!(visit_interval_year_month)
+            }
+            DataType::Primitive(PrimitiveType::IntervalDayTime(_)) => {
+                call!(visit_interval_day_time)
+            }
             &DataType::VOID => call!(visit_void),
             #[cfg(feature = "geo-type-in-dev")]
             DataType::Primitive(PrimitiveType::Geometry(geometry)) => {
@@ -768,10 +777,14 @@ mod tests {
     }
 
     #[test]
-    fn visit_schema_preserves_interval_fields() {
+    fn visit_schema_encodes_interval_fields_with_generic_tags() {
         let schema = schema! {
             nullable "ym": INTERVAL_YEAR_MONTH,
+            nullable "narrow_year": INTERVAL_YEAR,
+            nullable "narrow_month": INTERVAL_MONTH,
             not_null "dt": INTERVAL_DAY_TIME,
+            nullable "narrow_day": INTERVAL_DAY,
+            nullable "narrow_hour_minute": INTERVAL_HOUR_MINUTE,
             nullable "nested": {
                 nullable "inner_ym": INTERVAL_YEAR_MONTH,
             },
@@ -783,23 +796,39 @@ mod tests {
         let top_level_id = visit_schema_impl(&schema, &mut visitor);
 
         assert_eq!(top_level_id, 0);
-        assert_eq!(builder.lists[0].len(), 4);
+        assert_eq!(builder.lists[0].len(), 8);
         assert_eq!(
             builder.lists[0][0],
             VisitedField::new("ym", "interval year to month", true, None)
         );
         assert_eq!(
             builder.lists[0][1],
+            VisitedField::new("narrow_year", "interval year to month", true, None)
+        );
+        assert_eq!(
+            builder.lists[0][2],
+            VisitedField::new("narrow_month", "interval year to month", true, None)
+        );
+        assert_eq!(
+            builder.lists[0][3],
             VisitedField::new("dt", "interval day to second", false, None)
         );
+        assert_eq!(
+            builder.lists[0][4],
+            VisitedField::new("narrow_day", "interval day to second", true, None)
+        );
+        assert_eq!(
+            builder.lists[0][5],
+            VisitedField::new("narrow_hour_minute", "interval day to second", true, None)
+        );
 
-        let nested_child_list_id = builder.lists[0][2].children.unwrap();
+        let nested_child_list_id = builder.lists[0][6].children.unwrap();
         assert_eq!(
             builder.lists[nested_child_list_id][0],
             VisitedField::new("inner_ym", "interval year to month", true, None)
         );
 
-        let array_child_list_id = builder.lists[0][3].children.unwrap();
+        let array_child_list_id = builder.lists[0][7].children.unwrap();
         assert_eq!(
             builder.lists[array_child_list_id][0],
             VisitedField::new("array_element", "interval day to second", false, None)

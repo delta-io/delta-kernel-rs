@@ -15,12 +15,12 @@ use crate::arrow::datatypes::{DataType as ArrowDataType, Field, Fields, Schema a
 use crate::arrow::record_batch::RecordBatch;
 use crate::arrow::util::display::array_value_to_string;
 use crate::committer::FileSystemCommitter;
+use crate::engine::DelegatingEngine;
 use crate::engine::arrow_data::ArrowEngineData;
 use crate::engine::parquet_row_group_skipping::ParquetRowGroupSkipping;
 use crate::engine::sync::SyncEngine;
-use crate::engine::test_delegating::DelegatingEngine;
 use crate::expressions::{
-    col, column_name, column_pred, lit, Expression as Expr, Predicate as Pred, Scalar,
+    Expression as Expr, Predicate as Pred, Scalar, col, column_name, column_pred, expr, lit,
 };
 use crate::object_store::memory::InMemory;
 use crate::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
@@ -28,18 +28,20 @@ use crate::parquet::arrow::arrow_writer::ArrowWriter;
 use crate::scan::data_skipping::{all_referenced_columns, as_checkpoint_skipping_predicate};
 use crate::scan::state::ScanFile;
 use crate::schema::{
-    self, schema, schema_ref, ColumnMetadataKey, DataType, MetadataColumnSpec, StructField,
-    StructType,
+    self, ColumnMetadataKey, DataType, MetadataColumnSpec, StructField, StructType, schema,
+    schema_ref,
 };
 use crate::transaction::create_table::create_table;
 use crate::transaction::data_layout::DataLayout;
 use crate::unit_test_utils::TestCancellationToken;
+use crate::unit_test_utils::recording_reads::{Read, RecordingReads};
 use crate::{
     CancellationTokenRef, Engine, EngineData, FileDataReadResultIterator, FileMeta, FileSize,
-    KernelResult, KernelResultIteratorStatic, ParquetFooter, ParquetHandler, PredicateRef,
-    Snapshot,
+    KernelResult, KernelResultIterator, ParquetFooter, ParquetHandler, PredicateRef, Snapshot,
 };
 
+#[cfg(feature = "adaptive-metadata-in-dev")]
+mod adaptive_metadata;
 #[cfg(feature = "geo-type-in-dev")]
 mod geometry_stats;
 mod variant_stats;
@@ -74,6 +76,23 @@ fn assert_stats_schemas_aligned(logical: &StructType, physical: &StructType) {
     }
 }
 
+#[rstest]
+fn map_to_struct_options_preserves_timezone(
+    #[values(
+        None,
+        Some("UTC"),
+        Some("America/Los_Angeles"),
+        Some("+05:30"),
+        Some("Not/AZone")
+    )]
+    timezone: Option<&str>,
+) {
+    assert_eq!(
+        map_to_struct_options(timezone).timestamp_timezone(),
+        timezone
+    );
+}
+
 #[test]
 fn test_static_skipping() {
     let test_cases = [
@@ -81,13 +100,33 @@ fn test_static_skipping() {
         (true, Pred::FALSE),
         (false, Pred::TRUE),
         (false, Pred::NULL), // NULL is unknown, not false -- conservative (no skip)
-        (true, Pred::and(column_pred!("a"), Pred::FALSE)),
-        (false, Pred::or(column_pred!("a"), Pred::TRUE)),
-        (false, Pred::or(column_pred!("a"), Pred::FALSE)),
-        (false, Pred::lt(col!("a"), lit(10))),
-        (false, Pred::lt(lit(10), lit(100))),
-        (true, Pred::gt(lit(10), lit(100))),
-        (false, Pred::and(Pred::NULL, column_pred!("a"))), // NULL is unknown, not false
+        (true, Pred::from_expr(expr!(and(col("a"), false)))),
+        (false, Pred::from_expr(expr!(or(col("a"), true)))),
+        (false, Pred::from_expr(expr!(or(col("a"), false)))),
+        (false, Pred::from_expr(expr!(col("a") < 10))),
+        (false, Pred::from_expr(expr!(10 < 100))),
+        (true, Pred::from_expr(expr!(10 > 100))),
+        // NULL is unknown, not false.
+        (false, Pred::from_expr(expr!(and(null(BOOLEAN), col("a"))))),
+        (
+            true,
+            Pred::from_expr(Expr::case_when([(Pred::TRUE, lit(false))], lit(true))),
+        ),
+        (
+            false,
+            Pred::from_expr(Expr::case_when(
+                [(column_pred!("a"), lit(true))],
+                lit(false),
+            )),
+        ),
+        (
+            false, // A NULL condition does not establish ELSE during static pruning.
+            Pred::from_expr(Expr::case_when([(Pred::NULL, lit(true))], lit(false))),
+        ),
+        (
+            true,
+            Expr::case_when([(Pred::TRUE, lit(10))], lit(20)).eq(lit(20)),
+        ),
     ];
     for (should_skip, predicate) in test_cases {
         assert_eq!(
@@ -207,9 +246,9 @@ fn test_physical_predicate() {
             )),
         ),
         (
-            Pred::and(column_pred!("mapped.n"), Pred::TRUE),
+            Pred::from_expr(expr!(and(col("mapped.n"), true))),
             Some(PhysicalPredicate::Some(
-                Pred::and(column_pred!("phys_mapped.phys_n"), Pred::TRUE).into(),
+                Pred::from_expr(expr!(and(col("phys_mapped.phys_n"), true))).into(),
                 schema_ref! {
                     (StructField::nullable(
                         "phys_mapped",
@@ -228,7 +267,7 @@ fn test_physical_predicate() {
             )),
         ),
         (
-            Pred::and(column_pred!("mapped.n"), Pred::FALSE),
+            Pred::from_expr(expr!(and(col("mapped.n"), false))),
             Some(PhysicalPredicate::StaticSkipAll),
         ),
     ];
@@ -253,16 +292,10 @@ fn test_physical_predicate() {
         nullable "createdAt": LONG,
         nullable "Value": LONG,
     },
-    Pred::and(
-        Pred::gt(col!("createdat"), lit(500i64)),
-        Pred::lt(col!("value"), lit(100i64)),
-    ),
+    Pred::from_expr(expr!(and(col("createdat") > 500i64, col("value") < 100i64))),
     ColumnMappingMode::None,
     PhysicalPredicate::Some(
-        Arc::new(Pred::and(
-            Pred::gt(col!("createdAt"), lit(500i64)),
-            Pred::lt(col!("Value"), lit(100i64)),
-        )),
+        Arc::new(Pred::from_expr(expr!(and(col("createdAt") > 500i64, col("Value") < 100i64)))),
         schema_ref! {
             nullable "createdAt": LONG,
             nullable "Value": LONG,
@@ -281,16 +314,13 @@ fn test_physical_predicate() {
             "phys_value",
         )])),
     },
-    Pred::and(
-        Pred::gt(col!("createdat"), lit(500i64)),
-        Pred::lt(col!("value"), lit(100i64)),
-    ),
+    Pred::from_expr(expr!(and(col("createdat") > 500i64, col("value") < 100i64))),
     ColumnMappingMode::Name,
     PhysicalPredicate::Some(
-        Arc::new(Pred::and(
-            Pred::gt(col!("phys_created"), lit(500i64)),
-            Pred::lt(col!("phys_value"), lit(100i64)),
-        )),
+        Arc::new(Pred::from_expr(expr!(and(
+            col("phys_created") > 500i64,
+            col("phys_value") < 100i64,
+        )))),
         schema_ref! {
             (StructField::nullable("phys_created", DataType::LONG).with_metadata([(
                 ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
@@ -306,16 +336,10 @@ fn test_physical_predicate() {
 #[case::duplicate_column_different_casing(
     // predicate references same column with different casings: value > 5 AND VALUE < 10
     schema! { nullable "Value": LONG },
-    Pred::and(
-        Pred::gt(col!("value"), lit(5i64)),
-        Pred::lt(col!("VALUE"), lit(10i64)),
-    ),
+    Pred::from_expr(expr!(and(col("value") > 5i64, col("VALUE") < 10i64))),
     ColumnMappingMode::None,
     PhysicalPredicate::Some(
-        Arc::new(Pred::and(
-            Pred::gt(col!("Value"), lit(5i64)),
-            Pred::lt(col!("Value"), lit(10i64)),
-        )),
+        Arc::new(Pred::from_expr(expr!(and(col("Value") > 5i64, col("Value") < 10i64)))),
         schema_ref! { nullable "Value": LONG },
     ),
 )]
@@ -382,7 +406,7 @@ fn test_scan_builder_accepts_predicate_on_unprojected_data_column() {
         .unwrap();
 
     let projection = snapshot.schema().project(&["a_float"]).unwrap();
-    let predicate = Arc::new(col!("number").gt(lit(5_i64)));
+    let predicate = Arc::new(Pred::from_expr(expr!(col("number") > 5_i64)));
 
     let scan = snapshot
         .scan_builder()
@@ -420,7 +444,7 @@ fn test_scan_builder_rejects_predicate_on_projection_only_metadata_column() {
             .add_metadata_column("my_row_index", MetadataColumnSpec::RowIndex)
             .unwrap(),
     );
-    let predicate = Arc::new(col!("my_row_index").gt(lit(5_i64)));
+    let predicate = Arc::new(Pred::from_expr(expr!(col("my_row_index") > 5_i64)));
 
     let err = snapshot
         .scan_builder()
@@ -701,6 +725,51 @@ fn test_scan_metadata_from_same_version() {
     assert_eq!(new_files.len(), 1);
 }
 
+#[rstest]
+fn scan_metadata_from_requires_timezone_support_only_for_timestamp_partitions(
+    #[values("UTC", "America/Los_Angeles", "+05:30")] timezone: &str,
+    #[values(false, true)] parsed_struct: bool,
+    #[values(false, true)] timestamp_partition: bool,
+) {
+    let table_root = "memory:///test_table/";
+    let engine = SyncEngine::new_with_store(Arc::new(InMemory::new()));
+    let partition_type = if timestamp_partition {
+        DataType::TIMESTAMP
+    } else {
+        DataType::STRING
+    };
+    let schema = schema_ref! {
+        (StructField::nullable("p", partition_type)),
+        nullable "value": INTEGER,
+    };
+    let snapshot = create_table(table_root, schema, "SyncEngine", true)
+        .with_data_layout(DataLayout::partitioned(["p"]))
+        .build(&engine, Box::new(FileSystemCommitter::new()))
+        .unwrap()
+        .commit(&engine)
+        .unwrap()
+        .unwrap_post_commit_snapshot();
+    let version = snapshot.version();
+    let options = if parsed_struct {
+        PartitionValuesOptions::with_struct()
+    } else {
+        PartitionValuesOptions::string_map_only()
+    };
+    let scan = snapshot
+        .scan_builder()
+        .with_partition_values(options.with_timestamp_timezone(timezone))
+        .build()
+        .unwrap();
+
+    let result = scan.scan_metadata_from(&engine, version, Vec::new(), None);
+    if timestamp_partition {
+        assert_result_error_with_message(result, "with_timestamp_timezone in scan_metadata_from");
+    } else {
+        let metadata: Vec<_> = result.unwrap().try_collect().unwrap();
+        assert!(metadata.is_empty());
+    }
+}
+
 #[test_log::test]
 fn scan_metadata_from_cancels_cached_metadata_consumption() {
     let path =
@@ -733,21 +802,36 @@ fn scan_metadata_from_cancels_cached_metadata_consumption() {
     assert!(matches!(metadata.next(), Some(Err(KernelError::Cancelled))));
 }
 
-// reading v0 with 3 files.
-// updating to v1 with 3 more files added.
-#[test_log::test]
-fn test_scan_metadata_from_with_update() {
-    let path = std::fs::canonicalize(PathBuf::from("./tests/data/basic_partitioned/")).unwrap();
+#[rstest]
+#[case::incremental_commits("basic_partitioned", 0, 1, &[3], &[3, 3], &[Read::Json])]
+#[case::checkpoint_full_rescan(
+    "with_checkpoint_no_last_checkpoint",
+    1,
+    2,
+    &[1],
+    &[1],
+    &[Read::Footer, Read::Parquet]
+)]
+fn scan_metadata_from_binds_token_to_new_reads(
+    #[case] table_name: &str,
+    #[case] existing_version: Version,
+    #[case] snapshot_version: Version,
+    #[case] expected_existing_rows: &[usize],
+    #[case] expected_rows: &[usize],
+    #[case] expected_reads: &[Read],
+    #[values(false, true)] pre_cancelled: bool,
+) {
+    let path = std::fs::canonicalize(PathBuf::from(format!("./tests/data/{table_name}/"))).unwrap();
     let url = url::Url::from_directory_path(path).unwrap();
-    let engine = Arc::new(SyncEngine::new());
+    let base_engine = SyncEngine::new();
 
     let snapshot = Snapshot::builder_for(url.clone())
-        .at_version(0)
-        .build(engine.as_ref())
+        .at_version(existing_version)
+        .build(&base_engine)
         .unwrap();
     let scan = snapshot.scan_builder().build().unwrap();
     let files: Vec<_> = scan
-        .scan_metadata(engine.as_ref())
+        .scan_metadata(&base_engine)
         .unwrap()
         .map_ok(|ScanMetadata { scan_files, .. }| {
             let (underlying_data, selection_vector) = scan_files.into_parts();
@@ -758,33 +842,62 @@ fn test_scan_metadata_from_with_update() {
         })
         .try_collect()
         .unwrap();
-    assert_eq!(files.len(), 1);
-    assert_eq!(files[0].num_rows(), 3);
+    let existing_rows: Vec<_> = files.iter().map(RecordBatch::num_rows).collect();
+    assert_eq!(existing_rows, expected_existing_rows);
 
     let files: Vec<_> = files
         .into_iter()
         .map(|b| Box::new(ArrowEngineData::from(b)) as Box<dyn EngineData>)
         .collect();
     let snapshot = Snapshot::builder_for(url)
-        .at_version(1)
-        .build(engine.as_ref())
+        .at_version(snapshot_version)
+        .build(&base_engine)
         .unwrap();
-    let scan = snapshot.scan_builder().build().unwrap();
-    let new_files: Vec<_> = scan
-        .scan_metadata_from(engine.as_ref(), 0, files, None)
-        .unwrap()
-        .map_ok(|ScanMetadata { scan_files, .. }| {
-            let (underlying_data, selection_vector) = scan_files.into_parts();
-            let batch: RecordBatch = ArrowEngineData::try_from_engine_data(underlying_data)
-                .unwrap()
-                .into();
-            filter_record_batch(&batch, &BooleanArray::from(selection_vector)).unwrap()
-        })
-        .try_collect()
+    // No read triggers cancellation; `pre_cancelled` cancels the token up front.
+    let reads = RecordingReads::new(None);
+    if pre_cancelled {
+        reads.token.cancel();
+    }
+    let scan = snapshot
+        .scan_builder()
+        .with_cancellation_token(reads.token.clone() as CancellationTokenRef)
+        .build()
         .unwrap();
-    assert_eq!(new_files.len(), 2);
-    assert_eq!(new_files[0].num_rows(), 3);
-    assert_eq!(new_files[1].num_rows(), 3);
+    let engine = reads.engine();
+    let result = scan.scan_metadata_from(&engine, existing_version, files, None);
+
+    if pre_cancelled {
+        let cancelled = match result {
+            Err(KernelError::Cancelled) => true,
+            Ok(mut metadata) => matches!(metadata.next(), Some(Err(KernelError::Cancelled))),
+            Err(_) => false,
+        };
+        assert!(cancelled, "pre-cancelled scan must report cancellation");
+    } else {
+        let new_files: Vec<_> = result
+            .unwrap()
+            .map_ok(|ScanMetadata { scan_files, .. }| {
+                let (underlying_data, selection_vector) = scan_files.into_parts();
+                let batch: RecordBatch = ArrowEngineData::try_from_engine_data(underlying_data)
+                    .unwrap()
+                    .into();
+                filter_record_batch(&batch, &BooleanArray::from(selection_vector)).unwrap()
+            })
+            .try_collect()
+            .unwrap();
+        let actual_rows: Vec<_> = new_files.iter().map(RecordBatch::num_rows).collect();
+        assert_eq!(actual_rows, expected_rows);
+    }
+
+    if !pre_cancelled {
+        let events = reads.events.lock().unwrap();
+        for expected_read in expected_reads {
+            assert!(
+                events.contains(expected_read),
+                "expected {expected_read:?} read, got {events:?}"
+            );
+        }
+    }
 }
 
 #[test]
@@ -868,9 +981,7 @@ fn test_data_row_group_skipping() {
     assert_eq!(data.len(), 1);
 
     // Ineffective predicate pushdown attempted, so the one data file should be returned.
-    let int_col = col!("numeric.ints.int32");
-    let value = lit(1000i32);
-    let predicate = Arc::new(int_col.clone().gt(value.clone()));
+    let predicate = Arc::new(Pred::from_expr(expr!(col("numeric.ints.int32") > 1000i32)));
     let scan = snapshot
         .clone()
         .scan_builder()
@@ -885,7 +996,7 @@ fn test_data_row_group_skipping() {
     //
     // Effective predicate pushdown, so no data files should be returned. BUT since we disabled
     // predicate pushdown, the one data file is still returned.
-    let predicate = Arc::new(int_col.lt(value));
+    let predicate = Arc::new(Pred::from_expr(expr!(col("numeric.ints.int32") < 1000i32)));
     let scan = snapshot
         .scan_builder()
         .with_predicate(predicate)
@@ -908,7 +1019,7 @@ fn test_missing_column_row_group_skipping() {
     //
     // WARNING: https://github.com/delta-io/delta-kernel-rs/issues/434 - This
     // optimization is currently disabled, so the one data file is still returned.
-    let predicate = Arc::new(col!("missing").lt(lit(1000i64)));
+    let predicate = Arc::new(Pred::from_expr(expr!(col("missing") < 1000i64)));
     let scan = snapshot
         .clone()
         .scan_builder()
@@ -919,7 +1030,7 @@ fn test_missing_column_row_group_skipping() {
     assert_eq!(data.len(), 1);
 
     // Predicate over a logically missing column fails the scan
-    let predicate = Arc::new(col!("numeric.ints.invalid").lt(lit(1000)));
+    let predicate = Arc::new(Pred::from_expr(expr!(col("numeric.ints.invalid") < 1000)));
     snapshot
         .scan_builder()
         .with_predicate(predicate)
@@ -1089,7 +1200,7 @@ fn test_build_actions_meta_predicate_with_predicate() {
     let snapshot = Snapshot::builder_for(url).build(&engine).unwrap();
 
     // Build a scan with a predicate eligible for data skipping
-    let predicate = Arc::new(Pred::gt(col!("id"), lit(400i64)));
+    let predicate = Arc::new(Pred::from_expr(expr!(col("id") > 400i64)));
     let scan = snapshot
         .scan_builder()
         .with_predicate(predicate)
@@ -1157,10 +1268,7 @@ fn test_build_actions_meta_predicate_static_skip_all() {
 
 // Partition-only scans have no stats schema, so the partition schema must enable the rewrite.
 #[rstest]
-#[case::equality(Pred::eq(
-    col!("modified"),
-    lit("2021-02-01"),
-), None)]
+#[case::equality(Pred::from_expr(expr!(col("modified") == "2021-02-01")), None)]
 #[case::date_cast_range(Pred::and(
     Pred::ge(
         Expr::cast(col!("modified"), DataType::DATE),
@@ -1229,7 +1337,7 @@ fn test_build_actions_meta_predicate_partition_column_mapping(
             Scalar::Date(20_641),
         )
     } else {
-        Pred::eq(col!("category"), lit("a"))
+        Pred::from_expr(expr!(col("category") == "a"))
     };
     let scan = snapshot
         .scan_builder()
@@ -1511,17 +1619,17 @@ fn apply_row_group_filter(parquet_bytes: Bytes, meta_predicate: &Pred) -> usize 
 /// | id IS NOT NULL | no predicate (col vs col, #1873)                                                       | 6     |
 #[rstest]
 #[case::comparison(
-    Pred::gt(col!("id"), lit(200i64)),
+    Pred::from_expr(expr!(col("id") > 200i64)),
     Some(3),
     "keep RG 0 (null stats) + RG 1 (max>200), skip RG 2 + RG 3 (max<200)"
 )]
 #[case::is_null(
-    Pred::is_null(col!("id")),
+    Pred::from_expr(expr!(is_null(col("id")))),
     Some(5),
     "keep RG 0 (nullCount>0) + RG 2 (nullCount>0) + RG 3 (null nullCount), skip RG 1 (nullCount=0)"
 )]
 #[case::is_not_null(
-    Pred::not(Pred::is_null(col!("id"))),
+    Pred::from_expr(expr!(not(is_null(col("id"))))),
     None,
     "IS NOT NULL produces no skipping predicate (column vs column, #1873)"
 )]
@@ -1634,15 +1742,15 @@ fn standard_multi_rg() -> Bytes {
 }
 
 #[rstest]
-#[case::stats_gt(Pred::gt(col!("x"), lit(150i64)), vec![3, 4])]
-#[case::stats_le(Pred::le(col!("x"), lit(110i64)), vec![1, 2])]
+#[case::stats_gt(Pred::from_expr(expr!(col("x") > 150i64)), vec![3, 4])]
+#[case::stats_le(Pred::from_expr(expr!(col("x") <= 110i64)), vec![1, 2])]
 #[case::stats_all_kept(
-    Pred::ge(col!("x"), lit(0i64)),
+    Pred::from_expr(expr!(col("x") >= 0i64)),
     vec![1, 2, 3, 4]
 )]
-#[case::partition_eq(Pred::eq(col!("part"), lit("a")), vec![1, 3])]
-#[case::partition_lt(Pred::lt(col!("part"), lit("b")), vec![1, 3])]
-#[case::partition_all_pruned(Pred::eq(col!("part"), lit("z")), vec![])]
+#[case::partition_eq(Pred::from_expr(expr!(col("part") == "a")), vec![1, 3])]
+#[case::partition_lt(Pred::from_expr(expr!(col("part") < "b")), vec![1, 3])]
+#[case::partition_all_pruned(Pred::from_expr(expr!(col("part") == "z")), vec![])]
 #[case::partition_cast_kept(
     Pred::eq(
         Expr::cast(col!("part"), DataType::DATE),
@@ -1656,27 +1764,21 @@ fn standard_multi_rg() -> Bytes {
             Expr::cast(col!("part"), DataType::DATE),
             Scalar::Date(18_628),
         ),
-        Pred::gt(col!("x"), lit(150i64)),
+        Pred::from_expr(expr!(col("x") > 150i64)),
     ),
     vec![3, 4]
 )]
 #[case::and_stats_and_partition(
-    Pred::and(
-        Pred::eq(col!("part"), lit("a")),
-        Pred::gt(col!("x"), lit(150i64)),
-    ),
+    Pred::from_expr(expr!(and(col("part") == "a", col("x") > 150i64))),
     vec![3]
 )]
 #[case::or_stats_or_partition(
-    Pred::or(
-        Pred::eq(col!("part"), lit("c")),
-        Pred::gt(col!("x"), lit(150i64)),
-    ),
+    Pred::from_expr(expr!(or(col("part") == "c", col("x") > 150i64))),
     vec![3, 4]
 )]
-#[case::partition_is_null(Pred::is_null(col!("part")), vec![])]
+#[case::partition_is_null(Pred::from_expr(expr!(is_null(col("part")))), vec![])]
 #[case::partition_is_not_null(
-    Pred::is_not_null(col!("part")),
+    Pred::from_expr(expr!(is_not_null(col("part")))),
     vec![1, 2, 3, 4]
 )]
 fn test_checkpoint_reader_skips_expected_row_groups(
@@ -1693,33 +1795,33 @@ fn test_checkpoint_reader_skips_expected_row_groups(
 #[rstest]
 #[case::is_null_keeps_only_null_group(
     &[&[rg(1, 0, 10, Some("a"))] as &[RgSpec], &[rg(2, 100, 110, None)], &[rg(3, 200, 210, Some("c"))]],
-    Pred::is_null(col!("part")),
+    Pred::from_expr(expr!(is_null(col("part")))),
     vec![2],
 )]
 // Footer min/max ignore the null-valued Add, so the non-matching range prunes the group.
 #[case::mixed_group_with_null_partition_pruned(
     &[&[rg(1, 0, 10, Some("a")), rg(2, 100, 110, None)] as &[RgSpec]],
-    Pred::eq(col!("part"), lit("z")),
+    Pred::from_expr(expr!(col("part") == "z")),
     vec![],
 )]
 #[case::partition_range_contains_target(
     &[&[rg(1, 0, 10, Some("a")), rg(2, 100, 110, Some("c"))] as &[RgSpec]],
-    Pred::eq(col!("part"), lit("b")),
+    Pred::from_expr(expr!(col("part") == "b")),
     vec![1, 2],
 )]
 #[case::all_null_group_pruned_under_eq(
     &[&[rg(1, 0, 10, Some("a"))] as &[RgSpec], &[rg(2, 100, 110, None), rg(3, 200, 210, None)]],
-    Pred::eq(col!("part"), lit("z")),
+    Pred::from_expr(expr!(col("part") == "z")),
     vec![],
 )]
 #[case::all_null_group_pruned_under_gt(
     &[&[rg(1, 0, 10, Some("a"))] as &[RgSpec], &[rg(2, 100, 110, None), rg(3, 200, 210, None)]],
-    Pred::gt(col!("part"), lit("m")),
+    Pred::from_expr(expr!(col("part") > "m")),
     vec![],
 )]
 #[case::all_null_group_pruned_under_is_not_null(
     &[&[rg(1, 0, 10, Some("a"))] as &[RgSpec], &[rg(2, 100, 110, None), rg(3, 200, 210, None)]],
-    Pred::is_not_null(col!("part")),
+    Pred::from_expr(expr!(is_not_null(col("part")))),
     vec![1],
 )]
 fn test_checkpoint_reader_handles_partition_groups(
@@ -1733,8 +1835,8 @@ fn test_checkpoint_reader_handles_partition_groups(
 
 /// A checkpoint may omit `partitionValues_parsed`; the absent leaf remains non-pruning.
 #[rstest]
-#[case::comparison(Pred::eq(col!("part"), lit("z")))]
-#[case::is_not_null(Pred::is_not_null(col!("part")))]
+#[case::comparison(Pred::from_expr(expr!(col("part") == "z")))]
+#[case::is_not_null(Pred::from_expr(expr!(is_not_null(col("part")))))]
 fn test_checkpoint_reader_keeps_missing_partition_column(#[case] pred: Pred) {
     let parquet_bytes = write_checkpoint(&[&[rg(1, 0, 10, Some("a"))] as &[RgSpec]], false);
     assert_eq!(surviving_ids(parquet_bytes, &pred), vec![1]);
@@ -1788,7 +1890,7 @@ impl ParquetHandler for RecordingParquetHandler {
     fn write_parquet_file(
         &self,
         location: url::Url,
-        data: KernelResultIteratorStatic<Box<dyn EngineData>>,
+        data: Box<dyn KernelResultIterator<Box<dyn EngineData>>>,
     ) -> KernelResult<FileSize> {
         self.inner.write_parquet_file(location, data)
     }
@@ -1870,7 +1972,7 @@ fn test_checkpoint_stats_projection_matches_requested_output(
     recorder.take_reads();
 
     let predicate: Option<PredicateRef> =
-        skip_stats.then(|| Arc::new(Pred::gt(col!("id"), lit(0i64))) as PredicateRef);
+        skip_stats.then(|| Arc::new(Pred::from_expr(expr!(col("id") > 0i64))) as PredicateRef);
     let scan = snapshot
         .scan_builder()
         .with_predicate(predicate)
@@ -1967,13 +2069,13 @@ fn test_all_struct_parses_json_commit_stats() {
 #[rstest]
 #[case::v1_partition(
     "v1-multi-part-partitioned-struct-stats-only",
-    Pred::eq(col!("part"), lit(1i32)),
+    Pred::from_expr(expr!(col("part") == 1i32)),
     column_name!("add.partitionValues_parsed.part"),
     ".checkpoint.",
 )]
 #[case::v2_sidecar(
     "v2-parquet-sidecars-struct-stats-only",
-    Pred::gt(col!("id"), lit(2i64)),
+    Pred::from_expr(expr!(col("id") > 2i64)),
     column_name!("add.stats_parsed.maxValues.id"),
     "_sidecars/",
 )]
@@ -2022,7 +2124,7 @@ fn test_skip_stats_disables_data_skipping() {
     let engine = Arc::new(SyncEngine::new());
     let snapshot = Snapshot::builder_for(url).build(engine.as_ref()).unwrap();
 
-    let predicate = Arc::new(Pred::gt(col!("id"), lit(400i64)));
+    let predicate = Arc::new(Pred::from_expr(expr!(col("id") > 400i64)));
     let scan = snapshot
         .scan_builder()
         .with_predicate(predicate)
@@ -2158,28 +2260,28 @@ fn test_default_stats_options_no_struct_output() {
 #[case::id_predicate_requested(
     StatsOptions::struct_columns(vec![column_name!("id")]),
     &["id"],
-    Some(col!("id").gt(lit(400i64))),
+    Some(Pred::from_expr(expr!(col("id") > 400i64))),
     "id",
     &[("401", "500"), ("501", "600")],
 )]
 #[case::id_predicate_not_requested(
     StatsOptions::struct_columns(vec![column_name!("name")]),
     &["name"],
-    Some(col!("id").gt(lit(400i64))),
+    Some(Pred::from_expr(expr!(col("id") > 400i64))),
     "name",
     &[("name_401", "name_500"), ("name_501", "name_600")],
 )]
 #[case::salary_predicate_with_multiple_requested_columns(
     StatsOptions::struct_columns(vec![column_name!("id"), column_name!("name")]),
     &["id", "name"],
-    Some(col!("salary").le(lit(70_000i64))),
+    Some(Pred::from_expr(expr!(col("salary") <= 70_000i64))),
     "id",
     &[("1", "100"), ("101", "200")],
 )]
 #[case::salary_requested_with_different_predicate_column(
     StatsOptions::struct_columns(vec![column_name!("salary")]),
     &["salary"],
-    Some(col!("id").gt(lit(500i64))),
+    Some(Pred::from_expr(expr!(col("id") > 500i64))),
     "salary",
     &[("100100", "110000")],
 )]
@@ -2253,7 +2355,7 @@ fn scan_metadata_struct_columns_fully_pruning_predicate_yields_no_batches() {
     let snapshot = Snapshot::builder_for(url).build(engine.as_ref()).unwrap();
     let scan = snapshot
         .scan_builder()
-        .with_predicate(Arc::new(col!("id").gt(lit(600i64))))
+        .with_predicate(Arc::new(Pred::from_expr(expr!(col("id") > 600i64))))
         .with_stats(StatsOptions::struct_columns(vec![column_name!("salary")]))
         .build()
         .unwrap();
@@ -2645,7 +2747,7 @@ fn scan_builder_stats_output_schemas_follow_struct_columns(
     let snapshot = Snapshot::builder_for(&table_root).build(&engine).unwrap();
     let builder = snapshot
         .scan_builder()
-        .with_predicate(Arc::new(col!("id").gt(lit(400i64))))
+        .with_predicate(Arc::new(Pred::from_expr(expr!(col("id") > 400i64))))
         .with_stats(StatsOptions::struct_columns(vec![column_name!("name")]));
 
     let schemas = builder
@@ -2657,9 +2759,11 @@ fn scan_builder_stats_output_schemas_follow_struct_columns(
     assert!(logical_min_values.field("id").is_none());
     let physical_min_values = stats_struct_field(&schemas.physical, MIN_VALUES);
     if column_mapping_mode.is_some() {
-        assert!(physical_min_values
-            .fields()
-            .all(|field| field.name().starts_with("col-")));
+        assert!(
+            physical_min_values
+                .fields()
+                .all(|field| field.name().starts_with("col-"))
+        );
     } else {
         assert_eq!(physical_min_values, logical_min_values);
     }
@@ -2711,7 +2815,7 @@ impl ParquetHandler for EmptyParquetHandler {
     fn write_parquet_file(
         &self,
         _location: url::Url,
-        _data: KernelResultIteratorStatic<Box<dyn EngineData>>,
+        _data: Box<dyn KernelResultIterator<Box<dyn EngineData>>>,
     ) -> KernelResult<FileSize> {
         unimplemented!()
     }
@@ -2773,12 +2877,12 @@ mod scan_metadata_completed_tests {
     use rstest::rstest;
 
     use super::ScanBuilder;
-    use crate::engine::sync::SyncEngine;
-    use crate::expressions::{col, lit, Expression as Expr, Predicate as Pred};
-    use crate::metrics::MetricEvent;
-    use crate::unit_test_utils::{install_thread_local_metrics_reporter, CapturingReporter};
-    use crate::utils::FoldWithOption as _;
     use crate::Snapshot;
+    use crate::engine::sync::SyncEngine;
+    use crate::expressions::{Predicate as Pred, expr};
+    use crate::metrics::MetricEvent;
+    use crate::unit_test_utils::{CapturingReporter, install_thread_local_metrics_reporter};
+    use crate::utils::FoldWithOption as _;
 
     fn run_scan(
         table: &str,
@@ -2832,7 +2936,7 @@ mod scan_metadata_completed_tests {
     )]
     #[case::partition_filter(
         "./tests/data/basic_partitioned/",
-        Some(Arc::new(Expr::eq(col!("letter"), lit("a")))),
+        Some(Arc::new(Pred::from_expr(expr!(col("letter") == "a")))),
         (6, 6, 2, 1502, 0, 4)
     )]
     fn test_scan_metrics(
@@ -2898,9 +3002,11 @@ mod scan_metadata_completed_tests {
             let _ = iter.next();
             // Drop without exhausting -- callback must not fire
         }
-        assert!(reporter
-            .events()
-            .iter()
-            .all(|e| !matches!(e, MetricEvent::ScanMetadataCompleted(_))));
+        assert!(
+            reporter
+                .events()
+                .iter()
+                .all(|e| !matches!(e, MetricEvent::ScanMetadataCompleted(_)))
+        );
     }
 }

@@ -9,7 +9,7 @@ use bytes::Bytes;
 use roaring::RoaringTreemap;
 
 use crate::actions::deletion_vector::{
-    create_dv_crc32, DeletionVectorDescriptor, DeletionVectorPath, DeletionVectorStorageType,
+    DeletionVectorDescriptor, DeletionVectorPath, DeletionVectorStorageType, create_dv_crc32,
 };
 use crate::{KernelError, KernelResult};
 

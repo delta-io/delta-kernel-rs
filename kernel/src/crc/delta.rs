@@ -12,10 +12,10 @@ use super::file_stats::FileStatsDelta;
 use super::{
     Crc, DomainMetadataState, FileSizeHistogram, FileStats, FileStatsState, SetTransactionState,
 };
+use crate::Version;
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::actions::LastManifestCommit;
 use crate::actions::{DomainMetadata, Metadata, Protocol, SetTransaction};
-use crate::Version;
 
 /// CRC-relevant changes aggregated over commits `(X, Y]`.
 #[derive(Debug, Clone, Default)]
@@ -39,9 +39,13 @@ pub(crate) struct CrcDelta {
     pub(crate) last_manifest_commit: Option<LastManifestCommit>,
     /// Whether the file-stats portion of this delta can be applied incrementally. When `false`,
     /// [`Crc::apply`] transitions [`FileStatsState`] to `Indeterminate`. Producers set this to
-    /// `false` whenever they observe a signal that makes incremental tracking unsound (for
-    /// example, a non-incremental operation such as `ANALYZE STATS`).
+    /// `false` when file-stat changes cannot be tracked safely or their policy excludes
+    /// incremental construction. Replay rejects unknown operations only when their commit
+    /// contains file actions; transactions exclude custom operations even without file
+    /// actions.
     pub(crate) is_incremental_safe: bool,
+    /// Unsupported operation, when known, if `is_incremental_safe` is false.
+    pub(crate) unsupported_operation: Option<String>,
 }
 
 impl CrcDelta {
@@ -83,7 +87,9 @@ impl CrcDelta {
                 }),
             })
         } else {
-            FileStatsState::Indeterminate
+            FileStatsState::Indeterminate {
+                unsupported_operation: self.unsupported_operation,
+            }
         };
         Some(Crc {
             version,
@@ -154,6 +160,7 @@ impl Crc {
             &self.file_stats_state,
             &delta.file_stats,
             delta.is_incremental_safe,
+            delta.unsupported_operation,
         );
 
         // These fields describe one exact table version and are not maintained by incremental
@@ -191,14 +198,17 @@ fn transition_file_stats(
     current: &FileStatsState,
     delta: &FileStatsDelta,
     is_incremental_safe: bool,
+    unsupported_operation: Option<String>,
 ) -> FileStatsState {
     match current {
         // Indeterminate is terminal in incremental replay. A future full add/remove dedup
         // pass could recover Complete.
-        FileStatsState::Indeterminate => FileStatsState::Indeterminate,
+        FileStatsState::Indeterminate { .. } => current.clone(),
         // A non-incremental delta makes incremental tracking impossible; a full
         // reconciliation can recover.
-        _ if !is_incremental_safe => FileStatsState::Indeterminate,
+        _ if !is_incremental_safe => FileStatsState::Indeterminate {
+            unsupported_operation,
+        },
         FileStatsState::Complete(stats) => FileStatsState::Complete(FileStats {
             // Counts and bytes have no non-negative check.
             num_files: stats.num_files + delta.net_files(),
@@ -240,8 +250,8 @@ mod tests {
     use super::*;
     use crate::actions::{Add, DomainMetadata, Metadata, Protocol};
     use crate::crc::{
-        is_incremental_safe_operation, DeletedRecordCountsHistogram, FileSizeHistogram,
-        SetTransactionState,
+        DeletedRecordCountsHistogram, FileSizeHistogram, SetTransactionState,
+        is_incremental_safe_operation,
     };
 
     fn base_crc() -> Crc {
@@ -319,11 +329,15 @@ mod tests {
             "UPDATE",
             "DELETE",
             "OPTIMIZE",
+            "REORG",
             "CREATE TABLE",
             "REPLACE TABLE",
             "CREATE TABLE AS SELECT",
             "REPLACE TABLE AS SELECT",
             "CREATE OR REPLACE TABLE AS SELECT",
+            "ADD COLUMNS",
+            "COMPUTE STATS",
+            "Deletion Vector Tombstones",
         ] {
             assert!(
                 is_incremental_safe_operation(op),
@@ -336,6 +350,7 @@ mod tests {
     fn test_non_incremental_safe_operations() {
         assert!(!is_incremental_safe_operation("ANALYZE STATS"));
         assert!(!is_incremental_safe_operation("UNKNOWN"));
+        assert!(!is_incremental_safe_operation("Manual Update"));
     }
 
     // ===== Crc deserialized from CRC file (default state) =====
@@ -405,19 +420,35 @@ mod tests {
         assert!(crc.file_stats_state.is_indeterminate());
     }
 
-    #[test]
-    fn test_indeterminate_stays_indeterminate() {
+    #[rstest]
+    fn test_indeterminate_stays_indeterminate(
+        #[values(None, Some("UNKNOWN"))] unsupported_operation: Option<&str>,
+    ) {
         let unsafe_change = CrcDelta {
             is_incremental_safe: false,
+            unsupported_operation: unsupported_operation.map(str::to_owned),
             ..add_files_delta(1, 100)
         };
+        let expected = FileStatsState::Indeterminate {
+            unsupported_operation: unsupported_operation.map(str::to_owned),
+        };
         let crc = base_crc().apply(unsafe_change, 1);
-        assert!(crc.file_stats_state.is_indeterminate());
+        assert_eq!(crc.file_stats_state, expected);
 
         // Subsequent safe op doesn't recover the state. Version still advances.
         let crc = crc.apply(add_files_delta(5, 500), 2);
         assert!(crc.file_stats_state.is_indeterminate());
         assert_eq!(crc.version, 2);
+        assert_eq!(crc.file_stats_state, expected);
+
+        let crc = crc.apply(
+            CrcDelta {
+                unsupported_operation: Some("ANOTHER UNKNOWN".to_string()),
+                ..CrcDelta::default()
+            },
+            3,
+        );
+        assert_eq!(crc.file_stats_state, expected);
     }
 
     // ===== apply: non-file-stats field updates =====
@@ -632,17 +663,25 @@ mod tests {
         assert_eq!(crc.file_stats().unwrap().num_files(), 5);
     }
 
-    #[test]
-    fn into_complete_crc_with_unsafe_delta_is_indeterminate() {
+    #[rstest]
+    fn into_complete_crc_with_unsafe_delta_is_indeterminate(
+        #[values(None, Some("UNKNOWN"))] unsupported_operation: Option<&str>,
+    ) {
         let delta = CrcDelta {
             protocol: Some(test_protocol()),
             metadata: Some(Metadata::default()),
             is_incremental_safe: false,
+            unsupported_operation: unsupported_operation.map(str::to_owned),
             ..add_files_delta(5, 1000)
         };
         let crc = delta.into_complete_crc(7).unwrap();
         assert_eq!(crc.version, 7);
-        assert!(crc.file_stats_state.is_indeterminate());
+        assert_eq!(
+            crc.file_stats_state,
+            FileStatsState::Indeterminate {
+                unsupported_operation: unsupported_operation.map(str::to_owned),
+            }
+        );
     }
 
     // ===== apply: set transaction tests =====

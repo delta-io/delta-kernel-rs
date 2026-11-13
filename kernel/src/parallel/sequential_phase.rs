@@ -18,10 +18,10 @@ use crate::log_reader::checkpoint_manifest::CheckpointManifestReader;
 use crate::log_replay::ActionsBatch;
 use crate::log_segment::LogSegment;
 use crate::scan::log_replay::ScanLogReplayProcessor;
-use crate::scan::{ScanMetadata, COMMIT_READ_SCHEMA};
+use crate::scan::{COMMIT_READ_SCHEMA, ScanMetadata};
 use crate::schema::SchemaRef;
 use crate::utils::require;
-use crate::{Engine, FileMeta, KernelError, KernelResult, KernelResultIteratorStatic};
+use crate::{Engine, FileMeta, KernelError, KernelResult, KernelResultIterator};
 
 /// Sequential log replay processor for parallel execution.
 ///
@@ -68,7 +68,7 @@ pub(crate) struct SequentialPhase {
     // The processor that will be used to process the action batches
     processor: ScanLogReplayProcessor,
     // Commit action batches, exhausted before the checkpoint manifest
-    commit_phase: Option<KernelResultIteratorStatic<ActionsBatch>>,
+    commit_phase: Option<Box<dyn KernelResultIterator<ActionsBatch>>>,
     // The checkpoint manifest reader that will be used to read the checkpoint manifest files.
     // If the checkpoint is single-part, this will be Some(CheckpointManifestReader).
     checkpoint_manifest_phase: Option<CheckpointManifestReader>,
@@ -106,8 +106,8 @@ impl SequentialPhase {
         engine: Arc<dyn Engine>,
         checkpoint_read_schema: SchemaRef,
     ) -> KernelResult<Self> {
-        let commit_phase: Option<KernelResultIteratorStatic<ActionsBatch>> = Some(Box::new(
-            log_segment.read_commit_actions(engine.as_ref(), COMMIT_READ_SCHEMA.clone(), None)?,
+        let commit_phase: Option<Box<dyn KernelResultIterator<ActionsBatch>>> = Some(Box::new(
+            log_segment.read_commit_actions(engine.as_ref(), COMMIT_READ_SCHEMA.clone())?,
         ));
 
         // Concurrently start reading the checkpoint manifest. Only create a checkpoint manifest
@@ -208,6 +208,7 @@ impl Iterator for SequentialPhase {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Result;
     use crate::scan::{AfterSequentialScanMetadata, StatsOptions};
     use crate::unit_test_utils::{assert_result_error_with_message, load_test_table};
 
@@ -217,7 +218,7 @@ mod tests {
         stats: StatsOptions,
         expected_adds: &[&str],
         expected_sidecars: &[&str],
-    ) -> KernelResult<()> {
+    ) -> Result<()> {
         let (engine, snapshot, _tempdir) = load_test_table(table_name)?;
 
         let scan = snapshot.scan_builder().with_stats(stats).build()?;
@@ -278,7 +279,7 @@ mod tests {
     }
 
     #[test]
-    fn test_sequential_v2_with_commits_only() -> KernelResult<()> {
+    fn test_sequential_v2_with_commits_only() -> Result<()> {
         verify_sequential_processing(
             "table-without-dv-small",
             StatsOptions::default(),
@@ -288,7 +289,7 @@ mod tests {
     }
 
     #[test]
-    fn test_sequential_v2_with_sidecars() -> KernelResult<()> {
+    fn test_sequential_v2_with_sidecars() -> Result<()> {
         verify_sequential_processing(
             "v2-checkpoints-json-with-sidecars",
             StatsOptions::default(),
@@ -301,7 +302,7 @@ mod tests {
     }
 
     #[test]
-    fn test_sequential_finish_before_exhaustion_error() -> KernelResult<()> {
+    fn test_sequential_finish_before_exhaustion_error() -> Result<()> {
         let (engine, snapshot, _tempdir) = load_test_table("table-without-dv-small")?;
 
         let scan = snapshot.scan_builder().build()?;
@@ -315,7 +316,7 @@ mod tests {
     }
 
     #[test]
-    fn test_sequential_checkpoint_without_sidecars() -> KernelResult<()> {
+    fn test_sequential_checkpoint_without_sidecars() -> Result<()> {
         verify_sequential_processing(
             "v2-checkpoints-json-without-sidecars",
             StatsOptions::default(),
@@ -332,9 +333,7 @@ mod tests {
     #[rstest::rstest]
     #[case::default(StatsOptions::default())]
     #[case::without_stats(StatsOptions::none())]
-    fn test_sequential_parquet_checkpoint_with_sidecars(
-        #[case] stats: StatsOptions,
-    ) -> KernelResult<()> {
+    fn test_sequential_parquet_checkpoint_with_sidecars(#[case] stats: StatsOptions) -> Result<()> {
         verify_sequential_processing(
             "v2-checkpoints-parquet-with-sidecars",
             stats,
@@ -348,7 +347,7 @@ mod tests {
     }
 
     #[test]
-    fn test_sequential_checkpoint_no_commits() -> KernelResult<()> {
+    fn test_sequential_checkpoint_no_commits() -> Result<()> {
         verify_sequential_processing(
             "with_checkpoint_no_last_checkpoint",
             StatsOptions::default(),

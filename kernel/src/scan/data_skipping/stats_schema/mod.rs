@@ -7,25 +7,30 @@ use std::borrow::Cow;
 use column_filter::StatsColumnFilter;
 pub(crate) use column_filter::StatsConfig;
 
+use crate::KernelResult;
 use crate::actions::{MAX_VALUES, MIN_VALUES, NULL_COUNT, NUM_RECORDS, TIGHT_BOUNDS};
 use crate::schema::{
     ArrayType, ColumnName, DataType, MapType, PrimitiveType, Schema, StructField, StructType,
+    file_sub_field_has_min_max,
 };
-use crate::transforms::{transform_output_type, SchemaTransform};
-use crate::KernelResult;
+use crate::transforms::{SchemaTransform, transform_output_type};
 
 /// Generates the expected schema for file statistics.
 ///
 /// The base stats schema is dependent on the current table configuration and derived via:
 /// - only fields present in data files are included (use physical names, no partition columns)
 /// - if the table property `delta.dataSkippingStatsColumns` is set, include only those columns.
-///   Column names may refer to struct fields in which case all child fields are included.
-/// - otherwise the first `dataSkippingNumIndexedCols` (default 32) leaf fields are included.
+///   Column names may refer to struct or `file` fields in which case all child fields are included.
+/// - otherwise the first `dataSkippingNumIndexedCols` (default 32) leaf fields are included. Each
+///   sub-field of a `file` column is a leaf.
 /// - all fields are made nullable.
 ///
 /// The `nullCount` struct field is a nested structure mirroring the table's column hierarchy.
 /// It tracks the count of null values for each column. All leaf fields from the base schema
 /// are converted to LONG type (since null counts are always integers).
+///
+/// A `file` column appears as a plain struct of its sub-fields. All six are in `nullCount`, and
+/// all but `checksum` and `inline` are in `minValues`/`maxValues`.
 ///
 /// Note: Array and Map types are included in `nullCount` (null counts are meaningful for these
 /// types) but excluded from `minValues`/`maxValues` (not eligible for data skipping). Variant is
@@ -274,16 +279,21 @@ fn make_nullable_field<'a>(
 /// The nullCount struct field tracks the number of null values for each column.
 /// All leaf fields (primitives, arrays, maps, variants) are converted to LONG type
 /// since null counts are always integers, while struct fields are recursed into
-/// to preserve the nested structure. Field metadata (including column mapping info)
-/// is preserved for all fields.
+/// to preserve the nested structure. A `file` column becomes a plain struct of its sub-fields.
+/// Field metadata (including column mapping info) is preserved for all fields.
 pub(crate) struct NullCountStatsTransform;
 impl<'a> SchemaTransform<'a> for NullCountStatsTransform {
     transform_output_type!(|'a, T| Cow<'a, T>);
 
     fn transform_struct_field(&mut self, field: &'a StructField) -> Cow<'a, StructField> {
-        // Only recurse into struct fields; convert all other types (leaf fields) to LONG
+        // Recurse into struct and `file` fields; convert all other types (leaf fields) to LONG
         match &field.data_type {
             DataType::Struct(_) => self.recurse_into_struct_field(field),
+            // A `file` column's null counts form a struct with one LONG field per sub-field.
+            DataType::File(file_fields) => make_nullable_field(
+                field,
+                Cow::Owned(self.transform_struct(file_fields).into_owned().into()),
+            ),
             _ => Cow::Owned(StructField {
                 name: field.name.clone(),
                 data_type: DataType::LONG,
@@ -335,7 +345,8 @@ impl<'col> BaseStatsTransform<'col> {
 impl<'a> SchemaTransform<'a> for BaseStatsTransform<'_> {
     transform_output_type!(|'a, T| Option<Cow<'a, T>>);
 
-    // Always traverse struct fields. All non-struct leaf types count against the column limit.
+    // Always traverse struct and `file` fields. All other leaf types count against the column
+    // limit, including each `file` sub-field.
     fn transform_struct_field(&mut self, field: &'a StructField) -> Option<Cow<'a, StructField>> {
         self.filter.enter_field(field.name());
         let data_type = self.transform(&field.data_type);
@@ -371,6 +382,23 @@ struct MinMaxStatsTransform {
 
 impl<'a> SchemaTransform<'a> for MinMaxStatsTransform {
     transform_output_type!(|'a, T| Option<Cow<'a, T>>);
+
+    /// A `file` column's bounds are a plain struct of the sub-fields that have min/max statistics.
+    fn transform_struct_field(&mut self, field: &'a StructField) -> Option<Cow<'a, StructField>> {
+        let DataType::File(file_fields) = &field.data_type else {
+            return self.recurse_into_struct_field(field);
+        };
+        let sub_fields: Vec<_> = file_fields
+            .fields()
+            .filter(|f| file_sub_field_has_min_max(f.name()))
+            .filter_map(|f| self.transform_struct_field(f))
+            .map(Cow::into_owned)
+            .collect();
+        (!sub_fields.is_empty()).then(|| {
+            let data_type = StructType::new_unchecked(sub_fields).into();
+            make_nullable_field(field, Cow::Owned(data_type))
+        })
+    }
 
     // Array and Map fields pass through BaseStatsTransform (for nullCount) but must be excluded
     // from min/max stats.
@@ -926,6 +954,154 @@ mod tests {
                     nullable "v": unshredded_variant(),
                 },
             ),
+        );
+    }
+
+    fn stats_schema_for(schema: &StructType, properties: &[(&str, &str)]) -> StructType {
+        let properties: TableProperties = properties.iter().copied().into();
+        expected_stats_schema(
+            schema,
+            &stats_config_from_table_properties(&properties),
+            None,
+            None,
+        )
+        .unwrap()
+    }
+
+    /// A `file` column's statistics are a plain struct of its sub-fields: `nullCount` covers all
+    /// six, and min/max cover all but `checksum` and `inline`.
+    #[test]
+    fn test_stats_schema_file_column() {
+        let schema = StructType::new_unchecked([
+            StructField::nullable("id", DataType::LONG),
+            StructField::nullable("f", DataType::file_type()),
+        ]);
+        let null_count = schema! {
+            nullable "id": LONG,
+            nullable "f": {
+                nullable "uri": LONG,
+                nullable "offset": LONG,
+                nullable "size": LONG,
+                nullable "content_type": LONG,
+                nullable "checksum": LONG,
+                nullable "inline": LONG,
+            },
+        };
+        let min_max = schema! {
+            nullable "id": LONG,
+            nullable "f": {
+                nullable "uri": STRING,
+                nullable "offset": LONG,
+                nullable "size": LONG,
+                nullable "content_type": STRING,
+            },
+        };
+        assert_eq!(
+            stats_schema_for(&schema, &[]),
+            expected_stats(null_count, min_max)
+        );
+    }
+
+    /// Each `file` sub-field counts as one leaf against `dataSkippingNumIndexedCols`, as a struct
+    /// field does.
+    #[test]
+    fn test_stats_schema_file_sub_fields_count_against_limit() {
+        let schema = StructType::new_unchecked([
+            StructField::nullable("id", DataType::LONG),
+            StructField::nullable("f", DataType::file_type()),
+            StructField::nullable("name", DataType::STRING),
+        ]);
+        let stats = stats_schema_for(&schema, &[("delta.dataSkippingNumIndexedCols", "3")]);
+        assert_eq!(
+            stats,
+            expected_stats(
+                schema! {
+                    nullable "id": LONG,
+                    nullable "f": { nullable "uri": LONG, nullable "offset": LONG },
+                },
+                schema! {
+                    nullable "id": LONG,
+                    nullable "f": { nullable "uri": STRING, nullable "offset": LONG },
+                },
+            )
+        );
+    }
+
+    /// A `file` in an array or a map does not expand: the array or map takes one slot against
+    /// `dataSkippingNumIndexedCols`, like any array or map.
+    #[test]
+    fn test_stats_schema_file_in_array_or_map_takes_one_slot() {
+        let schema = StructType::new_unchecked([
+            StructField::nullable("a", ArrayType::new(DataType::file_type(), true)),
+            StructField::nullable(
+                "m",
+                MapType::new(DataType::STRING, DataType::file_type(), true),
+            ),
+            StructField::nullable("x", DataType::LONG),
+            StructField::nullable("y", DataType::LONG),
+        ]);
+        let stats = stats_schema_for(&schema, &[("delta.dataSkippingNumIndexedCols", "3")]);
+        assert_eq!(
+            stats,
+            expected_stats(
+                schema! { nullable "a": LONG, nullable "m": LONG, nullable "x": LONG },
+                schema! { nullable "x": LONG },
+            )
+        );
+    }
+
+    /// `dataSkippingStatsColumns` selects a whole `file` column or single sub-fields. A
+    /// sub-field without min/max gets only `nullCount`.
+    #[test]
+    fn test_stats_schema_file_sub_fields_by_stats_columns() {
+        let schema = StructType::new_unchecked([
+            StructField::nullable("id", DataType::LONG),
+            StructField::nullable("f", DataType::file_type()),
+        ]);
+        let stats = stats_schema_for(
+            &schema,
+            &[("delta.dataSkippingStatsColumns", "f.size,f.checksum")],
+        );
+        assert_eq!(
+            stats,
+            expected_stats(
+                schema! { nullable "f": { nullable "size": LONG, nullable "checksum": LONG } },
+                schema! { nullable "f": { nullable "size": LONG } },
+            )
+        );
+
+        let stats = stats_schema_for(&schema, &[("delta.dataSkippingStatsColumns", "f.inline")]);
+        assert_eq!(
+            stats,
+            schema! {
+                nullable NUM_RECORDS: LONG,
+                nullable NULL_COUNT: (schema! { nullable "f": { nullable "inline": LONG } }),
+                nullable TIGHT_BOUNDS: BOOLEAN,
+            }
+        );
+    }
+
+    /// A `file` nested in a struct gets statistics like a top-level one. One in an array or map
+    /// is a single leaf with only `nullCount`, like any array or map.
+    #[test]
+    fn test_stats_schema_nested_file_columns() {
+        let schema = StructType::new_unchecked([
+            StructField::nullable(
+                "s",
+                StructType::new_unchecked([StructField::nullable("f", DataType::file_type())]),
+            ),
+            StructField::nullable("a", ArrayType::new(DataType::file_type(), true)),
+        ]);
+        let stats = stats_schema_for(&schema, &[("delta.dataSkippingStatsColumns", "s.f.size,a")]);
+        assert_eq!(
+            stats,
+            expected_stats(
+                schema! {
+                    nullable "s": { nullable "f": { nullable "size": LONG } },
+                    nullable "a": LONG,
+                },
+                schema! { nullable "s": { nullable "f": { nullable "size": LONG } } },
+            )
         );
     }
 

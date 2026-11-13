@@ -8,15 +8,15 @@
 mod tests {
     use std::sync::Arc;
 
+    #[cfg(feature = "nanosecond-timestamps")]
+    use delta_kernel::arrow::array::TimestampNanosecondArray;
     use delta_kernel::arrow::array::types::{
         Date32Type, Decimal128Type, Float32Type, Float64Type, Int32Type, TimestampMicrosecondType,
     };
     use delta_kernel::arrow::array::{
-        Array, ArrayRef, BinaryArray, BooleanArray, Int16Array, Int64Array, Int8Array,
+        Array, ArrayRef, BinaryArray, BooleanArray, Int8Array, Int16Array, Int64Array,
         LargeStringArray, PrimitiveArray, RecordBatch, StringArray, StringViewArray, StructArray,
     };
-    #[cfg(feature = "nanosecond-timestamps")]
-    use crate::arrow::array::TimestampNanosecondArray;
     use delta_kernel::arrow::datatypes::{
         DataType as ArrowDataType, Field as ArrowField, Fields, Schema as ArrowSchema,
     };
@@ -24,7 +24,7 @@ mod tests {
     use delta_kernel::expressions::column_name;
     use delta_kernel::schema::DataType;
     use delta_kernel::transaction::stats_verifier::{
-        verify_num_records_present, StatsColumnVerifier,
+        StatsColumnVerifier, verify_num_records_present,
     };
     use delta_kernel::{EngineData, KernelError};
     use rstest::rstest;
@@ -145,8 +145,7 @@ mod tests {
                 min_values,
                 max_values,
             );
-            let verifier =
-                StatsColumnVerifier::new(vec![(column_name!("col"), DataType::LONG)]);
+            let verifier = StatsColumnVerifier::new(vec![(column_name!("col"), DataType::LONG)]);
             let err_msg = verifier.verify(&[batch]).unwrap_err().to_string();
             assert!(err_msg.contains("file1.parquet"), "case: {category}");
             assert!(err_msg.contains(category), "case: {category}");
@@ -370,8 +369,7 @@ mod tests {
 
         let engine_data: Box<dyn EngineData> = Box::new(ArrowEngineData::new(add_file_batch));
 
-        let verifier =
-            StatsColumnVerifier::new(vec![(column_name!("city"), DataType::STRING)]);
+        let verifier = StatsColumnVerifier::new(vec![(column_name!("city"), DataType::STRING)]);
         verifier.verify(&[engine_data]).unwrap();
     }
 

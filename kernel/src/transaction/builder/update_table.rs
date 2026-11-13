@@ -1,21 +1,25 @@
 //! Builder for transactions against an existing table.
 
+use std::marker::PhantomData;
+
 use delta_kernel_derive::internal_api;
 
-use super::state::TransactionBuilderState;
 use super::TransactionBuilder;
+use super::state::TransactionBuilderState;
 use crate::committer::Committer;
 use crate::expressions::ColumnName;
 use crate::schema::StructField;
 use crate::snapshot::SnapshotRef;
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::{
-    validate_iceberg_compat_if_needed, IcebergCompatValidationContext, Operation, TableFeature,
-    V2_VALIDATOR, V3_VALIDATOR,
+    IcebergCompatValidationContext, Operation, TableFeature, V2_VALIDATOR, V3_VALIDATOR,
+    validate_iceberg_compat_if_needed,
 };
 use crate::transaction::domain_metadata::validate_unique_domains;
-use crate::transaction::schema_evolution::{evolve_table_config, SchemaOperation};
-use crate::transaction::{ExecutionMode, Transaction, UpdateTable, UpdateTableOperation};
+use crate::transaction::schema_evolution::{SchemaOperation, evolve_table_config};
+use crate::transaction::{
+    ExecutionMode, Imperative, Transaction, UpdateTable, UpdateTableOperation,
+};
 use crate::utils::{current_time_ms, require};
 use crate::{Engine, KernelError, KernelResult};
 
@@ -47,7 +51,7 @@ use crate::{Engine, KernelError, KernelResult};
 /// data-file batches or manifest writes for `ALTER TABLE`.
 ///
 /// cbindgen:ignore
-pub type UpdateTableTransactionBuilder = TransactionBuilder<UpdateTable>;
+pub type UpdateTableTransactionBuilder<MODE = Imperative> = TransactionBuilder<UpdateTable, MODE>;
 
 /// Opaque state collected by update-table-specific builder setters.
 #[doc(hidden)]
@@ -59,7 +63,7 @@ pub struct UpdateTableBuilderState {
     is_blind_append: bool,
 }
 
-impl std::fmt::Debug for TransactionBuilder<UpdateTable> {
+impl<MODE: ExecutionMode> std::fmt::Debug for TransactionBuilder<UpdateTable, MODE> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("UpdateTableTransactionBuilder")
             .field("snapshot_version", &self.local_state.snapshot.version())
@@ -88,9 +92,12 @@ impl TransactionBuilder<UpdateTable> {
                 domain_metadata_removals: Vec::new(),
                 is_blind_append: false,
             },
+            _mode: PhantomData,
         }
     }
+}
 
+impl<MODE: ExecutionMode> TransactionBuilder<UpdateTable, MODE> {
     /// Marks the transaction as a blind append assertion.
     ///
     /// Blind appends add new files without depending on existing table state. Commit validation
@@ -208,13 +215,13 @@ impl TransactionBuilder<UpdateTable> {
     /// - Connector commit information that does not contain exactly one row.
     ///
     /// Schema changes are rejected when `icebergCompatV2`, `icebergCompatV3`, or
-    /// `allowColumnDefaults` is enabled. This applies to standalone ALTER TABLE transactions and
-    /// schema evolution during data-changing writes.
+    /// `allowColumnDefaults` is enabled, or when the table has generated columns. This applies to
+    /// standalone ALTER TABLE transactions and schema evolution during data-changing writes.
     pub fn build(
         self,
         engine: &dyn Engine,
         committer: Box<dyn Committer>,
-    ) -> KernelResult<Transaction> {
+    ) -> KernelResult<Transaction<UpdateTable, MODE>> {
         self.validate()?;
         let transaction = try_new_update_table(self, committer, engine)?;
         transaction.validate_domain_metadata_operations()?;
@@ -280,13 +287,14 @@ impl TransactionBuilder<UpdateTable> {
 }
 
 fn try_new_update_table<MODE: ExecutionMode>(
-    builder: UpdateTableTransactionBuilder,
+    builder: UpdateTableTransactionBuilder<MODE>,
     committer: Box<dyn Committer>,
     engine: &dyn Engine,
 ) -> KernelResult<Transaction<UpdateTable, MODE>> {
     let TransactionBuilder {
         common_state,
         local_state,
+        _mode: _,
     } = builder;
     let UpdateTableBuilderState {
         snapshot: read_snapshot,
@@ -301,12 +309,18 @@ fn try_new_update_table<MODE: ExecutionMode>(
         .table_configuration()
         .ensure_operation_supported(Operation::Write)?;
 
+    // TODO(#3223): Strip generation expressions on metadata updates when the pre-update protocol
+    // did not support generated columns, so a protocol upgrade cannot activate previously ignored
+    // formulas.
+
     // TODO(#3240): Validate that delta.enableRowTracking=true has the required protocol support
     // and materialized column-name properties. Materialized names must be distinct and must not
     // collide with physical data columns.
 
     // Read clustering columns from snapshot (returns None if clustering not enabled)
-    let clustering_columns = read_snapshot.get_physical_clustering_columns(engine)?;
+    let clustering_columns = read_snapshot
+        .reader()
+        .get_physical_clustering_columns(engine)?;
 
     let commit_timestamp = current_time_ms()?;
 
@@ -370,6 +384,13 @@ fn apply_schema_changes(
             "Schema changes are not yet supported on tables with allowColumnDefaults enabled",
         ));
     }
+    if table_config.is_feature_supported(&TableFeature::GeneratedColumns)
+        && table_config.has_generation_expressions()
+    {
+        return Err(KernelError::unsupported(
+            "Schema changes are not yet supported on tables with generated columns",
+        ));
+    }
     evolve_table_config(&table_config, changes)
 }
 
@@ -388,18 +409,18 @@ mod tests {
     use crate::engine::arrow_conversion::TryIntoArrow;
     use crate::engine::arrow_data::ArrowEngineData;
     use crate::engine::sync::SyncEngine;
-    use crate::expressions::column_name;
     #[cfg(feature = "adaptive-metadata-in-dev")]
     use crate::expressions::ColumnName;
+    use crate::expressions::column_name;
     use crate::object_store::memory::InMemory;
-    use crate::schema::{schema_ref, DataType, StructField};
+    use crate::schema::{DataType, StructField, schema_ref};
     use crate::snapshot::Snapshot;
     use crate::table_features::TableFeature;
     use crate::table_properties::{ENABLE_ICEBERG_COMPAT_V2, ENABLE_ICEBERG_COMPAT_V3};
     use crate::transaction::create_table::create_table;
     use crate::transaction::{SchemaOperation, UpdateTableOperation};
     use crate::unit_test_utils::{copy_test_table, load_test_table, test_schema_flat};
-    use crate::{Engine, KernelError, KernelResult, SnapshotRef};
+    use crate::{Engine, KernelError, Result, SnapshotRef};
 
     #[rstest]
     #[case::write(UpdateTableOperation::Write)]
@@ -407,7 +428,7 @@ mod tests {
     #[case::custom(UpdateTableOperation::Custom("vendor.write".to_string()))]
     fn builder_collects_existing_table_transaction_intent(
         #[case] operation: UpdateTableOperation,
-    ) -> KernelResult<()> {
+    ) -> Result<()> {
         let (engine, snapshot, _tempdir) = load_test_table("table-without-dv-small")?;
         let transaction = snapshot
             .update_table(
@@ -441,7 +462,7 @@ mod tests {
     }
 
     #[test]
-    fn replacement_setters_use_the_last_value_and_empty_correlation_clears() -> KernelResult<()> {
+    fn replacement_setters_use_the_last_value_and_empty_correlation_clears() -> Result<()> {
         let (engine, snapshot, _tempdir) = load_test_table("table-without-dv-small")?;
         let transaction = snapshot
             .update_table(UpdateTableOperation::Delete, "second-engine", true)
@@ -467,7 +488,7 @@ mod tests {
     }
 
     #[test]
-    fn builder_debug_summarizes_intent() -> KernelResult<()> {
+    fn builder_debug_summarizes_intent() -> Result<()> {
         let (_engine, snapshot, _tempdir) = load_test_table("table-without-dv-small")?;
         let debug = format!(
             "{:?}",
@@ -483,14 +504,20 @@ mod tests {
     }
 
     #[test]
-    fn builder_applies_optional_transaction_intent() -> KernelResult<()> {
+    fn builder_applies_optional_transaction_intent() -> Result<()> {
         let (engine, snapshot, _tempdir) = load_test_table("table-without-dv-small")?;
         let commit_info_schema = schema_ref! { nullable "tag": STRING };
-        let arrow_schema: ArrowSchema = commit_info_schema.as_ref().try_into_arrow()?;
-        let commit_info = Box::new(ArrowEngineData::new(RecordBatch::try_new(
-            Arc::new(arrow_schema),
-            vec![Arc::new(StringArray::from(vec![Some("value")]))],
-        )?));
+        let arrow_schema: ArrowSchema = commit_info_schema
+            .as_ref()
+            .try_into_arrow()
+            .map_err(KernelError::from)?;
+        let commit_info = Box::new(ArrowEngineData::new(
+            RecordBatch::try_new(
+                Arc::new(arrow_schema),
+                vec![Arc::new(StringArray::from(vec![Some("value")]))],
+            )
+            .map_err(KernelError::from)?,
+        ));
         let mut transaction = snapshot
             .update_table(UpdateTableOperation::Write, "test-engine", false)
             .with_commit_info(commit_info, commit_info_schema)
@@ -521,14 +548,20 @@ mod tests {
     #[rstest]
     #[case(0)]
     #[case(2)]
-    fn builder_rejects_non_single_row_commit_info(#[case] row_count: usize) -> KernelResult<()> {
+    fn builder_rejects_non_single_row_commit_info(#[case] row_count: usize) -> Result<()> {
         let (engine, snapshot, _tempdir) = load_test_table("table-without-dv-small")?;
         let commit_info_schema = schema_ref! { nullable "tag": STRING };
-        let arrow_schema: ArrowSchema = commit_info_schema.as_ref().try_into_arrow()?;
-        let commit_info = Box::new(ArrowEngineData::new(RecordBatch::try_new(
-            Arc::new(arrow_schema),
-            vec![Arc::new(StringArray::from(vec![Some("value"); row_count]))],
-        )?));
+        let arrow_schema: ArrowSchema = commit_info_schema
+            .as_ref()
+            .try_into_arrow()
+            .map_err(KernelError::from)?;
+        let commit_info = Box::new(ArrowEngineData::new(
+            RecordBatch::try_new(
+                Arc::new(arrow_schema),
+                vec![Arc::new(StringArray::from(vec![Some("value"); row_count]))],
+            )
+            .map_err(KernelError::from)?,
+        ));
 
         let error = snapshot
             .update_table(UpdateTableOperation::Write, "test-engine", true)
@@ -546,7 +579,7 @@ mod tests {
 
     #[cfg(feature = "adaptive-metadata-in-dev")]
     #[test]
-    fn builder_collects_nested_schema_intent() -> KernelResult<()> {
+    fn builder_collects_nested_schema_intent() -> Result<()> {
         let (_engine, snapshot, _tempdir) = load_test_table("table-without-dv-small")?;
         let builder = snapshot
             .update_table(UpdateTableOperation::AlterTable, "test-engine", false)
@@ -563,7 +596,7 @@ mod tests {
     }
 
     #[test]
-    fn alter_table_operation_uses_unified_builder() -> KernelResult<()> {
+    fn alter_table_operation_uses_unified_builder() -> Result<()> {
         let (engine, snapshot, _tempdir) = load_test_table("table-without-dv-small")?;
         let transaction = snapshot
             .update_table(UpdateTableOperation::AlterTable, "test-engine", false)
@@ -575,15 +608,17 @@ mod tests {
             UpdateTableOperation::AlterTable.into()
         );
         assert!(transaction.should_emit_metadata);
-        assert!(transaction
-            .effective_table_config
-            .logical_schema()
-            .contains("new_column"));
+        assert!(
+            transaction
+                .effective_table_config
+                .logical_schema()
+                .contains("new_column")
+        );
         Ok(())
     }
 
     #[test]
-    fn custom_operation_with_schema_change_uses_behavioral_validation() -> KernelResult<()> {
+    fn custom_operation_with_schema_change_uses_behavioral_validation() -> Result<()> {
         let (engine, snapshot, _tempdir) = load_test_table("table-without-dv-small")?;
         let transaction = snapshot
             .update_table(
@@ -598,33 +633,42 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn custom_operation_rejects_reserved_known_name() -> KernelResult<()> {
+    #[rstest]
+    fn custom_operation_rejects_reserved_known_name(
+        #[values("ALTER TABLE", "REORG", "LIQUID TAGGING", "Deletion Vector Tombstones")]
+        operation: &str,
+        #[values(false, true)] data_change: bool,
+    ) -> Result<()> {
         let (engine, snapshot, _tempdir) = load_test_table("table-without-dv-small")?;
         let error = snapshot
             .update_table(
-                UpdateTableOperation::Custom("ALTER TABLE".to_string()),
+                UpdateTableOperation::Custom(operation.to_string()),
                 "test-engine",
-                true,
+                data_change,
             )
             .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))
             .unwrap_err();
 
-        assert!(error.to_string().contains("reserved"));
+        assert!(
+            matches!(&error, KernelError::InvalidTransactionState(message)
+            if message == &format!("custom operation name '{operation}' is reserved"))
+        );
         Ok(())
     }
 
     #[test]
-    fn alter_table_requires_schema_changes() -> KernelResult<()> {
+    fn alter_table_requires_schema_changes() -> Result<()> {
         let (engine, snapshot, _tempdir) = load_test_table("table-without-dv-small")?;
         let error = snapshot
             .update_table(UpdateTableOperation::AlterTable, "test-engine", false)
             .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))
             .unwrap_err();
 
-        assert!(error
-            .to_string()
-            .contains("requires at least one schema change"));
+        assert!(
+            error
+                .to_string()
+                .contains("requires at least one schema change")
+        );
         Ok(())
     }
 
@@ -690,6 +734,7 @@ mod tests {
             UpdateTableOperation::Update,
             UpdateTableOperation::Merge,
             UpdateTableOperation::Optimize,
+            UpdateTableOperation::Reorg,
             UpdateTableOperation::Custom("UNKNOWN".to_string())
         )]
         operation: UpdateTableOperation,
@@ -768,9 +813,11 @@ mod tests {
         );
         let result = builder.build(engine.as_ref(), Box::new(FileSystemCommitter::new()));
         if let Some(feature) = feature.filter(|_| feature_enabled) {
-            assert!(snapshot
-                .table_configuration()
-                .is_feature_supported(&feature));
+            assert!(
+                snapshot
+                    .table_configuration()
+                    .is_feature_supported(&feature)
+            );
             assert!(snapshot.table_configuration().is_feature_enabled(&feature));
             let error = result.unwrap_err();
             let expected =
@@ -893,7 +940,7 @@ mod tests {
     fn invalid_intent_is_rejected(
         #[case] intent: InvalidIntent,
         #[case] expected: &str,
-    ) -> KernelResult<()> {
+    ) -> Result<()> {
         let (engine, snapshot, _tempdir) = load_test_table("table-without-dv-small")?;
         let operation = match intent {
             InvalidIntent::AlterTableBlindAppend | InvalidIntent::AlterTableWithDataChange => {
@@ -943,7 +990,7 @@ mod tests {
     fn alter_table_commit_rejects_staged_file_batches(
         #[case] action: StagedFileAction,
         #[case] selection_vector: &[bool],
-    ) -> KernelResult<()> {
+    ) -> Result<()> {
         let (engine, snapshot, _tempdir) = load_test_table("table-without-dv-small")?;
         let mut transaction = snapshot
             .update_table(UpdateTableOperation::AlterTable, "test-engine", false)
@@ -987,7 +1034,7 @@ mod tests {
     #[rstest]
     fn alter_table_build_requires_data_change_false(
         #[values(false, true)] data_change: bool,
-    ) -> KernelResult<()> {
+    ) -> Result<()> {
         let (url, _tempdir) = copy_test_table("table-without-dv-small")?;
         let engine = SyncEngine::new();
         let snapshot = Snapshot::builder_for(url).build(&engine)?;
@@ -1013,7 +1060,7 @@ mod tests {
     }
 
     #[test]
-    fn alter_table_commit_rejects_invalid_internal_data_change() -> KernelResult<()> {
+    fn alter_table_commit_rejects_invalid_internal_data_change() -> Result<()> {
         let (engine, snapshot, _tempdir) = load_test_table("table-without-dv-small")?;
         let mut transaction = snapshot
             .update_table(UpdateTableOperation::AlterTable, "test-engine", false)
@@ -1031,7 +1078,7 @@ mod tests {
     #[rstest]
     fn custom_schema_changes_preserve_explicit_data_change(
         #[values(false, true)] data_change: bool,
-    ) -> KernelResult<()> {
+    ) -> Result<()> {
         let (engine, snapshot, _tempdir) = load_test_table("table-without-dv-small")?;
         let mut transaction = snapshot
             .update_table(
@@ -1048,9 +1095,9 @@ mod tests {
         transaction
             .staged_data_changes
             .add_files_metadata
-            .push(Box::new(ArrowEngineData::new(RecordBatch::try_from_iter(
-                [("value", values)],
-            )?)));
+            .push(Box::new(ArrowEngineData::new(
+                RecordBatch::try_from_iter([("value", values)]).map_err(KernelError::from)?,
+            )));
         assert_eq!(transaction.data_change, data_change);
         Ok(())
     }
@@ -1080,7 +1127,7 @@ mod tests {
         #[case] removals: &[&str],
         #[case] app_ids: &[&str],
         #[case] expected: &str,
-    ) -> KernelResult<()> {
+    ) -> Result<()> {
         let (engine, snapshot, _tempdir) = load_test_table("table-without-dv-small")?;
         let mut builder = snapshot.update_table(UpdateTableOperation::Write, "test-engine", true);
         for domain in additions {
@@ -1102,7 +1149,7 @@ mod tests {
     }
 
     #[test]
-    fn domain_metadata_without_table_feature_is_rejected_during_build() -> KernelResult<()> {
+    fn domain_metadata_without_table_feature_is_rejected_during_build() -> Result<()> {
         let (engine, snapshot, _tempdir) = load_test_table("table-without-dv-small")?;
         let error = snapshot
             .update_table(UpdateTableOperation::Write, "test-engine", true)

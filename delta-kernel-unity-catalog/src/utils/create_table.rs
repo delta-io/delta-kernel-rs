@@ -143,8 +143,9 @@ pub fn build_uc_create_table_request(
     // UC only recognizes the `delta.clustering` and `delta.rowTracking` domain metadatas.
     let uc_recognized_domains = HashSet::from([CLUSTERING_DOMAIN_NAME, ROW_TRACKING_DOMAIN_NAME]);
     let mut domain_metadata: HashMap<String, serde_json::Value> = HashMap::new();
-    for (domain, dm) in
-        snapshot.get_domain_metadatas_internal(engine, Some(&uc_recognized_domains))?
+    for (domain, dm) in snapshot
+        .reader()
+        .get_domain_metadatas_internal(engine, Some(&uc_recognized_domains))?
     {
         let value = serde_json::from_str(dm.configuration()).map_err(|e| {
             KernelError::generic(format!("malformed {domain} domain metadata: {e}"))
@@ -152,7 +153,7 @@ pub fn build_uc_create_table_request(
         domain_metadata.insert(domain, value);
     }
 
-    let in_commit_timestamp_ms = snapshot.get_timestamp(engine)?;
+    let in_commit_timestamp_ms = snapshot.reader().get_timestamp(engine)?;
 
     Ok(CreateTableRequest {
         name: table_name.into(),
@@ -195,11 +196,11 @@ mod tests {
 
     use delta_kernel::expressions::column_name;
     use delta_kernel::object_store::memory::InMemory;
-    use delta_kernel::schema::{schema_ref, SchemaRef};
+    use delta_kernel::schema::{SchemaRef, schema_ref};
     use delta_kernel::snapshot::Snapshot;
+    use delta_kernel::transaction::UpdateTableOperation;
     use delta_kernel::transaction::create_table::create_table;
     use delta_kernel::transaction::data_layout::DataLayout;
-    use delta_kernel::transaction::UpdateTableOperation;
     use delta_kernel_default_engine::DefaultEngineBuilder;
     use rstest::rstest;
     use test_utils::TestCatalogCommitter;
@@ -266,16 +267,18 @@ mod tests {
 
         assert_eq!(req.protocol.min_reader_version, 3);
         assert_eq!(req.protocol.min_writer_version, 7);
-        assert!(req
-            .protocol
-            .reader_features
-            .iter()
-            .any(|f| f == "catalogManaged"));
-        assert!(req
-            .protocol
-            .writer_features
-            .iter()
-            .any(|f| f == "inCommitTimestamp"));
+        assert!(
+            req.protocol
+                .reader_features
+                .iter()
+                .any(|f| f == "catalogManaged")
+        );
+        assert!(
+            req.protocol
+                .writer_features
+                .iter()
+                .any(|f| f == "inCommitTimestamp")
+        );
 
         assert_eq!(
             req.properties["io.unitycatalog.tableId"],

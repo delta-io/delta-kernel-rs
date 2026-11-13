@@ -395,8 +395,8 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use delta_kernel::arrow::array::{
-        ffi as arrow_ffi, ArrayRef, BinaryArray, Int32Array, Int64Array, RecordBatch, StringArray,
-        StructArray, UInt64Array,
+        ArrayRef, BinaryArray, Int32Array, Int64Array, RecordBatch, StringArray, StructArray,
+        UInt64Array, ffi as arrow_ffi,
     };
     use delta_kernel::arrow::datatypes::{
         DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
@@ -404,8 +404,8 @@ mod tests {
     use delta_kernel::engine::arrow_data::ArrowEngineData;
 
     use super::*;
-    use crate::error::{EngineExecError, FFIKernelError};
     use crate::ExclusiveRustString;
+    use crate::error::{EngineExecError, FFIKernelError};
 
     // === Shared Test Helpers ===
 

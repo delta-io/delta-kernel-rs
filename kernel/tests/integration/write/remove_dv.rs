@@ -9,12 +9,12 @@ use delta_kernel::actions::deletion_vector::{DeletionVectorDescriptor, DeletionV
 use delta_kernel::actions::{NUM_RECORDS, TIGHT_BOUNDS};
 use delta_kernel::arrow::array::builder::{MapBuilder, MapFieldNames, StringBuilder};
 use delta_kernel::arrow::array::{
-    new_null_array, Array, ArrayRef, AsArray, Int32Array, Int64Array, RecordBatch, StringArray,
-    StructArray,
+    Array, ArrayRef, AsArray, Int32Array, Int64Array, RecordBatch, StringArray, StructArray,
+    new_null_array,
 };
 use delta_kernel::arrow::compute::concat_batches;
 use delta_kernel::arrow::datatypes::{
-    DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
+    DataType as ArrowDataType, Field as ArrowField, Int64Type, Schema as ArrowSchema,
 };
 use delta_kernel::arrow::error::ArrowError;
 use delta_kernel::committer::FileSystemCommitter;
@@ -22,14 +22,14 @@ use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::engine_data::FilteredEngineData;
 use delta_kernel::expressions::{
-    col, lit, null_lit, ExpressionStructPatchBuilder, MapData, Scalar,
+    ExpressionStructPatchBuilder, MapData, Scalar, expr, lit, null_lit,
 };
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use delta_kernel::log_replay::FileActionKey;
-use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::ObjectStoreExt as _;
-use delta_kernel::scan::{scan_row_schema, PartitionValuesOptions, StatsOptions};
-use delta_kernel::schema::{schema_ref, DataType, MapType};
+use delta_kernel::object_store::path::Path;
+use delta_kernel::scan::{PartitionValuesOptions, StatsOptions, scan_row_schema};
+use delta_kernel::schema::{DataType, MapType, schema_ref};
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::{CommitResult, UpdateTableOperation};
 use delta_kernel::{
@@ -37,13 +37,15 @@ use delta_kernel::{
 };
 use itertools::Itertools;
 use rstest::rstest;
+use rstest_reuse::{apply, template};
 use serde_json::Deserializer;
 use tempfile::tempdir;
 use test_utils::{
-    assert_result_error_with_message, begin_transaction, begin_transaction_with, copy_directory,
-    create_add_files_metadata, create_default_engine, create_default_engine_mt_executor,
-    create_table_with_column_mapping_mode, engine_store_setup, insert_data, into_record_batch,
-    load_and_begin_transaction_with, read_actions_from_commit, replace_array_row,
+    AddActionRowTracking, assert_result_error_with_message, begin_transaction,
+    begin_transaction_with, copy_directory, create_add_files_metadata, create_default_engine,
+    create_default_engine_mt_executor, create_table_with_column_mapping_mode,
+    deletion_vector_array, engine_store_setup, insert_data, into_record_batch,
+    load_and_begin_transaction_with, read_actions_from_commit, replace_array_row, replace_column,
     setup_test_table_p37, setup_test_tables, test_table_setup,
 };
 use url::Url;
@@ -93,7 +95,7 @@ async fn append_only_enforces_data_change_for_file_actions(
     #[case] data_change: bool,
     #[case] selection_vector: &[bool],
     #[case] expected_error: Option<&str>,
-) -> KernelResult<()> {
+) -> delta_kernel::Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
     let table_url = Url::from_directory_path(&table_path).unwrap();
     let schema = schema_ref! { nullable "number": INTEGER };
@@ -119,13 +121,17 @@ async fn append_only_enforces_data_change_for_file_actions(
         write_context
             .physical_data_schema()
             .as_ref()
-            .try_into_arrow()?,
+            .try_into_arrow()
+            .map_err(KernelError::from)?,
     );
     for value in [1, 2, 3] {
-        let data = ArrowEngineData::new(RecordBatch::try_new(
-            arrow_schema.clone(),
-            vec![Arc::new(Int32Array::from(vec![value]))],
-        )?);
+        let data = ArrowEngineData::new(
+            RecordBatch::try_new(
+                arrow_schema.clone(),
+                vec![Arc::new(Int32Array::from(vec![value]))],
+            )
+            .map_err(KernelError::from)?,
+        );
         txn.add_files(engine.write_parquet(&data, &write_context).await?);
     }
     let snapshot = txn.commit(engine.as_ref())?.unwrap_post_commit_snapshot();
@@ -234,6 +240,338 @@ fn selected_scan_file_batch(
         }
     }
     Err(KernelError::generic("expected at least one scan file"))
+}
+
+#[rstest]
+#[case::valid(FileActionUniquenessCase::valid())]
+#[case::dedup_disabled(FileActionUniquenessCase {
+    adds: [
+        file_action("remove-0.parquet", None),
+        file_action("remove-0.parquet", None),
+    ],
+    removes: SelectedFileActions {
+        rows: [
+            file_action("remove-0.parquet", None),
+            file_action("remove-0.parquet", None),
+        ],
+        selection_vector: &[true, true],
+    },
+    dedup_validation_enabled: false,
+    ..FileActionUniquenessCase::valid()
+})]
+#[case::dedup_disabled_empty_add_path(FileActionUniquenessCase {
+    adds: [file_action("", None), file_action("add-1.parquet", None)],
+    dedup_validation_enabled: false,
+    expected_error: Some("AddFile path must not be empty"),
+    ..FileActionUniquenessCase::valid()
+})]
+#[case::dedup_disabled_empty_remove_path(FileActionUniquenessCase {
+    removes: SelectedFileActions {
+        rows: [file_action("", None), file_action("remove-1.parquet", None)],
+        selection_vector: &[true, true],
+    },
+    dedup_validation_enabled: false,
+    expected_error: Some("RemoveFile path must not be empty"),
+    ..FileActionUniquenessCase::valid()
+})]
+#[case::dedup_disabled_empty_dv_path(FileActionUniquenessCase {
+    dv_updates: SelectedFileActions {
+        rows: [file_action("", None), file_action("dv-1.parquet", None)],
+        selection_vector: &[true, true],
+    },
+    dedup_validation_enabled: false,
+    expected_error: Some("AddFile path must not be empty"),
+    ..FileActionUniquenessCase::valid()
+})]
+#[case::duplicate_add(FileActionUniquenessCase {
+    adds: [
+        file_action("same.parquet", None),
+        file_action("same.parquet", None),
+    ],
+    expected_error: Some("multiple AddFile actions"),
+    ..FileActionUniquenessCase::valid()
+})]
+#[case::duplicate_remove(FileActionUniquenessCase {
+    removes: SelectedFileActions {
+        rows: [
+            file_action("remove-0.parquet", None),
+            file_action("remove-0.parquet", Some("different-dv")),
+        ],
+        selection_vector: &[true, true],
+    },
+    expected_error: Some("multiple RemoveFile actions"),
+    ..FileActionUniquenessCase::valid()
+})]
+#[case::duplicate_remove_implicit_tail(FileActionUniquenessCase {
+    removes: SelectedFileActions {
+        rows: [
+            file_action("remove-0.parquet", None),
+            file_action("remove-0.parquet", None),
+        ],
+        selection_vector: &[true],
+    },
+    expected_error: Some("multiple RemoveFile actions"),
+    ..FileActionUniquenessCase::valid()
+})]
+#[case::duplicate_remove_unselected(FileActionUniquenessCase {
+    removes: SelectedFileActions {
+        rows: [
+            file_action("remove-0.parquet", None),
+            file_action("remove-0.parquet", None),
+        ],
+        selection_vector: &[true, false],
+    },
+    ..FileActionUniquenessCase::valid()
+})]
+#[case::add_remove_same_key(FileActionUniquenessCase {
+    adds: [
+        file_action("remove-0.parquet", None),
+        file_action("add-1.parquet", None),
+    ],
+    expected_error: Some("without a deletion vector"),
+    ..FileActionUniquenessCase::valid()
+})]
+#[case::add_remove_same_path_different_dv(FileActionUniquenessCase {
+    adds: [
+        file_action("remove-0.parquet", None),
+        file_action("add-1.parquet", None),
+    ],
+    removes: SelectedFileActions {
+        rows: [
+            file_action("remove-0.parquet", Some("old-dv")),
+            file_action("remove-1.parquet", None),
+        ],
+        selection_vector: &[true, true],
+    },
+    ..FileActionUniquenessCase::valid()
+})]
+#[case::add_collides_with_dv_update(FileActionUniquenessCase {
+    adds: [
+        file_action("dv-0.parquet", None),
+        file_action("add-1.parquet", None),
+    ],
+    dv_updates: SelectedFileActions {
+        rows: [
+            file_action("dv-0.parquet", Some("old-dv")),
+            file_action("dv-1.parquet", None),
+        ],
+        selection_vector: &[true, true],
+    },
+    expected_error: Some("multiple AddFile actions"),
+    ..FileActionUniquenessCase::valid()
+})]
+#[case::add_ignores_unselected_dv_update_collision(FileActionUniquenessCase {
+    adds: [
+        file_action("dv-0.parquet", None),
+        file_action("add-1.parquet", None),
+    ],
+    dv_updates: SelectedFileActions {
+        rows: [
+            file_action("dv-0.parquet", None),
+            file_action("dv-1.parquet", None),
+        ],
+        selection_vector: &[false, true],
+    },
+    ..FileActionUniquenessCase::valid()
+})]
+#[case::remove_collides_with_dv_update(FileActionUniquenessCase {
+    removes: SelectedFileActions {
+        rows: [
+            file_action("dv-0.parquet", None),
+            file_action("remove-1.parquet", None),
+        ],
+        selection_vector: &[true, true],
+    },
+    expected_error: Some("multiple RemoveFile actions"),
+    ..FileActionUniquenessCase::valid()
+})]
+#[tokio::test]
+async fn commit_validates_file_action_uniqueness(
+    #[case] case: FileActionUniquenessCase,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // === Initialize table with files ===
+    let schema = schema_ref! { nullable "id": INTEGER };
+    let (_store, engine, table_url, _) = create_dv_table_with_files(
+        "file_action_uniqueness",
+        schema,
+        &[],
+        &[
+            "remove-0.parquet",
+            "remove-1.parquet",
+            "dv-0.parquet",
+            "dv-1.parquet",
+        ],
+    )
+    .await?;
+    let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
+    let scan_files = get_scan_files(snapshot.clone(), engine.as_ref())?;
+    let batches = scan_files
+        .into_iter()
+        .map(|scan_files| scan_files.apply_selection_vector().map(into_record_batch))
+        .collect::<KernelResult<Vec<_>>>()?;
+    let batch = concat_batches(&batches[0].schema(), &batches)?;
+    let base_row = batch.slice(0, 1);
+    let mut txn = begin_transaction_with(
+        snapshot,
+        engine.as_ref(),
+        UpdateTableOperation::Write,
+        "test-engine",
+        true,
+        |builder| {
+            if case.dedup_validation_enabled {
+                builder
+            } else {
+                builder.without_dedup_validation()
+            }
+        },
+    )?;
+
+    // === Stage AddFiles ===
+    txn.add_files(create_add_files_metadata(
+        txn.add_files_schema(),
+        case.adds
+            .iter()
+            .map(|file| {
+                (
+                    file.path,
+                    1, /* size */
+                    1, /* modification_time */
+                    Some(1),
+                )
+            })
+            .collect(),
+    )?);
+
+    // === Stage RemoveFiles ===
+    let removes = apply_path_dv(&base_row, &case.removes.rows)?;
+    txn.remove_files(FilteredEngineData::try_new(
+        Box::new(ArrowEngineData::new(removes)),
+        case.removes.selection_vector.to_vec(),
+    )?);
+
+    // === Stage DV updates ===
+    let scan_file = apply_path_dv(&base_row, &case.dv_updates.rows)?;
+    let descriptors = case
+        .dv_updates
+        .rows
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| {
+            case.dv_updates
+                .selection_vector
+                .get(*index)
+                .copied()
+                .unwrap_or(true)
+        })
+        .map(|(index, file)| {
+            let descriptor = DeletionVectorDescriptor {
+                storage_type: DeletionVectorStorageType::PersistedRelative,
+                path_or_inline_dv: format!("new-dv-{index}.bin"),
+                offset: Some(0),
+                size_in_bytes: 1,
+                cardinality: 1,
+            };
+            (file.path.to_string(), descriptor)
+        })
+        .collect();
+    txn.update_deletion_vectors(
+        descriptors,
+        std::iter::once(Ok(FilteredEngineData::try_new(
+            Box::new(ArrowEngineData::new(scan_file)),
+            case.dv_updates.selection_vector.to_vec(),
+        )?)),
+    )?;
+
+    // === Commit and assert the result ===
+    let result = txn.commit(engine.as_ref());
+    if let Some(expected_error) = case.expected_error {
+        assert_result_error_with_message(result, expected_error);
+    } else {
+        result?.unwrap_committed();
+    }
+    Ok(())
+}
+
+#[derive(Clone)]
+struct SelectedFileActions {
+    rows: [FileActionInput; 2],
+    selection_vector: &'static [bool],
+}
+
+#[derive(Clone)]
+struct FileActionUniquenessCase {
+    adds: [FileActionInput; 2],
+    removes: SelectedFileActions,
+    dv_updates: SelectedFileActions,
+    dedup_validation_enabled: bool,
+    expected_error: Option<&'static str>,
+}
+
+impl FileActionUniquenessCase {
+    fn valid() -> Self {
+        Self {
+            adds: [
+                file_action("add-0.parquet", None),
+                file_action("add-1.parquet", None),
+            ],
+            removes: SelectedFileActions {
+                rows: [
+                    file_action("remove-0.parquet", None),
+                    file_action("remove-1.parquet", None),
+                ],
+                selection_vector: &[true, true],
+            },
+            dv_updates: SelectedFileActions {
+                rows: [
+                    file_action("dv-0.parquet", None),
+                    file_action("dv-1.parquet", None),
+                ],
+                selection_vector: &[true, true],
+            },
+            expected_error: None,
+            dedup_validation_enabled: true,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct FileActionInput {
+    path: &'static str,
+    path_or_inline_dv: Option<&'static str>,
+}
+
+const fn file_action(
+    path: &'static str,
+    path_or_inline_dv: Option<&'static str>,
+) -> FileActionInput {
+    FileActionInput {
+        path,
+        path_or_inline_dv,
+    }
+}
+
+fn apply_path_dv(
+    base_row: &RecordBatch,
+    file_actions: &[FileActionInput],
+) -> Result<RecordBatch, ArrowError> {
+    let batch = concat_batches(
+        &base_row.schema(),
+        &vec![base_row.clone(); file_actions.len()],
+    )?;
+    let paths = Arc::new(StringArray::from(
+        file_actions
+            .iter()
+            .map(|file| file.path)
+            .collect::<Vec<_>>(),
+    ));
+    let batch = replace_column(&batch, "path", paths);
+
+    let paths_or_inline_dvs = file_actions
+        .iter()
+        .map(|file| file.path_or_inline_dv)
+        .collect::<Vec<_>>();
+    let deletion_vectors = Arc::new(deletion_vector_array("u", &paths_or_inline_dvs));
+    Ok(replace_column(&batch, "deletionVector", deletion_vectors))
 }
 
 #[derive(Clone, Copy)]
@@ -348,7 +686,7 @@ async fn commit_validates_staged_remove_fields(
     #[case] modification: StagedRemoveFileModification,
     #[case] selection_vector: &[bool],
     #[case] expected_error: Option<&str>,
-) -> KernelResult<()> {
+) -> delta_kernel::Result<()> {
     // === Create table ===
     let schema = get_simple_int_schema();
     let (table_url, engine, _store, _table_name) =
@@ -386,9 +724,9 @@ async fn commit_validates_staged_remove_fields(
         .first()
         .expect("at least one scan metadata batch")
         .schema();
-    let batch = concat_batches(&schema, &batches)?;
+    let batch = concat_batches(&schema, &batches).map_err(KernelError::from)?;
     assert_eq!(batch.num_rows(), 3);
-    let path_index = batch.schema().index_of("path")?;
+    let path_index = batch.schema().index_of("path").map_err(KernelError::from)?;
     let paths = batch
         .column(path_index)
         .as_any()
@@ -401,7 +739,7 @@ async fn commit_validates_staged_remove_fields(
         .map(|(_, path)| path.expect("path is present").to_owned())
         .collect::<Vec<_>>();
     expected_surviving_paths.sort();
-    let corrupted = modify_staged_remove_file(&batch, modification)?;
+    let corrupted = modify_staged_remove_file(&batch, modification).map_err(KernelError::from)?;
 
     // === Commit and assert ===
     let mut txn = begin_transaction(snapshot, engine.as_ref())?;
@@ -418,7 +756,7 @@ async fn commit_validates_staged_remove_fields(
         for scan_files in get_scan_files(snapshot, engine.as_ref())? {
             let (data, selection_vector) = scan_files.into_parts();
             let batch = into_record_batch(data);
-            let path_index = batch.schema().index_of("path")?;
+            let path_index = batch.schema().index_of("path").map_err(KernelError::from)?;
             let paths = batch
                 .column(path_index)
                 .as_any()
@@ -437,7 +775,7 @@ async fn commit_validates_staged_remove_fields(
 }
 
 #[tokio::test]
-async fn test_remove_files_adds_expected_entries() -> KernelResult<()> {
+async fn test_remove_files_adds_expected_entries() -> delta_kernel::Result<()> {
     // This test verifies that Remove actions generated from scan metadata contain all expected
     // fields from the Remove struct (defined in kernel/src/actions/mod.rs).
     //
@@ -472,11 +810,12 @@ async fn test_remove_files_adds_expected_entries() -> KernelResult<()> {
 
             // Read the commit log directly to verify remove actions
             let commit_path = tmp_table_path.join(format!("_delta_log/{commit_version:020}.json"));
-            let commit_content = std::fs::read_to_string(commit_path)?;
+            let commit_content = std::fs::read_to_string(commit_path).map_err(KernelError::from)?;
 
             let parsed_commits: Vec<_> = Deserializer::from_str(&commit_content)
                 .into_iter::<serde_json::Value>()
-                .try_collect()?;
+                .try_collect()
+                .map_err(KernelError::from)?;
 
             // Verify we have at least commitInfo and remove actions
             assert!(
@@ -544,7 +883,8 @@ async fn test_remove_files_adds_expected_entries() -> KernelResult<()> {
 
             // stats (optional)
             let stats = remove["stats"].as_str().expect("Missing stats");
-            let stats_json: serde_json::Value = serde_json::from_str(stats)?;
+            let stats_json: serde_json::Value =
+                serde_json::from_str(stats).map_err(KernelError::from)?;
             assert_eq!(stats_json[NUM_RECORDS], 10);
 
             // tags (optional)
@@ -600,8 +940,8 @@ async fn test_remove_files_adds_expected_entries() -> KernelResult<()> {
 /// `test_remove_files_adds_expected_entries` covers the timestamped, conditionally-extended shape.
 #[cfg(feature = "adaptive-metadata-in-dev")]
 #[tokio::test]
-async fn remove_on_adaptive_metadata_table_nulls_deletion_timestamp_and_forces_extended_metadata(
-) -> KernelResult<()> {
+async fn remove_on_adaptive_metadata_table_nulls_deletion_timestamp_and_forces_extended_metadata()
+-> delta_kernel::Result<()> {
     // v1: create a `number: INTEGER` adaptiveMetadata table and append a data file.
     let (_tmp_dir, table_url, engine, snapshot) =
         create_number_table(vec!["adaptiveMetadata-preview"], vec![], "id", true).await?;
@@ -662,7 +1002,7 @@ async fn remove_on_adaptive_metadata_table_nulls_deletion_timestamp_and_forces_e
 async fn test_remove_scanned_file_sets_extended_metadata(
     #[case] missing_fields: &[ExtendedMetadataField],
     #[case] expected_extended_file_metadata: bool,
-) -> KernelResult<()> {
+) -> delta_kernel::Result<()> {
     let (_temp_dir, table_url, engine, snapshot) =
         create_number_table(vec![], vec![], "none", true).await?;
 
@@ -716,7 +1056,7 @@ async fn test_remove_scanned_file_sets_extended_metadata(
 }
 
 #[tokio::test]
-async fn test_update_deletion_vectors_adds_expected_entries() -> KernelResult<()> {
+async fn test_update_deletion_vectors_adds_expected_entries() -> delta_kernel::Result<()> {
     // This test verifies that deletion vector updates write proper Remove and Add actions
     // to the transaction log.
     //
@@ -789,10 +1129,12 @@ async fn test_update_deletion_vectors_adds_expected_entries() -> KernelResult<()
 
             // Read the original version 1 log to get original file metadata
             let original_log_path = tmp_table_path.join("_delta_log/00000000000000000001.json");
-            let original_log_content = std::fs::read_to_string(original_log_path)?;
+            let original_log_content =
+                std::fs::read_to_string(original_log_path).map_err(KernelError::from)?;
             let original_commits: Vec<_> = Deserializer::from_str(&original_log_content)
                 .into_iter::<serde_json::Value>()
-                .try_collect()?;
+                .try_collect()
+                .map_err(KernelError::from)?;
 
             let file_path = "part-00000-fae5310a-a37d-4e51-827b-c3d5516560ca-c000.snappy.parquet";
 
@@ -820,11 +1162,12 @@ async fn test_update_deletion_vectors_adds_expected_entries() -> KernelResult<()
 
             // Read the commit log directly
             let commit_path = tmp_table_path.join(format!("_delta_log/{commit_version:020}.json"));
-            let commit_content = std::fs::read_to_string(commit_path)?;
+            let commit_content = std::fs::read_to_string(commit_path).map_err(KernelError::from)?;
 
             let parsed_commits: Vec<_> = Deserializer::from_str(&commit_content)
                 .into_iter::<serde_json::Value>()
-                .try_collect()?;
+                .try_collect()
+                .map_err(KernelError::from)?;
 
             // Should have commitInfo, remove, and add actions
             assert!(
@@ -1104,7 +1447,7 @@ async fn test_update_deletion_vectors_rejects_corrupted_scan_files(
     #[case] modification: ScanFileModification,
     #[case] expected_error: &str,
     #[values(0, 1, 2)] invalid_batch_index: usize,
-) -> KernelResult<()> {
+) -> delta_kernel::Result<()> {
     const BATCH_COUNT: usize = 3;
 
     let schema = schema_ref! {
@@ -1197,20 +1540,22 @@ fn modify_scan_file(
         .nth(modification.row_id)
         .expect("modified selected row must exist in scan-file batch");
 
-    if modification.field_name == "partitionValues" {
+    if ["partitionValues", "baseRowId", "defaultRowCommitVersion"]
+        .contains(&modification.field_name)
+    {
         let constants_index = schema
             .index_of("fileConstantValues")
             .expect("fileConstantValues field in scan data");
         let constants = columns[constants_index].as_struct();
-        let partition_values_index = constants
+        let field_index = constants
             .fields()
             .iter()
-            .position(|field| field.name() == "partitionValues")
-            .expect("partitionValues field in fileConstantValues");
-        let partition_values = constants.column(partition_values_index);
+            .position(|field| field.name() == modification.field_name)
+            .expect("modified field in fileConstantValues");
+        let value = constants.column(field_index);
         let mut constant_columns = constants.columns().to_vec();
-        constant_columns[partition_values_index] =
-            replace_array_row(partition_values, modification.value.clone(), row_index);
+        constant_columns[field_index] =
+            replace_array_row(value, modification.value.clone(), row_index);
         columns[constants_index] = Arc::new(StructArray::new(
             constants.fields().clone(),
             constant_columns,
@@ -1274,7 +1619,7 @@ fn string_map_array(values: &[(&str, Option<&str>)]) -> ArrayRef {
 #[tokio::test]
 async fn test_update_deletion_vectors_multiple_files(
     #[case] partition_values: &[(&str, Option<&str>)],
-) -> KernelResult<()> {
+) -> delta_kernel::Result<()> {
     // This test verifies that update_deletion_vectors can update multiple files
     // in a single call, creating proper Remove and Add actions for each file.
     let _ = tracing_subscriber::fmt::try_init();
@@ -1311,17 +1656,21 @@ async fn test_update_deletion_vectors_multiple_files(
             let commit_version = committed.commit_version();
 
             // Read the commit log directly from object store
-            let final_commit_path =
-                table_url.join(&format!("_delta_log/{commit_version:020}.json"))?;
+            let final_commit_path = table_url
+                .join(&format!("_delta_log/{commit_version:020}.json"))
+                .map_err(KernelError::from)?;
             let commit_content = store
-                .get(&Path::from_url_path(final_commit_path.path())?)
-                .await?
+                .get(&Path::from_url_path(final_commit_path.path()).map_err(KernelError::from)?)
+                .await
+                .map_err(KernelError::from)?
                 .bytes()
-                .await?;
+                .await
+                .map_err(KernelError::from)?;
 
             let parsed_commits: Vec<_> = Deserializer::from_slice(&commit_content)
                 .into_iter::<serde_json::Value>()
-                .try_collect()?;
+                .try_collect()
+                .map_err(KernelError::from)?;
 
             // Extract all remove and add actions
             let remove_actions: Vec<_> = parsed_commits
@@ -1410,7 +1759,7 @@ async fn test_update_deletion_vectors_respects_selection_vector(
     #[case] selection_vector: &[bool],
     #[case] target_indexes: &[usize],
     #[case] expect_mismatch: bool,
-) -> KernelResult<()> {
+) -> delta_kernel::Result<()> {
     let schema = schema_ref! {
         nullable "id": INTEGER,
         nullable "value": STRING,
@@ -1476,7 +1825,7 @@ async fn test_update_deletion_vectors_respects_selection_vector(
         .into_iter()
         .map(|scan_files| scan_files.apply_selection_vector().map(into_record_batch))
         .collect::<KernelResult<Vec<_>>>()?;
-    let batch = concat_batches(&batches[0].schema(), &batches)?;
+    let batch = concat_batches(&batches[0].schema(), &batches).map_err(KernelError::from)?;
     let scan_files = FilteredEngineData::try_new(
         Box::new(ArrowEngineData::new(batch)),
         selection_vector.to_vec(),
@@ -1495,15 +1844,20 @@ async fn test_update_deletion_vectors_respects_selection_vector(
     let version = committed.commit_version();
 
     // Read the commit directly from the (in-memory) store.
-    let commit_path = table_url.join(&format!("_delta_log/{version:020}.json"))?;
+    let commit_path = table_url
+        .join(&format!("_delta_log/{version:020}.json"))
+        .map_err(KernelError::from)?;
     let commit_content = store
-        .get(&Path::from_url_path(commit_path.path())?)
-        .await?
+        .get(&Path::from_url_path(commit_path.path()).map_err(KernelError::from)?)
+        .await
+        .map_err(KernelError::from)?
         .bytes()
-        .await?;
+        .await
+        .map_err(KernelError::from)?;
     let actions: Vec<serde_json::Value> = Deserializer::from_slice(&commit_content)
         .into_iter()
-        .try_collect()?;
+        .try_collect()
+        .map_err(KernelError::from)?;
     let adds: Vec<&serde_json::Value> = actions.iter().filter_map(|a| a.get("add")).collect();
     let removes: Vec<&serde_json::Value> = actions.iter().filter_map(|a| a.get("remove")).collect();
 
@@ -1561,7 +1915,8 @@ async fn test_update_deletion_vectors_respects_selection_vector(
             add["deletionVector"].is_object(),
             "new add must carry a deletion vector"
         );
-        let stats: serde_json::Value = serde_json::from_str(add["stats"].as_str().unwrap())?;
+        let stats: serde_json::Value =
+            serde_json::from_str(add["stats"].as_str().unwrap()).map_err(KernelError::from)?;
         assert_eq!(
             stats[TIGHT_BOUNDS].as_bool(),
             Some(false),
@@ -1578,7 +1933,7 @@ async fn test_update_deletion_vectors_respects_selection_vector(
 }
 
 #[tokio::test]
-async fn test_remove_files_verify_files_excluded_from_scan() -> KernelResult<()> {
+async fn test_remove_files_verify_files_excluded_from_scan() -> delta_kernel::Result<()> {
     // Adds and then removes files and then verifies they don't appear in the scan.
 
     // setup tracing
@@ -1706,7 +2061,7 @@ fn with_missing_extended_metadata_fields(
 }
 
 #[tokio::test]
-async fn test_remove_files_with_modified_selection_vector() -> KernelResult<()> {
+async fn test_remove_files_with_modified_selection_vector() -> delta_kernel::Result<()> {
     // This test verifies that we can selectively remove files by:
     // 1. Calling remove_files multiple times with different subsets
     // 2. Modifying the selection vector to choose which files to remove
@@ -1872,13 +2227,13 @@ async fn test_remove_files_with_modified_selection_vector() -> KernelResult<()> 
 async fn test_remove_files_after_predicate_scan_includes_stats_parsed(
     #[case] use_struct_stats_checkpoint: bool,
     #[case] use_predicate: bool,
-) -> KernelResult<()> {
+) -> delta_kernel::Result<()> {
     let _ = tracing_subscriber::fmt::try_init();
 
     let schema = get_simple_int_schema();
 
     // Use a local directory so we can inspect the commit log for stats content.
-    let tmp_dir = tempdir()?;
+    let tmp_dir = tempdir().map_err(KernelError::from)?;
     let tmp_url = Url::from_directory_path(tmp_dir.path()).unwrap();
 
     for (table_url, engine, _store, _table_name) in
@@ -1927,8 +2282,8 @@ async fn test_remove_files_after_predicate_scan_includes_stats_parsed(
             .scan_builder()
             .with_stats(StatsOptions::all());
         if use_predicate {
-            scan_builder =
-                scan_builder.with_predicate(Arc::new(Pred::gt(col!("number"), lit(0_i32))));
+            scan_builder = scan_builder
+                .with_predicate(Arc::new(Pred::from_expr(expr!(col("number") > 0_i32))));
         }
         let scan = scan_builder.build()?;
 
@@ -1964,7 +2319,8 @@ async fn test_remove_files_after_predicate_scan_includes_stats_parsed(
             let stats_str = remove["stats"]
                 .as_str()
                 .expect("stats field should be a non-null JSON string");
-            let stats: serde_json::Value = serde_json::from_str(stats_str)?;
+            let stats: serde_json::Value =
+                serde_json::from_str(stats_str).map_err(KernelError::from)?;
             assert!(
                 stats[NUM_RECORDS].as_i64().unwrap_or(0) > 0,
                 "stats.numRecords should be populated, got: {stats}"
@@ -1993,14 +2349,14 @@ async fn test_remove_files_after_predicate_scan_includes_stats_parsed(
 #[case::data_predicate(
     StatsOptions::all(),
     PartitionValuesOptions::string_map_only(),
-    Some(Pred::gt(col!("id"), lit(0_i32))),
+    Some(Pred::from_expr(expr!(col("id") > 0_i32))),
     &["usa", "japan"],
     true /* expect_stats */,
 )]
 #[case::partition_predicate(
     StatsOptions::all(),
     PartitionValuesOptions::string_map_only(),
-    Some(Pred::eq(col!("country"), lit("usa".to_string()))),
+    Some(Pred::from_expr(expr!(col("country") == lit("usa".to_string())))),
     &["usa"],
     true /* expect_stats */,
 )]
@@ -2018,7 +2374,7 @@ async fn test_remove_files_partitioned_with_parsed_columns(
     #[case] predicate: Option<Pred>,
     #[case] expected_partitions: &[&str],
     #[case] expect_stats: bool,
-) -> KernelResult<()> {
+) -> delta_kernel::Result<()> {
     let _ = tracing_subscriber::fmt::try_init();
 
     let partition_col = "country";
@@ -2030,7 +2386,7 @@ async fn test_remove_files_partitioned_with_parsed_columns(
 
     // Local directory backing: `read_actions_from_commit` reads commit JSON off disk
     // and does not support the default in-memory store's `memory://` URL.
-    let tmp_dir = tempdir()?;
+    let tmp_dir = tempdir().map_err(KernelError::from)?;
     let tmp_url = Url::from_directory_path(tmp_dir.path()).unwrap();
 
     for (table_url, engine, _store, _table_name) in setup_test_tables(
@@ -2128,7 +2484,8 @@ async fn test_remove_files_partitioned_with_parsed_columns(
                 let stats_str = remove["stats"]
                     .as_str()
                     .expect("stats field should be a non-null JSON string");
-                let stats: serde_json::Value = serde_json::from_str(stats_str)?;
+                let stats: serde_json::Value =
+                    serde_json::from_str(stats_str).map_err(KernelError::from)?;
                 assert!(
                     stats[NUM_RECORDS].as_i64().unwrap_or(0) > 0,
                     "stats.numRecords should be populated, got: {stats}"
@@ -2179,12 +2536,13 @@ type DvSmallTableSetup = (
 ///
 /// Returns `(temp_dir, table_path, engine, snapshot)`. Keep `temp_dir` alive for the test;
 /// `table_path` lets callers read commit JSON directly off disk.
-fn setup_table_with_dv_small() -> KernelResult<DvSmallTableSetup> {
-    let temp_dir = tempfile::tempdir()?;
+fn setup_table_with_dv_small() -> delta_kernel::Result<DvSmallTableSetup> {
+    let temp_dir = tempfile::tempdir().map_err(KernelError::from)?;
     let table_path = temp_dir.path().join("table-with-dv-small");
     let source_path = std::fs::canonicalize(std::path::PathBuf::from(
         "./tests/data/table-with-dv-small/",
-    ))?;
+    ))
+    .map_err(KernelError::from)?;
     copy_directory(&source_path, &table_path)?;
 
     let table_url = Url::from_directory_path(&table_path).expect("table path must be a valid URL");
@@ -2200,8 +2558,8 @@ fn setup_table_with_dv_small() -> KernelResult<DvSmallTableSetup> {
 /// remove under the id that [`DeletionVectorDescriptor::unique_id_for`] derives for the add's DV.
 #[cfg(feature = "adaptive-metadata-in-dev")]
 #[tokio::test]
-async fn adaptive_metadata_remove_cancels_add_across_dv_storage_types(
-) -> Result<(), Box<dyn std::error::Error>> {
+async fn adaptive_metadata_remove_cancels_add_across_dv_storage_types()
+-> Result<(), Box<dyn std::error::Error>> {
     // v1: create an adaptiveMetadata table with one data file.
     let (_tmp_dir, table_url, engine, snapshot) =
         create_number_table(vec!["adaptiveMetadata-preview"], vec![], "id", true).await?;
@@ -2292,8 +2650,8 @@ async fn create_number_table(
     writer_features: Vec<&str>,
     column_mapping_mode: &str,
     use_37_protocol: bool,
-) -> KernelResult<(tempfile::TempDir, Url, Arc<dyn Engine>, Arc<Snapshot>)> {
-    let temp_dir = tempfile::tempdir()?;
+) -> delta_kernel::Result<(tempfile::TempDir, Url, Arc<dyn Engine>, Arc<Snapshot>)> {
+    let temp_dir = tempfile::tempdir().map_err(KernelError::from)?;
     let temp_dir_url =
         Url::from_directory_path(temp_dir.path()).expect("tempdir path must be a valid URL");
     let (store, engine, table_location) = engine_store_setup("number_table", Some(&temp_dir_url));
@@ -2320,4 +2678,316 @@ async fn create_number_table(
     .await?
     .unwrap_post_commit_snapshot();
     Ok((temp_dir, table_url, engine, snapshot))
+}
+
+#[template]
+#[rstest]
+#[case::enabled_selected(RowTrackingMetadataCase {
+    row_tracking_state: RowTrackingState::Enabled,
+    selection_vector: &[true, true, true],
+    expected_error: Some("row-tracking field"),
+})]
+#[case::supported_selected(RowTrackingMetadataCase {
+    row_tracking_state: RowTrackingState::Supported,
+    selection_vector: &[true, true, true],
+    expected_error: None,
+})]
+#[case::suspended_selected(RowTrackingMetadataCase {
+    row_tracking_state: RowTrackingState::Suspended,
+    selection_vector: &[true, true, true],
+    expected_error: None,
+})]
+#[case::unsupported_selected(RowTrackingMetadataCase {
+    row_tracking_state: RowTrackingState::Unsupported,
+    selection_vector: &[true, true, true],
+    expected_error: None,
+})]
+#[case::enabled_implicitly_selected(RowTrackingMetadataCase {
+    row_tracking_state: RowTrackingState::Enabled,
+    selection_vector: &[false],
+    expected_error: Some("row-tracking field"),
+})]
+#[case::supported_implicitly_selected(RowTrackingMetadataCase {
+    row_tracking_state: RowTrackingState::Supported,
+    selection_vector: &[false],
+    expected_error: None,
+})]
+#[case::enabled_invalid_row_unselected(RowTrackingMetadataCase {
+    row_tracking_state: RowTrackingState::Enabled,
+    selection_vector: &[true, false, true],
+    expected_error: None,
+})]
+#[case::supported_invalid_row_unselected(RowTrackingMetadataCase {
+    row_tracking_state: RowTrackingState::Supported,
+    selection_vector: &[true, false, true],
+    expected_error: None,
+})]
+#[case::enabled_none_selected(RowTrackingMetadataCase {
+    row_tracking_state: RowTrackingState::Enabled,
+    selection_vector: &[false, false, false],
+    expected_error: None,
+})]
+#[case::supported_none_selected(RowTrackingMetadataCase {
+    row_tracking_state: RowTrackingState::Supported,
+    selection_vector: &[false, false, false],
+    expected_error: None,
+})]
+fn row_tracking_metadata_cases(
+    #[case] case: RowTrackingMetadataCase,
+    #[values(None, Some(-1))] value: Option<i64>,
+    #[values("baseRowId", "defaultRowCommitVersion")] field: &'static str,
+    #[values("none", "name", "id")] cm_mode: &str,
+) {
+}
+
+#[apply(row_tracking_metadata_cases)]
+#[tokio::test]
+async fn commit_validates_remove_row_tracking_metadata(
+    case: RowTrackingMetadataCase,
+    value: Option<i64>,
+    field: &'static str,
+    cm_mode: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let RowTrackingMetadataCase {
+        row_tracking_state,
+        selection_vector,
+        expected_error,
+    } = case;
+    // === Given a table with row tracking in the requested state ===
+    let (_temp_dir, engine, snapshot) = create_row_tracking_table(row_tracking_state, cm_mode)?;
+    let (original, corrupted) = batch_with_invalid_row_tracking_meta(
+        snapshot.clone(),
+        engine.as_ref(),
+        ScanFileModification {
+            field_name: field,
+            value: Arc::new(Int64Array::from(vec![value])),
+            row_id: 1,
+        },
+    )?;
+    let selected_paths = selected_file_paths(&original, selection_vector);
+    let mut expected = row_tracking_file_metadata(&original);
+    for path in &selected_paths {
+        expected.remove(path);
+    }
+
+    // === When committing removals of the selected files ===
+    let corrupted = FilteredEngineData::try_new(
+        Box::new(ArrowEngineData::new(corrupted)),
+        selection_vector.to_vec(),
+    )?;
+    let mut txn = begin_transaction(snapshot, engine.as_ref())?;
+    txn.ack_row_tracking_preservation();
+    txn.remove_files(corrupted);
+    let result = txn.commit(engine.as_ref());
+
+    // === Expect a validation error or the exact surviving file metadata ===
+    if let Some(expected_error) = expected_error {
+        assert_result_error_with_message(result, &format!("{expected_error} '{field}'"));
+    } else {
+        assert_row_tracking_files(
+            result?.unwrap_post_commit_snapshot(),
+            engine.as_ref(),
+            &expected,
+        )?;
+    }
+    Ok(())
+}
+
+#[apply(row_tracking_metadata_cases)]
+#[tokio::test]
+async fn commit_validates_dv_row_tracking_metadata(
+    case: RowTrackingMetadataCase,
+    value: Option<i64>,
+    field: &'static str,
+    cm_mode: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let RowTrackingMetadataCase {
+        row_tracking_state,
+        selection_vector,
+        expected_error,
+    } = case;
+    // === Given a table with row tracking in the requested state ===
+    let (_temp_dir, engine, snapshot) = create_row_tracking_table(row_tracking_state, cm_mode)?;
+    let (original, corrupted) = batch_with_invalid_row_tracking_meta(
+        snapshot.clone(),
+        engine.as_ref(),
+        ScanFileModification {
+            field_name: field,
+            value: Arc::new(Int64Array::from(vec![value])),
+            row_id: 1,
+        },
+    )?;
+    let selected_paths = selected_file_paths(&original, selection_vector);
+    let mut expected = row_tracking_file_metadata(&original);
+    let corrupted_metadata = row_tracking_file_metadata(&corrupted);
+    for path in &selected_paths {
+        expected.insert(path.clone(), corrupted_metadata[path]);
+    }
+
+    // === When committing DV updates for the selected files ===
+    let corrupted = FilteredEngineData::try_new(
+        Box::new(ArrowEngineData::new(corrupted)),
+        selection_vector.to_vec(),
+    )?;
+    let mut txn = begin_transaction(snapshot, engine.as_ref())?;
+    txn.ack_row_tracking_preservation();
+    txn.update_deletion_vectors(
+        sequential_dv_descriptors(&selected_paths),
+        std::iter::once(Ok(corrupted)),
+    )?;
+    let result = txn.commit(engine.as_ref());
+
+    // === Expect a validation error or the exact surviving file metadata ===
+    if let Some(expected_error) = expected_error {
+        assert_result_error_with_message(result, &format!("{expected_error} '{field}'"));
+    } else {
+        assert_row_tracking_files(
+            result?.unwrap_post_commit_snapshot(),
+            engine.as_ref(),
+            &expected,
+        )?;
+    }
+    Ok(())
+}
+
+#[derive(Debug)]
+struct RowTrackingMetadataCase {
+    row_tracking_state: RowTrackingState,
+    selection_vector: &'static [bool],
+    expected_error: Option<&'static str>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RowTrackingState {
+    Enabled,
+    Supported,
+    Suspended,
+    Unsupported,
+}
+
+type RowTrackingTableSetup = (tempfile::TempDir, Arc<dyn Engine>, Arc<Snapshot>);
+
+fn create_row_tracking_table(
+    row_tracking_state: RowTrackingState,
+    cm_mode: &str,
+) -> Result<RowTrackingTableSetup, Box<dyn std::error::Error>> {
+    let (temp_dir, table_path, engine) = test_table_setup()?;
+    let mut properties = vec![
+        ("delta.enableDeletionVectors", "true"),
+        ("delta.columnMapping.mode", cm_mode),
+    ];
+    match row_tracking_state {
+        RowTrackingState::Enabled => properties.push(("delta.enableRowTracking", "true")),
+        RowTrackingState::Supported | RowTrackingState::Suspended => {
+            properties.push(("delta.feature.rowTracking", "supported"));
+        }
+        RowTrackingState::Unsupported => {}
+    }
+    let snapshot = create_table(
+        &table_path,
+        schema_ref! { nullable "id": INTEGER },
+        "Test/1.0",
+        true,
+    )
+    .with_table_properties(properties)
+    .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+    .commit(engine.as_ref())?
+    .unwrap_post_commit_snapshot();
+    let mut txn = begin_transaction(snapshot, engine.as_ref())?;
+    txn.add_files(create_add_files_metadata(
+        txn.add_files_schema(),
+        vec![
+            ("file0.parquet", 10, 1, Some(3)),
+            ("file1.parquet", 10, 1, Some(3)),
+            ("file2.parquet", 10, 1, Some(3)),
+        ],
+    )?);
+    let snapshot = txn.commit(engine.as_ref())?.unwrap_post_commit_snapshot();
+    // Create-table does not support suspension; suspend after assigning the original metadata.
+    let snapshot = if row_tracking_state == RowTrackingState::Suspended {
+        let table_url = Url::from_directory_path(&table_path).unwrap();
+        set_table_properties(
+            &table_path,
+            &table_url,
+            engine.as_ref(),
+            snapshot.version(),
+            &[("delta.rowTrackingSuspended", "true")],
+        )?
+    } else {
+        snapshot
+    };
+    Ok((temp_dir, engine, snapshot))
+}
+
+fn batch_with_invalid_row_tracking_meta(
+    snapshot: Arc<Snapshot>,
+    engine: &dyn Engine,
+    modification: ScanFileModification,
+) -> KernelResult<(RecordBatch, RecordBatch)> {
+    let scan_file = selected_scan_file_batch(snapshot, engine)?;
+    assert_eq!(scan_file.data().len(), 3);
+    let original = into_record_batch(scan_file.apply_selection_vector()?);
+    let scan_file = FilteredEngineData::with_all_rows_selected(Box::new(ArrowEngineData::new(
+        original.clone(),
+    )));
+    let (corrupted, _) = modify_scan_file(scan_file, &modification).into_parts();
+    Ok((original, into_record_batch(corrupted)))
+}
+
+fn selected_file_paths(batch: &RecordBatch, selection_vector: &[bool]) -> Vec<String> {
+    batch
+        .column_by_name("path")
+        .unwrap()
+        .as_string::<i32>()
+        .iter()
+        .enumerate()
+        .filter(|(row, _)| selection_vector.get(*row).copied().unwrap_or(true))
+        .map(|(_, path)| path.unwrap().to_owned())
+        .collect()
+}
+
+fn row_tracking_file_metadata(batch: &RecordBatch) -> HashMap<String, AddActionRowTracking> {
+    let constants = batch
+        .column_by_name("fileConstantValues")
+        .unwrap()
+        .as_struct();
+    let base_row_ids = constants
+        .column_by_name("baseRowId")
+        .unwrap()
+        .as_primitive::<Int64Type>();
+    let versions = constants
+        .column_by_name("defaultRowCommitVersion")
+        .unwrap()
+        .as_primitive::<Int64Type>();
+    batch
+        .column_by_name("path")
+        .unwrap()
+        .as_string::<i32>()
+        .iter()
+        .zip(base_row_ids.iter())
+        .zip(versions.iter())
+        .map(|((path, base_row_id), default_row_commit_version)| {
+            (
+                path.unwrap().to_owned(),
+                AddActionRowTracking {
+                    base_row_id,
+                    default_row_commit_version,
+                },
+            )
+        })
+        .collect()
+}
+
+fn assert_row_tracking_files(
+    snapshot: Arc<Snapshot>,
+    engine: &dyn Engine,
+    expected: &HashMap<String, AddActionRowTracking>,
+) -> KernelResult<()> {
+    let mut actual = HashMap::new();
+    for scan_files in get_scan_files(snapshot, engine)? {
+        let batch = into_record_batch(scan_files.apply_selection_vector()?);
+        actual.extend(row_tracking_file_metadata(&batch));
+    }
+    assert_eq!(&actual, expected);
+    Ok(())
 }

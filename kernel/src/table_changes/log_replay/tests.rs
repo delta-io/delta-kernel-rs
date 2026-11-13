@@ -7,31 +7,31 @@ use rstest::rstest;
 use test_utils::LoggingTest;
 
 use super::{
-    table_changes_action_iter, table_changes_action_iter_with_mode, TableChangesScanMetadata,
+    TableChangesScanMetadata, table_changes_action_iter, table_changes_action_iter_with_mode,
 };
 use crate::actions::{Add, Cdc, CommitInfo, Metadata, Protocol, Remove};
 use crate::engine::sync::SyncEngine;
-use crate::expressions::{col, lit, BinaryPredicateOp};
+use crate::expressions::expr;
 use crate::log_segment::LogSegment;
 use crate::path::ParsedLogPath;
-use crate::scan::state::DvInfo;
 use crate::scan::PhysicalPredicate;
-use crate::schema::{schema, schema_ref, DataType, SchemaRef, StructField};
+use crate::scan::state::DvInfo;
+use crate::schema::{DataType, SchemaRef, StructField, schema, schema_ref};
+use crate::table_changes::CdfMode;
 use crate::table_changes::log_replay::LogReplayScanner;
 use crate::table_changes::test_utils::{
     row_tracking_metadata, row_tracking_table_config, test_deletion_vector,
 };
-use crate::table_changes::CdfMode;
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::{ColumnMappingMode, TableFeature};
 use crate::table_properties::{
     ENABLE_CHANGE_DATA_FEED, ENABLE_ROW_TRACKING, ROW_TRACKING_SUSPENDED,
 };
 use crate::unit_test_utils::{
-    assert_result_error_with_message, Action, LocalMockTable, MockProtocolBuilder,
-    MockTableConfigurationBuilder,
+    Action, LocalMockTable, MockProtocolBuilder, MockTableConfigurationBuilder,
+    assert_result_error_with_message,
 };
-use crate::{Engine, KernelError, KernelResult, Predicate, Version};
+use crate::{Engine, KernelError, KernelResult, KernelResultIterator, Predicate, Version};
 
 fn get_schema() -> SchemaRef {
     schema_ref! {
@@ -163,7 +163,7 @@ fn get_segment(
     Ok(log_segment.listed.ascending_commit_files)
 }
 
-fn result_to_sv(iter: impl Iterator<Item = KernelResult<TableChangesScanMetadata>>) -> Vec<bool> {
+fn result_to_sv(iter: impl KernelResultIterator<TableChangesScanMetadata>) -> Vec<bool> {
     iter.map_ok(|scan_metadata| scan_metadata.selection_vector.into_iter())
         .flatten_ok()
         .try_collect()
@@ -1009,7 +1009,7 @@ async fn data_skipping_filter() {
         .await;
 
     // Look for actions with id > 4
-    let predicate = Predicate::binary(BinaryPredicateOp::GreaterThan, col!("id"), lit(4));
+    let predicate = Predicate::from_expr(expr!(col("id") > 4));
     let logical_schema = get_schema();
     let predicate =
         match PhysicalPredicate::try_new(&predicate, &logical_schema, ColumnMappingMode::None) {
@@ -1082,7 +1082,7 @@ async fn data_skipping_filter_prunes_partition_values_but_keeps_removes() {
         .with_table_root(table_root_url)
         .build();
 
-    let predicate = Predicate::binary(BinaryPredicateOp::Equal, col!("part"), lit("x"));
+    let predicate = Predicate::from_expr(expr!(col("part") == "x"));
     let predicate =
         match PhysicalPredicate::try_new(&predicate, &logical_schema, ColumnMappingMode::None) {
             Ok(PhysicalPredicate::Some(p, s)) => Some((p, s)),
@@ -1138,7 +1138,7 @@ async fn data_skipping_filter_prunes_stats_but_keeps_removes() {
         .await;
 
     let logical_schema = get_schema();
-    let predicate = Predicate::binary(BinaryPredicateOp::GreaterThan, col!("id"), lit(4));
+    let predicate = Predicate::from_expr(expr!(col("id") > 4));
     let predicate =
         match PhysicalPredicate::try_new(&predicate, &logical_schema, ColumnMappingMode::None) {
             Ok(PhysicalPredicate::Some(p, s)) => Some((p, s)),

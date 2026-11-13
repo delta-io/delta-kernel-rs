@@ -3,23 +3,23 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use delta_kernel::arrow::array::{new_null_array, Array, Int32Array, StringArray};
+use delta_kernel::KernelError;
+use delta_kernel::arrow::array::{Array, Int32Array, StringArray, new_null_array};
 use delta_kernel::arrow::datatypes::DataType as ArrowDataType;
 use delta_kernel::arrow::record_batch::RecordBatch;
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
-use delta_kernel::expressions::{column_name, ColumnName, Scalar};
+use delta_kernel::expressions::{ColumnName, Scalar, column_name};
 use delta_kernel::schema::{
-    schema, schema_ref, try_schema, ArrayType, ColumnMetadataKey, DataType, MapType, MetadataValue,
-    SchemaRef, StructField, StructType,
+    ArrayType, ColumnMetadataKey, DataType, MapType, MetadataValue, SchemaRef, StructField,
+    StructType, schema, schema_ref, try_schema,
 };
 use delta_kernel::snapshot::Snapshot;
 use delta_kernel::table_features::ColumnMappingMode;
+use delta_kernel::transaction::UpdateTableOperation;
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
-use delta_kernel::transaction::UpdateTableOperation;
-use delta_kernel::{KernelError, KernelResult};
 use rstest::rstest;
 use serde_json::json;
 use test_utils::{
@@ -44,7 +44,7 @@ fn committer() -> Box<FileSystemCommitter> {
 #[tokio::test]
 async fn schema_evolution_while_writing_round_trips_new_column(
     #[values("none", "name", "id")] cm_mode: &str,
-) -> KernelResult<()> {
+) -> delta_kernel::Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
     let snapshot = create_table_and_load_snapshot(
         &table_path,
@@ -53,12 +53,19 @@ async fn schema_evolution_while_writing_round_trips_new_column(
         &[("delta.columnMapping.mode", cm_mode)],
     )?;
     let old_batch = RecordBatch::try_new(
-        Arc::new(snapshot.schema().as_ref().try_into_arrow()?),
+        Arc::new(
+            snapshot
+                .schema()
+                .as_ref()
+                .try_into_arrow()
+                .map_err(KernelError::from)?,
+        ),
         vec![
             Arc::new(Int32Array::from(vec![1, 2])),
             Arc::new(StringArray::from(vec!["old-a", "old-b"])),
         ],
-    )?;
+    )
+    .map_err(KernelError::from)?;
     let before =
         write_batch_to_table(&snapshot, engine.as_ref(), old_batch, HashMap::new()).await?;
     let old_max_id = max_column_id(&before);
@@ -76,14 +83,16 @@ async fn schema_evolution_while_writing_round_trips_new_column(
             write_context
                 .logical_data_schema()
                 .as_ref()
-                .try_into_arrow()?,
+                .try_into_arrow()
+                .map_err(KernelError::from)?,
         ),
         vec![
             Arc::new(Int32Array::from(vec![3, 4])),
             Arc::new(StringArray::from(vec!["new-a", "new-b"])),
             Arc::new(StringArray::from(vec!["US", "CA"])),
         ],
-    )?;
+    )
+    .map_err(KernelError::from)?;
     let add_metadata = engine
         .write_parquet(&ArrowEngineData::new(batch), &write_context)
         .await?;
@@ -149,9 +158,10 @@ async fn schema_evolution_while_writing_round_trips_new_column(
                 .unwrap();
             for row in 0..batch.num_rows() {
                 let country = (!countries.is_null(row)).then(|| countries.value(row).to_string());
-                assert!(rows
-                    .insert(ids.value(row), (names.value(row).to_string(), country))
-                    .is_none());
+                assert!(
+                    rows.insert(ids.value(row), (names.value(row).to_string(), country))
+                        .is_none()
+                );
             }
         }
         assert_eq!(
@@ -260,11 +270,13 @@ async fn alter_table_commit_rejects_staged_files(
     let fresh = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
     assert_eq!(fresh.version(), before.version());
     assert_eq!(fresh.schema(), before.schema());
-    assert!(!temp_dir
-        .path()
-        .join("_delta_log")
-        .join(format!("{:020}.json", before.version() + 1))
-        .exists());
+    assert!(
+        !temp_dir
+            .path()
+            .join("_delta_log")
+            .join(format!("{:020}.json", before.version() + 1))
+            .exists()
+    );
     test_read(&ArrowEngineData::new(old_batch), fresh.table_root(), engine)?;
     Ok(())
 }
@@ -376,7 +388,7 @@ async fn add_column_validates_cdf_column_names(
     )]
     column_name: &str,
     #[values("none", "name", "id")] cm_mode: &str,
-) -> KernelResult<()> {
+) -> delta_kernel::Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
     let mut properties = vec![
         ("delta.feature.changeDataFeed", "supported"),
@@ -419,7 +431,7 @@ async fn add_column_validates_cdf_physical_column_names(
     #[case] cm_mode: &str,
     #[case] cdf_enabled: bool,
     #[case] expected_error: Option<&str>,
-) -> KernelResult<()> {
+) -> delta_kernel::Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
     let mut properties = vec![
         ("delta.feature.changeDataFeed", "supported"),
@@ -465,7 +477,7 @@ async fn add_column_validates_cdf_physical_column_names(
 }
 
 #[tokio::test]
-async fn alter_table_commit_info_includes_operation_maps() -> KernelResult<()> {
+async fn alter_table_commit_info_includes_operation_maps() -> delta_kernel::Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
     let snapshot =
         create_table_and_load_snapshot(&table_path, simple_schema(), engine.as_ref(), &[])?;
@@ -502,7 +514,7 @@ async fn alter_table_commit_info_includes_operation_maps() -> KernelResult<()> {
 async fn add_columns_lifecycle(
     #[values(None, Some("name"), Some("id"))] cm_mode: Option<&str>,
     #[values(1, 3)] num_columns: usize,
-) -> KernelResult<()> {
+) -> delta_kernel::Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
     let properties: Vec<(&str, &str)> = cm_mode
         .map(|m| vec![("delta.columnMapping.mode", m)])
@@ -575,12 +587,14 @@ async fn add_columns_lifecycle(
         }
         assert!(max_column_id(&reloaded).expect("CM table must have maxColumnId") > orig);
     } else {
-        assert!(reloaded
-            .table_configuration()
-            .metadata()
-            .configuration()
-            .get("delta.columnMapping.maxColumnId")
-            .is_none());
+        assert!(
+            reloaded
+                .table_configuration()
+                .metadata()
+                .configuration()
+                .get("delta.columnMapping.maxColumnId")
+                .is_none()
+        );
     }
 
     // Scan back -- old rows should have NULL for every new column.
@@ -698,7 +712,7 @@ async fn add_complex_type_column(
     #[case] field: StructField,
     #[case] expected_id_count: usize,
     #[values(None, Some("name"), Some("id"))] cm_mode: Option<&str>,
-) -> KernelResult<()> {
+) -> delta_kernel::Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
     let properties: Vec<(&str, &str)> = cm_mode
         .map(|m| vec![("delta.columnMapping.mode", m)])
@@ -763,7 +777,7 @@ async fn add_column_failures(
     #[case] properties: &[(&str, &str)],
     #[case] field: StructField,
     #[case] error_contains: &str,
-) -> KernelResult<()> {
+) -> delta_kernel::Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
     let snapshot =
         create_table_and_load_snapshot(&table_path, simple_schema(), engine.as_ref(), properties)?;
@@ -783,7 +797,7 @@ async fn add_column_failures(
 /// row with values in both new columns (v3) → reload. The reload must rebuild the snapshot
 /// from the checkpoint + alter commits + data commit and return the written values.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn back_to_back_alters_with_checkpoint() -> KernelResult<()> {
+async fn back_to_back_alters_with_checkpoint() -> delta_kernel::Result<()> {
     // Checkpoint writing requires the multi-threaded engine (like `maintenance_ops.rs`).
     let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
 
@@ -875,7 +889,7 @@ async fn back_to_back_alters_with_checkpoint() -> KernelResult<()> {
 #[tokio::test]
 async fn add_column_at_round_trip(
     #[values(None, Some("name"), Some("id"))] cm_mode: Option<&str>,
-) -> KernelResult<()> {
+) -> delta_kernel::Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
     let schema = schema_ref! {
         nullable "parent": {
@@ -926,7 +940,7 @@ async fn add_column_at_round_trip(
 #[tokio::test]
 async fn add_column_at_nested_struct_with_column_mapping(
     #[values("name", "id")] cm_mode: &str,
-) -> KernelResult<()> {
+) -> delta_kernel::Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
     let schema = Arc::new(StructType::try_new(vec![
         StructField::nullable("id", DataType::INTEGER),
@@ -982,7 +996,7 @@ async fn add_column_at_nested_struct_with_column_mapping(
 #[tokio::test]
 async fn add_column_at_containers_round_trip(
     #[values(None, Some("name"), Some("id"))] cm_mode: Option<&str>,
-) -> KernelResult<()> {
+) -> delta_kernel::Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
     let schema = schema_ref! {
         nullable "items": [ nullable {
@@ -1049,7 +1063,7 @@ async fn add_column_at_containers_round_trip(
 }
 
 #[tokio::test]
-async fn add_column_at_struct_fields_named_like_container_segments() -> KernelResult<()> {
+async fn add_column_at_struct_fields_named_like_container_segments() -> delta_kernel::Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
     let schema = schema_ref! {
         nullable "address": {
@@ -1105,7 +1119,7 @@ async fn add_column_at_struct_fields_named_like_container_segments() -> KernelRe
 }
 
 #[tokio::test]
-async fn add_column_at_rejects_duplicate_field_in_same_builder() -> KernelResult<()> {
+async fn add_column_at_rejects_duplicate_field_in_same_builder() -> delta_kernel::Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
     let schema = schema_ref! {
         nullable "address": {
@@ -1131,7 +1145,7 @@ async fn add_column_at_rejects_duplicate_field_in_same_builder() -> KernelResult
 }
 
 #[tokio::test]
-async fn add_column_at_rejects_non_struct_parent() -> KernelResult<()> {
+async fn add_column_at_rejects_non_struct_parent() -> delta_kernel::Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
     let snapshot =
         create_table_and_load_snapshot(&table_path, simple_schema(), engine.as_ref(), &[])?;
@@ -1158,7 +1172,7 @@ async fn add_column_at_rejects_non_struct_parent() -> KernelResult<()> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn empty_create_then_add_column(
     #[values(None, Some("name"), Some("id"))] cm_mode: Option<&str>,
-) -> KernelResult<()> {
+) -> delta_kernel::Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
     let properties: Vec<(&str, &str)> = cm_mode
         .map(|m| vec![("delta.columnMapping.mode", m)])
@@ -1283,7 +1297,7 @@ async fn set_nullable_succeeds(
     #[case] schema: SchemaRef,
     #[case] column: ColumnName,
     #[values(None, Some("name"), Some("id"))] cm_mode: Option<&str>,
-) -> KernelResult<()> {
+) -> delta_kernel::Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
     let properties: Vec<(&str, &str)> = cm_mode
         .map(|m| vec![("delta.columnMapping.mode", m)])
@@ -1328,7 +1342,7 @@ async fn set_nullable_on_layout_column_with_checkpoint(
     #[case] layout: DataLayout,
     #[case] col_value: &str,
     #[values(None, Some("name"), Some("id"))] cm_mode: Option<&str>,
-) -> KernelResult<()> {
+) -> delta_kernel::Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
     // Partition values live in the directory path; clustering values live in the row batch.
     let is_partitioned = matches!(layout, DataLayout::Partitioned { .. });
@@ -1365,7 +1379,8 @@ async fn set_nullable_on_layout_column_with_checkpoint(
         let batch = RecordBatch::try_new(
             nonpartition_arrow_schema,
             vec![Arc::new(Int32Array::from(vec![1]))],
-        )?;
+        )
+        .map_err(KernelError::from)?;
         let mut partition_values = HashMap::new();
         partition_values.insert(col_name.to_string(), Scalar::String(col_value.to_string()));
         write_batch_to_table(&v0_arc, engine.as_ref(), batch, partition_values).await?
@@ -1379,7 +1394,8 @@ async fn set_nullable_on_layout_column_with_checkpoint(
                 Arc::new(Int32Array::from(vec![1])),
                 Arc::new(StringArray::from(vec![col_value])),
             ],
-        )?;
+        )
+        .map_err(KernelError::from)?;
         write_batch_to_table(&v0_arc, engine.as_ref(), batch, HashMap::new()).await?
     };
 
@@ -1418,7 +1434,7 @@ async fn set_nullable_on_layout_column_with_checkpoint(
 }
 
 #[tokio::test]
-async fn set_nullable_nonexistent_column_fails() -> KernelResult<()> {
+async fn set_nullable_nonexistent_column_fails() -> delta_kernel::Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
     let snapshot =
         create_table_and_load_snapshot(&table_path, simple_schema(), engine.as_ref(), &[])?;
@@ -1446,7 +1462,7 @@ async fn set_nullable_nonexistent_column_fails() -> KernelResult<()> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn chain_add_column_and_set_nullable(
     #[values(None, Some("name"), Some("id"))] cm_mode: Option<&str>,
-) -> KernelResult<()> {
+) -> delta_kernel::Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
     let schema = schema_ref! {
         not_null "id": INTEGER,
@@ -1526,7 +1542,7 @@ async fn chain_add_column_and_set_nullable(
 fn field_with_stray_key(name: &str, key: &ColumnMetadataKey, ty: DataType) -> StructField {
     let mut f = StructField::nullable(name, ty);
     f.metadata
-        .insert(key.as_ref().to_string(), MetadataValue::Number(99));
+        .insert(key.as_ref().into(), MetadataValue::Number(99));
     f
 }
 
@@ -1548,7 +1564,7 @@ async fn add_column_with_stray_cm_metadata_on_non_cm_table_is_stripped(
         ColumnMetadataKey::ParquetFieldNestedIds
     )]
     key: ColumnMetadataKey,
-) -> KernelResult<()> {
+) -> delta_kernel::Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
     let snapshot =
         create_table_and_load_snapshot(&table_path, simple_schema(), engine.as_ref(), &[])?;
@@ -1599,7 +1615,7 @@ async fn add_column_strip_is_none_mode_only(
     #[case] expected_mode: ColumnMappingMode,
     #[case] properties: &[(&str, &str)],
     #[case] annotation_kept: bool,
-) -> KernelResult<()> {
+) -> delta_kernel::Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
     let snapshot =
         create_table_and_load_snapshot(&table_path, simple_schema(), engine.as_ref(), properties)?;
@@ -1640,7 +1656,7 @@ async fn schema_changes_blocked_when_iceberg_compat_enabled(
         UpdateTableOperation::Custom("UNKNOWN".to_string())
     )]
     operation: UpdateTableOperation,
-) -> KernelResult<()> {
+) -> delta_kernel::Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
     let snapshot = create_table_and_load_snapshot(
         &table_path,
@@ -1670,7 +1686,7 @@ async fn schema_changes_blocked_when_iceberg_compat_enabled(
 }
 
 #[tokio::test]
-async fn add_column_with_orphan_default_metadata_succeeds() -> KernelResult<()> {
+async fn add_column_with_orphan_default_metadata_succeeds() -> delta_kernel::Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
     let snapshot =
         create_table_and_load_snapshot(&table_path, simple_schema(), engine.as_ref(), &[])?;
@@ -1713,7 +1729,7 @@ async fn add_column_with_orphan_default_metadata_succeeds() -> KernelResult<()> 
 #[tokio::test]
 async fn schema_changes_blocked_when_allow_column_defaults_enabled(
     #[case] operation: UpdateTableOperation,
-) -> KernelResult<()> {
+) -> delta_kernel::Result<()> {
     let (store, engine, table_url) = engine_store_setup("alter_column_defaults", None);
     let table_url = create_test_table(
         store,
@@ -1773,7 +1789,7 @@ fn physical_name_for_field(field: &StructField) -> &str {
 #[tokio::test]
 async fn add_column_preserves_complete_cm_metadata(
     #[values("name", "id")] cm_mode: &str,
-) -> KernelResult<()> {
+) -> delta_kernel::Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
     let snapshot = create_table_and_load_snapshot(
         &table_path,
@@ -1818,7 +1834,7 @@ async fn add_column_preserves_complete_cm_metadata(
 #[tokio::test]
 async fn add_column_with_only_physical_name_allocates_id(
     #[values("name", "id")] cm_mode: &str,
-) -> KernelResult<()> {
+) -> delta_kernel::Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
     let snapshot = create_table_and_load_snapshot(
         &table_path,
@@ -1856,7 +1872,7 @@ async fn add_column_with_only_physical_name_allocates_id(
 #[tokio::test]
 async fn add_column_with_only_id_fills_physical_name(
     #[values("name", "id")] cm_mode: &str,
-) -> KernelResult<()> {
+) -> delta_kernel::Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
     let snapshot = create_table_and_load_snapshot(
         &table_path,
@@ -1897,7 +1913,7 @@ async fn add_column_with_only_id_fills_physical_name(
 /// verbatim and `maxColumnId` unchanged. Matches delta-spark; diverges from the Java Kernel
 /// proposal in https://github.com/delta-io/delta/pull/4520, which would reject this.
 #[tokio::test]
-async fn add_column_with_id_below_max_column_id_succeeds() -> KernelResult<()> {
+async fn add_column_with_id_below_max_column_id_succeeds() -> delta_kernel::Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
     // Pre-populate the table with sparse ids (1, 100) using the create-table preserve path.
@@ -1943,7 +1959,7 @@ async fn add_column_with_id_below_max_column_id_succeeds() -> KernelResult<()> {
 /// duplicate-id check happens when the alter builder constructs the new
 /// `TableConfiguration` via `make_physical`.
 #[tokio::test]
-async fn add_column_with_id_colliding_existing_field_is_rejected() -> KernelResult<()> {
+async fn add_column_with_id_colliding_existing_field_is_rejected() -> delta_kernel::Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
     let snapshot = create_table_and_load_snapshot(
         &table_path,
@@ -1994,7 +2010,7 @@ async fn add_column_with_id_colliding_existing_field_is_rejected() -> KernelResu
 async fn add_column_on_stale_table_leaves_schema_untouched(
     #[case] added_field: StructField,
     #[case] expected_added_cm_id: Option<i64>,
-) -> KernelResult<()> {
+) -> delta_kernel::Result<()> {
     let (store, engine, table_url) = engine_store_setup("alter_stale_cm", None);
 
     // `value` carries a stale id; protocol omits columnMapping and no mode is set (resolves to
@@ -2004,7 +2020,9 @@ async fn add_column_on_stale_table_leaves_schema_untouched(
         (StructField::nullable("value", DataType::INTEGER)
             .add_metadata([("delta.columnMapping.id", MetadataValue::Number(2))])),
     };
-    let escaped = serde_json::to_string(&serde_json::to_string(&stale_schema)?).unwrap();
+    let escaped =
+        serde_json::to_string(&serde_json::to_string(&stale_schema).map_err(KernelError::from)?)
+            .unwrap();
     // v0 written directly to bypass create_table validation (which strips stale annotations).
     let v0 = format!(
         r#"{{"protocol":{{"minReaderVersion":1,"minWriterVersion":2}}}}

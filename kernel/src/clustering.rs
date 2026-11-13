@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use crate::actions::DomainMetadata;
 use crate::expressions::ColumnName;
 use crate::scan::data_skipping::stats_schema::is_skipping_eligible_datatype;
-use crate::schema::{DataType, StructType};
+use crate::schema::{DataType, StructType, is_null_count_only_file_sub_field};
 use crate::{KernelError, KernelResult};
 
 /// Domain metadata structure for clustering columns.
@@ -69,11 +69,13 @@ pub(crate) struct ClusteringColumnInfo {
 /// 2. No duplicate columns
 ///
 /// **Schema validations:**
-/// 3. Column paths must resolve in the schema (including nested paths through structs)
-/// 4. Leaf field must have a data type eligible for statistics collection
+/// 3. Column paths must resolve in the schema (including nested paths through structs and `file`
+///    columns)
+/// 4. Leaf field must have a type eligible for min/max statistics. For `file` sub-fields,
+///    `checksum` and `inline` are rejected because they have only null-count statistics.
 ///
 /// Both top-level and nested columns are supported. For nested columns, all intermediate
-/// fields must be struct types and the leaf field must be a stats-eligible primitive.
+/// fields must be struct or `file` types and the leaf field must be a stats-eligible primitive.
 ///
 /// # Errors
 ///
@@ -100,6 +102,11 @@ pub(crate) fn validate_clustering_columns(
             )));
         }
 
+        if is_null_count_only_file_sub_field(&schema.fields_of_path(col)?) {
+            return Err(KernelError::generic(format!(
+                "Clustering column '{col}' is a `file` sub-field without min/max statistics"
+            )));
+        }
         let field = schema.field_at(col)?;
         match field.data_type() {
             DataType::Primitive(ptype) if is_skipping_eligible_datatype(ptype) => {}
@@ -158,7 +165,7 @@ pub(crate) fn parse_clustering_columns(json_str: &str) -> KernelResult<Vec<Colum
 mod tests {
     use super::*;
     use crate::expressions::column_name;
-    use crate::schema::{schema, DataType, StructField};
+    use crate::schema::{DataType, StructField, schema};
 
     #[rstest::rstest]
     #[case::simple(
@@ -203,10 +210,12 @@ mod tests {
         let columns = vec![column_name!("nonexistent")];
         let result = validate_clustering_columns(&schema, &columns);
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("not found in schema"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("not found in schema")
+        );
     }
 
     #[test]
@@ -248,10 +257,12 @@ mod tests {
         let columns = vec![column_name!("flat_col", "child")];
         let result = validate_clustering_columns(&schema, &columns);
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("is not a struct type"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("is not a struct or `file` type")
+        );
     }
 
     #[test]
@@ -264,10 +275,12 @@ mod tests {
         let columns = vec![column_name!("parent", "nonexistent")];
         let result = validate_clustering_columns(&schema, &columns);
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("not found in schema"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("not found in schema")
+        );
     }
 
     #[test]
@@ -360,6 +373,39 @@ mod tests {
                 field.data_type()
             );
             assert!(result.unwrap_err().to_string().contains("unsupported type"));
+        }
+    }
+
+    /// The `file` sub-fields with min/max statistics are valid clustering columns; `checksum` and
+    /// `inline` are not, and neither is the whole `file` column.
+    #[rstest::rstest]
+    #[case::uri("f.uri", None)]
+    #[case::offset("f.offset", None)]
+    #[case::size("f.size", None)]
+    #[case::content_type("f.content_type", None)]
+    #[case::checksum("f.checksum", Some("without min/max statistics"))]
+    #[case::inline("f.inline", Some("without min/max statistics"))]
+    #[case::whole_column("f", Some("unsupported type"))]
+    #[case::nested("s.f.size", None)]
+    fn test_validate_clustering_columns_file_sub_fields(
+        #[case] column: &str,
+        #[case] error: Option<&str>,
+    ) {
+        let schema = StructType::new_unchecked([
+            StructField::nullable("f", DataType::file_type()),
+            StructField::nullable(
+                "s",
+                StructType::new_unchecked([StructField::nullable("f", DataType::file_type())]),
+            ),
+        ]);
+        let columns = [ColumnName::from_naive_str_split(column)];
+        let result = validate_clustering_columns(&schema, &columns);
+        match error {
+            None => result.unwrap(),
+            Some(error) => {
+                let message = result.unwrap_err().to_string();
+                assert!(message.contains(error), "{column}: {message}");
+            }
         }
     }
 

@@ -69,11 +69,11 @@ built with [Arrow] and [Tokio].
 ```toml
 # fewer dependencies, requires consumer to implement Engine trait.
 # allows consumers to implement their own in-memory format
-delta_kernel = "0.30.0"
+delta_kernel = "0.30.1"
 
 # or pull in the default Arrow/Tokio engine alongside the kernel
-delta_kernel = "0.30.0"
-delta_kernel_default_engine = { version = "0.30.0", features = ["rustls"] }
+delta_kernel = "0.30.1"
+delta_kernel_default_engine = { version = "0.30.1", features = ["rustls"] }
 ```
 
 ### Feature flags
@@ -130,6 +130,7 @@ and then checking what version of `object_store` it depends on.
 
 ## Documentation
 
+- [User Guide](https://docs.delta.io/kernel/rust/) for connector workflows and cross-API concepts
 - [API Docs](https://docs.rs/delta_kernel/latest/delta_kernel/)
 
 ## Examples

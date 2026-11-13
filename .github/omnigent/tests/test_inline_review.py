@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -294,6 +296,74 @@ class InlineReviewTest(unittest.TestCase):
         )[0]
 
         self.assertIn("mode=inline", automatic_trigger)
+
+    def test_review_allowlist_uses_repository_variable_without_checkout(self) -> None:
+        path = Path(__file__).parents[2] / "workflows" / "ai-review.yml"
+        workflow = yaml.safe_load(path.read_text())
+        steps = workflow["jobs"]["authorize"]["steps"]
+        authorization = next(step for step in steps if step.get("id") == "access")
+
+        self.assertEqual(
+            authorization["env"]["AI_REVIEW_ALLOWLIST"], "${{ vars.AI_REVIEW_ALLOWLIST }}"
+        )
+        self.assertFalse(any("actions/checkout@" in step.get("uses", "") for step in steps))
+
+    def test_review_authorization_checks_allowlist_subject_event_and_write_access(self) -> None:
+        path = Path(__file__).parents[2] / "workflows" / "ai-review.yml"
+        workflow = yaml.safe_load(path.read_text())
+        authorization = next(
+            step
+            for step in workflow["jobs"]["authorize"]["steps"]
+            if step.get("id") == "access"
+        )
+        cases = [
+            ("exact match", '["alice", "bob"]', "alice", True),
+            ("case-insensitive match", '["Alice"]', "ALICE", True),
+            ("substring", '["malice"]', "alice", False),
+            ("missing login", '["bob"]', "alice", False),
+            ("trailing text", '["alice # note", "alice "]', "alice", False),
+            ("empty subject", '["", "alice"]', "", False),
+            ("unset variable", None, "alice", False),
+            ("empty variable", "", "alice", False),
+            ("empty array", "[]", "alice", False),
+            ("invalid JSON", '["alice"', "alice", False),
+            ("string instead of array", '"alice"', "alice", False),
+            ("object instead of array", '{"login": "alice"}', "alice", False),
+            ("null instead of array", "null", "alice", False),
+            ("number instead of array", "42", "alice", False),
+            ("non-string entry", '["alice", 42]', "alice", False),
+            ("nested array", '[["alice"]]', "alice", False),
+            ("multiple JSON values", '[] ["alice"]', "alice", False),
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "output"
+            for event in ("issue_comment", "pull_request_target", "workflow_dispatch"):
+                for has_write in (False, True):
+                    for name, allowlist, subject, matches in cases:
+                        with self.subTest(event=event, has_write=has_write, case=name):
+                            output.write_text("")
+                            env = {
+                                **os.environ,
+                                "AUTH_SUBJECT": subject,
+                                "EVENT_NAME": event,
+                                "HAS_WRITE": str(has_write).lower(),
+                                "GITHUB_OUTPUT": str(output),
+                            }
+                            env.pop("AI_REVIEW_ALLOWLIST", None)
+                            if allowlist is not None:
+                                env["AI_REVIEW_ALLOWLIST"] = allowlist
+                            result = subprocess.run(
+                                ["bash", "-c", authorization["run"]],
+                                env=env,
+                                check=False,
+                                capture_output=True,
+                                text=True,
+                            )
+                            self.assertEqual(result.returncode, 0, result.stderr)
+                            allowed = has_write or (event != "workflow_dispatch" and matches)
+                            self.assertEqual(
+                                output.read_text(), f"allowed={str(allowed).lower()}\n"
+                            )
 
     def test_diff_positions_tracks_both_sides_and_context(self) -> None:
         self.assertEqual(

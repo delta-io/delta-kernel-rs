@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use datafusion::arrow::array::{new_null_array, ArrayRef, RecordBatch, StructArray};
+use datafusion::arrow::array::{ArrayRef, RecordBatch, StructArray, new_null_array};
 use datafusion::arrow::datatypes::{DataType as ArrowDataType, Schema as ArrowSchema};
 use datafusion::common::utils::take_function_args;
 use datafusion::common::{
@@ -11,8 +11,8 @@ use datafusion::common::{
 use datafusion::functions::core::expr_fn::{coalesce, get_field, named_struct, nullif};
 use datafusion::functions_nested::expr_fn::make_array;
 use datafusion::logical_expr::{
-    binary_expr, cast, lit, Case, ColumnarValue, Expr as DFExpr, Operator, ScalarFunctionArgs,
-    ScalarUDF, ScalarUDFImpl, Signature, Volatility,
+    Case, ColumnarValue, Expr as DFExpr, Operator, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl,
+    Signature, Volatility, binary_expr, cast, lit,
 };
 use delta_kernel::engine::arrow_conversion::TryIntoArrow;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
@@ -77,6 +77,10 @@ pub fn to_df_expr(
                 "converting the ToJson expression is not yet supported",
             )),
         },
+
+        KernelExpression::CaseWhen(_) => Err(KernelError::unsupported(
+            "converting a CaseWhen expression is not yet supported",
+        )),
 
         // TODO(#3007): implement once kernel's Cast semantics are clarified.
         KernelExpression::Cast(_) => Err(KernelError::unsupported(
@@ -152,7 +156,7 @@ fn variadic_to_df_expr(
             Some(other) => {
                 return Err(KernelError::unsupported(format!(
                     "converting an Array expression requires an array output type, got {other:?}"
-                )))
+                )));
             }
             None => None,
         },
@@ -640,10 +644,10 @@ mod tests {
     use datafusion::physical_expr::create_physical_expr;
     use datafusion::physical_expr::execution_props::ExecutionProps;
     use delta_kernel::expressions::{
-        col, lit, null_lit, ColumnName as KernelColumnName, Expression as KernelExpr,
-        ExpressionStructPatch, ExpressionStructPatchBuilder, MapToStructOptions,
+        ColumnName as KernelColumnName, Expression as KernelExpr, ExpressionStructPatch,
+        ExpressionStructPatchBuilder, MapToStructOptions, col, expr, lit, null_lit,
     };
-    use delta_kernel::schema::{schema, schema_ref, ArrayType, DataType, MapType, StructType};
+    use delta_kernel::schema::{ArrayType, DataType, MapType, StructType, schema, schema_ref};
     use rstest::rstest;
 
     use super::*;
@@ -720,7 +724,7 @@ mod tests {
 
     #[rstest]
     #[case::coalesce(
-        KernelExpr::coalesce([col!("a"), col!("b"), lit(0i64)]),
+        expr!(coalesce(col("a"), col("b"), 0i64)),
         "coalesce(a, b, Int64(0))"
     )]
     #[case::array(
@@ -728,7 +732,7 @@ mod tests {
         "make_array(Int64(1), Int64(2))"
     )]
     #[case::nested_coalesce(
-        KernelExpr::coalesce([KernelExpr::coalesce([col!("a"), col!("b")]), col!("x")]),
+        expr!(coalesce(coalesce(col("a"), col("b")), col("x"))),
         "coalesce(coalesce(a, b), x)"
     )]
     #[case::nested_array(
@@ -787,7 +791,7 @@ mod tests {
 
     #[test]
     fn embedded_predicate_delegates_to_predicate_converter() {
-        let kernel = KernelExpr::Predicate(Box::new(col!("b").is_null()));
+        let kernel = expr!(is_null(col("b")));
         assert_eq!(lower(kernel), "b IS NULL");
     }
 
@@ -836,7 +840,7 @@ mod tests {
     fn struct_with_nullability_wraps_in_case() {
         let kernel = KernelExpr::struct_with_nullability_from(
             [col!("b"), lit(1i64)],
-            KernelExpr::Predicate(Box::new(col!("x").is_not_null())),
+            expr!(is_not_null(col("x"))),
         );
         // Kernel models IS NOT NULL as Not(IsNull), so the guard renders as "NOT x IS NULL".
         let rendered = lower_typed(kernel, pq_output_schema().into());
@@ -1145,8 +1149,9 @@ mod tests {
         #[case] expected_value: &str,
     ) {
         let target = schema! { nullable "f": (field_type) };
-        let expected =
-            format!("CASE WHEN pv IS NOT NULL THEN named_struct(Utf8(\"f\"), {expected_value}) ELSE NULL END");
+        let expected = format!(
+            "CASE WHEN pv IS NOT NULL THEN named_struct(Utf8(\"f\"), {expected_value}) ELSE NULL END"
+        );
         assert_eq!(lower_map_to_struct(target), expected);
     }
 

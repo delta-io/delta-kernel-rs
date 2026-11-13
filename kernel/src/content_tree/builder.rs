@@ -9,13 +9,13 @@ use std::sync::{Arc, LazyLock};
 
 use crate::actions::NUM_RECORDS;
 use crate::content_tree::{
-    struct_expr_from_schema, ContentTreeNodeEntry, DataContentType, DataFileFormat, TrackingInfo,
-    TrackingStatus, CONTENT_TYPE, FILE_FORMAT, FILE_SEQUENCE_NUMBER, FILE_SIZE_IN_BYTES,
-    FIRST_ROW_ID, FORMAT_VERSION, LOCATION, PARTITION_SPEC_ID, RECORD_COUNT, SEQUENCE_NUMBER,
-    TRACKING, TRACKING_SNAPSHOT_ID, TRACKING_STATUS,
+    CONTENT_TYPE, ContentTreeNodeEntry, DataContentType, DataFileFormat, FILE_FORMAT,
+    FILE_SEQUENCE_NUMBER, FILE_SIZE_IN_BYTES, FIRST_ROW_ID, LOCATION, PARTITION_SPEC_ID,
+    RECORD_COUNT, SEQUENCE_NUMBER, TRACKING, TRACKING_SNAPSHOT_ID, TRACKING_STATUS, TrackingInfo,
+    TrackingStatus, struct_expr_from_schema,
 };
 use crate::engine_data::{EngineData, GetData, RowVisitor, TypedGetData as _};
-use crate::expressions::{lit, ColumnName, Expression};
+use crate::expressions::{ColumnName, Expression, lit};
 use crate::scan::log_replay::{
     BASE_ROW_ID_NAME, DEFAULT_ROW_COMMIT_VERSION_NAME, PATH_NAME, SIZE_NAME, STATS_NAME,
 };
@@ -25,9 +25,6 @@ use crate::schema::{
 };
 use crate::transaction::augmented_write_metadata_schema;
 use crate::{Engine, KernelError, KernelResult};
-
-/// The Iceberg format version stamped onto each written entry: 4 (the V4 adaptive metadata tree).
-const AMT_FORMAT_VERSION: i32 = 4;
 
 /// Dotted path of the `stats.numRecords` leaf column, used for column selection and error messages.
 const STATS_NUM_RECORDS: &str = "stats.numRecords";
@@ -49,7 +46,7 @@ fn write_metadata_input_schema() -> KernelResult<SchemaRef> {
         _ => {
             return Err(KernelError::generic(
                 "add-file write-metadata schema is missing the `stats` struct",
-            ))
+            ));
         }
     };
     let narrowed = SchemaStructPatchBuilder::new()
@@ -83,9 +80,9 @@ static REQUIRED_NON_NULL_COLUMNS: LazyLock<ColumnNamesAndTypes> = LazyLock::new(
 /// (one `Data` entry per input row), suitable for serializing as an AMT root manifest.
 ///
 /// Each input row is a newly added file, producing an [`TrackingStatus::Added`] `Data` entry
-/// (`fileFormat` parquet, `formatVersion` 4, `specId` 0 -- unpartitioned tables only). Both
-/// `sequenceNumber` and `fileSequenceNumber` take the input `defaultRowCommitVersion`; remaining
-/// entry fields are null, and statistics and partition values are omitted from the output schema.
+/// (`fileFormat` parquet, `specId` 0 -- unpartitioned tables only). Both `sequenceNumber` and
+/// `fileSequenceNumber` take the input `defaultRowCommitVersion`; remaining entry fields are null,
+/// and statistics and partition values are omitted from the output schema.
 ///
 /// This path is only valid for AMT tables, which always have row tracking enabled, so every input
 /// row carries an assigned `baseRowId` and `defaultRowCommitVersion`.
@@ -217,7 +214,6 @@ fn build_content_tree_entry_expression(
         PARTITION_SPEC_ID => Some(lit(0i32)),
         RECORD_COUNT => Some(projections.record_count.clone()),
         FILE_SIZE_IN_BYTES => Some(projections.file_size_in_bytes.clone()),
-        FORMAT_VERSION => Some(lit(AMT_FORMAT_VERSION)),
         _ => None,
     })
 }
@@ -240,11 +236,11 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
+    use crate::Engine;
     use crate::engine::arrow_conversion::TryIntoArrow as _;
     use crate::engine::arrow_data::EngineDataArrowExt as _;
     use crate::engine::sync::SyncEngine;
     use crate::expressions::{Scalar, StructData};
-    use crate::Engine;
 
     /// A row of write-metadata input, where any field may be null (to exercise null rejection).
     #[derive(Clone, Copy)]
@@ -373,7 +369,7 @@ mod tests {
             tracking: TrackingInfo {
                 status: TrackingStatus::Added,
                 snapshot_id: Some(snapshot_id),
-                dv_snapshot_id: None,
+                modified_snapshot_id: None,
                 sequence_number: Some(commit_version),
                 file_sequence_number: Some(commit_version),
                 first_row_id: Some(base_row_id),
@@ -387,11 +383,11 @@ mod tests {
             record_count: num_records,
             file_size_in_bytes: size,
             content_stats: None,
+            tight_stats: None,
             manifest_info: None,
             key_metadata: None,
             split_offsets: None,
-            equality_ids: None,
-            format_version: AMT_FORMAT_VERSION,
+            column_files: None,
             tags: None,
         }
     }

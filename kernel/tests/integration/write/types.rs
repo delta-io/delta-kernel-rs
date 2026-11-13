@@ -1,30 +1,34 @@
 //! Integration tests for type-specific writes (timestampNtz, variant, shredded variant).
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 #[cfg(feature = "nanosecond-timestamps")]
 use delta_kernel::arrow::array::TimestampNanosecondArray;
 use delta_kernel::arrow::array::{
-    new_null_array, ArrayRef, BinaryArray, Int32Array, StructArray, TimestampMicrosecondArray,
+    Array, ArrayRef, BinaryArray, Int32Array, Int32Builder, ListArray, ListBuilder, StringArray,
+    StringBuilder, StructArray, TimestampMicrosecondArray, new_null_array,
 };
-use delta_kernel::arrow::buffer::NullBuffer;
-use delta_kernel::arrow::datatypes::{DataType as ArrowDataType, Field};
+use delta_kernel::arrow::buffer::{NullBuffer, OffsetBuffer};
+use delta_kernel::arrow::compute::cast;
+use delta_kernel::arrow::datatypes::{DataType as ArrowDataType, Field, FieldRef};
 use delta_kernel::arrow::record_batch::RecordBatch;
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_conversion::{TryFromKernel, TryIntoArrow as _};
 use delta_kernel::engine::arrow_data::ArrowEngineData;
-use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::ObjectStoreExt as _;
-use delta_kernel::schema::{schema_ref, DataType, SchemaRef, StructField, StructType};
-use delta_kernel::transaction::create_table::create_table as kernel_create_table;
+use delta_kernel::object_store::path::Path;
+use delta_kernel::schema::{DataType, SchemaRef, StructField, StructType, schema_ref};
 use delta_kernel::transaction::UpdateTableOperation;
+use delta_kernel::transaction::create_table::create_table as kernel_create_table;
 use delta_kernel::{KernelError, Snapshot};
 use itertools::Itertools;
 use rstest::rstest;
 use serde_json::Deserializer;
 use tempfile::tempdir;
 use test_utils::{
-    create_add_files_metadata, create_table, engine_store_setup, test_read, test_table_setup,
+    create_add_files_metadata, create_table, create_table_and_load_snapshot, engine_store_setup,
+    test_read, test_table_setup, write_batch_to_table,
 };
 use url::Url;
 
@@ -173,13 +177,15 @@ async fn test_append_timestamp(
     // Check that the add action exists
     assert!(parsed_commits[1].get("add").is_some());
     // Ensure the supplied data-change intent is used.
-    assert!(parsed_commits[1]
-        .get("add")
-        .unwrap()
-        .get("dataChange")
-        .unwrap()
-        .as_bool()
-        .unwrap());
+    assert!(
+        parsed_commits[1]
+            .get("add")
+            .unwrap()
+            .get("dataChange")
+            .unwrap()
+            .as_bool()
+            .unwrap()
+    );
 
     let stats: serde_json::Value =
         serde_json::from_str(parsed_commits[1]["add"]["stats"].as_str().unwrap())?;
@@ -193,8 +199,8 @@ async fn test_append_timestamp(
 }
 
 #[tokio::test]
-async fn test_append_timestamp_stats_are_millisecond_truncated(
-) -> Result<(), Box<dyn std::error::Error>> {
+async fn test_append_timestamp_stats_are_millisecond_truncated()
+-> Result<(), Box<dyn std::error::Error>> {
     let _ = tracing_subscriber::fmt::try_init();
 
     let schema = schema_ref! { nullable "ts": TIMESTAMP };
@@ -691,6 +697,89 @@ async fn test_not_null_data_column_rejects_null_in_batch(
     Ok(())
 }
 
+/// Writes columns of each Arrow list type (a list of strings, a list of structs, and a list inside
+/// a struct) through the logical-to-physical transform and reads them back. The batch is sliced so
+/// every list's first offset is non-zero.
+#[rstest]
+#[tokio::test]
+async fn test_write_columns_of_each_arrow_list_type(
+    #[values(
+        ArrowDataType::List,
+        ArrowDataType::LargeList,
+        ArrowDataType::ListView,
+        ArrowDataType::LargeListView
+    )]
+    list_type: fn(FieldRef) -> ArrowDataType,
+    #[values("none", "id", "name")] column_mapping_mode: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let schema = schema_ref! {
+        nullable "tags": [ nullable STRING ],
+        nullable "items": [ nullable { nullable "label": STRING } ],
+        nullable "meta": { nullable "ids": [ nullable INTEGER ] },
+    };
+    let (_tmp_dir, table_path, engine) = test_table_setup()?;
+    let snapshot = create_table_and_load_snapshot(
+        &table_path,
+        schema,
+        engine.as_ref(),
+        &[("delta.columnMapping.mode", column_mapping_mode)],
+    )?;
+
+    let as_list_type = |list: ArrayRef| -> ArrayRef {
+        let ArrowDataType::List(element) = list.data_type() else {
+            panic!("expected a List, got {}", list.data_type());
+        };
+        cast(&list, &list_type(element.clone())).unwrap()
+    };
+    let mut tags = ListBuilder::new(StringBuilder::new());
+    tags.extend([
+        Some(vec![Some("dropped")]),
+        Some(vec![Some("a"), None]),
+        None,
+        Some(vec![]),
+    ]);
+    let tags = as_list_type(Arc::new(tags.finish()));
+    let labels: ArrayRef = Arc::new(StringArray::from(vec![
+        Some("dropped"),
+        Some("x"),
+        None,
+        Some("z"),
+    ]));
+    let item_values = StructArray::from(vec![(
+        Arc::new(Field::new("label", ArrowDataType::Utf8, true)),
+        labels,
+    )]);
+    let items = as_list_type(Arc::new(ListArray::new(
+        Arc::new(Field::new_list_field(item_values.data_type().clone(), true)),
+        OffsetBuffer::from_lengths([1, 2, 0, 1]),
+        Arc::new(item_values),
+        Some(NullBuffer::from(vec![true, true, false, true])),
+    )));
+    let mut ids = ListBuilder::new(Int32Builder::new());
+    ids.extend([
+        Some(vec![Some(0)]),
+        Some(vec![Some(1), Some(2)]),
+        None,
+        Some(vec![]),
+    ]);
+    let ids = as_list_type(Arc::new(ids.finish()));
+    let meta = StructArray::from(vec![(
+        Arc::new(Field::new("ids", ids.data_type().clone(), true)),
+        ids,
+    )]);
+    let data = RecordBatch::try_from_iter([
+        ("tags", tags),
+        ("items", items),
+        ("meta", Arc::new(meta) as ArrayRef),
+    ])?
+    .slice(1, 3);
+
+    write_batch_to_table(&snapshot, engine.as_ref(), data.clone(), HashMap::new()).await?;
+
+    test_read(&ArrowEngineData::new(data), snapshot.table_root(), engine)?;
+    Ok(())
+}
+
 // === Void type write-time validation tests ===
 
 /// Helper to create a table with a given schema and attempt a commit with dummy add_files.
@@ -925,8 +1014,8 @@ async fn metadata_only_commit_with_void_in_array_succeeds() -> Result<(), Box<dy
 // Schema: {id: int, s: struct<a: int, b: void>}
 // Physical: {id: int, s: struct<a: int>}
 #[tokio::test]
-async fn write_context_excludes_nested_void_from_physical_schema(
-) -> Result<(), Box<dyn std::error::Error>> {
+async fn write_context_excludes_nested_void_from_physical_schema()
+-> Result<(), Box<dyn std::error::Error>> {
     let schema = schema_ref! {
         nullable "id": INTEGER,
         nullable "s": {

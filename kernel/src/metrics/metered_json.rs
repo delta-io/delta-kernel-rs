@@ -5,8 +5,8 @@
 
 use std::sync::Arc;
 
-use crate::metrics::events::emit_json_read_completed;
 use crate::metrics::PrecountedMetricsIterator;
+use crate::metrics::events::emit_json_read_completed;
 use crate::schema::SchemaRef;
 use crate::{
     CancellationTokenRef, EngineData, FileDataReadResultIterator, FileMeta, FileSize,
@@ -94,7 +94,7 @@ impl JsonHandler for MeteredJsonHandler {
     fn write_json_file(
         &self,
         path: &url::Url,
-        data: KernelResultIterator<'_, FilteredEngineData>,
+        data: Box<dyn KernelResultIterator<FilteredEngineData> + '_>,
         overwrite: bool,
     ) -> KernelResult<FileSize> {
         self.inner.write_json_file(path, data, overwrite)
@@ -113,7 +113,7 @@ mod tests {
     use crate::engine::arrow_data::ArrowEngineData;
     use crate::metrics::MetricEvent;
     use crate::schema::schema_ref;
-    use crate::unit_test_utils::{install_thread_local_metrics_reporter, CapturingReporter};
+    use crate::unit_test_utils::{CapturingReporter, install_thread_local_metrics_reporter};
 
     #[derive(Debug, Default)]
     struct StubJsonHandler {
@@ -162,7 +162,7 @@ mod tests {
         fn write_json_file(
             &self,
             _path: &Url,
-            _data: KernelResultIterator<'_, FilteredEngineData>,
+            _data: Box<dyn KernelResultIterator<FilteredEngineData> + '_>,
             _overwrite: bool,
         ) -> KernelResult<FileSize> {
             self.write_size.ok_or_else(|| {

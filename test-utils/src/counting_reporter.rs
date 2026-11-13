@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 use delta_kernel::metrics::{
-    CommitFailureReason, MetricEvent, MetricsReporter, SnapshotLoadType,
+    CommitFailureReason, LastCheckpointReadOutcome, MetricEvent, MetricsReporter, SnapshotLoadType,
     WithMetricsReporterLayer as _,
 };
 use tracing::subscriber::DefaultGuard;
@@ -220,6 +220,20 @@ pub struct CountingReporter {
     /// Total number of bytes read from CRC files, across all CRC read calls.
     pub crc_bytes_read: RelaxedCounter,
 
+    // _last_checkpoint reader counters
+    /// Number of `_last_checkpoint` read attempts.
+    pub last_checkpoint_reads: RelaxedCounter,
+    /// Number of hints parsed and retained.
+    pub last_checkpoint_read_successes: RelaxedCounter,
+    /// Number of read attempts where storage reported the hint absent.
+    pub last_checkpoint_read_not_found: RelaxedCounter,
+    /// Number of read attempts that produced an invalid hint.
+    pub last_checkpoint_read_invalid: RelaxedCounter,
+    /// Number of read attempts that returned another error.
+    pub last_checkpoint_read_errors: RelaxedCounter,
+    /// Number of read attempts with an unrecorded or unrecognized outcome.
+    pub last_checkpoint_read_unknown: RelaxedCounter,
+
     // Domain metadata load counters (Snapshot::get_domain_metadatas_internal)
     pub domain_metadata_loads: RelaxedCounter,
     pub domain_metadata_load_failures: RelaxedCounter,
@@ -282,6 +296,12 @@ impl CountingReporter {
         self.latest_crc_files_found.reset();
         self.crc_read_calls.reset();
         self.crc_bytes_read.reset();
+        self.last_checkpoint_reads.reset();
+        self.last_checkpoint_read_successes.reset();
+        self.last_checkpoint_read_not_found.reset();
+        self.last_checkpoint_read_invalid.reset();
+        self.last_checkpoint_read_errors.reset();
+        self.last_checkpoint_read_unknown.reset();
         self.domain_metadata_loads.reset();
         self.domain_metadata_load_failures.reset();
         self.domain_metadata_cache_hits.reset();
@@ -327,11 +347,15 @@ impl CountingReporter {
         let crc_files_found = self.latest_crc_files_found.get();
 
         println!("  [io] {label}");
-        println!("    storage : {list_calls} list ({list_files} files seen)  {storage_reads} raw read ({storage_files} files, {storage_kib} KiB)  {copy_calls} copy");
+        println!(
+            "    storage : {list_calls} list ({list_files} files seen)  {storage_reads} raw read ({storage_files} files, {storage_kib} KiB)  {copy_calls} copy"
+        );
         println!("    json    : {json_calls} call(s)  {json_files} files  {json_kib} KiB");
         println!("    parquet : {parquet_calls} call(s)  {parquet_files} files  {parquet_kib} KiB");
         println!("    crc     : {crc_calls} call(s)  {crc_kib} KiB");
-        println!("    log     : {log_loads} segment load(s) -- {commits} commits  {checkpoints} checkpoints  {compactions} compactions  {crc_files_found} latest_crc_files");
+        println!(
+            "    log     : {log_loads} segment load(s) -- {commits} commits  {checkpoints} checkpoints  {compactions} compactions  {crc_files_found} latest_crc_files"
+        );
     }
 }
 
@@ -375,6 +399,18 @@ impl MetricsReporter for CountingReporter {
             MetricEvent::CrcReadSuccess(e) => {
                 self.crc_read_calls.inc();
                 self.crc_bytes_read.add(e.bytes_read);
+            }
+            MetricEvent::LastCheckpointReadCompleted(e) => {
+                self.last_checkpoint_reads.inc();
+                match e.outcome {
+                    LastCheckpointReadOutcome::Success => self.last_checkpoint_read_successes.inc(),
+                    LastCheckpointReadOutcome::NotFound => {
+                        self.last_checkpoint_read_not_found.inc()
+                    }
+                    LastCheckpointReadOutcome::Invalid => self.last_checkpoint_read_invalid.inc(),
+                    LastCheckpointReadOutcome::Error => self.last_checkpoint_read_errors.inc(),
+                    LastCheckpointReadOutcome::Unknown => self.last_checkpoint_read_unknown.inc(),
+                }
             }
             MetricEvent::DomainMetadataLoadSuccess(e) => {
                 self.domain_metadata_loads.inc();
@@ -420,6 +456,10 @@ impl MetricsReporter for CountingReporter {
             | MetricEvent::ProtocolMetadataLoadFailure(_)
             | MetricEvent::LogSegmentLoadFailure(_)
             | MetricEvent::CrcReadFailure
+            | MetricEvent::CheckpointWriteSuccess(_)
+            | MetricEvent::CheckpointWriteFailure(_)
+            | MetricEvent::ChecksumWriteSuccess(_)
+            | MetricEvent::ChecksumWriteFailure(_)
             | MetricEvent::ScanMetadataCompleted(_) => {}
         }
     }
@@ -463,6 +503,55 @@ mod tests {
 
     fn dur() -> Duration {
         Duration::from_millis(1)
+    }
+
+    #[rstest]
+    #[case(LastCheckpointReadOutcome::Success)]
+    #[case(LastCheckpointReadOutcome::NotFound)]
+    #[case(LastCheckpointReadOutcome::Invalid)]
+    #[case(LastCheckpointReadOutcome::Error)]
+    #[case(LastCheckpointReadOutcome::Unknown)]
+    fn last_checkpoint_read_counts_one_attempt_and_outcome_then_resets(
+        #[case] outcome: LastCheckpointReadOutcome,
+    ) {
+        let reporter = CountingReporter::new();
+        reporter.report(MetricEvent::LastCheckpointReadCompleted(
+            delta_kernel::metrics::LastCheckpointReadCompleted {
+                outcome,
+                duration: dur(),
+            },
+        ));
+        assert_eq!(reporter.last_checkpoint_reads.get(), 1);
+        let counters = [
+            (
+                &reporter.last_checkpoint_read_successes,
+                LastCheckpointReadOutcome::Success,
+            ),
+            (
+                &reporter.last_checkpoint_read_not_found,
+                LastCheckpointReadOutcome::NotFound,
+            ),
+            (
+                &reporter.last_checkpoint_read_invalid,
+                LastCheckpointReadOutcome::Invalid,
+            ),
+            (
+                &reporter.last_checkpoint_read_errors,
+                LastCheckpointReadOutcome::Error,
+            ),
+            (
+                &reporter.last_checkpoint_read_unknown,
+                LastCheckpointReadOutcome::Unknown,
+            ),
+        ];
+        for (counter, expected) in counters {
+            assert_eq!(counter.get(), u64::from(outcome == expected));
+        }
+        reporter.reset();
+        assert_eq!(reporter.last_checkpoint_reads.get(), 0);
+        for (counter, _) in counters {
+            assert_eq!(counter.get(), 0);
+        }
     }
 
     #[test]

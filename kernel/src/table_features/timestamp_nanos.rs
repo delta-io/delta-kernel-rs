@@ -3,7 +3,7 @@
 use super::TableFeature;
 use crate::schema::{PrimitiveType, Schema};
 use crate::table_configuration::TableConfiguration;
-use crate::transforms::{transform_output_type, SchemaTransform};
+use crate::transforms::{SchemaTransform, transform_output_type};
 use crate::utils::require;
 use crate::{KernelError, KernelResult};
 
@@ -51,7 +51,7 @@ mod tests {
     use rstest::rstest;
 
     use crate::actions::Protocol;
-    use crate::schema::{schema, DataType};
+    use crate::schema::{DataType, schema};
     use crate::table_features::TableFeature;
     use crate::unit_test_utils::assert_schema_feature_validation;
 

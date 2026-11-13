@@ -80,8 +80,7 @@ pub use ir::plan::Plan;
 pub use ir::{IoOperation, Operation};
 
 use crate::{
-    AsAny, EngineData, FileMeta, KernelError, KernelResult, KernelResultIteratorStatic,
-    ParquetFooter,
+    AsAny, EngineData, FileMeta, KernelError, KernelResult, KernelResultIterator, ParquetFooter,
 };
 
 /// Provides the ability to execute declarative plans to the Delta Kernel.
@@ -127,11 +126,11 @@ pub trait ScopedPlanExecutor: PlanExecutor {
 /// Each variant describes a different shape of output that a plan can possibly produce.
 pub enum PlanResult {
     /// A stream of columnar data batches (as [`EngineData`]) produced by the plan.
-    Data(KernelResultIteratorStatic<Box<dyn EngineData>>),
+    Data(Box<dyn KernelResultIterator<Box<dyn EngineData>>>),
     /// A stream of file metadata entries.
-    FileMeta(KernelResultIteratorStatic<FileMeta>),
+    FileMeta(Box<dyn KernelResultIterator<FileMeta>>),
     /// A stream of raw byte buffers.
-    Bytes(KernelResultIteratorStatic<Bytes>),
+    Bytes(Box<dyn KernelResultIterator<Bytes>>),
     /// Metadata extracted from a Parquet file footer.
     ParquetFooter(ParquetFooter),
     /// Represents the successful completion of a plan, but with no return value.
@@ -141,7 +140,7 @@ pub enum PlanResult {
 impl PlanResult {
     /// Consumes the PlanResult and extracts the inner iterator of EngineData (assuming that it is a
     /// PlanResult::Data variant). Returns an error if the PlanResult is not the expected variant.
-    pub fn into_data(self) -> KernelResult<KernelResultIteratorStatic<Box<dyn EngineData>>> {
+    pub fn into_data(self) -> KernelResult<Box<dyn KernelResultIterator<Box<dyn EngineData>>>> {
         match self {
             Self::Data(iter) => Ok(iter),
             other => Err(other.type_mismatch("Data")),
@@ -151,7 +150,7 @@ impl PlanResult {
     /// Consumes the PlanResult and extracts the inner iterator of FileMeta (assuming that it is a
     /// PlanResult::FileMeta variant). Returns an error if the PlanResult is not the expected
     /// variant.
-    pub fn into_file_meta(self) -> KernelResult<KernelResultIteratorStatic<FileMeta>> {
+    pub fn into_file_meta(self) -> KernelResult<Box<dyn KernelResultIterator<FileMeta>>> {
         match self {
             Self::FileMeta(iter) => Ok(iter),
             other => Err(other.type_mismatch("FileMeta")),
@@ -161,7 +160,7 @@ impl PlanResult {
     /// Consumes the PlanResult and extracts the inner iterator of Bytes (assuming that it is a
     /// PlanResult::Bytes variant). Returns an error if the PlanResult is not a PlanResult::Bytes
     /// variant.
-    pub fn into_bytes(self) -> KernelResult<KernelResultIteratorStatic<Bytes>> {
+    pub fn into_bytes(self) -> KernelResult<Box<dyn KernelResultIterator<Bytes>>> {
         match self {
             Self::Bytes(iter) => Ok(iter),
             other => Err(other.type_mismatch("Bytes")),

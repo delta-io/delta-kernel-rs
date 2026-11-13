@@ -18,7 +18,7 @@ use std::sync::Arc;
 
 use delta_kernel_derive::internal_api;
 use derive_more::Constructor;
-use tracing::{debug, warn};
+use tracing::{trace, warn};
 use url::Url;
 
 use crate::engine_data::GetData;
@@ -130,13 +130,13 @@ impl Deduplicator for FileActionDeduplicator<'_> {
         // https://github.com/delta-io/delta/blob/master/spark/src/test/resources/delta/table-with-dv-large/_delta_log/00000000000000000001.json
 
         if self.seen_file_keys.contains(&key) {
-            debug!(
+            trace!(
                 "Ignoring duplicate ({}, {:?}) in scan, is log {}",
                 key.path, key.dv_unique_id, self.is_log_batch
             );
             true
         } else {
-            debug!(
+            trace!(
                 "Including ({}, {:?}) in scan, is log {}",
                 key.path, key.dv_unique_id, self.is_log_batch
             );
@@ -281,10 +281,10 @@ mod tests {
 
     use super::deduplicator::CheckpointDeduplicator;
     use super::*;
+    use crate::KernelResult;
     use crate::engine_data::GetData;
     #[cfg(feature = "adaptive-metadata-in-dev")]
     use crate::unit_test_utils::assert_result_error_with_message;
-    use crate::KernelResult;
 
     /// Mock GetData implementation for testing
     struct MockGetData {
@@ -564,14 +564,18 @@ mod tests {
         let getters = create_getters_with_mocks(None, Some(&mock_remove));
 
         // With skip_removes=true, should return None
-        assert!(deduplicator
-            .extract_file_action(0, &getters, true)?
-            .is_none());
+        assert!(
+            deduplicator
+                .extract_file_action(0, &getters, true)?
+                .is_none()
+        );
 
         // With skip_removes=false, should return Some
-        assert!(deduplicator
-            .extract_file_action(0, &getters, false)?
-            .is_some());
+        assert!(
+            deduplicator
+                .extract_file_action(0, &getters, false)?
+                .is_some()
+        );
 
         Ok(())
     }
@@ -582,9 +586,11 @@ mod tests {
         let deduplicator = create_deduplicator(&mut seen, true);
 
         let getters = create_getters_with_mocks(None, None);
-        assert!(deduplicator
-            .extract_file_action(0, &getters, false)?
-            .is_none());
+        assert!(
+            deduplicator
+                .extract_file_action(0, &getters, false)?
+                .is_none()
+        );
 
         Ok(())
     }

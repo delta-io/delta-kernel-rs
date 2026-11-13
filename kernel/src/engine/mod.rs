@@ -3,6 +3,8 @@
 //! The default Arrow/Tokio engine lives in the separate `delta_kernel_default_engine` crate.
 //! `SyncEngine` is included only in test builds.
 
+mod cancellable_engine;
+pub(crate) use cancellable_engine::CancellableEngine;
 #[cfg(feature = "arrow-expression")]
 use delta_kernel_derive::internal_api;
 
@@ -31,16 +33,42 @@ pub(crate) fn writer_options() -> ArrowWriterOptions {
     ArrowWriterOptions::new().with_skip_arrow_metadata(true)
 }
 
+/// Returns the [`ArrowWriterOptions`] for writing batches of `arrow_schema` as a data file with
+/// `physical_kernel_schema`: the [`writer_options`], with each `file` column written as a group
+/// annotated with the Parquet `FILE` logical type whose sub-fields carry the field ids the column
+/// reserves. Fails if `physical_kernel_schema` has a `file` column and the `arrow-60` feature is
+/// not enabled, if a `file` column is missing from `arrow_schema`, or if its sub-field ids
+/// overflow.
+// Converting Parquet errors into `KernelError` needs `default-engine-base`.
+#[cfg(all(feature = "arrow-expression", feature = "default-engine-base"))]
+#[internal_api]
+pub(crate) fn data_file_writer_options(
+    arrow_schema: &crate::arrow::datatypes::Schema,
+    physical_kernel_schema: &crate::schema::StructType,
+) -> crate::KernelResult<ArrowWriterOptions> {
+    parquet_file_type::with_file_columns(writer_options(), arrow_schema, physical_kernel_schema)
+}
+
+#[cfg(all(feature = "arrow-expression", feature = "default-engine-base"))]
+mod parquet_file_type;
+#[cfg(all(
+    feature = "arrow-expression",
+    feature = "default-engine-base",
+    feature = "arrow-60",
+    feature = "test-utils"
+))]
+pub use parquet_file_type::{FileGroup, file_groups};
+
 #[cfg(feature = "arrow-conversion")]
 pub mod arrow_conversion;
 
 #[cfg(all(feature = "arrow-expression", feature = "default-engine-base"))]
 pub mod arrow_expression;
-#[cfg(all(feature = "arrow-expression", feature = "internal-api"))]
+#[cfg(all(feature = "default-engine-base", feature = "internal-api"))]
 pub mod arrow_utils;
-#[cfg(all(feature = "arrow-expression", not(feature = "internal-api")))]
+#[cfg(all(feature = "default-engine-base", not(feature = "internal-api")))]
 pub(crate) mod arrow_utils;
-#[cfg(all(feature = "internal-api", feature = "arrow-expression"))]
+#[cfg(all(feature = "default-engine-base", feature = "internal-api"))]
 pub use self::arrow_utils::{parse_json, to_json_bytes};
 
 // The plan executor support modules read Arrow data (`arrow_utils`, `arrow_data`), so they
@@ -48,11 +76,21 @@ pub use self::arrow_utils::{parse_json, to_json_bytes};
 #[cfg(all(feature = "declarative-plans", feature = "default-engine-base"))]
 pub mod plans;
 
-#[cfg(test)]
-pub(crate) mod sync;
+#[cfg(any(
+    test,
+    all(
+        feature = "test-utils",
+        feature = "declarative-plans",
+        feature = "default-engine-base"
+    )
+))]
+pub mod sync;
 
-#[cfg(test)]
-pub(crate) mod test_delegating;
+#[cfg(any(test, feature = "test-utils"))]
+mod test_delegating;
+
+#[cfg(any(test, feature = "test-utils"))]
+pub use test_delegating::{DelegatingEngine, PanicEngine};
 
 #[cfg(feature = "default-engine-base")]
 pub mod arrow_data;

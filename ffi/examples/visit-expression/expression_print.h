@@ -310,6 +310,16 @@ void print_tree_helper(ExpressionItem ref, int depth) {
       print_expression_item_list(m2s->child_expr, depth + 1);
       break;
     }
+    case CaseWhen: {
+      struct CaseWhenExpr* case_when = ref.ref;
+      printf("CaseWhen\n");
+      for (size_t i = 0; i < case_when->conditions.len; i++) {
+        print_tree_helper(case_when->conditions.list[i], depth + 1);
+        print_tree_helper(case_when->results.list[i], depth + 1);
+      }
+      print_expression_item_list(case_when->else_expr, depth + 1);
+      break;
+    }
   }
 }
 

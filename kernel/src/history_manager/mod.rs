@@ -25,7 +25,7 @@ use std::num::NonZero;
 
 use error::{LogHistoryError, NearestTimestamp};
 use itertools::Itertools;
-use search::{binary_search_by_key_with_bounds, Bound, SearchError};
+use search::{Bound, SearchError, binary_search_by_key_with_bounds};
 use tracing::{info, trace, warn};
 use url::Url;
 
@@ -126,7 +126,7 @@ fn get_timestamp_search_bounds(
 
     let (ict_enablement_version, ict_timestamp) = match ict_enablement {
         InCommitTimestampEnablement::NotEnabled => {
-            return Ok(TimestampSearchBounds::FileModificationSearch)
+            return Ok(TimestampSearchBounds::FileModificationSearch);
         }
         InCommitTimestampEnablement::Enabled {
             enablement: Some((v, t)),
@@ -238,9 +238,7 @@ fn linear_search_file_mod_timestamps(
         if monotonic_ts != raw_ts {
             trace!(
                 version = commit.version,
-                raw_ts,
-                monotonic_ts,
-                "Adjusted non-monotonic timestamp"
+                raw_ts, monotonic_ts, "Adjusted non-monotonic timestamp"
             );
         }
 
@@ -252,7 +250,7 @@ fn linear_search_file_mod_timestamps(
             Bound::GreatestLower => break,
             // LeastUpper: return version upon first match
             Bound::LeastUpper if monotonic_ts >= timestamp => {
-                return Ok(CommitAt::new(commit.version, monotonic_ts))
+                return Ok(CommitAt::new(commit.version, monotonic_ts));
             }
             Bound::LeastUpper => {}
         }
@@ -322,24 +320,23 @@ fn binary_search_ict_timestamps(
         Err(SearchError::OutOfRange) => {
             // OutOfRange under `GreatestLower` means timestamp < commits[0]'s
             // ICT; under `LeastUpper` it means timestamp > commits.last()'s
-            // ICT. The boundary timestamp is read via `commit_to_ict`; on
-            // engine failure we degrade to `Unknown` so the original
-            // out-of-range error is preserved.
-            let nearest = bound
-                .boundary_of(commits)
-                .and_then(|boundary| {
-                    commit_to_ict(boundary)
-                        .inspect_err(|e| {
-                            warn!(
-                                error = ?e,
-                                version = boundary.version,
-                                "failed to read boundary ICT for nearest_timestamp hint",
-                            );
-                        })
-                        .ok()
-                        .map(|ts| NearestTimestamp::from_boundary(bound, ts))
-                })
-                .unwrap_or(NearestTimestamp::Unknown);
+            // ICT. Preserve cancellation from the boundary read; other failures
+            // degrade to `Unknown` so the original out-of-range error survives.
+            let nearest = match bound.boundary_of(commits) {
+                Some(boundary) => match commit_to_ict(boundary) {
+                    Ok(timestamp) => NearestTimestamp::from_boundary(bound, timestamp),
+                    Err(error) if error.is_cancelled() => return Err(error),
+                    Err(error) => {
+                        warn!(
+                            error = ?error,
+                            version = boundary.version,
+                            "failed to read boundary ICT for nearest_timestamp hint",
+                        );
+                        NearestTimestamp::Unknown
+                    }
+                },
+                None => NearestTimestamp::Unknown,
+            };
             Err(LogHistoryError::out_of_range(timestamp, bound, nearest))
         }
     }
@@ -388,6 +385,7 @@ pub(crate) fn timestamp_to_version(
     // Short-circuit: compare against snapshot's timestamp to avoid log segment rebuild.
     // This optimization mirrors Delta Spark and Java Kernel behavior.
     let snap_ts = snapshot
+        .reader()
         .get_timestamp(engine)
         .map_err(|e| LogHistoryError::internal("failed to get snapshot timestamp", e))?;
     match (timestamp.cmp(&snap_ts), bound) {
@@ -395,7 +393,7 @@ pub(crate) fn timestamp_to_version(
         (Ordering::Equal, _) => return Ok(CommitAt::new(snapshot.version(), snap_ts)),
         // Timestamp after snapshot: for GreatestLower, snapshot is the answer
         (Ordering::Greater, Bound::GreatestLower) => {
-            return Ok(CommitAt::new(snapshot.version(), snap_ts))
+            return Ok(CommitAt::new(snapshot.version(), snap_ts));
         }
         // Timestamp after snapshot: for LeastUpper, no version exists
         (Ordering::Greater, Bound::LeastUpper) => {
@@ -718,29 +716,24 @@ fn get_earliest_published_commit_version(
     log_root: &Url,
     earliest_ratified_commit_version: Option<Version>,
 ) -> KernelResult<Version> {
-    // TODO(#3188): thread a cancellation token through the history-manager entry points.
-    list_delta_log_from_storage(
-        engine.storage_handler().as_ref(),
-        log_root,
-        0,
-        Version::MAX,
-        None,
-    )?
-    .filter_ok(|f| f.file_type == LogPathFileType::Commit)
-    .next()
-    .transpose()?
-    .map(|f| f.version)
-    .ok_or_else(|| {
-        if earliest_ratified_commit_version == Some(0) {
-            return DeltaError::generic(format!(
-                "expected a published v0 commit for catalog-managed table {log_root}, \
+    // Listing inherits any token bound to the engine's storage handler.
+    // TODO(#3188): accept cancellation tokens on the history-manager entry points.
+    list_delta_log_from_storage(engine.storage_handler().as_ref(), log_root, 0, Version::MAX)?
+        .filter_ok(|f| f.file_type == LogPathFileType::Commit)
+        .next()
+        .transpose()?
+        .map(|f| f.version)
+        .ok_or_else(|| {
+            if earliest_ratified_commit_version == Some(0) {
+                return DeltaError::generic(format!(
+                    "expected a published v0 commit for catalog-managed table {log_root}, \
                        but the log listing returned no commits"
-            ));
-        }
-        DeltaError::from(LogHistoryError::NoCommitsFound {
-            log_root: log_root.clone(),
+                ));
+            }
+            DeltaError::from(LogHistoryError::NoCommitsFound {
+                log_root: log_root.clone(),
+            })
         })
-    })
 }
 
 /// Returns the earliest table version that can be fully reconstructed, and from which we can replay
@@ -775,14 +768,10 @@ fn get_earliest_recreatable_commit(
     let mut multi_part_checkpoint_progress = HashMap::<(Version, u32), HashSet<u32>>::new();
     let mut earliest_commit_version: Option<Version> = None;
 
-    // TODO(#3188): thread a cancellation token through the history-manager entry points.
-    let listing = list_delta_log_from_storage(
-        engine.storage_handler().as_ref(),
-        log_root,
-        0,
-        Version::MAX,
-        None,
-    )?;
+    // Listing inherits any token bound to the engine's storage handler.
+    // TODO(#3188): accept cancellation tokens on the history-manager entry points.
+    let listing =
+        list_delta_log_from_storage(engine.storage_handler().as_ref(), log_root, 0, Version::MAX)?;
     for parsed_result in listing {
         let parsed_log_path = parsed_result?;
         if !should_process_log_file(&parsed_log_path) {
@@ -797,14 +786,14 @@ fn get_earliest_recreatable_commit(
                 let earliest_version =
                     *earliest_commit_version.get_or_insert(parsed_log_path.version);
 
-                if let Some(checkpoint_version) = last_complete_checkpoint {
-                    if checkpoint_version >= earliest_version {
-                        // Given the contiguity assumption of delta_log commits,
-                        // when a full checkpoint has contiguous commits starting before or at
-                        // checkpoint_version that table can be
-                        // recreated at checkpoint_version.
-                        return Ok(checkpoint_version);
-                    }
+                if let Some(checkpoint_version) = last_complete_checkpoint
+                    && checkpoint_version >= earliest_version
+                {
+                    // Given the contiguity assumption of delta_log commits,
+                    // when a full checkpoint has contiguous commits starting before or at
+                    // checkpoint_version that table can be
+                    // recreated at checkpoint_version.
+                    return Ok(checkpoint_version);
                 }
             }
             LogPathFileType::ClassicCheckpoint | LogPathFileType::UuidCheckpoint => {
@@ -908,9 +897,10 @@ pub fn get_earliest_commit(
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
-    use std::fs::{remove_file, OpenOptions};
+    use std::fs::{OpenOptions, remove_file};
     use std::ops::RangeInclusive;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
     use std::time::{Duration, SystemTime};
 
     use bytes::Bytes;
@@ -921,13 +911,17 @@ mod tests {
     use super::*;
     use crate::actions::{CommitInfo, Metadata, Protocol};
     use crate::engine::sync::SyncEngine;
+    use crate::engine::{CancellableEngine, DelegatingEngine};
     use crate::object_store::memory::InMemory;
-    use crate::schema::{schema_ref, SchemaRef};
+    use crate::schema::{SchemaRef, schema_ref};
     use crate::snapshot::{Snapshot, SnapshotBuilder};
     use crate::table_features::TableFeature;
-    use crate::unit_test_utils::{Action, LocalMockTable};
+    use crate::unit_test_utils::{Action, LocalMockTable, TestCancellationToken};
     use crate::utils::FoldWithOption as _;
-    use crate::Version;
+    use crate::{
+        EngineData, FileDataReadResultIterator, FileMeta, FileSize, FilteredEngineData,
+        JsonHandler, KernelError, KernelResultIterator, PredicateRef, Version,
+    };
 
     fn get_test_schema() -> SchemaRef {
         schema_ref! {
@@ -1964,7 +1958,9 @@ mod tests {
             (Ok(p), Ok(r)) => assert_eq!(p, r, "diverged at ts={timestamp} bound={bound:?}"),
             (Err(_), Err(_)) => {}
             (p, r) => {
-                panic!("Published and Recreatable diverged at ts={timestamp} bound={bound:?}: {p:?} vs {r:?}")
+                panic!(
+                    "Published and Recreatable diverged at ts={timestamp} bound={bound:?}: {p:?} vs {r:?}"
+                )
             }
         }
     }
@@ -2085,6 +2081,154 @@ mod tests {
         version_range
             .map(|v| delta_path_for_version(v, "json").to_string())
             .collect()
+    }
+
+    #[rstest::rstest]
+    fn earliest_commit_listing_inherits_engine_token(
+        #[values(HistoryCommitType::Published, HistoryCommitType::Recreatable)]
+        commit_type: HistoryCommitType,
+        #[values(false, true)] cancelled: bool,
+    ) {
+        let (engine, log_root) = engine_with_log_files(&commit_path(0..=1), &HashSet::new());
+        let token = Arc::new(TestCancellationToken::default());
+        if cancelled {
+            token.cancel();
+        }
+        let engine = CancellableEngine::new(&engine, token);
+        let result = get_earliest_commit(&engine, &log_root, None, commit_type);
+        if cancelled {
+            assert!(matches!(result, Err(KernelError::Cancelled)));
+        } else {
+            assert_eq!(result.unwrap(), 0);
+        }
+    }
+
+    #[rstest::rstest]
+    #[tokio::test]
+    async fn timestamp_lookup_preserves_cancellation(
+        #[values(HistoryCommitType::Published, HistoryCommitType::Recreatable)]
+        commit_type: HistoryCommitType,
+        #[values(Bound::GreatestLower, Bound::LeastUpper)] bound: Bound,
+        #[values(false, true)] cancelled: bool,
+    ) {
+        let table = mock_table_with_timestamps(&[(100, None), (200, None)], None).await;
+        let original = SyncEngine::new();
+        let path = Url::from_directory_path(table.table_root()).unwrap();
+        let snapshot = Snapshot::builder_for(path).build(&original).unwrap();
+        let token = Arc::new(TestCancellationToken::default());
+        if cancelled {
+            token.cancel();
+        }
+        let engine = CancellableEngine::new(&original, token);
+        let result = match bound {
+            Bound::GreatestLower => latest_version_as_of(&snapshot, &engine, 150, commit_type),
+            Bound::LeastUpper => first_version_after(&snapshot, &engine, 150, commit_type),
+        };
+        if cancelled {
+            assert!(matches!(result, Err(KernelError::Cancelled)), "{result:?}");
+        } else {
+            let expected = match bound {
+                Bound::GreatestLower => CommitAt::new(0, 100),
+                Bound::LeastUpper => CommitAt::new(1, 200),
+            };
+            assert_eq!(result.unwrap(), expected);
+        }
+    }
+
+    /// Injects a failure when the boundary hint rereads its commit file.
+    struct FailRepeatedJson {
+        /// Handler that performs reads before the injected failure.
+        inner: Arc<dyn JsonHandler>,
+        /// Commit file reread for the out-of-range boundary hint.
+        target: Url,
+        /// Number of reads that included `target`.
+        target_reads: AtomicUsize,
+        /// Selects cancellation or an ordinary read failure for the repeated read.
+        cancelled: bool,
+    }
+
+    impl JsonHandler for FailRepeatedJson {
+        fn parse_json(
+            &self,
+            json_strings: Box<dyn EngineData>,
+            output_schema: SchemaRef,
+        ) -> KernelResult<Box<dyn EngineData>> {
+            self.inner.parse_json(json_strings, output_schema)
+        }
+
+        fn read_json_files(
+            &self,
+            files: &[FileMeta],
+            physical_schema: SchemaRef,
+            predicate: Option<PredicateRef>,
+        ) -> KernelResult<FileDataReadResultIterator> {
+            if files.iter().any(|file| file.location == self.target)
+                && self.target_reads.fetch_add(1, AtomicOrdering::SeqCst) > 0
+            {
+                return Err(if self.cancelled {
+                    KernelError::Cancelled
+                } else {
+                    KernelError::generic("boundary read failed")
+                });
+            }
+            self.inner
+                .read_json_files(files, physical_schema, predicate)
+        }
+
+        fn write_json_file(
+            &self,
+            path: &Url,
+            data: Box<dyn KernelResultIterator<FilteredEngineData> + '_>,
+            overwrite: bool,
+        ) -> KernelResult<FileSize> {
+            self.inner.write_json_file(path, data, overwrite)
+        }
+    }
+
+    #[rstest::rstest]
+    #[case(Bound::GreatestLower, 50)]
+    #[case(Bound::LeastUpper, 350)]
+    #[tokio::test]
+    async fn ict_boundary_lookup_preserves_cancellation(
+        #[case] bound: Bound,
+        #[case] timestamp: Timestamp,
+        #[values(false, true)] cancelled: bool,
+    ) {
+        let (_table, engine, _snapshot, log_segment) = build_test_snapshot(
+            &[(0, Some(100)), (0, Some(200)), (0, Some(300))],
+            Some(0),
+            None,
+        )
+        .await;
+        let commits = &log_segment.listed.ascending_commit_files;
+        let json = Arc::new(FailRepeatedJson {
+            inner: engine.json_handler(),
+            target: bound
+                .boundary_of(commits)
+                .unwrap()
+                .location
+                .location
+                .clone(),
+            target_reads: AtomicUsize::new(0),
+            cancelled,
+        });
+        let engine = DelegatingEngine::new(Arc::new(engine)).with_json_handler(json.clone());
+        let result = binary_search_ict_timestamps(commits, timestamp, bound, &engine);
+        assert_eq!(json.target_reads.load(AtomicOrdering::SeqCst), 2);
+        if cancelled {
+            assert!(matches!(
+                result.map_err(KernelError::from),
+                Err(KernelError::Cancelled)
+            ));
+        } else {
+            assert!(matches!(
+                result,
+                Err(LogHistoryError::TimestampOutOfRange {
+                    nearest_timestamp: NearestTimestamp::Unknown,
+                    ..
+                })
+            ));
+        }
     }
 
     fn single_part_checkpoint_path(v: Version) -> String {

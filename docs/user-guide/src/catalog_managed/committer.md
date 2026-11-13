@@ -18,7 +18,7 @@ pub trait Committer: Send {
     fn commit(
         &self,
         engine: &dyn Engine,
-        actions: KernelResultIterator<'_, FilteredEngineData>,
+        actions: Box<dyn KernelResultIterator<FilteredEngineData> + '_>,
         commit_metadata: CommitMetadata,
     ) -> KernelResult<CommitResponse>;
 
@@ -118,11 +118,11 @@ Write the actions to a staged commit file in `_staged_commits/`:
 fn commit(
     &self,
     engine: &dyn Engine,
-    actions: KernelResultIterator<'_, FilteredEngineData>,
+    actions: Box<dyn KernelResultIterator<FilteredEngineData> + '_>,
     commit_metadata: CommitMetadata,
 ) -> KernelResult<CommitResponse> {
     // Write actions to _staged_commits/<version>.<uuid>.json. `actions` is
-    // already a Box<dyn Iterator<...>>, so pass it directly (do not re-box).
+    // already a Box<dyn KernelResultIterator<...>>, so pass it directly (do not re-box).
     let staged_path = commit_metadata.staged_commit_path()?;
     let written_size = engine
         .json_handler()
@@ -230,7 +230,7 @@ impl Committer for MyCatalogCommitter {
     fn commit(
         &self,
         engine: &dyn Engine,
-        actions: KernelResultIterator<'_, FilteredEngineData>,
+        actions: Box<dyn KernelResultIterator<FilteredEngineData> + '_>,
         commit_metadata: CommitMetadata,
     ) -> KernelResult<CommitResponse> {
         // 1. Stage: write actions to _staged_commits/

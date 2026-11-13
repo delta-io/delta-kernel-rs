@@ -11,10 +11,11 @@ use delta_kernel::arrow::datatypes::{DataType, Field, Schema};
 use delta_kernel::engine::arrow_conversion::{TryFromArrow as _, TryIntoArrow as _};
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::engine::arrow_utils::{
-    fixup_parquet_read, ordering_needs_row_indexes, parquet_read_plan, RowIndexBuilder,
+    RowIndexBuilder, fixup_parquet_read, ordering_needs_row_indexes, parquet_read_plan,
+    validate_file_values_for_write,
 };
 use delta_kernel::engine::parquet_row_group_skipping::ParquetRowGroupSkipping;
-use delta_kernel::engine::{reader_options, writer_options};
+use delta_kernel::engine::{data_file_writer_options, reader_options, writer_options};
 use delta_kernel::expressions::ColumnName;
 use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::{DynObjectStore, ObjectStoreExt as _};
@@ -32,17 +33,17 @@ use delta_kernel::schema::{SchemaRef, StructType};
 use delta_kernel::transaction::BoundWriteContext;
 use delta_kernel::{
     CancellationTokenRef, EngineData, FileDataReadResultIterator, FileMeta, FileSize,
-    FoldWithOption as _, KernelError, KernelResult, KernelResultIteratorStatic, ParquetFooter,
+    FoldWithOption as _, KernelError, KernelResult, KernelResultIterator, ParquetFooter,
     ParquetHandler, PredicateRef,
 };
 use futures::stream::{self, BoxStream};
 use futures::{StreamExt, TryStreamExt};
 use uuid::Uuid;
 
+use crate::UrlExt;
 use crate::executor::TaskExecutor;
 use crate::file_stream::{FileOpenFuture, FileOpener, FileStream};
 use crate::stats::collect_stats;
-use crate::UrlExt;
 
 #[derive(Debug)]
 pub struct DefaultParquetHandler<E: TaskExecutor> {
@@ -73,8 +74,8 @@ impl DataFileMetadata {
         &self.file_meta.location
     }
 
-    /// Converts this `DataFileMetadata` into an [`EngineData`] record batch matching the schema
-    /// returned by [`Transaction::add_files_schema`].
+    /// Converts this `DataFileMetadata` into an [`EngineData`] record batch matching the base
+    /// schema returned by [`Transaction::add_files_schema`].
     ///
     /// The `partition_values` map uses physical column names as keys and protocol-serialized
     /// strings as values. `None` represents a null partition value. The serialization layer
@@ -199,16 +200,15 @@ impl<E: TaskExecutor> DefaultParquetHandler<E> {
     ) -> KernelResult<DataFileMetadata> {
         let batch: Box<_> = ArrowEngineData::try_from_engine_data(data)?;
         let record_batch = batch.record_batch();
+        validate_file_values_for_write(record_batch, physical_schema)?;
 
         // Collect statistics before writing (includes numRecords)
         let stats = collect_stats(record_batch, stats_columns, physical_schema)?;
 
+        let options = data_file_writer_options(&record_batch.schema(), physical_schema)?;
         let mut buffer = vec![];
-        let mut writer = ArrowWriter::try_new_with_options(
-            &mut buffer,
-            record_batch.schema(),
-            writer_options(),
-        )?;
+        let mut writer =
+            ArrowWriter::try_new_with_options(&mut buffer, record_batch.schema(), options)?;
         writer.write(record_batch)?;
         writer.close()?; // writer must be closed to write footer
 
@@ -369,7 +369,7 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
     fn write_parquet_file(
         &self,
         location: url::Url,
-        mut data: KernelResultIteratorStatic<Box<dyn EngineData>>,
+        mut data: Box<dyn KernelResultIterator<Box<dyn EngineData>>>,
     ) -> KernelResult<FileSize> {
         let store = self.store.clone();
 
@@ -599,19 +599,22 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use bytes::Bytes;
+    use delta_kernel::EngineData;
     use delta_kernel::actions::{NUM_RECORDS, TIGHT_BOUNDS};
     #[cfg(feature = "nanosecond-timestamps")]
     use delta_kernel::arrow::array::TimestampNanosecondArray;
     use delta_kernel::arrow::array::{
-        Array, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float32Array, Float64Array,
-        Int16Array, Int32Array, Int64Array, Int8Array, RecordBatch, StringArray,
-        TimestampMicrosecondArray, TimestampMillisecondArray,
+        Array, AsArray, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float32Array,
+        Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, RecordBatch, StringArray,
+        TimestampMicrosecondArray,
     };
+    use delta_kernel::arrow::compute::cast;
     use delta_kernel::arrow::datatypes::{
-        DataType as ArrowDataType, Field, Schema as ArrowSchema, TimeUnit,
+        DataType as ArrowDataType, Field, Schema as ArrowSchema, TimeUnit, TimestampMicrosecondType,
     };
     use delta_kernel::engine::arrow_conversion::TryIntoKernel as _;
     use delta_kernel::engine::arrow_data::ArrowEngineData;
+    use delta_kernel::expressions::{Predicate, Scalar, expr};
     use delta_kernel::object_store::local::LocalFileSystem;
     use delta_kernel::object_store::memory::InMemory;
     use delta_kernel::object_store::{
@@ -620,9 +623,8 @@ mod tests {
     };
     use delta_kernel::parquet::arrow::{ARROW_SCHEMA_META_KEY, PARQUET_FIELD_ID_META_KEY};
     use delta_kernel::schema::{
-        schema, schema_ref, ColumnMetadataKey, DataType, MetadataValue, StructField, StructType,
+        ColumnMetadataKey, DataType, MetadataValue, StructField, StructType, schema, schema_ref,
     };
-    use delta_kernel::EngineData;
     use delta_kernel_default_engine_test_utils::{
         assert_result_error_with_message, current_time_ms,
         try_into_record_batch as into_record_batch,
@@ -635,11 +637,14 @@ mod tests {
         test_parquet_handler_write_always_overwrites,
         test_parquet_handler_write_omits_arrow_schema,
     };
+    use test_utils::record_batch_to_bytes;
     use url::Url;
+    use wiremock::matchers::{method, path, query_param};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use super::*;
-    use crate::executor::tokio::TokioBackgroundExecutor;
     use crate::DEFAULT_BATCH_SIZE;
+    use crate::executor::tokio::TokioBackgroundExecutor;
 
     fn long_schema(name: &str) -> StructType {
         schema! { nullable (name): LONG }
@@ -895,46 +900,127 @@ mod tests {
         assert_eq!(data[0].num_rows(), 10);
     }
 
-    // A Parquet file can physically store TIMESTAMP(MILLIS) (for example, checkpoint stats
-    // written by a non-kernel writer). End to end, the default engine must (a) convert the
-    // millisecond footer schema to the kernel's microsecond TIMESTAMP / TIMESTAMP_NTZ, and
-    // (b) rescale the values to microseconds (x1000) when reading them into that schema.
     #[tokio::test]
-    async fn test_read_millisecond_timestamps() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let file_path = temp_dir.path().join("ms_timestamps.parquet");
+    async fn test_read_presigned_parquet_preserves_query_and_batches() {
+        let physical_schema = Arc::new(long_schema("value"));
+        let expected = RecordBatch::try_new(
+            Arc::new(physical_schema.as_ref().try_into_arrow().unwrap()),
+            vec![Arc::new(Int64Array::from(vec![
+                Some(1),
+                None,
+                Some(3),
+                Some(4),
+                Some(5),
+            ]))],
+        )
+        .unwrap();
+        let bytes = record_batch_to_bytes(&expected);
+        let file_size = bytes.len() as u64;
 
-        // 1700000000123 ms since epoch -> 1_700_000_000_123_000 us.
-        let ms: i64 = 1_700_000_000_123;
+        // HTTP and HTTPS select the same presigned-URL branch; HTTP avoids local TLS setup.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/data.parquet"))
+            .and(query_param("X-Amz-Signature", "test-signature"))
+            .and(query_param("X-Amz-Security-Token", "test/token+value="))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(bytes))
+            .expect(2)
+            .mount(&server)
+            .await;
+        let mut url = Url::parse(&format!("{}/data.parquet", server.uri())).unwrap();
+        url.query_pairs_mut()
+            .append_pair("X-Amz-Signature", "test-signature")
+            .append_pair("X-Amz-Security-Token", "test/token+value=");
+        let files = [FileMeta::new(url, 0, file_size)];
+
+        let handler = DefaultParquetHandler::new(
+            Arc::new(InMemory::new()),
+            Arc::new(TokioBackgroundExecutor::new()),
+        )
+        .with_batch_size(NonZero::new(2).unwrap());
+        let data: Vec<RecordBatch> = handler
+            .read_parquet_files(&files, physical_schema.clone(), None)
+            .unwrap()
+            .map(into_record_batch)
+            .try_collect()
+            .unwrap();
+
+        assert_eq!(
+            data,
+            vec![
+                expected.slice(0, 2),
+                expected.slice(2, 2),
+                expected.slice(4, 1)
+            ]
+        );
+        let footer = handler.read_parquet_footer(&files[0]).unwrap();
+        assert_eq!(footer.schema, physical_schema);
+        server.verify().await;
+    }
+
+    #[rstest::rstest]
+    #[case::millis(
+        TimeUnit::Millisecond,
+        vec![vec![1_700_000_000_123]],
+        None,
+        &[1_700_000_000_123_000]
+    )]
+    #[case::nanos(
+        TimeUnit::Nanosecond,
+        vec![vec![1_999, -1_999, 999, -999]],
+        None,
+        &[1, -1, 0, 0]
+    )]
+    #[case::millis_pruning(
+        TimeUnit::Millisecond,
+        vec![vec![0, 1_000], vec![10_000, 11_000]],
+        Some(5_000_000),
+        &[10_000_000, 11_000_000]
+    )]
+    #[case::nanos_pruning(
+        TimeUnit::Nanosecond,
+        vec![vec![0, 1_000_000_000], vec![10_000_000_000, 11_000_000_000]],
+        Some(5_000_000),
+        &[10_000_000, 11_000_000]
+    )]
+    #[tokio::test]
+    async fn test_read_timestamp_units_as_microseconds(
+        #[case] unit: TimeUnit,
+        #[case] row_groups: Vec<Vec<i64>>,
+        #[case] lower_bound_us: Option<i64>,
+        #[case] expected_us: &[i64],
+    ) {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let file_path = temp_dir.path().join("timestamps.parquet");
+
         let arrow_schema = Arc::new(ArrowSchema::new(vec![
             Field::new(
                 "ts_utc",
-                ArrowDataType::Timestamp(TimeUnit::Millisecond, Some("UTC".into())),
+                ArrowDataType::Timestamp(unit, Some("UTC".into())),
                 true,
             ),
-            Field::new(
-                "ts_ntz",
-                ArrowDataType::Timestamp(TimeUnit::Millisecond, None),
-                true,
-            ),
+            Field::new("ts_ntz", ArrowDataType::Timestamp(unit, None), true),
         ]));
-        let batch = RecordBatch::try_new(
-            arrow_schema.clone(),
-            vec![
-                Arc::new(TimestampMillisecondArray::from(vec![ms]).with_timezone("UTC"))
-                    as Arc<dyn Array>,
-                Arc::new(TimestampMillisecondArray::from(vec![ms])) as Arc<dyn Array>,
-            ],
-        )
-        .unwrap();
-
         let mut writer = ArrowWriter::try_new(
             std::fs::File::create(&file_path).unwrap(),
-            arrow_schema,
+            arrow_schema.clone(),
             None,
         )
         .unwrap();
-        writer.write(&batch).unwrap();
+        for values in row_groups {
+            let values = Int64Array::from(values);
+            let batch = RecordBatch::try_new(
+                arrow_schema.clone(),
+                arrow_schema
+                    .fields()
+                    .iter()
+                    .map(|field| cast(&values, field.data_type()).unwrap())
+                    .collect(),
+            )
+            .unwrap();
+            writer.write(&batch).unwrap();
+            writer.flush().unwrap();
+        }
         writer.close().unwrap();
 
         let file_size = std::fs::metadata(&file_path).unwrap().len();
@@ -949,39 +1035,54 @@ mod tests {
             Arc::new(TokioBackgroundExecutor::new()),
         );
 
-        // (a) Footer schema: millisecond timestamps convert to the kernel's microsecond types.
+        // With `nanosecond-timestamps`, the footer reports nanosecond files as nanosecond types,
+        // but a microsecond read schema must still be honored.
+        #[cfg(feature = "nanosecond-timestamps")]
+        let (expected_utc, expected_ntz) = if unit == TimeUnit::Nanosecond {
+            (DataType::TIMESTAMP_NANOS, DataType::TIMESTAMP_NANOS_NTZ)
+        } else {
+            (DataType::TIMESTAMP, DataType::TIMESTAMP_NTZ)
+        };
+        #[cfg(not(feature = "nanosecond-timestamps"))]
+        let (expected_utc, expected_ntz) = (DataType::TIMESTAMP, DataType::TIMESTAMP_NTZ);
         let footer = handler.read_parquet_footer(&file_meta).unwrap();
         assert_eq!(
             footer.schema.field("ts_utc").unwrap().data_type(),
-            &DataType::TIMESTAMP
+            &expected_utc
         );
         assert_eq!(
             footer.schema.field("ts_ntz").unwrap().data_type(),
-            &DataType::TIMESTAMP_NTZ
+            &expected_ntz
         );
+        let read_schema = schema_ref! {
+            nullable "ts_utc": TIMESTAMP,
+            nullable "ts_ntz": TIMESTAMP_NTZ,
+        };
 
-        // (b) Data path: values are rescaled ms -> us when read into the microsecond schema.
+        let predicate = lower_bound_us.map(|bound| {
+            Arc::new(Predicate::from_expr(expr!(
+                col("ts_ntz") > lit(Scalar::TimestampNtz(bound))
+            )))
+        });
         let data: Vec<RecordBatch> = handler
-            .read_parquet_files(slice::from_ref(&file_meta), footer.schema.clone(), None)
+            .read_parquet_files(slice::from_ref(&file_meta), read_schema, predicate)
             .unwrap()
             .map(into_record_batch)
             .try_collect()
             .unwrap();
 
-        assert_eq!(data.len(), 1);
-        assert_eq!(data[0].num_rows(), 1);
-        let expected_us = ms * 1_000;
+        let expected: Vec<_> = expected_us.iter().copied().map(Some).collect();
         for col_idx in 0..2 {
-            let col = data[0]
-                .column(col_idx)
-                .as_any()
-                .downcast_ref::<TimestampMicrosecondArray>()
-                .unwrap();
-            assert_eq!(
-                col.value(0),
-                expected_us,
-                "column {col_idx} should be rescaled to us"
-            );
+            let actual: Vec<_> = data
+                .iter()
+                .flat_map(|batch| {
+                    batch
+                        .column(col_idx)
+                        .as_primitive_opt::<TimestampMicrosecondType>()
+                        .expect("reader output must use microseconds")
+                })
+                .collect();
+            assert_eq!(actual, expected, "column {col_idx}");
         }
     }
 
@@ -1211,7 +1312,7 @@ mod tests {
         ));
 
         // Create iterator with single batch
-        let data_iter: KernelResultIteratorStatic<Box<dyn EngineData>> =
+        let data_iter: Box<dyn KernelResultIterator<Box<dyn EngineData>>> =
             Box::new(std::iter::once(Ok(engine_data)));
 
         // Test writing through the trait method
@@ -1445,7 +1546,7 @@ mod tests {
         ));
 
         // Create iterator with single batch
-        let data_iter: KernelResultIteratorStatic<Box<dyn EngineData>> =
+        let data_iter: Box<dyn KernelResultIterator<Box<dyn EngineData>>> =
             Box::new(std::iter::once(Ok(engine_data)));
 
         // Write the data
@@ -1595,9 +1696,11 @@ mod tests {
                 .unwrap();
             assert_eq!(timestamp_col.value(0), 1609459200000000000i64);
             assert_eq!(timestamp_col.value(4), 1609804800000000123i64);
-            assert!(timestamp_col
-                .timezone()
-                .is_some_and(|tz| tz.eq_ignore_ascii_case("utc")));
+            assert!(
+                timestamp_col
+                    .timezone()
+                    .is_some_and(|tz| tz.eq_ignore_ascii_case("utc"))
+            );
             col_idx += 1;
 
             // Verify timestamp column (without timezone)
@@ -1620,9 +1723,11 @@ mod tests {
             .unwrap();
         assert_eq!(timestamp_col.value(0), 1609459200000000i64);
         assert_eq!(timestamp_col.value(4), 1609804800000000i64);
-        assert!(timestamp_col
-            .timezone()
-            .is_some_and(|tz| tz.eq_ignore_ascii_case("utc")));
+        assert!(
+            timestamp_col
+                .timezone()
+                .is_some_and(|tz| tz.eq_ignore_ascii_case("utc"))
+        );
         col_idx += 1;
 
         // Verify timestamp_ntz column (without timezone)
@@ -1866,7 +1971,7 @@ mod tests {
             )])
             .unwrap(),
         ));
-        let data_iter: KernelResultIteratorStatic<Box<dyn EngineData>> =
+        let data_iter: Box<dyn KernelResultIterator<Box<dyn EngineData>>> =
             Box::new(std::iter::once(Ok(engine_data)));
 
         // WHEN we write a parquet file to that path

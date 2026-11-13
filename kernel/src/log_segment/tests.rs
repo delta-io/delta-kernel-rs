@@ -1,3 +1,4 @@
+use std::iter;
 use std::sync::{Arc, LazyLock};
 
 use itertools::Itertools;
@@ -8,18 +9,20 @@ use test_utils::{
 use url::Url;
 
 use super::*;
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use crate::Snapshot;
 use crate::actions::visitors::{AddVisitor, SidecarVisitor};
 use crate::actions::{
-    get_all_actions_schema, get_commit_schema, Add, CheckpointMetadata, Remove, Sidecar, ADD_NAME,
-    COMMIT_INFO_NAME, LOG_METADATA_SCHEMA, MAX_VALUES, METADATA_NAME, MIN_VALUES, NUM_RECORDS,
-    REMOVE_NAME, SIDECAR_FILE_SCHEMA_TAG, SIDECAR_NAME,
+    ADD_NAME, Add, COMMIT_INFO_NAME, CheckpointMetadata, LOG_METADATA_SCHEMA, MAX_VALUES,
+    METADATA_NAME, MIN_VALUES, NUM_RECORDS, REMOVE_NAME, Remove, SIDECAR_FILE_SCHEMA_TAG,
+    SIDECAR_NAME, Sidecar, get_all_actions_schema, get_commit_schema,
 };
 use crate::arrow::array::{StringArray, StructArray};
 use crate::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt as _};
 use crate::engine::arrow_expression::evaluate_expression::extract_column_ref;
-use crate::engine::sync::json::SyncJsonHandler;
 use crate::engine::sync::SyncEngine;
-use crate::engine::test_delegating::DelegatingEngine;
+use crate::engine::sync::json::SyncJsonHandler;
+use crate::engine::{DelegatingEngine, PanicEngine};
 use crate::expressions::{col, column_name};
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::last_checkpoint_hint::{AmtCheckpoint, CheckpointType};
@@ -27,9 +30,9 @@ use crate::last_checkpoint_hint::{HintAction, LastCheckpointHint, LastCheckpoint
 use crate::log_replay::ActionsBatch;
 use crate::log_segment::LogSegment;
 use crate::log_segment_files::LogSegmentFiles;
+use crate::object_store::ObjectStoreExt as _;
 use crate::object_store::memory::InMemory;
 use crate::object_store::path::Path;
-use crate::object_store::ObjectStoreExt as _;
 use crate::parquet::arrow::ArrowWriter;
 use crate::path::tests::multipart_checkpoint_name;
 use crate::path::{LogPathFileType, ParsedLogPath};
@@ -41,24 +44,23 @@ use crate::scan::{
     CHECKPOINT_READ_SCHEMA, CHECKPOINT_READ_SCHEMA_NO_JSON_STATS, COMMIT_READ_SCHEMA,
 };
 use crate::schema::{
-    schema, schema_ref, DataType, SchemaRef, SchemaStructPatchBuilder, StructField, StructType,
+    DataType, SchemaRef, SchemaStructPatchBuilder, StructField, StructType, schema, schema_ref,
 };
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::unit_test_utils::adaptive_metadata_fixtures::{
-    adaptive_metadata_protocol_and_metadata, minimal_checkpoint_action, setup_table, write_commit,
+    adaptive_metadata_protocol_and_metadata, minimal_checkpoint_action, setup_table,
+    write_manifest_commit, write_manifest_commit_keeping_pm,
 };
 use crate::unit_test_utils::{
-    assert_batch_matches, assert_result_error_with_message, create_log_path,
-    create_log_path_with_size, load_test_table, string_array_to_engine_data, Action,
+    Action, assert_batch_matches, assert_result_error_with_message, create_log_path,
+    create_log_path_with_size, load_test_table, string_array_to_engine_data,
 };
 #[cfg(feature = "geo-type-in-dev")]
 use crate::unit_test_utils::{geography_type, geometry_type};
-#[cfg(feature = "adaptive-metadata-in-dev")]
-use crate::Snapshot;
 use crate::{
     EngineData, FileDataReadResultIterator, FileMeta, FileSize, JsonHandler, KernelResult,
-    KernelResultIteratorStatic, ParquetFooter, ParquetHandler, Predicate, PredicateRef, RowVisitor,
-    StorageHandler,
+    KernelResultIterator, ParquetFooter, ParquetHandler, Predicate, PredicateRef, Result,
+    RowVisitor, StorageHandler,
 };
 
 /// Processes sidecar files for the given checkpoint batch.
@@ -71,7 +73,7 @@ fn process_sidecars(
     batch: &dyn EngineData,
     checkpoint_read_schema: SchemaRef,
     meta_predicate: Option<PredicateRef>,
-) -> KernelResult<Option<impl Iterator<Item = KernelResult<Box<dyn EngineData>>> + Send>> {
+) -> KernelResult<Option<impl KernelResultIterator<Box<dyn EngineData>> + use<>>> {
     // Visit the rows of the checkpoint batch to extract sidecar file references
     let mut visitor = SidecarVisitor::default();
     visitor.visit_rows_of(batch)?;
@@ -159,6 +161,14 @@ async fn write_parquet_to_store(
     write_multi_row_group_parquet_to_store(store, vec![data], &path).await
 }
 
+/// Lists the log segment for the latest version of the table at `table_root`.
+#[cfg(feature = "adaptive-metadata-in-dev")]
+pub(crate) fn latest_log_segment(table_root: &Url, engine: &dyn Engine) -> LogSegment {
+    let log_root = table_root.join("_delta_log/").unwrap();
+    let storage = engine.storage_handler();
+    LogSegment::for_snapshot_impl(storage.as_ref(), log_root, vec![], None, None).unwrap()
+}
+
 /// Writes all actions to a _delta_log parquet checkpoint file in the store.
 /// This function formats the provided filename into the _delta_log directory.
 pub(crate) async fn add_checkpoint_to_store(
@@ -201,7 +211,7 @@ async fn write_multi_row_group_parquet_to_store(
 
 /// Returns the materialized row count and sorted paths of all materialized Add actions.
 fn collect_materialized_adds(
-    actions: impl Iterator<Item = KernelResult<ActionsBatch>>,
+    actions: impl KernelResultIterator<ActionsBatch>,
 ) -> KernelResult<(usize, Vec<String>)> {
     let mut rows = 0;
     let mut add_paths: Vec<String> = Vec::new();
@@ -228,7 +238,6 @@ fn collect_projected_adds(
             None,
             None,
             None,
-            None, // cancellation_token
         )?
         .actions;
     collect_materialized_adds(actions)
@@ -249,7 +258,7 @@ impl ParquetHandler for IgnorePredicateParquetHandler {
     fn write_parquet_file(
         &self,
         location: Url,
-        data: KernelResultIteratorStatic<Box<dyn EngineData>>,
+        data: Box<dyn KernelResultIterator<Box<dyn EngineData>>>,
     ) -> KernelResult<FileSize> {
         self.0.write_parquet_file(location, data)
     }
@@ -315,6 +324,171 @@ fn staged_commit_log_paths(versions: &[Version]) -> Vec<ParsedLogPath> {
         .collect()
 }
 
+#[rstest]
+#[case::empty(vec![], false, Some(0))]
+#[case::version_zero(vec![0], false, Some(0))]
+#[case::different_sizes(vec![7, 13, 29], false, Some(49))]
+#[case::staged_and_published(vec![7, 13, 29], true, Some(49))]
+#[case::unsigned_total(vec![i64::MAX as u64, 1], false, Some(1 << 63))]
+#[case::maximum_total(vec![u64::MAX, 0], false, Some(u64::MAX))]
+#[case::overflow(vec![u64::MAX, 1], false, None)]
+fn log_segment_stats_counts_only_replay_commits(
+    #[case] sizes: Vec<u64>,
+    #[case] staged: bool,
+    #[case] expected_bytes: Option<u64>,
+) {
+    let commits: Vec<_> = sizes
+        .iter()
+        .enumerate()
+        .map(|(version, size)| {
+            let path = if staged && version > 0 {
+                staged_commit_path_for_version(version as u64)
+            } else {
+                delta_path_for_version(version as u64, "json")
+            };
+            create_log_path_with_size(&format!("memory:///{path}"), *size)
+        })
+        .collect();
+    let checkpoint_only = commits.is_empty();
+    let latest_commit_file = commits.last().cloned().unwrap_or_else(|| {
+        create_log_path_with_size("memory:///_delta_log/00000000000000000000.json", u64::MAX)
+    });
+    let segment = LogSegment {
+        end_version: sizes.len().saturating_sub(1) as u64,
+        checkpoint_version: checkpoint_only.then_some(0),
+        log_root: Url::parse("memory:///_delta_log/").unwrap(),
+        last_checkpoint_metadata: None,
+        listed: LogSegmentFiles {
+            ascending_commit_files: commits,
+            checkpoint_parts: if checkpoint_only {
+                vec![create_log_path_with_size(
+                    "memory:///_delta_log/00000000000000000000.checkpoint.parquet",
+                    u64::MAX,
+                )]
+            } else {
+                vec![]
+            },
+            latest_crc_file: Some(create_log_path_with_size(
+                "memory:///_delta_log/00000000000000000000.crc",
+                u64::MAX,
+            )),
+            latest_commit_file: Some(latest_commit_file),
+            ..Default::default()
+        },
+    };
+    match expected_bytes {
+        Some(total_commit_file_bytes) => assert_eq!(
+            segment.stats().unwrap(),
+            LogSegmentStats {
+                num_commit_files: sizes.len() as u64,
+                total_commit_file_bytes,
+            }
+        ),
+        None => assert_result_error_with_message(segment.stats(), "commit file size overflow"),
+    }
+}
+
+#[rstest]
+#[case::nested_same_start(
+    &[10, 10, 10, 10],
+    &[(1, 2, 7), (1, 3, 12)],
+    &[(1, 3), (0, 0)],
+    Some(22),
+)]
+#[case::uncovered_trailing_commits(
+    &[10, 10, 10, 10, 10],
+    &[(1, 2, 7)],
+    &[(4, 4), (3, 3), (1, 2), (0, 0)],
+    Some(37),
+)]
+#[case::disjoint_compactions(
+    &[10, 10, 10, 10, 10, 10, 10],
+    &[(0, 1, 7), (3, 4, 13)],
+    &[(6, 6), (5, 5), (3, 4), (2, 2), (0, 1)],
+    Some(50),
+)]
+#[case::maximum_total(
+    &[10, 10, 1],
+    &[(0, 1, u64::MAX - 1)],
+    &[(2, 2), (0, 1)],
+    Some(u64::MAX),
+)]
+#[case::overflow(
+    &[10, 10, 1],
+    &[(0, 1, u64::MAX)],
+    &[(2, 2), (0, 1)],
+    None,
+)]
+fn log_segment_stats_uses_selected_compactions(
+    #[case] commit_sizes: &[u64],
+    #[case] compactions: &[(Version, Version, u64)],
+    #[case] expected_cover: &[(Version, Version)],
+    #[case] expected_bytes: Option<u64>,
+) {
+    let segment = LogSegment {
+        end_version: commit_sizes.len() as u64 - 1,
+        checkpoint_version: None,
+        log_root: Url::parse("memory:///_delta_log/").unwrap(),
+        last_checkpoint_metadata: None,
+        listed: LogSegmentFiles {
+            ascending_commit_files: commit_sizes
+                .iter()
+                .enumerate()
+                .map(|(version, size)| {
+                    let path = delta_path_for_version(version as u64, "json");
+                    create_log_path_with_size(&format!("memory:///{path}"), *size)
+                })
+                .collect(),
+            ascending_compaction_files: compactions
+                .iter()
+                .map(|(start, end, size)| {
+                    let path = compacted_log_path_for_versions(*start, *end, "json");
+                    create_log_path_with_size(&format!("memory:///{path}"), *size)
+                })
+                .collect(),
+            ..Default::default()
+        },
+    };
+    let cover = segment.find_commit_cover();
+    let expected_locations = expected_cover
+        .iter()
+        .map(|(start, end)| {
+            let path = if start == end {
+                delta_path_for_version(*start, "json")
+            } else {
+                compacted_log_path_for_versions(*start, *end, "json")
+            };
+            format!("memory:///{path}")
+        })
+        .collect_vec();
+    assert_eq!(
+        cover
+            .iter()
+            .map(|file| file.location.to_string())
+            .collect_vec(),
+        expected_locations,
+    );
+    let cover_bytes = cover
+        .iter()
+        .try_fold(0u64, |total, file| total.checked_add(file.size));
+    assert_eq!(cover_bytes, expected_bytes);
+    match expected_bytes {
+        Some(total_commit_file_bytes) => {
+            let stats = segment.stats().unwrap();
+            assert_eq!(
+                stats,
+                LogSegmentStats {
+                    num_commit_files: expected_cover.len() as u64,
+                    total_commit_file_bytes,
+                }
+            );
+            assert_eq!(stats.num_commit_files, cover.len() as u64);
+            assert_eq!(Some(stats.total_commit_file_bytes), cover_bytes);
+        }
+        None => assert_result_error_with_message(segment.stats(), "commit file size overflow"),
+    }
+}
+
 /// Gets the file size from the store for use in FileMeta
 async fn get_file_size(store: &Arc<InMemory>, path: &str) -> u64 {
     let object_meta = store.head(&Path::from(path)).await.unwrap();
@@ -343,7 +517,6 @@ async fn build_snapshot_with_uuid_checkpoint_parquet() {
         storage.as_ref(),
         log_root,
         vec![], // log_tail
-        None,
         None,
         None,
     )
@@ -381,7 +554,6 @@ async fn build_snapshot_with_uuid_checkpoint_json() {
         storage.as_ref(),
         log_root,
         vec![], // log_tail
-        None,
         None,
         None,
     )
@@ -430,7 +602,6 @@ async fn build_snapshot_with_correct_last_uuid_checkpoint() {
         vec![], // log_tail
         Some(checkpoint_metadata),
         None,
-        None,
     )
     .unwrap();
     let commit_files = log_segment.listed.ascending_commit_files;
@@ -476,7 +647,6 @@ async fn build_snapshot_with_multiple_incomplete_multipart_checkpoints() {
         vec![], // log_tail
         None,
         None,
-        None,
     )
     .unwrap();
     let commit_files = log_segment.listed.ascending_commit_files;
@@ -518,7 +688,6 @@ async fn build_snapshot_with_out_of_date_last_checkpoint() {
         log_root,
         vec![], // log_tail
         Some(checkpoint_metadata),
-        None,
         None,
     )
     .unwrap();
@@ -567,7 +736,6 @@ async fn build_snapshot_with_correct_last_multipart_checkpoint() {
         vec![], // log_tail
         Some(checkpoint_metadata),
         None,
-        None,
     )
     .unwrap();
     let commit_files = log_segment.listed.ascending_commit_files;
@@ -614,7 +782,6 @@ async fn build_snapshot_with_missing_checkpoint_part_from_hint_fails() {
         log_root,
         vec![], // log_tail
         Some(checkpoint_metadata),
-        None,
         None,
     );
     assert_result_error_with_message(
@@ -669,7 +836,6 @@ async fn build_snapshot_applies_checkpoint_hint_iff_it_names_the_selected_checkp
         log_root,
         vec![], // log_tail
         Some(checkpoint_metadata),
-        None,
         None,
     )
     .unwrap();
@@ -735,7 +901,6 @@ async fn build_snapshot_with_missing_checkpoint_part_no_hint() {
         vec![], // log_tail
         None,
         None,
-        None,
     )
     .unwrap();
 
@@ -785,7 +950,6 @@ async fn build_snapshot_with_out_of_date_last_checkpoint_and_incomplete_recent_c
         vec![], // log_tail
         Some(checkpoint_metadata),
         None,
-        None,
     )
     .unwrap();
     let commit_files = log_segment.listed.ascending_commit_files;
@@ -826,7 +990,6 @@ async fn build_snapshot_without_checkpoints() {
         vec![], // log_tail
         None,
         None,
-        None,
     )
     .unwrap();
     let commit_files = log_segment.listed.ascending_commit_files;
@@ -847,7 +1010,6 @@ async fn build_snapshot_without_checkpoints() {
         vec![], // log_tail
         None,
         Some(2),
-        None,
     )
     .unwrap();
     let commit_files = log_segment.listed.ascending_commit_files;
@@ -893,7 +1055,6 @@ async fn build_snapshot_with_checkpoint_greater_than_time_travel_version() {
         vec![], // log_tail
         Some(checkpoint_metadata),
         Some(4),
-        None,
     )
     .unwrap();
     let commit_files = log_segment.listed.ascending_commit_files;
@@ -935,7 +1096,6 @@ async fn build_snapshot_with_start_checkpoint_and_time_travel_version() {
         vec![], // log_tail
         Some(checkpoint_metadata),
         Some(4),
-        None,
     )
     .unwrap();
 
@@ -959,8 +1119,7 @@ async fn build_snapshot_time_travel_no_checkpoint_falls_back_to_v0(
     let (storage, log_root) = build_log_with_paths_and_checkpoint(&paths, None).await;
 
     let log_segment =
-        LogSegment::for_snapshot_impl(storage.as_ref(), log_root, vec![], hint, Some(5), None)
-            .unwrap();
+        LogSegment::for_snapshot_impl(storage.as_ref(), log_root, vec![], hint, Some(5)).unwrap();
 
     let commit_files = log_segment.listed.ascending_commit_files;
     let checkpoint_parts = log_segment.listed.checkpoint_parts;
@@ -987,8 +1146,7 @@ async fn build_snapshot_time_travel_no_hint_checkpoint_at_end_version_included()
     .await;
 
     let log_segment =
-        LogSegment::for_snapshot_impl(storage.as_ref(), log_root, vec![], None, Some(5), None)
-            .unwrap();
+        LogSegment::for_snapshot_impl(storage.as_ref(), log_root, vec![], None, Some(5)).unwrap();
 
     let commit_files = log_segment.listed.ascending_commit_files;
     let checkpoint_parts = log_segment.listed.checkpoint_parts;
@@ -1107,7 +1265,10 @@ async fn table_changes_fails_with_larger_start_version_than_end() {
     )
     .await;
     let log_segment_res = LogSegment::for_table_changes(storage.as_ref(), log_root, 1, Some(0));
-    assert_result_error_with_message(log_segment_res, "Generic delta kernel error: Failed to build LogSegment: start_version cannot be greater than end_version");
+    assert_result_error_with_message(
+        log_segment_res,
+        "Generic delta kernel error: Failed to build LogSegment: start_version cannot be greater than end_version",
+    );
 }
 
 #[test_log::test(rstest::rstest)]
@@ -1282,8 +1443,8 @@ async fn test_reading_sidecar_files_with_predicate() -> KernelResult<()> {
 }
 
 #[tokio::test]
-async fn test_create_checkpoint_stream_returns_checkpoint_batches_as_is_if_schema_has_no_file_actions(
-) -> KernelResult<()> {
+async fn test_create_checkpoint_stream_returns_checkpoint_batches_as_is_if_schema_has_no_file_actions()
+-> KernelResult<()> {
     let (store, log_root) = new_in_memory_store();
     let engine = SyncEngine::new_with_store(store.clone());
     add_checkpoint_to_store(
@@ -1317,7 +1478,6 @@ async fn test_create_checkpoint_stream_returns_checkpoint_batches_as_is_if_schem
         None, // meta_predicate
         None, // stats_schema
         None, // partition_schema
-        None, // cancellation_token
     )?;
     let mut iter = checkpoint_result.actions;
 
@@ -1337,8 +1497,8 @@ async fn test_create_checkpoint_stream_returns_checkpoint_batches_as_is_if_schem
 }
 
 #[tokio::test]
-async fn test_create_checkpoint_stream_returns_checkpoint_batches_if_checkpoint_is_multi_part(
-) -> KernelResult<()> {
+async fn test_create_checkpoint_stream_returns_checkpoint_batches_if_checkpoint_is_multi_part()
+-> KernelResult<()> {
     let (store, log_root) = new_in_memory_store();
     let engine = SyncEngine::new_with_store(store.clone());
 
@@ -1391,7 +1551,6 @@ async fn test_create_checkpoint_stream_returns_checkpoint_batches_if_checkpoint_
         None, // meta_predicate
         None, // stats_schema
         None, // partition_schema
-        None, // cancellation_token
     )?;
     let mut iter = checkpoint_result.actions;
 
@@ -1416,8 +1575,8 @@ async fn test_create_checkpoint_stream_returns_checkpoint_batches_if_checkpoint_
 }
 
 #[tokio::test]
-async fn test_create_checkpoint_stream_reads_parquet_checkpoint_batch_without_sidecars(
-) -> KernelResult<()> {
+async fn test_create_checkpoint_stream_reads_parquet_checkpoint_batch_without_sidecars()
+-> KernelResult<()> {
     let (store, log_root) = new_in_memory_store();
     let engine = SyncEngine::new_with_store(store.clone());
 
@@ -1457,7 +1616,6 @@ async fn test_create_checkpoint_stream_reads_parquet_checkpoint_batch_without_si
         None, // meta_predicate
         None, // stats_schema
         None, // partition_schema
-        None, // cancellation_token
     )?;
     let mut iter = checkpoint_result.actions;
 
@@ -1683,8 +1841,8 @@ async fn test_scan_checkpoint_read_handles_all_remove_sidecar_row_groups(
 }
 
 #[tokio::test]
-async fn test_create_checkpoint_stream_reads_json_checkpoint_batch_without_sidecars(
-) -> KernelResult<()> {
+async fn test_create_checkpoint_stream_reads_json_checkpoint_batch_without_sidecars()
+-> KernelResult<()> {
     let (store, log_root) = new_in_memory_store();
     let engine = SyncEngine::new_with_store(store.clone());
 
@@ -1720,7 +1878,6 @@ async fn test_create_checkpoint_stream_reads_json_checkpoint_batch_without_sidec
         None, // meta_predicate
         None, // stats_schema
         None, // partition_schema
-        None, // cancellation_token
     )?;
     let mut iter = checkpoint_result.actions;
 
@@ -1747,8 +1904,8 @@ async fn test_create_checkpoint_stream_reads_json_checkpoint_batch_without_sidec
 // - Batches from both the checkpoint file and sidecar files are returned.
 // - Each returned batch is correctly flagged with is_log_batch set to false
 #[tokio::test]
-async fn test_create_checkpoint_stream_reads_checkpoint_file_and_returns_sidecar_batches(
-) -> KernelResult<()> {
+async fn test_create_checkpoint_stream_reads_checkpoint_file_and_returns_sidecar_batches()
+-> KernelResult<()> {
     let (store, log_root) = new_in_memory_store();
     let engine = SyncEngine::new_with_store(store.clone());
 
@@ -1813,7 +1970,6 @@ async fn test_create_checkpoint_stream_reads_checkpoint_file_and_returns_sidecar
         None, // meta_predicate
         None, // stats_schema
         None, // partition_schema
-        None, // cancellation_token
     )?;
     let mut iter = checkpoint_result.actions;
 
@@ -1897,7 +2053,6 @@ async fn create_segment_for(segment: LogSegmentConfig<'_>) -> LogSegment {
         staged_commits_log_tail,
         None,
         segment.version_to_load,
-        None,
     )
     .unwrap()
 }
@@ -1920,7 +2075,6 @@ async fn test_list_log_files_with_version() -> KernelResult<()> {
         &log_root,
         vec![], // log_tail
         Some(0),
-        None,
         None,
     )?;
     let latest_crc = result.latest_crc_file.unwrap();
@@ -2115,22 +2269,184 @@ async fn test_commit_cover(
     })
     .await;
     let cover = log_segment.find_commit_cover();
-    // our test-utils include "_delta_log" in the path, which is already in log_segment.log_root, so
-    // we don't use them. TODO: Unify this
-    let expected_locations = expected_files.iter().map(|ef| match ef {
-        ExpectedFile::Commit(version) => log_segment
-            .log_root
-            .join(&format!("{version:020}.json"))
-            .expect("Couldn't join"),
-        ExpectedFile::Compaction(lo, hi) => log_segment
+    assert_eq!(
+        cover.into_iter().map(|f| f.location).collect_vec(),
+        expected_cover_locations(&log_segment.log_root, expected_files)
+    );
+}
+
+/// The locations of `expected_files` under `log_root`.
+// Our test-utils include "_delta_log" in the path, which is already in `log_root`, so we don't use
+// them. TODO: Unify this
+fn expected_cover_locations(log_root: &Url, expected_files: &[ExpectedFile]) -> Vec<Url> {
+    expected_files
+        .iter()
+        .map(|ef| match ef {
+            ExpectedFile::Commit(version) => log_root.join(&format!("{version:020}.json")),
+            ExpectedFile::Compaction(lo, hi) => {
+                log_root.join(&format!("{lo:020}.{hi:020}.compacted.json"))
+            }
+        })
+        .map(|url| url.expect("Couldn't join"))
+        .collect()
+}
+
+/// The log segment holds commits `0..=end_version` and a single compaction covering `11..=20`.
+/// Each case gives `end_version`, the `after` bound, and the expected cover, newest first: the
+/// compaction is selected only when it starts after `after`.
+#[rstest]
+#[case::compaction_after_bound(20, Some(8), vec![
+    ExpectedFile::Compaction(11, 20), ExpectedFile::Commit(10), ExpectedFile::Commit(9),
+])]
+#[case::bound_just_before_compaction_start(20, Some(10), vec![ExpectedFile::Compaction(11, 20)])]
+#[case::bound_at_compaction_start(20, Some(11), (12..=20).rev().map(ExpectedFile::Commit).collect())]
+#[case::compaction_spans_bound(20, Some(15), (16..=20).rev().map(ExpectedFile::Commit).collect())]
+#[case::compaction_after_bound_with_later_commits(22, Some(5),
+    [ExpectedFile::Commit(22), ExpectedFile::Commit(21), ExpectedFile::Compaction(11, 20)]
+        .into_iter()
+        .chain((6..=10).rev().map(ExpectedFile::Commit))
+        .collect()
+)]
+#[case::compaction_spans_bound_with_later_commits(30, Some(15),
+    (16..=30).rev().map(ExpectedFile::Commit).collect())]
+#[case::no_bound(20, None,
+    iter::once(ExpectedFile::Compaction(11, 20))
+        .chain((0..=10).rev().map(ExpectedFile::Commit))
+        .collect()
+)]
+fn commit_cover_after_excludes_compaction_starting_at_or_before_bound(
+    #[case] end_version: Version,
+    #[case] after: Option<Version>,
+    #[case] expected_files: Vec<ExpectedFile>,
+) {
+    let log_root = Url::parse("memory:///_delta_log/").unwrap();
+    let log_path = |name: String| create_log_path(log_root.join(&name).unwrap().as_str());
+    let commits = (0..=end_version)
+        .map(|v| log_path(format!("{v:020}.json")))
+        .collect_vec();
+    let log_segment = LogSegment::try_new(
+        LogSegmentFiles {
+            latest_commit_file: commits.last().cloned(),
+            max_published_version: Some(end_version),
+            ascending_commit_files: commits,
+            ascending_compaction_files: vec![log_path(format!(
+                "{:020}.{:020}.compacted.json",
+                11, 20
+            ))],
+            ..Default::default()
+        },
+        log_root.clone(),
+        Some(end_version),
+        None,
+    )
+    .unwrap();
+
+    let cover = log_segment.find_commit_cover_after(after);
+    assert_eq!(
+        cover.into_iter().map(|f| f.location).collect_vec(),
+        expected_cover_locations(&log_root, &expected_files)
+    );
+}
+
+// Compaction listing is disabled, so the compactions are added to the listed segment by hand.
+#[rstest]
+#[case::replaces_spanning_compaction_with_commits(
+    (None, 4),
+    &[2],
+    &[
+        ExpectedFile::Commit(4),
+        ExpectedFile::Commit(3),
+        ExpectedFile::Commit(2),
+        ExpectedFile::Compaction(0, 1),
+    ]
+)]
+#[case::spanning_compaction_end(
+    (None, 4),
+    &[1],
+    &[
+        ExpectedFile::Commit(4),
+        ExpectedFile::Compaction(2, 3),
+        ExpectedFile::Commit(1),
+        ExpectedFile::Commit(0),
+    ]
+)]
+#[case::no_compaction_spans_version(
+    (None, 4),
+    &[4],
+    &[ExpectedFile::Commit(4), ExpectedFile::Compaction(2, 3), ExpectedFile::Compaction(0, 1)]
+)]
+#[case::compactions_spanning_either_version(
+    (None, 4),
+    &[0, 3],
+    &[
+        ExpectedFile::Commit(4),
+        ExpectedFile::Commit(3),
+        ExpectedFile::Commit(2),
+        ExpectedFile::Commit(1),
+        ExpectedFile::Commit(0),
+    ]
+)]
+#[case::oldest_exclusive_drops_files_at_or_below_it(
+    (Some(1), 4),
+    &[],
+    &[ExpectedFile::Commit(4), ExpectedFile::Compaction(2, 3)]
+)]
+#[case::newest_inclusive_drops_compaction_past_it(
+    (None, 2),
+    &[],
+    &[ExpectedFile::Commit(2), ExpectedFile::Compaction(0, 1)]
+)]
+#[case::compaction_ending_at_newest_inclusive(
+    (None, 3),
+    &[],
+    &[ExpectedFile::Compaction(2, 3), ExpectedFile::Compaction(0, 1)]
+)]
+#[case::oldest_exclusive_inside_compaction(
+    (Some(0), 4),
+    &[],
+    &[ExpectedFile::Commit(4), ExpectedFile::Compaction(2, 3), ExpectedFile::Commit(1)]
+)]
+#[case::oldest_exclusive_at_compaction_start(
+    (Some(2), 4),
+    &[],
+    &[ExpectedFile::Commit(4), ExpectedFile::Commit(3)]
+)]
+#[case::required_delta_outside_range_is_ignored(
+    (Some(1), 4),
+    &[1],
+    &[ExpectedFile::Commit(4), ExpectedFile::Compaction(2, 3)]
+)]
+#[case::empty_range((Some(4), 4), &[], &[])]
+#[tokio::test]
+async fn commit_cover_in_range_reads_required_commits_as_their_own_files(
+    #[case] (oldest_exclusive, newest_inclusive): (Option<Version>, Version),
+    #[case] required_commits: &[Version],
+    #[case] expected_files: &[ExpectedFile],
+) {
+    let mut log_segment = create_segment_for(LogSegmentConfig {
+        published_commit_versions: &[0, 1, 2, 3, 4],
+        ..Default::default()
+    })
+    .await;
+    let compaction = |lo: Version, hi: Version| {
+        let location = log_segment
             .log_root
             .join(&format!("{lo:020}.{hi:020}.compacted.json"))
-            .expect("Couldn't join"),
-    });
-    assert_eq!(cover.len(), expected_locations.len());
-    for (location, expected_location) in cover.iter().zip(expected_locations) {
-        assert_eq!(location.location, expected_location);
-    }
+            .unwrap();
+        ParsedLogPath::new(FileMeta::new(location, 0, 100)).unwrap()
+    };
+    let compactions = vec![compaction(0, 1), compaction(2, 3)];
+    log_segment.listed.ascending_compaction_files = compactions;
+
+    let cover = log_segment
+        .find_commit_cover_paths_in_range(oldest_exclusive, newest_inclusive, required_commits)
+        .into_iter()
+        .map(|path| path.location.location.clone())
+        .collect_vec();
+    assert_eq!(
+        cover,
+        expected_cover_locations(&log_segment.log_root, expected_files)
+    );
 }
 
 #[tokio::test]
@@ -2331,7 +2647,6 @@ async fn test_commit_cover_zero_byte_compaction_uses_commits() {
         vec![],
         None,
         None,
-        None,
     )
     .unwrap();
 
@@ -2476,19 +2791,21 @@ fn test_validate_listed_log_file_cached_fields_match_location() {
 #[test]
 fn test_validate_listed_log_file_out_of_order_commit_files() {
     let log_root = Url::parse("file:///_delta_log/").unwrap();
-    assert!(LogSegment::try_new(
-        LogSegmentFiles {
-            ascending_commit_files: vec![
-                create_log_path("file:///_delta_log/00000000000000000003.json"),
-                create_log_path("file:///_delta_log/00000000000000000001.json"),
-            ],
-            ..Default::default()
-        },
-        log_root,
-        None,
-        None,
-    )
-    .is_err());
+    assert!(
+        LogSegment::try_new(
+            LogSegmentFiles {
+                ascending_commit_files: vec![
+                    create_log_path("file:///_delta_log/00000000000000000003.json"),
+                    create_log_path("file:///_delta_log/00000000000000000001.json"),
+                ],
+                ..Default::default()
+            },
+            log_root,
+            None,
+            None,
+        )
+        .is_err()
+    );
 }
 
 #[test]
@@ -2572,24 +2889,26 @@ fn test_checkpoint_covers_gap_before_retained_commits() {
 #[test]
 fn test_try_new_crc_at_end_version_is_ok() {
     let log_root = Url::parse("file:///_delta_log/").unwrap();
-    assert!(LogSegment::try_new(
-        LogSegmentFiles {
-            ascending_commit_files: vec![create_log_path(
-                "file:///_delta_log/00000000000000000002.json",
-            )],
-            latest_commit_file: Some(create_log_path(
-                "file:///_delta_log/00000000000000000002.json",
-            )),
-            latest_crc_file: Some(create_log_path(
-                "file:///_delta_log/00000000000000000002.crc"
-            )),
-            ..Default::default()
-        },
-        log_root,
-        None,
-        None,
-    )
-    .is_ok());
+    assert!(
+        LogSegment::try_new(
+            LogSegmentFiles {
+                ascending_commit_files: vec![create_log_path(
+                    "file:///_delta_log/00000000000000000002.json",
+                )],
+                latest_commit_file: Some(create_log_path(
+                    "file:///_delta_log/00000000000000000002.json",
+                )),
+                latest_crc_file: Some(create_log_path(
+                    "file:///_delta_log/00000000000000000002.crc"
+                )),
+                ..Default::default()
+            },
+            log_root,
+            None,
+            None,
+        )
+        .is_ok()
+    );
 }
 
 #[test]
@@ -2614,50 +2933,54 @@ fn test_try_new_crc_rejects_non_crc_path() {
 #[test]
 fn test_try_new_crc_newer_than_end_version_is_err() {
     let log_root = Url::parse("file:///_delta_log/").unwrap();
-    assert!(LogSegment::try_new(
-        LogSegmentFiles {
-            ascending_commit_files: vec![create_log_path(
-                "file:///_delta_log/00000000000000000002.json",
-            )],
-            latest_commit_file: Some(create_log_path(
-                "file:///_delta_log/00000000000000000002.json",
-            )),
-            latest_crc_file: Some(create_log_path(
-                "file:///_delta_log/00000000000000000003.crc"
-            )),
-            ..Default::default()
-        },
-        log_root,
-        None,
-        None,
-    )
-    .is_err());
+    assert!(
+        LogSegment::try_new(
+            LogSegmentFiles {
+                ascending_commit_files: vec![create_log_path(
+                    "file:///_delta_log/00000000000000000002.json",
+                )],
+                latest_commit_file: Some(create_log_path(
+                    "file:///_delta_log/00000000000000000002.json",
+                )),
+                latest_crc_file: Some(create_log_path(
+                    "file:///_delta_log/00000000000000000003.crc"
+                )),
+                ..Default::default()
+            },
+            log_root,
+            None,
+            None,
+        )
+        .is_err()
+    );
 }
 
 #[test]
 fn test_try_new_crc_older_than_checkpoint_is_err() {
     let log_root = Url::parse("file:///_delta_log/").unwrap();
-    assert!(LogSegment::try_new(
-        LogSegmentFiles {
-            ascending_commit_files: vec![create_log_path(
-                "file:///_delta_log/00000000000000000004.json",
-            )],
-            latest_commit_file: Some(create_log_path(
-                "file:///_delta_log/00000000000000000004.json",
-            )),
-            checkpoint_parts: vec![create_log_path(
-                "file:///_delta_log/00000000000000000003.checkpoint.parquet",
-            )],
-            latest_crc_file: Some(create_log_path(
-                "file:///_delta_log/00000000000000000002.crc"
-            )),
-            ..Default::default()
-        },
-        log_root,
-        None,
-        None,
-    )
-    .is_err());
+    assert!(
+        LogSegment::try_new(
+            LogSegmentFiles {
+                ascending_commit_files: vec![create_log_path(
+                    "file:///_delta_log/00000000000000000004.json",
+                )],
+                latest_commit_file: Some(create_log_path(
+                    "file:///_delta_log/00000000000000000004.json",
+                )),
+                checkpoint_parts: vec![create_log_path(
+                    "file:///_delta_log/00000000000000000003.checkpoint.parquet",
+                )],
+                latest_crc_file: Some(create_log_path(
+                    "file:///_delta_log/00000000000000000002.crc"
+                )),
+                ..Default::default()
+            },
+            log_root,
+            None,
+            None,
+        )
+        .is_err()
+    );
 }
 
 #[test]
@@ -3040,7 +3363,6 @@ async fn test_latest_commit_file_field_is_captured() {
         vec![],
         None,
         SnapshotLoadMetricContext::for_test(),
-        None,
     )
     .unwrap();
 
@@ -3074,7 +3396,6 @@ async fn test_latest_commit_file_with_checkpoint_filtering() {
         vec![],
         None,
         SnapshotLoadMetricContext::for_test(),
-        None,
     )
     .unwrap();
 
@@ -3102,7 +3423,6 @@ async fn test_latest_commit_file_with_no_commits() {
         vec![],
         None,
         SnapshotLoadMetricContext::for_test(),
-        None,
     )
     .unwrap();
 
@@ -3133,7 +3453,6 @@ async fn test_latest_commit_file_with_checkpoint_at_same_version() {
         vec![],
         None,
         SnapshotLoadMetricContext::for_test(),
-        None,
     )
     .unwrap();
 
@@ -3166,7 +3485,6 @@ async fn test_latest_commit_file_edge_case_commit_before_checkpoint() {
         vec![],
         None,
         SnapshotLoadMetricContext::for_test(),
-        None,
     )
     .unwrap();
 
@@ -3185,23 +3503,25 @@ fn test_log_segment_contiguous_commit_files() {
     let log_root = Url::parse("file:///_delta_log/").unwrap();
 
     // contiguous commits are accepted
-    assert!(LogSegment::try_new(
-        LogSegmentFiles {
-            ascending_commit_files: vec![
-                create_log_path("file:///_delta_log/00000000000000000001.json"),
-                create_log_path("file:///_delta_log/00000000000000000002.json"),
-                create_log_path("file:///_delta_log/00000000000000000003.json"),
-            ],
-            latest_commit_file: Some(create_log_path(
-                "file:///_delta_log/00000000000000000003.json",
-            )),
-            ..Default::default()
-        },
-        log_root.clone(),
-        None,
-        None,
-    )
-    .is_ok());
+    assert!(
+        LogSegment::try_new(
+            LogSegmentFiles {
+                ascending_commit_files: vec![
+                    create_log_path("file:///_delta_log/00000000000000000001.json"),
+                    create_log_path("file:///_delta_log/00000000000000000002.json"),
+                    create_log_path("file:///_delta_log/00000000000000000003.json"),
+                ],
+                latest_commit_file: Some(create_log_path(
+                    "file:///_delta_log/00000000000000000003.json",
+                )),
+                ..Default::default()
+            },
+            log_root.clone(),
+            None,
+            None,
+        )
+        .is_ok()
+    );
 
     // gaps are disallowed by LogSegment::try_new
     let log_segment = LogSegment::try_new(
@@ -3234,9 +3554,10 @@ fn test_log_segment_checkpoint_gap_rejects_version_overflow() {
     let commit = create_log_path("file:///_delta_log/00000000000000000000.json");
     let err = validate_checkpoint_commit_gap(Some(Version::MAX), &[commit]).unwrap_err();
     assert!(matches!(err, KernelError::InvalidCheckpoint(_)));
-    assert!(err
-        .to_string()
-        .contains("checkpoint version 18446744073709551615 is the maximum supported version"));
+    assert!(
+        err.to_string()
+            .contains("checkpoint version 18446744073709551615 is the maximum supported version")
+    );
 }
 
 /// `checkpoint_sidecars()` distinguishes "the matched hint lists zero sidecars" (`Some(&[])`) from
@@ -3417,7 +3738,7 @@ async fn test_get_file_actions_schema_v1_parquet_with_hint(
 
     // Verify that get_file_actions_schema_and_sidecars returns appropriate schema based on hint
     // version
-    let (schema, sidecars) = log_segment.get_file_actions_schema_and_sidecars(&engine, None)?;
+    let (schema, sidecars) = log_segment.get_file_actions_schema_and_sidecars(&engine)?;
     let schema = schema.expect("V1 checkpoint should yield a file actions schema");
     if expect_hint_schema_used {
         assert_eq!(schema, hint_schema, "should use hint when versions match");
@@ -3482,7 +3803,7 @@ async fn test_get_file_actions_schema_v2_identity_filter(
         }),
     )?;
 
-    let (schema, sidecars) = log_segment.get_file_actions_schema_and_sidecars(&engine, None)?;
+    let (schema, sidecars) = log_segment.get_file_actions_schema_and_sidecars(&engine)?;
     let schema = schema.expect("leaf V2 checkpoint should yield a file actions schema");
     if identity_matches {
         assert_eq!(
@@ -3563,7 +3884,7 @@ async fn test_get_file_actions_schema_multi_part_v1(#[case] use_hint: bool) -> K
         }),
     )?;
 
-    let (schema, sidecars) = log_segment.get_file_actions_schema_and_sidecars(&engine, None)?;
+    let (schema, sidecars) = log_segment.get_file_actions_schema_and_sidecars(&engine)?;
     let schema = schema.expect("Multi-part V1 should return file actions schema");
 
     // Verify stats_parsed is detectable in the returned schema.
@@ -3717,8 +4038,8 @@ async fn test_max_published_version_published_and_staged_commits_with_overlap() 
 }
 
 #[tokio::test]
-async fn test_max_published_version_checkpoint_followed_by_published_and_staged_commits_with_overlap(
-) {
+async fn test_max_published_version_checkpoint_followed_by_published_and_staged_commits_with_overlap()
+ {
     let log_segment = create_segment_for(LogSegmentConfig {
         published_commit_versions: &[5, 6, 7, 8, 9],
         staged_commit_versions: &[7, 8, 9, 10],
@@ -3848,7 +4169,6 @@ async fn test_checkpoint_stream_resolves_stats_projection(
         None, // meta_predicate
         Some(&stats_schema),
         None, // partition_schema
-        None, // cancellation_token
     )?;
 
     assert_eq!(
@@ -4560,7 +4880,6 @@ async fn test_checkpoint_stream_sets_has_partition_values_parsed() -> KernelResu
         None, // meta_predicate
         None, // stats_schema
         Some(&partition_schema),
-        None, // cancellation_token
     )?;
 
     // Verify that checkpoint_info reports partitionValues_parsed as available
@@ -4625,7 +4944,6 @@ async fn test_checkpoint_stream_no_partition_values_parsed_when_incompatible() -
         None,
         None,
         Some(&partition_schema),
-        None, // cancellation_token
     )?;
 
     // Verify it's false
@@ -4883,7 +5201,7 @@ async fn test_new_with_commit_not_end_version_plus_one() {
 
     assert_result_error_with_message(
         result,
-        "Cannot extend and create new LogSegment. Tail commit file version (10) does not equal LogSegment end_version (4) + 1."
+        "Cannot extend and create new LogSegment. Tail commit file version (10) does not equal LogSegment end_version (4) + 1.",
     );
 }
 
@@ -5007,7 +5325,7 @@ async fn test_try_new_with_crc_file_rejects_invalid_path(
     })
     .await;
     let url = Url::parse(path).unwrap();
-    let crc_path = ParsedLogPath::try_from(url).unwrap().unwrap();
+    let crc_path = ParsedLogPath::new(url).unwrap();
     let result = log_segment.try_new_with_crc_file(crc_path);
     assert_result_error_with_message(result, expected_error);
 }
@@ -5021,7 +5339,7 @@ async fn test_try_new_with_crc_file_sets_crc_and_preserves_other_fields() {
     })
     .await;
     let url = Url::parse("file:///_delta_log/00000000000000000002.crc").unwrap();
-    let crc_path = ParsedLogPath::try_from(url).unwrap().unwrap();
+    let crc_path = ParsedLogPath::new(url).unwrap();
     let result = log_segment.try_new_with_crc_file(crc_path).unwrap();
 
     let crc_file = result.listed.latest_crc_file.as_ref().unwrap();
@@ -5042,8 +5360,310 @@ async fn test_try_new_with_crc_file_sets_crc_and_preserves_other_fields() {
 }
 
 // ============================================================================
-// get_unpublished_catalog_commits tests
+// Commit publication tests
 // ============================================================================
+
+/// With published commits 0 and 1 and staged commits 1 and 2, publishing through 2 replaces both
+/// staged paths. Commit 1's path must change even though commit 1 was already published.
+/// Commits newer than `published_through` must keep their staged paths.
+#[rstest]
+#[case::one_commit_already_published(&[0, 1], &[1, 2], Some(2), true)]
+#[case::commit_2_stays_staged(&[0], &[1, 2], Some(1), true)]
+#[case::none_published(&[], &[0, 1], None, false)]
+#[case::version_zero(&[], &[0], Some(0), true)]
+#[case::all_staged(&[], &[0, 1], Some(1), true)]
+#[case::all_paths_already_published(&[0, 1, 2], &[], Some(2), false)]
+#[case::published_commits_with_staged_paths(&[0, 1, 2], &[1, 2], Some(2), true)]
+#[tokio::test]
+async fn test_new_as_published_uses_published_file_metadata(
+    #[case] published_commit_versions: &[Version],
+    #[case] staged_commit_versions: &[Version],
+    #[case] published_through: Option<Version>,
+    #[case] expect_updated: bool,
+) {
+    // GIVEN: a commit version may have both a published file and a catalog-supplied staged file.
+    let mut original = create_segment_for(LogSegmentConfig {
+        published_commit_versions,
+        staged_commit_versions,
+        ..Default::default()
+    })
+    .await;
+    // Only destinations eligible for replacement exist; reading any other path must fail.
+    let paths: Vec<_> = staged_commit_versions
+        .iter()
+        .filter(|version| published_through.is_some_and(|through| **version <= through))
+        .map(|version| delta_path_for_version(*version, "json"))
+        .collect();
+    let (storage, _) = build_log_with_paths_and_checkpoint(&paths, None).await;
+    let engine = DelegatingEngine::new(Arc::new(PanicEngine)).with_storage_handler(storage.clone());
+    for file in original
+        .listed
+        .ascending_commit_files
+        .iter_mut()
+        .chain(original.listed.latest_commit_file.iter_mut())
+    {
+        file.location.size = 123 + file.version;
+        if file.file_type == StagedCommit
+            && published_through.is_some_and(|version| file.version <= version)
+        {
+            let destination = original
+                .log_root
+                .join(&published_commit_file_name(file.version))
+                .unwrap();
+            file.location.last_modified = storage.head(&destination).unwrap().last_modified - 1000;
+        }
+    }
+    let source = original.clone();
+    let publish_engine: &dyn Engine = if expect_updated {
+        &engine
+    } else {
+        &PanicEngine
+    };
+
+    // WHEN: replace staged references through the published version.
+    let updated = original
+        .new_as_published(publish_engine, published_through)
+        .unwrap();
+
+    // THEN: use destination metadata only for eligible references.
+    assert_eq!(updated.is_some(), expect_updated);
+    let published = updated.as_ref().unwrap_or(&original);
+
+    let assert_reference = |before: &ParsedLogPath, after: &ParsedLogPath| {
+        if before.file_type == StagedCommit
+            && published_through.is_some_and(|version| before.version <= version)
+        {
+            let filename = format!("{:020}.json", before.version);
+            assert_eq!(
+                after.location.location,
+                original.log_root.join(&filename).unwrap()
+            );
+            assert_eq!(after.filename, filename);
+            assert_eq!(after.extension, "json");
+            assert_eq!(after.file_type, Commit);
+            assert_eq!(after.version, before.version);
+            let expected = storage.head(&after.location.location).unwrap();
+            assert_eq!(after.location, expected);
+            assert_eq!(
+                after.location.last_modified - before.location.last_modified,
+                1000
+            );
+            assert_ne!(after.location.size, before.location.size);
+        } else {
+            assert_eq!(after, before);
+        }
+    };
+    assert_eq!(
+        published.listed.ascending_commit_files.len(),
+        original.listed.ascending_commit_files.len()
+    );
+    for (before, after) in original
+        .listed
+        .ascending_commit_files
+        .iter()
+        .zip(&published.listed.ascending_commit_files)
+    {
+        assert_reference(before, after);
+    }
+    assert_reference(
+        original.listed.latest_commit_file.as_ref().unwrap(),
+        published.listed.latest_commit_file.as_ref().unwrap(),
+    );
+    assert_eq!(published.listed.max_published_version, published_through);
+    assert_eq!(published.end_version, original.end_version);
+    assert_eq!(published.log_root, original.log_root);
+    assert_eq!(original, source);
+    assert!(
+        published
+            .new_as_published(&PanicEngine, published_through)
+            .unwrap()
+            .is_none()
+    );
+}
+
+/// A checkpoint at version 2 supplies all log actions, so `ascending_commit_files` is empty.
+/// `latest_commit_file` can still name staged commit 2 for in-commit timestamp reads.
+/// Replace that path only when version 2 is known to be published.
+#[rstest]
+#[case::none_published(None, StagedCommit, false)]
+#[case::published_before_checkpoint(Some(1), StagedCommit, true)]
+#[case::checkpoint_commit_published(Some(2), Commit, true)]
+#[tokio::test]
+async fn test_new_as_published_with_checkpoint_at_snapshot_version(
+    #[case] published_through: Option<Version>,
+    #[case] expected_type: LogPathFileType,
+    #[case] expected_updated: bool,
+    #[values(false, true)] retain_latest: bool,
+) {
+    // GIVEN: a checkpoint at the snapshot version, with or without latest_commit_file.
+    let mut original = create_segment_for(LogSegmentConfig {
+        checkpoint_version: Some(2),
+        staged_commit_versions: &[2],
+        ..Default::default()
+    })
+    .await;
+    original.listed.latest_crc_file = Some(create_log_path(
+        "memory:///_delta_log/00000000000000000002.crc",
+    ));
+    original.last_checkpoint_metadata = Some(LastCheckpointHint {
+        version: 2,
+        ..Default::default()
+    });
+    if !retain_latest {
+        original.listed.latest_commit_file = None;
+    }
+
+    let (storage, _) =
+        build_log_with_paths_and_checkpoint(&[delta_path_for_version(2, "json")], None).await;
+    let engine = DelegatingEngine::new(Arc::new(PanicEngine)).with_storage_handler(storage.clone());
+    let publish_engine: &dyn Engine = if retain_latest && published_through == Some(2) {
+        &engine
+    } else {
+        &PanicEngine
+    };
+    let updated = original
+        .new_as_published(publish_engine, published_through)
+        .unwrap();
+
+    assert_eq!(updated.is_some(), expected_updated);
+    let published = updated.as_ref().unwrap_or(&original);
+
+    assert!(published.listed.ascending_commit_files.is_empty());
+    assert_eq!(published.checkpoint_version, original.checkpoint_version);
+    assert_eq!(
+        published.listed.checkpoint_parts,
+        original.listed.checkpoint_parts
+    );
+    assert_eq!(
+        published.listed.latest_crc_file,
+        original.listed.latest_crc_file
+    );
+    assert_eq!(
+        published.last_checkpoint_metadata,
+        original.last_checkpoint_metadata
+    );
+    assert_eq!(
+        published.listed.ascending_compaction_files,
+        original.listed.ascending_compaction_files
+    );
+    assert_eq!(published.listed.max_published_version, published_through);
+    assert_eq!(
+        published
+            .listed
+            .latest_commit_file
+            .as_ref()
+            .map(|file| file.file_type.clone()),
+        retain_latest.then_some(expected_type)
+    );
+    if retain_latest && published_through == Some(2) {
+        let latest = published.listed.latest_commit_file.as_ref().unwrap();
+        assert_eq!(
+            latest.location,
+            storage.head(&latest.location.location).unwrap()
+        );
+    }
+}
+
+#[rstest]
+#[case::first_destination_missing(2)]
+#[case::last_destination_missing(1)]
+#[tokio::test]
+async fn test_new_as_published_missing_destination_preserves_original(
+    #[case] present_version: Version,
+) {
+    let original = create_segment_for(LogSegmentConfig {
+        published_commit_versions: &[0],
+        staged_commit_versions: &[1, 2],
+        ..Default::default()
+    })
+    .await;
+    let source = original.clone();
+    let (storage, _) = build_log_with_paths_and_checkpoint(
+        &[delta_path_for_version(present_version, "json")],
+        None,
+    )
+    .await;
+    let engine = DelegatingEngine::new(Arc::new(PanicEngine)).with_storage_handler(storage);
+
+    let result = original.new_as_published(&engine, Some(2));
+
+    assert!(matches!(result, Err(KernelError::FileNotFound(_))));
+    assert_eq!(original, source);
+}
+
+#[rstest]
+#[case::after_snapshot_version(Some(3))]
+#[case::before_published_version(Some(0))]
+#[case::missing_published_version(None)]
+#[tokio::test]
+async fn test_new_as_published_rejects_invalid_published_version(
+    #[case] published_through: Option<Version>,
+) {
+    // GIVEN: commits 0 and 1 are published; staged commit 2 is not.
+    let original = create_segment_for(LogSegmentConfig {
+        published_commit_versions: &[0, 1],
+        staged_commit_versions: &[2],
+        ..Default::default()
+    })
+    .await;
+
+    // WHEN: publication would exceed version 2 or forget that version 1 is already published.
+    let result = original.new_as_published(&PanicEngine, published_through);
+
+    // THEN: reject the invalid published version.
+    assert!(matches!(result, Err(KernelError::InvalidLogSegment(_))));
+}
+
+#[tokio::test]
+async fn test_new_as_published_preserves_checkpoints_and_log_compactions() {
+    // GIVEN: a checkpoint at 0, a log compaction for 1-2, and staged paths for published commits
+    // 2-3.
+    let original = create_segment_for(LogSegmentConfig {
+        published_commit_versions: &[0, 1, 2, 3],
+        staged_commit_versions: &[2, 3],
+        checkpoint_version: Some(0),
+        ..Default::default()
+    })
+    .await;
+    // Snapshot listing excludes compactions, so construct the retained reference directly.
+    let mut listed = original.listed;
+    listed.ascending_compaction_files.push(create_log_path(
+        "memory:///_delta_log/00000000000000000001.00000000000000000002.compacted.json",
+    ));
+    let original = LogSegment::try_new(
+        listed,
+        original.log_root,
+        Some(original.end_version),
+        original.last_checkpoint_metadata,
+    )
+    .unwrap();
+    assert!(!original.listed.ascending_compaction_files.is_empty());
+    assert!(!original.listed.checkpoint_parts.is_empty());
+
+    let (storage, _) = build_log_with_paths_and_checkpoint(
+        &[
+            delta_path_for_version(2, "json"),
+            delta_path_for_version(3, "json"),
+        ],
+        None,
+    )
+    .await;
+    let engine = DelegatingEngine::new(Arc::new(PanicEngine)).with_storage_handler(storage);
+    let published = original
+        .new_as_published(&engine, Some(3))
+        .unwrap()
+        .unwrap();
+
+    // THEN: the checkpoint and log compaction files are unchanged.
+    assert_eq!(
+        published.listed.ascending_compaction_files,
+        original.listed.ascending_compaction_files
+    );
+    assert_eq!(
+        published.listed.checkpoint_parts,
+        original.listed.checkpoint_parts
+    );
+}
 
 #[tokio::test]
 async fn test_get_unpublished_catalog_commits() {
@@ -5435,12 +6055,12 @@ fn new_for_version_zero_rejects_non_commit_file() {
 }
 
 #[test]
-fn test_commit_phase_processes_commits() -> KernelResult<()> {
+fn test_commit_phase_processes_commits() -> Result<()> {
     let (engine, snapshot, _tempdir) = load_test_table("app-txn-no-checkpoint")?;
     let log_segment = snapshot.log_segment();
 
     let schema = COMMIT_READ_SCHEMA.clone();
-    let commit_actions = log_segment.read_commit_actions(engine.as_ref(), schema, None)?;
+    let commit_actions = log_segment.read_commit_actions(engine.as_ref(), schema)?;
 
     let mut file_paths = vec![];
     for result in commit_actions {
@@ -5481,9 +6101,26 @@ fn test_commit_phase_processes_commits() -> KernelResult<()> {
 }
 
 #[cfg(feature = "adaptive-metadata-in-dev")]
-#[test]
-fn latest_checkpoint_action_returns_none_without_checkpoint() -> KernelResult<()> {
+#[rstest]
+#[case::no_checkpoint_action(false)]
+#[case::checkpoint_action_in_log(true)]
+fn latest_checkpoint_action_returns_none_on_non_amt_table(
+    #[case] write_checkpoint_action: bool,
+) -> Result<()> {
     let (engine, table_root) = setup_table()?;
+    if write_checkpoint_action {
+        // The action carries the table's own protocol, so adaptiveMetadata stays disabled.
+        let config = Snapshot::builder_for(table_root.clone())
+            .build(&engine)?
+            .table_configuration()
+            .clone();
+        let checkpoint = CheckpointAction {
+            protocol: config.protocol().clone(),
+            metadata: config.metadata().clone(),
+            ..minimal_checkpoint_action("metadata/root-v1.parquet", 1)?
+        };
+        write_manifest_commit(&engine, &table_root, 1, checkpoint)?;
+    }
     let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
     assert!(snapshot.latest_checkpoint_action(&engine)?.is_none());
     Ok(())
@@ -5492,19 +6129,19 @@ fn latest_checkpoint_action_returns_none_without_checkpoint() -> KernelResult<()
 // The log is replayed newest-first, so the most recent `checkpoint` action wins.
 #[cfg(feature = "adaptive-metadata-in-dev")]
 #[test]
-fn latest_checkpoint_action_returns_the_latest_of_multiple() -> KernelResult<()> {
+fn latest_checkpoint_action_returns_the_latest_of_multiple() -> Result<()> {
     let (engine, table_root) = setup_table()?;
-    write_commit(
+    write_manifest_commit(
         &engine,
         &table_root,
         1,
-        minimal_checkpoint_action("metadata/root-v1.parquet", 1)?.into_engine_data(&engine)?,
+        minimal_checkpoint_action("metadata/root-v1.parquet", 1)?,
     )?;
-    write_commit(
+    write_manifest_commit(
         &engine,
         &table_root,
         2,
-        minimal_checkpoint_action("metadata/root-v2.parquet", 2)?.into_engine_data(&engine)?,
+        minimal_checkpoint_action("metadata/root-v2.parquet", 2)?,
     )?;
 
     let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
@@ -5522,13 +6159,13 @@ fn latest_checkpoint_action_returns_the_latest_of_multiple() -> KernelResult<()>
 // A fresh snapshot does observe it.
 #[cfg(feature = "adaptive-metadata-in-dev")]
 #[test]
-fn latest_checkpoint_action_is_stable_when_newer_checkpoint_written_later() -> KernelResult<()> {
+fn latest_checkpoint_action_is_stable_when_newer_checkpoint_written_later() -> Result<()> {
     let (engine, table_root) = setup_table()?;
-    write_commit(
+    write_manifest_commit(
         &engine,
         &table_root,
         1,
-        minimal_checkpoint_action("metadata/root-v1.parquet", 1)?.into_engine_data(&engine)?,
+        minimal_checkpoint_action("metadata/root-v1.parquet", 1)?,
     )?;
 
     let snapshot = Snapshot::builder_for(table_root.clone()).build(&engine)?;
@@ -5539,11 +6176,11 @@ fn latest_checkpoint_action_is_stable_when_newer_checkpoint_written_later() -> K
     assert_eq!(first.version(), 1);
 
     // Write a newer checkpoint action AFTER the snapshot's log segment was frozen.
-    write_commit(
+    write_manifest_commit(
         &engine,
         &table_root,
         2,
-        minimal_checkpoint_action("metadata/root-v2.parquet", 2)?.into_engine_data(&engine)?,
+        minimal_checkpoint_action("metadata/root-v2.parquet", 2)?,
     )?;
 
     // The frozen snapshot still reports version 1.
@@ -5603,7 +6240,7 @@ async fn amt_last_checkpoint_hint_bounds_listing(
     #[case] checkpoint_file: Option<Version>,
     #[case] missing_commits: &[Version],
     #[case] end_version: Option<Version>,
-    #[case] expected: Result<(Option<Version>, Vec<Version>), &str>,
+    #[case] expected: KernelResult<(Option<Version>, Vec<Version>), &str>,
 ) {
     let hint = LastCheckpointHint {
         version: 5,
@@ -5628,7 +6265,6 @@ async fn amt_last_checkpoint_hint_bounds_listing(
         vec![], // log_tail
         Some(hint),
         end_version,
-        None,
     );
     match expected {
         Ok((checkpoint_version, commits)) => {
@@ -5644,17 +6280,21 @@ async fn amt_last_checkpoint_hint_bounds_listing(
 // the protocol and metadata come from the manifest commit's checkpoint action, not commit 0.
 #[cfg(feature = "adaptive-metadata-in-dev")]
 #[test]
-fn snapshot_with_amt_last_checkpoint_hint_skips_earlier_commits() -> KernelResult<()> {
+fn snapshot_with_amt_last_checkpoint_hint_skips_earlier_commits() -> Result<()> {
     let (engine, table_root) = setup_table()?;
-    for version in 1..=2 {
-        write_commit(
-            &engine,
-            &table_root,
-            version,
-            minimal_checkpoint_action(&format!("metadata/root-v{version}.parquet"), version)?
-                .into_engine_data(&engine)?,
-        )?;
-    }
+    write_manifest_commit(
+        &engine,
+        &table_root,
+        1,
+        minimal_checkpoint_action("metadata/root-v1.parquet", 1)?,
+    )?;
+    // v2 leaves P&M unchanged, so it has no top-level P&M and only its checkpoint action has them.
+    write_manifest_commit_keeping_pm(
+        &engine,
+        &table_root,
+        2,
+        minimal_checkpoint_action("metadata/root-v2.parquet", 2)?,
+    )?;
     let hint = LastCheckpointHint {
         version: 2,
         size: 1,
@@ -5665,7 +6305,7 @@ fn snapshot_with_amt_last_checkpoint_hint_skips_earlier_commits() -> KernelResul
         }),
         ..Default::default()
     };
-    let log_root = table_root.join("_delta_log/")?;
+    let log_root = table_root.join("_delta_log/").map_err(KernelError::from)?;
     engine.storage_handler().put(
         &LastCheckpointHint::path(&log_root)?,
         hint.to_json_bytes().into(),
