@@ -279,13 +279,13 @@ impl SidecarSplitter {
                 None
             })?;
             let batch = match result.and_then(|f| {
-                let _timer = self.metrics.start(CheckpointPhase::Selection);
+                let _timer = self.metrics.start(CheckpointPhase::OutputPreparation);
                 f.apply_selection_vector()
             }) {
                 Ok(b) => b,
                 Err(e) => return Some(Err(e)),
             };
-            let _timer = self.metrics.start(CheckpointPhase::SidecarSplit);
+            let _timer = self.metrics.start(CheckpointPhase::OutputPreparation);
             let non_file_actions_batch = match self.non_file_actions_picker.pick(batch.as_ref()) {
                 Ok(b) => b,
                 Err(e) => return Some(Err(e)),

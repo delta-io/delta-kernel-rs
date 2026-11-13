@@ -469,7 +469,7 @@ impl CheckpointWriter {
         metrics: CheckpointMetrics,
     ) -> KernelResult<(ActionReconciliationIterator, SchemaRef)> {
         let mut actions = {
-            let _timer = metrics.start(CheckpointPhase::InputSetup);
+            let _timer = metrics.start(CheckpointPhase::Input);
             self.snapshot
                 .log_segment()
                 .read_actions(engine, self.read_schema.clone())?
@@ -477,7 +477,7 @@ impl CheckpointWriter {
         let input_metrics = metrics.clone();
         let actions = std::iter::from_fn(move || {
             let batch = {
-                let _timer = input_metrics.start(CheckpointPhase::InputRead);
+                let _timer = input_metrics.start(CheckpointPhase::Input);
                 actions.next()
             };
             if let Some(Ok(batch)) = &batch {
@@ -497,9 +497,7 @@ impl CheckpointWriter {
             .map(move |batch| {
                 let batch = batch?;
                 let _timer = reconciliation_metrics.start(CheckpointPhase::Reconciliation);
-                let result = processor.process_actions_batch(batch);
-                reconciliation_metrics.record_reconciliation(processor.metrics());
-                result
+                processor.process_actions_batch(batch)
             })
             .filter_ok(HasSelectionVector::has_selected_rows);
 
@@ -708,7 +706,7 @@ impl CheckpointWriter {
         let state = data_iter.state();
         let lazy_data = data_iter.map(move |r| {
             r.and_then(|f| {
-                let _timer = metrics.start(CheckpointPhase::Selection);
+                let _timer = metrics.start(CheckpointPhase::OutputPreparation);
                 f.apply_selection_vector()
             })
         });

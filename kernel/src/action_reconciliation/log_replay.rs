@@ -62,18 +62,6 @@ pub(crate) struct ActionReconciliationProcessor {
     txn_expiration_timestamp: Option<i64>,
     /// Table root for normalizing paths. `Some` iff adaptiveMetadata is enabled.
     dv_normalization_root: Option<Url>,
-    metrics: ReconciliationMetrics,
-}
-
-/// Cumulative counts, including work completed before a visitor error.
-#[derive(Default)]
-pub(crate) struct ReconciliationMetrics {
-    pub(crate) num_add_files_seen: u64,
-    pub(crate) num_remove_files_seen: u64,
-    pub(crate) num_duplicate_file_actions: u64,
-    pub(crate) num_expired_tombstones: u64,
-    pub(crate) num_reconciled_actions: u64,
-    pub(crate) peak_hash_set_size: u64,
 }
 
 /// This struct is the output of the [`ActionReconciliationProcessor`].
@@ -242,37 +230,19 @@ impl ActionReconciliationProcessor {
             self.txn_expiration_timestamp,
             self.dv_normalization_root.clone(),
         );
-        let result = visitor.visit_rows_of(actions.as_ref());
-        let ActionReconciliationVisitor {
-            selection_vector,
-            actions_count,
-            add_actions_count,
-            remove_actions_count,
-            seen_protocol,
-            seen_metadata,
-            metrics,
-            ..
-        } = visitor;
-        self.metrics.num_add_files_seen += metrics.num_add_files_seen;
-        self.metrics.num_remove_files_seen += metrics.num_remove_files_seen;
-        self.metrics.num_duplicate_file_actions += metrics.num_duplicate_file_actions;
-        self.metrics.num_expired_tombstones += metrics.num_expired_tombstones;
-        self.metrics.num_reconciled_actions += actions_count as u64;
-        // This set grows only for log batches; checkpoint rows only probe it.
-        self.metrics.peak_hash_set_size = self.seen_file_keys.len() as u64;
-        result?;
+        visitor.visit_rows_of(actions.as_ref())?;
 
         // Update protocol and metadata seen flags
-        self.seen_protocol = seen_protocol;
-        self.seen_metadata = seen_metadata;
+        self.seen_protocol = visitor.seen_protocol;
+        self.seen_metadata = visitor.seen_metadata;
 
-        let filtered_data = FilteredEngineData::try_new(actions, selection_vector)?;
+        let filtered_data = FilteredEngineData::try_new(actions, visitor.selection_vector)?;
 
         Ok(ActionReconciliationBatch {
             filtered_data,
-            actions_count,
-            add_actions_count,
-            remove_actions_count,
+            actions_count: visitor.actions_count,
+            add_actions_count: visitor.add_actions_count,
+            remove_actions_count: visitor.remove_actions_count,
         })
     }
 
@@ -290,12 +260,7 @@ impl ActionReconciliationProcessor {
             minimum_file_retention_timestamp,
             txn_expiration_timestamp,
             dv_normalization_root,
-            metrics: ReconciliationMetrics::default(),
         }
-    }
-
-    pub(crate) fn metrics(&self) -> &ReconciliationMetrics {
-        &self.metrics
     }
 }
 
@@ -370,7 +335,6 @@ pub(crate) struct ActionReconciliationVisitor<'seen> {
     seen_domains: &'seen mut HashSet<String>,
     /// Transaction expiration timestamp for filtering old transactions
     txn_expiration_timestamp: Option<i64>,
-    metrics: ReconciliationMetrics,
 }
 
 /// A projected column used by `ActionReconciliationVisitor`.
@@ -453,7 +417,6 @@ impl ActionReconciliationVisitor<'_> {
             seen_txns,
             seen_domains,
             txn_expiration_timestamp,
-            metrics: ReconciliationMetrics::default(),
         }
     }
 
@@ -507,21 +470,13 @@ impl ActionReconciliationVisitor<'_> {
             return Ok(None); // No file action found, continue checking other types
         };
 
-        if is_add {
-            self.metrics.num_add_files_seen += 1;
-        } else {
-            self.metrics.num_remove_files_seen += 1;
-        }
-
         // Check for valid, non-duplicate adds and non-expired removes
         let is_valid = if self.deduplicator.check_and_record_seen(file_key) {
-            self.metrics.num_duplicate_file_actions += 1;
             false // duplicate!
         } else if is_add {
             self.add_actions_count += 1;
             true
         } else if self.is_expired_tombstone(i, getters[Self::REMOVE_DELETION_TIMESTAMP.index])? {
-            self.metrics.num_expired_tombstones += 1;
             false
         } else {
             self.remove_actions_count += 1;
@@ -887,9 +842,8 @@ mod tests {
     fn reconciliation_counts_retained_unique_file_actions_across_batches(
         #[case] minimum_file_retention_timestamp: i64,
         #[case] expected_remove_count: i64,
-        #[values(false, true)] checkpoint_batch: bool,
     ) -> KernelResult<()> {
-        let mut input_batches = vec![
+        let input_batches = vec![
             create_batch(vec![
                 r#"{"remove":{"path":"removed","deletionTimestamp":100,"dataChange":true}}"#,
                 r#"{"remove":{"path":"removed","deletionTimestamp":100,"dataChange":true}}"#,
@@ -910,34 +864,13 @@ mod tests {
                 r#"{"remove":{"path":"third","deletionTimestamp":99,"dataChange":true}}"#,
             ])?,
         ];
-        input_batches[1].is_log_batch = !checkpoint_batch;
         let mut processor =
             ActionReconciliationProcessor::new(minimum_file_retention_timestamp, None, None);
-        let iterator =
-            ActionReconciliationIterator::new(Box::new(input_batches.into_iter().enumerate().map(
-                move |(index, batch)| {
-                    let result = processor.process_actions_batch(batch);
-                    if index == 1 {
-                        let metrics = processor.metrics();
-                        assert_eq!(metrics.num_add_files_seen, 2);
-                        assert_eq!(metrics.num_remove_files_seen, 6);
-                        assert_eq!(metrics.num_duplicate_file_actions, 4);
-                        assert_eq!(
-                            metrics.num_expired_tombstones,
-                            3 - expected_remove_count as u64
-                        );
-                        assert_eq!(
-                            metrics.num_reconciled_actions,
-                            2 + expected_remove_count as u64
-                        );
-                        assert_eq!(
-                            metrics.peak_hash_set_size,
-                            if checkpoint_batch { 3 } else { 4 }
-                        );
-                    }
-                    result
-                },
-            )));
+        let iterator = ActionReconciliationIterator::new(Box::new(
+            input_batches
+                .into_iter()
+                .map(move |batch| processor.process_actions_batch(batch)),
+        ));
         let state = iterator.state();
         assert!(!state.is_exhausted());
 
@@ -958,45 +891,6 @@ mod tests {
             })
             .sum();
         assert_eq!(selected_rows as i64, state.actions_count());
-        Ok(())
-    }
-
-    #[test]
-    fn reconciliation_metrics_preserve_partial_work_on_visitor_error() -> KernelResult<()> {
-        let add = concat!(
-            r#"{"add":{"path":"active","partitionValues":{},"size":1,"#,
-            r#""modificationTime":1,"dataChange":true}}"#,
-        );
-        let batch = create_batch(vec![
-            add,
-            add,
-            r#"{"remove":{"path":"expired","deletionTimestamp":1,"dataChange":true}}"#,
-            concat!(
-                r#"{"add":{"path":"broken","partitionValues":{},"size":1,"#,
-                r#""modificationTime":1,"dataChange":true,"#,
-                r#""deletionVector":{"storageType":"unknown","pathOrInlineDv":"dv","#,
-                r#""sizeInBytes":1,"cardinality":1}}}"#,
-            ),
-        ])?;
-        let mut processor =
-            ActionReconciliationProcessor::new(100, None, Some(Url::parse("memory:///").unwrap()));
-
-        let result = processor.process_actions_batch(batch);
-
-        assert!(
-            result
-                .err()
-                .unwrap()
-                .to_string()
-                .contains("unsupported deletion vector storage type")
-        );
-        let metrics = processor.metrics();
-        assert_eq!(metrics.num_add_files_seen, 2);
-        assert_eq!(metrics.num_remove_files_seen, 1);
-        assert_eq!(metrics.num_duplicate_file_actions, 1);
-        assert_eq!(metrics.num_expired_tombstones, 1);
-        assert_eq!(metrics.num_reconciled_actions, 1);
-        assert_eq!(metrics.peak_hash_set_size, 2);
         Ok(())
     }
 

@@ -1754,11 +1754,8 @@ impl Snapshot {
         skip_all,
         fields(report, operation_id = %MetricId::new(), version, outcome, mode, duration_ns,
             bytes_written, num_add_files, num_remove_files, num_actions, num_sidecars,
-            input_setup_duration_ns, input_read_duration_ns, reconciliation_duration_ns,
-            stats_transform_duration_ns, selection_duration_ns, sidecar_split_duration_ns,
-            num_input_batches, num_log_rows, num_checkpoint_rows, num_add_files_seen,
-            num_remove_files_seen, num_duplicate_file_actions, num_expired_tombstones,
-            num_reconciled_actions, peak_hash_set_size),
+            input_duration_ns, reconciliation_duration_ns, stats_transform_duration_ns,
+            output_preparation_duration_ns, num_log_rows, num_checkpoint_rows),
         err
     )]
     pub fn checkpoint(

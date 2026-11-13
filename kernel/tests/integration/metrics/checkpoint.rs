@@ -100,27 +100,14 @@ async fn checkpoint_reports_reconciled_counts_and_stored_bytes(
     assert_ne!(operation_id.as_bytes(), [0; 16]);
     assert_eq!(event.version, snapshot.version());
     let processing = &event.processing;
-    assert_eq!(processing.num_add_files_seen, 2);
-    assert_eq!(processing.num_remove_files_seen, 1);
-    assert_eq!(processing.num_duplicate_file_actions, 1);
-    assert_eq!(processing.num_expired_tombstones, 0);
-    assert_eq!(processing.num_reconciled_actions, 4);
-    assert_eq!(processing.peak_hash_set_size, 2);
     assert_eq!(processing.num_checkpoint_rows > 0, previous_checkpoint);
     assert!(processing.num_log_rows > 0);
-    assert_eq!(
-        processing.num_input_batches,
-        processing.num_log_rows + processing.num_checkpoint_rows
-    );
-    assert!(processing.input_setup_duration > Duration::ZERO);
-    assert!(processing.input_read_duration > Duration::ZERO);
+    // Include input rows discarded by reconciliation.
+    assert!(processing.num_log_rows + processing.num_checkpoint_rows > 4);
+    assert!(processing.input_duration > Duration::ZERO);
     assert!(processing.reconciliation_duration > Duration::ZERO);
     assert!(processing.stats_transform_duration > Duration::ZERO);
-    assert!(processing.selection_duration > Duration::ZERO);
-    assert_eq!(
-        processing.sidecar_split_duration > Duration::ZERO,
-        num_sidecars > 0
-    );
+    assert!(processing.output_preparation_duration > Duration::ZERO);
     assert_processing_within_duration(processing, event.duration);
     let CheckpointWriteOutcome::Written { stats } = event.outcome else {
         panic!("expected Written");
@@ -300,8 +287,8 @@ async fn checkpoint_duration_includes_data_writes_and_excludes_hint_writes(
         (event.mode, event.duration, &event.processing)
     };
     assert_eq!(mode, CheckpointWriteMode::V1);
-    assert_eq!(processing.num_add_files_seen, 1);
-    assert_eq!(processing.num_reconciled_actions, 3);
+    assert_eq!(processing.num_log_rows, 5);
+    assert_eq!(processing.num_checkpoint_rows, 0);
     assert_processing_within_duration(processing, duration);
     assert!(duration >= checkpoint_delay);
     let hint_duration = engine.json.hint_duration.lock().unwrap().unwrap();
@@ -311,7 +298,7 @@ async fn checkpoint_duration_includes_data_writes_and_excludes_hint_writes(
 
 #[rstest]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn checkpoint_input_timing_includes_sidecar_peek_and_failing_pulls(
+async fn checkpoint_input_timing_includes_setup_sidecar_peek_and_failing_pulls(
     #[values(false, true)] sidecars: bool,
     #[values(None, Some(0), Some(1))] fail_after: Option<usize>,
 ) -> delta_kernel::Result<()> {
@@ -344,7 +331,7 @@ async fn checkpoint_input_timing_includes_sidecar_peek_and_failing_pulls(
     let (processing, duration, operation_id) = match &events[0] {
         MetricEvent::CheckpointWriteSuccess(event) if fail_after.is_none() => {
             assert_eq!(result?.0, CheckpointWriteResult::Written);
-            assert_eq!(event.processing.num_reconciled_actions, 3);
+            assert_eq!(event.processing.num_log_rows, 5);
             (&event.processing, event.duration, event.operation_id)
         }
         MetricEvent::CheckpointWriteFailure(event) if fail_after.is_some() => {
@@ -355,13 +342,14 @@ async fn checkpoint_input_timing_includes_sidecar_peek_and_failing_pulls(
                     .contains("injected input failure")
             );
             let consumed = fail_after.unwrap() as u64;
-            assert_eq!(event.processing.num_input_batches, consumed);
             assert_eq!(event.processing.num_log_rows, consumed);
             (&event.processing, event.duration, event.operation_id)
         }
         event => panic!("unexpected checkpoint event: {event:?}"),
     };
-    assert!(processing.input_read_duration >= delay * (fail_after.unwrap_or(0) as u32 + 1));
+    assert_eq!(processing.num_checkpoint_rows, 0);
+    // One delay for setup, one per row, and one for the final or failing pull.
+    assert!(processing.input_duration >= delay * (processing.num_log_rows as u32 + 2));
     assert_processing_within_duration(processing, duration);
 
     // Reuse the snapshot for a fresh attempt to detect state leaking across calls.
@@ -373,8 +361,8 @@ async fn checkpoint_input_timing_includes_sidecar_peek_and_failing_pulls(
         panic!("expected successful retry");
     };
     assert_ne!(event.operation_id, operation_id);
-    assert_eq!(event.processing.num_add_files_seen, 1);
-    assert_eq!(event.processing.num_reconciled_actions, 3);
+    assert_eq!(event.processing.num_log_rows, 5);
+    assert_eq!(event.processing.num_checkpoint_rows, 0);
     Ok(())
 }
 
@@ -489,12 +477,10 @@ fn checkpoint_events(reporter: &CapturingReporter) -> Vec<MetricEvent> {
 }
 
 fn assert_processing_within_duration(processing: &CheckpointProcessingStats, duration: Duration) {
-    let stages = processing.input_setup_duration
-        + processing.input_read_duration
+    let stages = processing.input_duration
         + processing.reconciliation_duration
         + processing.stats_transform_duration
-        + processing.selection_duration
-        + processing.sidecar_split_duration;
+        + processing.output_preparation_duration;
     assert!(
         stages <= duration,
         "pipeline timers overlap: {processing:?}, total={duration:?}"
@@ -583,6 +569,7 @@ impl JsonHandler for ControlledJsonHandler {
         physical_schema: SchemaRef,
         predicate: Option<PredicateRef>,
     ) -> KernelResult<FileDataReadResultIterator> {
+        std::thread::sleep(self.input_delay);
         let mut input = self
             .inner
             .read_json_files(files, physical_schema, predicate)?;

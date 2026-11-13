@@ -467,21 +467,12 @@ mod tests {
                 num_remove_files = Empty,
                 num_actions = Empty,
                 num_sidecars = Empty,
-                input_setup_duration_ns = Empty,
-                input_read_duration_ns = Empty,
+                input_duration_ns = Empty,
                 reconciliation_duration_ns = Empty,
                 stats_transform_duration_ns = Empty,
-                selection_duration_ns = Empty,
-                sidecar_split_duration_ns = Empty,
-                num_input_batches = Empty,
+                output_preparation_duration_ns = Empty,
                 num_log_rows = Empty,
                 num_checkpoint_rows = Empty,
-                num_add_files_seen = Empty,
-                num_remove_files_seen = Empty,
-                num_duplicate_file_actions = Empty,
-                num_expired_tombstones = Empty,
-                num_reconciled_actions = Empty,
-                peak_hash_set_size = Empty,
             );
             let _entered = span.enter();
             span.record("mode", "v2_with_sidecars");
@@ -493,21 +484,12 @@ mod tests {
             span.record("num_sidecars", 1u64);
             for (name, value) in [
                 ("version", 42u64),
-                ("input_setup_duration_ns", 1),
-                ("input_read_duration_ns", 2),
-                ("reconciliation_duration_ns", 3),
-                ("stats_transform_duration_ns", 4),
-                ("selection_duration_ns", 5),
-                ("sidecar_split_duration_ns", 6),
-                ("num_input_batches", 7),
-                ("num_log_rows", 8),
-                ("num_checkpoint_rows", 9),
-                ("num_add_files_seen", 10),
-                ("num_remove_files_seen", 11),
-                ("num_duplicate_file_actions", 12),
-                ("num_expired_tombstones", 13),
-                ("num_reconciled_actions", 14),
-                ("peak_hash_set_size", 15),
+                ("input_duration_ns", 1),
+                ("reconciliation_duration_ns", 2),
+                ("stats_transform_duration_ns", 3),
+                ("output_preparation_duration_ns", 4),
+                ("num_log_rows", 5),
+                ("num_checkpoint_rows", 6),
             ] {
                 span.record(name, value);
             }
@@ -555,21 +537,12 @@ mod tests {
         assert_eq!(
             processing,
             CheckpointProcessingStats {
-                input_setup_duration: Duration::from_nanos(1),
-                input_read_duration: Duration::from_nanos(2),
-                reconciliation_duration: Duration::from_nanos(3),
-                stats_transform_duration: Duration::from_nanos(4),
-                selection_duration: Duration::from_nanos(5),
-                sidecar_split_duration: Duration::from_nanos(6),
-                num_input_batches: 7,
-                num_log_rows: 8,
-                num_checkpoint_rows: 9,
-                num_add_files_seen: 10,
-                num_remove_files_seen: 11,
-                num_duplicate_file_actions: 12,
-                num_expired_tombstones: 13,
-                num_reconciled_actions: 14,
-                peak_hash_set_size: 15,
+                input_duration: Duration::from_nanos(1),
+                reconciliation_duration: Duration::from_nanos(2),
+                stats_transform_duration: Duration::from_nanos(3),
+                output_preparation_duration: Duration::from_nanos(4),
+                num_log_rows: 5,
+                num_checkpoint_rows: 6,
             }
         );
     }

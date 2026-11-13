@@ -406,56 +406,31 @@ pub struct CheckpointWriteFailure {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[repr(C)]
 pub struct CheckpointProcessingStats {
-    /// Time creating the log-action input iterator, in nanoseconds.
-    pub input_setup_duration_ns: u64,
-    /// Time advancing input, including reads, decoding, waits, and the final or failing pull.
-    pub input_read_duration_ns: u64,
+    /// Time creating and advancing the input iterator, in nanoseconds.
+    /// Includes reads, decoding, waits, and the final or failing pull.
+    pub input_duration_ns: u64,
     /// Time reconciling actions and constructing selection vectors, in nanoseconds.
     pub reconciliation_duration_ns: u64,
     /// Time evaluating statistics and partition-value representation transforms, in nanoseconds.
     pub stats_transform_duration_ns: u64,
-    /// Time applying reconciliation selection vectors, in nanoseconds.
-    pub selection_duration_ns: u64,
-    /// Time projecting and filtering file/non-file actions for sidecars, in nanoseconds.
-    pub sidecar_split_duration_ns: u64,
-    /// Successfully received input batches, including fully discarded batches.
-    pub num_input_batches: u64,
+    /// Time applying selection vectors to output batches, in nanoseconds.
+    /// Includes projection and filtering of file/non-file actions for sidecar output.
+    pub output_preparation_duration_ns: u64,
     /// Input rows from the log after the previous checkpoint.
     pub num_log_rows: u64,
     /// Input rows from the previous checkpoint and its sidecars.
     pub num_checkpoint_rows: u64,
-    /// Add-file actions encountered before deduplication.
-    pub num_add_files_seen: u64,
-    /// Remove-file actions encountered before deduplication and retention filtering.
-    pub num_remove_files_seen: u64,
-    /// File actions suppressed by a newer action with the same path and deletion-vector ID.
-    pub num_duplicate_file_actions: u64,
-    /// Non-duplicate Remove-file actions discarded by retention filtering.
-    pub num_expired_tombstones: u64,
-    /// Actions selected by reconciliation, excluding generated metadata and sidecar references.
-    pub num_reconciled_actions: u64,
-    /// Peak number of file-action keys held for deduplication, not bytes.
-    pub peak_hash_set_size: u64,
 }
 
 impl From<kernel::CheckpointProcessingStats> for CheckpointProcessingStats {
     fn from(stats: kernel::CheckpointProcessingStats) -> Self {
         Self {
-            input_setup_duration_ns: duration_ns(stats.input_setup_duration),
-            input_read_duration_ns: duration_ns(stats.input_read_duration),
+            input_duration_ns: duration_ns(stats.input_duration),
             reconciliation_duration_ns: duration_ns(stats.reconciliation_duration),
             stats_transform_duration_ns: duration_ns(stats.stats_transform_duration),
-            selection_duration_ns: duration_ns(stats.selection_duration),
-            sidecar_split_duration_ns: duration_ns(stats.sidecar_split_duration),
-            num_input_batches: stats.num_input_batches,
+            output_preparation_duration_ns: duration_ns(stats.output_preparation_duration),
             num_log_rows: stats.num_log_rows,
             num_checkpoint_rows: stats.num_checkpoint_rows,
-            num_add_files_seen: stats.num_add_files_seen,
-            num_remove_files_seen: stats.num_remove_files_seen,
-            num_duplicate_file_actions: stats.num_duplicate_file_actions,
-            num_expired_tombstones: stats.num_expired_tombstones,
-            num_reconciled_actions: stats.num_reconciled_actions,
-            peak_hash_set_size: stats.peak_hash_set_size,
         }
     }
 }
@@ -1170,38 +1145,20 @@ mod tests {
     -> (kernel::CheckpointProcessingStats, CheckpointProcessingStats) {
         (
             kernel::CheckpointProcessingStats {
-                input_setup_duration: Duration::from_nanos(1),
-                input_read_duration: Duration::from_nanos(2),
-                reconciliation_duration: Duration::from_nanos(3),
-                stats_transform_duration: Duration::from_nanos(4),
-                selection_duration: Duration::from_nanos(5),
-                sidecar_split_duration: Duration::from_nanos(6),
-                num_input_batches: 7,
-                num_log_rows: 8,
-                num_checkpoint_rows: 9,
-                num_add_files_seen: 10,
-                num_remove_files_seen: 11,
-                num_duplicate_file_actions: 12,
-                num_expired_tombstones: 13,
-                num_reconciled_actions: 14,
-                peak_hash_set_size: 15,
+                input_duration: Duration::from_nanos(1),
+                reconciliation_duration: Duration::from_nanos(2),
+                stats_transform_duration: Duration::from_nanos(3),
+                output_preparation_duration: Duration::from_nanos(4),
+                num_log_rows: 5,
+                num_checkpoint_rows: 6,
             },
             CheckpointProcessingStats {
-                input_setup_duration_ns: 1,
-                input_read_duration_ns: 2,
-                reconciliation_duration_ns: 3,
-                stats_transform_duration_ns: 4,
-                selection_duration_ns: 5,
-                sidecar_split_duration_ns: 6,
-                num_input_batches: 7,
-                num_log_rows: 8,
-                num_checkpoint_rows: 9,
-                num_add_files_seen: 10,
-                num_remove_files_seen: 11,
-                num_duplicate_file_actions: 12,
-                num_expired_tombstones: 13,
-                num_reconciled_actions: 14,
-                peak_hash_set_size: 15,
+                input_duration_ns: 1,
+                reconciliation_duration_ns: 2,
+                stats_transform_duration_ns: 3,
+                output_preparation_duration_ns: 4,
+                num_log_rows: 5,
+                num_checkpoint_rows: 6,
             },
         )
     }
