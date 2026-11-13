@@ -6,6 +6,9 @@ import re
 
 
 BOT_MARKER = "<!-- ai-review-bot -->"
+REVISION_MARKER = re.compile(
+    r"<!-- ai-review-revision base=([0-9a-f]{40}) head=([0-9a-f]{40}) -->"
+)
 INLINE_FEEDBACK_FOOTER = (
     "\n\n---\n"
     "<sub>Feedback: react 👍 if helpful, 👎 if unhelpful or incorrect, "
@@ -73,6 +76,7 @@ def strip_review_body(body: str) -> str:
     if body.startswith(REVIEW_HEADER):
         body = body[len(REVIEW_HEADER) :].lstrip()
     body = _REVIEW_FOOTER.sub("", body)
+    body = REVISION_MARKER.sub("", body).rstrip()
     details_start = "<details><summary>Show review</summary>"
     if body.startswith(details_start) and body.rstrip().endswith("</details>"):
         body = body[len(details_start) :].lstrip()

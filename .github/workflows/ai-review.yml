@@ -38,6 +38,10 @@ on:
         description: PR number to review.
         required: true
         type: string
+      full_review:
+        description: Force a full review after a redesign or substantial rework.
+        type: boolean
+        default: false
       output_mode:
         description: Where to put the review.
         required: false
@@ -103,12 +107,14 @@ jobs:
       output_mode: ${{ steps.trigger.outputs.output_mode }}
       pr_number: ${{ steps.trigger.outputs.pr_number }}
       skip: ${{ steps.trigger.outputs.skip }}
+      full_review: ${{ steps.trigger.outputs.full_review }}
     steps:
       - name: Resolve trigger
         id: trigger
         env:
           ACTOR: ${{ github.actor }}
           COMMENT_BODY: ${{ github.event.comment.body }}
+          DISPATCH_FULL: ${{ inputs.full_review }}
           DISPATCH_MODE: ${{ inputs.output_mode }}
           DISPATCH_PR: ${{ inputs.pr }}
           EVENT_NAME: ${{ github.event_name }}
@@ -118,6 +124,7 @@ jobs:
         run: |
           set -euo pipefail
 
+          full_review=false
           skip=false
           mode=artifact
           auth_subject="$ACTOR"
@@ -132,13 +139,14 @@ jobs:
               for word in $command; do
                 case "$word" in
                   /review) ;;
+                  full) full_review=true ;;
                   artifact|dark) mode=artifact ;;
                   summary) mode=summary ;;
                   collapsed) mode=collapsed ;;
                   inline) mode=inline ;;
                   comment) mode=comment ;;
                   *)
-                    echo "::error::Unknown /review option '$word'. Use artifact, summary, collapsed, inline, or comment."
+                    echo "::error::Unknown /review option '$word'. Use full, artifact, summary, collapsed, inline, or comment."
                     exit 1
                     ;;
                 esac
@@ -150,6 +158,7 @@ jobs:
               auth_subject="$PR_AUTHOR"
               ;;
             workflow_dispatch)
+              full_review="${DISPATCH_FULL:-false}"
               n="$DISPATCH_PR"
               mode="${DISPATCH_MODE:-artifact}"
               ;;
@@ -168,6 +177,7 @@ jobs:
             *) echo "::error::Invalid output mode '$mode'."; exit 1 ;;
           esac
 
+          echo "full_review=$full_review" >> "$GITHUB_OUTPUT"
           echo "skip=$skip" >> "$GITHUB_OUTPUT"
           echo "auth_subject=$auth_subject" >> "$GITHUB_OUTPUT"
           echo "pr_number=$n" >> "$GITHUB_OUTPUT"
@@ -769,6 +779,7 @@ jobs:
         if: steps.creds.outputs.available == 'true'
         id: context
         env:
+          FORCE_FULL_REVIEW: ${{ needs.authorize.outputs.full_review }}
           GH_TOKEN: ${{ github.token }}
           OMNIGENT_BOT_LOGIN: ${{ vars.OMNIGENT_BOT_LOGIN }}
           OUTPUT_MODE: ${{ needs.authorize.outputs.output_mode }}
@@ -793,6 +804,7 @@ jobs:
                       author { __typename login }
                       body
                       submittedAt
+                      commit { oid }
                       comments(first: 50) {
                         nodes { fullDatabaseId path line originalLine body }
                       }
@@ -850,6 +862,7 @@ jobs:
 
           sys.path.insert(0, ".github/omnigent")
           from inline_review import inline_prompt_instructions
+          from review_incremental import select_review_diff
           from review_history import (
               DEFAULT_TRUSTED_BOT_LOGINS,
               attach_inline_comment_sides,
@@ -898,7 +911,15 @@ jobs:
                   "\n\n[PR description truncated at 4096 characters by the workflow. "
                   "Do not report omissions based on unavailable text.]"
               )
-          diff_bytes = pathlib.Path("/tmp/pr_diff.txt").read_bytes()
+          full_diff = pathlib.Path("/tmp/pr_diff.txt").read_text(errors="replace")
+          review_diff, review_scope, incremental = select_review_diff(
+              metadata=meta, history=history_document, full_diff=full_diff,
+              trusted_bot_logins=trusted_bot_logins,
+              force_full=os.environ.get("FORCE_FULL_REVIEW") == "true",
+          )
+          pathlib.Path("/tmp/review_diff.txt").write_text(review_diff)
+          pathlib.Path("/tmp/review_scope.json").write_text(json.dumps({"incremental": incremental}))
+          diff_bytes = review_diff.encode("utf-8")
           truncated = len(diff_bytes) > max_diff_bytes
           diff = diff_bytes[:max_diff_bytes].decode("utf-8", errors="replace")
           truncation_note = (
@@ -925,10 +946,15 @@ jobs:
               f"{meta['changed_files']} file(s)\n\n"
               "## PR Description\n"
               f"{body}\n\n"
-              "## PR Diff\n\n"
+              f"## Review scope\n{review_scope}\n\n"
+              "## Review Diff\n\n"
               "```diff\n"
               f"{diff}\n"
               f"```{truncation_note}\n"
+              "\n## Complete PR diff for title and description verification only\n"
+              f"```diff\n{full_diff[:30000]}\n```\n"
+              + ("[Complete PR diff truncated; do not infer omissions.]\n"
+                 if len(full_diff) > 30000 else "")
           )
           pathlib.Path("/tmp/reviewer_context.txt").write_text(reviewer_context)
 
@@ -999,7 +1025,10 @@ jobs:
           Failed agents: comma-separated checked-in agent names, or none
           Do not downgrade a finding to bypass a failed gate.
 
-          ## PR Diff
+          ## Review scope
+          {review_scope}
+
+          ## Review Diff
 
           ```diff
           {diff}
@@ -1166,6 +1195,7 @@ jobs:
           sys.path.insert(0, ".github/omnigent")
           from inline_review import extract_inline_findings
           from review_publish import extract_marked_review
+          from review_incremental import publication_findings, revision_marker
 
           raw = pathlib.Path("/tmp/review_raw_output.txt").read_text(errors="replace")
           marker = os.environ.get("REVIEW_MARKER", "")
@@ -1233,10 +1263,14 @@ jobs:
               except ValueError as error:
                   print(f"::error::AI inline review metadata is invalid: {error}.")
                   sys.exit(1)
+              scope = json.loads(pathlib.Path("/tmp/review_scope.json").read_text())
+              findings = publication_findings(findings, scope["incremental"])
               pathlib.Path("/tmp/inline_findings.json").write_text(
                   json.dumps(findings)
               )
 
+          meta = json.loads(pathlib.Path("/tmp/pr_meta.json").read_text())
+          body += "\n\n" + revision_marker(meta["base"]["sha"], meta["head"]["sha"])
           pathlib.Path("/tmp/review_output.txt").write_text(body + "\n")
           PYEOF
 
