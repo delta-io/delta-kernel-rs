@@ -11,7 +11,8 @@ use std::vec;
 
 use delta_kernel::actions::deletion_vector::split_vector;
 use delta_kernel::arrow::array::{
-    ArrayRef, AsArray as _, Int64Array, ListArray, RecordBatch, TimestampMicrosecondArray,
+    ArrayRef, AsArray as _, Decimal128Array, Int64Array, ListArray, RecordBatch,
+    TimestampMicrosecondArray,
 };
 use delta_kernel::arrow::compute::{concat_batches, filter_record_batch};
 use delta_kernel::arrow::datatypes::{
@@ -392,6 +393,21 @@ fn read_with_scan_metadata(
     let result_schema = Arc::new(ArrowSchema::try_from_kernel(
         scan.logical_schema().as_ref(),
     )?);
+    let batches = read_scan_metadata(location, engine, scan)?;
+    if expected.is_empty() {
+        assert_eq!(batches.len(), 0);
+    } else {
+        let batch = concat_batches(&result_schema, &batches)?;
+        assert_batches_sorted_eq!(expected, &[batch]);
+    }
+    Ok(())
+}
+
+fn read_scan_metadata(
+    location: &Url,
+    engine: &dyn Engine,
+    scan: &Scan,
+) -> Result<Vec<RecordBatch>, Box<dyn std::error::Error>> {
     let scan_metadata = scan.scan_metadata(engine)?;
     let mut scan_files = vec![];
     for res in scan_metadata {
@@ -445,13 +461,7 @@ fn read_with_scan_metadata(
         }
     }
 
-    if expected.is_empty() {
-        assert_eq!(batches.len(), 0);
-    } else {
-        let batch = concat_batches(&result_schema, &batches)?;
-        assert_batches_sorted_eq!(expected, &[batch]);
-    }
-    Ok(())
+    Ok(batches)
 }
 
 fn read_table_data(
@@ -1705,73 +1715,44 @@ fn type_widening_decimal() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[rstest::rstest]
-#[case::decimal_greater_scale(
-    "decimal_decimal_greater_scale",
-    Scalar::decimal(6_789_000, 20, 5).unwrap(),
-    vec![
-        "+-------------------------------+",
-        "| decimal_decimal_greater_scale |",
-        "+-------------------------------+",
-        "| 67.89000                      |",
-        "+-------------------------------+",
-    ]
-)]
-#[case::byte_decimal(
-    "byte_decimal",
-    Scalar::decimal(10, 4, 1).unwrap(),
-    vec![
-        "+--------------+",
-        "| byte_decimal |",
-        "+--------------+",
-        "| 1.0          |",
-        "+--------------+",
-    ]
-)]
-#[case::short_decimal(
-    "short_decimal",
-    Scalar::decimal(20, 6, 1).unwrap(),
-    vec![
-        "+---------------+",
-        "| short_decimal |",
-        "+---------------+",
-        "| 2.0           |",
-        "+---------------+",
-    ]
-)]
-#[case::int_decimal(
-    "int_decimal",
-    Scalar::decimal(30, 11, 1).unwrap(),
-    vec![
-        "+-------------+",
-        "| int_decimal |",
-        "+-------------+",
-        "| 3.0         |",
-        "+-------------+",
-    ]
-)]
-#[case::long_decimal(
-    "long_decimal",
-    Scalar::decimal(40, 21, 1).unwrap(),
-    vec![
-        "+--------------+",
-        "| long_decimal |",
-        "+--------------+",
-        "| 4.0          |",
-        "+--------------+",
-    ]
-)]
+#[case::decimal_greater_scale("decimal_decimal_greater_scale", 6_789_000, 20, 5)]
+#[case::byte_decimal("byte_decimal", 10, 4, 1)]
+#[case::short_decimal("short_decimal", 20, 6, 1)]
+#[case::int_decimal("int_decimal", 30, 11, 1)]
+#[case::long_decimal("long_decimal", 40, 21, 1)]
 fn type_widening_decimal_predicate_keeps_older_scale_file(
     #[case] column: &str,
-    #[case] value: Scalar,
-    #[case] expected: Vec<&str>,
+    #[case] value: i128,
+    #[case] precision: u8,
+    #[case] scale: u8,
+    #[values(false, true)] use_scan_metadata: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let predicate = Pred::eq(Expr::column([column]), lit(value));
-    read_table_data_str(
-        "./tests/data/type-widening/",
-        Some(&[column]),
-        Some(predicate),
-        expected,
-    )
+    let path = std::fs::canonicalize("./tests/data/type-widening/")?;
+    let url = Url::from_directory_path(path).unwrap();
+    let engine = test_utils::create_default_engine(&url)?;
+    let snapshot = Snapshot::builder_for(url.clone()).build(engine.as_ref())?;
+    let field = snapshot.schema().field(column).unwrap().clone();
+    let schema = Arc::new(Schema::new_unchecked([field]));
+    let predicate = Pred::eq(
+        Expr::column([column]),
+        lit(Scalar::decimal(value, precision, scale)?),
+    );
+    let scan = snapshot
+        .scan_builder()
+        .with_schema(schema)
+        .with_predicate(Some(Arc::new(predicate)))
+        .build()?;
+    let batches = if use_scan_metadata {
+        read_scan_metadata(&url, engine.as_ref(), &scan)?
+    } else {
+        read_scan(&scan, engine)?
+    };
+    let expected_array =
+        Decimal128Array::from(vec![value]).with_precision_and_scale(precision, scale as i8)?;
+    let expected = RecordBatch::try_from_iter([(column, Arc::new(expected_array) as ArrayRef)])?;
+    let actual = concat_batches(&expected.schema(), &batches)?;
+    assert_eq!(actual, expected);
+    Ok(())
 }
 
 // Verify that predicates over invalid/missing columns do not cause skipping.

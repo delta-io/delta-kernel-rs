@@ -239,78 +239,6 @@ fn test_get_stat_values() {
     );
 
     assert_eq!(
-        filter.get_min_stat(
-            &column_name!("numeric.decimals.decimal32"),
-            &DataType::decimal(10, 5).unwrap()
-        ),
-        Some(Scalar::decimal(1103200, 10, 5).unwrap())
-    );
-
-    assert_eq!(
-        filter.get_min_stat(
-            &column_name!("numeric.decimals.decimal64"),
-            &DataType::decimal(20, 5).unwrap()
-        ),
-        Some(Scalar::decimal(1106400, 20, 5).unwrap())
-    );
-
-    assert_eq!(
-        filter.get_min_stat(
-            &column_name!("numeric.decimals.decimal128"),
-            &DataType::decimal(38, 5).unwrap()
-        ),
-        Some(Scalar::decimal(1112800, 38, 5).unwrap())
-    );
-
-    assert_eq!(
-        filter.get_min_stat(
-            &column_name!("numeric.decimals.decimal32"),
-            &DataType::decimal(8, 2).unwrap()
-        ),
-        None
-    );
-
-    assert_eq!(
-        filter.get_min_stat(
-            &column_name!("numeric.decimals.decimal32"),
-            &DataType::decimal(6, 5).unwrap()
-        ),
-        None
-    );
-
-    assert_eq!(
-        filter.get_min_stat(
-            &column_name!("numeric.ints.int32"),
-            &DataType::decimal(12, 2).unwrap()
-        ),
-        Some(Scalar::decimal(100_000_000, 12, 2).unwrap())
-    );
-
-    assert_eq!(
-        filter.get_min_stat(
-            &column_name!("numeric.ints.int64"),
-            &DataType::decimal(22, 2).unwrap()
-        ),
-        Some(Scalar::decimal(100_000_000_000i64, 22, 2).unwrap())
-    );
-
-    assert_eq!(
-        filter.get_min_stat(
-            &column_name!("numeric.ints.int8"),
-            &DataType::decimal(5, 2).unwrap()
-        ),
-        Some(Scalar::decimal(0, 5, 2).unwrap())
-    );
-
-    assert_eq!(
-        filter.get_min_stat(
-            &column_name!("chrono.date32"),
-            &DataType::decimal(10, 0).unwrap()
-        ),
-        None
-    );
-
-    assert_eq!(
         filter.get_min_stat(&column_name!("chrono.date32"), &DataType::DATE),
         Some(PrimitiveType::Date.parse_scalar("1971-01-01").unwrap())
     );
@@ -493,62 +421,6 @@ fn test_get_stat_values() {
     );
 
     assert_eq!(
-        filter.get_max_stat(
-            &column_name!("numeric.decimals.decimal32"),
-            &DataType::decimal(10, 5).unwrap()
-        ),
-        Some(Scalar::decimal(1503200, 10, 5).unwrap())
-    );
-
-    assert_eq!(
-        filter.get_max_stat(
-            &column_name!("numeric.decimals.decimal64"),
-            &DataType::decimal(20, 5).unwrap()
-        ),
-        Some(Scalar::decimal(1506400, 20, 5).unwrap())
-    );
-
-    assert_eq!(
-        filter.get_max_stat(
-            &column_name!("numeric.decimals.decimal128"),
-            &DataType::decimal(38, 5).unwrap()
-        ),
-        Some(Scalar::decimal(1512800, 38, 5).unwrap())
-    );
-
-    assert_eq!(
-        filter.get_max_stat(
-            &column_name!("numeric.decimals.decimal32"),
-            &DataType::decimal(8, 2).unwrap()
-        ),
-        None
-    );
-
-    assert_eq!(
-        filter.get_max_stat(
-            &column_name!("numeric.ints.int32"),
-            &DataType::decimal(12, 2).unwrap()
-        ),
-        Some(Scalar::decimal(100_000_400, 12, 2).unwrap())
-    );
-
-    assert_eq!(
-        filter.get_max_stat(
-            &column_name!("numeric.ints.int64"),
-            &DataType::decimal(22, 2).unwrap()
-        ),
-        Some(Scalar::decimal(100_000_000_400i64, 22, 2).unwrap())
-    );
-
-    assert_eq!(
-        filter.get_max_stat(
-            &column_name!("numeric.ints.int8"),
-            &DataType::decimal(5, 2).unwrap()
-        ),
-        Some(Scalar::decimal(400, 5, 2).unwrap())
-    );
-
-    assert_eq!(
         filter.get_max_stat(&column_name!("chrono.date32"), &DataType::DATE),
         Some(PrimitiveType::Date.parse_scalar("1971-01-05").unwrap())
     );
@@ -598,6 +470,40 @@ fn test_get_stat_values() {
                 .parse_scalar("1971-01-05 00:00:00.000000")
                 .unwrap()
         )
+    );
+}
+
+#[rstest]
+#[case::decimal32("numeric.decimals.decimal32", 10, 5, Some((1_103_200, 1_503_200)))]
+#[case::decimal64("numeric.decimals.decimal64", 20, 5, Some((1_106_400, 1_506_400)))]
+#[case::decimal128("numeric.decimals.decimal128", 38, 5, Some((1_112_800, 1_512_800)))]
+#[case::narrower_scale("numeric.decimals.decimal32", 8, 2, None)]
+#[case::insufficient_precision("numeric.decimals.decimal32", 6, 5, None)]
+#[case::int8("numeric.ints.int8", 5, 2, Some((0, 400)))]
+#[case::int16("numeric.ints.int16", 7, 2, Some((100_000, 100_400)))]
+#[case::int32("numeric.ints.int32", 12, 2, Some((100_000_000, 100_000_400)))]
+#[case::int64("numeric.ints.int64", 22, 2, Some((100_000_000_000, 100_000_000_400)))]
+#[case::date("chrono.date32", 10, 0, None)]
+fn decimal_stat_values(
+    #[case] column: &str,
+    #[case] precision: u8,
+    #[case] scale: u8,
+    #[case] expected: Option<(i128, i128)>,
+) {
+    let file = File::open("./tests/data/parquet_row_group_skipping/part-00000-b92e017a-50ba-4676-8322-48fc371c2b59-c000.snappy.parquet").unwrap();
+    let metadata = ArrowReaderMetadata::load(&file, reader_options()).unwrap();
+    let column = ColumnName::from_naive_str_split(column);
+    let predicate = Predicate::from_expr(Expression::column(column.clone()));
+    let filter = RowGroupFilter::new(metadata.metadata().row_group(0), &predicate);
+    let data_type = DataType::decimal(precision, scale).unwrap();
+    let scalar = |bits| Scalar::decimal(bits, precision, scale).unwrap();
+    assert_eq!(
+        filter.get_min_stat(&column, &data_type),
+        expected.map(|(min, _)| scalar(min))
+    );
+    assert_eq!(
+        filter.get_max_stat(&column, &data_type),
+        expected.map(|(_, max)| scalar(max))
     );
 }
 
@@ -1081,6 +987,88 @@ fn decimal_footer_stats_match_reader_cast(
     };
     assert_eq!(extract_min_scalar(&target, column), expected.0);
     assert_eq!(extract_max_scalar(&target, column), expected.1);
+}
+
+#[rstest]
+#[case::no_statistics(false, false, false)]
+#[case::no_bounds(true, false, false)]
+#[case::min_only(true, true, false)]
+#[case::max_only(true, false, true)]
+#[case::both_bounds(true, true, true)]
+fn decimal_missing_bounds_do_not_prune_matching_groups(
+    #[case] has_statistics: bool,
+    #[case] has_min: bool,
+    #[case] has_max: bool,
+    #[values(9, 18, 20)] precision: u8,
+) {
+    let bytes = write_decimal_parquet(precision, 2, &["d"], &[&[1_050, 2_000]]);
+    let builder = parquet_reader(bytes);
+    let row_group = builder.metadata().row_group(0);
+    let descriptor = row_group.column(0).column_descr_ptr();
+    let mut column = ColumnChunkMetaData::builder(descriptor.clone()).set_num_values(2);
+    if has_statistics {
+        let stats = match descriptor.physical_type() {
+            PhysicalType::INT32 => Statistics::int32(
+                has_min.then_some(1_050),
+                has_max.then_some(2_000),
+                None,
+                Some(0),
+                false,
+            ),
+            PhysicalType::INT64 => Statistics::int64(
+                has_min.then_some(1_050),
+                has_max.then_some(2_000),
+                None,
+                Some(0),
+                false,
+            ),
+            PhysicalType::FIXED_LEN_BYTE_ARRAY => {
+                let width = descriptor.type_length() as usize;
+                let bytes = |value: i128| {
+                    FixedLenByteArray::from(value.to_be_bytes()[16 - width..].to_vec())
+                };
+                Statistics::fixed_len_byte_array(
+                    has_min.then(|| bytes(1_050)),
+                    has_max.then(|| bytes(2_000)),
+                    None,
+                    Some(0),
+                    false,
+                )
+            }
+            physical_type => panic!("Unexpected decimal physical type: {physical_type:?}"),
+        };
+        column = column.set_statistics(stats);
+    }
+    let row_group = row_group
+        .clone()
+        .into_builder()
+        .set_column_metadata(vec![column.build().unwrap()])
+        .build()
+        .unwrap();
+    let predicate = column_pred!("d");
+    let filter = RowGroupFilter::new(&row_group, &predicate);
+    let target = DataType::decimal(22, 4).unwrap();
+    let scalar = |value| Scalar::decimal(value, 22, 4).unwrap();
+    assert_eq!(
+        filter.get_min_stat(&column_name!("d"), &target),
+        has_min.then(|| scalar(105_000))
+    );
+    assert_eq!(
+        filter.get_max_stat(&column_name!("d"), &target),
+        has_max.then(|| scalar(200_000))
+    );
+    assert!(RowGroupFilter::apply(
+        &row_group,
+        &Predicate::eq(col!("d"), lit(scalar(105_000)))
+    ));
+    assert_eq!(
+        RowGroupFilter::apply(&row_group, &Predicate::lt(col!("d"), lit(scalar(105_000)))),
+        !has_min
+    );
+    assert_eq!(
+        RowGroupFilter::apply(&row_group, &Predicate::gt(col!("d"), lit(scalar(200_000)))),
+        !has_max
+    );
 }
 
 #[test]

@@ -7,11 +7,16 @@ use delta_kernel_derive::internal_api;
 use itertools::Itertools;
 
 use super::arrow_conversion::TryIntoArrow as _;
+use crate::arrow::datatypes::DataType::{
+    Date32, Decimal128, Float32, Float64, Int8, Int16, Int32, Int64, Timestamp,
+};
 use crate::arrow::datatypes::{DataType as ArrowDataType, Field as ArrowField, TimeUnit};
 use crate::engine::arrow_utils::make_arrow_error;
 use crate::schema::{DataType, MetadataKey, MetadataValue, StructField};
 use crate::utils::require;
 use crate::{KernelError, KernelResult};
+
+const DECIMAL_RADIX: i128 = 10;
 
 /// Controls how `ensure_data_types` validates struct fields and metadata.
 #[derive(Clone, Copy)]
@@ -272,8 +277,6 @@ fn check_cast_compat(
     target_type: ArrowDataType,
     source_type: &ArrowDataType,
 ) -> KernelResult<DataTypeCompat> {
-    use ArrowDataType::*;
-
     match (source_type, &target_type) {
         (source_type, target_type) if source_type == target_type => Ok(DataTypeCompat::Identical),
         (&ArrowDataType::Timestamp(_, _), &ArrowDataType::Timestamp(_, _)) => {
@@ -324,8 +327,6 @@ pub(crate) fn decimal_upcast_factor(
     target_precision: u8,
     target_scale: i8,
 ) -> Option<i128> {
-    use ArrowDataType::*;
-
     let (source_precision, source_scale) = match source_type {
         Decimal128(p, s) => (*p, *s),
         // Allow converting integers to a decimal that can hold all possible values.
@@ -340,7 +341,7 @@ pub(crate) fn decimal_upcast_factor(
     if target_precision < source_precision || target_precision - source_precision < scale_increase {
         return None;
     }
-    10i128.checked_pow(scale_increase.into())
+    DECIMAL_RADIX.checked_pow(scale_increase.into())
 }
 
 impl PartialEq<String> for MetadataValue {
@@ -427,6 +428,7 @@ mod tests {
         assert!(!can_upcast_to_decimal(&Decimal128(2, 0), 2u8, 1i8));
         assert!(!can_upcast_to_decimal(&Decimal128(2, 0), 2u8, -1i8));
         assert!(!can_upcast_to_decimal(&Decimal128(5, 2), 6u8, 4i8));
+        assert!(!can_upcast_to_decimal(&Decimal128(1, i8::MIN), 38, 0));
 
         assert!(!can_upcast_to_decimal(&Int8, 2u8, 0i8));
         assert!(!can_upcast_to_decimal(&Int8, 3u8, 1i8));
