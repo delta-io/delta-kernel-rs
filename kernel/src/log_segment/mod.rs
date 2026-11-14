@@ -703,6 +703,83 @@ impl LogSegment {
         LogSegment::try_new(listed_files, log_root, end_version, None)
     }
 
+    /// Builds a published compaction interval, reusing cached commits and reporting Delta errors.
+    #[cfg(feature = "declarative-plans")]
+    pub(crate) fn for_compaction(
+        &self,
+        storage: &dyn StorageHandler,
+        start_version: Version,
+        end_version: Version,
+    ) -> Result<Self> {
+        require!(
+            start_version < end_version && end_version <= self.end_version,
+            KernelError::generic(
+                "Log compaction requires start_version < end_version <= snapshot version"
+            )
+            .into()
+        );
+        // Dropping a feature creates checkpoints. Earlier commits may still require that feature
+        // even though this snapshot's protocol no longer lists it.
+        require!(
+            self.checkpoint_version
+                .is_none_or(|version| start_version > version),
+            KernelError::generic("Log compaction must start after the snapshot's checkpoint")
+                .into()
+        );
+        let commits = &self.listed.ascending_commit_files;
+        let commits = &commits[commits.partition_point(|file| file.version < start_version)
+            ..commits.partition_point(|file| file.version <= end_version)];
+        let mut listed_files = if (end_version - start_version).checked_add(1)
+            == Some(commits.len() as Version)
+            && commits
+                .iter()
+                .zip(start_version..=end_version)
+                .all(|(file, version)| {
+                    file.version == version && file.file_type == LogPathFileType::Commit
+                }) {
+            LogSegmentFiles {
+                ascending_commit_files: commits.to_vec(),
+                latest_commit_file: commits.last().cloned(),
+                max_published_version: Some(end_version),
+                ..Default::default()
+            }
+        } else {
+            LogSegmentFiles::list_commits(
+                storage,
+                &self.log_root,
+                vec![],
+                Some(start_version),
+                Some(end_version),
+            )?
+        };
+        validate_start_version_available(start_version, listed_files.ascending_commit_files.first())
+            .and_then(|()| {
+                Self::try_new_impl(
+                    &mut listed_files,
+                    self.log_root.clone(),
+                    Some(end_version),
+                    None,
+                )
+            })
+            .map_err(|error| match error.without_backtrace() {
+                KernelError::EmptyLog
+                | KernelError::StartVersionNotFound { .. }
+                | KernelError::MissingVersion(_) => {
+                    Error::Delta(DeltaError::versions_not_contiguous(
+                        listed_files
+                            .ascending_commit_files
+                            .iter()
+                            .map(|file| file.version),
+                        start_version,
+                        end_version,
+                        self.end_version,
+                        Some(Box::new(error)),
+                    ))
+                }
+                _ => Error::Kernel(error),
+            })
+    }
+
     #[allow(unused)]
     /// Constructs a [`LogSegment`] to be used for timestamp conversion. This [`LogSegment`] will
     /// consist only of contiguous commit files up to `end_version` (inclusive). If present,
