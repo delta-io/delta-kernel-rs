@@ -23,7 +23,7 @@ use crate::path::LogPathFileType::*;
 use crate::path::{
     CheckpointInstance, LogPathFileType, ParsedLogPath, may_begin_listable_log_path,
 };
-use crate::{KernelError, KernelResult, KernelResultIterator, StorageHandler, Version};
+use crate::{FileMeta, KernelError, KernelResult, KernelResultIterator, StorageHandler, Version};
 
 #[cfg(test)]
 mod tests;
@@ -75,9 +75,20 @@ pub(crate) fn list_delta_log_from_storage(
     end_version: Version,
 ) -> KernelResult<impl KernelResultIterator<ParsedLogPath> + use<>> {
     let start_from = log_root.join(&format!("{start_version:020}"))?;
+    Ok(parse_delta_log_listing(
+        storage.list_from(&start_from)?,
+        log_root,
+        end_version,
+    ))
+}
+
+pub(crate) fn parse_delta_log_listing<I: KernelResultIterator<FileMeta>>(
+    listing: I,
+    log_root: &Url,
+    end_version: Version,
+) -> impl KernelResultIterator<ParsedLogPath> + use<I> {
     let log_root_str = log_root.to_string();
-    let files = storage
-        .list_from(&start_from)?
+    listing
         // The listing is sorted by full path, so nothing relevant follows the first relative path
         // past the version-named region (see `may_begin_listable_log_path`). Stopping there avoids
         // paging through `_staged_commits/` and `_sidecars/`, which can hold thousands of files.
@@ -103,8 +114,7 @@ pub(crate) fn list_delta_log_from_storage(
             // discard any path with too-large version; keep errors
             Ok(path) => path.version <= end_version,
             Err(_) => true,
-        });
-    Ok(files)
+        })
 }
 
 /// Groups all checkpoint parts according to the checkpoint they belong to.
@@ -581,26 +591,37 @@ impl LogSegmentFiles {
         let end = end_version.unwrap_or(Version::MAX);
         let fs_iter = list_delta_log_from_storage(storage, log_root, start, end)?;
 
-        let log_tail_start_version = log_tail.first().map(|f| f.version);
+        Self::from_commit_listing(fs_iter, log_tail, start, end)
+    }
+
+    pub(crate) fn from_commit_listing(
+        filesystem_listing: impl KernelResultIterator<ParsedLogPath>,
+        log_tail: Vec<ParsedLogPath>,
+        start_version: Version,
+        end_version: Version,
+    ) -> KernelResult<Self> {
+        let log_tail_start_version = log_tail.first().map(|file| file.version);
         let mut listed_commits = Vec::new();
         let mut max_published_version: Option<Version> = None;
-        // Filesystem commits, skipping any covered by the log_tail.
-        for file_result in fs_iter {
+        // Filesystem commits, skipping any covered by log_tail.
+        for file_result in filesystem_listing {
             let file = file_result?;
             if file.file_type != LogPathFileType::Commit {
                 continue;
             }
             max_published_version = max_published_version.max(Some(file.version));
-            if log_tail_start_version.is_some_and(|tail_start| file.version >= tail_start) {
+            if log_tail_start_version
+                .is_some_and(|tail_start_version| file.version >= tail_start_version)
+            {
                 continue;
             }
             should_process_log_file(&file); // warns if 0 bytes
             listed_commits.push(file);
         }
 
-        // Log_tail commits, extending the filesystem prefix in ascending order.
+        // Supplied commits, extending the filesystem prefix in ascending order.
         for file in log_tail {
-            if file.version < start || file.version > end {
+            if file.version < start_version || file.version > end_version {
                 continue;
             }
             if file.file_type == LogPathFileType::Commit {
