@@ -29,6 +29,9 @@ use crate::{Engine, EvaluationHandler, JsonHandler, ParquetHandler, StorageHandl
 /// Storage, JSON file reads, and Parquet file reads are converted into
 /// [`Operation`](crate::plans::Operation)s and delegated to the plan executor.
 ///
+/// The executor can keep protocol and metadata replay imperative by returning `false` from
+/// [`PlanExecutor::supports_protocol_metadata_replay`]. Handler I/O still uses the executor.
+///
 /// Operations not yet implemented on the plan-execution path (e.g. `write_json_file`,
 /// `write_parquet_file`) are delegated to `fallback` when one is configured, and otherwise return
 /// an unsupported error. A fallback is optional because a connector may be unable to construct one:
@@ -96,6 +99,7 @@ impl Engine for PlanBasedEngine {
 mod tests {
     use std::sync::Arc;
 
+    use rstest::rstest;
     use tempfile::tempdir;
     use url::Url;
 
@@ -106,10 +110,58 @@ mod tests {
     use crate::engine::sync::SyncEngine;
     use crate::engine::sync::plan::SyncPlanExecutor;
     use crate::engine_data::FilteredEngineData;
-    use crate::{Engine as _, EngineData, KernelError};
+    use crate::unit_test_utils::plans::ScanOnlyPlanExecutor;
+    use crate::unit_test_utils::{TestCancellationToken, load_test_table};
+    use crate::{CancellationTokenRef, Engine as _, EngineData, KernelError, Snapshot};
 
     fn plan_engine(fallback: Option<Arc<dyn crate::Engine>>) -> PlanBasedEngine {
         PlanBasedEngine::new(fallback, Arc::new(SyncPlanExecutor::default()))
+    }
+
+    #[rstest]
+    #[case::commits("app-txn-no-checkpoint")]
+    #[case::checkpoint("app-txn-checkpoint")]
+    #[case::json_checkpoint("v2-checkpoints-json-without-sidecars")]
+    fn snapshot_uses_imperative_pm_with_scan_only_executor(
+        #[case] table: &str,
+        #[values(false, true)] cancellable: bool,
+    ) {
+        let (_engine, expected, _tempdir) = load_test_table(table).unwrap();
+        let engine = PlanBasedEngine::new(
+            None,
+            Arc::new(ScanOnlyPlanExecutor(SyncPlanExecutor::default())),
+        );
+        let executor = engine.require_plan_executor().unwrap();
+        assert!(!executor.supports_protocol_metadata_replay());
+
+        let actual = Snapshot::builder_for(expected.table_root().clone())
+            .with_cancellation_token(
+                cancellable
+                    .then(|| Arc::new(TestCancellationToken::default()) as CancellationTokenRef),
+            )
+            .build(&engine)
+            .unwrap();
+
+        assert_eq!(actual.version(), expected.version());
+        assert_eq!(actual.schema(), expected.schema());
+        assert_eq!(
+            actual.table_configuration().protocol(),
+            expected.table_configuration().protocol()
+        );
+
+        // Exercise replay even when the fixture's CRC lets snapshot loading bypass it.
+        let resolution = actual
+            .log_segment()
+            .read_protocol_metadata_opt(&engine, None)
+            .unwrap();
+        assert_eq!(
+            resolution.protocol.as_ref(),
+            Some(expected.table_configuration().protocol())
+        );
+        assert_eq!(
+            resolution.metadata.as_ref(),
+            Some(expected.table_configuration().metadata())
+        );
     }
 
     #[test]

@@ -91,6 +91,17 @@ pub trait PlanExecutor: AsAny {
     /// Executes the given declarative plan and returns the result.
     fn execute_op(&self, op: Operation) -> KernelResult<PlanResult>;
 
+    /// Returns whether Kernel may use this executor for declarative protocol and metadata replay.
+    ///
+    /// The default is `true`. Executors that only support file scans should return `false`, so
+    /// Kernel replays protocol and metadata through its imperative engine handlers. This does not
+    /// restrict handler I/O or explicitly requested plan execution. Implementations should return
+    /// the same value throughout the executor's lifetime. Delegating executors should forward this
+    /// method to their inner executor.
+    fn supports_protocol_metadata_replay(&self) -> bool {
+        true
+    }
+
     /// Reads a parquet file's footer (schema and, in future, row-group stats) via a
     /// [`IoOperation::ParquetFooter`] op.
     fn read_parquet_footer(&self, file: FileMeta) -> KernelResult<ParquetFooter> {

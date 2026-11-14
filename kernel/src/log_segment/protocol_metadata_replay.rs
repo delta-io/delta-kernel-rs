@@ -126,7 +126,7 @@ impl LogSegment {
     /// pass over the segment.
     fn replay_for_pm(&self, engine: &dyn Engine) -> KernelResult<PmCandidate> {
         #[cfg(feature = "declarative-plans")]
-        if let Some(executor) = engine.plan_executor() {
+        if let Some(executor) = pm_plan_executor(engine) {
             // P&M need no checkpoint action here: a commit that changes them also writes them as
             // top-level actions.
             let candidate = self.replay_for_pm_via_plan(
@@ -150,7 +150,7 @@ impl LogSegment {
     ) -> KernelResult<PmCandidate> {
         #[cfg(all(feature = "adaptive-metadata-in-dev", feature = "declarative-plans"))]
         if let (Some(plan_executor), Some(_)) = (
-            engine.plan_executor(),
+            pm_plan_executor(engine),
             self.newest_commit_after_checkpoint(),
         ) {
             let executor = plan_executor.as_ref();
@@ -335,7 +335,12 @@ impl LogSegment {
                 None,
                 None,
             )?
-            .actions;
+            .actions
+            // An empty batch has no file path from which to derive a commit version.
+            .filter(|batch| match batch {
+                Ok(batch) => !batch.actions.is_empty(),
+                Err(_) => true,
+            });
         Ok(batches.map(move |batch| {
             let batch = batch?;
             // A commit's version is parsed from its `_file`; a checkpoint batch uses the constant.
@@ -369,6 +374,13 @@ impl LogSegment {
             .last()
             .filter(|commit| commit.version == self.end_version)
     }
+}
+
+#[cfg(feature = "declarative-plans")]
+fn pm_plan_executor(engine: &dyn Engine) -> Option<Arc<dyn PlanExecutor>> {
+    engine
+        .plan_executor()
+        .filter(|executor| executor.supports_protocol_metadata_replay())
 }
 
 /// The part of the log one P&M plan reads.
