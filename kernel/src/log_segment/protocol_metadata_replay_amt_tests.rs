@@ -22,7 +22,11 @@ use crate::committer::FileSystemCommitter;
 use crate::crc::{Crc, FileStats, FileStatsState};
 #[cfg(feature = "declarative-plans")]
 use crate::engine::DelegatingEngine;
+#[cfg(feature = "declarative-plans")]
+use crate::engine::plans::PlanBasedEngine;
 use crate::engine::sync::SyncEngine;
+#[cfg(feature = "declarative-plans")]
+use crate::engine::sync::plan::SyncPlanExecutor;
 #[cfg(feature = "declarative-plans")]
 use crate::expressions::Scalar;
 use crate::object_store::ObjectStoreExt as _;
@@ -39,6 +43,8 @@ use crate::unit_test_utils::adaptive_metadata_fixtures::{
     checkpoint_line, commit_info_line, last_manifest_commit_info, pointer,
     protocol_and_metadata_lines,
 };
+#[cfg(feature = "declarative-plans")]
+use crate::unit_test_utils::plans::ScanOnlyPlanExecutor;
 use crate::unit_test_utils::{
     adaptive_metadata_table_configuration, parse_json_batch, test_schema_flat_with_column_mapping,
 };
@@ -289,11 +295,21 @@ fn non_plan_engine(store: Arc<InMemory>) -> impl Engine {
     engine
 }
 
+#[cfg(feature = "declarative-plans")]
+fn hybrid_engine(store: Arc<InMemory>) -> PlanBasedEngine {
+    PlanBasedEngine::new(
+        None,
+        Arc::new(ScanOnlyPlanExecutor(SyncPlanExecutor::new(Some(store)))),
+    )
+}
+
 #[tokio::test]
 async fn test_load_resolves_pm_from_manifest_commit_checkpoint_action() {
     check_manifest_commit_checkpoint(non_plan_engine).await;
     #[cfg(feature = "declarative-plans")]
     check_manifest_commit_checkpoint(|store| SyncEngine::new_with_store(store)).await;
+    #[cfg(feature = "declarative-plans")]
+    check_manifest_commit_checkpoint(hybrid_engine).await;
 }
 
 // A single commit whose only P&M is a checkpoint action. The build succeeds only if P&M came from
@@ -989,6 +1005,8 @@ async fn segment_ending_on_checkpoint_ignores_its_checkpoint_action_rows() {
     check_segment_ending_on_checkpoint(non_plan_engine).await;
     #[cfg(feature = "declarative-plans")]
     check_segment_ending_on_checkpoint(|store| SyncEngine::new_with_store(store)).await;
+    #[cfg(feature = "declarative-plans")]
+    check_segment_ending_on_checkpoint(hybrid_engine).await;
 }
 
 async fn check_segment_ending_on_checkpoint<E: Engine>(
@@ -1034,6 +1052,8 @@ async fn incremental_update_resolves_latest_checkpoint_action(
     #[case] expected_version: i64,
 ) {
     assert_incremental_update_action(&new_commit, expected_version, non_plan_engine).await;
+    #[cfg(feature = "declarative-plans")]
+    assert_incremental_update_action(&new_commit, expected_version, hybrid_engine).await;
     #[cfg(feature = "declarative-plans")]
     assert_incremental_update_action(&new_commit, expected_version, |store| {
         SyncEngine::new_with_store(store)

@@ -333,7 +333,13 @@ impl LogSegment {
             commit_schema.fields().cloned().chain([file_column]),
         )?);
         let checkpoint_version = self.checkpoint_version.map(|v| v as i64);
-        let batches = self.read_original_actions(engine, commit_schema, checkpoint_schema)?;
+        let batches = self
+            .read_original_actions(engine, commit_schema, checkpoint_schema)?
+            // An empty batch has no file path from which to derive a commit version.
+            .filter(|batch| match batch {
+                Ok(batch) => !batch.actions.is_empty(),
+                Err(_) => true,
+            });
         Ok(batches.map(move |batch| {
             let batch = batch?;
             // A commit's version is parsed from its `_file`; a checkpoint batch uses the constant.
@@ -379,11 +385,14 @@ enum PmReader {
 }
 
 impl PmReader {
-    /// Returns a plan reader when `engine` has a plan executor, otherwise a file reader.
+    /// Returns a plan reader when the executor supports P&M replay, otherwise a file reader.
     #[cfg_attr(not(feature = "declarative-plans"), allow(unused_variables))]
     fn for_engine(engine: &dyn Engine) -> Self {
         #[cfg(feature = "declarative-plans")]
-        if let Some(executor) = engine.plan_executor() {
+        if let Some(executor) = engine
+            .plan_executor()
+            .filter(|executor| executor.supports_protocol_metadata_replay())
+        {
             return Self::Plan(executor);
         }
         Self::Files
