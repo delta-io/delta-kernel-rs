@@ -5778,6 +5778,18 @@ struct CrcPruningCase {
     after_commits: &[5, 6, 7, 8, 9],
     after_compactions: &[],
 })]
+//                      0  1  2  3  4  5  6  7  8  9
+// commits:             x  x  x  x  x  x  x  x  x  x
+// crc:                                            |
+// after commits:       (none)
+#[case::crc_at_end_version(CrcPruningCase {
+    commits: &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9],
+    compactions: &[],
+    checkpoint: None,
+    crc_version: 9,
+    after_commits: &[],
+    after_compactions: &[],
+})]
 #[tokio::test]
 async fn test_segment_crc_filtering(#[case] case: CrcPruningCase) {
     let seg = create_segment_for(LogSegmentConfig {
@@ -5791,6 +5803,10 @@ async fn test_segment_crc_filtering(#[case] case: CrcPruningCase) {
     let after = seg.segment_after_version(case.crc_version);
     assert_eq!(extract_commit_versions(&after), case.after_commits);
     assert_eq!(extract_compaction_ranges(&after), case.after_compactions);
+    assert_eq!(
+        after.listed.latest_commit_file.map(|commit| commit.version),
+        case.after_commits.last().copied()
+    );
     assert!(after.checkpoint_version.is_none());
     assert!(after.listed.checkpoint_parts.is_empty());
 }
