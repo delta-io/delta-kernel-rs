@@ -6,11 +6,10 @@ use std::sync::Arc;
 
 use itertools::Itertools;
 
-use super::plan::encode_keys_as_rows;
+use super::plan::EncodedKeys;
 use crate::arrow::array::{Array, ArrayRef, Int64Array, RecordBatch, new_null_array};
 use crate::arrow::compute::interleave;
 use crate::arrow::datatypes::DataType as ArrowDataType;
-use crate::arrow::row::OwnedRow;
 use crate::engine::arrow_conversion::TryIntoArrow as _;
 use crate::engine::arrow_expression::evaluate_expression::{extract_column, extract_column_ref};
 use crate::expressions::ColumnName;
@@ -53,17 +52,27 @@ pub(super) fn eval_aggregate(
         .try_collect()?;
 
     // Each group tracks a representative input row and per-agg states as we route rows to it.
-    let mut groups = HashMap::<OwnedRow, (InputRow, Vec<Box<dyn Any>>)>::new();
+    // Groups are numbered in order of first appearance, and a row's key is looked up as borrowed
+    // bytes, so only a new group allocates its key.
+    let mut group_numbers = HashMap::<Box<[u8]>, usize>::new();
+    let mut reps = Vec::<InputRow>::new();
+    let mut aggs_by_group = Vec::<Vec<Box<dyn Any>>>::new();
     let initial_aggs = || ops.iter().map(|op| op.init_state()).collect();
     for (batch_idx, batch) in input.iter().enumerate() {
         let updaters: Vec<_> = ops.iter().map(|op| op.prepare(batch)).try_collect()?;
-        let group_keys = encode_keys_as_rows(batch, &aggregate.group_by)?;
-        for (row_idx, group_key) in group_keys.into_iter().enumerate() {
+        let group_keys = EncodedKeys::try_new(batch, &aggregate.group_by)?;
+        for (row_idx, group_key) in group_keys.iter().enumerate() {
             let row = (batch_idx, row_idx);
-            let (_, aggs) = groups
-                .entry(group_key)
-                .or_insert_with(|| (row, initial_aggs()));
-            for (updater, agg_state) in updaters.iter().zip(aggs) {
+            let group = match group_numbers.get(group_key) {
+                Some(&group) => group,
+                None => {
+                    group_numbers.insert(Box::from(group_key), reps.len());
+                    reps.push(row);
+                    aggs_by_group.push(initial_aggs());
+                    reps.len() - 1
+                }
+            };
+            for (updater, agg_state) in updaters.iter().zip(&mut aggs_by_group[group]) {
                 updater.update(agg_state.as_mut(), row)?;
             }
         }
@@ -71,7 +80,6 @@ pub(super) fn eval_aggregate(
 
     // Handle empty input. Grouped: no rows. Ungrouped: one synthetic group of initial agg states.
     let output_schema = Arc::new(aggregate.schema.as_ref().try_into_arrow()?);
-    let (reps, mut aggs_by_group): (Vec<_>, Vec<_>) = groups.into_values().unzip();
     if aggs_by_group.is_empty() {
         if !aggregate.group_by.is_empty() {
             return Ok(vec![]);
@@ -581,7 +589,7 @@ mod tests {
         Ok(())
     }
 
-    /// Checks a table-formatted expectation without depending on HashMap group order.
+    /// Checks a table-formatted expectation without depending on group order.
     fn assert_batches_eq(batches: &[RecordBatch], expected: &str) {
         let mut expected_lines: Vec<_> = expected.trim().lines().collect();
         sort_lines!(expected_lines);

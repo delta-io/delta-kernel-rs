@@ -8,11 +8,12 @@
 // PlanBasedEngine (backed by this PlanExecutor)
 
 use std::collections::{HashMap, HashSet};
+use std::iter;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
-use itertools::Itertools;
+use itertools::{Either, Itertools};
 
 use super::aggs::eval_aggregate;
 use super::json::try_create_from_json;
@@ -25,7 +26,7 @@ use crate::arrow::array::{
 };
 use crate::arrow::compute::filter_record_batch;
 use crate::arrow::datatypes::Schema as ArrowSchema;
-use crate::arrow::row::{OwnedRow, RowConverter, SortField};
+use crate::arrow::row::{RowConverter, Rows, SortField};
 use crate::engine::arrow_conversion::{TryFromArrow as _, TryIntoArrow as _};
 use crate::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt};
 use crate::engine::arrow_expression::evaluate_expression::extract_column_ref;
@@ -602,17 +603,20 @@ fn eval_semi_join(
     probe: &[RecordBatch],
     build: &[RecordBatch],
 ) -> KernelResult<Vec<RecordBatch>> {
-    let mut build_keys = HashSet::new();
+    // Probe keys are looked up as borrowed bytes, so only the build side allocates per key.
+    let mut build_keys = HashSet::<Box<[u8]>>::new();
     for batch in build {
-        build_keys.extend(encode_keys_as_rows(batch, &join.build_keys)?);
+        let keys = EncodedKeys::try_new(batch, &join.build_keys)?;
+        build_keys.extend(keys.iter().map(Box::from));
     }
 
     probe
         .iter()
         .map(|batch| {
-            let keep = encode_keys_as_rows(batch, &join.probe_keys)?
-                .into_iter()
-                .map(|key| join.inverted != build_keys.contains(&key));
+            let probe_keys = EncodedKeys::try_new(batch, &join.probe_keys)?;
+            let keep = probe_keys
+                .iter()
+                .map(|key| join.inverted != build_keys.contains(key));
             Ok(filter_record_batch(batch, &BooleanArray::from_iter(keep))?)
         })
         .collect()
@@ -642,30 +646,48 @@ fn splice_file_constants(
         .collect()
 }
 
-/// Encodes `columns` of `batch` as one comparable/hashable [`OwnedRow`] key per input row.
-///
-/// Empty `columns` (e.g. ungrouped aggregation) yields a vec of empty keys that self-compare equal
-pub(super) fn encode_keys_as_rows(
-    batch: &RecordBatch,
-    columns: &[ColumnName],
-) -> KernelResult<Vec<OwnedRow>> {
-    if columns.is_empty() {
-        let key = RowConverter::new(vec![])?.parser().parse(&[]).owned();
-        return Ok(vec![key; batch.num_rows()]);
+/// The keys of `columns` for each row of a batch, in arrow's row format: equal keys, NULLs
+/// included, have equal bytes, so the bytes hash and compare as the keys do.
+pub(super) struct EncodedKeys {
+    /// `None` for empty `columns` (e.g. ungrouped aggregation), where every row has the same
+    /// empty key.
+    rows: Option<Rows>,
+    num_rows: usize,
+}
+
+impl EncodedKeys {
+    pub(super) fn try_new(batch: &RecordBatch, columns: &[ColumnName]) -> KernelResult<Self> {
+        let num_rows = batch.num_rows();
+        if columns.is_empty() {
+            return Ok(Self {
+                rows: None,
+                num_rows,
+            });
+        }
+        let arrays: Vec<_> = columns
+            .iter()
+            .map(|name| extract_column(batch, name))
+            .try_collect()?;
+        // Constructing RowConverter requires a `SortField`. We initialize default, unsorted field
+        // for each column.
+        let sort_fields = arrays
+            .iter()
+            .map(|array| SortField::new(array.data_type().clone()))
+            .collect();
+        let rows = RowConverter::new(sort_fields)?.convert_columns(&arrays)?;
+        Ok(Self {
+            rows: Some(rows),
+            num_rows,
+        })
     }
-    let arrays: Vec<_> = columns
-        .iter()
-        .map(|name| extract_column(batch, name))
-        .try_collect()?;
-    // Constructing RowConverter requires a `SortField`. We initialize default, unsorted field for
-    // each column.
-    let sort_fields = arrays
-        .iter()
-        .map(|array| SortField::new(array.data_type().clone()))
-        .collect();
-    let converter = RowConverter::new(sort_fields)?;
-    let rows = converter.convert_columns(&arrays)?;
-    Ok(rows.iter().map(|row| row.owned()).collect())
+
+    /// Each row's key bytes, in row order.
+    pub(super) fn iter(&self) -> impl Iterator<Item = &[u8]> {
+        match &self.rows {
+            Some(rows) => Either::Left(rows.iter().map(|row| row.data())),
+            None => Either::Right(iter::repeat_n(&[][..], self.num_rows)),
+        }
+    }
 }
 
 fn scalar_value(array: &dyn Array, row: usize) -> KernelResult<Scalar> {
@@ -1247,14 +1269,13 @@ mod tests {
     }
 
     #[test]
-    fn encode_keys_as_rows_synthesizes_empty_keys_when_ungrouped() -> KernelResult<()> {
+    fn encoded_keys_are_empty_and_equal_when_ungrouped() -> KernelResult<()> {
         let batch = RecordBatch::try_from_iter([(
             "x",
             Arc::new(Int64Array::from(vec![1, 2, 3])) as ArrayRef,
         )])?;
-        let keys = encode_keys_as_rows(&batch, &[])?;
-        assert_eq!(keys.len(), 3);
-        assert!(keys.iter().all(|key| key == &keys[0]));
+        let keys = EncodedKeys::try_new(&batch, &[])?;
+        assert_eq!(keys.iter().collect_vec(), [&[] as &[u8]; 3]);
         Ok(())
     }
 
