@@ -7,9 +7,6 @@ use delta_kernel_derive::internal_api;
 use itertools::Itertools;
 
 use super::arrow_conversion::TryIntoArrow as _;
-use crate::arrow::datatypes::DataType::{
-    Date32, Decimal128, Float32, Float64, Int8, Int16, Int32, Int64, Timestamp,
-};
 use crate::arrow::datatypes::{DataType as ArrowDataType, Field as ArrowField, TimeUnit};
 use crate::engine::arrow_utils::make_arrow_error;
 use crate::schema::{DataType, MetadataKey, MetadataValue, StructField};
@@ -286,14 +283,29 @@ fn check_cast_compat(
         }
         // Allow up-casting to a larger type if it's safe and can't cause overflow or loss of
         // precision.
-        (Int8, Int16 | Int32 | Int64 | Float64) => Ok(DataTypeCompat::NeedsCast(target_type)),
-        (Int16, Int32 | Int64 | Float64) => Ok(DataTypeCompat::NeedsCast(target_type)),
-        (Int32, Int64 | Float64) => Ok(DataTypeCompat::NeedsCast(target_type)),
-        (Float32, Float64) => Ok(DataTypeCompat::NeedsCast(target_type)),
-        (_, Decimal128(p, s)) if can_upcast_to_decimal(source_type, *p, *s) => {
+        (
+            ArrowDataType::Int8,
+            ArrowDataType::Int16
+            | ArrowDataType::Int32
+            | ArrowDataType::Int64
+            | ArrowDataType::Float64,
+        ) => Ok(DataTypeCompat::NeedsCast(target_type)),
+        (
+            ArrowDataType::Int16,
+            ArrowDataType::Int32 | ArrowDataType::Int64 | ArrowDataType::Float64,
+        ) => Ok(DataTypeCompat::NeedsCast(target_type)),
+        (ArrowDataType::Int32, ArrowDataType::Int64 | ArrowDataType::Float64) => {
             Ok(DataTypeCompat::NeedsCast(target_type))
         }
-        (Date32, Timestamp(_, None)) => Ok(DataTypeCompat::NeedsCast(target_type)),
+        (ArrowDataType::Float32, ArrowDataType::Float64) => {
+            Ok(DataTypeCompat::NeedsCast(target_type))
+        }
+        (_, ArrowDataType::Decimal128(p, s)) if can_upcast_to_decimal(source_type, *p, *s) => {
+            Ok(DataTypeCompat::NeedsCast(target_type))
+        }
+        (ArrowDataType::Date32, ArrowDataType::Timestamp(_, None)) => {
+            Ok(DataTypeCompat::NeedsCast(target_type))
+        }
         // Physical type reinterpretation: some checkpoint writers store date/timestamp columns
         // as plain integers without Parquet logical type annotations. The Delta protocol
         // guarantees data files conform to the table schema, so a schema mismatch (e.g. Int32
@@ -301,8 +313,10 @@ fn check_cast_compat(
         //
         // Keep these date/timestamp rules aligned with
         // `PrimitiveType::is_checkpoint_cast_compatible` in `schema/mod.rs`.
-        (Int32, Date32) => Ok(DataTypeCompat::NeedsCast(target_type)),
-        (Int64, Timestamp(TimeUnit::Microsecond, _)) => Ok(DataTypeCompat::NeedsCast(target_type)),
+        (ArrowDataType::Int32, ArrowDataType::Date32) => Ok(DataTypeCompat::NeedsCast(target_type)),
+        (ArrowDataType::Int64, ArrowDataType::Timestamp(TimeUnit::Microsecond, _)) => {
+            Ok(DataTypeCompat::NeedsCast(target_type))
+        }
         _ => Err(make_arrow_error(format!(
             "Incorrect datatype. Expected {target_type}, got {source_type}"
         ))),
@@ -328,12 +342,12 @@ pub(crate) fn decimal_upcast_factor(
     target_scale: i8,
 ) -> Option<i128> {
     let (source_precision, source_scale) = match source_type {
-        Decimal128(p, s) => (*p, *s),
+        ArrowDataType::Decimal128(p, s) => (*p, *s),
         // Allow converting integers to a decimal that can hold all possible values.
-        Int8 => (3u8, 0i8),
-        Int16 => (5u8, 0i8),
-        Int32 => (10u8, 0i8),
-        Int64 => (20u8, 0i8),
+        ArrowDataType::Int8 => (3u8, 0i8),
+        ArrowDataType::Int16 => (5u8, 0i8),
+        ArrowDataType::Int32 => (10u8, 0i8),
+        ArrowDataType::Int64 => (20u8, 0i8),
         _ => return None,
     };
 
@@ -382,62 +396,94 @@ mod tests {
 
     #[test]
     fn accepts_safe_decimal_casts() {
-        use ArrowDataType::*;
-
-        use super::can_upcast_to_decimal;
-
-        assert!(can_upcast_to_decimal(&Decimal128(1, 0), 2u8, 0i8));
-        assert!(can_upcast_to_decimal(&Decimal128(1, 0), 2u8, 1i8));
-        assert!(can_upcast_to_decimal(&Decimal128(5, -2), 6u8, -2i8));
-        assert!(can_upcast_to_decimal(&Decimal128(5, -2), 6u8, -1i8));
-        assert!(can_upcast_to_decimal(&Decimal128(5, 1), 6u8, 1i8));
-        assert!(can_upcast_to_decimal(&Decimal128(5, 1), 6u8, 2i8));
         assert!(can_upcast_to_decimal(
-            &Decimal128(10, 5),
+            &ArrowDataType::Decimal128(1, 0),
+            2u8,
+            0i8
+        ));
+        assert!(can_upcast_to_decimal(
+            &ArrowDataType::Decimal128(1, 0),
+            2u8,
+            1i8
+        ));
+        assert!(can_upcast_to_decimal(
+            &ArrowDataType::Decimal128(5, -2),
+            6u8,
+            -2i8
+        ));
+        assert!(can_upcast_to_decimal(
+            &ArrowDataType::Decimal128(5, -2),
+            6u8,
+            -1i8
+        ));
+        assert!(can_upcast_to_decimal(
+            &ArrowDataType::Decimal128(5, 1),
+            6u8,
+            1i8
+        ));
+        assert!(can_upcast_to_decimal(
+            &ArrowDataType::Decimal128(5, 1),
+            6u8,
+            2i8
+        ));
+        assert!(can_upcast_to_decimal(
+            &ArrowDataType::Decimal128(10, 5),
             crate::arrow::datatypes::DECIMAL128_MAX_PRECISION,
             crate::arrow::datatypes::DECIMAL128_MAX_SCALE - 5
         ));
 
-        assert!(can_upcast_to_decimal(&Int8, 3u8, 0i8));
-        assert!(can_upcast_to_decimal(&Int8, 4u8, 0i8));
-        assert!(can_upcast_to_decimal(&Int8, 4u8, 1i8));
-        assert!(can_upcast_to_decimal(&Int8, 7u8, 2i8));
+        assert!(can_upcast_to_decimal(&ArrowDataType::Int8, 3u8, 0i8));
+        assert!(can_upcast_to_decimal(&ArrowDataType::Int8, 4u8, 0i8));
+        assert!(can_upcast_to_decimal(&ArrowDataType::Int8, 4u8, 1i8));
+        assert!(can_upcast_to_decimal(&ArrowDataType::Int8, 7u8, 2i8));
 
-        assert!(can_upcast_to_decimal(&Int16, 5u8, 0i8));
-        assert!(can_upcast_to_decimal(&Int16, 6u8, 0i8));
-        assert!(can_upcast_to_decimal(&Int16, 6u8, 1i8));
-        assert!(can_upcast_to_decimal(&Int16, 9u8, 2i8));
+        assert!(can_upcast_to_decimal(&ArrowDataType::Int16, 5u8, 0i8));
+        assert!(can_upcast_to_decimal(&ArrowDataType::Int16, 6u8, 0i8));
+        assert!(can_upcast_to_decimal(&ArrowDataType::Int16, 6u8, 1i8));
+        assert!(can_upcast_to_decimal(&ArrowDataType::Int16, 9u8, 2i8));
 
-        assert!(can_upcast_to_decimal(&Int32, 10u8, 0i8));
-        assert!(can_upcast_to_decimal(&Int32, 11u8, 0i8));
-        assert!(can_upcast_to_decimal(&Int32, 11u8, 1i8));
-        assert!(can_upcast_to_decimal(&Int32, 14u8, 2i8));
+        assert!(can_upcast_to_decimal(&ArrowDataType::Int32, 10u8, 0i8));
+        assert!(can_upcast_to_decimal(&ArrowDataType::Int32, 11u8, 0i8));
+        assert!(can_upcast_to_decimal(&ArrowDataType::Int32, 11u8, 1i8));
+        assert!(can_upcast_to_decimal(&ArrowDataType::Int32, 14u8, 2i8));
 
-        assert!(can_upcast_to_decimal(&Int64, 20u8, 0i8));
-        assert!(can_upcast_to_decimal(&Int64, 21u8, 0i8));
-        assert!(can_upcast_to_decimal(&Int64, 21u8, 1i8));
-        assert!(can_upcast_to_decimal(&Int64, 24u8, 2i8));
+        assert!(can_upcast_to_decimal(&ArrowDataType::Int64, 20u8, 0i8));
+        assert!(can_upcast_to_decimal(&ArrowDataType::Int64, 21u8, 0i8));
+        assert!(can_upcast_to_decimal(&ArrowDataType::Int64, 21u8, 1i8));
+        assert!(can_upcast_to_decimal(&ArrowDataType::Int64, 24u8, 2i8));
     }
 
     #[test]
     fn rejects_unsafe_decimal_casts() {
-        use ArrowDataType::*;
+        assert!(!can_upcast_to_decimal(
+            &ArrowDataType::Decimal128(2, 0),
+            2u8,
+            1i8
+        ));
+        assert!(!can_upcast_to_decimal(
+            &ArrowDataType::Decimal128(2, 0),
+            2u8,
+            -1i8
+        ));
+        assert!(!can_upcast_to_decimal(
+            &ArrowDataType::Decimal128(5, 2),
+            6u8,
+            4i8
+        ));
+        assert!(!can_upcast_to_decimal(
+            &ArrowDataType::Decimal128(1, i8::MIN),
+            38,
+            0
+        ));
 
-        use super::can_upcast_to_decimal;
-
-        assert!(!can_upcast_to_decimal(&Decimal128(2, 0), 2u8, 1i8));
-        assert!(!can_upcast_to_decimal(&Decimal128(2, 0), 2u8, -1i8));
-        assert!(!can_upcast_to_decimal(&Decimal128(5, 2), 6u8, 4i8));
-        assert!(!can_upcast_to_decimal(&Decimal128(1, i8::MIN), 38, 0));
-
-        assert!(!can_upcast_to_decimal(&Int8, 2u8, 0i8));
-        assert!(!can_upcast_to_decimal(&Int8, 3u8, 1i8));
-        assert!(!can_upcast_to_decimal(&Int16, 4u8, 0i8));
-        assert!(!can_upcast_to_decimal(&Int16, 5u8, 1i8));
-        assert!(!can_upcast_to_decimal(&Int32, 9u8, 0i8));
-        assert!(!can_upcast_to_decimal(&Int32, 10u8, 1i8));
-        assert!(!can_upcast_to_decimal(&Int64, 19u8, 0i8));
-        assert!(!can_upcast_to_decimal(&Int64, 20u8, 1i8));
+        assert!(!can_upcast_to_decimal(&ArrowDataType::Int8, 2u8, 0i8));
+        assert!(!can_upcast_to_decimal(&ArrowDataType::Int8, 3u8, 1i8));
+        assert!(!can_upcast_to_decimal(&ArrowDataType::Int16, 4u8, 0i8));
+        assert!(!can_upcast_to_decimal(&ArrowDataType::Int16, 5u8, 1i8));
+        assert!(!can_upcast_to_decimal(&ArrowDataType::Int32, 9u8, 0i8));
+        assert!(!can_upcast_to_decimal(&ArrowDataType::Int32, 10u8, 1i8));
+        assert!(!can_upcast_to_decimal(&ArrowDataType::Int64, 19u8, 0i8));
+        assert!(!can_upcast_to_decimal(&ArrowDataType::Int64, 20u8, 1i8));
     }
 
     /// Build a variant-shaped arrow struct from `(name, type)` pairs with the given nullability.
