@@ -318,7 +318,7 @@ fn list_entries(array: &dyn Array, present: &[bool]) -> KernelResult<(ArrayRef, 
         ArrowDataType::FixedSizeList(..) => array.as_fixed_size_list_opt().map(|list| {
             let length = list.value_length() as usize;
             used_values(list.values(), present, |row| {
-                let start = list.value_offset(row) as usize;
+                let start = row * length;
                 start..start + length
             })
         }),
