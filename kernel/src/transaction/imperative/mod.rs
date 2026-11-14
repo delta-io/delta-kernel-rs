@@ -46,7 +46,7 @@ use crate::schema::ToSchema;
 use crate::schema::{ArrayType, SchemaRef, StructField, StructType, schema_ref};
 use crate::struct_patch::ProjectionStructPatchBuilder;
 use crate::table_features::TableFeature;
-use crate::utils::require;
+use crate::utils::{current_time_ms, require};
 use crate::{
     DataType, Engine, EngineData, Expression, ExpressionEvaluator, KernelResult,
     KernelResultIterator, Result, RowVisitor, Version, create_row, version_as_i64,
@@ -100,8 +100,11 @@ impl<STATE> Transaction<STATE, Imperative> {
         ),
         err
     )]
-    pub fn commit(self, engine: &dyn Engine) -> Result<CommitResult<STATE>> {
+    pub fn commit(mut self, engine: &dyn Engine) -> Result<CommitResult<STATE>> {
         let commit_start = Instant::now();
+        // The protocol bases the in-commit timestamp on the time of the commit attempt, so
+        // sample the clock here instead of keeping the time the transaction was built.
+        self.set_commit_timestamp(current_time_ms()?);
 
         // === Pre-commit validation ===
         self.validate_operation_compatibility()?;
