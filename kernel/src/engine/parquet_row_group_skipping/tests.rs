@@ -7,12 +7,15 @@ use bytes::Bytes;
 use rstest::rstest;
 
 use super::*;
-use crate::arrow::array::{ArrayRef, AsArray, Int64Array, RecordBatch, StringArray, StructArray};
-use crate::arrow::compute::cast;
-use crate::arrow::datatypes::{
-    DataType as ArrowDataType, Field, Fields, Schema as ArrowSchema, TimeUnit as ArrowTimeUnit,
-    TimestampMicrosecondType,
+use crate::arrow::array::{
+    ArrayRef, AsArray, Decimal128Array, Int64Array, RecordBatch, StringArray, StructArray,
 };
+use crate::arrow::compute::{CastOptions, cast, cast_with_options};
+use crate::arrow::datatypes::{
+    DataType as ArrowDataType, Decimal128Type, Field, Fields, Schema as ArrowSchema,
+    TimeUnit as ArrowTimeUnit, TimestampMicrosecondType,
+};
+use crate::engine::ensure_data_types::{ValidationMode, ensure_data_types};
 use crate::engine::reader_options;
 use crate::expressions::{
     Expression, OpaquePredicateOp, ScalarExpressionEvaluator, col, column_name, column_pred, expr,
@@ -471,6 +474,40 @@ fn test_get_stat_values() {
 }
 
 #[rstest]
+#[case::decimal32("numeric.decimals.decimal32", 10, 5, Some((1_103_200, 1_503_200)))]
+#[case::decimal64("numeric.decimals.decimal64", 20, 5, Some((1_106_400, 1_506_400)))]
+#[case::decimal128("numeric.decimals.decimal128", 38, 5, Some((1_112_800, 1_512_800)))]
+#[case::narrower_scale("numeric.decimals.decimal32", 8, 2, None)]
+#[case::insufficient_precision("numeric.decimals.decimal32", 6, 5, None)]
+#[case::int8("numeric.ints.int8", 5, 2, Some((0, 400)))]
+#[case::int16("numeric.ints.int16", 7, 2, Some((100_000, 100_400)))]
+#[case::int32("numeric.ints.int32", 12, 2, Some((100_000_000, 100_000_400)))]
+#[case::int64("numeric.ints.int64", 22, 2, Some((100_000_000_000, 100_000_000_400)))]
+#[case::date("chrono.date32", 10, 0, None)]
+fn decimal_stat_values(
+    #[case] column: &str,
+    #[case] precision: u8,
+    #[case] scale: u8,
+    #[case] expected: Option<(i128, i128)>,
+) {
+    let file = File::open("./tests/data/parquet_row_group_skipping/part-00000-b92e017a-50ba-4676-8322-48fc371c2b59-c000.snappy.parquet").unwrap();
+    let metadata = ArrowReaderMetadata::load(&file, reader_options()).unwrap();
+    let column = ColumnName::from_naive_str_split(column);
+    let predicate = Predicate::from_expr(Expression::column(column.clone()));
+    let filter = RowGroupFilter::new(metadata.metadata().row_group(0), &predicate);
+    let data_type = DataType::decimal(precision, scale).unwrap();
+    let scalar = |bits| Scalar::decimal(bits, precision, scale).unwrap();
+    assert_eq!(
+        filter.get_min_stat(&column, &data_type),
+        expected.map(|(min, _)| scalar(min))
+    );
+    assert_eq!(
+        filter.get_max_stat(&column, &data_type),
+        expected.map(|(_, max)| scalar(max))
+    );
+}
+
+#[rstest]
 #[case::greater_positive(Predicate::gt, 1_500_000, 2)]
 #[case::less_positive(Predicate::lt, 1_500_000, 5)]
 #[case::greater_negative(Predicate::gt, -1_500_000, 5)]
@@ -499,32 +536,66 @@ fn timestamp_row_group_skipping_rescales_footer_units(
         &[&values[..2], &values[2..3], &values[3..]],
     );
     let (_, scalar) = timestamp_kind(timezone);
-    let bound = lit(scalar(bound));
-    let count_rows = |builder: ParquetRecordBatchReaderBuilder<Bytes>| -> usize {
-        builder
-            .build()
-            .unwrap()
-            .map(|batch| batch.unwrap().num_rows())
-            .sum()
-    };
-    let builder = || parquet_reader(bytes.clone());
-
-    let predicate = comparison(Expression::column(col_path), bound.clone());
-    assert_eq!(
-        count_rows(builder().with_row_group_filter(&predicate, None)),
-        expected_rows
+    assert_partition_filters_keep(
+        bytes,
+        &col_path,
+        comparison,
+        lit(scalar(bound)),
+        expected_rows,
     );
+}
 
-    let predicate = comparison(col!("ts"), bound);
-    let partition_columns = HashSet::from(["ts".into()]);
+/// Scale-2 row groups: `[-40.00, -30.00]`, `[10.50, 20.00]`, `[30.00, 40.00]`.
+const DECIMAL_ROW_GROUPS: &[&[i128]] = &[&[-4_000, -3_000], &[1_050, 2_000], &[3_000, 4_000]];
+
+#[rstest]
+#[case::greater_positive(Predicate::gt, 150_000, 4)]
+#[case::less_positive(Predicate::lt, 150_000, 4)]
+#[case::greater_negative(Predicate::gt, -350_000, 6)]
+#[case::less_negative(Predicate::lt, -350_000, 2)]
+#[case::equal_positive(Predicate::eq, 200_000, 2)]
+#[case::equal_negative(Predicate::eq, -300_000, 2)]
+#[case::equal_absent(Predicate::eq, 500_000, 0)]
+fn decimal_row_group_skipping_rescales_footer_scale(
+    #[case] comparison: fn(Expression, Expression) -> Predicate,
+    #[case] bound: i128,
+    #[case] expected_rows: usize,
+    #[values(
+        (9, PhysicalType::INT32),
+        (18, PhysicalType::INT64),
+        (20, PhysicalType::FIXED_LEN_BYTE_ARRAY)
+    )]
+    storage: (u8, PhysicalType),
+) {
+    let (precision, physical_type) = storage;
+    let col_path = ["add", "partitionValues_parsed", "d"];
+    let bytes = write_decimal_parquet(precision, 2, &col_path, DECIMAL_ROW_GROUPS);
     assert_eq!(
-        count_rows(builder().with_checkpoint_row_group_filter(
-            &predicate,
-            &partition_columns,
-            None
-        )),
-        expected_rows
+        parquet_reader(bytes.clone())
+            .metadata()
+            .row_group(0)
+            .column(0)
+            .column_type(),
+        physical_type
     );
+    let bound = lit(Scalar::decimal(bound, 22, 4).unwrap());
+    assert_partition_filters_keep(bytes, &col_path, comparison, bound, expected_rows);
+}
+
+#[rstest]
+fn decimal_row_group_skipping_keeps_groups_for_narrower_literal_scale(
+    #[values(9, 18, 20)] precision: u8,
+) {
+    let col_path = ["d"];
+    let bytes = write_decimal_parquet(precision, 2, &col_path, DECIMAL_ROW_GROUPS);
+    // Scale-2 footer bounds cannot be widened to the literal's scale 1, so they are unknown and
+    // even the group whose rows all exceed 15.0 must survive.
+    let predicate = Predicate::lt(
+        Expression::column(col_path),
+        lit(Scalar::decimal(150, 10, 1).unwrap()),
+    );
+    let rows = count_rows(parquet_reader(bytes).with_row_group_filter(&predicate, None));
+    assert_eq!(rows, 6);
 }
 
 #[rstest]
@@ -715,30 +786,315 @@ fn timestamp_footer_stats_respect_annotations(
     #[case] expected: Option<i64>,
     #[values(None, Some("UTC"))] timezone: Option<&str>,
 ) {
-    let builder = Type::primitive_type_builder("ts", PhysicalType::INT64)
-        .with_logical_type(logical_type.clone())
-        .with_converted_type(converted_type);
-    let builder = if converted_type == ConvertedType::DECIMAL {
-        builder.with_precision(10).with_scale(2)
-    } else {
-        builder
-    };
-    let column = ColumnDescriptor::new(
-        Arc::new(builder.build().unwrap()),
-        0,
-        0,
-        ColumnPath::from("ts"),
-    );
-    assert_eq!(column.logical_type_ref(), logical_type.as_ref());
+    let decimal = (converted_type == ConvertedType::DECIMAL).then_some((10, 2));
     let stats = Statistics::int64(Some(1_000), Some(1_000), None, Some(0), false);
-    let column = ColumnChunkMetaData::builder(Arc::new(column))
-        .set_statistics(stats)
-        .build()
-        .unwrap();
+    let column = annotated_chunk(
+        PhysicalType::INT64,
+        logical_type,
+        converted_type,
+        decimal,
+        stats,
+    );
     let (data_type, scalar) = timestamp_kind(timezone);
     let expected = expected.map(scalar);
     assert_eq!(extract_min_scalar(&data_type, &column), expected.clone());
     assert_eq!(extract_max_scalar(&data_type, &column), expected);
+}
+
+#[rstest]
+#[case::logical_decimal(
+    Some(LogicalType::decimal(2, 9)),
+    ConvertedType::DECIMAL,
+    1_050,
+    Some(105_000)
+)]
+#[case::legacy_decimal(None, ConvertedType::DECIMAL, 1_050, Some(105_000))]
+#[case::unannotated(None, ConvertedType::NONE, 1_050, Some(10_500_000))]
+#[case::logical_signed_integer(
+    Some(LogicalType::integer(8, true)),
+    ConvertedType::INT_8,
+    105,
+    Some(1_050_000)
+)]
+#[case::negative_logical_signed_integer(
+    Some(LogicalType::integer(8, true)),
+    ConvertedType::INT_8,
+    -105,
+    Some(-1_050_000)
+)]
+#[case::legacy_signed_integer(None, ConvertedType::INT_16, 1_050, Some(10_500_000))]
+#[case::logical_unsigned_integer(
+    Some(LogicalType::integer(32, false)),
+    ConvertedType::UINT_32,
+    1_050,
+    None
+)]
+#[case::legacy_unsigned_integer(None, ConvertedType::UINT_32, 1_050, None)]
+#[case::logical_date(Some(LogicalType::Date), ConvertedType::DATE, 1_050, None)]
+#[case::legacy_date(None, ConvertedType::DATE, 1_050, None)]
+fn decimal_footer_stats_respect_annotations(
+    #[case] logical_type: Option<LogicalType>,
+    #[case] converted_type: ConvertedType,
+    #[case] value: i32,
+    #[case] expected: Option<i128>,
+) {
+    let decimal = (converted_type == ConvertedType::DECIMAL).then_some((9, 2));
+    let stats = Statistics::int32(Some(value), Some(value), None, Some(0), false);
+    let column = annotated_chunk(
+        PhysicalType::INT32,
+        logical_type,
+        converted_type,
+        decimal,
+        stats,
+    );
+    let data_type = DataType::decimal(14, 4).unwrap();
+    let expected = expected.map(|bits| Scalar::decimal(bits, 14, 4).unwrap());
+    assert_eq!(extract_min_scalar(&data_type, &column), expected.clone());
+    assert_eq!(extract_max_scalar(&data_type, &column), expected);
+}
+
+#[rstest]
+#[case::decimal(
+    Some(LogicalType::decimal(2, 20)),
+    ConvertedType::DECIMAL,
+    16,
+    false,
+    Some(105_000)
+)]
+#[case::deprecated_bounds(
+    Some(LogicalType::decimal(2, 20)),
+    ConvertedType::DECIMAL,
+    16,
+    true,
+    None
+)]
+#[case::truncated_bounds(
+    Some(LogicalType::decimal(2, 20)),
+    ConvertedType::DECIMAL,
+    8,
+    false,
+    None
+)]
+#[case::unannotated(None, ConvertedType::NONE, 16, false, None)]
+fn decimal_fixed_len_byte_array_footer_stats_respect_annotations(
+    #[case] logical_type: Option<LogicalType>,
+    #[case] converted_type: ConvertedType,
+    #[case] width: usize,
+    #[case] deprecated: bool,
+    #[case] expected: Option<i128>,
+) {
+    let bytes = FixedLenByteArray::from(1_050i128.to_be_bytes()[16 - width..].to_vec());
+    let stats = Statistics::fixed_len_byte_array(
+        Some(bytes.clone()),
+        Some(bytes),
+        None,
+        Some(0),
+        deprecated,
+    );
+    let decimal = (converted_type == ConvertedType::DECIMAL).then_some((20, 2));
+    let column = annotated_chunk(
+        PhysicalType::FIXED_LEN_BYTE_ARRAY,
+        logical_type,
+        converted_type,
+        decimal,
+        stats,
+    );
+    let data_type = DataType::decimal(22, 4).unwrap();
+    let expected = expected.map(|bits| Scalar::decimal(bits, 22, 4).unwrap());
+    assert_eq!(extract_min_scalar(&data_type, &column), expected.clone());
+    assert_eq!(extract_max_scalar(&data_type, &column), expected);
+}
+
+#[test]
+fn byte_array_decimal_footer_stats_yield_no_bound() {
+    let bytes = ByteArray::from(1_050i128.to_be_bytes().to_vec());
+    let stats = Statistics::byte_array(Some(bytes.clone()), Some(bytes), None, Some(0), false);
+    let column = annotated_chunk(
+        PhysicalType::BYTE_ARRAY,
+        Some(LogicalType::decimal(2, 20)),
+        ConvertedType::DECIMAL,
+        Some((20, 2)),
+        stats,
+    );
+    let data_type = DataType::decimal(22, 4).unwrap();
+    assert_eq!(extract_min_scalar(&data_type, &column), None);
+    assert_eq!(extract_max_scalar(&data_type, &column), None);
+}
+
+#[rstest]
+#[case::zero(0, Some(0))]
+#[case::fits(1, Some(10i128.pow(37)))]
+#[case::exceeds_precision(10, None)]
+#[case::rescale_overflow(i128::MAX, None)]
+#[case::negative_rescale_overflow(i128::MIN, None)]
+fn decimal_footer_stats_reject_values_that_do_not_fit_target(
+    #[case] value: i128,
+    #[case] expected: Option<i128>,
+) {
+    let bytes = FixedLenByteArray::from(value.to_be_bytes().to_vec());
+    let stats =
+        Statistics::fixed_len_byte_array(Some(bytes.clone()), Some(bytes), None, Some(0), false);
+    let column = annotated_chunk(
+        PhysicalType::FIXED_LEN_BYTE_ARRAY,
+        Some(LogicalType::decimal(0, 1)),
+        ConvertedType::DECIMAL,
+        Some((1, 0)),
+        stats,
+    );
+    let data_type = DataType::decimal(38, 37).unwrap();
+    let expected = expected.map(|bits| Scalar::decimal(bits, 38, 37).unwrap());
+    assert_eq!(extract_min_scalar(&data_type, &column), expected.clone());
+    assert_eq!(extract_max_scalar(&data_type, &column), expected);
+}
+
+#[rstest]
+fn decimal_footer_stats_match_reader_cast(
+    #[values(
+        ArrowDataType::Int8,
+        ArrowDataType::Int16,
+        ArrowDataType::Int32,
+        ArrowDataType::Int64,
+        ArrowDataType::Decimal128(9, 2),
+        ArrowDataType::Decimal128(18, 2),
+        ArrowDataType::Decimal128(20, 2),
+        ArrowDataType::Decimal256(40, 2)
+    )]
+    source_type: ArrowDataType,
+    #[values(4, 5, 10, 12, 14, 20, 22, 38)] precision: u8,
+    #[values(0, 1, 2, 4)] scale: u8,
+) {
+    let source = cast(&Int64Array::from(vec![-105, 105]), &source_type).unwrap();
+    let builder = parquet_reader(write_row_groups(&["d"], [source.clone()]));
+    let column = builder.metadata().row_group(0).column(0);
+    let target = DataType::decimal(precision, scale).unwrap();
+    let expected = match ensure_data_types(&target, &source_type, ValidationMode::TypesOnly) {
+        Ok(_) => {
+            let opts = CastOptions {
+                safe: false,
+                ..Default::default()
+            };
+            let widened = cast_with_options(
+                &source,
+                &ArrowDataType::Decimal128(precision, scale as i8),
+                &opts,
+            )
+            .unwrap();
+            let widened = widened.as_primitive::<Decimal128Type>();
+            let bound = |i| Some(Scalar::decimal(widened.value(i), precision, scale).unwrap());
+            (bound(0), bound(1))
+        }
+        Err(_) => (None, None),
+    };
+    assert_eq!(extract_min_scalar(&target, column), expected.0);
+    assert_eq!(extract_max_scalar(&target, column), expected.1);
+}
+
+#[rstest]
+#[case::no_statistics(false, false, false)]
+#[case::no_bounds(true, false, false)]
+#[case::min_only(true, true, false)]
+#[case::max_only(true, false, true)]
+#[case::both_bounds(true, true, true)]
+fn decimal_missing_bounds_do_not_prune_matching_groups(
+    #[case] has_statistics: bool,
+    #[case] has_min: bool,
+    #[case] has_max: bool,
+    #[values(9, 18, 20)] precision: u8,
+) {
+    let bytes = write_decimal_parquet(precision, 2, &["d"], &[&[1_050, 2_000]]);
+    let builder = parquet_reader(bytes);
+    let row_group = builder.metadata().row_group(0);
+    let descriptor = row_group.column(0).column_descr_ptr();
+    let mut column = ColumnChunkMetaData::builder(descriptor.clone()).set_num_values(2);
+    if has_statistics {
+        let stats = match descriptor.physical_type() {
+            PhysicalType::INT32 => Statistics::int32(
+                has_min.then_some(1_050),
+                has_max.then_some(2_000),
+                None,
+                Some(0),
+                false,
+            ),
+            PhysicalType::INT64 => Statistics::int64(
+                has_min.then_some(1_050),
+                has_max.then_some(2_000),
+                None,
+                Some(0),
+                false,
+            ),
+            PhysicalType::FIXED_LEN_BYTE_ARRAY => {
+                let width = descriptor.type_length() as usize;
+                let bytes = |value: i128| {
+                    FixedLenByteArray::from(value.to_be_bytes()[16 - width..].to_vec())
+                };
+                Statistics::fixed_len_byte_array(
+                    has_min.then(|| bytes(1_050)),
+                    has_max.then(|| bytes(2_000)),
+                    None,
+                    Some(0),
+                    false,
+                )
+            }
+            physical_type => panic!("Unexpected decimal physical type: {physical_type:?}"),
+        };
+        column = column.set_statistics(stats);
+    }
+    let row_group = row_group
+        .clone()
+        .into_builder()
+        .set_column_metadata(vec![column.build().unwrap()])
+        .build()
+        .unwrap();
+    let predicate = column_pred!("d");
+    let filter = RowGroupFilter::new(&row_group, &predicate);
+    let target = DataType::decimal(22, 4).unwrap();
+    let scalar = |value| Scalar::decimal(value, 22, 4).unwrap();
+    assert_eq!(
+        filter.get_min_stat(&column_name!("d"), &target),
+        has_min.then(|| scalar(105_000))
+    );
+    assert_eq!(
+        filter.get_max_stat(&column_name!("d"), &target),
+        has_max.then(|| scalar(200_000))
+    );
+    assert!(RowGroupFilter::apply(
+        &row_group,
+        &Predicate::eq(col!("d"), lit(scalar(105_000)))
+    ));
+    assert_eq!(
+        RowGroupFilter::apply(&row_group, &Predicate::lt(col!("d"), lit(scalar(105_000)))),
+        !has_min
+    );
+    assert_eq!(
+        RowGroupFilter::apply(&row_group, &Predicate::gt(col!("d"), lit(scalar(200_000)))),
+        !has_max
+    );
+}
+
+#[test]
+fn test_decimal_bits_from_bytes_sign_extends_negative_stats() {
+    // FIXED_LEN_BYTE_ARRAY decimal statistics are `type_length`-wide big-endian two's-complement
+    // byte arrays, so a negative value usually occupies fewer than 16 bytes. Decoding must
+    // sign-extend the high bytes; zero-padding turns a negative stat into a large positive one,
+    // which makes row-group skipping prune groups that actually contain matching rows.
+
+    // -1 unscaled, one byte: 0xFF.
+    assert_eq!(decimal_bits_from_bytes(&[0xFF]), Some(-1));
+
+    // -256 unscaled, two bytes: 0xFF00.
+    assert_eq!(decimal_bits_from_bytes(&[0xFF, 0x00]), Some(-256));
+
+    // Positive values must stay correct.
+    assert_eq!(decimal_bits_from_bytes(&[0x01]), Some(1));
+
+    // Empty slice: no most-significant byte, treated as non-negative, decodes to 0.
+    assert_eq!(decimal_bits_from_bytes(&[]), Some(0));
+
+    // Full 16-byte negative value: every byte is copied, so the fill is unused.
+    assert_eq!(decimal_bits_from_bytes(&(-1i128).to_be_bytes()), Some(-1));
+
+    // Wider than i128: the reader decodes such columns as Decimal256, which Kernel cannot read.
+    assert_eq!(decimal_bits_from_bytes(&[0x00; 17]), None);
 }
 
 #[rstest]
@@ -778,6 +1134,26 @@ fn timestamp_checkpoint_stats_rescale_before_widening(
 }
 
 #[rstest]
+fn decimal_checkpoint_stats_rescale_footer_scale(
+    #[values(9, 18, 20)] precision: u8,
+    #[values(MIN_VALUES, MAX_VALUES)] stat: &str,
+) {
+    let col_path = ["add", "stats_parsed", stat, "d"];
+    let bytes = write_decimal_parquet(precision, 2, &col_path, &[&[6_789]]);
+    let builder = parquet_reader(bytes);
+    let predicate = column_pred!("d");
+    let filter =
+        CheckpointRowGroupFilter::new(builder.metadata().row_group(0), &predicate, &NO_PARTITIONS);
+    let data_type = DataType::decimal(23, 5).unwrap();
+    let actual = if stat == MIN_VALUES {
+        filter.get_min_stat(&column_name!("d"), &data_type)
+    } else {
+        filter.get_max_stat(&column_name!("d"), &data_type)
+    };
+    assert_eq!(actual, Some(Scalar::decimal(6_789_000, 23, 5).unwrap()));
+}
+
+#[rstest]
 fn timestamp_checkpoint_meta_predicate_preserves_truncated_max(
     #[values(
         ArrowTimeUnit::Millisecond,
@@ -804,17 +1180,48 @@ fn timestamp_checkpoint_meta_predicate_preserves_truncated_max(
         &HashSet::from([column_name!("ts")]),
     )
     .unwrap();
-    let rows: usize = parquet_reader(bytes)
-        .with_row_group_filter(&predicate, None)
-        .build()
-        .unwrap()
-        .map(|batch| batch.unwrap().num_rows())
-        .sum();
+    let rows = count_rows(parquet_reader(bytes).with_row_group_filter(&predicate, None));
     assert_eq!(rows, 1);
 }
 
 fn parquet_reader<T: ChunkReader + 'static>(data: T) -> ParquetRecordBatchReaderBuilder<T> {
     ParquetRecordBatchReaderBuilder::try_new_with_options(data, reader_options()).unwrap()
+}
+
+fn count_rows(builder: ParquetRecordBatchReaderBuilder<Bytes>) -> usize {
+    builder
+        .build()
+        .unwrap()
+        .map(|batch| batch.unwrap().num_rows())
+        .sum()
+}
+
+/// Asserts that the data filter on `col_path` (nested under `add.partitionValues_parsed`) and the
+/// checkpoint filter on its leaf as a partition column both keep `expected_rows` rows.
+fn assert_partition_filters_keep(
+    bytes: Bytes,
+    col_path: &[&str],
+    comparison: fn(Expression, Expression) -> Predicate,
+    bound: Expression,
+    expected_rows: usize,
+) {
+    let predicate = comparison(Expression::column(col_path.iter().copied()), bound.clone());
+    assert_eq!(
+        count_rows(parquet_reader(bytes.clone()).with_row_group_filter(&predicate, None)),
+        expected_rows
+    );
+
+    let leaf = *col_path.last().unwrap();
+    let predicate = comparison(Expression::column([leaf]), bound);
+    let partition_columns = HashSet::from([leaf.into()]);
+    assert_eq!(
+        count_rows(parquet_reader(bytes).with_checkpoint_row_group_filter(
+            &predicate,
+            &partition_columns,
+            None
+        )),
+        expected_rows
+    );
 }
 
 fn write_timestamp_parquet(
@@ -824,9 +1231,31 @@ fn write_timestamp_parquet(
     row_groups: &[&[i64]],
 ) -> Bytes {
     let data_type = ArrowDataType::Timestamp(unit, timezone.map(Into::into));
+    let arrays = row_groups
+        .iter()
+        .map(|&values| cast(&Int64Array::from(values.to_vec()), &data_type).unwrap());
+    write_row_groups(col_path, arrays)
+}
+
+fn write_decimal_parquet(
+    precision: u8,
+    scale: i8,
+    col_path: &[&str],
+    row_groups: &[&[i128]],
+) -> Bytes {
+    let arrays = row_groups.iter().map(|&values| -> ArrayRef {
+        let array = Decimal128Array::from(values.to_vec())
+            .with_precision_and_scale(precision, scale)
+            .unwrap();
+        Arc::new(array)
+    });
+    write_row_groups(col_path, arrays)
+}
+
+/// Writes one row group per array, each stored as the leaf column at `col_path`.
+fn write_row_groups(col_path: &[&str], row_groups: impl IntoIterator<Item = ArrayRef>) -> Bytes {
     let mut writer = None;
-    for &values in row_groups {
-        let array = cast(&Int64Array::from(values.to_vec()), &data_type).unwrap();
+    for array in row_groups {
         let (field, array) = wrap_in_nested_struct(col_path, array);
         let schema = Arc::new(ArrowSchema::new(vec![field]));
         let batch = RecordBatch::try_new(schema.clone(), vec![array]).unwrap();
@@ -837,6 +1266,35 @@ fn write_timestamp_parquet(
         writer.flush().unwrap();
     }
     writer.unwrap().into_inner().unwrap().into()
+}
+
+/// `decimal` is the legacy `(precision, scale)` pair; FIXED_LEN_BYTE_ARRAY columns are 16 bytes
+/// wide.
+fn annotated_chunk(
+    physical_type: PhysicalType,
+    logical_type: Option<LogicalType>,
+    converted_type: ConvertedType,
+    decimal: Option<(i32, i32)>,
+    stats: Statistics,
+) -> ColumnChunkMetaData {
+    let mut builder = Type::primitive_type_builder("c", physical_type)
+        .with_logical_type(logical_type.clone())
+        .with_converted_type(converted_type)
+        .with_length(16);
+    if let Some((precision, scale)) = decimal {
+        builder = builder.with_precision(precision).with_scale(scale);
+    }
+    let column = ColumnDescriptor::new(
+        Arc::new(builder.build().unwrap()),
+        0,
+        0,
+        ColumnPath::from("c"),
+    );
+    assert_eq!(column.logical_type_ref(), logical_type.as_ref());
+    ColumnChunkMetaData::builder(Arc::new(column))
+        .set_statistics(stats)
+        .build()
+        .unwrap()
 }
 
 fn timestamp_kind(timezone: Option<&str>) -> (DataType, fn(i64) -> Scalar) {
@@ -1592,43 +2050,4 @@ fn checkpoint_filter_nested_struct_column_stats() {
         &predicate,
         &NO_PARTITIONS
     ));
-}
-
-#[test]
-fn test_decimal_from_bytes_sign_extends_negative_stats() {
-    // Parquet stores decimal statistics as minimal-width big-endian two's-complement byte
-    // arrays, so a negative value occupies fewer than 16 bytes. Decoding must sign-extend the
-    // high bytes; zero-padding turns a negative stat into a large positive one, which makes
-    // row-group skipping prune groups that actually contain matching rows.
-    let dtype = DecimalType::try_new(38, 3).unwrap();
-
-    // -1 unscaled, one byte: 0xFF.
-    assert_eq!(
-        decimal_from_bytes(Some(&[0xFF]), dtype),
-        Some(Scalar::decimal(-1, 38, 3).unwrap())
-    );
-
-    // -256 unscaled, two bytes: 0xFF00.
-    assert_eq!(
-        decimal_from_bytes(Some(&[0xFF, 0x00]), dtype),
-        Some(Scalar::decimal(-256, 38, 3).unwrap())
-    );
-
-    // Positive minimal-width values must stay correct.
-    assert_eq!(
-        decimal_from_bytes(Some(&[0x01]), dtype),
-        Some(Scalar::decimal(1, 38, 3).unwrap())
-    );
-
-    // Empty slice: no most-significant byte, treated as non-negative, decodes to 0.
-    assert_eq!(
-        decimal_from_bytes(Some(&[]), dtype),
-        Some(Scalar::decimal(0, 38, 3).unwrap())
-    );
-
-    // Full 16-byte negative value: resize is a no-op, sign already present.
-    assert_eq!(
-        decimal_from_bytes(Some(&(-1i128).to_be_bytes()), dtype),
-        Some(Scalar::decimal(-1, 38, 3).unwrap())
-    );
 }

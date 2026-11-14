@@ -13,6 +13,8 @@ use crate::schema::{DataType, MetadataKey, MetadataValue, StructField};
 use crate::utils::require;
 use crate::{KernelError, KernelResult};
 
+const DECIMAL_RADIX: i128 = 10;
+
 /// Controls how `ensure_data_types` validates struct fields and metadata.
 #[derive(Clone, Copy)]
 #[internal_api]
@@ -272,8 +274,6 @@ fn check_cast_compat(
     target_type: ArrowDataType,
     source_type: &ArrowDataType,
 ) -> KernelResult<DataTypeCompat> {
-    use ArrowDataType::*;
-
     match (source_type, &target_type) {
         (source_type, target_type) if source_type == target_type => Ok(DataTypeCompat::Identical),
         (&ArrowDataType::Timestamp(_, _), &ArrowDataType::Timestamp(_, _)) => {
@@ -283,14 +283,29 @@ fn check_cast_compat(
         }
         // Allow up-casting to a larger type if it's safe and can't cause overflow or loss of
         // precision.
-        (Int8, Int16 | Int32 | Int64 | Float64) => Ok(DataTypeCompat::NeedsCast(target_type)),
-        (Int16, Int32 | Int64 | Float64) => Ok(DataTypeCompat::NeedsCast(target_type)),
-        (Int32, Int64 | Float64) => Ok(DataTypeCompat::NeedsCast(target_type)),
-        (Float32, Float64) => Ok(DataTypeCompat::NeedsCast(target_type)),
-        (_, Decimal128(p, s)) if can_upcast_to_decimal(source_type, *p, *s) => {
+        (
+            ArrowDataType::Int8,
+            ArrowDataType::Int16
+            | ArrowDataType::Int32
+            | ArrowDataType::Int64
+            | ArrowDataType::Float64,
+        ) => Ok(DataTypeCompat::NeedsCast(target_type)),
+        (
+            ArrowDataType::Int16,
+            ArrowDataType::Int32 | ArrowDataType::Int64 | ArrowDataType::Float64,
+        ) => Ok(DataTypeCompat::NeedsCast(target_type)),
+        (ArrowDataType::Int32, ArrowDataType::Int64 | ArrowDataType::Float64) => {
             Ok(DataTypeCompat::NeedsCast(target_type))
         }
-        (Date32, Timestamp(_, None)) => Ok(DataTypeCompat::NeedsCast(target_type)),
+        (ArrowDataType::Float32, ArrowDataType::Float64) => {
+            Ok(DataTypeCompat::NeedsCast(target_type))
+        }
+        (_, ArrowDataType::Decimal128(p, s)) if can_upcast_to_decimal(source_type, *p, *s) => {
+            Ok(DataTypeCompat::NeedsCast(target_type))
+        }
+        (ArrowDataType::Date32, ArrowDataType::Timestamp(_, None)) => {
+            Ok(DataTypeCompat::NeedsCast(target_type))
+        }
         // Physical type reinterpretation: some checkpoint writers store date/timestamp columns
         // as plain integers without Parquet logical type annotations. The Delta protocol
         // guarantees data files conform to the table schema, so a schema mismatch (e.g. Int32
@@ -298,8 +313,10 @@ fn check_cast_compat(
         //
         // Keep these date/timestamp rules aligned with
         // `PrimitiveType::is_checkpoint_cast_compatible` in `schema/mod.rs`.
-        (Int32, Date32) => Ok(DataTypeCompat::NeedsCast(target_type)),
-        (Int64, Timestamp(TimeUnit::Microsecond, _)) => Ok(DataTypeCompat::NeedsCast(target_type)),
+        (ArrowDataType::Int32, ArrowDataType::Date32) => Ok(DataTypeCompat::NeedsCast(target_type)),
+        (ArrowDataType::Int64, ArrowDataType::Timestamp(TimeUnit::Microsecond, _)) => {
+            Ok(DataTypeCompat::NeedsCast(target_type))
+        }
         _ => Err(make_arrow_error(format!(
             "Incorrect datatype. Expected {target_type}, got {source_type}"
         ))),
@@ -313,21 +330,32 @@ fn can_upcast_to_decimal(
     target_precision: u8,
     target_scale: i8,
 ) -> bool {
-    use ArrowDataType::*;
+    decimal_upcast_factor(source_type, target_precision, target_scale).is_some()
+}
 
+/// Multiplier that widens unscaled values of `source_type` to a decimal of `target_precision` and
+/// `target_scale` without loss of information, or `None` when `check_cast_compat` rejects that
+/// cast. Row group skipping applies it to footer bounds so pruning agrees with the reader.
+pub(crate) fn decimal_upcast_factor(
+    source_type: &ArrowDataType,
+    target_precision: u8,
+    target_scale: i8,
+) -> Option<i128> {
     let (source_precision, source_scale) = match source_type {
-        Decimal128(p, s) => (*p, *s),
+        ArrowDataType::Decimal128(p, s) => (*p, *s),
         // Allow converting integers to a decimal that can hold all possible values.
-        Int8 => (3u8, 0i8),
-        Int16 => (5u8, 0i8),
-        Int32 => (10u8, 0i8),
-        Int64 => (20u8, 0i8),
-        _ => return false,
+        ArrowDataType::Int8 => (3u8, 0i8),
+        ArrowDataType::Int16 => (5u8, 0i8),
+        ArrowDataType::Int32 => (10u8, 0i8),
+        ArrowDataType::Int64 => (20u8, 0i8),
+        _ => return None,
     };
 
-    target_precision >= source_precision
-        && target_scale >= source_scale
-        && target_precision - source_precision >= (target_scale - source_scale) as u8
+    let scale_increase = u8::try_from(target_scale.checked_sub(source_scale)?).ok()?;
+    if target_precision < source_precision || target_precision - source_precision < scale_increase {
+        return None;
+    }
+    DECIMAL_RADIX.checked_pow(scale_increase.into())
 }
 
 impl PartialEq<String> for MetadataValue {
@@ -361,6 +389,7 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
+    use crate::arrow::datatypes::DataType::{Decimal128, Int8, Int16, Int32, Int64};
     use crate::arrow::datatypes::{DataType as ArrowDataType, Field as ArrowField, Fields};
     use crate::engine::arrow_conversion::TryFromKernel as _;
     use crate::schema::{ArrayType, CheckpointFieldKind, DataType, MapType, PrimitiveType, schema};
@@ -368,10 +397,6 @@ mod tests {
 
     #[test]
     fn accepts_safe_decimal_casts() {
-        use ArrowDataType::*;
-
-        use super::can_upcast_to_decimal;
-
         assert!(can_upcast_to_decimal(&Decimal128(1, 0), 2u8, 0i8));
         assert!(can_upcast_to_decimal(&Decimal128(1, 0), 2u8, 1i8));
         assert!(can_upcast_to_decimal(&Decimal128(5, -2), 6u8, -2i8));
@@ -407,13 +432,10 @@ mod tests {
 
     #[test]
     fn rejects_unsafe_decimal_casts() {
-        use ArrowDataType::*;
-
-        use super::can_upcast_to_decimal;
-
         assert!(!can_upcast_to_decimal(&Decimal128(2, 0), 2u8, 1i8));
         assert!(!can_upcast_to_decimal(&Decimal128(2, 0), 2u8, -1i8));
         assert!(!can_upcast_to_decimal(&Decimal128(5, 2), 6u8, 4i8));
+        assert!(!can_upcast_to_decimal(&Decimal128(1, i8::MIN), 38, 0));
 
         assert!(!can_upcast_to_decimal(&Int8, 2u8, 0i8));
         assert!(!can_upcast_to_decimal(&Int8, 3u8, 1i8));
@@ -513,7 +535,7 @@ mod tests {
             [
                 ("metadata", ArrowDataType::Binary),
                 ("value", ArrowDataType::Binary),
-                ("typed_value", ArrowDataType::Int64),
+                ("typed_value", Int64),
             ],
             false,
         ),
@@ -523,7 +545,7 @@ mod tests {
         variant_arrow_struct(
             [
                 ("metadata", ArrowDataType::Binary),
-                ("typed_value", ArrowDataType::Int64),
+                ("typed_value", Int64),
                 ("value", ArrowDataType::Binary),
             ],
             false,
@@ -534,7 +556,7 @@ mod tests {
         variant_arrow_struct(
             [
                 ("metadata", ArrowDataType::Binary),
-                ("typed_value", ArrowDataType::Int64),
+                ("typed_value", Int64),
             ],
             false,
         ),
@@ -563,7 +585,7 @@ mod tests {
     fn file_arrow_struct(order: &[&'static str]) -> ArrowDataType {
         let field = |name: &'static str| {
             let data_type = match name {
-                "offset" | "size" => ArrowDataType::Int64,
+                "offset" | "size" => Int64,
                 "inline" => ArrowDataType::Binary,
                 _ => ArrowDataType::Utf8,
             };
@@ -621,12 +643,12 @@ mod tests {
         variant_arrow_struct(
             [
                 ("uri", ArrowDataType::Utf8),
-                ("offset", ArrowDataType::Int64),
-                ("size", ArrowDataType::Int64),
+                ("offset", Int64),
+                ("size", Int64),
                 ("content_type", ArrowDataType::Utf8),
                 ("checksum", ArrowDataType::Utf8),
                 ("inline", ArrowDataType::Binary),
-                ("extra", ArrowDataType::Int64),
+                ("extra", Int64),
             ],
             true,
         ),
@@ -641,7 +663,7 @@ mod tests {
             [
                 ("uri", ArrowDataType::Utf8),
                 ("offset", ArrowDataType::Utf8),
-                ("size", ArrowDataType::Int64),
+                ("size", Int64),
                 ("content_type", ArrowDataType::Utf8),
                 ("checksum", ArrowDataType::Utf8),
                 ("inline", ArrowDataType::Binary),
@@ -663,7 +685,7 @@ mod tests {
         assert!(
             ensure_data_types(
                 &DataType::decimal(5, 2).unwrap(),
-                &ArrowDataType::Decimal128(5, 2),
+                &Decimal128(5, 2),
                 ValidationMode::TypesAndNames
             )
             .is_ok()
@@ -671,7 +693,7 @@ mod tests {
         assert_result_error_with_message(
             ensure_data_types(
                 &DataType::decimal(5, 2).unwrap(),
-                &ArrowDataType::Decimal128(5, 3),
+                &Decimal128(5, 3),
                 ValidationMode::TypesAndNames,
             ),
             "Invalid argument error: Incorrect datatype. Expected Decimal128(5, 2), got Decimal128(5, 3)",
@@ -683,7 +705,7 @@ mod tests {
         let arrow_field = ArrowField::new_map(
             "map",
             "entries",
-            ArrowField::new("key", ArrowDataType::Int64, false),
+            ArrowField::new("key", Int64, false),
             ArrowField::new("val", ArrowDataType::Utf8, true),
             false,
             false,
@@ -720,7 +742,7 @@ mod tests {
         assert!(
             ensure_data_types(
                 &DataType::from(ArrayType::new(DataType::LONG, true)),
-                &ArrowDataType::new_list(ArrowDataType::Int64, true),
+                &ArrowDataType::new_list(Int64, true),
                 ValidationMode::TypesAndNames
             )
             .is_ok()
@@ -728,7 +750,7 @@ mod tests {
         assert!(
             ensure_data_types(
                 &DataType::from(ArrayType::new(DataType::LONG, true)),
-                &ArrowDataType::new_large_list(ArrowDataType::Int64, true),
+                &ArrowDataType::new_large_list(Int64, true),
                 ValidationMode::TypesAndNames
             )
             .is_ok()
@@ -736,7 +758,7 @@ mod tests {
         assert_result_error_with_message(
             ensure_data_types(
                 &DataType::from(ArrayType::new(DataType::STRING, true)),
-                &ArrowDataType::new_list(ArrowDataType::Int64, true),
+                &ArrowDataType::new_list(Int64, true),
                 ValidationMode::TypesAndNames,
             ),
             "Invalid argument error: Incorrect datatype. Expected Utf8, got Int64",
@@ -744,7 +766,7 @@ mod tests {
         assert_result_error_with_message(
             ensure_data_types(
                 &DataType::from(ArrayType::new(DataType::LONG, true)),
-                &ArrowDataType::new_list(ArrowDataType::Int64, false),
+                &ArrowDataType::new_list(Int64, false),
                 ValidationMode::Full,
             ),
             "Generic delta kernel error: List has nullability true in kernel and false in arrow",
@@ -775,8 +797,8 @@ mod tests {
         let arrow_simple_ok = ArrowField::new_struct(
             "arrow_struct",
             Fields::from(vec![
-                ArrowField::new("w", ArrowDataType::Int64, true),
-                ArrowField::new("x", ArrowDataType::Int64, true),
+                ArrowField::new("w", Int64, true),
+                ArrowField::new("x", Int64, true),
             ]),
             true,
         );
@@ -791,7 +813,7 @@ mod tests {
 
         let arrow_missing_simple = ArrowField::new_struct(
             "arrow_struct",
-            Fields::from(vec![ArrowField::new("w", ArrowDataType::Int64, true)]),
+            Fields::from(vec![ArrowField::new("w", Int64, true)]),
             true,
         );
         assert_result_error_with_message(
@@ -806,8 +828,8 @@ mod tests {
         let arrow_nullable_mismatch_simple = ArrowField::new_struct(
             "arrow_struct",
             Fields::from(vec![
-                ArrowField::new("w", ArrowDataType::Int64, false),
-                ArrowField::new("x", ArrowDataType::Int64, true),
+                ArrowField::new("w", Int64, false),
+                ArrowField::new("x", Int64, true),
             ]),
             true,
         );
@@ -830,8 +852,8 @@ mod tests {
             nullable "x": STRING,
         });
         let arrow = ArrowDataType::Struct(Fields::from(vec![
-            ArrowField::new("w", ArrowDataType::Int64, true),
-            ArrowField::new("extra", ArrowDataType::Int64, true),
+            ArrowField::new("w", Int64, true),
+            ArrowField::new("extra", Int64, true),
             ArrowField::new("x", ArrowDataType::Utf8, true),
         ]));
         assert_eq!(
@@ -848,8 +870,8 @@ mod tests {
             nullable "x": LONG,
         });
         let arrow = ArrowDataType::Struct(Fields::from(vec![
-            ArrowField::new("w", ArrowDataType::Int64, true),
-            ArrowField::new("extra", ArrowDataType::Int64, true),
+            ArrowField::new("w", Int64, true),
+            ArrowField::new("extra", Int64, true),
             ArrowField::new("x", ArrowDataType::Utf8, true),
         ]));
         assert_result_error_with_message(
@@ -881,10 +903,7 @@ mod tests {
         assert_eq!(
             ensure_data_types(
                 &DataType::from(ArrayType::new(DataType::LONG, true)),
-                &ArrowDataType::ListView(Arc::new(ArrowField::new_list_field(
-                    ArrowDataType::Int64,
-                    true
-                ))),
+                &ArrowDataType::ListView(Arc::new(ArrowField::new_list_field(Int64, true))),
                 ValidationMode::Full
             )
             .unwrap(),
@@ -893,10 +912,7 @@ mod tests {
         assert_eq!(
             ensure_data_types(
                 &DataType::from(ArrayType::new(DataType::LONG, true)),
-                &ArrowDataType::LargeListView(Arc::new(ArrowField::new_list_field(
-                    ArrowDataType::Int64,
-                    true
-                ))),
+                &ArrowDataType::LargeListView(Arc::new(ArrowField::new_list_field(Int64, true))),
                 ValidationMode::Full
             )
             .unwrap(),
@@ -930,12 +946,7 @@ mod tests {
     fn ensure_int32_to_date_reinterpretation() {
         // Int32 -> Date32: checkpoint writers may omit the DATE logical type annotation
         assert_eq!(
-            ensure_data_types(
-                &DataType::DATE,
-                &ArrowDataType::Int32,
-                ValidationMode::TypesAndNames
-            )
-            .unwrap(),
+            ensure_data_types(&DataType::DATE, &Int32, ValidationMode::TypesAndNames).unwrap(),
             DataTypeCompat::NeedsCast(ArrowDataType::Date32)
         );
         // Reverse is not supported: Date32 -> Int32
@@ -954,12 +965,7 @@ mod tests {
         // Int64 -> Timestamp (with UTC timezone, i.e. kernel `timestamp`)
         let ts_utc = ArrowDataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()));
         assert_eq!(
-            ensure_data_types(
-                &DataType::TIMESTAMP,
-                &ArrowDataType::Int64,
-                ValidationMode::TypesAndNames
-            )
-            .unwrap(),
+            ensure_data_types(&DataType::TIMESTAMP, &Int64, ValidationMode::TypesAndNames).unwrap(),
             DataTypeCompat::NeedsCast(ts_utc)
         );
         // Int64 -> TimestampNtz (no timezone, i.e. kernel `timestamp_ntz`)
@@ -967,7 +973,7 @@ mod tests {
         assert_eq!(
             ensure_data_types(
                 &DataType::TIMESTAMP_NTZ,
-                &ArrowDataType::Int64,
+                &Int64,
                 ValidationMode::TypesAndNames
             )
             .unwrap(),
@@ -989,7 +995,7 @@ mod tests {
         assert_eq!(
             ensure_data_types(
                 &DataType::INTERVAL_YEAR_MONTH,
-                &ArrowDataType::Int32,
+                &Int32,
                 ValidationMode::TypesAndNames
             )
             .unwrap(),
@@ -998,7 +1004,7 @@ mod tests {
         assert_eq!(
             ensure_data_types(
                 &DataType::INTERVAL_DAY_TIME,
-                &ArrowDataType::Int64,
+                &Int64,
                 ValidationMode::TypesAndNames
             )
             .unwrap(),
@@ -1063,7 +1069,7 @@ mod tests {
         });
         let arrow = ArrowDataType::Struct(
             vec![
-                ArrowField::new("physical_x", ArrowDataType::Int64, true),
+                ArrowField::new("physical_x", Int64, true),
                 ArrowField::new("physical_y", ArrowDataType::Utf8, true),
             ]
             .into(),
@@ -1077,8 +1083,7 @@ mod tests {
             nullable "a": LONG,
             nullable "b": LONG,
         });
-        let arrow =
-            ArrowDataType::Struct(vec![ArrowField::new("x", ArrowDataType::Int64, true)].into());
+        let arrow = ArrowDataType::Struct(vec![ArrowField::new("x", Int64, true)].into());
         assert_result_error_with_message(
             ensure_data_types(&kernel, &arrow, ValidationMode::TypesOnly),
             "Struct field count mismatch",
@@ -1093,7 +1098,7 @@ mod tests {
         });
         let arrow = ArrowDataType::Struct(
             vec![
-                ArrowField::new("x", ArrowDataType::Int64, true),
+                ArrowField::new("x", Int64, true),
                 ArrowField::new("y", ArrowDataType::Utf8, true),
             ]
             .into(),
