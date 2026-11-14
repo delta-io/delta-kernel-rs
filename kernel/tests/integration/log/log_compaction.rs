@@ -1,26 +1,18 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use delta_kernel::Snapshot;
-use delta_kernel::engine::to_json_bytes;
 use delta_kernel::object_store::ObjectStoreExt as _;
 use delta_kernel::object_store::path::Path;
 use delta_kernel::schema::schema_ref;
 use test_utils::{create_table, engine_store_setup};
-use url::Url;
 
-/// Convert a URL to a `delta_kernel::object_store::Path`
-fn url_to_object_store_path(url: &Url) -> Result<Path, Box<dyn std::error::Error>> {
-    let path_segments = url
-        .path_segments()
-        .ok_or_else(|| format!("URL has no path segments: {url}"))?;
-
-    let path_string = path_segments.skip(1).collect::<Vec<_>>().join("/");
-
-    Ok(Path::from(path_string))
-}
+use crate::common::write_utils::write_log_compaction;
 
 #[tokio::test]
-#[ignore = "log compaction disabled (#2337)"]
+#[cfg_attr(
+    not(feature = "declarative-plans"),
+    ignore = "log compaction disabled (#2337)"
+)]
 async fn action_reconciliation_round_trip() -> Result<(), Box<dyn std::error::Error>> {
     let _ = tracing_subscriber::fmt::try_init();
 
@@ -71,55 +63,14 @@ async fn action_reconciliation_round_trip() -> Result<(), Box<dyn std::error::Er
         )
         .await?;
 
-    // Create snapshot and log compaction writer
     let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
-    let mut writer = snapshot.log_compaction_writer(0, 2)?;
-
-    // Get compaction data iterator
-    let mut compaction_data = writer.compaction_data(&engine)?;
-    let compaction_path = writer.compaction_path().clone();
+    let compaction_path = write_log_compaction(&snapshot, &engine, store.clone(), 0, 2)?;
 
     // Verify the compaction file name
     let expected_filename = "00000000000000000000.00000000000000000002.compacted.json";
     assert!(compaction_path.to_string().ends_with(expected_filename));
 
-    // Process compaction data batches and collect the actual compacted data
-    let mut batch_count = 0;
-    let mut compacted_data_batches = Vec::new();
-
-    // Log compaction should produce reconciled actions from the version range:
-    // - Protocol + metadata from table creation
-    // - Add action for file1 (first/newest add for this file path)
-    // - Add action for file2 (first/newest add for this file path)
-    // - Remove action for file1 (first/newest remove for this file path, non-expired tombstone)
-    // - CommitInfo actions should be excluded from compaction
-    //
-    // Note: Actions are processed in reverse chronological order (newest to oldest).
-    // The reconciliation keeps the first (newest) occurrence of each action type
-    // for each unique file path, so both add and remove actions for file1 are kept.
-    for batch_result in compaction_data.by_ref() {
-        let batch = batch_result?;
-        compacted_data_batches.push(batch);
-        batch_count += 1;
-    }
-
-    assert!(
-        batch_count > 0,
-        "Should have processed at least one compaction batch"
-    );
-
-    // Convert the end-to-end flow of writing the JSON. We are going beyond the public
-    // log compaction APIs since the test is writing the compacted JSON and verifying it
-    // bu this is intentional, as most engines would be implementing something similar
-    let compaction_data_iter = compacted_data_batches.into_iter().map(Ok);
-    let json_bytes = to_json_bytes(compaction_data_iter)?;
-    let final_content = String::from_utf8(json_bytes)?;
-
-    let compaction_file_path = url_to_object_store_path(&compaction_path)?;
-
-    store
-        .put(&compaction_file_path, final_content.clone().into())
-        .await?;
+    let compaction_file_path = Path::from_url_path(compaction_path.path())?;
 
     // Verify the compacted file content that we just wrote
     let compacted_content = store.get(&compaction_file_path).await?;
@@ -191,7 +142,10 @@ async fn action_reconciliation_round_trip() -> Result<(), Box<dyn std::error::Er
 
 /// Test log compaction behavior with expired tombstones.
 #[tokio::test]
-#[ignore = "log compaction disabled (#2337)"]
+#[cfg_attr(
+    not(feature = "declarative-plans"),
+    ignore = "log compaction disabled (#2337)"
+)]
 async fn expired_tombstone_exclusion() -> Result<(), Box<dyn std::error::Error>> {
     let _ = tracing_subscriber::fmt::try_init();
 
@@ -268,39 +222,13 @@ async fn expired_tombstone_exclusion() -> Result<(), Box<dyn std::error::Error>>
         .await?;
 
     let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
-    let mut writer = snapshot.log_compaction_writer(0, 3)?;
-
-    let mut compaction_data = writer.compaction_data(&engine)?;
-    let compaction_path = writer.compaction_path().clone();
+    let compaction_path = write_log_compaction(&snapshot, &engine, store.clone(), 0, 3)?;
 
     // Verify the compaction file name
     let expected_filename = "00000000000000000000.00000000000000000003.compacted.json";
     assert!(compaction_path.to_string().ends_with(expected_filename));
 
-    let mut batch_count = 0;
-    let mut compacted_data_batches = Vec::new();
-
-    for batch_result in compaction_data.by_ref() {
-        let batch = batch_result?;
-        compacted_data_batches.push(batch);
-        batch_count += 1;
-    }
-
-    assert!(
-        batch_count > 0,
-        "Should have processed at least one compaction batch"
-    );
-
-    // Convert to JSON and write to storage for verification
-    let compaction_data_iter = compacted_data_batches.into_iter().map(Ok);
-    let json_bytes = to_json_bytes(compaction_data_iter)?;
-    let final_content = String::from_utf8(json_bytes)?;
-
-    let compaction_file_path = url_to_object_store_path(&compaction_path)?;
-
-    store
-        .put(&compaction_file_path, final_content.clone().into())
-        .await?;
+    let compaction_file_path = Path::from_url_path(compaction_path.path())?;
 
     // Verify the compacted file content
     let compacted_content = store.get(&compaction_file_path).await?;
@@ -360,10 +288,8 @@ async fn expired_tombstone_exclusion() -> Result<(), Box<dyn std::error::Error>>
         !has_commit_info,
         "Compacted file should NOT contain commitInfo actions (they should be excluded)"
     );
-    assert!(
-        !has_remove_expired_file,
-        "Compacted file should NOT contain remove action for expired file"
-    );
+    // Declarative compaction retains tombstones: an interval may be replayed over older state.
+    assert_eq!(has_remove_expired_file, cfg!(feature = "declarative-plans"));
     assert!(
         has_remove_recent_file,
         "Compacted file should contain remove action for recent file"

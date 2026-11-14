@@ -1,7 +1,7 @@
 //! # Log Compaction
 //!
-//! **NOTE:** Log compaction is currently disabled on both reads and writes due to
-//! insufficient integration test coverage. See issue #2337 for re-enablement tracking.
+//! **NOTE:** The imperative writer and compacted-file discovery remain disabled (#2337).
+//! With `declarative-plans`, use `Snapshot::compact_log`.
 //!
 //! This module provides an API for writing log compaction files that aggregate
 //! multiple commit JSON files into single compacted files. This improves performance
@@ -88,6 +88,8 @@ use crate::actions::{
 };
 use crate::schema::{SchemaRef, lazy_schema_ref};
 
+#[cfg(feature = "declarative-plans")]
+mod plan;
 mod writer;
 
 pub use writer::{LogCompactionWriter, should_compact};
