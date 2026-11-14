@@ -254,7 +254,8 @@ uintptr_t convert_engine_to_kernel_expression_item(
       uintptr_t child = convert_engine_to_kernel_expression_item(
           state, m2s->child_expr.list[0]);
       struct FfiMapToStructOptions options = {
-        .timestamp_timezone = {.tag = NoneKernelStringSlice}
+        .timestamp_timezone = {.tag = NoneKernelStringSlice},
+        .null_on_invalid = m2s->null_on_invalid
       };
       if (m2s->timestamp_timezone != NULL) {
         options.timestamp_timezone.tag = SomeKernelStringSlice;

@@ -204,6 +204,11 @@ pub enum VariadicExpressionOp {
     /// [`Scalar::Array`] instead. The difference is that `Array` is evaluated at runtime, while
     /// `Scalar::Array` is evaluated at compile time.
     Array,
+    /// A map from alternating key/value operands. Keys must have one shared type, values must
+    /// have one shared type, and neither side receives implicit casts. Null or duplicate keys
+    /// within a row are errors; values may be null unless the result type disallows them.
+    /// Every result row is a non-null map. Empty maps require a caller-supplied map result type.
+    Map,
 }
 
 /// A junction (AND/OR) predicate operator over N child predicates.
@@ -727,6 +732,8 @@ impl ParseJsonExpression {
 pub struct MapToStructOptions {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     timestamp_timezone: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    null_on_invalid: bool,
 }
 
 impl MapToStructOptions {
@@ -745,6 +752,17 @@ impl MapToStructOptions {
     /// Fixed offsets use `+HH:MM[:SS]` or `-HH:MM[:SS]` form, or `Z` for UTC.
     pub fn timestamp_timezone(&self) -> Option<&str> {
         self.timestamp_timezone.as_deref()
+    }
+
+    /// Return null for unparseable values; invalid schemas and timezones still fail.
+    pub fn with_null_on_invalid(mut self, null_on_invalid: bool) -> Self {
+        self.null_on_invalid = null_on_invalid;
+        self
+    }
+
+    /// Whether unparseable values become null instead of failing evaluation.
+    pub fn null_on_invalid(&self) -> bool {
+        self.null_on_invalid
     }
 
     /// Returns whether no parsing options are configured.
@@ -812,7 +830,9 @@ impl MapToStructOptions {
 ///
 /// Non-empty geometry and geography values are unsupported. Struct, array, map, and variant target
 /// fields are not primitive partition types and are rejected. Any other unparseable non-empty value
-/// returns [`KernelError::ParseError`] and fails evaluation; it does not silently become null.
+/// returns [`KernelError::ParseError`] and fails evaluation, unless
+/// [`MapToStructOptions::with_null_on_invalid`] enables nulls for invalid values. This option does
+/// not suppress invalid schemas, unsupported types, or invalid timezone configuration.
 ///
 /// # Implementing this expression
 ///
@@ -1003,6 +1023,14 @@ impl Expression {
     /// Creates a new Array constructor expression. See [`VariadicExpressionOp::Array`].
     pub fn array(exprs: impl IntoIterator<Item = impl Into<Expression>>) -> Self {
         Self::variadic(VariadicExpressionOp::Array, exprs)
+    }
+
+    /// Creates a map from key/value expressions. See [`VariadicExpressionOp::Map`].
+    pub fn map(entries: impl IntoIterator<Item = (Expression, Expression)>) -> Self {
+        Self::variadic(
+            VariadicExpressionOp::Map,
+            entries.into_iter().flat_map(|(key, value)| [key, value]),
+        )
     }
 
     /// Creates a searched CASE expression from ordered condition/result `branches` and an
@@ -1259,6 +1287,7 @@ impl Display for VariadicExpressionOp {
         match self {
             Coalesce => write!(f, "COALESCE"),
             Array => write!(f, "ARRAY"),
+            Map => write!(f, "MAP"),
         }
     }
 }
@@ -1349,16 +1378,16 @@ impl Display for Expression {
                     p.output_schema.fields().len()
                 )
             }
-            MapToStruct(m) => match m.options.timestamp_timezone() {
-                Some(timezone) => {
-                    write!(
-                        f,
-                        "MAP_TO_STRUCT({}, timestamp_timezone={timezone:?})",
-                        m.map_expr
-                    )
+            MapToStruct(m) => {
+                write!(f, "MAP_TO_STRUCT({}", m.map_expr)?;
+                if let Some(timezone) = m.options.timestamp_timezone() {
+                    write!(f, ", timestamp_timezone={timezone:?}")?;
                 }
-                None => write!(f, "MAP_TO_STRUCT({})", m.map_expr),
-            },
+                if m.options.null_on_invalid() {
+                    write!(f, ", null_on_invalid=true")?;
+                }
+                write!(f, ")")
+            }
             Cast(c) => write!(f, "CAST({} AS {})", c.expr, c.target),
         }
     }
@@ -1718,9 +1747,10 @@ mod tests {
             }
         }
 
-        #[test]
-        fn test_variadic_expression_roundtrip() {
-            let expr = expr!(coalesce(col("a"), col("b"), "default"));
+        #[rstest::rstest]
+        #[case(expr!(coalesce(col("a"), col("b"), "default")))]
+        #[case(Expression::map([(lit("tag"), Expression::cast(col!("count"), DataType::STRING))]))]
+        fn test_variadic_expression_roundtrip(#[case] expr: Expression) {
             assert_roundtrip(&expr);
         }
 
@@ -1843,6 +1873,10 @@ mod tests {
                 Expression::map_to_struct(
                     col!("pv"),
                     MapToStructOptions::default().with_timestamp_timezone("America/Los_Angeles"),
+                ),
+                Expression::map_to_struct(
+                    col!("pv"),
+                    MapToStructOptions::default().with_null_on_invalid(true),
                 ),
             ];
 

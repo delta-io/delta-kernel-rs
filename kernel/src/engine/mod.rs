@@ -76,6 +76,11 @@ pub use self::arrow_utils::{parse_json, to_json_bytes};
 #[cfg(all(feature = "declarative-plans", feature = "default-engine-base"))]
 pub mod plans;
 
+// The storage adapter does not require Arrow engine support.
+#[cfg(feature = "declarative-plans")]
+#[path = "plans/storage.rs"]
+pub mod plan_storage;
+
 #[cfg(any(
     test,
     all(

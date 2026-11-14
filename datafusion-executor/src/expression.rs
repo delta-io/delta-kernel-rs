@@ -6,13 +6,14 @@ use datafusion::arrow::array::{ArrayRef, RecordBatch, StructArray, new_null_arra
 use datafusion::arrow::datatypes::{DataType as ArrowDataType, Schema as ArrowSchema};
 use datafusion::common::utils::take_function_args;
 use datafusion::common::{
-    Column as DFColumn, DataFusionError, Result as DFResult, ScalarValue as DFScalarValue,
+    Column as DFColumn, DFSchema, DataFusionError, Result as DFResult, ScalarValue as DFScalarValue,
 };
 use datafusion::functions::core::expr_fn::{coalesce, get_field, named_struct, nullif};
 use datafusion::functions_nested::expr_fn::make_array;
+use datafusion::functions_nested::map::map;
 use datafusion::logical_expr::{
-    Case, ColumnarValue, Expr as DFExpr, Operator, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl,
-    Signature, Volatility, binary_expr, cast, lit,
+    Case, ColumnarValue, Expr as DFExpr, ExprSchemable, Operator, ScalarFunctionArgs, ScalarUDF,
+    ScalarUDFImpl, Signature, Volatility, binary_expr, cast, lit, try_cast,
 };
 use delta_kernel::engine::arrow_conversion::TryIntoArrow;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
@@ -20,8 +21,8 @@ use delta_kernel::engine::arrow_expression::evaluate_expression as kernel_expres
 use delta_kernel::engine::parse_json;
 use delta_kernel::expressions::{
     BinaryExpression, BinaryExpressionOp, Expression as KernelExpression, ExpressionRef,
-    ExpressionStructPatch, MapToStructExpression, MapToStructOptions, ParseJsonExpression,
-    UnaryExpressionOp, VariadicExpression, VariadicExpressionOp,
+    ExpressionStructPatch, MapData, MapToStructExpression, MapToStructOptions, ParseJsonExpression,
+    Scalar, UnaryExpressionOp, VariadicExpression, VariadicExpressionOp,
 };
 use delta_kernel::schema::{
     DataType as KernelDataType, PrimitiveType, SchemaRef as KernelSchemaRef, StructField,
@@ -82,9 +83,9 @@ pub fn to_df_expr(
             "converting a CaseWhen expression is not yet supported",
         )),
 
-        // TODO(#3007): implement once kernel's Cast semantics are clarified.
-        KernelExpression::Cast(_) => Err(KernelError::unsupported(
-            "converting a Cast expression is not yet supported",
+        KernelExpression::Cast(cast) => Ok(try_cast(
+            to_df_expr(&cast.expr, input_schema, None)?,
+            (&cast.target).try_into_arrow()?,
         )),
 
         KernelExpression::Opaque(_) => Err(KernelError::unsupported(
@@ -142,34 +143,108 @@ fn binary_expr_to_df_expr(
 /// Lowers a variadic expression: `Coalesce` to `coalesce(..)` and `Array` to `make_array(..)`, each
 /// over the converted arguments. `Coalesce` forwards `output_type` to construct schema-dependent
 /// arguments before DataFusion performs common-type resolution and supported implicit conversions.
-/// A known `Array<E>` target is peeled to `E` and forwarded to each element so an array of structs
-/// gets its element schema; an unknown target leaves elements untyped.
+/// Container targets supply child types. `Map` lowers to the native constructor, which rejects
+/// null and duplicate keys. Nonempty maps require nullable values and matching operand types.
 fn variadic_to_df_expr(
     variadic: &VariadicExpression,
     input_schema: &StructType,
     output_type: Option<&KernelDataType>,
 ) -> KernelResult<DFExpr> {
-    let arg_output_type = match variadic.op {
-        VariadicExpressionOp::Coalesce => output_type,
-        VariadicExpressionOp::Array => match output_type {
-            Some(KernelDataType::Array(arr)) => Some(arr.element_type()),
-            Some(other) => {
-                return Err(KernelError::unsupported(format!(
-                    "converting an Array expression requires an array output type, got {other:?}"
+    let args = |output_type| {
+        variadic
+            .exprs
+            .iter()
+            .map(|e| to_df_expr(e, input_schema, output_type))
+            .collect::<KernelResult<Vec<DFExpr>>>()
+    };
+    match variadic.op {
+        VariadicExpressionOp::Coalesce => Ok(coalesce(args(output_type)?)),
+        VariadicExpressionOp::Array => {
+            let element_type = match output_type {
+                Some(KernelDataType::Array(arr)) => Some(arr.element_type()),
+                Some(other) => {
+                    return Err(KernelError::unsupported(format!(
+                        "converting an Array expression requires an array output type, got {other:?}"
+                    )));
+                }
+                None => None,
+            };
+            Ok(make_array(args(element_type)?))
+        }
+        VariadicExpressionOp::Map => map_to_df_expr(variadic, input_schema, output_type),
+    }
+}
+
+fn map_to_df_expr(
+    variadic: &VariadicExpression,
+    input_schema: &StructType,
+    output_type: Option<&KernelDataType>,
+) -> KernelResult<DFExpr> {
+    if !variadic.exprs.len().is_multiple_of(2) {
+        return Err(KernelError::generic(
+            "Map expression requires alternating key/value operands",
+        ));
+    }
+    let target = match output_type {
+        Some(KernelDataType::Map(map)) => Some(map.as_ref()),
+        None => None,
+        Some(other) => {
+            return Err(KernelError::unsupported(format!(
+                "converting a Map expression requires a map output type, got {other:?}"
+            )));
+        }
+    };
+    if variadic.exprs.is_empty() {
+        let target = target.ok_or_else(|| {
+            KernelError::generic("Empty Map expression requires a map result type")
+        })?;
+        let scalar = Scalar::Map(MapData::try_new(
+            target.clone(),
+            std::iter::empty::<(Scalar, Scalar)>(),
+        )?);
+        return Ok(lit(to_df_scalar(&scalar)?));
+    }
+    if target.is_some_and(|m| !m.value_contains_null()) {
+        return Err(KernelError::unsupported(
+            "Nonempty Map with non-nullable values is unsupported",
+        ));
+    }
+    let mut keys = Vec::new();
+    let mut values = Vec::new();
+    for pair in variadic.exprs.chunks_exact(2) {
+        keys.push(to_df_expr(
+            &pair[0],
+            input_schema,
+            target.map(|m| m.key_type()),
+        )?);
+        values.push(to_df_expr(
+            &pair[1],
+            input_schema,
+            target.map(|m| m.value_type()),
+        )?);
+    }
+    let arrow_schema: ArrowSchema = input_schema.try_into_arrow()?;
+    let schema = DFSchema::try_from(arrow_schema).map_err(KernelError::generic_err)?;
+    for (side, args, expected) in [
+        ("key", &keys, target.map(|m| m.key_type())),
+        ("value", &values, target.map(|m| m.value_type())),
+    ] {
+        let expected = match expected {
+            Some(data_type) => data_type.try_into_arrow()?,
+            None => args[0]
+                .get_type(&schema)
+                .map_err(KernelError::generic_err)?,
+        };
+        for arg in args {
+            let actual = arg.get_type(&schema).map_err(KernelError::generic_err)?;
+            if actual != expected {
+                return Err(KernelError::generic(format!(
+                    "Map {side} operands must have type {expected:?}, got {actual:?}"
                 )));
             }
-            None => None,
-        },
-    };
-    let args: KernelResult<Vec<DFExpr>> = variadic
-        .exprs
-        .iter()
-        .map(|e| to_df_expr(e, input_schema, arg_output_type))
-        .collect();
-    match variadic.op {
-        VariadicExpressionOp::Coalesce => Ok(coalesce(args?)),
-        VariadicExpressionOp::Array => Ok(make_array(args?)),
+        }
     }
+    Ok(map(keys, values))
 }
 
 /// Extracts the target struct type for a struct-shaped arm from the caller's `output_type`,
@@ -634,10 +709,11 @@ impl ScalarUDFImpl for ParseJsonUdf {
 #[cfg(test)]
 mod tests {
     use datafusion::arrow::array::{
-        Array, AsArray, Int32Array, MapBuilder, StringArray, StringBuilder,
+        Array, AsArray, Int32Array, Int64Array, MapBuilder, StringArray, StringBuilder,
         TimestampMicrosecondArray,
     };
     use datafusion::arrow::datatypes::Field as ArrowField;
+    use datafusion::arrow::util::display::array_value_to_string;
     use datafusion::assert_batches_eq;
     use datafusion::common::DFSchema;
     use datafusion::logical_expr::physical_planning_context::PhysicalPlanningContext;
@@ -744,6 +820,100 @@ mod tests {
     )]
     fn variadic_lowers_to_call(#[case] kernel: KernelExpr, #[case] expected: &str) {
         assert_eq!(lower(kernel), expected);
+    }
+
+    #[rstest]
+    #[case::mixed_keys(
+        KernelExpr::map([(col!("b"), lit(1_i64)), (lit(2_i32), lit(3_i64))]),
+        None, "Map key operands",
+    )]
+    #[case::mixed_values(
+        KernelExpr::map([(lit("x"), col!("b")), (lit("y"), lit(2_i32))]),
+        None, "Map value operands",
+    )]
+    #[case::declared_key(
+        KernelExpr::map([(lit("x"), col!("b"))]),
+        Some(MapType::new(DataType::LONG, DataType::LONG, true).into()), "Map key operands",
+    )]
+    #[case::declared_value(
+        KernelExpr::map([(lit("x"), col!("b"))]),
+        Some(MapType::new(DataType::STRING, DataType::STRING, true).into()), "Map value operands",
+    )]
+    #[case::non_nullable_values(
+        KernelExpr::map([(lit("x"), col!("b"))]),
+        Some(MapType::new(DataType::STRING, DataType::LONG, false).into()), "non-nullable values",
+    )]
+    fn map_lowering_rejects_invalid_types(
+        #[case] expr: KernelExpr,
+        #[case] output_type: Option<DataType>,
+        #[case] expected: &str,
+    ) {
+        let err = to_df_expr(&expr, &test_schema(), output_type.as_ref())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains(expected), "{err}");
+    }
+
+    #[rstest]
+    #[case::cast(
+        KernelExpr::map([(lit("tag"), KernelExpr::cast(col!("count"), DataType::STRING))]),
+        None,
+        Ok(["{tag: 3}", "{tag: }"]),
+    )]
+    #[case::cast_typed(
+        KernelExpr::map([(lit("tag"), KernelExpr::cast(col!("count"), DataType::STRING))]),
+        Some(MapType::new(DataType::STRING, DataType::STRING, true).into()),
+        Ok(["{tag: 3}", "{tag: }"]),
+    )]
+    #[case::empty(
+        KernelExpr::map([]),
+        Some(MapType::new(DataType::STRING, DataType::STRING, false).into()),
+        Ok(["{}", "{}"]),
+    )]
+    #[case::null_key(
+        KernelExpr::map([(col!("count"), lit(1_i64))]), None, Err("map key cannot be null"),
+    )]
+    #[case::duplicate_keys(
+        KernelExpr::map([(lit("x"), col!("count")), (lit("x"), lit(1_i64))]),
+        None, Err("map key must be unique"),
+    )]
+    fn map_executes(
+        #[case] expr: KernelExpr,
+        #[case] output_type: Option<DataType>,
+        #[case] expected: Result<[&str; 2], &str>,
+    ) {
+        let batch = RecordBatch::try_from_iter([(
+            "count",
+            Arc::new(Int64Array::from(vec![Some(3), None])) as ArrayRef,
+        )])
+        .unwrap();
+        let logical = to_df_expr(
+            &expr,
+            &schema! { nullable "count": LONG },
+            output_type.as_ref(),
+        )
+        .unwrap();
+        let physical = create_physical_expr(
+            &logical,
+            &DFSchema::try_from(batch.schema().as_ref().clone()).unwrap(),
+            &ExecutionProps::new(),
+            &PhysicalPlanningContext::default(),
+        )
+        .unwrap();
+        let result = physical.evaluate(&batch).and_then(|v| v.into_array(2));
+        match expected {
+            Ok(expected) => {
+                let result = result.unwrap();
+                assert_eq!(result.null_count(), 0);
+                for (row, expected) in expected.iter().enumerate() {
+                    assert_eq!(
+                        array_value_to_string(result.as_ref(), row).unwrap(),
+                        *expected
+                    );
+                }
+            }
+            Err(expected) => assert!(result.unwrap_err().to_string().contains(expected)),
+        }
     }
 
     /// An array of structs peels the element type off the `Array<Struct>` target and threads the
@@ -1181,7 +1351,8 @@ mod tests {
     fn map_to_struct_with_unsupported_target_is_an_error(
         #[values(
             MapToStructOptions::default(),
-            MapToStructOptions::default().with_timestamp_timezone("America/Los_Angeles")
+            MapToStructOptions::default().with_timestamp_timezone("America/Los_Angeles"),
+            MapToStructOptions::default().with_null_on_invalid(true)
         )]
         options: MapToStructOptions,
         #[case] output_type: Option<DataType>,
@@ -1203,6 +1374,7 @@ mod tests {
     fn map_to_struct_executes_with_options(
         #[case] options: MapToStructOptions,
         #[case] expected_timestamp: i64,
+        #[values(false, true)] null_on_invalid: bool,
     ) {
         let mut maps = MapBuilder::new(None, StringBuilder::new(), StringBuilder::new());
         maps.keys().append_value("id");
@@ -1210,6 +1382,13 @@ mod tests {
         maps.keys().append_value("ts");
         maps.values().append_value("2024-06-15 09:30:00");
         maps.append(true).unwrap();
+        if null_on_invalid {
+            maps.keys().append_value("id");
+            maps.values().append_value("not a number");
+            maps.keys().append_value("ts");
+            maps.values().append_value("not a timestamp");
+            maps.append(true).unwrap();
+        }
         maps.append(false).unwrap();
         let map = Arc::new(maps.finish()) as ArrayRef;
         let arrow_schema =
@@ -1220,7 +1399,7 @@ mod tests {
             nullable "ts": TIMESTAMP,
         };
         let logical = to_df_expr(
-            &KernelExpr::map_to_struct(col!("pv"), options),
+            &KernelExpr::map_to_struct(col!("pv"), options.with_null_on_invalid(null_on_invalid)),
             &pv_map_schema(),
             Some(&DataType::from(target)),
         )
@@ -1233,7 +1412,11 @@ mod tests {
             &PhysicalPlanningContext::default(),
         )
         .unwrap();
-        let result = physical.evaluate(&batch).unwrap().into_array(2).unwrap();
+        let result = physical
+            .evaluate(&batch)
+            .unwrap()
+            .into_array(batch.num_rows())
+            .unwrap();
         let result = result.as_struct();
         let ids = result
             .column(0)
@@ -1247,7 +1430,12 @@ mod tests {
             .unwrap();
         assert_eq!(ids.value(0), 7);
         assert_eq!(timestamps.value(0), expected_timestamp);
-        assert!(result.is_null(1));
+        if null_on_invalid {
+            assert!(result.is_valid(1));
+            assert!(ids.is_null(1));
+            assert!(timestamps.is_null(1));
+        }
+        assert!(result.is_null(batch.num_rows() - 1));
     }
 
     #[test]
@@ -1266,8 +1454,10 @@ mod tests {
         assert!(udf("America/Los_Angeles") != udf("America/New_York"));
     }
 
-    #[test]
-    fn configured_map_to_struct_reports_invalid_timezone() {
+    #[rstest]
+    fn configured_map_to_struct_reports_invalid_timezone(
+        #[values(false, true)] null_on_invalid: bool,
+    ) {
         let mut maps = MapBuilder::new(None, StringBuilder::new(), StringBuilder::new());
         maps.keys().append_value("ts");
         maps.values().append_value("2024-06-15 09:30:00");
@@ -1279,7 +1469,9 @@ mod tests {
         let logical = to_df_expr(
             &KernelExpr::map_to_struct(
                 col!("pv"),
-                MapToStructOptions::default().with_timestamp_timezone("Not/AZone"),
+                MapToStructOptions::default()
+                    .with_timestamp_timezone("Not/AZone")
+                    .with_null_on_invalid(null_on_invalid),
             ),
             &pv_map_schema(),
             Some(&DataType::from(schema! { nullable "ts": TIMESTAMP })),

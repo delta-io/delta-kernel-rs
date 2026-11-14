@@ -49,6 +49,7 @@ enum VariadicExpressionOp {
   VARIADIC_EXPRESSION_OP_UNSPECIFIED = 0;
   VARIADIC_EXPRESSION_OP_COALESCE = 1;
   VARIADIC_EXPRESSION_OP_ARRAY = 2;
+  VARIADIC_EXPRESSION_OP_MAP = 3;
 }
 
 enum JunctionPredicateOp {
@@ -139,6 +140,12 @@ message VariadicExpression {
   repeated Expression exprs = 2;
 }
 
+// Safe cast: values that cannot be represented in the target type become NULL.
+message CastExpression {
+  Expression expr = 1;
+  delta.kernel.schema.DataType target = 2;
+}
+
 message CaseWhenBranch {
   Predicate condition = 1;
   Expression result = 2;
@@ -161,6 +168,8 @@ message MapToStructOptions {
   // the host or table metadata. A timezone or offset in a value takes precedence; absence means
   // UTC.
   optional string timestamp_timezone = 1;
+  // Invalid values become null. Invalid schemas, unsupported types, and timezones still fail.
+  bool null_on_invalid = 2;
 }
 
 message MapToStructExpression {
@@ -252,5 +261,6 @@ message Expression {
     ParseJsonExpression parse_json = 11;
     MapToStructExpression map_to_struct = 12;
     string unknown = 13;
+    CastExpression cast = 14;
   }
 }
