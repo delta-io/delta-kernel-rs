@@ -52,6 +52,10 @@ For each new/changed logic path identified in Step 1, determine:
 - Are **edge cases** covered (empty table, single row, null values, boundary conditions)?
 - Are **error paths** tested (invalid input, missing files, corrupt data)?
 
+For changed keyed replay, seed two transaction app IDs or domains, update only one, and assert
+both winning identities/payloads/versions across affected non-file and mixed replay strategies.
+A single key cannot detect a global winner silently dropping other state.
+
 ### Step 4: Delta-specific test scenarios
 
 For delta-kernel-rs changes, check coverage of these scenarios where relevant:
