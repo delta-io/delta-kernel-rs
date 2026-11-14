@@ -4,7 +4,7 @@ use std::iter;
 
 use super::action_projector::ActionProjector;
 use super::checkpoint_sidecar::read_sidecar_actions;
-use super::reader::{ReadContext, StatsRead, read_add_actions_from_amt};
+use super::reader::{ReadContext, SkippingPredicate, StatsRead, read_add_actions_from_amt};
 use crate::actions::{
     ADD_NAME, CheckpointAction, DOMAIN_METADATA_NAME, LOG_DOMAIN_METADATA_SCHEMA,
     LOG_METADATA_SCHEMA, LOG_PROTOCOL_SCHEMA, LOG_TXN_SCHEMA, METADATA_NAME, PROTOCOL_NAME,
@@ -37,13 +37,15 @@ const CHECKPOINT_ACTION_KINDS: &[&str] = &[
 ///
 /// `stats_schema` is the physical Delta stats schema to read from the content tree's
 /// `content_stats` as `add.stats_parsed` (see [`StatsRead::try_new`] for its requirements), or
-/// `None` to read no stats.
+/// `None` to read no stats. With stats, `skipping` skips the content tree's leaf manifests that
+/// cannot hold a matching file (see [`SkippingPredicate`]).
 pub(crate) fn read_checkpoint_action(
     engine: &dyn Engine,
     checkpoint: &CheckpointAction,
     log_root: &LogRoot,
     read_schema: SchemaRef,
     stats_schema: Option<&StructType>,
+    mut skipping: Option<SkippingPredicate>,
 ) -> Result<Box<dyn KernelResultIterator<ActionsBatch>>> {
     if let Some(other) = read_schema
         .fields()
@@ -65,6 +67,7 @@ pub(crate) fn read_checkpoint_action(
                 log_root,
                 read_schema.clone(),
                 stats_schema,
+                skipping.take(),
             )?,
             PROTOCOL_NAME => inline_actions(
                 engine,
@@ -115,6 +118,7 @@ fn read_tree_adds(
     log_root: &LogRoot,
     read_schema: SchemaRef,
     stats_schema: Option<&StructType>,
+    skipping: Option<SkippingPredicate>,
 ) -> Result<Box<dyn KernelResultIterator<ActionsBatch>>> {
     // TODO(#3320): the content tree does not yet carry partition values, so its adds would read
     // with empty `partitionValues`.
@@ -133,7 +137,7 @@ fn read_tree_adds(
         modification_time: 1,
         data_change: false,
         stats: stats_schema
-            .map(|schema| StatsRead::try_new(checkpoint, schema.clone()))
+            .map(|schema| StatsRead::try_new(checkpoint, schema.clone(), skipping))
             .transpose()?,
     };
     let projector = ActionProjector::try_new(engine, ADD_NAME, ctx.add_schema(), read_schema)?;
@@ -287,6 +291,7 @@ mod tests {
                 checkpoint_schema,
                 None,
                 false,
+                None,
             )?
             .actions
             .map(|batch| {
@@ -410,6 +415,7 @@ mod tests {
             &log_root(),
             CHECKPOINT_READ_SCHEMA.clone(),
             None,
+            None,
         )
         .unwrap()
         .map(|batch| batch.unwrap().actions.try_into_record_batch().unwrap())
@@ -439,7 +445,7 @@ mod tests {
         };
 
         let batches: Vec<_> =
-            read_checkpoint_action(&engine, &checkpoint, &log_root(), read_schema, None)
+            read_checkpoint_action(&engine, &checkpoint, &log_root(), read_schema, None, None)
                 .unwrap()
                 .map(|batch| batch.unwrap().actions.try_into_record_batch().unwrap())
                 .collect();
@@ -544,11 +550,17 @@ mod tests {
             (&REMOVE_FIELD),
         };
 
-        let batches: Vec<_> =
-            read_checkpoint_action(&engine, &checkpoint, &log_root(), read_schema.clone(), None)
-                .unwrap()
-                .map(|batch| batch.unwrap().actions.try_into_record_batch().unwrap())
-                .collect();
+        let batches: Vec<_> = read_checkpoint_action(
+            &engine,
+            &checkpoint,
+            &log_root(),
+            read_schema.clone(),
+            None,
+            None,
+        )
+        .unwrap()
+        .map(|batch| batch.unwrap().actions.try_into_record_batch().unwrap())
+        .collect();
 
         let [batch] = batches.as_slice() else {
             panic!("expected one batch, got {}", batches.len());
@@ -579,6 +591,7 @@ mod tests {
             &log_root(),
             CHECKPOINT_READ_SCHEMA.clone(),
             None,
+            None,
         );
         assert!(matches!(result, Err(Error::Kernel(KernelError::Cancelled))));
     }
@@ -598,6 +611,7 @@ mod tests {
                 &log_root(),
                 CHECKPOINT_READ_SCHEMA.clone(),
                 None,
+                None,
             ),
             "partitioned adaptiveMetadata checkpoint action is not yet supported; partition \
              columns: [\"id\"]",
@@ -614,7 +628,7 @@ mod tests {
             .unwrap();
 
         let batches: Vec<_> =
-            read_checkpoint_action(&engine, &checkpoint, &log_root(), read_schema, None)
+            read_checkpoint_action(&engine, &checkpoint, &log_root(), read_schema, None, None)
                 .unwrap()
                 .map(|batch| batch.unwrap())
                 .collect();
@@ -709,7 +723,7 @@ mod tests {
         set_actions(&mut checkpoint, &["a", "b"], vec![sidecar]);
 
         let keys: Vec<_> =
-            read_checkpoint_action(&engine, &checkpoint, &log_root(), source_schema, None)
+            read_checkpoint_action(&engine, &checkpoint, &log_root(), source_schema, None, None)
                 .unwrap()
                 .flat_map(|batch| {
                     let batch = batch.unwrap();
@@ -729,7 +743,7 @@ mod tests {
             .project(&[ADD_NAME, COMMIT_INFO_NAME])
             .unwrap();
         assert_result_error_with_message(
-            read_checkpoint_action(&engine, &checkpoint, &log_root(), schema, None),
+            read_checkpoint_action(&engine, &checkpoint, &log_root(), schema, None, None),
             &format!("reading `{COMMIT_INFO_NAME}` actions"),
         );
     }

@@ -370,6 +370,66 @@ fn data_skipping_prunes_tree_files_by_content_stats(
     assert_eq!(paths, strings(expected));
 }
 
+/// Leaf manifests are skipped by their root entries' `content_stats`, which are keyed by the
+/// checkpoint action's schema. The leaf ruled out by the predicate does not exist, so reading it
+/// fails the scan: without a predicate, or after a schema change, no leaf is skipped.
+#[rstest]
+#[case::checkpoint_schema(Some(Pred::gt(col!("id"), lit(100i64))), false, Some(&["high.parquet"][..]))]
+#[case::no_predicate(None, false, None)]
+#[case::schema_changed_after_checkpoint(Some(Pred::gt(col!("id"), lit(100i64))), true, None)]
+fn data_skipping_skips_leaf_manifests_by_root_content_stats(
+    #[case] predicate: Option<Pred>,
+    #[case] change_schema: bool,
+    #[case] expected: Option<&[&str]>,
+) {
+    let (engine, _) = setup_adaptive_metadata_table();
+    let mut low = data_manifest_entry("metadata/missing.parquet", 1, TrackingStatus::Added);
+    low.tracking.first_row_id = Some(0);
+    let high_path = "metadata/high.parquet";
+    let high_leaf = write_manifest(
+        &engine,
+        table_root().join(high_path).unwrap(),
+        &[added_data_entry("high.parquet", 1, 1, 0, 0)],
+    );
+    let mut high = data_manifest_entry(high_path, high_leaf.size as i64, TrackingStatus::Added);
+    high.tracking.first_row_id = Some(10);
+    // `id` (field ID 1) is in `[1, 9]` under `low` and `[200, 300]` under `high`, never null.
+    let stats = vec![
+        x_stats(&x_full_stats(), &[1, 9, 1, 0]),
+        x_stats(&x_full_stats(), &[200, 300, 1, 0]),
+    ];
+    let location = table_root().join("metadata/root.parquet").unwrap();
+    let root = write_manifest_with_stats(&engine, location, &[low, high], &x_full_stats(), stats);
+    let mut version = commit_root_manifest_file(&engine, &table_root(), root);
+    if change_schema {
+        // Drops `name`, keeping `id` and its field ID.
+        let id = test_schema_flat_with_column_mapping()
+            .field("id")
+            .unwrap()
+            .clone();
+        let lines = protocol_and_metadata_lines(Arc::new(StructType::new_unchecked([id])), &[]);
+        let data = parse_json_batch(lines.lines().collect::<Vec<_>>().into());
+        write_commit_after_manifest_commit(&engine, &table_root(), version + 1, version, data)
+            .unwrap();
+        version += 1;
+    }
+
+    let scan = snapshot_at(&engine, version)
+        .scan_builder()
+        .with_predicate(predicate.map(Arc::new))
+        .build()
+        .unwrap();
+    let paths: KernelResult<Vec<String>> =
+        get_files_for_scan(scan, &engine).map(|paths| paths.into_iter().sorted().collect());
+    match expected {
+        Some(expected) => assert_eq!(paths.unwrap(), strings(expected)),
+        None => assert!(
+            paths.is_err(),
+            "reading the missing leaf should fail: {paths:?}"
+        ),
+    }
+}
+
 /// The scan metadata of `snapshot`, with selection vectors applied, as cached by a caller of
 /// `scan_metadata_from`.
 fn cached_scan_metadata(engine: &SyncEngine, snapshot: Arc<Snapshot>) -> Vec<Box<dyn EngineData>> {
