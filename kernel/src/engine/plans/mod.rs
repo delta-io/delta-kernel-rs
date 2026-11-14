@@ -14,12 +14,11 @@ use std::sync::Arc;
 
 pub mod json;
 pub mod parquet;
-pub mod storage;
-
 use json::PlanBasedJsonHandler;
 use parquet::PlanBasedParquetHandler;
 use storage::PlanBasedStorageHandler;
 
+pub use super::plan_storage as storage;
 use crate::engine::arrow_expression::ArrowEvaluationHandler;
 use crate::plans::PlanExecutor;
 use crate::{Engine, EvaluationHandler, JsonHandler, ParquetHandler, StorageHandler};
