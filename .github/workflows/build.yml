@@ -479,20 +479,31 @@ jobs:
   miri:
     name: "Miri (shard ${{ matrix.partition }}/3)"
     runs-on: ubuntu-latest
+    env:
+      # Track nightly so Miri fixes and new checks reach CI without manual compiler updates.
+      # rust-cache keys include the compiler version. PR and merge-queue runs may be cold until
+      # a successful Miri job on main saves an entry for the new nightly.
+      MIRI_TOOLCHAIN: nightly
     strategy:
       matrix:
         partition: [1, 2, 3]
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      # rust-cache hashes compiler versions; select Miri before restoring its artifacts.
       - name: Install Miri
         run: |
-          rustup toolchain install nightly --component miri
-          rustup override set nightly
+          rustup toolchain install "$MIRI_TOOLCHAIN" --component miri
+          rustup override set "$MIRI_TOOLCHAIN"
+          # The sysroot hash includes rust-src mtimes, so fresh installs invalidate a cached sysroot.
           cargo miri setup
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      # Keep the cache upgrade scoped to Miri to measure dependency reuse independently.
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           cache-bin: false
           save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+      # rust-cache runs cargo metadata internally without --locked.
+      - name: Check cache setup preserved Cargo.lock
+        run: git diff --exit-code -- Cargo.lock
       - uses: taiki-e/install-action@98ec31d284eb962f41c14065e9391a955aa810cf # nextest
         with:
           tool: cargo-nextest@0.9.132
