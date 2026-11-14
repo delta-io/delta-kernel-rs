@@ -34,6 +34,8 @@ mod publish_types;
 
 pub use commit_types::{CommitMetadata, CommitProtocolMetadata, CommitResponse, CommitType};
 #[cfg(feature = "declarative-plans")]
+pub(crate) use declarative::file_meta_from_batches;
+#[cfg(feature = "declarative-plans")]
 pub use declarative::write_commit_json_declarative;
 pub use filesystem::FileSystemCommitter;
 pub use publish_types::{CatalogCommit, PublishMetadata};
