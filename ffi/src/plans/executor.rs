@@ -20,7 +20,7 @@ pub struct SharedPlanExecutor;
 /// C callback, provided by the Engine, for executing an [`Operation`].
 ///
 /// `context` - an opaque pointer, originally passed to
-/// [`get_plan_executor`](super::get_plan_executor).
+/// an executor constructor in [`super`].
 /// `plan_proto` - a byte slice containing the proto-serialized representation of an [`Operation`]
 /// `out` - an out pointer into which the engine writes the result.
 ///
@@ -35,11 +35,13 @@ pub type CExecuteOpFn = extern "C" fn(
 
 /// A [`PlanExecutor`] implementation that forwards each [`Operation`] to a C callback.
 ///
-/// Constructed and managed via [`get_plan_executor`](super::get_plan_executor) and
-/// [`free_plan_executor`](super::free_plan_executor).
+/// Constructed via [`get_plan_executor`](super::get_plan_executor) or
+/// [`get_plan_executor_with_pm_replay`](super::get_plan_executor_with_pm_replay), and released via
+/// [`free_plan_executor`](super::free_plan_executor) when not consumed by an engine.
 pub struct FfiPlanExecutor {
     context: NullableCvoid,
     callback: CExecuteOpFn,
+    supports_protocol_metadata_replay: bool,
 }
 
 impl FfiPlanExecutor {
@@ -47,8 +49,16 @@ impl FfiPlanExecutor {
     ///
     /// The `context` pointer and `callback` must satisfy the thread-safety and lifetime
     /// requirements documented on [`get_plan_executor`](super::get_plan_executor).
-    pub(crate) fn new(context: NullableCvoid, callback: CExecuteOpFn) -> Self {
-        Self { context, callback }
+    pub(crate) fn new(
+        context: NullableCvoid,
+        callback: CExecuteOpFn,
+        supports_protocol_metadata_replay: bool,
+    ) -> Self {
+        Self {
+            context,
+            callback,
+            supports_protocol_metadata_replay,
+        }
     }
 }
 
@@ -57,6 +67,10 @@ unsafe impl Send for FfiPlanExecutor {}
 unsafe impl Sync for FfiPlanExecutor {}
 
 impl PlanExecutor for FfiPlanExecutor {
+    fn supports_protocol_metadata_replay(&self) -> bool {
+        self.supports_protocol_metadata_replay
+    }
+
     fn execute_op(&self, op: Operation) -> KernelResult<PlanResult> {
         let plan_proto_bytes = op.to_proto_bytes();
         let plan_proto_slice = kernel_bytes_slice!(plan_proto_bytes);
