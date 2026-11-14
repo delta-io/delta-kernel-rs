@@ -1,0 +1,14 @@
+{
+  "case_id": "existing",
+  "status": "provisional; independent adjudication required",
+  "issues": [
+    {
+      "id": "C1",
+      "kind": "runtime",
+      "truth": "true",
+      "scope": "out",
+      "evidence": "Integer division by zero panics. The same function exists in both snapshots with no added callers."
+    }
+  ],
+  "input_digest": "309a50bf6b63750c1d62e6e1d4d46b8013bf4f21f0cf5b8e8aae246489d1d9c6"
+}

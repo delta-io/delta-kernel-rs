@@ -1,0 +1,14 @@
+{
+  "case_id": "guarded",
+  "status": "provisional; independent adjudication required",
+  "issues": [
+    {
+      "id": "C1",
+      "kind": "runtime",
+      "truth": "false",
+      "scope": "in",
+      "evidence": "ok_or plus ? returns Err for None before Ok(count); unwrap is absent."
+    }
+  ],
+  "input_digest": "1ffd8416b54ff9ab248ec559475fd341de2e04e3574a5a0c9a36ff7c9aa6a5b4"
+}
