@@ -49,6 +49,7 @@ derive_more = { version = "~2.1", default-features = false, features = ["constru
 futures = { version = "0.3", optional = true }
 indexmap = "2.10.0"
 itertools = "0.14"
+md-5 = { version = "0.10", optional = true }
 percent-encoding = "2"
 rand = "0.9"
 roaring = "0.11.2"
@@ -122,7 +123,7 @@ arrow-expression = ["need-arrow", "dep:chrono-tz"]
 schema-diff = []
 
 # Declarative plan IR (experimental).
-declarative-plans = ["internal-api", "dep:prost", "dep:prost-build"]
+declarative-plans = ["internal-api", "dep:md-5", "dep:prost", "dep:prost-build"]
 
 # Sources a prebuilt `protoc` for the codegen `declarative-plans` runs, so the build needs no
 # system protobuf install. Leave it off to pass `protoc` through the `PROTOC` env var instead;

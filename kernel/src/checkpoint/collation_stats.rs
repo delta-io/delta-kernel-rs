@@ -22,7 +22,7 @@ use crate::struct_patch::ProjectionStructPatchBuilder;
 use crate::transforms::{SchemaTransform, transform_output_type};
 use crate::{KernelError, KernelResult, Snapshot};
 
-const COLLATION_STATS: &str = "statsWithCollation";
+pub(crate) const COLLATION_STATS: &str = "statsWithCollation";
 
 /// Returns the source collation stats field, if present in parsed checkpoint stats.
 pub(crate) fn source_collation_stats(schema: &StructType) -> Option<&StructField> {
@@ -439,6 +439,8 @@ mod tests {
     async fn checkpoint_discovers_only_active_collation_bounds(
         #[case] replace_dv: bool,
         #[case] earlier_checkpoint: bool,
+        #[values(false, true)] v2: bool,
+        #[values(false, true)] write_json: bool,
     ) -> Result<()> {
         let store: Arc<DynObjectStore> = Arc::new(InMemory::new());
         let engine = SyncEngine::new_with_store(store.clone());
@@ -449,10 +451,29 @@ mod tests {
         } else {
             schema_ref! { nullable "nested": { (collated_field("leaf")) } }
         };
-        let metadata = Metadata::try_new(None, None, old_schema, vec![], 0, HashMap::new())?;
+        let metadata = Metadata::try_new(
+            None,
+            None,
+            old_schema,
+            vec![],
+            0,
+            HashMap::from([
+                ("delta.checkpoint.writeStatsAsStruct".into(), "true".into()),
+                (
+                    "delta.checkpoint.writeStatsAsJson".into(),
+                    write_json.to_string(),
+                ),
+            ]),
+        )?;
         let updated_metadata = metadata.clone().with_schema(new_schema)?;
-        let protocol =
-            Protocol::try_new_modern(["deletionVectors"], ["deletionVectors", "collations"])?;
+        let protocol = Protocol::try_new_modern(
+            ["deletionVectors"]
+                .into_iter()
+                .chain(v2.then_some("v2Checkpoint")),
+            ["deletionVectors", "collations"]
+                .into_iter()
+                .chain(v2.then_some("v2Checkpoint")),
+        )?;
         let old_dv = replace_dv.then(|| {
             json!({
                 "storageType": "p", "pathOrInlineDv": "file:///deletion-vectors.bin", "offset": 0,
@@ -549,6 +570,35 @@ mod tests {
             checkpoint_stats_schema(&snapshot, binary_stats, &mut batches)?.0,
             expected
         );
+        #[cfg(feature = "declarative-plans")]
+        {
+            let writer = checkpoint_writer(snapshot.clone(), &engine)?;
+            let plan = if v2 {
+                let (content, _) = writer.declarative_v2_checkpoint_data_plans(&engine)?;
+                content
+            } else {
+                writer.declarative_checkpoint_data_plan(&engine)?
+            };
+            assert_eq!(
+                source_collation_stats(&plan.schema).unwrap(),
+                expected.field(COLLATION_STATS).unwrap(),
+            );
+            let data = engine
+                .require_plan_executor()?
+                .execute_op(crate::plans::Operation::QueryPlan(plan))?
+                .into_data()?;
+            let rows =
+                json_rows(data.map(|data| data.map(FilteredEngineData::with_all_rows_selected)))?;
+            let adds = rows
+                .iter()
+                .filter(|row| row["add"]["path"].is_string())
+                .collect::<Vec<_>>();
+            assert_eq!(adds.len(), 1);
+            let add = &adds[0]["add"];
+            assert_eq!(add["path"], path);
+            assert_json_contains(&add["stats_parsed"][COLLATION_STATS], &active_bounds);
+            assert_eq!(add.get("stats").is_some(), write_json);
+        }
         Ok(())
     }
 

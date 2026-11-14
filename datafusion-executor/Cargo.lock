@@ -1415,6 +1415,7 @@ dependencies = [
  "derive_more",
  "indexmap",
  "itertools 0.14.0",
+ "md-5 0.10.6",
  "object_store",
  "parquet",
  "percent-encoding",

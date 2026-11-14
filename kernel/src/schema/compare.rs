@@ -25,6 +25,36 @@ use std::collections::{HashMap, HashSet};
 use super::{DataType, StructField, StructType};
 use crate::utils::require;
 
+/// Exact type equality, including nested field order.
+#[cfg(feature = "declarative-plans")]
+pub(crate) fn data_types_equal_ordered(left: &DataType, right: &DataType) -> bool {
+    fn same_order(left: &DataType, right: &DataType) -> bool {
+        match (left, right) {
+            (DataType::Struct(left), DataType::Struct(right))
+            | (DataType::Variant(left), DataType::Variant(right))
+            | (DataType::File(left), DataType::File(right)) => {
+                left.fields().zip(right.fields()).all(|(left, right)| {
+                    left.name() == right.name() && same_order(left.data_type(), right.data_type())
+                })
+            }
+            (DataType::Array(left), DataType::Array(right)) => {
+                same_order(left.element_type(), right.element_type())
+            }
+            (DataType::Map(left), DataType::Map(right)) => {
+                same_order(left.key_type(), right.key_type())
+                    && same_order(left.value_type(), right.value_type())
+            }
+            #[cfg(feature = "udt-in-dev")]
+            (DataType::UserDefined(left), DataType::UserDefined(right)) => {
+                same_order(left.sql_type(), right.sql_type())
+            }
+            _ => true,
+        }
+    }
+
+    left == right && same_order(left, right)
+}
+
 /// The nullability flag of a schema's field. This can be compared with a read schema field's
 /// nullability flag using [`Nullable::can_read_as`].
 #[derive(Clone, Copy)]

@@ -49,6 +49,7 @@ enum VariadicExpressionOp {
   VARIADIC_EXPRESSION_OP_UNSPECIFIED = 0;
   VARIADIC_EXPRESSION_OP_COALESCE = 1;
   VARIADIC_EXPRESSION_OP_ARRAY = 2;
+  VARIADIC_EXPRESSION_OP_MAP = 3;
 }
 
 enum JunctionPredicateOp {
@@ -137,6 +138,12 @@ message BinaryExpression {
 message VariadicExpression {
   VariadicExpressionOp op = 1;
   repeated Expression exprs = 2;
+}
+
+// Safe cast: values that cannot be represented in the target type become NULL.
+message CastExpression {
+  Expression expr = 1;
+  delta.kernel.schema.DataType target = 2;
 }
 
 message CaseWhenBranch {
@@ -252,5 +259,6 @@ message Expression {
     ParseJsonExpression parse_json = 11;
     MapToStructExpression map_to_struct = 12;
     string unknown = 13;
+    CastExpression cast = 14;
   }
 }
