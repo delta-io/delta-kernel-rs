@@ -389,6 +389,7 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
+    use crate::arrow::datatypes::DataType::{Decimal128, Int8, Int16, Int32, Int64};
     use crate::arrow::datatypes::{DataType as ArrowDataType, Field as ArrowField, Fields};
     use crate::engine::arrow_conversion::TryFromKernel as _;
     use crate::schema::{ArrayType, CheckpointFieldKind, DataType, MapType, PrimitiveType, schema};
@@ -396,94 +397,54 @@ mod tests {
 
     #[test]
     fn accepts_safe_decimal_casts() {
+        assert!(can_upcast_to_decimal(&Decimal128(1, 0), 2u8, 0i8));
+        assert!(can_upcast_to_decimal(&Decimal128(1, 0), 2u8, 1i8));
+        assert!(can_upcast_to_decimal(&Decimal128(5, -2), 6u8, -2i8));
+        assert!(can_upcast_to_decimal(&Decimal128(5, -2), 6u8, -1i8));
+        assert!(can_upcast_to_decimal(&Decimal128(5, 1), 6u8, 1i8));
+        assert!(can_upcast_to_decimal(&Decimal128(5, 1), 6u8, 2i8));
         assert!(can_upcast_to_decimal(
-            &ArrowDataType::Decimal128(1, 0),
-            2u8,
-            0i8
-        ));
-        assert!(can_upcast_to_decimal(
-            &ArrowDataType::Decimal128(1, 0),
-            2u8,
-            1i8
-        ));
-        assert!(can_upcast_to_decimal(
-            &ArrowDataType::Decimal128(5, -2),
-            6u8,
-            -2i8
-        ));
-        assert!(can_upcast_to_decimal(
-            &ArrowDataType::Decimal128(5, -2),
-            6u8,
-            -1i8
-        ));
-        assert!(can_upcast_to_decimal(
-            &ArrowDataType::Decimal128(5, 1),
-            6u8,
-            1i8
-        ));
-        assert!(can_upcast_to_decimal(
-            &ArrowDataType::Decimal128(5, 1),
-            6u8,
-            2i8
-        ));
-        assert!(can_upcast_to_decimal(
-            &ArrowDataType::Decimal128(10, 5),
+            &Decimal128(10, 5),
             crate::arrow::datatypes::DECIMAL128_MAX_PRECISION,
             crate::arrow::datatypes::DECIMAL128_MAX_SCALE - 5
         ));
 
-        assert!(can_upcast_to_decimal(&ArrowDataType::Int8, 3u8, 0i8));
-        assert!(can_upcast_to_decimal(&ArrowDataType::Int8, 4u8, 0i8));
-        assert!(can_upcast_to_decimal(&ArrowDataType::Int8, 4u8, 1i8));
-        assert!(can_upcast_to_decimal(&ArrowDataType::Int8, 7u8, 2i8));
+        assert!(can_upcast_to_decimal(&Int8, 3u8, 0i8));
+        assert!(can_upcast_to_decimal(&Int8, 4u8, 0i8));
+        assert!(can_upcast_to_decimal(&Int8, 4u8, 1i8));
+        assert!(can_upcast_to_decimal(&Int8, 7u8, 2i8));
 
-        assert!(can_upcast_to_decimal(&ArrowDataType::Int16, 5u8, 0i8));
-        assert!(can_upcast_to_decimal(&ArrowDataType::Int16, 6u8, 0i8));
-        assert!(can_upcast_to_decimal(&ArrowDataType::Int16, 6u8, 1i8));
-        assert!(can_upcast_to_decimal(&ArrowDataType::Int16, 9u8, 2i8));
+        assert!(can_upcast_to_decimal(&Int16, 5u8, 0i8));
+        assert!(can_upcast_to_decimal(&Int16, 6u8, 0i8));
+        assert!(can_upcast_to_decimal(&Int16, 6u8, 1i8));
+        assert!(can_upcast_to_decimal(&Int16, 9u8, 2i8));
 
-        assert!(can_upcast_to_decimal(&ArrowDataType::Int32, 10u8, 0i8));
-        assert!(can_upcast_to_decimal(&ArrowDataType::Int32, 11u8, 0i8));
-        assert!(can_upcast_to_decimal(&ArrowDataType::Int32, 11u8, 1i8));
-        assert!(can_upcast_to_decimal(&ArrowDataType::Int32, 14u8, 2i8));
+        assert!(can_upcast_to_decimal(&Int32, 10u8, 0i8));
+        assert!(can_upcast_to_decimal(&Int32, 11u8, 0i8));
+        assert!(can_upcast_to_decimal(&Int32, 11u8, 1i8));
+        assert!(can_upcast_to_decimal(&Int32, 14u8, 2i8));
 
-        assert!(can_upcast_to_decimal(&ArrowDataType::Int64, 20u8, 0i8));
-        assert!(can_upcast_to_decimal(&ArrowDataType::Int64, 21u8, 0i8));
-        assert!(can_upcast_to_decimal(&ArrowDataType::Int64, 21u8, 1i8));
-        assert!(can_upcast_to_decimal(&ArrowDataType::Int64, 24u8, 2i8));
+        assert!(can_upcast_to_decimal(&Int64, 20u8, 0i8));
+        assert!(can_upcast_to_decimal(&Int64, 21u8, 0i8));
+        assert!(can_upcast_to_decimal(&Int64, 21u8, 1i8));
+        assert!(can_upcast_to_decimal(&Int64, 24u8, 2i8));
     }
 
     #[test]
     fn rejects_unsafe_decimal_casts() {
-        assert!(!can_upcast_to_decimal(
-            &ArrowDataType::Decimal128(2, 0),
-            2u8,
-            1i8
-        ));
-        assert!(!can_upcast_to_decimal(
-            &ArrowDataType::Decimal128(2, 0),
-            2u8,
-            -1i8
-        ));
-        assert!(!can_upcast_to_decimal(
-            &ArrowDataType::Decimal128(5, 2),
-            6u8,
-            4i8
-        ));
-        assert!(!can_upcast_to_decimal(
-            &ArrowDataType::Decimal128(1, i8::MIN),
-            38,
-            0
-        ));
+        assert!(!can_upcast_to_decimal(&Decimal128(2, 0), 2u8, 1i8));
+        assert!(!can_upcast_to_decimal(&Decimal128(2, 0), 2u8, -1i8));
+        assert!(!can_upcast_to_decimal(&Decimal128(5, 2), 6u8, 4i8));
+        assert!(!can_upcast_to_decimal(&Decimal128(1, i8::MIN), 38, 0));
 
-        assert!(!can_upcast_to_decimal(&ArrowDataType::Int8, 2u8, 0i8));
-        assert!(!can_upcast_to_decimal(&ArrowDataType::Int8, 3u8, 1i8));
-        assert!(!can_upcast_to_decimal(&ArrowDataType::Int16, 4u8, 0i8));
-        assert!(!can_upcast_to_decimal(&ArrowDataType::Int16, 5u8, 1i8));
-        assert!(!can_upcast_to_decimal(&ArrowDataType::Int32, 9u8, 0i8));
-        assert!(!can_upcast_to_decimal(&ArrowDataType::Int32, 10u8, 1i8));
-        assert!(!can_upcast_to_decimal(&ArrowDataType::Int64, 19u8, 0i8));
-        assert!(!can_upcast_to_decimal(&ArrowDataType::Int64, 20u8, 1i8));
+        assert!(!can_upcast_to_decimal(&Int8, 2u8, 0i8));
+        assert!(!can_upcast_to_decimal(&Int8, 3u8, 1i8));
+        assert!(!can_upcast_to_decimal(&Int16, 4u8, 0i8));
+        assert!(!can_upcast_to_decimal(&Int16, 5u8, 1i8));
+        assert!(!can_upcast_to_decimal(&Int32, 9u8, 0i8));
+        assert!(!can_upcast_to_decimal(&Int32, 10u8, 1i8));
+        assert!(!can_upcast_to_decimal(&Int64, 19u8, 0i8));
+        assert!(!can_upcast_to_decimal(&Int64, 20u8, 1i8));
     }
 
     /// Build a variant-shaped arrow struct from `(name, type)` pairs with the given nullability.
@@ -574,7 +535,7 @@ mod tests {
             [
                 ("metadata", ArrowDataType::Binary),
                 ("value", ArrowDataType::Binary),
-                ("typed_value", ArrowDataType::Int64),
+                ("typed_value", Int64),
             ],
             false,
         ),
@@ -584,7 +545,7 @@ mod tests {
         variant_arrow_struct(
             [
                 ("metadata", ArrowDataType::Binary),
-                ("typed_value", ArrowDataType::Int64),
+                ("typed_value", Int64),
                 ("value", ArrowDataType::Binary),
             ],
             false,
@@ -595,7 +556,7 @@ mod tests {
         variant_arrow_struct(
             [
                 ("metadata", ArrowDataType::Binary),
-                ("typed_value", ArrowDataType::Int64),
+                ("typed_value", Int64),
             ],
             false,
         ),
@@ -624,7 +585,7 @@ mod tests {
     fn file_arrow_struct(order: &[&'static str]) -> ArrowDataType {
         let field = |name: &'static str| {
             let data_type = match name {
-                "offset" | "size" => ArrowDataType::Int64,
+                "offset" | "size" => Int64,
                 "inline" => ArrowDataType::Binary,
                 _ => ArrowDataType::Utf8,
             };
@@ -682,12 +643,12 @@ mod tests {
         variant_arrow_struct(
             [
                 ("uri", ArrowDataType::Utf8),
-                ("offset", ArrowDataType::Int64),
-                ("size", ArrowDataType::Int64),
+                ("offset", Int64),
+                ("size", Int64),
                 ("content_type", ArrowDataType::Utf8),
                 ("checksum", ArrowDataType::Utf8),
                 ("inline", ArrowDataType::Binary),
-                ("extra", ArrowDataType::Int64),
+                ("extra", Int64),
             ],
             true,
         ),
@@ -702,7 +663,7 @@ mod tests {
             [
                 ("uri", ArrowDataType::Utf8),
                 ("offset", ArrowDataType::Utf8),
-                ("size", ArrowDataType::Int64),
+                ("size", Int64),
                 ("content_type", ArrowDataType::Utf8),
                 ("checksum", ArrowDataType::Utf8),
                 ("inline", ArrowDataType::Binary),
@@ -724,7 +685,7 @@ mod tests {
         assert!(
             ensure_data_types(
                 &DataType::decimal(5, 2).unwrap(),
-                &ArrowDataType::Decimal128(5, 2),
+                &Decimal128(5, 2),
                 ValidationMode::TypesAndNames
             )
             .is_ok()
@@ -732,7 +693,7 @@ mod tests {
         assert_result_error_with_message(
             ensure_data_types(
                 &DataType::decimal(5, 2).unwrap(),
-                &ArrowDataType::Decimal128(5, 3),
+                &Decimal128(5, 3),
                 ValidationMode::TypesAndNames,
             ),
             "Invalid argument error: Incorrect datatype. Expected Decimal128(5, 2), got Decimal128(5, 3)",
@@ -744,7 +705,7 @@ mod tests {
         let arrow_field = ArrowField::new_map(
             "map",
             "entries",
-            ArrowField::new("key", ArrowDataType::Int64, false),
+            ArrowField::new("key", Int64, false),
             ArrowField::new("val", ArrowDataType::Utf8, true),
             false,
             false,
@@ -781,7 +742,7 @@ mod tests {
         assert!(
             ensure_data_types(
                 &DataType::from(ArrayType::new(DataType::LONG, true)),
-                &ArrowDataType::new_list(ArrowDataType::Int64, true),
+                &ArrowDataType::new_list(Int64, true),
                 ValidationMode::TypesAndNames
             )
             .is_ok()
@@ -789,7 +750,7 @@ mod tests {
         assert!(
             ensure_data_types(
                 &DataType::from(ArrayType::new(DataType::LONG, true)),
-                &ArrowDataType::new_large_list(ArrowDataType::Int64, true),
+                &ArrowDataType::new_large_list(Int64, true),
                 ValidationMode::TypesAndNames
             )
             .is_ok()
@@ -797,7 +758,7 @@ mod tests {
         assert_result_error_with_message(
             ensure_data_types(
                 &DataType::from(ArrayType::new(DataType::STRING, true)),
-                &ArrowDataType::new_list(ArrowDataType::Int64, true),
+                &ArrowDataType::new_list(Int64, true),
                 ValidationMode::TypesAndNames,
             ),
             "Invalid argument error: Incorrect datatype. Expected Utf8, got Int64",
@@ -805,7 +766,7 @@ mod tests {
         assert_result_error_with_message(
             ensure_data_types(
                 &DataType::from(ArrayType::new(DataType::LONG, true)),
-                &ArrowDataType::new_list(ArrowDataType::Int64, false),
+                &ArrowDataType::new_list(Int64, false),
                 ValidationMode::Full,
             ),
             "Generic delta kernel error: List has nullability true in kernel and false in arrow",
@@ -836,8 +797,8 @@ mod tests {
         let arrow_simple_ok = ArrowField::new_struct(
             "arrow_struct",
             Fields::from(vec![
-                ArrowField::new("w", ArrowDataType::Int64, true),
-                ArrowField::new("x", ArrowDataType::Int64, true),
+                ArrowField::new("w", Int64, true),
+                ArrowField::new("x", Int64, true),
             ]),
             true,
         );
@@ -852,7 +813,7 @@ mod tests {
 
         let arrow_missing_simple = ArrowField::new_struct(
             "arrow_struct",
-            Fields::from(vec![ArrowField::new("w", ArrowDataType::Int64, true)]),
+            Fields::from(vec![ArrowField::new("w", Int64, true)]),
             true,
         );
         assert_result_error_with_message(
@@ -867,8 +828,8 @@ mod tests {
         let arrow_nullable_mismatch_simple = ArrowField::new_struct(
             "arrow_struct",
             Fields::from(vec![
-                ArrowField::new("w", ArrowDataType::Int64, false),
-                ArrowField::new("x", ArrowDataType::Int64, true),
+                ArrowField::new("w", Int64, false),
+                ArrowField::new("x", Int64, true),
             ]),
             true,
         );
@@ -891,8 +852,8 @@ mod tests {
             nullable "x": STRING,
         });
         let arrow = ArrowDataType::Struct(Fields::from(vec![
-            ArrowField::new("w", ArrowDataType::Int64, true),
-            ArrowField::new("extra", ArrowDataType::Int64, true),
+            ArrowField::new("w", Int64, true),
+            ArrowField::new("extra", Int64, true),
             ArrowField::new("x", ArrowDataType::Utf8, true),
         ]));
         assert_eq!(
@@ -909,8 +870,8 @@ mod tests {
             nullable "x": LONG,
         });
         let arrow = ArrowDataType::Struct(Fields::from(vec![
-            ArrowField::new("w", ArrowDataType::Int64, true),
-            ArrowField::new("extra", ArrowDataType::Int64, true),
+            ArrowField::new("w", Int64, true),
+            ArrowField::new("extra", Int64, true),
             ArrowField::new("x", ArrowDataType::Utf8, true),
         ]));
         assert_result_error_with_message(
@@ -942,10 +903,7 @@ mod tests {
         assert_eq!(
             ensure_data_types(
                 &DataType::from(ArrayType::new(DataType::LONG, true)),
-                &ArrowDataType::ListView(Arc::new(ArrowField::new_list_field(
-                    ArrowDataType::Int64,
-                    true
-                ))),
+                &ArrowDataType::ListView(Arc::new(ArrowField::new_list_field(Int64, true))),
                 ValidationMode::Full
             )
             .unwrap(),
@@ -954,10 +912,7 @@ mod tests {
         assert_eq!(
             ensure_data_types(
                 &DataType::from(ArrayType::new(DataType::LONG, true)),
-                &ArrowDataType::LargeListView(Arc::new(ArrowField::new_list_field(
-                    ArrowDataType::Int64,
-                    true
-                ))),
+                &ArrowDataType::LargeListView(Arc::new(ArrowField::new_list_field(Int64, true))),
                 ValidationMode::Full
             )
             .unwrap(),
@@ -991,12 +946,7 @@ mod tests {
     fn ensure_int32_to_date_reinterpretation() {
         // Int32 -> Date32: checkpoint writers may omit the DATE logical type annotation
         assert_eq!(
-            ensure_data_types(
-                &DataType::DATE,
-                &ArrowDataType::Int32,
-                ValidationMode::TypesAndNames
-            )
-            .unwrap(),
+            ensure_data_types(&DataType::DATE, &Int32, ValidationMode::TypesAndNames).unwrap(),
             DataTypeCompat::NeedsCast(ArrowDataType::Date32)
         );
         // Reverse is not supported: Date32 -> Int32
@@ -1015,12 +965,7 @@ mod tests {
         // Int64 -> Timestamp (with UTC timezone, i.e. kernel `timestamp`)
         let ts_utc = ArrowDataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()));
         assert_eq!(
-            ensure_data_types(
-                &DataType::TIMESTAMP,
-                &ArrowDataType::Int64,
-                ValidationMode::TypesAndNames
-            )
-            .unwrap(),
+            ensure_data_types(&DataType::TIMESTAMP, &Int64, ValidationMode::TypesAndNames).unwrap(),
             DataTypeCompat::NeedsCast(ts_utc)
         );
         // Int64 -> TimestampNtz (no timezone, i.e. kernel `timestamp_ntz`)
@@ -1028,7 +973,7 @@ mod tests {
         assert_eq!(
             ensure_data_types(
                 &DataType::TIMESTAMP_NTZ,
-                &ArrowDataType::Int64,
+                &Int64,
                 ValidationMode::TypesAndNames
             )
             .unwrap(),
@@ -1050,7 +995,7 @@ mod tests {
         assert_eq!(
             ensure_data_types(
                 &DataType::INTERVAL_YEAR_MONTH,
-                &ArrowDataType::Int32,
+                &Int32,
                 ValidationMode::TypesAndNames
             )
             .unwrap(),
@@ -1059,7 +1004,7 @@ mod tests {
         assert_eq!(
             ensure_data_types(
                 &DataType::INTERVAL_DAY_TIME,
-                &ArrowDataType::Int64,
+                &Int64,
                 ValidationMode::TypesAndNames
             )
             .unwrap(),
@@ -1124,7 +1069,7 @@ mod tests {
         });
         let arrow = ArrowDataType::Struct(
             vec![
-                ArrowField::new("physical_x", ArrowDataType::Int64, true),
+                ArrowField::new("physical_x", Int64, true),
                 ArrowField::new("physical_y", ArrowDataType::Utf8, true),
             ]
             .into(),
@@ -1138,8 +1083,7 @@ mod tests {
             nullable "a": LONG,
             nullable "b": LONG,
         });
-        let arrow =
-            ArrowDataType::Struct(vec![ArrowField::new("x", ArrowDataType::Int64, true)].into());
+        let arrow = ArrowDataType::Struct(vec![ArrowField::new("x", Int64, true)].into());
         assert_result_error_with_message(
             ensure_data_types(&kernel, &arrow, ValidationMode::TypesOnly),
             "Struct field count mismatch",
@@ -1154,7 +1098,7 @@ mod tests {
         });
         let arrow = ArrowDataType::Struct(
             vec![
-                ArrowField::new("x", ArrowDataType::Int64, true),
+                ArrowField::new("x", Int64, true),
                 ArrowField::new("y", ArrowDataType::Utf8, true),
             ]
             .into(),
