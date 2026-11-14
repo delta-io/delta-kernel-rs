@@ -41,3 +41,9 @@ Compute engine (Spark, Flink, DuckDB, Polars, ...)
 - Kernel describes I/O and computation through `Engine`; engine implementations perform them.
 - `EngineData` is opaque to kernel production code. Inspect rows through the visitor APIs, and
   handle every batch returned for a file.
+- Declarative scans, single-part checkpoint reconstruction, and minor log compaction share
+  `action_reconciliation::plan` replay. `ActionSet` selects source schemas, required-leaf filters,
+  and replay identities. `MetadataPlanner` normalizes each source before replay; scans prune before
+  reconciliation and checkpoints apply retention afterward. Non-file-only V2 source reads skip
+  sidecars. `Snapshot::compact_log` replays a published commit interval without retention and writes
+  the compacted file through the engine's plan executor.
