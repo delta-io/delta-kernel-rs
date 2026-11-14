@@ -26,7 +26,7 @@ use crate::checkpoint::collation_stats::{
 };
 use crate::committer::CatalogCommit;
 #[cfg(feature = "adaptive-metadata-in-dev")]
-use crate::content_tree::read_checkpoint_action;
+use crate::content_tree::{SkippingPredicate, read_checkpoint_action};
 use crate::expressions::ColumnName;
 use crate::last_checkpoint_hint::{HintAction, LastCheckpointHint};
 use crate::log_replay::ActionsBatch;
@@ -1055,6 +1055,7 @@ impl LogSegment {
     /// checkpoint's adds carry `stats_schema` as `add.stats_parsed`, read from the content tree's
     /// `content_stats`. Those are keyed by the checkpoint's schema, so the caller sets it only when
     /// `stats_schema` is derived from that same schema; otherwise the tree's adds carry no stats.
+    /// With stats, `skipping` skips the tree's leaf manifests that cannot hold a matching file.
     #[cfg(feature = "adaptive-metadata-in-dev")]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn read_actions_with_checkpoint_action(
@@ -1066,6 +1067,7 @@ impl LogSegment {
         checkpoint_read_schema: SchemaRef,
         stats_schema: Option<&StructType>,
         stats_parsed: bool,
+        skipping: Option<SkippingPredicate>,
     ) -> KernelResult<ActionsWithCheckpointInfo<Box<dyn KernelResultIterator<ActionsBatch>>>> {
         let version = Version::try_from(checkpoint.version())
             .ok()
@@ -1119,6 +1121,7 @@ impl LogSegment {
             &LogRoot::new(table_root.clone())?,
             checkpoint_read_schema.clone(),
             stats_parsed_schema,
+            skipping.filter(|_| has_stats_parsed),
         )
         .map_err(KernelError::generic_err)?;
         Ok(ActionsWithCheckpointInfo {

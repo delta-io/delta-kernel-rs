@@ -141,14 +141,25 @@ pub(crate) fn write_manifest_with_stats(
     content_stats: &StructType,
     stats: Vec<Scalar>,
 ) -> FileMeta {
+    let data = entry_batch_with_stats(engine, entries, content_stats, stats);
+    write_batch(engine, location, data)
+}
+
+/// Builds an [`entry_batch`] followed by a `content_stats` column of type `content_stats` holding
+/// `stats[i]` for entry `i`.
+pub(crate) fn entry_batch_with_stats(
+    engine: &dyn Engine,
+    entries: &[ContentTreeNodeEntry],
+    content_stats: &StructType,
+    stats: Vec<Scalar>,
+) -> Box<dyn EngineData> {
     let column_type = ArrayType::new(content_stats.clone(), true);
     let column = ArrayData::try_new(column_type, stats).unwrap();
     let schema = ContentTreeNodeEntry::to_schema_with_content_stats(Some(content_stats.clone()));
     let field = schema.field(CONTENT_STATS_FIELD_NAME).unwrap().clone();
-    let data = entry_batch(engine, entries)
+    entry_batch(engine, entries)
         .append_columns(Arc::new(StructType::new_unchecked([field])), vec![column])
-        .unwrap();
-    write_batch(engine, location, data)
+        .unwrap()
 }
 
 /// Every `content_stats` stat of [`x_table`].
