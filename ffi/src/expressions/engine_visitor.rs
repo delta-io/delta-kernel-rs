@@ -687,14 +687,15 @@ fn visit_expression_impl(
             visit_fn(visitor.data, sibling_list_id, child_list_id);
         }
         Expression::Variadic(VariadicExpression { op, exprs }) => {
+            let visit_fn = match op {
+                VariadicExpressionOp::Coalesce => visitor.visit_coalesce,
+                VariadicExpressionOp::Array => visitor.visit_array,
+                VariadicExpressionOp::Map => return visit_unknown(visitor, sibling_list_id, "map"),
+            };
             let child_list_id = call!(visitor, make_field_list, exprs.len());
             for expr in exprs {
                 visit_expression_impl(visitor, expr, child_list_id);
             }
-            let visit_fn = match op {
-                VariadicExpressionOp::Coalesce => visitor.visit_coalesce,
-                VariadicExpressionOp::Array => visitor.visit_array,
-            };
             visit_fn(visitor.data, sibling_list_id, child_list_id);
         }
         Expression::CaseWhen(CaseWhenExpression {
@@ -848,6 +849,7 @@ mod tests {
             sibling_list_id: usize,
             child_list_id: usize,
             timestamp_timezone: Option<String>,
+            null_on_invalid: bool,
         },
     }
 
@@ -878,6 +880,7 @@ mod tests {
             sibling_list_id,
             child_list_id,
             timestamp_timezone,
+            null_on_invalid: options.null_on_invalid,
         });
     }
 
@@ -1102,10 +1105,15 @@ mod tests {
     #[rstest]
     #[case::default(None)]
     #[case::configured(Some("America/Los_Angeles"))]
-    fn map_to_struct_visits_options(#[case] timestamp_timezone: Option<&str>) {
-        let options = timestamp_timezone.map_or_else(MapToStructOptions::default, |timezone| {
-            MapToStructOptions::default().with_timestamp_timezone(timezone)
-        });
+    fn map_to_struct_visits_options(
+        #[case] timestamp_timezone: Option<&str>,
+        #[values(false, true)] null_on_invalid: bool,
+    ) {
+        let options = timestamp_timezone
+            .map_or_else(MapToStructOptions::default, |timezone| {
+                MapToStructOptions::default().with_timestamp_timezone(timezone)
+            })
+            .with_null_on_invalid(null_on_invalid);
         let expression =
             Expression::map_to_struct(Expression::column(["partitionValues"]), options);
         let mut builder = TestExpressionBuilder::default();
@@ -1125,6 +1133,7 @@ mod tests {
                     sibling_list_id: 0,
                     child_list_id: 1,
                     timestamp_timezone: timestamp_timezone.map(str::to_string),
+                    null_on_invalid,
                 }
             ]
         );

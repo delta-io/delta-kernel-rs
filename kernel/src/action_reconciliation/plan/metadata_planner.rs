@@ -10,7 +10,7 @@ use crate::actions::{
     ADD_FIELD, ADD_NAME, ADD_SCHEMA, Add, REMOVE_NAME, STATS_PARSED, get_all_actions_schema,
 };
 use crate::checkpoint::CheckpointShape;
-use crate::checkpoint::collation_stats::source_collation_stats;
+use crate::checkpoint::collation_stats::{COLLATION_STATS, source_collation_stats};
 use crate::expressions::{
     ColumnName, Expression as Expr, Predicate, UnaryExpressionOp, col, column_name, expr,
 };
@@ -46,6 +46,7 @@ pub(crate) struct MetadataPlanner<'a> {
     pub(crate) parsed_partition_schema: Option<SchemaRef>,
     pub(crate) read_collations: bool,
     pub(crate) stats_filter: Option<Predicate>,
+    permissive_partition_parsing: bool,
 }
 
 /// The statistics representation present in a metadata plan.
@@ -71,6 +72,7 @@ impl<'a> MetadataPlanner<'a> {
             parsed_partition_schema: None,
             read_collations: false,
             stats_filter: None,
+            permissive_partition_parsing: false,
         }
     }
 
@@ -110,6 +112,12 @@ impl<'a> MetadataPlanner<'a> {
 
     pub(crate) fn with_read_collations(mut self, read_collations: bool) -> Self {
         self.read_collations = read_collations;
+        self
+    }
+
+    /// Allows obsolete partition values to become null before replay removes their Adds.
+    pub(crate) fn with_permissive_partition_parsing(mut self) -> Self {
+        self.permissive_partition_parsing = true;
         self
     }
 
@@ -273,15 +281,28 @@ impl<'a> MetadataPlanner<'a> {
         // Decide what kind of stats to read from the file by transforming `ADD_SCHEMA` based on the
         // `file_schema` and table-derived stats schema.
         let prefer_json_stats = self.stats.synthesize_json && file_add_schema.contains(STATS);
-        let (patch, stats_kind) = match (self.stats_schema.as_ref(), get_type_of(STATS_PARSED)) {
+        // Source collation identifiers and bound types can differ from the sampled output schema.
+        let stats_schema = self
+            .stats_schema
+            .as_ref()
+            .map(|stats| {
+                if self.read_collations && stats.contains(COLLATION_STATS) {
+                    SchemaStructPatchBuilder::new()
+                        .drop(COLLATION_STATS)
+                        .build(stats)
+                        .map(Arc::new)
+                } else {
+                    Ok(stats.clone())
+                }
+            })
+            .transpose()?;
+        let (patch, stats_kind) = match (stats_schema.as_ref(), get_type_of(STATS_PARSED)) {
             // Parsed statistics are requested and present in the file
-            (Some(required_stats), Some(DataType::Struct(file_parsed_stats)))
+            (Some(required_stats), Some(DataType::Struct(_)))
                 if !prefer_json_stats
-                    && LogSegment::structs_have_compatible_types(
-                        file_parsed_stats,
+                    && LogSegment::schema_has_compatible_stats_parsed(
+                        file_schema,
                         required_stats,
-                        STATS_PARSED,
-                        CheckpointFieldKind::Stats,
                     ) =>
             {
                 let stats_schema = required_stats.clone().try_fold_with(
@@ -311,6 +332,30 @@ impl<'a> MetadataPlanner<'a> {
             self.parsed_partition_schema.as_ref(),
             get_type_of(PARTITION_VALUES_PARSED),
         ) {
+            (Some(required), Some(DataType::Struct(native)))
+                if self.permissive_partition_parsing =>
+            {
+                // Read only present, compatible fields; missing values come from the raw map.
+                let fields = required
+                    .fields()
+                    .filter(|field| {
+                        native.contains(field.name())
+                            && LogSegment::structs_have_compatible_types(
+                                native,
+                                &StructType::new_unchecked([(*field).clone()]),
+                                PARTITION_VALUES_PARSED,
+                                CheckpointFieldKind::PartitionValues,
+                            )
+                    })
+                    .cloned();
+                let schema = StructType::try_new(fields)?;
+                if schema.num_fields() == 0 {
+                    (patch, false)
+                } else {
+                    let field = StructField::nullable(PARTITION_VALUES_PARSED, schema);
+                    (patch.insert_after(PARTITION_VALUES, field), true)
+                }
+            }
             (Some(required), Some(DataType::Struct(native)))
                 if LogSegment::structs_have_compatible_types(
                     native,
@@ -373,7 +418,8 @@ impl<'a> MetadataPlanner<'a> {
                     let field = StructField::nullable(PARTITION_VALUES_PARSED, schema.clone());
                     let expr = Expr::map_to_struct(
                         col!(ADD_NAME, PARTITION_VALUES),
-                        map_to_struct_options(self.partitions.timestamp_timezone.as_deref()),
+                        map_to_struct_options(self.partitions.timestamp_timezone.as_deref())
+                            .with_null_on_invalid(self.permissive_partition_parsing),
                     );
                     patch.insert_after_at([ADD_NAME], PARTITION_VALUES, field, expr)
                 })
@@ -382,7 +428,71 @@ impl<'a> MetadataPlanner<'a> {
                     patch.append(field, expr!(is_not_null(col("add.path"))))
                 })
         })?;
+        let plan = if has_struct_partitions && self.permissive_partition_parsing {
+            self.fill_missing_partition_values(plan)?
+        } else {
+            plan
+        };
         Ok((plan, stats))
+    }
+
+    // Preserve native timestamp instants while parsing only absent or incompatible fields.
+    fn fill_missing_partition_values(&self, plan: PlanBuilder) -> KernelResult<PlanBuilder> {
+        let Some(required) = self.parsed_partition_schema.as_ref() else {
+            return Ok(plan);
+        };
+        let native = plan
+            .schema()
+            .field_at(&column_name!(ADD_NAME, PARTITION_VALUES_PARSED))?;
+        let DataType::Struct(native) = native.data_type() else {
+            unreachable!("resolved partition schema")
+        };
+        let missing = StructType::try_new(
+            required
+                .fields()
+                .filter(|field| !native.contains(field.name()))
+                .cloned(),
+        )?;
+        if missing.num_fields() == 0 {
+            return Ok(plan);
+        }
+        const MISSING: &str = "partitionValues_missing";
+        let exprs = required
+            .fields()
+            .map(|field| {
+                Expr::column([
+                    ADD_NAME,
+                    if native.contains(field.name()) {
+                        PARTITION_VALUES_PARSED
+                    } else {
+                        MISSING
+                    },
+                    field.name(),
+                ])
+            })
+            .collect::<Vec<_>>();
+        plan.project_patch(|patch| {
+            patch.insert_after_at(
+                [ADD_NAME],
+                PARTITION_VALUES_PARSED,
+                StructField::nullable(MISSING, missing),
+                Expr::map_to_struct(
+                    col!(ADD_NAME, PARTITION_VALUES),
+                    map_to_struct_options(self.partitions.timestamp_timezone.as_deref())
+                        .with_null_on_invalid(true),
+                ),
+            )
+        })?
+        .project_patch(|patch| {
+            patch
+                .replace_at(
+                    [ADD_NAME],
+                    PARTITION_VALUES_PARSED,
+                    StructField::nullable(PARTITION_VALUES_PARSED, required.clone()),
+                    Expr::struct_from(exprs),
+                )
+                .drop_at([ADD_NAME], MISSING)
+        })
     }
 
     /// Reconciles version-tagged commits with an already-reconciled checkpoint or CRC base.
@@ -465,8 +575,22 @@ impl<'a> MetadataPlanner<'a> {
                     match (read_stats, output_stats_schema) {
                         (_, None) => patch.drop_at([ADD_NAME], STATS_PARSED),
                         (Some(read), Some(output)) if read != output.as_ref() => {
-                            let mut parent = vec![ADD_NAME.into(), STATS_PARSED.into()];
-                            Self::project_filter_only_stats(patch, read, output, &mut parent)
+                            if self.read_collations && output.contains(COLLATION_STATS) {
+                                // Parse to the sampled shape without relabeling source identifiers.
+                                let json = Expr::unary(
+                                    UnaryExpressionOp::ToJson,
+                                    col!(ADD_NAME, STATS_PARSED),
+                                );
+                                patch.replace_at(
+                                    [ADD_NAME],
+                                    STATS_PARSED,
+                                    StructField::nullable(STATS_PARSED, output.clone()),
+                                    Expr::parse_json(json, output.clone()),
+                                )
+                            } else {
+                                let mut parent = vec![ADD_NAME.into(), STATS_PARSED.into()];
+                                Self::project_filter_only_stats(patch, read, output, &mut parent)
+                            }
                         }
                         _ => patch,
                     }

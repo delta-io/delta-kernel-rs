@@ -139,6 +139,8 @@ use crate::{
 
 pub(crate) mod collation_stats;
 #[cfg(feature = "declarative-plans")]
+mod plan;
+#[cfg(feature = "declarative-plans")]
 mod shape;
 mod sidecar;
 
@@ -424,7 +426,7 @@ impl CheckpointWriter {
     /// This method reads actions from the log segment, processes them for checkpoint creation,
     /// and applies stats transforms based on table properties:
     /// - `delta.checkpoint.writeStatsAsJson` (default: true)
-    /// - `delta.checkpoint.writeStatsAsStruct` (default: false)
+    /// - `delta.checkpoint.writeStatsAsStruct` (default: true)
     ///
     /// The returned [`ActionReconciliationIterator`] yields [`FilteredEngineData`] batches with
     /// stats transforms already applied. Use [`ActionReconciliationIterator::state`] to get the

@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 
 use delta_kernel::arrow::array::RecordBatchReader;
+use delta_kernel::arrow::datatypes::DataType;
 use delta_kernel::checkpoint::CheckpointSpec;
 use delta_kernel::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use test_utils::{create_table_and_load_snapshot, test_table_setup_mt, write_batch_to_table};
@@ -20,11 +21,21 @@ use crate::common::write_utils::{
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_snapshot_checkpoint_on_v1_table(
     #[case] spec: Option<CheckpointSpec>,
+    #[values(None, Some(true), Some(false))] write_struct: Option<bool>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let schema = get_simple_schema();
     let (_tmp_dir, table_path, engine) = test_table_setup_mt()?;
+    let properties = write_struct
+        .map(|enabled| {
+            (
+                "delta.checkpoint.writeStatsAsStruct",
+                if enabled { "true" } else { "false" },
+            )
+        })
+        .into_iter()
+        .collect::<Vec<_>>();
     let mut snapshot =
-        create_table_and_load_snapshot(&table_path, schema.clone(), engine.as_ref(), &[])?;
+        create_table_and_load_snapshot(&table_path, schema.clone(), engine.as_ref(), &properties)?;
 
     snapshot = write_batch_to_table(
         &snapshot,
@@ -44,6 +55,14 @@ async fn test_snapshot_checkpoint_on_v1_table(
     assert!(
         schema.field_with_name("checkpointMetadata").is_err(),
         "V1 checkpoint must not contain `checkpointMetadata` column, found schema: {schema:?}"
+    );
+    let DataType::Struct(add_fields) = schema.field_with_name("add")?.data_type() else {
+        panic!("checkpoint add must be a struct");
+    };
+    assert!(add_fields.find("stats").is_some());
+    assert_eq!(
+        add_fields.find("stats_parsed").is_some(),
+        write_struct.unwrap_or(true)
     );
 
     Ok(())

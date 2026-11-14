@@ -31,7 +31,10 @@ use crate::arrow::error::ArrowError;
 use crate::arrow::json::StructMode;
 use crate::arrow::json::writer::{EncoderOptions, make_encoder};
 use crate::delta_kernel_derive::internal_api;
-use crate::engine::arrow_conversion::{LIST_ARRAY_ROOT, TryFromKernel, TryIntoArrow};
+use crate::engine::arrow_conversion::{
+    LIST_ARRAY_ROOT, MAP_KEY_DEFAULT, MAP_ROOT_DEFAULT, MAP_VALUE_DEFAULT, TryFromKernel,
+    TryIntoArrow,
+};
 use crate::engine::arrow_expression::opaque::{
     ArrowOpaqueExpressionOpAdaptor, ArrowOpaquePredicateOpAdaptor,
 };
@@ -41,10 +44,11 @@ use crate::error::{KernelError, KernelResult};
 use crate::expressions::{
     BinaryExpression, BinaryExpressionOp, BinaryPredicate, BinaryPredicateOp, CaseWhenExpression,
     Expression, ExpressionRef, ExpressionStructPatch, JunctionPredicate, JunctionPredicateOp,
-    OpaqueExpression, OpaquePredicate, Predicate, Scalar, UnaryExpression, UnaryExpressionOp,
-    UnaryPredicate, UnaryPredicateOp, VariadicExpression, VariadicExpressionOp,
+    MapData, OpaqueExpression, OpaquePredicate, Predicate, Scalar, UnaryExpression,
+    UnaryExpressionOp, UnaryPredicate, UnaryPredicateOp, VariadicExpression, VariadicExpressionOp,
 };
-use crate::schema::{DataType, PrimitiveType, StructField, StructType};
+use crate::schema::{ArrayType, DataType, PrimitiveType, StructField, StructType};
+use crate::utils::require;
 
 #[internal_api]
 pub(crate) trait ProvidesColumnByName {
@@ -266,7 +270,7 @@ fn evaluate_struct_patch_expression(
             ArrowField::new(
                 output_field.name(),
                 output_col.data_type().clone(),
-                output_col.is_nullable(),
+                output_field.nullable,
             )
         })
         .collect();
@@ -365,6 +369,9 @@ pub fn evaluate_expression(
         (Variadic(VariadicExpression { op: Array, exprs }), result_type) => {
             evaluate_array_expression(exprs, batch, result_type)
         }
+        (Variadic(VariadicExpression { op: Map, exprs }), result_type) => {
+            evaluate_map_expression(exprs, batch, result_type)
+        }
         (Opaque(OpaqueExpression { op, exprs }), _) => {
             match op
                 .any_ref()
@@ -400,7 +407,12 @@ pub fn evaluate_expression(
         (MapToStruct(m), Some(DataType::Struct(output_schema))) => {
             let map_arr = evaluate_expression(&m.map_expr, batch, None)?;
             let timestamp_timezone = TimestampTimezone::try_from_options(&m.options)?;
-            let result = evaluate_map_to_struct(&map_arr, output_schema, timestamp_timezone)?;
+            let result = evaluate_map_to_struct(
+                &map_arr,
+                output_schema,
+                timestamp_timezone,
+                m.options.null_on_invalid(),
+            )?;
             Ok(Arc::new(result) as ArrayRef)
         }
         (MapToStruct(_), dt) => Err(KernelError::Generic(format!(
@@ -437,8 +449,8 @@ pub fn evaluate_expression(
 /// evaluate, the same way a bare struct expression does), and when it declares the element
 /// field non-nullable, no input may contain nulls. See [`VariadicExpressionOp::Array`] for
 /// the expression contract.
-fn evaluate_array_expression(
-    exprs: &[Expression],
+fn evaluate_array_expression<'a>(
+    exprs: impl IntoIterator<Item = &'a Expression>,
     batch: &RecordBatch,
     result_type: Option<&DataType>,
 ) -> KernelResult<ArrayRef> {
@@ -457,7 +469,7 @@ fn evaluate_array_expression(
     let contains_null = array_type.is_none_or(|a| a.contains_null());
 
     let element_arrays: Vec<ArrayRef> = exprs
-        .iter()
+        .into_iter()
         .map(|expr| evaluate_expression(expr, batch, element_kernel_type))
         .try_collect()?;
 
@@ -524,6 +536,83 @@ fn evaluate_array_expression(
     // consistent with the other expression arms. (Element nullability is enforced above, since
     // `validate_array_type` runs in TypesAndNames mode where nullability checks are a no-op.)
     validate_array_type(Arc::new(list), result_type)
+}
+
+fn evaluate_map_expression(
+    exprs: &[Expression],
+    batch: &RecordBatch,
+    result_type: Option<&DataType>,
+) -> KernelResult<ArrayRef> {
+    require!(
+        exprs.len().is_multiple_of(2),
+        KernelError::generic("Map expression requires alternating key/value operands")
+    );
+    let map_type = match result_type {
+        Some(DataType::Map(map)) => Some(map.as_ref()),
+        None => None,
+        Some(other) => {
+            return Err(KernelError::generic(format!(
+                "Map expression requires a DataType::Map result type, but got {other:?}"
+            )));
+        }
+    };
+    if exprs.is_empty() {
+        let map_type = map_type.ok_or_else(|| {
+            KernelError::generic("Empty Map expression requires a map result type")
+        })?;
+        return Scalar::Map(MapData::try_new(
+            map_type.clone(),
+            std::iter::empty::<(Scalar, Scalar)>(),
+        )?)
+        .to_array(batch.num_rows());
+    }
+    let key_type = map_type.map(|m| DataType::from(ArrayType::new(m.key_type().clone(), false)));
+    let value_type = map_type.map(|m| {
+        DataType::from(ArrayType::new(
+            m.value_type().clone(),
+            m.value_contains_null(),
+        ))
+    });
+    let keys = evaluate_array_expression(exprs.iter().step_by(2), batch, key_type.as_ref())?;
+    let values =
+        evaluate_array_expression(exprs.iter().skip(1).step_by(2), batch, value_type.as_ref())?;
+    let keys = keys.as_list::<i32>();
+    let values = values.as_list::<i32>();
+    require!(
+        keys.values().null_count() == 0,
+        KernelError::generic("Map expression keys cannot be null")
+    );
+    let key_data = keys.values().to_data();
+    for offsets in keys.value_offsets().windows(2) {
+        for i in offsets[0] as usize..offsets[1] as usize {
+            for j in offsets[0] as usize..i {
+                require!(
+                    key_data.slice(i, 1) != key_data.slice(j, 1),
+                    KernelError::generic("Map expression contains duplicate keys")
+                );
+            }
+        }
+    }
+    let entries = StructArray::try_new(
+        vec![
+            ArrowField::new(MAP_KEY_DEFAULT, keys.values().data_type().clone(), false),
+            ArrowField::new(
+                MAP_VALUE_DEFAULT,
+                values.values().data_type().clone(),
+                map_type.is_none_or(|m| m.value_contains_null()),
+            ),
+        ]
+        .into(),
+        vec![keys.values().clone(), values.values().clone()],
+        None,
+    )?;
+    let field = Arc::new(ArrowField::new(
+        MAP_ROOT_DEFAULT,
+        entries.data_type().clone(),
+        false,
+    ));
+    let map = MapArray::try_new(field, keys.offsets().clone(), entries, None, false)?;
+    validate_array_type(Arc::new(map), result_type)
 }
 
 fn evaluate_case_when(
@@ -1082,12 +1171,13 @@ fn parse_partition_scalar(
 /// `timestamp_timezone` controls `TIMESTAMP` values without an embedded offset or named timezone.
 ///
 /// - Missing keys produce null values
-/// - Parse errors are propagated (indicating a broken table)
+/// - Parse errors propagate unless `null_on_invalid` is enabled
 /// - Duplicate keys are invalid input and their result is undefined
 fn evaluate_map_to_struct(
     map_arr: &ArrayRef,
     output_schema: &StructType,
     timestamp_timezone: TimestampTimezone,
+    null_on_invalid: bool,
 ) -> KernelResult<StructArray> {
     let map_array = map_arr
         .as_any()
@@ -1168,9 +1258,13 @@ fn evaluate_map_to_struct(
             // and where the value is non-null.
             if entry_idx >= entry_start && map_values.is_valid(entry_idx as usize) {
                 let raw = map_values.value(entry_idx as usize);
-                match parse_partition_scalar(target_types[i], raw, timestamp_timezone)? {
-                    Some(scalar) => scalar.append_to(builder, 1)?,
-                    None => Scalar::append_null(builder, field.data_type(), 1)?,
+                match parse_partition_scalar(target_types[i], raw, timestamp_timezone) {
+                    Ok(Some(scalar)) => scalar.append_to(builder, 1)?,
+                    Ok(None) => Scalar::append_null(builder, field.data_type(), 1)?,
+                    Err(KernelError::ParseError(..)) if null_on_invalid => {
+                        Scalar::append_null(builder, field.data_type(), 1)?;
+                    }
+                    Err(error) => return Err(error),
                 }
             } else {
                 Scalar::append_null(builder, field.data_type(), 1)?;
@@ -1227,6 +1321,7 @@ mod tests {
     use crate::arrow::datatypes::{
         DataType as ArrowDataType, Field as ArrowField, Fields, Schema as ArrowSchema,
     };
+    use crate::arrow::util::display::array_value_to_string;
     use crate::engine::arrow_conversion::TryIntoKernel;
     use crate::expressions::{
         ArrayData, BinaryExpressionOp, BinaryPredicateOp, Expression as Expr,
@@ -3028,12 +3123,21 @@ mod tests {
         assert_eq!(regions.value(0), "us");
     }
 
-    #[test]
-    fn test_map_to_struct_parse_error() {
+    #[rstest]
+    fn test_map_to_struct_parse_error(
+        #[values(false, true)] null_on_invalid: bool,
+        #[values("not_a_number", "2147483648")] invalid: &str,
+    ) {
         let mut builder = MapBuilder::new(None, StringBuilder::new(), StringBuilder::new());
         builder.keys().append_value("count");
-        builder.values().append_value("not_a_number");
+        builder.values().append_value(invalid);
+        builder.keys().append_value("valid");
+        builder.values().append_value("7");
         builder.append(true).unwrap();
+        builder.keys().append_value("count");
+        builder.values().append_value("42");
+        builder.append(true).unwrap();
+        builder.append(false).unwrap();
 
         let map_array = builder.finish();
         let schema = ArrowSchema::new(vec![ArrowField::new(
@@ -3043,11 +3147,37 @@ mod tests {
         )]);
         let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(map_array)]).unwrap();
 
-        let output_schema = schema! { nullable "count": INTEGER };
+        let output_schema = schema! { nullable "count": INTEGER, nullable "valid": INTEGER };
         let result_type = DataType::from(output_schema);
-        let expr = Expr::map_to_struct(col!("pv"), MapToStructOptions::default());
+        let expr = Expr::map_to_struct(
+            col!("pv"),
+            MapToStructOptions::default().with_null_on_invalid(null_on_invalid),
+        );
         let result = evaluate_expression(&expr, &batch, Some(&result_type));
-        assert!(result.is_err());
+        if null_on_invalid {
+            let result = result.unwrap();
+            let result = result.as_struct();
+            assert_eq!(
+                result
+                    .column(0)
+                    .as_primitive::<Int32Type>()
+                    .iter()
+                    .collect::<Vec<_>>(),
+                [None, Some(42), None]
+            );
+            assert_eq!(
+                result
+                    .column(1)
+                    .as_primitive::<Int32Type>()
+                    .iter()
+                    .collect::<Vec<_>>(),
+                [Some(7), None, None]
+            );
+            assert!(result.is_valid(0));
+            assert!(result.is_null(2));
+        } else {
+            assert!(matches!(result, Err(KernelError::ParseError(..))));
+        }
     }
 
     #[test]
@@ -3853,6 +3983,83 @@ mod tests {
 
         let result = evaluate_expression(&expr, &batch, Some(&output_type));
         assert_result_error_with_message(result, "Missing Struct fields");
+    }
+
+    #[rstest]
+    #[case::cast(
+        Expr::map([(lit("literalTag"), Expr::cast(col!("count"), DataType::STRING))]),
+        None,
+        ["{literalTag: 3}", "{literalTag: }", "{literalTag: 8}"],
+    )]
+    #[case::numeric_keys(
+        Expr::map([(lit(1_i64), col!("count")), (lit(2_i64), lit(9_i64))]),
+        Some(MapType::new(DataType::LONG, DataType::LONG, true).into()),
+        ["{1: 3, 2: 9}", "{1: , 2: 9}", "{1: 8, 2: 9}"],
+    )]
+    #[case::nested_values(
+        Expr::map([(lit("x"), Expr::array([col!("count")]))]),
+        Some(MapType::new(DataType::STRING, ArrayType::new(DataType::LONG, true), false).into()),
+        ["{x: [3]}", "{x: []}", "{x: [8]}"],
+    )]
+    #[case::empty(
+        Expr::map([]),
+        Some(MapType::new(DataType::STRING, DataType::LONG, false).into()),
+        ["{}", "{}", "{}"],
+    )]
+    fn test_evaluate_map_output(
+        #[case] expr: Expr,
+        #[case] result_type: Option<DataType>,
+        #[case] expected: [&str; 3],
+        #[values(0, 3)] num_rows: usize,
+    ) {
+        let batch = RecordBatch::try_from_iter([(
+            "count",
+            Arc::new(Int64Array::from(vec![Some(3), None, Some(8)])) as ArrayRef,
+        )])
+        .unwrap()
+        .slice(0, num_rows);
+        let result = evaluate_expression(&expr, &batch, result_type.as_ref()).unwrap();
+        let map = result.as_map();
+        assert_eq!(map.len(), num_rows);
+        assert_eq!(map.null_count(), 0);
+        assert!(!map.entries().fields()[0].is_nullable());
+        if let Some(result_type) = result_type {
+            assert_eq!(
+                result.data_type(),
+                &ArrowDataType::try_from_kernel(&result_type).unwrap()
+            );
+        }
+        for (row, expected) in expected.iter().take(num_rows).enumerate() {
+            assert_eq!(
+                array_value_to_string(result.as_ref(), row).unwrap(),
+                *expected
+            );
+        }
+    }
+
+    #[rstest]
+    #[case::odd_operands(Expr::variadic(VariadicExpressionOp::Map, [lit(1)]), None, "alternating")]
+    #[case::untyped_empty(Expr::map([]), None, "requires a map result type")]
+    #[case::wrong_target(Expr::map([(lit(1), lit(2))]), Some(DataType::INTEGER), "DataType::Map")]
+    #[case::key_types(Expr::map([(lit(1), lit(2)), (lit("x"), lit(3))]), None, "same element type")]
+    #[case::value_types(Expr::map([(lit(1), lit(2)), (lit(2), lit("x"))]), None, "same element type")]
+    #[case::null_key(Expr::map([(col!("b"), lit(1))]), None, "keys cannot be null")]
+    #[case::duplicate(Expr::map([(lit(1), lit(2)), (lit(1), lit(3))]), None, "duplicate keys")]
+    #[case::dynamic_duplicate(Expr::map([(col!("a"), lit(1)), (lit(2), lit(3))]), None, "duplicate keys")]
+    #[case::non_nullable_values(
+        Expr::map([(lit(1), col!("b"))]),
+        Some(MapType::new(DataType::INTEGER, DataType::INTEGER, false).into()),
+        "non-nullable elements",
+    )]
+    fn test_evaluate_map_errors(
+        #[case] expr: Expr,
+        #[case] result_type: Option<DataType>,
+        #[case] expected: &str,
+    ) {
+        assert_result_error_with_message(
+            evaluate_expression(&expr, &ab_batch_with_b_nulls(), result_type.as_ref()),
+            expected,
+        );
     }
 
     fn int_array_ty(contains_null: bool) -> DataType {

@@ -284,6 +284,19 @@ impl DeltaError {
         self
     }
 
+    /// Reports reconstructed state that disagrees with the version checksum.
+    #[cfg(feature = "declarative-plans")]
+    pub(crate) fn txn_log_failed_integrity(version: crate::Version, mismatch: &str) -> Self {
+        Self::new(
+            DeltaErrorCondition::DeltaTxnLogFailedIntegrity,
+            vec![
+                DeltaErrorParameter::new("version", version),
+                DeltaErrorParameter::new("mismatchStringOpt", mismatch),
+            ],
+            None,
+        )
+    }
+
     /// Creates an error with an optional diagnostic cause and captures its backtrace.
     ///
     /// `parameters` must contain exactly [`DeltaErrorCondition::parameter_names`], in that order.

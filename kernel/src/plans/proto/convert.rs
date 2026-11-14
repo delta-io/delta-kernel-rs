@@ -20,7 +20,7 @@ use crate::expressions::{
 };
 use crate::plans::ir::nodes::{
     Agg, Aggregate, DynamicScan, FileType, Filter, Operator, PrefixSum, Project, RelationRef,
-    ScanFile, ScanJson, ScanParquet, SemiJoin, Values, WriteJson,
+    ScanFile, ScanJson, ScanParquet, SemiJoin, Values, WriteJson, WriteParquet, WriteParquetFiles,
 };
 use crate::plans::ir::plan::{Plan, PlanNode};
 use crate::plans::{IoOperation, Operation};
@@ -155,6 +155,8 @@ impl From<&Operator> for proto_plan::Operator {
             Operator::Aggregate(n) => Op::Aggregate(n.into()),
             Operator::PrefixSum(n) => Op::PrefixSum(n.into()),
             Operator::WriteJson(n) => Op::WriteJson(n.into()),
+            Operator::WriteParquet(n) => Op::WriteParquet(n.into()),
+            Operator::WriteParquetFiles(n) => Op::WriteParquetFiles(n.into()),
             Operator::SemiJoin(n) => Op::SemiJoin(n.into()),
             Operator::UnionAll(_) => Op::UnionAll(proto_plan::UnionAllNode {}),
         };
@@ -232,6 +234,27 @@ impl From<&WriteJson> for proto_plan::WriteJsonNode {
             overwrite: node.overwrite,
             ordered: node.ordered,
             schema: Some(node.schema.as_ref().into()),
+        }
+    }
+}
+
+impl From<&WriteParquet> for proto_plan::WriteParquetNode {
+    fn from(node: &WriteParquet) -> Self {
+        Self {
+            file_path: node.file_path.to_string(),
+            overwrite: node.overwrite,
+            ordered: node.ordered,
+            write_schema: Some(node.write_schema.as_ref().into()),
+        }
+    }
+}
+
+impl From<&WriteParquetFiles> for proto_plan::WriteParquetFilesNode {
+    fn from(node: &WriteParquetFiles) -> Self {
+        Self {
+            write_schema: Some(node.write_schema.as_ref().into()),
+            base_url: node.base_url.to_string(),
+            file_name_template: node.file_name_template.clone(),
         }
     }
 }
@@ -378,8 +401,10 @@ impl From<&Expression> for proto_expr::Expression {
                     else_expr: Some(Box::new(case_when.else_expr.as_ref().into())),
                 }))
             }
-            // No proto cast node yet; serialize as an opaque unknown.
-            Expression::Cast(cast) => Kind::Unknown(format!("cast_to_{}", cast.target)),
+            Expression::Cast(cast) => Kind::Cast(Box::new(proto_expr::CastExpression {
+                expr: Some(Box::new(cast.expr.as_ref().into())),
+                target: Some((&cast.target).into()),
+            })),
         };
         proto_expr::Expression { kind: Some(kind) }
     }
@@ -468,6 +493,7 @@ impl From<&MapToStructOptions> for proto_expr::MapToStructOptions {
     fn from(options: &MapToStructOptions) -> Self {
         Self {
             timestamp_timezone: options.timestamp_timezone().map(ToOwned::to_owned),
+            null_on_invalid: options.null_on_invalid(),
         }
     }
 }
@@ -561,6 +587,7 @@ impl From<VariadicExpressionOp> for proto_expr::VariadicExpressionOp {
         match op {
             VariadicExpressionOp::Coalesce => proto_expr::VariadicExpressionOp::Coalesce,
             VariadicExpressionOp::Array => proto_expr::VariadicExpressionOp::Array,
+            VariadicExpressionOp::Map => proto_expr::VariadicExpressionOp::Map,
         }
     }
 }
@@ -1100,7 +1127,8 @@ mod tests {
     };
     use crate::plans::ir::nodes::{
         Agg, Aggregate, DynamicScan, FileType, Filter, Operator, PrefixSum, Project, RelationRef,
-        ScanFile, ScanJson, ScanParquet, SemiJoin, UnionAll, Values, WriteJson,
+        ScanFile, ScanJson, ScanParquet, SemiJoin, UnionAll, Values, WriteJson, WriteParquet,
+        WriteParquetFiles,
     };
     use crate::plans::ir::plan::{Plan, PlanNode};
     use crate::plans::proto::{
@@ -1457,6 +1485,14 @@ mod tests {
         file_path: Url::parse("memory:///out.json").unwrap(), overwrite: false,
         schema: sample_schema(), ordered: true,
     }), "write_json")]
+    #[case(Operator::WriteParquet(WriteParquet {
+        file_path: Url::parse("memory:///out.parquet").unwrap(), overwrite: false,
+        write_schema: sample_schema(), ordered: true,
+    }), "write_parquet")]
+    #[case(Operator::WriteParquetFiles(WriteParquetFiles {
+        write_schema: sample_schema(), base_url: Url::parse("memory:///files/").unwrap(),
+        file_name_template: "part-{uuid}.parquet".into(),
+    }), "write_parquet_files")]
     fn from_operator(#[case] op: Operator, #[case] expected: &str) {
         use proto_plan::operator::Op;
         let kind = match proto_plan::Operator::from(&op).op.unwrap() {
@@ -1472,12 +1508,20 @@ mod tests {
             Op::PrefixSum(_) => "prefix_sum",
             Op::UnionAll(_) => "union_all",
             Op::WriteJson(_) => "write_json",
+            Op::WriteParquet(_) => "write_parquet",
+            Op::WriteParquetFiles(node) => {
+                assert_eq!(node.write_schema, Some(sample_schema().as_ref().into()));
+                assert_eq!(node.base_url, "memory:///files/");
+                assert_eq!(node.file_name_template, "part-{uuid}.parquet");
+                "write_parquet_files"
+            }
         };
         assert_eq!(kind, expected);
     }
 
     #[rstest]
-    fn from_write_json(
+    fn from_write(
+        #[values(FileType::Json, FileType::Parquet)] file_type: FileType,
         #[values(false, true)] overwrite: bool,
         #[values(false, true)] ordered: bool,
     ) {
@@ -1487,11 +1531,35 @@ mod tests {
             ordered,
             schema: sample_schema(),
         };
-        let proto = proto_plan::WriteJsonNode::from(&node);
-        assert_eq!(proto.file_path, node.file_path.as_str());
-        assert_eq!(proto.overwrite, overwrite);
-        assert_eq!(proto.ordered, ordered);
-        assert_eq!(proto.schema, Some(node.schema.as_ref().into()));
+        let (path, actual_overwrite, actual_ordered, schema) = match file_type {
+            FileType::Json => {
+                let proto = proto_plan::WriteJsonNode::from(&node);
+                (
+                    proto.file_path,
+                    proto.overwrite,
+                    proto.ordered,
+                    proto.schema,
+                )
+            }
+            FileType::Parquet => {
+                let proto = proto_plan::WriteParquetNode::from(&WriteParquet {
+                    file_path: node.file_path.clone(),
+                    write_schema: node.schema.clone(),
+                    overwrite,
+                    ordered,
+                });
+                (
+                    proto.file_path,
+                    proto.overwrite,
+                    proto.ordered,
+                    proto.write_schema,
+                )
+            }
+        };
+        assert_eq!(path, node.file_path.as_str());
+        assert_eq!(actual_overwrite, overwrite);
+        assert_eq!(actual_ordered, ordered);
+        assert_eq!(schema, Some(node.schema.as_ref().into()));
     }
 
     #[test]
@@ -1749,6 +1817,8 @@ mod tests {
     #[case(Expression::unary(UnaryExpressionOp::ToJson, lit(1)), "unary")]
     #[case(Expression::binary(BinaryExpressionOp::Plus, lit(1), lit(2)), "binary")]
     #[case(expr!(coalesce(1, 2)), "variadic")]
+    #[case(Expression::map([(lit("tag"), lit(1))]), "variadic")]
+    #[case(Expression::cast(col!("count"), DataType::STRING), "cast")]
     #[case(Expression::opaque(TestOpaqueExprOp, [lit(1)]), "opaque")]
     #[case(Expression::parse_json(lit("{}"), sample_schema()), "parse_json")]
     #[case(
@@ -1779,6 +1849,7 @@ mod tests {
             Kind::Opaque(_) => "opaque",
             Kind::ParseJson(_) => "parse_json",
             Kind::MapToStruct(_) => "map_to_struct",
+            Kind::Cast(_) => "cast",
             Kind::Unknown(_) => "unknown",
         };
         assert_eq!(kind, expected);
@@ -1869,6 +1940,36 @@ mod tests {
     }
 
     #[test]
+    fn map_with_cast_survives_protobuf_wire_encoding() {
+        use proto_expr::expression::Kind;
+        let expr = Expression::map([(
+            lit("literalTag"),
+            Expression::cast(col!("count"), DataType::STRING),
+        )]);
+        let proto = proto_expr::Expression::from(&expr);
+        let bytes = prost::Message::encode_to_vec(&proto);
+        let decoded: proto_expr::Expression = prost::Message::decode(bytes.as_slice()).unwrap();
+        assert_eq!(decoded, proto);
+        let Some(Kind::Variadic(map)) = decoded.kind else {
+            panic!("expected map")
+        };
+        assert_eq!(map.op, proto_expr::VariadicExpressionOp::Map as i32);
+        assert_eq!(map.exprs.len(), 2);
+        assert_eq!(
+            map.exprs[0],
+            proto_expr::Expression::from(&lit("literalTag"))
+        );
+        let Some(Kind::Cast(cast)) = &map.exprs[1].kind else {
+            panic!("expected cast")
+        };
+        assert_eq!(cast.target, Some((&DataType::STRING).into()));
+        assert_eq!(
+            cast.expr,
+            Some(Box::new(proto_expr::Expression::from(&col!("count"))))
+        );
+    }
+
+    #[test]
     fn from_opaque_expression() {
         let proto_expr::expression::Kind::Opaque(opaque) =
             expr_kind_of(Expression::opaque(TestOpaqueExprOp, [lit(1), lit(2)]))
@@ -1890,8 +1991,8 @@ mod tests {
         assert!(parse_json.output_schema.is_some());
     }
 
-    #[test]
-    fn from_map_to_struct_expression() {
+    #[rstest]
+    fn from_map_to_struct_expression(#[values(false, true)] null_on_invalid: bool) {
         let proto_expr::expression::Kind::MapToStruct(map_to_struct) = expr_kind_of(
             Expression::map_to_struct(col!("m"), MapToStructOptions::default()),
         ) else {
@@ -1903,7 +2004,9 @@ mod tests {
         let proto_expr::expression::Kind::MapToStruct(map_to_struct) =
             expr_kind_of(Expression::map_to_struct(
                 col!("m"),
-                MapToStructOptions::default().with_timestamp_timezone("America/Los_Angeles"),
+                MapToStructOptions::default()
+                    .with_timestamp_timezone("America/Los_Angeles")
+                    .with_null_on_invalid(null_on_invalid),
             ))
         else {
             panic!("expected a map_to_struct expression");
@@ -1914,6 +2017,10 @@ mod tests {
                 .as_ref()
                 .and_then(|options| options.timestamp_timezone.as_deref()),
             Some("America/Los_Angeles")
+        );
+        assert_eq!(
+            map_to_struct.options.unwrap().null_on_invalid,
+            null_on_invalid
         );
     }
 
@@ -2024,6 +2131,7 @@ mod tests {
         proto_expr::VariadicExpressionOp::Coalesce
     )]
     #[case(VariadicExpressionOp::Array, proto_expr::VariadicExpressionOp::Array)]
+    #[case(VariadicExpressionOp::Map, proto_expr::VariadicExpressionOp::Map)]
     fn from_variadic_expression_op(
         #[case] op: VariadicExpressionOp,
         #[case] expected: proto_expr::VariadicExpressionOp,
