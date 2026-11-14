@@ -5,7 +5,7 @@
 
 use std::sync::Arc;
 
-use tracing::{error, instrument};
+use tracing::{debug, error, instrument};
 
 use super::{IncrementalReplay, PreparedSnapshot, Snapshot};
 use crate::log_segment::{LogSegment, PmResolution};
@@ -167,6 +167,10 @@ impl Snapshot {
                 // TODO(#3845): Preserve publication evidence from the supplied tail before reuse.
                 let built_as_latest = existing_snapshot.built_as_latest
                     && max_catalog_version.is_none_or(|max| max <= existing_snapshot_version);
+                debug!(
+                    built_as_latest,
+                    "Reusing snapshot: requested version matches existing version"
+                );
                 return Ok(Self::reuse_with_build_metadata(
                     &existing_snapshot,
                     built_as_latest,
@@ -205,6 +209,10 @@ impl Snapshot {
                 // The builder reaches this branch without an effective target: neither an
                 // explicit version nor a catalog bound can contradict the latest claim.
                 let built_as_latest = existing_snapshot.built_as_latest || built_as_latest;
+                debug!(
+                    built_as_latest,
+                    "Reusing snapshot: no newer table state found"
+                );
                 return Ok(Self::reuse_with_build_metadata(
                     &existing_snapshot,
                     built_as_latest,
@@ -212,6 +220,12 @@ impl Snapshot {
                 ));
             }
             NewSegment::Rebuild(new_log_segment) => {
+                debug!(
+                    from_version = existing_snapshot_version,
+                    to_version = new_log_segment.end_version,
+                    checkpoint_version = ?new_log_segment.checkpoint_version,
+                    "Rebuilding snapshot: checkpoint is newer than existing snapshot"
+                );
                 emit_log_segment_load(
                     metric_context,
                     &new_log_segment,
@@ -252,6 +266,12 @@ impl Snapshot {
                 return Ok(Arc::new(snapshot));
             }
             NewSegment::Combined(combined_log_segment) => {
+                debug!(
+                    from_version = existing_snapshot_version,
+                    to_version = combined_log_segment.end_version,
+                    checkpoint_version = ?combined_log_segment.checkpoint_version,
+                    "Advancing snapshot using existing table state"
+                );
                 emit_log_segment_load(
                     metric_context,
                     &combined_log_segment,
@@ -306,6 +326,14 @@ impl Snapshot {
             }
         };
         emit_protocol_metadata_load(metric_context, resolution.source, pm_start.elapsed());
+        debug!(
+            source = ?resolution.source,
+            base_crc_version = ?base_crc.as_ref().map(|crc| crc.version),
+            crc_at_target = crc_at_version.is_some(),
+            metadata_resolved = resolution.metadata.is_some(),
+            protocol_resolved = resolution.protocol.is_some(),
+            "Resolved incremental snapshot metadata"
+        );
 
         let table_configuration = TableConfiguration::try_new_from(
             existing_table_config,

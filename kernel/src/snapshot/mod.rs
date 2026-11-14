@@ -10,7 +10,7 @@ use std::sync::OnceLock;
 use std::time::Instant;
 
 use delta_kernel_derive::internal_api;
-use tracing::{error, info, instrument, trace, warn};
+use tracing::{debug, error, info, instrument, trace, warn};
 use url::Url;
 
 use crate::action_reconciliation::calculate_transaction_expiration_timestamp;
@@ -563,6 +563,12 @@ impl Snapshot {
             (None, None) => return fail(KernelError::MissingMetadataAndProtocol),
         };
         emit_protocol_metadata_load(metric_context, source, pm_start.elapsed());
+        debug!(
+            ?source,
+            base_crc_version = ?base_crc.as_ref().map(|crc| crc.version),
+            crc_at_target = crc_at_version.is_some(),
+            "Resolved snapshot protocol and metadata"
+        );
 
         let table_configuration = TableConfiguration::try_new(
             metadata,
@@ -650,6 +656,13 @@ impl Snapshot {
             &new_table_configuration,
             new_crc,
         )?;
+        debug!(
+            parent: &self.span,
+            from_version = read_version,
+            to_version = new_version,
+            crc_version = ?new_crc.base().map(|crc| crc.version),
+            "Constructed post-commit snapshot state"
+        );
         // A successful commit means the post-commit snapshot is the latest version.
         Ok(Self::new_with_validated_crc(
             new_log_segment,
@@ -967,6 +980,10 @@ impl Snapshot {
         if let Some(base) = self.tail_replay_base_crc(engine)?
             && let SetTransactionState::Complete(base_active) = &base.set_transaction_state
         {
+            debug!(
+                base_crc_version = base.version,
+                "Resolving application transaction from CRC and tail commits"
+            );
             let txn = SetTransactionScanner::get_one_rooted_in_crc(
                 self.log_segment(),
                 application_id,
@@ -985,6 +1002,7 @@ impl Snapshot {
 
         // Fallback: full log replay. Scan for the newest txn and apply expiration to it, like the
         // CRC paths above.
+        debug!("Resolving application transaction by full log replay: no authoritative CRC answer");
         let txn = SetTransactionScanner::get_one(self, application_id, engine)?;
         let version = txn.and_then(|txn| txn.non_expired_version(expiration_timestamp));
         record_metric(false, version.is_some());
@@ -1185,6 +1203,10 @@ impl Snapshot {
         if let Some(base) = self.tail_replay_base_crc(engine)?
             && let DomainMetadataState::Complete(base_active) = &base.domain_metadata_state
         {
+            debug!(
+                base_crc_version = base.version,
+                "Resolving domain metadata from CRC and tail commits"
+            );
             let rooted = self.log_segment().scan_domain_metadatas_rooted_in_crc(
                 base.version,
                 base_active,
@@ -1204,6 +1226,7 @@ impl Snapshot {
         //       miss search could skip that range and only scan the older commits, then
         //       union those results with the Partial cache's entries to produce the final
         //       answer.
+        debug!("Resolving domain metadata by full log replay: no authoritative CRC answer");
         let replayed = scan_domain_metadata_actions(
             self.read_log_actions(engine, LOG_DOMAIN_METADATA_SCHEMA.clone())?,
             domains,
@@ -1631,6 +1654,11 @@ impl Snapshot {
         let record_root = |root: &str, mode: ChecksumWriteResolutionMode| {
             span.record("root", root);
             write_span.record("resolution_mode", mode.as_ref());
+            debug!(
+                root,
+                resolution_mode = mode.as_ref(),
+                "Selected checksum resolution strategy"
+            );
         };
         // Case 1: an in-memory CRC at this version is ready to write as-is.
         if let Some(crc) = self.crc_at_version() {
