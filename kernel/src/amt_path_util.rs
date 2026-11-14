@@ -20,14 +20,14 @@ use crate::{FileMeta, KernelError, KernelResult};
 ///
 /// # Errors
 ///
-/// Returns an error if `path` contains a `.` or `..` segment, or if the resolved location fails
-/// to parse as a [`Url`].
+/// Returns an error if `path` contains a `.` or `..` segment, if a relative `path` is empty or
+/// begins with `/`, or if the resolved location fails to parse as a [`Url`].
 ///
 /// [relative paths specification]: https://iceberg.apache.org/spec/#paths-in-metadata
 pub(crate) fn resolve_amt_location(path: &str, table_root: &Url) -> KernelResult<Url> {
     match parse_absolute_amt_location(path)? {
         Some(url) => Ok(url),
-        None => encode_and_join(path, table_root),
+        None => resolve_table_relative(path, table_root),
     }
 }
 
@@ -468,16 +468,16 @@ mod tests {
     }
 
     #[rstest]
-    #[case::relative_dot_dot("a/../b.bin")]
-    #[case::relative_leading_dot("./a.bin")]
-    #[case::relative_trailing_dot("a/.")]
-    #[case::bare_dot_dot("..")]
-    #[case::absolute_dot_dot("s3://bucket/x/../y.parquet")]
-    fn test_resolve_amt_location_rejects_dot_segments(#[case] path: &str) {
+    #[case::relative_dot_dot("a/../b.bin", "contains a '.' or '..' segment")]
+    #[case::relative_leading_dot("./a.bin", "contains a '.' or '..' segment")]
+    #[case::relative_trailing_dot("a/.", "contains a '.' or '..' segment")]
+    #[case::bare_dot_dot("..", "contains a '.' or '..' segment")]
+    #[case::absolute_dot_dot("s3://bucket/x/../y.parquet", "contains a '.' or '..' segment")]
+    #[case::empty("", "must not be empty")]
+    #[case::leading_slash("/a.parquet", "must not begin with a leading '/'")]
+    #[case::network_path("//host/a.parquet", "must not begin with a leading '/'")]
+    fn test_resolve_amt_location_rejects_invalid_paths(#[case] path: &str, #[case] message: &str) {
         let table_root = Url::parse("memory:///table/").unwrap();
-        assert_result_error_with_message(
-            resolve_amt_location(path, &table_root),
-            "contains a '.' or '..' segment",
-        );
+        assert_result_error_with_message(resolve_amt_location(path, &table_root), message);
     }
 }
