@@ -10,7 +10,9 @@ use url::Url;
 use super::data_skipping::DataSkippingFilter;
 use super::metrics::ScanMetrics;
 use super::state_info::{ResolvedPhysicalStatsSchemas, StateInfo};
-use super::{COMMIT_READ_SCHEMA, PhysicalPredicate, ScanMetadata, map_to_struct_options};
+use super::{
+    COMMIT_READ_SCHEMA, ParsedColumnSource, PhysicalPredicate, ScanMetadata, map_to_struct_options,
+};
 use crate::actions::deletion_vector::DeletionVectorDescriptor;
 use crate::engine_data::{EngineData, GetData, RowVisitor, TypedGetData as _};
 use crate::expressions::{
@@ -189,6 +191,12 @@ pub struct ScanLogReplayProcessor {
     partition_values_options: ScanPartitionValuesOptions,
     /// Information about checkpoint reading for stats optimization
     checkpoint_info: CheckpointReadInfo,
+    /// Source of `partitionValues_parsed` in commit batches; `None` when the column is not
+    /// emitted.
+    commit_partition_values_source: Option<ParsedColumnSource>,
+    /// Source of `partitionValues_parsed` in checkpoint batches; `None` when the column is not
+    /// emitted.
+    checkpoint_partition_values_source: Option<ParsedColumnSource>,
     /// Metrics related to the scan
     metrics: Arc<ScanMetrics>,
 }
@@ -294,6 +302,18 @@ impl ScanLogReplayProcessor {
                 None
             };
 
+        let (commit_partition_values_source, checkpoint_partition_values_source) =
+            if partition_schema_for_transform.is_some() {
+                let checkpoint_source = if has_partition_values_parsed {
+                    ParsedColumnSource::Checkpoint
+                } else {
+                    ParsedColumnSource::Derived
+                };
+                (Some(ParsedColumnSource::Derived), Some(checkpoint_source))
+            } else {
+                (None, None)
+            };
+
         let output_schema = scan_row_schema_with_parsed_columns(
             stats_schema_for_transform.clone(),
             partition_schema_for_transform.clone(),
@@ -366,8 +386,20 @@ impl ScanLogReplayProcessor {
             stats_options,
             partition_values_options,
             checkpoint_info,
+            commit_partition_values_source,
+            checkpoint_partition_values_source,
             metrics,
         })
+    }
+
+    /// The source of `partitionValues_parsed` in the batch type being processed. One batch never
+    /// mixes sources because each input batch uses a single evaluator.
+    fn partition_values_source(&self, is_log_batch: bool) -> Option<ParsedColumnSource> {
+        if is_log_batch {
+            self.commit_partition_values_source
+        } else {
+            self.checkpoint_partition_values_source
+        }
     }
 
     /// Get a reference to the checkpoint info.
@@ -1125,8 +1157,12 @@ impl ParallelLogReplayProcessor for ScanLogReplayProcessor {
         };
         self.record_selected_add_files(&final_selection, &active_add_file_sizes)?;
         let transformed_actions = self.project_stats_output(transformed_actions)?;
-        let scan_metadata =
-            ScanMetadata::try_new(transformed_actions, final_selection, row_transform_exprs)?;
+        let scan_metadata = ScanMetadata::try_new(
+            transformed_actions,
+            final_selection,
+            row_transform_exprs,
+            self.partition_values_source(is_log_batch),
+        )?;
         self.metrics
             .update_peak_hash_set_size(self.seen_file_keys.len());
         Ok(scan_metadata)
@@ -1233,8 +1269,12 @@ impl ScanLogReplayProcessor {
         };
         self.record_selected_add_files(&final_selection, &active_add_file_sizes)?;
         let transformed_actions = self.project_stats_output(transformed_actions)?;
-        let scan_metadata =
-            ScanMetadata::try_new(transformed_actions, final_selection, row_transform_exprs)?;
+        let scan_metadata = ScanMetadata::try_new(
+            transformed_actions,
+            final_selection,
+            row_transform_exprs,
+            self.partition_values_source(is_log_batch),
+        )?;
         self.metrics
             .update_peak_hash_set_size(self.seen_file_keys.len());
         Ok(scan_metadata)

@@ -398,6 +398,19 @@ impl StatsOptions {
     }
 }
 
+/// Where Kernel got a typed column in a [`ScanMetadata`] batch.
+///
+/// See [`ScanMetadata::partition_values_source`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParsedColumnSource {
+    /// Read from the checkpoint's own typed column.
+    Checkpoint,
+    /// Built by Kernel from the raw action field. For partition values this is the
+    /// `add.partitionValues` string map, where [`PartitionValuesOptions::with_timestamp_timezone`]
+    /// applies.
+    Derived,
+}
+
 /// Engine-facing partition value options. Pass to scan builders, such as [`ScanBuilder`] and
 /// [`crate::incremental_scan::IncrementalScanBuilder`], to control partition-column related
 /// behavior.
@@ -423,7 +436,7 @@ impl PartitionValuesOptions {
     /// `partitionColumns`.
     /// On non-partitioned tables the column is omitted. Values come directly from the checkpoint's
     /// native `partitionValues_parsed` column when present and compatible, otherwise from parsing
-    /// the string map.
+    /// the string map. [`ScanMetadata::partition_values_source`] reports which one a batch used.
     pub fn with_struct() -> Self {
         Self {
             parsed_struct: true,
@@ -945,17 +958,40 @@ pub struct ScanMetadata {
     /// Note: This vector can be indexed by row number, as rows masked by the selection vector will
     /// have corresponding entries that will be `None`.
     pub scan_file_transforms: Vec<Option<ExpressionRef>>,
+
+    partition_values_source: Option<ParsedColumnSource>,
 }
 
 impl ScanMetadata {
+    /// Where this batch's `partitionValues_parsed` column came from, or `None` when the batch has
+    /// no such column.
+    ///
+    /// A connector that caches parsed partition values across queries with different
+    /// [`PartitionValuesOptions::with_timestamp_timezone`] settings can reuse
+    /// [`ParsedColumnSource::Checkpoint`] values, which are fixed instants. Values from
+    /// [`ParsedColumnSource::Derived`] batches depend on the configured timezone for offset-less
+    /// `TIMESTAMP` partition strings.
+    ///
+    /// Kernel emits the column when [`PartitionValuesOptions::with_struct`] is set, and when the
+    /// scan predicate references a partition column. A batch never mixes sources:
+    /// checkpoint batches report `Checkpoint` when the checkpoint has a compatible native
+    /// `partitionValues_parsed` column, and `Derived` otherwise; commit batches always report
+    /// `Derived`. `Scan::scan_metadata_from` and `parallel_scan_metadata` always report
+    /// `Derived` when they emit the column.
+    pub fn partition_values_source(&self) -> Option<ParsedColumnSource> {
+        self.partition_values_source
+    }
+
     fn try_new(
         data: Box<dyn EngineData>,
         selection_vector: Vec<bool>,
         scan_file_transforms: Vec<Option<ExpressionRef>>,
+        partition_values_source: Option<ParsedColumnSource>,
     ) -> KernelResult<Self> {
         Ok(Self {
             scan_files: FilteredEngineData::try_new(data, selection_vector)?,
             scan_file_transforms,
+            partition_values_source,
         })
     }
 }

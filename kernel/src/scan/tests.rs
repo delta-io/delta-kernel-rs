@@ -2,6 +2,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
+use ::test_utils::table_builder::{DataLayoutConfig, LogState, TableConfig, TestTableBuilder};
 use ::test_utils::{assert_result_error_with_message, get_column, load_test_data};
 use bytes::Bytes;
 use rstest::rstest;
@@ -706,15 +707,7 @@ fn test_scan_metadata_from_same_version() {
     let files: Vec<_> = scan
         .scan_metadata(engine.as_ref())
         .unwrap()
-        .map_ok(|ScanMetadata { scan_files, .. }| {
-            let (underlying_data, selection_vector) = scan_files.into_parts();
-            let batch: RecordBatch = ArrowEngineData::try_from_engine_data(underlying_data)
-                .unwrap()
-                .into();
-            let filtered_batch =
-                filter_record_batch(&batch, &BooleanArray::from(selection_vector)).unwrap();
-            Box::new(ArrowEngineData::from(filtered_batch)) as Box<dyn EngineData>
-        })
+        .map_ok(selected_scan_files)
         .try_collect()
         .unwrap();
     let new_files: Vec<_> = scan
@@ -724,6 +717,69 @@ fn test_scan_metadata_from_same_version() {
         .unwrap();
 
     assert_eq!(new_files.len(), 1);
+}
+
+/// `scan_metadata_from` derives `partitionValues_parsed` from the string map, both for cached
+/// metadata at the same version and for cached metadata plus newer commits.
+#[rstest]
+fn scan_metadata_from_reports_derived_partition_values_source(
+    #[values(1, 2)] existing_version: Version,
+) {
+    let table = TestTableBuilder::new()
+        .with_log_state(LogState::with_latest_version(2).with_checkpoint_at([1]))
+        .with_table_config(TableConfig::new().write_stats_as_struct(true))
+        .with_data_layout(DataLayoutConfig::PartitionedAllTypes)
+        .build()
+        .unwrap();
+    let engine = SyncEngine::new_with_store(table.store().clone());
+    let snapshot = Snapshot::builder_for(table.table_root())
+        .build(&engine)
+        .unwrap();
+    let cached: Vec<_> = snapshot
+        .clone()
+        .scan_builder()
+        .build()
+        .unwrap()
+        .scan_metadata(&engine)
+        .unwrap()
+        .map_ok(selected_scan_files)
+        .try_collect()
+        .unwrap();
+    let scan = snapshot
+        .scan_builder()
+        .with_partition_values(PartitionValuesOptions::with_struct())
+        .build()
+        .unwrap();
+
+    let batches: Vec<_> = scan
+        .scan_metadata_from(&engine, existing_version, cached, None)
+        .unwrap()
+        .try_collect()
+        .unwrap();
+
+    let mut selected_batches = 0;
+    for batch in batches {
+        if batch.scan_files.selection_vector().contains(&true) {
+            selected_batches += 1;
+            assert_eq!(
+                batch.partition_values_source(),
+                Some(ParsedColumnSource::Derived)
+            );
+        }
+    }
+    assert!(selected_batches > 0);
+}
+
+/// Keeps only the selected rows of a batch, in the form `scan_metadata_from` accepts as cached
+/// metadata.
+fn selected_scan_files(ScanMetadata { scan_files, .. }: ScanMetadata) -> Box<dyn EngineData> {
+    let (underlying_data, selection_vector) = scan_files.into_parts();
+    let batch: RecordBatch = ArrowEngineData::try_from_engine_data(underlying_data)
+        .unwrap()
+        .into();
+    let filtered_batch =
+        filter_record_batch(&batch, &BooleanArray::from(selection_vector)).unwrap();
+    Box::new(ArrowEngineData::from(filtered_batch))
 }
 
 #[rstest]
