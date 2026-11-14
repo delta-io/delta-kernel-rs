@@ -7,9 +7,7 @@ use crate::log_segment::{
     validate_commit_files_contiguous, validate_commit_files_sorted,
     validate_start_version_available,
 };
-use crate::log_segment_files::{
-    LogSegmentFiles, find_complete_checkpoint_version, parse_delta_log_listing,
-};
+use crate::log_segment_files::{LogSegmentFiles, parse_delta_log_listing};
 use crate::path::ParsedLogPath;
 use crate::snapshot::SnapshotRef;
 use crate::utils::require;
@@ -132,9 +130,7 @@ impl CommitRangeBuilder {
     ///
     /// Returns [`KernelError::MissingVersion`] if a snapshot-derived range requires a commit beyond
     /// what is available from the snapshot's log segment and the supplied catalog tail, or if the
-    /// listed commits are non-contiguous. An unbounded, validated path-based range also returns
-    /// this error if a later complete checkpoint implies missing trailing commit JSON files.
-    /// Returns [`KernelError::StartVersionNotFound`] (carrying
+    /// listed commits are non-contiguous. Returns [`KernelError::StartVersionNotFound`] (carrying
     /// the earliest still-available version) if the requested start is unavailable but later
     /// versions exist, [`KernelError::EmptyLog`] if nothing is available in the requested range at
     /// all, and [`KernelError::CommitRange`] if the resolved version range is invalid
@@ -214,26 +210,15 @@ impl CommitRangeBuilder {
                     &log_root,
                     configured_end_version.unwrap_or(Version::MAX),
                 );
-                let (commit_files, latest_complete_checkpoint_version) =
-                    Self::collect_commit_files(
-                        listing,
-                        log_tail,
-                        start_version,
-                        configured_end_version,
-                    )?;
+                let commit_files = Self::collect_commit_files(
+                    listing,
+                    log_tail,
+                    start_version,
+                    configured_end_version,
+                )?;
                 let latest_commit_version =
                     commit_files.last().ok_or(KernelError::EmptyLog)?.version;
-                // If a listing contains only 11.json, 12.json, and a complete checkpoint at 13, the
-                // table reached version 13 even though 13.json is missing. An unbounded validated
-                // range must report MissingVersion(13). Calling with_commit_range_validation(false)
-                // permits a range ending at 12.
-                let latest_version = if commit_range_validation {
-                    latest_commit_version
-                        .max(latest_complete_checkpoint_version.unwrap_or(latest_commit_version))
-                } else {
-                    latest_commit_version
-                };
-                let end_version = configured_end_version.unwrap_or(latest_version);
+                let end_version = configured_end_version.unwrap_or(latest_commit_version);
                 (commit_files, end_version)
             }
         };
@@ -305,33 +290,19 @@ impl CommitRangeBuilder {
     }
 
     /// Collects commit files from `file_listing` and the supplied log tail.
-    ///
-    /// Also returns the latest complete checkpoint version found in the listing. This lets callers
-    /// detect missing commit JSON files when a checkpoint is newer than the last listed commit.
     fn collect_commit_files(
         file_listing: impl KernelResultIterator<ParsedLogPath>,
         log_tail: Vec<ParsedLogPath>,
         start_version: Version,
         configured_end_version: Option<Version>,
-    ) -> KernelResult<(Vec<ParsedLogPath>, Option<Version>)> {
-        let mut checkpoint_parts = Vec::new();
-        let file_listing = file_listing.inspect(|file| {
-            if let Ok(file) = file
-                && file.is_checkpoint()
-            {
-                checkpoint_parts.push(file.clone());
-            }
-        });
-        let commit_files = LogSegmentFiles::from_commit_listing(
+    ) -> KernelResult<Vec<ParsedLogPath>> {
+        Ok(LogSegmentFiles::from_commit_listing(
             file_listing,
             log_tail,
             start_version,
             configured_end_version.unwrap_or(Version::MAX),
         )?
-        .ascending_commit_files;
-        let latest_complete_checkpoint_version =
-            find_complete_checkpoint_version(&checkpoint_parts);
-        Ok((commit_files, latest_complete_checkpoint_version))
+        .ascending_commit_files)
     }
 
     fn validate_complete_range(
@@ -550,7 +521,12 @@ mod tests {
     #[cfg_attr(not(feature = "declarative-plans"), rstest::rstest(declarative => [false]))]
     #[case::complete(&[11, 12, 13], "checkpoint.parquet", "checkpoint", None, true, Ok(13))]
     #[case::missing_middle(&[11, 13], "checkpoint.parquet", "checkpoint", None, true, Err(12))]
-    #[case::missing_terminal(&[11, 12], "checkpoint.parquet", "checkpoint", None, true, Err(13))]
+    #[case::unbounded_ends_at_last_commit(
+        &[11, 12], "checkpoint.parquet", "checkpoint", None, true, Ok(12)
+    )]
+    #[case::explicit_end_requires_commit_json(
+        &[11, 12], "checkpoint.parquet", "checkpoint", Some(13), true, Err(13)
+    )]
     #[case::validation_disabled(&[11, 12], "checkpoint.parquet", "checkpoint", None, false, Ok(12))]
     #[case::explicit_end_before_checkpoint(
         &[11, 12, 13], "checkpoint.parquet", "checkpoint", Some(12), true, Ok(12)
@@ -559,7 +535,7 @@ mod tests {
         &[11, 12], "checkpoint.0000000001.0000000002.parquet", "checkpoint", None, true, Ok(12)
     )]
     #[case::empty_checkpoint(&[11, 12], "checkpoint.parquet", "", None, true, Ok(12))]
-    fn test_checkpoint_does_not_replace_missing_commit_json(
+    fn test_commit_range_bounds_with_checkpoint(
         #[case] commit_versions: &[Version],
         #[case] checkpoint_suffix: &str,
         #[case] checkpoint_contents: &str,

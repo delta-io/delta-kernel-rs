@@ -179,9 +179,7 @@ fn group_checkpoint_parts(
 
 /// Returns the version of the latest complete checkpoint in `files`, or `None` if no complete
 /// checkpoint exists. Skips 0-byte checkpoint files so they don't count toward completeness.
-pub(crate) fn find_complete_checkpoint_version(
-    ascending_files: &[ParsedLogPath],
-) -> Option<Version> {
+fn find_complete_checkpoint_version(ascending_files: &[ParsedLogPath]) -> Option<Version> {
     ascending_files
         .iter()
         .filter(|f| f.is_checkpoint() && should_process_log_file(f))
@@ -605,7 +603,7 @@ impl LogSegmentFiles {
         let log_tail_start_version = log_tail.first().map(|file| file.version);
         let mut listed_commits = Vec::new();
         let mut max_published_version: Option<Version> = None;
-        // Filesystem commits, skipping any covered by the supplied tail.
+        // Filesystem commits, skipping any covered by log_tail.
         for file_result in filesystem_listing {
             let file = file_result?;
             if file.file_type != LogPathFileType::Commit {
