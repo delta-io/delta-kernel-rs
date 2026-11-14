@@ -12,12 +12,15 @@ use delta_kernel::committer::{
 use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::engine_data::FilteredEngineData;
-use delta_kernel::expressions::Scalar;
-use delta_kernel::schema::{SchemaRef, schema_ref};
+use delta_kernel::expressions::{ColumnName, Scalar};
+use delta_kernel::schema::{
+    ArrayType, DataType, MapType, MetadataValue, SchemaRef, StructField, StructType, schema,
+    schema_ref,
+};
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
 use delta_kernel::transaction::{CommitResult, UpdateTableOperation};
-use delta_kernel::{Engine, KernelError, KernelResult, KernelResultIterator, Snapshot};
+use delta_kernel::{Engine, KernelError, KernelResult, KernelResultIterator, Result, Snapshot};
 use rstest::rstest;
 use test_utils::{
     assert_batches_sorted_eq, assert_result_error_with_message, read_actions_from_commit,
@@ -38,7 +41,7 @@ fn batch(schema: &SchemaRef, columns: Vec<ArrayRef>) -> KernelResult<ArrowEngine
 async fn overwrite_removes_all_old_files_and_preserves_table_metadata(
     #[values(false, true)] overwrite_schema: bool,
     #[values(false, true)] empty_input: bool,
-) -> KernelResult<(), Box<dyn std::error::Error>> {
+) -> Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
     let original = schema_ref! { nullable "id": INTEGER, nullable "legacy": STRING };
     let snapshot = create_table(&table_path, original.clone(), "test", true)
@@ -150,7 +153,9 @@ async fn overwrite_removes_all_old_files_and_preserves_table_metadata(
 
     // Compare the complete action because table identity and creation fields have no public getter.
     let mut metadata = read_actions_from_commit(&url, 0, "metaData")?.remove(0);
-    metadata["schemaString"] = serde_json::to_string(target.as_ref())?.into();
+    metadata["schemaString"] = serde_json::to_string(target.as_ref())
+        .map_err(KernelError::from)?
+        .into();
     assert_eq!(
         read_actions_from_commit(&url, 2, "metaData")?,
         vec![metadata]
@@ -173,12 +178,14 @@ async fn overwrite_removes_all_old_files_and_preserves_table_metadata(
 #[case::tighten_nullability_overwrite(schema_ref! { not_null "id": INTEGER }, true, true)]
 #[case::rename(schema_ref! { nullable "renamed": INTEGER }, false, false)]
 #[case::rename_overwrite(schema_ref! { nullable "renamed": INTEGER }, true, true)]
+#[case::drop_all(schema_ref! {}, false, false)]
+#[case::empty_overwrite(schema_ref! {}, true, false)]
 #[tokio::test]
 async fn overwrite_schema_uses_target_validation_instead_of_evolution(
     #[case] target: SchemaRef,
     #[case] overwrite_schema: bool,
     #[case] succeeds: bool,
-) -> KernelResult<()> {
+) -> Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
     let snapshot = create_table(
         &table_path,
@@ -219,7 +226,7 @@ async fn overwrite_rejects_incompatible_builder_intent(
     #[case] data_change: bool,
     #[case] blind: bool,
     #[case] message: &str,
-) -> KernelResult<()> {
+) -> Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
     let schema = schema_ref! { nullable "id": INTEGER };
     let snapshot = create_table(&table_path, schema.clone(), "test", true)
@@ -242,7 +249,7 @@ async fn overwrite_rejects_incompatible_builder_intent(
 }
 
 #[tokio::test]
-async fn overwrite_rejects_caller_removals() -> KernelResult<()> {
+async fn overwrite_rejects_caller_removals() -> Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
     let schema = schema_ref! { nullable "id": INTEGER };
     let snapshot = create_table(&table_path, schema.clone(), "test", true)
@@ -282,7 +289,7 @@ async fn overwrite_rejects_caller_removals() -> KernelResult<()> {
 #[tokio::test]
 async fn overwrite_conflicts_instead_of_committing_stale_removals(
     #[values(false, true)] concurrent_schema_change: bool,
-) -> KernelResult<(), Box<dyn std::error::Error>> {
+) -> Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
     let schema = schema_ref! { nullable "id": INTEGER };
     let source = create_table(&table_path, schema.clone(), "test", true)
@@ -337,7 +344,7 @@ async fn overwrite_conflicts_instead_of_committing_stale_removals(
 async fn overwrite_removes_partitioned_files_and_retains_dv_identity(
     #[values(false, true)] partitioned: bool,
     #[values(false, true)] with_dvs: bool,
-) -> KernelResult<()> {
+) -> Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
     let schema = schema_ref! { nullable "id": INTEGER, nullable "p": STRING };
     let builder = create_table(&table_path, schema, "test", true)
@@ -413,7 +420,7 @@ async fn overwrite_removes_partitioned_files_and_retains_dv_identity(
         if with_dvs {
             assert_eq!(
                 remove["deletionVector"],
-                serde_json::to_value(&descriptors[path])?
+                serde_json::to_value(&descriptors[path]).map_err(KernelError::from)?
             );
         } else {
             assert!(remove["deletionVector"].is_null());
@@ -426,7 +433,7 @@ async fn overwrite_removes_partitioned_files_and_retains_dv_identity(
 }
 
 #[tokio::test]
-async fn insert_with_evolved_schema_retains_existing_data() -> KernelResult<()> {
+async fn insert_with_evolved_schema_retains_existing_data() -> Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
     let schema = schema_ref! { nullable "id": INTEGER };
     let snapshot = create_table(&table_path, schema.clone(), "test", true)
@@ -497,7 +504,7 @@ async fn insert_with_evolved_schema_retains_existing_data() -> KernelResult<()> 
 async fn overwrite_validates_retained_partitioning(
     #[case] target: SchemaRef,
     #[case] message: &str,
-) -> KernelResult<()> {
+) -> Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
     let snapshot = create_table(
         &table_path,
@@ -522,12 +529,14 @@ async fn overwrite_validates_retained_partitioning(
 #[rstest]
 #[case::column_mapping("delta.columnMapping.mode", "name", "column mapping")]
 #[case::column_mapping_id("delta.columnMapping.mode", "id", "column mapping")]
+#[case::cdf("delta.enableChangeDataFeed", "true", "changeDataFeed")]
+#[case::row_tracking("delta.enableRowTracking", "true", "rowTracking")]
 #[tokio::test]
 async fn overwrite_rejects_unsupported_schema_combinations(
     #[case] property: &str,
     #[case] value: &str,
     #[case] message: &str,
-) -> KernelResult<()> {
+) -> Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
     let snapshot = create_table(
         &table_path,
@@ -576,7 +585,7 @@ impl Committer for FailOnceCommitter {
 }
 
 #[tokio::test]
-async fn overwrite_retry_regenerates_removals_without_duplicates() -> KernelResult<()> {
+async fn overwrite_retry_regenerates_removals_without_duplicates() -> Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
     let schema = schema_ref! { nullable "id": INTEGER };
     let snapshot = create_table(&table_path, schema.clone(), "test", true)
@@ -613,5 +622,187 @@ async fn overwrite_retry_regenerates_removals_without_duplicates() -> KernelResu
         .commit(engine.as_ref())?
         .unwrap_committed();
     assert_eq!(read_actions_from_commit(&url, 2, "remove")?.len(), 1);
+    Ok(())
+}
+
+#[rstest]
+#[tokio::test]
+async fn target_schema_evolves_nested_fields(
+    #[values("struct", "array", "map_key", "map_value")] container: &str,
+) -> Result<()> {
+    let wrap = |inner: StructType| -> DataType {
+        match container {
+            "struct" => inner.into(),
+            "array" => ArrayType::new(inner, true).into(),
+            "map_key" => MapType::new(inner, DataType::STRING, true).into(),
+            "map_value" => MapType::new(DataType::STRING, inner, true).into(),
+            _ => unreachable!(),
+        }
+    };
+    let original = Arc::new(StructType::try_new([StructField::nullable(
+        "nested",
+        wrap(schema! { not_null "value": INTEGER }),
+    )])?);
+    let target = Arc::new(StructType::try_new([StructField::nullable(
+        "nested",
+        wrap(schema! { nullable "value": INTEGER, nullable "added": STRING }),
+    )])?);
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+    let source = create_table(&table_path, original.clone(), "test", true)
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .commit(engine.as_ref())?
+        .unwrap_post_commit_snapshot();
+    let txn = source
+        .clone()
+        .update_table(UpdateTableOperation::Write, "test", true)
+        .with_schema(target.clone(), false)
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
+    assert_eq!(
+        txn.write_state()?
+            .write_context_builder()
+            .build()?
+            .physical_data_schema(),
+        &target
+    );
+    let result = txn.commit(engine.as_ref())?.unwrap_post_commit_snapshot();
+    assert_eq!(result.schema(), target);
+    assert_eq!(source.schema(), original);
+    Ok(())
+}
+
+#[rstest]
+#[case::array(
+    DataType::from(ArrayType::new(DataType::INTEGER, false)),
+    DataType::from(ArrayType::new(DataType::INTEGER, true))
+)]
+#[case::map(
+    DataType::from(MapType::new(DataType::STRING, DataType::INTEGER, false)),
+    DataType::from(MapType::new(DataType::STRING, DataType::INTEGER, true))
+)]
+#[tokio::test]
+async fn target_schema_rejects_collection_nullability_changes(
+    #[case] original: DataType,
+    #[case] target: DataType,
+) -> Result<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+    let original = Arc::new(StructType::try_new([StructField::nullable(
+        "items", original,
+    )])?);
+    let target = Arc::new(StructType::try_new([StructField::nullable(
+        "items", target,
+    )])?);
+    let source = create_table(&table_path, original, "test", true)
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .commit(engine.as_ref())?
+        .unwrap_post_commit_snapshot();
+    assert_result_error_with_message(
+        source
+            .update_table(UpdateTableOperation::Write, "test", true)
+            .with_schema(target, false)
+            .build(engine.as_ref(), Box::new(FileSystemCommitter::new())),
+        "Unsupported schema evolution at 'items'",
+    );
+    Ok(())
+}
+
+#[rstest]
+#[case::column_mapping_id("delta.columnMapping.id", MetadataValue::Number(1))]
+#[case::column_mapping_name("delta.columnMapping.physicalName", MetadataValue::String("col-1".into()))]
+#[case::identity("delta.identity.start", MetadataValue::Number(1))]
+#[case::generated("delta.generationExpression", MetadataValue::String("1".into()))]
+#[case::default("CURRENT_DEFAULT", MetadataValue::String("1".into()))]
+#[case::existing_default("EXISTS_DEFAULT", MetadataValue::String("1".into()))]
+#[case::type_changes("delta.typeChanges", MetadataValue::String("[]".into()))]
+#[tokio::test]
+async fn overwrite_rejects_unsupported_target_annotations(
+    #[case] annotation: &str,
+    #[case] value: MetadataValue,
+    #[values(false, true)] nested: bool,
+) -> Result<()> {
+    let field =
+        StructField::nullable("value", DataType::INTEGER).with_metadata([(annotation, value)]);
+    let target = StructType::try_new([field])?;
+    let target = if nested {
+        StructType::try_new([StructField::nullable(
+            "nested",
+            ArrayType::new(target, true),
+        )])?
+    } else {
+        target
+    };
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+    let source = create_table(
+        &table_path,
+        schema_ref! { nullable "id": INTEGER },
+        "test",
+        true,
+    )
+    .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+    .commit(engine.as_ref())?
+    .unwrap_post_commit_snapshot();
+    assert_result_error_with_message(
+        source
+            .update_table(UpdateTableOperation::Overwrite, "test", true)
+            .with_schema(Arc::new(target), true)
+            .build(engine.as_ref(), Box::new(FileSystemCommitter::new())),
+        &format!("Schema overwrite does not support column annotation '{annotation}'"),
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn target_schema_rejects_mixing_complete_and_incremental_changes() -> Result<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+    let schema = schema_ref! { nullable "id": INTEGER };
+    let source = create_table(&table_path, schema.clone(), "test", true)
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .commit(engine.as_ref())?
+        .unwrap_post_commit_snapshot();
+    assert_result_error_with_message(
+        source
+            .update_table(UpdateTableOperation::Overwrite, "test", true)
+            .with_schema(schema, true)
+            .add_column(StructField::nullable("added", DataType::STRING))
+            .build(engine.as_ref(), Box::new(FileSystemCommitter::new())),
+        "with_schema cannot be combined with incremental schema changes",
+    );
+    Ok(())
+}
+
+#[rstest]
+#[case::clustering(true, "clustering")]
+#[case::row_tracking(
+    false,
+    "Whole-table overwrite is not supported on tables with rowTracking"
+)]
+#[tokio::test]
+async fn overwrite_rejects_unsupported_table_features(
+    #[case] clustered: bool,
+    #[case] message: &str,
+) -> Result<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+    let schema = schema_ref! { nullable "id": INTEGER };
+    let builder = create_table(&table_path, schema.clone(), "test", true);
+    let builder = if clustered {
+        builder.with_data_layout(DataLayout::Clustered {
+            columns: vec![ColumnName::new(["id"])],
+        })
+    } else {
+        builder.with_table_properties([("delta.enableRowTracking", "true")])
+    };
+    let source = builder
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .commit(engine.as_ref())?
+        .unwrap_post_commit_snapshot();
+    let builder = source.update_table(UpdateTableOperation::Overwrite, "test", true);
+    let builder = if clustered {
+        builder.with_schema(schema, true)
+    } else {
+        builder
+    };
+    assert_result_error_with_message(
+        builder.build(engine.as_ref(), Box::new(FileSystemCommitter::new())),
+        message,
+    );
     Ok(())
 }

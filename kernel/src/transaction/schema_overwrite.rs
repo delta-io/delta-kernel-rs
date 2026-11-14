@@ -8,13 +8,13 @@ use crate::table_configuration::TableConfiguration;
 use crate::table_features::{ColumnMappingMode, Operation, TableFeature};
 use crate::transforms::{SchemaTransform, transform_output_type};
 use crate::utils::require;
-use crate::{KernelError, KernelResult};
+use crate::{KernelError, KernelResult, Result};
 
 pub(super) fn apply_target_schema(
     table_config: &TableConfiguration,
     target: SchemaRef,
     overwrite: bool,
-) -> KernelResult<TableConfiguration> {
+) -> Result<TableConfiguration> {
     if !overwrite {
         let mut operations = Vec::new();
         collect_evolution(
@@ -28,7 +28,7 @@ pub(super) fn apply_target_schema(
 
     require!(
         table_config.column_mapping_mode() == ColumnMappingMode::None,
-        KernelError::unsupported("Schema overwrite with column mapping is not supported")
+        KernelError::unsupported("Schema overwrite with column mapping is not supported").into()
     );
     for feature in [
         TableFeature::ClusteredTable,
@@ -40,6 +40,7 @@ pub(super) fn apply_target_schema(
             KernelError::unsupported(format!(
                 "Schema overwrite is not supported on tables with {feature} enabled"
             ))
+            .into()
         );
     }
     require!(
@@ -48,11 +49,11 @@ pub(super) fn apply_target_schema(
             .configuration()
             .keys()
             .any(|key| key.starts_with("delta.constraints.")),
-        KernelError::unsupported("Schema overwrite with CHECK constraints is not supported")
+        KernelError::unsupported("Schema overwrite with CHECK constraints is not supported").into()
     );
     require!(
         target.fields().next().is_some(),
-        KernelError::schema("Schema overwrite requires a nonempty target schema")
+        KernelError::schema("Schema overwrite requires a nonempty target schema").into()
     );
     StructType::ensure_no_metadata_columns(&mut target.fields())?;
     OverwriteAnnotationValidator.transform_struct(&target)?;
@@ -62,6 +63,7 @@ pub(super) fn apply_target_schema(
         require!(
             target.num_fields() > partitions.len(),
             KernelError::schema("Schema overwrite must retain at least one non-partition column")
+                .into()
         );
         for name in partitions {
             let field = target.field(name).ok_or_else(|| {
@@ -74,6 +76,7 @@ pub(super) fn apply_target_schema(
                 KernelError::schema(format!(
                     "Partition column '{name}' must have a primitive type"
                 ))
+                .into()
             );
         }
     }
