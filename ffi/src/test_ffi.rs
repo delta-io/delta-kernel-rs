@@ -148,6 +148,10 @@ pub unsafe extern "C" fn get_testing_kernel_expression() -> Handle<SharedExpress
         lit(false),
         lit(Scalar::Timestamp(50)),
         lit(Scalar::TimestampNtz(100)),
+        #[cfg(feature = "nanosecond-timestamps")]
+        lit(Scalar::TimestampNanos(150)),
+        #[cfg(feature = "nanosecond-timestamps")]
+        lit(Scalar::TimestampNanosNtz(200)),
         lit(Scalar::Date(32)),
         lit(0x0000deadbeefcafeu64.to_be_bytes().to_vec()),
         // Both the most and least significant u64 of the Decimal value will be 1
@@ -269,6 +273,10 @@ pub unsafe extern "C" fn get_simple_testing_kernel_expression() -> Handle<Shared
         lit(Scalar::Date(19000)),
         lit(Scalar::Timestamp(1234567890)),
         lit(Scalar::TimestampNtz(9876543210)),
+        #[cfg(feature = "nanosecond-timestamps")]
+        lit(Scalar::TimestampNanos(1_234_567_890_123_456_789)),
+        #[cfg(feature = "nanosecond-timestamps")]
+        lit(Scalar::TimestampNanosNtz(-987_654_321)),
         lit(
             Scalar::interval_year_month(-13, IntervalYearToMonthType::IntervalYearToMonth).unwrap(),
         ),

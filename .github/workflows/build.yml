@@ -408,7 +408,7 @@ jobs:
           cargo build --locked
           popd
           pushd ffi
-          cargo build --locked --features default-engine-rustls,test-ffi,tracing,delta-kernel-unity-catalog,geo-type-in-dev,udt-in-dev
+          cargo build --locked --features default-engine-rustls,test-ffi,tracing,delta-kernel-unity-catalog,geo-type-in-dev,udt-in-dev,nanosecond-timestamps
           popd
       - name: build and run read-table test
         run: |

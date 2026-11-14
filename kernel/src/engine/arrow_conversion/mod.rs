@@ -372,6 +372,15 @@ impl TryFromKernel<&DataType> for ArrowDataType {
                     PrimitiveType::TimestampNtz => {
                         Ok(ArrowDataType::Timestamp(TimeUnit::Microsecond, None))
                     }
+                    #[cfg(feature = "nanosecond-timestamps")]
+                    PrimitiveType::TimestampNanos => Ok(ArrowDataType::Timestamp(
+                        TimeUnit::Nanosecond,
+                        Some("UTC".into()),
+                    )),
+                    #[cfg(feature = "nanosecond-timestamps")]
+                    PrimitiveType::TimestampNanosNtz => {
+                        Ok(ArrowDataType::Timestamp(TimeUnit::Nanosecond, None))
+                    }
                     PrimitiveType::Void => Ok(ArrowDataType::Null),
                     PrimitiveType::IntervalYearMonth(_) => Ok(ArrowDataType::Int32),
                     PrimitiveType::IntervalDayTime(_) => Ok(ArrowDataType::Int64),
@@ -610,7 +619,21 @@ impl TryFromArrow<&ArrowDataType> for DataType {
             {
                 Ok(DataType::TIMESTAMP)
             }
+            #[cfg(feature = "nanosecond-timestamps")]
+            ArrowDataType::Timestamp(TimeUnit::Nanosecond, None) => {
+                Ok(DataType::TIMESTAMP_NANOS_NTZ)
+            }
+            #[cfg(feature = "nanosecond-timestamps")]
+            ArrowDataType::Timestamp(TimeUnit::Nanosecond, Some(tz))
+                if tz.eq_ignore_ascii_case("utc") =>
+            {
+                Ok(DataType::TIMESTAMP_NANOS)
+            }
+            // Fall back to converting nanosecond timestamps to microsecond when the
+            // nanosecond-timestamp feature is not enabled.
+            #[cfg(not(feature = "nanosecond-timestamps"))]
             ArrowDataType::Timestamp(TimeUnit::Nanosecond, None) => Ok(DataType::TIMESTAMP_NTZ),
+            #[cfg(not(feature = "nanosecond-timestamps"))]
             ArrowDataType::Timestamp(TimeUnit::Nanosecond, Some(tz))
                 if tz.eq_ignore_ascii_case("utc") =>
             {
@@ -815,6 +838,18 @@ mod tests {
         assert_eq!(ntz, DataType::TIMESTAMP_NTZ);
 
         Ok(())
+    }
+
+    // Timestamp stats are serialized with a hardcoded `Z` suffix, which is only correct when the
+    // Arrow timezone is UTC, so any other timezone must be rejected.
+    #[rstest]
+    fn test_non_utc_timestamp_conversion_fails(
+        #[values(TimeUnit::Millisecond, TimeUnit::Microsecond, TimeUnit::Nanosecond)]
+        unit: TimeUnit,
+        #[values("", "+08:00", "America/New_York")] timezone: &str,
+    ) {
+        let arrow_type = ArrowDataType::Timestamp(unit, Some(timezone.into()));
+        assert!(DataType::try_from_arrow(&arrow_type).is_err());
     }
 
     // void is inherently always-null, so nullable=false is semantically contradictory.

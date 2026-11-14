@@ -8,6 +8,8 @@
 mod tests {
     use std::sync::Arc;
 
+    #[cfg(feature = "nanosecond-timestamps")]
+    use delta_kernel::arrow::array::TimestampNanosecondArray;
     use delta_kernel::arrow::array::types::{
         Date32Type, Decimal128Type, Float32Type, Float64Type, Int32Type, TimestampMicrosecondType,
     };
@@ -501,6 +503,22 @@ mod tests {
         Arc::new(PrimitiveArray::<TimestampMicrosecondType>::from(vec![None::<i64>, None, None])) as ArrayRef,
         DataType::TIMESTAMP_NTZ,
     )]
+    #[cfg_attr(feature = "nanosecond-timestamps", case::timestamp_nanos(
+        Arc::new(TimestampNanosecondArray::from(vec![Some(1_000_000i64), Some(2_000_000), Some(3_000_123)])) as ArrayRef,
+        DataType::TIMESTAMP_NANOS,
+    ))]
+    #[cfg_attr(feature = "nanosecond-timestamps", case::timestamp_nanos_all_null(
+        Arc::new(TimestampNanosecondArray::from(vec![None::<i64>, None, None])) as ArrayRef,
+        DataType::TIMESTAMP_NANOS,
+    ))]
+    #[cfg_attr(feature = "nanosecond-timestamps", case::timestamp_nanos_ntz(
+        Arc::new(TimestampNanosecondArray::from(vec![Some(1_000_000i64), Some(2_000_000), Some(3_000_123)])) as ArrayRef,
+        DataType::TIMESTAMP_NANOS_NTZ,
+    ))]
+    #[cfg_attr(feature = "nanosecond-timestamps", case::timestamp_nanos_ntz_all_null(
+        Arc::new(TimestampNanosecondArray::from(vec![None::<i64>, None, None])) as ArrayRef,
+        DataType::TIMESTAMP_NANOS_NTZ,
+    ))]
     #[case::string(
         Arc::new(StringArray::from(vec![Some("a"), Some("b"), Some("c")])) as ArrayRef,
         DataType::STRING,

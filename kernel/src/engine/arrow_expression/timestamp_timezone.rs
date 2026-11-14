@@ -1,4 +1,4 @@
-//! Arrow reader-timezone handling for `TIMESTAMP` partition values.
+//! Arrow reader-timezone handling for `TIMESTAMP` and `TIMESTAMP_NANOS` partition values.
 //!
 //! Kernel never infers this timezone from the host or the Delta table. A connector supplies its
 //! reader/session timezone through [`MapToStructOptions`], and no option means UTC. Timestamp
@@ -12,7 +12,7 @@
 
 use std::str::FromStr;
 
-use chrono::{FixedOffset, LocalResult, NaiveDateTime, Offset, TimeDelta, TimeZone, Utc};
+use chrono::{DateTime, FixedOffset, LocalResult, NaiveDateTime, Offset, TimeDelta, TimeZone, Utc};
 use chrono_tz::Tz;
 
 use crate::arrow::compute::kernels::cast_utils::string_to_datetime;
@@ -71,7 +71,7 @@ impl TimestampTimezone {
         }
     }
 
-    /// Parses a partition timestamp into microseconds since the Unix epoch.
+    /// Parses a partition timestamp into a UTC DateTime.
     ///
     /// Arrow handles the timestamp grammar. An offset or timezone carried by `raw` takes
     /// precedence over the configured reader timezone. For an offset-less value in a named reader
@@ -83,12 +83,12 @@ impl TimestampTimezone {
     ///
     /// Arrow rejects both transition cases, so named timezones use a fallback only when Arrow
     /// cannot resolve the local timestamp.
-    pub(crate) fn parse_timestamp(self, raw: &str) -> Option<i64> {
+    pub(crate) fn parse_timestamp(self, raw: &str) -> Option<DateTime<Utc>> {
         match self {
             Self::Named(timezone) => parse_timestamp_in_named_timezone(raw, timezone),
             Self::Fixed(timezone) => string_to_datetime(&timezone, raw)
                 .ok()
-                .map(|timestamp| timestamp.timestamp_micros()),
+                .map(|timestamp| timestamp.to_utc()),
         }
     }
 }
@@ -126,13 +126,13 @@ fn parse_two_digits(value: &str) -> Option<i32> {
 }
 
 /// Parses with Arrow, resolving only named-zone clock transitions that Arrow rejects.
-fn parse_timestamp_in_named_timezone(raw: &str, timezone: Tz) -> Option<i64> {
+fn parse_timestamp_in_named_timezone(raw: &str, timezone: Tz) -> Option<DateTime<Utc>> {
     if let Ok(timestamp) = string_to_datetime(&timezone, raw) {
-        return Some(timestamp.timestamp_micros());
+        return Some(timestamp.to_utc());
     }
     let local_datetime = string_to_datetime(&Utc, raw).ok()?.naive_utc();
     match timezone.from_local_datetime(&local_datetime) {
-        LocalResult::Ambiguous(first, second) => Some(first.min(second).timestamp_micros()),
+        LocalResult::Ambiguous(first, second) => Some(first.min(second).to_utc()),
         LocalResult::None => resolve_nonexistent_local_timestamp(local_datetime, timezone),
         LocalResult::Single(_) => {
             // A unique local time means Arrow rejected the input for another reason.
@@ -142,7 +142,10 @@ fn parse_timestamp_in_named_timezone(raw: &str, timezone: Tz) -> Option<i64> {
 }
 
 /// Resolves a local timestamp skipped by a forward clock transition using the prior offset.
-fn resolve_nonexistent_local_timestamp(local_datetime: NaiveDateTime, timezone: Tz) -> Option<i64> {
+fn resolve_nonexistent_local_timestamp(
+    local_datetime: NaiveDateTime,
+    timezone: Tz,
+) -> Option<DateTime<Utc>> {
     // Walking back 48 hours finds the prior offset even when a zone skips a full calendar day.
     let offset = (1..=48).find_map(|hours| {
         let before_transition = local_datetime.checked_sub_signed(TimeDelta::hours(hours))?;
@@ -153,7 +156,7 @@ fn resolve_nonexistent_local_timestamp(local_datetime: NaiveDateTime, timezone: 
     })?;
     local_datetime
         .checked_sub_signed(TimeDelta::seconds(i64::from(offset.local_minus_utc())))
-        .map(|utc_datetime| utc_datetime.and_utc().timestamp_micros())
+        .map(|utc_datetime| utc_datetime.and_utc())
 }
 
 #[cfg(test)]
@@ -186,7 +189,9 @@ mod tests {
     fn applies_reader_offsets(#[case] timezone: &str, #[case] expected: &str) {
         let timezone = TimestampTimezone::try_from_options(&options(timezone)).unwrap();
         assert_eq!(
-            timezone.parse_timestamp("2024-01-15 12:30:45"),
+            timezone
+                .parse_timestamp("2024-01-15 12:30:45")
+                .map(|timestamp| timestamp.timestamp_micros()),
             Some(expected_timestamp_micros(expected))
         );
     }
@@ -225,7 +230,9 @@ mod tests {
     #[case::excess_fraction("2024-01-15 12:30:45.123456789123", "2024-01-15T12:30:45.123456Z")]
     fn parses_compatible_partition_timestamps(#[case] raw: &str, #[case] expected: &str) {
         assert_eq!(
-            TimestampTimezone::default().parse_timestamp(raw),
+            TimestampTimezone::default()
+                .parse_timestamp(raw)
+                .map(|timestamp| timestamp.timestamp_micros()),
             Some(expected_timestamp_micros(expected))
         );
     }

@@ -17,6 +17,7 @@ default = ["arrow"]
 arrow = ["arrow-60"]
 arrow-60 = ["delta_kernel/arrow-60", "delta_kernel_default_engine/arrow-60"]
 arrow-59 = ["delta_kernel/arrow-59", "delta_kernel_default_engine/arrow-59"]
+nanosecond-timestamps = ["delta_kernel/nanosecond-timestamps"]
 
 [dependencies]
 # NOTE: We MUST build with SOME arrow version (or compilation would fail). So we pull in `arrow-59`,

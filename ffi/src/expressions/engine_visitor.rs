@@ -292,6 +292,12 @@ pub struct EngineExpressionVisitor {
         result_list_id: usize,
         else_list_id: usize,
     ),
+    /// Visit a 64bit timestamp belonging to the list identified by `sibling_list_id`.
+    /// The timestamp is nanosecond precision and adjusted to UTC.
+    pub visit_literal_timestamp_nanos: VisitLiteralFn<i64>,
+    /// Visit a 64bit timestamp belonging to the list identified by `sibling_list_id`.
+    /// The timestamp is nanosecond precision with no timezone.
+    pub visit_literal_timestamp_nanos_ntz: VisitLiteralFn<i64>,
 }
 
 /// Visit the expression of the passed [`SharedExpression`] Handle using the provided `visitor`.
@@ -599,6 +605,24 @@ fn visit_expression_scalar(
         Scalar::TimestampNtz(val) => {
             call!(visitor, visit_literal_timestamp_ntz, sibling_list_id, *val)
         }
+        #[cfg(feature = "nanosecond-timestamps")]
+        Scalar::TimestampNanos(val) => {
+            call!(
+                visitor,
+                visit_literal_timestamp_nanos,
+                sibling_list_id,
+                *val
+            )
+        }
+        #[cfg(feature = "nanosecond-timestamps")]
+        Scalar::TimestampNanosNtz(val) => {
+            call!(
+                visitor,
+                visit_literal_timestamp_nanos_ntz,
+                sibling_list_id,
+                *val
+            )
+        }
         Scalar::Date(val) => call!(visitor, visit_literal_date, sibling_list_id, *val),
         Scalar::Binary(buf) => call!(
             visitor,
@@ -828,6 +852,22 @@ mod tests {
 
     #[derive(Debug, PartialEq, Eq)]
     enum LiteralEvent {
+        Timestamp {
+            sibling_list_id: usize,
+            value: i64,
+        },
+        TimestampNtz {
+            sibling_list_id: usize,
+            value: i64,
+        },
+        TimestampNanos {
+            sibling_list_id: usize,
+            value: i64,
+        },
+        TimestampNanosNtz {
+            sibling_list_id: usize,
+            value: i64,
+        },
         IntervalYearMonth {
             sibling_list_id: usize,
             value: i32,
@@ -878,6 +918,50 @@ mod tests {
             sibling_list_id,
             child_list_id,
             timestamp_timezone,
+        });
+    }
+
+    extern "C" fn visit_literal_timestamp(data: *mut c_void, sibling_list_id: usize, value: i64) {
+        let builder = unsafe { &mut *(data as *mut TestExpressionBuilder) };
+        builder.events.push(LiteralEvent::Timestamp {
+            sibling_list_id,
+            value,
+        });
+    }
+
+    extern "C" fn visit_literal_timestamp_ntz(
+        data: *mut c_void,
+        sibling_list_id: usize,
+        value: i64,
+    ) {
+        let builder = unsafe { &mut *(data as *mut TestExpressionBuilder) };
+        builder.events.push(LiteralEvent::TimestampNtz {
+            sibling_list_id,
+            value,
+        });
+    }
+
+    extern "C" fn visit_literal_timestamp_nanos(
+        data: *mut c_void,
+        sibling_list_id: usize,
+        value: i64,
+    ) {
+        let builder = unsafe { &mut *(data as *mut TestExpressionBuilder) };
+        builder.events.push(LiteralEvent::TimestampNanos {
+            sibling_list_id,
+            value,
+        });
+    }
+
+    extern "C" fn visit_literal_timestamp_nanos_ntz(
+        data: *mut c_void,
+        sibling_list_id: usize,
+        value: i64,
+    ) {
+        let builder = unsafe { &mut *(data as *mut TestExpressionBuilder) };
+        builder.events.push(LiteralEvent::TimestampNanosNtz {
+            sibling_list_id,
+            value,
         });
     }
 
@@ -979,8 +1063,10 @@ mod tests {
             visit_literal_double: ignore_f64,
             visit_literal_string: ignore_string_slice,
             visit_literal_bool: ignore_bool,
-            visit_literal_timestamp: ignore_i64,
-            visit_literal_timestamp_ntz: ignore_i64,
+            visit_literal_timestamp,
+            visit_literal_timestamp_ntz,
+            visit_literal_timestamp_nanos,
+            visit_literal_timestamp_nanos_ntz,
             visit_literal_date: ignore_i32,
             visit_literal_interval_year_month,
             visit_literal_interval_day_time,
@@ -1087,6 +1173,72 @@ mod tests {
         LiteralEvent::IntervalDayTime { sibling_list_id: 0, value: i64::MAX }
     )]
     fn visit_expression_uses_interval_literal_callbacks(
+        #[case] expression: Expression,
+        #[case] expected: LiteralEvent,
+    ) {
+        let mut builder = TestExpressionBuilder::default();
+        let mut visitor = test_visitor(&mut builder);
+
+        let top_level_id = visit_expression_internal(&expression, &mut visitor);
+
+        assert_eq!(top_level_id, 0);
+        assert_eq!(builder.events, vec![expected]);
+    }
+
+    #[rstest]
+    #[case(lit(Scalar::Timestamp(0)), LiteralEvent::Timestamp { sibling_list_id: 0, value: 0 })]
+    #[case(
+        lit(Scalar::Timestamp(i64::MIN)),
+        LiteralEvent::Timestamp { sibling_list_id: 0, value: i64::MIN }
+    )]
+    #[case(
+        lit(Scalar::TimestampNtz(i64::MAX)),
+        LiteralEvent::TimestampNtz { sibling_list_id: 0, value: i64::MAX }
+    )]
+    #[case(
+        lit(Scalar::TimestampNtz(-1)),
+        LiteralEvent::TimestampNtz { sibling_list_id: 0, value: -1 }
+    )]
+    fn visit_expression_uses_timestamp_literal_callbacks(
+        #[case] expression: Expression,
+        #[case] expected: LiteralEvent,
+    ) {
+        let mut builder = TestExpressionBuilder::default();
+        let mut visitor = test_visitor(&mut builder);
+
+        let top_level_id = visit_expression_internal(&expression, &mut visitor);
+
+        assert_eq!(top_level_id, 0);
+        assert_eq!(builder.events, vec![expected]);
+    }
+
+    #[cfg(feature = "nanosecond-timestamps")]
+    #[rstest]
+    #[case(
+        lit(Scalar::TimestampNanos(1_234_567_890_123_456_789)),
+        LiteralEvent::TimestampNanos { sibling_list_id: 0, value: 1_234_567_890_123_456_789 }
+    )]
+    #[case(
+        lit(Scalar::TimestampNanos(-1)),
+        LiteralEvent::TimestampNanos { sibling_list_id: 0, value: -1 }
+    )]
+    #[case(
+        lit(Scalar::TimestampNanos(i64::MIN)),
+        LiteralEvent::TimestampNanos { sibling_list_id: 0, value: i64::MIN }
+    )]
+    #[case(
+        lit(Scalar::TimestampNanosNtz(987_654_321_987_654_321)),
+        LiteralEvent::TimestampNanosNtz { sibling_list_id: 0, value: 987_654_321_987_654_321 }
+    )]
+    #[case(
+        lit(Scalar::TimestampNanosNtz(0)),
+        LiteralEvent::TimestampNanosNtz { sibling_list_id: 0, value: 0 }
+    )]
+    #[case(
+        lit(Scalar::TimestampNanosNtz(i64::MAX)),
+        LiteralEvent::TimestampNanosNtz { sibling_list_id: 0, value: i64::MAX }
+    )]
+    fn visit_expression_uses_timestamp_nanos_literal_callbacks(
         #[case] expression: Expression,
         #[case] expected: LiteralEvent,
     ) {

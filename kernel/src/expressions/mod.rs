@@ -730,7 +730,7 @@ pub struct MapToStructOptions {
 }
 
 impl MapToStructOptions {
-    /// Interpret offset-less `TIMESTAMP` values in `timestamp_timezone`.
+    /// Interpret offset-less `TIMESTAMP` and `TIMESTAMP_NANOS` values in `timestamp_timezone`.
     ///
     /// Accepts an IANA timezone identifier, a fixed offset in `+HH:MM[:SS]` or `-HH:MM[:SS]` form,
     /// or `Z` for UTC. Named zones preserve their clock-transition rules; fixed offsets apply when

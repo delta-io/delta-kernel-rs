@@ -1,0 +1,3 @@
+{"commitInfo":{"timestamp":1792362972357,"operation":"CREATE TABLE","operationParameters":{},"kernelVersion":"v0.30.0","engineInfo":"Test/1.0","txnId":"83d7eb4f-8596-446a-833c-548aaead638e"}}
+{"protocol":{"minReaderVersion":3,"minWriterVersion":7,"readerFeatures":[],"writerFeatures":[]}}
+{"metaData":{"id":"d8bc4d02-0121-4d35-9517-b69e214b7216","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"EventTime\",\"type\":\"timestamp\",\"nullable\":true,\"metadata\":{}},{\"name\":\"UserId\",\"type\":\"long\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"createdTime":1792362972357,"configuration":{"delta.checkpoint.writeStatsAsStruct":"true","delta.checkpoint.writeStatsAsJson":"false"}}}

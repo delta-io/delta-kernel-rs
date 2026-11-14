@@ -170,7 +170,7 @@ impl ParquetStatsProvider for RowGroupFilter<'_> {
 
 /// Extracts the minimum stat value from a parquet column chunk, converting from the physical
 /// parquet type to the requested logical Delta type. INT64 timestamp stats are rescaled to
-/// microseconds using the column's Parquet annotation.
+/// the requested timestamp unit using the column's Parquet annotation.
 fn extract_min_scalar(data_type: &DataType, column: &ColumnChunkMetaData) -> Option<Scalar> {
     use PrimitiveType::*;
     let value = match (data_type.as_primitive_opt()?, column.statistics()?) {
@@ -198,6 +198,19 @@ fn extract_min_scalar(data_type: &DataType, column: &ColumnChunkMetaData) -> Opt
         (Binary, _) => return None,
         (Date, Statistics::Int32(s)) => Scalar::Date(*s.min_opt()?),
         (Date, _) => return None,
+        #[cfg(feature = "nanosecond-timestamps")]
+        (TimestampNanos, Statistics::Int64(s)) => Scalar::TimestampNanos(timestamp_stat_as_nanos(
+            *s.min_opt()?,
+            column.column_descr(),
+        )?),
+        #[cfg(feature = "nanosecond-timestamps")]
+        (TimestampNanos, _) => return None,
+        #[cfg(feature = "nanosecond-timestamps")]
+        (TimestampNanosNtz, Statistics::Int64(s)) => Scalar::TimestampNanosNtz(
+            timestamp_stat_as_nanos(*s.min_opt()?, column.column_descr())?,
+        ),
+        #[cfg(feature = "nanosecond-timestamps")]
+        (TimestampNanosNtz, _) => return None,
         (Timestamp, Statistics::Int64(s)) => Scalar::Timestamp(timestamp_stat_as_micros(
             *s.min_opt()?,
             column.column_descr(),
@@ -226,7 +239,7 @@ fn extract_min_scalar(data_type: &DataType, column: &ColumnChunkMetaData) -> Opt
 
 /// Extracts the maximum stat value from a parquet column chunk, converting from the physical
 /// parquet type to the requested logical Delta type. INT64 timestamp stats are rescaled to
-/// microseconds using the column's Parquet annotation.
+/// the requested timestamp unit using the column's Parquet annotation.
 fn extract_max_scalar(data_type: &DataType, column: &ColumnChunkMetaData) -> Option<Scalar> {
     use PrimitiveType::*;
     let value = match (data_type.as_primitive_opt()?, column.statistics()?) {
@@ -254,6 +267,19 @@ fn extract_max_scalar(data_type: &DataType, column: &ColumnChunkMetaData) -> Opt
         (Binary, _) => return None,
         (Date, Statistics::Int32(s)) => Scalar::Date(*s.max_opt()?),
         (Date, _) => return None,
+        #[cfg(feature = "nanosecond-timestamps")]
+        (TimestampNanos, Statistics::Int64(s)) => Scalar::TimestampNanos(timestamp_stat_as_nanos(
+            *s.max_opt()?,
+            column.column_descr(),
+        )?),
+        #[cfg(feature = "nanosecond-timestamps")]
+        (TimestampNanos, _) => return None,
+        #[cfg(feature = "nanosecond-timestamps")]
+        (TimestampNanosNtz, Statistics::Int64(s)) => Scalar::TimestampNanosNtz(
+            timestamp_stat_as_nanos(*s.max_opt()?, column.column_descr())?,
+        ),
+        #[cfg(feature = "nanosecond-timestamps")]
+        (TimestampNanosNtz, _) => return None,
         (Timestamp, Statistics::Int64(s)) => Scalar::Timestamp(timestamp_stat_as_micros(
             *s.max_opt()?,
             column.column_descr(),
@@ -320,21 +346,51 @@ fn timestamp_from_date(days: Option<&i32>) -> Option<Scalar> {
 /// Returns `None` for non-timestamp annotations or scaling overflow, so that bound cannot justify
 /// skipping a row group.
 fn timestamp_stat_as_micros(value: i64, column: &ColumnDescriptor) -> Option<i64> {
+    let unit = match timestamp_stat_unit(column) {
+        Some(unit) => unit,
+        None if column.logical_type_ref().is_none()
+            && column.converted_type() == ConvertedType::NONE =>
+        {
+            TimeUnit::MICROS
+        }
+        None => return None,
+    };
+    match unit {
+        TimeUnit::MILLIS => value.checked_mul(1_000),
+        TimeUnit::MICROS => Some(value),
+        // Match the reader's microsecond cast, which truncates toward zero even for negatives.
+        // Pruning could drop matching rows if predicates were evaluated at nanosecond
+        // precision.
+        TimeUnit::NANOS => Some(value / 1_000),
+    }
+}
+
+/// Converts an INT64 footer timestamp bound to the nanosecond value the reader returns.
+///
+/// The counterpart of [`timestamp_stat_as_micros`] for nanosecond read types, with the same
+/// metadata policy requirement. Rescaling to nanoseconds is exact, so only overflow is lossy.
+///
+/// Returns `None` for non-timestamp or missing annotations, or scaling overflow.
+#[cfg(feature = "nanosecond-timestamps")]
+fn timestamp_stat_as_nanos(value: i64, column: &ColumnDescriptor) -> Option<i64> {
+    match timestamp_stat_unit(column)? {
+        TimeUnit::MILLIS => value.checked_mul(1_000_000),
+        TimeUnit::MICROS => value.checked_mul(1_000),
+        TimeUnit::NANOS => Some(value),
+    }
+}
+
+/// Returns the unit of an INT64 column's timestamp annotation, from its logical type or legacy
+/// converted type. Returns `None` for unannotated columns and non-timestamp annotations.
+fn timestamp_stat_unit(column: &ColumnDescriptor) -> Option<TimeUnit> {
     match column.logical_type_ref() {
-        Some(LogicalType::Timestamp(timestamp)) => match timestamp.unit {
-            TimeUnit::MILLIS => value.checked_mul(1_000),
-            TimeUnit::MICROS => Some(value),
-            // Match the reader's microsecond cast, which truncates toward zero even for negatives.
-            // Pruning could drop matching rows if predicates were evaluated at nanosecond
-            // precision.
-            TimeUnit::NANOS => Some(value / 1_000),
-        },
+        Some(LogicalType::Timestamp(timestamp)) => Some(timestamp.unit),
+        Some(_) => None,
         None => match column.converted_type() {
-            ConvertedType::TIMESTAMP_MILLIS => value.checked_mul(1_000),
-            ConvertedType::TIMESTAMP_MICROS | ConvertedType::NONE => Some(value),
+            ConvertedType::TIMESTAMP_MILLIS => Some(TimeUnit::MILLIS),
+            ConvertedType::TIMESTAMP_MICROS => Some(TimeUnit::MICROS),
             _ => None,
         },
-        Some(_) => None,
     }
 }
 
@@ -507,18 +563,23 @@ impl ParquetStatsProvider for CheckpointRowGroupFilter<'_> {
 
 /// Adjusts a max stat value to account for millisecond truncation in JSON-serialized stats.
 /// `stats_parsed` inherits from JSON stats which truncate timestamps to millisecond precision:
-/// `stored_max <= actual_max <= stored_max + 999us`. Adding 999us ensures we never falsely
-/// prune files whose actual max exceeds the truncated value. Non-timestamp values pass through
-/// unchanged.
+/// `stored_max <= actual_max <= stored_max + max_gap`. Adding the maximum possible truncation gap
+/// ensures we never falsely prune files whose actual max exceeds the truncated value. The gap is
+/// one millisecond minus one unit, expressed in each type's resolution: 999us for microsecond
+/// timestamps, 999_999ns for nanosecond timestamps. Non-timestamp values pass through unchanged.
 ///
 /// See also [`DataSkippingPredicateCreator::adjust_scalar_for_max_stat_truncation`] in
 /// `scan/data_skipping.rs`, which handles the same truncation issue from the predicate side
-/// (subtracting 999us from the comparison value instead of adding to the stat).
+/// (subtracting the gap from the comparison value instead of adding to the stat).
 #[allow(dead_code)]
 fn adjust_stats_for_truncation(val: Scalar) -> Scalar {
     match val {
         Scalar::Timestamp(us) => Scalar::Timestamp(us.saturating_add(999)),
         Scalar::TimestampNtz(us) => Scalar::TimestampNtz(us.saturating_add(999)),
+        #[cfg(feature = "nanosecond-timestamps")]
+        Scalar::TimestampNanos(ns) => Scalar::TimestampNanos(ns.saturating_add(999_999)),
+        #[cfg(feature = "nanosecond-timestamps")]
+        Scalar::TimestampNanosNtz(ns) => Scalar::TimestampNanosNtz(ns.saturating_add(999_999)),
         other => other,
     }
 }

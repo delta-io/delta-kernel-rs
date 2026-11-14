@@ -349,6 +349,24 @@ DEFINE_VISIT_SIMPLE_TYPE(timestamp_ntz)
 DEFINE_VISIT_SIMPLE_TYPE(void)
 DEFINE_VISIT_SIMPLE_TYPE(variant)
 
+void visit_timestamp_nanos(void* data,
+                           uintptr_t sibling_list_id,
+                           struct KernelStringSlice name,
+                           bool is_nullable,
+                           const CMetadataMap * metadata)
+{
+  visit_simple_type(data, sibling_list_id, name, is_nullable, metadata, "timestamp_ltz(9)");
+}
+
+void visit_timestamp_nanos_ntz(void* data,
+                               uintptr_t sibling_list_id,
+                               struct KernelStringSlice name,
+                               bool is_nullable,
+                               const CMetadataMap * metadata)
+{
+  visit_simple_type(data, sibling_list_id, name, is_nullable, metadata, "timestamp_ntz(9)");
+}
+
 void visit_interval_year_month(void* data,
                                uintptr_t sibling_list_id,
                                struct KernelStringSlice name,
@@ -477,6 +495,8 @@ CSchema* build_cschema(SharedSchema* schema, SharedExternEngine* engine)
     .visit_interval_day_time = visit_interval_day_time,
     .visit_void = visit_void,
     .visit_variant = visit_variant,
+    .visit_timestamp_nanos = visit_timestamp_nanos,
+    .visit_timestamp_nanos_ntz = visit_timestamp_nanos_ntz,
   };
   uintptr_t schema_list_id = visit_schema(schema, &visitor);
 #ifdef VERBOSE

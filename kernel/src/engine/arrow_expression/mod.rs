@@ -103,6 +103,11 @@ impl Scalar {
                 // timezone was already set at builder construction time
                 append_val_n_as!(array::TimestampMicrosecondBuilder, *val)
             }
+            #[cfg(feature = "nanosecond-timestamps")]
+            TimestampNanos(val) | TimestampNanosNtz(val) => {
+                // timezone was already set at builder construction time
+                append_val_n_as!(array::TimestampNanosecondBuilder, *val)
+            }
             IntervalYearMonth(val) => append_val_n_as!(array::Int32Builder, val.months()),
             IntervalDayTime(val) => append_val_n_as!(array::Int64Builder, val.micros()),
             Date(val) => append_val_n_as!(array::Date32Builder, *val),
@@ -186,6 +191,10 @@ impl Scalar {
             DataType::BOOLEAN => append_nulls_as!(array::BooleanBuilder),
             DataType::TIMESTAMP | DataType::TIMESTAMP_NTZ => {
                 append_nulls_as!(array::TimestampMicrosecondBuilder)
+            }
+            #[cfg(feature = "nanosecond-timestamps")]
+            DataType::TIMESTAMP_NANOS | DataType::TIMESTAMP_NANOS_NTZ => {
+                append_nulls_as!(array::TimestampNanosecondBuilder)
             }
             DataType::DATE => append_nulls_as!(array::Date32Builder),
             DataType::BINARY => append_nulls_as!(array::BinaryBuilder),
@@ -520,15 +529,32 @@ fn primitive_types_compatible(expected: &PrimitiveType, data_type: &ArrowDataTyp
                 None,
             ),
         ) => true,
+        #[cfg(feature = "nanosecond-timestamps")]
+        (PrimitiveType::TimestampNanos, ArrowDataType::Timestamp(TimeUnit::Nanosecond, tz)) => {
+            tz.as_deref().is_some_and(|tz| !tz.is_empty())
+        }
+        #[cfg(feature = "nanosecond-timestamps")]
+        (PrimitiveType::TimestampNanosNtz, ArrowDataType::Timestamp(TimeUnit::Nanosecond, tz)) => {
+            tz.as_deref().is_none_or(str::is_empty)
+        }
         (PrimitiveType::Void, ArrowDataType::Null) => true,
         (PrimitiveType::IntervalYearMonth(_), ArrowDataType::Int32 | ArrowDataType::UInt32) => true,
         (PrimitiveType::IntervalDayTime(_), ArrowDataType::Int64 | ArrowDataType::UInt64) => true,
         _ => false,
     }
 }
+
 #[cfg(test)]
 fn expected_timestamp_micros(value: &str) -> i64 {
     chrono::DateTime::parse_from_rfc3339(value)
         .unwrap()
         .timestamp_micros()
+}
+
+#[cfg(all(test, feature = "nanosecond-timestamps"))]
+fn expected_timestamp_nanos(value: &str) -> i64 {
+    chrono::DateTime::parse_from_rfc3339(value)
+        .unwrap()
+        .timestamp_nanos_opt()
+        .unwrap()
 }

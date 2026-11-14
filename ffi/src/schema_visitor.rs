@@ -563,6 +563,114 @@ pub unsafe extern "C" fn visit_field_interval_day_time(
     unsafe { result.into_extern_result(&*error_allocators) }
 }
 
+/// Visit a `timestamp_ltz(9)` field. Similar to timestamp but nanosecond resolution.
+///
+/// Returns an error if kernel was not built with the `nanosecond-timestamps` feature.
+///
+/// # Safety
+///
+/// `error_allocators` must be non-null, aligned, and point to an initialized [`ErrorAllocators`]
+/// for this call. Its callbacks and context must satisfy [`ErrorAllocators`]'s requirements
+/// until this call returns.
+///
+/// `state` must be valid, and `name` must reference valid UTF-8 data for the call. Non-null
+/// `metadata` must point to a valid descriptor and callback.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn visit_field_timestamp_nanos(
+    state: &mut KernelSchemaVisitorState,
+    name: KernelStringSlice,
+    nullable: bool,
+    metadata: *const EngineMetadata,
+    error_allocators: *const ErrorAllocators,
+) -> ExternResult<usize> {
+    let name_str = unsafe { TryFromStringSlice::try_from_slice(&name) };
+    let result = visit_field_timestamp_nanos_impl(state, name_str, nullable, metadata);
+    unsafe { result.into_extern_result(&*error_allocators) }
+}
+
+#[cfg(feature = "nanosecond-timestamps")]
+fn visit_field_timestamp_nanos_impl(
+    state: &mut KernelSchemaVisitorState,
+    name: KernelResult<&str>,
+    nullable: bool,
+    metadata: *const EngineMetadata,
+) -> KernelResult<usize> {
+    let metadata = visit_engine_metadata(unsafe { metadata.as_ref() });
+    visit_field_primitive_impl(
+        state,
+        name,
+        PrimitiveType::TimestampNanos,
+        nullable,
+        metadata,
+    )
+}
+
+#[cfg(not(feature = "nanosecond-timestamps"))]
+fn visit_field_timestamp_nanos_impl(
+    _state: &mut KernelSchemaVisitorState,
+    _name: KernelResult<&str>,
+    _nullable: bool,
+    _metadata: *const EngineMetadata,
+) -> KernelResult<usize> {
+    Err(KernelError::unsupported(
+        "`nanosecond-timestamps` feature not enabled in delta-kernel",
+    ))
+}
+
+/// Visit a `timestamp_ntz(9)` field. Similar to timestamp_ntz but nanosecond resolution.
+///
+/// Returns an error if kernel was not built with the `nanosecond-timestamps` feature.
+///
+/// # Safety
+///
+/// `error_allocators` must be non-null, aligned, and point to an initialized [`ErrorAllocators`]
+/// for this call. Its callbacks and context must satisfy [`ErrorAllocators`]'s requirements
+/// until this call returns.
+///
+/// `state` must be valid, and `name` must reference valid UTF-8 data for the call. Non-null
+/// `metadata` must point to a valid descriptor and callback.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn visit_field_timestamp_nanos_ntz(
+    state: &mut KernelSchemaVisitorState,
+    name: KernelStringSlice,
+    nullable: bool,
+    metadata: *const EngineMetadata,
+    error_allocators: *const ErrorAllocators,
+) -> ExternResult<usize> {
+    let name_str = unsafe { TryFromStringSlice::try_from_slice(&name) };
+    let result = visit_field_timestamp_nanos_ntz_impl(state, name_str, nullable, metadata);
+    unsafe { result.into_extern_result(&*error_allocators) }
+}
+
+#[cfg(feature = "nanosecond-timestamps")]
+fn visit_field_timestamp_nanos_ntz_impl(
+    state: &mut KernelSchemaVisitorState,
+    name: KernelResult<&str>,
+    nullable: bool,
+    metadata: *const EngineMetadata,
+) -> KernelResult<usize> {
+    let metadata = visit_engine_metadata(unsafe { metadata.as_ref() });
+    visit_field_primitive_impl(
+        state,
+        name,
+        PrimitiveType::TimestampNanosNtz,
+        nullable,
+        metadata,
+    )
+}
+
+#[cfg(not(feature = "nanosecond-timestamps"))]
+fn visit_field_timestamp_nanos_ntz_impl(
+    _state: &mut KernelSchemaVisitorState,
+    _name: KernelResult<&str>,
+    _nullable: bool,
+    _metadata: *const EngineMetadata,
+) -> KernelResult<usize> {
+    Err(KernelError::unsupported(
+        "`nanosecond-timestamps` feature not enabled in delta-kernel",
+    ))
+}
+
 /// Visit a void field. Void fields are not materialized in data files and read as all-null columns.
 ///
 /// # Safety
@@ -2158,6 +2266,8 @@ mod tests {
         //   col_date: date,
         //   col_timestamp: timestamp,
         //   col_timestamp_ntz: timestamp_ntz,
+        //   col_timestamp_nanos: timestamp_nanos,
+        //   col_timestamp_nanos_ntz: timestamp_nanos_ntz,
         //   col_interval_year_month: interval year to month,
         //   col_interval_day_time: interval day to second,
         //   col_void: void,
@@ -2186,6 +2296,17 @@ mod tests {
         let col_timestamp = visit_field!(timestamp, state, "col_timestamp", false, null());
         let col_timestamp_ntz =
             visit_field!(timestamp_ntz, state, "col_timestamp_ntz", false, null());
+        #[cfg(feature = "nanosecond-timestamps")]
+        let col_timestamp_nanos =
+            visit_field!(timestamp_nanos, state, "col_timestamp_nanos", false, null());
+        #[cfg(feature = "nanosecond-timestamps")]
+        let col_timestamp_nanos_ntz = visit_field!(
+            timestamp_nanos_ntz,
+            state,
+            "col_timestamp_nanos_ntz",
+            false,
+            null()
+        );
         let col_interval_year_month = visit_field!(
             interval_year_month,
             state,
@@ -2267,6 +2388,10 @@ mod tests {
             col_date,
             col_timestamp,
             col_timestamp_ntz,
+            #[cfg(feature = "nanosecond-timestamps")]
+            col_timestamp_nanos,
+            #[cfg(feature = "nanosecond-timestamps")]
+            col_timestamp_nanos_ntz,
             col_interval_year_month,
             col_interval_day_time,
             col_void,
@@ -2295,11 +2420,7 @@ mod tests {
         // Verify the schema
         let schema = extract_kernel_schema(&mut state, schema_id).unwrap();
         let fields: Vec<_> = schema.fields().collect();
-        #[cfg(feature = "geo-type-in-dev")]
-        let expected_len = 22;
-        #[cfg(not(feature = "geo-type-in-dev"))]
-        let expected_len = 20;
-        assert_eq!(fields.len(), expected_len);
+        assert_eq!(fields.len(), all_columns.len());
 
         // Validate the primitive fields
         let primitive_field_expectations = [
@@ -2315,6 +2436,10 @@ mod tests {
             ("col_date", PrimitiveType::Date),
             ("col_timestamp", PrimitiveType::Timestamp),
             ("col_timestamp_ntz", PrimitiveType::TimestampNtz),
+            #[cfg(feature = "nanosecond-timestamps")]
+            ("col_timestamp_nanos", PrimitiveType::TimestampNanos),
+            #[cfg(feature = "nanosecond-timestamps")]
+            ("col_timestamp_nanos_ntz", PrimitiveType::TimestampNanosNtz),
             (
                 "col_interval_year_month",
                 PrimitiveType::interval_year_month(IntervalYearToMonthType::IntervalYearToMonth),
@@ -2337,25 +2462,32 @@ mod tests {
             assert!(!fields[index].is_nullable());
         }
 
-        assert_eq!(fields[15].name(), "col_decimal");
-        let DataType::Primitive(PrimitiveType::Decimal(decimal_type)) = fields[15].data_type()
+        let num_primitive = primitive_field_expectations.len();
+        assert_eq!(fields[num_primitive].name(), "col_decimal");
+        let DataType::Primitive(PrimitiveType::Decimal(decimal_type)) =
+            fields[num_primitive].data_type()
         else {
             panic!("Field col_decimal is not a decimal type");
         };
         assert_eq!(decimal_type.precision(), 10);
         assert_eq!(decimal_type.scale(), 2);
 
-        assert_eq!(fields[16].name(), "col_array");
-        assert_array(fields[16], DataType::STRING, false);
+        assert_eq!(fields[num_primitive + 1].name(), "col_array");
+        assert_array(fields[num_primitive + 1], DataType::STRING, false);
 
-        assert_eq!(fields[17].name(), "col_map");
-        assert_map(fields[17], DataType::STRING, DataType::LONG, false);
+        assert_eq!(fields[num_primitive + 2].name(), "col_map");
+        assert_map(
+            fields[num_primitive + 2],
+            DataType::STRING,
+            DataType::LONG,
+            false,
+        );
 
-        assert_eq!(fields[18].name(), "col_struct");
-        assert_struct(fields[18], DataType::STRING, false);
+        assert_eq!(fields[num_primitive + 3].name(), "col_struct");
+        assert_struct(fields[num_primitive + 3], DataType::STRING, false);
 
-        assert_eq!(fields[19].name(), "col_variant");
-        let DataType::Variant(variant_type) = fields[19].data_type() else {
+        assert_eq!(fields[num_primitive + 4].name(), "col_variant");
+        let DataType::Variant(variant_type) = fields[num_primitive + 4].data_type() else {
             panic!("Expected variant type for col_variant");
         };
         let variant_fields: Vec<_> = variant_type.fields().collect();
@@ -2373,17 +2505,17 @@ mod tests {
 
         #[cfg(feature = "geo-type-in-dev")]
         {
-            assert_eq!(fields[20].name(), "col_geometry");
+            assert_eq!(fields[num_primitive + 5].name(), "col_geometry");
             let DataType::Primitive(PrimitiveType::Geometry(geometry_type)) =
-                fields[20].data_type()
+                fields[num_primitive + 5].data_type()
             else {
                 panic!("Field col_geometry is not a geometry type");
             };
             assert_eq!(geometry_type.crs(), "OGC:CRS84");
 
-            assert_eq!(fields[21].name(), "col_geography");
+            assert_eq!(fields[num_primitive + 6].name(), "col_geography");
             let DataType::Primitive(PrimitiveType::Geography(geography_type)) =
-                fields[21].data_type()
+                fields[num_primitive + 6].data_type()
             else {
                 panic!("Field col_geography is not a geography type");
             };

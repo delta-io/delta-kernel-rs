@@ -181,6 +181,12 @@ void print_tree_helper(ExpressionItem ref, int depth) {
         case TimestampNtz:
           printf("TimestampNtz(%lld)\n", (long long)lit->value.long_data);
           break;
+        case TimestampNanos:
+          printf("TimestampNanos(%lld)\n", (long long)lit->value.long_data);
+          break;
+        case TimestampNanosNtz:
+          printf("TimestampNanosNtz(%lld)\n", (long long)lit->value.long_data);
+          break;
         case Date:
           printf("Date(%d)\n", lit->value.integer_data);
           break;
@@ -211,7 +217,8 @@ void print_tree_helper(ExpressionItem ref, int depth) {
           static const char* null_type_names[] = {
             "Boolean", "Byte", "Short", "Integer", "Long", "Float",
             "Double", "String", "Binary", "Date", "Timestamp", "TimestampNtz",
-            "Decimal", "IntervalYearMonth", "IntervalDayTime",
+            "Decimal", "IntervalYearMonth", "IntervalDayTime", "TimestampNanos",
+            "TimestampNanosNtz",
           };
           const size_t null_type_count = sizeof(null_type_names) / sizeof(null_type_names[0]);
           struct NullTypeInfo* nt = &lit->value.null_type;

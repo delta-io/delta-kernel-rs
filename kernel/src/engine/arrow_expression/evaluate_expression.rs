@@ -1039,8 +1039,8 @@ fn coalesce_arrays(
 /// Parses one raw partition-value string into its target [`Scalar`], or `None` for a null value.
 ///
 /// An empty string casts via [`PrimitiveType::empty_string_partition_cast`].
-/// `timestamp_timezone` applies only to `TIMESTAMP` values without an embedded offset or named
-/// timezone; it does not affect `DATE` or `TIMESTAMP_NTZ`.
+/// `timestamp_timezone` applies only to `TIMESTAMP` and `TIMESTAMP_NANOS` values without an
+/// embedded offset or named timezone; it does not affect `DATE` or the NTZ timestamp types.
 fn parse_partition_scalar(
     prim: &PrimitiveType,
     raw: &str,
@@ -1049,26 +1049,41 @@ fn parse_partition_scalar(
     if raw.is_empty() {
         return Ok(prim.empty_string_partition_cast());
     }
+    let parse_error =
+        || KernelError::ParseError(raw.to_string(), DataType::Primitive(prim.clone()));
     match prim {
         PrimitiveType::Date => {
-            let days = Date32Type::parse(raw).ok_or_else(|| {
-                KernelError::ParseError(raw.to_string(), DataType::Primitive(prim.clone()))
-            })?;
+            let days = Date32Type::parse(raw).ok_or_else(parse_error)?;
             return Ok(Some(Scalar::Date(days)));
         }
         PrimitiveType::Timestamp => {
-            let micros = timestamp_timezone.parse_timestamp(raw).ok_or_else(|| {
-                KernelError::ParseError(raw.to_string(), DataType::Primitive(prim.clone()))
-            })?;
+            let micros = timestamp_timezone
+                .parse_timestamp(raw)
+                .ok_or_else(parse_error)?
+                .timestamp_micros();
             return Ok(Some(Scalar::Timestamp(micros)));
         }
         PrimitiveType::TimestampNtz => {
             let micros = string_to_datetime(&Utc, raw)
-                .map_err(|_| {
-                    KernelError::ParseError(raw.to_string(), DataType::Primitive(prim.clone()))
-                })?
+                .map_err(|_| parse_error())?
                 .timestamp_micros();
             return Ok(Some(Scalar::TimestampNtz(micros)));
+        }
+        #[cfg(feature = "nanosecond-timestamps")]
+        PrimitiveType::TimestampNanos => {
+            let nanos = timestamp_timezone
+                .parse_timestamp(raw)
+                .and_then(|timestamp| timestamp.timestamp_nanos_opt())
+                .ok_or_else(parse_error)?;
+            return Ok(Some(Scalar::TimestampNanos(nanos)));
+        }
+        #[cfg(feature = "nanosecond-timestamps")]
+        PrimitiveType::TimestampNanosNtz => {
+            let nanos = string_to_datetime(&Utc, raw)
+                .ok()
+                .and_then(|timestamp| timestamp.timestamp_nanos_opt())
+                .ok_or_else(parse_error)?;
+            return Ok(Some(Scalar::TimestampNanosNtz(nanos)));
         }
         _ => {}
     }
@@ -1079,7 +1094,8 @@ fn parse_partition_scalar(
 /// Evaluates `MAP_TO_STRUCT(map_col, output_schema)`: extracts keys from a `Map<String, String>`
 /// and parses each value into its target type, producing a `StructArray`. An empty-string value
 /// casts via [`PrimitiveType::empty_string_partition_cast`].
-/// `timestamp_timezone` controls `TIMESTAMP` values without an embedded offset or named timezone.
+/// `timestamp_timezone` controls `TIMESTAMP` and `TIMESTAMP_NANOS` values without an embedded
+/// offset or named timezone.
 ///
 /// - Missing keys produce null values
 /// - Parse errors are propagated (indicating a broken table)
@@ -1215,9 +1231,14 @@ mod tests {
     use std::sync::Arc;
 
     use rstest::rstest;
+    use rstest_reuse::{apply, template};
 
     use super::super::expected_timestamp_micros;
+    #[cfg(feature = "nanosecond-timestamps")]
+    use super::super::expected_timestamp_nanos;
     use super::*;
+    #[cfg(feature = "nanosecond-timestamps")]
+    use crate::arrow::array::TimestampNanosecondArray;
     use crate::arrow::array::{
         ArrayData as ArrowArrayData, ArrayRef, BinaryArray, BooleanArray, Date32Array,
         Float32Array, Float64Array, Int32Array, Int64Array, LargeStringArray, ListArray,
@@ -3114,6 +3135,7 @@ mod tests {
         Ok(timestamps.is_valid(0).then(|| timestamps.value(0)))
     }
 
+    #[template]
     #[rstest]
     #[case::default_compatibility(
         None,
@@ -3186,15 +3208,104 @@ mod tests {
         "2024-10-05T15:45:00Z"
     )]
     #[case::skipped_day(Some("Pacific/Apia"), "2011-12-30 12:00:00", "2011-12-30T22:00:00Z")]
-    fn test_map_to_struct_timestamp_timezone(
+    fn timestamp_timezone_cases(
         #[case] timestamp_timezone: Option<&str>,
         #[case] raw: &str,
         #[case] expected: &str,
+    ) {
+    }
+
+    #[apply(timestamp_timezone_cases)]
+    fn test_map_to_struct_timestamp_timezone(
+        timestamp_timezone: Option<&str>,
+        raw: &str,
+        expected: &str,
     ) {
         assert_eq!(
             evaluate_map_timestamp_timezone(raw, DataType::TIMESTAMP, timestamp_timezone).unwrap(),
             Some(expected_timestamp_micros(expected))
         );
+    }
+
+    #[cfg(feature = "nanosecond-timestamps")]
+    fn evaluate_map_timestamp_nanos(
+        raw: &str,
+        target: DataType,
+        timestamp_timezone: Option<&str>,
+    ) -> KernelResult<Option<i64>> {
+        let field = evaluate_map_to_struct_field(raw, target, timestamp_timezone)?;
+        let timestamps = field
+            .as_any()
+            .downcast_ref::<TimestampNanosecondArray>()
+            .unwrap();
+        Ok(timestamps.is_valid(0).then(|| timestamps.value(0)))
+    }
+
+    #[cfg(feature = "nanosecond-timestamps")]
+    #[apply(timestamp_timezone_cases)]
+    fn test_map_to_struct_timestamp_nanos_timezone(
+        timestamp_timezone: Option<&str>,
+        raw: &str,
+        expected: &str,
+    ) {
+        assert_eq!(
+            evaluate_map_timestamp_nanos(raw, DataType::TIMESTAMP_NANOS, timestamp_timezone)
+                .unwrap(),
+            Some(expected_timestamp_nanos(expected))
+        );
+    }
+
+    #[cfg(feature = "nanosecond-timestamps")]
+    #[rstest]
+    #[case::iana_winter(
+        Some("America/Los_Angeles"),
+        "2024-01-15 12:30:45.123456789",
+        "2024-01-15T20:30:45.123456789Z"
+    )]
+    #[case::normalized_utc(
+        Some("America/Los_Angeles"),
+        "2024-01-15T12:30:45.123456789Z",
+        "2024-01-15T12:30:45.123456789Z"
+    )]
+    fn test_map_to_struct_timestamp_nanos_timezone_keeps_nanosecond_precision(
+        #[case] timestamp_timezone: Option<&str>,
+        #[case] raw: &str,
+        #[case] expected: &str,
+    ) {
+        assert_eq!(
+            evaluate_map_timestamp_nanos(raw, DataType::TIMESTAMP_NANOS, timestamp_timezone)
+                .unwrap(),
+            Some(expected_timestamp_nanos(expected))
+        );
+    }
+
+    #[cfg(feature = "nanosecond-timestamps")]
+    #[rstest]
+    #[case::space_separator("2024-01-15 12:30:45.123456789")]
+    #[case::t_separator("2024-01-15T12:30:45.123456789")]
+    fn test_map_to_struct_timestamp_timezone_does_not_affect_timestamp_nanos_ntz(
+        #[case] raw: &str,
+    ) {
+        assert_eq!(
+            evaluate_map_timestamp_nanos(
+                raw,
+                DataType::TIMESTAMP_NANOS_NTZ,
+                Some("America/Los_Angeles")
+            )
+            .unwrap(),
+            Some(expected_timestamp_nanos("2024-01-15T12:30:45.123456789Z"))
+        );
+    }
+
+    #[cfg(feature = "nanosecond-timestamps")]
+    #[rstest]
+    fn test_map_to_struct_timestamp_nanos_out_of_range_is_parse_error(
+        #[values(DataType::TIMESTAMP_NANOS, DataType::TIMESTAMP_NANOS_NTZ)] target: DataType,
+    ) {
+        assert!(matches!(
+            evaluate_map_timestamp_nanos("2300-01-01 00:00:00", target, None),
+            Err(KernelError::ParseError(..))
+        ));
     }
 
     #[test]
