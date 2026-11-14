@@ -1,4 +1,5 @@
 use delta_kernel::KernelResult;
+use delta_kernel::schema::{DataType, PrimitiveType};
 use delta_kernel::snapshot::Snapshot;
 
 use crate::error::{ExternResult, IntoExternResult};
@@ -72,60 +73,95 @@ pub unsafe extern "C" fn snapshot_row_tracking_high_water_mark(
     unsafe { result.into_extern_result(&engine_ref) }
 }
 
-/// Signature of the callback invoked once per clustering column by
-/// [`visit_clustering_columns`], in the order the columns appear in the `delta.clustering`
-/// domain. Each invocation describes one column:
-///   - `logical_column`: the column path resolved against the table schema. When column mapping is
-///     enabled this is the logical name, not the physical identifier stored in the domain.
-///   - `physical_column`: the column path as stored in the domain. Use this to correlate a
-///     clustering column with per-file statistics, which are keyed on physical names.
-///   - `type_tag`: the column's data type, encoded with the same tag values as
-///     `visit_expression_literal_null`. Complex types (struct, array, map, variant) and void report
-///     the non-primitive sentinel (255); use a schema visitor for their full details.
-///   - `precision` / `scale`: meaningful only when `type_tag` is the `decimal` tag (12); zero
-///     otherwise.
+/// Callback for a supported non-decimal primitive clustering column.
 ///
-/// Both column paths are dotted strings with individual fields backtick-escaped when they
-/// contain special characters, losslessly parseable back into a multi-part column reference.
-/// Note that column-mapping physical identifiers (e.g. `col-<uuid>`) contain hyphens and so
-/// arrive backtick-quoted; parse the path rather than comparing the raw string.
-///
-/// Resolving a domain-listed column against the schema matches names case-sensitively, so a
-/// domain entry whose casing differs from the schema's is reported as an error rather than
-/// resolved. Java kernel matches case-insensitively here.
-pub type ClusteringColumnVisitor = extern "C" fn(
+/// The type tag uses the established primitive tags from `visit_expression_literal_null`.
+/// Column paths are borrowed dotted strings and remain valid only for this callback.
+pub type VisitPrimitiveClusteringColumnFn = extern "C" fn(
     engine_context: NullableCvoid,
     logical_column: KernelStringSlice,
     physical_column: KernelStringSlice,
     type_tag: u8,
+);
+
+/// Callback for a decimal clustering column.
+///
+/// The callback receives precision and scale instead of a generic decimal type tag. Column paths
+/// are borrowed dotted strings and remain valid only for this callback.
+pub type VisitDecimalClusteringColumnFn = extern "C" fn(
+    engine_context: NullableCvoid,
+    logical_column: KernelStringSlice,
+    physical_column: KernelStringSlice,
     precision: u8,
     scale: u8,
 );
 
-/// Visit the table's clustering columns, invoking `visitor` once per column. See
-/// [`ClusteringColumnVisitor`] for what each invocation reports.
+/// Callbacks invoked once per supported clustering column by `visit_clustering_columns`, in the
+/// order the columns appear in the `delta.clustering` domain. Each invocation describes one
+/// column:
+///
+/// - `logical_column` is resolved against the table schema. With column mapping enabled, it is the
+///   logical name, not the physical identifier stored in the domain.
+/// - `physical_column` is stored in the domain and can be used to correlate the column with
+///   per-file statistics, which are keyed by physical names.
+/// - `visit_primitive` receives a supported non-decimal primitive type tag, using the established
+///   values from `visit_expression_literal_null`.
+/// - `visit_decimal` receives the decimal precision and scale.
+///
+/// Both column paths are dotted strings with individual fields backtick-escaped when they contain
+/// special characters, so they can be parsed losslessly into multi-part column references.
+/// Physical column-mapping identifiers such as `col-<uuid>` contain hyphens and arrive
+/// backtick-quoted, so parse the path rather than comparing the raw string. Schema resolution
+/// matches names case-sensitively, while Java kernel matches case-insensitively here.
+///
+/// Both callback pointers must remain valid for the duration of the call. The paths are borrowed
+/// only until the respective callback returns.
+#[repr(C)]
+pub struct ClusteringColumnVisitor {
+    /// Receives supported non-decimal primitive clustering columns.
+    pub visit_primitive: VisitPrimitiveClusteringColumnFn,
+    /// Receives decimal clustering columns with their precision and scale.
+    pub visit_decimal: VisitDecimalClusteringColumnFn,
+}
+
+/// Visit the table's clustering columns, invoking one appropriate callback per column. See
+/// [`ClusteringColumnVisitor`] for callback arguments and lifetime rules.
 ///
 /// Returns the number of columns visited when the table has the `clustering` feature with a
 /// current `delta.clustering` domain entry -- `Some(0)` means the table is clustered but the
 /// entry lists no columns. Returns `None` when the feature is absent or the domain has no
 /// current entry; the visitor does not run in that case. This distinction mirrors kernel's
 /// `Option<Vec<_>>`: `None` is "not clustered", `Some(0)` is "clustered on nothing".
+/// Returns `SchemaError` for any unsupported clustering column type. All descriptors are
+/// validated before callbacks run, so an error never leaves partially visited columns.
 ///
 /// # Safety
 ///
-/// Caller is responsible for passing in a valid snapshot and engine handle, a valid
-/// `engine_context` opaque pointer forwarded to each `visitor` invocation, and a valid
-/// `visitor` function pointer.
+/// Caller is responsible for passing valid snapshot and engine handles, a valid `engine_context`
+/// opaque pointer forwarded to each callback, and a non-null, correctly aligned `visitor` pointer
+/// that remains readable for the duration of the call. Both callback function pointers in
+/// `visitor` must be valid and callable for the duration of the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn visit_clustering_columns(
     snapshot: Handle<SharedSnapshot>,
     engine: Handle<SharedExternEngine>,
     engine_context: NullableCvoid,
-    visitor: ClusteringColumnVisitor,
+    visitor: *const ClusteringColumnVisitor,
 ) -> ExternResult<OptionalValue<usize>> {
     let snapshot = unsafe { snapshot.as_ref() };
     let engine = unsafe { engine.as_ref() };
-    let result = visit_clustering_columns_impl(snapshot, engine, engine_context, visitor);
+    let result = if visitor.is_null() {
+        Err(delta_kernel::KernelError::generic(
+            "ClusteringColumnVisitor pointer is null",
+        ))
+    } else if !visitor.is_aligned() {
+        Err(delta_kernel::KernelError::generic(
+            "ClusteringColumnVisitor pointer is misaligned",
+        ))
+    } else {
+        let visitor = unsafe { &*visitor };
+        visit_clustering_columns_impl(snapshot, engine, engine_context, visitor)
+    };
     unsafe { result.into_extern_result(&engine) }
 }
 
@@ -133,7 +169,7 @@ fn visit_clustering_columns_impl(
     snapshot: &Snapshot,
     extern_engine: &dyn ExternEngine,
     engine_context: NullableCvoid,
-    visitor: ClusteringColumnVisitor,
+    visitor: &ClusteringColumnVisitor,
 ) -> KernelResult<OptionalValue<usize>> {
     let Some(infos) = snapshot
         .reader()
@@ -141,20 +177,97 @@ fn visit_clustering_columns_impl(
     else {
         return Ok(OptionalValue::None);
     };
-    for info in &infos {
-        let logical = info.logical_column.to_string();
-        let physical = info.physical_column.to_string();
-        let (tag, precision, scale) = NullTypeTag::from_data_type(&info.data_type);
-        visitor(
-            engine_context,
-            kernel_string_slice!(logical),
-            kernel_string_slice!(physical),
-            tag as u8,
-            precision,
-            scale,
-        );
+    let columns: KernelResult<Vec<_>> = infos
+        .iter()
+        .map(|info| {
+            Ok((
+                info.logical_column.to_string(),
+                info.physical_column.to_string(),
+                ClusteringColumnDispatch::from_data_type(&info.data_type)?,
+            ))
+        })
+        .collect();
+
+    // Validate all metadata before invoking callbacks so malformed entries cannot leave partial
+    // callback side effects.
+    for (logical, physical, dispatch) in columns? {
+        dispatch.visit(visitor, engine_context, logical, physical);
     }
     Ok(OptionalValue::Some(infos.len()))
+}
+
+/// Callback kind and type-specific arguments for one clustering column.
+enum ClusteringColumnDispatch {
+    Primitive(u8),
+    Decimal { precision: u8, scale: u8 },
+}
+
+impl ClusteringColumnDispatch {
+    fn from_data_type(data_type: &DataType) -> KernelResult<Self> {
+        match data_type {
+            DataType::Primitive(PrimitiveType::Decimal(decimal)) => Ok(Self::Decimal {
+                precision: decimal.precision(),
+                scale: decimal.scale(),
+            }),
+            DataType::Primitive(PrimitiveType::Byte) => {
+                Ok(Self::Primitive(NullTypeTag::Byte as u8))
+            }
+            DataType::Primitive(PrimitiveType::Short) => {
+                Ok(Self::Primitive(NullTypeTag::Short as u8))
+            }
+            DataType::Primitive(PrimitiveType::Integer) => {
+                Ok(Self::Primitive(NullTypeTag::Integer as u8))
+            }
+            DataType::Primitive(PrimitiveType::Long) => {
+                Ok(Self::Primitive(NullTypeTag::Long as u8))
+            }
+            DataType::Primitive(PrimitiveType::Float) => {
+                Ok(Self::Primitive(NullTypeTag::Float as u8))
+            }
+            DataType::Primitive(PrimitiveType::Double) => {
+                Ok(Self::Primitive(NullTypeTag::Double as u8))
+            }
+            DataType::Primitive(PrimitiveType::Date) => {
+                Ok(Self::Primitive(NullTypeTag::Date as u8))
+            }
+            DataType::Primitive(PrimitiveType::Timestamp) => {
+                Ok(Self::Primitive(NullTypeTag::Timestamp as u8))
+            }
+            DataType::Primitive(PrimitiveType::TimestampNtz) => {
+                Ok(Self::Primitive(NullTypeTag::TimestampNtz as u8))
+            }
+            DataType::Primitive(PrimitiveType::String) => {
+                Ok(Self::Primitive(NullTypeTag::String as u8))
+            }
+            _ => Err(delta_kernel::KernelError::schema(format!(
+                "Unsupported clustering column type: {data_type}"
+            ))),
+        }
+    }
+
+    fn visit(
+        self,
+        visitor: &ClusteringColumnVisitor,
+        engine_context: NullableCvoid,
+        logical: String,
+        physical: String,
+    ) {
+        match self {
+            Self::Primitive(type_tag) => (visitor.visit_primitive)(
+                engine_context,
+                kernel_string_slice!(logical),
+                kernel_string_slice!(physical),
+                type_tag,
+            ),
+            Self::Decimal { precision, scale } => (visitor.visit_decimal)(
+                engine_context,
+                kernel_string_slice!(logical),
+                kernel_string_slice!(physical),
+                precision,
+                scale,
+            ),
+        }
+    }
 }
 
 /// Get the domain metadata as an optional string allocated by `AllocatedStringFn` for a specific
@@ -469,11 +582,25 @@ mod tests {
         let collected: Box<Vec<VisitedColumn>> = Box::default();
         let collected_ptr = Box::into_raw(collected);
 
-        extern "C" fn visitor(
+        extern "C" fn visit_primitive(
             state: NullableCvoid,
             logical_column: KernelStringSlice,
             physical_column: KernelStringSlice,
             type_tag: u8,
+        ) {
+            let ptr: *mut Vec<VisitedColumn> = state.unwrap().as_ptr().cast();
+            let columns = unsafe { &mut *ptr };
+            let logical: KernelResult<String> =
+                unsafe { TryFromStringSlice::try_from_slice(&logical_column) };
+            let physical: KernelResult<String> =
+                unsafe { TryFromStringSlice::try_from_slice(&physical_column) };
+            columns.push((logical.unwrap(), physical.unwrap(), type_tag, 0, 0));
+        }
+
+        extern "C" fn visit_decimal(
+            state: NullableCvoid,
+            logical_column: KernelStringSlice,
+            physical_column: KernelStringSlice,
             precision: u8,
             scale: u8,
         ) {
@@ -486,18 +613,22 @@ mod tests {
             columns.push((
                 logical.unwrap(),
                 physical.unwrap(),
-                type_tag,
+                TAG_DECIMAL,
                 precision,
                 scale,
             ));
         }
 
+        let visitor = ClusteringColumnVisitor {
+            visit_primitive,
+            visit_decimal,
+        };
         let count: Option<usize> = ok_or_panic(unsafe {
             visit_clustering_columns(
                 snapshot.shallow_copy(),
                 engine.shallow_copy(),
                 Some(NonNull::new_unchecked(collected_ptr).cast()),
-                visitor,
+                &visitor,
             )
         })
         .into();
@@ -585,6 +716,7 @@ mod tests {
     // Type tags mirror `visit_expression_literal_null`'s encoding.
     const TAG_INTEGER: u8 = 3;
     const TAG_STRING: u8 = 7;
+    const TAG_DECIMAL: u8 = 12;
 
     // `follow_up` is an optional second `delta.clustering` write `(config, removed)`, letting
     // one case exercise tombstone and latest-write-wins reconciliation. Expectations are
@@ -704,11 +836,9 @@ mod tests {
         Ok(())
     }
 
-    // Decimal is the only tag carrying a payload, so pin precision/scale explicitly.
+    // Decimal columns use the dedicated callback with precision and scale.
     #[tokio::test]
-    async fn test_visit_clustering_columns_decimal_reports_precision_and_scale() -> KernelResult<()>
-    {
-        const TAG_DECIMAL: u8 = 12;
+    async fn test_visit_clustering_columns_dispatches_decimal() -> KernelResult<()> {
         let storage = Arc::new(InMemory::new());
         let engine = DefaultEngineBuilder::new(storage.clone()).build();
         let engine = engine_to_handle(Arc::new(engine), TEST_ERROR_ALLOCATORS);
@@ -830,21 +960,31 @@ mod tests {
         )
         .await;
 
-        extern "C" fn visitor(
+        extern "C" fn primitive(
+            _: NullableCvoid,
+            _: KernelStringSlice,
+            _: KernelStringSlice,
+            _: u8,
+        ) {
+        }
+        extern "C" fn decimal(
             _: NullableCvoid,
             _: KernelStringSlice,
             _: KernelStringSlice,
             _: u8,
             _: u8,
-            _: u8,
         ) {
         }
+        let visitor = ClusteringColumnVisitor {
+            visit_primitive: primitive,
+            visit_decimal: decimal,
+        };
         let res = unsafe {
             visit_clustering_columns(
                 snapshot.shallow_copy(),
                 engine.shallow_copy(),
                 None,
-                visitor,
+                &visitor,
             )
         };
         assert_extern_result_error_with_message(res, FFIKernelError::GenericError, None);

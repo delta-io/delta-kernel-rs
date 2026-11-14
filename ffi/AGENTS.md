@@ -869,13 +869,12 @@ In-Commit Timestamp is unavailable from retained CRC state. Domain-metadata and 
 FFI reads also use an unscoped reader, preserving the engine's cancellation and timeout behavior.
 The C API signatures do not expose reader state or a cancellation token.
 
-Domain-metadata reads live in `ffi/src/domain_metadata.rs`: `get_domain_metadata` /
-`visit_domain_metadata` for user domains, and `visit_clustering_columns`, which reports one
-descriptor per clustering column -- logical name, physical name (what per-file stats are keyed on),
-and a type tag -- without exposing the guarded `delta.*` domain JSON directly. It returns
-`OptionalValue<usize>`: `None` means not clustered, `Some(0)` means clustered on no columns. The
-type tag reuses the `visit_expression_literal_null` encoding, with 255 for types that don't fit a
-compact tag (struct, array, map, variant, void, and geometry/geography).
+In `ffi/src/domain_metadata.rs`, `get_domain_metadata` and `visit_domain_metadata` expose user
+domains; `visit_clustering_columns` reports clustering columns without exposing guarded `delta.*`
+domain JSON. Its callbacks receive primitive tags or decimal precision and scale, plus logical and
+physical paths borrowed for the callback. The result is `OptionalValue<usize>` (`None` means
+unclustered; `Some(0)` means clustered with no columns). The callback table changes the C ABI, so
+consumers need the matching header and library.
 
 ## Commit Range Flow
 

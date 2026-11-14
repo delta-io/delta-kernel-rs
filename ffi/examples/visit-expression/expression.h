@@ -164,10 +164,21 @@ struct MapData {
   ExpressionItemList keys;
   ExpressionItemList vals;
 };
-struct NullTypeInfo {
-  uint8_t type_tag;
+enum NullTypeInfoKind {
+  NullTypeTagOnly,
+  NullTypeDecimal,
+};
+struct DecimalNullInfo {
   uint8_t precision;
   uint8_t scale;
+};
+union NullTypeValue {
+  uint8_t type_tag;
+  struct DecimalNullInfo decimal;
+};
+struct NullTypeInfo {
+  enum NullTypeInfoKind kind;
+  union NullTypeValue value;
 };
 struct Literal {
   enum LitType type;
@@ -313,14 +324,24 @@ void visit_expr_struct_literal(void* data,
 void visit_expr_null_literal(
     void* data,
     uintptr_t sibling_id_list,
-    uint8_t type_tag,
+    uint8_t type_tag) {
+  struct Literal* literal = malloc(sizeof(struct Literal));
+  literal->type = Null;
+  literal->value.null_type.kind = NullTypeTagOnly;
+  literal->value.null_type.value.type_tag = type_tag;
+  put_expr_item(data, sibling_id_list, literal, Literal);
+}
+
+void visit_expr_decimal_null_literal(
+    void* data,
+    uintptr_t sibling_id_list,
     uint8_t precision,
     uint8_t scale) {
   struct Literal* literal = malloc(sizeof(struct Literal));
   literal->type = Null;
-  literal->value.null_type.type_tag = type_tag;
-  literal->value.null_type.precision = precision;
-  literal->value.null_type.scale = scale;
+  literal->value.null_type.kind = NullTypeDecimal;
+  literal->value.null_type.value.decimal.precision = precision;
+  literal->value.null_type.value.decimal.scale = scale;
   put_expr_item(data, sibling_id_list, literal, Literal);
 }
 
@@ -549,6 +570,7 @@ ExpressionItemList construct_expression(SharedExpression* expression) {
     .visit_literal_interval_day_time = visit_expr_interval_day_time_literal,
     .visit_literal_binary = visit_expr_binary_literal,
     .visit_literal_null = visit_expr_null_literal,
+    .visit_literal_decimal_null = visit_expr_decimal_null_literal,
     .visit_literal_decimal = visit_expr_decimal_literal,
     .visit_literal_string = visit_expr_string_literal,
     .visit_literal_struct = visit_expr_struct_literal,
@@ -604,6 +626,7 @@ ExpressionItemList construct_predicate(SharedPredicate* predicate) {
     .visit_literal_interval_day_time = visit_expr_interval_day_time_literal,
     .visit_literal_binary = visit_expr_binary_literal,
     .visit_literal_null = visit_expr_null_literal,
+    .visit_literal_decimal_null = visit_expr_decimal_null_literal,
     .visit_literal_decimal = visit_expr_decimal_literal,
     .visit_literal_string = visit_expr_string_literal,
     .visit_literal_struct = visit_expr_struct_literal,

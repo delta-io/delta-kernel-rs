@@ -211,16 +211,23 @@ void print_tree_helper(ExpressionItem ref, int depth) {
           static const char* null_type_names[] = {
             "Boolean", "Byte", "Short", "Integer", "Long", "Float",
             "Double", "String", "Binary", "Date", "Timestamp", "TimestampNtz",
-            "Decimal", "IntervalYearMonth", "IntervalDayTime",
+            "ReservedDecimal", "IntervalYearMonth", "IntervalDayTime",
           };
           const size_t null_type_count = sizeof(null_type_names) / sizeof(null_type_names[0]);
           struct NullTypeInfo* nt = &lit->value.null_type;
-          if (nt->type_tag == 12) {
-            printf("Null(Decimal(%d,%d))\n", nt->precision, nt->scale);
-          } else if (nt->type_tag < null_type_count) {
-            printf("Null(%s)\n", null_type_names[nt->type_tag]);
-          } else {
-            printf("Null(tag=%d)\n", nt->type_tag);
+          switch (nt->kind) {
+            case NullTypeTagOnly:
+              if (nt->value.type_tag < null_type_count) {
+                printf("Null(%s)\n", null_type_names[nt->value.type_tag]);
+              } else {
+                printf("Null(tag=%d)\n", nt->value.type_tag);
+              }
+              break;
+            case NullTypeDecimal:
+              printf("Null(Decimal(%d,%d))\n",
+                     nt->value.decimal.precision,
+                     nt->value.decimal.scale);
+              break;
           }
           break;
         }
