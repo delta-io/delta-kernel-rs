@@ -26,7 +26,7 @@ use crate::checkpoint::collation_stats::{
 };
 use crate::committer::CatalogCommit;
 #[cfg(feature = "adaptive-metadata-in-dev")]
-use crate::content_tree::{TreeStatsRequest, read_checkpoint_action};
+use crate::content_tree::{AmtStatsRequest, read_checkpoint_action};
 use crate::expressions::ColumnName;
 use crate::last_checkpoint_hint::{HintAction, LastCheckpointHint};
 use crate::log_replay::ActionsBatch;
@@ -1052,7 +1052,7 @@ impl LogSegment {
     /// not read.
     ///
     /// `table_root` resolves the action's manifest locations. `stats_schema` is the physical stats
-    /// schema the caller replays with. `tree_stats` reads it from the content tree's
+    /// schema the caller replays with. `amt_stats` reads it from the content tree's
     /// `content_stats` as `add.stats_parsed`. Those are keyed by the checkpoint's schema, so the
     /// caller passes it only when `stats_schema` is derived from that same schema; otherwise the
     /// tree's adds carry no stats.
@@ -1066,7 +1066,7 @@ impl LogSegment {
         commit_read_schema: SchemaRef,
         checkpoint_read_schema: SchemaRef,
         stats_schema: Option<&StructType>,
-        tree_stats: Option<TreeStatsRequest<'_>>,
+        amt_stats: Option<AmtStatsRequest<'_>>,
     ) -> KernelResult<ActionsWithCheckpointInfo<Box<dyn KernelResultIterator<ActionsBatch>>>> {
         let version = Version::try_from(checkpoint.version())
             .ok()
@@ -1102,15 +1102,15 @@ impl LogSegment {
             &self.find_commit_cover_after(Some(version)),
             commit_read_schema,
         )?;
-        let has_stats_parsed = tree_stats.is_some();
+        let has_stats_parsed = amt_stats.is_some();
         let mut add_fields = Vec::new();
         if needs_json_stats_fallback(&checkpoint_read_schema, stats_schema, has_stats_parsed) {
             add_fields.push(StructField::nullable("stats", DataType::STRING));
         }
-        if let Some(tree_stats) = &tree_stats {
+        if let Some(amt_stats) = &amt_stats {
             add_fields.push(StructField::nullable(
                 "stats_parsed",
-                tree_stats.schema().clone(),
+                amt_stats.schema().clone(),
             ));
         }
         let checkpoint_read_schema =
@@ -1121,7 +1121,7 @@ impl LogSegment {
             checkpoint,
             &LogRoot::new(table_root.clone())?,
             checkpoint_read_schema.clone(),
-            tree_stats.as_ref(),
+            amt_stats.as_ref(),
         )
         .map_err(KernelError::generic_err)?;
         Ok(ActionsWithCheckpointInfo {

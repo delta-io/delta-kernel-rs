@@ -4,7 +4,7 @@ use std::iter;
 
 use super::action_projector::ActionProjector;
 use super::checkpoint_sidecar::read_sidecar_actions;
-use super::reader::{ReadContext, StatsRead, TreeStatsRequest, read_add_actions_from_amt};
+use super::reader::{AmtStatsRequest, ReadContext, StatsRead, read_add_actions_from_amt};
 use crate::actions::{
     ADD_NAME, CheckpointAction, DOMAIN_METADATA_NAME, LOG_DOMAIN_METADATA_SCHEMA,
     LOG_METADATA_SCHEMA, LOG_PROTOCOL_SCHEMA, LOG_TXN_SCHEMA, METADATA_NAME, PROTOCOL_NAME,
@@ -42,7 +42,7 @@ pub(crate) fn read_checkpoint_action(
     checkpoint: &CheckpointAction,
     log_root: &LogRoot,
     read_schema: SchemaRef,
-    stats: Option<&TreeStatsRequest<'_>>,
+    stats: Option<&AmtStatsRequest<'_>>,
 ) -> Result<Box<dyn KernelResultIterator<ActionsBatch>>> {
     if let Some(other) = read_schema
         .fields()
@@ -107,7 +107,7 @@ fn read_tree_adds(
     checkpoint: &CheckpointAction,
     log_root: &LogRoot,
     read_schema: SchemaRef,
-    stats: Option<&TreeStatsRequest<'_>>,
+    stats: Option<&AmtStatsRequest<'_>>,
 ) -> Result<Box<dyn KernelResultIterator<ActionsBatch>>> {
     // TODO(#3320): the content tree does not yet carry partition values, so its adds would read
     // with empty `partitionValues`.

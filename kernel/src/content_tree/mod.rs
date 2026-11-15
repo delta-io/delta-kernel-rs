@@ -21,7 +21,7 @@ use std::sync::LazyLock;
 use bytes::Bytes;
 pub(crate) use checkpoint_action_stream::read_checkpoint_action;
 use delta_kernel_derive::ToSchema;
-pub(crate) use reader::TreeStatsRequest;
+pub(crate) use reader::AmtStatsRequest;
 use url::Url;
 
 use crate::engine_data::{EngineData, GetData, TypedGetData as _};

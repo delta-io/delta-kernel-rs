@@ -105,10 +105,10 @@ pub(crate) fn read_add_actions_from_amt(
         )?;
     for batch in batches {
         let batch = batch?;
-        let keep = leaf_filter
-            .as_ref()
-            .map(|filter| filter.apply(batch.as_ref()))
-            .transpose()?;
+        let keep = match &leaf_filter {
+            Some(filter) => filter.apply(batch.as_ref())?,
+            None => vec![true; batch.len()],
+        };
         leaves.visit_batch(batch.as_ref(), keep)?;
         root_actions.push(converter.convert(batch.as_ref(), RemovedEntries::default())?);
     }
@@ -180,13 +180,13 @@ pub(crate) struct StatsRead {
 
 /// The Delta stats to read from an AMT checkpoint's content tree as `Add.stats_parsed`, and the
 /// scan predicate to skip the tree's leaf manifests by.
-pub(crate) struct TreeStatsRequest<'a> {
+pub(crate) struct AmtStatsRequest<'a> {
     /// The physical Delta stats schema: the type of `Add.stats_parsed`.
     schema: &'a StructType,
     skipping: Option<SkippingPredicate>,
 }
 
-impl<'a> TreeStatsRequest<'a> {
+impl<'a> AmtStatsRequest<'a> {
     /// Requests the physical Delta stats `schema` (see [`StatsRead::try_new`] for its
     /// requirements), skipping the leaf manifests whose stats rule out `predicate`. The
     /// predicate's references to columns outside `stats_columns` cannot rule out a leaf.
@@ -225,7 +225,7 @@ impl StatsRead {
     /// physical schema, in the same order and with the same type.
     pub(crate) fn try_new(
         checkpoint: &CheckpointAction,
-        request: &TreeStatsRequest<'_>,
+        request: &AmtStatsRequest<'_>,
     ) -> Result<Self> {
         let metadata = checkpoint.metadata();
         let mode = column_mapping_mode(checkpoint.protocol(), &metadata.parse_table_properties());
@@ -237,7 +237,7 @@ impl StatsRead {
     /// schema the manifests were written with.
     fn from_physical_schema(
         physical_schema: &StructType,
-        request: &TreeStatsRequest<'_>,
+        request: &AmtStatsRequest<'_>,
     ) -> KernelResult<Self> {
         let schema = request.schema;
         let content_stats = projected_stats_schema(physical_schema, schema)?;
@@ -1084,9 +1084,9 @@ struct LeafRefVisitor<'u> {
     /// The table root URL relative leaf locations resolve against.
     table_root: &'u Url,
     leaves: Vec<LeafRef>,
-    /// The current batch's leaf filter output: row `i`'s leaf is [skipped](LeafRef::skipped) when
-    /// `keep[i]` is false. `None` keeps every leaf.
-    keep: Option<Vec<bool>>,
+    /// The current batch's leaf filter output, set by [`Self::visit_batch`]: row `i`'s leaf is
+    /// [skipped](LeafRef::skipped) when `keep[i]` is false.
+    keep: Vec<bool>,
     /// Index within the current batch of the next row to visit.
     next_row: usize,
 }
@@ -1096,23 +1096,21 @@ impl<'u> LeafRefVisitor<'u> {
         Self {
             table_root,
             leaves: Vec::new(),
-            keep: None,
+            keep: Vec::new(),
             next_row: 0,
         }
     }
 
     /// Collects the leaves of one root batch, skipping those whose row `keep` deselects.
-    fn visit_batch(&mut self, batch: &dyn EngineData, keep: Option<Vec<bool>>) -> KernelResult<()> {
-        if let Some(keep) = &keep {
-            require!(
-                keep.len() == batch.len(),
-                KernelError::internal_error(format!(
-                    "leaf filter selected {} rows of a root batch of {}",
-                    keep.len(),
-                    batch.len()
-                ))
-            );
-        }
+    fn visit_batch(&mut self, batch: &dyn EngineData, keep: Vec<bool>) -> KernelResult<()> {
+        require!(
+            keep.len() == batch.len(),
+            KernelError::internal_error(format!(
+                "leaf filter selected {} rows of a root batch of {}",
+                keep.len(),
+                batch.len()
+            ))
+        );
         self.keep = keep;
         self.next_row = 0;
         self.visit_rows_of(batch)
@@ -1146,10 +1144,10 @@ impl RowVisitor for LeafRefVisitor<'_> {
                 continue;
             }
             let mut leaf = LeafRef::try_from_getters(row, &getters[1..], self.table_root)?;
-            leaf.skipped = self
-                .keep
-                .as_ref()
-                .is_some_and(|keep| keep.get(first_row + row) == Some(&false));
+            let keep = self.keep.get(first_row + row).copied().ok_or_else(|| {
+                KernelError::internal_error("LeafRefVisitor visited a row outside `visit_batch`")
+            })?;
+            leaf.skipped = !keep;
             self.leaves.push(leaf);
         }
         Ok(())
@@ -1535,7 +1533,8 @@ mod tests {
         let table_root = Url::parse("memory:///table/").unwrap();
         let mut visitor = LeafRefVisitor::new(&table_root);
         for entries in batches {
-            visitor.visit_rows_of(entry_batch(&engine, entries).as_ref())?;
+            let batch = entry_batch(&engine, entries);
+            visitor.visit_batch(batch.as_ref(), vec![true; batch.len()])?;
         }
         Ok(visitor.leaves)
     }
@@ -1643,7 +1642,10 @@ mod tests {
         let entry = data_manifest_entry("leaf.parquet", 1, TrackingStatus::Existing);
         let batch = struct_batch(&engine, &[with_field(&entry.into(), path, value)]);
         let mut visitor = LeafRefVisitor::new(&table_root);
-        assert_result_error_with_message(visitor.visit_rows_of(batch.as_ref()), message);
+        assert_result_error_with_message(
+            visitor.visit_batch(batch.as_ref(), vec![true; batch.len()]),
+            message,
+        );
     }
 
     // === Manifest read schemas ===
@@ -1892,7 +1894,7 @@ mod tests {
             StructField::nullable(MAX_VALUES, phys_id),
             StructField::nullable(TIGHT_BOUNDS, DataType::BOOLEAN),
         ]);
-        let request = TreeStatsRequest::new(&stats_schema, None, &HashSet::new());
+        let request = AmtStatsRequest::new(&stats_schema, None, &HashSet::new());
         let ctx = ReadContext {
             stats: with_stats.then(|| StatsRead::try_new(&checkpoint, &request).unwrap()),
             ..read_ctx()
@@ -3146,9 +3148,9 @@ mod tests {
         schema: &'a StructType,
         predicate: Pred,
         stats_column: &str,
-    ) -> TreeStatsRequest<'a> {
+    ) -> AmtStatsRequest<'a> {
         let stats_columns = HashSet::from([ColumnName::new([stats_column])]);
-        TreeStatsRequest::new(schema, Some(Arc::new(predicate)), &stats_columns)
+        AmtStatsRequest::new(schema, Some(Arc::new(predicate)), &stats_columns)
     }
 
     /// The scan's physical Delta stats schema over the single column `column` of type `data_type`.
