@@ -1,5 +1,6 @@
 //! Validation of `file` values read from or written to Parquet.
 
+use std::borrow::Cow;
 use std::ops::Range;
 
 use crate::arrow::array::cast::AsArray;
@@ -26,7 +27,7 @@ pub(crate) fn validate_file_values_for_read(
     data: &StructArray,
     kernel_schema: &StructType,
 ) -> KernelResult<()> {
-    visit_file_values(data, kernel_schema, validate_locator)
+    visit_file_values(data, kernel_schema, |value| Ok(validate_locator(value)?))
 }
 
 /// Fails if a `file` value in `data` is invalid for a writer to write: it breaks a rule
@@ -38,8 +39,10 @@ pub(crate) fn validate_file_values_for_write(
 ) -> KernelResult<()> {
     visit_file_values(data, kernel_schema, |value| {
         validate_locator(value)?;
-        value.uri().map_or(Ok(()), validate_file_uri)?;
-        validate_checksum_format(value.checksum())
+        if let Some(uri) = value.uri() {
+            validate_file_uri(uri).map_err(|e| Cow::Owned(e.to_string()))?;
+        }
+        Ok(validate_checksum_format(value.checksum())?)
     })
 }
 
@@ -214,7 +217,7 @@ fn string_at(array: &dyn Array, row: usize) -> Option<&str> {
 fn visit_file_values(
     data: &StructArray,
     kernel_schema: &StructType,
-    check: impl Fn(&FileValue<'_>) -> Result<(), &'static str>,
+    check: impl Fn(&FileValue<'_>) -> Result<(), Cow<'static, str>>,
 ) -> KernelResult<()> {
     let Some(file_paths) = FilePaths::from_schema(kernel_schema)? else {
         return Ok(());
@@ -355,7 +358,7 @@ fn visit_at_file_paths(
     file_paths: &FilePaths,
     parent_present: &[bool],
     current_column_path: &mut Vec<String>,
-    check: &impl Fn(&FileValue<'_>) -> Result<(), &'static str>,
+    check: &impl Fn(&FileValue<'_>) -> Result<(), Cow<'static, str>>,
 ) -> KernelResult<()> {
     let current_present = rows_present(array, parent_present);
     match file_paths {
@@ -421,7 +424,7 @@ fn visit_file(
     file: &StructArray,
     present: &[bool],
     path: &[String],
-    check: &impl Fn(&FileValue<'_>) -> Result<(), &'static str>,
+    check: &impl Fn(&FileValue<'_>) -> Result<(), Cow<'static, str>>,
 ) -> KernelResult<()> {
     let columns = FileColumns::new(file)?;
     for row in (0..file.len()).filter(|&row| present[row]) {
@@ -907,9 +910,12 @@ mod tests {
     #[case::empty("", Some("a relative uri must have a non-empty path"))]
     #[case::encoded_slash(
         "_files/a%2Fb.png",
-        Some("its path contains '\\', '%2F' or '%5C', which can separate path segments")
+        Some("its path contains '%2F' or '%5C', which can separate path segments")
     )]
-    #[case::unparseable_absolute("http://[bad/a.png", Some("an absolute uri must parse as a URL"))]
+    #[case::unparseable_absolute(
+        "http://[bad/a.png",
+        Some("an absolute uri must parse as a URL: invalid IPv6 address")
+    )]
     #[case::space(
         "_files/a b.png",
         Some("contains a space or an ASCII control character")
@@ -918,26 +924,37 @@ mod tests {
         "s3://b/.\t./a",
         Some("contains a space or an ASCII control character")
     )]
-    fn write_checks_uri(#[case] uri: &'static str, #[case] problem: Option<&str>) {
+    fn write_checks_uri(#[case] uri: &'static str, #[case] reason: Option<&str>) {
         let (data, schema) = top_level(file_array(&[Some((Some(uri), None, None, None))]));
         validate_file_values_for_read(&data, &schema).unwrap();
         let result = validate_file_values_for_write(&data, &schema);
-        match problem {
+        match reason {
             None => result.unwrap(),
-            Some(problem) => assert_invalid(result, "f", problem),
+            Some(reason) => assert_invalid(
+                result,
+                "f",
+                &format!("Unsupported file uri: {uri:?}: {reason}"),
+            ),
         }
     }
 
     /// A dictionary-encoded `uri` is checked like a plain string one.
     #[rstest]
     #[case::relative("/a.png", "a relative uri must not start with '/'")]
-    #[case::absolute("http://[bad/a.png", "an absolute uri must parse as a URL")]
-    fn write_checks_dictionary_encoded_uri(#[case] uri: &str, #[case] problem: &str) {
+    #[case::absolute(
+        "http://[bad/a.png",
+        "an absolute uri must parse as a URL: invalid IPv6 address"
+    )]
+    fn write_checks_dictionary_encoded_uri(#[case] uri: &str, #[case] reason: &str) {
         let uris: DictionaryArray<Int32Type> = vec![Some(uri)].into_iter().collect();
         let file = with_field(file_array(&[VALID]), "uri", Arc::new(uris));
         let (data, schema) = top_level(file);
         validate_file_values_for_read(&data, &schema).unwrap();
-        assert_invalid(validate_file_values_for_write(&data, &schema), "f", problem);
+        assert_invalid(
+            validate_file_values_for_write(&data, &schema),
+            "f",
+            &format!("Unsupported file uri: {uri:?}: {reason}"),
+        );
     }
 
     /// Writes check the `checksum` format; reads do not, since readers ignore what they cannot use.
