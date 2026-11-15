@@ -14,8 +14,9 @@ use crate::{KernelError, KernelResult};
 /// [relative paths specification]:
 ///
 /// - A `uri` with a URI scheme ([RFC 3986 section 3.1]) is absolute and is parsed as a [`Url`].
-/// - A `uri` without a scheme is relative and is joined onto `table_root` with a single `/`.
-///   Against `s3://bucket/table/`, `_files/a.png` resolves to `s3://bucket/table/_files/a.png`.
+/// - A `uri` without a scheme is relative and is joined onto `table_root` with a single `/`. For
+///   example, against `s3://bucket/table/`, `_files/a.png` resolves to
+///   `s3://bucket/table/_files/a.png`.
 ///
 /// The `uri` is an RFC 3986 URI-reference and is not percent-encoded again: `_files/a%20b.png`
 /// names the object `_files/a b.png`.
@@ -30,10 +31,12 @@ use crate::{KernelError, KernelResult};
 ///
 /// # Errors
 ///
-/// Returns an error if:
-/// - the `uri` contains a space or an ASCII control character, which URL parsing drops or trims;
-/// - its path contains `\`, `%2F` or `%5C`, which URL parsing or an object store can treat as a
-///   path separator;
+/// Returns [`KernelError::UnsupportedFileUri`] if:
+/// - the `uri` contains a space or an ASCII control character, which URL parsing drops or trims, or
+///   a `\`, which URL parsing can treat as `/`;
+/// - its path contains `%2F` or `%5C`, which an object store can treat as a path separator. The
+///   path is the part after the scheme and any `//` authority, up to the first `?` or `#`, so these
+///   are allowed in the authority, query and fragment;
 /// - its path has a `.` or `..` segment, including `%2e` forms, which URL parsing or an object
 ///   store would navigate;
 /// - an absolute `uri` fails to parse as a [`Url`];
@@ -43,23 +46,27 @@ use crate::{KernelError, KernelResult};
 /// [relative paths specification]: https://iceberg.apache.org/spec/#paths-in-metadata
 /// [RFC 3986 section 3.1]: https://datatracker.ietf.org/doc/html/rfc3986#section-3.1
 pub fn resolve_file_uri(table_root: &Url, uri: &str) -> KernelResult<Url> {
-    let unsupported =
-        |reason: &str| KernelError::generic(format!("Unsupported file uri {uri:?}: {reason}"));
-    match check_uri(uri).map_err(unsupported)? {
+    match check_uri(uri)? {
         CheckedUri::Absolute(url) => Ok(url),
         CheckedUri::Relative => {
             // The `uri` is appended to the root's text, so a query or fragment there would absorb
             // it.
             require!(
                 table_root.query().is_none() && table_root.fragment().is_none(),
-                unsupported(&format!(
-                    "the table root {table_root} has a query or fragment"
-                ))
+                unsupported(
+                    uri,
+                    &format!("the table root {table_root} has a query or fragment")
+                )
             );
             let base = with_trailing_slash(table_root);
-            Url::parse(&format!("{base}{uri}")).map_err(|e| unsupported(&e.to_string()))
+            Url::parse(&format!("{base}{uri}")).map_err(|e| unsupported(uri, &e.to_string()))
         }
     }
+}
+
+/// Returns a [`KernelError::UnsupportedFileUri`] naming `uri` and `reason`.
+fn unsupported(uri: &str, reason: &str) -> KernelError {
+    KernelError::unsupported_file_uri(format!("{uri:?}: {reason}"))
 }
 
 /// A `uri` that [`check_uri`] accepts.
@@ -69,38 +76,66 @@ enum CheckedUri {
 }
 
 /// Checks `uri` against the forms [`resolve_file_uri`] supports, and parses it if it is absolute.
-/// See [`resolve_file_uri`] for the rules. Its path is the part before any `?` or `#`.
+/// See [`resolve_file_uri`] for the rules.
 ///
 /// AMT paths are checked differently (see `amt_path_util::reject_dot_segments`): they are raw
 /// paths that kernel percent-encodes before parsing, so only a literal `.` or `..` segment
 /// navigates there.
-fn check_uri(uri: &str) -> Result<CheckedUri, &'static str> {
+fn check_uri(uri: &str) -> KernelResult<CheckedUri> {
+    let fail = |reason: &str| Err(unsupported(uri, reason));
     if uri.chars().any(|c| c == ' ' || c.is_ascii_control()) {
-        return Err("contains a space or an ASCII control character");
+        return fail("contains a space or an ASCII control character");
     }
-    let path = uri.split(['?', '#']).next().unwrap_or_default();
-    let lowercase = path.to_ascii_lowercase();
-    if path.contains('\\') || lowercase.contains("%2f") || lowercase.contains("%5c") {
-        return Err("its path contains '\\', '%2F' or '%5C', which can separate path segments");
+    if uri.contains('\\') {
+        return fail("contains '\\', which can separate path segments");
     }
-    if lowercase
+    let scheme_len = scheme_len(uri);
+    let path = uri_path(uri, scheme_len).to_ascii_lowercase();
+    if path.contains("%2f") || path.contains("%5c") {
+        return fail("its path contains '%2F' or '%5C', which can separate path segments");
+    }
+    if path
         .split('/')
         .any(|segment| matches!(segment.replace("%2e", ".").as_str(), "." | ".."))
     {
-        return Err("its path has a '.' or '..' segment");
+        return fail("its path has a '.' or '..' segment");
     }
-    if scheme_len(uri).is_some() {
+    if scheme_len.is_some() {
         return Url::parse(uri)
             .map(CheckedUri::Absolute)
-            .map_err(|_| "an absolute uri must parse as a URL");
+            .map_err(|e| unsupported(uri, &format!("an absolute uri must parse as a URL: {e}")));
     }
     if path.is_empty() {
-        return Err("a relative uri must have a non-empty path");
+        return fail("a relative uri must have a non-empty path");
     }
     if path.starts_with('/') {
-        return Err("a relative uri must not start with '/'");
+        return fail("a relative uri must not start with '/'");
     }
     Ok(CheckedUri::Relative)
+}
+
+/// Returns the path of `uri`, whose scheme is `scheme_len` bytes long if it has one: the part after
+/// the scheme and any `//` authority, up to the first `?` or `#`. Per [RFC 3986 section 3.2], an
+/// authority ends at the first `/`, `?` or `#`.
+///
+/// [RFC 3986 section 3.2]: https://datatracker.ietf.org/doc/html/rfc3986#section-3.2
+fn uri_path(uri: &str, scheme_len: Option<usize>) -> &str {
+    let rest = match scheme_len {
+        Some(len) => {
+            let after_scheme = &uri[len + 1..];
+            match after_scheme.strip_prefix("//") {
+                Some(authority_and_path) => {
+                    let end = authority_and_path
+                        .find(['/', '?', '#'])
+                        .unwrap_or(authority_and_path.len());
+                    &authority_and_path[end..]
+                }
+                None => after_scheme,
+            }
+        }
+        None => uri,
+    };
+    rest.split(['?', '#']).next().unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -190,6 +225,7 @@ mod tests {
 
     const CONTROL: &str = "space or an ASCII control character";
     const SEPARATOR: &str = "'%2F' or '%5C'";
+    const BACKSLASH: &str = "contains '\\'";
     const DOT: &str = "'.' or '..' segment";
 
     #[rstest]
@@ -202,8 +238,10 @@ mod tests {
     #[case::nul("_files/a\0.png", CONTROL)]
     #[case::absolute_with_tab("s3://bucket/x/.\t./a.png", CONTROL)]
     // URL parsing or an object store can treat these as separators.
-    #[case::backslash("_files\\a.png", SEPARATOR)]
-    #[case::leading_backslash("\\a.png", SEPARATOR)]
+    #[case::backslash("_files\\a.png", BACKSLASH)]
+    #[case::leading_backslash("\\a.png", BACKSLASH)]
+    // URL parsing reads `\` as `/` for some schemes, so it would split the authority.
+    #[case::backslash_in_authority("https://host\\a/b.png", BACKSLASH)]
     #[case::encoded_slash("_files/a%2Fb.png", SEPARATOR)]
     #[case::encoded_slash_lower("_files/a%2fb.png", SEPARATOR)]
     #[case::encoded_backslash("_files/a%5Cb.png", SEPARATOR)]
@@ -232,9 +270,48 @@ mod tests {
     #[case::only_fragment("#x", "non-empty path")]
     #[case::unparseable_absolute("http://[bad/a.png", "must parse as a URL")]
     fn test_resolve_file_uri_rejects(#[case] uri: &str, #[case] reason: &str) {
-        let err = resolve_file_uri(&root(), uri).unwrap_err().to_string();
+        let err = resolve_file_uri(&root(), uri).unwrap_err();
+        assert!(matches!(err, KernelError::UnsupportedFileUri(_)), "{err:?}");
+        let err = err.to_string();
         assert!(err.contains("Unsupported file uri"), "{err}");
         assert!(err.contains(reason), "{err}");
+    }
+
+    /// Only the path is checked for encoded separators: the scheme and authority are not, so an
+    /// encoded `/` or tab in a username is allowed, while a literal tab anywhere is rejected.
+    #[test]
+    fn test_resolve_file_uri_with_encoded_slash_in_username() {
+        let uri = "https://tenant%2Fuser:pass@example.com/a.png";
+        let parsed = Url::parse(uri).unwrap();
+        assert_eq!(parsed.username(), "tenant%2Fuser");
+        assert_eq!(parsed.path(), "/a.png");
+        assert_eq!(resolve_file_uri(&root(), uri).unwrap(), parsed);
+    }
+
+    #[test]
+    fn test_resolve_file_uri_with_encoded_tab_in_username() {
+        let uri = "https://tenant%09user:pass@example.com/a.png";
+        let parsed = Url::parse(uri).unwrap();
+        assert_eq!(parsed.username(), "tenant%09user");
+        assert_eq!(resolve_file_uri(&root(), uri).unwrap(), parsed);
+    }
+
+    #[test]
+    fn test_resolve_file_uri_rejects_literal_tab_in_username() {
+        let uri = "https://tenant\tuser:pass@example.com/a.png";
+        assert_eq!(Url::parse(uri).unwrap().username(), "tenantuser");
+        let err = resolve_file_uri(&root(), uri).unwrap_err().to_string();
+        assert!(err.contains("ASCII control character"), "{err}");
+    }
+
+    #[rstest]
+    #[case::relative("_files/a.png?x=%2F", None, "_files/a.png")]
+    #[case::fragment("_files/a.png#%2F", None, "_files/a.png")]
+    #[case::authority("s3://user%2F@bucket/x/a.png?q", Some(2), "/x/a.png")]
+    #[case::no_path("s3://bucket", Some(2), "")]
+    #[case::no_authority("mailto:a@b.c", Some(6), "a@b.c")]
+    fn test_uri_path(#[case] uri: &str, #[case] scheme_len: Option<usize>, #[case] expected: &str) {
+        assert_eq!(uri_path(uri, scheme_len), expected);
     }
 
     /// A relative `uri` cannot be joined onto a table root with a query or fragment, which would
