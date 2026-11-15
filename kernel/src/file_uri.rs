@@ -1,10 +1,18 @@
-//! Resolution of the `uri` of a `file` value against the table root.
+//! Resolution of the `uri` of a `file` value against the table root, and the location where a
+//! writer writes the files of new `file` references.
 
-use url::Url;
+use percent_encoding::percent_decode_str;
+use url::{Position, Url};
+use uuid::Uuid;
 
 use crate::path_encoding::{scheme_len, with_trailing_slash};
+use crate::table_properties::FILE_TYPE_WRITE_LOCATION;
 use crate::utils::require;
 use crate::{KernelError, KernelResult};
+
+/// The directory of the table root where writers write the files of new `file` references when
+/// `delta.fileType.writeLocation` is not set.
+const FILES_DIR: &str = "_files";
 
 /// Resolves the `uri` of a `file` value into the location of the bytes it references.
 ///
@@ -62,6 +70,129 @@ pub fn resolve_file_uri(table_root: &Url, uri: &str) -> KernelResult<Url> {
     }
 }
 
+/// A unique location for a new file that a `file` value references, created by
+/// [`BoundWriteContext::new_referenced_file_path`].
+///
+/// A connector writes the bytes to [`location`](Self::location) and stores [`uri`](Self::uri) in
+/// the `uri` field of the `file` value.
+///
+/// [`BoundWriteContext::new_referenced_file_path`]:
+///     crate::transaction::BoundWriteContext::new_referenced_file_path
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReferencedFilePath {
+    uri: String,
+    location: Url,
+}
+
+impl ReferencedFilePath {
+    /// The value to store in the `uri` field of the `file` value: relative to the table root (for
+    /// example `_files/<uuid>.png`) when the write location is under `_files`, and absolute when
+    /// the write location is outside the table root.
+    pub fn uri(&self) -> &str {
+        &self.uri
+    }
+
+    /// The location to write the bytes to: [`uri`](Self::uri) resolved with [`resolve_file_uri`].
+    pub fn location(&self) -> &Url {
+        &self.location
+    }
+}
+
+/// Creates a [`ReferencedFilePath`] with a new UUID name, optionally followed by `.<extension>`,
+/// at the write location set by `write_location` (the `delta.fileType.writeLocation` value), or
+/// under `_files` when it is not set.
+///
+/// Returns an error if `write_location` is invalid (see [`write_location_uri_prefix`]), or if
+/// `extension` is empty or has a character other than an ASCII letter, digit, `-`, `_` or `.`.
+pub(crate) fn new_referenced_file_path(
+    table_root: &Url,
+    write_location: Option<&str>,
+    extension: Option<&str>,
+) -> KernelResult<ReferencedFilePath> {
+    let prefix = write_location_uri_prefix(table_root, write_location)?;
+    let suffix = match extension {
+        None => String::new(),
+        Some(extension) => {
+            require!(
+                !extension.is_empty()
+                    && extension
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.')),
+                KernelError::generic(format!(
+                    "Invalid referenced file extension {extension:?}: it must be non-empty and \
+                     contain only ASCII letters, digits, '-', '_' and '.'"
+                ))
+            );
+            format!(".{extension}")
+        }
+    };
+    let uri = format!("{prefix}{}{suffix}", Uuid::new_v4());
+    let location = resolve_file_uri(table_root, &uri)?;
+    Ok(ReferencedFilePath { uri, location })
+}
+
+/// Returns the `uri` prefix, ending in `/`, under which a writer writes the files of new `file`
+/// references: `_files/` when `write_location` is `None`, a relative `write_location` with a
+/// trailing `/`, or the text of an absolute `write_location` parsed as a [`Url`] with a trailing
+/// `/`.
+///
+/// Per the `file` type protocol, a valid value is either a table-root-relative path under `_files`
+/// (`_files` itself, or `_files/<prefix>`) or an absolute URI outside the table root. A writer must
+/// not write files at any other value, so this returns an error for one, and for a value that
+/// [`resolve_file_uri`] does not support. Whether an absolute URI is outside the table root is
+/// decided lexically; see [`is_within`].
+fn write_location_uri_prefix(
+    table_root: &Url,
+    write_location: Option<&str>,
+) -> KernelResult<String> {
+    let Some(value) = write_location else {
+        return Ok(format!("{FILES_DIR}/"));
+    };
+    let invalid = |reason: &str| {
+        KernelError::generic(format!(
+            "Invalid {FILE_TYPE_WRITE_LOCATION} {value:?}: {reason}"
+        ))
+    };
+    require!(
+        !value.contains(['?', '#']),
+        invalid("a write location cannot have a query or fragment")
+    );
+    let dir = value.strip_suffix('/').unwrap_or(value);
+    match check_uri(value).map_err(invalid)? {
+        CheckedUri::Absolute(_) => {
+            let url = Url::parse(&format!("{dir}/")).map_err(|e| invalid(&e.to_string()))?;
+            require!(
+                !url.cannot_be_a_base(),
+                invalid("an absolute write location must be a hierarchical URI")
+            );
+            require!(
+                !is_within(&url, table_root),
+                invalid("an absolute write location must be outside the table root")
+            );
+            Ok(url.into())
+        }
+        CheckedUri::Relative => {
+            require!(
+                dir == FILES_DIR || dir.starts_with(&format!("{FILES_DIR}/")),
+                invalid("a relative write location must be under `_files`")
+            );
+            require!(
+                !dir.split('/').any(str::is_empty),
+                invalid("a relative write location cannot have an empty path segment")
+            );
+            Ok(format!("{dir}/"))
+        }
+    }
+}
+
+/// Checks that a writer may write `uri`: it is a `uri` that [`resolve_file_uri`] supports, for any
+/// table root without a query or fragment. The `file` type protocol requires a writer to write
+/// each `uri` as an absolute URI or as a relative reference resolved per its URI resolution rules.
+#[cfg(feature = "default-engine-base")]
+pub(crate) fn validate_file_uri(uri: &str) -> Result<(), &'static str> {
+    check_uri(uri).map(|_| ())
+}
+
 /// A `uri` that [`check_uri`] accepts.
 enum CheckedUri {
     Absolute(Url),
@@ -101,6 +232,26 @@ fn check_uri(uri: &str) -> Result<CheckedUri, &'static str> {
         return Err("a relative uri must not start with '/'");
     }
     Ok(CheckedUri::Relative)
+}
+
+/// Returns whether `url` is `table_root` or under it.
+///
+/// The scheme and authority (`scheme://[userinfo@]host[:port]`) are compared as text, ignoring
+/// case, and the paths segment by segment after percent-decoding each segment, so `%74able` for
+/// `table` counts as the table root, but a sibling that only shares a name prefix (`table2`) does
+/// not. The check is otherwise lexical: it doesn't unify scheme aliases such as `s3` and `s3a`, a
+/// default port written out, or userinfo, compares paths case-sensitively, and doesn't follow
+/// symlinks. A location spelled in one of those ways counts as outside.
+fn is_within(url: &Url, table_root: &Url) -> bool {
+    let authority = |url: &Url| url[..Position::BeforePath].to_ascii_lowercase();
+    let segments = |url: &Url| -> Vec<String> {
+        url.path()
+            .split('/')
+            .filter(|segment| !segment.is_empty())
+            .map(|segment| percent_decode_str(segment).decode_utf8_lossy().into_owned())
+            .collect()
+    };
+    authority(url) == authority(table_root) && segments(url).starts_with(&segments(table_root))
 }
 
 #[cfg(test)]
@@ -248,5 +399,153 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("query or fragment"), "{err}");
+        let err = new_referenced_file_path(&root, None, None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("query or fragment"), "{err}");
+    }
+
+    /// Writes accept exactly the `uri`s that resolution accepts.
+    #[cfg(feature = "default-engine-base")]
+    #[rstest]
+    #[case("_files/a.png")]
+    #[case("s3://other/a.png")]
+    #[case("_files/a.png?p=../x")]
+    #[case("")]
+    #[case("/a.png")]
+    #[case("\\a.png")]
+    #[case("_files/../a.png")]
+    #[case("_files/a%2Fb.png")]
+    #[case("_files/.\t./a.png")]
+    #[case("s3://bucket/x/../a.png")]
+    #[case("http://[bad/a.png")]
+    fn test_validate_file_uri_matches_resolve_file_uri(#[case] uri: &str) {
+        assert_eq!(
+            validate_file_uri(uri).is_ok(),
+            resolve_file_uri(&root(), uri).is_ok(),
+            "{uri:?}"
+        );
+    }
+
+    #[rstest]
+    #[case::default(None, "_files/")]
+    #[case::files_dir(Some("_files"), "_files/")]
+    #[case::files_dir_with_slash(Some("_files/"), "_files/")]
+    #[case::files_prefix(Some("_files/p1"), "_files/p1/")]
+    #[case::nested_files_prefix(Some("_files/a/b/"), "_files/a/b/")]
+    #[case::absolute(Some("s3://other/files"), "s3://other/files/")]
+    #[case::absolute_with_slash(Some("s3://other/files/"), "s3://other/files/")]
+    #[case::absolute_bucket_root(Some("s3://other"), "s3://other/")]
+    #[case::absolute_same_bucket(Some("s3://bucket/elsewhere"), "s3://bucket/elsewhere/")]
+    // Only the table root's own path is inside it, not a sibling that shares its name as a prefix.
+    #[case::absolute_sibling_with_shared_prefix(Some("s3://bucket/table2"), "s3://bucket/table2/")]
+    // The check is lexical, so a scheme alias of the table root's scheme, userinfo, or an explicit
+    // port makes the same location count as outside the table root.
+    #[case::absolute_scheme_alias(Some("s3a://bucket/table/p1"), "s3a://bucket/table/p1/")]
+    #[case::absolute_userinfo(Some("s3://user@bucket/table/p1"), "s3://user@bucket/table/p1/")]
+    #[case::absolute_port(Some("s3://bucket:443/table/p1"), "s3://bucket:443/table/p1/")]
+    fn test_write_location_uri_prefix(#[case] value: Option<&str>, #[case] expected: &str) {
+        assert_eq!(write_location_uri_prefix(&root(), value).unwrap(), expected);
+    }
+
+    #[rstest]
+    #[case::relative_outside_files("other/p1", "must be under `_files`")]
+    #[case::relative_files_name_prefix("_filesx/p1", "must be under `_files`")]
+    #[case::relative_files_wrong_case("_FILES/p1", "must be under `_files`")]
+    #[case::relative_empty("", "non-empty path")]
+    #[case::relative_leading_slash("/_files/p1", "must not start with '/'")]
+    #[case::relative_parent("_files/../p1", DOT)]
+    #[case::relative_encoded_slash("_files%2Fp1", SEPARATOR)]
+    #[case::relative_empty_segment("_files//p1", "empty path segment")]
+    #[case::relative_trailing_double_slash("_files//", "empty path segment")]
+    #[case::relative_space("_files/a b", CONTROL)]
+    #[case::relative_query("_files/p1?x", "query or fragment")]
+    #[case::absolute_table_root("s3://bucket/table", "outside the table root")]
+    #[case::absolute_table_root_with_slash("s3://bucket/table/", "outside the table root")]
+    #[case::absolute_under_table_root("s3://bucket/table/_files/p1", "outside the table root")]
+    // An encoded spelling of the table root, or a differently-cased scheme, is still the root.
+    #[case::absolute_encoded_table_root("s3://bucket/%74able/p1", "outside the table root")]
+    #[case::absolute_upper_case_scheme("S3://bucket/table/p1", "outside the table root")]
+    // Encoded separators and dot navigation could lead back inside the table root.
+    #[case::absolute_encoded_slash("s3://bucket/table%2F_files/p1", SEPARATOR)]
+    #[case::absolute_encoded_backslash("s3://bucket/table%5C_files/p1", SEPARATOR)]
+    #[case::absolute_parent("s3://bucket/x/../table/p1", DOT)]
+    #[case::absolute_fragment("s3://other/files#x", "query or fragment")]
+    #[case::absolute_not_hierarchical("mailto:files@example.com", "hierarchical URI")]
+    fn test_write_location_uri_prefix_rejects(#[case] value: &str, #[case] reason: &str) {
+        let err = write_location_uri_prefix(&root(), Some(value))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("delta.fileType.writeLocation"), "{err}");
+        assert!(err.contains(reason), "{err}");
+    }
+
+    #[rstest]
+    #[case::default(None, None, "_files/", "s3://bucket/table/_files/", "")]
+    #[case::extension(None, Some("png"), "_files/", "s3://bucket/table/_files/", ".png")]
+    #[case::multi_part_extension(
+        None,
+        Some("tar.gz"),
+        "_files/",
+        "s3://bucket/table/_files/",
+        ".tar.gz"
+    )]
+    #[case::files_prefix(
+        Some("_files/p1"),
+        None,
+        "_files/p1/",
+        "s3://bucket/table/_files/p1/",
+        ""
+    )]
+    #[case::absolute(
+        Some("s3://other/files"),
+        Some("png"),
+        "s3://other/files/",
+        "s3://other/files/",
+        ".png"
+    )]
+    fn test_new_referenced_file_path(
+        #[case] write_location: Option<&str>,
+        #[case] extension: Option<&str>,
+        #[case] uri_prefix: &str,
+        #[case] location_prefix: &str,
+        #[case] suffix: &str,
+    ) {
+        let path = new_referenced_file_path(&root(), write_location, extension).unwrap();
+        let name = path.uri().strip_prefix(uri_prefix).unwrap();
+        let uuid = name.strip_suffix(suffix).unwrap();
+        assert!(Uuid::parse_str(uuid).is_ok(), "{name}");
+        assert_eq!(path.location().as_str(), format!("{location_prefix}{name}"));
+        assert_eq!(
+            resolve_file_uri(&root(), path.uri()).unwrap(),
+            *path.location()
+        );
+    }
+
+    #[test]
+    fn test_new_referenced_file_path_is_unique() {
+        let first = new_referenced_file_path(&root(), None, None).unwrap();
+        let second = new_referenced_file_path(&root(), None, None).unwrap();
+        assert_ne!(first.uri(), second.uri());
+    }
+
+    #[rstest]
+    #[case::empty("")]
+    #[case::slash("png/x")]
+    #[case::space("p ng")]
+    #[case::percent("p%2Fng")]
+    fn test_new_referenced_file_path_rejects_invalid_extension(#[case] extension: &str) {
+        let err = new_referenced_file_path(&root(), None, Some(extension))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("Invalid referenced file extension"), "{err}");
+    }
+
+    #[test]
+    fn test_new_referenced_file_path_rejects_invalid_write_location() {
+        let err = new_referenced_file_path(&root(), Some("other"), None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("must be under `_files`"), "{err}");
     }
 }

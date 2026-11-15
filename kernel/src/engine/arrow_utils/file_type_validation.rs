@@ -9,13 +9,15 @@ use crate::arrow::compute::cast;
 use crate::arrow::datatypes::{DataType as ArrowDataType, Int64Type};
 use crate::engine::arrow_utils::make_arrow_error;
 use crate::expressions::ColumnName;
+use crate::file_uri::validate_file_uri;
 use crate::schema::StructType;
 use crate::schema::file_utils::FilePaths;
 use crate::{KernelError, KernelResult};
 
 /// Fails if a non-null `file` value in `data` is invalid under the Parquet `FILE` specification,
 /// which requires readers to reject it; see [`validate_locator`]. Any `uri`, absolute or relative,
-/// is accepted; a relative one resolves against the table root, and reading does not resolve it.
+/// is accepted; a relative one resolves against the table root, and reading does not resolve it
+/// (see [`crate::resolve_file_uri`]).
 ///
 /// Columns are matched to `kernel_schema` by name, and a `file` column missing from `data` is an
 /// error. A value is checked only if it is present: not null, and not under a null struct, list or
@@ -28,14 +30,15 @@ pub(crate) fn validate_file_values_for_read(
 }
 
 /// Fails if a `file` value in `data` is invalid for a writer to write: it breaks a rule
-/// [`validate_file_values_for_read`] applies, or its `checksum` is malformed; see
-/// [`validate_checksum_format`].
+/// [`validate_file_values_for_read`] applies, its `uri` breaks the URI resolution rules (see
+/// [`validate_file_uri`]), or its `checksum` is malformed (see [`validate_checksum_format`]).
 pub(crate) fn validate_file_values_for_write(
     data: &StructArray,
     kernel_schema: &StructType,
 ) -> KernelResult<()> {
     visit_file_values(data, kernel_schema, |value| {
         validate_locator(value)?;
+        value.uri().map_or(Ok(()), validate_file_uri)?;
         validate_checksum_format(value.checksum())
     })
 }
@@ -123,6 +126,11 @@ impl FileValue<'_> {
         int64_at(self.columns.size, self.row)
     }
 
+    /// The `uri`, or `None` if it is null or not a string.
+    fn uri(&self) -> Option<&str> {
+        string_at(self.columns.uri.as_ref(), self.row)
+    }
+
     /// The `checksum`, or `None` if it is null or not a string.
     fn checksum(&self) -> Option<&str> {
         string_at(self.columns.checksum.as_ref(), self.row)
@@ -131,6 +139,7 @@ impl FileValue<'_> {
 
 /// The sub-field columns of an array of `file` values that the rules use.
 struct FileColumns<'a> {
+    uri: ArrayRef,
     /// Which `uri` values are null, after decoding (see [`Array::logical_nulls`]).
     uri_nulls: Option<NullBuffer>,
     offset: &'a PrimitiveArray<Int64Type>,
@@ -151,15 +160,22 @@ impl<'a> FileColumns<'a> {
                 .as_primitive_opt::<Int64Type>()
                 .ok_or_else(|| make_arrow_error(format!("`file` field '{name}' is not an INT64")))
         };
-        let checksum = field("checksum")?;
-        // A dictionary-encoded `checksum` is decoded once, so each value can be read as a string.
-        let checksum = match checksum.data_type() {
-            ArrowDataType::Dictionary(..) => cast(checksum, &ArrowDataType::Utf8)?,
-            _ => checksum.clone(),
+        // A dictionary-encoded string is decoded once, so each value can be read as a string. Only
+        // writes check `uri` and `checksum`; reads decode a dictionary-encoded one too, a cost
+        // accepted so reads and writes share one view of the columns. A plain string column is
+        // not copied.
+        let string = |name: &str| -> KernelResult<ArrayRef> {
+            let array = field(name)?;
+            Ok(match array.data_type() {
+                ArrowDataType::Dictionary(..) => cast(array, &ArrowDataType::Utf8)?,
+                _ => array.clone(),
+            })
         };
+        let checksum = string("checksum")?;
         // A dictionary-encoded value is null if its key is, or if the key points to a null value,
         // so the nulls are taken after decoding.
         Ok(Self {
+            uri: string("uri")?,
             uri_nulls: field("uri")?.logical_nulls(),
             offset: int64("offset")?,
             size: int64("size")?,
@@ -865,14 +881,63 @@ mod tests {
         assert_eq!((span, present), (0..0, vec![]));
     }
 
+    /// Replaces the `name` field of `file` with `values`.
+    fn with_field(file: StructArray, name: &str, values: ArrayRef) -> StructArray {
+        let (fields, mut columns, nulls) = file.into_parts();
+        let index = fields.iter().position(|f| f.name() == name).unwrap();
+        let mut fields: Vec<_> = fields.iter().map(|f| f.as_ref().clone()).collect();
+        fields[index] = Field::new(name, values.data_type().clone(), true);
+        columns[index] = values;
+        StructArray::try_new(fields.into(), columns, nulls).unwrap()
+    }
+
     /// Replaces the `checksum` field of `file` with `checksums`.
     fn with_checksums(file: StructArray, checksums: ArrayRef) -> StructArray {
-        let (fields, mut columns, nulls) = file.into_parts();
-        let index = fields.iter().position(|f| f.name() == "checksum").unwrap();
-        let mut fields: Vec<_> = fields.iter().map(|f| f.as_ref().clone()).collect();
-        fields[index] = Field::new("checksum", checksums.data_type().clone(), true);
-        columns[index] = checksums;
-        StructArray::try_new(fields.into(), columns, nulls).unwrap()
+        with_field(file, "checksum", checksums)
+    }
+
+    /// Writes check that a `uri` follows the URI resolution rules. Reads do not: a `uri` that does
+    /// not resolve fails only when its bytes are accessed.
+    #[rstest]
+    #[case::absolute("s3://b/a", None)]
+    #[case::relative("_files/a.png", None)]
+    #[case::relative_outside_files("other/a.png", None)]
+    #[case::leading_slash("/a.png", Some("a relative uri must not start with '/'"))]
+    #[case::parent("_files/../a.png", Some("its path has a '.' or '..' segment"))]
+    #[case::empty("", Some("a relative uri must have a non-empty path"))]
+    #[case::encoded_slash(
+        "_files/a%2Fb.png",
+        Some("its path contains '\\', '%2F' or '%5C', which can separate path segments")
+    )]
+    #[case::unparseable_absolute("http://[bad/a.png", Some("an absolute uri must parse as a URL"))]
+    #[case::space(
+        "_files/a b.png",
+        Some("contains a space or an ASCII control character")
+    )]
+    #[case::absolute_with_tab(
+        "s3://b/.\t./a",
+        Some("contains a space or an ASCII control character")
+    )]
+    fn write_checks_uri(#[case] uri: &'static str, #[case] problem: Option<&str>) {
+        let (data, schema) = top_level(file_array(&[Some((Some(uri), None, None, None))]));
+        validate_file_values_for_read(&data, &schema).unwrap();
+        let result = validate_file_values_for_write(&data, &schema);
+        match problem {
+            None => result.unwrap(),
+            Some(problem) => assert_invalid(result, "f", problem),
+        }
+    }
+
+    /// A dictionary-encoded `uri` is checked like a plain string one.
+    #[rstest]
+    #[case::relative("/a.png", "a relative uri must not start with '/'")]
+    #[case::absolute("http://[bad/a.png", "an absolute uri must parse as a URL")]
+    fn write_checks_dictionary_encoded_uri(#[case] uri: &str, #[case] problem: &str) {
+        let uris: DictionaryArray<Int32Type> = vec![Some(uri)].into_iter().collect();
+        let file = with_field(file_array(&[VALID]), "uri", Arc::new(uris));
+        let (data, schema) = top_level(file);
+        validate_file_values_for_read(&data, &schema).unwrap();
+        assert_invalid(validate_file_values_for_write(&data, &schema), "f", problem);
     }
 
     /// Writes check the `checksum` format; reads do not, since readers ignore what they cannot use.
