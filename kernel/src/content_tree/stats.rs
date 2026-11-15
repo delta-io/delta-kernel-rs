@@ -17,16 +17,15 @@ use std::sync::Arc;
 
 use tracing::warn;
 
-use crate::actions::{MAX_VALUES, MIN_VALUES, NULL_COUNT, NUM_RECORDS, STATS_PARSED, TIGHT_BOUNDS};
+use crate::actions::{MAX_VALUES, MIN_VALUES, NULL_COUNT, NUM_RECORDS, TIGHT_BOUNDS};
 use crate::content_tree::{
     CONTENT_STATS_FIELD_NAME, CONTENT_TYPE, DataContentType, LOWER_BOUND, NAN_VALUE_COUNT,
     NULL_VALUE_COUNT, RECORD_COUNT, TOTAL_BYTES, UPPER_BOUND, VALUE_COUNT,
 };
 use crate::expressions::{ColumnName, Expression, ExpressionRef, Predicate as Pred, lit, null_lit};
 use crate::schema::{
-    ColumnMetadataKey, DataType, MetadataValue, PrimitiveType, SchemaRef, StructField, StructType,
+    ColumnMetadataKey, DataType, MetadataValue, PrimitiveType, StructField, StructType,
 };
-use crate::struct_patch::ProjectionStructPatchBuilder;
 use crate::transforms::{SchemaTransform, transform_output_type};
 use crate::{KernelError, KernelResult};
 
@@ -689,42 +688,6 @@ impl<'a> StatsLeafVisitor<'a> for StatsSchemaCollector {
 
 // == AMT content_stats -> parsed Delta stats ==
 
-/// Replaces [`CONTENT_STATS_FIELD_NAME`] in `input_schema` with a nullable [`STATS_PARSED`] column
-/// of type `delta_stats_schema` (see [`parsed_stats_expression`]). Other columns pass through.
-/// Returns `(output_schema, expression)`.
-pub(crate) fn build_parsed_stats_expression(
-    table_schema: &StructType,
-    delta_stats_schema: &StructType,
-    input_schema: &StructType,
-) -> KernelResult<(SchemaRef, ExpressionRef)> {
-    match input_schema
-        .field(CONTENT_STATS_FIELD_NAME)
-        .map(StructField::data_type)
-    {
-        Some(DataType::Struct(_)) => {}
-        other => {
-            return Err(KernelError::generic(format!(
-                "content_stats column '{CONTENT_STATS_FIELD_NAME}' must be a struct in the input \
-                 schema, found: {other:?}"
-            )));
-        }
-    }
-    if let Some(missing) = [CONTENT_TYPE, RECORD_COUNT]
-        .into_iter()
-        .find(|name| input_schema.field(name).is_none())
-    {
-        return Err(KernelError::generic(format!(
-            "AMT entry column '{missing}' not found in input schema"
-        )));
-    }
-
-    let stats_expr = parsed_stats_expression(table_schema, delta_stats_schema)?;
-    let output_field = StructField::nullable(STATS_PARSED, delta_stats_schema.clone());
-    ProjectionStructPatchBuilder::new(input_schema)
-        .replace(CONTENT_STATS_FIELD_NAME, output_field, Arc::new(stats_expr))
-        .build()
-}
-
 /// Builds the expression evaluating an AMT entry row to its Delta stats, a struct of type
 /// `delta_stats_schema`:
 ///
@@ -735,8 +698,6 @@ pub(crate) fn build_parsed_stats_expression(
 /// maxValues:   {<table nesting>}  <- content_stats.<leaf>.upper_bound
 /// tightBounds: boolean            <- false
 /// ```
-///
-/// Float/double bounds are null unless `nan_value_count` is 0, since AMT bounds exclude NaN.
 ///
 /// `content_stats` must have been read with [`projected_stats_schema`] for the same `table_schema`
 /// and `delta_stats_schema`. A leaf without a `content_stats` entry (array/map columns,
@@ -957,11 +918,11 @@ fn aligned_struct_expr(
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;
-    use std::iter;
 
     use rstest::rstest;
 
     use super::*;
+    use crate::actions::STATS_PARSED;
     use crate::arrow::array::RecordBatch;
     use crate::engine::arrow_data::ArrowEngineData;
     use crate::engine::sync::SyncEngine;
@@ -2278,22 +2239,6 @@ mod tests {
             .clone()
     }
 
-    /// Evaluates [`build_parsed_stats_expression`] over `manifest_data`.
-    fn convert_amt_stats_to_delta_stats(
-        engine: &dyn Engine,
-        manifest_data: &dyn EngineData,
-        table_schema: &StructType,
-        delta_stats_schema: &StructType,
-        input_schema: &StructType,
-    ) -> KernelResult<Box<dyn EngineData>> {
-        let (output_schema, expr) =
-            build_parsed_stats_expression(table_schema, delta_stats_schema, input_schema)?;
-        engine
-            .evaluation_handler()
-            .new_expression_evaluator(Arc::new(input_schema.clone()), expr, output_schema.into())?
-            .evaluate(manifest_data)
-    }
-
     /// The input schema the conversion reads: `content_stats` read with [`projected_stats_schema`],
     /// plus the entry's `recordCount` and `contentType` columns.
     fn parsed_stats_input_schema(table: &StructType, delta: &StructType) -> StructType {
@@ -2326,8 +2271,7 @@ mod tests {
     }
 
     /// Converts a single input row (`content_stats`, `recordCount`, `contentType`) and asserts the
-    /// produced batch equals one built directly from `expected_stats` (the Delta stats struct
-    /// scalar) and the same passthrough columns. Uses the real evaluator end to end.
+    /// produced Delta stats equal `expected_stats`. Uses the real evaluator end to end.
     fn assert_parsed_stats_of(
         content_type: DataContentType,
         table: &StructType,
@@ -2339,33 +2283,31 @@ mod tests {
         let input_schema = parsed_stats_input_schema(table, delta);
         let engine = SyncEngine::new();
         let handler = engine.evaluation_handler();
-        let passthrough = [
-            Scalar::Long(record_count),
-            Scalar::Integer(content_type as i32),
-        ];
         let input = handler
             .create_many(
                 Arc::new(input_schema.clone()),
-                vec![
-                    iter::once(content_stats)
-                        .chain(passthrough.clone())
-                        .collect(),
-                ],
+                vec![vec![
+                    content_stats,
+                    Scalar::Long(record_count),
+                    Scalar::Integer(content_type as i32),
+                ]],
             )
             .unwrap();
 
-        let (output_schema, _) =
-            build_parsed_stats_expression(table, delta, &input_schema).unwrap();
+        let output_schema = Arc::new(StructType::new_unchecked([StructField::nullable(
+            STATS_PARSED,
+            delta.clone(),
+        )]));
         let expected = handler
-            .create_many(
-                output_schema,
-                vec![iter::once(expected_stats).chain(passthrough).collect()],
-            )
+            .create_many(output_schema.clone(), vec![vec![expected_stats]])
             .unwrap();
 
-        let actual =
-            convert_amt_stats_to_delta_stats(&engine, input.as_ref(), table, delta, &input_schema)
-                .unwrap();
+        let expr = Expression::struct_from([parsed_stats_expression(table, delta).unwrap()]);
+        let actual = handler
+            .new_expression_evaluator(Arc::new(input_schema), Arc::new(expr), output_schema.into())
+            .unwrap()
+            .evaluate(input.as_ref())
+            .unwrap();
 
         assert_eq!(to_batch(actual), to_batch(expected));
     }
@@ -2763,50 +2705,6 @@ mod tests {
         assert_parsed_stats(&table, &delta, content_stats, 8, expected);
     }
 
-    /// `content_stats_col` names the input's stats column; `missing` names a required entry
-    /// column the input schema omits.
-    #[rstest]
-    #[case::content_stats_missing("other_stats", None, "must be a struct")]
-    #[case::record_count_missing(
-        CONTENT_STATS_FIELD_NAME,
-        Some(RECORD_COUNT),
-        "'recordCount' not found"
-    )]
-    #[case::content_type_missing(
-        CONTENT_STATS_FIELD_NAME,
-        Some(CONTENT_TYPE),
-        "'contentType' not found"
-    )]
-    fn parsed_stats_errors_on_bad_columns(
-        #[case] content_stats_col: &str,
-        #[case] missing: Option<&str>,
-        #[case] needle: &str,
-    ) {
-        let table = StructType::new_unchecked([field_with_id("id", DataType::LONG, true, 0)]);
-        let delta = delta_stats_with_bounds(StatCategorySchemas::all(stat_cols(["id"])));
-        let content_stats_schema = projected_stats_schema(&table, &delta).unwrap();
-        let entry_columns = [
-            StructField::nullable(RECORD_COUNT, DataType::LONG),
-            StructField::nullable(CONTENT_TYPE, DataType::INTEGER),
-        ];
-        let input_schema = StructType::new_unchecked(
-            iter::once(StructField::nullable(
-                content_stats_col,
-                content_stats_schema,
-            ))
-            .chain(
-                entry_columns
-                    .into_iter()
-                    .filter(|field| Some(field.name().as_str()) != missing),
-            ),
-        );
-
-        assert_result_error_with_message(
-            build_parsed_stats_expression(&table, &delta, &input_schema),
-            needle,
-        );
-    }
-
     #[test]
     fn parsed_stats_errors_when_category_order_differs_from_table() {
         let table = StructType::new_unchecked([
@@ -2818,10 +2716,8 @@ mod tests {
             min_values: stat_cols(["id", "score"]),
             max_values: stat_cols(["id", "score"]),
         });
-        let input_schema = parsed_stats_input_schema(&table, &delta);
-
         assert_result_error_with_message(
-            build_parsed_stats_expression(&table, &delta, &input_schema),
+            parsed_stats_expression(&table, &delta),
             "but the table walk produced",
         );
     }
