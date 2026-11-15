@@ -52,7 +52,7 @@ use crate::actions::deletion_vector::{
 use crate::actions::{ADD_FIELD, ADD_NAME, Add, REMOVE_FIELD, SIDECAR_FIELD};
 use crate::cancellation::{CancellableIterator, CancellationTokenRef};
 #[cfg(feature = "adaptive-metadata-in-dev")]
-use crate::content_tree::SkippingPredicate;
+use crate::content_tree::TreeStatsRequest;
 use crate::engine::CancellableEngine;
 use crate::engine_data::FilteredEngineData;
 use crate::expressions::{
@@ -1502,13 +1502,19 @@ impl Scan {
                     .schema_string();
             // Leaf manifests are skipped with the same predicate and stats columns that data
             // skipping prunes their files with.
-            let skipping = match &self.state_info.physical_predicate {
-                PhysicalPredicate::Some(predicate, _) => Some(SkippingPredicate {
-                    predicate: predicate.clone(),
-                    stats_columns: self.state_info.eligible_physical_stats_columns.clone(),
-                }),
+            let predicate = match &self.state_info.physical_predicate {
+                PhysicalPredicate::Some(predicate, _) => Some(predicate.clone()),
                 PhysicalPredicate::StaticSkipAll | PhysicalPredicate::None => None,
             };
+            let tree_stats = physical_stats_read_schema
+                .filter(|_| stats_parsed)
+                .map(|schema| {
+                    TreeStatsRequest::new(
+                        schema,
+                        predicate,
+                        &self.state_info.eligible_physical_stats_columns,
+                    )
+                });
             return self
                 .snapshot
                 .log_segment()
@@ -1519,8 +1525,7 @@ impl Scan {
                     COMMIT_READ_SCHEMA.clone(),
                     checkpoint_schema,
                     physical_stats_read_schema,
-                    stats_parsed,
-                    skipping,
+                    tree_stats,
                 );
         }
         // Checkpoints already represent reconciled state, so scans project only Add actions. This

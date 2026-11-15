@@ -40,7 +40,6 @@ use crate::engine_data::{
 };
 use crate::expressions::{
     ArrayData, ColumnName, Expression, ExpressionRef, MapData, PredicateRef, Scalar, expr, lit,
-    null_lit,
 };
 use crate::scan::data_skipping::DataSkippingFilter;
 use crate::scan::log_replay::{
@@ -52,6 +51,7 @@ use crate::schema::{
     StructType, ToSchema as _,
 };
 use crate::table_features::column_mapping_mode;
+use crate::utils::require;
 use crate::{
     Engine, ExpressionEvaluator, FileDataReadResultIterator, FileMeta, KernelError, KernelResult,
     KernelResultIterator, Result,
@@ -109,7 +109,7 @@ pub(crate) fn read_add_actions_from_amt(
             .as_ref()
             .map(|filter| filter.apply(batch.as_ref()))
             .transpose()?;
-        leaves.visit_batch(batch.as_ref(), keep.unwrap_or_default())?;
+        leaves.visit_batch(batch.as_ref(), keep)?;
         root_actions.push(converter.convert(batch.as_ref(), RemovedEntries::default())?);
     }
     let leaf_actions =
@@ -178,53 +178,75 @@ pub(crate) struct StatsRead {
     skipping: Option<SkippingPredicate>,
 }
 
-/// A scan predicate to skip leaf manifests by, with the physical columns whose stats `schema` of
-/// the [`StatsRead`] it belongs to carries.
-pub(crate) struct SkippingPredicate {
-    /// The scan predicate over physical column names.
-    pub(crate) predicate: PredicateRef,
-    /// The physical leaf columns with stats; the predicate's references to any other column cannot
-    /// rule out a leaf.
-    pub(crate) stats_columns: HashSet<ColumnName>,
+/// The Delta stats to read from an AMT checkpoint's content tree as `Add.stats_parsed`, and the
+/// scan predicate to skip the tree's leaf manifests by.
+pub(crate) struct TreeStatsRequest<'a> {
+    /// The physical Delta stats schema: the type of `Add.stats_parsed`.
+    schema: &'a StructType,
+    skipping: Option<SkippingPredicate>,
+}
+
+impl<'a> TreeStatsRequest<'a> {
+    /// Requests the physical Delta stats `schema` (see [`StatsRead::try_new`] for its
+    /// requirements), skipping the leaf manifests whose stats rule out `predicate`. The
+    /// predicate's references to columns outside `stats_columns` cannot rule out a leaf.
+    pub(crate) fn new(
+        schema: &'a StructType,
+        predicate: Option<PredicateRef>,
+        stats_columns: &HashSet<ColumnName>,
+    ) -> Self {
+        let skipping = predicate.map(|predicate| SkippingPredicate {
+            predicate,
+            stats_columns: stats_columns.clone(),
+        });
+        Self { schema, skipping }
+    }
+
+    /// The physical Delta stats schema: the type of `Add.stats_parsed`.
+    pub(crate) fn schema(&self) -> &'a StructType {
+        self.schema
+    }
+}
+
+/// A scan predicate over physical column names, with the physical leaf columns whose stats can
+/// rule out a leaf manifest.
+#[derive(Clone)]
+struct SkippingPredicate {
+    predicate: PredicateRef,
+    stats_columns: HashSet<ColumnName>,
 }
 
 impl StatsRead {
-    /// Plans reading the physical Delta stats `schema` from `checkpoint`'s content tree, skipping
-    /// leaf manifests by `skipping` when given.
+    /// Plans reading the stats `request` asks for from `checkpoint`'s content tree.
     ///
     /// `content_stats` is keyed by Parquet field ID, which the Delta stats schema does not carry,
     /// so the IDs come from the checkpoint's own metadata: the schema the manifests were written
-    /// with. Every column of `schema` must therefore be a column of the checkpoint's physical
-    /// schema, in the same order and with the same type.
+    /// with. Every column of the requested schema must therefore be a column of the checkpoint's
+    /// physical schema, in the same order and with the same type.
     pub(crate) fn try_new(
         checkpoint: &CheckpointAction,
-        schema: StructType,
-        skipping: Option<SkippingPredicate>,
+        request: &TreeStatsRequest<'_>,
     ) -> Result<Self> {
         let metadata = checkpoint.metadata();
         let mode = column_mapping_mode(checkpoint.protocol(), &metadata.parse_table_properties());
         let physical_schema = metadata.parse_schema()?.make_physical(mode)?;
-        Ok(Self::from_physical_schema(
-            &physical_schema,
-            schema,
-            skipping,
-        )?)
+        Ok(Self::from_physical_schema(&physical_schema, request)?)
     }
 
     /// Like [`Self::try_new`], with the field IDs taken from `physical_schema`, the physical
     /// schema the manifests were written with.
     fn from_physical_schema(
         physical_schema: &StructType,
-        schema: StructType,
-        skipping: Option<SkippingPredicate>,
+        request: &TreeStatsRequest<'_>,
     ) -> KernelResult<Self> {
-        let content_stats = projected_stats_schema(physical_schema, &schema)?;
-        let expression = parsed_stats_expression(physical_schema, &schema)?;
+        let schema = request.schema;
+        let content_stats = projected_stats_schema(physical_schema, schema)?;
+        let expression = parsed_stats_expression(physical_schema, schema)?;
         Ok(Self {
-            schema: Arc::new(schema),
+            schema: Arc::new(schema.clone()),
             content_stats: (content_stats.num_fields() > 0).then_some(content_stats),
             expression: Arc::new(expression),
-            skipping,
+            skipping: request.skipping.clone(),
         })
     }
 
@@ -249,19 +271,14 @@ impl StatsRead {
         let skipping = self.skipping.as_ref()?;
         // Without `content_stats` every converted stat is null, so no leaf could be ruled out.
         self.content_stats.as_ref()?;
-        DataSkippingFilter::new(
+        // The content tree carries no partition values yet (see #3320).
+        DataSkippingFilter::for_stats(
             engine,
-            Some(skipping.predicate.clone()),
-            Some(&self.schema),
+            skipping.predicate.clone(),
+            &self.schema,
             self.expression.clone(),
-            // The content tree carries no partition values yet (see #3320).
-            None,
-            Arc::new(null_lit(DataType::BOOLEAN)),
-            // Every root entry is a file or leaf manifest, never a remove to guard.
-            Arc::new(lit(true)),
             root_schema,
             &skipping.stats_columns,
-            None,
         )
     }
 }
@@ -1068,8 +1085,8 @@ struct LeafRefVisitor<'u> {
     table_root: &'u Url,
     leaves: Vec<LeafRef>,
     /// The current batch's leaf filter output: row `i`'s leaf is [skipped](LeafRef::skipped) when
-    /// `keep[i]` is false. Rows past its end are kept.
-    keep: Vec<bool>,
+    /// `keep[i]` is false. `None` keeps every leaf.
+    keep: Option<Vec<bool>>,
     /// Index within the current batch of the next row to visit.
     next_row: usize,
 }
@@ -1079,14 +1096,23 @@ impl<'u> LeafRefVisitor<'u> {
         Self {
             table_root,
             leaves: Vec::new(),
-            keep: Vec::new(),
+            keep: None,
             next_row: 0,
         }
     }
 
-    /// Collects the leaves of one root batch, skipping those whose row `keep` deselects (an empty
-    /// `keep` keeps every leaf).
-    fn visit_batch(&mut self, batch: &dyn EngineData, keep: Vec<bool>) -> KernelResult<()> {
+    /// Collects the leaves of one root batch, skipping those whose row `keep` deselects.
+    fn visit_batch(&mut self, batch: &dyn EngineData, keep: Option<Vec<bool>>) -> KernelResult<()> {
+        if let Some(keep) = &keep {
+            require!(
+                keep.len() == batch.len(),
+                KernelError::internal_error(format!(
+                    "leaf filter selected {} rows of a root batch of {}",
+                    keep.len(),
+                    batch.len()
+                ))
+            );
+        }
         self.keep = keep;
         self.next_row = 0;
         self.visit_rows_of(batch)
@@ -1120,7 +1146,10 @@ impl RowVisitor for LeafRefVisitor<'_> {
                 continue;
             }
             let mut leaf = LeafRef::try_from_getters(row, &getters[1..], self.table_root)?;
-            leaf.skipped = self.keep.get(first_row + row) == Some(&false);
+            leaf.skipped = self
+                .keep
+                .as_ref()
+                .is_some_and(|keep| keep.get(first_row + row) == Some(&false));
             self.leaves.push(leaf);
         }
         Ok(())
@@ -1863,9 +1892,9 @@ mod tests {
             StructField::nullable(MAX_VALUES, phys_id),
             StructField::nullable(TIGHT_BOUNDS, DataType::BOOLEAN),
         ]);
+        let request = TreeStatsRequest::new(&stats_schema, None, &HashSet::new());
         let ctx = ReadContext {
-            stats: with_stats
-                .then(|| StatsRead::try_new(&checkpoint, stats_schema.clone(), None).unwrap()),
+            stats: with_stats.then(|| StatsRead::try_new(&checkpoint, &request).unwrap()),
             ..read_ctx()
         };
 
@@ -3112,18 +3141,14 @@ mod tests {
 
     // === Leaf skipping ===
 
-    /// The scan predicate `predicate` over the physical columns `stats_columns`.
-    fn skipping<'a>(
+    /// Requests `schema`, skipping leaves by `predicate` over the physical column `stats_column`.
+    fn skipping_request<'a>(
+        schema: &'a StructType,
         predicate: Pred,
-        stats_columns: impl IntoIterator<Item = &'a str>,
-    ) -> SkippingPredicate {
-        SkippingPredicate {
-            predicate: Arc::new(predicate),
-            stats_columns: stats_columns
-                .into_iter()
-                .map(|name| ColumnName::new([name]))
-                .collect(),
-        }
+        stats_column: &str,
+    ) -> TreeStatsRequest<'a> {
+        let stats_columns = HashSet::from([ColumnName::new([stats_column])]);
+        TreeStatsRequest::new(schema, Some(Arc::new(predicate)), &stats_columns)
     }
 
     /// The scan's physical Delta stats schema over the single column `column` of type `data_type`.
@@ -3162,12 +3187,9 @@ mod tests {
     fn leaf_is_read(data_type: DataType, stats: Option<Vec<Scalar>>, predicate: Pred) -> bool {
         let engine = SyncEngine::new();
         let table = StructType::new_unchecked([field_with_id("c", data_type.clone(), true, 1)]);
-        let stats_read = StatsRead::from_physical_schema(
-            &table,
-            delta_stats_schema("c", data_type),
-            Some(skipping(predicate, ["c"])),
-        )
-        .unwrap();
+        let schema = delta_stats_schema("c", data_type);
+        let request = skipping_request(&schema, predicate, "c");
+        let stats_read = StatsRead::from_physical_schema(&table, &request).unwrap();
         let content_stats = stats_read.content_stats.clone().unwrap();
         let mut entry = data_manifest_entry("leaf.parquet", 1, TrackingStatus::Added);
         entry.record_count = 3;
@@ -3404,11 +3426,9 @@ mod tests {
         checkpoint: &CheckpointAction,
         predicate: Pred,
     ) -> Result<Vec<(String, i64)>> {
-        let stats = StatsRead::try_new(
-            checkpoint,
-            phys_id_stats_schema(),
-            Some(skipping(predicate, ["phys_id"])),
-        )?;
+        let schema = phys_id_stats_schema();
+        let stats =
+            StatsRead::try_new(checkpoint, &skipping_request(&schema, predicate, "phys_id"))?;
         let ctx = ReadContext {
             stats: Some(stats),
             ..read_ctx()
