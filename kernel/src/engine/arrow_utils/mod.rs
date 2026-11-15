@@ -1270,6 +1270,7 @@ pub(crate) fn fix_record_batch_nested_null_masks(batch: RecordBatch) -> KernelRe
 /// Splits a StructArray into its parts, unions in the parent null mask, and uses the result to
 /// recursively update the children as well before putting everything back together.
 fn compute_nested_null_masks(sa: StructArray, parent_nulls: Option<&NullBuffer>) -> StructArray {
+    let len = sa.len();
     let (fields, columns, nulls) = sa.into_parts();
     let nulls = NullBuffer::union(parent_nulls, nulls.as_ref());
     let columns = columns
@@ -1307,7 +1308,7 @@ fn compute_nested_null_masks(sa: StructArray, parent_nulls: Option<&NullBuffer>)
     //
     // SAFETY: We are simply reassembling the input `StructArray` we previously broke apart, with
     // updated null buffers. See above for details about null buffer safety.
-    unsafe { StructArray::new_unchecked(fields, columns, nulls) }
+    unsafe { StructArray::new_unchecked_with_length(fields, columns, nulls, len) }
 }
 
 /// Parse a column of JSON strings into a typed `RecordBatch` matching `schema`. N input
@@ -4806,6 +4807,26 @@ mod tests {
             other => panic!("expected nested Struct, got {other:?}"),
         };
         assert_eq!(nested_children[0].name(), "tgt_z");
+    }
+
+    #[rstest]
+    fn test_nested_null_masks_preserve_empty_struct_length(
+        #[values(0, 3)] len: usize,
+        #[values(false, true)] parent_nulls: bool,
+    ) {
+        let empty = Arc::new(StructArray::new_empty_fields(len, None));
+        let field = ArrowField::new("empty", empty.data_type().clone(), true);
+        let nulls =
+            parent_nulls.then(|| NullBuffer::from((0..len).map(|i| i != 0).collect::<Vec<_>>()));
+        let outer =
+            StructArray::try_new_with_length(vec![field].into(), vec![empty], nulls, len).unwrap();
+        let expected_nulls = outer.nulls().cloned();
+        let result = fix_nested_null_masks(outer);
+        assert_eq!(result.len(), len);
+        let child = result.column(0).as_struct();
+        assert_eq!(child.len(), len);
+        assert_eq!(child.num_columns(), 0);
+        assert_eq!(child.nulls(), expected_nulls.as_ref());
     }
 
     /// Verify that `fix_nested_null_masks` handles a struct with a NullArray child column
