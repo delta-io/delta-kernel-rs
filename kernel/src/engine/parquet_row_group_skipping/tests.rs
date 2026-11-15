@@ -35,6 +35,7 @@ use crate::parquet::file::reader::{ChunkReader, FileReader};
 use crate::parquet::file::serialized_reader::SerializedFileReader;
 use crate::parquet::schema::types::{ColumnPath, Type};
 use crate::scan::data_skipping::as_checkpoint_skipping_predicate;
+use crate::schema::PrimitiveType;
 use crate::{KernelResult, Predicate};
 
 /// Empty partition column set for tests that don't need partition columns.

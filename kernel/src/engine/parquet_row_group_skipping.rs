@@ -1,6 +1,7 @@
 //! An implementation of parquet row group skipping using data skipping predicates over footer
 //! stats.
 use std::collections::{HashMap, HashSet};
+use std::string::String;
 use std::sync::Arc;
 
 use chrono::{DateTime, Days};
@@ -21,7 +22,8 @@ use crate::parquet::file::statistics::Statistics;
 use crate::parquet::schema::types::{
     ColumnDescPtr, ColumnDescriptor, SchemaDescriptor, Type as ParquetType,
 };
-use crate::schema::{DataType, DecimalType, PrimitiveType};
+use crate::schema::PrimitiveType::*;
+use crate::schema::{DataType, DecimalType};
 
 #[cfg(test)]
 mod tests;
@@ -180,7 +182,6 @@ impl ParquetStatsProvider for RowGroupFilter<'_> {
 /// microseconds and decimal stats widened to the requested scale using the column's Parquet
 /// annotation; a decimal stat that cannot be widened exactly is `None`.
 fn extract_min_scalar(data_type: &DataType, column: &ColumnChunkMetaData) -> Option<Scalar> {
-    use PrimitiveType::*;
     let value = match (data_type.as_primitive_opt()?, column.statistics()?) {
         (String, Statistics::ByteArray(s)) => s.min_opt()?.as_utf8().ok()?.into(),
         (String, Statistics::FixedLenByteArray(s)) => s.min_opt()?.as_utf8().ok()?.into(),
@@ -239,7 +240,6 @@ fn extract_min_scalar(data_type: &DataType, column: &ColumnChunkMetaData) -> Opt
 /// microseconds and decimal stats widened to the requested scale using the column's Parquet
 /// annotation; a decimal stat that cannot be widened exactly is `None`.
 fn extract_max_scalar(data_type: &DataType, column: &ColumnChunkMetaData) -> Option<Scalar> {
-    use PrimitiveType::*;
     let value = match (data_type.as_primitive_opt()?, column.statistics()?) {
         (String, Statistics::ByteArray(s)) => s.max_opt()?.as_utf8().ok()?.into(),
         (String, Statistics::FixedLenByteArray(s)) => s.max_opt()?.as_utf8().ok()?.into(),
