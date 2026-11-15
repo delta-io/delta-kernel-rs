@@ -1087,8 +1087,6 @@ struct LeafRefVisitor<'u> {
     /// The current batch's leaf filter output, set by [`Self::visit_batch`]: row `i`'s leaf is
     /// [skipped](LeafRef::skipped) when `keep[i]` is false.
     keep: Vec<bool>,
-    /// Index within the current batch of the next row to visit.
-    next_row: usize,
 }
 
 impl<'u> LeafRefVisitor<'u> {
@@ -1097,7 +1095,6 @@ impl<'u> LeafRefVisitor<'u> {
             table_root,
             leaves: Vec::new(),
             keep: Vec::new(),
-            next_row: 0,
         }
     }
 
@@ -1112,7 +1109,6 @@ impl<'u> LeafRefVisitor<'u> {
             ))
         );
         self.keep = keep;
-        self.next_row = 0;
         self.visit_rows_of(batch)
     }
 }
@@ -1132,8 +1128,6 @@ impl RowVisitor for LeafRefVisitor<'_> {
         // `tracking.status` is the first tracking column; check it before parsing the rest of the
         // row.
         let status_index = tracking_start(getters);
-        let first_row = self.next_row;
-        self.next_row += row_count;
         for row in 0..row_count {
             let content_type = DataContentType::try_from_repr(getters[0].get(row, CONTENT_TYPE)?)?;
             if content_type != DataContentType::DataManifest {
@@ -1144,7 +1138,7 @@ impl RowVisitor for LeafRefVisitor<'_> {
                 continue;
             }
             let mut leaf = LeafRef::try_from_getters(row, &getters[1..], self.table_root)?;
-            let keep = self.keep.get(first_row + row).copied().ok_or_else(|| {
+            let keep = self.keep.get(row).copied().ok_or_else(|| {
                 KernelError::internal_error("LeafRefVisitor visited a row outside `visit_batch`")
             })?;
             leaf.skipped = !keep;
