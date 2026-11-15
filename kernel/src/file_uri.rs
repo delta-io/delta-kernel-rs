@@ -125,9 +125,9 @@ pub(crate) fn new_referenced_file_path(
                     && extension
                         .chars()
                         .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.')),
-                KernelError::generic(format!(
-                    "Invalid referenced file extension {extension:?}: it must be non-empty and \
-                     contain only ASCII letters, digits, '-', '_' and '.'"
+                KernelError::invalid_referenced_file_path(format!(
+                    "extension {extension:?} is invalid: it must be non-empty and contain only \
+                     ASCII letters, digits, '-', '_' and '.'"
                 ))
             );
             format!(".{extension}")
@@ -156,8 +156,8 @@ fn write_location_uri_prefix(
         return Ok(format!("{FILES_DIR}/"));
     };
     let invalid = |reason: &str| {
-        KernelError::generic(format!(
-            "Invalid {FILE_TYPE_WRITE_LOCATION} {value:?}: {reason}"
+        KernelError::invalid_referenced_file_path(format!(
+            "{FILE_TYPE_WRITE_LOCATION} {value:?} is invalid: {reason}"
         ))
     };
     require!(
@@ -546,9 +546,12 @@ mod tests {
     #[case::absolute_fragment("s3://other/files#x", "query or fragment")]
     #[case::absolute_not_hierarchical("mailto:files@example.com", "hierarchical URI")]
     fn test_write_location_uri_prefix_rejects(#[case] value: &str, #[case] reason: &str) {
-        let err = write_location_uri_prefix(&root(), Some(value))
-            .unwrap_err()
-            .to_string();
+        let err = write_location_uri_prefix(&root(), Some(value)).unwrap_err();
+        assert!(
+            matches!(err, KernelError::InvalidReferencedFilePath(_)),
+            "{err:?}"
+        );
+        let err = err.to_string();
         assert!(err.contains("delta.fileType.writeLocation"), "{err}");
         assert!(err.contains(reason), "{err}");
     }
@@ -608,10 +611,14 @@ mod tests {
     #[case::space("p ng")]
     #[case::percent("p%2Fng")]
     fn test_new_referenced_file_path_rejects_invalid_extension(#[case] extension: &str) {
-        let err = new_referenced_file_path(&root(), None, Some(extension))
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("Invalid referenced file extension"), "{err}");
+        let err = new_referenced_file_path(&root(), None, Some(extension)).unwrap_err();
+        assert!(
+            matches!(err, KernelError::InvalidReferencedFilePath(_)),
+            "{err:?}"
+        );
+        let err = err.to_string();
+        assert!(err.contains("extension"), "{err}");
+        assert!(err.contains("is invalid"), "{err}");
     }
 
     #[test]
