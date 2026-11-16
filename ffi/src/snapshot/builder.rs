@@ -414,6 +414,8 @@ fn snapshot_builder_build_impl(
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::c_char;
+
     use delta_kernel::metrics::MetricEvent;
     use rstest::rstest;
     use test_utils::{CapturingReporter, TestAction, actions_to_string};
@@ -426,16 +428,22 @@ mod tests {
     };
     use crate::{free_engine, free_snapshot, kernel_string_slice};
 
-    #[test]
-    fn correlation_id_setter_copies_replaces_and_clears_input() {
+    #[rstest]
+    fn correlation_id_setter_copies_input_and_consumes_builder_on_error(
+        #[values(false, true)] fail: bool,
+        #[values(std::ptr::null(), b"\xff".as_ptr().cast())] correlation_id_ptr: *const c_char,
+    ) {
         let engine = error_only_engine_handle();
         let table_root = "memory:///table/";
+        let engine_owner = unsafe { engine.clone_as_arc() };
+        let baseline = Arc::strong_count(&engine_owner);
         let builder = unsafe {
             ok_or_panic(get_snapshot_builder(
                 kernel_string_slice!(table_root),
                 engine.shallow_copy(),
             ))
         };
+        assert_eq!(Arc::strong_count(&engine_owner), baseline + 1);
         let mut id = String::from("request-1");
         let builder = unsafe {
             ok_or_panic(snapshot_builder_with_correlation_id(
@@ -460,51 +468,23 @@ mod tests {
             unsafe { builder.as_ref() }.correlation_id.as_deref(),
             Some("request-2")
         );
-        let builder = unsafe {
-            ok_or_panic(snapshot_builder_with_correlation_id(
-                builder,
-                KernelStringSlice {
-                    ptr: std::ptr::null(),
-                    len: 0,
-                },
-            ))
-        };
-        assert!(unsafe { builder.as_ref() }.correlation_id.is_none());
-        unsafe {
-            free_snapshot_builder(builder);
-            free_engine(engine);
-        }
-    }
-
-    #[rstest]
-    fn correlation_id_setter_consumes_builder_on_error(#[values(false, true)] null_pointer: bool) {
-        let engine = error_only_engine_handle();
-        let table_root = "memory:///table/";
-        let engine_owner = unsafe { engine.clone_as_arc() };
-        let baseline = Arc::strong_count(&engine_owner);
-        let builder = unsafe {
-            ok_or_panic(get_snapshot_builder(
-                kernel_string_slice!(table_root),
-                engine.shallow_copy(),
-            ))
-        };
-        assert_eq!(Arc::strong_count(&engine_owner), baseline + 1);
-        let invalid_utf8 = [0xffu8];
         let id = KernelStringSlice {
-            ptr: if null_pointer {
-                std::ptr::null()
-            } else {
-                invalid_utf8.as_ptr().cast()
-            },
-            len: 1,
+            ptr: correlation_id_ptr,
+            len: usize::from(fail),
         };
         let result = unsafe { snapshot_builder_with_correlation_id(builder, id) };
-        let expected = if null_pointer {
-            FFIKernelError::GenericError
+        if fail {
+            let expected = if correlation_id_ptr.is_null() {
+                FFIKernelError::GenericError
+            } else {
+                FFIKernelError::Utf8Error
+            };
+            assert_extern_result_error_with_message(result, expected, None);
         } else {
-            FFIKernelError::Utf8Error
-        };
-        assert_extern_result_error_with_message(result, expected, None);
+            let builder = ok_or_panic(result);
+            assert!(unsafe { builder.as_ref() }.correlation_id.is_none());
+            unsafe { free_snapshot_builder(builder) };
+        }
         assert_eq!(Arc::strong_count(&engine_owner), baseline);
         unsafe { free_engine(engine) };
     }
