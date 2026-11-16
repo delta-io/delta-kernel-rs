@@ -485,15 +485,28 @@ async fn row_tracking_unavailable_midstream_fails(#[case] properties: &[(&str, &
         .await;
 
     let res = execute_row_tracking(engine, &mock_table, get_schema()).map(|_| ());
-    assert!(
-        matches!(
-            &res,
-            Err(Error::Kernel(
-                KernelError::RowTrackingChangeFeedUnsupported(1)
-            ))
-        ),
-        "expected row tracking to be unavailable at version 1, got {res:?}"
+    let Error::Delta(error) = res.unwrap_err() else {
+        panic!("expected row-tracking transition error")
+    };
+    assert_eq!(
+        error.name(),
+        "DELTA_CHANGELOG_ROW_TRACKING_DISABLED_IN_RANGE"
     );
+    assert_eq!(error.sql_state(), Some("0AKDE"));
+    assert_eq!(
+        error
+            .parameters()
+            .iter()
+            .map(|p| (p.name(), p.value()))
+            .collect::<Vec<_>>(),
+        [("version", "1")]
+    );
+    let context = std::error::Error::source(&error).unwrap();
+    assert_eq!(context.to_string(), "commit v=1");
+    assert!(matches!(
+        context.source().unwrap().downcast_ref::<KernelError>(),
+        Some(KernelError::RowTrackingChangeFeedUnsupported(1))
+    ));
 }
 
 fn nested_id_type(value_type: DataType) -> DataType {
