@@ -237,6 +237,7 @@ fn keyed<T: CheckpointEntry>(entries: &[T]) -> impl Iterator<Item = (String, T)>
 
 #[cfg(test)]
 mod tests {
+    use std::fmt::Debug;
     use std::sync::Arc;
 
     use itertools::Itertools as _;
@@ -775,7 +776,8 @@ mod tests {
     }
 
     // The checkpoint action holds the `inline` app id and domain inline, and `kept` and `spilled`
-    // in sidecars.
+    // in sidecars. A case's changes apply only to the kinds selected by `txns_change` and
+    // `domains_change`, so the other kind must come through untouched.
     #[rstest]
     #[case::unchanged(None, None, &["inline"], true)]
     #[case::new_entry(Some("new"), None, &["inline", "new"], true)]
@@ -787,6 +789,8 @@ mod tests {
         #[case] logged: Option<&str>,
         #[case] inline_keys: &[&str],
         #[case] sidecars_kept: bool,
+        #[values(true, false)] txns_change: bool,
+        #[values(true, false)] domains_change: bool,
     ) -> Result<()> {
         let (engine, table_root) = setup_table()?;
         let mut existing = minimal_checkpoint_action("metadata/root-v1.parquet", 1)?;
@@ -808,50 +812,66 @@ mod tests {
             sidecar_keys.map(|key| domain(key, "{}")),
         )];
         write_manifest_commit(&engine, &table_root, 1, existing.clone())?;
-        let logged_domain = logged.map(|key| domain(key, r#"{"logged":true}"#));
-        let logged_txn = logged.map(|key| SetTransaction::new(key.to_string(), 3, None));
-        if let Some((dm, txn)) = logged_domain.clone().zip(logged_txn.clone()) {
-            let lines = [domain_metadata_line(dm), txn_line(&txn.app_id, txn.version)];
-            write_log_lines(&engine, &table_root, lines)?;
-        }
+        let logged_domain = logged
+            .filter(|_| domains_change)
+            .map(|key| domain(key, r#"{"logged":true}"#));
+        let logged_txn = logged
+            .filter(|_| txns_change)
+            .map(|key| SetTransaction::new(key.to_string(), 3, None));
+        let lines = logged_domain
+            .clone()
+            .map(domain_metadata_line)
+            .into_iter()
+            .chain(
+                logged_txn
+                    .as_ref()
+                    .map(|txn| txn_line(&txn.app_id, txn.version)),
+            );
+        write_log_lines(&engine, &table_root, lines)?;
 
         let set_transactions: Vec<_> = changed
+            .filter(|_| txns_change)
             .map(|key| SetTransaction::new(key.to_string(), 2, None))
             .into_iter()
             .collect();
         let dm_changes: Vec<_> = changed
+            .filter(|_| domains_change)
             .map(|key| DomainMetadata::new(key.to_string(), r#"{"changed":true}"#.to_string()))
             .into_iter()
             .collect();
         let checkpoint = compute_at_latest(&engine, &table_root, &dm_changes, &set_transactions)?;
 
-        let app_ids = checkpoint.transactions.iter().map(|t| t.app_id.as_str());
-        assert_eq!(app_ids.sorted().collect_vec(), inline_keys);
-        let domains = checkpoint.domain_metadata.iter().map(|d| d.domain());
-        assert_eq!(domains.sorted().collect_vec(), inline_keys);
-        assert!(
-            set_transactions
-                .iter()
-                .chain(&logged_txn)
-                .all(|t| checkpoint.transactions.contains(t))
-        );
-        assert!(
-            dm_changes
-                .iter()
-                .chain(&logged_domain)
-                .all(|d| checkpoint.domain_metadata.contains(d))
-        );
-        let (txn_sidecars, domain_metadata_sidecars) = if sidecars_kept {
-            (existing.txn_sidecars, existing.domain_metadata_sidecars)
-        } else {
-            (vec![], vec![])
+        let expected = |kind_changes| match kind_changes {
+            true => (inline_keys, sidecars_kept),
+            false => (&["inline"][..], true),
         };
-        assert_eq!(checkpoint.txn_sidecars, txn_sidecars);
-        assert_eq!(
-            checkpoint.domain_metadata_sidecars,
-            domain_metadata_sidecars
-        );
+        let (keys, kept) = expected(txns_change);
+        let txn_changes = set_transactions.iter().chain(&logged_txn);
+        assert_checkpoint_entries(&checkpoint, &existing, txn_changes, keys, kept);
+        let (keys, kept) = expected(domains_change);
+        let domain_changes = dm_changes.iter().chain(&logged_domain);
+        assert_checkpoint_entries(&checkpoint, &existing, domain_changes, keys, kept);
         Ok(())
+    }
+
+    /// Asserts `checkpoint` holds exactly `inline_keys` of kind `T` inline, including every entry
+    /// in `changes`, and carries `existing`'s sidecars of that kind iff `sidecars_kept`.
+    fn assert_checkpoint_entries<'a, T: CheckpointEntry + PartialEq + Debug + 'a>(
+        checkpoint: &CheckpointAction,
+        existing: &CheckpointAction,
+        changes: impl IntoIterator<Item = &'a T>,
+        inline_keys: &[&str],
+        sidecars_kept: bool,
+    ) {
+        let inline = T::inline(checkpoint);
+        let keys = inline.iter().map(|entry| entry.key()).sorted();
+        assert_eq!(keys.collect_vec(), inline_keys);
+        assert!(changes.into_iter().all(|entry| inline.contains(entry)));
+        let expected_sidecars = match sidecars_kept {
+            true => T::sidecars(existing),
+            false => &[],
+        };
+        assert_eq!(T::sidecars(checkpoint), expected_sidecars);
     }
 
     // The checkpoint action holds domain `inline` inline and `spilled` in a sidecar. Cases that
