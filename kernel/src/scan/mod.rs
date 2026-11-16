@@ -582,7 +582,7 @@ impl ScanBuilder {
     /// Extra-indexed columns that cannot be resolved are omitted with a warning. Returns an error
     /// when a column requested through [`StatsOptions::struct_columns`] cannot be resolved, or when
     /// the selected fields cannot form a valid statistics schema.
-    pub fn stats_output_schemas(&self) -> KernelResult<Option<StatsOutputSchemas>> {
+    pub fn stats_output_schemas(&self) -> Result<Option<StatsOutputSchemas>> {
         build_stats_output_schemas(self.snapshot.table_configuration(), &self.stats)
     }
 
@@ -740,7 +740,7 @@ impl PhysicalPredicate {
         predicate: &Predicate,
         logical_schema: &Schema,
         column_mapping_mode: ColumnMappingMode,
-    ) -> KernelResult<PhysicalPredicate> {
+    ) -> Result<PhysicalPredicate> {
         if can_statically_skip_all_files(predicate) {
             return Ok(PhysicalPredicate::StaticSkipAll);
         }
@@ -994,16 +994,16 @@ pub struct Scan {
 pub(crate) fn build_stats_output_schemas(
     table_configuration: &TableConfiguration,
     stats: &StatsOptions,
-) -> KernelResult<Option<StatsOutputSchemas>> {
+) -> Result<Option<StatsOutputSchemas>> {
     match &stats.struct_stats {
         StructStats::None => Ok(None),
-        StructStats::AllIndexed { extra_indexed } => table_configuration
+        StructStats::AllIndexed { extra_indexed } => Ok(table_configuration
             .build_indexed_stats_output_schemas(
                 extra_indexed,
                 stats.variant_min_max,
                 #[cfg(feature = "geo-type-in-dev")]
                 stats.geometry_min_max,
-            ),
+            )?),
         StructStats::Columns { requested } => table_configuration
             .build_selected_stats_output_schemas(
                 requested,

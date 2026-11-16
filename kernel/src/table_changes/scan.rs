@@ -17,7 +17,7 @@ use crate::scan::state_info::StateInfo;
 use crate::scan::{PartitionValuesOptions, PhysicalPredicate, StatsOptions};
 use crate::schema::{MetadataColumnSpec, SchemaRef};
 use crate::utils::FoldWithOption as _;
-use crate::{Engine, EngineData, Error, FileMeta, KernelError, KernelResult, PredicateRef, Result};
+use crate::{Engine, EngineData, Error, FileMeta, KernelError, PredicateRef, Result};
 
 /// The result of building a [`TableChanges`] scan over a table. This can be used to get the change
 /// data feed from the table.
@@ -110,14 +110,14 @@ impl TableChangesScanBuilder {
     /// provided schema make sense, and to prepare some metadata that the scan will need.  The
     /// [`TableChangesScan`] type itself can be used to fetch the files and associated metadata
     /// required to perform actual data reads.
-    pub fn build(self) -> KernelResult<TableChangesScan> {
+    pub fn build(self) -> Result<TableChangesScan> {
         // Row-tracking CDF requires row-level reconciliation by row IDs, which this
         // scanner does not perform.
         if self.table_changes.mode != CdfMode::ChangeDataFeed {
-            return Err(KernelError::unsupported(
+            return Err(Error::Kernel(KernelError::unsupported(
                 "A row-tracking TableChanges cannot be scanned for data; use \
                  TableChanges::scan_file_listing instead",
-            ));
+            )));
         }
         // Predicates may reference any column in the full CDF-extended schema even when
         // `with_schema` narrows the output. Resolve predicate columns against the full schema
@@ -128,9 +128,9 @@ impl TableChangesScanBuilder {
         if logical_read_schema.contains_metadata_column(&MetadataColumnSpec::RowId)
             || logical_read_schema.contains_metadata_column(&MetadataColumnSpec::RowCommitVersion)
         {
-            return Err(KernelError::unsupported(
+            return Err(Error::Kernel(KernelError::unsupported(
                 "Row ID and Row Commit Version metadata are unsupported in CDF scans",
-            ));
+            )));
         }
 
         // Create StateInfo using CDF field classifier

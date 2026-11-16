@@ -1,4 +1,3 @@
-use crate::scan::column_lookup_error;
 //! StateInfo handles the state that we use through log-replay in order to correctly construct all
 //! the physical->logical transforms needed for each add file
 
@@ -12,11 +11,13 @@ use crate::actions::NULL_COUNT;
 use crate::expressions::ColumnName;
 use crate::scan::field_classifiers::TransformFieldClassifier;
 use crate::scan::transform_spec::{FieldTransformSpec, TransformSpec};
-use crate::scan::{PartitionValuesOptions, PhysicalPredicate, StatsOptions, StructStats};
+use crate::scan::{
+    PartitionValuesOptions, PhysicalPredicate, StatsOptions, StructStats, column_lookup_error,
+};
 use crate::schema::{DataType, MetadataColumnSpec, SchemaRef, StructType};
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::{ColumnMappingMode, TableFeature, get_any_level_column_physical_name};
-use crate::{KernelError, KernelResult, PredicateRef, StructField};
+use crate::{Error, KernelError, KernelResult, PredicateRef, Result, StructField};
 
 /// Resolved physical statistics schemas for a scan.
 ///
@@ -349,7 +350,7 @@ fn resolve_physical_columns_with_warnings(
 fn resolve_physical_columns_strict(
     table_configuration: &TableConfiguration,
     logical: &[ColumnName],
-) -> KernelResult<Vec<ColumnName>> {
+) -> Result<Vec<ColumnName>> {
     let logical_schema = table_configuration.logical_schema();
     let column_mapping_mode = table_configuration.column_mapping_mode();
     logical
@@ -396,7 +397,7 @@ impl StateInfo {
         stats: &StatsOptions,
         partition_values: &PartitionValuesOptions,
         classifier: C,
-    ) -> KernelResult<Self> {
+    ) -> Result<Self> {
         stats.validate()?;
         let partition_columns = table_configuration.logical_partition_columns();
         let column_mapping_mode = table_configuration.column_mapping_mode();
@@ -465,9 +466,9 @@ impl StateInfo {
                         };
                         let Some(row_id_col_name) = metadata_info.materialized_row_id_column_name
                         else {
-                            return Err(KernelError::internal_error(
+                            return Err(Error::Kernel(KernelError::internal_error(
                                 "Should always return a materialized_row_id_column_name if selecting row ids",
-                            ));
+                            )));
                         };
 
                         let row_id_col_name = row_id_col_name.to_string();
@@ -482,10 +483,10 @@ impl StateInfo {
                         let Some(row_commit_version_col_name) =
                             metadata_info.materialized_row_commit_version_column_name
                         else {
-                            return Err(KernelError::internal_error(
+                            return Err(Error::Kernel(KernelError::internal_error(
                                 "missing materialized Row Commit Version column name when row \
                                  tracking is enabled",
-                            ));
+                            )));
                         };
 
                         let row_commit_version_col_name = row_commit_version_col_name.to_string();
@@ -517,11 +518,11 @@ impl StateInfo {
                         if !logical_field.is_metadata_column()
                             && metadata_info.metadata_field_names.contains(&physical_name)
                         {
-                            return Err(KernelError::Schema(format!(
+                            return Err(Error::Kernel(KernelError::Schema(format!(
                                 "Metadata column names must not match physical columns, but logical column '{}' has physical name '{}'",
                                 logical_field.name(),
                                 physical_name,
-                            )));
+                            ))));
                         }
                         last_physical_field = Some(physical_name);
                     }
@@ -720,7 +721,6 @@ pub(crate) mod tests {
     use rstest::rstest;
 
     use super::*;
-    use crate::Result;
     use crate::actions::{MAX_VALUES, MIN_VALUES};
     use crate::expressions::{Predicate as Pred, col, column_name, expr, lit};
     #[cfg(feature = "geo-type-in-dev")]
@@ -971,7 +971,7 @@ pub(crate) mod tests {
             );
         }
 
-        Ok(StateInfo::try_new(
+        StateInfo::try_new(
             schema.clone(),
             table_configuration.logical_schema(),
             &table_configuration,
@@ -979,7 +979,7 @@ pub(crate) mod tests {
             &stats,
             &partition_values,
             (),
-        )?)
+        )
     }
 
     pub(crate) fn assert_transform_spec(
