@@ -20,7 +20,7 @@ pub struct SharedPlanExecutor;
 /// C callback, provided by the Engine, for executing an [`Operation`].
 ///
 /// `context` - an opaque pointer, originally passed to
-/// an executor constructor in [`super`].
+/// [`get_plan_executor`](super::get_plan_executor).
 /// `plan_proto` - a byte slice containing the proto-serialized representation of an [`Operation`]
 /// `out` - an out pointer into which the engine writes the result.
 ///
@@ -35,8 +35,7 @@ pub type CExecuteOpFn = extern "C" fn(
 
 /// A [`PlanExecutor`] implementation that forwards each [`Operation`] to a C callback.
 ///
-/// Constructed via [`get_plan_executor`](super::get_plan_executor) or
-/// [`get_plan_executor_with_pm_replay`](super::get_plan_executor_with_pm_replay), and released via
+/// Constructed via [`get_plan_executor`](super::get_plan_executor), and released via
 /// [`free_plan_executor`](super::free_plan_executor) when not consumed by an engine.
 pub struct FfiPlanExecutor {
     context: NullableCvoid,
@@ -161,7 +160,7 @@ mod tests {
     fn try_execute_dummy_op(expected_plan_result: CPlanResult) -> KernelResult<PlanResult> {
         let cell: Mutex<Option<CPlanResult>> = Mutex::new(Some(expected_plan_result));
         let context = Some(NonNull::from_ref(&cell).cast());
-        let executor = unsafe { get_plan_executor(context, mock_execute_op) };
+        let executor = unsafe { get_plan_executor(context, mock_execute_op, true) };
         let plan_executor: Arc<dyn PlanExecutor> = unsafe { executor.into_inner() };
 
         // Construct a dummy op because we don't actually care about the plan bytes here.
@@ -202,7 +201,7 @@ mod tests {
             unsafe { out.write(EngineExecResult::Failure(err)) };
         }
 
-        let executor = unsafe { get_plan_executor(None, fail_execute_op) };
+        let executor = unsafe { get_plan_executor(None, fail_execute_op, true) };
         let plan_executor: Arc<dyn PlanExecutor> = unsafe { executor.into_inner() };
 
         let url = Url::parse("memory:///table/").unwrap();
@@ -227,7 +226,7 @@ mod tests {
         ) {
         }
 
-        let executor = unsafe { get_plan_executor(None, noop_execute_op) };
+        let executor = unsafe { get_plan_executor(None, noop_execute_op, true) };
         let plan_executor: Arc<dyn PlanExecutor> = unsafe { executor.into_inner() };
 
         let url = Url::parse("memory:///table/").unwrap();
@@ -354,7 +353,7 @@ mod tests {
             unsafe { out.write(EngineExecResult::Success(CPlanResult::Unit)) };
         }
 
-        let executor = unsafe { get_plan_executor(None, validate_op) };
+        let executor = unsafe { get_plan_executor(None, validate_op, true) };
         let plan_executor: Arc<dyn PlanExecutor> = unsafe { executor.into_inner() };
 
         let url = Url::parse("memory:///table/").unwrap();
