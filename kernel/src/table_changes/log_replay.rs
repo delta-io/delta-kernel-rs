@@ -26,8 +26,8 @@ use crate::table_configuration::TableConfiguration;
 use crate::table_features::{Operation, TableFeature, format_features};
 use crate::utils::require;
 use crate::{
-    Engine, EngineData, Error, KernelError, KernelResult, KernelResultIterator, PredicateRef,
-    Result, RowVisitor, Version,
+    DeltaError, Engine, EngineData, Error, KernelError, KernelResult, KernelResultIterator,
+    PredicateRef, Result, RowVisitor, Version,
 };
 
 #[cfg(test)]
@@ -260,13 +260,20 @@ impl LogReplayScanner {
                 // Compatibility is evaluated against the end version's logical schema.
                 require!(
                     mode.schemas_compatible(&schema, table_schema.as_ref()),
-                    Error::Kernel(
-                        KernelError::change_data_feed_incompatible_schema_at_version(
-                            table_schema,
-                            &schema,
-                            commit_file.version
-                        )
-                    )
+                    Error::Delta(DeltaError::change_data_feed_incompatible_schema_change(
+                        *range.start(),
+                        *range.end(),
+                        table_schema,
+                        *range.end(),
+                        commit_file.version,
+                        Some(Box::new(
+                            KernelError::change_data_feed_incompatible_schema_at_version(
+                                table_schema,
+                                &schema,
+                                commit_file.version,
+                            )
+                        )),
+                    ))
                 );
             }
 

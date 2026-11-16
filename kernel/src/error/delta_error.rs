@@ -105,6 +105,28 @@ impl DeltaError {
         &self.backtrace
     }
 
+    /// Reports the replay commit incompatible with the change feed's end-version read schema.
+    pub fn change_data_feed_incompatible_schema_change(
+        start: Version,
+        end: Version,
+        read_schema: &StructType,
+        read_version: Version,
+        incompatible_version: Version,
+        source: Option<BoxedError>,
+    ) -> Self {
+        Self::new(
+            DeltaErrorCondition::DeltaChangeDataFeedIncompatibleSchemaChange,
+            vec![
+                DeltaErrorParameter::new("start", start),
+                DeltaErrorParameter::new("end", end),
+                DeltaErrorParameter::new("readSchema", read_schema),
+                DeltaErrorParameter::new("readVersion", read_version),
+                DeltaErrorParameter::new("incompatibleVersion", incompatible_version),
+            ],
+            source,
+        )
+    }
+
     /// Reports a version without recorded change data in the requested inclusive range.
     pub fn missing_change_data(
         start_version: Version,

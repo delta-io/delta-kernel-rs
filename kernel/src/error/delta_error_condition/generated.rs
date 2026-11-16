@@ -14,6 +14,8 @@ use super::ConditionMetadata;
 pub enum DeltaErrorCondition {
     /// `DELTA_ADAPTIVE_METADATA_REQUIRES_COLUMN_MAPPING_ID_MODE` (SQLSTATE `42000`).
     DeltaAdaptiveMetadataRequiresColumnMappingIdMode,
+    /// `DELTA_CHANGE_DATA_FEED_INCOMPATIBLE_SCHEMA_CHANGE` (SQLSTATE `0AKDC`).
+    DeltaChangeDataFeedIncompatibleSchemaChange,
     /// `DELTA_DELETION_VECTOR_CHECKSUM_MISMATCH` (SQLSTATE `XXKDS`).
     DeltaDeletionVectorChecksumMismatch,
     /// `DELTA_DELETION_VECTOR_SIZE_MISMATCH` (SQLSTATE `XXKDS`).
@@ -52,6 +54,12 @@ impl DeltaErrorCondition {
                 sql_state: Some("42000"),
                 parameter_names: &["feature", "prop", "mode"],
                 message_template: "The table feature '<feature>' requires column mapping mode 'id', but the table property '<prop>' is set to '<mode>'. Recreate the table with '<prop>' = 'id', or omit the property to have it set automatically.",
+            },
+            Self::DeltaChangeDataFeedIncompatibleSchemaChange => ConditionMetadata {
+                name: "DELTA_CHANGE_DATA_FEED_INCOMPATIBLE_SCHEMA_CHANGE",
+                sql_state: Some("0AKDC"),
+                parameter_names: &["start", "end", "readSchema", "readVersion", "incompatibleVersion"],
+                message_template: "Retrieving table changes between version <start> and <end> failed because of an incompatible schema change.\nYour read schema is <readSchema> at version <readVersion>, but we found an incompatible schema change at version <incompatibleVersion>.\nIf possible, please query table changes separately from version <start> to <incompatibleVersion> - 1, and from version <incompatibleVersion> to <end>.",
             },
             Self::DeltaDeletionVectorChecksumMismatch => ConditionMetadata {
                 name: "DELTA_DELETION_VECTOR_CHECKSUM_MISMATCH",
