@@ -16,9 +16,10 @@ pub mod result;
 
 /// Build a [`PlanExecutor`] backed by an engine-provided C callback.
 ///
-/// Set `supports_protocol_metadata_replay` to `true` to enable declarative protocol and metadata
-/// replay, or `false` to use imperative replay through engine handlers. The executor remains
-/// available for handler I/O and explicitly requested plans. See
+/// Pass `true` for `supports_protocol_metadata_replay` if the callback supports declarative
+/// protocol and metadata replay. Pass `false` for an executor limited to I/O operations and file
+/// scans; Kernel then performs that replay through engine handlers. This choice is fixed for the
+/// executor's lifetime. Handler I/O and explicitly requested plans still use the executor. See
 /// [`PlanExecutor::supports_protocol_metadata_replay`] for the support contract.
 ///
 /// The returned handle can be consumed by [`get_plan_based_engine`] or released with
