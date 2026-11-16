@@ -32,6 +32,7 @@ use crate::schema::{
     self, ColumnMetadataKey, DataType, MetadataColumnSpec, StructField, StructType, schema,
     schema_ref,
 };
+use crate::table_changes::TableChanges;
 use crate::transaction::create_table::create_table;
 use crate::transaction::data_layout::DataLayout;
 use crate::unit_test_utils::TestCancellationToken;
@@ -2891,6 +2892,114 @@ fn scan_builder_stats_output_schemas_returns_none_without_struct_output(
         .with_stats(stats);
 
     assert!(builder.stats_output_schemas().unwrap().is_none());
+}
+
+struct FailingParquetHandler {
+    lazy: bool,
+    missing: bool,
+    paths: Arc<Mutex<Vec<String>>>,
+}
+
+impl ParquetHandler for FailingParquetHandler {
+    fn read_parquet_files(
+        &self,
+        files: &[FileMeta],
+        _schema: SchemaRef,
+        _predicate: Option<PredicateRef>,
+    ) -> KernelResult<FileDataReadResultIterator> {
+        self.paths
+            .lock()
+            .unwrap()
+            .extend(files.iter().map(|file| file.location.to_string()));
+        let error = if self.missing {
+            KernelError::FileNotFound("original engine diagnostic".into())
+        } else {
+            KernelError::Cancelled
+        };
+        if self.lazy {
+            Ok(Box::new(std::iter::once(Err(error))))
+        } else {
+            Err(error)
+        }
+    }
+
+    fn read_parquet_footer(&self, _: &FileMeta) -> KernelResult<ParquetFooter> {
+        panic!("unexpected footer read")
+    }
+
+    fn write_parquet_file(
+        &self,
+        _: Url,
+        _: Box<dyn KernelResultIterator<Box<dyn EngineData>>>,
+    ) -> KernelResult<FileSize> {
+        panic!("unexpected write")
+    }
+}
+
+#[rstest]
+fn required_data_file_errors_preserve_classification(
+    #[values(false, true)] lazy: bool,
+    #[values(false, true)] missing: bool,
+    #[values(false, true)] cdf: bool,
+) {
+    let fixture = if cdf {
+        "tests/data/table-with-cdf"
+    } else {
+        "tests/data/table-without-dv-small"
+    };
+    let root = Url::from_directory_path(fs::canonicalize(fixture).unwrap()).unwrap();
+    let paths = Arc::new(Mutex::new(vec![]));
+    let engine = Arc::new(
+        DelegatingEngine::new(Arc::new(SyncEngine::new())).with_parquet_handler(Arc::new(
+            FailingParquetHandler {
+                lazy,
+                missing,
+                paths: paths.clone(),
+            },
+        )),
+    );
+    let error = if cdf {
+        let changes = TableChanges::try_new(root.as_str(), engine.as_ref(), 0, Some(1)).unwrap();
+        Arc::new(changes)
+            .scan_builder()
+            .build()
+            .unwrap()
+            .execute(engine)
+            .unwrap()
+            .next()
+            .unwrap()
+            .err()
+            .expect("data-file failure")
+    } else {
+        let scan = Snapshot::builder_for(root.as_str())
+            .build(engine.as_ref())
+            .unwrap()
+            .scan_builder()
+            .build()
+            .unwrap();
+        scan.execute(engine)
+            .unwrap()
+            .next()
+            .unwrap()
+            .err()
+            .expect("data-file failure")
+    };
+    if missing {
+        let Error::Delta(error) = error else {
+            panic!("expected missing-file Delta error")
+        };
+        assert_eq!(error.name(), "DELTA_FILE_NOT_FOUND");
+        assert_eq!(error.sql_state(), Some("42K03"));
+        assert_eq!(error.parameters()[0].name(), "path");
+        let path = error.parameters()[0].value();
+        assert_eq!(path, paths.lock().unwrap()[0]);
+        assert_eq!(
+            std::error::Error::source(&error).unwrap().to_string(),
+            KernelError::FileNotFound("original engine diagnostic".into()).to_string()
+        );
+    } else {
+        assert!(matches!(error, Error::Kernel(KernelError::Cancelled)));
+    }
 }
 
 /// A [`ParquetHandler`] that returns an empty iterator for every `read_parquet_files` call.
