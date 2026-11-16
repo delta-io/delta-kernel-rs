@@ -140,6 +140,14 @@ impl ParquetReadPlan {
         };
 
         let metadata = if virtual_row_indexes {
+            // TODO(#3966): Support Arrow 59 row indexes without the i16 row-group ordinal limit.
+            #[cfg(all(feature = "arrow-59", not(feature = "arrow-60")))]
+            if metadata.metadata().num_row_groups() > i16::MAX as usize + 1 {
+                return Err(KernelError::unsupported(
+                    "Exact Parquet reads with Arrow 59 do not support row indexes in files \
+                     with more than 32,768 row groups",
+                ));
+            }
             let field = Arc::new(
                 Field::new("__kernel_row_number", DataType::Int64, false)
                     .with_extension_type(RowNumber),

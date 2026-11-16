@@ -163,6 +163,10 @@ impl FileRowSelection {
 /// projection. Projected field-ID bindings, nullable parents with only missing children, nested
 /// collection reconciliation, and reordered FILE fields need further work.
 /// This API is not used by [`crate::scan::Scan::execute`].
+///
+/// With Arrow 59, built-in engines return [`KernelError::Unsupported`] before emitting batches
+/// if a file has more than 32,768 row groups and the output or predicate needs row indexes.
+/// Arrow 60 does not have this limit.
 #[derive(Default, Clone)]
 pub struct ParquetReadOptions {
     output_schema: Option<SchemaRef>,

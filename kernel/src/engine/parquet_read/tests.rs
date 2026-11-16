@@ -14,7 +14,7 @@ use crate::engine::sync::SyncEngine;
 use crate::expressions::{Predicate, col, lit};
 use crate::metrics::MeteredParquetHandler;
 use crate::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-use crate::parquet::file::metadata::RowGroupMetaData;
+use crate::parquet::file::metadata::{FileMetaData, ParquetMetaData, RowGroupMetaData};
 use crate::parquet::file::properties::WriterProperties;
 use crate::parquet::file::reader::{ChunkReader, Length};
 use crate::scan::state::DvInfo;
@@ -445,6 +445,105 @@ fn exact_read_row_indexes_use_footer_order_with_missing_ordinal() {
             .values(),
         &[6, 7, 9]
     );
+}
+
+#[rstest]
+fn exact_read_row_group_limit_depends_on_arrow_version_and_row_indexes(
+    #[values(32_768, 32_769)] row_group_count: usize,
+    #[values(false, true)] project_row_index: bool,
+    #[values(false, true)] filter_row_index: bool,
+) {
+    let bytes = file_bytes();
+    let metadata = ArrowReaderMetadata::load(&bytes, reader_options()).unwrap();
+    let group = metadata.metadata().row_group(0);
+    // Reuse real column chunks to keep the boundary fixture small. Omit the optional ordinals.
+    let group = RowGroupMetaData::builder(group.schema_descr_ptr())
+        .set_num_rows(group.num_rows())
+        .set_total_byte_size(group.total_byte_size())
+        .set_column_metadata(group.columns().to_vec())
+        .build()
+        .unwrap();
+    let total_rows = row_group_count as i64 * group.num_rows();
+    let file_metadata =
+        FileMetaData::new(1, total_rows, None, None, group.schema_descr_ptr(), None);
+    let metadata = ArrowReaderMetadata::try_new(
+        Arc::new(ParquetMetaData::new(
+            file_metadata,
+            vec![group; row_group_count],
+        )),
+        reader_options(),
+    )
+    .unwrap();
+    let schema = Arc::new(
+        schema_ref! { nullable "x": INTEGER }
+            .add_metadata_column("position", MetadataColumnSpec::RowIndex)
+            .unwrap(),
+    );
+    let output = schema
+        .project(if project_row_index {
+            &["x", "position"][..]
+        } else {
+            &["x"][..]
+        })
+        .unwrap();
+    let mut options = ParquetReadOptions::default()
+        .with_output_schema(output)
+        .with_row_selection(
+            FileRowSelection::from_ranges(std::iter::once(
+                (total_rows - 4) as u64..total_rows as u64,
+            ))
+            .unwrap(),
+        )
+        .with_result_offset(1)
+        .with_result_limit(1);
+    if filter_row_index {
+        options = options.with_row_filter(Arc::new(col!("position").ge(lit(total_rows - 3))));
+    }
+    let plan = ParquetReadPlan::new(metadata, schema, options, "file".into());
+    if cfg!(all(feature = "arrow-59", not(feature = "arrow-60")))
+        && row_group_count > 32_768
+        && (project_row_index || filter_row_index)
+    {
+        let Err(error) = plan else {
+            panic!("Arrow 59 must reject unsupported row indexes before decoding");
+        };
+        let KernelError::Unsupported(message) = error.without_backtrace() else {
+            panic!("Expected Unsupported, got {error}");
+        };
+        assert!(message.contains("Arrow 59"));
+        assert!(message.contains("32,768 row groups"));
+        return;
+    }
+    let (builder, finish) = plan.unwrap().configure(|metadata| {
+        ParquetRecordBatchReaderBuilder::new_with_metadata(bytes, metadata).with_batch_size(2)
+    });
+    let batches = builder
+        .build()
+        .unwrap()
+        .map(|batch| finish(batch.unwrap()).map(Into::into))
+        .collect::<KernelResult<Vec<RecordBatch>>>()
+        .unwrap();
+    let result = concat_batches(&batches[0].schema(), &batches).unwrap();
+    let values = result
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .unwrap();
+    assert_eq!(
+        values.iter().collect::<Vec<_>>(),
+        vec![if filter_row_index { None } else { Some(0) }]
+    );
+    if project_row_index {
+        let positions = result
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(
+            positions.values(),
+            &[total_rows - if filter_row_index { 2 } else { 3 }]
+        );
+    }
 }
 
 #[test]
