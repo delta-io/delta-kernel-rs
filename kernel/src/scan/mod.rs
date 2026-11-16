@@ -661,14 +661,15 @@ impl ScanBuilder {
         // Predicates may reference columns outside self.logical_read_schema, so resolve against the
         // full table schema
         let table_schema = self.snapshot.schema();
-        // Reject scans of empty-schema tables. CREATE TABLE accepts an empty schema as
-        // a transient state, but a scan over zero columns has no way to derive row
-        // counts downstream and panics in the arrow layer. Users must populate the
-        // schema with ALTER TABLE ADD COLUMN before scanning.
+        // CREATE TABLE accepts an empty schema, but scans require columns to derive row counts.
         if table_schema.num_fields() == 0 {
-            return Err(Error::Kernel(KernelError::generic(
+            let source = KernelError::generic(
                 "Cannot scan Delta table with empty schema; use ALTER TABLE ADD COLUMN \
                  to add at least one column before scanning",
+            );
+            return Err(Error::Delta(DeltaError::read_table_without_columns(
+                self.snapshot.table_root(),
+                Some(Box::new(source)),
             )));
         }
 
