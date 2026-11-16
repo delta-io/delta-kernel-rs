@@ -105,6 +105,20 @@ impl DeltaError {
         &self.backtrace
     }
 
+    /// Reports a scan of a table whose schema has no columns.
+    pub fn read_table_without_columns(
+        table_name: impl ToString,
+        source: Option<BoxedError>,
+    ) -> Self {
+        // TODO(https://github.com/delta-io/delta/issues/8177): Update the message in delta-io/delta
+        // to "Add at least one column to the table before reading it."
+        Self::new(
+            DeltaErrorCondition::DeltaReadTableWithoutColumns,
+            vec![DeltaErrorParameter::new("tableName", table_name)],
+            source,
+        )
+    }
+
     /// Reports an active file's partition value that cannot be read as the expected type.
     pub fn failed_cast_partition_value(
         value: &str,

@@ -46,6 +46,8 @@ pub enum DeltaErrorCondition {
     DeltaPartitionColumnNotFound,
     /// `DELTA_PATH_DOES_NOT_EXIST` (SQLSTATE `42K03`).
     DeltaPathDoesNotExist,
+    /// `DELTA_READ_TABLE_WITHOUT_COLUMNS` (SQLSTATE `428GU`).
+    DeltaReadTableWithoutColumns,
     /// `DELTA_TRUNCATED_TRANSACTION_LOG` (SQLSTATE `42K03`).
     DeltaTruncatedTransactionLog,
     /// `DELTA_VERSIONS_NOT_CONTIGUOUS` (SQLSTATE `KD00C`).
@@ -158,6 +160,12 @@ impl DeltaErrorCondition {
                 sql_state: Some("42K03"),
                 parameter_names: &["path"],
                 message_template: "<path> doesn't exist, or is not a Delta table.",
+            },
+            Self::DeltaReadTableWithoutColumns => ConditionMetadata {
+                name: "DELTA_READ_TABLE_WITHOUT_COLUMNS",
+                sql_state: Some("428GU"),
+                parameter_names: &["tableName"],
+                message_template: "You are trying to read a Delta table <tableName> that does not have any columns.\n\nWrite some new data with the option `mergeSchema = true` to be able to read the table.",
             },
             Self::DeltaTruncatedTransactionLog => ConditionMetadata {
                 name: "DELTA_TRUNCATED_TRANSACTION_LOG",
