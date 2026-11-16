@@ -293,7 +293,7 @@ async fn cdf_not_enabled() {
 
     assert!(matches!(
         res,
-        Err(Error::Kernel(KernelError::ChangeDataFeedUnsupported(_)))
+        Err(Error::Delta(ref error)) if error.name() == "DELTA_MISSING_CHANGE_DATA"
     ));
 }
 
@@ -430,7 +430,33 @@ async fn cdf_disabled_midstream() {
         )])
         .await;
 
-    assert_midstream_failure(engine, &mock_table);
+    let error = execute_table_changes(engine, &mock_table, 0, Some(1))
+        .err()
+        .unwrap();
+    let Error::Delta(error) = error else {
+        panic!("expected missing change data")
+    };
+    assert_eq!(error.name(), "DELTA_MISSING_CHANGE_DATA");
+    assert_eq!(error.sql_state(), Some("KD002"));
+    assert_eq!(
+        error
+            .parameters()
+            .iter()
+            .map(|p| (p.name(), p.value()))
+            .collect::<Vec<_>>(),
+        [
+            ("startVersion", "0"),
+            ("endVersion", "1"),
+            ("version", "1"),
+            ("key", ENABLE_CHANGE_DATA_FEED)
+        ]
+    );
+    let context = std::error::Error::source(&error).unwrap();
+    assert_eq!(context.to_string(), "commit v=1");
+    assert!(matches!(
+        context.source().unwrap().downcast_ref::<KernelError>(),
+        Some(KernelError::ChangeDataFeedUnsupported(1))
+    ));
 }
 
 #[rstest]
