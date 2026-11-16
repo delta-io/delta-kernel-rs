@@ -300,7 +300,9 @@ fn check_cast_compat(
         (ArrowDataType::Float32, ArrowDataType::Float64) => {
             Ok(DataTypeCompat::NeedsCast(target_type))
         }
-        (_, ArrowDataType::Decimal128(p, s)) if can_upcast_to_decimal(source_type, *p, *s) => {
+        (_, ArrowDataType::Decimal128(p, s))
+            if decimal_upcast_factor(source_type, *p, *s).is_some() =>
+        {
             Ok(DataTypeCompat::NeedsCast(target_type))
         }
         (ArrowDataType::Date32, ArrowDataType::Timestamp(_, None)) => {
@@ -321,16 +323,6 @@ fn check_cast_compat(
             "Incorrect datatype. Expected {target_type}, got {source_type}"
         ))),
     }
-}
-
-// Returns whether the given source type can be safely cast to a decimal with the given precision
-// and scale without loss of information.
-fn can_upcast_to_decimal(
-    source_type: &ArrowDataType,
-    target_precision: u8,
-    target_scale: i8,
-) -> bool {
-    decimal_upcast_factor(source_type, target_precision, target_scale).is_some()
 }
 
 /// Multiplier that widens unscaled values of `source_type` to a decimal of `target_precision` and
@@ -397,54 +389,57 @@ mod tests {
 
     #[test]
     fn accepts_safe_decimal_casts() {
-        assert!(can_upcast_to_decimal(&Decimal128(1, 0), 2u8, 0i8));
-        assert!(can_upcast_to_decimal(&Decimal128(1, 0), 2u8, 1i8));
-        assert!(can_upcast_to_decimal(&Decimal128(5, -2), 6u8, -2i8));
-        assert!(can_upcast_to_decimal(&Decimal128(5, -2), 6u8, -1i8));
-        assert!(can_upcast_to_decimal(&Decimal128(5, 1), 6u8, 1i8));
-        assert!(can_upcast_to_decimal(&Decimal128(5, 1), 6u8, 2i8));
-        assert!(can_upcast_to_decimal(
-            &Decimal128(10, 5),
-            crate::arrow::datatypes::DECIMAL128_MAX_PRECISION,
-            crate::arrow::datatypes::DECIMAL128_MAX_SCALE - 5
-        ));
+        assert!(decimal_upcast_factor(&Decimal128(1, 0), 2u8, 0i8).is_some());
+        assert!(decimal_upcast_factor(&Decimal128(1, 0), 2u8, 1i8).is_some());
+        assert!(decimal_upcast_factor(&Decimal128(5, -2), 6u8, -2i8).is_some());
+        assert!(decimal_upcast_factor(&Decimal128(5, -2), 6u8, -1i8).is_some());
+        assert!(decimal_upcast_factor(&Decimal128(5, 1), 6u8, 1i8).is_some());
+        assert!(decimal_upcast_factor(&Decimal128(5, 1), 6u8, 2i8).is_some());
+        assert!(
+            decimal_upcast_factor(
+                &Decimal128(10, 5),
+                crate::arrow::datatypes::DECIMAL128_MAX_PRECISION,
+                crate::arrow::datatypes::DECIMAL128_MAX_SCALE - 5
+            )
+            .is_some()
+        );
 
-        assert!(can_upcast_to_decimal(&Int8, 3u8, 0i8));
-        assert!(can_upcast_to_decimal(&Int8, 4u8, 0i8));
-        assert!(can_upcast_to_decimal(&Int8, 4u8, 1i8));
-        assert!(can_upcast_to_decimal(&Int8, 7u8, 2i8));
+        assert!(decimal_upcast_factor(&Int8, 3u8, 0i8).is_some());
+        assert!(decimal_upcast_factor(&Int8, 4u8, 0i8).is_some());
+        assert!(decimal_upcast_factor(&Int8, 4u8, 1i8).is_some());
+        assert!(decimal_upcast_factor(&Int8, 7u8, 2i8).is_some());
 
-        assert!(can_upcast_to_decimal(&Int16, 5u8, 0i8));
-        assert!(can_upcast_to_decimal(&Int16, 6u8, 0i8));
-        assert!(can_upcast_to_decimal(&Int16, 6u8, 1i8));
-        assert!(can_upcast_to_decimal(&Int16, 9u8, 2i8));
+        assert!(decimal_upcast_factor(&Int16, 5u8, 0i8).is_some());
+        assert!(decimal_upcast_factor(&Int16, 6u8, 0i8).is_some());
+        assert!(decimal_upcast_factor(&Int16, 6u8, 1i8).is_some());
+        assert!(decimal_upcast_factor(&Int16, 9u8, 2i8).is_some());
 
-        assert!(can_upcast_to_decimal(&Int32, 10u8, 0i8));
-        assert!(can_upcast_to_decimal(&Int32, 11u8, 0i8));
-        assert!(can_upcast_to_decimal(&Int32, 11u8, 1i8));
-        assert!(can_upcast_to_decimal(&Int32, 14u8, 2i8));
+        assert!(decimal_upcast_factor(&Int32, 10u8, 0i8).is_some());
+        assert!(decimal_upcast_factor(&Int32, 11u8, 0i8).is_some());
+        assert!(decimal_upcast_factor(&Int32, 11u8, 1i8).is_some());
+        assert!(decimal_upcast_factor(&Int32, 14u8, 2i8).is_some());
 
-        assert!(can_upcast_to_decimal(&Int64, 20u8, 0i8));
-        assert!(can_upcast_to_decimal(&Int64, 21u8, 0i8));
-        assert!(can_upcast_to_decimal(&Int64, 21u8, 1i8));
-        assert!(can_upcast_to_decimal(&Int64, 24u8, 2i8));
+        assert!(decimal_upcast_factor(&Int64, 20u8, 0i8).is_some());
+        assert!(decimal_upcast_factor(&Int64, 21u8, 0i8).is_some());
+        assert!(decimal_upcast_factor(&Int64, 21u8, 1i8).is_some());
+        assert!(decimal_upcast_factor(&Int64, 24u8, 2i8).is_some());
     }
 
     #[test]
     fn rejects_unsafe_decimal_casts() {
-        assert!(!can_upcast_to_decimal(&Decimal128(2, 0), 2u8, 1i8));
-        assert!(!can_upcast_to_decimal(&Decimal128(2, 0), 2u8, -1i8));
-        assert!(!can_upcast_to_decimal(&Decimal128(5, 2), 6u8, 4i8));
-        assert!(!can_upcast_to_decimal(&Decimal128(1, i8::MIN), 38, 0));
+        assert!(decimal_upcast_factor(&Decimal128(2, 0), 2u8, 1i8).is_none());
+        assert!(decimal_upcast_factor(&Decimal128(2, 0), 2u8, -1i8).is_none());
+        assert!(decimal_upcast_factor(&Decimal128(5, 2), 6u8, 4i8).is_none());
+        assert!(decimal_upcast_factor(&Decimal128(1, i8::MIN), 38, 0).is_none());
 
-        assert!(!can_upcast_to_decimal(&Int8, 2u8, 0i8));
-        assert!(!can_upcast_to_decimal(&Int8, 3u8, 1i8));
-        assert!(!can_upcast_to_decimal(&Int16, 4u8, 0i8));
-        assert!(!can_upcast_to_decimal(&Int16, 5u8, 1i8));
-        assert!(!can_upcast_to_decimal(&Int32, 9u8, 0i8));
-        assert!(!can_upcast_to_decimal(&Int32, 10u8, 1i8));
-        assert!(!can_upcast_to_decimal(&Int64, 19u8, 0i8));
-        assert!(!can_upcast_to_decimal(&Int64, 20u8, 1i8));
+        assert!(decimal_upcast_factor(&Int8, 2u8, 0i8).is_none());
+        assert!(decimal_upcast_factor(&Int8, 3u8, 1i8).is_none());
+        assert!(decimal_upcast_factor(&Int16, 4u8, 0i8).is_none());
+        assert!(decimal_upcast_factor(&Int16, 5u8, 1i8).is_none());
+        assert!(decimal_upcast_factor(&Int32, 9u8, 0i8).is_none());
+        assert!(decimal_upcast_factor(&Int32, 10u8, 1i8).is_none());
+        assert!(decimal_upcast_factor(&Int64, 19u8, 0i8).is_none());
+        assert!(decimal_upcast_factor(&Int64, 20u8, 1i8).is_none());
     }
 
     /// Build a variant-shaped arrow struct from `(name, type)` pairs with the given nullability.

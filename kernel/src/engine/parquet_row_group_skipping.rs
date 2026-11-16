@@ -1,7 +1,6 @@
 //! An implementation of parquet row group skipping using data skipping predicates over footer
 //! stats.
 use std::collections::{HashMap, HashSet};
-use std::string::String;
 use std::sync::Arc;
 
 use chrono::{DateTime, Days};
@@ -22,8 +21,7 @@ use crate::parquet::file::statistics::Statistics;
 use crate::parquet::schema::types::{
     ColumnDescPtr, ColumnDescriptor, SchemaDescriptor, Type as ParquetType,
 };
-use crate::schema::PrimitiveType::*;
-use crate::schema::{DataType, DecimalType};
+use crate::schema::{DataType, DecimalType, PrimitiveType};
 
 #[cfg(test)]
 mod tests;
@@ -183,43 +181,45 @@ impl ParquetStatsProvider for RowGroupFilter<'_> {
 /// annotation; a decimal stat that cannot be widened exactly is `None`.
 fn extract_min_scalar(data_type: &DataType, column: &ColumnChunkMetaData) -> Option<Scalar> {
     let value = match (data_type.as_primitive_opt()?, column.statistics()?) {
-        (String, Statistics::ByteArray(s)) => s.min_opt()?.as_utf8().ok()?.into(),
-        (String, Statistics::FixedLenByteArray(s)) => s.min_opt()?.as_utf8().ok()?.into(),
-        (String, _) => return None,
-        (Long, Statistics::Int64(s)) => s.min_opt()?.into(),
-        (Long, Statistics::Int32(s)) => (*s.min_opt()? as i64).into(),
-        (Long, _) => return None,
-        (Integer, Statistics::Int32(s)) => s.min_opt()?.into(),
-        (Integer, _) => return None,
-        (Short, Statistics::Int32(s)) => (*s.min_opt()? as i16).into(),
-        (Short, _) => return None,
-        (Byte, Statistics::Int32(s)) => (*s.min_opt()? as i8).into(),
-        (Byte, _) => return None,
-        (Float, Statistics::Float(s)) => s.min_opt()?.into(),
-        (Float, _) => return None,
-        (Double, Statistics::Double(s)) => s.min_opt()?.into(),
-        (Double, Statistics::Float(s)) => (*s.min_opt()? as f64).into(),
-        (Double, _) => return None,
-        (Boolean, Statistics::Boolean(s)) => s.min_opt()?.into(),
-        (Boolean, _) => return None,
-        (Binary, Statistics::ByteArray(s)) => s.min_opt()?.data().into(),
-        (Binary, Statistics::FixedLenByteArray(s)) => s.min_opt()?.data().into(),
-        (Binary, _) => return None,
-        (Date, Statistics::Int32(s)) => Scalar::Date(*s.min_opt()?),
-        (Date, _) => return None,
-        (Timestamp, Statistics::Int64(s)) => Scalar::Timestamp(timestamp_stat_as_micros(
-            *s.min_opt()?,
-            column.column_descr(),
-        )?),
-        (Timestamp, _) => return None, // TODO: Int96 timestamps
-        (TimestampNtz, Statistics::Int64(s)) => Scalar::TimestampNtz(timestamp_stat_as_micros(
-            *s.min_opt()?,
-            column.column_descr(),
-        )?),
-        (TimestampNtz, Statistics::Int32(s)) => timestamp_from_date(s.min_opt())?,
-        (TimestampNtz, _) => return None, // TODO: Int96 timestamps
-        (IntervalYearMonth(_) | IntervalDayTime(_), _) => return None,
-        (Decimal(d), stats) => {
+        (PrimitiveType::String, Statistics::ByteArray(s)) => s.min_opt()?.as_utf8().ok()?.into(),
+        (PrimitiveType::String, Statistics::FixedLenByteArray(s)) => {
+            s.min_opt()?.as_utf8().ok()?.into()
+        }
+        (PrimitiveType::String, _) => return None,
+        (PrimitiveType::Long, Statistics::Int64(s)) => s.min_opt()?.into(),
+        (PrimitiveType::Long, Statistics::Int32(s)) => (*s.min_opt()? as i64).into(),
+        (PrimitiveType::Long, _) => return None,
+        (PrimitiveType::Integer, Statistics::Int32(s)) => s.min_opt()?.into(),
+        (PrimitiveType::Integer, _) => return None,
+        (PrimitiveType::Short, Statistics::Int32(s)) => (*s.min_opt()? as i16).into(),
+        (PrimitiveType::Short, _) => return None,
+        (PrimitiveType::Byte, Statistics::Int32(s)) => (*s.min_opt()? as i8).into(),
+        (PrimitiveType::Byte, _) => return None,
+        (PrimitiveType::Float, Statistics::Float(s)) => s.min_opt()?.into(),
+        (PrimitiveType::Float, _) => return None,
+        (PrimitiveType::Double, Statistics::Double(s)) => s.min_opt()?.into(),
+        (PrimitiveType::Double, Statistics::Float(s)) => (*s.min_opt()? as f64).into(),
+        (PrimitiveType::Double, _) => return None,
+        (PrimitiveType::Boolean, Statistics::Boolean(s)) => s.min_opt()?.into(),
+        (PrimitiveType::Boolean, _) => return None,
+        (PrimitiveType::Binary, Statistics::ByteArray(s)) => s.min_opt()?.data().into(),
+        (PrimitiveType::Binary, Statistics::FixedLenByteArray(s)) => s.min_opt()?.data().into(),
+        (PrimitiveType::Binary, _) => return None,
+        (PrimitiveType::Date, Statistics::Int32(s)) => Scalar::Date(*s.min_opt()?),
+        (PrimitiveType::Date, _) => return None,
+        (PrimitiveType::Timestamp, Statistics::Int64(s)) => Scalar::Timestamp(
+            timestamp_stat_as_micros(*s.min_opt()?, column.column_descr())?,
+        ),
+        (PrimitiveType::Timestamp, _) => return None, // TODO: Int96 timestamps
+        (PrimitiveType::TimestampNtz, Statistics::Int64(s)) => Scalar::TimestampNtz(
+            timestamp_stat_as_micros(*s.min_opt()?, column.column_descr())?,
+        ),
+        (PrimitiveType::TimestampNtz, Statistics::Int32(s)) => timestamp_from_date(s.min_opt())?,
+        (PrimitiveType::TimestampNtz, _) => return None, // TODO: Int96 timestamps
+        (PrimitiveType::IntervalYearMonth(_) | PrimitiveType::IntervalDayTime(_), _) => {
+            return None;
+        }
+        (PrimitiveType::Decimal(d), stats) => {
             let column = column.column_descr();
             decimal_stat_as(
                 decimal_unscaled(stats, column, DecimalBound::Min)?,
@@ -228,9 +228,9 @@ fn extract_min_scalar(data_type: &DataType, column: &ColumnChunkMetaData) -> Opt
             )?
         }
         // Void columns have no Parquet representation, so no stats exist
-        (Void, _) => return None,
+        (PrimitiveType::Void, _) => return None,
         #[cfg(feature = "geo-type-in-dev")]
-        (Geometry(_) | Geography(_), _) => return None,
+        (PrimitiveType::Geometry(_) | PrimitiveType::Geography(_), _) => return None,
     };
     Some(value)
 }
@@ -241,43 +241,45 @@ fn extract_min_scalar(data_type: &DataType, column: &ColumnChunkMetaData) -> Opt
 /// annotation; a decimal stat that cannot be widened exactly is `None`.
 fn extract_max_scalar(data_type: &DataType, column: &ColumnChunkMetaData) -> Option<Scalar> {
     let value = match (data_type.as_primitive_opt()?, column.statistics()?) {
-        (String, Statistics::ByteArray(s)) => s.max_opt()?.as_utf8().ok()?.into(),
-        (String, Statistics::FixedLenByteArray(s)) => s.max_opt()?.as_utf8().ok()?.into(),
-        (String, _) => return None,
-        (Long, Statistics::Int64(s)) => s.max_opt()?.into(),
-        (Long, Statistics::Int32(s)) => (*s.max_opt()? as i64).into(),
-        (Long, _) => return None,
-        (Integer, Statistics::Int32(s)) => s.max_opt()?.into(),
-        (Integer, _) => return None,
-        (Short, Statistics::Int32(s)) => (*s.max_opt()? as i16).into(),
-        (Short, _) => return None,
-        (Byte, Statistics::Int32(s)) => (*s.max_opt()? as i8).into(),
-        (Byte, _) => return None,
-        (Float, Statistics::Float(s)) => s.max_opt()?.into(),
-        (Float, _) => return None,
-        (Double, Statistics::Double(s)) => s.max_opt()?.into(),
-        (Double, Statistics::Float(s)) => (*s.max_opt()? as f64).into(),
-        (Double, _) => return None,
-        (Boolean, Statistics::Boolean(s)) => s.max_opt()?.into(),
-        (Boolean, _) => return None,
-        (Binary, Statistics::ByteArray(s)) => s.max_opt()?.data().into(),
-        (Binary, Statistics::FixedLenByteArray(s)) => s.max_opt()?.data().into(),
-        (Binary, _) => return None,
-        (Date, Statistics::Int32(s)) => Scalar::Date(*s.max_opt()?),
-        (Date, _) => return None,
-        (Timestamp, Statistics::Int64(s)) => Scalar::Timestamp(timestamp_stat_as_micros(
-            *s.max_opt()?,
-            column.column_descr(),
-        )?),
-        (Timestamp, _) => return None, // TODO: Int96 timestamps
-        (TimestampNtz, Statistics::Int64(s)) => Scalar::TimestampNtz(timestamp_stat_as_micros(
-            *s.max_opt()?,
-            column.column_descr(),
-        )?),
-        (TimestampNtz, Statistics::Int32(s)) => timestamp_from_date(s.max_opt())?,
-        (TimestampNtz, _) => return None, // TODO: Int96 timestamps
-        (IntervalYearMonth(_) | IntervalDayTime(_), _) => return None,
-        (Decimal(d), stats) => {
+        (PrimitiveType::String, Statistics::ByteArray(s)) => s.max_opt()?.as_utf8().ok()?.into(),
+        (PrimitiveType::String, Statistics::FixedLenByteArray(s)) => {
+            s.max_opt()?.as_utf8().ok()?.into()
+        }
+        (PrimitiveType::String, _) => return None,
+        (PrimitiveType::Long, Statistics::Int64(s)) => s.max_opt()?.into(),
+        (PrimitiveType::Long, Statistics::Int32(s)) => (*s.max_opt()? as i64).into(),
+        (PrimitiveType::Long, _) => return None,
+        (PrimitiveType::Integer, Statistics::Int32(s)) => s.max_opt()?.into(),
+        (PrimitiveType::Integer, _) => return None,
+        (PrimitiveType::Short, Statistics::Int32(s)) => (*s.max_opt()? as i16).into(),
+        (PrimitiveType::Short, _) => return None,
+        (PrimitiveType::Byte, Statistics::Int32(s)) => (*s.max_opt()? as i8).into(),
+        (PrimitiveType::Byte, _) => return None,
+        (PrimitiveType::Float, Statistics::Float(s)) => s.max_opt()?.into(),
+        (PrimitiveType::Float, _) => return None,
+        (PrimitiveType::Double, Statistics::Double(s)) => s.max_opt()?.into(),
+        (PrimitiveType::Double, Statistics::Float(s)) => (*s.max_opt()? as f64).into(),
+        (PrimitiveType::Double, _) => return None,
+        (PrimitiveType::Boolean, Statistics::Boolean(s)) => s.max_opt()?.into(),
+        (PrimitiveType::Boolean, _) => return None,
+        (PrimitiveType::Binary, Statistics::ByteArray(s)) => s.max_opt()?.data().into(),
+        (PrimitiveType::Binary, Statistics::FixedLenByteArray(s)) => s.max_opt()?.data().into(),
+        (PrimitiveType::Binary, _) => return None,
+        (PrimitiveType::Date, Statistics::Int32(s)) => Scalar::Date(*s.max_opt()?),
+        (PrimitiveType::Date, _) => return None,
+        (PrimitiveType::Timestamp, Statistics::Int64(s)) => Scalar::Timestamp(
+            timestamp_stat_as_micros(*s.max_opt()?, column.column_descr())?,
+        ),
+        (PrimitiveType::Timestamp, _) => return None, // TODO: Int96 timestamps
+        (PrimitiveType::TimestampNtz, Statistics::Int64(s)) => Scalar::TimestampNtz(
+            timestamp_stat_as_micros(*s.max_opt()?, column.column_descr())?,
+        ),
+        (PrimitiveType::TimestampNtz, Statistics::Int32(s)) => timestamp_from_date(s.max_opt())?,
+        (PrimitiveType::TimestampNtz, _) => return None, // TODO: Int96 timestamps
+        (PrimitiveType::IntervalYearMonth(_) | PrimitiveType::IntervalDayTime(_), _) => {
+            return None;
+        }
+        (PrimitiveType::Decimal(d), stats) => {
             let column = column.column_descr();
             decimal_stat_as(
                 decimal_unscaled(stats, column, DecimalBound::Max)?,
@@ -286,9 +288,9 @@ fn extract_max_scalar(data_type: &DataType, column: &ColumnChunkMetaData) -> Opt
             )?
         }
         // Void columns have no Parquet representation, so no stats exist
-        (Void, _) => return None,
+        (PrimitiveType::Void, _) => return None,
         #[cfg(feature = "geo-type-in-dev")]
-        (Geometry(_) | Geography(_), _) => return None,
+        (PrimitiveType::Geometry(_) | PrimitiveType::Geography(_), _) => return None,
     };
     Some(value)
 }
