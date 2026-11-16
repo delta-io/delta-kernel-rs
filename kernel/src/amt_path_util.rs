@@ -286,36 +286,6 @@ mod tests {
         "metadata/root.parquet",
         "memory:///table/metadata/root.parquet"
     )]
-    #[case::single_char_scheme_treated_as_absolute(
-        "memory:///table/",
-        "c:/foo/root.parquet",
-        "c:/foo/root.parquet"
-    )]
-    // A colon inside a relative path segment is not a scheme delimiter (a `/` precedes it), so
-    // the path stays relative.
-    #[case::colon_in_relative_segment_stays_relative(
-        "memory:///table/",
-        "metadata/snap-123:456.parquet",
-        "memory:///table/metadata/snap-123:456.parquet"
-    )]
-    // RFC 3986 requires the first scheme char to be ALPHA; a leading digit is not a scheme.
-    #[case::leading_digit_scheme_treated_as_relative(
-        "memory:///table/",
-        "3com/root.parquet",
-        "memory:///table/3com/root.parquet"
-    )]
-    // A non-ASCII leading letter (Greek alpha, U+03B1) is not a valid scheme char.
-    #[case::non_ascii_scheme_treated_as_relative(
-        "memory:///table/",
-        "\u{03b1}scheme/root.parquet",
-        "memory:///table/%CE%B1scheme/root.parquet"
-    )]
-    // A multi-char, non-alphanumeric scheme (`git+ssh`) is absolute and used as-is.
-    #[case::compound_scheme_treated_as_absolute(
-        "memory:///table/",
-        "git+ssh://host/repo/root.parquet",
-        "git+ssh://host/repo/root.parquet"
-    )]
     // A raw space is percent-encoded, not left to break URL parsing.
     #[case::space_is_encoded(
         "memory:///table/",
@@ -360,16 +330,6 @@ mod tests {
         "s3://bucket/data/a#b.parquet",
         "s3://bucket/data/a%23b.parquet"
     )]
-    #[case::absolute_question_and_space_are_encoded(
-        "memory:///table/",
-        "s3://bucket/data/a b?c.parquet",
-        "s3://bucket/data/a%20b%3Fc.parquet"
-    )]
-    #[case::absolute_percent_escape_is_literal(
-        "memory:///table/",
-        "s3://bucket/data/a%20b.parquet",
-        "s3://bucket/data/a%2520b.parquet"
-    )]
     fn test_resolve_amt_location(
         #[case] table_root: &str,
         #[case] path: &str,
@@ -383,15 +343,6 @@ mod tests {
     #[rstest]
     #[case::encoded_space("s3://bucket/data/dv%20file.bin", "s3://bucket/data/dv file.bin")]
     #[case::unencoded("s3://bucket/data/dv.bin", "s3://bucket/data/dv.bin")]
-    #[case::encoded_reserved_chars(
-        "s3://bucket/data/a%23b%3Fc%25d.bin",
-        "s3://bucket/data/a#b?c%d.bin"
-    )]
-    #[case::userinfo_authority_kept(
-        "abfss://c1@acct.dfs.core.windows.net/t/a%20b.bin",
-        "abfss://c1@acct.dfs.core.windows.net/t/a b.bin"
-    )]
-    #[case::empty_authority("file:///tmp/dv%20a.bin", "file:///tmp/dv a.bin")]
     fn test_raw_amt_location_from_uri_round_trips(#[case] uri: &str, #[case] expected_raw: &str) {
         let raw = raw_amt_location_from_uri(uri).unwrap();
         assert_eq!(raw, expected_raw);

@@ -906,7 +906,7 @@ fn map_changed_strings(
     let mapped = match input.data_type() {
         ArrowDataType::Utf8 => {
             let rows = input.as_string::<i32>();
-            let builder = LargeStringBuilder::with_capacity(rows.len(), rows.values().len());
+            let builder = || LargeStringBuilder::with_capacity(rows.len(), rows.values().len());
             // Large offsets keep the build from overflowing; the cast back to Utf8 then returns an
             // error where building a Utf8 array directly would panic.
             replay_changed_rows(rows, builder, f)
@@ -915,12 +915,12 @@ fn map_changed_strings(
         }
         ArrowDataType::LargeUtf8 => {
             let rows = input.as_string::<i64>();
-            let builder = LargeStringBuilder::with_capacity(rows.len(), rows.values().len());
+            let builder = || LargeStringBuilder::with_capacity(rows.len(), rows.values().len());
             replay_changed_rows(rows, builder, f)
         }
         ArrowDataType::Utf8View => {
             let rows = input.as_string_view();
-            replay_changed_rows(rows, StringViewBuilder::with_capacity(rows.len()), f)
+            replay_changed_rows(rows, || StringViewBuilder::with_capacity(rows.len()), f)
         }
         other => {
             return Err(KernelError::invalid_expression(format!(
@@ -931,12 +931,12 @@ fn map_changed_strings(
     Ok(mapped.unwrap_or_else(|| input.clone()))
 }
 
-/// `rows` with `f` applied, built with `builder`, or `None` when `f` borrows every row unchanged.
-/// Finding the first changed row costs one call of `f` per earlier row and allocates nothing; the
-/// rows before it are then copied as they are.
+/// `rows` with `f` applied, built with a builder from `make_builder`, or `None` when `f` borrows
+/// every row unchanged. Finding the first changed row costs one call of `f` per earlier row and
+/// allocates nothing; the rows before it are then copied as they are.
 fn replay_changed_rows<'a, B>(
     rows: impl StringArrayType<'a>,
-    mut builder: B,
+    make_builder: impl FnOnce() -> B,
     f: impl Fn(&'a str) -> Cow<'a, str>,
 ) -> Option<ArrayRef>
 where
@@ -945,6 +945,7 @@ where
     let first_changed = rows
         .iter()
         .position(|row| row.is_some_and(|row| matches!(f(row), Cow::Owned(_))))?;
+    let mut builder = make_builder();
     builder.extend(
         rows.iter()
             .take(first_changed)

@@ -101,8 +101,20 @@ mod tests {
     #[case::relative_space("data/a b.parquet", "data/a%20b.parquet")]
     #[case::relative_colon_kept("data/a:b.parquet", "data/a:b.parquet")]
     #[case::absolute_path_encoded("s3://bucket/a b#1.parquet", "s3://bucket/a%20b%231.parquet")]
+    #[case::absolute_question_and_space(
+        "s3://bucket/data/a b?c.parquet",
+        "s3://bucket/data/a%20b%3Fc.parquet"
+    )]
+    #[case::absolute_percent_escape_is_literal(
+        "s3://bucket/data/a%20b.parquet",
+        "s3://bucket/data/a%2520b.parquet"
+    )]
     #[case::empty_authority("file:///tmp/a b.parquet", "file:///tmp/a%20b.parquet")]
     #[case::authority_kept_verbatim("s3://[::1]/t/[x]", "s3://[::1]/t/%5Bx%5D")]
+    #[case::userinfo_authority_kept(
+        "abfss://c1@acct.dfs.core.windows.net/t/a b.bin",
+        "abfss://c1@acct.dfs.core.windows.net/t/a%20b.bin"
+    )]
     #[case::authority_only("s3://bucket", "s3://bucket")]
     #[case::no_authority("C:/data dir/a", "C:/data%20dir/a")]
     #[case::non_ascii("data/M\u{fc}nchen", "data/M%C3%BCnchen")]
