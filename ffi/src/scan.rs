@@ -1196,7 +1196,7 @@ pub unsafe extern "C" fn free_scan_metadata_arrow_result(result: *mut ScanMetada
 mod scan_builder_tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-    use std::ffi::c_void;
+    use std::ffi::{c_char, c_void};
     use std::sync::Arc;
 
     use delta_kernel::metrics::MetricEvent;
@@ -1236,14 +1236,22 @@ mod scan_builder_tests {
     };
 
     #[rstest]
+    #[case::preserves_id(false, None)]
+    #[case::clears_id(true, None)]
+    #[case::invalid_utf8(false, Some(b"\xff".as_ptr().cast()))]
+    #[case::null_pointer(false, Some(std::ptr::null()))]
     #[tokio::test]
-    async fn scan_builder_correlation_id_copies_replaces_and_clears_input(
-        #[values(false, true)] clear: bool,
+    async fn scan_builder_correlation_id_copies_input_and_consumes_builder_on_error(
+        #[case] clear: bool,
+        #[case] invalid_correlation_id_ptr: Option<*const c_char>,
     ) {
         let (engine, snapshot) = setup_snapshot(actions_to_string(vec![TestAction::Metadata]))
             .await
             .unwrap();
+        let snapshot_owner = unsafe { snapshot.clone_as_arc() };
+        let baseline = Arc::strong_count(&snapshot_owner);
         let builder = unsafe { scan_builder(snapshot.shallow_copy()) };
+        assert_eq!(Arc::strong_count(&snapshot_owner), baseline + 1);
         let initial_id = "initial-request";
         let builder = unsafe {
             ok_or_panic(scan_builder_with_correlation_id(
@@ -1253,86 +1261,61 @@ mod scan_builder_tests {
             ))
         };
         let mut id = String::from("scan-request");
-        let builder = unsafe {
-            ok_or_panic(scan_builder_with_correlation_id(
-                builder,
-                engine.shallow_copy(),
-                kernel_string_slice!(id),
-            ))
+        let correlation_id = match invalid_correlation_id_ptr {
+            Some(ptr) => KernelStringSlice { ptr, len: 1 },
+            None => kernel_string_slice!(id),
+        };
+        let result = unsafe {
+            scan_builder_with_correlation_id(builder, engine.shallow_copy(), correlation_id)
         };
         id.clear();
         drop(id);
-        let builder = if clear {
-            unsafe {
-                ok_or_panic(scan_builder_with_correlation_id(
-                    builder,
-                    engine.shallow_copy(),
-                    KernelStringSlice {
-                        ptr: std::ptr::null(),
-                        len: 0,
-                    },
-                ))
-            }
-        } else {
-            builder
-        };
-        let scan = unsafe { ok_or_panic(scan_builder_build(builder, engine.shallow_copy())) };
-        let reporter = Arc::new(CapturingReporter::default());
-        let _guard = install_thread_local_metrics_reporter(reporter.clone());
-        unsafe { scan.as_ref() }
-            .scan_metadata(unsafe { engine.as_ref() }.engine().as_ref())
-            .unwrap()
-            .collect::<Result<Vec<_>, _>>()
-            .unwrap();
-        let completions: Vec<_> = reporter
-            .events()
-            .into_iter()
-            .filter_map(|event| match event {
-                MetricEvent::ScanMetadataCompleted(event) => Some(event),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(completions.len(), 1);
-        assert_eq!(
-            completions[0].correlation_id.as_deref(),
-            if clear { None } else { Some("scan-request") },
-        );
-        unsafe {
-            free_scan(scan);
-            free_snapshot(snapshot);
-            free_engine(engine);
-        }
-    }
-
-    #[rstest]
-    #[tokio::test]
-    async fn scan_builder_correlation_id_consumes_builder_on_error(
-        #[values(false, true)] null_pointer: bool,
-    ) {
-        let (engine, snapshot) = setup_snapshot(actions_to_string(vec![TestAction::Metadata]))
-            .await
-            .unwrap();
-        let snapshot_owner = unsafe { snapshot.clone_as_arc() };
-        let baseline = Arc::strong_count(&snapshot_owner);
-        let builder = unsafe { scan_builder(snapshot.shallow_copy()) };
-        assert_eq!(Arc::strong_count(&snapshot_owner), baseline + 1);
-        let invalid_utf8 = [0xffu8];
-        let id = KernelStringSlice {
-            ptr: if null_pointer {
-                std::ptr::null()
+        if let Some(correlation_id_ptr) = invalid_correlation_id_ptr {
+            let expected = if correlation_id_ptr.is_null() {
+                FFIKernelError::GenericError
             } else {
-                invalid_utf8.as_ptr().cast()
-            },
-            len: 1,
-        };
-        let result =
-            unsafe { scan_builder_with_correlation_id(builder, engine.shallow_copy(), id) };
-        let expected = if null_pointer {
-            FFIKernelError::GenericError
+                FFIKernelError::Utf8Error
+            };
+            assert_extern_result_error_with_message(result, expected, None);
         } else {
-            FFIKernelError::Utf8Error
-        };
-        assert_extern_result_error_with_message(result, expected, None);
+            let builder = ok_or_panic(result);
+            let builder = if clear {
+                unsafe {
+                    ok_or_panic(scan_builder_with_correlation_id(
+                        builder,
+                        engine.shallow_copy(),
+                        KernelStringSlice {
+                            ptr: std::ptr::null(),
+                            len: 0,
+                        },
+                    ))
+                }
+            } else {
+                builder
+            };
+            let scan = unsafe { ok_or_panic(scan_builder_build(builder, engine.shallow_copy())) };
+            let reporter = Arc::new(CapturingReporter::default());
+            let _guard = install_thread_local_metrics_reporter(reporter.clone());
+            unsafe { scan.as_ref() }
+                .scan_metadata(unsafe { engine.as_ref() }.engine().as_ref())
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            let completions: Vec<_> = reporter
+                .events()
+                .into_iter()
+                .filter_map(|event| match event {
+                    MetricEvent::ScanMetadataCompleted(event) => Some(event),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(completions.len(), 1);
+            assert_eq!(
+                completions[0].correlation_id.as_deref(),
+                if clear { None } else { Some("scan-request") },
+            );
+            unsafe { free_scan(scan) };
+        }
         assert_eq!(Arc::strong_count(&snapshot_owner), baseline);
         unsafe {
             free_snapshot(snapshot);
