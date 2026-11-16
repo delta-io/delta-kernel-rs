@@ -219,7 +219,7 @@ impl TableChangesScan {
     pub fn execute(
         &self,
         engine: Arc<dyn Engine>,
-    ) -> KernelResult<impl Iterator<Item = KernelResult<Box<dyn EngineData>>> + Send + use<>> {
+    ) -> Result<impl Iterator<Item = Result<Box<dyn EngineData>>> + Send + use<>> {
         let scan_metadata = self.scan_metadata(engine.clone())?;
         let scan_files = scan_metadata_to_scan_file(scan_metadata);
 
@@ -259,7 +259,7 @@ fn read_scan_file(
     table_root: &Url,
     state_info: &StateInfo,
     _physical_predicate: Option<PredicateRef>,
-) -> KernelResult<impl Iterator<Item = KernelResult<Box<dyn EngineData>>> + Send + use<>> {
+) -> Result<impl Iterator<Item = Result<Box<dyn EngineData>>> + Send + use<>> {
     let ResolvedCdfScanFile {
         scan_file,
         mut selection_vector,
@@ -301,7 +301,7 @@ fn read_scan_file(
         .read_parquet_files(&[file], physical_schema, None)
         .map_err(|error| required_file_error(error, &location))?;
 
-    let result = read_result_iter.map(move |batch| -> KernelResult<_> {
+    let result = read_result_iter.map(move |batch| -> Result<_> {
         let batch = batch.map_err(|error| required_file_error(error, &location))?;
         // Transform the physical data into the correct logical form, or pass through unchanged.
         let logical = if let Some(ref eval) = phys_to_logical_eval {
