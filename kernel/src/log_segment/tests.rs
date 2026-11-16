@@ -1,3 +1,4 @@
+use std::error::Error as _;
 use std::iter;
 use std::sync::{Arc, LazyLock};
 
@@ -1253,9 +1254,11 @@ async fn test_non_contiguous_log() {
     ));
 }
 
+#[rstest]
 #[tokio::test]
-async fn table_changes_fails_with_larger_start_version_than_end() {
-    // Commit with version 1 is missing
+async fn table_changes_fails_with_larger_start_version_than_end(
+    #[values(false, true)] with_log_tail: bool,
+) {
     let (storage, log_root) = build_log_with_paths_and_checkpoint(
         &[
             delta_path_for_version(0, "json"),
@@ -1264,11 +1267,31 @@ async fn table_changes_fails_with_larger_start_version_than_end() {
         None,
     )
     .await;
-    let log_segment_res = LogSegment::for_table_changes(storage.as_ref(), log_root, 1, Some(0));
-    assert_result_error_with_message(
-        log_segment_res,
-        "Generic delta kernel error: Failed to build LogSegment: start_version cannot be greater than end_version",
+    let result = if with_log_tail {
+        LogSegment::for_table_changes_with_log_tail(storage.as_ref(), log_root, 1, Some(0), vec![])
+    } else {
+        LogSegment::for_table_changes(storage.as_ref(), log_root, 1, Some(0))
+    };
+    let Error::Delta(error) = result.unwrap_err() else {
+        panic!("expected Delta range error")
+    };
+    assert_eq!(error.name(), "DELTA_INVALID_CDC_RANGE");
+    assert_eq!(error.sql_state(), Some("22003"));
+    assert_eq!(
+        error
+            .parameters()
+            .iter()
+            .map(|p| (p.name(), p.value()))
+            .collect::<Vec<_>>(),
+        [("start", "1"), ("end", "0")]
     );
+    let source = error
+        .source()
+        .unwrap()
+        .downcast_ref::<KernelError>()
+        .unwrap();
+    assert!(matches!(source, KernelError::Generic(message)
+        if message == "Failed to build LogSegment: start_version cannot be greater than end_version"));
 }
 
 #[test_log::test(rstest::rstest)]

@@ -678,9 +678,15 @@ impl LogSegment {
         if let Some(end_version) = end_version
             && start_version > end_version
         {
-            return Err(KernelError::generic(
+            // TODO(3421): Remove the KernelError generic source following the error migration
+            let source = KernelError::generic(
                 "Failed to build LogSegment: start_version cannot be greater than end_version",
-            ));
+            );
+            return Err(Error::Delta(DeltaError::invalid_cdc_range(
+                start_version,
+                end_version,
+                Some(Box::new(source)),
+            )));
         }
 
         // TODO: compactions?

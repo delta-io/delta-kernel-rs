@@ -18,6 +18,8 @@ pub enum DeltaErrorCondition {
     DeltaDuplicateColumnsFoundExistingSchema,
     /// `DELTA_DUPLICATE_COLUMNS_FOUND.PARTITION_COLUMNS` (SQLSTATE `42711`).
     DeltaDuplicateColumnsFoundPartitionColumns,
+    /// `DELTA_INVALID_CDC_RANGE` (SQLSTATE `22003`).
+    DeltaInvalidCdcRange,
     /// `DELTA_LOG_FILE_NOT_FOUND` (SQLSTATE `42K03`).
     DeltaLogFileNotFound,
     /// `DELTA_PARSING_UNSUPPORTED_DATA_TYPE` (SQLSTATE `KD009`).
@@ -54,6 +56,12 @@ impl DeltaErrorCondition {
                 sql_state: Some("42711"),
                 parameter_names: &["duplicateCols"],
                 message_template: "Found duplicate column(s): <duplicateCols>. The duplicate was found in the partition columns.",
+            },
+            Self::DeltaInvalidCdcRange => ConditionMetadata {
+                name: "DELTA_INVALID_CDC_RANGE",
+                sql_state: Some("22003"),
+                parameter_names: &["start", "end"],
+                message_template: "CDC range from start <start> to end <end> was invalid. End cannot be before start.",
             },
             Self::DeltaLogFileNotFound => ConditionMetadata {
                 name: "DELTA_LOG_FILE_NOT_FOUND",

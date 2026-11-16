@@ -105,6 +105,18 @@ impl DeltaError {
         &self.backtrace
     }
 
+    /// Reports explicitly reversed bounds for a change-data-feed request.
+    pub fn invalid_cdc_range(start: Version, end: Version, source: Option<BoxedError>) -> Self {
+        Self::new(
+            DeltaErrorCondition::DeltaInvalidCdcRange,
+            vec![
+                DeltaErrorParameter::new("start", start),
+                DeltaErrorParameter::new("end", end),
+            ],
+            source,
+        )
+    }
+
     /// Creates a `DELTA_PATH_DOES_NOT_EXIST` error for a table root that does not exist or has no
     /// Delta log.
     ///
