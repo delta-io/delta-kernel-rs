@@ -3,12 +3,12 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use delta_kernel::Engine;
 use delta_kernel::arrow::array::{
     Array, ArrayRef, AsArray, BinaryArray, Int32Array, Int64Array, ListArray, MapArray,
     RecordBatch, StringArray, StructArray,
 };
 use delta_kernel::arrow::buffer::{NullBuffer, OffsetBuffer};
-use delta_kernel::arrow::compute::concat_batches;
 use delta_kernel::arrow::datatypes::{
     DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
 };
@@ -17,7 +17,7 @@ use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
 use delta_kernel::engine::{FileGroup, file_groups};
 use delta_kernel::expressions::{
-    ColumnName, Predicate as Pred, Scalar, col, column_expr, column_name, expr, lit,
+    ColumnName, Predicate as Pred, Scalar, column_expr, column_name, expr,
 };
 use delta_kernel::object_store::DynObjectStore;
 use delta_kernel::object_store::local::LocalFileSystem;
@@ -29,13 +29,12 @@ use delta_kernel::snapshot::{Snapshot, SnapshotRef};
 use delta_kernel::table_changes::TableChanges;
 use delta_kernel::transaction::create_table::{CreateTableTransaction, create_table};
 use delta_kernel::transaction::data_layout::DataLayout;
-use delta_kernel::{Engine, FileMeta, ParquetReadOptions};
 use rstest::rstest;
 use test_utils::delta_kernel_default_engine::DefaultEngine;
 use test_utils::delta_kernel_default_engine::executor::tokio::TokioMultiThreadExecutor;
 use test_utils::{
-    add_commit, create_table_and_load_snapshot, into_record_batch, read_add_infos, read_scan,
-    test_table_setup, test_table_setup_mt, write_batch_to_table,
+    add_commit, create_table_and_load_snapshot, read_add_infos, read_scan, test_table_setup,
+    test_table_setup_mt, write_batch_to_table,
 };
 use url::Url;
 
@@ -86,87 +85,6 @@ fn file_values_with_checksum() -> StructArray {
     let index = fields.iter().position(|f| f.name() == "checksum").unwrap();
     columns[index] = Arc::new(StringArray::from(vec![Some("CRC32:0a1b2c3d"), None, None]));
     StructArray::try_new(fields, columns, nulls).unwrap()
-}
-
-#[rstest]
-#[case::external(col!("c.size").gt(lit(5i64)), vec![0])]
-#[case::null_size(col!("c.size").is_null(), vec![1, 2])]
-#[tokio::test(flavor = "multi_thread")]
-async fn exact_read_file_subfield_predicate(
-    #[case] predicate: Pred,
-    #[case] expected_ids: Vec<i32>,
-    #[values("id", "file", "reordered_file")] output_kind: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let (_dir, table_path, engine, snapshot) =
-        write_table("none", DataType::file_type(), Arc::new(file_values())).await?;
-    let snapshot = snapshot?;
-    let files = read_add_infos(&snapshot, engine.as_ref())?;
-    assert_eq!(files.len(), 1);
-    let location = Url::from_directory_path(&table_path)
-        .unwrap()
-        .join(&files[0].path)?;
-    let file = FileMeta {
-        size: std::fs::metadata(location.to_file_path().unwrap())?.len(),
-        location,
-        last_modified: 0,
-    };
-    let schema = snapshot.scan_builder().build()?.physical_schema().clone();
-    let output = if output_kind == "reordered_file" {
-        let field = schema.field("c").unwrap();
-        let DataType::File(fields) = field.data_type() else {
-            panic!("expected a FILE column");
-        };
-        Arc::new(StructType::try_new([StructField {
-            data_type: DataType::File(Box::new(fields.project_as_struct(&[
-                "offset",
-                "uri",
-                "size",
-                "content_type",
-                "checksum",
-                "inline",
-            ])?)),
-            ..field.clone()
-        }])?)
-    } else {
-        schema.project(&[if output_kind == "file" { "c" } else { "id" }])?
-    };
-    let expected_schema: ArrowSchema = output.as_ref().try_into_arrow()?;
-    let batches = engine
-        .parquet_handler()
-        .read_parquet_file_with_options(
-            &file,
-            schema,
-            ParquetReadOptions::default()
-                .with_output_schema(output)
-                .with_row_filter(Arc::new(predicate)),
-        )?
-        .map(|batch| batch.map(into_record_batch))
-        .collect::<delta_kernel::KernelResult<Vec<_>>>()?;
-    let result = concat_batches(&batches[0].schema(), &batches)?;
-    assert_eq!(result.num_rows(), expected_ids.len());
-    assert_eq!(result.schema().as_ref(), &expected_schema);
-    if output_kind != "id" {
-        let expected = file_values().slice(expected_ids[0] as usize, expected_ids.len());
-        let actual = result.column(0).as_struct();
-        for row in 0..expected.len() {
-            assert_eq!(actual.is_valid(row), expected.is_valid(row));
-        }
-        for field in actual.fields() {
-            assert_eq!(
-                actual.column_by_name(field.name()),
-                expected.column_by_name(field.name())
-            );
-        }
-    } else {
-        assert_eq!(
-            result
-                .column(0)
-                .as_primitive::<delta_kernel::arrow::datatypes::Int32Type>()
-                .values(),
-            &expected_ids
-        );
-    }
-    Ok(())
 }
 
 /// A `file` column `c` at top level, in a struct (`c.f`), as an array element, or as a map value,

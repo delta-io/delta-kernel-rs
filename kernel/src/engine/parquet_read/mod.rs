@@ -2,36 +2,28 @@
 
 use std::borrow::Cow;
 use std::collections::HashSet;
-use std::ops::Range;
 use std::sync::Arc;
 
 use delta_kernel_derive::internal_api;
 
-use crate::arrow::array::{Array, BooleanArray, BooleanBufferBuilder, Int64Array, RecordBatch};
+use crate::arrow::array::{Array, BooleanArray, Int64Array, RecordBatch};
 use crate::arrow::buffer::{BooleanBuffer, Buffer};
 use crate::arrow::datatypes::{DataType, Field};
 use crate::arrow::error::ArrowError;
 use crate::engine::arrow_conversion::TryIntoArrow as _;
 use crate::engine::arrow_data::ArrowEngineData;
-use crate::engine::arrow_expression::evaluate_expression::{
-    evaluate_predicate, validate_predicate,
-};
+use crate::engine::arrow_expression::evaluate_expression::evaluate_predicate;
 use crate::engine::arrow_utils::{
-    ReorderIndex, fixup_parquet_read, ordering_needs_row_indexes, ordering_preserves_values,
-    projected_parquet_read_plan,
+    ReorderIndex, fixup_parquet_read, ordering_needs_row_indexes, parquet_read_plan,
 };
-use crate::engine::parquet_row_group_skipping::RowGroupFilter;
 use crate::engine::reader_options;
-use crate::expressions::{ColumnName, Scalar};
+use crate::expressions::ColumnName;
 use crate::parquet::arrow::arrow_reader::{
-    ArrowPredicateFn, ArrowReaderBuilder, ArrowReaderMetadata, RowFilter, RowSelection, RowSelector,
+    ArrowPredicateFn, ArrowReaderBuilder, ArrowReaderMetadata, RowFilter, RowSelection,
 };
 use crate::parquet::arrow::{ProjectionMask, RowNumber};
-use crate::schema::{
-    ColumnMetadataKey, DataType as KernelDataType, PrimitiveType, SchemaRef, StructField,
-    StructType,
-};
-use crate::transforms::{ExpressionTransform, SchemaTransform, transform_output_type};
+use crate::schema::{DataType as KernelDataType, SchemaRef, StructField, StructType};
+use crate::transforms::{SchemaTransform, transform_output_type};
 use crate::utils::FoldWithOption as _;
 use crate::{KernelError, KernelResult, ParquetReadOptions};
 
@@ -64,9 +56,15 @@ impl ParquetReadPlan {
             .output_schema()
             .cloned()
             .unwrap_or(read_schema.clone());
-        let (output_ordering, projection) =
-            projected_parquet_read_plan(&read_schema, &output_schema, &metadata)?;
-        let (total_rows, row_group_ranges) = validated_row_group_ranges(
+        for field in output_schema.fields() {
+            NonEmptyStructs.transform_struct_field(field)?;
+        }
+        // TODO: Reconcile field-ID name fallback and resolve projections against the complete
+        // read schema before scan adoption.
+        // TODO: Preserve nullable parents with only missing children and reconcile nested
+        // collections and reordered FILE fields in the shared reader helpers.
+        let (output_ordering, projection) = parquet_read_plan(&output_schema, &metadata)?;
+        let total_rows = validated_row_count(
             metadata.metadata().file_metadata().num_rows(),
             metadata
                 .metadata()
@@ -75,7 +73,8 @@ impl ParquetReadPlan {
                 .map(|group| group.num_rows()),
         )?;
         let row_count = total_rows as u64;
-        let mut selection = options
+        // TODO: Keep scattered range/exclusion selections compact during decoder planning.
+        let selection = options
             .row_selection()
             .map(|selection| {
                 if let Some((bytes, _)) = selection.as_keep_mask() {
@@ -87,7 +86,7 @@ impl ParquetReadPlan {
                     )));
                 }
                 let ranges = selection.ranges(row_count)?;
-                Ok::<_, KernelError>(row_selection_from_ranges(
+                Ok::<_, KernelError>(RowSelection::from_consecutive_ranges(
                     ranges.map(|range| range.start as usize..range.end as usize),
                     total_rows,
                 ))
@@ -104,51 +103,18 @@ impl ParquetReadPlan {
                 Some(schema) => schema.into_owned(),
                 None => StructType::try_new([])?,
             });
+            for field in predicate_schema.fields() {
+                NonEmptyStructs.transform_struct_field(field)?;
+            }
             let empty =
                 RecordBatch::new_empty(Arc::new(predicate_schema.as_ref().try_into_arrow()?));
-            validate_predicate(predicate, &empty)?;
-            let (ordering, mask) =
-                projected_parquet_read_plan(&read_schema, &predicate_schema, &metadata)?;
+            // TODO: Validate skipped conditional branches and fix IN/JSON evaluator edge cases
+            // before Scan::execute adopts exact filtering.
+            evaluate_predicate(predicate, &empty, false)?;
+            let (ordering, mask) = parquet_read_plan(&predicate_schema, &metadata)?;
             virtual_row_indexes |= ordering_needs_row_indexes(&ordering);
 
-            // Footer scalar comparisons equate signed zeros, and its bounds omit NaNs. Field-ID
-            // remapping, casts, and generated values can also invalidate bounds.
-            let mut floating_literals = HasFloatingPointLiteral::default();
-            floating_literals.transform_pred(predicate);
-            let mut can_use_footer_stats =
-                !floating_literals.0 && ordering_preserves_values(&ordering);
-            for column in projection.references {
-                read_schema.visit_fields_of_path(column, |field| {
-                    can_use_footer_stats &= field
-                        .get_config_value(&ColumnMetadataKey::ParquetFieldId)
-                        .is_none()
-                        && !matches!(
-                            field.data_type().physical_type(),
-                            KernelDataType::Primitive(PrimitiveType::Float | PrimitiveType::Double)
-                        );
-                })?;
-            }
-            if can_use_footer_stats {
-                let ranges: Vec<_> = metadata
-                    .metadata()
-                    .row_groups()
-                    .iter()
-                    .zip(row_group_ranges)
-                    .filter_map(|(group, range)| {
-                        RowGroupFilter::apply(group, predicate).then_some(range)
-                    })
-                    .collect();
-                if ranges.len() != metadata.metadata().num_row_groups() {
-                    selection = Some(match selection {
-                        _ if ranges.is_empty() => {
-                            RowSelection::from_consecutive_ranges(std::iter::empty(), total_rows)
-                        }
-                        Some(rows) => intersect_row_selection(rows, ranges.into_iter(), total_rows),
-                        None => row_selection_from_ranges(ranges.into_iter(), total_rows),
-                    });
-                }
-            }
-
+            // TODO: Add conservative footer pruning for exact predicates.
             let predicate = predicate.clone();
             let location = file_location.clone();
             let row_indexes = virtual_row_indexes;
@@ -250,102 +216,38 @@ impl ParquetReadPlan {
     }
 }
 
-fn row_selection_from_ranges(
-    mut ranges: impl Iterator<Item = Range<usize>>,
-    total_rows: usize,
-) -> RowSelection {
-    // Each range needs at most a skip and a select run. Stop collecting once a bitmap is smaller.
-    let max_ranges = (total_rows.div_ceil(8) / (2 * size_of::<RowSelector>())).max(1);
-    let mut prefix: Vec<Range<usize>> = Vec::new();
-    for range in ranges.by_ref() {
-        if range.is_empty() {
-            continue;
-        }
-        if let Some(last) = prefix.last_mut().filter(|last| last.end == range.start) {
-            last.end = range.end;
-        } else {
-            prefix.push(range);
-        }
-        if prefix.len() > max_ranges {
-            return mask_selection(prefix.into_iter().chain(ranges), total_rows, None);
-        }
-    }
-    RowSelection::from_consecutive_ranges(prefix.into_iter(), total_rows)
-}
-
-fn intersect_row_selection(
-    rows: RowSelection,
-    ranges: impl Iterator<Item = Range<usize>>,
-    total_rows: usize,
-) -> RowSelection {
-    // Mixed mask/run intersection expands the mask into runs.
-    if let Some(mask) = rows.as_mask() {
-        return mask_selection(ranges, total_rows, Some(mask));
-    }
-    let pruned = row_selection_from_ranges(ranges, total_rows);
-    if let Some(mask) = pruned.as_mask() {
-        let mut end = 0;
-        let ranges = rows.iter().filter_map(|selector| {
-            let start = end;
-            end += selector.row_count;
-            (!selector.skip).then_some(start..end)
-        });
-        mask_selection(ranges, total_rows, Some(mask))
-    } else {
-        rows.intersection(&pruned)
-    }
-}
-
-fn mask_selection(
-    ranges: impl Iterator<Item = Range<usize>>,
-    total_rows: usize,
-    source: Option<&BooleanBuffer>,
-) -> RowSelection {
-    let mut mask = BooleanBufferBuilder::new(total_rows);
-    for range in ranges {
-        mask.append_n(range.start - mask.len(), false);
-        match source {
-            Some(source) => mask.append_buffer(&source.slice(range.start, range.len())),
-            None => mask.append_n(range.len(), true),
-        }
-    }
-    mask.append_n(total_rows - mask.len(), false);
-    RowSelection::from_boolean_buffer(mask.finish())
-}
-
-fn validated_row_group_ranges(
+fn validated_row_count(
     file_rows: i64,
     group_rows: impl IntoIterator<Item = i64>,
-) -> KernelResult<(usize, Vec<Range<usize>>)> {
+) -> KernelResult<usize> {
     let total_rows = usize::try_from(file_rows).map_err(KernelError::generic_err)?;
-    let mut end = 0usize;
-    let ranges = group_rows
-        .into_iter()
-        .map(|rows| {
-            let start = end;
-            let rows = usize::try_from(rows).map_err(KernelError::generic_err)?;
-            end = end
-                .checked_add(rows)
-                .ok_or_else(|| KernelError::generic("Parquet row-group counts overflow"))?;
-            Ok(start..end)
-        })
-        .collect::<KernelResult<Vec<_>>>()?;
-    if end != total_rows {
+    let mut sum = 0usize;
+    for rows in group_rows {
+        let rows = usize::try_from(rows).map_err(KernelError::generic_err)?;
+        sum = sum
+            .checked_add(rows)
+            .ok_or_else(|| KernelError::generic("Parquet row-group counts overflow"))?;
+    }
+    if sum != total_rows {
         return Err(KernelError::generic(
             "Parquet row-group counts do not match the file row count",
         ));
     }
-    Ok((total_rows, ranges))
+    Ok(total_rows)
 }
 
-#[derive(Default)]
-struct HasFloatingPointLiteral(bool);
+struct NonEmptyStructs;
 
-impl<'a> ExpressionTransform<'a> for HasFloatingPointLiteral {
-    transform_output_type!(|'a, T| ());
+impl<'a> SchemaTransform<'a> for NonEmptyStructs {
+    transform_output_type!(|'a, T| KernelResult<()>);
 
-    fn transform_expr_literal(&mut self, value: &'a Scalar) {
-        self.0 |= matches!(value, Scalar::Float(_) | Scalar::Double(_));
+    fn transform_struct(&mut self, schema: &'a StructType) -> KernelResult<()> {
+        if schema.num_fields() == 0 {
+            return Err(KernelError::unsupported(
+                "Empty nested structs in Parquet reads",
+            ));
+        }
+        self.recurse_into_struct(schema)
     }
 }
 

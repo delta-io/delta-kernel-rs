@@ -245,15 +245,11 @@ fn test_binary_predicate_with_view_types(
     assert_eq!(results, expected_not_distinct);
 }
 
-#[rstest]
-fn test_literal_type_array(#[values(0, 1, 3)] row_count: usize) {
+#[test]
+fn test_literal_type_array() {
     let field = Arc::new(Field::new("item", DataType::Int32, true));
     let schema = Schema::new([field.clone()]);
-    let batch = RecordBatch::try_new(
-        Arc::new(schema),
-        vec![Arc::new(Int32Array::from(vec![0; row_count]))],
-    )
-    .unwrap();
+    let batch = RecordBatch::new_empty(Arc::new(schema));
 
     let not_in_op = Pred::not(Pred::binary(
         BinaryPredicateOp::In,
@@ -268,12 +264,12 @@ fn test_literal_type_array(#[values(0, 1, 3)] row_count: usize) {
     ));
 
     let result = evaluate_predicate(&not_in_op, &batch, false).unwrap();
-    let not_in_expected = BooleanArray::from(vec![true; row_count]);
+    let not_in_expected = BooleanArray::from(vec![true]);
     assert_eq!(result, not_in_expected);
 
     // Test inversion
     let result = evaluate_predicate(&not_in_op, &batch, true).unwrap();
-    let in_expected = BooleanArray::from(vec![false; row_count]);
+    let in_expected = BooleanArray::from(vec![false]);
     assert_eq!(result, in_expected);
 }
 

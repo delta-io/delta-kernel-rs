@@ -982,13 +982,15 @@ pub trait ParquetHandler: AsAny {
     ///
     /// Apply physical selection, then the exact filter, then result offset and limit. Rows and
     /// batches retain file order, and generated row indexes retain original physical positions.
-    /// Unsupported options or predicates and invalid selection bounds must fail before any batch
-    /// is emitted. Data-dependent decoding or evaluation errors can still occur during iteration.
+    /// Unsupported options and invalid selection bounds must fail before any batch is emitted.
+    /// Predicate support and type errors may be reported during iteration, including after
+    /// earlier batches have been returned.
     /// Options must never be silently ignored. Cancellation follows the engine operation contract.
     ///
     /// The default implementation supports cancellation and reads with no output schema supplied;
     /// other options return an unsupported error. Engines override this method to provide
-    /// projection, exact filtering, and selection.
+    /// projection, exact filtering, and selection. See [`ParquetReadOptions`] for the built-in
+    /// engines' current expression and schema reconciliation limitations.
     fn read_parquet_file_with_options(
         &self,
         file: &FileMeta,

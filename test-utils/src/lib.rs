@@ -204,8 +204,8 @@ use delta_kernel::actions::{
     LOG_ADD_SCHEMA, MAX_VALUES, MIN_VALUES, NULL_COUNT, NUM_RECORDS, TIGHT_BOUNDS,
 };
 use delta_kernel::arrow::array::{
-    Array, ArrayRef, AsArray, BooleanArray, Float64Array, Int32Array, Int64Array, ListArray,
-    MapArray, MapBuilder, RecordBatch, StringArray, StringBuilder, StructArray,
+    Array, ArrayRef, AsArray, BooleanArray, Float64Array, Int32Array, Int64Array, MapArray,
+    MapBuilder, RecordBatch, StringArray, StringBuilder, StructArray,
 };
 use delta_kernel::arrow::buffer::{NullBuffer, OffsetBuffer};
 use delta_kernel::arrow::compute::concat;
@@ -1510,70 +1510,6 @@ pub fn nested_batches() -> KernelResult<Vec<RecordBatch>> {
             vec![Some(40), None, Some(60)],
         )?,
     ])
-}
-
-/// Returns stored, widened, and widened/reordered batches for nested collection reads.
-/// Each collection contains a populated row, an empty row, and a null row.
-pub fn nested_collection_reconciliation_batches() -> (RecordBatch, RecordBatch, RecordBatch) {
-    let list = |values: ArrayRef| -> ArrayRef {
-        Arc::new(ListArray::new(
-            Arc::new(Field::new("element", values.data_type().clone(), true)),
-            OffsetBuffer::from_lengths([values.len(), 0, 0]),
-            values,
-            Some(NullBuffer::from(vec![true, true, false])),
-        ))
-    };
-    let map = |values: ArrayRef| -> ArrayRef {
-        let keys = Arc::new(StringArray::from_iter_values(
-            (0..values.len()).map(|i| i.to_string()),
-        ));
-        let entries = StructArray::from(vec![
-            (
-                Arc::new(Field::new("key", ArrowDataType::Utf8, false)),
-                keys as ArrayRef,
-            ),
-            (
-                Arc::new(Field::new("value", values.data_type().clone(), true)),
-                values,
-            ),
-        ]);
-        Arc::new(MapArray::new(
-            Arc::new(Field::new("key_value", entries.data_type().clone(), false)),
-            OffsetBuffer::from_lengths([entries.len(), 0, 0]),
-            entries,
-            Some(NullBuffer::from(vec![true, true, false])),
-            false,
-        ))
-    };
-    let batch = |widened, reordered| {
-        let numbers: ArrayRef = if widened {
-            Arc::new(Int64Array::from(vec![Some(1), None, Some(3)]))
-        } else {
-            Arc::new(Int32Array::from(vec![Some(1), None, Some(3)]))
-        };
-        let mut fields = vec![
-            (
-                Arc::new(Field::new("x", numbers.data_type().clone(), true)),
-                numbers.clone(),
-            ),
-            (
-                Arc::new(Field::new("y", ArrowDataType::Utf8, true)),
-                Arc::new(StringArray::from(vec![Some("a"), Some("b"), None])) as ArrayRef,
-            ),
-        ];
-        if reordered {
-            fields.reverse();
-        }
-        let structs: ArrayRef = Arc::new(StructArray::from(fields));
-        RecordBatch::try_from_iter([
-            ("nested_lists", list(list(structs.clone()))),
-            ("list_maps", list(map(numbers))),
-            ("map_lists", map(list(structs.clone()))),
-            ("list_map_lists", list(map(list(structs)))),
-        ])
-        .unwrap()
-    };
-    (batch(false, false), batch(true, false), batch(true, true))
 }
 
 // ---------------------------------------------------------------------------

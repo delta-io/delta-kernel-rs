@@ -239,28 +239,36 @@ mod tests {
         );
     }
 
-    #[test]
-    fn read_parquet_files_emits_parquet_read_completed() {
+    #[rstest::rstest]
+    fn read_parquet_data_emits_parquet_read_completed(#[values(false, true)] exact: bool) {
         let (reporter, _guard) = install_capture();
         let inner: Arc<dyn ParquetHandler> = Arc::new(StubParquetHandler::default());
         let handler = MeteredParquetHandler::new(inner);
 
         let files = vec![fake_file("a.parquet", 256), fake_file("b.parquet", 1024)];
-        let iter = handler
-            .read_parquet_files(&files, delta_schema(), None)
-            .unwrap();
+        let iter = if exact {
+            handler.read_parquet_file_with_options(
+                &files[0],
+                delta_schema(),
+                ParquetReadOptions::default(),
+            )
+        } else {
+            handler.read_parquet_files(&files, delta_schema(), None)
+        }
+        .unwrap();
         let _: Vec<_> = iter.collect();
 
         let events = reporter.events();
-        let read = events
+        let reads: Vec<_> = events
             .iter()
-            .find(|e| matches!(e, MetricEvent::ParquetReadCompleted(_)))
-            .expect("expected ParquetReadCompleted event");
-        let MetricEvent::ParquetReadCompleted(e) = read else {
-            unreachable!();
-        };
-        assert_eq!(e.num_files, 2);
-        assert_eq!(e.bytes_read, 1280);
+            .filter_map(|event| match event {
+                MetricEvent::ParquetReadCompleted(read) => Some(read),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(reads.len(), 1);
+        assert_eq!(reads[0].num_files, if exact { 1 } else { 2 });
+        assert_eq!(reads[0].bytes_read, if exact { 256 } else { 1280 });
     }
 
     #[test]

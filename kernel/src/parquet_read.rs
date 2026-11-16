@@ -6,7 +6,6 @@ use std::sync::Arc;
 use roaring::RoaringTreemap;
 
 use crate::schema::{DataType, SchemaRef, StructType};
-use crate::transforms::{SchemaTransform, transform_output_type};
 use crate::{CancellationTokenRef, KernelError, KernelResult, PredicateRef};
 
 /// Eligible rows in original, zero-based physical file coordinates.
@@ -156,8 +155,14 @@ impl FileRowSelection {
 ///
 /// Physical selection precedes exact filtering, then result offset and limit. Output columns are
 /// materialized for surviving rows. Defaults select all rows and all columns in the read schema.
-/// Empty nested structs in output or predicate values are unsupported; a zero-column output
-/// schema remains valid.
+/// Built-in Arrow engines reject empty nested structs in output or predicate values; a
+/// zero-column output schema remains valid.
+///
+/// Built-in Arrow engines inherit limitations in conditional/IN/JSON expression evaluation and
+/// schema reconciliation. Field-ID name fallback can reject differing IDs, even without output
+/// projection. Projected field-ID bindings, nullable parents with only missing children, nested
+/// collection reconciliation, and reordered FILE fields need further work.
+/// This API is not used by [`crate::scan::Scan::execute`].
 #[derive(Default, Clone)]
 pub struct ParquetReadOptions {
     output_schema: Option<SchemaRef>,
@@ -173,7 +178,7 @@ impl ParquetReadOptions {
     /// Retained fields must preserve nullability and metadata. Struct fields may be recursively
     /// projected; other types must match apart from nested field order.
     /// An empty top-level schema returns batches with no columns and the correct row count.
-    /// Empty nested structs are unsupported.
+    /// Built-in Arrow engines do not support empty nested structs.
     ///
     /// Clone parent fields when projecting nested children to preserve their metadata and
     /// nullability:
@@ -269,34 +274,17 @@ impl ParquetReadOptions {
     }
 
     /// Checks that output fields are a compatible projection and filter references resolve.
-    /// Engines must also validate predicate support and selection bounds before returning data.
+    /// Engines must also validate selection bounds before returning data. Predicate support and
+    /// type errors may be reported during iteration.
     pub fn validate(&self, read_schema: &StructType) -> KernelResult<()> {
         let output = self.output_schema.as_deref().unwrap_or(read_schema);
         validate_projection(read_schema, output)?;
-        for field in output.fields() {
-            NonEmptyStructs.transform_struct_field(field)?;
-        }
         if let Some(predicate) = &self.row_filter {
             for column in predicate.references() {
-                NonEmptyStructs.transform_struct_field(read_schema.field_at(column)?)?;
+                read_schema.field_at(column)?;
             }
         }
         Ok(())
-    }
-}
-
-struct NonEmptyStructs;
-
-impl<'a> SchemaTransform<'a> for NonEmptyStructs {
-    transform_output_type!(|'a, T| KernelResult<()>);
-
-    fn transform_struct(&mut self, schema: &'a StructType) -> KernelResult<()> {
-        if schema.num_fields() == 0 {
-            return Err(KernelError::unsupported(
-                "Empty nested structs in Parquet reads",
-            ));
-        }
-        self.recurse_into_struct(schema)
     }
 }
 
@@ -332,7 +320,6 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
-    use crate::expressions::col;
     use crate::schema::{
         ArrayType, ColumnMetadataKey, MapType, MetadataValue, StructField, schema_ref,
     };
@@ -447,34 +434,6 @@ mod tests {
             selection.ranges(row_count).unwrap().collect::<Vec<_>>(),
             expected
         );
-    }
-
-    #[rstest]
-    fn rejects_empty_nested_structs_before_decoding(
-        #[values(false, true)] nullable: bool,
-        #[values("output", "default", "predicate")] use_site: &str,
-    ) {
-        let nested = |schema: StructType| {
-            Arc::new(StructType::try_new([StructField::new("s", schema, nullable)]).unwrap())
-        };
-        let complete =
-            nested(StructType::try_new([StructField::nullable("key", DataType::INTEGER)]).unwrap());
-        let empty = nested(StructType::try_new([]).unwrap());
-        let (read_schema, options) = match use_site {
-            "output" => (
-                complete,
-                ParquetReadOptions::default().with_output_schema(empty),
-            ),
-            "predicate" => (
-                empty,
-                ParquetReadOptions::default()
-                    .with_output_schema(schema_ref! {})
-                    .with_row_filter(Arc::new(col!("s").is_null())),
-            ),
-            _ => (empty, ParquetReadOptions::default()),
-        };
-        assert!(matches!(options.validate(&read_schema),
-            Err(error) if matches!(error.without_backtrace(), KernelError::Unsupported(_))));
     }
 
     #[test]

@@ -356,14 +356,12 @@ fn apply_schema_to_map(
     )?)
 }
 
-// FILE fields match by name, whereas apply_schema_to_struct matches by position. Put columns
-// in the requested order before applying its metadata and nullability.
-fn apply_schema_to_file(array: &ArrayRef, schema: &Schema) -> KernelResult<StructArray> {
-    if schema != &*FILE_FIELDS {
-        return Err(make_arrow_error(
-            "Only the canonical FILE fields are supported",
-        ));
-    }
+// Rebuild a `file` struct with its sub-fields in the kernel's order. A `file`'s sub-fields are
+// matched by name, in any order (see [`ensure_data_types`]), whereas [`apply_schema_to_struct`]
+// matches by position, so they are first picked by name. As for any struct, the rebuilt fields
+// take the kernel's metadata, so sub-field ids a writer put on them are dropped.
+fn apply_schema_to_file(array: &ArrayRef) -> KernelResult<StructArray> {
+    // Every `file` has the canonical sub-fields, so the canonical type is the kernel schema.
     static KERNEL_FILE_TYPE: LazyLock<DataType> = LazyLock::new(DataType::file_type);
     ensure_data_types(&KERNEL_FILE_TYPE, array.data_type(), ValidationMode::Full)?;
     let Some(struct_array) = array.as_struct_opt() else {
@@ -377,7 +375,7 @@ fn apply_schema_to_file(array: &ArrayRef, schema: &Schema) -> KernelResult<Struc
         .enumerate()
         .map(|(index, field)| (field.name().as_str(), index))
         .collect();
-    let (fields, columns): (Vec<_>, Vec<_>) = schema
+    let (fields, columns): (Vec<_>, Vec<_>) = FILE_FIELDS
         .fields()
         .map(|kernel_field| {
             let index = *index_by_name
@@ -395,7 +393,7 @@ fn apply_schema_to_file(array: &ArrayRef, schema: &Schema) -> KernelResult<Struc
         })
         .process_results(|iter| iter.unzip())?;
     let ordered = StructArray::try_new(fields.into(), columns, struct_array.nulls().cloned())?;
-    apply_schema_to_struct(&ordered, schema)
+    apply_schema_to_struct(&ordered, &FILE_FIELDS)
 }
 
 /// Applies field names, nullability, metadata, and compatible leaf casts from `schema`.
@@ -506,7 +504,7 @@ fn apply_schema_to_inner(
             apply_schema_to_inner(array, udt.sql_type(), None, "")?
         }
         Struct(stype) => Arc::new(apply_schema_to_struct(array, stype)?),
-        File(schema) => Arc::new(apply_schema_to_file(array, schema)?),
+        File(_) => Arc::new(apply_schema_to_file(array)?),
         Array(atype) => apply_schema_to_list(array, atype, ancestor, relative_path)?,
         Map(mtype) => Arc::new(apply_schema_to_map(array, mtype, ancestor, relative_path)?),
         // A leaf whose type is not identical to the passed schema needs to be cast.
@@ -1198,8 +1196,6 @@ mod file_tests {
     use std::collections::HashMap;
     use std::sync::Arc;
 
-    use rstest::rstest;
-
     use super::*;
     use crate::arrow::array::{BinaryArray, Int64Array, ListArray, StringArray};
     use crate::arrow::buffer::{NullBuffer, OffsetBuffer};
@@ -1300,52 +1296,6 @@ mod file_tests {
         let batch = apply_schema(&data, &DataType::Struct(Box::new(schema))).unwrap();
 
         assert_canonical(batch.column(0).as_struct());
-    }
-
-    #[rstest]
-    fn test_apply_schema_to_file_preserves_requested_order(#[values(false, true)] in_list: bool) {
-        let file = reversed_file();
-        let fields = FILE_FIELDS
-            .project_as_struct(&[
-                "offset",
-                "uri",
-                "size",
-                "content_type",
-                "checksum",
-                "inline",
-            ])
-            .unwrap();
-        let file_type = DataType::File(Box::new(fields));
-        let expected_type: ArrowDataType = (&file_type).try_into_arrow().unwrap();
-        let array: ArrayRef = Arc::new(file.clone());
-        let (array, schema) = if in_list {
-            let list = ListArray::new(
-                Arc::new(ArrowField::new("element", array.data_type().clone(), true)),
-                OffsetBuffer::from_lengths([2]),
-                array,
-                None,
-            );
-            (
-                Arc::new(list) as ArrayRef,
-                DataType::from(ArrayType::new(file_type, true)),
-            )
-        } else {
-            (array, file_type)
-        };
-        let result = apply_schema_to(&array, &schema).unwrap();
-        let actual = if in_list {
-            result.as_list::<i32>().values().as_struct()
-        } else {
-            result.as_struct()
-        };
-        assert_eq!(actual.data_type(), &expected_type);
-        assert_eq!(actual.nulls(), file.nulls());
-        for field in actual.fields() {
-            assert_eq!(
-                actual.column_by_name(field.name()),
-                file.column_by_name(field.name())
-            );
-        }
     }
 
     /// The same holds for `file` values that are list elements.
