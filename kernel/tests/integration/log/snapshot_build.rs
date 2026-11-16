@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use delta_kernel::arrow::array::{ArrayRef, Int32Array};
 use delta_kernel::committer::{Committer, FileSystemCommitter};
-use delta_kernel::schema::{schema, schema_ref};
+use delta_kernel::schema::{DataType, schema, schema_ref};
 use delta_kernel::snapshot::{
     CheckpointWriteResult, ChecksumWriteResult, IncrementalReplay, SnapshotBuilder,
 };
@@ -154,6 +154,54 @@ async fn snapshot_schema_nesting_boundary(
         error => error,
     };
     assert!(matches!(error, KernelError::Schema(_)));
+    Ok(())
+}
+
+#[rstest]
+#[case::no_mapping(None, None)]
+#[case::name_mapping(Some("name"), Some("delta.columnMapping.physicalName"))]
+#[case::id_mapping(Some("id"), Some("delta.columnMapping.physicalName"))]
+#[tokio::test]
+async fn snapshot_schema_without_field_metadata(
+    #[case] mapping_mode: Option<&str>,
+    #[case] expected_error: Option<&str>,
+    #[values(false, true)] nullable: bool,
+) -> delta_kernel::Result<()> {
+    let (store, engine, table_url) = engine_store_setup("schema_without_field_metadata", None);
+    let schema = json!({"type": "struct", "fields": [
+        {"name": "value", "type": "long", "nullable": nullable}
+    ]});
+    let configuration: HashMap<_, _> = mapping_mode
+        .map(|mode| ("delta.columnMapping.mode", mode))
+        .into_iter()
+        .collect();
+    let commit = [
+        json!({"protocol": {"minReaderVersion": 2, "minWriterVersion": 5}}),
+        json!({"metaData": {
+            "id": "schema-without-field-metadata",
+            "format": {"provider": "parquet", "options": {}},
+            "schemaString": schema.to_string(),
+            "partitionColumns": [],
+            "configuration": configuration,
+            "createdTime": 0
+        }}),
+    ]
+    .map(|action| action.to_string())
+    .join("\n");
+    add_commit(table_url.as_str(), store.as_ref(), 0, commit).await?;
+
+    let result = Snapshot::builder_for(table_url).build(&engine);
+    if let Some(expected_error) = expected_error {
+        assert_result_error_with_message(result, expected_error);
+    } else {
+        let snapshot = result?;
+        assert_eq!(snapshot.version(), 0);
+        let schema = snapshot.schema();
+        let field = schema.field("value").unwrap();
+        assert_eq!(field.data_type(), &DataType::LONG);
+        assert_eq!(field.is_nullable(), nullable);
+        assert!(field.metadata().is_empty());
+    }
     Ok(())
 }
 

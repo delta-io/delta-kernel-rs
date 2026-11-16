@@ -372,7 +372,8 @@ pub struct StructField {
     pub data_type: DataType,
     /// Denotes whether this Field can be null
     pub nullable: bool,
-    /// A JSON map containing information about this column
+    /// Column annotations, defaulting to an empty map when omitted from JSON.
+    #[serde(default)]
     pub metadata: HashMap<MetadataKey, MetadataValue>,
 }
 
@@ -3438,6 +3439,85 @@ mod tests {
             ]
         );
         assert!(fields.fields().all(|f| f.is_nullable()));
+    }
+
+    #[rstest]
+    fn test_struct_field_metadata_deserialization(
+        #[values(false, true)] nullable: bool,
+        #[values(None, Some("{}"), Some(r#"{"comment":"keep"}"#))] metadata: Option<&str>,
+    ) {
+        let mut json = serde_json::json!({"name": "value", "type": "long", "nullable": nullable});
+        if let Some(metadata) = metadata {
+            json["metadata"] = serde_json::from_str(metadata).unwrap();
+        }
+        let expected = StructField {
+            metadata: serde_json::from_str(metadata.unwrap_or("{}")).unwrap(),
+            ..StructField::new("value", DataType::LONG, nullable)
+        };
+
+        let field: StructField = serde_json::from_value(json).unwrap();
+        assert_eq!(field, expected);
+        let serialized = serde_json::to_value(&field).unwrap();
+        assert_eq!(
+            serialized["metadata"],
+            serde_json::to_value(&expected.metadata).unwrap()
+        );
+        assert_eq!(
+            serde_json::from_value::<StructField>(serialized).unwrap(),
+            expected
+        );
+    }
+
+    #[rstest]
+    #[case::struct_type(
+        r#"{"type":"struct","fields":[{"name":"inner","type":"long","nullable":false}]}"#,
+        DataType::from(schema! { not_null "inner": LONG })
+    )]
+    #[case::array(
+        r#"{"type":"array","elementType":{
+            "type":"struct","fields":[{"name":"inner","type":"long","nullable":false}]
+        },"containsNull":true}"#,
+        DataType::from(ArrayType::new(schema! { not_null "inner": LONG }, true))
+    )]
+    #[case::map_key(
+        r#"{"type":"map","keyType":{
+            "type":"struct","fields":[{"name":"inner","type":"long","nullable":false}]
+        },"valueType":"long","valueContainsNull":false}"#,
+        DataType::from(MapType::new(schema! { not_null "inner": LONG }, DataType::LONG, false))
+    )]
+    #[case::map_value(
+        r#"{"type":"map","keyType":"long","valueType":{
+            "type":"struct","fields":[{"name":"inner","type":"long","nullable":false}]
+        },"valueContainsNull":true}"#,
+        DataType::from(MapType::new(DataType::LONG, schema! { not_null "inner": LONG }, true))
+    )]
+    fn test_nested_struct_field_without_metadata(#[case] json: &str, #[case] expected: DataType) {
+        assert_eq!(serde_json::from_str::<DataType>(json).unwrap(), expected);
+    }
+
+    #[rstest]
+    #[case::null_metadata(r#""nullable":true,"metadata":null"#, "expected a map")]
+    #[case::string_metadata(r#""nullable":true,"metadata":"bad""#, "expected a map")]
+    #[case::array_metadata(r#""nullable":true,"metadata":[]"#, "expected a map")]
+    #[case::boolean_metadata(r#""nullable":true,"metadata":false"#, "expected a map")]
+    #[case::missing_nullable(r#""metadata":{}"#, "missing field `nullable`")]
+    #[case::both_missing("", "missing field `nullable`")]
+    #[case::null_nullable(r#""nullable":null,"metadata":{}"#, "expected a boolean")]
+    #[case::string_nullable(r#""nullable":"true","metadata":{}"#, "expected a boolean")]
+    fn test_struct_field_rejects_invalid_metadata_or_nullability(
+        #[case] fields: &str,
+        #[case] expected_error: &str,
+    ) {
+        let extra_fields = if fields.is_empty() {
+            String::new()
+        } else {
+            format!(",{fields}")
+        };
+        let json = format!(r#"{{"name":"value","type":"long"{extra_fields}}}"#);
+        assert_result_error_with_message(
+            serde_json::from_str::<StructField>(&json),
+            expected_error,
+        );
     }
 
     #[test]
