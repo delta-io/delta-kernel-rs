@@ -1752,8 +1752,8 @@ impl Snapshot {
         parent = &self.span,
         name = "snap.checkpoint",
         skip_all,
-        fields(report, operation_id = %MetricId::new(), version, outcome, mode, duration_ns,
-            bytes_written, num_add_files, num_remove_files, num_actions, num_sidecars,
+        fields(report, operation_id = %MetricId::new(), version = self.version(), outcome, mode,
+            duration_ns, bytes_written, num_add_files, num_remove_files, num_actions, num_sidecars,
             input_duration_ns, reconciliation_duration_ns, stats_transform_duration_ns,
             output_preparation_duration_ns, num_log_rows, num_checkpoint_rows),
         err
@@ -1765,7 +1765,6 @@ impl Snapshot {
     ) -> Result<(CheckpointWriteResult, SnapshotRef)> {
         let start = Instant::now();
         let span = tracing::Span::current();
-        span.record("version", self.version());
         if self.log_segment.checkpoint_version == Some(self.log_segment.end_version) {
             info!(
                 "Checkpoint already exists for snapshot version {}",

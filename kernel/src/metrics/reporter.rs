@@ -458,7 +458,7 @@ mod tests {
                 "snap.checkpoint",
                 report = Empty,
                 operation_id = %operation_id,
-                version = Empty,
+                version = 42u64,
                 outcome = Empty,
                 mode = Empty,
                 duration_ns = Empty,
@@ -483,8 +483,7 @@ mod tests {
             span.record("num_actions", 5u64);
             span.record("num_sidecars", 1u64);
             for (name, value) in [
-                ("version", 42u64),
-                ("input_duration_ns", 1),
+                ("input_duration_ns", 1u64),
                 ("reconciliation_duration_ns", 2),
                 ("stats_transform_duration_ns", 3),
                 ("output_preparation_duration_ns", 4),

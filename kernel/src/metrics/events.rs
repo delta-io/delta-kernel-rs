@@ -489,8 +489,8 @@ impl CheckpointWriteSuccess {
     pub(crate) const SPAN_NAME: &'static str = "snap.checkpoint";
 
     pub(crate) fn from_attrs(attrs: &Attributes<'_>) -> Self {
-        Self {
-            operation_id: MetricId::from_attrs(attrs),
+        let mut event = Self {
+            operation_id: MetricId::nil(),
             version: 0,
             outcome: CheckpointWriteOutcome::Written {
                 stats: CheckpointWriteStats::default(),
@@ -498,7 +498,9 @@ impl CheckpointWriteSuccess {
             mode: CheckpointWriteMode::NotAttempted,
             duration: Duration::ZERO,
             processing: CheckpointProcessingStats::default(),
-        }
+        };
+        attrs.record(&mut event);
+        event
     }
 
     fn record_u64(&mut self, name: &str, value: u64) -> Result<(), &'static str> {
@@ -548,6 +550,20 @@ impl CheckpointWriteSuccess {
             _ => return Err(Self::SPAN_NAME),
         }
         Ok(())
+    }
+}
+
+impl Visit for CheckpointWriteSuccess {
+    fn record_u64(&mut self, field: &Field, value: u64) {
+        if field.name() == "version" {
+            self.version = value;
+        }
+    }
+
+    fn record_debug(&mut self, field: &Field, value: &dyn fmt::Debug) {
+        if let Some(id) = record_operation_id(field, value, Self::SPAN_NAME) {
+            self.operation_id = id;
+        }
     }
 }
 
