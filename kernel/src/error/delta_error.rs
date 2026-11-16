@@ -511,7 +511,7 @@ mod tests {
     use rstest::rstest;
 
     use super::{DeltaError, DeltaErrorParameter, render_template};
-    use crate::schema::{DataType, StructType};
+    use crate::schema::StructType;
     use crate::table_features::ColumnMappingMode;
     use crate::{BoxedError, DeltaErrorCondition, Error, KernelError, Result};
 

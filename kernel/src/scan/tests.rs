@@ -36,9 +36,9 @@ use crate::transaction::data_layout::DataLayout;
 use crate::unit_test_utils::TestCancellationToken;
 use crate::unit_test_utils::recording_reads::{Read, RecordingReads};
 use crate::{
-    CancellationTokenRef, Engine, EngineData, FileDataReadResultIterator, FileMeta, FileSize,
-    KernelError, KernelResult, KernelResultIterator, ParquetFooter, ParquetHandler, PredicateRef,
-    Result, Snapshot,
+    CancellationTokenRef, Engine, EngineData, Error, FileDataReadResultIterator, FileMeta,
+    FileSize, KernelError, KernelResult, KernelResultIterator, ParquetFooter, ParquetHandler,
+    PredicateRef, Result, Snapshot,
 };
 
 #[cfg(feature = "adaptive-metadata-in-dev")]
@@ -645,7 +645,7 @@ fn test_without_row_transforms_scan_metadata_surfaces_deletion_vectors() {
     );
 }
 
-fn get_files_for_scan(scan: Scan, engine: &dyn Engine) -> KernelResult<Vec<String>> {
+fn get_files_for_scan(scan: Scan, engine: &dyn Engine) -> Result<Vec<String>> {
     let scan_metadata_iter = scan.scan_metadata(engine)?;
     fn scan_metadata_callback(paths: &mut Vec<String>, scan_file: ScanFile) {
         paths.push(scan_file.path.to_string());
@@ -800,7 +800,10 @@ fn scan_metadata_from_cancels_cached_metadata_consumption() {
         .unwrap();
 
     token.cancel();
-    assert!(matches!(metadata.next(), Some(Err(KernelError::Cancelled))));
+    assert!(matches!(
+        metadata.next(),
+        Some(Err(Error::Kernel(KernelError::Cancelled)))
+    ));
 }
 
 #[rstest]
@@ -869,8 +872,11 @@ fn scan_metadata_from_binds_token_to_new_reads(
 
     if pre_cancelled {
         let cancelled = match result {
-            Err(KernelError::Cancelled) => true,
-            Ok(mut metadata) => matches!(metadata.next(), Some(Err(KernelError::Cancelled))),
+            Err(Error::Kernel(KernelError::Cancelled)) => true,
+            Ok(mut metadata) => matches!(
+                metadata.next(),
+                Some(Err(Error::Kernel(KernelError::Cancelled)))
+            ),
             Err(_) => false,
         };
         assert!(cancelled, "pre-cancelled scan must report cancellation");
@@ -1113,7 +1119,7 @@ fn test_scan_metadata_with_stats_columns() {
     let scan_metadata_results: Vec<_> = scan
         .scan_metadata(engine.as_ref())
         .unwrap()
-        .collect::<KernelResult<Vec<_>>>()
+        .collect::<Result<Vec<_>>>()
         .unwrap();
 
     assert!(
@@ -2048,7 +2054,7 @@ fn test_all_struct_parses_json_commit_stats() {
     for scan_metadata in scan
         .scan_metadata(engine.as_ref())
         .unwrap()
-        .collect::<KernelResult<Vec<_>>>()
+        .collect::<Result<Vec<_>>>()
         .unwrap()
     {
         let (underlying_data, selection_vector) = scan_metadata.scan_files.into_parts();
@@ -2137,7 +2143,7 @@ fn test_skip_stats_disables_data_skipping() {
     let scan_metadata_results: Vec<_> = scan
         .scan_metadata(engine.as_ref())
         .unwrap()
-        .collect::<KernelResult<Vec<_>>>()
+        .collect::<Result<Vec<_>>>()
         .unwrap();
 
     let mut selected_file_count = 0;
@@ -2171,7 +2177,7 @@ fn test_with_stats_last_call_wins() {
     for scan_metadata in scan
         .scan_metadata(engine.as_ref())
         .unwrap()
-        .collect::<KernelResult<Vec<_>>>()
+        .collect::<Result<Vec<_>>>()
         .unwrap()
     {
         let (underlying_data, _) = scan_metadata.scan_files.into_parts();
@@ -2202,7 +2208,7 @@ fn test_default_stats_options_no_struct_output() {
     let scan_metadata_results: Vec<_> = scan
         .scan_metadata(engine.as_ref())
         .unwrap()
-        .collect::<KernelResult<Vec<_>>>()
+        .collect::<Result<Vec<_>>>()
         .unwrap();
 
     assert!(

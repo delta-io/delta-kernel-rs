@@ -2249,9 +2249,7 @@ pub fn remove_all_and_get_remove_actions(
     engine: &impl Engine,
 ) -> Result<Vec<serde_json::Value>> {
     let scan = snapshot.clone().scan_builder().build()?;
-    let all_scan_metadata: Vec<_> = scan
-        .scan_metadata(engine)?
-        .collect::<KernelResult<Vec<_>>>()?;
+    let all_scan_metadata: Vec<_> = scan.scan_metadata(engine)?.collect::<Result<Vec<_>>>()?;
 
     let mut txn = snapshot
         .clone()

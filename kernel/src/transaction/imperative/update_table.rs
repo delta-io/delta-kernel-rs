@@ -22,10 +22,10 @@ use crate::expressions::{
 };
 use crate::scan::data_skipping::stats_schema::schema_with_all_fields_nullable;
 use crate::scan::log_replay::get_scan_metadata_transform_expr;
-use crate::scan::{restored_add_schema, scan_row_schema};
+use crate::scan::{ScanMetadata, restored_add_schema, scan_row_schema};
 use crate::schema::{ArrayType, SchemaRef, StructField, ToSchema, lazy_schema_ref};
 use crate::table_features::TableFeature;
-use crate::{DataType, Engine, Expression, KernelResult, KernelResultIterator};
+use crate::{DataType, Engine, Error, Expression, KernelResult, KernelResultIterator, Result};
 
 impl Transaction<UpdateTable, Imperative> {
     /// Remove files from the table in this transaction. This API generally enables the engine to
@@ -108,8 +108,8 @@ impl Transaction<UpdateTable, Imperative> {
     /// txn.update_deletion_vectors(dv_map, files_iter)?;
     /// ```
     pub fn scan_metadata_to_engine_data(
-        scan_metadata: impl KernelResultIterator<crate::scan::ScanMetadata>,
-    ) -> impl KernelResultIterator<FilteredEngineData> {
+        scan_metadata: impl Iterator<Item = Result<ScanMetadata>> + Send,
+    ) -> impl Iterator<Item = Result<FilteredEngineData>> + Send {
         scan_metadata.map(|result| result.map(|metadata| metadata.scan_files))
     }
 
@@ -182,12 +182,12 @@ impl Transaction<UpdateTable, Imperative> {
     pub(crate) fn update_deletion_vectors(
         &mut self,
         new_dv_descriptors: HashMap<String, DeletionVectorDescriptor>,
-        existing_data_files: impl KernelResultIterator<FilteredEngineData>,
-    ) -> KernelResult<()> {
+        existing_data_files: impl Iterator<Item = Result<FilteredEngineData>> + Send,
+    ) -> Result<()> {
         if self.is_create_table() {
-            return Err(KernelError::generic(
+            return Err(Error::Kernel(KernelError::generic(
                 "Deletion vector operations require an existing table",
-            ));
+            )));
         }
         self.ensure_deletion_vectors_enabled()?;
 
@@ -231,11 +231,11 @@ impl Transaction<UpdateTable, Imperative> {
         }
 
         if matched_dv_files != new_dv_descriptors.len() {
-            return Err(KernelError::generic(format!(
+            return Err(Error::Kernel(KernelError::generic(format!(
                 "Number of matched DV files does not match number of new DV descriptors: {} != {}",
                 matched_dv_files,
                 new_dv_descriptors.len()
-            )));
+            ))));
         }
 
         self.staged_data_changes

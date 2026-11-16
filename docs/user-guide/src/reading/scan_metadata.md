@@ -46,9 +46,9 @@ For example:
 ```rust,no_run
 # extern crate delta_kernel;
 # use delta_kernel::scan::state::ScanFile;
-# use delta_kernel::{KernelResult, Engine};
+# use delta_kernel::{Result, Engine};
 # fn perform_read(_chunk: &[ScanFile]) {}
-# fn example(scan: &delta_kernel::scan::Scan, engine: &dyn Engine) -> KernelResult<()> {
+# fn example(scan: &delta_kernel::scan::Scan, engine: &dyn Engine) -> Result<()> {
 fn collect_files(files: &mut Vec<ScanFile>, file: ScanFile) {
     files.push(file);
 }

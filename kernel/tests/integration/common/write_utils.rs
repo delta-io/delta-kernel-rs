@@ -502,9 +502,7 @@ pub fn get_scan_files(
     engine: &dyn delta_kernel::Engine,
 ) -> delta_kernel::Result<Vec<FilteredEngineData>> {
     let scan = snapshot.scan_builder().build()?;
-    let all_scan_metadata: Vec<_> = scan
-        .scan_metadata(engine)?
-        .collect::<KernelResult<Vec<_>>>()?;
+    let all_scan_metadata: Vec<_> = scan.scan_metadata(engine)?.collect::<Result<Vec<_>, _>>()?;
 
     Ok(all_scan_metadata
         .into_iter()

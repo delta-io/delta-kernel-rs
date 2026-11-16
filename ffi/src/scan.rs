@@ -9,9 +9,7 @@ use delta_kernel::scan::state::{DvInfo, ScanFile};
 use delta_kernel::scan::{PartitionValuesOptions, Scan, ScanBuilder, ScanMetadata, StatsOptions};
 use delta_kernel::schema::{MetadataKey, MetadataValue};
 use delta_kernel::snapshot::SnapshotRef;
-use delta_kernel::{
-    Expression, ExpressionRef, KernelError, KernelResult, KernelResultIterator, Result,
-};
+use delta_kernel::{Expression, ExpressionRef, KernelError, KernelResult, Result};
 use delta_kernel_ffi_macros::handle_descriptor;
 use derive_more::From;
 use tracing::{debug, trace};
@@ -39,7 +37,7 @@ pub struct SharedScan;
 pub struct SharedScanMetadata;
 
 /// Boxed scan metadata iterator stored behind [`ScanMetadataIterator`]'s mutex.
-type ScanMetadataIter = Box<dyn KernelResultIterator<ScanMetadata>>;
+type ScanMetadataIter = Box<dyn Iterator<Item = Result<ScanMetadata>> + Send>;
 
 /// An opaque, exclusive handle owning a [`ScanBuilder`].
 ///
@@ -581,7 +579,7 @@ pub unsafe extern "C" fn scan_metadata_iter_init(
 fn scan_metadata_iter_init_impl(
     engine: &Arc<dyn ExternEngine>,
     scan: &Scan,
-) -> KernelResult<Handle<SharedScanMetadataIterator>> {
+) -> Result<Handle<SharedScanMetadataIterator>> {
     let scan_metadata = scan.scan_metadata(engine.engine().as_ref())?;
     let data = ScanMetadataIterator {
         data: Mutex::new(Box::new(scan_metadata)),
@@ -622,7 +620,7 @@ fn scan_metadata_next_impl(
         engine_context: NullableCvoid,
         scan_metadata: Handle<SharedScanMetadata>,
     ),
-) -> KernelResult<bool> {
+) -> Result<bool> {
     let mut data = data.lock_iter()?;
     if let Some(scan_metadata) = data.next().transpose()? {
         (engine_visitor)(engine_context, Arc::new(scan_metadata).into());
@@ -1118,7 +1116,7 @@ pub unsafe extern "C" fn scan_metadata_next_arrow(
 #[cfg(feature = "default-engine-base")]
 fn scan_metadata_next_arrow_impl(
     data: &ScanMetadataIterator,
-) -> KernelResult<*mut ScanMetadataArrowResult> {
+) -> Result<*mut ScanMetadataArrowResult> {
     let mut iter = data
         .data
         .lock()
