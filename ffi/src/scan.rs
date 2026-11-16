@@ -2389,7 +2389,7 @@ mod tests {
         unsafe fn plan_based_engine(
             fallback: &Handle<SharedExternEngine>,
         ) -> Handle<SharedExternEngine> {
-            let executor = unsafe { get_plan_executor(None, unreachable_executor) };
+            let executor = unsafe { get_plan_executor(None, unreachable_executor, true) };
             unsafe {
                 get_plan_based_engine(
                     executor,

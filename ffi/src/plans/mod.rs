@@ -16,8 +16,13 @@ pub mod result;
 
 /// Build a [`PlanExecutor`] backed by an engine-provided C callback.
 ///
-/// The executor supports declarative protocol and metadata replay. Use
-/// [`get_plan_executor_with_pm_replay`] to opt out of that replay while retaining plan-based I/O.
+/// Set `supports_protocol_metadata_replay` to `true` to enable declarative protocol and metadata
+/// replay, or `false` to use imperative replay through engine handlers. The executor remains
+/// available for handler I/O and explicitly requested plans. See
+/// [`PlanExecutor::supports_protocol_metadata_replay`] for the support contract.
+///
+/// The returned handle can be consumed by [`get_plan_based_engine`] or released with
+/// [`free_plan_executor`].
 ///
 /// # Safety
 /// The `context` pointer MUST be thread-safe (Send + Sync) and MUST remain valid for as long as the
@@ -25,25 +30,6 @@ pub mod result;
 /// for the executor's lifetime and support concurrent calls.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn get_plan_executor(
-    context: NullableCvoid,
-    callback: CExecuteOpFn,
-) -> Handle<SharedPlanExecutor> {
-    unsafe { get_plan_executor_with_pm_replay(context, callback, true) }
-}
-
-/// Build a callback-backed executor with configurable protocol and metadata replay support.
-///
-/// Passing `false` makes Kernel replay protocol and metadata through imperative engine handlers.
-/// The executor remains available for handler I/O and explicitly requested plans. See
-/// [`PlanExecutor::supports_protocol_metadata_replay`] for the support contract.
-///
-/// The returned handle can be consumed by [`get_plan_based_engine`] or released with
-/// [`free_plan_executor`].
-///
-/// # Safety
-/// The context and callback must satisfy the requirements of [`get_plan_executor`].
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn get_plan_executor_with_pm_replay(
     context: NullableCvoid,
     callback: CExecuteOpFn,
     supports_protocol_metadata_replay: bool,
@@ -56,14 +42,14 @@ pub unsafe extern "C" fn get_plan_executor_with_pm_replay(
     executor.into()
 }
 
-/// Free an executor obtained from [`get_plan_executor`] or [`get_plan_executor_with_pm_replay`].
+/// Free an executor obtained from [`get_plan_executor`].
 ///
 /// Normally the handle is consumed by [`get_plan_based_engine`] and need not be explicitly freed by
 /// the caller. Use this only when discarding the executor without wrapping it in PlanBasedEngine.
 ///
 /// # Safety
 ///
-/// Caller must pass a valid handle obtained from either executor constructor and must not use it
+/// Caller must pass a valid handle obtained from [`get_plan_executor`] and must not use it
 /// again afterwards.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn free_plan_executor(executor: Handle<SharedPlanExecutor>) {
@@ -86,7 +72,7 @@ pub unsafe extern "C" fn free_plan_executor(executor: Handle<SharedPlanExecutor>
 /// and callbacks must remain valid for every use and support concurrent calls if shared across
 /// threads.
 ///
-/// Caller must pass a valid [`SharedPlanExecutor`] handle obtained from either executor constructor
+/// Caller must pass a valid [`SharedPlanExecutor`] handle obtained from [`get_plan_executor`]
 /// and a valid [`ErrorAllocators`]. When `fallback_engine` is [`OptionalValue::Some`], it must
 /// contain a valid [`SharedExternEngine`] handle.
 #[unsafe(no_mangle)]
@@ -139,19 +125,13 @@ mod tests {
     }
 
     #[rstest]
-    #[case::default(None)]
-    #[case::enabled(Some(true))]
-    #[case::disabled(Some(false))]
-    fn plan_executor_pm_support_survives_engine_construction(#[case] support: Option<bool>) {
-        let executor = unsafe {
-            match support {
-                Some(enabled) => get_plan_executor_with_pm_replay(None, unit_callback, enabled),
-                None => get_plan_executor(None, unit_callback),
-            }
-        };
+    #[case::enabled(true)]
+    #[case::disabled(false)]
+    fn plan_executor_pm_support_survives_engine_construction(#[case] support: bool) {
+        let executor = unsafe { get_plan_executor(None, unit_callback, support) };
         assert_eq!(
             unsafe { executor.as_ref() }.supports_protocol_metadata_replay(),
-            support.unwrap_or(true)
+            support
         );
 
         let engine_handle =
@@ -162,7 +142,7 @@ mod tests {
                 .require_plan_executor()
                 .unwrap()
                 .supports_protocol_metadata_replay(),
-            support.unwrap_or(true)
+            support
         );
         engine
             .storage_handler()
@@ -188,7 +168,7 @@ mod tests {
 
     #[test]
     fn plan_based_engine_works_after_fallback_handle_is_freed() {
-        let executor = unsafe { get_plan_executor(None, unreachable_callback) };
+        let executor = unsafe { get_plan_executor(None, unreachable_callback, true) };
 
         // The caller retains ownership of the fallback engine handle. `shallow_copy` mimics C
         // passing the pointer by value, so we can still free our own handle afterward.
@@ -231,7 +211,7 @@ mod tests {
 
     #[test]
     fn get_plan_based_engine_without_fallback_returns_plan_based_engine() {
-        let executor = unsafe { get_plan_executor(None, unreachable_callback) };
+        let executor = unsafe { get_plan_executor(None, unreachable_callback, true) };
 
         let engine_handle =
             unsafe { get_plan_based_engine(executor, OptionalValue::None, &TEST_ERROR_ALLOCATORS) };
@@ -245,7 +225,7 @@ mod tests {
     /// rather than delegating.
     #[test]
     fn without_fallback_unimplemented_operations_are_unsupported() {
-        let executor = unsafe { get_plan_executor(None, unreachable_callback) };
+        let executor = unsafe { get_plan_executor(None, unreachable_callback, true) };
         let engine_handle =
             unsafe { get_plan_based_engine(executor, OptionalValue::None, &TEST_ERROR_ALLOCATORS) };
 
