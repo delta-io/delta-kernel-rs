@@ -1,3 +1,4 @@
+use crate::DeltaErrorCondition;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
@@ -544,9 +545,8 @@ async fn row_tracking_schema_compatibility(
         assert!(
             matches!(
                 &res,
-                Err(Error::Kernel(
-                    KernelError::ChangeDataFeedIncompatibleSchema(_, _)
-                ))
+                Err(Error::Delta(error)) if error.condition() ==
+                    DeltaErrorCondition::DeltaChangeDataFeedIncompatibleSchemaChange
             ),
             "expected incompatible-schema error, got {res:?}"
         );
@@ -677,16 +677,41 @@ async fn incompatible_schemas_fail() {
 
         let table_root_url = url::Url::from_directory_path(mock_table.table_root()).unwrap();
         let table_config = get_default_table_config(&table_root_url);
+        let expected_read_schema = cdf_schema.to_string();
         let res: Result<Vec<_>> =
             table_changes_action_iter(engine, &table_config, commits, cdf_schema, None)
                 .unwrap()
                 .try_collect();
 
+        let Error::Delta(error) = res.err().unwrap() else {
+            panic!("expected replay schema Delta error")
+        };
+        assert_eq!(
+            error.name(),
+            "DELTA_CHANGE_DATA_FEED_INCOMPATIBLE_SCHEMA_CHANGE"
+        );
+        assert_eq!(error.sql_state(), Some("0AKDC"));
+        let parameters = error.parameters();
+        assert_eq!(
+            parameters.iter().map(|p| p.name()).collect::<Vec<_>>(),
+            [
+                "start",
+                "end",
+                "readSchema",
+                "readVersion",
+                "incompatibleVersion"
+            ]
+        );
+        assert_eq!(parameters[0].value(), "0");
+        assert_eq!(parameters[1].value(), "0");
+        assert_eq!(parameters[2].value(), expected_read_schema);
+        assert_eq!(parameters[3].value(), "0");
+        assert_eq!(parameters[4].value(), "0");
+        let context = std::error::Error::source(&error).unwrap();
+        assert_eq!(context.to_string(), "commit v=0");
         assert!(matches!(
-            res,
-            Err(Error::Kernel(
-                KernelError::ChangeDataFeedIncompatibleSchema(_, _)
-            ))
+            context.source().unwrap().downcast_ref::<KernelError>(),
+            Some(KernelError::ChangeDataFeedIncompatibleSchema(_, _))
         ));
     }
 
@@ -814,9 +839,7 @@ async fn demonstration_schema_evolution_failures() {
     assert!(
         matches!(
             res,
-            Err(Error::Kernel(
-                KernelError::ChangeDataFeedIncompatibleSchema(_, _)
-            ))
+            Err(Error::Delta(ref error)) if error.name() == "DELTA_CHANGE_DATA_FEED_INCOMPATIBLE_SCHEMA_CHANGE"
         ),
         "Expected ChangeDataFeedIncompatibleSchema error for adding nullable column"
     );
@@ -836,9 +859,7 @@ async fn demonstration_schema_evolution_failures() {
     assert!(
         matches!(
             res,
-            Err(Error::Kernel(
-                KernelError::ChangeDataFeedIncompatibleSchema(_, _)
-            ))
+            Err(Error::Delta(ref error)) if error.name() == "DELTA_CHANGE_DATA_FEED_INCOMPATIBLE_SCHEMA_CHANGE"
         ),
         "Expected ChangeDataFeedIncompatibleSchema error for type widening"
     );
@@ -858,9 +879,7 @@ async fn demonstration_schema_evolution_failures() {
     assert!(
         matches!(
             res,
-            Err(Error::Kernel(
-                KernelError::ChangeDataFeedIncompatibleSchema(_, _)
-            ))
+            Err(Error::Delta(ref error)) if error.name() == "DELTA_CHANGE_DATA_FEED_INCOMPATIBLE_SCHEMA_CHANGE"
         ),
         "Expected ChangeDataFeedIncompatibleSchema error for nullability change"
     );
