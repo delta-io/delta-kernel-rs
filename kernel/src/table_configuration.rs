@@ -18,6 +18,7 @@ use url::Url;
 
 use crate::actions::{Metadata, NULL_COUNT, Protocol};
 use crate::expressions::ColumnName;
+use crate::scan::column_lookup_error;
 use crate::scan::data_skipping::stats_schema::{
     StatsConfig, StripFieldMetadataTransform, expected_stats_schema, is_skipping_eligible_datatype,
     stats_column_names,
@@ -636,16 +637,17 @@ impl TableConfiguration {
                     logical_column,
                     column_mapping_mode,
                 )
+                .map_err(|error| column_lookup_error(error, &logical_schema, logical_column, false))
             })
-            .collect::<KernelResult<Vec<_>>>()?;
+            .collect::<Result<Vec<_>>>()?;
 
-        self.build_stats_output_schemas_for_resolved_columns(
+        Ok(self.build_stats_output_schemas_for_resolved_columns(
             logical_columns,
             &physical_columns,
             variant_min_max,
             #[cfg(feature = "geo-type-in-dev")]
             geometry_min_max,
-        )
+        )?)
     }
 
     fn build_stats_output_schemas_for_resolved_columns(

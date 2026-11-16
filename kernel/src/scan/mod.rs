@@ -83,7 +83,7 @@ use crate::table_features::{ColumnMappingMode, Operation};
 use crate::transforms::{ExpressionTransform, SchemaTransform, transform_output_type};
 use crate::utils::{FoldWithOption as _, IteratorExt, require};
 use crate::{
-    Engine, EngineData, Error, FileMeta, KernelError, KernelResult,
+    DeltaError, Engine, EngineData, Error, FileMeta, KernelError, KernelResult,
     KernelResultIterator, Result, SnapshotRef, Version,
 };
 
@@ -771,9 +771,15 @@ impl PhysicalPredicate {
             // clause has invalid column references. Data skipping is best-effort and the predicate
             // anyway needs to be evaluated against every row of data -- which is impossible if the
             // columns are missing/invalid. Just blow up instead of trying to handle it gracefully.
-            return Err(KernelError::missing_column(format!(
+            let source = KernelError::missing_column(format!(
                 "Predicate references unknown column: {unresolved}"
-            )));
+            ));
+            return Err(column_lookup_error(
+                source,
+                logical_schema,
+                unresolved,
+                true,
+            ));
         }
         let Some(schema) = schema_opt else {
             // The predicate doesn't statically skip all files, and it doesn't reference any columns
@@ -1891,6 +1897,45 @@ pub fn selection_vector(
     let storage = engine.storage_handler();
     let dv_treemap = descriptor.read(storage, table_root)?;
     Ok(deletion_treemap_to_bools(dv_treemap))
+}
+
+/// Classifies failed scan lookups without changing Kernel-only schema utilities.
+/// A successful logical lookup preserves other failures, such as missing mapping annotations.
+pub(crate) fn column_lookup_error(
+    error: KernelError,
+    schema: &StructType,
+    column: &ColumnName,
+    case_insensitive: bool,
+) -> Error {
+    if column.path().is_empty() {
+        return Error::Kernel(error);
+    }
+    let mut current = schema;
+    for (index, name) in column.path().iter().enumerate() {
+        let field = if case_insensitive {
+            current
+                .fields()
+                .find(|field| field.name().to_lowercase() == name.to_lowercase())
+        } else {
+            current.field(name)
+        };
+        let Some(field) = field else {
+            // TODO(3421): Remove the KernelError generic source following the error migration
+            return Error::Delta(DeltaError::column_not_found_in_schema(
+                &column.to_string(),
+                schema,
+                Some(Box::new(error)),
+            ));
+        };
+        if index + 1 == column.path().len() {
+            break;
+        }
+        let (DataType::Struct(inner) | DataType::File(inner)) = field.data_type() else {
+            return Error::Kernel(error);
+        };
+        current = inner;
+    }
+    Error::Kernel(error)
 }
 
 /// Returns [`MapToStructOptions`] with the supplied timezone, or the default (UTC) when absent.

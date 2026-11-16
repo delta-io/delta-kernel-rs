@@ -18,6 +18,8 @@ pub enum DeltaErrorCondition {
     DeltaChangelogRowTrackingDisabledInRange,
     /// `DELTA_CHANGE_DATA_FEED_INCOMPATIBLE_SCHEMA_CHANGE` (SQLSTATE `0AKDC`).
     DeltaChangeDataFeedIncompatibleSchemaChange,
+    /// `DELTA_COLUMN_NOT_FOUND_IN_SCHEMA` (SQLSTATE `42703`).
+    DeltaColumnNotFoundInSchema,
     /// `DELTA_DELETION_VECTOR_CHECKSUM_MISMATCH` (SQLSTATE `XXKDS`).
     DeltaDeletionVectorChecksumMismatch,
     /// `DELTA_DELETION_VECTOR_SIZE_MISMATCH` (SQLSTATE `XXKDS`).
@@ -70,6 +72,12 @@ impl DeltaErrorCondition {
                 sql_state: Some("0AKDC"),
                 parameter_names: &["start", "end", "readSchema", "readVersion", "incompatibleVersion"],
                 message_template: "Retrieving table changes between version <start> and <end> failed because of an incompatible schema change.\nYour read schema is <readSchema> at version <readVersion>, but we found an incompatible schema change at version <incompatibleVersion>.\nIf possible, please query table changes separately from version <start> to <incompatibleVersion> - 1, and from version <incompatibleVersion> to <end>.",
+            },
+            Self::DeltaColumnNotFoundInSchema => ConditionMetadata {
+                name: "DELTA_COLUMN_NOT_FOUND_IN_SCHEMA",
+                sql_state: Some("42703"),
+                parameter_names: &["columnName", "tableSchema"],
+                message_template: "Couldn't find column <columnName> in:\n<tableSchema>",
             },
             Self::DeltaDeletionVectorChecksumMismatch => ConditionMetadata {
                 name: "DELTA_DELETION_VECTOR_CHECKSUM_MISMATCH",

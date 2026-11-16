@@ -924,7 +924,13 @@ mod tests {
             ))
         };
         let result = unsafe { incremental_scan_builder_build(builder) };
-        assert_extern_result_error_with_message(result, FFIKernelError::MissingColumnError, None);
+        let ExternResult::Err(error) = result else {
+            panic!("expected missing-column error")
+        };
+        assert_eq!(
+            unsafe { recover_error(error) }.condition.as_deref(),
+            Some("DELTA_COLUMN_NOT_FOUND_IN_SCHEMA")
+        );
 
         unsafe { free_snapshot(snapshot) };
         unsafe { free_engine(engine) };

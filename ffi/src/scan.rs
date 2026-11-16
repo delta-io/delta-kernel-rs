@@ -1688,7 +1688,7 @@ mod scan_builder_tests {
     enum ColumnStatsExpected {
         Fields(&'static [&'static str]),
         SetterError(FFIKernelError),
-        BuildError(FFIKernelError),
+        BuildError(&'static str),
     }
 
     #[rstest::rstest]
@@ -1697,7 +1697,7 @@ mod scan_builder_tests {
     #[case::requested_missing(
         false,
         ColumnStatsInput::Missing,
-        ColumnStatsExpected::BuildError(FFIKernelError::GenericError)
+        ColumnStatsExpected::BuildError("DELTA_COLUMN_NOT_FOUND_IN_SCHEMA")
     )]
     #[case::extra_missing(true, ColumnStatsInput::Missing,
         ColumnStatsExpected::Fields(&["id", "val"]))]
@@ -1805,7 +1805,10 @@ mod scan_builder_tests {
                         else {
                             panic!("expected build error")
                         };
-                        assert_eq!(unsafe { recover_error(error) }.etype, expected);
+                        assert_eq!(
+                            unsafe { recover_error(error) }.condition.as_deref(),
+                            Some(expected)
+                        );
                     }
                     ColumnStatsExpected::SetterError(_) => unreachable!(),
                 }
