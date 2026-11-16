@@ -2238,6 +2238,8 @@ pub(crate) fn emit_log_segment_load(
 }
 
 /// Emit a [`MetricEvent::LogSegmentLoadFailure`]. Call once per log-segment load, on failure.
+///
+/// Pass the elapsed time of the failed operation; it is preserved when the helper span closes.
 pub(crate) fn emit_log_segment_load_failure(ctx: &SnapshotLoadMetricContext, duration: Duration) {
     let span = tracing::span!(
         tracing::Level::INFO,
@@ -2275,6 +2277,8 @@ pub(crate) fn emit_protocol_metadata_load(
 
 /// Emit a [`MetricEvent::ProtocolMetadataLoadFailure`]. Call once per snapshot load on the P&M
 /// resolution path, on failure.
+///
+/// Pass the elapsed time of the failed operation; it is preserved when the helper span closes.
 pub(crate) fn emit_protocol_metadata_load_failure(
     ctx: &SnapshotLoadMetricContext,
     duration: Duration,

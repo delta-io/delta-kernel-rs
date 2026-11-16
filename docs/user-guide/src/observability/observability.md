@@ -137,7 +137,7 @@ events from the same snapshot load together.
 | `ProtocolMetadataLoadSuccess` | `operation_id`, `duration` | Time to read protocol and metadata actions from the log. |
 | `ProtocolMetadataLoadFailure` | `operation_id`, `duration` | Time spent before protocol/metadata loading failed. |
 | `SnapshotBuildSuccess` | `operation_id`, `version`, `duration` | End-to-end snapshot creation, including the table version that was loaded. |
-| `SnapshotBuildFailure` | `operation_id`, `duration` | Time spent before snapshot creation failed. |
+| `SnapshotBuildFailure` | `operation_id`, `duration` | Time spent before snapshot creation failed. Use this to track error rates. |
 
 ### Scan metadata events
 
@@ -295,8 +295,9 @@ impl MetricsReporter for CorrelatingReporter {
             MetricEvent::SnapshotBuildFailure(e) => {
                 let steps = self.drain(e.operation_id);
                 println!(
-                    "Snapshot {} failed after {} sub-events; last step: {:?}",
+                    "Snapshot {} failed after {:?} ({} sub-events); last step: {:?}",
                     e.operation_id,
+                    e.duration,
                     steps.len(),
                     steps.last()
                 );
