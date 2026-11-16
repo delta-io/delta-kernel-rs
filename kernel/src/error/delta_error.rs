@@ -105,6 +105,15 @@ impl DeltaError {
         &self.backtrace
     }
 
+    /// Reports the exact path of a required data, change-data, or deletion-vector file.
+    pub fn file_not_found(path: impl ToString, source: Option<BoxedError>) -> Self {
+        Self::new(
+            DeltaErrorCondition::DeltaFileNotFound,
+            vec![DeltaErrorParameter::new("path", path)],
+            source,
+        )
+    }
+
     /// Reports a deletion vector whose stored CRC differs from its computed checksum.
     pub fn deletion_vector_checksum_mismatch(source: Option<BoxedError>) -> Self {
         Self::new(

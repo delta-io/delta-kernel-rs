@@ -14,6 +14,7 @@ use url::Url;
 
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::amt_path_util::{resolve_table_relative, validate_table_relative};
+use crate::error::required_file_error;
 use crate::path_encoding::uri_decode_path;
 use crate::schema::DataType;
 use crate::snapshot::Snapshot;
@@ -568,11 +569,13 @@ impl DeletionVectorDescriptor {
                         ))))?;
 
                 let dv_data = storage
-                    .read_files(vec![(path.clone(), None)])?
+                    .read_files(vec![(path.clone(), None)])
+                    .map_err(|error| required_file_error(error, &path))?
                     .next()
                     .ok_or(KernelError::missing_data(format!(
                         "No deletion vector data for {path}"
-                    )))??;
+                    )))?
+                    .map_err(|error| required_file_error(error, &path))?;
                 let dv_data_len = dv_data.len();
 
                 self.validate_framing(&dv_data, &path)?;

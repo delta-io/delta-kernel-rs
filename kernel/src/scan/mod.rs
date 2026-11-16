@@ -53,6 +53,7 @@ use crate::actions::{ADD_FIELD, ADD_NAME, Add, REMOVE_FIELD, SIDECAR_FIELD};
 use crate::cancellation::{CancellableIterator, CancellationTokenRef};
 use crate::engine::CancellableEngine;
 use crate::engine_data::FilteredEngineData;
+use crate::error::required_file_error;
 use crate::expressions::{
     ColumnName, ExpressionRef, MapToStructOptions, Predicate, PredicateRef, column_name,
 };
@@ -1783,7 +1784,7 @@ impl Scan {
                     size: scan_file.size.try_into().map_err(|_| {
                         KernelError::generic("Unable to convert scan file size into FileSize")
                     })?,
-                    location: file_path,
+                    location: file_path.clone(),
                 };
 
                 // WARNING: We validated the physical predicate against a schema that includes
@@ -1796,7 +1797,7 @@ impl Scan {
                     &[meta],
                     physical_schema.clone(),
                     None,
-                )?;
+                ).map_err(|error| required_file_error(error, &file_path))?;
 
                 let mut read_result_iter = read_result_iter.peekable();
 
@@ -1817,7 +1818,7 @@ impl Scan {
                 let physical_schema_inner = physical_schema.clone();
                 let logical_schema_inner = logical_schema.clone();
                 Ok(read_result_iter.map(move |read_result| -> Result<_> {
-                    let read_result = read_result?;
+                    let read_result = read_result.map_err(|error| required_file_error(error, &file_path))?;
                     // transform the physical data into the correct logical form
                     let logical = state::transform_to_logical(
                         engine.as_ref(),
