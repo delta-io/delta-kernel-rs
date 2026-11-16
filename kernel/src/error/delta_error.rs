@@ -214,6 +214,26 @@ impl DeltaError {
         )
     }
 
+    /// Reports the non-struct prefix that prevents resolving a nested logical column.
+    pub fn column_path_not_nested(
+        prefix: &str,
+        data_type: &DataType,
+        column: &str,
+        schema: &StructType,
+        source: Option<BoxedError>,
+    ) -> Self {
+        Self::new(
+            DeltaErrorCondition::DeltaColumnPathNotNested,
+            vec![
+                DeltaErrorParameter::new("columnPath", prefix),
+                DeltaErrorParameter::new("other", data_type),
+                DeltaErrorParameter::new("column", column),
+                DeltaErrorParameter::new("schema", schema),
+            ],
+            source,
+        )
+    }
+
     /// Reports explicitly reversed bounds for a change-data-feed request.
     pub fn invalid_cdc_range(start: Version, end: Version, source: Option<BoxedError>) -> Self {
         Self::new(
