@@ -55,7 +55,9 @@ use crate::table_properties::{
     MATERIALIZED_ROW_COMMIT_VERSION_COLUMN_NAME, MATERIALIZED_ROW_ID_COLUMN_NAME,
 };
 use crate::utils::{require, try_parse_uri};
-use crate::{Engine, Error, KernelError, KernelResult, KernelResultIterator, Result, Version};
+use crate::{
+    DeltaError, Engine, Error, KernelError, KernelResult, KernelResultIterator, Result, Version,
+};
 
 mod log_replay;
 mod net_changes;
@@ -319,6 +321,19 @@ impl TableChanges {
         mode: CdfMode,
     ) -> Result<Self> {
         let log_root = table_root.join("_delta_log/").map_err(KernelError::from)?;
+        if let Some(end_version) = end_version
+            && start_version > end_version
+        {
+            // TODO(3421): Remove the KernelError generic source following the error migration
+            let source = KernelError::generic(
+                "Failed to build LogSegment: start_version cannot be greater than end_version",
+            );
+            return Err(Error::Delta(DeltaError::invalid_cdc_range(
+                start_version,
+                end_version,
+                Some(Box::new(source)),
+            )));
+        }
         let log_segment = LogSegment::for_table_changes(
             engine.storage_handler().as_ref(),
             log_root,
@@ -1123,5 +1138,48 @@ mod tests {
             .try_collect()
             .unwrap();
         assert!(listing.is_empty(), "expected an empty listing: {listing:?}");
+    }
+}
+
+#[cfg(test)]
+mod error_tests {
+    use std::error::Error as _;
+
+    use rstest::rstest;
+
+    use super::*;
+    use crate::DeltaErrorCondition;
+    use crate::engine::PanicEngine;
+
+    #[rstest]
+    #[case(CdfMode::ChangeDataFeed)]
+    #[case(CdfMode::RowTracking)]
+    fn reversed_cdf_bounds_fail_before_engine_access(#[case] mode: CdfMode) {
+        let error = TableChanges::try_new_internal(
+            Url::parse("memory:///").unwrap(),
+            &PanicEngine,
+            4,
+            Some(2),
+            mode,
+        )
+        .err()
+        .unwrap();
+        let Error::Delta(error) = error else {
+            panic!("expected Delta range error")
+        };
+        assert_eq!(error.condition(), DeltaErrorCondition::DeltaInvalidCdcRange);
+        assert_eq!(error.sql_state(), Some("22003"));
+        assert_eq!(
+            error
+                .parameters()
+                .iter()
+                .map(|p| (p.name(), p.value()))
+                .collect::<Vec<_>>(),
+            [("start", "4"), ("end", "2")]
+        );
+        assert!(
+            matches!(error.source().unwrap().downcast_ref::<KernelError>(),
+            Some(KernelError::Generic(message)) if message.contains("start_version"))
+        );
     }
 }
