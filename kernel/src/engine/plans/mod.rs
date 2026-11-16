@@ -110,9 +110,9 @@ mod tests {
     use crate::engine::sync::SyncEngine;
     use crate::engine::sync::plan::SyncPlanExecutor;
     use crate::engine_data::FilteredEngineData;
-    use crate::unit_test_utils::plans::ScanOnlyPlanExecutor;
-    use crate::unit_test_utils::{TestCancellationToken, load_test_table};
-    use crate::{CancellationTokenRef, Engine as _, EngineData, KernelError, Snapshot};
+    use crate::unit_test_utils::load_test_table;
+    use crate::unit_test_utils::plans::IOOnlyPlanExecutor;
+    use crate::{Engine as _, EngineData, KernelError, Snapshot};
 
     fn plan_engine(fallback: Option<Arc<dyn crate::Engine>>) -> PlanBasedEngine {
         PlanBasedEngine::new(fallback, Arc::new(SyncPlanExecutor::default()))
@@ -122,23 +122,16 @@ mod tests {
     #[case::commits("app-txn-no-checkpoint")]
     #[case::checkpoint("app-txn-checkpoint")]
     #[case::json_checkpoint("v2-checkpoints-json-without-sidecars")]
-    fn snapshot_uses_imperative_pm_with_scan_only_executor(
-        #[case] table: &str,
-        #[values(false, true)] cancellable: bool,
-    ) {
+    fn snapshot_uses_imperative_pm_with_io_only_executor(#[case] table: &str) {
         let (_engine, expected, _tempdir) = load_test_table(table).unwrap();
         let engine = PlanBasedEngine::new(
             None,
-            Arc::new(ScanOnlyPlanExecutor(SyncPlanExecutor::default())),
+            Arc::new(IOOnlyPlanExecutor(SyncPlanExecutor::default())),
         );
         let executor = engine.require_plan_executor().unwrap();
         assert!(!executor.supports_protocol_metadata_replay());
 
         let actual = Snapshot::builder_for(expected.table_root().clone())
-            .with_cancellation_token(
-                cancellable
-                    .then(|| Arc::new(TestCancellationToken::default()) as CancellationTokenRef),
-            )
             .build(&engine)
             .unwrap();
 

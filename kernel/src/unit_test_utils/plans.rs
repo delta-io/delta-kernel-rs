@@ -6,9 +6,9 @@ use crate::plans::{Operation, Plan, PlanExecutor, PlanResult};
 use crate::{Engine, KernelError, KernelResult};
 
 /// Executes handler I/O while rejecting relational P&M plans.
-pub(crate) struct ScanOnlyPlanExecutor(pub SyncPlanExecutor);
+pub(crate) struct IOOnlyPlanExecutor(pub SyncPlanExecutor);
 
-impl PlanExecutor for ScanOnlyPlanExecutor {
+impl PlanExecutor for IOOnlyPlanExecutor {
     fn supports_protocol_metadata_replay(&self) -> bool {
         false
     }
