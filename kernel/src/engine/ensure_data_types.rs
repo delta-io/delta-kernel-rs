@@ -325,9 +325,8 @@ fn check_cast_compat(
     }
 }
 
-/// Multiplier that widens unscaled values of `source_type` to a decimal of `target_precision` and
-/// `target_scale` without loss of information, or `None` when `check_cast_compat` rejects that
-/// cast. Row group skipping applies it to footer bounds so pruning agrees with the reader.
+/// Returns the multiplier for losslessly widening unscaled values of `source_type` to a decimal
+/// with `target_precision` and `target_scale`, or `None` if that conversion is unsupported.
 pub(crate) fn decimal_upcast_factor(
     source_type: &ArrowDataType,
     target_precision: u8,
