@@ -182,6 +182,8 @@ impl TableChangesScan {
             commits,
             schema,
             physical_predicate,
+            self.table_changes.start_table_config.version()
+                ..=self.table_changes.end_snapshot.version(),
         )?;
         Ok(Some(it).into_iter().flatten())
     }

@@ -6,9 +6,7 @@ use itertools::Itertools;
 use rstest::rstest;
 use test_utils::LoggingTest;
 
-use super::{
-    TableChangesScanMetadata, table_changes_action_iter, table_changes_action_iter_with_mode,
-};
+use super::TableChangesScanMetadata;
 use crate::actions::{Add, Cdc, CommitInfo, Metadata, Protocol, Remove};
 use crate::engine::sync::SyncEngine;
 use crate::expressions::expr;
@@ -32,6 +30,56 @@ use crate::unit_test_utils::{
     assert_result_error_with_message,
 };
 use crate::{Engine, Error, KernelError, KernelResult, Predicate, Result, Version};
+
+fn table_changes_action_iter<I>(
+    engine: Arc<dyn Engine>,
+    configuration: &TableConfiguration,
+    commits: I,
+    schema: SchemaRef,
+    predicate: Option<(crate::PredicateRef, SchemaRef)>,
+) -> Result<impl Iterator<Item = Result<TableChangesScanMetadata>> + Send>
+where
+    I: IntoIterator<Item = ParsedLogPath>,
+{
+    let commits: Vec<_> = commits.into_iter().collect();
+    let end = commits
+        .last()
+        .map_or(configuration.version(), |c| c.version);
+    super::table_changes_action_iter(
+        engine,
+        configuration,
+        commits,
+        schema,
+        predicate,
+        configuration.version()..=end,
+    )
+}
+
+fn table_changes_action_iter_with_mode<I>(
+    engine: Arc<dyn Engine>,
+    configuration: &TableConfiguration,
+    commits: I,
+    schema: SchemaRef,
+    predicate: Option<(crate::PredicateRef, SchemaRef)>,
+    mode: CdfMode,
+) -> Result<impl Iterator<Item = Result<TableChangesScanMetadata>> + Send>
+where
+    I: IntoIterator<Item = ParsedLogPath>,
+{
+    let commits: Vec<_> = commits.into_iter().collect();
+    let end = commits
+        .last()
+        .map_or(configuration.version(), |c| c.version);
+    super::table_changes_action_iter_with_mode(
+        engine,
+        configuration,
+        commits,
+        schema,
+        predicate,
+        configuration.version()..=end,
+        mode,
+    )
+}
 
 fn get_schema() -> SchemaRef {
     schema_ref! {
@@ -1246,6 +1294,7 @@ async fn file_meta_timestamp() {
         &mut table_config,
         commit,
         &get_schema(),
+        0..=0,
         CdfMode::ChangeDataFeed,
     )
     .unwrap();
@@ -1534,6 +1583,7 @@ async fn test_timestamp_with_ict_enabled() {
         &mut table_config,
         commit,
         &get_schema(),
+        0..=0,
         CdfMode::ChangeDataFeed,
     )
     .unwrap();
@@ -1585,6 +1635,7 @@ async fn test_timestamp_with_ict_disabled() {
         &mut table_config,
         commit.clone(),
         &get_schema(),
+        0..=0,
         CdfMode::ChangeDataFeed,
     )
     .unwrap();
@@ -1643,6 +1694,7 @@ async fn test_timestamp_with_commit_info_not_first() {
         &mut table_config,
         commit,
         &get_schema(),
+        0..=0,
         CdfMode::ChangeDataFeed,
     );
 
