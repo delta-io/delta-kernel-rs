@@ -27,6 +27,7 @@ use crate::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use crate::parquet::arrow::arrow_writer::ArrowWriter;
 use crate::scan::data_skipping::{all_referenced_columns, as_checkpoint_skipping_predicate};
 use crate::scan::state::ScanFile;
+use crate::scan::state_info::tests::get_state_info_with_stats;
 use crate::schema::{
     self, ColumnMetadataKey, DataType, MetadataColumnSpec, StructField, StructType, schema,
     schema_ref,
@@ -373,6 +374,94 @@ fn test_physical_predicate_case_insensitive(
     assert_eq!(result, expected);
 }
 
+#[rstest]
+#[case::missing(vec!["s", "absent"], false)]
+#[case::quoted_missing(vec!["s", "missing'\\\""], false)]
+fn column_lookup_catalog_metadata(
+    #[case] path: Vec<&str>,
+    #[case] non_struct: bool,
+    #[values(false, true)] predicate: bool,
+) {
+    let schema = schema_ref! {
+        nullable "s": { nullable "id": LONG },
+        nullable "quote'\\\"": LONG,
+    };
+    let column = ColumnName::new(path.clone());
+    let error = if predicate {
+        PhysicalPredicate::try_new(
+            &Expr::column(path).is_not_null(),
+            &schema,
+            ColumnMappingMode::None,
+        )
+        .unwrap_err()
+    } else {
+        get_state_info_with_stats(
+            schema.clone(),
+            vec![],
+            None,
+            &[],
+            HashMap::new(),
+            vec![],
+            StatsOptions::struct_columns(vec![column.clone()]),
+        )
+        .expect_err("invalid requested column")
+    };
+    let Error::Delta(error) = error else {
+        panic!("expected lookup Delta error")
+    };
+    assert_eq!(
+        error.sql_state(),
+        Some(if non_struct { "42704" } else { "42703" })
+    );
+    let parameters = error
+        .parameters()
+        .iter()
+        .map(|p| (p.name(), p.value()))
+        .collect::<Vec<_>>();
+    let column_text = column.to_string();
+    let schema_text = schema.to_string();
+    if non_struct {
+        let prefix =
+            ColumnName::new(column.path()[..column.path().len() - 1].iter().cloned()).to_string();
+        assert_eq!(error.name(), "DELTA_COLUMN_PATH_NOT_NESTED");
+        assert_eq!(
+            parameters,
+            vec![
+                ("columnPath", prefix.as_str()),
+                ("other", "long"),
+                ("column", column_text.as_str()),
+                ("schema", schema_text.as_str())
+            ]
+        );
+    } else {
+        assert_eq!(error.name(), "DELTA_COLUMN_NOT_FOUND_IN_SCHEMA");
+        assert_eq!(
+            parameters,
+            vec![
+                ("columnName", column_text.as_str()),
+                ("tableSchema", schema_text.as_str())
+            ]
+        );
+    }
+    assert!(
+        std::error::Error::source(&error)
+            .unwrap()
+            .downcast_ref::<KernelError>()
+            .is_some()
+    );
+}
+
+#[rstest]
+#[case::empty_path(vec![])]
+#[case::resolved_path(vec!["id"])]
+fn lookup_classification_preserves_unrelated_kernel_errors(#[case] path: Vec<&str>) {
+    let schema = schema! { nullable "id": LONG };
+    let source = KernelError::Schema("missing mapping annotation".into());
+    let error = column_lookup_error(source, &schema, &ColumnName::new(path), false);
+    assert!(matches!(error, Error::Kernel(KernelError::Schema(message))
+        if message == "missing mapping annotation"));
+}
+
 /// Unknown column still fails even with case-insensitive matching.
 #[test]
 fn test_physical_predicate_case_insensitive_unknown_column() {
@@ -455,7 +544,7 @@ fn test_scan_builder_rejects_predicate_on_projection_only_metadata_column() {
         .expect_err("build should reject predicate referencing a projection-only metadata column");
     let msg = err.to_string();
     assert!(
-        msg.contains("Predicate references unknown column") && msg.contains("my_row_index"),
+        msg.contains("Couldn't find column my_row_index"),
         "unexpected error: {msg}"
     );
 }
@@ -2424,7 +2513,7 @@ fn test_scan_metadata_with_nonexistent_stats_columns() {
         })
         .build();
 
-    assert_result_error_with_message(result, "Could not resolve column 'nonexistent_column'");
+    assert_result_error_with_message(result, "Couldn't find column nonexistent_column");
 }
 
 #[test]

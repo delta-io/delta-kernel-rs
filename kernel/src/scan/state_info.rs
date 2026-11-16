@@ -1,3 +1,4 @@
+use crate::scan::column_lookup_error;
 //! StateInfo handles the state that we use through log-replay in order to correctly construct all
 //! the physical->logical transforms needed for each add file
 
@@ -353,7 +354,10 @@ fn resolve_physical_columns_strict(
     let column_mapping_mode = table_configuration.column_mapping_mode();
     logical
         .iter()
-        .map(|col| get_any_level_column_physical_name(&logical_schema, col, column_mapping_mode))
+        .map(|col| {
+            get_any_level_column_physical_name(&logical_schema, col, column_mapping_mode)
+                .map_err(|error| column_lookup_error(error, &logical_schema, col, false))
+        })
         .collect()
 }
 

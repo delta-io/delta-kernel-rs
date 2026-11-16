@@ -198,6 +198,22 @@ impl DeltaError {
         )
     }
 
+    /// Reports a requested logical column absent from the table schema.
+    pub fn column_not_found_in_schema(
+        column: &str,
+        schema: &StructType,
+        source: Option<BoxedError>,
+    ) -> Self {
+        Self::new(
+            DeltaErrorCondition::DeltaColumnNotFoundInSchema,
+            vec![
+                DeltaErrorParameter::new("columnName", column),
+                DeltaErrorParameter::new("tableSchema", schema),
+            ],
+            source,
+        )
+    }
+
     /// Reports explicitly reversed bounds for a change-data-feed request.
     pub fn invalid_cdc_range(start: Version, end: Version, source: Option<BoxedError>) -> Self {
         Self::new(
