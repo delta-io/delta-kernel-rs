@@ -1388,52 +1388,50 @@ mod tests {
     ) {
         let id = kernel::MetricId::new();
         let duration = Duration::from_nanos(duration_ns);
-        let events = [
-            kernel::MetricEvent::SnapshotBuildFailure(kernel::SnapshotBuildFailure {
-                operation_id: id,
-                correlation_id: None,
-                table_type: kernel::TableType::PathBased,
-                load_type: kernel::SnapshotLoadType::SnapshotHint,
-                duration,
-            }),
+        let snapshot = kernel::MetricEvent::SnapshotBuildFailure(kernel::SnapshotBuildFailure {
+            operation_id: id,
+            correlation_id: None,
+            table_type: kernel::TableType::PathBased,
+            load_type: kernel::SnapshotLoadType::SnapshotHint,
+            duration,
+        });
+        with_ffi_event(&snapshot, |ffi| {
+            assert!(matches!(
+                ffi,
+                MetricEvent::SnapshotBuildFailure(e)
+                    if e.load_type == SnapshotLoadType::SnapshotHint && e.duration_ns == duration_ns
+            ));
+        });
+
+        let log_segment =
             kernel::MetricEvent::LogSegmentLoadFailure(kernel::LogSegmentLoadFailure {
                 operation_id: id,
                 correlation_id: None,
                 table_type: kernel::TableType::PathBased,
                 load_type: kernel::LogSegmentLoadType::Full,
                 duration,
-            }),
+            });
+        with_ffi_event(&log_segment, |ffi| {
+            assert!(matches!(
+                ffi,
+                MetricEvent::LogSegmentLoadFailure(e) if e.duration_ns == duration_ns
+            ));
+        });
+
+        let protocol_metadata =
             kernel::MetricEvent::ProtocolMetadataLoadFailure(kernel::ProtocolMetadataLoadFailure {
                 operation_id: id,
                 correlation_id: None,
                 table_type: kernel::TableType::PathBased,
                 load_type: kernel::LogSegmentLoadType::Full,
                 duration,
-            }),
-        ];
-        for event in events {
-            with_ffi_event(&event, |ffi| {
-                let actual_duration_ns = match (&event, ffi) {
-                    (
-                        kernel::MetricEvent::SnapshotBuildFailure(_),
-                        MetricEvent::SnapshotBuildFailure(e),
-                    ) => {
-                        assert_eq!(e.load_type, SnapshotLoadType::SnapshotHint);
-                        e.duration_ns
-                    }
-                    (
-                        kernel::MetricEvent::LogSegmentLoadFailure(_),
-                        MetricEvent::LogSegmentLoadFailure(e),
-                    ) => e.duration_ns,
-                    (
-                        kernel::MetricEvent::ProtocolMetadataLoadFailure(_),
-                        MetricEvent::ProtocolMetadataLoadFailure(e),
-                    ) => e.duration_ns,
-                    _ => panic!("expected matching snapshot lifecycle failure variant"),
-                };
-                assert_eq!(actual_duration_ns, duration_ns);
             });
-        }
+        with_ffi_event(&protocol_metadata, |ffi| {
+            assert!(matches!(
+                ffi,
+                MetricEvent::ProtocolMetadataLoadFailure(e) if e.duration_ns == duration_ns
+            ));
+        });
     }
 
     #[rstest]

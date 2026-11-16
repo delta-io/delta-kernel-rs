@@ -2564,6 +2564,57 @@ mod tests {
         assert_eq!(ProtocolMetadataSource::parse_or_unknown(value), expected);
     }
 
+    #[rstest]
+    fn snapshot_load_failure_display_includes_context_and_duration(
+        #[values(Duration::ZERO, Duration::from_nanos(73))] duration: Duration,
+        #[values(None, Some("snapshot-request"))] correlation_id: Option<&str>,
+    ) {
+        let operation_id = MetricId::new();
+        let correlation_id = correlation_id.map(Arc::<str>::from);
+        let table_type = TableType::CatalogManaged;
+        let events = [
+            (
+                "LogSegmentLoadFailure",
+                MetricEvent::LogSegmentLoadFailure(LogSegmentLoadFailure {
+                    operation_id,
+                    correlation_id: correlation_id.clone(),
+                    table_type,
+                    load_type: LogSegmentLoadType::Incremental,
+                    duration,
+                }),
+            ),
+            (
+                "ProtocolMetadataLoadFailure",
+                MetricEvent::ProtocolMetadataLoadFailure(ProtocolMetadataLoadFailure {
+                    operation_id,
+                    correlation_id: correlation_id.clone(),
+                    table_type,
+                    load_type: LogSegmentLoadType::Incremental,
+                    duration,
+                }),
+            ),
+            (
+                "SnapshotBuildFailure",
+                MetricEvent::SnapshotBuildFailure(SnapshotBuildFailure {
+                    operation_id,
+                    correlation_id: correlation_id.clone(),
+                    table_type,
+                    load_type: SnapshotLoadType::Incremental,
+                    duration,
+                }),
+            ),
+        ];
+        for (name, event) in events {
+            assert_eq!(
+                event.to_string(),
+                format!(
+                    "{name}(id={operation_id}, table_type=catalog_managed, \
+                     correlation_id={correlation_id:?}, load_type=incremental, duration={duration:?})"
+                )
+            );
+        }
+    }
+
     #[test]
     fn into_failure_maps_commit_success_to_error_reason() {
         let id = MetricId::new();

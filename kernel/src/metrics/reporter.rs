@@ -571,10 +571,10 @@ mod tests {
         let delay = Duration::from_millis(1);
         let _ = failing_build(delay);
         let events = reporter.events();
-        let [MetricEvent::SnapshotBuildFailure(event)] = events.as_slice() else {
-            panic!("expected a snapshot build failure; got: {events:?}");
-        };
-        assert!(event.duration >= delay);
+        assert!(
+            matches!(events.as_slice(), [MetricEvent::SnapshotBuildFailure(event)] if event.duration >= delay),
+            "expected one snapshot build failure with duration >= {delay:?}; got: {events:?}"
+        );
     }
 
     #[rstest::rstest]
