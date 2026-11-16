@@ -105,6 +105,15 @@ impl DeltaError {
         &self.backtrace
     }
 
+    /// Reports a deletion vector whose stored CRC differs from its computed checksum.
+    pub fn deletion_vector_checksum_mismatch(source: Option<BoxedError>) -> Self {
+        Self::new(
+            DeltaErrorCondition::DeltaDeletionVectorChecksumMismatch,
+            vec![],
+            source,
+        )
+    }
+
     /// Reports a stored deletion-vector size that differs from its descriptor.
     pub fn deletion_vector_size_mismatch(source: Option<BoxedError>) -> Self {
         Self::new(

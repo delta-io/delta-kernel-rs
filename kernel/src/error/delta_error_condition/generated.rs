@@ -14,6 +14,8 @@ use super::ConditionMetadata;
 pub enum DeltaErrorCondition {
     /// `DELTA_ADAPTIVE_METADATA_REQUIRES_COLUMN_MAPPING_ID_MODE` (SQLSTATE `42000`).
     DeltaAdaptiveMetadataRequiresColumnMappingIdMode,
+    /// `DELTA_DELETION_VECTOR_CHECKSUM_MISMATCH` (SQLSTATE `XXKDS`).
+    DeltaDeletionVectorChecksumMismatch,
     /// `DELTA_DELETION_VECTOR_SIZE_MISMATCH` (SQLSTATE `XXKDS`).
     DeltaDeletionVectorSizeMismatch,
     /// `DELTA_DUPLICATE_COLUMNS_FOUND.EXISTING_SCHEMA` (SQLSTATE `42711`).
@@ -46,6 +48,12 @@ impl DeltaErrorCondition {
                 sql_state: Some("42000"),
                 parameter_names: &["feature", "prop", "mode"],
                 message_template: "The table feature '<feature>' requires column mapping mode 'id', but the table property '<prop>' is set to '<mode>'. Recreate the table with '<prop>' = 'id', or omit the property to have it set automatically.",
+            },
+            Self::DeltaDeletionVectorChecksumMismatch => ConditionMetadata {
+                name: "DELTA_DELETION_VECTOR_CHECKSUM_MISMATCH",
+                sql_state: Some("XXKDS"),
+                parameter_names: &[],
+                message_template: "Could not verify deletion vector integrity, CRC checksum verification failed.",
             },
             Self::DeltaDeletionVectorSizeMismatch => ConditionMetadata {
                 name: "DELTA_DELETION_VECTOR_SIZE_MISMATCH",

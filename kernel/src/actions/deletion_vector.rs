@@ -651,8 +651,10 @@ impl DeletionVectorDescriptor {
                 let expected_crc = crc32.checksum(&bytes.slice(magic_start..crc_start));
                 require!(
                     crc == expected_crc,
-                    Error::Kernel(KernelError::DeletionVector(format!(
-                        "CRC32 checksum mismatch for {path}. Got: {crc}, expected: {expected_crc}"
+                    Error::Delta(DeltaError::deletion_vector_checksum_mismatch(Some(
+                        Box::new(KernelError::DeletionVector(format!(
+                            "CRC32 checksum mismatch for {path}. Got: {crc}, expected: {expected_crc}"
+                        )))
                     )))
                 );
                 // Safety: verified bytes is larger than crc_start + 4, above.
@@ -1316,6 +1318,55 @@ mod tests {
                 info.get_row_indexes(&engine, &parent),
                 Err(Error::Delta(_))
             ));
+        }
+    }
+
+    #[rstest::rstest]
+    #[case::checksum(false, false)]
+    #[case::framing_precedes_checksum(true, false)]
+    #[case::magic_precedes_checksum(false, true)]
+    fn deletion_vector_checksum_classification_preserves_precedence(
+        #[case] invalid_framing: bool,
+        #[case] invalid_magic: bool,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = Url::from_directory_path(dir.path()).unwrap();
+        let descriptor = dv_example();
+        let mut bytes = std::fs::read(
+            "tests/data/table-with-dv-small/deletion_vector_61d16c75-6994-46b7-a15b-8b538852e50e.bin"
+        ).unwrap();
+        let crc_start = 5 + descriptor.size_in_bytes as usize;
+        bytes[crc_start] ^= 1;
+        if invalid_framing {
+            bytes[0] = 2;
+        }
+        if invalid_magic {
+            bytes[5..9].fill(0);
+        }
+        let path = descriptor.absolute_path(&parent).unwrap().unwrap();
+        std::fs::write(path.to_file_path().unwrap(), bytes).unwrap();
+        let error = descriptor
+            .read(SyncEngine::new().storage_handler(), &parent)
+            .unwrap_err();
+        if invalid_framing || invalid_magic {
+            assert!(matches!(
+                error,
+                Error::Kernel(KernelError::DeletionVector(_))
+            ));
+        } else {
+            let Error::Delta(error) = error else {
+                panic!("expected Delta checksum error")
+            };
+            assert_eq!(error.name(), "DELTA_DELETION_VECTOR_CHECKSUM_MISMATCH");
+            assert_eq!(error.sql_state(), Some("XXKDS"));
+            assert!(error.parameters().is_empty());
+            let source = std::error::Error::source(&error)
+                .unwrap()
+                .downcast_ref::<KernelError>()
+                .unwrap();
+            assert!(
+                matches!(source, KernelError::DeletionVector(message) if message.contains(path.as_str()) && message.contains("CRC32"))
+            );
         }
     }
 
