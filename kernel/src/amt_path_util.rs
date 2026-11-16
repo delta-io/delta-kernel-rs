@@ -267,6 +267,33 @@ mod tests {
         "file:/tmp/a b.parquet",
         "file:///tmp/a%20b.parquet"
     )]
+    // Scheme edge cases: the encoded-location resolver relies on `Url::join` deciding absolute vs
+    // relative the same way `scheme_len` does.
+    #[case::single_char_scheme_treated_as_absolute(
+        "memory:///table/",
+        "c:/foo/root.parquet",
+        "c:/foo/root.parquet"
+    )]
+    #[case::colon_in_relative_segment_stays_relative(
+        "memory:///table/",
+        "metadata/snap-123:456.parquet",
+        "memory:///table/metadata/snap-123:456.parquet"
+    )]
+    #[case::leading_digit_scheme_treated_as_relative(
+        "memory:///table/",
+        "3com/root.parquet",
+        "memory:///table/3com/root.parquet"
+    )]
+    #[case::non_ascii_scheme_treated_as_relative(
+        "memory:///table/",
+        "\u{03b1}scheme/root.parquet",
+        "memory:///table/%CE%B1scheme/root.parquet"
+    )]
+    #[case::compound_scheme_treated_as_absolute(
+        "memory:///table/",
+        "git+ssh://host/repo/root.parquet",
+        "git+ssh://host/repo/root.parquet"
+    )]
     // A raw space is percent-encoded, not left to break URL parsing.
     #[case::space_is_encoded(
         "memory:///table/",
