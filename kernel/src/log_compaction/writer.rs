@@ -54,7 +54,7 @@ impl RetentionCalculator for LogCompactionWriter {
 }
 
 impl LogCompactionWriter {
-    // TODO(#2337): require compaction-specific reconciliation before re-enabling writes.
+    // TODO(#3914): require compaction-specific reconciliation before re-enabling writes.
     pub(crate) fn try_new(
         _snapshot: SnapshotRef,
         _start_version: Version,
@@ -125,7 +125,7 @@ impl LogCompactionWriter {
 
         let min_file_retention_timestamp_millis = self.deleted_file_retention_timestamp()?;
 
-        // TODO(#2337): retain removals, deleted domains, and expired transaction markers across
+        // TODO(#3914): retain removals, deleted domains, and expired transaction markers across
         // partial compactions. Checkpoint retention can resurrect state preceding this range.
         let mut processor = ActionReconciliationProcessor::new(
             min_file_retention_timestamp_millis,

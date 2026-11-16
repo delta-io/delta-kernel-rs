@@ -13,6 +13,7 @@ use url::Url;
 
 use crate::{resolve_table_path, try_parse_uri};
 
+// TODO(#3914): use the production writer once it preserves suppression records for partial ranges.
 /// Writes a log compaction from the original commits in `start..=end` and returns its URL.
 ///
 /// `table_root` must be a directory URL backed by `store`, and `start < end`.
