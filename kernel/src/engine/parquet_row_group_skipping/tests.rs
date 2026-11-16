@@ -475,6 +475,109 @@ fn test_get_stat_values() {
 }
 
 #[rstest]
+#[case::string(
+    DataType::STRING,
+    Statistics::byte_array(None, None, None, Some(2), false)
+)]
+#[case::fixed_string(
+    DataType::STRING,
+    Statistics::fixed_len_byte_array(None, None, None, Some(2), false)
+)]
+#[case::long(DataType::LONG, Statistics::int64(None, None, None, Some(2), false))]
+#[case::widened_integer(DataType::LONG, Statistics::int32(None, None, None, Some(2), false))]
+#[case::integer(DataType::INTEGER, Statistics::int32(None, None, None, Some(2), false))]
+#[case::short(DataType::SHORT, Statistics::int32(None, None, None, Some(2), false))]
+#[case::byte(DataType::BYTE, Statistics::int32(None, None, None, Some(2), false))]
+#[case::float(DataType::FLOAT, Statistics::float(None, None, None, Some(2), false))]
+#[case::double(DataType::DOUBLE, Statistics::double(None, None, None, Some(2), false))]
+#[case::widened_float(DataType::DOUBLE, Statistics::float(None, None, None, Some(2), false))]
+#[case::boolean(
+    DataType::BOOLEAN,
+    Statistics::boolean(None, None, None, Some(2), false)
+)]
+#[case::binary(
+    DataType::BINARY,
+    Statistics::byte_array(None, None, None, Some(2), false)
+)]
+#[case::fixed_binary(
+    DataType::BINARY,
+    Statistics::fixed_len_byte_array(None, None, None, Some(2), false)
+)]
+#[case::date(DataType::DATE, Statistics::int32(None, None, None, Some(2), false))]
+#[case::timestamp(
+    DataType::TIMESTAMP,
+    Statistics::int64(None, None, None, Some(2), false)
+)]
+#[case::timestamp_ntz(
+    DataType::TIMESTAMP_NTZ,
+    Statistics::int64(None, None, None, Some(2), false)
+)]
+#[case::date_as_timestamp_ntz(
+    DataType::TIMESTAMP_NTZ,
+    Statistics::int32(None, None, None, Some(2), false)
+)]
+fn missing_footer_bounds_yield_no_scalar(#[case] data_type: DataType, #[case] stats: Statistics) {
+    let column = annotated_chunk(
+        stats.physical_type(),
+        None,
+        ConvertedType::NONE,
+        None,
+        stats,
+    );
+    assert_eq!(extract_min_scalar(&data_type, &column), None);
+    assert_eq!(extract_max_scalar(&data_type, &column), None);
+}
+
+#[rstest]
+#[case::string("bool", DataType::STRING)]
+#[case::long("bool", DataType::LONG)]
+#[case::integer("bool", DataType::INTEGER)]
+#[case::short("bool", DataType::SHORT)]
+#[case::byte("bool", DataType::BYTE)]
+#[case::float("bool", DataType::FLOAT)]
+#[case::double("bool", DataType::DOUBLE)]
+#[case::boolean("numeric.ints.int32", DataType::BOOLEAN)]
+#[case::binary("bool", DataType::BINARY)]
+#[case::date("bool", DataType::DATE)]
+#[case::timestamp("bool", DataType::TIMESTAMP)]
+#[case::timestamp_ntz("bool", DataType::TIMESTAMP_NTZ)]
+#[case::void("bool", DataType::VOID)]
+fn incompatible_footer_types_yield_no_scalar(#[case] column: &str, #[case] data_type: DataType) {
+    let file = File::open("./tests/data/parquet_row_group_skipping/part-00000-b92e017a-50ba-4676-8322-48fc371c2b59-c000.snappy.parquet").unwrap();
+    let metadata = ArrowReaderMetadata::load(&file, reader_options()).unwrap();
+    let column = ColumnName::from_naive_str_split(column);
+    let predicate = Predicate::from_expr(Expression::column(column.clone()));
+    let filter = RowGroupFilter::new(metadata.metadata().row_group(0), &predicate);
+    assert_eq!(filter.get_min_stat(&column, &data_type), None);
+    assert_eq!(filter.get_max_stat(&column, &data_type), None);
+}
+
+#[rstest]
+fn invalid_utf8_footer_bounds_yield_no_string(#[values(false, true)] fixed_len: bool) {
+    let bytes = ByteArray::from(vec![0xff; 16]);
+    let stats = if fixed_len {
+        Statistics::fixed_len_byte_array(
+            Some(bytes.clone().into()),
+            Some(bytes.into()),
+            None,
+            Some(0),
+            false,
+        )
+    } else {
+        Statistics::byte_array(Some(bytes.clone()), Some(bytes), None, Some(0), false)
+    };
+    let column = annotated_chunk(
+        stats.physical_type(),
+        None,
+        ConvertedType::NONE,
+        None,
+        stats,
+    );
+    assert_eq!(extract_min_scalar(&DataType::STRING, &column), None);
+    assert_eq!(extract_max_scalar(&DataType::STRING, &column), None);
+}
+
+#[rstest]
 #[case::decimal32("numeric.decimals.decimal32", 10, 5, Some((1_103_200, 1_503_200)))]
 #[case::decimal64("numeric.decimals.decimal64", 20, 5, Some((1_106_400, 1_506_400)))]
 #[case::decimal128("numeric.decimals.decimal128", 38, 5, Some((1_112_800, 1_512_800)))]
