@@ -395,6 +395,10 @@ pub enum CheckpointWriteMode {
 }
 
 /// A [`crate::Snapshot::checkpoint`] call wrote a checkpoint or reported that one already exists.
+///
+/// [`CheckpointWriteOutcome::Written`] reports completed batch processing. An early
+/// [`CheckpointWriteOutcome::AlreadyExists`] reports zero processing values; an `AlreadyExists`
+/// return after processing starts retains the work performed.
 #[derive(Debug, Clone)]
 pub struct CheckpointWriteSuccess {
     /// Unique identifier for this checkpoint attempt.
@@ -416,7 +420,9 @@ pub struct CheckpointWriteSuccess {
 
 /// A [`crate::Snapshot::checkpoint`] call returned an error.
 ///
-/// Checkpoint data may have been written before hint publication or snapshot construction failed.
+/// Processing metrics retain the work performed before the error and are zero for preflight
+/// failures. If hint publication or returned snapshot construction fails after checkpoint data
+/// completion, the failure event retains the completed processing metrics.
 #[derive(Debug, Clone)]
 pub struct CheckpointWriteFailure {
     /// Unique identifier for this checkpoint attempt.
@@ -429,7 +435,7 @@ pub struct CheckpointWriteFailure {
     ///
     /// Uses the same timing boundary as [`CheckpointWriteSuccess::duration`].
     pub duration: Duration,
-    /// Partial work performed before the error.
+    /// Work performed before the error.
     pub processing: CheckpointProcessingStats,
 }
 
@@ -453,7 +459,9 @@ pub struct CheckpointProcessingStats {
     /// Existing statistics are reused or converted; table data files are not scanned.
     pub stats_transform_duration: Duration,
     /// Time applying selection vectors to output batches.
-    /// Includes projection and filtering of file/non-file actions for sidecar output.
+    /// Without sidecars, this covers selection-vector application only. With sidecars, it also
+    /// covers splitting, projecting, and filtering file/non-file actions and buffering non-file
+    /// batches. Interpret this duration together with the event's [`CheckpointWriteMode`].
     pub output_preparation_duration: Duration,
     /// Input rows from the log after the previous checkpoint.
     pub num_log_rows: u64,

@@ -366,6 +366,9 @@ pub struct TransactionCommitFailure {
 }
 
 /// A [`delta_kernel::Snapshot::checkpoint`] call returned successfully.
+///
+/// Written checkpoints report completed processing. An early AlreadyExists reports zero
+/// processing values; an AlreadyExists return after processing starts retains the work performed.
 #[repr(C)]
 pub struct CheckpointWriteSuccess {
     /// Unique identifier for this checkpoint attempt.
@@ -384,6 +387,10 @@ pub struct CheckpointWriteSuccess {
 }
 
 /// A [`delta_kernel::Snapshot::checkpoint`] call returned an error, including after data writes.
+///
+/// Processing metrics retain work performed before the error. Preflight failures report zero
+/// processing values. Hint publication or snapshot construction failures retain completed
+/// processing.
 #[repr(C)]
 pub struct CheckpointWriteFailure {
     /// Unique identifier for this checkpoint attempt.
@@ -395,7 +402,7 @@ pub struct CheckpointWriteFailure {
     /// API entry through checkpoint data completion, or an earlier error, in nanoseconds.
     /// Excludes `_last_checkpoint` publication and returned snapshot construction.
     pub duration_ns: u64,
-    /// Partial work performed before the error.
+    /// Work performed before the error.
     pub processing: CheckpointProcessingStats,
 }
 
@@ -414,7 +421,9 @@ pub struct CheckpointProcessingStats {
     /// Time evaluating statistics and partition-value representation transforms, in nanoseconds.
     pub stats_transform_duration_ns: u64,
     /// Time applying selection vectors to output batches, in nanoseconds.
-    /// Includes projection and filtering of file/non-file actions for sidecar output.
+    /// Without sidecars, this covers selection-vector application only. With sidecars, it also
+    /// covers splitting, projecting, and filtering file/non-file actions and buffering non-file
+    /// batches. Interpret this duration together with the event's [`CheckpointWriteMode`].
     pub output_preparation_duration_ns: u64,
     /// Input rows from the log after the previous checkpoint.
     pub num_log_rows: u64,
@@ -644,7 +653,7 @@ pub enum MetricEvent {
 }
 
 fn duration_ns(duration: std::time::Duration) -> u64 {
-    duration.as_nanos() as u64
+    u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
 }
 
 /// Borrow the caller-supplied correlation id as a [`KernelStringSlice`], or an empty slice when
@@ -1088,11 +1097,17 @@ mod tests {
         #[case] mode: kernel::CheckpointWriteMode,
         #[case] expected_mode: CheckpointWriteMode,
         #[values(false, true)] failed: bool,
-        #[values(0u64, 456)] duration_ns: u64,
+        #[values(
+            (Duration::ZERO, 0),
+            (Duration::from_nanos(456), 456),
+            (Duration::from_nanos(u64::MAX), u64::MAX),
+            (Duration::from_nanos(u64::MAX) + Duration::from_nanos(1), u64::MAX)
+        )]
+        durations: (Duration, u64),
     ) {
         let operation_id = kernel::MetricId::new();
         let (processing, expected_processing) = checkpoint_processing_stats();
-        let duration = Duration::from_nanos(duration_ns);
+        let (duration, duration_ns) = durations;
         let event = if failed {
             kernel::MetricEvent::CheckpointWriteFailure(kernel::CheckpointWriteFailure {
                 operation_id,

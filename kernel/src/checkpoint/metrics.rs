@@ -1,3 +1,10 @@
+//! Collects batch processing metrics for one [`crate::Snapshot::checkpoint`] attempt.
+//!
+//! Clones share timers for input, reconciliation, statistics transforms, and output preparation,
+//! plus row counts from the log and previous checkpoint. See
+//! [`crate::metrics::CheckpointProcessingStats`] for the timing and counting boundaries.
+//! A report guard records the accumulated values when the attempt ends, including on early returns.
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
@@ -15,6 +22,13 @@ impl CheckpointMetrics {
         Self((!span.is_disabled()).then(Default::default))
     }
 
+    pub(crate) fn disabled() -> Self {
+        Self(None)
+    }
+
+    /// Reports accumulated metrics on drop. Keep the guard alive until the checkpoint attempt ends
+    /// so that it includes all completed processing work.
+    #[must_use = "dropping this guard early records incomplete checkpoint metrics"]
     pub(crate) fn report_on_drop(&self, span: Span) -> impl Drop + '_ {
         CheckpointMetricsReport {
             metrics: self,

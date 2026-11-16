@@ -554,9 +554,17 @@ void print_metric(MetricEvent event) {
   case MetricEventCheckpointWriteSuccess:
     PM_START(CheckpointWriteSuccess);
     CheckpointWriteSuccess cps = event.checkpoint_write_success;
+    PM_ID(cps, operation_id);
+    PM_U64(cps, version);
     printf("  outcome: %d,\n", cps.outcome.tag);
     PM_U64(cps, mode);
     PM_U64(cps, duration_ns);
+    PM_U64(cps.processing, input_duration_ns);
+    PM_U64(cps.processing, reconciliation_duration_ns);
+    PM_U64(cps.processing, stats_transform_duration_ns);
+    PM_U64(cps.processing, output_preparation_duration_ns);
+    PM_U64(cps.processing, num_log_rows);
+    PM_U64(cps.processing, num_checkpoint_rows);
     if (cps.outcome.tag == CheckpointWriteOutcomeWritten) {
       CheckpointWriteStats stats = cps.outcome.written.stats;
       PM_U64(stats, bytes_written);
@@ -571,8 +579,16 @@ void print_metric(MetricEvent event) {
   case MetricEventCheckpointWriteFailure:
     PM_START(CheckpointWriteFailure);
     CheckpointWriteFailure cpf = event.checkpoint_write_failure;
+    PM_ID(cpf, operation_id);
+    PM_U64(cpf, version);
     PM_U64(cpf, mode);
     PM_U64(cpf, duration_ns);
+    PM_U64(cpf.processing, input_duration_ns);
+    PM_U64(cpf.processing, reconciliation_duration_ns);
+    PM_U64(cpf.processing, stats_transform_duration_ns);
+    PM_U64(cpf.processing, output_preparation_duration_ns);
+    PM_U64(cpf.processing, num_log_rows);
+    PM_U64(cpf.processing, num_checkpoint_rows);
     PM_END;
     return;
 

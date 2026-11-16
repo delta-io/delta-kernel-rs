@@ -431,6 +431,7 @@ impl CheckpointWriter {
     /// The returned [`ActionReconciliationIterator`] yields [`FilteredEngineData`] batches with
     /// stats transforms already applied. Use [`ActionReconciliationIterator::state`] to get the
     /// shared state for building a [`LastCheckpointHintStats`] after the iterator is exhausted.
+    /// Direct writer iteration does not collect [`crate::metrics::CheckpointProcessingStats`].
     ///
     /// # Engine Usage
     ///
@@ -458,7 +459,7 @@ impl CheckpointWriter {
         &self,
         engine: &dyn Engine,
     ) -> KernelResult<ActionReconciliationIterator> {
-        self.checkpoint_data_with_schema(engine, CheckpointMetrics::default())
+        self.checkpoint_data_with_schema(engine, CheckpointMetrics::disabled())
             .map(|(data, _)| data)
     }
 
