@@ -121,11 +121,21 @@ authoritative list and signatures, consult the generated
 | `get_engine_builder` / `builder_with_option` / `builder_build` | Create an engine with custom storage options |
 | `builder_with_multithreaded_executor` | Configure the builder to use a multi-threaded tokio executor |
 | `builder_with_io_concurrency` | Configure read-path I/O concurrency (buffer size and batch size) for the JSON and Parquet handlers |
+| `get_plan_executor` | Create a callback-backed executor with configurable declarative protocol and metadata replay support (`declarative-plans`) |
+| `get_plan_based_engine` | Consume an executor handle to create an engine with plan-backed I/O (`declarative-plans`) |
+| `free_plan_executor` | Release an executor handle that was not consumed by an engine (`declarative-plans`) |
 | `free_engine` | Release the engine handle |
 
 Builder `with_*` functions consume their input handle and return the updated handle on success.
 Replace the input handle with the result; on error, the builder has been dropped. `build` and
 `free` also consume the builder.
+
+With `declarative-plans`, you can route file reads and storage operations through your own executor
+while Kernel replays protocol and metadata imperatively. Create the executor with
+`get_plan_executor(context, callback, false)`, then pass its handle to `get_plan_based_engine`.
+Choose `true` if your executor also supports declarative protocol and metadata replay. See
+[`get_plan_executor`](https://docs.rs/delta_kernel_ffi/latest/delta_kernel_ffi/plans/fn.get_plan_executor.html)
+for the support and callback lifetime requirements.
 
 **Snapshots**
 
