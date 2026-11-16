@@ -333,12 +333,9 @@ impl TableChanges {
             .table_configuration()
             .ensure_operation_supported(Operation::Cdf)?;
 
-        let end_snapshot = match end_version {
-            Some(version) => Snapshot::builder_from(start_snapshot.clone())
-                .at_version(version)
-                .build(engine)?,
-            None => Snapshot::builder_from(start_snapshot.clone()).build(engine)?,
-        };
+        let end_snapshot = Snapshot::builder_from(start_snapshot.clone())
+            .at_version(log_segment.end_version)
+            .build(engine)?;
         end_snapshot
             .table_configuration()
             .ensure_operation_supported(Operation::Cdf)?;
@@ -541,6 +538,7 @@ impl TableChanges {
             commits,
             schema,
             None,
+            self.start_table_config.version()..=self.end_snapshot.version(),
             self.mode,
         )?;
         // Any listing error surfaces here rather than mid-iteration.

@@ -2,6 +2,7 @@
 //! the metadata needed to generate the Change Data Feed.
 
 use std::collections::{HashMap, HashSet};
+use std::ops::RangeInclusive;
 use std::slice;
 use std::sync::{Arc, LazyLock};
 
@@ -26,7 +27,7 @@ use crate::table_features::{Operation, TableFeature, format_features};
 use crate::utils::require;
 use crate::{
     Engine, EngineData, Error, KernelError, KernelResult, KernelResultIterator, PredicateRef,
-    Result, RowVisitor,
+    Result, RowVisitor, Version,
 };
 
 #[cfg(test)]
@@ -58,6 +59,7 @@ pub(crate) fn table_changes_action_iter<I>(
     commit_files: I,
     table_schema: SchemaRef,
     physical_predicate: Option<(PredicateRef, SchemaRef)>,
+    range: RangeInclusive<Version>,
 ) -> Result<impl Iterator<Item = Result<TableChangesScanMetadata>> + Send + use<I>>
 where
     I: IntoIterator<Item = ParsedLogPath>,
@@ -70,6 +72,7 @@ where
         commit_files,
         table_schema,
         physical_predicate,
+        range,
         CdfMode::ChangeDataFeed,
     )
 }
@@ -85,6 +88,7 @@ pub(crate) fn table_changes_action_iter_with_mode<I>(
     commit_files: I,
     table_schema: SchemaRef,
     physical_predicate: Option<(PredicateRef, SchemaRef)>,
+    range: RangeInclusive<Version>,
     mode: CdfMode,
 ) -> Result<impl Iterator<Item = Result<TableChangesScanMetadata>> + Send + use<I>>
 where
@@ -115,6 +119,7 @@ where
                 &mut current_configuration,
                 commit_file,
                 &table_schema,
+                range.clone(),
                 mode,
             )?;
             Ok(scanner.into_scan_batches(engine.clone(), filter.clone())?)
@@ -193,6 +198,7 @@ impl LogReplayScanner {
         table_configuration: &mut TableConfiguration,
         commit_file: ParsedLogPath,
         table_schema: &SchemaRef,
+        _range: RangeInclusive<Version>,
         mode: CdfMode,
     ) -> Result<Self> {
         let visitor_schema = PreparePhaseVisitor::schema();
