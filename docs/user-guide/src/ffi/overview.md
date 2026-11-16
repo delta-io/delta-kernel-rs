@@ -130,6 +130,13 @@ Builder `with_*` functions consume their input handle and return the updated han
 Replace the input handle with the result; on error, the builder has been dropped. `build` and
 `free` also consume the builder.
 
+With `declarative-plans`, you can route file reads and storage operations through your own executor
+while Kernel replays protocol and metadata imperatively. Create the executor with
+`get_plan_executor(context, callback, false)`, then pass its handle to `get_plan_based_engine`.
+Choose `true` if your executor also supports declarative protocol and metadata replay. See
+[`get_plan_executor`](https://docs.rs/delta_kernel_ffi/latest/delta_kernel_ffi/plans/fn.get_plan_executor.html)
+for the support and callback lifetime requirements.
+
 **Snapshots**
 
 | Function | Purpose |

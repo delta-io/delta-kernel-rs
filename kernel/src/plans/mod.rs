@@ -93,11 +93,11 @@ pub trait PlanExecutor: AsAny {
 
     /// Returns whether Kernel may use this executor for declarative protocol and metadata replay.
     ///
-    /// The default is `true`. Executors that only support file scans should return `false`, so
-    /// Kernel replays protocol and metadata through its imperative engine handlers. This does not
-    /// restrict handler I/O or explicitly requested plan execution. Implementations should return
-    /// the same value throughout the executor's lifetime. Delegating executors should forward this
-    /// method to their inner executor.
+    /// The default is `true`. Executors limited to I/O operations and file scans should return
+    /// `false`, so Kernel replays protocol and metadata through its imperative engine handlers.
+    /// This does not restrict handler I/O or explicitly requested plan execution.
+    /// Implementations should return the same value throughout the executor's lifetime.
+    /// Delegating executors should forward this method to their inner executor.
     fn supports_protocol_metadata_replay(&self) -> bool {
         true
     }
