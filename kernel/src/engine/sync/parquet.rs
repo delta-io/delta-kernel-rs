@@ -9,11 +9,15 @@ use url::Url;
 use super::get_bytes;
 #[cfg(test)]
 use super::{put_bytes, read_files_arrow};
+#[cfg(test)]
+use crate::cancellation::{CancellableIterator, check_cancelled};
 use crate::engine::arrow_conversion::TryFromArrow as _;
 use crate::engine::arrow_data::ArrowEngineData;
 use crate::engine::arrow_utils::{
     RowIndexBuilder, fixup_parquet_read, ordering_needs_row_indexes, parquet_read_plan,
 };
+#[cfg(test)]
+use crate::engine::parquet_read::ParquetReadPlan;
 use crate::engine::parquet_row_group_skipping::ParquetRowGroupSkipping;
 use crate::engine::reader_options;
 #[cfg(test)]
@@ -25,7 +29,7 @@ use crate::parquet::arrow::arrow_writer::ArrowWriter;
 use crate::schema::{SchemaRef, StructType};
 use crate::utils::FoldWithOption as _;
 #[cfg(test)]
-use crate::{EngineData, FileDataReadResultIterator, FileSize, ParquetHandler};
+use crate::{EngineData, FileDataReadResultIterator, FileSize, ParquetHandler, ParquetReadOptions};
 use crate::{FileMeta, KernelResult, KernelResultIterator, ParquetFooter, PredicateRef};
 
 #[cfg(test)]
@@ -55,10 +59,14 @@ pub(super) fn try_create_from_parquet(
     let mut row_indexes = row_indexes.map(|rb| rb.build()).transpose()?;
     let stream = builder.build()?;
     Ok(stream.map(move |rbr| {
+        let batch = rbr?;
+        let indexes = row_indexes
+            .as_mut()
+            .map(|rows| rows.take(batch.num_rows()).collect());
         fixup_parquet_read(
-            rbr?,
+            batch,
             &requested_ordering,
-            row_indexes.as_mut(),
+            indexes,
             Some(&file_location),
             Some(&schema),
         )
@@ -81,6 +89,26 @@ impl ParquetHandler for SyncParquetHandler {
             try_create_from_parquet,
         );
         Ok(Box::new(iter.map(|data| Ok(Box::new(data?) as _))))
+    }
+
+    fn read_parquet_file_with_options(
+        &self,
+        file: &FileMeta,
+        read_schema: SchemaRef,
+        options: ParquetReadOptions,
+    ) -> KernelResult<FileDataReadResultIterator> {
+        let token = options.cancellation_token().cloned();
+        check_cancelled(token.as_ref())?;
+        options.validate(&read_schema)?;
+        let bytes = get_bytes(self.store.as_ref(), &file.location)?;
+        let metadata = ArrowReaderMetadata::load(&bytes, reader_options())?;
+        let plan = ParquetReadPlan::new(metadata, read_schema, options, file.location.to_string())?;
+        let (builder, finish) = plan.configure(|metadata| {
+            ParquetRecordBatchReaderBuilder::new_with_metadata(bytes, metadata)
+        });
+        let reader = builder.build()?;
+        let iter = reader.map(move |batch| Ok(Box::new(finish(batch?)?) as Box<dyn EngineData>));
+        Ok(Box::new(CancellableIterator::new(iter, token)))
     }
 
     /// Writes engine data to a Parquet file at the specified location.

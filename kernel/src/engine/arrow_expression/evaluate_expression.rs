@@ -45,6 +45,7 @@ use crate::expressions::{
     UnaryPredicate, UnaryPredicateOp, VariadicExpression, VariadicExpressionOp,
 };
 use crate::schema::{DataType, PrimitiveType, StructField, StructType};
+use crate::transforms::{ExpressionTransform, transform_output_type};
 
 #[internal_api]
 pub(crate) trait ProvidesColumnByName {
@@ -551,7 +552,7 @@ fn evaluate_case_when(
             let array_index = arrays.len();
             let is_scalar = values.len() == 1;
             arrays.push(values);
-            // Scalar results, like literal-only IN, use source row 0 for every output row.
+            // Scalar results use source row 0 for every output row.
             for (row, original_row) in output_rows.enumerate() {
                 output_row_sources[original_row] = (array_index, if is_scalar { 0 } else { row });
             }
@@ -566,8 +567,7 @@ fn evaluate_case_when(
         if condition.true_count() == 0 {
             continue;
         }
-        // Literal-only IN predicates return one value for the whole batch. A singleton reaching
-        // this point is TRUE, so broadcast it to all remaining rows.
+        // A scalar predicate reaching this point is TRUE for every remaining row.
         let selected = if condition.len() == 1 {
             BooleanArray::from_iter(std::iter::repeat_n(Some(true), remaining_rows.len()))
         } else {
@@ -708,6 +708,12 @@ fn arrow_convert_to_view_type(vals: Arc<dyn Array>) -> KernelResult<Arc<dyn Arra
     }
 }
 
+/// Validates predicate support and branch types against an empty batch before reading rows.
+pub(crate) fn validate_predicate(predicate: &Predicate, empty: &RecordBatch) -> KernelResult<()> {
+    PredicateValidator(empty).transform_pred(predicate)?;
+    evaluate_predicate(predicate, empty, false).map(|_| ())
+}
+
 /// Evaluates a (possibly inverted) kernel predicate over a record batch
 pub fn evaluate_predicate(
     predicate: &Predicate,
@@ -756,6 +762,19 @@ pub fn evaluate_predicate(
 
                     let right = evaluate_expression(right, batch, None)?;
                     let right = arrow_convert_to_non_view_type(right)?;
+                    let ArrowDataType::List(element) = right.data_type() else {
+                        return Err(KernelError::invalid_expression(format!(
+                            "Cannot cast to list array: {}",
+                            right.data_type()
+                        )));
+                    };
+                    if left.data_type() != element.data_type() {
+                        return Err(KernelError::invalid_expression(format!(
+                            "IN needle type {} does not match list element type {}",
+                            left.data_type(),
+                            element.data_type(),
+                        )));
+                    }
                     if let Some(string_arr) = left.as_string_opt::<i32>()
                         && let Some(list_arr) = right.as_list_opt::<i32>()
                         && list_arr.value_type() == ArrowDataType::Utf8
@@ -804,7 +823,7 @@ pub fn evaluate_predicate(
                     // and map elements/needles are unsupported: `logical_eq` returns `false` for
                     // them, so they never match, not even a structurally identical value.
                     let exists = ad.array_elements().iter().any(|e| lit.logical_eq(e));
-                    Ok(BooleanArray::from(vec![exists]))
+                    Ok(BooleanArray::from(vec![exists; batch.num_rows()]))
                 }
                 (l, r) => Err(KernelError::invalid_expression(format!(
                     "Invalid right value for (NOT) IN comparison, left is: {l} right is: {r}"
@@ -901,11 +920,8 @@ pub(crate) fn to_json(input: &dyn Datum) -> KernelResult<ArrayRef, ArrowError> {
             })?;
 
             let num_rows = struct_array.len();
-            if num_rows == 0 {
-                return Ok(Arc::new(StringArray::from(Vec::<Option<String>>::new())));
-            }
 
-            // Create the encoder using make_encoder with "struct mode" (not "list mode")
+            // Encoder construction validates nested types even when the batch is empty.
             let field = Arc::new(ArrowField::new_struct(
                 "root",
                 struct_array.fields().iter().cloned().collect_vec(),
@@ -1208,6 +1224,67 @@ fn validate_array_type(array: ArrayRef, expected: Option<&DataType>) -> KernelRe
         ensure_data_types(expected, array.data_type(), ValidationMode::TypesAndNames)?;
     }
     Ok(array)
+}
+
+// Empty-input evaluation skips conditional branches, but support must be checked before any output.
+struct PredicateValidator<'a>(&'a RecordBatch);
+
+impl<'a> ExpressionTransform<'a> for PredicateValidator<'_> {
+    transform_output_type!(|'a, T| KernelResult<()>);
+
+    fn transform_pred_binary(&mut self, predicate: &'a BinaryPredicate) -> KernelResult<()> {
+        self.recurse_into_pred_binary(predicate)?;
+        if predicate.op == BinaryPredicateOp::In
+            && let (Expression::Literal(needle), Expression::Literal(Scalar::Array(values))) =
+                (predicate.left.as_ref(), predicate.right.as_ref())
+        {
+            let compound = |value: &Scalar| {
+                matches!(value, Scalar::Struct(_) | Scalar::Array(_) | Scalar::Map(_))
+            };
+            if compound(needle) || values.array_elements().iter().any(compound) {
+                return Err(KernelError::unsupported("Compound literal IN operands"));
+            }
+        }
+        if predicate.op == BinaryPredicateOp::In {
+            evaluate_predicate(&Predicate::Binary(predicate.clone()), self.0, false)?;
+        }
+        Ok(())
+    }
+
+    fn transform_expr_case_when(&mut self, expression: &'a CaseWhenExpression) -> KernelResult<()> {
+        self.recurse_into_expr_case_when(expression)?;
+        let result_type = evaluate_expression(&expression.else_expr, self.0, None)?;
+        for (condition, result) in &expression.branches {
+            evaluate_predicate(condition, self.0, false)?;
+            let result = evaluate_expression(result, self.0, None)?;
+            if result.data_type() != result_type.data_type() {
+                return Err(KernelError::generic(
+                    "CASE WHEN branches must have the same type",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn transform_expr_variadic(&mut self, expression: &'a VariadicExpression) -> KernelResult<()> {
+        self.recurse_into_expr_variadic(expression)?;
+        if expression.op == VariadicExpressionOp::Coalesce {
+            let mut result_type = None;
+            for child in &expression.exprs {
+                let result = evaluate_expression(child, self.0, None)?;
+                if result_type
+                    .as_ref()
+                    .is_some_and(|data_type| data_type != result.data_type())
+                {
+                    return Err(KernelError::generic(
+                        "COALESCE operands must have the same type",
+                    ));
+                }
+                result_type = Some(result.data_type().clone());
+            }
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -2221,6 +2298,52 @@ mod tests {
             let result = evaluate_predicate(&Pred::not(pred), &batch, false).unwrap();
             assert_eq!(result.null_count(), 0);
             assert_eq!(result.value(0), !expected);
+        }
+    }
+
+    #[rstest]
+    #[case::integer(lit(1i32), ArrowDataType::Int32, true)]
+    #[case::long(lit(1i64), ArrowDataType::Int64, true)]
+    #[case::string(lit("x"), ArrowDataType::Utf8, true)]
+    #[case::integer_in_long(lit(1i32), ArrowDataType::Int64, false)]
+    #[case::long_in_integer(lit(1i64), ArrowDataType::Int32, false)]
+    #[case::integer_in_string(lit(1i32), ArrowDataType::Utf8, false)]
+    #[case::string_in_integer(lit("x"), ArrowDataType::Int32, false)]
+    fn test_validate_in_list_element_type_on_empty_batch(
+        #[case] needle: Expr,
+        #[case] element_type: ArrowDataType,
+        #[case] compatible: bool,
+        #[values(false, true)] inverted: bool,
+        #[values("root", "case", "coalesce")] composition: &str,
+    ) {
+        let element = Arc::new(ArrowField::new("item", element_type, true));
+        let empty = RecordBatch::new_empty(Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "list",
+            ArrowDataType::List(element),
+            true,
+        )])));
+        let predicate = Pred::binary(BinaryPredicateOp::In, needle, col!("list"));
+        let predicate = if inverted {
+            Pred::not(predicate)
+        } else {
+            predicate
+        };
+        let predicate = match composition {
+            "case" => {
+                Expr::case_when([(Pred::FALSE, Expr::from(predicate))], lit(true)).eq(lit(true))
+            }
+            "coalesce" => Expr::coalesce([lit(true), Expr::from(predicate)]).eq(lit(true)),
+            _ => predicate,
+        };
+        let result = validate_predicate(&predicate, &empty);
+        if compatible {
+            result.unwrap();
+        } else {
+            let error = result.unwrap_err();
+            assert!(matches!(
+                error.without_backtrace(),
+                KernelError::InvalidExpressionEvaluation(_)
+            ));
         }
     }
 

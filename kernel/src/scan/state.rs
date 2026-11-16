@@ -16,7 +16,7 @@ use crate::engine_data::{FilteredRowVisitor, GetData, RowIndexIterator, TypedGet
 use crate::scan::get_transform_for_row;
 use crate::schema::{ColumnName, ColumnNamesAndTypes, DataType, Schema, SchemaRef};
 use crate::utils::require;
-use crate::{Engine, EngineData, ExpressionRef, KernelError, KernelResult};
+use crate::{Engine, EngineData, ExpressionRef, FileRowSelection, KernelError, KernelResult};
 
 /// Deletion-vector metadata used by an engine to materialize a selection vector.
 ///
@@ -81,6 +81,19 @@ impl DvInfo {
     ) -> KernelResult<Option<Vec<bool>>> {
         let dv_treemap = self.get_treemap(engine, table_root)?;
         Ok(dv_treemap.map(deletion_treemap_to_bools))
+    }
+
+    /// Loads this deletion vector as a compressed physical selection for
+    /// [`crate::ParquetReadOptions::with_row_selection`], or returns `None` if absent.
+    /// Rows beyond the last deleted position remain eligible.
+    pub fn get_file_row_selection(
+        &self,
+        engine: &dyn Engine,
+        table_root: &url::Url,
+    ) -> KernelResult<Option<FileRowSelection>> {
+        Ok(self
+            .get_treemap(engine, table_root)?
+            .map(FileRowSelection::from_exclusions))
     }
 
     /// Returns a vector of row indexes that should be *removed* from the result set

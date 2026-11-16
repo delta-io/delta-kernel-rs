@@ -110,7 +110,7 @@ impl<T> ParquetRowGroupSkipping for ArrowReaderBuilder<T> {
 /// A [`ParquetStatsProvider`] for data file row group skipping. It obtains stats from a parquet
 /// [`RowGroupMetaData`] and pre-computes the mapping of each referenced column path to its
 /// corresponding field index, for O(1) stats lookups.
-struct RowGroupFilter<'a> {
+pub(crate) struct RowGroupFilter<'a> {
     row_group: &'a RowGroupMetaData,
     field_indices: HashMap<ColumnName, usize>,
 }
@@ -125,12 +125,12 @@ impl<'a> RowGroupFilter<'a> {
     }
 
     /// Applies a filtering predicate to a row group. Return value false means to skip it.
-    fn apply(row_group: &'a RowGroupMetaData, predicate: &Predicate) -> bool {
+    pub(crate) fn apply(row_group: &'a RowGroupMetaData, predicate: &Predicate) -> bool {
         use crate::kernel_predicates::KernelPredicateEvaluator as _;
         RowGroupFilter::new(row_group, predicate).eval_sql_where(predicate) != Some(false)
     }
 
-    /// Returns the column chunk metadata, or `None` if the column doesn't exist.
+    /// Returns metadata for an indexed, non-repeated leaf, or `None` when unavailable.
     fn get_column(&self, col: &ColumnName) -> Option<&ColumnChunkMetaData> {
         self.field_indices
             .get(col)
@@ -148,19 +148,8 @@ impl ParquetStatsProvider for RowGroupFilter<'_> {
     }
 
     fn get_parquet_nullcount_stat(&self, col: &ColumnName) -> Option<i64> {
-        // NOTE: Stats for any given column are optional, which may produce a NULL nullcount. But if
-        // the column itself is missing, then we know all values are implied to be NULL.
-        //
-        let Some(column) = self.get_column(col) else {
-            // WARNING: This optimization is only sound if the caller has verified that the column
-            // actually exists in the table's logical schema, and that any necessary logical to
-            // physical name mapping has been performed. Because we currently lack both the
-            // validation and the name mapping support, we must disable this optimization for the
-            // time being. See https://github.com/delta-io/delta-kernel-rs/issues/434.
-            return self.get_parquet_rowcount_stat().filter(|_| false);
-        };
-
-        extract_nullcount(column.statistics())
+        // Unindexed columns, including repeated leaves, have unknown row-level null counts.
+        extract_nullcount(self.get_column(col)?.statistics())
     }
 
     fn get_parquet_rowcount_stat(&self) -> Option<i64> {
@@ -543,13 +532,13 @@ pub(crate) fn compute_field_indices(
 ) -> HashMap<ColumnName, usize> {
     // Build up a set of requested column paths, then take each found path as the corresponding map
     // key (avoids unnecessary cloning).
-    //
-    // NOTE: If a requested column was not available, it is silently ignored. These missing columns
-    // are implied all-null, so we will infer their min/max stats as NULL and nullcount == rowcount.
+    // Repeated-leaf statistics describe elements, not rows: an empty list can count as a null
+    // leaf even though the list itself is non-null.
     let mut requested_columns = predicate.references();
     fields
         .iter()
         .enumerate()
+        .filter(|(_, field)| field.max_rep_level() == 0)
         .filter_map(|(i, f)| {
             requested_columns
                 .take(f.path().parts())

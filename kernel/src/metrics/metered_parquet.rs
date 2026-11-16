@@ -1,4 +1,4 @@
-//! [`MeteredParquetHandler`] wraps any [`ParquetHandler`] so its `read_parquet_files`
+//! [`MeteredParquetHandler`] wraps any [`ParquetHandler`] so each Parquet data read
 //! emits the kernel's standard `ParquetReadCompleted` span, carrying
 //! `(num_files, bytes_read)` exactly once when the returned iterator is exhausted or
 //! dropped. `read_parquet_footer` and `write_parquet_file` pass through.
@@ -10,11 +10,11 @@ use crate::metrics::events::emit_parquet_read_completed;
 use crate::schema::SchemaRef;
 use crate::{
     CancellationTokenRef, EngineData, FileDataReadResultIterator, FileMeta, FileSize, KernelResult,
-    KernelResultIterator, ParquetFooter, ParquetHandler, PredicateRef,
+    KernelResultIterator, ParquetFooter, ParquetHandler, ParquetReadOptions, PredicateRef,
 };
 
 /// Decorator over an engine-provided `Arc<dyn ParquetHandler>` that emits a
-/// `ParquetReadCompleted` span on every `read_parquet_files` call.
+/// `ParquetReadCompleted` span on every Parquet data read, including exact reads.
 /// `read_parquet_footer` and `write_parquet_file` are pass-through and emit nothing.
 pub struct MeteredParquetHandler {
     inner: Arc<dyn ParquetHandler>,
@@ -84,6 +84,18 @@ impl ParquetHandler for MeteredParquetHandler {
         Ok(Self::meter(files, inner))
     }
 
+    fn read_parquet_file_with_options(
+        &self,
+        file: &FileMeta,
+        read_schema: SchemaRef,
+        options: ParquetReadOptions,
+    ) -> KernelResult<FileDataReadResultIterator> {
+        let inner = self
+            .inner
+            .read_parquet_file_with_options(file, read_schema, options)?;
+        Ok(Self::meter(std::slice::from_ref(file), inner))
+    }
+
     fn write_parquet_file(
         &self,
         location: url::Url,
@@ -113,9 +125,13 @@ mod tests {
     use url::Url;
 
     use super::*;
+    use crate::KernelError;
+    use crate::expressions::{col, lit};
     use crate::metrics::MetricEvent;
     use crate::schema::schema_ref;
-    use crate::unit_test_utils::{CapturingReporter, install_thread_local_metrics_reporter};
+    use crate::unit_test_utils::{
+        CapturingReporter, TestCancellationToken, install_thread_local_metrics_reporter,
+    };
 
     #[derive(Debug, Default)]
     struct StubParquetHandler {
@@ -175,6 +191,52 @@ mod tests {
 
     fn delta_schema() -> SchemaRef {
         schema_ref! { nullable "x": INTEGER }
+    }
+
+    #[rstest::rstest]
+    #[case::filter(ParquetReadOptions::default().with_row_filter(Arc::new(col!("x").gt(lit(0i32)))))]
+    #[case::projection(ParquetReadOptions::default().with_output_schema(schema_ref! {}))]
+    #[case::explicit_schema(ParquetReadOptions::default().with_output_schema(delta_schema()))]
+    #[case::offset(ParquetReadOptions::default().with_result_offset(1))]
+    #[case::limit(ParquetReadOptions::default().with_result_limit(0))]
+    #[case::selection(ParquetReadOptions::default().with_row_selection(
+        crate::FileRowSelection::from_ranges(vec![]).unwrap()
+    ))]
+    fn exact_read_default_rejects_options_before_legacy_delegation(
+        #[case] options: ParquetReadOptions,
+    ) {
+        let stub = Arc::new(StubParquetHandler::default());
+        let handler = MeteredParquetHandler::new(stub.clone());
+        let result = handler.read_parquet_file_with_options(
+            &fake_file("data.parquet", 1),
+            delta_schema(),
+            options,
+        );
+        assert!(
+            matches!(result, Err(error) if matches!(error.without_backtrace(), KernelError::Unsupported(_)))
+        );
+        assert!(
+            !stub
+                .cancellation_read_called
+                .load(std::sync::atomic::Ordering::SeqCst)
+        );
+    }
+
+    #[rstest::rstest]
+    fn exact_read_default_accepts_unprojected_reads(#[values(false, true)] cancellation: bool) {
+        let stub = StubParquetHandler::default();
+        let mut options = ParquetReadOptions::default();
+        if cancellation {
+            options = options.with_cancellation_token(Arc::new(TestCancellationToken::default()));
+        }
+        let rows = stub
+            .read_parquet_file_with_options(&fake_file("data.parquet", 1), delta_schema(), options)
+            .unwrap();
+        assert_eq!(rows.count(), 0);
+        assert!(
+            stub.cancellation_read_called
+                .load(std::sync::atomic::Ordering::SeqCst)
+        );
     }
 
     #[test]

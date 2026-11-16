@@ -1580,7 +1580,7 @@ impl fmt::Display for JsonReadCompleted {
 // ParquetReadCompleted
 // ====================================================================
 
-/// Emitted once per `ParquetHandler::read_parquet_files` call when the returned iterator is
+/// Emitted once per Parquet data read, including exact reads, when the returned iterator is
 /// fully consumed or dropped. `bytes_read` is the sum of on-disk `FileMeta::size`, not the
 /// deserialized payload size.
 #[derive(Debug, Clone)]
@@ -2163,8 +2163,7 @@ pub fn emit_json_read_completed(num_files: u64, bytes_read: u64) {
 
 /// Emit a [`MetricEvent::ParquetReadCompleted`] via a tracing span.
 ///
-/// Call once per [`crate::ParquetHandler::read_parquet_files`] invocation, at iterator exhaustion
-/// or drop.
+/// Call once per Parquet data read, including exact reads, at iterator exhaustion or drop.
 pub fn emit_parquet_read_completed(num_files: u64, bytes_read: u64) {
     let _span = tracing::span!(
         tracing::Level::INFO,

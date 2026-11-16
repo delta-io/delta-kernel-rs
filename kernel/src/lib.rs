@@ -108,6 +108,7 @@ mod log_compaction;
 mod log_path;
 mod log_reader;
 pub mod metrics;
+pub mod parquet_read;
 pub mod partition;
 pub(crate) mod path_encoding;
 #[cfg(feature = "declarative-plans")]
@@ -125,6 +126,7 @@ pub mod transforms;
 
 pub use crc::{FileSizeHistogram, FileStats};
 pub use log_path::LogPath;
+pub use parquet_read::{FileRowSelection, ParquetReadOptions};
 pub use row_tracking::ROW_TRACKING_INITIAL_HIGH_WATER_MARK;
 
 // Public under test-utils so integration tests can call get_high_water_mark via snapshot.
@@ -969,6 +971,48 @@ pub trait ParquetHandler: AsAny {
         check_cancelled(cancellation_token.as_ref())?;
         let iter = self.read_parquet_files(files, physical_schema, predicate)?;
         Ok(Box::new(CancellableIterator::new(iter, cancellation_token)))
+    }
+
+    /// Reads one file with exact filtering, physical selection, and a window over matching rows.
+    ///
+    /// `read_schema` uses the physical names, field IDs, and requested Delta types described by
+    /// [`Self::read_parquet_files`], including every predicate and output column. Callers resolve
+    /// logical names and partition values before calling this method. Predicate columns undergo
+    /// the same schema reconciliation as output columns, including widening and missing NULLs.
+    ///
+    /// Apply physical selection, then the exact filter, then result offset and limit. Rows and
+    /// batches retain file order, and generated row indexes retain original physical positions.
+    /// Unsupported options or predicates and invalid selection bounds must fail before any batch
+    /// is emitted. Data-dependent decoding or evaluation errors can still occur during iteration.
+    /// Options must never be silently ignored. Cancellation follows the engine operation contract.
+    ///
+    /// The default implementation supports cancellation and reads with no output schema supplied;
+    /// other options return an unsupported error. Engines override this method to provide
+    /// projection, exact filtering, and selection.
+    fn read_parquet_file_with_options(
+        &self,
+        file: &FileMeta,
+        read_schema: SchemaRef,
+        options: ParquetReadOptions,
+    ) -> KernelResult<FileDataReadResultIterator> {
+        check_cancelled(options.cancellation_token())?;
+        options.validate(&read_schema)?;
+        if options.row_filter().is_some()
+            || options.row_selection().is_some()
+            || options.result_offset() != 0
+            || options.result_limit().is_some()
+            || options.output_schema().is_some()
+        {
+            return Err(KernelError::unsupported(
+                "Exact Parquet read options are not supported",
+            ));
+        }
+        self.read_parquet_files_with_cancellation(
+            std::slice::from_ref(file),
+            read_schema,
+            None,
+            options.cancellation_token().cloned(),
+        )
     }
 
     /// Write data to a Parquet file at the specified URL.
