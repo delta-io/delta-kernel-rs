@@ -54,7 +54,7 @@ async fn append_row<E: TaskExecutor>(
     engine: &Arc<DefaultEngine<E>>,
     kind: TableKind,
     value: i32,
-) -> KernelResult<Arc<Snapshot>> {
+) -> delta_kernel::Result<Arc<Snapshot>> {
     let column: ArrayRef = Arc::new(Int32Array::from(vec![value]));
     Ok(insert_data_with(
         snapshot,

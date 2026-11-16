@@ -32,7 +32,9 @@ use crate::table_properties::CheckConstraint;
 use crate::utils::{PhantomType, require};
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::version_as_i64;
-use crate::{DataType, Engine, EngineData, FileMeta, KernelResult, KernelResultIterator, Version};
+use crate::{
+    DataType, Engine, EngineData, FileMeta, KernelResult, KernelResultIterator, Result, Version,
+};
 
 #[cfg(feature = "internal-api")]
 pub mod builder;
@@ -386,7 +388,7 @@ impl<MODE: ExecutionMode> Transaction<UpdateTable, MODE> {
     ///
     /// Revalidates the effective table configuration, returning an error if it is invalid.
     /// This fixture helper does not validate protocol transition rules.
-    pub fn update_table_protocol_for_test(&mut self, protocol: Protocol) -> KernelResult<()> {
+    pub fn update_table_protocol_for_test(&mut self, protocol: Protocol) -> Result<()> {
         self.effective_table_config = TableConfiguration::try_new_from(
             &self.effective_table_config,
             None,
@@ -1346,7 +1348,7 @@ impl<STATE, MODE: ExecutionMode> Transaction<STATE, MODE> {
         file_meta: FileMeta,
         crc_delta: CrcDelta,
         #[cfg(feature = "adaptive-metadata-in-dev")] checkpoint_action: Option<CheckpointAction>,
-    ) -> KernelResult<CommittedTransaction> {
+    ) -> Result<CommittedTransaction> {
         let parsed_commit = ParsedLogPath::parse_commit(file_meta)?;
 
         let commit_version = parsed_commit.version;
@@ -1374,7 +1376,8 @@ impl<STATE, MODE: ExecutionMode> Transaction<STATE, MODE> {
                 let log_root = self
                     .effective_table_config
                     .table_root()
-                    .join("_delta_log/")?;
+                    .join("_delta_log/")
+                    .map_err(KernelError::from)?;
                 let log_segment = LogSegment::new_for_version_zero(log_root, parsed_commit)?;
                 let crc = crc_delta.into_complete_crc(0).ok_or_else(|| {
                     KernelError::internal_error(
@@ -1662,7 +1665,9 @@ mod tests {
     use crate::unit_test_utils::{
         adaptive_metadata_table_configuration, test_schema_flat_with_column_mapping,
     };
-    use crate::{EvaluationHandler, Expression, KernelResultIterator, Result, Snapshot};
+    use crate::{
+        Error, EvaluationHandler, Expression, KernelError, KernelResultIterator, Result, Snapshot,
+    };
 
     #[rstest]
     fn transaction_constructor_initializes_all_defaults(
@@ -1996,10 +2001,7 @@ mod tests {
         }
     }
 
-    fn create_dv_transaction(
-        snapshot: Arc<Snapshot>,
-        engine: &dyn Engine,
-    ) -> KernelResult<Transaction> {
+    fn create_dv_transaction(snapshot: Arc<Snapshot>, engine: &dyn Engine) -> Result<Transaction> {
         snapshot
             .update_table(UpdateTableOperation::Delete, "test_engine", true)
             .build(engine, Box::new(FileSystemCommitter::new()))
@@ -2009,7 +2011,7 @@ mod tests {
     #[rstest]
     fn test_add_files_schema(
         #[values(DataLayout::None, DataLayout::clustered(["id"]))] layout: DataLayout,
-    ) -> KernelResult<()> {
+    ) -> Result<()> {
         let engine = SyncEngine::new_with_store(Arc::new(InMemory::new()));
         let txn = create_table(
             "memory:///t",
@@ -2038,7 +2040,7 @@ mod tests {
     }
 
     #[test]
-    fn test_new_deletion_vector_path() -> KernelResult<()> {
+    fn test_new_deletion_vector_path() -> Result<()> {
         let engine = SyncEngine::new();
         let path =
             std::fs::canonicalize(PathBuf::from("./tests/data/table-with-dv-small/")).unwrap();
@@ -2074,7 +2076,7 @@ mod tests {
     }
 
     #[test]
-    fn write_state_reflects_schema_configured_on_builder() -> KernelResult<()> {
+    fn write_state_reflects_schema_configured_on_builder() -> Result<()> {
         let (engine, snapshot) = setup_non_dv_table();
         let txn = snapshot
             .clone()
@@ -2147,7 +2149,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_set_nullable_is_persisted_on_commit() -> KernelResult<()> {
+    fn schema_set_nullable_is_persisted_on_commit() -> Result<()> {
         let engine: Arc<dyn Engine> =
             Arc::new(SyncEngine::new_with_store(Arc::new(InMemory::new())));
         let schema = Arc::new(StructType::try_new([
@@ -2264,7 +2266,7 @@ mod tests {
             base: &Transaction,
             schema: StructType,
             writer_features: impl IntoIterator<Item = TableFeature>,
-        ) -> KernelResult<TableConfiguration> {
+        ) -> Result<TableConfiguration> {
             let metadata = base
                 .effective_table_config
                 .metadata()
@@ -2357,7 +2359,7 @@ mod tests {
     }
 
     #[test]
-    fn test_write_context_schemas_exclude_partition_columns() -> KernelResult<()> {
+    fn test_write_context_schemas_exclude_partition_columns() -> Result<()> {
         let engine = SyncEngine::new();
         let path = std::fs::canonicalize(PathBuf::from("./tests/data/basic_partitioned/")).unwrap();
         let url = url::Url::from_directory_path(path).unwrap();
@@ -2498,9 +2500,7 @@ mod tests {
     #[case::cm_none(ColumnMappingMode::None)]
     #[case::cm_name(ColumnMappingMode::Name)]
     #[case::cm_id(ColumnMappingMode::Id)]
-    fn test_materialized_partition_column_insert(
-        #[case] cm_mode: ColumnMappingMode,
-    ) -> KernelResult<()> {
+    fn test_materialized_partition_column_insert(#[case] cm_mode: ColumnMappingMode) -> Result<()> {
         let cm = match cm_mode {
             ColumnMappingMode::None => "none",
             ColumnMappingMode::Name => "name",
@@ -2551,7 +2551,8 @@ mod tests {
                 Arc::new(NullArray::new(1)),
                 Arc::new(Int32Array::from(vec![20])),
             ],
-        )?;
+        )
+        .map_err(KernelError::from)?;
         let rb = eval_logical_to_physical(&wc, batch)?;
 
         // With void stripped and partition literals inserted, the output names/order must match
@@ -2660,7 +2661,7 @@ mod tests {
     /// Tests that update_deletion_vectors validates table protocol requirements.
     /// Validates that attempting DV updates on unsupported tables returns protocol error.
     #[test]
-    fn test_update_deletion_vectors_unsupported_table() -> KernelResult<()> {
+    fn test_update_deletion_vectors_unsupported_table() -> Result<()> {
         let (engine, snapshot) = setup_non_dv_table();
         let mut txn = create_dv_transaction(snapshot, &engine)?;
 
@@ -2700,7 +2701,7 @@ mod tests {
     /// Tests that update_deletion_vectors validates DV descriptors match scan files.
     /// Validates detection of mismatch between provided DV descriptors and actual files.
     #[test]
-    fn test_update_deletion_vectors_mismatch_count() -> KernelResult<()> {
+    fn test_update_deletion_vectors_mismatch_count() -> Result<()> {
         let (engine, snapshot) = setup_dv_enabled_table();
         let mut txn = create_dv_transaction(snapshot, &engine)?;
 
@@ -2724,7 +2725,7 @@ mod tests {
 
     /// Tests that a mismatch after scanning some files does not leave staged DV updates behind.
     #[test]
-    fn test_update_deletion_vectors_mismatch_does_not_mutate_transaction() -> KernelResult<()> {
+    fn test_update_deletion_vectors_mismatch_does_not_mutate_transaction() -> Result<()> {
         let (engine, snapshot) = setup_dv_enabled_table();
         let mut txn = create_dv_transaction(snapshot.clone(), &engine)?;
         let scan = snapshot.scan_builder().build()?;
@@ -2768,7 +2769,7 @@ mod tests {
     }
 
     #[test]
-    fn test_update_deletion_vectors_iter_error_does_not_mutate_transaction() -> KernelResult<()> {
+    fn test_update_deletion_vectors_iter_error_does_not_mutate_transaction() -> Result<()> {
         let (engine, snapshot) = setup_dv_enabled_table();
         let mut txn = create_dv_transaction(snapshot.clone(), &engine)?;
         txn.staged_data_changes
@@ -2817,7 +2818,7 @@ mod tests {
     /// Tests that update_deletion_vectors handles empty DV updates correctly as a no-op.
     /// This edge case occurs when a DELETE operation matches no rows.
     #[test]
-    fn test_update_deletion_vectors_empty_inputs() -> KernelResult<()> {
+    fn test_update_deletion_vectors_empty_inputs() -> Result<()> {
         let (engine, snapshot) = setup_dv_enabled_table();
         let mut txn = create_dv_transaction(snapshot, &engine)?;
 
@@ -2833,7 +2834,7 @@ mod tests {
     }
 
     #[test]
-    fn unmatched_dv_inputs_do_not_require_row_tracking_acknowledgment() -> KernelResult<()> {
+    fn unmatched_dv_inputs_do_not_require_row_tracking_acknowledgment() -> Result<()> {
         let (engine, snapshot) = setup_dv_enabled_table();
         let mut txn = create_dv_transaction(snapshot.clone(), &engine)?;
         let scan = snapshot.scan_builder().build()?;
@@ -2915,10 +2916,10 @@ mod tests {
 
     #[cfg(feature = "adaptive-metadata-in-dev")]
     #[test]
-    fn test_ctas_rejected_on_iceberg_native_v4_table() -> KernelResult<()> {
-        let tempdir = tempfile::tempdir()?;
+    fn test_ctas_rejected_on_iceberg_native_v4_table() -> Result<()> {
+        let tempdir = tempfile::tempdir().map_err(KernelError::from)?;
         let table_path = tempdir.path().join("table");
-        std::fs::create_dir(&table_path)?;
+        std::fs::create_dir(&table_path).map_err(KernelError::from)?;
         let engine = SyncEngine::new();
         let mut txn = create_table(
             table_path.to_string_lossy(),
@@ -3070,8 +3071,8 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_blind_append_rejects_create_table() -> KernelResult<()> {
-        let tempdir = tempfile::tempdir()?;
+    fn test_validate_blind_append_rejects_create_table() -> Result<()> {
+        let tempdir = tempfile::tempdir().map_err(KernelError::from)?;
         let schema = schema_ref! { nullable "id": INTEGER };
         let engine = Arc::new(crate::engine::sync::SyncEngine::new());
         let mut txn = create_table(
@@ -3131,7 +3132,7 @@ mod tests {
         // If it fails, it should NOT be an InvalidTransactionState error
         if let Err(e) = result {
             assert!(
-                !matches!(e, KernelError::InvalidTransactionState(_)),
+                !matches!(e, Error::Kernel(KernelError::InvalidTransactionState(_))),
                 "Blind append validation should have passed, got: {e}"
             );
         }
@@ -3200,7 +3201,7 @@ mod tests {
     fn test_physical_schema_column_mapping(
         #[case] schema: SchemaRef,
         #[case] mode: ColumnMappingMode,
-    ) -> KernelResult<()> {
+    ) -> Result<()> {
         let (_engine, txn) = crate::unit_test_utils::setup_column_mapping_txn(schema, mode)?;
         let write_state = txn.write_state().unwrap();
         let write_context = write_state.write_context_builder().build().unwrap();
@@ -3250,7 +3251,7 @@ mod tests {
     /// levels. Builds a RecordBatch with logical names, evaluates the transform, and checks
     /// that the output uses physical names from the physical schema — including nested struct
     /// children.
-    fn validate_logical_to_physical_transform(mode: ColumnMappingMode) -> KernelResult<()> {
+    fn validate_logical_to_physical_transform(mode: ColumnMappingMode) -> Result<()> {
         let schema = test_schema_nested();
         let (_engine, txn) = crate::unit_test_utils::setup_column_mapping_txn(schema, mode)?;
         let write_state = txn.write_state().unwrap();
@@ -3281,7 +3282,10 @@ mod tests {
         let result_batch = result.record_batch();
 
         // Verify: all field names, types, and metadata match the physical schema
-        let expected_arrow_schema: ArrowSchema = physical_schema.as_ref().try_into_arrow()?;
+        let expected_arrow_schema: ArrowSchema = physical_schema
+            .as_ref()
+            .try_into_arrow()
+            .map_err(KernelError::from)?;
         assert_eq!(result_batch.schema().as_ref(), &expected_arrow_schema);
 
         // Verify: data is preserved (id values)
@@ -3299,7 +3303,7 @@ mod tests {
     #[case::name_mode(ColumnMappingMode::Name)]
     #[case::id_mode(ColumnMappingMode::Id)]
     #[case::none_mode(ColumnMappingMode::None)]
-    fn test_logical_to_physical_transform(#[case] mode: ColumnMappingMode) -> KernelResult<()> {
+    fn test_logical_to_physical_transform(#[case] mode: ColumnMappingMode) -> Result<()> {
         validate_logical_to_physical_transform(mode)
     }
 
@@ -3317,7 +3321,7 @@ mod tests {
             RowTrackingState::Suspended
         )]
         row_tracking_state: RowTrackingState,
-    ) -> KernelResult<()> {
+    ) -> Result<()> {
         // === Given every column-mapping mode and Row Tracking state ===
         let column_mapping_mode = match mode {
             ColumnMappingMode::None => "none",
@@ -3453,7 +3457,7 @@ mod tests {
             .unwrap_err();
         assert!(matches!(
             err,
-            crate::KernelError::Generic(e) if e.contains("This table is path-based and cannot be committed to with a catalog committer")
+            Error::Kernel(KernelError::Generic(e)) if e.contains("This table is path-based and cannot be committed to with a catalog committer")
         ));
     }
 
@@ -3472,7 +3476,7 @@ mod tests {
             .unwrap_err();
         assert!(matches!(
             err,
-            crate::KernelError::Generic(e) if e.contains("This table is path-based and cannot be committed to with a catalog committer")
+            Error::Kernel(KernelError::Generic(e)) if e.contains("This table is path-based and cannot be committed to with a catalog committer")
         ));
     }
 

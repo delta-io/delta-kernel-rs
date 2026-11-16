@@ -38,7 +38,7 @@ const IS_ADD: &str = "is_add";
 pub(crate) struct MetadataPlanner<'a> {
     pub(crate) segment: &'a LogSegment,
     pub(crate) actions: ActionSet,
-    pub(crate) checkpoint_shape: Option<CheckpointShape>,
+    pub(crate) checkpoint_shape: Option<Arc<CheckpointShape>>,
     pub(crate) stats: StatsOptions,
     pub(crate) partitions: PartitionValuesOptions,
     pub(crate) stats_schema: Option<SchemaRef>,
@@ -76,7 +76,7 @@ impl<'a> MetadataPlanner<'a> {
 
     pub(crate) fn with_checkpoint_shape(
         mut self,
-        checkpoint_shape: impl Into<Option<CheckpointShape>>,
+        checkpoint_shape: impl Into<Option<Arc<CheckpointShape>>>,
     ) -> Self {
         self.checkpoint_shape = checkpoint_shape.into();
         self
@@ -160,7 +160,7 @@ impl<'a> MetadataPlanner<'a> {
     /// JSON stats are retained or synthesized only when requested.
     /// Without tombstones, remove fields are omitted from the read, filter, and key.
     pub(crate) fn checkpoint_actions(&self) -> KernelResult<PlanBuilder> {
-        let checkpoint_shape = self.checkpoint_shape.as_ref();
+        let checkpoint_shape = self.checkpoint_shape.as_deref();
         self.build_metadata_plan(ActionSource::Checkpoint, checkpoint_shape, |schema| {
             sources::checkpoint_actions(self.segment, checkpoint_shape, self.actions, schema)
         })
@@ -194,13 +194,6 @@ impl<'a> MetadataPlanner<'a> {
         self.build_metadata_plan(ActionSource::Commit, None, |schema| {
             sources::commit_arm(self.segment, base_version, schema)
         })
-    }
-
-    /// Whether [`CheckpointShape`](crate::checkpoint::CheckpointShape) should inspect the
-    /// leaf-level checkpoint schema to choose the statistics representation and identify
-    /// compatible structured partition values.
-    pub(crate) fn requires_checkpoint_add_schema(&self) -> bool {
-        self.stats_schema.is_some() || self.parsed_partition_schema.is_some()
     }
 
     /// Reads and filters selected actions, attaches their identity key, then prepares metadata.
@@ -260,7 +253,7 @@ impl<'a> MetadataPlanner<'a> {
             ));
         }
         let file_schema = checkpoint_shape
-            .and_then(|checkpoint_shape| checkpoint_shape.leaf_checkpoint_schema.as_deref())
+            .map(|checkpoint_shape| checkpoint_shape.leaf_checkpoint_schema.as_ref())
             .unwrap_or(get_all_actions_schema());
         let add_field = file_schema.field(ADD_NAME).unwrap_or(&ADD_FIELD);
         let file_add_schema = match add_field.data_type() {

@@ -298,6 +298,10 @@ and update this section in your PR. The same pattern works for
   errors. `?` converts a `KernelError` into `Error::Kernel`; never convert an `Error` back into a
   `KernelError`. `?` applies one conversion, so a function returning `Result` converts foreign
   errors through `KernelError` first (`.map_err(KernelError::from)?`).
+- When matching a `KernelError` to classify a failure, match on `error.without_backtrace()` so
+  `Backtraced` wrappers do not change the classification. This borrows the underlying error.
+  Preserve the original `error`, including its backtrace wrappers, when propagating it or attaching
+  it as a source to another error.
 - Prefer the `KernelResultIterator<T>` marker trait over spelling
   `Iterator<Item = KernelResult<T>> + Send`, including in public APIs. Use
   `impl KernelResultIterator<T>` for unboxed streams and `Box<dyn KernelResultIterator<T>>`

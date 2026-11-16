@@ -41,7 +41,7 @@ use crate::unit_test_utils::{
     adaptive_metadata_table_configuration, test_schema_flat_with_column_mapping,
 };
 pub(super) use crate::unit_test_utils::{create_add_action, create_remove_action};
-use crate::{FileMeta, KernelError, KernelResult, LogPath, Result, Snapshot};
+use crate::{Error, FileMeta, KernelError, KernelResult, LogPath, Result, Snapshot};
 
 #[rstest::rstest]
 #[case::default_retention(
@@ -690,7 +690,7 @@ async fn test_no_checkpoint_on_unpublished_snapshot() -> Result<()> {
 
     assert!(matches!(
         snapshot.create_checkpoint_writer(&engine).unwrap_err(),
-        crate::KernelError::UnpublishedVersion(1)
+        Error::Kernel(KernelError::UnpublishedVersion(1))
     ));
     Ok(())
 }

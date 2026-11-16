@@ -35,7 +35,7 @@ async fn test_write_txn_actions(
                 .with_transaction_id("app_id1".to_string(), 0)
                 .with_transaction_id("app_id1".to_string(), 1)
                 .build(&engine, Box::new(FileSystemCommitter::new())),
-            Err(KernelError::InvalidTransactionState(msg)) if msg.contains("app_id app_id1")
+            Err(delta_kernel::Error::Kernel(KernelError::InvalidTransactionState(msg))) if msg.contains("app_id app_id1")
         ));
 
         if after_build {

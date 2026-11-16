@@ -133,7 +133,12 @@ pub(crate) fn field_id_to_statistics_base(field_id: i32) -> Option<i32> {
 /// [`ColumnMetadataKey::ParquetFieldId`] -- the same annotation the `#[field_id = N]` derive macro
 /// attaches to the other `content_tree` structs. It carries no `delta.columnMapping.*` logical
 /// annotations, which are consumed by (not produced from) logical->physical conversion.
-fn field_with_id(name: &str, data_type: DataType, nullable: bool, field_id: i32) -> StructField {
+pub(crate) fn field_with_id(
+    name: &str,
+    data_type: DataType,
+    nullable: bool,
+    field_id: i32,
+) -> StructField {
     StructField::new(name, data_type, nullable).with_metadata([(
         ColumnMetadataKey::ParquetFieldId.as_ref(),
         MetadataValue::Number(field_id as i64),
@@ -291,7 +296,7 @@ fn build_stats_struct(
 /// sub-fields).
 ///
 /// Errors if the leaf is missing its field-id metadata, or is an (as-yet unimplemented) geospatial
-/// column.
+/// column on the unprojected path. A projected read skips a geospatial leaf instead.
 ///
 /// `categories` is forwarded to [`build_stats_struct`] to restrict the sub-fields (see there);
 /// `None` emits the full stats struct.
@@ -312,16 +317,20 @@ fn leaf_stats_field(
         ))
     })?;
 
-    // Geospatial stats generation is not implemented yet. Error (rather than silently dropping the
-    // column) so this is not forgotten once geospatial support lands -- checked before the range
-    // check below so an out-of-range geo field ID still errors. Reachable only with the
-    // `geo-type-in-dev` feature enabled.
-    // TODO: emit proper stats for geospatial columns.
+    // Geospatial stats generation is not implemented yet. The unprojected path errors (rather than
+    // silently dropping the column) so this is not forgotten once geospatial support lands --
+    // checked before the range check below so an out-of-range geo field ID still errors. A
+    // projected read only narrows the stats a scan reads, and stats are optional there, so it skips
+    // the leaf rather than failing the scan. Reachable only with the `geo-type-in-dev` feature.
+    // TODO(#3926): emit proper stats for geospatial columns.
     #[cfg(feature = "geo-type-in-dev")]
     if matches!(
         field.data_type(),
         DataType::Primitive(PrimitiveType::Geometry(_) | PrimitiveType::Geography(_))
     ) {
+        if categories.is_some() {
+            return Ok(None);
+        }
         return Err(KernelError::unsupported(format!(
             "AMT stats schema generation is not yet implemented for geospatial column '{}' (type {})",
             field.name(),
@@ -681,19 +690,8 @@ impl<'a> StatsLeafVisitor<'a> for StatsSchemaCollector {
 // == AMT content_stats -> parsed Delta stats ==
 
 /// Replaces [`CONTENT_STATS_FIELD_NAME`] in `input_schema` with a nullable [`STATS_PARSED`] column
-/// of type `delta_stats_schema`. Other columns pass through. Returns `(output_schema, expression)`.
-///
-/// ```text
-/// numRecords:  long               <- recordCount
-/// nullCount:   {<table nesting>}  <- content_stats.<leaf>.null_value_count
-/// minValues:   {<table nesting>}  <- content_stats.<leaf>.lower_bound
-/// maxValues:   {<table nesting>}  <- content_stats.<leaf>.upper_bound
-/// tightBounds: boolean            <- false
-/// ```
-///
-/// `content_stats` must have been read with [`projected_stats_schema`] for the same `table_schema`
-/// and `delta_stats_schema`. A leaf without a `content_stats` entry (array/map columns,
-/// out-of-range field IDs) yields null.
+/// of type `delta_stats_schema` (see [`parsed_stats_expression`]). Other columns pass through.
+/// Returns `(output_schema, expression)`.
 pub(crate) fn build_parsed_stats_expression(
     table_schema: &StructType,
     delta_stats_schema: &StructType,
@@ -717,14 +715,37 @@ pub(crate) fn build_parsed_stats_expression(
         )));
     }
 
-    let scopes = CategoryScopes::from_delta_stats_schema(delta_stats_schema)?;
-    let root = StatsLeafWalker::walk(table_schema, Some(scopes), &ParsedStatsExprBuilder)?;
-    let stats_expr = assemble_parsed_stats_expr(root, delta_stats_schema, &scopes)?;
-
+    let stats_expr = parsed_stats_expression(table_schema, delta_stats_schema)?;
     let output_field = StructField::nullable(STATS_PARSED, delta_stats_schema.clone());
     ProjectionStructPatchBuilder::new(input_schema)
         .replace(CONTENT_STATS_FIELD_NAME, output_field, Arc::new(stats_expr))
         .build()
+}
+
+/// Builds the expression evaluating an AMT entry row to its Delta stats, a struct of type
+/// `delta_stats_schema`:
+///
+/// ```text
+/// numRecords:  long               <- recordCount
+/// nullCount:   {<table nesting>}  <- content_stats.<leaf>.null_value_count
+/// minValues:   {<table nesting>}  <- content_stats.<leaf>.lower_bound
+/// maxValues:   {<table nesting>}  <- content_stats.<leaf>.upper_bound
+/// tightBounds: boolean            <- false
+/// ```
+///
+/// `content_stats` must have been read with [`projected_stats_schema`] for the same `table_schema`
+/// and `delta_stats_schema`. A leaf without a `content_stats` entry (array/map columns,
+/// out-of-range field IDs) yields null, so the expression reads no `content_stats` when none of
+/// the requested stats are recorded there.
+///
+/// Every column of `delta_stats_schema` must be a column of `table_schema`, in table order.
+pub(crate) fn parsed_stats_expression(
+    table_schema: &StructType,
+    delta_stats_schema: &StructType,
+) -> KernelResult<Expression> {
+    let scopes = CategoryScopes::from_delta_stats_schema(delta_stats_schema)?;
+    let root = StatsLeafWalker::walk(table_schema, Some(scopes), &ParsedStatsExprBuilder)?;
+    assemble_parsed_stats_expr(root, delta_stats_schema, &scopes)
 }
 
 /// A built child expression and the name of the output field it fills.
@@ -1349,6 +1370,20 @@ mod tests {
             err.to_string().contains("geospatial"),
             "unexpected error: {err}"
         );
+    }
+
+    #[cfg(feature = "geo-type-in-dev")]
+    #[test]
+    fn projected_stats_schema_skips_geospatial_column() {
+        let geometry = GeometryType::try_new("EPSG:4326").expect("valid crs");
+        let schema = StructType::new_unchecked([
+            field_with_id("g", geometry.into(), true, 1),
+            field_with_id("x", DataType::LONG, true, 2),
+        ]);
+        let delta = delta_stats(Some(stat_cols(["g", "x"])), None, None);
+        let projected = projected_stats_schema(&schema, &delta).expect("should succeed");
+        let names: Vec<_> = projected.fields().map(|f| f.name().as_str()).collect();
+        assert_eq!(names, ["x"]);
     }
 
     #[test]

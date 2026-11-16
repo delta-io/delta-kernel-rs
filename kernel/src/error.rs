@@ -103,6 +103,9 @@ pub(crate) fn add_scalar_path_context(
     }
 }
 
+/// An owned, thread-safe error used as a diagnostic source.
+pub type BoxedError = Box<dyn std::error::Error + Send + Sync + 'static>;
+
 /// A result whose error is the top-level [`Error`].
 ///
 /// APIs that can fail with a [`DeltaError`] return this type. Other kernel APIs return
@@ -261,7 +264,7 @@ pub enum KernelError {
     #[error("Generic error: {source}")]
     GenericError {
         /// Source error
-        source: Box<dyn std::error::Error + Send + Sync + 'static>,
+        source: BoxedError,
     },
 
     /// An error involving the maximum catalog-ratified version when building a snapshot.
@@ -425,6 +428,11 @@ pub enum KernelError {
     #[error("Invalid interval: {0}")]
     InvalidInterval(String),
 
+    /// The `uri` of a `file` value has a form that kernel doesn't resolve; see
+    /// [`resolve_file_uri`](crate::resolve_file_uri).
+    #[error("Unsupported file uri: {0}")]
+    UnsupportedFileUri(String),
+
     /// Invalid CRS or other parameter for a Geometry / Geography type
     #[error("Invalid geo parameters: {0}")]
     InvalidGeoParams(String),
@@ -535,7 +543,7 @@ impl KernelError {
         Self::CheckpointWrite(msg.to_string())
     }
 
-    pub fn generic_err(source: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> Self {
+    pub fn generic_err(source: impl Into<BoxedError>) -> Self {
         Self::GenericError {
             source: source.into(),
         }
@@ -580,6 +588,11 @@ impl KernelError {
     /// represented by its qualifier.
     pub fn invalid_interval(msg: impl ToString) -> Self {
         Self::InvalidInterval(msg.to_string())
+    }
+    /// Creates an UnsupportedFileUri error. The message names the `uri` and why it is not
+    /// supported.
+    pub fn unsupported_file_uri(msg: impl ToString) -> Self {
+        Self::UnsupportedFileUri(msg.to_string())
     }
     #[cfg(feature = "geo-type-in-dev")]
     pub fn invalid_geo_params(msg: impl ToString) -> Self {

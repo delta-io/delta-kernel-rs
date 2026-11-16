@@ -108,9 +108,6 @@ use itertools::Itertools;
 use tracing::info;
 use url::Url;
 
-#[cfg(feature = "declarative-plans")]
-#[allow(unused_imports)]
-pub(crate) use crate::action_reconciliation::checkpoint_shape::{CheckpointShape, CheckpointType};
 use crate::action_reconciliation::file_metadata::{
     StatsTransformConfig, build_checkpoint_read_schema, build_checkpoint_transform,
 };
@@ -136,13 +133,17 @@ use crate::table_configuration::TableConfiguration;
 use crate::table_features::TableFeature;
 use crate::table_properties::TableProperties;
 use crate::{
-    Engine, EngineData, FileMeta, KernelError, KernelResult, KernelResultIterator, Version,
+    Engine, EngineData, FileMeta, KernelError, KernelResult, KernelResultIterator, Result, Version,
     version_as_i64,
 };
 
 pub(crate) mod collation_stats;
+#[cfg(feature = "declarative-plans")]
+mod shape;
 mod sidecar;
 
+#[cfg(feature = "declarative-plans")]
+pub use shape::{CheckpointKind, CheckpointShape};
 use sidecar::{SidecarSplitter, SingleSidecarDataIterator, create_sidecar_action_batch};
 #[cfg(test)]
 pub(crate) mod tests;
@@ -375,7 +376,7 @@ impl RetentionCalculator for CheckpointWriter {
 
 impl CheckpointWriter {
     /// Creates a new [`CheckpointWriter`] for the given snapshot.
-    pub(crate) fn try_new(snapshot: SnapshotRef, engine: &dyn Engine) -> KernelResult<Self> {
+    pub(crate) fn try_new(snapshot: SnapshotRef, engine: &dyn Engine) -> Result<Self> {
         snapshot
             .table_configuration()
             .ensure_read_write_supported()?;
