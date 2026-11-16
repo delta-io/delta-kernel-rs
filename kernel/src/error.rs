@@ -5,6 +5,8 @@ use std::convert::Infallible;
 use std::num::ParseIntError;
 use std::str::Utf8Error;
 
+use url::Url;
+
 use crate::Version;
 #[cfg(feature = "default-engine-base")]
 use crate::arrow::error::ArrowError;
@@ -725,5 +727,69 @@ impl From<object_store::Error> for KernelError {
 impl From<Infallible> for KernelError {
     fn from(value: Infallible) -> Self {
         match value {}
+    }
+}
+
+/// Classifies an absent required scan file without reclassifying other storage failures.
+pub(crate) fn required_file_error(error: KernelError, path: &Url) -> Error {
+    if matches!(error.without_backtrace(), KernelError::FileNotFound(_)) {
+        Error::Delta(DeltaError::file_not_found(path, Some(Box::new(error))))
+    } else {
+        Error::Kernel(error)
+    }
+}
+
+#[cfg(test)]
+mod required_file_tests {
+    use std::error::Error as _;
+
+    use rstest::rstest;
+    use url::Url;
+
+    use super::*;
+
+    #[rstest]
+    #[case::missing(KernelError::FileNotFound("native path".into()), true)]
+    #[case::wrapped_missing(KernelError::FileNotFound("native path".into()).with_backtrace(), true)]
+    #[case::cancelled(KernelError::Cancelled, false)]
+    #[case::empty(KernelError::missing_data("no item"), false)]
+    #[case::permission(
+        KernelError::from(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
+        false
+    )]
+    #[case::timeout(
+        KernelError::from(std::io::Error::from(std::io::ErrorKind::TimedOut)),
+        false
+    )]
+    fn only_proven_file_absence_is_delta(#[case] source: KernelError, #[case] missing: bool) {
+        let source_message = source.to_string();
+        let path = Url::parse("memory:///data/a%27b.parquet").unwrap();
+        match required_file_error(source, &path) {
+            Error::Delta(error) => {
+                assert!(missing);
+                assert_eq!(error.condition(), DeltaErrorCondition::DeltaFileNotFound);
+                assert_eq!(error.sql_state(), Some("42K03"));
+                assert_eq!(
+                    error
+                        .parameters()
+                        .iter()
+                        .map(|p| (p.name(), p.value()))
+                        .collect::<Vec<_>>(),
+                    [("path", path.as_str())]
+                );
+                assert_eq!(error.source().unwrap().to_string(), source_message);
+                assert!(
+                    error
+                        .source()
+                        .unwrap()
+                        .downcast_ref::<KernelError>()
+                        .is_some()
+                );
+            }
+            Error::Kernel(error) => {
+                assert!(!missing);
+                assert_eq!(error.to_string(), source_message);
+            }
+        }
     }
 }
