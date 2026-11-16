@@ -133,11 +133,11 @@ events from the same snapshot load together.
 | Event | Fields | What it measures |
 |-------|--------|------------------|
 | `LogSegmentLoadSuccess` | `operation_id`, `duration`, `num_commit_files`, `num_checkpoint_files`, `num_compaction_files`, `has_latest_crc_file` | Time to list and organize log files into a log segment. |
-| `LogSegmentLoadFailure` | `operation_id` | Log segment load failed. |
+| `LogSegmentLoadFailure` | `operation_id`, `duration` | Time spent before log segment loading failed. |
 | `ProtocolMetadataLoadSuccess` | `operation_id`, `duration` | Time to read protocol and metadata actions from the log. |
-| `ProtocolMetadataLoadFailure` | `operation_id` | Protocol/metadata load failed. |
+| `ProtocolMetadataLoadFailure` | `operation_id`, `duration` | Time spent before protocol/metadata loading failed. |
 | `SnapshotBuildSuccess` | `operation_id`, `version`, `duration` | End-to-end snapshot creation, including the table version that was loaded. |
-| `SnapshotBuildFailure` | `operation_id` | Snapshot creation failed. Use this to track error rates. |
+| `SnapshotBuildFailure` | `operation_id`, `duration` | Time spent before snapshot creation failed. |
 
 ### Scan metadata events
 
