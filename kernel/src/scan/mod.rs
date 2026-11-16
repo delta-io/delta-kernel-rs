@@ -1931,7 +1931,15 @@ pub(crate) fn column_lookup_error(
             break;
         }
         let (DataType::Struct(inner) | DataType::File(inner)) = field.data_type() else {
-            return Error::Kernel(error);
+            let prefix = ColumnName::new(column.path()[..=index].iter().cloned());
+            // TODO(3421): Remove the KernelError generic source following the error migration
+            return Error::Delta(DeltaError::column_path_not_nested(
+                &prefix.to_string(),
+                field.data_type(),
+                &column.to_string(),
+                schema,
+                Some(Box::new(error)),
+            ));
         };
         current = inner;
     }

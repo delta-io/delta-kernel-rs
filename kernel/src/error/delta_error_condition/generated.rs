@@ -20,6 +20,8 @@ pub enum DeltaErrorCondition {
     DeltaChangeDataFeedIncompatibleSchemaChange,
     /// `DELTA_COLUMN_NOT_FOUND_IN_SCHEMA` (SQLSTATE `42703`).
     DeltaColumnNotFoundInSchema,
+    /// `DELTA_COLUMN_PATH_NOT_NESTED` (SQLSTATE `42704`).
+    DeltaColumnPathNotNested,
     /// `DELTA_DELETION_VECTOR_CHECKSUM_MISMATCH` (SQLSTATE `XXKDS`).
     DeltaDeletionVectorChecksumMismatch,
     /// `DELTA_DELETION_VECTOR_SIZE_MISMATCH` (SQLSTATE `XXKDS`).
@@ -78,6 +80,12 @@ impl DeltaErrorCondition {
                 sql_state: Some("42703"),
                 parameter_names: &["columnName", "tableSchema"],
                 message_template: "Couldn't find column <columnName> in:\n<tableSchema>",
+            },
+            Self::DeltaColumnPathNotNested => ConditionMetadata {
+                name: "DELTA_COLUMN_PATH_NOT_NESTED",
+                sql_state: Some("42704"),
+                parameter_names: &["columnPath", "other", "column", "schema"],
+                message_template: "Expected <columnPath> to be a nested data type, but found <other>. Was looking for the\nindex of <column> in a nested field.\nSchema:\n<schema>",
             },
             Self::DeltaDeletionVectorChecksumMismatch => ConditionMetadata {
                 name: "DELTA_DELETION_VECTOR_CHECKSUM_MISMATCH",

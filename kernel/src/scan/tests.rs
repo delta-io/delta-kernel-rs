@@ -377,6 +377,8 @@ fn test_physical_predicate_case_insensitive(
 #[rstest]
 #[case::missing(vec!["s", "absent"], false)]
 #[case::quoted_missing(vec!["s", "missing'\\\""], false)]
+#[case::scalar_prefix(vec!["s", "id", "child"], true)]
+#[case::quoted_prefix(vec!["quote'\\\"", "child"], true)]
 fn column_lookup_catalog_metadata(
     #[case] path: Vec<&str>,
     #[case] non_struct: bool,
