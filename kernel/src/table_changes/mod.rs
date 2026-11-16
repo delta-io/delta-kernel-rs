@@ -575,12 +575,15 @@ impl TableChanges {
 mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
+    use bytes::Bytes;
     use itertools::{Itertools, assert_equal};
 
     use super::*;
     use crate::actions::deletion_vector::DeletionVectorDescriptor;
     use crate::actions::{Add, Metadata, Protocol, Remove};
+    use crate::engine::DelegatingEngine;
     use crate::engine::sync::SyncEngine;
     use crate::schema::{DataType, StructField, StructType, schema_ref};
     use crate::table_changes::CDF_FIELDS;
@@ -591,20 +594,135 @@ mod tests {
     };
     use crate::table_features::TableFeature;
     use crate::table_properties::{
-        COLUMN_MAPPING_MODE, MATERIALIZED_ROW_COMMIT_VERSION_COLUMN_NAME,
+        COLUMN_MAPPING_MODE, ENABLE_CHANGE_DATA_FEED, MATERIALIZED_ROW_COMMIT_VERSION_COLUMN_NAME,
         MATERIALIZED_ROW_ID_COLUMN_NAME,
     };
     use crate::unit_test_utils::{
         Action, LocalMockTable, assert_result_error_with_message,
         test_schema_flat_with_column_mapping,
     };
-    use crate::{Engine, Error, KernelError};
+    use crate::{Engine, Error, FileMeta, FileSlice, KernelError, StorageHandler};
 
     fn listing_test_schema() -> Arc<StructType> {
         schema_ref! {
             nullable "id": INTEGER,
             nullable "value": STRING,
         }
+    }
+
+    struct AppendAfterListing {
+        inner: Arc<dyn StorageHandler>,
+        commit_path: Url,
+        appended: AtomicBool,
+    }
+
+    impl StorageHandler for AppendAfterListing {
+        fn list_from(&self, path: &Url) -> KernelResult<Box<dyn KernelResultIterator<FileMeta>>> {
+            let files = self
+                .inner
+                .list_from(path)?
+                .collect::<KernelResult<Vec<_>>>()?;
+            if !self.appended.swap(true, Ordering::SeqCst) {
+                self.inner.put(
+                    &self.commit_path,
+                    Bytes::from_static(b"{\"commitInfo\":{\"timestamp\":0}}"),
+                    false,
+                )?;
+            }
+            Ok(Box::new(files.into_iter().map(Ok)))
+        }
+
+        fn read_files(
+            &self,
+            files: Vec<FileSlice>,
+        ) -> KernelResult<Box<dyn KernelResultIterator<Bytes>>> {
+            self.inner.read_files(files)
+        }
+
+        fn copy_atomic(&self, src: &Url, dest: &Url) -> KernelResult<()> {
+            self.inner.copy_atomic(src, dest)
+        }
+
+        fn put(&self, path: &Url, data: Bytes, overwrite: bool) -> KernelResult<()> {
+            self.inner.put(path, data, overwrite)
+        }
+
+        fn head(&self, path: &Url) -> KernelResult<FileMeta> {
+            self.inner.head(path)
+        }
+
+        fn delete(&self, path: &Url) -> KernelResult<()> {
+            self.inner.delete(path)
+        }
+    }
+
+    #[rstest::rstest]
+    #[case::latest(None)]
+    #[case::explicit(Some(2))]
+    #[tokio::test]
+    async fn concurrent_append_preserves_selected_cdf_end_version(
+        #[case] end_version: Option<Version>,
+    ) {
+        let mut table = LocalMockTable::new();
+        let metadata = |enabled: bool| {
+            Metadata::try_new(
+                None,
+                None,
+                listing_test_schema(),
+                vec![],
+                0,
+                HashMap::from([(ENABLE_CHANGE_DATA_FEED.to_string(), enabled.to_string())]),
+            )
+            .unwrap()
+        };
+        table
+            .commit([
+                Action::Protocol(Protocol::try_new_legacy(1, 4).unwrap()),
+                Action::Metadata(metadata(true)),
+            ])
+            .await;
+        table.commit([Action::Metadata(metadata(false))]).await;
+        table.commit([Action::Metadata(metadata(true))]).await;
+        let root = Url::from_directory_path(table.table_root()).unwrap();
+        let inner: Arc<dyn Engine> = Arc::new(SyncEngine::new());
+        let storage = Arc::new(AppendAfterListing {
+            inner: inner.storage_handler(),
+            commit_path: root.join("_delta_log/00000000000000000003.json").unwrap(),
+            appended: AtomicBool::new(false),
+        });
+        let engine = Arc::new(
+            DelegatingEngine::new(inner)
+                .with_storage_handler(storage.clone())
+                .without_plan_executor(),
+        );
+        let changes = TableChanges::try_new(&root, engine.as_ref(), 0, end_version).unwrap();
+        assert!(storage.appended.load(Ordering::SeqCst));
+        assert_eq!(changes.end_version(), 2);
+        assert_eq!(changes.end_snapshot.version(), 2);
+        let scan = changes.into_scan_builder().build().unwrap();
+        let error = scan
+            .execute(engine)
+            .unwrap()
+            .collect::<Result<Vec<_>>>()
+            .err()
+            .expect("expected missing change data");
+        let Error::Delta(error) = error else {
+            panic!("expected missing change data");
+        };
+        assert_eq!(error.name(), "DELTA_MISSING_CHANGE_DATA");
+        assert_eq!(
+            error
+                .parameters()
+                .iter()
+                .map(|p| (p.name(), p.value()))
+                .collect::<Vec<_>>(),
+            [
+                ("startVersion", "0"),
+                ("endVersion", "2"),
+                ("version", "1"),
+                ("key", ENABLE_CHANGE_DATA_FEED),
+            ]
+        );
     }
 
     #[test]
