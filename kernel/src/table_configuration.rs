@@ -621,7 +621,7 @@ impl TableConfiguration {
         logical_columns: &[ColumnName],
         variant_min_max: bool,
         #[cfg(feature = "geo-type-in-dev")] geometry_min_max: bool,
-    ) -> KernelResult<Option<StatsOutputSchemas>> {
+    ) -> Result<Option<StatsOutputSchemas>> {
         if logical_columns.is_empty() {
             return Ok(None);
         }
