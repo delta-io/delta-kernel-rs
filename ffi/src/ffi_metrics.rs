@@ -11,7 +11,7 @@
 
 use delta_kernel::metrics as kernel;
 
-use crate::{KernelStringSlice, kernel_string_slice};
+use crate::{KernelStringSlice, OptionalValue, kernel_string_slice};
 
 /// The 16 raw bytes of an operation's UUID, used to correlate events from the same operation.
 #[repr(C)]
@@ -505,6 +505,210 @@ pub struct LastCheckpointReadCompleted {
     pub duration_ns: u64,
 }
 
+/// Direction of checkpoint discovery.
+///
+/// cbindgen:prefix-with-name=true
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(C)]
+pub enum CheckpointDiscoveryMode {
+    Forward,
+    Backward,
+    Unknown,
+}
+
+impl From<kernel::CheckpointDiscoveryMode> for CheckpointDiscoveryMode {
+    fn from(value: kernel::CheckpointDiscoveryMode) -> Self {
+        match value {
+            kernel::CheckpointDiscoveryMode::Forward => Self::Forward,
+            kernel::CheckpointDiscoveryMode::Backward => Self::Backward,
+            kernel::CheckpointDiscoveryMode::Unknown => Self::Unknown,
+        }
+    }
+}
+
+/// Whether checkpoint discovery or inspection returned successfully.
+///
+/// cbindgen:prefix-with-name=true
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(C)]
+pub enum CheckpointReadOutcome {
+    Success,
+    Error,
+}
+
+impl From<kernel::CheckpointReadOutcome> for CheckpointReadOutcome {
+    fn from(value: kernel::CheckpointReadOutcome) -> Self {
+        match value {
+            kernel::CheckpointReadOutcome::Success => Self::Success,
+            kernel::CheckpointReadOutcome::Error => Self::Error,
+        }
+    }
+}
+
+/// Scope of sidecar-reference inspection.
+///
+/// cbindgen:prefix-with-name=true
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(C)]
+pub enum CheckpointInspectionMode {
+    SidecarProbe,
+    SidecarEnumeration,
+    Unknown,
+}
+
+impl From<kernel::CheckpointInspectionMode> for CheckpointInspectionMode {
+    fn from(value: kernel::CheckpointInspectionMode) -> Self {
+        match value {
+            kernel::CheckpointInspectionMode::SidecarProbe => Self::SidecarProbe,
+            kernel::CheckpointInspectionMode::SidecarEnumeration => Self::SidecarEnumeration,
+            kernel::CheckpointInspectionMode::Unknown => Self::Unknown,
+        }
+    }
+}
+
+/// Physical format of the inspected top-level checkpoint.
+///
+/// cbindgen:prefix-with-name=true
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(C)]
+pub enum CheckpointReadFormat {
+    Json,
+    Parquet,
+    Unknown,
+}
+
+impl From<kernel::CheckpointReadFormat> for CheckpointReadFormat {
+    fn from(value: kernel::CheckpointReadFormat) -> Self {
+        match value {
+            kernel::CheckpointReadFormat::Json => Self::Json,
+            kernel::CheckpointReadFormat::Parquet => Self::Parquet,
+            kernel::CheckpointReadFormat::Unknown => Self::Unknown,
+        }
+    }
+}
+
+/// Completion of checkpoint discovery. See [`kernel::CheckpointDiscoveryCompleted`] for bounds,
+/// counting rules, and the distinction between no checkpoint and a failed search.
+#[repr(C)]
+pub struct CheckpointDiscoveryCompleted {
+    pub operation_id: OptionalValue<MetricId>,
+    pub correlation_id: KernelStringSlice,
+    pub mode: CheckpointDiscoveryMode,
+    pub outcome: CheckpointReadOutcome,
+    pub start_version: u64,
+    pub end_version: OptionalValue<u64>,
+    pub num_list_calls: u64,
+    pub num_files_examined: u64,
+    pub checkpoint_version: OptionalValue<u64>,
+    pub duration_ns: u64,
+}
+
+/// Completion of sidecar-reference inspection. A probe's observed count is not a total count;
+/// see [`kernel::CheckpointInspectionCompleted`] for the operation boundary.
+#[repr(C)]
+pub struct CheckpointInspectionCompleted {
+    pub operation_id: OptionalValue<MetricId>,
+    pub correlation_id: KernelStringSlice,
+    pub mode: CheckpointInspectionMode,
+    pub format: CheckpointReadFormat,
+    pub outcome: CheckpointReadOutcome,
+    pub checkpoint_version: u64,
+    pub checkpoint_size_bytes: u64,
+    pub num_sidecars_observed: u64,
+    pub duration_ns: u64,
+}
+
+/// C representation of [`kernel::CheckpointHintReadOutcome`].
+///
+/// cbindgen:prefix-with-name=true
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(C)]
+pub enum CheckpointHintReadOutcome {
+    Parsed,
+    Missing,
+    Empty,
+    Invalid,
+    Error,
+}
+
+impl From<kernel::CheckpointHintReadOutcome> for CheckpointHintReadOutcome {
+    fn from(value: kernel::CheckpointHintReadOutcome) -> Self {
+        match value {
+            kernel::CheckpointHintReadOutcome::Parsed => Self::Parsed,
+            kernel::CheckpointHintReadOutcome::Missing => Self::Missing,
+            kernel::CheckpointHintReadOutcome::Empty => Self::Empty,
+            kernel::CheckpointHintReadOutcome::Invalid => Self::Invalid,
+            kernel::CheckpointHintReadOutcome::Error => Self::Error,
+        }
+    }
+}
+
+/// C representation of [`kernel::CheckpointSidecarReadMode`].
+///
+/// cbindgen:prefix-with-name=true
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(C)]
+pub enum CheckpointSidecarReadMode {
+    Footer,
+    Data,
+    Unknown,
+}
+
+impl From<kernel::CheckpointSidecarReadMode> for CheckpointSidecarReadMode {
+    fn from(value: kernel::CheckpointSidecarReadMode) -> Self {
+        match value {
+            kernel::CheckpointSidecarReadMode::Footer => Self::Footer,
+            kernel::CheckpointSidecarReadMode::Data => Self::Data,
+            kernel::CheckpointSidecarReadMode::Unknown => Self::Unknown,
+        }
+    }
+}
+
+/// C representation of [`kernel::CheckpointSidecarReadOutcome`].
+///
+/// cbindgen:prefix-with-name=true
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(C)]
+pub enum CheckpointSidecarReadOutcome {
+    Success,
+    Error,
+    Incomplete,
+}
+
+impl From<kernel::CheckpointSidecarReadOutcome> for CheckpointSidecarReadOutcome {
+    fn from(value: kernel::CheckpointSidecarReadOutcome) -> Self {
+        match value {
+            kernel::CheckpointSidecarReadOutcome::Success => Self::Success,
+            kernel::CheckpointSidecarReadOutcome::Error => Self::Error,
+            kernel::CheckpointSidecarReadOutcome::Incomplete => Self::Incomplete,
+        }
+    }
+}
+
+/// One hint read attempt. Fallback-permitting outcomes do not imply snapshot success.
+/// See [`kernel::CheckpointHintReadCompleted`] for the complete outcome contract.
+#[repr(C)]
+pub struct CheckpointHintReadCompleted {
+    pub operation_id: OptionalValue<MetricId>,
+    pub correlation_id: KernelStringSlice,
+    pub outcome: CheckpointHintReadOutcome,
+    pub checkpoint_version: OptionalValue<u64>,
+    pub duration_ns: u64,
+}
+
+/// One sidecar footer or content read, including failure and incomplete lazy reads.
+/// See [`kernel::CheckpointSidecarReadCompleted`] for counting and duration boundaries.
+#[repr(C)]
+pub struct CheckpointSidecarReadCompleted {
+    pub operation_id: OptionalValue<MetricId>,
+    pub correlation_id: KernelStringSlice,
+    pub mode: CheckpointSidecarReadMode,
+    pub outcome: CheckpointSidecarReadOutcome,
+    pub checkpoint_version: u64,
+    pub num_files_requested: u64,
+    pub duration_ns: u64,
+}
+
 /// A `JsonHandler::read_json_files` call completed.
 #[repr(C)]
 pub struct JsonReadCompleted {
@@ -593,6 +797,10 @@ pub enum MetricEvent {
     ChecksumWriteSuccess(ChecksumWriteSuccess),
     ChecksumWriteFailure(ChecksumWriteFailure),
     LastCheckpointReadCompleted(LastCheckpointReadCompleted),
+    CheckpointDiscoveryCompleted(CheckpointDiscoveryCompleted),
+    CheckpointInspectionCompleted(CheckpointInspectionCompleted),
+    CheckpointHintReadCompleted(CheckpointHintReadCompleted),
+    CheckpointSidecarReadCompleted(CheckpointSidecarReadCompleted),
 }
 
 /// Borrow the caller-supplied correlation id as a [`KernelStringSlice`], or an empty slice when
@@ -614,6 +822,53 @@ impl MetricEvent {
         use kernel::MetricEvent as K;
         let ns = |d: std::time::Duration| d.as_nanos() as u64;
         match event {
+            K::CheckpointHintReadCompleted(e) => {
+                Self::CheckpointHintReadCompleted(CheckpointHintReadCompleted {
+                    operation_id: e.operation_id.map(MetricId::from).into(),
+                    correlation_id: correlation_id_slice(e.correlation_id.as_deref()),
+                    outcome: e.outcome.into(),
+                    checkpoint_version: e.checkpoint_version.into(),
+                    duration_ns: ns(e.duration),
+                })
+            }
+            K::CheckpointSidecarReadCompleted(e) => {
+                Self::CheckpointSidecarReadCompleted(CheckpointSidecarReadCompleted {
+                    operation_id: e.operation_id.map(MetricId::from).into(),
+                    correlation_id: correlation_id_slice(e.correlation_id.as_deref()),
+                    mode: e.mode.into(),
+                    outcome: e.outcome.into(),
+                    checkpoint_version: e.checkpoint_version,
+                    num_files_requested: e.num_files_requested,
+                    duration_ns: ns(e.duration),
+                })
+            }
+            K::CheckpointDiscoveryCompleted(e) => {
+                Self::CheckpointDiscoveryCompleted(CheckpointDiscoveryCompleted {
+                    operation_id: e.operation_id.map(MetricId::from).into(),
+                    correlation_id: correlation_id_slice(e.correlation_id.as_deref()),
+                    mode: e.mode.into(),
+                    outcome: e.outcome.into(),
+                    start_version: e.start_version,
+                    end_version: e.end_version.into(),
+                    num_list_calls: e.num_list_calls,
+                    num_files_examined: e.num_files_examined,
+                    checkpoint_version: e.checkpoint_version.into(),
+                    duration_ns: ns(e.duration),
+                })
+            }
+            K::CheckpointInspectionCompleted(e) => {
+                Self::CheckpointInspectionCompleted(CheckpointInspectionCompleted {
+                    operation_id: e.operation_id.map(MetricId::from).into(),
+                    correlation_id: correlation_id_slice(e.correlation_id.as_deref()),
+                    mode: e.mode.into(),
+                    format: e.format.into(),
+                    outcome: e.outcome.into(),
+                    checkpoint_version: e.checkpoint_version,
+                    checkpoint_size_bytes: e.checkpoint_size_bytes,
+                    num_sidecars_observed: e.num_sidecars_observed,
+                    duration_ns: ns(e.duration),
+                })
+            }
             K::LogSegmentLoadSuccess(kernel::LogSegmentLoadSuccess {
                 operation_id,
                 correlation_id,
@@ -944,6 +1199,264 @@ mod tests {
             };
             assert_eq!(event.outcome, expected);
             assert_eq!(event.duration_ns, 17);
+        });
+    }
+
+    fn assert_read_context(
+        operation_id: &OptionalValue<MetricId>,
+        correlation_id: KernelStringSlice,
+        expected: Option<kernel::MetricId>,
+    ) {
+        match (operation_id, expected) {
+            (OptionalValue::Some(actual), Some(expected)) => {
+                assert_eq!(actual.bytes, expected.as_bytes())
+            }
+            (OptionalValue::None, None) => {}
+            _ => panic!("operation id presence changed across FFI"),
+        }
+        // Safety: each caller keeps the source event alive through this callback.
+        let correlation = unsafe { correlation_id.try_to_string() }.unwrap();
+        assert_eq!(
+            correlation,
+            if expected.is_some() {
+                "caller-read"
+            } else {
+                ""
+            }
+        );
+    }
+
+    #[rstest]
+    #[case::parsed(
+        kernel::CheckpointHintReadOutcome::Parsed,
+        CheckpointHintReadOutcome::Parsed
+    )]
+    #[case::missing(
+        kernel::CheckpointHintReadOutcome::Missing,
+        CheckpointHintReadOutcome::Missing
+    )]
+    #[case::empty(
+        kernel::CheckpointHintReadOutcome::Empty,
+        CheckpointHintReadOutcome::Empty
+    )]
+    #[case::invalid(
+        kernel::CheckpointHintReadOutcome::Invalid,
+        CheckpointHintReadOutcome::Invalid
+    )]
+    #[case::error(
+        kernel::CheckpointHintReadOutcome::Error,
+        CheckpointHintReadOutcome::Error
+    )]
+    fn from_kernel_hint_read_preserves_outcome_and_context(
+        #[case] outcome: kernel::CheckpointHintReadOutcome,
+        #[case] expected: CheckpointHintReadOutcome,
+        #[values(false, true)] has_context: bool,
+        #[values(None, Some(0), Some(u64::MAX))] version: Option<u64>,
+    ) {
+        let operation_id = has_context.then(kernel::MetricId::new);
+        let event =
+            kernel::MetricEvent::CheckpointHintReadCompleted(kernel::CheckpointHintReadCompleted {
+                operation_id,
+                correlation_id: has_context.then(|| "caller-read".into()),
+                outcome,
+                checkpoint_version: version,
+                duration: Duration::from_nanos(123),
+            });
+        with_ffi_event(&event, |ffi| {
+            let MetricEvent::CheckpointHintReadCompleted(event) = ffi else {
+                panic!("expected hint report");
+            };
+            assert_read_context(&event.operation_id, event.correlation_id, operation_id);
+            assert_eq!(event.outcome, expected);
+            assert_eq!(event.checkpoint_version, version.into());
+            assert_eq!(event.duration_ns, 123);
+        });
+    }
+
+    #[rstest]
+    #[case::success(
+        kernel::CheckpointSidecarReadOutcome::Success,
+        CheckpointSidecarReadOutcome::Success
+    )]
+    #[case::error(
+        kernel::CheckpointSidecarReadOutcome::Error,
+        CheckpointSidecarReadOutcome::Error
+    )]
+    #[case::incomplete(
+        kernel::CheckpointSidecarReadOutcome::Incomplete,
+        CheckpointSidecarReadOutcome::Incomplete
+    )]
+    fn from_kernel_sidecar_read_preserves_outcome_and_context(
+        #[case] outcome: kernel::CheckpointSidecarReadOutcome,
+        #[case] expected: CheckpointSidecarReadOutcome,
+        #[values(
+            kernel::CheckpointSidecarReadMode::Footer,
+            kernel::CheckpointSidecarReadMode::Data,
+            kernel::CheckpointSidecarReadMode::Unknown
+        )]
+        mode: kernel::CheckpointSidecarReadMode,
+        #[values(false, true)] has_context: bool,
+    ) {
+        let operation_id = has_context.then(kernel::MetricId::new);
+        let event = kernel::MetricEvent::CheckpointSidecarReadCompleted(
+            kernel::CheckpointSidecarReadCompleted {
+                operation_id,
+                correlation_id: has_context.then(|| "caller-read".into()),
+                mode,
+                outcome,
+                checkpoint_version: 0,
+                num_files_requested: 3,
+                duration: Duration::from_nanos(456),
+            },
+        );
+        with_ffi_event(&event, |ffi| {
+            let MetricEvent::CheckpointSidecarReadCompleted(event) = ffi else {
+                panic!("expected sidecar report");
+            };
+            assert_read_context(&event.operation_id, event.correlation_id, operation_id);
+            assert_eq!(event.mode, CheckpointSidecarReadMode::from(mode));
+            assert_eq!(event.outcome, expected);
+            assert_eq!(event.checkpoint_version, 0);
+            assert_eq!(event.num_files_requested, 3);
+            assert_eq!(event.duration_ns, 456);
+        });
+    }
+
+    #[rstest]
+    #[case::forward(
+        kernel::CheckpointDiscoveryMode::Forward,
+        CheckpointDiscoveryMode::Forward
+    )]
+    #[case::backward(
+        kernel::CheckpointDiscoveryMode::Backward,
+        CheckpointDiscoveryMode::Backward
+    )]
+    #[case::unknown(
+        kernel::CheckpointDiscoveryMode::Unknown,
+        CheckpointDiscoveryMode::Unknown
+    )]
+    fn from_kernel_checkpoint_discovery_preserves_optional_versions(
+        #[case] mode: kernel::CheckpointDiscoveryMode,
+        #[case] expected_mode: CheckpointDiscoveryMode,
+        #[values(None, Some(0), Some(u64::MAX))] end_version: Option<u64>,
+        #[values(None, Some(0), Some(u64::MAX))] checkpoint_version: Option<u64>,
+        #[values(false, true)] failed: bool,
+        #[values(false, true)] has_context: bool,
+    ) {
+        let operation_id = has_context.then(kernel::MetricId::new);
+        let outcome = if failed {
+            kernel::CheckpointReadOutcome::Error
+        } else {
+            kernel::CheckpointReadOutcome::Success
+        };
+        let event = kernel::MetricEvent::CheckpointDiscoveryCompleted(
+            kernel::CheckpointDiscoveryCompleted {
+                operation_id,
+                correlation_id: has_context.then(|| "caller-read".into()),
+                mode,
+                outcome,
+                start_version: 7,
+                end_version,
+                num_list_calls: 2,
+                num_files_examined: 31,
+                checkpoint_version,
+                duration: Duration::from_nanos(123),
+            },
+        );
+        with_ffi_event(&event, |ffi| {
+            let MetricEvent::CheckpointDiscoveryCompleted(event) = ffi else {
+                panic!("expected CheckpointDiscoveryCompleted");
+            };
+            assert_read_context(&event.operation_id, event.correlation_id, operation_id);
+            assert_eq!(event.mode, expected_mode);
+            assert_eq!(
+                event.outcome,
+                if failed {
+                    CheckpointReadOutcome::Error
+                } else {
+                    CheckpointReadOutcome::Success
+                }
+            );
+            assert_eq!(event.start_version, 7);
+            assert_eq!(event.end_version, end_version.into());
+            assert_eq!(event.num_list_calls, 2);
+            assert_eq!(event.num_files_examined, 31);
+            assert_eq!(event.checkpoint_version, checkpoint_version.into());
+            assert_eq!(event.duration_ns, 123);
+        });
+    }
+
+    #[rstest]
+    #[case::probe(
+        kernel::CheckpointInspectionMode::SidecarProbe,
+        CheckpointInspectionMode::SidecarProbe
+    )]
+    #[case::enumeration(
+        kernel::CheckpointInspectionMode::SidecarEnumeration,
+        CheckpointInspectionMode::SidecarEnumeration
+    )]
+    #[case::unknown(
+        kernel::CheckpointInspectionMode::Unknown,
+        CheckpointInspectionMode::Unknown
+    )]
+    fn from_kernel_checkpoint_inspection_preserves_fields(
+        #[case] mode: kernel::CheckpointInspectionMode,
+        #[case] expected_mode: CheckpointInspectionMode,
+        #[values(
+            kernel::CheckpointReadFormat::Json,
+            kernel::CheckpointReadFormat::Parquet,
+            kernel::CheckpointReadFormat::Unknown
+        )]
+        format: kernel::CheckpointReadFormat,
+        #[values(false, true)] failed: bool,
+        #[values(false, true)] has_context: bool,
+        #[values(0, u64::MAX)] checkpoint_version: u64,
+    ) {
+        let operation_id = has_context.then(kernel::MetricId::new);
+        let outcome = if failed {
+            kernel::CheckpointReadOutcome::Error
+        } else {
+            kernel::CheckpointReadOutcome::Success
+        };
+        let event = kernel::MetricEvent::CheckpointInspectionCompleted(
+            kernel::CheckpointInspectionCompleted {
+                operation_id,
+                correlation_id: has_context.then(|| "caller-read".into()),
+                mode,
+                format,
+                outcome,
+                checkpoint_version,
+                checkpoint_size_bytes: 321,
+                num_sidecars_observed: 4,
+                duration: Duration::from_nanos(456),
+            },
+        );
+        with_ffi_event(&event, |ffi| {
+            let MetricEvent::CheckpointInspectionCompleted(event) = ffi else {
+                panic!("expected CheckpointInspectionCompleted");
+            };
+            assert_read_context(&event.operation_id, event.correlation_id, operation_id);
+            assert_eq!(event.mode, expected_mode);
+            assert_eq!(
+                event.format,
+                match format {
+                    kernel::CheckpointReadFormat::Json => CheckpointReadFormat::Json,
+                    kernel::CheckpointReadFormat::Parquet => CheckpointReadFormat::Parquet,
+                    kernel::CheckpointReadFormat::Unknown => CheckpointReadFormat::Unknown,
+                }
+            );
+            assert_eq!(
+                event.outcome,
+                if failed {
+                    CheckpointReadOutcome::Error
+                } else {
+                    CheckpointReadOutcome::Success
+                }
+            );
+            assert_eq!(event.checkpoint_version, checkpoint_version);
+            assert_eq!(event.checkpoint_size_bytes, 321);
+            assert_eq!(event.num_sidecars_observed, 4);
+            assert_eq!(event.duration_ns, 456);
         });
     }
 

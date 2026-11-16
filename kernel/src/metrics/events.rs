@@ -25,6 +25,10 @@ use tracing::span::Attributes;
 use tracing::warn;
 use uuid::Uuid;
 
+use super::{
+    CheckpointDiscoveryCompleted, CheckpointHintReadCompleted, CheckpointInspectionCompleted,
+    CheckpointSidecarReadCompleted,
+};
 use crate::log_segment::LogSegment;
 
 // ====================================================================
@@ -117,6 +121,10 @@ pub enum MetricEvent {
     StorageListCompleted(StorageListCompleted),
     StorageReadCompleted(StorageReadCompleted),
     StorageCopyCompleted(StorageCopyCompleted),
+    CheckpointDiscoveryCompleted(CheckpointDiscoveryCompleted),
+    CheckpointInspectionCompleted(CheckpointInspectionCompleted),
+    CheckpointHintReadCompleted(CheckpointHintReadCompleted),
+    CheckpointSidecarReadCompleted(CheckpointSidecarReadCompleted),
 }
 
 impl MetricEvent {
@@ -142,7 +150,11 @@ impl MetricEvent {
             | Self::ScanMetadataCompleted(_)
             | Self::StorageListCompleted(_)
             | Self::StorageReadCompleted(_)
-            | Self::StorageCopyCompleted(_) => {}
+            | Self::StorageCopyCompleted(_)
+            | Self::CheckpointDiscoveryCompleted(_)
+            | Self::CheckpointInspectionCompleted(_)
+            | Self::CheckpointHintReadCompleted(_)
+            | Self::CheckpointSidecarReadCompleted(_) => {}
 
             // These failure events carry no duration.
             Self::LogSegmentLoadFailure(_)
@@ -168,6 +180,12 @@ impl MetricEvent {
             Self::CheckpointWriteSuccess(e) => e.record_u64(name, value),
             Self::ChecksumWriteSuccess(e) => e.record_u64(name, value),
 
+            Self::CheckpointDiscoveryCompleted(_) => Err(CheckpointDiscoveryCompleted::SPAN_NAME),
+            Self::CheckpointInspectionCompleted(_) => Err(CheckpointInspectionCompleted::SPAN_NAME),
+            Self::CheckpointHintReadCompleted(_) => Err(CheckpointHintReadCompleted::SPAN_NAME),
+            Self::CheckpointSidecarReadCompleted(_) => {
+                Err(CheckpointSidecarReadCompleted::SPAN_NAME)
+            }
             Self::LogSegmentLoadSuccess(_) => Err(LogSegmentLoadSuccess::SPAN_NAME),
             Self::ProtocolMetadataLoadSuccess(_) => Err(ProtocolMetadataLoadSuccess::SPAN_NAME),
             Self::SetTransactionLoadSuccess(_) => Err(SetTransactionLoadSuccess::SPAN_NAME),
@@ -200,6 +218,12 @@ impl MetricEvent {
             Self::SetTransactionLoadSuccess(e) => e.record_bool(name, value),
 
             // No bool fields set during span lifetime — a runtime record() on these is a bug.
+            Self::CheckpointDiscoveryCompleted(_) => Err(CheckpointDiscoveryCompleted::SPAN_NAME),
+            Self::CheckpointInspectionCompleted(_) => Err(CheckpointInspectionCompleted::SPAN_NAME),
+            Self::CheckpointHintReadCompleted(_) => Err(CheckpointHintReadCompleted::SPAN_NAME),
+            Self::CheckpointSidecarReadCompleted(_) => {
+                Err(CheckpointSidecarReadCompleted::SPAN_NAME)
+            }
             Self::LogSegmentLoadSuccess(_) => Err(LogSegmentLoadSuccess::SPAN_NAME),
             Self::ProtocolMetadataLoadSuccess(_) => Err(ProtocolMetadataLoadSuccess::SPAN_NAME),
             Self::SnapshotBuildSuccess(_) => Err(SnapshotBuildSuccess::SPAN_NAME),
@@ -323,7 +347,11 @@ impl MetricEvent {
             | Self::ScanMetadataCompleted(_)
             | Self::StorageListCompleted(_)
             | Self::StorageReadCompleted(_)
-            | Self::StorageCopyCompleted(_)) => e,
+            | Self::StorageCopyCompleted(_)
+            | Self::CheckpointDiscoveryCompleted(_)
+            | Self::CheckpointInspectionCompleted(_)
+            | Self::CheckpointHintReadCompleted(_)
+            | Self::CheckpointSidecarReadCompleted(_)) => e,
         }
     }
 }
@@ -356,6 +384,10 @@ impl fmt::Display for MetricEvent {
             Self::StorageListCompleted(e) => e.fmt(f),
             Self::StorageReadCompleted(e) => e.fmt(f),
             Self::StorageCopyCompleted(e) => e.fmt(f),
+            Self::CheckpointDiscoveryCompleted(e) => e.fmt(f),
+            Self::CheckpointInspectionCompleted(e) => e.fmt(f),
+            Self::CheckpointHintReadCompleted(e) => e.fmt(f),
+            Self::CheckpointSidecarReadCompleted(e) => e.fmt(f),
         }
     }
 }

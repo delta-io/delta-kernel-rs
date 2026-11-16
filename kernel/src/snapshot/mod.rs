@@ -351,6 +351,16 @@ impl Snapshot {
         &self,
         engine: &dyn Engine,
     ) -> KernelResult<Option<Arc<CheckpointShape>>> {
+        self.checkpoint_info_with_context(engine, &crate::metrics::CheckpointReadContext::default())
+    }
+
+    /// Resolve checkpoint state, reporting actual discovery with the caller's metric context.
+    #[cfg(feature = "declarative-plans")]
+    pub(crate) fn checkpoint_info_with_context(
+        &self,
+        engine: &dyn Engine,
+        context: &crate::metrics::CheckpointReadContext,
+    ) -> KernelResult<Option<Arc<CheckpointShape>>> {
         if let Some(resolved) = self.checkpoint_info.get() {
             return Ok(resolved.clone());
         }
@@ -368,7 +378,8 @@ impl Snapshot {
             None
         } else {
             let executor = engine.require_plan_executor()?;
-            CheckpointShape::resolve(executor.as_ref(), self.log_segment())?.map(Arc::new)
+            CheckpointShape::resolve_with_context(executor.as_ref(), self.log_segment(), context)?
+                .map(Arc::new)
         };
         // All initializers hold the mutex; publish only after every fallible operation succeeds.
         let _ = self.checkpoint_info.set(resolved.clone());

@@ -12,6 +12,7 @@
 //! [`LogSegment`]: crate::log_segment::LogSegment
 
 use std::collections::HashMap;
+use std::time::Instant;
 
 use delta_kernel_derive::internal_api;
 use itertools::Itertools;
@@ -19,6 +20,10 @@ use tracing::{debug, info, instrument, trace, warn};
 use url::Url;
 
 use crate::last_checkpoint_hint::LastCheckpointHint;
+use crate::metrics::{
+    CheckpointDiscoveryCompleted, CheckpointDiscoveryMode, CheckpointReadContext,
+    CheckpointReadOutcome,
+};
 use crate::path::LogPathFileType::*;
 use crate::path::{
     CheckpointInstance, LogPathFileType, ParsedLogPath, may_begin_listable_log_path,
@@ -631,7 +636,7 @@ impl LogSegmentFiles {
     // - SortedCommitFiles: Vec<ParsedLogPath>, is_ascending: bool, end_version: Version
     // - CheckpointParts: Vec<ParsedLogPath>, checkpoint_version: Version (guarantee all same
     //   version)
-    #[instrument(name = "log.list", skip_all, fields(enable_call_frame, start = ?start_version, end = ?end_version), err)]
+    #[cfg(test)]
     pub(crate) fn list(
         storage: &dyn StorageHandler,
         log_root: &Url,
@@ -649,6 +654,7 @@ impl LogSegmentFiles {
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn list_with_checkpoint_handling(
         storage: &dyn StorageHandler,
         log_root: &Url,
@@ -657,10 +663,72 @@ impl LogSegmentFiles {
         end_version: Option<Version>,
         checkpoint_handling: CheckpointHandling,
     ) -> KernelResult<Self> {
+        Self::list_with_context(
+            storage,
+            log_root,
+            log_tail,
+            start_version,
+            end_version,
+            checkpoint_handling,
+            &CheckpointReadContext::default(),
+        )
+    }
+
+    #[instrument(name = "log.list", skip_all, fields(enable_call_frame, start = ?start_version, end = ?end_version), err)]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn list_with_context(
+        storage: &dyn StorageHandler,
+        log_root: &Url,
+        log_tail: Vec<ParsedLogPath>,
+        start_version: Option<Version>,
+        end_version: Option<Version>,
+        checkpoint_handling: CheckpointHandling,
+        context: &CheckpointReadContext,
+    ) -> KernelResult<Self> {
         let start = start_version.unwrap_or(0);
         let end = end_version.unwrap_or(Version::MAX);
-        let fs_iter = list_delta_log_from_storage(storage, log_root, start, end)?;
-        Self::build_log_segment_files(fs_iter, log_tail, start, end_version, checkpoint_handling)
+        if checkpoint_handling == CheckpointHandling::Ignore {
+            let fs_iter = list_delta_log_from_storage(storage, log_root, start, end)?;
+            return Self::build_log_segment_files(
+                fs_iter,
+                log_tail,
+                start,
+                end_version,
+                checkpoint_handling,
+            );
+        }
+        let started = Instant::now();
+        let mut report = CheckpointDiscoveryCompleted {
+            operation_id: context.operation_id,
+            correlation_id: context.correlation_id.clone(),
+            mode: CheckpointDiscoveryMode::Forward,
+            start_version: start,
+            end_version,
+            num_list_calls: 1,
+            ..Default::default()
+        };
+        let result = (|| {
+            let fs_iter =
+                list_delta_log_from_storage(storage, log_root, start, end)?.inspect(|entry| {
+                    if entry.is_ok() {
+                        report.num_files_examined += 1;
+                    }
+                });
+            Self::build_log_segment_files(
+                fs_iter,
+                log_tail,
+                start,
+                end_version,
+                checkpoint_handling,
+            )
+        })();
+        if let Ok(files) = &result {
+            report.outcome = CheckpointReadOutcome::Success;
+            report.checkpoint_version = files.checkpoint_parts.first().map(|file| file.version);
+        }
+        report.duration = started.elapsed();
+        report.emit();
+        result
     }
 
     /// List all commit and checkpoint files after the provided checkpoint. It is guaranteed that
@@ -677,13 +745,16 @@ impl LogSegmentFiles {
         log_root: &Url,
         log_tail: Vec<ParsedLogPath>,
         end_version: Option<Version>,
+        context: &CheckpointReadContext,
     ) -> KernelResult<Self> {
-        let listed_files = Self::list(
+        let listed_files = Self::list_with_context(
             storage,
             log_root,
             log_tail,
             Some(checkpoint_metadata.version),
             end_version,
+            CheckpointHandling::Adopt,
+            context,
         )?;
 
         let Some(latest_checkpoint) = listed_files.checkpoint_parts.last() else {
@@ -766,29 +837,51 @@ impl LogSegmentFiles {
         log_root: &Url,
         log_tail: Vec<ParsedLogPath>,
         end_version: Version,
+        context: &CheckpointReadContext,
     ) -> KernelResult<Self> {
-        // Scan backward in 1000-version windows, collecting ALL file types, until a complete
-        // checkpoint is found or the log is exhausted.
+        let started = Instant::now();
+        let mut report = CheckpointDiscoveryCompleted {
+            operation_id: context.operation_id,
+            correlation_id: context.correlation_id.clone(),
+            mode: CheckpointDiscoveryMode::Backward,
+            start_version: end_version,
+            end_version: Some(end_version),
+            ..Default::default()
+        };
+        // Retain each window for log-segment assembly without another storage listing.
         let mut windows: Vec<Vec<ParsedLogPath>> = Vec::new();
-        let mut found_checkpoint_version: Option<Version> = None;
-        // upper is the exclusive upper bound of the next window; adding 1 includes end_version
-        // in the first window. The inclusive range passed to list_delta_log_from_storage is
-        // [lower, upper - 1].
-        // TODO(#3835): Handle the exclusive upper bound when end_version is Version::MAX.
-        let mut upper = end_version + 1;
-        while upper > 0 {
-            let lower = upper.saturating_sub(BACKWARD_SCAN_WINDOW_SIZE);
-            let window_files: Vec<_> =
-                list_delta_log_from_storage(storage, log_root, lower, upper - 1)?.try_collect()?;
-
-            found_checkpoint_version = find_complete_checkpoint_version(&window_files);
-            windows.push(window_files);
-
-            if found_checkpoint_version.is_some() {
-                break;
+        let search: KernelResult<Option<Version>> = (|| {
+            // The exclusive upper bound includes end_version in the first window.
+            // TODO(#3835): Handle the exclusive upper bound when end_version is Version::MAX.
+            let mut upper = end_version + 1;
+            while upper > 0 {
+                let lower = upper.saturating_sub(BACKWARD_SCAN_WINDOW_SIZE);
+                report.start_version = lower;
+                report.num_list_calls += 1;
+                let window_files: Vec<_> =
+                    list_delta_log_from_storage(storage, log_root, lower, upper - 1)?
+                        .inspect(|entry| {
+                            if entry.is_ok() {
+                                report.num_files_examined += 1;
+                            }
+                        })
+                        .try_collect()?;
+                let found = find_complete_checkpoint_version(&window_files);
+                windows.push(window_files);
+                if found.is_some() {
+                    return Ok(found);
+                }
+                upper = lower;
             }
-            upper = lower;
+            Ok(None)
+        })();
+        if let Ok(found) = &search {
+            report.outcome = CheckpointReadOutcome::Success;
+            report.checkpoint_version = *found;
         }
+        report.duration = started.elapsed();
+        report.emit();
+        let found_checkpoint_version = search?;
 
         let fs_iter = windows.into_iter().rev().flatten().map(Ok);
         let start = found_checkpoint_version.unwrap_or(0);

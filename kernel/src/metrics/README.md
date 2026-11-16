@@ -45,6 +45,10 @@ variants can carry success-only statistics or a failure-only reason without opti
 Existing success/failure event pairs also express that distinction; changing them requires an
 explicit compatibility decision.
 
+Checkpoint discovery and inspection use completion reports with an explicit outcome. A
+successful operation may find no checkpoint or sidecars. Their emit helpers supply the duration,
+including failed work, without a success-to-failure conversion.
+
 ## Adding an event
 
 1. Define the struct + `SPAN_NAME` in `events.rs`; add a `MetricEvent` variant and its
