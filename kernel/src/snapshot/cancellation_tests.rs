@@ -185,31 +185,56 @@ fn only_cancelled_crc_read_blocks_incremental_snapshot_build(
 }
 
 #[rstest]
-#[case::log_segment(Read::List)]
-#[case::protocol_metadata(Read::Crc)]
+#[case::fresh_log_segment(Read::List, false)]
+#[case::incremental_log_segment(Read::List, true)]
+#[case::protocol_metadata(Read::Crc, false)]
 fn engine_reported_cancellation_without_token_preserves_failure_duration(
     #[case] failed_read: Read,
+    #[case] incremental: bool,
 ) {
+    let (url, _temp) = stale_crc_table();
     let delay = Duration::from_millis(1);
     let mut reads = RecordingReads::new(Some(failed_read));
     let handler = Arc::get_mut(&mut reads).unwrap();
     handler.expected_token = None;
     handler.cancel_delay = delay;
+    let base = incremental.then(|| {
+        Snapshot::builder_for(&url)
+            .at_version(0)
+            .build(reads.inner.as_ref())
+            .unwrap()
+    });
     let reporter = Arc::new(CapturingReporter::default());
     let _guard = install_thread_local_metrics_reporter(reporter.clone());
-    let result = Snapshot::builder_for("tests/data/crc-full").build(&reads.engine());
+    let result = if let Some(base) = base {
+        Snapshot::builder_from(base).build(&reads.engine())
+    } else {
+        Snapshot::builder_for(url).build(&reads.engine())
+    };
     assert!(matches!(result, Err(Error::Kernel(KernelError::Cancelled))));
     assert_eq!(reads.events.lock().unwrap().last(), Some(&failed_read));
     let events = reporter.events();
-    let duration = events
+    let (duration, load_type) = events
         .iter()
         .find_map(|event| match (failed_read, event) {
-            (Read::List, MetricEvent::LogSegmentLoadFailure(event)) => Some(event.duration),
-            (Read::Crc, MetricEvent::ProtocolMetadataLoadFailure(event)) => Some(event.duration),
+            (Read::List, MetricEvent::LogSegmentLoadFailure(event)) => {
+                Some((event.duration, event.load_type))
+            }
+            (Read::Crc, MetricEvent::ProtocolMetadataLoadFailure(event)) => {
+                Some((event.duration, event.load_type))
+            }
             _ => None,
         })
         .expect("expected a metric for the failed operation");
     assert!(duration >= delay);
+    assert_eq!(
+        load_type,
+        if incremental {
+            LogSegmentLoadType::Incremental
+        } else {
+            LogSegmentLoadType::Full
+        }
+    );
     assert!(matches!(
         events.last(),
         Some(MetricEvent::SnapshotBuildFailure(event)) if event.duration >= duration
