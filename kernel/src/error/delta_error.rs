@@ -105,6 +105,15 @@ impl DeltaError {
         &self.backtrace
     }
 
+    /// Reports a replay commit that disables row tracking after a known enabled state.
+    pub fn row_tracking_disabled_in_range(version: Version, source: Option<BoxedError>) -> Self {
+        Self::new(
+            DeltaErrorCondition::DeltaChangelogRowTrackingDisabledInRange,
+            vec![DeltaErrorParameter::new("version", version)],
+            source,
+        )
+    }
+
     /// Reports the replay commit incompatible with the change feed's end-version read schema.
     pub fn change_data_feed_incompatible_schema_change(
         start: Version,

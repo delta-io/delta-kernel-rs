@@ -277,6 +277,9 @@ impl LogReplayScanner {
                 );
             }
 
+            let was_row_tracking_enabled =
+                table_configuration.is_feature_enabled(&TableFeature::RowTracking);
+
             // Update table configuration with any new Protocol or Metadata from this commit
             if has_metadata_update || has_protocol_update {
                 *table_configuration = TableConfiguration::try_new_from(
@@ -307,7 +310,20 @@ impl LogReplayScanner {
             if has_metadata_update {
                 require!(
                     table_configuration.is_feature_enabled(&mode.required_feature()),
-                    mode.feature_disabled_error(commit_file.version, *range.start(), *range.end())
+                    if mode == CdfMode::RowTracking && was_row_tracking_enabled {
+                        Error::Delta(DeltaError::row_tracking_disabled_in_range(
+                            commit_file.version,
+                            Some(Box::new(KernelError::row_tracking_change_feed_unsupported(
+                                commit_file.version,
+                            ))),
+                        ))
+                    } else {
+                        mode.feature_disabled_error(
+                            commit_file.version,
+                            *range.start(),
+                            *range.end(),
+                        )
+                    }
                 );
             }
 

@@ -14,6 +14,8 @@ use super::ConditionMetadata;
 pub enum DeltaErrorCondition {
     /// `DELTA_ADAPTIVE_METADATA_REQUIRES_COLUMN_MAPPING_ID_MODE` (SQLSTATE `42000`).
     DeltaAdaptiveMetadataRequiresColumnMappingIdMode,
+    /// `DELTA_CHANGELOG_ROW_TRACKING_DISABLED_IN_RANGE` (SQLSTATE `0AKDE`).
+    DeltaChangelogRowTrackingDisabledInRange,
     /// `DELTA_CHANGE_DATA_FEED_INCOMPATIBLE_SCHEMA_CHANGE` (SQLSTATE `0AKDC`).
     DeltaChangeDataFeedIncompatibleSchemaChange,
     /// `DELTA_DELETION_VECTOR_CHECKSUM_MISMATCH` (SQLSTATE `XXKDS`).
@@ -54,6 +56,12 @@ impl DeltaErrorCondition {
                 sql_state: Some("42000"),
                 parameter_names: &["feature", "prop", "mode"],
                 message_template: "The table feature '<feature>' requires column mapping mode 'id', but the table property '<prop>' is set to '<mode>'. Recreate the table with '<prop>' = 'id', or omit the property to have it set automatically.",
+            },
+            Self::DeltaChangelogRowTrackingDisabledInRange => ConditionMetadata {
+                name: "DELTA_CHANGELOG_ROW_TRACKING_DISABLED_IN_RANGE",
+                sql_state: Some("0AKDE"),
+                parameter_names: &["version"],
+                message_template: "Delta CDC requires row tracking to remain enabled across the requested range.\nCommit at version <version> disabled row tracking. Pick a starting/ending version that brackets a row-tracking-enabled state.",
             },
             Self::DeltaChangeDataFeedIncompatibleSchemaChange => ConditionMetadata {
                 name: "DELTA_CHANGE_DATA_FEED_INCOMPATIBLE_SCHEMA_CHANGE",
