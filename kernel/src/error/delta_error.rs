@@ -105,6 +105,15 @@ impl DeltaError {
         &self.backtrace
     }
 
+    /// Reports a stored deletion-vector size that differs from its descriptor.
+    pub fn deletion_vector_size_mismatch(source: Option<BoxedError>) -> Self {
+        Self::new(
+            DeltaErrorCondition::DeltaDeletionVectorSizeMismatch,
+            vec![],
+            source,
+        )
+    }
+
     /// Reports explicitly reversed bounds for a change-data-feed request.
     pub fn invalid_cdc_range(start: Version, end: Version, source: Option<BoxedError>) -> Self {
         Self::new(

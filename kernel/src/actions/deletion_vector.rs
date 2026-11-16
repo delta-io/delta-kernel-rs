@@ -18,7 +18,7 @@ use crate::path_encoding::uri_decode_path;
 use crate::schema::DataType;
 use crate::snapshot::Snapshot;
 use crate::utils::require;
-use crate::{KernelError, KernelResult, Scalar, StorageHandler};
+use crate::{DeltaError, Error, KernelError, KernelResult, Scalar, StorageHandler};
 
 /// Magic number for portable RoaringBitmap serialization format.
 /// This is the standard format defined in the RoaringBitmap Specification
@@ -617,9 +617,11 @@ impl DeletionVectorDescriptor {
                 let dv_size = read_u32(&mut cursor, Endian::Big)?;
                 require!(
                     dv_size == size_in_bytes,
-                    KernelError::DeletionVector(format!(
-                        "DV size mismatch for {path}. Log indicates {size_in_bytes}, file says: {dv_size}"
-                    ))
+                    Error::Delta(DeltaError::deletion_vector_size_mismatch(Some(Box::new(
+                        KernelError::DeletionVector(format!(
+                            "DV size mismatch for {path}. Log indicates {size_in_bytes}, file says: {dv_size}"
+                        ))
+                    ))))
                 );
                 let magic = read_u32(&mut cursor, Endian::Little)?;
                 require!(
@@ -1259,6 +1261,62 @@ mod tests {
         let err = inline.read(storage, &parent).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("Native serialization in inline bitmaps is not yet supported"));
+    }
+
+    #[rstest::rstest]
+    #[case::size(false, false)]
+    #[case::framing_precedes_size(true, false)]
+    #[case::size_precedes_magic(false, true)]
+    fn deletion_vector_size_classification_preserves_precedence(
+        #[case] invalid_framing: bool,
+        #[case] invalid_magic: bool,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = Url::from_directory_path(dir.path()).unwrap();
+        let descriptor = dv_example();
+        let mut bytes = std::fs::read(
+            "tests/data/table-with-dv-small/deletion_vector_61d16c75-6994-46b7-a15b-8b538852e50e.bin"
+        ).unwrap();
+        bytes[1..5].copy_from_slice(&99_u32.to_be_bytes());
+        if invalid_framing {
+            bytes[0] = 2;
+        }
+        if invalid_magic {
+            bytes[5..9].fill(0);
+        }
+        let path = descriptor.absolute_path(&parent).unwrap().unwrap();
+        std::fs::write(path.to_file_path().unwrap(), bytes).unwrap();
+        let engine = SyncEngine::new();
+        let error = descriptor
+            .read(engine.storage_handler(), &parent)
+            .unwrap_err();
+        if invalid_framing {
+            assert!(matches!(
+                error,
+                Error::Kernel(KernelError::DeletionVector(_))
+            ));
+        } else {
+            let Error::Delta(error) = error else {
+                panic!("expected Delta size error")
+            };
+            assert_eq!(error.name(), "DELTA_DELETION_VECTOR_SIZE_MISMATCH");
+            assert_eq!(error.sql_state(), Some("XXKDS"));
+            assert!(error.parameters().is_empty());
+            let source = std::error::Error::source(&error)
+                .unwrap()
+                .downcast_ref::<KernelError>()
+                .unwrap();
+            assert!(
+                matches!(source, KernelError::DeletionVector(message) if message.contains(path.as_str()) && message.contains("99"))
+            );
+            let info = DvInfo {
+                deletion_vector: Some(descriptor),
+            };
+            assert!(matches!(
+                info.get_row_indexes(&engine, &parent),
+                Err(Error::Delta(_))
+            ));
+        }
     }
 
     #[test]
