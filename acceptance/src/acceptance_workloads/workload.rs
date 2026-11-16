@@ -98,7 +98,7 @@ pub fn execute_read_workload(
     // Execute scan and apply row-level filtering
     let batches: Vec<RecordBatch> = scan
         .execute(engine)?
-        .map(|data| data?.try_into_record_batch())
+        .map(|data| data.and_then(|data| data.try_into_record_batch().map_err(Into::into)))
         .try_collect()?;
     let batches = filter_batches_with_predicate(batches, predicate.as_deref())?;
     let batches = match read_spec.columns.as_deref() {

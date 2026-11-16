@@ -14,7 +14,7 @@ use delta_kernel::object_store::ObjectStoreExt as _;
 use delta_kernel::scan::StatsOptions;
 use delta_kernel::schema::schema_ref;
 use delta_kernel::transaction::{CommitResult, UpdateTableOperation};
-use delta_kernel::{EngineData, KernelError, KernelResult, KernelResultIterator, Snapshot};
+use delta_kernel::{EngineData, KernelError, KernelResult, Result, Snapshot};
 use itertools::Itertools;
 use tempfile::tempdir;
 use test_utils::{
@@ -51,8 +51,8 @@ async fn write_parquet_file(
 }
 
 fn count_total_scan_rows(
-    scan_result_iter: impl KernelResultIterator<Box<dyn EngineData>>,
-) -> KernelResult<usize> {
+    scan_result_iter: impl Iterator<Item = Result<Box<dyn EngineData>>> + Send,
+) -> Result<usize> {
     scan_result_iter
         .map(|result| Ok(result?.len()))
         .fold_ok(0, Add::add)
@@ -318,7 +318,7 @@ async fn test_write_deletion_vectors_end_to_end() -> delta_kernel::Result<()> {
     // Collect all rows to verify content
     let batches: Vec<_> = stream
         .map(|result| result.map(into_record_batch))
-        .collect::<KernelResult<Vec<_>>>()?;
+        .collect::<Result<Vec<_>>>()?;
 
     // Verify the correct rows remain
     // File 1: all except 1, 2, 5, 7 => 0, 3, 4, 6, 8, 9
@@ -413,7 +413,7 @@ async fn test_scan_reads_puffin_framed_deletion_vector()
     let batches: Vec<_> = scan
         .execute(engine.clone())?
         .map(|result| result.map(into_record_batch))
-        .collect::<KernelResult<Vec<_>>>()?;
+        .collect::<Result<Vec<_>>>()?;
     verify_sorted_scan_results(
         batches,
         vec![1, 2, 3, 4, 5, 6, 7, 8],

@@ -171,7 +171,7 @@ async fn latest_snapshot_test(
     let scan = snapshot.scan_builder().build()?;
     let scan_res = scan.execute(Arc::new(engine))?;
     let batches: Vec<RecordBatch> = scan_res
-        .map(EngineDataArrowExt::try_into_record_batch)
+        .map(|batch| batch.and_then(|batch| batch.try_into_record_batch().map_err(Into::into)))
         .try_collect()?;
 
     let expected = read_expected(&expected_path.expect("expect an expected dir")).await?;

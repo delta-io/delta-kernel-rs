@@ -4862,8 +4862,8 @@ mod tests {
         let scan_after = snapshot.scan_builder().build()?;
         let total: usize = scan_after
             .execute(kernel_engine.clone())?
-            .map(|r| Ok::<_, delta_kernel::KernelError>(r?.len()))
-            .sum::<KernelResult<_>>()?;
+            .map(|r| r.map(|data| data.len()))
+            .sum::<delta_kernel::Result<_>>()?;
         assert_eq!(total, 2, "expected 2 surviving rows");
 
         unsafe {

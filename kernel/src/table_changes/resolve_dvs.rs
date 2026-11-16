@@ -3,7 +3,7 @@ use url::Url;
 use super::scan_file::CdfScanFileType;
 use crate::actions::deletion_vector::{deletion_treemap_to_bools, selection_treemap_to_bools};
 use crate::table_changes::scan_file::CdfScanFile;
-use crate::{Engine, KernelError, KernelResult};
+use crate::{Engine, Error, KernelError, Result};
 
 /// A [`CdfScanFile`] with its associated `selection_vector`. The `scan_type` is resolved to
 /// match the `_change_type` that its rows will have in the change data feed.
@@ -37,7 +37,7 @@ pub(crate) fn resolve_scan_file_dv(
     engine: &dyn Engine,
     table_root: &Url,
     scan_file: CdfScanFile,
-) -> KernelResult<impl Iterator<Item = ResolvedCdfScanFile> + use<>> {
+) -> Result<impl Iterator<Item = ResolvedCdfScanFile> + use<>> {
     let add_dv = scan_file.dv_info.get_treemap(engine, table_root)?;
     let rm_dv = scan_file
         .remove_dv
@@ -46,14 +46,14 @@ pub(crate) fn resolve_scan_file_dv(
         .transpose()?;
     let (add_dv, rm_dv) = match (add_dv, rm_dv, &scan_file.scan_type) {
         (_, Some(_), CdfScanFileType::Remove) => {
-            return Err(KernelError::generic(
+            return Err(Error::Kernel(KernelError::generic(
                 "CdfScanFile with type remove cannot have a remove deletion vector",
-            ));
+            )));
         }
         (_, Some(_), CdfScanFileType::Cdc) => {
-            return Err(KernelError::generic(
+            return Err(Error::Kernel(KernelError::generic(
                 "CdfScanFile with type cdc cannot have a remove deletion vector",
-            ));
+            )));
         }
         (add_dv, Some(rm_dv), CdfScanFileType::Add) => {
             let add_dv = add_dv.unwrap_or_else(Default::default);

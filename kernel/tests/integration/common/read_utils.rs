@@ -26,7 +26,7 @@ pub fn read_row_tracking_scan(
         .scan_builder()
         .with_schema(Arc::new(scan_schema))
         .build()?;
-    Ok(read_scan(&scan, engine)?)
+    read_scan(&scan, engine)
 }
 
 pub fn read_parquet_file(path: &std::path::Path) -> RecordBatch {
