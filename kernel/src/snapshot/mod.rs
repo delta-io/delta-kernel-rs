@@ -1755,7 +1755,7 @@ impl Snapshot {
         fields(report, operation_id = %MetricId::new(), version = self.version(), outcome, mode,
             duration_ns, bytes_written, num_add_files, num_remove_files, num_actions, num_sidecars,
             input_duration_ns, reconciliation_duration_ns, stats_transform_duration_ns,
-            output_preparation_duration_ns, num_log_rows, num_checkpoint_rows),
+            output_preparation_duration_ns, num_actions_from_log_tail, num_actions_from_checkpoint),
         err
     )]
     pub fn checkpoint(

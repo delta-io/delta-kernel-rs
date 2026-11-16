@@ -471,8 +471,8 @@ mod tests {
                 reconciliation_duration_ns = Empty,
                 stats_transform_duration_ns = Empty,
                 output_preparation_duration_ns = Empty,
-                num_log_rows = Empty,
-                num_checkpoint_rows = Empty,
+                num_actions_from_log_tail = Empty,
+                num_actions_from_checkpoint = Empty,
             );
             let _entered = span.enter();
             span.record("mode", "v2_with_sidecars");
@@ -487,8 +487,8 @@ mod tests {
                 ("reconciliation_duration_ns", 2),
                 ("stats_transform_duration_ns", 3),
                 ("output_preparation_duration_ns", 4),
-                ("num_log_rows", 5),
-                ("num_checkpoint_rows", 6),
+                ("num_actions_from_log_tail", 5),
+                ("num_actions_from_checkpoint", 6),
             ] {
                 span.record(name, value);
             }
@@ -504,7 +504,7 @@ mod tests {
                 event.duration,
                 event.operation_id,
                 event.version,
-                event.processing,
+                event.processing_stats,
             ),
             (MetricEvent::CheckpointWriteSuccess(event), false) => {
                 assert_eq!(
@@ -524,7 +524,7 @@ mod tests {
                     event.duration,
                     event.operation_id,
                     event.version,
-                    event.processing,
+                    event.processing_stats,
                 )
             }
             (event, _) => panic!("unexpected checkpoint metric: {event:?}"),
@@ -540,8 +540,8 @@ mod tests {
                 reconciliation_duration: Duration::from_nanos(2),
                 stats_transform_duration: Duration::from_nanos(3),
                 output_preparation_duration: Duration::from_nanos(4),
-                num_log_rows: 5,
-                num_checkpoint_rows: 6,
+                num_actions_from_log_tail: 5,
+                num_actions_from_checkpoint: 6,
             }
         );
     }

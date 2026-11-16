@@ -55,6 +55,7 @@ async fn checkpoint_reports_reconciled_counts_and_stored_bytes(
     #[case] mode: CheckpointWriteMode,
     #[case] num_sidecars: u64,
     #[values(false, true)] previous_checkpoint: bool,
+    #[values(1, 16)] batch_size: usize,
 ) -> delta_kernel::Result<()> {
     let features = if v2 {
         FeatureSet::new().v2_checkpoint()
@@ -71,7 +72,7 @@ async fn checkpoint_reports_reconciled_counts_and_stored_bytes(
         .build()?;
     let reporter = Arc::new(CapturingReporter::default());
     let _guard = install_thread_local_metrics_reporter(reporter.clone());
-    let engine = checkpoint_engine(&table);
+    let engine = checkpoint_engine(&table, batch_size);
     let first_data = Snapshot::builder_for(table.table_root())
         .at_version(1)
         .build(engine.as_ref())?;
@@ -99,11 +100,20 @@ async fn checkpoint_reports_reconciled_counts_and_stored_bytes(
     let operation_id = event.operation_id;
     assert_ne!(operation_id.as_bytes(), [0; 16]);
     assert_eq!(event.version, snapshot.version());
-    let processing = &event.processing;
-    assert_eq!(processing.num_checkpoint_rows > 0, previous_checkpoint);
-    assert!(processing.num_log_rows > 0);
-    // Include input rows discarded by reconciliation.
-    assert!(processing.num_log_rows + processing.num_checkpoint_rows > 4);
+    let processing = &event.processing_stats;
+    // Include input actions discarded by reconciliation.
+    let expected_counts = match (previous_checkpoint, v2) {
+        (false, _) => (9, 0),
+        (true, false) => (4, 3),
+        (true, true) => (4, 4),
+    };
+    assert_eq!(
+        (
+            processing.num_actions_from_log_tail,
+            processing.num_actions_from_checkpoint,
+        ),
+        expected_counts,
+    );
     assert!(processing.input_duration > Duration::ZERO);
     assert!(processing.reconciliation_duration > Duration::ZERO);
     assert!(processing.stats_transform_duration > Duration::ZERO);
@@ -166,7 +176,7 @@ async fn checkpoint_reports_reconciled_counts_and_stored_bytes(
     assert_eq!(event.mode, CheckpointWriteMode::NotAttempted);
     assert_ne!(event.operation_id, operation_id);
     assert_eq!(event.version, snapshot.version());
-    assert_eq!(event.processing, CheckpointProcessingStats::default());
+    assert_eq!(event.processing_stats, CheckpointProcessingStats::default());
     Ok(())
 }
 
@@ -177,7 +187,7 @@ async fn sidecar_mode_with_no_file_actions_reports_zero_sidecars() -> delta_kern
         .build()?;
     let reporter = Arc::new(CapturingReporter::default());
     let _guard = install_thread_local_metrics_reporter(reporter.clone());
-    let engine = checkpoint_engine(&table);
+    let engine = checkpoint_engine(&table, 1);
     let snapshot = Snapshot::builder_for(table.table_root()).build(engine.as_ref())?;
     let (result, _checkpointed) = snapshot.checkpoint(
         engine.as_ref(),
@@ -226,7 +236,7 @@ async fn invalid_checkpoint_spec_reports_error_without_selecting_mode(
         .build()?;
     let reporter = Arc::new(CapturingReporter::default());
     let _guard = install_thread_local_metrics_reporter(reporter.clone());
-    let engine = checkpoint_engine(&table);
+    let engine = checkpoint_engine(&table, 1);
     let snapshot = Snapshot::builder_for(table.table_root()).build(engine.as_ref())?;
 
     assert!(snapshot.checkpoint(engine.as_ref(), Some(&spec)).is_err());
@@ -239,7 +249,7 @@ async fn invalid_checkpoint_spec_reports_error_without_selecting_mode(
     assert_eq!(event.mode, CheckpointWriteMode::NotAttempted);
     assert_ne!(event.operation_id.as_bytes(), [0; 16]);
     assert_eq!(event.version, snapshot.version());
-    assert_eq!(event.processing, CheckpointProcessingStats::default());
+    assert_eq!(event.processing_stats, CheckpointProcessingStats::default());
     Ok(())
 }
 
@@ -255,7 +265,7 @@ async fn checkpoint_duration_includes_data_writes_and_excludes_hint_writes(
     let _guard = install_thread_local_metrics_reporter(reporter.clone());
     let checkpoint_delay = Duration::from_millis(20);
     let engine = ControlledCheckpointEngine::new(
-        checkpoint_engine(&table),
+        checkpoint_engine(&table, 1),
         checkpoint_delay,
         None,
         Duration::from_millis(40),
@@ -274,7 +284,7 @@ async fn checkpoint_duration_includes_data_writes_and_excludes_hint_writes(
         let MetricEvent::CheckpointWriteFailure(event) = &events[0] else {
             panic!("expected CheckpointWriteFailure");
         };
-        (event.mode, event.duration, &event.processing)
+        (event.mode, event.duration, &event.processing_stats)
     } else {
         assert_eq!(result?.0, CheckpointWriteResult::Written);
         let MetricEvent::CheckpointWriteSuccess(event) = &events[0] else {
@@ -284,11 +294,11 @@ async fn checkpoint_duration_includes_data_writes_and_excludes_hint_writes(
             panic!("expected Written");
         };
         assert_eq!(stats.num_add_files, 1);
-        (event.mode, event.duration, &event.processing)
+        (event.mode, event.duration, &event.processing_stats)
     };
     assert_eq!(mode, CheckpointWriteMode::V1);
-    assert_eq!(processing.num_log_rows, 5);
-    assert_eq!(processing.num_checkpoint_rows, 0);
+    assert_eq!(processing.num_actions_from_log_tail, 5);
+    assert_eq!(processing.num_actions_from_checkpoint, 0);
     assert_processing_within_duration(processing, duration);
     assert!(duration >= checkpoint_delay);
     let hint_duration = engine.json.hint_duration.lock().unwrap().unwrap();
@@ -306,7 +316,7 @@ async fn checkpoint_input_timing_includes_setup_sidecar_peek_and_failing_pulls(
         .with_features(FeatureSet::new().v2_checkpoint())
         .with_log_state(LogState::with_latest_version(1))
         .build()?;
-    let inner = checkpoint_engine(&table);
+    let inner = checkpoint_engine(&table, 1);
     let reporter = Arc::new(CapturingReporter::default());
     let _guard = install_thread_local_metrics_reporter(reporter.clone());
     let snapshot = Snapshot::builder_for(table.table_root()).build(inner.as_ref())?;
@@ -331,8 +341,8 @@ async fn checkpoint_input_timing_includes_setup_sidecar_peek_and_failing_pulls(
     let (processing, duration, operation_id) = match &events[0] {
         MetricEvent::CheckpointWriteSuccess(event) if fail_after.is_none() => {
             assert_eq!(result?.0, CheckpointWriteResult::Written);
-            assert_eq!(event.processing.num_log_rows, 5);
-            (&event.processing, event.duration, event.operation_id)
+            assert_eq!(event.processing_stats.num_actions_from_log_tail, 5);
+            (&event.processing_stats, event.duration, event.operation_id)
         }
         MetricEvent::CheckpointWriteFailure(event) if fail_after.is_some() => {
             assert!(
@@ -342,14 +352,14 @@ async fn checkpoint_input_timing_includes_setup_sidecar_peek_and_failing_pulls(
                     .contains("injected input failure")
             );
             let consumed = fail_after.unwrap() as u64;
-            assert_eq!(event.processing.num_log_rows, consumed);
-            (&event.processing, event.duration, event.operation_id)
+            assert_eq!(event.processing_stats.num_actions_from_log_tail, consumed);
+            (&event.processing_stats, event.duration, event.operation_id)
         }
         event => panic!("unexpected checkpoint event: {event:?}"),
     };
-    assert_eq!(processing.num_checkpoint_rows, 0);
+    assert_eq!(processing.num_actions_from_checkpoint, 0);
     // One delay for setup, one per row, and one for the final or failing pull.
-    assert!(processing.input_duration >= delay * (processing.num_log_rows as u32 + 2));
+    assert!(processing.input_duration >= delay * (processing.num_actions_from_log_tail as u32 + 2));
     assert_processing_within_duration(processing, duration);
 
     // Reuse the snapshot for a fresh attempt to detect state leaking across calls.
@@ -361,8 +371,8 @@ async fn checkpoint_input_timing_includes_setup_sidecar_peek_and_failing_pulls(
         panic!("expected successful retry");
     };
     assert_ne!(event.operation_id, operation_id);
-    assert_eq!(event.processing.num_log_rows, 5);
-    assert_eq!(event.processing.num_checkpoint_rows, 0);
+    assert_eq!(event.processing_stats.num_actions_from_log_tail, 5);
+    assert_eq!(event.processing_stats.num_actions_from_checkpoint, 0);
     Ok(())
 }
 
@@ -378,7 +388,7 @@ async fn checkpoint_write_errors_preserve_mode_and_duration(
     let _guard = install_thread_local_metrics_reporter(reporter.clone());
     let delay = Duration::from_millis(20);
     let engine = ControlledCheckpointEngine::new(
-        checkpoint_engine(&table),
+        checkpoint_engine(&table, 1),
         delay,
         Some(error),
         Duration::ZERO,
@@ -422,7 +432,7 @@ async fn checkpoint_with_newer_hint_reports_written_without_publishing_hint()
     let reporter = Arc::new(CapturingReporter::default());
     let _guard = install_thread_local_metrics_reporter(reporter.clone());
     let engine = ControlledCheckpointEngine::new(
-        checkpoint_engine(&table),
+        checkpoint_engine(&table, 1),
         Duration::ZERO,
         None,
         Duration::ZERO,
@@ -452,13 +462,13 @@ async fn checkpoint_with_newer_hint_reports_written_without_publishing_hint()
     Ok(())
 }
 
-fn checkpoint_engine(table: &TestTable) -> Arc<dyn Engine> {
+fn checkpoint_engine(table: &TestTable, batch_size: usize) -> Arc<dyn Engine> {
     Arc::new(
         DefaultEngineBuilder::new(table.store().clone())
             .with_task_executor(Arc::new(TokioMultiThreadExecutor::new(
                 tokio::runtime::Handle::current(),
             )))
-            .with_batch_size(NonZeroUsize::new(1).unwrap())
+            .with_batch_size(NonZeroUsize::new(batch_size).unwrap())
             .build(),
     )
 }

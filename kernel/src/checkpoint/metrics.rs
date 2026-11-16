@@ -1,7 +1,7 @@
 //! Collects batch processing metrics for one [`crate::Snapshot::checkpoint`] attempt.
 //!
 //! Clones share timers for input, reconciliation, statistics transforms, and output preparation,
-//! plus row counts from the log and previous checkpoint. See
+//! plus input action counts from the log tail and previous checkpoint. See
 //! [`crate::metrics::CheckpointProcessingStats`] for the timing and counting boundaries.
 //! A report guard records the accumulated values when the attempt ends, including on early returns.
 
@@ -13,7 +13,10 @@ use tracing::Span;
 
 use crate::log_replay::ActionsBatch;
 
-/// Shared only by the batch pipeline of one checkpoint attempt. Custom writer calls leave it off.
+/// Shared by the batch pipeline of one [`crate::Snapshot::checkpoint`] attempt.
+///
+/// [`super::CheckpointWriter::checkpoint_data`] uses a disabled collector: that API leaves writing
+/// and finalization to the caller and does not emit a checkpoint-write metric event.
 #[derive(Clone, Default)]
 pub(crate) struct CheckpointMetrics(Option<Arc<CheckpointCounters>>);
 
@@ -53,18 +56,34 @@ impl CheckpointMetrics {
     pub(crate) fn record_input(&self, batch: &ActionsBatch) {
         let Some(counters) = &self.0 else { return };
         let rows = if batch.is_log_batch {
-            &counters.num_log_rows
+            &counters.num_actions_from_log_tail
         } else {
-            &counters.num_checkpoint_rows
+            &counters.num_actions_from_checkpoint
         };
         rows.fetch_add(batch.actions.len() as u64, Ordering::Relaxed);
     }
 }
 
+/// Timed sections of checkpoint batch production.
+///
+/// Each section excludes pulls from earlier stages. Timers record elapsed time on scope exit,
+/// including error returns; [`Self::Input`] times input setup and iterator pulls themselves.
 pub(crate) enum CheckpointPhase {
+    /// Building the input through `LogSegment::read_actions` and advancing its iterator over log,
+    /// checkpoint, and sidecar batches. Includes final and failing pulls, plus input consumed by
+    /// collation sampling and the first sidecar peek.
     Input,
+    /// Processing each received batch with `ActionReconciliationProcessor`, before dropping batches
+    /// with no selected rows. Includes action deduplication, retention checks, and selection-vector
+    /// construction. Input iterator calls have already completed.
     Reconciliation,
+    /// Evaluating statistics and partition-value transforms on reconciled batches with selected
+    /// rows, including wrapping the result in `FilteredEngineData`. Excludes evaluator setup and
+    /// the checkpoint metadata action generated for V2 output, which bypasses these transforms.
     StatsTransform,
+    /// Preparing an output batch after its upstream iterator returns. Without sidecars, covers
+    /// selection-vector application. With sidecars, also covers both action pickers and buffering
+    /// non-file batches in `SidecarSplitter`. Excludes Parquet encoding and storage writes.
     OutputPreparation,
 }
 
@@ -88,8 +107,8 @@ struct CheckpointCounters {
     reconciliation_duration_ns: AtomicU64,
     stats_transform_duration_ns: AtomicU64,
     output_preparation_duration_ns: AtomicU64,
-    num_log_rows: AtomicU64,
-    num_checkpoint_rows: AtomicU64,
+    num_actions_from_log_tail: AtomicU64,
+    num_actions_from_checkpoint: AtomicU64,
 }
 
 struct CheckpointMetricsReport<'a> {
@@ -117,8 +136,14 @@ impl Drop for CheckpointMetricsReport<'_> {
                 "output_preparation_duration_ns",
                 &counters.output_preparation_duration_ns,
             ),
-            ("num_log_rows", &counters.num_log_rows),
-            ("num_checkpoint_rows", &counters.num_checkpoint_rows),
+            (
+                "num_actions_from_log_tail",
+                &counters.num_actions_from_log_tail,
+            ),
+            (
+                "num_actions_from_checkpoint",
+                &counters.num_actions_from_checkpoint,
+            ),
         ] {
             self.span.record(name, counter.load(Ordering::Relaxed));
         }
