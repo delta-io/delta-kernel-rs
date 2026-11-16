@@ -46,7 +46,7 @@ use crate::unit_test_utils::adaptive_metadata_fixtures::{
     checkpoint_line, commit_info_line, last_manifest_commit_info, protocol_and_metadata_lines,
 };
 #[cfg(feature = "declarative-plans")]
-use crate::unit_test_utils::plans::ScanOnlyPlanExecutor;
+use crate::unit_test_utils::plans::IOOnlyPlanExecutor;
 use crate::unit_test_utils::{
     adaptive_metadata_table_configuration, parse_json_batch, test_schema_flat_with_column_mapping,
 };
@@ -155,7 +155,7 @@ fn non_plan_engine(store: Arc<InMemory>) -> impl Engine {
 fn hybrid_engine(store: Arc<InMemory>) -> PlanBasedEngine {
     PlanBasedEngine::new(
         None,
-        Arc::new(ScanOnlyPlanExecutor(SyncPlanExecutor::new(Some(store)))),
+        Arc::new(IOOnlyPlanExecutor(SyncPlanExecutor::new(Some(store)))),
     )
 }
 
