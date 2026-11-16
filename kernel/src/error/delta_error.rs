@@ -6,7 +6,7 @@ use std::fmt;
 
 use super::{BoxedError, DeltaErrorCondition};
 use crate::Version;
-use crate::schema::StructType;
+use crate::schema::{DataType, StructType};
 use crate::table_properties::{ENABLE_CHANGE_DATA_FEED, LOG_RETENTION_DURATION};
 #[cfg(any(test, feature = "test-utils"))]
 use crate::{KernelError, KernelResult};
@@ -103,6 +103,22 @@ impl DeltaError {
     /// disabled unless `RUST_BACKTRACE` or `RUST_LIB_BACKTRACE` enables it.
     pub fn backtrace(&self) -> &Backtrace {
         &self.backtrace
+    }
+
+    /// Reports an active file's partition value that cannot be read as the expected type.
+    pub fn failed_cast_partition_value(
+        value: &str,
+        data_type: &DataType,
+        source: Option<BoxedError>,
+    ) -> Self {
+        Self::new(
+            DeltaErrorCondition::DeltaFailedCastPartitionValue,
+            vec![
+                DeltaErrorParameter::new("value", value),
+                DeltaErrorParameter::new("dataType", data_type),
+            ],
+            source,
+        )
     }
 
     /// Reports a replay commit that disables row tracking after a known enabled state.
@@ -495,7 +511,7 @@ mod tests {
     use rstest::rstest;
 
     use super::{DeltaError, DeltaErrorParameter, render_template};
-    use crate::schema::StructType;
+    use crate::schema::{DataType, StructType};
     use crate::table_features::ColumnMappingMode;
     use crate::{BoxedError, DeltaErrorCondition, Error, KernelError, Result};
 

@@ -32,7 +32,7 @@ use delta_kernel::schema::{
 };
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
-use delta_kernel::{KernelError, Snapshot, SnapshotRef};
+use delta_kernel::{Error, KernelError, Snapshot, SnapshotRef};
 use rstest::rstest;
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -1178,9 +1178,23 @@ async fn scan_with_replace_table_schema_change(
     }
     let error = surviving_paths(&table_path, engine, predicate, use_parallel)
         .expect_err("an active incompatible add file should fail the scan");
+    let Some(Error::Delta(error)) = error.downcast_ref::<Error>() else {
+        panic!("expected active partition Delta error: {error}");
+    };
+    assert_eq!(error.name(), "DELTA_FAILED_CAST_PARTITION_VALUE");
+    assert_eq!(error.sql_state(), Some("22018"));
+    assert_eq!(
+        error.parameters()[0].value(),
+        "not-an-integer-active-partition"
+    );
+    assert_eq!(error.parameters()[1].value(), "long");
+    let source = std::error::Error::source(error)
+        .unwrap()
+        .downcast_ref::<KernelError>()
+        .unwrap();
     assert!(matches!(
-        error.downcast_ref::<KernelError>(),
-        Some(KernelError::ParseError(_, _))
+        source.without_backtrace(),
+        KernelError::ParseError(_, _)
     ));
     Ok(())
 }
