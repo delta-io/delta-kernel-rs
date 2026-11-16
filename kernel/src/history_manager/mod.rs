@@ -634,7 +634,11 @@ pub fn first_version_after(
 /// let (start_version, end_version) =
 ///     timestamp_range_to_versions(&snapshot, &engine, start_timestamp, Some(end_timestamp))?;
 /// ```
-#[tracing::instrument(skip(snapshot, engine), ret, fields(latest_version = snapshot.version(), table_root = %snapshot.table_root()))]
+#[tracing::instrument(
+    skip(snapshot, engine),
+    ret,
+    fields(enable_call_frame, latest_version = snapshot.version(), table_root = %snapshot.table_root())
+)]
 pub fn timestamp_range_to_versions(
     snapshot: &Snapshot,
     engine: &dyn Engine,
