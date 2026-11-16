@@ -16,7 +16,7 @@ use crate::engine_data::{FilteredRowVisitor, GetData, RowIndexIterator, TypedGet
 use crate::scan::get_transform_for_row;
 use crate::schema::{ColumnName, ColumnNamesAndTypes, DataType, Schema, SchemaRef};
 use crate::utils::require;
-use crate::{Engine, EngineData, ExpressionRef, KernelError, KernelResult};
+use crate::{Engine, EngineData, ExpressionRef, KernelError, KernelResult, Result};
 
 /// Deletion-vector metadata used by an engine to materialize a selection vector.
 ///
@@ -64,7 +64,7 @@ impl DvInfo {
         &self,
         engine: &dyn Engine,
         table_root: &url::Url,
-    ) -> KernelResult<Option<RoaringTreemap>> {
+    ) -> Result<Option<RoaringTreemap>> {
         self.deletion_vector
             .as_ref()
             .map(|dv_descriptor| {
@@ -78,7 +78,7 @@ impl DvInfo {
         &self,
         engine: &dyn Engine,
         table_root: &url::Url,
-    ) -> KernelResult<Option<Vec<bool>>> {
+    ) -> Result<Option<Vec<bool>>> {
         let dv_treemap = self.get_treemap(engine, table_root)?;
         Ok(dv_treemap.map(deletion_treemap_to_bools))
     }
@@ -88,7 +88,7 @@ impl DvInfo {
         &self,
         engine: &dyn Engine,
         table_root: &url::Url,
-    ) -> KernelResult<Option<Vec<u64>>> {
+    ) -> Result<Option<Vec<u64>>> {
         self.deletion_vector
             .as_ref()
             .map(|dv| {

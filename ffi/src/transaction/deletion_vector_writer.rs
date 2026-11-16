@@ -1122,7 +1122,7 @@ mod tests {
                 .build()?
                 .execute(engine.clone())?
                 .map(|batch| batch.map(|data| data.len()))
-                .collect::<KernelResult<Vec<_>>>()?
+                .collect::<delta_kernel::Result<Vec<_>>>()?
                 .into_iter()
                 .sum::<usize>(),
             6

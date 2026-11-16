@@ -1215,10 +1215,10 @@ pub async fn setup_test_tables(
     ])
 }
 
-pub fn read_scan(scan: &Scan, engine: Arc<dyn Engine>) -> KernelResult<Vec<RecordBatch>> {
+pub fn read_scan(scan: &Scan, engine: Arc<dyn Engine>) -> Result<Vec<RecordBatch>> {
     let scan_results = scan.execute(engine)?;
     scan_results
-        .map(EngineDataArrowExt::try_into_record_batch)
+        .map(|batch| batch.and_then(|batch| batch.try_into_record_batch().map_err(Into::into)))
         .try_collect()
 }
 

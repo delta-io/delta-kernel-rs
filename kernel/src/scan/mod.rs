@@ -1739,13 +1739,13 @@ impl Scan {
     pub fn execute(
         &self,
         engine: Arc<dyn Engine>,
-    ) -> KernelResult<impl KernelResultIterator<Box<dyn EngineData>> + use<>> {
+    ) -> Result<impl Iterator<Item = Result<Box<dyn EngineData>>> + Send + use<>> {
         if self.state_info.skip_row_transforms {
-            return Err(KernelError::unsupported(
+            return Err(Error::Kernel(KernelError::unsupported(
                 "Scan::execute is not supported when row transforms are disabled by \
                  without_row_transforms or by with_timestamp_timezone on a table with TIMESTAMP \
                  partition columns; use scan_metadata for listing and read data with your own reader",
-            ));
+            )));
         }
 
         fn scan_metadata_callback(batches: &mut Vec<state::ScanFile>, file: state::ScanFile) {
@@ -1772,9 +1772,9 @@ impl Scan {
         let physical_schema = self.physical_schema().clone();
         let logical_schema = self.logical_schema().clone();
         let result = scan_files_iter
-            .map(move |scan_file| -> KernelResult<_> {
+            .map(move |scan_file| -> Result<_> {
                 let scan_file = scan_file?;
-                let file_path = table_root.join(&scan_file.path)?;
+                let file_path = table_root.join(&scan_file.path).map_err(KernelError::from)?;
                 let mut selection_vector = scan_file
                     .dv_info
                     .get_selection_vector(engine.as_ref(), &table_root)?;
@@ -1805,18 +1805,18 @@ impl Scan {
                 // 0-row file from a buggy connector, so we conservatively allow it.
                 let expect_data = scan_file.stats.as_ref().is_some_and(|s| s.num_records > 0);
                 if expect_data && read_result_iter.peek().is_none() {
-                    return Err(KernelError::internal_error(format!(
+                    return Err(Error::Kernel(KernelError::internal_error(format!(
                         "ParquetHandler returned no data for file '{}'. This is likely a connector \
                          bug -- the handler's read_parquet_files must return at least one batch for \
                          each requested file that contains rows.",
                         scan_file.path
-                    )));
+                    ))));
                 }
 
                 let engine = engine.clone(); // Arc clone
                 let physical_schema_inner = physical_schema.clone();
                 let logical_schema_inner = logical_schema.clone();
-                Ok(read_result_iter.map(move |read_result| -> KernelResult<_> {
+                Ok(read_result_iter.map(move |read_result| -> Result<_> {
                     let read_result = read_result?;
                     // transform the physical data into the correct logical form
                     let logical = state::transform_to_logical(
@@ -1837,13 +1837,13 @@ impl Scan {
                         logical.and_then(|data| data.apply_selection_vector(sv))
                     });
                     selection_vector = rest;
-                    result
+                    result.map_err(Error::Kernel)
                 }))
             })
             // Iterator<Result<Iterator<Result<Box<dyn EngineData>>>>> to Iterator<Result<Result<Box<dyn EngineData>>>>
             .flatten_ok()
             // Iterator<Result<Result<Box<dyn EngineData>>>> to Iterator<Result<Box<dyn EngineData>>>
-            .map(KernelResult::flatten);
+            .map(Result::flatten);
         Ok(result)
     }
 }
@@ -1880,11 +1880,13 @@ pub fn scan_row_schema() -> SchemaRef {
     log_replay::SCAN_ROW_SCHEMA.clone()
 }
 
+/// Reads a deletion vector into a selection mask, where `false` marks a deleted row.
+/// Rows beyond the returned mask are selected.
 pub fn selection_vector(
     engine: &dyn Engine,
     descriptor: &DeletionVectorDescriptor,
     table_root: &Url,
-) -> KernelResult<Vec<bool>> {
+) -> Result<Vec<bool>> {
     let storage = engine.storage_handler();
     let dv_treemap = descriptor.read(storage, table_root)?;
     Ok(deletion_treemap_to_bools(dv_treemap))

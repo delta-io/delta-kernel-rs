@@ -9,7 +9,9 @@ use delta_kernel::scan::state::{DvInfo, ScanFile};
 use delta_kernel::scan::{PartitionValuesOptions, Scan, ScanBuilder, ScanMetadata, StatsOptions};
 use delta_kernel::schema::{MetadataKey, MetadataValue};
 use delta_kernel::snapshot::SnapshotRef;
-use delta_kernel::{Expression, ExpressionRef, KernelError, KernelResult, KernelResultIterator};
+use delta_kernel::{
+    Expression, ExpressionRef, KernelError, KernelResult, KernelResultIterator, Result,
+};
 use delta_kernel_ffi_macros::handle_descriptor;
 use derive_more::From;
 use tracing::{debug, trace};
@@ -965,7 +967,7 @@ fn selection_vector_from_dv_impl(
     dv_info: &DvInfo,
     extern_engine: &dyn ExternEngine,
     root_url: KernelResult<Url>,
-) -> KernelResult<KernelBoolSlice> {
+) -> Result<KernelBoolSlice> {
     match dv_info.get_selection_vector(extern_engine.engine().as_ref(), &root_url?)? {
         Some(v) => Ok(v.into()),
         None => Ok(KernelBoolSlice::empty()),
@@ -992,7 +994,7 @@ fn row_indexes_from_dv_impl(
     dv_info: &DvInfo,
     extern_engine: &dyn ExternEngine,
     root_url: KernelResult<Url>,
-) -> KernelResult<KernelRowIndexArray> {
+) -> Result<KernelRowIndexArray> {
     match dv_info.get_row_indexes(extern_engine.engine().as_ref(), &root_url?)? {
         Some(v) => Ok(v.into()),
         None => Ok(KernelRowIndexArray::empty()),

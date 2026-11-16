@@ -18,7 +18,7 @@ use crate::path_encoding::uri_decode_path;
 use crate::schema::DataType;
 use crate::snapshot::Snapshot;
 use crate::utils::require;
-use crate::{DeltaError, Error, KernelError, KernelResult, Scalar, StorageHandler};
+use crate::{DeltaError, Error, KernelError, KernelResult, Result, Scalar, StorageHandler};
 
 /// Magic number for portable RoaringBitmap serialization format.
 /// This is the standard format defined in the RoaringBitmap Specification
@@ -528,20 +528,16 @@ impl DeletionVectorDescriptor {
     //  little, while the version, size, and checksum are big
     //  - dvs can potentially indicate the size in the delta log, and _also_ in the file. If both
     //  are present, we assert they are the same
-    pub fn read(
-        &self,
-        storage: Arc<dyn StorageHandler>,
-        parent: &Url,
-    ) -> KernelResult<RoaringTreemap> {
+    pub fn read(&self, storage: Arc<dyn StorageHandler>, parent: &Url) -> Result<RoaringTreemap> {
         match self.absolute_path(parent)? {
             None => {
                 let byte_slice = z85::decode(&self.path_or_inline_dv)
                     .map_err(|_| KernelError::deletion_vector("Failed to decode DV"))?;
                 require!(
                     byte_slice.len() >= INLINE_DELETION_VECTOR_MAGIC_SIZE,
-                    KernelError::deletion_vector(
+                    Error::Kernel(KernelError::deletion_vector(
                         "Inline deletion vector payload must contain at least 4 bytes"
-                    )
+                    ))
                 );
                 let magic = slice_to_u32(
                     &byte_slice[..INLINE_DELETION_VECTOR_MAGIC_SIZE],
@@ -549,15 +545,18 @@ impl DeletionVectorDescriptor {
                 )?;
                 match magic {
                     ROARING_BITMAP_PORTABLE_MAGIC => {
-                        RoaringTreemap::deserialize_from(&byte_slice[4..])
-                            .map_err(|err| KernelError::DeletionVector(err.to_string()))
+                        RoaringTreemap::deserialize_from(&byte_slice[4..]).map_err(|err| {
+                            Error::Kernel(KernelError::DeletionVector(err.to_string()))
+                        })
                     }
-                    ROARING_BITMAP_NATIVE_MAGIC => Err(KernelError::deletion_vector(
-                        "Native serialization in inline bitmaps is not yet supported",
-                    )),
-                    _ => Err(KernelError::DeletionVector(format!(
+                    ROARING_BITMAP_NATIVE_MAGIC => {
+                        Err(Error::Kernel(KernelError::deletion_vector(
+                            "Native serialization in inline bitmaps is not yet supported",
+                        )))
+                    }
+                    _ => Err(Error::Kernel(KernelError::DeletionVector(format!(
                         "Invalid magic {magic}"
-                    ))),
+                    )))),
                 }
             }
             Some(path) => {
@@ -608,9 +607,9 @@ impl DeletionVectorDescriptor {
                 let crc_start = this_dv_start + 4 + (size_in_bytes as usize);
                 require!(
                     this_dv_start < dv_data_len,
-                    KernelError::DeletionVector(format!(
+                    Error::Kernel(KernelError::DeletionVector(format!(
                         "This DV start is out of bounds for {path} (Offset: {this_dv_start} >= Size: {dv_data_len})"
-                    ))
+                    )))
                 );
 
                 cursor.set_position(this_dv_start as u64);
@@ -626,7 +625,9 @@ impl DeletionVectorDescriptor {
                 let magic = read_u32(&mut cursor, Endian::Little)?;
                 require!(
                     magic == ROARING_BITMAP_PORTABLE_MAGIC,
-                    KernelError::DeletionVector(format!("Invalid magic {magic} for {path}"))
+                    Error::Kernel(KernelError::DeletionVector(format!(
+                        "Invalid magic {magic} for {path}"
+                    )))
                 );
 
                 let bytes = cursor.into_inner();
@@ -634,11 +635,11 @@ impl DeletionVectorDescriptor {
                 // +4 to account for CRC value
                 require!(
                     bytes.len() >= crc_start + 4,
-                    KernelError::DeletionVector(format!(
+                    Error::Kernel(KernelError::DeletionVector(format!(
                         "Can't read deletion vector for {path} as there are not enough bytes. Expected {}, but got {}",
                         crc_start + 4,
                         bytes.len()
-                    ))
+                    )))
                 );
 
                 let mut crc_cursor: Cursor<Bytes> =
@@ -650,29 +651,25 @@ impl DeletionVectorDescriptor {
                 let expected_crc = crc32.checksum(&bytes.slice(magic_start..crc_start));
                 require!(
                     crc == expected_crc,
-                    KernelError::DeletionVector(format!(
+                    Error::Kernel(KernelError::DeletionVector(format!(
                         "CRC32 checksum mismatch for {path}. Got: {crc}, expected: {expected_crc}"
-                    ))
+                    )))
                 );
                 // Safety: verified bytes is larger than crc_start + 4, above.
                 let dv_bytes = bytes.slice(bitmap_start..crc_start);
                 let cursor = Cursor::new(dv_bytes);
-                RoaringTreemap::deserialize_from(cursor).map_err(|err| {
+                Ok(RoaringTreemap::deserialize_from(cursor).map_err(|err| {
                     KernelError::DeletionVector(format!(
                         "Failed to deserialize deletion vector for {path}: {err}"
                     ))
-                })
+                })?)
             }
         }
     }
 
     /// Materialize the row indexes of the deletion vector as a `Vec<u64>` in which each element
     /// represents a row index that is deleted from the table.
-    pub fn row_indexes(
-        &self,
-        storage: Arc<dyn StorageHandler>,
-        parent: &Url,
-    ) -> KernelResult<Vec<u64>> {
+    pub fn row_indexes(&self, storage: Arc<dyn StorageHandler>, parent: &Url) -> Result<Vec<u64>> {
         Ok(self.read(storage, parent)?.into_iter().collect())
     }
 
@@ -1226,7 +1223,10 @@ mod tests {
         let parent = Url::parse("http://not.used").unwrap();
 
         let error = inline.read(storage, &parent).unwrap_err();
-        assert!(matches!(&error, KernelError::DeletionVector(_)));
+        assert!(matches!(
+            &error,
+            Error::Kernel(KernelError::DeletionVector(_))
+        ));
         assert!(
             error.to_string().contains(expected_error),
             "expected error containing {expected_error:?}, got {error}"
@@ -1413,8 +1413,11 @@ mod tests {
         let rows = info.get_row_indexes(&engine, &parent);
         let selection = crate::scan::selection_vector(&engine, &descriptor, &parent);
         if cancelled {
-            assert!(matches!(rows, Err(KernelError::Cancelled)));
-            assert!(matches!(selection, Err(KernelError::Cancelled)));
+            assert!(matches!(rows, Err(Error::Kernel(KernelError::Cancelled))));
+            assert!(matches!(
+                selection,
+                Err(Error::Kernel(KernelError::Cancelled))
+            ));
         } else {
             assert_eq!(rows.unwrap().unwrap(), [0, 9]);
             assert_eq!(
