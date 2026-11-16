@@ -7,9 +7,8 @@
 //! [`FrameReporterLayer`] separately reports dynamic enter/exit notifications for tracing spans
 //! that opt in with [`ENABLE_CALL_FRAME_FIELD`]. It does not create or modify [`MetricEvent`]s.
 //!
-//! Each operation (Snapshot, Transaction, Scan) is assigned a unique operation ID ([`MetricId`])
-//! when it starts, and all subsequent events for that operation reference this ID.
-//! This allows reporters to correlate events and track operation lifecycles.
+//! Events with an `operation_id` use [`MetricId`] for correlation. Handler and file-read events,
+//! including `_last_checkpoint` reads, do not carry an operation ID.
 //!
 //! # Example: Implementing a Custom MetricsReporter
 //!
@@ -91,8 +90,9 @@ pub use events::{
     CheckpointWriteFailure, CheckpointWriteMode, CheckpointWriteOutcome, CheckpointWriteStats,
     CheckpointWriteSuccess, ChecksumWriteFailure, ChecksumWriteOutcome,
     ChecksumWriteResolutionMode, ChecksumWriteSuccess, CommitFailureReason, CrcReadSuccess,
-    DomainMetadataLoadSuccess, JsonReadCompleted, LogSegmentLoadFailure, LogSegmentLoadSuccess,
-    LogSegmentLoadType, MetricEvent, MetricId, ParquetReadCompleted, ProtocolMetadataLoadFailure,
+    DomainMetadataLoadSuccess, JsonReadCompleted, LastCheckpointReadCompleted,
+    LastCheckpointReadOutcome, LogSegmentLoadFailure, LogSegmentLoadSuccess, LogSegmentLoadType,
+    MetricEvent, MetricId, ParquetReadCompleted, ProtocolMetadataLoadFailure,
     ProtocolMetadataLoadSuccess, ProtocolMetadataSource, ScanMetadataCompleted, ScanType,
     SetTransactionLoadSuccess, SnapshotBuildFailure, SnapshotBuildSuccess,
     SnapshotLoadMetricContext, SnapshotLoadType, StorageCopyCompleted, StorageListCompleted,

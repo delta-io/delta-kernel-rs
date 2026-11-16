@@ -124,7 +124,7 @@ async fn create_table_validates_cdf_column_names(
     )]
     column_name: &str,
     #[values("none", "name", "id")] cm_mode: &str,
-) -> KernelResult<()> {
+) -> delta_kernel::Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
     let schema = schema_ref! { (StructField::nullable(column_name, DataType::STRING)) };
     let mut properties = vec![
@@ -165,7 +165,7 @@ async fn create_table_validates_cdf_reserved_physical_column_names(
     #[case] cm_mode: &str,
     #[case] cdf_enabled: bool,
     #[case] expected_error: Option<&str>,
-) -> KernelResult<()> {
+) -> delta_kernel::Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
     let schema = schema_ref! {
         (StructField::nullable("value", DataType::STRING).with_metadata([
@@ -260,7 +260,7 @@ async fn test_create_table_with_user_domain_metadata() -> delta_kernel::Result<(
 }
 
 #[tokio::test]
-async fn test_create_table_already_exists() -> KernelResult<()> {
+async fn test_create_table_already_exists() -> delta_kernel::Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
     // Create schema for a user profiles table
@@ -293,7 +293,7 @@ async fn test_create_table_already_exists() -> KernelResult<()> {
 
     assert!(matches!(
         result,
-        Err(KernelError::TableAlreadyExistsAtPath(path)) if path == table_path
+        Err(delta_kernel::Error::Kernel(KernelError::TableAlreadyExistsAtPath(path))) if path == table_path
     ));
 
     Ok(())
@@ -499,7 +499,7 @@ async fn test_create_table_rejects_delta_invariants_metadata() -> KernelResult<(
 async fn test_create_table_log_actions(
     #[case] replace_metrics_after_build: bool,
     #[values("AuditService/2.1.0", "")] engine_info: &str,
-) -> KernelResult<()> {
+) -> delta_kernel::Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
     // Create schema
@@ -632,7 +632,7 @@ async fn test_create_table_log_actions(
 }
 
 /// Helper to create a `CreateTableTransaction` for tests.
-fn create_test_create_table_txn() -> KernelResult<(
+fn create_test_create_table_txn() -> delta_kernel::Result<(
     Arc<impl delta_kernel::Engine>,
     CreateTableTransaction,
     tempfile::TempDir,
@@ -648,7 +648,7 @@ fn create_test_create_table_txn() -> KernelResult<(
 }
 
 #[tokio::test]
-async fn test_create_table_txn_debug() -> KernelResult<()> {
+async fn test_create_table_txn_debug() -> delta_kernel::Result<()> {
     let (_engine, txn, _tempdir) = create_test_create_table_txn()?;
     let debug_str = format!("{txn:?}");
     assert!(
@@ -777,7 +777,7 @@ fn create_resolves_domain_metadata_after_all_feature_selection(
     #[case] properties: &[(&str, &str)],
     #[case] layout: DataLayout,
     #[case] expects_domain_metadata: bool,
-) -> KernelResult<()> {
+) -> delta_kernel::Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
     let snapshot = create_table(&table_path, simple_schema()?, "test", true)
         .with_table_properties(properties.iter().copied())

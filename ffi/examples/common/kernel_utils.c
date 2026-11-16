@@ -643,6 +643,21 @@ void print_metric(MetricEvent event) {
     PM_END;
     return;
 
+  case MetricEventLastCheckpointReadCompleted:
+    PM_START(LastCheckpointReadCompleted);
+    LastCheckpointReadCompleted hint = event.last_checkpoint_read_completed;
+    printf("  outcome:");
+    switch (hint.outcome) {
+    case LastCheckpointReadOutcomeSuccess: printf(" Success,\n"); break;
+    case LastCheckpointReadOutcomeNotFound: printf(" NotFound,\n"); break;
+    case LastCheckpointReadOutcomeInvalid: printf(" Invalid,\n"); break;
+    case LastCheckpointReadOutcomeError: printf(" Error,\n"); break;
+    case LastCheckpointReadOutcomeUnknown: printf(" Unknown,\n"); break;
+    }
+    PM_U64(hint, duration_ns);
+    PM_END;
+    return;
+
   default: printf("\n\n WARNING: Got an unknown metric \n\n"); return;
   }
 }

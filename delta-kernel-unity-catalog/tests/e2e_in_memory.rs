@@ -392,7 +392,7 @@ async fn test_insert_without_publish_hits_limit() -> Result<(), TestError> {
         .commit(&engine)
         .unwrap_err();
     assert!(
-        matches!(err, delta_kernel::KernelError::Generic(msg) if msg.contains("Max unpublished commits"))
+        matches!(err, delta_kernel::Error::Kernel(delta_kernel::KernelError::Generic(msg)) if msg.contains("Max unpublished commits"))
     );
     Ok(())
 }
@@ -588,7 +588,10 @@ async fn test_publish_retries_after_partial_copy_failure() -> Result<(), TestErr
     let error = snapshot
         .publish(engine.as_ref(), &uc_committer(&update_table_client))
         .unwrap_err();
-    assert!(matches!(error, KernelError::FileNotFound(_)));
+    assert!(matches!(
+        error,
+        delta_kernel::Error::Kernel(KernelError::FileNotFound(_))
+    ));
 
     // THEN: commit 1's published file exists, but commit 2's does not.
     let log_dir = tmp_dir.path().join("_delta_log");
@@ -624,7 +627,7 @@ async fn test_cannot_checkpoint_unpublished_snapshot() -> Result<(), TestError> 
     let err = snapshot.checkpoint(&engine, None).unwrap_err();
     assert!(matches!(
         err,
-        delta_kernel::KernelError::UnpublishedVersion(1)
+        delta_kernel::Error::Kernel(delta_kernel::KernelError::UnpublishedVersion(1))
     ));
     Ok(())
 }

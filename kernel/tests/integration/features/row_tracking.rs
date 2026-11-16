@@ -117,7 +117,7 @@ async fn write_data_to_table(
     }
 
     // Commit the transaction
-    Ok(txn.commit(engine.as_ref())?)
+    txn.commit(engine.as_ref())
 }
 
 /// Helper function to create a row-tracking table with a single `number: INTEGER` column.
@@ -967,14 +967,14 @@ async fn test_no_row_tracking_fields_without_feature() -> delta_kernel::Result<(
 fn read_row_id_scan(
     snapshot: Arc<Snapshot>,
     engine: Arc<dyn delta_kernel::Engine>,
-) -> KernelResult<Vec<RecordBatch>> {
+) -> delta_kernel::Result<Vec<RecordBatch>> {
     read_row_tracking_scan(snapshot, engine, [MetadataColumnSpec::RowId])
 }
 
 fn read_row_commit_version_scan(
     snapshot: Arc<Snapshot>,
     engine: Arc<dyn delta_kernel::Engine>,
-) -> KernelResult<Vec<RecordBatch>> {
+) -> delta_kernel::Result<Vec<RecordBatch>> {
     read_row_tracking_scan(snapshot, engine, [MetadataColumnSpec::RowCommitVersion])
 }
 
