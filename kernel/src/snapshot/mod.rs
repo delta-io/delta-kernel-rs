@@ -513,12 +513,14 @@ impl Snapshot {
 
         // Step 1: read the latest on-disk CRC and, if usable, advance it to the end version
         //         (or use it as-is when already there) per `incremental_replay`.
-        let base_crc = log_segment
-            .read_latest_crc(engine)
-            .inspect_err(|_| emit_protocol_metadata_load_failure(metric_context))?;
+        let base_crc = log_segment.read_latest_crc(engine).inspect_err(|_| {
+            emit_protocol_metadata_load_failure(metric_context, pm_start.elapsed())
+        })?;
         let crc_at_version = log_segment
             .try_build_crc_within_budget(engine, base_crc.as_ref(), incremental_replay)
-            .inspect_err(|_| emit_protocol_metadata_load_failure(metric_context))?;
+            .inspect_err(|_| {
+                emit_protocol_metadata_load_failure(metric_context, pm_start.elapsed())
+            })?;
 
         // Step 2: P&M from that CRC, else log replay rooted at the base CRC, checkpoint, or
         //         first commit. The replay reports its own source (seeded vs full) and, under AMT,
@@ -548,12 +550,14 @@ impl Snapshot {
                         _ => Error::Kernel(error),
                     }
                 })
-                .inspect_err(|_| emit_protocol_metadata_load_failure(metric_context))?,
+                .inspect_err(|_| {
+                    emit_protocol_metadata_load_failure(metric_context, pm_start.elapsed())
+                })?,
         };
 
         // Fresh snapshot creation requires both Protocol and Metadata to be present.
         let fail = |e| {
-            emit_protocol_metadata_load_failure(metric_context);
+            emit_protocol_metadata_load_failure(metric_context, pm_start.elapsed());
             Err(Error::Kernel(e))
         };
         let (metadata, protocol) = match (metadata, protocol) {
