@@ -730,6 +730,19 @@ impl From<Infallible> for KernelError {
     }
 }
 
+/// Classifies a partition parse failure after obsolete file actions have been removed.
+pub(crate) fn partition_value_error(error: KernelError) -> Error {
+    if let KernelError::ParseError(value, data_type) = error.without_backtrace() {
+        Error::Delta(DeltaError::failed_cast_partition_value(
+            &value.clone(),
+            &data_type.clone(),
+            Some(Box::new(error)),
+        ))
+    } else {
+        Error::Kernel(error)
+    }
+}
+
 /// Classifies an absent required scan file without reclassifying other storage failures.
 pub(crate) fn required_file_error(error: KernelError, path: &Url) -> Error {
     if matches!(error.without_backtrace(), KernelError::FileNotFound(_)) {

@@ -11,7 +11,7 @@ use super::resolve_dvs::{ResolvedCdfScanFile, resolve_scan_file_dv};
 use super::scan_file::scan_metadata_to_scan_file;
 use super::{CdfMode, TableChanges};
 use crate::actions::deletion_vector::split_vector;
-use crate::error::required_file_error;
+use crate::error::{partition_value_error, required_file_error};
 use crate::scan::field_classifiers::CdfTransformFieldClassifier;
 use crate::scan::state_info::StateInfo;
 use crate::scan::{PartitionValuesOptions, PhysicalPredicate, StatsOptions};
@@ -269,7 +269,8 @@ fn read_scan_file(
 
     let physical_schema =
         scan_file_physical_schema(&scan_file, state_info.physical_schema.as_ref());
-    let transform_expr = get_cdf_transform_expr(&scan_file, state_info, physical_schema.as_ref())?;
+    let transform_expr = get_cdf_transform_expr(&scan_file, state_info, physical_schema.as_ref())
+        .map_err(partition_value_error)?;
 
     // Only create an evaluator if transformation is needed
     let phys_to_logical_eval = transform_expr
