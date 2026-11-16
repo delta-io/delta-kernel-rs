@@ -817,7 +817,7 @@ Snapshot builder API (`ffi/src/snapshot/builder.rs` and `ffi/src/snapshot/hint/m
 - `snapshot_builder_with_max_catalog_version(builder, version)` -- optional: set max catalog version (for catalog-managed tables)
 - `snapshot_builder_with_snapshot_hint(builder, hint)` -- optional: validate and copy a complete
   typed snapshot hint into the builder. Log paths may name published or staged commits, checkpoint
-  files, or CRC files; log compaction paths are rejected. Kernel validates every supplied path beneath
+  files, compaction files, or CRC files. Kernel validates every supplied path beneath
   the builder's `_delta_log` root before grouping and checkpoint selection, preserving supplied
   locations. The connector must canonicalize paths into the same URL form as the table root.
   A failed call consumes and drops the builder
@@ -837,7 +837,7 @@ borrowed. The callback runs once on success and is not invoked on error. All nes
 when the callback returns; copy retained values during the callback. No hint handle is returned.
 Supply the copied values through `snapshot_builder_with_snapshot_hint` when rebuilding a snapshot.
 The hint preserves build-time freshness, not current freshness, and includes only a matching
-checkpoint hint and an at-version CRC. Compaction files are unsupported.
+checkpoint hint and an at-version CRC. Original commit and compaction paths are retained together.
 
 Export includes an explicit publication watermark,
 preserving absence even when published commits are not represented by the retained paths.

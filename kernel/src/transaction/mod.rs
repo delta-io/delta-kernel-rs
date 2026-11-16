@@ -388,7 +388,7 @@ impl<MODE: ExecutionMode> Transaction<UpdateTable, MODE> {
     ///
     /// Revalidates the effective table configuration, returning an error if it is invalid.
     /// This fixture helper does not validate protocol transition rules.
-    pub fn update_table_protocol_for_test(&mut self, protocol: Protocol) -> KernelResult<()> {
+    pub fn update_table_protocol_for_test(&mut self, protocol: Protocol) -> Result<()> {
         self.effective_table_config = TableConfiguration::try_new_from(
             &self.effective_table_config,
             None,

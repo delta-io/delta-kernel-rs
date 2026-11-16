@@ -145,6 +145,9 @@ impl LogSegment {
             let uses_plan = engine.plan_executor().is_some();
             #[cfg(not(feature = "declarative-plans"))]
             let uses_plan = false;
+            // Original commit versions let imperative replay rank P&M against the AMT content
+            // root in one pass. Compactions and plans need the newest pointer before choosing
+            // the replay range.
             if self.listed.ascending_compaction_files.is_empty() && !uses_plan {
                 let candidate =
                     self.replay_pm_segment(engine, PmReplaySegment::UncompactedSegment)?;

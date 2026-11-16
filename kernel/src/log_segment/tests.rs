@@ -5601,7 +5601,7 @@ async fn test_new_as_published_preserves_checkpoints_and_log_compactions() {
         ..Default::default()
     })
     .await;
-    // Snapshot listing excludes compactions, so construct the retained reference directly.
+    // Construct the retained reference directly to isolate publication from compaction selection.
     let mut listed = original.listed;
     listed.ascending_compaction_files.push(create_log_path(
         "memory:///_delta_log/00000000000000000001.00000000000000000002.compacted.json",

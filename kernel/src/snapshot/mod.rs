@@ -1506,10 +1506,8 @@ impl Snapshot {
     /// - `start_version`: The first version to include in the compaction (inclusive)
     /// - `end_version`: The last version to include in the compaction (inclusive)
     ///
-    /// # Returns
-    /// A [`LogCompactionWriter`] that can be used to generate the compaction file.
-    ///
-    /// NOTE: This method is currently a no-op because log compaction is disabled (#2337)
+    /// Returns an unsupported error because compaction writing is disabled (#2337). Reading
+    /// existing compaction files is supported.
     pub fn log_compaction_writer(
         self: Arc<Self>,
         start_version: Version,

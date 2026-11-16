@@ -598,7 +598,7 @@ async fn commit_consumers_preserve_history_with_compaction()
     let scan = changes.into_scan_builder().build()?;
     let batches = scan
         .execute(engine.clone())?
-        .collect::<KernelResult<Vec<_>>>()?;
+        .collect::<delta_kernel::Result<Vec<_>>>()?;
     assert_eq!(batches.iter().map(|b| b.len()).sum::<usize>(), 6);
     assert!(!reads.requested_paths().contains(&path));
     let compacted = Snapshot::builder_for(table.table_root()).build(engine.as_ref())?;

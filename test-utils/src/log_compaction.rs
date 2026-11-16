@@ -1,6 +1,7 @@
 //! Reconciled JSON fixtures for testing compaction readers without enabling compaction writes.
 //!
-//! Reconciliation preserves JSON fields independently of kernel's writer and replay code.
+//! The production writer uses checkpoint retention, which can discard actions needed to suppress
+//! state preceding a partial compaction. These fixtures retain those actions independently.
 
 use std::collections::{BTreeMap, HashSet};
 
