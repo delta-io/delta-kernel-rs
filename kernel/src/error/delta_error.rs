@@ -7,7 +7,7 @@ use std::fmt;
 use super::{BoxedError, DeltaErrorCondition};
 use crate::Version;
 use crate::schema::StructType;
-use crate::table_properties::LOG_RETENTION_DURATION;
+use crate::table_properties::{ENABLE_CHANGE_DATA_FEED, LOG_RETENTION_DURATION};
 #[cfg(any(test, feature = "test-utils"))]
 use crate::{KernelError, KernelResult};
 
@@ -103,6 +103,25 @@ impl DeltaError {
     /// disabled unless `RUST_BACKTRACE` or `RUST_LIB_BACKTRACE` enables it.
     pub fn backtrace(&self) -> &Backtrace {
         &self.backtrace
+    }
+
+    /// Reports a version without recorded change data in the requested inclusive range.
+    pub fn missing_change_data(
+        start_version: Version,
+        end_version: Version,
+        version: Version,
+        source: Option<BoxedError>,
+    ) -> Self {
+        Self::new(
+            DeltaErrorCondition::DeltaMissingChangeData,
+            vec![
+                DeltaErrorParameter::new("startVersion", start_version),
+                DeltaErrorParameter::new("endVersion", end_version),
+                DeltaErrorParameter::new("version", version),
+                DeltaErrorParameter::new("key", ENABLE_CHANGE_DATA_FEED),
+            ],
+            source,
+        )
     }
 
     /// Reports the exact path of a required data, change-data, or deletion-vector file.

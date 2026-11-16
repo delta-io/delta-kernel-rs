@@ -28,6 +28,8 @@ pub enum DeltaErrorCondition {
     DeltaInvalidCdcRange,
     /// `DELTA_LOG_FILE_NOT_FOUND` (SQLSTATE `42K03`).
     DeltaLogFileNotFound,
+    /// `DELTA_MISSING_CHANGE_DATA` (SQLSTATE `KD002`).
+    DeltaMissingChangeData,
     /// `DELTA_PARSING_UNSUPPORTED_DATA_TYPE` (SQLSTATE `KD009`).
     DeltaParsingUnsupportedDataType,
     /// `DELTA_PARTITION_COLUMN_NOT_FOUND` (SQLSTATE `42703`).
@@ -92,6 +94,12 @@ impl DeltaErrorCondition {
                 sql_state: Some("42K03"),
                 parameter_names: &["version", "checkpointVersion", "logPath"],
                 message_template: "Unable to retrieve the delta log files to construct table version <version> starting from checkpoint version <checkpointVersion> at <logPath>.",
+            },
+            Self::DeltaMissingChangeData => ConditionMetadata {
+                name: "DELTA_MISSING_CHANGE_DATA",
+                sql_state: Some("KD002"),
+                parameter_names: &["startVersion", "endVersion", "version", "key"],
+                message_template: "Error getting change data for range [<startVersion> , <endVersion>] as change data was not\nrecorded for version [<version>]. If you've enabled change data feed on this table,\nuse `DESCRIBE HISTORY` to see when it was first enabled.\nOtherwise, to start recording change data, use `ALTER TABLE table_name SET TBLPROPERTIES\n(<key>=true)`.",
             },
             Self::DeltaParsingUnsupportedDataType => ConditionMetadata {
                 name: "DELTA_PARSING_UNSUPPORTED_DATA_TYPE",

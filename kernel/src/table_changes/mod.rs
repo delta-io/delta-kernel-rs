@@ -117,10 +117,22 @@ impl CdfMode {
     }
 
     /// Returns the mode-specific error when [`CdfMode::required_feature`] is disabled at `version`.
-    pub(crate) fn feature_disabled_error(self, version: Version) -> KernelError {
+    pub(crate) fn feature_disabled_error(
+        self,
+        version: Version,
+        start: Version,
+        end: Version,
+    ) -> Error {
         match self {
-            CdfMode::ChangeDataFeed => KernelError::change_data_feed_unsupported(version),
-            CdfMode::RowTracking => KernelError::row_tracking_change_feed_unsupported(version),
+            CdfMode::ChangeDataFeed => Error::Delta(DeltaError::missing_change_data(
+                start,
+                end,
+                version,
+                Some(Box::new(KernelError::change_data_feed_unsupported(version))),
+            )),
+            CdfMode::RowTracking => {
+                Error::Kernel(KernelError::row_tracking_change_feed_unsupported(version))
+            }
         }
     }
 
@@ -362,12 +374,16 @@ impl TableChanges {
         // for the cdc-file path, RowTracking for the row-tracking path.
         //
         // Note: We must still check each metadata and protocol action in the CDF range.
-        let check_table_config = |snapshot: &Snapshot| -> KernelResult<()> {
+        let check_table_config = |snapshot: &Snapshot| -> Result<()> {
             require!(
                 snapshot
                     .table_configuration()
                     .is_feature_enabled(&mode.required_feature()),
-                mode.feature_disabled_error(snapshot.version())
+                mode.feature_disabled_error(
+                    snapshot.version(),
+                    start_version,
+                    end_snapshot.version()
+                )
             );
             Ok(())
         };
@@ -634,7 +650,7 @@ mod tests {
             );
             assert!(matches!(
                 res,
-                Err(Error::Kernel(KernelError::ChangeDataFeedUnsupported(_)))
+                Err(Error::Delta(ref error)) if error.name() == "DELTA_MISSING_CHANGE_DATA"
             ))
         }
     }

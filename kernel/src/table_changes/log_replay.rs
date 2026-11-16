@@ -114,6 +114,7 @@ where
     let result = commit_files
         .into_iter()
         .map(move |commit_file| -> Result<_> {
+            let version = commit_file.version;
             let scanner = LogReplayScanner::try_new(
                 engine.as_ref(),
                 &mut current_configuration,
@@ -121,7 +122,13 @@ where
                 &table_schema,
                 range.clone(),
                 mode,
-            )?;
+            )
+            .map_err(|error| match error {
+                Error::Delta(error) => {
+                    Error::Delta(error.with_context(format!("commit v={version}")))
+                }
+                other => other,
+            })?;
             Ok(scanner.into_scan_batches(engine.clone(), filter.clone())?)
         }) //Iterator-Result-Iterator-Result
         .flatten_ok() // Iterator-Result-Result
@@ -198,7 +205,7 @@ impl LogReplayScanner {
         table_configuration: &mut TableConfiguration,
         commit_file: ParsedLogPath,
         table_schema: &SchemaRef,
-        _range: RangeInclusive<Version>,
+        range: RangeInclusive<Version>,
         mode: CdfMode,
     ) -> Result<Self> {
         let visitor_schema = PreparePhaseVisitor::schema();
@@ -293,7 +300,7 @@ impl LogReplayScanner {
             if has_metadata_update {
                 require!(
                     table_configuration.is_feature_enabled(&mode.required_feature()),
-                    Error::Kernel(mode.feature_disabled_error(commit_file.version))
+                    mode.feature_disabled_error(commit_file.version, *range.start(), *range.end())
                 );
             }
 
