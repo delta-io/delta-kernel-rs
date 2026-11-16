@@ -17,7 +17,11 @@ pub(in crate::scan) enum MetadataReplayBase {
 
 impl MetadataReplayBase {
     /// Select the newest eligible metadata base and resolve checkpoint shape only when needed.
-    pub(in crate::scan) fn try_new(snapshot: &Snapshot, engine: &dyn Engine) -> KernelResult<Self> {
+    pub(in crate::scan) fn try_new(
+        snapshot: &Snapshot,
+        engine: &dyn Engine,
+        context: &crate::metrics::CheckpointReadContext,
+    ) -> KernelResult<Self> {
         let checkpoint_version = snapshot.log_segment().checkpoint_version;
         // Keep replay eligibility independent of SnapshotCrc's validation.
         if let Some((version, files)) = snapshot
@@ -33,7 +37,7 @@ impl MetadataReplayBase {
             });
         }
 
-        let shape = snapshot.checkpoint_info(engine)?;
+        let shape = snapshot.checkpoint_info_with_context(engine, context)?;
         Ok(Self::Checkpoint {
             version: checkpoint_version,
             shape,
@@ -95,7 +99,11 @@ mod tests {
         let crc = Some(crc);
         let snapshot = Arc::new(Snapshot::new_with_crc(segment, config, crc, false, false)?);
         let scan = snapshot.scan_builder().build()?;
-        let base = MetadataReplayBase::try_new(&scan.snapshot, &engine)?;
+        let base = MetadataReplayBase::try_new(
+            &scan.snapshot,
+            &engine,
+            &crate::metrics::CheckpointReadContext::default(),
+        )?;
         assert_eq!(base.version(), Some(version));
         let is_crc = matches!(base, MetadataReplayBase::Crc { .. });
         assert_eq!(is_crc, has_all_files);
