@@ -420,7 +420,9 @@ mod tests {
             let scan = reloaded.scan_builder().build()?;
             let rows = sample_rows_by_path(json_rows(
                 scan.scan_metadata(&engine)?
-                    .map(|batch| Ok(batch?.scan_files)),
+                    .collect::<Result<Vec<_>>>()?
+                    .into_iter()
+                    .map(|batch| Ok(batch.scan_files)),
             )?);
             for (path, bounds) in samples() {
                 let stats = serde_json::from_str(rows[path]["stats"].as_str().unwrap())
@@ -636,7 +638,9 @@ mod tests {
         let scan = snapshot.scan_builder().with_stats(stats).build()?;
         let rows = json_rows(
             scan.scan_metadata(&engine)?
-                .map(|batch| Ok(batch?.scan_files)),
+                .collect::<Result<Vec<_>>>()?
+                .into_iter()
+                .map(|batch| Ok(batch.scan_files)),
         )?;
         assert_eq!(rows.len(), 1);
         let stats_json = rows[0]["stats"].as_str().unwrap();

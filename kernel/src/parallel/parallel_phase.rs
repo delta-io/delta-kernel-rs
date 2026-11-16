@@ -14,7 +14,7 @@ use itertools::Itertools;
 use crate::log_replay::{ActionsBatch, ParallelLogReplayProcessor};
 use crate::scan::CHECKPOINT_READ_SCHEMA;
 use crate::schema::SchemaRef;
-use crate::{Engine, EngineData, FileMeta, KernelResult, KernelResultIterator};
+use crate::{Engine, EngineData, Error, FileMeta, KernelResult, KernelResultIterator, Result};
 
 /// Processes checkpoint leaf files in parallel using a shared processor.
 ///
@@ -110,7 +110,7 @@ impl<P: ParallelLogReplayProcessor> ParallelPhase<P> {
 /// - Parquet parsing errors
 /// - Processing errors from the processor
 impl<P: ParallelLogReplayProcessor> Iterator for ParallelPhase<P> {
-    type Item = KernelResult<P::Output>;
+    type Item = Result<P::Output>;
 
     fn next(&mut self) -> Option<Self::Item> {
         self.leaf_checkpoint_reader
@@ -154,7 +154,7 @@ mod tests {
         CapturingReporter, install_thread_local_metrics_reporter, load_test_table, parse_json_batch,
     };
     use crate::utils::FoldWithOption as _;
-    use crate::{KernelError, PredicateRef, Result, SnapshotRef};
+    use crate::{KernelError, PredicateRef, SnapshotRef};
 
     // ============================================================
     // Test helpers for focused ParallelPhase tests
@@ -271,9 +271,11 @@ mod tests {
         )?;
 
         let mut all_paths = parallel.try_fold(Vec::new(), |acc, metadata_res| {
-            metadata_res?.visit_scan_files(acc, |ps: &mut Vec<String>, scan_file| {
-                ps.push(scan_file.path);
-            })
+            metadata_res?
+                .visit_scan_files(acc, |ps: &mut Vec<String>, scan_file| {
+                    ps.push(scan_file.path);
+                })
+                .map_err(Error::Kernel)
         })?;
 
         // Verify results
@@ -362,9 +364,11 @@ mod tests {
         )?;
 
         let mut all_paths = parallel.try_fold(Vec::new(), |acc, metadata_res| {
-            metadata_res?.visit_scan_files(acc, |ps: &mut Vec<String>, scan_file| {
-                ps.push(scan_file.path);
-            })
+            metadata_res?
+                .visit_scan_files(acc, |ps: &mut Vec<String>, scan_file| {
+                    ps.push(scan_file.path);
+                })
+                .map_err(Error::Kernel)
         })?;
 
         all_paths.sort();
@@ -394,9 +398,11 @@ mod tests {
         let mut scan_metadata_iter = scan.scan_metadata(engine)?;
 
         let mut paths = scan_metadata_iter.try_fold(Vec::new(), |acc, metadata_res| {
-            metadata_res?.visit_scan_files(acc, |ps: &mut Vec<String>, scan_file: ScanFile| {
-                ps.push(scan_file.path);
-            })
+            metadata_res?
+                .visit_scan_files(acc, |ps: &mut Vec<String>, scan_file: ScanFile| {
+                    ps.push(scan_file.path);
+                })
+                .map_err(Error::Kernel)
         })?;
         paths.sort();
         Ok(paths)
@@ -421,9 +427,11 @@ mod tests {
         let mut sequential = scan.parallel_scan_metadata(engine.clone())?;
 
         let mut all_paths = sequential.try_fold(Vec::new(), |acc, metadata_res| {
-            metadata_res?.visit_scan_files(acc, |ps: &mut Vec<String>, scan_file| {
-                ps.push(scan_file.path);
-            })
+            metadata_res?
+                .visit_scan_files(acc, |ps: &mut Vec<String>, scan_file| {
+                    ps.push(scan_file.path);
+                })
+                .map_err(Error::Kernel)
         })?;
 
         match sequential.finish()? {
@@ -454,7 +462,7 @@ mod tests {
                         let state = final_state.clone();
                         let dispatcher = dispatcher.clone();
 
-                        thread::spawn(move || -> KernelResult<Vec<String>> {
+                        thread::spawn(move || -> Result<Vec<String>> {
                             // Set the dispatcher in this thread to capture logs
                             let _guard = dispatcher.map(|d| tracing::dispatcher::set_default(&d));
 
@@ -467,12 +475,11 @@ mod tests {
                             )?;
 
                             parallel.try_fold(Vec::new(), |acc, metadata_res| {
-                                metadata_res?.visit_scan_files(
-                                    acc,
-                                    |ps: &mut Vec<String>, scan_file| {
+                                metadata_res?
+                                    .visit_scan_files(acc, |ps: &mut Vec<String>, scan_file| {
                                         ps.push(scan_file.path);
-                                    },
-                                )
+                                    })
+                                    .map_err(Error::Kernel)
                             })
                         })
                     })
@@ -1026,13 +1033,15 @@ mod tests {
             .build()?;
         let mut single_node_iter = scan.scan_metadata(engine.as_ref())?;
         let mut expected_paths = single_node_iter.try_fold(Vec::new(), |acc, metadata_res| {
-            metadata_res?.visit_scan_files(acc, |ps: &mut Vec<String>, scan_file| {
-                assert!(
-                    scan_file.stats.is_none(),
-                    "Single-node: scan_file.stats should be None when skip_stats=true"
-                );
-                ps.push(scan_file.path);
-            })
+            metadata_res?
+                .visit_scan_files(acc, |ps: &mut Vec<String>, scan_file| {
+                    assert!(
+                        scan_file.stats.is_none(),
+                        "Single-node: scan_file.stats should be None when skip_stats=true"
+                    );
+                    ps.push(scan_file.path);
+                })
+                .map_err(Error::Kernel)
         })?;
         expected_paths.sort();
 
@@ -1045,13 +1054,15 @@ mod tests {
 
         // Verify stats is None in sequential results and collect paths
         let mut all_paths = sequential.try_fold(Vec::new(), |acc, metadata_res| {
-            metadata_res?.visit_scan_files(acc, |ps: &mut Vec<String>, scan_file| {
-                assert!(
-                    scan_file.stats.is_none(),
-                    "sequential: scan_file.stats should be None when skip_stats=true"
-                );
-                ps.push(scan_file.path);
-            })
+            metadata_res?
+                .visit_scan_files(acc, |ps: &mut Vec<String>, scan_file| {
+                    assert!(
+                        scan_file.stats.is_none(),
+                        "sequential: scan_file.stats should be None when skip_stats=true"
+                    );
+                    ps.push(scan_file.path);
+                })
+                .map_err(Error::Kernel)
         })?;
 
         match sequential.finish()? {
@@ -1062,13 +1073,15 @@ mod tests {
                     ParallelScanMetadata::try_new(engine.clone(), Arc::from(state), files)?;
 
                 let parallel_paths = parallel.try_fold(Vec::new(), |acc, metadata_res| {
-                    metadata_res?.visit_scan_files(acc, |ps: &mut Vec<String>, scan_file| {
-                        assert!(
-                            scan_file.stats.is_none(),
-                            "parallel: scan_file.stats should be None when skip_stats=true"
-                        );
-                        ps.push(scan_file.path);
-                    })
+                    metadata_res?
+                        .visit_scan_files(acc, |ps: &mut Vec<String>, scan_file| {
+                            assert!(
+                                scan_file.stats.is_none(),
+                                "parallel: scan_file.stats should be None when skip_stats=true"
+                            );
+                            ps.push(scan_file.path);
+                        })
+                        .map_err(Error::Kernel)
                 })?;
 
                 all_paths.extend(parallel_paths);

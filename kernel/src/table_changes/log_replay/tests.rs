@@ -1,4 +1,3 @@
-use crate::DeltaErrorCondition;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
@@ -30,7 +29,7 @@ use crate::unit_test_utils::{
     Action, LocalMockTable, MockProtocolBuilder, MockTableConfigurationBuilder,
     assert_result_error_with_message,
 };
-use crate::{Engine, Error, KernelError, Predicate, Result, Version};
+use crate::{DeltaErrorCondition, Engine, Error, KernelError, Predicate, Result, Version};
 
 fn table_changes_action_iter<I>(
     engine: Arc<dyn Engine>,

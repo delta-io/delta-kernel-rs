@@ -4591,7 +4591,7 @@ mod tests {
         let scan = snapshot.scan_builder().build()?;
         let scan_meta: Vec<_> = scan
             .scan_metadata(kernel_engine.as_ref())?
-            .collect::<KernelResult<_>>()?;
+            .collect::<Result<_, _>>()?;
         let total_selected: usize = scan_meta
             .iter()
             .map(|m| {
@@ -4635,7 +4635,7 @@ mod tests {
         let scan = snapshot.scan_builder().build()?;
         let scan_meta_items: Vec<_> = scan
             .scan_metadata(kernel_engine.as_ref())?
-            .collect::<KernelResult<_>>()?;
+            .collect::<Result<_, _>>()?;
         assert_eq!(scan_meta_items.len(), 1);
 
         let scan_meta = scan_meta_items.into_iter().next().unwrap();

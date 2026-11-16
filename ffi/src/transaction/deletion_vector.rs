@@ -8,7 +8,7 @@ use std::os::raw::c_int;
 
 use delta_kernel::actions::deletion_vector::{DeletionVectorDescriptor, DeletionVectorStorageType};
 use delta_kernel::transaction::Transaction;
-use delta_kernel::{KernelError, KernelResult};
+use delta_kernel::{KernelError, KernelResult, Result};
 use delta_kernel_ffi_macros::handle_descriptor;
 
 use super::ExclusiveUpdateTableTransaction;
@@ -257,7 +257,7 @@ fn update_table_txn_update_deletion_vectors_impl(
     txn: &mut Transaction,
     dv_map: DvDescriptorMap,
     scan_iter: &crate::scan::ScanMetadataIterator,
-) -> KernelResult<()> {
+) -> Result<()> {
     let mut guard = scan_iter.lock_iter()?;
     let files_iter = Transaction::scan_metadata_to_engine_data(&mut **guard);
     txn.update_deletion_vectors(dv_map.inner, files_iter)

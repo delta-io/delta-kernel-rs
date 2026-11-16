@@ -34,7 +34,9 @@ use crate::schema::{
 use crate::struct_patch::{ProjectionStructPatchBuilder, project_struct_preserving_nulls};
 use crate::table_features::ColumnMappingMode;
 use crate::utils::{FoldWithOption as _, require};
-use crate::{Engine, ExpressionEvaluator, KernelError, KernelResult, KernelResultIterator};
+use crate::{
+    Engine, Error, ExpressionEvaluator, KernelError, KernelResult, KernelResultIterator, Result,
+};
 
 /// Read-time stats toggles consumed by [`ScanLogReplayProcessor`].
 #[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
@@ -567,7 +569,7 @@ impl ScanLogReplayProcessor {
         dedup_selection: Vec<bool>,
         row_transform_exprs: Vec<Option<ExpressionRef>>,
         active_add_file_sizes: Vec<u64>,
-    ) -> KernelResult<RetryTransformAndDataSkipOutput> {
+    ) -> Result<RetryTransformAndDataSkipOutput> {
         let row_transform_exprs = dedup_selection
             .iter()
             .enumerate()
@@ -1053,19 +1055,16 @@ impl ParallelLogReplayProcessor for ScanLogReplayProcessor {
         fields(enable_call_frame),
         err
     )]
-    fn process_actions_batch_parallel(
-        &self,
-        actions_batch: ActionsBatch,
-    ) -> KernelResult<Self::Output> {
+    fn process_actions_batch_parallel(&self, actions_batch: ActionsBatch) -> Result<Self::Output> {
         let ActionsBatch {
             actions,
             is_log_batch,
         } = actions_batch;
         require!(
             !is_log_batch,
-            KernelError::generic(
+            Error::Kernel(KernelError::generic(
                 "Parallel checkpoint processor may only be applied to checkpoint files"
-            )
+            ))
         );
 
         let mut should_retry_transform_and_data_skip = false;
@@ -1083,7 +1082,7 @@ impl ParallelLogReplayProcessor for ScanLogReplayProcessor {
                     should_retry_transform_and_data_skip = true;
                     (Err(err), vec![true; actions.len()])
                 }
-                Err(err) => return Err(err),
+                Err(err) => return Err(Error::Kernel(err)),
             };
 
         // Step 2: Run deduplication visitor on RAW batch (needs add.path, remove.path, etc.)
@@ -1165,7 +1164,7 @@ impl ScanLogReplayProcessor {
     pub(crate) fn process_actions_batch_sequential(
         &mut self,
         actions_batch: ActionsBatch,
-    ) -> KernelResult<ScanMetadata> {
+    ) -> Result<ScanMetadata> {
         let ActionsBatch {
             actions,
             is_log_batch,
@@ -1195,7 +1194,7 @@ impl ScanLogReplayProcessor {
                     should_retry_transform_and_data_skip = true;
                     (Err(err), vec![true; actions.len()])
                 }
-                Err(err) => return Err(err),
+                Err(err) => return Err(Error::Kernel(err)),
             };
 
         // Step 2: Run deduplication visitor on RAW batch (needs add.path, remove.path, etc.)
@@ -1294,8 +1293,8 @@ pub(crate) fn scan_action_iter<I>(
     checkpoint_info: CheckpointReadInfo,
     stats_options: ScanStatsOptions,
     partition_values_options: ScanPartitionValuesOptions,
-) -> KernelResult<(
-    impl KernelResultIterator<ScanMetadata> + use<I>,
+) -> Result<(
+    impl Iterator<Item = Result<ScanMetadata>> + Send + use<I>,
     Arc<ScanMetrics>,
 )>
 where
@@ -1343,7 +1342,9 @@ mod tests {
         DirectDataSkippingPredicateEvaluator, DirectPredicateEvaluator,
         IndirectDataSkippingPredicateEvaluator,
     };
-    use crate::log_replay::{ActionsBatch, FileActionKey, HasSelectionVector, ParallelLogReplayProcessor};
+    use crate::log_replay::{
+        ActionsBatch, FileActionKey, HasSelectionVector, ParallelLogReplayProcessor,
+    };
     use crate::log_segment::CheckpointReadInfo;
     use crate::metrics::{MetricId, ScanType};
     use crate::scan::state::ScanFile;
@@ -1361,8 +1362,8 @@ mod tests {
     use crate::table_features::ColumnMappingMode;
     use crate::unit_test_utils::{assert_result_error_with_message, string_array_to_engine_data};
     use crate::{
-        DeltaErrorCondition, Engine, EngineData, Error, Expression as Expr, ExpressionEvaluator, ExpressionRef, KernelError,
-        KernelResult, Result,
+        DeltaErrorCondition, Engine, EngineData, Error, Expression as Expr, ExpressionEvaluator,
+        ExpressionRef, KernelError, KernelResult, Result,
     };
 
     /// Test evaluator that fails once before delegating, exposing both timed transform attempts.
@@ -1854,9 +1855,9 @@ mod tests {
         .unwrap();
 
         // Add file keys with and without DV info
-        let key1 = crate::log_replay::FileActionKey::new("file1.parquet", None);
-        let key2 = crate::log_replay::FileActionKey::new("file2.parquet", Some("dv-1".to_string()));
-        let key3 = crate::log_replay::FileActionKey::new("file3.parquet", Some("dv-2".to_string()));
+        let key1 = FileActionKey::new("file1.parquet", None);
+        let key2 = FileActionKey::new("file2.parquet", Some("dv-1".to_string()));
+        let key3 = FileActionKey::new("file3.parquet", Some("dv-2".to_string()));
         processor.seen_file_keys.insert(key1.clone());
         processor.seen_file_keys.insert(key2.clone());
         processor.seen_file_keys.insert(key3.clone());

@@ -23,7 +23,7 @@ use url::Url;
 
 use crate::engine_data::GetData;
 use crate::log_replay::deduplicator::{Deduplicator, FileActionInfo};
-use crate::{EngineData, KernelResult};
+use crate::{EngineData, KernelResult, Result};
 
 pub(crate) mod deduplicator;
 
@@ -245,10 +245,7 @@ impl ActionsBatch {
 #[internal_api]
 pub(crate) trait ParallelLogReplayProcessor {
     type Output;
-    fn process_actions_batch_parallel(
-        &self,
-        actions_batch: ActionsBatch,
-    ) -> KernelResult<Self::Output>;
+    fn process_actions_batch_parallel(&self, actions_batch: ActionsBatch) -> Result<Self::Output>;
 }
 
 impl<T> ParallelLogReplayProcessor for Arc<T>
@@ -257,10 +254,7 @@ where
 {
     type Output = T::Output;
 
-    fn process_actions_batch_parallel(
-        &self,
-        actions_batch: ActionsBatch,
-    ) -> KernelResult<Self::Output> {
+    fn process_actions_batch_parallel(&self, actions_batch: ActionsBatch) -> Result<Self::Output> {
         T::process_actions_batch_parallel(self, actions_batch)
     }
 }

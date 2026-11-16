@@ -83,8 +83,8 @@ use crate::table_features::{ColumnMappingMode, Operation};
 use crate::transforms::{ExpressionTransform, SchemaTransform, transform_output_type};
 use crate::utils::{FoldWithOption as _, IteratorExt, require};
 use crate::{
-    Engine, EngineData, Error, FileMeta, KernelError, KernelResult, KernelResultIterator, Result,
-    SnapshotRef, Version,
+    Engine, EngineData, Error, FileMeta, KernelError, KernelResult,
+    KernelResultIterator, Result, SnapshotRef, Version,
 };
 
 pub(crate) mod data_skipping;
@@ -1145,14 +1145,14 @@ impl Scan {
     pub fn scan_metadata(
         &self,
         engine: &dyn Engine,
-    ) -> KernelResult<impl KernelResultIterator<ScanMetadata> + use<>> {
+    ) -> Result<impl Iterator<Item = Result<ScanMetadata>> + Send + use<>> {
         self.with_cancellable_engine(engine, |engine| self.scan_metadata_with_engine(engine))
     }
 
     fn scan_metadata_with_engine(
         &self,
         engine: &dyn Engine,
-    ) -> KernelResult<impl KernelResultIterator<ScanMetadata> + use<>> {
+    ) -> Result<impl Iterator<Item = Result<ScanMetadata>> + Send + use<>> {
         let actions_with_checkpoint_info = self.replay_for_scan_metadata(engine)?;
         self.scan_metadata_inner(engine, actions_with_checkpoint_info)
     }
@@ -1214,7 +1214,7 @@ impl Scan {
         existing_version: Version,
         existing_data: impl IntoIterator<Item = Box<dyn EngineData>, IntoIter: Send + 'static>,
         existing_predicate: Option<PredicateRef>,
-    ) -> KernelResult<Box<dyn KernelResultIterator<ScanMetadata>>> {
+    ) -> Result<Box<dyn Iterator<Item = Result<ScanMetadata>> + Send>> {
         self.with_cancellable_engine(engine, |engine| {
             self.scan_metadata_from_with_engine(
                 engine,
@@ -1231,7 +1231,7 @@ impl Scan {
         existing_version: Version,
         existing_data: impl IntoIterator<Item = Box<dyn EngineData>, IntoIter: Send + 'static>,
         _existing_predicate: Option<PredicateRef>,
-    ) -> KernelResult<Box<dyn KernelResultIterator<ScanMetadata>>> {
+    ) -> Result<Box<dyn Iterator<Item = Result<ScanMetadata>> + Send>> {
         // TODO(#3609): scan_metadata_from does not reuse existing partitionValues_parsed
         // from compatible checkpoints. Support reusing those values and enable connector-supplied
         // timezone support.
@@ -1240,10 +1240,10 @@ impl Scan {
                 self.snapshot.table_configuration(),
                 &self.partition_values_options,
             ),
-            KernelError::unsupported(
+            Error::Kernel(KernelError::unsupported(
                 "Kernel does not yet support with_timestamp_timezone in scan_metadata_from on \
                  tables with TIMESTAMP partition columns; use scan_metadata instead"
-            )
+            ))
         );
         // TODO(#966): validate that the current predicate is compatible with the hint predicate.
         let existing_data = existing_data.into_iter();
@@ -1253,11 +1253,11 @@ impl Scan {
             CancellableIterator::new(existing_data.map(Ok), self.cancellation_token.clone());
 
         if existing_version > self.snapshot.version() {
-            return Err(KernelError::Generic(format!(
+            return Err(Error::Kernel(KernelError::Generic(format!(
                 "existing_version {} is greater than current version {}",
                 existing_version,
                 self.snapshot.version()
-            )));
+            ))));
         }
 
         // in order to be processed by our log replay, we must re-shape the existing scan metadata
@@ -1378,7 +1378,7 @@ impl Scan {
         &self,
         engine: &dyn Engine,
         actions_with_checkpoint_info: ActionsWithCheckpointInfo<I>,
-    ) -> KernelResult<impl KernelResultIterator<ScanMetadata> + use<I>>
+    ) -> Result<impl Iterator<Item = Result<ScanMetadata>> + Send + use<I>>
     where
         I: KernelResultIterator<ActionsBatch>,
     {
@@ -1762,10 +1762,10 @@ impl Scan {
 
         let scan_metadata_iter = self.scan_metadata(engine.as_ref())?;
         let scan_files_iter = scan_metadata_iter
-            .map(|res| {
+            .map(|res| -> Result<_> {
                 let scan_metadata = res?;
                 let scan_files = vec![];
-                scan_metadata.visit_scan_files(scan_files, scan_metadata_callback)
+                Ok(scan_metadata.visit_scan_files(scan_files, scan_metadata_callback)?)
             })
             // Iterator<Result<Vec<ScanFile>>> to Iterator<Result<ScanFile>>
             .flatten_ok();
