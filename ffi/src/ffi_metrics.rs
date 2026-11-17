@@ -367,8 +367,8 @@ pub struct TransactionCommitFailure {
 
 /// A [`delta_kernel::Snapshot::checkpoint`] call returned successfully.
 ///
-/// Written checkpoints report completed processing. An early AlreadyExists reports zero
-/// processing values; an AlreadyExists return after processing starts retains the work performed.
+/// Written checkpoints report completed processing and output. An early AlreadyExists reports zero
+/// processing and output values; later AlreadyExists returns retain the work performed.
 #[repr(C)]
 pub struct CheckpointWriteSuccess {
     /// Unique identifier for this checkpoint attempt.
@@ -384,13 +384,14 @@ pub struct CheckpointWriteSuccess {
     pub duration_ns: u64,
     /// Work performed while producing checkpoint batches, including on an AlreadyExists return.
     pub processing_stats: CheckpointProcessingStats,
+    /// Output work performed, including on an AlreadyExists return after writing starts.
+    pub output_stats: CheckpointOutputStats,
 }
 
 /// A [`delta_kernel::Snapshot::checkpoint`] call returned an error, including after data writes.
 ///
-/// Processing metrics retain work performed before the error. Preflight failures report zero
-/// processing values. Hint publication or snapshot construction failures retain completed
-/// processing.
+/// Processing and output metrics retain work performed before the error. Preflight failures report
+/// zero values. Hint publication or snapshot construction failures retain completed measurements.
 #[repr(C)]
 pub struct CheckpointWriteFailure {
     /// Unique identifier for this checkpoint attempt.
@@ -404,6 +405,9 @@ pub struct CheckpointWriteFailure {
     pub duration_ns: u64,
     /// Work performed before the error.
     pub processing_stats: CheckpointProcessingStats,
+    /// Output work performed before the error, including successful writes before verification
+    /// fails.
+    pub output_stats: CheckpointOutputStats,
 }
 
 /// Checkpoint processing times and input action counts. Timings measure elapsed time, including
@@ -413,9 +417,13 @@ pub struct CheckpointWriteFailure {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[repr(C)]
 pub struct CheckpointProcessingStats {
-    /// Time creating and advancing the iterator over log, checkpoint, and sidecar batches,
-    /// in nanoseconds. Includes input reads, decoding, and the final or failing iterator call.
-    pub input_duration_ns: u64,
+    /// Time setting up and consuming commit and log-compaction input, in nanoseconds.
+    /// Includes reads, decoding, waits, and final or failing iterator calls.
+    pub log_tail_input_duration_ns: u64,
+    /// Time setting up and consuming the previous checkpoint and its sidecars, in nanoseconds.
+    /// Includes schema/footer reads, sidecar-reference extraction, decoding, waits, and final
+    /// or failing iterator calls, including for JSON main checkpoints.
+    pub checkpoint_input_duration_ns: u64,
     /// Time reconciling actions and constructing selection vectors, in nanoseconds.
     pub reconciliation_duration_ns: u64,
     /// Time evaluating statistics and partition-value transforms for checkpoint output,
@@ -436,7 +444,8 @@ pub struct CheckpointProcessingStats {
 impl From<kernel::CheckpointProcessingStats> for CheckpointProcessingStats {
     fn from(stats: kernel::CheckpointProcessingStats) -> Self {
         Self {
-            input_duration_ns: duration_ns(stats.input_duration),
+            log_tail_input_duration_ns: duration_ns(stats.log_tail_input_duration),
+            checkpoint_input_duration_ns: duration_ns(stats.checkpoint_input_duration),
             reconciliation_duration_ns: duration_ns(stats.reconciliation_duration),
             stats_transform_duration_ns: duration_ns(stats.stats_transform_duration),
             output_preparation_duration_ns: duration_ns(stats.output_preparation_duration),
@@ -446,26 +455,54 @@ impl From<kernel::CheckpointProcessingStats> for CheckpointProcessingStats {
     }
 }
 
-/// Size and action counts from a successful checkpoint write.
+/// Output work retained on failures and AlreadyExists returns. Byte and sidecar counts include
+/// successful Parquet calls even if verification fails; they exclude bytes from failing calls.
+/// See [`delta_kernel::metrics::CheckpointOutputStats`] for the accounting boundaries.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[repr(C)]
+pub struct CheckpointOutputStats {
+    /// Parquet writer time excluding input iterator pulls, in nanoseconds. Includes failing calls.
+    pub parquet_write_duration_ns: u64,
+    /// Time querying metadata and verifying written file sizes, in nanoseconds. Includes failures.
+    pub verification_duration_ns: u64,
+    /// Sizes returned by successful Parquet writes of the main checkpoint and new sidecars.
+    pub bytes_written: u64,
+    /// Sidecars whose Parquet writes returned successfully.
+    pub num_sidecars_written: u64,
+}
+
+impl From<kernel::CheckpointOutputStats> for CheckpointOutputStats {
+    fn from(stats: kernel::CheckpointOutputStats) -> Self {
+        Self {
+            parquet_write_duration_ns: duration_ns(stats.parquet_write_duration),
+            verification_duration_ns: duration_ns(stats.verification_duration),
+            bytes_written: stats.bytes_written,
+            num_sidecars_written: stats.num_sidecars_written,
+        }
+    }
+}
+
+/// Contents of a completed checkpoint, including referenced sidecars.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[repr(C)]
 pub struct CheckpointWriteStats {
-    /// Main checkpoint and all sidecar bytes, excluding `_last_checkpoint`.
-    pub bytes_written: u64,
-    /// Active Add-file actions written after reconciliation.
+    /// Main checkpoint size plus every referenced sidecar's size, excluding `_last_checkpoint`.
+    pub size_in_bytes: u64,
+    /// Active Add actions across the completed checkpoint.
     pub num_add_files: u64,
-    /// Retained Remove-file actions written, excluding expired tombstones.
+    /// Retained Remove actions across the completed checkpoint.
     pub num_remove_files: u64,
-    /// All emitted actions, including metadata and V2 sidecar references.
+    /// Action rows across the main checkpoint and referenced sidecars, including sidecar
+    /// references.
     pub num_actions: u64,
-    /// Actual sidecar files written; zero means none were produced.
+    /// Total sidecars referenced by the completed checkpoint.
     pub num_sidecars: u64,
 }
 
 impl From<kernel::CheckpointWriteStats> for CheckpointWriteStats {
     fn from(stats: kernel::CheckpointWriteStats) -> Self {
         Self {
-            bytes_written: stats.bytes_written,
+            size_in_bytes: stats.size_in_bytes,
             num_add_files: stats.num_add_files,
             num_remove_files: stats.num_remove_files,
             num_actions: stats.num_actions,
@@ -940,6 +977,7 @@ impl MetricEvent {
                 mode,
                 duration,
                 processing_stats,
+                output_stats,
             }) => Self::CheckpointWriteSuccess(CheckpointWriteSuccess {
                 operation_id: (*operation_id).into(),
                 version: *version,
@@ -947,6 +985,7 @@ impl MetricEvent {
                 mode: (*mode).into(),
                 duration_ns: duration_ns(*duration),
                 processing_stats: (*processing_stats).into(),
+                output_stats: (*output_stats).into(),
             }),
             K::CheckpointWriteFailure(kernel::CheckpointWriteFailure {
                 operation_id,
@@ -954,12 +993,14 @@ impl MetricEvent {
                 mode,
                 duration,
                 processing_stats,
+                output_stats,
             }) => Self::CheckpointWriteFailure(CheckpointWriteFailure {
                 operation_id: (*operation_id).into(),
                 version: *version,
                 mode: (*mode).into(),
                 duration_ns: duration_ns(*duration),
                 processing_stats: (*processing_stats).into(),
+                output_stats: (*output_stats).into(),
             }),
         }
     }
@@ -1039,6 +1080,12 @@ mod tests {
     ) {
         let operation_id = kernel::MetricId::new();
         let (processing_stats, expected_processing) = checkpoint_processing_stats();
+        let output_stats = kernel::CheckpointOutputStats {
+            parquet_write_duration: Duration::from_nanos(7),
+            verification_duration: Duration::from_nanos(8),
+            bytes_written: 9,
+            num_sidecars_written: 10,
+        };
         let (bytes, adds, removes, actions, sidecars) = if zero_stats {
             (0, 0, 0, 0, 0)
         } else {
@@ -1050,7 +1097,7 @@ mod tests {
             version: 42,
             outcome: kernel::CheckpointWriteOutcome::Written {
                 stats: kernel::CheckpointWriteStats {
-                    bytes_written: bytes,
+                    size_in_bytes: bytes,
                     num_add_files: adds,
                     num_remove_files: removes,
                     num_actions: actions,
@@ -1060,6 +1107,7 @@ mod tests {
             mode,
             duration: Duration::from_nanos(123),
             processing_stats,
+            output_stats,
         });
 
         with_ffi_event(&event, |ffi| {
@@ -1070,12 +1118,21 @@ mod tests {
             assert_eq!(e.operation_id.bytes, operation_id.as_bytes());
             assert_eq!(e.version, 42);
             assert_eq!(e.processing_stats, expected_processing);
+            assert_eq!(
+                e.output_stats,
+                CheckpointOutputStats {
+                    parquet_write_duration_ns: 7,
+                    verification_duration_ns: 8,
+                    bytes_written: 9,
+                    num_sidecars_written: 10,
+                }
+            );
             assert_eq!(e.duration_ns, 123);
             assert_eq!(
                 e.outcome,
                 CheckpointWriteOutcome::Written {
                     stats: CheckpointWriteStats {
-                        bytes_written: bytes,
+                        size_in_bytes: bytes,
                         num_add_files: adds,
                         num_remove_files: removes,
                         num_actions: actions,
@@ -1110,6 +1167,12 @@ mod tests {
         let operation_id = kernel::MetricId::new();
         let (processing_stats, expected_processing) = checkpoint_processing_stats();
         let (duration, duration_ns) = durations;
+        let output_stats = kernel::CheckpointOutputStats {
+            parquet_write_duration: duration,
+            verification_duration: duration.saturating_add(Duration::from_nanos(1)),
+            bytes_written: 9,
+            num_sidecars_written: 10,
+        };
         let event = if failed {
             kernel::MetricEvent::CheckpointWriteFailure(kernel::CheckpointWriteFailure {
                 operation_id,
@@ -1117,6 +1180,7 @@ mod tests {
                 mode,
                 duration,
                 processing_stats,
+                output_stats,
             })
         } else {
             kernel::MetricEvent::CheckpointWriteSuccess(kernel::CheckpointWriteSuccess {
@@ -1126,17 +1190,19 @@ mod tests {
                 mode,
                 duration,
                 processing_stats,
+                output_stats,
             })
         };
 
         with_ffi_event(&event, |ffi| {
-            let (mode, duration, id, version, processing_stats) = match ffi {
+            let (mode, duration, id, version, processing_stats, output_stats) = match ffi {
                 MetricEvent::CheckpointWriteFailure(e) if failed => (
                     e.mode,
                     e.duration_ns,
                     e.operation_id,
                     e.version,
                     e.processing_stats,
+                    e.output_stats,
                 ),
                 MetricEvent::CheckpointWriteSuccess(e) if !failed => {
                     assert_eq!(e.outcome, CheckpointWriteOutcome::AlreadyExists);
@@ -1146,6 +1212,7 @@ mod tests {
                         e.operation_id,
                         e.version,
                         e.processing_stats,
+                        e.output_stats,
                     )
                 }
                 _ => panic!("expected checkpoint success or failure matching the kernel event"),
@@ -1155,6 +1222,15 @@ mod tests {
             assert_eq!(id.bytes, operation_id.as_bytes());
             assert_eq!(version, 42);
             assert_eq!(processing_stats, expected_processing);
+            assert_eq!(
+                output_stats,
+                CheckpointOutputStats {
+                    parquet_write_duration_ns: duration_ns,
+                    verification_duration_ns: duration_ns.saturating_add(1),
+                    bytes_written: 9,
+                    num_sidecars_written: 10,
+                }
+            );
         });
     }
 
@@ -1162,7 +1238,8 @@ mod tests {
     -> (kernel::CheckpointProcessingStats, CheckpointProcessingStats) {
         (
             kernel::CheckpointProcessingStats {
-                input_duration: Duration::from_nanos(1),
+                log_tail_input_duration: Duration::from_nanos(1),
+                checkpoint_input_duration: Duration::from_nanos(7),
                 reconciliation_duration: Duration::from_nanos(2),
                 stats_transform_duration: Duration::from_nanos(3),
                 output_preparation_duration: Duration::from_nanos(4),
@@ -1170,7 +1247,8 @@ mod tests {
                 num_actions_from_checkpoint: 6,
             },
             CheckpointProcessingStats {
-                input_duration_ns: 1,
+                log_tail_input_duration_ns: 1,
+                checkpoint_input_duration_ns: 7,
                 reconciliation_duration_ns: 2,
                 stats_transform_duration_ns: 3,
                 output_preparation_duration_ns: 4,

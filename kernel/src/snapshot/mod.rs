@@ -1753,9 +1753,11 @@ impl Snapshot {
         name = "snap.checkpoint",
         skip_all,
         fields(report, operation_id = %MetricId::new(), version = self.version(), outcome, mode,
-            duration_ns, bytes_written, num_add_files, num_remove_files, num_actions, num_sidecars,
-            input_duration_ns, reconciliation_duration_ns, stats_transform_duration_ns,
-            output_preparation_duration_ns, num_actions_from_log_tail, num_actions_from_checkpoint),
+            duration_ns, size_in_bytes, num_add_files, num_remove_files, num_actions, num_sidecars,
+            log_tail_input_duration_ns, checkpoint_input_duration_ns, reconciliation_duration_ns,
+            stats_transform_duration_ns, output_preparation_duration_ns,
+            num_actions_from_log_tail, num_actions_from_checkpoint,
+            parquet_write_duration_ns, verification_duration_ns, bytes_written, num_sidecars_written),
         err
     )]
     pub fn checkpoint(
@@ -1877,7 +1879,7 @@ impl Snapshot {
             false, /* skipped_new_checkpoints */
         )?);
         span.record(
-            "bytes_written",
+            "size_in_bytes",
             info.last_checkpoint_stats.size_in_bytes as u64,
         );
         span.record(

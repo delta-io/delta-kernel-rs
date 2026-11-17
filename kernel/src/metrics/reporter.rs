@@ -330,9 +330,9 @@ mod tests {
 
     use crate::metrics::events::SNAPSHOT_COMPLETED_SPAN;
     use crate::metrics::{
-        CheckpointProcessingStats, CheckpointWriteMode, CheckpointWriteOutcome,
-        CheckpointWriteStats, LastCheckpointReadOutcome, MetricEvent, MetricId,
-        WithMetricsReporterLayer as _,
+        CheckpointOutputStats, CheckpointProcessingStats, CheckpointWriteMode,
+        CheckpointWriteOutcome, CheckpointWriteStats, LastCheckpointReadOutcome, MetricEvent,
+        MetricId, WithMetricsReporterLayer as _,
     };
     use crate::unit_test_utils::{CapturingReporter, install_thread_local_metrics_reporter};
 
@@ -463,32 +463,42 @@ mod tests {
                 mode = Empty,
                 duration_ns = Empty,
                 bytes_written = Empty,
+                size_in_bytes = Empty,
                 num_add_files = Empty,
                 num_remove_files = Empty,
                 num_actions = Empty,
                 num_sidecars = Empty,
-                input_duration_ns = Empty,
+                log_tail_input_duration_ns = Empty,
+                checkpoint_input_duration_ns = Empty,
                 reconciliation_duration_ns = Empty,
                 stats_transform_duration_ns = Empty,
                 output_preparation_duration_ns = Empty,
                 num_actions_from_log_tail = Empty,
                 num_actions_from_checkpoint = Empty,
+                parquet_write_duration_ns = Empty,
+                verification_duration_ns = Empty,
+                num_sidecars_written = Empty,
             );
             let _entered = span.enter();
             span.record("mode", "v2_with_sidecars");
             span.record("duration_ns", duration_ns);
-            span.record("bytes_written", 50u64);
+            span.record("size_in_bytes", 50u64);
             span.record("num_add_files", 1u64);
             span.record("num_remove_files", 0u64);
             span.record("num_actions", 5u64);
             span.record("num_sidecars", 1u64);
             for (name, value) in [
-                ("input_duration_ns", 1u64),
+                ("log_tail_input_duration_ns", 1u64),
                 ("reconciliation_duration_ns", 2),
                 ("stats_transform_duration_ns", 3),
                 ("output_preparation_duration_ns", 4),
                 ("num_actions_from_log_tail", 5),
                 ("num_actions_from_checkpoint", 6),
+                ("checkpoint_input_duration_ns", 7),
+                ("parquet_write_duration_ns", 8),
+                ("verification_duration_ns", 9),
+                ("bytes_written", 10),
+                ("num_sidecars_written", 11),
             ] {
                 span.record(name, value);
             }
@@ -498,20 +508,21 @@ mod tests {
         }
         let events = reporter.events();
         assert_eq!(events.len(), 1);
-        let (mode, duration, id, version, processing) = match (&events[0], fail) {
+        let (mode, duration, id, version, processing, output) = match (&events[0], fail) {
             (MetricEvent::CheckpointWriteFailure(event), true) => (
                 event.mode,
                 event.duration,
                 event.operation_id,
                 event.version,
                 event.processing_stats,
+                event.output_stats,
             ),
             (MetricEvent::CheckpointWriteSuccess(event), false) => {
                 assert_eq!(
                     event.outcome,
                     CheckpointWriteOutcome::Written {
                         stats: CheckpointWriteStats {
-                            bytes_written: 50,
+                            size_in_bytes: 50,
                             num_add_files: 1,
                             num_remove_files: 0,
                             num_actions: 5,
@@ -525,6 +536,7 @@ mod tests {
                     event.operation_id,
                     event.version,
                     event.processing_stats,
+                    event.output_stats,
                 )
             }
             (event, _) => panic!("unexpected checkpoint metric: {event:?}"),
@@ -536,12 +548,22 @@ mod tests {
         assert_eq!(
             processing,
             CheckpointProcessingStats {
-                input_duration: Duration::from_nanos(1),
+                log_tail_input_duration: Duration::from_nanos(1),
+                checkpoint_input_duration: Duration::from_nanos(7),
                 reconciliation_duration: Duration::from_nanos(2),
                 stats_transform_duration: Duration::from_nanos(3),
                 output_preparation_duration: Duration::from_nanos(4),
                 num_actions_from_log_tail: 5,
                 num_actions_from_checkpoint: 6,
+            }
+        );
+        assert_eq!(
+            output,
+            CheckpointOutputStats {
+                parquet_write_duration: Duration::from_nanos(8),
+                verification_duration: Duration::from_nanos(9),
+                bytes_written: 10,
+                num_sidecars_written: 11,
             }
         );
     }

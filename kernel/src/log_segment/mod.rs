@@ -24,6 +24,7 @@ use crate::actions::{
 use crate::checkpoint::collation_stats::{
     build_collation_stats_read_transform, source_collation_stats,
 };
+use crate::checkpoint::metrics::{CheckpointMetrics, CheckpointPhase};
 use crate::committer::CatalogCommit;
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::content_tree::read_checkpoint_action;
@@ -1022,6 +1023,28 @@ impl LogSegment {
         stats_schema: Option<&StructType>,
         partition_schema: Option<&StructType>,
     ) -> KernelResult<ActionsWithCheckpointInfo<Box<dyn KernelResultIterator<ActionsBatch>>>> {
+        self.read_actions_with_metrics(
+            engine,
+            commit_read_schema,
+            checkpoint_read_schema,
+            meta_predicate,
+            stats_schema,
+            partition_schema,
+            CheckpointMetrics::disabled(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn read_actions_with_metrics(
+        &self,
+        engine: &dyn Engine,
+        commit_read_schema: SchemaRef,
+        checkpoint_read_schema: SchemaRef,
+        meta_predicate: Option<PredicateRef>,
+        stats_schema: Option<&StructType>,
+        partition_schema: Option<&StructType>,
+        metrics: CheckpointMetrics,
+    ) -> KernelResult<ActionsWithCheckpointInfo<Box<dyn KernelResultIterator<ActionsBatch>>>> {
         // Combine the action-presence predicate with the caller's skipping predicate so readers
         // can omit checkpoint data that cannot contain a relevant action.
         let projection_predicate = checkpoint_action_projection_predicate(&checkpoint_read_schema);
@@ -1030,20 +1053,48 @@ impl LogSegment {
 
         // `replay` expects commit files to be sorted in descending order, so the return value here
         // is correct
-        let commit_stream = self.read_commit_actions(engine, commit_read_schema)?;
-
-        let checkpoint_result = self.create_checkpoint_stream(
-            engine,
-            checkpoint_read_schema,
-            checkpoint_predicate,
-            stats_schema,
-            partition_schema,
-        )?;
+        let commit_stream = {
+            let _timer = metrics.start(CheckpointPhase::LogTailInput);
+            self.read_commit_actions(engine, commit_read_schema)?
+        };
+        let checkpoint_result = {
+            let _timer = metrics.start(CheckpointPhase::CheckpointInput);
+            self.create_checkpoint_stream(
+                engine,
+                checkpoint_read_schema,
+                checkpoint_predicate,
+                stats_schema,
+                partition_schema,
+            )?
+        };
+        let commit_stream = metrics.input_iterator(CheckpointPhase::LogTailInput, commit_stream);
+        let checkpoint_stream =
+            metrics.input_iterator(CheckpointPhase::CheckpointInput, checkpoint_result.actions);
 
         Ok(ActionsWithCheckpointInfo {
-            actions: Box::new(commit_stream.chain(checkpoint_result.actions)),
+            actions: Box::new(commit_stream.chain(checkpoint_stream)),
             checkpoint_info: checkpoint_result.checkpoint_info,
         })
+    }
+
+    /// Reads checkpoint-write input, timing each source before the streams are joined.
+    pub(crate) fn read_actions_for_checkpoint(
+        &self,
+        engine: &dyn Engine,
+        action_schema: SchemaRef,
+        metrics: CheckpointMetrics,
+    ) -> KernelResult<impl KernelResultIterator<ActionsBatch> + use<>> {
+        Ok(self
+            .read_actions_with_metrics(
+                engine,
+                action_schema.clone(),
+                action_schema,
+                None,
+                None,
+                None,
+                metrics,
+            )?
+            .actions)
     }
 
     /// Same as [`Self::read_actions_with_projected_checkpoint_actions`], but reads the AMT

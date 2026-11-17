@@ -559,15 +559,20 @@ void print_metric(MetricEvent event) {
     printf("  outcome: %d,\n", cps.outcome.tag);
     PM_U64(cps, mode);
     PM_U64(cps, duration_ns);
-    PM_U64(cps.processing_stats, input_duration_ns);
+    PM_U64(cps.processing_stats, log_tail_input_duration_ns);
+    PM_U64(cps.processing_stats, checkpoint_input_duration_ns);
     PM_U64(cps.processing_stats, reconciliation_duration_ns);
     PM_U64(cps.processing_stats, stats_transform_duration_ns);
     PM_U64(cps.processing_stats, output_preparation_duration_ns);
     PM_U64(cps.processing_stats, num_actions_from_log_tail);
     PM_U64(cps.processing_stats, num_actions_from_checkpoint);
+    PM_U64(cps.output_stats, parquet_write_duration_ns);
+    PM_U64(cps.output_stats, verification_duration_ns);
+    PM_U64(cps.output_stats, bytes_written);
+    PM_U64(cps.output_stats, num_sidecars_written);
     if (cps.outcome.tag == CheckpointWriteOutcomeWritten) {
       CheckpointWriteStats stats = cps.outcome.written.stats;
-      PM_U64(stats, bytes_written);
+      PM_U64(stats, size_in_bytes);
       PM_U64(stats, num_add_files);
       PM_U64(stats, num_remove_files);
       PM_U64(stats, num_actions);
@@ -583,12 +588,17 @@ void print_metric(MetricEvent event) {
     PM_U64(cpf, version);
     PM_U64(cpf, mode);
     PM_U64(cpf, duration_ns);
-    PM_U64(cpf.processing_stats, input_duration_ns);
+    PM_U64(cpf.processing_stats, log_tail_input_duration_ns);
+    PM_U64(cpf.processing_stats, checkpoint_input_duration_ns);
     PM_U64(cpf.processing_stats, reconciliation_duration_ns);
     PM_U64(cpf.processing_stats, stats_transform_duration_ns);
     PM_U64(cpf.processing_stats, output_preparation_duration_ns);
     PM_U64(cpf.processing_stats, num_actions_from_log_tail);
     PM_U64(cpf.processing_stats, num_actions_from_checkpoint);
+    PM_U64(cpf.output_stats, parquet_write_duration_ns);
+    PM_U64(cpf.output_stats, verification_duration_ns);
+    PM_U64(cpf.output_stats, bytes_written);
+    PM_U64(cpf.output_stats, num_sidecars_written);
     PM_END;
     return;
 

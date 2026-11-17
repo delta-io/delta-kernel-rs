@@ -303,6 +303,7 @@ impl MetricEvent {
                     mode: e.mode,
                     duration: e.duration,
                     processing_stats: e.processing_stats,
+                    output_stats: e.output_stats,
                 })
             }
             Self::ChecksumWriteSuccess(e) => Self::ChecksumWriteFailure(ChecksumWriteFailure {
@@ -379,7 +380,7 @@ pub enum CheckpointWriteOutcome {
 /// Checkpoint format and sidecar-writing mode selected during a checkpoint call.
 ///
 /// The mode is retained if preparation or writing fails. It describes the selected work;
-/// [`CheckpointWriteStats::num_sidecars`] reports how many sidecars were actually written.
+/// [`CheckpointOutputStats::num_sidecars_written`] reports how many sidecar writes succeeded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, EnumString, StrumDisplay, AsRefStr, IntoStaticStr)]
 #[strum(serialize_all = "snake_case")]
 pub enum CheckpointWriteMode {
@@ -396,9 +397,9 @@ pub enum CheckpointWriteMode {
 
 /// A [`crate::Snapshot::checkpoint`] call wrote a checkpoint or reported that one already exists.
 ///
-/// [`CheckpointWriteOutcome::Written`] reports completed batch processing. An early
-/// [`CheckpointWriteOutcome::AlreadyExists`] reports zero processing values; an `AlreadyExists`
-/// return after processing starts retains the work performed.
+/// [`CheckpointWriteOutcome::Written`] reports completed processing and output. An early
+/// [`CheckpointWriteOutcome::AlreadyExists`] reports zero processing and output values;
+/// an `AlreadyExists` return after processing starts retains the work performed.
 #[derive(Debug, Clone)]
 pub struct CheckpointWriteSuccess {
     /// Unique identifier for this checkpoint attempt.
@@ -416,13 +417,15 @@ pub struct CheckpointWriteSuccess {
     pub duration: Duration,
     /// Work performed while producing checkpoint batches, including on an AlreadyExists return.
     pub processing_stats: CheckpointProcessingStats,
+    /// Output work performed, including on an AlreadyExists return after writing starts.
+    pub output_stats: CheckpointOutputStats,
 }
 
 /// A [`crate::Snapshot::checkpoint`] call returned an error.
 ///
-/// Processing metrics retain the work performed before the error and are zero for preflight
-/// failures. If hint publication or returned snapshot construction fails after checkpoint data
-/// completion, the failure event retains the completed processing metrics.
+/// Processing and output metrics retain work performed before the error and are zero for
+/// preflight failures. If hint publication or returned snapshot construction fails after checkpoint
+/// data completion, the failure event retains the completed processing and output metrics.
 #[derive(Debug, Clone)]
 pub struct CheckpointWriteFailure {
     /// Unique identifier for this checkpoint attempt.
@@ -437,6 +440,9 @@ pub struct CheckpointWriteFailure {
     pub duration: Duration,
     /// Work performed before the error.
     pub processing_stats: CheckpointProcessingStats,
+    /// Output work performed before the error, including successful writes before verification
+    /// fails.
+    pub output_stats: CheckpointOutputStats,
 }
 
 /// Processing times and input action counts for one [`crate::Snapshot::checkpoint`] attempt.
@@ -454,9 +460,14 @@ pub struct CheckpointWriteFailure {
 /// checkpoint, such as checkpoint metadata and sidecar references.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct CheckpointProcessingStats {
-    /// Time creating and advancing the iterator over log, checkpoint, and sidecar batches.
-    /// Includes input reads, decoding, and the final or failing iterator call.
-    pub input_duration: Duration,
+    /// Time setting up and consuming input from commit and log-compaction files.
+    /// Includes reads, decoding, waits, and final or failing iterator calls.
+    pub log_tail_input_duration: Duration,
+
+    /// Time setting up and consuming the previous checkpoint and its sidecars.
+    /// Includes schema/footer reads, sidecar-reference extraction, decoding, waits, and final
+    /// or failing iterator calls. Includes JSON main checkpoints as well as Parquet input.
+    pub checkpoint_input_duration: Duration,
 
     /// Time reconciling input actions and building selection vectors.
     pub reconciliation_duration: Duration,
@@ -480,19 +491,37 @@ pub struct CheckpointProcessingStats {
     pub num_actions_from_checkpoint: u64,
 }
 
-/// Size and action counts from a successful checkpoint write, excluding `_last_checkpoint`.
+/// Output work performed by one checkpoint attempt, retained on failures and AlreadyExists returns.
+///
+/// Timings measure elapsed time, including waits. They exclude `_last_checkpoint` publication.
+/// Byte and sidecar counts include only successful Parquet write calls, even if size verification
+/// subsequently fails. Bytes uploaded by a failing call are not available from the engine API.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CheckpointOutputStats {
+    /// Parquet writer time, excluding pulls from its input iterator. Includes failing write calls.
+    pub parquet_write_duration: Duration,
+    /// Time querying storage metadata and verifying written file sizes, including failures.
+    pub verification_duration: Duration,
+    /// Sum of sizes returned by successful Parquet writes of the main checkpoint and new sidecars.
+    pub bytes_written: u64,
+    /// Sidecars whose Parquet write calls returned successfully.
+    pub num_sidecars_written: u64,
+}
+
+/// Contents of a completed checkpoint, including referenced sidecars and excluding
+/// `_last_checkpoint`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct CheckpointWriteStats {
-    /// Combined byte size of the main checkpoint and all sidecar files.
-    pub bytes_written: u64,
-    /// Active Add-file actions written after reconciliation.
+    /// Main checkpoint size plus every referenced sidecar's size.
+    pub size_in_bytes: u64,
+    /// Active Add actions across the completed checkpoint.
     pub num_add_files: u64,
-    /// Retained Remove-file tombstones written, excluding expired tombstones.
+    /// Retained Remove actions across the completed checkpoint.
     pub num_remove_files: u64,
-    /// All emitted actions across the main checkpoint and sidecars, including metadata and
+    /// Action rows across the main checkpoint and referenced sidecars, including metadata and
     /// sidecar references. This is not the sum of Add and Remove counts.
     pub num_actions: u64,
-    /// Actual sidecar files written; zero when none were produced.
+    /// Total sidecars referenced by the completed checkpoint.
     pub num_sidecars: u64,
 }
 
@@ -509,6 +538,7 @@ impl CheckpointWriteSuccess {
             mode: CheckpointWriteMode::NotAttempted,
             duration: Duration::ZERO,
             processing_stats: CheckpointProcessingStats::default(),
+            output_stats: CheckpointOutputStats::default(),
         };
         attrs.record(&mut event);
         event
@@ -518,8 +548,11 @@ impl CheckpointWriteSuccess {
         match name {
             "version" => self.version = value,
             "duration_ns" => self.duration = Duration::from_nanos(value),
-            "input_duration_ns" => {
-                self.processing_stats.input_duration = Duration::from_nanos(value)
+            "log_tail_input_duration_ns" => {
+                self.processing_stats.log_tail_input_duration = Duration::from_nanos(value)
+            }
+            "checkpoint_input_duration_ns" => {
+                self.processing_stats.checkpoint_input_duration = Duration::from_nanos(value)
             }
             "reconciliation_duration_ns" => {
                 self.processing_stats.reconciliation_duration = Duration::from_nanos(value)
@@ -534,6 +567,14 @@ impl CheckpointWriteSuccess {
             "num_actions_from_checkpoint" => {
                 self.processing_stats.num_actions_from_checkpoint = value
             }
+            "parquet_write_duration_ns" => {
+                self.output_stats.parquet_write_duration = Duration::from_nanos(value)
+            }
+            "verification_duration_ns" => {
+                self.output_stats.verification_duration = Duration::from_nanos(value)
+            }
+            "bytes_written" => self.output_stats.bytes_written = value,
+            "num_sidecars_written" => self.output_stats.num_sidecars_written = value,
             _ => return self.record_write_stats(name, value),
         }
         Ok(())
@@ -545,7 +586,7 @@ impl CheckpointWriteSuccess {
             _ => CheckpointWriteStats::default(),
         };
         match name {
-            "bytes_written" => stats.bytes_written = value,
+            "size_in_bytes" => stats.size_in_bytes = value,
             "num_add_files" => stats.num_add_files = value,
             "num_remove_files" => stats.num_remove_files = value,
             "num_actions" => stats.num_actions = value,
@@ -587,13 +628,14 @@ impl fmt::Display for CheckpointWriteSuccess {
         write!(
             f,
             "CheckpointWriteSuccess(id={}, version={}, outcome={}, mode={}, \
-             duration={:?}, processing_stats={:?}",
+             duration={:?}, processing_stats={:?}, output_stats={:?}",
             self.operation_id,
             self.version,
             self.outcome,
             self.mode,
             self.duration,
             self.processing_stats,
+            self.output_stats,
         )?;
         if let CheckpointWriteOutcome::Written { stats } = self.outcome {
             write!(f, ", stats={stats:?}")?;
@@ -607,8 +649,13 @@ impl fmt::Display for CheckpointWriteFailure {
         write!(
             f,
             "CheckpointWriteFailure(id={}, version={}, mode={}, \
-             duration={:?}, processing_stats={:?})",
-            self.operation_id, self.version, self.mode, self.duration, self.processing_stats,
+             duration={:?}, processing_stats={:?}, output_stats={:?})",
+            self.operation_id,
+            self.version,
+            self.mode,
+            self.duration,
+            self.processing_stats,
+            self.output_stats,
         )
     }
 }
@@ -2508,7 +2555,7 @@ mod tests {
     #[case::written_nonzero(
         CheckpointWriteOutcome::Written {
             stats: CheckpointWriteStats {
-                bytes_written: 50,
+                size_in_bytes: 50,
                 num_add_files: 1,
                 num_remove_files: 2,
                 num_actions: 7,

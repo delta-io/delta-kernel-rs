@@ -469,23 +469,11 @@ impl CheckpointWriter {
         engine: &dyn Engine,
         metrics: CheckpointMetrics,
     ) -> KernelResult<(ActionReconciliationIterator, SchemaRef)> {
-        let mut actions = {
-            let _timer = metrics.start(CheckpointPhase::Input);
-            self.snapshot
-                .log_segment()
-                .read_actions(engine, self.read_schema.clone())?
-        };
-        let input_metrics = metrics.clone();
-        let actions = std::iter::from_fn(move || {
-            let batch = {
-                let _timer = input_metrics.start(CheckpointPhase::Input);
-                actions.next()
-            };
-            if let Some(Ok(batch)) = &batch {
-                input_metrics.record_input(batch);
-            }
-            batch
-        });
+        let actions = self.snapshot.log_segment().read_actions_for_checkpoint(
+            engine,
+            self.read_schema.clone(),
+            metrics.clone(),
+        )?;
 
         // Process actions through reconciliation
         let mut processor = ActionReconciliationProcessor::new(
@@ -628,7 +616,7 @@ impl CheckpointWriter {
             data_iter,
             engine.evaluation_handler().as_ref(),
             output_schema.clone(),
-            metrics,
+            metrics.clone(),
         )?;
 
         // Write sidecar files
@@ -640,6 +628,7 @@ impl CheckpointWriter {
                 file_actions_per_sidecar_hint,
                 self.snapshot.table_root(),
                 self.snapshot.version(),
+                &metrics,
             )? {
                 sidecar_metas.push(entry);
             }
@@ -675,9 +664,12 @@ impl CheckpointWriter {
         let checkpoint_path = self.checkpoint_path()?;
         let main_data: Box<dyn KernelResultIterator<Box<dyn EngineData>>> =
             Box::new(non_file_batches.into_iter().chain(sidecar_batch).map(Ok));
-        let main_size = engine
-            .parquet_handler()
-            .write_parquet_file(checkpoint_path.clone(), main_data)?;
+        let main_size = metrics.write_parquet_file(
+            engine.parquet_handler().as_ref(),
+            checkpoint_path.clone(),
+            main_data,
+            false,
+        )?;
 
         // size_in_bytes covers the main checkpoint file plus all sidecar files.
         let sidecar_sizes_sum = sidecar_metas
@@ -692,6 +684,7 @@ impl CheckpointWriter {
             main_size,
             sidecar_sizes_sum,
             sidecar_count,
+            &metrics,
         )
     }
 
@@ -705,15 +698,19 @@ impl CheckpointWriter {
         let checkpoint_path = self.checkpoint_path()?;
         let (data_iter, _) = self.checkpoint_data_with_schema(engine, metrics.clone())?;
         let state = data_iter.state();
+        let preparation_metrics = metrics.clone();
         let lazy_data = data_iter.map(move |r| {
             r.and_then(|f| {
-                let _timer = metrics.start(CheckpointPhase::OutputPreparation);
+                let _timer = preparation_metrics.start(CheckpointPhase::OutputPreparation);
                 f.apply_selection_vector()
             })
         });
-        let main_size = engine
-            .parquet_handler()
-            .write_parquet_file(checkpoint_path.clone(), Box::new(lazy_data))?;
+        let main_size = metrics.write_parquet_file(
+            engine.parquet_handler().as_ref(),
+            checkpoint_path.clone(),
+            Box::new(lazy_data),
+            false,
+        )?;
 
         build_written_checkpoint_info(
             engine,
@@ -722,6 +719,7 @@ impl CheckpointWriter {
             main_size,
             0, /* sidecar_sizes_sum */
             0, /* sidecar_count */
+            &metrics,
         )
     }
 
@@ -885,6 +883,7 @@ fn write_single_sidecar(
     file_actions_per_sidecar_hint: usize,
     table_root: &Url,
     version: Version,
+    metrics: &CheckpointMetrics,
 ) -> KernelResult<Option<(String, FileMeta)>> {
     let mut iter =
         SingleSidecarDataIterator::new(splitter.clone(), file_actions_per_sidecar_hint)?.peekable();
@@ -892,11 +891,13 @@ fn write_single_sidecar(
         return Ok(None);
     }
     let (filename, sidecar_url) = path::new_sidecar(table_root, version)?;
-    let written_size = engine
-        .parquet_handler()
-        .write_parquet_file(sidecar_url.clone(), Box::new(iter))?;
-    let meta = engine.storage_handler().head(&sidecar_url)?;
-    verify_written_size(&sidecar_url, written_size, meta.size)?;
+    let written_size = metrics.write_parquet_file(
+        engine.parquet_handler().as_ref(),
+        sidecar_url.clone(),
+        Box::new(iter),
+        true,
+    )?;
+    let meta = verify_written_file(engine, &sidecar_url, written_size, metrics)?;
     Ok(Some((filename, meta)))
 }
 
@@ -913,6 +914,18 @@ fn verify_written_size(path: &Url, written_size: u64, observed_size: u64) -> Ker
     Ok(())
 }
 
+fn verify_written_file(
+    engine: &dyn Engine,
+    path: &Url,
+    written_size: u64,
+    metrics: &CheckpointMetrics,
+) -> KernelResult<FileMeta> {
+    let _timer = metrics.start(CheckpointPhase::Verification);
+    let meta = engine.storage_handler().head(path)?;
+    verify_written_size(path, written_size, meta.size)?;
+    Ok(meta)
+}
+
 fn build_written_checkpoint_info(
     engine: &dyn Engine,
     checkpoint_path: &Url,
@@ -920,9 +933,9 @@ fn build_written_checkpoint_info(
     written_size: u64,
     sidecar_sizes_sum: u64,
     sidecar_count: u64,
+    metrics: &CheckpointMetrics,
 ) -> KernelResult<WrittenCheckpointInfo> {
-    let file_meta = engine.storage_handler().head(checkpoint_path)?;
-    verify_written_size(checkpoint_path, written_size, file_meta.size)?;
+    let file_meta = verify_written_file(engine, checkpoint_path, written_size, metrics)?;
     let total_size_in_bytes = file_meta
         .size
         .checked_add(sidecar_sizes_sum)
