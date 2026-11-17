@@ -86,6 +86,11 @@ impl MultiFileWrite {
         Ok(write)
     }
 
+    /// Returns the fixed file metadata fields preceding partition keys and statistics.
+    pub fn metadata_schema() -> &'static SchemaRef {
+        &DESCRIPTOR_SCHEMA
+    }
+
     /// Validates this operator and derives its fixed metadata, partition and statistics fields.
     ///
     /// Returns an error under the conditions documented on [`try_new`](Self::try_new), including
