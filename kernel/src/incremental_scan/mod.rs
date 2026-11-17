@@ -83,7 +83,8 @@ impl IncrementalScanBuilder {
     /// JSONs (consumers should fall back to a full scan via [`crate::Snapshot::scan_builder`]).
     /// That happens when the target snapshot's commit list does not cover
     /// `(base_version, target_version]`, or when some commit in the range may record file actions
-    /// outside its commit JSON (e.g. adaptiveMetadata manifest commits).
+    /// outside its commit JSON (e.g. adaptiveMetadata manifest commits). TODO(#2866): serve such
+    /// ranges by reading their file actions from the metadata tree instead of returning `None`.
     ///
     /// Does not re-list `_delta_log/`: walks the target snapshot's already-validated commit
     /// list and clips it to `(base_version, target_version]`. For catalog-managed tables
