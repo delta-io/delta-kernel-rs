@@ -31,12 +31,12 @@ pub(crate) const DEFAULT_LOG_RETENTION_DURATION: &str = "interval 30 days";
 pub(crate) const DEFAULT_DELETED_FILE_RETENTION_DURATION: &str = "interval 1 week";
 
 /// Where a recognized property may be set.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy)]
 enum PropertyAccess {
     /// Accepted on CREATE and UPDATE with value validation.
-    Editable,
+    Editable(fn(&str) -> bool),
     /// Accepted on CREATE with value validation; rejected on UPDATE until protocol prep exists.
-    CreateOnly,
+    CreateOnly(fn(&str) -> bool),
     /// Known but never settable by connectors through property APIs.
     Recognized,
 }
@@ -46,24 +46,19 @@ enum PropertyAccess {
 struct TablePropertyDef {
     key: &'static str,
     access: PropertyAccess,
-    /// Returns `true` when `value` is syntactically valid. Unused for
-    /// [`PropertyAccess::Recognized`].
-    validate: Option<fn(&str) -> bool>,
 }
 
 const fn editable(key: &'static str, validate: fn(&str) -> bool) -> TablePropertyDef {
     TablePropertyDef {
         key,
-        access: PropertyAccess::Editable,
-        validate: Some(validate),
+        access: PropertyAccess::Editable(validate),
     }
 }
 
 const fn create_only(key: &'static str, validate: fn(&str) -> bool) -> TablePropertyDef {
     TablePropertyDef {
         key,
-        access: PropertyAccess::CreateOnly,
-        validate: Some(validate),
+        access: PropertyAccess::CreateOnly(validate),
     }
 }
 
@@ -71,7 +66,6 @@ const fn recognized(key: &'static str) -> TablePropertyDef {
     TablePropertyDef {
         key,
         access: PropertyAccess::Recognized,
-        validate: None,
     }
 }
 
@@ -202,9 +196,15 @@ pub(crate) fn is_delta_property_key(key: &str) -> bool {
         .is_some_and(|prefix| prefix.eq_ignore_ascii_case(DELTA_PROPERTY_PREFIX))
 }
 
-fn is_table_feature_signal_key(key: &str) -> bool {
+/// Returns `true` when `key` is a `delta.feature.*` signal (case-insensitive prefix).
+pub(crate) fn is_table_feature_signal_key(key: &str) -> bool {
     key.get(..SET_TABLE_FEATURE_SUPPORTED_PREFIX.len())
         .is_some_and(|prefix| prefix.eq_ignore_ascii_case(SET_TABLE_FEATURE_SUPPORTED_PREFIX))
+}
+
+/// Strips a case-insensitive `delta.feature.` prefix, returning the feature name.
+pub(crate) fn strip_table_feature_signal_prefix(key: &str) -> Option<&str> {
+    is_table_feature_signal_key(key).then(|| &key[SET_TABLE_FEATURE_SUPPORTED_PREFIX.len()..])
 }
 
 #[derive(Clone, Copy)]
@@ -258,32 +258,24 @@ fn validate_and_normalize_property(
         });
     };
 
-    let allowed = matches!(
-        (operation, def.access),
+    let validate = match (operation, def.access) {
         (
             PropertySetOperation::Create,
-            PropertyAccess::Editable | PropertyAccess::CreateOnly
-        ) | (PropertySetOperation::Update, PropertyAccess::Editable)
-    );
-    if !allowed {
-        return Err(match operation {
-            PropertySetOperation::Create => KernelError::generic(format!(
-                "Setting delta property '{}' is not supported during CREATE TABLE",
-                def.key
-            )),
-            PropertySetOperation::Update => KernelError::invalid_transaction_state(format!(
-                "Cannot modify the table property '{}'",
-                def.key
-            )),
-        });
-    }
-
-    let Some(validate) = def.validate else {
-        // Settable entries always carry a validator; Recognized ones are rejected above.
-        return Err(KernelError::internal_error(format!(
-            "table property '{}' is marked settable without a validator",
-            def.key
-        )));
+            PropertyAccess::Editable(validate) | PropertyAccess::CreateOnly(validate),
+        )
+        | (PropertySetOperation::Update, PropertyAccess::Editable(validate)) => validate,
+        _ => {
+            return Err(match operation {
+                PropertySetOperation::Create => KernelError::generic(format!(
+                    "Setting delta property '{}' is not supported during CREATE TABLE",
+                    def.key
+                )),
+                PropertySetOperation::Update => KernelError::invalid_transaction_state(format!(
+                    "Cannot modify the table property '{}'",
+                    def.key
+                )),
+            });
+        }
     };
 
     if !validate(&value) {
@@ -334,25 +326,54 @@ pub(crate) fn validate_and_normalize_property_for_update(
 pub(crate) fn validate_log_and_deleted_file_retention(
     configuration: &HashMap<String, String>,
 ) -> KernelResult<()> {
-    let log_raw = configuration
-        .get(LOG_RETENTION_DURATION)
-        .map(String::as_str)
-        .unwrap_or(DEFAULT_LOG_RETENTION_DURATION);
-    let deleted_raw = configuration
-        .get(DELETED_FILE_RETENTION_DURATION)
-        .map(String::as_str)
-        .unwrap_or(DEFAULT_DELETED_FILE_RETENTION_DURATION);
+    check_log_and_deleted_file_retention(
+        configuration,
+        /* require_parse_log= */ true,
+        /* require_parse_deleted= */ true,
+    )
+}
 
-    let log = parse_interval(log_raw).ok_or_else(|| {
-        KernelError::invalid_transaction_state(format!(
-            "Invalid value '{log_raw}' for table property '{LOG_RETENTION_DURATION}'"
-        ))
-    })?;
-    let deleted = parse_interval(deleted_raw).ok_or_else(|| {
-        KernelError::invalid_transaction_state(format!(
-            "Invalid value '{deleted_raw}' for table property '{DELETED_FILE_RETENTION_DURATION}'"
-        ))
-    })?;
+/// Retention cross-check for UPDATE after property adds have been validated.
+///
+/// Runs only when `validated_adds` sets a retention key (Spark checks only then). Existing values
+/// that this crate's interval parser cannot read are treated as the protocol default for the
+/// untouched side, so legacy spellings do not block every property update.
+pub(crate) fn validate_retention_for_property_adds(
+    existing: &HashMap<String, String>,
+    validated_adds: &HashMap<String, String>,
+) -> KernelResult<()> {
+    let sets_log = validated_adds.contains_key(LOG_RETENTION_DURATION);
+    let sets_deleted = validated_adds.contains_key(DELETED_FILE_RETENTION_DURATION);
+    if !sets_log && !sets_deleted {
+        return Ok(());
+    }
+
+    let mut merged = existing.clone();
+    merged.extend(
+        validated_adds
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone())),
+    );
+    check_log_and_deleted_file_retention(&merged, sets_log, sets_deleted)
+}
+
+fn check_log_and_deleted_file_retention(
+    configuration: &HashMap<String, String>,
+    require_parse_log: bool,
+    require_parse_deleted: bool,
+) -> KernelResult<()> {
+    let (log_raw, log) = retention_duration_for_comparison(
+        configuration,
+        LOG_RETENTION_DURATION,
+        DEFAULT_LOG_RETENTION_DURATION,
+        require_parse_log,
+    )?;
+    let (deleted_raw, deleted) = retention_duration_for_comparison(
+        configuration,
+        DELETED_FILE_RETENTION_DURATION,
+        DEFAULT_DELETED_FILE_RETENTION_DURATION,
+        require_parse_deleted,
+    )?;
 
     if log < deleted {
         let log_present = configuration.contains_key(LOG_RETENTION_DURATION);
@@ -370,6 +391,31 @@ pub(crate) fn validate_log_and_deleted_file_retention(
         return Err(KernelError::invalid_transaction_state(message));
     }
     Ok(())
+}
+
+fn retention_duration_for_comparison(
+    configuration: &HashMap<String, String>,
+    key: &str,
+    default: &str,
+    require_parse: bool,
+) -> KernelResult<(String, std::time::Duration)> {
+    let parsed_default = || {
+        parse_interval(default).ok_or_else(|| {
+            KernelError::internal_error(format!("invalid built-in retention default '{default}'"))
+        })
+    };
+    let Some(raw) = configuration.get(key).map(String::as_str) else {
+        return Ok((default.to_string(), parsed_default()?));
+    };
+    if let Some(duration) = parse_interval(raw) {
+        return Ok((raw.to_string(), duration));
+    }
+    if require_parse {
+        return Err(KernelError::invalid_transaction_state(format!(
+            "Invalid value '{raw}' for table property '{key}'"
+        )));
+    }
+    Ok((default.to_string(), parsed_default()?))
 }
 
 #[cfg(test)]
@@ -568,7 +614,7 @@ mod tests {
         );
 
         for def in EDITABLE_CONFIG_PROPERTIES {
-            assert_eq!(def.access, PropertyAccess::Editable);
+            assert!(matches!(def.access, PropertyAccess::Editable(_)));
             let (canonical, _) =
                 validate_and_normalize_property_for_create(def.key, sample_value(def)).unwrap();
             assert_eq!(canonical, def.key);
@@ -598,7 +644,7 @@ mod tests {
             .iter()
             .chain(KERNEL_MANAGED_PROPERTIES.iter())
             .chain(OTHER_RECOGNIZED_PROPERTIES.iter())
-            .filter(|def| def.access != PropertyAccess::Editable);
+            .filter(|def| !matches!(def.access, PropertyAccess::Editable(_)));
 
         for def in non_editable {
             for key in [def.key.to_string(), def.key.to_ascii_uppercase()] {
@@ -664,6 +710,50 @@ mod tests {
             error
                 .to_string()
                 .contains("needs to be less than or equal to"),
+            "error={error}"
+        );
+    }
+
+    #[test]
+    fn update_retention_check_skips_when_no_retention_key_is_set() {
+        let existing = HashMap::from([
+            (LOG_RETENTION_DURATION.to_string(), "2 weeks".to_string()),
+            (
+                DELETED_FILE_RETENTION_DURATION.to_string(),
+                "INTERVAL 30 DAYS".to_string(),
+            ),
+        ]);
+        let adds = HashMap::from([("app.owner".to_string(), "kernel".to_string())]);
+        validate_retention_for_property_adds(&existing, &adds).unwrap();
+    }
+
+    #[test]
+    fn update_retention_check_defaults_unparseable_existing_untouched_side() {
+        let existing = HashMap::from([(LOG_RETENTION_DURATION.to_string(), "2 weeks".to_string())]);
+        // deleted=1 day vs default log=30 days is compatible; unparseable existing log must not
+        // fail.
+        let adds = HashMap::from([(
+            DELETED_FILE_RETENTION_DURATION.to_string(),
+            "interval 1 days".to_string(),
+        )]);
+        validate_retention_for_property_adds(&existing, &adds).unwrap();
+    }
+
+    #[test]
+    fn update_retention_check_uses_existing_log_when_only_deleted_is_set() {
+        let existing = HashMap::from([(
+            LOG_RETENTION_DURATION.to_string(),
+            "interval 3 days".to_string(),
+        )]);
+        let adds = HashMap::from([(
+            DELETED_FILE_RETENTION_DURATION.to_string(),
+            "interval 7 days".to_string(),
+        )]);
+        let error = validate_retention_for_property_adds(&existing, &adds).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("needs to be greater than or equal to"),
             "error={error}"
         );
     }

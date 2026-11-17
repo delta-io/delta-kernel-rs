@@ -18,7 +18,7 @@ use crate::table_features::{
 };
 use crate::table_properties::{
     DELTA_PROPERTY_PREFIX, is_delta_property_key, validate_and_normalize_property_for_update,
-    validate_log_and_deleted_file_retention,
+    validate_retention_for_property_adds,
 };
 use crate::transaction::domain_metadata::validate_unique_domains;
 use crate::transaction::schema_evolution::{SchemaOperation, evolve_table_config};
@@ -389,18 +389,16 @@ impl<MODE: ExecutionMode> TransactionBuilder<UpdateTable, MODE> {
         }
         // Duplicate additions are validated by the shared builder state.
         self.common_state.validate()?;
-        // Retention checks do not need the engine; reject before I/O.
-        if !properties_added.is_empty() {
-            let mut merged = self
-                .local_state
+        // Retention checks do not need the engine; reject before I/O. Retention is checked only
+        // when a retention key is being set (Spark parity).
+        validate_retention_for_property_adds(
+            self.local_state
                 .snapshot
                 .table_configuration()
                 .metadata()
-                .configuration()
-                .clone();
-            merged.extend(properties_added);
-            validate_log_and_deleted_file_retention(&merged)?;
-        }
+                .configuration(),
+            &properties_added,
+        )?;
         Ok(())
     }
 }
@@ -677,7 +675,10 @@ mod tests {
     use crate::schema::{DataType, StructField, schema_ref};
     use crate::snapshot::Snapshot;
     use crate::table_features::TableFeature;
-    use crate::table_properties::{ENABLE_ICEBERG_COMPAT_V2, ENABLE_ICEBERG_COMPAT_V3};
+    use crate::table_properties::{
+        DELETED_FILE_RETENTION_DURATION, ENABLE_ICEBERG_COMPAT_V2, ENABLE_ICEBERG_COMPAT_V3,
+        LOG_RETENTION_DURATION,
+    };
     use crate::transaction::create_table::create_table;
     use crate::transaction::{SchemaOperation, UpdateTableOperation};
     use crate::unit_test_utils::{copy_test_table, load_test_table, test_schema_flat};
@@ -1310,6 +1311,33 @@ mod tests {
                 ("delta.logRetentionDuration", "interval 1 days"),
                 ("delta.deletedFileRetentionDuration", "interval 7 days"),
             ])
+            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))
+            .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("needs to be greater than or equal to"),
+            "error={error}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn with_table_properties_added_checks_retention_against_existing_log_value() -> Result<()> {
+        let engine = Arc::new(SyncEngine::new_with_store(Arc::new(InMemory::new())));
+        let snapshot = create_table("memory:///", test_schema_flat(), "test-engine", true)
+            .with_table_properties([
+                (LOG_RETENTION_DURATION, "interval 3 days"),
+                (DELETED_FILE_RETENTION_DURATION, "interval 1 days"),
+            ])
+            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+            .commit(engine.as_ref())?
+            .unwrap_post_commit_snapshot();
+
+        let error = snapshot
+            .update_table(UpdateTableOperation::AlterTable, "test-engine", false)
+            .with_table_properties_added([(DELETED_FILE_RETENTION_DURATION, "interval 7 days")])
             .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))
             .unwrap_err();
 
