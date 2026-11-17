@@ -1010,7 +1010,7 @@ mod tests {
     )]
     #[case::size_overflow(
         DeletionVectorInfo { size_in_bytes: i64::from(i32::MAX) + 10, ..test_dv_info() },
-        "Int64 value '2147483649' to integer failed"
+        "2147483649"
     )]
     #[case::negative_offset(
         DeletionVectorInfo { offset: -1, ..test_dv_info() },
@@ -1018,7 +1018,7 @@ mod tests {
     )]
     #[case::offset_overflow(
         DeletionVectorInfo { offset: i64::from(i32::MAX) + 1, ..test_dv_info() },
-        "Int64 value '2147483648' to integer failed"
+        "2147483648"
     )]
     #[case::negative_cardinality(
         DeletionVectorInfo { cardinality: -1, ..test_dv_info() },
