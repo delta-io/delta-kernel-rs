@@ -210,7 +210,7 @@ mod tests {
         create_adaptive_metadata_table, write_sidecar,
     };
     use crate::unit_test_utils::{
-        Action, TestCancellationToken, assert_result_error_with_message, create_log_path_with_size,
+        Action, TestCancellationToken, assert_result_error_with_message,
         test_schema_flat_with_column_mapping,
     };
     use crate::{CancellationTokenRef, Error, Version};
@@ -329,8 +329,6 @@ mod tests {
         assert_eq!(batches, commit_then_tree_batches());
     }
 
-    /// A compacted delta that starts at or before the checkpoint action's version spans it and is
-    /// never read; one that starts after it is.
     #[rstest]
     #[case::spans_checkpoint_version(
         TWO_ADDS_VERSION,
@@ -341,12 +339,13 @@ mod tests {
         TWO_ADDS_VERSION - 1,
         TWO_ADDS_VERSION,
         vec![
-            (true, strings(&["compacted.parquet"]), vec![]),
+            (true, strings(&["c.parquet"]), strings(&["a.parquet"])),
+            (true, strings(&["b.parquet"]), vec![]),
             (false, strings(&["a.parquet", "b.parquet"]), vec![]),
         ]
     )]
     #[tokio::test]
-    async fn compacted_delta_is_read_only_when_it_starts_after_checkpoint_version(
+    async fn checkpoint_action_replay_ignores_compactions(
         #[case] checkpoint_version: Version,
         #[case] compaction_start: Version,
         #[case] expected: Vec<BatchPaths>,
@@ -369,15 +368,8 @@ mod tests {
         .unwrap();
         let path = Path::from(format!("_delta_log/{name}"));
         store.put(&path, compacted.clone().into()).await.unwrap();
-        let mut log_segment = latest_log_segment(&table_root(), &engine);
-        // Listing skips compacted deltas while log compaction is disabled (#2337).
-        log_segment
-            .listed
-            .ascending_compaction_files
-            .push(create_log_path_with_size(
-                log_root().log_root().join(&name).unwrap().as_str(),
-                compacted.len() as u64,
-            ));
+        let log_segment = latest_log_segment(&table_root(), &engine);
+        assert_eq!(log_segment.listed.ascending_compaction_files.len(), 1);
 
         let batches = read_paths(
             &engine,

@@ -59,20 +59,24 @@ impl<'a> MetadataPlanner<'a> {
             .flatten();
 
         let adds_actions = ActionSet::live_adds();
-        Ok(Self::new(scan.snapshot.log_segment(), adds_actions)
-            .with_stats(scan.stats.clone())
-            .with_stats_schemas(
-                scan.stats
-                    .json_synthesis_schema(scan.snapshot.table_configuration())?
-                    .or_else(|| scan.state_info.physical_stats_read_schema().cloned()),
-                scan.state_info.physical_stats_output_schema().cloned(),
-            )
-            .with_partition_values(
-                scan.partition_values_options.clone(),
-                parsed_partition_schema.cloned(),
-            )
-            .with_read_collations(scan.needs_collation_stats_schema())
-            .with_stats_filter(stats_filter))
+        Ok(Self::new(
+            scan.snapshot.log_segment(),
+            adds_actions,
+            !scan.snapshot.has_adaptive_metadata(),
+        )
+        .with_stats(scan.stats.clone())
+        .with_stats_schemas(
+            scan.stats
+                .json_synthesis_schema(scan.snapshot.table_configuration())?
+                .or_else(|| scan.state_info.physical_stats_read_schema().cloned()),
+            scan.state_info.physical_stats_output_schema().cloned(),
+        )
+        .with_partition_values(
+            scan.partition_values_options.clone(),
+            parsed_partition_schema.cloned(),
+        )
+        .with_read_collations(scan.needs_collation_stats_schema())
+        .with_stats_filter(stats_filter))
     }
 }
 

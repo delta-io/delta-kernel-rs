@@ -477,22 +477,43 @@ jobs:
           make
           make test
   miri:
-    name: "Miri (shard ${{ matrix.partition }}/3)"
+    name: "Miri (shard ${{ matrix.partition }}/5)"
     runs-on: ubuntu-latest
+    env:
+      # Use the latest nightly so CI gets Miri fixes and new checks without manual pin updates.
+      # Each new nightly changes the rust-cache key, so PR and merge-queue runs rebuild
+      # dependencies until a successful shard-1 job on main saves a cache entry for that nightly.
+      MIRI_TOOLCHAIN: nightly
     strategy:
       matrix:
-        partition: [1, 2, 3]
+        partition: [1, 2, 3, 4, 5]
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      # Install nightly before rust-cache so the cache key includes this nightly's version.
+      # Otherwise rust-cache would restore dependencies built by an older nightly, and Cargo
+      # would rebuild them.
       - name: Install Miri
         run: |
-          rustup toolchain install nightly --component miri
-          rustup override set nightly
+          rustup toolchain install "$MIRI_TOOLCHAIN" --component miri
+          rustup override set "$MIRI_TOOLCHAIN"
+          # `cargo miri setup` builds Miri's sysroot on every run. Caching it wouldn't help:
+          # Miri rebuilds the sysroot when rust-src file mtimes change, and each fresh rustup
+          # install writes those files with new mtimes.
           cargo miri setup
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      # Miri needs rust-cache 2.9.2 or newer. Before saving, older versions cut nightly Cargo's
+      # `build/proc-macro2/` and `.fingerprint/proc-macro2/` names at the last `-`, find no crate
+      # named `proc`, and delete both. Cargo then rebuilds that crate and its dependents after
+      # each restore. Stable Cargo names these directories `proc-macro2-<hash>/`, which older
+      # versions parse correctly, so the other jobs are unaffected.
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           cache-bin: false
-          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+          # All shards restore this cache; only shard 1 saves it, to avoid uploading it five times.
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && matrix.partition == 1 }}
+      # rust-cache runs `cargo metadata` without `--locked`, which can rewrite Cargo.lock. Fail
+      # here because the later `--locked` test command would accept the rewritten lockfile.
+      - name: Check cache setup preserved Cargo.lock
+        run: git diff --exit-code -- Cargo.lock
       - uses: taiki-e/install-action@98ec31d284eb962f41c14065e9391a955aa810cf # nextest
         with:
           tool: cargo-nextest@0.9.132
@@ -516,7 +537,7 @@ jobs:
           printf 'CARGO_INCREMENTAL=%s\n' "$CARGO_INCREMENTAL" \
             | tee target/ci-telemetry/miri-settings.txt
           pushd ffi
-          MIRIFLAGS="-Zmiri-disable-isolation -Zmiri-provenance-gc=1000000" cargo miri nextest run --locked --features default-engine-rustls,delta-kernel-unity-catalog,declarative-plans,vendored-protoc,geo-type-in-dev --partition slice:${{ matrix.partition }}/3
+          MIRIFLAGS="-Zmiri-disable-isolation -Zmiri-provenance-gc=1000000" cargo miri nextest run --locked --features default-engine-rustls,delta-kernel-unity-catalog,declarative-plans,vendored-protoc,geo-type-in-dev --partition slice:${{ matrix.partition }}/5
       - name: Check Miri timing report
         run: test -s target/nextest/default-miri/junit.xml
       - name: Upload Miri timings and runner information

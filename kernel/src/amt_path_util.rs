@@ -7,7 +7,7 @@ use std::borrow::Cow;
 
 use url::{ParseError, Url};
 
-use crate::path_encoding::{uri_decode_path, uri_encode_path};
+use crate::path_encoding::{scheme_len, uri_decode_path, uri_encode_path, with_trailing_slash};
 use crate::utils::{require, to_file_size};
 use crate::{FileMeta, KernelError, KernelResult};
 
@@ -157,37 +157,6 @@ pub(crate) fn validate_table_relative(path: &str) -> KernelResult<()> {
     Ok(())
 }
 
-/// Returns the byte length of `location`'s URI scheme (excluding the terminating `:`), or `None`
-/// if `location` does not begin with one, per [RFC 3986 section 3.1]:
-/// `scheme = ALPHA *( ALPHA / DIGIT / "+" / "-" / "." )`, terminated by `:`.
-///
-/// A path without a scheme is relative (per the Iceberg V4 path spec).
-///
-/// [RFC 3986 section 3.1]: https://datatracker.ietf.org/doc/html/rfc3986#section-3.1
-fn scheme_len(location: &str) -> Option<usize> {
-    for (position, ch) in location.char_indices() {
-        if ch == ':' {
-            return (position > 0).then_some(position);
-        }
-        if !is_scheme_char(ch, position) {
-            return None;
-        }
-    }
-    None
-}
-
-/// Returns whether `ch` is allowed at `position` in a URI scheme, per [RFC 3986 section 3.1]:
-/// the first character must be `ALPHA`; subsequent characters may also be `DIGIT`, `+`, `-`, or
-/// `.`. Schemes are restricted to US-ASCII, so non-ASCII letters are rejected.
-///
-/// [RFC 3986 section 3.1]: https://datatracker.ietf.org/doc/html/rfc3986#section-3.1
-fn is_scheme_char(ch: char, position: usize) -> bool {
-    if ch.is_ascii_alphabetic() {
-        return true;
-    }
-    position > 0 && (ch.is_ascii_digit() || ch == '+' || ch == '-' || ch == '.')
-}
-
 /// Resolves a relative `path` against `table_root`: percent-encodes `path` so reserved URI
 /// characters survive a round trip through the object store, then concatenates it onto
 /// `table_root` with a single `/` separator and parses the result.
@@ -197,10 +166,7 @@ fn is_scheme_char(ch: char, position: usize) -> bool {
 /// Returns an error if the resolved location fails to parse as a [`Url`].
 fn encode_and_join(path: &str, table_root: &Url) -> KernelResult<Url> {
     reject_dot_segments(path)?;
-    let mut base = table_root.as_str().to_string();
-    if !base.ends_with('/') {
-        base.push('/');
-    }
+    let base = with_trailing_slash(table_root);
     uri_with_encoded_path(&base, path).map_err(|e| {
         KernelError::generic(format!(
             "Failed to resolve relative AMT location {path:?} against table root {base}: {e}"
@@ -228,6 +194,10 @@ fn uri_with_encoded_path(prefix: &str, raw_path: &str) -> Result<Url, ParseError
 
 /// Rejects a `path` containing a `.` or `..` segment: the Iceberg V4 path spec does not support
 /// relative navigation, and URL parsing would otherwise silently collapse such segments.
+///
+/// An AMT path is raw: kernel percent-encodes it before parsing, so `%` and `\` are data and only
+/// a literal `.` or `..` segment navigates. A `file` value's `uri` is already percent-encoded, so
+/// `file_uri::check_uri` also rejects `%2e` forms, `\`, and encoded separators.
 pub(crate) fn reject_dot_segments(path: &str) -> KernelResult<()> {
     require!(
         !path

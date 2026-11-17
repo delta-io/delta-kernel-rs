@@ -1341,6 +1341,7 @@ impl Scan {
             meta_predicate,
             physical_stats_read_schema,
             None,
+            !self.snapshot.has_adaptive_metadata(),
         )?;
         // Only the cached suffix needs a kernel-side check. The engine owns cancellation for the
         // newly read action prefix.
@@ -1542,6 +1543,7 @@ impl Scan {
                     .physical_partition_schema
                     .as_ref()
                     .map(|s| s.as_ref()),
+                !self.snapshot.has_adaptive_metadata(),
             )
     }
 
@@ -1734,6 +1736,7 @@ impl Scan {
             self.snapshot.log_segment(),
             engine.clone(),
             checkpoint_read_schema,
+            !self.snapshot.has_adaptive_metadata(),
         )?;
 
         Ok(SequentialScanMetadata::new(

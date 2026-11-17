@@ -104,10 +104,14 @@ async fn replay_selects_latest_action_without_retention(
         .then(|| snapshot.checkpoint_info(&engine))
         .transpose()?
         .flatten();
-    let state = MetadataPlanner::new(snapshot.log_segment(), actions)
-        .with_stats(StatsOptions::json_only())
-        .with_checkpoint_shape(checkpoint_shape)
-        .replay()?;
+    let state = MetadataPlanner::new(
+        snapshot.log_segment(),
+        actions,
+        !snapshot.has_adaptive_metadata(),
+    )
+    .with_stats(StatsOptions::json_only())
+    .with_checkpoint_shape(checkpoint_shape)
+    .replay()?;
     // Then: each requested payload and version comes from its latest action.
     let names = actions.output_action_names().collect::<Vec<_>>();
     let schema = schema_ref! {
