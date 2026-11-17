@@ -1420,7 +1420,10 @@ mod tests {
         mumbling_bitmap, struct_batch, test_dv_info, with_field, write_manifest,
         write_manifest_with_stats, x_full_stats, x_full_stats_value, x_stats, x_upper_bound_stats,
     };
-    use crate::content_tree::{DeletionVectorInfo, ManifestInfo};
+    use crate::content_tree::{
+        DeletionVectorInfo, LOWER_BOUND, ManifestInfo, NAN_VALUE_COUNT, NULL_VALUE_COUNT,
+        UPPER_BOUND, VALUE_COUNT,
+    };
     use crate::engine::DelegatingEngine;
     use crate::engine::arrow_conversion::TryFromArrow as _;
     use crate::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt as _};
@@ -3177,17 +3180,55 @@ mod tests {
         ])
     }
 
-    /// A `content_stats` value of type `content_stats` whose single leaf holds `values`, in field
-    /// order, or a null value when `values` is `None`.
-    fn leaf_stats(content_stats: &StructType, values: Option<Vec<Scalar>>) -> Scalar {
-        let Some(values) = values else {
+    /// The `content_stats` of a table's only column.
+    struct ColumnStats {
+        lower_bound: Scalar,
+        upper_bound: Scalar,
+        value_count: i64,
+        null_value_count: i64,
+        /// Read only for a floating-point column; `None` stands for an unknown count.
+        nan_value_count: Option<i64>,
+    }
+
+    /// LONG stats over `[1, 9]` across 10 values, none null.
+    const LONG_STATS: ColumnStats = ColumnStats {
+        lower_bound: Scalar::Long(1),
+        upper_bound: Scalar::Long(9),
+        value_count: 10,
+        null_value_count: 0,
+        nan_value_count: None,
+    };
+
+    /// DOUBLE stats over `[1.0, 9.5]` across 10 values, none null or NaN.
+    const DOUBLE_STATS: ColumnStats = ColumnStats {
+        lower_bound: Scalar::Double(1.0),
+        upper_bound: Scalar::Double(9.5),
+        value_count: 10,
+        null_value_count: 0,
+        nan_value_count: Some(0),
+    };
+
+    /// A `content_stats` value of type `content_stats` whose single leaf holds `stats`, or a null
+    /// value when `stats` is `None`.
+    fn leaf_stats(content_stats: &StructType, stats: Option<&ColumnStats>) -> Scalar {
+        let Some(stats) = stats else {
             return Scalar::Null(content_stats.clone().into());
         };
         let leaf_field = content_stats.fields().next().unwrap();
         let DataType::Struct(leaf) = leaf_field.data_type() else {
             panic!("leaf stats must be a struct");
         };
-        let leaf = StructData::try_new(leaf.fields().cloned().collect(), values).unwrap();
+        let values = leaf.fields().map(|field| match field.name().as_str() {
+            LOWER_BOUND => stats.lower_bound.clone(),
+            UPPER_BOUND => stats.upper_bound.clone(),
+            VALUE_COUNT => Scalar::Long(stats.value_count),
+            NULL_VALUE_COUNT => Scalar::Long(stats.null_value_count),
+            NAN_VALUE_COUNT => stats
+                .nan_value_count
+                .map_or(Scalar::Null(DataType::LONG), Scalar::Long),
+            other => panic!("unexpected leaf stat '{other}'"),
+        });
+        let leaf = StructData::try_new(leaf.fields().cloned().collect(), values.collect()).unwrap();
         let fields = vec![leaf_field.clone()];
         Scalar::Struct(StructData::try_new(fields, vec![Scalar::Struct(leaf)]).unwrap())
     }
@@ -3201,10 +3242,9 @@ mod tests {
 
     /// Whether the leaf filter for `predicate` reads or skips the leaf of a root `DataManifest`
     /// entry referencing 3 leaf entries, with as many rows as its stats' `value_count`, whose
-    /// stats for its table's only column `c` (of type `data_type`) are `stats`: the sub-fields
-    /// [`projected_stats_schema`] reads for [`delta_stats_schema`], in field order. `None`
-    /// stands for an entry without stats.
-    fn filter_leaf(data_type: DataType, stats: Option<Vec<Scalar>>, predicate: Pred) -> Leaf {
+    /// stats for its table's only column `c` (of type `data_type`) are `stats`. `None` stands for
+    /// an entry without stats.
+    fn filter_leaf(data_type: DataType, stats: Option<ColumnStats>, predicate: Pred) -> Leaf {
         let engine = SyncEngine::new();
         let table = StructType::new_unchecked([field_with_id("c", data_type.clone(), true, 1)]);
         let schema = delta_stats_schema("c", data_type);
@@ -3213,14 +3253,14 @@ mod tests {
         let content_stats = stats_read.content_stats.clone().unwrap();
         let mut entry = data_manifest_entry("leaf.parquet", 1, TrackingStatus::Added);
         entry.record_count = 3;
-        if let Some(Scalar::Long(rows)) = stats.as_ref().map(|stats| &stats[2]) {
-            entry.manifest_info.as_mut().unwrap().added_rows_count = *rows;
+        if let Some(stats) = &stats {
+            entry.manifest_info.as_mut().unwrap().added_rows_count = stats.value_count;
         }
         let batch = entry_batch_with_stats(
             &engine,
             &[entry],
             &content_stats,
-            vec![leaf_stats(&content_stats, stats)],
+            vec![leaf_stats(&content_stats, stats.as_ref())],
         );
         let root_schema = ManifestReadSchema::new(Some(content_stats)).root;
         let filter = stats_read.leaf_filter(&engine, root_schema).unwrap();
@@ -3230,34 +3270,6 @@ mod tests {
             [false] => Leaf::Skipped,
             keep => panic!("expected one row, got {keep:?}"),
         }
-    }
-
-    /// `[lower_bound, upper_bound, value_count, null_value_count]` of a non-floating leaf.
-    fn bounds_and_counts(
-        lower: impl Into<Scalar>,
-        upper: impl Into<Scalar>,
-        value_count: i64,
-        null_value_count: i64,
-    ) -> Option<Vec<Scalar>> {
-        Some(vec![
-            lower.into(),
-            upper.into(),
-            value_count.into(),
-            null_value_count.into(),
-        ])
-    }
-
-    /// `[lower_bound, upper_bound, value_count, null_value_count, nan_value_count]` of a DOUBLE
-    /// leaf over `[lower, upper]` with 10 values, none null.
-    fn double_stats(lower: f64, upper: f64, nan_value_count: Option<i64>) -> Option<Vec<Scalar>> {
-        let nan_value_count = nan_value_count.map_or(Scalar::Null(DataType::LONG), Scalar::from);
-        Some(vec![
-            lower.into(),
-            upper.into(),
-            10i64.into(),
-            0i64.into(),
-            nan_value_count,
-        ])
     }
 
     /// Microseconds of `4.000500s`: a timestamp a millisecond-truncated max stat would record as
@@ -3272,134 +3284,171 @@ mod tests {
     #[rstest]
     #[case::gt_above_max(
         DataType::LONG,
-        bounds_and_counts(1i64, 9i64, 10, 0),
+        Some(LONG_STATS),
         Pred::gt(col!("c"), lit(100i64)),
         Leaf::Skipped
     )]
     #[case::lt_above_min(
         DataType::LONG,
-        bounds_and_counts(1i64, 9i64, 10, 0),
+        Some(LONG_STATS),
         Pred::lt(col!("c"), lit(5i64)),
         Leaf::Read
     )]
     #[case::eq_outside_bounds(
         DataType::LONG,
-        bounds_and_counts(1i64, 9i64, 10, 0),
+        Some(LONG_STATS),
         Pred::eq(col!("c"), lit(10i64)),
         Leaf::Skipped
     )]
     #[case::eq_inside_bounds(
         DataType::LONG,
-        bounds_and_counts(1i64, 9i64, 10, 0),
+        Some(LONG_STATS),
         Pred::eq(col!("c"), lit(5i64)),
         Leaf::Read
     )]
     #[case::not_gt_below_min(
         DataType::LONG,
-        bounds_and_counts(1i64, 9i64, 10, 0),
+        Some(LONG_STATS),
         Pred::not(Pred::gt(col!("c"), lit(0i64))),
         Leaf::Skipped
     )]
     #[case::and_one_arm_rules_out(
         DataType::LONG,
-        bounds_and_counts(1i64, 9i64, 10, 0),
+        Some(LONG_STATS),
         Pred::and(Pred::gt(col!("c"), lit(0i64)), Pred::gt(col!("c"), lit(100i64))),
         Leaf::Skipped
     )]
     #[case::or_one_arm_matches(
         DataType::LONG,
-        bounds_and_counts(1i64, 9i64, 10, 0),
+        Some(LONG_STATS),
         Pred::or(Pred::lt(col!("c"), lit(0i64)), Pred::lt(col!("c"), lit(5i64))),
         Leaf::Read
     )]
     #[case::no_stats(DataType::LONG, None, Pred::gt(col!("c"), lit(100i64)), Leaf::Read)]
     #[case::unreferenced_column(
         DataType::LONG,
-        bounds_and_counts(1i64, 9i64, 10, 0),
+        Some(LONG_STATS),
         Pred::gt(col!("other"), lit(100i64)),
         Leaf::Read
     )]
     #[case::is_null_without_nulls(
         DataType::LONG,
-        bounds_and_counts(1i64, 9i64, 10, 0),
+        Some(LONG_STATS),
         Pred::is_null(col!("c")),
         Leaf::Skipped
     )]
     #[case::is_null_with_nulls(
         DataType::LONG,
-        bounds_and_counts(1i64, 9i64, 10, 4),
+        Some(ColumnStats {
+            null_value_count: 4,
+            ..LONG_STATS
+        }),
         Pred::is_null(col!("c")),
         Leaf::Read
     )]
     #[case::is_not_null_all_null(
         DataType::LONG,
-        bounds_and_counts(Scalar::Null(DataType::LONG), Scalar::Null(DataType::LONG), 10, 10),
+        Some(ColumnStats {
+            lower_bound: Scalar::Null(DataType::LONG),
+            upper_bound: Scalar::Null(DataType::LONG),
+            null_value_count: 10,
+            ..LONG_STATS
+        }),
         Pred::is_not_null(col!("c")),
         Leaf::Skipped
     )]
     #[case::is_not_null_null_count_equals_entry_count(
         DataType::LONG,
-        bounds_and_counts(1i64, 9i64, 1000, 3),
+        Some(ColumnStats {
+            value_count: 1000,
+            null_value_count: 3,
+            ..LONG_STATS
+        }),
         Pred::is_not_null(col!("c")),
         Leaf::Read
     )]
     #[case::string_above_max(
         DataType::STRING,
-        bounds_and_counts("apple", "banana", 10, 0),
+        Some(ColumnStats {
+            lower_bound: "apple".into(),
+            upper_bound: "banana".into(),
+            ..LONG_STATS
+        }),
         Pred::eq(col!("c"), lit("cherry")),
         Leaf::Skipped
     )]
     #[case::double_without_nan(
         DataType::DOUBLE,
-        double_stats(1.0, 9.5, Some(0)),
+        Some(DOUBLE_STATS),
         Pred::gt(col!("c"), lit(10.0f64)),
         Leaf::Skipped
     )]
     #[case::double_with_nan(
         DataType::DOUBLE,
-        double_stats(1.0, 9.5, Some(2)),
+        Some(ColumnStats {
+            nan_value_count: Some(2),
+            ..DOUBLE_STATS
+        }),
         Pred::gt(col!("c"), lit(10.0f64)),
         Leaf::Read
     )]
     #[case::double_unknown_nan_count(
         DataType::DOUBLE,
-        double_stats(1.0, 9.5, None),
+        Some(ColumnStats {
+            nan_value_count: None,
+            ..DOUBLE_STATS
+        }),
         Pred::gt(col!("c"), lit(10.0f64)),
         Leaf::Read
     )]
     #[case::double_below_min_with_nan(
         DataType::DOUBLE,
-        double_stats(1.0, 9.5, Some(2)),
+        Some(ColumnStats {
+            nan_value_count: Some(2),
+            ..DOUBLE_STATS
+        }),
         Pred::lt(col!("c"), lit(0.5f64)),
         Leaf::Read
     )]
     #[case::double_below_min_without_nan(
         DataType::DOUBLE,
-        double_stats(1.0, 9.5, Some(0)),
+        Some(DOUBLE_STATS),
         Pred::lt(col!("c"), lit(0.5f64)),
         Leaf::Skipped
     )]
     #[case::double_negative_zero_against_positive_zero(
         DataType::DOUBLE,
-        double_stats(-0.0, -0.0, Some(0)),
+        Some(ColumnStats {
+            lower_bound: Scalar::Double(-0.0),
+            upper_bound: Scalar::Double(-0.0),
+            ..DOUBLE_STATS
+        }),
         Pred::ge(col!("c"), lit(0.0f64)),
         Leaf::Skipped
     )]
     #[case::timestamp_above_max_by_more_than_a_millisecond(
         DataType::TIMESTAMP,
-        bounds_and_counts(Scalar::Timestamp(0), Scalar::Timestamp(TS_MAX), 10, 0),
+        Some(ColumnStats {
+            lower_bound: Scalar::Timestamp(0),
+            upper_bound: Scalar::Timestamp(TS_MAX),
+            ..LONG_STATS
+        }),
         Pred::gt(col!("c"), Scalar::Timestamp(TS_MAX + 1_000)),
         Leaf::Skipped
     )]
     #[case::timestamp_above_max_by_less_than_a_millisecond(
         DataType::TIMESTAMP,
-        bounds_and_counts(Scalar::Timestamp(0), Scalar::Timestamp(TS_MAX), 10, 0),
+        Some(ColumnStats {
+            lower_bound: Scalar::Timestamp(0),
+            upper_bound: Scalar::Timestamp(TS_MAX),
+            ..LONG_STATS
+        }),
         Pred::gt(col!("c"), Scalar::Timestamp(TS_MAX + 100)),
         Leaf::Read
     )]
     fn leaf_filter_reads_only_leaves_the_stats_cannot_rule_out(
         #[case] data_type: DataType,
-        #[case] stats: Option<Vec<Scalar>>,
+        #[case] stats: Option<ColumnStats>,
         #[case] predicate: Pred,
         #[case] expected: Leaf,
     ) {
