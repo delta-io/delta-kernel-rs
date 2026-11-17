@@ -1,9 +1,10 @@
 //! Imperative file staging and deletion vector updates for existing tables.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, LazyLock};
 
 use delta_kernel_derive::internal_api;
+use serde_json::value::RawValue;
 use tracing::instrument;
 
 use super::{Imperative, Transaction, UpdateTable};
@@ -129,6 +130,10 @@ impl Transaction<UpdateTable, Imperative> {
     /// non-negative `baseRowId` and `defaultRowCommitVersion` in `fileConstantValues`.
     ///
     /// On commit, each matched file's add action carries `stats.tightBounds: false`.
+    /// Arrow-based connectors retaining structured statistics can use
+    /// `crate::engine::arrow_stats::serialize_stats` to reconstruct `stats` JSON before staging
+    /// the update. Preserve the original `tightBounds`; this method widens only the replacement
+    /// Add's statistics and retains the original statistics in the Remove action.
     ///
     /// # Arguments
     ///
@@ -557,19 +562,22 @@ impl FilteredRowVisitor for DvMatchVisitor<'_> {
                          deletion vectors require an accurate {NUM_RECORDS}"
                     ))
                 })?;
-                let mut parsed: serde_json::Value = serde_json::from_str(&stats).map_err(|e| {
+                let parsed: &RawValue = serde_json::from_str(&stats).map_err(|e| {
                     KernelError::generic(format!(
                         "update_deletion_vectors: stats for {path} is not valid JSON: {e}"
                     ))
                 })?;
-                let stats_obj = parsed.as_object_mut().ok_or_else(|| {
-                    KernelError::generic(format!(
-                        "update_deletion_vectors: stats for {path} is not a JSON object"
-                    ))
-                })?;
+                // Keep each value's JSON bytes so decimal bounds and unknown fields survive the
+                // tightBounds rewrite without a floating-point conversion.
+                let mut stats_obj: BTreeMap<String, &RawValue> = serde_json::from_str(parsed.get())
+                    .map_err(|_| {
+                        KernelError::generic(format!(
+                            "update_deletion_vectors: stats for {path} is not a JSON object"
+                        ))
+                    })?;
                 if stats_obj
                     .get(NUM_RECORDS)
-                    .and_then(serde_json::Value::as_u64)
+                    .and_then(|value| serde_json::from_str::<u64>(value.get()).ok())
                     .is_none()
                 {
                     return Err(KernelError::generic(format!(
@@ -582,13 +590,13 @@ impl FilteredRowVisitor for DvMatchVisitor<'_> {
                 // stats.
                 let already_wide = stats_obj
                     .get(TIGHT_BOUNDS)
-                    .and_then(serde_json::Value::as_bool)
+                    .and_then(|value| serde_json::from_str::<bool>(value.get()).ok())
                     == Some(false);
                 let new_stats = if already_wide {
                     stats
                 } else {
-                    stats_obj.insert(TIGHT_BOUNDS.to_string(), serde_json::Value::Bool(false));
-                    serde_json::to_string(&parsed).map_err(|e| {
+                    stats_obj.insert(TIGHT_BOUNDS.to_string(), RawValue::FALSE);
+                    serde_json::to_string(&stats_obj).map_err(|e| {
                         KernelError::generic(format!(
                             "update_deletion_vectors: failed to re-serialize stats for {path}: {e}"
                         ))
@@ -673,6 +681,10 @@ mod tests {
     #[case::stats_missing_num_records(Some("{}"), &[], Some(NUM_RECORDS))]
     #[case::stats_not_json_object(Some("5"), &[], Some("not a JSON object"))]
     #[case::stats_invalid_json(Some("{not json"), &[], Some("not valid JSON"))]
+    #[case::negative_num_records(Some(r#"{"numRecords":-1}"#), &[], Some(NUM_RECORDS))]
+    #[case::null_num_records(Some(r#"{"numRecords":null}"#), &[], Some(NUM_RECORDS))]
+    #[case::fractional_num_records(Some(r#"{"numRecords":1.5}"#), &[], Some(NUM_RECORDS))]
+    #[case::string_num_records(Some(r#"{"numRecords":"10"}"#), &[], Some(NUM_RECORDS))]
     #[case::stats_with_num_records(Some(r#"{"numRecords":10}"#), &[], None)]
     #[case::extra_columns_dont_shift_indexes(
         Some(r#"{"numRecords":10}"#),
@@ -712,5 +724,33 @@ mod tests {
             .visit_rows_of(&data)
             .expect("unmatched rows must not trigger stats validation");
         assert!(visitor.matched_file_indexes.is_empty());
+    }
+
+    #[rstest]
+    fn dv_match_visitor_preserves_exact_stats_values(
+        #[values(None, Some(true), Some(false))] tight_bounds: Option<bool>,
+    ) {
+        let min_values = concat!(
+            r#"{"decimal":1234567890123456789012345678.9012345678,"float":"-Infinity","#,
+            r#""variant":"00001","geometry":"POINT (1.25 -2.5)"}"#,
+        );
+        let tight_bounds = tight_bounds
+            .map(|value| format!(",\"tightBounds\":{value}"))
+            .unwrap_or_default();
+        let stats = format!(
+            r#"{{"numRecords":10,"minValues":{min_values},"unknown":1e500{tight_bounds}}}"#
+        );
+        let dv_updates = dv_updates_for(TEST_PATH);
+        let mut visitor = DvMatchVisitor::new(&dv_updates);
+        let data = make_scan_metadata_row(TEST_PATH, Some(&stats), &[]);
+        visitor.visit_rows_of(&data).unwrap();
+        let Scalar::String(rewritten) = &visitor.new_entries[0].stats else {
+            panic!("expected stats string");
+        };
+        let values: BTreeMap<String, &RawValue> = serde_json::from_str(rewritten).unwrap();
+        assert_eq!(values["numRecords"].get(), "10");
+        assert_eq!(values["tightBounds"].get(), "false");
+        assert_eq!(values["minValues"].get(), min_values);
+        assert_eq!(values["unknown"].get(), "1e500");
     }
 }
