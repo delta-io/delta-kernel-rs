@@ -7,14 +7,14 @@ use rstest::rstest;
 use crate::engine::sync::SyncEngine;
 use crate::log_replay::FileActionKey;
 use crate::unit_test_utils::adaptive_metadata_fixtures::{TestCommit, table_with_commits};
-use crate::{KernelResult, Snapshot, SnapshotRef, Version};
+use crate::{Result, Snapshot, SnapshotRef, Version};
 
 /// The live adds of an incremental scan from `base_version` to `target`, or `None` on fallback.
 fn incremental_live_adds(
     engine: &SyncEngine,
     target: SnapshotRef,
     base_version: Version,
-) -> KernelResult<Option<HashSet<FileActionKey>>> {
+) -> Result<Option<HashSet<FileActionKey>>> {
     let stream = target
         .incremental_scan_builder(base_version)
         .build(engine)?;
