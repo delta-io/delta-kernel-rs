@@ -64,9 +64,9 @@ pub struct UpdateTableBuilderState {
     snapshot: SnapshotRef,
     operation: UpdateTableOperation,
     schema_changes: Option<Vec<SchemaOperation>>,
-    /// Property-add requests in call order. Each inner vec is one
-    /// with_table_properties_added call
-    /// later calls override earlier values for the same canonical key at build.
+    /// Property-add batches in call order. Each inner vec is one
+    /// [`with_table_properties_added`](UpdateTableTransactionBuilder::with_table_properties_added)
+    /// call; later calls override earlier values for the same canonical key at build.
     properties_added: Vec<Vec<(String, String)>>,
     domain_metadata_removals: Vec<String>,
     is_blind_append: bool,
@@ -142,10 +142,10 @@ impl<MODE: ExecutionMode> TransactionBuilder<UpdateTable, MODE> {
     ///
     /// Values merge into the existing configuration; unrelated properties are preserved. Repeated
     /// calls merge, and a later call's value for the same canonical key wins. Within a single call,
-    /// two case-variant spellings of one `delta.*` key are rejected at [`build`](Self::build).
-    /// Non-`delta.*` application properties are accepted with their original key casing. Recognized
-    /// config-only `delta.*` keys are rewritten to their canonical form and value-validated during
-    /// [`build`](Self::build).
+    /// two entries for the same `delta.*` key (including exact duplicates and case variants) are
+    /// rejected at [`build`](Self::build). Non-`delta.*` application properties are accepted with
+    /// their original key casing. Recognized config-only `delta.*` keys are rewritten to their
+    /// canonical form and value-validated during [`build`](Self::build).
     ///
     /// Feature-enabling `delta.*` properties (for example `delta.enableDeletionVectors`),
     /// `delta.feature.*` signals, CHECK constraints, and unknown `delta.*` keys are rejected.
@@ -430,9 +430,10 @@ fn try_new_update_table<MODE: ExecutionMode>(
         if operation == UpdateTableOperation::AlterTable {
             validated
         } else {
-            effective_table_config
-                .metadata()
-                .filter_out_unchanged_properties(validated)
+            filter_out_unchanged_properties(
+                effective_table_config.metadata().configuration(),
+                validated,
+            )
         }
     };
     let has_property_changes = !properties_added.is_empty();
@@ -486,6 +487,20 @@ fn apply_schema_changes(
         .into());
     }
     evolve_table_config(&table_config, changes)
+}
+
+/// Drops entries from `new_properties` that already match `current` exactly.
+///
+/// Used for data operations so Metadata is emitted only when a value actually changes. ALTER TABLE
+/// keeps requested adds even when unchanged.
+fn filter_out_unchanged_properties(
+    current: &HashMap<String, String>,
+    new_properties: HashMap<String, String>,
+) -> HashMap<String, String> {
+    new_properties
+        .into_iter()
+        .filter(|(key, value)| current.get(key) != Some(value))
+        .collect()
 }
 
 /// Merges already-validated, changed `properties_added` into `table_config`'s metadata.

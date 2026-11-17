@@ -142,8 +142,8 @@ Ordinary application properties (keys that do not start with `delta.`) are store
 original casing. Recognized config-only `delta.*` keys, such as `delta.checkpointInterval`,
 `delta.logRetentionDuration`, `delta.setTransactionRetentionDuration`, or
 `delta.parquet.format.version`, are matched case-insensitively, rewritten to their canonical form,
-and value-validated. Repeated calls merge. Two case-variant spellings of one `delta.*` key in the
-same call are rejected.
+and value-validated. Repeated calls merge. Two entries for the same `delta.*` key in one call
+(including exact duplicates and case variants) are rejected.
 
 Feature-enabling properties (for example `delta.enableChangeDataFeed`), `delta.feature.*` signals,
 unknown `delta.*` keys, and CHECK constraints are rejected. Setting properties does not change the
