@@ -70,65 +70,26 @@ impl ResolveColumnAsScalar for IsAddResolver {
 #[case::string_to_integer_succeeds(
     Scalar::String("42".to_string()),
     DataType::INTEGER,
-    CastMode::Safe,
     Some(Scalar::Integer(42))
 )]
 #[case::string_to_integer_failure_is_null(
     Scalar::String("not an integer".to_string()),
     DataType::INTEGER,
-    CastMode::Safe,
     Some(Scalar::Null(DataType::INTEGER))
 )]
-#[case::strict_string_to_integer_succeeds(
-    Scalar::String("42".to_string()),
-    DataType::INTEGER,
-    CastMode::Strict,
-    Some(Scalar::Integer(42))
-)]
-#[case::strict_string_to_integer_failure_is_unknown(
-    Scalar::String("not an integer".to_string()),
-    DataType::INTEGER,
-    CastMode::Strict,
-    None
-)]
-#[case::strict_empty_string_is_unknown(
-    Scalar::String(String::new()),
-    DataType::INTEGER,
-    CastMode::Strict,
-    None
-)]
-#[case::strict_null_string_is_null(
-    Scalar::Null(DataType::STRING),
-    DataType::INTEGER,
-    CastMode::Strict,
-    Some(Scalar::Null(DataType::INTEGER))
-)]
-#[case::strict_null_non_string_is_unknown(
-    Scalar::Null(DataType::BOOLEAN),
-    DataType::DATE,
-    CastMode::Strict,
-    None
-)]
-#[case::identity_passthrough(
-    Scalar::Long(42),
-    DataType::LONG,
-    CastMode::Safe,
-    Some(Scalar::Long(42))
-)]
+#[case::identity_passthrough(Scalar::Long(42), DataType::LONG, Some(Scalar::Long(42)))]
 #[case::null_source_uses_target_type(
     Scalar::Null(DataType::STRING),
     DataType::INTEGER,
-    CastMode::Safe,
     Some(Scalar::Null(DataType::INTEGER))
 )]
-#[case::unsupported_pair(Scalar::Long(42), DataType::INTEGER, CastMode::Safe, None)]
+#[case::unsupported_pair(Scalar::Long(42), DataType::INTEGER, None)]
 fn test_cast_scalar(
     #[case] value: Scalar,
     #[case] target: DataType,
-    #[case] mode: CastMode,
     #[case] expected: Option<Scalar>,
 ) {
-    assert_eq!(cast_scalar(value, &target, mode), expected);
+    assert_eq!(cast_scalar(value, &target), expected);
 }
 
 #[rstest::rstest]
@@ -780,6 +741,14 @@ fn test_eval_binary_strict_cast_column_is_unknown(
         (&val, &strict)
     };
     assert_eq!(filter.eval_pred_binary(op, left, right, false), None);
+}
+
+#[rstest::rstest]
+#[case::safe(Expr::cast(col!("x"), DataType::INTEGER), Some(Scalar::Integer(1)))]
+#[case::strict(Expr::cast_strict(col!("x"), DataType::INTEGER), None)]
+fn test_eval_expr_evaluates_only_safe_casts(#[case] expr: Expr, #[case] expected: Option<Scalar>) {
+    let filter = DefaultKernelPredicateEvaluator::from(Scalar::String("1".to_string()));
+    assert_eq!(filter.eval_expr(&expr), expected);
 }
 
 #[derive(Debug, PartialEq)]
