@@ -627,6 +627,8 @@ fn legacy_string_footer_bounds_do_not_prune_matching_groups(
     assert!(RowGroupFilter::apply(row_group, &predicate));
 
     // Signed byte comparison ranks 0xC3 below 0x62, so a legacy writer records `ab` as the max.
+    // Trusted as written, those bounds prune the group and lose the `a\u{e9}` row; marked legacy,
+    // they are ignored and the group survives.
     let stats = byte_array_stats(false, Some(&b"a"[..]), Some(&b"ab"[..]), deprecated);
     let column = ColumnChunkMetaData::builder(row_group.column(0).column_descr_ptr())
         .set_num_values(3)
