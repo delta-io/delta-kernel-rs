@@ -86,6 +86,9 @@ pub(crate) fn crc_arm(
 
 /// Build the commit JSON source with file versions in `version`.
 /// When `base_version` is set, only commits newer than that base are read.
+///
+/// Compaction actions carry the range's start version, not their original commit versions.
+/// Callers that need original commit versions must set `use_compactions` to false.
 pub(crate) fn commit_arm(
     log_segment: &LogSegment,
     base_version: Option<Version>,

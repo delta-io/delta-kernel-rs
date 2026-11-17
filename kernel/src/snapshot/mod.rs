@@ -687,8 +687,7 @@ impl Snapshot {
     /// latest. Missing checkpoint hints and CRCs at this snapshot's version remain absent.
     /// Rebuild it with [`SnapshotBuilder::with_snapshot_hint`] for the same table root.
     ///
-    /// Original commit and compaction paths are retained together. Returns the owned hint;
-    /// capturing retained state does not produce errors.
+    /// Original commit and compaction paths are retained together.
     #[internal_api]
     #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
     pub(crate) fn to_snapshot_hint(&self) -> KernelResult<SnapshotHint> {

@@ -983,13 +983,12 @@ impl LogSegment {
             .collect()
     }
 
-    /// Reads scan actions, using log compactions when `use_compactions` is true.
+    /// Reads scan actions from newest to oldest, using log compactions for commit reads when
+    /// `use_compactions` is true. Checkpoint reads are unaffected.
     ///
-    /// This returns an iterator of
-    /// [`ActionsBatch`]s which includes EngineData of actions + a boolean flag indicating whether
-    /// the data was read from a commit file (true) or a checkpoint file (false).
-    ///
-    /// The log files will be read from most recent to oldest.
+    /// Returns an iterator of [`ActionsBatch`]s containing action data and an `is_log_batch` flag
+    /// that is true for commits and compactions, and false for checkpoints. Also returns
+    /// `CheckpointReadInfo` with stats_parsed compatibility and the checkpoint schema.
     ///
     /// `commit_read_schema` is the (physical) schema to read the commit files with, and
     /// `checkpoint_read_schema` is the (physical) schema to read checkpoint files with. This can be
@@ -997,15 +996,8 @@ impl LogSegment {
     /// schemas can be useful as a cheap way of doing additional filtering on the checkpoint files
     /// (e.g. filtering out remove actions).
     ///
-    ///  The engine data returned might have extra non-log actions (e.g. sidecar
-    ///  actions) that are not part of the schema but this is an implementation
-    ///  detail that should not be relied on and will likely change.
-    ///
-    /// Read a stream of actions from this log segment. This returns an iterator of
-    /// [`ActionsBatch`]s which includes EngineData of actions + a boolean flag indicating whether
-    /// the data was read from a commit file (true) or a checkpoint file (false).
-    ///
-    /// Also returns `CheckpointReadInfo` with stats_parsed compatibility and the checkpoint schema.
+    /// The returned engine data might have extra non-log actions (e.g. sidecar actions) outside
+    /// the schema; callers must not rely on their presence.
     ///
     /// `meta_predicate` is an optional conservative predicate for checkpoint reads, not the query's
     /// final data filter. When every projected action has a reliable presence witness, their
@@ -1376,6 +1368,10 @@ impl LogSegment {
     }
 
     /// Returns scan commit files tagged with file-constant `version`.
+    ///
+    /// Every action in a compaction is tagged with the range's start version, not its original
+    /// commit version. Callers that need original commit versions must set `use_compactions` to
+    /// false.
     #[cfg(feature = "declarative-plans")]
     pub(crate) fn commit_cover_version_tagged_scan_files(
         &self,
