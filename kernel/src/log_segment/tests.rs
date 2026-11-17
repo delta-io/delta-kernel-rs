@@ -30,6 +30,8 @@ use crate::last_checkpoint_hint::{HintAction, LastCheckpointHint, LastCheckpoint
 use crate::log_replay::ActionsBatch;
 use crate::log_segment::LogSegment;
 use crate::log_segment_files::LogSegmentFiles;
+#[cfg(feature = "declarative-plans")]
+use crate::metrics::MetricEvent;
 use crate::object_store::ObjectStoreExt as _;
 use crate::object_store::memory::InMemory;
 use crate::object_store::path::Path;
@@ -55,6 +57,8 @@ use crate::unit_test_utils::{
     Action, assert_batch_matches, assert_result_error_with_message, create_log_path,
     create_log_path_with_size, load_test_table, string_array_to_engine_data,
 };
+#[cfg(feature = "declarative-plans")]
+use crate::unit_test_utils::{CapturingReporter, install_thread_local_metrics_reporter};
 #[cfg(feature = "geo-type-in-dev")]
 use crate::unit_test_utils::{geography_type, geometry_type};
 use crate::{
@@ -6359,4 +6363,58 @@ fn compaction(table_root: &Url, lo: Version, hi: Version) -> ParsedLogPath {
         .unwrap_or_else(|error| panic!("compaction {lo}-{hi} under {table_root}: {error}"));
     ParsedLogPath::new(FileMeta::new(path.location, 0, 100))
         .unwrap_or_else(|| panic!("invalid compaction {lo}-{hi} under {table_root}"))
+}
+
+#[cfg(feature = "declarative-plans")]
+#[rstest]
+#[case::single(0, false)]
+#[case::compacted(20, true)]
+fn scan_plan_metrics_use_selected_cover_without_expanding_compactions(
+    #[case] end: Version,
+    #[case] compacted: bool,
+    #[values(false, true)] use_compactions: bool,
+) {
+    let root = Url::parse("memory:///_delta_log/").unwrap();
+    let path = |name: String| create_log_path_with_size(root.join(&name).unwrap().as_str(), 7);
+    let commits: Vec<_> = (0..=end).map(|v| path(format!("{v:020}.json"))).collect();
+    let segment = LogSegment::try_new(
+        LogSegmentFiles {
+            latest_commit_file: commits.last().cloned(),
+            max_published_version: Some(end),
+            ascending_commit_files: commits,
+            ascending_compaction_files: if compacted {
+                vec![path(format!("{:020}.{:020}.compacted.json", 1, end))]
+            } else {
+                vec![]
+            },
+            ..Default::default()
+        },
+        root,
+        Some(end),
+        None,
+    )
+    .unwrap();
+    let reporter = Arc::new(CapturingReporter::default());
+    let _guard = install_thread_local_metrics_reporter(reporter.clone());
+    let span = tracing::info_span!(
+        "scan.declarative_metadata_scan_plan",
+        report = tracing::field::Empty
+    );
+    let files = span
+        .in_scope(|| segment.commit_cover_version_tagged_scan_files(use_compactions))
+        .unwrap();
+    drop(span);
+    let events = reporter.events();
+    let [MetricEvent::ScanPlanGenerationCompleted(event)] = events.as_slice() else {
+        panic!("expected one scan-plan report: {events:?}");
+    };
+    assert_eq!(
+        (event.commit_start_version, event.commit_end_version),
+        (Some(0), Some(end))
+    );
+    assert_eq!(
+        event.compaction_file_count,
+        u64::from(compacted && use_compactions)
+    );
+    assert_eq!(event.commit_total_size_bytes, files.len() as u64 * 7);
 }

@@ -100,6 +100,8 @@ pub(crate) fn is_io_event(event: &MetricEvent) -> bool {
         | MetricEvent::StorageCopyCompleted(_)
         | MetricEvent::JsonReadCompleted(_)
         | MetricEvent::ParquetReadCompleted(_) => true,
+        #[cfg(feature = "declarative-plans")]
+        MetricEvent::ScanPlanGenerationCompleted(_) => false,
         MetricEvent::LogSegmentLoadSuccess(_)
         | MetricEvent::LogSegmentLoadFailure(_)
         | MetricEvent::ProtocolMetadataLoadSuccess(_)
