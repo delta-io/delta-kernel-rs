@@ -2670,6 +2670,43 @@ fn test_validate_listed_log_file_in_order_compaction_files() {
     .is_ok());
 }
 
+#[rstest]
+#[case::before_checkpoint(3, 8, false)]
+#[case::ending_at_checkpoint(3, 10, false)]
+#[case::starting_at_checkpoint(10, 12, false)]
+#[case::spanning_checkpoint(5, 12, false)]
+#[case::after_checkpoint(11, 12, true)]
+fn try_new_keeps_only_compactions_starting_after_checkpoint(
+    #[case] lo: Version,
+    #[case] hi: Version,
+    #[case] kept: bool,
+) {
+    let log_root = Url::parse("file:///_delta_log/").unwrap();
+    let log_segment = LogSegment::try_new(
+        LogSegmentFiles {
+            checkpoint_parts: vec![create_log_path(
+                "file:///_delta_log/00000000000000000010.checkpoint.parquet",
+            )],
+            ascending_commit_files: (11..=12)
+                .map(|v| create_log_path(&format!("file:///_delta_log/{v:020}.json")))
+                .collect(),
+            latest_commit_file: Some(create_log_path(
+                "file:///_delta_log/00000000000000000012.json",
+            )),
+            ascending_compaction_files: vec![create_log_path(&format!(
+                "file:///_delta_log/{lo:020}.{hi:020}.compacted.json"
+            ))],
+            ..Default::default()
+        },
+        log_root,
+        Some(12),
+        None,
+    )
+    .unwrap();
+    let expected = if kept { vec![(lo, hi)] } else { vec![] };
+    assert_eq!(extract_compaction_ranges(&log_segment), expected);
+}
+
 #[test]
 fn test_validate_listed_log_file_out_of_order_compaction_files() {
     let log_root = Url::parse("file:///_delta_log/").unwrap();
