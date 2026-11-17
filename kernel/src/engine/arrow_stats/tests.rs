@@ -5,9 +5,12 @@ use rstest::rstest;
 use serde_json::json;
 
 use super::*;
+#[cfg(feature = "geo-type-in-dev")]
+use crate::arrow::array::new_null_array;
 use crate::arrow::array::{
-    ArrayRef, Date32Array, Decimal128Array, Float32Array, Float64Array, Int64Array,
-    LargeStringArray, StringViewArray, TimestampMicrosecondArray,
+    ArrayRef, BooleanArray, Date32Array, Decimal128Array, Float32Array, Float64Array, Int8Array,
+    Int16Array, Int32Array, Int64Array, LargeStringArray, StringViewArray,
+    TimestampMicrosecondArray,
 };
 use crate::arrow::buffer::NullBuffer;
 use crate::arrow::datatypes::Field;
@@ -82,12 +85,55 @@ fn non_finite_floats_encode_as_strings(#[case] value: f64, #[case] expected: &st
     }
 }
 
-#[test]
-fn finite_floats_remain_numbers_alongside_non_finite_and_null_values() {
-    let values = Float64Array::from(vec![Some(1.25), Some(f64::NAN), None]);
-    let encoded = encode_bound(Arc::new(values), DataType::DOUBLE).unwrap();
+#[rstest]
+#[case::float(
+    Arc::new(Float32Array::from(vec![Some(1.25), Some(f32::NAN), None])) as ArrayRef,
+    DataType::FLOAT,
+)]
+#[case::double(
+    Arc::new(Float64Array::from(vec![Some(1.25), Some(f64::NAN), None])) as ArrayRef,
+    DataType::DOUBLE,
+)]
+fn finite_floats_remain_numbers_alongside_non_finite_and_null_values(
+    #[case] values: ArrayRef,
+    #[case] data_type: DataType,
+) {
+    let encoded = encode_bound(values, data_type).unwrap();
     assert_eq!(encoded.value(0), r#"{"bound":1.25}"#);
     assert_eq!(encoded.value(1), r#"{"bound":"NaN"}"#);
+    assert_eq!(encoded.value(2), "{}");
+}
+
+#[rstest]
+#[case::boolean(
+    Arc::new(BooleanArray::from(vec![Some(false), Some(true), None])) as ArrayRef,
+    DataType::BOOLEAN,
+    ["false", "true"],
+)]
+#[case::byte(
+    Arc::new(Int8Array::from(vec![Some(i8::MIN), Some(i8::MAX), None])) as ArrayRef,
+    DataType::BYTE,
+    ["-128", "127"],
+)]
+#[case::short(
+    Arc::new(Int16Array::from(vec![Some(i16::MIN), Some(i16::MAX), None])) as ArrayRef,
+    DataType::SHORT,
+    ["-32768", "32767"],
+)]
+#[case::integer(
+    Arc::new(Int32Array::from(vec![Some(i32::MIN), Some(i32::MAX), None])) as ArrayRef,
+    DataType::INTEGER,
+    ["-2147483648", "2147483647"],
+)]
+fn primitive_bounds_preserve_values_and_nulls(
+    #[case] values: ArrayRef,
+    #[case] data_type: DataType,
+    #[case] expected: [&str; 2],
+) {
+    let encoded = encode_bound(values, data_type).unwrap();
+    for (row, expected) in expected.into_iter().enumerate() {
+        assert_eq!(encoded.value(row), format!(r#"{{"bound":{expected}}}"#));
+    }
     assert_eq!(encoded.value(2), "{}");
 }
 
@@ -120,6 +166,17 @@ fn non_utc_annotations_return_errors(
         encode_bound(Arc::new(values), DataType::TIMESTAMP),
         "statistics type",
     );
+}
+
+#[rstest]
+#[case::timestamp_without_timezone(None, DataType::TIMESTAMP)]
+#[case::timestamp_ntz_with_timezone(Some("UTC"), DataType::TIMESTAMP_NTZ)]
+fn timestamp_timezone_annotations_must_match_the_logical_type(
+    #[case] timezone: Option<&str>,
+    #[case] data_type: DataType,
+) {
+    let values = TimestampMicrosecondArray::from(vec![0]).with_timezone_opt(timezone);
+    assert_result_error_with_message(encode_bound(Arc::new(values), data_type), "statistics type");
 }
 
 #[test]
@@ -195,17 +252,22 @@ fn variant_concatenates_metadata_and_value_then_zero_pads(
 #[rstest]
 fn variant_requires_non_null_children_only_when_the_parent_is_valid(
     #[values(false, true)] valid_parent: bool,
+    #[values("metadata", "value")] null_child: &str,
 ) {
+    let columns = ["metadata", "value"]
+        .map(|name| {
+            Arc::new(BinaryArray::from(vec![
+                (name != null_child).then_some(b"ab".as_slice()),
+            ])) as ArrayRef
+        })
+        .to_vec();
     let values = StructArray::new(
         vec![
             Arc::new(Field::new("metadata", ArrowDataType::Binary, true)),
             Arc::new(Field::new("value", ArrowDataType::Binary, true)),
         ]
         .into(),
-        vec![
-            Arc::new(BinaryArray::from(vec![None as Option<&[u8]>])),
-            Arc::new(BinaryArray::from_vec(vec![&[0, 1]])),
-        ],
+        columns,
         Some(NullBuffer::from(vec![valid_parent])),
     );
     let result = encode_bound(Arc::new(values), DataType::unshredded_variant());
@@ -246,6 +308,7 @@ fn unsupported_or_mismatched_types_return_errors() {
         DataType::STRING,
         DataType::BINARY,
         DataType::unshredded_variant(),
+        DataType::from(schema! { nullable "x": LONG }),
     ] {
         assert_result_error_with_message(
             encode_bound(values.clone(), data_type),
@@ -278,20 +341,21 @@ fn mismatched_struct_fields_return_errors(#[case] field_names: Vec<&str>, #[case
 }
 
 #[rstest]
-#[case::extra_variant_child(vec!["metadata", "value", "extra"], false, false)]
-#[case::missing_variant_child(vec!["metadata"], false, false)]
-#[case::renamed_variant_child(vec!["metadata", "other"], false, false)]
-#[case::non_binary_variant_child(vec!["metadata", "value"], true, false)]
-#[case::shredded_variant(vec!["metadata", "value"], false, true)]
+#[case::extra_variant_child(vec!["metadata", "value", "extra"], None, false)]
+#[case::missing_variant_child(vec!["metadata"], None, false)]
+#[case::renamed_variant_child(vec!["metadata", "other"], None, false)]
+#[case::non_binary_metadata(vec!["metadata", "value"], Some("metadata"), false)]
+#[case::non_binary_value(vec!["metadata", "value"], Some("value"), false)]
+#[case::shredded_variant(vec!["metadata", "value"], None, true)]
 fn invalid_variant_layouts_return_errors(
     #[case] field_names: Vec<&str>,
-    #[case] non_binary_value: bool,
+    #[case] non_binary_child: Option<&str>,
     #[case] shredded: bool,
 ) {
     let fields = field_names
         .into_iter()
         .map(|name| {
-            let values: ArrayRef = if name == "value" && non_binary_value {
+            let values: ArrayRef = if Some(name) == non_binary_child {
                 Arc::new(StringArray::from(vec!["invalid"]))
             } else {
                 Arc::new(BinaryArray::from_vec(vec![b"ab".as_slice()]))
@@ -325,6 +389,20 @@ fn invalid_variant_layouts_return_errors(
 fn binary_bounds_are_rejected_even_with_a_matching_arrow_type() {
     let values = Arc::new(BinaryArray::from_vec(vec![b"ab".as_slice()]));
     assert_result_error_with_message(encode_bound(values, DataType::BINARY), "statistics type");
+}
+
+#[cfg(feature = "geo-type-in-dev")]
+#[test]
+fn geography_bounds_are_unsupported() {
+    let values = Arc::new(BinaryArray::from_vec(vec![b"ab".as_slice()]));
+    let data_type = crate::unit_test_utils::geography_type(
+        "EPSG:4326",
+        crate::schema::EdgeInterpolationAlgorithm::Spherical,
+    );
+    assert_result_error_with_message(
+        encode_bound(values, data_type),
+        "Geo types are not yet supported",
+    );
 }
 
 #[rstest]
@@ -384,7 +462,11 @@ fn geometry_uses_wkt_while_coordinate_structs_remain_objects(#[case] little_endi
 
 #[cfg(feature = "geo-type-in-dev")]
 #[rstest]
+#[case::empty(vec![])]
+#[case::short_header(vec![1, 1, 0, 0])]
 #[case::truncated(vec![1, 1, 0, 0, 0])]
+#[case::truncated_coordinate([vec![1, 1, 0, 0, 0], vec![0; 15]].concat())]
+#[case::trailing_byte([vec![1, 1, 0, 0, 0], vec![0; 17]].concat())]
 #[case::invalid_byte_order(vec![2; 21])]
 #[case::not_a_point(vec![0; 21])]
 fn invalid_geometry_bounds_return_errors(#[case] wkb: Vec<u8>) {
@@ -397,38 +479,107 @@ fn invalid_geometry_bounds_return_errors(#[case] wkb: Vec<u8>) {
 
 #[cfg(feature = "geo-type-in-dev")]
 #[rstest]
-#[case::null_x(vec!["x", "y"], None, false)]
-#[case::missing_y(vec!["x"], Some(1.0), false)]
-#[case::renamed_y(vec!["x", "other"], Some(1.0), false)]
-#[case::extra_coordinate(vec!["x", "y", "z"], Some(1.0), false)]
-#[case::float32_coordinates(vec!["x", "y"], Some(1.0), true)]
-fn invalid_geometry_coordinate_structs_return_errors(
-    #[case] field_names: Vec<&str>,
-    #[case] x: Option<f64>,
-    #[case] float32: bool,
+#[case::integer(ArrowDataType::Int64)]
+#[case::large_binary(ArrowDataType::LargeBinary)]
+#[case::missing_y(ArrowDataType::Struct(
+    vec![
+        Field::new("x", ArrowDataType::Float64, true),
+    ].into(),
+))]
+#[case::missing_x(ArrowDataType::Struct(
+    vec![
+        Field::new("other", ArrowDataType::Float64, true),
+        Field::new("y", ArrowDataType::Float64, true),
+    ].into(),
+))]
+#[case::renamed_y(ArrowDataType::Struct(
+    vec![
+        Field::new("x", ArrowDataType::Float64, true),
+        Field::new("other", ArrowDataType::Float64, true),
+    ].into(),
+))]
+#[case::extra_coordinate(ArrowDataType::Struct(
+    ["x", "y", "z"]
+        .map(|name| Arc::new(Field::new(name, ArrowDataType::Float64, true)))
+        .into(),
+))]
+#[case::float32_x(ArrowDataType::Struct(
+    vec![
+        Field::new("x", ArrowDataType::Float32, true),
+        Field::new("y", ArrowDataType::Float64, true),
+    ].into(),
+))]
+#[case::float32_y(ArrowDataType::Struct(
+    vec![
+        Field::new("x", ArrowDataType::Float64, true),
+        Field::new("y", ArrowDataType::Float32, true),
+    ].into(),
+))]
+fn invalid_geometry_layouts_return_errors_even_without_non_null_rows(
+    #[case] arrow_type: ArrowDataType,
+    #[values(0, 1)] len: usize,
 ) {
-    let fields = field_names
-        .into_iter()
-        .map(|name| {
-            let value = if name == "x" { x } else { Some(2.0) };
-            let values: ArrayRef = if float32 {
-                Arc::new(Float32Array::from(vec![value.map(|v| v as f32)]))
-            } else {
-                Arc::new(Float64Array::from(vec![value]))
-            };
-            (
-                Arc::new(Field::new(name, values.data_type().clone(), true)),
-                values,
-            )
-        })
-        .collect::<Vec<_>>();
     assert_result_error_with_message(
         encode_bound(
-            Arc::new(StructArray::from(fields)),
+            new_null_array(&arrow_type, len),
             crate::unit_test_utils::geometry_type("EPSG:4326"),
         ),
         "2D point",
     );
+}
+
+#[cfg(feature = "geo-type-in-dev")]
+#[rstest]
+fn geometry_requires_non_null_coordinates_only_when_the_parent_is_valid(
+    #[values("x", "y")] null_coordinate: &str,
+    #[values(false, true)] valid_parent: bool,
+) {
+    let (fields, columns): (Vec<_>, Vec<_>) = ["x", "y"]
+        .into_iter()
+        .map(|name| {
+            (
+                Arc::new(Field::new(name, ArrowDataType::Float64, true)),
+                Arc::new(Float64Array::from(vec![
+                    (name != null_coordinate).then_some(1.0),
+                ])) as ArrayRef,
+            )
+        })
+        .unzip();
+    let values = StructArray::new(
+        fields.into(),
+        columns,
+        Some(NullBuffer::from(vec![valid_parent])),
+    );
+    let result = encode_bound(
+        Arc::new(values),
+        crate::unit_test_utils::geometry_type("EPSG:4326"),
+    );
+    if valid_parent {
+        assert_result_error_with_message(result, "2D point");
+    } else {
+        assert_eq!(result.unwrap().value(0), "{}");
+    }
+}
+
+#[cfg(feature = "geo-type-in-dev")]
+#[rstest]
+#[case::wkb(ArrowDataType::Binary)]
+#[case::coordinates(ArrowDataType::Struct(
+    ["x", "y"]
+        .map(|name| Arc::new(Field::new(name, ArrowDataType::Float64, true)))
+        .into(),
+))]
+fn valid_geometry_layouts_accept_nulls_and_empty_batches(
+    #[case] arrow_type: ArrowDataType,
+    #[values(0, 1)] len: usize,
+) {
+    let encoded = encode_bound(
+        new_null_array(&arrow_type, len),
+        crate::unit_test_utils::geometry_type("EPSG:4326"),
+    )
+    .unwrap();
+    assert_eq!(encoded.len(), len);
+    assert!(encoded.iter().all(|value| value == Some("{}")));
 }
 
 #[cfg(feature = "geo-type-in-dev")]

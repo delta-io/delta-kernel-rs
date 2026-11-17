@@ -1,5 +1,9 @@
 //! Delta file-statistics JSON encoding for Arrow-based engines.
+//!
+//! Requires the `default-engine-base` and `internal-api` features.
 
+#[cfg(feature = "geo-type-in-dev")]
+use crate::arrow::array::Float64Array;
 use crate::arrow::array::{
     Array, AsArray, BinaryArray, NullBufferBuilder, StringArray, StructArray,
 };
@@ -24,17 +28,18 @@ use crate::{KernelError, KernelResult};
 /// Null fields are omitted, and a null statistics struct produces a null string. Decimal precision
 /// is preserved, non-finite floats become `"NaN"`, `"Infinity"`, or `"-Infinity"`, and timestamps
 /// are truncated down to milliseconds. Unshredded VARIANT bounds encode as padded Z85 strings.
-/// Geometry bounds encode as WKT points; they may be supplied as 2D Point WKB or as structs with
-/// FLOAT64 `x` and `y` fields. Ordinary structs with those field names remain JSON objects.
+/// With `geo-type-in-dev`, Geometry bounds use an experimental WKT point encoding. They may be
+/// supplied as 2D Point WKB or as structs with exactly FLOAT64 `x` and `y` fields. Ordinary structs
+/// with those field names remain JSON objects.
 ///
 /// Strings may use Arrow's UTF-8, large UTF-8, or UTF-8 view representation. Timestamps use
-/// microseconds; timezone-aware arrays must be annotated as `UTC`, `Etc/UTC`, or a zero fixed
-/// offset. Other primitive arrays must match the schema's Arrow representation.
+/// microseconds: `TIMESTAMP` arrays must be annotated as `UTC`, `Etc/UTC`, or a zero fixed offset,
+/// while `TIMESTAMP_NTZ` arrays must have no timezone annotation. Other primitive arrays must match
+/// the schema's Arrow representation.
 ///
 /// `numRecords` and `tightBounds` are preserved. When passing the result to
-/// [`update_deletion_vectors`],
-/// keep the physical row count: the transaction validates it and widens the replacement Add's
-/// bounds. Preserve the original `tightBounds` for the paired Remove action.
+/// `Transaction::update_deletion_vectors`, the caller must preserve an accurate physical row count;
+/// the transaction checks only that `numRecords` is a non-negative integer.
 ///
 /// Returns an error if the Arrow data does not match the supplied schema or contains an unsupported
 /// statistics type, shredded VARIANT, or invalid Geometry bound.
@@ -55,8 +60,6 @@ use crate::{KernelError, KernelResult};
 /// assert_eq!(json.value(0), r#"{"numRecords":10}"#);
 /// # Ok::<(), delta_kernel::KernelError>(())
 /// ```
-///
-/// [`update_deletion_vectors`]: crate::transaction::Transaction::update_deletion_vectors
 pub fn serialize_stats(
     stats: &StructArray,
     physical_stats_schema: &StructType,
@@ -96,7 +99,7 @@ enum StatsKind<'a> {
     Struct(Vec<(&'a str, StatsEncoder<'a>)>),
     Variant(&'a BinaryArray, &'a BinaryArray),
     #[cfg(feature = "geo-type-in-dev")]
-    Geometry,
+    Geometry(GeometryEncoder<'a>),
     Primitive(&'a PrimitiveType, ArrayFormatter<'a>),
 }
 
@@ -157,7 +160,9 @@ impl<'a> StatsEncoder<'a> {
                 StatsKind::Variant(binary("metadata")?, binary("value")?)
             }
             #[cfg(feature = "geo-type-in-dev")]
-            DataType::Primitive(PrimitiveType::Geometry(_)) => StatsKind::Geometry,
+            DataType::Primitive(PrimitiveType::Geometry(_)) => {
+                StatsKind::Geometry(GeometryEncoder::new(values)?)
+            }
             DataType::Primitive(primitive) => {
                 let expected: ArrowDataType = data_type.try_into_arrow()?;
                 let compatible = match (primitive, values.data_type()) {
@@ -231,7 +236,7 @@ impl<'a> StatsEncoder<'a> {
                 write_string(&z85::encode(&bytes), out)?;
             }
             #[cfg(feature = "geo-type-in-dev")]
-            StatsKind::Geometry => write_string(&geometry_point(self.values, row)?, out)?,
+            StatsKind::Geometry(encoder) => write_string(&encoder.point(row)?, out)?,
             StatsKind::Primitive(primitive, formatter) => {
                 let float = match primitive {
                     PrimitiveType::Float => Some(f64::from(
@@ -284,56 +289,74 @@ fn type_error(data_type: &DataType) -> KernelError {
 }
 
 #[cfg(feature = "geo-type-in-dev")]
-fn geometry_point(values: &dyn Array, row: usize) -> KernelResult<String> {
-    let invalid = || KernelError::generic("Geometry statistics require a non-null 2D point");
-    let (x, y) = if let Some(array) = values.as_struct_opt() {
+enum GeometryEncoder<'a> {
+    Wkb(&'a BinaryArray),
+    Coordinates(&'a Float64Array, &'a Float64Array),
+}
+
+#[cfg(feature = "geo-type-in-dev")]
+impl<'a> GeometryEncoder<'a> {
+    fn new(values: &'a dyn Array) -> KernelResult<Self> {
+        if let Some(array) = values.as_binary_opt::<i32>() {
+            return Ok(Self::Wkb(array));
+        }
+        let array = values.as_struct_opt().ok_or_else(invalid_geometry)?;
         if array.num_columns() != 2 {
-            return Err(invalid());
+            return Err(invalid_geometry());
         }
         let coordinate = |name| {
-            let array = array
+            array
                 .column_by_name(name)
                 .and_then(|a| a.as_primitive_opt::<Float64Type>())
-                .ok_or_else(invalid)?;
-            if array.is_null(row) {
-                return Err(invalid());
-            }
-            Ok(array.value(row))
+                .ok_or_else(invalid_geometry)
         };
-        (coordinate("x")?, coordinate("y")?)
-    } else {
-        let bytes = values
-            .as_binary_opt::<i32>()
-            .ok_or_else(invalid)?
-            .value(row);
-        let [order, a, b, c, d, coordinates @ ..] = bytes else {
-            return Err(invalid());
-        };
-        let (little_endian, tag) = match order {
-            0 => (false, u32::from_be_bytes([*a, *b, *c, *d])),
-            1 => (true, u32::from_le_bytes([*a, *b, *c, *d])),
-            _ => return Err(invalid()),
-        };
-        if tag != 1 || coordinates.len() != 16 {
-            return Err(invalid());
-        }
-        let coordinate = |bytes: &[u8]| -> KernelResult<f64> {
-            let bytes = bytes.try_into().map_err(|_| invalid())?;
-            Ok(if little_endian {
-                f64::from_le_bytes(bytes)
-            } else {
-                f64::from_be_bytes(bytes)
-            })
-        };
-        (
-            coordinate(&coordinates[..8])?,
-            coordinate(&coordinates[8..])?,
-        )
-    };
-    if !x.is_finite() || !y.is_finite() {
-        return Err(invalid());
+        Ok(Self::Coordinates(coordinate("x")?, coordinate("y")?))
     }
-    Ok(format!("POINT ({x} {y})"))
+
+    fn point(&self, row: usize) -> KernelResult<String> {
+        let (x, y) = match self {
+            Self::Coordinates(x, y) => {
+                if x.is_null(row) || y.is_null(row) {
+                    return Err(invalid_geometry());
+                }
+                (x.value(row), y.value(row))
+            }
+            Self::Wkb(array) => {
+                let [order, a, b, c, d, coordinates @ ..] = array.value(row) else {
+                    return Err(invalid_geometry());
+                };
+                let (little_endian, tag) = match order {
+                    0 => (false, u32::from_be_bytes([*a, *b, *c, *d])),
+                    1 => (true, u32::from_le_bytes([*a, *b, *c, *d])),
+                    _ => return Err(invalid_geometry()),
+                };
+                let (coordinates, remainder) = coordinates.as_chunks::<8>();
+                let [x, y] = coordinates else {
+                    return Err(invalid_geometry());
+                };
+                if tag != 1 || !remainder.is_empty() {
+                    return Err(invalid_geometry());
+                }
+                let coordinate = |bytes: &[u8; 8]| {
+                    if little_endian {
+                        f64::from_le_bytes(*bytes)
+                    } else {
+                        f64::from_be_bytes(*bytes)
+                    }
+                };
+                (coordinate(x), coordinate(y))
+            }
+        };
+        if !x.is_finite() || !y.is_finite() {
+            return Err(invalid_geometry());
+        }
+        Ok(format!("POINT ({x} {y})"))
+    }
+}
+
+#[cfg(feature = "geo-type-in-dev")]
+fn invalid_geometry() -> KernelError {
+    KernelError::generic("Geometry statistics require a non-null 2D point")
 }
 
 #[cfg(test)]

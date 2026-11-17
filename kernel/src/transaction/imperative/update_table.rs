@@ -130,10 +130,8 @@ impl Transaction<UpdateTable, Imperative> {
     /// non-negative `baseRowId` and `defaultRowCommitVersion` in `fileConstantValues`.
     ///
     /// On commit, each matched file's add action carries `stats.tightBounds: false`.
-    /// Arrow-based connectors retaining structured statistics can use
-    /// `crate::engine::arrow_stats::serialize_stats` to reconstruct `stats` JSON before staging
-    /// the update. Preserve the original `tightBounds`; this method widens only the replacement
-    /// Add's statistics and retains the original statistics in the Remove action.
+    /// Preserve the original `tightBounds` in the supplied statistics; this method widens only the
+    /// replacement Add's statistics and retains the original statistics in the Remove action.
     ///
     /// # Arguments
     ///

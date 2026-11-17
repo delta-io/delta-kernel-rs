@@ -96,7 +96,7 @@ pub use test_delegating::{DelegatingEngine, PanicEngine};
 pub mod arrow_data;
 #[cfg(feature = "default-engine-base")]
 pub(crate) mod arrow_get_data;
-#[cfg(feature = "default-engine-base")]
+#[cfg(all(feature = "default-engine-base", feature = "internal-api"))]
 pub mod arrow_stats;
 
 #[cfg(all(feature = "default-engine-base", feature = "internal-api"))]
