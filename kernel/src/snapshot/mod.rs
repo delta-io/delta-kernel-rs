@@ -670,7 +670,7 @@ impl Snapshot {
     // Field accessors and state queries
     // ============================================================================
 
-    /// Returns statistics for this snapshot's selected replay commit files without I/O.
+    /// Returns statistics for this snapshot's original commit files without I/O.
     ///
     /// Returns zero counts and bytes when a checkpoint covers the entire snapshot.
     ///

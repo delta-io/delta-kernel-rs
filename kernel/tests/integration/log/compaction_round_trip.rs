@@ -766,8 +766,7 @@ async fn compaction_preserves_protocol_upgrades(
         .build()?;
     let (engine, reads) = test_engine(table.store().clone(), 1);
     let old = Snapshot::builder_for(table.table_root()).build(engine.as_ref())?;
-    let mut upgraded = old.clone();
-    for protocol in [
+    for (version, protocol) in [2, 3].into_iter().zip([
         Protocol::try_new(
             1,
             7,
@@ -784,10 +783,17 @@ async fn compaction_preserves_protocol_upgrades(
                 TableFeature::TimestampWithoutTimezone,
             ]),
         )?,
-    ] {
-        let mut txn = begin_transaction(upgraded, engine.as_ref())?;
-        txn.update_table_protocol_for_test(protocol.clone())?;
-        upgraded = txn.commit(engine.as_ref())?.unwrap_post_commit_snapshot();
+    ]) {
+        add_commit(
+            table.table_root(),
+            table.store().as_ref(),
+            version,
+            json!({ "protocol": protocol }).to_string(),
+        )
+        .await?;
+        let upgraded = Snapshot::builder_for(table.table_root())
+            .at_version(version)
+            .build(engine.as_ref())?;
         assert_eq!(upgraded.table_configuration().protocol(), &protocol);
     }
     let latest = Snapshot::builder_for(table.table_root())

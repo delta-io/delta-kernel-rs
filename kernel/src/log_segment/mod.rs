@@ -68,15 +68,16 @@ mod protocol_metadata_replay_amt_tests;
 #[cfg(test)]
 pub(crate) mod tests;
 
-/// Statistics for the commit files selected to replay a snapshot's log segment.
+/// Statistics for the original commit files in a snapshot's log segment.
 ///
-/// Includes original published and staged commits. Excludes log compactions, checkpoints,
-/// sidecars, CRCs, and commits retained only for timestamp lookup.
+/// Includes published and staged commits after the checkpoint. Excludes log compactions, even
+/// when scans read them in place of the commits they cover, as well as checkpoints, sidecars,
+/// CRCs, and commits retained only for timestamp lookup.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct LogSegmentStats {
     /// Number of original commit files.
     pub num_commit_files: u64,
-    /// Sum of the selected commit file sizes in bytes.
+    /// Sum of the original commit file sizes in bytes.
     pub total_commit_file_bytes: u64,
 }
 
