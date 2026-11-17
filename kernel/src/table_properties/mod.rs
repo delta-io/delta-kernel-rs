@@ -22,7 +22,10 @@ use crate::{KernelError, Version};
 
 mod config;
 mod deserialize;
-pub(crate) use config::{is_delta_property_key, validate_and_normalize_property_for_update};
+pub(crate) use config::{
+    is_delta_property_key, validate_and_normalize_property_for_create,
+    validate_and_normalize_property_for_update, validate_log_and_deleted_file_retention,
+};
 pub use deserialize::ParseIntervalError;
 
 /// Prefix for delta table properties (e.g., `delta.enableChangeDataFeed`, `delta.appendOnly`).

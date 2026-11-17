@@ -16,7 +16,10 @@ use crate::table_features::{
     IcebergCompatValidationContext, Operation, TableFeature, V2_VALIDATOR, V3_VALIDATOR,
     validate_iceberg_compat_if_needed,
 };
-use crate::table_properties::{is_delta_property_key, validate_and_normalize_property_for_update};
+use crate::table_properties::{
+    is_delta_property_key, validate_and_normalize_property_for_update,
+    validate_log_and_deleted_file_retention,
+};
 use crate::transaction::domain_metadata::validate_unique_domains;
 use crate::transaction::schema_evolution::{SchemaOperation, evolve_table_config};
 use crate::transaction::{
@@ -348,9 +351,19 @@ impl<MODE: ExecutionMode> TransactionBuilder<UpdateTable, MODE> {
         }
         // Duplicate additions are validated by the shared builder state.
         self.common_state.validate()?;
-        // Property key/value validation does not need the engine; reject before any I/O in build.
+        // Property key/value and retention checks do not need the engine; reject before I/O.
         if self.local_state.has_property_changes() {
-            let _ = validate_and_canonicalize_properties_added(&self.local_state.properties_added)?;
+            let validated =
+                validate_and_canonicalize_properties_added(&self.local_state.properties_added)?;
+            let mut merged = self
+                .local_state
+                .snapshot
+                .table_configuration()
+                .metadata()
+                .configuration()
+                .clone();
+            merged.extend(validated);
+            validate_log_and_deleted_file_retention(&merged)?;
         }
         Ok(())
     }
@@ -989,6 +1002,27 @@ mod tests {
         assert!(
             error.to_string().contains(expected),
             "error={error}, expected={expected}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn with_table_properties_added_rejects_incompatible_retention_durations() -> Result<()> {
+        let (engine, snapshot, _tempdir) = load_test_table("table-without-dv-small")?;
+        let error = snapshot
+            .update_table(UpdateTableOperation::AlterTable, "test-engine", false)
+            .with_table_properties_added([
+                ("delta.logRetentionDuration", "interval 1 days"),
+                ("delta.deletedFileRetentionDuration", "interval 7 days"),
+            ])
+            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))
+            .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("needs to be greater than or equal to"),
+            "error={error}"
         );
         Ok(())
     }
