@@ -17,6 +17,8 @@ mod occ_plan;
 mod winner_check_plan;
 
 #[cfg(test)]
+mod real_table_tests;
+#[cfg(test)]
 mod tests;
 
 use decision::{

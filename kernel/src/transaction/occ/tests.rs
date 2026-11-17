@@ -117,11 +117,16 @@ impl TestTable {
     }
 
     fn winners(&self, read_version: Version) -> Vec<WinningCommit> {
-        let range = CommitRange::builder_for(&self.root, read_version + 1)
-            .build(&SyncEngine::new())
-            .unwrap();
-        WinningCommit::from_commit_range(&range).unwrap()
+        winners_after(&self.root, read_version)
     }
+}
+
+/// The commits after `read_version` in the table at `root`, up to the latest version.
+pub(super) fn winners_after(root: &str, read_version: Version) -> Vec<WinningCommit> {
+    let range = CommitRange::builder_for(root, read_version + 1)
+        .build(&SyncEngine::new())
+        .unwrap();
+    WinningCommit::from_commit_range(&range).unwrap()
 }
 
 /// A read relation with no files, for tests that inspect only T's facts.
@@ -129,11 +134,10 @@ fn no_read_files() -> RelationRef {
     RelationRef::new("read_files", schema_ref! { not_null "path": STRING })
 }
 
-/// A partitioned DELETE of `DELETED_DATE` that reads the files in `read_files`. It runs as
-/// copy-on-write under WriteSerializable.
-fn delete_facts(read_files: &RelationRef) -> LoserFacts {
+/// A DELETE that rewrites files under WriteSerializable, with the given read scope.
+pub(super) fn delete_loser(read_version: Version, read_scope: ReadScope) -> LoserFacts {
     LoserFacts {
-        read_version: READ_VERSION,
+        read_version,
         isolation_level: IsolationLevel::WriteSerializable,
         is_blind_append: false,
         has_data_change: true,
@@ -144,7 +148,36 @@ fn delete_facts(read_files: &RelationRef) -> LoserFacts {
         rewrites_files: true,
         written_domains: vec![],
         read_app_ids: vec![],
-        read_scope: ReadScope::Files {
+        read_scope,
+    }
+}
+
+/// The read scope of a files-scoped read of `read_files`, filtered by `partition_predicate`.
+pub(super) fn files_scope(
+    read_files: &RelationRef,
+    partition_schema: SchemaRef,
+    partition_predicate: Option<PredicateRef>,
+) -> ReadScope {
+    ReadScope::Files {
+        read_files: read_files.clone(),
+        partition_schema,
+        partition_predicate,
+        map_to_struct_options: MapToStructOptions::default(),
+    }
+}
+
+/// Makes `facts` an OPTIMIZE. An OPTIMIZE changes no data and writes no other action, so under
+/// WriteSerializable it drops to SnapshotIsolation.
+pub(super) fn make_optimize(facts: &mut LoserFacts) {
+    facts.has_data_change = false;
+    facts.operation_changes_data = false;
+}
+
+/// A partitioned DELETE of `DELETED_DATE` that reads the files in `read_files`.
+fn delete_facts(read_files: &RelationRef) -> LoserFacts {
+    delete_loser(
+        READ_VERSION,
+        ReadScope::Files {
             read_files: read_files.clone(),
             partition_schema: schema_ref! { nullable "date": DATE },
             partition_predicate: Some(Arc::new(
@@ -152,18 +185,18 @@ fn delete_facts(read_files: &RelationRef) -> LoserFacts {
             )),
             map_to_struct_options: MapToStructOptions::default(),
         },
-    }
+    )
 }
 
 /// T's file actions and read files, retained in a fresh scoped executor.
-struct LoserRelations {
+pub(super) struct LoserRelations {
     executor: ScopedSyncPlanExecutor,
     file_actions: RelationRef,
-    read_files: RelationRef,
+    pub(super) read_files: RelationRef,
 }
 
 impl LoserRelations {
-    fn new(removed: &[&str], read: &[&str]) -> Self {
+    pub(super) fn new(removed: &[&str], read: &[&str]) -> Self {
         let executor = SyncPlanExecutor::default().get_scoped();
         let path_field = StructField::not_null("path", DataType::STRING);
         let removes = Vec::from_iter(removed.iter().map(|&path| {
@@ -187,7 +220,11 @@ impl LoserRelations {
         delete_facts(&self.read_files)
     }
 
-    fn detect(&self, facts: &LoserFacts, winners: &[WinningCommit]) -> ConflictDetection {
+    pub(super) fn detect(
+        &self,
+        facts: &LoserFacts,
+        winners: &[WinningCommit],
+    ) -> ConflictDetection {
         detect_conflicts(&self.executor, facts, winners, &self.file_actions).unwrap()
     }
 }
