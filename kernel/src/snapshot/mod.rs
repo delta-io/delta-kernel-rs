@@ -71,6 +71,8 @@ mod builder;
 mod cancellation_tests;
 #[cfg(test)]
 mod crc_write_tests;
+#[cfg(feature = "declarative-plans")]
+mod data_cleanup;
 mod hint;
 mod incremental;
 mod reader;
@@ -80,6 +82,11 @@ mod tracing_tests;
 #[doc(hidden)]
 pub use builder::{FromSnapshot, FromTableRoot};
 pub use builder::{IncrementalReplay, IncrementalSnapshotBuilder, SnapshotBuilder};
+#[cfg(feature = "declarative-plans")]
+pub use data_cleanup::{
+    DATA_CLEANUP_LAST_MODIFIED, DATA_CLEANUP_LOCATION, DATA_CLEANUP_RELATIVE_PATH,
+    DataCleanupOptions,
+};
 #[allow(unused_imports)]
 #[internal_api]
 pub(crate) use hint::{PublicationWatermark, SnapshotHint, SnapshotHintFreshness};

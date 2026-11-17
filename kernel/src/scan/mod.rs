@@ -66,6 +66,8 @@ use crate::metrics::events::emit_scan_metadata_completed;
 use crate::metrics::{MetricId, ScanType};
 use crate::parallel::sequential_phase::SequentialPhase;
 #[cfg(feature = "declarative-plans")]
+use crate::plans::PlanBuilder;
+#[cfg(feature = "declarative-plans")]
 use crate::plans::ir::plan::Plan;
 use crate::scan::log_replay::{
     BASE_ROW_ID_NAME, CLUSTERING_PROVIDER_NAME, DEFAULT_ROW_COMMIT_VERSION_NAME,
@@ -1496,6 +1498,19 @@ impl Scan {
         &self,
         engine: &dyn Engine,
     ) -> KernelResult<Option<Plan>> {
+        match self.declarative_metadata_scan_plan_builder(engine)? {
+            Some(plan) => plan.build_opt(),
+            None => Ok(None),
+        }
+    }
+
+    /// Like [`Self::declarative_metadata_scan_plan`], but returns the unbuilt relation so kernel
+    /// can compose it into a larger plan. Returns `None` when no Delta metadata matches the scan.
+    #[cfg(feature = "declarative-plans")]
+    pub(crate) fn declarative_metadata_scan_plan_builder(
+        &self,
+        engine: &dyn Engine,
+    ) -> KernelResult<Option<PlanBuilder>> {
         // TODO(#3609): Support connector-supplied timezone in declarative metadata scans.
         require!(
             !table_requires_timestamp_timezone_support(
@@ -1518,7 +1533,7 @@ impl Scan {
 
         let planner = scan_plan::MetadataPlanner::try_from_scan(self)?;
         let base = scan_plan::MetadataReplayBase::try_new(&self.snapshot, engine)?;
-        self.build_metadata_scan_plan_with(base, planner)
+        self.metadata_scan_plan_builder_with(base, planner)
     }
 
     #[cfg(feature = "declarative-plans")]

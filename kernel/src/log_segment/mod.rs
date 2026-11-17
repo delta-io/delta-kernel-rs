@@ -1395,7 +1395,7 @@ impl LogSegment {
     }
 
     #[cfg(feature = "declarative-plans")]
-    fn version_tagged_scan_files<'a>(
+    pub(crate) fn version_tagged_scan_files<'a>(
         paths: impl IntoIterator<Item = &'a ParsedLogPath>,
     ) -> KernelResult<Vec<ScanFile>> {
         paths
