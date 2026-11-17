@@ -45,10 +45,8 @@ API details.
 
 ## Build & Test Commands
 
-> **`datafusion-executor` and `integration-tests` are separate workspaces.** Root `--workspace`
-> commands do not include them. For `datafusion_executor` commands, see
-> `datafusion-executor/CLAUDE.md`. `integration-tests/test-all-arrow-versions.sh` tests each
-> supported Arrow version.
+> **`integration-tests` is a separate workspace.** Root `--workspace` commands do not
+> include it. `integration-tests/test-all-arrow-versions.sh` tests each supported Arrow version.
 
 ```bash
 # Build
