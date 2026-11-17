@@ -477,16 +477,16 @@ jobs:
           make
           make test
   miri:
-    name: "Miri (shard ${{ matrix.partition }}/3)"
+    name: "Miri (shard ${{ matrix.partition }}/5)"
     runs-on: ubuntu-latest
     env:
       # Use the latest nightly so CI gets Miri fixes and new checks without manual pin updates.
       # Each new nightly changes the rust-cache key, so PR and merge-queue runs rebuild
-      # dependencies until a Miri run on main saves a cache entry for that nightly.
+      # dependencies until a successful shard-1 job on main saves a cache entry for that nightly.
       MIRI_TOOLCHAIN: nightly
     strategy:
       matrix:
-        partition: [1, 2, 3]
+        partition: [1, 2, 3, 4, 5]
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       # Install nightly before rust-cache so the cache key includes this nightly's version.
@@ -508,7 +508,8 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           cache-bin: false
-          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+          # All shards restore this cache; only shard 1 saves it, to avoid uploading it five times.
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && matrix.partition == 1 }}
       # rust-cache runs `cargo metadata` without `--locked`, which can rewrite Cargo.lock. Fail
       # here because the later `--locked` test command would accept the rewritten lockfile.
       - name: Check cache setup preserved Cargo.lock
@@ -536,7 +537,7 @@ jobs:
           printf 'CARGO_INCREMENTAL=%s\n' "$CARGO_INCREMENTAL" \
             | tee target/ci-telemetry/miri-settings.txt
           pushd ffi
-          MIRIFLAGS="-Zmiri-disable-isolation -Zmiri-provenance-gc=1000000" cargo miri nextest run --locked --features default-engine-rustls,delta-kernel-unity-catalog,declarative-plans,vendored-protoc,geo-type-in-dev --partition slice:${{ matrix.partition }}/3
+          MIRIFLAGS="-Zmiri-disable-isolation -Zmiri-provenance-gc=1000000" cargo miri nextest run --locked --features default-engine-rustls,delta-kernel-unity-catalog,declarative-plans,vendored-protoc,geo-type-in-dev --partition slice:${{ matrix.partition }}/5
       - name: Check Miri timing report
         run: test -s target/nextest/default-miri/junit.xml
       - name: Upload Miri timings and runner information
