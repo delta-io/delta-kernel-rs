@@ -307,8 +307,6 @@ struct ListingAccumulator {
     /// ends
     pending_checkpoint_parts: Vec<ParsedLogPath>,
     /// End-version bound used in process_file() to filter CompactedCommit files
-    // TODO(#2337): remove allow(dead_code) when log compaction is re-enabled
-    #[allow(dead_code)]
     end_version: Option<Version>,
     /// The version of the current group being accumulated
     group_version: Option<Version>,
@@ -322,17 +320,10 @@ impl ListingAccumulator {
         }
         match file.file_type {
             Commit | StagedCommit => self.output.ascending_commit_files.push(file),
-            // TODO(#2337): re-enable log compaction once testing is sufficient
-            // CompactedCommit { hi } if self.end_version.is_none_or(|end| hi <= end) => {
-            //     self.output.ascending_compaction_files.push(file);
-            // }
-            // CompactedCommit { .. } => (), // Failed the bounds check above
-            CompactedCommit { .. } => {
-                debug!(
-                    "Skipping unsupported log compaction file: {:?}",
-                    file.location
-                );
+            CompactedCommit { hi } if self.end_version.is_none_or(|end| hi <= end) => {
+                self.output.ascending_compaction_files.push(file);
             }
+            CompactedCommit { .. } => (), // Failed the bounds check above
             ClassicCheckpoint | UuidCheckpoint | MultiPartCheckpoint { .. } => {
                 self.pending_checkpoint_parts.push(file)
             }
@@ -774,6 +765,7 @@ impl LogSegmentFiles {
         // upper is the exclusive upper bound of the next window; adding 1 includes end_version
         // in the first window. The inclusive range passed to list_delta_log_from_storage is
         // [lower, upper - 1].
+        // TODO(#3835): Handle the exclusive upper bound when end_version is Version::MAX.
         let mut upper = end_version + 1;
         while upper > 0 {
             let lower = upper.saturating_sub(BACKWARD_SCAN_WINDOW_SIZE);

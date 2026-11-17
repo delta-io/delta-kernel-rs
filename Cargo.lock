@@ -11,7 +11,6 @@ dependencies = [
  "delta_kernel_default_engine",
  "delta_kernel_workloads",
  "flate2",
- "futures",
  "itertools 0.14.0",
  "serde",
  "serde_json",
@@ -1567,6 +1566,8 @@ dependencies = [
  "rustc_version",
  "serde",
  "serde_json",
+ "serde_stacker",
+ "stacker",
  "strum 0.28.0",
  "tempfile",
  "test-log",
@@ -4517,6 +4518,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "serde_stacker"
+version = "0.1.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d4936375d50c4be7eff22293a9344f8e46f323ed2b3c243e52f89138d9bb0f4a"
+dependencies = [
+ "serde",
+ "serde_core",
+ "stacker",
+]
+
+[[package]]
 name = "serde_urlencoded"
 version = "0.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5231,9 +5243,9 @@ checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 
 [[package]]
 name = "trybuild"
-version = "1.0.116"
+version = "1.0.119"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "47c635f0191bd3a2941013e5062667100969f8c4e9cd787c14f977265d73616e"
+checksum = "4c5c9f7b7b1a048dd2bebdb7260b0cc71ec5587b19352fa5c3cd9e1c067103f0"
 dependencies = [
  "glob",
  "serde",

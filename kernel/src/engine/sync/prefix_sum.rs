@@ -3,10 +3,8 @@
 use std::sync::Arc;
 
 use crate::arrow::array::{Array as _, Int64Array, RecordBatch};
-use crate::arrow::buffer::NullBuffer;
 use crate::arrow::datatypes::Schema as ArrowSchema;
 use crate::engine::arrow_conversion::TryFromKernel as _;
-use crate::engine::arrow_expression::evaluate_expression::extract_column_ref;
 use crate::plans::ir::nodes::PrefixSum;
 use crate::{KernelError, KernelResult};
 
@@ -20,19 +18,10 @@ pub(super) fn eval_prefix_sum(
     let mut output = Vec::with_capacity(input.len());
     for batch in input {
         let values = super::extract_long_column(batch, &prefix_sum.input)?;
-        let path = prefix_sum.input.path();
-
-        // Compute a null buffer ny unioning across the entire path because a child may contain
-        // hidden values that should be masked by an ancestor's nulls.
-        let mut nulls = values.nulls().cloned();
-        for len in 1..path.len() {
-            let ancestor = extract_column_ref(batch, &path[..len])?;
-            nulls = NullBuffer::union(nulls.as_ref(), ancestor.nulls());
-        }
 
         let mut offsets = Vec::with_capacity(batch.num_rows());
         for row_idx in 0..batch.num_rows() {
-            if nulls.as_ref().is_none_or(|nulls| nulls.is_valid(row_idx)) {
+            if values.is_valid(row_idx) {
                 offsets.push(Some(running_total));
                 running_total =
                     i64::checked_add(running_total, values.value(row_idx)).ok_or_else(|| {
@@ -53,8 +42,13 @@ pub(super) fn eval_prefix_sum(
 mod tests {
     use super::*;
     use crate::arrow::array::{ArrayRef, StringArray, StructArray};
+    use crate::arrow::buffer::NullBuffer;
     use crate::arrow::util::pretty::pretty_format_batches;
+    use crate::engine::arrow_data::EngineDataArrowExt;
+    use crate::engine::arrow_expression::evaluate_expression::extract_column;
+    use crate::engine::sync::plan::SyncPlanExecutor;
     use crate::expressions::column_name;
+    use crate::plans::{Operation, PlanBuilder, PlanExecutor};
     use crate::schema::{DataType, StructField, schema, schema_ref};
 
     /// Asserts `batches` pretty-print equal to `expected` (row order must match).
@@ -180,12 +174,25 @@ mod tests {
         } else {
             vec![batch.slice(1, 5)]
         };
-        let prefix_sum = PrefixSum::try_new(
-            &input_schema,
-            column_name!("outer.stats.numRecords"),
-            "offset",
-        )?;
-        let output = eval_prefix_sum(&prefix_sum, &input)?;
+        let scoped = SyncPlanExecutor::default().get_scoped();
+        let sources = input
+            .into_iter()
+            .enumerate()
+            .map(|(index, batch)| {
+                let source =
+                    scoped.create_ref(&format!("batch-{index}"), input_schema.clone(), batch)?;
+                Ok(PlanBuilder::relation_source(source))
+            })
+            .collect::<KernelResult<Vec<_>>>()?;
+        let plan = PlanBuilder::union_all(sources)?
+            .prefix_sum(column_name!("outer.stats.numRecords"), "offset")?
+            .build()?;
+        let output = scoped
+            .execute_op(Operation::QueryPlan(plan))?
+            .into_data()?
+            .map(|data| data.try_into_record_batch())
+            .collect::<KernelResult<Vec<_>>>()?;
+        assert_eq!(output.len(), if split_batches { 2 } else { 1 });
         let offsets: Vec<_> = output
             .iter()
             .flat_map(|batch| {
@@ -207,9 +214,28 @@ mod tests {
                 Some(if leaf_nullable { 10 } else { 15 }),
             ]
         );
-        for (input, output) in input.iter().zip(&output) {
-            assert_eq!(input.column(0), output.column(0));
-        }
+        let effective_values: Vec<_> = output
+            .iter()
+            .flat_map(|batch| {
+                let values = extract_column(batch, &["outer", "stats", "numRecords"]).unwrap();
+                values
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .iter()
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        assert_eq!(
+            effective_values,
+            [
+                Some(10),
+                None,
+                None,
+                if leaf_nullable { None } else { Some(5) },
+                Some(20),
+            ]
+        );
         Ok(())
     }
 

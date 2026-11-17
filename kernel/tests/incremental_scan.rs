@@ -11,6 +11,7 @@ use std::sync::Arc;
 use delta_kernel::arrow::array::{Int32Array, MapArray, RecordBatch, StringArray, StructArray};
 use delta_kernel::arrow::datatypes::Schema as ArrowSchema;
 use delta_kernel::committer::FileSystemCommitter;
+use delta_kernel::engine::DelegatingEngine;
 use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
 use delta_kernel::expressions::{Predicate as Pred, PredicateRef, Scalar, expr};
 use delta_kernel::incremental_scan::{
@@ -26,19 +27,17 @@ use delta_kernel::scan::state::ScanFile;
 use delta_kernel::schema::{StructType, schema_ref};
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
-use delta_kernel::{
-    Engine, EvaluationHandler, JsonHandler, ParquetHandler, Snapshot, SnapshotRef, StorageHandler,
-};
+use delta_kernel::{Engine, Snapshot, SnapshotRef};
 use rstest::rstest;
 use test_utils::delta_kernel_default_engine::executor::tokio::TokioBackgroundExecutor;
 use test_utils::delta_kernel_default_engine::json::DefaultJsonHandler;
 use test_utils::delta_kernel_default_engine::{DefaultEngine, DefaultEngineBuilder};
+use test_utils::log_compaction::write_compaction_from_commits;
 use test_utils::{
     TestAction, actions_to_string, actions_to_string_catalog_managed,
     actions_to_string_partitioned, add_commit, add_staged_commit, assert_result_error_with_message,
-    compacted_log_path_for_versions, create_log_path, create_table_and_load_snapshot,
-    delta_path_for_version, get_column, into_record_batch, test_table_setup_mt,
-    write_batch_to_table,
+    create_log_path, create_table_and_load_snapshot, delta_path_for_version, get_column,
+    into_record_batch, test_table_setup_mt, write_batch_to_table,
 };
 use url::Url;
 
@@ -553,12 +552,7 @@ async fn compaction_file_in_range_is_ignored() -> Result<(), Box<dyn std::error:
     )
     .await?;
 
-    // Drop a compaction file covering 1-3 next to the commit JSONs. Body is irrelevant
-    // because the incremental scan never opens it.
-    let compaction_path: ObjectStorePath = compacted_log_path_for_versions(1, 3, "json");
-    storage
-        .put(&compaction_path, bytes::Bytes::new().into())
-        .await?;
+    write_compaction_from_commits(table_root, storage.as_ref(), 1, 3).await?;
 
     let target = Snapshot::builder_for(table_url)
         .at_version(3)
@@ -788,49 +782,24 @@ async fn mixed_intra_batch_selection_vector() -> Result<(), Box<dyn std::error::
 }
 
 // === Batch-splitting invariance ===
-//
-// Engine wrapper that overrides only the JSON handler so we can force `read_json_files`
-// to chunk a single commit file across many `ActionsBatch` yields. Used by the
-// `single_commit_split_across_batches_dedups_correctly` test to verify the kernel does
-// not carry per-batch dedup state. A naive consumer that assumes "one yield = one commit"
-// would mis-cancel a same-commit `add(P, dv=new) + remove(P, dv=old)` pair when the two
-// rows land in different batches. Our dedup is keyed on `(path, dv_unique_id)` against a
-// global `seen_file_keys`, so output must be identical regardless of how the JSON reader
-// chunks rows.
-struct CustomBatchSizeEngine {
-    inner: Arc<DefaultEngine<TokioBackgroundExecutor>>,
-    json: Arc<DefaultJsonHandler<TokioBackgroundExecutor>>,
-}
 
-impl CustomBatchSizeEngine {
-    fn new(storage: Arc<InMemory>, batch_size: usize) -> Self {
-        let task_executor = Arc::new(TokioBackgroundExecutor::new());
-        let json = Arc::new(
-            DefaultJsonHandler::new(storage.clone(), task_executor.clone())
-                .with_batch_size(NonZero::new(batch_size).expect("batch_size is non-zero")),
-        );
-        let inner = Arc::new(
-            DefaultEngineBuilder::new(storage)
-                .with_task_executor(task_executor)
-                .build(),
-        );
-        Self { inner, json }
-    }
-}
-
-impl Engine for CustomBatchSizeEngine {
-    fn evaluation_handler(&self) -> Arc<dyn EvaluationHandler> {
-        self.inner.evaluation_handler()
-    }
-    fn storage_handler(&self) -> Arc<dyn StorageHandler> {
-        self.inner.storage_handler()
-    }
-    fn json_handler(&self) -> Arc<dyn JsonHandler> {
-        self.json.clone()
-    }
-    fn parquet_handler(&self) -> Arc<dyn ParquetHandler> {
-        self.inner.parquet_handler()
-    }
+/// Overrides the JSON batch size so tests can split a single commit across multiple `ActionsBatch`
+/// yields and check that deduplication is independent of batch boundaries. The JSON handler shares
+/// storage and the task executor with the base engine.
+fn custom_batch_size_engine(storage: Arc<InMemory>, batch_size: usize) -> DelegatingEngine {
+    let task_executor = Arc::new(TokioBackgroundExecutor::new());
+    let batch_sized_json_handler = Arc::new(
+        DefaultJsonHandler::new(storage.clone(), task_executor.clone())
+            .with_batch_size(NonZero::new(batch_size).expect("batch_size is non-zero")),
+    );
+    let inner = Arc::new(
+        DefaultEngineBuilder::new(storage)
+            .with_task_executor(task_executor)
+            .build(),
+    );
+    DelegatingEngine::new(inner)
+        .with_json_handler(batch_sized_json_handler)
+        .without_plan_executor()
 }
 
 // Regression test for batch-splitting invariance. A single commit contains a mix that
@@ -885,7 +854,7 @@ async fn single_commit_split_across_batches_dedups_correctly(
     .join("\n");
     add_commit(table_root, storage.as_ref(), 1, v1_actions).await?;
 
-    let engine = CustomBatchSizeEngine::new(storage, batch_size);
+    let engine = custom_batch_size_engine(storage, batch_size);
     let target = Snapshot::builder_for(table_url)
         .at_version(1)
         .build(&engine)?;

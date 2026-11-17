@@ -971,7 +971,7 @@ mod tests {
     #[cfg_attr(miri, ignore)]
     async fn serialized_results_stage_with_new_files_and_commit_through_ffi(
         #[case] shared: bool,
-    ) -> KernelResult<()> {
+    ) -> delta_kernel::Result<()> {
         let (store, engine, root) = test_utils::engine_store_setup("ffi_dv_commit", None);
         let engine = Arc::new(engine);
         let snapshot = test_utils::create_table_and_load_snapshot(
@@ -990,10 +990,16 @@ mod tests {
             ("second.parquet", vec![50, 60]),
         ] {
             let batch =
-                RecordBatch::try_from_iter([("id", Arc::new(Int32Array::from(ids)) as ArrayRef)])?;
+                RecordBatch::try_from_iter([("id", Arc::new(Int32Array::from(ids)) as ArrayRef)])
+                    .map_err(KernelError::from)?;
             let bytes = test_utils::record_batch_to_bytes(&batch);
-            let object_path = Path::from_url_path(root.join(path)?.path())?;
-            store.put(&object_path, bytes.clone().into()).await?;
+            let object_path =
+                Path::from_url_path(root.join(path).map_err(KernelError::from)?.path())
+                    .map_err(KernelError::from)?;
+            store
+                .put(&object_path, bytes.clone().into())
+                .await
+                .map_err(KernelError::from)?;
             adds.push((
                 path,
                 bytes.len() as i64,
@@ -1036,13 +1042,16 @@ mod tests {
         let mut data_index = 0;
         for (output_index, group) in groups.iter().enumerate() {
             let (output, results) = serialize(group);
-            let output_path = root.join(&format!("serialized-{output_index}.bin"))?;
+            let output_path = root
+                .join(&format!("serialized-{output_index}.bin"))
+                .map_err(KernelError::from)?;
             store
                 .put(
-                    &Path::from_url_path(output_path.path())?,
+                    &Path::from_url_path(output_path.path()).map_err(KernelError::from)?,
                     output.bytes.into(),
                 )
-                .await?;
+                .await
+                .map_err(KernelError::from)?;
             let output_url = output_path.as_str();
             for result in results {
                 let descriptor = ok_or_panic(unsafe {
@@ -1071,15 +1080,22 @@ mod tests {
         let replacement = RecordBatch::try_from_iter([(
             "id",
             Arc::new(Int32Array::from(vec![200, 300, 500])) as ArrayRef,
-        )])?;
+        )])
+        .map_err(KernelError::from)?;
         let bytes = test_utils::record_batch_to_bytes(&replacement);
         let replacement_path = "replacement.parquet";
         store
             .put(
-                &Path::from_url_path(root.join(replacement_path)?.path())?,
+                &Path::from_url_path(
+                    root.join(replacement_path)
+                        .map_err(KernelError::from)?
+                        .path(),
+                )
+                .map_err(KernelError::from)?,
                 bytes.clone().into(),
             )
-            .await?;
+            .await
+            .map_err(KernelError::from)?;
         let adds = test_utils::create_add_files_metadata(
             unsafe { txn.as_ref() }.add_files_schema(),
             vec![(replacement_path, bytes.len() as i64, 1_000_000, Some(3))],
@@ -1135,7 +1151,17 @@ mod tests {
         ids.sort_unstable();
         assert_eq!(ids, vec![10, 40, 60, 200, 300, 500]);
         for (path, bytes) in original_files {
-            assert_eq!(store.get(&path).await?.bytes().await?.as_ref(), bytes);
+            assert_eq!(
+                store
+                    .get(&path)
+                    .await
+                    .map_err(KernelError::from)?
+                    .bytes()
+                    .await
+                    .map_err(KernelError::from)?
+                    .as_ref(),
+                bytes
+            );
         }
         unsafe {
             free_committed_transaction(committed);

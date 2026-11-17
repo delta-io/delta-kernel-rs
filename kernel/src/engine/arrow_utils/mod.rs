@@ -11,7 +11,7 @@ use std::sync::{Arc, LazyLock, OnceLock};
 use delta_kernel_derive::internal_api;
 use derive_more::Constructor;
 use itertools::Itertools;
-use tracing::debug;
+use tracing::trace;
 
 use self::apply_schema::apply_schema_to_struct;
 use self::file_type_validation::validate_file_values_for_read;
@@ -232,9 +232,11 @@ impl RowIndexBuilder {
 ///   via `ArrowSchema::new`).
 ///
 /// **Type validation.** `apply_schema_to_struct` runs `ensure_data_types(.., Full)` at every
-/// primitive leaf. This is safe because `reorder_struct_array` above has already resolved every
+/// primitive leaf. On this path `reorder_struct_array` above has already resolved every
 /// `DataTypeCompat::NeedsCast` into an actual `arrow::compute::cast`, so post-reorder leaf types
-/// are `Identical` to the kernel target.
+/// are `Identical` to the kernel target and the leaf cast is a no-op. Note that `apply_schema` has
+/// other callers (the expression evaluator) with no such pre-cast step, so it resolves
+/// `NeedsCast` itself rather than relying on this invariant.
 ///
 /// **File values.** A non-null `file` value that the File type requires readers to reject fails
 /// the read; `validate_file_values_for_read` in `file_type_validation.rs` lists the rules.
@@ -519,7 +521,7 @@ fn get_indices(
         kernel_field_info,
     } in matched_parquet_fields
     {
-        debug!(
+        trace!(
             "Getting indices for field {} with offset {parquet_offset}, with index {parquet_index}",
             field.name()
         );
@@ -738,7 +740,7 @@ fn get_indices(
         } else {
             // We're NOT selecting this field, but we still need to track how many leaf columns we
             // skipped over
-            debug!("Skipping over un-selected field: {}", field.name());
+            trace!("Skipping over un-selected field: {}", field.name());
             // offset by number of inner fields. subtract one, because the enumerate still
             // counts this logical "parent" field
             parquet_offset += count_cols(field).saturating_sub(1);
@@ -755,14 +757,14 @@ fn get_indices(
             if !found_fields.contains(field.name()) {
                 match field.get_metadata_column_spec() {
                     Some(MetadataColumnSpec::RowIndex) => {
-                        debug!("Inserting a row index column: {}", field.name());
+                        trace!("Inserting a row index column: {}", field.name());
                         reorder_indices.push(ReorderIndex::row_index(
                             requested_position,
                             Arc::new(field.try_into_arrow()?),
                         ));
                     }
                     Some(MetadataColumnSpec::FilePath) => {
-                        debug!("Inserting a file path column: {}", field.name());
+                        trace!("Inserting a file path column: {}", field.name());
                         reorder_indices.push(ReorderIndex::file_path(
                             requested_position,
                             Arc::new(field.try_into_arrow()?),
@@ -774,7 +776,7 @@ fn get_indices(
                         )));
                     }
                     None if field.nullable => {
-                        debug!("Inserting missing and nullable field: {}", field.name());
+                        trace!("Inserting missing and nullable field: {}", field.name());
                         reorder_indices.push(ReorderIndex::missing(
                             requested_position,
                             Arc::new(field.try_into_arrow()?),
@@ -917,8 +919,8 @@ fn ordering_needs_transform(requested_ordering: &[ReorderIndex]) -> bool {
     // Check for all elements if we need a transform. This is true if any elements are not in order
     // (i.e. element[i].index < element[i+1].index), or any element needs a transform
     requested_ordering
-        .windows(2)
-        .any(|ri| (ri[0].index >= ri[1].index) || ri[1].needs_transform())
+        .array_windows()
+        .any(|[a, b]| a.index >= b.index || b.needs_transform())
 }
 
 /// Check if an ordering requires row index computation.
@@ -965,14 +967,14 @@ pub(crate) fn reorder_struct_array(
     mut row_indexes: Option<&mut FlattenedRangeIterator<i64>>,
     file_location: Option<&str>,
 ) -> KernelResult<StructArray> {
-    debug!("Reordering {input_data:?} with ordering: {requested_ordering:?}");
+    trace!("Reordering {input_data:?} with ordering: {requested_ordering:?}");
     if !ordering_needs_transform(requested_ordering) {
         // indices is already sorted, meaning we requested in the order that the columns were
         // stored in the parquet
         Ok(input_data)
     } else {
         // requested an order different from the parquet, reorder
-        debug!("Have requested reorder {requested_ordering:#?} on {input_data:?}");
+        trace!("Have requested reorder {requested_ordering:#?} on {input_data:?}");
         let num_rows = input_data.len();
         let num_cols = requested_ordering.len();
         let (input_fields, input_cols, null_buffer) = input_data.into_parts();
@@ -1244,9 +1246,31 @@ pub fn fix_nested_null_masks(batch: StructArray) -> StructArray {
     compute_nested_null_masks(batch, None)
 }
 
+/// Propagates parent null masks through a record batch's nested struct columns while preserving
+/// its schema and row count.
+#[cfg(all(feature = "declarative-plans", any(test, feature = "test-utils")))]
+pub(crate) fn fix_record_batch_nested_null_masks(batch: RecordBatch) -> KernelResult<RecordBatch> {
+    if !batch
+        .columns()
+        .iter()
+        .any(|column| matches!(column.data_type(), ArrowDataType::Struct(_)))
+    {
+        return Ok(batch);
+    }
+    let schema = batch.schema();
+    let row_count = batch.num_rows();
+    let columns = fix_nested_null_masks(batch.into()).columns().to_vec();
+    Ok(RecordBatch::try_new_with_options(
+        schema,
+        columns,
+        &RecordBatchOptions::new().with_row_count(Some(row_count)),
+    )?)
+}
+
 /// Splits a StructArray into its parts, unions in the parent null mask, and uses the result to
 /// recursively update the children as well before putting everything back together.
 fn compute_nested_null_masks(sa: StructArray, parent_nulls: Option<&NullBuffer>) -> StructArray {
+    let len = sa.len();
     let (fields, columns, nulls) = sa.into_parts();
     let nulls = NullBuffer::union(parent_nulls, nulls.as_ref());
     let columns = columns
@@ -1284,7 +1308,7 @@ fn compute_nested_null_masks(sa: StructArray, parent_nulls: Option<&NullBuffer>)
     //
     // SAFETY: We are simply reassembling the input `StructArray` we previously broke apart, with
     // updated null buffers. See above for details about null buffer safety.
-    unsafe { StructArray::new_unchecked(fields, columns, nulls) }
+    unsafe { StructArray::new_unchecked_with_length(fields, columns, nulls, len) }
 }
 
 /// Parse a column of JSON strings into a typed `RecordBatch` matching `schema`. N input
@@ -4783,6 +4807,26 @@ mod tests {
             other => panic!("expected nested Struct, got {other:?}"),
         };
         assert_eq!(nested_children[0].name(), "tgt_z");
+    }
+
+    #[rstest]
+    fn test_nested_null_masks_preserve_empty_struct_length(
+        #[values(0, 3)] len: usize,
+        #[values(false, true)] parent_nulls: bool,
+    ) {
+        let empty = Arc::new(StructArray::new_empty_fields(len, None));
+        let field = ArrowField::new("empty", empty.data_type().clone(), true);
+        let nulls =
+            parent_nulls.then(|| NullBuffer::from((0..len).map(|i| i != 0).collect::<Vec<_>>()));
+        let outer =
+            StructArray::try_new_with_length(vec![field].into(), vec![empty], nulls, len).unwrap();
+        let expected_nulls = outer.nulls().cloned();
+        let result = fix_nested_null_masks(outer);
+        assert_eq!(result.len(), len);
+        let child = result.column(0).as_struct();
+        assert_eq!(child.len(), len);
+        assert_eq!(child.num_columns(), 0);
+        assert_eq!(child.nulls(), expected_nulls.as_ref());
     }
 
     /// Verify that `fix_nested_null_masks` handles a struct with a NullArray child column

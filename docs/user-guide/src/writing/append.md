@@ -34,7 +34,7 @@ may differ.
 # use delta_kernel::transaction::{CommitResult, UpdateTableOperation};
 # use delta_kernel::{KernelResult, Snapshot};
 # #[tokio::main]
-# async fn main() -> KernelResult<()> {
+# async fn main() -> KernelResult<(), Box<dyn std::error::Error>> {
 # let url = delta_kernel::try_parse_uri("/tmp/table")?;
 # let engine = DefaultEngine::builder(store_from_url(&url)?).build();
 // 1. Get a snapshot

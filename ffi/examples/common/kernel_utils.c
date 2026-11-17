@@ -428,6 +428,7 @@ void print_metric(MetricEvent event) {
     PM_SLICE(lslf, correlation_id);
     print_table_type(lslf.table_type);
     print_log_segment_load_type(lslf.load_type);
+    PM_U64(lslf, duration_ns);
     PM_END;
     return;
 
@@ -449,6 +450,7 @@ void print_metric(MetricEvent event) {
     PM_SLICE(pmlf, correlation_id);
     print_table_type(pmlf.table_type);
     print_log_segment_load_type(pmlf.load_type);
+    PM_U64(pmlf, duration_ns);
     PM_END;
     return;
 
@@ -471,6 +473,7 @@ void print_metric(MetricEvent event) {
     PM_SLICE(slf, correlation_id);
     print_table_type(slf.table_type);
     print_load_type(slf.load_type);
+    PM_U64(slf, duration_ns);
     PM_END;
     return;
 
@@ -551,6 +554,31 @@ void print_metric(MetricEvent event) {
     PM_END;
     return;
 
+  case MetricEventCheckpointWriteSuccess:
+    PM_START(CheckpointWriteSuccess);
+    CheckpointWriteSuccess cps = event.checkpoint_write_success;
+    printf("  outcome: %d,\n", cps.outcome.tag);
+    PM_U64(cps, mode);
+    PM_U64(cps, duration_ns);
+    if (cps.outcome.tag == CheckpointWriteOutcomeWritten) {
+      CheckpointWriteStats stats = cps.outcome.written.stats;
+      PM_U64(stats, bytes_written);
+      PM_U64(stats, num_add_files);
+      PM_U64(stats, num_remove_files);
+      PM_U64(stats, num_actions);
+      PM_U64(stats, num_sidecars);
+    }
+    PM_END;
+    return;
+
+  case MetricEventCheckpointWriteFailure:
+    PM_START(CheckpointWriteFailure);
+    CheckpointWriteFailure cpf = event.checkpoint_write_failure;
+    PM_U64(cpf, mode);
+    PM_U64(cpf, duration_ns);
+    PM_END;
+    return;
+
   case MetricEventJsonReadCompleted:
     PM_START(MetricEventJsonReadCompleted);
     JsonReadCompleted jrc = event.json_read_completed;
@@ -615,6 +643,21 @@ void print_metric(MetricEvent event) {
     PM_START(MetricEventStorageCopyCompleted);
     StorageCopyCompleted scc = event.storage_copy_completed;
     PM_U64(scc, duration_ns);
+    PM_END;
+    return;
+
+  case MetricEventLastCheckpointReadCompleted:
+    PM_START(LastCheckpointReadCompleted);
+    LastCheckpointReadCompleted hint = event.last_checkpoint_read_completed;
+    printf("  outcome:");
+    switch (hint.outcome) {
+    case LastCheckpointReadOutcomeSuccess: printf(" Success,\n"); break;
+    case LastCheckpointReadOutcomeNotFound: printf(" NotFound,\n"); break;
+    case LastCheckpointReadOutcomeInvalid: printf(" Invalid,\n"); break;
+    case LastCheckpointReadOutcomeError: printf(" Error,\n"); break;
+    case LastCheckpointReadOutcomeUnknown: printf(" Unknown,\n"); break;
+    }
+    PM_U64(hint, duration_ns);
     PM_END;
     return;
 

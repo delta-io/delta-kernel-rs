@@ -37,7 +37,7 @@ use std::sync::{Arc, Mutex};
 use delta_kernel::incremental_scan::{IncrementalScanStream, IncrementalScanSummary};
 use delta_kernel::log_replay::FileActionKey;
 use delta_kernel::snapshot::SnapshotRef;
-use delta_kernel::{KernelError, KernelResult, PredicateRef, Version};
+use delta_kernel::{KernelError, KernelResult, PredicateRef, Result, Version};
 use delta_kernel_ffi_macros::handle_descriptor;
 
 #[cfg(feature = "default-engine-base")]
@@ -176,7 +176,7 @@ pub unsafe extern "C" fn incremental_scan_builder_build(
 
 fn incremental_scan_builder_build_impl(
     builder: FfiIncrementalScanBuilder,
-) -> KernelResult<OptionalValue<Handle<SharedIncrementalScanStream>>> {
+) -> Result<OptionalValue<Handle<SharedIncrementalScanStream>>> {
     let engine = builder.engine.engine();
     let maybe_stream = builder
         .target_snapshot
@@ -526,7 +526,7 @@ mod tests {
         summary: &Handle<SharedIncrementalScanSummary>,
     ) -> Vec<(String, Option<String>)> {
         let keys = RefCell::new(Vec::new());
-        let ctx = std::ptr::NonNull::new(&keys as *const _ as *mut std::ffi::c_void);
+        let ctx = Some(std::ptr::NonNull::from_ref(&keys).cast());
         unsafe {
             incremental_scan_summary_visit_live_adds(summary.shallow_copy(), ctx, collect_key)
         };
@@ -537,7 +537,7 @@ mod tests {
         summary: &Handle<SharedIncrementalScanSummary>,
     ) -> Vec<(String, Option<String>)> {
         let keys = RefCell::new(Vec::new());
-        let ctx = std::ptr::NonNull::new(&keys as *const _ as *mut std::ffi::c_void);
+        let ctx = Some(std::ptr::NonNull::from_ref(&keys).cast());
         unsafe { incremental_scan_summary_visit_removes(summary.shallow_copy(), ctx, collect_key) };
         keys.into_inner()
     }

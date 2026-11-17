@@ -25,7 +25,8 @@ use crate::table_configuration::TableConfiguration;
 use crate::table_features::{Operation, TableFeature, format_features};
 use crate::utils::require;
 use crate::{
-    Engine, EngineData, KernelError, KernelResult, KernelResultIterator, PredicateRef, RowVisitor,
+    Engine, EngineData, Error, KernelError, KernelResult, KernelResultIterator, PredicateRef,
+    Result, RowVisitor,
 };
 
 #[cfg(test)]
@@ -57,7 +58,7 @@ pub(crate) fn table_changes_action_iter<I>(
     commit_files: I,
     table_schema: SchemaRef,
     physical_predicate: Option<(PredicateRef, SchemaRef)>,
-) -> KernelResult<impl KernelResultIterator<TableChangesScanMetadata> + use<I>>
+) -> Result<impl Iterator<Item = Result<TableChangesScanMetadata>> + Send + use<I>>
 where
     I: IntoIterator<Item = ParsedLogPath>,
     I::IntoIter: Send,
@@ -85,7 +86,7 @@ pub(crate) fn table_changes_action_iter_with_mode<I>(
     table_schema: SchemaRef,
     physical_predicate: Option<(PredicateRef, SchemaRef)>,
     mode: CdfMode,
-) -> KernelResult<impl KernelResultIterator<TableChangesScanMetadata> + use<I>>
+) -> Result<impl Iterator<Item = Result<TableChangesScanMetadata>> + Send + use<I>>
 where
     I: IntoIterator<Item = ParsedLogPath>,
     I::IntoIter: Send,
@@ -108,7 +109,7 @@ where
     let mut current_configuration = start_table_configuration.clone();
     let result = commit_files
         .into_iter()
-        .map(move |commit_file| -> KernelResult<_> {
+        .map(move |commit_file| -> Result<_> {
             let scanner = LogReplayScanner::try_new(
                 engine.as_ref(),
                 &mut current_configuration,
@@ -116,10 +117,10 @@ where
                 &table_schema,
                 mode,
             )?;
-            scanner.into_scan_batches(engine.clone(), filter.clone())
+            Ok(scanner.into_scan_batches(engine.clone(), filter.clone())?)
         }) //Iterator-Result-Iterator-Result
         .flatten_ok() // Iterator-Result-Result
-        .map(|x| x?); // Iterator-Result
+        .map(|x| x?.map_err(Error::from)); // Iterator-Result
     Ok(result)
 }
 
@@ -193,7 +194,7 @@ impl LogReplayScanner {
         commit_file: ParsedLogPath,
         table_schema: &SchemaRef,
         mode: CdfMode,
-    ) -> KernelResult<Self> {
+    ) -> Result<Self> {
         let visitor_schema = PreparePhaseVisitor::schema();
 
         // Note: We do not perform data skipping yet because we need to visit all add and
@@ -246,10 +247,12 @@ impl LogReplayScanner {
                 // Compatibility is evaluated against the end version's logical schema.
                 require!(
                     mode.schemas_compatible(&schema, table_schema.as_ref()),
-                    KernelError::change_data_feed_incompatible_schema_at_version(
-                        table_schema,
-                        &schema,
-                        commit_file.version
+                    Error::Kernel(
+                        KernelError::change_data_feed_incompatible_schema_at_version(
+                            table_schema,
+                            &schema,
+                            commit_file.version
+                        )
                     )
                 );
             }
@@ -266,8 +269,7 @@ impl LogReplayScanner {
                 let writer_features_str = table_configuration
                     .protocol()
                     .writer_features()
-                    .map(format_features)
-                    .unwrap_or_else(|| "[]".to_string());
+                    .map_or_else(|| "[]".to_string(), format_features);
 
                 info!(
                     version = commit_file.version,
@@ -285,14 +287,19 @@ impl LogReplayScanner {
             if has_metadata_update {
                 require!(
                     table_configuration.is_feature_enabled(&mode.required_feature()),
-                    mode.feature_disabled_error(commit_file.version)
+                    Error::Kernel(mode.feature_disabled_error(commit_file.version))
                 );
             }
 
             if has_protocol_update {
                 table_configuration
                     .ensure_operation_supported(Operation::Cdf)
-                    .map_err(|e| mode.protocol_support_error(e, commit_file.version))?;
+                    .map_err(|e| match e {
+                        Error::Kernel(e) => {
+                            mode.protocol_support_error(e, commit_file.version).into()
+                        }
+                        other => other,
+                    })?;
             }
         }
         // We resolve the remove deletion vector map after visiting the entire commit.
@@ -309,10 +316,10 @@ impl LogReplayScanner {
         let timestamp = if table_configuration.is_feature_enabled(&TableFeature::InCommitTimestamp)
         {
             let Some(in_commit_timestamp) = in_commit_timestamp_opt else {
-                return Err(KernelError::generic(format!(
+                return Err(Error::Kernel(KernelError::generic(format!(
                     "In-commit timestamp is enabled but not found in commit at version {}",
                     commit_file.version
-                )));
+                ))));
             };
             in_commit_timestamp
         } else {

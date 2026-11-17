@@ -23,7 +23,9 @@ use delta_kernel::arrow::datatypes::{
 use delta_kernel::column_trie::ColumnTrie;
 use delta_kernel::engine::arrow_utils::fix_nested_null_masks;
 use delta_kernel::expressions::ColumnName;
-use delta_kernel::schema::{DataType as KernelDataType, StructType};
+use delta_kernel::schema::{
+    DataType as KernelDataType, StructType, is_null_count_only_file_sub_field,
+};
 use delta_kernel::{KernelError, KernelResult};
 
 /// Maximum prefix length for string statistics (Delta protocol requirement).
@@ -403,8 +405,11 @@ fn compute_column_stats(
                 return Ok(ColumnStats::default());
             }
 
-            let null_count: Option<ArrayRef> =
-                Some(Arc::new(Int64Array::from(vec![column.null_count() as i64])));
+            // Logical nulls: a dictionary key can be valid but point at a null value, which
+            // `null_count` does not count.
+            let null_count: Option<ArrayRef> = Some(Arc::new(Int64Array::from(vec![
+                column.logical_null_count() as i64,
+            ])));
 
             let complex_type = matches!(
                 column.data_type(),
@@ -504,7 +509,7 @@ pub fn collect_stats(
     stats_columns: &[ColumnName],
     physical_schema: &StructType,
 ) -> KernelResult<StructArray> {
-    let null_count_only_columns = interval_column_names(physical_schema, stats_columns);
+    let null_count_only_columns = null_count_only_column_names(physical_schema, stats_columns);
     reduce_stats(
         &collect_stats_raw(batch, stats_columns, &null_count_only_columns)?,
         TruncateStats::Yes,
@@ -662,7 +667,7 @@ impl FileStatsAccumulator {
     /// only) from integer columns.
     pub fn new(stats_columns: &[ColumnName], physical_schema: &StructType) -> Self {
         Self {
-            null_count_only_columns: interval_column_names(physical_schema, stats_columns),
+            null_count_only_columns: null_count_only_column_names(physical_schema, stats_columns),
             stats_columns: stats_columns.to_vec(),
             batch_schema: None,
             state: AccumulatorState::Open(None),
@@ -905,15 +910,21 @@ fn is_interval_type(data_type: &KernelDataType) -> bool {
     primitive_type.is_interval()
 }
 
-fn interval_column_names(schema: &StructType, stats_columns: &[ColumnName]) -> Vec<ColumnName> {
+/// Returns the `stats_columns` that get only `nullCount`: intervals, and the `file` sub-fields
+/// without min/max statistics (`checksum` and `inline`).
+fn null_count_only_column_names(
+    schema: &StructType,
+    stats_columns: &[ColumnName],
+) -> Vec<ColumnName> {
     stats_columns
         .iter()
         .filter(|col| {
-            schema
-                .fields_of_path(col)
-                .ok()
-                .and_then(|fields| fields.last().map(|field| field.data_type()))
-                .is_some_and(is_interval_type)
+            schema.fields_of_path(col).is_ok_and(|path| {
+                is_null_count_only_file_sub_field(&path)
+                    || path
+                        .last()
+                        .is_some_and(|leaf| is_interval_type(leaf.data_type()))
+            })
         })
         .cloned()
         .collect()
@@ -922,8 +933,8 @@ fn interval_column_names(schema: &StructType, stats_columns: &[ColumnName]) -> V
 #[cfg(test)]
 mod tests {
     use delta_kernel::arrow::array::{
-        Array, AsArray, BinaryArray, Decimal128Array, Float64Array, Int32Array, Int64Array,
-        ListArray, MapArray, NullArray, RecordBatchOptions, StringArray,
+        Array, AsArray, BinaryArray, Decimal128Array, DictionaryArray, Float64Array, Int32Array,
+        Int64Array, ListArray, MapArray, NullArray, RecordBatchOptions, StringArray,
     };
     use delta_kernel::arrow::buffer::{NullBuffer, OffsetBuffer};
     use delta_kernel::arrow::compute::concat_batches;
@@ -933,7 +944,7 @@ mod tests {
     use delta_kernel::engine::arrow_expression::evaluate_expression::to_json;
     use delta_kernel::expressions::column_name;
     use delta_kernel::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-    use delta_kernel::schema::schema;
+    use delta_kernel::schema::{StructField, schema};
     use test_utils::{assert_batches_sorted_eq, assert_result_error_with_message};
 
     use super::*;
@@ -1007,6 +1018,42 @@ mod tests {
             .downcast_ref::<Int64Array>()
             .unwrap();
         assert_eq!(value_null_count.value(0), 1);
+    }
+
+    /// A dictionary key that is valid but points at a null value is a null, at top level and
+    /// in a struct, so `nullCount` counts it.
+    #[test]
+    fn test_collect_stats_null_counts_dictionary_null_values() {
+        // Rows: "a", a valid key for a null value, a null key.
+        let dict = || {
+            Arc::new(DictionaryArray::<Int32Type>::new(
+                Int32Array::from(vec![Some(0), Some(1), None]),
+                Arc::new(StringArray::from(vec![Some("a"), None])),
+            )) as ArrayRef
+        };
+        let dict_type = DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8));
+        let child = Field::new("uri", dict_type.clone(), true);
+        // The struct is null in the first row, so its `uri` is null there too.
+        let s = StructArray::new(
+            Fields::from(vec![child.clone()]),
+            vec![dict()],
+            Some(NullBuffer::from(vec![false, true, true])),
+        );
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("d", dict_type, true),
+            Field::new("s", s.data_type().clone(), true),
+        ]));
+        let batch = RecordBatch::try_new(schema, vec![dict(), Arc::new(s)]).unwrap();
+
+        let stats = collect_stats(&batch, &[column_name!("d"), column_name!("s.uri")]).unwrap();
+
+        assert_eq!(flat_stat::<Int64Type>(&stats, NULL_COUNT, "d"), 2);
+        let s_null_counts = child_struct(&stats, NULL_COUNT)
+            .column_by_name("s")
+            .unwrap()
+            .as_struct();
+        let uri = s_null_counts.column_by_name("uri").unwrap();
+        assert_eq!(uri.as_primitive::<Int64Type>().value(0), 3);
     }
 
     #[test]
@@ -2927,6 +2974,54 @@ mod tests {
             // The sibling column still gets bounds, so the exclusion is targeted.
             assert!(child_struct(&merged, section).column_by_name("n").is_some());
         }
+    }
+
+    /// The null-count-only columns are intervals and the `file` sub-fields `checksum` and
+    /// `inline`, at top level or nested in a struct, but no other `file` sub-field.
+    #[test]
+    fn test_null_count_only_column_names() {
+        let schema = StructType::try_new([
+            StructField::nullable("span", KernelDataType::INTERVAL_DAY_TIME),
+            StructField::nullable("f", KernelDataType::file_type()),
+            StructField::nullable(
+                "s",
+                StructType::try_new([StructField::nullable("f", KernelDataType::file_type())])
+                    .unwrap(),
+            ),
+            StructField::nullable(
+                "checksum",
+                StructType::try_new([StructField::nullable("checksum", KernelDataType::STRING)])
+                    .unwrap(),
+            ),
+        ])
+        .unwrap();
+        let columns: Vec<_> = [
+            "span",
+            "f.uri",
+            "f.offset",
+            "f.size",
+            "f.content_type",
+            "f.checksum",
+            "f.inline",
+            "s.f.size",
+            "s.f.checksum",
+            "s.f.inline",
+            "checksum.checksum",
+        ]
+        .into_iter()
+        .map(ColumnName::from_naive_str_split)
+        .collect();
+        let expected: Vec<_> = [
+            "span",
+            "f.checksum",
+            "f.inline",
+            "s.f.checksum",
+            "s.f.inline",
+        ]
+        .into_iter()
+        .map(ColumnName::from_naive_str_split)
+        .collect();
+        assert_eq!(null_count_only_column_names(&schema, &columns), expected);
     }
 
     #[test]

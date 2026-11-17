@@ -1,6 +1,8 @@
 //! Snapshot tests for adaptiveMetadata (AMT) tables whose state is carried by a `checkpoint`
 //! action.
 
+use std::sync::Arc;
+
 use itertools::Itertools as _;
 use rstest::rstest;
 use url::Url;
@@ -10,10 +12,13 @@ use crate::actions::{
     LastManifestCommit, SetTransaction,
 };
 use crate::engine::sync::SyncEngine;
-use crate::unit_test_utils::Action;
+use crate::metrics::MeteredDeltaEngine;
+use crate::snapshot::builder::tests::measuring_reporter;
 use crate::unit_test_utils::adaptive_metadata_fixtures::{
-    checkpoint_line, setup_adaptive_metadata_table, write_ict_commit, write_sidecar,
+    checkpoint_line, domain, domain_metadata_line, setup_adaptive_metadata_table, txn_line,
+    write_ict_commit, write_sidecar,
 };
+use crate::unit_test_utils::is_io_event;
 use crate::{Snapshot, SnapshotRef, Version};
 
 /// The version [`table_with_checkpoint_action`] commits its checkpoint action at.
@@ -93,12 +98,46 @@ fn checkpoint_action(snapshot: &Snapshot) -> CheckpointAction {
     )
 }
 
-fn txn(app_id: &str, version: i64) -> SetTransaction {
-    SetTransaction::new(app_id.to_string(), version, None)
+#[rstest]
+fn newer_catalog_bound_preserves_populated_adaptive_metadata_caches(
+    #[values(None, Some(CHECKPOINT_VERSION + 1))] crc_version: Option<Version>,
+) {
+    // GIVEN a latest snapshot with populated adaptive-metadata caches and an optional CRC.
+    let (engine, source) = table_with_checkpoint_action(
+        "",
+        |_, _, snapshot| checkpoint_action(snapshot),
+        "",
+        crc_version,
+    );
+    let checkpoint = source.latest_checkpoint_action(&engine).unwrap().unwrap();
+    let manifest = source.last_manifest_commit(&engine).unwrap().unwrap();
+    let engine = MeteredDeltaEngine::new(Arc::new(engine));
+    let (reporter, _guard) = measuring_reporter();
+
+    // WHEN the same version is requested with a newer catalog bound.
+    let historical = Snapshot::builder_from(source.clone())
+        .at_version(source.version())
+        .with_max_catalog_version(source.version() + 1)
+        .build(&engine)
+        .unwrap();
+    // THEN only the result's freshness changes, preserving the populated caches without I/O.
+    assert!(!historical.is_built_as_latest());
+    assert!(source.is_built_as_latest());
+    assert!(Arc::ptr_eq(
+        historical
+            .checkpoint_action
+            .get()
+            .unwrap()
+            .as_ref()
+            .unwrap(),
+        &checkpoint,
+    ));
+    assert_eq!(historical.last_manifest_commit.get(), Some(&Some(manifest)));
+    assert!(!reporter.events().iter().any(is_io_event));
 }
 
-fn txn_line(app_id: &str, version: i64) -> String {
-    serde_json::to_string(&Action::Txn(txn(app_id, version))).unwrap()
+fn txn(app_id: &str, version: i64) -> SetTransaction {
+    SetTransaction::new(app_id.to_string(), version, None)
 }
 
 /// The action's txns, which the consistent cases also commit before it.
@@ -173,14 +212,6 @@ fn app_id_versions_come_from_checkpoint_action_and_later_commits(
     assert_eq!(tail_base.map(|crc| crc.version), expected_tail_base);
 }
 
-fn dm(domain: &str, configuration: &str) -> DomainMetadata {
-    DomainMetadata::new(domain.to_string(), configuration.to_string())
-}
-
-fn dm_line(dm: DomainMetadata) -> String {
-    serde_json::to_string(&Action::DomainMetadata(dm)).unwrap()
-}
-
 /// The action's domains, which the consistent cases also commit before it.
 const ACTION_DOMAINS: &[(&str, &str)] = &[("a", "a1"), ("b", "b1"), ("d", "d1")];
 
@@ -198,23 +229,23 @@ fn domain_metadata_comes_from_checkpoint_action_and_later_commits(
 ) {
     let before = before
         .iter()
-        .map(|(domain, configuration)| dm_line(dm(domain, configuration)))
+        .map(|(name, configuration)| domain_metadata_line(domain(name, configuration)))
         .join("\n");
     let after = format!(
         "{}\n{}",
-        dm_line(dm("a", "a2")),
-        dm_line(DomainMetadata::remove("b".to_string(), String::new()))
+        domain_metadata_line(domain("a", "a2")),
+        domain_metadata_line(DomainMetadata::remove("b".to_string(), String::new()))
     );
     let (engine, snapshot) = table_with_checkpoint_action(
         &before,
         |engine, table_root, snapshot| CheckpointAction {
-            domain_metadata: vec![dm("a", "a1"), dm("b", "b1")],
+            domain_metadata: vec![domain("a", "a1"), domain("b", "b1")],
             domain_metadata_sidecars: vec![write_sidecar(
                 engine,
                 table_root,
                 "domains.parquet",
                 LOG_DOMAIN_METADATA_SCHEMA.clone(),
-                vec![dm("d", "d1").into()],
+                vec![domain("d", "d1").into()],
             )],
             ..checkpoint_action(snapshot)
         },

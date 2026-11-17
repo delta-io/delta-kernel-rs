@@ -22,13 +22,15 @@ use crate::{
 /// [`snapshot_builder_with_incremental_crc_replay`], [`snapshot_builder_with_log_tail`], and
 /// [`snapshot_builder_with_max_catalog_version`] (for catalog-managed tables). Builders returned
 /// by [`get_snapshot_builder`] may instead receive a complete typed snapshot hint with
-/// [`hint::snapshot_builder_with_snapshot_hint`].
+/// [`hint::snapshot_builder_with_snapshot_hint`]. Use [`snapshot_builder_with_correlation_id`] to
+/// associate the build's metrics with a caller-supplied identifier.
 /// Finally, call [`snapshot_builder_build`] to consume the builder and obtain the snapshot. If you
 /// need to discard the builder without building, call [`free_snapshot_builder`].
 pub struct FfiSnapshotBuilder {
     pub(super) engine: Arc<dyn ExternEngine>,
     pub(super) source: FfiSnapshotBuilderSource,
     version: Option<Version>,
+    correlation_id: Option<String>,
     incremental_replay: IncrementalReplay,
     log_tail: Vec<LogPath>,
     max_catalog_version: Option<Version>,
@@ -121,9 +123,13 @@ pub unsafe extern "C" fn get_snapshot_builder_from(
 }
 
 /// Sets an explicit target version on a snapshot builder. When omitted, a hinted build uses the
-/// hinted version; an ordinary build uses `max_catalog_version` when configured, otherwise the
-/// latest listed version. A hint and explicit target must match or build returns
-/// `InvalidSnapshotHint`.
+/// hinted version. An ordinary build uses `max_catalog_version` when configured, otherwise it
+/// discovers the latest version using the filesystem and any tail supplied through
+/// [`snapshot_builder_with_log_tail`].
+/// A hint and explicit target must match or build returns `InvalidSnapshotHint`.
+///
+/// An explicit target does not require a catalog bound solely because that version is
+/// catalog-managed. An explicit target must not exceed a supplied catalog bound.
 ///
 /// # Safety
 ///
@@ -137,6 +143,31 @@ pub unsafe extern "C" fn snapshot_builder_with_version(
     let mut builder = unsafe { builder.into_inner() };
     builder.version = Some(version);
     builder.into()
+}
+
+/// Attach a caller-supplied identifier to this snapshot build's metric events.
+///
+/// Copies the identifier before returning. Repeated calls replace the previous value; an empty
+/// value clears it. Invalid UTF-8 or a null pointer with nonzero length returns an error.
+///
+/// # Safety
+///
+/// `builder` must be a valid handle. It is consumed on both success and error and must not be
+/// used or freed afterward. The caller owns the returned builder on success. `correlation_id`
+/// is borrowed for this call. If its pointer is non-null, it must address `len` readable bytes
+/// until the call returns.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn snapshot_builder_with_correlation_id(
+    builder: Handle<ExclusiveSnapshotBuilder>,
+    correlation_id: KernelStringSlice,
+) -> ExternResult<Handle<ExclusiveSnapshotBuilder>> {
+    let mut builder = unsafe { builder.into_inner() };
+    let engine = builder.engine.clone();
+    let result = unsafe { correlation_id.try_to_string() }.map(|id| {
+        builder.correlation_id = Some(id).filter(|id| !id.is_empty());
+        builder.into()
+    });
+    unsafe { result.into_extern_result(&engine.as_ref()) }
 }
 
 /// Set the replay mode for advancing a stale CRC during a fresh or incremental snapshot build.
@@ -160,7 +191,15 @@ pub unsafe extern "C" fn snapshot_builder_with_incremental_crc_replay(
     builder.into()
 }
 
-/// Set the log tail on a snapshot builder for catalog-managed tables.
+/// Set the catalog-supplied log tail on a snapshot builder.
+///
+/// A nonempty tail must be an ascending, contiguous sequence of commits without duplicates.
+/// For replay, it replaces filesystem commit files from its first version onward, including
+/// filesystem commits newer than the tail.
+///
+/// Staged commits supplied in the tail must have been ratified by the managing catalog and require
+/// [`snapshot_builder_with_max_catalog_version`] even with an explicit target. See that function
+/// for constraints on the last tail version when a bound is supplied.
 ///
 /// # Errors
 ///
@@ -186,8 +225,19 @@ pub unsafe extern "C" fn snapshot_builder_with_log_tail(
     unsafe { result.into_extern_result(&engine_ref) }
 }
 
-/// Set the max catalog version on a snapshot builder for catalog-managed tables. This bounds the
-/// snapshot version to what the catalog has ratified.
+/// Bound the snapshot version to what the catalog has ratified.
+///
+/// Without an explicit target, this selects the catalog version even if newer filesystem commits
+/// exist. An explicit target must not exceed the bound. These rules apply whether or not the
+/// resulting snapshot is catalog-managed.
+///
+/// Supply the catalog's bound when loading its latest ratified version, including a downgrade.
+/// An empty catalog tail does not remove this requirement. A latest version request that returns
+/// a catalog-managed snapshot without a bound fails with `MaxCatalogVersionError`.
+///
+/// With a bound and no explicit target, the last log-tail entry, if any, must match the bound.
+/// With an explicit target, the last entry, if any, must be at least the target version.
+/// See [`snapshot_builder_with_log_tail`] for staged-commit input requirements.
 ///
 /// # Safety
 ///
@@ -205,6 +255,15 @@ pub unsafe extern "C" fn snapshot_builder_with_max_catalog_version(
 
 /// Consume the builder and return a snapshot. After calling, the builder pointer is _no longer
 /// valid_. The builder is always freed by this call, whether or not it succeeds.
+///
+/// Failures that [`SnapshotBuilder::build`] reports as Delta errors go to the
+/// `allocate_delta_error` callback; all other failures go to `allocate_kernel_error`. For example,
+/// a latest-version build of a table root without a Delta log reports `DELTA_PATH_DOES_NOT_EXIST`,
+/// while the same build with [`snapshot_builder_with_version`] reports `EmptyLogError`. A local
+/// table path that does not exist fails earlier, when [`get_snapshot_builder`] or engine
+/// construction parses it, with `InvalidTableLocationError`.
+///
+/// [`SnapshotBuilder::build`]: delta_kernel::snapshot::SnapshotBuilder::build
 ///
 /// # Safety
 ///
@@ -244,6 +303,7 @@ fn make_snapshot_builder(
         engine,
         source,
         version: None,
+        correlation_id: None,
         incremental_replay: IncrementalReplay::Disabled,
         log_tail: Vec::new(),
         max_catalog_version: None,
@@ -262,11 +322,12 @@ unsafe fn snapshot_builder_with_log_tail_impl(
 
 fn snapshot_builder_build_impl(
     builder: FfiSnapshotBuilder,
-) -> KernelResult<Handle<SharedSnapshot>> {
+) -> delta_kernel::Result<Handle<SharedSnapshot>> {
     let FfiSnapshotBuilder {
         engine,
         source,
         version,
+        correlation_id,
         incremental_replay,
         log_tail,
         max_catalog_version,
@@ -276,6 +337,7 @@ fn snapshot_builder_build_impl(
 
     struct BuildOptions {
         version: Option<Version>,
+        correlation_id: Option<String>,
         incremental_replay: IncrementalReplay,
         log_tail: Vec<LogPath>,
         max_catalog_version: Option<Version>,
@@ -291,15 +353,19 @@ fn snapshot_builder_build_impl(
             Box<SnapshotHint>,
         )
             -> KernelResult<delta_kernel::snapshot::SnapshotBuilder<Mode>>,
-    ) -> KernelResult<SnapshotRef> {
+    ) -> delta_kernel::Result<SnapshotRef> {
         let BuildOptions {
             version,
+            correlation_id,
             incremental_replay,
             log_tail,
             max_catalog_version,
             snapshot_hint,
         } = options;
         builder = builder.with_incremental_crc_replay(incremental_replay);
+        if let Some(correlation_id) = correlation_id {
+            builder = builder.with_correlation_id(correlation_id);
+        }
         if let Some(version) = version {
             builder = builder.at_version(version);
         }
@@ -317,6 +383,7 @@ fn snapshot_builder_build_impl(
 
     let options = BuildOptions {
         version,
+        correlation_id,
         incremental_replay,
         log_tail,
         max_catalog_version,
@@ -343,4 +410,152 @@ fn snapshot_builder_build_impl(
         ),
     }?;
     Ok(snapshot.into())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::ffi::c_char;
+
+    use delta_kernel::metrics::MetricEvent;
+    use rstest::rstest;
+    use test_utils::{CapturingReporter, TestAction, actions_to_string};
+
+    use super::*;
+    use crate::error::FFIKernelError;
+    use crate::ffi_test_utils::{
+        assert_extern_result_error_with_message, error_only_engine_handle,
+        install_thread_local_metrics_reporter, ok_or_panic, recover_error, setup_snapshot,
+    };
+    use crate::{free_engine, free_snapshot, kernel_string_slice};
+
+    #[rstest]
+    fn correlation_id_setter_copies_input_and_consumes_builder_on_error(
+        #[values(false, true)] fail: bool,
+        #[values(std::ptr::null(), b"\xff".as_ptr().cast())] correlation_id_ptr: *const c_char,
+    ) {
+        let engine = error_only_engine_handle();
+        let table_root = "memory:///table/";
+        let engine_owner = unsafe { engine.clone_as_arc() };
+        let baseline = Arc::strong_count(&engine_owner);
+        let builder = unsafe {
+            ok_or_panic(get_snapshot_builder(
+                kernel_string_slice!(table_root),
+                engine.shallow_copy(),
+            ))
+        };
+        assert_eq!(Arc::strong_count(&engine_owner), baseline + 1);
+        let mut id = String::from("request-1");
+        let builder = unsafe {
+            ok_or_panic(snapshot_builder_with_correlation_id(
+                builder,
+                kernel_string_slice!(id),
+            ))
+        };
+        id.clear();
+        assert_eq!(
+            unsafe { builder.as_ref() }.correlation_id.as_deref(),
+            Some("request-1")
+        );
+        id.push_str("request-2");
+        let builder = unsafe {
+            ok_or_panic(snapshot_builder_with_correlation_id(
+                builder,
+                kernel_string_slice!(id),
+            ))
+        };
+        drop(id);
+        assert_eq!(
+            unsafe { builder.as_ref() }.correlation_id.as_deref(),
+            Some("request-2")
+        );
+        let id = KernelStringSlice {
+            ptr: correlation_id_ptr,
+            len: usize::from(fail),
+        };
+        let result = unsafe { snapshot_builder_with_correlation_id(builder, id) };
+        if fail {
+            let expected = if correlation_id_ptr.is_null() {
+                FFIKernelError::GenericError
+            } else {
+                FFIKernelError::Utf8Error
+            };
+            assert_extern_result_error_with_message(result, expected, None);
+        } else {
+            let builder = ok_or_panic(result);
+            assert!(unsafe { builder.as_ref() }.correlation_id.is_none());
+            unsafe { free_snapshot_builder(builder) };
+        }
+        assert_eq!(Arc::strong_count(&engine_owner), baseline);
+        unsafe { free_engine(engine) };
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn snapshot_builder_correlation_id_reaches_metrics(
+        #[values(false, true)] incremental: bool,
+        #[values(false, true)] fail: bool,
+    ) {
+        let (engine, snapshot) = setup_snapshot(actions_to_string(vec![TestAction::Metadata]))
+            .await
+            .unwrap();
+        let table_root = "memory:///";
+        let builder = unsafe {
+            ok_or_panic(if incremental {
+                get_snapshot_builder_from(snapshot.shallow_copy(), engine.shallow_copy())
+            } else {
+                get_snapshot_builder(kernel_string_slice!(table_root), engine.shallow_copy())
+            })
+        };
+        let id = String::from("snapshot-request");
+        let builder = unsafe {
+            ok_or_panic(snapshot_builder_with_correlation_id(
+                builder,
+                kernel_string_slice!(id),
+            ))
+        };
+        drop(id);
+        let builder = if fail {
+            unsafe { snapshot_builder_with_version(builder, 99) }
+        } else {
+            builder
+        };
+        let reporter = Arc::new(CapturingReporter::default());
+        let _guard = install_thread_local_metrics_reporter(reporter.clone());
+        match unsafe { snapshot_builder_build(builder) } {
+            ExternResult::Ok(snapshot) => {
+                unsafe { free_snapshot(snapshot) };
+                assert!(!fail);
+            }
+            ExternResult::Err(error) => {
+                unsafe { recover_error(error) };
+                assert!(fail);
+            }
+        }
+        let mut completions = 0;
+        for event in reporter.events() {
+            let correlation_id = match event {
+                MetricEvent::SnapshotBuildSuccess(event) => {
+                    completions += 1;
+                    assert!(!fail);
+                    event.correlation_id
+                }
+                MetricEvent::SnapshotBuildFailure(event) => {
+                    completions += 1;
+                    assert!(fail);
+                    event.correlation_id
+                }
+                MetricEvent::LogSegmentLoadSuccess(event) => event.correlation_id,
+                MetricEvent::LogSegmentLoadFailure(event) => event.correlation_id,
+                MetricEvent::ProtocolMetadataLoadSuccess(event) => event.correlation_id,
+                MetricEvent::ProtocolMetadataLoadFailure(event) => event.correlation_id,
+                _ => continue,
+            };
+            assert_eq!(correlation_id.as_deref(), Some("snapshot-request"));
+        }
+        assert_eq!(completions, 1);
+        unsafe {
+            free_snapshot(snapshot);
+            free_engine(engine);
+        }
+    }
 }

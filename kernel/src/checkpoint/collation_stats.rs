@@ -238,7 +238,7 @@ mod tests {
     use crate::scan::StatsOptions;
     use crate::schema::{ColumnMetadataKey, MetadataValue, schema, schema_ref};
     use crate::snapshot::SnapshotRef;
-    use crate::{Engine, EngineData, version_as_i64};
+    use crate::{Engine, EngineData, Result, version_as_i64};
 
     #[rstest]
     #[case::missing(None, vec![])]
@@ -312,7 +312,7 @@ mod tests {
     #[tokio::test]
     async fn checkpoint_sampling_stops_after_first_add_batch(
         #[case] has_collations: bool,
-    ) -> KernelResult<()> {
+    ) -> Result<()> {
         let (_, engine, snapshot) = checkpoint_table(false, false).await?;
         let stats = if has_collations {
             json!({ COLLATION_STATS: { "ICU.en_US.72": {} } })
@@ -328,6 +328,7 @@ mod tests {
             filtered_data: FilteredEngineData::with_all_rows_selected(data),
             actions_count: 1,
             add_actions_count: 1,
+            remove_actions_count: 0,
         };
         let mut batches = std::iter::once(Ok(batch)).chain(std::iter::once_with(|| {
             panic!("read past the first Add batch")
@@ -349,7 +350,7 @@ mod tests {
     #[tokio::test]
     async fn checkpoint_omits_unsampled_identifiers_without_relabeling_bounds(
         #[case] write_json: bool,
-    ) -> KernelResult<()> {
+    ) -> Result<()> {
         let (_, engine, snapshot) = checkpoint_table(write_json, false).await?;
         let writer = checkpoint_writer(snapshot, &engine)?;
         let (batches, output_schema) = writer.checkpoint_data_with_schema(&engine)?;
@@ -381,7 +382,8 @@ mod tests {
             let add = &adds[path];
             assert_sampled_bounds(&add["stats_parsed"], &bounds);
             if write_json {
-                let json: Value = serde_json::from_str(add["stats"].as_str().unwrap())?;
+                let json: Value = serde_json::from_str(add["stats"].as_str().unwrap())
+                    .map_err(KernelError::from)?;
                 assert_eq!(json[COLLATION_STATS], bounds);
             } else {
                 assert!(add.get("stats").is_none());
@@ -394,7 +396,7 @@ mod tests {
     #[case::v1_consecutive_checkpoints(false)]
     #[case::v2_sidecar_smoke(true)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn checkpoint_collation_bounds_round_trip(#[case] sidecars: bool) -> KernelResult<()> {
+    async fn checkpoint_collation_bounds_round_trip(#[case] sidecars: bool) -> Result<()> {
         let (store, engine, _) = checkpoint_table(false, sidecars).await?;
         for version in 1..=if sidecars { 1 } else { 2 } {
             if version == 2 {
@@ -421,7 +423,8 @@ mod tests {
                     .map(|batch| Ok(batch?.scan_files)),
             )?);
             for (path, bounds) in samples() {
-                let stats = serde_json::from_str(rows[path]["stats"].as_str().unwrap())?;
+                let stats = serde_json::from_str(rows[path]["stats"].as_str().unwrap())
+                    .map_err(KernelError::from)?;
                 assert_sampled_bounds(&stats, &bounds);
             }
         }
@@ -436,7 +439,7 @@ mod tests {
     async fn checkpoint_discovers_only_active_collation_bounds(
         #[case] replace_dv: bool,
         #[case] earlier_checkpoint: bool,
-    ) -> KernelResult<()> {
+    ) -> Result<()> {
         let store: Arc<DynObjectStore> = Arc::new(InMemory::new());
         let engine = SyncEngine::new_with_store(store.clone());
         let table_root = "memory:///";
@@ -574,7 +577,7 @@ mod tests {
     async fn read_adds_only_collations_to_the_ordinary_stats_projection(
         #[case] has_json: bool,
         #[values(false, true)] parsed: bool,
-    ) -> KernelResult<()> {
+    ) -> Result<()> {
         let bounds = json!({ "ICU.en_US.72": { "minValues": { "other": "B" } } });
         let source = schema! {
             nullable "numRecords": LONG,
@@ -637,7 +640,10 @@ mod tests {
         )?;
         assert_eq!(rows.len(), 1);
         let stats_json = rows[0]["stats"].as_str().unwrap();
-        assert_eq!(serde_json::from_str::<Value>(stats_json)?, expected);
+        assert_eq!(
+            serde_json::from_str::<Value>(stats_json).map_err(KernelError::from)?,
+            expected
+        );
         if has_json {
             assert_eq!(stats_json, expected.to_string());
         }
@@ -661,7 +667,7 @@ mod tests {
             assert_eq!(actual.len(), 1);
             let stats_json = actual[0]["add"]["stats"].as_str().unwrap();
             assert_eq!(
-                serde_json::from_str::<Value>(stats_json)?,
+                serde_json::from_str::<Value>(stats_json).map_err(KernelError::from)?,
                 if has_json {
                     expected.clone()
                 } else {
@@ -681,7 +687,7 @@ mod tests {
     async fn checkpoint_table(
         write_json: bool,
         sidecars: bool,
-    ) -> KernelResult<(Arc<DynObjectStore>, SyncEngine, SnapshotRef)> {
+    ) -> Result<(Arc<DynObjectStore>, SyncEngine, SnapshotRef)> {
         let store: Arc<DynObjectStore> = Arc::new(InMemory::new());
         let engine = SyncEngine::new_with_store(store.clone());
         let table_schema = schema_ref! {

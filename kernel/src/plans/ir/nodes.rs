@@ -818,6 +818,8 @@ pub enum Agg {
     Count(ColumnName),
     /// [`Agg::count_star`] has no operands.
     CountStar,
+    /// Operand for [`Agg::first_non_null`].
+    FirstNonNull(ColumnName),
     /// Operands for [`Agg::min_non_null_by`].
     MinNonNullBy(NonNullByOperands),
     /// Operands for [`Agg::max_non_null_by`].
@@ -833,6 +835,15 @@ pub struct NonNullByOperands {
 }
 
 impl Agg {
+    /// Selects the first encountered non-null `value`, or NULL for empty/all-null input.
+    ///
+    /// The result retains the operand's type and is nullable. Struct validity determines
+    /// presence; null children are preserved. Without an ordering contract, the selected row
+    /// may depend on the executor's partition and merge order.
+    pub fn first_non_null(value: impl Into<ColumnName>) -> Self {
+        Self::FirstNonNull(value.into())
+    }
+
     /// Like [`max`](Self::max), but selects the least non-NULL value in each group.
     ///
     /// ```text
@@ -991,7 +1002,9 @@ impl Agg {
             })
         };
         match self {
-            Agg::Min(value) | Agg::Max(value) => resolve(value, None, true),
+            Agg::Min(value) | Agg::Max(value) | Agg::FirstNonNull(value) => {
+                resolve(value, None, true)
+            }
             Agg::Sum(value) => resolve(value, Some(DataType::LONG), true),
             Agg::Count(value) => resolve(value, Some(DataType::LONG), false),
             Agg::CountStar => Ok(StructField::not_null(
@@ -1022,6 +1035,11 @@ pub struct AggregateBuilder {
 }
 
 impl AggregateBuilder {
+    /// Adds the first non-null `value` to the aggregate output, preserving its name and type.
+    pub fn first_non_null(self, value: impl Into<ColumnName>) -> Self {
+        self.aggregate(Agg::first_non_null(value))
+    }
+
     /// Adds an aggregate column, emitted after the group keys in call order, using each [`Agg`]'s
     /// default output name (see the per-function docs). Prefer the named helpers for the common
     /// case (e.g. [`max`](Self::max); use [`aggregate_as`](Self::aggregate_as) to override the

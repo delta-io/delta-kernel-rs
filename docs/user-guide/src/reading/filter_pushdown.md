@@ -149,8 +149,8 @@ Pass the predicate to `ScanBuilder::with_predicate`:
 # use delta_kernel_default_engine::DefaultEngine;
 # use delta_kernel_default_engine::storage::store_from_url;
 # use delta_kernel::expressions::{col, lit, Predicate};
-# use delta_kernel::{KernelResult, Snapshot};
-# fn example() -> KernelResult<()> {
+# use delta_kernel::Snapshot;
+# fn example() -> delta_kernel::Result<()> {
 # let url = delta_kernel::try_parse_uri("/tmp/table")?;
 # let store = store_from_url(&url)?;
 # let engine = DefaultEngine::builder(store).build();
@@ -278,8 +278,8 @@ statistics altogether. This avoids the cost of parsing statistics from checkpoin
 # use delta_kernel_default_engine::DefaultEngine;
 # use delta_kernel_default_engine::storage::store_from_url;
 # use delta_kernel::scan::StatsOptions;
-# use delta_kernel::{KernelResult, Snapshot};
-# fn example() -> KernelResult<()> {
+# use delta_kernel::Snapshot;
+# fn example() -> delta_kernel::Result<()> {
 # let url = delta_kernel::try_parse_uri("/tmp/table")?;
 # let store = store_from_url(&url)?;
 # let engine = DefaultEngine::builder(store).build();
@@ -314,8 +314,8 @@ scan metadata, pass `StatsOptions::all_struct()` (structured stats without JSON 
 # use delta_kernel_default_engine::DefaultEngine;
 # use delta_kernel_default_engine::storage::store_from_url;
 # use delta_kernel::scan::StatsOptions;
-# use delta_kernel::{KernelResult, Snapshot};
-# fn example() -> KernelResult<()> {
+# use delta_kernel::Snapshot;
+# fn example() -> delta_kernel::Result<()> {
 # let url = delta_kernel::try_parse_uri("/tmp/table")?;
 # let store = store_from_url(&url)?;
 # let engine = DefaultEngine::builder(store).build();
@@ -350,8 +350,8 @@ To receive statistics for only a subset of columns, pass `StatsOptions::struct_c
 # use delta_kernel_default_engine::storage::store_from_url;
 # use delta_kernel::expressions::column_name;
 # use delta_kernel::scan::StatsOptions;
-# use delta_kernel::{KernelResult, Snapshot};
-# fn example() -> KernelResult<()> {
+# use delta_kernel::Snapshot;
+# fn example() -> delta_kernel::Result<()> {
 # let url = delta_kernel::try_parse_uri("/tmp/table")?;
 # let store = store_from_url(&url)?;
 # let engine = DefaultEngine::builder(store).build();

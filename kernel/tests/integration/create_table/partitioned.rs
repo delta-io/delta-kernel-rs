@@ -2,7 +2,6 @@
 //!
 //! TODO(#2201): Add end-to-end tests for insert + scan + checkpoint on partitioned tables.
 
-use delta_kernel::KernelResult;
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::snapshot::Snapshot;
 use delta_kernel::table_features::TableFeature;
@@ -16,7 +15,7 @@ use super::{partition_test_schema, simple_schema};
 #[rstest]
 #[case::exact_casing("date")]
 #[case::mismatched_casing("DATE")]
-fn test_create_table_partitioned_basic(#[case] partition_col: &str) -> KernelResult<()> {
+fn test_create_table_partitioned_basic(#[case] partition_col: &str) -> delta_kernel::Result<()> {
     let schema = partition_test_schema()?;
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
@@ -52,7 +51,7 @@ fn test_create_table_partitioned_basic(#[case] partition_col: &str) -> KernelRes
 #[case::non_partitioned(false)]
 fn test_create_table_with_materialize_partition_columns_partitioned_and_not(
     #[case] partitioned: bool,
-) -> KernelResult<()> {
+) -> delta_kernel::Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
     let schema = if partitioned {
         partition_test_schema()?

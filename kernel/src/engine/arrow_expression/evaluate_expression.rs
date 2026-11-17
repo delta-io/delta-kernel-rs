@@ -1220,8 +1220,8 @@ mod tests {
     use super::*;
     use crate::arrow::array::{
         ArrayData as ArrowArrayData, ArrayRef, BinaryArray, BooleanArray, Date32Array,
-        Float64Array, Int32Array, Int64Array, LargeStringArray, ListArray, MapBuilder, StringArray,
-        StringBuilder, StructArray, TimestampMicrosecondArray,
+        Float32Array, Float64Array, Int32Array, Int64Array, LargeStringArray, ListArray,
+        MapBuilder, StringArray, StringBuilder, StructArray, TimestampMicrosecondArray,
     };
     use crate::arrow::buffer::{OffsetBuffer, ScalarBuffer};
     use crate::arrow::datatypes::{
@@ -1991,6 +1991,141 @@ mod tests {
         // Error: binary result type mismatch
         let result = evaluate_expression(&add_expr, &batch, Some(&DataType::STRING));
         assert_result_error_with_message(result, "Incorrect datatype");
+    }
+
+    #[rstest]
+    #[case::float_double(lit(6_f32), lit(2_f64), DataType::DOUBLE)]
+    #[case::double_float(lit(6_f64), lit(2_f32), DataType::DOUBLE)]
+    #[case::integer_long(lit(6_i32), lit(2_i64), DataType::LONG)]
+    #[case::long_integer(lit(6_i64), lit(2_i32), DataType::LONG)]
+    fn test_arithmetic_rejects_mixed_numeric_types(
+        #[case] left: Expr,
+        #[case] right: Expr,
+        #[case] common_type: DataType,
+        #[values(
+            BinaryExpressionOp::Plus,
+            BinaryExpressionOp::Minus,
+            BinaryExpressionOp::Multiply,
+            BinaryExpressionOp::Divide
+        )]
+        op: BinaryExpressionOp,
+        #[values(false, true)] declare_result_type: bool,
+    ) {
+        let batch = create_test_batch();
+        let expr = Expr::binary(op, left, right);
+        // A requested result type validates the output; it does not cast either operand.
+        let result_type = declare_result_type.then_some(&common_type);
+        assert_result_error_with_message(
+            evaluate_expression(&expr, &batch, result_type),
+            "Invalid arithmetic operation",
+        );
+    }
+
+    fn numeric_type_batch() -> RecordBatch {
+        RecordBatch::try_from_iter([
+            (
+                "f32",
+                Arc::new(Float32Array::from(vec![
+                    Some(6.0),
+                    None,
+                    Some(2.0),
+                    Some(-2.0),
+                ])) as ArrayRef,
+            ),
+            (
+                "f64",
+                Arc::new(Float64Array::from(vec![
+                    Some(6.0),
+                    None,
+                    Some(2.0),
+                    Some(-2.0),
+                ])),
+            ),
+            (
+                "i32",
+                Arc::new(Int32Array::from(vec![Some(6), None, Some(2), Some(-2)])),
+            ),
+            (
+                "i64",
+                Arc::new(Int64Array::from(vec![Some(6), None, Some(2), Some(-2)])),
+            ),
+        ])
+        .unwrap()
+    }
+
+    #[rstest]
+    #[case::float(col!("f32"), lit(2_f32), DataType::FLOAT)]
+    #[case::double(col!("f64"), lit(2_f64), DataType::DOUBLE)]
+    #[case::integer(col!("i32"), lit(2_i32), DataType::INTEGER)]
+    #[case::long(col!("i64"), lit(2_i64), DataType::LONG)]
+    #[case::float_to_double(Expr::cast(col!("f32"), DataType::DOUBLE), lit(2_f64), DataType::DOUBLE)]
+    #[case::integer_to_long(Expr::cast(col!("i32"), DataType::LONG), lit(2_i64), DataType::LONG)]
+    fn test_numeric_arithmetic_same_types_and_explicit_casts(
+        #[case] left: Expr,
+        #[case] right: Expr,
+        #[case] result_type: DataType,
+    ) {
+        let batch = numeric_type_batch();
+        let arrow_type = (&result_type).try_into_arrow().unwrap();
+        for (op, first, third, last) in [
+            (BinaryExpressionOp::Plus, 8.0, 4.0, 0.0),
+            (BinaryExpressionOp::Minus, 4.0, 0.0, -4.0),
+            (BinaryExpressionOp::Multiply, 12.0, 4.0, -4.0),
+            (BinaryExpressionOp::Divide, 3.0, 1.0, -1.0),
+        ] {
+            let expr = Expr::binary(op, left.clone(), right.clone());
+            let result = evaluate_expression(&expr, &batch, Some(&result_type)).unwrap();
+            let expected = Float64Array::from(vec![Some(first), None, Some(third), Some(last)]);
+            let expected = cast(&expected, &arrow_type).unwrap();
+            assert_eq!(result.as_ref(), expected.as_ref(), "{expr}");
+        }
+    }
+
+    #[rstest]
+    #[case::float_double(lit(6_f32), lit(2_f64))]
+    #[case::double_float(lit(6_f64), lit(2_f32))]
+    #[case::integer_long(lit(6_i32), lit(2_i64))]
+    #[case::long_integer(lit(6_i64), lit(2_i32))]
+    fn test_comparison_rejects_mixed_numeric_types(
+        #[case] left: Expr,
+        #[case] right: Expr,
+        #[values(
+            BinaryPredicateOp::Equal,
+            BinaryPredicateOp::LessThan,
+            BinaryPredicateOp::GreaterThan
+        )]
+        op: BinaryPredicateOp,
+    ) {
+        let batch = create_test_batch();
+        let pred = Pred::binary(op, left, right);
+        assert_result_error_with_message(
+            evaluate_predicate(&pred, &batch, false),
+            "Invalid comparison operation",
+        );
+    }
+
+    #[rstest]
+    #[case::float(col!("f32"), lit(2_f32))]
+    #[case::double(col!("f64"), lit(2_f64))]
+    #[case::integer(col!("i32"), lit(2_i32))]
+    #[case::long(col!("i64"), lit(2_i64))]
+    #[case::float_to_double(Expr::cast(col!("f32"), DataType::DOUBLE), lit(2_f64))]
+    #[case::integer_to_long(Expr::cast(col!("i32"), DataType::LONG), lit(2_i64))]
+    fn test_numeric_comparison_same_types_and_explicit_casts(
+        #[case] left: Expr,
+        #[case] right: Expr,
+    ) {
+        let batch = numeric_type_batch();
+        for (op, first, third, last) in [
+            (BinaryPredicateOp::Equal, false, true, false),
+            (BinaryPredicateOp::LessThan, false, false, true),
+            (BinaryPredicateOp::GreaterThan, true, false, false),
+        ] {
+            let pred = Pred::binary(op, left.clone(), right.clone());
+            let result = evaluate_predicate(&pred, &batch, false).unwrap();
+            let expected = BooleanArray::from(vec![Some(first), None, Some(third), Some(last)]);
+            assert_eq!(result, expected, "{pred}");
+        }
     }
 
     fn divide(left: Expr, right: Expr) -> Expr {

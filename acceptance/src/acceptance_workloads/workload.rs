@@ -45,7 +45,7 @@ fn build_snapshot(
     engine: &dyn Engine,
     table_root: &Url,
     time_travel: Option<&TimeTravel>,
-) -> KernelResult<Arc<Snapshot>> {
+) -> delta_kernel::Result<Arc<Snapshot>> {
     let version = time_travel
         .map(TimeTravel::as_version)
         .transpose()
@@ -63,7 +63,7 @@ pub fn execute_read_workload(
     engine: Arc<dyn Engine>,
     table_root: &Url,
     read_spec: &ReadSpec,
-) -> KernelResult<ReadResult> {
+) -> delta_kernel::Result<ReadResult> {
     let snapshot = build_snapshot(engine.as_ref(), table_root, read_spec.time_travel.as_ref())?;
 
     let table_schema = snapshot.schema();
@@ -172,7 +172,7 @@ pub fn execute_snapshot_workload(
     engine: Arc<dyn Engine>,
     table_root: &Url,
     snapshot_spec: &SnapshotConstructionSpec,
-) -> KernelResult<SnapshotResult> {
+) -> delta_kernel::Result<SnapshotResult> {
     let snapshot = build_snapshot(
         engine.as_ref(),
         table_root,

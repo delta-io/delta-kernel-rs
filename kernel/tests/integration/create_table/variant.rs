@@ -49,7 +49,7 @@ fn test_create_table_with_variant(
     )]
     schema: Arc<StructType>,
     #[values("none", "name", "id")] cm_mode: &str,
-) -> KernelResult<()> {
+) -> delta_kernel::Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
     let _ = create_table(&table_path, schema.clone(), "Test/1.0", true)
@@ -91,7 +91,7 @@ fn test_create_table_with_variant(
 
 /// A schema without variant columns should not add the variantType feature.
 #[test]
-fn test_create_table_no_variant_no_feature() -> KernelResult<()> {
+fn test_create_table_no_variant_no_feature() -> delta_kernel::Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
     let schema = schema_ref! {

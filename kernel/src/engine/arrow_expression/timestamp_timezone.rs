@@ -43,6 +43,11 @@ impl FromStr for TimestampTimezone {
     type Err = KernelError;
 
     fn from_str(value: &str) -> KernelResult<Self> {
+        // `Z` is the normalized id of the zero offset, and it is not an IANA name.
+        if value == "Z" {
+            return Ok(Self::default());
+        }
+
         let timezone = if value.starts_with(['+', '-']) {
             parse_normalized_fixed_offset(value).map(Self::Fixed)
         } else {
@@ -57,8 +62,8 @@ impl TimestampTimezone {
     ///
     /// # Errors
     ///
-    /// Returns an error when the configured value is neither a recognized IANA timezone nor a
-    /// fixed offset in `+HH:MM` or `-HH:MM` form.
+    /// Returns an error when the configured value is not a recognized IANA timezone, a fixed
+    /// offset in `+HH:MM[:SS]` or `-HH:MM[:SS]` form, or `Z` for UTC.
     pub(crate) fn try_from_options(options: &MapToStructOptions) -> KernelResult<Self> {
         match options.timestamp_timezone() {
             Some(value) => value.parse(),
@@ -88,7 +93,8 @@ impl TimestampTimezone {
     }
 }
 
-/// Parses a normalized fixed offset within the conventional `-18:00` through `+18:00` range.
+/// Parses a normalized `+HH:MM[:SS]` or `-HH:MM[:SS]` offset within the conventional `-18:00`
+/// through `+18:00` range.
 fn parse_normalized_fixed_offset(value: &str) -> Option<FixedOffset> {
     let sign = match value.as_bytes().first()? {
         b'+' => 1,
@@ -98,10 +104,16 @@ fn parse_normalized_fixed_offset(value: &str) -> Option<FixedOffset> {
     let mut components = value.get(1..)?.split(':');
     let hours = parse_two_digits(components.next()?)?;
     let minutes = parse_two_digits(components.next()?)?;
-    if components.next().is_some() || hours > 18 || minutes > 59 || (hours == 18 && minutes != 0) {
+    let seconds = components.next().map_or(Some(0), parse_two_digits)?;
+    if components.next().is_some()
+        || hours > 18
+        || minutes > 59
+        || seconds > 59
+        || (hours == 18 && (minutes != 0 || seconds != 0))
+    {
         return None;
     }
-    FixedOffset::east_opt(sign * (hours * 3_600 + minutes * 60))
+    FixedOffset::east_opt(sign * (hours * 3_600 + minutes * 60 + seconds))
 }
 
 /// Parses exactly two ASCII decimal digits.
@@ -160,8 +172,23 @@ mod tests {
     #[case::minute_offset("+05:30")]
     #[case::positive_limit("+18:00")]
     #[case::negative_limit("-18:00")]
+    #[case::positive_limit_with_seconds("+18:00:00")]
+    #[case::below_limit_with_seconds("+17:59:59")]
     fn accepts_normalized_reader_timezones(#[case] timezone: &str) {
         assert!(TimestampTimezone::try_from_options(&options(timezone)).is_ok());
+    }
+
+    #[rstest]
+    #[case::canonical_utc("Z", "2024-01-15T12:30:45Z")]
+    #[case::positive("+05:30:15", "2024-01-15T07:00:30Z")]
+    #[case::negative("-05:30:15", "2024-01-15T18:01:00Z")]
+    #[case::sub_minute_negative("-00:00:01", "2024-01-15T12:30:46Z")]
+    fn applies_reader_offsets(#[case] timezone: &str, #[case] expected: &str) {
+        let timezone = TimestampTimezone::try_from_options(&options(timezone)).unwrap();
+        assert_eq!(
+            timezone.parse_timestamp("2024-01-15 12:30:45"),
+            Some(expected_timestamp_micros(expected))
+        );
     }
 
     #[rstest]
@@ -170,13 +197,16 @@ mod tests {
     #[case::compact_hour("+05")]
     #[case::compact_hour_minute("+0530")]
     #[case::invalid_minutes("+05:60")]
-    #[case::second_precision("+05:00:01")]
+    #[case::invalid_seconds("+05:30:60")]
+    #[case::empty_seconds("+05:30:")]
+    #[case::single_digit_seconds("+05:30:1")]
     #[case::past_limit("+18:00:01")]
     #[case::past_limit_minutes("+18:30")]
     #[case::invalid_hours("+19:00")]
     #[case::extra_component("+05:00:00:00")]
     #[case::nondigit_hours("+/0:00")]
     #[case::nondigit_minutes("+00:/0")]
+    #[case::nondigit_seconds("+00:00:/0")]
     #[case::unknown_name("Not/AZone")]
     fn rejects_noncanonical_reader_timezones(#[case] timezone: &str) {
         assert!(TimestampTimezone::try_from_options(&options(timezone)).is_err());

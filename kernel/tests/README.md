@@ -137,7 +137,7 @@ The golden V2 checkpoint tables have a different protocol (v1/v2, no table featu
 
 | Table | Location | Schema | Protocol (R/W) | Description | Tests |
 |-------|----------|--------|----------|-------------|-------|
-| `type-widening` | data/ | 13 columns named by widening path (e.g. `byte_long`, `float_double`, `date_timestamp_ntz`) | v1/v2 (at v0) | Commit 0 = narrow types, commit 1 = widened | `read.rs::type_widening_basic/type_widening_decimal` |
+| `type-widening` | data/ | 13 columns named by widening path (e.g. `byte_long`, `float_double`, `date_timestamp_ntz`) | v1/v2 (at v0) | Commit 0 = narrow types, commit 1 = enables type widening, commit 2 = widened | `read.rs::type_widening_basic/type_widening_decimal/type_widening_decimal_predicate_keeps_older_scale_file` |
 | `unshredded-variant` | data/unshredded-variant.tar.zst | `id: long, v: variant, array_of_variants: array<variant>, struct_of_variants: struct{v: variant}, map_of_variants: map<string,variant>, array_of_struct_of_variants: array<struct{v: variant}>, struct_of_array_of_variants: struct{v: array<variant>}` | v3/v7 | r:`variantType-preview` w:`variantType-preview,appendOnly,invariants`, `checkpointInterval=2` | Unshredded variant type column | `read.rs::unshredded_variant_table` |
 
 ## Application Transactions

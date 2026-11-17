@@ -1,37 +1,42 @@
 use std::collections::BTreeMap;
 use std::error::Error as _;
 use std::ptr::NonNull;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
+use bytes::Bytes;
 use delta_kernel::actions::Metadata;
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use delta_kernel::actions::{Add, LastManifestCommit};
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use delta_kernel::crc::Crc;
+use delta_kernel::engine::{DelegatingEngine, PanicEngine};
 use delta_kernel::last_checkpoint_hint::{LastCheckpointHint, LastCheckpointV2};
 use delta_kernel::log_segment::LogSegment;
-use delta_kernel::path::ParsedLogPath;
+use delta_kernel::metrics::{MetricEvent, SnapshotLoadType};
+use delta_kernel::path::{LogPathFileType, ParsedLogPath};
 use delta_kernel::snapshot::{IncrementalReplay, PublicationWatermark, Snapshot};
-use delta_kernel::{
-    Engine, EvaluationHandler, FileMeta, JsonHandler, ParquetHandler, StorageHandler,
-};
+use delta_kernel::{FileMeta, FileSlice, KernelResult, KernelResultIterator, StorageHandler};
 use test_utils::table_builder::{LogState, TestTableBuilder};
-use test_utils::{TestCatalogCommitter, compacted_log_path_for_versions, create_log_path};
+use test_utils::{
+    CapturingReporter, TestCatalogCommitter, compacted_log_path_for_versions, create_log_path,
+};
+use url::Url;
 
 use super::*;
 use crate::delta_types::*;
 use crate::error::FFIKernelError;
 use crate::ffi_test_utils::{
     TEST_ERROR_ALLOCATORS, assert_extern_result_error_contains,
-    assert_extern_result_error_with_message, ok_or_panic,
+    assert_extern_result_error_with_message, install_thread_local_metrics_reporter, ok_or_panic,
 };
 use crate::log_path::FfiLogPath;
 use crate::{
     FfiFileStats, FfiIncrementalReplay, FfiLogSegmentStats, KernelI64Slice, KernelStringSlice,
     OptionalValue, SharedExternEngine, engine_to_handle, free_engine, free_snapshot,
     get_snapshot_builder, get_snapshot_builder_from, snapshot_builder_build,
-    snapshot_builder_with_incremental_crc_replay, snapshot_builder_with_max_catalog_version,
-    snapshot_builder_with_version, snapshot_log_segment_stats,
+    snapshot_builder_with_correlation_id, snapshot_builder_with_incremental_crc_replay,
+    snapshot_builder_with_max_catalog_version, snapshot_builder_with_version,
+    snapshot_log_segment_stats,
 };
 
 fn slice(value: &'static str) -> KernelStringSlice {
@@ -140,7 +145,42 @@ fn empty_crc() -> FfiCrc {
 }
 
 fn test_engine() -> Handle<SharedExternEngine> {
-    engine_to_handle(Arc::new(NoIoEngine), TEST_ERROR_ALLOCATORS)
+    engine_to_handle(Arc::new(PanicEngine), TEST_ERROR_ALLOCATORS)
+}
+
+struct SingleHeadStorage(Mutex<Option<FileMeta>>);
+
+impl StorageHandler for SingleHeadStorage {
+    fn head(&self, path: &Url) -> KernelResult<FileMeta> {
+        let metadata = self
+            .0
+            .lock()
+            .unwrap()
+            .take()
+            .expect("unexpected second HEAD");
+        assert_eq!(path, &metadata.location);
+        Ok(metadata)
+    }
+
+    fn list_from(&self, _: &Url) -> KernelResult<Box<dyn KernelResultIterator<FileMeta>>> {
+        panic!("unexpected list_from")
+    }
+
+    fn read_files(&self, _: Vec<FileSlice>) -> KernelResult<Box<dyn KernelResultIterator<Bytes>>> {
+        panic!("unexpected read_files")
+    }
+
+    fn copy_atomic(&self, _: &Url, _: &Url) -> KernelResult<()> {
+        panic!("unexpected copy_atomic")
+    }
+
+    fn put(&self, _: &Url, _: Bytes, _: bool) -> KernelResult<()> {
+        panic!("unexpected put")
+    }
+
+    fn delete(&self, _: &Url) -> KernelResult<()> {
+        panic!("unexpected delete")
+    }
 }
 
 #[rstest::rstest]
@@ -207,26 +247,6 @@ fn log_segment_stats_borrows_handles_and_propagates_errors_without_io(
     }
 }
 
-struct NoIoEngine;
-
-impl Engine for NoIoEngine {
-    fn evaluation_handler(&self) -> Arc<dyn EvaluationHandler> {
-        panic!("snapshot hints must not require evaluation")
-    }
-
-    fn storage_handler(&self) -> Arc<dyn StorageHandler> {
-        panic!("snapshot hints must not require storage")
-    }
-
-    fn json_handler(&self) -> Arc<dyn JsonHandler> {
-        panic!("snapshot hints must not require JSON I/O")
-    }
-
-    fn parquet_handler(&self) -> Arc<dyn ParquetHandler> {
-        panic!("snapshot hints must not require Parquet I/O")
-    }
-}
-
 fn test_builder(engine: &Handle<SharedExternEngine>) -> Handle<ExclusiveSnapshotBuilder> {
     unsafe {
         ok_or_panic(get_snapshot_builder(
@@ -270,6 +290,38 @@ unsafe fn with_minimal_hint(
         FfiSnapshotHintFreshness::Unverified,
     );
     unsafe { ok_or_panic(snapshot_builder_with_snapshot_hint(builder, &hint)) }
+}
+
+#[test]
+fn snapshot_hint_build_preserves_correlation_id() {
+    let engine = test_engine();
+    let builder = unsafe {
+        ok_or_panic(snapshot_builder_with_correlation_id(
+            with_minimal_hint(test_builder(&engine)),
+            slice("hint-request"),
+        ))
+    };
+    let reporter = Arc::new(CapturingReporter::default());
+    let _guard = install_thread_local_metrics_reporter(reporter.clone());
+    let snapshot = unsafe { ok_or_panic(snapshot_builder_build(builder)) };
+    let completions: Vec<_> = reporter
+        .events()
+        .into_iter()
+        .filter_map(|event| match event {
+            MetricEvent::SnapshotBuildSuccess(event) => Some(event),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(completions.len(), 1);
+    assert_eq!(completions[0].load_type, SnapshotLoadType::SnapshotHint);
+    assert_eq!(
+        completions[0].correlation_id.as_deref(),
+        Some("hint-request")
+    );
+    unsafe {
+        free_snapshot(snapshot);
+        free_engine(engine);
+    }
 }
 
 fn read_snapshot_metadata(snapshot: &Handle<SharedSnapshot>) -> Metadata {
@@ -401,7 +453,7 @@ extern "C" fn count_hint_visits(context: NullableCvoid, _hint: *const FfiSnapsho
 }
 
 #[test]
-fn snapshot_hint_export_rejects_compaction_without_calling_visitor() {
+fn snapshot_hint_export_round_trips_compaction_paths() {
     let engine = test_engine();
     let paths = [
         FfiLogPath::new(
@@ -446,26 +498,8 @@ fn snapshot_hint_export_rejects_compaction_without_calling_visitor() {
     let snapshot: Handle<SharedSnapshot> = Arc::new(snapshot).into();
     unsafe { free_snapshot(source) };
 
-    let mut visits = 0usize;
-    let result = unsafe {
-        snapshot_to_snapshot_hint(
-            snapshot.shallow_copy(),
-            engine.shallow_copy(),
-            Some(NonNull::from(&mut visits).cast()),
-            count_hint_visits,
-        )
-    };
-    assert_extern_result_error_contains(
-        result,
-        FFIKernelError::InvalidSnapshotHint,
-        "log compaction",
-    );
-    assert_eq!(visits, 0);
-    assert_eq!(unsafe { snapshot.as_ref() }.version(), 1);
-    unsafe {
-        free_snapshot(snapshot);
-        free_engine(engine);
-    }
+    assert_exported_paths_and_round_trip(snapshot);
+    unsafe { free_engine(engine) };
 }
 
 struct CopiedHintPaths {
@@ -497,6 +531,7 @@ fn assert_exported_paths_and_round_trip(snapshot: Handle<SharedSnapshot>) {
         .checkpoint_parts
         .iter()
         .chain(&files.ascending_commit_files)
+        .chain(&files.ascending_compaction_files)
         .chain(files.latest_commit_file.iter())
         .chain(files.latest_crc_file.iter())
         .map(|path| {
@@ -524,8 +559,8 @@ fn assert_exported_paths_and_round_trip(snapshot: Handle<SharedSnapshot>) {
     assert!(
         state
             .files
-            .windows(2)
-            .all(|pair| pair[0].location.as_str() < pair[1].location.as_str())
+            .array_windows()
+            .all(|[a, b]| a.location.as_str() < b.location.as_str())
     );
     assert_eq!(
         state.files,
@@ -921,8 +956,16 @@ fn visited_hint_preserves_partial_crc_maps_and_indeterminate_file_stats() {
     }
 }
 
-#[test]
-fn visited_hint_after_publish_preserves_staged_paths_and_advanced_watermark() {
+#[rstest::rstest]
+#[case::unpublished(0, false)]
+#[case::new_publication(0, true)]
+#[case::already_published(1, true)]
+fn visited_hint_preserves_commit_paths_and_watermark_for_explicit_version(
+    #[case] source_watermark: Version,
+    #[case] publish: bool,
+    #[values(None, Some(1), Some(2))] max_catalog_version: Option<Version>,
+) {
+    // GIVEN: a hint with published commit 0 and staged commit 1, which may already be published.
     let engine = test_engine();
     let reader_features = [slice("catalogManaged")];
     let writer_features = [slice("catalogManaged"), slice("inCommitTimestamp")];
@@ -960,8 +1003,8 @@ fn visited_hint_after_publish_preserves_staged_paths_and_advanced_watermark() {
                 "memory:///hinted-table/_delta_log/_staged_commits/",
                 "00000000000000000001.3a0d65cd-4056-49b8-937b-95f9e3ee90e5.json",
             )),
-            2,
-            1,
+            17,
+            13,
         ),
     ];
     let crc = FfiCrc {
@@ -975,35 +1018,92 @@ fn visited_hint_after_publish_preserves_staged_paths_and_advanced_watermark() {
     hint.protocol = protocol();
     hint.metadata = metadata();
     hint.crc = &crc;
+    hint.publication_watermark = FfiPublicationWatermark::PublishedThrough(source_watermark);
+    let source_hint_paths = unsafe { hint.log_paths.log_paths() }.unwrap();
     let builder = unsafe { snapshot_builder_with_max_catalog_version(test_builder(&engine), 1) };
     let builder = unsafe { ok_or_panic(snapshot_builder_with_snapshot_hint(builder, &hint)) };
     let source = unsafe { ok_or_panic(snapshot_builder_build(builder)) };
     let source_ref = unsafe { source.clone_as_arc() };
     assert_eq!(
         source_ref.log_segment().listed.max_published_version,
-        Some(0)
+        Some(source_watermark)
     );
-    let kernel_engine = unsafe { engine.as_ref() }.engine();
-    let published = source_ref
-        .publish(kernel_engine.as_ref(), &TestCatalogCommitter)
-        .unwrap();
+    let source_segment = source_ref.log_segment().clone();
+    let published = if publish {
+        let published_meta = FileMeta::new(
+            Url::parse("memory:///hinted-table/_delta_log/00000000000000000001.json").unwrap(),
+            23,
+            19,
+        );
+        let publish_engine = DelegatingEngine::new(Arc::new(PanicEngine)).with_storage_handler(
+            Arc::new(SingleHeadStorage(Mutex::new(Some(published_meta)))),
+        );
+        source_ref
+            .publish(&publish_engine, &TestCatalogCommitter)
+            .unwrap()
+    } else {
+        source_ref.clone()
+    };
+    let published_version = if publish { 1 } else { source_watermark };
     assert_eq!(
         published.log_segment().listed.max_published_version,
-        Some(1)
+        Some(published_version)
+    );
+    let published_files = &published.log_segment().listed.ascending_commit_files;
+    assert_eq!(published_files.len(), 2);
+    for (file, expected_location, (size, last_modified)) in itertools::izip!(
+        published_files,
+        [
+            "memory:///hinted-table/_delta_log/00000000000000000000.json",
+            if publish {
+                "memory:///hinted-table/_delta_log/00000000000000000001.json"
+            } else {
+                source_segment.listed.ascending_commit_files[1]
+                    .location
+                    .location
+                    .as_str()
+            },
+        ],
+        [(1, 1), if publish { (19, 23) } else { (13, 17) }],
+    ) {
+        assert_eq!(file.location.location.as_str(), expected_location);
+        let expected_type = if publish || file.version == 0 {
+            LogPathFileType::Commit
+        } else {
+            LogPathFileType::StagedCommit
+        };
+        assert_eq!(file.file_type, expected_type);
+        assert_eq!(file.location.size, size);
+        assert_eq!(file.location.last_modified, last_modified);
+    }
+    assert_eq!(
+        published.log_segment().listed.latest_commit_file.as_ref(),
+        published_files.last()
+    );
+    assert_eq!(source_ref.log_segment(), &source_segment);
+    assert_eq!(
+        unsafe { hint.log_paths.log_paths() }.unwrap(),
+        source_hint_paths
     );
     assert_eq!(
-        published.log_segment().listed.ascending_commit_files,
-        source_ref.log_segment().listed.ascending_commit_files
+        PublicationWatermark::from(hint.publication_watermark),
+        PublicationWatermark::PublishedThrough(source_watermark)
     );
     let published: Handle<SharedSnapshot> = published.into();
     let expected_segment = unsafe { published.as_ref() }.log_segment().listed.clone();
-    let builder = unsafe { snapshot_builder_with_max_catalog_version(test_builder(&engine), 1) };
+    let builder = unsafe { snapshot_builder_with_version(test_builder(&engine), 1) };
+    let builder = if let Some(bound) = max_catalog_version {
+        unsafe { snapshot_builder_with_max_catalog_version(builder, bound) }
+    } else {
+        builder
+    };
     let mut state = VisitedHint {
         builder: Some(builder),
         result: None,
         watermark: None,
         visits: 0,
     };
+    // WHEN: export the returned snapshot through the FFI visitor.
     assert!(unsafe {
         ok_or_panic(snapshot_to_snapshot_hint(
             published.shallow_copy(),
@@ -1012,6 +1112,8 @@ fn visited_hint_after_publish_preserves_staged_paths_and_advanced_watermark() {
             install_visited_hint,
         ))
     });
+
+    // THEN: the exported hint rebuilds a snapshot with the same commit paths and metadata.
     assert_eq!(state.visits, 1);
     unsafe {
         free_snapshot(source);
@@ -1020,7 +1122,7 @@ fn visited_hint_after_publish_preserves_staged_paths_and_advanced_watermark() {
     drop(source_ref);
     assert_eq!(
         state.watermark,
-        Some(PublicationWatermark::PublishedThrough(1))
+        Some(PublicationWatermark::PublishedThrough(published_version))
     );
     let rebuilt =
         unsafe { ok_or_panic(snapshot_builder_build(ok_or_panic(state.result.unwrap()))) };
@@ -1447,8 +1549,10 @@ fn aggregate_with_rejects_null_nonempty_log_path_array() {
     }
 }
 
-#[test]
-fn aggregate_with_rejects_log_compaction_paths() {
+#[rstest::rstest]
+#[case::complete(true)]
+#[case::missing_commit(false)]
+fn aggregate_with_log_compaction_requires_individual_commits(#[case] complete: bool) {
     let engine = test_engine();
     let builder = test_builder(&engine);
     let log_path = FfiLogPath::new(
@@ -1459,19 +1563,51 @@ fn aggregate_with_rejects_log_compaction_paths() {
         1,
         1,
     );
-    let hint = test_snapshot_hint(
-        std::slice::from_ref(&log_path),
-        1,
-        FfiSnapshotHintFreshness::Unverified,
+    let paths = [
+        log_path,
+        FfiLogPath::new(
+            slice("memory:///hinted-table/_delta_log/00000000000000000000.json"),
+            0,
+            0,
+        ),
+        FfiLogPath::new(
+            slice("memory:///hinted-table/_delta_log/00000000000000000001.json"),
+            1234,
+            0,
+        ),
+    ];
+    let supplied_paths = if complete { &paths[..] } else { &paths[..1] };
+    let hint = test_snapshot_hint(supplied_paths, 1, FfiSnapshotHintFreshness::Unverified);
+    let builder = unsafe { ok_or_panic(snapshot_builder_with_snapshot_hint(builder, &hint)) };
+    if !complete {
+        assert_extern_result_error_contains(
+            unsafe { snapshot_builder_build(builder) },
+            FFIKernelError::InvalidSnapshotHint,
+            "log segment",
+        );
+        unsafe { free_engine(engine) };
+        return;
+    }
+    let snapshot = unsafe { ok_or_panic(snapshot_builder_build(builder)) };
+    let source = unsafe { snapshot.as_ref() };
+    assert_eq!(source.version(), 1);
+    assert_eq!(source.log_segment().listed.ascending_commit_files.len(), 2);
+    assert_eq!(
+        source.log_segment().listed.ascending_compaction_files.len(),
+        1
     );
-    let result = unsafe { snapshot_builder_with_snapshot_hint(builder, &hint) };
-    assert_extern_result_error_contains(
-        result,
-        FFIKernelError::InvalidSnapshotHint,
-        "log compaction",
+    assert_eq!(
+        unsafe {
+            ok_or_panic(crate::snapshot_timestamp(
+                snapshot.shallow_copy(),
+                engine.shallow_copy(),
+            ))
+        },
+        1234
     );
 
     unsafe {
+        free_snapshot(snapshot);
         free_engine(engine);
     }
 }

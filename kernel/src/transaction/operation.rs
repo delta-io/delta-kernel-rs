@@ -2,7 +2,7 @@ use std::fmt;
 
 use strum::{EnumIter, IntoEnumIterator};
 
-use crate::crc::is_incremental_safe_operation;
+use crate::crc::{FileStatsPolicy, is_incremental_safe_operation};
 
 /// Identifies an operation supported by [`UpdateTableTransactionBuilder`].
 ///
@@ -39,11 +39,13 @@ pub enum UpdateTableOperation {
     /// An operation name recorded verbatim in commit history and successful transaction metrics.
     ///
     /// The name must be nonempty and must not match a reserved operation name, such as `REORG` or
-    /// `ALTER TABLE`. The full set consists of all [typed operation names](UpdateTableOperation)
+    /// `ALTER TABLE`. Reserved names include all [typed operation names](UpdateTableOperation)
     /// and [`RESERVED_TABLE_OPERATION_NAMES`][ops]. Name matching is case-sensitive. Kernel does
     /// not infer built-in operation semantics from the name, but all other transaction and
     /// protocol checks still apply. Custom operations do not qualify for incremental version
-    /// checksum construction.
+    /// checksum construction in post-commit snapshots.
+    ///
+    /// All operation names accepted by checksum replay are also reserved.
     ///
     /// Custom names are not guaranteed to remain valid across Kernel versions. Adding a typed
     /// variant reserves its exact name. Callers using that custom name must select the typed
@@ -146,6 +148,7 @@ fn validate_custom_name(name: &str) -> Result<(), String> {
     }
     if UpdateTableOperation::iter().any(|operation| operation.as_str() == name)
         || RESERVED_TABLE_OPERATION_NAMES.contains(&name)
+        || FileStatsPolicy::for_operation(name) != FileStatsPolicy::Unsupported
     {
         return Err(format!("custom operation name '{name}' is reserved"));
     }
@@ -207,6 +210,15 @@ mod tests {
                     "CREATE TABLE AS SELECT",
                     "REPLACE TABLE AS SELECT",
                     "CREATE OR REPLACE TABLE AS SELECT",
+                    "COMPUTE STATS",
+                    "ROW TRACKING BACKFILL",
+                    "ROW TRACKING UNBACKFILL",
+                    "DROP FEATURE",
+                    "LIQUID BACKFILL",
+                    "LIQUID TAGGING",
+                    "REPLACE PARTITIONED BY WITH CLUSTER BY",
+                    "Deletion Vector Tombstones",
+                    "TRUNCATE",
                 ]
                 .map(str::to_owned),
             )
@@ -226,7 +238,20 @@ mod tests {
 
     #[test]
     fn custom_name_validation_is_case_sensitive_and_preserves_whitespace() {
-        for name in ["write", "Write", " WRITE ", "reorg", " REORG ", "INSERT"] {
+        for name in [
+            "write",
+            "Write",
+            " WRITE ",
+            "reorg",
+            " REORG ",
+            "INSERT",
+            "liquid tagging",
+            " LIQUID TAGGING ",
+            "deletion vector tombstones",
+            "Manual Update",
+            "SET TBLPROPERTIES",
+            "UNSET TBLPROPERTIES",
+        ] {
             let operation = UpdateTableOperation::Custom(name.to_string());
             assert!(operation.validate().is_ok());
             assert_eq!(operation.as_str(), name);

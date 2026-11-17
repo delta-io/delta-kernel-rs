@@ -1,3 +1,5 @@
+#[cfg(feature = "declarative-plans")]
+pub(crate) mod plans;
 pub(crate) mod recording_reads;
 
 use std::borrow::Borrow;
@@ -52,7 +54,7 @@ use crate::table_properties::{
 use crate::transaction::create_table::create_table;
 use crate::transaction::{BASE_ADD_FILES_SCHEMA, CreateTable, Transaction};
 use crate::{
-    Engine, EngineData, FileMeta, KernelError, KernelResult, Snapshot, SnapshotRef, Version,
+    Engine, EngineData, FileMeta, KernelError, KernelResult, Result, Snapshot, SnapshotRef, Version,
 };
 
 /// Parses `path` (a full URL string) into a [`ParsedLogPath`] with zero size, for building
@@ -87,6 +89,37 @@ impl CapturingReporter {
     /// Returns a copy of all captured events.
     pub(crate) fn events(&self) -> Vec<MetricEvent> {
         self.events.lock().unwrap().clone()
+    }
+}
+
+/// Whether an event reports storage listing, copying, or a storage, JSON, or Parquet read.
+pub(crate) fn is_io_event(event: &MetricEvent) -> bool {
+    match event {
+        MetricEvent::StorageListCompleted(_)
+        | MetricEvent::StorageReadCompleted(_)
+        | MetricEvent::StorageCopyCompleted(_)
+        | MetricEvent::JsonReadCompleted(_)
+        | MetricEvent::ParquetReadCompleted(_) => true,
+        MetricEvent::LogSegmentLoadSuccess(_)
+        | MetricEvent::LogSegmentLoadFailure(_)
+        | MetricEvent::ProtocolMetadataLoadSuccess(_)
+        | MetricEvent::ProtocolMetadataLoadFailure(_)
+        | MetricEvent::SnapshotBuildSuccess(_)
+        | MetricEvent::SnapshotBuildFailure(_)
+        | MetricEvent::TransactionCommitSuccess(_)
+        | MetricEvent::TransactionCommitFailure(_)
+        | MetricEvent::CheckpointWriteSuccess(_)
+        | MetricEvent::CheckpointWriteFailure(_)
+        | MetricEvent::DomainMetadataLoadSuccess(_)
+        | MetricEvent::DomainMetadataLoadFailure
+        | MetricEvent::SetTransactionLoadSuccess(_)
+        | MetricEvent::SetTransactionLoadFailure
+        | MetricEvent::CrcReadSuccess(_)
+        | MetricEvent::CrcReadFailure
+        | MetricEvent::LastCheckpointReadCompleted(_)
+        | MetricEvent::ChecksumWriteSuccess(_)
+        | MetricEvent::ChecksumWriteFailure(_)
+        | MetricEvent::ScanMetadataCompleted(_) => false,
     }
 }
 
@@ -135,6 +168,28 @@ use crate::schema::{
 };
 #[cfg(feature = "geo-type-in-dev")]
 use crate::schema::{EdgeInterpolationAlgorithm, GeographyType, GeometryType, PrimitiveType};
+
+/// Create a simple Add action with the specified path (no stats)
+pub(crate) fn create_add_action(path: &str) -> Action {
+    Action::Add(Add {
+        path: path.into(),
+        data_change: true,
+        ..Default::default()
+    })
+}
+
+/// Create a Remove action with the specified path
+///
+/// The remove action has deletion_timestamp set to i64::MAX to ensure the
+/// remove action is not considered expired during testing.
+pub(crate) fn create_remove_action(path: &str) -> Action {
+    Action::Remove(Remove {
+        path: path.into(),
+        data_change: true,
+        deletion_timestamp: Some(i64::MAX), // Ensure the remove action is not expired
+        ..Default::default()
+    })
+}
 
 /// A mock table that writes commits to a local temporary delta log. This can be used to
 /// construct a delta log used for testing.
@@ -337,7 +392,7 @@ pub(crate) mod adaptive_metadata_fixtures {
 
     use super::*;
     use crate::actions::{
-        CheckpointAction, ContentRoot, LOG_METADATA_SCHEMA, LOG_PROTOCOL_SCHEMA,
+        CheckpointAction, ContentRoot, DomainMetadata, LOG_METADATA_SCHEMA, LOG_PROTOCOL_SCHEMA,
         LastManifestCommit, Sidecar,
     };
     use crate::arrow::array::{Array as _, AsArray as _};
@@ -399,6 +454,22 @@ pub(crate) mod adaptive_metadata_fixtures {
         serde_json::json!({ "checkpoint": checkpoint }).to_string()
     }
 
+    /// A commit line holding a `txn` for `app_id` at `version`.
+    pub(crate) fn txn_line(app_id: &str, version: i64) -> String {
+        let txn = SetTransaction::new(app_id.to_string(), version, None);
+        serde_json::json!({ "txn": txn }).to_string()
+    }
+
+    /// A domain metadata action for `domain` with `configuration`.
+    pub(crate) fn domain(domain: &str, configuration: &str) -> DomainMetadata {
+        DomainMetadata::new(domain.to_string(), configuration.to_string())
+    }
+
+    /// A commit line holding `domain_metadata`.
+    pub(crate) fn domain_metadata_line(domain_metadata: DomainMetadata) -> String {
+        serde_json::json!({ "domainMetadata": domain_metadata }).to_string()
+    }
+
     /// A minimal `checkpoint` action referencing `path` as the content root at `version`.
     pub(crate) fn minimal_checkpoint_action(
         path: &str,
@@ -455,7 +526,7 @@ pub(crate) mod adaptive_metadata_fixtures {
     }
 
     /// Creates an empty in-memory table and returns its engine and table-root URL.
-    pub(crate) fn setup_table() -> KernelResult<(SyncEngine, Url)> {
+    pub(crate) fn setup_table() -> Result<(SyncEngine, Url)> {
         let engine = SyncEngine::new_with_store(Arc::new(InMemory::new()));
         let schema = schema_ref! { nullable "id": INTEGER };
         let _ = create_table("memory:///", schema, "test", true)
@@ -892,7 +963,7 @@ impl MockTableConfigurationBuilder {
         self.try_build().unwrap()
     }
 
-    pub(crate) fn try_build(self) -> KernelResult<TableConfiguration> {
+    pub(crate) fn try_build(self) -> Result<TableConfiguration> {
         let schema = self
             .schema
             .unwrap_or_else(|| schema_ref! { nullable "value": INTEGER });
@@ -1551,7 +1622,7 @@ pub(crate) fn test_deep_nested_schema_missing_leaf_cm() -> StructType {
 pub(crate) fn setup_column_mapping_txn(
     schema: SchemaRef,
     mode: ColumnMappingMode,
-) -> KernelResult<(Arc<dyn Engine>, Transaction<CreateTable>)> {
+) -> Result<(Arc<dyn Engine>, Transaction<CreateTable>)> {
     let mode_str = match mode {
         ColumnMappingMode::Name => "name",
         ColumnMappingMode::Id => "id",
@@ -1673,7 +1744,7 @@ pub(crate) fn copy_test_table(table_name: &str) -> KernelResult<(Url, TempDir)> 
 /// for the duration of the test to prevent premature cleanup of extracted files.
 pub(crate) fn load_test_table(
     table_name: &str,
-) -> KernelResult<(Arc<dyn Engine>, SnapshotRef, Option<TempDir>)> {
+) -> Result<(Arc<dyn Engine>, SnapshotRef, Option<TempDir>)> {
     let (path, tempdir) = resolve_test_table_path(table_name)?;
 
     let url = Url::from_directory_path(&path)

@@ -1,6 +1,7 @@
 //! Scans of adaptiveMetadata (AMT) tables, whose state at or below the latest `checkpoint` action
 //! is read from that action's content tree.
 
+use std::iter;
 use std::sync::Arc;
 
 use itertools::Itertools as _;
@@ -9,21 +10,31 @@ use serde_json::json;
 use url::Url;
 
 use super::get_files_for_scan;
-use crate::arrow::array::StringArray;
-use crate::content_tree::test_utils::{added_data_entry, data_manifest_entry, write_manifest};
+use crate::arrow::array::{AsArray as _, StringArray};
+use crate::arrow::datatypes::Int64Type;
+use crate::content_tree::test_utils::{
+    added_data_entry, data_manifest_entry, write_manifest, write_manifest_with_stats, x_full_stats,
+    x_stats,
+};
 use crate::content_tree::{ContentTreeNodeEntry, TrackingInfo, TrackingStatus};
+use crate::engine::arrow_data::EngineDataArrowExt as _;
 use crate::engine::sync::SyncEngine;
-use crate::expressions::{Predicate as Pred, col, lit};
+use crate::expressions::{Predicate as Pred, Scalar, col, lit};
 use crate::object_store::memory::InMemory;
 use crate::scan::{Scan, ScanMetadata};
-use crate::schema::schema_ref;
+use crate::schema::{SchemaRef, StructType, schema_ref};
+use crate::table_features::ColumnMappingMode;
 use crate::transaction::BASE_ADD_FILES_SCHEMA;
 use crate::unit_test_utils::adaptive_metadata_fixtures::{
     checkpoint_action_with_root, commit_file_changes, commit_files, commit_root_manifest,
-    commit_root_manifest_file, create_adaptive_metadata_table, setup_adaptive_metadata_table,
+    commit_root_manifest_file, create_adaptive_metadata_table, protocol_and_metadata_lines,
+    setup_adaptive_metadata_table, write_commit_after_manifest_commit,
     write_manifest_commit_keeping_pm,
 };
-use crate::unit_test_utils::{assert_result_error_with_message, string_array_to_engine_data};
+use crate::unit_test_utils::{
+    assert_result_error_with_message, parse_json_batch, string_array_to_engine_data,
+    test_schema_flat_with_column_mapping,
+};
 use crate::{Engine, EngineData, FileMeta, KernelResult, Snapshot, Version};
 
 const TABLE_ROOT: &str = "memory:///";
@@ -187,6 +198,45 @@ fn scan_entry_point_without_checkpoint_action_support_is_unsupported(
     );
 }
 
+#[cfg(feature = "declarative-plans")]
+#[test]
+fn declarative_scan_without_checkpoint_action_does_not_require_checkpoint_info_support() {
+    // Given: an adaptive-metadata snapshot without a checkpoint action or usable CRC.
+    let (engine, table_root) = setup_adaptive_metadata_table();
+    let version = commit_files(&engine, &table_root, &["a.parquet"], &[]);
+    let loaded = snapshot_at(&engine, version);
+    // Force commit replay even when the writer provided an allFiles CRC.
+    let snapshot = Arc::new(
+        Snapshot::new(
+            loaded.log_segment().clone(),
+            loaded.table_configuration().clone(),
+        )
+        .unwrap(),
+    );
+    assert!(snapshot.base_crc().is_none());
+    assert!(
+        snapshot
+            .latest_checkpoint_action(&engine)
+            .unwrap()
+            .is_none()
+    );
+    let scan = snapshot.clone().scan_builder().build().unwrap();
+    assert_result_error_with_message(
+        snapshot.reader().get_checkpoint_info(&engine),
+        "Checkpoint info does not support adaptive metadata",
+    );
+
+    // When: declarative scan planning resolves checkpoint state internally.
+    let plan = scan.declarative_metadata_scan_plan(&engine).unwrap();
+
+    // Then: planning succeeds while the complete-metadata getter remains unsupported.
+    assert!(plan.is_some());
+    assert_result_error_with_message(
+        snapshot.reader().get_checkpoint_info(&engine),
+        "Checkpoint info does not support adaptive metadata",
+    );
+}
+
 #[test]
 fn scan_with_missing_root_manifest_names_it() {
     let (engine, _) = setup_adaptive_metadata_table();
@@ -271,6 +321,55 @@ fn data_skipping_prunes_commit_files_but_keeps_tree_files_without_stats() {
     assert_eq!(paths, strings(&["high.parquet", "tree.parquet"]));
 }
 
+/// Tree files are pruned by their `content_stats`, which are keyed by the checkpoint action's
+/// schema, so a schema change after it leaves them unread.
+#[rstest]
+#[case::checkpoint_schema(false, &["high.parquet"])]
+#[case::schema_changed_after_checkpoint(true, &["high.parquet", "low.parquet"])]
+fn data_skipping_prunes_tree_files_by_content_stats(
+    #[case] change_schema: bool,
+    #[case] expected: &[&str],
+) {
+    let (engine, _) = setup_adaptive_metadata_table();
+    let entries = [
+        added_data_entry("low.parquet", 1, 1, 0, 0),
+        added_data_entry("high.parquet", 1, 1, 1, 0),
+    ];
+    // `id` (field ID 1) is in `[1, 9]` in `low` and `[200, 300]` in `high`, never null.
+    let stats = vec![
+        x_stats(&x_full_stats(), &[1, 9, 1, 0]),
+        x_stats(&x_full_stats(), &[200, 300, 1, 0]),
+    ];
+    let location = table_root().join("metadata/root.parquet").unwrap();
+    let root = write_manifest_with_stats(&engine, location, &entries, &x_full_stats(), stats);
+    let mut version = commit_root_manifest_file(&engine, &table_root(), root);
+    if change_schema {
+        // Drops `name`, keeping `id` and its field ID.
+        let id = test_schema_flat_with_column_mapping()
+            .field("id")
+            .unwrap()
+            .clone();
+        let lines = protocol_and_metadata_lines(Arc::new(StructType::new_unchecked([id])), &[]);
+        let data = parse_json_batch(lines.lines().collect::<Vec<_>>().into());
+        write_commit_after_manifest_commit(&engine, &table_root(), version + 1, version, data)
+            .unwrap();
+        version += 1;
+    }
+
+    let predicate = Arc::new(Pred::gt(col!("id"), lit(100i64)));
+    let scan = snapshot_at(&engine, version)
+        .scan_builder()
+        .with_predicate(predicate)
+        .build()
+        .unwrap();
+    let paths: Vec<_> = get_files_for_scan(scan, &engine)
+        .unwrap()
+        .into_iter()
+        .sorted()
+        .collect();
+    assert_eq!(paths, strings(expected));
+}
+
 /// The scan metadata of `snapshot`, with selection vectors applied, as cached by a caller of
 /// `scan_metadata_from`.
 fn cached_scan_metadata(engine: &SyncEngine, snapshot: Arc<Snapshot>) -> Vec<Box<dyn EngineData>> {
@@ -315,4 +414,73 @@ fn scan_metadata_from_hint_before_checkpoint_action_rescans(
     }
     paths.sort();
     assert_eq!(paths, strings(expected));
+}
+
+/// Tree locations are decoded paths, so a data file literally named `c%20d.parquet` is found only
+/// if `add.path` encodes its `%`: `Scan::execute` joins each scan file's path onto the table root.
+#[test]
+fn scan_execute_reads_files_whose_locations_need_encoding() {
+    let (engine, table_root) = setup_adaptive_metadata_table();
+    let physical_schema: SchemaRef = Arc::new(
+        test_schema_flat_with_column_mapping()
+            .make_physical(ColumnMappingMode::Id)
+            .unwrap(),
+    );
+    let files = [
+        ("a b.parquet", 1, "first"),
+        ("dir/c%20d.parquet", 2, "second"),
+    ];
+    let entries: Vec<_> = files
+        .iter()
+        .enumerate()
+        .map(|(row_id, (location, id, name))| {
+            let data = engine
+                .evaluation_handler()
+                .create_many(
+                    physical_schema.clone(),
+                    vec![vec![Scalar::from(*id as i64), Scalar::from(*name)]],
+                )
+                .unwrap();
+            // Escape each segment independently of the code under test.
+            let mut url = table_root.clone();
+            url.path_segments_mut()
+                .unwrap()
+                .pop_if_empty()
+                .extend(location.split('/'));
+            let size = engine
+                .parquet_handler()
+                .write_parquet_file(url, Box::new(iter::once(Ok(data))))
+                .unwrap();
+            added_data_entry(location, size as i64, 1, row_id as i64, 0)
+        })
+        .collect();
+    let version = commit_root_manifest(&engine, &table_root, "metadata/root.parquet", &entries);
+
+    let scan = snapshot_at(&engine, version)
+        .scan_builder()
+        .build()
+        .unwrap();
+    let rows: Vec<(i64, String)> = scan
+        .execute(Arc::new(engine))
+        .unwrap()
+        .flat_map(|data| {
+            let batch = data.unwrap().try_into_record_batch().unwrap();
+            let ids = batch
+                .column_by_name("id")
+                .unwrap()
+                .as_primitive::<Int64Type>();
+            let names = batch.column_by_name("name").unwrap().as_string::<i32>();
+            ids.values()
+                .iter()
+                .zip(names.iter().flatten())
+                .map(|(id, name)| (*id, name.to_string()))
+                .collect::<Vec<_>>()
+        })
+        .sorted()
+        .collect();
+
+    assert_eq!(
+        rows,
+        vec![(1, "first".to_string()), (2, "second".to_string())]
+    );
 }

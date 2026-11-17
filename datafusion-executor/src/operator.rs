@@ -284,6 +284,9 @@ fn lower_aggregate_function(agg: &KernelAgg, input_schema: &DFSchema) -> DFResul
         KernelAgg::Count(value) => Ok(count(column_to_df_expr(value, input_schema)?)),
         // DataFusion produces 1 for every input row, so counting it implements COUNT(*).
         KernelAgg::CountStar => Ok(count(df_lit(1))),
+        KernelAgg::FirstNonNull(_) => Err(DataFusionError::NotImplemented(
+            "FIRST_NON_NULL aggregate".into(),
+        )),
         KernelAgg::MinNonNullBy(operands) => lower_non_null_by(
             &operands.value,
             &operands.null_sentinel,

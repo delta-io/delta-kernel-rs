@@ -3,7 +3,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use delta_kernel::Snapshot;
 use delta_kernel::arrow::array::{Int32Array, RecordBatch, StringArray};
 use delta_kernel::arrow::datatypes::{
     DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
@@ -12,6 +11,7 @@ use delta_kernel::object_store::path::Path as ObjectStorePath;
 use delta_kernel::object_store::{DynObjectStore, ObjectStoreExt as _};
 use delta_kernel::schema::{DataType, schema};
 use delta_kernel::table_features::TableFeature;
+use delta_kernel::{KernelError, Snapshot};
 use rstest::rstest;
 use serde_json::json;
 use test_utils::column_mapping_fixtures::cm_field;
@@ -238,7 +238,7 @@ async fn load_error(
     scenario: &str,
     reader_features: &[&str],
     writer_features: &[&str],
-) -> delta_kernel::KernelError {
+) -> delta_kernel::Error {
     let (store, engine, table_url) = engine_store_setup(scenario, None);
     setup_table(
         store.as_ref(),
@@ -272,7 +272,10 @@ async fn invalid_protocol_shapes_are_rejected(
     );
     let err = load_error(&scenario, reader_features, writer_features).await;
     assert!(
-        matches!(err, delta_kernel::KernelError::InvalidProtocol(_)),
+        matches!(
+            err,
+            delta_kernel::Error::Kernel(KernelError::InvalidProtocol(_))
+        ),
         "{err}"
     );
 }
@@ -300,7 +303,10 @@ async fn reader_v3_without_reader_features_is_rejected() {
         .build(&engine)
         .expect_err("expected snapshot load to fail");
     assert!(
-        matches!(err, delta_kernel::KernelError::InvalidProtocol(_)),
+        matches!(
+            err,
+            delta_kernel::Error::Kernel(KernelError::InvalidProtocol(_))
+        ),
         "{err}"
     );
 }

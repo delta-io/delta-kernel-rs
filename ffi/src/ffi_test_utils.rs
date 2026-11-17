@@ -5,12 +5,18 @@ use std::ptr::NonNull;
 #[cfg(test)]
 use std::sync::Arc;
 
+use delta_kernel::metrics::{MetricsReporter, ReportGeneratorLayer};
 #[cfg(test)]
 use delta_kernel::{Engine, KernelResult, object_store::memory::InMemory};
 #[cfg(test)]
 use delta_kernel_default_engine::DefaultEngineBuilder;
 #[cfg(test)]
 use test_utils::add_commit;
+use tracing::subscriber::DefaultGuard;
+use tracing_subscriber::Layer as _;
+use tracing_subscriber::filter::LevelFilter;
+use tracing_subscriber::layer::SubscriberExt as _;
+use tracing_subscriber::util::SubscriberInitExt as _;
 
 use crate::error::allocation::{DeltaErrorInfo, KernelErrorInfo};
 use crate::error::{AllocateError, ErrorAllocators, ExternResult, FFIKernelError};
@@ -25,11 +31,24 @@ use crate::{
 };
 use crate::{KernelBytesSlice, KernelStringSlice, NullableCvoid, TryFromStringSlice};
 
+/// Capture metrics locally without claiming the global subscriber used by the FFI callbacks.
+pub(crate) fn install_thread_local_metrics_reporter(
+    reporter: Arc<dyn MetricsReporter>,
+) -> DefaultGuard {
+    // Match the FFI subscriber's per-layer filtering: switching to an unfiltered registry can
+    // inherit its thread-local filter state and panic when the next span is created.
+    tracing_subscriber::registry()
+        .with(ReportGeneratorLayer::new(reporter).with_filter(LevelFilter::TRACE))
+        .set_default()
+}
+
 // Connector-owned diagnostic storage used by FFI tests.
 #[cfg(test)]
 pub(crate) struct EngineErrorWithMessage {
     pub(crate) etype: FFIKernelError,
     pub(crate) message: String,
+    /// The Delta catalog condition, present only for errors from the Delta callback.
+    pub(crate) condition: Option<String>,
 }
 
 pub(crate) const TEST_ERROR_ALLOCATORS: ErrorAllocators = ErrorAllocators {
@@ -46,6 +65,7 @@ unsafe extern "C" fn allocate_kernel_err(
     let error = EngineErrorWithMessage {
         etype: info.code,
         message: unsafe { info.message.try_to_string().unwrap() },
+        condition: None,
     };
     Box::into_raw(Box::new(error)).cast()
 }
@@ -58,6 +78,7 @@ unsafe extern "C" fn allocate_delta_err(
     let error = EngineErrorWithMessage {
         etype: FFIKernelError::UnknownError,
         message: unsafe { info.message.try_to_string().unwrap() },
+        condition: Some(unsafe { info.condition.try_to_string().unwrap() }),
     };
     Box::into_raw(Box::new(error)).cast()
 }
@@ -219,6 +240,22 @@ pub(crate) fn assert_extern_result_error_contains<T>(
         "expected error message to contain '{expected_message}', got '{}'",
         error.message
     );
+}
+
+/// Check that the Delta callback received `expected_condition` and `expected_message`, recovering
+/// the error to prevent leaks.
+#[cfg(test)]
+pub(crate) fn assert_extern_result_delta_error<T>(
+    res: ExternResult<T>,
+    expected_condition: &str,
+    expected_message: &str,
+) {
+    let ExternResult::Err(ptr) = res else {
+        panic!("Expected Delta error '{expected_condition}'");
+    };
+    let error = unsafe { recover_error(ptr) };
+    assert_eq!(error.condition.as_deref(), Some(expected_condition));
+    assert_eq!(error.message, expected_message);
 }
 
 fn expect_extern_result_error<T>(

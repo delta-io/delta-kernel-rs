@@ -45,7 +45,9 @@ fn clustering_test_schema() -> KernelResult<Arc<StructType>> {
 #[case::nested_mismatched_casing(vec![vec!["ADDRESS", "CITY"]])]
 #[case::mixed(vec![vec!["id"], vec!["name"], vec!["address", "city"], vec!["address", "zip"], vec!["l1", "l2", "l3", "l4", "value"]])]
 #[tokio::test]
-async fn test_create_clustered_table(#[case] col_paths: Vec<Vec<&str>>) -> KernelResult<()> {
+async fn test_create_clustered_table(
+    #[case] col_paths: Vec<Vec<&str>>,
+) -> delta_kernel::Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
     let schema = clustering_test_schema()?;
     let input_cols: Vec<ColumnName> = col_paths
@@ -102,7 +104,7 @@ async fn test_create_clustered_table(#[case] col_paths: Vec<Vec<&str>>) -> Kerne
 /// AND uses `DataLayout::Clustered`. Both would try to add DomainMetadata, but we should
 /// only have it once in the feature lists.
 #[tokio::test]
-async fn test_clustering_with_explicit_feature_signal_no_duplicates() -> KernelResult<()> {
+async fn test_clustering_with_explicit_feature_signal_no_duplicates() -> delta_kernel::Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
     let schema = simple_schema()?;
@@ -143,7 +145,7 @@ async fn test_clustering_with_explicit_feature_signal_no_duplicates() -> KernelR
 }
 
 #[tokio::test]
-async fn test_clustering_stats_columns_within_limit() -> KernelResult<()> {
+async fn test_clustering_stats_columns_within_limit() -> delta_kernel::Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
     // Build schema with 10 columns (cluster on column 5, within default 32 limit)
@@ -168,7 +170,7 @@ async fn test_clustering_stats_columns_within_limit() -> KernelResult<()> {
 }
 
 #[tokio::test]
-async fn test_clustering_stats_columns_beyond_limit() -> KernelResult<()> {
+async fn test_clustering_stats_columns_beyond_limit() -> delta_kernel::Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
     // Build schema with 40 columns (cluster on column 35, beyond default 32 limit)

@@ -1,7 +1,11 @@
 # Building a scan
 
-To read data from a Delta table, you build a `Scan` from a `Snapshot`, optionally
-configure column selection and filter predicates, and then execute it.
+To read table data, configure a `ScanBuilder`, build a `Scan`, and choose the execution path that
+matches your connector. The [`ScanBuilder` rustdoc] and [`Scan` rustdoc] define the exact API
+contracts; this page shows how the calls fit together.
+
+[`ScanBuilder` rustdoc]: https://docs.rs/delta_kernel/latest/delta_kernel/scan/struct.ScanBuilder.html
+[`Scan` rustdoc]: https://docs.rs/delta_kernel/latest/delta_kernel/scan/struct.Scan.html
 
 ## The basic pattern
 
@@ -19,8 +23,8 @@ Every scan follows the same pattern:
 # use std::sync::Arc;
 # use delta_kernel_default_engine::DefaultEngine;
 # use delta_kernel_default_engine::storage::store_from_url;
-# use delta_kernel::{KernelResult, Snapshot};
-# fn example() -> KernelResult<()> {
+# use delta_kernel::Snapshot;
+# fn example() -> delta_kernel::Result<()> {
 # let url = delta_kernel::try_parse_uri("/tmp/table")?;
 # let store = store_from_url(&url)?;
 # let engine = DefaultEngine::builder(store).build();
@@ -51,8 +55,8 @@ Pass a schema containing only the columns you want to read:
 # use delta_kernel_default_engine::DefaultEngine;
 # use delta_kernel_default_engine::storage::store_from_url;
 # use delta_kernel::schema::{DataType, StructField, StructType};
-# use delta_kernel::{KernelResult, Snapshot};
-# fn example() -> KernelResult<()> {
+# use delta_kernel::Snapshot;
+# fn example() -> delta_kernel::Result<()> {
 # let url = delta_kernel::try_parse_uri("/tmp/table")?;
 # let store = store_from_url(&url)?;
 # let engine = DefaultEngine::builder(store).build();
@@ -86,8 +90,8 @@ Pass a predicate expression to skip files that cannot contain matching rows:
 # use delta_kernel_default_engine::DefaultEngine;
 # use delta_kernel_default_engine::storage::store_from_url;
 # use delta_kernel::expressions::{col, lit, Predicate};
-# use delta_kernel::{KernelResult, Snapshot};
-# fn example() -> KernelResult<()> {
+# use delta_kernel::Snapshot;
+# fn example() -> delta_kernel::Result<()> {
 # let url = delta_kernel::try_parse_uri("/tmp/table")?;
 # let store = store_from_url(&url)?;
 # let engine = DefaultEngine::builder(store).build();
@@ -132,8 +136,8 @@ transformations. It returns an iterator of `EngineData` results.
 # use delta_kernel::engine::arrow_data::EngineDataArrowExt as _;
 # use delta_kernel_default_engine::DefaultEngine;
 # use delta_kernel_default_engine::storage::store_from_url;
-# use delta_kernel::{KernelResult, Snapshot};
-# fn example() -> KernelResult<()> {
+# use delta_kernel::Snapshot;
+# fn example() -> delta_kernel::Result<()> {
 # let url = delta_kernel::try_parse_uri("/tmp/table")?;
 # let store = store_from_url(&url)?;
 # let engine = DefaultEngine::builder(store).build();

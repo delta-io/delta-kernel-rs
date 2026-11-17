@@ -29,13 +29,9 @@ pub extern "C" fn alloc_tracking_enabled() -> bool {
 /// Returns zero when built without `alloc-tracking`.
 #[unsafe(no_mangle)]
 pub extern "C" fn peak_native_bytes() -> u64 {
-    #[cfg(feature = "alloc-tracking")]
-    {
-        GLOBAL_ALLOC.peak_usage() as u64
-    }
-    #[cfg(not(feature = "alloc-tracking"))]
-    {
-        0
+    cfg_select! {
+        feature = "alloc-tracking" => GLOBAL_ALLOC.peak_usage() as u64,
+        _ => 0,
     }
 }
 
@@ -45,13 +41,9 @@ pub extern "C" fn peak_native_bytes() -> u64 {
 /// built without `alloc-tracking`.
 #[unsafe(no_mangle)]
 pub extern "C" fn current_native_bytes() -> u64 {
-    #[cfg(feature = "alloc-tracking")]
-    {
-        GLOBAL_ALLOC.current_usage() as u64
-    }
-    #[cfg(not(feature = "alloc-tracking"))]
-    {
-        0
+    cfg_select! {
+        feature = "alloc-tracking" => GLOBAL_ALLOC.current_usage() as u64,
+        _ => 0,
     }
 }
 
@@ -63,15 +55,13 @@ pub extern "C" fn current_native_bytes() -> u64 {
 /// Returns zero when built without `alloc-tracking`.
 #[unsafe(no_mangle)]
 pub extern "C" fn reset_peak_native_bytes() -> u64 {
-    #[cfg(feature = "alloc-tracking")]
-    {
-        let previous_peak = GLOBAL_ALLOC.peak_usage() as u64;
-        GLOBAL_ALLOC.reset_peak_usage();
-        previous_peak
-    }
-    #[cfg(not(feature = "alloc-tracking"))]
-    {
-        0
+    cfg_select! {
+        feature = "alloc-tracking" => {
+            let previous_peak = GLOBAL_ALLOC.peak_usage() as u64;
+            GLOBAL_ALLOC.reset_peak_usage();
+            previous_peak
+        }
+        _ => 0,
     }
 }
 

@@ -3,9 +3,11 @@
 //!
 //! [relative paths specification]: https://iceberg.apache.org/spec/#paths-in-metadata
 
+use std::borrow::Cow;
+
 use url::{ParseError, Url};
 
-use crate::path_encoding::{uri_decode_path, uri_encode_path};
+use crate::path_encoding::{scheme_len, uri_decode_path, uri_encode_path, with_trailing_slash};
 use crate::utils::{require, to_file_size};
 use crate::{FileMeta, KernelError, KernelResult};
 
@@ -83,6 +85,33 @@ pub(crate) fn amt_manifest_filemeta(
     })
 }
 
+/// Converts a raw AMT data-file `location` into the RFC 2396 form `add.path` uses: the path
+/// component is percent-encoded as in [`resolve_amt_location`], while a scheme and authority are
+/// kept as-is, and a relative location stays relative. Returns [`Cow::Borrowed`] when nothing
+/// needs encoding.
+///
+/// # Errors
+///
+/// Returns an error if `location` contains a `.` or `..` segment, which [`resolve_amt_location`]
+/// rejects too, or if a relative `location` is empty or begins with `/` (see
+/// [`validate_table_relative`]), which would resolve outside the table root.
+pub(crate) fn amt_location_to_add_path(location: &str) -> KernelResult<Cow<'_, str>> {
+    reject_dot_segments(location)?;
+    let (prefix, raw_path) = match scheme_len(location) {
+        Some(scheme_len) => split_authority(location, scheme_len),
+        None => {
+            validate_table_relative(location)?;
+            ("", location)
+        }
+    };
+    // TODO(#2423): non-ASCII characters are percent-encoded here but left raw by Delta-Spark, so
+    // Add/Remove reconciliation can see two spellings of the same file.
+    Ok(match uri_encode_path(raw_path) {
+        Cow::Borrowed(_) => Cow::Borrowed(location),
+        Cow::Owned(encoded) => Cow::Owned(format!("{prefix}{encoded}")),
+    })
+}
+
 /// Resolve a strictly table-relative `path` into an absolute [`Url`] under `table_root`.
 ///
 /// Unlike [`resolve_amt_location`], an absolute `path` is rejected rather than used as-is: the
@@ -128,37 +157,6 @@ pub(crate) fn validate_table_relative(path: &str) -> KernelResult<()> {
     Ok(())
 }
 
-/// Returns the byte length of `location`'s URI scheme (excluding the terminating `:`), or `None`
-/// if `location` does not begin with one, per [RFC 3986 section 3.1]:
-/// `scheme = ALPHA *( ALPHA / DIGIT / "+" / "-" / "." )`, terminated by `:`.
-///
-/// A path without a scheme is relative (per the Iceberg V4 path spec).
-///
-/// [RFC 3986 section 3.1]: https://datatracker.ietf.org/doc/html/rfc3986#section-3.1
-fn scheme_len(location: &str) -> Option<usize> {
-    for (position, ch) in location.char_indices() {
-        if ch == ':' {
-            return (position > 0).then_some(position);
-        }
-        if !is_scheme_char(ch, position) {
-            return None;
-        }
-    }
-    None
-}
-
-/// Returns whether `ch` is allowed at `position` in a URI scheme, per [RFC 3986 section 3.1]:
-/// the first character must be `ALPHA`; subsequent characters may also be `DIGIT`, `+`, `-`, or
-/// `.`. Schemes are restricted to US-ASCII, so non-ASCII letters are rejected.
-///
-/// [RFC 3986 section 3.1]: https://datatracker.ietf.org/doc/html/rfc3986#section-3.1
-fn is_scheme_char(ch: char, position: usize) -> bool {
-    if ch.is_ascii_alphabetic() {
-        return true;
-    }
-    position > 0 && (ch.is_ascii_digit() || ch == '+' || ch == '-' || ch == '.')
-}
-
 /// Resolves a relative `path` against `table_root`: percent-encodes `path` so reserved URI
 /// characters survive a round trip through the object store, then concatenates it onto
 /// `table_root` with a single `/` separator and parses the result.
@@ -168,10 +166,7 @@ fn is_scheme_char(ch: char, position: usize) -> bool {
 /// Returns an error if the resolved location fails to parse as a [`Url`].
 fn encode_and_join(path: &str, table_root: &Url) -> KernelResult<Url> {
     reject_dot_segments(path)?;
-    let mut base = table_root.as_str().to_string();
-    if !base.ends_with('/') {
-        base.push('/');
-    }
+    let base = with_trailing_slash(table_root);
     uri_with_encoded_path(&base, path).map_err(|e| {
         KernelError::generic(format!(
             "Failed to resolve relative AMT location {path:?} against table root {base}: {e}"
@@ -199,6 +194,10 @@ fn uri_with_encoded_path(prefix: &str, raw_path: &str) -> Result<Url, ParseError
 
 /// Rejects a `path` containing a `.` or `..` segment: the Iceberg V4 path spec does not support
 /// relative navigation, and URL parsing would otherwise silently collapse such segments.
+///
+/// An AMT path is raw: kernel percent-encodes it before parsing, so `%` and `\` are data and only
+/// a literal `.` or `..` segment navigates. A `file` value's `uri` is already percent-encoded, so
+/// `file_uri::check_uri` also rejects `%2e` forms, `\`, and encoded separators.
 pub(crate) fn reject_dot_segments(path: &str) -> KernelResult<()> {
     require!(
         !path
@@ -217,6 +216,85 @@ mod tests {
     use test_utils::assert_result_error_with_message;
 
     use super::*;
+
+    /// `expected_url` is where a scan reads the file: `add.path` joined onto the table root.
+    #[rstest]
+    #[case::plain_relative(
+        "data/a.parquet",
+        "data/a.parquet",
+        false,
+        "memory:///table/data/a.parquet"
+    )]
+    #[case::spaced_relative(
+        "data/a b.parquet",
+        "data/a%20b.parquet",
+        true,
+        "memory:///table/data/a%20b.parquet"
+    )]
+    #[case::percent_relative(
+        "data/a%b.parquet",
+        "data/a%25b.parquet",
+        true,
+        "memory:///table/data/a%25b.parquet"
+    )]
+    #[case::non_ascii_relative(
+        "data/M\u{fc}nchen.parquet",
+        "data/M%C3%BCnchen.parquet",
+        true,
+        "memory:///table/data/M%C3%BCnchen.parquet"
+    )]
+    #[case::query_and_fragment_relative(
+        "data/a?b#c.parquet",
+        "data/a%3Fb%23c.parquet",
+        true,
+        "memory:///table/data/a%3Fb%23c.parquet"
+    )]
+    #[case::plain_absolute(
+        "s3://bucket/t/a.parquet",
+        "s3://bucket/t/a.parquet",
+        false,
+        "s3://bucket/t/a.parquet"
+    )]
+    #[case::spaced_absolute(
+        "s3://bucket/t/a b.parquet",
+        "s3://bucket/t/a%20b.parquet",
+        true,
+        "s3://bucket/t/a%20b.parquet"
+    )]
+    #[case::spaced_absolute_without_authority(
+        "file:/tmp/a b.parquet",
+        "file:/tmp/a%20b.parquet",
+        true,
+        "file:///tmp/a%20b.parquet"
+    )]
+    fn test_amt_location_to_add_path(
+        #[case] location: &str,
+        #[case] expected: &str,
+        #[case] encoded: bool,
+        #[case] expected_url: &str,
+    ) {
+        let path = amt_location_to_add_path(location).unwrap();
+        assert_eq!(path, expected);
+        assert_eq!(matches!(path, Cow::Owned(_)), encoded);
+        let table_root = Url::parse("memory:///table/").unwrap();
+        let url = table_root.join(&path).unwrap();
+        assert_eq!(url.as_str(), expected_url);
+        assert_eq!(url, resolve_amt_location(location, &table_root).unwrap());
+    }
+
+    #[rstest]
+    #[case::parent_segment("../a.parquet", "contains a '.' or '..' segment")]
+    #[case::current_segment("data/./a.parquet", "contains a '.' or '..' segment")]
+    #[case::absolute_parent_segment("s3://bucket/t/../a.parquet", "contains a '.' or '..' segment")]
+    #[case::empty("", "must not be empty")]
+    #[case::leading_slash("/a.parquet", "must not begin with a leading '/'")]
+    #[case::network_path("//host/a.parquet", "must not begin with a leading '/'")]
+    fn amt_location_to_add_path_rejects_invalid_locations(
+        #[case] location: &str,
+        #[case] message: &str,
+    ) {
+        assert_result_error_with_message(amt_location_to_add_path(location), message);
+    }
 
     #[rstest]
     #[case::relative_path(

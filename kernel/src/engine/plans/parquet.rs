@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use tracing::debug;
+use tracing::trace;
 use url::Url;
 
 use crate::plans::{IoOperation, Operation, PlanBuilder, PlanExecutor};
@@ -61,7 +61,7 @@ impl ParquetHandler for PlanBasedParquetHandler {
                  handler is configured",
             ));
         };
-        debug!(%location, "PlanBasedParquetHandler delegating write_parquet_file to fallback handler");
+        trace!(%location, "PlanBasedParquetHandler delegating write_parquet_file to fallback handler");
         fallback.write_parquet_file(location, data)
     }
 
