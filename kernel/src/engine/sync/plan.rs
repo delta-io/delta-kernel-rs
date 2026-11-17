@@ -13,6 +13,7 @@ use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
 use itertools::Itertools;
+use uuid::Uuid;
 
 use super::aggs::eval_aggregate;
 use super::json::try_create_from_json;
@@ -38,8 +39,9 @@ use crate::engine::data_file_writer_options;
 use crate::expressions::{ArrayData, ColumnName, PredicateRef, Scalar};
 use crate::object_store::DynObjectStore;
 use crate::plans::ir::nodes::{
-    DynamicScan, FILE_META_SCHEMA, FileType, Operator, Project, RelationId, RelationRef, ScanFile,
-    ScanJson, ScanParquet, SemiJoin, Values, WriteJson, WriteParquet,
+    DynamicScan, FILE_META_SCHEMA, FILES_META_SCHEMA, FileType, Operator, Project, RelationId,
+    RelationRef, ScanFile, ScanJson, ScanParquet, SemiJoin, Values, WriteJson, WriteParquet,
+    WriteParquetFiles,
 };
 use crate::plans::ir::plan::{Plan, PlanNode};
 use crate::plans::{IoOperation, Operation, PlanExecutor, PlanResult, ScopedPlanExecutor};
@@ -273,6 +275,8 @@ impl SyncPlanExecutor {
             Operator::WriteParquet(write) => {
                 self.eval_write_parquet(&write, inputs.iter().flat_map(|&i| results[i].iter()))
             }
+            Operator::WriteParquetFiles(write) => self
+                .eval_write_parquet_files(&write, inputs.iter().flat_map(|&i| results[i].iter())),
             Operator::SemiJoin(join) => {
                 eval_semi_join(join, &results[inputs[0]], &results[inputs[1]])
             }
@@ -336,17 +340,10 @@ impl SyncPlanExecutor {
             eval_aggregate(&write.to_aggregate()?, &input)?
         };
         let output_schema = Arc::new(write.schema.as_ref().try_into_arrow()?);
-        let schema: Arc<ArrowSchema> = Arc::new(write.write_schema.as_ref().try_into_arrow()?);
-        let options = data_file_writer_options(&schema, &write.write_schema)?;
-        let columns = (0..write.write_schema.num_fields()).collect_vec();
-        // Input order is preserved even when `ordered` is false.
-        let batches = input.iter().map(|batch| {
-            let batch = batch.project(&columns)?;
-            validate_file_values_for_write(&batch, &write.write_schema)?;
-            Ok(batch)
-        });
-        let bytes = to_parquet_bytes(schema, options, batches)?;
-        let meta = self.write_file_result(&write.file_path, bytes.into(), write.overwrite)?;
+        let schema = Arc::new(write.write_schema.as_ref().try_into_arrow()?);
+        let bytes = Self::parquet_bytes(&write.write_schema, schema, input.iter())?
+            .ok_or_else(|| KernelError::generic("Write requires at least one input row"))?;
+        let meta = self.write_file_result(&write.file_path, bytes, write.overwrite)?;
         let columns = meta
             .columns()
             .iter()
@@ -354,6 +351,55 @@ impl SyncPlanExecutor {
             .cloned()
             .collect_vec();
         Ok(vec![RecordBatch::try_new(output_schema, columns)?])
+    }
+
+    fn parquet_bytes<'a>(
+        write_schema: &StructType,
+        schema: Arc<ArrowSchema>,
+        input: impl Iterator<Item = &'a RecordBatch> + Send,
+    ) -> KernelResult<Option<Bytes>> {
+        let options = data_file_writer_options(&schema, write_schema)?;
+        let columns = (0..write_schema.num_fields()).collect_vec();
+        let mut has_rows = false;
+        // Input order is preserved even when `ordered` is false.
+        let batches = input.map(|batch| {
+            let batch = batch.project(&columns)?;
+            validate_file_values_for_write(&batch, write_schema)?;
+            has_rows |= batch.num_rows() != 0;
+            Ok(batch)
+        });
+        let bytes = to_parquet_bytes(schema, options, batches)?;
+        Ok(has_rows.then_some(bytes.into()))
+    }
+
+    fn eval_write_parquet_files<'a>(
+        &self,
+        write: &WriteParquetFiles,
+        input: impl Iterator<Item = &'a RecordBatch>,
+    ) -> KernelResult<Vec<RecordBatch>> {
+        write.validate_destination()?;
+        let schema: Arc<ArrowSchema> = Arc::new(write.write_schema.as_ref().try_into_arrow()?);
+        // Serialize every batch before publishing any file, including validating empty batches.
+        let files = input
+            .map(|batch| {
+                Self::parquet_bytes(&write.write_schema, schema.clone(), std::iter::once(batch))
+            })
+            .collect::<KernelResult<Vec<_>>>()?;
+        let output_schema: Arc<ArrowSchema> =
+            Arc::new(FILES_META_SCHEMA.as_ref().try_into_arrow()?);
+        let mut output = Vec::new();
+        for bytes in files.into_iter().flatten() {
+            let file_name = write
+                .file_name_template
+                .replace("{uuid}", &Uuid::new_v4().to_string());
+            let path = write.base_url.join(&file_name)?;
+            let meta = self.write_file_result(&path, bytes, false)?;
+            let columns = std::iter::once(Arc::new(StringArray::from(vec![file_name])) as ArrayRef)
+                .chain(meta.columns().iter().cloned())
+                .collect();
+            output.push(RecordBatch::try_new(output_schema.clone(), columns)?);
+        }
+        Ok(output)
     }
 
     fn write_file_result(
@@ -769,7 +815,7 @@ fn values_to_record_batch(values: Values) -> KernelResult<RecordBatch> {
 #[cfg(test)]
 mod tests {
     use rstest::rstest;
-    use test_utils::assert_batches_sorted_eq;
+    use test_utils::{assert_batches_sorted_eq, sort_lines};
     use url::Url;
 
     use super::*;
@@ -779,6 +825,7 @@ mod tests {
     #[cfg(feature = "arrow-60")]
     use crate::arrow::compute::concat_batches;
     use crate::arrow::datatypes::{DataType as ArrowDataType, Field, Int64Type};
+    use crate::arrow::util::pretty::pretty_format_batches;
     #[cfg(feature = "arrow-60")]
     use crate::engine::file_groups;
     use crate::engine::sync::get_bytes;
@@ -1000,6 +1047,82 @@ mod tests {
         Ok(())
     }
 
+    #[rstest]
+    #[case::absent(&[])]
+    #[case::empty(&[None, None])]
+    #[case::populated(&[Some(1), Some(2)])]
+    #[case::mixed(&[None, Some(1), None, Some(2), None])]
+    fn write_parquet_files_returns_stored_files_once_for_shared_consumers(
+        #[case] ids: &[Option<i64>],
+        #[values(false, true)] in_memory: bool,
+    ) -> KernelResult<()> {
+        let dir = tempfile::tempdir()?;
+        let base = if in_memory {
+            Url::parse("memory:///files/")?
+        } else {
+            Url::from_directory_path(dir.path()).unwrap()
+        };
+        let executor = SyncPlanExecutor::new(in_memory.then(|| Arc::new(InMemory::new()) as _));
+        let schema = schema_ref! { not_null "id": LONG };
+        let inputs = ids
+            .iter()
+            .map(|id| {
+                PlanBuilder::values(schema.clone(), vec![vec![id.unwrap_or_default().into()]])?
+                    .filter(Predicate::literal(id.is_some()))
+            })
+            .collect::<KernelResult<Vec<_>>>()?;
+        let files = PlanBuilder::write_parquet_files(
+            inputs,
+            schema.clone(),
+            base.clone(),
+            "part-{uuid}.parquet".into(),
+        )?;
+        assert_eq!(files.schema(), &*FILES_META_SCHEMA);
+        let plan = PlanBuilder::union_all([files.clone(), files])?.build()?;
+        let actual = executor.eval_plan(plan, None)?;
+        let expected_files = ids.iter().flatten().count();
+        assert_eq!(
+            actual.iter().map(RecordBatch::num_rows).sum::<usize>(),
+            expected_files * 2
+        );
+        let stored = executor
+            .storage
+            .list_from(&base)?
+            .collect::<KernelResult<Vec<_>>>()?;
+        assert_eq!(stored.len(), expected_files);
+        let mut rows = Vec::new();
+        for meta in &stored {
+            let name = meta.location.path_segments().unwrap().next_back().unwrap();
+            Uuid::parse_str(
+                name.strip_prefix("part-")
+                    .unwrap()
+                    .strip_suffix(".parquet")
+                    .unwrap(),
+            )
+            .unwrap();
+            let row = vec![
+                name.into(),
+                meta.location.to_string().into(),
+                (meta.size as i64).into(),
+                meta.last_modified.into(),
+            ];
+            rows.extend([row.clone(), row]);
+        }
+        if expected_files != 0 {
+            let expected = values_to_record_batch(Values::new(FILES_META_SCHEMA.clone(), rows))?;
+            let formatted = pretty_format_batches(&[expected])?.to_string();
+            let mut expected: Vec<_> = formatted.trim().lines().collect();
+            sort_lines!(expected);
+            assert_batches_sorted_eq!(expected, &actual);
+            let read = PlanBuilder::scan_parquet(stored, &[], schema)?.build()?;
+            assert_batches_sorted_eq!(
+                ["+----+", "| id |", "+----+", "| 1  |", "| 2  |", "+----+"].as_slice(),
+                &executor.eval_plan(read, None)?
+            );
+        }
+        Ok(())
+    }
+
     #[rustfmt::skip]
     #[rstest]
     #[case::narrow_without_stats(
@@ -1069,6 +1192,7 @@ mod tests {
         #[case] expected_write: &[&str],
         #[case] expected_stats: &[&str],
         #[values(false, true)] input_has_field_ids: bool,
+        #[values(false, true)] multiple_files: bool,
     ) -> KernelResult<()> {
         let executor = SyncPlanExecutor::new(Some(Arc::new(InMemory::new())));
         let path = Url::parse("memory:///output.parquet")?;
@@ -1132,14 +1256,25 @@ mod tests {
             ],
         ];
         let rows = PlanBuilder::values(input_schema.clone(), data)?;
-        let plan = PlanBuilder::write_parquet(
-            [rows.clone(), rows],
-            WriteParquet::new(write_schema, path.clone()).with_stats_agg(stats_agg),
-        )?
+        let plan = if multiple_files {
+            PlanBuilder::write_parquet_files(
+                [rows.clone(), rows],
+                write_schema,
+                Url::parse("memory:///")?,
+                "{uuid}.parquet".into(),
+            )?
+            .project_patch(|patch| patch.drop("file_name"))?
+        } else {
+            PlanBuilder::write_parquet(
+                [rows.clone(), rows],
+                WriteParquet::new(write_schema, path.clone()).with_stats_agg(stats_agg),
+            )?
+        }
         .build()?;
         let output_schema: ArrowSchema = plan.schema.as_ref().try_into_arrow()?;
         let result = executor.eval_plan(plan, None)?;
         assert_eq!(result[0].schema().as_ref(), &output_schema);
+        let expected_stats = if multiple_files { &[][..] } else { expected_stats };
         let stats_columns = (FILE_META_SCHEMA.num_fields()..result[0].num_columns()).collect_vec();
         if stats_columns.is_empty() {
             assert!(expected_stats.is_empty());
@@ -1147,26 +1282,35 @@ mod tests {
             let actual = result[0].project(&stats_columns)?;
             assert_batches_sorted_eq!(expected_stats, &[actual]);
         }
-        let file = executor.storage.head(&path)?;
-        let reader =
-            ParquetRecordBatchReaderBuilder::try_new(get_bytes(executor.storage.store(), &path)?)?;
-        let fields = reader.parquet_schema().root_schema().get_fields();
-        assert_eq!(fields.len(), write_fields.len());
-        assert_eq!(fields[0].get_basic_info().id(), 1);
-        if let Some(stats) = fields.get(1) {
-            assert_eq!(stats.get_basic_info().id(), 3);
-            assert_eq!(stats.get_fields()[0].get_basic_info().id(), 2);
-        }
-        if let Some(items) = fields.get(2) {
-            let entries = items.get_fields()[0].get_fields();
-            assert_eq!(entries[0].get_basic_info().id(), 4);
-            assert_eq!(entries[1].get_basic_info().id(), 5);
-            let element = &entries[1].get_fields()[0].get_fields()[0];
-            assert_eq!(element.get_basic_info().id(), 6);
-            assert_eq!(element.get_fields()[0].get_basic_info().id(), 7);
+        let files = result
+            .iter()
+            .flat_map(|batch| batch["location"].as_string::<i32>().iter())
+            .map(|location| executor.storage.head(&Url::parse(location.unwrap())?))
+            .collect::<KernelResult<Vec<_>>>()?;
+        assert_eq!(files.len(), if multiple_files { 2 } else { 1 });
+        for file in &files {
+            let reader = ParquetRecordBatchReaderBuilder::try_new(get_bytes(
+                executor.storage.store(),
+                &file.location,
+            )?)?;
+            let fields = reader.parquet_schema().root_schema().get_fields();
+            assert_eq!(fields.len(), write_fields.len());
+            assert_eq!(fields[0].get_basic_info().id(), 1);
+            if let Some(stats) = fields.get(1) {
+                assert_eq!(stats.get_basic_info().id(), 3);
+                assert_eq!(stats.get_fields()[0].get_basic_info().id(), 2);
+            }
+            if let Some(items) = fields.get(2) {
+                let entries = items.get_fields()[0].get_fields();
+                assert_eq!(entries[0].get_basic_info().id(), 4);
+                assert_eq!(entries[1].get_basic_info().id(), 5);
+                let element = &entries[1].get_fields()[0].get_fields()[0];
+                assert_eq!(element.get_basic_info().id(), 6);
+                assert_eq!(element.get_fields()[0].get_basic_info().id(), 7);
+            }
         }
         let read_schema = input_schema.project(write_fields)?;
-        let plan = PlanBuilder::scan_parquet([file], &[], read_schema)?.build()?;
+        let plan = PlanBuilder::scan_parquet(files, &[], read_schema)?.build()?;
         let actual = executor.eval_plan(plan, None)?;
         assert_batches_sorted_eq!(expected_write, &actual);
         Ok(())
@@ -1224,9 +1368,11 @@ mod tests {
         #[case] file: Option<(Option<&str>, i64, Option<&str>)>,
         #[case] problem: Option<&str>,
         #[values(false, true)] valid_prefix: bool,
+        #[values(false, true)] multiple_files: bool,
     ) -> KernelResult<()> {
         let executor = SyncPlanExecutor::new(Some(Arc::new(InMemory::new())));
-        let path = Url::parse("memory:///output.parquet")?;
+        let base = Url::parse("memory:///")?;
+        let path = base.join("output.parquet")?;
         let original = Bytes::from_static(b"original contents");
         executor.storage.put(&path, original.clone(), false)?;
         let schema = schema_ref! {
@@ -1266,10 +1412,20 @@ mod tests {
                     .map(PlanBuilder::relation_source)
             })
             .collect::<KernelResult<Vec<_>>>()?;
-        let write = PlanBuilder::write_parquet(
-            inputs,
-            WriteParquet::new(schema.clone(), path.clone()).with_overwrite(true),
-        )?
+        let write = if multiple_files {
+            PlanBuilder::write_parquet_files(
+                inputs,
+                schema.clone(),
+                base.clone(),
+                "{uuid}.parquet".into(),
+            )?
+            .project_patch(|patch| patch.drop("file_name"))?
+        } else {
+            PlanBuilder::write_parquet(
+                inputs,
+                WriteParquet::new(schema.clone(), path.clone()).with_overwrite(true),
+            )?
+        }
         .build()?;
         let result = scoped.execute_op(Operation::QueryPlan(write));
         let problem = if cfg!(feature = "arrow-60") {
@@ -1281,30 +1437,39 @@ mod tests {
             let error = result.err().expect("FILE write must fail");
             assert!(error.to_string().contains(problem), "{error}");
             assert_eq!(get_bytes(executor.storage.store(), &path)?, original);
+            assert_eq!(executor.storage.list_from(&base)?.count(), 1);
             return Ok(());
         }
         #[cfg(feature = "arrow-60")]
         {
-            let file = file_meta_from_batches(result?.into_data()?)?;
-            let reader = ParquetRecordBatchReaderBuilder::try_new(get_bytes(
-                executor.storage.store(),
-                &file.location,
-            )?)?;
-            let groups = file_groups(reader.parquet_schema().root_schema());
-            assert_eq!(groups.len(), 1);
-            assert_eq!(groups[0].path, "file");
-            assert_eq!(groups[0].id, Some(10));
-            assert_eq!(
-                groups[0].sub_field_ids,
-                (11..17).map(Some).collect::<Vec<_>>()
-            );
-            let scan = PlanBuilder::scan_parquet([file], &[], schema)?.build()?;
+            let result = result?;
+            let data = result.into_data()?;
+            let files = data
+                .map(|batch| file_meta_from_batches(std::iter::once(batch)))
+                .collect::<KernelResult<Vec<_>>>()?;
+            for file in &files {
+                let reader = ParquetRecordBatchReaderBuilder::try_new(get_bytes(
+                    executor.storage.store(),
+                    &file.location,
+                )?)?;
+                let groups = file_groups(reader.parquet_schema().root_schema());
+                assert_eq!(groups.len(), 1);
+                assert_eq!(groups[0].path, "file");
+                assert_eq!(groups[0].id, Some(10));
+                assert_eq!(
+                    groups[0].sub_field_ids,
+                    (11..17).map(Some).collect::<Vec<_>>()
+                );
+            }
+            let scan = PlanBuilder::scan_parquet(files, &[], schema)?.build()?;
             let expected = if valid_prefix {
                 concat_batches(&batch.schema(), [&prefix, &batch])?
             } else {
                 batch
             };
-            assert_eq!(executor.eval_plan(scan, None)?, vec![expected]);
+            let actual = executor.eval_plan(scan, None)?;
+            let actual = concat_batches(&expected.schema(), &actual)?;
+            assert_eq!(actual, expected);
         }
         Ok(())
     }

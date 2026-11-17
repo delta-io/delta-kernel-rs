@@ -43,9 +43,9 @@ use delta_kernel_derive::internal_api;
 use url::Url;
 
 use super::ir::nodes::{
-    Aggregate, AggregateBuilder, DynamicScan, FILE_META_SCHEMA, FileType, Filter, Operator,
-    PrefixSum, Project, RelationRef, ScanFile, ScanJson, ScanParquet, SemiJoin, UnionAll, Values,
-    WriteJson, WriteParquet,
+    Aggregate, AggregateBuilder, DynamicScan, FILE_META_SCHEMA, FILES_META_SCHEMA, FileType,
+    Filter, Operator, PrefixSum, Project, RelationRef, ScanFile, ScanJson, ScanParquet, SemiJoin,
+    UnionAll, Values, WriteJson, WriteParquet, WriteParquetFiles,
 };
 use super::ir::plan::{Plan, PlanNode};
 use crate::expressions::{ColumnName, Expression, ExpressionRef, PredicateRef, Scalar, StructData};
@@ -341,28 +341,7 @@ impl PlanBuilder {
         inputs: impl IntoIterator<Item = PlanBuilder>,
         mut write: WriteParquet,
     ) -> KernelResult<Self> {
-        if write.write_schema.num_fields() == 0 {
-            return Err(KernelError::schema(
-                "WriteParquet requires at least one field",
-            ));
-        }
-        let mut present = Vec::new();
-        for input in inputs {
-            if input.schema().num_fields() < write.write_schema.num_fields() {
-                return Err(KernelError::schema("WriteParquet schema exceeds its input"));
-            }
-            for (source, field) in input.schema().fields().zip(write.write_schema.fields()) {
-                if !fields_equal_ignoring_metadata(source, field) {
-                    return Err(KernelError::schema(format!(
-                        "WriteParquet field {} must match its input prefix",
-                        field.name()
-                    )));
-                }
-            }
-            if let PlanBuilderRoot::Present(node) = input.0 {
-                present.push(node);
-            }
-        }
+        let present = parquet_inputs(inputs, &write.write_schema)?;
         if present.is_empty() {
             return Err(KernelError::generic(
                 "WriteParquet requires at least one input row",
@@ -395,6 +374,30 @@ impl PlanBuilder {
         }
         write.schema = Arc::new(FILE_META_SCHEMA.add(stats_schema.fields().cloned())?);
         Ok(Self::present(write.schema.clone(), write, present))
+    }
+
+    /// Writes engine-sized Parquet files with names such as `part-{uuid}.parquet` beneath
+    /// `base_url`, returning [`FILES_META_SCHEMA`]. Empty inputs produce no files or rows.
+    /// Field selection follows [`Self::write_parquet`]; see [`WriteParquetFiles`] for naming
+    /// and execution requirements.
+    pub fn write_parquet_files(
+        inputs: impl IntoIterator<Item = PlanBuilder>,
+        write_schema: SchemaRef,
+        base_url: Url,
+        file_name_template: String,
+    ) -> KernelResult<Self> {
+        let write = WriteParquetFiles {
+            write_schema,
+            base_url,
+            file_name_template,
+        };
+        write.validate_destination()?;
+        let inputs = parquet_inputs(inputs, &write.write_schema)?;
+        Ok(if inputs.is_empty() {
+            Self(PlanBuilderRoot::Absent(FILES_META_SCHEMA.clone()))
+        } else {
+            Self::present(FILES_META_SCHEMA.clone(), write, inputs)
+        })
     }
 
     /// Keep rows where `predicate` holds. Output schema is unchanged. See [`Filter`].
@@ -825,6 +828,35 @@ fn check_columns_resolve<'a>(
     Ok(())
 }
 
+fn parquet_inputs(
+    inputs: impl IntoIterator<Item = PlanBuilder>,
+    write_schema: &SchemaRef,
+) -> KernelResult<Vec<BuilderNodeRef>> {
+    if write_schema.num_fields() == 0 {
+        return Err(KernelError::schema(
+            "WriteParquet requires at least one field",
+        ));
+    }
+    let mut present = Vec::new();
+    for input in inputs {
+        if input.schema().num_fields() < write_schema.num_fields() {
+            return Err(KernelError::schema("WriteParquet schema exceeds its input"));
+        }
+        for (source, field) in input.schema().fields().zip(write_schema.fields()) {
+            if !fields_equal_ignoring_metadata(source, field) {
+                return Err(KernelError::schema(format!(
+                    "WriteParquet field {} must match its input prefix",
+                    field.name()
+                )));
+            }
+        }
+        if let PlanBuilderRoot::Present(node) = input.0 {
+            present.push(node);
+        }
+    }
+    Ok(present)
+}
+
 /// Error unless each of `names` is a top-level, non-metadata field of `schema`. A file-constant is
 /// one scalar broadcast into a top-level field, so nested paths and engine-generated metadata
 /// columns are rejected.
@@ -1164,15 +1196,20 @@ mod tests {
     #[case::absent_skipped_field(absent_over(schema_ref! { nullable "extra": LONG, nullable "id": STRING }))]
     fn write_rejects_mismatched_input_schema(
         #[case] other: PlanBuilder,
-        #[values(FileType::Json, FileType::Parquet)] file_type: FileType,
+        #[values("json", "parquet", "parquet_files")] writer: &str,
     ) -> KernelResult<()> {
         let path = Url::parse("memory:///output")?;
         let inputs = [vals(id_schema()), other];
-        let result = match file_type {
-            FileType::Json => PlanBuilder::write_json(inputs, path, false, false),
-            FileType::Parquet => {
-                PlanBuilder::write_parquet(inputs, WriteParquet::new(id_schema(), path))
-            }
+        let result = match writer {
+            "json" => PlanBuilder::write_json(inputs, path, false, false),
+            "parquet" => PlanBuilder::write_parquet(inputs, WriteParquet::new(id_schema(), path)),
+            "parquet_files" => PlanBuilder::write_parquet_files(
+                inputs,
+                id_schema(),
+                Url::parse("memory:///files/")?,
+                "{uuid}.parquet".into(),
+            ),
+            _ => panic!("unexpected writer {writer}"),
         };
         assert!(matches!(result, Err(KernelError::Schema(_))));
         Ok(())
@@ -1217,16 +1254,53 @@ mod tests {
             schema! { not_null "a": LONG, nullable "b": LONG }
         )]
         target: StructType,
+        #[values(false, true)] multiple_files: bool,
     ) -> KernelResult<()> {
         let source = Arc::new(wrap(schema! { nullable "a": LONG, nullable "b": LONG }));
-        let result = PlanBuilder::write_parquet(
-            [vals(source)],
-            WriteParquet::new(
-                Arc::new(wrap(target)),
-                Url::parse("memory:///output.parquet")?,
-            ),
-        );
+        let target = Arc::new(wrap(target));
+        let result = if multiple_files {
+            PlanBuilder::write_parquet_files(
+                [vals(source)],
+                target,
+                Url::parse("memory:///")?,
+                "{uuid}.parquet".into(),
+            )
+        } else {
+            PlanBuilder::write_parquet(
+                [vals(source)],
+                WriteParquet::new(target, Url::parse("memory:///output.parquet")?),
+            )
+        };
         assert!(matches!(result, Err(KernelError::Schema(_))));
+        Ok(())
+    }
+
+    #[rstest::rstest]
+    #[case::valid("memory:///files/", "part-{uuid}.parquet", true)]
+    #[case::missing_uuid("memory:///files/", "part.parquet", false)]
+    #[case::two_uuids("memory:///files/", "{uuid}-{uuid}.parquet", false)]
+    #[case::path("memory:///files/", "../{uuid}.parquet", false)]
+    #[case::absolute("memory:///files/", "file:{uuid}.parquet", false)]
+    #[case::query("memory:///files/", "{uuid}.parquet?x", false)]
+    #[case::base_file("memory:///files", "{uuid}.parquet", false)]
+    #[case::base_query("memory:///files/?x", "{uuid}.parquet", false)]
+    #[case::base_fragment("memory:///files/#x", "{uuid}.parquet", false)]
+    #[case::opaque_base("data:files/", "{uuid}.parquet", false)]
+    fn write_parquet_files_validates_destination(
+        #[case] base_url: &str,
+        #[case] template: &str,
+        #[case] valid: bool,
+    ) -> KernelResult<()> {
+        let result = PlanBuilder::write_parquet_files(
+            [],
+            id_schema(),
+            Url::parse(base_url)?,
+            template.into(),
+        );
+        assert_eq!(result.is_ok(), valid);
+        if valid {
+            assert_eq!(result?.schema(), &*FILES_META_SCHEMA);
+        }
         Ok(())
     }
 
