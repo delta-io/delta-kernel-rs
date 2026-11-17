@@ -1220,7 +1220,7 @@ fn declarative_metadata_reconciles_checkpoint_with_later_commits(
                     .any(|f| f.meta.location.path().ends_with(".compacted.json")),
             _ => false,
         }),
-        compact
+        compact && !cfg!(feature = "adaptive-metadata-in-dev")
     );
     let actual = declarative_metadata(&scan, &engine)?;
 
