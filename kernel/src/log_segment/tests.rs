@@ -2233,6 +2233,50 @@ async fn test_compaction_starts_at_checkpoint() {
     .await;
 }
 
+#[rstest]
+#[case::before_checkpoint(Some(10), 3, 8, false)]
+#[case::ending_at_checkpoint(Some(10), 3, 10, false)]
+#[case::starting_at_checkpoint(Some(10), 10, 12, false)]
+#[case::spanning_checkpoint(Some(10), 5, 12, false)]
+#[case::after_checkpoint(Some(10), 11, 12, true)]
+#[case::after_checkpoint_past_end_version(Some(10), 11, 13, false)]
+#[case::no_checkpoint(None, 0, 8, true)]
+fn try_new_keeps_compactions_after_checkpoint_through_end_version(
+    #[case] checkpoint: Option<Version>,
+    #[case] lo: Version,
+    #[case] hi: Version,
+    #[case] expect_kept: bool,
+) {
+    let log_root = Url::parse("file:///_delta_log/").unwrap();
+    let first_commit = checkpoint.map_or(0, |cp| cp + 1);
+    let log_segment = LogSegment::try_new(
+        LogSegmentFiles {
+            checkpoint_parts: checkpoint
+                .map(|cp| {
+                    create_log_path(&format!("file:///_delta_log/{cp:020}.checkpoint.parquet"))
+                })
+                .into_iter()
+                .collect(),
+            ascending_commit_files: (first_commit..=12)
+                .map(|v| create_log_path(&format!("file:///_delta_log/{v:020}.json")))
+                .collect(),
+            latest_commit_file: Some(create_log_path(
+                "file:///_delta_log/00000000000000000012.json",
+            )),
+            ascending_compaction_files: vec![create_log_path(&format!(
+                "file:///_delta_log/{lo:020}.{hi:020}.compacted.json"
+            ))],
+            ..Default::default()
+        },
+        log_root,
+        Some(12),
+        None,
+    )
+    .unwrap();
+    let expected = if expect_kept { vec![(lo, hi)] } else { vec![] };
+    assert_eq!(extract_compaction_ranges(&log_segment), expected);
+}
+
 enum ExpectedFile {
     Commit(Version),
     Compaction(Version, Version),
