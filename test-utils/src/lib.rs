@@ -3,6 +3,8 @@
 pub mod column_mapping_fixtures;
 pub mod counting_reporter;
 pub mod engine_contract;
+pub mod json_read_capture;
+pub mod log_compaction;
 pub mod table_builder;
 
 /// Helper macro to extract a typed column from a RecordBatch or StructArray.
@@ -129,10 +131,12 @@ macro_rules! define_sweeps {
 }
 
 define_sweeps! {
-    // TODO: Log compaction (needs LogState::with_compaction_at, #2337).
     // TODO: Schema history (add/drop/rename) (needs schema-evolution support).
     log_state_values = (
         commits_only(),
+        compaction_at_end(),
+        interior_compactions(),
+        compaction_after_checkpoint(),
         checkpoint_at_end(),
         checkpoint_at_end_no_hint(),
         checkpoint_mid(),
@@ -251,6 +255,7 @@ use delta_kernel_default_engine::executor::tokio::{
 use delta_kernel_default_engine::storage::store_from_url;
 use delta_kernel_default_engine::{DefaultEngine, DefaultEngineBuilder};
 use itertools::Itertools;
+pub use json_read_capture::JsonReadCapture;
 use serde_json::{Deserializer, json, to_vec};
 use tracing::subscriber::DefaultGuard;
 use tracing_subscriber::layer::SubscriberExt;

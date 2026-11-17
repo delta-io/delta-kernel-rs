@@ -1402,16 +1402,17 @@ pub unsafe extern "C" fn snapshot_timestamp(
     unsafe { result.into_extern_result(&engine_ref) }
 }
 
-/// Statistics for the commit files selected to replay a snapshot's log segment.
+/// Statistics for the original commit files in a snapshot's log segment.
 ///
-/// Includes published and staged commits, and selected compactions in place of covered commits.
-/// Excludes checkpoints, sidecars, CRCs, and commits retained only for timestamp lookup.
+/// Includes published and staged commits after the checkpoint. Excludes log compactions, even
+/// when scans read them in place of the commits they cover, as well as checkpoints, sidecars,
+/// CRCs, and commits retained only for timestamp lookup.
 #[derive(Debug, PartialEq, Eq)]
 #[repr(C)]
 pub struct FfiLogSegmentStats {
-    /// Number of selected commit files, counting each selected compaction as one file.
+    /// Number of original commit files.
     pub num_commit_files: u64,
-    /// Sum of the selected commit file sizes in bytes.
+    /// Sum of the original commit file sizes in bytes.
     pub total_commit_file_bytes: u64,
 }
 
@@ -1424,7 +1425,7 @@ impl From<LogSegmentStats> for FfiLogSegmentStats {
     }
 }
 
-/// Returns selected replay commit file statistics from `snapshot` without I/O.
+/// Returns original commit file statistics from `snapshot` without I/O.
 ///
 /// Borrows both handles. Uses `engine` only to allocate errors. The returned value needs no
 /// release. Returns zero counts and bytes when a checkpoint covers the entire snapshot.

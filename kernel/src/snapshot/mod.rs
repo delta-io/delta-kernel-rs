@@ -674,7 +674,7 @@ impl Snapshot {
     // Field accessors and state queries
     // ============================================================================
 
-    /// Returns statistics for this snapshot's selected replay commit files without I/O.
+    /// Returns statistics for this snapshot's original commit files without I/O.
     ///
     /// Returns zero counts and bytes when a checkpoint covers the entire snapshot.
     ///
@@ -691,10 +691,7 @@ impl Snapshot {
     /// latest. Missing checkpoint hints and CRCs at this snapshot's version remain absent.
     /// Rebuild it with [`SnapshotBuilder::with_snapshot_hint`] for the same table root.
     ///
-    /// # Errors
-    ///
-    /// Returns [`SnapshotHintError::LogCompaction`] when the retained log segment contains
-    /// compaction files, which snapshot hints do not support.
+    /// Original commit and compaction paths are retained together.
     #[internal_api]
     #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
     pub(crate) fn to_snapshot_hint(&self) -> KernelResult<SnapshotHint> {
@@ -1335,8 +1332,8 @@ impl Snapshot {
         Ok(self.read_ict_and_last_manifest_commit(engine)?.1)
     }
 
-    #[cfg(feature = "adaptive-metadata-in-dev")]
-    fn has_adaptive_metadata(&self) -> bool {
+    /// Whether the snapshot's table has adaptive metadata enabled.
+    pub(crate) fn has_adaptive_metadata(&self) -> bool {
         self.table_configuration()
             .is_feature_enabled(&TableFeature::AdaptiveMetadataPreview)
     }

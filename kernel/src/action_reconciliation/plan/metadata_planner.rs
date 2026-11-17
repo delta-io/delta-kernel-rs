@@ -37,6 +37,7 @@ const IS_ADD: &str = "is_add";
 #[derive(Clone)]
 pub(crate) struct MetadataPlanner<'a> {
     pub(crate) segment: &'a LogSegment,
+    use_compactions: bool,
     pub(crate) actions: ActionSet,
     pub(crate) checkpoint_shape: Option<Arc<CheckpointShape>>,
     pub(crate) stats: StatsOptions,
@@ -59,9 +60,10 @@ enum StatsKind {
 
 impl<'a> MetadataPlanner<'a> {
     /// Binds the source context for one metadata plan. Callers supply resolved metadata schemas.
-    pub(crate) fn new(segment: &'a LogSegment, actions: ActionSet) -> Self {
+    pub(crate) fn new(segment: &'a LogSegment, actions: ActionSet, use_compactions: bool) -> Self {
         Self {
             segment,
+            use_compactions,
             actions,
             checkpoint_shape: None,
             stats: StatsOptions::none(),
@@ -192,7 +194,7 @@ impl<'a> MetadataPlanner<'a> {
         base_version: Option<Version>,
     ) -> KernelResult<PlanBuilder> {
         self.build_metadata_plan(ActionSource::Commit, None, |schema| {
-            sources::commit_arm(self.segment, base_version, schema)
+            sources::commit_arm(self.segment, base_version, schema, self.use_compactions)
         })
     }
 
