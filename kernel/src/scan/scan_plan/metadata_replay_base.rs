@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use crate::actions::Add;
 use crate::checkpoint::CheckpointInfo;
+use crate::metrics::{CheckpointMetrics, ReplayBase, ScanPlanGenerationCompleted};
 use crate::{Engine, KernelResult, Snapshot, Version};
 
 /// Reconciled table state from which metadata replay starts.
@@ -28,12 +29,32 @@ impl MetadataReplayBase {
                 checkpoint_version.is_none_or(|checkpoint| *version >= checkpoint)
             })
         {
+            ScanPlanGenerationCompleted::update(|event| event.replay_base = Some(ReplayBase::Crc));
             return Ok(Self::Crc {
                 version,
                 files: files.to_vec(),
             });
         }
 
+        ScanPlanGenerationCompleted::update(|event| {
+            event.replay_base = Some(if checkpoint_version.is_some() {
+                ReplayBase::Checkpoint
+            } else {
+                ReplayBase::Empty
+            });
+            event.checkpoint =
+                snapshot
+                    .log_segment()
+                    .checkpoint
+                    .map(|selected| CheckpointMetrics {
+                        selected,
+                        info: None,
+                        cache_hit: None,
+                        root_footer_calls: 0,
+                        sidecar_footer_calls: 0,
+                        metadata_query_calls: 0,
+                    });
+        });
         let info = snapshot.checkpoint_info(engine)?;
         Ok(Self::Checkpoint {
             version: checkpoint_version,
@@ -61,10 +82,13 @@ mod tests {
     use crate::crc::Crc;
     use crate::engine::DelegatingEngine;
     use crate::engine::arrow_data::EngineDataArrowExt as _;
+    use crate::metrics::MetricEvent;
     use crate::plans::Operation as PlanOperation;
     use crate::plans::ir::nodes::Operator;
     use crate::scan::scan_plan::tests::log_segment;
-    use crate::unit_test_utils::load_test_table;
+    use crate::unit_test_utils::{
+        CapturingReporter, install_thread_local_metrics_reporter, load_test_table,
+    };
 
     #[rstest]
     #[case::without_checkpoint(4, None, true)]
@@ -142,9 +166,28 @@ mod tests {
         let config = target.table_configuration().clone();
         let snapshot = Arc::new(Snapshot::new_with_crc(segment, config, crc, false, false)?);
         let scan = snapshot.scan_builder().build()?;
+        let reporter = Arc::new(CapturingReporter::default());
+        let _guard = install_thread_local_metrics_reporter(reporter.clone());
         let plan = scan.declarative_metadata_scan_plan(
             &DelegatingEngine::new(engine.clone()).without_plan_executor(),
         )?;
+        let reports: Vec<_> = reporter
+            .events()
+            .into_iter()
+            .filter_map(|event| match event {
+                MetricEvent::ScanPlanGenerationCompleted(event) => Some(event),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(reports.len(), 1);
+        let event = &reports[0];
+        assert_eq!(event.replay_base, Some(ReplayBase::Crc));
+        assert!(event.checkpoint.is_none());
+        let bounds = (target_version > version).then_some((version + 1, target_version));
+        assert_eq!(
+            event.commit_start_version.zip(event.commit_end_version),
+            bounds
+        );
         if expected_rows == 0 {
             assert!(plan.is_none());
             return Ok(());
