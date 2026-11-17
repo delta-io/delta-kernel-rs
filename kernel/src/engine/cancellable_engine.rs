@@ -17,7 +17,8 @@ use crate::plans::PlanExecutor;
 use crate::{
     CancellationTokenRef, Engine, EngineData, EvaluationHandler, FileDataReadResultIterator,
     FileMeta, FileSize, FileSlice, FilteredEngineData, JsonHandler, KernelResult,
-    KernelResultIterator, ParquetFooter, ParquetHandler, PredicateRef, SchemaRef, StorageHandler,
+    KernelResultIterator, ParquetFooter, ParquetHandler, ParquetReadOptions, PredicateRef,
+    SchemaRef, StorageHandler,
 };
 
 /// An engine adapter that supplies a default cancellation token to storage, JSON, and
@@ -205,6 +206,19 @@ impl JsonHandler for ReadHandler<dyn JsonHandler> {
 }
 
 impl ParquetHandler for ReadHandler<dyn ParquetHandler> {
+    fn read_parquet_file_with_options(
+        &self,
+        file: &FileMeta,
+        read_schema: SchemaRef,
+        mut options: ParquetReadOptions,
+    ) -> KernelResult<FileDataReadResultIterator> {
+        if options.cancellation_token().is_none() {
+            options = options.with_cancellation_token(self.cancellation_token.clone());
+        }
+        self.inner
+            .read_parquet_file_with_options(file, read_schema, options)
+    }
+
     cancellable_read_pair! {
         /// Reads projected Parquet batches using a per-call token or the default token.
         fn read_parquet_files, read_parquet_files_with_cancellation(

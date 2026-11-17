@@ -64,7 +64,7 @@
 //! operation, fired when the returned iterator is exhausted or dropped:
 //! `StorageListCompleted` / `StorageReadCompleted` / `StorageCopyCompleted` for storage,
 //! `JsonReadCompleted` for `JsonHandler::read_json_files`, and `ParquetReadCompleted`
-//! for `ParquetHandler::read_parquet_files`. `DefaultEngine` wraps its three handlers
+//! for Parquet data reads, including exact reads. `DefaultEngine` wraps its three handlers
 //! in [`MeteredStorageHandler`], [`MeteredJsonHandler`], and [`MeteredParquetHandler`]
 //! at construction; any other engine gets the same coverage by wrapping its [`Engine`]
 //! in [`MeteredDeltaEngine`].

@@ -9,7 +9,7 @@ use crate::plans::{IoOperation, Operation, PlanBuilder, PlanExecutor};
 use crate::schema::SchemaRef;
 use crate::{
     EngineData, FileDataReadResultIterator, FileMeta, FileSize, KernelError, KernelResult,
-    KernelResultIterator, ParquetFooter, ParquetHandler, PredicateRef,
+    KernelResultIterator, ParquetFooter, ParquetHandler, ParquetReadOptions, PredicateRef,
 };
 
 /// A [`ParquetHandler`] that delegates to a [`PlanExecutor`].
@@ -50,6 +50,18 @@ impl ParquetHandler for PlanBasedParquetHandler {
             .into_data()
     }
 
+    fn read_parquet_file_with_options(
+        &self,
+        file: &FileMeta,
+        read_schema: SchemaRef,
+        options: ParquetReadOptions,
+    ) -> KernelResult<FileDataReadResultIterator> {
+        let fallback = self.fallback.as_ref().ok_or_else(|| {
+            KernelError::unsupported("Exact Parquet reads require a fallback handler")
+        })?;
+        fallback.read_parquet_file_with_options(file, read_schema, options)
+    }
+
     fn write_parquet_file(
         &self,
         location: Url,
@@ -80,6 +92,7 @@ mod tests {
     use std::path::Path;
     use std::sync::Arc;
 
+    use rstest::rstest;
     use tempfile::tempdir;
     use url::Url;
 
@@ -89,9 +102,12 @@ mod tests {
     use crate::engine::arrow_data::ArrowEngineData;
     use crate::engine::sync::SyncEngine;
     use crate::engine::sync::plan::SyncPlanExecutor;
+    use crate::expressions::{col, lit};
     use crate::parquet::arrow::arrow_writer::ArrowWriter;
     use crate::schema::{SchemaRef, schema_ref};
-    use crate::{Engine as _, EngineData, FileMeta, ParquetHandler as _};
+    use crate::{
+        Engine as _, EngineData, FileMeta, KernelError, ParquetHandler as _, ParquetReadOptions,
+    };
 
     fn make_handler() -> PlanBasedParquetHandler {
         PlanBasedParquetHandler::new(
@@ -106,6 +122,46 @@ mod tests {
             Arc::new(Int64Array::from(vec![1, 2, 3])) as Arc<dyn Array>,
         )])
         .unwrap()
+    }
+
+    #[rstest]
+    fn exact_read_uses_fallback_or_returns_unsupported(#[values(false, true)] with_fallback: bool) {
+        let dir = tempdir().unwrap();
+        let (file, schema) =
+            make_test_parquet_file(&dir.path().join("data.parquet"), &single_column_batch());
+        let handler = PlanBasedParquetHandler::new(
+            Arc::new(SyncPlanExecutor::default()),
+            with_fallback.then(|| SyncEngine::new().parquet_handler()),
+        );
+        let options = ParquetReadOptions::default()
+            .with_row_filter(Arc::new(col!("value").gt(lit(1i64))))
+            .with_result_offset(1)
+            .with_result_limit(1);
+        let result = handler.read_parquet_file_with_options(&file, schema, options);
+        if !with_fallback {
+            let error = result.err().unwrap();
+            assert!(matches!(
+                error.without_backtrace(),
+                KernelError::Unsupported(_)
+            ));
+            return;
+        }
+        let values: Vec<_> = result
+            .unwrap()
+            .flat_map(|batch| {
+                let batch: RecordBatch = ArrowEngineData::try_from_engine_data(batch.unwrap())
+                    .unwrap()
+                    .into();
+                batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .values()
+                    .to_vec()
+            })
+            .collect();
+        assert_eq!(values, vec![3]);
     }
 
     #[test]

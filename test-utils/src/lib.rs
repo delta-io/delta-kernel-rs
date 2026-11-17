@@ -242,8 +242,8 @@ use delta_kernel::transaction::{
 use delta_kernel::{
     CancellationToken, CancellationTokenRef, CancelledFuture, Engine, EngineData,
     FileDataReadResultIterator, FileMeta, FileSize, FilteredEngineData, JsonHandler, KernelError,
-    KernelResult, KernelResultIterator, LogPath, ParquetFooter, ParquetHandler, PredicateRef,
-    Result, Snapshot, try_parse_uri,
+    KernelResult, KernelResultIterator, LogPath, ParquetFooter, ParquetHandler, ParquetReadOptions,
+    PredicateRef, Result, Snapshot, try_parse_uri,
 };
 // Re-export `delta_kernel_default_engine` so kernel's integration tests can access it without
 // taking a direct dev-dep on the new crate (which would create a cycle via this crate).
@@ -2011,6 +2011,17 @@ impl ParquetHandler for CapturingParquetHandler {
             predicate,
             cancellation_token,
         )
+    }
+
+    fn read_parquet_file_with_options(
+        &self,
+        file: &FileMeta,
+        read_schema: SchemaRef,
+        options: ParquetReadOptions,
+    ) -> KernelResult<FileDataReadResultIterator> {
+        capture_first_token(&self.seen, &options.cancellation_token().cloned());
+        self.inner
+            .read_parquet_file_with_options(file, read_schema, options)
     }
 
     fn write_parquet_file(

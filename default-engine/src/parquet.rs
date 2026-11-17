@@ -14,6 +14,7 @@ use delta_kernel::engine::arrow_utils::{
     RowIndexBuilder, fixup_parquet_read, ordering_needs_row_indexes, parquet_read_plan,
     validate_file_values_for_write,
 };
+use delta_kernel::engine::parquet_read::ParquetReadPlan;
 use delta_kernel::engine::parquet_row_group_skipping::ParquetRowGroupSkipping;
 use delta_kernel::engine::{data_file_writer_options, reader_options, writer_options};
 use delta_kernel::expressions::ColumnName;
@@ -34,7 +35,7 @@ use delta_kernel::transaction::BoundWriteContext;
 use delta_kernel::{
     CancellationTokenRef, EngineData, FileDataReadResultIterator, FileMeta, FileSize,
     FoldWithOption as _, KernelError, KernelResult, KernelResultIterator, ParquetFooter,
-    ParquetHandler, PredicateRef,
+    ParquetHandler, ParquetReadOptions, PredicateRef,
 };
 use futures::stream::{self, BoxStream};
 use futures::{StreamExt, TryStreamExt};
@@ -267,12 +268,18 @@ impl<E: TaskExecutor> DefaultParquetHandler<E> {
     }
 }
 
+#[derive(Clone)]
+enum ParquetReadMode {
+    Conservative(Option<PredicateRef>),
+    Exact(ParquetReadOptions),
+}
+
 /// Internal async implementation of read_parquet_files
 async fn read_parquet_files_impl(
     store: Arc<DynObjectStore>,
     files: Vec<FileMeta>,
     physical_schema: SchemaRef,
-    predicate: Option<PredicateRef>,
+    mode: ParquetReadMode,
     buffer_size: usize,
     batch_size: usize,
 ) -> KernelResult<BoxStream<'static, KernelResult<Box<dyn EngineData>>>> {
@@ -294,7 +301,7 @@ async fn read_parquet_files_impl(
         let file_opener = Box::new(PresignedUrlOpener::new(
             batch_size,
             physical_schema.clone(),
-            predicate,
+            mode,
         ));
         let stream = FileStream::new(files, arrow_schema, file_opener)?.map_ok(
             |record_batch| -> Box<dyn EngineData> { Box::new(ArrowEngineData::new(record_batch)) },
@@ -306,8 +313,8 @@ async fn read_parquet_files_impl(
     let file_futures = files.into_iter().map(move |file| {
         let store = store.clone();
         let schema = physical_schema.clone();
-        let predicate = predicate.clone();
-        async move { open_parquet_file(store, schema, predicate, None, batch_size, file).await }
+        let mode = mode.clone();
+        async move { open_parquet_file(store, schema, mode, batch_size, file).await }
     });
     // create a stream from that iterator which buffers up to `buffer_size` futures at a time
     let result_stream = stream::iter(file_futures)
@@ -341,8 +348,31 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
             self.store.clone(),
             files.to_vec(),
             physical_schema,
-            predicate,
+            ParquetReadMode::Conservative(predicate),
             self.buffer_size.get(),
+            self.batch_size.get(),
+        );
+        super::stream_future_to_cancellable_iter(
+            self.task_executor.clone(),
+            future,
+            cancellation_token,
+        )
+    }
+
+    fn read_parquet_file_with_options(
+        &self,
+        file: &FileMeta,
+        read_schema: SchemaRef,
+        options: ParquetReadOptions,
+    ) -> KernelResult<FileDataReadResultIterator> {
+        options.validate(&read_schema)?;
+        let cancellation_token = options.cancellation_token().cloned();
+        let future = read_parquet_files_impl(
+            self.store.clone(),
+            vec![file.clone()],
+            read_schema,
+            ParquetReadMode::Exact(options),
+            1,
             self.batch_size.get(),
         );
         super::stream_future_to_cancellable_iter(
@@ -453,8 +483,7 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
 async fn open_parquet_file(
     store: Arc<DynObjectStore>,
     table_schema: SchemaRef,
-    predicate: Option<PredicateRef>,
-    limit: Option<usize>,
+    mode: ParquetReadMode,
     batch_size: usize,
     file_meta: FileMeta,
 ) -> KernelResult<BoxStream<'static, KernelResult<RecordBatch>>> {
@@ -489,6 +518,20 @@ async fn open_parquet_file(
     };
 
     let metadata = ArrowReaderMetadata::load_async(&mut reader, reader_options()).await?;
+    let predicate = match mode {
+        ParquetReadMode::Exact(options) => {
+            let plan = ParquetReadPlan::new(metadata, table_schema, options, file_location)?;
+            let (builder, finish) = plan.configure(|metadata| {
+                ParquetRecordBatchStreamBuilder::new_with_metadata(reader, metadata)
+                    .with_batch_size(batch_size)
+            });
+            let stream = builder.build()?;
+            return Ok(stream
+                .map(move |batch| finish(batch?).map(Into::into))
+                .boxed());
+        }
+        ParquetReadMode::Conservative(predicate) => predicate,
+    };
     let (requested_ordering, mask) = parquet_read_plan(&table_schema, &metadata)?;
 
     let mut row_indexes = ordering_needs_row_indexes(&requested_ordering)
@@ -499,17 +542,20 @@ async fn open_parquet_file(
         .fold_with(predicate, |builder, predicate| {
             builder.with_row_group_filter(predicate.as_ref(), row_indexes.as_mut())
         })
-        .fold_with(limit, ParquetRecordBatchStreamBuilder::with_limit)
         .with_batch_size(batch_size);
 
     let mut row_indexes = row_indexes.map(|rb| rb.build()).transpose()?;
     let stream = builder.build()?;
 
     let stream = stream.map(move |rbr| {
+        let batch = rbr?;
+        let indexes = row_indexes
+            .as_mut()
+            .map(|rows| rows.take(batch.num_rows()).collect());
         fixup_parquet_read(
-            rbr?,
+            batch,
             &requested_ordering,
-            row_indexes.as_mut(),
+            indexes,
             Some(&file_location),
             Some(&table_schema),
         )
@@ -521,23 +567,17 @@ async fn open_parquet_file(
 /// Implements [`FileOpener`] for a opening a parquet file from a presigned URL
 struct PresignedUrlOpener {
     batch_size: usize,
-    predicate: Option<PredicateRef>,
-    limit: Option<usize>,
+    mode: ParquetReadMode,
     table_schema: SchemaRef,
     client: reqwest::Client,
 }
 
 impl PresignedUrlOpener {
-    pub(crate) fn new(
-        batch_size: usize,
-        schema: SchemaRef,
-        predicate: Option<PredicateRef>,
-    ) -> Self {
+    pub(crate) fn new(batch_size: usize, schema: SchemaRef, mode: ParquetReadMode) -> Self {
         Self {
             batch_size,
             table_schema: schema,
-            predicate,
-            limit: None,
+            mode,
             client: reqwest::Client::new(),
         }
     }
@@ -551,8 +591,7 @@ impl FileOpener for PresignedUrlOpener {
     ) -> KernelResult<FileOpenFuture> {
         let batch_size = self.batch_size;
         let table_schema = self.table_schema.clone();
-        let predicate = self.predicate.clone();
-        let limit = self.limit;
+        let mode = self.mode.clone();
         let client = self.client.clone(); // uses Arc internally according to reqwest docs
         let file_location = file_meta.location.to_string();
 
@@ -560,6 +599,21 @@ impl FileOpener for PresignedUrlOpener {
             // fetch the file from the interweb
             let reader = client.get(&file_location).send().await?.bytes().await?;
             let metadata = ArrowReaderMetadata::load(&reader, reader_options())?;
+            let predicate = match mode {
+                ParquetReadMode::Exact(options) => {
+                    let plan =
+                        ParquetReadPlan::new(metadata, table_schema, options, file_location)?;
+                    let (builder, finish) = plan.configure(|metadata| {
+                        ParquetRecordBatchReaderBuilder::new_with_metadata(reader, metadata)
+                            .with_batch_size(batch_size)
+                    });
+                    let reader = builder.build()?;
+                    return Ok(stream::iter(reader)
+                        .map(move |batch| finish(batch?).map(Into::into))
+                        .boxed());
+                }
+                ParquetReadMode::Conservative(predicate) => predicate,
+            };
             let (requested_ordering, mask) = parquet_read_plan(&table_schema, &metadata)?;
 
             let mut row_indexes = ordering_needs_row_indexes(&requested_ordering)
@@ -570,17 +624,20 @@ impl FileOpener for PresignedUrlOpener {
                 .fold_with(predicate, |builder, predicate| {
                     builder.with_row_group_filter(predicate.as_ref(), row_indexes.as_mut())
                 })
-                .fold_with(limit, ParquetRecordBatchReaderBuilder::with_limit)
                 .with_batch_size(batch_size)
                 .build()?;
 
             let mut row_indexes = row_indexes.map(|rb| rb.build()).transpose()?;
             let stream = futures::stream::iter(reader);
             let stream = stream.map(move |rbr| {
+                let batch = rbr?;
+                let indexes = row_indexes
+                    .as_mut()
+                    .map(|rows| rows.take(batch.num_rows()).collect());
                 fixup_parquet_read(
-                    rbr?,
+                    batch,
                     &requested_ordering,
-                    row_indexes.as_mut(),
+                    indexes,
                     Some(&file_location),
                     Some(&table_schema),
                 )
@@ -635,7 +692,7 @@ mod tests {
         test_parquet_handler_write_always_overwrites,
         test_parquet_handler_write_omits_arrow_schema,
     };
-    use test_utils::record_batch_to_bytes;
+    use test_utils::{record_batch_to_bytes, record_batch_to_bytes_with_props};
     use url::Url;
     use wiremock::matchers::{method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -643,6 +700,122 @@ mod tests {
     use super::*;
     use crate::DEFAULT_BATCH_SIZE;
     use crate::executor::tokio::TokioBackgroundExecutor;
+
+    async fn parquet_test_source(
+        bytes: Vec<u8>,
+        presigned: bool,
+    ) -> (Arc<InMemory>, FileMeta, Option<MockServer>) {
+        let size = bytes.len() as u64;
+        let store = Arc::new(InMemory::new());
+        let (location, server) = if presigned {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/data.parquet"))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(bytes))
+                .mount(&server)
+                .await;
+            let location = Url::parse(&format!(
+                "{}/data.parquet?X-Amz-Signature=test",
+                server.uri()
+            ))
+            .unwrap();
+            (location, Some(server))
+        } else {
+            store
+                .put(&Path::from("data.parquet"), bytes.into())
+                .await
+                .unwrap();
+            (Url::parse("memory:///data.parquet").unwrap(), None)
+        };
+        (store, FileMeta::new(location, 0, size), server)
+    }
+
+    #[rstest::rstest]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn exact_read_public_handler_and_metering(#[values(false, true)] presigned: bool) {
+        let batch = RecordBatch::try_from_iter(vec![
+            (
+                "x",
+                Arc::new(Int32Array::from_iter_values(0..9)) as Arc<dyn Array>,
+            ),
+            (
+                "payload",
+                Arc::new(StringArray::from_iter_values(
+                    (0..9).map(|i| format!("row-{i}")),
+                )) as Arc<dyn Array>,
+            ),
+        ])
+        .unwrap();
+        let properties = delta_kernel::parquet::file::properties::WriterProperties::builder()
+            .set_max_row_group_row_count(Some(3))
+            .build();
+        let bytes = record_batch_to_bytes_with_props(&batch, properties);
+        let (store, file, _server) = parquet_test_source(bytes, presigned).await;
+        let handler = delta_kernel::metrics::MeteredParquetHandler::new(Arc::new(
+            DefaultParquetHandler::new(store, Arc::new(TokioBackgroundExecutor::new()))
+                .with_batch_size(NonZero::new(1).unwrap()),
+        ));
+        let schema = Arc::new(
+            schema_ref! { nullable "x": INTEGER, nullable "payload": STRING }
+                .add_metadata_column(
+                    "position",
+                    delta_kernel::schema::MetadataColumnSpec::RowIndex,
+                )
+                .unwrap(),
+        );
+        let options = ParquetReadOptions::default()
+            .with_output_schema(schema.project(&["position", "payload"]).unwrap())
+            .with_row_selection(
+                delta_kernel::FileRowSelection::from_ranges(std::iter::once(1..9)).unwrap(),
+            )
+            .with_row_filter(Arc::new(
+                delta_kernel::expressions::col!("x").gt(delta_kernel::expressions::lit(2i32)),
+            ))
+            .with_result_offset(1)
+            .with_result_limit(2);
+        let batches = handler
+            .read_parquet_file_with_options(&file, schema, options)
+            .unwrap();
+        let batches: Vec<RecordBatch> = batches.map(into_record_batch).try_collect().unwrap();
+        let positions: Vec<i64> = batches
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .values()
+                    .iter()
+                    .copied()
+            })
+            .collect();
+        assert_eq!(positions, vec![4, 5]);
+        assert_eq!(
+            batches[0]
+                .column(1)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap()
+                .value(0),
+            "row-4"
+        );
+    }
+
+    #[test]
+    fn exact_read_cancellation_precedes_io() {
+        let handler = DefaultParquetHandler::new(
+            Arc::new(InMemory::new()),
+            Arc::new(TokioBackgroundExecutor::new()),
+        );
+        let options = ParquetReadOptions::default()
+            .with_cancellation_token(Arc::new(test_utils::TestCancellationToken::cancelled()));
+        let file = FileMeta::new(Url::parse("memory:///missing.parquet").unwrap(), 0, 0);
+        assert!(
+            matches!(handler.read_parquet_file_with_options(&file, schema_ref! {}, options),
+            Err(error) if matches!(error.without_backtrace(), KernelError::Cancelled))
+        );
+    }
 
     fn long_schema(name: &str) -> StructType {
         schema! { nullable (name): LONG }
@@ -757,8 +930,7 @@ mod tests {
         let stream = open_parquet_file(
             store,
             Arc::new(physical_schema.try_into_kernel().unwrap()),
-            None,
-            None,
+            ParquetReadMode::Conservative(None),
             DEFAULT_BATCH_SIZE,
             file_meta,
         )
@@ -841,8 +1013,7 @@ mod tests {
         let stream = open_parquet_file(
             counting_store.clone(),
             physical_schema,
-            None,
-            None,
+            ParquetReadMode::Conservative(None),
             DEFAULT_BATCH_SIZE,
             file_meta,
         )

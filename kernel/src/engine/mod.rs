@@ -101,6 +101,8 @@ pub(crate) mod arrow_get_data;
 pub mod ensure_data_types;
 #[cfg(all(feature = "default-engine-base", not(feature = "internal-api")))]
 pub(crate) mod ensure_data_types;
+#[cfg(all(feature = "arrow-expression", feature = "default-engine-base"))]
+pub mod parquet_read;
 #[cfg(feature = "default-engine-base")]
 // module is always pub; trait inside is gated by #[internal_api]
 pub mod parquet_row_group_skipping;

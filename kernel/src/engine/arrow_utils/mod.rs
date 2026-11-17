@@ -18,14 +18,14 @@ use self::file_type_validation::validate_file_values_for_read;
 use crate::arrow::array::cast::AsArray;
 use crate::arrow::array::{
     Array as ArrowArray, ArrayRef as ArrowArrayRef, GenericListArray, GenericListViewArray,
-    MapArray, OffsetSizeTrait, PrimitiveArray, RecordBatch, RecordBatchOptions, StringArray,
+    Int64Array, MapArray, OffsetSizeTrait, RecordBatch, RecordBatchOptions, StringArray,
     StructArray, make_array, new_null_array,
 };
 use crate::arrow::buffer::NullBuffer;
 use crate::arrow::compute::{CastOptions, cast_with_options};
 use crate::arrow::datatypes::{
     DataType as ArrowDataType, Field as ArrowField, FieldRef as ArrowFieldRef,
-    Fields as ArrowFields, Int64Type, Schema as ArrowSchema, SchemaRef as ArrowSchemaRef,
+    Fields as ArrowFields, Schema as ArrowSchema, SchemaRef as ArrowSchemaRef,
 };
 use crate::arrow::json::writer::{LineDelimited, NullableEncoder, make_encoder};
 use crate::arrow::json::{Encoder, EncoderFactory, EncoderOptions, ReaderBuilder, WriterBuilder};
@@ -213,7 +213,7 @@ impl RowIndexBuilder {
 /// Applies post-processing to data read from parquet files. This includes `reorder_struct_array` to
 /// ensure schema compatibility, as well as `fix_nested_null_masks` to ensure that leaf columns have
 /// accurate null masks that row visitors rely on for correctness.
-/// `row_indexes` are passed through to `reorder_struct_array`.
+/// `row_indexes` are passed through to `reorder_struct_array` and must match the batch row count.
 /// `file_location` is used to populate file metadata columns if requested.
 ///
 /// If `target_schema` is provided, rewrites the batch's schema wrappers to match the kernel
@@ -248,7 +248,7 @@ impl RowIndexBuilder {
 pub(crate) fn fixup_parquet_read(
     batch: RecordBatch,
     requested_ordering: &[ReorderIndex],
-    row_indexes: Option<&mut FlattenedRangeIterator<i64>>,
+    row_indexes: Option<Int64Array>,
     file_location: Option<&str>,
     target_schema: Option<&SchemaRef>,
 ) -> KernelResult<ArrowEngineData> {
@@ -964,7 +964,7 @@ fn new_missing_array(field: &ArrowField, num_rows: usize) -> Arc<dyn ArrowArray>
 pub(crate) fn reorder_struct_array(
     input_data: StructArray,
     requested_ordering: &[ReorderIndex],
-    mut row_indexes: Option<&mut FlattenedRangeIterator<i64>>,
+    row_indexes: Option<Int64Array>,
     file_location: Option<&str>,
 ) -> KernelResult<StructArray> {
     trace!("Reordering {input_data:?} with ordering: {requested_ordering:?}");
@@ -1077,21 +1077,19 @@ pub(crate) fn reorder_struct_array(
                     final_fields_cols[reorder_index.index] = Some((field.clone(), array));
                 }
                 ReorderIndexTransform::RowIndex(field) => {
-                    let Some(ref mut row_index_iter) = row_indexes else {
+                    let Some(row_index_array) = &row_indexes else {
                         return Err(KernelError::generic(
-                            "Row index column requested but row index iterator not provided",
+                            "Row index column requested but row index array not provided",
                         ));
                     };
-                    let row_index_array: PrimitiveArray<Int64Type> =
-                        row_index_iter.take(num_rows).collect();
                     require!(
                         row_index_array.len() == num_rows,
                         KernelError::internal_error(
-                            "Row index iterator exhausted before reaching the end of the file"
+                            "Row index array length does not match the batch row count"
                         )
                     );
                     final_fields_cols[reorder_index.index] =
-                        Some((Arc::clone(field), Arc::new(row_index_array)));
+                        Some((Arc::clone(field), Arc::new(row_index_array.clone())));
                 }
                 ReorderIndexTransform::FilePath(field) => {
                     let Some(file_path) = file_location else {
@@ -1744,7 +1742,7 @@ mod tests {
     use crate::arrow::buffer::{OffsetBuffer, ScalarBuffer};
     use crate::arrow::datatypes::{
         DataType as ArrowDataType, Field as ArrowField, Fields as ArrowFields, Int32Type,
-        Schema as ArrowSchema, SchemaRef as ArrowSchemaRef,
+        Int64Type, Schema as ArrowSchema, SchemaRef as ArrowSchemaRef,
     };
     use crate::engine::arrow_conversion::TryIntoArrow;
     use crate::engine::arrow_data::ArrowEngineData;
@@ -2718,7 +2716,7 @@ mod tests {
         let result = reorder_struct_array(arry, &reorder, None, None);
         assert_result_error_with_message(
             result,
-            "Row index column requested but row index iterator not provided",
+            "Row index column requested but row index array not provided",
         );
     }
 
@@ -2734,11 +2732,9 @@ mod tests {
             ),
         ];
 
-        // Create a mock row index iterator
-        #[allow(clippy::single_range_in_vec_init)]
-        let mut row_indexes = vec![(0..4)].into_iter().flatten();
+        let row_indexes: Int64Array = (0..4).collect();
 
-        let ordered = reorder_struct_array(arry, &reorder, Some(&mut row_indexes), None).unwrap();
+        let ordered = reorder_struct_array(arry, &reorder, Some(row_indexes), None).unwrap();
         assert_eq!(ordered.column_names(), vec!["b", "row_idx"]);
 
         // Verify the row index column contains the expected values

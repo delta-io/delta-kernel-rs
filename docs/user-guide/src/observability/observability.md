@@ -190,7 +190,7 @@ storage call may serve multiple higher-level operations.
 | `StorageReadCompleted` | `duration`, `num_files`, `bytes_read` | A storage read call. `bytes_read` is the total on-disk size. |
 | `StorageCopyCompleted` | `duration` | A storage copy/rename call. |
 | `JsonReadCompleted` | `num_files`, `bytes_read` | One `JsonHandler::read_json_files` call completed. `bytes_read` is the sum of on-disk file sizes. |
-| `ParquetReadCompleted` | `num_files`, `bytes_read` | One `ParquetHandler::read_parquet_files` call completed. `bytes_read` is the sum of on-disk file sizes. |
+| `ParquetReadCompleted` | `num_files`, `bytes_read` | One Parquet data read completed, including exact reads. `bytes_read` is the sum of on-disk file sizes. |
 | `CrcReadSuccess` | `duration`, `bytes_read` | One CRC file read and parsed successfully. `bytes_read` is the raw byte count from storage. |
 | `CrcReadFailure` | none | A CRC file read or parse failed. Non-cancellation failures allow log replay. |
 

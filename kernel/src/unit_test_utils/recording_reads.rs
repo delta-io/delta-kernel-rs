@@ -12,7 +12,7 @@ use crate::engine::sync::SyncEngine;
 use crate::{
     CancellationTokenRef, Engine, EngineData, FileDataReadResultIterator, FileMeta, FileSize,
     FileSlice, FilteredEngineData, JsonHandler, KernelError, KernelResult, KernelResultIterator,
-    ParquetFooter, ParquetHandler, PredicateRef, SchemaRef, StorageHandler,
+    ParquetFooter, ParquetHandler, ParquetReadOptions, PredicateRef, SchemaRef, StorageHandler,
 };
 
 /// Read boundary observed by the recording handlers.
@@ -208,6 +208,18 @@ impl JsonHandler for RecordingReads {
 }
 
 impl ParquetHandler for RecordingReads {
+    fn read_parquet_file_with_options(
+        &self,
+        file: &FileMeta,
+        read_schema: SchemaRef,
+        options: ParquetReadOptions,
+    ) -> KernelResult<FileDataReadResultIterator> {
+        self.record(Read::Parquet, &options.cancellation_token().cloned())?;
+        self.inner
+            .parquet_handler()
+            .read_parquet_file_with_options(file, read_schema, options)
+    }
+
     plain_reads! {
         /// Records an unscoped Parquet read.
         fn read_parquet_files, read_parquet_files_with_cancellation(
