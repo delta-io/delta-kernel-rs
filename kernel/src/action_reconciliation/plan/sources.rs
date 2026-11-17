@@ -90,12 +90,13 @@ pub(crate) fn commit_arm(
     log_segment: &LogSegment,
     base_version: Option<Version>,
     schema: SchemaRef,
+    use_compactions: bool,
 ) -> KernelResult<PlanBuilder> {
     let commit_files = match base_version {
         Some(version) => log_segment
             .segment_after_version(version)
-            .commit_cover_version_tagged_scan_files()?,
-        None => log_segment.commit_cover_version_tagged_scan_files()?,
+            .commit_cover_version_tagged_scan_files(use_compactions)?,
+        None => log_segment.commit_cover_version_tagged_scan_files(use_compactions)?,
     };
     PlanBuilder::scan_json(commit_files, &[VERSION], schema)
 }
@@ -275,12 +276,16 @@ mod tests {
             .flatten();
 
         // When: selected checkpoint actions are planned from the same resolved shape.
-        let plan = MetadataPlanner::new(snapshot.log_segment(), actions)
-            .with_stats(StatsOptions::json_only())
-            .with_checkpoint_shape(checkpoint_shape)
-            .checkpoint_actions()?
-            .project_patch(|patch| patch.drop(ACTION_KEY))?
-            .build()?;
+        let plan = MetadataPlanner::new(
+            snapshot.log_segment(),
+            actions,
+            !snapshot.has_adaptive_metadata(),
+        )
+        .with_stats(StatsOptions::json_only())
+        .with_checkpoint_shape(checkpoint_shape)
+        .checkpoint_actions()?
+        .project_patch(|patch| patch.drop(ACTION_KEY))?
+        .build()?;
         // Then: file-action reads always use a complete static sidecar list.
         assert!(
             plan.nodes

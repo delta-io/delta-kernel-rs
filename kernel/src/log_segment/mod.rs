@@ -982,7 +982,7 @@ impl LogSegment {
             .collect()
     }
 
-    /// Reads scan actions, using log compactions only in builds without AMT.
+    /// Reads scan actions, using log compactions when `use_compactions` is true.
     ///
     /// This returns an iterator of
     /// [`ActionsBatch`]s which includes EngineData of actions + a boolean flag indicating whether
@@ -1021,6 +1021,7 @@ impl LogSegment {
         meta_predicate: Option<PredicateRef>,
         stats_schema: Option<&StructType>,
         partition_schema: Option<&StructType>,
+        use_compactions: bool,
     ) -> KernelResult<ActionsWithCheckpointInfo<Box<dyn KernelResultIterator<ActionsBatch>>>> {
         // Combine the action-presence predicate with the caller's skipping predicate so readers
         // can omit checkpoint data that cannot contain a relevant action.
@@ -1030,7 +1031,8 @@ impl LogSegment {
 
         // `replay` expects commit files to be sorted in descending order, so the return value here
         // is correct
-        let commit_stream = self.read_scan_commit_actions(engine, commit_read_schema)?;
+        let commit_stream =
+            self.read_scan_commit_actions(engine, commit_read_schema, use_compactions)?;
 
         let checkpoint_result = self.create_checkpoint_stream(
             engine,
@@ -1201,13 +1203,14 @@ impl LogSegment {
         Self::read_commit_files(engine, &files, schema)
     }
 
-    /// Reads scan commits newest first, using log compactions only in builds without AMT.
+    /// Reads scan commits newest first, using log compactions when `use_compactions` is true.
     pub(crate) fn read_scan_commit_actions(
         &self,
         engine: &dyn Engine,
         schema: SchemaRef,
+        use_compactions: bool,
     ) -> KernelResult<impl KernelResultIterator<ActionsBatch> + use<>> {
-        let files = if cfg!(feature = "adaptive-metadata-in-dev") {
+        let files = if !use_compactions {
             self.original_commit_paths(None, self.end_version)
                 .into_iter()
                 .map(|path| path.location.clone())
@@ -1333,10 +1336,10 @@ impl LogSegment {
             .collect()
     }
 
-    /// Selects scan commits, using log compactions only in builds without AMT.
+    /// Selects scan commits, using log compactions when `use_compactions` is true.
     #[cfg(feature = "declarative-plans")]
-    fn scan_commit_paths(&self) -> Vec<&ParsedLogPath> {
-        if cfg!(feature = "adaptive-metadata-in-dev") {
+    fn scan_commit_paths(&self, use_compactions: bool) -> Vec<&ParsedLogPath> {
+        if !use_compactions {
             self.original_commit_paths(None, self.end_version)
         } else {
             self.find_commit_cover_paths(None)
@@ -1373,8 +1376,11 @@ impl LogSegment {
 
     /// Returns scan commit files tagged with file-constant `version`.
     #[cfg(feature = "declarative-plans")]
-    pub(crate) fn commit_cover_version_tagged_scan_files(&self) -> KernelResult<Vec<ScanFile>> {
-        Self::version_tagged_scan_files(self.scan_commit_paths())
+    pub(crate) fn commit_cover_version_tagged_scan_files(
+        &self,
+        use_compactions: bool,
+    ) -> KernelResult<Vec<ScanFile>> {
+        Self::version_tagged_scan_files(self.scan_commit_paths(use_compactions))
     }
 
     /// Returns the checkpoint parts tagged with file-constant `version`, paired with the single

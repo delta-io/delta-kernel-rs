@@ -39,7 +39,7 @@ use url::Url;
 #[cfg(feature = "declarative-plans")]
 #[rstest]
 #[tokio::test(flavor = "multi_thread")]
-async fn snapshot_replay_uses_originals_and_scan_compaction_depends_on_amt(
+async fn snapshot_replay_uses_originals_and_non_amt_scans_use_compactions(
     #[values(false, true)] use_plan: bool,
     #[values(false, true)] checkpoint: bool,
     #[values(false, true)] crc: bool,
@@ -91,21 +91,17 @@ async fn snapshot_replay_uses_originals_and_scan_compaction_depends_on_amt(
                 })?;
             }
             assert_eq!(files.len(), version as usize);
-            assert_eq!(
+            assert!(
                 reads
                     .requested_paths()
                     .iter()
-                    .any(|path| path.path().ends_with(".compacted.json")),
-                !cfg!(feature = "adaptive-metadata-in-dev"),
+                    .any(|path| path.path().ends_with(".compacted.json"))
             );
             if use_plan {
                 let plan = scan
                     .declarative_metadata_scan_plan(engine.as_ref())?
                     .unwrap();
-                assert_eq!(
-                    plan_uses_compaction(&plan),
-                    !cfg!(feature = "adaptive-metadata-in-dev")
-                );
+                assert!(plan_uses_compaction(&plan));
                 let batches = SyncPlanExecutor::new(Some(table.store().clone()))
                     .execute_op(Operation::QueryPlan(plan))?
                     .into_data()?;
@@ -212,10 +208,7 @@ async fn partial_compaction_preserves_suppression(
     assert!(!reads.requested_paths().contains(&path));
     reads.clear();
     assert!(read_scan(&compacted.scan_builder().build()?, engine.clone())?.is_empty());
-    assert_eq!(
-        reads.successful_paths().contains(&path),
-        !cfg!(feature = "adaptive-metadata-in-dev")
-    );
+    assert!(reads.successful_paths().contains(&path));
     Ok(())
 }
 
@@ -297,10 +290,7 @@ async fn compaction_reads_match_commits(
         });
         let successful_reads = reads.successful_paths();
         let requested_reads = reads.requested_paths();
-        assert_eq!(
-            paths.iter().any(|p| successful_reads.contains(p)),
-            eligible && !cfg!(feature = "adaptive-metadata-in-dev"),
-        );
+        assert_eq!(paths.iter().any(|p| successful_reads.contains(p)), eligible,);
         for (path, &(start, end)) in paths.iter().zip(&ranges) {
             if end > baseline.version() || (checkpoint && baseline.version() >= 2 && start <= 2) {
                 assert!(
@@ -359,12 +349,11 @@ async fn checkpoint_from_compacted_log_preserves_rows() -> Result<(), Box<dyn st
     let compacted = Snapshot::builder_for(table.table_root()).build(engine.as_ref())?;
     let expected = scan_results(compacted.clone(), engine.clone())?;
     compacted.checkpoint(engine.as_ref(), None)?;
-    assert_eq!(
+    assert!(
         reads
             .successful_paths()
             .iter()
-            .any(|p| p.path().ends_with(".compacted.json")),
-        !cfg!(feature = "adaptive-metadata-in-dev"),
+            .any(|p| p.path().ends_with(".compacted.json"))
     );
     let reloaded = Snapshot::builder_for(table.table_root()).build(engine.as_ref())?;
     assert_eq!(scan_results(reloaded, engine.clone())?, expected);
@@ -372,8 +361,7 @@ async fn checkpoint_from_compacted_log_preserves_rows() -> Result<(), Box<dyn st
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn malformed_compaction_only_affects_scans_without_amt()
--> Result<(), Box<dyn std::error::Error>> {
+async fn malformed_compaction_only_affects_scans() -> Result<(), Box<dyn std::error::Error>> {
     let table = TestTableBuilder::new()
         .with_log_state(LogState::with_latest_version(3))
         .build()?;
@@ -393,10 +381,7 @@ async fn malformed_compaction_only_affects_scans_without_amt()
             .any(|path| path.path().ends_with(".compacted.json"))
     );
     let scan = snapshot.scan_builder().build()?;
-    assert_eq!(
-        read_scan(&scan, engine).is_err(),
-        !cfg!(feature = "adaptive-metadata-in-dev")
-    );
+    assert!(read_scan(&scan, engine).is_err());
     Ok(())
 }
 
@@ -470,10 +455,7 @@ async fn checkpoint_hint_behavior_with_compaction(
         assert_eq!(snapshot.version(), baseline.version());
         assert_eq!(scan_results(snapshot, engine.clone())?, expected);
         if let Some(path) = compaction {
-            assert_eq!(
-                reads.successful_paths().contains(&path),
-                !cfg!(feature = "adaptive-metadata-in-dev")
-            );
+            assert!(reads.successful_paths().contains(&path));
         }
     }
     Ok(())
@@ -586,10 +568,7 @@ async fn compaction_without_adds_preserves_state(
         );
         assert!(!reads.requested_paths().contains(&path));
     } else {
-        assert_eq!(
-            reads.successful_paths().contains(&path),
-            !cfg!(feature = "adaptive-metadata-in-dev")
-        );
+        assert!(reads.successful_paths().contains(&path));
     }
     Ok(())
 }
@@ -625,10 +604,7 @@ async fn compaction_preserves_nested_variant_data() -> Result<(), Box<dyn std::e
         scan_results_with_predicates(fresh, engine.clone(), predicates)?,
         expected
     );
-    assert_eq!(
-        reads.successful_paths().contains(&path),
-        !cfg!(feature = "adaptive-metadata-in-dev")
-    );
+    assert!(reads.successful_paths().contains(&path));
     Ok(())
 }
 
@@ -649,10 +625,7 @@ async fn existing_compaction_fixture_matches_original_commits(
     let actual = scan_results_with_predicates(compacted.clone(), engine.clone(), vec![None])?;
     assert!(!actual[0].files.is_empty());
     let paths = reads.successful_paths();
-    assert_eq!(
-        paths.iter().any(|p| p.path().ends_with(".compacted.json")),
-        !cfg!(feature = "adaptive-metadata-in-dev")
-    );
+    assert!(paths.iter().any(|p| p.path().ends_with(".compacted.json")));
 
     let log_root = Url::parse(&table_root)?.join("_delta_log/")?;
     let prefix = Path::from_url_path(log_root.path())?;
@@ -774,10 +747,7 @@ async fn compaction_preserves_schema_changes(
         assert_eq!(snapshot.schema(), latest.schema());
         assert_eq!(scan_results(snapshot, engine.clone())?, expected);
     }
-    assert_eq!(
-        reads.successful_paths().contains(&path),
-        !cfg!(feature = "adaptive-metadata-in-dev")
-    );
+    assert!(reads.successful_paths().contains(&path));
     Ok(())
 }
 
@@ -841,16 +811,13 @@ async fn compaction_preserves_protocol_upgrades(
             scan_results(latest.clone(), engine.clone())?
         );
     }
-    assert_eq!(
-        reads.successful_paths().contains(&path),
-        !cfg!(feature = "adaptive-metadata-in-dev")
-    );
+    assert!(reads.successful_paths().contains(&path));
     Ok(())
 }
 
 #[rstest]
 #[tokio::test(flavor = "multi_thread")]
-async fn parallel_metadata_compaction_depends_on_amt(
+async fn parallel_metadata_uses_compaction_for_non_amt_tables(
     #[values(false, true)] checkpoint: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let table = TestTableBuilder::new()
@@ -889,12 +856,11 @@ async fn parallel_metadata_compaction_depends_on_amt(
     actual.sort();
     assert_eq!(actual.len(), 6);
     assert_eq!(actual, expected);
-    assert_eq!(
+    assert!(
         reads
             .successful_paths()
             .iter()
-            .any(|p| p.path().ends_with(".compacted.json")),
-        !cfg!(feature = "adaptive-metadata-in-dev"),
+            .any(|p| p.path().ends_with(".compacted.json"))
     );
     Ok(())
 }

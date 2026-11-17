@@ -1329,8 +1329,8 @@ impl Snapshot {
         Ok(self.read_ict_and_last_manifest_commit(engine)?.1)
     }
 
-    #[cfg(feature = "adaptive-metadata-in-dev")]
-    fn has_adaptive_metadata(&self) -> bool {
+    /// Whether the snapshot's table has adaptive metadata enabled.
+    pub(crate) fn has_adaptive_metadata(&self) -> bool {
         self.table_configuration()
             .is_feature_enabled(&TableFeature::AdaptiveMetadataPreview)
     }

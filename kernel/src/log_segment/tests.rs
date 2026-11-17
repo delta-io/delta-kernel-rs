@@ -238,6 +238,7 @@ fn collect_projected_adds(
             None,
             None,
             None,
+            true,
         )?
         .actions;
     collect_materialized_adds(actions)
