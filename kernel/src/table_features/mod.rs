@@ -388,10 +388,7 @@ static CHECKPOINT_PROTECTION_INFO: FeatureInfo = FeatureInfo {
     feature_type: FeatureType::WriterOnly,
     min_legacy_version: None,
     feature_requirements: &[],
-    #[cfg(feature = "checkpoint-protection")]
     kernel_support: KernelSupport::Supported,
-    #[cfg(not(feature = "checkpoint-protection"))]
-    kernel_support: KernelSupport::NotSupported,
     enablement_check: EnablementCheck::AlwaysIfSupported,
 };
 
