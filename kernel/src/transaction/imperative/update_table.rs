@@ -130,8 +130,8 @@ impl Transaction<UpdateTable, Imperative> {
     /// non-negative `baseRowId` and `defaultRowCommitVersion` in `fileConstantValues`.
     ///
     /// On commit, each matched file's add action carries `stats.tightBounds: false`.
-    /// Preserve the original `tightBounds` in the supplied statistics; this method widens only the
-    /// replacement Add's statistics and retains the original statistics in the Remove action.
+    /// Callers should pass the file's original statistics unchanged, including `tightBounds`.
+    /// Only the replacement Add is widened, and the Remove action keeps the original statistics.
     ///
     /// # Arguments
     ///
