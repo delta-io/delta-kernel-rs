@@ -1,6 +1,6 @@
 //! Builder for transactions against an existing table.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::marker::PhantomData;
 
 use delta_kernel_derive::internal_api;
@@ -64,14 +64,17 @@ pub struct UpdateTableBuilderState {
     snapshot: SnapshotRef,
     operation: UpdateTableOperation,
     schema_changes: Option<Vec<SchemaOperation>>,
-    properties_added: HashMap<String, String>,
+    /// Property-add requests in call order. Each inner vec is one
+    /// with_table_properties_added call
+    /// later calls override earlier values for the same canonical key at build.
+    properties_added: Vec<Vec<(String, String)>>,
     domain_metadata_removals: Vec<String>,
     is_blind_append: bool,
 }
 
 impl UpdateTableBuilderState {
     fn has_property_changes(&self) -> bool {
-        !self.properties_added.is_empty()
+        self.properties_added.iter().any(|batch| !batch.is_empty())
     }
 
     fn has_metadata_changes(&self) -> bool {
@@ -90,7 +93,12 @@ impl<MODE: ExecutionMode> std::fmt::Debug for TransactionBuilder<UpdateTable, MO
             )
             .field(
                 "properties_added_count",
-                &self.local_state.properties_added.len(),
+                &self
+                    .local_state
+                    .properties_added
+                    .iter()
+                    .map(Vec::len)
+                    .sum::<usize>(),
             )
             .finish()
     }
@@ -109,7 +117,7 @@ impl TransactionBuilder<UpdateTable> {
                 snapshot,
                 operation,
                 schema_changes: None,
-                properties_added: HashMap::new(),
+                properties_added: Vec::new(),
                 domain_metadata_removals: Vec::new(),
                 is_blind_append: false,
             },
@@ -133,32 +141,30 @@ impl<MODE: ExecutionMode> TransactionBuilder<UpdateTable, MODE> {
     /// Adds or updates table properties in the metadata configuration.
     ///
     /// Values merge into the existing configuration; unrelated properties are preserved. Repeated
-    /// calls merge, and a later value for the same key wins. For `delta.*` keys, matching is
-    /// case-insensitive: a later spelling replaces an earlier one before build-time
-    /// canonicalization. Non-`delta.*` application properties are accepted with their original key
-    /// casing. Recognized config-only `delta.*` keys are rewritten to their canonical form and
-    /// value-validated during [`build`](Self::build).
+    /// calls merge, and a later call's value for the same canonical key wins. Within a single call,
+    /// two case-variant spellings of one `delta.*` key are rejected at [`build`](Self::build).
+    /// Non-`delta.*` application properties are accepted with their original key casing. Recognized
+    /// config-only `delta.*` keys are rewritten to their canonical form and value-validated during
+    /// [`build`](Self::build).
     ///
     /// Feature-enabling `delta.*` properties (for example `delta.enableDeletionVectors`),
     /// `delta.feature.*` signals, CHECK constraints, and unknown `delta.*` keys are rejected.
-    /// Property changes are applied during [`build`](Self::build). Entries that already match the
-    /// current configuration are skipped, so a Metadata action is emitted only when at least one
-    /// added value actually changes.
+    /// Property changes are applied during [`build`](Self::build). For `ALTER TABLE`, requested
+    /// adds always emit Metadata, including when every value already matches the current
+    /// configuration. Data operations skip unchanged values so Metadata is emitted only when at
+    /// least one added value actually changes.
     pub fn with_table_properties_added<I, K, V>(mut self, properties: I) -> Self
     where
         I: IntoIterator<Item = (K, V)>,
         K: Into<String>,
         V: Into<String>,
     {
-        for (key, value) in properties {
-            let key = key.into();
-            let value = value.into();
-            if is_delta_property_key(&key) {
-                self.local_state
-                    .properties_added
-                    .retain(|existing, _| !existing.eq_ignore_ascii_case(&key));
-            }
-            self.local_state.properties_added.insert(key, value);
+        let batch: Vec<(String, String)> = properties
+            .into_iter()
+            .map(|(key, value)| (key.into(), value.into()))
+            .collect();
+        if !batch.is_empty() {
+            self.local_state.properties_added.push(batch);
         }
         self
     }
@@ -342,6 +348,10 @@ impl<MODE: ExecutionMode> TransactionBuilder<UpdateTable, MODE> {
         }
         // Duplicate additions are validated by the shared builder state.
         self.common_state.validate()?;
+        // Property key/value validation does not need the engine; reject before any I/O in build.
+        if self.local_state.has_property_changes() {
+            let _ = validate_and_canonicalize_properties_added(&self.local_state.properties_added)?;
+        }
         Ok(())
     }
 }
@@ -410,25 +420,23 @@ fn try_new_update_table<MODE: ExecutionMode>(
         Some(changes) => apply_schema_changes(effective_table_config, changes)?,
         None => effective_table_config,
     };
-    // Drop adds that already match the current configuration so identical re-sets do not rewrite
-    // Metadata (matches Java Metadata.filterOutUnchangedProperties).
     let properties_added = if properties_added.is_empty() {
-        properties_added
+        HashMap::new()
     } else {
-        let validated = validate_and_canonicalize_properties_added(properties_added)?;
-        effective_table_config
-            .metadata()
-            .filter_out_unchanged_properties(validated)
+        let validated = validate_and_canonicalize_properties_added(&properties_added)?;
+        // ALTER TABLE always keeps requested adds (Spark always rewrites Metadata for SET
+        // TBLPROPERTIES). Data operations drop identical values so Metadata is emitted only when
+        // a value actually changes.
+        if operation == UpdateTableOperation::AlterTable {
+            validated
+        } else {
+            effective_table_config
+                .metadata()
+                .filter_out_unchanged_properties(validated)
+        }
     };
     let has_property_changes = !properties_added.is_empty();
     let should_emit_metadata = has_schema_changes || has_property_changes;
-    // validate() treats any requested property add as a table change. After dropping identical
-    // values, an ALTER TABLE may have nothing left to apply.
-    if operation == UpdateTableOperation::AlterTable && !should_emit_metadata {
-        return Err(KernelError::invalid_transaction_state(
-            "ALTER TABLE requires at least one table change",
-        ));
-    }
     let effective_table_config = if has_property_changes {
         apply_table_properties_added(effective_table_config, properties_added)?
     } else {
@@ -486,7 +494,7 @@ fn apply_schema_changes(
 fn apply_table_properties_added(
     table_config: TableConfiguration,
     properties_added: HashMap<String, String>,
-) -> KernelResult<TableConfiguration> {
+) -> Result<TableConfiguration> {
     let metadata = properties_added
         .into_iter()
         .fold(table_config.metadata().clone(), |metadata, (key, value)| {
@@ -496,12 +504,23 @@ fn apply_table_properties_added(
 }
 
 fn validate_and_canonicalize_properties_added(
-    properties_added: HashMap<String, String>,
+    properties_added: &[Vec<(String, String)>],
 ) -> KernelResult<HashMap<String, String>> {
-    let mut validated = HashMap::with_capacity(properties_added.len());
-    for (key, value) in properties_added {
-        let (canonical_key, value) = validate_and_normalize_property_for_update(key, value)?;
-        validated.insert(canonical_key, value);
+    let mut validated = HashMap::new();
+    for batch in properties_added {
+        let mut seen_delta_keys = HashSet::new();
+        for (key, _) in batch {
+            if is_delta_property_key(key) && !seen_delta_keys.insert(key.to_ascii_lowercase()) {
+                return Err(KernelError::invalid_transaction_state(format!(
+                    "Conflicting spellings of table property '{key}' in the same request"
+                )));
+            }
+        }
+        for (key, value) in batch {
+            let (canonical_key, value) =
+                validate_and_normalize_property_for_update(key.clone(), value.clone())?;
+            validated.insert(canonical_key, value);
+        }
     }
     Ok(validated)
 }
@@ -818,6 +837,16 @@ mod tests {
         "zstd",
         "delta.parquet.compression.codec"
     )]
+    #[case::set_transaction_retention(
+        "delta.setTransactionRetentionDuration",
+        "interval 1 days",
+        "delta.setTransactionRetentionDuration"
+    )]
+    #[case::parquet_format_version(
+        "delta.parquet.format.version",
+        "2.12.0",
+        "delta.parquet.format.version"
+    )]
     fn with_table_properties_added_accepts_allowed_keys(
         #[case] key: &str,
         #[case] value: &str,
@@ -839,7 +868,7 @@ mod tests {
     }
 
     #[test]
-    fn with_table_properties_added_skips_identical_values() -> Result<()> {
+    fn with_table_properties_added_skips_identical_values_on_write() -> Result<()> {
         let engine = Arc::new(SyncEngine::new_with_store(Arc::new(InMemory::new())));
         let snapshot = create_table("memory:///", test_schema_flat(), "test-engine", true)
             .with_table_properties([("app.owner", "kernel"), ("app.team", "delta")])
@@ -858,12 +887,17 @@ mod tests {
             .clone()
             .update_table(UpdateTableOperation::AlterTable, "test-engine", false)
             .with_table_properties_added([("app.owner", "kernel")])
-            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()));
-        assert!(matches!(
-            &alter_unchanged,
-            Err(KernelError::InvalidTransactionState(message))
-            if message == "ALTER TABLE requires at least one table change"
-        ));
+            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
+        assert!(alter_unchanged.should_emit_metadata);
+        assert_eq!(
+            alter_unchanged
+                .effective_table_config
+                .metadata()
+                .configuration()
+                .get("app.owner")
+                .map(String::as_str),
+            Some("kernel")
+        );
 
         let mixed = snapshot
             .update_table(UpdateTableOperation::Write, "test-engine", true)
@@ -878,14 +912,12 @@ mod tests {
     }
 
     #[test]
-    fn with_table_properties_added_case_variants_later_wins() -> Result<()> {
+    fn with_table_properties_added_later_call_wins_case_variants() -> Result<()> {
         let (engine, snapshot, _tempdir) = load_test_table("table-without-dv-small")?;
         let transaction = snapshot
             .update_table(UpdateTableOperation::Write, "test-engine", true)
-            .with_table_properties_added([
-                ("DELTA.checkpointInterval", "1"),
-                ("delta.checkpointInterval", "42"),
-            ])
+            .with_table_properties_added([("DELTA.checkpointInterval", "1")])
+            .with_table_properties_added([("delta.checkpointInterval", "42")])
             .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
 
         let after = transaction
@@ -899,6 +931,27 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn with_table_properties_added_rejects_conflicting_spellings_in_same_request() -> Result<()> {
+        let (engine, snapshot, _tempdir) = load_test_table("table-without-dv-small")?;
+        let error = snapshot
+            .update_table(UpdateTableOperation::Write, "test-engine", true)
+            .with_table_properties_added([
+                ("DELTA.checkpointInterval", "1"),
+                ("delta.checkpointInterval", "42"),
+            ])
+            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))
+            .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("Conflicting spellings of table property"),
+            "error={error}"
+        );
+        Ok(())
+    }
+
     #[rstest]
     #[case::unknown_delta("delta.unknownProperty", "true", "Unknown configuration key")]
     #[case::feature_enablement(
@@ -906,24 +959,7 @@ mod tests {
         "true",
         "Cannot modify the table property"
     )]
-    #[case::append_only("delta.appendOnly", "true", "Cannot modify the table property")]
-    #[case::checkpoint_policy("delta.checkpointPolicy", "v2", "Cannot modify the table property")]
-    #[case::check_constraint(
-        "delta.constraints.positive_id",
-        "id > 0",
-        "Cannot modify the table property"
-    )]
-    #[case::malformed_interval(
-        "delta.checkpointInterval",
-        "not-a-number",
-        "Invalid value 'not-a-number' for table property"
-    )]
-    #[case::malformed_bool(
-        "delta.enableExpiredLogCleanup",
-        "yes",
-        "Invalid value 'yes' for table property"
-    )]
-    fn with_table_properties_added_rejects_unsupported_or_invalid_keys(
+    fn with_table_properties_added_rejects_via_registry(
         #[case] key: &str,
         #[case] value: &str,
         #[case] expected: &str,

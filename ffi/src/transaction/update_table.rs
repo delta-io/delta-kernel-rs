@@ -357,7 +357,7 @@ pub unsafe extern "C" fn update_table_txn_builder_set_nullable(
     unsafe { result.into_extern_result(&engine) }
 }
 
-/// Replaces requested table-property additions with a borrowed string map.
+/// Adds or updates requested table properties from a borrowed string map. Repeated calls merge.
 ///
 /// Copies keys and values before returning a replacement builder. Returns decoding errors here;
 /// property and final-state validation runs at build.

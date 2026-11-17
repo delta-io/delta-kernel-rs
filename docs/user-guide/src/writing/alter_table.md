@@ -140,11 +140,14 @@ operations may combine schema evolution with data-file actions.
 Call `with_table_properties_added` to merge key/value pairs into the table's metadata configuration.
 Ordinary application properties (keys that do not start with `delta.`) are stored with their
 original casing. Recognized config-only `delta.*` keys, such as `delta.checkpointInterval`,
-`delta.logRetentionDuration`, or `delta.parquet.compression.codec`, are matched
-case-insensitively, rewritten to their canonical form, and value-validated.
+`delta.logRetentionDuration`, `delta.setTransactionRetentionDuration`, or
+`delta.parquet.format.version`, are matched case-insensitively, rewritten to their canonical form,
+and value-validated. Repeated calls merge. Two case-variant spellings of one `delta.*` key in the
+same call are rejected.
 
-Feature-enabling properties (for example `delta.enableChangeDataFeed`), unknown `delta.*` keys,
-and CHECK constraints are rejected. Setting properties does not change the protocol.
+Feature-enabling properties (for example `delta.enableChangeDataFeed`), `delta.feature.*` signals,
+unknown `delta.*` keys, and CHECK constraints are rejected. Setting properties does not change the
+protocol. Re-setting a property to its current value still counts as an `ALTER TABLE` change.
 
 ```rust,ignore
 let result = snapshot
