@@ -2671,23 +2671,30 @@ fn test_validate_listed_log_file_in_order_compaction_files() {
 }
 
 #[rstest]
-#[case::before_checkpoint(3, 8, false)]
-#[case::ending_at_checkpoint(3, 10, false)]
-#[case::starting_at_checkpoint(10, 12, false)]
-#[case::spanning_checkpoint(5, 12, false)]
-#[case::after_checkpoint(11, 12, true)]
+#[case::before_checkpoint(Some(10), 3, 8, false)]
+#[case::ending_at_checkpoint(Some(10), 3, 10, false)]
+#[case::starting_at_checkpoint(Some(10), 10, 12, false)]
+#[case::spanning_checkpoint(Some(10), 5, 12, false)]
+#[case::after_checkpoint(Some(10), 11, 12, true)]
+#[case::after_checkpoint_past_end_version(Some(10), 11, 13, false)]
+#[case::no_checkpoint(None, 0, 8, true)]
 fn try_new_keeps_only_compactions_starting_after_checkpoint(
+    #[case] checkpoint: Option<Version>,
     #[case] lo: Version,
     #[case] hi: Version,
     #[case] kept: bool,
 ) {
     let log_root = Url::parse("file:///_delta_log/").unwrap();
+    let first_commit = checkpoint.map_or(0, |cp| cp + 1);
     let log_segment = LogSegment::try_new(
         LogSegmentFiles {
-            checkpoint_parts: vec![create_log_path(
-                "file:///_delta_log/00000000000000000010.checkpoint.parquet",
-            )],
-            ascending_commit_files: (11..=12)
+            checkpoint_parts: checkpoint
+                .map(|cp| {
+                    create_log_path(&format!("file:///_delta_log/{cp:020}.checkpoint.parquet"))
+                })
+                .into_iter()
+                .collect(),
+            ascending_commit_files: (first_commit..=12)
                 .map(|v| create_log_path(&format!("file:///_delta_log/{v:020}.json")))
                 .collect(),
             latest_commit_file: Some(create_log_path(

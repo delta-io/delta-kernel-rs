@@ -1218,7 +1218,7 @@ impl LogSegment {
     /// optimal, but we assume there are rarely overlapping compactions so this is okay. NB: This
     /// returns files is DESCENDING ORDER, as that's what `replay` expects. This function assumes
     /// that all files in `self.ascending_commit_files` and `self.ascending_compaction_files` are in
-    /// range for this log segment. This invariant is maintained by our listing code.
+    /// range for this log segment. [`LogSegment::try_new`] enforces this invariant.
     pub(crate) fn find_commit_cover(&self) -> Vec<FileMeta> {
         self.find_commit_cover_after(None)
     }
@@ -1975,7 +1975,8 @@ impl LogSegment {
     }
 
     /// Retains the files on failure so callers can classify errors using the validated state.
-    /// Commits at or before the checkpoint are filtered out before replay continuity checks.
+    /// Commits and compactions at or before the checkpoint are filtered out; commits are filtered
+    /// before replay continuity checks.
     fn try_new_impl(
         listed_files: &mut LogSegmentFiles,
         log_root: Url,
