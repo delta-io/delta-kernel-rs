@@ -1126,7 +1126,9 @@ impl TryFrom<AggregateBuilder> for Aggregate {
 /// The output for row `i` is `start + SUM(input[0..i])`, or `start` for `i=0`. NULL inputs do not
 /// contribute and produce NULL outputs for their respective rows. Zero-valued inputs are valid but
 /// produce duplicate outputs (because they do not increase the value of the sum). Input rows are
-/// consumed exactly once in any order and output rows can be produced in any order.
+/// consumed exactly once in any order and output rows can be produced in any order. Executors
+/// must fail if `start + SUM(input)` over all non-NULL rows overflows i64, even though that final
+/// total is not emitted.
 ///
 /// # Output schema
 ///
@@ -1136,7 +1138,7 @@ impl TryFrom<AggregateBuilder> for Aggregate {
 /// # Example
 ///
 /// ```text
-/// PrefixSum { input: numRecords, output: offset, schema: { path, numRecords, offset } }
+/// PrefixSum { input: numRecords, output: offset, start: 0, schema: { path, numRecords, offset } }
 /// ```
 ///
 /// One valid output (encounter order):
@@ -1175,7 +1177,9 @@ pub struct PrefixSum {
     pub input: ColumnName,
     /// Name of the new top-level LONG column holding exclusive prefixes.
     pub output: String,
-    /// Initial value of the running sum, fixed when the plan is built. Defaults to `0`.
+    /// Initial value of the running sum. [`Self::try_new`] sets it to `0`; use
+    /// [`Self::with_start`] to change it. A start derived from table state (e.g. the row ID
+    /// high-water mark) requires rebuilding the plan when that state changes.
     pub start: i64,
     /// Input schema with [`Self::output`] appended.
     pub schema: SchemaRef,

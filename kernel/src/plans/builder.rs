@@ -516,7 +516,8 @@ impl PlanBuilder {
         self.aggregate(aggs(builder))
     }
 
-    /// Append exclusive prefixes of `input` as a new LONG column named `output`. See [`PrefixSum`].
+    /// Append exclusive prefixes of `input` as a new LONG column named `output`, starting at
+    /// `start` (`0` if `None`). See [`PrefixSum`].
     ///
     /// Over an absent input the result stays absent (with the prefix-sum output schema).
     ///
@@ -538,7 +539,7 @@ impl PlanBuilder {
     ///     schema,
     ///     vec![vec!["a".into(), 10i64.into()], vec!["b".into(), 5i64.into()]],
     /// )?
-    /// .prefix_sum(column_name!("numRecords"), "offset")?
+    /// .prefix_sum(column_name!("numRecords"), "offset", None)?
     /// .build()?;
     /// # Ok::<(), delta_kernel::KernelError>(())
     /// ```
@@ -546,22 +547,10 @@ impl PlanBuilder {
         self,
         input: impl Into<ColumnName>,
         output: impl Into<String>,
+        start: Option<i64>,
     ) -> KernelResult<Self> {
-        self.prefix_sum_with_start(input, output, 0)
-    }
-
-    /// Like [`Self::prefix_sum`], with offsets starting at `start` instead of `0`.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error under the same conditions as [`PrefixSum::try_new`].
-    pub fn prefix_sum_with_start(
-        self,
-        input: impl Into<ColumnName>,
-        output: impl Into<String>,
-        start: i64,
-    ) -> KernelResult<Self> {
-        let prefix_sum = PrefixSum::try_new(self.schema(), input, output)?.with_start(start);
+        let prefix_sum = PrefixSum::try_new(self.schema(), input, output)?
+            .with_start(start.unwrap_or_default());
         let schema = Arc::clone(&prefix_sum.schema);
         Ok(self.unary_op_or_absent(schema, prefix_sum))
     }
@@ -1113,7 +1102,7 @@ mod tests {
     })]
     #[case::grouped_aggregate(absent_src().aggregate(
         Aggregate::group_by(part_schema(), [column_name!("id")]).max(column_name!("part"))))]
-    #[case::prefix_sum(absent_over(x_schema()).prefix_sum(column_name!("x"), "offset"))]
+    #[case::prefix_sum(absent_over(x_schema()).prefix_sum(column_name!("x"), "offset", None))]
     #[case::semi_join_absent_build(
         vals(id_schema()).semi_join(absent_src(), [column_name!("id")], [column_name!("id")]))]
     #[case::semi_join_absent_probe(
@@ -1247,12 +1236,7 @@ mod tests {
         #[case] start: Option<i64>,
         #[case] expected_start: i64,
     ) -> KernelResult<()> {
-        let plan = match start {
-            None => vals(x_schema()).prefix_sum(column_name!("x"), "offset")?,
-            Some(start) => {
-                vals(x_schema()).prefix_sum_with_start(column_name!("x"), "offset", start)?
-            }
-        };
+        let plan = vals(x_schema()).prefix_sum(column_name!("x"), "offset", start)?;
         let schema = plan.schema();
         assert_eq!(
             schema
@@ -1582,11 +1566,11 @@ mod tests {
     #[case::aggregate_unknown_group_by("not found in schema",
         || vals(id_schema()).aggregate(Aggregate::group_by(id_schema(), [column_name!("nope")]).max(column_name!("id"))))]
     #[case::prefix_sum_unknown_input("not found in schema",
-        || vals(x_schema()).prefix_sum(column_name!("nope"), "offset"))]
+        || vals(x_schema()).prefix_sum(column_name!("nope"), "offset", None))]
     #[case::prefix_sum_non_long("must be LONG",
-        || vals(id_schema()).prefix_sum(column_name!("id"), "offset"))]
+        || vals(id_schema()).prefix_sum(column_name!("id"), "offset", None))]
     #[case::prefix_sum_duplicate_output("Duplicate field name",
-        || vals(x_schema()).prefix_sum(column_name!("x"), "x"))]
+        || vals(x_schema()).prefix_sum(column_name!("x"), "x", None))]
     // union
     #[case::union_schema_disagrees("differing",
         || PlanBuilder::union_all([vals(id_schema()), vals(x_schema())]))]
