@@ -16,6 +16,7 @@ use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
 use crate::expressions::{ColumnName, Predicate, col};
 use crate::last_checkpoint_hint::{HintAction, LastCheckpointHint, LastCheckpointV2};
 use crate::log_segment::LogSegment;
+use crate::metrics::CheckpointMetrics;
 use crate::path::{LogPathFileType, ParsedLogPath};
 use crate::plans::ir::nodes::FileType;
 use crate::plans::{Operation, PlanBuilder, PlanExecutor};
@@ -62,6 +63,7 @@ impl CheckpointInfo {
             Some(sidecars) => (Cow::Borrowed(sidecars.as_slice()), hint_metadata),
             None => {
                 if file_type == FileType::Parquet && root_schema.is_none() {
+                    CheckpointMetrics::update(|m| m.root_footer_calls += 1);
                     root_schema = Some(read_parquet_footer_schema(exec, root.location.clone())?);
                 }
                 let needs_root_read = root_schema.as_ref().is_none_or(|schema| {
@@ -98,14 +100,20 @@ impl CheckpointInfo {
             });
             match tagged {
                 Some(schema) => Arc::new(schema),
-                None => read_parquet_footer_schema(exec, first.clone())?,
+                None => {
+                    CheckpointMetrics::update(|m| m.sidecar_footer_calls += 1);
+                    read_parquet_footer_schema(exec, first.clone())?
+                }
             }
         } else if file_type == FileType::Json {
             CHECKPOINT_ACTIONS_SCHEMA_V2.clone()
         } else {
             let schema = match root_schema {
                 Some(ref schema) => schema.clone(),
-                None => read_parquet_footer_schema(exec, root.location.clone())?,
+                None => {
+                    CheckpointMetrics::update(|m| m.root_footer_calls += 1);
+                    read_parquet_footer_schema(exec, root.location.clone())?
+                }
             };
             root_schema = Some(schema.clone());
             schema
@@ -234,6 +242,7 @@ fn collect_checkpoint_metadata(
     }?
     .filter(predicate)?
     .build()?;
+    CheckpointMetrics::update(|m| m.metadata_query_calls += 1);
     let data = exec.execute_op(Operation::QueryPlan(plan))?.into_data()?;
     let mut sidecars = SidecarVisitor::default();
     let mut metadata = CheckpointMetadataVisitor::default();
@@ -301,12 +310,14 @@ mod tests {
     use crate::expressions::Predicate;
     use crate::last_checkpoint_hint::{HintAction, LastCheckpointHint, LastCheckpointV2};
     use crate::log_segment_files::LogSegmentFiles;
+    use crate::metrics::{MetricEvent, ScanPlanOutcome};
     use crate::path::LogPathFileType;
     use crate::plans::ir::nodes::Operator;
     use crate::plans::{IoOperation, PlanResult};
     use crate::schema::{schema, schema_ref};
     use crate::unit_test_utils::{
-        copy_test_table, create_log_path, create_log_path_with_size, load_test_table,
+        CapturingReporter, copy_test_table, create_log_path, create_log_path_with_size,
+        install_thread_local_metrics_reporter, load_test_table,
     };
     use crate::{Engine, KernelError, KernelResult, Result, Snapshot};
 
@@ -723,6 +734,8 @@ mod tests {
             .unwrap();
 
         // When: scan planning resolves the checkpoint.
+        let reporter = Arc::new(CapturingReporter::default());
+        let _guard = install_thread_local_metrics_reporter(reporter.clone());
         let plan = scan
             .declarative_metadata_scan_plan(&counted)
             .unwrap()
@@ -754,12 +767,34 @@ mod tests {
             Some(SelectedCheckpointType::V2)
         );
         let info = resolve_checkpoint_info(&snapshot, &counted);
-        scan.declarative_metadata_scan_plan(&counted).unwrap();
+        scan.declarative_metadata_scan_plan(
+            &DelegatingEngine::new(Arc::new(counted)).without_plan_executor(),
+        )
+        .unwrap();
 
         // Then: the cached result is shared and no further discovery is performed.
         assert!(Arc::ptr_eq(&info, cached));
         assert_eq!(exec.io_counts(), (1, root_footer_reads + 1));
         assert_eq!(exec.batches_read.get(), batches);
+        let reports: Vec<_> = reporter
+            .events()
+            .into_iter()
+            .filter_map(|event| match event {
+                MetricEvent::ScanPlanGenerationCompleted(event) => event.checkpoint,
+                _ => None,
+            })
+            .collect();
+        assert_eq!(reports.len(), 2);
+        for (report, hit) in reports.iter().zip([false, true]) {
+            assert!(Arc::ptr_eq(report.info.as_ref().unwrap(), cached));
+            assert_eq!(report.cache_hit, Some(hit));
+            assert_eq!(
+                report.root_footer_calls,
+                if hit { 0 } else { root_footer_reads }
+            );
+            assert_eq!(report.sidecar_footer_calls, u64::from(!hit));
+            assert_eq!(report.metadata_query_calls, u64::from(!hit));
+        }
     }
 
     #[rstest]
@@ -1609,6 +1644,8 @@ mod tests {
         let engine = DelegatingEngine::new(engine).with_plan_executor(exec.clone());
 
         // When: either scan planning or a getter encounters the failure after one sidecar.
+        let reporter = Arc::new(CapturingReporter::default());
+        let _guard = install_thread_local_metrics_reporter(reporter.clone());
         let error = if scan_first {
             snapshot
                 .clone()
@@ -1625,6 +1662,29 @@ mod tests {
         assert!(error.to_string().contains("injected batch failure"));
         assert_eq!(exec.batches_read.get(), 3);
         assert!(snapshot.cached_checkpoint_info().is_none());
+        let reports: Vec<_> = reporter
+            .events()
+            .into_iter()
+            .filter_map(|event| match event {
+                MetricEvent::ScanPlanGenerationCompleted(event) => Some(event),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(reports.len(), usize::from(scan_first));
+        if let Some(event) = reports.first() {
+            assert_eq!(event.outcome, ScanPlanOutcome::Error);
+            let checkpoint = event.checkpoint.as_ref().unwrap();
+            assert_eq!(
+                Some(checkpoint.version),
+                snapshot.log_segment().checkpoint_version
+            );
+            assert_eq!(checkpoint.checkpoint_type, snapshot.known_checkpoint_type());
+            assert!(checkpoint.info.is_none());
+            assert_eq!(checkpoint.cache_hit, Some(false));
+            assert_eq!(checkpoint.metadata_query_calls, 1);
+            assert_eq!(checkpoint.root_footer_calls, 0);
+            assert_eq!(checkpoint.sidecar_footer_calls, 0);
+        }
         // When: a second getter retries discovery.
         let info = resolve_checkpoint_info(&snapshot, &engine);
 

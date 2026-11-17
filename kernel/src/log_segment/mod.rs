@@ -1421,7 +1421,25 @@ impl LogSegment {
         &self,
         use_compactions: bool,
     ) -> KernelResult<Vec<ScanFile>> {
-        Self::version_tagged_scan_files(self.scan_commit_paths(use_compactions))
+        let paths = self.scan_commit_paths(use_compactions);
+        crate::metrics::ScanPlanGenerationCompleted::update(|event| {
+            for path in &paths {
+                event.commit_start_version = Some(path.version);
+                event.commit_end_version =
+                    event.commit_end_version.or(Some(match path.file_type {
+                        LogPathFileType::CompactedCommit { hi } => hi,
+                        _ => path.version,
+                    }));
+                event.commit_total_size_bytes = event
+                    .commit_total_size_bytes
+                    .saturating_add(path.location.size);
+                event.compaction_file_count += u64::from(matches!(
+                    path.file_type,
+                    LogPathFileType::CompactedCommit { .. }
+                ));
+            }
+        });
+        Self::version_tagged_scan_files(paths)
     }
 
     /// Returns the checkpoint parts tagged with file-constant `version`, paired with the single

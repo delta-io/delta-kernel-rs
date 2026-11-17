@@ -9,7 +9,11 @@
 //! - Operation ids are UUIDs in kernel (see [`MetricId`]). Here we report the raw 16 bytes of the
 //!   UUID.
 
+#[cfg(feature = "declarative-plans")]
+mod scan_plan;
 use delta_kernel::metrics as kernel;
+#[cfg(feature = "declarative-plans")]
+pub use scan_plan::*;
 
 use crate::{KernelStringSlice, kernel_string_slice};
 
@@ -695,6 +699,9 @@ pub enum MetricEvent {
     ChecksumWriteSuccess(ChecksumWriteSuccess),
     ChecksumWriteFailure(ChecksumWriteFailure),
     LastCheckpointReadCompleted(LastCheckpointReadCompleted),
+    /// Callback-scoped borrowed scan-plan report.
+    #[cfg(feature = "declarative-plans")]
+    ScanPlanGenerationCompleted(*const ScanPlanGenerationCompleted),
 }
 
 fn duration_ns(duration: std::time::Duration) -> u64 {
@@ -713,12 +720,12 @@ fn correlation_id_slice(correlation_id: Option<&str>) -> KernelStringSlice {
 }
 
 impl MetricEvent {
-    /// Build an FFI event from a kernel event. Note that this event is only valid as long as the
-    /// passed argument is still alive, since we might make `KernelStringSlices` out of some
-    /// fields.
-    pub(crate) fn from_kernel(event: &kernel::MetricEvent) -> Self {
+    /// Invoke the callback while all borrowed FFI records and nested storage are alive.
+    fn with_kernel_event<R>(event: &kernel::MetricEvent, f: impl FnOnce(Self) -> R) -> R {
         use kernel::MetricEvent as K;
-        match event {
+        let event = match event {
+            #[cfg(feature = "declarative-plans")]
+            K::ScanPlanGenerationCompleted(event) => return scan_plan::with_event(event, f),
             K::LogSegmentLoadSuccess(kernel::LogSegmentLoadSuccess {
                 operation_id,
                 correlation_id,
@@ -1014,7 +1021,8 @@ impl MetricEvent {
                 processing_stats: (*processing_stats).into(),
                 output_stats: (*output_stats).into(),
             }),
-        }
+        };
+        f(event)
     }
 }
 
@@ -1023,7 +1031,7 @@ pub(crate) fn with_ffi_event<R>(
     event: &kernel::MetricEvent,
     f: impl FnOnce(MetricEvent) -> R,
 ) -> R {
-    f(MetricEvent::from_kernel(event))
+    MetricEvent::with_kernel_event(event, f)
 }
 
 #[cfg(test)]
