@@ -189,14 +189,12 @@ pub struct ScanLogReplayProcessor {
     stats_options: ScanStatsOptions,
     /// Read-time partition value options.
     partition_values_options: ScanPartitionValuesOptions,
+    /// Source of `partitionValues_parsed` in checkpoint batches. `None` when the scan does not
+    /// emit the column, for either batch type. Commit batches report `Derived` whenever the column
+    /// is emitted, because JSON commits carry only the string map.
+    checkpoint_partition_values_source: Option<ParsedColumnSource>,
     /// Information about checkpoint reading for stats optimization
     checkpoint_info: CheckpointReadInfo,
-    /// Source of `partitionValues_parsed` in commit batches; `None` when the column is not
-    /// emitted.
-    commit_partition_values_source: Option<ParsedColumnSource>,
-    /// Source of `partitionValues_parsed` in checkpoint batches; `None` when the column is not
-    /// emitted.
-    checkpoint_partition_values_source: Option<ParsedColumnSource>,
     /// Metrics related to the scan
     metrics: Arc<ScanMetrics>,
 }
@@ -302,17 +300,14 @@ impl ScanLogReplayProcessor {
                 None
             };
 
-        let (commit_partition_values_source, checkpoint_partition_values_source) =
-            if partition_schema_for_transform.is_some() {
-                let checkpoint_source = if has_partition_values_parsed {
-                    ParsedColumnSource::Checkpoint
-                } else {
-                    ParsedColumnSource::Derived
-                };
-                (Some(ParsedColumnSource::Derived), Some(checkpoint_source))
-            } else {
-                (None, None)
-            };
+        let checkpoint_source = if has_partition_values_parsed {
+            ParsedColumnSource::Checkpoint
+        } else {
+            ParsedColumnSource::Derived
+        };
+        let checkpoint_partition_values_source = partition_schema_for_transform
+            .is_some()
+            .then_some(checkpoint_source);
 
         let output_schema = scan_row_schema_with_parsed_columns(
             stats_schema_for_transform.clone(),
@@ -385,21 +380,10 @@ impl ScanLogReplayProcessor {
             state_info,
             stats_options,
             partition_values_options,
-            checkpoint_info,
-            commit_partition_values_source,
             checkpoint_partition_values_source,
+            checkpoint_info,
             metrics,
         })
-    }
-
-    /// The source of `partitionValues_parsed` in the batch type being processed. One batch never
-    /// mixes sources because each input batch uses a single evaluator.
-    fn partition_values_source(&self, is_log_batch: bool) -> Option<ParsedColumnSource> {
-        if is_log_batch {
-            self.commit_partition_values_source
-        } else {
-            self.checkpoint_partition_values_source
-        }
     }
 
     /// Get a reference to the checkpoint info.
@@ -543,6 +527,16 @@ impl ScanLogReplayProcessor {
             internal_state.stats_options,
             internal_state.partition_values_options,
         )
+    }
+
+    /// The source of `partitionValues_parsed` in the batch type being processed.
+    fn partition_values_source(&self, is_log_batch: bool) -> Option<ParsedColumnSource> {
+        if is_log_batch {
+            self.checkpoint_partition_values_source
+                .map(|_| ParsedColumnSource::Derived)
+        } else {
+            self.checkpoint_partition_values_source
+        }
     }
 
     fn transform_and_data_skip(

@@ -17,7 +17,10 @@ use delta_kernel::object_store::DynObjectStore;
 use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::parquet::arrow::ArrowWriter;
 use delta_kernel::scan::state::ScanFile;
-use delta_kernel::scan::{ParsedColumnSource, PartitionValuesOptions, ScanMetadata};
+use delta_kernel::scan::{
+    AfterSequentialScanMetadata, ParallelScanMetadata, ParsedColumnSource, PartitionValuesOptions,
+    ScanMetadata,
+};
 use delta_kernel::schema::{DataType, StructField, schema_ref};
 use delta_kernel::table_features::{ColumnMappingMode, get_any_level_column_physical_name};
 use delta_kernel::transaction::create_table::create_table;
@@ -265,12 +268,14 @@ fn scan_metadata_partition_values_source_follows_emitted_column(
 }
 
 /// Parallel scan metadata derives `partitionValues_parsed` from the string map even when the
-/// checkpoint has a native column.
+/// checkpoint has a native column, in both the sequential and the parallel phase.
 #[test]
 fn parallel_scan_metadata_reports_derived_partition_values_source() {
     let (engine, snapshot, _table) = test_context!(
-        LogState::with_latest_version(2).with_checkpoint_at([1]),
-        FeatureSet::empty(),
+        LogState::with_latest_version(2)
+            .with_checkpoint_at([1])
+            .with_sidecars_if_enabled(Some(1)),
+        FeatureSet::new().v2_checkpoint(),
         partitioned(),
         TableConfig::new().write_stats_as_struct(true),
         version_latest(),
@@ -280,11 +285,25 @@ fn parallel_scan_metadata_reports_derived_partition_values_source() {
         .with_partition_values(PartitionValuesOptions::with_struct())
         .build()
         .unwrap();
-
-    let sequential = scan.parallel_scan_metadata(Arc::new(engine)).unwrap();
+    let engine = Arc::new(engine);
+    let mut sequential = scan.parallel_scan_metadata(engine.clone()).unwrap();
 
     assert_batch_sources(
-        batch_partition_values_sources(sequential),
+        batch_partition_values_sources(sequential.by_ref()),
+        &[Some(ParsedColumnSource::Derived)],
+    );
+
+    let AfterSequentialScanMetadata::Parallel { state, files } = sequential.finish().unwrap()
+    else {
+        panic!("expected a parallel checkpoint phase");
+    };
+    assert!(!files.is_empty());
+    let parallel = ParallelScanMetadata::try_new(engine, Arc::from(state), files).unwrap();
+
+    // Checked separately so that a `Derived` commit batch from the sequential phase cannot
+    // satisfy the assertion for the sidecar batches.
+    assert_batch_sources(
+        batch_partition_values_sources(parallel),
         &[Some(ParsedColumnSource::Derived)],
     );
 }
@@ -676,6 +695,9 @@ async fn offset_less_timestamp_partition_read_with_json_and_checkpoint(
     paths.sort();
     assert_eq!(paths, ["file1.parquet", "file2.parquet"]);
 
+    // Each file reports the source of the batch it was read from. `file1` is in the checkpoint, so
+    // it reports `Checkpoint` only when the checkpoint has a native column. `file2` exists only in
+    // a JSON commit, which carries just the string map, so it is always `Derived`.
     let checkpoint_source = if write_parsed_partition {
         ParsedColumnSource::Checkpoint
     } else {

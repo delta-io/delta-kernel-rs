@@ -719,10 +719,16 @@ fn test_scan_metadata_from_same_version() {
 }
 
 /// `scan_metadata_from` derives `partitionValues_parsed` from the string map, both for cached
-/// metadata at the same version and for cached metadata plus newer commits.
+/// metadata at the same version and for cached metadata plus newer commits. Cached metadata from
+/// before the checkpoint falls back to a full scan, where the checkpoint batch reports its native
+/// column. Each case returns the same files as a full latest scan.
 #[rstest]
-fn scan_metadata_from_reports_derived_partition_values_source(
-    #[values(1, 2)] existing_version: Version,
+#[case::before_checkpoint(0, &[ParsedColumnSource::Checkpoint, ParsedColumnSource::Derived])]
+#[case::at_checkpoint(1, &[ParsedColumnSource::Derived])]
+#[case::at_latest(2, &[ParsedColumnSource::Derived])]
+fn scan_metadata_from_reports_partition_values_source(
+    #[case] existing_version: Version,
+    #[case] expected_sources: &[ParsedColumnSource],
 ) {
     let table = TestTableBuilder::new()
         .with_log_state(LogState::with_latest_version(2).with_checkpoint_at([1]))
@@ -731,11 +737,10 @@ fn scan_metadata_from_reports_derived_partition_values_source(
         .build()
         .unwrap();
     let engine = SyncEngine::new_with_store(table.store().clone());
-    let snapshot = Snapshot::builder_for(table.table_root())
+    let cached: Vec<_> = Snapshot::builder_for(table.table_root())
+        .at_version(existing_version)
         .build(&engine)
-        .unwrap();
-    let cached: Vec<_> = snapshot
-        .clone()
+        .unwrap()
         .scan_builder()
         .build()
         .unwrap()
@@ -744,7 +749,9 @@ fn scan_metadata_from_reports_derived_partition_values_source(
         .map_ok(selected_scan_files)
         .try_collect()
         .unwrap();
-    let scan = snapshot
+    let scan = Snapshot::builder_for(table.table_root())
+        .build(&engine)
+        .unwrap()
         .scan_builder()
         .with_partition_values(PartitionValuesOptions::with_struct())
         .build()
@@ -756,17 +763,36 @@ fn scan_metadata_from_reports_derived_partition_values_source(
         .try_collect()
         .unwrap();
 
-    let mut selected_batches = 0;
+    let mut actual_sources = Vec::new();
+    let mut actual_paths = Vec::new();
     for batch in batches {
         if batch.scan_files.selection_vector().contains(&true) {
-            selected_batches += 1;
-            assert_eq!(
-                batch.partition_values_source(),
-                Some(ParsedColumnSource::Derived)
-            );
+            let source = batch.partition_values_source().unwrap();
+            if !actual_sources.contains(&source) {
+                actual_sources.push(source);
+            }
         }
+        actual_paths = batch
+            .visit_scan_files(actual_paths, |paths, file| {
+                paths.push(file.path.to_string())
+            })
+            .unwrap();
     }
-    assert!(selected_batches > 0);
+    assert_eq!(
+        actual_sources.len(),
+        expected_sources.len(),
+        "{actual_sources:?}"
+    );
+    assert!(
+        expected_sources.iter().all(|s| actual_sources.contains(s)),
+        "{actual_sources:?}"
+    );
+
+    let mut expected_paths = get_files_for_scan(scan, &engine).unwrap();
+    assert!(!expected_paths.is_empty());
+    actual_paths.sort();
+    expected_paths.sort();
+    assert_eq!(actual_paths, expected_paths);
 }
 
 /// Keeps only the selected rows of a batch, in the form `scan_metadata_from` accepts as cached

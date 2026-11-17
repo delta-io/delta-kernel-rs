@@ -348,11 +348,12 @@ impl StatsOptions {
 /// See [`ScanMetadata::partition_values_source`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ParsedColumnSource {
-    /// Read from the checkpoint's own typed column.
+    /// Read from the checkpoint's own typed column. `TIMESTAMP` values are fixed instants that the
+    /// timezone setting does not change.
     Checkpoint,
     /// Built by Kernel from the raw action field. For partition values this is the
-    /// `add.partitionValues` string map, where [`PartitionValuesOptions::with_timestamp_timezone`]
-    /// applies.
+    /// `add.partitionValues` string map, so offset-less `TIMESTAMP` values depend on
+    /// [`PartitionValuesOptions::with_timestamp_timezone`].
     Derived,
 }
 
@@ -900,6 +901,8 @@ pub struct ScanMetadata {
     /// have corresponding entries that will be `None`.
     pub scan_file_transforms: Vec<Option<ExpressionRef>>,
 
+    /// Set by log replay from the evaluator that produced `scan_files`. See
+    /// [`Self::partition_values_source`].
     partition_values_source: Option<ParsedColumnSource>,
 }
 
@@ -907,18 +910,21 @@ impl ScanMetadata {
     /// Where this batch's `partitionValues_parsed` column came from, or `None` when the batch has
     /// no such column.
     ///
-    /// A connector that caches parsed partition values across queries with different
-    /// [`PartitionValuesOptions::with_timestamp_timezone`] settings can reuse
-    /// [`ParsedColumnSource::Checkpoint`] values, which are fixed instants. Values from
-    /// [`ParsedColumnSource::Derived`] batches depend on the configured timezone for offset-less
-    /// `TIMESTAMP` partition strings.
-    ///
-    /// Kernel emits the column when [`PartitionValuesOptions::with_struct`] is set, and when the
-    /// scan predicate references a partition column. A batch never mixes sources:
-    /// checkpoint batches report `Checkpoint` when the checkpoint has a compatible native
+    /// Kernel emits the column when [`PartitionValuesOptions::with_struct`] is set, or when the
+    /// scan predicate references a partition column and stats are not skipped. A batch never mixes
+    /// sources: checkpoint batches report `Checkpoint` when the checkpoint has a compatible native
     /// `partitionValues_parsed` column, and `Derived` otherwise; commit batches always report
-    /// `Derived`. `Scan::scan_metadata_from` and `parallel_scan_metadata` always report
-    /// `Derived` when they emit the column.
+    /// `Derived`. `parallel_scan_metadata` always reports `Derived`. `Scan::scan_metadata_from`
+    /// reports `Derived` for the cached rows and later commits; when the checkpoint is newer than
+    /// `existing_version`, it falls back to a full scan that follows the rules above.
+    ///
+    /// The emitted field set and its source depend on this scan's configuration: a predicate-only
+    /// scan can report `Checkpoint` for a file that a `with_struct` scan reports as `Derived`.
+    /// [`ParsedColumnSource::Checkpoint`] values are fixed instants;
+    /// [`ParsedColumnSource::Derived`] values of offset-less `TIMESTAMP` strings depend on
+    /// [`PartitionValuesOptions::with_timestamp_timezone`]. A connector that caches values across
+    /// timezones can reuse a cached `Checkpoint` value only when the current batch also reports
+    /// `Checkpoint` for the same emitted field set.
     pub fn partition_values_source(&self) -> Option<ParsedColumnSource> {
         self.partition_values_source
     }
