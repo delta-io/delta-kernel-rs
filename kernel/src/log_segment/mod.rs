@@ -1047,7 +1047,7 @@ impl LogSegment {
     /// not read.
     ///
     /// `table_root` resolves the action's manifest locations. `stats_schema` is the physical stats
-    /// schema the caller replays with. `amt_stats` reads it from the content tree's
+    /// schema the caller replays with. `amt_stats_request` reads it from the content tree's
     /// `content_stats` as `add.stats_parsed` (see [`AmtStatsRequest::for_checkpoint`]); without it,
     /// the tree's adds carry no stats.
     #[cfg(feature = "adaptive-metadata-in-dev")]
@@ -1060,7 +1060,7 @@ impl LogSegment {
         commit_read_schema: SchemaRef,
         checkpoint_read_schema: SchemaRef,
         stats_schema: Option<&StructType>,
-        amt_stats: Option<AmtStatsRequest<'_>>,
+        amt_stats_request: Option<AmtStatsRequest<'_>>,
     ) -> KernelResult<ActionsWithCheckpointInfo<Box<dyn KernelResultIterator<ActionsBatch>>>> {
         let version = Version::try_from(checkpoint.version())
             .ok()
@@ -1100,15 +1100,15 @@ impl LogSegment {
                 .collect::<Vec<_>>(),
             commit_read_schema,
         )?;
-        let has_stats_parsed = amt_stats.is_some();
+        let has_stats_parsed = amt_stats_request.is_some();
         let mut add_fields = Vec::new();
         if needs_json_stats_fallback(&checkpoint_read_schema, stats_schema, has_stats_parsed) {
             add_fields.push(StructField::nullable("stats", DataType::STRING));
         }
-        if let Some(amt_stats) = &amt_stats {
+        if let Some(amt_stats_request) = &amt_stats_request {
             add_fields.push(StructField::nullable(
                 "stats_parsed",
-                amt_stats.schema().clone(),
+                amt_stats_request.schema().clone(),
             ));
         }
         let checkpoint_read_schema =
@@ -1119,7 +1119,7 @@ impl LogSegment {
             checkpoint,
             &LogRoot::new(table_root.clone())?,
             checkpoint_read_schema.clone(),
-            amt_stats.as_ref(),
+            amt_stats_request.as_ref(),
         )
         .map_err(KernelError::generic_err)?;
         Ok(ActionsWithCheckpointInfo {

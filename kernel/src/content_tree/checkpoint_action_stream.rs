@@ -35,14 +35,14 @@ const CHECKPOINT_ACTION_KINDS: &[&str] = &[
 /// itself, and `txn` and `domainMetadata` rows from the action and its sidecars of that kind. A
 /// checkpoint holds reconciled state, so `remove` rows are never produced.
 ///
-/// `stats` asks for the Delta stats to read from the content tree's `content_stats` as
+/// `stats_request` asks for the Delta stats to read from the content tree's `content_stats` as
 /// `add.stats_parsed` and the leaf manifests to skip, or is `None` to read no stats.
 pub(crate) fn read_checkpoint_action(
     engine: &dyn Engine,
     checkpoint: &CheckpointAction,
     log_root: &LogRoot,
     read_schema: SchemaRef,
-    stats: Option<&AmtStatsRequest<'_>>,
+    stats_request: Option<&AmtStatsRequest<'_>>,
 ) -> Result<Box<dyn KernelResultIterator<ActionsBatch>>> {
     if let Some(other) = read_schema
         .fields()
@@ -58,7 +58,13 @@ pub(crate) fn read_checkpoint_action(
     let mut streams = Vec::new();
     for field in read_schema.fields() {
         let stream = match field.name().as_str() {
-            ADD_NAME => read_tree_adds(engine, checkpoint, log_root, read_schema.clone(), stats)?,
+            ADD_NAME => read_tree_adds(
+                engine,
+                checkpoint,
+                log_root,
+                read_schema.clone(),
+                stats_request,
+            )?,
             PROTOCOL_NAME => inline_actions(
                 engine,
                 PROTOCOL_NAME,
@@ -107,7 +113,7 @@ fn read_tree_adds(
     checkpoint: &CheckpointAction,
     log_root: &LogRoot,
     read_schema: SchemaRef,
-    stats: Option<&AmtStatsRequest<'_>>,
+    stats_request: Option<&AmtStatsRequest<'_>>,
 ) -> Result<Box<dyn KernelResultIterator<ActionsBatch>>> {
     // TODO(#3320): the content tree does not yet carry partition values, so its adds would read
     // with empty `partitionValues`.
@@ -125,8 +131,8 @@ fn read_tree_adds(
         // TODO(#2866): inherit each file's commit timestamp instead of a non-zero constant.
         modification_time: 1,
         data_change: false,
-        stats: stats
-            .map(|stats| StatsRead::try_new(checkpoint, stats))
+        stats: stats_request
+            .map(|request| StatsRead::try_new(checkpoint, request))
             .transpose()?,
     };
     let projector = ActionProjector::try_new(engine, ADD_NAME, ctx.add_schema(), read_schema)?;

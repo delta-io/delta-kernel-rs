@@ -1499,7 +1499,7 @@ impl Scan {
                 PhysicalPredicate::Some(predicate, _) => Some(predicate.clone()),
                 PhysicalPredicate::StaticSkipAll | PhysicalPredicate::None => None,
             };
-            let amt_stats = physical_stats_read_schema.and_then(|schema| {
+            let amt_stats_request = physical_stats_read_schema.and_then(|schema| {
                 AmtStatsRequest::for_checkpoint(
                     &checkpoint,
                     self.snapshot.table_configuration().metadata(),
@@ -1518,7 +1518,7 @@ impl Scan {
                     COMMIT_READ_SCHEMA.clone(),
                     checkpoint_schema,
                     physical_stats_read_schema,
-                    amt_stats,
+                    amt_stats_request,
                 );
         }
         // Checkpoints already represent reconciled state, so scans project only Add actions. This
