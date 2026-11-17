@@ -20,7 +20,7 @@ use crate::expressions::{
 };
 use crate::plans::ir::nodes::{
     Agg, Aggregate, DynamicScan, FileType, Filter, Operator, PrefixSum, Project, RelationRef,
-    ScanFile, ScanJson, ScanParquet, SemiJoin, Values, WriteJson,
+    ScanFile, ScanJson, ScanParquet, SemiJoin, Values, WriteJson, WriteParquet,
 };
 use crate::plans::ir::plan::{Plan, PlanNode};
 use crate::plans::{IoOperation, Operation};
@@ -156,6 +156,7 @@ impl From<&Operator> for proto_plan::Operator {
             Operator::Aggregate(n) => Op::Aggregate(n.into()),
             Operator::PrefixSum(n) => Op::PrefixSum(n.into()),
             Operator::WriteJson(n) => Op::WriteJson(n.into()),
+            Operator::WriteParquet(n) => Op::WriteParquet(n.into()),
             Operator::SemiJoin(n) => Op::SemiJoin(n.into()),
             Operator::UnionAll(_) => Op::UnionAll(proto_plan::UnionAllNode {}),
         };
@@ -233,6 +234,25 @@ impl From<&WriteJson> for proto_plan::WriteJsonNode {
             overwrite: node.overwrite,
             ordered: node.ordered,
             schema: Some(node.schema.as_ref().into()),
+        }
+    }
+}
+
+impl From<&WriteParquet> for proto_plan::WriteParquetNode {
+    fn from(node: &WriteParquet) -> Self {
+        Self {
+            file_path: node.file_path.to_string(),
+            overwrite: node.overwrite,
+            ordered: node.ordered,
+            write_schema: Some(node.write_schema.as_ref().into()),
+            stats_agg: node
+                .stats_agg
+                .iter()
+                .map(|stats| proto_plan::write_parquet_node::StatsAgg {
+                    name: stats.name.clone(),
+                    agg: Some((&stats.agg).into()),
+                })
+                .collect(),
         }
     }
 }
@@ -1106,7 +1126,8 @@ mod tests {
     };
     use crate::plans::ir::nodes::{
         Agg, Aggregate, DynamicScan, FileType, Filter, Operator, PrefixSum, Project, RelationRef,
-        ScanFile, ScanJson, ScanParquet, SemiJoin, UnionAll, Values, WriteJson,
+        ScanFile, ScanJson, ScanParquet, SemiJoin, StatsAgg, UnionAll, Values, WriteJson,
+        WriteParquet,
     };
     use crate::plans::ir::plan::{Plan, PlanNode};
     use crate::plans::proto::{
@@ -1468,6 +1489,11 @@ mod tests {
         file_path: Url::parse("memory:///out.json").unwrap(), overwrite: false,
         schema: sample_schema(), ordered: true,
     }), "write_json")]
+    #[case(Operator::WriteParquet(WriteParquet {
+        file_path: Url::parse("memory:///out.parquet").unwrap(), overwrite: false,
+        write_schema: sample_schema(), ordered: true,
+        stats_agg: vec![StatsAgg::new("row_count", Agg::CountStar)],
+    }), "write_parquet")]
     fn from_operator(#[case] op: Operator, #[case] expected: &str) {
         use proto_plan::operator::Op;
         let kind = match proto_plan::Operator::from(&op).op.unwrap() {
@@ -1483,12 +1509,14 @@ mod tests {
             Op::PrefixSum(_) => "prefix_sum",
             Op::UnionAll(_) => "union_all",
             Op::WriteJson(_) => "write_json",
+            Op::WriteParquet(_) => "write_parquet",
         };
         assert_eq!(kind, expected);
     }
 
     #[rstest]
-    fn from_write_json(
+    fn from_write(
+        #[values(FileType::Json, FileType::Parquet)] file_type: FileType,
         #[values(false, true)] overwrite: bool,
         #[values(false, true)] ordered: bool,
     ) {
@@ -1498,11 +1526,44 @@ mod tests {
             ordered,
             schema: sample_schema(),
         };
-        let proto = proto_plan::WriteJsonNode::from(&node);
-        assert_eq!(proto.file_path, node.file_path.as_str());
-        assert_eq!(proto.overwrite, overwrite);
-        assert_eq!(proto.ordered, ordered);
-        assert_eq!(proto.schema, Some(node.schema.as_ref().into()));
+        let (path, actual_overwrite, actual_ordered, schema) = match file_type {
+            FileType::Json => {
+                let proto = proto_plan::WriteJsonNode::from(&node);
+                (
+                    proto.file_path,
+                    proto.overwrite,
+                    proto.ordered,
+                    proto.schema,
+                )
+            }
+            FileType::Parquet => {
+                let stats_agg = vec![StatsAgg::new("row_count", Agg::CountStar)];
+                let proto = proto_plan::WriteParquetNode::from(&WriteParquet {
+                    file_path: node.file_path.clone(),
+                    write_schema: node.schema.clone(),
+                    stats_agg: stats_agg.clone(),
+                    overwrite,
+                    ordered,
+                });
+                assert_eq!(
+                    proto.stats_agg,
+                    vec![proto_plan::write_parquet_node::StatsAgg {
+                        name: "row_count".into(),
+                        agg: Some((&Agg::CountStar).into()),
+                    }]
+                );
+                (
+                    proto.file_path,
+                    proto.overwrite,
+                    proto.ordered,
+                    proto.write_schema,
+                )
+            }
+        };
+        assert_eq!(path, node.file_path.as_str());
+        assert_eq!(actual_overwrite, overwrite);
+        assert_eq!(actual_ordered, ordered);
+        assert_eq!(schema, Some(node.schema.as_ref().into()));
     }
 
     #[test]

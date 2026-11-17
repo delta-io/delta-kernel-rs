@@ -53,9 +53,10 @@ pub enum Operator {
     // === N-ary operators (variable inputs) ===================================
     UnionAll(UnionAll),
     WriteJson(WriteJson),
+    WriteParquet(WriteParquet),
 }
 
-/// Output schema of [`WriteJson`]: the file's fully qualified `location`,
+/// File metadata returned by [`WriteJson`] and [`WriteParquet`]: the fully qualified `location`,
 /// `size` in bytes, and `last_modified` in milliseconds since the Unix epoch.
 pub static FILE_META_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
     not_null "location": STRING,
@@ -116,6 +117,92 @@ pub struct WriteJson {
     /// unspecified. For example, Delta uses this to write the `commitInfo` action before other
     /// actions in a commit.
     pub ordered: bool,
+}
+
+/// Writes all input rows to one Parquet file and returns file metadata and aggregate statistics.
+///
+/// `write_schema` is a prefix of every input schema and supplies file metadata, including Parquet
+/// field IDs. Field names, types (including nested fields), and nullability must match. Trailing
+/// input fields are omitted from the file. The engine chooses compression and row-group sizing.
+/// The output is [`FILE_META_SCHEMA`] followed by the named `stats_agg` results in list order.
+/// Statistics cover all input rows, including fields omitted from `write_schema`, using the
+/// usual [`Agg`] null semantics.
+///
+/// The atomic-create, overwrite, input ordering, nonempty input, and duplicate-destination
+/// contracts of [`WriteJson`] also apply. Executors must reject invalid inputs before creating
+/// or replacing the destination.
+#[derive(Debug, Clone)]
+pub struct WriteParquet {
+    /// Named aggregate statistics over all input rows, in output-column order.
+    pub stats_agg: Vec<StatsAgg>,
+    /// Physical schema of the fields to write, including file metadata.
+    pub write_schema: SchemaRef,
+    /// Fully qualified URL of the destination file.
+    pub file_path: Url,
+    /// Whether an existing destination may be replaced.
+    pub overwrite: bool,
+    /// Whether all rows from each input must precede rows from the next input.
+    pub ordered: bool,
+}
+
+impl WriteParquet {
+    /// Configures a single-file write with no statistics, overwrite, or input ordering.
+    pub fn new(write_schema: SchemaRef, file_path: Url) -> Self {
+        Self {
+            stats_agg: Vec::new(),
+            write_schema,
+            file_path,
+            overwrite: false,
+            ordered: false,
+        }
+    }
+
+    /// Sets the aggregate statistics returned after the file metadata.
+    pub fn with_stats_agg(mut self, stats_agg: impl CollectInto<Vec<StatsAgg>>) -> Self {
+        self.stats_agg = stats_agg.collect_into();
+        self
+    }
+
+    /// Sets whether an existing destination may be replaced.
+    pub fn with_overwrite(mut self, overwrite: bool) -> Self {
+        self.overwrite = overwrite;
+        self
+    }
+
+    /// Sets whether inputs must be written in their declared order.
+    pub fn with_ordered(mut self, ordered: bool) -> Self {
+        self.ordered = ordered;
+        self
+    }
+
+    /// Binds statistics against the full input schema.
+    pub(crate) fn stats_aggregate(&self, input_schema: SchemaRef) -> KernelResult<Aggregate> {
+        self.stats_agg
+            .iter()
+            .fold(Aggregate::ungrouped(input_schema), |builder, stats| {
+                builder.aggregate_as(stats.agg.clone(), &stats.name)
+            })
+            .build()
+    }
+}
+
+/// A named aggregate statistic produced by [`WriteParquet`].
+#[derive(Debug, Clone)]
+pub struct StatsAgg {
+    /// Output column name.
+    pub name: String,
+    /// Aggregate over all input rows.
+    pub agg: Agg,
+}
+
+impl StatsAgg {
+    /// Names an aggregate statistic.
+    pub fn new(name: impl Into<String>, agg: Agg) -> Self {
+        Self {
+            name: name.into(),
+            agg,
+        }
+    }
 }
 
 /// An engine-assigned identifier for a relation retained by a

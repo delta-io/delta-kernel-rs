@@ -32,16 +32,20 @@ use crate::engine::arrow_expression::evaluate_expression::extract_column_ref;
 use crate::engine::arrow_expression::{ArrowEvaluationHandler, extract_column};
 use crate::engine::arrow_utils::{
     coerce_columns_to_schema, fix_record_batch_nested_null_masks, to_json_bytes,
+    validate_file_values_for_write,
 };
+use crate::engine::data_file_writer_options;
 use crate::expressions::{ArrayData, ColumnName, PredicateRef, Scalar};
 use crate::object_store::DynObjectStore;
+use crate::parquet::arrow::arrow_writer::ArrowWriter;
 use crate::plans::ir::nodes::{
     DynamicScan, FILE_META_SCHEMA, FileType, Operator, Project, RelationId, RelationRef, ScanFile,
-    ScanJson, ScanParquet, SemiJoin, Values, WriteJson,
+    ScanJson, ScanParquet, SemiJoin, Values, WriteJson, WriteParquet,
 };
 use crate::plans::ir::plan::{Plan, PlanNode};
 use crate::plans::{IoOperation, Operation, PlanExecutor, PlanResult, ScopedPlanExecutor};
-use crate::schema::{ArrayType, DataType, SchemaRef, StructType};
+use crate::schema::compare::data_types_equal_ordered;
+use crate::schema::{ArrayType, DataType, SchemaRef, StructField, StructType};
 use crate::{
     EvaluationHandler as _, FileMeta, FilteredEngineData, KernelError, KernelResult,
     KernelResultIterator, StorageHandler as _,
@@ -268,6 +272,9 @@ impl SyncPlanExecutor {
             Operator::WriteJson(write) => {
                 self.eval_write_json(&write, inputs.iter().flat_map(|&i| results[i].iter()))
             }
+            Operator::WriteParquet(write) => {
+                self.eval_write_parquet(&write, inputs.iter().flat_map(|&i| results[i].iter()))
+            }
             Operator::SemiJoin(join) => {
                 eval_semi_join(join, &results[inputs[0]], &results[inputs[1]])
             }
@@ -307,18 +314,99 @@ impl SyncPlanExecutor {
                 ArrowEngineData::new(batch.clone()),
             )))
         }))?;
-        put_bytes(self.storage.store(), file_path, bytes.into(), *overwrite)?;
+        Ok(vec![self.write_file_result(
+            file_path,
+            bytes.into(),
+            *overwrite,
+        )?])
+    }
+
+    fn eval_write_parquet<'a>(
+        &self,
+        write: &WriteParquet,
+        input: impl Iterator<Item = &'a RecordBatch>,
+    ) -> KernelResult<Vec<RecordBatch>> {
+        let input = input.cloned().collect::<Vec<_>>();
+        let first = input
+            .iter()
+            .find(|batch| batch.num_rows() != 0)
+            .ok_or_else(|| KernelError::generic("Write requires at least one input row"))?;
+        let (output_schema, stats) = if write.stats_agg.is_empty() {
+            (FILE_META_SCHEMA.clone(), vec![])
+        } else {
+            let input_schema = Arc::new(StructType::try_from_arrow(first.schema().as_ref())?);
+            let aggregate = write.stats_aggregate(input_schema)?;
+            let stats = eval_aggregate(&aggregate, &input)?;
+            let output_schema = Arc::new(StructType::try_new(
+                FILE_META_SCHEMA
+                    .fields()
+                    .chain(aggregate.schema.fields())
+                    .cloned(),
+            )?);
+            (output_schema, stats)
+        };
+        let output_schema = Arc::new(output_schema.as_ref().try_into_arrow()?);
+        let schema = Arc::new(write.write_schema.as_ref().try_into_arrow()?);
+        let mut bytes = Vec::new();
+        let options = data_file_writer_options(&schema, &write.write_schema)?;
+        let mut writer = ArrowWriter::try_new_with_options(&mut bytes, schema.clone(), options)?;
+        // Input order is preserved even when `ordered` is false.
+        for batch in &input {
+            let columns = batch
+                .columns()
+                .get(..schema.fields().len())
+                .ok_or_else(|| KernelError::schema("WriteParquet schema exceeds its input"))?;
+            for (source, field) in batch.schema_ref().fields().iter().zip(schema.fields()) {
+                if source.name() != field.name()
+                    || source.is_nullable() != field.is_nullable()
+                    || (source.data_type() != field.data_type()
+                        && !data_types_equal_ordered(
+                            StructField::try_from_arrow(source.as_ref())?.data_type(),
+                            StructField::try_from_arrow(field.as_ref())?.data_type(),
+                        ))
+                {
+                    return Err(KernelError::schema(format!(
+                        "Write field {} does not match its input prefix",
+                        field.name()
+                    )));
+                }
+            }
+            // Rebind metadata on list/map child fields without changing their value types.
+            let columns = coerce_columns_to_schema(columns.to_vec(), &schema)?;
+            let batch = RecordBatch::try_new(schema.clone(), columns)?;
+            validate_file_values_for_write(&batch, &write.write_schema)?;
+            writer.write(&batch)?;
+        }
+        writer.close()?;
+        let meta = self.write_file_result(&write.file_path, bytes.into(), write.overwrite)?;
+        Ok(vec![RecordBatch::try_new(
+            output_schema,
+            meta.columns()
+                .iter()
+                .chain(stats.iter().flat_map(|batch| batch.columns()))
+                .cloned()
+                .collect(),
+        )?])
+    }
+
+    fn write_file_result(
+        &self,
+        file_path: &url::Url,
+        bytes: Bytes,
+        overwrite: bool,
+    ) -> KernelResult<RecordBatch> {
+        put_bytes(self.storage.store(), file_path, bytes, overwrite)?;
         let meta = self.storage.head(file_path)?;
         let size = i64::try_from(meta.size)
             .map_err(|_| KernelError::generic("Written file size exceeds LONG range"))?;
-        Ok(vec![values_to_record_batch(Values::new(
+        values_to_record_batch(Values::new(
             FILE_META_SCHEMA.clone(),
             vec![vec![
                 meta.location.to_string().into(),
                 size.into(),
                 meta.last_modified.into(),
             ]],
-        ))?])
+        ))
     }
 
     /// Reads `files` as `file_type`, broadcasting each file's [`ScanFile::file_constants`] into the
@@ -719,25 +807,42 @@ mod tests {
 
     use super::*;
     use crate::actions::deletion_vector::DeletionVectorDescriptor;
-    use crate::arrow::array::StructArray;
+    use crate::arrow::array::{AsArray, StructArray};
     use crate::arrow::buffer::{BooleanBuffer, NullBuffer};
-    use crate::arrow::datatypes::{DataType as ArrowDataType, Field};
+    use crate::arrow::datatypes::{DataType as ArrowDataType, Field, Int64Type};
+    #[cfg(feature = "arrow-60")]
+    use crate::engine::file_groups;
     use crate::engine::sync::get_bytes;
     use crate::expressions::{
-        Expression, Predicate, StructData, col, column_name, expr, lit, null_lit,
+        Expression, MapData, Predicate, StructData, col, column_name, expr, lit, null_lit,
     };
     use crate::object_store::memory::InMemory;
-    use crate::plans::PlanBuilder;
-    use crate::plans::ir::nodes::Agg;
-    use crate::schema::{ToSchema as _, schema, schema_ref};
+    use crate::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+    use crate::plans::ir::nodes::{Agg, StatsAgg};
+    use crate::plans::{PlanBuilder, file_meta_from_batches};
+    use crate::schema::{FILE_FIELDS, MapType, MetadataValue, ToSchema as _, schema, schema_ref};
 
     fn write_plan(
         inputs: impl IntoIterator<Item = PlanBuilder>,
         path: &Url,
         overwrite: bool,
         ordered: bool,
+        file_type: FileType,
     ) -> KernelResult<Plan> {
-        PlanBuilder::write_json(inputs, path.clone(), overwrite, ordered)?.build()
+        let inputs = Vec::from_iter(inputs);
+        match file_type {
+            FileType::Json => PlanBuilder::write_json(inputs, path.clone(), overwrite, ordered),
+            FileType::Parquet => {
+                let schema = inputs[0].schema().clone();
+                PlanBuilder::write_parquet(
+                    inputs,
+                    WriteParquet::new(schema, path.clone())
+                        .with_overwrite(overwrite)
+                        .with_ordered(ordered),
+                )
+            }
+        }?
+        .build()
     }
 
     fn write_and_check_output(
@@ -746,42 +851,32 @@ mod tests {
         path: &Url,
         schema: SchemaRef,
         expected_rows: &[&str],
+        file_type: FileType,
     ) -> KernelResult<()> {
-        assert_eq!(
-            plan.schema,
-            schema_ref! {
-                not_null "location": STRING,
-                not_null "size": LONG,
-                not_null "last_modified": LONG,
-            }
-        );
-        let batches = executor
-            .execute_op(Operation::QueryPlan(plan))?
-            .into_data()?
-            .map(|data| data.try_into_record_batch())
-            .collect::<KernelResult<Vec<_>>>()?;
-        let meta = executor.storage.head(path)?;
-        let expected = values_to_record_batch(Values::new(
-            FILE_META_SCHEMA.clone(),
-            vec![vec![
-                path.to_string().into(),
-                (meta.size as i64).into(),
-                meta.last_modified.into(),
-            ]],
-        ))?;
-        assert_eq!(batches, vec![expected]);
+        assert_eq!(plan.schema, *FILE_META_SCHEMA);
+        let meta = file_meta_from_batches(
+            executor
+                .execute_op(Operation::QueryPlan(plan))?
+                .into_data()?,
+        )?;
+        assert_eq!(meta, executor.storage.head(path)?);
         assert_eq!(
             meta.size,
             get_bytes(executor.storage.store(), path)?.len() as u64
         );
-        let scan = PlanBuilder::scan_json([meta], &[], schema)?.build()?;
+        let scan = match file_type {
+            FileType::Json => PlanBuilder::scan_json([meta], &[], schema),
+            FileType::Parquet => PlanBuilder::scan_parquet([meta], &[], schema),
+        }?
+        .build()?;
         let batches = executor.eval_plan(scan, None)?;
         assert_batches_sorted_eq!(expected_rows, &batches);
         Ok(())
     }
 
     #[rstest]
-    fn write_json_writes_all_inputs_and_honors_options(
+    fn write_writes_all_inputs_and_honors_options(
+        #[values(FileType::Json, FileType::Parquet)] file_type: FileType,
         #[values(false, true)] ordered: bool,
         #[values(false, true)] in_memory: bool,
         #[values(false, true)] overwrite: bool,
@@ -833,18 +928,33 @@ mod tests {
                 &path,
                 overwrite,
                 ordered,
+                file_type,
             )?,
             &path,
             schema.clone(),
             expected_rows,
+            file_type,
         )?;
 
         let original_bytes = get_bytes(executor.storage.store(), &path)?;
         if ordered {
-            let mut ids = serde_json::Deserializer::from_slice(&original_bytes)
-                .into_iter::<serde_json::Value>()
-                .map(|row| Ok(row?["id"].as_i64().unwrap()))
-                .collect::<KernelResult<Vec<_>>>()?;
+            let meta = executor.storage.head(&path)?;
+            let scan = match file_type {
+                FileType::Json => PlanBuilder::scan_json([meta], &[], schema.clone()),
+                FileType::Parquet => PlanBuilder::scan_parquet([meta], &[], schema.clone()),
+            }?
+            .build()?;
+            let batches = executor.eval_plan(scan, None)?;
+            let mut ids = batches
+                .iter()
+                .flat_map(|batch| {
+                    batch["id"]
+                        .as_primitive::<Int64Type>()
+                        .values()
+                        .iter()
+                        .copied()
+                })
+                .collect::<Vec<_>>();
             // Each input's rows must stay together; their order within the group is unrestricted.
             assert_eq!(ids.len(), 7);
             ids[..2].sort_unstable();
@@ -853,7 +963,7 @@ mod tests {
             assert_eq!(ids, [6, 7, 2, 3, 4, 6, 7]);
         }
         let replacement = PlanBuilder::values(schema.clone(), vec![vec![9i64.into()]])?;
-        let replacement = write_plan([replacement], &path, overwrite, ordered)?;
+        let replacement = write_plan([replacement], &path, overwrite, ordered, file_type)?;
         if overwrite {
             #[rustfmt::skip]
             let expected_rows = &[
@@ -863,7 +973,14 @@ mod tests {
                 "| 9  |",
                 "+----+",
             ];
-            write_and_check_output(&executor, replacement, &path, schema, expected_rows)?;
+            write_and_check_output(
+                &executor,
+                replacement,
+                &path,
+                schema,
+                expected_rows,
+                file_type,
+            )?;
         } else {
             let result = executor.execute_op(Operation::QueryPlan(replacement));
             assert!(matches!(result, Err(KernelError::FileAlreadyExists(_))));
@@ -873,8 +990,10 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn write_json_rejects_empty_input() -> KernelResult<()> {
+    #[rstest]
+    fn write_rejects_empty_input(
+        #[values(FileType::Json, FileType::Parquet)] file_type: FileType,
+    ) -> KernelResult<()> {
         let executor = SyncPlanExecutor::new(Some(Arc::new(InMemory::new())));
         let input =
             PlanBuilder::values(schema_ref! { not_null "id": LONG }, vec![vec![1i64.into()]])?
@@ -882,7 +1001,7 @@ mod tests {
         let path = Url::parse("memory:///output")?;
         let original = Bytes::from_static(b"original contents");
         executor.storage.put(&path, original.clone(), false)?;
-        let plan = write_plan([input], &path, true, false)?;
+        let plan = write_plan([input], &path, true, false, file_type)?;
         assert!(matches!(
             executor.execute_op(Operation::QueryPlan(plan)),
             Err(KernelError::Generic(message)) if message.contains("at least one input row")
@@ -891,24 +1010,326 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn write_json_rejects_mismatched_batch_without_writing() -> KernelResult<()> {
+    #[rstest]
+    #[case::wrong_type(schema_ref! { not_null "id": STRING }, "bad".into())]
+    #[case::missing_field(schema_ref! { not_null "other": LONG }, 1i64.into())]
+    #[case::wrong_nullability(schema_ref! { nullable "id": LONG }, 1i64.into())]
+    fn write_rejects_mismatched_batch_without_writing(
+        #[case] schema: SchemaRef,
+        #[case] value: Scalar,
+        #[values(FileType::Json, FileType::Parquet)] file_type: FileType,
+        #[values(false, true)] valid_prefix: bool,
+    ) -> KernelResult<()> {
         let executor = SyncPlanExecutor::new(Some(Arc::new(InMemory::new())));
         let path = Url::parse("memory:///output")?;
         let original = Bytes::from_static(b"original contents");
         executor.storage.put(&path, original.clone(), false)?;
-        let input =
-            PlanBuilder::values(schema_ref! { not_null "id": LONG }, vec![vec![1i64.into()]])?;
-        let mut plan = write_plan([input], &path, true, false)?;
-        let Operator::WriteJson(write) = &mut plan.nodes.last_mut().unwrap().op else {
-            panic!("expected WriteJson");
+        let inputs = (0..=usize::from(valid_prefix))
+            .map(|_| {
+                PlanBuilder::values(schema_ref! { not_null "id": LONG }, vec![vec![1i64.into()]])
+            })
+            .collect::<KernelResult<Vec<_>>>()?;
+        let mut plan = write_plan(inputs, &path, true, false, file_type)?;
+        let last_input = *plan.nodes.last().unwrap().inputs.last().unwrap();
+        let Operator::Values(values) = &mut plan.nodes[last_input].op else {
+            panic!("expected Values");
         };
-        write.schema = schema_ref! { not_null "id": STRING };
+        values.schema = schema;
+        values.rows = vec![vec![value]];
         assert!(matches!(
             executor.execute_op(Operation::QueryPlan(plan)),
             Err(KernelError::Schema(_))
         ));
         assert_eq!(get_bytes(executor.storage.store(), &path)?, original);
+        Ok(())
+    }
+
+    #[rstest]
+    fn write_parquet_writes_prefix_and_preserves_struct_stats(
+        #[values(false, true)] with_stats: bool,
+    ) -> KernelResult<()> {
+        let executor = SyncPlanExecutor::new(Some(Arc::new(InMemory::new())));
+        let path = Url::parse("memory:///output.parquet")?;
+        let stats = schema! {
+            (StructField::nullable("numRecords", DataType::LONG)
+                .with_metadata([("parquet.field.id", 2i64)])),
+        };
+        let input_schema = schema_ref! {
+            nullable "amount": LONG,
+            nullable "stats": (stats.clone()),
+            nullable "region": STRING,
+        };
+        let write_schema = schema_ref! {
+            (StructField::nullable("amount", DataType::LONG)
+                .with_metadata([("parquet.field.id", 1i64)])),
+            (StructField::nullable("stats", stats.clone())
+                .with_metadata([("parquet.field.id", 3i64)])),
+        };
+        let rows = PlanBuilder::values(
+            input_schema,
+            vec![
+                vec![
+                    10i64.into(),
+                    StructData::try_new(stats.fields().cloned().collect(), vec![2i64.into()])?
+                        .into(),
+                    "US".into(),
+                ],
+                vec![
+                    Scalar::Null(DataType::LONG),
+                    Scalar::Null(stats.into()),
+                    "FR".into(),
+                ],
+            ],
+        )?;
+        let plan = PlanBuilder::write_parquet(
+            [rows.clone(), rows],
+            WriteParquet::new(write_schema.clone(), path.clone()).with_stats_agg(if with_stats {
+                vec![
+                    StatsAgg::new("count", Agg::CountStar),
+                    StatsAgg::new("amount_count", Agg::count(column_name!("amount"))),
+                    StatsAgg::new("amount_sum", Agg::sum(column_name!("amount"))),
+                    StatsAgg::new("region_count", Agg::count(column_name!("region"))),
+                ]
+            } else {
+                vec![]
+            }),
+        )?
+        .build()?;
+        let output_schema: ArrowSchema = plan.schema.as_ref().try_into_arrow()?;
+        let result = executor.eval_plan(plan, None)?;
+        assert_eq!(result[0].schema().as_ref(), &output_schema);
+        if with_stats {
+            let actual = result[0].project(&[3, 4, 5, 6])?;
+            #[rustfmt::skip]
+            let expected: &[&str] = &[
+                "+-------+--------------+------------+--------------+",
+                "| count | amount_count | amount_sum | region_count |",
+                "+-------+--------------+------------+--------------+",
+                "| 4     | 2            | 20         | 4            |",
+                "+-------+--------------+------------+--------------+",
+            ];
+            assert_batches_sorted_eq!(expected, &[actual]);
+        }
+        let file = executor.storage.head(&path)?;
+        let reader =
+            ParquetRecordBatchReaderBuilder::try_new(get_bytes(executor.storage.store(), &path)?)?;
+        let fields = reader.parquet_schema().root_schema().get_fields();
+        assert_eq!(fields.len(), 2);
+        assert_eq!(fields[0].get_basic_info().id(), 1);
+        assert_eq!(fields[1].get_basic_info().id(), 3);
+        assert_eq!(fields[1].get_fields()[0].get_basic_info().id(), 2);
+        let plan = PlanBuilder::scan_parquet([file], &[], write_schema)?.build()?;
+        let actual = executor.eval_plan(plan, None)?;
+        #[rustfmt::skip]
+        let expected: &[&str] = &[
+            "+--------+-----------------+",
+            "| amount | stats           |",
+            "+--------+-----------------+",
+            "|        |                 |",
+            "|        |                 |",
+            "| 10     | {numRecords: 2} |",
+            "| 10     | {numRecords: 2} |",
+            "+--------+-----------------+",
+        ];
+        assert_batches_sorted_eq!(expected, &actual);
+        Ok(())
+    }
+
+    #[rstest]
+    #[case::unsupported_sum(Agg::sum(column_name!("id")))]
+    #[case::missing_operand(Agg::count(column_name!("missing")))]
+    fn write_parquet_rejects_invalid_statistics_without_writing(
+        #[case] agg: Agg,
+    ) -> KernelResult<()> {
+        let executor = SyncPlanExecutor::new(Some(Arc::new(InMemory::new())));
+        let path = Url::parse("memory:///output")?;
+        let original = Bytes::from_static(b"original contents");
+        executor.storage.put(&path, original.clone(), false)?;
+        let schema = schema_ref! { nullable "id": STRING };
+        let input = PlanBuilder::values(schema.clone(), vec![vec!["x".into()]])?;
+        let mut plan = PlanBuilder::write_parquet(
+            [input],
+            WriteParquet::new(schema, path.clone())
+                .with_overwrite(true)
+                .with_stats_agg([StatsAgg::new("count", Agg::CountStar)]),
+        )?
+        .build()?;
+        let Operator::WriteParquet(write) = &mut plan.nodes.last_mut().unwrap().op else {
+            panic!("expected WriteParquet");
+        };
+        write.stats_agg = vec![StatsAgg::new("count", agg)];
+        assert!(executor.eval_plan(plan, None).is_err());
+        assert_eq!(get_bytes(executor.storage.store(), &path)?, original);
+        Ok(())
+    }
+
+    #[rstest]
+    #[case::valid(Some((Some("data.bin"), 3, Some("CRC32:12345678"))), None)]
+    #[case::null(None, None)]
+    #[case::missing_locator(Some((None, 0, None)), Some("neither `uri` nor `inline` is set"))]
+    #[case::negative_size(Some((Some("data.bin"), -1, None)), Some("`size` is negative"))]
+    #[case::malformed_checksum(
+        Some((Some("data.bin"), 3, Some("MD5:xyz"))),
+        Some("`checksum` digest")
+    )]
+    fn write_parquet_validates_file_values_and_preserves_annotation(
+        #[case] file: Option<(Option<&str>, i64, Option<&str>)>,
+        #[case] problem: Option<&str>,
+    ) -> KernelResult<()> {
+        let executor = SyncPlanExecutor::new(Some(Arc::new(InMemory::new())));
+        let path = Url::parse("memory:///output.parquet")?;
+        let original = Bytes::from_static(b"original contents");
+        executor.storage.put(&path, original.clone(), false)?;
+        let schema = schema_ref! {
+            (StructField::nullable("file", DataType::file_type())
+                .with_metadata([("parquet.field.id", 10i64)])),
+        };
+        let value = match file {
+            None => Scalar::Null(DataType::file_type()),
+            Some((uri, size, checksum)) => StructData::try_new(
+                FILE_FIELDS.fields().cloned().collect(),
+                vec![
+                    uri.map(String::from).into(),
+                    Scalar::Null(DataType::LONG),
+                    size.into(),
+                    Scalar::Null(DataType::STRING),
+                    checksum.map(String::from).into(),
+                    Scalar::Null(DataType::BINARY),
+                ],
+            )?
+            .into(),
+        };
+        let batch = RecordBatch::try_new(
+            Arc::new(schema.as_ref().try_into_arrow()?),
+            vec![value.to_array(1)?],
+        )?;
+        let scoped = executor.get_scoped();
+        let input =
+            PlanBuilder::relation_source(scoped.create_ref("file", schema.clone(), batch)?);
+        let write = PlanBuilder::write_parquet(
+            [input],
+            WriteParquet::new(schema, path.clone()).with_overwrite(true),
+        )?
+        .build()?;
+        let result = scoped.execute_op(Operation::QueryPlan(write));
+        let problem = if cfg!(feature = "arrow-60") {
+            problem
+        } else {
+            Some("requires the `arrow-60` feature")
+        };
+        if let Some(problem) = problem {
+            let error = result.err().expect("FILE write must fail");
+            assert!(error.to_string().contains(problem), "{error}");
+            assert_eq!(get_bytes(executor.storage.store(), &path)?, original);
+            return Ok(());
+        }
+        #[cfg(feature = "arrow-60")]
+        {
+            let file = file_meta_from_batches(result?.into_data()?)?;
+            let reader = ParquetRecordBatchReaderBuilder::try_new(get_bytes(
+                executor.storage.store(),
+                &file.location,
+            )?)?;
+            let groups = file_groups(reader.parquet_schema().root_schema());
+            assert_eq!(groups.len(), 1);
+            assert_eq!(groups[0].path, "file");
+            assert_eq!(groups[0].id, Some(10));
+            assert_eq!(
+                groups[0].sub_field_ids,
+                (11..17).map(Some).collect::<Vec<_>>()
+            );
+        }
+        Ok(())
+    }
+
+    #[rstest]
+    #[case::top_level(|schema| schema)]
+    #[case::struct_field(|schema| schema! { nullable "value": (schema) })]
+    #[case::array_element(|schema| schema! { nullable "value": (ArrayType::new(schema, true)) })]
+    #[case::map_key(|schema| schema! { nullable "value": (MapType::new(schema, DataType::LONG, true)) })]
+    #[case::map_value(|schema| schema! { nullable "value": (MapType::new(DataType::STRING, schema, true)) })]
+    fn write_parquet_rejects_reordered_fields(
+        #[case] wrap: fn(StructType) -> StructType,
+    ) -> KernelResult<()> {
+        let executor = SyncPlanExecutor::new(Some(Arc::new(InMemory::new())));
+        let base = Url::parse("memory:///")?;
+        let source = Arc::new(wrap(schema! { nullable "a": LONG, nullable "b": LONG }));
+        let target = Arc::new(wrap(schema! { nullable "b": LONG, nullable "a": LONG }));
+        let row = source
+            .fields()
+            .map(|field| Scalar::Null(field.data_type().clone()))
+            .collect();
+        let input = PlanBuilder::values(source.clone(), vec![row])?;
+        let write = |schema| {
+            PlanBuilder::write_parquet(
+                [input.clone()],
+                WriteParquet::new(schema, base.join("output.parquet")?),
+            )
+        };
+        assert!(matches!(write(target.clone()), Err(KernelError::Schema(_))));
+        // Plans received by an executor need the same validation as locally built plans.
+        let mut plan = write(source)?.build()?;
+        let Operator::WriteParquet(write) = &mut plan.nodes.last_mut().unwrap().op else {
+            panic!("expected WriteParquet");
+        };
+        write.write_schema = target;
+        assert!(matches!(
+            executor.eval_plan(plan, None),
+            Err(KernelError::Schema(_))
+        ));
+        assert_eq!(executor.storage.list_from(&base)?.count(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn write_parquet_adds_nested_ids() -> KernelResult<()> {
+        let executor = SyncPlanExecutor::new(Some(Arc::new(InMemory::new())));
+        let path = Url::parse("memory:///nested.parquet")?;
+        let element = schema! {
+            (StructField::not_null("number", DataType::LONG).with_metadata([("numeric", 7i64)])),
+        };
+        let array_type = ArrayType::new(element.clone(), true);
+        let map_type = MapType::new(DataType::STRING, array_type.clone(), true);
+        let field = StructField::nullable("items", map_type.clone());
+        let write_field = field.clone().with_metadata([(
+            "delta.columnMapping.nested.ids",
+            MetadataValue::Other(serde_json::json!({
+                "items.key": 1, "items.value": 2, "items.value.element": 3,
+            })),
+        )]);
+        let input_schema = schema_ref! { (field), };
+        let write_schema = schema_ref! { (write_field), };
+        let value = StructData::try_new(element.fields().cloned().collect(), vec![1i64.into()])?;
+        let array = ArrayData::try_new(array_type, [value.into(), Scalar::Null(element.into())])?;
+        let rows = vec![vec![
+            MapData::try_new(map_type, [("x", Scalar::from(array))])?.into(),
+        ]];
+        let input = PlanBuilder::values(input_schema.clone(), rows.clone())?;
+        let plan = PlanBuilder::write_parquet(
+            [input],
+            WriteParquet::new(write_schema.clone(), path.clone()),
+        )?
+        .build()?;
+        let result = executor.execute_op(Operation::QueryPlan(plan))?;
+        let file = file_meta_from_batches(result.into_data()?)?;
+        let reader =
+            ParquetRecordBatchReaderBuilder::try_new(get_bytes(executor.storage.store(), &path)?)?;
+        let fields =
+            reader.parquet_schema().root_schema().get_fields()[0].get_fields()[0].get_fields();
+        assert_eq!(fields[0].get_basic_info().id(), 1);
+        assert_eq!(fields[1].get_basic_info().id(), 2);
+        assert_eq!(
+            fields[1].get_fields()[0].get_fields()[0]
+                .get_basic_info()
+                .id(),
+            3
+        );
+        let actual = PlanBuilder::scan_parquet([file], &[], input_schema.clone())?.build()?;
+        let expected = PlanBuilder::values(input_schema, rows)?.build()?;
+        assert_eq!(
+            executor.eval_plan(actual, None)?,
+            executor.eval_plan(expected, None)?
+        );
         Ok(())
     }
 

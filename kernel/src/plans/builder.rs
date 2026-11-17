@@ -45,11 +45,12 @@ use url::Url;
 use super::ir::nodes::{
     Aggregate, AggregateBuilder, DynamicScan, FILE_META_SCHEMA, FileType, Filter, Operator,
     PrefixSum, Project, RelationRef, ScanFile, ScanJson, ScanParquet, SemiJoin, UnionAll, Values,
-    WriteJson,
+    WriteJson, WriteParquet,
 };
 use super::ir::plan::{Plan, PlanNode};
 use crate::expressions::{ColumnName, Expression, ExpressionRef, PredicateRef, Scalar, StructData};
-use crate::schema::{SchemaRef, ToSchema};
+use crate::schema::compare::data_types_equal_ordered;
+use crate::schema::{SchemaRef, StructType, ToSchema};
 use crate::struct_patch::ProjectionStructPatchBuilder;
 use crate::utils::CollectInto;
 use crate::{KernelError, KernelResult};
@@ -327,6 +328,45 @@ impl PlanBuilder {
             },
             inputs,
         ))
+    }
+
+    /// Writes `inputs` to one Parquet file with the supplied configuration.
+    ///
+    /// The write schema must match the input prefix, but may supply different file metadata.
+    /// Absent inputs are dropped; no remaining inputs is an error. Returns one row of
+    /// [`FILE_META_SCHEMA`] followed by the named statistics, which may reference unwritten input
+    /// fields. Missing operands, inconsistent output types, and duplicate output names are errors.
+    /// See [`WriteParquet`] for the execution contract.
+    pub fn write_parquet(
+        inputs: impl IntoIterator<Item = PlanBuilder>,
+        write: WriteParquet,
+    ) -> KernelResult<Self> {
+        let present = parquet_inputs(inputs, &write.write_schema)?;
+        if present.is_empty() {
+            return Err(KernelError::generic(
+                "WriteParquet requires at least one input row",
+            ));
+        }
+        let stats_schema = write.stats_aggregate(present[0].schema.clone())?.schema;
+        for input in &present[1..] {
+            let rebound = write.stats_aggregate(input.schema.clone())?;
+            if !stats_schema
+                .fields()
+                .zip(rebound.schema.fields())
+                .all(|(left, right)| data_types_equal_ordered(left.data_type(), right.data_type()))
+            {
+                return Err(KernelError::schema(
+                    "WriteParquet statistics must match every input",
+                ));
+            }
+        }
+        let output_schema = Arc::new(StructType::try_new(
+            FILE_META_SCHEMA
+                .fields()
+                .chain(stats_schema.fields())
+                .cloned(),
+        )?);
+        Ok(Self::present(output_schema, write, present))
     }
 
     /// Keep rows where `predicate` holds. Output schema is unchanged. See [`Filter`].
@@ -757,6 +797,38 @@ fn check_columns_resolve<'a>(
     Ok(())
 }
 
+fn parquet_inputs(
+    inputs: impl IntoIterator<Item = PlanBuilder>,
+    write_schema: &SchemaRef,
+) -> KernelResult<Vec<BuilderNodeRef>> {
+    if write_schema.fields().next().is_none() {
+        return Err(KernelError::schema(
+            "WriteParquet requires at least one field",
+        ));
+    }
+    let mut present = Vec::new();
+    for input in inputs {
+        if input.schema().num_fields() < write_schema.num_fields() {
+            return Err(KernelError::schema("WriteParquet schema exceeds its input"));
+        }
+        for (source, field) in input.schema().fields().zip(write_schema.fields()) {
+            if source.name() != field.name()
+                || !data_types_equal_ordered(source.data_type(), field.data_type())
+                || source.is_nullable() != field.is_nullable()
+            {
+                return Err(KernelError::schema(format!(
+                    "WriteParquet field {} must match its input prefix",
+                    field.name()
+                )));
+            }
+        }
+        if let PlanBuilderRoot::Present(node) = input.0 {
+            present.push(node);
+        }
+    }
+    Ok(present)
+}
+
 /// Error unless each of `names` is a top-level, non-metadata field of `schema`. A file-constant is
 /// one scalar broadcast into a top-level field, so nested paths and engine-generated metadata
 /// columns are rejected.
@@ -791,7 +863,7 @@ mod tests {
     use crate::FileMeta;
     use crate::actions::deletion_vector::DeletionVectorDescriptor;
     use crate::expressions::{Expression, Predicate, col, column_name, expr, lit};
-    use crate::plans::ir::nodes::FileType;
+    use crate::plans::ir::nodes::{Agg, FileType, StatsAgg};
     use crate::schema::{
         DataType, MetadataColumnSpec, StructField, StructType, schema, schema_ref,
     };
@@ -1070,9 +1142,17 @@ mod tests {
     #[rstest::rstest]
     #[case::no_inputs(vec![])]
     #[case::absent_inputs(vec![absent_src(), absent_src()])]
-    fn write_json_rejects_empty_inputs(#[case] inputs: Vec<PlanBuilder>) -> KernelResult<()> {
+    fn write_rejects_empty_inputs(
+        #[case] inputs: Vec<PlanBuilder>,
+        #[values(FileType::Json, FileType::Parquet)] file_type: FileType,
+    ) -> KernelResult<()> {
         let path = Url::parse("memory:///output")?;
-        let result = PlanBuilder::write_json(inputs, path, false, false);
+        let result = match file_type {
+            FileType::Json => PlanBuilder::write_json(inputs, path, false, false),
+            FileType::Parquet => {
+                PlanBuilder::write_parquet(inputs, WriteParquet::new(id_schema(), path))
+            }
+        };
         assert!(matches!(result, Err(KernelError::Generic(message))
             if message.contains("at least one input")));
         Ok(())
@@ -1081,10 +1161,46 @@ mod tests {
     #[rstest::rstest]
     #[case::present(vals(x_schema()))]
     #[case::absent(absent_over(x_schema()))]
-    fn write_json_rejects_mismatched_input_schema(#[case] other: PlanBuilder) -> KernelResult<()> {
+    #[case::wrong_type(vals(schema_ref! { nullable "id": LONG }))]
+    #[case::wrong_nullability(vals(schema_ref! { not_null "id": STRING }))]
+    #[case::skipped_field(vals(schema_ref! { nullable "extra": LONG, nullable "id": STRING }))]
+    #[case::absent_skipped_field(absent_over(schema_ref! { nullable "extra": LONG, nullable "id": STRING }))]
+    fn write_rejects_mismatched_input_schema(
+        #[case] other: PlanBuilder,
+        #[values(FileType::Json, FileType::Parquet)] file_type: FileType,
+    ) -> KernelResult<()> {
         let path = Url::parse("memory:///output")?;
-        let result = PlanBuilder::write_json([vals(id_schema()), other], path, false, false);
+        let inputs = [vals(id_schema()), other];
+        let result = match file_type {
+            FileType::Json => PlanBuilder::write_json(inputs, path, false, false),
+            FileType::Parquet => {
+                PlanBuilder::write_parquet(inputs, WriteParquet::new(id_schema(), path))
+            }
+        };
         assert!(matches!(result, Err(KernelError::Schema(_))));
+        Ok(())
+    }
+
+    #[rstest::rstest]
+    #[case::missing_operand(id_schema(), vec![StatsAgg::new("count", Agg::count(column_name!("missing")))])]
+    #[case::duplicate_alias(id_schema(), vec![StatsAgg::new("count", Agg::CountStar); 2])]
+    #[case::file_column_collision(id_schema(), vec![StatsAgg::new("SIZE", Agg::CountStar)])]
+    #[case::later_missing_operand(id_schema(), vec![StatsAgg::new("min", Agg::min(column_name!("n")))])]
+    #[case::later_wrong_type(schema_ref! { nullable "id": STRING, nullable "n": STRING },
+        vec![StatsAgg::new("min", Agg::min(column_name!("n")))])]
+    fn write_parquet_rejects_invalid_statistics(
+        #[case] other: SchemaRef,
+        #[case] stats: Vec<StatsAgg>,
+    ) -> KernelResult<()> {
+        let first = schema_ref! { nullable "id": STRING, nullable "n": LONG };
+        assert!(
+            PlanBuilder::write_parquet(
+                [vals(first), vals(other)],
+                WriteParquet::new(id_schema(), Url::parse("memory:///output")?)
+                    .with_stats_agg(stats),
+            )
+            .is_err()
+        );
         Ok(())
     }
 
