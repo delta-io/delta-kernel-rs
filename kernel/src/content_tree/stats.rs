@@ -19,8 +19,9 @@ use tracing::warn;
 
 use crate::actions::{MAX_VALUES, MIN_VALUES, NULL_COUNT, NUM_RECORDS, TIGHT_BOUNDS};
 use crate::content_tree::{
-    CONTENT_STATS_FIELD_NAME, CONTENT_TYPE, DataContentType, LOWER_BOUND, NAN_VALUE_COUNT,
-    NULL_VALUE_COUNT, RECORD_COUNT, TOTAL_BYTES, UPPER_BOUND, VALUE_COUNT,
+    ADDED_ROWS_COUNT, CONTENT_STATS_FIELD_NAME, CONTENT_TYPE, DELETED_ROWS_COUNT, DataContentType,
+    EXISTING_ROWS_COUNT, LOWER_BOUND, MANIFEST_INFO, MODIFIED_ROWS_COUNT, NAN_VALUE_COUNT,
+    NULL_VALUE_COUNT, RECORD_COUNT, REPLACED_ROWS_COUNT, TOTAL_BYTES, UPPER_BOUND, VALUE_COUNT,
 };
 use crate::expressions::{ColumnName, Expression, ExpressionRef, Predicate as Pred, lit, null_lit};
 use crate::schema::{
@@ -692,7 +693,8 @@ impl<'a> StatsLeafVisitor<'a> for StatsSchemaCollector {
 /// `delta_stats_schema`:
 ///
 /// ```text
-/// numRecords:  long               <- recordCount (data file entries only, else null)
+/// numRecords:  long               <- recordCount (data file entry)
+///                                    manifestInfo.*RowsCount summed (data manifest entry)
 /// nullCount:   {<table nesting>}  <- content_stats.<leaf>.null_value_count
 /// minValues:   {<table nesting>}  <- content_stats.<leaf>.lower_bound
 /// maxValues:   {<table nesting>}  <- content_stats.<leaf>.upper_bound
@@ -808,15 +810,18 @@ fn assemble_parsed_stats_expr(
         let name = field.name().as_str();
         let expr = match name {
             // A manifest entry's `recordCount` counts the entries of the manifest it references,
-            // not rows, so only a data file entry has a Delta `numRecords`.
+            // not rows, so its rows come from `manifestInfo` instead.
             NUM_RECORDS => Expression::case_when(
-                [(
-                    Pred::eq(
-                        Expression::column([CONTENT_TYPE]),
-                        lit(DataContentType::Data as i32),
+                [
+                    (
+                        content_type_is(DataContentType::Data),
+                        Expression::column([RECORD_COUNT]),
                     ),
-                    Expression::column([RECORD_COUNT]),
-                )],
+                    (
+                        content_type_is(DataContentType::DataManifest),
+                        manifest_row_count(),
+                    ),
+                ],
                 null_lit(DataType::LONG),
             ),
             // Wide bounds are still valid for data skipping; readers just can't treat them as
@@ -835,6 +840,25 @@ fn assemble_parsed_stats_expr(
         fields.push(Arc::new(expr));
     }
     Ok(Expression::struct_from(fields))
+}
+
+/// Whether an entry row has `content_type`.
+fn content_type_is(content_type: DataContentType) -> Pred {
+    Pred::eq(Expression::column([CONTENT_TYPE]), lit(content_type as i32))
+}
+
+/// The rows of every entry of the manifest a manifest entry references, live or not.
+///
+/// A manifest deletion vector leaves the entry's aggregate `content_stats` counting the entries it
+/// removes, so counting only live rows could make `nullCount` equal `numRecords` while a live row
+/// is not null. Counting every row keeps `numRecords` at least the rows any aggregate covers.
+fn manifest_row_count() -> Expression {
+    let count = |name| Expression::column([MANIFEST_INFO, name]);
+    count(ADDED_ROWS_COUNT)
+        + count(EXISTING_ROWS_COUNT)
+        + count(MODIFIED_ROWS_COUNT)
+        + count(DELETED_ROWS_COUNT)
+        + count(REPLACED_ROWS_COUNT)
 }
 
 /// Combines a struct's `children` into one struct expression per stat category. `path` locates the
@@ -2239,8 +2263,22 @@ mod tests {
             .clone()
     }
 
+    /// The `manifestInfo` row counts the conversion reads.
+    fn manifest_row_counts_schema() -> StructType {
+        let rows_counts = [
+            ADDED_ROWS_COUNT,
+            EXISTING_ROWS_COUNT,
+            MODIFIED_ROWS_COUNT,
+            DELETED_ROWS_COUNT,
+            REPLACED_ROWS_COUNT,
+        ];
+        StructType::new_unchecked(
+            rows_counts.map(|name| StructField::not_null(name, DataType::LONG)),
+        )
+    }
+
     /// The input schema the conversion reads: `content_stats` read with [`projected_stats_schema`],
-    /// plus the entry's `recordCount` and `contentType` columns.
+    /// plus the entry's `recordCount`, `contentType`, and `manifestInfo` row counts.
     fn parsed_stats_input_schema(table: &StructType, delta: &StructType) -> StructType {
         StructType::new_unchecked([
             StructField::nullable(
@@ -2249,6 +2287,7 @@ mod tests {
             ),
             StructField::nullable(RECORD_COUNT, DataType::LONG),
             StructField::nullable(CONTENT_TYPE, DataType::INTEGER),
+            StructField::nullable(MANIFEST_INFO, manifest_row_counts_schema()),
         ])
     }
 
@@ -2261,7 +2300,7 @@ mod tests {
         expected_stats: Scalar,
     ) {
         assert_parsed_stats_of(
-            DataContentType::Data,
+            None,
             table,
             delta,
             content_stats,
@@ -2270,10 +2309,11 @@ mod tests {
         );
     }
 
-    /// Converts a single input row (`content_stats`, `recordCount`, `contentType`) and asserts the
-    /// produced Delta stats equal `expected_stats`. Uses the real evaluator end to end.
+    /// Converts a single input row and asserts the produced Delta stats equal `expected_stats`.
+    /// The row is a data manifest entry with `manifest_rows_counts` as its `manifestInfo` row
+    /// counts when given, else a data file entry. Uses the real evaluator end to end.
     fn assert_parsed_stats_of(
-        content_type: DataContentType,
+        manifest_rows_counts: Option<[i64; 5]>,
         table: &StructType,
         delta: &StructType,
         content_stats: Scalar,
@@ -2281,6 +2321,19 @@ mod tests {
         expected_stats: Scalar,
     ) {
         let input_schema = parsed_stats_input_schema(table, delta);
+        let (content_type, manifest_info) = match manifest_rows_counts {
+            Some(counts) => (
+                DataContentType::DataManifest,
+                struct_scalar(
+                    &manifest_row_counts_schema(),
+                    counts.map(Scalar::Long).to_vec(),
+                ),
+            ),
+            None => (
+                DataContentType::Data,
+                Scalar::Null(manifest_row_counts_schema().into()),
+            ),
+        };
         let engine = SyncEngine::new();
         let handler = engine.evaluation_handler();
         let input = handler
@@ -2290,6 +2343,7 @@ mod tests {
                     content_stats,
                     Scalar::Long(record_count),
                     Scalar::Integer(content_type as i32),
+                    manifest_info,
                 ]],
             )
             .unwrap();
@@ -2402,9 +2456,10 @@ mod tests {
         assert_parsed_stats(&table, &delta, content_stats, 100, expected);
     }
 
-    /// A manifest entry's `recordCount` counts entries, not rows, so it yields no `numRecords`.
+    /// A manifest entry's `recordCount` counts entries, not rows, so its `numRecords` sums the
+    /// `manifestInfo` row counts of every status, live or not.
     #[test]
-    fn parsed_stats_of_manifest_entry_has_no_record_count() {
+    fn parsed_stats_of_manifest_entry_sums_manifest_row_counts() {
         let table = StructType::new_unchecked([field_with_id("id", DataType::LONG, true, 0)]);
         let delta = StructType::new_unchecked([
             StructField::nullable(NUM_RECORDS, DataType::LONG),
@@ -2423,13 +2478,13 @@ mod tests {
         let expected = struct_scalar(
             &delta,
             vec![
-                Scalar::Null(DataType::LONG),
+                Scalar::Long(15),
                 struct_scalar(&stat_cols(["id"]), vec![Scalar::Long(0)]),
             ],
         );
 
         assert_parsed_stats_of(
-            DataContentType::DataManifest,
+            Some([1, 2, 3, 4, 5]),
             &table,
             &delta,
             content_stats,

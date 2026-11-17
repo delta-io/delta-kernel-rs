@@ -68,7 +68,8 @@ pub(crate) fn added_data_entry(
 }
 
 /// A `DataManifest` entry referencing the leaf manifest at `location` with the given size and
-/// tracking status.
+/// tracking status. Its leaf holds one ADDED entry of 10 rows, the rows [`x_full_stats_value`]
+/// counts.
 pub(crate) fn data_manifest_entry(
     location: &str,
     size: i64,
@@ -79,6 +80,8 @@ pub(crate) fn data_manifest_entry(
     entry.tracking.status = status;
     entry.manifest_info = Some(ManifestInfo {
         format_version: AMT_FORMAT_VERSION,
+        added_files_count: 1,
+        added_rows_count: 10,
         ..Default::default()
     });
     entry

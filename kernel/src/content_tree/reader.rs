@@ -275,9 +275,7 @@ impl StatsRead {
     /// [`Self::expression`], the same conversion that fills `Add.stats_parsed`, and evaluates the
     /// predicate over them with the Delta [`DataSkippingFilter`]. A `DataManifest` entry's stats
     /// aggregate those of the leaf's entries, and the Delta V4 metadata RFC requires an aggregate
-    /// to be null when any entry lacks that stat, so they bound every row of the leaf. The
-    /// conversion emits no `numRecords` for a manifest entry, whose `recordCount` counts
-    /// entries rather than rows, so `IS NOT NULL` never rules a leaf out.
+    /// to be null when any entry lacks that stat, so they bound every row of the leaf.
     ///
     /// A filter that cannot be built is not an error: skipping is an optimization, and the leaf's
     /// files still pass through data skipping during log replay.
@@ -3195,9 +3193,10 @@ mod tests {
     }
 
     /// Whether the leaf filter for `predicate` reads the leaf of a root `DataManifest` entry
-    /// referencing 3 leaf entries, whose stats for its table's only column `c` (of type
-    /// `data_type`) are `stats`: the sub-fields [`projected_stats_schema`] reads for
-    /// [`delta_stats_schema`], in field order. `None` stands for an entry without stats.
+    /// referencing 3 leaf entries, with as many rows as its stats' `value_count`, whose stats for
+    /// its table's only column `c` (of type `data_type`) are `stats`: the sub-fields
+    /// [`projected_stats_schema`] reads for [`delta_stats_schema`], in field order. `None`
+    /// stands for an entry without stats.
     fn leaf_is_read(data_type: DataType, stats: Option<Vec<Scalar>>, predicate: Pred) -> bool {
         let engine = SyncEngine::new();
         let table = StructType::new_unchecked([field_with_id("c", data_type.clone(), true, 1)]);
@@ -3207,6 +3206,9 @@ mod tests {
         let content_stats = stats_read.content_stats.clone().unwrap();
         let mut entry = data_manifest_entry("leaf.parquet", 1, TrackingStatus::Added);
         entry.record_count = 3;
+        if let Some(Scalar::Long(rows)) = stats.as_ref().map(|stats| &stats[2]) {
+            entry.manifest_info.as_mut().unwrap().added_rows_count = *rows;
+        }
         let batch = entry_batch_with_stats(
             &engine,
             &[entry],
@@ -3257,9 +3259,8 @@ mod tests {
     /// The root `DataManifest` entry's `content_stats` aggregate every row of its leaf, so a leaf
     /// is read only when they cannot rule out the predicate. The stats are converted to Delta
     /// stats and evaluated with Delta's data skipping rules, so the conversion's losses show up
-    /// here: a manifest entry has no `numRecords`, so `IS NOT NULL` never skips; a max is treated
-    /// as possibly truncated to milliseconds; and comparisons against a signed zero are decided
-    /// in total order, as for Delta file stats.
+    /// here: a max is treated as possibly truncated to milliseconds, and comparisons against a
+    /// signed zero are decided in total order, as for Delta file stats.
     #[rstest]
     #[case::gt_above_max(
         DataType::LONG,
@@ -3326,7 +3327,7 @@ mod tests {
         DataType::LONG,
         bounds_and_counts(Scalar::Null(DataType::LONG), Scalar::Null(DataType::LONG), 10, 10),
         Pred::is_not_null(col!("c")),
-        true
+        false
     )]
     #[case::is_not_null_null_count_equals_entry_count(
         DataType::LONG,
