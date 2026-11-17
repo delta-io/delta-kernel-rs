@@ -165,12 +165,14 @@ async fn snapshot_schema_nesting_boundary(
 async fn snapshot_schema_without_field_metadata(
     #[case] mapping_mode: Option<&str>,
     #[case] expected_error: Option<&str>,
-    #[values(false, true)] nullable: bool,
+    #[values(None, Some(false), Some(true))] nullable: Option<bool>,
 ) -> delta_kernel::Result<()> {
     let (store, engine, table_url) = engine_store_setup("schema_without_field_metadata", None);
-    let schema = json!({"type": "struct", "fields": [
-        {"name": "value", "type": "long", "nullable": nullable}
-    ]});
+    let mut field = json!({"name": "value", "type": "long"});
+    if let Some(nullable) = nullable {
+        field["nullable"] = nullable.into();
+    }
+    let schema = json!({"type": "struct", "fields": [field]});
     let configuration: HashMap<_, _> = mapping_mode
         .map(|mode| ("delta.columnMapping.mode", mode))
         .into_iter()
@@ -199,7 +201,7 @@ async fn snapshot_schema_without_field_metadata(
         let schema = snapshot.schema();
         let field = schema.field("value").unwrap();
         assert_eq!(field.data_type(), &DataType::LONG);
-        assert_eq!(field.is_nullable(), nullable);
+        assert_eq!(field.is_nullable(), nullable.unwrap_or(true));
         assert!(field.metadata().is_empty());
     }
     Ok(())

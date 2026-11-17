@@ -363,17 +363,17 @@ impl FromStr for MetadataColumnSpec {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize, PartialEq, Clone, Eq)]
+/// A schema field with its data type, nullability, and column annotations.
+#[derive(Debug, Serialize, PartialEq, Clone, Eq)]
 pub struct StructField {
     /// Name of this (possibly nested) column
     pub name: String,
     /// The data type of this field
     #[serde(rename = "type")]
     pub data_type: DataType,
-    /// Denotes whether this Field can be null
+    /// Whether values may be null. Defaults to true when both this key and metadata are omitted.
     pub nullable: bool,
     /// Column annotations, defaulting to an empty map when omitted from JSON.
-    #[serde(default)]
     pub metadata: HashMap<MetadataKey, MetadataValue>,
 }
 
@@ -1738,6 +1738,47 @@ impl ColumnNamesAndTypes {
     pub(crate) fn as_ref(&self) -> (&[ColumnName], &[DataType]) {
         (&self.0, &self.1)
     }
+}
+
+impl<'de> Deserialize<'de> for StructField {
+    fn deserialize<D>(deserializer: D) -> KernelResult<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let field = StructFieldDeHelper::deserialize(deserializer)?;
+        let nullable = match field.nullable {
+            Some(nullable) => nullable,
+            None if field.metadata.is_none() => true,
+            None => return Err(serde::de::Error::missing_field("nullable")),
+        };
+        Ok(Self {
+            name: field.name,
+            data_type: field.data_type,
+            nullable,
+            metadata: field.metadata.unwrap_or_default(),
+        })
+    }
+}
+
+/// Field JSON before applying Spark's coupled omission defaults.
+#[derive(Deserialize)]
+struct StructFieldDeHelper {
+    name: String,
+    #[serde(rename = "type")]
+    data_type: DataType,
+    #[serde(default, deserialize_with = "deserialize_present")]
+    nullable: Option<bool>,
+    #[serde(default, deserialize_with = "deserialize_present")]
+    metadata: Option<HashMap<MetadataKey, MetadataValue>>,
+}
+
+/// Rejects explicit nulls, reserving None for omitted fields.
+fn deserialize_present<'de, D, T>(deserializer: D) -> KernelResult<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    T::deserialize(deserializer).map(Some)
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -3442,17 +3483,27 @@ mod tests {
     }
 
     #[rstest]
+    #[case::non_nullable_without_metadata(Some(false), None)]
+    #[case::nullable_without_metadata(Some(true), None)]
+    #[case::non_nullable_empty_metadata(Some(false), Some("{}"))]
+    #[case::nullable_empty_metadata(Some(true), Some("{}"))]
+    #[case::non_nullable_populated_metadata(Some(false), Some(r#"{"comment":"keep"}"#))]
+    #[case::nullable_populated_metadata(Some(true), Some(r#"{"comment":"keep"}"#))]
+    #[case::both_absent(None, None)]
     fn test_struct_field_metadata_deserialization(
-        #[values(false, true)] nullable: bool,
-        #[values(None, Some("{}"), Some(r#"{"comment":"keep"}"#))] metadata: Option<&str>,
+        #[case] nullable: Option<bool>,
+        #[case] metadata: Option<&str>,
     ) {
-        let mut json = serde_json::json!({"name": "value", "type": "long", "nullable": nullable});
+        let mut json = serde_json::json!({"name": "value", "type": "long"});
+        if let Some(nullable) = nullable {
+            json["nullable"] = nullable.into();
+        }
         if let Some(metadata) = metadata {
             json["metadata"] = serde_json::from_str(metadata).unwrap();
         }
         let expected = StructField {
             metadata: serde_json::from_str(metadata.unwrap_or("{}")).unwrap(),
-            ..StructField::new("value", DataType::LONG, nullable)
+            ..StructField::new("value", DataType::LONG, nullable.unwrap_or(true))
         };
 
         let field: StructField = serde_json::from_value(json).unwrap();
@@ -3462,6 +3513,7 @@ mod tests {
             serialized["metadata"],
             serde_json::to_value(&expected.metadata).unwrap()
         );
+        assert_eq!(serialized["nullable"], expected.nullable);
         assert_eq!(
             serde_json::from_value::<StructField>(serialized).unwrap(),
             expected
@@ -3469,30 +3521,43 @@ mod tests {
     }
 
     #[rstest]
-    #[case::struct_type(
-        r#"{"type":"struct","fields":[{"name":"inner","type":"long","nullable":false}]}"#,
-        DataType::from(schema! { not_null "inner": LONG })
-    )]
+    #[case::struct_type("/fields/0", |schema: StructType| schema.into())]
     #[case::array(
-        r#"{"type":"array","elementType":{
-            "type":"struct","fields":[{"name":"inner","type":"long","nullable":false}]
-        },"containsNull":true}"#,
-        DataType::from(ArrayType::new(schema! { not_null "inner": LONG }, true))
+        "/elementType/fields/0",
+        |schema: StructType| ArrayType::new(schema, true).into()
     )]
     #[case::map_key(
-        r#"{"type":"map","keyType":{
-            "type":"struct","fields":[{"name":"inner","type":"long","nullable":false}]
-        },"valueType":"long","valueContainsNull":false}"#,
-        DataType::from(MapType::new(schema! { not_null "inner": LONG }, DataType::LONG, false))
+        "/keyType/fields/0",
+        |schema: StructType| MapType::new(schema, DataType::LONG, false).into()
     )]
     #[case::map_value(
-        r#"{"type":"map","keyType":"long","valueType":{
-            "type":"struct","fields":[{"name":"inner","type":"long","nullable":false}]
-        },"valueContainsNull":true}"#,
-        DataType::from(MapType::new(DataType::LONG, schema! { not_null "inner": LONG }, true))
+        "/valueType/fields/0",
+        |schema: StructType| MapType::new(DataType::LONG, schema, true).into()
     )]
-    fn test_nested_struct_field_without_metadata(#[case] json: &str, #[case] expected: DataType) {
-        assert_eq!(serde_json::from_str::<DataType>(json).unwrap(), expected);
+    fn test_nested_struct_field_without_metadata(
+        #[case] field_path: &str,
+        #[case] wrap: fn(StructType) -> DataType,
+        #[values(None, Some(false), Some(true))] nullable: Option<bool>,
+    ) {
+        let expected = wrap(
+            StructType::try_new([StructField::new(
+                "inner",
+                DataType::LONG,
+                nullable.unwrap_or(true),
+            )])
+            .unwrap(),
+        );
+        let mut json = serde_json::to_value(&expected).unwrap();
+        let field = json
+            .pointer_mut(field_path)
+            .unwrap()
+            .as_object_mut()
+            .unwrap();
+        field.remove("metadata");
+        if nullable.is_none() {
+            field.remove("nullable");
+        }
+        assert_eq!(serde_json::from_value::<DataType>(json).unwrap(), expected);
     }
 
     #[rstest]
@@ -3500,20 +3565,30 @@ mod tests {
     #[case::string_metadata(r#""nullable":true,"metadata":"bad""#, "expected a map")]
     #[case::array_metadata(r#""nullable":true,"metadata":[]"#, "expected a map")]
     #[case::boolean_metadata(r#""nullable":true,"metadata":false"#, "expected a map")]
+    #[case::number_metadata(r#""nullable":true,"metadata":0"#, "expected a map")]
+    #[case::null_metadata_without_nullable(r#""metadata":null"#, "expected a map")]
     #[case::missing_nullable(r#""metadata":{}"#, "missing field `nullable`")]
-    #[case::both_missing("", "missing field `nullable`")]
+    #[case::missing_nullable_populated_metadata(
+        r#""metadata":{"comment":"keep"}"#,
+        "missing field `nullable`"
+    )]
     #[case::null_nullable(r#""nullable":null,"metadata":{}"#, "expected a boolean")]
     #[case::string_nullable(r#""nullable":"true","metadata":{}"#, "expected a boolean")]
+    #[case::null_nullable_without_metadata(r#""nullable":null"#, "expected a boolean")]
+    #[case::string_nullable_without_metadata(r#""nullable":"true""#, "expected a boolean")]
+    #[case::number_nullable_without_metadata(r#""nullable":1"#, "expected a boolean")]
+    #[case::array_nullable_without_metadata(r#""nullable":[]"#, "expected a boolean")]
+    #[case::object_nullable_without_metadata(r#""nullable":{}"#, "expected a boolean")]
+    #[case::duplicate_nullable(r#""nullable":true,"nullable":false"#, "duplicate field `nullable`")]
+    #[case::duplicate_metadata(
+        r#""nullable":true,"metadata":{},"metadata":{}"#,
+        "duplicate field `metadata`"
+    )]
     fn test_struct_field_rejects_invalid_metadata_or_nullability(
         #[case] fields: &str,
         #[case] expected_error: &str,
     ) {
-        let extra_fields = if fields.is_empty() {
-            String::new()
-        } else {
-            format!(",{fields}")
-        };
-        let json = format!(r#"{{"name":"value","type":"long"{extra_fields}}}"#);
+        let json = format!(r#"{{"name":"value","type":"long",{fields}}}"#);
         assert_result_error_with_message(
             serde_json::from_str::<StructField>(&json),
             expected_error,
