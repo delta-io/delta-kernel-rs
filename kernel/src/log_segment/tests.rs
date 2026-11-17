@@ -419,7 +419,7 @@ fn log_segment_stats_counts_only_replay_commits(
     &[(2, 2), (0, 1)],
     None,
 )]
-fn log_segment_stats_uses_selected_compactions(
+fn log_segment_stats_ignores_compactions(
     #[case] commit_sizes: &[u64],
     #[case] compactions: &[(Version, Version, u64)],
     #[case] expected_cover: &[(Version, Version)],
@@ -472,21 +472,13 @@ fn log_segment_stats_uses_selected_compactions(
         .iter()
         .try_fold(0u64, |total, file| total.checked_add(file.size));
     assert_eq!(cover_bytes, expected_bytes);
-    match expected_bytes {
-        Some(total_commit_file_bytes) => {
-            let stats = segment.stats().unwrap();
-            assert_eq!(
-                stats,
-                LogSegmentStats {
-                    num_commit_files: expected_cover.len() as u64,
-                    total_commit_file_bytes,
-                }
-            );
-            assert_eq!(stats.num_commit_files, cover.len() as u64);
-            assert_eq!(Some(stats.total_commit_file_bytes), cover_bytes);
+    assert_eq!(
+        segment.stats().unwrap(),
+        LogSegmentStats {
+            num_commit_files: commit_sizes.len() as u64,
+            total_commit_file_bytes: commit_sizes.iter().sum(),
         }
-        None => assert_result_error_with_message(segment.stats(), "commit file size overflow"),
-    }
+    );
 }
 
 /// Gets the file size from the store for use in FileMeta

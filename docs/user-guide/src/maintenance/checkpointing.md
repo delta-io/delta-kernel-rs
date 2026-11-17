@@ -173,9 +173,10 @@ post-commit pattern that includes writing a CRC file before checkpointing.
 ## Log compaction
 
 Log compaction aggregates an inclusive range of commit JSON files into a compacted file,
-reducing the number of files Kernel reads during snapshot reconstruction. Kernel automatically
-selects available compactions that fit the target version and checkpoint boundaries. Empty
-compactions are skipped in favor of the original commits.
+reducing the number of files Kernel reads when planning scans. Kernel automatically
+selects available compactions for scans that fit the target version and checkpoint boundaries
+when built without `adaptive-metadata-in-dev`. Snapshot reconstruction always uses original
+commits and checkpoints. Empty compactions are skipped in favor of the original commits.
 
 Keep the original commits: commit-level APIs such as Change Data Feed and timestamp lookup
 still need them. Compaction writing remains disabled. `Snapshot::log_compaction_writer()`
