@@ -58,8 +58,6 @@ use crate::table_properties::CheckConstraint;
 use crate::table_properties::TableProperties;
 use crate::transaction::{UpdateTableOperation, UpdateTableTransactionBuilder};
 use crate::utils::require;
-#[cfg(feature = "adaptive-metadata-in-dev")]
-use crate::version_as_i64;
 use crate::{
     DeltaError, Engine, Error, KernelError, KernelResult, KernelResultIterator,
     LogCompactionWriter, Result, Version,
@@ -1332,19 +1330,6 @@ impl Snapshot {
             return Ok(resolved.clone());
         }
         Ok(self.read_ict_and_last_manifest_commit(engine)?.1)
-    }
-
-    /// Whether the latest adaptiveMetadata content root was written after `version`.
-    #[cfg(feature = "adaptive-metadata-in-dev")]
-    pub(crate) fn has_content_root_after(
-        &self,
-        engine: &dyn Engine,
-        version: Version,
-    ) -> KernelResult<bool> {
-        let version = version_as_i64(version)?;
-        Ok(self
-            .last_manifest_commit(engine)?
-            .is_some_and(|last| last.content_root_version > version))
     }
 
     /// Whether the snapshot's table has adaptive metadata enabled.

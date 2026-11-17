@@ -1497,6 +1497,18 @@ impl LastManifestCommit {
         Ok(())
     }
 
+    /// Whether some commit after `version`, up to this manifest commit, may record its file
+    /// actions only in the metadata tree, leaving them out of its commit JSON.
+    ///
+    /// Only the latest pointer is needed. A manifest commit's file actions live only in the tree
+    /// when its content root version is its own version, and content root versions never decrease
+    /// across manifest commits, so any such commit after `version` has a content root version at
+    /// or below this one's. A lagging content root makes the answer conservative.
+    pub(crate) fn may_have_tree_only_file_actions_after(&self, version: Version) -> bool {
+        // `validate` guarantees content_root_version is non-negative.
+        self.content_root_version as u64 > version
+    }
+
     /// Parses the first `commitInfo.lastManifestCommit` in `data`, if any.
     pub(crate) fn try_new_from_data(data: &dyn EngineData) -> KernelResult<Option<Self>> {
         let mut visitor = visitors::LastManifestCommitVisitor::default();
@@ -2241,6 +2253,23 @@ mod tests {
     ) {
         let result = LastManifestCommit::new(version, content_root_version);
         assert_eq!(result.is_ok(), ok);
+    }
+
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[rstest]
+    #[case::content_root_after_version(2, 2, 1, true)]
+    #[case::content_root_at_version(2, 2, 2, false)]
+    #[case::content_root_before_version(2, 2, 3, false)]
+    #[case::lagging_content_root_after_version(2, 1, 0, true)]
+    #[case::lagging_content_root_at_version(2, 1, 1, false)]
+    fn test_may_have_tree_only_file_actions_after_compares_content_root_version(
+        #[case] version: i64,
+        #[case] content_root_version: i64,
+        #[case] after: Version,
+        #[case] expected: bool,
+    ) {
+        let last = LastManifestCommit::new(version, content_root_version).unwrap();
+        assert_eq!(last.may_have_tree_only_file_actions_after(after), expected);
     }
 
     #[test]

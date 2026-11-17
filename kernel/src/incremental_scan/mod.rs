@@ -82,8 +82,8 @@ impl IncrementalScanBuilder {
     /// Build the incremental scan stream, or `None` if the range cannot be served from commit
     /// JSONs (consumers should fall back to a full scan via [`crate::Snapshot::scan_builder`]).
     /// That happens when the target snapshot's commit list does not cover
-    /// `(base_version, target_version]`, or when the adaptiveMetadata content root was written
-    /// within the range.
+    /// `(base_version, target_version]`, or when some commit in the range may record file actions
+    /// outside its commit JSON (e.g. adaptiveMetadata manifest commits).
     ///
     /// Does not re-list `_delta_log/`: walks the target snapshot's already-validated commit
     /// list and clips it to `(base_version, target_version]`. For catalog-managed tables
@@ -166,7 +166,8 @@ impl IncrementalScanBuilder {
         #[cfg(feature = "adaptive-metadata-in-dev")]
         if self
             .target_snapshot
-            .has_content_root_after(engine, self.base_version)?
+            .last_manifest_commit(engine)?
+            .is_some_and(|last| last.may_have_tree_only_file_actions_after(self.base_version))
         {
             return Ok(None);
         }
