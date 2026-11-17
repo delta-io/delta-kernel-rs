@@ -179,7 +179,7 @@ impl ParquetStatsProvider for RowGroupFilter<'_> {
 /// parquet type to the requested logical Delta type. INT64 timestamp stats are rescaled to
 /// microseconds and decimal stats widened to the requested scale using the column's Parquet
 /// annotation; a decimal stat that cannot be widened exactly is `None`, as is a string or binary
-/// stat whose legacy `min`/`max` footer fields differ (see [`byte_array_bound`]).
+/// stat taken from the legacy `min`/`max` footer fields (see [`byte_array_bound`]).
 fn extract_min_scalar(data_type: &DataType, column: &ColumnChunkMetaData) -> Option<Scalar> {
     let stats = column.statistics()?;
     let value = match (data_type.as_primitive_opt()?, stats) {
@@ -234,7 +234,7 @@ fn extract_min_scalar(data_type: &DataType, column: &ColumnChunkMetaData) -> Opt
 /// parquet type to the requested logical Delta type. INT64 timestamp stats are rescaled to
 /// microseconds and decimal stats widened to the requested scale using the column's Parquet
 /// annotation; a decimal stat that cannot be widened exactly is `None`, as is a string or binary
-/// stat whose legacy `min`/`max` footer fields differ (see [`byte_array_bound`]).
+/// stat taken from the legacy `min`/`max` footer fields (see [`byte_array_bound`]).
 fn extract_max_scalar(data_type: &DataType, column: &ColumnChunkMetaData) -> Option<Scalar> {
     let stats = column.statistics()?;
     let value = match (data_type.as_primitive_opt()?, stats) {
@@ -302,20 +302,19 @@ enum StatBound {
 /// Legacy `min`/`max` footer fields are rejected: writers filled them using signed byte
 /// comparison, which disagrees with the unsigned order kernel applies to strings and binary as
 /// soon as a byte is >= 0x80, so either bound may exclude values the row group holds. Equal
-/// legacy bounds are kept because the group then holds a single distinct value, which is exact
-/// under any order.
+/// legacy bounds do not prove a single value either: parquet-mr before 1.8.0 could store a reused
+/// buffer as both bounds (PARQUET-251), and kernel has no `created_by` check to rule such files
+/// out.
 fn byte_array_bound(stats: &Statistics, bound: StatBound) -> Option<&[u8]> {
-    let (min, max) = match stats {
-        Statistics::ByteArray(s) => (s.min_bytes_opt(), s.max_bytes_opt()),
-        Statistics::FixedLenByteArray(s) => (s.min_bytes_opt(), s.max_bytes_opt()),
-        _ => return None,
-    };
-    if stats.is_min_max_deprecated() && min != max {
+    if stats.is_min_max_deprecated() {
         return None;
     }
-    match bound {
-        StatBound::Min => min,
-        StatBound::Max => max,
+    match (stats, bound) {
+        (Statistics::ByteArray(s), StatBound::Min) => s.min_bytes_opt(),
+        (Statistics::ByteArray(s), StatBound::Max) => s.max_bytes_opt(),
+        (Statistics::FixedLenByteArray(s), StatBound::Min) => s.min_bytes_opt(),
+        (Statistics::FixedLenByteArray(s), StatBound::Max) => s.max_bytes_opt(),
+        _ => None,
     }
 }
 

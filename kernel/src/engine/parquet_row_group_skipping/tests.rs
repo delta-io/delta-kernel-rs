@@ -568,17 +568,14 @@ fn invalid_utf8_footer_bounds_yield_no_string(#[values(false, true)] fixed_len: 
 }
 
 #[rstest]
-#[case::current(false, Some("ab"), Some("ac"), Some("ab"), Some("ac"))]
-#[case::legacy(true, Some("ab"), Some("ac"), None, None)]
-#[case::legacy_min_only(true, Some("ab"), None, None, None)]
-#[case::legacy_max_only(true, None, Some("ac"), None, None)]
-#[case::legacy_single_value(true, Some("ab"), Some("ab"), Some("ab"), Some("ab"))]
-fn legacy_byte_array_footer_bounds_yield_scalars_only_when_equal(
-    #[case] deprecated: bool,
+#[case::both_bounds(Some("ab"), Some("ac"))]
+#[case::min_only(Some("ab"), None)]
+#[case::max_only(None, Some("ac"))]
+#[case::single_value(Some("ab"), Some("ab"))]
+fn byte_array_footer_bounds_yield_scalars_only_when_not_legacy(
     #[case] min: Option<&str>,
     #[case] max: Option<&str>,
-    #[case] expected_min: Option<&str>,
-    #[case] expected_max: Option<&str>,
+    #[values(false, true)] deprecated: bool,
     #[values(DataType::STRING, DataType::BINARY)] data_type: DataType,
     #[values(false, true)] fixed_len: bool,
 ) {
@@ -595,21 +592,16 @@ fn legacy_byte_array_footer_bounds_yield_scalars_only_when_equal(
         None,
         stats,
     );
-    let scalar = |value: &str| -> Scalar {
-        if data_type == DataType::STRING {
+    let expected = |value: Option<&str>| -> Option<Scalar> {
+        let value = value.filter(|_| !deprecated)?;
+        Some(if data_type == DataType::STRING {
             value.into()
         } else {
             value.as_bytes().into()
-        }
+        })
     };
-    assert_eq!(
-        extract_min_scalar(&data_type, &column),
-        expected_min.map(scalar)
-    );
-    assert_eq!(
-        extract_max_scalar(&data_type, &column),
-        expected_max.map(scalar)
-    );
+    assert_eq!(extract_min_scalar(&data_type, &column), expected(min));
+    assert_eq!(extract_max_scalar(&data_type, &column), expected(max));
 }
 
 #[rstest]
