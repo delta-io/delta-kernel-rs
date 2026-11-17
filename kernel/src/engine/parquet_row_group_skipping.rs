@@ -321,10 +321,10 @@ fn byte_array_bound(stats: &Statistics, bound: StatBound) -> Option<&[u8]> {
 
 /// Unscaled bound of a decimal column chunk from its INT32, INT64 or FIXED_LEN_BYTE_ARRAY stats.
 ///
-/// Legacy `min`/`max` footer fields are rejected for FIXED_LEN_BYTE_ARRAY: writers filled them
-/// using byte-wise comparison, which is not numeric order for multi-byte two's complement.
-/// Bounds must match the column's `type_length` so a truncated value cannot be sign-extended
-/// to a different number.
+/// FIXED_LEN_BYTE_ARRAY bounds come from [`byte_array_bound`], which rejects legacy `min`/`max`
+/// footer fields; byte-wise comparison is not numeric order for multi-byte two's complement
+/// either. Bounds must match the column's `type_length` so a truncated value cannot be
+/// sign-extended to a different number.
 fn decimal_unscaled(
     stats: &Statistics,
     column: &ColumnDescriptor,
@@ -335,12 +335,8 @@ fn decimal_unscaled(
         (Statistics::Int32(s), StatBound::Max) => (*s.max_opt()?).into(),
         (Statistics::Int64(s), StatBound::Min) => (*s.min_opt()?).into(),
         (Statistics::Int64(s), StatBound::Max) => (*s.max_opt()?).into(),
-        (Statistics::FixedLenByteArray(s), bound) if !stats.is_min_max_deprecated() => {
-            let bytes = match bound {
-                StatBound::Min => s.min_bytes_opt()?,
-                StatBound::Max => s.max_bytes_opt()?,
-            };
-            fixed_len_decimal_bits(bytes, column)?
+        (Statistics::FixedLenByteArray(_), bound) => {
+            fixed_len_decimal_bits(byte_array_bound(stats, bound)?, column)?
         }
         _ => return None,
     })
