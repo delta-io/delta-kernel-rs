@@ -330,7 +330,7 @@ impl LogSegment {
         Ok(batches)
     }
 
-    /// Reads the original commits in `segment` and the checkpoint, tagging each batch with its
+    /// Reads the commit files in `segment` and the checkpoint, tagging each batch with its
     /// version. Each commit file projects its checkpoint action, so replay captures the pointed one
     /// if it reaches that row before it stops.
     fn read_pm_batches(

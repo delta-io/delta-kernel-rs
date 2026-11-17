@@ -15,7 +15,7 @@ use delta_kernel::object_store::{DynObjectStore, ObjectStoreExt};
 #[cfg(feature = "declarative-plans")]
 use delta_kernel::plans::ir::nodes::Operator;
 #[cfg(feature = "declarative-plans")]
-use delta_kernel::plans::{Operation, Plan, PlanExecutor, PlanResult};
+use delta_kernel::plans::{Operation, Plan, PlanExecutor};
 use delta_kernel::scan::{AfterSequentialScanMetadata, ParallelScanMetadata};
 use delta_kernel::schema::{DataType, MetadataColumnSpec, StructField, schema_ref};
 use delta_kernel::snapshot::IncrementalReplay;
@@ -39,7 +39,7 @@ use url::Url;
 #[cfg(feature = "declarative-plans")]
 #[rstest]
 #[tokio::test(flavor = "multi_thread")]
-async fn snapshot_replay_uses_originals_and_non_amt_scans_use_compactions(
+async fn snapshot_replay_and_non_amt_scans_use_compactions(
     #[values(false, true)] use_plan: bool,
     #[values(false, true)] checkpoint: bool,
     #[values(false, true)] crc: bool,
@@ -75,12 +75,6 @@ async fn snapshot_replay_uses_originals_and_non_amt_scans_use_compactions(
             .build(engine.as_ref())?;
         assert_eq!(updated.schema(), fresh.schema());
         assert_eq!(rebuilt.version(), version);
-        assert!(
-            !reads
-                .requested_paths()
-                .iter()
-                .any(|path| path.path().ends_with(".compacted.json"))
-        );
         for snapshot in [fresh, updated, rebuilt] {
             reads.clear();
             let scan = snapshot.scan_builder().build()?;
@@ -205,7 +199,6 @@ async fn partial_compaction_preserves_suppression(
             .get_app_id_version("app", engine.as_ref())?,
         None
     );
-    assert!(!reads.requested_paths().contains(&path));
     reads.clear();
     assert!(read_scan(&compacted.scan_builder().build()?, engine.clone())?.is_empty());
     assert!(reads.successful_paths().contains(&path));
@@ -277,12 +270,6 @@ async fn compaction_reads_match_commits(
             baseline.table_configuration().protocol()
         );
         assert_eq!(fresh.table_properties(), baseline.table_properties());
-        assert!(
-            !reads
-                .requested_paths()
-                .iter()
-                .any(|path| path.path().ends_with(".compacted.json"))
-        );
         reads.clear();
         assert_eq!(scan_results(fresh.clone(), engine.clone())?, *expected);
         let eligible = ranges.iter().any(|&(start, end)| {
@@ -361,11 +348,11 @@ async fn checkpoint_from_compacted_log_preserves_rows() -> Result<(), Box<dyn st
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn malformed_compaction_only_affects_scans() -> Result<(), Box<dyn std::error::Error>> {
+async fn malformed_compaction_fails_snapshot_load() -> Result<(), Box<dyn std::error::Error>> {
     let table = TestTableBuilder::new()
         .with_log_state(LogState::with_latest_version(3))
         .build()?;
-    let (engine, reads) = test_engine(table.store().clone(), 1);
+    let (engine, _) = test_engine(table.store().clone(), 1);
     table
         .store()
         .put(
@@ -373,15 +360,11 @@ async fn malformed_compaction_only_affects_scans() -> Result<(), Box<dyn std::er
             String::from("{").into(),
         )
         .await?;
-    let snapshot = Snapshot::builder_for(table.table_root()).build(engine.as_ref())?;
     assert!(
-        !reads
-            .requested_paths()
-            .iter()
-            .any(|path| path.path().ends_with(".compacted.json"))
+        Snapshot::builder_for(table.table_root())
+            .build(engine.as_ref())
+            .is_err()
     );
-    let scan = snapshot.scan_builder().build()?;
-    assert!(read_scan(&scan, engine).is_err());
     Ok(())
 }
 
@@ -911,7 +894,7 @@ async fn compaction_preserves_unsupported_reader_feature_error()
         .unwrap_err()
         .to_string();
     assert_eq!(actual, expected);
-    assert!(!reads.requested_paths().contains(&path));
+    assert!(reads.requested_paths().contains(&path));
     Ok(())
 }
 
@@ -993,11 +976,7 @@ fn test_engine_with_plan(
     #[cfg_attr(not(feature = "declarative-plans"), allow(unused_variables))] use_plan: bool,
 ) -> (Arc<DelegatingEngine>, JsonReadCapture) {
     #[cfg(feature = "declarative-plans")]
-    let executor = use_plan.then(|| {
-        Arc::new(SnapshotPlanExecutor(SyncPlanExecutor::new(Some(
-            store.clone(),
-        ))))
-    });
+    let executor = use_plan.then(|| Arc::new(SyncPlanExecutor::new(Some(store.clone()))));
     let inner = Arc::new(
         DefaultEngineBuilder::new(store)
             .with_batch_size(NonZero::new(batch_size).unwrap())
@@ -1025,18 +1004,4 @@ fn plan_uses_compaction(plan: &Plan) -> bool {
             .any(|file| file.meta.location.path().ends_with(".compacted.json")),
         _ => false,
     })
-}
-
-// Snapshot discovery plans must select original commits even when compactions are listed.
-#[cfg(feature = "declarative-plans")]
-struct SnapshotPlanExecutor(SyncPlanExecutor);
-
-#[cfg(feature = "declarative-plans")]
-impl PlanExecutor for SnapshotPlanExecutor {
-    fn execute_op(&self, op: Operation) -> KernelResult<PlanResult> {
-        if let Operation::QueryPlan(plan) = &op {
-            assert!(!plan_uses_compaction(plan));
-        }
-        self.0.execute_op(op)
-    }
 }

@@ -27,7 +27,6 @@ use crate::engine::sync::SyncEngine;
 use crate::expressions::Scalar;
 use crate::object_store::ObjectStoreExt as _;
 use crate::object_store::memory::InMemory;
-use crate::path::ParsedLogPath;
 #[cfg(feature = "declarative-plans")]
 use crate::plans::ir::nodes::Operator;
 #[cfg(feature = "declarative-plans")]
@@ -1544,8 +1543,8 @@ async fn non_plan_replay_of_older_commits_stops_once_newest_commit_completes_pm(
     assert_replay(&log, None, &expected, non_plan_engine).await;
 }
 
-// Writes `contents` as a log compaction over versions `lo..=hi` and returns a segment that uses it.
-// Compaction listing is disabled, so the compaction is added to the segment by hand.
+// Writes `contents` as a log compaction over versions `lo..=hi` and returns a segment that lists
+// it.
 async fn segment_with_compaction(
     store: &InMemory,
     table_root: &Url,
@@ -1559,13 +1558,8 @@ async fn segment_with_compaction(
         .await
         .unwrap();
 
-    let mut log_segment = latest_log_segment(table_root, engine);
-    let compaction_location = table_root.join(compaction.as_ref()).unwrap();
-    let compaction = ParsedLogPath::new(FileMeta::new(compaction_location, 0, 100)).unwrap();
-    log_segment
-        .listed
-        .ascending_compaction_files
-        .push(compaction);
+    let log_segment = latest_log_segment(table_root, engine);
+    assert_eq!(log_segment.listed.ascending_compaction_files.len(), 1);
     log_segment
 }
 
