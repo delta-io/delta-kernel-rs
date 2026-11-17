@@ -95,6 +95,14 @@ message WriteParquetNode {
   delta.kernel.schema.StructType schema = 6;
 }
 
+message WriteParquetFilesNode {
+  // Schema of every input column, including file metadata.
+  delta.kernel.schema.StructType write_schema = 1;
+  string base_url = 2;
+  // One `{uuid}` placeholder; see the Rust IR for the filename contract.
+  string file_name_template = 3;
+}
+
 enum FileType {
   FILE_TYPE_UNSPECIFIED = 0;
   FILE_TYPE_PARQUET = 1;
@@ -195,6 +203,7 @@ message Operator {
     // Sinks (write nodes)
     WriteJsonNode write_json = 11;
     WriteParquetNode write_parquet = 13;
+    WriteParquetFilesNode write_parquet_files = 14;
   }
 }
 

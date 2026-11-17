@@ -33,6 +33,11 @@ use delta_kernel::schema::{
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
 use delta_kernel::{KernelError, Snapshot, SnapshotRef};
+#[cfg(feature = "declarative-plans")]
+use delta_kernel::{
+    engine::{plans::PlanBasedEngine, sync::plan::SyncPlanExecutor},
+    plans::{Operation, PlanExecutor as _, ir::nodes::FileType},
+};
 use rstest::rstest;
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -911,6 +916,137 @@ async fn millisecond_truncated_timestamp_stats_dont_overprune(
     Ok(())
 }
 
+async fn replace_table_schema_change(
+    old_schema: SchemaRef,
+    checkpoint_spec: Option<&CheckpointSpec>,
+    write_struct: bool,
+    old_json_stats: bool,
+) -> Result<(tempfile::TempDir, String, Arc<TestEngine>), Box<dyn std::error::Error>> {
+    let (_tmp_dir, table_path, engine) = test_table_setup_mt()?;
+
+    let old_partition = if old_schema.field("part").unwrap().data_type() == &DataType::STRING {
+        "not-an-integer"
+    } else {
+        "1"
+    };
+    let old_value = if old_schema.field("value").unwrap().data_type() == &DataType::STRING {
+        json!("not-an-integer")
+    } else {
+        json!(10)
+    };
+    let builder = create_table(&table_path, old_schema, "Test/1.0", true)
+        .with_data_layout(DataLayout::partitioned(["part"]))
+        .with_table_properties([
+            (
+                "delta.checkpoint.writeStatsAsStruct",
+                write_struct.to_string(),
+            ),
+            (
+                "delta.checkpoint.writeStatsAsJson",
+                old_json_stats.to_string(),
+            ),
+        ]);
+    let builder = if matches!(checkpoint_spec, Some(CheckpointSpec::V1)) {
+        builder
+    } else {
+        builder.with_table_properties([("delta.feature.v2Checkpoint", "supported")])
+    };
+    builder
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .commit(engine.as_ref())?
+        .unwrap_post_commit_snapshot();
+
+    let store: Arc<delta_kernel::object_store::DynObjectStore> = Arc::new(LocalFileSystem::new());
+    let table_url = Url::from_directory_path(&table_path)
+        .map_err(|_| "table_path should be a valid file URL")?;
+
+    // Commit 2 writes addFiles using `old_schema`.
+    let old_paths = ["old-1.parquet", "old-2.parquet", "old-3.parquet"];
+    let old_adds = [
+        json!({
+            "commitInfo": {
+                "timestamp": 1700000000000i64,
+                "operation": "WRITE",
+                "version": 1,
+            }
+        }),
+        add_file_action(old_paths[0], 201, old_partition, old_value.clone())?,
+        add_file_action(old_paths[1], 202, old_partition, old_value.clone())?,
+        add_file_action(old_paths[2], 203, old_partition, old_value)?,
+    ];
+    add_commit(
+        table_url.as_str(),
+        store.as_ref(),
+        1,
+        old_adds.map(|action| action.to_string()).join("\n"),
+    )
+    .await?;
+
+    if let Some(spec) = checkpoint_spec {
+        Snapshot::builder_for(table_url.clone())
+            .build(engine.as_ref())?
+            .checkpoint(engine.as_ref(), Some(spec))?;
+    }
+
+    // Commit 3 replaces the table metadata and removes the addFiles.
+    let replacement_schema = schema! {
+        not_null "part": LONG,
+        nullable "value": LONG,
+    };
+    let replacement = [
+        json!({
+            "commitInfo": {
+                "timestamp": 1700000001000i64,
+                "operation": "CREATE OR REPLACE TABLE",
+                "version": 2,
+            }
+        }),
+        json!({
+            "metaData": {
+                "id": "replacement-table",
+                "format": { "provider": "parquet", "options": {} },
+                "schemaString": serde_json::to_string(&replacement_schema)?,
+                "partitionColumns": ["part"],
+                "configuration": { "delta.checkpoint.writeStatsAsStruct": write_struct.to_string() },
+                "createdTime": 1700000001000i64,
+            }
+        }),
+        remove_file_action(old_paths[0])?,
+        remove_file_action(old_paths[1])?,
+        remove_file_action(old_paths[2])?,
+    ];
+    add_commit(
+        table_url.as_str(),
+        store.as_ref(),
+        2,
+        replacement.map(|action| action.to_string()).join("\n"),
+    )
+    .await?;
+
+    // Commit 4 writes addFiles with distinct partition values and statistics.
+    let new_adds = [
+        json!({
+            "commitInfo": {
+                "timestamp": 1700000002000i64,
+                "operation": "WRITE",
+                "version": 3,
+            }
+        }),
+        add_file_action("new-1.parquet", 101, "1", 10)?,
+        add_file_action("new-2.parquet", 102, "2", 20)?,
+        add_file_action("new-3.parquet", 103, "3", 30)?,
+    ];
+    add_commit(
+        table_url.as_str(),
+        store.as_ref(),
+        3,
+        new_adds.map(|action| action.to_string()).join("\n"),
+    )
+    .await?;
+
+    Ok((_tmp_dir, table_path, engine))
+}
+
 /// Replace table may change partition and data column types. A scan after replacement should
 /// remain compatible with the old addFiles.
 #[rstest]
@@ -941,139 +1077,23 @@ async fn scan_with_replace_table_schema_change(
     #[values(false, true)] use_parallel: bool,
     #[values(false, true)] checkpoint_old_add: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let (_tmp_dir, table_path, engine) = test_table_setup_mt()?;
-
-    // Commit 1 creates the table with a string partition column.
     let old_schema = schema_ref! {
         nullable "part": STRING,
         nullable "value": STRING,
     };
-    create_table(&table_path, old_schema, "Test/1.0", true)
-        .with_data_layout(DataLayout::partitioned(["part"]))
-        .with_table_properties([("delta.feature.v2Checkpoint", "supported")])
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
-        .commit(engine.as_ref())?
-        .unwrap_post_commit_snapshot();
-
+    let checkpoint_spec = CheckpointSpec::V2(V2CheckpointConfig::WithSidecar {
+        file_actions_per_sidecar_hint: Some(1),
+    });
+    let (_tmp_dir, table_path, engine) = replace_table_schema_change(
+        old_schema,
+        checkpoint_old_add.then_some(&checkpoint_spec),
+        false,
+        true,
+    )
+    .await?;
     let store: Arc<delta_kernel::object_store::DynObjectStore> = Arc::new(LocalFileSystem::new());
     let table_url = Url::from_directory_path(&table_path)
         .map_err(|_| "table_path should be a valid file URL")?;
-
-    // Commit 2 writes addFiles using `old_schema`.
-    let old_paths = ["old-1.parquet", "old-2.parquet", "old-3.parquet"];
-    let old_adds = [
-        json!({
-            "commitInfo": {
-                "timestamp": 1700000000000i64,
-                "operation": "WRITE",
-                "version": 1,
-            }
-        }),
-        add_file_action(
-            old_paths[0],
-            201,                           /* size */
-            "not-an-integer-partition-1",  /* partition_value */
-            "not-an-integer-data-value-1", /* data_value */
-        )?,
-        add_file_action(
-            old_paths[1],
-            202,                           /* size */
-            "not-an-integer-partition-2",  /* partition_value */
-            "not-an-integer-data-value-2", /* data_value */
-        )?,
-        add_file_action(
-            old_paths[2],
-            203,                           /* size */
-            "not-an-integer-partition-3",  /* partition_value */
-            "not-an-integer-data-value-3", /* data_value */
-        )?,
-    ];
-    add_commit(
-        table_url.as_str(),
-        store.as_ref(),
-        1,
-        old_adds.map(|action| action.to_string()).join("\n"),
-    )
-    .await?;
-
-    let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
-    if checkpoint_old_add {
-        let checkpoint_spec = CheckpointSpec::V2(V2CheckpointConfig::WithSidecar {
-            file_actions_per_sidecar_hint: Some(1),
-        });
-        snapshot.checkpoint(engine.as_ref(), Some(&checkpoint_spec))?;
-    }
-
-    // Commit 3 replaces the table metadata and removes the addFiles.
-    let replacement_schema = schema! {
-        nullable "part": LONG,
-        nullable "value": LONG,
-    };
-    let replacement = [
-        json!({
-            "commitInfo": {
-                "timestamp": 1700000001000i64,
-                "operation": "CREATE OR REPLACE TABLE",
-                "version": 2,
-            }
-        }),
-        json!({
-            "metaData": {
-                "id": "replacement-table",
-                "format": { "provider": "parquet", "options": {} },
-                "schemaString": serde_json::to_string(&replacement_schema)?,
-                "partitionColumns": ["part"],
-                "configuration": {},
-                "createdTime": 1700000001000i64,
-            }
-        }),
-        remove_file_action(old_paths[0])?,
-        remove_file_action(old_paths[1])?,
-        remove_file_action(old_paths[2])?,
-    ];
-    add_commit(
-        table_url.as_str(),
-        store.as_ref(),
-        2,
-        replacement.map(|action| action.to_string()).join("\n"),
-    )
-    .await?;
-
-    // Commit 4 writes addFiles with distinct partition values and statistics.
-    let new_adds = [
-        json!({
-            "commitInfo": {
-                "timestamp": 1700000002000i64,
-                "operation": "WRITE",
-                "version": 3,
-            }
-        }),
-        add_file_action(
-            "new-1.parquet",
-            101, /* size */
-            "1", /* partition_value */
-            10,  /* data_value */
-        )?,
-        add_file_action(
-            "new-2.parquet",
-            102, /* size */
-            "2", /* partition_value */
-            20,  /* data_value */
-        )?,
-        add_file_action(
-            "new-3.parquet",
-            103, /* size */
-            "3", /* partition_value */
-            30,  /* data_value */
-        )?,
-    ];
-    add_commit(
-        table_url.as_str(),
-        store.as_ref(),
-        3,
-        new_adds.map(|action| action.to_string()).join("\n"),
-    )
-    .await?;
 
     let reporter = Arc::new(CapturingReporter::default());
     let _guard = install_thread_local_metrics_reporter(reporter.clone());
@@ -1182,6 +1202,59 @@ async fn scan_with_replace_table_schema_change(
         error.downcast_ref::<KernelError>(),
         Some(KernelError::ParseError(_, _))
     ));
+    Ok(())
+}
+
+#[cfg(feature = "declarative-plans")]
+#[rstest]
+#[case::v1(CheckpointSpec::V1, FileType::Parquet)]
+#[case::inline(CheckpointSpec::V2(V2CheckpointConfig::NoSidecar), FileType::Parquet)]
+#[case::sidecars_parquet(CheckpointSpec::V2(V2CheckpointConfig::WithSidecar {
+    file_actions_per_sidecar_hint: Some(1),
+}), FileType::Parquet)]
+#[case::sidecars_json(CheckpointSpec::V2(V2CheckpointConfig::WithSidecar {
+    file_actions_per_sidecar_hint: Some(1),
+}), FileType::Json)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn declarative_checkpoint_after_replace_table_with_incompatible_native_metadata(
+    #[case] spec: CheckpointSpec,
+    #[case] format: FileType,
+    #[values(false, true)] old_json_stats: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (_tmp_dir, table_path, engine) = replace_table_schema_change(
+        schema_ref! { nullable "part": STRING, nullable "value": STRING },
+        Some(&spec),
+        true,
+        old_json_stats,
+    )
+    .await?;
+    let table_url = Url::from_directory_path(&table_path).unwrap();
+    let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
+    let executor = Arc::new(SyncPlanExecutor::new(None));
+    let planning_engine = PlanBasedEngine::new(Some(engine.clone()), executor.clone());
+    let writer = snapshot.create_checkpoint_writer(&planning_engine)?;
+    let plan = writer.declarative_checkpoint_plan(&planning_engine, format)?;
+    let bytes = writer
+        .last_checkpoint_bytes_from_result(executor.execute_op(Operation::QueryPlan(plan))?)?;
+    std::fs::write(
+        table_url
+            .join("_delta_log/_last_checkpoint")?
+            .to_file_path()
+            .unwrap(),
+        bytes,
+    )?;
+    assert_eq!(
+        surviving_paths(
+            &table_path,
+            engine,
+            Arc::new(Pred::from_expr(expr!(and(
+                col("part") == 1i64,
+                col("value") == 10i64
+            )))),
+            false,
+        )?,
+        ["new-1.parquet"]
+    );
     Ok(())
 }
 
@@ -1456,15 +1529,15 @@ async fn all_null_files_pruned_regardless_of_source(
     let schema = schema_ref! { nullable "value": LONG };
     // For the struct-stats cases, also disable `writeStatsAsJson` so the checkpoint carries ONLY
     // `stats_parsed`. That forces the scan to read the pre-parsed struct (no JSON fallback),
-    // genuinely validating that path. The JSON-stats case keeps the defaults
-    // (`writeStatsAsJson=true`, `writeStatsAsStruct=false`), so its checkpoint carries only JSON
-    // stats. Either way the all-null file's `nullCount` survives into the checkpoint.
+    // validating that path. The JSON-stats case explicitly disables structured stats. Either way
+    // the all-null file's `nullCount` survives into the checkpoint.
     let table_properties: &[(&str, &str)] = match source {
         AllNullSource::CheckpointStructStats | AllNullSource::Both => &[
             ("delta.checkpoint.writeStatsAsStruct", "true"),
             ("delta.checkpoint.writeStatsAsJson", "false"),
         ],
-        AllNullSource::CommitOnly | AllNullSource::CheckpointJsonStats => &[],
+        AllNullSource::CheckpointJsonStats => &[("delta.checkpoint.writeStatsAsStruct", "false")],
+        AllNullSource::CommitOnly => &[],
     };
     let _ = create_table_and_load_snapshot(&table_path, schema, engine.as_ref(), table_properties)?;
     let store: Arc<delta_kernel::object_store::DynObjectStore> = Arc::new(LocalFileSystem::new());

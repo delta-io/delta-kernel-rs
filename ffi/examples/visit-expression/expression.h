@@ -133,6 +133,7 @@ struct Column {
 struct MapToStructExpr {
   ExpressionItemList child_expr;
   char* timestamp_timezone;
+  bool null_on_invalid;
 };
 struct CaseWhenExpr {
   ExpressionItemList conditions;
@@ -454,6 +455,7 @@ void visit_map_to_struct_expr(void* data,
   m2s->timestamp_timezone = options->timestamp_timezone.tag == SomeKernelStringSlice
       ? allocate_string(options->timestamp_timezone.some)
       : NULL;
+  m2s->null_on_invalid = options->null_on_invalid;
   put_expr_item(data, sibling_list_id, m2s, MapToStruct);
 }
 
