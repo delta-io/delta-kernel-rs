@@ -547,6 +547,9 @@ impl From<UnaryExpressionOp> for proto_expr::UnaryExpressionOp {
     fn from(op: UnaryExpressionOp) -> Self {
         match op {
             UnaryExpressionOp::ToJson { .. } => proto_expr::UnaryExpressionOp::ToJson,
+            UnaryExpressionOp::DeletionVectorPath => {
+                proto_expr::UnaryExpressionOp::DeletionVectorPath
+            }
         }
     }
 }
@@ -2011,6 +2014,10 @@ mod tests {
 
     #[rstest]
     #[case(UnaryExpressionOp::TO_JSON, proto_expr::UnaryExpressionOp::ToJson)]
+    #[case(
+        UnaryExpressionOp::DeletionVectorPath,
+        proto_expr::UnaryExpressionOp::DeletionVectorPath
+    )]
     fn from_unary_expression_op(
         #[case] op: UnaryExpressionOp,
         #[case] expected: proto_expr::UnaryExpressionOp,

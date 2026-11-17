@@ -155,6 +155,19 @@ pub enum UnaryExpressionOp {
         /// Encode timestamps with all six microsecond digits instead of three.
         full_precision_timestamps: bool,
     },
+    /// The file that stores a deletion vector, given its [`DeletionVectorDescriptor`] struct. The
+    /// output is STRING in the same form as an Add action's `path`:
+    ///
+    /// - `'u'` (UUID-relative): `<prefix>/deletion_vector_<uuid>.bin`, relative to the table root.
+    /// - `'p'` (absolute): `pathOrInlineDv` unchanged.
+    /// - `'r'` (raw relative, with `adaptive-metadata-in-dev`): `pathOrInlineDv` percent-encoded.
+    /// - `'i'` (inline): NULL, because no file stores the DV.
+    ///
+    /// A NULL descriptor produces NULL. A malformed `'u'` encoding, an unknown storage type, or a
+    /// NULL `storageType` or `pathOrInlineDv` in a non-NULL descriptor is an evaluation error.
+    ///
+    /// [`DeletionVectorDescriptor`]: crate::actions::deletion_vector::DeletionVectorDescriptor
+    DeletionVectorPath,
 }
 
 impl UnaryExpressionOp {
@@ -1255,6 +1268,7 @@ impl Display for UnaryExpressionOp {
         use UnaryExpressionOp::*;
         match self {
             ToJson { .. } => write!(f, "TO_JSON"),
+            DeletionVectorPath => write!(f, "DELETION_VECTOR_PATH"),
         }
     }
 }
