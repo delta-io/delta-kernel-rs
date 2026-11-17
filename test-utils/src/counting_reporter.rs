@@ -620,6 +620,7 @@ mod tests {
                         table_type: TableType::PathBased,
                         correlation_id: None,
                         load_type,
+                        duration: dur(),
                     }));
                 }
             }
@@ -871,6 +872,7 @@ mod tests {
             table_type: TableType::PathBased,
             correlation_id: None,
             load_type: SnapshotLoadType::SnapshotHint,
+            duration: dur(),
         }));
 
         reporter.reset();
