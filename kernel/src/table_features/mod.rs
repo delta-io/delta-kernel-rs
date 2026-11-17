@@ -384,6 +384,10 @@ static CHECK_CONSTRAINTS_INFO: FeatureInfo = FeatureInfo {
 // metadata cleanup. Any future metadata cleanup implementation must follow the above writer
 // requirements. Reference:
 // https://github.com/delta-io/delta/blob/master/protocol_rfcs/checkpoint-protection.md
+//
+// TODO(#2337): When enabling log compaction, account for feature drops: Kernel may not support
+// all features used by earlier commits in the compacted range. Make sure this is handled (e.g.,
+// skip ranges containing checkpoints).
 static CHECKPOINT_PROTECTION_INFO: FeatureInfo = FeatureInfo {
     feature_type: FeatureType::WriterOnly,
     min_legacy_version: None,
