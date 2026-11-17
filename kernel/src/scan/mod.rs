@@ -1493,29 +1493,21 @@ impl Scan {
             self.checkpoint_read_options();
         #[cfg(feature = "adaptive-metadata-in-dev")]
         if let Some(checkpoint) = self.snapshot.latest_checkpoint_action(engine)? {
-            // The scan's stats schema follows the snapshot's schema, which a later commit may have
-            // changed since the checkpoint's `content_stats` were written.
-            let stats_parsed = checkpoint.metadata().schema_string()
-                == self
-                    .snapshot
-                    .table_configuration()
-                    .metadata()
-                    .schema_string();
             // Leaf manifests are skipped with the same predicate and stats columns that data
             // skipping prunes their files with.
             let predicate = match &self.state_info.physical_predicate {
                 PhysicalPredicate::Some(predicate, _) => Some(predicate.clone()),
                 PhysicalPredicate::StaticSkipAll | PhysicalPredicate::None => None,
             };
-            let amt_stats = physical_stats_read_schema
-                .filter(|_| stats_parsed)
-                .map(|schema| {
-                    AmtStatsRequest::new(
-                        schema,
-                        predicate,
-                        &self.state_info.eligible_physical_stats_columns,
-                    )
-                });
+            let amt_stats = physical_stats_read_schema.and_then(|schema| {
+                AmtStatsRequest::for_checkpoint(
+                    &checkpoint,
+                    self.snapshot.table_configuration().metadata(),
+                    schema,
+                    predicate,
+                    &self.state_info.eligible_physical_stats_columns,
+                )
+            });
             return self
                 .snapshot
                 .log_segment()

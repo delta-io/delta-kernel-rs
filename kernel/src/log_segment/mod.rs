@@ -1048,9 +1048,8 @@ impl LogSegment {
     ///
     /// `table_root` resolves the action's manifest locations. `stats_schema` is the physical stats
     /// schema the caller replays with. `amt_stats` reads it from the content tree's
-    /// `content_stats` as `add.stats_parsed`. Those are keyed by the checkpoint's schema, so the
-    /// caller passes it only when `stats_schema` is derived from that same schema; otherwise the
-    /// tree's adds carry no stats.
+    /// `content_stats` as `add.stats_parsed` (see [`AmtStatsRequest::for_checkpoint`]); without it,
+    /// the tree's adds carry no stats.
     #[cfg(feature = "adaptive-metadata-in-dev")]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn read_actions_with_checkpoint_action(

@@ -20,7 +20,7 @@ use std::{iter, slice};
 use bytes::Bytes;
 use url::Url;
 
-use crate::actions::{ADD_NAME, ADD_SCHEMA, CheckpointAction, STATS_PARSED};
+use crate::actions::{ADD_NAME, ADD_SCHEMA, CheckpointAction, Metadata, STATS_PARSED};
 use crate::amt_path_util::{amt_location_to_add_path, amt_manifest_filemeta};
 use crate::cancellation::CancellationTokenRef;
 use crate::content_tree::dv_conversion::{
@@ -187,10 +187,27 @@ pub(crate) struct AmtStatsRequest<'a> {
 }
 
 impl<'a> AmtStatsRequest<'a> {
+    /// Requests the physical Delta stats `schema`, derived from `table_metadata`, from
+    /// `checkpoint`'s content tree, as [`Self::new`] does. Returns `None`, reading no stats and
+    /// skipping no leaf manifests, when `table_metadata` has a different table schema than the
+    /// checkpoint.
+    pub(crate) fn for_checkpoint(
+        checkpoint: &CheckpointAction,
+        table_metadata: &Metadata,
+        schema: &'a StructType,
+        predicate: Option<PredicateRef>,
+        stats_columns: &HashSet<ColumnName>,
+    ) -> Option<Self> {
+        // `content_stats` is written with the checkpoint's schema, which a later commit may have
+        // changed.
+        (checkpoint.metadata().schema_string() == table_metadata.schema_string())
+            .then(|| Self::new(schema, predicate, stats_columns))
+    }
+
     /// Requests the physical Delta stats `schema` (see [`StatsRead::try_new`] for its
     /// requirements), skipping the leaf manifests whose stats rule out `predicate`. The
     /// predicate's references to columns outside `stats_columns` cannot rule out a leaf.
-    pub(crate) fn new(
+    fn new(
         schema: &'a StructType,
         predicate: Option<PredicateRef>,
         stats_columns: &HashSet<ColumnName>,
