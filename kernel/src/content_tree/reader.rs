@@ -1100,8 +1100,8 @@ struct LeafRefVisitor<'u> {
     /// The table root URL relative leaf locations resolve against.
     table_root: &'u Url,
     leaves: Vec<LeafRef>,
-    /// The current batch's leaf filter output, set by [`Self::visit_batch`]: row `i`'s leaf is
-    /// [skipped](LeafRef::skipped) when `keep[i]` is false.
+    /// The leaf filter output of the batch [`Self::visit_batch`] is visiting, empty otherwise: row
+    /// `i`'s leaf is [skipped](LeafRef::skipped) when `keep[i]` is false.
     keep: Vec<bool>,
 }
 
@@ -1125,7 +1125,9 @@ impl<'u> LeafRefVisitor<'u> {
             ))
         );
         self.keep = keep;
-        self.visit_rows_of(batch)
+        let result = self.visit_rows_of(batch);
+        self.keep.clear();
+        result
     }
 }
 
@@ -1658,6 +1660,20 @@ mod tests {
         assert_result_error_with_message(
             visitor.visit_batch(batch.as_ref(), vec![true; batch.len()]),
             message,
+        );
+    }
+
+    #[test]
+    fn leaf_ref_visitor_does_not_reuse_selection_outside_visit_batch() {
+        let engine = SyncEngine::new();
+        let table_root = Url::parse("memory:///table/").unwrap();
+        let entry = data_manifest_entry("leaf.parquet", 1, TrackingStatus::Existing);
+        let batch = entry_batch(&engine, &[entry]);
+        let mut visitor = LeafRefVisitor::new(&table_root);
+        visitor.visit_batch(batch.as_ref(), vec![false]).unwrap();
+        assert_result_error_with_message(
+            visitor.visit_rows_of(batch.as_ref()),
+            "visited a row outside `visit_batch`",
         );
     }
 
