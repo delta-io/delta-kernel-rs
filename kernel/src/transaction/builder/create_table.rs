@@ -31,13 +31,12 @@ use crate::schema::{
 };
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::{
-    ColumnMappingMode, IcebergCompatValidationContext, SET_TABLE_FEATURE_SUPPORTED_PREFIX,
-    SET_TABLE_FEATURE_SUPPORTED_VALUE, TableFeature, V2_VALIDATOR, add_feature_to_lists,
-    assign_column_mapping_metadata, auto_enable_property_driven_features,
-    ensure_domain_metadata_dependency, find_max_column_id_in_schema,
-    get_any_level_column_physical_name, get_column_mapping_mode_from_properties,
-    schema_contains_timestamp_ntz, strip_stray_column_mapping_metadata,
-    validate_iceberg_compat_if_needed,
+    ColumnMappingMode, IcebergCompatValidationContext, SET_TABLE_FEATURE_SUPPORTED_VALUE,
+    TableFeature, V2_VALIDATOR, add_feature_to_lists, assign_column_mapping_metadata,
+    auto_enable_property_driven_features, ensure_domain_metadata_dependency,
+    find_max_column_id_in_schema, get_any_level_column_physical_name,
+    get_column_mapping_mode_from_properties, schema_contains_timestamp_ntz,
+    strip_stray_column_mapping_metadata, validate_iceberg_compat_if_needed,
 };
 use crate::table_properties::{
     CHECKPOINT_POLICY, COLUMN_MAPPING_MAX_COLUMN_ID, COLUMN_MAPPING_MODE, CheckpointPolicy,
@@ -45,6 +44,7 @@ use crate::table_properties::{
     ENABLE_ICEBERG_COMPAT_V2, ENABLE_ICEBERG_COMPAT_V3, ENABLE_ICEBERG_NATIVE_V4,
     ENABLE_IN_COMMIT_TIMESTAMPS, ENABLE_ROW_TRACKING, MATERIALIZED_ROW_COMMIT_VERSION_COLUMN_NAME,
     MATERIALIZED_ROW_ID_COLUMN_NAME, ROW_TRACKING_SUSPENDED, TableProperties,
+    is_table_feature_signal_key, strip_table_feature_signal_prefix,
     validate_and_normalize_property_for_create, validate_log_and_deleted_file_retention,
 };
 use crate::transaction::create_table::CreateTableTransaction;
@@ -776,15 +776,16 @@ fn validate_extract_table_features_and_properties(
 
     // Partition properties into feature signals and regular properties
     // Feature signals (delta.feature.X=supported) are processed but not stored in metadata
-    // Feature signals are removed from the properties map.
+    // Feature signals are removed from the properties map. Prefix match is case-insensitive so
+    // mixed-case keys do not fall through to property normalization.
     let (feature_signals, properties): (HashMap<_, _>, HashMap<_, _>) = properties
         .into_iter()
-        .partition(|(k, _)| k.starts_with(SET_TABLE_FEATURE_SUPPORTED_PREFIX));
+        .partition(|(k, _)| is_table_feature_signal_key(k));
 
     // Process and validate feature signals
     for (key, value) in &feature_signals {
-        // Safe: we partitioned for keys starting with this prefix above
-        let Some(feature_name) = key.strip_prefix(SET_TABLE_FEATURE_SUPPORTED_PREFIX) else {
+        // Safe: we partitioned with is_table_feature_signal_key above
+        let Some(feature_name) = strip_table_feature_signal_prefix(key) else {
             continue;
         };
 
@@ -1626,6 +1627,37 @@ mod tests {
             !validated
                 .properties
                 .contains_key("DELTA.checkpointInterval")
+        );
+    }
+
+    #[test]
+    fn test_create_rejects_conflicting_spellings_of_same_delta_key() {
+        assert_result_error_with_message(
+            validate_extract_table_features_and_properties(HashMap::from([
+                ("DELTA.checkpointInterval".to_string(), "1".to_string()),
+                ("delta.checkpointInterval".to_string(), "42".to_string()),
+            ])),
+            "Conflicting spellings of table property 'delta.checkpointInterval'",
+        );
+    }
+
+    #[test]
+    fn test_create_accepts_mixed_case_feature_signal_prefix() {
+        let properties = HashMap::from([(
+            "DELTA.feature.deletionVectors".to_string(),
+            "supported".to_string(),
+        )]);
+        let validated = validate_extract_table_features_and_properties(properties).unwrap();
+        assert!(
+            validated
+                .reader_features
+                .contains(&TableFeature::DeletionVectors)
+        );
+        assert!(
+            !validated
+                .properties
+                .keys()
+                .any(|key| key.eq_ignore_ascii_case("DELTA.feature.deletionVectors"))
         );
     }
 
