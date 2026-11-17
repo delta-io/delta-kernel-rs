@@ -1740,6 +1740,8 @@ impl ColumnNamesAndTypes {
     }
 }
 
+// Spark accepts omitted metadata, but defaults nullability only when both keys are omitted.
+// These coupled defaults require custom deserialization for direct and nested schema fields.
 impl<'de> Deserialize<'de> for StructField {
     fn deserialize<D>(deserializer: D) -> KernelResult<Self, D::Error>
     where
@@ -1760,7 +1762,7 @@ impl<'de> Deserialize<'de> for StructField {
     }
 }
 
-/// Field JSON before applying Spark's coupled omission defaults.
+/// Retains key presence so a supplied empty metadata object still requires explicit nullability.
 #[derive(Deserialize)]
 struct StructFieldDeHelper {
     name: String,
@@ -1772,7 +1774,10 @@ struct StructFieldDeHelper {
     metadata: Option<HashMap<MetadataKey, MetadataValue>>,
 }
 
-/// Rejects explicit nulls, reserving None for omitted fields.
+/// Keeps omission distinct from explicit null by deserializing supplied values as their concrete
+/// type.
+///
+/// Option's default deserializer would let null booleans or maps take the omission defaults.
 fn deserialize_present<'de, D, T>(deserializer: D) -> KernelResult<Option<T>, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -3482,6 +3487,7 @@ mod tests {
         assert!(fields.fields().all(|f| f.is_nullable()));
     }
 
+    /// Accepts Spark's omission forms while preserving explicit values across serialization.
     #[rstest]
     #[case::non_nullable_without_metadata(Some(false), None)]
     #[case::nullable_without_metadata(Some(true), None)]
@@ -3520,6 +3526,8 @@ mod tests {
         );
     }
 
+    /// Struct fields use the same omission defaults inside structs, array elements, and maps.
+    /// Explicit false nullability must survive at each nesting position.
     #[rstest]
     #[case::struct_type("/fields/0", |schema: StructType| schema.into())]
     #[case::array(
@@ -3560,6 +3568,8 @@ mod tests {
         assert_eq!(serde_json::from_value::<DataType>(json).unwrap(), expected);
     }
 
+    /// Defaults apply only to omitted keys; nulls and invalid types must remain errors.
+    /// Supplying metadata keeps nullability required, even for an empty object.
     #[rstest]
     #[case::null_metadata(r#""nullable":true,"metadata":null"#, "expected a map")]
     #[case::string_metadata(r#""nullable":true,"metadata":"bad""#, "expected a map")]
@@ -3588,6 +3598,7 @@ mod tests {
         #[case] fields: &str,
         #[case] expected_error: &str,
     ) {
+        // Raw JSON preserves duplicate keys so the deserializer can reject them.
         let json = format!(r#"{{"name":"value","type":"long",{fields}}}"#);
         assert_result_error_with_message(
             serde_json::from_str::<StructField>(&json),

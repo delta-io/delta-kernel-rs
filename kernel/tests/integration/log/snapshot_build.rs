@@ -157,6 +157,8 @@ async fn snapshot_schema_nesting_boundary(
     Ok(())
 }
 
+/// Persisted schemas use the field omission defaults while still requiring column-mapping
+/// annotations.
 #[rstest]
 #[case::no_mapping(None, None)]
 #[case::name_mapping(Some("name"), Some("delta.columnMapping.physicalName"))]
