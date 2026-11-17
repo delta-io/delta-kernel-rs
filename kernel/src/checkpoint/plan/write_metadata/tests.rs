@@ -154,10 +154,7 @@ async fn checkpoint_plan_persists_statistics_and_reloads_without_older_commits(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (_table, snapshot, engine) = if matches!(state, "native_stats" | "variant_stats") {
         crate::checkpoint::plan::tests::checkpoint_representation_table(
-            v2,
-            true,
-            false,
-            state == "variant_stats",
+            v2, true, false, false, true,
         )
         .await?
     } else {
@@ -211,6 +208,10 @@ async fn checkpoint_plan_persists_statistics_and_reloads_without_older_commits(
                     StructField::not_null("checkpoint_schema", DataType::STRING),
                 ]),
             )?),
+            nullable "prefetch": (schema! {
+                not_null "is_sidecar": BOOLEAN,
+                nullable "json": STRING,
+            }),
         },
     );
     let mut writes = plan.nodes.iter().filter_map(|node| match &node.op {
@@ -585,6 +586,9 @@ fn checkpoint_validates_add_count_against_crc(
 #[case::missing_root_location([1, 0, 17], &["statistics", "root_without_location"], Some("Invalid checkpoint result row"))]
 #[case::missing_root_size([1, 0, 17], &["statistics", "root_without_size"], Some("Invalid checkpoint result row"))]
 #[case::missing_root_time([1, 0, 17], &["statistics", "root_without_time"], Some("Invalid checkpoint result row"))]
+#[case::orphan_prefetch_json([1, 0, 17], &["statistics", "root", "orphan_prefetch"], Some("Invalid checkpoint result row"))]
+#[case::statistics_with_prefetch([1, 0, 17], &["statistics_with_prefetch", "root"], Some("Invalid checkpoint result row"))]
+#[case::schema_on_prefetch([1, 0, 17], &["statistics", "root", "prefetch_with_schema"], Some("Invalid checkpoint result row"))]
 #[case::late_error([1, 0, 17], &["statistics", "root", "late"], Some("late checkpoint result error"))]
 fn checkpoint_statistics_decoder_validates_counts_and_root(
     #[case] counts: [i64; 3],
@@ -607,6 +611,13 @@ fn checkpoint_statistics_decoder_validates_counts_and_root(
                     let mut partial = root.clone();
                     partial.as_object_mut().unwrap().remove("checkpoint_schema");
                     json!({"root": partial})
+                }
+                "orphan_prefetch" => json!({"prefetch":{"json":"{}"}}),
+                "statistics_with_prefetch" => {
+                    json!({"statistics":statistics,"prefetch":{"is_sidecar":true}})
+                }
+                "prefetch_with_schema" => {
+                    json!({"prefetch":{"is_sidecar":true},"root":{"checkpoint_schema":"not JSON"}})
                 }
                 "empty" => json!({}),
                 "overlapping" => json!({"statistics": statistics, "root": root}),
