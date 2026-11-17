@@ -174,12 +174,13 @@ impl<'a> FileColumns<'a> {
                 _ => array.clone(),
             })
         };
+        let uri = string("uri")?;
         let checksum = string("checksum")?;
         // A dictionary-encoded value is null if its key is, or if the key points to a null value,
         // so the nulls are taken after decoding.
         Ok(Self {
-            uri: string("uri")?,
-            uri_nulls: field("uri")?.logical_nulls(),
+            uri_nulls: uri.logical_nulls(),
+            uri,
             offset: int64("offset")?,
             size: int64("size")?,
             checksum,

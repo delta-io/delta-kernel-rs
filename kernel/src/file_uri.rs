@@ -165,12 +165,24 @@ fn write_location_uri_prefix(
         invalid("a write location cannot have a query or fragment")
     );
     let dir = value.strip_suffix('/').unwrap_or(value);
+    let empty_segment = || invalid("a write location cannot have an empty path segment");
     match check_uri(value).map_err(|e| invalid(&e.to_string()))? {
         CheckedUri::Absolute(_) => {
             let url = Url::parse(&format!("{dir}/")).map_err(|e| invalid(&e.to_string()))?;
             require!(
                 !url.cannot_be_a_base(),
                 invalid("an absolute write location must be a hierarchical URI")
+            );
+            // A URL with neither a host nor a path, such as `s3://`, has an empty path, so the
+            // file name would follow `//` and be read as the host.
+            let segments = url
+                .path()
+                .strip_prefix('/')
+                .ok_or_else(|| invalid("an absolute write location must have a host or a path"))?;
+            let segments = segments.strip_suffix('/').unwrap_or(segments);
+            require!(
+                segments.is_empty() || !segments.split('/').any(str::is_empty),
+                empty_segment()
             );
             require!(
                 !is_within(&url, table_root),
@@ -183,10 +195,7 @@ fn write_location_uri_prefix(
                 dir == FILES_DIR || dir.starts_with(&format!("{FILES_DIR}/")),
                 invalid("a relative write location must be under `_files`")
             );
-            require!(
-                !dir.split('/').any(str::is_empty),
-                invalid("a relative write location cannot have an empty path segment")
-            );
+            require!(!dir.split('/').any(str::is_empty), empty_segment());
             Ok(format!("{dir}/"))
         }
     }
@@ -272,18 +281,20 @@ fn uri_path(uri: &str, scheme_len: Option<usize>) -> &str {
 /// Returns whether `url` is `table_root` or under it.
 ///
 /// The scheme and authority (`scheme://[userinfo@]host[:port]`) are compared as text, ignoring
-/// case, and the paths segment by segment after percent-decoding each segment, so `%74able` for
-/// `table` counts as the table root, but a sibling that only shares a name prefix (`table2`) does
-/// not. The check is otherwise lexical: it doesn't unify scheme aliases such as `s3` and `s3a`, a
-/// default port written out, or userinfo, compares paths case-sensitively, and doesn't follow
-/// symlinks. A location spelled in one of those ways counts as outside.
+/// case, and the paths segment by segment after percent-decoding them, as an object store does.
+/// So `%74able` for `table` counts as the table root, as does `a/b` for a root spelled `a%2Fb`, but
+/// a sibling that only shares a name prefix (`table2`) does not. The check is otherwise lexical: it
+/// doesn't unify scheme aliases such as `s3` and `s3a`, a default port written out, or userinfo,
+/// compares paths case-sensitively, and doesn't follow symlinks. A location spelled in one of those
+/// ways counts as outside.
 fn is_within(url: &Url, table_root: &Url) -> bool {
     let authority = |url: &Url| url[..Position::BeforePath].to_ascii_lowercase();
     let segments = |url: &Url| -> Vec<String> {
-        url.path()
+        percent_decode_str(url.path())
+            .decode_utf8_lossy()
             .split('/')
             .filter(|segment| !segment.is_empty())
-            .map(|segment| percent_decode_str(segment).decode_utf8_lossy().into_owned())
+            .map(str::to_owned)
             .collect()
     };
     authority(url) == authority(table_root) && segments(url).starts_with(&segments(table_root))
@@ -545,6 +556,9 @@ mod tests {
     #[case::absolute_parent("s3://bucket/x/../table/p1", DOT)]
     #[case::absolute_fragment("s3://other/files#x", "query or fragment")]
     #[case::absolute_not_hierarchical("mailto:files@example.com", "hierarchical URI")]
+    #[case::absolute_no_host_or_path("s3://", "host or a path")]
+    #[case::absolute_empty_segment("s3://other/files//p1", "empty path segment")]
+    #[case::absolute_trailing_double_slash("s3://other/files//", "empty path segment")]
     fn test_write_location_uri_prefix_rejects(#[case] value: &str, #[case] reason: &str) {
         let err = write_location_uri_prefix(&root(), Some(value)).unwrap_err();
         assert!(
@@ -554,6 +568,14 @@ mod tests {
         let err = err.to_string();
         assert!(err.contains("delta.fileType.writeLocation"), "{err}");
         assert!(err.contains(reason), "{err}");
+    }
+
+    // An object store decodes the whole path, so `a%2Fb` and `a/b` are the same prefix.
+    #[test]
+    fn test_write_location_under_root_with_encoded_slash() {
+        let root = Url::parse("s3://bucket/a%2Fb/").unwrap();
+        let err = write_location_uri_prefix(&root, Some("s3://bucket/a/b/files")).unwrap_err();
+        assert!(err.to_string().contains("outside the table root"), "{err}");
     }
 
     #[rstest]
