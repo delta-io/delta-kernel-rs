@@ -300,11 +300,12 @@ enum StatBound {
 /// Bound of a BYTE_ARRAY or FIXED_LEN_BYTE_ARRAY column chunk as raw bytes.
 ///
 /// Legacy `min`/`max` footer fields are rejected: writers filled them using signed byte
-/// comparison, which disagrees with the unsigned order kernel applies to strings and binary as
-/// soon as a byte is >= 0x80, so either bound may exclude values the row group holds. Equal
-/// legacy bounds do not prove a single value either: parquet-mr before 1.8.0 could store a reused
-/// buffer as both bounds (PARQUET-251), and kernel has no `created_by` check to rule such files
-/// out.
+/// comparison, while data skipping compares these bounds with predicate literals through
+/// [`Scalar::logical_partial_cmp`], which orders `String` and `Binary` by unsigned bytes. The two
+/// orders disagree as soon as a byte is >= 0x80, so either bound may exclude values the row group
+/// holds. Equal legacy bounds do not prove a single value either: parquet-mr before 1.8.0 could
+/// store a reused buffer as both bounds (PARQUET-251), and kernel has no `created_by` check to
+/// rule such files out.
 fn byte_array_bound(stats: &Statistics, bound: StatBound) -> Option<&[u8]> {
     if stats.is_min_max_deprecated() {
         return None;
