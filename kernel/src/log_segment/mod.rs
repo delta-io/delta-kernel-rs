@@ -128,14 +128,16 @@ pub(crate) struct ActionsWithCheckpointInfo<A: KernelResultIterator<ActionsBatch
     pub checkpoint_info: CheckpointReadInfo,
 }
 
-/// A [`LogSegment`] represents a contiguous section of the log and is made of checkpoint files
-/// and commit files and guarantees the following:
+/// A [`LogSegment`] represents a contiguous section of the log and is made of checkpoint files,
+/// commit files, and log compaction files. It guarantees the following:
 ///     1. Commit file versions will not have any gaps between them.
 ///     2. If checkpoint(s) is/are present in the range, only commits with versions greater than the
 ///        most recent checkpoint version are retained. There will not be a gap between the
 ///        checkpoint version and the first commit version.
 ///     3. All checkpoint_parts must belong to the same checkpoint version, and must form a complete
 ///        version. Multi-part checkpoints must have all their parts.
+///     4. Each retained log compaction starts after the checkpoint version, if any, and ends at or
+///        before `end_version`.
 ///
 /// [`LogSegment`] is used in [`Snapshot`] when built with [`LogSegment::for_snapshot`], and
 /// in `TableChanges` when built with [`LogSegment::for_table_changes`].
@@ -1214,11 +1216,9 @@ impl LogSegment {
         Self::read_commit_files(engine, &files, schema)
     }
 
-    /// find a minimal set to cover the range of commits we want. This is greedy so not always
-    /// optimal, but we assume there are rarely overlapping compactions so this is okay. NB: This
-    /// returns files is DESCENDING ORDER, as that's what `replay` expects. This function assumes
-    /// that all files in `self.ascending_commit_files` and `self.ascending_compaction_files` are in
-    /// range for this log segment. [`LogSegment::try_new`] enforces this invariant.
+    /// Returns commits and log compactions covering the segment's commits, newest first.
+    /// The greedy selection may not be minimal when compactions overlap. It relies on the file
+    /// range guarantees of [`LogSegment`].
     pub(crate) fn find_commit_cover(&self) -> Vec<FileMeta> {
         self.find_commit_cover_after(None)
     }
@@ -1975,8 +1975,8 @@ impl LogSegment {
     }
 
     /// Retains the files on failure so callers can classify errors using the validated state.
-    /// Commits and compactions at or before the checkpoint are filtered out; commits are filtered
-    /// before replay continuity checks.
+    /// Commits at or before the checkpoint are filtered out before replay continuity checks.
+    /// Log compactions outside the range guaranteed by [`LogSegment`] are dropped.
     fn try_new_impl(
         listed_files: &mut LogSegmentFiles,
         log_root: Url,
@@ -2008,8 +2008,8 @@ impl LogSegment {
             &listed_files.checkpoint_parts,
             end_version,
         )?;
-        // Like commits, compactions must start after the checkpoint: replay reads them ahead of
-        // it. Future compactions cannot bound replay or post-commit statistics.
+        // Like commits, compactions must start after the checkpoint: replay should only read
+        // compactions ahead of the checkpoint.
         listed_files.ascending_compaction_files.retain(|file| {
             matches!(
                 file.file_type,
