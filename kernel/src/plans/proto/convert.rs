@@ -20,7 +20,7 @@ use crate::expressions::{
 };
 use crate::plans::ir::nodes::{
     Agg, Aggregate, DynamicScan, FileType, Filter, Operator, PrefixSum, Project, RelationRef,
-    ScanFile, ScanJson, ScanParquet, SemiJoin, Values, WriteJson, WriteParquet,
+    ScanFile, ScanJson, ScanParquet, SemiJoin, Values, WriteJson, WriteParquet, WriteParquetFiles,
 };
 use crate::plans::ir::plan::{Plan, PlanNode};
 use crate::plans::{IoOperation, Operation};
@@ -157,6 +157,7 @@ impl From<&Operator> for proto_plan::Operator {
             Operator::PrefixSum(n) => Op::PrefixSum(n.into()),
             Operator::WriteJson(n) => Op::WriteJson(n.into()),
             Operator::WriteParquet(n) => Op::WriteParquet(n.into()),
+            Operator::WriteParquetFiles(n) => Op::WriteParquetFiles(n.into()),
             Operator::SemiJoin(n) => Op::SemiJoin(n.into()),
             Operator::UnionAll(_) => Op::UnionAll(proto_plan::UnionAllNode {}),
         };
@@ -254,6 +255,16 @@ impl From<&WriteParquet> for proto_plan::WriteParquetNode {
                     agg: Some((&stats.agg).into()),
                 })
                 .collect(),
+        }
+    }
+}
+
+impl From<&WriteParquetFiles> for proto_plan::WriteParquetFilesNode {
+    fn from(node: &WriteParquetFiles) -> Self {
+        Self {
+            write_schema: Some(node.write_schema.as_ref().into()),
+            base_url: node.base_url.to_string(),
+            file_name_template: node.file_name_template.clone(),
         }
     }
 }
@@ -498,6 +509,7 @@ impl From<&MapToStructOptions> for proto_expr::MapToStructOptions {
     fn from(options: &MapToStructOptions) -> Self {
         Self {
             timestamp_timezone: options.timestamp_timezone().map(ToOwned::to_owned),
+            null_on_invalid: options.null_on_invalid(),
         }
     }
 }
@@ -1136,7 +1148,7 @@ mod tests {
     use crate::plans::ir::nodes::{
         Agg, Aggregate, DynamicScan, FILE_META_SCHEMA, FileType, Filter, Operator, PrefixSum,
         Project, RelationRef, ScanFile, ScanJson, ScanParquet, SemiJoin, StatsAgg, UnionAll,
-        Values, WriteJson, WriteParquet,
+        Values, WriteJson, WriteParquet, WriteParquetFiles,
     };
     use crate::plans::ir::plan::{Plan, PlanNode};
     use crate::plans::proto::{
@@ -1501,6 +1513,10 @@ mod tests {
     #[case(Operator::WriteParquet(WriteParquet::new(
         sample_schema(), Url::parse("memory:///out.parquet").unwrap(),
     )), "write_parquet")]
+    #[case(Operator::WriteParquetFiles(WriteParquetFiles {
+        write_schema: sample_schema(), base_url: Url::parse("memory:///files/").unwrap(),
+        file_name_template: "part-{uuid}.parquet".into(),
+    }), "write_parquet_files")]
     fn from_operator(#[case] op: Operator, #[case] expected: &str) {
         use proto_plan::operator::Op;
         let kind = match proto_plan::Operator::from(&op).op.unwrap() {
@@ -1517,6 +1533,12 @@ mod tests {
             Op::UnionAll(_) => "union_all",
             Op::WriteJson(_) => "write_json",
             Op::WriteParquet(_) => "write_parquet",
+            Op::WriteParquetFiles(node) => {
+                assert_eq!(node.write_schema, Some(sample_schema().as_ref().into()));
+                assert_eq!(node.base_url, "memory:///files/");
+                assert_eq!(node.file_name_template, "part-{uuid}.parquet");
+                "write_parquet_files"
+            }
         };
         assert_eq!(kind, expected);
     }
@@ -2035,8 +2057,8 @@ mod tests {
         assert!(parse_json.output_schema.is_some());
     }
 
-    #[test]
-    fn from_map_to_struct_expression() {
+    #[rstest]
+    fn from_map_to_struct_expression(#[values(false, true)] null_on_invalid: bool) {
         let proto_expr::expression::Kind::MapToStruct(map_to_struct) = expr_kind_of(
             Expression::map_to_struct(col!("m"), MapToStructOptions::default()),
         ) else {
@@ -2048,7 +2070,9 @@ mod tests {
         let proto_expr::expression::Kind::MapToStruct(map_to_struct) =
             expr_kind_of(Expression::map_to_struct(
                 col!("m"),
-                MapToStructOptions::default().with_timestamp_timezone("America/Los_Angeles"),
+                MapToStructOptions::default()
+                    .with_timestamp_timezone("America/Los_Angeles")
+                    .with_null_on_invalid(null_on_invalid),
             ))
         else {
             panic!("expected a map_to_struct expression");
@@ -2059,6 +2083,10 @@ mod tests {
                 .as_ref()
                 .and_then(|options| options.timestamp_timezone.as_deref()),
             Some("America/Los_Angeles")
+        );
+        assert_eq!(
+            map_to_struct.options.unwrap().null_on_invalid,
+            null_on_invalid
         );
     }
 

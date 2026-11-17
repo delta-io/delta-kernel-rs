@@ -2,24 +2,27 @@
 
 mod write_metadata;
 
-use super::{CheckpointWriter, collation_stats};
+use std::sync::Arc;
+
+use super::CheckpointWriter;
 use crate::action_reconciliation::RetentionCalculator as _;
-use crate::action_reconciliation::log_replay::ActionReconciliationBatch;
 use crate::action_reconciliation::plan::action_set::ActionSet;
 use crate::action_reconciliation::plan::{MetadataPlanner, VERSION};
 use crate::actions::{CHECKPOINT_METADATA_FIELD, CHECKPOINT_METADATA_NAME, CheckpointMetadata};
-use crate::expressions::{Expression as Expr, Predicate, Scalar, col, column_name, lit, null_lit};
-use crate::plans::{Operation, Plan, PlanBuilder};
+use crate::expressions::{Expression as Expr, Predicate, Scalar, col, lit, null_lit};
+use crate::plans::{Plan, PlanBuilder};
 use crate::scan::{PartitionValuesOptions, StatsOptions};
+use crate::schema::StructType;
 use crate::struct_patch::ProjectionStructPatchBuilder;
-use crate::{Engine, FilteredEngineData, KernelError, KernelResult};
+use crate::{Engine, KernelError, KernelResult};
 
 impl CheckpointWriter {
     /// Builds rows for a single-part V1 or inline V2 checkpoint, based on the table features.
     ///
     /// Shares source planning and typed metadata conversion with scans. File writing and
-    /// publication remain with the caller. Structured collation stats require an extra engine
-    /// replay during planning to sample one live Add using Kernel's existing sampling policy.
+    /// publication remain with the caller. Ordinary V2 statistics support structured output.
+    /// Collation bounds stay in JSON, retained alongside structured stats even when
+    /// `delta.checkpoint.writeStatsAsJson` is false, without planning-time sampling.
     pub fn declarative_checkpoint_data_plan(&self, engine: &dyn Engine) -> KernelResult<Plan> {
         self.checkpoint_actions(engine)?.build()
     }
@@ -71,11 +74,19 @@ impl CheckpointWriter {
     ///
     /// The non-content plan reads the checkpoint root without resolving sidecars. Sidecar
     /// references, checkpointMetadata, and publication are supplied by the write orchestration.
-    /// Structured collation stats require the same planning-time sampling replay as V1.
+    /// Collation-specific bounds stay in JSON stats, without sampling live Add actions.
     pub fn declarative_v2_checkpoint_data_plans(
         &self,
         engine: &dyn Engine,
     ) -> KernelResult<(Plan, Plan)> {
+        let (content, non_content) = self.v2_checkpoint_actions(engine)?;
+        Ok((content.build()?, non_content.build()?))
+    }
+
+    fn v2_checkpoint_actions(
+        &self,
+        engine: &dyn Engine,
+    ) -> KernelResult<(PlanBuilder, PlanBuilder)> {
         if !self.schema_context.is_v2 {
             return Err(KernelError::unsupported(
                 "V2 checkpoint plans require the v2Checkpoint feature",
@@ -87,8 +98,7 @@ impl CheckpointWriter {
             .filter(file_retention_predicate(
                 self.deleted_file_retention_timestamp()?,
             ))?
-            .project_patch(checkpoint_file_projection)?
-            .build()?;
+            .project_patch(checkpoint_file_projection)?;
         let non_content = MetadataPlanner::new(
             self.snapshot.log_segment(),
             ActionSet {
@@ -102,8 +112,7 @@ impl CheckpointWriter {
         .filter(non_content_retention_predicate(
             self.get_transaction_expiration_timestamp()?,
         ))?
-        .project_patch(|patch| patch.drop(VERSION))?
-        .build()?;
+        .project_patch(|patch| patch.drop(VERSION))?;
         Ok((content, non_content))
     }
 
@@ -128,52 +137,13 @@ impl CheckpointWriter {
         let write_parsed = write_stats_as_struct.unwrap_or(true);
         let write_struct = context.is_v2 && write_parsed;
         let shape = self.snapshot.checkpoint_info(engine)?;
-        let output_stats_schema = if write_struct && config.has_collations_feature() {
-            // The engine reconciles files; only one live Add returns for versioned schema
-            // discovery.
-            let sample = MetadataPlanner::new(
-                self.snapshot.log_segment(),
-                ActionSet::live_adds_with_tombstones(),
-                false,
-            )
-            .with_checkpoint_info(shape.clone())
-            .with_stats(StatsOptions::json_only())
-            .with_stats_schemas(Some(context.stats_schema.clone()), None)
-            .with_read_collations(true)
-            .replay()?
-            .aggregate_ungrouped(|aggs| {
-                aggs.max_non_null_by(
-                    column_name!("add"),
-                    column_name!("add.path"),
-                    column_name!(VERSION),
-                )
-            })?
-            .filter(col!("add.path").is_not_null())?
-            .build()?;
-            let mut batches = engine
-                .require_plan_executor()?
-                .execute_op(Operation::QueryPlan(sample))?
-                .into_data()?
-                .map(|data| {
-                    data.map(|data| ActionReconciliationBatch {
-                        actions_count: data.len() as i64,
-                        add_actions_count: data.len() as i64,
-                        remove_actions_count: 0,
-                        filtered_data: FilteredEngineData::with_all_rows_selected(data),
-                    })
-                });
-            collation_stats::checkpoint_stats_schema(
-                &self.snapshot,
-                context.stats_schema.clone(),
-                &mut batches,
-            )?
-            .0
-        } else {
-            context.stats_schema.clone()
-        };
+        // Versioned collation keys need dynamic field names. Keep them in JSON, while ordinary
+        // structured stats use the writer's fixed schema without a planning-time replay.
+        let output_stats_schema = context.stats_schema.clone();
         // JSON VARIANT bounds require Z85 encoding.
         let stats = StatsOptions {
-            synthesize_json: context.stats_config.write_stats_as_json,
+            synthesize_json: context.stats_config.write_stats_as_json
+                || (write_struct && config.has_collations_feature()),
             #[cfg(feature = "geo-type-in-dev")]
             geometry_min_max: true,
             ..if write_struct {
@@ -182,22 +152,37 @@ impl CheckpointWriter {
                 StatsOptions::json_only()
             }
         };
+        let read_collations = stats.synthesize_json && config.has_collations_feature();
+        // Obsolete values may parse to null before replay, even for NOT NULL table columns.
+        let partition_schema = context
+            .partition_schema
+            .as_ref()
+            .filter(|_| write_parsed)
+            .map(|schema| {
+                Arc::new(StructType::new_unchecked(schema.fields().cloned().map(
+                    |mut field| {
+                        field.nullable = true;
+                        field
+                    },
+                )))
+            });
         Ok(MetadataPlanner::new(segment, actions, false)
             .with_checkpoint_info(shape)
+            .with_permissive_partition_parsing()
             .with_stats_schemas(
                 stats
                     .json_synthesis_schema(config)?
                     .or_else(|| write_struct.then(|| output_stats_schema.clone())),
                 write_struct.then_some(output_stats_schema),
             )
-            .with_read_collations(config.has_collations_feature())
+            .with_read_collations(read_collations)
             .with_stats(stats)
             .with_partition_values(
                 PartitionValuesOptions {
                     parsed_struct: write_parsed,
                     ..Default::default()
                 },
-                context.partition_schema.clone().filter(|_| write_parsed),
+                partition_schema,
             ))
     }
 }
@@ -224,7 +209,7 @@ fn file_retention_predicate(file_cutoff: i64) -> Predicate {
 
 fn non_content_retention_predicate(txn_cutoff: Option<i64>) -> Predicate {
     let txn_retained = match txn_cutoff {
-        // Replay has already suppressed older versions; missing lastUpdated expires with retention.
+        // Replay suppresses older versions; missing lastUpdated expires with retention.
         Some(cutoff) => Predicate::or(
             col!("txn.appId").is_null(),
             col!("txn.lastUpdated").gt(lit(cutoff)),

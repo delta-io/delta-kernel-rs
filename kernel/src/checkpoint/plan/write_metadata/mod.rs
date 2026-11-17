@@ -1,10 +1,9 @@
-//! Checkpoint manifests and `_last_checkpoint` metadata over reconstructed actions and completed
-//! writes.
+//! Checkpoint manifests and complete `_last_checkpoint` metadata.
 //!
-//! Counts describe retained rows; byte sizes come from caller-supplied completed write results.
-//! V2 prefetch is bounded in the engine before returning to Kernel. Kernel serializes the hint
-//! with schema hints. A fresh checkpoint has no compacted-file
-//! chain; AMT and legacy multipart generation are outside this planner's scope.
+//! The complete checkpoint plan shares reconstruction between counts and writes. Byte sizes come
+//! from completed file descriptors; V2 prefetch is bounded in the engine. Kernel drains the result
+//! and serializes the hint, including schema hints, before publication.
+//! AMT and legacy multipart generation are outside this planner's scope.
 
 use std::sync::{Arc, LazyLock};
 
@@ -13,12 +12,15 @@ use serde::de::DeserializeOwned;
 mod write;
 
 use super::super::{CheckpointWriter, LastCheckpointHintStats, V2CheckpointConfig};
-#[cfg(test)]
-use crate::EngineData;
-use crate::actions::{CHECKPOINT_METADATA_FIELD, SIDECAR_FIELD, SIDECAR_FILE_SCHEMA_TAG, Sidecar};
+use crate::action_reconciliation::plan::action_set::ActionSet;
+use crate::actions::{
+    CHECKPOINT_METADATA_FIELD, CHECKPOINT_METADATA_NAME, SIDECAR_FIELD, SIDECAR_FILE_SCHEMA_TAG,
+    Sidecar,
+};
 use crate::engine_data::TypedGetData as _;
 use crate::expressions::{
-    ColumnName, Expression as Expr, Scalar, UnaryExpressionOp, col, column_name, lit, null_lit,
+    ColumnName, Expression as Expr, Predicate, Scalar, UnaryExpressionOp, col, column_name, lit,
+    null_lit,
 };
 use crate::last_checkpoint_hint::{
     CheckpointFileStatus, LAST_CHECKPOINT_NON_FILE_ACTIONS_THRESHOLD,
@@ -26,10 +28,9 @@ use crate::last_checkpoint_hint::{
 };
 use crate::path::{CheckpointInstance, ParsedLogPath};
 use crate::plans::ir::nodes::Agg;
-use crate::plans::{Plan, RelationRef};
-#[cfg(test)]
-use crate::schema::StructField;
-use crate::schema::{DataType, SchemaRef, StructType, ToSchema as _, lazy_schema_ref, schema};
+use crate::schema::{
+    DataType, SchemaRef, StructField, StructType, ToSchema as _, lazy_schema_ref, schema,
+};
 use crate::{FileMeta, GetData, KernelError, KernelResult, PlanBuilder, RowVisitor};
 
 const NUM_ACTIONS: &str = "num_actions";
@@ -50,25 +51,14 @@ static STATISTICS_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
 };
 
 impl CheckpointWriter {
-    /// Projects completed sidecar write results into sidecar actions.
-    /// Input rows contain `path` relative to `_sidecars/`, `size` in bytes, and
-    /// `file_modification` in milliseconds since the Unix epoch.
-    pub fn declarative_sidecar_actions_plan(sidecars: RelationRef) -> KernelResult<Plan> {
-        sidecar_actions(sidecars)?.build()
-    }
-
-    /// Builds the V2 manifest rows, including sidecar references and fresh checkpoint metadata.
-    /// `content_counts` contains `num_actions` and `num_of_add_files` for the sidecar input.
-    /// The engine combines these counts with completed sidecar sizes and constructs the metadata.
-    /// `content_schema` is the sidecar input schema; its bounded JSON goes in `sidecarFileSchema`.
-    /// No files are written: retain these rows for the manifest write and hint computation.
-    pub fn declarative_v2_checkpoint_manifest_plan(
+    // Combine completed sidecars, retained non-content actions, and fresh checkpoint metadata.
+    fn v2_manifest(
         &self,
-        non_content: RelationRef,
-        sidecars: RelationRef,
-        content_counts: RelationRef,
+        non_content: PlanBuilder,
+        sidecars: PlanBuilder,
+        content_counts: PlanBuilder,
         content_schema: &SchemaRef,
-    ) -> KernelResult<Plan> {
+    ) -> KernelResult<PlanBuilder> {
         if !self.schema_context.is_v2 {
             return Err(KernelError::unsupported(
                 "A V2 manifest requires a V2 checkpoint writer",
@@ -90,12 +80,7 @@ impl CheckpointWriter {
             checkpoint_schema_json(content_schema)?
                 .map(|schema| (lit(SIDECAR_FILE_SCHEMA_TAG), lit(schema))),
         );
-        let metadata = checkpoint_totals(
-            PlanBuilder::relation_source(content_counts),
-            Some(sidecars.clone()),
-            None,
-        )?
-        .project(
+        let metadata = checkpoint_totals(content_counts, Some(sidecars.clone()), None)?.project(
             Expr::struct_from([Expr::struct_from([lit(self.version), Expr::map(tags)])]),
             Arc::new(schema! { (&CHECKPOINT_METADATA_FIELD) }),
         )?;
@@ -106,34 +91,57 @@ impl CheckpointWriter {
                 .cloned()
                 .chain([SIDECAR_FIELD.clone(), CHECKPOINT_METADATA_FIELD.clone()]),
         )?);
-        let inputs = [
-            PlanBuilder::relation_source(non_content),
-            sidecar_actions(sidecars)?,
-            metadata,
-        ]
-        .into_iter()
-        .map(|input| {
-            // Disjoint action arms share a root schema; only the union needs typed null columns.
-            let expr = Expr::struct_from(schema.fields().map(|field| {
-                if input.schema().contains(field.name()) {
-                    Expr::column([field.name()])
-                } else {
-                    null_lit(field.data_type().clone())
-                }
-            }));
-            input.project(expr, schema.clone())
-        })
-        .collect::<KernelResult<Vec<_>>>()?;
-        PlanBuilder::union_all(inputs)?.build()
+        let inputs = [non_content, sidecar_actions(sidecars)?, metadata]
+            .into_iter()
+            .map(|input| {
+                // Disjoint action arms share a root schema; only the union needs typed null
+                // columns.
+                let expr = Expr::struct_from(schema.fields().map(|field| {
+                    if input.schema().contains(field.name()) {
+                        Expr::column([field.name()])
+                    } else {
+                        null_lit(field.data_type().clone())
+                    }
+                }));
+                input.project(expr, schema.clone())
+            })
+            .collect::<KernelResult<Vec<_>>>()?;
+        PlanBuilder::union_all(inputs)
     }
 
-    /// Builds bounded V2 hint prefetch from the retained manifest rows.
-    /// Each list is complete, including checkpointMetadata, or omitted when it exceeds the
-    /// count threshold. The bound is enforced in the engine before any rows reach Kernel.
-    /// A null JSON row marks a complete list, keeping empty lists distinct from omitted lists.
-    pub fn declarative_last_checkpoint_prefetch_plan(manifest: RelationRef) -> KernelResult<Plan> {
-        let manifest = PlanBuilder::relation_source(manifest);
-        let non_content = manifest.clone().filter(col!("sidecar.path").is_null())?;
+    // Bound each complete hint list independently before returning any action JSON to Kernel.
+    fn last_checkpoint_prefetch(actions: PlanBuilder) -> KernelResult<PlanBuilder> {
+        let non_file_names = ActionSet {
+            live_adds: false,
+            include_tombstones: false,
+            ..ActionSet::ALL
+        }
+        .output_action_names()
+        .chain([CHECKPOINT_METADATA_NAME])
+        .filter(|name| actions.schema().contains(name))
+        .collect::<Vec<_>>();
+        let non_content_schema = Arc::new(StructType::try_new(
+            actions
+                .schema()
+                .fields()
+                .filter(|field| non_file_names.contains(&field.name().as_str()))
+                .cloned(),
+        )?);
+        let non_content = actions
+            .clone()
+            .filter(Predicate::or_from(
+                non_file_names
+                    .iter()
+                    .map(|name| Expr::column([*name]).is_not_null()),
+            ))?
+            .project(
+                Expr::struct_from(
+                    non_content_schema
+                        .fields()
+                        .map(|field| Expr::column([field.name()])),
+                ),
+                non_content_schema,
+            )?;
         let schema = Arc::new(schema! { not_null "action": (non_content.schema().clone()) });
         let expr = Expr::struct_from([Expr::struct_from(
             non_content
@@ -142,7 +150,11 @@ impl CheckpointWriter {
                 .map(|field| Expr::column([field.name()])),
         )]);
         let non_content = non_content.project(expr, schema)?;
-        let sidecars = manifest.filter(col!("sidecar.path").is_not_null())?;
+        let sidecars = if actions.schema().contains("sidecar") {
+            actions.filter(col!("sidecar.path").is_not_null())?
+        } else {
+            PlanBuilder::values(Arc::new(schema! { (&SIDECAR_FIELD) }), vec![])?
+        };
         PlanBuilder::union_all([
             bounded_prefetch(
                 non_content,
@@ -156,8 +168,7 @@ impl CheckpointWriter {
                 true,
                 LAST_CHECKPOINT_SIDECARS_THRESHOLD,
             )?,
-        ])?
-        .build()
+        ])
     }
 
     fn serialize_checkpoint_hint(
@@ -193,12 +204,12 @@ impl CheckpointWriter {
         }
         let root_size = i64::try_from(root_file.size)
             .map_err(|_| KernelError::checkpoint_write("Checkpoint root size exceeds i64"))?;
-        let has_sidecars = self.schema_context.is_v2
+        let with_sidecars = self.schema_context.is_v2
             && matches!(
                 &self.v2_checkpoint_config,
                 V2CheckpointConfig::WithSidecar { .. }
             );
-        if stats.size_in_bytes < root_size || (!has_sidecars && stats.size_in_bytes != root_size) {
+        if stats.size_in_bytes < root_size || (!with_sidecars && stats.size_in_bytes != root_size) {
             return Err(KernelError::checkpoint_write(
                 "Checkpoint byte count does not match root file",
             ));
@@ -238,40 +249,6 @@ impl CheckpointWriter {
     }
 }
 
-impl RowVisitor for LastCheckpointHintStats {
-    fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
-        static NAMES: LazyLock<[ColumnName; 3]> = LazyLock::new(|| {
-            [
-                column_name!(NUM_ACTIONS),
-                column_name!(NUM_ADDS),
-                column_name!(NUM_BYTES),
-            ]
-        });
-        (&*NAMES, &[DataType::LONG, DataType::LONG, DataType::LONG])
-    }
-
-    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> KernelResult<()> {
-        if row_count != 1 {
-            return Err(KernelError::checkpoint_write(
-                "Checkpoint statistics must contain exactly one row",
-            ));
-        }
-        self.num_actions = getters[0].get(0, NUM_ACTIONS)?;
-        self.num_of_add_files = getters[1].get(0, NUM_ADDS)?;
-        self.size_in_bytes = getters[2].get(0, NUM_BYTES)?;
-        if self.num_actions < self.num_of_add_files
-            || self.num_of_add_files < 0
-            || self.size_in_bytes < 0
-        {
-            return Err(KernelError::checkpoint_write(
-                "Invalid checkpoint statistics",
-            ));
-        }
-        Ok(())
-    }
-}
-
-#[cfg(test)]
 fn action_counts(actions: PlanBuilder, includes_adds: bool) -> KernelResult<PlanBuilder> {
     let counts = actions.aggregate_ungrouped(|aggs| {
         let aggs = aggs.aggregate_as(Agg::count_star(), NUM_ACTIONS);
@@ -293,15 +270,15 @@ fn action_counts(actions: PlanBuilder, includes_adds: bool) -> KernelResult<Plan
 // Only count rows and file descriptors enter this union; full action state stays in the engine.
 fn checkpoint_totals(
     counts: PlanBuilder,
-    sidecars: Option<RelationRef>,
-    root: Option<RelationRef>,
+    sidecars: Option<PlanBuilder>,
+    root: Option<PlanBuilder>,
 ) -> KernelResult<PlanBuilder> {
     let mut inputs = vec![counts.project(
         Expr::struct_from([col!(NUM_ACTIONS), col!(NUM_ADDS), lit(0i64)]),
         STATISTICS_SCHEMA.clone(),
     )?];
     for files in [sidecars, root].into_iter().flatten() {
-        inputs.push(PlanBuilder::relation_source(files).project(
+        inputs.push(files.project(
             Expr::struct_from([lit(0i64), lit(0i64), col!("size")]),
             STATISTICS_SCHEMA.clone(),
         )?);
@@ -313,19 +290,8 @@ fn checkpoint_totals(
     })
 }
 
-#[cfg(test)]
-fn read_statistics(data: &dyn EngineData) -> KernelResult<LastCheckpointHintStats> {
-    let mut stats = LastCheckpointHintStats {
-        num_actions: 0,
-        num_of_add_files: 0,
-        size_in_bytes: 0,
-    };
-    stats.visit_rows_of(data)?;
-    Ok(stats)
-}
-
-fn sidecar_actions(sidecars: RelationRef) -> KernelResult<PlanBuilder> {
-    PlanBuilder::relation_source(sidecars).project(
+fn sidecar_actions(sidecars: PlanBuilder) -> KernelResult<PlanBuilder> {
+    sidecars.project(
         Expr::struct_from([Expr::struct_from([
             col!("path"),
             col!("size"),
@@ -360,12 +326,13 @@ fn bounded_prefetch(
         PREFETCH_SCHEMA.clone(),
         vec![vec![is_sidecar.into(), Scalar::null(DataType::STRING)]],
     )?;
-    let rows = input.project(
+    // Gate before ToJson so omitted lists do not serialize every action. The marker distinguishes
+    // a complete empty list from an omitted list.
+    let rows = input.semi_join(within_limit.clone(), [], [])?.project(
         Expr::struct_from([lit(is_sidecar), json]),
         PREFETCH_SCHEMA.clone(),
     )?;
-    // Empty-key semi-join is EXISTS: suppress the entire list, including its marker, over the cap.
-    PlanBuilder::union_all([marker, rows])?.semi_join(within_limit, [], [])
+    PlanBuilder::union_all([marker.semi_join(within_limit, [], [])?, rows])
 }
 
 impl RowVisitor for LastCheckpointV2 {
