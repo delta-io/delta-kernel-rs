@@ -9,7 +9,10 @@ use delta_kernel::transaction::{Transaction, UpdateTableOperation};
 use delta_kernel::{Engine, KernelError, KernelResult, Snapshot, SnapshotRef};
 use rstest::rstest;
 use serde_json::json;
-use test_utils::{add_commit, create_add_files_metadata, test_table_setup, test_table_setup_mt};
+use test_utils::{
+    add_commit, assert_result_error_with_message, create_add_files_metadata, test_table_setup,
+    test_table_setup_mt,
+};
 use url::Url;
 
 use crate::common::write_utils::get_scan_files;
@@ -254,5 +257,20 @@ async fn alter_table_commit_succeeds_only_with_ack_and_keeps_constraints(
     let altered = txn.commit(engine.as_ref())?.unwrap_post_commit_snapshot();
     let from_altered = constraint_pairs(altered.check_constraints());
     assert_eq!(from_altered, POSITIVE_AMOUNT);
+    Ok(())
+}
+
+#[tokio::test]
+async fn schema_overwrite_rejects_retained_check_constraints() -> delta_kernel::Result<()> {
+    let (_tmp, table_path, engine) = test_table_setup()?;
+    let table_url = write_table(&table_path, CHECK_CONSTRAINTS_FEATURE, POSITIVE_AMOUNT).await?;
+    let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
+    assert_result_error_with_message(
+        snapshot
+            .update_table(UpdateTableOperation::Overwrite, "test", true)
+            .with_schema(schema_ref! { nullable "renamed": STRING }, true)
+            .build(engine.as_ref(), Box::new(FileSystemCommitter::new())),
+        "Schema overwrite with CHECK constraints is not supported",
+    );
     Ok(())
 }
