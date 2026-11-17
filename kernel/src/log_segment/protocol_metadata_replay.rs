@@ -206,10 +206,7 @@ impl LogSegment {
         let (commit_paths, extra_actions) =
             (segment.commit_paths(self), segment.extra_actions(self)?);
         #[cfg(not(feature = "adaptive-metadata-in-dev"))]
-        let (commit_paths, extra_actions) = (
-            self.original_commit_paths(None, self.end_version),
-            Vec::new(),
-        );
+        let (commit_paths, extra_actions) = (self.find_commit_cover_paths(None), Vec::new());
         let schema = pm_plan_schema(&extra_actions)?;
 
         let commits = PlanBuilder::scan_json(
@@ -355,7 +352,7 @@ impl LogSegment {
         #[cfg(feature = "adaptive-metadata-in-dev")]
         let commit_paths = segment.commit_paths(self);
         #[cfg(not(feature = "adaptive-metadata-in-dev"))]
-        let commit_paths = self.original_commit_paths(None, self.end_version);
+        let commit_paths = self.find_commit_cover_paths(None);
         let commit_files = commit_paths
             .into_iter()
             .map(|path| path.location.clone())
@@ -398,6 +395,22 @@ impl LogSegment {
                 actions: batch.actions,
             })
         }))
+    }
+
+    /// The commit cover, newest first. When a log compaction covers the newest commit, that commit
+    /// is also read as its own file: compactions drop `commitInfo`, and with it the newest
+    /// `lastManifestCommit`. Only that `commitInfo` is needed from the newest commit; the
+    /// compaction is still generally cheaper to read than the commits it replaces.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    fn pm_commit_cover_paths(&self) -> Vec<&ParsedLogPath> {
+        let mut paths = self.find_commit_cover_paths(None);
+        if let Some(newest_commit) = self.newest_commit_after_checkpoint()
+            && !paths.contains(&newest_commit)
+        {
+            // Put it first so replay reads the pointer even if it stops early.
+            paths.insert(0, newest_commit);
+        }
+        paths
     }
 
     /// The newest commit after the checkpoint, if any.
@@ -498,14 +511,18 @@ impl PmReader {
     }
 
     /// Whether replay must read the newest commit of `log_segment` before it can choose the older
-    /// files, because a plan fixes its files before it runs.
+    /// files: a plan fixes its files before it runs, and a log compaction can hide the pointed
+    /// commit's checkpoint action from a single pass of file reads.
     #[cfg(feature = "adaptive-metadata-in-dev")]
     fn reads_newest_commit_first(&self, log_segment: &LogSegment) -> bool {
         log_segment.newest_commit_after_checkpoint().is_some()
             && match self {
                 #[cfg(feature = "declarative-plans")]
                 Self::Plan(_) => true,
-                Self::Files => false,
+                Self::Files => log_segment
+                    .pm_commit_cover_paths()
+                    .iter()
+                    .any(|path| !path.is_commit()),
             }
     }
 }
@@ -518,8 +535,9 @@ enum PmReplaySegment {
     WholeSegment,
     /// Only the newest commit.
     NewestCommit,
-    /// The commits after `oldest_exclusive` (all when `None`), except the newest. Also keeps
-    /// the checkpoint action in the manifest commit at `manifest_commit`.
+    /// The commits after `oldest_exclusive` (all when `None`), except the newest. The manifest
+    /// commit at `manifest_commit` is read as its own file, so a log compaction cannot hide its
+    /// checkpoint action.
     OlderCommits {
         oldest_exclusive: Option<Version>,
         manifest_commit: Option<Version>,
@@ -567,14 +585,17 @@ impl PmReplaySegment {
     /// The commit files the replay reads from `log_segment`.
     fn commit_paths(self, log_segment: &LogSegment) -> Vec<&ParsedLogPath> {
         match self {
-            Self::WholeSegment => log_segment.original_commit_paths(None, log_segment.end_version),
+            Self::WholeSegment => log_segment.pm_commit_cover_paths(),
             Self::NewestCommit => Vec::from_iter(log_segment.newest_commit_after_checkpoint()),
             Self::OlderCommits {
-                oldest_exclusive, ..
+                oldest_exclusive,
+                manifest_commit,
             } => match log_segment.end_version.checked_sub(1) {
-                Some(newest_inclusive) => {
-                    log_segment.original_commit_paths(oldest_exclusive, newest_inclusive)
-                }
+                Some(newest_inclusive) => log_segment.find_commit_cover_paths_in_range(
+                    oldest_exclusive,
+                    newest_inclusive,
+                    manifest_commit.as_slice(),
+                ),
                 // A segment ending at version 0 has no commits older than its newest.
                 None => Vec::new(),
             },

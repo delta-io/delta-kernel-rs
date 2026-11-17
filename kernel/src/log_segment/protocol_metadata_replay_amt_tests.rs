@@ -1444,6 +1444,21 @@ async fn check_pointer_after_newest_commit<E: Engine>(
         .schema(test_schema_flat_with_column_mapping())
         .last_manifest_commit(resolved_pointer(2, 1))
 )]
+// A checkpoint file bounds this replay and supplies P&M, so replay needs no checkpoint action.
+// When a compaction hides the pointed manifest commit, replay keeps no action, ignoring older
+// manifest commits' actions, and the snapshot follows the pointer.
+#[case::bounded_replay_drops_older_action(
+    ReplayLog::after_manifest_commit(vec![
+        checkpoint_commit(1, &[], one_column_schema()),
+        checkpoint_commit(2, &[], one_column_schema()),
+        commit_info(Some(pointer(2, 2))),
+    ])
+    .with_checkpoint_at(0)
+    .with_compaction((2, 3), txn_commit()),
+    ReplayExpectation::default()
+        .captured(None)
+        .last_manifest_commit(resolved_pointer(2, 2))
+)]
 // Replay stops at the pointed manifest commit v1 without reading older commits; the unparseable v0
 // fails the build if replay reads it.
 #[case::stops_at_pointed_commit_in_compaction_ending_at_newest(
