@@ -924,6 +924,7 @@ impl CastExpression {
     /// The name a cast is lowered to where a boundary has no cast node and must pass it as
     /// [`Expression::Unknown`].
     #[internal_api]
+    #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
     pub(crate) fn unknown_name(&self) -> String {
         let prefix = match self.mode {
             CastMode::Safe => "cast_to",

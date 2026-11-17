@@ -337,7 +337,7 @@ pub trait KernelPredicateEvaluator {
                 Distinct => self.eval_pred_distinct(col, val, inverted),
                 In => None, // arg order is semantically important
             },
-            // Strict casts can fail instead of yielding NULL, so they don't drive pruning.
+            // Only safe casts are evaluated: `eval_pred_cast` assumes a failed cast is NULL.
             (Cast(c), Literal(val)) if c.mode == CastMode::Safe => match c.expr.as_ref() {
                 Column(col) => self.eval_pred_cast(op, col, &c.target, val, inverted),
                 _ => None,
@@ -711,7 +711,9 @@ impl<R: ResolveColumnAsScalar> DefaultKernelPredicateEvaluator<R> {
                     warn!("Failed to evaluate {:?}: {err:?}", op.as_ref());
                 })
                 .ok(),
-            Expr::Cast(c) => cast_scalar(self.eval_expr(&c.expr)?, &c.target, c.mode),
+            // Only safe casts are evaluated: a strict cast fails rather than yielding NULL.
+            Expr::Cast(c) if c.mode == CastMode::Strict => None,
+            Expr::Cast(c) => cast_scalar(self.eval_expr(&c.expr)?, &c.target),
             // ParseJson and MapToStruct produce structured output, not scalar values
             Expr::ParseJson(_) | Expr::MapToStruct(_) => None,
             Expr::Unknown(_) => None,
@@ -719,37 +721,25 @@ impl<R: ResolveColumnAsScalar> DefaultKernelPredicateEvaluator<R> {
     }
 }
 
-/// Casts a scalar according to `mode`: a string source is parsed into a primitive target via
-/// [`PrimitiveType::parse_scalar`](crate::schema::PrimitiveType::parse_scalar), and a source
-/// already of the target type passes through. A string that does not parse to a value yields
-/// `Scalar::Null` under [`CastMode::Safe`]. Under [`CastMode::Strict`] it yields `None`, since the
-/// cast fails rather than producing a value.
+/// Casts a scalar following SQL `CAST` semantics: a string source is parsed into a primitive target
+/// via [`PrimitiveType::parse_scalar`](crate::schema::PrimitiveType::parse_scalar), and a source
+/// already of the target type passes through. An unparseable string yields `Scalar::Null`.
 ///
 /// String-to-primitive, identity, and null-source conversions are handled; any other source/target
 /// combination yields `None`, including numeric/temporal casts like `Long -> Int` that the arrow
 /// path can perform. The accepted string formats are a strict subset of arrow's (e.g. arrow parses
-/// the hyphen-less `20240115` as a date but `parse_scalar` does not), so a safe cast here is only
-/// ever more conservative than arrow: a form it rejects becomes NULL, never a differing non-null
-/// value.
-fn cast_scalar(value: Scalar, target: &DataType, mode: CastMode) -> Option<Scalar> {
+/// the hyphen-less `20240115` as a date but `parse_scalar` does not), so this path is only ever
+/// more conservative than arrow: a form it rejects becomes NULL, never a differing non-null value.
+fn cast_scalar(value: Scalar, target: &DataType) -> Option<Scalar> {
     if value.data_type() == *target {
         return Some(value);
     }
     match (value, target) {
-        // `parse_scalar` reads an empty string as NULL, which a strict cast must reject too.
-        (Scalar::String(raw), DataType::Primitive(ptype)) => {
-            match ptype
+        (Scalar::String(raw), DataType::Primitive(ptype)) => Some(
+            ptype
                 .parse_scalar(&raw)
-                .ok()
-                .filter(|parsed| !parsed.is_null())
-            {
-                Some(parsed) => Some(parsed),
-                None => (mode == CastMode::Safe).then(|| Scalar::Null(target.clone())),
-            }
-        }
-        // Only a string source is known to cast to every primitive type, so a strict cast of any
-        // other NULL may be an unsupported pair, which fails rather than yielding NULL.
-        (Scalar::Null(source), _) if mode == CastMode::Strict && source != DataType::STRING => None,
+                .unwrap_or_else(|_| Scalar::Null(target.clone())),
+        ),
         (Scalar::Null(_), _) => Some(Scalar::Null(target.clone())),
         _ => None,
     }
@@ -812,7 +802,7 @@ impl<R: ResolveColumnAsScalar> KernelPredicateEvaluator for DefaultKernelPredica
         val: &Scalar,
         inverted: bool,
     ) -> Option<bool> {
-        let col = cast_scalar(self.resolve_column(col)?, target, CastMode::Safe)?;
+        let col = cast_scalar(self.resolve_column(col)?, target)?;
         self.eval_pred_binary_scalars(op, &col, val, inverted)
     }
 
