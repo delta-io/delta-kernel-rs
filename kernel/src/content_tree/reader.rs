@@ -713,13 +713,12 @@ struct LeafToAddActions {
 }
 
 impl LeafToAddActions {
-    /// Validates all the leaves and reads those not [skipped](LeafRef::skipped), with
-    /// `read_schema` (see [`ManifestReadSchema::leaf`]), stopping when `cancellation_token` is
-    /// cancelled.
+    /// Validates and reads the leaves not [skipped](LeafRef::skipped), with `read_schema` (see
+    /// [`ManifestReadSchema::leaf`]), stopping when `cancellation_token` is cancelled.
     ///
     /// # Errors
     /// Returns an error if two leaves share a location (their batches could not be told apart), if
-    /// a leaf cannot yet be read (see [`LeafRef::check_readable`]), if a leaf's
+    /// a leaf to read cannot yet be read (see [`LeafRef::check_readable`]), if a leaf's
     /// context cannot be built (see [`LeafReadContext::new`]), or if the engine fails to start the
     /// read.
     fn try_new(
@@ -736,15 +735,11 @@ impl LeafToAddActions {
                 dup.file_meta.location
             )));
         }
-        // A skipped leaf is still checked, so whether the read path supports a tree does not depend
-        // on the predicate.
-        for leaf in &leaves {
-            leaf.check_readable()?;
-        }
         let (pending, files): (VecDeque<_>, Vec<_>) = leaves
             .into_iter()
             .filter(|leaf| !leaf.skipped)
             .map(|leaf| {
+                leaf.check_readable()?;
                 let location = leaf.file_meta.location.to_string();
                 let context =
                     LeafReadContext::new(engine, &leaf.parent_info, leaf.manifest_dv, ctx)
@@ -3461,17 +3456,19 @@ mod tests {
         );
     }
 
-    /// Whether a tree is readable does not depend on the predicate: a skipped leaf the read path
-    /// could not read still fails the read.
     #[test]
-    fn read_add_actions_from_amt_checks_skipped_leaves() {
+    fn read_add_actions_from_amt_rejects_unreadable_leaf_only_when_not_skipped() {
         let engine = memory_engine();
         let mut unreadable = missing_leaf();
         unreadable.manifest_info.as_mut().unwrap().format_version = 0;
         let checkpoint = write_root_of_ranged_leaves(&engine, unreadable);
 
+        let skipped =
+            read_tree_skipping(&engine, &checkpoint, Pred::gt(col!("phys_id"), lit(100i64)));
+        assert_eq!(skipped.unwrap(), vec![("high.parquet".to_string(), 1000)]);
+
         assert_result_error_with_message(
-            read_tree_skipping(&engine, &checkpoint, Pred::gt(col!("phys_id"), lit(100i64))),
+            read_tree_skipping(&engine, &checkpoint, Pred::lt(col!("phys_id"), lit(100i64))),
             "only supports format version",
         );
     }
