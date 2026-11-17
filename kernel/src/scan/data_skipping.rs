@@ -7,8 +7,6 @@ use tracing::{debug, error, trace};
 
 use crate::actions::visitors::SelectionVectorVisitor;
 use crate::actions::{MAX_VALUES, MIN_VALUES, NULL_COUNT, NUM_RECORDS};
-#[cfg(feature = "adaptive-metadata-in-dev")]
-use crate::expressions::null_lit;
 use crate::expressions::{
     BinaryPredicateOp, ColumnName, Expression as Expr, ExpressionRef, JunctionPredicateOp,
     MapToStructOptions, OpaquePredicateOpRef, Predicate as Pred, PredicateRef, Scalar, col,
@@ -292,35 +290,6 @@ impl DataSkippingFilter {
             is_add_expr,
             input_schema,
             &physical_stats_columns,
-            None,
-        )
-    }
-
-    /// Builds a filter over batches of `input_schema` in which every row is a file to prune, with
-    /// `stats_expr` extracting its data stats as `stats_schema` and no partition values.
-    ///
-    /// Returns `None` (equivalent to keep-all) when the predicate is ineligible for data skipping.
-    /// See [`Self::new`] for how `stats_columns` must line up with `stats_schema`.
-    #[cfg(feature = "adaptive-metadata-in-dev")]
-    pub(crate) fn for_stats(
-        engine: &dyn Engine,
-        predicate: PredicateRef,
-        stats_schema: &SchemaRef,
-        stats_expr: ExpressionRef,
-        input_schema: SchemaRef,
-        stats_columns: &HashSet<ColumnName>,
-    ) -> Option<Self> {
-        Self::new(
-            engine,
-            Some(predicate),
-            Some(stats_schema),
-            stats_expr,
-            None,
-            Arc::new(null_lit(DataType::BOOLEAN)),
-            // No row is a Remove whose partition predicate needs guarding.
-            Arc::new(lit(true)),
-            input_schema,
-            stats_columns,
             None,
         )
     }

@@ -40,6 +40,7 @@ use crate::engine_data::{
 };
 use crate::expressions::{
     ArrayData, ColumnName, Expression, ExpressionRef, MapData, PredicateRef, Scalar, expr, lit,
+    null_lit,
 };
 use crate::scan::data_skipping::DataSkippingFilter;
 use crate::scan::log_replay::{
@@ -288,14 +289,19 @@ impl StatsRead {
         let skipping = self.skipping.as_ref()?;
         // Without `content_stats` every converted stat is null, so no leaf could be ruled out.
         self.content_stats.as_ref()?;
-        // The content tree carries no partition values yet (see #3320).
-        DataSkippingFilter::for_stats(
+        DataSkippingFilter::new(
             engine,
-            skipping.predicate.clone(),
-            &self.schema,
+            Some(skipping.predicate.clone()),
+            Some(&self.schema),
             self.expression.clone(),
+            // The content tree carries no partition values yet (see #3320).
+            None,
+            Arc::new(null_lit(DataType::BOOLEAN)),
+            // No root entry is a Remove whose partition predicate needs guarding.
+            Arc::new(lit(true)),
             root_schema,
             &skipping.stats_columns,
+            None,
         )
     }
 }
