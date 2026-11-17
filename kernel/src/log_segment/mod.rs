@@ -2011,10 +2011,12 @@ impl LogSegment {
         // Like commits, compactions must start after the checkpoint: replay reads them ahead of
         // it. Future compactions cannot bound replay or post-commit statistics.
         listed_files.ascending_compaction_files.retain(|file| {
-            let LogPathFileType::CompactedCommit { hi } = file.file_type else {
-                return false;
-            };
-            checkpoint_version.is_none_or(|cp| cp < file.version) && hi <= effective_version
+            matches!(
+                file.file_type,
+                LogPathFileType::CompactedCommit { hi }
+                    if checkpoint_version.is_none_or(|cp| cp < file.version)
+                        && hi <= effective_version
+            )
         });
         validate_latest_commit_file(listed_files, effective_version)?;
         validate_crc(
