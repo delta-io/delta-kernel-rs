@@ -55,6 +55,9 @@ cargo build --workspace --all-features
 # Run all tests (prefer nextest over cargo test)
 cargo nextest run --workspace --all-features
 
+# Run doctests
+cargo test --workspace --all-features --doc
+
 # Run tests for a specific crate
 cargo nextest run -p delta_kernel --all-features
 
@@ -74,25 +77,11 @@ cargo clippy-no-default-kernel-dependents
 cargo check-no-default-kernel
 cargo check-no-default-engine
 cargo clippy-no-default-kernel-leaves
-
-# Download the latest upstream catalog and record its commit and hash.
-cargo xtask update-delta-error-catalog
-
-# Generate DeltaErrorCondition from the local catalog and selected-conditions.json.
-# --check fails if stale, writing nothing.
-cargo xtask generate-delta-error-conditions [--check]
-
-# Local pre-push check (a subset of CI)
-cargo +nightly fmt \
-  && cargo clippy --workspace --benches --tests --all-features -- -D warnings \
-  && RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps \
-  && cargo nextest run --workspace --all-features \
-  && cargo test --workspace --all-features --doc
 ```
 
-CI runs more than the pre-push check: it passes `--locked`, runs the no-default-features aliases
-above, verifies the MSRV, and runs the `ffi` tests under Miri. `.github/workflows/build.yml` is
-authoritative.
+Before pushing, run the format, lint, and doc check, then all tests and the doctests. CI runs more
+than that: it passes `--locked`, runs the no-default-features aliases above, verifies the MSRV, and
+runs the `ffi` tests under Miri. `.github/workflows/build.yml` is authoritative.
 
 Use `cargo metadata --no-deps` to discover current workspace package names. Read each crate's
 `Cargo.toml` for its feature flags; the manifests are the source of truth.
@@ -137,16 +126,12 @@ Use `cargo metadata --no-deps` to discover current workspace package names. Read
 - Prefer descriptive test names over doc comments. Encode the scenario and expected
   behavior in the test name. Only add a test doc comment when the intent is too
   verbose or complex to express succinctly in the name.
-- Use `rstest` to parameterize tests that share the same logic but differ in setup
-  or inputs. Prefer `#[case]` over duplicating test functions. When parameters are
-  independent and form a cartesian product, prefer `#[values]` over enumerating
-  every combination with `#[case]`.
-- Actively look for rstest consolidation opportunities: when writing multiple tests
-  that share the same setup/flow and differ only in configuration and expected
-  outcome, write one parameterized rstest instead of separate functions. Also check
-  whether a new test duplicates the flow of an existing nearby test and should be
-  merged into it as a new `#[case]`. A common pattern is toggling a feature (e.g.
-  column mapping on/off) and asserting success vs. error.
+- Use `rstest` when tests share the same logic and differ only in setup, inputs, or expected
+  outcome: write one parameterized test with `#[case]` instead of separate functions. When
+  parameters are independent and form a cartesian product, use `#[values]` instead of enumerating
+  every combination. Before adding a test, check whether a nearby test has the same flow and
+  should gain a new `#[case]`. A common pattern is toggling a feature (e.g. column mapping on/off)
+  and asserting success vs. error.
 - Reuse helpers from `test_utils` and the integration-test fixtures instead of writing
   custom ones when possible. See **Common test helpers** below for a curated starter list.
 - **Committing in tests:** Use `txn.commit(engine)?.unwrap_committed()` to assert a
@@ -203,15 +188,12 @@ This list is non-exhaustive: when in doubt, browse the source files directly
 
 **Table creation in tests**
 
-- `test_utils::table_builder::TestTableBuilder` (and the `test_table(...)` shorthand): worth
-  considering for a table in a specific state: composes `LogState`, `FeatureSet`,
-  `DataLayoutConfig`, and `TableConfig` through the real write path. Pair with the
-  `build_snapshot!` macro and, for broad coverage, the `default_sweep` template. See the Testing
-  section above.
+- `test_utils::table_builder::TestTableBuilder` (and the `test_table(...)` shorthand): see the
+  Testing section above.
 - Prefer the kernel `create_table` builder
   (`delta_kernel::transaction::create_table::create_table`) when you need a single bespoke
-  table rather than the builder's composed states. It exercises the same path connectors use
-  and auto-derives the protocol from the schema and feature flags.
+  table rather than `TestTableBuilder`'s composed states. It exercises the same path connectors
+  use and auto-derives the protocol from the schema and feature flags.
 - `test_utils::create_table` (a JSON helper that hand-rolls protocol + metadata) is older
   but still needed when the kernel builder cannot enable a particular feature combination.
 
@@ -245,8 +227,9 @@ and update this section in your PR. The same pattern works for
 
 ## Common Gotchas
 
-- **EngineData is opaque:** NEVER downcast to `ArrowEngineData` or any concrete type
-  in production code (ok in tests). NEVER assume one batch per file: ALWAYS iterate.
+- **EngineData is opaque:** inspect rows through the visitor APIs. NEVER downcast to
+  `ArrowEngineData` or any concrete type in production code (ok in tests). NEVER assume one batch
+  per file: ALWAYS iterate.
 - **Column mapping:** Physical column names can differ from logical names. ALWAYS use
   the schema from `Snapshot::schema()` for user data columns. Metadata/system schema
   column names (defined by the protocol) are not subject to column mapping.
@@ -267,6 +250,7 @@ and update this section in your PR. The same pattern works for
   thread-local dispatch tests or assume no other thread can emit an event.
 - **Generated code:** files starting with ``//! Generated by `cargo xtask ...` `` are never edited by
   hand. Change the generator in `xtask/` or its inputs and rerun the command.
+  `kernel/error_catalog/README.md` documents the error-catalog commands.
 
 ## Code Style
 
@@ -310,15 +294,15 @@ and update this section in your PR. The same pattern works for
   `Iterator<Item = KernelResult<T>> + Send`, including in public APIs. Use
   `impl KernelResultIterator<T>` for unboxed streams and `Box<dyn KernelResultIterator<T>>`
   (`'static`) or `Box<dyn KernelResultIterator<T> + '_>` (borrowed) at dyn/storage boundaries.
-- Prefer the `lit` / `null_lit` constructors over `Expression::literal(...)` / `lit(Scalar::Null(...))`
-  when building expressions inline. They take `impl Into<Scalar>` and `impl Into<DataType>`,
-  respectively. Prefer `Predicate::TRUE` / `FALSE` / `NULL` for predicates whose value is statically
-  known, reserving `Predicate::literal(b)` for runtime `bool` values.
-- Prefer the `col!` macro and `lit(value)` constructor over `Expression::column(...)` /
-  `Expression::literal(...)` when building expressions inline. `col!` uses the same
-  compile-time segment rules as `column_name!` (string literals split on `.`; constants are
-  single simple segments). Use `Expression::column([...])` for runtime or non-simple names.
-  (`column_expr!` is a doc-hidden compatibility alias of `col!`.)
+- When building expressions inline, prefer `lit(value)` and `null_lit(data_type)` over
+  `Expression::literal(...)` and `lit(Scalar::Null(...))`, and the `col!` macro over
+  `Expression::column(...)`. `lit` takes `impl Into<Scalar>` and `null_lit` takes
+  `impl Into<DataType>`. `col!` uses the same compile-time segment rules as `column_name!`
+  (string literals split on `.`; constants are single simple segments); use
+  `Expression::column([...])` for runtime or non-simple names. (`column_expr!` is a doc-hidden
+  compatibility alias of `col!`.)
+- Prefer `Predicate::TRUE` / `FALSE` / `NULL` for predicates whose value is statically known,
+  reserving `Predicate::literal(b)` for runtime `bool` values.
 - Prefer the `schema!` / `schema_ref!` macros for inline declarative schema literals,
   `lazy_schema_ref!` for `LazyLock<SchemaRef>` statics, and `try_schema!` when names of
   interpolated fields might collide. Outside the kernel crate, these macros require the
