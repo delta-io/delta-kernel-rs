@@ -1271,10 +1271,7 @@ impl<STATE, MODE: ExecutionMode> Transaction<STATE, MODE> {
 
     /// Generate non-file commit actions as in-memory structs, that can then be encoded into the
     /// committable format (e.g EngineData)
-    fn prepare_nonfile_actions(
-        &mut self,
-        engine: &dyn Engine,
-    ) -> KernelResult<NonfileCommitActions> {
+    fn prepare_nonfile_actions(&mut self, engine: &dyn Engine) -> Result<NonfileCommitActions> {
         let set_transactions = self.set_transactions.clone();
         let in_commit_timestamp = self.get_in_commit_timestamp(engine)?;
         let mut kernel_commit_info = CommitInfo::new(

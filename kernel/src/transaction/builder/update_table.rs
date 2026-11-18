@@ -359,12 +359,22 @@ impl<MODE: ExecutionMode> TransactionBuilder<UpdateTable, MODE> {
         }
         validate_properties_removed_keys(&self.local_state.properties_removed)?;
         // Overlap check needs canonical add keys (`DELTA.checkpointInterval` vs remove of
-        // `delta.checkpointInterval`).
-        let properties_added = if self.local_state.properties_added.is_empty() {
-            HashMap::new()
-        } else {
-            validate_and_canonicalize_properties_added(&self.local_state.properties_added)?
-        };
+        // `delta.checkpointInterval`). Feature signals are not table properties and are
+        // validated by parse_feature_signal during build.
+        let non_feature_batches: Vec<Vec<(String, String)>> = self
+            .local_state
+            .properties_added
+            .iter()
+            .map(|batch| {
+                batch
+                    .iter()
+                    .filter(|(key, _)| !key.starts_with(SET_TABLE_FEATURE_SUPPORTED_PREFIX))
+                    .cloned()
+                    .collect()
+            })
+            .filter(|batch: &Vec<_>| !batch.is_empty())
+            .collect();
+        let properties_added = validate_and_canonicalize_properties_added(&non_feature_batches)?;
         validate_properties_added_removed_no_overlap(
             &properties_added,
             &self.local_state.properties_removed,
@@ -457,11 +467,24 @@ fn try_new_update_table<MODE: ExecutionMode>(
     )?;
 
     let is_alter = operation == UpdateTableOperation::AlterTable;
-    let (feature_signals, properties_added): (HashMap<String, String>, HashMap<String, String>) =
-        properties_added
-            .into_iter()
-            .partition(|(key, _)| key.starts_with(SET_TABLE_FEATURE_SUPPORTED_PREFIX));
-    let feature_signals = feature_signals
+    // Feature signals (`delta.feature.X=supported`) are partitioned out of each add-batch and are
+    // not stored in metadata; remaining batches keep call-order for canonicalization.
+    let mut feature_signal_pairs = HashMap::new();
+    let mut remaining_batches = Vec::new();
+    for batch in properties_added {
+        let mut remaining = Vec::new();
+        for (key, value) in batch {
+            if key.starts_with(SET_TABLE_FEATURE_SUPPORTED_PREFIX) {
+                feature_signal_pairs.insert(key, value);
+            } else {
+                remaining.push((key, value));
+            }
+        }
+        if !remaining.is_empty() {
+            remaining_batches.push(remaining);
+        }
+    }
+    let feature_signals = feature_signal_pairs
         .iter()
         .map(|(key, value)| parse_feature_signal(key, value, "UPDATE TABLE"))
         .collect::<KernelResult<Vec<_>>>()?;
@@ -470,10 +493,10 @@ fn try_new_update_table<MODE: ExecutionMode>(
         Some(changes) => apply_schema_changes(effective_table_config, changes)?,
         None => effective_table_config,
     };
-    let properties_added = if properties_added.is_empty() {
+    let properties_added = if remaining_batches.is_empty() {
         HashMap::new()
     } else {
-        let validated = validate_and_canonicalize_properties_added(&properties_added)?;
+        let validated = validate_and_canonicalize_properties_added(&remaining_batches)?;
         // ALTER TABLE always keeps requested adds (Spark always rewrites Metadata for SET
         // TBLPROPERTIES). Data operations drop identical values so Metadata is emitted only when
         // a value actually changes.
@@ -517,7 +540,8 @@ fn try_new_update_table<MODE: ExecutionMode>(
     if operation == UpdateTableOperation::AlterTable && !should_emit_metadata {
         return Err(KernelError::invalid_transaction_state(
             "ALTER TABLE requires at least one table change",
-        ));
+        )
+        .into());
     }
 
     Ok(Transaction {
@@ -1600,7 +1624,7 @@ mod tests {
 
         assert!(matches!(
             &error,
-            KernelError::InvalidTransactionState(message)
+            Error::Kernel(KernelError::InvalidTransactionState(message))
             if message == "blind append cannot include property changes"
         ));
         Ok(())

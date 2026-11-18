@@ -26,7 +26,7 @@ use crate::table_properties::{
     MATERIALIZED_ROW_ID_COLUMN_NAME, ROW_TRACKING_SUSPENDED, TableProperties,
     UNIVERSAL_FORMAT_ENABLED_FORMATS,
 };
-use crate::{KernelError, KernelResult};
+use crate::{KernelError, KernelResult, Result};
 
 /// Table features that `delta.feature.<name>=supported` may enable, on CREATE/UPDATE TABLE
 ///
@@ -165,7 +165,7 @@ pub(crate) fn prepare_protocol_for_update(
     before: &TableConfiguration,
     after: TableConfiguration,
     feature_signals: &[TableFeature],
-) -> KernelResult<ProtocolPrepResult> {
+) -> Result<ProtocolPrepResult> {
     reject_existing_table_toggles(before, &after, feature_signals)?;
 
     let mut metadata = after.metadata().clone();
@@ -198,7 +198,8 @@ pub(crate) fn prepare_protocol_for_update(
                 return Err(KernelError::generic(format!(
                     "Catalog-managed tables require '{ENABLE_IN_COMMIT_TIMESTAMPS}=true', \
                      but it was explicitly set to 'false'"
-                )));
+                ))
+                .into());
             }
             None => {
                 metadata = metadata.with_configuration_entry(ENABLE_IN_COMMIT_TIMESTAMPS, "true");
