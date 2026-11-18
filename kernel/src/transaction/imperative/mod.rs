@@ -328,6 +328,7 @@ impl<STATE> Transaction<STATE, Imperative> {
             )?;
         }
         // Millisecond stats JSON can't keep the microsecond bounds a non-null tightStats promises.
+        // TODO(#3491): relax this check.
         if self.effective_table_config.stats_json_op() == UnaryExpressionOp::TO_JSON {
             write_validation::validate_no_tight_stats_set(
                 &self.staged_data_changes.add_files_metadata,
