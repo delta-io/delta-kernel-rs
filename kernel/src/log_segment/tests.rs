@@ -2082,11 +2082,29 @@ async fn test_list_log_files_with_version() -> KernelResult<()> {
     Ok(())
 }
 
+#[rstest]
+#[case::simple(&[0, 1, 2], &[(1, 2)], None, None, &[0, 1, 2], &[(1, 2)])]
+#[case::in_version_range(&[0, 1, 2, 3], &[(1, 2)], None, Some(2), &[0, 1, 2], &[(1, 2)])]
+#[case::out_of_version_range(&[0, 1, 2, 3, 4], &[(1, 3)], None, Some(2), &[0, 1, 2], &[])]
+#[case::multiple_compactions(
+    &[0, 1, 2, 3, 4, 5], &[(1, 2), (3, 5)], None, None,
+    &[0, 1, 2, 3, 4, 5], &[(1, 2), (3, 5)],
+)]
+#[case::one_compaction_out_of_range(
+    &[0, 1, 2, 3, 4, 5], &[(1, 2), (3, 5)], None, Some(4),
+    &[0, 1, 2, 3, 4], &[(1, 2)],
+)]
+#[case::with_checkpoint(&[0, 1, 2, 4, 5], &[(1, 2), (4, 5)], Some(3), None, &[4, 5], &[(4, 5)])]
+#[case::before_checkpoint(&[0, 1, 2, 4, 5], &[(1, 2)], Some(3), None, &[4, 5], &[])]
+#[case::starting_at_checkpoint(&[0, 1, 2, 4, 5], &[(3, 5)], Some(3), None, &[4, 5], &[])]
+#[tokio::test]
 async fn test_compaction_listing(
-    commit_versions: &[u64],
-    compaction_versions: &[(u64, u64)],
-    checkpoint_version: Option<u64>,
-    version_to_load: Option<u64>,
+    #[case] commit_versions: &[Version],
+    #[case] compaction_versions: &[(Version, Version)],
+    #[case] checkpoint_version: Option<Version>,
+    #[case] version_to_load: Option<Version>,
+    #[case] expected_commits: &[Version],
+    #[case] expected_compactions: &[(Version, Version)],
 ) {
     let log_segment = create_segment_for(LogSegmentConfig {
         published_commit_versions: commit_versions,
@@ -2096,141 +2114,19 @@ async fn test_compaction_listing(
         ..Default::default()
     })
     .await;
-    let version_to_load = version_to_load.unwrap_or(u64::MAX);
-    let checkpoint_cuttoff = checkpoint_version.map(|v| v as i64).unwrap_or(-1);
-    let expected_commit_versions: Vec<&u64> = commit_versions
-        .iter()
-        .filter(|v| **v as i64 > checkpoint_cuttoff && **v <= version_to_load)
-        .collect();
-    let expected_compaction_versions: Vec<&(u64, u64)> = compaction_versions
-        .iter()
-        .filter(|(start, end)| *start as i64 > checkpoint_cuttoff && *end <= version_to_load)
-        .collect();
 
-    assert_eq!(
-        log_segment.listed.ascending_commit_files.len(),
-        expected_commit_versions.len()
+    assert!(
+        log_segment
+            .listed
+            .ascending_commit_files
+            .iter()
+            .all(|file| file.is_commit())
     );
+    assert_eq!(extract_commit_versions(&log_segment), expected_commits);
     assert_eq!(
-        log_segment.listed.ascending_compaction_files.len(),
-        expected_compaction_versions.len()
+        extract_compaction_ranges(&log_segment),
+        expected_compactions
     );
-
-    for (commit_file, expected_version) in log_segment
-        .listed
-        .ascending_commit_files
-        .iter()
-        .zip(expected_commit_versions.iter())
-    {
-        assert!(commit_file.is_commit());
-        assert_eq!(commit_file.version, **expected_version);
-    }
-
-    for (compaction_file, (expected_start, expected_end)) in log_segment
-        .listed
-        .ascending_compaction_files
-        .iter()
-        .zip(expected_compaction_versions.iter())
-    {
-        assert!(matches!(
-            compaction_file.file_type,
-            LogPathFileType::CompactedCommit { .. }
-        ));
-        assert_eq!(compaction_file.version, *expected_start);
-        if let LogPathFileType::CompactedCommit { hi } = compaction_file.file_type {
-            assert_eq!(hi, *expected_end);
-        } else {
-            panic!("File was compaction but type was not CompactedCommit");
-        }
-    }
-}
-
-#[tokio::test]
-async fn test_compaction_simple() {
-    test_compaction_listing(
-        &[0, 1, 2],
-        &[(1, 2)],
-        None, // checkpoint version
-        None, // version to load
-    )
-    .await;
-}
-
-#[tokio::test]
-async fn test_compaction_in_version_range() {
-    test_compaction_listing(
-        &[0, 1, 2, 3],
-        &[(1, 2)],
-        None,    // checkpoint version
-        Some(2), // version to load
-    )
-    .await;
-}
-
-#[tokio::test]
-async fn test_compaction_out_of_version_range() {
-    test_compaction_listing(
-        &[0, 1, 2, 3, 4],
-        &[(1, 3)],
-        None,    // checkpoint version
-        Some(2), // version to load
-    )
-    .await;
-}
-
-#[tokio::test]
-async fn test_multi_compaction() {
-    test_compaction_listing(
-        &[0, 1, 2, 3, 4, 5],
-        &[(1, 2), (3, 5)],
-        None, // checkpoint version
-        None, //version to load
-    )
-    .await;
-}
-
-#[tokio::test]
-async fn test_multi_compaction_one_out_of_range() {
-    test_compaction_listing(
-        &[0, 1, 2, 3, 4, 5],
-        &[(1, 2), (3, 5)],
-        None,    // checkpoint version
-        Some(4), // version to load
-    )
-    .await;
-}
-
-#[tokio::test]
-async fn test_compaction_with_checkpoint() {
-    test_compaction_listing(
-        &[0, 1, 2, 4, 5],
-        &[(1, 2), (4, 5)],
-        Some(3), // checkpoint version
-        None,    // version to load
-    )
-    .await;
-}
-
-#[tokio::test]
-async fn test_compaction_to_early_with_checkpoint() {
-    test_compaction_listing(
-        &[0, 1, 2, 4, 5],
-        &[(1, 2)],
-        Some(3), // checkpoint version
-        None,    // version to load
-    )
-    .await;
-}
-
-#[tokio::test]
-async fn test_compaction_starts_at_checkpoint() {
-    test_compaction_listing(
-        &[0, 1, 2, 4, 5],
-        &[(3, 5)],
-        Some(3), // checkpoint version
-        None,    // version to load
-    )
-    .await;
 }
 
 #[rstest]
@@ -2247,25 +2143,19 @@ fn try_new_keeps_compactions_after_checkpoint_through_end_version(
     #[case] hi: Version,
     #[case] expect_kept: bool,
 ) {
-    let log_root = Url::parse("file:///_delta_log/").unwrap();
+    let table_root = Url::parse("file:///test_table/").unwrap();
+    let log_root = table_root.join("_delta_log/").unwrap();
     let first_commit = checkpoint.map_or(0, |cp| cp + 1);
+    let commit_files = commits(&table_root, first_commit..=12);
     let log_segment = LogSegment::try_new(
         LogSegmentFiles {
             checkpoint_parts: checkpoint
-                .map(|cp| {
-                    create_log_path(&format!("file:///_delta_log/{cp:020}.checkpoint.parquet"))
-                })
+                .map(|cp| classic_checkpoint(&table_root, cp))
                 .into_iter()
                 .collect(),
-            ascending_commit_files: (first_commit..=12)
-                .map(|v| create_log_path(&format!("file:///_delta_log/{v:020}.json")))
-                .collect(),
-            latest_commit_file: Some(create_log_path(
-                "file:///_delta_log/00000000000000000012.json",
-            )),
-            ascending_compaction_files: vec![create_log_path(&format!(
-                "file:///_delta_log/{lo:020}.{hi:020}.compacted.json"
-            ))],
+            latest_commit_file: commit_files.last().cloned(),
+            ascending_commit_files: commit_files,
+            ascending_compaction_files: vec![compaction(&table_root, lo, hi)],
             ..Default::default()
         },
         log_root,
@@ -2688,22 +2578,16 @@ async fn test_commit_cover_zero_byte_compaction_uses_commits() {
 
 #[test]
 fn test_validate_listed_log_file_in_order_compaction_files() {
-    let log_root = Url::parse("file:///_delta_log/").unwrap();
-    assert!(LogSegment::try_new(
+    let table_root = Url::parse("file:///test_table/").unwrap();
+    let log_root = table_root.join("_delta_log/").unwrap();
+    let commit_files = commits(&table_root, 0..=4);
+    LogSegment::try_new(
         LogSegmentFiles {
-            ascending_commit_files: (0..=4)
-                .map(|v| create_log_path(&format!("file:///_delta_log/{v:020}.json")))
-                .collect(),
-            latest_commit_file: Some(create_log_path(
-                "file:///_delta_log/00000000000000000004.json",
-            )),
+            latest_commit_file: commit_files.last().cloned(),
+            ascending_commit_files: commit_files,
             ascending_compaction_files: vec![
-                create_log_path(
-                    "file:///_delta_log/00000000000000000000.00000000000000000004.compacted.json",
-                ),
-                create_log_path(
-                    "file:///_delta_log/00000000000000000001.00000000000000000002.compacted.json",
-                ),
+                compaction(&table_root, 0, 4),
+                compaction(&table_root, 1, 2),
             ],
             ..Default::default()
         },
@@ -2711,24 +2595,19 @@ fn test_validate_listed_log_file_in_order_compaction_files() {
         None,
         None,
     )
-    .is_ok());
+    .unwrap();
 }
 
 #[test]
 fn test_validate_listed_log_file_out_of_order_compaction_files() {
-    let log_root = Url::parse("file:///_delta_log/").unwrap();
+    let table_root = Url::parse("file:///test_table/").unwrap();
+    let log_root = table_root.join("_delta_log/").unwrap();
     let result = LogSegment::try_new(
         LogSegmentFiles {
-            ascending_commit_files: vec![create_log_path(
-                "file:///_delta_log/00000000000000000001.json",
-            )],
+            ascending_commit_files: commits(&table_root, [1]),
             ascending_compaction_files: vec![
-                create_log_path(
-                    "file:///_delta_log/00000000000000000000.00000000000000000004.compacted.json",
-                ),
-                create_log_path(
-                    "file:///_delta_log/00000000000000000000.00000000000000000003.compacted.json",
-                ),
+                compaction(&table_root, 0, 4),
+                compaction(&table_root, 0, 3),
             ],
             ..Default::default()
         },
@@ -2770,13 +2649,11 @@ fn test_validate_listed_log_file_invalid_commit_sequence(
     #[case] versions: &[Version],
     #[case] end_version: Option<Version>,
 ) {
-    let log_root = Url::parse("file:///_delta_log/").unwrap();
+    let table_root = Url::parse("file:///test_table/").unwrap();
+    let log_root = table_root.join("_delta_log/").unwrap();
     let result = LogSegment::try_new(
         LogSegmentFiles {
-            ascending_commit_files: versions
-                .iter()
-                .map(|version| create_log_path(&format!("file:///_delta_log/{version:020}.json")))
-                .collect(),
+            ascending_commit_files: commits(&table_root, versions.iter().copied()),
             ..Default::default()
         },
         log_root,
@@ -2854,16 +2731,12 @@ fn test_validate_checkpoint_commit_gap_reports_lowest_missing_version(
     #[case] commit_versions: &[Version],
     #[case] expected: Version,
 ) {
-    let log_root = Url::parse("file:///_delta_log/").unwrap();
+    let table_root = Url::parse("file:///test_table/").unwrap();
+    let log_root = table_root.join("_delta_log/").unwrap();
     let result = LogSegment::try_new(
         LogSegmentFiles {
-            checkpoint_parts: vec![create_log_path(&format!(
-                "file:///_delta_log/{checkpoint_version:020}.checkpoint.parquet"
-            ))],
-            ascending_commit_files: commit_versions
-                .iter()
-                .map(|version| create_log_path(&format!("file:///_delta_log/{version:020}.json")))
-                .collect(),
+            checkpoint_parts: vec![classic_checkpoint(&table_root, checkpoint_version)],
+            ascending_commit_files: commits(&table_root, commit_versions.iter().copied()),
             ..Default::default()
         },
         log_root,
@@ -6462,4 +6335,28 @@ async fn snapshot_commit_gap_reports_full_replay_sequence(
         std::error::Error::source(&error).and_then(|source| source.downcast_ref::<KernelError>()),
         Some(KernelError::MissingVersion(version)) if *version == missing,
     ));
+}
+
+/// Builds commit paths in the supplied order, preserving duplicates and gaps.
+fn commits(table_root: &Url, versions: impl IntoIterator<Item = Version>) -> Vec<ParsedLogPath> {
+    versions
+        .into_iter()
+        .map(|version| ParsedLogPath::create_parsed_published_commit(table_root, version))
+        .collect()
+}
+
+/// Builds a classic checkpoint path with synthetic file metadata.
+fn classic_checkpoint(table_root: &Url, version: Version) -> ParsedLogPath {
+    let path = ParsedLogPath::new_classic_parquet_checkpoint(table_root, version)
+        .unwrap_or_else(|error| panic!("checkpoint {version} under {table_root}: {error}"));
+    ParsedLogPath::new(FileMeta::new(path.location, 0, 100))
+        .unwrap_or_else(|| panic!("invalid checkpoint {version} under {table_root}"))
+}
+
+/// Builds a compaction path with synthetic file metadata.
+fn compaction(table_root: &Url, lo: Version, hi: Version) -> ParsedLogPath {
+    let path = ParsedLogPath::new_log_compaction(table_root, lo, hi)
+        .unwrap_or_else(|error| panic!("compaction {lo}-{hi} under {table_root}: {error}"));
+    ParsedLogPath::new(FileMeta::new(path.location, 0, 100))
+        .unwrap_or_else(|| panic!("invalid compaction {lo}-{hi} under {table_root}"))
 }

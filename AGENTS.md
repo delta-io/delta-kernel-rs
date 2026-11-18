@@ -55,6 +55,9 @@ cargo build --workspace --all-features
 # Run all tests (prefer nextest over cargo test)
 cargo nextest run --workspace --all-features
 
+# Run doctests
+cargo test --workspace --all-features --doc
+
 # Run tests for a specific crate
 cargo nextest run -p delta_kernel --all-features
 
@@ -67,28 +70,18 @@ cargo nextest run --workspace --all-features test_name_here
 # Format, lint, and doc check (always run after code changes)
 cargo +nightly fmt \
   && cargo clippy --workspace --benches --tests --all-features -- -D warnings \
-  && cargo doc --workspace --all-features --no-deps
+  && RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps
 
 # Split no-default-features CI checks (cargo aliases from .cargo/config.toml)
 cargo clippy-no-default-kernel-dependents
 cargo check-no-default-kernel
 cargo check-no-default-engine
 cargo clippy-no-default-kernel-leaves
-
-# Download the latest upstream catalog and record its commit and hash.
-cargo xtask update-delta-error-catalog
-
-# Generate DeltaErrorCondition from the local catalog and selected-conditions.json.
-# --check fails if stale, writing nothing.
-cargo xtask generate-delta-error-conditions [--check]
-
-# Quick pre-push check (mimics CI)
-cargo +nightly fmt \
-  && cargo clippy --workspace --benches --tests --all-features -- -D warnings \
-  && cargo doc --workspace --all-features --no-deps \
-  && cargo nextest run --workspace --all-features \
-  && cargo test --workspace --all-features --doc
 ```
+
+Before pushing, run the format, lint, and doc check, then all tests and the doctests. CI runs more
+than that: it passes `--locked`, runs the no-default-features aliases above, verifies the MSRV, and
+runs the `ffi` tests under Miri. `.github/workflows/build.yml` is authoritative.
 
 Use `cargo metadata --no-deps` to discover current workspace package names. Read each crate's
 `Cargo.toml` for its feature flags; the manifests are the source of truth.
@@ -117,11 +110,13 @@ Use `cargo metadata --no-deps` to discover current workspace package names. Read
   (`LogState x FeatureSet x (DataLayoutConfig, TableConfig) x VersionTarget`: data layout and table
   config are bundled into one axis to avoid a cartesian explosion), or a per-axis template with
   your own `#[values]`, can help; see `kernel/tests/integration/cross_product/mod.rs`. Drop to
-  lower-level setup like `test_table_setup` (or hand-rolled `add_commit` / `LocalMockTable`) only
-  when necessary: e.g. for states the builder cannot express, such as corrupt or malformed logs.
+  lower-level setup like `test_table_setup` (or hand-rolled `add_commit`, or `LocalMockTable` in
+  kernel unit tests) only when necessary: e.g. for states the builder cannot express, such as
+  corrupt or malformed logs.
 - Consider how the feature interacts with Delta table features. Cross-check behavior against the
   Delta protocol spec.
-- Consider write paths: normal commits, checkpointing, CRC files, log compaction files.
+- Consider write paths: normal commits, checkpointing, and CRC files. Log compaction writes are
+  disabled (#2337), but kernel reads tables that contain compaction files.
 - When adding cloud-storage functionality to an engine, such as writing JSON files, make sure to
   test it against S3, Azure, and GCS.
 - Consider read paths: loading a snapshot from scratch at latest version, at a specific
@@ -131,16 +126,12 @@ Use `cargo metadata --no-deps` to discover current workspace package names. Read
 - Prefer descriptive test names over doc comments. Encode the scenario and expected
   behavior in the test name. Only add a test doc comment when the intent is too
   verbose or complex to express succinctly in the name.
-- Use `rstest` to parameterize tests that share the same logic but differ in setup
-  or inputs. Prefer `#[case]` over duplicating test functions. When parameters are
-  independent and form a cartesian product, prefer `#[values]` over enumerating
-  every combination with `#[case]`.
-- Actively look for rstest consolidation opportunities: when writing multiple tests
-  that share the same setup/flow and differ only in configuration and expected
-  outcome, write one parameterized rstest instead of separate functions. Also check
-  whether a new test duplicates the flow of an existing nearby test and should be
-  merged into it as a new `#[case]`. A common pattern is toggling a feature (e.g.
-  column mapping on/off) and asserting success vs. error.
+- Use `rstest` when tests share the same logic and differ only in setup, inputs, or expected
+  outcome: write one parameterized test with `#[case]` instead of separate functions. When
+  parameters are independent and form a cartesian product, use `#[values]` instead of enumerating
+  every combination. Before adding a test, check whether a nearby test has the same flow and
+  should gain a new `#[case]`. A common pattern is toggling a feature (e.g. column mapping on/off)
+  and asserting success vs. error.
 - Reuse helpers from `test_utils` and the integration-test fixtures instead of writing
   custom ones when possible. See **Common test helpers** below for a curated starter list.
 - **Committing in tests:** Use `txn.commit(engine)?.unwrap_committed()` to assert a
@@ -154,10 +145,10 @@ Use `cargo metadata --no-deps` to discover current workspace package names. Read
   from `test_utils`: do NOT write local helpers that duplicate this.
 - **`add_commit` and table setup in tests:** `add_commit` takes a `table_root` string and
   resolves it to an absolute object-store path. The `table_root` must be a proper URL string
-  with a trailing slash (e.g. `"memory:///"`, `"file:///tmp/my_table/"`). Avoid using the
-  `Url` type directly: most test helpers and kernel APIs accept `impl AsRef<str>`, so pass
-  URL strings instead. When using local storage, use an un-prefixed store
-  (`LocalFileSystem::new()`) with a `file:///` URL string. Do NOT use
+  with a trailing slash (e.g. `"memory:///"`, `"file:///tmp/my_table/"`). Pass URL strings to
+  `add_commit` and `Snapshot::builder_for`, which accept `impl AsRef<str>`;
+  `read_actions_from_commit` and `test_read` take `&Url`. When using local storage, use an
+  un-prefixed store (`LocalFileSystem::new()`) with a `file:///` URL string. Do NOT use
   `LocalFileSystem::new_with_prefix()` with `add_commit`: `add_commit` already resolves the full
   path from the URL, so the prefix causes double-nesting. For in-memory tests, use
   `InMemory::new()` with `"memory:///"`. ALWAYS use the same `table_root` URL string for both
@@ -197,15 +188,12 @@ This list is non-exhaustive: when in doubt, browse the source files directly
 
 **Table creation in tests**
 
-- `test_utils::table_builder::TestTableBuilder` (and the `test_table(...)` shorthand): worth
-  considering for a table in a specific state: composes `LogState`, `FeatureSet`,
-  `DataLayoutConfig`, and `TableConfig` through the real write path. Pair with the
-  `build_snapshot!` macro and, for broad coverage, the `default_sweep` template. See the Testing
-  section above.
+- `test_utils::table_builder::TestTableBuilder` (and the `test_table(...)` shorthand): see the
+  Testing section above.
 - Prefer the kernel `create_table` builder
   (`delta_kernel::transaction::create_table::create_table`) when you need a single bespoke
-  table rather than the builder's composed states. It exercises the same path connectors use
-  and auto-derives the protocol from the schema and feature flags.
+  table rather than `TestTableBuilder`'s composed states. It exercises the same path connectors
+  use and auto-derives the protocol from the schema and feature flags.
 - `test_utils::create_table` (a JSON helper that hand-rolls protocol + metadata) is older
   but still needed when the kernel builder cannot enable a particular feature combination.
 
@@ -239,8 +227,9 @@ and update this section in your PR. The same pattern works for
 
 ## Common Gotchas
 
-- **EngineData is opaque:** NEVER downcast to `ArrowEngineData` or any concrete type
-  in production code (ok in tests). NEVER assume one batch per file: ALWAYS iterate.
+- **EngineData is opaque:** inspect rows through the visitor APIs. NEVER downcast to
+  `ArrowEngineData` or any concrete type in production code (ok in tests). NEVER assume one batch
+  per file: ALWAYS iterate.
 - **Column mapping:** Physical column names can differ from logical names. ALWAYS use
   the schema from `Snapshot::schema()` for user data columns. Metadata/system schema
   column names (defined by the protocol) are not subject to column mapping.
@@ -249,8 +238,8 @@ and update this section in your PR. The same pattern works for
 - **Tracing layer callbacks must not emit tracing events directly:** Calling `warn!()` or
   any tracing macro inside a `tracing_subscriber::Layer` callback (`on_event`, `on_record`,
   `on_close`) while holding a span's `extensions_mut()` write lock will re-enter the layer
-  and deadlock on the same lock. In `on_new_span`, no extension lock is held during
-  `attrs.record()`, so direct `warn!()` is safe there. In `on_record`, store warnings in a
+  and deadlock on the same lock. `on_new_span` builds its event with `from_attrs` before taking
+  the extension lock, so direct `warn!()` is safe there. In `on_record`, store warnings in a
   `pending_warnings: Vec<String>` field on the visitor, take them out after the extensions
   block closes, and emit via `warn!()` only then. (`on_event`'s visitor does no
   warning-eligible work, so it may run under the lock directly.) See
@@ -261,6 +250,7 @@ and update this section in your PR. The same pattern works for
   thread-local dispatch tests or assume no other thread can emit an event.
 - **Generated code:** files starting with ``//! Generated by `cargo xtask ...` `` are never edited by
   hand. Change the generator in `xtask/` or its inputs and rerun the command.
+  `kernel/error_catalog/README.md` documents the error-catalog commands.
 
 ## Code Style
 
@@ -304,19 +294,20 @@ and update this section in your PR. The same pattern works for
   `Iterator<Item = KernelResult<T>> + Send`, including in public APIs. Use
   `impl KernelResultIterator<T>` for unboxed streams and `Box<dyn KernelResultIterator<T>>`
   (`'static`) or `Box<dyn KernelResultIterator<T> + '_>` (borrowed) at dyn/storage boundaries.
-- Prefer the `lit` / `null_lit` constructors over `Expression::literal(...)` / `lit(Scalar::Null(...))`
-  when building expressions inline. They take `impl Into<Scalar>` and `impl Into<DataType>`,
-  respectively. Prefer `Predicate::TRUE` / `FALSE` / `NULL` for predicates whose value is statically
-  known, reserving `Predicate::literal(b)` for runtime `bool` values.
-- Prefer the `col!` macro and `lit(value)` constructor over `Expression::column(...)` /
-  `Expression::literal(...)` when building expressions inline. `col!` uses the same
-  compile-time segment rules as `column_name!` (string literals split on `.`; constants are
-  single simple segments). Use `Expression::column([...])` for runtime or non-simple names.
-  (`column_expr!` is a doc-hidden compatibility alias of `col!`.)
+- When building expressions inline, prefer `lit(value)` and `null_lit(data_type)` over
+  `Expression::literal(...)` and `lit(Scalar::Null(...))`, and the `col!` macro over
+  `Expression::column(...)`. `lit` takes `impl Into<Scalar>` and `null_lit` takes
+  `impl Into<DataType>`. `col!` uses the same compile-time segment rules as `column_name!`
+  (string literals split on `.`; constants are single simple segments); use
+  `Expression::column([...])` for runtime or non-simple names. (`column_expr!` is a doc-hidden
+  compatibility alias of `col!`.)
+- Prefer `Predicate::TRUE` / `FALSE` / `NULL` for predicates whose value is statically known,
+  reserving `Predicate::literal(b)` for runtime `bool` values.
 - Prefer the `schema!` / `schema_ref!` macros for inline declarative schema literals,
   `lazy_schema_ref!` for `LazyLock<SchemaRef>` statics, and `try_schema!` when names of
-  interpolated fields might collide. For Delta log action schemas, reuse the canonical
-  `*_FIELD` and `LOG_*_SCHEMA` statics from `actions` instead of re-declaring
+  interpolated fields might collide. Outside the kernel crate, these macros require the
+  `internal-api` feature. For Delta log action schemas, reuse the canonical `*_FIELD` and
+  `LOG_*_SCHEMA` statics from `actions` instead of re-declaring
   `StructField::nullable(ACTION_NAME, Action::to_schema())` or projecting from
   `get_commit_schema()`. Prefer `StructType::try_new` or schema builder/patch APIs for complex
   data-dependent schema manipulation.
@@ -394,9 +385,12 @@ A separate "Returns an `Option<ColumnName>`" section would add nothing to the si
 
 ## Pull Requests
 
-**Title:** use conventional commit format, lowercase after prefix, no period at the end.
+**Title:** use conventional commit format, lowercase after prefix, no period at the end, and at
+most 72 characters after the prefix (CI rejects longer titles).
 Allowed types: `feat`, `fix`, `refactor`, `chore`, `docs`, `perf`, `test`, `ci`.
-If the pull request contains a breaking change, the type must have a `!` suffix.
+If the pull request contains a breaking change, the type must have a `!` suffix. CI adds the
+`breaking-change` label when its semver check finds one, and a labeled PR fails title validation
+without the `!`.
 Examples: `feat: add checkpoint stream support`, `fix: handle empty log segment`,
 `refactor: extract common log replay logic`
 Breaking change examples: `feat!: make_physical takes column mapping and sets parquet field ids`,

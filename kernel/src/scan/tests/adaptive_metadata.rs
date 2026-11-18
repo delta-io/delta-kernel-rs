@@ -20,7 +20,6 @@ use crate::content_tree::{ContentTreeNodeEntry, TrackingInfo, TrackingStatus};
 use crate::engine::arrow_data::EngineDataArrowExt as _;
 use crate::engine::sync::SyncEngine;
 use crate::expressions::{Predicate as Pred, Scalar, col, lit};
-use crate::object_store::memory::InMemory;
 use crate::scan::{Scan, ScanMetadata};
 use crate::schema::{SchemaRef, StructType, schema_ref};
 use crate::table_features::ColumnMappingMode;
@@ -142,7 +141,7 @@ fn scan_reads_leaf_manifests() {
 
 #[test]
 fn scan_of_partitioned_table_with_checkpoint_action_is_unsupported() {
-    let engine = SyncEngine::new_with_store(Arc::new(InMemory::new()));
+    let engine = SyncEngine::in_memory();
     create_adaptive_metadata_table(&engine, &table_root(), &["id"]);
     let version = commit_root_manifest(
         &engine,

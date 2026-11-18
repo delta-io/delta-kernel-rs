@@ -45,7 +45,8 @@ use crate::metrics::events::{
 };
 use crate::metrics::{
     CheckpointWriteMode, CheckpointWriteOutcome, ChecksumWriteOutcome, ChecksumWriteResolutionMode,
-    SnapshotLoadMetricContext, emit_protocol_metadata_load, emit_protocol_metadata_load_failure,
+    MetricId, SnapshotLoadMetricContext, emit_protocol_metadata_load,
+    emit_protocol_metadata_load_failure,
 };
 use crate::path::ParsedLogPath;
 use crate::row_tracking::{ROW_TRACKING_DOMAIN_NAME, parse_row_tracking_high_water_mark};
@@ -1752,8 +1753,12 @@ impl Snapshot {
         parent = &self.span,
         name = "snap.checkpoint",
         skip_all,
-        fields(report, outcome, mode, duration_ns, bytes_written, num_add_files, num_remove_files,
-            num_actions, num_sidecars),
+        fields(report, operation_id = %MetricId::new(), version = self.version(), outcome, mode,
+            duration_ns, size_in_bytes, num_add_files, num_remove_files, num_actions, num_sidecars,
+            log_tail_input_duration_ns, checkpoint_input_duration_ns, reconciliation_duration_ns,
+            stats_transform_duration_ns, output_preparation_duration_ns,
+            num_actions_from_log_tail, num_actions_from_checkpoint,
+            parquet_write_duration_ns, verification_duration_ns, bytes_written, num_sidecars_written),
         err
     )]
     pub fn checkpoint(
@@ -1818,6 +1823,8 @@ impl Snapshot {
         };
         span.record("mode", mode.as_ref());
 
+        let metrics = crate::checkpoint::metrics::CheckpointMetrics::new(&span);
+        let _metrics_report = metrics.report_on_drop(span.clone());
         let writer = Arc::clone(self).create_checkpoint_writer(engine)?;
 
         let write_result = match spec {
@@ -1826,9 +1833,9 @@ impl Snapshot {
             })) => {
                 let hint =
                     file_actions_per_sidecar_hint.unwrap_or(DEFAULT_FILE_ACTIONS_PER_SIDECAR_HINT);
-                writer.write_v2_checkpoint_with_sidecars(engine, hint)
+                writer.write_v2_checkpoint_with_sidecars(engine, hint, metrics.clone())
             }
-            _ => writer.write_checkpoint_without_sidecars(engine),
+            _ => writer.write_checkpoint_without_sidecars(engine, metrics.clone()),
         };
 
         let info = match write_result {
@@ -1873,7 +1880,7 @@ impl Snapshot {
             false, /* skipped_new_checkpoints */
         )?);
         span.record(
-            "bytes_written",
+            "size_in_bytes",
             info.last_checkpoint_stats.size_in_bytes as u64,
         );
         span.record(
@@ -2025,15 +2032,16 @@ mod tests {
     use crate::object_store::path::Path;
     use crate::parquet::arrow::ArrowWriter;
     use crate::path::{LogPathFileType, ParsedLogPath};
-    use crate::schema::{DataType, StructField, StructType, schema_ref};
+    use crate::schema::{DataType, StructField, StructType, schema, schema_ref};
     use crate::table_features::{
         TABLE_FEATURES_MIN_READER_VERSION, TABLE_FEATURES_MIN_WRITER_VERSION,
     };
     use crate::table_properties::ENABLE_IN_COMMIT_TIMESTAMPS;
     use crate::transaction::create_table::create_table;
     use crate::unit_test_utils::{
-        MockProtocolBuilder, MockTableConfigurationBuilder, assert_result_error_with_message,
-        create_log_path, string_array_to_engine_data,
+        Action, MockProtocolBuilder, MockTableConfigurationBuilder,
+        assert_result_error_with_message, create_log_path, metadata_action, serialize_actions,
+        string_array_to_engine_data,
     };
     use crate::utils::FoldWithOption as _;
     use crate::{FilteredEngineData, KernelError, Result};
@@ -2138,7 +2146,7 @@ mod tests {
     }
 
     fn engine_with_published_commits() -> SyncEngine {
-        let engine = SyncEngine::new_with_store(Arc::new(InMemory::new()));
+        let engine = SyncEngine::in_memory();
         let storage = engine.storage_handler();
         for version in [1, 2] {
             let location = Url::parse(&format!(
@@ -2778,90 +2786,51 @@ mod tests {
         let store = Arc::new(InMemory::new());
         let engine = SyncEngine::new_with_store(store.clone());
 
-        // commit0
-        // - domain1: not removed
-        // - domain2: not removed
-        let commit = [
-            json!({
-                "protocol": {
-                    "minReaderVersion": 1,
-                    "minWriterVersion": 1
-                }
-            }),
-            json!({
-                "metaData": {
-                    "id":"5fba94ed-9794-4965-ba6e-6ee3c0d22af9",
-                    "format": { "provider": "parquet", "options": {} },
-                    "schemaString": "{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"val\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}]}",
-                    "partitionColumns": [],
-                    "configuration": {},
-                    "createdTime": 1587968585495i64
-                }
-            }),
-            json!({
-                "domainMetadata": {
-                    "domain": "domain1",
-                    "configuration": "domain1_commit0",
-                    "removed": false
-                }
-            }),
-            json!({
-                "domainMetadata": {
-                    "domain": "domain2",
-                    "configuration": "domain2_commit0",
-                    "removed": false
-                }
-            }),
-            json!({
-                "domainMetadata": {
-                    "domain": "domain3",
-                    "configuration": "domain3_commit0",
-                    "removed": false
-                }
-            }),
-        ]
-        .map(|json| json.to_string())
-        .join("\n");
-        add_commit(table_root, store.clone().as_ref(), 0, commit)
+        let schema = schema! { nullable "id": INTEGER, nullable "val": STRING };
+        // Keep the legacy protocol to exercise domain replay without a feature declaration.
+        let actions = [
+            Action::Protocol(Protocol::try_new_legacy(1, 1)?),
+            metadata_action(
+                "5fba94ed-9794-4965-ba6e-6ee3c0d22af9",
+                &schema,
+                1587968585495,
+            ),
+            Action::DomainMetadata(DomainMetadata::new(
+                "domain1".into(),
+                "domain1_commit0".into(),
+            )),
+            Action::DomainMetadata(DomainMetadata::new(
+                "domain2".into(),
+                "domain2_commit0".into(),
+            )),
+            Action::DomainMetadata(DomainMetadata::new(
+                "domain3".into(),
+                "domain3_commit0".into(),
+            )),
+        ];
+        add_commit(table_root, store.as_ref(), 0, serialize_actions(actions))
             .await
             .unwrap();
 
-        // commit1
-        // - domain1: removed
-        // - domain2: not-removed
-        // - internal domain
-        let commit = [
-            json!({
-                "domainMetadata": {
-                    "domain": "domain1",
-                    "configuration": "domain1_commit1",
-                    "removed": true
-                }
-            }),
-            json!({
-                "domainMetadata": {
-                    "domain": "domain2",
-                    "configuration": "domain2_commit1",
-                    "removed": false
-                }
-            }),
-            json!({
-                "domainMetadata": {
-                    "domain": "delta.domain3",
-                    "configuration": "domain3_commit1",
-                    "removed": false
-                }
-            }),
-        ]
-        .map(|json| json.to_string())
-        .join("\n");
-        add_commit(table_root, store.as_ref(), 1, commit)
+        let actions = [
+            Action::DomainMetadata(DomainMetadata::remove(
+                "domain1".into(),
+                "domain1_commit1".into(),
+            )),
+            Action::DomainMetadata(DomainMetadata::new(
+                "domain2".into(),
+                "domain2_commit1".into(),
+            )),
+            Action::DomainMetadata(DomainMetadata::new(
+                "delta.domain3".into(),
+                "domain3_commit1".into(),
+            )),
+        ];
+        add_commit(table_root, store.as_ref(), 1, serialize_actions(actions))
             .await
             .unwrap();
 
         let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
-
-        // Test get_domain_metadata
 
         assert_eq!(snapshot.get_domain_metadata("domain1", &engine)?, None);
         assert_eq!(
@@ -2878,13 +2847,11 @@ mod tests {
         assert!(matches!(err, KernelError::Generic(msg) if
                 msg == "User DomainMetadata are not allowed to use system-controlled 'delta.*' domain"));
 
-        // Test get_domain_metadata_internal
         assert_eq!(
             snapshot.get_domain_metadata_internal("delta.domain3", &engine)?,
             Some("domain3_commit1".to_string())
         );
 
-        // Test get_all_domain_metadata
         let mut metadata = snapshot.get_all_domain_metadata(&engine)?;
         metadata.sort_by(|a, b| a.domain().cmp(b.domain()));
 

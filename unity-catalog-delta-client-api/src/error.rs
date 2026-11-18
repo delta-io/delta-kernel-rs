@@ -11,9 +11,14 @@ pub enum Error {
     #[error("Table not found: {0}")]
     TableNotFound(String),
 
-    /// The number of unpublished commits has exceeded the maximum allowed.
-    #[error("Max unpublished commits exceeded (max: {0})")]
-    MaxUnpublishedCommitsExceeded(u16),
+    /// The unpublished commit limit has been reached.
+    /// The caller must publish pending commits before retrying.
+    /// The payload is the maximum allowed when the backend supplies it.
+    #[error(
+        "Max unpublished commits exceeded{}",
+        .0.map(|max| format!(" (max: {max})")).unwrap_or_default()
+    )]
+    MaxUnpublishedCommitsExceeded(Option<u16>),
 
     /// The requested operation is not supported.
     #[error("Operation not supported: {0}")]

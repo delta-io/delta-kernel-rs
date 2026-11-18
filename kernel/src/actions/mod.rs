@@ -2177,10 +2177,9 @@ mod tests {
     use crate::arrow::datatypes::{DataType as ArrowDataType, Field, Schema};
     use crate::arrow::json::ReaderBuilder;
     use crate::engine::arrow_data::EngineDataArrowExt as _;
-    use crate::engine::arrow_expression::ArrowEvaluationHandler;
+    use crate::engine::sync::SyncEngine;
     #[cfg(feature = "adaptive-metadata-in-dev")]
     use crate::engine::to_json_bytes;
-    use crate::engine::{DelegatingEngine, PanicEngine};
     #[cfg(feature = "adaptive-metadata-in-dev")]
     use crate::engine_data::FilteredEngineData;
     use crate::expressions::{Scalar, StructData};
@@ -2202,13 +2201,6 @@ mod tests {
     #[case::unknown_action("futureAction", None)]
     fn test_action_presence_leaf(#[case] action_name: &str, #[case] expected_leaf: Option<&str>) {
         assert_eq!(action_presence_leaf(action_name), expected_leaf);
-    }
-
-    /// Allows Arrow expression evaluation and rejects other required handler access.
-    fn expr_engine() -> DelegatingEngine {
-        DelegatingEngine::new(Arc::new(PanicEngine))
-            .with_evaluation_handler(Arc::new(ArrowEvaluationHandler))
-            .without_plan_executor()
     }
 
     #[rstest]
@@ -3289,7 +3281,7 @@ mod tests {
 
     #[test]
     fn test_metadata_with_log_schema() {
-        let engine = expr_engine();
+        let engine = SyncEngine::new();
         let schema = schema_ref! { not_null "id": INTEGER };
 
         let metadata = Metadata::try_new(
@@ -3337,7 +3329,7 @@ mod tests {
 
     #[test]
     fn test_protocol_creates_log_row() {
-        let engine = expr_engine();
+        let engine = SyncEngine::new();
         let protocol = Protocol::try_new_modern(
             [TableFeature::DeletionVectors, TableFeature::ColumnMapping],
             [TableFeature::DeletionVectors, TableFeature::ColumnMapping],
@@ -3718,7 +3710,7 @@ mod tests {
     #[cfg(feature = "adaptive-metadata-in-dev")]
     #[test]
     fn test_checkpoint_action_scalar_round_trip() -> KernelResult<()> {
-        let engine = expr_engine();
+        let engine = SyncEngine::new();
         let action = sample_checkpoint_action();
         let scalar = action.clone().try_into_scalar()?;
         let data = create_row(&engine, LOG_CHECKPOINT_SCHEMA.clone(), scalar)?;
@@ -3753,7 +3745,7 @@ mod tests {
         // pin the exact bytes. This is the only guard on the wire format: element order, camelCase
         // field names, the sidecar `type` discriminator, and the JSON writer's null omission (the
         // null union siblings collapse each element to a single-key tagged object).
-        let engine = expr_engine();
+        let engine = SyncEngine::new();
         let scalar = sample_checkpoint_action().try_into_scalar()?;
         let data = create_row(&engine, LOG_CHECKPOINT_SCHEMA.clone(), scalar)?;
         let filtered = FilteredEngineData::with_all_rows_selected(data);
@@ -3839,7 +3831,7 @@ mod tests {
             txn_sidecars: vec![sidecar("t1.parquet"), sidecar("t2.parquet")],
             domain_metadata_sidecars: vec![],
         };
-        let engine = expr_engine();
+        let engine = SyncEngine::new();
         let scalar = action.clone().try_into_scalar()?;
         let data = create_row(&engine, LOG_CHECKPOINT_SCHEMA.clone(), scalar)?;
         let back = CheckpointAction::try_new_from_data(data.as_ref())?
@@ -3862,7 +3854,7 @@ mod tests {
             ),
             ..sample_checkpoint_action()
         };
-        let engine = expr_engine();
+        let engine = SyncEngine::new();
         let scalar = action.clone().try_into_scalar()?;
         let data = create_row(&engine, LOG_CHECKPOINT_SCHEMA.clone(), scalar)?;
         let back = CheckpointAction::try_new_from_data(data.as_ref())?

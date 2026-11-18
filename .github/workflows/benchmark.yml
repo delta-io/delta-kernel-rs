@@ -61,8 +61,9 @@ jobs:
           cache: false
       # shared-key keeps this and `run-benchmark` in the same cache namespace
       # so PR runs can restore what we save here.
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
+          prefix-key: v1-rust
           cache-bin: false
           shared-key: bench
           save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
@@ -210,8 +211,9 @@ jobs:
       # with `warm-bench-cache` so PR runs restore the entry that main pushes
       # save -- without the shared-key, each job's cache lives in a separate
       # namespace and the warming would not benefit PRs.
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
+          prefix-key: v1-rust
           cache-bin: false
           shared-key: bench
           save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
