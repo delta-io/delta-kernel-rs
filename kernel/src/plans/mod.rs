@@ -91,14 +91,14 @@ pub trait PlanExecutor: AsAny {
     /// Executes the given declarative plan and returns the result.
     fn execute_op(&self, op: Operation) -> KernelResult<PlanResult>;
 
-    /// Returns whether Kernel may use this executor for declarative protocol and metadata replay.
+    /// Returns whether Kernel may use this executor for query plans beyond file scans.
     ///
     /// The default is `true`. Executors limited to I/O operations and file scans should return
     /// `false`, so Kernel replays protocol and metadata through its imperative engine handlers.
     /// This does not restrict handler I/O or explicitly requested plan execution.
     /// Implementations should return the same value throughout the executor's lifetime.
     /// Delegating executors should forward this method to their inner executor.
-    fn supports_protocol_metadata_replay(&self) -> bool {
+    fn support_query_plans(&self) -> bool {
         true
     }
 

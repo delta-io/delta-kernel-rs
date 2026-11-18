@@ -12,7 +12,7 @@ use crate::{Engine, KernelError, KernelResult};
 pub(crate) struct IOOnlyPlanExecutor(pub SyncPlanExecutor);
 
 impl PlanExecutor for IOOnlyPlanExecutor {
-    fn supports_protocol_metadata_replay(&self) -> bool {
+    fn support_query_plans(&self) -> bool {
         false
     }
 

@@ -927,7 +927,7 @@ struct RecordingPlanExecutor {
 #[rstest]
 #[case::enabled(Arc::new(SyncPlanExecutor::default()), true)]
 #[case::disabled(Arc::new(IOOnlyPlanExecutor(SyncPlanExecutor::default())), false)]
-fn recording_executor_preserves_pm_replay_support(
+fn recording_executor_preserves_query_plan_support(
     #[case] inner: Arc<dyn PlanExecutor>,
     #[case] expected: bool,
 ) {
@@ -935,13 +935,13 @@ fn recording_executor_preserves_pm_replay_support(
         inner,
         plans: Arc::default(),
     };
-    assert_eq!(executor.supports_protocol_metadata_replay(), expected);
+    assert_eq!(executor.support_query_plans(), expected);
 }
 
 #[cfg(feature = "declarative-plans")]
 impl PlanExecutor for RecordingPlanExecutor {
-    fn supports_protocol_metadata_replay(&self) -> bool {
-        self.inner.supports_protocol_metadata_replay()
+    fn support_query_plans(&self) -> bool {
+        self.inner.support_query_plans()
     }
 
     fn execute_op(&self, op: Operation) -> KernelResult<PlanResult> {

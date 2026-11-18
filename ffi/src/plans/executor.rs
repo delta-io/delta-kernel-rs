@@ -40,7 +40,7 @@ pub type CExecuteOpFn = extern "C" fn(
 pub struct FfiPlanExecutor {
     context: NullableCvoid,
     callback: CExecuteOpFn,
-    supports_protocol_metadata_replay: bool,
+    support_query_plans: bool,
 }
 
 impl FfiPlanExecutor {
@@ -51,12 +51,12 @@ impl FfiPlanExecutor {
     pub(crate) fn new(
         context: NullableCvoid,
         callback: CExecuteOpFn,
-        supports_protocol_metadata_replay: bool,
+        support_query_plans: bool,
     ) -> Self {
         Self {
             context,
             callback,
-            supports_protocol_metadata_replay,
+            support_query_plans,
         }
     }
 }
@@ -66,8 +66,8 @@ unsafe impl Send for FfiPlanExecutor {}
 unsafe impl Sync for FfiPlanExecutor {}
 
 impl PlanExecutor for FfiPlanExecutor {
-    fn supports_protocol_metadata_replay(&self) -> bool {
-        self.supports_protocol_metadata_replay
+    fn support_query_plans(&self) -> bool {
+        self.support_query_plans
     }
 
     fn execute_op(&self, op: Operation) -> KernelResult<PlanResult> {

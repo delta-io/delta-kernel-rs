@@ -29,9 +29,6 @@ use crate::{Engine, EvaluationHandler, JsonHandler, ParquetHandler, StorageHandl
 /// Storage, JSON file reads, and Parquet file reads are converted into
 /// [`Operation`](crate::plans::Operation)s and delegated to the plan executor.
 ///
-/// The executor can keep protocol and metadata replay imperative by returning `false` from
-/// [`PlanExecutor::supports_protocol_metadata_replay`]. Handler I/O still uses the executor.
-///
 /// Operations not yet implemented on the plan-execution path (e.g. `write_json_file`,
 /// `write_parquet_file`) are delegated to `fallback` when one is configured, and otherwise return
 /// an unsupported error. A fallback is optional because a connector may be unable to construct one:
@@ -129,7 +126,7 @@ mod tests {
             Arc::new(IOOnlyPlanExecutor(SyncPlanExecutor::default())),
         );
         let executor = engine.require_plan_executor().unwrap();
-        assert!(!executor.supports_protocol_metadata_replay());
+        assert!(!executor.support_query_plans());
 
         let actual = Snapshot::builder_for(expected.table_root().clone())
             .build(&engine)

@@ -385,13 +385,13 @@ enum PmReader {
 }
 
 impl PmReader {
-    /// Returns a plan reader when the executor supports P&M replay, otherwise a file reader.
+    /// Returns a plan reader when the executor supports query plans, otherwise a file reader.
     #[cfg_attr(not(feature = "declarative-plans"), allow(unused_variables))]
     fn for_engine(engine: &dyn Engine) -> Self {
         #[cfg(feature = "declarative-plans")]
         if let Some(executor) = engine
             .plan_executor()
-            .filter(|executor| executor.supports_protocol_metadata_replay())
+            .filter(|executor| executor.support_query_plans())
         {
             return Self::Plan(executor);
         }
@@ -1259,73 +1259,34 @@ mod tests {
 
         use rstest::rstest;
         use test_utils::assert_result_error_with_message;
-        use url::Url;
 
         use crate::arrow::record_batch::RecordBatch;
-        use crate::engine::DelegatingEngine;
         use crate::engine::arrow_conversion::TryIntoArrow as _;
         use crate::engine::arrow_data::ArrowEngineData;
-        use crate::schema::SchemaRef;
         use crate::unit_test_utils::load_test_table;
-        use crate::{
-            EngineData, FileDataReadResultIterator, FileMeta, FileSize, FilteredEngineData,
-            JsonHandler, KernelError, KernelResult, KernelResultIterator, PredicateRef,
-        };
-
-        struct EmptyBatchJsonHandler {
-            inner: Arc<dyn JsonHandler>,
-            inject_error: bool,
-        }
-
-        impl JsonHandler for EmptyBatchJsonHandler {
-            fn read_json_files(
-                &self,
-                files: &[FileMeta],
-                schema: SchemaRef,
-                predicate: Option<PredicateRef>,
-            ) -> KernelResult<FileDataReadResultIterator> {
-                let empty: Box<dyn EngineData> = Box::new(ArrowEngineData::new(
-                    RecordBatch::new_empty(Arc::new(schema.as_ref().try_into_arrow()?)),
-                ));
-                let error = self
-                    .inject_error
-                    .then(|| Err(KernelError::generic("injected JSON read error")));
-                let batches = self.inner.read_json_files(files, schema, predicate)?;
-                Ok(Box::new(
-                    std::iter::once(Ok(empty)).chain(error).chain(batches),
-                ))
-            }
-
-            fn parse_json(
-                &self,
-                data: Box<dyn EngineData>,
-                schema: SchemaRef,
-            ) -> KernelResult<Box<dyn EngineData>> {
-                self.inner.parse_json(data, schema)
-            }
-
-            fn write_json_file(
-                &self,
-                path: &Url,
-                data: Box<dyn KernelResultIterator<FilteredEngineData> + '_>,
-                overwrite: bool,
-            ) -> KernelResult<FileSize> {
-                self.inner.write_json_file(path, data, overwrite)
-            }
-        }
+        use crate::unit_test_utils::recording_reads::RecordingReads;
+        use crate::{EngineData, KernelError};
 
         #[rstest]
         #[case::before_actions(false)]
         #[case::before_error(true)]
         fn imperative_pm_handles_empty_batches(#[case] inject_error: bool) {
             let (inner, expected, _tempdir) = load_test_table("app-txn-no-checkpoint").unwrap();
-            let handler = Arc::new(EmptyBatchJsonHandler {
-                inner: inner.json_handler(),
-                inject_error,
-            });
-            let engine = DelegatingEngine::new(inner)
-                .with_json_handler(handler)
-                .without_plan_executor();
+            let mut reads = RecordingReads::new(None);
+            let config = Arc::get_mut(&mut reads).unwrap();
+            config.inner = inner;
+            config.expected_token = None;
+            config.transform_json_batches = Some(Box::new(move |schema, batches| {
+                let empty: Box<dyn EngineData> = Box::new(ArrowEngineData::new(
+                    RecordBatch::new_empty(Arc::new(schema.as_ref().try_into_arrow()?)),
+                ));
+                let error =
+                    inject_error.then(|| Err(KernelError::generic("injected JSON read error")));
+                Ok(Box::new(
+                    std::iter::once(Ok(empty)).chain(error).chain(batches),
+                ))
+            }));
+            let engine = reads.engine();
 
             let result = expected
                 .log_segment()

@@ -16,11 +16,11 @@ pub mod result;
 
 /// Build a [`PlanExecutor`] backed by an engine-provided C callback.
 ///
-/// Pass `true` for `supports_protocol_metadata_replay` if the callback supports declarative
-/// protocol and metadata replay. Pass `false` for an executor limited to I/O operations and file
-/// scans; Kernel then performs that replay through engine handlers. This choice is fixed for the
-/// executor's lifetime. Handler I/O and explicitly requested plans still use the executor. See
-/// [`PlanExecutor::supports_protocol_metadata_replay`] for the support contract.
+/// Pass `true` for `support_query_plans` if the callback supports query plans beyond file scans.
+/// Pass `false` for an executor limited to I/O operations and file scans; Kernel then replays
+/// protocol and metadata through engine handlers. This choice is fixed for the executor's lifetime.
+/// Handler I/O and explicitly requested plans still use the executor. See
+/// [`PlanExecutor::support_query_plans`] for the support contract.
 ///
 /// The returned handle can be consumed by [`get_plan_based_engine`] or released with
 /// [`free_plan_executor`].
@@ -33,13 +33,10 @@ pub mod result;
 pub unsafe extern "C" fn get_plan_executor(
     context: NullableCvoid,
     callback: CExecuteOpFn,
-    supports_protocol_metadata_replay: bool,
+    support_query_plans: bool,
 ) -> Handle<SharedPlanExecutor> {
-    let executor: Arc<dyn PlanExecutor> = Arc::new(FfiPlanExecutor::new(
-        context,
-        callback,
-        supports_protocol_metadata_replay,
-    ));
+    let executor: Arc<dyn PlanExecutor> =
+        Arc::new(FfiPlanExecutor::new(context, callback, support_query_plans));
     executor.into()
 }
 
@@ -128,12 +125,9 @@ mod tests {
     #[rstest]
     #[case::enabled(true)]
     #[case::disabled(false)]
-    fn plan_executor_pm_support_survives_engine_construction(#[case] support: bool) {
+    fn plan_executor_query_plan_support_survives_engine_construction(#[case] support: bool) {
         let executor = unsafe { get_plan_executor(None, unit_callback, support) };
-        assert_eq!(
-            unsafe { executor.as_ref() }.supports_protocol_metadata_replay(),
-            support
-        );
+        assert_eq!(unsafe { executor.as_ref() }.support_query_plans(), support);
 
         let engine_handle =
             unsafe { get_plan_based_engine(executor, OptionalValue::None, &TEST_ERROR_ALLOCATORS) };
@@ -142,7 +136,7 @@ mod tests {
             engine
                 .require_plan_executor()
                 .unwrap()
-                .supports_protocol_metadata_replay(),
+                .support_query_plans(),
             support
         );
         engine
