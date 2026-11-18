@@ -1261,7 +1261,8 @@ mod tests {
     }
 
     // A type the CRC holds in full is written inline from the CRC, dropping that type's
-    // sidecars. Both sidecars point at unwritten files, so reading either fails.
+    // sidecars. A type it doesn't is folded from the checkpoint action and the log commits after
+    // it. Both sidecars point at unwritten files, so reading either fails.
     #[rstest]
     fn compute_checkpoint_action_uses_a_complete_crc_over_the_checkpoint_action(
         #[values(true, false)] txns_complete: bool,
@@ -1274,6 +1275,12 @@ mod tests {
         existing.txn_sidecars = vec![missing_sidecar("txn.parquet")];
         existing.domain_metadata_sidecars = vec![missing_sidecar("domains.parquet")];
         write_manifest_commit(&engine, &table_root, 1, existing.clone())?;
+        let (logged_txn, logged_domain) = (txn("inline", 2), domain("inline", "2"));
+        let logged = [
+            txn_line(&logged_txn.app_id, logged_txn.version),
+            domain_metadata_line(logged_domain.clone()),
+        ];
+        write_log_lines(&engine, &table_root, logged)?;
 
         // The CRC holds `from-crc` instead of the action's entries, so the source is visible.
         let built = Snapshot::builder_for(table_root.clone()).build(&engine)?;
@@ -1308,20 +1315,42 @@ mod tests {
             true,
             false,
         )?);
-        let manifest = root_manifest(&table_root, "metadata/root-v2.parquet", 1024, snapshot);
+        if txns_complete && domains_complete {
+            // Neither the checkpoint action nor the commits after it are needed, so any log read
+            // fails.
+            for version in 1..=built.version() {
+                let commit = table_root
+                    .join(&format!("_delta_log/{version:020}.json"))
+                    .map_err(KernelError::from)?;
+                engine.storage_handler().delete(&commit)?;
+            }
+        }
+        let commit_version = built.version() + 1;
+        let manifest = root_manifest(&table_root, "metadata/root-v4.parquet", 1024, snapshot);
         let table_config = manifest.read_snapshot.table_configuration().clone();
-        let checkpoint = manifest.compute_checkpoint_action(&engine, 2, &table_config, &[], &[])?;
+        let checkpoint =
+            manifest.compute_checkpoint_action(&engine, commit_version, &table_config, &[], &[])?;
 
-        let expected = |complete| match complete {
-            true => (&["from-crc"][..], false),
-            false => (&["inline"][..], true),
-        };
-        let (keys, kept) = expected(txns_complete);
-        let no_changes = std::iter::empty::<&SetTransaction>();
-        assert_checkpoint_entries(&checkpoint, &existing, no_changes, keys, kept);
-        let (keys, kept) = expected(domains_complete);
-        let no_changes = std::iter::empty::<&DomainMetadata>();
-        assert_checkpoint_entries(&checkpoint, &existing, no_changes, keys, kept);
+        // A type folded from the checkpoint action keeps its sidecars and takes the logged update.
+        let keys = |complete| if complete { ["from-crc"] } else { ["inline"] };
+        let txn_logged = (!txns_complete).then_some(&logged_txn);
+        let txn_keys = keys(txns_complete);
+        assert_checkpoint_entries(
+            &checkpoint,
+            &existing,
+            txn_logged,
+            &txn_keys,
+            !txns_complete,
+        );
+        let domain_logged = (!domains_complete).then_some(&logged_domain);
+        let domain_keys = keys(domains_complete);
+        assert_checkpoint_entries(
+            &checkpoint,
+            &existing,
+            domain_logged,
+            &domain_keys,
+            !domains_complete,
+        );
         Ok(())
     }
 
