@@ -7,7 +7,6 @@
 
 use std::sync::Arc;
 
-use delta_kernel::KernelResult;
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::schema::{
     ArrayType, ColumnMetadataKey, DataType, MapType, MetadataValue, StructField, StructType,
@@ -676,7 +675,7 @@ fn test_create_table_dup_physical_name(
     #[case] schema: StructType,
     #[case] expected_error_substring: Option<&str>,
     #[values("name", "id")] cm_mode: &str,
-) -> KernelResult<()> {
+) -> delta_kernel::Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
     let result = create_table(&table_path, Arc::new(schema), "Test/1.0", true)
         .with_table_properties([("delta.columnMapping.mode", cm_mode)])

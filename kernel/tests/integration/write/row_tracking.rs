@@ -19,7 +19,6 @@ use crate::common::read_utils::read_row_tracking_scan;
 mod row_tracking_preservation {
     use std::collections::HashMap;
 
-    use delta_kernel::KernelError;
     use delta_kernel::actions::deletion_vector_writer::KernelDeletionVector;
     use delta_kernel::arrow::array::{Array, ArrayRef, MapBuilder, StringArray, StringBuilder};
     use delta_kernel::schema::{DataType, SchemaRef, StructField};
@@ -121,7 +120,7 @@ mod row_tracking_preservation {
     }
 
     #[test]
-    fn create_table_does_not_emit_row_tracking_preservation_tag() -> KernelResult<()> {
+    fn create_table_does_not_emit_row_tracking_preservation_tag() -> delta_kernel::Result<()> {
         let (_temp_dir, table_path, engine) = test_table_setup()?;
         let table_url = Url::from_directory_path(&table_path).unwrap();
         let commit_version = kernel_create_table(
@@ -141,7 +140,7 @@ mod row_tracking_preservation {
     }
 
     #[test]
-    fn alter_table_emits_row_tracking_preservation_tag() -> KernelResult<()> {
+    fn alter_table_emits_row_tracking_preservation_tag() -> delta_kernel::Result<()> {
         let (_temp_dir, table_path, engine) = test_table_setup()?;
         let table_url = Url::from_directory_path(&table_path).unwrap();
         let snapshot = kernel_create_table(
@@ -173,7 +172,7 @@ mod row_tracking_preservation {
     fn commit_info_preservation_tag_merges_connector_commit_info(
         #[case] test_case: ConnectorCommitInfoTestCase,
         #[values(false, true)] set_commit_info_after_build: bool,
-    ) -> KernelResult<()> {
+    ) -> delta_kernel::Result<()> {
         // === Create a Row Tracking table ===
         let (_temp_dir, table_path, engine) = test_table_setup()?;
         let table_url = Url::from_directory_path(&table_path).unwrap();
@@ -415,7 +414,7 @@ mod row_tracking_preservation {
     async fn deletion_vector_update_requires_preservation_acknowledgment()
     -> delta_kernel::Result<()> {
         // === Create a Row Tracking table with deletion vectors and insert data ===
-        let tmp_dir = tempfile::tempdir().map_err(KernelError::from)?;
+        let tmp_dir = tempfile::tempdir().map_err(delta_kernel::KernelError::from)?;
         let (_schema, table_url, engine, store) = setup_number_table_with_features(
             &tmp_dir,
             "dv_update_without_preservation_acknowledgment",
@@ -510,8 +509,8 @@ mod row_tracking_preservation {
             .first()
             .expect("source scan must return data")
             .schema();
-        let merged_batch =
-            concat_batches(&source_schema, &source_batches).map_err(KernelError::from)?;
+        let merged_batch = concat_batches(&source_schema, &source_batches)
+            .map_err(delta_kernel::KernelError::from)?;
         let expected_rows = vec![(10, 0, 1), (20, 1, 1), (30, 2, 2), (40, 3, 2), (50, 4, 2)];
         assert_eq!(
             collect_rows(
@@ -578,7 +577,7 @@ mod row_tracking_preservation {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn optimize_preserves_row_tracking_metadata_after_deletion_vector_update()
-    -> KernelResult<()> {
+    -> delta_kernel::Result<()> {
         // === Write the source file ===
         let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
         let table_url = Url::from_directory_path(&table_path).unwrap();
@@ -641,7 +640,8 @@ mod row_tracking_preservation {
             .first()
             .expect("deletion vector scan must return data")
             .schema();
-        let merged_batch = concat_batches(&survivor_schema, &survivor_batches)?;
+        let merged_batch = concat_batches(&survivor_schema, &survivor_batches)
+            .map_err(delta_kernel::KernelError::from)?;
         let expected_rows = vec![(10, 0, 1), (30, 2, 1), (50, 4, 1)];
         assert_eq!(
             collect_rows(
@@ -678,7 +678,7 @@ mod row_tracking_preservation {
         snapshot: Arc<Snapshot>,
         engine: &Arc<DefaultEngine<TokioMultiThreadExecutor>>,
         batch: RecordBatch,
-    ) -> KernelResult<Arc<Snapshot>> {
+    ) -> delta_kernel::Result<Arc<Snapshot>> {
         let source_files = get_scan_files(snapshot.clone(), engine.as_ref())?;
         let mut txn = snapshot
             .update_table(UpdateTableOperation::Optimize, "test-engine", false)
@@ -754,7 +754,7 @@ mod row_tracking_preservation {
 fn write_context_row_tracking_columns_respect_iceberg_compat_v3(
     #[case] table_properties: &[(&str, &str)],
     #[case] expected_error: Option<&str>,
-) -> KernelResult<()> {
+) -> delta_kernel::Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
     let snapshot = kernel_create_table(
         table_path.as_str(),
@@ -790,7 +790,7 @@ fn write_context_row_tracking_columns_respect_iceberg_compat_v3(
 #[tokio::test(flavor = "multi_thread")]
 async fn write_context_maps_row_tracking_metadata_to_physical(
     #[values("none", "name", "id")] column_mapping_mode: &str,
-) -> KernelResult<()> {
+) -> delta_kernel::Result<()> {
     // === Create table and insert data ===
     let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
     let schema = schema_ref! { nullable "number": INTEGER };
@@ -828,7 +828,8 @@ async fn write_context_maps_row_tracking_metadata_to_physical(
     )?;
 
     // === Merge the batches ===
-    let merged_batch = concat_batches(&source_batches[0].schema(), &source_batches)?;
+    let merged_batch = concat_batches(&source_batches[0].schema(), &source_batches)
+        .map_err(delta_kernel::KernelError::from)?;
 
     // === Assert merged logical data ===
     let expected_rows = vec![(10, 0, 1), (20, 1, 1), (30, 2, 2), (40, 3, 2), (50, 4, 2)];

@@ -13,6 +13,7 @@ rust-version.workspace = true
 [package.metadata.release]
 pre-release-replacements = [
   { file = "../README.md", search = "delta_kernel_default_engine = \\{ version = \"[a-z0-9\\.-]+\"", replace = "delta_kernel_default_engine = { version = \"{{version}}\"" },
+  { file = "../docs/user-guide/src/getting_started/installation.md", search = "delta_kernel_default_engine = \\{ version = \"[a-z0-9\\.-]+\"", replace = "delta_kernel_default_engine = { version = \"{{version}}\"" },
 ]
 
 [dependencies]

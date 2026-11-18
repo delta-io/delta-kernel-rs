@@ -10,7 +10,7 @@
 //! [`Schema`]: crate::schema::Schema
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use delta_kernel_derive::internal_api;
 use tracing::warn;
@@ -28,7 +28,7 @@ use crate::schema::generated_column::collect_generated_columns;
 pub(crate) use crate::schema::variant_utils::validate_variant_type_feature_support;
 use crate::schema::void_utils::strip_void_from_schema;
 use crate::schema::{
-    ColumnMetadataKey, DataType, GeneratedColumn, SchemaRef, StructField, StructType,
+    ColumnMetadataKey, DataType, GeneratedColumn, MakePhysical, SchemaRef, StructField, StructType,
     is_null_count_only_file_sub_field, schema_has_invariants, validate_column_defaults_metadata,
 };
 #[cfg(feature = "adaptive-metadata-in-dev")]
@@ -44,10 +44,10 @@ use crate::table_features::{
     get_any_level_column_physical_name, validate_iceberg_compat_if_needed,
     validate_timestamp_ntz_feature_support,
 };
-use crate::table_properties::TableProperties;
+use crate::table_properties::{COLUMN_MAPPING_MODE, TableProperties};
 use crate::transforms::SchemaTransform as _;
 use crate::utils::require;
-use crate::{KernelError, KernelResult, Version};
+use crate::{DeltaError, Error, KernelError, KernelResult, Result, Version};
 
 /// Logical and physical schemas for the structured statistics emitted by a scan.
 ///
@@ -271,20 +271,30 @@ fn build_stats_schema_for_columns(
     Ok(strip_metadata(schema))
 }
 
-fn validate_partition_columns(
-    metadata: &Metadata,
-    logical_schema: &StructType,
-) -> KernelResult<()> {
+fn validate_partition_columns(metadata: &Metadata, logical_schema: &StructType) -> Result<()> {
     let mut seen = HashSet::new();
     for col in metadata.partition_columns() {
         if !seen.insert(col) {
-            return Err(KernelError::generic(format!(
-                "Duplicate partition column: '{col}'"
-            )));
+            return Err(DeltaError::duplicate_partition_column(
+                col,
+                // TODO(3421): Remove the KernelError generic source following the error migration
+                Some(Box::new(KernelError::generic(format!(
+                    "Duplicate partition column: '{col}'"
+                )))),
+            )
+            .into());
         }
         require!(
             logical_schema.field(col).is_some(),
-            KernelError::generic(format!("Partition column '{col}' not found in schema"))
+            DeltaError::partition_column_not_found(
+                col,
+                logical_schema,
+                // TODO(3421): Remove the KernelError generic source following the error migration
+                Some(Box::new(KernelError::generic(format!(
+                    "Partition column '{col}' not found in schema"
+                )))),
+            )
+            .into()
         );
     }
     Ok(())
@@ -301,7 +311,7 @@ fn validate_partition_columns(
 /// After construction, call `ensure_operation_supported` to verify that the kernel supports the
 /// required operations for the table's protocol features.
 #[internal_api]
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub(crate) struct TableConfiguration {
     metadata: Metadata,
     protocol: Protocol,
@@ -309,17 +319,43 @@ pub(crate) struct TableConfiguration {
     logical_schema: SchemaRef,
     /// Whether any field in the logical schema declares a column default.
     has_column_with_default: bool,
-    /// The subset of the logical schema that remains after excluding partition columns.
-    logical_schema_without_partition_columns: SchemaRef,
-    /// Physical schema for all columns (field names respect column mapping mode).
-    physical_schema: SchemaRef,
-    /// The subset of the physical schema that remains after excluding partition columns.
-    physical_data_schema_without_partition_columns: SchemaRef,
+    /// Physical schema, materialized only for operations that request it.
+    physical_schema: OnceLock<SchemaRef>,
+    /// Logical and physical schemas without partition columns, initialized together on first use.
+    data_schemas_without_partition_columns: OnceLock<FilteredDataSchemas>,
     table_properties: TableProperties,
     column_mapping_mode: ColumnMappingMode,
     table_root: Url,
     version: Version,
 }
+
+impl PartialEq for TableConfiguration {
+    fn eq(&self, other: &Self) -> bool {
+        // Derived caches do not affect equality, regardless of whether they are initialized.
+        let Self {
+            metadata,
+            protocol,
+            logical_schema,
+            has_column_with_default,
+            physical_schema: _,
+            data_schemas_without_partition_columns: _,
+            table_properties,
+            column_mapping_mode,
+            table_root,
+            version,
+        } = self;
+        metadata == &other.metadata
+            && protocol == &other.protocol
+            && logical_schema == &other.logical_schema
+            && has_column_with_default == &other.has_column_with_default
+            && table_properties == &other.table_properties
+            && column_mapping_mode == &other.column_mapping_mode
+            && table_root == &other.table_root
+            && version == &other.version
+    }
+}
+
+impl Eq for TableConfiguration {}
 
 impl TableConfiguration {
     /// Constructs a [`TableConfiguration`] for a table located in `table_root` at `version`.
@@ -347,7 +383,7 @@ impl TableConfiguration {
         protocol: Protocol,
         table_root: Url,
         version: Version,
-    ) -> KernelResult<Self> {
+    ) -> Result<Self> {
         let logical_schema = Arc::new(metadata.parse_schema()?);
         Self::try_new_inner(metadata, protocol, table_root, version, logical_schema)
     }
@@ -358,7 +394,7 @@ impl TableConfiguration {
         base: &Self,
         metadata: Metadata,
         logical_schema: SchemaRef,
-    ) -> KernelResult<Self> {
+    ) -> Result<Self> {
         Self::try_new_inner(
             metadata,
             base.protocol.clone(),
@@ -374,42 +410,17 @@ impl TableConfiguration {
         table_root: Url,
         version: Version,
         logical_schema: SchemaRef,
-    ) -> KernelResult<Self> {
+    ) -> Result<Self> {
         let table_properties = metadata.parse_table_properties();
         let column_mapping_mode = column_mapping_mode(&protocol, &table_properties);
 
-        let physical_schema = Arc::new(logical_schema.make_physical(column_mapping_mode)?);
-        let partition_columns: HashSet<&str> = metadata
-            .partition_columns()
-            .iter()
-            .map(|s| s.as_str())
-            .collect();
-        let physical_data_schema_without_partition_columns = {
-            let fields = logical_schema
-                .fields()
-                .zip(physical_schema.fields())
-                .filter(|(logical_field, _)| {
-                    !partition_columns.contains(logical_field.name().as_str())
-                })
-                .map(|(_, physical_field)| physical_field.clone());
-            // Safety: subset of an already-valid schema.
-            Arc::new(StructType::new_unchecked(fields))
-        };
-        let logical_schema_without_partition_columns = {
-            let fields = logical_schema
-                .fields()
-                .filter(|field| !partition_columns.contains(field.name().as_str()))
-                .cloned();
-            // Safety: subset of an already-valid schema.
-            Arc::new(StructType::new_unchecked(fields))
-        };
+        MakePhysical::validate_read_column_mapping(column_mapping_mode, &logical_schema)?;
 
         let mut table_config = Self {
             logical_schema,
             has_column_with_default: false,
-            logical_schema_without_partition_columns,
-            physical_schema,
-            physical_data_schema_without_partition_columns,
+            physical_schema: OnceLock::new(),
+            data_schemas_without_partition_columns: OnceLock::new(),
             metadata,
             protocol,
             table_properties,
@@ -427,9 +438,9 @@ impl TableConfiguration {
         require!(
             !(table_config.table_properties.enable_row_tracking == Some(true)
                 && table_config.is_row_tracking_suspended()),
-            KernelError::invalid_protocol(
+            Error::Kernel(KernelError::invalid_protocol(
                 "Row tracking cannot be enabled and suspended at the same time"
-            )
+            ))
         );
 
         // Validate schema against protocol features now that we have a TC instance.
@@ -470,7 +481,7 @@ impl TableConfiguration {
         new_metadata: Option<Metadata>,
         new_protocol: Option<Protocol>,
         new_version: Version,
-    ) -> KernelResult<Self> {
+    ) -> Result<Self> {
         // simplest case: no new P/M, just return the existing table configuration with new version
         if new_metadata.is_none() && new_protocol.is_none() {
             return Ok(Self {
@@ -510,7 +521,7 @@ impl TableConfiguration {
         new_version: Version,
         new_metadata: Option<Metadata>,
         new_protocol: Option<Protocol>,
-    ) -> KernelResult<Self> {
+    ) -> Result<Self> {
         Self::try_new_from(table_configuration, new_metadata, new_protocol, new_version)
     }
 
@@ -789,12 +800,48 @@ impl TableConfiguration {
 
     /// Returns the logical schema excluding partition columns.
     pub(crate) fn logical_schema_without_partition_columns(&self) -> SchemaRef {
-        self.logical_schema_without_partition_columns.clone()
+        self.data_schemas_without_partition_columns()
+            .logical
+            .clone()
     }
 
     /// Returns the physical data schema excluding partition columns.
     pub(crate) fn physical_data_schema_without_partition_columns(&self) -> SchemaRef {
-        self.physical_data_schema_without_partition_columns.clone()
+        self.data_schemas_without_partition_columns()
+            .physical
+            .clone()
+    }
+
+    fn data_schemas_without_partition_columns(&self) -> &FilteredDataSchemas {
+        self.data_schemas_without_partition_columns.get_or_init(|| {
+            let physical_schema = self.physical_schema();
+            let partition_columns: HashSet<&str> = self
+                .metadata
+                .partition_columns()
+                .iter()
+                .map(String::as_str)
+                .collect();
+            if partition_columns.is_empty() {
+                return FilteredDataSchemas {
+                    logical: self.logical_schema.clone(),
+                    physical: physical_schema,
+                };
+            }
+            // Partition columns use logical names; translate them before filtering physical fields.
+            let physical_partition_columns: HashSet<_> = partition_columns
+                .iter()
+                .filter_map(|name| self.logical_schema.field(name))
+                .map(|field| field.physical_name(self.column_mapping_mode))
+                .collect();
+            FilteredDataSchemas {
+                logical: Arc::new(self.logical_schema.share_selected_fields(|field| {
+                    !partition_columns.contains(field.name().as_str())
+                })),
+                physical: Arc::new(physical_schema.share_selected_fields(|field| {
+                    !physical_partition_columns.contains(field.name().as_str())
+                })),
+            }
+        })
     }
 
     /// Translates `delta.dataSkippingStatsColumns` entries to physical column names.
@@ -906,7 +953,14 @@ impl TableConfiguration {
     /// physical column names derived from column mapping metadata.
     #[internal_api]
     pub(crate) fn physical_schema(&self) -> SchemaRef {
-        self.physical_schema.clone()
+        self.physical_schema
+            .get_or_init(|| {
+                Arc::new(
+                    self.logical_schema
+                        .make_validated_physical(self.column_mapping_mode),
+                )
+            })
+            .clone()
     }
 
     /// Whether partition column values must be materialized into data files.
@@ -1010,39 +1064,59 @@ impl TableConfiguration {
     }
 
     /// Validates that all feature requirements for a given feature are satisfied.
-    fn validate_feature_requirements(&self, feature: &TableFeature) -> KernelResult<()> {
+    fn validate_feature_requirements(&self, feature: &TableFeature) -> Result<()> {
         for req in feature.info().feature_requirements {
             match req {
                 FeatureRequirement::Supported(dep) => {
                     require!(
                         self.is_feature_supported(dep),
-                        KernelError::invalid_protocol(format!(
+                        Error::Kernel(KernelError::invalid_protocol(format!(
                             "Feature '{feature}' requires '{dep}' to be supported"
-                        ))
+                        )))
                     );
                 }
                 FeatureRequirement::Enabled(dep) => {
+                    if *feature == TableFeature::AdaptiveMetadataPreview
+                        && *dep == TableFeature::ColumnMapping
+                        && self.is_feature_supported(dep)
+                        && !self.is_feature_enabled(dep)
+                        && let Some(mode) = self
+                            .metadata
+                            .configuration()
+                            .get(COLUMN_MAPPING_MODE)
+                            .filter(|mode| mode.as_str() != "id")
+                    {
+                        // The dependency check runs before the mode check. Read the stored value
+                        // here because property parsing omits unrecognized mode strings.
+                        return Err(DeltaError::adaptive_metadata_mapping_mode(
+                            mode,
+                            Some(Box::new(KernelError::invalid_protocol(format!(
+                                "Feature '{feature}' requires '{dep}' to be enabled"
+                            )))),
+                        )
+                        .into());
+                    }
                     require!(
                         self.is_feature_enabled(dep),
-                        KernelError::invalid_protocol(format!(
+                        Error::Kernel(KernelError::invalid_protocol(format!(
                             "Feature '{feature}' requires '{dep}' to be enabled"
-                        ))
+                        )))
                     );
                 }
                 FeatureRequirement::NotSupported(dep) => {
                     require!(
                         !self.is_feature_supported(dep),
-                        KernelError::invalid_protocol(format!(
+                        Error::Kernel(KernelError::invalid_protocol(format!(
                             "Feature '{feature}' requires '{dep}' to not be supported"
-                        ))
+                        )))
                     );
                 }
                 FeatureRequirement::NotEnabled(dep) => {
                     require!(
                         !self.is_feature_enabled(dep),
-                        KernelError::invalid_protocol(format!(
+                        Error::Kernel(KernelError::invalid_protocol(format!(
                             "Feature '{feature}' requires '{dep}' to not be enabled"
-                        ))
+                        )))
                     );
                 }
                 FeatureRequirement::Custom(check) => {
@@ -1055,18 +1129,14 @@ impl TableConfiguration {
 
     /// Checks that kernel supports a feature for the given operation.
     /// Returns an error if the feature is unknown, not supported, or fails validation.
-    fn check_feature_support(
-        &self,
-        feature: &TableFeature,
-        operation: Operation,
-    ) -> KernelResult<()> {
+    fn check_feature_support(&self, feature: &TableFeature, operation: Operation) -> Result<()> {
         let info = feature.info();
         match &info.kernel_support {
             KernelSupport::Supported => {}
             KernelSupport::NotSupported => {
-                return Err(KernelError::unsupported(format!(
+                return Err(Error::Kernel(KernelError::unsupported(format!(
                     "Feature '{feature}' is not supported"
-                )));
+                ))));
             }
             KernelSupport::Custom(check) => {
                 check(&self.protocol, &self.table_properties, operation)?;
@@ -1112,7 +1182,7 @@ impl TableConfiguration {
     /// - For `SnapshotLoad`, `Scan` and `Cdf`: checks reader version and reader features
     /// - For `Write` operations: checks writer version and writer features
     #[internal_api]
-    pub(crate) fn ensure_operation_supported(&self, operation: Operation) -> KernelResult<()> {
+    pub(crate) fn ensure_operation_supported(&self, operation: Operation) -> Result<()> {
         match operation {
             Operation::SnapshotLoad | Operation::Scan | Operation::Cdf => {
                 self.ensure_read_supported(operation)
@@ -1122,13 +1192,13 @@ impl TableConfiguration {
     }
 
     /// Ensures Kernel supports both scanning and writing this table.
-    pub(crate) fn ensure_read_write_supported(&self) -> KernelResult<()> {
+    pub(crate) fn ensure_read_write_supported(&self) -> Result<()> {
         self.ensure_operation_supported(Operation::Scan)?;
         self.ensure_operation_supported(Operation::Write)
     }
 
     /// Internal helper for read operations (Scan, Cdf, SnapshotLoad)
-    fn ensure_read_supported(&self, operation: Operation) -> KernelResult<()> {
+    fn ensure_read_supported(&self, operation: Operation) -> Result<()> {
         check_reader_version_range(&self.protocol)?;
 
         // Check all enabled reader features have kernel support
@@ -1140,22 +1210,22 @@ impl TableConfiguration {
     }
 
     /// Internal helper for write operations
-    pub(crate) fn ensure_write_supported(&self) -> KernelResult<()> {
+    pub(crate) fn ensure_write_supported(&self) -> Result<()> {
         // Version check: kernel supports writer versions
         // MIN_VALID_RW_VERSION..=MAX_VALID_WRITER_VERSION
         require!(
             self.protocol.min_writer_version() >= MIN_VALID_RW_VERSION,
-            KernelError::InvalidProtocol(format!(
+            Error::Kernel(KernelError::InvalidProtocol(format!(
                 "min_writer_version must be >= {MIN_VALID_RW_VERSION}, got {}",
                 self.protocol.min_writer_version()
-            ))
+            )))
         );
         // Version check: kernel supports writer versions 1..=MAX_VALID_WRITER_VERSION
         if self.protocol.min_writer_version() > MAX_VALID_WRITER_VERSION {
-            return Err(KernelError::unsupported(format!(
+            return Err(Error::Kernel(KernelError::unsupported(format!(
                 "Unsupported minimum writer version {}",
                 self.protocol.min_writer_version()
-            )));
+            ))));
         }
 
         // Check all enabled writer features have kernel support
@@ -1170,10 +1240,10 @@ impl TableConfiguration {
         require!(
             self.is_feature_supported(&TableFeature::CheckConstraints)
                 || !self.has_check_constraints(),
-            KernelError::invalid_protocol(
+            Error::Kernel(KernelError::invalid_protocol(
                 "Table contains CHECK constraints but does not support the 'checkConstraints' \
                  writer feature",
-            )
+            ))
         );
 
         // Run discovery to assert that every generated column's expression is a string, because
@@ -1186,9 +1256,9 @@ impl TableConfiguration {
         if self.is_feature_supported(&TableFeature::Invariants)
             && schema_has_invariants(self.logical_schema.as_ref())
         {
-            return Err(KernelError::unsupported(
+            return Err(Error::Kernel(KernelError::unsupported(
                 "Column invariants are not yet supported",
-            ));
+            )));
         }
 
         Ok(())
@@ -1353,16 +1423,25 @@ impl TableConfiguration {
     }
 }
 
+/// Logical and physical schemas with partition columns excluded.
+#[derive(Debug, Clone)]
+struct FilteredDataSchemas {
+    logical: SchemaRef,
+    physical: SchemaRef,
+}
+
 #[cfg(test)]
 mod test {
 
     use std::collections::HashMap;
+    use std::sync::Arc;
 
     use rstest::rstest;
 
     use super::{InCommitTimestampEnablement, StatsOutputSchemas, TableConfiguration};
-    use crate::KernelError;
     use crate::actions::{MIN_VALUES, Metadata, Protocol};
+    use crate::scan::state_info::StateInfo;
+    use crate::scan::{PartitionValuesOptions, StatsOptions};
     use crate::schema::{
         ColumnMetadataKey, ColumnName, DataType, MetadataValue, SchemaRef, StructField,
         column_name, schema, schema_ref,
@@ -1386,6 +1465,7 @@ mod test {
         test_schema_with_array_and_column_mapping, test_schema_with_map,
         test_schema_with_map_and_column_mapping,
     };
+    use crate::{DeltaErrorCondition, Error, KernelError};
 
     #[rstest]
     fn collations_feature_without_annotations_requires_only_domain_metadata_for_writes(
@@ -1465,13 +1545,192 @@ mod test {
     }
 
     #[test]
-    fn table_configuration_rejects_partition_column_missing_from_schema() {
+    fn unpartitioned_schema_views_share_backing() {
+        let table_config = MockTableConfigurationBuilder::new()
+            .with_schema(schema! {
+                nullable "value": INTEGER,
+                nullable "part": STRING,
+            })
+            .build();
+
+        assert!(Arc::ptr_eq(
+            &table_config.logical_schema,
+            &table_config.logical_schema_without_partition_columns()
+        ));
+        assert!(Arc::ptr_eq(
+            &table_config.physical_schema(),
+            &table_config.physical_data_schema_without_partition_columns()
+        ));
+    }
+
+    #[rstest]
+    fn physical_schema_is_lazy_and_preserves_eager_output(
+        #[values(
+            ColumnMappingMode::None,
+            ColumnMappingMode::Name,
+            ColumnMappingMode::Id
+        )]
+        mode: ColumnMappingMode,
+        #[values(false, true)] file_column: bool,
+    ) {
+        let schema = test_schema_nested_with_column_mapping();
+        let schema = if file_column {
+            let field = StructField {
+                data_type: DataType::file_type(),
+                ..schema.fields().next().unwrap().clone()
+            };
+            schema_ref! { (field) }
+        } else {
+            schema
+        };
+        let expected = schema.make_physical(mode).unwrap();
+        let mut features = vec![TableFeature::ColumnMapping];
+        if file_column {
+            features.push(TableFeature::FileType);
+        }
+        let config = MockTableConfigurationBuilder::new()
+            .with_schema(schema)
+            .with_column_mapping(Some(mode))
+            .with_protocol(MockProtocolBuilder::new().with_features(features).build())
+            .build();
+        let untouched = config.clone();
+        assert!(config.physical_schema.get().is_none());
+        config.ensure_operation_supported(Operation::Scan).unwrap();
+        assert!(config.physical_schema.get().is_none());
+        let physical = config.physical_schema();
+        assert_eq!(*physical, expected);
+        assert!(Arc::ptr_eq(&physical, &config.physical_schema()));
+        assert!(untouched.physical_schema.get().is_none());
+        assert_eq!(config, untouched);
+    }
+
+    #[rstest]
+    fn partitioned_schema_views_remain_filtered(
+        #[values(
+            ColumnMappingMode::None,
+            ColumnMappingMode::Name,
+            ColumnMappingMode::Id
+        )]
+        mode: ColumnMappingMode,
+    ) {
+        let schema = test_schema_nested_with_column_mapping();
+        let table_config = MockTableConfigurationBuilder::new()
+            .with_schema(schema.clone())
+            .with_column_mapping(Some(mode))
+            .with_protocol(
+                MockProtocolBuilder::new()
+                    .with_features([TableFeature::ColumnMapping])
+                    .build(),
+            )
+            .with_partition_columns(["id"])
+            .build();
+
+        let expected_logical = schema.project(&["info"]).unwrap();
+        assert_eq!(
+            table_config.logical_schema_without_partition_columns(),
+            expected_logical
+        );
+        assert_eq!(
+            *table_config.physical_data_schema_without_partition_columns(),
+            expected_logical.make_physical(mode).unwrap()
+        );
+    }
+
+    #[rstest]
+    fn scan_schema_reuse_matches_fallback_and_preserves_projection_laziness(
+        #[values(
+            ColumnMappingMode::None,
+            ColumnMappingMode::Name,
+            ColumnMappingMode::Id
+        )]
+        mode: ColumnMappingMode,
+        #[values(false, true)] partitioned: bool,
+    ) {
+        let config = MockTableConfigurationBuilder::new()
+            .with_schema(test_schema_nested_with_column_mapping())
+            .with_column_mapping(Some(mode))
+            .with_protocol(
+                MockProtocolBuilder::new()
+                    .with_features([TableFeature::ColumnMapping])
+                    .build(),
+            )
+            .with_partition_columns(if partitioned { vec!["id"] } else { vec![] })
+            .build();
+        let table_schema = config.logical_schema();
+        let stats = StatsOptions::default();
+        let partition_values = PartitionValuesOptions::default();
+        let projected_schema = table_schema.project(&["info"]).unwrap();
+        let projected = StateInfo::try_new(
+            projected_schema.clone(),
+            table_schema.clone(),
+            &config,
+            None,
+            &stats,
+            &partition_values,
+            (),
+        )
+        .unwrap();
+        assert!(config.physical_schema.get().is_none());
+        assert!(
+            config
+                .data_schemas_without_partition_columns
+                .get()
+                .is_none()
+        );
+        assert_eq!(
+            *projected.physical_schema,
+            projected_schema.make_physical(mode).unwrap()
+        );
+
+        let fallback = StateInfo::try_new(
+            Arc::new(table_schema.as_ref().clone()),
+            table_schema.clone(),
+            &config,
+            None,
+            &stats,
+            &partition_values,
+            (),
+        )
+        .unwrap();
+        assert!(config.physical_schema.get().is_none());
+        let reused = StateInfo::try_new(
+            table_schema.clone(),
+            table_schema,
+            &config,
+            None,
+            &stats,
+            &partition_values,
+            (),
+        )
+        .unwrap();
+        assert!(config.physical_schema.get().is_some());
+        assert_eq!(reused.logical_schema, fallback.logical_schema);
+        assert_eq!(reused.physical_schema, fallback.physical_schema);
+        assert_eq!(reused.transform_spec, fallback.transform_spec);
+    }
+
+    #[rstest]
+    #[case::missing(vec!["missing"])]
+    #[case::missing_before_duplicate(vec!["missing", "missing"])]
+    fn table_configuration_rejects_partition_column_missing_from_schema(
+        #[case] columns: Vec<&str>,
+    ) {
         let result = MockTableConfigurationBuilder::new()
-            .with_partition_columns(["missing"])
+            .with_partition_columns(columns)
             .with_protocol(MockProtocolBuilder::new().with_versions(1, 2).build())
             .try_build();
 
-        assert_result_error_with_message(result, "Partition column 'missing' not found in schema");
+        let Error::Delta(error) = result.unwrap_err() else {
+            panic!("expected Delta error")
+        };
+        assert_eq!(
+            error.condition(),
+            DeltaErrorCondition::DeltaPartitionColumnNotFound
+        );
+        assert_eq!(error.sql_state(), Some("42703"));
+        assert_eq!(error.parameters()[0].value(), "missing");
+        assert!(!error.parameters()[1].value().is_empty());
+        assert!(std::error::Error::source(&error).is_some());
     }
 
     #[derive(Debug, PartialEq)]
@@ -1487,9 +1746,9 @@ mod test {
         fn for_table_config(table_config: &TableConfiguration) -> Self {
             match table_config.ensure_operation_supported(Operation::Write) {
                 Ok(()) => Self::Supported,
-                Err(KernelError::InvalidProtocol(_)) => Self::InvalidProtocol,
-                Err(KernelError::Schema(_)) => Self::InvalidSchema,
-                Err(KernelError::Unsupported(_)) => Self::Unsupported,
+                Err(Error::Kernel(KernelError::InvalidProtocol(_))) => Self::InvalidProtocol,
+                Err(Error::Kernel(KernelError::Schema(_))) => Self::InvalidSchema,
+                Err(Error::Kernel(KernelError::Unsupported(_))) => Self::Unsupported,
                 Err(err) => panic!("unexpected write error: {err:?}"),
             }
         }
@@ -1858,7 +2117,16 @@ mod test {
             .with_protocol(MockProtocolBuilder::new().with_versions(1, 2).build())
             .try_build();
 
-        assert_result_error_with_message(result, "Duplicate partition column: 'part'");
+        let Error::Delta(error) = result.unwrap_err() else {
+            panic!("expected Delta error")
+        };
+        assert_eq!(
+            error.condition(),
+            DeltaErrorCondition::DeltaDuplicateColumnsFoundPartitionColumns
+        );
+        assert_eq!(error.sql_state(), Some("42711"));
+        assert_eq!(error.parameters()[0].value(), "part");
+        assert!(std::error::Error::source(&error).is_some());
     }
 
     #[test]
@@ -3186,6 +3454,46 @@ mod test {
         );
     }
 
+    #[rstest]
+    fn partition_filtered_schemas_share_fields(
+        #[values(
+            ColumnMappingMode::None,
+            ColumnMappingMode::Name,
+            ColumnMappingMode::Id
+        )]
+        mode: ColumnMappingMode,
+        #[values(vec![], vec!["part_a"], vec!["part_b"], vec!["part_a", "part_b"])] partitions: Vec<
+            &str,
+        >,
+    ) {
+        let config = MockTableConfigurationBuilder::new()
+            .with_schema(partitioned_schema_with_column_mapping())
+            .with_column_mapping(mode)
+            .with_partition_columns(partitions.clone())
+            .with_protocol(MockProtocolBuilder::new().with_versions(2, 5).build())
+            .build();
+
+        let logical = config.logical_schema_without_partition_columns();
+        let physical = config.physical_data_schema_without_partition_columns();
+        let physical_schema = config.physical_schema();
+        assert_eq!(logical.fields().len(), 3 - partitions.len());
+        assert_eq!(physical.fields().len(), logical.fields().len());
+        for logical_field in config.logical_schema.fields() {
+            let physical_field = physical_schema
+                .field(logical_field.physical_name(mode))
+                .unwrap();
+            let retained_logical = logical.field(logical_field.name());
+            let retained_physical = physical.field(physical_field.name());
+            if partitions.contains(&logical_field.name().as_str()) {
+                assert!(retained_logical.is_none());
+                assert!(retained_physical.is_none());
+            } else {
+                assert!(std::ptr::eq(retained_logical.unwrap(), logical_field));
+                assert!(std::ptr::eq(retained_physical.unwrap(), physical_field));
+            }
+        }
+    }
+
     #[test]
     fn test_physical_stats_column_names_excludes_partition_columns() {
         let config = MockTableConfigurationBuilder::new()
@@ -3718,6 +4026,18 @@ mod test {
         all_adaptive_metadata_deps(),
         Some("column mapping in 'id' mode")
     )]
+    #[case::cm_none_mode_rejected(
+        all_adaptive_metadata_props(),
+        Some(ColumnMappingMode::None),
+        all_adaptive_metadata_deps(),
+        Some("explicit mapping mode")
+    )]
+    #[case::cm_mode_absent(
+        all_adaptive_metadata_props(),
+        None,
+        all_adaptive_metadata_deps(),
+        Some("requires 'columnMapping' to be enabled")
+    )]
     // Column mapping feature absent entirely -> the `Enabled(ColumnMapping)` arm fires first.
     #[case::column_mapping_not_supported(
         all_adaptive_metadata_props(),
@@ -3756,6 +4076,12 @@ mod test {
         adaptive_metadata_deps_with(TableFeature::V2Checkpoint),
         Some("requires 'v2Checkpoint' to not be supported")
     )]
+    #[case::unrecognized_mapping_mode(
+        all_adaptive_metadata_props().into_iter().chain([("delta.columnMapping.mode", "custom")]).collect(),
+        None,
+        all_adaptive_metadata_deps(),
+        None
+    )]
     fn test_adaptive_metadata_feature_requirements(
         #[case] props: Vec<(&str, &str)>,
         #[case] cm_mode: Option<ColumnMappingMode>,
@@ -3788,6 +4114,44 @@ mod test {
             )
             .build();
         let result = config.validate_feature_requirements(&TableFeature::AdaptiveMetadataPreview);
+        let stored_mode = cm_mode
+            .map(|mode| match mode {
+                ColumnMappingMode::None => "none",
+                ColumnMappingMode::Name => "name",
+                ColumnMappingMode::Id => "id",
+            })
+            .or_else(|| {
+                props
+                    .iter()
+                    .find_map(|(key, value)| (*key == "delta.columnMapping.mode").then_some(*value))
+            });
+        if stored_mode.is_some_and(|mode| mode != "id")
+            && deps.contains(&TableFeature::ColumnMapping)
+        {
+            let Error::Delta(error) = result.unwrap_err() else {
+                panic!("expected Delta error")
+            };
+            assert_eq!(
+                error.condition(),
+                DeltaErrorCondition::DeltaAdaptiveMetadataRequiresColumnMappingIdMode
+            );
+            assert_eq!(error.sql_state(), Some("42000"));
+            let parameters: Vec<_> = error
+                .parameters()
+                .iter()
+                .map(|p| (p.name(), p.value()))
+                .collect();
+            assert_eq!(
+                parameters,
+                vec![
+                    ("feature", "adaptiveMetadata-preview"),
+                    ("prop", "delta.columnMapping.mode"),
+                    ("mode", stored_mode.unwrap()),
+                ]
+            );
+            assert!(std::error::Error::source(&error).is_some());
+            return;
+        }
         match expected_error_substring {
             Some(msg) => assert_result_error_with_message(result, msg),
             None => assert!(result.is_ok(), "expected Ok, got {result:?}"),

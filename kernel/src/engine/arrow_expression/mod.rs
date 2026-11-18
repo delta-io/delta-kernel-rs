@@ -104,7 +104,7 @@ impl Scalar {
                 append_val_n_as!(array::TimestampMicrosecondBuilder, *val)
             }
             IntervalYearMonth(val) => append_val_n_as!(array::Int32Builder, val.months()),
-            IntervalDayTime(val) => append_val_n_as!(array::Int64Builder, *val),
+            IntervalDayTime(val) => append_val_n_as!(array::Int64Builder, val.micros()),
             Date(val) => append_val_n_as!(array::Date32Builder, *val),
             Binary(val) => append_val_as!(array::BinaryBuilder, val),
             // precision and scale were already set at builder construction time
@@ -227,7 +227,9 @@ impl Scalar {
             DataType::Primitive(PrimitiveType::IntervalYearMonth(_)) => {
                 append_nulls_as!(array::Int32Builder)
             }
-            DataType::INTERVAL_DAY_TIME => append_nulls_as!(array::Int64Builder),
+            DataType::Primitive(PrimitiveType::IntervalDayTime(_)) => {
+                append_nulls_as!(array::Int64Builder)
+            }
             #[cfg(feature = "geo-type-in-dev")]
             DataType::Primitive(PrimitiveType::Geometry(_) | PrimitiveType::Geography(_)) => {
                 return Err(KernelError::unsupported(
@@ -520,7 +522,7 @@ fn primitive_types_compatible(expected: &PrimitiveType, data_type: &ArrowDataTyp
         ) => true,
         (PrimitiveType::Void, ArrowDataType::Null) => true,
         (PrimitiveType::IntervalYearMonth(_), ArrowDataType::Int32 | ArrowDataType::UInt32) => true,
-        (PrimitiveType::IntervalDayTime, ArrowDataType::Int64 | ArrowDataType::UInt64) => true,
+        (PrimitiveType::IntervalDayTime(_), ArrowDataType::Int64 | ArrowDataType::UInt64) => true,
         _ => false,
     }
 }

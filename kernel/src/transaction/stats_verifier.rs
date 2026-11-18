@@ -198,11 +198,11 @@ fn column_types_for(dt: &DataType) -> KernelResult<&'static ColumnNamesAndTypes>
         &DataType::TIMESTAMP => Ok(&COL_TYPES_TIMESTAMP),
         &DataType::TIMESTAMP_NTZ => Ok(&COL_TYPES_TIMESTAMP_NTZ),
         DataType::Primitive(PrimitiveType::Decimal(_)) => Ok(&COL_TYPES_DECIMAL),
-        DataType::Primitive(PrimitiveType::IntervalYearMonth(_)) | &DataType::INTERVAL_DAY_TIME => {
-            Err(KernelError::unsupported(format!(
-                "Interval types are not supported for stats validation: {dt}"
-            )))
-        }
+        DataType::Primitive(
+            PrimitiveType::IntervalYearMonth(_) | PrimitiveType::IntervalDayTime(_),
+        ) => Err(KernelError::unsupported(format!(
+            "Interval types are not supported for stats validation: {dt}"
+        ))),
         #[cfg(feature = "geo-type-in-dev")]
         DataType::Primitive(PrimitiveType::Geometry(_) | PrimitiveType::Geography(_)) => Err(
             KernelError::unsupported(format!("Unsupported data type for stats validation: {dt}")),
@@ -244,11 +244,11 @@ fn is_stat_present<'b>(
         DataType::Primitive(PrimitiveType::Decimal(_)) => {
             Ok(getter.get_decimal(row_idx, field_name)?.is_some())
         }
-        DataType::Primitive(PrimitiveType::IntervalYearMonth(_)) | &DataType::INTERVAL_DAY_TIME => {
-            Err(KernelError::unsupported(format!(
-                "Interval types are not supported for stats presence check: {data_type}"
-            )))
-        }
+        DataType::Primitive(
+            PrimitiveType::IntervalYearMonth(_) | PrimitiveType::IntervalDayTime(_),
+        ) => Err(KernelError::unsupported(format!(
+            "Interval types are not supported for stats presence check: {data_type}"
+        ))),
         #[cfg(feature = "geo-type-in-dev")]
         DataType::Primitive(PrimitiveType::Geometry(_) | PrimitiveType::Geography(_)) => {
             Err(KernelError::unsupported(format!(

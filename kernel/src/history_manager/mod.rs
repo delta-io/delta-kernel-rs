@@ -525,7 +525,11 @@ pub(crate) fn timestamp_to_version(
 /// let timestamp = 1672531200000; // Milliseconds since epoch for 2023-01-01
 /// let commit = latest_version_as_of(&snapshot, &engine, timestamp, HistoryCommitType::Recreatable)?;
 /// ```
-#[tracing::instrument(skip(snapshot, engine), ret, fields(latest_version = snapshot.version(), table_root = %snapshot.table_root()))]
+#[tracing::instrument(
+    skip(snapshot, engine),
+    ret,
+    fields(enable_call_frame, latest_version = snapshot.version(), table_root = %snapshot.table_root())
+)]
 pub fn latest_version_as_of(
     snapshot: &Snapshot,
     engine: &dyn Engine,
@@ -566,7 +570,11 @@ pub fn latest_version_as_of(
 /// let timestamp = 1672531200000; // Milliseconds since epoch for 2023-01-01
 /// let commit = first_version_after(&snapshot, &engine, timestamp, HistoryCommitType::Recreatable)?;
 /// ```
-#[tracing::instrument(skip(snapshot, engine), ret, fields(latest_version = snapshot.version(), table_root = %snapshot.table_root()))]
+#[tracing::instrument(
+    skip(snapshot, engine),
+    ret,
+    fields(enable_call_frame, latest_version = snapshot.version(), table_root = %snapshot.table_root())
+)]
 pub fn first_version_after(
     snapshot: &Snapshot,
     engine: &dyn Engine,
@@ -626,7 +634,11 @@ pub fn first_version_after(
 /// let (start_version, end_version) =
 ///     timestamp_range_to_versions(&snapshot, &engine, start_timestamp, Some(end_timestamp))?;
 /// ```
-#[tracing::instrument(skip(snapshot, engine), ret, fields(latest_version = snapshot.version(), table_root = %snapshot.table_root()))]
+#[tracing::instrument(
+    skip(snapshot, engine),
+    ret,
+    fields(enable_call_frame, latest_version = snapshot.version(), table_root = %snapshot.table_root())
+)]
 pub fn timestamp_range_to_versions(
     snapshot: &Snapshot,
     engine: &dyn Engine,
@@ -874,7 +886,7 @@ pub enum HistoryCommitType {
 /// - [`DeltaError::Generic`] when the listing yields no commits and
 ///   `earliest_ratified_commit_version` is `Some(0)`, flagging a broken catalog-managed invariant
 ///   (ratified commit 0 with no published filesystem commit).
-#[tracing::instrument(skip(engine), err, ret)]
+#[tracing::instrument(skip(engine), err, ret, fields(enable_call_frame))]
 pub fn get_earliest_commit(
     engine: &dyn Engine,
     log_root: &Url,
@@ -912,7 +924,6 @@ mod tests {
     use crate::actions::{CommitInfo, Metadata, Protocol};
     use crate::engine::sync::SyncEngine;
     use crate::engine::{CancellableEngine, DelegatingEngine};
-    use crate::object_store::memory::InMemory;
     use crate::schema::{SchemaRef, schema_ref};
     use crate::snapshot::{Snapshot, SnapshotBuilder};
     use crate::table_features::TableFeature;
@@ -2063,7 +2074,7 @@ mod tests {
     /// an engine wired to it plus the corresponding `_delta_log/` URL. Paths listed in
     /// `empty_paths` are written as 0-byte files to exercise empty-file skipping.
     fn engine_with_log_files(paths: &[String], empty_paths: &HashSet<String>) -> (SyncEngine, Url) {
-        let engine = SyncEngine::new_with_store(Arc::new(InMemory::new()));
+        let engine = SyncEngine::in_memory();
         let storage = engine.storage_handler();
         for path in paths {
             let bytes = if empty_paths.contains(path) {

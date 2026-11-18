@@ -146,9 +146,9 @@ async fn append_only_enforces_data_change_for_file_actions(
             } else {
                 vec![false; data.len()]
             };
-            FilteredEngineData::try_new(data, selection_vector)
+            Ok(FilteredEngineData::try_new(data, selection_vector)?)
         })
-        .collect::<KernelResult<Vec<_>>>()?;
+        .collect::<delta_kernel::Result<Vec<_>>>()?;
     let mut txn = begin_transaction_with(
         snapshot,
         engine.as_ref(),
@@ -232,14 +232,16 @@ async fn append_only_enforces_data_change_for_file_actions(
 fn selected_scan_file_batch(
     snapshot: Arc<Snapshot>,
     engine: &dyn Engine,
-) -> KernelResult<FilteredEngineData> {
+) -> delta_kernel::Result<FilteredEngineData> {
     for scan_files in get_scan_files(snapshot, engine)? {
         let data = scan_files.apply_selection_vector()?;
         if !data.is_empty() {
             return Ok(FilteredEngineData::with_all_rows_selected(data));
         }
     }
-    Err(KernelError::generic("expected at least one scan file"))
+    Err(delta_kernel::Error::Kernel(KernelError::generic(
+        "expected at least one scan file",
+    )))
 }
 
 #[rstest]
@@ -388,7 +390,7 @@ fn selected_scan_file_batch(
 #[tokio::test]
 async fn commit_validates_file_action_uniqueness(
     #[case] case: FileActionUniquenessCase,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> std::result::Result<(), Box<dyn std::error::Error>> {
     // === Initialize table with files ===
     let schema = schema_ref! { nullable "id": INTEGER };
     let (_store, engine, table_url, _) = create_dv_table_with_files(
@@ -553,7 +555,7 @@ const fn file_action(
 fn apply_path_dv(
     base_row: &RecordBatch,
     file_actions: &[FileActionInput],
-) -> Result<RecordBatch, ArrowError> {
+) -> std::result::Result<RecordBatch, ArrowError> {
     let batch = concat_batches(
         &base_row.schema(),
         &vec![base_row.clone(); file_actions.len()],
@@ -2559,7 +2561,7 @@ fn setup_table_with_dv_small() -> delta_kernel::Result<DvSmallTableSetup> {
 #[cfg(feature = "adaptive-metadata-in-dev")]
 #[tokio::test]
 async fn adaptive_metadata_remove_cancels_add_across_dv_storage_types()
--> Result<(), Box<dyn std::error::Error>> {
+-> std::result::Result<(), Box<dyn std::error::Error>> {
     // v1: create an adaptiveMetadata table with one data file.
     let (_tmp_dir, table_url, engine, snapshot) =
         create_number_table(vec!["adaptiveMetadata-preview"], vec![], "id", true).await?;
@@ -2611,7 +2613,8 @@ async fn adaptive_metadata_remove_cancels_add_across_dv_storage_types()
         .unwrap_committed()
         .commit_version();
     let commit_path = table_url
-        .join(&format!("_delta_log/{version:020}.json"))?
+        .join(&format!("_delta_log/{version:020}.json"))
+        .map_err(delta_kernel::KernelError::from)?
         .to_file_path()
         .expect("local table");
     let commit = std::fs::read_to_string(&commit_path)?;
@@ -2621,7 +2624,8 @@ async fn adaptive_metadata_remove_cancels_add_across_dv_storage_types()
         commit.contains(u_json),
         "unexpected remove encoding: {commit}"
     );
-    std::fs::write(&commit_path, commit.replace(u_json, r_json))?;
+    std::fs::write(&commit_path, commit.replace(u_json, r_json))
+        .map_err(delta_kernel::KernelError::from)?;
 
     let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
     let live_files: usize = get_scan_files(snapshot.clone(), engine.as_ref())?
@@ -2747,7 +2751,7 @@ async fn commit_validates_remove_row_tracking_metadata(
     value: Option<i64>,
     field: &'static str,
     cm_mode: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> std::result::Result<(), Box<dyn std::error::Error>> {
     let RowTrackingMetadataCase {
         row_tracking_state,
         selection_vector,
@@ -2800,7 +2804,7 @@ async fn commit_validates_dv_row_tracking_metadata(
     value: Option<i64>,
     field: &'static str,
     cm_mode: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> std::result::Result<(), Box<dyn std::error::Error>> {
     let RowTrackingMetadataCase {
         row_tracking_state,
         selection_vector,
@@ -2870,7 +2874,7 @@ type RowTrackingTableSetup = (tempfile::TempDir, Arc<dyn Engine>, Arc<Snapshot>)
 fn create_row_tracking_table(
     row_tracking_state: RowTrackingState,
     cm_mode: &str,
-) -> Result<RowTrackingTableSetup, Box<dyn std::error::Error>> {
+) -> std::result::Result<RowTrackingTableSetup, Box<dyn std::error::Error>> {
     let (temp_dir, table_path, engine) = test_table_setup()?;
     let mut properties = vec![
         ("delta.enableDeletionVectors", "true"),
@@ -2923,7 +2927,7 @@ fn batch_with_invalid_row_tracking_meta(
     snapshot: Arc<Snapshot>,
     engine: &dyn Engine,
     modification: ScanFileModification,
-) -> KernelResult<(RecordBatch, RecordBatch)> {
+) -> delta_kernel::Result<(RecordBatch, RecordBatch)> {
     let scan_file = selected_scan_file_batch(snapshot, engine)?;
     assert_eq!(scan_file.data().len(), 3);
     let original = into_record_batch(scan_file.apply_selection_vector()?);
@@ -2982,7 +2986,7 @@ fn assert_row_tracking_files(
     snapshot: Arc<Snapshot>,
     engine: &dyn Engine,
     expected: &HashMap<String, AddActionRowTracking>,
-) -> KernelResult<()> {
+) -> delta_kernel::Result<()> {
     let mut actual = HashMap::new();
     for scan_files in get_scan_files(snapshot, engine)? {
         let batch = into_record_batch(scan_files.apply_selection_vector()?);

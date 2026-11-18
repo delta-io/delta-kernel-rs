@@ -49,7 +49,7 @@ use crate::table_features::TableFeature;
 use crate::utils::require;
 use crate::{
     DataType, Engine, EngineData, Expression, ExpressionEvaluator, KernelResult,
-    KernelResultIterator, RowVisitor, Version, create_row, version_as_i64,
+    KernelResultIterator, Result, RowVisitor, Version, create_row, version_as_i64,
 };
 
 mod update_table;
@@ -100,7 +100,7 @@ impl<STATE> Transaction<STATE, Imperative> {
         ),
         err
     )]
-    pub fn commit(self, engine: &dyn Engine) -> KernelResult<CommitResult<STATE>> {
+    pub fn commit(self, engine: &dyn Engine) -> Result<CommitResult<STATE>> {
         let commit_start = Instant::now();
 
         // === Pre-commit validation ===
@@ -223,7 +223,7 @@ impl<STATE> Transaction<STATE, Imperative> {
         post_commit_inputs: PostCommitInputs,
         prepare_duration: Duration,
         committer_duration: Duration,
-    ) -> KernelResult<CommitResult<STATE>> {
+    ) -> Result<CommitResult<STATE>> {
         match commit_response {
             Ok(CommitResponse::Committed { file_meta }) => {
                 let PostCommitInputs {
@@ -271,7 +271,7 @@ impl<STATE> Transaction<STATE, Imperative> {
                     .record("failure_reason", CommitFailureReason::RetryableIo.as_ref());
                 Ok(CommitResult::Retryable(self.into_retryable(e)))
             }
-            Err(e) => Err(e),
+            Err(e) => Err(e.into()),
         }
     }
 
@@ -843,7 +843,6 @@ fn build_remove_struct_patch(
 mod tests {
     use std::path::PathBuf;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use ::test_utils::get_column;
     use rstest::rstest;
@@ -857,11 +856,11 @@ mod tests {
     use crate::arrow::datatypes::{DataType as ArrowDataType, Schema as ArrowSchema};
     use crate::arrow::record_batch::RecordBatch;
     use crate::committer::FileSystemCommitter;
-    use crate::engine::DelegatingEngine;
     use crate::engine::arrow_conversion::TryIntoArrow;
     use crate::engine::arrow_data::ArrowEngineData;
     use crate::engine::arrow_expression::ArrowEvaluationHandler;
     use crate::engine::sync::SyncEngine;
+    use crate::engine::{DelegatingEngine, RelaxedCounter};
     use crate::expressions::{ExpressionRef, MapData, PredicateRef, Scalar, StructData};
     use crate::scan::log_replay::PATH_NAME;
     use crate::schema::{MapType, column_name, schema};
@@ -870,7 +869,9 @@ mod tests {
     use crate::transaction::create_table::create_table;
     use crate::transaction::operation::UpdateTableOperation;
     use crate::unit_test_utils::{copy_test_table, create_valid_add_file_batch, test_schema_flat};
-    use crate::{EvaluationHandler, ExpressionEvaluator, PredicateEvaluator, Result, Snapshot};
+    use crate::{
+        EvaluationHandler, ExpressionEvaluator, KernelError, PredicateEvaluator, Result, Snapshot,
+    };
 
     impl Transaction {
         /// Set clustering columns for testing purposes without needing a table
@@ -929,7 +930,7 @@ mod tests {
 
     #[derive(Default)]
     struct CountingEvaluationHandler {
-        evaluators_created: AtomicUsize,
+        evaluators_created: RelaxedCounter,
     }
 
     impl EvaluationHandler for CountingEvaluationHandler {
@@ -939,7 +940,7 @@ mod tests {
             expression: ExpressionRef,
             output_type: DataType,
         ) -> KernelResult<Arc<dyn ExpressionEvaluator>> {
-            self.evaluators_created.fetch_add(1, Ordering::Relaxed);
+            self.evaluators_created.inc();
             ArrowEvaluationHandler.new_expression_evaluator(schema, expression, output_type)
         }
 
@@ -972,7 +973,7 @@ mod tests {
     fn test_add_action_evaluators_reused_for_repeated_schema(
         #[values(false, true)] row_tracking: bool,
         #[case] optional_columns: &[(bool, bool)],
-        #[case] max_evaluators: usize,
+        #[case] max_evaluators: u64,
     ) -> KernelResult<()> {
         let handler = Arc::new(CountingEvaluationHandler::default());
         let engine = DelegatingEngine::new(Arc::new(SyncEngine::new()))
@@ -998,7 +999,7 @@ mod tests {
             })
             .collect::<KernelResult<Vec<_>>>()?;
         let actions = build_add_actions(&engine, batches.into_iter().map(Ok), row_tracking, true)?;
-        assert_eq!(handler.evaluators_created.load(Ordering::Relaxed), 0);
+        assert_eq!(handler.evaluators_created.get(), 0);
         let actions = actions.collect::<KernelResult<Vec<_>>>()?;
         assert_eq!(actions.len(), optional_columns.len());
         for (action, &(tags, provider)) in actions.iter().zip(optional_columns) {
@@ -1012,7 +1013,7 @@ mod tests {
                 row_tracking
             );
         }
-        let created = handler.evaluators_created.load(Ordering::Relaxed);
+        let created = handler.evaluators_created.get();
         assert!(
             created <= max_evaluators,
             "created {created} evaluators for {} batches; expected at most {max_evaluators}",
@@ -1097,7 +1098,7 @@ mod tests {
         DeletionVectorUpdate,
     }
 
-    fn set_append_only(txn: &mut Transaction, enabled: bool) -> KernelResult<()> {
+    fn set_append_only(txn: &mut Transaction, enabled: bool) -> Result<()> {
         let metadata = txn
             .effective_table_config
             .metadata()
@@ -1180,8 +1181,8 @@ mod tests {
     #[rstest]
     fn create_table_add_actions_preserve_data_change(
         #[values(false, true)] data_change: bool,
-    ) -> KernelResult<()> {
-        let tempdir = tempfile::tempdir()?;
+    ) -> Result<()> {
+        let tempdir = tempfile::tempdir().map_err(KernelError::from)?;
         let engine = SyncEngine::new();
         let mut transaction = create_table(
             tempdir.path().to_string_lossy(),

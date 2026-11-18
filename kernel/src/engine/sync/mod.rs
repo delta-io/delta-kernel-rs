@@ -1,7 +1,8 @@
 //! Synchronous I/O support for kernel tests and the test plan executor.
 //!
-//! `SyncEngine` is compiled only for kernel unit tests. The plan executor is also available to
-//! dependent crate tests through the test feature combination.
+//! `SyncEngine` is compiled for kernel unit tests and for dependent crates that enable
+//! `test-utils` and `default-engine-base`. Its plan executor additionally requires
+//! `declarative-plans`.
 //!
 //! All I/O goes through an `ObjectStore`. Without an explicit store, a [`LocalFileSystem`] is
 //! built lazily per-URL (rooted at the URL's drive on Windows, or `/` on Unix), so any `file://`
@@ -22,15 +23,16 @@ use itertools::Itertools;
 use tracing::trace;
 use url::Url;
 
-#[cfg(test)]
 use super::arrow_expression::ArrowEvaluationHandler;
 use crate::engine::arrow_data::ArrowEngineData;
 use crate::object_store::local::LocalFileSystem;
+use crate::object_store::memory::InMemory;
 use crate::object_store::path::Path;
 use crate::object_store::{DynObjectStore, ObjectStoreExt as _};
-#[cfg(test)]
-use crate::{Engine, EvaluationHandler, JsonHandler, ParquetHandler, StorageHandler};
-use crate::{FileMeta, KernelError, KernelResult, KernelResultIterator, PredicateRef, SchemaRef};
+use crate::{
+    Engine, EvaluationHandler, FileMeta, JsonHandler, KernelError, KernelResult,
+    KernelResultIterator, ParquetHandler, PredicateRef, SchemaRef, StorageHandler,
+};
 
 pub(crate) mod json;
 mod parquet;
@@ -45,7 +47,7 @@ mod prefix_sum;
 #[cfg(feature = "declarative-plans")]
 pub mod plan;
 
-#[cfg(all(test, feature = "declarative-plans"))]
+#[cfg(feature = "declarative-plans")]
 use plan::SyncPlanExecutor;
 
 #[cfg(feature = "declarative-plans")]
@@ -74,7 +76,6 @@ fn extract_long_column<'a>(
 }
 
 /// A simple (test-only) implementation of [`Engine`]. See module docs for supported stores.
-#[cfg(test)]
 pub struct SyncEngine {
     storage_handler: Arc<storage::SyncStorageHandler>,
     json_handler: Arc<json::SyncJsonHandler>,
@@ -84,7 +85,6 @@ pub struct SyncEngine {
     plan_executor: Arc<SyncPlanExecutor>,
 }
 
-#[cfg(test)]
 impl SyncEngine {
     /// Create a SyncEngine that reads from the local filesystem via [`LocalFileSystem`].
     pub fn new() -> Self {
@@ -96,6 +96,11 @@ impl SyncEngine {
     /// reactor-dependent stores.
     pub fn new_with_store(store: Arc<DynObjectStore>) -> Self {
         Self::new_inner(Some(store))
+    }
+
+    /// Create a SyncEngine backed by a fresh [`InMemory`] store.
+    pub fn in_memory() -> Self {
+        Self::new_with_store(Arc::new(InMemory::new()))
     }
 
     fn new_inner(store: Option<Arc<DynObjectStore>>) -> Self {
@@ -110,14 +115,12 @@ impl SyncEngine {
     }
 }
 
-#[cfg(test)]
 impl Default for SyncEngine {
     fn default() -> Self {
         Self::new()
     }
 }
 
-#[cfg(test)]
 impl Engine for SyncEngine {
     fn evaluation_handler(&self) -> Arc<dyn EvaluationHandler> {
         self.evaluation_handler.clone()
