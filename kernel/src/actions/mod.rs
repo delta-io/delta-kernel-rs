@@ -911,9 +911,10 @@ pub(crate) struct CommitInfo {
     pub(crate) txn_id: Option<String>,
     /// Map of tags associated with this commit.
     pub(crate) tags: Option<HashMap<String, Option<String>>>,
-    /// Whether this commit changes the table's logical records. Required on every commit when
+    /// Whether this commit changes the table's logical records. Kernel writes the transaction's
+    /// `data_change` on every commit, replacing any engine-supplied value. Required when
     /// adaptiveMetadata is enabled, where readers treat it as the source of truth over the
-    /// per-file-action `dataChange` flags; optional otherwise.
+    /// per-file-action `dataChange` flags.
     #[cfg_attr(test, serde(skip_serializing_if = "Option::is_none"))]
     pub(crate) data_change: Option<bool>,
     /// Identifies the latest manifest commit up to this version. Absent until the table's first

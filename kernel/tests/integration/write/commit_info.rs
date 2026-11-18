@@ -81,7 +81,7 @@ async fn test_commit_info_defaults_to_empty_parameters_and_omitted_metrics(
                 "operationParameters": {},
                 "engineInfo": engine_info,
                 "txnId": ZERO_UUID,
-                "dataChange": false,
+                "dataChange": true,
             }
         });
 
@@ -126,8 +126,11 @@ async fn transaction_builder_writes_operation_parameters_and_metrics()
     Ok(())
 }
 
+#[rstest]
 #[tokio::test]
-async fn test_commit_info_action() -> Result<(), Box<dyn std::error::Error>> {
+async fn test_commit_info_action(
+    #[values(false, true)] data_change: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
     // setup tracing
     let _ = tracing_subscriber::fmt::try_init();
     // create a simple table: one int column named 'number'
@@ -138,7 +141,7 @@ async fn test_commit_info_action() -> Result<(), Box<dyn std::error::Error>> {
     {
         let txn = Snapshot::builder_for(table_url.clone())
             .build(&engine)?
-            .update_table(UpdateTableOperation::Write, "default engine", true)
+            .update_table(UpdateTableOperation::Write, "default engine", data_change)
             .build(&engine, Box::new(FileSystemCommitter::new()))?;
 
         let _ = txn.commit(&engine)?;
@@ -168,7 +171,7 @@ async fn test_commit_info_action() -> Result<(), Box<dyn std::error::Error>> {
                 "operationParameters": {},
                 "engineInfo": "default engine",
                 "txnId": ZERO_UUID,
-                "dataChange": false
+                "dataChange": data_change
             }
         })];
 
@@ -413,7 +416,7 @@ async fn test_commit_info_merges_custom_fields_and_ignores_reserved_fields(
             "kernelVersion": format!("v{}", env!("CARGO_PKG_VERSION")),
             "txnId": ZERO_UUID,
             "timestamp": 0,
-            "dataChange": false,
+            "dataChange": true,
         });
         if let Some(operation_metrics) = operation_metrics {
             expected_commit_info["operationMetrics"] = operation_metrics;

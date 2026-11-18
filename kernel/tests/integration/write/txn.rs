@@ -142,7 +142,7 @@ async fn test_write_txn_actions(
                     "operationParameters": {},
                     "engineInfo": "default engine",
                     "txnId": ZERO_UUID,
-                    "dataChange": false
+                    "dataChange": true
                 }
             }),
             json!({
