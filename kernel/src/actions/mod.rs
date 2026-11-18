@@ -1525,7 +1525,6 @@ impl LastManifestCommit {
 /// the table protocol and metadata, making the commit self-contained with respect to P+M.
 ///
 /// Each app id and each domain appears at most once across the inline entries and the sidecars.
-/// Readers keep the first occurrence, reading inline entries before sidecars.
 ///
 /// Example manifest-commit JSON:
 /// ```json
