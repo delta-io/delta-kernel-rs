@@ -157,7 +157,7 @@ async fn commit_table(commits: &[String]) -> (Arc<InMemory>, Url) {
     for (version, commit) in commits.iter().enumerate() {
         add_commit(
             table_root.as_str(),
-            store.as_ref(),
+            engine.store(),
             version as u64,
             commit.clone(),
         )

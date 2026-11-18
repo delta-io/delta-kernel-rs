@@ -2829,9 +2829,7 @@ mod tests {
         ]
         .map(|json| json.to_string())
         .join("\n");
-        add_commit(table_root, store.clone().as_ref(), 0, commit)
-            .await
-            .unwrap();
+        add_commit(table_root, store, 0, commit).await.unwrap();
 
         // commit1
         // - domain1: removed
@@ -2862,9 +2860,7 @@ mod tests {
         ]
         .map(|json| json.to_string())
         .join("\n");
-        add_commit(table_root, store.as_ref(), 1, commit)
-            .await
-            .unwrap();
+        add_commit(table_root, store, 1, commit).await.unwrap();
 
         let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
 
@@ -2930,7 +2926,7 @@ mod tests {
         let engine = SyncEngine::new_with_store(store.clone());
         commit(
             table_root,
-            store.as_ref(),
+            engine.store(),
             0,
             vec![
                 json!({
@@ -3021,7 +3017,7 @@ mod tests {
 
         // Create a basic commit without ICT enabled
         let commit0 = create_basic_commit(false, None);
-        add_commit(table_root, store.as_ref(), 0, commit0).await?;
+        add_commit(table_root, engine.store(), 0, commit0).await?;
 
         let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
 
@@ -3041,19 +3037,19 @@ mod tests {
 
         // Create initial commit without ICT
         let commit0 = create_basic_commit(false, None);
-        add_commit(table_root, store.as_ref(), 0, commit0).await?;
+        add_commit(table_root, engine.store(), 0, commit0).await?;
 
         // Create commit that enables ICT (version 1 = enablement version)
         let commit1 =
             create_basic_commit(true, Some(("1".to_string(), "1587968586154".to_string())));
-        add_commit(table_root, store.as_ref(), 1, commit1).await?;
+        add_commit(table_root, engine.store(), 1, commit1).await?;
 
         // Create commit with ICT enabled
         let expected_timestamp = 1587968586200i64;
         let commit2 = format!(
             r#"{{"commitInfo":{{"timestamp":1587968586154,"inCommitTimestamp":{expected_timestamp},"operation":"WRITE"}}}}"#,
         );
-        add_commit(table_root, store.as_ref(), 2, commit2.to_string()).await?;
+        add_commit(table_root, engine.store(), 2, commit2.to_string()).await?;
 
         // Read snapshot at version 0 (before ICT enablement)
         let snapshot_v0 = Snapshot::builder_for(table_root)
@@ -3105,11 +3101,11 @@ mod tests {
                 }
             }),
         ];
-        commit(table_root, store.as_ref(), 0, commit_data.to_vec()).await;
+        commit(table_root, engine.store(), 0, commit_data.to_vec()).await;
 
         // Create commit that predates ICT enablement (no inCommitTimestamp)
         let commit_predates = [create_commit_info(1234567890, None)];
-        commit(table_root, store.as_ref(), 1, commit_predates.to_vec()).await;
+        commit(table_root, engine.store(), 1, commit_predates.to_vec()).await;
 
         let snapshot_predates = Snapshot::builder_for(table_root)
             .at_version(1)
@@ -3142,12 +3138,12 @@ mod tests {
                 false,
             ),
         ];
-        commit(table_root, store.as_ref(), 0, commit_data.to_vec()).await; // ICT enabled from
+        commit(table_root, engine.store(), 0, commit_data.to_vec()).await; // ICT enabled from
         // version 0
 
         // Create commit without ICT despite being enabled (corrupt case)
         let commit_missing_ict = [create_commit_info(1234567890, None)];
-        commit(table_root, store.as_ref(), 1, commit_missing_ict.to_vec()).await;
+        commit(table_root, engine.store(), 1, commit_missing_ict.to_vec()).await;
 
         let snapshot_missing = Snapshot::builder_for(table_root)
             .at_version(1)
@@ -3178,7 +3174,7 @@ mod tests {
                 false,
             ),
         ];
-        commit(url.as_str(), store.as_ref(), 0, commit_data.to_vec()).await;
+        commit(url.as_str(), engine.store(), 0, commit_data.to_vec()).await;
 
         // Build snapshot to get table configuration
         let snapshot = Snapshot::builder_for(url.as_str())
@@ -3218,7 +3214,7 @@ mod tests {
                 false,
             ),
         ];
-        commit(table_root, store.as_ref(), 0, commit0_data.to_vec()).await;
+        commit(table_root, store, 0, commit0_data.to_vec()).await;
 
         // Create 00000000000000000001.checkpoint.parquet
         let checkpoint_data = [
@@ -3263,7 +3259,7 @@ mod tests {
         // Create 00000000000000000001.json with ICT
         let expected_ict = 1587968586200i64;
         let commit1_data = [create_commit_info(1587968586200, Some(expected_ict))];
-        commit(table_root, store.as_ref(), 1, commit1_data.to_vec()).await;
+        commit(table_root, store, 1, commit1_data.to_vec()).await;
 
         // Build snapshot - LogSegment will filter out the commit file because checkpoint exists at
         // same version
@@ -3350,7 +3346,7 @@ mod tests {
                 false,
             ),
         ]);
-        commit(url.as_str(), store.as_ref(), 0, commit_data).await;
+        commit(url.as_str(), engine.store(), 0, commit_data).await;
 
         let snapshot = Snapshot::builder_for(url.as_str())
             .at_version(0)
@@ -3383,7 +3379,7 @@ mod tests {
                 false,
             ),
         ];
-        commit(table_root, store.as_ref(), 0, commit_data).await;
+        commit(table_root, store, 0, commit_data).await;
         let loaded_snapshot = Snapshot::builder_for(table_root).build(&engine)?;
         // Drop the synthesized CRC so timestamp resolution reads the referenced commit file.
         let snapshot = Snapshot::new_with_crc(
@@ -3426,7 +3422,7 @@ mod tests {
                 false,
             ),
         ];
-        commit(table_root, store.as_ref(), 0, commit0_data).await;
+        commit(table_root, engine.store(), 0, commit0_data).await;
 
         let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
         let result = snapshot.get_timestamp(&engine);
@@ -3576,7 +3572,7 @@ mod tests {
                 "createdTime": 1234567890
             }}),
         ];
-        commit(table_root, &storage, 0, actions).await;
+        commit(table_root, engine.store(), 0, actions).await;
 
         let snapshot = Snapshot::builder_for(table_root).build(&engine).unwrap();
         let config = snapshot.metadata_configuration();

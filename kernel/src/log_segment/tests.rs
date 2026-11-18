@@ -1318,7 +1318,7 @@ async fn test_checkpoint_batch_with_sidecars_returns_sidecar_batches() -> Kernel
     let read_schema = get_all_actions_schema().project(&[ADD_NAME, REMOVE_NAME, SIDECAR_NAME])?;
 
     let sidecar1_size = add_sidecar_to_store(
-        &store,
+        engine.store(),
         add_batch_simple(read_schema.clone()),
         "sidecarfile1.parquet",
     )
@@ -1326,7 +1326,7 @@ async fn test_checkpoint_batch_with_sidecars_returns_sidecar_batches() -> Kernel
     .size;
 
     let sidecar2_size = add_sidecar_to_store(
-        &store,
+        engine.store(),
         add_batch_with_remove(read_schema.clone()),
         "sidecarfile2.parquet",
     )
@@ -1397,7 +1397,7 @@ async fn test_reading_sidecar_files_with_predicate() -> KernelResult<()> {
 
     // Add a sidecar file with only add actions
     let sidecar_size = add_sidecar_to_store(
-        &store,
+        engine.store(),
         add_batch_simple(read_schema.clone()),
         "sidecarfile1.parquet",
     )
@@ -1435,7 +1435,7 @@ async fn test_create_checkpoint_stream_returns_checkpoint_batches_as_is_if_schem
     let engine = SyncEngine::in_memory();
     let log_root = memory_log_root();
     add_checkpoint_to_store(
-        &store,
+        engine.store(),
         // Create a checkpoint batch with sidecar actions to verify that the sidecar actions are
         // not read.
         sidecar_batch_with_given_paths(vec!["sidecar1.parquet"], get_commit_schema().clone()),
@@ -1500,20 +1500,20 @@ async fn test_create_checkpoint_stream_returns_checkpoint_batches_if_checkpoint_
     let checkpoint_part_2 = "00000000000000000001.checkpoint.0000000002.0000000002.parquet";
 
     add_checkpoint_to_store(
-        &store,
+        store,
         sidecar_batch_with_given_paths(vec!["sidecar1.parquet"], get_all_actions_schema().clone()),
         checkpoint_part_1,
     )
     .await?;
     add_checkpoint_to_store(
-        &store,
+        store,
         sidecar_batch_with_given_paths(vec!["sidecar2.parquet"], get_all_actions_schema().clone()),
         checkpoint_part_2,
     )
     .await?;
 
-    let cp1_size = get_file_size(&store, &format!("_delta_log/{checkpoint_part_1}")).await;
-    let cp2_size = get_file_size(&store, &format!("_delta_log/{checkpoint_part_2}")).await;
+    let cp1_size = get_file_size(store, &format!("_delta_log/{checkpoint_part_1}")).await;
+    let cp2_size = get_file_size(store, &format!("_delta_log/{checkpoint_part_2}")).await;
 
     let checkpoint_one_file = log_root.join(checkpoint_part_1)?.to_string();
     let checkpoint_two_file = log_root.join(checkpoint_part_2)?.to_string();
@@ -1570,7 +1570,7 @@ async fn test_create_checkpoint_stream_reads_parquet_checkpoint_batch_without_si
     let log_root = memory_log_root();
 
     add_checkpoint_to_store(
-        &store,
+        store,
         add_batch_simple(get_commit_schema().clone()),
         "00000000000000000001.checkpoint.parquet",
     )
@@ -1582,7 +1582,7 @@ async fn test_create_checkpoint_stream_reads_parquet_checkpoint_batch_without_si
 
     // Get the actual file size for proper footer reading
     let checkpoint_size =
-        get_file_size(&store, "_delta_log/00000000000000000001.checkpoint.parquet").await;
+        get_file_size(store, "_delta_log/00000000000000000001.checkpoint.parquet").await;
 
     let v2_checkpoint_read_schema = get_all_actions_schema().project(&[ADD_NAME, SIDECAR_NAME])?;
 
@@ -1664,14 +1664,14 @@ async fn test_scan_checkpoint_read_handles_all_remove_row_groups(
     // Real checkpoints store removes with the full file-action schema; the add column is null.
     let total_rows: usize = row_groups.iter().map(|batch| batch.len()).sum();
     write_multi_row_group_parquet_to_store(
-        &store,
+        store,
         row_groups,
         &format!("_delta_log/{checkpoint_name}"),
     )
     .await?;
 
     let checkpoint_file = log_root.join(checkpoint_name)?.to_string();
-    let checkpoint_size = get_file_size(&store, &format!("_delta_log/{checkpoint_name}")).await;
+    let checkpoint_size = get_file_size(store, &format!("_delta_log/{checkpoint_name}")).await;
 
     let log_segment = LogSegment::try_new(
         LogSegmentFiles {
@@ -1715,7 +1715,7 @@ async fn test_scan_checkpoint_read_tolerates_unfiltered_json_rows() -> KernelRes
     let checkpoint_name =
         "00000000000000000001.checkpoint.3a0d65cd-4056-49b8-937b-95f9e3ee90e5.json";
     write_json_to_store(
-        &store,
+        engine.store(),
         vec![
             Action::Remove(Remove {
                 path: "part-00000-fae5310a-a37d-4e51-827b-c3d5516560ca-c001.snappy.parquet".into(),
@@ -1777,7 +1777,7 @@ async fn test_scan_checkpoint_read_handles_all_remove_sidecar_row_groups(
 
     let sidecar_name = "sidecarfile.parquet";
     write_multi_row_group_parquet_to_store(
-        &store,
+        store,
         vec![
             remove_only_batch(get_commit_schema().clone()) as _,
             adds_only_batch(get_commit_schema().clone()) as _,
@@ -1785,11 +1785,11 @@ async fn test_scan_checkpoint_read_handles_all_remove_sidecar_row_groups(
         &format!("_delta_log/_sidecars/{sidecar_name}"),
     )
     .await?;
-    let sidecar_size = get_file_size(&store, &format!("_delta_log/_sidecars/{sidecar_name}")).await;
+    let sidecar_size = get_file_size(store, &format!("_delta_log/_sidecars/{sidecar_name}")).await;
 
     let checkpoint_name = "00000000000000000001.checkpoint.parquet";
     add_checkpoint_to_store(
-        &store,
+        store,
         sidecar_batch_with_given_paths_and_sizes(
             vec![(sidecar_name, sidecar_size)],
             get_all_actions_schema().clone(),
@@ -1798,7 +1798,7 @@ async fn test_scan_checkpoint_read_handles_all_remove_sidecar_row_groups(
     )
     .await?;
     let checkpoint_file = log_root.join(checkpoint_name)?.to_string();
-    let checkpoint_size = get_file_size(&store, &format!("_delta_log/{checkpoint_name}")).await;
+    let checkpoint_size = get_file_size(store, &format!("_delta_log/{checkpoint_name}")).await;
 
     let log_segment = LogSegment::try_new(
         LogSegmentFiles {
@@ -1840,7 +1840,7 @@ async fn test_create_checkpoint_stream_reads_json_checkpoint_batch_without_sidec
     let filename = "00000000000000000010.checkpoint.80a083e8-7026-4e79-81be-64bd76c43a11.json";
 
     write_json_to_store(
-        &store,
+        engine.store(),
         vec![Action::Add(Add {
             path: "fake_path_1".into(),
             data_change: true,
@@ -1903,7 +1903,7 @@ async fn test_create_checkpoint_stream_reads_checkpoint_file_and_returns_sidecar
 
     // Write sidecars first so we can get their actual sizes
     let sidecar1_size = add_sidecar_to_store(
-        &store,
+        store,
         add_batch_simple(COMMIT_READ_SCHEMA.clone()),
         "sidecarfile1.parquet",
     )
@@ -1911,7 +1911,7 @@ async fn test_create_checkpoint_stream_reads_checkpoint_file_and_returns_sidecar
     .size;
 
     let sidecar2_size = add_sidecar_to_store(
-        &store,
+        store,
         add_batch_with_remove(COMMIT_READ_SCHEMA.clone()),
         "sidecarfile2.parquet",
     )
@@ -1920,7 +1920,7 @@ async fn test_create_checkpoint_stream_reads_checkpoint_file_and_returns_sidecar
 
     // Now create checkpoint with correct sidecar sizes
     add_checkpoint_to_store(
-        &store,
+        store,
         sidecar_batch_with_given_paths_and_sizes(
             vec![
                 ("sidecarfile1.parquet", sidecar1_size),
@@ -1938,7 +1938,7 @@ async fn test_create_checkpoint_stream_reads_checkpoint_file_and_returns_sidecar
 
     // Get the actual file size for proper footer reading
     let checkpoint_size =
-        get_file_size(&store, "_delta_log/00000000000000000001.checkpoint.parquet").await;
+        get_file_size(store, "_delta_log/00000000000000000001.checkpoint.parquet").await;
 
     // Sidecar batches now use the same schema as checkpoint (including sidecar column)
     let v2_checkpoint_read_schema = get_all_actions_schema().project(&[ADD_NAME, SIDECAR_NAME])?;
@@ -3701,7 +3701,7 @@ async fn test_get_file_actions_schema_v1_parquet_with_hint(
     // Build a checkpoint with an initial v1 schema
     let v1_schema = COMMIT_READ_SCHEMA.clone();
     add_checkpoint_to_store(
-        &store,
+        engine.store(),
         add_batch_simple(v1_schema.clone()),
         "00000000000000000001.checkpoint.parquet",
     )
@@ -3709,7 +3709,7 @@ async fn test_get_file_actions_schema_v1_parquet_with_hint(
 
     let checkpoint_rel = "00000000000000000001.checkpoint.parquet";
     let checkpoint_file = log_root.join(checkpoint_rel)?.to_string();
-    let cp_size = get_file_size(&store, &format!("_delta_log/{checkpoint_rel}")).await;
+    let cp_size = get_file_size(engine.store(), &format!("_delta_log/{checkpoint_rel}")).await;
 
     let hint_schema: SchemaRef = schema_ref! {
         nullable "metadata": {},
@@ -3785,9 +3785,9 @@ async fn test_get_file_actions_schema_v2_identity_filter(
 
     // Schema actually written to the selected (leaf, no-sidecar) V2 checkpoint footer.
     let footer_schema = get_commit_schema().project(&[ADD_NAME, REMOVE_NAME])?;
-    add_checkpoint_to_store(&store, add_batch_simple(footer_schema.clone()), selected).await?;
+    add_checkpoint_to_store(store, add_batch_simple(footer_schema.clone()), selected).await?;
     let checkpoint_file = log_root.join(selected)?.to_string();
-    let cp_size = get_file_size(&store, &format!("_delta_log/{selected}")).await;
+    let cp_size = get_file_size(store, &format!("_delta_log/{selected}")).await;
 
     // A distinct hint schema so we can tell whether the hint or the footer was used.
     let hint_schema: SchemaRef = schema_ref! {
@@ -3863,20 +3863,20 @@ async fn test_get_file_actions_schema_multi_part_v1(#[case] use_hint: bool) -> K
     };
 
     add_checkpoint_to_store(
-        &store,
+        store,
         add_batch_simple(v1_schema.clone()),
         checkpoint_part_1,
     )
     .await?;
     add_checkpoint_to_store(
-        &store,
+        store,
         add_batch_simple(v1_schema.clone()),
         checkpoint_part_2,
     )
     .await?;
 
-    let cp1_size = get_file_size(&store, &format!("_delta_log/{checkpoint_part_1}")).await;
-    let cp2_size = get_file_size(&store, &format!("_delta_log/{checkpoint_part_2}")).await;
+    let cp1_size = get_file_size(store, &format!("_delta_log/{checkpoint_part_1}")).await;
+    let cp2_size = get_file_size(store, &format!("_delta_log/{checkpoint_part_2}")).await;
 
     let cp1_file = log_root.join(checkpoint_part_1)?.to_string();
     let cp2_file = log_root.join(checkpoint_part_2)?.to_string();
@@ -4156,7 +4156,7 @@ async fn test_checkpoint_stream_resolves_stats_projection(
         get_commit_schema().clone()
     };
     add_checkpoint_to_store(
-        &store,
+        store,
         add_batch_simple(checkpoint_schema),
         "00000000000000000001.checkpoint.parquet",
     )
@@ -4166,7 +4166,7 @@ async fn test_checkpoint_stream_resolves_stats_projection(
         .join("00000000000000000001.checkpoint.parquet")?
         .to_string();
     let checkpoint_size =
-        get_file_size(&store, "_delta_log/00000000000000000001.checkpoint.parquet").await;
+        get_file_size(store, "_delta_log/00000000000000000001.checkpoint.parquet").await;
     let log_segment = LogSegment::try_new(
         LogSegmentFiles {
             checkpoint_parts: vec![create_log_path_with_size(&checkpoint_file, checkpoint_size)],
@@ -4855,7 +4855,7 @@ async fn test_checkpoint_stream_sets_has_partition_values_parsed() -> KernelResu
     };
 
     add_checkpoint_to_store(
-        &store,
+        store,
         add_batch_with_partition_values_parsed(checkpoint_schema),
         "00000000000000000001.checkpoint.parquet",
     )
@@ -4865,7 +4865,7 @@ async fn test_checkpoint_stream_sets_has_partition_values_parsed() -> KernelResu
         .join("00000000000000000001.checkpoint.parquet")?
         .to_string();
     let checkpoint_size =
-        get_file_size(&store, "_delta_log/00000000000000000001.checkpoint.parquet").await;
+        get_file_size(store, "_delta_log/00000000000000000001.checkpoint.parquet").await;
 
     // Use a read schema that includes the add field
     let read_schema: SchemaRef = schema_ref! {
@@ -4929,7 +4929,7 @@ async fn test_checkpoint_stream_no_partition_values_parsed_when_incompatible() -
 
     // Write a checkpoint WITHOUT partitionValues_parsed
     add_checkpoint_to_store(
-        &store,
+        store,
         add_batch_simple(get_all_actions_schema().project(&[ADD_NAME])?),
         "00000000000000000001.checkpoint.parquet",
     )
@@ -4939,7 +4939,7 @@ async fn test_checkpoint_stream_no_partition_values_parsed_when_incompatible() -
         .join("00000000000000000001.checkpoint.parquet")?
         .to_string();
     let checkpoint_size =
-        get_file_size(&store, "_delta_log/00000000000000000001.checkpoint.parquet").await;
+        get_file_size(store, "_delta_log/00000000000000000001.checkpoint.parquet").await;
 
     let read_schema = get_all_actions_schema().project(&[ADD_NAME])?;
 

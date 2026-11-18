@@ -170,14 +170,14 @@ async fn create_table(
 ) -> Result<(), Box<dyn std::error::Error>> {
     add_commit(
         table_root,
-        store.as_ref(),
+        engine.store(),
         0,
         actions_to_string(vec![TestAction::Metadata]),
     )
     .await?;
     add_commit(
         table_root,
-        store.as_ref(),
+        engine.store(),
         1,
         actions_to_string(vec![TestAction::Add("part-00000-test.parquet".into())]),
     )

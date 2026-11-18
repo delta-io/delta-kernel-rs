@@ -93,7 +93,7 @@ async fn test_create_checkpoint_metadata_batch() -> Result<()> {
     // 1st commit (version 0) - metadata and protocol actions
     // Protocol action includes the v2Checkpoint reader/writer feature.
     write_commit_to_store(
-        &store,
+        engine.store(),
         vec![
             create_v2_checkpoint_protocol_action(),
             create_metadata_action(),
@@ -321,7 +321,7 @@ async fn test_v1_checkpoint_latest_version_by_default() -> Result<()> {
     let engine = SyncEngine::in_memory();
     // 1st commit: adds `fake_path_1`
     write_commit_to_store(
-        &store,
+        engine.store(),
         vec![create_add_action_with_stats("fake_path_1", 10)],
         0,
     )
@@ -329,7 +329,7 @@ async fn test_v1_checkpoint_latest_version_by_default() -> Result<()> {
 
     // 2nd commit: adds `fake_path_2` & removes `fake_path_1`
     write_commit_to_store(
-        &store,
+        engine.store(),
         vec![
             create_add_action_with_stats("fake_path_2", 20),
             create_remove_action("fake_path_1"),
@@ -341,7 +341,7 @@ async fn test_v1_checkpoint_latest_version_by_default() -> Result<()> {
     // 3rd commit: metadata & protocol actions
     // Protocol action does not include the v2Checkpoint reader/writer feature.
     write_commit_to_store(
-        &store,
+        engine.store(),
         vec![create_metadata_action(), create_basic_protocol_action()],
         2,
     )
@@ -385,7 +385,7 @@ async fn test_v1_checkpoint_latest_version_by_default() -> Result<()> {
     // - size: 1 metadata + 1 protocol + 1 add action + 1 remove action
     // - numOfAddFiles: 1 add file from 2nd commit (fake_path_2)
     // - sizeInBytes: passed to finalize (10)
-    assert_last_checkpoint_contents(&store, 2, 4, 1, size_in_bytes).await?;
+    assert_last_checkpoint_contents(engine.store(), 2, 4, 1, size_in_bytes).await?;
 
     Ok(())
 }
@@ -399,7 +399,7 @@ async fn test_v1_checkpoint_specific_version() -> Result<()> {
     // 1st commit (version 0) - metadata and protocol actions
     // Protocol action does not include the v2Checkpoint reader/writer feature.
     write_commit_to_store(
-        &store,
+        engine.store(),
         vec![create_basic_protocol_action(), create_metadata_action()],
         0,
     )
@@ -407,7 +407,7 @@ async fn test_v1_checkpoint_specific_version() -> Result<()> {
 
     // 2nd commit (version 1) - add actions
     write_commit_to_store(
-        &store,
+        engine.store(),
         vec![
             create_add_action_with_stats("file1.parquet", 100),
             create_add_action_with_stats("file2.parquet", 200),
@@ -452,7 +452,7 @@ async fn test_v1_checkpoint_specific_version() -> Result<()> {
     // - size: 1 metadata + 1 protocol
     // - numOfAddFiles: no add files in version 0
     // - sizeInBytes: passed to finalize (10)
-    assert_last_checkpoint_contents(&store, 0, 2, 0, size_in_bytes).await?;
+    assert_last_checkpoint_contents(engine.store(), 0, 2, 0, size_in_bytes).await?;
 
     Ok(())
 }
@@ -462,7 +462,7 @@ async fn test_finalize_errors_if_checkpoint_data_iterator_is_not_exhausted() -> 
     let engine = SyncEngine::in_memory();
     // 1st commit (version 0) - metadata and protocol actions
     write_commit_to_store(
-        &store,
+        engine.store(),
         vec![create_basic_protocol_action(), create_metadata_action()],
         0,
     )
@@ -551,7 +551,7 @@ async fn test_v2_checkpoint_supported_table() -> Result<()> {
     let engine = SyncEngine::in_memory();
     // 1st commit: adds `fake_path_2` & removes `fake_path_1`
     write_commit_to_store(
-        &store,
+        engine.store(),
         vec![
             create_add_action_with_stats("fake_path_2", 50),
             create_remove_action("fake_path_1"),
@@ -563,7 +563,7 @@ async fn test_v2_checkpoint_supported_table() -> Result<()> {
     // 2nd commit: metadata & protocol actions
     // Protocol action includes the v2Checkpoint reader/writer feature.
     write_commit_to_store(
-        &store,
+        engine.store(),
         vec![
             create_metadata_action(),
             create_v2_checkpoint_protocol_action(),
@@ -615,7 +615,7 @@ async fn test_v2_checkpoint_supported_table() -> Result<()> {
     // - size: 1 metadata + 1 protocol + 1 add action + 1 remove action + 1 checkpointMetadata
     // - numOfAddFiles: 1 add file from version 0
     // - sizeInBytes: passed to finalize (10)
-    assert_last_checkpoint_contents(&store, 1, 5, 1, size_in_bytes).await?;
+    assert_last_checkpoint_contents(engine.store(), 1, 5, 1, size_in_bytes).await?;
 
     Ok(())
 }
@@ -626,7 +626,7 @@ async fn test_no_checkpoint_on_unpublished_snapshot() -> Result<()> {
     let store = engine.store();
     // normal commit with catalog-managed protocol
     write_commit_to_store(
-        &store,
+        store,
         vec![
             create_metadata_action_with_config(HashMap::from([(
                 "delta.enableInCommitTimestamps".to_string(),
@@ -691,7 +691,7 @@ async fn test_no_standalone_checkpoint_on_adaptive_metadata_table(
     ]
     .map(|action| action.to_string())
     .join("\n");
-    add_commit("memory:///", store.as_ref(), 0, commit)
+    add_commit("memory:///", engine.store(), 0, commit)
         .await
         .unwrap();
 
@@ -722,7 +722,7 @@ async fn test_snapshot_checkpoint() -> Result<()> {
     let store = engine.store();
     // Version 0: metadata & protocol
     write_commit_to_store(
-        &store,
+        store,
         vec![create_metadata_action(), create_basic_protocol_action()],
         0,
     )
@@ -730,7 +730,7 @@ async fn test_snapshot_checkpoint() -> Result<()> {
 
     // Version 1: add 3 files
     write_commit_to_store(
-        &store,
+        store,
         vec![
             create_add_action("file1.parquet"),
             create_add_action("file2.parquet"),
@@ -742,7 +742,7 @@ async fn test_snapshot_checkpoint() -> Result<()> {
 
     // Version 2: add 2 more files, remove 1
     write_commit_to_store(
-        &store,
+        store,
         vec![
             create_add_action("file4.parquet"),
             create_add_action("file5.parquet"),
@@ -754,7 +754,7 @@ async fn test_snapshot_checkpoint() -> Result<()> {
 
     // Version 3: add 1 file, remove 2
     write_commit_to_store(
-        &store,
+        store,
         vec![
             create_add_action("file6.parquet"),
             create_remove_action("file2.parquet"),
@@ -766,7 +766,7 @@ async fn test_snapshot_checkpoint() -> Result<()> {
 
     // Version 4: add 2 files
     write_commit_to_store(
-        &store,
+        store,
         vec![
             create_add_action("file7.parquet"),
             create_add_action("file8.parquet"),
@@ -787,11 +787,11 @@ async fn test_snapshot_checkpoint() -> Result<()> {
         .await
         .map_err(KernelError::from)?
         .size;
-    assert_last_checkpoint_contents(&store, 4, 10, 5, checkpoint_size).await?;
+    assert_last_checkpoint_contents(store, 4, 10, 5, checkpoint_size).await?;
 
     // Version 5: add 2 files, remove 1
     write_commit_to_store(
-        &store,
+        store,
         vec![
             create_add_action("file9.parquet"),
             create_add_action("file10.parquet"),
@@ -802,7 +802,7 @@ async fn test_snapshot_checkpoint() -> Result<()> {
     .await?;
 
     // Version 6: add 1 file
-    write_commit_to_store(&store, vec![create_add_action("file11.parquet")], 6).await?;
+    write_commit_to_store(store, vec![create_add_action("file11.parquet")], 6).await?;
 
     let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
 
@@ -815,7 +815,7 @@ async fn test_snapshot_checkpoint() -> Result<()> {
         .await
         .map_err(KernelError::from)?
         .size;
-    assert_last_checkpoint_contents(&store, 6, 13, 7, checkpoint_size).await?;
+    assert_last_checkpoint_contents(store, 6, 13, 7, checkpoint_size).await?;
 
     Ok(())
 }
@@ -994,7 +994,7 @@ async fn test_checkpoint_skips_last_checkpoint_write_when_hint_version_is_newer(
     // Version 1
     add_commit(
         table_root.as_str(),
-        store.as_ref(),
+        engine.store(),
         1,
         actions_to_string(vec![TestAction::Add("file1.parquet".to_string())]),
     )
@@ -1004,7 +1004,7 @@ async fn test_checkpoint_skips_last_checkpoint_write_when_hint_version_is_newer(
     // Version 2
     add_commit(
         table_root.as_str(),
-        store.as_ref(),
+        engine.store(),
         2,
         actions_to_string(vec![TestAction::Add("file2.parquet".to_string())]),
     )
@@ -1015,21 +1015,21 @@ async fn test_checkpoint_skips_last_checkpoint_write_when_hint_version_is_newer(
     let snapshot_v2 = Snapshot::builder_for(table_root.clone()).build(&engine)?;
     assert_eq!(snapshot_v2.version(), 2);
     snapshot_v2.checkpoint(&engine, None)?;
-    let last_checkpoint = read_last_checkpoint_file(&store).await?;
+    let last_checkpoint = read_last_checkpoint_file(engine.store()).await?;
     let size_in_bytes = last_checkpoint
         .get("sizeInBytes")
         .and_then(Value::as_u64)
         .ok_or_else(|| {
             crate::KernelError::generic("missing or invalid sizeInBytes in _last_checkpoint")
         })?;
-    assert_last_checkpoint_contents(&store, 2, 4, 2, size_in_bytes).await?;
+    assert_last_checkpoint_contents(engine.store(), 2, 4, 2, size_in_bytes).await?;
 
     // Time-travel to version 1 and writing a checkpoint should not override _last_checkpoint
     let snapshot_v1 = Snapshot::builder_for(table_root)
         .at_version(1)
         .build(&engine)?;
     snapshot_v1.checkpoint(&engine, None)?;
-    assert_last_checkpoint_contents(&store, 2, 4, 2, size_in_bytes).await?;
+    assert_last_checkpoint_contents(engine.store(), 2, 4, 2, size_in_bytes).await?;
     Ok(())
 }
 
@@ -1146,7 +1146,7 @@ async fn test_stats_config_round_trip(
 
     // Commit 0: protocol + metadata with initial settings
     write_commit_to_store(
-        &store,
+        engine.store(),
         vec![
             create_basic_protocol_action(),
             create_metadata_with_stats_config(json1, struct1),
@@ -1157,7 +1157,7 @@ async fn test_stats_config_round_trip(
 
     // Commit 1: add action with JSON stats
     write_commit_to_store(
-        &store,
+        engine.store(),
         vec![create_add_action_with_stats("file1.parquet", 100)],
         1,
     )
@@ -1169,7 +1169,7 @@ async fn test_stats_config_round_trip(
 
     // Commit 2: update metadata with new settings
     write_commit_to_store(
-        &store,
+        engine.store(),
         vec![create_metadata_with_stats_config(json2, struct2)],
         2,
     )
@@ -1212,7 +1212,7 @@ async fn test_stats_config_round_trip_partitioned(
 
     // Commit 0: protocol + partitioned metadata with initial settings
     write_commit_to_store(
-        &store,
+        engine.store(),
         vec![
             create_basic_protocol_action(),
             create_metadata_with_stats_config_and_partitions(
@@ -1236,7 +1236,7 @@ async fn test_stats_config_round_trip_partitioned(
     };
     add.partition_values
         .insert("category".into(), "books".into());
-    write_commit_to_store(&store, vec![Action::Add(add)], 1).await?;
+    write_commit_to_store(engine.store(), vec![Action::Add(add)], 1).await?;
 
     // Write checkpoint 1 with (json1, struct1) settings
     let snapshot1 = Snapshot::builder_for(table_root.clone()).build(&engine)?;
@@ -1244,7 +1244,7 @@ async fn test_stats_config_round_trip_partitioned(
 
     // Commit 2: update metadata with new settings
     write_commit_to_store(
-        &store,
+        engine.store(),
         vec![create_metadata_with_stats_config_and_partitions(
             json2,
             struct2,
@@ -1330,7 +1330,7 @@ async fn test_checkpoint_with_varchar_metadata_on_field() -> Result<()> {
         nullable "name": STRING,
     };
     write_commit_to_store(
-        &store,
+        engine.store(),
         vec![
             create_basic_protocol_action(),
             Action::Metadata(
@@ -1372,7 +1372,7 @@ async fn test_checkpoint_with_varchar_metadata_on_field() -> Result<()> {
             )])),
     };
     write_commit_to_store(
-        &store,
+        engine.store(),
         vec![Action::Metadata(
             Metadata::try_new(Some("test".into()), None, schema_v1, vec![], 0, config).unwrap(),
         )],

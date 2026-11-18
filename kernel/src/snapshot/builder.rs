@@ -668,14 +668,14 @@ pub(super) mod tests {
     ) -> KernelResult<(), Box<dyn std::error::Error>> {
         add_commit(
             table_root,
-            store.as_ref(),
+            store,
             0,
             actions_to_string(vec![TestAction::Metadata]),
         )
         .await?;
         add_commit(
             table_root,
-            store.as_ref(),
+            store,
             1,
             format!(
                 "{}\n{}",

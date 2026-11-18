@@ -477,7 +477,7 @@ mod tests {
         let store = Arc::new(InMemory::new());
         let engine = two_adds_then_add_and_remove(&store);
         add_checkpoint_to_store(
-            &store,
+            store.as_ref(),
             add_batch_simple(get_commit_schema().clone()),
             &format!("{file_version:020}.checkpoint.parquet"),
         )
