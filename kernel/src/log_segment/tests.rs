@@ -48,8 +48,8 @@ use crate::schema::{
 };
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::unit_test_utils::adaptive_metadata_fixtures::{
-    adaptive_metadata_protocol_and_metadata, minimal_checkpoint_action, setup_table,
-    write_manifest_commit, write_manifest_commit_keeping_pm,
+    adaptive_metadata_protocol_and_metadata, commit_info_line, minimal_checkpoint_action,
+    setup_table, write_manifest_commit, write_manifest_commit_keeping_pm,
 };
 use crate::unit_test_utils::{
     Action, assert_batch_matches, assert_result_error_with_message, create_log_path,
@@ -6098,9 +6098,9 @@ fn latest_checkpoint_action_is_stable_when_newer_checkpoint_written_later() -> R
 
 // An AMT `_last_checkpoint` hint at version 5 has no checkpoint file. The listing starts at the
 // hinted version as long as the manifest commit carrying the checkpoint action is listed, or, for
-// time travel before the manifest commit, the hint embeds that action. Commit 5 is dropped unless
-// it is the manifest commit or the last listed commit. `embedded_action` is the embedded action's
-// version.
+// a snapshot before the manifest commit whose newest commit has no `lastManifestCommit`, the hint
+// embeds that action. Commit 5 is dropped unless it is the manifest commit or the last listed
+// commit. `embedded_action` is the embedded action's version.
 #[cfg(feature = "adaptive-metadata-in-dev")]
 #[rstest]
 #[case::manifest_commit_at_hint(5, None, None, &[], None, Ok((None, vec![5, 6, 7])))]
@@ -6169,10 +6169,21 @@ async fn amt_last_checkpoint_hint_bounds_listing(
         .map(|v| delta_path_for_version(v, "json"))
         .chain(checkpoint_file.map(|v| delta_path_for_version(v, "checkpoint.parquet")))
         .collect_vec();
-    let (storage, log_root) = build_log_with_paths_and_checkpoint(&paths, None).await;
+    let (engine, log_root) = build_engine_with_paths_and_checkpoint(&paths, None).await;
+    let storage = engine.storage_handler();
+    // A snapshot before the manifest commit reads its newest commit's `lastManifestCommit`.
+    let newest_commit = end_version.unwrap_or(7);
+    if !missing_commits.contains(&newest_commit) {
+        storage.put(
+            &log_root.join(&format!("{newest_commit:020}.json"))?,
+            commit_info_line(1, None).into(),
+            true,
+        )?;
+    }
 
-    let log_segment = LogSegment::for_snapshot_impl(
+    let log_segment = LogSegment::for_snapshot_with_engine(
         storage.as_ref(),
+        Some(&engine),
         log_root,
         vec![], // log_tail
         Some(hint),

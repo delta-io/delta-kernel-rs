@@ -418,8 +418,8 @@ impl Snapshot {
                 self.log_segment
                     .read_last_checkpoint_action_from_pointer(engine, &pointer)?,
             )),
-            // Without a pointer no manifest commit is listed, so the action embedded in the
-            // segment's AMT base, if any, is the latest.
+            // Without a pointer no manifest commit precedes the snapshot, so the action embedded
+            // in the `_last_checkpoint` hint the segment was listed from, if any, is the latest.
             None => self
                 .log_segment
                 .amt_base()

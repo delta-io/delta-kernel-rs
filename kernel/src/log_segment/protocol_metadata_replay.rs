@@ -136,22 +136,18 @@ impl LogSegment {
             PmReplaySegment::WholeSegment,
             PmCandidate::default(),
         )?;
-        self.seed_with_amt_base(candidate)
+        Ok(self.seed_with_amt_base(candidate))
     }
 
-    /// Seeds `candidate` with the checkpoint action embedded in the segment's AMT base, as a
-    /// checkpoint file's actions would be. Say hint 5, manifest commit 8, snapshot at 7: commits 6
-    /// and 7 are replayed, and the action at 5 supplies protocol and metadata unless they change a
-    /// newer value. Content roots never decrease across manifest commits, so any checkpoint action
-    /// in commits 6 or 7 comes from an earlier manifest commit with a root at or before 5, and the
-    /// base action stays latest. The action ranks at the manifest commit that added it, as an
-    /// action read from that commit would.
+    /// Seeds `candidate` with the protocol and metadata of the checkpoint action embedded in the
+    /// segment's AMT base, as a checkpoint file's actions would be. Say hint 5, manifest commit 8,
+    /// snapshot at 7: commits 6 and 7 are replayed, and the action at 5 supplies protocol and
+    /// metadata unless they change a newer value. The action itself is not captured: the snapshot
+    /// takes its latest checkpoint action from `lastManifestCommit` when it has one.
     #[allow(unused_mut)]
-    fn seed_with_amt_base(&self, mut candidate: PmCandidate) -> KernelResult<PmCandidate> {
+    fn seed_with_amt_base(&self, mut candidate: PmCandidate) -> PmCandidate {
         #[cfg(feature = "adaptive-metadata-in-dev")]
-        if let Some(base) = self.amt_base()
-            && let Some(action) = base.checkpoint_action
-        {
+        if let Some(action) = self.amt_base().and_then(|base| base.checkpoint_action) {
             let version = action.version();
             candidate.protocol = newer(
                 Some((version, action.protocol().clone())),
@@ -161,15 +157,8 @@ impl LogSegment {
                 Some((version, action.metadata().clone())),
                 candidate.metadata,
             );
-            candidate.checkpoint = newer(
-                Some((
-                    version_as_i64(base.manifest_commit_version)?,
-                    action.clone(),
-                )),
-                candidate.checkpoint,
-            );
         }
-        Ok(candidate)
+        candidate
     }
 
     /// [`Self::replay_for_pm`] for a segment that no CRC or checkpoint file bounds, whose P&M may
@@ -183,7 +172,7 @@ impl LogSegment {
             let reader = PmReader::for_engine(engine);
             if reader.reads_newest_commit_first(self) {
                 let candidate = self.replay_newest_commit_first(engine, &reader)?;
-                return self.seed_with_amt_base(candidate);
+                return Ok(self.seed_with_amt_base(candidate));
             }
         }
         self.replay_for_pm(engine)
