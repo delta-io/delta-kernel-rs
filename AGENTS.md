@@ -7,6 +7,22 @@ Delta protocol so connectors can read and write Delta tables without understandi
 internals. Kernel never does I/O directly: it defines _what_ to do via its APIs
 (`Snapshot`, `Scan`, `Transaction`) and delegates _how_ to the `Engine` trait.
 
+## Read Before You Start
+
+Before you change code, read the file that matches your task. Most of these files are not loaded
+automatically.
+
+| Task | Read |
+|---|---|
+| Any change under `ffi/` | `ffi/AGENTS.md` |
+| Any change under `.github/` | `.github/CLAUDE.md` |
+| Any user-guide edit | `docs/user-guide/CLAUDE.md` |
+| Writing or changing a test, test helper, or test table | `AGENTS/testing.md` |
+| Adding test data under `kernel/tests/data/` | `kernel/tests/README.md` |
+| Finding the module that owns a behavior | `AGENTS/architecture.md` |
+| Changing metric events, reporters, or tracing layers | `kernel/src/metrics/README.md` |
+| Changing Delta error conditions or their generated code | `kernel/error_catalog/README.md` |
+
 ## Documentation Ownership
 
 Choose where to document something by the reader's task and the scope of the explanation:
@@ -98,21 +114,9 @@ Use `cargo metadata --no-deps` to discover current workspace package names. Read
 - **Integration tests** exercise only public APIs end-to-end. See `kernel/tests/README.md`
   for a catalog of available test tables (schema, protocol, features, and which tests use
   them). Consult it before creating new test data to avoid duplication.
-- **Consider `TestTableBuilder` (`test_utils::table_builder`) to build the table under test.**
-  Unlike `create_table`, which builds a single create transaction with a given set of features and
-  data layout, the builder *builds up* a multi-version table: data files written across many
-  commits, plus checkpoints, CRC files, a stale/missing `_last_checkpoint` hint, or post-cleanup
-  logs. So when a test needs a populated table history in a specific state, the builder is often a
-  good fit, composing `LogState`, `FeatureSet`, `DataLayoutConfig`, and `TableConfig` through the
-  real kernel write path so the table is protocol-correct by construction. Load a snapshot at any
-  `VersionTarget` with the `build_snapshot!` macro. For coverage across many table states, the
-  `default_sweep` cross-product template
-  (`LogState x FeatureSet x (DataLayoutConfig, TableConfig) x VersionTarget`: data layout and table
-  config are bundled into one axis to avoid a cartesian explosion), or a per-axis template with
-  your own `#[values]`, can help; see `kernel/tests/integration/cross_product/mod.rs`. Drop to
-  lower-level setup like `test_table_setup` (or hand-rolled `add_commit`, or `LocalMockTable` in
-  kernel unit tests) only when necessary: e.g. for states the builder cannot express, such as
-  corrupt or malformed logs.
+- **Consider `TestTableBuilder` (`test_utils::table_builder`)** when a test needs a multi-version
+  table in a specific state: data files across many commits, checkpoints, CRC files, a stale or
+  missing `_last_checkpoint` hint, or post-cleanup logs.
 - Consider how the feature interacts with Delta table features. Cross-check behavior against the
   Delta protocol spec.
 - Consider write paths: normal commits, checkpointing, and CRC files. Log compaction writes are
@@ -132,8 +136,9 @@ Use `cargo metadata --no-deps` to discover current workspace package names. Read
   every combination. Before adding a test, check whether a nearby test has the same flow and
   should gain a new `#[case]`. A common pattern is toggling a feature (e.g. column mapping on/off)
   and asserting success vs. error.
-- Reuse helpers from `test_utils` and the integration-test fixtures instead of writing
-  custom ones when possible. See **Common test helpers** below for a curated starter list.
+- Reuse helpers from `test_utils` and the integration-test fixtures instead of writing custom
+  ones, such as `test_table_setup`, `TestTableBuilder`, `add_commit`, `read_actions_from_commit`,
+  and `assert_result_error_with_message`. `AGENTS/testing.md` has the full catalog.
 - **Committing in tests:** Use `txn.commit(engine)?.unwrap_committed()` to assert a
   successful commit and get the `CommittedTransaction`. When you only need the resulting
   snapshot, use `txn.commit(engine)?.unwrap_post_commit_snapshot()` to get the
@@ -143,87 +148,9 @@ Use `cargo metadata --no-deps` to discover current workspace package names. Read
   commit JSON when the data is inaccessible via public API (e.g., system domain metadata
   is blocked by `get_domain_metadata`). For commit JSON reads, use `read_actions_from_commit`
   from `test_utils`: do NOT write local helpers that duplicate this.
-- **`add_commit` and table setup in tests:** `add_commit` takes a `table_root` string and
-  resolves it to an absolute object-store path. The `table_root` must be a proper URL string
-  with a trailing slash (e.g. `"memory:///"`, `"file:///tmp/my_table/"`). Pass URL strings to
-  `add_commit` and `Snapshot::builder_for`, which accept `impl AsRef<str>`;
-  `read_actions_from_commit` and `test_read` take `&Url`. When using local storage, use an
-  un-prefixed store (`LocalFileSystem::new()`) with a `file:///` URL string. Do NOT use
-  `LocalFileSystem::new_with_prefix()` with `add_commit`: `add_commit` already resolves the full
-  path from the URL, so the prefix causes double-nesting. For in-memory tests, use
-  `InMemory::new()` with `"memory:///"`. ALWAYS use the same `table_root` URL string for both
-  `add_commit` (writing log files) and `Snapshot::builder_for` (reading the table). ALWAYS include
-  a trailing slash in directory URLs to ensure correct path joining.
-
-### Common Test Helpers
-
-Before writing a custom helper, check this curated list and the locations below.
-This list is non-exhaustive: when in doubt, browse the source files directly
-(`test-utils/src/lib.rs`, `kernel/tests/integration/common/`,
-`kernel/tests/integration/<topic>/mod.rs`).
-
-**Arrow construction (from `delta_kernel::arrow`)**
-
-- `arrow::array::new_null_array(&arrow_type, n)`: Arrow array of `n` nulls of any Arrow
-  type. Prefer this over per-type `Int32Array::from(vec![None as Option<i32>])` builders.
-- `engine::arrow_conversion::TryIntoArrow`:
-  `(&kernel_data_type).try_into_arrow()` for `DataType`,
-  `(&kernel_struct_type).try_into_arrow()` for `StructType` -> Arrow `Schema`.
-
-**Handler access and overrides (from `delta_kernel::engine`, with `test-utils`)**
-
-- `PanicEngine`: assert that an operation requests no required engine handler.
-- `DelegatingEngine`: override selected handlers while delegating the rest to an inner engine.
-  See the types' rustdoc for override and executor selection behavior.
-
-**Engine + table setup (from `test_utils`)**
-
-- `test_table_setup()` / `test_table_setup_mt()`: engine + temp table path. Use the `_mt`
-  variant under `#[tokio::test(flavor = "multi_thread")]`. Required whenever a test calls
-  `snapshot.checkpoint()`: it issues nested `block_on` calls that deadlock on a single-threaded
-  runtime / `TokioBackgroundExecutor`.
-- `engine_store_setup(table_name, local_directory)`: returns
-  `(store, engine, table_location)` when a test needs direct object-store access.
-- `setup_test_tables(...)`: multiple pre-built tables for read/scan tests.
-
-**Table creation in tests**
-
-- `test_utils::table_builder::TestTableBuilder` (and the `test_table(...)` shorthand): see the
-  Testing section above.
-- Prefer the kernel `create_table` builder
-  (`delta_kernel::transaction::create_table::create_table`) when you need a single bespoke
-  table rather than `TestTableBuilder`'s composed states. It exercises the same path connectors
-  use and auto-derives the protocol from the schema and feature flags.
-- `test_utils::create_table` (a JSON helper that hand-rolls protocol + metadata) is older
-  but still needed when the kernel builder cannot enable a particular feature combination.
-
-**Schema fixtures**
-
-- `test_utils`: `nested_schema`, `schema_with_type`, `nested_schema_with_type`,
-  `multi_schema_with_type`, `top_level_ntz_schema` / `nested_ntz_schema` /
-  `multiple_ntz_schema`, `top_level_variant_schema` / `nested_variant_schema` /
-  `multiple_variant_schema`.
-- `kernel/tests/integration/create_table/mod.rs`: `simple_schema`, `partition_test_schema`.
-
-**Commit + read helpers (from `test_utils`)**
-
-- `add_commit`, `add_staged_commit`: write a JSON commit at a given version.
-- `read_actions_from_commit`: read raw JSON actions from a specific local-file commit. Use
-  this instead of hand-rolled `serde_json` parsing.
-- `test_read`: full-scan read of a table; use for round-trip assertions.
-- `into_record_batch`: convert `Box<dyn EngineData>` to Arrow `RecordBatch`.
-
-**Assertion helpers (from `test_utils`)**
-
-- `assert_schema_has_field(schema, &["a".into(), "b".into()])`: assert a (possibly nested)
-  field path.
-- `assert_result_error_with_message(result, "needle")`: assert an error contains a
-  substring.
-
-**If a name here doesn't match what's in code:** the list may have drifted from a rename.
-Run `rg '^pub (fn|async fn)' test-utils/src/lib.rs` to discover the current public surface,
-and update this section in your PR. The same pattern works for
-`kernel/tests/integration/common/write_utils.rs`.
+- **`add_commit`:** pass the same `table_root` URL string, with a trailing slash, to `add_commit`
+  and `Snapshot::builder_for`. Do NOT use `LocalFileSystem::new_with_prefix()` with `add_commit`:
+  the prefix double-nests the path.
 
 ## Common Gotchas
 
@@ -235,22 +162,18 @@ and update this section in your PR. The same pattern works for
   column names (defined by the protocol) are not subject to column mapping.
 - **Transforms:** Generic recursive schema and expression transform traits and helpers
   are in `kernel/src/transforms/`.
-- **Tracing layer callbacks must not emit tracing events directly:** Calling `warn!()` or
-  any tracing macro inside a `tracing_subscriber::Layer` callback (`on_event`, `on_record`,
-  `on_close`) while holding a span's `extensions_mut()` write lock will re-enter the layer
-  and deadlock on the same lock. `on_new_span` builds its event with `from_attrs` before taking
-  the extension lock, so direct `warn!()` is safe there. In `on_record`, store warnings in a
-  `pending_warnings: Vec<String>` field on the visitor, take them out after the extensions
-  block closes, and emit via `warn!()` only then. (`on_event`'s visitor does no
-  warning-eligible work, so it may run under the lock directly.) See
-  `kernel/src/metrics/reporter.rs` for the canonical pattern.
+- **Tracing layer callbacks must not emit tracing events while holding a span's
+  `extensions_mut()` lock:** the emitted event re-enters the layer and deadlocks on the same
+  lock. Read `kernel/src/metrics/README.md` before changing a layer.
 - **Keep tests with process-global state safe under concurrency:** `cargo test` runs tests as
   parallel threads in one test binary, while nextest normally runs each test in a separate
   process. Tests for global tracing subscribers and callbacks must not share capture buffers with
   thread-local dispatch tests or assume no other thread can emit an event.
+- **Tests that call `snapshot.checkpoint()` need a multi-threaded runtime:** use
+  `test_table_setup_mt()` under `#[tokio::test(flavor = "multi_thread")]`. Checkpointing issues
+  nested `block_on` calls that deadlock on a single-threaded runtime or `TokioBackgroundExecutor`.
 - **Generated code:** files starting with ``//! Generated by `cargo xtask ...` `` are never edited by
   hand. Change the generator in `xtask/` or its inputs and rerun the command.
-  `kernel/error_catalog/README.md` documents the error-catalog commands.
 
 ## Code Style
 
@@ -261,10 +184,6 @@ and update this section in your PR. The same pattern works for
 - Prefer `==` over `matches!` for simple single-variant enum comparisons. `matches!` is
   for patterns with bindings or guards. For example: `self == Variant` not
   `matches!(self, Variant)`.
-- Prefer `#[repr(C)]` enums for closed FFI choice sets instead of integer aliases and constants.
-  Add `cbindgen:prefix-with-name=true` so generated variants remain unambiguous. Use an integer
-  discriminator only when unknown values are intentionally recoverable, and validate them at the
-  boundary. Invalid enum tags are undefined behavior, so unsafe FFI APIs must require valid tags.
 - Prefer `StructField::nullable` / `StructField::not_null` over
   `StructField::new(name, type, bool)` when nullability is known at compile time.
   Reserve `StructField::new` for cases where nullability is a runtime value.
@@ -404,8 +323,6 @@ and data flow. Keep it concise.
 
 Read these when relevant to the task at hand:
 
-- `CLAUDE/architecture.md`: task-oriented source navigation for kernel internals
-- `docs/user-guide/CLAUDE.md`: writing standards for the mdBook user guide
 - [Delta Kernel user guide](https://docs.delta.io/kernel/rust/): introductions and connector workflows
 - [delta_kernel rustdoc](https://docs.rs/delta_kernel/latest/delta_kernel/): API explanations,
   contracts, and executable examples
