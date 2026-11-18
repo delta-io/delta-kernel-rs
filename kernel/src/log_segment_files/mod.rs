@@ -62,11 +62,11 @@ pub(crate) struct LogSegmentFiles {
 pub(crate) enum HintListing {
     /// The listing, starting from the hint.
     Listed(LogSegmentFiles),
-    /// The hint is an AMT hint whose manifest commit is after the snapshot and that embeds no
-    /// checkpoint action, so nothing supplies the snapshot's base. Holds the listing from the
-    /// hinted version, whose newest commit is the snapshot's.
+    /// The hint is an AMT hint whose manifest commit is after the snapshot, so the snapshot's
+    /// `lastManifestCommit` decides where listing starts. Holds the listing from the hinted
+    /// version, whose newest commit is the snapshot's.
     #[cfg(feature = "adaptive-metadata-in-dev")]
-    AmtBaseMissing(LogSegmentFiles),
+    ManifestCommitAfterSnapshot(LogSegmentFiles),
 }
 
 /// Returns a lazy iterator of [`ParsedLogPath`]s from the filesystem over versions
@@ -201,8 +201,8 @@ fn find_complete_checkpoint_version(ascending_files: &[ParsedLogPath]) -> Option
 /// `embedded_action` must be at the checkpoint version. The manifest commit must also be listed,
 /// unless it is after the snapshot's last version.
 ///
-/// Returns `false` when the manifest commit is after the snapshot's last version and there is no
-/// `embedded_action`, so nothing in the listing supplies the snapshot's base.
+/// Returns whether the manifest commit is listed: `false` when it is after the snapshot's last
+/// version.
 #[cfg(feature = "adaptive-metadata-in-dev")]
 fn validate_amt_listing(
     listed_files: &LogSegmentFiles,
@@ -247,12 +247,12 @@ fn validate_amt_listing(
     // happens when time traveling before the manifest commit (say checkpoint 5, manifest commit 8,
     // snapshot at 6), or when loading the latest snapshot before the manifest commit is visible in
     // the log (say checkpoint 5, manifest commit 8, newest listed commit 7, as with a not yet
-    // backfilled catalog commit). Only an embedded action can then supply the base.
+    // backfilled catalog commit).
     if end_version
         .or(last)
         .is_some_and(|end| manifest_commit_version > end)
     {
-        return Ok(embedded_action.is_some());
+        return Ok(false);
     }
     if !commits.iter().any(|c| c.version == manifest_commit_version) {
         return Err(KernelError::invalid_checkpoint(format!(
@@ -697,10 +697,9 @@ impl LogSegmentFiles {
     /// selected is logged and ignored, not an error.
     ///
     /// An AMT hint has no checkpoint file, so its listing is accepted without one when the hint's
-    /// manifest commit is listed or, for a snapshot that ends before that commit, when the hint
-    /// embeds its checkpoint action. Commits the checkpoint action already covers are then dropped
+    /// manifest commit is listed. Commits the checkpoint action already covers are then dropped
     /// (see [`Self::trim_to_latest_checkpoint`]). A snapshot that ends before the manifest commit
-    /// of a hint with no embedded action yields [`HintListing::AmtBaseMissing`].
+    /// yields [`HintListing::ManifestCommitAfterSnapshot`].
     pub(crate) fn list_with_checkpoint_hint(
         checkpoint_metadata: &LastCheckpointHint,
         storage: &dyn StorageHandler,
@@ -723,20 +722,22 @@ impl LogSegmentFiles {
             #[cfg(feature = "adaptive-metadata-in-dev")]
             if let Some(manifest_commit_version) = checkpoint_metadata.amt_manifest_commit_version()
             {
-                if !validate_amt_listing(
+                let manifest_commit_listed = validate_amt_listing(
                     &listed_files,
                     checkpoint_metadata.version,
                     manifest_commit_version,
                     checkpoint_metadata.amt_checkpoint_action(),
                     end_version,
-                )? {
-                    return Ok(HintListing::AmtBaseMissing(listed_files));
-                }
+                )?;
                 listed_files.trim_to_latest_checkpoint(
                     checkpoint_metadata.version,
                     manifest_commit_version,
                 );
-                return Ok(HintListing::Listed(listed_files));
+                return Ok(if manifest_commit_listed {
+                    HintListing::Listed(listed_files)
+                } else {
+                    HintListing::ManifestCommitAfterSnapshot(listed_files)
+                });
             }
             // The hint names a checkpoint that no longer exists, and because the listing started
             // at the hinted version, no checkpoint exists at or after it either. The log was

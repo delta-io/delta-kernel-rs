@@ -1866,19 +1866,13 @@ fn classic_metadata_commit() -> String {
 // A snapshot at version 3 on a log listed from an AMT `_last_checkpoint` hint at content root 2
 // whose manifest commit 4 is after the snapshot: either time travel to 3 with commit 4 written, or
 // the latest snapshot before commit 4 is visible in the log. Commit 4 is not part of the snapshot,
-// so its checkpoint action and P&M come from the action embedded in the hint (one-column schema).
-// Each case varies commit 3 or adds a CRC at version 3; every case runs on both plan/non-plan
-// replay paths.
+// and commit 3 has no `lastManifestCommit`, so the checkpoint action and P&M come from the action
+// embedded in the hint (one-column schema). Each case varies commit 3 or adds a CRC at version 3;
+// every case runs on both plan/non-plan replay paths.
 #[rstest]
 #[case::no_pm_in_range(commit_info(None), false, 1)]
-// An older manifest commit's action (content root 1) in range loses to the embedded action.
-#[case::older_checkpoint_action_in_range(
-    manifest_commit(3, 1, test_schema_flat_with_column_mapping()),
-    false,
-    1
-)]
 #[case::newer_metadata_in_range(
-    metadata_commit(test_schema_flat_with_column_mapping()),
+    format!("{}\n{}", commit_info(None), metadata_commit(test_schema_flat_with_column_mapping())),
     false,
     test_schema_flat_with_column_mapping().fields().count()
 )]
@@ -1966,17 +1960,31 @@ async fn check_hint_checkpoint_action<E: Engine>(
 }
 
 // A snapshot at version 3 on a log whose AMT `_last_checkpoint` hint (content root 2, manifest
-// commit 4) embeds no checkpoint action, so the hint cannot supply the base. Listing instead starts
-// from the content root that commit 3's `lastManifestCommit` names, or, with none, as if there were
-// no hint. `commits` are the commits before 3; `expected_action` is the latest checkpoint action's
-// version.
+// commit 4) cannot supply the base: commit 3 has a `lastManifestCommit`, which decides the base
+// even when the hint embeds a newer checkpoint action, or the hint embeds no action. Listing starts
+// from the content root that `lastManifestCommit` names, or, with none, as if there were no hint.
+// `commits` are the commits before 3; `expected_action` is the latest checkpoint action's version.
 #[rstest]
 #[case::last_manifest_commit_names_earlier_root(
+    false,
     vec![(1, manifest_commit(1, 0, one_column_schema())), (2, commit_info(None))],
     commit_info(Some(pointer(1, 0))),
     Ok((vec![1, 2, 3], Some(0)))
 )]
+#[case::last_manifest_commit_overrides_hint_action(
+    true,
+    vec![(1, manifest_commit(1, 0, one_column_schema())), (2, commit_info(None))],
+    commit_info(Some(pointer(1, 0))),
+    Ok((vec![1, 2, 3], Some(0)))
+)]
+#[case::older_manifest_commit_in_range_overrides_hint_action(
+    true,
+    vec![(2, commit_info(None))],
+    manifest_commit(3, 1, one_column_schema()),
+    Ok((vec![2, 3], Some(1)))
+)]
 #[case::no_last_manifest_commit(
+    false,
     vec![
         (0, protocol_and_metadata_lines(one_column_schema(), &[])),
         (1, commit_info(None)),
@@ -1986,12 +1994,14 @@ async fn check_hint_checkpoint_action<E: Engine>(
     Ok((vec![0, 1, 2, 3], None))
 )]
 #[case::history_after_root_missing(
+    false,
     vec![(2, commit_info(None))],
     commit_info(Some(pointer(1, 0))),
     Err("AMT checkpoint at version 0 requires commits starting at or before version 1, but the first listed commit is Some(2)")
 )]
 #[tokio::test]
-async fn snapshot_before_manifest_commit_without_hint_action_lists_from_last_manifest_commit(
+async fn snapshot_before_manifest_commit_lists_from_last_manifest_commit(
+    #[case] hint_embeds_action: bool,
     #[case] commits: Vec<(u64, String)>,
     #[case] commit_3: String,
     #[case] expected: KernelResult<(Vec<u64>, Option<i64>), &str>,
@@ -2006,7 +2016,7 @@ async fn snapshot_before_manifest_commit_without_hint_action_lists_from_last_man
             .await
             .unwrap();
     }
-    put_amt_last_checkpoint_hint(&store, 2, 4, false).await;
+    put_amt_last_checkpoint_hint(&store, 2, 4, hint_embeds_action).await;
 
     let engine = non_plan_engine(store);
     let builder = Snapshot::builder_for(table_root);
