@@ -276,9 +276,9 @@ fn delta_only_snapshot_emits_expected_metrics() -> delta_kernel::Result<()> {
 /// After a v1 parquet checkpoint is written at version 1 and a further commit is added,
 /// a fresh snapshot sees one checkpoint file, one tail commit, and performs a single
 /// parquet read (checkpoint) plus a single JSON read (tail commit).
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn snapshot_with_v1_checkpoint_and_tail_commit_emits_expected_metrics()
--> delta_kernel::Result<()> {
+#[test]
+fn snapshot_with_v1_checkpoint_and_tail_commit_emits_expected_metrics() -> delta_kernel::Result<()>
+{
     let table = TestTableBuilder::new()
         .with_log_state(LogState::with_latest_version(2).with_checkpoint_at([1]))
         .with_schema(simple_schema())
@@ -299,9 +299,7 @@ async fn snapshot_with_v1_checkpoint_and_tail_commit_emits_expected_metrics()
     assert_eq!(reporter.json_files_read.get(), 1);
     assert_eq!(reporter.parquet_read_calls.get(), 1);
     assert_eq!(reporter.parquet_files_read.get(), 1);
-    #[cfg(not(windows))]
     assert!(reporter.json_bytes_read.get() > 0);
-    #[cfg(not(windows))]
     assert!(reporter.parquet_bytes_read.get() > 0);
 
     Ok(())
@@ -314,8 +312,8 @@ async fn snapshot_with_v1_checkpoint_and_tail_commit_emits_expected_metrics()
 /// When the latest version has a checkpoint and no subsequent commits exist, the snapshot
 /// has zero commit files and the JSON handler is called with an empty file list.
 /// read_commit_actions always invokes read_json_files even for an empty commit cover.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn snapshot_at_checkpoint_tip_emits_expected_metrics() -> delta_kernel::Result<()> {
+#[test]
+fn snapshot_at_checkpoint_tip_emits_expected_metrics() -> delta_kernel::Result<()> {
     let table = TestTableBuilder::new()
         .with_log_state(LogState::with_latest_version(1).with_checkpoint_at([1]))
         .with_schema(simple_schema())
@@ -502,9 +500,8 @@ async fn crc_at_prior_version_roots_replay_at_crc_for_both_modes(
 /// Checkpoint at v1 plus 3 additional commits (v2, v3, v4) verifies that all tail commits
 /// are read in a single JSON call and both byte counters are non-zero. The specific counts
 /// here reflect this table's setup: checkpoint at v1, three tail commits.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn checkpoint_with_multiple_tail_commits_emits_expected_metrics() -> delta_kernel::Result<()>
-{
+#[test]
+fn checkpoint_with_multiple_tail_commits_emits_expected_metrics() -> delta_kernel::Result<()> {
     let table = TestTableBuilder::new()
         .with_log_state(LogState::with_latest_version(4).with_checkpoint_at([1]))
         .with_schema(simple_schema())
@@ -523,9 +520,7 @@ async fn checkpoint_with_multiple_tail_commits_emits_expected_metrics() -> delta
     assert_eq!(reporter.json_read_calls.get(), 1);
     assert_eq!(reporter.json_files_read.get(), 3);
     assert_eq!(reporter.parquet_read_calls.get(), 1);
-    #[cfg(not(windows))]
     assert!(reporter.json_bytes_read.get() > 0);
-    #[cfg(not(windows))]
     assert!(reporter.parquet_bytes_read.get() > 0);
 
     Ok(())
