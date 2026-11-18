@@ -12,7 +12,7 @@ use std::fs;
 use std::path::Path;
 use std::process::Command;
 
-use anyhow::{bail, ensure, Context};
+use anyhow::{Context, bail, ensure};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -601,10 +601,12 @@ mod tests {
         }"#;
         let result = select_conditions(conditions(catalog), selection.as_bytes());
         if fails {
-            assert!(result
-                .unwrap_err()
-                .to_string()
-                .contains("both map to the Rust variant AB"));
+            assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("both map to the Rust variant AB")
+            );
         } else {
             assert_eq!(result.unwrap(), [condition_named(catalog, "A.B")]);
         }

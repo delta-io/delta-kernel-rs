@@ -13,13 +13,13 @@
 //! update_table_txn_get_unpartitioned_write_context(txn, engine)
 //! ```
 
-use delta_kernel::transaction::Transaction;
 use delta_kernel::KernelResult;
+use delta_kernel::transaction::Transaction;
 
 use crate::error::{ExternResult, IntoExternResult};
 use crate::handle::Handle;
 use crate::transaction::ExclusiveUpdateTableTransaction;
-use crate::{kernel_string_slice, KernelStringSlice, NullableCvoid, SharedExternEngine};
+use crate::{KernelStringSlice, NullableCvoid, SharedExternEngine, kernel_string_slice};
 
 /// Acknowledges that the connector materializes this table's column defaults before writing data
 /// files.
@@ -106,7 +106,7 @@ mod tests {
     use crate::ffi_test_utils::{build_update_table_txn, ok_or_panic};
     use crate::tests::get_default_engine;
     use crate::transaction::free_update_table_txn;
-    use crate::{free_engine, TryFromStringSlice};
+    use crate::{TryFromStringSlice, free_engine};
 
     const FIXTURE: &str = "../kernel/tests/data/table-with-column-defaults/";
 
@@ -144,7 +144,7 @@ mod tests {
         let txn = unsafe { ok_or_panic(build_update_table_txn(table_root, engine.shallow_copy())) };
 
         let mut collected: Vec<VisitedDefault> = Vec::new();
-        let engine_context = NonNull::new((&mut collected as *mut Vec<VisitedDefault>).cast());
+        let engine_context = Some(NonNull::from_mut(&mut collected).cast());
         let count = unsafe {
             ok_or_panic(update_table_txn_visit_top_level_column_defaults(
                 txn.shallow_copy(),

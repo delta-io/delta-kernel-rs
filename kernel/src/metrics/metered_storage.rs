@@ -11,7 +11,7 @@ use bytes::Bytes;
 use url::Url;
 
 use crate::metrics::events::{StorageCopyCompleted, StorageListCompleted, StorageReadCompleted};
-use crate::metrics::{emit_storage_span, MetricsIterator};
+use crate::metrics::{MetricsIterator, emit_storage_span};
 use crate::{
     CancellationTokenRef, FileMeta, FileSlice, KernelResult, KernelResultIterator, StorageHandler,
 };
@@ -131,7 +131,7 @@ mod tests {
 
     use super::*;
     use crate::metrics::MetricEvent;
-    use crate::unit_test_utils::{install_thread_local_metrics_reporter, CapturingReporter};
+    use crate::unit_test_utils::{CapturingReporter, install_thread_local_metrics_reporter};
 
     /// Storage handler that returns N preconfigured FileMeta / byte slices.
     #[derive(Debug)]
@@ -255,9 +255,11 @@ mod tests {
         storage.copy_atomic(&fake_url(), &fake_url()).unwrap();
 
         let events = reporter.events();
-        assert!(events
-            .iter()
-            .any(|e| matches!(e, MetricEvent::StorageCopyCompleted(_))));
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, MetricEvent::StorageCopyCompleted(_)))
+        );
     }
 
     #[test]
@@ -384,11 +386,15 @@ mod tests {
             .collect();
 
         let events = reporter.events();
-        assert!(events
-            .iter()
-            .any(|e| matches!(e, MetricEvent::StorageListCompleted(_))));
-        assert!(events
-            .iter()
-            .any(|e| matches!(e, MetricEvent::StorageReadCompleted(_))));
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, MetricEvent::StorageListCompleted(_)))
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, MetricEvent::StorageReadCompleted(_)))
+        );
     }
 }

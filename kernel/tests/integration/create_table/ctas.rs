@@ -11,20 +11,20 @@ use delta_kernel::actions::MIN_VALUES;
 use delta_kernel::arrow::array::{Array, Int64Array, StringArray, StructArray};
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
-use delta_kernel::expressions::{column_name, ColumnName};
+use delta_kernel::expressions::{ColumnName, column_name};
 use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::{DynObjectStore, ObjectStoreExt as _};
 use delta_kernel::snapshot::Snapshot;
 use delta_kernel::table_features::{
-    get_any_level_column_physical_name, ColumnMappingMode, TableFeature,
+    ColumnMappingMode, TableFeature, get_any_level_column_physical_name,
 };
+use delta_kernel::transaction::CommitResult;
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
-use delta_kernel::transaction::CommitResult;
 use delta_kernel::{Engine, FileMeta};
-use test_utils::delta_kernel_default_engine::executor::tokio::TokioMultiThreadExecutor;
 use test_utils::delta_kernel_default_engine::DefaultEngineBuilder;
+use test_utils::delta_kernel_default_engine::executor::tokio::TokioMultiThreadExecutor;
 use test_utils::{
     assert_schema_has_field, nested_batches, nested_schema, read_add_infos, test_table_setup,
     write_batch_to_table,

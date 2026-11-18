@@ -13,11 +13,11 @@ use crate::actions::visitors::InCommitTimestampVisitor;
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::actions::visitors::LastManifestCommitVisitor;
 #[cfg(feature = "adaptive-metadata-in-dev")]
-use crate::actions::{LastManifestCommit, COMMIT_INFO_NAME, LAST_MANIFEST_COMMIT_FIELD};
+use crate::actions::{COMMIT_INFO_NAME, LAST_MANIFEST_COMMIT_FIELD, LastManifestCommit};
 use crate::engine_data::RowVisitor;
+use crate::schema::SchemaRef;
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::schema::lazy_schema_ref;
-use crate::schema::SchemaRef;
 use crate::utils::require;
 use crate::{Engine, EngineData, FileMeta, KernelError, KernelResult, Version};
 
@@ -463,7 +463,7 @@ impl ParsedLogPath<Url> {
     #[allow(unused)]
     /// Create a new ParsedCommitPath<Url> for a new json commit file
     pub(crate) fn new_commit(table_root: &Url, version: Version) -> KernelResult<Self> {
-        let filename = format!("{version:020}.json");
+        let filename = published_commit_file_name(version);
         let path = Self::create_path(table_root, filename)?;
         if !path.is_commit() {
             return Err(KernelError::internal_error(
@@ -536,6 +536,12 @@ impl ParsedLogPath<Url> {
     }
 }
 
+// TODO(#3058): Consolidate log filename utilities in a dedicated file_names.rs module.
+/// Returns a published commit filename, such as `00000000000000000001.json`.
+pub(crate) fn published_commit_file_name(version: Version) -> String {
+    format!("{version:020}.json")
+}
+
 /// A checkpoint sidecar is a uniquely-named parquet file: `{unique}.parquet` where `unique` is
 /// some unique string such as a UUID. We use `<version>.checkpoint.<uuid>.parquet` here.
 ///
@@ -585,7 +591,7 @@ impl LogRoot {
 
     /// Create a new commit path (absolute path) for the given version.
     pub(crate) fn new_commit_path(&self, version: Version) -> KernelResult<ParsedLogPath<Url>> {
-        let filename = format!("{version:020}.json");
+        let filename = published_commit_file_name(version);
         let path = self.log_root().join(&filename)?;
         ParsedLogPath::new(path).ok_or_else(|| {
             KernelError::internal_error(format!("Attempted to create an invalid path: {filename}"))
@@ -644,7 +650,7 @@ pub(crate) mod tests {
 
     impl ParsedLogPath<FileMeta> {
         pub(crate) fn create_parsed_published_commit(table_root: &Url, version: Version) -> Self {
-            let filename = format!("{version:020}.json");
+            let filename = published_commit_file_name(version);
             let location = table_root
                 .join(DELTA_LOG_DIR_WITH_SLASH)
                 .unwrap()
@@ -833,15 +839,28 @@ pub(crate) mod tests {
         assert_eq!(parsed.file_type, expected_file_type);
     }
 
-    #[test]
-    fn test_new_commit() {
+    #[rstest::rstest]
+    #[case::zero(0, "00000000000000000000.json")]
+    #[case::padded(10, "00000000000000000010.json")]
+    #[case::maximum(Version::MAX, "18446744073709551615.json")]
+    fn test_new_commit(#[case] version: Version, #[case] filename: &str) {
+        // GIVEN: a table root and a commit version, including zero and u64::MAX.
         let table_root_dir = table_root_dir_url();
-        let log_path = ParsedLogPath::new_commit(&table_root_dir, 10).unwrap();
-        assert_eq!(log_path.version, 10);
+
+        // WHEN: create the commit path from the table root and from LogRoot.
+        let log_path = ParsedLogPath::new_commit(&table_root_dir, version).unwrap();
+        let log_root_path = LogRoot::new(table_root_dir)
+            .unwrap()
+            .new_commit_path(version)
+            .unwrap();
+
+        // THEN: both constructors return the same path with a 20-digit version and .json extension.
+        assert_eq!(log_path.version, version);
         assert!(log_path.is_commit());
         assert_eq!(log_path.extension, "json");
-        assert!(matches!(log_path.file_type, LogPathFileType::Commit));
-        assert_eq!(log_path.filename, "00000000000000000010.json");
+        assert_eq!(log_path.file_type, LogPathFileType::Commit);
+        assert_eq!(log_path.filename, filename);
+        assert_eq!(log_path, log_root_path);
     }
 
     #[test]

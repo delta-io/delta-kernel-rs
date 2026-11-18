@@ -5,21 +5,21 @@ use std::sync::{Arc, Mutex};
 use delta_kernel::arrow::array::{Array, ArrayData, StructArray};
 use delta_kernel::arrow::ffi::to_ffi;
 use delta_kernel::engine::arrow_data::EngineDataArrowExt;
-use delta_kernel::table_changes::scan::TableChangesScan;
 use delta_kernel::table_changes::TableChanges;
-use delta_kernel::{EngineData, KernelError, KernelResult, KernelResultIterator, Version};
+use delta_kernel::table_changes::scan::TableChangesScan;
+use delta_kernel::{EngineData, KernelError, KernelResult, Version};
 use delta_kernel_ffi_macros::handle_descriptor;
-use tracing::debug;
+use tracing::{debug, trace};
 use url::Url;
 
 use super::handle::Handle;
 use crate::engine_data::ArrowFFIData;
-use crate::expressions::kernel_visitor::{unwrap_kernel_predicate, KernelExpressionVisitorState};
+use crate::expressions::kernel_visitor::{KernelExpressionVisitorState, unwrap_kernel_predicate};
 use crate::scan::EnginePredicate;
 use crate::{
-    kernel_string_slice, unwrap_and_parse_path_as_url, AllocateStringFn, ExternEngine,
-    ExternResult, IntoExternResult, KernelStringSlice, NullableCvoid, SharedExternEngine,
-    SharedSchema,
+    AllocateStringFn, ExternEngine, ExternResult, IntoExternResult, KernelStringSlice,
+    NullableCvoid, SharedExternEngine, SharedSchema, kernel_string_slice,
+    unwrap_and_parse_path_as_url,
 };
 
 #[handle_descriptor(target=TableChanges, mutable=true, sized=true)]
@@ -75,7 +75,7 @@ fn table_changes_impl(
     extern_engine: &dyn ExternEngine,
     start_version: Version,
     end_version: Option<Version>,
-) -> KernelResult<Handle<ExclusiveTableChanges>> {
+) -> delta_kernel::Result<Handle<ExclusiveTableChanges>> {
     let table_changes = TableChanges::try_new(
         url?,
         extern_engine.engine().as_ref(),
@@ -236,7 +236,8 @@ pub unsafe extern "C" fn table_changes_scan_physical_schema(
     table_changes_scan.physical_schema().clone().into()
 }
 
-type TableChangesData = Mutex<Box<dyn KernelResultIterator<Box<dyn EngineData>>>>;
+type TableChangesData =
+    Mutex<Box<dyn Iterator<Item = delta_kernel::Result<Box<dyn EngineData>>> + Send>>;
 
 pub struct ScanTableChangesIterator {
     data: TableChangesData,
@@ -248,7 +249,7 @@ pub struct SharedScanTableChangesIterator;
 
 impl Drop for ScanTableChangesIterator {
     fn drop(&mut self) {
-        debug!("dropping ScanTableChangesIterator");
+        trace!("dropping ScanTableChangesIterator");
     }
 }
 
@@ -273,7 +274,7 @@ pub unsafe extern "C" fn table_changes_scan_execute(
 fn table_changes_scan_execute_impl(
     table_changes_scan: &TableChangesScan,
     engine: Arc<dyn ExternEngine>,
-) -> KernelResult<Handle<SharedScanTableChangesIterator>> {
+) -> delta_kernel::Result<Handle<SharedScanTableChangesIterator>> {
     let table_changes_iter = table_changes_scan.execute(engine.engine().clone())?;
     let data = ScanTableChangesIterator {
         data: Mutex::new(Box::new(table_changes_iter)),
@@ -315,7 +316,7 @@ pub unsafe extern "C" fn scan_table_changes_next(
 
 fn scan_table_changes_next_impl(
     data: &ScanTableChangesIterator,
-) -> KernelResult<*mut ArrowFFIData> {
+) -> delta_kernel::Result<*mut ArrowFFIData> {
     let mut data = data
         .data
         .lock()
@@ -329,7 +330,7 @@ fn scan_table_changes_next_impl(
 
     let batch_struct_array: StructArray = record_batch.into();
     let array_data: ArrayData = batch_struct_array.into_data();
-    let (out_array, out_schema) = to_ffi(&array_data)?;
+    let (out_array, out_schema) = to_ffi(&array_data).map_err(delta_kernel::KernelError::from)?;
     Ok(Box::into_raw(Box::new(ArrowFFIData {
         array: out_array,
         schema: out_schema,
@@ -350,18 +351,18 @@ mod tests {
     use delta_kernel::object_store::memory::InMemory;
     use delta_kernel::object_store::path::Path;
     use delta_kernel::object_store::{DynObjectStore, ObjectStoreExt as _};
-    use delta_kernel::schema::{schema_ref, StructType};
+    use delta_kernel::schema::{StructType, schema_ref};
     use delta_kernel::{Engine, KernelResult};
     use delta_kernel_default_engine::DefaultEngineBuilder;
     use delta_kernel_ffi::engine_data::get_engine_data;
     use itertools::Itertools;
     use test_utils::{
-        actions_to_string_with_metadata, add_commit, generate_batch, record_batch_to_bytes,
-        IntoArray as _, TestAction,
+        IntoArray as _, TestAction, actions_to_string_with_metadata, add_commit, generate_batch,
+        record_batch_to_bytes,
     };
 
     use super::*;
-    use crate::ffi_test_utils::{allocate_err, allocate_str, ok_or_panic, recover_string};
+    use crate::ffi_test_utils::{TEST_ERROR_ALLOCATORS, allocate_str, ok_or_panic, recover_string};
     use crate::{engine_to_handle, free_engine, free_schema, kernel_string_slice};
 
     const PARQUET_FILE1: &str =
@@ -495,10 +496,10 @@ mod tests {
     fn read_scan(
         scan: &TableChangesScan,
         engine: Arc<dyn Engine>,
-    ) -> KernelResult<Vec<RecordBatch>> {
+    ) -> delta_kernel::Result<Vec<RecordBatch>> {
         let scan_results = scan.execute(engine)?;
         scan_results
-            .map(EngineDataArrowExt::try_into_record_batch)
+            .map(|data| Ok::<_, delta_kernel::Error>(data?.try_into_record_batch()?))
             .try_collect()
     }
 
@@ -550,7 +551,7 @@ mod tests {
         commit_add_file(table_root, storage.as_ref(), 1, PARQUET_FILE2.to_string()).await?;
 
         let engine = DefaultEngineBuilder::new(storage).build();
-        let engine = engine_to_handle(Arc::new(engine), allocate_err);
+        let engine = engine_to_handle(Arc::new(engine), TEST_ERROR_ALLOCATORS);
 
         let table_changes = ok_or_panic(unsafe {
             table_changes_from_version(kernel_string_slice!(table_root), engine.shallow_copy(), 0)
@@ -638,7 +639,7 @@ mod tests {
         commit_add_file(table_root, storage.as_ref(), 1, PARQUET_FILE2.to_string()).await?;
 
         let engine = DefaultEngineBuilder::new(storage).build();
-        let engine = engine_to_handle(Arc::new(engine), allocate_err);
+        let engine = engine_to_handle(Arc::new(engine), TEST_ERROR_ALLOCATORS);
 
         let table_changes = ok_or_panic(unsafe {
             table_changes_from_version(kernel_string_slice!(table_root), engine.shallow_copy(), 0)
@@ -695,7 +696,7 @@ mod tests {
         commit_add_file(table_root, storage.as_ref(), 1, PARQUET_FILE2.to_string()).await?;
 
         let engine = DefaultEngineBuilder::new(storage).build();
-        let engine = engine_to_handle(Arc::new(engine), allocate_err);
+        let engine = engine_to_handle(Arc::new(engine), TEST_ERROR_ALLOCATORS);
 
         let table_changes = ok_or_panic(unsafe {
             table_changes_from_version(kernel_string_slice!(table_root), engine.shallow_copy(), 0)
@@ -721,7 +722,8 @@ mod tests {
             // Take ownership of the boxed ArrowFFIData; the inner array/schema are moved
             // into get_engine_data which takes ownership of the FFI_ArrowArray.
             let ArrowFFIData { array, schema } = *unsafe { Box::from_raw(data_ptr) };
-            let engine_data = ok_or_panic(unsafe { get_engine_data(array, &schema, allocate_err) });
+            let engine_data =
+                ok_or_panic(unsafe { get_engine_data(array, &schema, &TEST_ERROR_ALLOCATORS) });
             let record_batch = unsafe { engine_data.into_inner().try_into_record_batch() }?;
 
             println!("Batch ({i}) num rows {:?}", record_batch.num_rows());
@@ -778,7 +780,7 @@ mod tests {
         commit_remove_file(table_root, storage.as_ref(), 3, PARQUET_FILE2.to_string()).await?;
 
         let engine = DefaultEngineBuilder::new(storage).build();
-        let engine = engine_to_handle(Arc::new(engine), allocate_err);
+        let engine = engine_to_handle(Arc::new(engine), TEST_ERROR_ALLOCATORS);
 
         let table_changes = ok_or_panic(unsafe {
             table_changes_between_versions(

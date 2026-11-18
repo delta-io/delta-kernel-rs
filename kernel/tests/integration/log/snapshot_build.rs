@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use delta_kernel::arrow::array::{ArrayRef, Int32Array};
 use delta_kernel::committer::{Committer, FileSystemCommitter};
-use delta_kernel::schema::{schema, schema_ref};
+use delta_kernel::schema::{DataType, schema, schema_ref};
 use delta_kernel::snapshot::{
     CheckpointWriteResult, ChecksumWriteResult, IncrementalReplay, SnapshotBuilder,
 };
@@ -13,11 +13,11 @@ use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::{KernelError, KernelResult, Snapshot, Version};
 use rstest::rstest;
 use serde_json::json;
-use test_utils::delta_kernel_default_engine::executor::TaskExecutor;
 use test_utils::delta_kernel_default_engine::DefaultEngine;
+use test_utils::delta_kernel_default_engine::executor::TaskExecutor;
 use test_utils::{
-    add_commit, assert_result_error_with_message, engine_store_setup, insert_data_with,
-    test_table_setup_mt, TestCatalogCommitter,
+    TestCatalogCommitter, add_commit, assert_result_error_with_message, engine_store_setup,
+    insert_data_with, test_table_setup_mt,
 };
 
 /// The newest version of the table built by [`setup_multi_version_table`].
@@ -54,7 +54,7 @@ async fn append_row<E: TaskExecutor>(
     engine: &Arc<DefaultEngine<E>>,
     kind: TableKind,
     value: i32,
-) -> KernelResult<Arc<Snapshot>> {
+) -> delta_kernel::Result<Arc<Snapshot>> {
     let column: ArrayRef = Arc::new(Int32Array::from(vec![value]));
     Ok(insert_data_with(
         snapshot,
@@ -76,7 +76,7 @@ async fn setup_multi_version_table<E: TaskExecutor>(
     engine: &Arc<DefaultEngine<E>>,
     table_path: &str,
     kind: TableKind,
-) -> KernelResult<()> {
+) -> delta_kernel::Result<()> {
     let schema = schema_ref! { nullable "id": INTEGER };
     let builder = create_table(table_path, schema, "test_engine", true);
     let builder = match kind {
@@ -103,9 +103,16 @@ async fn setup_multi_version_table<E: TaskExecutor>(
     Ok(())
 }
 
+#[rstest]
+#[case::formerly_rejected(42, false)]
+#[case::supported(331, false)]
+#[case::exceeded(332, true)]
 #[tokio::test]
-async fn deeply_nested_schema_snapshot_load_returns_schema_error() -> KernelResult<()> {
-    let deeply_nested_schema = (0..42).fold(
+async fn snapshot_schema_nesting_boundary(
+    #[case] depth: usize,
+    #[case] exceeds_limit: bool,
+) -> KernelResult<()> {
+    let deeply_nested_schema = (0..depth).fold(
         schema! { nullable "leaf": INTEGER },
         |nested, depth| schema! { nullable (format!("level_{depth}")): (nested) },
     );
@@ -128,19 +135,77 @@ async fn deeply_nested_schema_snapshot_load_returns_schema_error() -> KernelResu
     add_commit(table_url.as_str(), store.as_ref(), 0, commit).await?;
 
     let result = Snapshot::builder_for(table_url).build(&engine);
+    if !exceeds_limit {
+        assert_eq!(result.unwrap().schema().as_ref(), &deeply_nested_schema);
+        return Ok(());
+    }
     assert_result_error_with_message(
         result.as_ref(),
         concat!(
             "Schema error: Table schema is too deeply nested: decoding ",
-            "metaData.schemaString exceeded serde_json's ",
-            "recursion limit: recursion limit exceeded"
+            "metaData.schemaString reached the JSON recursion limit of 1000"
         ),
     );
-    let error = match result.unwrap_err() {
+    let delta_kernel::Error::Kernel(error) = result.unwrap_err() else {
+        panic!("expected a kernel error");
+    };
+    let error = match error {
         KernelError::Backtraced { source, .. } => *source,
         error => error,
     };
     assert!(matches!(error, KernelError::Schema(_)));
+    Ok(())
+}
+
+/// Persisted schemas use the field omission defaults while still requiring column-mapping
+/// annotations.
+#[rstest]
+#[case::no_mapping(None, None)]
+#[case::name_mapping(Some("name"), Some("delta.columnMapping.physicalName"))]
+#[case::id_mapping(Some("id"), Some("delta.columnMapping.physicalName"))]
+#[tokio::test]
+async fn snapshot_schema_without_field_metadata(
+    #[case] mapping_mode: Option<&str>,
+    #[case] expected_error: Option<&str>,
+    #[values(None, Some(false), Some(true))] nullable: Option<bool>,
+) -> delta_kernel::Result<()> {
+    let (store, engine, table_url) = engine_store_setup("schema_without_field_metadata", None);
+    let mut field = json!({"name": "value", "type": "long"});
+    if let Some(nullable) = nullable {
+        field["nullable"] = nullable.into();
+    }
+    let schema = json!({"type": "struct", "fields": [field]});
+    let configuration: HashMap<_, _> = mapping_mode
+        .map(|mode| ("delta.columnMapping.mode", mode))
+        .into_iter()
+        .collect();
+    let commit = [
+        json!({"protocol": {"minReaderVersion": 2, "minWriterVersion": 5}}),
+        json!({"metaData": {
+            "id": "schema-without-field-metadata",
+            "format": {"provider": "parquet", "options": {}},
+            "schemaString": schema.to_string(),
+            "partitionColumns": [],
+            "configuration": configuration,
+            "createdTime": 0
+        }}),
+    ]
+    .map(|action| action.to_string())
+    .join("\n");
+    add_commit(table_url.as_str(), store.as_ref(), 0, commit).await?;
+
+    let result = Snapshot::builder_for(table_url).build(&engine);
+    if let Some(expected_error) = expected_error {
+        assert_result_error_with_message(result, expected_error);
+    } else {
+        let snapshot = result?;
+        assert_eq!(snapshot.version(), 0);
+        let schema = snapshot.schema();
+        let field = schema.field("value").unwrap();
+        assert_eq!(field.data_type(), &DataType::LONG);
+        assert_eq!(field.is_nullable(), nullable.unwrap_or(true));
+        assert!(field.metadata().is_empty());
+    }
     Ok(())
 }
 
@@ -172,7 +237,7 @@ async fn deeply_nested_schema_snapshot_load_returns_schema_error() -> KernelResu
 #[case::unsupported_writer_only(SnapshotLoadProtocolCase {
     min_reader_version: 3,
     reader_features: &["deletionVectors"],
-    writer_features: &["deletionVectors", "generatedColumns"],
+    writer_features: &["deletionVectors", "identityColumns"],
     expected_error: None,
 })]
 #[case::future_reader_version(SnapshotLoadProtocolCase {
@@ -195,7 +260,7 @@ async fn snapshot_load_validates_reader_protocol(
     #[case] case: SnapshotLoadProtocolCase,
     #[values(false, true)] incremental: bool,
     #[values(false, true)] time_travel: bool,
-) -> KernelResult<()> {
+) -> delta_kernel::Result<()> {
     let (store, engine, table_url) = engine_store_setup("snapshot_feature_validation", None);
     create_table(
         table_url.as_str(),
@@ -259,7 +324,7 @@ async fn row_tracking_configuration_rejects_only_enabled_and_suspended(
     #[case] suspended: Option<bool>,
     #[case] expect_error: bool,
     #[values(false, true)] incremental: bool,
-) -> KernelResult<()> {
+) -> delta_kernel::Result<()> {
     let configuration: HashMap<_, _> = [
         ("delta.enableRowTracking", enabled),
         ("delta.rowTrackingSuspended", suspended),
@@ -308,7 +373,7 @@ async fn row_tracking_configuration_rejects_only_enabled_and_suspended(
 async fn built_as_latest_is_inherited_by_derived_snapshots(
     #[values(true, false)] base_snap_time_travel_to_latest: bool,
     #[values(TableKind::FileSystem, TableKind::CatalogManaged)] kind: TableKind,
-) -> KernelResult<()> {
+) -> delta_kernel::Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
     setup_multi_version_table(&engine, &table_path, kind).await?;
 
@@ -353,7 +418,7 @@ async fn built_as_latest_is_inherited_by_derived_snapshots(
 async fn built_as_latest_on_fresh_and_incremental_build(
     #[values(None, Some(1), Some(3))] time_travel_version: Option<Version>,
     #[values(TableKind::FileSystem, TableKind::CatalogManaged)] kind: TableKind,
-) -> KernelResult<()> {
+) -> delta_kernel::Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
     setup_multi_version_table(&engine, &table_path, kind).await?;
 

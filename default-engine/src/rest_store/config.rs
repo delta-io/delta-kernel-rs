@@ -134,7 +134,7 @@ impl RestEndpointConfig {
                         None => {
                             return Err(generic_error(format!(
                                 "list entry `{path}` is outside the configured prefix `{prefix}`"
-                            )))
+                            )));
                         }
                     },
                     None => path,

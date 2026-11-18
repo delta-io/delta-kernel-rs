@@ -1,9 +1,11 @@
 //! Existing-table transaction FFI lifecycle.
 
+use delta_kernel::Result;
 use delta_kernel::engine_data::FilteredEngineData;
 
 use super::committed::commit_result_to_committed_handle;
 use super::*;
+use crate::delta_types::FfiStringMap;
 
 /// A handle for an update-table transaction (`Transaction<UpdateTable>`).
 ///
@@ -138,7 +140,7 @@ fn update_table_txn_builder_build_with_committer_impl(
     builder: UpdateTableTransactionBuilder,
     extern_engine: &dyn ExternEngine,
     committer: Box<dyn Committer>,
-) -> KernelResult<Handle<ExclusiveUpdateTableTransaction>> {
+) -> Result<Handle<ExclusiveUpdateTableTransaction>> {
     let engine = extern_engine.engine();
     let transaction = builder.build(engine.as_ref(), committer);
     Ok(Box::new(transaction?).into())
@@ -355,6 +357,28 @@ pub unsafe extern "C" fn update_table_txn_builder_set_nullable(
     unsafe { result.into_extern_result(&engine) }
 }
 
+/// Adds or updates requested table properties from a borrowed string map. Repeated calls merge.
+///
+/// Copies keys and values before returning a replacement builder. Returns decoding errors here;
+/// property and final-state validation runs at build.
+///
+/// # Safety
+///
+/// All handles and nested string slices must be valid for this call. Borrows `properties` and
+/// `engine`, and unconditionally consumes `builder`, including on errors.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn update_table_txn_builder_with_table_properties_added(
+    builder: Handle<ExclusiveUpdateTableTransactionBuilder>,
+    properties: &FfiStringMap,
+    engine: Handle<SharedExternEngine>,
+) -> ExternResult<Handle<ExclusiveUpdateTableTransactionBuilder>> {
+    let builder = unsafe { *builder.into_inner() };
+    let engine = unsafe { engine.as_ref() };
+    let result = unsafe { properties.try_to_hash_map() }
+        .map(|properties| Box::new(builder.with_table_properties_added(properties)).into());
+    unsafe { result.into_extern_result(&engine) }
+}
+
 fn decode_single_field(schema: &EngineSchema) -> KernelResult<delta_kernel::schema::StructField> {
     let mut fields = decode_engine_schema(schema)?.into_fields();
     match (fields.next(), fields.next()) {
@@ -463,6 +487,7 @@ pub enum KernelUpdateTableOperation {
     Update = 4,
     Merge = 5,
     Optimize = 6,
+    Reorg = 7,
 }
 
 impl From<KernelUpdateTableOperation> for UpdateTableOperation {
@@ -475,6 +500,7 @@ impl From<KernelUpdateTableOperation> for UpdateTableOperation {
             KernelUpdateTableOperation::Update => Self::Update,
             KernelUpdateTableOperation::Merge => Self::Merge,
             KernelUpdateTableOperation::Optimize => Self::Optimize,
+            KernelUpdateTableOperation::Reorg => Self::Reorg,
         }
     }
 }

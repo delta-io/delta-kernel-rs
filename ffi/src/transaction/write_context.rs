@@ -15,9 +15,9 @@ use crate::error::{ExternResult, IntoExternResult};
 use crate::expressions::SharedExpression;
 use crate::handle::Handle;
 use crate::{
-    kernel_bytes_slice, kernel_string_slice, AllocateBytesFn, AllocateColumnNamesFn,
-    AllocateStringFn, KernelBytesSlice, KernelStringSlice, NullableCvoid, OptionalValue,
-    SharedExternEngine, SharedSchema, TryFromStringSlice, Url,
+    AllocateBytesFn, AllocateColumnNamesFn, AllocateStringFn, KernelBytesSlice, KernelStringSlice,
+    NullableCvoid, OptionalValue, SharedExternEngine, SharedSchema, TryFromStringSlice, Url,
+    kernel_bytes_slice, kernel_string_slice,
 };
 
 /// A [`BoundWriteContext`] that provides schema and path information needed for writing data.

@@ -3,13 +3,19 @@
 use std::sync::LazyLock;
 
 use super::utils::{
-    columns_and_types_from_schema, dv_id_at, validate_required_field_exist, DELETION_VECTOR_NAME,
-    OFFSET_NAME, PATH_OR_INLINE_DV_NAME, STORAGE_TYPE_NAME,
+    DELETION_VECTOR_NAME, OFFSET_NAME, PATH_OR_INLINE_DV_NAME, STORAGE_TYPE_NAME,
+    columns_and_types_from_schema, dv_id_at, validate_required_field_exist,
+    validate_row_tracking_metadata,
 };
-use super::{FileActionUniquenessValidator, StagedDataValidator, Validation};
+use super::{
+    FileActionUniquenessValidator, RowTrackingEnablement, StagedDataValidator, Validation,
+};
 use crate::engine_data::{FilteredEngineData, GetData, TypedGetData as _};
 use crate::expressions::column_name;
-use crate::scan::log_replay::{PATH_NAME, SIZE_NAME};
+use crate::scan::log_replay::{
+    BASE_ROW_ID_NAME, DEFAULT_ROW_COMMIT_VERSION_NAME, FILE_CONSTANT_VALUES_NAME, PATH_NAME,
+    SIZE_NAME,
+};
 use crate::scan::scan_row_schema;
 use crate::schema::ColumnNamesAndTypes;
 use crate::utils::require;
@@ -19,6 +25,8 @@ use crate::{KernelError, KernelResult};
 const PATH: usize = 0;
 const SIZE: usize = 1;
 const DELETION_VECTOR_STORAGE_TYPE: usize = 2;
+const BASE_ROW_ID: usize = 5;
+const DEFAULT_ROW_COMMIT_VERSION: usize = 6;
 
 static REMOVE_FILE_COLUMNS_FOR_VALIDATION: LazyLock<KernelResult<ColumnNamesAndTypes>> =
     LazyLock::new(|| {
@@ -28,6 +36,8 @@ static REMOVE_FILE_COLUMNS_FOR_VALIDATION: LazyLock<KernelResult<ColumnNamesAndT
             column_name!(DELETION_VECTOR_NAME, STORAGE_TYPE_NAME),
             column_name!(DELETION_VECTOR_NAME, PATH_OR_INLINE_DV_NAME),
             column_name!(DELETION_VECTOR_NAME, OFFSET_NAME),
+            column_name!(FILE_CONSTANT_VALUES_NAME, BASE_ROW_ID_NAME),
+            column_name!(FILE_CONSTANT_VALUES_NAME, DEFAULT_ROW_COMMIT_VERSION_NAME),
         ];
         columns_and_types_from_schema(&scan_row_schema(), names)
     });
@@ -38,13 +48,16 @@ static REMOVE_FILE_COLUMNS_FOR_VALIDATION: LazyLock<KernelResult<ColumnNamesAndT
 /// For example, this can detect a file staged for both removal and a DV update.
 pub(crate) fn validate_remove_files(
     removes: &[FilteredEngineData],
+    row_tracking_enablement: RowTrackingEnablement,
     uniqueness_validator: Option<&mut FileActionUniquenessValidator>,
 ) -> KernelResult<()> {
-    StagedDataValidator::for_remove_files(uniqueness_validator)?.validate_selected_rows(removes)
+    StagedDataValidator::for_remove_files(row_tracking_enablement, uniqueness_validator)?
+        .validate_selected_rows(removes)
 }
 
 impl<'a> StagedDataValidator<'a> {
     fn for_remove_files(
+        row_tracking_enablement: RowTrackingEnablement,
         uniqueness_validator: Option<&'a mut FileActionUniquenessValidator>,
     ) -> KernelResult<Self> {
         let columns = REMOVE_FILE_COLUMNS_FOR_VALIDATION
@@ -55,7 +68,9 @@ impl<'a> StagedDataValidator<'a> {
                 ))
             })?;
         let mut validations: Vec<Box<dyn Validation + 'a>> =
-            vec![Box::new(MandatoryRemoveFileValidation)];
+            vec![Box::new(MandatoryRemoveFileValidation {
+                row_tracking_enablement,
+            })];
         if let Some(uniqueness_validator) = uniqueness_validator {
             validations.push(Box::new(RemoveFileUniquenessValidation {
                 uniqueness_validator,
@@ -71,7 +86,9 @@ impl<'a> StagedDataValidator<'a> {
 ///
 /// The protocol defines `size` as optional, but kernel requires it because its `RemoveFile`
 /// actions currently come only from `AddFile` actions, which provide `size`.
-struct MandatoryRemoveFileValidation;
+struct MandatoryRemoveFileValidation {
+    row_tracking_enablement: RowTrackingEnablement,
+}
 
 impl Validation for MandatoryRemoveFileValidation {
     fn validate_row<'a>(
@@ -97,6 +114,14 @@ impl Validation for MandatoryRemoveFileValidation {
                 "RemoveFile for '{path}' has negative size {size}; size must be non-negative"
             ))
         );
+        if self.row_tracking_enablement == RowTrackingEnablement::Enabled {
+            validate_row_tracking_metadata(
+                path,
+                getters[BASE_ROW_ID].get_opt(row, BASE_ROW_ID_NAME)?,
+                getters[DEFAULT_ROW_COMMIT_VERSION]
+                    .get_opt(row, DEFAULT_ROW_COMMIT_VERSION_NAME)?,
+            )?;
+        }
         Ok(())
     }
 }
@@ -127,7 +152,7 @@ mod tests {
     use test_utils::{deletion_vector_array, replace_column};
 
     use super::*;
-    use crate::arrow::array::{new_null_array, ArrayRef, Int64Array, StringArray};
+    use crate::arrow::array::{ArrayRef, Int64Array, StringArray, new_null_array};
     use crate::arrow::compute::concat_batches;
     use crate::arrow::datatypes::Schema as ArrowSchema;
     use crate::arrow::record_batch::RecordBatch;
@@ -156,7 +181,15 @@ mod tests {
             names[DELETION_VECTOR_STORAGE_TYPE + 2],
             ColumnName::new([DELETION_VECTOR_NAME, OFFSET_NAME])
         );
-        assert_eq!(names.len(), 5);
+        assert_eq!(
+            names[BASE_ROW_ID],
+            ColumnName::new([FILE_CONSTANT_VALUES_NAME, BASE_ROW_ID_NAME])
+        );
+        assert_eq!(
+            names[DEFAULT_ROW_COMMIT_VERSION],
+            ColumnName::new([FILE_CONSTANT_VALUES_NAME, DEFAULT_ROW_COMMIT_VERSION_NAME])
+        );
+        assert_eq!(names.len(), 7);
     }
 
     #[rstest]
@@ -185,11 +218,13 @@ mod tests {
         } else {
             let batch =
                 nullable_staged_remove_files(&["same", "same"], &[Some("dv-1"), Some("dv-2")]);
-            vec![FilteredEngineData::try_new(
-                Box::new(ArrowEngineData::new(batch)),
-                selection_vector.to_vec(),
-            )
-            .expect("selection vector length should match staged RemoveFile row count")]
+            vec![
+                FilteredEngineData::try_new(
+                    Box::new(ArrowEngineData::new(batch)),
+                    selection_vector.to_vec(),
+                )
+                .expect("selection vector length should match staged RemoveFile row count"),
+            ]
         };
         let result = validate_remove_files(&removes);
 
@@ -337,6 +372,10 @@ mod tests {
 
     fn validate_remove_files(removes: &[FilteredEngineData]) -> KernelResult<()> {
         let mut uniqueness_validator = FileActionUniquenessValidator::default();
-        super::validate_remove_files(removes, Some(&mut uniqueness_validator))
+        super::validate_remove_files(
+            removes,
+            RowTrackingEnablement::Disabled,
+            Some(&mut uniqueness_validator),
+        )
     }
 }

@@ -7,7 +7,7 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
-use strum::EnumString;
+use strum::{Display, EnumString};
 use tracing::debug;
 use uuid::Uuid;
 
@@ -17,12 +17,12 @@ use crate::schema::{
     ArrayType, ColumnMetadataKey, ColumnName, DataType, ExistingColumnMappingAnnotations,
     MakePhysical, MapType, MetadataValue, Schema, StructField, StructType,
 };
-use crate::table_properties::{TableProperties, COLUMN_MAPPING_MODE};
-use crate::transforms::{transform_output_type, SchemaTransform};
+use crate::table_properties::{COLUMN_MAPPING_MODE, TableProperties};
+use crate::transforms::{SchemaTransform, transform_output_type};
 use crate::{KernelError, KernelResult};
 
 /// Modes of column mapping a table can be in
-#[derive(Debug, EnumString, Serialize, Deserialize, Copy, Clone, PartialEq, Eq)]
+#[derive(Debug, Display, EnumString, Serialize, Deserialize, Copy, Clone, PartialEq, Eq)]
 #[strum(serialize_all = "camelCase")]
 #[serde(rename_all = "camelCase")]
 pub enum ColumnMappingMode {
@@ -601,9 +601,7 @@ pub(crate) fn try_assign_flat_column_mapping_info(
         (Some(preserved_id), None) => {
             *max_id = (*max_id).max(preserved_id);
             new_field.metadata.insert(
-                ColumnMetadataKey::ColumnMappingPhysicalName
-                    .as_ref()
-                    .to_string(),
+                ColumnMetadataKey::ColumnMappingPhysicalName.as_ref().into(),
                 MetadataValue::String(format!("col-{}", Uuid::new_v4())),
             );
         }
@@ -611,7 +609,7 @@ pub(crate) fn try_assign_flat_column_mapping_info(
         (None, Some(_)) => {
             let new_id = next_column_mapping_id(max_id)?;
             new_field.metadata.insert(
-                ColumnMetadataKey::ColumnMappingId.as_ref().to_string(),
+                ColumnMetadataKey::ColumnMappingId.as_ref().into(),
                 MetadataValue::Number(new_id),
             );
         }
@@ -619,13 +617,11 @@ pub(crate) fn try_assign_flat_column_mapping_info(
         (None, None) => {
             let new_id = next_column_mapping_id(max_id)?;
             new_field.metadata.insert(
-                ColumnMetadataKey::ColumnMappingId.as_ref().to_string(),
+                ColumnMetadataKey::ColumnMappingId.as_ref().into(),
                 MetadataValue::Number(new_id),
             );
             new_field.metadata.insert(
-                ColumnMetadataKey::ColumnMappingPhysicalName
-                    .as_ref()
-                    .to_string(),
+                ColumnMetadataKey::ColumnMappingPhysicalName.as_ref().into(),
                 MetadataValue::String(format!("col-{}", Uuid::new_v4())),
             );
         }
@@ -780,9 +776,7 @@ fn expect_physical_name(field: &StructField) -> KernelResult<String> {
 /// Sets the collected nested ids on `field` under the `delta.columnMapping.nested.ids` key.
 fn insert_nested_field_ids_metadata(field: &mut StructField, ids: NestedFieldIds) {
     field.metadata.insert(
-        ColumnMetadataKey::ColumnMappingNestedIds
-            .as_ref()
-            .to_string(),
+        ColumnMetadataKey::ColumnMappingNestedIds.as_ref().into(),
         MetadataValue::Other(serde_json::Value::Object(ids)),
     );
 }
@@ -956,7 +950,7 @@ pub(crate) fn drop_column_mapping_metadata(schema: &StructType) -> StructType {
 /// Returns an error if the column name cannot be resolved in the schema, or if column mapping is
 /// enabled but any field in the path lacks the required
 /// [`ColumnMetadataKey::ColumnMappingPhysicalName`] or [`ColumnMetadataKey::ColumnMappingId`]
-/// annotations.
+/// annotations. A `file` column's sub-fields are exempt: they keep their own names.
 #[delta_kernel_derive::internal_api]
 pub(crate) fn get_any_level_column_physical_name(
     schema: &StructType,
@@ -966,7 +960,14 @@ pub(crate) fn get_any_level_column_physical_name(
     let fields = schema.fields_of_path(col_name)?;
     let physical_path: Vec<String> = fields
         .iter()
-        .map(|field| -> KernelResult<String> {
+        .enumerate()
+        .map(|(i, field)| -> KernelResult<String> {
+            // A `file` column's sub-fields carry no column mapping annotations; their names are
+            // fixed by the type and are the same in the logical and physical schemas.
+            let in_file = i > 0 && matches!(fields[i - 1].data_type(), DataType::File(_));
+            if in_file {
+                return Ok(field.name.clone());
+            }
             if column_mapping_mode != ColumnMappingMode::None {
                 if !field.has_physical_name_annotation() {
                     return Err(KernelError::Schema(format!(
@@ -1027,13 +1028,14 @@ mod tests {
     use std::collections::{HashMap, HashSet};
 
     use super::*;
-    use crate::expressions::{column_name, ColumnName};
+    use crate::expressions::{ColumnName, column_name};
     #[cfg(feature = "udt-in-dev")]
     use crate::schema::UserDefinedType;
-    use crate::schema::{schema, DataType, MetadataValue, StructField, StructType};
+    use crate::schema::{DataType, MetadataValue, StructField, StructType, schema};
     use crate::unit_test_utils::{
-        assert_result_error_with_message, column_mapping_physical_name_dedup_fixtures as fixtures,
-        test_deep_nested_schema_missing_leaf_cm, MockTableConfigurationBuilder,
+        MockTableConfigurationBuilder, assert_result_error_with_message,
+        column_mapping_physical_name_dedup_fixtures as fixtures,
+        test_deep_nested_schema_missing_leaf_cm,
     };
     use crate::utils::FoldWithOption as _;
 
@@ -1064,9 +1066,11 @@ mod tests {
             field.get_config_value(&ColumnMetadataKey::ColumnMappingId),
             Some(&MetadataValue::Number(1))
         );
-        assert!(field
-            .get_config_value(&ColumnMetadataKey::ColumnMappingNestedIds)
-            .is_none());
+        assert!(
+            field
+                .get_config_value(&ColumnMetadataKey::ColumnMappingNestedIds)
+                .is_none()
+        );
         let physical = field.make_physical(mode).unwrap();
         assert_ne!(physical.name(), "value");
         assert_eq!(physical.name(), field.physical_name(mode));
@@ -2497,6 +2501,25 @@ mod tests {
         assert_eq!(result.path().len(), 2);
     }
 
+    /// A `file` column's sub-fields have no column mapping annotations and keep their names.
+    #[test]
+    fn test_get_any_level_column_physical_name_file_sub_field() {
+        let schema = StructType::new_unchecked([make_cm_field("f", 1, DataType::file_type())]);
+        for mode in [ColumnMappingMode::Name, ColumnMappingMode::Id] {
+            let result =
+                get_any_level_column_physical_name(&schema, &column_name!("f.size"), mode).unwrap();
+            let physical = schema.field("f").unwrap().physical_name(mode).to_string();
+            assert_eq!(result, ColumnName::new([physical, "size".to_string()]));
+        }
+        let result = get_any_level_column_physical_name(
+            &schema,
+            &column_name!("f.size"),
+            ColumnMappingMode::None,
+        )
+        .unwrap();
+        assert_eq!(result, column_name!("f.size"));
+    }
+
     #[test]
     fn test_get_any_level_column_physical_name_errors() {
         let schema = schema! { not_null "a": INTEGER };
@@ -2658,10 +2681,12 @@ mod tests {
             ColumnMappingMode::None,
         );
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("not found in schema"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("not found in schema")
+        );
     }
 
     #[test]
@@ -2698,10 +2723,12 @@ mod tests {
             ColumnMappingMode::None,
         );
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("is not a struct type"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("is not a struct or `file` type")
+        );
     }
 
     // === find_max_column_id_in_schema tests ===
@@ -2709,7 +2736,7 @@ mod tests {
     fn field_with_id(name: &str, ty: impl Into<DataType>, id: i64) -> StructField {
         let mut f = StructField::nullable(name, ty);
         f.metadata.insert(
-            ColumnMetadataKey::ColumnMappingId.as_ref().to_string(),
+            ColumnMetadataKey::ColumnMappingId.as_ref().into(),
             MetadataValue::Number(id),
         );
         f
@@ -2797,9 +2824,7 @@ mod tests {
             1,
         );
         field.metadata.insert(
-            ColumnMetadataKey::ColumnMappingNestedIds
-                .as_ref()
-                .to_string(),
+            ColumnMetadataKey::ColumnMappingNestedIds.as_ref().into(),
             MetadataValue::Other(serde_json::json!({
                 "m.key":   2,
                 "m.value": 99,

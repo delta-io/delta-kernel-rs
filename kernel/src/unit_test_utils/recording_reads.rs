@@ -1,13 +1,14 @@
 //! Recording handlers for cancellation tests across adapter and snapshot read paths.
 
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use bytes::Bytes;
 use url::Url;
 
 use super::TestCancellationToken;
+use crate::engine::DelegatingEngine;
 use crate::engine::sync::SyncEngine;
-use crate::engine::test_delegating::DelegatingEngine;
 use crate::{
     CancellationTokenRef, Engine, EngineData, FileDataReadResultIterator, FileMeta, FileSize,
     FileSlice, FilteredEngineData, JsonHandler, KernelError, KernelResult, KernelResultIterator,
@@ -35,6 +36,8 @@ pub(crate) struct RecordingReads {
     pub(crate) expected_token: Option<CancellationTokenRef>,
     /// Read boundary that triggers cancellation, when configured.
     pub(crate) cancel_on: Option<Read>,
+    /// Time spent at the read boundary before triggering cancellation.
+    pub(crate) cancel_delay: Duration,
     /// Cancels the test token after each JSON iterator item.
     pub(crate) cancel_json_after_batch: bool,
     /// Read boundaries observed in call order.
@@ -50,6 +53,7 @@ impl RecordingReads {
             expected_token: Some(token.clone()),
             token,
             cancel_on,
+            cancel_delay: Duration::ZERO,
             cancel_json_after_batch: false,
             events: Mutex::new(Vec::new()),
         })
@@ -75,6 +79,7 @@ impl RecordingReads {
         }
         self.events.lock().unwrap().push(read);
         if self.cancel_on == Some(read) {
+            std::thread::sleep(self.cancel_delay);
             self.token.cancel();
             if token.is_none() {
                 return Err(KernelError::Cancelled);

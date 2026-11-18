@@ -24,10 +24,10 @@ endif()
 # Testing
 include(CTest)
 set(TestRunner "../../../tests/read-table-changes-testing/run_test.sh")
-set(DatPath "../../../../acceptance/tests/dat/out/reader_tests/generated")
+set(DatPath "../../../../acceptance/workloads/cdc_deletes")
 set(ExpectedPath "../../../tests/read-table-changes-testing/expected-data")
-add_test(NAME read_cdf_full COMMAND ${TestRunner} ${DatPath}/cdf/delta/ ${ExpectedPath}/cdf.expected)
-add_test(NAME read_cdf_from_v1 COMMAND ${TestRunner} ${DatPath}/cdf/delta/ ${ExpectedPath}/cdf-from-v1.expected -s 1)
-add_test(NAME read_cdf_v1_only COMMAND ${TestRunner} ${DatPath}/cdf/delta/ ${ExpectedPath}/cdf-v1-only.expected -s 1 -e 1)
-# v2 is the DELETE commit (4 rows of CDC data); exercises the CDC-file-only path.
-add_test(NAME read_cdf_v2_only COMMAND ${TestRunner} ${DatPath}/cdf/delta/ ${ExpectedPath}/cdf-v2-only.expected -s 2 -e 2)
+add_test(NAME read_cdf_full COMMAND ${TestRunner} ${DatPath}/delta/ ${ExpectedPath}/cdf.expected)
+add_test(NAME read_cdf_from_v1 COMMAND ${TestRunner} ${DatPath}/delta/ ${ExpectedPath}/cdf-from-v1.expected -s 1)
+add_test(NAME read_cdf_v1_only COMMAND ${TestRunner} ${DatPath}/delta/ ${ExpectedPath}/cdf-v1-only.expected -s 1 -e 1)
+# v1 inserts rows without CDC files; v2 deletes rows with a CDC file.
+add_test(NAME read_cdf_v2_only COMMAND ${TestRunner} ${DatPath}/delta/ ${ExpectedPath}/cdf-v2-only.expected -s 2 -e 2)

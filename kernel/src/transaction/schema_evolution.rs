@@ -12,14 +12,14 @@ use crate::schema::validation::validate_schema;
 use crate::schema::{ColumnMetadataKey, DataType, SchemaRef, StructField, StructType};
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::{
-    find_max_column_id_in_schema, schema_has_column_mapping_metadata,
-    strip_stray_column_mapping_metadata, try_assign_flat_column_mapping_info,
-    validate_column_mapping_id, ColumnMappingMode, TableFeature,
+    ColumnMappingMode, TableFeature, find_max_column_id_in_schema,
+    schema_has_column_mapping_metadata, strip_stray_column_mapping_metadata,
+    try_assign_flat_column_mapping_info, validate_column_mapping_id,
 };
 use crate::table_properties::COLUMN_MAPPING_MAX_COLUMN_ID;
-use crate::transforms::{transform_output_type, SchemaTransform};
+use crate::transforms::{SchemaTransform, transform_output_type};
 use crate::utils::FoldWithOption as _;
-use crate::KernelResult;
+use crate::{KernelResult, Result};
 
 /// A schema evolution operation to be applied to a table.
 ///
@@ -64,7 +64,9 @@ fn add_field(parent: &mut StructType, field: StructField, parent_path: String) -
             parent_path,
         )));
     }
-    parent.field_map_mut().insert(field.name().clone(), field);
+    parent
+        .field_map_mut()
+        .insert(field.name().clone(), Arc::new(field));
     Ok(())
 }
 
@@ -76,7 +78,7 @@ impl<'a> SchemaTransform<'a> for AddedFieldMetadataValidator {
     fn transform_struct_field(&mut self, field: &'a StructField) -> KernelResult<()> {
         if let Some(key) = field.metadata.keys().find(|key| {
             key.as_str() == ColumnMetadataKey::GenerationExpression.as_ref()
-                || key.starts_with("delta.identity.")
+                || key.as_str().starts_with("delta.identity.")
         }) {
             return Err(KernelError::schema(format!(
                 "Cannot add column '{}': metadata annotation '{}' is not supported",
@@ -99,7 +101,7 @@ fn set_field_nullable(parent: &mut StructType, name: &str) -> KernelResult<()> {
         .values_mut()
         .find(|parent| parent.name().to_lowercase() == name.to_lowercase())
         .ok_or_else(|| KernelError::schema(format!("field '{}' does not exist", name)))?;
-    parent.nullable = true;
+    Arc::make_mut(parent).nullable = true;
     Ok(())
 }
 
@@ -238,7 +240,7 @@ pub(crate) fn apply_schema_operations(
         Ordering::Less => {
             return Err(KernelError::internal_error(
                 "max column ID went backwards during schema evolution",
-            ))
+            ));
         }
     };
     Ok(SchemaEvolutionResult {
@@ -256,7 +258,7 @@ pub(crate) fn apply_schema_operations(
 pub(crate) fn evolve_table_config(
     table_config: &TableConfiguration,
     operations: Vec<SchemaOperation>,
-) -> KernelResult<TableConfiguration> {
+) -> Result<TableConfiguration> {
     let schema = Arc::unwrap_or_clone(table_config.logical_schema());
     let column_mapping_mode = table_config.column_mapping_mode();
     let current_max_column_id = table_config.table_properties().column_mapping_max_column_id;
@@ -306,10 +308,10 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
-    use crate::expressions::{column_name, ColumnName};
+    use crate::expressions::{ColumnName, column_name};
     use crate::schema::{
-        schema, ArrayType, ColumnMetadataKey, DataType, MapType, MetadataColumnSpec, MetadataValue,
-        StructField, StructType,
+        ArrayType, ColumnMetadataKey, DataType, MapType, MetadataColumnSpec, MetadataValue,
+        StructField, StructType, schema,
     };
 
     fn simple_schema() -> StructType {
@@ -564,18 +566,24 @@ mod tests {
         )),
         ColumnName::new(["value"]),
     )]
-    fn add_column_at_traverses_nested_types(
+    fn add_column_at_traverses_shared_nested_types_without_mutating_source(
         #[case] parent_type: DataType,
         #[case] parent_path: ColumnName,
     ) {
         let schema =
             StructType::try_new([StructField::nullable("container", parent_type)]).unwrap();
+        let expected_source = schema.clone();
+        let shared = schema.share_selected_fields(|_| true);
+        assert!(std::ptr::eq(
+            schema.field("container").unwrap(),
+            shared.field("container").unwrap()
+        ));
         let parent = column_name!("container").join(&parent_path);
         let operation =
             SchemaOperation::add_column(parent, StructField::nullable("added", DataType::INTEGER));
 
         let result = apply_schema_operations(
-            schema,
+            shared,
             vec![operation],
             ColumnMappingMode::None,
             None,
@@ -595,6 +603,7 @@ mod tests {
             parent.field("added"),
             Some(&StructField::nullable("added", DataType::INTEGER))
         );
+        assert_eq!(schema, expected_source);
     }
 
     /// Second op may target a struct created by the first; under CM, max ID advances across both.
@@ -649,12 +658,23 @@ mod tests {
         deeply_nested_required_schema(),
         column_name!("address.location.zipcode")
     )]
-    fn set_nullable_succeeds(#[case] schema: StructType, #[case] column: ColumnName) {
+    fn set_nullable_on_shared_fields_preserves_source(
+        #[case] schema: StructType,
+        #[case] column: ColumnName,
+    ) {
+        let expected_source = schema.clone();
+        let shared = schema.share_selected_fields(|_| true);
+        assert!(
+            schema
+                .fields()
+                .zip(shared.fields())
+                .all(|(source, retained)| std::ptr::eq(source, retained))
+        );
         let ops = vec![SchemaOperation::SetNullable {
             column: column.clone(),
         }];
         let result = apply_schema_operations(
-            schema,
+            shared,
             ops,
             ColumnMappingMode::None,
             None,
@@ -662,6 +682,7 @@ mod tests {
         )
         .unwrap();
         assert!(result.schema.field_at_path(column.path()).is_nullable());
+        assert_eq!(schema, expected_source);
     }
 
     #[rstest]
@@ -963,7 +984,7 @@ mod tests {
     fn field_with_id_only(name: &str, ty: DataType, id: i64) -> StructField {
         let mut f = StructField::nullable(name, ty);
         f.metadata.insert(
-            ColumnMetadataKey::ColumnMappingId.as_ref().to_string(),
+            ColumnMetadataKey::ColumnMappingId.as_ref().into(),
             MetadataValue::Number(id),
         );
         f
@@ -999,9 +1020,7 @@ mod tests {
     fn add_column_with_only_physical_name_allocates_id() {
         let mut field = StructField::nullable("named", DataType::STRING);
         field.metadata.insert(
-            ColumnMetadataKey::ColumnMappingPhysicalName
-                .as_ref()
-                .to_string(),
+            ColumnMetadataKey::ColumnMappingPhysicalName.as_ref().into(),
             MetadataValue::String("user-supplied-name".to_string()),
         );
         let ops = vec![SchemaOperation::add_column(None, field)];
@@ -1054,7 +1073,7 @@ mod tests {
     fn add_column_with_wrong_typed_id_is_rejected() {
         let mut field = StructField::nullable("bad", DataType::STRING);
         field.metadata.insert(
-            ColumnMetadataKey::ColumnMappingId.as_ref().to_string(),
+            ColumnMetadataKey::ColumnMappingId.as_ref().into(),
             MetadataValue::String("not-a-number".to_string()),
         );
         let ops = vec![SchemaOperation::add_column(None, field)];
@@ -1080,7 +1099,7 @@ mod tests {
     fn stale_max_column_id_is_self_healed_by_schema_walk() {
         let mut existing = StructField::nullable("existing", DataType::STRING);
         existing.metadata.insert(
-            ColumnMetadataKey::ColumnMappingId.as_ref().to_string(),
+            ColumnMetadataKey::ColumnMappingId.as_ref().into(),
             MetadataValue::Number(42),
         );
         let schema = schema! {

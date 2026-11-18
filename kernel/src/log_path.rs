@@ -2,7 +2,7 @@
 
 use url::Url;
 
-use crate::path::{ParsedLogPath, DELTA_LOG_DIR_WITH_SLASH, STAGED_COMMITS_DIR};
+use crate::path::{DELTA_LOG_DIR_WITH_SLASH, ParsedLogPath, STAGED_COMMITS_DIR};
 use crate::utils::require;
 use crate::{FileMeta, FileSize, KernelError, KernelResult, Version};
 

@@ -132,7 +132,7 @@ impl SchemaComparison for StructType {
         let lowercase_field_map: HashMap<String, &StructField> = self
             .fields
             .iter()
-            .map(|(name, field)| (name.to_lowercase(), field))
+            .map(|(name, field)| (name.to_lowercase(), field.as_ref()))
             .collect();
         require!(
             lowercase_field_map.len() == self.fields.len(),
@@ -230,7 +230,7 @@ mod tests {
 
     use crate::schema::compare::{Error, SchemaComparison, SchemaComparisonResult};
     use crate::schema::{
-        schema, ArrayType, CheckpointFieldKind, DataType, MapType, PrimitiveType, StructField,
+        ArrayType, CheckpointFieldKind, DataType, MapType, PrimitiveType, StructField, schema,
     };
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]

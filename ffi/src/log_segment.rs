@@ -5,8 +5,8 @@ use delta_kernel::log_segment::LogSegment;
 use crate::handle::Handle;
 use crate::log_path::{FfiLogPath, LogPathArray};
 use crate::{
-    kernel_string_slice, optional_pointer, FfiSlice, KernelStringSlice, NullableCvoid,
-    OptionalValue, SharedSnapshot,
+    FfiSlice, KernelStringSlice, NullableCvoid, OptionalValue, SharedSnapshot, kernel_string_slice,
+    optional_pointer,
 };
 
 /// The files and publication state retained by a snapshot's log segment.
@@ -52,7 +52,7 @@ pub type LogSegmentVisitor = extern "C" fn(context: NullableCvoid, segment: *con
 ///
 /// `snapshot` must be a valid handle for the entire call. The callback must not free or consume
 /// the snapshot, retain borrowed pointers, or unwind across the FFI boundary.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn snapshot_log_segment(
     snapshot: Handle<SharedSnapshot>,
     context: NullableCvoid,
@@ -102,17 +102,23 @@ fn visit(segment: &LogSegment, context: NullableCvoid, visitor: LogSegmentVisito
 
 #[cfg(all(test, feature = "default-engine-base"))]
 mod tests {
+    use std::collections::HashMap;
     use std::ptr::NonNull;
     use std::sync::Arc;
 
+    use delta_kernel::actions::{Metadata, Protocol};
+    use delta_kernel::log_segment_files::LogSegmentFiles;
     use delta_kernel::path::ParsedLogPath;
+    use delta_kernel::schema::schema_ref;
     use delta_kernel::snapshot::Snapshot;
+    use delta_kernel::table_configuration::TableConfiguration;
+    use delta_kernel::table_features::TableFeature;
     use delta_kernel::{LogPath, Version};
-    use test_utils::table_builder::{LogState, TestTableBuilder};
-    use test_utils::{compacted_log_path_for_versions, create_log_path};
+    use test_utils::{compacted_log_path_for_versions, create_log_path, delta_path_for_version};
+    use url::Url;
 
     use super::*;
-    use crate::{free_snapshot, TryFromStringSlice};
+    use crate::{TryFromStringSlice, free_snapshot};
 
     #[derive(Default)]
     struct CapturedLogSegment {
@@ -163,42 +169,11 @@ mod tests {
         #[case] staged_and_compacted: bool,
         #[case] absent_metadata: bool,
     ) {
-        let table = TestTableBuilder::new()
-            .with_log_state(
-                LogState::with_latest_version(3)
-                    .with_checkpoint_at(checkpoint)
-                    .with_crc_at([2]),
-            )
-            .with_data(1, 1)
-            .build()
-            .unwrap();
-        let source = Snapshot::builder_for(table.table_root())
-            .build(&table.engine())
-            .unwrap();
-        let mut files = source.log_segment().listed.clone();
-        if staged_and_compacted {
-            let last = files.ascending_commit_files.last_mut().unwrap();
-            last.location.location = source
-                .table_root()
-                .join("_delta_log/_staged_commits/00000000000000000003.550e8400-e29b-41d4-a716-446655440000.json")
-                .unwrap();
-            *last = ParsedLogPath::new(last.location.clone()).unwrap();
-            files.latest_commit_file = Some(last.clone());
-            files.ascending_compaction_files.push(
-                create_log_path(
-                    source.table_root(),
-                    compacted_log_path_for_versions(0, 1, "json"),
-                )
-                .into(),
-            );
-            // Publication does not require rewriting retained staged paths.
-            files.max_published_version = Some(3);
-        }
-        if absent_metadata {
-            files.latest_commit_file = None;
-            files.latest_crc_file = None;
-            files.max_published_version = None;
-        }
+        let snapshot =
+            snapshot_with_fake_log_segment(checkpoint, staged_and_compacted, absent_metadata);
+        let segment = snapshot.log_segment();
+        let root = segment.log_root.clone();
+        let files = &segment.listed;
         let expected_file = |path: &ParsedLogPath| LogPath::try_new(path.location.clone()).unwrap();
         let expected_commits: Vec<_> = files
             .ascending_commit_files
@@ -215,12 +190,6 @@ mod tests {
         let expected_latest = files.latest_commit_file.as_ref().map(expected_file);
         let expected_crc = files.latest_crc_file.as_ref().map(expected_file);
         let expected_published = files.max_published_version;
-        let root = source.log_segment().log_root.clone();
-        let snapshot = Snapshot::new(
-            LogSegment::try_new(files, root.clone(), Some(3), None).unwrap(),
-            source.table_configuration().clone(),
-        )
-        .unwrap();
         let snapshot: Handle<SharedSnapshot> = Arc::new(snapshot).into();
         let mut captured = CapturedLogSegment::default();
         unsafe {
@@ -233,8 +202,6 @@ mod tests {
             assert_eq!(snapshot.as_ref().version(), 3);
             free_snapshot(snapshot);
         }
-        drop(source);
-        drop(table);
         assert_eq!(captured.visits, 1);
         assert_eq!(captured.root, root.as_str());
         assert_eq!(captured.version, 3);
@@ -245,5 +212,97 @@ mod tests {
         assert_eq!(captured.latest_commit, expected_latest);
         assert_eq!(captured.latest_crc, expected_crc);
         assert_eq!(captured.published, expected_published);
+    }
+
+    /// Builds a version-3 snapshot from fake log file metadata. It writes and reads no files.
+    ///
+    /// Don't build this snapshot with `TestTableBuilder`. Even with in-memory storage, Miri
+    /// interprets every commit, Parquet file, checkpoint, and CRC it writes, and the snapshot load
+    /// that reads them back, turning seconds of Miri time into minutes. `snapshot_log_segment`
+    /// reads only file metadata the snapshot already holds, so none of that work reaches the
+    /// `unsafe` FFI code Miri checks.
+    fn snapshot_with_fake_log_segment(
+        checkpoint: Option<Version>,
+        staged_and_compacted: bool,
+        absent_metadata: bool,
+    ) -> Snapshot {
+        let table_root = Url::parse("memory:///retained/").unwrap();
+        let fake_log_file = |version, suffix| -> ParsedLogPath {
+            let mut file: ParsedLogPath =
+                create_log_path(table_root.as_str(), delta_path_for_version(version, suffix))
+                    .into();
+            let kind = match suffix {
+                "json" => 0,
+                "checkpoint.parquet" => 1,
+                "crc" => 2,
+                _ => panic!("unexpected fixture suffix: {suffix}"),
+            };
+            // Give each file a unique size and timestamp so the test catches an export that
+            // reports another file's values.
+            let file_id = version * 10 + kind;
+            file.location.size = 100 + file_id;
+            file.location.last_modified = 1_000 + i64::try_from(file_id).unwrap();
+            file
+        };
+        let mut files = LogSegmentFiles {
+            ascending_commit_files: (checkpoint.map_or(0, |version| version + 1)..=3)
+                .map(|version| fake_log_file(version, "json"))
+                .collect(),
+            checkpoint_parts: checkpoint
+                .map(|version| fake_log_file(version, "checkpoint.parquet"))
+                .into_iter()
+                .collect(),
+            latest_commit_file: Some(fake_log_file(3, "json")),
+            // `LogSegment::try_new` rejects a CRC older than the checkpoint.
+            latest_crc_file: checkpoint
+                .is_none_or(|version| version <= 2)
+                .then(|| fake_log_file(2, "crc")),
+            max_published_version: Some(3),
+            ..Default::default()
+        };
+        if staged_and_compacted {
+            // Model a catalog log tail that still supplies staged v3 after v3.json is published.
+            // The segment marks v3 as published but keeps the staged path, which the export must
+            // report unchanged.
+            let last = files.ascending_commit_files.last_mut().unwrap();
+            last.location.location = table_root
+                .join("_delta_log/_staged_commits/00000000000000000003.550e8400-e29b-41d4-a716-446655440000.json")
+                .unwrap();
+            *last = ParsedLogPath::new(last.location.clone()).unwrap();
+            files.latest_commit_file = Some(last.clone());
+            let mut compaction: ParsedLogPath = create_log_path(
+                table_root.as_str(),
+                compacted_log_path_for_versions(0, 1, "json"),
+            )
+            .into();
+            // File ID 40 is above every ID `fake_log_file` assigns (at most 32), so this
+            // compaction file's size and timestamp stay unique.
+            compaction.location.size = 140;
+            compaction.location.last_modified = 1_040;
+            files.ascending_compaction_files.push(compaction);
+        }
+        if absent_metadata {
+            files.latest_commit_file = None;
+            files.latest_crc_file = None;
+            files.max_published_version = None;
+        }
+        let root = table_root.join("_delta_log/").unwrap();
+        let metadata = Metadata::try_new(
+            None,
+            None,
+            schema_ref! { nullable "id": INTEGER },
+            vec![],
+            0,
+            HashMap::new(),
+        )
+        .unwrap();
+        let protocol =
+            Protocol::try_new(1, 2, None::<Vec<TableFeature>>, None::<Vec<TableFeature>>).unwrap();
+        let configuration = TableConfiguration::try_new(metadata, protocol, table_root, 3).unwrap();
+        Snapshot::new(
+            LogSegment::try_new(files, root.clone(), Some(3), None).unwrap(),
+            configuration,
+        )
+        .unwrap()
     }
 }

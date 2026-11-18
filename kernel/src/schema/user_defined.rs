@@ -8,7 +8,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use super::file_utils::UsesFile;
 use super::{DataType, StructField};
-use crate::transforms::{transform_output_type, SchemaTransform};
+use crate::transforms::{SchemaTransform, transform_output_type};
 use crate::{KernelError, KernelResult};
 
 /// An engine-defined annotation over a physical Delta type.
@@ -173,15 +173,15 @@ fn contains_metadata_column(data_type: &DataType) -> bool {
 #[cfg(test)]
 mod tests {
     use rstest::rstest;
-    use serde_json::{json, Value};
+    use serde_json::{Value, json};
 
     use super::*;
-    use crate::schema::compare::{Error as ComparisonError, SchemaComparison};
-    use crate::schema::{schema, ArrayType, MapType, StructField};
-    use crate::table_changes::CdfMode;
-    use crate::transforms::{transform_output_type, SchemaTransform};
     #[cfg(feature = "declarative-plans")]
     use crate::PlanBuilder;
+    use crate::schema::compare::{Error as ComparisonError, SchemaComparison};
+    use crate::schema::{ArrayType, MapType, StructField, schema};
+    use crate::table_changes::CdfMode;
+    use crate::transforms::{SchemaTransform, transform_output_type};
 
     #[rstest]
     #[case(json!({"type":"udt", "sqlType":"long"}))]
@@ -484,10 +484,12 @@ mod tests {
     #[case::nested(schema! { nullable "f": (DataType::file_type()) }.into())]
     #[case::array_element(ArrayType::new(DataType::file_type(), true).into())]
     fn construction_rejects_file(#[case] sql_type: DataType) {
-        assert!(UserDefinedType::try_new(sql_type, HashMap::new())
-            .unwrap_err()
-            .to_string()
-            .contains("must not contain a `file`"));
+        assert!(
+            UserDefinedType::try_new(sql_type, HashMap::new())
+                .unwrap_err()
+                .to_string()
+                .contains("must not contain a `file`")
+        );
     }
 
     #[test]

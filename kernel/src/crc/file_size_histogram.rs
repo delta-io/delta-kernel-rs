@@ -142,7 +142,7 @@ impl FileSizeHistogram {
             ))
         );
         require!(
-            sorted_bin_boundaries.windows(2).all(|w| w[0] < w[1]),
+            sorted_bin_boundaries.array_windows().all(|[a, b]| a < b),
             KernelError::internal_error(
                 "sorted_bin_boundaries must be sorted in strictly ascending order"
             )
@@ -225,6 +225,18 @@ impl FileSizeHistogram {
         self.file_counts[idx] -= 1;
         self.total_bytes[idx] -= file_size;
         Ok(())
+    }
+
+    /// Adds each source bin, allowing negative results while building a delta.
+    /// Both histograms must have the same bin boundaries.
+    pub(crate) fn accumulate(&mut self, source: &Self) {
+        debug_assert_eq!(self.sorted_bin_boundaries, source.sorted_bin_boundaries);
+        for (target, source) in self.file_counts.iter_mut().zip(&source.file_counts) {
+            *target += source;
+        }
+        for (target, source) in self.total_bytes.iter_mut().zip(&source.total_bytes) {
+            *target += source;
+        }
     }
 
     /// Applies a delta histogram element-wise to this histogram. Both must have the same bin

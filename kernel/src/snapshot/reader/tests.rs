@@ -6,11 +6,11 @@ use rstest::rstest;
 
 use super::super::snapshot_crc::SnapshotCrc;
 use crate::crc::{DomainMetadataState, SetTransactionState};
-use crate::engine::sync::SyncEngine;
 use crate::engine::CancellableEngine;
+use crate::engine::sync::SyncEngine;
 use crate::metrics::MetricEvent;
 use crate::unit_test_utils::{
-    install_thread_local_metrics_reporter, CapturingReporter, TestCancellationToken,
+    CapturingReporter, TestCancellationToken, install_thread_local_metrics_reporter,
 };
 use crate::{CancellationTokenRef, KernelError, Snapshot};
 
@@ -133,10 +133,12 @@ fn reader_no_io_getters_can_succeed_after_cancellation() {
     ) as CancellationTokenRef);
     assert_eq!(reader.get_timestamp(&engine).unwrap(), expected);
     assert_eq!(reader.get_in_commit_timestamp(&engine).unwrap(), None);
-    assert!(reader
-        .get_clustering_column_infos(&engine)
-        .unwrap()
-        .is_none());
+    assert!(
+        reader
+            .get_clustering_column_infos(&engine)
+            .unwrap()
+            .is_none()
+    );
     assert_eq!(
         reader.get_physical_clustering_columns(&engine).unwrap(),
         None

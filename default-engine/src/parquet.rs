@@ -11,10 +11,11 @@ use delta_kernel::arrow::datatypes::{DataType, Field, Schema};
 use delta_kernel::engine::arrow_conversion::{TryFromArrow as _, TryIntoArrow as _};
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::engine::arrow_utils::{
-    fixup_parquet_read, ordering_needs_row_indexes, parquet_read_plan, RowIndexBuilder,
+    RowIndexBuilder, fixup_parquet_read, ordering_needs_row_indexes, parquet_read_plan,
+    validate_file_values_for_write,
 };
 use delta_kernel::engine::parquet_row_group_skipping::ParquetRowGroupSkipping;
-use delta_kernel::engine::{reader_options, writer_options};
+use delta_kernel::engine::{data_file_writer_options, reader_options, writer_options};
 use delta_kernel::expressions::ColumnName;
 use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::{DynObjectStore, ObjectStoreExt as _};
@@ -28,7 +29,7 @@ use delta_kernel::parquet::arrow::async_reader::ParquetRecordBatchStreamBuilder;
 use delta_kernel::parquet::arrow::async_writer::AsyncArrowWriter;
 #[allow(deprecated)]
 use delta_kernel::parquet::arrow::async_writer::ParquetObjectWriter;
-use delta_kernel::schema::{DataType as KernelDataType, SchemaRef, StructType};
+use delta_kernel::schema::{SchemaRef, StructType};
 use delta_kernel::transaction::BoundWriteContext;
 use delta_kernel::{
     CancellationTokenRef, EngineData, FileDataReadResultIterator, FileMeta, FileSize,
@@ -39,10 +40,10 @@ use futures::stream::{self, BoxStream};
 use futures::{StreamExt, TryStreamExt};
 use uuid::Uuid;
 
+use crate::UrlExt;
 use crate::executor::TaskExecutor;
 use crate::file_stream::{FileOpenFuture, FileOpener, FileStream};
 use crate::stats::collect_stats;
-use crate::UrlExt;
 
 #[derive(Debug)]
 pub struct DefaultParquetHandler<E: TaskExecutor> {
@@ -197,24 +198,17 @@ impl<E: TaskExecutor> DefaultParquetHandler<E> {
         stats_columns: &[ColumnName],
         physical_schema: &StructType,
     ) -> KernelResult<DataFileMetadata> {
-        if let Some(column) = find_file_column(physical_schema) {
-            return Err(KernelError::unsupported(format!(
-                "The default Parquet writer does not support writing `file` column '{column}'."
-            )));
-        }
-
         let batch: Box<_> = ArrowEngineData::try_from_engine_data(data)?;
         let record_batch = batch.record_batch();
+        validate_file_values_for_write(record_batch, physical_schema)?;
 
         // Collect statistics before writing (includes numRecords)
         let stats = collect_stats(record_batch, stats_columns, physical_schema)?;
 
+        let options = data_file_writer_options(&record_batch.schema(), physical_schema)?;
         let mut buffer = vec![];
-        let mut writer = ArrowWriter::try_new_with_options(
-            &mut buffer,
-            record_batch.schema(),
-            writer_options(),
-        )?;
+        let mut writer =
+            ArrowWriter::try_new_with_options(&mut buffer, record_batch.schema(), options)?;
         writer.write(record_batch)?;
         writer.close()?; // writer must be closed to write footer
 
@@ -271,34 +265,6 @@ impl<E: TaskExecutor> DefaultParquetHandler<E> {
             .await?;
         super::build_add_file_metadata(file_metadata, write_context)
     }
-}
-
-/// Returns the path of the first `file` column in `schema`, including one nested in a struct,
-/// array, or map.
-fn find_file_column(schema: &StructType) -> Option<ColumnName> {
-    fn visit_struct(struct_type: &StructType, path: &mut Vec<String>) -> bool {
-        struct_type.fields().any(|field| {
-            path.push(field.name().clone());
-            let found = visit(field.data_type(), path);
-            if !found {
-                path.pop();
-            }
-            found
-        })
-    }
-    fn visit(data_type: &KernelDataType, path: &mut Vec<String>) -> bool {
-        match data_type {
-            KernelDataType::File(_) => true,
-            KernelDataType::Struct(struct_type) => visit_struct(struct_type, path),
-            KernelDataType::Array(array) => visit(array.element_type(), path),
-            KernelDataType::Map(map) => {
-                visit(map.key_type(), path) || visit(map.value_type(), path)
-            }
-            _ => false,
-        }
-    }
-    let mut path = Vec::new();
-    visit_struct(schema, &mut path).then(|| ColumnName::new(path))
 }
 
 /// Internal async implementation of read_parquet_files
@@ -633,10 +599,11 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use bytes::Bytes;
+    use delta_kernel::EngineData;
     use delta_kernel::actions::{NUM_RECORDS, TIGHT_BOUNDS};
     use delta_kernel::arrow::array::{
         Array, AsArray, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float32Array,
-        Float64Array, Int16Array, Int32Array, Int64Array, Int8Array, RecordBatch, StringArray,
+        Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, RecordBatch, StringArray,
         TimestampMicrosecondArray,
     };
     use delta_kernel::arrow::compute::cast;
@@ -645,7 +612,7 @@ mod tests {
     };
     use delta_kernel::engine::arrow_conversion::TryIntoKernel as _;
     use delta_kernel::engine::arrow_data::ArrowEngineData;
-    use delta_kernel::expressions::{col, lit, Predicate, Scalar};
+    use delta_kernel::expressions::{Predicate, Scalar, expr};
     use delta_kernel::object_store::local::LocalFileSystem;
     use delta_kernel::object_store::memory::InMemory;
     use delta_kernel::object_store::{
@@ -654,10 +621,8 @@ mod tests {
     };
     use delta_kernel::parquet::arrow::{ARROW_SCHEMA_META_KEY, PARQUET_FIELD_ID_META_KEY};
     use delta_kernel::schema::{
-        schema, schema_ref, ArrayType, ColumnMetadataKey, DataType, MapType, MetadataValue,
-        StructField, StructType,
+        ColumnMetadataKey, DataType, MetadataValue, StructField, StructType, schema, schema_ref,
     };
-    use delta_kernel::EngineData;
     use delta_kernel_default_engine_test_utils::{
         assert_result_error_with_message, current_time_ms,
         try_into_record_batch as into_record_batch,
@@ -670,11 +635,14 @@ mod tests {
         test_parquet_handler_write_always_overwrites,
         test_parquet_handler_write_omits_arrow_schema,
     };
+    use test_utils::record_batch_to_bytes;
     use url::Url;
+    use wiremock::matchers::{method, path, query_param};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use super::*;
-    use crate::executor::tokio::TokioBackgroundExecutor;
     use crate::DEFAULT_BATCH_SIZE;
+    use crate::executor::tokio::TokioBackgroundExecutor;
 
     fn long_schema(name: &str) -> StructType {
         schema! { nullable (name): LONG }
@@ -930,6 +898,64 @@ mod tests {
         assert_eq!(data[0].num_rows(), 10);
     }
 
+    #[tokio::test]
+    async fn test_read_presigned_parquet_preserves_query_and_batches() {
+        let physical_schema = Arc::new(long_schema("value"));
+        let expected = RecordBatch::try_new(
+            Arc::new(physical_schema.as_ref().try_into_arrow().unwrap()),
+            vec![Arc::new(Int64Array::from(vec![
+                Some(1),
+                None,
+                Some(3),
+                Some(4),
+                Some(5),
+            ]))],
+        )
+        .unwrap();
+        let bytes = record_batch_to_bytes(&expected);
+        let file_size = bytes.len() as u64;
+
+        // HTTP and HTTPS select the same presigned-URL branch; HTTP avoids local TLS setup.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/data.parquet"))
+            .and(query_param("X-Amz-Signature", "test-signature"))
+            .and(query_param("X-Amz-Security-Token", "test/token+value="))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(bytes))
+            .expect(2)
+            .mount(&server)
+            .await;
+        let mut url = Url::parse(&format!("{}/data.parquet", server.uri())).unwrap();
+        url.query_pairs_mut()
+            .append_pair("X-Amz-Signature", "test-signature")
+            .append_pair("X-Amz-Security-Token", "test/token+value=");
+        let files = [FileMeta::new(url, 0, file_size)];
+
+        let handler = DefaultParquetHandler::new(
+            Arc::new(InMemory::new()),
+            Arc::new(TokioBackgroundExecutor::new()),
+        )
+        .with_batch_size(NonZero::new(2).unwrap());
+        let data: Vec<RecordBatch> = handler
+            .read_parquet_files(&files, physical_schema.clone(), None)
+            .unwrap()
+            .map(into_record_batch)
+            .try_collect()
+            .unwrap();
+
+        assert_eq!(
+            data,
+            vec![
+                expected.slice(0, 2),
+                expected.slice(2, 2),
+                expected.slice(4, 1)
+            ]
+        );
+        let footer = handler.read_parquet_footer(&files[0]).unwrap();
+        assert_eq!(footer.schema, physical_schema);
+        server.verify().await;
+    }
+
     #[rstest::rstest]
     #[case::millis(
         TimeUnit::Millisecond,
@@ -1020,10 +1046,9 @@ mod tests {
         );
 
         let predicate = lower_bound_us.map(|bound| {
-            Arc::new(Predicate::gt(
-                col!("ts_ntz"),
-                lit(Scalar::TimestampNtz(bound)),
-            ))
+            Arc::new(Predicate::from_expr(expr!(
+                col("ts_ntz") > lit(Scalar::TimestampNtz(bound))
+            )))
         });
         let data: Vec<RecordBatch> = handler
             .read_parquet_files(
@@ -1224,60 +1249,6 @@ mod tests {
 
         assert_eq!(data.len(), 1);
         assert_eq!(data[0].num_rows(), 3);
-    }
-
-    /// The default writer refuses a `file` column wherever it appears, and writes nothing.
-    #[rstest::rstest]
-    #[case::top_level(schema! { nullable "f": (DataType::file_type()) }, "f")]
-    #[case::in_struct(schema! { nullable "s": { nullable "f": (DataType::file_type()) } }, "s.f")]
-    #[case::array_element(
-        StructType::new_unchecked([StructField::nullable(
-            "a",
-            ArrayType::new(DataType::file_type(), true),
-        )]),
-        "a"
-    )]
-    #[case::map_value(
-        StructType::new_unchecked([StructField::nullable(
-            "m",
-            MapType::new(DataType::STRING, DataType::file_type(), true),
-        )]),
-        "m"
-    )]
-    #[tokio::test]
-    async fn test_write_parquet_rejects_file_column(
-        #[case] physical_schema: StructType,
-        #[case] column: &str,
-    ) {
-        let store = Arc::new(InMemory::new());
-        let parquet_handler =
-            DefaultParquetHandler::new(store.clone(), Arc::new(TokioBackgroundExecutor::new()));
-        let data = Box::new(ArrowEngineData::new(
-            RecordBatch::try_from_iter(vec![(
-                "a",
-                Arc::new(Int64Array::from(vec![1])) as Arc<dyn Array>,
-            )])
-            .unwrap(),
-        ));
-
-        let error = parquet_handler
-            .write_parquet(
-                &Url::parse("memory:///data/").unwrap(),
-                data,
-                &[],
-                &physical_schema,
-            )
-            .await
-            .unwrap_err()
-            .to_string();
-
-        assert!(
-            error.contains(&format!(
-                "does not support writing `file` column '{column}'"
-            )),
-            "got: {error}"
-        );
-        assert!(store.list(None).next().await.is_none());
     }
 
     #[tokio::test]
@@ -1683,9 +1654,11 @@ mod tests {
             .unwrap();
         assert_eq!(timestamp_col.value(0), 1609459200000000i64);
         assert_eq!(timestamp_col.value(4), 1609804800000000i64);
-        assert!(timestamp_col
-            .timezone()
-            .is_some_and(|tz| tz.eq_ignore_ascii_case("utc")));
+        assert!(
+            timestamp_col
+                .timezone()
+                .is_some_and(|tz| tz.eq_ignore_ascii_case("utc"))
+        );
         col_idx += 1;
 
         // Verify timestamp_ntz column (without timezone)

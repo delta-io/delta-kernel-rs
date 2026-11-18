@@ -189,7 +189,7 @@ impl Container {
         // Sparse values must be strictly ascending. This guarantees uniqueness -- so `count` cannot
         // over-count and let a malformed body slip past the cardinality check -- and upholds the
         // ascending-order contract of `MumblingBitmap::iter`.
-        if values.windows(2).any(|w| w[0] >= w[1]) {
+        if values.array_windows().any(|[a, b]| a >= b) {
             return Err(KernelError::generic(
                 "Mumbling sparse container values are not strictly ascending",
             ));

@@ -1,4 +1,5 @@
-use super::MetadataPlanner;
+use std::sync::Arc;
+
 use crate::actions::Add;
 use crate::checkpoint::CheckpointShape;
 use crate::{Engine, KernelResult, Snapshot, Version};
@@ -10,17 +11,13 @@ pub(in crate::scan) enum MetadataReplayBase {
     /// Checkpoint replay base, or an empty base when no checkpoint exists.
     Checkpoint {
         version: Option<Version>,
-        shape: CheckpointShape,
+        shape: Option<Arc<CheckpointShape>>,
     },
 }
 
 impl MetadataReplayBase {
     /// Select the newest eligible metadata base and resolve checkpoint shape only when needed.
-    pub(in crate::scan) fn try_new(
-        snapshot: &Snapshot,
-        engine: &dyn Engine,
-        planner: &MetadataPlanner<'_>,
-    ) -> KernelResult<Self> {
+    pub(in crate::scan) fn try_new(snapshot: &Snapshot, engine: &dyn Engine) -> KernelResult<Self> {
         let checkpoint_version = snapshot.log_segment().checkpoint_version;
         // Keep replay eligibility independent of SnapshotCrc's validation.
         if let Some((version, files)) = snapshot
@@ -36,14 +33,7 @@ impl MetadataReplayBase {
             });
         }
 
-        // Resolve the checkpoint shape once. The planner owns the decision to retain the file-
-        // action schema; checkpoint discovery owns how that schema is obtained.
-        let plan_executor = engine.require_plan_executor()?;
-        let shape = if planner.requires_checkpoint_add_schema() {
-            CheckpointShape::try_new_with_leaf_schema(plan_executor.as_ref(), snapshot)?
-        } else {
-            CheckpointShape::try_new(plan_executor.as_ref(), snapshot)?
-        };
+        let shape = snapshot.checkpoint_info(engine)?;
         Ok(Self::Checkpoint {
             version: checkpoint_version,
             shape,
@@ -66,11 +56,12 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
+    use crate::Result;
     use crate::crc::Crc;
+    use crate::engine::DelegatingEngine;
     use crate::engine::arrow_data::EngineDataArrowExt as _;
-    use crate::engine::test_delegating::DelegatingEngine;
-    use crate::plans::ir::nodes::Operator;
     use crate::plans::Operation as PlanOperation;
+    use crate::plans::ir::nodes::Operator;
     use crate::scan::scan_plan::tests::log_segment;
     use crate::unit_test_utils::load_test_table;
 
@@ -82,7 +73,7 @@ mod tests {
         #[case] version: Version,
         #[case] checkpoint_version: Option<Version>,
         #[case] has_all_files: bool,
-    ) -> KernelResult<()> {
+    ) -> Result<()> {
         let (engine, latest, _tempdir) =
             load_test_table("v1-multi-part-partitioned-struct-stats-only")?;
         let snapshot = Snapshot::builder_for(latest.table_root().clone())
@@ -104,11 +95,14 @@ mod tests {
         let crc = Some(crc);
         let snapshot = Arc::new(Snapshot::new_with_crc(segment, config, crc, false, false)?);
         let scan = snapshot.scan_builder().build()?;
-        let planner = MetadataPlanner::try_new(&scan)?;
-        let base = MetadataReplayBase::try_new(&scan.snapshot, &engine, &planner)?;
+        let base = MetadataReplayBase::try_new(&scan.snapshot, &engine)?;
         assert_eq!(base.version(), Some(version));
         let is_crc = matches!(base, MetadataReplayBase::Crc { .. });
         assert_eq!(is_crc, has_all_files);
+        assert_eq!(
+            scan.snapshot.cached_checkpoint_info().is_some(),
+            !has_all_files
+        );
         Ok(())
     }
 
@@ -121,7 +115,7 @@ mod tests {
         #[case] target_version: Version,
         #[case] empty_crc: bool,
         #[case] expected_rows: usize,
-    ) -> KernelResult<()> {
+    ) -> Result<()> {
         let (engine, latest, _tempdir) =
             load_test_table("v1-multi-part-partitioned-struct-stats-only")?;
         let target = Snapshot::builder_for(latest.table_root().clone())

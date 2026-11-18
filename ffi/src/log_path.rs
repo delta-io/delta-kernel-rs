@@ -4,7 +4,7 @@ use delta_kernel::path::ParsedLogPath;
 use delta_kernel::{FileMeta, KernelResult, LogPath};
 use url::Url;
 
-use crate::{kernel_string_slice, FfiSlice, KernelStringSlice, TryFromStringSlice};
+use crate::{FfiSlice, KernelStringSlice, TryFromStringSlice, kernel_string_slice};
 
 /// Borrowed array of FFI-safe log paths.
 pub type LogPathArray = FfiSlice<FfiLogPath>;

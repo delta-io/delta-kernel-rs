@@ -10,8 +10,8 @@ use super::{put_bytes, resolve_scope};
 use crate::object_store::path::Path;
 use crate::object_store::{DynObjectStore, ObjectStoreExt as _};
 use crate::{
-    keep_listing, FileMeta, FileSlice, KernelError, KernelResult, KernelResultIterator,
-    StorageHandler,
+    FileMeta, FileSlice, KernelError, KernelResult, KernelResultIterator, StorageHandler,
+    keep_listing,
 };
 
 #[derive(Constructor)]
@@ -137,8 +137,8 @@ mod tests {
     use url::Url;
 
     use super::SyncStorageHandler;
-    use crate::object_store::memory::InMemory;
     use crate::object_store::ObjectStoreExt as _;
+    use crate::object_store::memory::InMemory;
     use crate::utils::current_time_duration;
     use crate::{KernelError, StorageHandler};
 

@@ -11,17 +11,17 @@ use delta_kernel::arrow::datatypes::{DataType as ArrowDataType, Schema as ArrowS
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
-use delta_kernel::expressions::{column_name, ColumnName, Scalar};
+use delta_kernel::expressions::{ColumnName, Scalar, column_name};
 use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::{DynObjectStore, ObjectStoreExt as _};
 use delta_kernel::scan::StatsOptions;
-use delta_kernel::schema::{schema, schema_ref, DataType, MetadataValue, StructField};
-use delta_kernel::table_features::{get_any_level_column_physical_name, ColumnMappingMode};
+use delta_kernel::schema::{DataType, MetadataValue, StructField, schema, schema_ref};
+use delta_kernel::table_features::{ColumnMappingMode, get_any_level_column_physical_name};
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::{Engine, FileMeta, Snapshot};
-use test_utils::delta_kernel_default_engine::executor::tokio::TokioMultiThreadExecutor;
 use test_utils::delta_kernel_default_engine::DefaultEngineBuilder;
+use test_utils::delta_kernel_default_engine::executor::tokio::TokioMultiThreadExecutor;
 use test_utils::{
     add_commit, assert_partition_values, assert_schema_has_field,
     column_mapping_fixtures as fixtures, copy_directory, create_table_and_load_snapshot,
@@ -484,8 +484,8 @@ async fn test_duplicated_phy_path_rejected(
 /// be readable and appendable: the annotations are inert and columns resolve by logical name.
 /// Kernel matches delta-spark, which ignores residual annotations in `NoMapping` mode.
 #[tokio::test(flavor = "multi_thread")]
-async fn test_read_and_append_tolerates_stale_column_mapping_when_disabled(
-) -> Result<(), Box<dyn std::error::Error>> {
+async fn test_read_and_append_tolerates_stale_column_mapping_when_disabled()
+-> Result<(), Box<dyn std::error::Error>> {
     let tmp_dir = tempfile::tempdir()?;
     let table_url = Url::from_directory_path(tmp_dir.path()).unwrap();
     let store: Arc<DynObjectStore> = Arc::new(LocalFileSystem::new());

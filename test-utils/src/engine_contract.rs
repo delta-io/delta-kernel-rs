@@ -14,18 +14,18 @@ use delta_kernel::arrow::datatypes::{DataType as ArrowDataType, Field, Schema as
 use delta_kernel::engine::arrow_conversion::TryIntoKernel as _;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::engine_data::{FilteredEngineData, GetData, RowVisitor, TypedGetData as _};
-use delta_kernel::expressions::{column_name, ColumnName};
+use delta_kernel::expressions::{ColumnName, column_name};
 use delta_kernel::object_store::path::Path;
 use delta_kernel::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use delta_kernel::parquet::arrow::arrow_writer::ArrowWriter;
 use delta_kernel::parquet::arrow::{ARROW_SCHEMA_META_KEY, PARQUET_FIELD_ID_META_KEY};
 use delta_kernel::schema::{
-    schema_ref, ColumnMetadataKey, DataType, MetadataColumnSpec, PrimitiveType, SchemaRef,
-    StructField, StructType,
+    ColumnMetadataKey, DataType, MetadataColumnSpec, PrimitiveType, SchemaRef, StructField,
+    StructType, schema_ref,
 };
 use delta_kernel::{Engine, EngineData, FileMeta, JsonHandler, KernelResult, ParquetHandler};
 use itertools::Itertools;
-use tempfile::{tempdir, NamedTempFile};
+use tempfile::{NamedTempFile, tempdir};
 use url::Url;
 
 use crate::delta_path_for_version;

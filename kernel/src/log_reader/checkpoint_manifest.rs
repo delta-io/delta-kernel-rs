@@ -121,7 +121,7 @@ mod tests {
     use crate::engine::arrow_data::EngineDataArrowExt as _;
     use crate::schema::schema_ref;
     use crate::unit_test_utils::{assert_result_error_with_message, load_test_table};
-    use crate::{KernelResult, SnapshotRef};
+    use crate::{KernelResult, Result, SnapshotRef};
 
     /// Helper function to test manifest phase with expected add paths and sidecars
     fn verify_manifest_phase(
@@ -202,18 +202,19 @@ mod tests {
     }
 
     #[test]
-    fn test_manifest_phase_extracts_file_paths() -> KernelResult<()> {
+    fn test_manifest_phase_extracts_file_paths() -> Result<()> {
         let (engine, snapshot, _tempdir) = load_test_table("with_checkpoint_no_last_checkpoint")?;
         verify_manifest_phase(
             engine,
             snapshot,
             &["part-00000-a190be9e-e3df-439e-b366-06a863f51e99-c000.snappy.parquet"],
             &[],
-        )
+        )?;
+        Ok(())
     }
 
     #[test]
-    fn test_manifest_phase_early_finalize_error() -> KernelResult<()> {
+    fn test_manifest_phase_early_finalize_error() -> Result<()> {
         let (engine, snapshot, _tempdir) = load_test_table("with_checkpoint_no_last_checkpoint")?;
 
         let manifest_phase = CheckpointManifestReader::try_new(
@@ -232,7 +233,7 @@ mod tests {
     }
 
     #[test]
-    fn test_manifest_phase_collects_sidecars() -> KernelResult<()> {
+    fn test_manifest_phase_collects_sidecars() -> Result<()> {
         let (engine, snapshot, _tempdir) = load_test_table("v2-checkpoints-json-with-sidecars")?;
         verify_manifest_phase(
             engine,
@@ -242,11 +243,12 @@ mod tests {
                 "00000000000000000006.checkpoint.0000000001.0000000002.19af1366-a425-47f4-8fa6-8d6865625573.parquet",
                 "00000000000000000006.checkpoint.0000000002.0000000002.5008b69f-aa8a-4a66-9299-0733a56a7e63.parquet",
             ],
-        )
+        )?;
+        Ok(())
     }
 
     #[test]
-    fn test_manifest_phase_collects_sidecars_parquet() -> KernelResult<()> {
+    fn test_manifest_phase_collects_sidecars_parquet() -> Result<()> {
         let (engine, snapshot, _tempdir) = load_test_table("v2-checkpoints-parquet-with-sidecars")?;
         verify_manifest_phase(
             engine,
@@ -256,7 +258,8 @@ mod tests {
                 "00000000000000000006.checkpoint.0000000001.0000000002.76931b15-ead3-480d-b86c-afe55a577fc3.parquet",
                 "00000000000000000006.checkpoint.0000000002.0000000002.4367b29c-0e87-447f-8e81-9814cc01ad1f.parquet",
             ],
-        )
+        )?;
+        Ok(())
     }
 
     fn manifest_read_schema() -> SchemaRef {

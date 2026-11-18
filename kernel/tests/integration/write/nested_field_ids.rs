@@ -8,7 +8,7 @@ use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::schema::{
-    schema, ArrayType, ColumnMetadataKey, DataType, MapType, MetadataValue, StructField, StructType,
+    ArrayType, ColumnMetadataKey, DataType, MapType, MetadataValue, StructField, StructType, schema,
 };
 use delta_kernel::{EngineData, KernelResultIterator, ParquetHandler};
 use test_utils::delta_kernel_default_engine::executor::tokio::TokioBackgroundExecutor;

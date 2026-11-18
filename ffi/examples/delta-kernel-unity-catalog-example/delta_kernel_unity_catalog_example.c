@@ -158,7 +158,7 @@ int main(int argc, char* argv[])
     KernelStringSlice table_name_slice = { .ptr = table_name, .len = strlen(table_name) };
 
     ExternResultHandleMutableCommitter committer_res = get_uc_committer(
-        uc_client, table_id_slice, catalog_slice, schema_slice, table_name_slice, allocate_error);
+        uc_client, table_id_slice, catalog_slice, schema_slice, table_name_slice, &error_allocators);
 
     if (committer_res.tag != OkHandleMutableCommitter) {
         print_error("Failed to create UC committer", (Error*)committer_res.err);
@@ -172,7 +172,7 @@ int main(int argc, char* argv[])
     // Get the default engine
     KernelStringSlice table_path_slice = { .ptr = table_path, .len = strlen(table_path) };
     ExternResultHandleExclusiveEngineBuilder engine_builder_res =
-        get_engine_builder(table_path_slice, allocate_error);
+        get_engine_builder(table_path_slice, &error_allocators);
 
     if (engine_builder_res.tag != OkHandleExclusiveEngineBuilder) {
         print_error("Could not get engine builder", (Error*)engine_builder_res.err);

@@ -5,9 +5,9 @@ use std::sync::Arc;
 use tracing::span::Id;
 use tracing::subscriber::Interest;
 use tracing::{Metadata, Subscriber};
+use tracing_subscriber::Layer;
 use tracing_subscriber::layer::Context;
 use tracing_subscriber::registry::LookupSpan;
-use tracing_subscriber::Layer;
 
 /// Tracing field whose presence opts a span into call-frame lifecycle reporting.
 pub const ENABLE_CALL_FRAME_FIELD: &str = "enable_call_frame";
@@ -81,20 +81,24 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::panic::{catch_unwind, AssertUnwindSafe};
+    use std::panic::{AssertUnwindSafe, catch_unwind};
     use std::sync::Mutex;
 
     use tracing::field::Empty;
     use tracing::subscriber::with_default;
-    use tracing::{info_span, trace_span, Span};
-    use tracing_subscriber::layer::SubscriberExt as _;
+    use tracing::{Span, info_span, trace_span};
     use tracing_subscriber::Registry;
+    use tracing_subscriber::layer::SubscriberExt as _;
 
     use super::*;
+    use crate::Snapshot;
     use crate::engine::sync::SyncEngine;
+    use crate::history_manager::{
+        HistoryCommitType, first_version_after, get_earliest_commit, latest_version_as_of,
+        timestamp_range_to_versions,
+    };
     use crate::metrics::events::SNAPSHOT_COMPLETED_SPAN;
     use crate::unit_test_utils::{copy_test_table, load_test_table};
-    use crate::Snapshot;
 
     #[derive(Clone, Debug, PartialEq)]
     enum FrameEvent {
@@ -128,8 +132,7 @@ mod tests {
         let reporter = Arc::new(CapturingFrameReporter::default());
         let subscriber = Registry::default().with(FrameReporterLayer::new(reporter.clone()));
         with_default(subscriber, f);
-        let events = reporter.events.lock().unwrap().clone();
-        events
+        reporter.events.lock().unwrap().clone()
     }
 
     fn entered_callstacks(events: &[FrameEvent]) -> Vec<Vec<&'static str>> {
@@ -169,14 +172,18 @@ mod tests {
             let _inner_guard = inner.enter();
         });
 
-        let [FrameEvent::Enter {
-            id: outer_id,
-            name: "outer",
-        }, FrameEvent::Enter {
-            id: inner_id,
-            name: "inner",
-        }, FrameEvent::Exit { id: inner_exit_id }, FrameEvent::Exit { id: outer_exit_id }] =
-            events.as_slice()
+        let [
+            FrameEvent::Enter {
+                id: outer_id,
+                name: "outer",
+            },
+            FrameEvent::Enter {
+                id: inner_id,
+                name: "inner",
+            },
+            FrameEvent::Exit { id: inner_exit_id },
+            FrameEvent::Exit { id: outer_exit_id },
+        ] = events.as_slice()
         else {
             panic!("unexpected events: {events:?}");
         };
@@ -204,16 +211,17 @@ mod tests {
             let unmarked_metadata = unmarked.metadata().unwrap();
             let marked_metadata = marked.metadata().unwrap();
 
-            assert!(<FrameReporterLayer as Layer<Registry>>::register_callsite(
-                &layer,
-                unmarked_metadata
-            )
-            .is_never());
-            assert!(<FrameReporterLayer as Layer<Registry>>::register_callsite(
-                &layer,
-                marked_metadata
-            )
-            .is_always());
+            assert!(
+                <FrameReporterLayer as Layer<Registry>>::register_callsite(
+                    &layer,
+                    unmarked_metadata
+                )
+                .is_never()
+            );
+            assert!(
+                <FrameReporterLayer as Layer<Registry>>::register_callsite(&layer, marked_metadata)
+                    .is_always()
+            );
         });
     }
 
@@ -341,11 +349,106 @@ mod tests {
         );
     }
 
+    #[rstest::rstest]
+    fn history_lookups_report_balanced_frames(#[values(false, true)] fail: bool) {
+        let events = capture(|| {
+            let (engine, snapshot, _tempdir) = load_test_table("table-without-dv-small").unwrap();
+            assert_eq!(
+                latest_version_as_of(
+                    &snapshot,
+                    engine.as_ref(),
+                    if fail { i64::MIN } else { i64::MAX },
+                    HistoryCommitType::Published,
+                )
+                .is_err(),
+                fail,
+            );
+            assert_eq!(
+                first_version_after(
+                    &snapshot,
+                    engine.as_ref(),
+                    if fail { i64::MAX } else { 0 },
+                    HistoryCommitType::Published,
+                )
+                .is_err(),
+                fail,
+            );
+            let log_root = snapshot
+                .table_root()
+                .join(if fail { "missing_log/" } else { "_delta_log/" })
+                .unwrap();
+            assert_eq!(
+                get_earliest_commit(
+                    engine.as_ref(),
+                    &log_root,
+                    None,
+                    HistoryCommitType::Published
+                )
+                .is_err(),
+                fail,
+            );
+        });
+        let callstacks = entered_callstacks(&events);
+        for name in [
+            "latest_version_as_of",
+            "first_version_after",
+            "get_earliest_commit",
+        ] {
+            assert_contains_callstack(&callstacks, &[name]);
+        }
+    }
+
+    #[rstest::rstest]
+    #[case::bounded_success(
+        0,
+        Some(i64::MAX),
+        false,
+        &["first_version_after", "latest_version_as_of"]
+    )]
+    #[case::unbounded_success(0, None, false, &["first_version_after"])]
+    #[case::start_lookup_failure(i64::MAX, Some(i64::MAX), true, &["first_version_after"])]
+    #[case::end_lookup_failure(
+        i64::MIN,
+        Some(i64::MIN),
+        true,
+        &["first_version_after", "latest_version_as_of"]
+    )]
+    #[case::invalid_range(1, Some(0), true, &[])]
+    fn timestamp_range_lookup_reports_nested_balanced_frames(
+        #[case] start_timestamp: i64,
+        #[case] end_timestamp: Option<i64>,
+        #[case] fail: bool,
+        #[case] expected_children: &[&str],
+    ) {
+        let events = capture(|| {
+            let (engine, snapshot, _tempdir) = load_test_table("table-without-dv-small").unwrap();
+            assert_eq!(
+                timestamp_range_to_versions(
+                    &snapshot,
+                    engine.as_ref(),
+                    start_timestamp,
+                    end_timestamp,
+                )
+                .is_err(),
+                fail,
+            );
+        });
+        let callstacks = entered_callstacks(&events);
+        assert_contains_callstack(&callstacks, &["timestamp_range_to_versions"]);
+        let children: Vec<_> = callstacks
+            .iter()
+            .filter_map(|stack| match stack.as_slice() {
+                ["timestamp_range_to_versions", child] => Some(*child),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(children, expected_children);
+    }
+
     #[test]
     fn imperative_scan_reports_expected_callstacks() {
-        let (engine, snapshot, _tempdir) = load_test_table("table-without-dv-small").unwrap();
-
         let events = capture(|| {
+            let (engine, snapshot, _tempdir) = load_test_table("table-without-dv-small").unwrap();
             let scan = snapshot.scan_builder().build().unwrap();
             for metadata in scan.scan_metadata(engine.as_ref()).unwrap() {
                 metadata.unwrap();
@@ -363,23 +466,24 @@ mod tests {
     #[cfg(feature = "declarative-plans")]
     #[test]
     fn declarative_scan_reports_expected_callstacks() {
-        let (engine, snapshot, _tempdir) =
-            load_test_table("v2-checkpoints-parquet-with-sidecars").unwrap();
-
+        // Given: a manifest checkpoint whose hinted sidecar schema needs a footer read.
         let events = capture(|| {
+            let (engine, snapshot, _tempdir) =
+                load_test_table("v2-checkpoints-parquet-with-sidecars").unwrap();
             let scan = snapshot.scan_builder().build().unwrap();
+            // When: scan planning resolves its checkpoint inputs.
             scan.declarative_metadata_scan_plan(engine.as_ref())
                 .unwrap();
         });
         let callstacks = entered_callstacks(&events);
 
+        // Then: discovery and plan construction are both attributed to the scan.
         assert_contains_callstack(
             &callstacks,
             &[
                 "scan.declarative_metadata_scan_plan",
-                "checkpoint_shape.try_new_with_leaf_schema",
-                "checkpoint_shape.from_v2_checkpoint_hint",
-                "checkpoint_shape.try_new_manifest",
+                "checkpoint_shape.resolve",
+                "checkpoint_shape.read_parquet_footer_schema",
             ],
         );
         assert_contains_callstack(

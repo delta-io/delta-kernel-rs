@@ -112,6 +112,9 @@ message CountAgg {
   delta.kernel.expressions.ColumnName value = 1;
 }
 message CountStarAgg {}
+message FirstNonNullAgg {
+  delta.kernel.expressions.ColumnName value = 1;
+}
 message MinNonNullByAgg {
   delta.kernel.expressions.ColumnName value = 1;
   delta.kernel.expressions.ColumnName null_sentinel = 2;
@@ -132,6 +135,7 @@ message Agg {
     SumAgg sum = 5;
     CountAgg count = 6;
     CountStarAgg count_star = 7;
+    FirstNonNullAgg first_non_null = 8;
   }
 }
 
