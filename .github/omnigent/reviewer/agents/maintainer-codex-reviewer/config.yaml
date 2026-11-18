@@ -5,6 +5,7 @@ skills: none
 executor:
   type: omnigent
   model: maintainer-codex
+  reasoning_effort: medium
   config:
     harness: codex
 instructions: REVIEW.md
