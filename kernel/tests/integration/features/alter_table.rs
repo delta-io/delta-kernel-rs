@@ -2225,27 +2225,19 @@ async fn alter_table_disabling_ict_clears_enablement_info() -> delta_kernel::Res
 }
 
 #[tokio::test]
-async fn alter_table_enabling_column_mapping_assigns_ids_and_physical_names()
--> delta_kernel::Result<()> {
+async fn alter_table_rejects_enabling_column_mapping() -> delta_kernel::Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
     let snapshot =
         create_table_and_load_snapshot(&table_path, simple_schema(), engine.as_ref(), &[])?;
 
-    snapshot
+    let result = snapshot
         .update_table(UpdateTableOperation::AlterTable, "test-engine", false)
         .with_table_properties_added([("delta.columnMapping.mode", "name")])
-        .build(engine.as_ref(), committer())?
-        .commit(engine.as_ref())?
-        .unwrap_committed();
+        .build(engine.as_ref(), committer());
 
-    let reloaded = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
-    assert_eq!(
-        reloaded.table_properties().column_mapping_mode,
-        Some(delta_kernel::table_features::ColumnMappingMode::Name)
-    );
-    assert_eq!(
-        reloaded.table_properties().column_mapping_max_column_id,
-        Some(reloaded.schema().fields().count() as i64)
+    assert_result_error_with_message(
+        result,
+        "Changing column mapping mode on an existing table is not supported",
     );
     Ok(())
 }
