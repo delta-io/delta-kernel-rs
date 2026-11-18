@@ -289,10 +289,10 @@ mod tests {
         MAX_VALUES, MIN_VALUES, NUM_RECORDS, SIDECAR_FILE_SCHEMA_TAG, STATS_PARSED, Sidecar,
     };
     use crate::checkpoint::CheckpointKind;
-    use crate::engine::DelegatingEngine;
     use crate::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt as _};
     use crate::engine::sync::SyncEngine;
     use crate::engine::sync::plan::SyncPlanExecutor;
+    use crate::engine::{DelegatingEngine, RelaxedCounter};
     use crate::expressions::Predicate;
     use crate::last_checkpoint_hint::{HintAction, LastCheckpointHint, LastCheckpointV2};
     use crate::log_segment_files::LogSegmentFiles;
@@ -309,8 +309,8 @@ mod tests {
     /// a one-shot batch failure or executor panic.
     struct CountingExecutor {
         inner: SyncPlanExecutor,
-        query_scans: AtomicUsize,
-        footer_reads: AtomicUsize,
+        query_scans: RelaxedCounter,
+        footer_reads: RelaxedCounter,
         batches_read: Arc<AtomicUsize>,
         rows_in_batch: Option<usize>,
         fail_query_once: AtomicBool,
@@ -322,8 +322,8 @@ mod tests {
         fn new() -> Self {
             Self {
                 inner: SyncPlanExecutor::default(),
-                query_scans: AtomicUsize::new(0),
-                footer_reads: AtomicUsize::new(0),
+                query_scans: RelaxedCounter::default(),
+                footer_reads: RelaxedCounter::default(),
                 batches_read: Arc::new(AtomicUsize::new(0)),
                 rows_in_batch: Some(1),
                 fail_query_once: AtomicBool::new(false),
@@ -333,11 +333,8 @@ mod tests {
         }
 
         /// Returns checkpoint-query and Parquet-footer read counts.
-        fn io_counts(&self) -> (usize, usize) {
-            (
-                self.query_scans.load(Ordering::Relaxed),
-                self.footer_reads.load(Ordering::Relaxed),
-            )
+        fn io_counts(&self) -> (u64, u64) {
+            (self.query_scans.get(), self.footer_reads.get())
         }
     }
 
@@ -356,10 +353,10 @@ mod tests {
                             col!(CHECKPOINT_METADATA_NAME, "version").is_not_null(),
                         ))
                     );
-                    _ = self.query_scans.fetch_add(1, Ordering::Relaxed);
+                    self.query_scans.inc();
                 }
                 Operation::IoOperation(IoOperation::ParquetFooter { .. }) => {
-                    _ = self.footer_reads.fetch_add(1, Ordering::Relaxed);
+                    self.footer_reads.inc();
                     if let Some((entered, release)) = &self.footer_pause {
                         entered.send(()).unwrap();
                         release
@@ -476,7 +473,7 @@ mod tests {
         #[case] table: &str,
         #[case] expected_checkpoint: Option<CheckpointKind>,
         #[case] expect_parsed: bool,
-        #[case] unhinted_query_scans: usize,
+        #[case] unhinted_query_scans: u64,
         #[values(false, true)] omit_hint: bool,
     ) {
         // Given: a checkpoint layout with or without a matching hint.
@@ -506,10 +503,7 @@ mod tests {
             );
         }
         if omit_hint {
-            assert_eq!(
-                exec.query_scans.load(Ordering::Relaxed),
-                unhinted_query_scans
-            );
+            assert_eq!(exec.query_scans.get(), unhinted_query_scans);
         }
     }
 
@@ -635,8 +629,8 @@ mod tests {
 
         // Then: only the missing sidecar schema requires I/O.
         assert_eq!(shape.kind(), CheckpointKind::Manifest);
-        assert_eq!(exec.query_scans.load(Ordering::Relaxed), 0);
-        assert_eq!(exec.footer_reads.load(Ordering::Relaxed), 1);
+        assert_eq!(exec.query_scans.get(), 0);
+        assert_eq!(exec.footer_reads.get(), 1);
         assert!(!shape.sidecars.is_empty());
     }
 
@@ -645,7 +639,7 @@ mod tests {
     #[case::parquet("v2-checkpoints-parquet-with-sidecars", 1)]
     fn scan_caches_complete_metadata_for_getters_and_later_scans(
         #[case] table: &str,
-        #[case] root_footer_reads: usize,
+        #[case] root_footer_reads: u64,
         #[values(false, true)] include_stats: bool,
     ) {
         // Given: an unhinted manifest and a scan with or without requested statistics.
@@ -791,8 +785,8 @@ mod tests {
                 .sidecar_files(),
             Some([].as_slice())
         );
-        assert_eq!(exec.query_scans.load(Ordering::Relaxed), 0);
-        assert_eq!(exec.footer_reads.load(Ordering::Relaxed), 0);
+        assert_eq!(exec.query_scans.get(), 0);
+        assert_eq!(exec.footer_reads.get(), 0);
     }
 
     #[test]
@@ -836,8 +830,8 @@ mod tests {
         ));
         assert_eq!(info.leaf_file_count(), 1);
         assert_eq!(info.size_in_bytes(), root.location.size);
-        assert_eq!(exec.query_scans.load(Ordering::Relaxed), 0);
-        assert_eq!(exec.footer_reads.load(Ordering::Relaxed), 1);
+        assert_eq!(exec.query_scans.get(), 0);
+        assert_eq!(exec.footer_reads.get(), 1);
     }
 
     /// Builds a segment whose applicable hint lists one sidecar and carries a `checkpointMetadata`
@@ -924,12 +918,12 @@ mod tests {
             compatible
         );
         assert_eq!(
-            exec.footer_reads.load(Ordering::Relaxed),
+            exec.footer_reads.get(),
             0,
             "sidecarFileSchema hint must skip the sidecar footer read"
         );
         assert_eq!(
-            exec.query_scans.load(Ordering::Relaxed),
+            exec.query_scans.get(),
             0,
             "the hint fast path must not drain the checkpoint"
         );
@@ -1247,7 +1241,7 @@ mod tests {
 
         // Then: initialization recovers and the successful value is cached.
         assert!(Arc::ptr_eq(&info, &cached));
-        assert_eq!(exec.footer_reads.load(Ordering::Relaxed), 2);
+        assert_eq!(exec.footer_reads.get(), 2);
     }
 
     #[rstest]
@@ -1285,7 +1279,7 @@ mod tests {
 
         // Then: resolution reports the specific metadata error.
         assert!(error.to_string().contains(expected_error), "{error}");
-        assert_eq!(exec.query_scans.load(Ordering::Relaxed), 1);
+        assert_eq!(exec.query_scans.get(), 1);
     }
 
     #[rstest]
@@ -1467,11 +1461,8 @@ mod tests {
         } else {
             assert_eq!(info.leaf_schema().as_ref(), &tagged_schema);
         }
-        assert_eq!(exec.query_scans.load(Ordering::Relaxed), 1);
-        assert_eq!(
-            exec.footer_reads.load(Ordering::Relaxed),
-            usize::from(malformed_tags)
-        );
+        assert_eq!(exec.query_scans.get(), 1);
+        assert_eq!(exec.footer_reads.get(), u64::from(malformed_tags));
         // Then: bounded lists may be absent while the retained layout and totals remain exact.
         let expected_sidecars = lines
             .iter()
@@ -1593,7 +1584,7 @@ mod tests {
         let info = resolve_checkpoint_info(&snapshot, &engine);
 
         // Then: it retains the complete sidecar list, and subsequent getters perform no I/O.
-        assert_eq!(exec.query_scans.load(Ordering::Relaxed), 2);
+        assert_eq!(exec.query_scans.get(), 2);
         assert_eq!(info.leaf_file_count(), 2);
         assert_eq!(
             info.last_checkpoint()
@@ -1604,7 +1595,7 @@ mod tests {
         );
         let cached = resolve_checkpoint_info(&snapshot, &engine);
         assert!(Arc::ptr_eq(&info, &cached));
-        assert_eq!(exec.query_scans.load(Ordering::Relaxed), 2);
+        assert_eq!(exec.query_scans.get(), 2);
     }
 
     fn resolve_checkpoint_info(snapshot: &Snapshot, engine: &dyn Engine) -> Arc<CheckpointShape> {
