@@ -15,15 +15,6 @@ pub(crate) struct SyncStorageHandler {
     store: Option<Arc<DynObjectStore>>,
 }
 
-impl SyncStorageHandler {
-    /// The backing store, or `None` for the per-URL [`LocalFileSystem`] fallback.
-    ///
-    /// [`LocalFileSystem`]: crate::object_store::local::LocalFileSystem
-    pub(super) fn store(&self) -> Option<&Arc<DynObjectStore>> {
-        self.store.as_ref()
-    }
-}
-
 // This handler collects eagerly under `block_on`, so it cannot interrupt that I/O after it starts.
 // It relies on the default `*_with_cancellation` methods to check before delegation and before
 // pulling the resulting in-memory iterator.

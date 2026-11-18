@@ -100,21 +100,9 @@ impl SyncEngine {
         Self::new_inner(Some(store))
     }
 
-    /// Create a SyncEngine backed by a fresh [`InMemory`] store. Use [`Self::store`] to access it.
+    /// Create a SyncEngine backed by a fresh [`InMemory`] store.
     pub fn in_memory() -> Self {
         Self::new_with_store(Arc::new(InMemory::new()))
-    }
-
-    /// The explicit store this engine was built with.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the engine was built with [`Self::new`], which has no explicit store.
-    pub fn store(&self) -> &Arc<DynObjectStore> {
-        #[allow(clippy::expect_used)] // test-only code, panic is intentional
-        self.storage_handler
-            .store()
-            .expect("This SyncEngine has no explicit store")
     }
 
     fn new_inner(store: Option<Arc<DynObjectStore>>) -> Self {
