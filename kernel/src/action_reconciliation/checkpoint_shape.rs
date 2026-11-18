@@ -1470,7 +1470,7 @@ mod tests {
             .count();
         // Exercise metadata and sidecars together, separately, and across smaller mixed batches.
         assert_eq!(
-            exec.batches_read.get(),
+            exec.batches_read.get() as usize,
             rows_in_batch.map_or(1, |rows| (expected_sidecars + 1).div_ceil(rows))
         );
         assert_eq!(info.leaf_file_count(), expected_sidecars);
