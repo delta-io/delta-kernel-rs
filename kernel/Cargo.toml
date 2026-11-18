@@ -139,6 +139,8 @@ adaptive-metadata-in-dev = []
 geo-type-in-dev = []
 # Nanosecond timestamps table feature and primitive types, a preview of the protocol RFC
 # (https://github.com/delta-io/delta/blob/master/protocol_rfcs/nanosecond-timestamps.md).
+# Enabling this maps Arrow nanosecond timestamps to the nanosecond types instead of the
+# microsecond ones, so tables created from such schemas require `timestampNanos`.
 nanosecond-timestamps = ["test_utils/nanosecond-timestamps"]
 # Enables experimental user-defined schema types.
 udt-in-dev = []
