@@ -187,7 +187,6 @@ mod tests {
 
     use super::*;
     use crate::checkpoint::checkpoint_handles;
-    use crate::ffi_metrics::with_ffi_event;
     use crate::{TryFromStringSlice as _, free_engine, free_snapshot};
 
     #[rstest]
@@ -238,7 +237,7 @@ mod tests {
             compaction_file_count: 0,
         };
         let source = kernel::MetricEvent::ScanPlanGenerationCompleted(event.clone());
-        with_ffi_event(&source, |ffi| {
+        MetricEvent::with_kernel_event(&source, |ffi| {
             let MetricEvent::ScanPlanGenerationCompleted(record) = ffi else {
                 panic!("expected scan-plan metric");
             };
@@ -299,10 +298,11 @@ mod tests {
                         r#"{"type":"struct","fields":[]}"#
                     );
                     let hint = unsafe { info.last_checkpoint.try_to_kernel() }.unwrap();
-                    assert_eq!(
-                        hint.v2_checkpoint().unwrap().sidecar_files().unwrap().len(),
-                        1
-                    );
+                    let sidecars = hint.v2_checkpoint().unwrap().sidecar_files().unwrap();
+                    assert_eq!(sidecars.len(), 1);
+                    assert_eq!(sidecars[0].path, "leaf.parquet");
+                    assert_eq!(sidecars[0].size_in_bytes, 13);
+                    assert_eq!(sidecars[0].modification_time, 23);
                 }
                 assert_eq!(checkpoint.checkpoint_type, OptionalValue::None);
                 assert_eq!(checkpoint.cache_hit, OptionalValue::Some(false));

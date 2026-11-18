@@ -721,7 +721,7 @@ fn correlation_id_slice(correlation_id: Option<&str>) -> KernelStringSlice {
 
 impl MetricEvent {
     /// Invoke the callback while all borrowed FFI records and nested storage are alive.
-    fn with_kernel_event(event: &kernel::MetricEvent, f: impl FnOnce(Self)) {
+    pub(crate) fn with_kernel_event(event: &kernel::MetricEvent, f: impl FnOnce(Self)) {
         use kernel::MetricEvent as K;
         let event = match event {
             #[cfg(feature = "declarative-plans")]
@@ -1026,11 +1026,6 @@ impl MetricEvent {
     }
 }
 
-/// Invoke `f` with the FFI [`MetricEvent`] built from `event`.
-pub(crate) fn with_ffi_event(event: &kernel::MetricEvent, f: impl FnOnce(MetricEvent)) {
-    MetricEvent::with_kernel_event(event, f)
-}
-
 #[cfg(test)]
 mod tests {
     use std::mem::discriminant;
@@ -1071,7 +1066,7 @@ mod tests {
                 outcome,
                 duration: Duration::from_nanos(17),
             });
-        with_ffi_event(&event, |event| {
+        MetricEvent::with_kernel_event(&event, |event| {
             let MetricEvent::LastCheckpointReadCompleted(event) = event else {
                 panic!("expected LastCheckpointReadCompleted");
             };
@@ -1127,7 +1122,7 @@ mod tests {
             output_stats,
         });
 
-        with_ffi_event(&event, |ffi| {
+        MetricEvent::with_kernel_event(&event, |ffi| {
             let MetricEvent::CheckpointWriteSuccess(e) = ffi else {
                 panic!("expected CheckpointWriteSuccess");
             };
@@ -1211,7 +1206,7 @@ mod tests {
             })
         };
 
-        with_ffi_event(&event, |ffi| {
+        MetricEvent::with_kernel_event(&event, |ffi| {
             let (mode, duration, id, version, processing_stats, output_stats) = match ffi {
                 MetricEvent::CheckpointWriteFailure(e) if failed => (
                     e.mode,
@@ -1296,7 +1291,7 @@ mod tests {
                 committer_duration: Duration::from_nanos(20),
                 total_duration: Duration::from_nanos(30),
             });
-        with_ffi_event(&event, |ffi| {
+        MetricEvent::with_kernel_event(&event, |ffi| {
             let MetricEvent::TransactionCommitSuccess(e) = ffi else {
                 panic!("expected TransactionCommitSuccess");
             };
@@ -1336,7 +1331,7 @@ mod tests {
                 committer_duration: Duration::from_nanos(0),
                 total_duration: Duration::from_nanos(0),
             });
-        with_ffi_event(&event, |ffi| {
+        MetricEvent::with_kernel_event(&event, |ffi| {
             let MetricEvent::TransactionCommitSuccess(e) = ffi else {
                 panic!("expected TransactionCommitSuccess");
             };
@@ -1359,7 +1354,7 @@ mod tests {
                 table_type: kernel::TableType::CatalogManaged,
                 reason: kernel::CommitFailureReason::Conflict,
             });
-        with_ffi_event(&failure, |ffi| {
+        MetricEvent::with_kernel_event(&failure, |ffi| {
             let MetricEvent::TransactionCommitFailure(e) = ffi else {
                 panic!("expected TransactionCommitFailure");
             };
@@ -1418,7 +1413,7 @@ mod tests {
             resolution_mode: mode,
             duration,
         });
-        with_ffi_event(&event, |ffi| {
+        MetricEvent::with_kernel_event(&event, |ffi| {
             let MetricEvent::ChecksumWriteSuccess(event) = ffi else {
                 panic!("expected ChecksumWriteSuccess");
             };
@@ -1459,7 +1454,7 @@ mod tests {
             resolution_mode: mode,
             duration,
         });
-        with_ffi_event(&event, |ffi| {
+        MetricEvent::with_kernel_event(&event, |ffi| {
             let MetricEvent::ChecksumWriteFailure(event) = ffi else {
                 panic!("expected ChecksumWriteFailure");
             };
@@ -1489,7 +1484,7 @@ mod tests {
             action_transform_time: Duration::from_nanos(47),
             predicate_eval_time: Duration::from_nanos(53),
         });
-        with_ffi_event(&event, |ffi| {
+        MetricEvent::with_kernel_event(&event, |ffi| {
             let MetricEvent::ScanMetadataCompleted(e) = ffi else {
                 panic!("expected ScanMetadataCompleted");
             };
@@ -1529,7 +1524,7 @@ mod tests {
                 source: kernel::ProtocolMetadataSource::CrcAdvancedByReplay,
                 duration: Duration::from_nanos(53),
             });
-        with_ffi_event(&event, |ffi| {
+        MetricEvent::with_kernel_event(&event, |ffi| {
             let MetricEvent::ProtocolMetadataLoadSuccess(e) = ffi else {
                 panic!("expected ProtocolMetadataLoadSuccess");
             };
@@ -1561,7 +1556,7 @@ mod tests {
             crc_versions_behind: Some(5),
             duration: Duration::from_nanos(61),
         });
-        with_ffi_event(&event, |ffi| {
+        MetricEvent::with_kernel_event(&event, |ffi| {
             let MetricEvent::LogSegmentLoadSuccess(e) = ffi else {
                 panic!("expected LogSegmentLoadSuccess");
             };
@@ -1590,7 +1585,7 @@ mod tests {
             version: 7,
             duration: Duration::from_nanos(11),
         });
-        with_ffi_event(&event, |ffi| {
+        MetricEvent::with_kernel_event(&event, |ffi| {
             let MetricEvent::SnapshotBuildSuccess(e) = ffi else {
                 panic!("expected SnapshotBuildSuccess");
             };
@@ -1612,7 +1607,7 @@ mod tests {
             load_type: kernel::SnapshotLoadType::SnapshotHint,
             duration,
         });
-        with_ffi_event(&snapshot, |ffi| {
+        MetricEvent::with_kernel_event(&snapshot, |ffi| {
             assert!(matches!(
                 ffi,
                 MetricEvent::SnapshotBuildFailure(e)
@@ -1628,7 +1623,7 @@ mod tests {
                 load_type: kernel::LogSegmentLoadType::Full,
                 duration,
             });
-        with_ffi_event(&log_segment, |ffi| {
+        MetricEvent::with_kernel_event(&log_segment, |ffi| {
             assert!(matches!(
                 ffi,
                 MetricEvent::LogSegmentLoadFailure(e) if e.duration_ns == duration_ns
@@ -1643,7 +1638,7 @@ mod tests {
                 load_type: kernel::LogSegmentLoadType::Full,
                 duration,
             });
-        with_ffi_event(&protocol_metadata, |ffi| {
+        MetricEvent::with_kernel_event(&protocol_metadata, |ffi| {
             assert!(matches!(
                 ffi,
                 MetricEvent::ProtocolMetadataLoadFailure(e) if e.duration_ns == duration_ns
@@ -1684,7 +1679,7 @@ mod tests {
             crc_versions_behind: None,
             duration: Duration::from_nanos(0),
         });
-        with_ffi_event(&event, |ffi| {
+        MetricEvent::with_kernel_event(&event, |ffi| {
             let MetricEvent::LogSegmentLoadSuccess(e) = ffi else {
                 panic!("expected LogSegmentLoadSuccess");
             };
@@ -1705,7 +1700,7 @@ mod tests {
                 found: false,
                 duration: Duration::from_nanos(53),
             });
-        with_ffi_event(&event, |ffi| {
+        MetricEvent::with_kernel_event(&event, |ffi| {
             let MetricEvent::SetTransactionLoadSuccess(e) = ffi else {
                 panic!("expected SetTransactionLoadSuccess");
             };
