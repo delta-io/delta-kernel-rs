@@ -451,7 +451,7 @@ mod tests {
         (Arc<SyncEngine>, String, SnapshotRef, SnapshotHint),
         Box<dyn std::error::Error>,
     > {
-        let (engine, store, table_root) = setup_test();
+        let engine = SyncEngine::in_memory();
         create_table(&store, &table_root).await?;
         let snapshot = SnapshotBuilder::new_for(&table_root).build(engine.as_ref())?;
         let _ = snapshot.write_checksum(engine.as_ref())?;
@@ -500,7 +500,7 @@ mod tests {
         #[case] version: Option<Version>,
         #[case] expected: SnapshotHintFreshness,
     ) -> KernelResult<(), Box<dyn std::error::Error>> {
-        let (engine, store, table_root) = setup_test();
+        let engine = SyncEngine::in_memory();
         create_table(&store, &table_root).await?;
         let mut builder = Snapshot::builder_for(&table_root);
         if let Some(version) = version {
@@ -759,7 +759,7 @@ mod tests {
             None,
             SnapshotHintFreshness::Unverified,
         )?;
-        let (engine, _store, _table_root) = setup_test();
+        let engine = SyncEngine::in_memory();
         assert_log_segment_hint_error(
             SnapshotBuilder::new_for(TABLE_ROOT)
                 .with_snapshot_hint(hint)
@@ -831,7 +831,7 @@ mod tests {
         if reverse_paths {
             log_paths.reverse();
         }
-        let (engine, _store, _table_root) = setup_test();
+        let engine = SyncEngine::in_memory();
         let result = SnapshotHint::try_new(
             TABLE_ROOT,
             10,
@@ -920,7 +920,7 @@ mod tests {
             .location
             .location
             .to_string();
-        let (engine, _store, _table_root) = setup_test();
+        let engine = SyncEngine::in_memory();
         let result = SnapshotBuilder::new_for(builder_table_root)
             .with_snapshot_hint(hint)
             .build(engine.as_ref());
@@ -958,7 +958,7 @@ mod tests {
             SnapshotHintFreshness::Unverified,
         )
         .unwrap();
-        let (engine, _store, _table_root) = setup_test();
+        let engine = SyncEngine::in_memory();
         assert_log_segment_hint_error(
             SnapshotBuilder::new_for(builder_table_root)
                 .with_snapshot_hint(hint)
@@ -1235,7 +1235,7 @@ mod tests {
     #[test_log::test(tokio::test(flavor = "multi_thread"))]
     async fn complete_snapshot_hint_preserves_checkpoint_state()
     -> KernelResult<(), Box<dyn std::error::Error>> {
-        let (engine, store, table_root) = setup_test();
+        let engine = SyncEngine::in_memory();
         create_table(&store, &table_root).await?;
         let snapshot = SnapshotBuilder::new_for(&table_root).build(engine.as_ref())?;
         let _ = snapshot.checkpoint(engine.as_ref(), None)?;
@@ -1400,7 +1400,7 @@ mod tests {
     #[test_log::test(tokio::test(flavor = "multi_thread"))]
     async fn snapshot_hint_internal_log_invariant_preserves_source()
     -> KernelResult<(), Box<dyn std::error::Error>> {
-        let (engine, store, table_root) = setup_test();
+        let engine = SyncEngine::in_memory();
         create_table(&store, &table_root).await?;
         let snapshot = SnapshotBuilder::new_for(&table_root).build(engine.as_ref())?;
         let _ = snapshot.checkpoint(engine.as_ref(), None)?;
@@ -1559,7 +1559,7 @@ mod tests {
     #[test_log::test(tokio::test)]
     async fn time_travel_snapshot_hint_accepts_later_max_catalog_version()
     -> KernelResult<(), Box<dyn std::error::Error>> {
-        let (engine, store, table_root) = setup_test();
+        let engine = SyncEngine::in_memory();
         add_commit(
             &table_root,
             store.as_ref(),

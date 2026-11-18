@@ -152,7 +152,7 @@ async fn manifest_commit_table(later_commits: &[String]) -> (Arc<InMemory>, Url)
 // Commits `commits` as versions 0, 1, ... of an in-memory table, and returns the store and table
 // root.
 async fn commit_table(commits: &[String]) -> (Arc<InMemory>, Url) {
-    let store = Arc::new(InMemory::new());
+    let engine = SyncEngine::in_memory();
     let table_root = Url::parse("memory:///").unwrap();
     for (version, commit) in commits.iter().enumerate() {
         add_commit(

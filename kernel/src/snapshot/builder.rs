@@ -689,8 +689,7 @@ pub(super) mod tests {
 
     #[test_log::test(tokio::test)]
     async fn test_snapshot_builder() -> KernelResult<(), Box<dyn std::error::Error>> {
-        let (engine, store, table_root) = setup_test();
-        let engine = engine.as_ref();
+        let engine = SyncEngine::in_memory();
         create_table(&store, &table_root).await?;
 
         let snapshot = SnapshotBuilder::new_for(table_root.clone()).build(engine)?;
@@ -714,7 +713,8 @@ pub(super) mod tests {
         #[case] depth: usize,
         #[case] container: &str,
     ) -> KernelResult<(), Box<dyn std::error::Error>> {
-        let (engine, store, table_root) = setup_test();
+        let engine = SyncEngine::in_memory();
+        let store = engine.store();
         let data_type = (0..depth).fold(DataType::INTEGER, |nested, level| match container {
             "struct" => {
                 StructType::try_new([StructField::nullable(format!("level_{level}"), nested)])
@@ -764,8 +764,8 @@ pub(super) mod tests {
 
     #[test_log::test(tokio::test)]
     async fn test_snapshot_with_unsupported_type() -> KernelResult<()> {
-        let (engine, store, table_root) = setup_test();
-        let engine = engine.as_ref();
+        let engine = SyncEngine::in_memory();
+        let engine = &engine;
 
         // Create a table with an unsupported type in the schema
         let protocol = json!({
@@ -832,8 +832,7 @@ pub(super) mod tests {
 
     #[test_log::test(tokio::test)]
     async fn snapshot_failed_emits_metric_on_error() -> KernelResult<()> {
-        let (engine, store, table_root) = setup_test();
-
+        let engine = SyncEngine::in_memory();
         // Unsupported schema type forces a build failure
         let protocol = json!({"minReaderVersion": 1, "minWriterVersion": 2});
         let metadata = json!({
@@ -878,7 +877,7 @@ pub(super) mod tests {
 
     #[test_log::test(tokio::test)]
     async fn log_segment_load_failure_emits_metric_on_empty_log() -> KernelResult<()> {
-        let (engine, _store, table_root) = setup_test();
+        let engine = SyncEngine::in_memory();
         let (reporter, _guard) = measuring_reporter();
 
         let error = SnapshotBuilder::new_for(&table_root)
@@ -986,7 +985,7 @@ pub(super) mod tests {
         #[case] version: Option<Version>,
         #[case] max_catalog_version: Option<Version>,
     ) {
-        let (engine, _store, table_root) = setup_test();
+        let engine = SyncEngine::in_memory();
         let error = SnapshotBuilder::new_for(table_root)
             .fold_with(version, SnapshotBuilder::at_version)
             .fold_with(
@@ -1005,7 +1004,7 @@ pub(super) mod tests {
     // commit remains.
     #[tokio::test]
     async fn build_keeps_kernel_error_for_last_checkpoint_without_checkpoint() -> Result<()> {
-        let (engine, store, table_root) = setup_test();
+        let engine = SyncEngine::in_memory();
         store
             .put(
                 &Path::from("_delta_log/_last_checkpoint"),
@@ -1054,7 +1053,7 @@ pub(super) mod tests {
     #[test_log::test(tokio::test)]
     async fn protocol_metadata_load_failure_emits_metric_when_actions_absent()
     -> KernelResult<(), Box<dyn std::error::Error>> {
-        let (engine, store, table_root) = setup_test();
+        let engine = SyncEngine::in_memory();
         // A commit with no protocol/metadata: the segment lists fine, then the read fails.
         add_commit(
             &table_root,
@@ -1090,7 +1089,7 @@ pub(super) mod tests {
     #[test_log::test(tokio::test)]
     async fn snapshot_update_from_existing_emits_metric()
     -> KernelResult<(), Box<dyn std::error::Error>> {
-        let (engine, store, table_root) = setup_test();
+        let engine = SyncEngine::in_memory();
         create_table(&store, &table_root).await?;
 
         // Build v0 snapshot before installing the reporter so only the update is measured
@@ -1120,7 +1119,7 @@ pub(super) mod tests {
     #[test_log::test(tokio::test)]
     async fn snapshot_update_to_earlier_version_emits_failed_metric()
     -> KernelResult<(), Box<dyn std::error::Error>> {
-        let (engine, store, table_root) = setup_test();
+        let engine = SyncEngine::in_memory();
         create_table(&store, &table_root).await?;
 
         // Build v1 snapshot before installing the reporter
@@ -1156,7 +1155,7 @@ pub(super) mod tests {
     #[test_log::test(tokio::test)]
     async fn snapshot_completed_duration_exceeds_log_segment_load_duration()
     -> KernelResult<(), Box<dyn std::error::Error>> {
-        let (engine, store, table_root) = setup_test();
+        let engine = SyncEngine::in_memory();
         create_table(&store, &table_root).await?;
 
         let (reporter, _guard) = measuring_reporter();
@@ -1196,7 +1195,7 @@ pub(super) mod tests {
     async fn snapshot_build_and_child_events_carry_correlation_id(
         #[case] correlation_id: Option<&str>,
     ) -> KernelResult<(), Box<dyn std::error::Error>> {
-        let (engine, store, table_root) = setup_test();
+        let engine = SyncEngine::in_memory();
         create_table(&store, &table_root).await?;
 
         let (reporter, _guard) = measuring_reporter();
@@ -1269,7 +1268,7 @@ pub(super) mod tests {
         /// commit at version 0 (protocol + metadata).
         pub(in crate::snapshot) async fn setup_catalog_managed_test()
         -> (Arc<SyncEngine>, Arc<DynObjectStore>, String) {
-            let (engine, store, table_root) = setup_test();
+            let engine = SyncEngine::in_memory();
             let actions = vec![TestAction::Metadata];
             add_commit(
                 &table_root,
@@ -1409,8 +1408,9 @@ pub(super) mod tests {
             #[values(None, Some(0), Some(1))] base_version: Option<Version>,
         ) -> KernelResult<(), Box<dyn std::error::Error>> {
             // Given: published history that can cross catalog-managed boundaries.
-            let (engine, store, table_root) = setup_test();
-            let engine = Arc::new(MeteredDeltaEngine::new(engine));
+            let engine = SyncEngine::in_memory();
+            let store = engine.store().clone();
+            let engine = Arc::new(MeteredDeltaEngine::new(Arc::new(engine)));
             let catalog_protocol = Protocol::try_new_modern(
                 [TableFeature::CatalogManaged],
                 [
@@ -1559,8 +1559,9 @@ pub(super) mod tests {
             #[values(false, true)] checkpointed: bool,
         ) -> KernelResult<(), Box<dyn std::error::Error>> {
             // Given: a ratified downgrade with the selected publication and checkpoint state.
-            let (engine, store, table_root) = setup_test();
-            let engine = Arc::new(MeteredDeltaEngine::new(engine));
+            let engine = SyncEngine::in_memory();
+            let store = engine.store().clone();
+            let engine = Arc::new(MeteredDeltaEngine::new(Arc::new(engine)));
             let initial_actions = actions_to_string_catalog_managed(vec![
                 TestAction::Metadata,
                 TestAction::Add("retained.parquet".into()),
@@ -2170,7 +2171,8 @@ pub(super) mod tests {
             #[values(false, true)] incremental: bool,
         ) -> KernelResult<(), Box<dyn std::error::Error>> {
             // Given: a table that repeatedly downgrades and re-upgrades.
-            let (engine, store, table_root) = setup_test();
+            let engine = SyncEngine::in_memory();
+            let store = engine.store();
             add_commit(
                 &table_root,
                 store.as_ref(),
@@ -2395,8 +2397,7 @@ pub(super) mod tests {
             #[values(None, Some(1))] requested_version: Option<Version>,
             #[values(None, Some(0), Some(1))] max_catalog_version: Option<Version>,
         ) -> KernelResult<(), Box<dyn std::error::Error>> {
-            let (engine, store, table_root) = setup_test();
-            let engine = MeteredDeltaEngine::new(engine);
+            let engine = SyncEngine::in_memory();
             let metadata = if catalog_managed {
                 actions_to_string_catalog_managed(vec![TestAction::Metadata])
             } else {

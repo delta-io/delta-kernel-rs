@@ -2690,7 +2690,7 @@ mod tests {
     #[tokio::test]
     async fn test_read_table_with_empty_last_checkpoint() {
         // in memory file system
-        let store = Arc::new(InMemory::new());
+        let engine = SyncEngine::in_memory();
 
         // do a _last_checkpoint file with "{}" as content
         let empty = "{}".as_bytes().to_vec();
@@ -2712,7 +2712,7 @@ mod tests {
     #[tokio::test]
     async fn test_read_table_with_last_checkpoint() {
         // in memory file system
-        let store = Arc::new(InMemory::new());
+        let engine = SyncEngine::in_memory();
 
         // Define test cases: (path, data, expected_result)
         let (data, expected) = valid_last_checkpoint();
@@ -2782,9 +2782,8 @@ mod tests {
     #[tokio::test]
     async fn test_domain_metadata() -> Result<()> {
         let table_root = "memory:///test_table/";
-        let store = Arc::new(InMemory::new());
-        let engine = SyncEngine::new_with_store(store.clone());
-
+        let engine = SyncEngine::in_memory();
+        let store = engine.store();
         // commit0
         // - domain1: not removed
         // - domain2: not removed
@@ -2922,8 +2921,7 @@ mod tests {
         #[case] expected_error: Option<&str>,
         #[case] table_root: &str,
     ) -> Result<()> {
-        let store = Arc::new(InMemory::new());
-        let engine = SyncEngine::new_with_store(store.clone());
+        let engine = SyncEngine::in_memory();
         commit(
             table_root,
             engine.store(),
@@ -3011,9 +3009,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_timestamp_with_ict_disabled() -> KernelResult<(), Box<dyn std::error::Error>> {
-        let store = Arc::new(InMemory::new());
+        let engine = SyncEngine::in_memory();
         let table_root = "memory://test/";
-        let engine = SyncEngine::new_with_store(store.clone());
 
         // Create a basic commit without ICT enabled
         let commit0 = create_basic_commit(false, None);
@@ -3031,9 +3028,8 @@ mod tests {
     #[tokio::test]
     async fn test_timestamp_with_ict_enablement_timeline()
     -> KernelResult<(), Box<dyn std::error::Error>> {
-        let store = Arc::new(InMemory::new());
+        let engine = SyncEngine::in_memory();
         let table_root = "memory://test/";
-        let engine = SyncEngine::new_with_store(store.clone());
 
         // Create initial commit without ICT
         let commit0 = create_basic_commit(false, None);
@@ -3074,8 +3070,7 @@ mod tests {
     async fn test_get_timestamp_enablement_version_in_future() -> Result<()> {
         // Test invalid state where snapshot has enablement version in the future - should error
         let table_root = "memory:///test_table/";
-        let store = Arc::new(InMemory::new());
-        let engine = SyncEngine::new_with_store(store.clone());
+        let engine = SyncEngine::in_memory();
 
         let commit_data = [
             json!({
@@ -3125,8 +3120,7 @@ mod tests {
     async fn test_get_timestamp_missing_ict_when_enabled() -> Result<()> {
         // Test missing ICT when it should be present - should error
         let table_root = "memory:///test_table/";
-        let store = Arc::new(InMemory::new());
-        let engine = SyncEngine::new_with_store(store.clone());
+        let engine = SyncEngine::in_memory();
 
         let commit_data = [
             create_protocol(true, Some(TABLE_FEATURES_MIN_READER_VERSION as u32)),
@@ -3160,8 +3154,7 @@ mod tests {
         // get_in_commit_timestamp should return an error
 
         let url = Url::parse("memory:///").map_err(KernelError::from)?;
-        let store = Arc::new(InMemory::new());
-        let engine = SyncEngine::new_with_store(store.clone());
+        let engine = SyncEngine::in_memory();
 
         // Create initial commit with ICT enabled
         let commit_data = [
@@ -3197,9 +3190,8 @@ mod tests {
         // Test the scenario where both checkpoint and commit exist at the same version with ICT
         // enabled.
         let table_root = "memory:///test_table/";
-        let store = Arc::new(InMemory::new());
-        let engine = SyncEngine::new_with_store(store.clone());
-
+        let engine = SyncEngine::in_memory();
+        let store = engine.store();
         // Create 00000000000000000000.json with ICT enabled
         let commit0_data = [
             create_commit_info(1587968586154, None),
@@ -3320,8 +3312,7 @@ mod tests {
         #[case] ict_enabled: bool,
     ) -> Result<()> {
         let url = Url::parse("memory:///").map_err(KernelError::from)?;
-        let store = Arc::new(InMemory::new());
-        let engine = SyncEngine::new_with_store(store.clone());
+        let engine = SyncEngine::in_memory();
 
         // TODO: refactor `ict_config` from a raw tuple to a dedicated ICTConfig struct so the
         // enablement version and enablement timestamp fields are named and self-documenting.
@@ -3366,8 +3357,8 @@ mod tests {
     #[tokio::test]
     async fn test_get_timestamp_preserves_commit_read_error() -> Result<()> {
         let table_root = "memory:///";
-        let store = Arc::new(InMemory::new());
-        let engine = SyncEngine::new_with_store(store.clone());
+        let engine = SyncEngine::in_memory();
+        let store = engine.store();
         let commit_data = vec![
             create_commit_info(1677811175819, Some(1677811175999)),
             create_protocol(true, Some(TABLE_FEATURES_MIN_READER_VERSION as u32)),
@@ -3407,9 +3398,8 @@ mod tests {
     async fn test_get_timestamp_errors_when_ict_missing_from_commit_info() -> Result<()> {
         // ICT is enabled and commit file IS present in the log segment, but the commitInfo
         // action does not carry an inCommitTimestamp value (corrupt/incomplete commit).
-        let store = Arc::new(InMemory::new());
+        let engine = SyncEngine::in_memory();
         let table_root = "memory:///test_table/";
-        let engine = SyncEngine::new_with_store(store.clone());
 
         let commit0_data = vec![
             create_commit_info(1677811175819, None), // commitInfo without inCommitTimestamp
@@ -3547,9 +3537,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_metadata_configuration() {
-        let storage = Arc::new(InMemory::new());
+        let engine = SyncEngine::in_memory();
         let table_root = "memory:///";
-        let engine = SyncEngine::new_with_store(storage.clone());
 
         // Create a commit with custom configuration
         let actions = vec![
@@ -3616,8 +3605,7 @@ mod tests {
         use crate::transaction::create_table::create_table;
         use crate::transaction::data_layout::DataLayout;
 
-        let storage = Arc::new(InMemory::new());
-        let engine = SyncEngine::new_with_store(storage);
+        let engine = SyncEngine::in_memory();
         let schema = schema_ref! {
             nullable "id": INTEGER,
             nullable "region": STRING,
@@ -3754,8 +3742,7 @@ mod tests {
     #[test]
     fn estimated_owned_heap_size_reflects_schema_string() {
         fn snap_with_schema(schema: SchemaRef) -> SnapshotRef {
-            let store = Arc::new(InMemory::new());
-            let engine = SyncEngine::new_with_store(store);
+            let engine = SyncEngine::in_memory();
             create_table("memory:///", schema, "test", true)
                 .build(&engine, Box::new(FileSystemCommitter::new()))
                 .unwrap()

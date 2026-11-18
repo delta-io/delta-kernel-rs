@@ -250,18 +250,15 @@ fn test_version_filtering() {
 #[tokio::test]
 #[ignore = "log compaction disabled (#2337)"]
 async fn test_no_compaction_staged_commits() {
-    use std::sync::Arc;
-
     use crate::actions::Add;
     use crate::engine::sync::SyncEngine;
     use crate::object_store::ObjectStoreExt as _;
-    use crate::object_store::memory::InMemory;
     use crate::object_store::path::Path;
     use crate::table_features::TableFeature;
 
     // Set up in-memory store
-    let store = Arc::new(InMemory::new());
-    let engine = SyncEngine::new_with_store(store.clone());
+    let engine = SyncEngine::in_memory();
+    let store = engine.store();
 
     // Create basic commits with proper metadata and protocol
     use crate::actions::{Metadata, Protocol};

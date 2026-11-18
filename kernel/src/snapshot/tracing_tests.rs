@@ -157,13 +157,6 @@ where
     }
 }
 
-fn setup_test() -> (Arc<SyncEngine>, Arc<DynObjectStore>, String) {
-    let table_root = String::from("memory:///");
-    let store = Arc::new(InMemory::new());
-    let engine = Arc::new(SyncEngine::new_with_store(store.clone()));
-    (engine, store, table_root)
-}
-
 async fn create_table(
     store: &Arc<DynObjectStore>,
     table_root: &str,
@@ -201,7 +194,7 @@ fn commit_log_path(table_root: &str, version: u64) -> LogPath {
 #[tokio::test]
 async fn snapshot_spans_avoid_heavy_context_and_constructors_capture_failure_arguments()
 -> Result<(), Box<dyn std::error::Error>> {
-    let (engine, store, table_root) = setup_test();
+    let engine = SyncEngine::in_memory();
     create_table(&store, &table_root).await?;
 
     let (captured, _guard) = install_capture();
@@ -318,7 +311,7 @@ async fn snapshot_spans_avoid_heavy_context_and_constructors_capture_failure_arg
     assert_eq!(incremental_error["checkpoint_handling"], "Adopt");
     assert_eq!(incremental_error["message"], "failed to update snapshot");
 
-    let (invalid_engine, invalid_store, invalid_root) = setup_test();
+    let invalid_engine = SyncEngine::in_memory();
     add_commit(
         &invalid_root,
         invalid_store.as_ref(),
@@ -352,7 +345,7 @@ async fn snapshot_spans_avoid_heavy_context_and_constructors_capture_failure_arg
 #[tokio::test]
 async fn snapshot_unsupported_reader_feature_emits_constructor_error()
 -> Result<(), Box<dyn std::error::Error>> {
-    let (engine, store, table_root) = setup_test();
+    let engine = SyncEngine::in_memory();
     let unsupported_table = METADATA.replace(
         r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}"#,
         r#"{"protocol":{"minReaderVersion":3,"minWriterVersion":7,"readerFeatures":["futureFeature"],"writerFeatures":["futureFeature"]}}"#,
@@ -381,7 +374,7 @@ async fn snapshot_unsupported_reader_feature_emits_constructor_error()
 #[tokio::test]
 async fn incremental_failure_captures_assembled_log_segment()
 -> Result<(), Box<dyn std::error::Error>> {
-    let (engine, store, table_root) = setup_test();
+    let engine = SyncEngine::in_memory();
     add_commit(&table_root, store.as_ref(), 0, METADATA.to_owned()).await?;
     let snapshot = SnapshotBuilder::new_for(&table_root)
         .at_version(0)
@@ -419,7 +412,7 @@ async fn incremental_failure_captures_assembled_log_segment()
 #[tokio::test]
 async fn snapshot_rebuild_failure_emits_inner_and_outer_constructor_errors()
 -> Result<(), Box<dyn std::error::Error>> {
-    let (engine, store, table_root) = setup_test();
+    let engine = SyncEngine::in_memory();
     create_table(&store, &table_root).await?;
     let snapshot = SnapshotBuilder::new_for(table_root)
         .at_version(0)
