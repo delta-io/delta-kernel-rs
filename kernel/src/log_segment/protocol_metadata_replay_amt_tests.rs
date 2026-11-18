@@ -1428,7 +1428,7 @@ async fn replay_reads_the_files_a_compaction_hides(
 // Writes `contents` as a log compaction over versions `lo..=hi` and returns a segment that uses it.
 // Compaction listing is disabled, so the compaction is added to the segment by hand.
 async fn segment_with_compaction(
-    store: &InMemory,
+    store: &DynObjectStore,
     table_root: &Url,
     engine: &impl Engine,
     (lo, hi): (u64, u64),
@@ -1584,7 +1584,7 @@ async fn snapshot_on_checkpoint_reads_last_manifest_commit_from_commit_file(
 
 // Writes a parquet checkpoint at `version` holding only top-level protocol and metaData. Kernel
 // refuses to write a classic checkpoint on an adaptiveMetadata table, so it is written by hand.
-async fn put_pm_checkpoint(store: &Arc<InMemory>, version: u64) {
+async fn put_pm_checkpoint(store: &DynObjectStore, version: u64) {
     let rows = protocol_and_metadata_lines(one_column_schema(), &[]);
     add_checkpoint_to_store(
         store,
@@ -1596,7 +1596,7 @@ async fn put_pm_checkpoint(store: &Arc<InMemory>, version: u64) {
 }
 
 // Writes a CRC at `version` carrying `pointer` as its `lastManifestCommit`.
-async fn put_crc_with_pointer(store: &InMemory, version: u64, pointer: LastManifestCommit) {
+async fn put_crc_with_pointer(store: &DynObjectStore, version: u64, pointer: LastManifestCommit) {
     let config = adaptive_metadata_table_configuration(one_column_schema(), &[]);
     let crc = Crc {
         version,

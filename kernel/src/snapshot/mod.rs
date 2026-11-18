@@ -1988,7 +1988,7 @@ impl Snapshot {
 #[cfg(test)]
 async fn commit(
     table_root: impl AsRef<str>,
-    store: &crate::object_store::memory::InMemory,
+    store: &crate::object_store::DynObjectStore,
     version: Version,
     commit: Vec<serde_json::Value>,
 ) {

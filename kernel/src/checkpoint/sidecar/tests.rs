@@ -19,9 +19,8 @@ use crate::checkpoint::tests::{
 use crate::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt};
 use crate::engine::arrow_expression::ArrowEvaluationHandler;
 use crate::engine::sync::SyncEngine;
-use crate::object_store::ObjectStoreExt as _;
-use crate::object_store::memory::InMemory;
 use crate::object_store::path::Path;
+use crate::object_store::{DynObjectStore, ObjectStoreExt as _};
 use crate::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use crate::schema::{DataType, StructType, schema, schema_ref};
 use crate::unit_test_utils::Action;
@@ -95,7 +94,7 @@ struct ExpectedNonFileContent<'a> {
 }
 
 /// Reads sidecar parquet files from storage and returns all record batches.
-async fn read_sidecar_batches(store: &Arc<InMemory>, sidecar_urls: &[Url]) -> Vec<RecordBatch> {
+async fn read_sidecar_batches(store: &DynObjectStore, sidecar_urls: &[Url]) -> Vec<RecordBatch> {
     let mut batches = Vec::new();
     for url in sidecar_urls {
         let obj_path = Path::from(url.path().strip_prefix('/').unwrap_or(url.path()));

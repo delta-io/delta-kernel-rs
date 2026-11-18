@@ -30,9 +30,9 @@ use crate::last_checkpoint_hint::{HintAction, LastCheckpointHint, LastCheckpoint
 use crate::log_replay::ActionsBatch;
 use crate::log_segment::LogSegment;
 use crate::log_segment_files::LogSegmentFiles;
-use crate::object_store::ObjectStoreExt as _;
 use crate::object_store::memory::InMemory;
 use crate::object_store::path::Path;
+use crate::object_store::{DynObjectStore, ObjectStoreExt as _};
 use crate::parquet::arrow::ArrowWriter;
 use crate::path::tests::multipart_checkpoint_name;
 use crate::path::{LogPathFileType, ParsedLogPath};
@@ -148,7 +148,7 @@ pub(crate) fn memory_log_root() -> Url {
 
 // Writes a record batch obtained from engine data to the in-memory store at a given path.
 async fn write_parquet_to_store(
-    store: &Arc<InMemory>,
+    store: &DynObjectStore,
     path: String,
     data: Box<dyn EngineData>,
 ) -> KernelResult<()> {
@@ -166,7 +166,7 @@ pub(crate) fn latest_log_segment(table_root: &Url, engine: &dyn Engine) -> LogSe
 /// Writes all actions to a _delta_log parquet checkpoint file in the store.
 /// This function formats the provided filename into the _delta_log directory.
 pub(crate) async fn add_checkpoint_to_store(
-    store: &Arc<InMemory>,
+    store: &DynObjectStore,
     data: Box<dyn EngineData>,
     filename: &str,
 ) -> KernelResult<()> {
@@ -177,7 +177,7 @@ pub(crate) async fn add_checkpoint_to_store(
 /// Writes a Parquet file with one row group per batch. All batches must share the same Arrow
 /// schema.
 async fn write_multi_row_group_parquet_to_store(
-    store: &Arc<InMemory>,
+    store: &DynObjectStore,
     row_groups: Vec<Box<dyn EngineData>>,
     path: &str,
 ) -> KernelResult<()> {
@@ -272,7 +272,7 @@ fn ignore_predicate_engine(sync_engine: &Arc<SyncEngine>) -> DelegatingEngine {
 /// Writes all actions to a _delta_log/_sidecars file in the store and return the [`FileMeta`].
 /// This function formats the provided filename into the _sidecars subdirectory.
 async fn add_sidecar_to_store(
-    store: &Arc<InMemory>,
+    store: &DynObjectStore,
     data: Box<dyn EngineData>,
     filename: &str,
 ) -> KernelResult<FileMeta> {
@@ -290,7 +290,7 @@ async fn add_sidecar_to_store(
 /// Writes all actions to a _delta_log json checkpoint file in the store.
 /// This function formats the provided filename into the _delta_log directory.
 async fn write_json_to_store(
-    store: &Arc<InMemory>,
+    store: &DynObjectStore,
     actions: Vec<Action>,
     filename: &str,
 ) -> KernelResult<()> {
@@ -477,7 +477,7 @@ fn log_segment_stats_ignores_compactions(
 }
 
 /// Gets the file size from the store for use in FileMeta
-async fn get_file_size(store: &Arc<InMemory>, path: &str) -> u64 {
+async fn get_file_size(store: &DynObjectStore, path: &str) -> u64 {
     let object_meta = store.head(&Path::from(path)).await.unwrap();
     object_meta.size
 }

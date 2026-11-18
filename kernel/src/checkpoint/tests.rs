@@ -28,9 +28,8 @@ use crate::committer::FileSystemCommitter;
 use crate::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt};
 use crate::engine::sync::SyncEngine;
 use crate::log_replay::HasSelectionVector;
-use crate::object_store::ObjectStoreExt as _;
-use crate::object_store::memory::InMemory;
 use crate::object_store::path::Path;
+use crate::object_store::{DynObjectStore, ObjectStoreExt as _};
 use crate::schema::{DataType as KernelDataType, StructField, schema_ref};
 use crate::table_features::TableFeature;
 use crate::transaction::UpdateTableOperation;
@@ -214,7 +213,7 @@ fn test_create_last_checkpoint_data() -> KernelResult<()> {
 /// Writes all actions to a _delta_log json commit file in the store.
 /// This function formats the provided filename into the _delta_log directory.
 pub(super) async fn write_commit_to_store(
-    store: &Arc<InMemory>,
+    store: &DynObjectStore,
     actions: Vec<Action>,
     version: u64,
 ) -> KernelResult<()> {
@@ -288,7 +287,7 @@ fn try_finalize_checkpoint(
 
 /// Helper to verify the contents of the `_last_checkpoint` file
 async fn assert_last_checkpoint_contents(
-    store: &Arc<InMemory>,
+    store: &DynObjectStore,
     expected_version: u64,
     expected_size: u64,
     expected_num_add_files: u64,
@@ -306,7 +305,7 @@ async fn assert_last_checkpoint_contents(
 }
 
 /// Reads the `_last_checkpoint` file from storage
-async fn read_last_checkpoint_file(store: &Arc<InMemory>) -> KernelResult<Value> {
+async fn read_last_checkpoint_file(store: &DynObjectStore) -> KernelResult<Value> {
     let path = Path::from("_delta_log/_last_checkpoint");
     let data = store.get(&path).await?;
     let byte_data = data.bytes().await?;

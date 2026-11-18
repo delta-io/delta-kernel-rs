@@ -663,7 +663,7 @@ pub(super) mod tests {
     }
 
     pub(in crate::snapshot) async fn create_table(
-        store: &Arc<DynObjectStore>,
+        store: &DynObjectStore,
         table_root: &str,
     ) -> KernelResult<(), Box<dyn std::error::Error>> {
         add_commit(
