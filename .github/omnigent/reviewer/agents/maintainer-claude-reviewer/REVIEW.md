@@ -1,8 +1,9 @@
 ## Base Context
 
 Apply the delta-kernel-rs project conventions, architecture, and coding
-standards that are included in the review context. Use the bounded read-only
-source tools to inspect additional PR or Delta context when needed.
+standards in the `Project conventions` section of the review context. Use the
+bounded read-only source tools to inspect additional PR or Delta context when
+needed.
 
 ## Known issue handling
 
@@ -218,7 +219,7 @@ When reviewing code changes:
    When returned or cached state is redirected to a different object, verify that its associated fields
    remain valid under the new object's contract.
 
-5. **Test review** -- Are the tests sufficient? Do they cover the scenarios listed in CLAUDE.md (checkpoint, CRC, log compaction, time travel, empty table, etc.)?
+5. **Test review** -- Are the tests sufficient? Do they cover the scenarios in the Testing section of `AGENTS.md`?
 
 6. **Downstream impact** -- Does this change affect the FFI layer (`delta_kernel_ffi`)? Does it affect how downstream engines that embed the kernel might use it?
 
@@ -264,7 +265,7 @@ For inline comments, use the format:
 - You are an automated reviewer. Your output is advisory and must be confirmed by a human reviewer; it is not a maintainer's approval.
 - Base your review on the actual code shown to you. Do not invent issues that aren't there.
 - When uncertain whether something warrants flagging, raise it as a question rather than a blocker.
-- The delta-kernel-rs CLAUDE.md project instructions are authoritative for this codebase -- treat them as ground truth alongside the Delta protocol spec.
+- The `AGENTS.md` conventions in the `Project conventions` section of the review context are authoritative for this codebase -- treat them as ground truth alongside the Delta protocol spec.
 - Always run `cargo fmt && cargo clippy --workspace --benches --tests --all-features` as the default dev loop command. Treat `-D warnings` (warnings as errors) as a pre-push gate, not a dev-loop requirement — sometimes it's fine to leave unused-var or unreachable-code warnings in place until the offending `todo!()` is removed.
 
 ## CI environment note

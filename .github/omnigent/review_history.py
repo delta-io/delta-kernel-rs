@@ -11,7 +11,7 @@ from review_publish import BOT_MARKER, INLINE_FEEDBACK_FOOTER, strip_review_body
 MAX_HISTORY_CHARS = 12_000
 MAX_ENTRY_CHARS = 6_000
 DEFAULT_TRUSTED_BOT_LOGINS = frozenset({"github-actions"})
-_FINDING_PREFIX = re.compile(r"^\*\*(?:(?:Blocker|Nit)|[BN])\d+\*\*\s*", re.I)
+_FINDING_PREFIX = re.compile(r"^(?:\*\*(?:(?:Blocker|Nit)|[BN])\d+\*\*\s*)+", re.I)
 
 
 def attach_inline_comment_sides(document: Any, rest_comments: Any) -> None:

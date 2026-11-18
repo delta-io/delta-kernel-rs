@@ -80,13 +80,15 @@ dispatch has produced a result or exhausted its retry and every required
 disprove gate has returned a verdict.
 
 ## Disprove gate
-Before publishing any Blocker or Should Fix, run `disprove-reviewer` on the
-candidate finding list. Dispatch exactly one `disprove-reviewer` call for the
-whole batch; do not spawn one disprove reviewer per agent or per finding. Give
-it only compact, structured candidate findings, the agents that raised each
-finding, the cited diff excerpt/reference, and the proposed fix. Do not include
-the original reviewer reasoning beyond the candidate claim. Wait for the
-disprove gate before final consolidation.
+Before publishing, run `disprove-reviewer` on every candidate finding that a
+reviewer raised as blocking or should-fix. Published findings use only
+`Blocker<N>` and `Nit<N>` IDs; there is no published Should Fix category.
+Dispatch exactly one `disprove-reviewer` call for the whole batch; do not spawn
+one disprove reviewer per agent or per finding. Give it only compact,
+structured candidate findings, the agents that raised each finding, the cited
+diff excerpt/reference, and the proposed fix. Do not include the original
+reviewer reasoning beyond the candidate claim. Wait for the disprove gate
+before final consolidation.
 
 Route the gate's verdicts as follows:
 - `CONFIRMED`: keep the finding in the final review.
@@ -97,12 +99,13 @@ Route the gate's verdicts as follows:
 ## Consolidation
 When the reviewers report, deduplicate overlapping findings, drop weak or
 speculative ones (this repo has a strict, low-false-positive AI policy -- err
-toward silence), and merge everything into ONE review with sections:
-1. **Blocking issues** -- real correctness/protocol/safety defects present in the diff, plus
-   materially inaccurate PR descriptions or undisclosed breaking changes. Verify each is genuine
-   before including it; if unsure, drop it.
-2. **Non-blocking notes** -- brief, only if genuinely useful.
-3. **Summary** -- one paragraph.
+toward silence), and merge everything into ONE review. Write each section under
+exactly this level-two Markdown heading, in this order:
+- `## Blocking issues` -- real correctness/protocol/safety defects present in the diff, plus
+  materially inaccurate PR descriptions or undisclosed breaking changes. Verify each is genuine
+  before including it; if unsure, drop it.
+- `## Non-blocking notes` -- brief, only if genuinely useful.
+- `## Summary` -- one paragraph.
 Omit any empty section. Do NOT comment on style/formatting a linter catches,
 and do NOT restate the diff. "No blocking issues" is a fine review.
 

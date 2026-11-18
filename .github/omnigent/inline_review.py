@@ -31,7 +31,7 @@ _FINDING_HEADING = re.compile(
 )
 _SECTION_NAME_PATTERN = "|".join(re.escape(name) for name in _REVIEW_SECTION_NAMES)
 _SECTION_HEADING = re.compile(
-    rf"^(?:(?:##\s+)(?:{_SECTION_NAME_PATTERN})\s*:?|"
+    rf"^(?:(?:#{{2,3}}\s+)(?:{_SECTION_NAME_PATTERN})\s*:?|"
     rf"(?:\d+\.\s+\*\*)(?:{_SECTION_NAME_PATTERN})\*\*\s*:?|"
     rf"(?:{_SECTION_NAME_PATTERN})\s*:)\s*$",
     re.IGNORECASE,
@@ -40,7 +40,7 @@ _FINDING_GROUP_NAME_PATTERN = "|".join(
     re.escape(name) for name in _REVIEW_SECTION_NAMES[:2]
 )
 _FINDING_GROUP_HEADING = re.compile(
-    rf"^(?:(?:##\s+)(?:{_FINDING_GROUP_NAME_PATTERN})\s*:?|"
+    rf"^(?:(?:#{{2,3}}\s+)(?:{_FINDING_GROUP_NAME_PATTERN})\s*:?|"
     rf"(?:\d+\.\s+\*\*)(?:{_FINDING_GROUP_NAME_PATTERN})\*\*\s*:?|"
     rf"(?:{_FINDING_GROUP_NAME_PATTERN})\s*:)\s*$",
     re.IGNORECASE,
@@ -129,7 +129,8 @@ in the collapsed review. Start every human-readable finding on its own Markdown
 heading matching `{_FINDING_HEADING_TEMPLATE}`, using the same ID in this block.
 Keep the Summary to an overall assessment rather than repeating finding details.
 Use IDs matching `{_FINDING_ID.pattern}` (for example, `Blocker1` or `Nit1`) and
-do not add an entry for the Summary. Use the repository-relative path with no
+do not add an entry for the Summary. Do not start `body` with the finding ID;
+the workflow adds it. Use the repository-relative path with no
 backticks. Use {INLINE_FINDING_SIDES[1]} and the head-file line
 number for additions or context; use {INLINE_FINDING_SIDES[0]} and the base-file
 line number only for deleted lines. The location must occur in the supplied
@@ -445,7 +446,18 @@ def _validate_finding(finding: Any) -> tuple[str, str, int, str, str]:
         raise ValueError(f"inline finding {finding_id} has an invalid body")
     if any(ord(char) < 32 and char not in "\n\t" for char in body):
         raise ValueError(f"inline finding {finding_id} has control characters")
-    return finding_id, path, line, side, body.strip()
+    return finding_id, path, line, side, _strip_leading_id(body.strip(), finding_id)
+
+
+def _strip_leading_id(body: str, finding_id: str) -> str:
+    """Remove a ``finding_id`` label that the model repeated at the start of ``body``.
+
+    Only label forms are removed (``**Nit1**``, ``**Nit1:**``, ``Nit1:``). Prose that
+    begins with the ID, such as "Nit1 and Nit2 share a cause", is kept.
+    """
+    label = re.escape(finding_id)
+    stripped = re.sub(rf"^(?:\*\*{label}:?\*\*:?|{label}:)\s*", "", body)
+    return stripped or body
 
 
 def _load_history(path: Path) -> Any:

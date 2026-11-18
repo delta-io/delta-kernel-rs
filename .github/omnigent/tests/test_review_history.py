@@ -216,6 +216,14 @@ class ReviewHistoryTest(unittest.TestCase):
             module.canonical_finding_body("**Blocker1** Repeated finding."),
         )
 
+    def test_finding_normalization_ignores_doubled_id_prefix(self) -> None:
+        module = _load_module()
+
+        self.assertEqual(
+            module.canonical_finding_body("**Blocker1** **Blocker1** Repeated finding."),
+            module.canonical_finding_body("**Blocker2** Repeated finding."),
+        )
+
     def test_complete_review_deduplication_round_trips_publication_wrapper(self) -> None:
         module = _load_module()
         review_publish_path = Path(__file__).parents[1] / "review_publish.py"
