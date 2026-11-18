@@ -195,11 +195,11 @@ fn commit_log_path(table_root: &str, version: u64) -> LogPath {
 async fn snapshot_spans_avoid_heavy_context_and_constructors_capture_failure_arguments()
 -> Result<(), Box<dyn std::error::Error>> {
     let engine = SyncEngine::in_memory();
-    create_table(&store, &table_root).await?;
+    create_table(&engine, TABLE_ROOT).await?;
 
     let (captured, _guard) = install_capture();
 
-    let snapshot = SnapshotBuilder::new_for(table_root.clone())
+    let snapshot = SnapshotBuilder::new_for(TABLE_ROOT)
         .at_version(0)
         .build(engine.as_ref())?;
     let updated = SnapshotBuilder::new_from(snapshot).build(engine.as_ref())?;
@@ -259,7 +259,7 @@ async fn snapshot_spans_avoid_heavy_context_and_constructors_capture_failure_arg
                 fields.values().all(|value| value.len() < 256)
                     && fields
                         .get("path")
-                        .is_some_and(|path| path.contains(&table_root))
+                        .is_some_and(|path| path.contains(TABLE_ROOT))
             })
     );
     let fresh_values = trace_fields(&initial_values, FRESH_CONSTRUCTOR_SPAN);
@@ -313,14 +313,14 @@ async fn snapshot_spans_avoid_heavy_context_and_constructors_capture_failure_arg
 
     let invalid_engine = SyncEngine::in_memory();
     add_commit(
-        &invalid_root,
-        invalid_store.as_ref(),
+        TABLE_ROOT,
+        invalid_engine.store(),
         0,
         actions_to_string(vec![TestAction::Add("part-00000-test.parquet".into())]),
     )
     .await?;
     assert!(
-        SnapshotBuilder::new_for(invalid_root)
+        SnapshotBuilder::new_for(TABLE_ROOT)
             .with_correlation_id("fresh-test")
             .build(invalid_engine.as_ref())
             .is_err()
@@ -350,11 +350,11 @@ async fn snapshot_unsupported_reader_feature_emits_constructor_error()
         r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}"#,
         r#"{"protocol":{"minReaderVersion":3,"minWriterVersion":7,"readerFeatures":["futureFeature"],"writerFeatures":["futureFeature"]}}"#,
     );
-    add_commit(&table_root, store.as_ref(), 0, unsupported_table).await?;
+    add_commit(TABLE_ROOT, engine.store(), 0, unsupported_table).await?;
 
     let (captured, _guard) = install_capture();
     assert!(
-        SnapshotBuilder::new_for(table_root)
+        SnapshotBuilder::new_for(TABLE_ROOT)
             .with_correlation_id("unsupported-feature-test")
             .build(engine.as_ref())
             .is_err()
@@ -375,23 +375,23 @@ async fn snapshot_unsupported_reader_feature_emits_constructor_error()
 async fn incremental_failure_captures_assembled_log_segment()
 -> Result<(), Box<dyn std::error::Error>> {
     let engine = SyncEngine::in_memory();
-    add_commit(&table_root, store.as_ref(), 0, METADATA.to_owned()).await?;
-    let snapshot = SnapshotBuilder::new_for(&table_root)
+    add_commit(TABLE_ROOT, engine.store(), 0, METADATA.to_owned()).await?;
+    let snapshot = SnapshotBuilder::new_for(TABLE_ROOT)
         .at_version(0)
-        .build(engine.as_ref())?;
+        .build(&engine)?;
 
     let unsupported_table = METADATA.replace(
         r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}"#,
         r#"{"protocol":{"minReaderVersion":3,"minWriterVersion":7,"readerFeatures":["futureFeature"],"writerFeatures":["futureFeature"]}}"#,
     );
-    add_commit(&table_root, store.as_ref(), 1, unsupported_table).await?;
+    add_commit(TABLE_ROOT, engine.store(), 1, unsupported_table).await?;
 
     let (captured, _guard) = install_capture();
     assert!(
         SnapshotBuilder::new_from(snapshot)
             .with_log_tail(vec![
-                commit_log_path(&table_root, 0),
-                commit_log_path(&table_root, 1),
+                commit_log_path(TABLE_ROOT, 0),
+                commit_log_path(TABLE_ROOT, 1),
             ])
             .build(engine.as_ref())
             .is_err()
@@ -413,8 +413,8 @@ async fn incremental_failure_captures_assembled_log_segment()
 async fn snapshot_rebuild_failure_emits_inner_and_outer_constructor_errors()
 -> Result<(), Box<dyn std::error::Error>> {
     let engine = SyncEngine::in_memory();
-    create_table(&store, &table_root).await?;
-    let snapshot = SnapshotBuilder::new_for(table_root)
+    create_table(&engine, TABLE_ROOT).await?;
+    let snapshot = SnapshotBuilder::new_for(TABLE_ROOT)
         .at_version(0)
         .build(engine.as_ref())?;
 

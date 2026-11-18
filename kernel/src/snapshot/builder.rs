@@ -633,7 +633,6 @@ pub(super) mod tests {
     use super::*;
     use crate::engine::sync::SyncEngine;
     use crate::metrics::{LogSegmentLoadType, MetricEvent};
-    use crate::object_store::memory::InMemory;
     use crate::object_store::path::Path;
     use crate::object_store::{DynObjectStore, ObjectStoreExt as _};
     use crate::schema::{ArrayType, DataType, MapType, StructField, StructType};
@@ -641,12 +640,7 @@ pub(super) mod tests {
     use crate::utils::FoldWithOption as _;
     use crate::{DeltaErrorCondition, Result};
 
-    pub(in crate::snapshot) fn setup_test() -> (Arc<SyncEngine>, Arc<DynObjectStore>, String) {
-        let table_root = String::from("memory:///");
-        let store = Arc::new(InMemory::new());
-        let engine = Arc::new(SyncEngine::new_with_store(store.clone()));
-        (engine, store, table_root)
-    }
+    pub(in crate::snapshot) const TABLE_ROOT: &str = "memory:///";
 
     /// Returns the snapshot's active file paths in sorted order.
     pub(in crate::snapshot) fn scan_paths(
@@ -690,14 +684,14 @@ pub(super) mod tests {
     #[test_log::test(tokio::test)]
     async fn test_snapshot_builder() -> KernelResult<(), Box<dyn std::error::Error>> {
         let engine = SyncEngine::in_memory();
-        create_table(&store, &table_root).await?;
+        create_table(engine.store(), TABLE_ROOT).await?;
 
-        let snapshot = SnapshotBuilder::new_for(table_root.clone()).build(engine)?;
+        let snapshot = SnapshotBuilder::new_for(TABLE_ROOT).build(&engine)?;
         assert_eq!(snapshot.version(), 1);
 
-        let snapshot = SnapshotBuilder::new_for(table_root.clone())
+        let snapshot = SnapshotBuilder::new_for(TABLE_ROOT)
             .at_version(0)
-            .build(engine)?;
+            .build(&engine)?;
         assert_eq!(snapshot.version(), 0);
 
         Ok(())
@@ -734,20 +728,14 @@ pub(super) mod tests {
             "configuration": {}
         }});
         let protocol = json!({"protocol": {"minReaderVersion": 1, "minWriterVersion": 2}});
-        add_commit(
-            &table_root,
-            store.as_ref(),
-            0,
-            format!("{protocol}\n{metadata}"),
-        )
-        .await?;
-        let initial = Snapshot::builder_for(&table_root).build(engine.as_ref())?;
+        add_commit(TABLE_ROOT, store, 0, format!("{protocol}\n{metadata}")).await?;
+        let initial = Snapshot::builder_for(TABLE_ROOT).build(&engine)?;
         assert_eq!(initial.schema().as_ref(), &schema);
         let scan = initial.clone().scan_builder().build()?;
         assert_eq!(scan.logical_schema().as_ref(), &schema);
 
         metadata["metaData"]["name"] = json!("updated-metadata");
-        add_commit(&table_root, store.as_ref(), 1, metadata.to_string()).await?;
+        add_commit(TABLE_ROOT, store, 1, metadata.to_string()).await?;
         let updated = Snapshot::builder_from(initial).build(engine.as_ref())?;
         assert_eq!(updated.version(), 1);
         assert_eq!(
@@ -755,7 +743,7 @@ pub(super) mod tests {
             Some("updated-metadata")
         );
         assert_eq!(updated.schema().as_ref(), &schema);
-        let rebuilt = Snapshot::builder_for(&table_root)
+        let rebuilt = Snapshot::builder_for(TABLE_ROOT)
             .with_snapshot_hint(updated.to_snapshot_hint()?)
             .build(engine.as_ref())?;
         assert_eq!(rebuilt.schema().as_ref(), &schema);
@@ -803,7 +791,7 @@ pub(super) mod tests {
         let path = Path::from("_delta_log/00000000000000000000.json");
         store.put(&path, commit0_data.into()).await?;
 
-        let Error::Delta(error) = SnapshotBuilder::new_for(table_root)
+        let Error::Delta(error) = SnapshotBuilder::new_for(TABLE_ROOT)
             .build(engine)
             .unwrap_err()
         else {
@@ -856,7 +844,7 @@ pub(super) mod tests {
             .await?;
 
         let (reporter, _guard) = measuring_reporter();
-        let result = SnapshotBuilder::new_for(table_root).build(engine.as_ref());
+        let result = SnapshotBuilder::new_for(TABLE_ROOT).build(&engine);
         assert!(result.is_err());
 
         let events = reporter.events();
@@ -880,10 +868,10 @@ pub(super) mod tests {
         let engine = SyncEngine::in_memory();
         let (reporter, _guard) = measuring_reporter();
 
-        let error = SnapshotBuilder::new_for(&table_root)
-            .build(engine.as_ref())
+        let error = SnapshotBuilder::new_for(TABLE_ROOT)
+            .build(&engine)
             .unwrap_err();
-        assert_path_does_not_exist(&error, &table_root, &KernelError::EmptyLog);
+        assert_path_does_not_exist(&error, TABLE_ROOT, &KernelError::EmptyLog);
 
         let events = reporter.events();
         let failure = events
@@ -986,7 +974,7 @@ pub(super) mod tests {
         #[case] max_catalog_version: Option<Version>,
     ) {
         let engine = SyncEngine::in_memory();
-        let error = SnapshotBuilder::new_for(table_root)
+        let error = SnapshotBuilder::new_for(TABLE_ROOT)
             .fold_with(version, SnapshotBuilder::at_version)
             .fold_with(
                 max_catalog_version,
@@ -1012,7 +1000,7 @@ pub(super) mod tests {
             )
             .await
             .map_err(KernelError::from)?;
-        let error = SnapshotBuilder::new_for(table_root)
+        let error = SnapshotBuilder::new_for(TABLE_ROOT)
             .build(engine.as_ref())
             .unwrap_err();
         assert!(
@@ -1056,19 +1044,15 @@ pub(super) mod tests {
         let engine = SyncEngine::in_memory();
         // A commit with no protocol/metadata: the segment lists fine, then the read fails.
         add_commit(
-            &table_root,
-            store.as_ref(),
+            TABLE_ROOT,
+            engine.store(),
             0,
             actions_to_string(vec![TestAction::Add("part-00000-test.parquet".into())]),
         )
         .await?;
         let (reporter, _guard) = measuring_reporter();
 
-        assert!(
-            SnapshotBuilder::new_for(table_root)
-                .build(engine.as_ref())
-                .is_err()
-        );
+        assert!(SnapshotBuilder::new_for(TABLE_ROOT).build(&engine).is_err());
 
         let events = reporter.events();
         assert!(
@@ -1090,10 +1074,10 @@ pub(super) mod tests {
     async fn snapshot_update_from_existing_emits_metric()
     -> KernelResult<(), Box<dyn std::error::Error>> {
         let engine = SyncEngine::in_memory();
-        create_table(&store, &table_root).await?;
+        create_table(engine.store(), TABLE_ROOT).await?;
 
         // Build v0 snapshot before installing the reporter so only the update is measured
-        let snap_v0 = SnapshotBuilder::new_for(table_root)
+        let snap_v0 = SnapshotBuilder::new_for(TABLE_ROOT)
             .at_version(0)
             .build(engine.as_ref())?;
         assert_eq!(snap_v0.version(), 0);
@@ -1120,10 +1104,10 @@ pub(super) mod tests {
     async fn snapshot_update_to_earlier_version_emits_failed_metric()
     -> KernelResult<(), Box<dyn std::error::Error>> {
         let engine = SyncEngine::in_memory();
-        create_table(&store, &table_root).await?;
+        create_table(engine.store(), TABLE_ROOT).await?;
 
         // Build v1 snapshot before installing the reporter
-        let snap_v1 = SnapshotBuilder::new_for(table_root).build(engine.as_ref())?;
+        let snap_v1 = SnapshotBuilder::new_for(TABLE_ROOT).build(&engine)?;
         assert_eq!(snap_v1.version(), 1);
 
         let (reporter, _guard) = measuring_reporter();
@@ -1156,10 +1140,10 @@ pub(super) mod tests {
     async fn snapshot_completed_duration_exceeds_log_segment_load_duration()
     -> KernelResult<(), Box<dyn std::error::Error>> {
         let engine = SyncEngine::in_memory();
-        create_table(&store, &table_root).await?;
+        create_table(engine.store(), TABLE_ROOT).await?;
 
         let (reporter, _guard) = measuring_reporter();
-        let _snap = SnapshotBuilder::new_for(table_root).build(engine.as_ref())?;
+        let _snap = SnapshotBuilder::new_for(TABLE_ROOT).build(&engine)?;
 
         let events = reporter.events();
         let snap_duration = events
@@ -1196,10 +1180,10 @@ pub(super) mod tests {
         #[case] correlation_id: Option<&str>,
     ) -> KernelResult<(), Box<dyn std::error::Error>> {
         let engine = SyncEngine::in_memory();
-        create_table(&store, &table_root).await?;
+        create_table(engine.store(), TABLE_ROOT).await?;
 
         let (reporter, _guard) = measuring_reporter();
-        let _ = SnapshotBuilder::new_for(table_root)
+        let _ = SnapshotBuilder::new_for(TABLE_ROOT)
             .fold_with(correlation_id, SnapshotBuilder::with_correlation_id)
             .build(engine.as_ref())?;
 
@@ -1271,14 +1255,14 @@ pub(super) mod tests {
             let engine = SyncEngine::in_memory();
             let actions = vec![TestAction::Metadata];
             add_commit(
-                &table_root,
-                store.as_ref(),
+                TABLE_ROOT,
+                engine.store(),
                 0,
                 actions_to_string_catalog_managed(actions),
             )
             .await
             .expect("Failed to write initial catalog-managed commit");
-            (engine, store, table_root)
+            engine
         }
 
         #[rstest]
@@ -1292,8 +1276,8 @@ pub(super) mod tests {
             #[values(None, Some(0), Some(1))] requested_version: Option<Version>,
             #[values(false, true)] incremental: bool,
         ) -> KernelResult<(), Box<dyn std::error::Error>> {
-            let (engine, store, table_root) = setup_catalog_managed_test().await;
-            let base = SnapshotBuilder::new_for(&table_root)
+            let engine = setup_catalog_managed_test().await;
+            let base = SnapshotBuilder::new_for(TABLE_ROOT)
                 .with_max_catalog_version(0)
                 .build(engine.as_ref())?;
             let actions = if downgrade {
@@ -1305,12 +1289,12 @@ pub(super) mod tests {
             } else {
                 "{}".into()
             };
-            let path1 = add_staged_commit(&table_root, store.as_ref(), 1, actions.clone()).await?;
+            let path1 = add_staged_commit(TABLE_ROOT, engine.store(), 1, actions.clone()).await?;
             if published {
-                add_commit(&table_root, store.as_ref(), 1, actions).await?;
+                add_commit(TABLE_ROOT, engine.store(), 1, actions).await?;
             }
 
-            let log_tail = vec![create_log_path(&table_root, path1)];
+            let log_tail = vec![create_log_path(TABLE_ROOT, path1)];
 
             let result = if incremental {
                 SnapshotBuilder::new_from(base)
@@ -1318,7 +1302,7 @@ pub(super) mod tests {
                     .fold_with(requested_version, SnapshotBuilder::at_version)
                     .build(engine.as_ref())
             } else {
-                SnapshotBuilder::new_for(table_root)
+                SnapshotBuilder::new_for(TABLE_ROOT)
                     .with_log_tail(log_tail)
                     .fold_with(requested_version, SnapshotBuilder::at_version)
                     .build(engine.as_ref())
@@ -1334,9 +1318,9 @@ pub(super) mod tests {
 
         #[test_log::test(tokio::test)]
         async fn test_version_exceeds_max_catalog_version_errors() -> KernelResult<()> {
-            let (engine, _store, table_root) = setup_catalog_managed_test().await;
+            let engine = setup_catalog_managed_test().await;
 
-            let result = SnapshotBuilder::new_for(table_root)
+            let result = SnapshotBuilder::new_for(TABLE_ROOT)
                 .at_version(5)
                 .with_max_catalog_version(3)
                 .build(engine.as_ref());
@@ -1352,19 +1336,19 @@ pub(super) mod tests {
         #[test_log::test(tokio::test)]
         async fn test_log_tail_last_version_mismatch_errors()
         -> KernelResult<(), Box<dyn std::error::Error>> {
-            let (engine, store, table_root) = setup_catalog_managed_test().await;
+            let engine = setup_catalog_managed_test().await;
             let actions = vec![TestAction::Add("file_1.parquet".to_string())];
-            add_commit(&table_root, store.as_ref(), 1, actions_to_string(actions)).await?;
+            add_commit(TABLE_ROOT, engine.store(), 1, actions_to_string(actions)).await?;
             let actions = vec![TestAction::Add("file_2.parquet".to_string())];
-            add_commit(&table_root, store.as_ref(), 2, actions_to_string(actions)).await?;
+            add_commit(TABLE_ROOT, engine.store(), 2, actions_to_string(actions)).await?;
 
             let log_tail = vec![
-                create_log_path(&table_root, test_utils::delta_path_for_version(1, "json")),
-                create_log_path(&table_root, test_utils::delta_path_for_version(2, "json")),
+                create_log_path(TABLE_ROOT, test_utils::delta_path_for_version(1, "json")),
+                create_log_path(TABLE_ROOT, test_utils::delta_path_for_version(2, "json")),
             ];
 
             // log_tail ends at v2, max_catalog_version=3, no time-travel -> error
-            let result = SnapshotBuilder::new_for(table_root)
+            let result = SnapshotBuilder::new_for(TABLE_ROOT)
                 .with_log_tail(log_tail)
                 .with_max_catalog_version(3)
                 .build(engine.as_ref());
@@ -1380,9 +1364,9 @@ pub(super) mod tests {
         #[test_log::test(tokio::test)]
         async fn test_catalog_managed_table_without_max_catalog_version_errors() -> KernelResult<()>
         {
-            let (engine, _store, table_root) = setup_catalog_managed_test().await;
+            let engine = setup_catalog_managed_test().await;
 
-            let result = SnapshotBuilder::new_for(table_root).build(engine.as_ref());
+            let result = SnapshotBuilder::new_for(TABLE_ROOT).build(&engine);
 
             assert!(matches!(
                 result,
@@ -1433,8 +1417,8 @@ pub(super) mod tests {
                 })
                 .collect::<KernelResult<Vec<_>, _>>()?
                 .join("\n");
-            add_commit(&table_root, store.as_ref(), 0, initial_actions).await?;
-            let base = SnapshotBuilder::new_for(&table_root)
+            add_commit(TABLE_ROOT, &store, 0, initial_actions).await?;
+            let base = SnapshotBuilder::new_for(TABLE_ROOT)
                 .at_version(0)
                 .build(engine.as_ref())?;
             assert_eq!(
@@ -1452,7 +1436,7 @@ pub(super) mod tests {
                     };
                     actions.push_str(&format!("\n{}", json!({"protocol": protocol})));
                 }
-                add_commit(&table_root, store.as_ref(), version as Version, actions).await?;
+                add_commit(TABLE_ROOT, &store, version as Version, actions).await?;
             }
             let base = if let Some(version) = base_version {
                 SnapshotBuilder::new_from(base)
@@ -1478,7 +1462,7 @@ pub(super) mod tests {
                     )
                     .build(engine.as_ref())
             } else {
-                SnapshotBuilder::new_for(&table_root)
+                SnapshotBuilder::new_for(TABLE_ROOT)
                     .fold_with(requested_version, SnapshotBuilder::at_version)
                     .fold_with(
                         max_catalog_version,
@@ -1511,7 +1495,7 @@ pub(super) mod tests {
                 snapshot.table_configuration().is_catalog_managed(),
                 catalog_managed_at_version[expected_version as usize]
             );
-            let hinted = SnapshotBuilder::new_for(&table_root)
+            let hinted = SnapshotBuilder::new_for(TABLE_ROOT)
                 .with_snapshot_hint(snapshot.to_snapshot_hint()?)
                 .fold_with(requested_version, SnapshotBuilder::at_version)
                 .fold_with(
@@ -1568,8 +1552,8 @@ pub(super) mod tests {
                 TestAction::Add("removed.parquet".into()),
             ])
             .replace("catalogManaged", catalog_feature);
-            add_commit(&table_root, store.as_ref(), 0, initial_actions).await?;
-            let base = SnapshotBuilder::new_for(&table_root)
+            add_commit(TABLE_ROOT, &store, 0, initial_actions).await?;
+            let base = SnapshotBuilder::new_for(TABLE_ROOT)
                 .with_max_catalog_version(0)
                 .build(engine.as_ref())?;
             let base = if checkpointed {
@@ -1592,9 +1576,9 @@ pub(super) mod tests {
                 ])
             );
             let staged_downgrade =
-                add_staged_commit(&table_root, store.as_ref(), 1, downgrade.clone()).await?;
+                add_staged_commit(TABLE_ROOT, &store, 1, downgrade.clone()).await?;
             let expected_commit = create_log_path(
-                &table_root,
+                TABLE_ROOT,
                 if supply_tail {
                     staged_downgrade
                 } else {
@@ -1608,7 +1592,7 @@ pub(super) mod tests {
             };
             let expected_commit: ParsedLogPath = expected_commit.into();
             if published {
-                add_commit(&table_root, store.as_ref(), 1, downgrade).await?;
+                add_commit(TABLE_ROOT, &store, 1, downgrade).await?;
             }
 
             // When: load the downgrade through catalog discovery.
@@ -1619,7 +1603,7 @@ pub(super) mod tests {
                     .with_max_catalog_version(1)
                     .build(engine.as_ref())
             } else {
-                SnapshotBuilder::new_for(&table_root)
+                SnapshotBuilder::new_for(TABLE_ROOT)
                     .with_log_tail(log_tail)
                     .with_max_catalog_version(1)
                     .build(engine.as_ref())
@@ -1675,7 +1659,7 @@ pub(super) mod tests {
                     .count(),
                 1
             );
-            let hinted = SnapshotBuilder::new_for(&table_root)
+            let hinted = SnapshotBuilder::new_for(TABLE_ROOT)
                 .with_snapshot_hint(snapshot.to_snapshot_hint()?)
                 .build(engine.as_ref())?;
             for snapshot in [snapshot, hinted] {
@@ -1708,10 +1692,11 @@ pub(super) mod tests {
         ) -> KernelResult<(), Box<dyn std::error::Error>> {
             // Given: a cached snapshot of a ratified downgrade before publication.
             let downgrade_version = 2;
-            let (engine, store, table_root) = setup_catalog_managed_test().await;
-            let engine = Arc::new(MeteredDeltaEngine::new(engine));
+            let engine = setup_catalog_managed_test().await;
+            let store = engine.store().clone();
+            let engine = Arc::new(MeteredDeltaEngine::new(Arc::new(engine)));
             for version in 1..downgrade_version {
-                add_commit(&table_root, store.as_ref(), version, "{}".into()).await?;
+                add_commit(TABLE_ROOT, &store, version, "{}".into()).await?;
             }
             let downgrade = format!(
                 "{}\n{}",
@@ -1721,15 +1706,10 @@ pub(super) mod tests {
                     [TableFeature::InCommitTimestamp],
                 )?}),
             );
-            let staged = add_staged_commit(
-                &table_root,
-                store.as_ref(),
-                downgrade_version,
-                downgrade.clone(),
-            )
-            .await?;
-            let source = Snapshot::builder_for(&table_root)
-                .with_log_tail(vec![create_log_path(&table_root, staged)])
+            let staged =
+                add_staged_commit(TABLE_ROOT, &store, downgrade_version, downgrade.clone()).await?;
+            let source = Snapshot::builder_for(TABLE_ROOT)
+                .with_log_tail(vec![create_log_path(TABLE_ROOT, staged)])
                 .with_max_catalog_version(downgrade_version)
                 .build(engine.as_ref())?;
             let source_files = source.log_segment().listed.clone();
@@ -1742,7 +1722,7 @@ pub(super) mod tests {
             ));
 
             // When: publish the downgrade and discover any later filesystem changes.
-            add_commit(&table_root, store.as_ref(), downgrade_version, downgrade).await?;
+            add_commit(TABLE_ROOT, &store, downgrade_version, downgrade).await?;
             match refresh {
                 DowngradeRefresh::EarlierCheckpoint | DowngradeRefresh::TerminalCheckpoint => {
                     let version = if refresh == DowngradeRefresh::EarlierCheckpoint {
@@ -1750,7 +1730,7 @@ pub(super) mod tests {
                     } else {
                         downgrade_version
                     };
-                    Snapshot::builder_for(&table_root)
+                    Snapshot::builder_for(TABLE_ROOT)
                         .at_version(version)
                         .with_max_catalog_version(version)
                         .build(engine.as_ref())?
@@ -1766,7 +1746,7 @@ pub(super) mod tests {
                     } else {
                         "{}".into()
                     };
-                    add_commit(&table_root, store.as_ref(), downgrade_version + 1, actions).await?;
+                    add_commit(TABLE_ROOT, &store, downgrade_version + 1, actions).await?;
                 }
                 DowngradeRefresh::Published => {}
             }
@@ -1811,7 +1791,7 @@ pub(super) mod tests {
                             )
                         );
                     }
-                    let rebuilt = Snapshot::builder_for(&table_root)
+                    let rebuilt = Snapshot::builder_for(TABLE_ROOT)
                         .with_snapshot_hint(updated.to_snapshot_hint()?)
                         .build(engine.as_ref())?;
                     assert_eq!(rebuilt.log_segment().listed, updated.log_segment().listed);
@@ -1841,10 +1821,11 @@ pub(super) mod tests {
             #[values(false, true)] new_checkpoint: bool,
         ) -> KernelResult<(), Box<dyn std::error::Error>> {
             // Given: cached catalog history and a complete ratified tail through the new target.
-            let (engine, store, table_root) = setup_catalog_managed_test().await;
+            let engine = setup_catalog_managed_test().await;
+            let store = engine.store();
             add_commit(
-                &table_root,
-                store.as_ref(),
+                TABLE_ROOT,
+                store,
                 1,
                 actions_to_string(vec![TestAction::Add("file_1.parquet".into())]),
             )
@@ -1855,21 +1836,16 @@ pub(super) mod tests {
             };
             let mut tail = Vec::new();
             for version in 2..=target_version {
-                let staged = add_staged_commit(
-                    &table_root,
-                    store.as_ref(),
-                    version,
-                    commit_actions(version),
-                )
-                .await?;
-                tail.push(create_log_path(&table_root, staged));
+                let staged =
+                    add_staged_commit(TABLE_ROOT, store, version, commit_actions(version)).await?;
+                tail.push(create_log_path(TABLE_ROOT, staged));
             }
-            let source = Snapshot::builder_for(&table_root)
+            let source = Snapshot::builder_for(TABLE_ROOT)
                 .with_log_tail(tail[..tail.len() - 1].to_vec())
                 .with_max_catalog_version(source_version)
                 .build(engine.as_ref())?;
             let source = if restore_hint {
-                Snapshot::builder_for(&table_root)
+                Snapshot::builder_for(TABLE_ROOT)
                     .at_version(source_version)
                     .with_snapshot_hint(source.to_snapshot_hint()?)
                     .build(engine.as_ref())?
@@ -1878,17 +1854,11 @@ pub(super) mod tests {
             };
             if let Some(publish_through) = publish_through {
                 for version in 2..=publish_through {
-                    add_commit(
-                        &table_root,
-                        store.as_ref(),
-                        version,
-                        commit_actions(version),
-                    )
-                    .await?;
+                    add_commit(TABLE_ROOT, store, version, commit_actions(version)).await?;
                 }
             }
             if new_checkpoint {
-                Snapshot::builder_for(&table_root)
+                Snapshot::builder_for(TABLE_ROOT)
                     .at_version(1)
                     .build(engine.as_ref())?
                     .checkpoint(engine.as_ref(), None)?;
@@ -1902,7 +1872,7 @@ pub(super) mod tests {
                     SnapshotBuilder::at_version,
                 )
                 .build(engine.as_ref())?;
-            let fresh = Snapshot::builder_for(&table_root)
+            let fresh = Snapshot::builder_for(TABLE_ROOT)
                 .with_log_tail(tail)
                 .with_max_catalog_version(target_version)
                 .build(engine.as_ref())?;
@@ -1914,7 +1884,7 @@ pub(super) mod tests {
                 updated.log_segment().listed.max_published_version,
                 Some(publish_through.unwrap_or(1))
             );
-            let hinted = Snapshot::builder_for(&table_root)
+            let hinted = Snapshot::builder_for(TABLE_ROOT)
                 .at_version(target_version)
                 .with_snapshot_hint(updated.to_snapshot_hint()?)
                 .build(engine.as_ref())?;
@@ -1941,8 +1911,9 @@ pub(super) mod tests {
             #[values(false, true)] staged_snapshot: bool,
         ) -> KernelResult<(), Box<dyn std::error::Error>> {
             // Given: a published downgrade cached using either its staged or published path.
-            let (engine, store, table_root) = setup_catalog_managed_test().await;
-            let engine = Arc::new(MeteredDeltaEngine::new(engine));
+            let engine = setup_catalog_managed_test().await;
+            let store = engine.store().clone();
+            let engine = Arc::new(MeteredDeltaEngine::new(Arc::new(engine)));
             let downgrade = json!({
                 "protocol": Protocol::try_new_modern(
                     std::iter::empty::<TableFeature>(),
@@ -1950,24 +1921,23 @@ pub(super) mod tests {
                 )?
             })
             .to_string();
-            let staged =
-                add_staged_commit(&table_root, store.as_ref(), 1, downgrade.clone()).await?;
-            add_commit(&table_root, store.as_ref(), 1, downgrade.clone()).await?;
-            let staged = create_log_path(&table_root, staged);
+            let staged = add_staged_commit(TABLE_ROOT, &store, 1, downgrade.clone()).await?;
+            add_commit(TABLE_ROOT, &store, 1, downgrade.clone()).await?;
+            let staged = create_log_path(TABLE_ROOT, staged);
             let snapshot = if staged_snapshot {
-                SnapshotBuilder::new_for(&table_root)
+                SnapshotBuilder::new_for(TABLE_ROOT)
                     .with_log_tail(vec![staged.clone()])
                     .with_max_catalog_version(1)
                     .build(engine.as_ref())
             } else {
-                SnapshotBuilder::new_for(&table_root)
+                SnapshotBuilder::new_for(TABLE_ROOT)
                     .at_version(1)
                     .build(engine.as_ref())
             }?;
             let log_tail = match supplied_staged {
                 None => vec![],
                 Some(false) => vec![create_log_path(
-                    &table_root,
+                    TABLE_ROOT,
                     test_utils::delta_path_for_version(1, "json"),
                 )],
                 Some(true) if changed_metadata => {
@@ -2003,8 +1973,8 @@ pub(super) mod tests {
             #[values(false, true)] published: bool,
             #[values(false, true)] incremental: bool,
         ) -> KernelResult<(), Box<dyn std::error::Error>> {
-            let (engine, store, table_root) = setup_catalog_managed_test().await;
-            let base = SnapshotBuilder::new_for(&table_root)
+            let engine = setup_catalog_managed_test().await;
+            let base = SnapshotBuilder::new_for(TABLE_ROOT)
                 .with_max_catalog_version(0)
                 .build(engine.as_ref())?;
             let downgrade = json!({
@@ -2015,11 +1985,11 @@ pub(super) mod tests {
             })
             .to_string();
             let staged =
-                add_staged_commit(&table_root, store.as_ref(), 1, downgrade.clone()).await?;
+                add_staged_commit(TABLE_ROOT, engine.store(), 1, downgrade.clone()).await?;
             if published {
-                add_commit(&table_root, store.as_ref(), 1, downgrade).await?;
+                add_commit(TABLE_ROOT, engine.store(), 1, downgrade).await?;
             }
-            let tail = vec![create_log_path(&table_root, staged)];
+            let tail = vec![create_log_path(TABLE_ROOT, staged)];
             let result = if incremental {
                 SnapshotBuilder::new_from(base)
                     .at_version(1)
@@ -2027,7 +1997,7 @@ pub(super) mod tests {
                     .with_max_catalog_version(max_catalog_version)
                     .build(engine.as_ref())
             } else {
-                SnapshotBuilder::new_for(&table_root)
+                SnapshotBuilder::new_for(TABLE_ROOT)
                     .at_version(1)
                     .with_log_tail(tail)
                     .with_max_catalog_version(max_catalog_version)
@@ -2050,8 +2020,9 @@ pub(super) mod tests {
             #[values(false, true)] with_checksum: bool,
         ) -> KernelResult<(), Box<dyn std::error::Error>> {
             // Given: a cached ratified downgrade whose publication may advance independently.
-            let (engine, store, table_root) = setup_catalog_managed_test().await;
-            let engine = Arc::new(MeteredDeltaEngine::new(engine));
+            let engine = setup_catalog_managed_test().await;
+            let store = engine.store().clone();
+            let engine = Arc::new(MeteredDeltaEngine::new(Arc::new(engine)));
             let downgrade = format!(
                 "{}\n{}",
                 json!({
@@ -2068,10 +2039,9 @@ pub(super) mod tests {
                     )?
                 }),
             );
-            let staged =
-                add_staged_commit(&table_root, store.as_ref(), 1, downgrade.clone()).await?;
-            let log_tail = vec![create_log_path(&table_root, staged)];
-            let snapshot = SnapshotBuilder::new_for(&table_root)
+            let staged = add_staged_commit(TABLE_ROOT, &store, 1, downgrade.clone()).await?;
+            let log_tail = vec![create_log_path(TABLE_ROOT, staged)];
+            let snapshot = SnapshotBuilder::new_for(TABLE_ROOT)
                 .with_log_tail(log_tail.clone())
                 .with_max_catalog_version(1)
                 .build(engine.as_ref())?;
@@ -2086,10 +2056,10 @@ pub(super) mod tests {
             // When: repeat the catalog-bounded request before and after filesystem advancement.
             for published in [false, true] {
                 if published {
-                    add_commit(&table_root, store.as_ref(), 1, downgrade.clone()).await?;
+                    add_commit(TABLE_ROOT, &store, 1, downgrade.clone()).await?;
                     add_commit(
-                        &table_root,
-                        store.as_ref(),
+                        TABLE_ROOT,
+                        &store,
                         2,
                         actions_to_string(vec![TestAction::Add("after-downgrade.parquet".into())]),
                     )
@@ -2107,7 +2077,7 @@ pub(super) mod tests {
                     .with_max_catalog_version(1)
                     .build(engine.as_ref())?;
                 assert!(Arc::ptr_eq(&snapshot, &without_tail));
-                let hinted = SnapshotBuilder::new_for(&table_root)
+                let hinted = SnapshotBuilder::new_for(TABLE_ROOT)
                     .with_snapshot_hint(hint.clone())
                     .with_max_catalog_version(1)
                     .build(engine.as_ref())?;
@@ -2122,7 +2092,7 @@ pub(super) mod tests {
                         | MetricEvent::JsonReadCompleted(_)
                         | MetricEvent::ParquetReadCompleted(_)
                 )));
-                let fresh = SnapshotBuilder::new_for(&table_root)
+                let fresh = SnapshotBuilder::new_for(TABLE_ROOT)
                     .with_log_tail(log_tail.clone())
                     .with_max_catalog_version(1)
                     .build(engine.as_ref())?;
@@ -2145,12 +2115,12 @@ pub(super) mod tests {
                     1
                 );
             }
-            let published_only = SnapshotBuilder::new_for(&table_root)
+            let published_only = SnapshotBuilder::new_for(TABLE_ROOT)
                 .with_max_catalog_version(1)
                 .build(engine.as_ref())?;
             assert_eq!(published_only.version(), 1);
             assert!(!published_only.table_configuration().is_catalog_managed());
-            let hinted = SnapshotBuilder::new_for(&table_root)
+            let hinted = SnapshotBuilder::new_for(TABLE_ROOT)
                 .with_max_catalog_version(1)
                 .with_snapshot_hint(published_only.to_snapshot_hint()?)
                 .build(engine.as_ref())?;
@@ -2174,14 +2144,14 @@ pub(super) mod tests {
             let engine = SyncEngine::in_memory();
             let store = engine.store();
             add_commit(
-                &table_root,
-                store.as_ref(),
+                TABLE_ROOT,
+                store,
                 0,
                 actions_to_string_catalog_managed(vec![TestAction::Metadata])
                     .replace("catalogManaged", catalog_feature),
             )
             .await?;
-            let mut snapshot = SnapshotBuilder::new_for(&table_root)
+            let mut snapshot = SnapshotBuilder::new_for(TABLE_ROOT)
                 .with_max_catalog_version(0)
                 .build(engine.as_ref())?;
             let downgrade = json!({
@@ -2201,28 +2171,18 @@ pub(super) mod tests {
 
             // When: read each boundary with its catalog bound.
             for downgrade_version in [1, 3] {
-                let staged = add_staged_commit(
-                    &table_root,
-                    store.as_ref(),
-                    downgrade_version,
-                    downgrade.clone(),
-                )
-                .await?;
-                let log_tail = vec![create_log_path(&table_root, staged)];
-                add_commit(
-                    &table_root,
-                    store.as_ref(),
-                    downgrade_version,
-                    downgrade.clone(),
-                )
-                .await?;
+                let staged =
+                    add_staged_commit(TABLE_ROOT, store, downgrade_version, downgrade.clone())
+                        .await?;
+                let log_tail = vec![create_log_path(TABLE_ROOT, staged)];
+                add_commit(TABLE_ROOT, store, downgrade_version, downgrade.clone()).await?;
                 snapshot = if incremental {
                     SnapshotBuilder::new_from(snapshot)
                         .with_log_tail(log_tail.clone())
                         .with_max_catalog_version(downgrade_version)
                         .build(engine.as_ref())
                 } else {
-                    SnapshotBuilder::new_for(&table_root)
+                    SnapshotBuilder::new_for(TABLE_ROOT)
                         .with_log_tail(log_tail.clone())
                         .with_max_catalog_version(downgrade_version)
                         .build(engine.as_ref())
@@ -2231,20 +2191,14 @@ pub(super) mod tests {
                 assert!(!snapshot.table_configuration().is_catalog_managed());
 
                 let upgrade_version = downgrade_version + 1;
-                add_commit(
-                    &table_root,
-                    store.as_ref(),
-                    upgrade_version,
-                    upgrade.clone(),
-                )
-                .await?;
+                add_commit(TABLE_ROOT, store, upgrade_version, upgrade.clone()).await?;
                 let bounded = if incremental {
                     SnapshotBuilder::new_from(snapshot.clone())
                         .with_log_tail(log_tail)
                         .with_max_catalog_version(downgrade_version)
                         .build(engine.as_ref())
                 } else {
-                    SnapshotBuilder::new_for(&table_root)
+                    SnapshotBuilder::new_for(TABLE_ROOT)
                         .with_log_tail(log_tail)
                         .with_max_catalog_version(downgrade_version)
                         .build(engine.as_ref())
@@ -2257,7 +2211,7 @@ pub(super) mod tests {
                         .with_max_catalog_version(upgrade_version)
                         .build(engine.as_ref())
                 } else {
-                    SnapshotBuilder::new_for(&table_root)
+                    SnapshotBuilder::new_for(TABLE_ROOT)
                         .with_max_catalog_version(upgrade_version)
                         .build(engine.as_ref())
                 }?;
@@ -2283,7 +2237,8 @@ pub(super) mod tests {
         async fn test_catalog_downgrade_reuses_loaded_state_but_fresh_replay_propagates_errors(
             #[case] replacement_commit: Option<&str>,
         ) -> KernelResult<(), Box<dyn std::error::Error>> {
-            let (engine, store, table_root) = setup_catalog_managed_test().await;
+            let engine = setup_catalog_managed_test().await;
+            let store = engine.store();
             let downgrade = json!({
                 "protocol": Protocol::try_new_modern(
                     std::iter::empty::<TableFeature>(),
@@ -2291,9 +2246,9 @@ pub(super) mod tests {
                 )?
             })
             .to_string();
-            let staged = add_staged_commit(&table_root, store.as_ref(), 1, downgrade).await?;
-            let log_tail = vec![create_log_path(&table_root, staged.clone())];
-            let snapshot = SnapshotBuilder::new_for(&table_root)
+            let staged = add_staged_commit(TABLE_ROOT, store, 1, downgrade).await?;
+            let log_tail = vec![create_log_path(TABLE_ROOT, staged.clone())];
+            let snapshot = SnapshotBuilder::new_for(TABLE_ROOT)
                 .with_log_tail(log_tail.clone())
                 .with_max_catalog_version(1)
                 .build(engine.as_ref())?;
@@ -2309,7 +2264,7 @@ pub(super) mod tests {
                 .with_max_catalog_version(1)
                 .build(engine.as_ref())?;
             assert!(Arc::ptr_eq(&snapshot, &reused));
-            let error = SnapshotBuilder::new_for(&table_root)
+            let error = SnapshotBuilder::new_for(TABLE_ROOT)
                 .with_log_tail(log_tail)
                 .with_max_catalog_version(1)
                 .build(engine.as_ref())
@@ -2331,17 +2286,17 @@ pub(super) mod tests {
         #[test_log::test(tokio::test)]
         async fn test_log_tail_last_version_less_than_time_travel_version_errors()
         -> KernelResult<(), Box<dyn std::error::Error>> {
-            let (engine, store, table_root) = setup_catalog_managed_test().await;
+            let engine = setup_catalog_managed_test().await;
             let actions = vec![TestAction::Add("file_1.parquet".to_string())];
-            add_commit(&table_root, store.as_ref(), 1, actions_to_string(actions)).await?;
+            add_commit(TABLE_ROOT, engine.store(), 1, actions_to_string(actions)).await?;
 
             let log_tail = vec![create_log_path(
-                &table_root,
+                TABLE_ROOT,
                 test_utils::delta_path_for_version(1, "json"),
             )];
 
             // Time travel to v2, but log tail only goes up to v1
-            let result = SnapshotBuilder::new_for(table_root)
+            let result = SnapshotBuilder::new_for(TABLE_ROOT)
                 .at_version(2)
                 .with_log_tail(log_tail)
                 .with_max_catalog_version(3)
@@ -2358,14 +2313,14 @@ pub(super) mod tests {
         #[test_log::test(tokio::test)]
         async fn test_max_catalog_version_as_effective_version()
         -> KernelResult<(), Box<dyn std::error::Error>> {
-            let (engine, store, table_root) = setup_catalog_managed_test().await;
+            let engine = setup_catalog_managed_test().await;
             let actions = vec![TestAction::Add("file_1.parquet".to_string())];
-            add_commit(&table_root, store.as_ref(), 1, actions_to_string(actions)).await?;
+            add_commit(TABLE_ROOT, engine.store(), 1, actions_to_string(actions)).await?;
             let actions = vec![TestAction::Add("file_2.parquet".to_string())];
-            add_commit(&table_root, store.as_ref(), 2, actions_to_string(actions)).await?;
+            add_commit(TABLE_ROOT, engine.store(), 2, actions_to_string(actions)).await?;
 
             // max_catalog_version=1, no time-travel -> snapshot at v1
-            let snapshot = SnapshotBuilder::new_for(table_root)
+            let snapshot = SnapshotBuilder::new_for(TABLE_ROOT)
                 .with_max_catalog_version(1)
                 .build(engine.as_ref())?;
             assert_eq!(snapshot.version(), 1);
@@ -2376,12 +2331,12 @@ pub(super) mod tests {
         #[test_log::test(tokio::test)]
         async fn test_time_travel_with_max_catalog_version()
         -> KernelResult<(), Box<dyn std::error::Error>> {
-            let (engine, store, table_root) = setup_catalog_managed_test().await;
+            let engine = setup_catalog_managed_test().await;
             let actions = vec![TestAction::Add("file_1.parquet".to_string())];
-            add_commit(&table_root, store.as_ref(), 1, actions_to_string(actions)).await?;
+            add_commit(TABLE_ROOT, engine.store(), 1, actions_to_string(actions)).await?;
 
             // at_version(0) + max_catalog_version=1 -> snapshot at v0
-            let snapshot = SnapshotBuilder::new_for(table_root)
+            let snapshot = SnapshotBuilder::new_for(TABLE_ROOT)
                 .at_version(0)
                 .with_max_catalog_version(1)
                 .build(engine.as_ref())?;
@@ -2403,9 +2358,10 @@ pub(super) mod tests {
             } else {
                 actions_to_string(vec![TestAction::Metadata])
             };
-            add_commit(&table_root, store.as_ref(), 0, metadata).await?;
-            add_commit(&table_root, store.as_ref(), 1, "{}".into()).await?;
-            let initial = SnapshotBuilder::new_for(&table_root)
+            add_commit(TABLE_ROOT, engine.store(), 0, metadata).await?;
+            add_commit(TABLE_ROOT, engine.store(), 1, "{}".into()).await?;
+            let engine = MeteredDeltaEngine::new(Arc::new(engine));
+            let initial = SnapshotBuilder::new_for(TABLE_ROOT)
                 .with_max_catalog_version(1)
                 .build(&engine)?;
             let (reporter, _guard) = measuring_reporter();
@@ -2459,20 +2415,20 @@ pub(super) mod tests {
             #[case] log_tail_versions: Vec<u64>,
             #[case] mcv: u64,
         ) -> KernelResult<(), Box<dyn std::error::Error>> {
-            let (engine, store, table_root) = setup_catalog_managed_test().await;
+            let engine = setup_catalog_managed_test().await;
             for v in &commit_versions {
                 let actions = vec![TestAction::Add(format!("file_{v}.parquet"))];
-                add_commit(&table_root, store.as_ref(), *v, actions_to_string(actions)).await?;
+                add_commit(TABLE_ROOT, engine.store(), *v, actions_to_string(actions)).await?;
             }
 
             let log_tail: Vec<_> = log_tail_versions
                 .iter()
                 .map(|v| {
-                    create_log_path(&table_root, test_utils::delta_path_for_version(*v, "json"))
+                    create_log_path(TABLE_ROOT, test_utils::delta_path_for_version(*v, "json"))
                 })
                 .collect();
 
-            let result = SnapshotBuilder::new_for(table_root)
+            let result = SnapshotBuilder::new_for(TABLE_ROOT)
                 .with_log_tail(log_tail)
                 .with_max_catalog_version(mcv)
                 .build(engine.as_ref());
@@ -2512,13 +2468,13 @@ pub(super) mod tests {
         async fn test_non_commit_log_tail_errors(
             #[case] suffix: &str,
         ) -> KernelResult<(), Box<dyn std::error::Error>> {
-            let (engine, _store, table_root) = setup_catalog_managed_test().await;
+            let engine = setup_catalog_managed_test().await;
             let log_tail = vec![create_log_path(
-                &table_root,
+                TABLE_ROOT,
                 test_utils::delta_path_for_version(1, suffix),
             )];
 
-            let result = SnapshotBuilder::new_for(table_root)
+            let result = SnapshotBuilder::new_for(TABLE_ROOT)
                 .with_log_tail(log_tail)
                 .with_max_catalog_version(1)
                 .build(engine.as_ref());
