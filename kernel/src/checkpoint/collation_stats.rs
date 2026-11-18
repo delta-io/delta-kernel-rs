@@ -10,7 +10,7 @@ use std::sync::{Arc, LazyLock};
 use serde_json::Value;
 
 use crate::action_reconciliation::log_replay::ActionReconciliationBatch;
-use crate::actions::{NUM_RECORDS, TIGHT_BOUNDS};
+use crate::actions::{COLLATION_STATS, NUM_RECORDS, TIGHT_BOUNDS};
 use crate::engine_data::{FilteredRowVisitor, GetData, RowIndexIterator, TypedGetData};
 use crate::expressions::{
     ColumnName, Expression, ExpressionRef, UnaryExpressionOp, col, column_name,
@@ -22,7 +22,18 @@ use crate::struct_patch::ProjectionStructPatchBuilder;
 use crate::transforms::{SchemaTransform, transform_output_type};
 use crate::{KernelError, KernelResult, Snapshot};
 
-const COLLATION_STATS: &str = "statsWithCollation";
+/// Returns `stats` with `collation_stats` as its collation stats field, replacing any it holds.
+/// Without `stats`, the result holds only the file-level stats and the collation stats.
+pub(crate) fn set_collation_stats(
+    stats: Option<&StructType>,
+    collation_stats: StructField,
+) -> KernelResult<StructType> {
+    let file_level = schema! { nullable NUM_RECORDS: LONG, nullable TIGHT_BOUNDS: BOOLEAN };
+    SchemaStructPatchBuilder::new()
+        .drop_if_exists(COLLATION_STATS)
+        .append(collation_stats)
+        .build(stats.unwrap_or(&file_level))
+}
 
 /// Returns the source collation stats field, if present in parsed checkpoint stats.
 pub(crate) fn source_collation_stats(schema: &StructType) -> Option<&StructField> {
@@ -57,14 +68,12 @@ pub(crate) fn build_collation_stats_read_transform(
     let parsed_path = column_name!("add.stats_parsed");
     let target = requested.field_at(&parsed_path).ok();
     let stats = match target.map(StructField::data_type) {
-        Some(DataType::Struct(stats)) => stats.as_ref().clone(),
+        Some(DataType::Struct(stats)) => Some(stats.as_ref()),
         Some(_) => return Err(KernelError::schema("stats_parsed must be a struct")),
-        None => schema! { nullable NUM_RECORDS: LONG, nullable TIGHT_BOUNDS: BOOLEAN },
+        None => None,
     };
-    let stats = SchemaStructPatchBuilder::new()
-        .append(source.clone())
-        .build(&stats)?;
-    let raw_field = StructField::nullable("stats_parsed", stats);
+    let raw_field =
+        StructField::nullable("stats_parsed", set_collation_stats(stats, source.clone())?);
     let read_schema = Arc::new(
         if target.is_some() {
             SchemaStructPatchBuilder::new().replace_at(["add"], "stats_parsed", raw_field)
@@ -567,6 +576,43 @@ mod tests {
             build_collation_stats_read_transform(&requested, Some(&source))
                 .unwrap()
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn read_transform_reads_every_source_collation_and_outputs_the_requested_bounds() {
+        let source = StructField::nullable(
+            COLLATION_STATS,
+            schema! {
+                nullable "ICU.en_US.72": { nullable "minValues": { nullable "other": STRING } },
+                nullable "ICU.en_US.73": { nullable "maxValues": { nullable "other": STRING } },
+            },
+        );
+        let requested = schema! {
+            nullable "add": {
+                nullable "stats": STRING,
+                nullable "stats_parsed": {
+                    nullable "numRecords": LONG,
+                    nullable COLLATION_STATS: {
+                        nullable "ICU.en_US.72": {
+                            nullable "minValues": { nullable "other": STRING },
+                            nullable "maxValues": { nullable "other": STRING },
+                        },
+                    },
+                },
+            },
+        };
+        let transform = build_collation_stats_read_transform(&requested, Some(&source))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            source_collation_stats(&transform.read_schema),
+            Some(&source)
+        );
+        let parsed = column_name!("add.stats_parsed");
+        assert_eq!(
+            transform.output_schema.field_at(&parsed).unwrap(),
+            requested.field_at(&parsed).unwrap()
         );
     }
 

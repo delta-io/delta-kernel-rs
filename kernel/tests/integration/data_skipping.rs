@@ -25,7 +25,7 @@ use delta_kernel::expressions::{
 };
 use delta_kernel::metrics::{MetricEvent, ScanType};
 use delta_kernel::object_store::local::LocalFileSystem;
-use delta_kernel::scan::{AfterSequentialScanMetadata, ParallelScanMetadata, Scan, StatsOptions};
+use delta_kernel::scan::{Scan, StatsOptions};
 use delta_kernel::schema::{
     DataType, IntervalDayToSecondType, IntervalYearToMonthType, SchemaRef, StructField, StructType,
     schema, schema_ref,
@@ -45,6 +45,7 @@ use test_utils::{
 };
 use url::Url;
 
+use crate::common::read_utils::collect_scan_paths;
 use crate::common::write_utils::set_table_properties;
 
 type TestEngine = DefaultEngine<TokioMultiThreadExecutor>;
@@ -115,43 +116,6 @@ async fn build_capped_table_with_checkpoint()
 
     snapshot.checkpoint(engine.as_ref(), None)?;
     Ok((tmp_dir, table_path, engine))
-}
-
-/// Collects scan-file paths through sequential or parallel scan metadata.
-///
-/// Parallel execution assigns one file to each worker. Neither path guarantees result order.
-fn collect_scan_paths(
-    scan: &Scan,
-    engine: Arc<TestEngine>,
-    use_parallel: bool,
-) -> Result<Vec<String>, Box<dyn std::error::Error>> {
-    fn push_path(paths: &mut Vec<String>, scan_file: delta_kernel::scan::state::ScanFile) {
-        paths.push(scan_file.path);
-    }
-
-    let mut paths: Vec<String> = Vec::new();
-    if use_parallel {
-        let mut sequential = scan.parallel_scan_metadata(engine.clone())?;
-        for sm in sequential.by_ref() {
-            paths = sm?.visit_scan_files(paths, push_path)?;
-        }
-        if let AfterSequentialScanMetadata::Parallel { state, files } = sequential.finish()? {
-            let state = Arc::from(state);
-            for file in files {
-                let parallel =
-                    ParallelScanMetadata::try_new(engine.clone(), Arc::clone(&state), vec![file])?;
-                for sm in parallel {
-                    paths = sm?.visit_scan_files(paths, push_path)?;
-                }
-            }
-            state.log_metrics();
-        }
-    } else {
-        for sm in scan.scan_metadata(engine.as_ref())? {
-            paths = sm?.visit_scan_files(paths, push_path)?;
-        }
-    }
-    Ok(paths)
 }
 
 fn selected_paths(

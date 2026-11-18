@@ -17,9 +17,13 @@ use crate::content_tree::test_utils::{
     x_stats,
 };
 use crate::content_tree::{ContentTreeNodeEntry, TrackingInfo, TrackingStatus};
+use crate::engine::DelegatingEngine;
 use crate::engine::arrow_data::EngineDataArrowExt as _;
+use crate::engine::arrow_expression::collation::{
+    AsciiCaseInsensitive, CollationEvaluationHandler,
+};
 use crate::engine::sync::SyncEngine;
-use crate::expressions::{Predicate as Pred, Scalar, col, lit};
+use crate::expressions::{Predicate as Pred, Scalar, col, collated_comparison, lit};
 use crate::object_store::memory::InMemory;
 use crate::scan::{Scan, ScanMetadata};
 use crate::schema::{SchemaRef, StructType, schema_ref};
@@ -321,13 +325,25 @@ fn data_skipping_prunes_commit_files_but_keeps_tree_files_without_stats() {
     assert_eq!(paths, strings(&["high.parquet", "tree.parquet"]));
 }
 
+const COLLATION: &str = "test.ASCII_CI.1";
+
 /// Tree files are pruned by their `content_stats`, which are keyed by the checkpoint action's
 /// schema, so a schema change after it leaves them unread.
 #[rstest]
-#[case::checkpoint_schema(false, &["high.parquet"])]
-#[case::schema_changed_after_checkpoint(true, &["high.parquet", "low.parquet"])]
+#[case::checkpoint_schema(false, Pred::gt(col!("id"), lit(100i64)), &["high.parquet"])]
+#[case::schema_changed_after_checkpoint(
+    true,
+    Pred::gt(col!("id"), lit(100i64)),
+    &["high.parquet", "low.parquet"]
+)]
+#[case::collated_comparison(
+    false,
+    collated_comparison(COLLATION, col!("name").eq(lit("a"))),
+    &["high.parquet", "low.parquet"]
+)]
 fn data_skipping_prunes_tree_files_by_content_stats(
     #[case] change_schema: bool,
+    #[case] predicate: Pred,
     #[case] expected: &[&str],
 ) {
     let (engine, _) = setup_adaptive_metadata_table();
@@ -356,18 +372,22 @@ fn data_skipping_prunes_tree_files_by_content_stats(
         version += 1;
     }
 
-    let predicate = Arc::new(Pred::gt(col!("id"), lit(100i64)));
     let scan = snapshot_at(&engine, version)
         .scan_builder()
-        .with_predicate(predicate)
+        .with_predicate(Arc::new(predicate))
         .build()
         .unwrap();
-    let paths: Vec<_> = get_files_for_scan(scan, &engine)
+    let paths: Vec<_> = get_files_for_scan(scan, &with_collator(engine))
         .unwrap()
         .into_iter()
         .sorted()
         .collect();
     assert_eq!(paths, strings(expected));
+}
+
+fn with_collator(engine: SyncEngine) -> impl Engine {
+    let evaluation = CollationEvaluationHandler::new(Arc::new(AsciiCaseInsensitive(COLLATION)));
+    DelegatingEngine::new(Arc::new(engine)).with_evaluation_handler(Arc::new(evaluation))
 }
 
 /// The scan metadata of `snapshot`, with selection vectors applied, as cached by a caller of

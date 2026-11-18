@@ -8,6 +8,7 @@ use derive_more::From;
 use itertools::Itertools;
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de, ser};
 
+pub use self::collation::collated_comparison;
 #[doc(hidden)]
 pub use self::column_names::{__require_valid_simple_column_segment, column_expr};
 pub use self::column_names::{
@@ -30,6 +31,7 @@ use crate::transforms::{ExpressionTransform, transform_output_type};
 use crate::utils::CollectInto;
 use crate::{DataType, DynPartialEq, KernelError, KernelResult};
 
+pub(crate) mod collation;
 mod column_names;
 mod macros;
 mod scalars;

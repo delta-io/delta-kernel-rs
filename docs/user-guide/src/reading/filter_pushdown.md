@@ -179,9 +179,45 @@ To execute a collation-aware query, your connector owns the string comparison ru
 the original row filter. Kernel preserves `__COLLATIONS` schema annotations. Existing
 `statsWithCollation` bounds reach your connector when you request JSON statistics.
 Structured statistics omit these bounds. `StatsOptions::all_struct()` disables JSON synthesis.
-Kernel's predicates and internal [data skipping](#how-data-skipping-works) use UTF-8 binary semantics.
+Ordinary predicates and their [data skipping](#how-data-skipping-works) use UTF-8 binary semantics.
 An ordinary equality predicate for `"alice"` can skip a file containing `"Alice"`.
 Evaluating a case-insensitive comparison later cannot recover that file.
+
+To have Kernel skip files for a collated comparison, build it with [`collated_comparison`],
+which names the collation by its exact `provider.name.version` identifier:
+
+```rust,no_run
+# extern crate delta_kernel;
+# use std::sync::Arc;
+# use delta_kernel::expressions::{col, collated_comparison, lit};
+# use delta_kernel::SnapshotRef;
+# fn example(snapshot: SnapshotRef) -> delta_kernel::Result<()> {
+// name = 'alice' under a case-insensitive collation
+let predicate = collated_comparison("icu.UNICODE_CI.75.1", col!("name").eq(lit("alice")));
+
+let scan = snapshot
+    .scan_builder()
+    .with_predicate(Arc::new(predicate))
+    .build()?;
+# Ok(())
+# }
+```
+
+Kernel skips a file only when it records bounds under that exact identifier, and keeps a file
+without them. Only `Scan::scan_metadata`, `Scan::parallel_scan_metadata`, and the scans built on
+them skip files this way. Your Engine compares the bounds to the literal. If it evaluates with
+Kernel's `ArrowEvaluationHandler`, implement [`ArrowCollator`] over your collation library and
+return a [`CollationEvaluationHandler`] for it from your Engine's `evaluation_handler`. The
+[collation module rustdoc](https://docs.rs/delta_kernel/latest/delta_kernel/engine/arrow_expression/collation/index.html)
+has a complete example. `DefaultEngine` can't take a custom evaluation handler, so
+[assemble](../connector/implementing_engine.md#assemble-the-engine) an Engine that reuses
+`DefaultEngine`'s other handlers. If your Engine can't evaluate collated comparisons, don't pass
+one: the scan fails, or skips no files when the handler rejects the predicate up front. Skip
+files in your connector or derive a conservative predicate instead, as described below.
+
+[`collated_comparison`]: https://docs.rs/delta_kernel/latest/delta_kernel/expressions/fn.collated_comparison.html
+[`ArrowCollator`]: https://docs.rs/delta_kernel/latest/delta_kernel/engine/arrow_expression/collation/trait.ArrowCollator.html
+[`CollationEvaluationHandler`]: https://docs.rs/delta_kernel/latest/delta_kernel/engine/arrow_expression/collation/struct.CollationEvaluationHandler.html
 
 For connector-owned skipping, [request JSON stats](#controlling-statistics) with
 `StatsOptions::json_only()` or `StatsOptions::all()` and select the bounds that match the
@@ -198,8 +234,8 @@ Kernel combines those results conservatively. Scalar evaluation has a different 
 `eval_pred_scalar` returns `Err` for unsupported evaluation and `Ok(None)` for a SQL NULL result.
 Opaque predicates can't be serialized; reconstruct them on each worker when distributing a scan.
 
-If you don't use opaque predicates, derive a conservative binary predicate before calling
-`ScanBuilder::with_predicate`:
+For a comparison that neither `collated_comparison` nor your own `OpaquePredicateOp` covers,
+derive a conservative binary predicate before calling `ScanBuilder::with_predicate`:
 every row that is TRUE under the original filter must also be TRUE under the derived
 predicate. Let `C` be an unsupported collation-aware comparison and `B` a supported binary
 predicate:

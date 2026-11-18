@@ -126,6 +126,10 @@ pub(crate) const MAX_VALUES: &str = "maxValues";
 /// Whether the min/max/nullCount stats are tight or wide. Defaults to `true` when absent.
 #[internal_api]
 pub(crate) const TIGHT_BOUNDS: &str = "tightBounds";
+/// Per-column bounds under collations other than UTF-8 binary, keyed by versioned collation
+/// identifier.
+#[internal_api]
+pub(crate) const COLLATION_STATS: &str = "statsWithCollation";
 
 /// Struct-encoded per-file statistics column (checkpoints with `writeStatsAsStruct=true`).
 #[internal_api]

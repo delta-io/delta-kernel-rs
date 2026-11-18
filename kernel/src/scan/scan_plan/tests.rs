@@ -19,7 +19,7 @@ use crate::engine::DelegatingEngine;
 use crate::engine::arrow_conversion::TryIntoArrow as _;
 use crate::engine::arrow_data::EngineDataArrowExt as _;
 use crate::engine::sync::SyncEngine;
-use crate::expressions::{Predicate as Pred, column_name, expr};
+use crate::expressions::{Predicate as Pred, col, collated_comparison, column_name, expr};
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::object_store::ObjectStoreExt as _;
 #[cfg(feature = "adaptive-metadata-in-dev")]
@@ -1025,6 +1025,27 @@ fn declarative_metadata_data_skipping(
         &without_columns(&expected, &[STATS])?,
         &format!("table {table}"),
     )?;
+    Ok(())
+}
+
+#[rstest]
+fn declarative_metadata_keeps_every_file_for_a_collated_comparison(
+    #[values(
+        StatsOptions::json_only(),
+        StatsOptions::all_struct(),
+        StatsOptions::all()
+    )]
+    stats: StatsOptions,
+) -> Result<()> {
+    let (engine, snapshot, _tempdir) = load_test_table("v1-multi-part-struct-stats-only")?;
+    let predicate = collated_comparison("test.ASCII_CI.1", col!("value").eq(lit("x")));
+    let scan = snapshot
+        .scan_builder()
+        .with_predicate(Arc::new(predicate))
+        .with_stats(stats)
+        .build()?;
+    let metadata = declarative_metadata(&scan, engine.as_ref())?;
+    assert_eq!(metadata_row_count(&metadata), 5);
     Ok(())
 }
 
