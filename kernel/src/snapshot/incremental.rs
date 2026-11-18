@@ -867,7 +867,7 @@ mod tests {
         .await
         .unwrap();
 
-        // Typed CommitInfo serialization adds fields to these timestamp-only actions.
+        // Use raw JSON to keep these actions timestamp-only; typed CommitInfo adds other fields.
         commit(
             url.as_str(),
             store.as_ref(),
