@@ -2825,8 +2825,6 @@ mod tests {
 
         let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
 
-        // Test get_domain_metadata
-
         assert_eq!(snapshot.get_domain_metadata("domain1", &engine)?, None);
         assert_eq!(
             snapshot.get_domain_metadata("domain2", &engine)?,
@@ -2842,13 +2840,11 @@ mod tests {
         assert!(matches!(err, KernelError::Generic(msg) if
                 msg == "User DomainMetadata are not allowed to use system-controlled 'delta.*' domain"));
 
-        // Test get_domain_metadata_internal
         assert_eq!(
             snapshot.get_domain_metadata_internal("delta.domain3", &engine)?,
             Some("domain3_commit1".to_string())
         );
 
-        // Test get_all_domain_metadata
         let mut metadata = snapshot.get_all_domain_metadata(&engine)?;
         metadata.sort_by(|a, b| a.domain().cmp(b.domain()));
 

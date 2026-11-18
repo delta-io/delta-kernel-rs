@@ -887,7 +887,6 @@ mod tests {
             .at_version(1)
             .build(&engine)?;
 
-        // Verify base snapshot has latest_commit_file at version 1
         assert_eq!(
             base_snapshot
                 .log_segment
@@ -898,7 +897,6 @@ mod tests {
             Some(1)
         );
 
-        // Create log_tail with FileMeta for version 2
         let commit_2_url = url
             .join("_delta_log/")
             .map_err(KernelError::from)?
@@ -913,7 +911,6 @@ mod tests {
             .ok_or_else(|| KernelError::Generic("Failed to parse log path".to_string()))?;
         let log_tail = vec![parsed_path];
 
-        // Create new snapshot from base to version 2 using try_new_from directly
         let new_snapshot = Snapshot::try_new_from(
             base_snapshot.clone(),
             log_tail,
@@ -926,7 +923,6 @@ mod tests {
             false, /* built_as_latest */
         )?;
 
-        // Latest commit should now be version 2
         assert_eq!(
             new_snapshot
                 .log_segment

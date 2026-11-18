@@ -179,9 +179,9 @@ pub(crate) fn serialize_actions(actions: impl IntoIterator<Item = Action>) -> St
         .join("\n")
 }
 
-/// Builds a metadata action with the supplied table ID, schema, and creation time.
+/// Builds unpartitioned Parquet metadata with the supplied table ID, schema, and creation time.
 ///
-/// Uses Parquet with empty format options, partition columns, and configuration.
+/// Leaves the name and description absent, and the format options and configuration empty.
 pub(crate) fn metadata_action(id: &str, schema: &StructType, created_time: i64) -> Action {
     Action::Metadata(Metadata::from_parts(
         id.into(),
