@@ -758,7 +758,7 @@ fn correlation_id_slice(correlation_id: Option<&str>) -> KernelStringSlice {
 
 impl MetricEvent {
     /// Invoke the callback while all borrowed FFI records and nested storage are alive.
-    fn with_kernel_event<R>(event: &kernel::MetricEvent, f: impl FnOnce(Self) -> R) -> R {
+    fn with_kernel_event(event: &kernel::MetricEvent, f: impl FnOnce(Self)) {
         use kernel::MetricEvent as K;
         let event = match event {
             #[cfg(feature = "declarative-plans")]
@@ -1068,10 +1068,7 @@ impl MetricEvent {
 }
 
 /// Invoke `f` with the FFI [`MetricEvent`] built from `event`.
-pub(crate) fn with_ffi_event<R>(
-    event: &kernel::MetricEvent,
-    f: impl FnOnce(MetricEvent) -> R,
-) -> R {
+pub(crate) fn with_ffi_event(event: &kernel::MetricEvent, f: impl FnOnce(MetricEvent)) {
     MetricEvent::with_kernel_event(event, f)
 }
 
