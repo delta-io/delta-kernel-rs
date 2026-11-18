@@ -243,7 +243,6 @@ fn checkpoint_entries<T: CheckpointActionEntry>(
         // There's no base when no checkpoint action exists or the CRC holds this type in full. A
         // complete CRC doesn't say what changed since the action, so keeping the action's sidecars
         // would mean reading them to find touched entries.
-        // TODO: keep them by diffing the CRC against the action if inlining proves costly.
         let mut entries = T::read_from_snapshot(snapshot, engine)?;
         T::apply(&mut entries, keyed(txn_changes).collect());
         return Ok((entries, Vec::new()));
