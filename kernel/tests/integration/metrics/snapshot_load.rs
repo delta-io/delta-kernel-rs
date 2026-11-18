@@ -31,10 +31,7 @@ use test_utils::{
 };
 use url::Url;
 
-use super::{
-    LogState, TestTableBuilder, insert_rows, measuring_engine, setup_table_with_v1_checkpoint,
-    simple_schema,
-};
+use super::{LogState, TestTableBuilder, insert_rows, measuring_engine, simple_schema};
 
 fn assert_full_snapshot_completed(reporter: &CountingReporter) {
     assert_eq!(
@@ -275,28 +272,21 @@ fn delta_only_snapshot_emits_expected_metrics() -> delta_kernel::Result<()> {
 // ============================================================================
 // Scenario 2: v1 parquet checkpoint + one tail commit
 // ============================================================================
-// TODO: migrate to TestTableBuilder when checkpoint LogState variants land (#2284)
 
 /// After a v1 parquet checkpoint is written at version 1 and a further commit is added,
 /// a fresh snapshot sees one checkpoint file, one tail commit, and performs a single
 /// parquet read (checkpoint) plus a single JSON read (tail commit).
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn snapshot_with_v1_checkpoint_and_tail_commit_emits_expected_metrics()
--> delta_kernel::Result<()> {
-    let (table_url, setup_engine, _temp_dir) = setup_table_with_v1_checkpoint().await?;
+#[test]
+fn snapshot_with_v1_checkpoint_and_tail_commit_emits_expected_metrics() -> delta_kernel::Result<()>
+{
+    let table = TestTableBuilder::new()
+        .with_log_state(LogState::with_latest_version(2).with_checkpoint_at([1]))
+        .with_schema(simple_schema())
+        .with_data(1, 1)
+        .build()?;
 
-    // commit 2: insert another row after the checkpoint
-    let snap2 = Snapshot::builder_for(table_url.clone()).build(setup_engine.as_ref())?;
-    let _ = insert_data(
-        snap2,
-        &setup_engine,
-        vec![Arc::new(Int32Array::from(vec![2]))],
-    )
-    .await?
-    .unwrap_committed();
-
-    let (measure_engine, reporter, _guard) = measuring_engine(Arc::new(LocalFileSystem::new()));
-    let _snap = Snapshot::builder_for(table_url).build(&measure_engine)?;
+    let (measure_engine, reporter, _guard) = measuring_engine(table.store().clone());
+    let _snap = Snapshot::builder_for(table.table_root()).build(&measure_engine)?;
 
     assert_full_snapshot_completed(&reporter);
     assert_eq!(reporter.log_segment_loads.get(), 1);
@@ -309,12 +299,7 @@ async fn snapshot_with_v1_checkpoint_and_tail_commit_emits_expected_metrics()
     assert_eq!(reporter.json_files_read.get(), 1);
     assert_eq!(reporter.parquet_read_calls.get(), 1);
     assert_eq!(reporter.parquet_files_read.get(), 1);
-    // On Windows (NTFS), listing a file written moments earlier can return size=0 because
-    // the OS has not yet flushed size metadata to the directory entry. bytes_read is sourced
-    // from these FileMeta::size values, so it can be 0 even when real I/O occurred.
-    #[cfg(not(windows))]
     assert!(reporter.json_bytes_read.get() > 0);
-    #[cfg(not(windows))]
     assert!(reporter.parquet_bytes_read.get() > 0);
 
     Ok(())
@@ -323,17 +308,20 @@ async fn snapshot_with_v1_checkpoint_and_tail_commit_emits_expected_metrics()
 // ============================================================================
 // Scenario 3: v1 parquet checkpoint at latest version (no tail commits)
 // ============================================================================
-// TODO: migrate to TestTableBuilder when checkpoint LogState variants land (#2284)
 
 /// When the latest version has a checkpoint and no subsequent commits exist, the snapshot
 /// has zero commit files and the JSON handler is called with an empty file list.
 /// read_commit_actions always invokes read_json_files even for an empty commit cover.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn snapshot_at_checkpoint_tip_emits_expected_metrics() -> delta_kernel::Result<()> {
-    let (table_url, _setup_engine, _temp_dir) = setup_table_with_v1_checkpoint().await?;
+#[test]
+fn snapshot_at_checkpoint_tip_emits_expected_metrics() -> delta_kernel::Result<()> {
+    let table = TestTableBuilder::new()
+        .with_log_state(LogState::with_latest_version(1).with_checkpoint_at([1]))
+        .with_schema(simple_schema())
+        .with_data(1, 1)
+        .build()?;
 
-    let (measure_engine, reporter, _guard) = measuring_engine(Arc::new(LocalFileSystem::new()));
-    let _snap = Snapshot::builder_for(table_url).build(&measure_engine)?;
+    let (measure_engine, reporter, _guard) = measuring_engine(table.store().clone());
+    let _snap = Snapshot::builder_for(table.table_root()).build(&measure_engine)?;
 
     assert_full_snapshot_completed(&reporter);
     assert_eq!(reporter.log_segment_loads.get(), 1);
@@ -507,35 +495,21 @@ async fn crc_at_prior_version_roots_replay_at_crc_for_both_modes(
 // ============================================================================
 // Scenario 7: checkpoint behind latest version (with multiple tail commits)
 // ============================================================================
-// TODO: migrate to TestTableBuilder when checkpoint LogState variants land (#2284)
 
 /// A checkpoint that is multiple versions behind the latest forces a longer tail replay.
 /// Checkpoint at v1 plus 3 additional commits (v2, v3, v4) verifies that all tail commits
 /// are read in a single JSON call and both byte counters are non-zero. The specific counts
 /// here reflect this table's setup: checkpoint at v1, three tail commits.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn checkpoint_with_multiple_tail_commits_emits_expected_metrics() -> delta_kernel::Result<()>
-{
-    let (table_url, setup_engine, _temp_dir) = setup_table_with_v1_checkpoint().await?;
+#[test]
+fn checkpoint_with_multiple_tail_commits_emits_expected_metrics() -> delta_kernel::Result<()> {
+    let table = TestTableBuilder::new()
+        .with_log_state(LogState::with_latest_version(4).with_checkpoint_at([1]))
+        .with_schema(simple_schema())
+        .with_data(1, 1)
+        .build()?;
 
-    // commits 2, 3, 4: insert more data after the checkpoint
-    let mut snap = Snapshot::builder_for(table_url.clone()).build(setup_engine.as_ref())?;
-    for val in [2i32, 3, 4] {
-        let c = insert_data(
-            snap,
-            &setup_engine,
-            vec![Arc::new(Int32Array::from(vec![val]))],
-        )
-        .await?
-        .unwrap_committed();
-        snap = c
-            .post_commit_snapshot()
-            .expect("post-commit snapshot")
-            .clone();
-    }
-
-    let (measure_engine, reporter, _guard) = measuring_engine(Arc::new(LocalFileSystem::new()));
-    let _snap = Snapshot::builder_for(table_url).build(&measure_engine)?;
+    let (measure_engine, reporter, _guard) = measuring_engine(table.store().clone());
+    let _snap = Snapshot::builder_for(table.table_root()).build(&measure_engine)?;
 
     assert_full_snapshot_completed(&reporter);
     assert_eq!(reporter.log_segment_loads.get(), 1);
@@ -546,10 +520,7 @@ async fn checkpoint_with_multiple_tail_commits_emits_expected_metrics() -> delta
     assert_eq!(reporter.json_read_calls.get(), 1);
     assert_eq!(reporter.json_files_read.get(), 3);
     assert_eq!(reporter.parquet_read_calls.get(), 1);
-    // See Scenario 2 comment: Windows NTFS may report stale size=0 for recently written files.
-    #[cfg(not(windows))]
     assert!(reporter.json_bytes_read.get() > 0);
-    #[cfg(not(windows))]
     assert!(reporter.parquet_bytes_read.get() > 0);
 
     Ok(())
