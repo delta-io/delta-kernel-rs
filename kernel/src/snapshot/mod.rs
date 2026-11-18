@@ -45,7 +45,8 @@ use crate::metrics::events::{
 };
 use crate::metrics::{
     CheckpointWriteMode, CheckpointWriteOutcome, ChecksumWriteOutcome, ChecksumWriteResolutionMode,
-    SnapshotLoadMetricContext, emit_protocol_metadata_load, emit_protocol_metadata_load_failure,
+    MetricId, SnapshotLoadMetricContext, emit_protocol_metadata_load,
+    emit_protocol_metadata_load_failure,
 };
 use crate::path::ParsedLogPath;
 use crate::row_tracking::{ROW_TRACKING_DOMAIN_NAME, parse_row_tracking_high_water_mark};
@@ -1752,8 +1753,12 @@ impl Snapshot {
         parent = &self.span,
         name = "snap.checkpoint",
         skip_all,
-        fields(report, outcome, mode, duration_ns, bytes_written, num_add_files, num_remove_files,
-            num_actions, num_sidecars),
+        fields(report, operation_id = %MetricId::new(), version = self.version(), outcome, mode,
+            duration_ns, size_in_bytes, num_add_files, num_remove_files, num_actions, num_sidecars,
+            log_tail_input_duration_ns, checkpoint_input_duration_ns, reconciliation_duration_ns,
+            stats_transform_duration_ns, output_preparation_duration_ns,
+            num_actions_from_log_tail, num_actions_from_checkpoint,
+            parquet_write_duration_ns, verification_duration_ns, bytes_written, num_sidecars_written),
         err
     )]
     pub fn checkpoint(
@@ -1818,6 +1823,8 @@ impl Snapshot {
         };
         span.record("mode", mode.as_ref());
 
+        let metrics = crate::checkpoint::metrics::CheckpointMetrics::new(&span);
+        let _metrics_report = metrics.report_on_drop(span.clone());
         let writer = Arc::clone(self).create_checkpoint_writer(engine)?;
 
         let write_result = match spec {
@@ -1826,9 +1833,9 @@ impl Snapshot {
             })) => {
                 let hint =
                     file_actions_per_sidecar_hint.unwrap_or(DEFAULT_FILE_ACTIONS_PER_SIDECAR_HINT);
-                writer.write_v2_checkpoint_with_sidecars(engine, hint)
+                writer.write_v2_checkpoint_with_sidecars(engine, hint, metrics.clone())
             }
-            _ => writer.write_checkpoint_without_sidecars(engine),
+            _ => writer.write_checkpoint_without_sidecars(engine, metrics.clone()),
         };
 
         let info = match write_result {
@@ -1873,7 +1880,7 @@ impl Snapshot {
             false, /* skipped_new_checkpoints */
         )?);
         span.record(
-            "bytes_written",
+            "size_in_bytes",
             info.last_checkpoint_stats.size_in_bytes as u64,
         );
         span.record(

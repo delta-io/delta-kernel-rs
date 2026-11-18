@@ -28,11 +28,12 @@ Snapshot-build failures receive elapsed time when the lifecycle span closes. Log
 protocol/metadata failures preserve the operation duration passed to their emit helper; timing the
 helper span itself would omit the failed work.
 
-`CheckpointWriteSuccess` reports `Written` with statistics or `AlreadyExists` without statistics.
-`CheckpointWriteFailure` retains the selected mode and duration without write statistics. Both durations
-stop after checkpoint data writes and verification, before hint publication. Recording `duration_ns`
-preserves that boundary when the reporting span closes after the final API result is known. Calls
-that return before data completion use span-close timing.
+`CheckpointWriteOutcome::Written` carries completed-checkpoint contents in `CheckpointWriteStats`.
+Both checkpoint events retain the attempt's processing and output metrics, including work performed
+before an error or an `AlreadyExists` return. Both durations stop after checkpoint data writes and
+verification, before hint publication. Recording `duration_ns` preserves that boundary when the
+reporting span closes after the final API result is known. Calls that return before data completion
+use span-close timing.
 
 ## Completion outcomes
 
