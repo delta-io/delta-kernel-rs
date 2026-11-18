@@ -551,8 +551,8 @@ impl ScanBuilder {
     /// Ordinary string comparisons use UTF-8 binary semantics, including on columns with
     /// `__COLLATIONS`. For a collation-aware comparison, pass a
     /// [`collated_comparison`](crate::expressions::collated_comparison) to skip files using that
-    /// collation's bounds, or [`Predicate::unknown`] in its place to keep every file. Apply the
-    /// original filter after reading in both cases.
+    /// collation's bounds, or derive a conservative predicate whose TRUE rows include every match
+    /// of the original filter. Apply the original filter after reading in both cases.
     ///
     /// [`StructType::add_metadata_column`]: crate::schema::StructType::add_metadata_column
     pub fn with_predicate(mut self, predicate: impl Into<Option<PredicateRef>>) -> Self {

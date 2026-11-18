@@ -36,16 +36,8 @@ const SYNTHETIC_ID: &str = "test.ASCII_CI.1";
 
 /// Wraps `engine` so that it evaluates comparisons under `collation` ASCII case-insensitively.
 fn with_collator(engine: Arc<dyn Engine>, collation: &'static str) -> Arc<dyn Engine> {
-    let handler = CollationEvaluationHandler::new(
-        engine.evaluation_handler(),
-        Arc::new(AsciiCaseInsensitive(collation)),
-    );
+    let handler = CollationEvaluationHandler::new(Arc::new(AsciiCaseInsensitive(collation)));
     Arc::new(DelegatingEngine::new(engine).with_evaluation_handler(Arc::new(handler)))
-}
-
-/// Wraps `engine` so that it evaluates comparisons under [`SYNTHETIC_ID`].
-fn with_collation(engine: Arc<dyn Engine>) -> Arc<dyn Engine> {
-    with_collator(engine, SYNTHETIC_ID)
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -194,15 +186,6 @@ async fn connector_uses_only_exact_operation_collation_stats(
     Ok(())
 }
 
-/// How a [`Filter`] hands its case-insensitive comparison to Kernel.
-#[derive(Clone, Copy)]
-enum Comparison {
-    /// As a collated comparison, which Kernel skips files with.
-    Collated,
-    /// As an unknown predicate, which leaves the comparison to the connector.
-    Unknown,
-}
-
 #[derive(Clone, Debug)]
 enum Filter {
     CaseInsensitiveEqual(&'static str),
@@ -250,25 +233,20 @@ impl Filter {
         }
     }
 
-    /// The filter as a Kernel predicate with the same structure.
-    fn kernel_predicate(&self, comparison: Comparison) -> Predicate {
+    /// The filter as a Kernel predicate with the same structure, compared under [`SYNTHETIC_ID`].
+    fn kernel_predicate(&self) -> Predicate {
         match self {
-            Self::CaseInsensitiveEqual(literal) => match comparison {
-                Comparison::Collated => {
-                    collated_comparison(SYNTHETIC_ID, col!("name").eq(lit(*literal)))
-                }
-                Comparison::Unknown => Predicate::unknown("collated comparison"),
-            },
+            Self::CaseInsensitiveEqual(literal) => {
+                collated_comparison(SYNTHETIC_ID, col!("name").eq(lit(*literal)))
+            }
             Self::IdAtLeast(min) => col!("id").ge(lit(*min)),
-            Self::And(left, right) => Predicate::and(
-                left.kernel_predicate(comparison),
-                right.kernel_predicate(comparison),
-            ),
-            Self::Or(left, right) => Predicate::or(
-                left.kernel_predicate(comparison),
-                right.kernel_predicate(comparison),
-            ),
-            Self::Not(child) => Predicate::not(child.kernel_predicate(comparison)),
+            Self::And(left, right) => {
+                Predicate::and(left.kernel_predicate(), right.kernel_predicate())
+            }
+            Self::Or(left, right) => {
+                Predicate::or(left.kernel_predicate(), right.kernel_predicate())
+            }
+            Self::Not(child) => Predicate::not(child.kernel_predicate()),
         }
     }
 }
@@ -295,17 +273,11 @@ fn compound(and: bool) -> Filter {
 async fn conservative_predicates_prune_files_without_losing_original_matches(
     #[case] original: Filter,
     #[case] expected_candidates: usize,
-    #[values(false, true)] unknown_comparison: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (_temp, path, engine) = test_table_setup()?;
     let fixture = synthetic_fixture(Some(SYNTHETIC_ID), Operation::Equal);
     let snapshot = create_fixture(&path, engine.as_ref(), &fixture, &[]).await?;
-    // Kernel relaxes an unknown comparison the way the connector would relax it by hand.
-    let safe = if unknown_comparison {
-        original.kernel_predicate(Comparison::Unknown)
-    } else {
-        original.conservative_predicate(false)
-    };
+    let safe = original.conservative_predicate(false);
     assert!(!safe.references().contains(&column_name!("name")));
     let scan = snapshot
         .clone()
@@ -327,8 +299,7 @@ async fn conservative_predicates_prune_files_without_losing_original_matches(
     Ok(())
 }
 
-/// Kernel skips with the engine's comparison over the bounds of the predicate's exact collation,
-/// and only those (RFC: "Reader Requirements for Collations").
+/// Skips only with the predicate's exact collation (RFC: "Reader Requirements for Collations").
 #[rstest]
 #[case::commits("none", None, true, SYNTHETIC_ID)]
 #[case::json_stats_v1_checkpoint("none", Some(CheckpointSpec::V1), false, SYNTHETIC_ID)]
@@ -392,7 +363,7 @@ async fn collated_predicates_prune_files_without_losing_matches(
         snapshot.checkpoint(engine.as_ref(), Some(checkpoint))?;
     }
     let snapshot = Snapshot::builder_for(&path).build(engine.as_ref())?;
-    let engine = with_collation(engine);
+    let engine = with_collator(engine, SYNTHETIC_ID);
     let all_rows = rows(&read_scan(
         &snapshot.clone().scan_builder().build()?,
         engine.clone(),
@@ -416,8 +387,8 @@ async fn collated_predicates_prune_files_without_losing_matches(
         (not(compound(true)), 7),
         (not(compound(false)), 1),
     ] {
-        let candidates = candidate_rows(original.kernel_predicate(Comparison::Collated))?;
-        // Bounds under another identifier leave only the binary `id` comparison to skip with.
+        let candidates = candidate_rows(original.kernel_predicate())?;
+        // With bounds under another identifier, only the binary `id` comparison can skip.
         let expected_candidates = if stats_id == SYNTHETIC_ID {
             kept_rows
         } else {
@@ -435,8 +406,8 @@ async fn collated_predicates_prune_files_without_losing_matches(
     Ok(())
 }
 
-/// Only the first file can hold `charlie` ignoring case. Its binary bounds end at `Charlie`, so
-/// they would skip it too.
+/// Only the first file matches `charlie` ignoring case, and its binary bounds, which end at
+/// `Charlie`, would skip it.
 #[rstest]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn collated_predicate_on_a_nested_column_prunes_files_by_its_nested_bounds(
@@ -474,10 +445,10 @@ async fn collated_predicates_prune_sidecar_files_in_sequential_and_parallel_scan
         .build(engine.as_ref())?
         .scan_builder()
         .with_predicate(Arc::new(
-            Filter::CaseInsensitiveEqual("alice").kernel_predicate(Comparison::Collated),
+            Filter::CaseInsensitiveEqual("alice").kernel_predicate(),
         ))
         .build()?;
-    let kept = collect_scan_paths(&scan, with_collation(engine), parallel)?;
+    let kept = collect_scan_paths(&scan, with_collator(engine, SYNTHETIC_ID), parallel)?;
     assert_eq!(kept.len(), 2);
     Ok(())
 }
@@ -496,7 +467,7 @@ async fn collated_predicate_fails_the_scan_when_the_engine_cannot_evaluate_it(
     let scan = snapshot
         .scan_builder()
         .with_predicate(Arc::new(
-            Filter::CaseInsensitiveEqual("alice").kernel_predicate(Comparison::Collated),
+            Filter::CaseInsensitiveEqual("alice").kernel_predicate(),
         ))
         .build()?;
     let engine: Arc<dyn Engine> = match collation {

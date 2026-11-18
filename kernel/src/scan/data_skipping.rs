@@ -7,10 +7,11 @@ use tracing::{debug, error, trace};
 
 use crate::actions::visitors::SelectionVectorVisitor;
 use crate::actions::{COLLATION_STATS, MAX_VALUES, MIN_VALUES, NULL_COUNT, NUM_RECORDS};
+use crate::expressions::collation::CollatedComparison;
 use crate::expressions::{
-    BinaryPredicateOp, CollatedComparison, ColumnName, Expression as Expr, ExpressionRef,
-    JunctionPredicateOp, MapToStructOptions, OpaquePredicateOpRef, Predicate as Pred, PredicateRef,
-    Scalar, col, collated_comparison, column_name, expr, lit,
+    BinaryPredicateOp, ColumnName, Expression as Expr, ExpressionRef, JunctionPredicateOp,
+    MapToStructOptions, OpaquePredicateOpRef, Predicate as Pred, PredicateRef, Scalar, col,
+    collated_comparison, column_name, expr, lit,
 };
 use crate::kernel_predicates::{
     DataSkippingPredicateEvaluator, KernelPredicateEvaluator, KernelPredicateEvaluatorDefaults,
@@ -114,9 +115,8 @@ impl DataSkippingFilter {
     /// # Parameters
     /// - `engine`: Engine for creating evaluators
     /// - `predicate`: Optional predicate for data skipping
-    /// - `stats_schema`: The data stats schema (numRecords, nullCount, minValues, maxValues, and
-    ///   any statsWithCollation bounds, over which collated comparisons are rewritten). Pass `None`
-    ///   if no data stats are available.
+    /// - `stats_schema`: The data stats schema (numRecords, nullCount, minValues, maxValues,
+    ///   statsWithCollation). Pass `None` if no data stats are available.
     /// - `stats_expr`: Expression to extract data stats from the batch, producing output matching
     ///   `stats_schema`. For example, `col!("stats_parsed")` for pre-parsed stats, or
     ///   `Expression::parse_json(col!("add.stats"), stats_schema)` for JSON parsing.
@@ -613,14 +613,11 @@ impl DataSkippingColumns<'_> {
 /// For partition columns, rewrites to `partitionValues_parsed.*` since the partition value is
 /// the exact value for every row in the file (serving as both min and max).
 /// For collated comparisons, rewrites to `stats_parsed.statsWithCollation.<collation>.*`.
-#[derive(Clone, Copy)]
 struct DataSkippingPredicateCreator<'a> {
     data_skipping_columns: DataSkippingColumns<'a>,
-    /// The stats schema whose `statsWithCollation` bounds collated comparisons are rewritten
-    /// over. `None` disables those rewrites.
+    /// Stats schema holding the `statsWithCollation` bounds. `None` disables collated rewrites.
     stats_schema: Option<&'a StructType>,
-    /// The collation of the comparison being rewritten, if it has one. Its bounds then stand in
-    /// for the binary bounds, and the engine compares them under it.
+    /// Set while rewriting a collated comparison: min/max then resolve to this collation's bounds.
     collation: Option<&'a str>,
 }
 
@@ -639,7 +636,6 @@ impl<'a> DataSkippingPredicateCreator<'a> {
         }
     }
 
-    /// Enables rewrites over the collation bounds in `stats_schema`.
     fn with_collation_bounds(mut self, stats_schema: Option<&'a StructType>) -> Self {
         self.stats_schema = stats_schema;
         self
@@ -654,8 +650,7 @@ impl<'a> DataSkippingPredicateCreator<'a> {
             .then(|| Expr::from(column_name!("stats_parsed").join(&path)))
     }
 
-    /// Rewrites a comparison under a collation the way a binary comparison is rewritten, over the
-    /// bounds its column has under that collation.
+    /// Rewrites a collated comparison like a binary one, over its column's collation bounds.
     fn collated_skipping_predicate(
         &self,
         collated: &CollatedComparison,
@@ -737,7 +732,7 @@ impl DataSkippingPredicateEvaluator for DataSkippingPredicateCreator<'_> {
 
     /// For partition columns, wraps the comparison with `OR(NOT is_add, comparison)` so that
     /// Remove rows (which have null add-side partition values) are never filtered. Under a
-    /// collation, the comparison is one the engine evaluates.
+    /// collation, returns a `collated_comparison` over the bound instead.
     fn eval_partial_cmp(
         &self,
         ord: Ordering,

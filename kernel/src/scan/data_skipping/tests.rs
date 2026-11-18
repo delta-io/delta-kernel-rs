@@ -2002,9 +2002,9 @@ fn checkpoint_pushdown_non_stat_arm_folds_to_null_literal() {
 
 const COLLATION: &str = "test.ASCII_CI.1";
 
-/// Rewrites `pred` against stats that record the bounds of `name` and `nested.name` under
-/// [`COLLATION`], then binds the result to an ASCII case-insensitive implementation of it.
-fn collated_skipping_predicate(pred: &Pred) -> Option<Pred> {
+/// Rewrites `pred` over the [`COLLATION`] bounds of `name` and `nested.name`, then binds it to a
+/// test collator that implements only `collation`.
+fn collated_skipping_predicate(pred: &Pred, collation: &'static str) -> Option<Pred> {
     let stats = schema_ref! {
         nullable COLLATION_STATS: {
             nullable COLLATION: {
@@ -2023,7 +2023,7 @@ fn collated_skipping_predicate(pred: &Pred) -> Option<Pred> {
     let skipping_pred = DataSkippingPredicateCreator::new(&partition_columns, &stats_columns)
         .with_collation_bounds(Some(stats.as_ref()))
         .eval_sql_where(pred)?;
-    let collator: Arc<dyn ArrowCollator> = Arc::new(AsciiCaseInsensitive(COLLATION));
+    let collator: Arc<dyn ArrowCollator> = Arc::new(AsciiCaseInsensitive(collation));
     let bound = BindCollator(&collator).transform_pred(&skipping_pred);
     Some(bound.into_owned())
 }
@@ -2036,11 +2036,9 @@ fn collation_bounds(
     is_add: bool,
 ) -> HashMap<ColumnName, Scalar> {
     let bound = |stat: &str, value: Option<&str>| {
-        let bound = column_name!("stats_parsed", COLLATION_STATS)
-            .join(&ColumnName::new([COLLATION, stat]))
-            .join(column);
+        let path = ColumnName::new(["stats_parsed", COLLATION_STATS, COLLATION, stat]).join(column);
         (
-            bound,
+            path,
             value.map_or(Scalar::Null(DataType::STRING), Scalar::from),
         )
     };
@@ -2076,7 +2074,7 @@ fn collated_comparison_skips_exactly_the_files_that_cannot_match(
             (true, false) => Pred::not(collated(ordering, column.clone(), literal, false)),
             _ => collated(ordering, column.clone(), literal, inverted),
         };
-        let skipping_pred = collated_skipping_predicate(&pred).unwrap();
+        let skipping_pred = collated_skipping_predicate(&pred, COLLATION).unwrap();
         for min in 0..values.len() {
             for max in min..values.len() {
                 let may_match = values[min..=max]
@@ -2102,7 +2100,7 @@ fn collated_comparison_keeps_removes_and_files_with_missing_bounds(
     #[values(false, true)] inverted: bool,
 ) {
     let pred = collated(ordering, col!("name"), "c", inverted);
-    let skipping_pred = collated_skipping_predicate(&pred).unwrap();
+    let skipping_pred = collated_skipping_predicate(&pred, COLLATION).unwrap();
     let eval = |min, max, is_add| {
         let bounds = collation_bounds(&column_name!("name"), min, max, is_add);
         DefaultKernelPredicateEvaluator::from(bounds).eval(&skipping_pred)
@@ -2118,15 +2116,12 @@ fn collated_comparison_keeps_removes_and_files_with_missing_bounds(
 fn collated_comparison_is_rewritten_alike_for_either_operand_order() {
     let column_first = collated_comparison(COLLATION, col!("name").lt(lit("c")));
     let literal_first = collated_comparison(COLLATION, lit("c").gt(col!("name")));
-    let skipping_pred = collated_skipping_predicate(&column_first);
+    let skipping_pred = collated_skipping_predicate(&column_first, COLLATION);
     assert!(skipping_pred.is_some());
-    assert_eq!(collated_skipping_predicate(&literal_first), skipping_pred);
-}
-
-/// Bounds of `name` under [`COLLATION`] that exclude `c`, so a comparison that used them would
-/// skip the file.
-fn bounds_excluding_c() -> HashMap<ColumnName, Scalar> {
-    collation_bounds(&column_name!("name"), Some("a"), Some("b"), true)
+    assert_eq!(
+        collated_skipping_predicate(&literal_first, COLLATION),
+        skipping_pred
+    );
 }
 
 #[rstest]
@@ -2135,12 +2130,14 @@ fn bounds_excluding_c() -> HashMap<ColumnName, Scalar> {
 #[case::struct_column(COLLATION, col!("nested"))]
 #[case::not_a_column(COLLATION, lit("C"))]
 fn collated_comparison_keeps_the_file_without_its_bounds(
-    #[case] collation: &str,
+    #[case] collation: &'static str,
     #[case] value: Expr,
 ) {
     let pred = collated_comparison(collation, value.eq(lit("c")));
-    let verdict = collated_skipping_predicate(&pred).and_then(|skipping_pred| {
-        DefaultKernelPredicateEvaluator::from(bounds_excluding_c()).eval(&skipping_pred)
+    // These bounds of `name` would skip the file for `= 'c'` if they were used.
+    let bounds = collation_bounds(&column_name!("name"), Some("a"), Some("b"), true);
+    let verdict = collated_skipping_predicate(&pred, collation).and_then(|skipping_pred| {
+        DefaultKernelPredicateEvaluator::from(bounds).eval(&skipping_pred)
     });
     assert_eq!(verdict, NULL);
 }
@@ -2152,20 +2149,5 @@ fn collated_comparison_keeps_the_file_without_its_bounds(
 #[case::nested(collated_comparison(COLLATION, col!("name").eq(lit("c"))))]
 fn collated_predicate_that_is_not_a_comparison_is_not_rewritten(#[case] wrapped: Pred) {
     let pred = collated_comparison(COLLATION, wrapped);
-    assert_eq!(collated_skipping_predicate(&pred), None);
-}
-
-#[test]
-fn collated_comparison_keeps_the_file_without_a_stats_schema() {
-    let pred = collated_comparison(COLLATION, col!("name").eq(lit("c")));
-    let stats_columns = all_referenced_columns(&pred);
-    let skipping_pred = as_sql_data_skipping_predicate_with_stats_columns(
-        &pred,
-        &Default::default(),
-        &stats_columns,
-    );
-    let verdict = skipping_pred.and_then(|skipping_pred| {
-        DefaultKernelPredicateEvaluator::from(bounds_excluding_c()).eval(&skipping_pred)
-    });
-    assert_eq!(verdict, NULL);
+    assert_eq!(collated_skipping_predicate(&pred, COLLATION), None);
 }

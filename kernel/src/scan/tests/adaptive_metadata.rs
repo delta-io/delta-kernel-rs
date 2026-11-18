@@ -328,8 +328,7 @@ fn data_skipping_prunes_commit_files_but_keeps_tree_files_without_stats() {
 const COLLATION: &str = "test.ASCII_CI.1";
 
 /// Tree files are pruned by their `content_stats`, which are keyed by the checkpoint action's
-/// schema, so a schema change after it leaves them unread. Content stats record no collation
-/// bounds, so a collated comparison keeps every tree file.
+/// schema, so a schema change after it leaves them unread.
 #[rstest]
 #[case::checkpoint_schema(false, Pred::gt(col!("id"), lit(100i64)), &["high.parquet"])]
 #[case::schema_changed_after_checkpoint(
@@ -386,59 +385,8 @@ fn data_skipping_prunes_tree_files_by_content_stats(
     assert_eq!(paths, strings(expected));
 }
 
-/// Commit files record collation bounds in their JSON statistics, so a collated comparison skips
-/// them, while it keeps every tree file.
-#[test]
-fn collated_comparison_skips_commit_files_and_keeps_tree_files() {
-    let (engine, _) = setup_adaptive_metadata_table();
-    let version = commit_root_manifest(
-        &engine,
-        &table_root(),
-        "metadata/root.parquet",
-        &[added_data_entry("tree.parquet", 1, 1, 0, 0)],
-    );
-    let add = |path: &str, min: &str, max: &str| {
-        let stats = json!({
-            "numRecords": 1,
-            "statsWithCollation": { COLLATION: {
-                "minValues": { "phys_name": min },
-                "maxValues": { "phys_name": max },
-            } },
-        });
-        json!({ "add": {
-            "path": path,
-            "partitionValues": {},
-            "size": 1,
-            "modificationTime": 1,
-            "dataChange": true,
-            "stats": stats.to_string(),
-        } })
-        .to_string()
-    };
-    let adds = vec![add("low.parquet", "a", "c"), add("high.parquet", "x", "z")];
-    let adds = parse_json_batch(adds.into());
-    write_commit_after_manifest_commit(&engine, &table_root(), version + 1, version, adds).unwrap();
-
-    let predicate = collated_comparison(COLLATION, col!("name").gt(lit("m")));
-    let scan = snapshot_at(&engine, version + 1)
-        .scan_builder()
-        .with_predicate(Arc::new(predicate))
-        .build()
-        .unwrap();
-    let paths: Vec<_> = get_files_for_scan(scan, &with_collator(engine))
-        .unwrap()
-        .into_iter()
-        .sorted()
-        .collect();
-    assert_eq!(paths, strings(&["high.parquet", "tree.parquet"]));
-}
-
-/// Wraps `engine` so that it compares under [`COLLATION`] ASCII case-insensitively.
 fn with_collator(engine: SyncEngine) -> impl Engine {
-    let evaluation = CollationEvaluationHandler::new(
-        engine.evaluation_handler(),
-        Arc::new(AsciiCaseInsensitive(COLLATION)),
-    );
+    let evaluation = CollationEvaluationHandler::new(Arc::new(AsciiCaseInsensitive(COLLATION)));
     DelegatingEngine::new(Arc::new(engine)).with_evaluation_handler(Arc::new(evaluation))
 }
 

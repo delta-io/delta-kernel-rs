@@ -22,11 +22,8 @@ use crate::struct_patch::ProjectionStructPatchBuilder;
 use crate::transforms::{SchemaTransform, transform_output_type};
 use crate::{KernelError, KernelResult, Snapshot};
 
-/// Returns `stats` with `collation_stats` as its collation stats field. Without `stats`, the
-/// result holds only the file-level stats and the collation stats.
-///
-/// `stats` can already hold collation stats: a scan reads the bounds its predicate compares, and
-/// a checkpoint read then widens them to every collation the checkpoint records.
+/// Returns `stats` with `collation_stats` as its collation stats field, replacing any it holds.
+/// Without `stats`, the result holds only the file-level stats and the collation stats.
 pub(crate) fn set_collation_stats(
     stats: Option<&StructType>,
     collation_stats: StructField,

@@ -176,30 +176,15 @@ let scan = snapshot
 ## Collation-aware queries
 
 To execute a collation-aware query, your connector owns the string comparison rules and
-the original row filter. Kernel preserves `__COLLATIONS` schema annotations, but they don't
-change how Kernel evaluates a predicate. An ordinary string comparison uses UTF-8 binary
-semantics, including on collated columns, and so does the
-[data skipping](#how-data-skipping-works) for it. An ordinary equality predicate for `"alice"`
-can skip a file containing `"Alice"`. Evaluating a case-insensitive comparison later cannot
-recover that file.
+the original row filter. Kernel preserves `__COLLATIONS` schema annotations. Existing
+`statsWithCollation` bounds reach your connector when you request JSON statistics.
+Structured statistics omit these bounds. `StatsOptions::all_struct()` disables JSON synthesis.
+Ordinary predicates and their [data skipping](#how-data-skipping-works) use UTF-8 binary semantics.
+An ordinary equality predicate for `"alice"` can skip a file containing `"Alice"`.
+Evaluating a case-insensitive comparison later cannot recover that file.
 
-The predicate you build decides how Kernel treats each string comparison:
-
-| Comparison | Build it with | Data skipping |
-|------------|---------------|---------------|
-| UTF-8 binary | `Predicate::eq`, `Predicate::lt`, and the other ordinary constructors | Uses binary bounds |
-| Collated, and your Engine implements the collation | `collated_comparison` | Uses the bounds recorded for that exact collation |
-| Collated, and left to your connector | `Predicate::unknown` | Keeps every file for that comparison |
-
-Kernel combines them safely under `AND`, `OR`, and `NOT`, so keep the structure of the
-original filter. The operation determines the collation, which can differ from the schema's
-default.
-
-### Skipping with your collation
-
-Kernel has no collation library. A [`collated_comparison`] names its collation by the exact
-`provider.name.version` identifier and carries no implementation of it. To skip files for a
-collated comparison, pass it to the scan like any other predicate:
+To have Kernel skip files for a collated comparison, build it with [`collated_comparison`],
+which names the collation by its exact `provider.name.version` identifier:
 
 ```rust,no_run
 # extern crate delta_kernel;
@@ -218,50 +203,42 @@ let scan = snapshot
 # }
 ```
 
-Kernel reads the bounds that writers recorded under that identifier, and your Engine compares
-them to the literal. Kernel keeps a file whose bounds are missing. It never substitutes binary
-bounds or the bounds of another version. A checkpoint that stores statistics as a struct can
-omit a collation's bounds, and Kernel keeps the files of such a checkpoint. Only
-`Scan::scan_metadata` and the scans built on it skip files this way. Every other scan keeps
-every file.
-
-Your Engine's evaluation handler must evaluate the comparison. If your Engine evaluates Arrow
-data with Kernel's `ArrowEvaluationHandler`, implement [`ArrowCollator`] over your collation
-library and wrap the handler in a [`CollationEvaluationHandler`]. The
+Kernel skips a file only when it records bounds under that exact identifier, and keeps a file
+without them. Only `Scan::scan_metadata`, `Scan::parallel_scan_metadata`, and the scans built on
+them skip files this way. Your Engine compares the bounds to the literal. If it evaluates with
+Kernel's `ArrowEvaluationHandler`, implement [`ArrowCollator`] over your collation library and
+return a [`CollationEvaluationHandler`] for it from your Engine's `evaluation_handler`. The
 [collation module rustdoc](https://docs.rs/delta_kernel/latest/delta_kernel/engine/arrow_expression/collation/index.html)
-has a complete example. Return the wrapped handler from your Engine's `evaluation_handler`.
-`DefaultEngine` can't take a custom evaluation handler, so
+has a complete example. `DefaultEngine` can't take a custom evaluation handler, so
 [assemble](../connector/implementing_engine.md#assemble-the-engine) an Engine that reuses
-`DefaultEngine`'s other handlers.
-
-If your Engine's evaluation handler can't evaluate collated comparisons, don't pass one. A scan
-whose predicate holds one over a non-partition STRING column fails when the handler fails while
-evaluating, and skips no files when the handler rejects the predicate up front. Use
-`Predicate::unknown` instead.
-For a collation it doesn't implement, your `ArrowCollator` either returns an error, which fails
-the scan, or leaves every comparison undecided, which keeps every file. A collated comparison
-can't be serialized. To distribute a scan, rebuild the predicate on each worker.
+`DefaultEngine`'s other handlers. If your Engine can't evaluate collated comparisons, don't pass
+one: the scan fails, or skips no files when the handler rejects the predicate up front. Skip
+files in your connector or derive a conservative predicate instead, as described below.
 
 [`collated_comparison`]: https://docs.rs/delta_kernel/latest/delta_kernel/expressions/fn.collated_comparison.html
 [`ArrowCollator`]: https://docs.rs/delta_kernel/latest/delta_kernel/engine/arrow_expression/collation/trait.ArrowCollator.html
 [`CollationEvaluationHandler`]: https://docs.rs/delta_kernel/latest/delta_kernel/engine/arrow_expression/collation/struct.CollationEvaluationHandler.html
 
-### Skipping in your connector
+For connector-owned skipping, [request JSON stats](#controlling-statistics) with
+`StatsOptions::json_only()` or `StatsOptions::all()` and select the bounds that match the
+filtering operation's collation exactly: provider, name, and version. The operation determines
+the collation, which can differ from the schema's default. Use those bounds only with a
+comparison you implement for that exact collation. If the matching entry or required bounds
+are absent, retain the file.
+Never substitute binary bounds or another collation/version.
 
-To skip files in your connector instead, [request JSON stats](#controlling-statistics) with
-`StatsOptions::json_only()` or `StatsOptions::all()`. Existing `statsWithCollation` bounds
-reach your connector in the JSON statistics. Structured statistics omit these bounds. Select
-the bounds that match the filtering operation's collation exactly: provider, name, and version.
-Use those bounds only with a comparison you implement for that exact collation. If the matching
-entry or required bounds are absent, retain the file.
+Where your evaluator supports opaque predicates, you can implement `OpaquePredicateOp`.
+Each `as_data_skipping_predicate` or `eval_as_data_skipping_predicate` callback must return a
+safe result for its `inverted` flag's polarity, or `None` when it can't safely prune.
+Kernel combines those results conservatively. Scalar evaluation has a different contract:
+`eval_pred_scalar` returns `Err` for unsupported evaluation and `Ok(None)` for a SQL NULL result.
+Opaque predicates can't be serialized; reconstruct them on each worker when distributing a scan.
 
-### Predicates for another reader
-
-An underlying Parquet reader's statistics are binary, so a filter or row-group-skipping
-predicate you send it must not discard rows for a collation-aware comparison. If you derive
-such a predicate yourself, every row that is TRUE under the original filter must also be TRUE
-under the derived predicate. Let `C` be a collation-aware comparison the reader can't evaluate
-and `B` a supported binary predicate:
+For a comparison that neither `collated_comparison` nor your own `OpaquePredicateOp` covers,
+derive a conservative binary predicate before calling `ScanBuilder::with_predicate`:
+every row that is TRUE under the original filter must also be TRUE under the derived
+predicate. Let `C` be an unsupported collation-aware comparison and `B` a supported binary
+predicate:
 
 | Original filter | Conservative pushdown |
 |-----------------|-----------------------|
@@ -277,8 +254,9 @@ comparisons, including their negated forms, with `TRUE`. Then simplify the predi
 Dropping an unsupported `OR` branch or negating an already relaxed predicate can discard matching
 rows.
 
-Keep the original collation-aware filter and evaluate it on the rows that survive these
-optimizations. The [collation RFC](https://github.com/delta-io/delta/blob/master/protocol_rfcs/collated-string-type.md#reader-requirements-for-collations)
+Apply the same restriction to filter and row-group-skipping predicates sent to an underlying
+Parquet reader. Keep the original collation-aware filter and evaluate it on the rows that
+survive these optimizations. The [collation RFC](https://github.com/delta-io/delta/blob/master/protocol_rfcs/collated-string-type.md#reader-requirements-for-collations)
 defines the statistics-matching requirements.
 
 ## How data skipping works
