@@ -109,18 +109,19 @@ pub unsafe extern "C" fn snapshot_checkpoint_info(
     let result = snapshot
         .reader()
         .get_checkpoint_info(engine.engine().as_ref())
-        .and_then(|info| with_checkpoint_info(info.as_deref(), |info| visitor(context, info)))
+        .and_then(|info| visit(info.as_deref(), |info| visitor(context, info)))
         .map(|()| true);
     unsafe { result.into_extern_result(&engine) }
 }
 
 /// Invoke a callback while the checkpoint record and all nested backing storage are alive.
-pub(crate) fn with_checkpoint_info<R>(
+pub(crate) fn visit(
     info: Option<&CheckpointInfo>,
-    visitor: impl FnOnce(*const FfiCheckpointInfo) -> R,
-) -> KernelResult<R> {
+    visitor: impl FnOnce(*const FfiCheckpointInfo),
+) -> KernelResult<()> {
     let Some(info) = info else {
-        return Ok(visitor(std::ptr::null()));
+        visitor(std::ptr::null());
+        return Ok(());
     };
     let schema = serde_json::to_string(info.leaf_schema())?;
     let checkpoint = CheckpointBacking::try_new(info.last_checkpoint())?;
@@ -132,7 +133,8 @@ pub(crate) fn with_checkpoint_info<R>(
         last_checkpoint: checkpoint.as_ffi(),
         kind: info.kind().into(),
     };
-    Ok(visitor(&value))
+    visitor(&value);
+    Ok(())
 }
 
 #[cfg(test)]
