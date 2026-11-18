@@ -20,7 +20,7 @@ Test tables organized by feature area. Tables live in two locations:
 
 | Table | Location | Schema | Protocol (R/W) | Features | Description | Tests |
 |-------|----------|--------|----------|----------|-------------|-------|
-| `table-with-cdf` | data/ | `part: int, id: int` | v1/v4 | `enableChangeDataFeed=true` | Fake file paths for CDF validation logic | `table_changes/mod.rs::test_table_changes_errors/test_cdf_start_end_version/test_cdf_no_end_version`, `table_changes/scan.rs::test_table_changes_scan_errors/test_create_cdf_scan_batches_errors` |
+| `table-with-cdf` | data/ | `part: int, id: int` | v1/v4 | `enableChangeDataFeed=true` | Fake file paths for CDF validation logic | Unit tests in `table_changes/mod.rs`, `table_changes/scan.rs`, `scan/tests.rs`, and `engine/cancellable_engine/tests.rs` |
 | `cdf-table` | data/cdf-table.tar.zst | `id: int, name: string, birthday: date` partitioned by `birthday` | v1/v4 | `enableChangeDataFeed=true` | Base CDF table | `features::cdf::basic_cdf` |
 | `cdf-table-simple` | data/cdf-table-simple.tar.zst | `id: long` | v1/v7 | w:`changeDataFeed,appendOnly,invariants`, `enableChangeDataFeed=true` | Version range queries and validation | `features::cdf::simple_cdf_version_ranges/invalid_range_end_before_start/invalid_range_start_after_last_version_of_table` |
 | `cdf-table-non-partitioned` | data/cdf-table-non-partitioned.tar.zst | `id: int, name: string, birthday: date, long_field: long, boolean_field: boolean, double_field: double, smallint_field: short` | v1/v4 | `enableChangeDataFeed=true` | Non-partitioned CDF table | `features::cdf::cdf_non_partitioned` |
