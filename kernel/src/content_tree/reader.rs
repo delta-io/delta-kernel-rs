@@ -1271,7 +1271,7 @@ mod tests {
     use crate::content_tree::test_utils::{
         action_paths, added_data_entry, data_manifest_entry, entry_batch, mumbling_bitmap,
         struct_batch, test_dv_info, with_field, write_manifest, write_manifest_with_stats,
-        x_full_stats, x_full_stats_value, x_upper_bound_stats,
+        write_manifest_without_tags, x_full_stats, x_full_stats_value, x_upper_bound_stats,
     };
     use crate::content_tree::{DeletionVectorInfo, ManifestInfo};
     use crate::engine::DelegatingEngine;
@@ -1937,6 +1937,21 @@ mod tests {
         let batches = read_tree(&engine, &checkpoint).unwrap();
         let actual: Vec<_> = batches.iter().flat_map(add_tags).collect();
         assert_eq!(actual, tags);
+    }
+
+    #[test]
+    fn read_add_actions_from_amt_reads_missing_tags_column_as_null_tags() {
+        let engine = memory_engine();
+        let location = table_root().join(ROOT_PATH).unwrap();
+        let entries = [added_data_entry("a.parquet", 100, 10, 0, 5)];
+        let root = write_manifest_without_tags(&engine, location, &entries);
+        let footer = engine.parquet_handler().read_parquet_footer(&root).unwrap();
+        assert!(footer.schema.field(TAGS).is_none());
+        let checkpoint = checkpoint_action_with_root(ROOT_PATH, root.size as i64, 1).unwrap();
+
+        let actual = read_tree(&engine, &checkpoint).unwrap();
+        let expected = expected_adds(&engine, &[("a.parquet", 100, 0, 5)]);
+        assert_eq!(actual, vec![expected]);
     }
 
     /// The `add.tags` of each row of `batch`.
