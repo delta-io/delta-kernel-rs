@@ -418,6 +418,7 @@ impl From<&UnaryExpression> for proto_expr::UnaryExpression {
                 UnaryExpressionOp::ToJson {
                     full_precision_timestamps,
                 } => full_precision_timestamps,
+                UnaryExpressionOp::MapLen => false,
             },
         }
     }
@@ -546,6 +547,7 @@ impl From<UnaryExpressionOp> for proto_expr::UnaryExpressionOp {
     fn from(op: UnaryExpressionOp) -> Self {
         match op {
             UnaryExpressionOp::ToJson { .. } => proto_expr::UnaryExpressionOp::ToJson,
+            UnaryExpressionOp::MapLen => proto_expr::UnaryExpressionOp::MapLen,
         }
     }
 }
@@ -586,6 +588,7 @@ impl From<BinaryPredicateOp> for proto_expr::BinaryPredicateOp {
             BinaryPredicateOp::Equal => proto_expr::BinaryPredicateOp::Equal,
             BinaryPredicateOp::Distinct => proto_expr::BinaryPredicateOp::Distinct,
             BinaryPredicateOp::In => proto_expr::BinaryPredicateOp::In,
+            BinaryPredicateOp::MapHasKey => proto_expr::BinaryPredicateOp::MapHasKey,
         }
     }
 }
@@ -2005,6 +2008,7 @@ mod tests {
 
     #[rstest]
     #[case(UnaryExpressionOp::TO_JSON, proto_expr::UnaryExpressionOp::ToJson)]
+    #[case(UnaryExpressionOp::MapLen, proto_expr::UnaryExpressionOp::MapLen)]
     fn from_unary_expression_op(
         #[case] op: UnaryExpressionOp,
         #[case] expected: proto_expr::UnaryExpressionOp,
@@ -2067,6 +2071,7 @@ mod tests {
     #[case(BinaryPredicateOp::Equal, proto_expr::BinaryPredicateOp::Equal)]
     #[case(BinaryPredicateOp::Distinct, proto_expr::BinaryPredicateOp::Distinct)]
     #[case(BinaryPredicateOp::In, proto_expr::BinaryPredicateOp::In)]
+    #[case(BinaryPredicateOp::MapHasKey, proto_expr::BinaryPredicateOp::MapHasKey)]
     fn from_binary_predicate_op(
         #[case] op: BinaryPredicateOp,
         #[case] expected: proto_expr::BinaryPredicateOp,
