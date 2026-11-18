@@ -208,7 +208,8 @@ This list is non-exhaustive: when in doubt, browse the source files directly
 **Commit + read helpers (from `test_utils`)**
 
 - `add_commit`, `add_staged_commit`: write a JSON commit at a given version.
-- `read_actions_from_commit`: read raw JSON actions from a specific local-file commit.
+- `read_actions_from_commit`: read raw JSON actions from a specific local-file commit. Use
+  this instead of hand-rolled `serde_json` parsing.
 - `test_read`: full-scan read of a table; use for round-trip assertions.
 - `into_record_batch`: convert `Box<dyn EngineData>` to Arrow `RecordBatch`.
 
