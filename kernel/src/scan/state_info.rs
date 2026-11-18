@@ -140,6 +140,9 @@ pub(crate) struct StateInfo {
     pub(crate) skip_row_transforms: bool,
     /// Table root for normalizing paths. `Some` iff adaptiveMetadata is enabled.
     pub(crate) dv_normalization_root: Option<Url>,
+    /// The operator that encodes this table's `stats_parsed` as JSON. See
+    /// [`TableConfiguration::stats_json_op`].
+    pub(crate) stats_json_op: UnaryExpressionOp,
 }
 
 /// Validating the metadata columns also extracts information needed to properly construct the full
@@ -368,15 +371,6 @@ fn union_extra_into_filter(filter: &mut Vec<ColumnName>, extra: &[ColumnName]) {
 }
 
 impl StateInfo {
-    /// The operator that encodes this table's `stats_parsed` as JSON. See
-    /// [`TableConfiguration::stats_json_op`].
-    pub(crate) fn stats_json_op(&self) -> UnaryExpressionOp {
-        // `dv_normalization_root` is set exactly when adaptiveMetadata is enabled.
-        UnaryExpressionOp::ToJson {
-            full_precision_timestamps: self.dv_normalization_root.is_some(),
-        }
-    }
-
     /// Create StateInfo with a custom field classifier for different scan types.
     /// Get the state needed to process a scan.
     ///
@@ -682,6 +676,7 @@ impl StateInfo {
             is_catalog_managed: table_configuration.is_catalog_managed(),
             skip_row_transforms: false,
             dv_normalization_root: table_configuration.dv_normalization_root(),
+            stats_json_op: table_configuration.stats_json_op(),
         })
     }
 

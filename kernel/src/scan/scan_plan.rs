@@ -77,7 +77,7 @@ impl<'a> MetadataPlanner<'a> {
         )
         .with_read_collations(scan.needs_collation_stats_schema())
         .with_stats_filter(stats_filter)
-        .with_stats_json_op(scan.state_info.stats_json_op()))
+        .with_stats_json_op(scan.state_info.stats_json_op))
     }
 }
 

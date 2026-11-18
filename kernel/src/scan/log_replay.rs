@@ -105,6 +105,14 @@ struct InternalScanState {
     /// Table root for normalizing paths. `Some` iff adaptiveMetadata is enabled.
     #[serde(default)]
     dv_normalization_root: Option<Url>,
+    /// Blobs without this field come from kernels that always encoded stats JSON with
+    /// [`UnaryExpressionOp::TO_JSON`].
+    #[serde(default = "millisecond_stats_json_op")]
+    stats_json_op: UnaryExpressionOp,
+}
+
+fn millisecond_stats_json_op() -> UnaryExpressionOp {
+    UnaryExpressionOp::TO_JSON
 }
 
 /// Serializable processor state for distributed processing. This can be serialized using the
@@ -270,7 +278,7 @@ impl ScanLogReplayProcessor {
             synthesize_json,
         } = stats_options;
         let timestamp_timezone_name = partition_values_options.timestamp_timezone.as_deref();
-        let json_synthesis_op = synthesize_json.then(|| state_info.stats_json_op());
+        let json_synthesis_op = synthesize_json.then(|| state_info.stats_json_op);
 
         // Create metrics first so we can pass them to DataSkippingFilter
         let metrics = Arc::new(ScanMetrics::default());
@@ -429,6 +437,7 @@ impl ScanLogReplayProcessor {
             is_catalog_managed,
             skip_row_transforms,
             dv_normalization_root,
+            stats_json_op,
         } = self.state_info.as_ref().clone();
 
         // Extract predicate from PhysicalPredicate
@@ -453,6 +462,7 @@ impl ScanLogReplayProcessor {
             is_catalog_managed,
             skip_row_transforms,
             dv_normalization_root,
+            stats_json_op,
         };
         let internal_state_blob = serde_json::to_vec(&internal_state).map_err(|e| {
             KernelError::generic(format!("Failed to serialize internal state: {e}"))
@@ -518,6 +528,7 @@ impl ScanLogReplayProcessor {
             is_catalog_managed: internal_state.is_catalog_managed,
             skip_row_transforms: internal_state.skip_row_transforms,
             dv_normalization_root: internal_state.dv_normalization_root,
+            stats_json_op: internal_state.stats_json_op,
         });
 
         Self::new_with_seen_files(
@@ -1336,12 +1347,15 @@ mod tests {
     use std::time::Duration;
 
     use rstest::rstest;
+    use serde_json::json;
     use url::Url;
 
     use super::{
-        InternalScanState, ParsedColumnSource, ScanLogReplayProcessor, ScanPartitionValuesOptions,
-        ScanStatsOptions, SerializableScanState, get_add_transform_expr, scan_action_iter,
+        InternalScanState, ParsedColumnSource, SCAN_ROW_SCHEMA, ScanLogReplayProcessor,
+        ScanPartitionValuesOptions, ScanStatsOptions, SerializableScanState,
+        get_add_transform_expr, scan_action_iter,
     };
+    use crate::actions::{ADD_NAME, LOG_ADD_SCHEMA, MIN_VALUES};
     use crate::arrow::array::StringArray;
     use crate::arrow::array::cast::AsArray;
     use crate::arrow::array::types::TimestampMicrosecondType;
@@ -1371,9 +1385,15 @@ mod tests {
     use crate::scan::{
         COMMIT_READ_SCHEMA, PartitionValuesOptions, PhysicalPredicate, StatsOptions,
     };
-    use crate::schema::{DataType, MetadataColumnSpec, SchemaRef, schema_ref};
+    use crate::schema::{
+        DataType, MetadataColumnSpec, SchemaRef, SchemaStructPatchBuilder, StructField, schema,
+        schema_ref,
+    };
     use crate::table_features::ColumnMappingMode;
-    use crate::unit_test_utils::{assert_result_error_with_message, string_array_to_engine_data};
+    use crate::unit_test_utils::{
+        MICROSECOND_TIMESTAMP, assert_min_ts_in_stats_json, assert_result_error_with_message,
+        evaluate_on_json_rows, string_array_to_engine_data,
+    };
     use crate::{
         Engine, EngineData, Expression as Expr, ExpressionEvaluator, ExpressionRef, KernelError,
         KernelResult, Result,
@@ -1616,6 +1636,7 @@ mod tests {
             is_catalog_managed: false,
             skip_row_transforms: false,
             dv_normalization_root: None,
+            stats_json_op: UnaryExpressionOp::TO_JSON,
         });
         let (iter, _metrics) = scan_action_iter(
             &SyncEngine::new(),
@@ -2112,6 +2133,7 @@ mod tests {
                 is_catalog_managed: false,
                 skip_row_transforms: false,
                 dv_normalization_root: None,
+                stats_json_op: UnaryExpressionOp::TO_JSON,
             });
             let checkpoint_info = test_checkpoint_info();
             let processor = ScanLogReplayProcessor::new(
@@ -2150,6 +2172,7 @@ mod tests {
             is_catalog_managed: false,
             skip_row_transforms: false,
             dv_normalization_root: None,
+            stats_json_op: UnaryExpressionOp::TO_JSON,
         });
         let processor = ScanLogReplayProcessor::new(
             &engine,
@@ -2184,6 +2207,7 @@ mod tests {
             is_catalog_managed: true,
             skip_row_transforms: false,
             dv_normalization_root: None,
+            stats_json_op: UnaryExpressionOp::TO_JSON,
         });
         let processor = ScanLogReplayProcessor::new(
             &engine,
@@ -2218,6 +2242,7 @@ mod tests {
             is_catalog_managed: false,
             skip_row_transforms: skip,
             dv_normalization_root: None,
+            stats_json_op: UnaryExpressionOp::TO_JSON,
         });
         let processor = ScanLogReplayProcessor::new(
             &engine,
@@ -2252,6 +2277,9 @@ mod tests {
             requested_physical_stats_columns: Vec::new(),
             is_catalog_managed: false,
             skip_row_transforms: false,
+            stats_json_op: UnaryExpressionOp::ToJson {
+                full_precision_timestamps: dv_normalization_root.is_some(),
+            },
             dv_normalization_root,
         });
         ScanLogReplayProcessor::new(
@@ -2276,11 +2304,17 @@ mod tests {
             processor.into_serializable_state().unwrap(),
         )
         .unwrap();
+        assert_eq!(
+            deserialized.state_info.stats_json_op,
+            UnaryExpressionOp::ToJson {
+                full_precision_timestamps: root.is_some()
+            }
+        );
         assert_eq!(deserialized.state_info.dv_normalization_root, root);
     }
 
     #[test]
-    fn test_deserialize_blob_without_dv_normalization_root_defaults_to_none() {
+    fn test_deserialize_blob_without_dv_normalization_root_or_stats_json_op_uses_defaults() {
         let engine = SyncEngine::new();
         let root = Url::parse("s3://bucket/table/").unwrap();
         let mut state = processor_with_dv_normalization_root(&engine, Some(root))
@@ -2288,15 +2322,16 @@ mod tests {
             .unwrap();
         let mut blob: serde_json::Value =
             serde_json::from_slice(&state.internal_state_blob).unwrap();
-        assert!(
-            blob.as_object_mut()
-                .unwrap()
-                .remove("dv_normalization_root")
-                .is_some()
-        );
+        let fields = blob.as_object_mut().unwrap();
+        assert!(fields.remove("dv_normalization_root").is_some());
+        assert!(fields.remove("stats_json_op").is_some());
         state.internal_state_blob = serde_json::to_vec(&blob).unwrap();
         let deserialized = ScanLogReplayProcessor::from_serializable_state(&engine, state).unwrap();
         assert_eq!(deserialized.state_info.dv_normalization_root, None);
+        assert_eq!(
+            deserialized.state_info.stats_json_op,
+            UnaryExpressionOp::TO_JSON
+        );
     }
 
     #[test]
@@ -2334,6 +2369,7 @@ mod tests {
             is_catalog_managed: false,
             skip_row_transforms: false,
             dv_normalization_root: None,
+            stats_json_op: UnaryExpressionOp::TO_JSON,
         };
         let predicate = Arc::new(crate::expressions::column_pred!("id"));
         let invalid_blob = serde_json::to_vec(&invalid_internal_state).unwrap();
@@ -2368,6 +2404,7 @@ mod tests {
             is_catalog_managed: false,
             skip_row_transforms: false,
             dv_normalization_root: None,
+            stats_json_op: UnaryExpressionOp::TO_JSON,
         };
         let blob = serde_json::to_string(&invalid_internal_state).unwrap();
         let mut obj: serde_json::Value = serde_json::from_str(&blob).unwrap();
@@ -2544,6 +2581,54 @@ mod tests {
             "Expected c000 add to survive, got: {}",
             add_paths[0]
         );
+    }
+
+    #[rstest]
+    #[case::millisecond(UnaryExpressionOp::TO_JSON, "2026-07-02T15:55:55.298Z")]
+    #[case::full_precision(
+        UnaryExpressionOp::ToJson { full_precision_timestamps: true },
+        MICROSECOND_TIMESTAMP
+    )]
+    fn add_transform_synthesizes_stats_json_with_stats_json_op(
+        #[case] stats_json_op: UnaryExpressionOp,
+        #[case] expected_bound: &str,
+    ) -> KernelResult<()> {
+        let stats_parsed = StructField::nullable(
+            "stats_parsed",
+            schema! { nullable MIN_VALUES: { nullable "ts": TIMESTAMP } },
+        );
+        let checkpoint_schema = Arc::new(
+            SchemaStructPatchBuilder::new()
+                .append_at([ADD_NAME], stats_parsed)
+                .build(&LOG_ADD_SCHEMA)?,
+        );
+        let transform = get_add_transform_expr(
+            None,  // physical_stats_read_schema
+            true,  // has_stats_parsed
+            false, // skip_stats
+            Some(stats_json_op),
+            None,  // partition_schema
+            false, // has_partition_values_parsed
+            None,  // timestamp_timezone
+        );
+
+        let rows = evaluate_on_json_rows(
+            &SyncEngine::new(),
+            checkpoint_schema,
+            transform,
+            SCAN_ROW_SCHEMA.clone(),
+            &[json!({ ADD_NAME: {
+                "path": "a",
+                "partitionValues": {},
+                "size": 1,
+                "modificationTime": 0,
+                "dataChange": true,
+                "stats": null,
+                "stats_parsed": { MIN_VALUES: { "ts": MICROSECOND_TIMESTAMP } },
+            } })],
+        )?;
+        assert_min_ts_in_stats_json(&rows[0]["stats"], expected_bound);
+        Ok(())
     }
 
     /// Walk `expr` and count `Unary { op: ToJson, .. }` occurrences anywhere in the tree.

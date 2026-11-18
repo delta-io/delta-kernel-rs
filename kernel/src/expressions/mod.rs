@@ -140,16 +140,16 @@ pub enum UnaryExpressionOp {
     /// ```
     ///
     /// Timestamps must encode with exactly three fractional digits, truncated toward negative
-    /// infinity, because kernel writes `add.stats` with this operator and [Per-file Statistics]
-    /// truncates timestamp statistics down to milliseconds. TIMESTAMP takes a literal `Z` suffix
-    /// and TIMESTAMP_NTZ takes no offset, so `{ ts: 2026-07-02T15:55:55.298677Z }` becomes
-    /// `{"ts":"2026-07-02T15:55:55.298Z"}`. Emitting more digits, or rounding up, makes readers
-    /// prune files that hold matching rows.
+    /// infinity, because [Per-file Statistics] truncates timestamp statistics down to
+    /// milliseconds. TIMESTAMP takes a literal `Z` suffix and TIMESTAMP_NTZ takes no offset, so
+    /// `{ ts: 2026-07-02T15:55:55.298677Z }` becomes `{"ts":"2026-07-02T15:55:55.298Z"}`.
+    /// Emitting more digits, or rounding up, makes readers prune files that hold matching rows.
+    /// Kernel encodes file stats this way for tables without adaptiveMetadata.
     ///
     /// When `full_precision_timestamps` is set, timestamps instead encode with exactly six
     /// fractional digits, so the same value becomes `{"ts":"2026-07-02T15:55:55.298677Z"}` and the
-    /// operator is the exact inverse of [`ParseJsonExpression`]. Kernel writes adaptiveMetadata
-    /// `add.stats` with this flag set.
+    /// operator is the exact inverse of [`ParseJsonExpression`]. Kernel encodes adaptiveMetadata
+    /// file stats with this flag set.
     ///
     /// [Per-file Statistics]: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#per-file-statistics
     ToJson {

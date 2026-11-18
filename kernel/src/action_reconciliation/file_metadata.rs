@@ -299,12 +299,17 @@ fn transform_add_schema(
 #[cfg(test)]
 mod tests {
     use rstest::rstest;
+    use serde_json::json;
 
     use super::*;
-    use crate::actions::NUM_RECORDS;
+    use crate::actions::{MIN_VALUES, NUM_RECORDS};
+    use crate::engine::sync::SyncEngine;
     use crate::expressions::ExpressionStructPatch;
     use crate::schema::{MapType, schema, schema_ref};
-    use crate::unit_test_utils::MockTableConfigurationBuilder;
+    use crate::unit_test_utils::{
+        MICROSECOND_TIMESTAMP, MockTableConfigurationBuilder, assert_min_ts_in_stats_json,
+        evaluate_on_json_rows,
+    };
     #[cfg(feature = "adaptive-metadata-in-dev")]
     use crate::unit_test_utils::{
         adaptive_metadata_table_configuration, test_schema_flat_with_column_mapping,
@@ -453,6 +458,42 @@ mod tests {
             is_drop(inner, STATS_PARSED_FIELD),
             "stats_parsed should be dropped"
         );
+    }
+
+    #[rstest]
+    #[case::millisecond(UnaryExpressionOp::TO_JSON, "2026-07-02T15:55:55.298Z")]
+    #[case::full_precision(
+        UnaryExpressionOp::ToJson { full_precision_timestamps: true },
+        MICROSECOND_TIMESTAMP
+    )]
+    fn test_build_transform_encodes_stats_parsed_with_stats_json_op(
+        #[case] stats_json_op: UnaryExpressionOp,
+        #[case] expected_bound: &str,
+    ) -> KernelResult<()> {
+        let config = StatsTransformConfig {
+            write_stats_as_json: true,
+            write_stats_as_struct: false,
+            stats_json_op,
+        };
+        let stats_schema = schema_ref! { nullable MIN_VALUES: { nullable "ts": TIMESTAMP } };
+        let base_schema = schema! { nullable ADD_NAME: (add_schema(false)) };
+        let read_schema = build_checkpoint_read_schema(&base_schema, &stats_schema, None)?;
+        let (output_schema, transform) =
+            super::build_checkpoint_transform(&config, &read_schema, &stats_schema, None)?;
+
+        let rows = evaluate_on_json_rows(
+            &SyncEngine::new(),
+            read_schema,
+            transform,
+            output_schema,
+            &[json!({ ADD_NAME: {
+                "path": "a",
+                STATS_FIELD: null,
+                STATS_PARSED_FIELD: { MIN_VALUES: { "ts": MICROSECOND_TIMESTAMP } },
+            } })],
+        )?;
+        assert_min_ts_in_stats_json(&rows[0][ADD_NAME][STATS_FIELD], expected_bound);
+        Ok(())
     }
 
     #[test]
