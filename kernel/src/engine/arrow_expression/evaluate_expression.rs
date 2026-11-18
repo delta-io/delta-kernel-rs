@@ -884,8 +884,8 @@ pub fn evaluate_predicate(
 /// serialization), so matching it keeps stats parseable by readers that accept only that form.
 /// Hardcoding it is safe because a Delta `TIMESTAMP` stat is always UTC: `arrow_conversion` accepts
 /// a timezone-annotated array only when the annotation is UTC.
-const STATS_TIMESTAMP_TZ_FORMAT: &str = "%Y-%m-%dT%H:%M:%S%.3fZ";
-const STATS_TIMESTAMP_NTZ_FORMAT: &str = "%Y-%m-%dT%H:%M:%S%.3f";
+pub(crate) const STATS_TIMESTAMP_TZ_FORMAT: &str = "%Y-%m-%dT%H:%M:%S%.3fZ";
+pub(crate) const STATS_TIMESTAMP_NTZ_FORMAT: &str = "%Y-%m-%dT%H:%M:%S%.3f";
 
 /// Converts a StructArray to JSON-encoded strings
 #[internal_api]

@@ -7,9 +7,11 @@ use std::sync::Arc;
 
 use delta_kernel::actions::deletion_vector_writer::KernelDeletionVector;
 use delta_kernel::actions::{NUM_RECORDS, TIGHT_BOUNDS};
-use delta_kernel::arrow::array::{BooleanArray, Int64Array, StructArray};
+use delta_kernel::arrow::array::{AsArray, BooleanArray, Int64Array, StructArray};
 use delta_kernel::arrow::record_batch::RecordBatch;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
+use delta_kernel::engine::arrow_stats::serialize_stats;
+use delta_kernel::engine_data::FilteredEngineData;
 use delta_kernel::object_store::ObjectStoreExt as _;
 use delta_kernel::scan::StatsOptions;
 use delta_kernel::schema::schema_ref;
@@ -430,6 +432,7 @@ async fn test_scan_reads_puffin_framed_deletion_vector()
 #[tokio::test(flavor = "multi_thread")]
 async fn test_dv_update_stats_tight_bound(
     #[case] initial_tight_bounds: Option<bool>,
+    #[values(false, true)] reconstruct_from_struct_stats: bool,
 ) -> delta_kernel::Result<()> {
     // Nested schema: a `point` struct with two leaf columns.
     let schema = schema_ref! {
@@ -510,7 +513,30 @@ async fn test_dv_update_stats_tight_bound(
     let write_context = txn.write_state()?.write_context_builder().build()?;
     let dv_descriptor = write_deletion_vector_to_store(&store, &write_context, dv, "").await?;
 
-    let scan_files = get_scan_files(snapshot, engine.as_ref())?;
+    let scan_files = if reconstruct_from_struct_stats {
+        let builder = snapshot
+            .scan_builder()
+            .with_stats(StatsOptions::all_struct());
+        let stats_schema = builder.stats_output_schemas()?.unwrap().physical;
+        builder
+            .build()?
+            .scan_metadata(engine.as_ref())?
+            .map(|metadata| {
+                let (data, selection) = metadata?.scan_files.into_parts();
+                let batch = into_record_batch(data);
+                let stats = batch.column_by_name("stats_parsed").unwrap().as_struct();
+                let mut columns = batch.columns().to_vec();
+                let stats_index = batch.schema().index_of("stats")?;
+                let parsed_index = batch.schema().index_of("stats_parsed")?;
+                columns[stats_index] = Arc::new(serialize_stats(stats, &stats_schema)?);
+                let mut batch = RecordBatch::try_new(batch.schema(), columns)?;
+                batch.remove_column(parsed_index);
+                FilteredEngineData::try_new(Box::new(ArrowEngineData::new(batch)), selection)
+            })
+            .collect::<KernelResult<Vec<_>>>()?
+    } else {
+        get_scan_files(snapshot, engine.as_ref())?
+    };
     let mut dv_map = HashMap::new();
     dv_map.insert(data_file_path.to_string(), dv_descriptor);
     txn.update_deletion_vectors(dv_map, scan_files.into_iter().map(Ok))?;
