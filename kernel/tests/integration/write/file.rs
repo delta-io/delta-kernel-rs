@@ -988,7 +988,7 @@ async fn test_write_and_read_bytes_of_referenced_files() -> Result<(), Box<dyn s
 }
 
 /// Commits a `metaData` action that sets `delta.fileType.writeLocation` to `value`, as the system
-/// that allocates the write location would; kernel does not let users set it.
+/// that allocates the write location would.
 async fn set_write_location(
     table_path: &str,
     engine: &dyn Engine,

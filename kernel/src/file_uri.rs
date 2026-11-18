@@ -109,8 +109,9 @@ impl ReferencedFilePath {
 /// at the write location set by `write_location` (the `delta.fileType.writeLocation` value), or
 /// under `_files` when it is not set.
 ///
-/// Returns an error if `write_location` is invalid (see [`write_location_uri_prefix`]), or if
-/// `extension` is empty or has a character other than an ASCII letter, digit, `-`, `_` or `.`.
+/// Returns an error if `write_location` is invalid or unsupported (see
+/// [`write_location_uri_prefix`]), or if `extension` is empty or has a character other than an
+/// ASCII letter, digit, `-`, `_` or `.`.
 pub(crate) fn new_referenced_file_path(
     table_root: &Url,
     write_location: Option<&str>,
@@ -125,8 +126,8 @@ pub(crate) fn new_referenced_file_path(
                     && extension
                         .chars()
                         .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.')),
-                KernelError::invalid_referenced_file_path(format!(
-                    "extension {extension:?} is invalid: it must be non-empty and contain only \
+                KernelError::unsupported_referenced_file_path(format!(
+                    "extension {extension:?} is unsupported: it must be non-empty and contain only \
                      ASCII letters, digits, '-', '_' and '.'"
                 ))
             );
@@ -152,21 +153,21 @@ fn write_location_uri_prefix(
     table_root: &Url,
     write_location: Option<&str>,
 ) -> KernelResult<String> {
-    let Some(value) = write_location else {
+    let Some(write_location) = write_location else {
         return Ok(format!("{FILES_DIR}/"));
     };
     let invalid = |reason: &str| {
-        KernelError::invalid_referenced_file_path(format!(
-            "{FILE_TYPE_WRITE_LOCATION} {value:?} is invalid: {reason}"
+        KernelError::unsupported_referenced_file_path(format!(
+            "{FILE_TYPE_WRITE_LOCATION} {write_location:?} is invalid or unsupported: {reason}"
         ))
     };
     require!(
-        !value.contains(['?', '#']),
+        !write_location.contains(['?', '#']),
         invalid("a write location cannot have a query or fragment")
     );
-    let dir = value.strip_suffix('/').unwrap_or(value);
+    let dir = write_location.strip_suffix('/').unwrap_or(write_location);
     let empty_segment = || invalid("a write location cannot have an empty path segment");
-    match check_uri(value).map_err(|e| invalid(&e.to_string()))? {
+    match check_uri(write_location).map_err(|e| invalid(&e.to_string()))? {
         CheckedUri::Absolute(_) => {
             let url = Url::parse(&format!("{dir}/")).map_err(|e| invalid(&e.to_string()))?;
             require!(
@@ -289,12 +290,13 @@ fn uri_path(uri: &str, scheme_len: Option<usize>) -> &str {
 /// ways counts as outside.
 fn is_within(url: &Url, table_root: &Url) -> bool {
     let authority = |url: &Url| url[..Position::BeforePath].to_ascii_lowercase();
-    let segments = |url: &Url| -> Vec<String> {
-        percent_decode_str(url.path())
-            .decode_utf8_lossy()
-            .split('/')
+    // Paths are compared as decoded bytes, so an escape that is not valid UTF-8, such as `%FF`,
+    // only matches itself.
+    let segments = |url: &Url| -> Vec<Vec<u8>> {
+        let path: Vec<u8> = percent_decode_str(url.path()).collect();
+        path.split(|&byte| byte == b'/')
             .filter(|segment| !segment.is_empty())
-            .map(str::to_owned)
+            .map(<[u8]>::to_vec)
             .collect()
     };
     authority(url) == authority(table_root) && segments(url).starts_with(&segments(table_root))
@@ -562,12 +564,21 @@ mod tests {
     fn test_write_location_uri_prefix_rejects(#[case] value: &str, #[case] reason: &str) {
         let err = write_location_uri_prefix(&root(), Some(value)).unwrap_err();
         assert!(
-            matches!(err, KernelError::InvalidReferencedFilePath(_)),
+            matches!(err, KernelError::UnsupportedReferencedFilePath(_)),
             "{err:?}"
         );
         let err = err.to_string();
         assert!(err.contains("delta.fileType.writeLocation"), "{err}");
         assert!(err.contains(reason), "{err}");
+    }
+
+    #[rstest]
+    #[case::invalid_utf8_differs("s3://bucket/%FF/", "s3://bucket/%FE/p1", false)]
+    #[case::invalid_utf8_same("s3://bucket/%FF/", "s3://bucket/%FF/p1", true)]
+    #[case::encoded_slash("s3://bucket/a%2Fb/", "s3://bucket/a/b/p1", true)]
+    fn test_is_within(#[case] root: &str, #[case] url: &str, #[case] expected: bool) {
+        let (root, url) = (Url::parse(root).unwrap(), Url::parse(url).unwrap());
+        assert_eq!(is_within(&url, &root), expected);
     }
 
     // An object store decodes the whole path, so `a%2Fb` and `a/b` are the same prefix.
@@ -632,15 +643,15 @@ mod tests {
     #[case::slash("png/x")]
     #[case::space("p ng")]
     #[case::percent("p%2Fng")]
-    fn test_new_referenced_file_path_rejects_invalid_extension(#[case] extension: &str) {
+    fn test_new_referenced_file_path_rejects_unsupported_extension(#[case] extension: &str) {
         let err = new_referenced_file_path(&root(), None, Some(extension)).unwrap_err();
         assert!(
-            matches!(err, KernelError::InvalidReferencedFilePath(_)),
+            matches!(err, KernelError::UnsupportedReferencedFilePath(_)),
             "{err:?}"
         );
         let err = err.to_string();
         assert!(err.contains("extension"), "{err}");
-        assert!(err.contains("is invalid"), "{err}");
+        assert!(err.contains("is unsupported"), "{err}");
     }
 
     #[test]

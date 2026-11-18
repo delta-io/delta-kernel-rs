@@ -274,20 +274,19 @@ impl BoundWriteContext {
     /// [`ReferencedFilePath::location`] and store [`ReferencedFilePath::uri`] in the value's
     /// `uri`: relative to the table root under `_files`, absolute outside the table root.
     ///
-    /// The `file` type protocol requires a writer to write each file for a new reference under a
-    /// unique name, never to overwrite an existing file, and to treat a file as immutable once a
-    /// committed `uri` references it. Each call returns a new name, so a connector that writes
-    /// each file once to the returned location, and never modifies it, meets these requirements.
+    /// Write each file once to the returned location without overwriting an existing file. Once a
+    /// committed `uri` references it, do not modify or replace the file.
     /// Kernel does not write or track the file; keeping it is up to the connector or the system
     /// that owns the write location.
     ///
     /// # Errors
     ///
-    /// Returns an error if `delta.fileType.writeLocation` is invalid: it must be a
+    /// Returns an error if `delta.fileType.writeLocation` is invalid or unsupported: it must be a
     /// table-root-relative path under `_files` (for example `_files/<prefix>`) or an absolute URI
     /// outside the table root, and a writer must not write files at any other value. Also returns
     /// an error if `extension` is empty or has a character other than an ASCII letter, digit, `-`,
-    /// `_` or `.`.
+    /// `_` or `.`. This extension rule is kernel's: the protocol doesn't prescribe a format for
+    /// file names.
     pub fn new_referenced_file_path(
         &self,
         extension: Option<&str>,

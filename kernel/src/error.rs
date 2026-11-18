@@ -432,13 +432,13 @@ pub enum KernelError {
     UnsupportedFileUri(String),
 
     /// Kernel cannot create a location for a new file that a `file` value references, because the
-    /// table's write location or the requested extension is invalid; see
+    /// table's write location or the requested extension is unsupported; see
     /// [`BoundWriteContext::new_referenced_file_path`].
     ///
     /// [`BoundWriteContext::new_referenced_file_path`]:
     ///     crate::transaction::BoundWriteContext::new_referenced_file_path
     #[error("Cannot create a referenced file path: {0}")]
-    InvalidReferencedFilePath(String),
+    UnsupportedReferencedFilePath(String),
 
     /// Invalid CRS or other parameter for a Geometry / Geography type
     #[error("Invalid geo parameters: {0}")]
@@ -601,10 +601,10 @@ impl KernelError {
     pub fn unsupported_file_uri(msg: impl ToString) -> Self {
         Self::UnsupportedFileUri(msg.to_string())
     }
-    /// Creates an InvalidReferencedFilePath error. The message says whether the write location or
-    /// the extension is invalid, and why.
-    pub fn invalid_referenced_file_path(msg: impl ToString) -> Self {
-        Self::InvalidReferencedFilePath(msg.to_string())
+    /// Creates an UnsupportedReferencedFilePath error. The message says whether the write location
+    /// or the extension is invalid or unsupported, and why.
+    pub fn unsupported_referenced_file_path(msg: impl ToString) -> Self {
+        Self::UnsupportedReferencedFilePath(msg.to_string())
     }
     #[cfg(feature = "geo-type-in-dev")]
     pub fn invalid_geo_params(msg: impl ToString) -> Self {
