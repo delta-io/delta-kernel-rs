@@ -214,12 +214,21 @@ class InlineReviewTest(unittest.TestCase):
         for section in self.inline_review._REVIEW_SECTION_NAMES:
             self.assertIn(section, contract)
 
-    def test_every_reviewer_config_sets_explicit_reasoning_effort(self) -> None:
+    def test_every_reviewer_config_sets_reasoning_effort_valid_for_its_harness(
+        self,
+    ) -> None:
+        valid_efforts = {
+            "claude-sdk": {"low", "medium", "high", "xhigh", "max"},
+            "codex": {"none", "minimal", "low", "medium", "high", "xhigh"},
+        }
         reviewer_dir = Path(__file__).parents[1] / "reviewer"
         for config_path in reviewer_dir.rglob("config.yaml"):
             with self.subTest(config=config_path.parent.name):
                 executor = yaml.safe_load(config_path.read_text())["executor"]
-                self.assertIn("reasoning_effort", executor)
+                self.assertIn(
+                    executor.get("reasoning_effort"),
+                    valid_efforts[executor["config"]["harness"]],
+                )
 
     def test_markdown_prompts_preserve_source_safety(self) -> None:
         reviewer_dir = Path(__file__).parents[1] / "reviewer"
