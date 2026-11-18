@@ -31,7 +31,7 @@ use tracing_subscriber::layer::{Context, Identity, SubscriberExt};
 use tracing_subscriber::registry::LookupSpan;
 use tracing_subscriber::{Layer, Registry, reload};
 
-use crate::ffi_metrics::{MetricEvent, with_ffi_event};
+use crate::ffi_metrics::MetricEvent;
 use crate::{KernelStringSlice, kernel_string_slice};
 
 /// A type-erased logging layer that lives in the reloadable logging slot of the global subscriber.
@@ -383,7 +383,7 @@ impl MetricsReporter for FfiMetricsReporter {
             }
         };
         if let Some(callback) = callback {
-            with_ffi_event(&event, |ffi_event| callback(ffi_event));
+            MetricEvent::with_kernel_event(&event, |ffi_event| callback(ffi_event));
         }
     }
 }
