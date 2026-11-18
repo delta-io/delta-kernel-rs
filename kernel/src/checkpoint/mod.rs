@@ -140,6 +140,8 @@ use crate::{
 pub(crate) mod collation_stats;
 pub(crate) mod metrics;
 #[cfg(feature = "declarative-plans")]
+mod plan;
+#[cfg(feature = "declarative-plans")]
 mod shape;
 mod sidecar;
 
