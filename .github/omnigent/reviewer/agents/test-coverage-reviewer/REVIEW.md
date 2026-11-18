@@ -88,7 +88,7 @@ Beyond just existence, evaluate test quality:
 Tests should exercise the **contract**, not merely follow the shape of the code. Key principles:
 - The code needs clear enough contracts (via types, doc comments, naming) that you can write reasonable test cases _without_ looking at the implementation. If it doesn't, stop and flag that as the real problem.
 - Don't replicate the code's control flow in the test — that just verifies the code does what it currently does, not what it _should_ do.
-- **Assert errors at the most stable level available** — an error code or enum variant when one is fine-grained enough to identify the failure; otherwise a stable message substring via `assert_result_error_with_message`. Exact full-message matches are brittle because strings get refined. Do not report either choice alone as a defect.
+- **Assert errors at the most stable level available** — an error code or enum variant when one is fine-grained enough to identify the failure; otherwise a stable message substring via `assert_result_error_with_message`. Exact full-message matches are brittle because strings get refined. Neither a variant match nor a message-substring match is a defect by itself.
 - Recognize that many helpers receive more than adequate coverage from the code that uses them, assuming that code is well-tested. Don't demand dedicated tests for every helper.
 
 ## Output Format

@@ -241,6 +241,7 @@ def build_review_payload(
         if (path, line, side) not in allowed_positions:
             unmapped.append(finding_id)
             continue
+        body = _strip_leading_id(body, finding_id)
         if (path, line, side, canonical_finding_body(body)) in prior_comments:
             duplicates.append(finding_id)
             if finding_id in review_ids:
@@ -446,14 +447,15 @@ def _validate_finding(finding: Any) -> tuple[str, str, int, str, str]:
         raise ValueError(f"inline finding {finding_id} has an invalid body")
     if any(ord(char) < 32 and char not in "\n\t" for char in body):
         raise ValueError(f"inline finding {finding_id} has control characters")
-    return finding_id, path, line, side, _strip_leading_id(body.strip(), finding_id)
+    return finding_id, path, line, side, body.strip()
 
 
 def _strip_leading_id(body: str, finding_id: str) -> str:
-    """Remove a ``finding_id`` label that the model repeated at the start of ``body``.
+    """Remove a ``finding_id`` label repeated at the start of a non-empty ``body``.
 
-    Only label forms are removed (``**Nit1**``, ``**Nit1:**``, ``Nit1:``). Prose that
-    begins with the ID, such as "Nit1 and Nit2 share a cause", is kept.
+    Removes label forms only (``**Nit1**``, ``**Nit1:**``, ``Nit1:``), so prose such as
+    "Nit1 and Nit2 share a cause" is kept. A body that is only the label is returned
+    unchanged.
     """
     label = re.escape(finding_id)
     stripped = re.sub(rf"^(?:\*\*{label}:?\*\*:?|{label}:)\s*", "", body)
